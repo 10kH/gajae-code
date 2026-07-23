@@ -9055,7 +9055,9 @@ export class AgentSession {
 
 	#hasUnfinishedWork(): boolean {
 		const goal = this.getGoalModeState()?.goal;
-		if (goal && goal.status !== "complete" && goal.status !== "dropped") return true;
+		// A paused goal is parked on human input; it must not drive autonomous
+		// continuation (matching goal-mode pause semantics).
+		if (goal && goal.status === "active") return true;
 		if (
 			this.getTodoPhases().some(phase =>
 				phase.tasks.some(task => task.status === "pending" || task.status === "in_progress"),

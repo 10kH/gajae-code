@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
@@ -39,7 +39,7 @@ describe("AgentSession state-aware compaction", () => {
 	let session: AgentSession;
 	let sessionManager: SessionManager;
 	let authStorage: AuthStorage;
-	let compactSpy: ReturnType<typeof vi.spyOn>;
+	let compactSpy: Mock<typeof compactionModule.compact>;
 
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@pi-state-aware-compaction-");
@@ -124,6 +124,29 @@ describe("AgentSession state-aware compaction", () => {
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
 		await compact();
 		expect(promptSpy).toHaveBeenCalledTimes(1);
+	});
+	it("skips synthetic auto-continue when the only goal is paused", async () => {
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "goal-paused",
+				objective: "Wait on human input",
+				status: "paused",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: 0,
+				updatedAt: 0,
+			},
+		});
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		const notices: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "notice") notices.push(event.message);
+		});
+		await compact();
+		expect(promptSpy).not.toHaveBeenCalled();
+		expect(notices).toContain("Auto-continue skipped: no unfinished work detected");
 	});
 
 	it("passes active goal and open todos to the summarizer", async () => {
