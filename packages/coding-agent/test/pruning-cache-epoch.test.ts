@@ -113,17 +113,25 @@ describe("pruning cache-epoch invariant", () => {
 	});
 
 	function seedPrunableHistory(): void {
+		// Spread the output across three user turns: the newest two turns are
+		// protected by the recent-turn fence (protectRecentTurns=2), so the
+		// prunable mass must live in an older turn.
 		sessionManager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
 		// ~75k tokens of toolResult output: well past the 40k protect window and
 		// 20k minimum-savings hysteresis, so pruning WOULD fire if invoked.
 		for (let i = 0; i < 25; i++) {
 			sessionManager.appendMessage(toolResultMessage(i, 12_000));
 		}
+		sessionManager.appendMessage({ role: "user", content: "next", timestamp: Date.now() });
+		sessionManager.appendMessage(toolResultMessage(100, 100));
+		sessionManager.appendMessage({ role: "user", content: "latest", timestamp: Date.now() });
 	}
 
 	function seedSubMinimumPrunableHistory(): void {
 		sessionManager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
 		for (let i = 0; i < 18; i++) sessionManager.appendMessage(toolResultMessage(i, 12_000));
+		sessionManager.appendMessage({ role: "user", content: "next", timestamp: Date.now() });
+		sessionManager.appendMessage({ role: "user", content: "latest", timestamp: Date.now() });
 	}
 
 	function prunedEntryCount(): number {
