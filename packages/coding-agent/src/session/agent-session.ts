@@ -9022,6 +9022,50 @@ export class AgentSession {
 		this.setTodoPhases(phases.filter(p => p.tasks.length > 0));
 	}
 
+	async #compactionStateContext(): Promise<string[]> {
+		const context: string[] = [];
+		try {
+			const goal = this.getGoalModeState()?.goal;
+			if (goal) context.push(`Active goal: ${goal.objective.slice(0, 160)} (status: ${goal.status})`);
+		} catch {
+			// State context is best-effort.
+		}
+		try {
+			const state = await readVisibleSkillActiveState(this.sessionManager.getCwd(), this.sessionId, { tier: "hud" });
+			for (const entry of (state?.active_skills ?? []).filter(entry => entry.active !== false).slice(0, 5)) {
+				const skill = entry.skill.slice(0, 100);
+				const phase = (entry.phase ?? "unknown").slice(0, 80);
+				if (skill) context.push(`Active skill: ${skill} phase=${phase}`);
+			}
+		} catch {
+			// State context is best-effort.
+		}
+		try {
+			const todos = this.getTodoPhases()
+				.flatMap(phase => phase.tasks)
+				.filter(task => task.status === "pending" || task.status === "in_progress")
+				.slice(0, 10)
+				.map(task => task.content.slice(0, 120));
+			if (todos.length > 0) context.push(`Open todos: ${todos.join("; ")}`);
+		} catch {
+			// State context is best-effort.
+		}
+		return context;
+	}
+
+	#hasUnfinishedWork(): boolean {
+		const goal = this.getGoalModeState()?.goal;
+		if (goal && goal.status !== "complete" && goal.status !== "dropped") return true;
+		if (
+			this.getTodoPhases().some(phase =>
+				phase.tasks.some(task => task.status === "pending" || task.status === "in_progress"),
+			)
+		) {
+			return true;
+		}
+		return this.agent.hasQueuedMessages();
+	}
+
 	async #applyCompactionPostAppend(
 		compactionEntryId: string,
 		firstKeptEntryId: string,
@@ -10847,11 +10891,67 @@ export class AgentSession {
 		overThreshold = false,
 	): Promise<{ prunedCount: number; tokensSaved: number } | undefined> {
 		const branchEntries = this.sessionManager.getBranch();
-		const result = pruneToolOutputs(
-			branchEntries,
-			DEFAULT_PRUNE_CONFIG,
-			overThreshold ? { relaxedMinimum: 0 } : undefined,
-		);
+		const artifactManager = this.sessionManager.getArtifactManager();
+		const prunedArtifacts: Array<{ entryId: string; id: string; toolType: string; originalText: string }> = [];
+		let reservedArtifactId: string | undefined;
+		if (artifactManager) {
+			try {
+				reservedArtifactId = (await artifactManager.allocatePath("tool-output")).id;
+			} catch (error) {
+				logger.warn("Failed to reserve artifact ID for pruned tool output", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		const result = pruneToolOutputs(branchEntries, DEFAULT_PRUNE_CONFIG, {
+			relaxedMinimum: overThreshold ? 0 : undefined,
+			artifactRef: candidate => {
+				if (!artifactManager) return undefined;
+				const id = reservedArtifactId ?? String(artifactManager.allocateId());
+				reservedArtifactId = undefined;
+				const toolType = (candidate.toolName ?? "tool-output").replace(/[^a-zA-Z0-9_-]/g, "_") || "tool-output";
+				prunedArtifacts.push({ entryId: candidate.entryId, id, toolType, originalText: candidate.originalText });
+				return `artifact://${id}`;
+			},
+		});
+		const failedArtifactEntryIds = new Set<string>();
+		for (const artifact of prunedArtifacts.filter(artifact =>
+			result.originals.some(original => original.entryId === artifact.entryId),
+		)) {
+			try {
+				await artifactManager?.publishNamedNoReplace(
+					`${artifact.id}.${artifact.toolType}.log`,
+					new TextEncoder().encode(artifact.originalText),
+				);
+			} catch (error) {
+				failedArtifactEntryIds.add(artifact.entryId);
+				logger.warn("Failed to persist pruned tool output artifact", {
+					artifactId: artifact.id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		let toolTokensSaved = result.tokensSaved;
+		let toolPrunedCount = result.prunedCount;
+		const committedToolEntries = result.prunedEntries.filter(entry => {
+			if (!failedArtifactEntryIds.has(entry.id)) return true;
+			const original = result.originals.find(candidate => candidate.entryId === entry.id);
+			if (!original) return true;
+			const message = entry.message as ToolResultMessage;
+			toolTokensSaved -=
+				original.tokens -
+				estimateTextTokensHeuristic(
+					message.content
+						.filter((part): part is TextContent => part.type === "text")
+						.map(part => part.text)
+						.join(""),
+				);
+			toolPrunedCount--;
+			message.content = [{ type: "text", text: original.originalText }];
+			delete message.prunedAt;
+			return false;
+		});
+		if (result.prunedEntries.length > 0 && committedToolEntries.length === 0) return undefined;
 		const argumentResult = pruneAssistantToolArguments(branchEntries, DEFAULT_PRUNE_CONFIG);
 		const fileMentionResult = pruneStaleFileMentions(branchEntries, p =>
 			resolveReadPath(p, this.sessionManager.getCwd()),
@@ -10859,11 +10959,11 @@ export class AgentSession {
 		const volatileContextResult = pruneSupersededVolatileProjectContext(branchEntries);
 		const reminderResult = pruneSupersededMaintenanceReminders(branchEntries);
 		const tokensSaved =
-			result.tokensSaved +
+			toolTokensSaved +
 			argumentResult.argumentTokensSaved +
 			Math.round((fileMentionResult.bytesSaved + volatileContextResult.bytesSaved + reminderResult.bytesSaved) / 4);
 		const prunedCount =
-			result.prunedCount +
+			toolPrunedCount +
 			argumentResult.argumentPrunedCount +
 			fileMentionResult.changed.length +
 			volatileContextResult.changed.length +
@@ -10874,7 +10974,7 @@ export class AgentSession {
 
 		// getBranch() returns materialized copies for blob-externalized entries, so
 		// the pruning mutations must be written back into the canonical store.
-		const combined = [...result.prunedEntries, ...argumentResult.prunedEntries, ...fileMentionResult.changed];
+		const combined = [...committedToolEntries, ...argumentResult.prunedEntries, ...fileMentionResult.changed];
 		this.sessionManager.applyEntryMessageUpdates(combined);
 		this.sessionManager.applyCustomMessageEntryUpdates([...volatileContextResult.changed, ...reminderResult.changed]);
 		await this.sessionManager.rewriteEntries();
@@ -10934,7 +11034,10 @@ export class AgentSession {
 		const pruneResult = await this.#pruneToolOutputs();
 		if (!pruneResult || pruneResult.prunedCount === 0) return;
 
-		const resetReason = `below-threshold maintenance: reclaimed ${pruneResult.tokensSaved} tokens > cache-epoch reset cost ${cacheEpochResetCost}`;
+		const resetReason =
+			pruneResult.tokensSaved > cacheEpochResetCost
+				? `below-threshold maintenance: reclaimed ${pruneResult.tokensSaved} tokens > cache-epoch reset cost ${cacheEpochResetCost}`
+				: `below-threshold maintenance: reclaimed ${pruneResult.tokensSaved} tokens <= cache-epoch reset cost ${cacheEpochResetCost}`;
 		await this.#emitSessionEvent({
 			type: "notice",
 			level: "info",
@@ -12860,6 +12963,11 @@ export class AgentSession {
 			hookContext = hookContext ? [...hookContext, memoryBackendContext] : [memoryBackendContext];
 		}
 
+		const stateContext = await this.#compactionStateContext();
+		if (stateContext.length > 0) {
+			hookContext = hookContext ? [...hookContext, ...stateContext] : stateContext;
+		}
+
 		if (hookCompaction) {
 			preserveData ??= hookCompaction.preserveData;
 			return {
@@ -12898,6 +13006,7 @@ export class AgentSession {
 		if (!options?.force && compactionSettings.strategy === "off") return { kind: "skipped" };
 		if (!options?.force && reason !== "idle" && !compactionSettings.enabled) return { kind: "skipped" };
 		const generation = this.#promptGeneration;
+		const hadUnfinishedWork = this.#hasUnfinishedWork();
 		if (
 			options?.deferHandoffMaintenance !== false &&
 			!deferred &&
@@ -12980,8 +13089,10 @@ export class AgentSession {
 					});
 					if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
 					if (continueAfterMaintenance && reason !== "idle" && compactionSettings.autoContinue !== false) {
-						this.#scheduleAutoContinuePrompt(generation);
+						if (hadUnfinishedWork || this.#hasUnfinishedWork()) this.#scheduleAutoContinuePrompt(generation);
+						else this.emitNotice("info", "Auto-continue skipped: no unfinished work detected");
 					}
+
 					if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
 					return { kind: "compacted" };
 				}
@@ -13079,7 +13190,8 @@ export class AgentSession {
 						onError: error => this.#logCompactionContinuationError("queued_continue", error),
 					});
 				} else if (continueAfterMaintenance && reason !== "idle" && compactionSettings.autoContinue !== false) {
-					this.#scheduleAutoContinuePrompt(generation);
+					if (hadUnfinishedWork || this.#hasUnfinishedWork()) this.#scheduleAutoContinuePrompt(generation);
+					else this.emitNotice("info", "Auto-continue skipped: no unfinished work detected");
 				}
 				return { kind: "skipped" };
 			}
@@ -13324,7 +13436,8 @@ export class AgentSession {
 					onError: error => this.#logCompactionContinuationError("queued_continue", error),
 				});
 			} else if (continueAfterMaintenance && reason !== "idle" && compactionSettings.autoContinue !== false) {
-				this.#scheduleAutoContinuePrompt(generation);
+				if (hadUnfinishedWork || this.#hasUnfinishedWork()) this.#scheduleAutoContinuePrompt(generation);
+				else this.emitNotice("info", "Auto-continue skipped: no unfinished work detected");
 			}
 			return { kind: "compacted" };
 		} catch (error) {

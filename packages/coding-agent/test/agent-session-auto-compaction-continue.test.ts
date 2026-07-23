@@ -111,6 +111,7 @@ describe("AgentSession auto-compaction continuation", () => {
 			modelRegistry,
 			extensionRunner,
 		});
+		session.setTodoPhases([{ name: "Test", tasks: [{ content: "Keep working", status: "in_progress" }] }]);
 	}
 
 	beforeEach(async () => {

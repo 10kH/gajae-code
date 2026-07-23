@@ -91,6 +91,16 @@ function pair(
 	return result;
 }
 
+function userEntry(id: string): SessionEntry {
+	return {
+		type: "message",
+		id,
+		parentId: null,
+		timestamp: new Date(idCounter).toISOString(),
+		message: { role: "user", content: "continue", timestamp: idCounter },
+	} as SessionEntry;
+}
+
 const EAGER: PruneConfig = {
 	protectTokens: 0,
 	minimumSavings: 0,
@@ -160,13 +170,48 @@ describe("staleness supersession ordering", () => {
 		expect(ids).not.toContain(bounded.id);
 	});
 
-	it("lets a raw read supersede an earlier contained range", () => {
+	it("does not let a raw read supersede an earlier explicit range", () => {
 		const entries: SessionEntry[] = [];
 		const ranged = pair(entries, "c1", "read", { path: "src/a.ts:10000-10050" });
 		const raw = pair(entries, "c2", "read", { path: "src/a.ts:raw" });
 		const ids = prunedIds(entries, EAGER);
-		expect(ids).toContain(ranged.id);
+		expect(ids).not.toContain(ranged.id);
 		expect(ids).not.toContain(raw.id);
+	});
+
+	it("does not range-supersede through a raw selector stack, but exact raw repeats still supersede", () => {
+		const mixedEntries: SessionEntry[] = [];
+		const ranged = pair(mixedEntries, "c1", "read", { path: "src/a.ts:3" });
+		pair(mixedEntries, "c2", "read", { path: "src/a.ts:2-4:raw" });
+		expect(prunedIds(mixedEntries, EAGER)).not.toContain(ranged.id);
+
+		const repeatedEntries: SessionEntry[] = [];
+		const earlierRaw = pair(repeatedEntries, "c3", "read", { path: "src/a.ts:2-4:raw" });
+		pair(repeatedEntries, "c4", "read", { path: "src/a.ts:2-4:raw" });
+		expect(prunedIds(repeatedEntries, EAGER)).toContain(earlierRaw.id);
+	});
+
+	it("does not let an open-ended read supersede an explicit high range", () => {
+		const entries: SessionEntry[] = [];
+		const highRange = pair(entries, "c1", "read", { path: "src/a.ts:10000-10050" });
+		const openEnded = pair(entries, "c2", "read", { path: "src/a.ts:1-" });
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).not.toContain(highRange.id);
+		expect(ids).not.toContain(openEnded.id);
+	});
+
+	it("never prunes stale outputs in the newest two user turns", () => {
+		const entries: SessionEntry[] = [userEntry("u-old")];
+		const oldRead = pair(entries, "c1", "read", { path: "src/a.ts" });
+		entries.push(userEntry("u-middle"));
+		pair(entries, "c2", "read", { path: "src/a.ts" });
+		entries.push(userEntry("u-current"));
+		const staleCurrent = pair(entries, "c3", "read", { path: "src/a.ts" });
+		pair(entries, "c4", "read", { path: "src/a.ts" });
+
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).toContain(oldRead.id);
+		expect(ids).not.toContain(staleCurrent.id);
 	});
 
 	it("partially overlapping read ranges do not supersede each other", () => {
