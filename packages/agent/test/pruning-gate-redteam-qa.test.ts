@@ -220,12 +220,16 @@ describe("compaction pruning QA red-team gates", () => {
 			{ type: "text", text: "second block ".repeat(1_000) },
 		];
 		let artifactCalls = 0;
-		const pruned = pruneToolOutputs([output], { ...EAGER, protectedTools: [] }, {
-			artifactRef: () => {
-				artifactCalls++;
-				return "artifact://multi-text";
+		const pruned = pruneToolOutputs(
+			[output],
+			{ ...EAGER, protectedTools: [] },
+			{
+				artifactRef: () => {
+					artifactCalls++;
+					return "artifact://multi-text";
+				},
 			},
-		});
+		);
 
 		expect(artifactCalls).toBe(1);
 		expect(pruned.originals).toHaveLength(1);
@@ -244,12 +248,16 @@ describe("compaction pruning QA red-team gates", () => {
 			{ type: "text", text: "after image ".repeat(1_000) },
 		];
 		let artifactCalls = 0;
-		const pruned = pruneToolOutputs([output], { ...EAGER, protectedTools: [] }, {
-			artifactRef: () => {
-				artifactCalls++;
-				return "artifact://must-not-exist";
+		const pruned = pruneToolOutputs(
+			[output],
+			{ ...EAGER, protectedTools: [] },
+			{
+				artifactRef: () => {
+					artifactCalls++;
+					return "artifact://must-not-exist";
+				},
 			},
-		});
+		);
 
 		expect(artifactCalls).toBe(0);
 		expect(pruned.originals[0]).toMatchObject({ complete: false });
