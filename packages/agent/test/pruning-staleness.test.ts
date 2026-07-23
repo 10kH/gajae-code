@@ -744,4 +744,54 @@ describe("assistant edit argument pruning", () => {
 		expect(result.argumentPrunedCount).toBe(1);
 		expect(argumentSentinel(multiFile).reason).toBe("stale_tool_arguments");
 	});
+
+	it("fences edit arguments inside the newest protected turn even when superseded later in that turn", () => {
+		const entries: SessionEntry[] = [];
+		entries.push(userEntry("u1"));
+		const oldEdit = assistantCallEntry("c1", "edit", {
+			path: "src/old.ts",
+			old_string: "a",
+			new_string: "b".repeat(2000),
+		});
+		entries.push(oldEdit, toolResultEntry("c1", "edit", 100));
+		pair(entries, "c2", "write", { path: "src/old.ts", content: "c" }, 100);
+		entries.push(userEntry("u2"));
+		entries.push(userEntry("u3"));
+		const activeEdit = assistantCallEntry("c3", "edit", {
+			path: "src/active.ts",
+			old_string: "x",
+			new_string: "y".repeat(2000),
+		});
+		entries.push(activeEdit, toolResultEntry("c3", "edit", 100));
+		pair(entries, "c4", "write", { path: "src/active.ts", content: "z" }, 100);
+
+		const result = pruneAssistantToolArguments(entries, { ...EAGER, protectRecentTurns: 2 });
+
+		// Older superseded arguments outside the turn fence still prune.
+		expect(result.prunedEntries.map(entry => entry.id)).toEqual([oldEdit.id]);
+		expect(argumentSentinel(oldEdit).reason).toBe("stale_tool_arguments");
+		// The active/newest turn is fenced: its edit arguments survive even
+		// though a later write in the same turn superseded the path.
+		expect(argumentSentinel(activeEdit).reason).not.toBe("stale_tool_arguments");
+		expect(argumentSentinel(activeEdit)).toMatchObject({ path: "src/active.ts" });
+	});
+
+	it("fences apply_patch arguments inside the newest protected turn", () => {
+		const entries: SessionEntry[] = [];
+		entries.push(userEntry("u1"));
+		pair(entries, "c1", "read", { path: "src/a.ts" }, 100);
+		entries.push(userEntry("u2"));
+		entries.push(userEntry("u3"));
+		const activePatch = assistantCallEntry("c2", "apply_patch", {
+			input: ["*** Begin Patch", "*** Update File: src/active.ts", "@@", "-old", "+new", "*** End Patch"].join("\n"),
+			payload: "x".repeat(2000),
+		});
+		entries.push(activePatch, toolResultEntry("c2", "apply_patch", 100));
+		pair(entries, "c3", "write", { path: "src/active.ts", content: "z" }, 100);
+
+		const result = pruneAssistantToolArguments(entries, { ...EAGER, protectRecentTurns: 2 });
+
+		expect(result.argumentPrunedCount).toBe(0);
+		expect(argumentSentinel(activePatch).reason).not.toBe("stale_tool_arguments");
+	});
 });

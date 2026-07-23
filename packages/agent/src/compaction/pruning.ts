@@ -585,6 +585,7 @@ export function pruneAssistantToolArguments(
 	let accumulatedTokens = 0;
 	let argumentTokensSaved = 0;
 	const { latestSuccessfulMutationByPathGroup, failedCallIds } = buildAssistantArgumentStalenessIndex(entries);
+	const argumentFenceStart = recentTurnFenceStart(entries, config.protectRecentTurns ?? 2);
 	const candidates: Array<{
 		entry: SessionMessageEntry;
 		call: ToolCall;
@@ -596,6 +597,10 @@ export function pruneAssistantToolArguments(
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
 		if (entry.type !== "message") continue;
+		// Same newest-turn fence as tool-output pruning: edit/apply_patch
+		// arguments in the active (or otherwise protected) turn are live
+		// context, even when a later call in that turn superseded their path.
+		if (argumentFenceStart !== undefined && i >= argumentFenceStart) continue;
 		const message = entry.message as AgentMessage;
 		if (message.role !== "assistant") continue;
 		const entryTokens = estimateEntryTokens(entry);
