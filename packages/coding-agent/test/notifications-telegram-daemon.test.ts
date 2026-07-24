@@ -2217,11 +2217,11 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 while generation 27 refreshes retained native authority", () => {
+	test("keeps wire protocol 3 while generation 28 rejects special-file authority", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		// Generation 26 preserves bounded reload and lazy topic safeguards;
-		// generation 27 refreshes retained native path and process authority.
-		expect(DAEMON_GENERATION).toBe(27);
+		// Generation 27 refreshes native authority; generation 28 rejects special
+		// files before authority opens.
+		expect(DAEMON_GENERATION).toBe(28);
 	});
 
 	test("#2028 reloads a fully-provenanced owner without a generation", async () => {

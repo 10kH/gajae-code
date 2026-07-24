@@ -33,11 +33,12 @@ export type ChatDaemonAction = "stop" | "reload";
  * Generation 11 accepts typed retained exact-unlink cleanup authority — a
  * concrete detached quarantine plus a proven-absent canonical lock pathname —
  * when deleting an observed owner-lock lease. Generation 12 refreshes retained
- * native path and process authority semantics.
+ * native path and process authority semantics. Generation 13 rejects special
+ * files before retained native authority opens.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 12,
-	slack: 12,
+	discord: 13,
+	slack: 13,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
