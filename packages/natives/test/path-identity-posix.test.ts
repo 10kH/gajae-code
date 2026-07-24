@@ -112,6 +112,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		const contents = '{"preserve":"payload"}';
 		await fs.mkdir(directory, { mode: 0o755 });
 		await fs.writeFile(file, contents, { mode: 0o644 });
+		await fs.chmod(file, 0o400);
 
 		expectOwnerOnlySuccess(applyOwnerOnlyPathSecurity(directory, "directory"), "directory");
 		expectOwnerOnlySuccess(applyOwnerOnlyPathSecurity(file, "file"), "file");
