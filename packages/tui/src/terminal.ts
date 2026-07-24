@@ -8,6 +8,10 @@ import { isUnderTerminalMultiplexer } from "./terminal-capabilities";
 const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
 const TERMINAL_PROGRESS_CLEAR_SEQUENCE = "\x1b]9;4;0;\x07";
+// OSC 11 / DA1 appearance-probe watchdog. A live terminal answers in well under
+// a second; 3s only elapses when a reply was dropped (multiplexer/SSH glitch),
+// at which point the probe cycle is recovered instead of latching forever.
+const OSC11_QUERY_TIMEOUT_MS = 3_000;
 
 /**
  * Whether GJC may reprogram the keyboard with enhanced input protocols
@@ -222,6 +226,7 @@ export class ProcessTerminal implements Terminal {
 	#privateCsiResponseBuffer = "";
 	#pendingDa1Sentinels = 0;
 	#osc11PollTimer?: Timer;
+	#osc11QueryWatchdog?: Timer;
 	#mode2031DebounceTimer?: Timer;
 	#progressTimer?: ReturnType<typeof setInterval>;
 	#mouseEnabled = false;
@@ -475,10 +480,13 @@ export class ProcessTerminal implements Terminal {
 					this.#osc11Pending = false;
 					this.#osc11ResponseBuffer = "";
 				}
-				// Now that this DA1 cycle is complete, start any queued query.
+				// Now that this DA1 cycle is complete, start any queued query (which
+				// re-arms the watchdog); otherwise disarm it — both replies resolved.
 				if (this.#osc11QueryQueued && !this.#dead) {
 					this.#osc11QueryQueued = false;
 					this.#startOsc11Query();
+				} else {
+					this.#settleOsc11QueryWatchdog();
 				}
 				return;
 			}
@@ -499,6 +507,9 @@ export class ProcessTerminal implements Terminal {
 					const [, rHex, gHex, bHex] = osc11Match;
 					this.#osc11Pending = false;
 					this.#osc11ResponseBuffer = "";
+					// If the DA1 sentinel already arrived the cycle is done; otherwise
+					// stay armed until it does (or the watchdog recovers a dropped DA1).
+					this.#settleOsc11QueryWatchdog();
 					this.#handleOsc11Response(rHex!, gHex!, bHex!);
 					return;
 				}
@@ -556,8 +567,60 @@ export class ProcessTerminal implements Terminal {
 		this.#osc11Pending = true;
 		this.#osc11ResponseBuffer = "";
 		this.#pendingDa1Sentinels++;
+		this.#armOsc11QueryWatchdog();
 		this.#safeWrite("\x1b]11;?\x07"); // OSC 11 query (BEL terminated)
 		this.#safeWrite("\x1b[c"); // DA1 sentinel
+	}
+
+	/**
+	 * A terminal (or an intervening multiplexer / SSH link) can silently drop the
+	 * OSC 11 and/or DA1 reply for the in-flight probe. Without a timeout,
+	 * `#osc11Pending` / `#pendingDa1Sentinels` stay set forever, so every later
+	 * poll only re-queues (`#osc11QueryQueued`) and appearance probing never
+	 * re-arms — which also wedges the stdin drain that depends on it, latching the
+	 * composer (raw escape leakage, then dead input). A live terminal answers in
+	 * well under a second; when the far longer watchdog elapses the reply was
+	 * genuinely dropped, so abandon the stalled cycle and let probing resume.
+	 */
+	#armOsc11QueryWatchdog(): void {
+		this.#clearOsc11QueryWatchdog();
+		this.#osc11QueryWatchdog = setTimeout(() => {
+			this.#osc11QueryWatchdog = undefined;
+			this.#recoverStalledOsc11Query();
+		}, OSC11_QUERY_TIMEOUT_MS);
+		this.#osc11QueryWatchdog.unref();
+	}
+
+	#clearOsc11QueryWatchdog(): void {
+		if (this.#osc11QueryWatchdog) {
+			clearTimeout(this.#osc11QueryWatchdog);
+			this.#osc11QueryWatchdog = undefined;
+		}
+	}
+
+	/**
+	 * Disarm the watchdog only once BOTH the OSC 11 reply and its DA1 sentinel
+	 * have resolved. A half-complete cycle (e.g. OSC received but DA1 still
+	 * outstanding — the exact dropped-DA1 case) must stay armed so the watchdog
+	 * still recovers it.
+	 */
+	#settleOsc11QueryWatchdog(): void {
+		if (!this.#osc11Pending && this.#pendingDa1Sentinels === 0) {
+			this.#clearOsc11QueryWatchdog();
+		}
+	}
+
+	#recoverStalledOsc11Query(): void {
+		if (this.#dead) return;
+		this.#osc11Pending = false;
+		this.#pendingDa1Sentinels = 0;
+		this.#osc11ResponseBuffer = "";
+		// Re-arm immediately if a poll queued behind the stalled cycle; otherwise
+		// the next periodic poll starts a fresh query.
+		if (this.#osc11QueryQueued) {
+			this.#osc11QueryQueued = false;
+			this.#startOsc11Query();
+		}
 	}
 	/**
 	 * Parse an OSC 11 background color response and compute BT.601 luminance.
@@ -723,6 +786,7 @@ export class ProcessTerminal implements Terminal {
 		this.#osc11ResponseBuffer = "";
 		this.#privateCsiResponseBuffer = "";
 		this.#pendingDa1Sentinels = 0;
+		this.#clearOsc11QueryWatchdog();
 
 		// Disable Kitty keyboard protocol if not already done by drainInput()
 		if (this.#kittyProtocolActive) {
@@ -824,6 +888,7 @@ export class ProcessTerminal implements Terminal {
 		this.#dead = true;
 		this.#clearProgressTimer();
 		this.#stopOsc11Poll();
+		this.#clearOsc11QueryWatchdog();
 		if (this.#mode2031DebounceTimer) {
 			clearTimeout(this.#mode2031DebounceTimer);
 			this.#mode2031DebounceTimer = undefined;

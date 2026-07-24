@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Appearance probing (OSC 11 background-color query + DA1 sentinel) no longer latches when a terminal or intervening multiplexer/SSH link drops a reply. Previously a dropped DA1 sentinel left the probe state pending forever, so every later poll only re-queued and appearance detection — plus the stdin drain that depends on it — never re-armed, eventually filling the composer with raw escape sequences and freezing keystroke input until restart. A per-query watchdog now recovers the stalled cycle and resumes probing, and the timer is cleared on teardown (#3047).
+
 ## [0.11.8] - 2026-07-23
 
 ## [0.11.7] - 2026-07-22

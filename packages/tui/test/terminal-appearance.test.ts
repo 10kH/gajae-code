@@ -329,6 +329,57 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 
 		terminal.stop();
 	});
+
+	it("recovers appearance probing after the OSC 11 reply arrives but the DA1 sentinel is dropped (#3047)", () => {
+		vi.useFakeTimers();
+		const { terminal, queryCount, sentinelCount, received } = setupTerminal();
+		expect(queryCount()).toBe(1);
+		expect(sentinelCount()).toBe(1);
+
+		// OSC 11 reply arrives; the DA1 sentinel is dropped by the multiplexer.
+		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+
+		// The 2s poll cannot start a new query while the sentinel is still
+		// outstanding — pre-fix this latched forever (only re-queuing).
+		vi.advanceTimersByTime(2_000);
+		expect(queryCount()).toBe(1);
+
+		// The 3s watchdog abandons the stalled cycle and the queued poll re-arms.
+		vi.advanceTimersByTime(1_100);
+		expect(queryCount()).toBe(2);
+		expect(sentinelCount()).toBe(2);
+		expect(received).toEqual([]);
+
+		terminal.stop();
+	});
+
+	it("recovers appearance probing when both the OSC 11 and DA1 replies are dropped (#3047)", () => {
+		vi.useFakeTimers();
+		const { terminal, queryCount } = setupTerminal();
+		expect(queryCount()).toBe(1);
+
+		// No replies at all; a poll only queues behind the in-flight cycle.
+		vi.advanceTimersByTime(2_000);
+		expect(queryCount()).toBe(1);
+
+		// Watchdog fires and re-arms the queued query.
+		vi.advanceTimersByTime(1_100);
+		expect(queryCount()).toBe(2);
+
+		terminal.stop();
+	});
+
+	it("clears the OSC 11 watchdog on stop() so no probe fires after teardown (#3047)", () => {
+		vi.useFakeTimers();
+		const { terminal, queryCount } = setupTerminal();
+		expect(queryCount()).toBe(1);
+
+		// Stop with a cycle still in flight (replies dropped); teardown must clear
+		// both the poll and the watchdog so nothing fires afterward.
+		terminal.stop();
+		vi.advanceTimersByTime(10_000);
+		expect(queryCount()).toBe(1);
+	});
 });
 
 describe("ProcessTerminal raw-Buffer stdin (issue #454)", () => {
