@@ -302,6 +302,31 @@ export function isCanonicalGjcWorkflowSkill(skill: string): skill is CanonicalGj
 	return (CANONICAL_GJC_WORKFLOW_SKILLS as readonly string[]).includes(skill);
 }
 
+/**
+ * Phases that are not manifest-terminal but are blocked on a human or leader
+ * action, so an autonomous compaction continuation must not wake them.
+ */
+const HUMAN_BLOCKED_WORKFLOW_PHASES: Readonly<Partial<Record<CanonicalGjcWorkflowSkill, ReadonlySet<string>>>> = {
+	team: new Set(["awaiting_integration"]),
+	ultragoal: new Set(["blocked"]),
+};
+
+/**
+ * Continuation inertness for compaction auto-continue, derived from each
+ * workflow's manifest contract: manifest-terminal and human-blocked phases are
+ * inert; unknown skills or phases unknown to the skill's manifest are
+ * conservatively inert so a synthetic continuation never wakes an unrecognized
+ * workflow.
+ */
+export function isWorkflowContinuationInert(skill: string, phase: string): boolean {
+	const normalizedPhase = phase.trim().toLowerCase();
+	if (!isCanonicalGjcWorkflowSkill(skill)) return true;
+	const manifest = getSkillManifest(skill);
+	if (manifest.terminalStates.some(terminal => terminal.toLowerCase() === normalizedPhase)) return true;
+	if (HUMAN_BLOCKED_WORKFLOW_PHASES[skill]?.has(normalizedPhase)) return true;
+	return !manifest.states.some(state => state.id.toLowerCase() === normalizedPhase);
+}
+
 export function listActiveSkills(raw: unknown): SkillActiveEntry[] {
 	if (!raw || typeof raw !== "object") return [];
 	const state = raw as SkillActiveState;

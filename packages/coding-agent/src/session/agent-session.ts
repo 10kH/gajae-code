@@ -83,6 +83,7 @@ import type {
 	ProviderSessionState,
 	ServiceTier,
 	SimpleStreamOptions,
+	StopReason,
 	TextContent,
 	ToolCall,
 	ToolChoice,
@@ -312,6 +313,7 @@ import { deobfuscateSessionContext, type SecretObfuscator } from "../secrets/obf
 import { formatNoCredentialOnboardingError, formatNoModelOnboardingError } from "../setup/model-onboarding-guidance";
 import {
 	isCanonicalGjcWorkflowSkill,
+	isWorkflowContinuationInert,
 	readVisibleSkillActiveState,
 	syncSkillActiveState,
 } from "../skill-state/active-state";
@@ -423,6 +425,25 @@ import { getEntriesForInternalRead, getSessionContextForInternalRead } from "./s
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { pruneSupersededMaintenanceReminders, pruneSupersededVolatileProjectContext } from "./volatile-context-pruning";
 import { YieldQueue } from "./yield-queue";
+
+interface CompactionStateSnapshot {
+	goal: { objective: string; status: Goal["status"] } | undefined;
+	openTodos: string[];
+	activeSkills: Array<{ skill: string; phase: string }>;
+	queuedMessages: boolean;
+	lastAssistantStopReason: StopReason | undefined;
+}
+
+/** Escape XML-ish metacharacters and flatten newlines so state text cannot break compaction prompt framing. */
+function sanitizeCompactionStateText(value: string, maxLength: number): string {
+	return value
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/\r\n/g, " ")
+		.replace(/[\r\n]/g, " ")
+		.slice(0, maxLength);
+}
 
 /** Session-specific events that extend the core AgentEvent */
 export type AutoCompactionContinuationSkipReason = "auto_continue_disabled_non_resumable_tail";
@@ -9022,50 +9043,84 @@ export class AgentSession {
 		this.setTodoPhases(phases.filter(p => p.tasks.length > 0));
 	}
 
-	async #compactionStateContext(): Promise<string[]> {
-		const context: string[] = [];
+	async #compactionStateSnapshot(): Promise<CompactionStateSnapshot> {
+		const snapshot: CompactionStateSnapshot = {
+			goal: undefined,
+			openTodos: [],
+			activeSkills: [],
+			queuedMessages: false,
+			lastAssistantStopReason: undefined,
+		};
 		try {
 			const goal = this.getGoalModeState()?.goal;
-			if (goal) context.push(`Active goal: ${goal.objective.slice(0, 160)} (status: ${goal.status})`);
+			if (goal) snapshot.goal = { objective: goal.objective, status: goal.status };
 		} catch {
-			// State context is best-effort.
-		}
-		try {
-			const state = await readVisibleSkillActiveState(this.sessionManager.getCwd(), this.sessionId, { tier: "hud" });
-			for (const entry of (state?.active_skills ?? []).filter(entry => entry.active !== false).slice(0, 5)) {
-				const skill = entry.skill.slice(0, 100);
-				const phase = (entry.phase ?? "unknown").slice(0, 80);
-				if (skill) context.push(`Active skill: ${skill} phase=${phase}`);
-			}
-		} catch {
-			// State context is best-effort.
+			// State snapshot is best-effort.
 		}
 		try {
 			const todos = this.getTodoPhases()
 				.flatMap(phase => phase.tasks)
 				.filter(task => task.status === "pending" || task.status === "in_progress")
 				.slice(0, 10)
-				.map(task => task.content.slice(0, 120));
-			if (todos.length > 0) context.push(`Open todos: ${todos.join("; ")}`);
+				.map(task => task.content);
+			snapshot.openTodos = todos;
 		} catch {
-			// State context is best-effort.
+			// State snapshot is best-effort.
+		}
+		try {
+			const state = await readVisibleSkillActiveState(this.sessionManager.getCwd(), this.sessionId, { tier: "hud" });
+			snapshot.activeSkills = (state?.active_skills ?? [])
+				.filter(entry => entry.active !== false)
+				.slice(0, 5)
+				.map(entry => ({ skill: entry.skill, phase: entry.phase ?? "unknown" }));
+		} catch {
+			// State snapshot is best-effort.
+		}
+		try {
+			snapshot.queuedMessages = this.agent.hasQueuedMessages();
+		} catch {
+			// State snapshot is best-effort.
+		}
+		try {
+			for (let index = this.messages.length - 1; index >= 0; index--) {
+				const message = this.messages[index];
+				if (message.role !== "assistant") continue;
+				snapshot.lastAssistantStopReason = (message as AssistantMessage).stopReason;
+				break;
+			}
+		} catch {
+			// State snapshot is best-effort.
+		}
+		return snapshot;
+	}
+
+	#compactionStateContext(snapshot: CompactionStateSnapshot): string[] {
+		const context: string[] = [];
+		if (snapshot.goal) {
+			context.push(
+				`Active goal: ${sanitizeCompactionStateText(snapshot.goal.objective, 160)} (status: ${sanitizeCompactionStateText(snapshot.goal.status, 40)})`,
+			);
+		}
+		for (const entry of snapshot.activeSkills) {
+			const skill = sanitizeCompactionStateText(entry.skill, 100);
+			const phase = sanitizeCompactionStateText(entry.phase, 80);
+			if (skill) context.push(`Active skill: ${skill} phase=${phase}`);
+		}
+		if (snapshot.openTodos.length > 0) {
+			const todos = snapshot.openTodos.map(todo => sanitizeCompactionStateText(todo, 120));
+			context.push(`Open todos: ${todos.join("; ")}`);
 		}
 		return context;
 	}
 
-	#hasUnfinishedWork(): boolean {
-		const goal = this.getGoalModeState()?.goal;
+	#hasUnfinishedWork(snapshot: CompactionStateSnapshot): boolean {
 		// A paused goal is parked on human input; it must not drive autonomous
 		// continuation (matching goal-mode pause semantics).
-		if (goal && goal.status === "active") return true;
-		if (
-			this.getTodoPhases().some(phase =>
-				phase.tasks.some(task => task.status === "pending" || task.status === "in_progress"),
-			)
-		) {
-			return true;
-		}
-		return this.agent.hasQueuedMessages();
+		if (snapshot.goal?.status === "active") return true;
+		if (snapshot.openTodos.length > 0) return true;
+		if (snapshot.queuedMessages) return true;
+		if (snapshot.lastAssistantStopReason === "length") return true;
+		return snapshot.activeSkills.some(entry => !isWorkflowContinuationInert(entry.skill, entry.phase));
 	}
 
 	async #applyCompactionPostAppend(
@@ -10891,7 +10946,8 @@ export class AgentSession {
 	async #pruneToolOutputs(
 		signal?: AbortSignal,
 		overThreshold = false,
-	): Promise<{ prunedCount: number; tokensSaved: number } | undefined> {
+		options?: { commitGate?: (actual: { prunedCount: number; tokensSaved: number }) => boolean },
+	): Promise<{ prunedCount: number; tokensSaved: number; committed: boolean } | undefined> {
 		const branchEntries = this.sessionManager.getBranch();
 		const artifactManager = this.sessionManager.getArtifactManager();
 		const prunedArtifacts: Array<{ entryId: string; id: string; toolType: string; originalText: string }> = [];
@@ -10973,6 +11029,27 @@ export class AgentSession {
 		if (prunedCount === 0 || signal?.aborted) {
 			return undefined;
 		}
+		if (options?.commitGate && !options.commitGate({ prunedCount, tokensSaved })) {
+			// Roll back staged artifact publications; removal failures are logged,
+			// never masked as a clean rollback.
+			let unremovedArtifacts = 0;
+			for (const artifact of prunedArtifacts) {
+				if (failedArtifactEntryIds.has(artifact.entryId)) continue;
+				const removed =
+					(await artifactManager?.removeNamedBestEffort(`${artifact.id}.${artifact.toolType}.log`)) ?? false;
+				if (!removed) {
+					unremovedArtifacts++;
+					logger.warn("Failed to roll back staged pruned-output artifact", { artifactId: artifact.id });
+				}
+			}
+			logger.info("Below-threshold maintenance pruning staged but not committed", {
+				prunedCount,
+				tokensSaved,
+				rolledBackArtifacts: prunedArtifacts.length - failedArtifactEntryIds.size - unremovedArtifacts,
+				unremovedArtifacts,
+			});
+			return { prunedCount, tokensSaved, committed: false };
+		}
 
 		// getBranch() returns materialized copies for blob-externalized entries, so
 		// the pruning mutations must be written back into the canonical store.
@@ -10987,7 +11064,7 @@ export class AgentSession {
 		this.#resetInjectedContextSignatures();
 		this.#syncTodoPhasesFromBranch();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
-		return { prunedCount, tokensSaved };
+		return { prunedCount, tokensSaved, committed: true };
 	}
 
 	/**
@@ -11033,9 +11110,26 @@ export class AgentSession {
 			return;
 		}
 
-		const pruneResult = await this.#pruneToolOutputs();
+		const pruneResult = await this.#pruneToolOutputs(undefined, false, {
+			commitGate: actual => actual.tokensSaved > cacheEpochResetCost,
+		});
 		if (!pruneResult || pruneResult.prunedCount === 0) return;
-
+		if (!pruneResult.committed) {
+			const message = `Maintenance pruning skipped: actual savings ${pruneResult.tokensSaved} tokens <= cache-epoch reset cost ${cacheEpochResetCost} after artifact notices/publication rollback.`;
+			await this.#emitSessionEvent({
+				type: "notice",
+				level: "info",
+				source: "maintenance-prune",
+				message,
+			});
+			logger.info("Below-threshold maintenance pruning skipped", {
+				tokensSaved: pruneResult.tokensSaved,
+				prunedCount: pruneResult.prunedCount,
+				cacheEpochResetCost,
+				minSavings: compactionSettings.maintenancePruningMinSavingsTokens,
+			});
+			return;
+		}
 		const resetReason =
 			pruneResult.tokensSaved > cacheEpochResetCost
 				? `below-threshold maintenance: reclaimed ${pruneResult.tokensSaved} tokens > cache-epoch reset cost ${cacheEpochResetCost}`
@@ -11073,6 +11167,8 @@ export class AgentSession {
 			await this.abort();
 			const compactionAbortController = new AbortController();
 			this.#compactionAbortController = compactionAbortController;
+			// Take this invocation's state snapshot for the summarizer context.
+			const compactionStateSnapshot = await this.#compactionStateSnapshot();
 
 			try {
 				if (!this.model) {
@@ -11118,7 +11214,11 @@ export class AgentSession {
 					}
 				}
 
-				const compactionPrep = await this.#prepareCompactionFromHooks(preparation, hookCompaction);
+				const compactionPrep = await this.#prepareCompactionFromHooks(
+					preparation,
+					hookCompaction,
+					compactionStateSnapshot,
+				);
 
 				let summary: string;
 				let shortSummary: string | undefined;
@@ -12926,6 +13026,7 @@ export class AgentSession {
 	async #prepareCompactionFromHooks(
 		preparation: CompactionPreparation,
 		hookCompaction: CompactionResult | undefined,
+		stateSnapshot: CompactionStateSnapshot,
 	): Promise<
 		| {
 				kind: "fromHook";
@@ -12965,7 +13066,8 @@ export class AgentSession {
 			hookContext = hookContext ? [...hookContext, memoryBackendContext] : [memoryBackendContext];
 		}
 
-		const stateContext = await this.#compactionStateContext();
+		const stateContext = this.#compactionStateContext(stateSnapshot);
+
 		if (stateContext.length > 0) {
 			hookContext = hookContext ? [...hookContext, ...stateContext] : stateContext;
 		}
@@ -13008,7 +13110,8 @@ export class AgentSession {
 		if (!options?.force && compactionSettings.strategy === "off") return { kind: "skipped" };
 		if (!options?.force && reason !== "idle" && !compactionSettings.enabled) return { kind: "skipped" };
 		const generation = this.#promptGeneration;
-		const hadUnfinishedWork = this.#hasUnfinishedWork();
+		const compactionStateSnapshot = await this.#compactionStateSnapshot();
+		const hadUnfinishedWork = this.#hasUnfinishedWork(compactionStateSnapshot);
 		if (
 			options?.deferHandoffMaintenance !== false &&
 			!deferred &&
@@ -13091,7 +13194,8 @@ export class AgentSession {
 					});
 					if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
 					if (continueAfterMaintenance && reason !== "idle" && compactionSettings.autoContinue !== false) {
-						if (hadUnfinishedWork || this.#hasUnfinishedWork()) this.#scheduleAutoContinuePrompt(generation);
+						if (hadUnfinishedWork || this.#hasUnfinishedWork(await this.#compactionStateSnapshot()))
+							this.#scheduleAutoContinuePrompt(generation);
 						else this.emitNotice("info", "Auto-continue skipped: no unfinished work detected");
 					}
 
@@ -13192,7 +13296,8 @@ export class AgentSession {
 						onError: error => this.#logCompactionContinuationError("queued_continue", error),
 					});
 				} else if (continueAfterMaintenance && reason !== "idle" && compactionSettings.autoContinue !== false) {
-					if (hadUnfinishedWork || this.#hasUnfinishedWork()) this.#scheduleAutoContinuePrompt(generation);
+					if (hadUnfinishedWork || this.#hasUnfinishedWork(await this.#compactionStateSnapshot()))
+						this.#scheduleAutoContinuePrompt(generation);
 					else this.emitNotice("info", "Auto-continue skipped: no unfinished work detected");
 				}
 				return { kind: "skipped" };
@@ -13229,7 +13334,11 @@ export class AgentSession {
 				}
 			}
 
-			const compactionPrep = await this.#prepareCompactionFromHooks(preparation, hookCompaction);
+			const compactionPrep = await this.#prepareCompactionFromHooks(
+				preparation,
+				hookCompaction,
+				compactionStateSnapshot,
+			);
 			if (autoCompactionSignal.aborted) return await emitAborted();
 
 			let summary: string;
@@ -13438,7 +13547,8 @@ export class AgentSession {
 					onError: error => this.#logCompactionContinuationError("queued_continue", error),
 				});
 			} else if (continueAfterMaintenance && reason !== "idle" && compactionSettings.autoContinue !== false) {
-				if (hadUnfinishedWork || this.#hasUnfinishedWork()) this.#scheduleAutoContinuePrompt(generation);
+				if (hadUnfinishedWork || this.#hasUnfinishedWork(await this.#compactionStateSnapshot()))
+					this.#scheduleAutoContinuePrompt(generation);
 				else this.emitNotice("info", "Auto-continue skipped: no unfinished work detected");
 			}
 			return { kind: "compacted" };
