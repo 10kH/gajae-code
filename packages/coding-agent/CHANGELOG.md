@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.11.9] - 2026-07-24
+
 ### Fixed
 
 - Alibaba Token Plan canonical first-event timeouts now surface without session retry/fallback replay and are not internally retried by auto-compaction, preventing repeated provider usage (#3026).

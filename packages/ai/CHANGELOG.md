@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.11.9] - 2026-07-24
 ### Fixed
 
 - Kimi Code now allows one continuous 300-second first-event wait before aborting, while preserving explicit caller and environment timeout overrides and the existing inter-event idle timeout.
