@@ -2217,11 +2217,11 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 while generation 26 adds bounded reload and lazy topic lifecycle safeguards", () => {
+	test("keeps wire protocol 3 while generation 27 refreshes retained native authority", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		// Generation 25 preserves #2958 startup dead-root prune + leak-artifact
-		// self-heal; generation 26 adds #2956/#2960 bounded reload and lazy topics.
-		expect(DAEMON_GENERATION).toBe(26);
+		// Generation 26 preserves bounded reload and lazy topic safeguards;
+		// generation 27 refreshes retained native path and process authority.
+		expect(DAEMON_GENERATION).toBe(27);
 	});
 
 	test("#2028 reloads a fully-provenanced owner without a generation", async () => {
