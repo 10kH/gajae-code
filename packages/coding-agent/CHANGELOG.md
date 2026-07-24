@@ -9,6 +9,7 @@
 - SDK daemon CLI end-to-end tests now drain spawned child stdout and stderr concurrently with process exit, preventing CI pipe teardown races from replacing the product exit contract with SIGPIPE status 141 (#3024).
 - Interactive launch bootstrap is now suppressed for parser-accepted `--print=`, `--help=`, and `--version=` equals forms, keeping non-interactive output free of the warming-workspace preamble on TTYs.
 
+- Rejected subagent schema payloads now retain their complete structured data in canonical output artifacts; inline results remain bounded while `agent://` output stays lossless (#2894).
 ## [0.11.8] - 2026-07-23
 ### Added
 
