@@ -1297,6 +1297,10 @@ pub(crate) mod platform {
 		Ok(named)
 	}
 
+	#[allow(
+		clippy::missing_const_for_fn,
+		reason = "the macOS alias branch constructs a canonical owned path"
+	)]
 	fn descriptor_walk_path(path: &Path) -> Cow<'_, Path> {
 		#[cfg(target_os = "macos")]
 		{
@@ -1397,21 +1401,22 @@ pub(crate) mod platform {
 		}
 		// SAFETY: current is retained, name is validated and NUL-terminated, and
 		// O_NOFOLLOW rejects symlinks.
-		let mut target_fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+		let target_fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
 		#[cfg(target_os = "macos")]
-		if target_fd < 0 && !is_directory {
+		let target_fd = if target_fd < 0 && !is_directory {
 			let read_error = std::io::Error::last_os_error();
 			if read_error.raw_os_error() == Some(libc::EACCES) {
 				// A hostile macOS ACL may deny reads while leaving owner writes
 				// available. Retry only that denial with write authority so ACLs can
 				// be inspected and repaired without changing file contents.
 				// SAFETY: this retries the same retained parent and validated final component.
-				target_fd =
-					unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags | libc::O_WRONLY) };
+				unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags | libc::O_WRONLY) }
 			} else {
 				return Err(NativeOwnerOnlySecurityResult::failure(security_code(&read_error)));
 			}
-		}
+		} else {
+			target_fd
+		};
 		if target_fd < 0 {
 			return Err(NativeOwnerOnlySecurityResult::failure(security_code(
 				&std::io::Error::last_os_error(),
