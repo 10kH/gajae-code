@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The built-in `Claude Opus`, `Opus + Codex`, and `Fable + Opus + Codex` model profiles now target **Claude Opus 5** (`claude-opus-5`) instead of Opus 4.8 for their Anthropic roles — the newest, same-priced Opus.
+
 ### Fixed
 
 - Interactive prompt cancellation now reaches API-key preflight through `ModelRegistry`, allowing aborted submissions to clear immediately even while a shared credential-usage request continues in the background.
