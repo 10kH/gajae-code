@@ -7,6 +7,7 @@ import {
 	resolveMemoryGuardPolicy,
 	revalidateMemoryGuardAction,
 } from "../../src/runtime/memory-guard";
+import { __sampleWindowsJobMemoryForTest } from "../../src/tools/resource-gc";
 
 describe("resolveMemoryGuardPolicy", () => {
 	it("stays disabled by default and converts MB values to bytes", () => {
@@ -161,5 +162,71 @@ describe("MemoryGuardHost", () => {
 		expect(finalState.pendingDeadline).toBe(3_000);
 
 		unreg();
+	});
+});
+
+describe("__sampleWindowsJobMemoryForTest", () => {
+	it("samples uncapped Job Object without clamping to physical RAM", () => {
+		const ram16Gb = 16 * 1024 * 1024 * 1024;
+		const rss2Gb = 2 * 1024 * 1024 * 1024;
+		const commit20Gb = 20 * 1024 * 1024 * 1024;
+		const snapshot = __sampleWindowsJobMemoryForTest(ram16Gb, rss2Gb, {
+			kind: "job_snapshot",
+			platform: "win32",
+			isInJob: true,
+			jobMemoryUsedBytes: String(commit20Gb),
+			processWorkingSetBytes: String(rss2Gb),
+			processPrivateUsageBytes: String(rss2Gb),
+		});
+
+		if (!snapshot) throw new Error("expected snapshot");
+		const jobDomain = snapshot.domains?.find(d => d.source === "windows_job");
+		expect(jobDomain).toBeDefined();
+		expect(jobDomain?.hardCapBytes).toBe(Number.MAX_SAFE_INTEGER);
+		expect(jobDomain?.totalUsageBytes).toBe(commit20Gb);
+
+		const policyLimit24Gb = 24 * 1024 * 1024 * 1024;
+		const usageRatio = snapshot.totalUsageBytes / policyLimit24Gb;
+
+		expect(usageRatio).toBeLessThan(1);
+	});
+
+	it("samples capped Job Object and process working set domains", () => {
+		const ram16Gb = 16 * 1024 * 1024 * 1024;
+		const rss2Gb = 2 * 1024 * 1024 * 1024;
+		const jobLimit8Gb = 8 * 1024 * 1024 * 1024;
+		const jobUsage4Gb = 4 * 1024 * 1024 * 1024;
+		const snapshot = __sampleWindowsJobMemoryForTest(ram16Gb, rss2Gb, {
+			kind: "job_snapshot",
+			platform: "win32",
+			isInJob: true,
+			jobMemoryLimitBytes: String(jobLimit8Gb),
+			jobMemoryUsedBytes: String(jobUsage4Gb),
+			processMemoryLimitBytes: String(jobLimit8Gb),
+			processPrivateUsageBytes: String(rss2Gb),
+			processWorkingSetBytes: String(rss2Gb),
+		});
+
+		if (!snapshot) throw new Error("expected snapshot");
+		const jobDomain = snapshot.domains?.find(d => d.source === "windows_job");
+		expect(jobDomain).toBeDefined();
+		expect(jobDomain?.hardCapBytes).toBe(jobLimit8Gb);
+		expect(jobDomain?.totalUsageBytes).toBe(jobUsage4Gb);
+	});
+
+	it("returns null for non-job_snapshot probe results", () => {
+		expect(
+			__sampleWindowsJobMemoryForTest(1000, 100, {
+				kind: "unsupported_platform",
+				platform: "linux",
+			}),
+		).toBeNull();
+		expect(
+			__sampleWindowsJobMemoryForTest(1000, 100, {
+				kind: "not_in_job",
+				platform: "win32",
+				isInJob: false,
+			}),
+		).toBeNull();
 	});
 });
