@@ -31,6 +31,7 @@
 
 - Managed model fallback now gives each exhausted entry at most one retry with a rotated credential before advancing, so repeated quota failures cannot consume the attempts reserved for downstream models.
 - Telegram notification topics now fence malformed successful `createForumTopic` responses per session endpoint, preventing repeated ambiguous topic creation while keeping explicit Bot API failures retryable.
+- macOS queue controls are now discoverable and platform-native throughout the composer, status/help surfaces, and queue editor: Option+Q queues while busy, Option+Up/Down selects queued messages, and the queue pane documents edit/remove/reorder controls. Added Windows-to-macOS default-shortcut parity coverage and terminal guidance for Option-as-Meta, enhanced protocols, and Control-key remaps.
 - Windows managed-session resume no longer reports `durability_failed` when Bun rejects `fsync` on the read-only descriptor used to revalidate an existing canonical binding; Windows now uses an owner-writable descriptor for that durability fence while retaining no-follow and pre/post identity/content checks.
 - SDK daemon CLI end-to-end tests now capture spawned child stdout and stderr through temporary files instead of pipes, removing the CI pipe teardown race that replaced the product exit contract with SIGPIPE status 141 (#3024).
 - Interactive launch bootstrap is now suppressed for parser-accepted `--print=`, `--help=`, and `--version=` equals forms, keeping non-interactive output free of the warming-workspace preamble on TTYs.
