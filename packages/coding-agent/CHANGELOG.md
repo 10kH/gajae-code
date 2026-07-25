@@ -10,6 +10,7 @@
 ## [0.11.9] - 2026-07-24
 
 ### Fixed
+- Mouse support can now be enabled inside tmux and screen with `mouse.enabled: true`, so the wheel scrolls GJC's virtual session viewport before multiplexer scrollback. Dragging highlights rendered terminal text and copies it to the system clipboard on release while GJC owns mouse input. Mouse support remains disabled by default to preserve native terminal or tmux scrollback and selection behavior.
 
 - The synchronous `local://` resolver now accepts a `cleanup_pending` legacy-migration marker instead of rejecting it as unsafe. The async gate already treats that state as settled — entries are installed and content-verified, and only retirement of the legacy source is outstanding — so a managed session whose migration ended in `cleanup_pending` previously failed closed with "Unsafe local:// migration marker" on every `local://` read even though `initializeLocalRoot()` had succeeded. Both marker checks now share one settled-state definition; unrecognized marker values are still rejected. Follow-up to #3080; the asymmetry has been reachable since #2797.
 - Restricted role-agent `bash` now accepts literal mid-word tildes, so git revision syntax such as `git diff HEAD~1` no longer has to be quoted. Bash performs tilde expansion only at the start of a word, so word-initial forms (`~`, `~/path`, `~user`) remain blocked.
