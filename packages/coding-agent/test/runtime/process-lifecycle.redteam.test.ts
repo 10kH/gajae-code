@@ -102,8 +102,10 @@ describe("process-lifecycle adversarial owned-process invariants", () => {
 		const before = liveOwnedProcessCount();
 		const tmp = `/tmp/gjc-process-lifecycle-${process.pid}-${Date.now()}`;
 		const owner = spawnOwnedProcess(
-			["sh", "-c", `trap 'echo term >> ${tmp}; exit 0' TERM; echo up > ${tmp}; while :; do sleep 1; done`],
-			{ name: "redteam-concurrent-dispose", gracefulMs: 500 },
+			// `sh` runs a TERM trap only after the current foreground command returns, so the
+			// polling interval must stay well under `gracefulMs` or SIGKILL beats the handler.
+			["sh", "-c", `trap 'echo term >> ${tmp}; exit 0' TERM; echo up > ${tmp}; while :; do sleep 0.05; done`],
+			{ name: "redteam-concurrent-dispose", gracefulMs: 2_000 },
 		);
 		try {
 			await waitForAsync(() => fileContains(tmp, "up"), 2_000, "child readiness marker");
