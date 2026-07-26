@@ -1,6 +1,8 @@
-# Changelog
-
 ## [Unreleased]
+
+### Fixed
+
+- Post-merge Dev CI: update SDK operation matrix length pins for `model.profile.set` (C53) added by #3191 so registry bijection and control-count gates match the generated inventory.
 
 ### Added
 
@@ -18,6 +20,11 @@
 - `gjc deep-interview apply-round-result` no longer fails with `DI_INTERNAL_ERROR` on every call, which made the deep-interview workflow unable to score a single round. Three defects stacked: the Round-0 topology gate is recorded as a permanently unscorable `answered` shell (`--round` must be >= 1) yet counted toward the "earlier rounds must be scored" precondition, deadlocking every later round; the round-result decoder materializes omitted optional keys as `undefined`, which canonical JSON rejected outright, so any request omitting `targeting`/`ontology`/`bookkeeping` could not be digested; and `scoreToUnits` tested the raw float product, so ordinary scores whose scaling misses the integer grid (`0.69 * 10_000` is `6900.000000000001`) were rejected as non-integral 1e-4 units. Round-0 gate shells are now excluded from the ordering precondition, canonical JSON drops `undefined` object properties like `JSON.stringify` (array elements and the top-level value stay strict), and 1e-4 unit conversion is decided from the shortest round-trip decimal so genuinely off-grid precision such as `0.00005` and `0.05000000000000001` is still rejected.
 - Task output-limit environment overrides now accept only complete positive decimal safe integers; malformed, fractional, exponent-form, whitespace-padded, and precision-losing values fall back to the documented defaults instead of being partially parsed (#3175).
 - Task output-limit environment overrides now honor values loaded from agent, config-root, and home dotenv files through the shared utils env loader while retaining strict positive safe-integer validation and canonical GJC-first alias precedence.
+- MCP servers configured with a large `timeout` no longer widen the startup hang window for every consumer. The long startup ceiling now applies only to ACP lifecycle launches that supply their own MCP servers, derived from the session readiness deadline with reserved headroom; ordinary CLI/SDK `mcpConfigPath`, project, user, and plugin-bundle consumers keep the short default. An ACP launch that reaches the readiness cutoff before MCP startup now fails fast as a pending startup instead of silently falling back to the ordinary ceiling.
+
+### Added
+
+- JetBrains Air ACP sessions now preserve final answers across fast prompt completion, expose tool/retry/goal/notices and session title updates, apply Air's legacy `session/set_model` preset changes through the canonical session configuration path, accept client-supplied stdio/HTTP/SSE MCP servers, reject unsupported additional directories, and reject unavailable model presets before provider dispatch.
 
 ## [0.11.10] - 2026-07-25
 ### Changed
@@ -25,7 +32,6 @@
 - The built-in `claude-opus`, `opus-codex`, and `fable-opus-codex` presets now use `anthropic/claude-opus-5` instead of `anthropic/claude-opus-4-8`, with effort suffixes preserved; `packages/ai/src/models.json` was regenerated so `anthropic/claude-opus-5` resolves; non-opus roles (`anthropic/claude-sonnet-5` executor/planner overrides, codex and fable roles) are unchanged.
 
 ## [0.11.9] - 2026-07-24
-
 ### Fixed
 - Mouse support can now be enabled inside tmux and screen with `mouse.enabled: true`, so the wheel scrolls GJC's virtual session viewport before multiplexer scrollback. Dragging highlights rendered terminal text and copies it to the system clipboard on release while GJC owns mouse input. Mouse support remains disabled by default to preserve native terminal or tmux scrollback and selection behavior.
 
