@@ -4352,6 +4352,7 @@ export class SessionManager {
 	#needsFullRewriteOnNextPersist: boolean = false;
 	#ensuredOnDisk: boolean = false;
 	#recoveryHydrationContext: RecoveryHydrationContext | undefined;
+	#recoveryPromotionTranscriptPath: string | undefined;
 	#memoryGuardParticipantIngressToken: symbol | undefined;
 	#fileEntries: FileEntry[] = [];
 	#pendingStrictAdoption: { canonicalPath: string; identity: ResumeSessionIdentity } | undefined;
@@ -9006,15 +9007,30 @@ export class SessionManager {
 			destination.directory,
 			`.${input.checkpoint.session_id}.memory-guard.${crypto.randomUUID()}.jsonl`,
 		);
+		const transcriptName = path.basename(transcriptPath);
+		const managedStagingStore =
+			destination.kind === "managed"
+				? managedStoreFromContext(destination.securityContext, destination.directory)
+				: undefined;
+		const cleanupTranscript = async (): Promise<void> => {
+			if (managedStagingStore) {
+				await managedStagingStore.remove(transcriptName).catch(() => undefined);
+				return;
+			}
+			await fs.promises.rm(transcriptPath, { force: true }).catch(() => undefined);
+		};
 		let opened: RecoveryHydrationOpenResult;
 		let transcriptIdentity: ResumeSessionIdentity;
 		let createdDestination: CreatedDirectoryIdentity | undefined;
 		try {
-			createdDestination = await ensureOwnerOnlyDirectoryTracked(destination.directory);
-			await writeOwnerOnlyFileNoReplace(transcriptPath, transcriptData);
+			if (managedStagingStore) await managedStagingStore.publishNoReplace(transcriptName, transcriptData);
+			else {
+				createdDestination = await ensureOwnerOnlyDirectoryTracked(destination.directory);
+				await writeOwnerOnlyFileNoReplace(transcriptPath, transcriptData);
+			}
 			const captured = SessionManager.captureTranscriptStrict(transcriptPath, storage);
 			if (captured.kind !== "captured") {
-				await fs.promises.rm(transcriptPath, { force: true }).catch(() => undefined);
+				await cleanupTranscript();
 				await removeCreatedDirectoryIfEmpty(destination.directory, createdDestination);
 				return { kind: "blocked", reason: captured.reason };
 			}
@@ -9025,12 +9041,12 @@ export class SessionManager {
 				storage,
 			);
 		} catch {
-			await fs.promises.rm(transcriptPath, { force: true }).catch(() => undefined);
+			await cleanupTranscript();
 			await removeCreatedDirectoryIfEmpty(destination.directory, createdDestination);
 			return { kind: "blocked", reason: "destination-unavailable" };
 		}
 		if (opened.kind === "error") {
-			await fs.promises.rm(transcriptPath, { force: true }).catch(() => undefined);
+			await cleanupTranscript();
 			await removeCreatedDirectoryIfEmpty(destination.directory, createdDestination);
 			return { kind: "blocked", reason: opened.reason };
 		}
@@ -9039,16 +9055,29 @@ export class SessionManager {
 			(opened.manager.getSessionName() ?? null) !== input.checkpoint.session_name
 		) {
 			await opened.manager.close();
-			await fs.promises.rm(transcriptPath, { force: true }).catch(() => undefined);
+			await cleanupTranscript();
 			await removeCreatedDirectoryIfEmpty(destination.directory, createdDestination);
 			return { kind: "blocked", reason: "transcript-mismatch" };
 		}
 		opened.manager.#stageMemoryGuardCheckpointBlobs(checkpointBlobs);
+		opened.manager.#recoveryPromotionTranscriptPath = path.join(
+			destination.directory,
+			`${new Date().toISOString().replace(/[:.]/g, "-")}_${input.checkpoint.session_id}.jsonl`,
+		);
+		let cleanupConsumed = false;
+		const cleanup = async (): Promise<void> => {
+			if (cleanupConsumed) return;
+			cleanupConsumed = true;
+			await opened.manager.close();
+			await cleanupTranscript();
+			await removeCreatedDirectoryIfEmpty(destination.directory, createdDestination);
+		};
 		return {
 			kind: "staged",
 			manager: opened.manager,
 			hydrationContext: opened.context,
 			transcriptIdentity,
+			cleanup,
 		};
 	}
 
@@ -9126,7 +9155,25 @@ export class SessionManager {
 			this.#memoryGuardCheckpointBlobs = undefined;
 		}
 		await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
-		writeTerminalBreadcrumb(this.cwd, context.identity.canonicalPath);
+		const promotionPath = this.#recoveryPromotionTranscriptPath;
+		if (!promotionPath) throw new Error("Recovery transcript promotion path is unavailable.");
+		const promotedSource = inspectResumeSessionFile(context.identity.canonicalPath, this.storage);
+		if ("kind" in promotedSource) throw new Error("Recovery transcript became unavailable before publication.");
+		if (this.destination.kind === "managed") {
+			const store = this.#managedTranscriptStore();
+			const sourceName = path.basename(context.identity.canonicalPath);
+			const sourceSnapshot = store.readExpected(sourceName);
+			if (!sourceSnapshot) throw new Error("Recovery transcript authority changed before publication.");
+			await store.publishNoReplace(path.basename(promotionPath), promotedSource.content);
+			store.removeExpected(sourceName, sourceSnapshot);
+		} else {
+			await writeOwnerOnlyFileNoReplace(promotionPath, promotedSource.content);
+			await fs.promises.rm(context.identity.canonicalPath, { force: true });
+			await fsyncDirectoryPath(path.dirname(context.identity.canonicalPath));
+		}
+		this.#sessionFile = promotionPath;
+		this.#recoveryPromotionTranscriptPath = undefined;
+		writeTerminalBreadcrumb(this.cwd, promotionPath);
 		this.#recoveryHydrationContext = undefined;
 	}
 

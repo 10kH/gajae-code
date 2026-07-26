@@ -6470,19 +6470,19 @@ export class AgentSession {
 			staged.manager.getSessionId() !== staged.transcriptIdentity.sessionId ||
 			staged.hydrationContext.identity.sessionId !== staged.transcriptIdentity.sessionId
 		) {
-			await staged.manager.close();
+			await staged.cleanup();
 			return { kind: "blocked", reason: "transcript-mismatch" };
 		}
 		if (
 			!isMemoryGuardClaimsLease(claimsLease) ||
 			claimsLease.owner.sessionId !== staged.transcriptIdentity.sessionId
 		) {
-			await staged.manager.close();
+			await staged.cleanup();
 			return { kind: "blocked", reason: "claim-mismatch" };
 		}
 		const checkpointMessages = staged.manager.buildSessionContext().messages;
 		if (!util.isDeepStrictEqual(config.agent.state.messages, checkpointMessages)) {
-			await staged.manager.close();
+			await staged.cleanup();
 			return { kind: "blocked", reason: "agent-messages-mismatch" };
 		}
 		const session = new AgentSession({
@@ -6493,6 +6493,7 @@ export class AgentSession {
 		session.#memoryGuardClaimsLease = claimsLease;
 		if (session.recoveryHydrationContext !== staged.hydrationContext) {
 			await session.dispose();
+			await staged.cleanup();
 			return { kind: "blocked", reason: "hydration-context-mismatch" };
 		}
 		return {
@@ -8400,6 +8401,7 @@ export class AgentSession {
 			followUpQueuePolicy?: "respect-mode" | "sequential";
 		},
 	): Promise<void> {
+		this.#assertRecoveryHydrationPromoted();
 		const appMessage: CustomMessage<T> = {
 			role: "custom",
 			customType: message.customType,

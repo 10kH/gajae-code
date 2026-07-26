@@ -86,6 +86,7 @@ export type MemoryGuardRestoreResult =
 			manager: SessionManager;
 			hydrationContext: RecoveryHydrationContext;
 			transcriptIdentity: ResumeSessionIdentity;
+			cleanup: () => Promise<void>;
 	  }
 	| { kind: "blocked"; reason: MemoryGuardRestoreBlockedReason };
 

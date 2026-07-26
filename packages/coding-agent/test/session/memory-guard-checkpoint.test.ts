@@ -158,6 +158,10 @@ describe("memory guard checkpoint export/restore", () => {
 			);
 			await session.session.promoteRecoveryHydrationAfterOwnershipReadyFence(session.promotionFence);
 			expect(session.session.recoveryHydrationContext).toBeUndefined();
+			const promotedTranscript = session.session.sessionManager.getSessionFile();
+			expect(promotedTranscript).toBeDefined();
+			expect(path.basename(promotedTranscript!)).not.toStartWith(".");
+			expect(await Bun.file(promotedTranscript!).exists()).toBe(true);
 			await session.session.dispose();
 			await releaseMemoryGuardClaims(path.join(root, "claims"), claimsLease);
 		} finally {

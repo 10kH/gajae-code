@@ -63,7 +63,7 @@ describe("memory guard owner claims", () => {
 			]);
 			await expect(
 				releaseMemoryGuardClaims(stateDir, { ...lease, writerEpoch: lease.writerEpoch + 10 }),
-			).rejects.toThrow("memory_guard_claim_release_mismatch");
+			).rejects.toThrow("memory_guard_claim_lease_invalid");
 			const unchanged = await readMemoryGuardClaimsForTest(stateDir, claimOwner.sessionId);
 			expect(unchanged.claims).toHaveLength(2);
 			await releaseMemoryGuardClaims(stateDir, lease);

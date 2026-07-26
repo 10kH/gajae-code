@@ -297,6 +297,7 @@ export async function acquireMemoryGuardClaims(
 }
 
 export async function releaseMemoryGuardClaims(stateDir: string, claim: MemoryGuardClaimsLease): Promise<void> {
+	if (!issuedMemoryGuardClaimsLeases.has(claim)) throw new Error("memory_guard_claim_lease_invalid");
 	assertClaimOwner(claim.owner);
 	const { database } = await openClaimsDatabase(stateDir, claim.owner.sessionId);
 	try {
