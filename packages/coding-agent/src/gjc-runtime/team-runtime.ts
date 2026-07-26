@@ -1831,6 +1831,16 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 	const previousStartupAck = (await Bun.file(startupAckPath).exists())
 		? await Bun.file(startupAckPath).text()
 		: undefined;
+	const lifecyclePath = workerLifecyclePath(dir, worker.id);
+	const previousLifecycle = (await Bun.file(lifecyclePath).exists())
+		? await Bun.file(lifecyclePath).text()
+		: undefined;
+	const restorePredecessorStartupState = async (): Promise<void> => {
+		if (previousLifecycle === undefined) await fs.rm(lifecyclePath, { force: true });
+		else await Bun.write(lifecyclePath, previousLifecycle);
+		if (previousStartupAck === undefined) await fs.rm(startupAckPath, { force: true });
+		else await Bun.write(startupAckPath, previousStartupAck);
+	};
 	await fs.rm(startupAckPath, { force: true });
 	const replacementToken = input.replacementToken ?? randomUUID();
 	const startupAckTimeoutMs = parseDurationEnv(input.env, "GJC_TEAM_MEMORY_GUARD_STARTUP_TIMEOUT_MS", 120_000);
@@ -1845,7 +1855,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 			startupAckTimeoutMs,
 		});
 	} catch (error) {
-		if (previousStartupAck !== undefined) await Bun.write(startupAckPath, previousStartupAck);
+		await restorePredecessorStartupState();
 		const reason = error instanceof Error && error.message ? `relaunch_failed:${error.message}` : "relaunch_failed";
 		const retried = withMemoryGuardRetry(ledger, {
 			platform: input.platform,
@@ -1901,8 +1911,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 			stdout: "ignore",
 			stderr: "ignore",
 		});
-		if (previousStartupAck !== undefined) await Bun.write(startupAckPath, previousStartupAck);
-		else await fs.rm(startupAckPath, { force: true });
+		await restorePredecessorStartupState();
 		return {
 			ok: true,
 			result: "advisory",
@@ -1916,8 +1925,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 			stdout: "ignore",
 			stderr: "ignore",
 		});
-		if (previousStartupAck !== undefined) await Bun.write(startupAckPath, previousStartupAck);
-		else await fs.rm(startupAckPath, { force: true });
+		await restorePredecessorStartupState();
 		return {
 			ok: true,
 			result: "advisory",
@@ -1936,10 +1944,6 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		alive: true,
 		process_start_time: await readLinuxProcessStartTime(successorPane.pid),
 	};
-	const lifecyclePath = workerLifecyclePath(dir, worker.id);
-	const previousLifecycle = (await Bun.file(lifecyclePath).exists())
-		? await Bun.file(lifecyclePath).text()
-		: undefined;
 	const nextConfig: GjcTeamConfig = {
 		...config,
 		workers: config.workers.map(candidate =>
@@ -1957,10 +1961,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		if (previousHeartbeat === undefined) await fs.rm(heartbeatPath, { force: true });
 		else await Bun.write(heartbeatPath, previousHeartbeat);
 		await syncTeamConfigAndManifest(dir, config);
-		if (previousLifecycle === undefined) await fs.rm(lifecyclePath, { force: true });
-		else await Bun.write(lifecyclePath, previousLifecycle);
-		if (previousStartupAck !== undefined) await Bun.write(startupAckPath, previousStartupAck);
-		else await fs.rm(startupAckPath, { force: true });
+		await restorePredecessorStartupState();
 	};
 	try {
 		await writeJsonFile(heartbeatPath, successorHeartbeat);
