@@ -3546,6 +3546,18 @@ describe("team worker memory guard wiring", () => {
 		});
 		const claim = await claimGjcTeamTask("memory-guard-selector-team", "worker-2", cleanupRoot, env, "task-2");
 		expect(claim.ok).toBe(true);
+		const successorAck = Bun.sleep(50).then(() =>
+			executeGjcTeamApiOperation(
+				"worker-startup-ack",
+				{
+					team_name: "memory-guard-selector-team",
+					worker_id: "worker-2",
+					protocol_version: "1",
+				},
+				cleanupRoot,
+				env,
+			),
+		);
 		const oldPaneId = snapshot.workers.find(worker => worker.id === "worker-2")?.pane_id;
 		const result = (await executeGjcTeamApiOperation(
 			"apply-worker-memory-guard",
@@ -3566,6 +3578,7 @@ describe("team worker memory guard wiring", () => {
 			lifecycle_mutated: boolean;
 			ledger: { worker_id: string; state: string; current_task_id?: string; last_checkpoint?: { kind: string } };
 		};
+		await successorAck;
 		expect(result.result).toBe("replaced");
 		expect(result.lifecycle_mutated).toBe(true);
 		expect(result.ledger.worker_id).toBe("worker-2");

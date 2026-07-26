@@ -1480,6 +1480,7 @@ async function relaunchWorkerPaneForMemoryGuard(input: {
 	config: GjcTeamConfig;
 	worker: GjcTeamWorker;
 	platform: NodeJS.Platform;
+	startupAckPath: string;
 }): Promise<string> {
 	if (input.config.dry_run)
 		return `%memory-guard-${input.worker.id}-${stableHash(`${input.worker.id}:${now()}`).slice(0, 8)}`;
@@ -1525,6 +1526,17 @@ async function relaunchWorkerPaneForMemoryGuard(input: {
 			stdout: "ignore",
 			stderr: "ignore",
 		});
+	}
+	const startupDeadline = Date.now() + 10_000;
+	while (!(await Bun.file(input.startupAckPath).exists())) {
+		if (Date.now() >= startupDeadline) {
+			Bun.spawnSync([input.config.tmux_command, "kill-pane", "-t", newPaneId], {
+				stdout: "ignore",
+				stderr: "ignore",
+			});
+			throw new Error(`memory_guard_successor_startup_timeout:${input.worker.id}`);
+		}
+		await Bun.sleep(50);
 	}
 	if (input.worker.pane_id && paneBelongsToTeamTarget(input.config, input.worker.pane_id)) {
 		const killed = Bun.spawnSync([input.config.tmux_command, "kill-pane", "-t", input.worker.pane_id], {
@@ -1743,14 +1755,21 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 			ledger,
 		};
 	}
+	const startupAckPath = path.join(dir, "workers", safePathSegment("worker_id", worker.id), "startup-ack.json");
+	const previousStartupAck = (await Bun.file(startupAckPath).exists())
+		? await Bun.file(startupAckPath).text()
+		: undefined;
+	await fs.rm(startupAckPath, { force: true });
 	let newPaneId: string;
 	try {
 		newPaneId = await relaunchWorkerPaneForMemoryGuard({
 			config,
 			worker,
 			platform: process.platform,
+			startupAckPath,
 		});
 	} catch (error) {
+		if (previousStartupAck !== undefined) await Bun.write(startupAckPath, previousStartupAck);
 		const reason = error instanceof Error && error.message ? `relaunch_failed:${error.message}` : "relaunch_failed";
 		const retried = withMemoryGuardRetry(ledger, {
 			platform: input.platform,
@@ -1799,7 +1818,6 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 	config.updated_at = nowIso;
 	await syncTeamConfigAndManifest(dir, config);
 	await fs.rm(path.join(dir, "workers", safePathSegment("worker_id", worker.id), "heartbeat.json"), { force: true });
-	await fs.rm(path.join(dir, "workers", safePathSegment("worker_id", worker.id), "startup-ack.json"), { force: true });
 	await writeLifecycleRecord(workerRuntime, dir, { ...worker, pane_id: newPaneId }, "starting", {
 		pane_id: newPaneId,
 		started_at: nowIso,
@@ -4034,8 +4052,7 @@ async function writeGjcWorkerStartupAck(
 	env: NodeJS.ProcessEnv,
 	input: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-	const dir = await findTeamDir(teamName, cwd, env);
-	return withGjcTeamMutationFence(dir, () => writeWorkerStartupAck(workerRuntime, teamName, worker, cwd, env, input));
+	return writeWorkerStartupAck(workerRuntime, teamName, worker, cwd, env, input);
 }
 function parseDurationEnv(env: NodeJS.ProcessEnv, name: string, fallbackMs: number): number {
 	const raw = env[name]?.trim();
