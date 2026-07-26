@@ -15120,6 +15120,17 @@ describe("Telegram tool activity capability and routing", () => {
 		});
 		expect(s.get("notifications.telegram.toolActivity.enabled")).toBe(true);
 		expect(bot.calls.some(call => call.body.text === "Tool activity: on")).toBe(true);
+		const runtime = daemon as unknown as { toolActivityPolicyEpoch: number };
+		const epoch = runtime.toolActivityPolicyEpoch;
+		await daemon.handleTelegramUpdate({
+			update_id: 965,
+			message: {
+				chat: { id: 42, type: "private" },
+				text: "/toolactivity on",
+				message_id: 5,
+			},
+		});
+		expect(runtime.toolActivityPolicyEpoch).toBe(epoch);
 	});
 
 	test("/toolactivity off removes pending-topic and rate-limited tool starts", async () => {

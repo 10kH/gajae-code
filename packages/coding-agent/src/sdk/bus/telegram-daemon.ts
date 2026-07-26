@@ -6334,6 +6334,9 @@ export class TelegramNotificationDaemon {
 					state.settled.then(outcome => {
 						if (outcome === "visible" && this.legacyToolStarts.get(state.key) === state) {
 							const messageId = this.liveMessages.get(state.key);
+							this.liveMessages.delete(state.key);
+							if (this.toolActivityOwners.get(state.key) === state.owner)
+								this.toolActivityOwners.delete(state.key);
 							this.settleLegacyToolStart(state, "terminal");
 							if (messageId !== undefined) {
 								void this.enqueueToolTerminalization([{ messageId, owner: state.owner }], false);
@@ -6344,6 +6347,8 @@ export class TelegramNotificationDaemon {
 				);
 			else if (state.phase === "visible") {
 				const messageId = this.liveMessages.get(state.key);
+				this.liveMessages.delete(state.key);
+				if (this.toolActivityOwners.get(state.key) === state.owner) this.toolActivityOwners.delete(state.key);
 				this.settleLegacyToolStart(state, "terminal");
 				if (messageId !== undefined) {
 					visibleTerminalizations.push({ messageId, owner: state.owner });
@@ -7647,11 +7652,25 @@ export class TelegramNotificationDaemon {
 				const rejected = itemOutcomes.some(outcome => outcome.kind === "rejected");
 				if (retryable) {
 					if (!accepted) {
+						let retryItemId: string | undefined;
+						if (toolActivity?.phase === "started") {
+							const state = this.legacyToolStarts.get(
+								`${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`,
+							);
+							if (state !== undefined && state.owner === toolActivity) {
+								state.phase = "queued";
+								state.itemId = `legacy-tool-start:${this.nextLegacyToolStartId++}`;
+								retryItemId = state.itemId;
+							}
+						} else if (toolActivity?.phase === "terminal" && item.payload.legacyToolStart !== undefined) {
+							retryItemId = `legacy-tool-terminal:${this.nextLegacyToolStartId++}`;
+						}
 						this.submitPool({
 							sessionId: item.sessionId,
 							lane: item.lane,
 							coalesceKey: item.coalesceKey,
 							deadlineAt: item.deadlineAt,
+							...(retryItemId !== undefined ? { itemId: retryItemId } : {}),
 							payload: item.payload,
 						});
 					}
@@ -7661,7 +7680,7 @@ export class TelegramNotificationDaemon {
 				}
 				this.pool.settle(item.itemId!, disposition);
 				if (toolActivity?.phase === "started" && !retryable) this.failLegacyToolStart(toolActivity);
-				if (toolActivity?.phase === "terminal") {
+				if (toolActivity?.phase === "terminal" && !retryable) {
 					const state = item.payload.legacyToolStart;
 					if (state !== undefined && this.legacyToolStarts.get(state.key) === state)
 						this.settleLegacyToolStart(state, "terminal");
@@ -7669,7 +7688,7 @@ export class TelegramNotificationDaemon {
 				// A terminal tool frame owns the end of this coalescing key even when both
 				// edit and fallback delivery fail. Retaining the old message id would leak
 				// one entry per failure and let a later reused key edit stale Telegram state.
-				if (send.terminal && editKey) {
+				if (send.terminal && editKey && !retryable) {
 					this.liveMessages.delete(editKey);
 					const owner = this.toolActivityOwners.get(editKey);
 					if (!item.payload.toolActivity || owner?.session === item.payload.toolActivity.session)
@@ -7755,16 +7774,36 @@ export class TelegramNotificationDaemon {
 		if (toolActivity && !this.toolActivityDeliveryIsCurrent(toolActivity)) return;
 		if (send.identity && this.flatIdentitySent.has(sessionId)) return;
 		if (toolActivity && !this.toolActivityDeliveryIsCurrent(toolActivity)) return;
-		const legacyToolStart = toolActivity ? this.legacyToolStartForTerminal(toolActivity) : undefined;
+		const legacyToolStart =
+			toolActivity?.phase === "started"
+				? this.legacyToolStarts.get(`${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`)
+				: toolActivity?.phase === "terminal"
+					? this.legacyToolStartForTerminal(toolActivity)
+					: undefined;
+		if (
+			legacyToolStart !== undefined &&
+			legacyToolStart.owner === toolActivity &&
+			toolActivity?.phase === "started"
+		) {
+			legacyToolStart.phase = "queued";
+			legacyToolStart.itemId ??= `legacy-tool-start:${this.nextLegacyToolStartId++}`;
+		}
+		const poolItemId =
+			legacyToolStart !== undefined && legacyToolStart.owner === toolActivity
+				? toolActivity!.phase === "terminal"
+					? `legacy-tool-terminal:${this.nextLegacyToolStartId++}`
+					: legacyToolStart.itemId
+				: undefined;
 		const submitted = this.submitPool({
 			sessionId,
 			lane: send.lane,
 			coalesceKey: send.coalesceKey,
+			...(poolItemId !== undefined ? { itemId: poolItemId } : {}),
 			payload: {
 				send,
 				...(socketLease ? { socketLease } : {}),
 				...(toolActivity ? { toolActivity } : {}),
-				...(legacyToolStart ? { legacyToolStart } : {}),
+				...(legacyToolStart !== undefined && toolActivity?.phase === "terminal" ? { legacyToolStart } : {}),
 			},
 		});
 		if (!submitted) {
@@ -8982,6 +9021,7 @@ export class TelegramNotificationDaemon {
 					? "notifications.telegram.rich.enabled"
 					: "notifications.telegram.toolActivity.enabled";
 				const label = isRichCommand ? "Rich messages" : "Tool activity";
+				const toolActivityChanged = isRichCommand || this.opts.toolActivity?.enabled !== desired;
 				try {
 					await this.opts.settings.set(settingPath, desired);
 					// Confirm only after the global config write is durable.
@@ -8995,7 +9035,7 @@ export class TelegramNotificationDaemon {
 				}
 				if (isRichCommand) {
 					this.opts.rich = { enabled: desired };
-				} else {
+				} else if (toolActivityChanged) {
 					this.toolActivityPolicyEpoch++;
 					this.opts.toolActivity = { enabled: desired };
 					const legacySettlements = this.cancelLegacyToolStartsForPolicyTransition();
