@@ -20,6 +20,7 @@ import { logger } from "@gajae-code/utils";
 import type { Settings } from "../config/settings";
 import { computeMemoryGuardDomain } from "../runtime/memory-domain";
 import { chooseMemoryGuardAction, MemoryGuardHost, resolveMemoryGuardPolicy } from "../runtime/memory-guard";
+import type { MemoryGuardPolicy } from "../runtime/memory-guard-contract";
 import { resolveEffectiveMemoryLimit } from "../runtime/memory-limit";
 import { listTabsForGc, releaseTabIfGcEligible, type TabGcSnapshot } from "./browser/tab-supervisor";
 import { cleanupStaleScreenshotFallbackDirs, hasCreatedScreenshotFallbackDir } from "./computer-gc";
@@ -481,15 +482,15 @@ function sweepMemoryPressureGuard(d: ResourceGcDeps): Promise<void> | undefined 
 		memoryGuardGcActive.delete(sessionId);
 		memoryGuardRestartAboveSince.delete(sessionId);
 		memoryGuardRestartCooldownUntil.delete(sessionId);
+		memoryGuardLastEvaluatedAt.delete(sessionId);
 	}
 	if (!enabled) return undefined;
 	return sweepEnabledMemoryPressureGuard(d);
 }
 
 async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void> {
-	const snapshot = await d.memorySnapshot();
-	let gcRequested = false;
-	const gcTelemetry: Array<{ sessionId: string } & Record<string, unknown>> = [];
+	const now = d.monotonicNow();
+	const dueSessions: Array<{ sessionId: string; policy: MemoryGuardPolicy }> = [];
 	for (const [sessionId, settings] of activeSessions) {
 		const policy = resolveMemoryGuardPolicy(settings);
 		if (!policy.enabled) {
@@ -499,10 +500,17 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 			memoryGuardLastEvaluatedAt.delete(sessionId);
 			continue;
 		}
-		const now = d.now();
 		const lastEvaluated = memoryGuardLastEvaluatedAt.get(sessionId);
-		const due = lastEvaluated === undefined || now - lastEvaluated >= policy.checkIntervalMs;
-		if (due) memoryGuardLastEvaluatedAt.set(sessionId, now);
+		if (lastEvaluated !== undefined && now - lastEvaluated < policy.checkIntervalMs) continue;
+		memoryGuardLastEvaluatedAt.set(sessionId, now);
+		dueSessions.push({ sessionId, policy });
+	}
+	if (dueSessions.length === 0) return;
+
+	const snapshot = await d.memorySnapshot();
+	let gcRequested = false;
+	const gcTelemetry: Array<{ sessionId: string } & Record<string, unknown>> = [];
+	for (const { sessionId, policy } of dueSessions) {
 		const pressure = __selectMemoryPressureDomainForTest(snapshot, policy.policyLimitBytes);
 		const limit = resolveEffectiveMemoryLimit({
 			hardCapBytes: pressure.hardCapBytes,
@@ -512,7 +520,6 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 			memoryGuardGcActive.delete(sessionId);
 			memoryGuardRestartAboveSince.delete(sessionId);
 			memoryGuardRestartCooldownUntil.delete(sessionId);
-			memoryGuardLastEvaluatedAt.delete(sessionId);
 			continue;
 		}
 		const domain = computeMemoryGuardDomain({
@@ -529,7 +536,7 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 		});
 		const usageRatio = pressure.totalUsageBytes / limit.effectiveBytes;
 		if (usageRatio >= policy.gcThresholdRatio) {
-			if (due && !memoryGuardGcActive.has(sessionId)) {
+			if (!memoryGuardGcActive.has(sessionId)) {
 				gcRequested = true;
 				gcTelemetry.push({
 					sessionId,
@@ -556,7 +563,7 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 			continue;
 		}
 		const cooldownUntil = memoryGuardRestartCooldownUntil.get(sessionId) ?? 0;
-		if (!due || now - aboveSince < policy.restartThresholdWindowMs || now < cooldownUntil) continue;
+		if (now - aboveSince < policy.restartThresholdWindowMs || now < cooldownUntil) continue;
 		memoryGuardRestartCooldownUntil.set(sessionId, now + policy.cooldownMs);
 		d.logWarn("Memory guard: restart threshold sustained; restart remains advisory-only", {
 			sessionId,

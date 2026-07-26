@@ -359,8 +359,10 @@ describe("resource GC controller", () => {
 		expect(runGc).toHaveBeenCalledTimes(1);
 
 		rss = 60 * MB;
+		now += 30_000;
 		await sweepOnce(deps);
 		rss = 90 * MB;
+		now += 30_000;
 		await sweepOnce(deps);
 		now += 90_000;
 		await sweepOnce(deps);
@@ -377,6 +379,85 @@ describe("resource GC controller", () => {
 		now += 90_000;
 		await sweepOnce(deps);
 		expect(logWarn.mock.calls.filter(call => call[0].includes("restart threshold sustained"))).toHaveLength(2);
+	});
+
+	it("does not sample or mutate guard state before the configured check interval", async () => {
+		const settings = Settings.isolated({
+			"memoryGuard.enabled": true,
+			"memoryGuard.checkIntervalMs": 5_000,
+			"memoryGuard.policyLimitMb": 100,
+			"memoryGuard.gcThresholdPercent": 70,
+			"browser.gc.enabled": false,
+			"computer.screenshotGc.enabled": false,
+		});
+		registerResourceGcSession({ sessionId: "interval-guard", settings });
+
+		let monotonicNow = 0;
+		let usageBytes = 90 * MB;
+		const memorySnapshot = vi.fn(async () => ({
+			hardCapBytes: 100 * MB,
+			totalUsageBytes: usageBytes,
+			parentBytes: 10 * MB,
+			source: "linux_cgroup_v2" as const,
+		}));
+		const runGc = vi.fn();
+		const deps = baseDeps({
+			monotonicNow: () => monotonicNow,
+			memorySnapshot,
+			runGc,
+		});
+
+		await sweepOnce(deps);
+		usageBytes = 10 * MB;
+		monotonicNow = 1_000;
+		await sweepOnce(deps);
+
+		expect(memorySnapshot).toHaveBeenCalledTimes(1);
+		expect(runGc).toHaveBeenCalledTimes(1);
+
+		monotonicNow = 5_000;
+		await sweepOnce(deps);
+		expect(memorySnapshot).toHaveBeenCalledTimes(2);
+	});
+
+	it("uses monotonic time for sustained restart windows when wall time moves backward", async () => {
+		const settings = Settings.isolated({
+			"memoryGuard.enabled": true,
+			"memoryGuard.checkIntervalMs": 1_000,
+			"memoryGuard.policyLimitMb": 100,
+			"memoryGuard.gcThresholdPercent": 70,
+			"memoryGuard.restartThresholdPercent": 85,
+			"memoryGuard.restartThresholdWindowMs": 5_000,
+			"memoryGuard.cooldownMs": 60_000,
+			"browser.gc.enabled": false,
+			"computer.screenshotGc.enabled": false,
+		});
+		registerResourceGcSession({ sessionId: "monotonic-guard", settings });
+
+		let wallNow = 100_000;
+		let monotonicNow = 0;
+		const logWarn = vi.fn();
+		const deps = baseDeps({
+			now: () => wallNow,
+			monotonicNow: () => monotonicNow,
+			logWarn,
+			memorySnapshot: async () => ({
+				hardCapBytes: 100 * MB,
+				totalUsageBytes: 90 * MB,
+				parentBytes: 10 * MB,
+				source: "linux_cgroup_v2",
+			}),
+		});
+
+		await sweepOnce(deps);
+		wallNow = -100_000;
+		monotonicNow = 5_000;
+		await sweepOnce(deps);
+
+		expect(logWarn).toHaveBeenCalledWith(
+			"Memory guard: restart threshold sustained; restart remains advisory-only",
+			expect.objectContaining({ sessionId: "monotonic-guard" }),
+		);
 	});
 
 	it("keeps positive fractional sweep intervals schedulable", () => {
