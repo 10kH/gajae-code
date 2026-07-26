@@ -485,6 +485,10 @@ describe("built-in model profile catalog", () => {
 								.trim()
 								.toLowerCase()
 						: undefined;
+					// grok-4.5 mappings must carry an effort suffix; narrow for tsc + assert allowlist
+					if (effort === undefined) {
+						throw new Error(`missing effort suffix on grok-4.5 selector ${trimmedSelector}`);
+					}
 					expect(["minimal", "low", "medium", "high"]).toContain(effort);
 				}
 			}
