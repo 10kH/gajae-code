@@ -46,7 +46,11 @@ export interface SessionSurface {
 	getJobs(): unknown | Promise<unknown>;
 	/** Q26 keyed lookup of a submitted prompt's authoritative reconciliation status. */
 	getPromptStatus?(selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown | Promise<unknown>;
-	getSkillInvokeStatus?(selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown | Promise<unknown>;
+	getSkillInvokeStatus?(selector: {
+		commandId?: string;
+		turnId?: string;
+		clientRef?: string;
+	}): unknown | Promise<unknown>;
 	/** Q27 effective model-profile catalog from the live session registry. */
 	getModelProfiles?(): unknown[] | Promise<unknown[]>;
 	/** Query rows backed by the session's installed binding map. */
@@ -519,7 +523,6 @@ export class QueryHandlers {
 		}
 		return { id: request.id, ok: true, page };
 	}
-
 
 	async #skillInvokeStatus(request: QueryRequest): Promise<QueryResponse> {
 		if (request.cursor)

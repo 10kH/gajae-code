@@ -398,12 +398,7 @@ export interface ExtensionContext {
 		options?: {
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
-			onSkillPrepared?: (meta: {
-				name: string;
-				path: string;
-				lineCount?: number;
-				cleanedArgs?: string;
-			}) => void;
+			onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 		},
 	): Promise<unknown>;
 	setPlanMode?(on: boolean): unknown;
@@ -1148,7 +1143,11 @@ export interface ExtensionAPI {
 	/** Send a user message to the agent, or queue it when deliverAs is set. */
 	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp"; onPreflightAccepted?: () => void },
+		options?: {
+			deliverAs?: "steer" | "followUp";
+			onPreflightAccepted?: () => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+		},
 	): Promise<void>;
 
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */
@@ -1357,7 +1356,11 @@ export type SendMessageHandler = <T = unknown>(
 
 export type SendUserMessageHandler = (
 	content: string | (TextContent | ImageContent)[],
-	options?: { deliverAs?: "steer" | "followUp"; onPreflightAccepted?: () => void },
+	options?: {
+		deliverAs?: "steer" | "followUp";
+		onPreflightAccepted?: () => void;
+		onPreflightAcceptCommit?: () => void | Promise<void>;
+	},
 ) => void | Promise<void>;
 
 export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;
@@ -1488,12 +1491,7 @@ export interface ExtensionContextActions {
 		options?: {
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
-			onSkillPrepared?: (meta: {
-				name: string;
-				path: string;
-				lineCount?: number;
-				cleanedArgs?: string;
-			}) => void;
+			onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 		},
 	) => Promise<unknown>;
 	setPlanMode?: (on: boolean) => unknown;

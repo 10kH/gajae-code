@@ -676,12 +676,7 @@ export interface PromptOptions {
 	 */
 	onPreflightAcceptCommit?: () => void | Promise<void>;
 	/** Skill-only: prepared metadata before the durable fence (path/lineCount/cleanedArgs). */
-	onSkillPrepared?: (meta: {
-		name: string;
-		path: string;
-		lineCount?: number;
-		cleanedArgs?: string;
-	}) => void;
+	onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 }
 
 function promptPreflightCancelledError(): Error {
@@ -7457,9 +7452,7 @@ export class AgentSession {
 						invocation.args,
 						options?.onPreflightAccepted || options?.onPreflightAcceptCommit
 							? {
-									...(options.onPreflightAccepted
-										? { onPreflightAccepted: options.onPreflightAccepted }
-										: {}),
+									...(options.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : {}),
 									...(options.onPreflightAcceptCommit
 										? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
 										: {}),
@@ -7653,11 +7646,7 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
 		options?: Pick<
 			PromptOptions,
-			| "streamingBehavior"
-			| "toolChoice"
-			| "followUpQueuePolicy"
-			| "onPreflightAccepted"
-			| "onPreflightAcceptCommit"
+			"streamingBehavior" | "toolChoice" | "followUpQueuePolicy" | "onPreflightAccepted" | "onPreflightAcceptCommit"
 		>,
 	): Promise<void> {
 		const textContent =
@@ -8594,10 +8583,10 @@ export class AgentSession {
 	async sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
 		options?: {
-		deliverAs?: "steer" | "followUp";
-		onPreflightAccepted?: () => void;
-		onPreflightAcceptCommit?: () => void | Promise<void>;
-	},
+			deliverAs?: "steer" | "followUp";
+			onPreflightAccepted?: () => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+		},
 	): Promise<void> {
 		this.#assertRecoveryHydrationPromoted();
 		// Normalize content to text string + optional images

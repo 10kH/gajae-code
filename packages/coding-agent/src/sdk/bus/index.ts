@@ -83,9 +83,9 @@ import {
 } from "./config";
 import { telegramControlCommandUsage } from "./config-commands";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
+import { createKindAwareReconciliation } from "./kind-aware-reconciliation";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
 import { createPromptReconciliation, sanitizePromptFailure } from "./prompt-reconciliation";
-import { createKindAwareReconciliation } from "./kind-aware-reconciliation";
 import { createReconciliationStore } from "./reconciliation-store";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
 import {
@@ -1809,7 +1809,9 @@ function sdkQuerySurface(
 	}),
 	configOverrides: ReadonlyMap<string, unknown> = new Map(),
 	promptStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown,
-	skillStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({ status: "unknown" }),
+	skillStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
+		status: "unknown",
+	}),
 ): SessionSurface {
 	const metadata = () => ({
 		sessionId: id,
@@ -2428,7 +2430,7 @@ function sdkControlSurface(
 			void run.catch(() => {});
 			return await acceptedP;
 		},
-setPlanMode: async on => {
+		setPlanMode: async on => {
 			if (!bindings.has("setPlanMode") || !ctx.setPlanMode)
 				return unavailable("mode.plan.set", "no plan-mode seam is installed")();
 
@@ -3386,10 +3388,11 @@ export function createNotificationsExtension(
 		// eviction is the only removal, after which lookups report `unknown`.
 		const sessionFile =
 			typeof ctx.sessionManager?.getSessionFile === "function" ? ctx.sessionManager.getSessionFile() : null;
-		const sessionId = typeof ctx.sessionManager?.getSessionId === "function" ? ctx.sessionManager.getSessionId() : "";
+		const reconciliationSessionId =
+			typeof ctx.sessionManager?.getSessionId === "function" ? ctx.sessionManager.getSessionId() : "";
 		const durableStore =
-			sessionFile && sessionId
-				? createReconciliationStore({ sessionFile, sessionId: String(sessionId) })
+			sessionFile && reconciliationSessionId
+				? createReconciliationStore({ sessionFile, sessionId: String(reconciliationSessionId) })
 				: null;
 		const kindReconciliation = createKindAwareReconciliation({ store: durableStore });
 		if (durableStore) void kindReconciliation.hydrateFromStore();
@@ -3606,7 +3609,7 @@ export function createNotificationsExtension(
 				},
 				configOverrides,
 				lookupPromptStatus,
-				(selector) => kindReconciliation.lookup("skill", selector),
+				selector => kindReconciliation.lookup("skill", selector),
 			),
 			id,
 			revisions,

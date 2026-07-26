@@ -8,8 +8,8 @@ import {
 	PROMPT_RECONCILIATION_TERMINAL_TTL_MS,
 	type PromptCorrelation,
 	type PromptReconciliationStatus,
-	type TurnPromptReconciliation,
 	sanitizePromptFailure,
+	type TurnPromptReconciliation,
 } from "./prompt-reconciliation";
 import type { DurableReconciliationRecord, ReconciliationKind, ReconciliationStore } from "./reconciliation-store";
 
@@ -43,10 +43,9 @@ export interface KindAwareReconciliation {
 	hydrateFromStore(): Promise<void>;
 }
 
-export function createKindAwareReconciliation(options: {
-	now?: () => number;
-	store?: ReconciliationStore | null;
-} = {}): KindAwareReconciliation {
+export function createKindAwareReconciliation(
+	options: { now?: () => number; store?: ReconciliationStore | null } = {},
+): KindAwareReconciliation {
 	const now = options.now ?? Date.now;
 	const store = options.store ?? null;
 	const records = new Map<string, DurableReconciliationRecord>();
@@ -88,32 +87,24 @@ export function createKindAwareReconciliation(options: {
 			);
 			if (terminalEntries.length <= PROMPT_RECONCILIATION_TERMINAL_CAPACITY) continue;
 			terminalEntries.sort((a, b) => (a[1].terminalAt as number) - (b[1].terminalAt as number));
-			for (const [key] of terminalEntries.slice(
-				0,
-				terminalEntries.length - PROMPT_RECONCILIATION_TERMINAL_CAPACITY,
-			))
+			for (const [key] of terminalEntries.slice(0, terminalEntries.length - PROMPT_RECONCILIATION_TERMINAL_CAPACITY))
 				remove(key);
 		}
 	};
 
 	const activeCount = (kind: ReconciliationKind) => {
 		let count = 0;
-		for (const record of records.values())
-			if (record.kind === kind && record.terminalAt === undefined) count++;
+		for (const record of records.values()) if (record.kind === kind && record.terminalAt === undefined) count++;
 		return count;
 	};
 
-	const reservationCount = (kind: ReconciliationKind) =>
-		reservations.filter(r => r.kind === kind).length;
+	const reservationCount = (kind: ReconciliationKind) => reservations.filter(r => r.kind === kind).length;
 
 	const consumeReservation = (kind: ReconciliationKind, clientRef?: string) => {
 		const index = reservations.findIndex(r => r.kind === kind && r.clientRef === clientRef);
 		if (index === -1) return;
 		reservations.splice(index, 1);
-		if (
-			clientRef !== undefined &&
-			!reservations.some(r => r.kind === kind && r.clientRef === clientRef)
-		)
+		if (clientRef !== undefined && !reservations.some(r => r.kind === kind && r.clientRef === clientRef))
 			reservedFor(kind).delete(clientRef);
 	};
 

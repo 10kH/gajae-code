@@ -4,10 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	createReconciliationStore,
+	type DurableReconciliationRecord,
 	isSafeReconciliationSessionId,
 	reconciliationStorePath,
 	settleProcessRestart,
-	type DurableReconciliationRecord,
 } from "../src/sdk/bus/reconciliation-store";
 
 describe("reconciliation-store", () => {

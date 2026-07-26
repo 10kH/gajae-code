@@ -42,7 +42,14 @@ export interface ReconciliationStoreFs {
 	writeFile(file: string, data: string, options: { mode: number }): Promise<void>;
 	rename(from: string, to: string): Promise<void>;
 	unlink(file: string): Promise<void>;
-	open(file: string, flags: string): Promise<{ sync(): Promise<void>; close(): Promise<void>; writeFile(data: string, encoding: "utf8"): Promise<void> }>;
+	open(
+		file: string,
+		flags: string,
+	): Promise<{
+		sync(): Promise<void>;
+		close(): Promise<void>;
+		writeFile(data: string, encoding: "utf8"): Promise<void>;
+	}>;
 }
 
 const nodeFs: ReconciliationStoreFs = {
@@ -67,10 +74,6 @@ export function reconciliationStorePath(sessionFile: string, sessionId: string):
 	return path.join(path.dirname(sessionFile), RECONCILIATION_DIR_NAME, `${sessionId}.json`);
 }
 
-function emptyDocument(sessionId: string): ReconciliationStoreDocument {
-	return { version: RECONCILIATION_STORE_VERSION, sessionId, records: [] };
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -81,7 +84,7 @@ function parseDocument(raw: string, expectedSessionId: string): ReconciliationSt
 		throw new Error("invalid reconciliation store version");
 	if (value.sessionId !== expectedSessionId) throw new Error("session id mismatch");
 	if (!Array.isArray(value.records)) throw new Error("invalid records");
-	return value as ReconciliationStoreDocument;
+	return value as unknown as ReconciliationStoreDocument;
 }
 
 /**
@@ -151,10 +154,9 @@ export function createReconciliationStore(options: {
 			await fileFs.rename(temporary, filePath);
 		} catch (error) {
 			await fileFs.unlink(temporary).catch(() => {});
-			throw Object.assign(
-				error instanceof Error ? error : new Error("reconciliation persist failed"),
-				{ code: "reconciliation_persist_failed" },
-			);
+			throw Object.assign(error instanceof Error ? error : new Error("reconciliation persist failed"), {
+				code: "reconciliation_persist_failed",
+			});
 		}
 	};
 
