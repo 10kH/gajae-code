@@ -4,6 +4,10 @@
 
 - Post-merge Dev CI: update SDK operation matrix length pins for `model.profile.set` (C53) added by #3191 so registry bijection and control-count gates match the generated inventory.
 
+### Changed
+
+- Telegram per-tool activity is now opt-in and remains durably controllable with `/toolactivity on|off` or the Notifications preferences UI; disabling it suppresses tool start/completion success and error bubbles without hiding assistant, ask, or session notifications.
+
 ### Added
 
 - Added cross-platform memory-pressure observability with effective host/cgroup limits, configurable GC and restart advisory thresholds, typed Linux process probes, and a Windows Job Object native probe; unsupported lifecycle actions remain advisory-only.
