@@ -118,7 +118,7 @@ const defaultDeps: ResourceGcDeps = {
 };
 
 // ── Controller state (process-global; tabs/browsers are module-global too) ──────────────────
-const activeSessions = new Map<string, { settings: Settings; cwd: string }>();
+const activeSessions = new Map<string, { settings: Settings; cwd: () => string }>();
 const scheduler = new MemoryGuardHost({
 	run: async () => {
 		await sweepOnce(deps);
@@ -137,7 +137,7 @@ let deps: ResourceGcDeps = defaultDeps;
 export interface ResourceGcRegistration {
 	sessionId: string;
 	settings: Settings;
-	cwd?: string;
+	cwd?: string | (() => string);
 }
 
 function resolveSessionSweepIntervalMs(settings: Settings): number {
@@ -153,7 +153,9 @@ function resolveSessionSweepIntervalMs(settings: Settings): number {
  * session unregisters.
  */
 export function registerResourceGcSession(reg: ResourceGcRegistration): () => void {
-	activeSessions.set(reg.sessionId, { settings: reg.settings, cwd: reg.cwd ?? process.cwd() });
+	const registeredCwd = reg.cwd;
+	const cwd = typeof registeredCwd === "function" ? registeredCwd : () => registeredCwd ?? process.cwd();
+	activeSessions.set(reg.sessionId, { settings: reg.settings, cwd });
 	const unregisterSchedule = scheduler.register({
 		ownerId: reg.sessionId,
 		intervalMs: resolveSessionSweepIntervalMs(reg.settings),
@@ -609,8 +611,9 @@ async function applySelectedTeamWorker(
 async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void> {
 	const now = d.monotonicNow();
 	const dueSessions: Array<{ sessionId: string; policy: MemoryGuardPolicy; cwd: string }> = [];
-	for (const [sessionId, { settings, cwd }] of activeSessions) {
+	for (const [sessionId, { settings, cwd: resolveCwd }] of activeSessions) {
 		const policy = resolveMemoryGuardPolicy(settings);
+		const cwd = resolveCwd();
 		if (!policy.enabled) {
 			memoryGuardGcActive.delete(sessionId);
 			memoryGuardRestartAboveSince.delete(sessionId);
@@ -629,7 +632,7 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 	const snapshot = await d.memorySnapshot();
 	let gcRequested = false;
 	const gcTelemetry: Array<{ sessionId: string } & Record<string, unknown>> = [];
-	const guardedTeamRoots = new Set<string>();
+	let workerActionTaken = false;
 	for (const { sessionId, policy, cwd } of dueSessions) {
 		const pressure = __selectMemoryPressureDomainForTest(snapshot, policy.policyLimitBytes);
 		const limit = resolveEffectiveMemoryLimit({
@@ -691,8 +694,7 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 		if (now - aboveSince < policy.restartThresholdWindowMs || now < cooldownUntil) continue;
 		const workerIncidentId =
 			memoryGuardWorkerIncidentIds.get(sessionId) ?? `worker-pressure:${sessionId}:${Math.trunc(aboveSince)}`;
-		const guardAuthority = `${sessionId}\0${cwd}`;
-		if (decision.kind === "execute" && decision.target.kind === "worker" && !guardedTeamRoots.has(guardAuthority)) {
+		if (decision.kind === "execute" && decision.target.kind === "worker" && !workerActionTaken) {
 			const refreshedWorkers = await (d.listTeamWorkers ?? (async () => []))(cwd, sessionId);
 			const refreshedDomain = computeMemoryGuardDomain({
 				effectiveLimitBytes: limit.effectiveBytes,
@@ -709,7 +711,7 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 			});
 			const revalidated = revalidateMemoryGuardAction(decision, refreshedDecision);
 			if (revalidated.kind !== "execute" || revalidated.target.kind !== "worker") continue;
-			guardedTeamRoots.add(guardAuthority);
+			workerActionTaken = true;
 			try {
 				await (d.applyTeamWorkerGuard ?? (async () => undefined))(
 					cwd,

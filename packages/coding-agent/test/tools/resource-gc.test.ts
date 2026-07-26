@@ -500,7 +500,8 @@ describe("resource GC controller", () => {
 			"browser.gc.enabled": false,
 			"computer.screenshotGc.enabled": false,
 		});
-		registerResourceGcSession({ sessionId: "team-session", settings, cwd: "/workspace" });
+		let cwd = "/workspace";
+		registerResourceGcSession({ sessionId: "team-session", settings, cwd: () => cwd });
 		const applyTeamWorkerGuard = vi.fn(async () => undefined);
 		let monotonicNow = 0;
 		const deps = baseDeps({
@@ -515,15 +516,48 @@ describe("resource GC controller", () => {
 			applyTeamWorkerGuard,
 		});
 		await sweepOnce(deps);
+		cwd = "/moved-workspace";
 		monotonicNow = 30_000;
 		await sweepOnce(deps);
 		expect(applyTeamWorkerGuard).toHaveBeenCalledWith(
-			"/workspace",
+			"/moved-workspace",
 			"team-session",
 			"team-a/worker-1",
 			expect.any(Number),
 			"worker-pressure:team-session:0",
 		);
+	});
+
+	it("runs at most one worker replacement per shared pressure snapshot", async () => {
+		const settings = Settings.isolated({
+			"memoryGuard.enabled": true,
+			"memoryGuard.policyLimitMb": 100,
+			"memoryGuard.parentReserveMb": 10,
+			"memoryGuard.restartThresholdWindowMs": 0,
+			"browser.gc.enabled": false,
+			"computer.screenshotGc.enabled": false,
+		});
+		registerResourceGcSession({ sessionId: "shared-a", settings, cwd: "/workspace/a" });
+		registerResourceGcSession({ sessionId: "shared-b", settings, cwd: "/workspace/b" });
+		const applyTeamWorkerGuard = vi.fn(async () => undefined);
+		let monotonicNow = 0;
+		const deps = baseDeps({
+			monotonicNow: () => monotonicNow,
+			memorySnapshot: async () => ({
+				hardCapBytes: 100 * MB,
+				totalUsageBytes: 100 * MB,
+				parentBytes: 5 * MB,
+				source: "linux_cgroup_v2",
+			}),
+			listTeamWorkers: async (_cwd, sessionId) => [
+				{ workerId: `${sessionId}/worker-1`, bytes: 95 * MB, accepted: true },
+			],
+			applyTeamWorkerGuard,
+		});
+		await sweepOnce(deps);
+		monotonicNow = 30_000;
+		await sweepOnce(deps);
+		expect(applyTeamWorkerGuard).toHaveBeenCalledTimes(1);
 	});
 	it("schedules an enabled guard at its configured check interval", async () => {
 		const clock = controlledScheduler();

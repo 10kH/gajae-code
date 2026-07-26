@@ -366,11 +366,18 @@ describe("native gjc team runtime", () => {
 
 		const startupAck = (await executeGjcTeamApiOperation(
 			"worker-startup-ack",
-			{ team_name: "worker-lifecycle-team", worker_id: "worker-1", pid: 1234, protocol_version: "1" },
+			{
+				team_name: "worker-lifecycle-team",
+				worker_id: "worker-1",
+				pid: 1234,
+				protocol_version: "1",
+				replacement_token: "startup-generation-1",
+			},
 			cleanupRoot,
 			{ PATH: "", GJC_SESSION_ID: TEST_SESSION_ID },
-		)) as { pid?: number };
+		)) as { pid?: number; replacement_token?: string };
 		expect(startupAck.pid).toBe(1234);
+		expect(startupAck.replacement_token).toBe("startup-generation-1");
 
 		let snapshot = await readGjcTeamSnapshot("worker-lifecycle-team", cleanupRoot, {
 			PATH: "",
@@ -3553,6 +3560,7 @@ describe("team worker memory guard wiring", () => {
 					team_name: "memory-guard-selector-team",
 					worker_id: "worker-2",
 					protocol_version: "1",
+					replacement_token: "replacement-generation-1",
 				},
 				cleanupRoot,
 				env,
@@ -3566,6 +3574,7 @@ describe("team worker memory guard wiring", () => {
 				platform: "linux",
 				automatic_action_allowed: true,
 				reason: "rss_exceeded",
+				replacement_token: "replacement-generation-1",
 				candidates: [
 					{ worker_id: "worker-1", platform: "linux", excess_bytes: 1, retry_count: 0, retry_limit: 2 },
 					{ worker_id: "worker-2", platform: "linux", excess_bytes: 10, retry_count: 0, retry_limit: 2 },
