@@ -662,6 +662,9 @@ export class TUI extends Container {
 	#cursorRow = 0; // Logical cursor row (end of rendered content)
 	#hardwareCursorRow = 0; // Actual terminal cursor row (may differ due to IME positioning)
 	#viewportTopRow = 0; // Content row currently mapped to screen row 0
+	#scrollbackResumeViewportTop: number | undefined; // Reflowed history below this frontier is already committed
+	#nativeScrollbackViewportTop = 0;
+	#transcriptIdentityResetPending = false;
 	#manualViewportTop: number | undefined;
 	#viewportAnchorComponent: Component | null = null;
 	#viewportAnchorFrame: ViewportAnchorFrame | null = null;
@@ -835,6 +838,9 @@ export class TUI extends Container {
 		this.#manualViewportFallbackAnchors = [];
 		this.#reconcileMissingViewportAnchor = false;
 		this.#viewportAnchorFrame = null;
+		this.#scrollbackResumeViewportTop = undefined;
+		this.#nativeScrollbackViewportTop = 0;
+		this.#transcriptIdentityResetPending = true;
 	}
 
 	/** Allow one semantic-neighbor reconciliation after a definitive same-transcript rebuild. */
@@ -1395,7 +1401,8 @@ export class TUI extends Container {
 		}
 		if (renderMetrics.enabled) renderMetrics.recordRequest(source);
 		if (force) {
-			const preserveViewportCursor = useViewportRepaintPath(this.terminal);
+			const preserveViewportCursor =
+				useViewportRepaintPath(this.terminal) || shouldPreserveScrollbackOnFullClear(this.terminal);
 			// A forced full redraw supersedes any queued input-priority render.
 			this.#inputRenderPending = false;
 			this.#previousLines = [];
@@ -2393,6 +2400,19 @@ export class TUI extends Container {
 			if (usedWindowNormalize) renderMetrics.recordLineCount("offscreenScan", diffStart);
 		}
 		this.#latestRenderedLines = newLines;
+		const naturalViewportTop = Math.max(0, newLines.length - height);
+		const priorLogicalLineCount = Math.max(this.#previousLines.length, this.#maxLinesRendered);
+		if (this.#transcriptIdentityResetPending) {
+			this.#transcriptIdentityResetPending = false;
+		} else if (
+			newLines.length < priorLogicalLineCount &&
+			(naturalViewportTop < prevViewportTop || this.#manualViewportTop !== undefined)
+		) {
+			this.#scrollbackResumeViewportTop = Math.max(
+				this.#scrollbackResumeViewportTop ?? 0,
+				this.#nativeScrollbackViewportTop,
+			);
+		}
 
 		if (this.#manualViewportTop !== undefined) {
 			let resolvedAnchorTop = anchorFrame === null ? null : this.#resolveManualAnchor(anchorFrame);
@@ -2473,7 +2493,16 @@ export class TUI extends Container {
 			return;
 		}
 		// Helper to clear scrollback and viewport and render all new lines
+		let viewportRepaint: (reason: string, targetViewportTop?: number) => void;
 		const fullRender = (clear: boolean, reason = "full render"): void => {
+			if (
+				clear &&
+				shouldPreserveScrollbackOnFullClear(this.terminal) &&
+				this.#scrollbackResumeViewportTop !== undefined
+			) {
+				viewportRepaint(`preserving full replay blocked after scrollback-unsafe contraction: ${reason}`);
+				return;
+			}
 			this.#fullRedrawCount += 1;
 			if (renderMetrics.enabled) renderMetrics.recordFullRedraw(reason);
 			let buffer = "\x1b[?2026h"; // Begin synchronized output
@@ -2500,15 +2529,21 @@ export class TUI extends Container {
 				this.#maxLinesRendered = Math.max(this.#maxLinesRendered, newLines.length);
 			}
 			this.#viewportTopRow = Math.max(0, this.#maxLinesRendered - height);
+			this.#nativeScrollbackViewportTop = clear
+				? this.#viewportTopRow
+				: Math.max(this.#nativeScrollbackViewportTop, this.#viewportTopRow);
+			if (clear && !shouldPreserveScrollbackOnFullClear(this.terminal)) {
+				this.#scrollbackResumeViewportTop = undefined;
+			}
 			this.#previousLines = newLines;
 			this.#previousWidth = width;
 			this.#previousHeight = height;
 		};
 
-		const viewportRepaint = (reason: string): void => {
+		viewportRepaint = (reason: string, targetViewportTop = Math.max(0, newLines.length - height)): void => {
 			this.#fullRedrawCount += 1;
 			if (renderMetrics.enabled) renderMetrics.recordFullRedraw(reason);
-			const nextViewportTop = Math.max(0, newLines.length - height);
+			const nextViewportTop = targetViewportTop;
 			const currentScreenRow = Math.max(0, Math.min(height - 1, hardwareCursorRow - prevViewportTop));
 			let buffer = "\x1b[?2026h";
 			if (currentScreenRow > 0) {
@@ -2644,7 +2679,7 @@ export class TUI extends Container {
 			}
 			lastChanged = newLines.length - 1;
 		}
-		const appendStart = appendedLines && firstChanged === this.#previousLines.length && firstChanged > 0;
+		let appendStart = appendedLines && firstChanged === this.#previousLines.length && firstChanged > 0;
 
 		// No changes - but still need to update hardware cursor position if it moved
 		if (firstChanged === -1) {
@@ -2657,6 +2692,32 @@ export class TUI extends Container {
 		if (newLines.length < this.#previousLines.length && nextLiveViewportTop !== prevViewportTop) {
 			viewportRepaint(`content contraction changed viewport top (${prevViewportTop} -> ${nextLiveViewportTop})`);
 			return;
+		}
+		if (appendedLines && this.#scrollbackResumeViewportTop !== undefined && nextLiveViewportTop > prevViewportTop) {
+			const resumeViewportTop = this.#scrollbackResumeViewportTop;
+			if (nextLiveViewportTop <= resumeViewportTop) {
+				viewportRepaint(
+					`content expansion below committed scrollback frontier (${prevViewportTop} -> ${nextLiveViewportTop}, frontier=${resumeViewportTop})`,
+				);
+				return;
+			}
+
+			const previousLines = this.#previousLines;
+			const previousWidth = this.#previousWidth;
+			const previousHeight = this.#previousHeight;
+			viewportRepaint(
+				`staging committed scrollback frontier before resumed admission (${prevViewportTop} -> ${resumeViewportTop} -> ${nextLiveViewportTop})`,
+				resumeViewportTop,
+			);
+			this.#previousLines = previousLines;
+			this.#previousWidth = previousWidth;
+			this.#previousHeight = previousHeight;
+			prevViewportTop = resumeViewportTop;
+			viewportTop = resumeViewportTop;
+			hardwareCursorRow = this.#hardwareCursorRow;
+			firstChanged = resumeViewportTop;
+			appendStart = false;
+			this.#scrollbackResumeViewportTop = undefined;
 		}
 		// All changes are in deleted lines (nothing to render, just clear)
 		if (firstChanged >= newLines.length) {
@@ -2855,6 +2916,7 @@ export class TUI extends Container {
 		// Track content height for viewport calculation
 		this.#maxLinesRendered = newLines.length;
 		this.#viewportTopRow = Math.max(0, newLines.length - height);
+		this.#nativeScrollbackViewportTop = Math.max(this.#nativeScrollbackViewportTop, this.#viewportTopRow);
 
 		this.#previousLines = newLines;
 		this.#previousWidth = width;

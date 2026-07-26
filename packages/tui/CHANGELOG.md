@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Streaming layout contraction followed by regrowth no longer re-admits an already committed logical row into native terminal scrollback, preventing occasional duplicated assistant lines after Markdown reflow.
+
 ## [0.11.10] - 2026-07-25
 
 ## [0.11.7] - 2026-07-22
