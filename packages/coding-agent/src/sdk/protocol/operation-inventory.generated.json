@@ -2904,6 +2904,17 @@
 		}
 	},
 	{
+		"sourceId": "agent_session:restoreFromMemoryGuardCheckpoint",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal fail-closed recovery factory, not a general user-facing SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:promoteRecoveryHydrationAfterOwnershipReadyFence",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",

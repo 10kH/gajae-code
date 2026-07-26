@@ -101,7 +101,7 @@ describe("continueRecent with --worktree sessions", () => {
 		}
 	});
 
-	it("keeps a verified explicit-directory breadcrumb terminal-specific", async () => {
+	it("adopts a verified explicit-directory breadcrumb before managed candidates", async () => {
 		const unmanagedDir = path.join(root, "unmanaged-sessions");
 		const unmanagedFile = path.join(unmanagedDir, "unmanaged.jsonl");
 		fs.mkdirSync(unmanagedDir, { recursive: true });
@@ -114,7 +114,10 @@ describe("continueRecent with --worktree sessions", () => {
 		writeSession(worktree, "managed-worktree-session");
 		const resumed = await SessionManager.continueRecent(repo);
 		try {
-			expect(resumed.getSessionFile()).toBe(unmanagedFile);
+			const adoptedFile = resumed.getSessionFile();
+			expect(adoptedFile).not.toBe(unmanagedFile);
+			expect(adoptedFile?.startsWith(getSessionsDir())).toBe(true);
+			expect(adoptedFile ? fs.readFileSync(adoptedFile, "utf8") : "").toContain('"id":"unmanaged"');
 		} finally {
 			await resumed.close();
 		}
