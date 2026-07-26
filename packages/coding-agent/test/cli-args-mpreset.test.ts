@@ -1,6 +1,6 @@
 import { describe, expect, spyOn, test, vi } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import type { Model } from "@gajae-code/ai";
+import { type Model, THINKING_EFFORTS } from "@gajae-code/ai";
 import { CliParseError } from "@gajae-code/utils/cli";
 import { parseArgs } from "../src/cli/args";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
@@ -626,4 +626,24 @@ test("thinking-only startup uses authoritative override semantics", async () => 
 			options: { cause: "startup-override" },
 		}),
 	]);
+});
+
+describe("CLI --thinking contract", () => {
+	test("accepts every Effort level advertised by help", () => {
+		for (const level of THINKING_EFFORTS) {
+			expect(parseArgs(["--thinking", level]).thinking).toBe(level);
+		}
+	});
+
+	test("rejects the retired ultra token instead of silently ignoring it", () => {
+		expect(() => parseArgs(["--thinking", "ultra"])).toThrow(CliParseError);
+		expect(() => parseArgs(["--thinking", "ultra"])).toThrow(
+			/Invalid --thinking level "ultra".*minimal, low, medium, high, xhigh, max/,
+		);
+	});
+
+	test("rejects unknown tokens fail-closed", () => {
+		expect(() => parseArgs(["--thinking", "ludicrous"])).toThrow(CliParseError);
+		expect(() => parseArgs(["--thinking", "off"])).toThrow(CliParseError);
+	});
 });

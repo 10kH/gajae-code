@@ -208,14 +208,14 @@ export function parseArgs(args: string[]): Args {
 		} else if (arg === "--thinking" && i + 1 < args.length) {
 			const rawThinking = args[++i];
 			const thinking = parseEffort(rawThinking);
-			if (thinking !== undefined) {
-				result.thinking = thinking;
-			} else {
-				logger.warn("Invalid thinking level passed to --thinking", {
-					level: rawThinking,
-					validThinkingLevels: THINKING_EFFORTS,
-				});
+			if (thinking === undefined) {
+				// Fail closed: a silent ignore left users believing `ultra` (or any typo)
+				// was applied. Help / Flags.options advertise the real Effort enum.
+				throw new CliParseError(
+					`Invalid --thinking level "${rawThinking}". Expected one of: ${THINKING_EFFORTS.join(", ")}`,
+				);
 			}
+			result.thinking = thinking;
 		} else if (arg === "--print" || arg === "-p") {
 			result.print = true;
 		} else if (arg === "--export" && i + 1 < args.length) {
