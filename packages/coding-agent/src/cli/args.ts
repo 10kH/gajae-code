@@ -210,9 +210,7 @@ export function parseArgs(args: string[]): Args {
 			// a usage error, not a silent no-op / accidental consumption of `-p`.
 			const next = args[i + 1];
 			if (!next || next.startsWith("-")) {
-				throw new CliParseError(
-					`--thinking requires <level> (${THINKING_EFFORTS.join(", ")})`,
-				);
+				throw new CliParseError(`--thinking requires <level> (${THINKING_EFFORTS.join(", ")})`);
 			}
 			const rawThinking = args[++i];
 			const thinking = parseEffort(rawThinking);
