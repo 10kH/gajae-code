@@ -99,6 +99,21 @@ describe("memory guard checkpoint export/restore", () => {
 			if (restored.kind !== "staged") return;
 			expect(restored.manager.getSessionId()).toBe(checkpoint.session_id);
 			expect(restored.manager.getSessionName()).toBe("checkpoint-session");
+			const restoredEntryId = restored.manager.getEntries()[0]?.id;
+			if (!restoredEntryId) throw new Error("Expected restored entry");
+			expect(() => restored.manager.branch(restoredEntryId)).toThrow("recovery_hydration_not_promoted");
+			expect(() => restored.manager.resetLeaf()).toThrow("recovery_hydration_not_promoted");
+			expect(() => restored.manager.createBranchedSession(restoredEntryId)).toThrow(
+				"recovery_hydration_not_promoted",
+			);
+			expect(() => restored.manager.sanitizeLoadedOpenAIResponsesReplayMetadata()).toThrow(
+				"recovery_hydration_not_promoted",
+			);
+			await expect(restored.manager.newSession()).rejects.toThrow("recovery_hydration_not_promoted");
+			await expect(restored.manager.prepareNewSession()).rejects.toThrow("recovery_hydration_not_promoted");
+			await expect(restored.manager.prepareBranchedSession(restoredEntryId)).rejects.toThrow(
+				"recovery_hydration_not_promoted",
+			);
 			const authStorage = await AuthStorage.create(path.join(root, "auth.db"));
 			authStores.push(authStorage);
 			authStorage.setRuntimeApiKey("anthropic", "test-key");
