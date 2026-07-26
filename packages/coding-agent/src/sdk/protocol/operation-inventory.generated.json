@@ -2904,6 +2904,17 @@
 		}
 	},
 	{
+		"sourceId": "agent_session:restoreFromMemoryGuardCheckpoint",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal owner-recovery staged restore builder after durable claims/fencing, never a user-facing SDK operation",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:promoteRecoveryHydrationAfterOwnershipReadyFence",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
