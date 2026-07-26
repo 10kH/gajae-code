@@ -1372,7 +1372,8 @@ async function finalizeWorkerMemoryGuardBlockedState(input: {
 	cwd: string;
 	env: NodeJS.ProcessEnv;
 }): Promise<void> {
-	await updateGjcWorkerStatus(
+	await updateWorkerStatus(
+		workerRuntime,
 		input.teamName,
 		input.worker.id,
 		"blocked",
@@ -1536,7 +1537,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 			automatic_action_allowed: input.allowAutomaticAction,
 			updated_at: nowIso,
 		};
-	if (process.platform !== "linux") {
+	if (process.platform !== "linux" || input.platform !== "linux") {
 		ledger = {
 			...ledger,
 			platform: input.platform,

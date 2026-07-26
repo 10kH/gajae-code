@@ -508,14 +508,17 @@ async function readLinuxWorkerRssBytes(pid: number): Promise<number | null> {
 	}
 }
 
-async function sampleTeamWorkers(cwd: string): Promise<MemoryGuardWorkerSample[]> {
+async function sampleTeamWorkers(cwd: string, sessionId: string): Promise<MemoryGuardWorkerSample[]> {
 	if (process.platform !== "linux") return [];
 	const samples: MemoryGuardWorkerSample[] = [];
-	for (const team of await listGjcTeams(cwd, process.env)) {
+	for (const team of await listGjcTeams(cwd, { ...process.env, GJC_SESSION_ID: sessionId })) {
 		if (team.phase === "complete" || team.phase === "cancelled") continue;
 		for (const worker of team.workers) {
 			try {
-				const heartbeat = await readGjcWorkerHeartbeat(team.team_name, worker.id, cwd, process.env);
+				const heartbeat = await readGjcWorkerHeartbeat(team.team_name, worker.id, cwd, {
+					...process.env,
+					GJC_SESSION_ID: sessionId,
+				});
 				if (!heartbeat) continue;
 				const bytes = await readLinuxWorkerRssBytes(heartbeat.pid);
 				if (bytes === null) continue;
@@ -528,7 +531,12 @@ async function sampleTeamWorkers(cwd: string): Promise<MemoryGuardWorkerSample[]
 	return samples;
 }
 
-async function applySelectedTeamWorker(cwd: string, workerId: string, excessBytes: number): Promise<void> {
+async function applySelectedTeamWorker(
+	cwd: string,
+	sessionId: string,
+	workerId: string,
+	excessBytes: number,
+): Promise<void> {
 	const separator = workerId.lastIndexOf("/");
 	if (separator <= 0 || separator === workerId.length - 1) return;
 	const teamName = workerId.slice(0, separator);
@@ -543,7 +551,7 @@ async function applySelectedTeamWorker(cwd: string, workerId: string, excessByte
 			candidates: [{ worker_id: worker, platform: process.platform, excess_bytes: excessBytes }],
 		},
 		cwd,
-		process.env,
+		{ ...process.env, GJC_SESSION_ID: sessionId },
 	);
 }
 async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void> {
@@ -581,7 +589,7 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 			memoryGuardRestartCooldownUntil.delete(sessionId);
 			continue;
 		}
-		const workerSamples = await sampleTeamWorkers(cwd);
+		const workerSamples = await sampleTeamWorkers(cwd, sessionId);
 		const domain = computeMemoryGuardDomain({
 			effectiveLimitBytes: limit.effectiveBytes,
 			totalUsageBytes: pressure.totalUsageBytes,
@@ -597,7 +605,7 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 		});
 		if (decision.kind === "execute" && decision.target.kind === "worker" && !guardedTeamRoots.has(cwd)) {
 			guardedTeamRoots.add(cwd);
-			await applySelectedTeamWorker(cwd, decision.target.workerId, decision.target.excessBytes);
+			await applySelectedTeamWorker(cwd, sessionId, decision.target.workerId, decision.target.excessBytes);
 		}
 		const usageRatio = pressure.totalUsageBytes / limit.effectiveBytes;
 		if (usageRatio >= policy.gcThresholdRatio) {
