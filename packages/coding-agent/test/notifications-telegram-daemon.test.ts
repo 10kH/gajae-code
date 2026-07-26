@@ -14261,7 +14261,7 @@ describe("Telegram tool activity capability and routing", () => {
 			toolName: "read",
 			phase: "started",
 		});
-		await daemon.handleSessionMessage(session, {
+		const unknown = {
 			type: "tool_activity",
 			sessionId: "S",
 			toolCallId: "legacy-visible",
@@ -14269,11 +14269,13 @@ describe("Telegram tool activity capability and routing", () => {
 			phase: "unknown",
 			argsSummary: "secret args",
 			resultSummary: "secret result",
-		});
+		};
+		await Promise.all([daemon.handleSessionMessage(session, unknown), daemon.handleSessionMessage(session, unknown)]);
 
 		const edit = bot.calls.find(call => call.method === "editMessageText");
 		expect(String(edit?.body.text)).toContain("read — cancelled");
 		expect(String(edit?.body.text)).not.toContain("secret");
+		expect(bot.calls.filter(call => call.method === "editMessageText")).toHaveLength(1);
 	});
 	test("legacy-v1 unknown waits for an ordered in-flight start and settles it exactly once", async () => {
 		const bot = new FakeBotApi();

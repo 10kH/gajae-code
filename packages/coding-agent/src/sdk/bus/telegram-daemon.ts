@@ -3939,6 +3939,7 @@ interface LegacyToolStartSettlement {
 	settled: Promise<LegacyToolStartOutcome>;
 	resolve: (outcome: LegacyToolStartOutcome) => void;
 	settledOutcome?: LegacyToolStartOutcome;
+	terminalClaimed?: boolean;
 }
 
 interface PendingThreadedFrame {
@@ -7653,26 +7654,49 @@ export class TelegramNotificationDaemon {
 				if (retryable) {
 					if (!accepted) {
 						let retryItemId: string | undefined;
+						let retryAllowed = true;
 						if (toolActivity?.phase === "started") {
 							const state = this.legacyToolStarts.get(
 								`${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`,
 							);
 							if (state !== undefined && state.owner === toolActivity) {
-								state.phase = "queued";
-								state.itemId = `legacy-tool-start:${this.nextLegacyToolStartId++}`;
-								retryItemId = state.itemId;
+								retryAllowed =
+									!state.terminalClaimed &&
+									!this.toolActivityStopping &&
+									!this.stopRequested &&
+									this.opts.toolActivity?.enabled === true &&
+									state.policyEpoch === this.toolActivityPolicyEpoch &&
+									this.toolActivityAuthorityIsCurrent(state.owner);
+								if (retryAllowed) {
+									state.phase = "queued";
+									state.itemId = `legacy-tool-start:${this.nextLegacyToolStartId++}`;
+									retryItemId = state.itemId;
+								} else {
+									this.settleLegacyToolStart(state, "cancelled");
+								}
 							}
 						} else if (toolActivity?.phase === "terminal" && item.payload.legacyToolStart !== undefined) {
 							retryItemId = `legacy-tool-terminal:${this.nextLegacyToolStartId++}`;
 						}
-						this.submitPool({
-							sessionId: item.sessionId,
-							lane: item.lane,
-							coalesceKey: item.coalesceKey,
-							deadlineAt: item.deadlineAt,
-							...(retryItemId !== undefined ? { itemId: retryItemId } : {}),
-							payload: item.payload,
-						});
+						const newerCoalescedItem =
+							toolActivity === undefined &&
+							item.coalesceKey !== undefined &&
+							this.pool.someQueued(
+								queued =>
+									queued.sessionId === item.sessionId &&
+									queued.lane === item.lane &&
+									queued.coalesceKey === item.coalesceKey,
+							);
+						if (retryAllowed && !newerCoalescedItem) {
+							this.submitPool({
+								sessionId: item.sessionId,
+								lane: item.lane,
+								coalesceKey: item.coalesceKey,
+								deadlineAt: item.deadlineAt,
+								...(retryItemId !== undefined ? { itemId: retryItemId } : {}),
+								payload: item.payload,
+							});
+						}
 					}
 					disposition = "ambiguous";
 				} else if (disposition === "accepted" && !accepted && rejected) {
@@ -8448,9 +8472,11 @@ export class TelegramNotificationDaemon {
 					session.toolActivityCapability !== "v1" ||
 					!state ||
 					state.owner.session !== session ||
-					state.owner.toolName !== toolName
+					state.owner.toolName !== toolName ||
+					state.terminalClaimed
 				)
 					return;
+				state.terminalClaimed = true;
 				if (this.cancelUnsentLegacyToolStart(state)) return;
 				if (state.phase === "dispatching") await state.settled;
 				if (
