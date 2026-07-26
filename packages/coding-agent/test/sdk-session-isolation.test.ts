@@ -269,6 +269,11 @@ describe("createAgentSession session storage isolation", () => {
 				"utf8",
 			);
 			expect(marker === "verified\n" || marker === "absent\n" || marker === "cleanup_pending\n").toBe(true);
+
+			// Identity is only public after readiness: public getters resolve immediately
+			// against the gated successor (A11). Repeated /new + fork are covered in
+			// session-manager prepare/commit unit tests without extension session_switch
+			// startup (which can retain identity-rotation work across rotations).
 		} finally {
 			await session.dispose();
 		}
@@ -303,10 +308,10 @@ describe("createAgentSession session storage isolation", () => {
 			// already exists at each publication, so the agent, workflow-gate emitter,
 			// and hooks never observe an ungated root.
 			//
-			// Scope: this pins agent-identity publication only. The manager rotates its
-			// own session id inside sessionManager.newSession(), before the gate, and
-			// resolveLocalUrlToPath() keys on *that* id — so this test cannot and does
-			// not cover the manager-rotation window tracked in #3138.
+			// Scope: agent-identity publication after readiness. With #3138, the
+			// manager keeps public getters on the predecessor until commit after
+			// initializeLocalRoot(prepared), so agent publish cannot observe an
+			// ungated root.
 			const observations: Array<{ sessionId: string; markerExists: boolean }> = [];
 			const agentState = session.agent as unknown as { sessionId: string | undefined };
 			let publishedSessionId = agentState.sessionId;
