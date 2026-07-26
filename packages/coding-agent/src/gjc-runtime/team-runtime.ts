@@ -1638,12 +1638,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 	);
 	config.updated_at = nowIso;
 	await syncTeamConfigAndManifest(dir, config);
-	await writeJsonFile(path.join(dir, "workers", safePathSegment("worker_id", worker.id), "heartbeat.json"), {
-		pid: 0,
-		last_turn_at: nowIso,
-		turn_count: 0,
-		alive: true,
-	} satisfies WorkerHeartbeatFile);
+	await fs.rm(path.join(dir, "workers", safePathSegment("worker_id", worker.id), "heartbeat.json"), { force: true });
 	await writeLifecycleRecord(workerRuntime, dir, { ...worker, pane_id: newPaneId }, "starting", {
 		pane_id: newPaneId,
 		started_at: nowIso,
