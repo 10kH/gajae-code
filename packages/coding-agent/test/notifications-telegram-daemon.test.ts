@@ -19289,6 +19289,59 @@ describe("PR #3186 blockers", () => {
 		expect(runtime.legacyToolStarts.get(key)!.phase).toBe("visible");
 	});
 
+	test("retryable legacy start without its exact settlement is not requeued", async () => {
+		const bot = new FakeBotApi();
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const realCall = bot.call.bind(bot);
+		let startAttempts = 0;
+		bot.call = async (method, body, options) => {
+			if (method === "sendMessage" && String((body as { text?: unknown }).text).includes("read — started")) {
+				startAttempts++;
+				entered.resolve();
+				await release.promise;
+				return { ok: false, error_code: 429, parameters: { retry_after: 1 } };
+			}
+			return await realCall(method, body, options);
+		};
+		let now = 0;
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(tempAgentDir()),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			toolActivity: { enabled: true },
+			now: () => now,
+		});
+		const session = richSession();
+		await daemon.handleSessionMessage(session, { type: "hello", capabilities: [LEGACY_TOOL_ACTIVITY_CAPABILITY] });
+		await daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "repo",
+			branch: "branch",
+		});
+		const start = daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "lost-settlement",
+			toolName: "read",
+			phase: "started",
+		});
+		await entered.promise;
+		const runtime = daemon as unknown as {
+			legacyToolStarts: Map<string, unknown>;
+			flushPool(): Promise<void>;
+		};
+		runtime.legacyToolStarts.delete("S:tool:lost-settlement");
+		release.resolve();
+		await start;
+
+		now = 3_000;
+		await runtime.flushPool();
+		expect(startAttempts).toBe(1);
+	});
 	test("concurrent start and terminal frames use distinct pool item IDs sharing the same settlement", async () => {
 		const bot = new FakeBotApi();
 		const entered = Promise.withResolvers<void>();

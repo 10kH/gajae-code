@@ -7656,24 +7656,32 @@ export class TelegramNotificationDaemon {
 						let retryItemId: string | undefined;
 						let retryAllowed = true;
 						if (toolActivity?.phase === "started") {
-							const state = this.legacyToolStarts.get(
-								`${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`,
-							);
-							if (state !== undefined && state.owner === toolActivity) {
+							retryAllowed =
+								!this.toolActivityStopping &&
+								!this.stopRequested &&
+								this.opts.toolActivity?.enabled === true &&
+								toolActivity.policyEpoch === this.toolActivityPolicyEpoch &&
+								this.toolActivityAuthorityIsCurrent(toolActivity);
+							if (toolActivity.session.toolActivityCapability === "v1") {
+								const state = this.legacyToolStarts.get(
+									`${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`,
+								);
 								retryAllowed =
-									!state.terminalClaimed &&
-									!this.toolActivityStopping &&
-									!this.stopRequested &&
-									this.opts.toolActivity?.enabled === true &&
-									state.policyEpoch === this.toolActivityPolicyEpoch &&
-									this.toolActivityAuthorityIsCurrent(state.owner);
-								if (retryAllowed) {
-									state.phase = "queued";
-									state.itemId = `legacy-tool-start:${this.nextLegacyToolStartId++}`;
-									retryItemId = state.itemId;
-								} else {
-									this.settleLegacyToolStart(state, "cancelled");
+									retryAllowed &&
+									state !== undefined &&
+									state.owner === toolActivity &&
+									!state.terminalClaimed;
+								if (state !== undefined && state.owner === toolActivity) {
+									if (retryAllowed) {
+										state.phase = "queued";
+										state.itemId = `legacy-tool-start:${this.nextLegacyToolStartId++}`;
+										retryItemId = state.itemId;
+									} else {
+										this.settleLegacyToolStart(state, "cancelled");
+									}
 								}
+							} else if (retryAllowed) {
+								retryItemId = `tool-activity-start:${this.nextLegacyToolStartId++}`;
 							}
 						} else if (toolActivity?.phase === "terminal" && item.payload.legacyToolStart !== undefined) {
 							retryItemId = `legacy-tool-terminal:${this.nextLegacyToolStartId++}`;
