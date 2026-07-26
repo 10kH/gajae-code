@@ -1290,6 +1290,7 @@ async function writeWorkerMemoryGuardLedger(
 async function appendWorkerMemoryGuardAction(input: {
 	dir: string;
 	teamName: string;
+	cwd: string;
 	workerId: string;
 	task?: GjcTeamTask;
 	incidentId: string;
@@ -1299,20 +1300,24 @@ async function appendWorkerMemoryGuardAction(input: {
 }): Promise<void> {
 	const workerPath = path.join(input.dir, "workers", safePathSegment("worker_id", input.workerId));
 	const entries = await readTeamWorkerMemoryGuardLedger(workerPath);
-	await appendTeamWorkerMemoryGuardLedgerEntry(workerPath, {
-		schema_version: 1,
-		recorded_at: now(),
-		incident_id: input.incidentId,
-		team_name: input.teamName,
-		worker_id: input.workerId,
-		task_id: input.task?.id ?? "unclaimed",
-		claim_token: input.task?.claim?.token ?? "unclaimed",
-		attempt: nextTeamWorkerMemoryGuardAttempt(entries, input.incidentId),
-		platform: process.platform,
-		action: input.action,
-		result: input.result,
-		reason: input.reason,
-	});
+	await appendTeamWorkerMemoryGuardLedgerEntry(
+		workerPath,
+		{
+			schema_version: 1,
+			recorded_at: now(),
+			incident_id: input.incidentId,
+			team_name: input.teamName,
+			worker_id: input.workerId,
+			task_id: input.task?.id ?? "unclaimed",
+			claim_token: input.task?.claim?.token ?? "unclaimed",
+			attempt: nextTeamWorkerMemoryGuardAttempt(entries, input.incidentId),
+			platform: process.platform,
+			action: input.action,
+			result: input.result,
+			reason: input.reason,
+		},
+		{ cwd: input.cwd },
+	);
 }
 
 function normalizeWorkerMemoryGuardPlatform(value: unknown): string {
@@ -1591,6 +1596,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		await appendWorkerMemoryGuardAction({
 			dir,
 			teamName: input.teamName,
+			cwd: input.cwd,
 			workerId: worker.id,
 			task,
 			incidentId,
@@ -1621,6 +1627,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		await appendWorkerMemoryGuardAction({
 			dir,
 			teamName: input.teamName,
+			cwd: input.cwd,
 			workerId: worker.id,
 			task,
 			incidentId,
@@ -1645,6 +1652,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		await appendWorkerMemoryGuardAction({
 			dir,
 			teamName: input.teamName,
+			cwd: input.cwd,
 			workerId: worker.id,
 			task,
 			incidentId,
@@ -1680,6 +1688,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		await appendWorkerMemoryGuardAction({
 			dir,
 			teamName: input.teamName,
+			cwd: input.cwd,
 			workerId: worker.id,
 			task,
 			incidentId,
@@ -1727,6 +1736,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		await appendWorkerMemoryGuardAction({
 			dir,
 			teamName: input.teamName,
+			cwd: input.cwd,
 			workerId: worker.id,
 			task,
 			incidentId,
@@ -1776,6 +1786,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 	await appendWorkerMemoryGuardAction({
 		dir,
 		teamName: input.teamName,
+		cwd: input.cwd,
 		workerId: worker.id,
 		task,
 		incidentId,
