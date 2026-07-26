@@ -1551,12 +1551,15 @@ async function relaunchWorkerPaneForMemoryGuard(input: {
 		}
 		await Bun.sleep(50);
 	}
-	if (input.worker.pane_id && !paneBelongsToTeamTarget(input.config, input.worker.pane_id)) {
-		Bun.spawnSync([input.config.tmux_command, "kill-pane", "-t", newPaneId], {
-			stdout: "ignore",
-			stderr: "ignore",
-		});
-		throw new Error(`memory_guard_old_pane_outside_team_target:${input.worker.id}`);
+	if (input.worker.pane_id) {
+		const oldPane = probePaneTeamTarget(input.config, input.worker.pane_id);
+		if (oldPane.exists && !oldPane.belongsToTeamTarget) {
+			Bun.spawnSync([input.config.tmux_command, "kill-pane", "-t", newPaneId], {
+				stdout: "ignore",
+				stderr: "ignore",
+			});
+			throw new Error(`memory_guard_old_pane_outside_team_target:${input.worker.id}`);
+		}
 	}
 	Bun.spawnSync([input.config.tmux_command, "select-layout", "-t", input.config.tmux_target, "main-vertical"], {
 		stdout: "ignore",
@@ -1716,6 +1719,35 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		});
 		return { ok: true, result: "advisory", lifecycle_mutated: false, ledger };
 	}
+	const controllerPath = path.join(dir, "memory-guard-controller.json");
+	const controllerId = input.env.GJC_SESSION_ID?.trim() || `pid:${process.pid}`;
+	const controllerNow = currentTimeMs();
+	const controllerCooldownMs = parseDurationEnv(input.env, "GJC_TEAM_MEMORY_GUARD_ACTION_COOLDOWN_MS", 120_000);
+	const existingController = await readJsonFile<{
+		controller_id?: string;
+		cooldown_until?: string;
+	}>(controllerPath);
+	const existingCooldownUntil = Date.parse(existingController?.cooldown_until ?? "");
+	if (
+		existingController?.controller_id &&
+		existingController.controller_id !== controllerId &&
+		Number.isFinite(existingCooldownUntil) &&
+		existingCooldownUntil > controllerNow
+	)
+		return {
+			ok: true,
+			result: "advisory",
+			lifecycle_mutated: false,
+			reason: "team_memory_guard_controller_active",
+		};
+	await writeJsonFile(controllerPath, {
+		schema_version: 1,
+		controller_id: controllerId,
+		worker_id: worker.id,
+		incident_id: incidentId,
+		reserved_at: new Date(controllerNow).toISOString(),
+		cooldown_until: new Date(controllerNow + controllerCooldownMs).toISOString(),
+	});
 	const checkpoint = await checkpointWorkerForMemoryGuard(worker, currentTaskId);
 	if (!checkpoint.ok) {
 		const retried = withMemoryGuardRetry(ledger, {
@@ -1780,7 +1812,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		: undefined;
 	await fs.rm(startupAckPath, { force: true });
 	const replacementToken = input.replacementToken ?? randomUUID();
-	const startupAckTimeoutMs = parseDurationEnv(input.env, "GJC_TEAM_MEMORY_GUARD_STARTUP_TIMEOUT_MS", 10_000);
+	const startupAckTimeoutMs = parseDurationEnv(input.env, "GJC_TEAM_MEMORY_GUARD_STARTUP_TIMEOUT_MS", 120_000);
 	let newPaneId: string;
 	try {
 		newPaneId = await relaunchWorkerPaneForMemoryGuard({
@@ -1833,6 +1865,30 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 			ledger,
 		};
 	}
+	const postAckInventory = await readGjcContinuationAuthorityInventory(dir);
+	const postAckAuthority = postAckInventory.valid
+		? selectGjcContinuationWorkerAuthority(postAckInventory, worker.id)
+		: { valid: false as const, taskCount: 0, claimCount: 0 };
+	if (
+		!postAckAuthority.valid ||
+		postAckAuthority.task.id !== task?.id ||
+		postAckAuthority.claim.token !== task?.claim?.token ||
+		postAckAuthority.claim.leased_until !== task?.claim?.leased_until ||
+		Date.parse(postAckAuthority.claim.leased_until) <= currentTimeMs()
+	) {
+		Bun.spawnSync([config.tmux_command, "kill-pane", "-t", newPaneId], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		if (previousStartupAck !== undefined) await Bun.write(startupAckPath, previousStartupAck);
+		else await fs.rm(startupAckPath, { force: true });
+		return {
+			ok: true,
+			result: "advisory",
+			lifecycle_mutated: false,
+			reason: "worker_claim_authority_changed_after_startup",
+		};
+	}
 	const lifecyclePath = workerLifecyclePath(dir, worker.id);
 	const previousLifecycle = (await Bun.file(lifecyclePath).exists())
 		? await Bun.file(lifecyclePath).text()
@@ -1870,7 +1926,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 				stdout: "ignore",
 				stderr: "pipe",
 			});
-			if (killed.exitCode !== 0)
+			if (killed.exitCode !== 0 && probePaneTeamTarget(config, worker.pane_id).exists)
 				throw new Error(killed.stderr.toString().trim() || `memory_guard_kill_failed:${worker.id}`);
 		}
 	} catch (error) {
@@ -2720,15 +2776,19 @@ async function startTmuxSession(
 		throw error;
 	}
 }
-function paneBelongsToTeamTarget(config: GjcTeamConfig, paneId: string): boolean {
-	if (paneId === config.leader.pane_id) return false;
+function probePaneTeamTarget(config: GjcTeamConfig, paneId: string): { exists: boolean; belongsToTeamTarget: boolean } {
+	if (paneId === config.leader.pane_id) return { exists: true, belongsToTeamTarget: false };
 	const result = Bun.spawnSync([config.tmux_command, "display-message", "-p", "-t", paneId, "#S:#I #{pane_id}"], {
 		stdout: "pipe",
 		stderr: "ignore",
 	});
-	if (result.exitCode !== 0) return false;
+	if (result.exitCode !== 0) return { exists: false, belongsToTeamTarget: false };
 	const [target = "", detectedPaneId = ""] = result.stdout.toString().trim().split(/\s+/);
-	return target === config.tmux_target && detectedPaneId === paneId;
+	return { exists: true, belongsToTeamTarget: target === config.tmux_target && detectedPaneId === paneId };
+}
+
+function paneBelongsToTeamTarget(config: GjcTeamConfig, paneId: string): boolean {
+	return probePaneTeamTarget(config, paneId).belongsToTeamTarget;
 }
 function killWorkerPanes(config: GjcTeamConfig): void {
 	for (const worker of config.workers)
@@ -2869,13 +2929,24 @@ const UNMERGED_GIT_STATUS_CODES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "
 // into the leader branch on projects that do not gitignore `.gjc/_session-*/`.
 const PROTECTED_WORKER_CHECKPOINT_PREFIXES = [".gjc/_session-*/"];
 
-function parsePorcelainStatusFiles(stdout: string): string[] {
-	return stdout
-		.split(/\r?\n/)
-		.map(line => line.trimEnd())
-		.filter(Boolean)
-		.map(line => line.slice(3).trim())
-		.filter(Boolean);
+function parsePorcelainStatus(stdout: string): { files: string[]; statusCodes: string[] } {
+	const records = stdout.split("\0");
+	const files: string[] = [];
+	const statusCodes: string[] = [];
+	for (let index = 0; index < records.length; index++) {
+		const record = records[index];
+		if (!record) continue;
+		const statusCode = record.slice(0, 2);
+		const file = record.slice(3);
+		if (!file) continue;
+		statusCodes.push(statusCode);
+		files.push(file);
+		if (statusCode.includes("R") || statusCode.includes("C")) {
+			const source = records[++index];
+			if (source) files.push(source);
+		}
+	}
+	return { files: [...new Set(files)], statusCodes };
 }
 
 function normalizeGitStatusPath(filePath: string): string {
@@ -2902,7 +2973,7 @@ export function classifyGjcTeamCheckpointFiles(files: string[]): {
 }
 
 export function classifyWorkerCheckpointStatus(cwd: string): GjcWorkerCheckpointClassification {
-	const status = runGitResult(cwd, ["status", "--porcelain", "-uall"]);
+	const status = runGitResult(cwd, ["status", "--porcelain=v1", "-z", "-uall"]);
 	if (!status.ok) {
 		return {
 			kind: "git_error",
@@ -2911,11 +2982,9 @@ export function classifyWorkerCheckpointStatus(cwd: string): GjcWorkerCheckpoint
 		};
 	}
 	if (!status.stdout.trim()) return { kind: "clean", files: [] };
-	const files = parsePorcelainStatusFiles(status.stdout);
-	const hasUnmergedStatus = status.stdout
-		.split(/\r?\n/)
-		.filter(Boolean)
-		.some(line => UNMERGED_GIT_STATUS_CODES.has(line.slice(0, 2)));
+	const parsed = parsePorcelainStatus(status.stdout);
+	const files = parsed.files;
+	const hasUnmergedStatus = parsed.statusCodes.some(code => UNMERGED_GIT_STATUS_CODES.has(code));
 	const conflictFiles = listConflictFiles(cwd);
 	if (hasUnmergedStatus || conflictFiles.length > 0) {
 		return {
@@ -2932,7 +3001,7 @@ export async function classifyWorkerCheckpointStatusAsync(
 	cwd: string,
 	signal?: AbortSignal,
 ): Promise<GjcWorkerCheckpointClassification> {
-	const status = await runGitResultAsync(cwd, ["status", "--porcelain", "-uall"], signal);
+	const status = await runGitResultAsync(cwd, ["status", "--porcelain=v1", "-z", "-uall"], signal);
 	if (!status.ok) {
 		return {
 			kind: "git_error",
@@ -2941,11 +3010,9 @@ export async function classifyWorkerCheckpointStatusAsync(
 		};
 	}
 	if (!status.stdout.trim()) return { kind: "clean", files: [] };
-	const files = parsePorcelainStatusFiles(status.stdout);
-	const hasUnmergedStatus = status.stdout
-		.split(/\r?\n/)
-		.filter(Boolean)
-		.some(line => UNMERGED_GIT_STATUS_CODES.has(line.slice(0, 2)));
+	const parsed = parsePorcelainStatus(status.stdout);
+	const files = parsed.files;
+	const hasUnmergedStatus = parsed.statusCodes.some(code => UNMERGED_GIT_STATUS_CODES.has(code));
 	const conflictFiles = await listConflictFilesAsync(cwd, signal);
 	if (hasUnmergedStatus || conflictFiles.length > 0) {
 		return {
@@ -4109,7 +4176,24 @@ async function writeGjcWorkerStartupAck(
 	env: NodeJS.ProcessEnv,
 	input: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-	return writeWorkerStartupAck(workerRuntime, teamName, worker, cwd, env, input);
+	const pid = typeof input.pid === "number" && input.pid > 0 ? input.pid : process.pid;
+	const ackInput = { ...input, pid };
+	const ackAt = now();
+	await updateWorkerHeartbeat(
+		workerRuntime,
+		teamName,
+		worker,
+		{
+			pid,
+			last_turn_at: ackAt,
+			turn_count: 0,
+			alive: true,
+			process_start_time: await readLinuxProcessStartTime(pid),
+		},
+		cwd,
+		env,
+	);
+	return writeWorkerStartupAck(workerRuntime, teamName, worker, cwd, env, ackInput);
 }
 function parseDurationEnv(env: NodeJS.ProcessEnv, name: string, fallbackMs: number): number {
 	const raw = env[name]?.trim();

@@ -10,6 +10,7 @@ import {
 	buildWorkerCommand,
 	claimGjcTeamTask,
 	classifyGjcTeamCheckpointFiles,
+	classifyWorkerCheckpointStatus,
 	executeGjcTeamApiOperation,
 	type GjcTeamConfig,
 	type GjcTeamWorker,
@@ -2847,6 +2848,15 @@ describe("native gjc team runtime", () => {
 		expect(await Bun.file(path.join(cleanupRoot, ".omx", "reports", "team-commit-hygiene")).exists()).toBe(false);
 	});
 
+	it("decodes quoted porcelain paths for worker checkpoints", async () => {
+		cleanupRoot = await createGitRepo();
+		const spacedPath = path.join(cleanupRoot, "report draft.md");
+		await Bun.write(spacedPath, "checkpoint me\n");
+		expect(classifyWorkerCheckpointStatus(cleanupRoot)).toEqual({
+			kind: "eligible",
+			files: ["report draft.md"],
+		});
+	});
 	it("checkpoint classification excludes GJC runtime paths from worker auto-commits", async () => {
 		const protectedTeamPath = `.gjc/_session-${TEST_SESSION_ID}/state/team/demo/worker.json`;
 		const protectedReportPath = `.gjc/_session-${TEST_SESSION_ID}/reports/team-commit-hygiene/demo.ledger.json`;
