@@ -245,6 +245,7 @@ import { resolveCurrentPhaseForParent } from "../extensibility/gjc-plugins/injec
 import { readActiveSubskillsForParent, toActiveSubskillEntry } from "../extensibility/gjc-plugins/state";
 import { loadActiveSubskillTools } from "../extensibility/gjc-plugins/tools";
 import type { HookCommandContext } from "../extensibility/hooks/types";
+import type { SessionSwitchEvent } from "../extensibility/shared-events";
 import {
 	buildSkillPromptMessage,
 	getSkillSlashCommandName,
@@ -14777,7 +14778,10 @@ export class AgentSession {
 	 * Listeners are preserved and will continue receiving events.
 	 * @returns true if switch completed, false if cancelled by hook
 	 */
-	async switchSession(sessionPath: string): Promise<boolean> {
+	async switchSession(
+		sessionPath: string,
+		options?: { transition?: SessionSwitchEvent["transition"] },
+	): Promise<boolean> {
 		this.#beginSessionTransition("switch-session");
 		try {
 			const previousSessionFile = this.sessionManager.getSessionFile();
@@ -14936,6 +14940,7 @@ export class AgentSession {
 						type: "session_switch",
 						reason: "resume",
 						previousSessionFile,
+						...(options?.transition ? { transition: options.transition } : {}),
 					});
 				}
 				return true;
