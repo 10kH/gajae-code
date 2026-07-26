@@ -373,9 +373,9 @@ describe("resource GC controller", () => {
 			expect.objectContaining({ sessionId: "s1", effectiveLimitBytes: 100 * MB }),
 		);
 		settings.set("memoryGuard.enabled", false);
-		await sweepOnce(deps);
 		settings.set("memoryGuard.enabled", true);
 		await sweepOnce(deps);
+		expect(runGc).toHaveBeenCalledTimes(3);
 		now += 90_000;
 		await sweepOnce(deps);
 		expect(logWarn.mock.calls.filter(call => call[0].includes("restart threshold sustained"))).toHaveLength(2);

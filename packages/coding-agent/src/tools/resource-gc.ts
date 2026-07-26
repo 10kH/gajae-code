@@ -146,6 +146,12 @@ export function registerResourceGcSession(reg: ResourceGcRegistration): () => vo
 			path === "resourceGc.sweepIntervalMs"
 		) {
 			scheduler.updateInterval(reg.sessionId, resolveSessionSweepIntervalMs(reg.settings));
+			if (path === "memoryGuard.enabled" && !resolveMemoryGuardPolicy(reg.settings).enabled) {
+				memoryGuardGcActive.delete(reg.sessionId);
+				memoryGuardRestartAboveSince.delete(reg.sessionId);
+				memoryGuardRestartCooldownUntil.delete(reg.sessionId);
+				memoryGuardLastEvaluatedAt.delete(reg.sessionId);
+			}
 		}
 	});
 	let unregistered = false;
