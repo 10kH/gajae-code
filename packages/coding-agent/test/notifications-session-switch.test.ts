@@ -305,9 +305,13 @@ test("accepted turn.prompt submission failures emit a correlated terminal event"
 	createNotificationsExtension({
 		on: (event: string, handler: Handler) => handlers.set(event, handler),
 		registerCommand: () => {},
-		sendUserMessage: (_content: unknown, options: { onPreflightAccepted?: () => void } | undefined) => {
-			options?.onPreflightAccepted?.();
-			return Promise.reject(Object.assign(new Error("submission failed after acceptance"), { code: "unavailable" }));
+		sendUserMessage: async (
+			_content: unknown,
+			options?: { onPreflightAccepted?: () => void; onPreflightAcceptCommit?: () => void | Promise<void> },
+		) => {
+			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+			else options?.onPreflightAccepted?.();
+			throw Object.assign(new Error("submission failed after acceptance"), { code: "unavailable" });
 		},
 	} as never);
 	const sessionId = `terminal-failure-${process.pid}-${Date.now()}`;
