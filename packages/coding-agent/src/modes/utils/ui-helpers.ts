@@ -97,30 +97,86 @@ export interface ResumeProgressLease {
  * Mount a resume loader on the live status rail and wait for its render generation
  * to commit before session I/O begins. The commit is advisory: a stopped or
  * unavailable terminal resolves false and callers continue without blocking.
+ *
+ * Fail open (no-op lease, committed=false) when the status rail or UI lacks the
+ * child-mutation/render-commit surface required to mount progress. Headless and
+ * minimal controller contexts keep resume/migration semantics; full interactive
+ * TUI containers retain progress-before-switch.
  */
 export function acquireResumeProgressLease(
 	ctx: Pick<InteractiveModeContext, "ui" | "statusContainer">,
 ): ResumeProgressLease {
+	if (!canMountResumeProgressLease(ctx)) {
+		return {
+			committed: Promise.resolve(false),
+			clear(): void {},
+		};
+	}
+
+	const statusContainer = ctx.statusContainer as ResumeProgressStatusSurface;
+	const ui = ctx.ui as ResumeProgressUiSurface;
 	const loader = new Loader(
-		ctx.ui,
+		ui,
 		spinner => theme?.fg?.("accent", spinner) ?? spinner,
 		message => theme?.fg?.("muted", message) ?? message,
 		"Resuming session…",
 	);
-	ctx.statusContainer.addChild(loader);
-	const generation = ctx.ui.requestRenderWithGeneration(false, "resume-progress");
+	statusContainer.addChild(loader);
+	const generation = ui.requestRenderWithGeneration(false, "resume-progress");
 	let active = true;
-	const committed = ctx.ui.waitForRenderCommit(generation, RESUME_PROGRESS_COMMIT_TIMEOUT_MS).catch(() => false);
+	const committed = ui.waitForRenderCommit(generation, RESUME_PROGRESS_COMMIT_TIMEOUT_MS).catch(() => false);
 	return {
 		committed,
 		clear(): void {
 			if (!active) return;
 			active = false;
-			if (ctx.statusContainer.children.includes(loader)) ctx.statusContainer.removeChild(loader);
+			if (statusContainer.children.includes(loader)) statusContainer.removeChild(loader);
 			else loader.stop();
-			ctx.ui.requestRender(false, "resume-progress-clear");
+			ui.requestRender(false, "resume-progress-clear");
 		},
 	};
+}
+
+type ResumeProgressStatusSurface = {
+	addChild: (child: Component) => void;
+	removeChild: (child: Component) => void;
+	children: Component[];
+};
+
+type ResumeProgressUiSurface = InteractiveModeContext["ui"] & {
+	requestRenderWithGeneration: (force?: boolean, source?: string) => number;
+	waitForRenderCommit: (generation: number, timeoutMs?: number) => Promise<boolean>;
+	requestRender: (force?: boolean, source?: string) => void;
+};
+
+function canMountResumeProgressLease(ctx: Pick<InteractiveModeContext, "ui" | "statusContainer">): boolean {
+	const status = ctx.statusContainer as
+		| Partial<{
+				addChild: unknown;
+				removeChild: unknown;
+				children: unknown;
+		  }>
+		| null
+		| undefined;
+	const ui = ctx.ui as
+		| Partial<{
+				requestRenderWithGeneration: unknown;
+				waitForRenderCommit: unknown;
+				requestRender: unknown;
+		  }>
+		| null
+		| undefined;
+
+	return (
+		!!status &&
+		typeof status.addChild === "function" &&
+		typeof status.removeChild === "function" &&
+		Array.isArray(status.children) &&
+		!!ui &&
+		typeof ui.requestRenderWithGeneration === "function" &&
+		typeof ui.waitForRenderCommit === "function" &&
+		typeof ui.requestRender === "function"
+	);
 }
 type TextBlock = { type: "text"; text: string };
 interface RenderInitialMessagesOptions {
