@@ -3803,6 +3803,7 @@ function listProjectSessionTranscriptFiles(cwd: string): string[] {
 			}
 			if (
 				entry.isFile() &&
+				!entry.name.startsWith(".") &&
 				entry.name.endsWith(".jsonl") &&
 				isProjectSessionTranscriptPath(projectGjcDir, entryPath)
 			) {
@@ -3822,7 +3823,8 @@ function mergeSessionInventories(...inventories: SessionInfo[][]): SessionInfo[]
 	const sessions = new Map<string, SessionInfo>();
 	for (const inventory of inventories) {
 		for (const session of inventory) {
-			if (!sessions.has(session.id)) sessions.set(session.id, session);
+			const current = sessions.get(session.id);
+			if (!current || session.modified.getTime() > current.modified.getTime()) sessions.set(session.id, session);
 		}
 	}
 	return [...sessions.values()].sort((left, right) => right.modified.getTime() - left.modified.getTime());
@@ -4461,6 +4463,9 @@ export class SessionManager {
 				}
 			},
 		};
+	}
+	#coldSpillReadStore(): BlobStore {
+		return this.#memoryGuardCheckpointBlobs ? this.#residentImageBlobStore : this.#blobStore;
 	}
 
 	#residentCacheDir(sessionFile: string): string {
@@ -7687,7 +7692,7 @@ export class SessionManager {
 			? cloneSessionEntry(
 					rehydrateColdSpillEntry(
 						materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map()),
-						this.#blobStore,
+						this.#coldSpillReadStore(),
 						this.#residentBlobStoresForColdRehydrate(),
 					),
 				)
@@ -7706,7 +7711,7 @@ export class SessionManager {
 				cloneSessionEntry(
 					rehydrateColdSpillEntry(
 						materializeResidentEntryForReadSync(current, this.#residentBlobStores(), cache),
-						this.#blobStore,
+						this.#coldSpillReadStore(),
 						this.#residentBlobStoresForColdRehydrate(),
 					),
 				),
@@ -7748,7 +7753,7 @@ export class SessionManager {
 				cloneSessionEntry(
 					rehydrateColdSpillEntry(
 						materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), cache),
-						this.#blobStore,
+						this.#coldSpillReadStore(),
 						this.#residentBlobStoresForColdRehydrate(),
 					),
 				),
@@ -7914,7 +7919,7 @@ export class SessionManager {
 		const materialized = materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), new Map());
 		const rehydrated = rehydrateColdSpillEntry(
 			materialized,
-			this.#blobStore,
+			this.#coldSpillReadStore(),
 			this.#residentBlobStoresForColdRehydrate(),
 		);
 		if (rehydrated !== materialized) this.#coldSpillReadCount += this.#countColdSpillPayloads(entry);
@@ -9014,10 +9019,10 @@ export class SessionManager {
 				: undefined;
 		const cleanupTranscript = async (): Promise<void> => {
 			if (managedStagingStore) {
-				await managedStagingStore.remove(transcriptName).catch(() => undefined);
+				await managedStagingStore.remove(transcriptName);
 				return;
 			}
-			await fs.promises.rm(transcriptPath, { force: true }).catch(() => undefined);
+			await fs.promises.rm(transcriptPath, { force: true });
 		};
 		let opened: RecoveryHydrationOpenResult;
 		let transcriptIdentity: ResumeSessionIdentity;
@@ -9067,10 +9072,10 @@ export class SessionManager {
 		let cleanupConsumed = false;
 		const cleanup = async (): Promise<void> => {
 			if (cleanupConsumed) return;
-			cleanupConsumed = true;
 			await opened.manager.close();
 			await cleanupTranscript();
 			await removeCreatedDirectoryIfEmpty(destination.directory, createdDestination);
+			cleanupConsumed = true;
 		};
 		return {
 			kind: "staged",

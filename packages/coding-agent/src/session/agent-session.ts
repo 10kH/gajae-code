@@ -255,7 +255,11 @@ import {
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { assertDeepInterviewIntentManifest } from "../gjc-runtime/deep-interview-state";
 import { buildGjcRuntimeSessionEnv, consumePendingGoalModeRequest } from "../gjc-runtime/goal-mode-request";
-import { isMemoryGuardClaimsLease, type MemoryGuardClaimsLease } from "../gjc-runtime/memory-guard-owner-claims";
+import {
+	isMemoryGuardClaimsLease,
+	isMemoryGuardClaimsLeaseForStateDir,
+	type MemoryGuardClaimsLease,
+} from "../gjc-runtime/memory-guard-owner-claims";
 import {
 	assertNonEmptyGjcSessionId,
 	modeStatePath as sessionModeStatePath,
@@ -620,6 +624,7 @@ export interface AgentSessionMemoryGuardRestoreInput
 	extends Omit<AgentSessionConfig, "sessionManager" | "recoveryHydrationContext"> {
 	staged: Extract<MemoryGuardRestoreResult, { kind: "staged" }>;
 	claimsLease: MemoryGuardClaimsLease;
+	claimsStateDir: string;
 }
 
 export interface AgentMemoryGuardPromotionFence extends RecoveryHydrationPromotionFence {
@@ -6465,7 +6470,7 @@ export class AgentSession {
 	static async restoreFromMemoryGuardCheckpoint(
 		input: AgentSessionMemoryGuardRestoreInput,
 	): Promise<AgentMemoryGuardRestoreResult> {
-		const { staged, claimsLease, ...config } = input;
+		const { staged, claimsLease, claimsStateDir, ...config } = input;
 		if (
 			staged.manager.getSessionId() !== staged.transcriptIdentity.sessionId ||
 			staged.hydrationContext.identity.sessionId !== staged.transcriptIdentity.sessionId
@@ -6474,7 +6479,7 @@ export class AgentSession {
 			return { kind: "blocked", reason: "transcript-mismatch" };
 		}
 		if (
-			!isMemoryGuardClaimsLease(claimsLease) ||
+			!isMemoryGuardClaimsLeaseForStateDir(claimsLease, claimsStateDir) ||
 			claimsLease.owner.sessionId !== staged.transcriptIdentity.sessionId
 		) {
 			await staged.cleanup();

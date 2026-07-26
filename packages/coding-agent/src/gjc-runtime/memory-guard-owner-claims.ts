@@ -22,6 +22,7 @@ export interface MemoryGuardClaimsLease {
 	writerEpoch: number;
 	ttyEpoch: number;
 	owner: MemoryGuardClaimOwner;
+	claimStorePath: string;
 }
 
 const issuedMemoryGuardClaimsLeases = new WeakSet<MemoryGuardClaimsLease>();
@@ -36,6 +37,12 @@ function issueMemoryGuardClaimsLease(lease: MemoryGuardClaimsLease): MemoryGuard
 export function isMemoryGuardClaimsLease(value: unknown): value is MemoryGuardClaimsLease {
 	return (
 		typeof value === "object" && value !== null && issuedMemoryGuardClaimsLeases.has(value as MemoryGuardClaimsLease)
+	);
+}
+export function isMemoryGuardClaimsLeaseForStateDir(value: unknown, stateDir: string): value is MemoryGuardClaimsLease {
+	return (
+		isMemoryGuardClaimsLease(value) &&
+		value.claimStorePath === memoryGuardClaimPaths(stateDir, value.owner.sessionId).databaseFile
 	);
 }
 
@@ -284,7 +291,7 @@ export async function acquireMemoryGuardClaims(
 				insertClaimRow(database, "tty", ttyEpoch, owner, acquiredAt);
 				database.exec("COMMIT");
 				await enforceDatabaseModes(databaseFile);
-				return issueMemoryGuardClaimsLease({ writerEpoch, ttyEpoch, owner });
+				return issueMemoryGuardClaimsLease({ writerEpoch, ttyEpoch, owner, claimStorePath: databaseFile });
 			} catch (error) {
 				rollbackQuietly(database);
 				throw error;
@@ -299,6 +306,8 @@ export async function acquireMemoryGuardClaims(
 export async function releaseMemoryGuardClaims(stateDir: string, claim: MemoryGuardClaimsLease): Promise<void> {
 	if (!issuedMemoryGuardClaimsLeases.has(claim)) throw new Error("memory_guard_claim_lease_invalid");
 	assertClaimOwner(claim.owner);
+	const expectedDatabaseFile = memoryGuardClaimPaths(stateDir, claim.owner.sessionId).databaseFile;
+	if (claim.claimStorePath !== expectedDatabaseFile) throw new Error("memory_guard_claim_store_mismatch");
 	const { database } = await openClaimsDatabase(stateDir, claim.owner.sessionId);
 	try {
 		database.exec("BEGIN IMMEDIATE");
@@ -345,7 +354,7 @@ export async function probeMemoryGuardClaimsReleased(
 				insertClaimRow(database, "tty", ttyEpoch, owner, acquiredAt);
 				database.exec("COMMIT");
 				await enforceDatabaseModes(databaseFile);
-				const proof = issueMemoryGuardClaimsLease({ writerEpoch, ttyEpoch, owner });
+				const proof = issueMemoryGuardClaimsLease({ writerEpoch, ttyEpoch, owner, claimStorePath: databaseFile });
 				await releaseMemoryGuardClaims(stateDir, proof);
 				return proof;
 			} catch (error) {

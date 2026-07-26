@@ -146,6 +146,7 @@ describe("memory guard checkpoint export/restore", () => {
 				modelRegistry: new ModelRegistry(authStorage),
 				staged: restored,
 				claimsLease,
+				claimsStateDir: path.join(root, "claims"),
 			});
 			expect(session.kind).toBe("staged");
 			if (session.kind !== "staged") return;
