@@ -1998,6 +1998,12 @@ export class AuthStorage {
 				await saveApiKeyCredential(apiKey);
 				return;
 			}
+			case "bizrouter": {
+				const { loginBizRouter } = await import("./utils/oauth/bizrouter");
+				const apiKey = await loginBizRouter(ctrl);
+				await saveApiKeyCredential(apiKey);
+				return;
+			}
 			case "opengateway": {
 				const { loginOpenGateway } = await import("./utils/oauth/opengateway");
 				const apiKey = await loginOpenGateway(ctrl);

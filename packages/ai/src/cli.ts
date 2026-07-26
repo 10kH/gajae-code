@@ -119,6 +119,7 @@ Providers:
   cursor            Cursor (Anthropic, GPT, etc.)
   zenmux            ZenMux
   opengateway       OpenGateway by Sionic AI
+  bizrouter         BizRouter
   ollama-cloud      Ollama Cloud
 
 Examples:
