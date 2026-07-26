@@ -12,7 +12,7 @@ import {
 import { parseModelString } from "@gajae-code/coding-agent/config/model-resolver";
 import { ProfileModelSelectorSchema } from "@gajae-code/coding-agent/config/models-config-schema";
 import modelsJson from "../../ai/src/models.json";
-import { selectorHead } from "../src/config/model-selector-value";
+import { normalizeModelSelectorValue, selectorHead } from "../src/config/model-selector-value";
 
 type Role = "default" | "executor" | "planner" | "critic" | "architect";
 
@@ -218,6 +218,39 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		},
 	},
 	{
+		name: "grok-45-eco",
+		requiredProviders: ["xai"],
+		mapping: {
+			default: "xai/grok-4.5:low",
+			executor: "xai/grok-4.5:minimal",
+			planner: "xai/grok-4.5:low",
+			critic: "xai/grok-4.5:medium",
+			architect: "xai/grok-4.5:high",
+		},
+	},
+	{
+		name: "grok-45-medium",
+		requiredProviders: ["xai"],
+		mapping: {
+			default: "xai/grok-4.5:medium",
+			executor: "xai/grok-4.5:low",
+			planner: "xai/grok-4.5:medium",
+			critic: "xai/grok-4.5:high",
+			architect: "xai/grok-4.5:high",
+		},
+	},
+	{
+		name: "grok-45-pro",
+		requiredProviders: ["xai"],
+		mapping: {
+			default: "xai/grok-4.5:high",
+			executor: "xai/grok-4.5:medium",
+			planner: "xai/grok-4.5:high",
+			critic: "xai/grok-4.5:high",
+			architect: "xai/grok-4.5:high",
+		},
+	},
+	{
 		name: "grok-build-pro",
 		requiredProviders: ["grok-build"],
 		mapping: {
@@ -406,7 +439,7 @@ const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> 
 };
 
 describe("built-in model profile catalog", () => {
-	test("contains exact 30-profile matrix cell-for-cell", () => {
+	test("contains exact 33-profile matrix cell-for-cell", () => {
 		expect(BUILTIN_MODEL_PROFILES.map(profile => profile.name)).toEqual(
 			expectedProfiles.map(profile => profile.name),
 		);
@@ -414,6 +447,47 @@ describe("built-in model profile catalog", () => {
 			const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === expected.name);
 			expect(profile?.requiredProviders).toEqual(expected.requiredProviders);
 			expect(profile?.modelMapping).toEqual(expected.mapping);
+		}
+	});
+	test("Grok 4.5 profiles resolve every role at the expected effort", () => {
+		const profiles = mergeModelProfiles();
+		for (const name of ["grok-45-eco", "grok-45-medium", "grok-45-pro"] as const) {
+			const expected = expectedProfiles.find(profile => profile.name === name);
+			if (!expected) throw new Error(`Missing expected profile: ${name}`);
+			const definition = profiles.get(name);
+			if (!definition) throw new Error(`Missing resolved profile: ${name}`);
+			const resolved = resolveProfileBindings(definition);
+			expect(resolved.defaultSelector).toBe(expected.mapping.default);
+			expect(resolved.agentModelOverrides).toEqual({
+				executor: expected.mapping.executor,
+				architect: expected.mapping.architect,
+				planner: expected.mapping.planner,
+				critic: expected.mapping.critic,
+			});
+		}
+	});
+
+	test("Grok 4.5 profiles never request unsupported xhigh reasoning", () => {
+		const grok45Profiles = BUILTIN_MODEL_PROFILES.filter(profile => profile.name.startsWith("grok-45-"));
+		expect(grok45Profiles.map(profile => profile.name)).toEqual(["grok-45-eco", "grok-45-medium", "grok-45-pro"]);
+		for (const profile of grok45Profiles) {
+			for (const selectorValue of Object.values(profile.modelMapping)) {
+				for (const selector of normalizeModelSelectorValue(selectorValue)) {
+					const trimmedSelector = selector.trim();
+					const separator = trimmedSelector.lastIndexOf(":");
+					const hasEffort = separator > trimmedSelector.indexOf("/");
+					const modelReference = hasEffort ? trimmedSelector.slice(0, separator).trim() : trimmedSelector;
+					const parsed = parseModelString(modelReference);
+					if (parsed?.provider.toLowerCase() !== "xai" || parsed.id.toLowerCase() !== "grok-4.5") continue;
+					const effort = hasEffort
+						? trimmedSelector
+								.slice(separator + 1)
+								.trim()
+								.toLowerCase()
+						: undefined;
+					expect(["minimal", "low", "medium", "high"]).toContain(effort);
+				}
+			}
 		}
 	});
 
@@ -501,6 +575,13 @@ describe("built-in model profile catalog", () => {
 			displayName: "Kimi Coding Plan Medium",
 			providerGroup: "KIMI CODING PLAN",
 		});
+		for (const [name, displayName] of Object.entries({
+			"grok-45-eco": "Grok 4.5 Eco",
+			"grok-45-medium": "Grok 4.5 Medium",
+			"grok-45-pro": "Grok 4.5 Pro",
+		})) {
+			expect(getModelProfilePresentation(name)).toEqual({ displayName, providerGroup: "GROK" });
+		}
 		expect([...groupModelProfilesForPresetLanding(profiles).keys()]).toEqual([
 			"CODEX",
 			"OPENCODEGO",
