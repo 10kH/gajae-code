@@ -2360,13 +2360,7 @@ function sdkControlSurface(
 			const commandId = crypto.randomUUID();
 			const turnId = crypto.randomUUID();
 			const correlation = { commandId, turnId };
-			if (skillRecon) {
-				try {
-					skillRecon.admit(trimmedClientRef);
-				} catch (error) {
-					throw error;
-				}
-			}
+			if (skillRecon) skillRecon.admit(trimmedClientRef);
 			const { promise: acceptedP, resolve, reject } = Promise.withResolvers<Record<string, unknown>>();
 			let phase: "pending" | "accepted" | "rejected" = "pending";
 			const settleAccept = (value: Record<string, unknown>) => {
