@@ -522,6 +522,7 @@ describe("resource GC controller", () => {
 			"team-session",
 			"team-a/worker-1",
 			expect.any(Number),
+			"worker-pressure:team-session:0",
 		);
 	});
 	it("schedules an enabled guard at its configured check interval", async () => {

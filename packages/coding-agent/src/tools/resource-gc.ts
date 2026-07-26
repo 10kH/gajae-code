@@ -20,7 +20,12 @@ import { logger } from "@gajae-code/utils";
 import type { Settings } from "../config/settings";
 import { executeGjcTeamApiOperation, listGjcTeams, readGjcWorkerHeartbeat } from "../gjc-runtime/team-runtime";
 import { computeMemoryGuardDomain } from "../runtime/memory-domain";
-import { chooseMemoryGuardAction, MemoryGuardHost, resolveMemoryGuardPolicy } from "../runtime/memory-guard";
+import {
+	chooseMemoryGuardAction,
+	MemoryGuardHost,
+	resolveMemoryGuardPolicy,
+	revalidateMemoryGuardAction,
+} from "../runtime/memory-guard";
 import type { MemoryGuardPolicy, MemoryGuardWorkerSample } from "../runtime/memory-guard-contract";
 import { resolveEffectiveMemoryLimit } from "../runtime/memory-limit";
 import { listTabsForGc, releaseTabIfGcEligible, type TabGcSnapshot } from "./browser/tab-supervisor";
@@ -87,7 +92,13 @@ export interface ResourceGcDeps {
 	cleanupScreenshots: (opts: { now: () => number; staleMs: number }) => Promise<{ scanned: number; removed: number }>;
 	screenshotArmed: () => boolean;
 	listTeamWorkers?: (cwd: string, sessionId: string) => Promise<MemoryGuardWorkerSample[]>;
-	applyTeamWorkerGuard?: (cwd: string, sessionId: string, workerId: string, excessBytes: number) => Promise<void>;
+	applyTeamWorkerGuard?: (
+		cwd: string,
+		sessionId: string,
+		workerId: string,
+		excessBytes: number,
+		incidentId: string,
+	) => Promise<void>;
 }
 
 const defaultDeps: ResourceGcDeps = {
@@ -102,8 +113,8 @@ const defaultDeps: ResourceGcDeps = {
 	cleanupScreenshots: opts => cleanupStaleScreenshotFallbackDirs(opts),
 	screenshotArmed: () => hasCreatedScreenshotFallbackDir(),
 	listTeamWorkers: (cwd, sessionId) => sampleTeamWorkers(cwd, sessionId),
-	applyTeamWorkerGuard: (cwd, sessionId, workerId, excessBytes) =>
-		applySelectedTeamWorker(cwd, sessionId, workerId, excessBytes),
+	applyTeamWorkerGuard: (cwd, sessionId, workerId, excessBytes, incidentId) =>
+		applySelectedTeamWorker(cwd, sessionId, workerId, excessBytes, incidentId),
 };
 
 // ── Controller state (process-global; tabs/browsers are module-global too) ──────────────────
@@ -120,6 +131,7 @@ const memoryGuardGcActive = new Set<string>();
 const memoryGuardLastEvaluatedAt = new Map<string, number>();
 const memoryGuardRestartAboveSince = new Map<string, number>();
 const memoryGuardRestartCooldownUntil = new Map<string, number>();
+const memoryGuardWorkerIncidentIds = new Map<string, string>();
 let deps: ResourceGcDeps = defaultDeps;
 
 export interface ResourceGcRegistration {
@@ -156,6 +168,7 @@ export function registerResourceGcSession(reg: ResourceGcRegistration): () => vo
 			if (path === "memoryGuard.enabled" && !resolveMemoryGuardPolicy(reg.settings).enabled) {
 				memoryGuardGcActive.delete(reg.sessionId);
 				memoryGuardRestartAboveSince.delete(reg.sessionId);
+				memoryGuardWorkerIncidentIds.delete(reg.sessionId);
 				memoryGuardRestartCooldownUntil.delete(reg.sessionId);
 				memoryGuardLastEvaluatedAt.delete(reg.sessionId);
 			}
@@ -169,6 +182,7 @@ export function registerResourceGcSession(reg: ResourceGcRegistration): () => vo
 		memoryGuardLastEvaluatedAt.delete(reg.sessionId);
 		memoryGuardGcActive.delete(reg.sessionId);
 		memoryGuardRestartAboveSince.delete(reg.sessionId);
+		memoryGuardWorkerIncidentIds.delete(reg.sessionId);
 		memoryGuardRestartCooldownUntil.delete(reg.sessionId);
 		unregisterSchedule();
 		unregisterSettings();
@@ -493,6 +507,7 @@ function sweepMemoryPressureGuard(d: ResourceGcDeps): Promise<void> | undefined 
 		}
 		memoryGuardGcActive.delete(sessionId);
 		memoryGuardRestartAboveSince.delete(sessionId);
+		memoryGuardWorkerIncidentIds.delete(sessionId);
 		memoryGuardRestartCooldownUntil.delete(sessionId);
 		memoryGuardLastEvaluatedAt.delete(sessionId);
 	}
@@ -548,6 +563,13 @@ async function sampleTeamWorkers(cwd: string, sessionId: string): Promise<Memory
 					(await readLinuxProcessStartTime(heartbeat.pid)) !== heartbeat.process_start_time
 				)
 					continue;
+				const guard = (await executeGjcTeamApiOperation(
+					"read-worker-memory-guard",
+					{ team_name: team.team_name, worker: worker.id, platform: process.platform },
+					cwd,
+					{ ...process.env, GJC_SESSION_ID: sessionId },
+				)) as { automatic_action_allowed?: boolean; state?: string };
+				if (!guard.automatic_action_allowed || guard.state === "blocked") continue;
 				const bytes = await readLinuxWorkerRssBytes(heartbeat.pid);
 				if (bytes === null) continue;
 				samples.push({ workerId: `${team.team_name}/${worker.id}`, bytes, accepted: true });
@@ -564,6 +586,7 @@ async function applySelectedTeamWorker(
 	sessionId: string,
 	workerId: string,
 	excessBytes: number,
+	incidentId: string,
 ): Promise<void> {
 	const separator = workerId.lastIndexOf("/");
 	if (separator <= 0 || separator === workerId.length - 1) return;
@@ -576,6 +599,7 @@ async function applySelectedTeamWorker(
 			worker,
 			platform: process.platform,
 			reason: "production_memory_pressure_sweep",
+			incident_id: incidentId,
 			candidates: [{ worker_id: worker, platform: process.platform, excess_bytes: excessBytes }],
 		},
 		cwd,
@@ -590,6 +614,7 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 		if (!policy.enabled) {
 			memoryGuardGcActive.delete(sessionId);
 			memoryGuardRestartAboveSince.delete(sessionId);
+			memoryGuardWorkerIncidentIds.delete(sessionId);
 			memoryGuardRestartCooldownUntil.delete(sessionId);
 			memoryGuardLastEvaluatedAt.delete(sessionId);
 			continue;
@@ -614,6 +639,7 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 		if (limit.effectiveBytes === null) {
 			memoryGuardGcActive.delete(sessionId);
 			memoryGuardRestartAboveSince.delete(sessionId);
+			memoryGuardWorkerIncidentIds.delete(sessionId);
 			memoryGuardRestartCooldownUntil.delete(sessionId);
 			continue;
 		}
@@ -652,29 +678,50 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 
 		if (usageRatio < policy.restartThresholdRatio) {
 			memoryGuardRestartAboveSince.delete(sessionId);
+			memoryGuardWorkerIncidentIds.delete(sessionId);
 			continue;
 		}
 		const aboveSince = memoryGuardRestartAboveSince.get(sessionId);
 		if (aboveSince === undefined) {
 			memoryGuardRestartAboveSince.set(sessionId, now);
+			memoryGuardWorkerIncidentIds.set(sessionId, `worker-pressure:${sessionId}:${Math.trunc(now)}`);
 			continue;
 		}
 		const cooldownUntil = memoryGuardRestartCooldownUntil.get(sessionId) ?? 0;
 		if (now - aboveSince < policy.restartThresholdWindowMs || now < cooldownUntil) continue;
+		const workerIncidentId =
+			memoryGuardWorkerIncidentIds.get(sessionId) ?? `worker-pressure:${sessionId}:${Math.trunc(aboveSince)}`;
 		const guardAuthority = `${sessionId}\0${cwd}`;
 		if (decision.kind === "execute" && decision.target.kind === "worker" && !guardedTeamRoots.has(guardAuthority)) {
+			const refreshedWorkers = await (d.listTeamWorkers ?? (async () => []))(cwd, sessionId);
+			const refreshedDomain = computeMemoryGuardDomain({
+				effectiveLimitBytes: limit.effectiveBytes,
+				totalUsageBytes: pressure.totalUsageBytes,
+				parentBytes: pressure.parentBytes,
+				parentReserveBytes: policy.parentReserveBytes,
+				workers: refreshedWorkers,
+			});
+			const refreshedDecision = chooseMemoryGuardAction({
+				domain: refreshedDomain,
+				hostSupported: false,
+				workerSupported: workerId =>
+					refreshedWorkers.some(worker => worker.workerId === workerId && worker.accepted !== false),
+			});
+			const revalidated = revalidateMemoryGuardAction(decision, refreshedDecision);
+			if (revalidated.kind !== "execute" || revalidated.target.kind !== "worker") continue;
 			guardedTeamRoots.add(guardAuthority);
 			try {
 				await (d.applyTeamWorkerGuard ?? (async () => undefined))(
 					cwd,
 					sessionId,
-					decision.target.workerId,
-					decision.target.excessBytes,
+					revalidated.target.workerId,
+					revalidated.target.excessBytes,
+					workerIncidentId,
 				);
 			} catch (error) {
 				d.logWarn("Memory guard: team worker action failed; continuing sweep", {
 					sessionId,
-					workerId: decision.target.workerId,
+					workerId: revalidated.target.workerId,
 					error: String(error),
 				});
 			}
@@ -861,6 +908,7 @@ export function __resetResourceGcForTest(): void {
 	rssWarningActive = false;
 	memoryGuardGcActive.clear();
 	memoryGuardRestartAboveSince.clear();
+	memoryGuardWorkerIncidentIds.clear();
 	memoryGuardRestartCooldownUntil.clear();
 	memoryGuardLastEvaluatedAt.clear();
 	lastScreenshotScanAt = 0;
