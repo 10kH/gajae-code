@@ -54,6 +54,10 @@ import { classifyProviderRetry, providerNameFromModel } from "./provider-retry-s
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
 import {
+	type ExecutorExecutionMode,
+	resolveUltragoalRedTeamActivation,
+} from "./ultragoal-redteam-activation";
+import {
 	type AgentDefinition,
 	type AgentProgress,
 	hasCompleteUsageCostBreakdown,
@@ -190,6 +194,11 @@ export interface ExecutorOptions {
 	agent: AgentDefinition;
 	task: string;
 	assignment?: string;
+	/**
+	 * Typed executor execution mode. When set, overrides assignment-text heuristics
+	 * for ultragoal red-team prompt injection (#2698 / #2456).
+	 */
+	executionMode?: ExecutorExecutionMode;
 	context?: string;
 	description?: string;
 	index: number;
@@ -1603,9 +1612,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					systemPrompt: defaultPrompt => {
 						const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
 							agent: prompt.render(agent.systemPrompt, {
-								ultragoalRedTeam: /ultragoal\s+completion\s+(?:qa|red-team)|executorQa/i.test(
-									options.assignment ?? task,
-								),
+								// Typed executionMode wins; assignment text is compatibility-only (#2698 / #2456).
+								ultragoalRedTeam: resolveUltragoalRedTeamActivation({
+									executionMode: options.executionMode,
+									assignment: options.assignment ?? task,
+								}),
 							}),
 							context: options.context?.trim() ?? "",
 							worktree: worktree ?? "",

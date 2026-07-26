@@ -854,4 +854,35 @@ describe("workflow mutation guard", () => {
 			}),
 		).rejects.toBeInstanceOf(ToolError);
 	});
+
+	it("BashTool-shaped product mutation throws ToolError and leaves files byte-identical (#2698 / #2665)", async () => {
+		// Mirrors the agent-session bash wrapper: assertWorkflowMutationAllowed runs
+		// before BashTool.execute. A blocked mutation must not touch product or
+		// workflow state bytes — decision-only tests alone do not prove that.
+		const { assertWorkflowMutationAllowed } = await import(
+			"@gajae-code/coding-agent/skill-state/workflow-mutation-guard"
+		);
+		const cwd = await makeTempRoot();
+		await writeActiveDeepInterview(cwd);
+		await fs.mkdir(path.join(cwd, "src"), { recursive: true });
+		const productPath = path.join(cwd, "src", "product.ts");
+		const productBefore = "export const sentinel = \"UNTOUCHED-PRODUCT-BYTES\";\n";
+		await Bun.write(productPath, productBefore);
+		const modePath = modeStatePath(cwd, "session-a", "deep-interview");
+		const modeBefore = await fs.readFile(modePath);
+
+		await expect(
+			assertWorkflowMutationAllowed({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command: "printf x > src/product.ts" },
+			}),
+		).rejects.toBeInstanceOf(ToolError);
+
+		const productAfter = await fs.readFile(productPath, "utf8");
+		const modeAfter = await fs.readFile(modePath);
+		expect(productAfter).toBe(productBefore);
+		expect(Buffer.compare(modeBefore, modeAfter)).toBe(0);
+	});
 });
