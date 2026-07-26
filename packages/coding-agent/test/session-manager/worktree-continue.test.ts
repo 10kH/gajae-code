@@ -101,7 +101,7 @@ describe("continueRecent with --worktree sessions", () => {
 		}
 	});
 
-	it("adopts a verified explicit-directory breadcrumb before managed candidates", async () => {
+	it("keeps a verified explicit-directory breadcrumb terminal-specific", async () => {
 		const unmanagedDir = path.join(root, "unmanaged-sessions");
 		const unmanagedFile = path.join(unmanagedDir, "unmanaged.jsonl");
 		fs.mkdirSync(unmanagedDir, { recursive: true });
