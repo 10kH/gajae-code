@@ -694,6 +694,7 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 		if (now - aboveSince < policy.restartThresholdWindowMs || now < cooldownUntil) continue;
 		const workerIncidentId =
 			memoryGuardWorkerIncidentIds.get(sessionId) ?? `worker-pressure:${sessionId}:${Math.trunc(aboveSince)}`;
+		let workerActionAttemptedForSession = false;
 		if (decision.kind === "execute" && decision.target.kind === "worker" && !workerActionTaken) {
 			const refreshedWorkers = await (d.listTeamWorkers ?? (async () => []))(cwd, sessionId);
 			const refreshedDomain = computeMemoryGuardDomain({
@@ -712,6 +713,7 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 			const revalidated = revalidateMemoryGuardAction(decision, refreshedDecision);
 			if (revalidated.kind !== "execute" || revalidated.target.kind !== "worker") continue;
 			workerActionTaken = true;
+			workerActionAttemptedForSession = true;
 			try {
 				await (d.applyTeamWorkerGuard ?? (async () => undefined))(
 					cwd,
@@ -728,7 +730,7 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 				});
 			}
 		}
-		memoryGuardRestartCooldownUntil.set(sessionId, now + policy.cooldownMs);
+		if (workerActionAttemptedForSession) memoryGuardRestartCooldownUntil.set(sessionId, now + policy.cooldownMs);
 		d.logWarn("Memory guard: restart threshold sustained", {
 			sessionId,
 			parentBytes: pressure.parentBytes,

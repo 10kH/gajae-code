@@ -539,7 +539,10 @@ describe("resource GC controller", () => {
 		});
 		registerResourceGcSession({ sessionId: "shared-a", settings, cwd: "/workspace/a" });
 		registerResourceGcSession({ sessionId: "shared-b", settings, cwd: "/workspace/b" });
-		const applyTeamWorkerGuard = vi.fn(async () => undefined);
+		const applyTeamWorkerGuard = vi.fn(
+			async (_cwd: string, _sessionId: string, _workerId: string, _excessBytes: number, _incidentId: string) =>
+				undefined,
+		);
 		let monotonicNow = 0;
 		const deps = baseDeps({
 			monotonicNow: () => monotonicNow,
@@ -558,6 +561,10 @@ describe("resource GC controller", () => {
 		monotonicNow = 30_000;
 		await sweepOnce(deps);
 		expect(applyTeamWorkerGuard).toHaveBeenCalledTimes(1);
+		monotonicNow = 60_000;
+		await sweepOnce(deps);
+		expect(applyTeamWorkerGuard).toHaveBeenCalledTimes(2);
+		expect(applyTeamWorkerGuard.mock.calls[1]?.[1]).toBe("shared-b");
 	});
 	it("schedules an enabled guard at its configured check interval", async () => {
 		const clock = controlledScheduler();
