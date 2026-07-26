@@ -77,30 +77,30 @@ try {
 		explicitBin && explicitBin.length > 0
 			? [explicitBin, "mcp-serve", "sdk"]
 			: ["bun", "run", cliEntry, "mcp-serve", "sdk"];
-	child = Bun.spawn(spawnCmd, {
+	const proc = Bun.spawn(spawnCmd, {
 		cwd: repo,
 		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
 		env: process.env,
 	});
-	const writer = child.stdin;
-	writer.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" })}\n`);
-	writer.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" })}\n`);
-	writer.write(
+	child = proc;
+	proc.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" })}\n`);
+	proc.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" })}\n`);
+	proc.stdin.write(
 		`${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "gjc_session_query", arguments: { sessionId: "s1", query: "session.metadata" } } })}\n`,
 	);
-	writer.write(
+	proc.stdin.write(
 		`${JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "gjc_session_global", arguments: { operation: "session.get_endpoint" } } })}\n`,
 	);
-	await writer.end();
+	await proc.stdin.end();
 
 	// Bound wait: kill the child if it does not exit after stdin EOF so the outer
 	// suite never sits on an open stdout pipe for the full 60s.
-	const outPromise = new Response(child.stdout).text();
-	const errPromise = new Response(child.stderr).text();
+	const outPromise = new Response(proc.stdout).text();
+	const errPromise = new Response(proc.stderr).text();
 	const exitState = await Promise.race([
-		child.exited.then(code => ({ kind: "exit" as const, code })),
+		proc.exited.then(code => ({ kind: "exit" as const, code })),
 		Bun.sleep(15_000).then(() => ({ kind: "timeout" as const })),
 	]);
 	if (exitState.kind === "timeout") {
