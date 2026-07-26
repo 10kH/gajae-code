@@ -4773,7 +4773,15 @@ export function createNotificationsExtension(
 	};
 
 	api.on("session_start", async (_event, ctx) => {
-		await startAndReconcileSession(ctx);
+		const task = startAndReconcileSession(ctx);
+		// Join start+reconcile on lifecycle shutdown so a replacement Telegram root
+		// token minted by post-start reconcile cannot race retained owner release.
+		branchStartupTasks.add(task);
+		try {
+			await task;
+		} finally {
+			branchStartupTasks.delete(task);
+		}
 	});
 
 	// A session endpoint's token and generation are authority for exactly one
