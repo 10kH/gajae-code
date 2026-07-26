@@ -568,6 +568,7 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 	const snapshot = await d.memorySnapshot();
 	let gcRequested = false;
 	const gcTelemetry: Array<{ sessionId: string } & Record<string, unknown>> = [];
+	const guardedTeamRoots = new Set<string>();
 	for (const { sessionId, policy, cwd } of dueSessions) {
 		const pressure = __selectMemoryPressureDomainForTest(snapshot, policy.policyLimitBytes);
 		const limit = resolveEffectiveMemoryLimit({
@@ -594,8 +595,10 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 			workerSupported: workerId =>
 				workerSamples.some(worker => worker.workerId === workerId && worker.accepted !== false),
 		});
-		if (decision.kind === "execute" && decision.target.kind === "worker")
+		if (decision.kind === "execute" && decision.target.kind === "worker" && !guardedTeamRoots.has(cwd)) {
+			guardedTeamRoots.add(cwd);
 			await applySelectedTeamWorker(cwd, decision.target.workerId, decision.target.excessBytes);
+		}
 		const usageRatio = pressure.totalUsageBytes / limit.effectiveBytes;
 		if (usageRatio >= policy.gcThresholdRatio) {
 			if (!memoryGuardGcActive.has(sessionId)) {
