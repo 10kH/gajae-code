@@ -485,13 +485,11 @@ test("Telegram root release failure is retained and retried through lifecycle sh
 	const settings = telegramSettings(path.join(cwd, "agent"), true);
 	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
 	const unregisterImpl = telegramDaemon.unregisterNotificationRoot;
-	let initialRegistrationToken: string | undefined;
-	let failedInitialCleanup = false;
+	let unregisterAttempts = 0;
 	const unregister = spyOn(telegramDaemon, "unregisterNotificationRoot").mockImplementation(async input => {
-		if (!failedInitialCleanup && input.registrationToken === initialRegistrationToken) {
-			failedInitialCleanup = true;
-			throw new Error("roots write failed");
-		}
+		unregisterAttempts++;
+		// Fail the first owner-release attempt for the live registration token.
+		if (unregisterAttempts === 1) throw new Error("roots write failed");
 		return await unregisterImpl(input);
 	});
 	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
@@ -504,31 +502,33 @@ test("Telegram root release failure is retained and retried through lifecycle sh
 			false,
 			new Map(),
 			{ startupCapability: capability, lifecycleRequired: true },
-			true,
+			false,
 			async input => {
 				const registration = await telegramDaemon.registerNotificationRoot(input);
-				initialRegistrationToken ??= registration.token;
 				input.onRegistered?.(registration);
 				return "attached";
 			},
 		);
+		// Await full start+reconcile so shutdown uses the final replacement token only.
+		await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
 		await expect(capability.promise).resolves.toEqual({ status: "started" });
 		const rootsFile = telegramDaemon.daemonPaths(settings.getAgentDir()).roots;
 		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBe(path.join(cwd, ".gjc", "state"));
 		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
-		expect(unregister).toHaveBeenCalledTimes(2);
-		expect(unregister.mock.calls.map(call => call[0].registrationToken)).toEqual([
-			expect.any(String),
-			expect.any(String),
-		]);
-		expect(unregister.mock.calls[1]?.[0].registrationToken).not.toBe(unregister.mock.calls[0]?.[0].registrationToken);
+		// First shutdown retains the failed owner release (exactly one attempt).
+		expect(unregister).toHaveBeenCalledTimes(1);
+		expect(unregister.mock.calls[0]?.[0].registrationToken).toEqual(expect.any(String));
 		expect(
 			errorSpy.mock.calls.some(([message]) =>
 				String(message).includes(`SDK notification runtime ${sessionId} owner release failed`),
 			),
 		).toBe(true);
-		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBeUndefined();
+		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBe(path.join(cwd, ".gjc", "state"));
+		// Explicit later lifecycle shutdown retries the retained release and succeeds.
 		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+		expect(unregister).toHaveBeenCalledTimes(2);
+		expect(unregister.mock.calls[1]?.[0].registrationToken).toBe(unregister.mock.calls[0]?.[0].registrationToken);
+		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBeUndefined();
 		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8"))).toEqual({
 			version: 1,
 			roots: [],
@@ -536,10 +536,10 @@ test("Telegram root release failure is retained and retried through lifecycle sh
 			sessions: {},
 			registrationTokens: {},
 		});
-		expect(unregister).toHaveBeenCalledTimes(3);
 		await expect(
 			handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext),
 		).resolves.toBeUndefined();
+		expect(unregister).toHaveBeenCalledTimes(2);
 	} finally {
 		unregister.mockRestore();
 		errorSpy.mockRestore();

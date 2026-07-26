@@ -3003,6 +3003,7 @@ export function createNotificationsExtension(
 	const cleanupRetries = new Map<string, SessionRuntime>();
 	const sessionStartPromises = new Map<string, Promise<SessionStartResult>>();
 	const branchStartupTasks = new Set<Promise<void>>();
+	const sessionLifecycleTasks = new Set<Promise<void>>();
 	let activeRuntimeId: string | undefined;
 	let identityControlInFlight = false;
 	let deferredIdentityRotation:
@@ -4773,7 +4774,16 @@ export function createNotificationsExtension(
 	};
 
 	api.on("session_start", async (_event, ctx) => {
-		await startAndReconcileSession(ctx);
+		const task = startAndReconcileSession(ctx);
+		// Track full start+reconcile so settled startups join replacement-token
+		// reconcile before owner release. Pending native startup (/notify on) stays
+		// nonblocking: shutdown only awaits these tasks when sessionStartPromises is clear.
+		sessionLifecycleTasks.add(task);
+		try {
+			await task;
+		} finally {
+			sessionLifecycleTasks.delete(task);
+		}
 	});
 
 	// A session endpoint's token and generation are authority for exactly one
@@ -5423,8 +5433,12 @@ export function createNotificationsExtension(
 		extensionShuttingDown = true;
 		identityControlInFlight = false;
 		deferredIdentityRotation = undefined;
-		await Promise.allSettled([...branchStartupTasks]);
 		const id = sessionId(ctx);
+		// Join settled start+reconcile before owner release. Keep pending native
+		// startup (/notify on) nonblocking — do not await sessionLifecycleTasks while
+		// sessionStartPromises still has this id.
+		if (!sessionStartPromises.has(id)) await Promise.allSettled([...sessionLifecycleTasks]);
+		await Promise.allSettled([...branchStartupTasks]);
 		const rt = runtimes.get(id);
 		if (rt) terminalizeInFlightTools(rt, id, "cancelled");
 		// Startup is only genuinely in flight when a `sessionStartPromises` entry
