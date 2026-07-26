@@ -205,7 +205,15 @@ export function parseArgs(args: string[]): Args {
 				}
 			}
 			result.tools = validTools;
-		} else if (arg === "--thinking" && i + 1 < args.length) {
+		} else if (arg === "--thinking") {
+			// Match --credential / --mcp-config: a missing value or a following flag is
+			// a usage error, not a silent no-op / accidental consumption of `-p`.
+			const next = args[i + 1];
+			if (!next || next.startsWith("-")) {
+				throw new CliParseError(
+					`--thinking requires <level> (${THINKING_EFFORTS.join(", ")})`,
+				);
+			}
 			const rawThinking = args[++i];
 			const thinking = parseEffort(rawThinking);
 			if (thinking === undefined) {

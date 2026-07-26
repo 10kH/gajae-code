@@ -646,4 +646,19 @@ describe("CLI --thinking contract", () => {
 		expect(() => parseArgs(["--thinking", "ludicrous"])).toThrow(CliParseError);
 		expect(() => parseArgs(["--thinking", "off"])).toThrow(CliParseError);
 	});
+
+	test("rejects a bare --thinking with no value", () => {
+		expect(() => parseArgs(["--thinking"])).toThrow(CliParseError);
+		expect(() => parseArgs(["--thinking"])).toThrow(/--thinking requires <level>/);
+	});
+
+	test("rejects --thinking when the next token is another flag", () => {
+		// Pre-#3200 residual: `i + 1 < args.length` alone treated `-p` as the level.
+		expect(() => parseArgs(["--thinking", "-p", "hi"])).toThrow(CliParseError);
+		expect(() => parseArgs(["--thinking", "-p", "hi"])).toThrow(/--thinking requires <level>/);
+	});
+
+	test("rejects an empty --thinking= value", () => {
+		expect(() => parseArgs(["--thinking="])).toThrow(CliParseError);
+	});
 });
