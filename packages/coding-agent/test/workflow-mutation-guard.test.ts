@@ -866,7 +866,7 @@ describe("workflow mutation guard", () => {
 		await writeActiveDeepInterview(cwd);
 		await fs.mkdir(path.join(cwd, "src"), { recursive: true });
 		const productPath = path.join(cwd, "src", "product.ts");
-		const productBefore = "export const sentinel = \"UNTOUCHED-PRODUCT-BYTES\";\n";
+		const productBefore = 'export const sentinel = "UNTOUCHED-PRODUCT-BYTES";\n';
 		await Bun.write(productPath, productBefore);
 		const modePath = modeStatePath(cwd, "session-a", "deep-interview");
 		const modeBefore = await fs.readFile(modePath);

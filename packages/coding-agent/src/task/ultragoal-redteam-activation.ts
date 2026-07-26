@@ -55,9 +55,7 @@ export function parseExecutorExecutionMode(value: unknown): ExecutorExecutionMod
 export function assignmentRequestsUltragoalRedTeam(assignment: string | undefined): boolean {
 	const text = assignment?.trim() ?? "";
 	if (text.length === 0) return false;
-	return (
-		ULTRAGOAL_COMPLETION_QA.test(text) || EXECUTOR_QA_EVIDENCE.test(text) || EXECUTOR_QA_LANE.test(text)
-	);
+	return ULTRAGOAL_COMPLETION_QA.test(text) || EXECUTOR_QA_EVIDENCE.test(text) || EXECUTOR_QA_LANE.test(text);
 }
 
 export interface ResolveUltragoalRedTeamArgs {
