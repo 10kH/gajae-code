@@ -35,8 +35,6 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"slash_command:transcript": "visual/local-only transcript viewer, not a user-facing SDK control seam",
 	"slash_command:sessions": "visual/local-only sessions dashboard, not a user-facing SDK control seam",
 	"agent_session:constructor": "internal accessor/plumbing, not a user-facing control seam",
-	"agent_session:restoreFromMemoryGuardCheckpoint":
-		"internal fail-closed recovery factory, not a general user-facing SDK control seam",
 	"agent_session:nextToolChoice": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setForcedToolChoice": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getActiveSkillState": "internal accessor/plumbing, not a user-facing control seam",
@@ -121,6 +119,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:continuePersistedHistory": "internal startup lifecycle plumbing, not a user-facing control seam",
 	"agent_session:promoteRecoveryHydrationAfterOwnershipReadyFence":
 		"internal owner-recovery authority transition after a durable writer fence, never a user-facing SDK operation",
+	"agent_session:restoreFromMemoryGuardCheckpoint":
+		"internal owner-recovery staged restore builder after durable claims/fencing, never a user-facing SDK operation",
 	"agent_session:setActiveModelProfile": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getActiveModelProfile": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getSessionDefaultModelSelector": "internal accessor/plumbing, not a user-facing control seam",

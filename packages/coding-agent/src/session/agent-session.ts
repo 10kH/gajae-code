@@ -667,8 +667,16 @@ export interface PromptOptions {
 	/**
 	 * Invoked after all prompt preflight checks pass and immediately before agent execution begins.
 	 * Cancellation before this callback rejects the prompt.
+	 * Prefer `onPreflightAcceptCommit` for async durable acceptance (#3031/#3032).
 	 */
 	onPreflightAccepted?: () => void;
+	/**
+	 * Awaitable durable-accept fence. Called after preflight and before queue mutation
+	 * or `#promptAgentWithIdleRetry`. SDK bus installs a closure that fsyncs acceptance.
+	 */
+	onPreflightAcceptCommit?: () => void | Promise<void>;
+	/** Skill-only: prepared metadata before the durable fence (path/lineCount/cleanedArgs). */
+	onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 }
 
 function promptPreflightCancelledError(): Error {
@@ -6737,7 +6745,7 @@ export class AgentSession {
 	async invokeSkill(
 		name: string,
 		args = "",
-		options?: Pick<PromptOptions, "onPreflightAccepted">,
+		options?: Pick<PromptOptions, "onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared">,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
 		const skillName = name.trim();
 		if (!skillName) throw Object.assign(new Error("skill.invoke requires a skill name."), { code: "invalid_input" });
@@ -6770,6 +6778,12 @@ export class AgentSession {
 			attribution: "user" as const,
 		};
 		this.#deepInterviewPreclaimedCustomInputEpochs.set(skillPromptMessage, deepInterviewUserIntentEpoch);
+		options?.onSkillPrepared?.({
+			name: skill.name,
+			path: skill.filePath,
+			lineCount: built.details.lineCount,
+			cleanedArgs: activation.cleanedArgs || undefined,
+		});
 		await this.promptCustomMessage(skillPromptMessage, options);
 		return {
 			name: skill.name,
@@ -7437,7 +7451,14 @@ export class AgentSession {
 					await this.invokeSkill(
 						invocation.skill.name,
 						invocation.args,
-						options?.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : undefined,
+						options?.onPreflightAccepted || options?.onPreflightAcceptCommit
+							? {
+									...(options.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : {}),
+									...(options.onPreflightAcceptCommit
+										? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
+										: {}),
+								}
+							: undefined,
 					);
 					return;
 				}
@@ -7491,7 +7512,8 @@ export class AgentSession {
 			if (workflowIntentDiff) {
 				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 			}
-			options?.onPreflightAccepted?.();
+			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+			else options?.onPreflightAccepted?.();
 			return;
 		}
 
@@ -7623,7 +7645,10 @@ export class AgentSession {
 
 	async promptCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
-		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice" | "followUpQueuePolicy" | "onPreflightAccepted">,
+		options?: Pick<
+			PromptOptions,
+			"streamingBehavior" | "toolChoice" | "followUpQueuePolicy" | "onPreflightAccepted" | "onPreflightAcceptCommit"
+		>,
 	): Promise<void> {
 		const textContent =
 			typeof message.content === "string"
@@ -7685,7 +7710,10 @@ export class AgentSession {
 	async #promptWithMessage(
 		message: AgentMessage,
 		expandedText: string,
-		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck" | "onPreflightAccepted"> & {
+		options?: Pick<
+			PromptOptions,
+			"toolChoice" | "images" | "skipCompactionCheck" | "onPreflightAccepted" | "onPreflightAcceptCommit"
+		> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			predecessorAgentEndHold?: symbol;
@@ -7792,7 +7820,7 @@ export class AgentSession {
 				// A newer abort/prompt cycle superseded this preflight. Callers awaiting
 				// acceptance (onPreflightAccepted) must be told it never ran; direct
 				// callers (e.g. prompt() aborted during a TTSR wait) resolve gracefully.
-				if (options?.onPreflightAccepted) throw promptPreflightCancelledError();
+				if (options?.onPreflightAccepted || options?.onPreflightAcceptCommit) throw promptPreflightCancelledError();
 				return;
 			}
 
@@ -7906,7 +7934,7 @@ export class AgentSession {
 				this.#resetInjectedContextSignatures();
 				// Ack-waiting callers are told the preflight never ran; direct callers
 				// (aborted after setup) resolve gracefully as before f24f46ff5.
-				if (options?.onPreflightAccepted) throw promptPreflightCancelledError();
+				if (options?.onPreflightAccepted || options?.onPreflightAcceptCommit) throw promptPreflightCancelledError();
 				return;
 			}
 
@@ -7919,7 +7947,8 @@ export class AgentSession {
 					if (hindsightRecall) this.getHindsightSessionState()?.markRecallSnippetInjected(hindsightRecall);
 				},
 			};
-			options?.onPreflightAccepted?.();
+			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+			else options?.onPreflightAccepted?.();
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 			await this.#promptAgentWithIdleRetry(messages, agentPromptOptions, predecessorAgentEndHold);
 			const terminalAssistant = this.#findLastAssistantMessage();
@@ -7938,7 +7967,12 @@ export class AgentSession {
 			// Session identity changes historically cancel local setup silently. Only SDK
 			// submissions provide an acceptance callback and require an explicit terminal
 			// preflight failure for their remote request authority.
-			if (isPromptPreflightCancelledError(error) && !options?.onPreflightAccepted) return;
+			if (
+				isPromptPreflightCancelledError(error) &&
+				!options?.onPreflightAccepted &&
+				!options?.onPreflightAcceptCommit
+			)
+				return;
 			throw error;
 		} finally {
 			this.#removeEphemeralCustomMessages();
@@ -8039,7 +8073,7 @@ export class AgentSession {
 				}
 				return false;
 			},
-			invokeSkill: (name, args) => this.invokeSkill(name, args),
+			invokeSkill: (name, args, options) => this.invokeSkill(name, args, options),
 			setPlanMode: on => this.setSdkPlanMode(on),
 			operateGoal: (op, objective) => this.operateGoal(op, objective),
 			getSkillState: () => this.skills.map(skill => ({ name: skill.name, description: skill.description })),
@@ -8549,7 +8583,11 @@ export class AgentSession {
 	 */
 	async sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp"; onPreflightAccepted?: () => void },
+		options?: {
+			deliverAs?: "steer" | "followUp";
+			onPreflightAccepted?: () => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+		},
 	): Promise<void> {
 		this.#assertRecoveryHydrationPromoted();
 		// Normalize content to text string + optional images
@@ -8573,11 +8611,13 @@ export class AgentSession {
 		}
 
 		if (options?.deliverAs === "followUp") {
+			if (options.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 			await this.#queueFollowUp(text, images, { claimsGenuineUserIntent: true });
 			options.onPreflightAccepted?.();
 			return;
 		}
 		if (options?.deliverAs === "steer") {
+			if (options.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 			await this.#queueSteer(text, images, { claimsGenuineUserIntent: true });
 			options.onPreflightAccepted?.();
 			return;
@@ -8589,6 +8629,7 @@ export class AgentSession {
 		// in-flight compaction internally, and #queueSteer would otherwise park
 		// the message in the steering queue with no turn to consume it.
 		if (this.isStreaming) {
+			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 			await this.#queueSteer(text, images, { claimsGenuineUserIntent: true });
 			options?.onPreflightAccepted?.();
 			return;
@@ -8599,6 +8640,7 @@ export class AgentSession {
 			expandPromptTemplates: false,
 			images,
 			onPreflightAccepted: options?.onPreflightAccepted,
+			onPreflightAcceptCommit: options?.onPreflightAcceptCommit,
 		});
 	}
 
