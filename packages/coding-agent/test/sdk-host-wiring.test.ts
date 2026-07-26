@@ -15,6 +15,15 @@ import type {
 	ExtensionContextActions,
 	ExtensionUIContext,
 } from "../src/extensibility/extensions/types";
+
+async function firePreflightAccept(options?: {
+	onPreflightAccepted?: () => void;
+	onPreflightAcceptCommit?: () => void | Promise<void>;
+}): Promise<void> {
+	if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+	else options?.onPreflightAccepted?.();
+}
+
 import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
 import { buildAskGateAnswerSchema as buildDeepInterviewAskGateAnswerSchema } from "../src/modes/shared/agent-wire/deep-interview-gate";
 import {
@@ -134,8 +143,15 @@ function start(
 			options?: Parameters<ExtensionActions["sendUserMessage"]>[1],
 		) => {
 			if (forwardPreflightCallbacks) return Promise.resolve(sendUserMessage(content, options));
-			const { onPreflightAccepted, ...delivery } = options ?? {};
+			const { onPreflightAccepted, onPreflightAcceptCommit, ...delivery } = options ?? {};
 			const submission = sendUserMessage(content, Object.keys(delivery).length > 0 ? delivery : undefined);
+			// Prefer awaitable durable fence; fall back to legacy sync accept for older mocks.
+			if (onPreflightAcceptCommit) {
+				return Promise.resolve(onPreflightAcceptCommit()).then(() => {
+					onPreflightAccepted?.();
+					return submission;
+				});
+			}
 			onPreflightAccepted?.();
 			return Promise.resolve(submission);
 		},
@@ -1662,8 +1678,8 @@ test("SDK host buffers synchronous pre-ack start and end until after acknowledge
 	handlers = start(
 		sessionContext,
 		undefined,
-		(_content, options) => {
-			options?.onPreflightAccepted?.();
+		async (_content, options) => {
+			await firePreflightAccept(options);
 			void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 			void handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
 		},
@@ -1720,8 +1736,8 @@ test("SDK host buffers synchronous pre-ack accepted failure until after acknowle
 	handlers = start(
 		sessionContext,
 		undefined,
-		(_content, options) => {
-			options?.onPreflightAccepted?.();
+		async (_content, options) => {
+			await firePreflightAccept(options);
 			void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 			throw Object.assign(new Error("synchronous accepted failure"), { code: "unavailable" });
 		},
@@ -1867,7 +1883,7 @@ test("SDK host serializes concurrent prompt admission and replays correlated lif
 			submissions.push(String(content));
 			preflightStarted.resolve();
 			await releasePreflight.promise;
-			options?.onPreflightAccepted?.();
+			await firePreflightAccept(options);
 		},
 		true,
 	);
@@ -2044,7 +2060,7 @@ test("SDK host terminalizes a cancelled preflight and releases prompt authority"
 					throw Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" });
 				}
 			}
-			options?.onPreflightAccepted?.();
+			await firePreflightAccept(options);
 		},
 		true,
 	);
@@ -2111,7 +2127,9 @@ test("SDK host terminalizes a never-resolving preflight on abort and fences late
 		undefined,
 		async (content, options) => {
 			if (content !== "never resolve") return;
-			latePreflightAccepted = options?.onPreflightAccepted;
+			latePreflightAccepted = options?.onPreflightAcceptCommit
+				? () => void options.onPreflightAcceptCommit?.()
+				: options?.onPreflightAccepted;
 			preflightStarted.resolve();
 			await neverPreflight.promise;
 		},
@@ -2191,7 +2209,7 @@ test("SDK host abort-and-prompt cancels a never-resolving preflight before repla
 				preflightStarted.resolve();
 				await neverPreflight.promise;
 			}
-			options?.onPreflightAccepted?.();
+			await firePreflightAccept(options);
 		},
 		true,
 	);
@@ -2270,9 +2288,9 @@ test("SDK host waits for asynchronous abort unwind before delivering an abort-an
 	const handlers = start(
 		sessionContext,
 		undefined,
-		(content, options) => {
+		async (content, options) => {
 			deliveries.push([content, options]);
-			options?.onPreflightAccepted?.();
+			await firePreflightAccept(options);
 		},
 		true,
 	);
@@ -4604,12 +4622,17 @@ test("clientRef admission reservation is released when a submission is rejected 
 	const handlers = start(
 		sessionContext,
 		undefined,
-		(content: unknown, options: { onPreflightAccepted?: () => void } | undefined) => {
+		async (
+			content: unknown,
+			options:
+				| { onPreflightAccepted?: () => void; onPreflightAcceptCommit?: () => void | Promise<void> }
+				| undefined,
+		) => {
 			const text = String(content);
 			deliveries.push(text);
 			if (text === "doomed preflight")
 				return Promise.reject(Object.assign(new Error("submission lost"), { code: "unavailable" }));
-			options?.onPreflightAccepted?.();
+			await firePreflightAccept(options);
 			return Promise.resolve();
 		},
 		true,
@@ -4709,8 +4732,13 @@ test("accepted-then-failed submission retains its reconciliation record and bloc
 	const handlers = start(
 		sessionContext,
 		undefined,
-		(_content: unknown, options: { onPreflightAccepted?: () => void } | undefined) => {
-			options?.onPreflightAccepted?.();
+		async (
+			_content: unknown,
+			options:
+				| { onPreflightAccepted?: () => void; onPreflightAcceptCommit?: () => void | Promise<void> }
+				| undefined,
+		) => {
+			await firePreflightAccept(options);
 			throw Object.assign(new Error("synchronous accepted failure"), { code: "unavailable" });
 		},
 		true,

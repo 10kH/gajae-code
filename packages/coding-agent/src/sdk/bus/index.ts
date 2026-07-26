@@ -2122,11 +2122,16 @@ function sdkControlSurface(
 				error: Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" }),
 			});
 		pendingPreflightCancellations.add(cancelPreflight);
-		const onPreflightAcceptCommit = async () => {
+		const settleAccepted = async () => {
 			if (preflightSettled) return;
 			accepted = true;
 			await onPromptAccepted(correlation, requesterConnectionId, trimmedClientRef, trackReconciliation);
 			settlePreflight({ status: "accepted" });
+		};
+		// Durable fence preferred; keep legacy onPreflightAccepted for hosts/tests that only fire the sync hook.
+		const onPreflightAcceptCommit = settleAccepted;
+		const onPreflightAccepted = () => {
+			void settleAccepted();
 		};
 		// Do not acknowledge the prompt until AgentSession's async preflight
 		// succeeds. The terminal result records correlation before agent_start can fire.
@@ -2136,6 +2141,7 @@ function sdkControlSurface(
 				api.sendUserMessage(content, {
 					...(deliverAs ? { deliverAs } : !forceFresh && isBusy() ? { deliverAs: "steer" as const } : {}),
 					onPreflightAcceptCommit,
+					onPreflightAccepted,
 				}),
 			);
 		} catch (error) {
