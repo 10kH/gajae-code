@@ -8,6 +8,8 @@
 
 ### Fixed
 
+- Alibaba Token Plan first-event timeouts also match the exported lazy-stream watchdog text, preserve sticky fallback selection across later turns, avoid same-candidate auto-compaction replay, and reset attempt/overflow budgets only when an accepted queued steering/follow-up successor starts (#3026).
+- Queued steering and follow-up successors now reset predecessor fallback attempt budgets and overflow-maintenance counters only after `continue()` accepts the queued turn, without clearing the sticky fallback cursor.
 - Questions about `ultragoal` behavior now stay on the direct-answer path instead of being misclassified as requests to start the durable workflow.
 - Workflow intent routing now requires a leading `/skill:ultragoal` for slash-command escalation and recognizes Korean object-particle requests such as `ultragoal을 사용해줘` without routing questions that merely mention the command.
 - Aligned the startup GJC Forge splash border with the composer trailing gutter, including the one-row constrained fallback.
