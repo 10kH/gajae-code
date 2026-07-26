@@ -11,6 +11,7 @@ import { ollamaCloudModelManagerOptions } from "./ollama";
 import {
 	alibabaTokenPlanModelManagerOptions,
 	anthropicModelManagerOptions,
+	bizrouterModelManagerOptions,
 	cerebrasModelManagerOptions,
 	cloudflareAiGatewayModelManagerOptions,
 	deepinfraModelManagerOptions,
@@ -318,6 +319,12 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		"openai/gpt-4o",
 		config => opengatewayModelManagerOptions(config),
 		catalog("OpenGateway by Sionic AI", ["OPENGATEWAY_API_KEY"]),
+	),
+	catalogDescriptor(
+		"bizrouter",
+		"anthropic/claude-sonnet-4.5",
+		config => bizrouterModelManagerOptions(config),
+		catalog("BizRouter", ["BIZROUTER_API_KEY"]),
 	),
 	catalogDescriptor("zai", "glm-5.2", config => zaiModelManagerOptions(config), catalog("zAI", ["ZAI_API_KEY"])),
 	catalogDescriptor(

@@ -241,6 +241,11 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
+		id: "bizrouter",
+		name: "BizRouter",
+		available: true,
+	},
+	{
 		id: "opengateway",
 		name: "OpenGateway by Sionic AI",
 		available: true,
@@ -391,6 +396,7 @@ export async function refreshOAuthToken(
 		case "vercel-ai-gateway":
 		case "qwen-portal":
 		case "zenmux":
+		case "bizrouter":
 		case "opengateway":
 		case "vllm":
 			// API keys / static bearer tokens don't expire, return as-is
