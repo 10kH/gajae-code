@@ -7418,6 +7418,7 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		this.#assertRecoveryHydrationPromoted();
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 
 		if (expandPromptTemplates && text.startsWith("/skill:") && !options?.images?.length) {
@@ -8146,6 +8147,7 @@ export class AgentSession {
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
 	async steer(text: string, images?: ImageContent[]): Promise<void> {
+		this.#assertRecoveryHydrationPromoted();
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -8163,6 +8165,7 @@ export class AgentSession {
 		images?: ImageContent[],
 		options?: Pick<PromptOptions, "followUpQueuePolicy">,
 	): Promise<void> {
+		this.#assertRecoveryHydrationPromoted();
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -8540,6 +8543,7 @@ export class AgentSession {
 		content: string | (TextContent | ImageContent)[],
 		options?: { deliverAs?: "steer" | "followUp"; onPreflightAccepted?: () => void },
 	): Promise<void> {
+		this.#assertRecoveryHydrationPromoted();
 		// Normalize content to text string + optional images
 		let text: string;
 		let images: ImageContent[] | undefined;

@@ -150,6 +150,12 @@ describe("memory guard checkpoint export/restore", () => {
 			expect(session.kind).toBe("staged");
 			if (session.kind !== "staged") return;
 			expect(session.session.recoveryHydrationContext).toBe(restored.hydrationContext);
+			await expect(session.session.prompt("blocked")).rejects.toThrow("Recovery hydration has not been promoted");
+			await expect(session.session.steer("blocked")).rejects.toThrow("Recovery hydration has not been promoted");
+			await expect(session.session.followUp("blocked")).rejects.toThrow("Recovery hydration has not been promoted");
+			await expect(session.session.sendUserMessage("blocked")).rejects.toThrow(
+				"Recovery hydration has not been promoted",
+			);
 			await session.session.promoteRecoveryHydrationAfterOwnershipReadyFence(session.promotionFence);
 			expect(session.session.recoveryHydrationContext).toBeUndefined();
 			await session.session.dispose();
