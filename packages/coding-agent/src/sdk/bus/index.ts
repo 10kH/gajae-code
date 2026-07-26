@@ -3526,7 +3526,8 @@ export function createNotificationsExtension(
 				if (trackReconciliation) releasePromptAdmission(clientRef);
 				return;
 			}
-			if (trackReconciliation) await notePromptReconciliationAccepted(correlation, clientRef);
+			// Register delivery ownership synchronously before any await so post-accept
+			// failures that race the durable write still emit correlated terminals.
 			cleanupPromptRecords();
 			while (promptSubmissions.size >= PROMPT_SUBMISSION_CAPACITY) {
 				const oldest = promptSubmissions.entries().next().value as [string, PromptSubmission] | undefined;
@@ -3545,6 +3546,7 @@ export function createNotificationsExtension(
 				createdAt: Date.now(),
 				bufferedFrames: [],
 			});
+			if (trackReconciliation) await notePromptReconciliationAccepted(correlation, clientRef);
 		};
 		const recordPromptTerminal = (correlation: { commandId: string; turnId: string } | undefined) => {
 			if (!correlation) return false;
