@@ -267,8 +267,18 @@ function buildGeneratedBlock(dts: string): string {
 
 function patchCompatibilityDeclarations(dts: string): string {
 	let patched = dts;
-	if (!/^export declare class ComputerController\b/m.test(patched)) {
-		patched = patched.replace("/* eslint-disable */\n", `/* eslint-disable */\n${COMPUTER_CONTROLLER_DECLARATION}`);
+	if (!patched.includes("macOS computer-use controller")) {
+		if (/^export declare class ComputerController \{[\s\S]*?\n\}/m.test(patched)) {
+			patched = patched.replace(
+				/^export declare class ComputerController \{[\s\S]*?\n\}/m,
+				COMPUTER_CONTROLLER_DECLARATION.trim(),
+			);
+		} else {
+			patched = patched.replace(
+				"/* eslint-disable */\n",
+				`/* eslint-disable */\n${COMPUTER_CONTROLLER_DECLARATION}`,
+			);
+		}
 	}
 	return patched
 		.replace(
