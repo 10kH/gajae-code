@@ -361,7 +361,7 @@ async function migrateManagedLegacyLocal(
 					throw new Error("Legacy local:// migration destination verification failed");
 			}
 		}
-		for (const entry of await fs.readdir(staging)) {
+		for (const entry of (await fs.readdir(staging)).sort()) {
 			const destination = path.join(localRoot, entry);
 			try {
 				await fs.lstat(destination);

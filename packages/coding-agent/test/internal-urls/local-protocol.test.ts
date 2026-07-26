@@ -94,12 +94,12 @@ it("migrates opaque managed legacy topology, retires exactly once, and verifies 
 	});
 });
 
-it("rolls back managed migration publication on a destination collision without retiring the source", async () => {
+it("rolls back a sorted managed partial install and retries the same identity", async () => {
 	const sessionId = `managed-collision-${crypto.randomUUID()}`;
 	const snapshot = { rootDev: "1", rootIno: "2", entries: [] } as never;
 	let retired = 0;
 	await withLocalRoot(sessionId, async localRoot => {
-		await fs.writeFile(path.join(localRoot, "second"), "existing");
+		await fs.writeFile(path.join(localRoot, "02-second"), "existing");
 		const options = {
 			getSessionId: () => sessionId,
 			getManagedLegacyLocalMigrationSource: () => ({
@@ -108,13 +108,13 @@ it("rolls back managed migration publication on a destination collision without 
 					entries: [
 						{ relativePath: "", kind: "directory" as const },
 						{
-							relativePath: "first",
+							relativePath: "01-first",
 							kind: "file" as const,
 							bytes: Buffer.from("first"),
 							sha256: "a7937b64b8caa58f03721bb6bacf5c78cb235febe0e70b1b84cd99541461a08e",
 						},
 						{
-							relativePath: "second",
+							relativePath: "02-second",
 							kind: "file" as const,
 							bytes: Buffer.from("second"),
 							sha256: "16367aacb67a4a017c8da8ab95682ccb390863780f7114dda0a0e0c55644c7c4",
@@ -125,12 +125,19 @@ it("rolls back managed migration publication on a destination collision without 
 			}),
 		};
 		await expect(initializeLocalRoot(options)).rejects.toThrow("destination is ambiguous");
-		await expect(fs.lstat(path.join(localRoot, "first"))).rejects.toMatchObject({ code: "ENOENT" });
-		expect(await fs.readFile(path.join(localRoot, "second"), "utf8")).toBe("existing");
+		await expect(fs.lstat(path.join(localRoot, "01-first"))).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await fs.readFile(path.join(localRoot, "02-second"), "utf8")).toBe("existing");
 		expect(retired).toBe(0);
 		await expect(fs.lstat(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).rejects.toMatchObject({
 			code: "ENOENT",
 		});
+
+		await fs.rm(path.join(localRoot, "02-second"));
+		await initializeLocalRoot(options);
+		expect(await fs.readFile(path.join(localRoot, "01-first"), "utf8")).toBe("first");
+		expect(await fs.readFile(path.join(localRoot, "02-second"), "utf8")).toBe("second");
+		expect(await fs.readFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "utf8")).toBe("verified\n");
+		expect(retired).toBe(1);
 	});
 });
 
