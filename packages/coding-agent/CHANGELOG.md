@@ -13,6 +13,7 @@
 - JetBrains Air ACP sessions now preserve final answers across fast prompt completion, expose tool/retry/goal/notices and session title updates, apply Air's legacy `session/set_model` preset changes through the canonical session configuration path, accept client-supplied stdio/HTTP/SSE MCP servers, reject unsupported additional directories, and reject unavailable model presets before provider dispatch.
 
 ### Fixed
+- Session-manager fork/moveTo failure-injection tests now use a platform-aware hermetic seam: retained `RecoveryFsRoot` prototype spies on Linux and the direct native/fs fallbacks off Linux, with a required hit counter so a dead injection fails closed (#3209).
 - The #3216 win32 cleanup-producer regression no longer hardcodes divergent directory size `4096`; it injects `nativeRoot.size + 1` so the test stays hermetic when Linux directory size is already `4096` (post-merge Dev CI red on `79f0de870`).
 
 - Windows artifact-migration cleanup identity capture is now provable off-Windows: `detachArtifactRootForMigration` takes an injectable platform seam so the `win32` producer branch is exercised deterministically, and its regression fails if the native-root capture is reverted (#2913).
