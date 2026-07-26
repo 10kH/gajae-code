@@ -3,6 +3,8 @@
 ## [Unreleased]
 ### Fixed
 
+- The `ask` tool no longer rejects a JSON-string-encoded single-sided Round 0 payload before coercion; only the retired contract+review pair stays terminal, so a provider that serializes `questions` as a string no longer drives the model into an unbounded retry loop.
+- macOS screenshot paths now recover the narrow no-break space before `AM`/`PM` for any following separator, so IDE-attached files such as `Screenshot … 11.23.30 PM-1785075812409.png` resolve instead of failing with `ENOENT`; word continuations like ` PMX` are left untouched.
 - Interactive `/resume` no longer awaits ordinary notification-endpoint rotation after predecessor fencing when the transition is stamped `interactive_selector_resume`; lifecycle/SDK identity-control paths still await readiness and use a fail-closed control-drain orchestration that sends terminal control outcomes only after successor readiness, while uncertain predecessor stop no longer starts the successor (#2914).
 - Interactive TUI `/resume` commits a status-container progress lease before inspect/migration/switch work and clears it on every exit path, with generation-scoped render-commit wait that fails open when the terminal is stopped or unavailable (#2914).
 - Interactive `/resume` progress lease fails open when `statusContainer` or UI lacks child-mutation/render-commit surface, preserving headless/minimal controller contexts without weakening full TUI progress-before-switch (#3234 post-merge).
