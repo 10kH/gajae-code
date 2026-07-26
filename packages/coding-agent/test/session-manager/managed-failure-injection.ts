@@ -233,14 +233,11 @@ export function injectManagedAppend(
 		...args: Parameters<typeof fs.writeSync>
 	) {
 		const buffer = args[1];
-		const bytes =
-			typeof buffer === "string"
+		const bytes = Buffer.isBuffer(buffer)
+			? buffer
+			: typeof buffer === "string"
 				? Buffer.from(buffer)
-				: Buffer.isBuffer(buffer)
-					? buffer
-					: buffer instanceof Uint8Array
-						? Buffer.from(buffer)
-						: Buffer.alloc(0);
+				: Buffer.from(String(buffer ?? ""));
 		const result = impl("", bytes);
 		if (result !== "passthrough") {
 			hits.n += 1;
