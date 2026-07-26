@@ -86,6 +86,8 @@ export interface ResourceGcDeps {
 	releaseTab: (name: string, policy: { now: () => number; idleMs: number }) => Promise<boolean>;
 	cleanupScreenshots: (opts: { now: () => number; staleMs: number }) => Promise<{ scanned: number; removed: number }>;
 	screenshotArmed: () => boolean;
+	listTeamWorkers?: (cwd: string, sessionId: string) => Promise<MemoryGuardWorkerSample[]>;
+	applyTeamWorkerGuard?: (cwd: string, sessionId: string, workerId: string, excessBytes: number) => Promise<void>;
 }
 
 const defaultDeps: ResourceGcDeps = {
@@ -99,6 +101,9 @@ const defaultDeps: ResourceGcDeps = {
 	releaseTab: (name, policy) => releaseTabIfGcEligible(name, policy),
 	cleanupScreenshots: opts => cleanupStaleScreenshotFallbackDirs(opts),
 	screenshotArmed: () => hasCreatedScreenshotFallbackDir(),
+	listTeamWorkers: (cwd, sessionId) => sampleTeamWorkers(cwd, sessionId),
+	applyTeamWorkerGuard: (cwd, sessionId, workerId, excessBytes) =>
+		applySelectedTeamWorker(cwd, sessionId, workerId, excessBytes),
 };
 
 // ── Controller state (process-global; tabs/browsers are module-global too) ──────────────────
@@ -589,7 +594,7 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 			memoryGuardRestartCooldownUntil.delete(sessionId);
 			continue;
 		}
-		const workerSamples = await sampleTeamWorkers(cwd, sessionId);
+		const workerSamples = await (d.listTeamWorkers ?? (async () => []))(cwd, sessionId);
 		const domain = computeMemoryGuardDomain({
 			effectiveLimitBytes: limit.effectiveBytes,
 			totalUsageBytes: pressure.totalUsageBytes,
@@ -605,7 +610,12 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 		});
 		if (decision.kind === "execute" && decision.target.kind === "worker" && !guardedTeamRoots.has(cwd)) {
 			guardedTeamRoots.add(cwd);
-			await applySelectedTeamWorker(cwd, sessionId, decision.target.workerId, decision.target.excessBytes);
+			await (d.applyTeamWorkerGuard ?? (async () => undefined))(
+				cwd,
+				sessionId,
+				decision.target.workerId,
+				decision.target.excessBytes,
+			);
 		}
 		const usageRatio = pressure.totalUsageBytes / limit.effectiveBytes;
 		if (usageRatio >= policy.gcThresholdRatio) {
@@ -766,6 +776,8 @@ export function __setResourceGcDepsForTest(overrides: Partial<ResourceGcDeps>): 
 		...defaultDeps,
 		...overrides,
 		monotonicNow: overrides.monotonicNow ?? overrides.now ?? defaultDeps.monotonicNow,
+		listTeamWorkers: overrides.listTeamWorkers ?? (async () => []),
+		applyTeamWorkerGuard: overrides.applyTeamWorkerGuard ?? (async () => undefined),
 	};
 }
 

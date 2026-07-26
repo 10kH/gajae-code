@@ -491,6 +491,35 @@ describe("resource GC controller", () => {
 		expect(runGc).toHaveBeenCalledTimes(1);
 	});
 
+	it("routes eligible team worker pressure through the registered session adapter", async () => {
+		const settings = Settings.isolated({
+			"memoryGuard.enabled": true,
+			"memoryGuard.policyLimitMb": 100,
+			"memoryGuard.parentReserveMb": 10,
+			"browser.gc.enabled": false,
+			"computer.screenshotGc.enabled": false,
+		});
+		registerResourceGcSession({ sessionId: "team-session", settings, cwd: "/workspace" });
+		const applyTeamWorkerGuard = vi.fn(async () => undefined);
+		await sweepOnce(
+			baseDeps({
+				memorySnapshot: async () => ({
+					hardCapBytes: 100 * MB,
+					totalUsageBytes: 100 * MB,
+					parentBytes: 5 * MB,
+					source: "linux_cgroup_v2",
+				}),
+				listTeamWorkers: async () => [{ workerId: "team-a/worker-1", bytes: 95 * MB, accepted: true }],
+				applyTeamWorkerGuard,
+			}),
+		);
+		expect(applyTeamWorkerGuard).toHaveBeenCalledWith(
+			"/workspace",
+			"team-session",
+			"team-a/worker-1",
+			expect.any(Number),
+		);
+	});
 	it("schedules an enabled guard at its configured check interval", async () => {
 		const clock = controlledScheduler();
 		const runGc = vi.fn();
