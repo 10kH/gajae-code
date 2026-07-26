@@ -49,6 +49,7 @@ import {
 	isCanonicalPersistedGjcTeamTaskClaim,
 	isGjcTeamTaskCompletionVerified,
 	readGjcTeamTasksFromDir as readTasks,
+	selectCurrentClaimedTaskForWorker,
 	taskMetadataFromInput,
 	withGjcTeamMutationFence,
 	withGjcTeamTaskMutation,
@@ -1366,6 +1367,7 @@ async function finalizeWorkerMemoryGuardBlockedState(input: {
 	dir: string;
 	worker: GjcTeamWorker;
 	task: GjcTeamTask | undefined;
+	taskMutation: GjcTeamTaskMutationCapability;
 	reason: string;
 	cwd: string;
 	env: NodeJS.ProcessEnv;
@@ -1382,9 +1384,7 @@ async function finalizeWorkerMemoryGuardBlockedState(input: {
 	await writeLifecycleRecord(workerRuntime, input.dir, input.worker, "failed", { stop_reason: input.reason });
 	const task = input.task;
 	if (!task?.claim) return;
-	await withGjcTeamTaskMutation(taskStore(input.dir), capability =>
-		capability.transition(task.id, "blocked", task.claim!.token, input.worker.id),
-	);
+	await input.taskMutation.transition(task.id, "blocked", task.claim.token, input.worker.id);
 }
 
 async function checkpointWorkerForMemoryGuard(
@@ -1486,7 +1486,7 @@ async function relaunchWorkerPaneForMemoryGuard(input: {
 	return newPaneId;
 }
 
-async function applyWorkerMemoryGuard(input: {
+async function applyWorkerMemoryGuardUnlocked(input: {
 	teamName: string;
 	workerId?: string;
 	requestedWorkerId: string;
@@ -1498,8 +1498,10 @@ async function applyWorkerMemoryGuard(input: {
 	cwd: string;
 	env: NodeJS.ProcessEnv;
 	allowAutomaticAction?: boolean;
+	dir: string;
+	taskMutation: GjcTeamTaskMutationCapability;
 }): Promise<Record<string, unknown>> {
-	const dir = await findTeamDir(input.teamName, input.cwd, input.env);
+	const dir = input.dir;
 	const config = await readConfig(dir);
 	const ledgers = new Map<string, GjcTeamWorkerMemoryGuardLedger>();
 	for (const candidate of config.workers)
@@ -1510,26 +1512,38 @@ async function applyWorkerMemoryGuard(input: {
 		workerId = selectGjcTeamWorkerMemoryGuardCandidate(parsedCandidates)?.worker_id ?? workerId;
 	const worker = findKnownWorker(config, workerId);
 	const tasks = await readTasks(dir);
-	const task = findGjcTeamClaimedTaskForWorker(tasks, worker.id);
+	const activeTask = selectCurrentClaimedTaskForWorker(tasks, worker.id);
+	if (activeTask.kind === "ambiguous") throw new Error(`ambiguous_worker_claims:${worker.id}`);
+	const task =
+		activeTask.kind === "exact"
+			? activeTask.task
+			: tasks.find(
+					candidate =>
+						candidate.status === "blocked" &&
+						candidate.assignee === worker.id &&
+						candidate.claim?.owner === worker.id,
+				);
 	let ledger = ledgers.get(worker.id) ?? (await readWorkerMemoryGuardLedger(dir, worker.id, input.platform));
 	const nowIso = now();
 	const currentTaskId = task?.id;
 	const incidentId = input.incidentId ?? stableHash(`${worker.id}:${currentTaskId ?? "none"}:${nowIso}`).slice(0, 16);
 	const baseReason = input.reason?.trim() || "memory_guard_requested";
+	if (ledger.state === "blocked" || ledger.retry_count >= ledger.retry_limit)
+		return { ok: true, result: "blocked", lifecycle_mutated: false, ledger };
 	if (input.allowAutomaticAction !== undefined)
 		ledger = {
 			...ledger,
 			automatic_action_allowed: input.allowAutomaticAction,
 			updated_at: nowIso,
 		};
-	if (input.platform !== "linux") {
+	if (process.platform !== "linux") {
 		ledger = {
 			...ledger,
 			platform: input.platform,
 			state: "advisory",
 			current_task_id: currentTaskId,
 			last_incident_id: incidentId,
-			last_reason: `unsupported_platform:${input.platform}:${baseReason}`,
+			last_reason: `unsupported_platform:${input.platform}:host:${process.platform}:${baseReason}`,
 			last_pid_probe: input.pidProbe,
 			updated_at: nowIso,
 		};
@@ -1568,6 +1582,7 @@ async function applyWorkerMemoryGuard(input: {
 				dir,
 				worker,
 				task,
+				taskMutation: input.taskMutation,
 				reason: checkpoint.reason,
 				cwd: input.cwd,
 				env: input.env,
@@ -1579,11 +1594,43 @@ async function applyWorkerMemoryGuard(input: {
 			ledger,
 		};
 	}
-	const newPaneId = await relaunchWorkerPaneForMemoryGuard({
-		config,
-		worker,
-		platform: input.platform as NodeJS.Platform,
-	});
+	let newPaneId: string;
+	try {
+		newPaneId = await relaunchWorkerPaneForMemoryGuard({
+			config,
+			worker,
+			platform: process.platform,
+		});
+	} catch (error) {
+		const reason = error instanceof Error && error.message ? `relaunch_failed:${error.message}` : "relaunch_failed";
+		const retried = withMemoryGuardRetry(ledger, {
+			platform: input.platform,
+			reason,
+			incidentId,
+			currentTaskId,
+			pidProbe: input.pidProbe,
+			nowIso,
+		});
+		ledger = retried.ledger;
+		await writeWorkerMemoryGuardLedger(dir, ledger);
+		if (retried.finalBlocked)
+			await finalizeWorkerMemoryGuardBlockedState({
+				teamName: input.teamName,
+				dir,
+				worker,
+				task,
+				taskMutation: input.taskMutation,
+				reason,
+				cwd: input.cwd,
+				env: input.env,
+			});
+		return {
+			ok: true,
+			result: retried.finalBlocked ? "blocked" : "retrying",
+			lifecycle_mutated: retried.finalBlocked,
+			ledger,
+		};
+	}
 	config.workers = config.workers.map(candidate =>
 		candidate.id === worker.id
 			? { ...candidate, pane_id: newPaneId, last_heartbeat: nowIso, status: "starting" }
@@ -1591,6 +1638,12 @@ async function applyWorkerMemoryGuard(input: {
 	);
 	config.updated_at = nowIso;
 	await syncTeamConfigAndManifest(dir, config);
+	await writeJsonFile(path.join(dir, "workers", safePathSegment("worker_id", worker.id), "heartbeat.json"), {
+		pid: 0,
+		last_turn_at: nowIso,
+		turn_count: 0,
+		alive: true,
+	} satisfies WorkerHeartbeatFile);
 	await writeLifecycleRecord(workerRuntime, dir, { ...worker, pane_id: newPaneId }, "starting", {
 		pane_id: newPaneId,
 		started_at: nowIso,
@@ -1635,6 +1688,15 @@ async function applyWorkerMemoryGuard(input: {
 		ledger,
 		checkpoint: checkpoint.checkpoint,
 	};
+}
+
+async function applyWorkerMemoryGuard(
+	input: Omit<Parameters<typeof applyWorkerMemoryGuardUnlocked>[0], "dir" | "taskMutation">,
+): Promise<Record<string, unknown>> {
+	const dir = await findTeamDir(input.teamName, input.cwd, input.env);
+	return withGjcTeamTaskMutation(taskStore(dir), taskMutation =>
+		applyWorkerMemoryGuardUnlocked({ ...input, dir, taskMutation }),
+	);
 }
 async function readPhase(dir: string): Promise<GjcTeamPhase> {
 	try {
@@ -4681,10 +4743,14 @@ export async function executeGjcTeamApiOperation(
 			);
 		case "read-worker-memory-guard": {
 			const dir = await findTeamDir(teamName, cwd, env);
+			const config = await readConfig(dir);
+			assertKnownWorker(config, worker);
 			return readWorkerMemoryGuardLedger(dir, worker, normalizeWorkerMemoryGuardPlatform(input.platform));
 		}
 		case "update-worker-memory-guard": {
 			const dir = await findTeamDir(teamName, cwd, env);
+			const config = await readConfig(dir);
+			assertKnownWorker(config, worker);
 			const platform = normalizeWorkerMemoryGuardPlatform(input.platform);
 			const tasks = await readTasks(dir);
 			const currentTaskIdInput = input.current_task_id ?? input.currentTaskId;

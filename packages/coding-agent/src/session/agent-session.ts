@@ -2270,6 +2270,7 @@ export class AgentSession {
 			this.#unregisterResourceGc = registerResourceGcSession({
 				sessionId: resourceGcSessionId,
 				settings: this.settings,
+				cwd: this.sessionManager.getCwd(),
 			});
 		}
 		this.#unregisterRuntimeStateFinalizer = registerCoordinatorRuntimeStateFinalizer({

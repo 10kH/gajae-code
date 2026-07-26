@@ -18,9 +18,10 @@ function safeProbeWindowsJobMemory(): WindowsJobMemoryProbeResult {
 
 import { logger } from "@gajae-code/utils";
 import type { Settings } from "../config/settings";
+import { executeGjcTeamApiOperation, listGjcTeams, readGjcWorkerHeartbeat } from "../gjc-runtime/team-runtime";
 import { computeMemoryGuardDomain } from "../runtime/memory-domain";
 import { chooseMemoryGuardAction, MemoryGuardHost, resolveMemoryGuardPolicy } from "../runtime/memory-guard";
-import type { MemoryGuardPolicy } from "../runtime/memory-guard-contract";
+import type { MemoryGuardPolicy, MemoryGuardWorkerSample } from "../runtime/memory-guard-contract";
 import { resolveEffectiveMemoryLimit } from "../runtime/memory-limit";
 import { listTabsForGc, releaseTabIfGcEligible, type TabGcSnapshot } from "./browser/tab-supervisor";
 import { cleanupStaleScreenshotFallbackDirs, hasCreatedScreenshotFallbackDir } from "./computer-gc";
@@ -101,7 +102,7 @@ const defaultDeps: ResourceGcDeps = {
 };
 
 // ── Controller state (process-global; tabs/browsers are module-global too) ──────────────────
-const activeSessions = new Map<string, Settings>();
+const activeSessions = new Map<string, { settings: Settings; cwd: string }>();
 const scheduler = new MemoryGuardHost({
 	run: async () => {
 		await sweepOnce(deps);
@@ -119,6 +120,7 @@ let deps: ResourceGcDeps = defaultDeps;
 export interface ResourceGcRegistration {
 	sessionId: string;
 	settings: Settings;
+	cwd?: string;
 }
 
 function resolveSessionSweepIntervalMs(settings: Settings): number {
@@ -134,7 +136,7 @@ function resolveSessionSweepIntervalMs(settings: Settings): number {
  * session unregisters.
  */
 export function registerResourceGcSession(reg: ResourceGcRegistration): () => void {
-	activeSessions.set(reg.sessionId, reg.settings);
+	activeSessions.set(reg.sessionId, { settings: reg.settings, cwd: reg.cwd ?? process.cwd() });
 	const unregisterSchedule = scheduler.register({
 		ownerId: reg.sessionId,
 		intervalMs: resolveSessionSweepIntervalMs(reg.settings),
@@ -479,7 +481,7 @@ export function __selectMemoryPressureDomainForTest(
 
 function sweepMemoryPressureGuard(d: ResourceGcDeps): Promise<void> | undefined {
 	let enabled = false;
-	for (const [sessionId, settings] of activeSessions) {
+	for (const [sessionId, { settings }] of activeSessions) {
 		if (resolveMemoryGuardPolicy(settings).enabled) {
 			enabled = true;
 			continue;
@@ -493,10 +495,61 @@ function sweepMemoryPressureGuard(d: ResourceGcDeps): Promise<void> | undefined 
 	return sweepEnabledMemoryPressureGuard(d);
 }
 
+async function readLinuxWorkerRssBytes(pid: number): Promise<number | null> {
+	if (process.platform !== "linux" || !Number.isSafeInteger(pid) || pid <= 0) return null;
+	try {
+		const status = await Bun.file(`/proc/${pid}/status`).text();
+		const match = /^VmRSS:\s+(\d+)\s+kB$/m.exec(status);
+		if (!match) return null;
+		const kibibytes = Number(match[1]);
+		return Number.isSafeInteger(kibibytes) ? kibibytes * 1024 : null;
+	} catch {
+		return null;
+	}
+}
+
+async function sampleTeamWorkers(cwd: string): Promise<MemoryGuardWorkerSample[]> {
+	if (process.platform !== "linux") return [];
+	const samples: MemoryGuardWorkerSample[] = [];
+	for (const team of await listGjcTeams(cwd, process.env)) {
+		if (team.phase === "complete" || team.phase === "cancelled") continue;
+		for (const worker of team.workers) {
+			try {
+				const heartbeat = await readGjcWorkerHeartbeat(team.team_name, worker.id, cwd, process.env);
+				if (!heartbeat) continue;
+				const bytes = await readLinuxWorkerRssBytes(heartbeat.pid);
+				if (bytes === null) continue;
+				samples.push({ workerId: `${team.team_name}/${worker.id}`, bytes, accepted: true });
+			} catch {
+				// Missing or malformed worker authority is not eligible for automatic mutation.
+			}
+		}
+	}
+	return samples;
+}
+
+async function applySelectedTeamWorker(cwd: string, workerId: string, excessBytes: number): Promise<void> {
+	const separator = workerId.lastIndexOf("/");
+	if (separator <= 0 || separator === workerId.length - 1) return;
+	const teamName = workerId.slice(0, separator);
+	const worker = workerId.slice(separator + 1);
+	await executeGjcTeamApiOperation(
+		"apply-worker-memory-guard",
+		{
+			team_name: teamName,
+			worker,
+			platform: process.platform,
+			reason: "production_memory_pressure_sweep",
+			candidates: [{ worker_id: worker, platform: process.platform, excess_bytes: excessBytes }],
+		},
+		cwd,
+		process.env,
+	);
+}
 async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void> {
 	const now = d.monotonicNow();
-	const dueSessions: Array<{ sessionId: string; policy: MemoryGuardPolicy }> = [];
-	for (const [sessionId, settings] of activeSessions) {
+	const dueSessions: Array<{ sessionId: string; policy: MemoryGuardPolicy; cwd: string }> = [];
+	for (const [sessionId, { settings, cwd }] of activeSessions) {
 		const policy = resolveMemoryGuardPolicy(settings);
 		if (!policy.enabled) {
 			memoryGuardGcActive.delete(sessionId);
@@ -508,14 +561,14 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 		const lastEvaluated = memoryGuardLastEvaluatedAt.get(sessionId);
 		if (lastEvaluated !== undefined && now - lastEvaluated < policy.checkIntervalMs) continue;
 		memoryGuardLastEvaluatedAt.set(sessionId, now);
-		dueSessions.push({ sessionId, policy });
+		dueSessions.push({ sessionId, policy, cwd });
 	}
 	if (dueSessions.length === 0) return;
 
 	const snapshot = await d.memorySnapshot();
 	let gcRequested = false;
 	const gcTelemetry: Array<{ sessionId: string } & Record<string, unknown>> = [];
-	for (const { sessionId, policy } of dueSessions) {
+	for (const { sessionId, policy, cwd } of dueSessions) {
 		const pressure = __selectMemoryPressureDomainForTest(snapshot, policy.policyLimitBytes);
 		const limit = resolveEffectiveMemoryLimit({
 			hardCapBytes: pressure.hardCapBytes,
@@ -527,18 +580,22 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 			memoryGuardRestartCooldownUntil.delete(sessionId);
 			continue;
 		}
+		const workerSamples = await sampleTeamWorkers(cwd);
 		const domain = computeMemoryGuardDomain({
 			effectiveLimitBytes: limit.effectiveBytes,
 			totalUsageBytes: pressure.totalUsageBytes,
 			parentBytes: pressure.parentBytes,
 			parentReserveBytes: policy.parentReserveBytes,
-			workers: [],
+			workers: workerSamples,
 		});
 		const decision = chooseMemoryGuardAction({
 			domain,
 			hostSupported: false,
-			workerSupported: () => false,
+			workerSupported: workerId =>
+				workerSamples.some(worker => worker.workerId === workerId && worker.accepted !== false),
 		});
+		if (decision.kind === "execute" && decision.target.kind === "worker")
+			await applySelectedTeamWorker(cwd, decision.target.workerId, decision.target.excessBytes);
 		const usageRatio = pressure.totalUsageBytes / limit.effectiveBytes;
 		if (usageRatio >= policy.gcThresholdRatio) {
 			if (!memoryGuardGcActive.has(sessionId)) {
@@ -598,9 +655,9 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 
 function ownerBrowserPolicy(snapshot: TabGcSnapshot): BrowserGcPolicy | null {
 	if (!snapshot.ownerId) return null;
-	const settings = activeSessions.get(snapshot.ownerId);
-	if (!settings) return null;
-	return resolveBrowserGcPolicy(settings);
+	const registration = activeSessions.get(snapshot.ownerId);
+	if (!registration) return null;
+	return resolveBrowserGcPolicy(registration.settings);
 }
 
 /** Coarse, ordering-only eligibility; the live recheck in releaseTabIfGcEligible is authoritative. */
@@ -639,7 +696,7 @@ async function sweepBrowserTabs(d: ResourceGcDeps): Promise<void> {
 function pressuredOwnerIds(d: ResourceGcDeps): Set<string> {
 	const rss = d.rssBytes();
 	const owners = new Set<string>();
-	for (const [sessionId, settings] of activeSessions) {
+	for (const [sessionId, { settings }] of activeSessions) {
 		const policy = resolveBrowserGcPolicy(settings);
 		if (policy.enabled && rss > policy.rssLimitBytes) owners.add(sessionId);
 	}
@@ -678,7 +735,7 @@ async function sweepScreenshots(d: ResourceGcDeps): Promise<void> {
 
 	let staleMs: number | null = null;
 	let scanIntervalMs = Number.POSITIVE_INFINITY;
-	for (const settings of activeSessions.values()) {
+	for (const { settings } of activeSessions.values()) {
 		const policy = resolveComputerGcPolicy(settings);
 		if (!policy.enabled) continue;
 		staleMs = staleMs === null ? policy.staleMs : Math.min(staleMs, policy.staleMs);
