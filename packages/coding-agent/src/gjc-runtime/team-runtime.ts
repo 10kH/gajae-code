@@ -1720,7 +1720,8 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		return { ok: true, result: "advisory", lifecycle_mutated: false, ledger };
 	}
 	const controllerPath = path.join(dir, "memory-guard-controller.json");
-	const controllerId = input.env.GJC_SESSION_ID?.trim() || `pid:${process.pid}`;
+	const controllerProcessStart = await readLinuxProcessStartTime(process.pid);
+	const controllerId = `pid:${process.pid}:start:${controllerProcessStart ?? "unknown"}`;
 	const controllerNow = currentTimeMs();
 	const controllerCooldownMs = parseDurationEnv(input.env, "GJC_TEAM_MEMORY_GUARD_ACTION_COOLDOWN_MS", 120_000);
 	const existingController = await readJsonFile<{
