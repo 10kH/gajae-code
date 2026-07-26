@@ -1452,14 +1452,26 @@ async function checkpointWorkerForMemoryGuard(
 	} catch {
 		return { ok: false, reason: "checkpoint_git_error" };
 	}
-	if (classification.kind !== "clean" && classification.kind !== "eligible")
+	if (
+		classification.kind !== "clean" &&
+		classification.kind !== "eligible" &&
+		classification.kind !== "protected_only"
+	)
 		return { ok: false, reason: `checkpoint_${classification.kind}` };
 	let commit: string | null = null;
 	if (classification.kind === "eligible") {
 		const added = runGitResult(worker.worktree_path, ["add", "--", ...classification.files]);
 		if (!added.ok) return { ok: false, reason: "checkpoint_git_add_failed" };
 		const message = `gjc(team): memory-guard checkpoint ${worker.id} [${taskId ?? "unknown"}]`;
-		const committed = runGitResult(worker.worktree_path, ["commit", "--no-verify", "-m", message]);
+		const committed = runGitResult(worker.worktree_path, [
+			"commit",
+			"--no-verify",
+			"--only",
+			"-m",
+			message,
+			"--",
+			...classification.files,
+		]);
 		if (!committed.ok) return { ok: false, reason: "checkpoint_git_commit_failed" };
 		commit = resolveHead(worker.worktree_path);
 	}
@@ -1550,6 +1562,14 @@ async function relaunchWorkerPaneForMemoryGuard(input: {
 			throw new Error(`memory_guard_successor_startup_timeout:${input.worker.id}`);
 		}
 		await Bun.sleep(50);
+	}
+	const successorPane = probePaneTeamTarget(input.config, newPaneId);
+	if (!successorPane.exists || !successorPane.belongsToTeamTarget) {
+		Bun.spawnSync([input.config.tmux_command, "kill-pane", "-t", newPaneId], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		throw new Error(`memory_guard_successor_pane_unavailable:${input.worker.id}`);
 	}
 	if (input.worker.pane_id) {
 		const oldPane = probePaneTeamTarget(input.config, input.worker.pane_id);
@@ -1890,6 +1910,32 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 			reason: "worker_claim_authority_changed_after_startup",
 		};
 	}
+	const successorPane = probePaneTeamTarget(config, newPaneId);
+	if (!successorPane.exists || !successorPane.belongsToTeamTarget || !successorPane.pid) {
+		Bun.spawnSync([config.tmux_command, "kill-pane", "-t", newPaneId], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		if (previousStartupAck !== undefined) await Bun.write(startupAckPath, previousStartupAck);
+		else await fs.rm(startupAckPath, { force: true });
+		return {
+			ok: true,
+			result: "advisory",
+			lifecycle_mutated: false,
+			reason: "successor_pane_unavailable_after_startup",
+		};
+	}
+	const heartbeatPath = path.join(dir, "workers", safePathSegment("worker_id", worker.id), "heartbeat.json");
+	const previousHeartbeat = (await Bun.file(heartbeatPath).exists())
+		? await Bun.file(heartbeatPath).text()
+		: undefined;
+	const successorHeartbeat: WorkerHeartbeatFile = {
+		pid: successorPane.pid,
+		last_turn_at: now(),
+		turn_count: 0,
+		alive: true,
+		process_start_time: await readLinuxProcessStartTime(successorPane.pid),
+	};
 	const lifecyclePath = workerLifecyclePath(dir, worker.id);
 	const previousLifecycle = (await Bun.file(lifecyclePath).exists())
 		? await Bun.file(lifecyclePath).text()
@@ -1908,6 +1954,8 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 			stdout: "ignore",
 			stderr: "ignore",
 		});
+		if (previousHeartbeat === undefined) await fs.rm(heartbeatPath, { force: true });
+		else await Bun.write(heartbeatPath, previousHeartbeat);
 		await syncTeamConfigAndManifest(dir, config);
 		if (previousLifecycle === undefined) await fs.rm(lifecyclePath, { force: true });
 		else await Bun.write(lifecyclePath, previousLifecycle);
@@ -1915,6 +1963,7 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		else await fs.rm(startupAckPath, { force: true });
 	};
 	try {
+		await writeJsonFile(heartbeatPath, successorHeartbeat);
 		await syncTeamConfigAndManifest(dir, nextConfig);
 		await writeLifecycleRecord(workerRuntime, dir, { ...worker, pane_id: newPaneId }, "ready", {
 			pane_id: newPaneId,
@@ -1922,6 +1971,9 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 			stop_reason: undefined,
 			stopped_at: undefined,
 		});
+		const cutoverPane = probePaneTeamTarget(config, newPaneId);
+		if (!cutoverPane.exists || !cutoverPane.belongsToTeamTarget || cutoverPane.pid !== successorHeartbeat.pid)
+			throw new Error(`memory_guard_successor_pane_changed:${worker.id}`);
 		if (worker.pane_id && !config.dry_run) {
 			const killed = Bun.spawnSync([config.tmux_command, "kill-pane", "-t", worker.pane_id], {
 				stdout: "ignore",
@@ -2777,15 +2829,23 @@ async function startTmuxSession(
 		throw error;
 	}
 }
-function probePaneTeamTarget(config: GjcTeamConfig, paneId: string): { exists: boolean; belongsToTeamTarget: boolean } {
+function probePaneTeamTarget(
+	config: GjcTeamConfig,
+	paneId: string,
+): { exists: boolean; belongsToTeamTarget: boolean; pid?: number } {
 	if (paneId === config.leader.pane_id) return { exists: true, belongsToTeamTarget: false };
-	const result = Bun.spawnSync([config.tmux_command, "display-message", "-p", "-t", paneId, "#S:#I #{pane_id}"], {
-		stdout: "pipe",
-		stderr: "ignore",
-	});
+	const result = Bun.spawnSync(
+		[config.tmux_command, "display-message", "-p", "-t", paneId, "#S:#I #{pane_id} #{pane_pid}"],
+		{ stdout: "pipe", stderr: "ignore" },
+	);
 	if (result.exitCode !== 0) return { exists: false, belongsToTeamTarget: false };
-	const [target = "", detectedPaneId = ""] = result.stdout.toString().trim().split(/\s+/);
-	return { exists: true, belongsToTeamTarget: target === config.tmux_target && detectedPaneId === paneId };
+	const [target = "", detectedPaneId = "", rawPid = ""] = result.stdout.toString().trim().split(/\s+/);
+	const pid = Number(rawPid);
+	return {
+		exists: true,
+		belongsToTeamTarget: target === config.tmux_target && detectedPaneId === paneId,
+		pid: Number.isInteger(pid) && pid > 0 ? pid : undefined,
+	};
 }
 
 function paneBelongsToTeamTarget(config: GjcTeamConfig, paneId: string): boolean {
@@ -4177,24 +4237,7 @@ async function writeGjcWorkerStartupAck(
 	env: NodeJS.ProcessEnv,
 	input: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-	const pid = typeof input.pid === "number" && input.pid > 0 ? input.pid : process.pid;
-	const ackInput = { ...input, pid };
-	const ackAt = now();
-	await updateWorkerHeartbeat(
-		workerRuntime,
-		teamName,
-		worker,
-		{
-			pid,
-			last_turn_at: ackAt,
-			turn_count: 0,
-			alive: true,
-			process_start_time: await readLinuxProcessStartTime(pid),
-		},
-		cwd,
-		env,
-	);
-	return writeWorkerStartupAck(workerRuntime, teamName, worker, cwd, env, ackInput);
+	return writeWorkerStartupAck(workerRuntime, teamName, worker, cwd, env, input);
 }
 function parseDurationEnv(env: NodeJS.ProcessEnv, name: string, fallbackMs: number): number {
 	const raw = env[name]?.trim();

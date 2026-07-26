@@ -103,11 +103,11 @@ case "$1" in
       fi
     done
     case "$target" in
-      %9) echo "other-session:0 %9" ;;
-      %*) echo "test-session:0 $target" ;;
-      =test-session:*|=test-session|test-session:*|test-session) echo "test-session:0 %1" ;;
-      =other-session:*|=other-session|other-session:*|other-session) echo "other-session:0 %9" ;;
-      *) echo "test-session:0 %1" ;;
+      %9) echo "other-session:0 %9 4242" ;;
+      %*) echo "test-session:0 $target 4242" ;;
+      =test-session:*|=test-session|test-session:*|test-session) echo "test-session:0 %1 4242" ;;
+      =other-session:*|=other-session|other-session:*|other-session) echo "other-session:0 %9 4242" ;;
+      *) echo "test-session:0 %1 4242" ;;
     esac
     `
 }
@@ -3561,6 +3561,12 @@ describe("team worker memory guard wiring", () => {
 			platform: "linux",
 			env,
 		});
+		const workerWorktree = snapshot.workers.find(worker => worker.id === "worker-2")?.worktree_path;
+		expect(workerWorktree).toBeTruthy();
+		const protectedPath = `.gjc/_session-${TEST_SESSION_ID}/state/team/runtime.json`;
+		await Bun.write(path.join(workerWorktree!, protectedPath), "{}\n");
+		await Bun.write(path.join(workerWorktree!, "report draft.md"), "eligible\n");
+		runGit(workerWorktree!, ["add", "-f", "--", protectedPath]);
 		const claim = await claimGjcTeamTask("memory-guard-selector-team", "worker-2", cleanupRoot, env, "task-2");
 		expect(claim.ok).toBe(true);
 		const successorAck = Bun.sleep(50).then(() =>
@@ -3603,7 +3609,7 @@ describe("team worker memory guard wiring", () => {
 		expect(result.ledger.worker_id).toBe("worker-2");
 		expect(result.ledger.state).toBe("replaced");
 		expect(result.ledger.current_task_id).toBe("task-2");
-		expect(["clean", "eligible"].includes(result.ledger.last_checkpoint?.kind ?? "")).toBe(true);
+		expect(result.ledger.last_checkpoint?.kind).toBe("eligible");
 		const config = await readTeamConfig(snapshot.state_dir);
 		const manifest = (await Bun.file(path.join(snapshot.state_dir, "manifest.v2.json")).json()) as {
 			workers: Array<{ id: string; pane_id?: string }>;
@@ -3616,6 +3622,12 @@ describe("team worker memory guard wiring", () => {
 		expect(manifestWorker?.pane_id).toBe(configWorker?.pane_id);
 		const task = await readGjcTeamTask("memory-guard-selector-team", "task-2", cleanupRoot, env);
 		expect(task.status).toBe("in_progress");
+		const committedPaths = runGit(workerWorktree!, ["show", "--name-only", "--format="])
+			.split(/\r?\n/)
+			.filter(Boolean);
+		expect(committedPaths).toContain("report draft.md");
+		expect(committedPaths).not.toContain(protectedPath);
+		expect(runGit(workerWorktree!, ["diff", "--cached", "--name-only"]).split(/\r?\n/)).toContain(protectedPath);
 		expect(task.claim?.owner).toBe("worker-2");
 	});
 
