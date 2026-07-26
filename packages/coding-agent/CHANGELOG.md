@@ -1,6 +1,8 @@
-# Changelog
-
 ## [Unreleased]
+
+### Fixed
+
+- Post-merge Dev CI: update SDK operation matrix length pins for `model.profile.set` (C53) added by #3191 so registry bijection and control-count gates match the generated inventory.
 
 ### Added
 
