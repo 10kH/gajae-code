@@ -35,6 +35,7 @@ export function buildWorkerCommand(
 	config: GjcTeamConfig,
 	worker: GjcTeamWorker,
 	platform: NodeJS.Platform = process.platform,
+	promptOverride?: string,
 ): string {
 	const quote = platform === "win32" ? powershellQuote : shellQuote;
 	const envAssignment = (key: string, value: string): string =>
@@ -42,7 +43,8 @@ export function buildWorkerCommand(
 	const workspace = worker.worktree_path
 		? `Worker worktree: ${worker.worktree_path}.`
 		: `Worker cwd: ${config.leader.cwd}.`;
-	const prompt =
+	const initialPrompt =
+		promptOverride ??
 		[
 			`You are ${worker.id} in gjc team ${config.team_name}.`,
 			`Team state root: ${config.state_root}.`,
@@ -51,8 +53,9 @@ export function buildWorkerCommand(
 			"Before implementation, claim your worker-owned task and treat the claimed task record as the source of truth. Do not implement directly from the broad team brief.",
 			`Before claiming work, send startup ACK: gjc team api worker-startup-ack --input '{"team_name":"${config.team_name}","worker_id":"${worker.id}","protocol_version":"1"}' --json.`,
 			"Use gjc team api update-worker-status to report task-local activity, then claim-task/transition-task-status with this worker id; keep heartbeat current during long work, record completion_evidence (summary plus a passed command or verified inspection/artifact item) before completed, and do not mutate leader-owned goal state.",
-		]
-			.join("\n")
+		].join("\n");
+	const prompt =
+		initialPrompt
 			.replace(/[\uFEFF\u200B]/g, "")
 			.replace(/\r?\n+/g, " ")
 			.trim() || `Worker ${worker.id} ready.`;

@@ -366,7 +366,7 @@ describe("resource GC controller", () => {
 
 		expect(runGc).toHaveBeenCalledTimes(2);
 		expect(logWarn).toHaveBeenCalledWith(
-			"Memory guard: restart threshold sustained; restart remains advisory-only",
+			"Memory guard: restart threshold sustained",
 			expect.objectContaining({ sessionId: "s1", effectiveLimitBytes: 100 * MB }),
 		);
 		settings.set("memoryGuard.enabled", false);
@@ -452,7 +452,7 @@ describe("resource GC controller", () => {
 		await sweepOnce(deps);
 
 		expect(logWarn).toHaveBeenCalledWith(
-			"Memory guard: restart threshold sustained; restart remains advisory-only",
+			"Memory guard: restart threshold sustained",
 			expect.objectContaining({ sessionId: "monotonic-guard" }),
 		);
 	});
@@ -496,23 +496,27 @@ describe("resource GC controller", () => {
 			"memoryGuard.enabled": true,
 			"memoryGuard.policyLimitMb": 100,
 			"memoryGuard.parentReserveMb": 10,
+			"memoryGuard.restartThresholdWindowMs": 0,
 			"browser.gc.enabled": false,
 			"computer.screenshotGc.enabled": false,
 		});
 		registerResourceGcSession({ sessionId: "team-session", settings, cwd: "/workspace" });
 		const applyTeamWorkerGuard = vi.fn(async () => undefined);
-		await sweepOnce(
-			baseDeps({
-				memorySnapshot: async () => ({
-					hardCapBytes: 100 * MB,
-					totalUsageBytes: 100 * MB,
-					parentBytes: 5 * MB,
-					source: "linux_cgroup_v2",
-				}),
-				listTeamWorkers: async () => [{ workerId: "team-a/worker-1", bytes: 95 * MB, accepted: true }],
-				applyTeamWorkerGuard,
+		let monotonicNow = 0;
+		const deps = baseDeps({
+			monotonicNow: () => monotonicNow,
+			memorySnapshot: async () => ({
+				hardCapBytes: 100 * MB,
+				totalUsageBytes: 100 * MB,
+				parentBytes: 5 * MB,
+				source: "linux_cgroup_v2",
 			}),
-		);
+			listTeamWorkers: async () => [{ workerId: "team-a/worker-1", bytes: 95 * MB, accepted: true }],
+			applyTeamWorkerGuard,
+		});
+		await sweepOnce(deps);
+		monotonicNow = 30_000;
+		await sweepOnce(deps);
 		expect(applyTeamWorkerGuard).toHaveBeenCalledWith(
 			"/workspace",
 			"team-session",

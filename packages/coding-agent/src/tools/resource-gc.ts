@@ -513,6 +513,21 @@ async function readLinuxWorkerRssBytes(pid: number): Promise<number | null> {
 	}
 }
 
+async function readLinuxProcessStartTime(pid: number): Promise<string | null> {
+	try {
+		const stat = await Bun.file(`/proc/${pid}/stat`).text();
+		const commandEnd = stat.lastIndexOf(")");
+		if (commandEnd < 0) return null;
+		const startTime = stat
+			.slice(commandEnd + 2)
+			.trim()
+			.split(/\s+/)[19];
+		return startTime && /^\d+$/.test(startTime) ? startTime : null;
+	} catch {
+		return null;
+	}
+}
+
 async function sampleTeamWorkers(cwd: string, sessionId: string): Promise<MemoryGuardWorkerSample[]> {
 	if (process.platform !== "linux") return [];
 	const samples: MemoryGuardWorkerSample[] = [];
@@ -524,7 +539,15 @@ async function sampleTeamWorkers(cwd: string, sessionId: string): Promise<Memory
 					...process.env,
 					GJC_SESSION_ID: sessionId,
 				});
-				if (!heartbeat) continue;
+				const heartbeatAt = Date.parse(heartbeat?.last_turn_at ?? "");
+				if (
+					!heartbeat?.alive ||
+					!heartbeat.process_start_time ||
+					!Number.isFinite(heartbeatAt) ||
+					Date.now() - heartbeatAt >= 120_000 ||
+					(await readLinuxProcessStartTime(heartbeat.pid)) !== heartbeat.process_start_time
+				)
+					continue;
 				const bytes = await readLinuxWorkerRssBytes(heartbeat.pid);
 				if (bytes === null) continue;
 				samples.push({ workerId: `${team.team_name}/${worker.id}`, bytes, accepted: true });
@@ -608,15 +631,6 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 			workerSupported: workerId =>
 				workerSamples.some(worker => worker.workerId === workerId && worker.accepted !== false),
 		});
-		if (decision.kind === "execute" && decision.target.kind === "worker" && !guardedTeamRoots.has(cwd)) {
-			guardedTeamRoots.add(cwd);
-			await (d.applyTeamWorkerGuard ?? (async () => undefined))(
-				cwd,
-				sessionId,
-				decision.target.workerId,
-				decision.target.excessBytes,
-			);
-		}
 		const usageRatio = pressure.totalUsageBytes / limit.effectiveBytes;
 		if (usageRatio >= policy.gcThresholdRatio) {
 			if (!memoryGuardGcActive.has(sessionId)) {
@@ -647,8 +661,26 @@ async function sweepEnabledMemoryPressureGuard(d: ResourceGcDeps): Promise<void>
 		}
 		const cooldownUntil = memoryGuardRestartCooldownUntil.get(sessionId) ?? 0;
 		if (now - aboveSince < policy.restartThresholdWindowMs || now < cooldownUntil) continue;
+		const guardAuthority = `${sessionId}\0${cwd}`;
+		if (decision.kind === "execute" && decision.target.kind === "worker" && !guardedTeamRoots.has(guardAuthority)) {
+			guardedTeamRoots.add(guardAuthority);
+			try {
+				await (d.applyTeamWorkerGuard ?? (async () => undefined))(
+					cwd,
+					sessionId,
+					decision.target.workerId,
+					decision.target.excessBytes,
+				);
+			} catch (error) {
+				d.logWarn("Memory guard: team worker action failed; continuing sweep", {
+					sessionId,
+					workerId: decision.target.workerId,
+					error: String(error),
+				});
+			}
+		}
 		memoryGuardRestartCooldownUntil.set(sessionId, now + policy.cooldownMs);
-		d.logWarn("Memory guard: restart threshold sustained; restart remains advisory-only", {
+		d.logWarn("Memory guard: restart threshold sustained", {
 			sessionId,
 			parentBytes: pressure.parentBytes,
 			totalUsageBytes: pressure.totalUsageBytes,

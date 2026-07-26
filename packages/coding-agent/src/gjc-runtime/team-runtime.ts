@@ -55,12 +55,15 @@ import {
 	withGjcTeamTaskMutation,
 } from "./team-store";
 import {
+	appendTeamWorkerMemoryGuardLedgerEntry,
 	createInitialGjcTeamWorkerMemoryGuardLedger,
 	type GjcTeamWorkerMemoryGuardCheckpoint,
 	type GjcTeamWorkerMemoryGuardLedger,
 	type GjcTeamWorkerMemoryGuardSelectionCandidate,
 	isCanonicalGjcTeamWorkerMemoryGuardLedger,
+	nextTeamWorkerMemoryGuardAttempt,
 	normalizeGjcTeamWorkerMemoryGuardPidProbe,
+	readTeamWorkerMemoryGuardLedger,
 	selectGjcTeamWorkerMemoryGuardCandidate,
 	workerMemoryGuardLedgerPath,
 } from "./team-worker-memory-guard";
@@ -446,6 +449,7 @@ export interface WorkerHeartbeatFile {
 	last_turn_at: string;
 	turn_count: number;
 	alive: boolean;
+	process_start_time?: string;
 }
 interface GitResult {
 	ok: boolean;
@@ -1269,7 +1273,7 @@ async function readWorkerMemoryGuardLedger(
 ): Promise<GjcTeamWorkerMemoryGuardLedger> {
 	const ledgerPath = workerMemoryGuardLedgerPath(dir, workerId);
 	const existing = await readJsonFile<unknown>(ledgerPath);
-	if (isCanonicalGjcTeamWorkerMemoryGuardLedger(existing)) return existing;
+	if (isCanonicalGjcTeamWorkerMemoryGuardLedger(existing) && existing.worker_id === workerId) return existing;
 	const ledger = createInitialGjcTeamWorkerMemoryGuardLedger({ workerId, platform, now: now() });
 	await writeJsonFile(ledgerPath, ledger);
 	return ledger;
@@ -1283,8 +1287,53 @@ async function writeWorkerMemoryGuardLedger(
 	return ledger;
 }
 
+async function appendWorkerMemoryGuardAction(input: {
+	dir: string;
+	teamName: string;
+	workerId: string;
+	task?: GjcTeamTask;
+	incidentId: string;
+	action: "advisory" | "replace" | "blocked";
+	result: "noop" | "scheduled" | "succeeded" | "failed" | "blocked";
+	reason: string;
+}): Promise<void> {
+	const workerPath = path.join(input.dir, "workers", safePathSegment("worker_id", input.workerId));
+	const entries = await readTeamWorkerMemoryGuardLedger(workerPath);
+	await appendTeamWorkerMemoryGuardLedgerEntry(workerPath, {
+		schema_version: 1,
+		recorded_at: now(),
+		incident_id: input.incidentId,
+		team_name: input.teamName,
+		worker_id: input.workerId,
+		task_id: input.task?.id ?? "unclaimed",
+		claim_token: input.task?.claim?.token ?? "unclaimed",
+		attempt: nextTeamWorkerMemoryGuardAttempt(entries, input.incidentId),
+		platform: process.platform,
+		action: input.action,
+		result: input.result,
+		reason: input.reason,
+	});
+}
+
 function normalizeWorkerMemoryGuardPlatform(value: unknown): string {
 	return typeof value === "string" && value.trim() ? value.trim() : process.platform;
+}
+
+async function readLinuxProcessStartTime(pid: number): Promise<string | undefined> {
+	if (process.platform !== "linux" || !Number.isSafeInteger(pid) || pid <= 0) return undefined;
+	try {
+		const stat = await Bun.file(`/proc/${pid}/stat`).text();
+		const commandEnd = stat.lastIndexOf(")");
+		if (commandEnd < 0) return undefined;
+		const fields = stat
+			.slice(commandEnd + 2)
+			.trim()
+			.split(/\s+/);
+		const startTime = fields[19];
+		return startTime && /^\d+$/.test(startTime) ? startTime : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 function normalizeWorkerMemoryGuardSelectionCandidates(
@@ -1429,7 +1478,7 @@ async function relaunchWorkerPaneForMemoryGuard(input: {
 }): Promise<string> {
 	if (input.config.dry_run)
 		return `%memory-guard-${input.worker.id}-${stableHash(`${input.worker.id}:${now()}`).slice(0, 8)}`;
-	const workerCommand = buildWorkerCommand(input.config, input.worker, input.platform);
+	const workerCommand = buildWorkerCommand(input.config, input.worker, input.platform, GJC_TEAM_CONTINUATION_PROMPT);
 	const workerCwd = input.worker.worktree_path ?? input.config.leader.cwd;
 	const useSendKeysFallback = shouldDispatchWorkerWithSendKeys(input.config.tmux_command, input.platform);
 	const splitTarget =
@@ -1509,8 +1558,17 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		ledgers.set(candidate.id, await readWorkerMemoryGuardLedger(dir, candidate.id, input.platform));
 	let workerId = input.workerId ?? input.requestedWorkerId;
 	const parsedCandidates = normalizeWorkerMemoryGuardSelectionCandidates(input.candidates, ledgers);
-	if (!input.workerId && parsedCandidates.length > 0)
-		workerId = selectGjcTeamWorkerMemoryGuardCandidate(parsedCandidates)?.worker_id ?? workerId;
+	if (!input.workerId && Array.isArray(input.candidates)) {
+		const selected = selectGjcTeamWorkerMemoryGuardCandidate(parsedCandidates);
+		if (!selected)
+			return {
+				ok: true,
+				result: "advisory",
+				lifecycle_mutated: false,
+				reason: "no_eligible_worker_memory_guard_candidate",
+			};
+		workerId = selected.worker_id;
+	}
 	const worker = findKnownWorker(config, workerId);
 	const tasks = await readTasks(dir);
 	const activeTask = selectCurrentClaimedTaskForWorker(tasks, worker.id);
@@ -1529,8 +1587,19 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 	const currentTaskId = task?.id;
 	const incidentId = input.incidentId ?? stableHash(`${worker.id}:${currentTaskId ?? "none"}:${nowIso}`).slice(0, 16);
 	const baseReason = input.reason?.trim() || "memory_guard_requested";
-	if (ledger.state === "blocked" || ledger.retry_count >= ledger.retry_limit)
+	if (ledger.state === "blocked" || ledger.retry_count >= ledger.retry_limit) {
+		await appendWorkerMemoryGuardAction({
+			dir,
+			teamName: input.teamName,
+			workerId: worker.id,
+			task,
+			incidentId,
+			action: "blocked",
+			result: "blocked",
+			reason: ledger.last_reason ?? "retry_limit",
+		});
 		return { ok: true, result: "blocked", lifecycle_mutated: false, ledger };
+	}
 	if (input.allowAutomaticAction !== undefined)
 		ledger = {
 			...ledger,
@@ -1549,6 +1618,16 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 			updated_at: nowIso,
 		};
 		await writeWorkerMemoryGuardLedger(dir, ledger);
+		await appendWorkerMemoryGuardAction({
+			dir,
+			teamName: input.teamName,
+			workerId: worker.id,
+			task,
+			incidentId,
+			action: "advisory",
+			result: "noop",
+			reason: ledger.last_reason ?? "unsupported_platform",
+		});
 		return { ok: true, result: "advisory", lifecycle_mutated: false, ledger };
 	}
 	if (!ledger.automatic_action_allowed) {
@@ -1563,6 +1642,16 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 			updated_at: nowIso,
 		};
 		await writeWorkerMemoryGuardLedger(dir, ledger);
+		await appendWorkerMemoryGuardAction({
+			dir,
+			teamName: input.teamName,
+			workerId: worker.id,
+			task,
+			incidentId,
+			action: "advisory",
+			result: "noop",
+			reason: "automatic_linux_action_disabled",
+		});
 		return { ok: true, result: "advisory", lifecycle_mutated: false, ledger };
 	}
 	const checkpoint = await checkpointWorkerForMemoryGuard(worker, currentTaskId);
@@ -1588,6 +1677,16 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 				cwd: input.cwd,
 				env: input.env,
 			});
+		await appendWorkerMemoryGuardAction({
+			dir,
+			teamName: input.teamName,
+			workerId: worker.id,
+			task,
+			incidentId,
+			action: retried.finalBlocked ? "blocked" : "replace",
+			result: retried.finalBlocked ? "blocked" : "failed",
+			reason: checkpoint.reason,
+		});
 		return {
 			ok: true,
 			result: retried.finalBlocked ? "blocked" : "retrying",
@@ -1625,6 +1724,16 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 				cwd: input.cwd,
 				env: input.env,
 			});
+		await appendWorkerMemoryGuardAction({
+			dir,
+			teamName: input.teamName,
+			workerId: worker.id,
+			task,
+			incidentId,
+			action: retried.finalBlocked ? "blocked" : "replace",
+			result: retried.finalBlocked ? "blocked" : "failed",
+			reason,
+		});
 		return {
 			ok: true,
 			result: retried.finalBlocked ? "blocked" : "retrying",
@@ -1664,6 +1773,16 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		updated_at: nowIso,
 	};
 	await writeWorkerMemoryGuardLedger(dir, ledger);
+	await appendWorkerMemoryGuardAction({
+		dir,
+		teamName: input.teamName,
+		workerId: worker.id,
+		task,
+		incidentId,
+		action: "replace",
+		result: "succeeded",
+		reason: baseReason,
+	});
 	await appendEvent(dir, {
 		type: "worker_memory_guard_replaced",
 		worker: worker.id,
@@ -4724,19 +4843,22 @@ export async function executeGjcTeamApiOperation(
 			return readGjcWorkerHeartbeat(teamName, worker, cwd, env);
 		case "recover-stale-claims":
 			return recoverGjcTeamStaleClaims(teamName, cwd, env);
-		case "update-worker-heartbeat":
+		case "update-worker-heartbeat": {
+			const pid = Number(input.pid ?? 0);
 			return updateGjcWorkerHeartbeat(
 				teamName,
 				worker,
 				{
-					pid: Number(input.pid ?? 0),
+					pid,
 					last_turn_at: now(),
 					turn_count: Number(input.turn_count ?? 0),
 					alive: Boolean(input.alive ?? true),
+					process_start_time: await readLinuxProcessStartTime(pid),
 				},
 				cwd,
 				env,
 			);
+		}
 		case "read-worker-memory-guard": {
 			const dir = await findTeamDir(teamName, cwd, env);
 			const config = await readConfig(dir);
@@ -4750,9 +4872,11 @@ export async function executeGjcTeamApiOperation(
 			const platform = normalizeWorkerMemoryGuardPlatform(input.platform);
 			const tasks = await readTasks(dir);
 			const currentTaskIdInput = input.current_task_id ?? input.currentTaskId;
+			if (typeof currentTaskIdInput === "string" && !currentTaskIdInput.trim())
+				throw new Error("invalid_worker_memory_guard_task_id");
 			const currentTaskId =
 				typeof currentTaskIdInput === "string"
-					? currentTaskIdInput
+					? currentTaskIdInput.trim()
 					: findGjcTeamClaimedTaskForWorker(tasks, worker)?.id;
 			const existing = await readWorkerMemoryGuardLedger(dir, worker, platform);
 			const retryLimitInput = Number(input.retry_limit ?? input.retryLimit ?? existing.retry_limit);
