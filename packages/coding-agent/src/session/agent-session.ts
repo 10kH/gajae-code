@@ -10786,12 +10786,12 @@ export class AgentSession {
 			let committed = false;
 			let prepared: PreparedNewSession | undefined;
 			try {
-				// Prepare local:// migration, successor entries, persistence, display state,
-				// and gate construction without publishing successor manager/session state.
+				// Prepare successor entries, persistence, display state, and gate
+				// construction without publishing manager identity. Managed local-root
+				// readiness is the last fallible step before the sole commit (#3138).
 				prepared = await this.sessionManager.prepareNewSession(
 					previousSessionFile ? { parentSession: previousSessionFile } : undefined,
 				);
-				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				if (model) this.sessionManager.appendPreparedModelChange(prepared, `${model.provider}/${model.id}`);
 				this.sessionManager.appendPreparedThinkingLevelChange(prepared, this.thinkingLevel);
 				this.sessionManager.appendPreparedServiceTierChange(prepared, this.serviceTier ?? null);
@@ -10806,9 +10806,10 @@ export class AgentSession {
 				await this.sessionManager.ensurePreparedNewSessionOnDisk(prepared);
 				const sessionContext = this.buildPreparedDisplaySessionContext(prepared);
 				const successorGateEmitter = this.#constructWorkflowGateEmitter(prepared.sessionId);
+				// Last fallible action: verified local:// readiness from immutable staged options.
+				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 
-				// --- Commit boundary: every fallible successor preparation step above used
-				// staged state. This synchronous adoption is the sole identity publication.
+				// --- Commit boundary: synchronous adoption is the sole identity publication.
 				this.sessionManager.commitPreparedNewSession(prepared);
 				committed = true;
 				this.agent.reset();

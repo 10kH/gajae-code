@@ -4415,6 +4415,7 @@ export class SessionManager {
 			discarded: false,
 		};
 		this.#preparedNewSessions.add(stage);
+		this.#freezePreparedNewSessionIdentity(stage);
 		return stage;
 	}
 
@@ -4535,6 +4536,34 @@ export class SessionManager {
 		);
 	}
 
+	#freezePreparedNewSessionIdentity(stage: PreparedNewSessionState): void {
+		// Prevent identity ABA: callers must not rebind staged sessionId/file after prepare.
+		Object.defineProperty(stage, "sessionId", {
+			value: stage.sessionId,
+			writable: false,
+			enumerable: true,
+			configurable: false,
+		});
+		Object.defineProperty(stage, "sessionFile", {
+			value: stage.sessionFile,
+			writable: false,
+			enumerable: true,
+			configurable: false,
+		});
+		Object.defineProperty(stage, "artifactsDir", {
+			value: stage.artifactsDir,
+			writable: false,
+			enumerable: true,
+			configurable: false,
+		});
+		Object.defineProperty(stage, "managedLegacyLocalMigrationSource", {
+			value: stage.managedLegacyLocalMigrationSource,
+			writable: false,
+			enumerable: true,
+			configurable: false,
+		});
+	}
+
 	#getPreparedNewSessionStage(prepared: PreparedNewSession): PreparedNewSessionState {
 		const stage = prepared as PreparedNewSessionState;
 		if (!this.#preparedNewSessions.has(stage) || stage.committed || stage.discarded)
@@ -4598,6 +4627,7 @@ export class SessionManager {
 			discarded: false,
 		};
 		this.#preparedNewSessions.add(stage);
+		this.#freezePreparedNewSessionIdentity(stage);
 		try {
 			await this.copyArtifactsForFork(sourceFile, sessionFile);
 			const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
@@ -4679,6 +4709,7 @@ export class SessionManager {
 			discarded: false,
 		};
 		this.#preparedNewSessions.add(stage);
+		this.#freezePreparedNewSessionIdentity(stage);
 		try {
 			if (sessionFile) {
 				const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
@@ -6106,6 +6137,14 @@ export class SessionManager {
 	 * writer closure before any destructive operation.
 	 */
 	async closeStrict(): Promise<SessionManagerCloseOutcome> {
+		// Drain staged successors on the strict ACP dispose path as well as best-effort close (#3138).
+		try {
+			await this.#retryPreparedNewSessionCleanups();
+		} catch (error) {
+			logger.warn("Prepared session cleanup during closeStrict failed; retained for retry", {
+				error: toError(error).message,
+			});
+		}
 		let outcome: SessionManagerCloseOutcome = { kind: "closed" };
 		await this.#queuePersistTask(async () => {
 			const writer = this.#persistWriter;

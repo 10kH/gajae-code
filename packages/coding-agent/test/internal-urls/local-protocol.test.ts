@@ -141,6 +141,41 @@ it("rolls back a sorted managed partial install and retries the same identity", 
 	});
 });
 
+it("fails closed for real managed payloads above the 64 MiB safe size without writing a marker or retiring the source", async () => {
+	const sessionId = `managed-oversize-${crypto.randomUUID()}`;
+	const snapshot = { rootDev: "1", rootIno: "2", entries: [] } as never;
+	let retired = 0;
+	// Production sums entry.bytes.byteLength before install; use a real byteLength without
+	// allocating a full 64 MiB+ buffer into the process heap.
+	const oversizeBytes = { byteLength: 64 * 1024 * 1024 + 1 } as Buffer;
+	await withLocalRoot(sessionId, async localRoot => {
+		const options = {
+			getSessionId: () => sessionId,
+			getManagedLegacyLocalMigrationSource: () => ({
+				capture: async () => ({
+					snapshot,
+					entries: [
+						{ relativePath: "", kind: "directory" as const },
+						{
+							relativePath: "huge.bin",
+							kind: "file" as const,
+							bytes: oversizeBytes,
+							sha256: "deadbeef",
+						},
+					],
+				}),
+				retire: () => retired++,
+			}),
+		};
+		await expect(initializeLocalRoot(options)).rejects.toThrow("exceeds the safe size limit");
+		await expect(fs.lstat(path.join(localRoot, "huge.bin"))).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(fs.lstat(path.join(localRoot, ".gjc-local-legacy-migrated-v1"))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+		expect(retired).toBe(0);
+	});
+});
+
 describe("LocalProtocolHandler", () => {
 	beforeEach(() => {
 		LocalProtocolHandler.resetOverrideForTests();

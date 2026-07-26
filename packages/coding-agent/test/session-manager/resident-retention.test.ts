@@ -326,6 +326,25 @@ describe("SessionManager resident retention boundaries", () => {
 		expect(storage.existsSync(stagedPath)).toBe(false);
 	});
 
+	it("drains uncommitted prepared successors on close and closeStrict", async () => {
+		const storage = new MemorySessionStorage();
+		const session = SessionManager.create("/cwd", "/sessions", storage);
+		const prepared = await session.prepareNewSession();
+		const stagedPath = prepared.sessionFile!;
+		await session.ensurePreparedNewSessionOnDisk(prepared);
+		expect(storage.existsSync(stagedPath)).toBe(true);
+
+		await session.close();
+		expect(storage.existsSync(stagedPath)).toBe(false);
+
+		const prepared2 = await session.prepareNewSession();
+		const stagedPath2 = prepared2.sessionFile!;
+		await session.ensurePreparedNewSessionOnDisk(prepared2);
+		expect(storage.existsSync(stagedPath2)).toBe(true);
+		await session.closeStrict();
+		expect(storage.existsSync(stagedPath2)).toBe(false);
+	});
+
 	it("preserves prepared writer-close and temp-unlink failures and retries both cleanups", async () => {
 		const storage = new RetryablePreparedPersistenceStorage();
 		const session = SessionManager.create("/cwd", "/sessions", storage);
