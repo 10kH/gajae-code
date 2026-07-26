@@ -85,6 +85,8 @@ import { telegramControlCommandUsage } from "./config-commands";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
 import { createPromptReconciliation, sanitizePromptFailure } from "./prompt-reconciliation";
+import { createKindAwareReconciliation } from "./kind-aware-reconciliation";
+import { createReconciliationStore } from "./reconciliation-store";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
 import {
 	ASK_SELECTED_ACK_CAPABILITY,
@@ -1807,6 +1809,7 @@ function sdkQuerySurface(
 	}),
 	configOverrides: ReadonlyMap<string, unknown> = new Map(),
 	promptStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown,
+	skillStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({ status: "unknown" }),
 ): SessionSurface {
 	const metadata = () => ({
 		sessionId: id,
@@ -1935,6 +1938,8 @@ function sdkQuerySurface(
 		getJobs: () => ctx.getJobs(),
 		getPromptStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
 			promptStatusLookup(selector),
+		getSkillInvokeStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
+			skillStatusLookup(selector),
 		installedQueries: installedOperations(ctx, "query"),
 	};
 }
@@ -1962,7 +1967,7 @@ function sdkControlSurface(
 		requesterConnectionId?: string,
 		clientRef?: string,
 		trackReconciliation?: boolean,
-	) => void = () => {},
+	) => void | Promise<void> = () => {},
 	onPromptFailed: (correlation: { commandId: string; turnId: string }, error: unknown) => void = () => {},
 	acceptGateResolution: () => boolean,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T>,
@@ -1971,6 +1976,20 @@ function sdkControlSurface(
 	settings?: Settings,
 	configOverrides: Map<string, unknown> = new Map(),
 	configRevision: { current: number } = { current: 0 },
+	skillRecon?: {
+		admit: (clientRef?: string) => void;
+		release: (clientRef?: string) => void;
+		noteAccepted: (
+			correlation: { commandId: string; turnId: string },
+			clientRef?: string,
+			extra?: { skillName?: string },
+		) => Promise<void>;
+		noteTransition: (
+			correlation: { commandId: string; turnId: string } | undefined,
+			frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
+		) => Promise<void>;
+		lookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
+	},
 ): ControlSurface {
 	const unavailable = (operation: string, reason: string) => () => {
 		throw Object.assign(new Error(`${operation} is unavailable: ${reason}`), { code: "unavailable" });
@@ -2101,10 +2120,10 @@ function sdkControlSurface(
 				error: Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" }),
 			});
 		pendingPreflightCancellations.add(cancelPreflight);
-		const onPreflightAccepted = () => {
+		const onPreflightAcceptCommit = async () => {
 			if (preflightSettled) return;
 			accepted = true;
-			onPromptAccepted(correlation, requesterConnectionId, trimmedClientRef, trackReconciliation);
+			await onPromptAccepted(correlation, requesterConnectionId, trimmedClientRef, trackReconciliation);
 			settlePreflight({ status: "accepted" });
 		};
 		// Do not acknowledge the prompt until AgentSession's async preflight
@@ -2114,7 +2133,7 @@ function sdkControlSurface(
 			submission = Promise.resolve(
 				api.sendUserMessage(content, {
 					...(deliverAs ? { deliverAs } : !forceFresh && isBusy() ? { deliverAs: "steer" as const } : {}),
-					onPreflightAccepted,
+					onPreflightAcceptCommit,
 				}),
 			);
 		} catch (error) {
@@ -2324,15 +2343,92 @@ function sdkControlSurface(
 				code: "terminal_uncertain",
 			});
 		},
-		invokeSkill: (name, args) => {
+		invokeSkill: async (name, args, clientRef) => {
 			if (!bindings.has("invokeSkill") || !ctx.invokeSkill)
 				return unavailable("skill.invoke", "no skill invocation seam is installed")();
 
 			if (typeof args !== "undefined" && typeof args !== "string")
 				throw Object.assign(new Error("skill.invoke args must be a string."), { code: "invalid_input" });
-			return ctx.invokeSkill(name, args);
+			const trimmedClientRef =
+				typeof clientRef === "string" ? clientRef.trim() : clientRef === undefined ? undefined : "";
+			if (clientRef !== undefined && (!trimmedClientRef || trimmedClientRef.length > 128))
+				throw Object.assign(new Error("clientRef must be a non-empty string of at most 128 characters."), {
+					code: "invalid_input",
+				});
+			const commandId = crypto.randomUUID();
+			const turnId = crypto.randomUUID();
+			const correlation = { commandId, turnId };
+			if (skillRecon) {
+				try {
+					skillRecon.admit(trimmedClientRef);
+				} catch (error) {
+					throw error;
+				}
+			}
+			const { promise: acceptedP, resolve, reject } = Promise.withResolvers<Record<string, unknown>>();
+			let phase: "pending" | "accepted" | "rejected" = "pending";
+			const settleAccept = (value: Record<string, unknown>) => {
+				if (phase !== "pending") return;
+				phase = "accepted";
+				resolve(value);
+			};
+			const settleReject = (error: unknown) => {
+				if (phase !== "pending") return;
+				phase = "rejected";
+				reject(error);
+			};
+			let prepared: { name: string; path: string; lineCount?: number; cleanedArgs?: string } | undefined;
+			const run = Promise.resolve(
+				ctx.invokeSkill(name, args as string | undefined, {
+					onSkillPrepared: meta => {
+						prepared = meta;
+					},
+					onPreflightAcceptCommit: async () => {
+						const meta = prepared ?? { name: String(name), path: "" };
+						if (skillRecon)
+							await skillRecon.noteAccepted(correlation, trimmedClientRef, { skillName: meta.name });
+						settleAccept({
+							accepted: true,
+							commandId,
+							turnId,
+							name: meta.name,
+							path: meta.path,
+							...(meta.lineCount !== undefined ? { lineCount: meta.lineCount } : {}),
+							...(meta.cleanedArgs !== undefined ? { args: meta.cleanedArgs } : {}),
+							...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
+						});
+					},
+				}),
+			).then(
+				result => {
+					if (phase === "pending") {
+						// Completed without fence (e.g. queue path) — still surface result.
+						settleAccept({
+							accepted: true,
+							commandId,
+							turnId,
+							...(typeof result === "object" && result ? (result as object) : {}),
+							...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
+						});
+					} else if (skillRecon) {
+						void skillRecon.noteTransition(correlation, { type: "agent_end" });
+					}
+					return result;
+				},
+				error => {
+					if (phase === "pending") {
+						if (skillRecon) skillRecon.release(trimmedClientRef);
+						settleReject(error);
+					} else if (skillRecon) {
+						void skillRecon.noteTransition(correlation, { type: "agent_failed", error });
+					}
+					throw error;
+				},
+			);
+			void run.catch(() => {});
+			return await acceptedP;
 		},
-		setPlanMode: async on => {
+setPlanMode: async on => {
 			if (!bindings.has("setPlanMode") || !ctx.setPlanMode)
 				return unavailable("mode.plan.set", "no plan-mode seam is installed")();
 
@@ -3288,10 +3384,28 @@ export function createNotificationsExtension(
 		// (contract documented in ./prompt-reconciliation and ../prompt-status).
 		// Active records never age into terminal; documented TTL/capacity
 		// eviction is the only removal, after which lookups report `unknown`.
+		const sessionFile =
+			typeof ctx.sessionManager?.getSessionFile === "function" ? ctx.sessionManager.getSessionFile() : null;
+		const sessionId = typeof ctx.sessionManager?.getSessionId === "function" ? ctx.sessionManager.getSessionId() : "";
+		const durableStore =
+			sessionFile && sessionId
+				? createReconciliationStore({ sessionFile, sessionId: String(sessionId) })
+				: null;
+		const kindReconciliation = createKindAwareReconciliation({ store: durableStore });
+		if (durableStore) void kindReconciliation.hydrateFromStore();
+		// Backward-compatible process-local prompt reconciler kept for unit-test isolation;
+		// production path uses kindReconciliation for prompt+skill.
 		const reconciliation = createPromptReconciliation();
-		const admitPromptSubmission = reconciliation.admit;
-		const notePromptReconciliationAccepted = reconciliation.noteAccepted;
-		const lookupPromptStatus = reconciliation.lookup;
+		const admitPromptSubmission = (clientRef?: string) => kindReconciliation.admit("prompt", clientRef);
+		const notePromptReconciliationAccepted = async (
+			correlation: { commandId: string; turnId: string },
+			clientRef?: string,
+		) => {
+			await kindReconciliation.noteAccepted("prompt", correlation, clientRef);
+		};
+		const lookupPromptStatus = (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
+			kindReconciliation.lookup("prompt", selector);
+		const releasePromptAdmission = (clientRef?: string) => kindReconciliation.releaseAdmission("prompt", clientRef);
 		const removePendingPromptCorrelation = (correlation: { commandId: string; turnId: string }) => {
 			const pendingIndex = pendingPromptCorrelations.findIndex(
 				candidate => candidate.commandId === correlation.commandId && candidate.turnId === correlation.turnId,
@@ -3318,6 +3432,7 @@ export function createNotificationsExtension(
 			addTerminalTombstone(key);
 		};
 		const cleanupPromptRecords = (now = Date.now()) => {
+			kindReconciliation.cleanup();
 			reconciliation.cleanup();
 			for (const [key, expiresAt] of promptTerminalTombstones)
 				if (expiresAt <= now) promptTerminalTombstones.delete(key);
@@ -3396,7 +3511,7 @@ export function createNotificationsExtension(
 				if (commandId && turnId) finalizePrompt(key, { commandId, turnId });
 			}
 		};
-		const recordPromptAccepted = (
+		const recordPromptAccepted = async (
 			correlation: { commandId: string; turnId: string },
 			requesterConnectionId?: string,
 			clientRef?: string,
@@ -3405,10 +3520,10 @@ export function createNotificationsExtension(
 			if (!requesterConnectionId) {
 				// No delivery owner: tracked prompts cannot be reconciled. Release
 				// their admission reservation instead of leaking the active slot.
-				if (trackReconciliation) reconciliation.releaseAdmission(clientRef);
+				if (trackReconciliation) releasePromptAdmission(clientRef);
 				return;
 			}
-			if (trackReconciliation) notePromptReconciliationAccepted(correlation, clientRef);
+			if (trackReconciliation) await notePromptReconciliationAccepted(correlation, clientRef);
 			cleanupPromptRecords();
 			while (promptSubmissions.size >= PROMPT_SUBMISSION_CAPACITY) {
 				const oldest = promptSubmissions.entries().next().value as [string, PromptSubmission] | undefined;
@@ -3440,7 +3555,7 @@ export function createNotificationsExtension(
 		};
 		const emitPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
 			const sanitized = sanitizePromptFailure(error);
-			reconciliation.noteTransition(correlation, { type: "agent_failed", error: sanitized });
+			void kindReconciliation.noteTransition("prompt", correlation, { type: "agent_failed", error: sanitized });
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission || !runtime || !recordPromptTerminal(correlation)) return;
 			emitPromptLifecycle(correlation, {
@@ -3491,6 +3606,7 @@ export function createNotificationsExtension(
 				},
 				configOverrides,
 				lookupPromptStatus,
+				(selector) => kindReconciliation.lookup("skill", selector),
 			),
 			id,
 			revisions,
@@ -3507,10 +3623,18 @@ export function createNotificationsExtension(
 			() => runtime?.stopping !== true,
 			trackGateResolution,
 			admitPromptSubmission,
-			reconciliation.releaseAdmission,
+			releasePromptAdmission,
 			settings,
 			configOverrides,
 			configRevision,
+			{
+				admit: (clientRef?: string) => kindReconciliation.admit("skill", clientRef),
+				release: (clientRef?: string) => kindReconciliation.releaseAdmission("skill", clientRef),
+				noteAccepted: (correlation, clientRef, extra) =>
+					kindReconciliation.noteAccepted("skill", correlation, clientRef, extra),
+				noteTransition: (correlation, frame) => kindReconciliation.noteTransition("skill", correlation, frame),
+				lookup: selector => kindReconciliation.lookup("skill", selector),
+			},
 		);
 		const abandonPromptResponse = (connectionId: string, frame: Record<string, unknown>) => {
 			if (
@@ -3708,7 +3832,9 @@ export function createNotificationsExtension(
 			pendingPromptCorrelations,
 			activePromptCorrelation: undefined,
 			recordPromptTerminal,
-			notePromptReconciliation: reconciliation.noteTransition,
+			notePromptReconciliation: (correlation, frame) => {
+				void kindReconciliation.noteTransition("prompt", correlation, frame);
+			},
 			emitPromptFailure,
 			emitPromptLifecycle,
 			emitPromptEvent,

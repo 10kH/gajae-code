@@ -41,6 +41,7 @@
 - MCP servers configured with a large `timeout` no longer widen the startup hang window for every consumer. The long startup ceiling now applies only to ACP lifecycle launches that supply their own MCP servers, derived from the session readiness deadline with reserved headroom; ordinary CLI/SDK `mcpConfigPath`, project, user, and plugin-bundle consumers keep the short default. An ACP launch that reaches the readiness cutoff before MCP startup now fails fast as a pending startup instead of silently falling back to the ordinary ceiling.
 
 - SDK MCP stdio (`gjc mcp-serve sdk`) now awaits in-flight JSON-RPC handlers after stdin EOF so tools/call responses finish and WebSocket clients close before process exit; the entrypoint e2e fixture bounds child/server/temp cleanup on success and failure so the suite cannot hang for the full 60s on a stuck server.
+- Shared kind-aware durable invocation reconciliation substrate for `turn.prompt` and `skill.invoke` (#3031/#3032/#3035): private `.sdk-reconciliation` store, awaitable preflight accept fence, non-hanging skill early-accept with optional `clientRef`.
 - AD-L-G02 daemon session CLI e2e is less flaky under CI load: mock WebSocket servers defer `server_hello` one tick, and query failures report stdout/stderr so a non-zero exit surfaces the real SDK error instead of only `exitCode`.
 ## [0.11.10] - 2026-07-25
 ### Changed

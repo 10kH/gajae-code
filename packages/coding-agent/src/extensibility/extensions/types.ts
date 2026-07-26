@@ -392,7 +392,20 @@ export interface ExtensionContext {
 
 	getJobs(): unknown;
 	/** Typed skill and mode controls exposed to the SDK host. */
-	invokeSkill?(name: string, args?: string): Promise<unknown>;
+	invokeSkill?(
+		name: string,
+		args?: string,
+		options?: {
+			onPreflightAccepted?: () => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+			onSkillPrepared?: (meta: {
+				name: string;
+				path: string;
+				lineCount?: number;
+				cleanedArgs?: string;
+			}) => void;
+		},
+	): Promise<unknown>;
 	setPlanMode?(on: boolean): unknown;
 	operateGoal?(op: "create" | "get" | "resume" | "pause" | "complete" | "drop", objective?: string): Promise<unknown>;
 
@@ -1469,7 +1482,20 @@ export interface ExtensionContextActions {
 			| undefined,
 	) => void;
 	sdkControl?: (operation: string, input: Record<string, unknown>) => unknown | Promise<unknown>;
-	invokeSkill?: (name: string, args?: string) => Promise<unknown>;
+	invokeSkill?: (
+		name: string,
+		args?: string,
+		options?: {
+			onPreflightAccepted?: () => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+			onSkillPrepared?: (meta: {
+				name: string;
+				path: string;
+				lineCount?: number;
+				cleanedArgs?: string;
+			}) => void;
+		},
+	) => Promise<unknown>;
 	setPlanMode?: (on: boolean) => unknown;
 	operateGoal?: (
 		op: "create" | "get" | "resume" | "pause" | "complete" | "drop",
