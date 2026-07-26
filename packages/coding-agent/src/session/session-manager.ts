@@ -541,6 +541,30 @@ async function ensureOwnerOnlyDirectory(directoryPath: string): Promise<void> {
 	await fs.promises.chmod(directoryPath, 0o700).catch(() => undefined);
 	await fsyncDirectoryPath(directoryPath);
 }
+interface CreatedDirectoryIdentity {
+	dev: bigint;
+	ino: bigint;
+}
+
+async function ensureOwnerOnlyDirectoryTracked(directoryPath: string): Promise<CreatedDirectoryIdentity | undefined> {
+	const createdPath = await fs.promises.mkdir(directoryPath, { recursive: true, mode: 0o700 });
+	await fs.promises.chmod(directoryPath, 0o700).catch(() => undefined);
+	await fsyncDirectoryPath(directoryPath);
+	if (createdPath === undefined) return undefined;
+	const stat = await fs.promises.lstat(directoryPath, { bigint: true });
+	return { dev: stat.dev, ino: stat.ino };
+}
+
+async function removeCreatedDirectoryIfEmpty(
+	directoryPath: string,
+	created: CreatedDirectoryIdentity | undefined,
+): Promise<void> {
+	if (!created) return;
+	const stat = await fs.promises.lstat(directoryPath, { bigint: true }).catch(() => undefined);
+	if (!stat || stat.dev !== created.dev || stat.ino !== created.ino) return;
+	await fs.promises.rmdir(directoryPath).catch(() => undefined);
+	await fsyncDirectoryPath(path.dirname(directoryPath)).catch(() => undefined);
+}
 
 async function writeOwnerOnlyFileNoReplace(filePath: string, content: Uint8Array | string): Promise<void> {
 	await ensureOwnerOnlyDirectory(path.dirname(filePath));
@@ -4967,6 +4991,7 @@ export class SessionManager {
 
 	/** Prepare a path-only branch successor without publishing it through public manager state. @internal */
 	async prepareBranchedSession(leafId: string): Promise<PreparedNewSession> {
+		this.#assertRecoveryHydrationWritable();
 		await this.#retryPreparedNewSessionCleanups();
 		const branchPath = this.#getCanonicalBranchClones(leafId);
 		if (branchPath.length === 0) throw new Error(`Entry ${leafId} not found`);
@@ -6626,13 +6651,26 @@ export class SessionManager {
 				sha256: memoryGuardSha256Hex(data),
 			});
 		}
+		const publishedCheckpointPaths: string[] = [];
+		const cleanupPublishedCheckpointPaths = async (): Promise<void> => {
+			for (const publishedPath of publishedCheckpointPaths.reverse())
+				await fs.promises.rm(publishedPath, { force: true }).catch(() => undefined);
+			await fs.promises.rmdir(path.join(input.checkpointRoot, blobRootRelativePath)).catch(() => undefined);
+			await fs.promises.rmdir(participantRoot).catch(() => undefined);
+		};
+		const publishCheckpointFile = async (filePath: string, data: Uint8Array | string): Promise<void> => {
+			try {
+				await writeOwnerOnlyFileNoReplace(filePath, data);
+				publishedCheckpointPaths.push(filePath);
+			} catch (error) {
+				await cleanupPublishedCheckpointPaths();
+				throw error;
+			}
+		};
 		await ensureOwnerOnlyDirectory(participantRoot);
-		await writeOwnerOnlyFileNoReplace(
-			path.join(input.checkpointRoot, transcriptRelativePath),
-			captured.snapshot.content,
-		);
+		await publishCheckpointFile(path.join(input.checkpointRoot, transcriptRelativePath), captured.snapshot.content);
 		for (const write of blobWrites)
-			await writeOwnerOnlyFileNoReplace(
+			await publishCheckpointFile(
 				path.join(input.checkpointRoot, blobRootRelativePath, write.relativePath),
 				write.data,
 			);
@@ -6642,7 +6680,7 @@ export class SessionManager {
 			schema_version: 1,
 		};
 		const blobManifestText = memoryGuardCanonicalJson(blobManifest);
-		await writeOwnerOnlyFileNoReplace(path.join(input.checkpointRoot, blobManifestRelativePath), blobManifestText);
+		await publishCheckpointFile(path.join(input.checkpointRoot, blobManifestRelativePath), blobManifestText);
 		const checkpoint: MemoryGuardSessionManagerCheckpointV1 = {
 			blob_authority: {
 				kind: "checkpoint_blob_tree_v1",
@@ -6664,7 +6702,7 @@ export class SessionManager {
 			input.checkpointRoot,
 			memoryGuardParticipantRelativePath(sessionId, "session-manager.json"),
 		);
-		await writeOwnerOnlyFileNoReplace(checkpointPath, memoryGuardCanonicalJson(checkpoint));
+		await publishCheckpointFile(checkpointPath, memoryGuardCanonicalJson(checkpoint));
 		const currentRevisions = this.revisionSnapshot();
 		const recaptured = SessionManager.captureTranscriptStrict(this.#sessionFile, this.storage);
 		if (
@@ -6678,7 +6716,7 @@ export class SessionManager {
 			recaptured.kind !== "captured" ||
 			!sameResumeIdentity(captured.snapshot.identity, recaptured.snapshot.identity)
 		) {
-			await fs.promises.rm(checkpointPath, { force: true });
+			await cleanupPublishedCheckpointPaths();
 			throw new Error("memory_guard_checkpoint_state_changed_during_capture");
 		}
 		return checkpoint;
@@ -8097,6 +8135,7 @@ export class SessionManager {
 	 * Returns the new session file path, or undefined if not persisting.
 	 */
 	createBranchedSession(leafId: string): string | undefined {
+		this.#assertRecoveryHydrationWritable();
 		const previousSessionFile = this.#sessionFile;
 		const branchPath = this.#getCanonicalBranchClones(leafId);
 		if (branchPath.length === 0) {
@@ -8969,12 +9008,14 @@ export class SessionManager {
 		);
 		let opened: RecoveryHydrationOpenResult;
 		let transcriptIdentity: ResumeSessionIdentity;
+		let createdDestination: CreatedDirectoryIdentity | undefined;
 		try {
-			await ensureOwnerOnlyDirectory(destination.directory);
+			createdDestination = await ensureOwnerOnlyDirectoryTracked(destination.directory);
 			await writeOwnerOnlyFileNoReplace(transcriptPath, transcriptData);
 			const captured = SessionManager.captureTranscriptStrict(transcriptPath, storage);
 			if (captured.kind !== "captured") {
 				await fs.promises.rm(transcriptPath, { force: true }).catch(() => undefined);
+				await removeCreatedDirectoryIfEmpty(destination.directory, createdDestination);
 				return { kind: "blocked", reason: captured.reason };
 			}
 			transcriptIdentity = captured.snapshot.identity;
@@ -8985,10 +9026,12 @@ export class SessionManager {
 			);
 		} catch {
 			await fs.promises.rm(transcriptPath, { force: true }).catch(() => undefined);
+			await removeCreatedDirectoryIfEmpty(destination.directory, createdDestination);
 			return { kind: "blocked", reason: "destination-unavailable" };
 		}
 		if (opened.kind === "error") {
 			await fs.promises.rm(transcriptPath, { force: true }).catch(() => undefined);
+			await removeCreatedDirectoryIfEmpty(destination.directory, createdDestination);
 			return { kind: "blocked", reason: opened.reason };
 		}
 		if (
@@ -8996,6 +9039,8 @@ export class SessionManager {
 			(opened.manager.getSessionName() ?? null) !== input.checkpoint.session_name
 		) {
 			await opened.manager.close();
+			await fs.promises.rm(transcriptPath, { force: true }).catch(() => undefined);
+			await removeCreatedDirectoryIfEmpty(destination.directory, createdDestination);
 			return { kind: "blocked", reason: "transcript-mismatch" };
 		}
 		opened.manager.#stageMemoryGuardCheckpointBlobs(checkpointBlobs);
