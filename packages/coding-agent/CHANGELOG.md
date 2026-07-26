@@ -17,6 +17,7 @@
 - Model preset landing now shows explicit `Enter: apply` and `d: set as default` hints; pressing `d` applies the highlighted profile as the default while Enter keeps the session-only apply path (#3161).
 
 ### Fixed
+- Session-manager fork/moveTo failure-injection tests now use a platform-aware hermetic seam: retained `RecoveryFsRoot` prototype spies on Linux and the direct native/fs fallbacks off Linux, with a required hit counter so a dead injection fails closed (#3209).
 - The #3216 win32 cleanup-producer regression no longer hardcodes divergent directory size `4096`; it injects `nativeRoot.size + 1` so the test stays hermetic when Linux directory size is already `4096` (post-merge Dev CI red on `79f0de870`).
 
 - The synchronous `local://` resolver now accepts a `cleanup_pending` legacy-migration marker instead of rejecting it as unsafe. The async gate already treats that state as settled — entries are installed and content-verified, and only retirement of the legacy source is outstanding — so a managed session whose migration ended in `cleanup_pending` previously failed closed with "Unsafe local:// migration marker" on every `local://` read even though `initializeLocalRoot()` had succeeded. Both marker checks now share one settled-state definition; unrecognized marker values are still rejected. Follow-up to #3080; the asymmetry has been reachable since #2797.
