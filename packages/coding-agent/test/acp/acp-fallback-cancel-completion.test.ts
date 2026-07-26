@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
+import {
+	type AgentSideConnection,
+	type PromptRequest,
+	RequestError,
+	type SessionNotification,
+} from "@agentclientprotocol/sdk";
 import { AcpAgent } from "@gajae-code/coding-agent/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "@gajae-code/coding-agent/sdk/broker/discovery";
 import { TempDir } from "@gajae-code/utils";
@@ -211,5 +216,32 @@ describe("ACP production cancellation completion", () => {
 				);
 			}),
 		).toHaveLength(0);
+	});
+});
+
+describe("ACP request failure codes", () => {
+	let connectionAbort: AbortController;
+
+	beforeEach(() => {
+		connectionAbort = new AbortController();
+	});
+
+	afterEach(() => {
+		connectionAbort.abort();
+	});
+
+	function agent(): AcpAgent {
+		return new AcpAgent({ signal: connectionAbort.signal } as unknown as AgentSideConnection, {
+			agentDir: "/tmp",
+		});
+	}
+
+	it("rejects an unknown ext method with method-not-found instead of a successful result", async () => {
+		const error = await agent()
+			.extMethod("does/not-exist", {})
+			.catch((e: unknown) => e);
+
+		expect(error).toBeInstanceOf(RequestError);
+		expect((error as RequestError).code).toBe(-32601);
 	});
 });

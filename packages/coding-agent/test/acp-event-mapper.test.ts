@@ -607,9 +607,10 @@ describe("ACP event mapper", () => {
 			toolCallId: "tc-read-final",
 			status: "failed",
 			title: "Failed: read: missing.ts",
-			kind: "other",
 			locations: [{ path: path.resolve("/repo", "missing.ts") }],
 		});
+		// Failure is carried by `status`; the initial tool_call `kind` stays authoritative.
+		expect(updates[0]!.update).not.toHaveProperty("kind");
 	});
 
 	it("keeps terminal content alongside readable error and message fields", () => {
