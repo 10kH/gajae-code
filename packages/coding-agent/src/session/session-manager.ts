@@ -8395,20 +8395,7 @@ export class SessionManager {
 			relativeToManagedRoot === "" ||
 			(!relativeToManagedRoot.startsWith("..") && !path.isAbsolute(relativeToManagedRoot));
 
-		if (!isManagedPath) {
-			assertManagedDestinationBound();
-			const adoptedName = `${header.id}-${inspected.identity.sha256.slice(0, 12)}.jsonl`;
-			try {
-				await managedDestinationStore.publishNoReplace(adoptedName, inspected.content);
-			} catch (error) {
-				if (!(error instanceof Error && error.message.includes("destination_conflict"))) throw error;
-			}
-			const adoptedPath = path.join(destination.directory, adoptedName);
-			const adopted = inspectResumeSessionFile(adoptedPath, storage);
-			if ("kind" in adopted || adopted.identity.sha256 !== inspected.identity.sha256)
-				throw new Error("Managed adoption did not preserve the selected session.");
-			return adoptedPath;
-		}
+		if (!isManagedPath) return filePath;
 		assertManagedDestinationBound();
 		const resolved = resolveManagedScope({
 			cwd: header.cwd,
