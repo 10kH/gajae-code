@@ -1,16 +1,36 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import {
 	type AgentSideConnection,
+	type Client,
+	ClientSideConnection,
+	type CreateTerminalRequest,
+	type CreateTerminalResponse,
+	ndJsonStream,
 	type PromptRequest,
 	RequestError,
+	type RequestPermissionRequest,
+	type RequestPermissionResponse,
 	type SessionNotification,
 } from "@agentclientprotocol/sdk";
-import { AcpAgent } from "@gajae-code/coding-agent/modes/acp/acp-agent";
+import { AcpAgent, acpRequestFailure } from "@gajae-code/coding-agent/modes/acp/acp-agent";
+import { createAcpConnection } from "@gajae-code/coding-agent/modes/acp/acp-mode";
 import { writeBrokerDiscovery } from "@gajae-code/coding-agent/sdk/broker/discovery";
 import { TempDir } from "@gajae-code/utils";
+import { AcpSdkAdapterError } from "../../src/sdk/acp";
 
 type TestSocket = { send(message: string): void };
+class TestClient implements Client {
+	async requestPermission(_params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
+		return { outcome: { outcome: "selected", optionId: "allow_once" } };
+	}
+
+	async sessionUpdate(_params: SessionNotification): Promise<void> {}
+
+	async createTerminal(_params: CreateTerminalRequest): Promise<CreateTerminalResponse> {
+		return { terminalId: "test-terminal" };
+	}
+}
 
 async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
 	return await Promise.race([
@@ -243,5 +263,61 @@ describe("ACP request failure codes", () => {
 
 		expect(error).toBeInstanceOf(RequestError);
 		expect((error as RequestError).code).toBe(-32601);
+	});
+	it("maps adapter error codes and preserves their discriminators", () => {
+		const cases = [
+			{ code: "authentication_failed", expectedCode: -32000 },
+			{ code: "invalid_input", expectedCode: -32602 },
+			{ code: "unsupported", expectedCode: -32602 },
+			{ code: "unsupported_content", expectedCode: -32602 },
+			{ code: "conflict", expectedCode: -32603 },
+		];
+
+		for (const { code, expectedCode } of cases) {
+			const failure = acpRequestFailure(new AcpSdkAdapterError(code, `failure: ${code}`));
+
+			expect(failure).toBeInstanceOf(RequestError);
+			expect(failure).toMatchObject({
+				code: expectedCode,
+				data: { code },
+			});
+		}
+
+		const requestError = RequestError.invalidParams({ code: "already_request_error" }, "already wrapped");
+		expect(acpRequestFailure(requestError)).toBe(requestError);
+		expect(requestError.code).toBe(-32602);
+	});
+
+	it("maps ACP connection-boundary failures through the request-error proxy", async () => {
+		const initialize = spyOn(AcpAgent.prototype, "initialize").mockImplementation(() => {
+			throw new AcpSdkAdapterError("authentication_failed", "authenticate first");
+		});
+		const clientToAgent = new TransformStream();
+		const agentToClient = new TransformStream();
+		const clientConnection = new ClientSideConnection(
+			() => new TestClient(),
+			ndJsonStream(clientToAgent.writable, agentToClient.readable),
+		);
+		const serverConnection = createAcpConnection(ndJsonStream(agentToClient.writable, clientToAgent.readable));
+
+		try {
+			const error = await clientConnection
+				.initialize({ protocolVersion: 1, clientCapabilities: {} })
+				.catch((reason: unknown) => reason);
+
+			expect(error).toBeInstanceOf(RequestError);
+			expect(error).toMatchObject({
+				code: -32000,
+				data: { code: "authentication_failed" },
+			});
+		} finally {
+			initialize.mockRestore();
+			const closeConnection = (connection: unknown): void => {
+				(connection as { connection: { close(error?: Error): void } }).connection.close();
+			};
+			closeConnection(clientConnection);
+			closeConnection(serverConnection);
+			await Promise.allSettled([clientConnection.closed, serverConnection.closed]);
+		}
 	});
 });
