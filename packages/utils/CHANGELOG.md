@@ -6,6 +6,7 @@
 
 - Strict CLI commands now reject unexpected positional arguments with usage guidance instead of silently ignoring typos or unsupported trailing input; non-strict passthrough commands and variadic arguments retain their existing behavior (#3173).
 - Integer CLI flags now reject trailing characters, decimals, exponent notation, surrounding whitespace, and values outside JavaScript's safe-integer range instead of silently truncating or rounding them (#3172).
+- The documented `GJC_BASH_NO_CI` and `GJC_BASH_NO_LOGIN` environment variables now take effect for the spawn shell configuration, resolved GJC-first ahead of the legacy `PI_*` / `CLAUDE_*` aliases (previously only the legacy names were read, so the documented names were silent no-ops). Both now follow the canonical boolean-flag contract (`1`/`Y`/`TRUE`/`YES`/`ON`, case-insensitive) instead of any-non-empty-string, so `GJC_BASH_NO_CI=0` no longer suppresses `CI=true`. Adds `resetShellConfigCache()` for deterministic shell-config testing, and corrects `docs/environment-variables.md`, which advertised non-functional `ANTHROPIC_MODEL_*` aliases.
 
 ## [0.11.10] - 2026-07-25
 
