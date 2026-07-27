@@ -26,6 +26,7 @@ import { getCurrentThemeName, getSelectListTheme, getSettingsListTheme, theme } 
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
+import { GjcBundleSettingsComponent } from "./gjc-bundle-settings";
 import {
 	type NotificationsEditorOperations,
 	NotificationsSettingsEditorComponent,
@@ -650,6 +651,7 @@ function getSettingsTabs(): Tab[] {
 			return { id, label: `${icon} ${meta.label}` };
 		}),
 		{ id: "plugins", label: `${theme.icon.package} Plugins` },
+		{ id: "gjc-bundles", label: `${theme.icon.package} GJC Bundles` },
 	];
 }
 
@@ -740,10 +742,11 @@ export class SettingsSelectorComponent extends Container {
 	#tabBar: TabBar;
 	#currentList: SettingsList | null = null;
 	#pluginComponent: PluginSettingsComponent | null = null;
+	#gjcBundleComponent: GjcBundleSettingsComponent | null = null;
 	#notificationsEditor: NotificationsSettingsEditorComponent | null = null;
 	#statusPreviewContainer: Container | null = null;
 	#statusPreviewText: Text | null = null;
-	#currentTabId: SettingTab | "plugins" = "appearance";
+	#currentTabId: SettingTab | "plugins" | "gjc-bundles" = "appearance";
 	#textInputActive = false;
 
 	constructor(
@@ -759,7 +762,7 @@ export class SettingsSelectorComponent extends Container {
 		// Tab bar
 		this.#tabBar = new TabBar("Settings", getSettingsTabs(), getTabBarTheme());
 		this.#tabBar.onTabChange = () => {
-			this.#switchToTab(this.#tabBar.getActiveTab().id as SettingTab | "plugins");
+			this.#switchToTab(this.#tabBar.getActiveTab().id as SettingTab | "plugins" | "gjc-bundles");
 		};
 
 		this.addChild(this.#tabBar);
@@ -774,7 +777,7 @@ export class SettingsSelectorComponent extends Container {
 		this.addChild(new DynamicBorder());
 	}
 
-	#switchToTab(tabId: SettingTab | "plugins"): void {
+	#switchToTab(tabId: SettingTab | "plugins" | "gjc-bundles"): void {
 		if (this.#currentTabId === "notifications" && tabId !== "notifications" && !this.#disposeNotificationsEditor()) {
 			return;
 		}
@@ -789,6 +792,11 @@ export class SettingsSelectorComponent extends Container {
 			this.removeChild(this.#pluginComponent);
 			this.#pluginComponent = null;
 		}
+		if (this.#gjcBundleComponent) {
+			this.removeChild(this.#gjcBundleComponent);
+			this.#gjcBundleComponent.dispose();
+			this.#gjcBundleComponent = null;
+		}
 		if (this.#statusPreviewContainer) {
 			this.removeChild(this.#statusPreviewContainer);
 			this.#statusPreviewContainer = null;
@@ -801,6 +809,8 @@ export class SettingsSelectorComponent extends Container {
 
 		if (tabId === "plugins") {
 			this.#showPluginsTab();
+		} else if (tabId === "gjc-bundles") {
+			this.#showGjcBundlesTab();
 		} else if (tabId === "notifications") {
 			this.#showNotificationsTab();
 		} else {
@@ -1224,7 +1234,7 @@ export class SettingsSelectorComponent extends Container {
 
 	/** Re-evaluate condition gates against the current settings and refresh the active list. */
 	#refreshCurrentTabItems(defs: SettingDef[]): void {
-		if (this.#currentTabId === "plugins" || !this.#currentList) return;
+		if (this.#currentTabId === "plugins" || this.#currentTabId === "gjc-bundles" || !this.#currentList) return;
 		this.#currentList.setItems(this.#buildItemsForTab(defs, this.#currentTabId));
 	}
 
@@ -1271,15 +1281,24 @@ export class SettingsSelectorComponent extends Container {
 		});
 		this.addChild(this.#pluginComponent);
 	}
+	#showGjcBundlesTab(): void {
+		this.#gjcBundleComponent = new GjcBundleSettingsComponent(this.context.cwd, {
+			onClose: () => this.callbacks.onCancel(),
+			onBundlesChanged: () => this.callbacks.onPluginsChanged?.(),
+		});
+		this.addChild(this.#gjcBundleComponent);
+	}
 
 	getFocusComponent(): Component {
-		return (this.#currentList || this.#pluginComponent || this.#notificationsEditor)!;
+		return (this.#currentList || this.#pluginComponent || this.#gjcBundleComponent || this.#notificationsEditor)!;
 	}
 
 	override dispose(): void {
 		if (this.#notificationsEditor?.navigationLocked) return;
 		this.#notificationsEditor?.dispose();
 		this.#notificationsEditor = null;
+		this.#gjcBundleComponent?.dispose();
+		this.#gjcBundleComponent = null;
 		super.dispose();
 	}
 
@@ -1301,6 +1320,18 @@ export class SettingsSelectorComponent extends Container {
 			this.#notificationsEditor.handleInput(data);
 			return;
 		}
+		if (this.#gjcBundleComponent && this.#currentTabId === "gjc-bundles") {
+			if (tabNavigation) {
+				if (this.#gjcBundleComponent.navigationLocked) {
+					this.#gjcBundleComponent.handleInput(data);
+					return;
+				}
+				this.#tabBar.handleInput(data);
+				return;
+			}
+			this.#gjcBundleComponent.handleInput(data);
+			return;
+		}
 
 		// Handle tab switching — but NOT when a text input is active, since
 		// arrow keys must reach the cursor and Tab must not switch tabs.
@@ -1317,6 +1348,10 @@ export class SettingsSelectorComponent extends Container {
 		}
 		if (this.#pluginComponent) {
 			this.#pluginComponent.handleInput(data);
+			return;
+		}
+		if (this.#gjcBundleComponent) {
+			this.#gjcBundleComponent.handleInput(data);
 			return;
 		}
 

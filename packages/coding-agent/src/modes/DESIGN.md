@@ -308,3 +308,32 @@ The immutable matrix has exactly 20 keys: `live-overflow`, `manual-history`,
 `narrow-cjk/48x10/unicode-color`. Do not add or replace a manual-follow case.
 
 Each key has only `terminal.txt`, ANSI-preserving `terminal-ansi.txt`, `terminal.html`, and `metadata.json`; the manifest records SHA-256 and byte length. Per-key metadata binds immutable font/render assumptions and the ANSI-aware wrapping/truncation policy. `VirtualTerminal` reconstructs ANSI from visible xterm cells, including cell padding, palette/RGB colors, attributes, and inverse video; plain text is always the stripped reconstruction. The verifier owns an independent literal 20-key oracle and fails closed unless stripped ANSI equals text, `terminal.html` equals the exported canonical `ansiToHtml(terminal-ansi.txt)` byte-for-byte (including its complete document envelope and global CSS), HTML independently preserves the ANSI style-run text, every retained row has the exact `Bun.stringWidth` cell width (including trailing spaces), and `ansi_mode` agrees with required Unicode color SGR or ASCII/no-color output. Every metadata entry has exact CJK phrase-boundary metadata: the narrow-CJK key has only the three canonical boundaries in order and every other key has `[]`. Manual captures prove successful production wheel and PageUp paths and retain observable historical transcript-row evidence. It validates exact payload paths (no duplicates or traversal), immutable source/output revisions, state/status/suffix order, notice cardinality, capacity, actual mouse-copied transcript-only selection, composer, CJK, and provenance invariants. `review-input.json` binds the exact manifest digest, capture author/executor identity, acceptance/design versions, required artifacts, narrow-CJK boundaries, and deterministic host matrix. `--require-independent-review` requires an attestation with an exact root key set; exact per-key result and artifact-check key sets; exact defect `{ description, accepted }` keys with a trimmed, nonblank description; canonical trimmed reviewer identity distinct from both bound identities; the independent-terminal-reviewer role; fixture revision; expected and observed counts of 20; exact checked keys; accepted per-key artifact-check/notes results; accepted artifact/CJK/host decisions; bound digest; and final `accept`. Any malformed, incomplete, or extra attestation content fails closed.
+## GJC Bundles
+
+GJC Bundles is a directly hosted Settings surface using the existing framed-list
+grammar. A bundle identity is always displayed as its name plus `(user)` or
+`(project)`. Same-name rows in opposite scopes are distinct identities and are
+never merged, selected together, or mutated through one another.
+
+Only safe source presentation is permitted. Never render or retain a raw source
+locator, userinfo, query, fragment, token, authentication material, or a full
+parent path in labels, descriptions, status, confirmation, errors, or evidence.
+
+Persisted enablement is user intent: bundle and eligible-surface enabled or
+disabled state. Effective runtime status is advisory display evidence only and
+never acts as hidden authorization. Deterministic quarantine blocks an enable
+action; disable is always available. Runtime evidence does not alter either
+rule.
+
+Focus, cursor, wrapping, ANSI-aware cell measurement, CJK semantic wrapping,
+and list scrolling follow the existing settings contracts above. Up/Down wrap
+within lists. A non-cancellable bundle mutation visibly locks navigation,
+including Escape and tab changes, until it completes; the lock names its
+reason. Long names and descriptions wrap in allocated content regions without
+hiding scope identity, CJK text breaks only at semantic boundaries, ANSI styles
+do not affect width measurement, and long surface lists scroll while retaining
+the focused row and scroll position.
+
+This Settings surface does not install or uninstall bundles, edit sources, or
+repair quarantine. It supports only list/detail, update review/apply,
+bundle-toggle, and eligible-surface-toggle actions.

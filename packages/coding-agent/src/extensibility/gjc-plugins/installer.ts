@@ -6,16 +6,12 @@ import * as path from "node:path";
 import { gunzipSync } from "node:zlib";
 import { compileGjcPluginBundle } from "./compiler";
 import { gjcPluginProjectRoot, gjcPluginUserRoot } from "./paths";
-import {
-	readRegistry,
-	registryEntryFingerprint,
-	sortRegistryEntries,
-	withRegistryLock,
-	writeRegistryUnlocked,
-} from "./registry";
+import { readRegistry, sortRegistryEntries, withRegistryLock, writeRegistryUnlocked } from "./registry";
 import {
 	GJC_PLUGIN_MANIFEST_FILENAME,
+	type GjcLifecycleError,
 	GjcPluginLoadError,
+	type GjcPluginRegistry,
 	type GjcPluginRegistryEntry,
 	type GjcPluginRegistrySource,
 	type GjcPluginScope,
@@ -23,16 +19,36 @@ import {
 } from "./types";
 import { validateInstallPlan } from "./validation";
 
-export interface InstallGjcPluginOptions {
+export interface GjcBundleTransactionOptions {
 	scope: GjcPluginScope;
 	cwd: string;
-	force?: boolean;
+	/**
+	 * Policy hook evaluated while both scope locks are held. It decides whether
+	 * to commit the candidate, report an already-satisfied no-op, or abort with
+	 * a typed lifecycle error. Only the lifecycle service supplies this.
+	 */
+	decide: (input: GjcBundleTransactionContext) => Promise<GjcBundleTransactionDecision>;
 }
 
-export interface InstallGjcPluginResult {
-	status: "installed" | "updated" | "unchanged";
-	entry: GjcPluginRegistryEntry;
+export interface GjcBundleTransactionContext {
+	targetRegistry: GjcPluginRegistry;
+	/** Both scopes, deterministically sorted, for cross-scope decisions. */
+	effective: GjcPluginRegistryEntry[];
+	existing: GjcPluginRegistryEntry | undefined;
+	bundle: NormalizedGjcPluginBundle;
+	/** Entry the candidate would produce if committed as-is. */
+	candidate: GjcPluginRegistryEntry;
 }
+
+export type GjcBundleTransactionDecision =
+	| { kind: "commit"; entry: GjcPluginRegistryEntry }
+	| { kind: "noop"; entry: GjcPluginRegistryEntry }
+	| { kind: "abort"; error: GjcLifecycleError };
+
+export type GjcBundleTransactionResult =
+	| { status: "committed"; entry: GjcPluginRegistryEntry; remnants: string[] }
+	| { status: "noop"; entry: GjcPluginRegistryEntry; remnants: string[] }
+	| { status: "aborted"; error: GjcLifecycleError; remnants: string[] };
 
 // Resource limits for the in-house tar extractor (third-party security boundary).
 const TAR_MAX_FILES = 8192;
@@ -334,29 +350,32 @@ async function cleanupOrphans(root: string, dirName: string): Promise<void> {
 	}
 }
 
-export async function installGjcPluginBundle(
+/**
+ * Serialized bundle transaction: prepare outside the locks, then hold the
+ * user->project locks in a fixed order so the decision sees a consistent
+ * cross-scope view. Only the target scope is ever committed.
+ */
+export async function runGjcBundleTransaction(
 	source: string,
-	options: InstallGjcPluginOptions,
-): Promise<InstallGjcPluginResult> {
+	options: GjcBundleTransactionOptions,
+): Promise<GjcBundleTransactionResult> {
 	const resolved = await resolveSource(source);
 	try {
-		// 1. Compile + validate (never imports plugin code).
+		// Compile + validate outside every lock (never imports plugin code).
 		const bundle = await compileGjcPluginBundle(resolved.dir);
 		const dirName = safeDirSegment(bundle.name);
 		const root = scopeRoot(options.scope, options.cwd);
 		const finalDir = path.join(root, dirName);
 
-		// 2-4. Conflict check, atomic swap, and registry write are one serialized
-		// transaction per scope so concurrent installs cannot race or lose updates.
-		return await withRegistryLock(options.scope, options.cwd, async () => {
+		const critical = async (): Promise<GjcBundleTransactionResult> => {
 			await fs.mkdir(root, { recursive: true });
 			await cleanupOrphans(root, dirName);
 
-			const registry = await readRegistry(options.scope, options.cwd);
-			const existing = registry.plugins.find(p => p.name === bundle.name);
-			// Hard install-time collision + MCP security validation against the
-			// effective installed registry (registry is the collision authority).
-			validateInstallPlan(bundle, registry.plugins);
+			const targetRegistry = await readRegistry(options.scope, options.cwd);
+			const otherScope: GjcPluginScope = options.scope === "user" ? "project" : "user";
+			const otherRegistry = await readRegistry(otherScope, options.cwd);
+			const effective = sortRegistryEntries([...targetRegistry.plugins, ...otherRegistry.plugins]);
+			const existing = targetRegistry.plugins.find(p => p.name === bundle.name);
 			const candidate = bundleToRegistryEntry(
 				bundle,
 				finalDir,
@@ -364,18 +383,14 @@ export async function installGjcPluginBundle(
 				resolved.source,
 				new Date().toISOString(),
 			);
-			if (existing) {
-				const sameContent = registryEntryFingerprint(existing) === registryEntryFingerprint(candidate);
-				if (sameContent && (await isDirectory(finalDir))) {
-					return { status: "unchanged" as const, entry: existing };
-				}
-				if (!options.force) {
-					throw new GjcPluginLoadError(
-						"install_conflict",
-						`GJC plugin "${bundle.name}" is already installed with different content; pass --force to replace it`,
-					);
-				}
-			}
+
+			const decision = await options.decide({ targetRegistry, effective, existing, bundle, candidate });
+			if (decision.kind === "abort") return { status: "aborted", error: decision.error, remnants: [] };
+			if (decision.kind === "noop") return { status: "noop", entry: decision.entry, remnants: [] };
+
+			// Hard install-time collision + MCP security validation against the
+			// effective installed registry (registry is the collision authority).
+			validateInstallPlan(bundle, targetRegistry.plugins);
 
 			const unique = `${process.pid}-${randomBytes(6).toString("hex")}`;
 			const stagingDir = `${finalDir}.installing-${unique}`;
@@ -394,8 +409,8 @@ export async function installGjcPluginBundle(
 				// Registry write last; on failure, roll the filesystem back.
 				try {
 					const next = sortRegistryEntries([
-						...registry.plugins.filter(p => p.name !== bundle.name),
-						{ ...candidate, installedAt: existing?.installedAt ?? candidate.installedAt },
+						...targetRegistry.plugins.filter(p => p.name !== bundle.name),
+						decision.entry,
 					]);
 					await writeRegistryUnlocked({ version: 1, scope: options.scope, plugins: next }, options.cwd);
 				} catch (error) {
@@ -403,15 +418,52 @@ export async function installGjcPluginBundle(
 					if (hadFinal) await fs.rename(backupDir, finalDir);
 					throw error;
 				}
-				if (hadFinal) await fs.rm(backupDir, { recursive: true, force: true });
-				return { status: existing ? ("updated" as const) : ("installed" as const), entry: candidate };
+				const remnants: string[] = [];
+				if (hadFinal) {
+					try {
+						await fs.rm(backupDir, { recursive: true, force: true });
+					} catch {
+						remnants.push(backupDir);
+					}
+				}
+				return { status: "committed", entry: decision.entry, remnants };
 			} finally {
 				await fs.rm(stagingDir, { recursive: true, force: true });
 			}
-		});
+		};
+
+		// Both scopes are read for the cross-scope decision, so both locks are held
+		// in a fixed user->project order regardless of which scope commits.
+		return await withRegistryLock("user", options.cwd, () => withRegistryLock("project", options.cwd, critical));
 	} finally {
 		await resolved.cleanup();
 	}
+}
+
+/** Compile a source into a validated candidate bundle without touching disk state. */
+export async function resolveGjcBundleCandidate<T>(
+	source: string,
+	fn: (input: { bundle: NormalizedGjcPluginBundle; source: GjcPluginRegistrySource }) => Promise<T>,
+): Promise<T> {
+	const resolved = await resolveSource(source);
+	try {
+		const bundle = await compileGjcPluginBundle(resolved.dir);
+		return await fn({ bundle, source: resolved.source });
+	} finally {
+		await resolved.cleanup();
+	}
+}
+
+/** Build the registry entry a candidate bundle would produce at a target path. */
+export function candidateRegistryEntry(
+	bundle: NormalizedGjcPluginBundle,
+	scope: GjcPluginScope,
+	cwd: string,
+	source: GjcPluginRegistrySource,
+	now: string,
+): GjcPluginRegistryEntry {
+	const finalDir = path.join(scopeRoot(scope, cwd), safeDirSegment(bundle.name));
+	return bundleToRegistryEntry(bundle, finalDir, scope, source, now);
 }
 
 /** True only when the source actually resolves to a GJC plugin bundle (root gajae-plugin.json). */

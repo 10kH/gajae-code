@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { GjcPluginLoadErrorCode, GjcPluginRegistryEntry } from "./types";
+import { bundleIdentity } from "./lifecycle-reconciliation";
+import type { GjcBundleIdentity, GjcPluginLoadErrorCode, GjcPluginRegistryEntry } from "./types";
 
 /**
  * Session-start validation: the registry is the collision authority. Capability
@@ -22,6 +23,8 @@ export interface SessionCapabilityEvidence {
 }
 
 export interface SessionQuarantine {
+	/** Scope-qualified canonical target this finding belongs to. */
+	identity: GjcBundleIdentity;
 	plugin: string;
 	surfaceId: string;
 	code: GjcPluginLoadErrorCode;
@@ -52,6 +55,7 @@ export async function verifyEntryHashes(entry: GjcPluginRegistryEntry): Promise<
 			buf = await fs.readFile(abs);
 		} catch {
 			return {
+				identity: bundleIdentity(entry.scope, entry.name),
 				plugin: entry.name,
 				surfaceId: `plugin:${entry.name}`,
 				code: "runtime_mismatch",
@@ -60,6 +64,7 @@ export async function verifyEntryHashes(entry: GjcPluginRegistryEntry): Promise<
 		}
 		if (sha256(buf) !== file.sha256) {
 			return {
+				identity: bundleIdentity(entry.scope, entry.name),
 				plugin: entry.name,
 				surfaceId: `plugin:${entry.name}`,
 				code: "runtime_mismatch",
@@ -119,6 +124,7 @@ export function validateSessionBundles(
 		const recordCollision = (surfaceId: string, what: string): void => {
 			collided = true;
 			quarantine.push({
+				identity: bundleIdentity(entry.scope, entry.name),
 				plugin: entry.name,
 				surfaceId,
 				code: "session_collision",

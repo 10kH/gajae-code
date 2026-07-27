@@ -13,13 +13,20 @@ const TEST_CONFIG: CliConfig = {
 
 let tempRoot: string | undefined;
 
+const agentDirs: string[] = [];
+
 async function runPluginCommand(
 	args: string[],
 	cwd: string,
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+	// Isolate the user scope: without this the child process reads the real
+	// ~/.gjc/agent registry and inherits whatever the developer has installed.
+	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-command-agent-"));
+	agentDirs.push(agentDir);
 	const proc = Bun.spawn({
 		cmd: [process.execPath, path.join(import.meta.dir, "../src/cli.ts"), "plugin", ...args],
 		cwd,
+		env: { ...process.env, GJC_CODING_AGENT_DIR: agentDir },
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -42,6 +49,7 @@ describe("Plugin command scope parsing", () => {
 			await fs.rm(tempRoot, { recursive: true, force: true });
 			tempRoot = undefined;
 		}
+		for (const dir of agentDirs.splice(0)) await fs.rm(dir, { recursive: true, force: true });
 	});
 	it("rejects invalid scope values", async () => {
 		const command = new Plugin(["install", "--scope", "porject"], TEST_CONFIG);
@@ -66,7 +74,19 @@ describe("Plugin command scope parsing", () => {
 		const jsonList = await runPluginCommand(["list", "--json"], cwd);
 		expect(jsonList.exitCode).toBe(0);
 		expect(jsonList.stderr).toBe("");
-		const parsed = JSON.parse(jsonList.stdout) as { gjc?: Array<{ name: string; scope: string }> };
-		expect(parsed.gjc).toEqual([expect.objectContaining({ name: "valid-six-surface-bundle", scope: "project" })]);
+		// `gjc` now carries safe lifecycle summaries keyed by canonical identity
+		// (kind, scope, name) rather than raw registry entries.
+		const parsed = JSON.parse(jsonList.stdout) as {
+			gjc?: Array<{ identity: { kind: string; scope: string; name: string }; version: string }>;
+		};
+		expect(parsed.gjc).toEqual([
+			expect.objectContaining({
+				identity: { kind: "gjc-bundle", scope: "project", name: "valid-six-surface-bundle" },
+				version: "1.0.0",
+			}),
+		]);
+		// Safe summaries never expose the raw source locator or the install path.
+		expect(jsonList.stdout).not.toContain("pluginRoot");
+		expect(jsonList.stdout).not.toContain("copiedFiles");
 	});
 });
