@@ -379,7 +379,11 @@ async function handleGjcUpgrade(name: string, flags: PluginCommandArgs["flags"])
 		else if (flags.json) {
 			console.log(
 				JSON.stringify(
-					{ status: applied.value.status, bundle: applied.value.summary, remnants: applied.value.remnants },
+					{
+						status: applied.value.status,
+						bundle: applied.value.summary,
+						remnantCount: applied.value.remnantCount,
+					},
 					null,
 					2,
 				),
@@ -390,10 +394,8 @@ async function handleGjcUpgrade(name: string, flags: PluginCommandArgs["flags"])
 					`${theme.status.success} ${applied.value.status} GJC bundle ${name}@${applied.value.summary.version} (${scope})`,
 				),
 			);
-			if (applied.value.remnants.length > 0) {
-				console.error(
-					chalk.yellow(`  ${applied.value.remnants.length} leftover director(ies) could not be removed`),
-				);
+			if (applied.value.remnantCount > 0) {
+				console.error(chalk.yellow(`  ${applied.value.remnantCount} leftover directory could not be removed`));
 			}
 		}
 	}

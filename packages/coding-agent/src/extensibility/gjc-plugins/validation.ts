@@ -7,6 +7,7 @@ import {
 	GJC_SUBSKILL_PARENT_SKILLS,
 	GjcPluginLoadError,
 	type GjcPluginRegistryEntry,
+	type GjcPluginScope,
 	type GjcSubskillParentAgent,
 	type LoadedSubskillBinding,
 	type NormalizedGjcPluginBundle,
@@ -87,8 +88,12 @@ export function buildParentPhaseSet(bindings: readonly LoadedSubskillBinding[]):
 export function validateInstallPlan(
 	bundle: NormalizedGjcPluginBundle,
 	effectiveEntries: readonly GjcPluginRegistryEntry[],
+	scope?: GjcPluginScope,
 ): void {
-	const others = effectiveEntries.filter(e => e.name !== bundle.name);
+	const others = effectiveEntries.filter(e => {
+		if (scope === undefined) return e.name !== bundle.name;
+		return e.scope !== scope || e.name !== bundle.name;
+	});
 
 	const toolNames = new Set<string>();
 	const hookKeys = new Set<string>();

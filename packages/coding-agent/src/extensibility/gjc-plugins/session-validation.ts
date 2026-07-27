@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { bundleIdentity } from "./lifecycle-reconciliation";
+import { bundleIdentity, identityKey } from "./lifecycle-reconciliation";
 import type { GjcBundleIdentity, GjcPluginLoadErrorCode, GjcPluginRegistryEntry } from "./types";
 
 /**
@@ -108,7 +108,7 @@ export function validateSessionBundles(
 	preQuarantined: readonly SessionQuarantine[] = [],
 ): SessionValidationResult {
 	const quarantine: SessionQuarantine[] = [...preQuarantined];
-	const quarantinedPlugins = new Set(preQuarantined.map(q => q.plugin));
+	const quarantinedPlugins = new Set(preQuarantined.map(q => identityKey(q.identity)));
 
 	const seenTools = new Set<string>(evidence.toolNames ?? []);
 	const seenMcps = new Set<string>(evidence.mcpNames ?? []);
@@ -118,7 +118,7 @@ export function validateSessionBundles(
 	const active: GjcPluginRegistryEntry[] = [];
 	for (const entry of entries) {
 		if (!entry.enabled) continue; // user-disabled, not an error
-		if (quarantinedPlugins.has(entry.name)) continue;
+		if (quarantinedPlugins.has(identityKey(bundleIdentity(entry.scope, entry.name)))) continue;
 		const surfaces = activeSurfaceIds(entry);
 		let collided = false;
 		const recordCollision = (surfaceId: string, what: string): void => {

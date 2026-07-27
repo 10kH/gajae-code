@@ -8,8 +8,8 @@ import {
 	installGjcBundle,
 	type NormalizedGjcPluginSurfaces,
 	summarizeGjcPluginObservability,
-	writeRegistry,
 } from "../src/extensibility/gjc-plugins";
+import { writeRegistry } from "../src/extensibility/gjc-plugins/registry";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
 const sixSurface = path.join(fixturesRoot, "valid-six-surface-bundle");

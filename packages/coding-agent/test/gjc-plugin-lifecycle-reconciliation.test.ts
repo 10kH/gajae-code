@@ -133,14 +133,16 @@ describe("GJC bundle lifecycle reconciliation", () => {
 	});
 
 	test("reconciles persisted enablement and quarantine against candidate surfaces", () => {
+		// Quarantine is recomputed from the candidate's own justified findings;
+		// stale records for surfaces the candidate fixed are never carried over.
 		const result = reconcileEnablement(
 			["tool", "removed", "tool"],
+			["new", "tool"],
 			[
 				{ surfaceId: "tool", code: "runtime_mismatch", message: "first", detectedAt: "1" },
 				{ surfaceId: "tool", code: "runtime_mismatch", message: "duplicate", detectedAt: "2" },
 				{ surfaceId: "removed", code: "runtime_mismatch", message: "gone", detectedAt: "3" },
 			],
-			["new", "tool"],
 		);
 		expect(result.disabledSurfaceIds).toEqual(["tool"]);
 		expect(result.quarantine).toEqual([

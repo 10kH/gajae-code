@@ -306,7 +306,9 @@ export interface GjcBundleSafeSource {
 	kind: GjcPluginSourceKind;
 	/** Redacted display locator (host + path only; no userinfo/query/fragment). */
 	display: string;
+	/** Conservative safe git ref, omitted when the stored value is unsafe. */
 	ref?: string;
+	/** Hex-only revision identifier, omitted when the stored value is unsafe. */
 	sha?: string;
 	resolvedAt: string;
 	/** True when this source kind supports re-resolution during update. */
@@ -397,8 +399,8 @@ export type GjcUpdateApplyStatus = "updated" | "unchanged";
 export interface GjcUpdateApplyResult {
 	status: GjcUpdateApplyStatus;
 	summary: GjcBundleSummary;
-	/** Filesystem remnants that could not be removed after a successful swap. */
-	remnants: string[];
+	/** Number of filesystem remnants that could not be removed after a successful swap. */
+	remnantCount: number;
 }
 
 export interface GjcInstallResult {

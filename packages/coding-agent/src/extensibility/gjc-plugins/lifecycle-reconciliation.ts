@@ -66,18 +66,31 @@ export function targetFingerprint(entry: GjcPluginRegistryEntry): string {
 }
 
 /**
- * Fingerprint of the exact installed baseline an update compares against:
- * the installed content PLUS the persisted enablement intent it must carry
- * forward. Toggling the bundle or any surface changes this, so a preview taken
- * before the toggle can no longer be applied.
+ * Fingerprint of the exact installed baseline an update compares against: the
+ * installed content, the persisted enablement intent it must carry forward,
+ * and the stored source descriptor the update re-resolves from.
+ *
+ * Toggling the bundle or any surface changes this, so a preview taken before
+ * the toggle can no longer be applied. Binding the source matters just as much:
+ * apply re-resolves `entry.source.uri` before taking the locks, so a descriptor
+ * that changed in between must invalidate the reviewed baseline rather than let
+ * an update be committed from a locator the reviewer never saw.
  */
 export function baselineFingerprint(entry: GjcPluginRegistryEntry): string {
+	const source = [
+		entry.source.kind,
+		entry.source.uri,
+		entry.source.ref ?? "",
+		entry.source.sha ?? "",
+		entry.source.resolvedAt,
+	].join("\u0001");
 	return sha256(
 		[
 			targetFingerprint(entry),
 			entry.enabled ? "1" : "0",
 			[...new Set(entry.disabledSurfaceIds)].sort().join(","),
 			[...new Set((entry.quarantine ?? []).map(q => `${q.surfaceId}:${q.code}`))].sort().join(","),
+			source,
 		].join("\u0000"),
 	);
 }
@@ -144,17 +157,18 @@ export interface ReconciledEnablement {
  * - surviving disabled IDs stay disabled,
  * - IDs whose surface disappeared are dropped,
  * - new surface IDs are enabled by omission,
- * - quarantine is recomputed against the candidate's surface set.
+ * - quarantine is recomputed from candidateQuarantine against the candidate's
+ *   surface set; omitted input means no candidate quarantine is justified.
  */
 export function reconcileEnablement(
 	previousDisabledSurfaceIds: readonly string[],
-	previousQuarantine: readonly GjcPluginQuarantineEntry[],
 	candidateSurfaceIds: readonly string[],
+	candidateQuarantine: readonly GjcPluginQuarantineEntry[] = [],
 ): ReconciledEnablement {
 	const surviving = new Set(candidateSurfaceIds);
 	const disabledSurfaceIds = [...new Set(previousDisabledSurfaceIds)].filter(id => surviving.has(id)).sort();
 	const seen = new Set<string>();
-	const quarantine = previousQuarantine
+	const quarantine = candidateQuarantine
 		.filter(q => {
 			if (!surviving.has(q.surfaceId)) return false;
 			if (seen.has(q.surfaceId)) return false;

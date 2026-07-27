@@ -1,10 +1,4 @@
-import * as path from "node:path";
-import {
-	candidateRegistryEntry,
-	type GjcBundleTransactionDecision,
-	resolveGjcBundleCandidate,
-	runGjcBundleTransaction,
-} from "./installer";
+import { type GjcBundleTransactionDecision, resolveGjcBundleCandidate, runGjcBundleTransaction } from "./installer";
 import {
 	activationFingerprint,
 	baselineFingerprint,
@@ -55,20 +49,73 @@ function fail(code: GjcLifecycleError["code"], message: string, recovery?: strin
 const UNSUPPORTED_UPDATE_REASON: Partial<Record<GjcPluginRegistrySource["kind"], string>> = {};
 
 /**
- * Redact a stored locator to a display form: scheme + host + path only. No
- * userinfo, query, fragment, or credentials ever reach CLI/Settings output.
+ * Redact a stored locator to a display form: host + path only. No userinfo,
+ * query, fragment, credentials, or parent-directory segments reach output.
  */
+const SAFE_LOCATOR_SEGMENT = /^[A-Za-z0-9._-]+$/;
+const SAFE_HOST = /^[A-Za-z0-9.-]+$/;
+const SAFE_REF = /^[A-Za-z0-9._/-]{1,128}$/;
+const SAFE_SHA = /^[A-Fa-f0-9]{1,128}$/;
+
+function safePathSegments(value: string): string[] {
+	return value
+		.replace(/\\/g, "/")
+		.split("/")
+		.flatMap(segment => {
+			try {
+				return [decodeURIComponent(segment)];
+			} catch {
+				return [];
+			}
+		})
+		.filter(segment => segment !== "." && !segment.includes("..") && SAFE_LOCATOR_SEGMENT.test(segment));
+}
+
+function displayPath(segments: string[]): string {
+	return segments.join("/").replace(/\.git$/i, "");
+}
+
+function safeRef(value: string | undefined): string | undefined {
+	if (value === undefined || !SAFE_REF.test(value) || value.startsWith("/") || value.includes("..")) return undefined;
+	return value;
+}
+
+function safeSha(value: string | undefined): string | undefined {
+	return value !== undefined && SAFE_SHA.test(value) ? value : undefined;
+}
+
+function localPathDisplay(value: string, fallback: string): string {
+	const segments = safePathSegments(value);
+	return segments.at(-1) ?? fallback;
+}
+
 export function redactSourceLocator(source: GjcPluginRegistrySource): string {
-	if (source.kind === "path" || source.kind === "tarball") {
-		return path.basename(source.uri);
+	const unc = /^(?:\\\\|\/\/)(.+)$/.exec(source.uri);
+	if (unc) {
+		const [host, ...segments] = safePathSegments(unc[1] ?? "");
+		if (host && SAFE_HOST.test(host)) {
+			const safePath = displayPath(segments);
+			return safePath ? `${host}/${safePath}` : host;
+		}
+		return source.kind;
 	}
+
+	if (/^[A-Za-z]:[\\/]/.test(source.uri)) return localPathDisplay(source.uri, source.kind);
+	if (source.kind === "path" || /^(?:\.{1,2}[\\/]|[\\/])/.test(source.uri)) {
+		return localPathDisplay(source.uri, source.kind);
+	}
+
 	try {
 		const url = new URL(source.uri);
-		return `${url.protocol}//${url.hostname}${url.pathname.replace(/\.git$/, "")}`;
+		if (!SAFE_HOST.test(url.hostname)) return source.kind;
+		const safePath = displayPath(safePathSegments(url.pathname));
+		return safePath ? `${url.hostname}/${safePath}` : url.hostname;
 	} catch {
-		// scp-style (git@host:owner/repo) or otherwise unparseable: keep host+path.
-		const scp = /^[^@/]+@([^:]+):(.+)$/.exec(source.uri);
-		if (scp) return `${scp[1]}/${scp[2]?.replace(/\.git$/, "") ?? ""}`;
+		const scp = /^[^@/:]+@([A-Za-z0-9.-]+):(.+)$/.exec(source.uri);
+		if (scp) {
+			const safePath = displayPath(safePathSegments(scp[2] ?? ""));
+			return safePath ? `${scp[1]}/${safePath}` : (scp[1] ?? source.kind);
+		}
 		return source.kind;
 	}
 }
@@ -81,8 +128,10 @@ function toSafeSource(source: GjcPluginRegistrySource): GjcBundleSafeSource {
 		resolvedAt: source.resolvedAt,
 		updatable: unsupportedReason === undefined,
 	};
-	if (source.ref !== undefined) safe.ref = source.ref;
-	if (source.sha !== undefined) safe.sha = source.sha;
+	const ref = safeRef(source.ref);
+	const sha = safeSha(source.sha);
+	if (ref !== undefined) safe.ref = ref;
+	if (sha !== undefined) safe.sha = sha;
 	if (unsupportedReason !== undefined) safe.unsupportedReason = unsupportedReason;
 	return safe;
 }
@@ -326,11 +375,9 @@ export async function applyGjcBundleUpdate(
 			}
 			if (candidateHash === targetFingerprint(existing)) return { kind: "noop", entry: existing };
 
-			const reconciled = reconcileEnablement(
-				existing.disabledSurfaceIds,
-				existing.quarantine ?? [],
-				surfaceIdsOf(bundle.surfaces),
-			);
+			// Quarantine is recomputed against the candidate, never carried forward,
+			// so a surface the update fixes is not left permanently blocked.
+			const reconciled = reconcileEnablement(existing.disabledSurfaceIds, surfaceIdsOf(bundle.surfaces));
 			const next: GjcPluginRegistryEntry = {
 				...candidate,
 				enabled: existing.enabled,
@@ -345,11 +392,11 @@ export async function applyGjcBundleUpdate(
 
 	if (result.status === "aborted") return { ok: false, error: result.error };
 	if (result.status === "noop") {
-		return { ok: true, value: { status: "unchanged", summary: toBundleSummary(result.entry), remnants: [] } };
+		return { ok: true, value: { status: "unchanged", summary: toBundleSummary(result.entry), remnantCount: 0 } };
 	}
 	return {
 		ok: true,
-		value: { status: "updated", summary: toBundleSummary(result.entry), remnants: result.remnants },
+		value: { status: "updated", summary: toBundleSummary(result.entry), remnantCount: result.remnants.length },
 	};
 }
 
@@ -427,5 +474,3 @@ export async function setGjcBundleSurfaceEnabled(
 export async function currentActivationFingerprint(ctx: GjcLifecycleContext): Promise<string> {
 	return activationFingerprint(await readEffective(ctx.cwd));
 }
-
-export { candidateRegistryEntry };

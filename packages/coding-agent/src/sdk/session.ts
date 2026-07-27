@@ -1875,11 +1875,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			logger.warn("Failed to load constrained GJC plugin hooks", { error });
 		}
 
-		// Sole publication point for GJC bundle runtime evidence. Every producer has
-		// now run, so this is the one complete snapshot for this activation
-		// generation. A partial pass publishes nothing: consumers must see
-		// `unavailable` rather than a half-generation that looks clear.
-		if (gjcProducersComplete) gjcRuntimeStore.publish(gjcFindings.snapshot());
 		let notificationCfg: NotificationConfig | undefined;
 		try {
 			notificationCfg = getNotificationConfig(settings);
@@ -2257,8 +2252,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			try {
 				pluginSystemAppendices = await renderAlwaysOnSystemAppendices({ cwd });
 			} catch (error) {
+				gjcProducersComplete = false;
 				logger.warn("Failed to render GJC plugin system appendices", { error });
 			}
+
+			// Sole publication point for GJC bundle runtime evidence. Appendix
+			// rendering is the last producer, so only here is the generation
+			// complete. A partial pass publishes nothing: consumers must see
+			// `unavailable` rather than a half-generation that looks clear.
+			if (gjcProducersComplete) gjcRuntimeStore.publish(gjcFindings.snapshot());
 			const defaultPrompt = await buildSystemPromptInternal({
 				cwd,
 				skills,

@@ -17,12 +17,12 @@ import {
 	readRegistry,
 	redactSourceLocator,
 	registryPathForScope,
-	runGjcBundleTransaction,
 	setGjcBundleEnabled,
 	setGjcBundleSurfaceEnabled,
 	toBundleSummary,
-	writeRegistry,
 } from "../src/extensibility/gjc-plugins";
+import { runGjcBundleTransaction } from "../src/extensibility/gjc-plugins/installer";
+import { writeRegistry } from "../src/extensibility/gjc-plugins/registry";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
 const sixSurface = path.join(fixturesRoot, "valid-six-surface-bundle");
@@ -247,9 +247,13 @@ describe("GJC bundle lifecycle adversarial invariants", () => {
 		if (!preview.ok) throw new Error(preview.error.code);
 		expect(await applyGjcBundleUpdate({ cwd }, preview.value.token)).toMatchObject({ ok: true });
 		const registry = await readRegistry("project", cwd);
-		expect(registry.plugins[0]?.quarantine).toEqual([
-			{ surfaceId: removedId, code: "runtime_mismatch", message: "first", detectedAt: "1" },
-		]);
+		// Quarantine is recomputed against the candidate rather than carried
+		// forward, so a surface the update fixes must come back clean instead of
+		// staying permanently blocked by a stale record.
+		expect(registry.plugins[0]?.quarantine ?? []).toEqual([]);
+		const reconciled = await summary(cwd, identity);
+		expect(reconciled.quarantined).toBe(false);
+		expect(reconciled.surfaces.every(surface => !surface.quarantined)).toBe(true);
 	});
 
 	test("blocks quarantined enables but always permits de-escalating disables", async () => {
