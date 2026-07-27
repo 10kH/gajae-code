@@ -8,6 +8,7 @@
 - Interactive `/resume` no longer awaits ordinary notification-endpoint rotation after predecessor fencing when the transition is stamped `interactive_selector_resume`; lifecycle/SDK identity-control paths still await readiness and use a fail-closed control-drain orchestration that sends terminal control outcomes only after successor readiness, while uncertain predecessor stop no longer starts the successor (#2914).
 - Interactive TUI `/resume` commits a status-container progress lease before inspect/migration/switch work and clears it on every exit path, with generation-scoped render-commit wait that fails open when the terminal is stopped or unavailable (#2914).
 - Interactive `/resume` progress lease fails open when `statusContainer` or UI lacks child-mutation/render-commit surface, preserving headless/minimal controller contexts without weakening full TUI progress-before-switch (#3234 post-merge).
+- The documented `GJC_OPENAI_CODE_WEB_SEARCH_MODEL` environment variable now overrides the OpenAI-code web-search model; it is resolved GJC-first ahead of the legacy `PI_CODEX_WEB_SEARCH_MODEL` name (previously only the legacy name was read, so the documented name was a silent no-op).
 
 ### Added
 
