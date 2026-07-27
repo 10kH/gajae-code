@@ -226,13 +226,6 @@ Text functions generally return deterministic transformed output; errors are lim
 - Per-line parse failure does not fail the call: that line is appended unhighlighted and processing continues.
 - Unknown/unsupported language falls back to plain text syntax.
 
-## 7) Token counting (`tokens`)
-
-- `input` may be a single string or an array of strings.
-- Arrays return one aggregate count and are encoded in parallel in Rust.
-- Default encoding is `O200kBase`; `Cl100kBase` remains available as a compatibility alias routing to `o200k_base` in default builds.
-- The implementation uses ordinary tokenization, not special-token handling.
-
 ## Pure utility vs filesystem-dependent flows
 
 | Flow                         | Filesystem access | Shared cache         | Notes                                         |

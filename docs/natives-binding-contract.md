@@ -82,7 +82,7 @@ Consumers in `packages/coding-agent` and `packages/tui` import directly from `@g
 The contract preserves Rust/N-API call style:
 
 - **Promise-returning exports** for worker-thread or async runtime work (`grep`, `glob`, `fuzzyFind`, `astGrep`, `astEdit`, `htmlToMarkdown`, shell/PTY runs, image parse/resize/encode, clipboard image read).
-- **Synchronous exports** for deterministic in-memory transforms/parsers or direct system calls (`search`, `hasMatch`, highlighting, text utilities, token counting, process queries, `copyToClipboard`, `encodeSixel`).
+- **Synchronous exports** for deterministic in-memory transforms/parsers or direct system calls (`search`, `hasMatch`, highlighting, text utilities, process queries, `copyToClipboard`, `encodeSixel`).
 - **Constructor exports** for stateful runtime objects (`Shell`, `PtySession`, macOS observer/power handles).
 
 Changing sync ↔ async for an existing export is a breaking public API change because consumers call these exports directly.

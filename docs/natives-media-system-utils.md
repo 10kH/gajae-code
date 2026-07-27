@@ -1,6 +1,6 @@
 # Natives media + system utilities
 
-This document covers the media/system/conversion exports in `@gajae-code/natives`: image processing, HTML conversion, clipboard access, token counting, macOS appearance/power helpers, ProjFS helpers, and work profiling.
+This document covers the media/system/conversion exports in `@gajae-code/natives`: sixel encoding, HTML conversion, clipboard access, macOS appearance/power helpers, and work profiling.
 
 ## Implementation files
 
@@ -21,7 +21,7 @@ This document covers the media/system/conversion exports in `@gajae-code/natives
 
 | JS export                                           | Rust N-API export              | Rust module         |
 | --------------------------------------------------- | ------------------------------ | ------------------- |
-| `encodeSixel(bytes, targetWidthPx, targetHeightPx)` | `encode_sixel`                 | `image.rs`          |
+| `encodeSixel(bytes, targetWidthPx, targetHeightPx)` | `encode_sixel`                 | `sixel.rs`          |
 | `htmlToMarkdown(html, options?)`                    | `html_to_markdown`             | `html.rs`           |
 | `copyToClipboard(text)`                             | `copy_to_clipboard`            | `clipboard.rs`      |
 | `readImageFromClipboard()`                          | `read_image_from_clipboard`    | `clipboard.rs`      |
@@ -65,12 +65,6 @@ Conversion behavior:
 - Clipboard access or image encoding failures reject/throw as native errors.
 
 There is no current `packages/natives` TS wrapper that emits OSC52, handles Termux, or suppresses native clipboard failures. Any best-effort clipboard policy must live in consumers.
-
-### Tokens (`tokens`)
-
-- Arrays return one aggregate token count; encoding work is parallelized in Rust.
-- Default encoding is `O200kBase`; `Cl100kBase` remains exported as a compatibility alias that routes to `o200k_base` (the cl100k BPE table is not embedded in default builds).
-- The implementation uses ordinary encoding, not special-token handling.
 
 ### macOS appearance and power helpers
 
