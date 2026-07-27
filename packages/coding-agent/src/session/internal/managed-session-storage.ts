@@ -454,6 +454,8 @@ export class ManagedSessionDescendantStore {
 	readonly #policy: ManagedSessionSecurityPolicy;
 	readonly #authority: RecoveryFsRoot | undefined;
 	readonly #authorityBaseDir: string;
+	/** Logical profile root inherited by nested managed session destinations. */
+	readonly #profileAgentDir: string;
 	readonly #subtreeRoot: ManagedDirectoryRoot;
 
 	constructor(
@@ -461,12 +463,14 @@ export class ManagedSessionDescendantStore {
 		baseDir: string,
 		retained?: { authority: RecoveryFsRoot; authorityBaseDir: string },
 		policy?: ManagedSessionSecurityPolicy,
+		profileAgentDir?: string,
 	) {
 		managedRelativePath(root, baseDir);
 
 		this.#root = root;
 		this.#baseDir = path.resolve(baseDir);
 		this.#policy = policy ?? "default";
+		this.#profileAgentDir = profileAgentDir ?? root.canonicalPath;
 		this.#authorityBaseDir = retained?.authorityBaseDir ?? this.#baseDir;
 		if (retained) {
 			const relative = path.relative(retained.authorityBaseDir, this.#baseDir).split(path.sep).join("/");
@@ -520,10 +524,15 @@ export class ManagedSessionDescendantStore {
 		return this.#policy;
 	}
 
+	get profileAgentDir(): string {
+		return this.#profileAgentDir;
+	}
+
 	deriveSubtree(relativePath: string): ManagedSessionDescendantStore {
 		const child = this.ensureDirectory(relativePath);
 		const resolved = this.#resolve(relativePath);
-		if (!this.#authority) return new ManagedSessionDescendantStore(this.#root, resolved, undefined, this.#policy);
+		if (!this.#authority)
+			return new ManagedSessionDescendantStore(this.#root, resolved, undefined, this.#policy, this.#profileAgentDir);
 		const retainedChild = this.#authority.retainManagedDirectory(
 			this.#relative(resolved),
 			child.dev.toString(),
@@ -537,6 +546,7 @@ export class ManagedSessionDescendantStore {
 				authorityBaseDir: resolved,
 			},
 			this.#policy,
+			this.#profileAgentDir,
 		);
 	}
 
