@@ -368,8 +368,9 @@ export async function runGjcBundleTransaction(
 		const finalDir = path.join(root, dirName);
 
 		const critical = async (): Promise<GjcBundleTransactionResult> => {
-			await fs.mkdir(root, { recursive: true });
-			await cleanupOrphans(root, dirName);
+			// Read-only until the policy decision resolves. A refusal must not create
+			// the scope root or sweep orphans, so an existing-target refusal leaves
+			// the filesystem byte-for-byte untouched.
 
 			const targetRegistry = await readRegistry(options.scope, options.cwd);
 			const otherScope: GjcPluginScope = options.scope === "user" ? "project" : "user";
@@ -387,6 +388,10 @@ export async function runGjcBundleTransaction(
 			const decision = await options.decide({ targetRegistry, effective, existing, bundle, candidate });
 			if (decision.kind === "abort") return { status: "aborted", error: decision.error, remnants: [] };
 			if (decision.kind === "noop") return { status: "noop", entry: decision.entry, remnants: [] };
+
+			// The decision committed, so mutation may begin.
+			await fs.mkdir(root, { recursive: true });
+			await cleanupOrphans(root, dirName);
 
 			// Hard install-time collision + MCP security validation against the
 			// effective installed registry (registry is the collision authority).

@@ -184,6 +184,18 @@ export function toBundleSummary(entry: GjcPluginRegistryEntry): GjcBundleSummary
 	};
 }
 
+/**
+ * Rebuild the exact locator an update must re-resolve from. A git ref is stored
+ * separately from the URI, so re-resolving the bare URI would silently drop the
+ * reviewed branch or tag and update from the default branch instead.
+ */
+function storedSourceLocator(source: GjcPluginRegistrySource): string {
+	return source.kind === "git" && source.ref ? `${source.uri}#${source.ref}` : source.uri;
+}
+
+/** Exposed for locator-reconstruction tests; not part of the lifecycle API. */
+export const storedSourceLocatorForTest = storedSourceLocator;
+
 async function readEffective(cwd: string): Promise<GjcPluginRegistryEntry[]> {
 	const [user, project] = await Promise.all([readRegistry("user", cwd), readRegistry("project", cwd)]);
 	return sortRegistryEntries([...user.plugins, ...project.plugins]);
@@ -268,7 +280,7 @@ export async function previewGjcBundleUpdate(
 	}
 
 	const effective = await readEffective(ctx.cwd);
-	return await resolveGjcBundleCandidate(entry.source.uri, async ({ bundle }) => {
+	return await resolveGjcBundleCandidate(storedSourceLocator(entry.source), async ({ bundle }) => {
 		if (bundle.name !== entry.name) {
 			return {
 				ok: false as const,
@@ -331,7 +343,7 @@ export async function applyGjcBundleUpdate(
 		};
 	}
 
-	const result = await runGjcBundleTransaction(entry.source.uri, {
+	const result = await runGjcBundleTransaction(storedSourceLocator(entry.source), {
 		scope: identity.scope,
 		cwd: ctx.cwd,
 		decide: async ({ existing, effective, bundle, candidate }): Promise<GjcBundleTransactionDecision> => {

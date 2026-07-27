@@ -11,6 +11,7 @@ import {
 	applyGjcBundleUpdate,
 	bundleIdentity,
 	type GjcBundleSummary,
+	GjcPluginLoadError,
 	getGjcBundle,
 	installGjcBundle,
 	isGjcPluginBundleSource,
@@ -507,7 +508,10 @@ async function handleInstall(
 					);
 				}
 			} catch (err) {
-				console.error(chalk.red(`${theme.status.error} Failed to install GJC plugin ${spec}: ${err}`));
+				// Never echo the raw spec or the underlying cause: either can carry
+				// credentials, a query string, or an absolute home path.
+				const reason = err instanceof GjcPluginLoadError ? err.code : "install_failed";
+				console.error(chalk.red(`${theme.status.error} Failed to install GJC bundle (${reason})`));
 				process.exit(1);
 			}
 			continue;

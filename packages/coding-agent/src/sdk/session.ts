@@ -1798,6 +1798,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						);
 						const result = await owned.connectServers(configs, sources as never);
 						for (const [server, err] of result.errors) {
+							// A server that failed to connect leaves this generation
+							// incomplete: its surfaces produced no evidence, so publishing
+							// would present a partial pass as a clear one.
+							gjcProducersComplete = false;
 							logger.warn("GJC plugin MCP connect failed", { path: `mcp:${server}`, error: err });
 						}
 						if (result.connectedServers.length > 0) {
