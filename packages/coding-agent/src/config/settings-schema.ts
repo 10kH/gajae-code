@@ -387,16 +387,17 @@ export const SETTINGS_SCHEMA = {
 	},
 	"session.resumeModelBehavior": {
 		type: "enum",
-		values: ["keepSessionModel", "useCurrentDefault"] as const,
+		values: ["keepSessionModel", "useCurrentDefault", "ask"] as const,
 		default: "keepSessionModel",
 		ui: {
 			tab: "model",
 			label: "Resume Model Behavior",
 			description:
-				"When resuming a session: keep the model that session last used, or switch to the currently configured default model.",
+				"When resuming a session: keep the model that session last used, switch to the currently configured default model, or ask (TUI only; falls back to keeping the session's model in headless/CLI resume).",
 			options: [
 				{ value: "keepSessionModel", label: "Keep session's saved model" },
 				{ value: "useCurrentDefault", label: "Use current default model" },
+				{ value: "ask", label: "Ask on resume (TUI only)" },
 			],
 		},
 	},

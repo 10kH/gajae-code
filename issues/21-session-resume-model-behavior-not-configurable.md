@@ -46,10 +46,14 @@ both restore sites:
 - `agent-session.ts:9711` (`switchSession`) — same branch, applied after `sessionContext` is loaded,
   before `#setModelWithProviderSessionReset`/`agent.setModel`.
 
-Stage 2 (optional follow-up, larger scope): a third `"ask"` mode that prompts in the TUI resume
-picker (`selector-controller.ts:1145` `handleResumeSession`) only when the session's saved model
-differs from the resolved current default; CLI/headless resume has no prompt surface and should fall
-back to `keepSessionModel` semantics for `"ask"`.
+Stage 2 (done): a third `"ask"` mode prompts in the TUI resume picker
+(`selector-controller.ts` `handleResumeSession` → `#maybePromptResumeModelChoice`) only when the
+session's saved model differs from the resolved current default (`AgentSession#resolveConfiguredDefaultModel`).
+CLI/headless resume has no prompt surface, so `"ask"` falls back to `keepSessionModel` semantics
+there (the `sdk.ts` gate already only special-cases `"useCurrentDefault"`).
+
+## Status
+Stage 1 and Stage 2 both landed. See PR https://github.com/Yeachan-Heo/gajae-code/pull/3293.
 
 ## Non-goal
 - `task.agentModelOverrides` / `modelRoles` are out of scope — already global/live, no session

@@ -64,6 +64,7 @@ import {
 import { CustomProviderWizardComponent, type CustomProviderWizardSubmit } from "../components/custom-provider-wizard";
 import { ExtensionDashboard } from "../components/extensions";
 import { HistorySearchComponent } from "../components/history-search";
+import { HookSelectorComponent } from "../components/hook-selector";
 import { JobsOverlayComponent } from "../components/jobs-overlay";
 import { ModelSelectorComponent } from "../components/model-selector";
 import { OAuthSelectorComponent } from "../components/oauth-selector";
@@ -1155,6 +1156,47 @@ export class SelectorController {
 		this.ctx.renderInitialMessages();
 		await this.ctx.reloadTodos();
 		this.ctx.showStatus("Resumed session");
+
+		this.#maybePromptResumeModelChoice();
+	}
+
+	/**
+	 * When `session.resumeModelBehavior` is "ask", offer a one-shot choice after
+	 * resuming: keep the model the session was last using, or switch to whatever
+	 * `modelRoles.default` currently resolves to. No-op if the setting is unset,
+	 * the two models already match, or either model can't be resolved.
+	 */
+	#maybePromptResumeModelChoice(): void {
+		if (this.ctx.settings.get("session.resumeModelBehavior") !== "ask") return;
+		const sessionModel = this.ctx.session.model;
+		const currentDefault = this.ctx.session.resolveConfiguredDefaultModel();
+		if (!sessionModel || !currentDefault) return;
+		if (sessionModel.provider === currentDefault.provider && sessionModel.id === currentDefault.id) return;
+
+		this.showSelector(done => {
+			const selector = new HookSelectorComponent(
+				`This session last used ${sessionModel.provider}/${sessionModel.id}.\n` +
+					`Current default model is ${currentDefault.provider}/${currentDefault.id}.`,
+				[`Keep ${sessionModel.id}`, `Use ${currentDefault.id}`],
+				async (option: string) => {
+					done();
+					if (option === `Use ${currentDefault.id}`) {
+						try {
+							await this.ctx.session.setModel(currentDefault);
+							this.ctx.showStatus(`Switched to ${currentDefault.provider}/${currentDefault.id}`);
+						} catch (err) {
+							this.ctx.showError(err instanceof Error ? err.message : String(err));
+						}
+					}
+					this.ctx.ui.requestRender();
+				},
+				() => {
+					done();
+					this.ctx.ui.requestRender();
+				},
+			);
+			return { component: selector, focus: selector };
+		});
 	}
 
 	async handleSessionDeleteCommand(): Promise<void> {

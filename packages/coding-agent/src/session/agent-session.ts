@@ -6082,6 +6082,16 @@ export class AgentSession {
 	getSessionDefaultModelSelector(): string | undefined {
 		return this.sessionManager.buildSessionContext().models.default;
 	}
+	/**
+	 * Resolve the model that `modelRoles.default` currently points to, independent
+	 * of whatever model this session's log last recorded. Used by the TUI resume
+	 * flow's `session.resumeModelBehavior: "ask"` prompt to offer the currently
+	 * configured default as an alternative to the session's saved model.
+	 */
+	resolveConfiguredDefaultModel(): Model | undefined {
+		const availableModels = this.#modelRegistry.getAvailable();
+		return this.#resolveRoleModelFull("default", availableModels, undefined).model;
+	}
 
 	/**
 	 * Re-assert the session resume default ("provider/id") in the session log
