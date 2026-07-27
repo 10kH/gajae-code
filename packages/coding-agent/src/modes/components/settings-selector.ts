@@ -22,6 +22,7 @@ import type {
 	StatusLineSeparatorStyle,
 } from "../../config/settings-schema";
 import { SETTING_TABS, TAB_METADATA } from "../../config/settings-schema";
+import type { GjcRuntimeSnapshotProvider } from "../../extensibility/gjc-plugins/runtime-quarantine";
 import { getCurrentThemeName, getSelectListTheme, getSettingsListTheme, theme } from "../../modes/theme/theme";
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
 import { getTabBarTheme } from "../shared";
@@ -674,6 +675,14 @@ export interface SettingsRuntimeContext {
 	petAvailable?: boolean;
 	/** Terminal environment used to select unavailable-pet guidance. Omitted in production to use Bun.env. */
 	terminalEnv?: NodeJS.ProcessEnv;
+	/**
+	 * Runtime evidence published by the session for the current activation
+	 * generation. Omitted when no session published one, in which case the GJC
+	 * Bundles tab honestly reports runtime status as unavailable.
+	 */
+	gjcRuntimeSnapshot?: GjcRuntimeSnapshotProvider;
+	/** Activation generation the published snapshot must match to be merged. */
+	gjcActivationGeneration?: number;
 }
 
 /** Status line settings subset for preview */
@@ -1282,10 +1291,17 @@ export class SettingsSelectorComponent extends Container {
 		this.addChild(this.#pluginComponent);
 	}
 	#showGjcBundlesTab(): void {
-		this.#gjcBundleComponent = new GjcBundleSettingsComponent(this.context.cwd, {
-			onClose: () => this.callbacks.onCancel(),
-			onBundlesChanged: () => this.callbacks.onPluginsChanged?.(),
-		});
+		this.#gjcBundleComponent = new GjcBundleSettingsComponent(
+			this.context.cwd,
+			{
+				onClose: () => this.callbacks.onCancel(),
+				onBundlesChanged: () => this.callbacks.onPluginsChanged?.(),
+			},
+			{
+				runtimeSnapshotProvider: this.context.gjcRuntimeSnapshot,
+				activationGeneration: this.context.gjcActivationGeneration,
+			},
+		);
 		this.addChild(this.#gjcBundleComponent);
 	}
 

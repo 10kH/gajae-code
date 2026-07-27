@@ -10,6 +10,7 @@ import { resolveOrDefaultProjectRegistryPath } from "../discovery/helpers";
 import {
 	applyGjcBundleUpdate,
 	bundleIdentity,
+	type GjcBundleIdentity,
 	type GjcBundleSummary,
 	GjcPluginLoadError,
 	getGjcBundle,
@@ -346,6 +347,25 @@ async function handleGjcUpgrade(name: string, flags: PluginCommandArgs["flags"])
 		process.exit(3);
 	};
 
+	// Source re-resolution can throw with a cause carrying the raw locator, so
+	// the whole flow reports a stable code instead of the underlying error.
+	try {
+		await runGjcUpgrade(ctx, identity, name, scope, flags, emitError);
+	} catch (err) {
+		const reason = err instanceof GjcPluginLoadError ? err.code : "upgrade_failed";
+		console.error(chalk.red(`${theme.status.error} Failed to upgrade GJC bundle ${name} (${reason})`));
+		process.exit(1);
+	}
+}
+
+async function runGjcUpgrade(
+	ctx: { cwd: string },
+	identity: GjcBundleIdentity,
+	name: string,
+	scope: "user" | "project",
+	flags: PluginCommandArgs["flags"],
+	emitError: (error: { code: string; message: string; recovery?: string }) => never,
+): Promise<void> {
 	const preview = await previewGjcBundleUpdate(ctx, identity);
 	if (!preview.ok) emitError(preview.error);
 	else if (flags.dryRun || !preview.value.changed) {
@@ -479,7 +499,9 @@ async function handleInstall(
 		if (await isGjcPluginBundleSource(spec)) {
 			if (flags.user === flags.project) {
 				console.error(
-					chalk.red(`GJC plugin bundle install requires exactly one of --user or --project for "${spec}".`),
+					// The spec can carry credentials or an absolute home path, so name
+					// the missing flag instead of echoing it back.
+					chalk.red("GJC plugin bundle install requires exactly one of --user or --project."),
 				);
 				process.exit(1);
 			}
