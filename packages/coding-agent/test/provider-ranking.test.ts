@@ -89,6 +89,40 @@ describe("famous provider list", () => {
 	test("the list has no duplicates", () => {
 		expect(new Set(FAMOUS_PROVIDER_ORDER).size).toBe(FAMOUS_PROVIDER_ORDER.length);
 	});
+
+	test("matches the agreed curated order exactly", () => {
+		// Written out independently of FAMOUS_PROVIDER_ORDER so an accidental
+		// reorder or removal of the constant cannot validate itself.
+		const agreedOrder = [
+			"openai-codex",
+			"openai-codex-device",
+			"anthropic",
+			"xai",
+			"opencode-go",
+			"zai",
+			"glm-zcode",
+			"alibaba-token-plan",
+			"qwen-portal",
+			"kimi-code",
+			"moonshot",
+			"minimax-code",
+			"minimax-code-cn",
+			"xiaomi",
+			"xiaomi-token-plan-sgp",
+			"xiaomi-token-plan-ams",
+			"xiaomi-token-plan-cn",
+			"opengateway",
+			"github-copilot",
+			"cursor",
+		];
+		expect([...FAMOUS_PROVIDER_ORDER]).toEqual(agreedOrder);
+
+		// The same order must survive an actual sort of shuffled input.
+		const shuffled = [...agreedOrder]
+			.reverse()
+			.map((id, index) => provider(id, "none", `Label ${String(index).padStart(2, "0")}`));
+		expect(sortRankedProviders(shuffled).map(entry => entry.id)).toEqual(agreedOrder);
+	});
 });
 
 describe("compareRankedProviders", () => {

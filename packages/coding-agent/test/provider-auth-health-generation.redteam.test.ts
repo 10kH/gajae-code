@@ -224,7 +224,6 @@ describe("generation-scoped provider auth health", () => {
 
 	test("returns undefined for a storage with no recorded entries", async () => {
 		const authStorage = await createAuthStorage();
-		expect(() => getProviderAuthHealth(authStorage, "never-recorded")).not.toThrow();
 		expect(getProviderAuthHealth(authStorage, "never-recorded")).toBeUndefined();
 	});
 });
