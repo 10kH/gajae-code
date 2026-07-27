@@ -269,16 +269,31 @@ export function resolveAzureConfigForTest(
 	return resolveAzureConfig(model, options);
 }
 
+/**
+ * Azure API key for the client, from trusted environment sources only.
+ *
+ * `$env` merges the caller's `cwd/.env`, so reading the key there would let
+ * repository content supply the credential this client authenticates with.
+ * Provider credentials are resolved from the launching shell plus GJC/user-owned
+ * `.env` files, never the project `.env` — this fallback now matches that rule.
+ */
+function resolveAzureClientApiKey(apiKey: string): string | undefined {
+	if (apiKey) return apiKey;
+	return $credentialEnv("AZURE_OPENAI_API_KEY");
+}
+
+/** Test seam: the client API key as resolved from a caller value plus trusted env. */
+export function resolveAzureClientApiKeyForTest(apiKey: string): string | undefined {
+	return resolveAzureClientApiKey(apiKey);
+}
 function createClient(model: Model<"azure-openai-responses">, apiKey: string, options?: AzureOpenAIResponsesOptions) {
-	if (!apiKey) {
-		const envKey = $env.AZURE_OPENAI_API_KEY;
-		if (!envKey) {
-			throw new Error(
-				"Azure OpenAI API key is required. Set AZURE_OPENAI_API_KEY environment variable or pass it as an argument.",
-			);
-		}
-		apiKey = envKey;
+	const resolvedApiKey = resolveAzureClientApiKey(apiKey);
+	if (!resolvedApiKey) {
+		throw new Error(
+			"Azure OpenAI API key is required. Set AZURE_OPENAI_API_KEY environment variable or pass it as an argument.",
+		);
 	}
+	apiKey = resolvedApiKey;
 
 	const headers = { ...(model.headers ?? {}) };
 
