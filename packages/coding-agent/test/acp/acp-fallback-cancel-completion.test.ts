@@ -288,8 +288,12 @@ describe("ACP request failure codes", () => {
 		expect(requestError.code).toBe(-32602);
 	});
 
-	it("maps ACP connection-boundary failures through the request-error proxy", async () => {
-		const initialize = spyOn(AcpAgent.prototype, "initialize").mockImplementation(() => {
+	// The proxy has two arms: a synchronous `try/catch` and a `.catch` on a returned
+	// Promise. Every real agent method is `async`, so the Promise arm is the production
+	// path — a sync throw would leave it unproven and a deleted `.catch` would still
+	// look green here.
+	it("maps rejected connection-boundary promises through the request-error proxy", async () => {
+		const initialize = spyOn(AcpAgent.prototype, "initialize").mockImplementation(async () => {
 			throw new AcpSdkAdapterError("authentication_failed", "authenticate first");
 		});
 		const clientToAgent = new TransformStream();
@@ -310,6 +314,38 @@ describe("ACP request failure codes", () => {
 				code: -32000,
 				data: { code: "authentication_failed" },
 			});
+		} finally {
+			initialize.mockRestore();
+			const closeConnection = (connection: unknown): void => {
+				(connection as { connection: { close(error?: Error): void } }).connection.close();
+			};
+			closeConnection(clientConnection);
+			closeConnection(serverConnection);
+			await Promise.allSettled([clientConnection.closed, serverConnection.closed]);
+		}
+	});
+
+	// A second code over the same async arm, so the wire proof is not a single-value
+	// coincidence: `invalid_input` must reach the client as `-32602`, not `-32000`.
+	it("maps a rejected invalid-input promise to invalid-params on the wire", async () => {
+		const initialize = spyOn(AcpAgent.prototype, "initialize").mockRejectedValue(
+			new AcpSdkAdapterError("invalid_input", "protocolVersion is required"),
+		);
+		const clientToAgent = new TransformStream();
+		const agentToClient = new TransformStream();
+		const clientConnection = new ClientSideConnection(
+			() => new TestClient(),
+			ndJsonStream(clientToAgent.writable, agentToClient.readable),
+		);
+		const serverConnection = createAcpConnection(ndJsonStream(agentToClient.writable, clientToAgent.readable));
+
+		try {
+			const error = await clientConnection
+				.initialize({ protocolVersion: 1, clientCapabilities: {} })
+				.catch((reason: unknown) => reason);
+
+			expect(error).toBeInstanceOf(RequestError);
+			expect(error).toMatchObject({ code: -32602, data: { code: "invalid_input" } });
 		} finally {
 			initialize.mockRestore();
 			const closeConnection = (connection: unknown): void => {
