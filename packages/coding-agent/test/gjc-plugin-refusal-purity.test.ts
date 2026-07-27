@@ -36,12 +36,25 @@ async function mkProjectCwd(): Promise<string> {
 	return cwd;
 }
 
-async function treeOf(root: string): Promise<string[]> {
+/**
+ * Existence- and metadata-sensitive snapshot. A plain entry listing cannot
+ * distinguish a missing root from an empty one, and acquiring a scope lock
+ * creates the root and mutates its mtime without changing the entry list.
+ */
+async function treeOf(root: string): Promise<string> {
 	try {
+		const stat = await fs.stat(root);
 		const entries = await fs.readdir(root, { withFileTypes: true, recursive: true });
-		return entries.map(entry => path.join(entry.parentPath ?? root, entry.name)).sort();
+		const rows = await Promise.all(
+			entries.map(async entry => {
+				const full = path.join(entry.parentPath ?? root, entry.name);
+				const child = await fs.stat(full);
+				return `${path.relative(root, full)}:${child.isDirectory() ? "d" : "f"}:${child.size}`;
+			}),
+		);
+		return `present:${stat.mtimeMs}:${rows.sort().join("|")}`;
 	} catch {
-		return [];
+		return "absent";
 	}
 }
 
@@ -72,6 +85,42 @@ describe("GJC bundle refusal purity", () => {
 		expect(refused.ok).toBe(false);
 
 		expect(await treeOf(userRoot)).toEqual(beforeUser);
+	});
+
+	test("a refused install never creates the untargeted opposite-scope root", async () => {
+		const cwd = await mkProjectCwd();
+		const userRoot = path.join(agentDir, "gjc-plugins");
+		// Install ONLY into project, so the user scope was never a target. A prior
+		// successful install must not be what creates the user root, otherwise the
+		// refusal check below is vacuous.
+		expect((await installGjcBundle({ cwd }, "project", sixSurface)).ok).toBe(true);
+		expect(await treeOf(userRoot)).toBe("absent");
+
+		const refused = await installGjcBundle({ cwd }, "project", sixSurface);
+		expect(refused).toMatchObject({ ok: false, error: { code: "already_installed_use_upgrade" } });
+
+		// Acquiring the opposite-scope lock would have created this root.
+		expect(await treeOf(userRoot)).toBe("absent");
+	});
+
+	test("a refused install does not depend on the source being resolvable", async () => {
+		const cwd = await mkProjectCwd();
+		expect((await installGjcBundle({ cwd }, "project", sixSurface)).ok).toBe(true);
+		const scopeRoot = path.join(cwd, ".gjc", "gjc-plugins");
+		const before = await treeOf(scopeRoot);
+
+		// A copy that declares the same name but is otherwise broken must still be
+		// refused with the create-only error, not a compile/resolve failure.
+		const broken = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-refusal-broken-"));
+		tempDirs.push(broken);
+		await fs.writeFile(
+			path.join(broken, "gajae-plugin.json"),
+			JSON.stringify({ name: "valid-six-surface-bundle", version: "9.9.9" }),
+		);
+
+		const refused = await installGjcBundle({ cwd }, "project", broken);
+		expect(refused).toMatchObject({ ok: false, error: { code: "already_installed_use_upgrade" } });
+		expect(await treeOf(scopeRoot)).toBe(before);
 	});
 
 	test("a git ref is preserved when rebuilding the stored locator", () => {

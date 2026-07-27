@@ -1,3 +1,5 @@
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { type GjcBundleTransactionDecision, resolveGjcBundleCandidate, runGjcBundleTransaction } from "./installer";
 import {
 	activationFingerprint,
@@ -28,6 +30,7 @@ import type {
 	GjcUpdateApplyResult,
 	GjcUpdatePreview,
 } from "./types";
+import { GJC_PLUGIN_MANIFEST_FILENAME } from "./types";
 
 /**
  * GJC bundle lifecycle service.
@@ -225,6 +228,30 @@ function notInstalled(identity: GjcBundleIdentity): GjcLifecycleError {
 	);
 }
 
+function alreadyInstalled(name: string, scope: GjcPluginScope): GjcLifecycleError {
+	return fail(
+		"already_installed_use_upgrade",
+		`GJC bundle "${name}" is already installed in the ${scope} scope`,
+		`gjc plugin upgrade ${name} --${scope}`,
+	);
+}
+
+/**
+ * Bundle name declared by a local path source, without resolving or compiling
+ * it. Returns undefined for remote sources and for anything unreadable, so the
+ * caller falls through to the transaction's own preflight.
+ */
+async function declaredBundleName(source: string): Promise<string | undefined> {
+	try {
+		const manifest = await fs.readFile(path.join(source, GJC_PLUGIN_MANIFEST_FILENAME), "utf8");
+		const parsed: unknown = JSON.parse(manifest);
+		const name = (parsed as { name?: unknown }).name;
+		return typeof name === "string" && name.length > 0 ? name : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 /**
  * Fresh install only. An existing target in the same scope is create-only and
  * is refused identically with or without force; upgrading is a separate,
@@ -235,6 +262,17 @@ export async function installGjcBundle(
 	scope: GjcPluginScope,
 	source: string,
 ): Promise<GjcLifecycleResult<GjcInstallResult>> {
+	// A create-only refusal must not depend on the source being reachable, so
+	// resolve the identity from a path source before touching the network or
+	// the filesystem. Non-path sources still refuse inside the transaction,
+	// which preflights before acquiring any lock.
+	const declared = await declaredBundleName(source);
+	if (declared) {
+		const registry = await readRegistry(scope, ctx.cwd);
+		const existing = registry.plugins.find(p => p.name === declared);
+		if (existing) return { ok: false, error: alreadyInstalled(existing.name, scope) };
+	}
+
 	const result = await runGjcBundleTransaction(source, {
 		scope,
 		cwd: ctx.cwd,

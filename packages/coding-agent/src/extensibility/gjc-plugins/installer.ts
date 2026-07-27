@@ -367,6 +367,34 @@ export async function runGjcBundleTransaction(
 		const root = scopeRoot(options.scope, options.cwd);
 		const finalDir = path.join(root, dirName);
 
+		// Lock-free refusal preflight. Acquiring a scope lock creates the scope
+		// root and mutates directory metadata, so a create-only refusal must be
+		// decided before any lock is taken; otherwise "zero mutation" is false.
+		// The locked decision below re-checks, so this is an early-out only.
+		const preflightTarget = await readRegistry(options.scope, options.cwd);
+		const preexisting = preflightTarget.plugins.find(p => p.name === bundle.name);
+		if (preexisting) {
+			// The decision may compare a cross-scope fingerprint, so it must see the
+			// same complete universe the locked decision sees.
+			const preflightOther = await readRegistry(options.scope === "user" ? "project" : "user", options.cwd);
+			const early = await options.decide({
+				targetRegistry: preflightTarget,
+				effective: sortRegistryEntries([...preflightTarget.plugins, ...preflightOther.plugins]),
+				existing: preexisting,
+				bundle,
+				candidate: bundleToRegistryEntry(
+					bundle,
+					finalDir,
+					options.scope,
+					resolved.source,
+					new Date().toISOString(),
+				),
+			});
+			// Only an abort is honoured here; everything else is re-decided under
+			// the lock, so this can never short-circuit a commit.
+			if (early.kind === "abort") return { status: "aborted", error: early.error, remnants: [] };
+		}
+
 		const critical = async (): Promise<GjcBundleTransactionResult> => {
 			// Read-only until the policy decision resolves. A refusal must not create
 			// the scope root or sweep orphans, so an existing-target refusal leaves
@@ -437,9 +465,13 @@ export async function runGjcBundleTransaction(
 			}
 		};
 
-		// Both scopes are read for the cross-scope decision, so both locks are held
-		// in a fixed user->project order regardless of which scope commits.
-		return await withRegistryLock("user", options.cwd, () => withRegistryLock("project", options.cwd, critical));
+		// Only the committing scope is locked. Acquiring the opposite scope's lock
+		// would create that scope's root even when it is never written, breaking
+		// the zero-mutation guarantee for refusals. The opposite scope is only
+		// read, and registry writes are atomic (temp + rename), so an unlocked
+		// read still observes a consistent snapshot; cross-scope drift between
+		// preview and apply is caught by the decision-context fingerprint.
+		return await withRegistryLock(options.scope, options.cwd, critical);
 	} finally {
 		await resolved.cleanup();
 	}
