@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Process, ProcessStatus } from "@gajae-code/natives";
 import type { Subprocess } from "bun";
-import { $env, $pickflag, filterProcessEnv } from "./env";
+import { $pickCredentialEnv, $pickflag, filterProcessEnv } from "./env";
 import { $which } from "./which";
 
 export interface ShellConfig {
@@ -78,9 +78,16 @@ function getShellArgs(): string[] {
 
 /**
  * Get shell prefix for wrapping commands (profilers, strace, etc.).
+ *
+ * Resolved from trusted sources only. The prefix is interpolated ahead of every
+ * bash command (`${prefix} ${command}`) and executed through the shell, so it is
+ * an arbitrary-command-execution surface. `$env` merges the caller's
+ * `cwd/.env`, which means repository content could otherwise set it; resolution
+ * therefore goes through the non-project resolver (launching shell plus
+ * GJC/user-owned `.env` files), matching how provider credentials are resolved.
  */
 function getShellPrefix(): string | undefined {
-	return $env.PI_SHELL_PREFIX || $env.CLAUDE_CODE_SHELL_PREFIX;
+	return $pickCredentialEnv("PI_SHELL_PREFIX", "CLAUDE_CODE_SHELL_PREFIX");
 }
 
 /**
