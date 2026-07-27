@@ -9707,29 +9707,34 @@ export class AgentSession {
 				this.#closeAllProviderSessions("session reload");
 			}
 
-			// Restore model if saved
-			const defaultModelStr = sessionContext.models.default;
-			if (defaultModelStr) {
-				const slashIdx = defaultModelStr.indexOf("/");
-				if (slashIdx > 0) {
+			// Restore model if saved, unless the user configured resumed sessions to
+			// prefer the currently configured default model instead.
+			const resumeModelBehavior = this.settings.get("session.resumeModelBehavior");
+			const availableModels = this.#modelRegistry.getAvailable();
+			let match: Model | undefined;
+			if (resumeModelBehavior === "useCurrentDefault") {
+				match = this.#resolveRoleModelFull("default", availableModels, undefined).model;
+			} else {
+				const defaultModelStr = sessionContext.models.default;
+				const slashIdx = defaultModelStr?.indexOf("/") ?? -1;
+				if (defaultModelStr && slashIdx > 0) {
 					const provider = defaultModelStr.slice(0, slashIdx);
 					const modelId = defaultModelStr.slice(slashIdx + 1);
-					const availableModels = this.#modelRegistry.getAvailable();
-					const match = availableModels.find(m => m.provider === provider && m.id === modelId);
-					if (match) {
-						const currentModel = this.model;
-						const shouldResetProviderState =
-							switchingToDifferentSession ||
-							(currentModel !== undefined &&
-								(currentModel.provider !== match.provider ||
-									currentModel.id !== match.id ||
-									currentModel.api !== match.api));
-						if (shouldResetProviderState) {
-							this.#setModelWithProviderSessionReset(match);
-						} else {
-							this.agent.setModel(match);
-						}
-					}
+					match = availableModels.find(m => m.provider === provider && m.id === modelId);
+				}
+			}
+			if (match) {
+				const currentModel = this.model;
+				const shouldResetProviderState =
+					switchingToDifferentSession ||
+					(currentModel !== undefined &&
+						(currentModel.provider !== match.provider ||
+							currentModel.id !== match.id ||
+							currentModel.api !== match.api));
+				if (shouldResetProviderState) {
+					this.#setModelWithProviderSessionReset(match);
+				} else {
+					this.agent.setModel(match);
 				}
 			}
 

@@ -385,6 +385,21 @@ export const SETTINGS_SCHEMA = {
 			options: "runtime",
 		},
 	},
+	"session.resumeModelBehavior": {
+		type: "enum",
+		values: ["keepSessionModel", "useCurrentDefault"] as const,
+		default: "keepSessionModel",
+		ui: {
+			tab: "model",
+			label: "Resume Model Behavior",
+			description:
+				"When resuming a session: keep the model that session last used, or switch to the currently configured default model.",
+			options: [
+				{ value: "keepSessionModel", label: "Keep session's saved model" },
+				{ value: "useCurrentDefault", label: "Use current default model" },
+			],
+		},
+	},
 
 	modelTags: { type: "record", default: EMPTY_MODEL_TAGS_RECORD },
 

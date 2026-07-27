@@ -1019,9 +1019,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let model = options.model;
 	let modelFallbackMessage: string | undefined;
 	// If session has data, try to restore model from it.
-	// Skip restore when an explicit model was requested.
+	// Skip restore when an explicit model was requested, or when the user configured
+	// resumed sessions to prefer the currently configured default model instead.
+	const resumeModelBehavior = settings.get("session.resumeModelBehavior");
 	const defaultModelStr = existingSession.models.default;
-	if (!hasExplicitModel && !model && hasExistingSession && defaultModelStr) {
+	if (
+		!hasExplicitModel &&
+		!model &&
+		hasExistingSession &&
+		defaultModelStr &&
+		resumeModelBehavior !== "useCurrentDefault"
+	) {
 		await logger.time("restoreSessionModel", async () => {
 			const parsedModel = parseModelString(defaultModelStr);
 			if (parsedModel) {
