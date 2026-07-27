@@ -2910,17 +2910,17 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 while generation 33 adds replay-safe multi-select state", () => {
-		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		// Generation 32 adds sound-policy configuration and delivery; generation
-		// 33 adds action-bound multi-select state without changing the wire protocol.
-		expect(DAEMON_GENERATION).toBe(34);
-	});
 	test("keeps wire protocol 3 while generation 34 converts non-photo images to photos", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
 		// Generation 33 adds replay-safe multi-select state; generation 34 converts
 		// non-photo image formats into Telegram photo uploads when possible.
-		expect(DAEMON_GENERATION).toBe(34);
+		expect(DAEMON_GENERATION).toBe(35);
+	});
+	test("keeps wire protocol 3 while generation 35 adds topic-adoption folder picker", () => {
+		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
+		// Generation 34 converts non-photo images to photos; generation 35 adds
+		// the user-topic adoption folder picker without changing the wire protocol.
+		expect(DAEMON_GENERATION).toBe(35);
 	});
 	test.each([
 		"1",
