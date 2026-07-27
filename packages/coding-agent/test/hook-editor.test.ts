@@ -77,6 +77,10 @@ function createControllerContext() {
 		editor,
 		editorContainer,
 		ui,
+		restoreComposer() {
+			editorContainer.clear();
+			editorContainer.addChild(editor);
+		},
 		hookEditor: undefined,
 	} as unknown as TestContext;
 
@@ -245,7 +249,7 @@ describe("HookEditorComponent prompt-style mode", () => {
 		}
 	});
 
-	it("treats Ctrl+Enter as newline in prompt-style mode", () => {
+	it("submits on Ctrl+Enter in prompt-style mode", () => {
 		const onSubmit = vi.fn();
 		const onCancel = vi.fn();
 		const component = new HookEditorComponent(createTui(), "Prompt", undefined, onSubmit, onCancel, {
@@ -255,13 +259,9 @@ describe("HookEditorComponent prompt-style mode", () => {
 		component.handleInput("x");
 		component.handleInput("\x1b[13;5u");
 
-		expect(onSubmit).not.toHaveBeenCalled();
-
-		component.handleInput("y");
-		component.handleInput("\r");
-
 		expect(onSubmit).toHaveBeenCalledTimes(1);
-		expect(onSubmit).toHaveBeenCalledWith("x\ny");
+		expect(onSubmit).toHaveBeenCalledWith("x");
+		expect(onCancel).not.toHaveBeenCalled();
 	});
 
 	it("renders prompt-style editor with legacy ask chrome", () => {
@@ -427,5 +427,28 @@ describe("ExtensionUiController hook editor abort", () => {
 		ctx.hookSelector!.handleInput("\n");
 		expect(await promise).toBe("Alpha");
 		expect(ui.terminal.write).not.toHaveBeenCalledWith("\x1b[?1000l\x1b[?1006l");
+	});
+
+	it("restores the composer via the pet-aware restoreComposer when available", async () => {
+		const { ctx, editor, editorContainer, ui } = createControllerContext();
+		// Simulate InteractiveMode's pet-aware restore: re-mounts the framed editor
+		// (pet reserve intact) instead of the bare editor.
+		const framedEditor = { id: "pet-framed-editor" };
+		const restoreComposer = vi.fn(() => {
+			editorContainer.clear();
+			editorContainer.addChild(framedEditor);
+		});
+		ctx.restoreComposer = restoreComposer;
+		const controller = new ExtensionUiController(ctx);
+
+		const promise = controller.showHookSelector("Pick one", ["Alpha", "Beta"]);
+		expect(ctx.hookSelector).toBeDefined();
+
+		ctx.hookSelector!.handleInput("\n");
+		expect(await promise).toBe("Alpha");
+
+		expect(restoreComposer).toHaveBeenCalledTimes(1);
+		expect(editorContainer.children).toEqual([framedEditor]);
+		expect(ui.setFocus).toHaveBeenLastCalledWith(editor);
 	});
 });

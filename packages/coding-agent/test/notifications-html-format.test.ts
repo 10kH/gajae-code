@@ -10,13 +10,14 @@ import {
 	escapeHtml,
 	markdownToTelegramHtml,
 	numberedOptionList,
+	splitTelegramHtml,
 	TELEGRAM_MESSAGE_LIMIT,
 	TELEGRAM_PARSE_MODE,
 	truncateTelegramHtml,
-} from "../src/notifications/html-format";
-import { TelegramNotificationDaemon } from "../src/notifications/telegram-daemon";
-import { buildActionMessage } from "../src/notifications/telegram-reference";
-import { formatIdentityHeader, renderThreadedFrame } from "../src/notifications/threaded-render";
+} from "../src/sdk/bus/html-format";
+import { TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
+import { buildActionMessage } from "../src/sdk/bus/telegram-reference";
+import { formatIdentityHeader, renderThreadedFrame } from "../src/sdk/bus/threaded-render";
 
 describe("escapeHtml (AC2)", () => {
 	test("escapes & < > and escapes & first", () => {
@@ -26,9 +27,10 @@ describe("escapeHtml (AC2)", () => {
 });
 
 describe("markdownToTelegramHtml (AC5)", () => {
-	test("bold and italic", () => {
+	test("bold, italic, and strikethrough", () => {
 		expect(markdownToTelegramHtml("**hi**")).toBe("<b>hi</b>");
 		expect(markdownToTelegramHtml("*hi*")).toBe("<i>hi</i>");
+		expect(markdownToTelegramHtml("~~hi~~")).toBe("<s>hi</s>");
 	});
 
 	test("inline and fenced code escape their contents and are not re-parsed", () => {
@@ -61,6 +63,21 @@ describe("markdownToTelegramHtml (AC5)", () => {
 	test("GFM tables render as an aligned monospace <pre> block", () => {
 		const md = "| Name | Age |\n| --- | ---: |\n| Alice | 30 |\n| Bob | 1 |";
 		expect(markdownToTelegramHtml(md)).toBe("<pre>Name  | Age\n------|----\nAlice |  30\nBob   |   1</pre>");
+	});
+
+	test("wide GFM tables render as stacked records for narrow Telegram clients", () => {
+		const md =
+			"| 공식 | 표현 |\n| --- | --- |\n| 이차방정식 근의 공식 | \\\\(x=\\\\frac{-b\\\\pm\\\\sqrt{b^2-4ac}}{2a}\\\\) |";
+		expect(markdownToTelegramHtml(md)).toBe(
+			"<b>공식</b>: 이차방정식 근의 공식\n<b>표현</b>: \\\\(x=\\\\frac{-b\\\\pm\\\\sqrt{b^2-4ac}}{2a}\\\\)",
+		);
+	});
+	test("wide header-only GFM tables retain their grid", () => {
+		const header = "This header is intentionally wider than forty-two columns";
+		const html = markdownToTelegramHtml(`| ${header} |\n| --- |`);
+
+		expect(html).toContain(`<pre>${header}\n`);
+		expect(html).toContain(`${"-".repeat(header.length)}</pre>`);
 	});
 
 	test("table cell content is escaped and not re-parsed as markup", () => {
@@ -100,6 +117,45 @@ describe("truncateTelegramHtml (AC7)", () => {
 		expect(out.length).toBeLessThanOrEqual(18);
 		expect(out).not.toMatch(/&amp$/);
 		expect(out).not.toMatch(/&$/);
+	});
+});
+
+describe("splitTelegramHtml", () => {
+	test("chunks long plain text below Telegram limit without dropping content", () => {
+		const raw = "a".repeat(TELEGRAM_MESSAGE_LIMIT + 25);
+		const chunks = splitTelegramHtml(raw);
+		expect(chunks).toHaveLength(2);
+		expect(chunks.every(chunk => chunk.length <= TELEGRAM_MESSAGE_LIMIT)).toBe(true);
+		expect(chunks.join("")).toBe(raw);
+	});
+
+	test("does not split HTML tags or entities and reopens preformatted blocks", () => {
+		const body = `<pre>${"x".repeat(40)}&amp;${"y".repeat(40)}</pre>`;
+		const chunks = splitTelegramHtml(body, 35);
+		expect(chunks.length).toBeGreaterThan(1);
+		expect(chunks.every(chunk => chunk.length <= 35)).toBe(true);
+		expect(chunks.every(chunk => !chunk.includes("&amp") || chunk.includes("&amp;"))).toBe(true);
+		expect(chunks.every(chunk => chunk.startsWith("<pre>") && chunk.endsWith("</pre>"))).toBe(true);
+	});
+
+	test("preserves opening tag attributes when reopening chunks", () => {
+		const body = `<a href="https://example.com/${"x".repeat(20)}">${"label".repeat(20)}</a>`;
+		const chunks = splitTelegramHtml(body, 70);
+		expect(chunks.length).toBeGreaterThan(1);
+		expect(chunks.every(chunk => chunk.length <= 70)).toBe(true);
+		expect(chunks.every(chunk => !chunk.startsWith("<a>") && !chunk.includes("<a>"))).toBe(true);
+		expect(chunks.filter(chunk => chunk.startsWith("<a ")).length).toBeGreaterThan(1);
+	});
+
+	test("degrades oversized anchor tags instead of emitting over-limit chunks", () => {
+		const url = `https://example.com/${"x".repeat(TELEGRAM_MESSAGE_LIMIT + 100)}`;
+		const chunks = splitTelegramHtml(`<a href="${url}">label</a>`);
+
+		expect(chunks.length).toBeGreaterThan(0);
+		expect(chunks.every(chunk => chunk.length <= TELEGRAM_MESSAGE_LIMIT)).toBe(true);
+		expect(chunks.join("")).toBe("label");
+		expect(chunks.join("")).not.toContain("<a");
+		expect(chunks.join("")).not.toContain("</a>");
 	});
 });
 
@@ -237,19 +293,26 @@ class CapturingBotApi {
 	calls: Array<{ method: string; body: any }> = [];
 	async call(method: string, body: unknown): Promise<unknown> {
 		this.calls.push({ method, body });
+		if (method === "getChat")
+			return { ok: true, result: { id: (body as { chat_id?: unknown } | null)?.chat_id, type: "private" } };
 		if (method === "createForumTopic") return { ok: true, result: { message_thread_id: this.calls.length } };
 		if (method === "sendMessage") return { ok: true, result: { message_id: this.calls.length } };
 		return { ok: true, result: true };
 	}
 }
 
-function makeDaemon(bot: CapturingBotApi, agentDir: string): TelegramNotificationDaemon {
+function makeDaemon(
+	bot: CapturingBotApi,
+	agentDir: string,
+	rich: { enabled: boolean } = { enabled: false },
+): TelegramNotificationDaemon {
 	return new TelegramNotificationDaemon({
 		settings: isolatedSettings(agentDir),
 		ownerId: "owner",
 		botToken: "tok",
 		chatId: "42",
 		botApi: bot as any,
+		rich,
 	});
 }
 
@@ -274,6 +337,39 @@ describe("daemon send sites force parse_mode HTML (AC1)", () => {
 		});
 		const send = bot.calls.find(c => c.method === "sendMessage");
 		expect(send?.body.parse_mode).toBe(TELEGRAM_PARSE_MODE);
+	});
+
+	test("long turn_stream sendMessage is split in order", async () => {
+		const bot = new CapturingBotApi();
+		const daemon = makeDaemon(bot, Bun.env.TMPDIR ?? "/tmp");
+		await daemon.handleSessionMessage(fakeSession() as any, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		});
+		const raw = "a".repeat(TELEGRAM_MESSAGE_LIMIT + 25);
+		await daemon.handleSessionMessage(fakeSession() as any, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: raw,
+		});
+		// The split is scheduled through the rate-limit pool: the first chunk is
+		// sent on the granted slot and the continuation is re-queued, so a follow-up
+		// flush drains it (one send per token — no single-slot burst).
+		await daemon.handleSessionMessage(fakeSession() as any, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: "tail",
+		});
+		const texts = bot.calls
+			.filter(c => c.method === "sendMessage" && c.body.text?.startsWith("a"))
+			.map(c => String(c.body.text));
+		expect(texts).toHaveLength(2);
+		expect(texts.every(text => text.length <= TELEGRAM_MESSAGE_LIMIT)).toBe(true);
+		expect(texts.join("")).toBe(raw);
 	});
 
 	test("image_attachment sendPhoto sets parse_mode", async () => {

@@ -2,6 +2,69 @@
 
 ## [Unreleased]
 
+## [0.11.11] - 2026-07-26
+### Added
+
+- Added the `probeWindowsJobMemory` native API for advisory Windows Job Object memory-limit and usage snapshots.
+
+## [0.11.8] - 2026-07-23
+### Fixed
+
+- No-replace publication now reports dedicated mutation certainty and bounded diagnostics, and retained Linux publication syncs every distinct rename parent without short-circuiting after a failure (#2804).
+
+## [0.11.5] - 2026-07-20
+### Added
+- `Process.signalRoot` exposes stable root-only process signaling, and identity-bound exact unlink reports stale quarantines, live successors, and retained internal exchange-placeholder cleanup paths as distinct recovery evidence.
+- Added Linux-only descriptor-relative recovery filesystem authority with no-follow trusted-root stat, bounded read, exclusive create, no-replace install, fsync, and stable identity operations. Unsupported platforms and unsafe traversal, symlink, special-file, hard-link, oversized-content, or identity-swap evidence fail closed (#2681).
+- Linux owner-only path security now treats only definitive `ENOTSUP`/`EOPNOTSUPP` results from the exact POSIX ACL operation as proof that ACL storage is unsupported, while preserving descriptor-relative no-follow traversal, ownership, exact mode, type, identity, replacement, and fail-closed error checks for files and directories (#2687).
+
+## [0.11.2] - 2026-07-19
+
+### Fixed
+
+- The compiled-binary embedded-addon loader now re-extracts a cached native when its byte size does not match the embedded payload, so an intra-version rebuild that adds or removes native exports can no longer be shadowed by a stale same-version extraction in the per-version cache. The version sentinel alone cannot detect intra-version drift.
+
+## [0.11.0] - 2026-07-15
+
+### Fixed
+
+- Prefer a source-workspace native addon over optional platform packages while validating the current version sentinel on every candidate, so stale local or optional binaries fall through with actionable diagnostics instead of shadowing the active loader (#2168).
+
+### Added
+
+- Added additive SDK v3 workflow-gate bridge APIs (#2171): `registerWorkflowGateAsk` preserves a required nonempty `workflowGateId`; `registerArbitratedAsk` and `retireIfUnclaimed` support exact in-process presentation arbitration without exposing claims, receipts, epochs, routes, or other authority state. Legacy `registerAsk` remains uncorrelated and source-compatible.
+
+### Changed
+
+- Resolved the SDK v3 workflow-gate shipping classification (#2171): `workflowGateId` and Q12 diagnostics are additive SDK v3 surfaces, while `action_needed.id` remains the transient, generic `reply.id` authority. `expectedSessionId` omission remains accepted and audited for the entire SDK v3 line; new clients must send it, and mandatory enforcement or removal can occur no earlier than SDK v4 only after at least one full published deprecation release/window with deployed-client notice. Explicit session mismatches fail closed before resolution; mismatched sessions, stale/reissued actions, and unsafe ambiguity never regain authority.
+- Documented release pairing: the `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions (currently `0.10.2`), with the native loader version sentinel enforcing the pair. Mixed native/runtime versions are unsupported and cannot claim SDK compatibility.
+
+### Added
+
+- Added native canonical existing-directory identity and fail-closed owner-only path-security APIs. POSIX identity is lossless UTF-8 canonicalization; Windows resolves local final volume-GUID paths, rejects network paths, and applies/verifies TokenUser protected-DACL security without following reparse points (#2177).
+
+## [0.10.0] - 2026-07-12
+### Fixed
+
+- Preserved two-cell terminal width for Hangul Filler (U+3164), VS16 emoji-presentation graphemes, and emoji-modifier sequences while aligning TUI display-width measurement with native wrapping and truncation (#1979).
+- Fixed the native notifications server to capability-gate controlled asks per connection, default-deny until `ask_controls_v1` negotiation (reset on reconnect), and send additive non-actionable `action_unavailable` frames instead of stripped option buttons to non-capable clients (#2029).
+
+### Changed
+
+- Renamed the native notifications SDK crate from `gjc-notifications` to `gjc-sdk` as part of the Gajae-Code SDK rename. Sessions and daemons must restart together across the upgrade because discovery moved from `.gjc/state/notifications/` to `.gjc/state/sdk/` without dual-scan compatibility.
+
+## [0.9.1] - 2026-07-08
+
+### Changed
+
+- Declared the glibc runtime requirement in Linux platform package metadata.
+
+## [0.7.9] - 2026-07-01
+
+### Changed
+
+- Split published prebuilt `.node` artifacts into per-platform optional `@gajae-code/natives-*` packages while keeping `@gajae-code/natives` as the stable loader/types package with legacy local fallback resolution (#1280).
+
 ## [0.7.0] - 2026-06-22
 
 ### Added

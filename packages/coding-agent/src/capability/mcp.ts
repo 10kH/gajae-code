@@ -15,6 +15,8 @@ export interface MCPServer {
 	name: string;
 	/** Whether this server is enabled (default: true) */
 	enabled?: boolean;
+	/** Whether explicit runtime MCP consumers should connect automatically (default: true) */
+	autoload?: boolean;
 	/** Connection timeout in milliseconds */
 	timeout?: number;
 	/** Command to run (for stdio transport) */
@@ -23,6 +25,8 @@ export interface MCPServer {
 	args?: string[];
 	/** Environment variables */
 	env?: Record<string, string>;
+	/** Whether explicit stdio runtime consumers should avoid inheriting host environment */
+	noInheritEnv?: boolean;
 	/** Working directory for stdio transport */
 	cwd?: string;
 	/** URL (for HTTP/SSE transport) */

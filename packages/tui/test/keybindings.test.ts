@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { detectDefaultKeyCollisions, KeybindingsManager, TUI_KEYBINDINGS } from "@gajae-code/tui/keybindings";
+import { isKeyId } from "@gajae-code/tui/keys";
 
 describe("KeybindingsManager", () => {
 	it("does not evict selector confirm when input submit is rebound", () => {
@@ -33,6 +34,58 @@ describe("KeybindingsManager", () => {
 			},
 		]);
 		expect(keybindings.getKeys("tui.editor.cursorLeft")).toEqual(["left", "ctrl+b"]);
+	});
+
+	it("keeps page navigation bindings canonical across manager outputs", () => {
+		const keybindings = new KeybindingsManager(TUI_KEYBINDINGS);
+
+		expect(keybindings.getKeys("tui.editor.pageUp")).toEqual(["pageUp"]);
+		expect(keybindings.getKeys("tui.editor.pageDown")).toEqual(["pageDown"]);
+
+		const resolved = keybindings.getResolvedBindings();
+		expect(resolved["tui.editor.pageUp"]).toBe("pageUp");
+		expect(resolved["tui.editor.pageDown"]).toBe("pageDown");
+		expect(isKeyId(keybindings.getKeys("tui.editor.pageUp")[0]!)).toBe(true);
+		expect(isKeyId(keybindings.getKeys("tui.editor.pageDown")[0]!)).toBe(true);
+		expect(isKeyId(resolved["tui.editor.pageUp"] as string)).toBe(true);
+		expect(isKeyId(resolved["tui.editor.pageDown"] as string)).toBe(true);
+	});
+
+	describe("user binding ownership", () => {
+		it("clones array bindings passed to the constructor", () => {
+			const bindings = { "tui.select.up": ["down"] as ("down" | "up")[] };
+			const keybindings = new KeybindingsManager(TUI_KEYBINDINGS, bindings);
+
+			bindings["tui.select.up"].push("up");
+
+			expect(keybindings.getUserBindings()["tui.select.up"]).toEqual(["down"]);
+			expect(keybindings.getKeys("tui.select.up")).toEqual(["down"]);
+			expect(keybindings.matches("\x1b[B", "tui.select.up")).toBe(true);
+			expect(keybindings.matches("\x1b[A", "tui.select.up")).toBe(false);
+		});
+
+		it("clones array bindings passed to setUserBindings", () => {
+			const keybindings = new KeybindingsManager(TUI_KEYBINDINGS);
+			const bindings = { "tui.select.up": ["down"] as ("down" | "up")[] };
+
+			keybindings.setUserBindings(bindings);
+			bindings["tui.select.up"].push("up");
+
+			expect(keybindings.getUserBindings()["tui.select.up"]).toEqual(["down"]);
+			expect(keybindings.getKeys("tui.select.up")).toEqual(["down"]);
+		});
+
+		it("does not share returned configuration arrays between instances", () => {
+			const bindings = { "tui.select.up": ["down"] as ("down" | "up")[] };
+			const first = new KeybindingsManager(TUI_KEYBINDINGS, bindings);
+			const second = new KeybindingsManager(TUI_KEYBINDINGS, bindings);
+			(first.getUserBindings()["tui.select.up"] as string[]).push("up");
+
+			expect(first.getUserBindings()["tui.select.up"]).toEqual(["down"]);
+			expect(second.getUserBindings()["tui.select.up"]).toEqual(["down"]);
+			expect(first.getKeys("tui.select.up")).toEqual(["down"]);
+			expect(second.getKeys("tui.select.up")).toEqual(["down"]);
+		});
 	});
 });
 

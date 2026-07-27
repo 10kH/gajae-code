@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { filterProcessEnv, parseEnvFile, parseShellEnvFile } from "../src/env";
+import { $flag, $pickenvpos, $pickflag, filterProcessEnv, parseEnvFile, parseShellEnvFile } from "../src/env";
 
 const tempDirs: string[] = [];
 
@@ -315,5 +315,103 @@ describe("filterProcessEnv", () => {
 			"ProgramFiles(x86)": "C:\\Program Files (x86)",
 			"CommonProgramFiles(x86)": "C:\\Program Files (x86)\\Common Files",
 		});
+	});
+});
+
+describe("$flag", () => {
+	const NAME = "__PI_UTILS_FLAG_PROBE";
+	afterEach(() => {
+		delete process.env[NAME];
+	});
+
+	it("treats documented boolean-like values as truthy regardless of case", () => {
+		for (const value of ["1", "true", "TRUE", "True", "yes", "YES", "on", "ON", "y", "Y", " true "]) {
+			process.env[NAME] = value;
+			expect($flag(NAME)).toBe(true);
+		}
+	});
+
+	it("treats non-boolean-like and falsy values as false", () => {
+		for (const value of ["0", "false", "FALSE", "off", "no", "n", "2", "enabled", ""]) {
+			process.env[NAME] = value;
+			expect($flag(NAME)).toBe(false);
+		}
+	});
+
+	it("returns the default when the variable is unset", () => {
+		expect($flag(NAME)).toBe(false);
+		expect($flag(NAME, true)).toBe(true);
+	});
+});
+
+describe("$pickflag", () => {
+	const GJC_NAME = "__GJC_UTILS_PICKFLAG_PROBE";
+	const PI_NAME = "__PI_UTILS_PICKFLAG_PROBE";
+	afterEach(() => {
+		delete process.env[GJC_NAME];
+		delete process.env[PI_NAME];
+	});
+
+	it("prefers the GJC-first key when both are set", () => {
+		process.env[GJC_NAME] = "1";
+		process.env[PI_NAME] = "0";
+		expect($pickflag(GJC_NAME, PI_NAME)).toBe(true);
+	});
+
+	it("lets a falsy GJC value win over a truthy PI value (first set key decides)", () => {
+		process.env[GJC_NAME] = "0";
+		process.env[PI_NAME] = "1";
+		expect($pickflag(GJC_NAME, PI_NAME)).toBe(false);
+	});
+
+	it("falls back to the PI key when the GJC key is unset", () => {
+		process.env[PI_NAME] = "true";
+		expect($pickflag(GJC_NAME, PI_NAME)).toBe(true);
+	});
+
+	it("returns false when neither key is set", () => {
+		expect($pickflag(GJC_NAME, PI_NAME)).toBe(false);
+	});
+
+	it("applies TRUTHY case-insensitive matching per matched key", () => {
+		process.env[GJC_NAME] = "YES";
+		expect($pickflag(GJC_NAME, PI_NAME)).toBe(true);
+		process.env[GJC_NAME] = "enabled";
+		expect($pickflag(GJC_NAME, PI_NAME)).toBe(false);
+	});
+});
+
+describe("$pickenvpos", () => {
+	const GJC_NAME = "__GJC_UTILS_PICKENVPOS_PROBE";
+	const PI_NAME = "__PI_UTILS_PICKENVPOS_PROBE";
+	afterEach(() => {
+		delete process.env[GJC_NAME];
+		delete process.env[PI_NAME];
+	});
+
+	it("prefers a positive GJC-first value when both are set", () => {
+		process.env[GJC_NAME] = "7";
+		process.env[PI_NAME] = "9";
+		expect($pickenvpos([GJC_NAME, PI_NAME], 100)).toBe(7);
+	});
+
+	it("falls back to the PI key when the GJC key is unset", () => {
+		process.env[PI_NAME] = "42";
+		expect($pickenvpos([GJC_NAME, PI_NAME], 100)).toBe(42);
+	});
+
+	it("returns the default when neither key is set", () => {
+		expect($pickenvpos([GJC_NAME, PI_NAME], 100)).toBe(100);
+	});
+
+	it("returns the default when the only set value is invalid", () => {
+		process.env[GJC_NAME] = "not-a-number";
+		expect($pickenvpos([GJC_NAME, PI_NAME], 100)).toBe(100);
+	});
+
+	it("skips a set-but-invalid GJC key and falls through to a valid PI key", () => {
+		process.env[GJC_NAME] = "-5";
+		process.env[PI_NAME] = "3";
+		expect($pickenvpos([GJC_NAME, PI_NAME], 100)).toBe(3);
 	});
 });

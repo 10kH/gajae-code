@@ -1,5 +1,5 @@
 /**
- * Deterministic end-to-end QA of the notifications SDK.
+ * Deterministic end-to-end QA of the Gajae-Code SDK notification transport.
  *
  * Drives the REAL stack — napi `NotificationServer` (Rust WS core) + real
  * WebSocket + the real Telegram reference client — with only Telegram's HTTP API
@@ -8,7 +8,7 @@
  *   registerAsk -> action_needed broadcast -> reference client renders to
  *   (fake) Telegram with an inline keyboard -> button tap (fake getUpdates
  *   callback_query) -> reference client sends `reply` over WS -> server forwards
- *   it to the host (onReply) -> resolveClient -> action_resolved broadcast.
+ *   it to the host (onReply) -> resolveClaim -> action_resolved broadcast.
  */
 
 import { expect, test } from "bun:test";
@@ -17,8 +17,8 @@ import { expect, test } from "bun:test";
 // freshly-built NotificationServer. The relative path targets this workspace's own
 // built `packages/natives/native` (which CI rebuilds), so the e2e exercises the real core.
 import { NotificationServer } from "../../natives/native/index.js";
-import { notificationActionPayload } from "../src/notifications/helpers";
-import { runTelegramReferenceClient } from "../src/notifications/telegram-reference";
+import { notificationActionPayload } from "../src/sdk/bus/helpers";
+import { runTelegramReferenceClient } from "../src/sdk/bus/telegram-reference";
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 function jsonResponse(body: unknown): Response {
@@ -68,26 +68,41 @@ test("e2e: ask -> Telegram -> button tap -> reply -> resolved", async () => {
 	// ---- real server + host gate-resolution simulation ----
 	const stateRoot = `/tmp/notif-e2e-${process.pid}-${Date.now()}`;
 	const srv = new NotificationServer("e2e", "tok", stateRoot, true);
-	let forwarded: { id: string; answerJson: string } | undefined;
+	let forwarded: { id: string; answerJson: string; replyReceiptId: string } | undefined;
+	let forwardedCount = 0;
 	srv.onReply((_err, reply) => {
 		if (!reply) return;
-		forwarded = { id: reply.id, answerJson: reply.answerJson };
+		forwarded = { id: reply.id, answerJson: reply.answerJson, replyReceiptId: reply.replyReceiptId };
+		forwardedCount++;
 		// Simulate the host resolving the real gate, then confirming.
-		srv.resolveClient(reply.id, reply.answerJson, reply.idempotencyKey ?? undefined);
+		srv.resolveClaim(reply.replyReceiptId, reply.answerJson, reply.idempotencyKey ?? undefined);
 	});
 	const ep = await srv.start();
 	expect(ep.url).toContain("ws://127.0.0.1:");
 
 	// ---- real reference client (real WS to the server; fake Telegram) ----
-	const endpointFile = `${stateRoot}/notifications/e2e.json`;
+	const endpointFile = `${stateRoot}/sdk/e2e.json`;
+	let clientError: unknown;
 	const clientDone = runTelegramReferenceClient({
 		botToken: "x",
 		chatId: "1",
 		endpointFile,
 		fetchImpl: fakeFetch,
-	}).catch(() => {});
+	}).catch(error => {
+		clientError = error;
+	});
+	const observer = new WebSocket(`${ep.url}/?token=tok`);
+	let resolvedBroadcast = false;
+	await new Promise<void>((resolve, reject) => {
+		observer.addEventListener("open", () => resolve());
+		observer.addEventListener("error", () => reject(new Error("observer WS error")));
+	});
+	observer.addEventListener("message", event => {
+		const message = JSON.parse(String(event.data)) as { type?: string; id?: string };
+		if (message.type === "action_resolved" && message.id === "qa-ask-1") resolvedBroadcast = true;
+	});
 
-	await waitFor(() => srv.clientCount() >= 1, 4000, "reference client WS connect");
+	await waitFor(() => srv.clientCount() >= 2, 4000, "reference and observer WS connect");
 
 	srv.registerAsk(
 		JSON.stringify({
@@ -109,20 +124,31 @@ test("e2e: ask -> Telegram -> button tap -> reply -> resolved", async () => {
 	await waitFor(() => forwarded !== undefined, 4000, "reply forwarded to host");
 	expect(forwarded?.id).toBe("qa-ask-1");
 	expect(forwarded?.answerJson).toBe("0"); // option index 0 = "Yes"
+	await waitFor(() => resolvedBroadcast, 4000, "resolved broadcast");
+	const callbackData = (askMsg?.reply_markup as { inline_keyboard?: Array<Array<{ callback_data: string }>> })
+		.inline_keyboard?.[0]?.[0]?.callback_data;
+	if (!callbackData) throw new Error("missing callback data");
+	pendingUpdates.push({
+		update_id: updateId++,
+		callback_query: { id: "cq-replay", data: callbackData, message: { chat: { id: 1 } } },
+	});
+	await sleep(100);
+	expect(forwardedCount).toBe(1);
 
 	// idle ping path
 	srv.noteIdle(JSON.stringify({ id: "idle-1", kind: "idle", sessionId: "e2e", summary: "went idle" }));
 	await waitFor(() => sent.some(m => String(m.text).includes("went idle")), 4000, "idle ping delivered");
 
 	srv.stop();
+	observer.close();
 	await clientDone;
+	expect(clientError).toBeUndefined();
 }, 30000);
 
-test("interactive ask answered remotely via answer source (no RPC)", async () => {
-	// Mirrors what the notifications extension's AskAnswerSource does, against the
-	// real server: a pending interactive ask is registered repliable and resolved
-	// by a remote reply mapped to the chosen option label — proving asks can be
-	// answered remotely without RPC/unattended mode.
+test("interactive ask answered remotely via SDK answer source", async () => {
+	// Mirrors the SDK bus AskAnswerSource against the real server: a pending
+	// interactive ask is registered repliable and resolved by a remote SDK reply
+	// mapped to the chosen option label.
 	const stateRoot = `/tmp/notif-e2e-ans-${process.pid}-${Date.now()}`;
 	const srv = new NotificationServer("ans", "tok", stateRoot, true);
 
@@ -133,7 +159,7 @@ test("interactive ask answered remotely via answer source (no RPC)", async () =>
 		if (!p) return;
 		pending.delete(reply.id);
 		const idx = Number(JSON.parse(reply.answerJson));
-		srv.resolveClient(reply.id, reply.answerJson, reply.idempotencyKey ?? undefined);
+		srv.resolveClaim(reply.replyReceiptId, reply.answerJson, reply.idempotencyKey ?? undefined);
 		p.resolve(p.options[idx]);
 	});
 	const ep = await srv.start();
@@ -186,7 +212,7 @@ test("ask frames are exempt from redaction so they stay readable and answerable"
 		if (!reply) return;
 		const idx = Number(JSON.parse(reply.answerJson));
 		resolvedLabel = options[idx];
-		srv.resolveClient(reply.id, reply.answerJson, reply.idempotencyKey ?? undefined);
+		srv.resolveClaim(reply.replyReceiptId, reply.answerJson, reply.idempotencyKey ?? undefined);
 	});
 	const ep = await srv.start();
 	const ws = new WebSocket(`${ep.url}/?token=tok`);
@@ -234,3 +260,155 @@ test("ask frames are exempt from redaction so they stay readable and answerable"
 	ws.close();
 	srv.stop();
 }, 30000);
+
+test("arbitrated native ask lets a generic claim win exactly once over a direct retirement and ignores stale replies", async () => {
+	const sessionId = `arbitrated-${process.pid}-${Date.now()}`;
+	const token = "tok";
+	const srv = new NotificationServer(sessionId, token, `/tmp/${sessionId}`, true);
+	let forwarded: { receiptId: string; answerJson: string } | undefined;
+	let forwardedCount = 0;
+	srv.onReply((_error, reply) => {
+		if (!reply) return;
+		forwardedCount++;
+		forwarded = { receiptId: reply.replyReceiptId, answerJson: reply.answerJson };
+	});
+	const endpoint = await srv.start();
+	const ws = new WebSocket(`${endpoint.url}/?token=${token}`);
+	let actionsSeen = 0;
+	let terminals = 0;
+	ws.addEventListener("message", event => {
+		const frame = JSON.parse(String(event.data)) as { type?: string; id?: string; kind?: string };
+		if (frame.type === "action_needed" && frame.kind === "ask") actionsSeen++;
+		if (frame.type === "action_resolved") terminals++;
+	});
+	await new Promise<void>((resolve, reject) => {
+		ws.addEventListener("open", () => resolve(), { once: true });
+		ws.addEventListener("error", () => reject(new Error("ws error")), { once: true });
+	});
+	try {
+		const lease = srv.registerArbitratedAsk(
+			JSON.stringify({
+				id: "arbitrated-ask",
+				kind: "ask",
+				sessionId,
+				question: "Which path wins?",
+				options: ["generic", "direct"],
+			}),
+			true,
+		);
+		await waitFor(() => actionsSeen === 1, 4_000, "arbitrated ask action");
+		ws.send(JSON.stringify({ type: "reply", id: "arbitrated-ask", answer: 0, token }));
+		await waitFor(() => forwarded !== undefined, 4_000, "generic reply claim");
+
+		// The native generic claim owns this exact lease, so direct workflow control
+		// cannot retire it and create a second terminal path.
+		expect(srv.retireIfUnclaimed(lease)).toEqual({ status: "claimed" });
+		srv.resolveClaim(forwarded!.receiptId, forwarded!.answerJson);
+		await waitFor(() => terminals === 1, 4_000, "single action terminal");
+
+		// A delayed duplicate of the old generic action cannot create an orphan receipt
+		// or emit another terminal after the receipt-bound resolution above.
+		ws.send(JSON.stringify({ type: "reply", id: "arbitrated-ask", answer: 1, token }));
+		await sleep(100);
+		expect(forwardedCount).toBe(1);
+		expect(terminals).toBe(1);
+
+		const directLease = srv.registerArbitratedAsk(
+			JSON.stringify({
+				id: "direct-retired-ask",
+				kind: "ask",
+				sessionId,
+				question: "Can a stale reply revive this?",
+				options: ["no"],
+			}),
+			true,
+		);
+		await waitFor(() => actionsSeen === 2, 4_000, "direct-retired ask action");
+		expect(srv.retireIfUnclaimed(directLease)).toEqual({ status: "retired" });
+		ws.send(JSON.stringify({ type: "reply", id: "direct-retired-ask", answer: 0, token }));
+		await sleep(100);
+		expect(forwardedCount).toBe(1);
+		expect(terminals).toBe(2);
+	} finally {
+		ws.close();
+		srv.stop();
+	}
+}, 30_000);
+test("arbitrated native asks canonicalize recommendation hints for late clients and resolve raw selections once", async () => {
+	const sessionId = `arbitrated-recommendation-${process.pid}-${Date.now()}`;
+	const token = "tok";
+	const srv = new NotificationServer(sessionId, token, `/tmp/${sessionId}`, true);
+	const forwarded: Array<{ id: string; answerJson: string; receiptId: string }> = [];
+	srv.onReply((_error, reply) => {
+		if (!reply) return;
+		forwarded.push({ id: reply.id, answerJson: reply.answerJson, receiptId: reply.replyReceiptId });
+		srv.resolveClaim(reply.replyReceiptId, reply.answerJson, reply.idempotencyKey ?? undefined);
+	});
+	const endpoint = await srv.start();
+	try {
+		// Register before a client connects: the late client must receive the canonical
+		// pending action, not the producer's unvalidated JSON.
+		srv.registerArbitratedAsk(
+			JSON.stringify({
+				id: "recommended-ask",
+				kind: "ask",
+				sessionId,
+				question: "Which option is recommended?",
+				options: ["first", "second"],
+				recommendedIndex: 1,
+			}),
+			true,
+		);
+		const ws = new WebSocket(`${endpoint.url}/?token=${token}`);
+		const actions: Array<Record<string, unknown>> = [];
+		let terminals = 0;
+		ws.addEventListener("message", event => {
+			const frame = JSON.parse(String(event.data)) as Record<string, unknown>;
+			if (frame.type === "action_needed") actions.push(frame);
+			if (frame.type === "action_resolved") terminals++;
+		});
+		await new Promise<void>((resolve, reject) => {
+			ws.addEventListener("open", () => resolve(), { once: true });
+			ws.addEventListener("error", () => reject(new Error("ws error")), { once: true });
+		});
+		await waitFor(() => actions.some(action => action.id === "recommended-ask"), 4_000, "late recommendation replay");
+		expect(actions.find(action => action.id === "recommended-ask")).toMatchObject({
+			options: ["first", "second"],
+			recommendedIndex: 1,
+		});
+		ws.send(JSON.stringify({ type: "reply", id: "recommended-ask", answer: 1, token }));
+		await waitFor(() => forwarded.length === 1, 4_000, "recommended raw-index reply");
+		expect(forwarded[0]).toMatchObject({ id: "recommended-ask", answerJson: "1" });
+		await waitFor(() => terminals === 1, 4_000, "recommended action terminal");
+		srv.registerArbitratedAsk(
+			JSON.stringify({
+				id: "malformed-recommendation-ask",
+				kind: "ask",
+				sessionId,
+				question: "Can malformed advice still be answered?",
+				options: ["first", "second"],
+				recommendedIndex: 1.5,
+			}),
+			true,
+		);
+		await waitFor(
+			() => actions.some(action => action.id === "malformed-recommendation-ask"),
+			4_000,
+			"malformed recommendation action",
+		);
+		const malformed = actions.find(action => action.id === "malformed-recommendation-ask");
+		expect(malformed).toMatchObject({ options: ["first", "second"] });
+		expect(malformed).not.toHaveProperty("recommendedIndex");
+		ws.send(JSON.stringify({ type: "reply", id: "malformed-recommendation-ask", answer: 1, token }));
+		await waitFor(() => forwarded.length === 2, 4_000, "malformed recommendation raw-index reply");
+		expect(forwarded[1]).toMatchObject({ id: "malformed-recommendation-ask", answerJson: "1" });
+		await waitFor(() => terminals === 2, 4_000, "malformed recommendation terminal");
+		ws.send(JSON.stringify({ type: "reply", id: "malformed-recommendation-ask", answer: 1, token }));
+		await sleep(100);
+		expect(forwarded).toHaveLength(2);
+		expect(terminals).toBe(2);
+		ws.close();
+	} finally {
+		srv.stop();
+	}
+}, 30_000);

@@ -50,6 +50,21 @@ describe("parseRateLimitReason", () => {
 		expect(parseRateLimitReason("429 model_limit_reached: limit for this model reached")).toBe("QUOTA_EXHAUSTED");
 		expect(parseRateLimitReason("You have reached the message limit for this model")).toBe("QUOTA_EXHAUSTED");
 	});
+
+	it("classifies Anthropic account exhaustion as QUOTA_EXHAUSTED", () => {
+		expect(parseRateLimitReason("This request would exceed your account's rate limit. Please try again later.")).toBe(
+			"QUOTA_EXHAUSTED",
+		);
+		expect(parseRateLimitReason("anthropic-ratelimit-unified-overage-disabled-reason=out_of_credits")).toBe(
+			"QUOTA_EXHAUSTED",
+		);
+	});
+
+	it("classifies ZAI weekly/monthly limit exhaustion as QUOTA_EXHAUSTED", () => {
+		expect(
+			parseRateLimitReason("[1310][Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-07-14 07:49:08]"),
+		).toBe("QUOTA_EXHAUSTED");
+	});
 });
 
 describe("calculateRateLimitBackoffMs", () => {
@@ -75,8 +90,27 @@ describe("isUsageLimitError", () => {
 		expect(isUsageLimitError("resource exhausted")).toBe(false);
 	});
 
+	it("detects Anthropic account exhaustion without treating generic retry-after as usage exhaustion", () => {
+		expect(isUsageLimitError("This request would exceed your account's rate limit. Please try again later.")).toBe(
+			true,
+		);
+		expect(isUsageLimitError("anthropic-ratelimit-unified-overage-disabled-reason=out_of_credits")).toBe(true);
+		expect(isUsageLimitError("429 rate limit exceeded retry-after-ms=62291000")).toBe(false);
+		expect(isUsageLimitError("429 rate limit exceeded retry-after-ms=5000")).toBe(false);
+	});
+
+	it("detects ZAI weekly/monthly limit exhaustion as persistent usage exhaustion", () => {
+		expect(
+			isUsageLimitError(
+				'429 {"type":"error","error":{"type":"rate_limit_error","code":"1310","message":"[1310][Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-07-14 07:49:08]"}} retry-after-ms=504641000',
+			),
+		).toBe(true);
+	});
+
 	it("does not classify generic rate limits as usage exhaustion", () => {
 		expect(isUsageLimitError("429 rate limit exceeded, please retry in 5s")).toBe(false);
 		expect(isUsageLimitError("Requests per minute limit reached")).toBe(false);
+		expect(isUsageLimitError("429 rate limit exhausted, retry after 5s")).toBe(false);
+		expect(isUsageLimitError("rate limit exhausted, retry after 5 seconds")).toBe(false);
 	});
 });

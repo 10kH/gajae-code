@@ -4,8 +4,20 @@
  * CLI entry point — registers all commands explicitly and delegates to the
  * lightweight CLI runner from pi-utils.
  */
+import "@gajae-code/utils/postmortem";
+import { THINKING_EFFORTS } from "@gajae-code/ai";
 import { Args, type CliConfig, Command, type CommandEntry, Flags, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
+import { loadNative as loadNativeBindings } from "../../natives/native/loader-state.js";
+import { runFixtureReport } from "./cli/fixture-report";
+import { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } from "./gjc-runtime/managed-owner-admission";
+import {
+	isManagedOwnerSupervisorArgv,
+	MANAGED_OWNER_CHILD_TOKEN_ENV,
+	runManagedOwnerSupervisor,
+} from "./gjc-runtime/managed-owner-supervisor";
+import { isTmuxOwnerIsolationCliArgv, runTmuxOwnerIsolationCliFromStdin } from "./gjc-runtime/tmux-owner-isolation-cli";
+import { smokeTestTabWorker } from "./tools/browser/tab-worker-smoke";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
@@ -26,6 +38,7 @@ export const commands: CommandEntry[] = [
 	{ name: "codex-native-hook", load: () => import("./commands/codex-native-hook").then(m => m.default) },
 	{ name: "state", load: () => import("./commands/state").then(m => m.default) },
 	{ name: "setup", load: () => import("./commands/setup").then(m => m.default) },
+	{ name: "acp", load: () => import("./commands/acp").then(m => m.default) },
 	{ name: "skills", load: () => import("./commands/skills").then(m => m.default) },
 	{ name: "session", load: () => import("./commands/session").then(m => m.default) },
 	{ name: "harness", load: () => import("./commands/harness").then(m => m.default) },
@@ -35,7 +48,9 @@ export const commands: CommandEntry[] = [
 	{ name: "gc", load: () => import("./commands/gc").then(m => m.default) },
 	{ name: "ralplan", load: () => import("./commands/ralplan").then(m => m.default) },
 	{ name: "config", load: () => import("./commands/config").then(m => m.default) },
+	{ name: "stats", load: () => import("./commands/stats").then(m => m.default) },
 	{ name: "notify", load: () => import("./commands/notify").then(m => m.default) },
+	{ name: "sdk", load: () => import("./commands/sdk").then(m => m.default) },
 	{ name: "daemon", load: () => import("./commands/daemon").then(m => m.default) },
 	{ name: "web-search", aliases: ["q"], load: () => import("./commands/web-search").then(m => m.default) },
 	{ name: "local-provider", load: () => import("./commands/local-provider").then(m => m.default) },
@@ -51,6 +66,7 @@ export const commands: CommandEntry[] = [
 	{ name: "rlm", load: () => import("./commands/rlm").then(m => m.default) },
 	{ name: "update", load: () => import("./commands/update").then(m => m.default) },
 	{ name: "plugin", load: () => import("./commands/plugin").then(m => m.default) },
+	{ name: "completion", load: () => import("./commands/completion").then(m => m.default) },
 	{ name: "launch", load: () => import("./commands/launch").then(m => m.default) },
 ];
 
@@ -73,11 +89,65 @@ async function installRuntimeGlobals(): Promise<void> {
 	// `HTTP2Unsupported`. See @gajae-code/ai/utils/h2-fetch for details.
 	installH2Fetch();
 
-	// Strip macOS malloc-stack-logging env vars before any subprocess is spawned.
-	// Otherwise every child bun process (subagents, plugin installs, ptree spawns,
-	// etc.) prints a `MallocStackLogging: can't turn off …` warning to stderr.
+	const { warnIfMacOSNoFileLimitTooLow } = await import("./cli/nofile-limit");
+	warnIfMacOSNoFileLimitTooLow();
+
+	// Secondary in-process scrub of the macOS malloc-stack-logging vars. The real
+	// boundary is the darwin re-exec guard at the top of runCli(): Bun snapshots the
+	// spawn-default environment at startup, so deleting these here does NOT clean the
+	// env children inherit by default — it only tidies `process.env` for code that
+	// reads it directly. Kept as belt-and-braces for the rare re-exec-unavailable
+	// fallback; managed spawns already use filterProcessEnv and the native PTY lane
+	// strips them independently.
 	delete process.env.MallocStackLogging;
 	delete process.env.MallocStackLoggingNoCompact;
+}
+
+function isStatsHelpFastPath(argv: string[]): boolean {
+	return argv[0] === "stats" && (argv.includes("--help") || argv.includes("-h"));
+}
+
+function showStatsFastHelp(): void {
+	process.stdout.write(`Usage: ${APP_NAME} stats [options]
+
+View usage statistics
+
+Options:
+  -p, --port <number>   Port for the dashboard server (default: 3847)
+  -j, --json            Output stats as JSON
+  -s, --summary         Print summary to console
+  -h, --help            Show this help
+`);
+}
+
+export function interactiveBootstrapText(
+	argv: readonly string[],
+	stdinIsTTY = process.stdin.isTTY,
+	stdoutIsTTY = process.stdout.isTTY,
+): string | undefined {
+	if (!stdinIsTTY || !stdoutIsTTY || argv[0] !== "launch") return undefined;
+	for (let index = 1; index < argv.length; index++) {
+		const arg = argv[index];
+		if (
+			arg === "--print" ||
+			arg?.startsWith("--print=") ||
+			arg === "-p" ||
+			arg === "--export" ||
+			arg?.startsWith("--export=") ||
+			arg === "--list-models" ||
+			arg?.startsWith("--list-models=") ||
+			arg === "--mode" ||
+			arg?.startsWith("--mode=") ||
+			arg === "--help" ||
+			arg?.startsWith("--help=") ||
+			arg === "-h" ||
+			arg === "--version" ||
+			arg?.startsWith("--version=") ||
+			arg === "-v"
+		)
+			return undefined;
+	}
+	return "\u001b[?25h\u001b[38;5;45mGJC\u001b[0m warming workspace\r\n\r\n> ";
 }
 
 function isNotifyDaemonInternalFastPath(argv: string[]): boolean {
@@ -91,6 +161,70 @@ async function runNotifyDaemonInternalFastPath(argv: string[]): Promise<void> {
 		throw new Error("invalid notify daemon-internal fast path");
 	}
 	await runNotifyCommand(cmd);
+}
+
+function isChatDaemonInternalFastPath(argv: string[]): boolean {
+	return argv[0] === "daemon" && (argv[1] === "discord-internal" || argv[1] === "slack-internal");
+}
+
+async function runChatDaemonInternalFastPath(argv: string[]): Promise<void> {
+	const action = argv[1];
+	if (action !== "discord-internal" && action !== "slack-internal") {
+		throw new Error("invalid chat daemon internal fast path");
+	}
+	const { runChatDaemonInternal } = await import("./sdk/bus/chat-daemon-cli");
+	await runChatDaemonInternal(action === "discord-internal" ? "discord" : "slack", argv.slice(2));
+}
+
+type MemoryGuardNativeSmokeLoad = () => Record<string, unknown>;
+type WindowsJobMemoryProbeResult = Record<string, unknown> & { kind: string };
+type MemoryGuardNativeSmokeReceipt = {
+	api: "memory_guard_windows_job_probe_v1";
+	source: "pi_natives";
+	result: WindowsJobMemoryProbeResult;
+};
+
+export function isMemoryGuardNativeSmokeFastPath(argv: readonly string[]): boolean {
+	return (
+		argv.length === 3 && argv[0] === "internal" && argv[1] === "memory-guard-native-smoke" && argv[2] === "--json"
+	);
+}
+
+function parseWindowsJobMemoryProbeResult(value: unknown): WindowsJobMemoryProbeResult {
+	if (!value || typeof value !== "object") {
+		throw new Error("memory-guard-native-smoke: native probe returned a non-object result");
+	}
+	const result = value as Record<string, unknown>;
+	if (typeof result.kind !== "string") {
+		throw new Error("memory-guard-native-smoke: native probe result is missing a string kind tag");
+	}
+	return result as WindowsJobMemoryProbeResult;
+}
+
+export function runMemoryGuardNativeSmokeFastPath(
+	options: { loadNative?: MemoryGuardNativeSmokeLoad; writeStdout?: (text: string) => void } = {},
+): void {
+	const probe = (options.loadNative ?? loadNativeBindings)().probeWindowsJobMemory;
+	if (typeof probe !== "function") {
+		throw new Error("memory-guard-native-smoke: probeWindowsJobMemory export missing from native addon");
+	}
+	const receipt: MemoryGuardNativeSmokeReceipt = {
+		api: "memory_guard_windows_job_probe_v1",
+		source: "pi_natives",
+		result: parseWindowsJobMemoryProbeResult((probe as () => unknown)()),
+	};
+	(options.writeStdout ?? (text => process.stdout.write(text)))(`${JSON.stringify(receipt)}\n`);
+}
+
+function rootFixtureArg(argv: string[]): { present: boolean; id: string | undefined } {
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i];
+		// Stop at the first subcommand token so a `--fixture` flag belonging to a
+		// subcommand never hijacks the root fast-path into fixture-report mode.
+		if (isSubcommand(arg)) return { present: false, id: undefined };
+		if (arg === "--fixture") return { present: true, id: argv[i + 1] };
+	}
+	return { present: false, id: undefined };
 }
 
 function hasRootFastFlag(argv: string[], flags: readonly string[]): boolean {
@@ -109,7 +243,7 @@ function hasRootVersionFlag(argv: string[]): boolean {
 	return hasRootFastFlag(argv, versionFlags);
 }
 
-class RootHelpCommand extends Command {
+export class RootHelpCommand extends Command {
 	static description = "Red-claw AI coding assistant";
 	static hidden = true;
 	static args = {
@@ -128,27 +262,32 @@ class RootHelpCommand extends Command {
 		default: Flags.boolean({ description: "Persist --mpreset as the default model profile" }),
 		provider: Flags.string({ description: "Provider to use (legacy; prefer --model)" }),
 		"api-key": Flags.string({ description: "API key (defaults to env vars)" }),
+		credential: Flags.string({
+			description:
+				"Stored credential selector: email:<addr>, id:<n>, account:<id>, project:<id>, or provider/email:<addr>",
+		}),
 		"system-prompt": Flags.string({ description: "System prompt (default: coding assistant prompt)" }),
 		"append-system-prompt": Flags.string({ description: "Append text or file contents to the system prompt" }),
+		"mcp-config": Flags.string({ description: "Tools-only MCP config file (absolute path)" }),
 		"allow-home": Flags.boolean({ description: "Allow starting in ~ without auto-switching to a temp dir" }),
 		mode: Flags.string({
-			description: "Output mode: text (default), json, rpc, acp, rpc-ui, or bridge",
-			options: ["text", "json", "rpc", "acp", "rpc-ui", "bridge"],
+			description: "Output mode: text (default), json, or acp",
+			options: ["text", "json", "acp"],
 		}),
 		print: Flags.boolean({ char: "p", description: "Non-interactive mode: process prompt and exit" }),
 		continue: Flags.boolean({ char: "c", description: "Continue previous session" }),
 		resume: Flags.string({ char: "r", description: "Resume a session (by ID prefix, path, or picker if omitted)" }),
 		"session-dir": Flags.string({ description: "Directory for session storage and lookup" }),
 		"no-session": Flags.boolean({ description: "Don't save session (ephemeral)" }),
-		models: Flags.string({ description: "Comma-separated model patterns for Ctrl+P cycling" }),
+		models: Flags.string({ description: "Comma-separated model patterns for Alt+N cycling" }),
 		"no-tools": Flags.boolean({ description: "Disable all built-in tools" }),
 		"no-lsp": Flags.boolean({ description: "Disable LSP tools, formatting, and diagnostics" }),
 		"no-pty": Flags.boolean({ description: "Disable PTY-based interactive bash execution" }),
 		tmux: Flags.boolean({ description: "Launch interactive startup inside tmux" }),
 		tools: Flags.string({ description: "Comma-separated list of tools to enable (default: all)" }),
 		thinking: Flags.string({
-			description: "Set thinking level: ultra, high, medium, low",
-			options: ["ultra", "high", "medium", "low"],
+			description: `Set thinking level: ${THINKING_EFFORTS.join(", ")}`,
+			options: [...THINKING_EFFORTS],
 		}),
 		hook: Flags.string({ description: "Load a hook/extension file (can be used multiple times)", multiple: true }),
 		extension: Flags.string({
@@ -173,6 +312,7 @@ class RootHelpCommand extends Command {
 		`# Launch in a sibling git worktree\n  ${APP_NAME} --worktree`,
 		`# Use different model (fuzzy matching)\n  ${APP_NAME} --model opus "Help me refactor this code"`,
 		`# Limit model cycling to specific models\n  ${APP_NAME} --models claude-sonnet,claude-haiku,gpt-4o`,
+		`# Pin a stored credential for this session\n  ${APP_NAME} --credential email:me@example.com`,
 		`# Activate a model profile for this session\n  ${APP_NAME} --mpreset codex-medium`,
 		`# Persist a model profile as the default\n  ${APP_NAME} --mpreset opencodego --default`,
 		`# Export a session file to HTML\n  ${APP_NAME} --export ~/.gjc/agent/sessions/--path--/session.jsonl`,
@@ -191,16 +331,15 @@ function isSubcommand(first: string | undefined): boolean {
 }
 
 /**
- * Smoke-test entry. Spawns the stats sync worker, pings it, exits.
+ * Smoke-test entry. Spawns the stats sync worker and the browser tab worker, then verifies their protocol.
  *
- * Purpose: catch the silent worker-load regressions that hit compiled
- * binaries (issues #1011 and #1027). Neither `--version` nor
- * `stats --summary` actually spawns a Worker on a fresh install — the
- * sync path early-returns when no session files exist. This probe is the
- * minimal end-to-end test that proves `new Worker(...)` resolves and the
- * bundled worker module evaluates successfully. Wired into
- * `scripts/install-tests/run-ci.sh` so binary / source-link / tarball
- * installs all exercise it on every CI run.
+ * Purpose: catch silent compiled-worker load regressions (issues #1011,
+ * #1027, and #2598). Neither `--version` nor `stats --summary` spawns both
+ * worker entries on a fresh install. This probe proves each bundled worker
+ * module resolves and evaluates; the tab-worker probe also completes its
+ * bootstrap/closed protocol without launching a browser. Wired into
+ * `scripts/install-tests/run-ci.sh` so binary / source-link / tarball installs
+ * exercise it on every CI run.
  */
 async function runSmokeTest(): Promise<void> {
 	const { smokeTestSyncWorker } = await import("@gajae-code/stats");
@@ -217,20 +356,120 @@ async function runSmokeTest(): Promise<void> {
 	if (typeof h02ScoreSequenceFuzzy !== "function" || typeof h01FindBestFuzzyMatch !== "function") {
 		throw new Error("smoke-test: native fuzzy exports missing from embedded addon");
 	}
+	await smokeTestTabWorker();
 	process.stdout.write("smoke-test: ok\n");
+}
+
+/** Normalize the sole `gjc resume` alias into the value-less launch intent. */
+export function normalizeResumeAlias(argv: readonly string[]): string[] {
+	return argv.length === 1 && argv[0] === "resume" ? ["--resume"] : [...argv];
+}
+
+function routeLegacyRootArgv(argv: readonly string[]): string[] | undefined {
+	if (argv[0] === "coordinator-mcp") return ["mcp-serve", "coordinator", ...argv.slice(1)];
+	if (argv[0] !== "--team") return undefined;
+	const sizeValues: string[] = [];
+	const remaining: string[] = [];
+	for (let index = 1; index < argv.length; index++) {
+		const arg = argv[index] ?? "";
+		if (arg === "--team-size") {
+			sizeValues.push(argv[index + 1] ?? "");
+			index++;
+		} else if (arg.startsWith("--team-size=")) {
+			sizeValues.push(arg.slice("--team-size=".length));
+		} else {
+			remaining.push(arg);
+		}
+	}
+	const size = sizeValues[0];
+	if (sizeValues.length !== 1 || !size || !/^[1-9]\d*$/.test(size)) {
+		return ["team", "0", "invalid legacy --team-size"];
+	}
+	return ["team", size, ...remaining];
+}
+
+/** Apply the same default-launch routing used by runCli after root fast paths. */
+export function routeRootArgv(argv: readonly string[]): string[] {
+	const normalizedArgv = normalizeResumeAlias(argv);
+	const legacyArgv = routeLegacyRootArgv(normalizedArgv);
+	if (legacyArgv) return legacyArgv;
+	const first = normalizedArgv[0];
+	return first === "--help" || first === "-h" || first === "--version" || first === "-v" || first === "help"
+		? normalizedArgv
+		: isSubcommand(first)
+			? normalizedArgv
+			: ["launch", ...normalizedArgv];
 }
 
 /** Run the CLI with the given argv (no `process.argv` prefix). */
 export async function runCli(argv: string[]): Promise<void> {
+	// macOS malloc-env launch boundary. Re-exec once with a scrubbed environment
+	// BEFORE any fast path or subprocess spawn, so the startup env snapshot Bun hands
+	// to every child lane (Bun.spawn defaults, node:child_process, native PTY, tmux
+	// owner, plugin installs, subagents) is clean. This runs ahead of the
+	// tmux-owner-isolation and notify-daemon fast paths so those lanes execute inside
+	// the already-scrubbed process too. The cheap inline predicate keeps the common
+	// (uncontaminated / non-darwin) path free of extra module loads; the guard module
+	// (MACOS_MALLOC_ENV_VARS / GJC_MALLOC_ENV_REEXEC) loads only when a re-exec is due.
+	if (
+		process.platform === "darwin" &&
+		process.env.GJC_MALLOC_ENV_REEXEC === undefined &&
+		(process.env.MallocStackLogging !== undefined || process.env.MallocStackLoggingNoCompact !== undefined)
+	) {
+		const { reexecWithScrubbedMallocEnv } = await import("./cli/malloc-env-guard");
+		const code = await reexecWithScrubbedMallocEnv();
+		if (code !== null) {
+			process.exitCode = code;
+			return;
+		}
+		// Re-exec could not be spawned; fall through and run in this process.
+	}
+	if (isMemoryGuardNativeSmokeFastPath(argv)) {
+		runMemoryGuardNativeSmokeFastPath();
+		return;
+	}
+	if (isTmuxOwnerIsolationCliArgv(argv)) {
+		await runTmuxOwnerIsolationCliFromStdin();
+		return;
+	}
+	if (isManagedOwnerSupervisorArgv(argv)) {
+		await runManagedOwnerSupervisor();
+		return;
+	}
+	if (process.env[MANAGED_OWNER_CHILD_TOKEN_ENV] !== undefined) {
+		const admission = await admitManagedOwnerBeforeCli();
+		if (admission.kind === "blocked") return;
+		if (admission.kind === "recovery") {
+			await completeManagedOwnerRecovery(admission.context);
+			return;
+		}
+	}
 	if (isNotifyDaemonInternalFastPath(argv)) {
 		await runNotifyDaemonInternalFastPath(argv);
+		return;
+	}
+	if (isChatDaemonInternalFastPath(argv)) {
+		await runChatDaemonInternalFastPath(argv);
 		return;
 	}
 	if (argv[0] === "--smoke-test") {
 		await runSmokeTest();
 		return;
 	}
-	if (hasRootHelpFlag(argv)) {
+	const fixtureArg = rootFixtureArg(argv);
+	if (fixtureArg.present) {
+		const id = fixtureArg.id;
+		if (!id || id.startsWith("-")) {
+			process.stderr.write(`${APP_NAME} --fixture requires a fixture id\n`);
+			process.exitCode = 1;
+			return;
+		}
+		process.exitCode = await runFixtureReport(id);
+		return;
+	}
+	const normalizedArgv = normalizeResumeAlias(argv);
+	const legacyArgv = routeLegacyRootArgv(normalizedArgv);
+	if (!legacyArgv && hasRootHelpFlag(normalizedArgv)) {
 		const { renderRootHelp } = await import("@gajae-code/utils/cli");
 		const { getExtraHelpText } = await import("./cli/fast-help");
 		renderRootHelp({ bin: APP_NAME, version: VERSION, commands: new Map([["launch", RootHelpCommand]]) });
@@ -240,20 +479,18 @@ export async function runCli(argv: string[]): Promise<void> {
 		}
 		return;
 	}
-	if (hasRootVersionFlag(argv)) {
+	if (!legacyArgv && hasRootVersionFlag(normalizedArgv)) {
 		process.stdout.write(`${APP_NAME}/${VERSION}\n`);
 		return;
 	}
+	const runArgv = legacyArgv ?? routeRootArgv(normalizedArgv);
+	if (isStatsHelpFastPath(runArgv)) {
+		showStatsFastHelp();
+		return;
+	}
+	const bootstrap = interactiveBootstrapText(runArgv);
+	if (bootstrap) process.stdout.write(bootstrap);
 	await installRuntimeGlobals();
-	// --help and --version are handled by run() directly, don't rewrite those.
-	// Everything else that isn't a known subcommand routes to "launch".
-	const first = argv[0];
-	const runArgv =
-		first === "--help" || first === "-h" || first === "--version" || first === "-v" || first === "help"
-			? argv
-			: isSubcommand(first)
-				? argv
-				: ["launch", ...argv];
 	return run({ bin: APP_NAME, version: VERSION, argv: runArgv, commands, help: showHelp });
 }
 

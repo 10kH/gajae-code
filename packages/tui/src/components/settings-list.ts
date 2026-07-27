@@ -33,6 +33,7 @@ export class SettingsList implements Component {
 	#onChange: (id: string, newValue: string) => void;
 	#onCancel: () => void;
 	#onSelectionChange?: (item: SettingItem | undefined) => void;
+	#descriptionRows: number;
 
 	// Submenu state
 	#submenuComponent: Component | null = null;
@@ -45,6 +46,7 @@ export class SettingsList implements Component {
 		onChange: (id: string, newValue: string) => void,
 		onCancel: () => void,
 		onSelectionChange?: (item: SettingItem | undefined) => void,
+		descriptionRows = 0,
 	) {
 		this.#items = items;
 		this.#maxVisible = maxVisible;
@@ -52,7 +54,16 @@ export class SettingsList implements Component {
 		this.#onChange = onChange;
 		this.#onCancel = onCancel;
 		this.#onSelectionChange = onSelectionChange;
+		this.#descriptionRows = Math.max(0, descriptionRows);
 		this.#notifySelectionChange();
+	}
+
+	#clampSelectedIndex(): void {
+		if (this.#items.length === 0) {
+			this.#selectedIndex = 0;
+			return;
+		}
+		this.#selectedIndex = Math.max(0, Math.min(this.#selectedIndex, this.#items.length - 1));
 	}
 
 	/** Update an item's currentValue */
@@ -72,11 +83,7 @@ export class SettingsList implements Component {
 	 */
 	setItems(items: SettingItem[]): void {
 		this.#items = items;
-		if (this.#items.length === 0) {
-			this.#selectedIndex = 0;
-		} else if (this.#selectedIndex >= this.#items.length) {
-			this.#selectedIndex = this.#items.length - 1;
-		}
+		this.#clampSelectedIndex();
 		this.#notifySelectionChange();
 	}
 
@@ -113,7 +120,11 @@ export class SettingsList implements Component {
 		const endIndex = Math.min(startIndex + this.#maxVisible, this.#items.length);
 
 		// Calculate max label width for alignment
-		const maxLabelWidth = Math.min(30, Math.max(...this.#items.map(item => visibleWidth(item.label))));
+		const maxLabelWidth = Math.min(
+			30,
+			Math.max(0, width - 12),
+			Math.max(...this.#items.map(item => visibleWidth(item.label))),
+		);
 
 		// Render visible items
 		for (let i = startIndex; i < endIndex; i++) {
@@ -125,13 +136,15 @@ export class SettingsList implements Component {
 			const prefixWidth = visibleWidth(prefix);
 
 			// Pad label to align values
-			const labelPadded = item.label + padding(Math.max(0, maxLabelWidth - visibleWidth(item.label)));
+			const labelPadded =
+				truncateToWidth(item.label, maxLabelWidth, Ellipsis.Omit) +
+				padding(Math.max(0, maxLabelWidth - visibleWidth(item.label)));
 			const labelText = this.#theme.label(labelPadded, isSelected);
 
 			// Calculate space for value
 			const separator = "  ";
 			const usedWidth = prefixWidth + maxLabelWidth + visibleWidth(separator);
-			const valueMaxWidth = width - usedWidth - 2;
+			const valueMaxWidth = Math.max(0, width - usedWidth - 2);
 
 			const valueText = this.#theme.value(
 				truncateToWidth(item.currentValue, valueMaxWidth, Ellipsis.Omit),
@@ -147,9 +160,18 @@ export class SettingsList implements Component {
 			lines.push(this.#theme.hint(truncateToWidth(scrollText, width - 2, Ellipsis.Omit)));
 		}
 
-		// Add description for selected item
+		// Add description for selected item. Some hosts reserve a fixed
+		// description area so keyboard navigation does not resize the TUI when
+		// moving between described and undescribed rows.
 		const selectedItem = this.#items[this.#selectedIndex];
-		if (selectedItem?.description) {
+		if (this.#descriptionRows > 0) {
+			lines.push("");
+			const wrappedDesc = selectedItem?.description ? wrapTextWithAnsi(selectedItem.description, width - 4) : [];
+			for (let i = 0; i < this.#descriptionRows; i++) {
+				const line = wrappedDesc[i] ?? "";
+				lines.push(line ? this.#theme.description(`  ${line}`) : "");
+			}
+		} else if (selectedItem?.description) {
 			lines.push("");
 			const wrappedDesc = wrapTextWithAnsi(selectedItem.description, width - 4);
 			for (const line of wrappedDesc) {
@@ -174,6 +196,13 @@ export class SettingsList implements Component {
 
 		// Main list input handling
 		const kb = getKeybindings();
+		if (this.#items.length === 0) {
+			if (kb.matches(data, "tui.select.cancel")) {
+				this.#onCancel();
+			}
+			return;
+		}
+
 		if (kb.matches(data, "tui.select.up")) {
 			this.#selectedIndex = this.#selectedIndex === 0 ? this.#items.length - 1 : this.#selectedIndex - 1;
 			this.#notifySelectionChange();
@@ -216,6 +245,7 @@ export class SettingsList implements Component {
 		// Restore selection to the item that opened the submenu
 		if (this.#submenuItemIndex !== null) {
 			this.#selectedIndex = this.#submenuItemIndex;
+			this.#clampSelectedIndex();
 			this.#submenuItemIndex = null;
 			this.#notifySelectionChange();
 		}

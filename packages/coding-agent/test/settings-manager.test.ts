@@ -1,16 +1,34 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Effort } from "@gajae-code/ai";
-import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
-import { getCustomThemesDir, getProjectAgentDir, Snowflake } from "@gajae-code/utils";
+import { onAppendOnlyModeChanged, resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import {
+	getCustomThemesDir,
+	getDefaultTabWidth,
+	getProjectAgentDir,
+	logger,
+	Snowflake,
+	setDefaultTabWidth,
+} from "@gajae-code/utils";
 import { YAML } from "bun";
+import { withFileLock } from "../src/config/file-lock";
+import { createLightweightDaemonSettings } from "../src/sdk/bus/telegram-daemon-cli";
 
 describe("Settings", () => {
 	let testDir: string;
 	let agentDir: string;
 	let projectDir: string;
+
+	const removeTestDir = () => {
+		try {
+			fs.rmSync(testDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+		} catch (error) {
+			if (process.platform === "win32" && (error as NodeJS.ErrnoException).code === "EBUSY") return;
+			throw error;
+		}
+	};
 
 	beforeEach(() => {
 		// Reset global singleton so each test gets a fresh instance
@@ -22,7 +40,7 @@ describe("Settings", () => {
 		projectDir = path.join(testDir, "project");
 
 		if (fs.existsSync(testDir)) {
-			fs.rmSync(testDir, { recursive: true });
+			removeTestDir();
 		}
 		fs.mkdirSync(agentDir, { recursive: true });
 		fs.mkdirSync(getProjectAgentDir(projectDir), { recursive: true });
@@ -45,7 +63,32 @@ describe("Settings", () => {
 
 	afterEach(() => {
 		if (fs.existsSync(testDir)) {
-			fs.rmSync(testDir, { recursive: true });
+			removeTestDir();
+		}
+	});
+
+	it("does not log setting override values when initialization options differ", async () => {
+		const initialSecret = "initial-settings-secret";
+		const requestedSecret = "requested-settings-secret";
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await Settings.init({
+				inMemory: true,
+				cwd: projectDir,
+				overrides: { "auth.broker.token": initialSecret },
+			});
+			await Settings.init({
+				inMemory: true,
+				cwd: projectDir,
+				overrides: { "auth.broker.token": requestedSecret },
+			});
+
+			const logged = JSON.stringify(warning.mock.calls);
+			expect(logged).not.toContain(initialSecret);
+			expect(logged).not.toContain(requestedSecret);
+			expect(logged).toContain("auth.broker.token");
+		} finally {
+			warning.mockRestore();
 		}
 	});
 
@@ -212,6 +255,30 @@ describe("Settings", () => {
 
 			expect(settings.getModelRole("default")).toBe("anthropic/claude-opus-4-5");
 		});
+
+		it("keeps live agent model overrides aligned without persisting profile entries", () => {
+			const settings = Settings.isolated();
+
+			settings.set("task.agentModelOverrides", { executor: "persisted/executor" });
+			settings.override("task.agentModelOverrides", {
+				executor: "profile/executor",
+				planner: "profile/planner",
+			});
+
+			settings.setAgentModelOverride("planner", "user/planner:high");
+
+			expect(settings.get("task.agentModelOverrides")).toEqual({
+				executor: "profile/executor",
+				planner: "user/planner:high",
+			});
+
+			settings.clearOverride("task.agentModelOverrides");
+
+			expect(settings.get("task.agentModelOverrides")).toEqual({
+				executor: "persisted/executor",
+				planner: "user/planner:high",
+			});
+		});
 	});
 
 	describe("migrations", () => {
@@ -319,5 +386,442 @@ describe("Settings", () => {
 			settings = await Settings.init({ cwd: projectDir, agentDir });
 			expect(settings.get("theme.light")).toBe("light");
 		});
+	});
+
+	it("migrates ask.timeout milliseconds once and records schema version one", async () => {
+		await writeSettings({ ask: { timeout: 30_000 } });
+		let settings = await Settings.init({ cwd: projectDir, agentDir });
+		expect(settings.get("ask.timeout")).toBe(30);
+		expect((await readSettings()).configSchemaVersion).toBe(1);
+
+		resetSettingsForTest();
+		settings = await Settings.init({ cwd: projectDir, agentDir });
+		expect(settings.get("ask.timeout")).toBe(30);
+		expect((await readSettings()).ask).toEqual({ timeout: 30 });
+	});
+
+	describe("below-threshold maintenance pruning defaults (Finding 13)", () => {
+		it("keeps maintenance pruning off by default (evidence-gated) with a high min-savings floor", () => {
+			const settings = Settings.isolated();
+			const compaction = settings.getGroup("compaction");
+			expect(compaction.maintenancePruningEnabled).toBe(false);
+			expect(compaction.maintenancePruningMinSavingsTokens).toBe(8000);
+		});
+
+		it("exposes the opt-in override through getGroup", () => {
+			const settings = Settings.isolated({
+				"compaction.maintenancePruningEnabled": true,
+				"compaction.maintenancePruningMinSavingsTokens": 12000,
+			});
+			const compaction = settings.getGroup("compaction");
+			expect(compaction.maintenancePruningEnabled).toBe(true);
+			expect(compaction.maintenancePruningMinSavingsTokens).toBe(12000);
+		});
+	});
+	describe("IRC sidebar default", () => {
+		it("materializes irc.sidebar.enabled=true when the setting is omitted", () => {
+			const settings = Settings.isolated();
+			expect(settings.get("irc.sidebar.enabled")).toBe(true);
+		});
+
+		it("preserves an explicit false value across restart", async () => {
+			await writeSettings({ irc: { sidebar: { enabled: false } } });
+			let settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("irc.sidebar.enabled")).toBe(false);
+
+			resetSettingsForTest();
+			settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("irc.sidebar.enabled")).toBe(false);
+		});
+
+		it("lets project settings override the user default", async () => {
+			await writeSettings({ irc: { sidebar: { enabled: true } } });
+			await Bun.write(
+				path.join(getProjectAgentDir(projectDir), "settings.json"),
+				JSON.stringify({ irc: { sidebar: { enabled: false } } }),
+			);
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("irc.sidebar.enabled")).toBe(false);
+		});
+
+		it("falls back without overwriting a corrupt project value", async () => {
+			await writeSettings({ irc: { sidebar: { enabled: false } } });
+			const projectSettingsPath = path.join(getProjectAgentDir(projectDir), "settings.json");
+			await Bun.write(projectSettingsPath, '{"irc":{"sidebar":{"enabled":');
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("irc.sidebar.enabled")).toBe(false);
+			expect(await Bun.file(projectSettingsPath).text()).toBe('{"irc":{"sidebar":{"enabled":');
+		});
+
+		it("keeps the generated JSON schema default in sync with the settings source", async () => {
+			const schema = JSON.parse(
+				await Bun.file(new URL("../../../schemas/config.schema.json", import.meta.url)).text(),
+			);
+			const sidebarDefault = schema?.properties?.irc?.properties?.sidebar?.properties?.enabled?.default;
+			expect(sidebarDefault).toBe(true);
+		});
+	});
+	describe("causally ordered atomic persistence", () => {
+		it("persists a later durable batch after an earlier ordinary set", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			settings.set("notifications.redact", true);
+			await settings.commitAtomicBatch([{ path: "notifications.redact", op: "set", value: false }]);
+
+			expect(settings.get("notifications.redact")).toBe(false);
+			expect((await readSettings()).notifications).toEqual({ redact: false });
+		});
+
+		it("keeps a later ordinary set live and persists it after an earlier durable batch", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const batch = settings.commitAtomicBatch([{ path: "notifications.redact", op: "set", value: false }]);
+			settings.set("notifications.redact", true);
+
+			expect(settings.get("notifications.redact")).toBe(true);
+			await batch;
+			await settings.flushOrThrow();
+			expect((await readSettings()).notifications).toEqual({ redact: true });
+		});
+		it("fails closed after an atomic read failure", async () => {
+			for (const commit of [
+				(settings: Settings) =>
+					settings.commitAtomicBatch([{ path: "theme.dark", op: "set" as const, value: "red-claw" }]),
+				(settings: Settings) =>
+					settings.commitAtomicBatchWithCurrent(() => [
+						{ path: "theme.dark", op: "set" as const, value: "red-claw" },
+					]),
+			]) {
+				await writeSettings({ theme: { dark: "blue-crab" } });
+				const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+				await Bun.write(getConfigPath(), "notifications: [");
+
+				const failure = await commit(settings).catch(error => error);
+				expect(failure).toBeInstanceOf(Error);
+				expect(settings.canWriteDurableConfig()).toBe(false);
+				expect(settings.getSchemaReport()).toMatchObject({
+					valid: false,
+					issues: [{ path: "config.yml", kind: "invalid" }],
+				});
+				expect(() => settings.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+				await expect(
+					settings.commitAtomicBatch([{ path: "theme.dark", op: "set", value: "red-claw" }]),
+				).rejects.toThrow("Repair config.yml");
+				settings.getStorage()?.close();
+			}
+		});
+		it("keeps atomic failure recovery ahead of causally dependent queued work", async () => {
+			for (const commit of [
+				(settings: Settings) =>
+					settings.commitAtomicBatch([{ path: "notifications.enabled", op: "set" as const, value: true }]),
+				(settings: Settings) =>
+					settings.commitAtomicBatchWithCurrent(() => [
+						{ path: "notifications.enabled", op: "set" as const, value: true },
+					]),
+			]) {
+				await writeSettings({ theme: { dark: "blue-crab" } });
+				const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+				await Bun.write(getConfigPath(), "malformed-root\n");
+
+				const firstSettled = Promise.withResolvers<void>();
+				const first = commit(settings);
+				void first.finally(() => firstSettled.resolve()).catch(() => undefined);
+				const later = settings.commitAtomicBatchWithCurrent(async () => {
+					await firstSettled.promise;
+					return [];
+				});
+				const bounded = await Promise.race([
+					Promise.allSettled([first, later]),
+					Bun.sleep(2_000).then(() => "timeout" as const),
+				]);
+
+				expect(bounded).not.toBe("timeout");
+				expect(bounded).toMatchObject([
+					{
+						status: "rejected",
+						reason: {
+							message: "Cannot atomically repair notification settings while config.yml has a malformed root.",
+						},
+					},
+					{ status: "fulfilled" },
+				]);
+				settings.getStorage()?.close();
+			}
+		});
+
+		it("exposes an ordinary set and hook before disk completion without reentrant flush deadlock", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const hookValues: string[] = [];
+			const unsubscribe = onAppendOnlyModeChanged(value => {
+				hookValues.push(value);
+				void settings.flush();
+			});
+			try {
+				settings.set("provider.appendOnlyContext", "on");
+				expect(settings.get("provider.appendOnlyContext")).toBe("on");
+				expect(hookValues).toEqual(["on"]);
+				await settings.flushOrThrow();
+			} finally {
+				unsubscribe();
+			}
+
+			expect((await readSettings()).provider).toEqual({ appendOnlyContext: "on" });
+		});
+
+		it("unsets a path immediately and persists an explicit YAML deletion", async () => {
+			await writeSettings({ modelProfile: { default: "saved-profile" } });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			settings.unset("modelProfile.default");
+
+			expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
+			await settings.flushOrThrow();
+			expect((await readSettings()).modelProfile).toEqual({});
+		});
+
+		it("does not let an older persistence completion clobber a newer live revision", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			let releaseLock!: () => void;
+			let enteredLock!: () => void;
+			const lockEntered = new Promise<void>(resolve => {
+				enteredLock = resolve;
+			});
+			const lockRelease = new Promise<void>(resolve => {
+				releaseLock = resolve;
+			});
+			const heldLock = withFileLock(getConfigPath(), async () => {
+				enteredLock();
+				await lockRelease;
+			});
+			await lockEntered;
+
+			settings.set("notifications.redact", true);
+			const firstFlush = settings.flush();
+			await Promise.resolve();
+			settings.set("notifications.redact", false);
+			releaseLock();
+			await heldLock;
+			await firstFlush;
+			await settings.flushOrThrow();
+
+			expect(settings.get("notifications.redact")).toBe(false);
+			expect((await readSettings()).notifications).toEqual({ redact: false });
+		});
+
+		it("serializes a lightweight daemon write with a full Settings write", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const daemon = createLightweightDaemonSettings({ agentDir, rawConfig: {} }) as unknown as {
+				set(path: string, value: unknown): Promise<void>;
+			};
+			settings.set("defaultThinkingLevel", Effort.High);
+
+			await Promise.all([settings.flushOrThrow(), daemon.set("notifications.telegram.rich.enabled", false)]);
+			expect(await readSettings()).toMatchObject({
+				defaultThinkingLevel: Effort.High,
+				notifications: { telegram: { rich: { enabled: false } } },
+			});
+		});
+	});
+
+	it("loads the managed session migration policy from scoped settings", async () => {
+		await writeSettings({ session: { directoryMigration: "disabled" } });
+		const scoped = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		expect(scoped.get("session.directoryMigration")).toBe("disabled");
+		expect(Settings.isolated().get("session.directoryMigration")).toBe("copy-retain");
+	});
+
+	it("rejects invalid managed session migration overrides", () => {
+		const invalid = Settings.isolated({ "session.directoryMigration": "merge" });
+		expect(invalid.get("session.directoryMigration")).toBe("copy-retain");
+	});
+
+	it("keeps the generated schema migration enum and default in sync", async () => {
+		const schema = JSON.parse(await Bun.file(new URL("../../../schemas/config.schema.json", import.meta.url)).text());
+		const migration = schema?.properties?.session?.properties?.directoryMigration;
+		expect(migration?.default).toBe("copy-retain");
+		expect(migration?.enum).toEqual(["copy-retain", "disabled"]);
+	});
+	it("clears recovered diagnostics and notification validation after an empty-file repair", async () => {
+		const malformed = "notifications: [";
+		await Bun.write(getConfigPath(), malformed);
+		const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		try {
+			expect(settings.canWriteDurableConfig()).toBe(false);
+			expect(settings.getSchemaReport()).toMatchObject({ valid: false });
+			expect(() => settings.set("theme.dark", "red-claw")).toThrow("Repair config.yml");
+			expect(await Bun.file(getConfigPath()).text()).toBe(malformed);
+
+			await Bun.write(getConfigPath(), "");
+			await settings.flush();
+
+			expect(settings.canWriteDurableConfig()).toBe(true);
+			expect(settings.getSchemaReport()).toEqual({ issues: [], valid: true });
+			expect(settings.getNotificationSettingsSnapshot()).toMatchObject({ enabled: false });
+			settings.set("notifications.redact", true);
+			expect(settings.get("notifications.redact")).toBe(true);
+			await settings.flushOrThrow();
+			expect(await readSettings()).toMatchObject({ notifications: { redact: true } });
+		} finally {
+			settings.getStorage()?.close();
+		}
+	});
+	it("publishes repaired durable setting changes through hooks and listeners", async () => {
+		await Bun.write(getConfigPath(), "display: [");
+		const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		const changedPaths: string[] = [];
+		const unsubscribe = settings.onChanged(settingPath => changedPaths.push(settingPath));
+		try {
+			setDefaultTabWidth(3);
+			await Bun.write(getConfigPath(), "display:\n  tabWidth: 7\n");
+			await settings.flush();
+
+			expect(settings.get("display.tabWidth")).toBe(7);
+			expect(getDefaultTabWidth()).toBe(7);
+			expect(changedPaths).toEqual(["display.tabWidth"]);
+		} finally {
+			unsubscribe();
+			setDefaultTabWidth(4);
+			settings.getStorage()?.close();
+		}
+	});
+
+	it("persists a retained dirty patch on the first flush after YAML repair", async () => {
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		try {
+			settings.set("theme.dark", "blue-crab");
+			await Bun.write(getConfigPath(), "theme: [");
+			await settings.flush();
+
+			expect(settings.canWriteDurableConfig()).toBe(false);
+			expect(settings.get("theme.dark")).toBe("blue-crab");
+
+			await Bun.write(getConfigPath(), "");
+			await settings.flushOrThrow();
+
+			expect(settings.canWriteDurableConfig()).toBe(true);
+			expect((await readSettings()).theme).toEqual({ dark: "blue-crab" });
+		} finally {
+			settings.getStorage()?.close();
+		}
+	});
+	it("enters syntax recovery after a debounced save encounters malformed YAML", async () => {
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		try {
+			settings.set("theme.dark", "blue-crab");
+			await Bun.write(getConfigPath(), "theme: [");
+			await Bun.sleep(300);
+
+			expect(settings.canWriteDurableConfig()).toBe(false);
+			expect(settings.get("theme.dark")).toBe("blue-crab");
+			expect(settings.getSchemaReport()).toMatchObject({ valid: false });
+			expect(() => settings.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+			expect(() => settings.set("theme.light", "blue-crab")).toThrow("Repair config.yml");
+		} finally {
+			settings.getStorage()?.close();
+		}
+	});
+	it("preserves fail-closed notifications while replaying dirty patches after external syntax corruption", async () => {
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		try {
+			settings.set("notifications.redact", true);
+			settings.set("theme.dark", "blue-crab");
+			await Bun.write(getConfigPath(), "notifications: [");
+			await settings.flush();
+
+			expect(() => settings.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+			expect(settings.get("theme.dark")).toBe("blue-crab");
+
+			await Bun.write(getConfigPath(), "");
+			await settings.flushOrThrow();
+
+			expect(await readSettings()).toMatchObject({
+				notifications: { redact: true },
+				theme: { dark: "blue-crab" },
+			});
+		} finally {
+			settings.getStorage()?.close();
+		}
+	});
+	it("retains fail-closed recovery state when a durable refresh read fails", async () => {
+		const malformed = "notifications: [";
+		await Bun.write(getConfigPath(), malformed);
+		const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		try {
+			expect(settings.canWriteDurableConfig()).toBe(false);
+			fs.rmSync(getConfigPath());
+			fs.mkdirSync(getConfigPath());
+
+			await expect(settings.flush()).rejects.toThrow();
+			expect(settings.canWriteDurableConfig()).toBe(false);
+			expect(settings.getSchemaReport()).toMatchObject({ valid: false });
+			expect(() => settings.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+			expect(() => settings.set("notifications.redact", true)).toThrow("Repair config.yml");
+		} finally {
+			settings.getStorage()?.close();
+		}
+	});
+	it("serializes failed-save recovery behind a later reserved save", async () => {
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		let queuedNewestSave = false;
+		const warning = vi.spyOn(logger, "warn").mockImplementation(message => {
+			if (message !== "Settings: background save failed" || queuedNewestSave) return;
+			queuedNewestSave = true;
+			fs.writeFileSync(getConfigPath(), YAML.stringify({ theme: { dark: "red-claw" } }, null, 2));
+			settings.set("theme.dark", "red-claw");
+		});
+		try {
+			settings.set("theme.dark", "blue-crab");
+			await Bun.write(getConfigPath(), "theme: [");
+			await expect(settings.flushOrThrow()).rejects.toThrow();
+
+			expect(queuedNewestSave).toBe(true);
+			expect(settings.get("theme.dark")).toBe("red-claw");
+			expect((await readSettings()).theme).toEqual({ dark: "red-claw" });
+		} finally {
+			warning.mockRestore();
+			settings.getStorage()?.close();
+		}
+	});
+
+	it("keeps malformed global recovery and notification state in cwd clones", async () => {
+		const malformed = "notifications: [";
+		const clonedCwd = path.join(testDir, "cloned-project");
+		fs.mkdirSync(clonedCwd, { recursive: true });
+		await Bun.write(getConfigPath(), malformed);
+		const source = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		try {
+			const cloned = await source.cloneForCwd(clonedCwd);
+			expect(cloned.canWriteDurableConfig()).toBe(false);
+			expect(cloned.getSchemaReport()).toEqual(source.getSchemaReport());
+			expect(() => source.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+			expect(() => cloned.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+			expect(() => cloned.set("notifications.redact", true)).toThrow("Repair config.yml");
+			expect(await Bun.file(getConfigPath()).text()).toBe(malformed);
+		} finally {
+			source.getStorage()?.close();
+		}
+	});
+	it("keeps the source as the sole owner of retained patches in recovered cwd clones", async () => {
+		const clonedCwd = path.join(testDir, "cloned-project");
+		fs.mkdirSync(clonedCwd, { recursive: true });
+		const source = await Settings.init({ cwd: projectDir, agentDir });
+		try {
+			source.set("theme.dark", "blue-crab");
+			await Bun.write(getConfigPath(), "theme: [");
+			await Bun.sleep(300);
+
+			const cloned = await source.cloneForCwd(clonedCwd);
+			expect(cloned.canWriteDurableConfig()).toBe(false);
+			expect(cloned.get("theme.dark")).toBe("blue-crab");
+
+			await Bun.write(getConfigPath(), "");
+			await source.flushOrThrow();
+			expect((await readSettings()).theme).toEqual({ dark: "blue-crab" });
+
+			await Bun.write(getConfigPath(), YAML.stringify({ theme: { dark: "red-claw" } }, null, 2));
+			await cloned.flushOrThrow();
+			expect((await readSettings()).theme).toEqual({ dark: "red-claw" });
+		} finally {
+			source.getStorage()?.close();
+		}
 	});
 });

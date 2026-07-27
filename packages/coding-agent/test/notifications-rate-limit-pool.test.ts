@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { type RateLimitItem, RateLimitPool } from "../src/notifications/rate-limit-pool";
+import { type RateLimitItem, RateLimitPool } from "../src/sdk/bus/rate-limit-pool";
 
 function item(
 	sessionId: string,
@@ -63,6 +63,22 @@ describe("RateLimitPool", () => {
 		expect(pool.pending).toBe(1);
 		expect(pool.drain(0).map(i => i.payload)).toEqual(["v3"]);
 	});
+	test("reserves generated IDs across coalescing replacements", async () => {
+		const pool = new RateLimitPool<string>({ capacity: 2, refillPerSec: 0, now: () => 0 });
+		const first = pool.submit(item("s1", "live", "v1", "msg-7"));
+		const replacement = pool.submit(item("s1", "live", "v2", "msg-7"));
+		const next = pool.submit(item("s1", "live", "next"));
+
+		expect([first.itemId, replacement.itemId, next.itemId]).toEqual(["rate-limit:0", "rate-limit:1", "rate-limit:2"]);
+		await expect(first.settled).resolves.toBe("removed");
+
+		const granted = pool.drain(0);
+		expect(granted.map(job => job.itemId)).toEqual([replacement.itemId, next.itemId]);
+		for (const job of granted) pool.settle(job.itemId!, "accepted");
+
+		await expect(replacement.settled).resolves.toBe("accepted");
+		await expect(next.settled).resolves.toBe("accepted");
+	});
 
 	test("coalescing is scoped per session and per key", () => {
 		const pool = new RateLimitPool<string>({ capacity: 10, refillPerSec: 1, now: () => 0 });
@@ -70,6 +86,37 @@ describe("RateLimitPool", () => {
 		pool.submit(item("s2", "live", "b", "k"));
 		pool.submit(item("s1", "live", "c", "other"));
 		expect(pool.pending).toBe(3);
+	});
+
+	test("expires elapsed items before granting without consuming their token", () => {
+		const pool = new RateLimitPool<string>({ capacity: 1, refillPerSec: 0, now: () => 0 });
+		pool.submit({ ...item("s1", "ask", "expired"), itemId: "receipt-expired", deadlineAt: 100 });
+		pool.submit({ ...item("s2", "ask", "live"), itemId: "receipt-live", deadlineAt: 200 });
+
+		const result = pool.drainWithExpired(100);
+		expect(result.expired.map(i => i.payload)).toEqual(["expired"]);
+		expect(result.granted.map(i => i.payload)).toEqual(["live"]);
+		expect(pool.availableTokens(100)).toBe(0);
+		expect(pool.drain(200)).toEqual([]);
+	});
+
+	test("removes exactly the identified queued item and returns its payload", () => {
+		const pool = new RateLimitPool<string>({ capacity: 2, refillPerSec: 0, now: () => 0 });
+		pool.submit({ ...item("s1", "ask", "first"), itemId: "receipt-1" });
+		pool.submit({ ...item("s1", "ask", "second"), itemId: "receipt-2" });
+
+		expect(pool.removeById("receipt-2")).toMatchObject({ itemId: "receipt-2", payload: "second" });
+		expect(pool.removeById("receipt-2")).toBeUndefined();
+		expect(pool.drain(0).map(i => i.payload)).toEqual(["first"]);
+	});
+
+	test("does not coalesce identified jobs", () => {
+		const pool = new RateLimitPool<string>({ capacity: 2, refillPerSec: 0, now: () => 0 });
+		pool.submit({ ...item("s1", "ask", "first", "same-key"), itemId: "receipt-1" });
+		pool.submit({ ...item("s1", "ask", "second", "same-key"), itemId: "receipt-2" });
+
+		expect(pool.pending).toBe(2);
+		expect(pool.drain(0).map(i => i.payload)).toEqual(["first", "second"]);
 	});
 
 	test("removes matching queued items without consuming tokens", () => {
@@ -83,5 +130,17 @@ describe("RateLimitPool", () => {
 		expect(removed.map(i => i.payload)).toEqual(["s1-live"]);
 		expect(pool.pending).toBe(1);
 		expect(pool.drain(60_000).map(i => i.payload)).toEqual([]);
+	});
+	test("detects a queued coalesced successor without mutating the queue", () => {
+		const pool = new RateLimitPool<string>({ capacity: 1, refillPerSec: 0, now: () => 0 });
+		pool.submit(item("s1", "live", "latest", "preview"));
+
+		expect(
+			pool.someQueued(
+				queued => queued.sessionId === "s1" && queued.lane === "live" && queued.coalesceKey === "preview",
+			),
+		).toBe(true);
+		expect(pool.someQueued(queued => queued.sessionId === "missing")).toBe(false);
+		expect(pool.pending).toBe(1);
 	});
 });

@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { Skill } from "@gajae-code/coding-agent/extensibility/skills";
+import { appendOrMergeDeepInterviewRound } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
@@ -14,6 +15,23 @@ import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { SkillTool } from "@gajae-code/coding-agent/tools/skill";
 
 const TEST_SESSION_ID = "test-session";
+const INITIAL_SESSION_ID = process.env.GJC_SESSION_ID;
+
+function restoreSessionId(sessionId: string | undefined): void {
+	if (sessionId === undefined) delete process.env.GJC_SESSION_ID;
+	else process.env.GJC_SESSION_ID = sessionId;
+}
+
+function parseRequiredJson(text: string | undefined, source: string): Record<string, unknown> {
+	if (typeof text !== "string" || text.trim().length === 0) {
+		throw new Error(`${source} must contain non-empty JSON output`);
+	}
+	const parsed: unknown = JSON.parse(text);
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error(`${source} must contain a JSON object`);
+	}
+	return parsed as Record<string, unknown>;
+}
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const roots: string[] = [];
@@ -26,15 +44,17 @@ async function tempDir(prefix = "gjc-handoff-thrift-"): Promise<string> {
 
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map(root => fs.rm(root, { recursive: true, force: true })));
-	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+	restoreSessionId(INITIAL_SESSION_ID);
 });
+
+const escapedTempRoot = os.tmpdir().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const activeTempArtifact = new RegExp(`${escapedTempRoot}/(?:skill-tool|gjc)-[^\\n"]+`, "g");
 
 function scrub(text: string): string {
 	return text
+		.replaceAll(activeTempArtifact, "/tmp/SCRUBBED")
 		.replaceAll(/\/var\/folders\/[^\n"]+/g, "/tmp/SCRUBBED")
 		.replaceAll(/\/private\/var\/[^\n"]+/g, "/tmp/SCRUBBED")
-		.replaceAll(/\/tmp\/skill-tool-[^\n"]+/g, "/tmp/SCRUBBED")
-		.replaceAll(/\/tmp\/gjc-[^\n"]+/g, "/tmp/SCRUBBED")
 		.replaceAll(/[0-9a-f]{64}/g, "<sha256>")
 		.replaceAll(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/g, "<iso>");
 }
@@ -95,13 +115,21 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 			root,
 		);
 		expect(ralplanReceipt.status).toBe(0);
-		const ralplanReceiptPayload = JSON.parse(ralplanReceipt.stdout ?? "{}") as Record<string, unknown>;
+		const ralplanReceiptPayload = parseRequiredJson(ralplanReceipt.stdout, "ralplan receipt stdout");
+		const ralplanReceiptBinding = ralplanReceiptPayload.repository_binding;
+		expect(ralplanReceiptBinding).toEqual({
+			schema: "gjc.repository_binding.v1",
+			worktreeRoot: root,
+			commonDir: null,
+			displayPath: root,
+		});
 		assertKeys(ralplanReceiptPayload, [
 			"run_id",
 			"path",
 			"stage",
 			"stage_n",
 			"sha256",
+			"repository_binding",
 			"created_at",
 			"pending_approval_path",
 		]);
@@ -112,16 +140,45 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 			  "stage": "final",
 			  "stage_n": 2,
 			  "sha256": "<sha256>",
+			  "repository_binding": {
+			    "schema": "gjc.repository_binding.v1",
+			    "worktreeRoot": "/tmp/SCRUBBED",
+			    "commonDir": null,
+			    "displayPath": "/tmp/SCRUBBED"
+			  },
 			  "created_at": "<iso>",
 			  "pending_approval_path": "/tmp/SCRUBBED"
 			}
 			"
 			`);
+		const deduplicatedRalplanReceipt = await runNativeRalplanCommand(
+			["--write", "--stage", "final", "--stage_n", "2", "--artifact", "# Final", "--run-id", "run-b", "--json"],
+			root,
+		);
+		expect(deduplicatedRalplanReceipt.status).toBe(0);
+		const deduplicatedPayload = parseRequiredJson(
+			deduplicatedRalplanReceipt.stdout,
+			"deduplicated ralplan receipt stdout",
+		);
+		expect(deduplicatedPayload.deduplicated).toBe(true);
+		expect(deduplicatedPayload.repository_binding).toEqual(ralplanReceiptBinding);
+		assertKeys(deduplicatedPayload, [
+			"run_id",
+			"path",
+			"stage",
+			"stage_n",
+			"sha256",
+			"repository_binding",
+			"created_at",
+			"pending_approval_path",
+		]);
 
 		const ralplanSeed = await runNativeRalplanCommand(["--json", "scope the work"], root);
 		expect(ralplanSeed.status).toBe(0);
+		const ralplanSeedPayload = parseRequiredJson(ralplanSeed.stdout, "ralplan seed stdout");
+		expect(ralplanSeedPayload.repository_binding).toEqual(ralplanReceiptBinding);
 		expect(scrub(ralplanSeed.stdout ?? "")).toMatchInlineSnapshot(`
-			"{"ok":true,"skill":"ralplan","mode":"short","state_path":"/tmp/SCRUBBED","run_id":"run-b","handoff":"/skill:ralplan"}
+			"{"ok":true,"skill":"ralplan","mode":"short","state_path":"/tmp/SCRUBBED","run_id":"run-b","handoff":"/skill:ralplan","repository_binding":{"schema":"gjc.repository_binding.v1","worktreeRoot":"/tmp/SCRUBBED","commonDir":null,"displayPath":"/tmp/SCRUBBED"}}
 			"
 			`);
 
@@ -130,20 +187,53 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 			root,
 		);
 		expect(deepSeed.status).toBe(0);
-		const deepSeedPayload = JSON.parse(deepSeed.stdout ?? "{}") as Record<string, unknown>;
+		const deepSeedPayload = parseRequiredJson(deepSeed.stdout, "deep-interview seed stdout");
 		assertKeys(deepSeedPayload, ["state_path", "handoff"]);
 		expect(deepSeedPayload.handoff).toBe("/skill:deep-interview");
 		expect(scrub(deepSeed.stdout ?? "")).toMatchInlineSnapshot(`
-			"{"skill":"deep-interview","resolution":"standard","threshold":0.05,"threshold_source":"flag:explicit","idea":"clarify this idea","state_path":"/tmp/SCRUBBED","handoff":"/skill:deep-interview"}
+			"{"skill":"deep-interview","resolution":"standard","threshold":0.05,"threshold_source":"flag:explicit","idea":"clarify this idea","state_path":"/tmp/SCRUBBED","warnings":[],"handoff":"/skill:deep-interview"}
 			"
 			`);
-
-		const deepWrite = await runNativeDeepInterviewCommand(
+		const blockedDeepWrite = await runNativeDeepInterviewCommand(
 			["--write", "--stage", "final", "--slug", "matrix", "--spec", "# Spec", "--deliberate", "--json"],
 			root,
 		);
+		expect(blockedDeepWrite.status).toBe(2);
+		expect(blockedDeepWrite.stderr).toContain("missing Round 0 intent contract");
+		await appendOrMergeDeepInterviewRound(
+			root,
+			modeStatePath(root, TEST_SESSION_ID, "deep-interview"),
+			{
+				round: 0,
+				questionId: "intent-confirmation",
+				questionText: "Confirm locked intent",
+				component: "review-topology",
+				dimension: "topology",
+				selectedOptions: ["Confirm"],
+				intent_contract: {
+					items: [{ id: "artifact:matrix", category: "artifact", statement: "Preserve the handoff matrix" }],
+					confirmation_options: ["Confirm"],
+				},
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
+
+		const deepWrite = await runNativeDeepInterviewCommand(
+			[
+				"--write",
+				"--stage",
+				"final",
+				"--slug",
+				"matrix",
+				"--spec",
+				"# Spec\n\nartifact:matrix",
+				"--deliberate",
+				"--json",
+			],
+			root,
+		);
 		expect(deepWrite.status).toBe(0);
-		const deepWritePayload = JSON.parse(deepWrite.stdout ?? "{}") as Record<string, unknown>;
+		const deepWritePayload = parseRequiredJson(deepWrite.stdout, "deep-interview write stdout");
 		assertKeys(deepWritePayload, ["path", "sha256", "spec_path", "sha", "state_path", "handoff"]);
 		expect(deepWritePayload.spec_path).toBe(deepWritePayload.path);
 		expect(deepWritePayload.sha).toBe(deepWritePayload.sha256);
@@ -161,15 +251,26 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 			version: 1,
 			active: true,
 			current_phase: "interviewing",
+			owner_generation: "deep-interview-generation",
 		});
 		const stateHandoff = await runNativeStateCommand(
 			["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
 			root,
 		);
 		expect(stateHandoff.status).toBe(0);
-		const statePayload = JSON.parse(stateHandoff.stdout ?? "{}") as Record<string, unknown>;
+		const statePayload = parseRequiredJson(stateHandoff.stdout, "state handoff stdout");
 		assertKeys(statePayload, ["ok", "from", "to", "handoff_at", "phases", "receipts", "paths"]);
 		expect(statePayload.state).toBeUndefined();
+		const preservedCaller = parseRequiredJson(
+			await fs.readFile(modeStatePath(root, TEST_SESSION_ID, "deep-interview"), "utf-8"),
+			"deep-interview mode state",
+		);
+		const successor = parseRequiredJson(
+			await fs.readFile(modeStatePath(root, TEST_SESSION_ID, "ralplan"), "utf-8"),
+			"ralplan mode state",
+		);
+		expect(preservedCaller.owner_generation).toBe("deep-interview-generation");
+		expect(successor.owner_generation).toBeUndefined();
 		expect(scrub(stateHandoff.stdout ?? "")).toMatchInlineSnapshot(`
 			"{"ok":true,"from":"deep-interview","to":"ralplan","handoff_at":"<iso>","phases":{"from":"handoff","to":"planner"},"receipts":{"from":{"mutation_id":"deep-interview:handoff:ralplan:<iso>","status":"fresh","content_sha256":{"algorithm":"sha256","value":"<sha256>","covered_path":"/tmp/SCRUBBED","computed_at":"<iso>"}},"to":{"mutation_id":"deep-interview:handoff:ralplan:<iso>","status":"fresh","content_sha256":{"algorithm":"sha256","value":"<sha256>","covered_path":"/tmp/SCRUBBED","computed_at":"<iso>"}}},"paths":{"from":"/tmp/SCRUBBED","to":"/tmp/SCRUBBED","active_state":"/tmp/SCRUBBED"}}
 			"
@@ -227,9 +328,8 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 		};
 		const tool = SkillTool.createIf(session)!;
 		const skillResult = await tool.execute("call", { name: "ralplan", args: "review" });
-		const skillPayload = JSON.parse(
-			skillResult.content[0]?.type === "text" ? skillResult.content[0].text : "{}",
-		) as Record<string, unknown>;
+		const skillText = skillResult.content[0]?.type === "text" ? skillResult.content[0].text : undefined;
+		const skillPayload = parseRequiredJson(skillText, "skill tool stdout");
 		assertKeys(skillPayload, ["callee", "path", "args", "lineCount"]);
 		expect(captured[0]?.message.customType).toBe(SKILL_PROMPT_MESSAGE_TYPE);
 		expect(captured[0]?.message.content).toContain("# Ralplan");

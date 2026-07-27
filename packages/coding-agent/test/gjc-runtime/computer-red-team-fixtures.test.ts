@@ -99,9 +99,8 @@ function syntheticPng(): Buffer {
 	return Buffer.concat([PNG_SIGNATURE, pngChunk("IHDR", ihdr), pngChunk("IDAT", deflateSync(raw)), pngChunk("IEND")]);
 }
 
-let activeObjective = "";
 async function seedPlan(root: string): Promise<void> {
-	const created = await createUltragoalPlan({
+	await createUltragoalPlan({
 		cwd: root,
 		brief: "@goal computer gate fixture",
 	});
@@ -111,20 +110,7 @@ async function seedPlan(root: string): Promise<void> {
 		path.relative(root, path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "ledger.jsonl")),
 	]);
 	await runGit(root, ["commit", "-m", "plan"]);
-	activeObjective = created.gjcObjective;
 	await startNextUltragoalGoal({ cwd: root });
-}
-
-function goalSnapshot(): string {
-	return JSON.stringify({
-		goal: {
-			threadId: "test-thread",
-			objective: activeObjective,
-			status: "active",
-			createdAt: Date.now(),
-			updatedAt: Date.now(),
-		},
-	});
 }
 
 function artifact(kind = "native screenshot"): Record<string, unknown> {
@@ -218,6 +204,11 @@ function qualityGate(qa: Record<string, unknown>): string {
 			evidence: "targeted fixture rerun passed",
 			blockers: [],
 		},
+		criticReview: {
+			verdict: "OKAY",
+			evidence: "critic approved final aggregate terminus",
+			blockers: [],
+		},
 	});
 }
 
@@ -236,8 +227,6 @@ async function checkpoint(root: string, qa: Record<string, unknown>): Promise<st
 			"complete",
 			"--evidence",
 			"fixture complete",
-			"--gjc-goal-json",
-			goalSnapshot(),
 			"--quality-gate-json",
 			qualityGate(qa),
 		],
@@ -246,9 +235,13 @@ async function checkpoint(root: string, qa: Record<string, unknown>): Promise<st
 	return (result.stderr ?? "") + (result.stdout ?? "");
 }
 
-async function seedComputerChange(root: string, file = "crates/pi-natives/src/computer/executor.rs"): Promise<void> {
+async function seedComputerChange(
+	root: string,
+	file = "crates/pi-natives/src/computer/executor.rs",
+	content = "// computer change\n",
+): Promise<void> {
 	await fs.mkdir(path.dirname(path.join(root, file)), { recursive: true });
-	await fs.writeFile(path.join(root, file), "// computer change\n");
+	await fs.writeFile(path.join(root, file), content);
 	await runGit(root, ["add", file]);
 }
 
@@ -340,6 +333,48 @@ describe("computer red-team fixture matrix", () => {
 		expect(await checkpoint(root, qa)).toContain("Checkpointed G001 as complete");
 	});
 
+	it("does not trigger from non-computer edit to tools index registration", async () => {
+		const root = await tempDir();
+		await initRepo(root);
+		await seedPlan(root);
+		await writeQaArtifacts(root);
+		await seedComputerChange(root, "packages/coding-agent/src/tools/index.ts");
+		const cases = (executorQa().adversarialCases as Record<string, unknown>[]).filter(
+			row => row.id !== "blast-radius",
+		);
+		const qa = executorQa({ computerTouching: false, cases, surface: "native" });
+		expect(await checkpoint(root, qa)).toContain("Checkpointed G001 as complete");
+	});
+
+	it("triggers from computer-specific tools index registration diff", async () => {
+		const root = await tempDir();
+		await initRepo(root);
+		await seedPlan(root);
+		await writeQaArtifacts(root);
+		await seedComputerChange(
+			root,
+			"packages/coding-agent/src/tools/index.ts",
+			`import { ComputerTool, isComputerCallable, isComputerLoadablePlatform } from "./computer";
+
+export const BUILTIN_TOOLS = {
+	...(isComputerLoadablePlatform() ? { computer: ComputerTool.createIf } : {}),
+};
+
+export function isToolAllowed(name: string): boolean {
+	if (name === "computer") return isComputerCallable({});
+	return true;
+}
+`,
+		);
+		const cases = (executorQa().adversarialCases as Record<string, unknown>[]).filter(
+			row => row.id !== "blast-radius",
+		);
+		const message = await checkpoint(root, executorQa({ computerTouching: false, cases })).catch(error =>
+			String(error),
+		);
+		expect(message).toContain("COMPUTER_REDTEAM_CASE_MISSING");
+	});
+
 	it("allows non-operational docs-only computer tiering", async () => {
 		const root = await tempDir();
 		await initRepo(root);
@@ -348,5 +383,60 @@ describe("computer red-team fixture matrix", () => {
 		await seedComputerChange(root, "docs/computer-use/README.md");
 		const qa = executorQa({ computerTouching: false, surface: "native" });
 		expect(await checkpoint(root, qa)).toContain("Checkpointed G001 as complete");
+	});
+
+	it("does not trigger from a non-computer settings-schema edit", async () => {
+		const root = await tempDir();
+		await initRepo(root);
+		await seedPlan(root);
+		await writeQaArtifacts(root);
+		await seedComputerChange(
+			root,
+			"packages/coding-agent/src/config/settings-schema.ts",
+			`export const SETTINGS = {\n\t"tools.maxInlineResultBytes": { type: "number", default: 0 },\n};\n`,
+		);
+		const cases = (executorQa().adversarialCases as Record<string, unknown>[]).filter(
+			row => row.id !== "blast-radius",
+		);
+		const qa = executorQa({ computerTouching: false, cases, surface: "native" });
+		expect(await checkpoint(root, qa)).toContain("Checkpointed G001 as complete");
+	});
+
+	it("does not trigger from CI path-only non-computer settings-schema edit", async () => {
+		const root = await tempDir();
+		await createUltragoalPlan({ cwd: root, brief: "@goal computer gate fixture" });
+		await startNextUltragoalGoal({ cwd: root });
+		await writeQaArtifacts(root);
+		const savedChangedPaths = process.env.CI_DEV_CHANGED_PATHS;
+		process.env.CI_DEV_CHANGED_PATHS = "packages/coding-agent/src/config/settings-schema.ts";
+		try {
+			const cases = (executorQa().adversarialCases as Record<string, unknown>[]).filter(
+				row => row.id !== "blast-radius",
+			);
+			const qa = executorQa({ computerTouching: false, cases, surface: "native" });
+			expect(await checkpoint(root, qa)).toContain("Checkpointed G001 as complete");
+		} finally {
+			if (savedChangedPaths === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
+			else process.env.CI_DEV_CHANGED_PATHS = savedChangedPaths;
+		}
+	});
+
+	it("triggers from a computer-specific settings-schema diff", async () => {
+		const root = await tempDir();
+		await initRepo(root);
+		await seedPlan(root);
+		await writeQaArtifacts(root);
+		await seedComputerChange(
+			root,
+			"packages/coding-agent/src/config/settings-schema.ts",
+			`export const SETTINGS = {\n\t"computer.enabled": { type: "boolean", default: false },\n};\n`,
+		);
+		const cases = (executorQa().adversarialCases as Record<string, unknown>[]).filter(
+			row => row.id !== "blast-radius",
+		);
+		const message = await checkpoint(root, executorQa({ computerTouching: false, cases })).catch(error =>
+			String(error),
+		);
+		expect(message).toContain("COMPUTER_REDTEAM_CASE_MISSING");
 	});
 });

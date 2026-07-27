@@ -16,18 +16,32 @@ import { ToolExecutionComponent } from "../../modes/components/tool-execution";
 import { TtsrNotificationComponent } from "../../modes/components/ttsr-notification";
 import { getSymbolTheme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext, TodoPhase } from "../../modes/types";
-import { summaryFromMessage } from "../../notifications/helpers";
 import type { PlanApprovalDetails } from "../../plan-mode/approved-plan";
+import { completionNotifyDisabledByEnv } from "../../sdk/bus/config";
+import { summaryFromMessage } from "../../sdk/bus/helpers";
 import type { AgentSessionEvent } from "../../session/agent-session";
-import { isSilentAbort, readPendingDisplayTag } from "../../session/messages";
+import { type CustomMessage, isSilentAbort, readPendingDisplayTag } from "../../session/messages";
+import { transferSessionMessageIdentity } from "../../session/session-manager";
 import type { ResolveToolDetails } from "../../tools/resolve";
+import type { IrcObservationRecord } from "../irc-observation-ledger";
 import { interruptHint } from "../shared";
 import { buildAbortDisplayMessage } from "../utils/abort-message";
+import { consumeInjectedOptimisticSignature } from "../utils/injected-user-submission";
+import { parseIrcMessage } from "../utils/irc-message";
 import { ringTerminalBell } from "../utils/terminal-bell";
+
+import { addChatChild, argsWithPartialJson } from "../utils/ui-helpers";
 
 type AgentSessionEventKind = AgentSessionEvent["type"];
 
-const IRC_MESSAGE_VISIBLE_TTL_MS = 10_000;
+/** Test-only performance counters for advisory baseline tests. */
+export const __eventControllerPerfCounters = {
+	messageUpdateContentVisits: 0,
+	reset(): void {
+		this.messageUpdateContentVisits = 0;
+	},
+};
+
 const COMPLETION_NOTIFY_COMMAND_TIMEOUT_MS = 10_000;
 
 interface CompletionNotifyPayload {
@@ -100,6 +114,9 @@ export class EventController {
 	#lastAssistantComponent: AssistantMessageComponent | undefined = undefined;
 	#idleCompactionTimer?: NodeJS.Timeout;
 	#ircExpiryTimers = new Map<string, NodeJS.Timeout>();
+	#renderedIrcComponents = new Map<string, readonly Component[]>();
+	#toolIntentCache = new Map<string, { args: unknown; intent: string | undefined }>();
+	#thinkingContentIndices = new Set<number>();
 	#handlers: AgentSessionEventHandlers;
 
 	constructor(private ctx: InteractiveModeContext) {
@@ -118,14 +135,13 @@ export class EventController {
 			auto_compaction_end: e => this.#handleAutoCompactionEnd(e),
 			auto_retry_start: e => this.#handleAutoRetryStart(e),
 			auto_retry_end: e => this.#handleAutoRetryEnd(e),
-			retry_fallback_applied: e => this.#handleRetryFallbackApplied(e),
-			retry_fallback_succeeded: e => this.#handleRetryFallbackSucceeded(e),
 			ttsr_triggered: e => this.#handleTtsrTriggered(e),
 			todo_reminder: e => this.#handleTodoReminder(e),
 			todo_auto_clear: e => this.#handleTodoAutoClear(e),
 			irc_message: e => this.#handleIrcMessage(e),
 			subagent_steer_message: e => this.#handleSubagentSteerMessage(e),
 			notice: e => this.#handleNotice(e),
+			model_fallback_switched: e => this.#handleModelFallbackSwitched(e),
 			thinking_level_changed: async () => {},
 			goal_updated: async () => {},
 		} satisfies AgentSessionEventHandlers;
@@ -138,14 +154,12 @@ export class EventController {
 			this.ctx.editor.onEscape = this.ctx.retryEscapeHandler;
 			this.ctx.retryEscapeHandler = undefined;
 		}
+		this.ctx.retryEscapePrimed = false;
 		if (this.ctx.retryLoader) {
 			this.ctx.retryLoader.stop();
 			this.ctx.retryLoader = undefined;
 		}
-		for (const timer of this.#ircExpiryTimers.values()) {
-			clearTimeout(timer);
-		}
-		this.#ircExpiryTimers.clear();
+		this.clearIrcExpiryTimers();
 	}
 
 	#resetReadGroup(): void {
@@ -154,12 +168,12 @@ export class EventController {
 
 	#getReadGroup(): ReadToolGroupComponent {
 		if (!this.#lastReadGroup) {
-			this.ctx.chatContainer.addChild(new Text("", 0, 0));
+			addChatChild(this.ctx, new Text("", 0, 0));
 			const group = new ReadToolGroupComponent({
 				showContentPreview: this.ctx.settings.get("read.toolResultPreview"),
 			});
 			group.setExpanded(this.ctx.toolOutputExpanded);
-			this.ctx.chatContainer.addChild(group);
+			addChatChild(this.ctx, group);
 			this.#lastReadGroup = group;
 		}
 		return this.#lastReadGroup;
@@ -224,9 +238,11 @@ export class EventController {
 
 		const run = this.#handlers[event.type] as (e: AgentSessionEvent) => Promise<void>;
 		await run(event);
+		if (this.ctx.isTranscriptViewerOpen?.()) this.ctx.refreshTranscriptViewer?.();
 	}
 
 	async #handleAgentStart(_event: Extract<AgentSessionEvent, { type: "agent_start" }>): Promise<void> {
+		this.ctx.promptSuggestion?.onAgentStart();
 		this.#lastIntent = undefined;
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
@@ -241,14 +257,68 @@ export class EventController {
 			this.ctx.retryLoader = undefined;
 			this.ctx.statusContainer.clear();
 		}
+		this.ctx.retryEscapePrimed = false;
 		this.#cancelIdleCompaction();
 		this.ctx.updateEditorBorderColor();
 		this.ctx.ensureLoadingAnimation();
 		this.ctx.ui.requestRender();
 	}
 
+	#observeIrcMessage(message: CustomMessage): void {
+		const parsed = parseIrcMessage(message);
+		if (!parsed) return;
+		const arrival = this.ctx.captureIrcArrivalSnapshot();
+		const record = this.ctx.ircLedger.observe(parsed, arrival.panelVisible);
+		this.#cleanupEvictedIrcObservations();
+		if (!record) return;
+		const signature = `irc:${record.observationId}`;
+		if (this.#renderedCustomMessages.has(signature)) return;
+		this.#renderedCustomMessages.add(signature);
+		this.#resetReadGroup();
+		const components = this.ctx.addLiveIrcObservationToChat(record, arrival);
+		this.#renderedIrcComponents.set(record.observationId, components);
+		this.#scheduleIrcExpiry(record, components);
+		this.ctx.ui.requestRender();
+	}
+
+	#cleanupIrcObservationIds(observationIds: readonly string[]): void {
+		const removedComponents = new Set<Component>();
+		for (const observationId of observationIds) {
+			const timer = this.#ircExpiryTimers.get(observationId);
+			if (timer) clearTimeout(timer);
+			this.#ircExpiryTimers.delete(observationId);
+			for (const component of this.#renderedIrcComponents.get(observationId) ?? []) {
+				removedComponents.add(component);
+			}
+			this.#renderedIrcComponents.delete(observationId);
+			for (const component of this.ctx.removeRenderedIrcInlineComponents(observationId) ?? []) {
+				removedComponents.add(component);
+			}
+
+			this.#renderedCustomMessages.delete(`irc:${observationId}`);
+		}
+		for (const component of removedComponents) this.ctx.chatContainer.removeChild(component);
+	}
+
+	#cleanupEvictedIrcObservations(): void {
+		this.#cleanupIrcObservationIds(this.ctx.ircLedger.drainEvictedObservationIds());
+	}
+
+	#cleanupExpiredIrcInlineComponents(observationId: string): void {
+		const removedComponents = new Set<Component>(this.#renderedIrcComponents.get(observationId));
+		this.#renderedIrcComponents.delete(observationId);
+		for (const component of this.ctx.removeRenderedIrcInlineComponents(observationId) ?? []) {
+			removedComponents.add(component);
+		}
+		for (const component of removedComponents) this.ctx.chatContainer.removeChild(component);
+	}
+
 	async #handleMessageStart(event: Extract<AgentSessionEvent, { type: "message_start" }>): Promise<void> {
 		if (event.message.role === "hookMessage" || event.message.role === "custom") {
+			if (event.message.role === "custom" && parseIrcMessage(event.message)) {
+				this.#observeIrcMessage(event.message);
+				return;
+			}
 			const signature = `${event.message.role}:${event.message.customType}:${event.message.timestamp}`;
 			if (this.#renderedCustomMessages.has(signature)) {
 				return;
@@ -277,12 +347,17 @@ export class EventController {
 			const signature = `${textContent}\u0000${imageCount}`;
 
 			this.#resetReadGroup();
-			const wasOptimistic = this.ctx.optimisticUserMessageSignature === signature;
+			const wasSingleOptimistic = this.ctx.optimisticUserMessageSignature === signature;
+			const wasInjectedOptimistic = !wasSingleOptimistic && consumeInjectedOptimisticSignature(this.ctx, signature);
+			const wasOptimistic = wasSingleOptimistic || wasInjectedOptimistic;
 			const wasLocallySubmitted = this.ctx.locallySubmittedUserSignatures.delete(signature) || wasOptimistic;
 			if (!wasOptimistic) {
 				this.ctx.addMessageToChat(event.message);
 			}
-			if (wasOptimistic) {
+			// Only clear the single local slot when IT matched; an injected match is
+			// consumed from the counting Map above and must not clobber a coexisting
+			// pending local optimistic signature.
+			if (wasSingleOptimistic) {
 				this.ctx.optimisticUserMessageSignature = undefined;
 			}
 
@@ -305,26 +380,105 @@ export class EventController {
 		} else if (event.message.role === "assistant") {
 			this.#lastThinkingCount = 0;
 			this.#resetReadGroup();
-			this.ctx.streamingComponent = new AssistantMessageComponent(undefined, this.ctx.hideThinkingBlock, () =>
-				this.ctx.ui.requestRender(),
+			this.#toolIntentCache.clear();
+			this.#thinkingContentIndices.clear();
+			this.ctx.streamingComponent = new AssistantMessageComponent(
+				undefined,
+				this.ctx.hideThinkingBlock,
+				() => this.ctx.ui.requestRender(),
+				this.ctx.getAssistantViewportAnchorId?.(event.message),
 			);
 			this.ctx.streamingMessage = event.message;
-			this.ctx.chatContainer.addChild(this.ctx.streamingComponent);
-			this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage);
+			addChatChild(this.ctx, this.ctx.streamingComponent);
+			this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage, { streaming: true });
 			this.ctx.ui.requestRender();
 		}
 	}
 
 	async #handleIrcMessage(event: Extract<AgentSessionEvent, { type: "irc_message" }>): Promise<void> {
-		const signature = `${event.message.role}:${event.message.customType}:${event.message.timestamp}`;
-		if (this.#renderedCustomMessages.has(signature)) {
-			return;
+		this.#observeIrcMessage(event.message);
+	}
+
+	clearIrcExpiryTimers(): void {
+		for (const timer of this.#ircExpiryTimers.values()) {
+			clearTimeout(timer);
 		}
-		this.#renderedCustomMessages.add(signature);
-		this.#resetReadGroup();
-		const components = this.ctx.addMessageToChat(event.message);
-		this.#scheduleIrcExpiry(signature, components);
-		this.ctx.ui.requestRender();
+		this.#ircExpiryTimers.clear();
+	}
+
+	resetIrcObservations(): void {
+		this.clearIrcExpiryTimers();
+		const observationIds = new Set<string>(this.#renderedIrcComponents.keys());
+		for (const observationId of this.ctx.ircLedger.drainEvictedObservationIds()) observationIds.add(observationId);
+		this.#cleanupIrcObservationIds([...observationIds]);
+		for (const components of this.ctx.resetRenderedIrcInlineComponents()) {
+			for (const component of components) this.ctx.chatContainer.removeChild(component);
+		}
+		this.#renderedIrcComponents.clear();
+		for (const signature of this.#renderedCustomMessages) {
+			if (signature.startsWith("irc:")) this.#renderedCustomMessages.delete(signature);
+		}
+	}
+
+	reconcileIrcExpiryTimers(componentsByObservationId: Map<string, readonly Component[]>): void {
+		this.clearIrcExpiryTimers();
+		this.#renderedIrcComponents.clear();
+		const now = Date.now();
+		const inlineProjection = this.ctx.ircLedger.getInlineProjection(now);
+
+		this.#cleanupEvictedIrcObservations();
+		const projectedObservationIds = new Set(inlineProjection.map(record => record.observationId));
+		for (const [observationId, components] of componentsByObservationId) {
+			const record = this.ctx.ircLedger.getRecord(observationId);
+			if (
+				!projectedObservationIds.has(observationId) ||
+				(record?.mode === "ephemeral" && record.expiresAt! - now <= 0)
+			) {
+				for (const component of components) {
+					this.ctx.chatContainer.removeChild(component);
+				}
+				this.#renderedIrcComponents.delete(observationId);
+				componentsByObservationId.delete(observationId);
+			}
+		}
+		for (const record of inlineProjection) {
+			const components = componentsByObservationId.get(record.observationId);
+			if (!components) continue;
+			this.#renderedIrcComponents.set(record.observationId, components);
+			// #scheduleIrcExpiry owns the single expiry clock read: a record that
+			// crossed its deadline while projection/reconciliation ran above is
+			// cleaned up there (old timers were already cleared, so silently
+			// skipping the timer would leave the row inline indefinitely).
+			if (!this.#scheduleIrcExpiry(record, components)) {
+				componentsByObservationId.delete(record.observationId);
+			}
+		}
+	}
+
+	/**
+	 * Arms the removal timer for an ephemeral record using a single clock read.
+	 * Returns false when the record's deadline has already elapsed — in that
+	 * case the rendered components are removed from the chat container and
+	 * {@link #renderedIrcComponents} here, and the caller must drop its own
+	 * bookkeeping entry. Persistent records always return true (no timer).
+	 */
+	#scheduleIrcExpiry(record: IrcObservationRecord, components: readonly Component[]): boolean {
+		if (record.mode !== "ephemeral" || components.length === 0 || this.#ircExpiryTimers.has(record.observationId)) {
+			return true;
+		}
+		const remainingMs = record.expiresAt! - Date.now();
+		if (remainingMs <= 0) {
+			this.#cleanupExpiredIrcInlineComponents(record.observationId);
+			return false;
+		}
+		const timer = setTimeout(() => {
+			this.#ircExpiryTimers.delete(record.observationId);
+			this.#cleanupExpiredIrcInlineComponents(record.observationId);
+			this.ctx.ui.requestRender();
+		}, remainingMs);
+		timer.unref?.();
+		this.#ircExpiryTimers.set(record.observationId, timer);
+		return true;
 	}
 
 	async #handleSubagentSteerMessage(
@@ -337,26 +491,19 @@ export class EventController {
 		const signature = obsId
 			? `steer:${obsId}`
 			: `${event.message.role}:${event.message.customType}:${event.message.timestamp}:${details?.from}:${details?.to}:${details?.state}:${details?.body}`;
-		if (this.#renderedCustomMessages.has(signature)) {
-			return;
-		}
+		if (this.#renderedCustomMessages.has(signature)) return;
 		this.#renderedCustomMessages.add(signature);
 		this.#resetReadGroup();
 		this.ctx.addMessageToChat(event.message);
 		this.ctx.ui.requestRender();
 	}
 
-	#scheduleIrcExpiry(signature: string, components: Component[]): void {
-		if (components.length === 0 || this.#ircExpiryTimers.has(signature)) return;
-		const timer = setTimeout(() => {
-			this.#ircExpiryTimers.delete(signature);
-			for (const component of components) {
-				this.ctx.chatContainer.removeChild(component);
-			}
-			this.ctx.ui.requestRender();
-		}, IRC_MESSAGE_VISIBLE_TTL_MS);
-		timer.unref?.();
-		this.#ircExpiryTimers.set(signature, timer);
+	async #handleModelFallbackSwitched(
+		event: Extract<AgentSessionEvent, { type: "model_fallback_switched" }>,
+	): Promise<void> {
+		this.ctx.showStatus(`Fallback model: ${event.from} → ${event.to}`);
+		this.ctx.statusLine.invalidate();
+		this.ctx.ui.requestRender();
 	}
 
 	async #handleNotice(event: Extract<AgentSessionEvent, { type: "notice" }>): Promise<void> {
@@ -372,50 +519,60 @@ export class EventController {
 
 	async #handleMessageUpdate(event: Extract<AgentSessionEvent, { type: "message_update" }>): Promise<void> {
 		if (this.ctx.streamingComponent && event.message.role === "assistant") {
+			if (this.ctx.streamingMessage?.role === "assistant") {
+				transferSessionMessageIdentity([this.ctx.streamingMessage], [event.message]);
+			}
 			this.ctx.streamingMessage = event.message;
-			this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage);
+			this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage, { streaming: true });
+			const contentIndex = event.assistantMessageEvent?.contentIndex;
+			const changedContent =
+				typeof contentIndex === "number" && contentIndex >= 0
+					? this.ctx.streamingMessage.content[contentIndex]
+					: undefined;
+			const contentsToProcess = changedContent ? [changedContent] : this.ctx.streamingMessage.content;
 
-			const thinkingCount = this.ctx.streamingMessage.content.filter(
-				content => content.type === "thinking" && content.thinking.trim(),
-			).length;
-			if (thinkingCount > this.#lastThinkingCount) {
-				this.#resetReadGroup();
-				this.#lastThinkingCount = thinkingCount;
+			if (changedContent?.type === "thinking" && changedContent.thinking.trim()) {
+				if (typeof contentIndex === "number") this.#thinkingContentIndices.add(contentIndex);
+				const thinkingCount = this.#thinkingContentIndices.size;
+				if (thinkingCount > this.#lastThinkingCount) {
+					this.#resetReadGroup();
+					this.#lastThinkingCount = thinkingCount;
+				}
+			} else if (!changedContent) {
+				const thinkingCount = this.ctx.streamingMessage.content.filter(
+					content => content.type === "thinking" && content.thinking.trim(),
+				).length;
+				if (thinkingCount > this.#lastThinkingCount) {
+					this.#resetReadGroup();
+					this.#lastThinkingCount = thinkingCount;
+				}
 			}
 
-			for (const content of this.ctx.streamingMessage.content) {
+			for (const content of contentsToProcess) {
+				__eventControllerPerfCounters.messageUpdateContentVisits += 1;
 				if (content.type !== "toolCall") continue;
 				if (content.name === "read") {
-					if (!readArgsHaveTarget(content.arguments)) {
-						// Args still streaming — defer until path is parseable so we can route to the
-						// read group (regular files) vs ToolExecutionComponent (internal URLs).
-						// Creating either component now would lock the read into the wrong shape.
-						continue;
-					}
+					if (!readArgsHaveTarget(content.arguments)) continue;
 					if (!readArgsTargetInternalUrl(content.arguments)) {
 						this.#trackReadToolCall(content.id, content.arguments);
 						const component = this.ctx.pendingTools.get(content.id);
-						if (component) {
-							component.updateArgs(content.arguments, content.id);
-						} else {
+						if (component) component.updateArgs(content.arguments, content.id);
+						else {
 							const group = this.#getReadGroup();
 							group.updateArgs(content.arguments, content.id);
 							this.ctx.pendingTools.set(content.id, group);
 						}
 						continue;
 					}
-					// Internal URL read falls through to ToolExecutionComponent below.
 				}
 
-				// Preserve the raw partial JSON for renderers that need to surface fields before the JSON object closes.
-				// Bash uses this to show inline env assignments during streaming instead of popping them in at completion.
-				const renderArgs =
-					"partialJson" in content
-						? { ...content.arguments, __partialJson: content.partialJson }
-						: content.arguments;
+				const renderArgs = argsWithPartialJson(
+					content.arguments,
+					"partialJson" in content ? content.partialJson : undefined,
+				);
 				if (!this.ctx.pendingTools.has(content.id)) {
 					this.#resetReadGroup();
-					this.ctx.chatContainer.addChild(new Text("", 0, 0));
+					addChatChild(this.ctx, new Text("", 0, 0));
 					const tool = this.ctx.session.getToolByName(content.name);
 					const component = new ToolExecutionComponent(
 						content.name,
@@ -432,35 +589,33 @@ export class EventController {
 						content.id,
 					);
 					component.setExpanded(this.ctx.toolOutputExpanded);
-					this.ctx.chatContainer.addChild(component);
 					this.ctx.pendingTools.set(content.id, component);
+					addChatChild(this.ctx, component);
 				} else {
-					const component = this.ctx.pendingTools.get(content.id);
-					if (component) {
-						component.updateArgs(renderArgs, content.id);
-					}
+					this.ctx.pendingTools.get(content.id)?.updateArgs(renderArgs, content.id);
 				}
-			}
 
-			// Update working message with intent from streamed tool arguments
-			for (const content of this.ctx.streamingMessage.content) {
-				if (content.type !== "toolCall") continue;
 				const args = content.arguments;
 				if (!args || typeof args !== "object") continue;
+				let intent: string | undefined;
 				if (INTENT_FIELD in args) {
-					this.#updateWorkingMessageFromIntent(args[INTENT_FIELD]);
-					continue;
-				}
-				const tool = this.ctx.session.getToolByName(content.name);
-				if (typeof tool?.intent !== "function") continue;
-				try {
-					const derived = tool.intent(args as never)?.trim();
-					if (derived) {
-						this.#updateWorkingMessageFromIntent(derived);
+					intent = String(args[INTENT_FIELD]);
+				} else {
+					const cached = this.#toolIntentCache.get(content.id);
+					if (cached?.args === args) intent = cached.intent;
+					else {
+						const tool = this.ctx.session.getToolByName(content.name);
+						if (typeof tool?.intent === "function") {
+							try {
+								intent = tool.intent(args as never)?.trim();
+							} catch {
+								// intent function must never break the UI
+							}
+						}
+						this.#toolIntentCache.set(content.id, { args, intent });
 					}
-				} catch {
-					// intent function must never break the UI
 				}
+				if (intent) this.#updateWorkingMessageFromIntent(intent);
 			}
 
 			this.ctx.ui.requestRender();
@@ -470,6 +625,9 @@ export class EventController {
 	async #handleMessageEnd(event: Extract<AgentSessionEvent, { type: "message_end" }>): Promise<void> {
 		if (event.message.role === "user") return;
 		if (this.ctx.streamingComponent && event.message.role === "assistant") {
+			if (this.ctx.streamingMessage?.role === "assistant") {
+				transferSessionMessageIdentity([this.ctx.streamingMessage], [event.message]);
+			}
 			this.ctx.streamingMessage = event.message;
 			let errorMessage: string | undefined;
 			const aborted = this.ctx.streamingMessage.stopReason === "aborted";
@@ -493,9 +651,9 @@ export class EventController {
 				// display only — does NOT mutate the persisted message's stopReason
 				// (the marker on errorMessage drives replay-side suppression).
 				const msgWithoutAbort = { ...this.ctx.streamingMessage, stopReason: "stop" as const };
-				this.ctx.streamingComponent.updateContent(msgWithoutAbort);
+				this.ctx.streamingComponent.updateContent(msgWithoutAbort, { streaming: false });
 			} else {
-				this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage);
+				this.ctx.streamingComponent.updateContent(this.ctx.streamingMessage, { streaming: false });
 			}
 
 			if (this.ctx.streamingMessage.stopReason !== "aborted" && this.ctx.streamingMessage.stopReason !== "error") {
@@ -547,8 +705,8 @@ export class EventController {
 				event.toolCallId,
 			);
 			component.setExpanded(this.ctx.toolOutputExpanded);
-			this.ctx.chatContainer.addChild(component);
 			this.ctx.pendingTools.set(event.toolCallId, component);
+			addChatChild(this.ctx, component);
 			this.ctx.ui.requestRender();
 		}
 	}
@@ -646,7 +804,7 @@ export class EventController {
 			if (details?.sourceToolName === "plan_approval" && details.action === "apply") {
 				const planDetails = details.sourceResultDetails as PlanApprovalDetails | undefined;
 				if (planDetails) {
-					await this.ctx.handlePlanApproval(planDetails);
+					await this.ctx.planModeController.handleApproval(planDetails);
 				}
 			}
 		}
@@ -663,7 +821,7 @@ export class EventController {
 			this.ctx.streamingComponent = undefined;
 			this.ctx.streamingMessage = undefined;
 		}
-		await this.ctx.flushPendingModelSwitch();
+		await this.ctx.planModeController.flushPendingModelSwitch();
 		for (const toolCallId of Array.from(this.ctx.pendingTools.keys())) {
 			if (!this.#backgroundToolCallIds.has(toolCallId)) {
 				this.ctx.pendingTools.delete(toolCallId);
@@ -679,6 +837,7 @@ export class EventController {
 		this.ctx.ui.requestRender();
 		this.#scheduleIdleCompaction();
 		this.sendCompletionNotification();
+		this.ctx.promptSuggestion?.onAgentEnd();
 	}
 
 	async #handleAutoCompactionStart(
@@ -690,6 +849,10 @@ export class EventController {
 		this.ctx.editor.onEscape = () => {
 			this.ctx.session.abortCompaction();
 		};
+		if (this.ctx.loadingAnimation) {
+			this.ctx.loadingAnimation.stop();
+			this.ctx.loadingAnimation = undefined;
+		}
 		this.ctx.statusContainer.clear();
 		const reasonText =
 			event.reason === "overflow" ? "Context overflow detected, " : event.reason === "idle" ? "Idle " : "";
@@ -722,7 +885,7 @@ export class EventController {
 		if (event.aborted) {
 			this.ctx.showStatus(isHandoffAction ? "Auto-handoff cancelled" : "Auto context-full maintenance cancelled");
 		} else if (event.result) {
-			this.ctx.rebuildChatFromMessages();
+			this.ctx.rebuildChatFromMessages("reconcile-same-transcript");
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorTopBorder();
 			if (continuationDisabled && !isHandoffAction) {
@@ -730,11 +893,19 @@ export class EventController {
 			} else if (event.willRetry && !isHandoffAction) {
 				this.ctx.showStatus("Context overflow maintenance completed");
 			}
+		} else if (
+			event.skipped &&
+			event.errorMessage?.startsWith("Context overflow recovery skipped: nothing eligible to compact.") &&
+			!isHandoffAction
+		) {
+			this.ctx.showStatus(event.errorMessage);
 		} else if (event.errorMessage) {
 			this.ctx.showWarning(event.errorMessage);
 		} else if (isHandoffAction) {
-			this.ctx.chatContainer.clear();
-			this.ctx.rebuildChatFromMessages();
+			// Reset BEFORE rebuild so the new session's transcript is not replayed
+			// from the old ledger and then cleared out from under its timers.
+			this.ctx.resetIrcSidebarSession();
+			this.ctx.rebuildChatFromMessages("replace-identity");
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorTopBorder();
 			await this.ctx.reloadTodos();
@@ -768,6 +939,7 @@ export class EventController {
 		if (!this.ctx.retryEscapeHandler) {
 			this.ctx.retryEscapeHandler = this.ctx.editor.onEscape;
 		}
+		this.ctx.retryEscapePrimed = false;
 		let escPressed = false;
 		this.ctx.editor.onEscape = () => {
 			if (!escPressed) {
@@ -779,6 +951,10 @@ export class EventController {
 				this.ctx.session.abortRetry();
 			}
 		};
+		if (this.ctx.loadingAnimation) {
+			this.ctx.loadingAnimation.stop();
+			this.ctx.loadingAnimation = undefined;
+		}
 		this.ctx.statusContainer.clear();
 		// Stop any prior retry loader/timer before installing a new one.
 		this.ctx.retryLoader?.stop();
@@ -818,34 +994,23 @@ export class EventController {
 			this.ctx.retryLoader = undefined;
 			this.ctx.statusContainer.clear();
 		}
+		this.ctx.retryEscapePrimed = false;
 		if (!event.success) {
 			this.ctx.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
 		}
 		this.ctx.ui.requestRender();
 	}
 
-	async #handleRetryFallbackApplied(
-		event: Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>,
-	): Promise<void> {
-		this.ctx.showWarning(`Fallback: ${event.from} -> ${event.to}`);
-	}
-
-	async #handleRetryFallbackSucceeded(
-		event: Extract<AgentSessionEvent, { type: "retry_fallback_succeeded" }>,
-	): Promise<void> {
-		this.ctx.showStatus(`Fallback succeeded on ${event.model}`);
-	}
-
 	async #handleTtsrTriggered(event: Extract<AgentSessionEvent, { type: "ttsr_triggered" }>): Promise<void> {
 		const component = new TtsrNotificationComponent(event.rules);
 		component.setExpanded(this.ctx.toolOutputExpanded);
-		this.ctx.chatContainer.addChild(component);
+		addChatChild(this.ctx, component);
 		this.ctx.ui.requestRender();
 	}
 
 	async #handleTodoReminder(event: Extract<AgentSessionEvent, { type: "todo_reminder" }>): Promise<void> {
 		const component = new TodoReminderComponent(event.todos, event.attempt, event.maxAttempts);
-		this.ctx.chatContainer.addChild(component);
+		addChatChild(this.ctx, component);
 		this.ctx.ui.requestRender();
 	}
 
@@ -937,6 +1102,8 @@ export class EventController {
 	}
 
 	sendCompletionNotification(): void {
+		// Per-run hard opt-out (env, config-untouched, child-inheritable): GJC_NOTIFY=off.
+		if (completionNotifyDisabledByEnv(process.env)) return;
 		const isBackgrounded = this.ctx.isBackgrounded !== false;
 		const notify = settings.get("completion.notify");
 		if (notify === "off") return;

@@ -16,8 +16,8 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
-		id: "alibaba-coding-plan",
-		name: "Alibaba Coding Plan",
+		id: "alibaba-token-plan",
+		name: "Alibaba Token Plan",
 		available: true,
 	},
 	{
@@ -58,6 +58,11 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 	{
 		id: "deepseek",
 		name: "DeepSeek",
+		available: true,
+	},
+	{
+		id: "deepinfra",
+		name: "DeepInfra",
 		available: true,
 	},
 	{
@@ -236,6 +241,16 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
+		id: "bizrouter",
+		name: "BizRouter",
+		available: true,
+	},
+	{
+		id: "opengateway",
+		name: "OpenGateway by Sionic AI",
+		available: true,
+	},
+	{
 		id: "vllm",
 		name: "vLLM (Local OpenAI-compatible)",
 		available: true,
@@ -356,6 +371,7 @@ export async function refreshOAuthToken(
 		case "opencode-zen":
 		case "opencode-go":
 		case "cerebras":
+		case "deepinfra":
 		case "fireworks":
 		case "firepass":
 		case "fugu":
@@ -365,6 +381,7 @@ export async function refreshOAuthToken(
 		case "together":
 		case "litellm":
 		case "lm-studio":
+		case "alibaba-token-plan":
 		case "ollama":
 		case "ollama-cloud":
 		case "xiaomi":
@@ -379,6 +396,8 @@ export async function refreshOAuthToken(
 		case "vercel-ai-gateway":
 		case "qwen-portal":
 		case "zenmux":
+		case "bizrouter":
+		case "opengateway":
 		case "vllm":
 			// API keys / static bearer tokens don't expire, return as-is
 			newCredentials = credentials;

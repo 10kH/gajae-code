@@ -112,7 +112,6 @@ modelBindings:
 - `azure-openai-responses`
 - `bedrock-converse-stream`
 - `anthropic-messages`
-- `bedrock-converse-stream`
 - `google-generative-ai`
 - `google-vertex`
 - `google-gemini-cli`
@@ -120,7 +119,7 @@ modelBindings:
 - `cursor-agent`
 
 
-### First-class Azure OpenAI and Amazon Bedrock examples
+### First-class DeepInfra, Azure OpenAI, and Amazon Bedrock examples
 
 Azure OpenAI uses canonical OpenAI model IDs in GJC and resolves those IDs to Azure deployment names at request time. Set `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` to avoid assuming model id equals deployment name:
 
@@ -137,6 +136,18 @@ providers:
 
 ```sh
 export AZURE_OPENAI_DEPLOYMENT_NAME_MAP='gpt-4.1=gpt-41-prod,o3=o3-reasoning-prod'
+```
+
+DeepInfra is available as the first-class `deepinfra` provider. It uses DeepInfra's OpenAI-compatible Chat Completions endpoint and reads `DEEPINFRA_API_KEY` when no explicit config key is provided. Set `serviceTier: priority` in GJC config or use the runtime service-tier controls to send DeepInfra's `service_tier: "priority"` request field for supported models:
+
+```yaml
+providers:
+  deepinfra:
+    baseUrl: https://api.deepinfra.com/v1/openai
+    apiKeyEnv: DEEPINFRA_API_KEY
+    api: openai-completions
+    models:
+      - id: deepseek-ai/DeepSeek-V3.2
 ```
 
 Amazon Bedrock uses the native `bedrock-converse-stream` transport and AWS credential chain auth. Do not put AWS access keys in `models.yml`; configure `AWS_REGION` / `AWS_PROFILE` or standard static AWS credential environment variables instead:
@@ -159,6 +170,7 @@ For common MiniMax and GLM/zAI setup, prefer the provider presets so the OpenAI-
 gjc setup provider --preset minimax
 gjc setup provider --preset minimax-cn
 gjc setup provider --preset glm
+gjc setup provider --preset alibaba-token-plan
 ```
 
 The same presets are available inside the TUI:
@@ -167,9 +179,10 @@ The same presets are available inside the TUI:
 /provider add --preset minimax
 /provider add --preset glm
 /provider add zai
+/provider add --preset alibaba-token-plan
 ```
 
-Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, or `ZAI_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider.
+Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, `ZAI_API_KEY`, or `ALIBABA_TOKEN_PLAN_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider. The Alibaba Token Plan preset (aliases: alibaba, token-plan) writes an OpenAI-compatible custom provider named alibaba-token-plan with per-model API routing (qwen3.8-max-preview uses openai-responses; glm-5.2 and deepseek-v4-pro use openai-completions).
 
 ## Model profiles (`--mpreset`)
 
@@ -183,24 +196,46 @@ profiles:
     required_providers: [openai, anthropic]
     model_mapping:
       default: openai/gpt-5.2
-      executor: anthropic/claude-sonnet-4-6:medium
+      executor: anthropic/claude-sonnet-5:medium
       architect: openai/o3:high
       planner: openai/o3:high
       critic: openai/o3:high
 ```
 
-`model_mapping` keys are role names (`default`, `executor`, `architect`, `planner`, `critic`). Each role maps to exactly one model selector in the form `provider/modelId[:effort]`; comma-separated fallback chains are not supported in a single role value.
-`required_providers` is the aggregate set of providers required across the profile's mapped roles, not a per-role fallback chain.
+`model_mapping` keys are role names (`default`, `executor`, `architect`, `planner`, `critic`). Every role accepts either one `provider/modelId[:effort]` selector or a non-empty ordered array of selectors; the first entry is primary and later entries are fallback candidates. `required_providers` is the aggregate set of providers required across the profile's mapped roles.
+
+### Fallback chains
+
+Preset `model_mapping` roles, top-level `modelRoles`, and `task.agentModelOverrides` all accept `string | string[]`. Keep one selector per line when a chain needs to be readable:
+
+```yaml
+profiles:
+  reliable:
+    required_providers: [anthropic, openai]
+    model_mapping:
+      default: [anthropic/claude-sonnet-4-5, openai/gpt-4o-mini]
+modelBindings:
+  modelRoles:
+    default: [anthropic/claude-sonnet-4-5, openai/gpt-4o-mini]
+  agentModelOverrides:
+    executor: [anthropic/claude-sonnet-4-5, openai/gpt-4o-mini]
+```
+
+Resolution-time skips for unavailable, unauthenticated, or unknown entries cost zero attempts and advance immediately. Only request-time retryable failures (such as 429, quota, authentication, or 5xx failures) consume an entry's `fallback.maxAttempts` total attempts (default: `3`). The active default fallback remains sticky for the session; role-override fallback state is fresh for each subagent call. The active model is shown consistently in status and `/model`.
+
+Managed fallback attempts buffer provisional streamed output until an attempt is accepted, so output can appear later than it does for a one-model stream. Current Cursor-agent transports are fail-closed unavailable in retryable fallback chains: resolution rejects them with `Cursor model <selector> requires provider-side tool execution and cannot be used in a retryable fallback chain` because they do not provide a client-side tool-call mode.
+
+Cancellation discards provisional output and emits exactly one cancelled `agent_end`; RPC, ACP, and the TUI therefore settle once. On load, the source-aware one-shot migration reads legacy `retry.fallbackChains`, prepends the effective role chain, and writes the ordered, deduplicated result to the corresponding role array; the legacy key is then ignored.
 
 Built-in profiles are grouped by provider mix and tier:
 
-- `codex-{eco,medium,pro}` — all roles on `openai-codex/gpt-5.5`, differing only by per-role reasoning effort
+- `codex-{eco,medium,pro}` — GPT-5.6 Sol/Terra/Luna role mixes tuned by tier and reasoning effort
 - `opencodego` — single OpenCode Go preset (Kimi default, DeepSeek executor/architect, Qwen planner, MiMo critic)
-- `claude-opus` — Anthropic OAuth preset centered on `claude-opus-4-8`
+- `claude-opus` — Anthropic OAuth preset centered on `claude-opus-5`
 - Single-provider tiers: `glm-{eco,medium,pro}`, `kimi-coding-plan-{eco,medium,pro}`, `mimo-{eco,medium,pro}`, `grok-{eco,medium,pro}`, `cursor-{eco,medium,pro}`, `minimax-{eco,medium,pro}`
-- Combos: `opus-codex` (Claude main agent with Codex support roles), `codex-opencodego` (Codex orchestrator/architect with OpenCode Go workers)
+- Combos: `opus-codex`, `codex-opencodego`, and `fable-opus-codex`
 
-The `eco` tier favors cheaper/faster defaults, `medium` matches normal production defaults, and `pro` raises reasoning for architect, critic, and planner roles. Effort suffixes are clamped to each model's supported thinking range at preview and activation time (for example `codex-eco`'s executor `:minimal` resolves to effective `low` on `gpt-5.5`). Single-provider tiers pin each provider's current flagship (`zai/glm-5.2`, `kimi-code/kimi-k2.7-code`, `xiaomi/mimo-v2.5-pro`, `xai/grok-4.3`, `cursor/composer-1.5`, `minimax-code/minimax-m3`). User-defined profiles override built-ins by exact profile name.
+The `eco`, `medium`, and `pro` Codex profile mappings are current product judgments: Eco assigns Terra low/Luna low/Luna high/Terra xhigh/Terra high to default/executor/planner/critic/architect; Medium assigns Sol low/Terra low/Terra high/Sol xhigh/Sol high; and Pro assigns Sol medium/Terra medium/Sol high/Sol max/Sol xhigh. `opus-codex` retains the Medium Codex executor, critic, and architect roles but uses `anthropic/claude-sonnet-5` for planner; `codex-opencodego` retains the Medium Codex default and architect roles; and `fable-opus-codex` uses the Pro Codex executor and architect roles with `anthropic/claude-opus-5:medium` for planner. The descriptive repeated local exact-edit evidence informs only selected executor-style TypeScript tasks; it does not evaluate or prove default, planner, architect, or critic performance. See [GPT-5.6 Codex preset benchmark](./gpt-5.6-codex-preset-benchmark.md). Effort suffixes are clamped to each model's supported thinking range at preview and activation time. Single-provider tiers pin each provider's current flagship (`zai/glm-5.2`, `kimi-code/kimi-k2.7-code`, `xiaomi/mimo-v2.5-pro`, `xai/grok-4.3`, `cursor/composer-1.5`, `minimax-code/minimax-m3`). User-defined profiles override built-ins by exact profile name.
 
 
 Use `gjc --mpreset <name>` to activate a profile for the current session only. Activation hard-blocks when any provider listed in `required_providers` lacks credentials. Add `--default` to persist the selected profile as `modelProfile.default` in `config.yml`, so it applies at startup:
@@ -247,7 +282,7 @@ providers:
 
 - `auth`: `apiKey` (default), `none`, or `oauth`; for `models.yml` custom models, `oauth` is accepted by schema but does not waive the `apiKey` requirement
 - `models.yml` is strict: unknown provider/model keys fail validation before provider dispatch, so stale keys such as `requestTransform` or `wireModelId` only work where this document lists them.
-- `discovery.type`: `ollama`, `llama.cpp`, or `lm-studio`
+- `discovery.type`: `ollama`, `llama.cpp`, `lm-studio`, or `openai-models-list`
 - `cacheRetention`: `none`, `short`, or `long`; request-time options win over model/modelOverride values, then provider values, then `GJC_CACHE_RETENTION`, then the runtime default. The runtime default is `short` for most providers, but the Anthropic provider defaults to `long` (`ttl: "1h"`) because the ~5m default is too fragile for long-running subagent workflows. The 1h marker is only emitted on the canonical Anthropic API (`api.anthropic.com`) for models advertising `supportsLongCacheRetention`; proxies, gateways, and incapable models fall back to the default ephemeral (~5m) breakpoint. For OpenAI Responses, this controls `prompt_cache_retention` only; it does not disable `prompt_cache_key` when a stable session id exists.
 
 ## OpenAI-compatible proxy configuration
@@ -274,6 +309,25 @@ providers:
 ```
 
 Use provider-level `headers` for proxy-required headers. Keep the provider `api` set to `openai-completions` when the proxy exposes Chat Completions-compatible `/v1/chat/completions` semantics. `auth: apiKey` sends the resolved token as bearer auth; use `auth: none` only for trusted local/no-auth endpoints.
+
+`input` is the model modality list GJC uses to decide whether image content is forwarded. When a custom model omits `input`, GJC defaults to `[text]` (unless a bundled model with the same id contributes a reference). Vision-capable upstream models therefore need an explicit `input: [text, image]`; otherwise `read`/tool images are stripped before the request and replaced with `[image omitted: model does not support vision]`, even if the remote model can see images.
+
+```yaml
+providers:
+  ali:
+    baseUrl: https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+    apiKeyEnv: ALI_API_KEY
+    api: openai-completions
+    auth: apiKey
+    models:
+      # id-only → text-only; images will be omitted
+      - id: some-text-model
+      # vision-capable hosted model must declare image input
+      - id: qwen3.8-max-preview
+        name: Qwen3.8 Max Preview
+        reasoning: true
+        input: [text, image]
+```
 
 `requestTransform` and `wireModelId` remain supported for request-body shaping, but they are not needed for ordinary OpenAI-compatible proxies whose local model id is already the upstream wire id. Unknown config keys fail validation before a provider request is sent.
 
@@ -435,9 +489,10 @@ When multiple concrete variants share a canonical id, resolution uses:
 
 1. availability and auth
 2. `config.yml` `modelProviderOrder`
-3. existing registry/provider order if `modelProviderOrder` is unset
+3. the lowest combined `cost.input + cost.cacheRead`
+4. existing registry/provider order if the earlier ranks tie
 
-Disabled or unauthenticated providers are skipped.
+Disabled or unauthenticated providers are skipped. A session that resolves a canonical selector keeps its concrete variant across discovery refreshes; it changes only after an explicit concrete selection or when that variant is no longer available.
 
 Session state and transcripts continue to record the concrete provider/model that actually executed the turn.
 
@@ -570,6 +625,8 @@ Resolution precedence for exact selectors:
 2. exact canonical id resolves through the canonical index
 3. exact bare concrete id still works
 4. fuzzy and glob matching run after the exact paths
+
+Thinking suffixes are split once from the final `:` only after the complete selector does not resolve. This preserves concrete OpenRouter route IDs such as `openrouter/z-ai/glm-4.7:nitro`; `:high` can follow that route suffix. Multiple suffixes are not recursively consumed. A complete `provider/modelId` selector is exact-only: it never falls back to fuzzy, substring, glob, or another provider when that concrete selector is absent. Exact-case provider/model entries resolve deterministically for custom replacement semantics; a case-insensitive selector that remains ambiguous does not guess.
 
 ### Initial model selection priority
 

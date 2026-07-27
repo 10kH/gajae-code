@@ -6,12 +6,12 @@
  */
 import * as path from "node:path";
 import * as url from "node:url";
-import type { TSchema } from "@gajae-code/ai";
+import { isCanonicalMCPOAuthBinding, resolveMCPOAuthResourceOrigin, type TSchema } from "@gajae-code/ai";
 import { logger } from "@gajae-code/utils";
 import type { SourceMeta } from "../capability/types";
-import { resolveConfigValue } from "../config/resolve-config-value";
+import * as configValue from "../config/resolve-config-value";
 import type { CustomTool } from "../extensibility/custom-tools/types";
-import type { AuthStorage } from "../session/auth-storage";
+import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
 import {
 	connectToServer,
 	disconnectServer,
@@ -27,7 +27,6 @@ import {
 	unsubscribeFromResources,
 } from "./client";
 import { loadAllMCPConfigs, validateServerConfig } from "./config";
-import { refreshMCPOAuthToken } from "./oauth-flow";
 import type { MCPToolDetails } from "./tool-bridge";
 import { DeferredMCPTool, MCPTool } from "./tool-bridge";
 import type { MCPToolCache } from "./tool-cache";
@@ -43,7 +42,7 @@ import type {
 	MCPServerConnection,
 	MCPToolDefinition,
 } from "./types";
-import { MCPNotificationMethods } from "./types";
+import { MCPExpectedFailure, MCPNotificationMethods } from "./types";
 
 type ToolLoadResult = {
 	connection: MCPServerConnection;
@@ -56,20 +55,37 @@ type TrackedPromise<T> = {
 	value?: T;
 	reason?: unknown;
 };
+type ConnectionTask = {
+	name: string;
+	config: MCPServerConfig;
+	tracked: TrackedPromise<ToolLoadResult>;
+	connectionPromise: Promise<MCPServerConnection>;
+	toolsPromise: Promise<ToolLoadResult>;
+	connectionAbort: AbortController;
+	connectionEpoch: number;
+	disconnectEpoch: number;
+};
 
 const STARTUP_TIMEOUT_MS = 250;
 const STARTUP_TIMEOUT_GRACE_MS = 500;
+/**
+ * Default ceiling on how long `discoverAndConnect` waits for a server batch to
+ * come up. Deliberately short: a config with a large `timeout` must not be able
+ * to hang ordinary startup. ACP lifecycle launches carry their own, larger
+ * budget derived from the readiness deadline (see `maxStartupTimeoutMs`).
+ */
 const MAX_STARTUP_TIMEOUT_MS = 1_750;
 
-function resolveStartupTimeoutMs(configs: MCPServerConfig[]): number {
+export function resolveStartupTimeoutMs(configs: MCPServerConfig[], maxStartupTimeoutMs?: number): number {
+	const ceiling =
+		typeof maxStartupTimeoutMs === "number" && Number.isFinite(maxStartupTimeoutMs) && maxStartupTimeoutMs > 0
+			? Math.max(STARTUP_TIMEOUT_MS, maxStartupTimeoutMs)
+			: MAX_STARTUP_TIMEOUT_MS;
 	const configuredTimeouts = configs
 		.map(config => config.timeout)
 		.filter((timeout): timeout is number => typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0);
 	if (configuredTimeouts.length === 0) return STARTUP_TIMEOUT_MS;
-	return Math.min(
-		MAX_STARTUP_TIMEOUT_MS,
-		Math.max(STARTUP_TIMEOUT_MS, Math.max(...configuredTimeouts) + STARTUP_TIMEOUT_GRACE_MS),
-	);
+	return Math.min(ceiling, Math.max(STARTUP_TIMEOUT_MS, Math.max(...configuredTimeouts) + STARTUP_TIMEOUT_GRACE_MS));
 }
 
 function trackPromise<T>(promise: Promise<T>): TrackedPromise<T> {
@@ -85,6 +101,24 @@ function trackPromise<T>(promise: Promise<T>): TrackedPromise<T> {
 		},
 	);
 	return tracked;
+}
+const EXPECTED_CONFIG_RESOLUTION_CODES = new Set([
+	"EACCES",
+	"EISDIR",
+	"ELOOP",
+	"ENAMETOOLONG",
+	"ENOENT",
+	"ENOTDIR",
+	"EPERM",
+	"ESTALE",
+]);
+
+function isExpectedConfigResolutionFailure(error: unknown): boolean {
+	if (error instanceof DOMException && error.name === "AbortError") return true;
+	if (!(error instanceof Error)) return false;
+	if (error.name === "AbortError") return true;
+	const code = "code" in error && typeof error.code === "string" ? error.code : undefined;
+	return code !== undefined && EXPECTED_CONFIG_RESOLUTION_CODES.has(code);
 }
 
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -147,8 +181,24 @@ export interface MCPDiscoverOptions {
 	filterExa?: boolean;
 	/** Whether to filter out browser MCP servers when builtin browser tool is enabled (default: false) */
 	filterBrowser?: boolean;
+	/** Only connect servers with autoload !== false (default: false) */
+	autoloadOnly?: boolean;
 	/** Called when starting to connect to servers */
 	onConnecting?: (serverNames: string[]) => void;
+	/** Load only this explicit MCP config file. */
+	configPath?: string;
+}
+
+export interface MCPManagerOptions {
+	/** Restrict this instance to tools from an explicit MCP config. */
+	toolsOnly?: boolean;
+	/**
+	 * Ceiling for the startup wait, in milliseconds. Only ACP lifecycle launches
+	 * set this, so a slow ACP MCP handshake gets the readiness budget while every
+	 * other consumer keeps the short default. Non-positive or non-finite values
+	 * are ignored and the default applies.
+	 */
+	maxStartupTimeoutMs?: number;
 }
 
 /**
@@ -196,6 +246,27 @@ export class MCPManager {
 	#serverConfigs = new Map<string, MCPServerConfig>();
 	/** Monotonic epoch incremented on disconnectAll to invalidate stale reconnections. */
 	#epoch = 0;
+	readonly #toolsOnly: boolean;
+	#toolsOnlyConfigLoaded = false;
+	#connectionSetSealed = false;
+
+	#serverError(message: string): string {
+		return this.#toolsOnly ? "MCP server unavailable" : message;
+	}
+	#assertRawMCPAccessAllowed(): void {
+		if (this.#toolsOnly) throw new Error("Tools-only MCP manager does not allow raw MCP access");
+	}
+	#assertConnectionSetMutable(): void {
+		if (this.#connectionSetSealed) throw new Error("MCP manager connection set is sealed");
+	}
+
+	sealConnectionSet(): void {
+		this.#connectionSetSealed = true;
+	}
+
+	isConnectionSetSealed(): boolean {
+		return this.#connectionSetSealed;
+	}
 
 	#isCurrentConnection(
 		name: string,
@@ -212,15 +283,26 @@ export class MCPManager {
 		);
 	}
 
+	readonly #maxStartupTimeoutMs: number | undefined;
+
 	constructor(
 		private cwd: string,
 		private toolCache: MCPToolCache | null = null,
-	) {}
+		options: MCPManagerOptions = {},
+	) {
+		this.#toolsOnly = options.toolsOnly === true;
+		this.#maxStartupTimeoutMs = options.maxStartupTimeoutMs;
+	}
+
+	isToolsOnly(): boolean {
+		return this.#toolsOnly;
+	}
 
 	/**
 	 * Set a callback to receive all server notifications.
 	 */
 	setOnNotification(handler: (serverName: string, method: string, params: unknown) => void): void {
+		if (this.#toolsOnly) return;
 		this.#onNotification = handler;
 	}
 
@@ -228,6 +310,7 @@ export class MCPManager {
 	 * Set a callback to fire when any server's tools change.
 	 */
 	setOnToolsChanged(handler: (tools: CustomTool<TSchema, MCPToolDetails>[]) => void): void {
+		if (this.#toolsOnly) return;
 		this.#onToolsChanged = handler;
 	}
 
@@ -235,6 +318,7 @@ export class MCPManager {
 	 * Set a callback to fire when any server's resources change.
 	 */
 	setOnResourcesChanged(handler: (serverName: string, uri: string) => void): void {
+		if (this.#toolsOnly) return;
 		this.#onResourcesChanged = handler;
 	}
 
@@ -242,6 +326,7 @@ export class MCPManager {
 	 * Set a callback to fire when any server's prompts change.
 	 */
 	setOnPromptsChanged(handler: (serverName: string) => void): void {
+		if (this.#toolsOnly) return;
 		this.#onPromptsChanged = handler;
 		// Fire immediately for servers that already have prompts loaded
 		for (const [name, connection] of this.#connections) {
@@ -279,6 +364,7 @@ export class MCPManager {
 	}
 
 	setNotificationsEnabled(enabled: boolean): void {
+		if (this.#toolsOnly) return;
 		const wasEnabled = this.#notificationsEnabled;
 		this.#notificationsEnabled = enabled;
 		if (enabled === wasEnabled) return;
@@ -321,12 +407,28 @@ export class MCPManager {
 	 * Returns tools and any connection errors.
 	 */
 	async discoverAndConnect(options?: MCPDiscoverOptions): Promise<MCPLoadResult> {
-		const { configs, exaApiKeys, sources } = await loadAllMCPConfigs(this.cwd, {
+		this.#assertConnectionSetMutable();
+		const hasConfigPath = options?.configPath !== undefined;
+		if (this.#toolsOnly !== hasConfigPath) {
+			throw new Error(
+				this.#toolsOnly
+					? "Tools-only MCP manager requires an explicit config path"
+					: "Explicit MCP config requires a tools-only MCP manager",
+			);
+		}
+		if (this.#toolsOnly && this.#toolsOnlyConfigLoaded) {
+			throw new Error("Tools-only MCP manager already loaded an explicit config");
+		}
+		if (this.#toolsOnly) this.#toolsOnlyConfigLoaded = true;
+		const { configs, exaApiKeys, sources, configurationWarning } = await loadAllMCPConfigs(this.cwd, {
 			enableProjectConfig: options?.enableProjectConfig,
 			filterExa: options?.filterExa,
 			filterBrowser: options?.filterBrowser,
+			autoloadOnly: options?.autoloadOnly,
+			configPath: options?.configPath,
 		});
-		const result = await this.connectServers(configs, sources, options?.onConnecting);
+		const result = await this.#connectServers(configs, sources, options?.onConnecting);
+		if (configurationWarning) result.errors.set("$config", "MCP configuration unavailable");
 		result.exaApiKeys = exaApiKeys;
 		return result;
 	}
@@ -340,16 +442,16 @@ export class MCPManager {
 		sources: Record<string, SourceMeta>,
 		onConnecting?: (serverNames: string[]) => void,
 	): Promise<MCPLoadResult> {
-		type ConnectionTask = {
-			name: string;
-			config: MCPServerConfig;
-			tracked: TrackedPromise<ToolLoadResult>;
-			toolsPromise: Promise<ToolLoadResult>;
-			connectionAbort: AbortController;
-			connectionEpoch: number;
-			disconnectEpoch: number;
-		};
+		this.#assertRawMCPAccessAllowed();
+		this.#assertConnectionSetMutable();
+		return this.#connectServers(configs, sources, onConnecting);
+	}
 
+	async #connectServers(
+		configs: Record<string, MCPServerConfig>,
+		sources: Record<string, SourceMeta>,
+		onConnecting?: (serverNames: string[]) => void,
+	): Promise<MCPLoadResult> {
 		const errors = new Map<string, string>();
 		const connectedServers = new Set<string>();
 		const allTools: CustomTool<TSchema, MCPToolDetails>[] = [];
@@ -369,9 +471,14 @@ export class MCPManager {
 				}
 			}
 
-			// Skip if already connected
+			// Skip if already connected.
 			if (this.#connections.has(name)) {
 				connectedServers.add(name);
+				allTools.push(
+					...this.#tools.filter(
+						tool => (tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name,
+					),
+				);
 				continue;
 			}
 
@@ -386,7 +493,7 @@ export class MCPManager {
 			// Validate config
 			const validationErrors = validateServerConfig(name, config);
 			if (validationErrors.length > 0) {
-				errors.set(name, validationErrors.join("; "));
+				errors.set(name, this.#serverError(validationErrors.join("; ")));
 				reportedErrors.add(name);
 				continue;
 			}
@@ -403,10 +510,13 @@ export class MCPManager {
 			const connectionPromise = (async () => {
 				const resolvedConfig = await this.#resolveAuthConfig(config);
 				return connectToServer(name, resolvedConfig, {
+					advertiseRoots: !this.#toolsOnly,
 					signal: connectionAbort.signal,
-					onNotification: (method, params) => {
-						this.#handleServerNotification(name, method, params);
-					},
+					onNotification: this.#toolsOnly
+						? undefined
+						: (method, params) => {
+								this.#handleServerNotification(name, method, params);
+							},
 					onRequest: (method, params) => {
 						return this.#handleServerRequest(method, params);
 					},
@@ -423,7 +533,8 @@ export class MCPManager {
 					const stillCurrent =
 						this.#epoch === connectionEpoch &&
 						(this.#disconnectEpochs.get(name) ?? 0) === disconnectEpoch &&
-						this.#serverConfigs.get(name) === config;
+						this.#serverConfigs.get(name) === config &&
+						!connectionAbort.signal.aborted;
 					if (stillPending) {
 						this.#pendingConnections.delete(name);
 						this.#pendingConnectionControllers.delete(name);
@@ -447,12 +558,14 @@ export class MCPManager {
 						};
 					}
 
-					// Re-establish connection if the transport closes (server restart,
-					// network interruption).
-					connection.transport.onClose = () => {
-						logger.debug("MCP transport lost, triggering reconnect", { path: `mcp:${name}` });
-						void this.reconnectServer(name);
-					};
+					if (!this.#toolsOnly) {
+						// Re-establish connection if the transport closes (server restart,
+						// network interruption).
+						connection.transport.onClose = () => {
+							logger.debug("MCP transport lost, triggering reconnect", { path: `mcp:${name}` });
+							void this.reconnectServer(name);
+						};
+					}
 
 					return connection;
 				},
@@ -473,10 +586,13 @@ export class MCPManager {
 				} catch (error) {
 					connection.transport.onClose = undefined;
 					if (this.#connections.get(name) === connection) this.#connections.delete(name);
-					void connection.transport.close().catch(() => {});
+					await connection.transport.close().catch(() => {});
 					throw error;
 				}
-				if (!this.#isCurrentConnection(name, config, connectionEpoch, disconnectEpoch, connection)) {
+				if (
+					connectionAbort.signal.aborted ||
+					!this.#isCurrentConnection(name, config, connectionEpoch, disconnectEpoch, connection)
+				) {
 					connection.transport.onClose = undefined;
 					await connection.transport.close().catch(() => {});
 					throw new Error(`Server "${name}" was disconnected during tool loading`);
@@ -490,6 +606,7 @@ export class MCPManager {
 				name,
 				config,
 				tracked,
+				connectionPromise,
 				toolsPromise,
 				connectionAbort,
 				connectionEpoch,
@@ -498,20 +615,25 @@ export class MCPManager {
 
 			void toolsPromise
 				.then(async ({ connection, serverTools }) => {
+					if (connectionAbort.signal.aborted) return;
 					if (this.#pendingToolLoads.get(name) !== toolsPromise) return;
-					if (!this.#isCurrentConnection(name, config, connectionEpoch, disconnectEpoch, connection)) return;
+					if (
+						connectionAbort.signal.aborted ||
+						!this.#isCurrentConnection(name, config, connectionEpoch, disconnectEpoch, connection)
+					)
+						return;
 					this.#pendingToolLoads.delete(name);
-					const reconnect = () => this.reconnectServer(name);
+					const reconnect = this.#toolsOnly ? undefined : () => this.reconnectServer(name);
 					const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
 					this.#replaceServerTools(name, customTools);
-					this.#onToolsChanged?.(this.#tools);
-					void this.toolCache?.set(name, config, serverTools);
-					await this.#loadServerResourcesAndPrompts(name, connection);
+					if (!this.#toolsOnly) this.#onToolsChanged?.(this.#tools);
+					if (!this.#toolsOnly) void this.toolCache?.set(name, config, serverTools);
+					if (!this.#toolsOnly) await this.#loadServerResourcesAndPrompts(name, connection);
 				})
 				.catch(error => {
 					if (this.#pendingToolLoads.get(name) !== toolsPromise) return;
 					this.#pendingToolLoads.delete(name);
-					if (!allowBackgroundLogging || reportedErrors.has(name)) return;
+					if (!allowBackgroundLogging || reportedErrors.has(name) || this.#toolsOnly) return;
 					const message = error instanceof Error ? error.message : String(error);
 					logger.error("MCP tool load failed", { path: `mcp:${name}`, error: message });
 				});
@@ -519,21 +641,50 @@ export class MCPManager {
 
 		// Notify about servers we're connecting to
 		if (connectionTasks.length > 0 && onConnecting) {
-			onConnecting(connectionTasks.map(task => task.name));
+			try {
+				onConnecting(connectionTasks.map(task => task.name));
+			} catch (error) {
+				await this.#cleanupConnectionTasks(connectionTasks);
+				throw error;
+			}
 		}
 
 		if (connectionTasks.length > 0) {
-			const startupTimeoutMs = resolveStartupTimeoutMs(connectionTasks.map(task => task.config));
-			await Promise.race([
-				Promise.allSettled(connectionTasks.map(task => task.tracked.promise)),
-				delay(startupTimeoutMs),
+			const startupTimeoutMs = resolveStartupTimeoutMs(
+				connectionTasks.map(task => task.config),
+				this.#maxStartupTimeoutMs,
+			);
+			const firstUnexpectedFailure = Promise.withResolvers<{ reason: unknown }>();
+			if (this.#toolsOnly) {
+				for (const task of connectionTasks) {
+					void task.toolsPromise.catch(reason => {
+						if (!(reason instanceof MCPExpectedFailure)) firstUnexpectedFailure.resolve({ reason });
+					});
+				}
+			}
+			const startupOutcome = await Promise.race([
+				Promise.allSettled(connectionTasks.map(task => task.tracked.promise)).then(() => undefined),
+				delay(startupTimeoutMs).then(() => undefined),
+				firstUnexpectedFailure.promise,
 			]);
+			const unexpectedTask = connectionTasks.find(
+				task =>
+					task.tracked.status === "rejected" &&
+					this.#toolsOnly &&
+					!(task.tracked.reason instanceof MCPExpectedFailure),
+			);
+			const unexpectedFailure =
+				startupOutcome ?? (unexpectedTask ? { reason: unexpectedTask.tracked.reason } : undefined);
+			if (unexpectedFailure) {
+				await this.#cleanupConnectionTasks(connectionTasks);
+				throw unexpectedFailure.reason;
+			}
 
 			const cachedTools = new Map<string, MCPToolDefinition[]>();
 			const pendingTasks = connectionTasks.filter(task => task.tracked.status === "pending");
 
 			if (pendingTasks.length > 0) {
-				if (this.toolCache) {
+				if (this.toolCache && !this.#toolsOnly) {
 					await Promise.all(
 						pendingTasks.map(async task => {
 							const cached = await this.toolCache?.get(task.name, task.config);
@@ -548,17 +699,18 @@ export class MCPManager {
 				if (pendingWithoutCache.length > 0) {
 					for (const task of pendingWithoutCache) {
 						const message = `MCP server connection timed out during startup: ${task.name}`;
-						errors.set(task.name, message);
+						errors.set(task.name, this.#serverError(message));
 						reportedErrors.add(task.name);
 						task.connectionAbort.abort(new Error(message));
 						if (this.#pendingConnections.has(task.name)) this.#pendingConnections.delete(task.name);
 						if (this.#pendingToolLoads.get(task.name) === task.toolsPromise)
 							this.#pendingToolLoads.delete(task.name);
 						this.#pendingConnectionControllers.delete(task.name);
+						void this.#disconnectServer(task.name).catch(() => {});
 					}
-					// Do not await these promises here: a misbehaving stdio/MCP transport can ignore
-					// AbortSignal and keep startup blocked indefinitely. The background toolsPromise
-					// handler will clean up if it eventually settles.
+					// Abort and disconnect in the background: a misbehaving stdio/MCP transport can
+					// ignore AbortSignal and keep startup blocked indefinitely, but it must not remain
+					// registered if it eventually connects.
 				}
 			}
 
@@ -576,13 +728,21 @@ export class MCPManager {
 						continue;
 					}
 					connectedServers.add(name);
-					const reconnect = () => this.reconnectServer(name);
-					allTools.push(...MCPTool.fromTools(connection, serverTools, reconnect));
+					const reconnect = this.#toolsOnly ? undefined : () => this.reconnectServer(name);
+					try {
+						allTools.push(...MCPTool.fromTools(connection, serverTools, reconnect));
+					} catch (error) {
+						await this.#cleanupConnectionTasks(connectionTasks);
+						throw error;
+					}
 				} else if (task.tracked.status === "rejected") {
-					const message =
-						task.tracked.reason instanceof Error ? task.tracked.reason.message : String(task.tracked.reason);
-					errors.set(name, message);
+					const reason = task.tracked.reason;
+					const message = reason instanceof Error ? reason.message : String(reason);
+					errors.set(name, this.#serverError(message));
 					reportedErrors.add(name);
+					if (this.#toolsOnly && reason instanceof MCPExpectedFailure) {
+						await this.#disconnectServer(name);
+					}
 					if ((this.#disconnectEpochs.get(name) ?? 0) !== task.disconnectEpoch) {
 						shouldPublishToolSnapshot = false;
 					}
@@ -590,10 +750,21 @@ export class MCPManager {
 					const cached = cachedTools.get(name);
 					if (cached) {
 						const source = this.#sources.get(name);
-						const reconnect = () => this.reconnectServer(name);
-						allTools.push(
-							...DeferredMCPTool.fromTools(name, cached, () => this.waitForConnection(name), source, reconnect),
-						);
+						const reconnect = this.#toolsOnly ? undefined : () => this.reconnectServer(name);
+						try {
+							allTools.push(
+								...DeferredMCPTool.fromTools(
+									name,
+									cached,
+									() => this.#waitForConnection(name),
+									source,
+									reconnect,
+								),
+							);
+						} catch (error) {
+							await this.#cleanupConnectionTasks(connectionTasks);
+							throw error;
+						}
 					}
 				}
 			}
@@ -602,13 +773,17 @@ export class MCPManager {
 		// Stable sort by name so the order is independent of connection completion.
 		// See `sortMCPToolsByName` for the cache-stability rationale.
 		sortMCPToolsByName(allTools);
+		if (this.#toolsOnly && new Set(allTools.map(tool => tool.name)).size !== allTools.length) {
+			await this.#cleanupConnectionTasks(connectionTasks);
+			throw new Error("MCP tool catalog contains duplicate tool names");
+		}
 
 		// Update cached tools
 		if (shouldPublishToolSnapshot) this.#tools = allTools;
 		allowBackgroundLogging = true;
 
 		return {
-			tools: allTools,
+			tools: [...allTools],
 			errors,
 			connectedServers: Array.from(connectedServers),
 			exaApiKeys: [], // Will be populated by discoverAndConnect
@@ -616,7 +791,9 @@ export class MCPManager {
 	}
 
 	#replaceServerTools(name: string, tools: CustomTool<TSchema, MCPToolDetails>[]): void {
-		this.#tools = this.#tools.filter(t => !t.name.startsWith(`mcp__${name}_`));
+		this.#tools = this.#tools.filter(
+			tool => !((tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name),
+		);
 		this.#tools.push(...tools);
 		// Stable sort by name so reconnect order does not perturb the array.
 		// See `sortMCPToolsByName` for the cache-stability rationale.
@@ -668,6 +845,9 @@ export class MCPManager {
 
 	/** Handle server-to-client JSON-RPC requests (e.g. ping, roots/list). */
 	async #handleServerRequest(method: string, _params: unknown): Promise<unknown> {
+		if (this.#toolsOnly && method !== "ping") {
+			throw Object.assign(new Error(`Unsupported server request: ${method}`), { code: -32601 });
+		}
 		switch (method) {
 			case "ping":
 				return {};
@@ -693,13 +873,14 @@ export class MCPManager {
 	 * Get all loaded tools.
 	 */
 	getTools(): CustomTool<TSchema, MCPToolDetails>[] {
-		return this.#tools;
+		return [...this.#tools];
 	}
 
 	/**
 	 * Get a specific connection.
 	 */
 	getConnection(name: string): MCPServerConnection | undefined {
+		this.#assertRawMCPAccessAllowed();
 		return this.#connections.get(name);
 	}
 
@@ -728,6 +909,11 @@ export class MCPManager {
 	 * Wait for a connection to complete (or fail).
 	 */
 	async waitForConnection(name: string): Promise<MCPServerConnection> {
+		this.#assertRawMCPAccessAllowed();
+		return this.#waitForConnection(name);
+	}
+
+	async #waitForConnection(name: string): Promise<MCPServerConnection> {
 		const connection = this.#connections.get(name);
 		if (connection) return connection;
 		const pending = this.#pendingConnections.get(name);
@@ -745,6 +931,7 @@ export class MCPManager {
 	 * Resolve auth and shell-command substitutions in config before connecting.
 	 */
 	async prepareConfig(config: MCPServerConfig): Promise<MCPServerConfig> {
+		this.#assertRawMCPAccessAllowed();
 		return this.#resolveAuthConfig(config);
 	}
 
@@ -768,6 +955,12 @@ export class MCPManager {
 	 * Disconnect from a specific server.
 	 */
 	async disconnectServer(name: string): Promise<void> {
+		this.#assertRawMCPAccessAllowed();
+		this.#assertConnectionSetMutable();
+		await this.#disconnectServer(name);
+	}
+
+	async #disconnectServer(name: string): Promise<void> {
 		const nextEpoch = (this.#disconnectEpochs.get(name) ?? 0) + 1;
 		this.#disconnectEpochs.set(name, nextEpoch);
 		this.#pendingConnectionControllers.get(name)?.abort(new Error(`MCP server disconnected: ${name}`));
@@ -788,20 +981,66 @@ export class MCPManager {
 		}
 		this.#subscribedResources.delete(name);
 
+		let closeError: unknown;
 		if (connection) {
 			// Detach onClose to prevent spurious reconnect from close()
 			connection.transport.onClose = undefined;
-			await disconnectServer(connection);
-			this.#connections.delete(name);
+			try {
+				await disconnectServer(connection);
+			} catch (error) {
+				closeError = error;
+			}
+			if (this.#connections.get(name) === connection) this.#connections.delete(name);
 		}
 
 		// Remove tools from this server and notify consumers
-		const hadTools = this.#tools.some(t => t.name.startsWith(`mcp__${name}_`));
-		this.#tools = this.#tools.filter(t => !t.name.startsWith(`mcp__${name}_`));
+		const hadTools = this.#tools.some(
+			tool => (tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name,
+		);
+		this.#tools = this.#tools.filter(
+			tool => !((tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name),
+		);
 		if (hadTools) this.#onToolsChanged?.(this.#tools);
 
 		// Notify prompt consumers so stale commands are cleared
 		if (connection?.prompts?.length) this.#onPromptsChanged?.(name);
+		if (closeError) throw closeError;
+	}
+
+	#abortConnectionTask(task: ConnectionTask): void {
+		task.connectionAbort.abort(new Error(`MCP server startup aborted: ${task.name}`));
+		if (this.#pendingConnectionControllers.get(task.name) === task.connectionAbort) {
+			this.#pendingConnectionControllers.delete(task.name);
+		}
+		if (this.#pendingConnections.get(task.name) === task.connectionPromise) {
+			this.#pendingConnections.delete(task.name);
+		}
+		if (this.#pendingToolLoads.get(task.name) === task.toolsPromise) {
+			this.#pendingToolLoads.delete(task.name);
+		}
+		if ((this.#disconnectEpochs.get(task.name) ?? 0) === task.disconnectEpoch) {
+			this.#disconnectEpochs.set(task.name, task.disconnectEpoch + 1);
+		}
+	}
+
+	async #terminateConnectionTask(task: ConnectionTask): Promise<void> {
+		const connection = await task.connectionPromise.catch(() => undefined);
+		if (!connection || this.#connections.get(task.name) !== connection) return;
+
+		connection.transport.onClose = undefined;
+		try {
+			await disconnectServer(connection);
+		} catch {
+			// Preserve the primary startup failure over best-effort transport cleanup failures.
+		} finally {
+			if (this.#connections.get(task.name) === connection) this.#connections.delete(task.name);
+		}
+	}
+
+	async #cleanupConnectionTasks(tasks: ConnectionTask[]): Promise<void> {
+		for (const task of tasks) this.#abortConnectionTask(task);
+		await Promise.allSettled(tasks.map(task => this.#terminateConnectionTask(task)));
+		await Promise.allSettled(tasks.map(task => this.#disconnectServer(task.name)));
 	}
 
 	/**
@@ -845,6 +1084,7 @@ export class MCPManager {
 	 * Returns the new connection, or null if reconnection failed.
 	 */
 	async reconnectServer(name: string): Promise<MCPServerConnection | null> {
+		if (this.#toolsOnly || this.#connectionSetSealed) return null;
 		const pending = this.#pendingReconnections.get(name);
 		if (pending) return pending;
 
@@ -1022,6 +1262,7 @@ export class MCPManager {
 	 * Shared between initial connection and reconnection.
 	 */
 	async #loadServerResourcesAndPrompts(name: string, connection: MCPServerConnection): Promise<void> {
+		if (this.#toolsOnly) return;
 		if (serverSupportsResources(connection.capabilities)) {
 			try {
 				const [resources] = await Promise.all([listResources(connection), listResourceTemplates(connection)]);
@@ -1050,6 +1291,7 @@ export class MCPManager {
 	 * Refresh tools from a specific server.
 	 */
 	async refreshServerTools(name: string): Promise<void> {
+		if (this.#toolsOnly) return;
 		const connection = this.#connections.get(name);
 		if (!connection) return;
 		const globalEpoch = this.#epoch;
@@ -1074,6 +1316,7 @@ export class MCPManager {
 	 * Refresh tools from all servers.
 	 */
 	async refreshAllTools(): Promise<void> {
+		if (this.#toolsOnly) return;
 		const promises = Array.from(this.#connections.keys()).map(name => this.refreshServerTools(name));
 		await Promise.allSettled(promises);
 	}
@@ -1082,6 +1325,7 @@ export class MCPManager {
 	 * Refresh resources from a specific server.
 	 */
 	async refreshServerResources(name: string): Promise<void> {
+		if (this.#toolsOnly) return;
 		const connection = this.#connections.get(name);
 		if (!connection || !serverSupportsResources(connection.capabilities)) return;
 
@@ -1151,6 +1395,7 @@ export class MCPManager {
 	 * Refresh prompts from a specific server.
 	 */
 	async refreshServerPrompts(name: string): Promise<void> {
+		if (this.#toolsOnly) return;
 		const connection = this.#connections.get(name);
 		if (!connection || !serverSupportsPrompts(connection.capabilities)) return;
 
@@ -1164,6 +1409,7 @@ export class MCPManager {
 	 * Get resources and templates for a specific server.
 	 */
 	getServerResources(name: string): { resources: MCPResource[]; templates: MCPResourceTemplate[] } | undefined {
+		if (this.#toolsOnly) return undefined;
 		const connection = this.#connections.get(name);
 		if (!connection) return undefined;
 		return {
@@ -1180,6 +1426,7 @@ export class MCPManager {
 		uri: string,
 		options?: MCPRequestOptions,
 	): Promise<MCPResourceReadResult | undefined> {
+		if (this.#toolsOnly) return undefined;
 		const connection = this.#connections.get(name);
 		if (!connection) return undefined;
 		return readResource(connection, uri, options);
@@ -1189,6 +1436,7 @@ export class MCPManager {
 	 * Get prompts for a specific server.
 	 */
 	getServerPrompts(name: string): MCPPrompt[] | undefined {
+		if (this.#toolsOnly) return undefined;
 		const connection = this.#connections.get(name);
 		if (!connection) return undefined;
 		return connection.prompts ?? [];
@@ -1203,15 +1451,17 @@ export class MCPManager {
 		args?: Record<string, string>,
 		options?: MCPRequestOptions,
 	): Promise<MCPGetPromptResult | undefined> {
+		if (this.#toolsOnly) return undefined;
 		const connection = this.#connections.get(name);
 		if (!connection) return undefined;
 		return getPrompt(connection, promptName, args, options);
 	}
 
 	/**
-	 * Get all server instructions (for system prompt injection).
+	 * Get connected-server instructions for request-scoped untrusted user-role context.
 	 */
 	getServerInstructions(): Map<string, string> {
+		if (this.#toolsOnly) return new Map();
 		const instructions = new Map<string, string>();
 		for (const [name, connection] of this.#connections) {
 			if (connection.instructions) {
@@ -1238,63 +1488,86 @@ export class MCPManager {
 		let resolved: MCPServerConfig = { ...config };
 
 		const auth = config.auth;
-		if (auth?.type === "oauth" && auth.credentialId && this.#authStorage) {
+		if (auth?.type === "oauth") {
+			if (!auth.credentialId || !this.#authStorage || (config.type !== "http" && config.type !== "sse")) {
+				throw new MCPExpectedFailure();
+			}
 			const credentialId = auth.credentialId;
-			try {
-				let credential = this.#authStorage.get(credentialId);
-				if (credential?.type === "oauth") {
-					// Proactive refresh: 5-minute buffer before expiry
-					// Force refresh: on 401/403 auth errors (revoked tokens, clock skew, missing expires)
-					const REFRESH_BUFFER_MS = 5 * 60_000;
-					const shouldRefresh =
-						forceRefresh || (credential.expires && Date.now() >= credential.expires - REFRESH_BUFFER_MS);
-					if (shouldRefresh && credential.refresh && auth.tokenUrl) {
-						try {
-							const refreshed = await refreshMCPOAuthToken(
-								auth.tokenUrl,
-								credential.refresh,
-								auth.clientId,
-								auth.clientSecret,
-							);
-							const refreshedCredential = { type: "oauth" as const, ...refreshed };
-							await this.#authStorage.set(credentialId, refreshedCredential);
-							credential = refreshedCredential;
-						} catch (refreshError) {
-							logger.warn("MCP OAuth refresh failed, using existing token", {
-								credentialId,
-								error: refreshError,
-							});
-						}
-					}
+			let credential = this.#authStorage.get(credentialId);
+			const binding = credential?.type === "oauth" ? credential.mcpBinding : undefined;
+			const endpointOrigin = resolveMCPOAuthResourceOrigin(config.url);
+			if (
+				credential?.type !== "oauth" ||
+				!binding ||
+				!isCanonicalMCPOAuthBinding(binding) ||
+				binding.resourceOrigin !== endpointOrigin ||
+				(auth.tokenUrl !== undefined && auth.tokenUrl !== binding.tokenEndpoint)
+			) {
+				throw new MCPExpectedFailure();
+			}
 
-					if (resolved.type === "http" || resolved.type === "sse") {
-						resolved = {
-							...resolved,
-							headers: {
-								...resolved.headers,
-								Authorization: `Bearer ${credential.access}`,
-							},
-						};
+			// Proactive refresh: 5-minute buffer before expiry
+			// Force refresh: on 401/403 auth errors (revoked tokens, clock skew, missing expires)
+			const REFRESH_BUFFER_MS = 5 * 60_000;
+			const shouldRefresh =
+				forceRefresh || (credential.expires && Date.now() >= credential.expires - REFRESH_BUFFER_MS);
+			if (shouldRefresh && credential.refresh) {
+				let refreshedCredential: OAuthCredential | undefined;
+				try {
+					refreshedCredential = await this.#authStorage.forceRefreshOAuthCredential(credentialId, credential, {
+						clientId: auth.clientId,
+						clientSecret: auth.clientSecret,
+					});
+				} catch {
+					if (forceRefresh) throw new MCPExpectedFailure();
+					if (this.#toolsOnly) {
+						logger.debug("MCP OAuth refresh failed");
 					} else {
-						resolved = {
-							...resolved,
-							env: {
-								...resolved.env,
-								OAUTH_ACCESS_TOKEN: credential.access,
-							},
-						};
+						logger.warn("MCP OAuth refresh failed, using existing token");
 					}
 				}
-			} catch (error) {
-				logger.warn("Failed to resolve OAuth credential", { credentialId, error });
+				if (refreshedCredential) {
+					const refreshedBinding = refreshedCredential.mcpBinding;
+					if (
+						!refreshedBinding ||
+						refreshedBinding.resourceOrigin !== binding.resourceOrigin ||
+						refreshedBinding.tokenEndpoint !== binding.tokenEndpoint
+					) {
+						throw new MCPExpectedFailure();
+					}
+					credential = refreshedCredential;
+				}
 			}
+			resolved = {
+				...config,
+				headers: {
+					...config.headers,
+					Authorization: `Bearer ${credential.access}`,
+				},
+			};
 		}
+		if (this.#toolsOnly && resolved.type === "stdio") {
+			resolved = { ...resolved, noInheritEnv: true };
+		}
+
+		const resolveValue = async (value: string): Promise<string | undefined> => {
+			try {
+				const resolvedValue = await configValue.resolveConfigValue(value);
+				if (this.#toolsOnly && !resolvedValue) throw new MCPExpectedFailure();
+				return resolvedValue;
+			} catch (error) {
+				if (this.#toolsOnly && isExpectedConfigResolutionFailure(error)) {
+					throw new MCPExpectedFailure(error);
+				}
+				throw error;
+			}
+		};
 
 		if (resolved.type !== "http" && resolved.type !== "sse") {
 			if (resolved.env) {
 				const nextEnv: Record<string, string> = {};
 				for (const [key, value] of Object.entries(resolved.env)) {
-					const resolvedValue = await resolveConfigValue(value);
+					const resolvedValue = await resolveValue(value);
 					if (resolvedValue) nextEnv[key] = resolvedValue;
 				}
 				resolved = { ...resolved, env: nextEnv };
@@ -1303,7 +1576,7 @@ export class MCPManager {
 			if (resolved.headers) {
 				const nextHeaders: Record<string, string> = {};
 				for (const [key, value] of Object.entries(resolved.headers)) {
-					const resolvedValue = await resolveConfigValue(value);
+					const resolvedValue = await resolveValue(value);
 					if (resolvedValue) nextHeaders[key] = resolvedValue;
 				}
 				resolved = { ...resolved, headers: nextHeaders };
@@ -1325,7 +1598,8 @@ export async function createMCPManager(
 	manager: MCPManager;
 	result: MCPLoadResult;
 }> {
-	const manager = new MCPManager(cwd);
+	const manager =
+		options?.configPath !== undefined ? new MCPManager(cwd, null, { toolsOnly: true }) : new MCPManager(cwd);
 	const result = await manager.discoverAndConnect(options);
 	return { manager, result };
 }

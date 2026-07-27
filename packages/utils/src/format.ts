@@ -9,7 +9,9 @@ const DAY = 24 * HOUR;
  */
 export function formatDuration(ms: number): string {
 	if (ms < SEC) return `${ms}ms`;
-	if (ms < MIN) return `${(ms / SEC).toFixed(1)}s`;
+	// Truncate below 60.0s instead of rounding up into the next unit (the minute
+	// branch below), mirroring roundBelow/formatByteUnit: e.g. 59_999ms -> "59.9s".
+	if (ms < MIN) return `${(roundBelow(ms / 100, 600) / 10).toFixed(1)}s`;
 	if (ms < HOUR) {
 		const mins = Math.floor(ms / MIN);
 		const secs = Math.floor((ms % MIN) / SEC);
@@ -33,9 +35,9 @@ export function formatDuration(ms: number): string {
 export function formatNumber(n: number): string {
 	if (n < 1_000) return n.toString();
 	if (n < 10_000) return `${trim1(n / 1_000)}K`;
-	if (n < 1_000_000) return `${Math.round(n / 1_000)}K`;
+	if (n < 1_000_000) return `${roundBelow(n / 1_000, 1_000)}K`;
 	if (n < 10_000_000) return `${trim1(n / 1_000_000)}M`;
-	if (n < 1_000_000_000) return `${Math.round(n / 1_000_000)}M`;
+	if (n < 1_000_000_000) return `${roundBelow(n / 1_000_000, 1_000)}M`;
 	if (n < 10_000_000_000) return `${trim1(n / 1_000_000_000)}B`;
 	return `${Math.round(n / 1_000_000_000)}B`;
 }
@@ -46,15 +48,34 @@ function trim1(n: number): string {
 	return s.endsWith(".0") ? s.slice(0, -2) : s;
 }
 
+/** Round to an integer without crossing the next compact suffix boundary. */
+function roundBelow(n: number, nextUnit: number): number {
+	return Math.min(Math.round(n), nextUnit - 1);
+}
+
 /**
  * Format a byte count to a human-readable string.
  * Examples: "512B", "1.5KB", "2.3MB", "1.2GB"
  */
 export function formatBytes(bytes: number): string {
 	if (bytes < 1024) return `${bytes}B`;
-	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
-	if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
-	return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)}GB`;
+	if (bytes < 1024 * 1024) return `${formatByteUnit(bytes, 1024)}KB`;
+	if (bytes < 1024 * 1024 * 1024) return `${formatByteUnit(bytes, 1024 * 1024)}MB`;
+	// The GB branch is terminal (no larger unit), so it must not clamp below the
+	// next-unit boundary the way KB/MB do; clamping here reports every value >=
+	// 1 TiB as "1023.9GB" (e.g. 2 TiB -> "1023.9GB" instead of "2048.0GB").
+	return `${formatByteUnit(bytes, 1024 * 1024 * 1024, false)}GB`;
+}
+
+/**
+ * Format bytes to 1 decimal. Intermediate units (KB/MB) clamp just below the
+ * next-unit boundary so a value like 1023.95 KB never rounds up to "1024.0KB";
+ * the terminal GB unit passes `clampToNextUnit: false` because it has no next
+ * unit to protect against.
+ */
+function formatByteUnit(bytes: number, unit: number, clampToNextUnit = true): string {
+	const tenths = Math.round((bytes / unit) * 10);
+	return ((clampToNextUnit ? Math.min(tenths, 1024 * 10 - 1) : tenths) / 10).toFixed(1);
 }
 
 /**

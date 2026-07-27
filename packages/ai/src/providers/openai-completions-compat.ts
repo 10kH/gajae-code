@@ -69,7 +69,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		baseUrl.includes("api.anthropic.com") ||
 		/(^|\/)claude[-.]/i.test(model.id) ||
 		/(^|\/)anthropic\//i.test(model.id);
-	const isAlibaba = provider === "alibaba-coding-plan" || baseUrl.includes("dashscope");
+	const isAlibaba = baseUrl.includes("dashscope");
 	const isQwen = model.id.toLowerCase().includes("qwen");
 	// DeepSeek V4 (and other reasoning-capable DeepSeek models) reject follow-up requests in
 	// thinking mode unless prior assistant tool-call turns include `reasoning_content`. The
@@ -104,6 +104,10 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		baseUrl.includes("opencode.ai");
 	const isOpenCodeProvider = provider === "opencode-go" || provider === "opencode-zen";
 	const isOpenCodeGoReasoning = provider === "opencode-go" && Boolean(model.reasoning);
+	const isOpenCodeGoKimiReasoning = provider === "opencode-go" && isKimiModel && Boolean(model.reasoning);
+	const isOpenCodeGoKimi25Reasoning = isOpenCodeGoKimiReasoning && model.id === "kimi-k2.5";
+	const isOpenCodeGoKimi27CodeReasoning = isOpenCodeGoKimiReasoning && model.id === "kimi-k2.7-code";
+	const needsOpenCodeGoKimiEffortMap = isOpenCodeGoKimi25Reasoning || isOpenCodeGoKimi27CodeReasoning;
 
 	const useMaxTokens =
 		provider === "mistral" ||
@@ -170,22 +174,31 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 					xhigh: "default",
 					max: "default",
 				} satisfies Partial<Record<OpenAIReasoningEffort, string>>)
-			: isDeepseekFamily && model.reasoning
+			: needsOpenCodeGoKimiEffortMap
 				? ({
-						minimal: "high",
-						low: "high",
-						medium: "high",
-						high: "high",
-						xhigh: "max",
-						max: "max",
+						// Live Go probes (2026-07-06) showed model-specific effort gaps:
+						// kimi-k2.5 rejects "minimal", while kimi-k2.7-code rejects
+						// OpenAI-style "xhigh" and "max"; all other Kimi efforts tested
+						// successfully and should pass through unchanged.
+						...(isOpenCodeGoKimi25Reasoning ? { minimal: "low" } : {}),
+						...(isOpenCodeGoKimi27CodeReasoning ? { xhigh: "high", max: "high" } : {}),
 					} satisfies Partial<Record<OpenAIReasoningEffort, string>>)
-				: isFireworks
+				: isDeepseekFamily && model.reasoning
 					? ({
-							// Fireworks' OpenAI-compatible endpoint rejects OpenAI's
-							// `minimal` literal but accepts `none` for the lowest setting.
-							minimal: "none",
+							minimal: "high",
+							low: "high",
+							medium: "high",
+							high: "high",
+							xhigh: "max",
+							max: "max",
 						} satisfies Partial<Record<OpenAIReasoningEffort, string>>)
-					: {};
+					: isFireworks
+						? ({
+								// Fireworks' OpenAI-compatible endpoint rejects OpenAI's
+								// `minimal` literal but accepts `none` for the lowest setting.
+								minimal: "none",
+							} satisfies Partial<Record<OpenAIReasoningEffort, string>>)
+						: {};
 
 	return {
 		supportsStore: !isNonStandard,
@@ -198,7 +211,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		disableReasoningOnForcedToolChoice: isKimiModel || isAnthropicModel || isOpenCodeGoReasoning,
 		disableReasoningOnToolChoice: isDeepseekFamily && Boolean(model.reasoning) && !isOpenRouter,
 		supportsToolChoice: !isDirectDeepseekReasoning,
-		supportsForcedToolChoice: true,
+		supportsForcedToolChoice: !isOpenCodeGoKimiReasoning,
 		maxTokensField: useMaxTokens ? "max_tokens" : "max_completion_tokens",
 		requiresToolResultName: isMistral,
 		requiresAssistantAfterToolResult: false,
@@ -231,7 +244,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		requiresAssistantContentForToolCalls: isKimiModel || isDirectDeepseekReasoning,
 		openRouterRouting: undefined,
 		vercelGatewayRouting: undefined,
-		supportsStrictMode: detectStrictModeSupport(provider, baseUrl),
+		supportsStrictMode: detectStrictModeSupport(provider, baseUrl) && !(isDeepseekFamily && isOpenRouter),
 		extraBody: isDirectDeepseekReasoning ? { thinking: { type: "enabled" } } : undefined,
 		toolStrictMode: isCerebras ? "all_strict" : "mixed",
 	};

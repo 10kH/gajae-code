@@ -1,10 +1,13 @@
 import type { Effort } from "@gajae-code/ai/model-thinking";
+import { PET_MODE_IDS, PET_SKIN_IDS, PET_SKINS } from "@gajae-code/tui/components/gajae-pet";
 import { TASK_SIMPLE_MODES } from "../task/simple-mode";
 import { getThinkingLevelMetadata } from "../thinking-metadata";
 import { EDIT_MODES } from "../utils/edit-mode";
 import { CONFIGURABLE_SEARCH_PROVIDER_IDS } from "../web/search/types";
+import type { ModelSelectorValue } from "./model-selector-value";
 
 const THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as readonly Effort[];
+const DEFAULT_THINKING_LEVELS = ["off", ...THINKING_EFFORTS] as const;
 
 import {
 	DEFAULT_DISABLED_EXTENSIONS,
@@ -36,7 +39,8 @@ export type SettingTab =
 	| "editing"
 	| "tools"
 	| "tasks"
-	| "providers";
+	| "providers"
+	| "notifications";
 
 /** Tab display metadata - icon is resolved via theme.symbol() */
 export type TabMetadata = { label: string; icon: `tab.${string}` };
@@ -52,6 +56,7 @@ export const SETTING_TABS: SettingTab[] = [
 	"tools",
 	"tasks",
 	"providers",
+	"notifications",
 ];
 
 /** Tab display metadata - icon is a symbol key from theme.ts (tab.*) */
@@ -65,6 +70,7 @@ export const TAB_METADATA: Record<SettingTab, { label: string; icon: `tab.${stri
 	tools: { label: "Tools", icon: "tab.tools" },
 	tasks: { label: "Tasks", icon: "tab.tasks" },
 	providers: { label: "Providers", icon: "tab.providers" },
+	notifications: { label: "Notifications", icon: "tab.providers" },
 };
 
 /** Status line segment identifiers */
@@ -107,6 +113,11 @@ interface UiBase {
 	description: string;
 	/** Condition function name - setting only shown when true */
 	condition?: string;
+	/**
+	 * Persistence owner for settings which must not use the generic immediate
+	 * settings-list write path.
+	 */
+	editing?: "notification-atomic";
 }
 
 interface UiBoolean extends UiBase {}
@@ -169,9 +180,14 @@ interface ArrayDef<T> {
 	ui?: UiBase;
 }
 
+interface RecordValueDef {
+	type: "model-selector-value";
+}
+
 interface RecordDef<T> {
 	type: "record";
 	default: Record<string, T>;
+	valueSchema?: RecordValueDef;
 	ui?: UiBase;
 }
 
@@ -199,7 +215,8 @@ export interface ModelTagsSettings {
 // Typed defaults for array/record settings — named constants avoid `as` casts
 // under `as const` while still letting SettingValue infer the correct element type.
 const EMPTY_STRING_ARRAY: string[] = [];
-const EMPTY_STRING_RECORD: Record<string, string> = {};
+const EMPTY_MODEL_SELECTOR_RECORD: Record<string, ModelSelectorValue> = {};
+const MODEL_SELECTOR_VALUE_SCHEMA = { type: "model-selector-value" } as const;
 const DEFAULT_CYCLE_ORDER: string[] = ["default"];
 const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
 const HINDSIGHT_RECALL_TYPES_DEFAULT: string[] = ["world", "experience"];
@@ -253,20 +270,106 @@ export const SETTINGS_SCHEMA = {
 	// per-machine overrides remain trivial.
 	"auth.broker.url": { type: "string", default: undefined },
 	"auth.broker.token": { type: "string", default: undefined },
+	"session.directoryMigration": {
+		type: "enum",
+		values: ["copy-retain", "disabled"] as const,
+		default: "copy-retain",
+	},
 
 	// Notifications (shared daemon with Telegram/Discord/Slack presentation adapters)
 	"notifications.enabled": { type: "boolean", default: false },
-	"notifications.telegram.botToken": { type: "string", default: undefined },
+	"notifications.telegram.botToken": {
+		type: "string",
+		default: undefined,
+		validate: (value: unknown) => typeof value === "string",
+	},
 	"notifications.telegram.chatId": { type: "string", default: undefined },
+	"notifications.telegram.activation": { type: "record", default: {} as Record<string, unknown> },
+	"notifications.telegram.btw.enabled": { type: "boolean", default: true },
+	"notifications.telegram.streaming.enabled": { type: "boolean", default: true },
+	"notifications.telegram.rich.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "notifications",
+			label: "Telegram Rich Messages",
+			description: "Format Telegram notifications with rich message content.",
+			editing: "notification-atomic",
+		},
+	},
+	"notifications.telegram.richDraft.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "notifications",
+			label: "Telegram Rich Drafts",
+			description: "Include rich draft updates in Telegram notifications.",
+			editing: "notification-atomic",
+		},
+	},
+	"notifications.telegram.toolActivity.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "notifications",
+			label: "Telegram Tool Activity",
+			description: "Send Telegram updates for tool starts and completions.",
+			editing: "notification-atomic",
+		},
+	},
+	"notifications.telegram.topics.nameTemplate": { type: "string", default: undefined },
 	"notifications.discord.botToken": { type: "string", default: undefined },
-	"notifications.discord.channelId": { type: "string", default: undefined },
+	"notifications.discord.applicationId": { type: "string", default: undefined },
+	"notifications.discord.guildId": { type: "string", default: undefined },
+	"notifications.discord.parentChannelId": { type: "string", default: undefined },
 	"notifications.slack.botToken": { type: "string", default: undefined },
+	"notifications.slack.appToken": { type: "string", default: undefined },
+	"notifications.slack.workspaceId": { type: "string", default: undefined },
 	"notifications.slack.channelId": { type: "string", default: undefined },
-	"notifications.redact": { type: "boolean", default: false },
+	"notifications.slack.authorizedUserId": { type: "string", default: undefined },
+	"notifications.redact": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "notifications",
+			label: "Redact Notification Content",
+			description: "Redact sensitive content before notifications are delivered.",
+			editing: "notification-atomic",
+		},
+	},
 	"notifications.verbosity": {
 		type: "string",
 		default: "lean",
 		validate: (value: string) => value === "lean" || value === "verbose",
+		ui: {
+			tab: "notifications",
+			label: "Notification Verbosity",
+			description: "Choose concise or detailed notification messages.",
+			options: [
+				{ value: "lean", label: "Lean", description: "Send concise notification messages" },
+				{ value: "verbose", label: "Verbose", description: "Send detailed notification messages" },
+			],
+			editing: "notification-atomic",
+		},
+	},
+	"notifications.sessionScope": {
+		type: "string",
+		default: "all",
+		validate: (value: string) => value === "all" || value === "primary",
+		ui: {
+			tab: "notifications",
+			label: "Notification Session Scope",
+			description: "Send notifications from all sessions or only the primary session.",
+			options: [
+				{ value: "all", label: "All Sessions", description: "Allow eligible sessions" },
+				{
+					value: "primary",
+					label: "Primary Session",
+					description: "Limit automatic notifications to the primary session",
+				},
+			],
+			editing: "notification-atomic",
+		},
 	},
 	"notifications.daemon.idleTimeoutMs": {
 		type: "number",
@@ -280,7 +383,8 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "interaction",
 			label: "Terminal Bell",
-			description: "Emit a BEL character for local terminal notifications",
+			description:
+				"Emit a BEL character for local terminal notifications. Windows Terminal may keep BEL silent depending on profile/system sound settings; use completion.notifyCommand for a PowerShell Console.Beep workaround.",
 		},
 	},
 	"notifications.bellOnComplete": {
@@ -374,7 +478,7 @@ export const SETTINGS_SCHEMA = {
 
 	disabledExtensions: { type: "array", default: DEFAULT_DISABLED_EXTENSIONS },
 
-	modelRoles: { type: "record", default: EMPTY_STRING_RECORD },
+	modelRoles: { type: "record", default: EMPTY_MODEL_SELECTOR_RECORD, valueSchema: MODEL_SELECTOR_VALUE_SCHEMA },
 	"modelProfile.default": {
 		type: "string",
 		default: undefined,
@@ -412,6 +516,11 @@ export const SETTINGS_SCHEMA = {
 		type: "number",
 		default: 0.05,
 		validate: (value: number) => Number.isFinite(value) && value > 0 && value <= 1,
+	},
+	"gjc.ralplan.maxIterations": {
+		type: "number",
+		default: 5,
+		validate: (value: number) => Number.isInteger(value) && value >= 1 && value <= 20,
 	},
 
 	// ────────────────────────────────────────────────────────────────────────
@@ -470,7 +579,7 @@ export const SETTINGS_SCHEMA = {
 	// Status line
 	"statusLine.preset": {
 		type: "enum",
-		values: ["default", "minimal", "compact", "full", "nerd", "ascii", "custom"] as const,
+		values: ["default", "default-usage", "minimal", "compact", "full", "nerd", "ascii", "custom"] as const,
 		default: "default",
 		ui: {
 			tab: "appearance",
@@ -478,6 +587,11 @@ export const SETTINGS_SCHEMA = {
 			description: "Pre-built status line configurations",
 			options: [
 				{ value: "default", label: "Default", description: "Model, path, git, context, tokens, cost" },
+				{
+					value: "default-usage",
+					label: "Default + Usage",
+					description: "Default layout with provider usage quota",
+				},
 				{ value: "minimal", label: "Minimal", description: "Path and git only" },
 				{ value: "compact", label: "Compact", description: "Model, git, cost, context" },
 				{ value: "full", label: "Full", description: "All segments including time" },
@@ -517,6 +631,40 @@ export const SETTINGS_SCHEMA = {
 			description: "Use the session name color for the editor border and status line gap",
 		},
 	},
+
+	"pet.mode": {
+		type: "enum",
+		values: PET_MODE_IDS,
+		default: "off",
+		ui: {
+			tab: "appearance",
+			label: "Gajae Pet",
+			description: "16x16 real-pixel gajae living beside the composer (sixel/kitty terminals)",
+			options: [
+				{ value: "off", label: "Off", description: "No pet" },
+				...PET_SKIN_IDS.map(id => ({
+					value: id,
+					label: PET_SKINS[id].label,
+					description: PET_SKINS[id].description,
+				})),
+			],
+		},
+	},
+	"statusLine.maxRows": {
+		type: "number",
+		default: 1,
+		ui: {
+			tab: "appearance",
+			label: "Status Line Rows",
+			description:
+				"Maximum rows for the status line. When greater than 1, overflowing segments wrap onto additional rows instead of being dropped.",
+			options: [
+				{ value: "1", label: "1 row", description: "Single line; overflow is truncated (default)" },
+				{ value: "2", label: "2 rows", description: "Wrap overflow onto a second row" },
+				{ value: "3", label: "3 rows", description: "Wrap overflow across up to three rows" },
+			],
+		},
+	},
 	"tools.artifactSpillThreshold": {
 		type: "number",
 		default: 50,
@@ -537,6 +685,52 @@ export const SETTINGS_SCHEMA = {
 				{ value: "200", label: "200 KB", description: "~50K tokens" },
 				{ value: "500", label: "500 KB", description: "~125K tokens" },
 				{ value: "1000", label: "1 MB", description: "~250K tokens" },
+			],
+		},
+	},
+	"tools.preAdmissionArtifactSpill": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			label: "Pre-admission artifact spill",
+			description:
+				"Experimental opt-in: save oversized tool results before provider context construction, retaining a UTF-8-safe head, tail, digest, and artifact receipt inline",
+		},
+	},
+
+	"tools.readArtifactSpillThreshold": {
+		type: "number",
+		default: 256,
+		ui: {
+			tab: "tools",
+			label: "Read artifact spill threshold (KB)",
+			description:
+				"Explicit large reads above this combined size are saved as an artifact with a bounded head-and-tail snippet inline. Bare reads, directories, and converted-document receipts remain inline.",
+			options: [
+				{ value: "0", label: "Off", description: "No read-specific spill (backstop only)" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+				{ value: "100", label: "100 KB", description: "~25K tokens" },
+				{ value: "256", label: "256 KB", description: "Default; ~64K tokens" },
+				{ value: "512", label: "512 KB", description: "~128K tokens" },
+				{ value: "1000", label: "1 MB", description: "~250K tokens" },
+			],
+		},
+	},
+
+	"tools.fileMentionInlineBytes": {
+		type: "number",
+		default: 10,
+		ui: {
+			tab: "tools",
+			label: "File-mention inline cap (KB)",
+			description:
+				"Inline byte cap for auto-read `@path` file mentions, aligned with the 10 KiB bare-read receipt so incidental mentions stay within the same bounded context budget. The full file is still available via the read tool.",
+			options: [
+				{ value: "5", label: "5 KB", description: "~1.25K tokens" },
+				{ value: "10", label: "10 KB", description: "Default; ~2.5K tokens" },
+				{ value: "20", label: "20 KB", description: "~5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens (matches bare-read receipt)" },
 			],
 		},
 	},
@@ -618,6 +812,25 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"tools.maxInlineResultBytes": {
+		type: "number",
+		default: 0,
+		ui: {
+			tab: "tools",
+			label: "Max inline tool-result size (KB)",
+			description:
+				"Absolute backstop cap on inline tool-result text, enforced after artifact spill for every tool (including read and tools that set their own partial artifact meta). Output above this size is force-saved as an artifact and truncated to head+tail. 0 disables (default; opt-in pending measurement).",
+			options: [
+				{ value: "0", label: "Off", description: "Disabled; no absolute inline cap" },
+				{ value: "20", label: "20 KB", description: "~5K tokens" },
+				{ value: "30", label: "30 KB", description: "~7.5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+				{ value: "75", label: "75 KB", description: "~19K tokens" },
+				{ value: "100", label: "100 KB", description: "~25K tokens" },
+			],
+		},
+	},
+
 	"statusLine.showHookStatus": {
 		type: "boolean",
 		default: false,
@@ -626,6 +839,15 @@ export const SETTINGS_SCHEMA = {
 	"statusLine.showSkillHud": {
 		type: "boolean",
 		default: true,
+	},
+	"statusLine.showActionHints": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			label: "Status Line Action Hints",
+			description: "Show contextual keyboard shortcuts in the status line",
+		},
 	},
 
 	"statusLine.leftSegments": { type: "array", default: [] as StatusLineSegmentId[] },
@@ -742,13 +964,13 @@ export const SETTINGS_SCHEMA = {
 	// Reasoning and prompts
 	defaultThinkingLevel: {
 		type: "enum",
-		values: THINKING_EFFORTS,
+		values: DEFAULT_THINKING_LEVELS,
 		default: THINKING_EFFORTS[3],
 		ui: {
 			tab: "model",
 			label: "Thinking Level",
 			description: "Reasoning depth for thinking-capable models",
-			options: [...THINKING_EFFORTS.map(getThinkingLevelMetadata)],
+			options: [...DEFAULT_THINKING_LEVELS.map(getThinkingLevelMetadata)],
 		},
 	},
 
@@ -956,6 +1178,12 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"fallback.maxAttempts": {
+		type: "number",
+		default: 3,
+		validate: (value: number) => Number.isInteger(value) && value > 0,
+	},
+
 	// Retries
 	"retry.enabled": { type: "boolean", default: true },
 
@@ -984,7 +1212,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "model",
 			label: "Max Retry Delay",
 			description:
-				"Maximum wait between retries, in ms. When the provider asks us to wait longer than this and no credential or model fallback succeeds, the request fails fast instead of sleeping (e.g. 3-hour Anthropic rate-limit windows).",
+				"Maximum wait between retries, in ms. Legacy retries clamp provider Retry-After hints to this value; managed fallback honors typed Retry-After hints even when they exceed it.",
 		},
 	},
 	"retry.requestMaxRetries": {
@@ -1031,6 +1259,16 @@ export const SETTINGS_SCHEMA = {
 	// Interaction
 	// ────────────────────────────────────────────────────────────────────────
 
+	"mouse.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			label: "Mouse Support",
+			description:
+				"Enable GJC session scrolling, drag-to-copy text selection, and overlay row selection with the mouse. Disabled by default to preserve native terminal or tmux scrollback and selection.",
+		},
+	},
 	// Conversation flow
 	steeringMode: {
 		type: "enum",
@@ -1127,6 +1365,16 @@ export const SETTINGS_SCHEMA = {
 			description: "Suggest emojis from `:name:` shortcodes and expand text emoticons like `:D` or `:-)`",
 		},
 	},
+	promptSuggestions: {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			label: "Prompt Suggestions",
+			description:
+				"Predict your likely next prompt after each turn (smol-model call) and show it as ghost text; Tab accepts",
+		},
+	},
 
 	"startup.quiet": {
 		type: "boolean",
@@ -1161,7 +1409,8 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "interaction",
 			label: "Check for Updates",
-			description: "If false, skip update check",
+			description:
+				"At interactive startup, notify of newer versions; never install. Use `gjc update` only for recognized Bun global, Windows npm, or bundled-installer binaries; source, linked, and unrecognized installs use their original method.",
 		},
 	},
 
@@ -1195,7 +1444,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "interaction",
 			label: "Completion Notification Command",
 			description:
-				"Optional user-level shell command to run when an agent turn completes; receives GJC_NOTIFICATION_* environment variables.",
+				"Optional user-level shell command to run when an agent turn completes; receives GJC_NOTIFICATION_* environment variables. On Windows, this can call PowerShell [Console]::Beep when terminal BEL is silent.",
 		},
 	},
 
@@ -1358,7 +1607,19 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "context",
 			label: "Save Handoff Docs",
-			description: "Save generated handoff documents to markdown files for the auto-handoff flow",
+			description:
+				"Save auto-triggered handoff documents as session artifacts (resolvable artifact:// URIs); manual /handoff does not save",
+		},
+	},
+
+	"compaction.handoffPromptExtension": {
+		type: "string",
+		default: "",
+		ui: {
+			tab: "context",
+			label: "Handoff Prompt Extension",
+			description:
+				"Extra guidance appended to the default handoff-generation prompt for both manual /handoff and auto-handoff. It supplements, and never replaces, the built-in safety- and continuity-critical instructions.",
 		},
 	},
 
@@ -1379,6 +1640,15 @@ export const SETTINGS_SCHEMA = {
 	"compaction.autoContinue": { type: "boolean", default: true },
 
 	"compaction.remoteEndpoint": { type: "string", default: undefined },
+
+	// Below-threshold maintenance pruning (Finding 13). Internal/measurement-only:
+	// keep the runtime setting for targeted experiments, but do not expose it in
+	// settings UI. Live layofflabs/gpt-5.5 medium evidence on 2026-07-07 showed no
+	// savings and a cache-hit regression; pruning rewrites already-sent history and
+	// can force a provider cache-epoch reset.
+	"compaction.maintenancePruningEnabled": { type: "boolean", default: false },
+
+	"compaction.maintenancePruningMinSavingsTokens": { type: "number", default: 8000 },
 
 	// Idle compaction
 	"compaction.idleEnabled": {
@@ -1653,7 +1923,8 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "context",
 			label: "TTSR Context Mode",
-			description: "What to do with partial output when TTSR triggers",
+			description:
+				"What to do with partial output when TTSR triggers. 'discard' (recommended) drops the aborted partial turn so it never accumulates in context. 'keep' retains every aborted partial turn, which grows the token footprint each time a rule fires — prefer 'discard' unless you specifically need the partial output.",
 		},
 	},
 
@@ -1806,6 +2077,51 @@ export const SETTINGS_SCHEMA = {
 				{ value: "500", label: "500 lines" },
 				{ value: "1000", label: "1000 lines" },
 				{ value: "5000", label: "5000 lines" },
+			],
+		},
+	},
+	"read.receiptBudgetLines": {
+		type: "number",
+		default: 50,
+		ui: {
+			tab: "editing",
+			label: "Read Receipt Line Budget",
+			description: "Maximum lines included in a bare read receipt before a selector footer is shown",
+			options: [
+				{ value: "25", label: "25 lines" },
+				{ value: "50", label: "50 lines", description: "Default" },
+				{ value: "100", label: "100 lines" },
+				{ value: "200", label: "200 lines" },
+			],
+		},
+	},
+	"read.receiptBudgetBytes": {
+		type: "number",
+		default: 10,
+		ui: {
+			tab: "editing",
+			label: "Read Receipt Byte Budget (KB)",
+			description: "Maximum UTF-8 body size for a bare read receipt before a selector footer is shown",
+			options: [
+				{ value: "5", label: "5 KB", description: "~1.25K tokens" },
+				{ value: "10", label: "10 KB", description: "Default; ~2.5K tokens" },
+				{ value: "20", label: "20 KB", description: "~5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+			],
+		},
+	},
+	"read.summaryMaxBytes": {
+		type: "number",
+		default: 20,
+		ui: {
+			tab: "editing",
+			label: "Read Summary Size Budget (KB)",
+			description: "Maximum UTF-8 size for a structural read summary before additional units are elided",
+			options: [
+				{ value: "10", label: "10 KB", description: "~2.5K tokens" },
+				{ value: "20", label: "20 KB", description: "Default; ~5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+				{ value: "100", label: "100 KB", description: "~25K tokens" },
 			],
 		},
 	},
@@ -2091,6 +2407,16 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"irc.sidebar.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			label: "IRC Sidebar",
+			description: "Enable the IRC message sidebar (opens with the toggle key; starts closed)",
+		},
+	},
+
 	// Optional tools
 
 	"renderMermaid.enabled": {
@@ -2166,9 +2492,9 @@ export const SETTINGS_SCHEMA = {
 		default: false,
 		ui: {
 			tab: "tools",
-			label: "Insane Search Fallback",
+			label: "Insane Search Fallback (Compatibility)",
 			description:
-				"Opt in to the vendored insane-search escalation for blocked public URL reads (403/WAF/JS-gated). Off by default. Requires preinstalled python3 + curl_cffi (and node + playwright/stealth for the browser phase); changes network posture by enabling TLS/browser impersonation for public pages.",
+				"Compatibility-only preference. Remote renderer fallback stays disabled because it cannot preserve validated per-hop network routing.",
 		},
 	},
 
@@ -2220,6 +2546,11 @@ export const SETTINGS_SCHEMA = {
 		ui: { tab: "tools", label: "Web Search", description: "Enable the web_search tool for web searching" },
 	},
 
+	"web_search.provider": {
+		type: "enum",
+		values: ["auto", ...CONFIGURABLE_SEARCH_PROVIDER_IDS] as const,
+		default: "auto",
+	},
 	"web_search.fallback": {
 		type: "array",
 		default: EMPTY_STRING_ARRAY,
@@ -2272,6 +2603,39 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"browser.profileReuse": {
+		type: "string",
+		default: "auto",
+		validate: (value: string) => value === "auto" || value === "opt-in",
+		ui: {
+			tab: "tools",
+			label: "Profile reuse posture",
+			description:
+				"'auto' (default): when a usable real Chrome profile is available, the browser tool uses an isolated copy of it (cookies/session/cache) for stronger stealth, warns, and falls back to synthetic. 'opt-in': stay synthetic unless a real profile is explicitly requested.",
+		},
+	},
+
+	"browser.geo.timezone": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "tools",
+			label: "Geo timezone override",
+			description:
+				"Optional IANA timezone (e.g. 'America/New_York') for headless sessions. Default unset preserves the real timezone. Only set this to a value coherent with your egress (e.g. a proxy region); an incoherent timezone increases bot detection.",
+		},
+	},
+	"browser.geo.locale": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "tools",
+			label: "Geo locale override",
+			description:
+				"Optional UI locale (e.g. 'en-US') for headless sessions. Default unset preserves the real locale. Only set this coherently with your egress region.",
+		},
+	},
+
 	"browser.gc.enabled": {
 		type: "boolean",
 		default: true,
@@ -2310,6 +2674,47 @@ export const SETTINGS_SCHEMA = {
 			label: "Resource GC Sweep Interval (ms)",
 			description: "How often the resource GC sweeps browser tabs and stale screenshot directories.",
 		},
+	},
+	"memoryGuard.enabled": {
+		type: "boolean",
+		default: false,
+	},
+	"memoryGuard.checkIntervalMs": {
+		type: "number",
+		default: 30_000,
+		validate: (value: number) => Number.isFinite(value) && value > 0,
+	},
+	"memoryGuard.gcThresholdPercent": {
+		type: "number",
+		default: 70,
+		validate: (value: number) => Number.isFinite(value) && value >= 0 && value <= 100,
+	},
+	"memoryGuard.restartThresholdPercent": {
+		type: "number",
+		default: 85,
+		validate: (value: number) => Number.isFinite(value) && value >= 0 && value <= 100,
+	},
+	"memoryGuard.restartThresholdWindowMs": {
+		type: "number",
+		default: 90_000,
+		validate: (value: number) => Number.isFinite(value) && value > 0,
+	},
+	"memoryGuard.cooldownMs": {
+		type: "number",
+		default: 600_000,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+	},
+	"memoryGuard.parentReserveMb": {
+		type: "number",
+		default: 1024,
+		validate: (value: number) =>
+			Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER / (1024 * 1024),
+	},
+	"memoryGuard.policyLimitMb": {
+		type: "number",
+		default: 0,
+		validate: (value: number) =>
+			Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER / (1024 * 1024),
 	},
 
 	"computer.enabled": {
@@ -2483,7 +2888,7 @@ export const SETTINGS_SCHEMA = {
 	"tools.discoveryMode": {
 		type: "enum",
 		values: ["off", "all"] as const,
-		default: "off",
+		default: "all",
 		ui: {
 			tab: "tools",
 			label: "Tool Discovery",
@@ -2498,7 +2903,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "tools",
 			label: "Essential Tools Override",
 			description:
-				"Override the always-loaded built-in tools (default: read, bash, edit). Leave empty to use defaults.",
+				"Override the always-loaded built-in tools (default: read, bash, edit, write, search, find). Leave empty to use defaults.",
 		},
 	},
 
@@ -2532,6 +2937,15 @@ export const SETTINGS_SCHEMA = {
 	// Tasks
 	// ────────────────────────────────────────────────────────────────────────
 
+	"tasksPane.defaultVisible": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			label: "Tasks Pane Visible By Default",
+			description: "Open the unified tasks pane when the interactive UI starts",
+		},
+	},
 	// Plan mode
 	"plan.enabled": {
 		type: "boolean",
@@ -2795,7 +3209,8 @@ export const SETTINGS_SCHEMA = {
 
 	"task.agentModelOverrides": {
 		type: "record",
-		default: {} as Record<string, string>,
+		default: {} as Record<string, ModelSelectorValue>,
+		valueSchema: MODEL_SELECTOR_VALUE_SCHEMA,
 	},
 
 	"tasks.todoClearDelay": {
@@ -2957,23 +3372,69 @@ export const SETTINGS_SCHEMA = {
 	},
 	"providers.image": {
 		type: "enum",
-		values: ["auto", "openai", "gemini", "openrouter", "antigravity"] as const,
+		values: ["auto", "openai", "gemini", "openrouter", "antigravity", "alibaba", "custom"] as const,
 		default: "auto",
 		ui: {
 			tab: "providers",
-			label: "Image Provider",
-			description: "Provider for image generation tool",
+			label: "Image Generation",
+			description: "Provider and model for image generation tool",
 			options: [
 				{
 					value: "auto",
 					label: "Auto",
-					description: "Priority: GPT model image tool > Antigravity > OpenRouter > Gemini",
+					description: "Priority: GPT model image tool > Antigravity > OpenRouter > Gemini > Alibaba",
 				},
-				{ value: "openai", label: "OpenAI", description: "Uses the active GPT Responses/Codex model" },
+				{ value: "openai", label: "OpenAI", description: "Uses gpt-image-2 via OpenAI Responses/Codex" },
 				{ value: "gemini", label: "Gemini", description: "Requires GEMINI_API_KEY" },
 				{ value: "openrouter", label: "OpenRouter", description: "Requires OPENROUTER_API_KEY" },
 				{ value: "antigravity", label: "Antigravity", description: "Requires login with google-antigravity" },
+				{
+					value: "alibaba",
+					label: "Alibaba Bailian",
+					description: "Requires ALIBABA_TOKEN_PLAN_API_KEY (wan2.7-image via Token Plan)",
+				},
+				{
+					value: "custom",
+					label: "Custom",
+					description: "OpenAI-compatible endpoint (set providers.imageCustomUrl)",
+				},
 			],
+		},
+	},
+	"providers.imageModel": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "providers",
+			label: "Image Model",
+			description: "Override the default image generation model for the selected provider",
+		},
+	},
+	"providers.imageCustomUrl": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "providers",
+			label: "Image Custom URL",
+			description: "Base URL for custom OpenAI-compatible image endpoint",
+		},
+	},
+	"providers.imageCustomKey": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "providers",
+			label: "Image Custom API Key",
+			description: "API key for custom OpenAI-compatible image endpoint",
+		},
+	},
+	"providers.imageCustomKeyEnv": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "providers",
+			label: "Image Custom API Key Env",
+			description: "Environment variable name holding the API key for custom image endpoint",
 		},
 	},
 
@@ -3181,6 +3642,122 @@ export function getEnumValues(path: SettingPath): readonly string[] | undefined 
 	return "values" in def ? (def.values as readonly string[]) : undefined;
 }
 
+export const CONFIG_SCHEMA_VERSION = 1;
+
+export type SettingsSchemaIssue = {
+	path: string;
+	kind: "unknown" | "invalid" | "coerced" | "pending-migration";
+	detail: string;
+};
+
+export type SettingsSchemaReport = { issues: SettingsSchemaIssue[]; valid: boolean };
+
+function schemaValueAtPath(value: Record<string, unknown>, path: string): unknown {
+	let current: unknown = value;
+	for (const segment of path.split(".")) {
+		if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
+		current = (current as Record<string, unknown>)[segment];
+	}
+	return current;
+}
+
+function schemaSetAtPath(value: Record<string, unknown>, path: string, next: unknown): void {
+	const segments = path.split(".");
+	let current = value;
+	for (const segment of segments.slice(0, -1)) {
+		const child = current[segment];
+		if (!child || typeof child !== "object" || Array.isArray(child)) current[segment] = {};
+		current = current[segment] as Record<string, unknown>;
+	}
+	current[segments.at(-1)!] = next;
+}
+
+function schemaPaths(value: Record<string, unknown>, prefix = ""): string[] {
+	const paths: string[] = [];
+	for (const [key, child] of Object.entries(value)) {
+		const path = prefix ? `${prefix}.${key}` : key;
+		const definition = SETTINGS_SCHEMA[path as SettingPath];
+		// Records intentionally accept user-defined keys; validate their entries below.
+		if (definition?.type === "record") {
+			paths.push(path);
+		} else if (child && typeof child === "object" && !Array.isArray(child)) {
+			paths.push(...schemaPaths(child as Record<string, unknown>, path));
+		} else {
+			paths.push(path);
+		}
+	}
+	return paths;
+}
+
+function validSettingValue(definition: (typeof SETTINGS_SCHEMA)[SettingPath], value: unknown): boolean {
+	return (
+		(definition.type === "boolean" && typeof value === "boolean") ||
+		(definition.type === "string" && typeof value === "string") ||
+		(definition.type === "number" &&
+			typeof value === "number" &&
+			Number.isFinite(value) &&
+			(!("validate" in definition) || !definition.validate || definition.validate(value))) ||
+		(definition.type === "enum" &&
+			typeof value === "string" &&
+			(definition.values as readonly string[]).includes(value)) ||
+		(definition.type === "array" && Array.isArray(value)) ||
+		(definition.type === "record" && !!value && typeof value === "object" && !Array.isArray(value))
+	);
+}
+
+/** Coerce supported scalar legacy values and report unknown or invalid settings without dropping them. */
+export function reconcileSettingsSchema(raw: Record<string, unknown>): {
+	settings: Record<string, unknown>;
+	report: SettingsSchemaReport;
+} {
+	const settings = structuredClone(raw);
+	const issues: SettingsSchemaIssue[] = [];
+	const knownPaths = new Set(Object.keys(SETTINGS_SCHEMA));
+	for (const path of schemaPaths(settings)) {
+		if (path === "configSchemaVersion" || knownPaths.has(path)) continue;
+		if (![...knownPaths].some(known => known.startsWith(`${path}.`))) {
+			issues.push({ path, kind: "unknown", detail: "Setting is not recognized by this version." });
+		}
+	}
+	for (const path of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
+		const value = schemaValueAtPath(settings, path);
+		if (value === undefined) continue;
+		const definition = SETTINGS_SCHEMA[path];
+		let next = value;
+		if (definition.type === "boolean" && (value === "true" || value === "false")) next = value === "true";
+		if (
+			definition.type === "number" &&
+			typeof value === "string" &&
+			value.trim() !== "" &&
+			Number.isFinite(Number(value))
+		) {
+			next = Number(value);
+		}
+		if (next !== value) {
+			schemaSetAtPath(settings, path, next);
+			issues.push({ path, kind: "coerced", detail: `Coerced ${typeof value} to ${definition.type}.` });
+		}
+		if (!validSettingValue(definition, next))
+			issues.push({ path, kind: "invalid", detail: `Expected ${definition.type}.` });
+		if (
+			definition.type === "record" &&
+			"valueSchema" in definition &&
+			definition.valueSchema &&
+			validSettingValue(definition, next)
+		) {
+			for (const [key, entry] of Object.entries(next as Record<string, unknown>)) {
+				if (
+					definition.valueSchema.type === "model-selector-value" &&
+					!(typeof entry === "string" || (Array.isArray(entry) && entry.every(item => typeof item === "string")))
+				) {
+					issues.push({ path: `${path}.${key}`, kind: "invalid", detail: "Expected model-selector-value." });
+				}
+			}
+		}
+	}
+	return { settings, report: { issues, valid: !issues.some(issue => issue.kind === "invalid") } };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Derived Types from Schema
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3206,9 +3783,12 @@ export interface CompactionSettings {
 	reserveTokens: number;
 	keepRecentTokens: number;
 	handoffSaveToDisk: boolean;
+	handoffPromptExtension: string;
 	autoContinue: boolean;
 	remoteEnabled: boolean;
 	remoteEndpoint: string | undefined;
+	maintenancePruningEnabled: boolean;
+	maintenancePruningMinSavingsTokens: number;
 	idleEnabled: boolean;
 	idleThresholdTokens: number;
 	idleTimeoutSeconds: number;
@@ -3285,8 +3865,10 @@ export interface ExaSettings {
 export interface StatusLineSettings {
 	preset: StatusLinePreset;
 	separator: StatusLineSeparatorStyle;
+	maxRows: number;
 	showHookStatus: boolean;
 	showSkillHud: boolean;
+	showActionHints: boolean;
 	leftSegments: StatusLineSegmentId[];
 	rightSegments: StatusLineSegmentId[];
 	segmentOptions: Record<string, unknown>;
@@ -3325,21 +3907,56 @@ export interface ShellMinimizerSettings {
 	maxCaptureBytes: number;
 }
 
+export interface MemoryGuardSettings {
+	enabled: boolean;
+	checkIntervalMs: number;
+	gcThresholdPercent: number;
+	restartThresholdPercent: number;
+	restartThresholdWindowMs: number;
+	cooldownMs: number;
+	parentReserveMb: number;
+	policyLimitMb: number;
+}
+
 export interface NotificationsSettings {
 	enabled: boolean;
 	telegram: {
 		botToken: string | undefined;
 		chatId: string | undefined;
+		btw: {
+			enabled: boolean;
+		};
+		rich: {
+			enabled: boolean;
+		};
+		richDraft: {
+			enabled: boolean;
+		};
+		toolActivity: {
+			enabled: boolean;
+		};
+		streaming: {
+			enabled: boolean;
+		};
+		topics: {
+			nameTemplate: string | undefined;
+		};
 	};
 	discord: {
 		botToken: string | undefined;
-		channelId: string | undefined;
+		applicationId: string | undefined;
+		guildId: string | undefined;
+		parentChannelId: string | undefined;
 	};
 	slack: {
 		botToken: string | undefined;
+		appToken: string | undefined;
+		workspaceId: string | undefined;
 		channelId: string | undefined;
 	};
 	redact: boolean;
+	verbosity: "lean" | "verbose";
+	sessionScope: "all" | "primary";
 	daemon: {
 		idleTimeoutMs: number;
 	};
@@ -3359,7 +3976,8 @@ export interface GroupTypeMap {
 	statusLine: StatusLineSettings;
 	thinkingBudgets: ThinkingBudgetsSettings;
 	stt: SttSettings;
-	modelRoles: Record<string, string>;
+	memoryGuard: MemoryGuardSettings;
+	modelRoles: Record<string, ModelSelectorValue>;
 	modelTags: ModelTagsSettings;
 	cycleOrder: string[];
 	shellMinimizer: ShellMinimizerSettings;

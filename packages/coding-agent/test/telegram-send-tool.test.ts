@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "../src/config/settings";
-import { registerTelegramFileSink } from "../src/notifications/attachment-registry";
+import { registerTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import type { ToolSession } from "../src/tools";
 import { TelegramSendTool } from "../src/tools/telegram-send";
 
@@ -76,6 +76,19 @@ describe("telegram_send egress containment", () => {
 		const { tool } = setup();
 		const res = await tool.execute("c", { path: "nope.txt" });
 		expect(res.isError).toBe(true);
+		expect(sinkCalls).toHaveLength(0);
+	});
+
+	it("rejects oversized files before invoking the Telegram sink", async () => {
+		const { root, tool } = setup();
+		const bigPath = path.join(root, "too-large.bin");
+		fs.writeFileSync(bigPath, "");
+		fs.truncateSync(bigPath, 50 * 1024 * 1024 + 1);
+
+		const res = await tool.execute("c", { path: "too-large.bin" });
+
+		expect(res.isError).toBe(true);
+		expect(res.details?.error ?? "").toContain("Telegram document limit");
 		expect(sinkCalls).toHaveLength(0);
 	});
 });

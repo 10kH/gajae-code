@@ -26,6 +26,20 @@
 			},
 			"additionalProperties": false
 		},
+		"session": {
+			"type": "object",
+			"properties": {
+				"directoryMigration": {
+					"type": "string",
+					"enum": [
+						"copy-retain",
+						"disabled"
+					],
+					"default": "copy-retain"
+				}
+			},
+			"additionalProperties": false
+		},
 		"notifications": {
 			"type": "object",
 			"properties": {
@@ -41,6 +55,73 @@
 						},
 						"chatId": {
 							"type": "string"
+						},
+						"activation": {
+							"type": "object",
+							"additionalProperties": true,
+							"default": {}
+						},
+						"btw": {
+							"type": "object",
+							"properties": {
+								"enabled": {
+									"type": "boolean",
+									"default": true
+								}
+							},
+							"additionalProperties": false
+						},
+						"streaming": {
+							"type": "object",
+							"properties": {
+								"enabled": {
+									"type": "boolean",
+									"default": true
+								}
+							},
+							"additionalProperties": false
+						},
+						"rich": {
+							"type": "object",
+							"properties": {
+								"enabled": {
+									"type": "boolean",
+									"description": "Format Telegram notifications with rich message content.",
+									"default": true
+								}
+							},
+							"additionalProperties": false
+						},
+						"richDraft": {
+							"type": "object",
+							"properties": {
+								"enabled": {
+									"type": "boolean",
+									"description": "Include rich draft updates in Telegram notifications.",
+									"default": false
+								}
+							},
+							"additionalProperties": false
+						},
+						"toolActivity": {
+							"type": "object",
+							"properties": {
+								"enabled": {
+									"type": "boolean",
+									"description": "Send Telegram updates for tool starts and completions.",
+									"default": false
+								}
+							},
+							"additionalProperties": false
+						},
+						"topics": {
+							"type": "object",
+							"properties": {
+								"nameTemplate": {
+									"type": "string"
+								}
+							},
+							"additionalProperties": false
 						}
 					},
 					"additionalProperties": false
@@ -51,7 +132,13 @@
 						"botToken": {
 							"type": "string"
 						},
-						"channelId": {
+						"applicationId": {
+							"type": "string"
+						},
+						"guildId": {
+							"type": "string"
+						},
+						"parentChannelId": {
 							"type": "string"
 						}
 					},
@@ -63,7 +150,16 @@
 						"botToken": {
 							"type": "string"
 						},
+						"appToken": {
+							"type": "string"
+						},
+						"workspaceId": {
+							"type": "string"
+						},
 						"channelId": {
+							"type": "string"
+						},
+						"authorizedUserId": {
 							"type": "string"
 						}
 					},
@@ -71,11 +167,18 @@
 				},
 				"redact": {
 					"type": "boolean",
+					"description": "Redact sensitive content before notifications are delivered.",
 					"default": false
 				},
 				"verbosity": {
 					"type": "string",
+					"description": "Choose concise or detailed notification messages.",
 					"default": "lean"
+				},
+				"sessionScope": {
+					"type": "string",
+					"description": "Send notifications from all sessions or only the primary session.",
+					"default": "all"
 				},
 				"daemon": {
 					"type": "object",
@@ -89,7 +192,7 @@
 				},
 				"terminalBell": {
 					"type": "boolean",
-					"description": "Emit a BEL character for local terminal notifications",
+					"description": "Emit a BEL character for local terminal notifications. Windows Terminal may keep BEL silent depending on profile/system sound settings; use completion.notifyCommand for a PowerShell Console.Beep workaround.",
 					"default": false
 				},
 				"bellOnComplete": {
@@ -181,7 +284,24 @@
 		},
 		"modelRoles": {
 			"type": "object",
-			"additionalProperties": true,
+			"additionalProperties": {
+				"anyOf": [
+					{
+						"type": "string",
+						"minLength": 1,
+						"pattern": "\\S"
+					},
+					{
+						"type": "array",
+						"minItems": 1,
+						"items": {
+							"type": "string",
+							"minLength": 1,
+							"pattern": "\\S"
+						}
+					}
+				]
+			},
 			"default": {}
 		},
 		"modelProfile": {
@@ -227,6 +347,16 @@
 						}
 					},
 					"additionalProperties": false
+				},
+				"ralplan": {
+					"type": "object",
+					"properties": {
+						"maxIterations": {
+							"type": "number",
+							"default": 5
+						}
+					},
+					"additionalProperties": false
 				}
 			},
 			"additionalProperties": false
@@ -269,6 +399,7 @@
 					"type": "string",
 					"enum": [
 						"default",
+						"default-usage",
 						"minimal",
 						"compact",
 						"full",
@@ -298,12 +429,22 @@
 					"description": "Use the session name color for the editor border and status line gap",
 					"default": true
 				},
+				"maxRows": {
+					"type": "number",
+					"description": "Maximum rows for the status line. When greater than 1, overflowing segments wrap onto additional rows instead of being dropped.",
+					"default": 1
+				},
 				"showHookStatus": {
 					"type": "boolean",
 					"default": false
 				},
 				"showSkillHud": {
 					"type": "boolean",
+					"default": true
+				},
+				"showActionHints": {
+					"type": "boolean",
+					"description": "Show contextual keyboard shortcuts in the status line",
 					"default": true
 				},
 				"leftSegments": {
@@ -324,6 +465,22 @@
 			},
 			"additionalProperties": false
 		},
+		"pet": {
+			"type": "object",
+			"properties": {
+				"mode": {
+					"type": "string",
+					"enum": [
+						"off",
+						"red",
+						"blue"
+					],
+					"description": "16x16 real-pixel gajae living beside the composer (sixel/kitty terminals)",
+					"default": "off"
+				}
+			},
+			"additionalProperties": false
+		},
 		"tools": {
 			"type": "object",
 			"properties": {
@@ -331,6 +488,21 @@
 					"type": "number",
 					"description": "Tool output above this size is saved as an artifact; tail is kept inline",
 					"default": 50
+				},
+				"preAdmissionArtifactSpill": {
+					"type": "boolean",
+					"description": "Experimental opt-in: save oversized tool results before provider context construction, retaining a UTF-8-safe head, tail, digest, and artifact receipt inline",
+					"default": false
+				},
+				"readArtifactSpillThreshold": {
+					"type": "number",
+					"description": "Explicit large reads above this combined size are saved as an artifact with a bounded head-and-tail snippet inline. Bare reads, directories, and converted-document receipts remain inline.",
+					"default": 256
+				},
+				"fileMentionInlineBytes": {
+					"type": "number",
+					"description": "Inline byte cap for auto-read `@path` file mentions, aligned with the 10 KiB bare-read receipt so incidental mentions stay within the same bounded context budget. The full file is still available via the read tool.",
+					"default": 10
 				},
 				"artifactTailBytes": {
 					"type": "number",
@@ -352,6 +524,11 @@
 					"description": "Maximum lines of tail content kept inline when output spills to artifact",
 					"default": 500
 				},
+				"maxInlineResultBytes": {
+					"type": "number",
+					"description": "Absolute backstop cap on inline tool-result text, enforced after artifact spill for every tool (including read and tools that set their own partial artifact meta). Output above this size is force-saved as an artifact and truncated to head+tail. 0 disables (default; opt-in pending measurement).",
+					"default": 0
+				},
 				"intentTracing": {
 					"type": "boolean",
 					"description": "Ask the agent to describe the intent of each tool call before executing it",
@@ -369,12 +546,12 @@
 						"all"
 					],
 					"description": "Hide non-essential built-in tools behind a search tool to save tokens.",
-					"default": "off"
+					"default": "all"
 				},
 				"essentialOverride": {
 					"type": "array",
 					"items": true,
-					"description": "Override the always-loaded built-in tools (default: read, bash, edit). Leave empty to use defaults.",
+					"description": "Override the always-loaded built-in tools (default: read, bash, edit, write, search, find). Leave empty to use defaults.",
 					"default": []
 				}
 			},
@@ -471,6 +648,7 @@
 		"defaultThinkingLevel": {
 			"type": "string",
 			"enum": [
+				"off",
 				"minimal",
 				"low",
 				"medium",
@@ -659,8 +837,35 @@
 				},
 				"agentModelOverrides": {
 					"type": "object",
-					"additionalProperties": true,
+					"additionalProperties": {
+						"anyOf": [
+							{
+								"type": "string",
+								"minLength": 1,
+								"pattern": "\\S"
+							},
+							{
+								"type": "array",
+								"minItems": 1,
+								"items": {
+									"type": "string",
+									"minLength": 1,
+									"pattern": "\\S"
+								}
+							}
+						]
+					},
 					"default": {}
+				}
+			},
+			"additionalProperties": false
+		},
+		"fallback": {
+			"type": "object",
+			"properties": {
+				"maxAttempts": {
+					"type": "number",
+					"default": 3
 				}
 			},
 			"additionalProperties": false
@@ -683,7 +888,7 @@
 				},
 				"maxDelayMs": {
 					"type": "number",
-					"description": "Maximum wait between retries, in ms. When the provider asks us to wait longer than this and no credential or model fallback succeeds, the request fails fast instead of sleeping (e.g. 3-hour Anthropic rate-limit windows).",
+					"description": "Maximum wait between retries, in ms. Legacy retries clamp provider Retry-After hints to this value; managed fallback honors typed Retry-After hints even when they exceed it.",
 					"default": 300000
 				},
 				"requestMaxRetries": {
@@ -709,6 +914,17 @@
 					],
 					"description": "When to return to the primary model after a fallback",
 					"default": "cooldown-expiry"
+				}
+			},
+			"additionalProperties": false
+		},
+		"mouse": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable GJC session scrolling, drag-to-copy text selection, and overlay row selection with the mouse. Disabled by default to preserve native terminal or tmux scrollback and selection.",
+					"default": false
 				}
 			},
 			"additionalProperties": false
@@ -781,6 +997,11 @@
 			"description": "Suggest emojis from `:name:` shortcodes and expand text emoticons like `:D` or `:-)`",
 			"default": true
 		},
+		"promptSuggestions": {
+			"type": "boolean",
+			"description": "Predict your likely next prompt after each turn (smol-model call) and show it as ghost text; Tab accepts",
+			"default": false
+		},
 		"startup": {
 			"type": "object",
 			"properties": {
@@ -802,7 +1023,7 @@
 				},
 				"checkUpdate": {
 					"type": "boolean",
-					"description": "If false, skip update check",
+					"description": "At interactive startup, notify of newer versions; never install. Use `gjc update` only for recognized Bun global, Windows npm, or bundled-installer binaries; source, linked, and unrecognized installs use their original method.",
 					"default": true
 				}
 			},
@@ -838,7 +1059,7 @@
 				},
 				"notifyCommand": {
 					"type": "string",
-					"description": "Optional user-level shell command to run when an agent turn completes; receives GJC_NOTIFICATION_* environment variables.",
+					"description": "Optional user-level shell command to run when an agent turn completes; receives GJC_NOTIFICATION_* environment variables. On Windows, this can call PowerShell [Console]::Beep when terminal BEL is silent.",
 					"default": ""
 				}
 			},
@@ -936,8 +1157,13 @@
 				},
 				"handoffSaveToDisk": {
 					"type": "boolean",
-					"description": "Save generated handoff documents to markdown files for the auto-handoff flow",
+					"description": "Save auto-triggered handoff documents as session artifacts (resolvable artifact:// URIs); manual /handoff does not save",
 					"default": false
+				},
+				"handoffPromptExtension": {
+					"type": "string",
+					"description": "Extra guidance appended to the default handoff-generation prompt for both manual /handoff and auto-handoff. It supplements, and never replaces, the built-in safety- and continuity-critical instructions.",
+					"default": ""
 				},
 				"remoteEnabled": {
 					"type": "boolean",
@@ -958,6 +1184,14 @@
 				},
 				"remoteEndpoint": {
 					"type": "string"
+				},
+				"maintenancePruningEnabled": {
+					"type": "boolean",
+					"default": false
+				},
+				"maintenancePruningMinSavingsTokens": {
+					"type": "number",
+					"default": 8000
 				},
 				"idleEnabled": {
 					"type": "boolean",
@@ -1213,7 +1447,7 @@
 						"discard",
 						"keep"
 					],
-					"description": "What to do with partial output when TTSR triggers",
+					"description": "What to do with partial output when TTSR triggers. 'discard' (recommended) drops the aborted partial turn so it never accumulates in context. 'keep' retains every aborted partial turn, which grows the token footprint each time a rule fires — prefer 'discard' unless you specifically need the partial output.",
 					"default": "discard"
 				},
 				"interruptMode": {
@@ -1304,6 +1538,21 @@
 					"type": "number",
 					"description": "Default number of lines returned when agent calls read without a limit",
 					"default": 300
+				},
+				"receiptBudgetLines": {
+					"type": "number",
+					"description": "Maximum lines included in a bare read receipt before a selector footer is shown",
+					"default": 50
+				},
+				"receiptBudgetBytes": {
+					"type": "number",
+					"description": "Maximum UTF-8 body size for a bare read receipt before a selector footer is shown",
+					"default": 10
+				},
+				"summaryMaxBytes": {
+					"type": "number",
+					"description": "Maximum UTF-8 size for a structural read summary before additional units are elided",
+					"default": 20
 				},
 				"summarize": {
 					"type": "object",
@@ -1590,6 +1839,17 @@
 					"type": "boolean",
 					"description": "Enable agent-to-agent IRC messaging via the irc tool",
 					"default": true
+				},
+				"sidebar": {
+					"type": "object",
+					"properties": {
+						"enabled": {
+							"type": "boolean",
+							"description": "Enable the IRC message sidebar (opens with the toggle key; starts closed)",
+							"default": true
+						}
+					},
+					"additionalProperties": false
 				}
 			},
 			"additionalProperties": false
@@ -1676,7 +1936,7 @@
 			"properties": {
 				"insaneFallback": {
 					"type": "boolean",
-					"description": "Opt in to the vendored insane-search escalation for blocked public URL reads (403/WAF/JS-gated). Off by default. Requires preinstalled python3 + curl_cffi (and node + playwright/stealth for the browser phase); changes network posture by enabling TLS/browser impersonation for public pages.",
+					"description": "Compatibility-only preference. Remote renderer fallback stays disabled because it cannot preserve validated per-hop network routing.",
 					"default": false
 				}
 			},
@@ -1721,6 +1981,30 @@
 					"type": "boolean",
 					"description": "Enable the web_search tool for web searching",
 					"default": true
+				},
+				"provider": {
+					"type": "string",
+					"enum": [
+						"auto",
+						"duckduckgo",
+						"insane",
+						"exa",
+						"brave",
+						"jina",
+						"kimi",
+						"zai",
+						"anthropic",
+						"perplexity",
+						"gemini",
+						"codex",
+						"xai",
+						"tavily",
+						"parallel",
+						"kagi",
+						"synthetic",
+						"searxng"
+					],
+					"default": "auto"
 				},
 				"fallback": {
 					"type": "array",
@@ -1774,6 +2058,25 @@
 					"type": "string",
 					"description": "Directory to save screenshots. If unset, screenshots go to a temp file. Supports ~. Examples: ~/Downloads, ~/Desktop, /sdcard/Download (Android)"
 				},
+				"profileReuse": {
+					"type": "string",
+					"description": "'auto' (default): when a usable real Chrome profile is available, the browser tool uses an isolated copy of it (cookies/session/cache) for stronger stealth, warns, and falls back to synthetic. 'opt-in': stay synthetic unless a real profile is explicitly requested.",
+					"default": "auto"
+				},
+				"geo": {
+					"type": "object",
+					"properties": {
+						"timezone": {
+							"type": "string",
+							"description": "Optional IANA timezone (e.g. 'America/New_York') for headless sessions. Default unset preserves the real timezone. Only set this to a value coherent with your egress (e.g. a proxy region); an incoherent timezone increases bot detection."
+						},
+						"locale": {
+							"type": "string",
+							"description": "Optional UI locale (e.g. 'en-US') for headless sessions. Default unset preserves the real locale. Only set this coherently with your egress region."
+						}
+					},
+					"additionalProperties": false
+				},
 				"gc": {
 					"type": "object",
 					"properties": {
@@ -1805,6 +2108,44 @@
 					"type": "number",
 					"description": "How often the resource GC sweeps browser tabs and stale screenshot directories.",
 					"default": 30000
+				}
+			},
+			"additionalProperties": false
+		},
+		"memoryGuard": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"default": false
+				},
+				"checkIntervalMs": {
+					"type": "number",
+					"default": 30000
+				},
+				"gcThresholdPercent": {
+					"type": "number",
+					"default": 70
+				},
+				"restartThresholdPercent": {
+					"type": "number",
+					"default": 85
+				},
+				"restartThresholdWindowMs": {
+					"type": "number",
+					"default": 90000
+				},
+				"cooldownMs": {
+					"type": "number",
+					"default": 600000
+				},
+				"parentReserveMb": {
+					"type": "number",
+					"default": 1024
+				},
+				"policyLimitMb": {
+					"type": "number",
+					"default": 0
 				}
 			},
 			"additionalProperties": false
@@ -1922,6 +2263,17 @@
 				"notificationDebounceMs": {
 					"type": "number",
 					"default": 500
+				}
+			},
+			"additionalProperties": false
+		},
+		"tasksPane": {
+			"type": "object",
+			"properties": {
+				"defaultVisible": {
+					"type": "boolean",
+					"description": "Open the unified tasks pane when the interactive UI starts",
+					"default": false
 				}
 			},
 			"additionalProperties": false
@@ -2091,10 +2443,28 @@
 						"openai",
 						"gemini",
 						"openrouter",
-						"antigravity"
+						"antigravity",
+						"alibaba",
+						"custom"
 					],
-					"description": "Provider for image generation tool",
+					"description": "Provider and model for image generation tool",
 					"default": "auto"
+				},
+				"imageModel": {
+					"type": "string",
+					"description": "Override the default image generation model for the selected provider"
+				},
+				"imageCustomUrl": {
+					"type": "string",
+					"description": "Base URL for custom OpenAI-compatible image endpoint"
+				},
+				"imageCustomKey": {
+					"type": "string",
+					"description": "API key for custom OpenAI-compatible image endpoint"
+				},
+				"imageCustomKeyEnv": {
+					"type": "string",
+					"description": "Environment variable name holding the API key for custom image endpoint"
 				},
 				"kimiApiFormat": {
 					"type": "string",

@@ -31,6 +31,14 @@ import { embeddedAddon } from "./embedded-addon.js";
  */
 
 const SUPPORTED_PLATFORMS = ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64"];
+const OPTIONAL_PACKAGE_BY_PLATFORM_TAG = {
+	"darwin-arm64": "@gajae-code/natives-darwin-arm64",
+	"darwin-x64": "@gajae-code/natives-darwin-x64",
+	"linux-arm64": "@gajae-code/natives-linux-arm64",
+	"linux-x64": "@gajae-code/natives-linux-x64",
+	"win32-x64": "@gajae-code/natives-win32-x64",
+};
+
 
 function getNativesDir() {
 	const xdgDataHome = process.env.XDG_DATA_HOME;
@@ -79,6 +87,32 @@ export function getAddonFilenames({ tag, arch, variant }) {
 }
 
 /**
+ * @param {string} platformTag
+ * @returns {string[]}
+ */
+export function getOptionalPackageNames(platformTag) {
+	const packageName = OPTIONAL_PACKAGE_BY_PLATFORM_TAG[platformTag];
+	return packageName ? [packageName] : [];
+}
+
+/**
+ * @param {{ packageNames: string[]; requireResolve: (id: string) => string }} input
+ * @returns {string[]}
+ */
+export function resolveOptionalPackageNativeDirs({ packageNames, requireResolve }) {
+	const dirs = [];
+	for (const packageName of packageNames) {
+		try {
+			const manifestPath = requireResolve(`${packageName}/package.json`);
+			dirs.push(path.join(path.dirname(manifestPath), "native"));
+		} catch {
+			// Optional dependency is absent on non-matching platforms or older installs.
+		}
+	}
+	return dirs;
+}
+
+/**
  * Decide whether the loader should mirror the package's `native/<filename>.node`
  * into the per-version cache directory (`~/.gjc/natives/<version>/`) before loading.
  *
@@ -112,6 +146,8 @@ export function shouldStageNodeModulesAddon({ platform, isCompiledBinary, native
  *   addonFilenames: string[];
  *   isCompiledBinary: boolean;
  *   stageFromNodeModules?: boolean;
+ *   isWorkspaceLoad?: boolean;
+ *   optionalPackageNativeDirs?: string[];
  *   nativeDir: string;
  *   execDir: string;
  *   versionedDir: string;
@@ -123,15 +159,25 @@ export function resolveLoaderCandidates({
 	addonFilenames,
 	isCompiledBinary,
 	stageFromNodeModules = false,
+	isWorkspaceLoad = false,
+	optionalPackageNativeDirs = [],
 	nativeDir,
 	execDir,
 	versionedDir,
 	userDataDir,
 }) {
-	const baseReleaseCandidates = addonFilenames.flatMap(filename => [
+	const workspaceCandidates = addonFilenames.map(filename => path.join(nativeDir, filename));
+	const optionalPackageCandidates = optionalPackageNativeDirs.flatMap(optionalNativeDir =>
+		addonFilenames.map(filename => path.join(optionalNativeDir, filename)),
+	);
+	const legacyReleaseCandidates = addonFilenames.flatMap(filename => [
 		path.join(nativeDir, filename),
 		path.join(execDir, filename),
 	]);
+	const legacyExecCandidates = addonFilenames.map(filename => path.join(execDir, filename));
+	const baseReleaseCandidates = isWorkspaceLoad
+		? [...workspaceCandidates, ...optionalPackageCandidates, ...legacyExecCandidates]
+		: [...optionalPackageCandidates, ...legacyReleaseCandidates];
 	const compiledCandidates = addonFilenames.flatMap(filename => [
 		path.join(versionedDir, filename),
 		path.join(userDataDir, filename),
@@ -146,6 +192,52 @@ export function resolveLoaderCandidates({
 		releaseCandidates = baseReleaseCandidates;
 	}
 	return [...new Set(releaseCandidates)];
+}
+
+/**
+ * Deterministically try candidate paths in order using injected operations.
+ * This leaves file loading and compatibility policy at the call site while
+ * making fallback behavior testable without a native addon on disk.
+ *
+ * @template T
+ * @param {{
+ *   candidates: string[];
+ *   requireCandidate: (candidate: string) => T;
+ *   validateCandidate: (bindings: T, candidate: string) => void;
+ *   describeCandidate: (candidate: string) => string;
+ * }} input
+ * @returns {{ bindings: T | null; errors: string[] }}
+ */
+export function loadFromCandidates({ candidates, requireCandidate, validateCandidate, describeCandidate }) {
+	const errors = [];
+	for (const candidate of candidates) {
+		try {
+			const bindings = requireCandidate(candidate);
+			validateCandidate(bindings, candidate);
+			return { bindings, errors };
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			errors.push(`${describeCandidate(candidate)}: ${message}`);
+		}
+	}
+	return { bindings: null, errors };
+}
+
+/**
+ * Decide whether a previously extracted embedded addon may be reused. A cached
+ * extraction from an earlier build of the same version carries the same version
+ * sentinel yet can expose a different native surface, so it is fresh only when
+ * its byte size matches the embedded payload. `sizeOf` returns the byte size of
+ * a path, or `null` when it cannot be inspected.
+ * @param {{ targetPath: string; embeddedPath: string; sizeOf: (path: string) => number | null }} input
+ * @returns {boolean}
+ */
+export function cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath, sizeOf }) {
+	const cachedSize = sizeOf(targetPath);
+	if (cachedSize === null) return false;
+	const embeddedSize = sizeOf(embeddedPath);
+	if (embeddedSize === null) return false;
+	return cachedSize === embeddedSize;
 }
 
 // =========================================================================
@@ -214,70 +306,79 @@ function resolveCpuVariant(override) {
 	return detectAvx2Support() ? "modern" : "baseline";
 }
 
-function selectEmbeddedAddonFile(selectedVariant) {
-	if (!embeddedAddon) return null;
-	const defaultFile = embeddedAddon.files.find(file => file.variant === "default") || null;
-	if (process.arch !== "x64") return defaultFile || embeddedAddon.files[0] || null;
-	if (selectedVariant === "modern") {
-		return (
-			embeddedAddon.files.find(file => file.variant === "modern") ||
-			embeddedAddon.files.find(file => file.variant === "baseline") ||
-			null
-		);
-	}
-	return embeddedAddon.files.find(file => file.variant === "baseline") || null;
+function embeddedAddonCandidates(selectedVariant) {
+	if (!embeddedAddon) return [];
+	const files = embeddedAddon.files;
+	const candidates = process.arch !== "x64"
+		? [files.find(file => file.variant === "default"), ...files]
+		: selectedVariant === "modern"
+			? [files.find(file => file.variant === "modern"), files.find(file => file.variant === "baseline")]
+			: [files.find(file => file.variant === "baseline")];
+	return [...new Set(candidates.filter(Boolean))];
 }
 
-function maybeExtractEmbeddedAddon(ctx, errors) {
-	if (!ctx.isCompiledBinary || !embeddedAddon) return null;
-	if (embeddedAddon.platformTag !== ctx.platformTag || embeddedAddon.version !== ctx.packageVersion) return null;
+function maybeExtractEmbeddedAddons(ctx, errors) {
+	if (!ctx.isCompiledBinary || !embeddedAddon) return [];
+	if (embeddedAddon.platformTag !== ctx.platformTag || embeddedAddon.version !== ctx.packageVersion) return [];
 
-	const selectedEmbeddedFile = selectEmbeddedAddonFile(ctx.selectedVariant);
-	if (!selectedEmbeddedFile) return null;
-	const targetPath = path.join(ctx.versionedDir, selectedEmbeddedFile.filename);
-	if (fs.existsSync(targetPath)) return targetPath;
+	const extracted = [];
+	for (const embeddedFile of embeddedAddonCandidates(ctx.selectedVariant)) {
+		const targetPath = path.join(ctx.versionedDir, embeddedFile.filename);
+		if (fs.existsSync(targetPath)) {
+			// Guard against intra-version drift: a cached extraction written by an earlier
+			// build of the same version carries the same version sentinel but can expose a
+			// different native surface (e.g. a symbol added mid-cycle). The embedded addon
+			// is the source of truth, so reuse the cached file only when it matches the
+			// embedded payload size and re-extract otherwise.
+			const sizeOf = candidate => {
+				try {
+					return fs.statSync(candidate).size;
+				} catch {
+					return null;
+				}
+			};
+			if (cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath: embeddedFile.filePath, sizeOf })) {
+				extracted.push(targetPath);
+				continue;
+			}
+		}
 
-	try {
-		fs.mkdirSync(ctx.versionedDir, { recursive: true });
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		errors.push(`embedded addon dir: ${message}`);
-		return null;
+		try {
+			fs.mkdirSync(ctx.versionedDir, { recursive: true });
+			const buffer = fs.readFileSync(embeddedFile.filePath);
+			const tempPath = `${targetPath}.tmp.${process.pid}`;
+			fs.writeFileSync(tempPath, buffer);
+			fs.renameSync(tempPath, targetPath);
+			extracted.push(targetPath);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			errors.push(`embedded addon write (${embeddedFile.filename}): ${message}`);
+		}
 	}
-
-	try {
-		const buffer = fs.readFileSync(selectedEmbeddedFile.filePath);
-		const tempPath = `${targetPath}.tmp.${process.pid}`;
-		fs.writeFileSync(tempPath, buffer);
-		fs.renameSync(tempPath, targetPath);
-		return targetPath;
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		errors.push(`embedded addon write (${selectedEmbeddedFile.filename}): ${message}`);
-		return null;
-	}
+	return extracted;
 }
 
 /**
- * Mirror `nativeDir/<filename>.node` to `versionedDir/<filename>.node` on Windows
- * installs so the running process keeps its OS-level handle on a versioned
- * cache path, never on the `node_modules` copy that bun must overwrite on
- * update. No-op on non-Windows, in workspace dev, and for compiled binaries —
- * see `shouldStageNodeModulesAddon` for the gating rules.
+ * Mirror the optional-package or legacy bundled `native/<filename>.node` into
+ * `versionedDir/<filename>.node` on Windows installs so the running process
+ * keeps its OS-level handle on a versioned cache path, never on the
+ * `node_modules` copy that bun must overwrite on update. No-op on non-Windows,
+ * in workspace dev, and for compiled binaries — see `shouldStageNodeModulesAddon`.
  */
 function maybeStageNodeModulesAddon(ctx, errors) {
 	if (!ctx.stageFromNodeModules) return null;
 
 	let stagedPath = null;
+	const sourceDirs = [...ctx.optionalPackageNativeDirs, ctx.nativeDir];
 	for (const filename of ctx.addonFilenames) {
-		const sourcePath = path.join(ctx.nativeDir, filename);
 		const targetPath = path.join(ctx.versionedDir, filename);
 
 		if (fs.existsSync(targetPath)) {
 			stagedPath = stagedPath || targetPath;
 			continue;
 		}
-		if (!fs.existsSync(sourcePath)) continue;
+		const sourcePath = sourceDirs.map(sourceDir => path.join(sourceDir, filename)).find(candidate => fs.existsSync(candidate));
+		if (!sourcePath) continue;
 
 		try {
 			fs.mkdirSync(ctx.versionedDir, { recursive: true });
@@ -300,19 +401,26 @@ function maybeStageNodeModulesAddon(ctx, errors) {
 	return stagedPath;
 }
 
-function validateLoadedBindings(ctx, bindings, candidate) {
-	// In workspace dev (running out of `packages/natives/native/` rather than a
-	// `node_modules` install or a compiled bundle) the local `.node` only gains
-	// the renamed sentinel after `bun --cwd=packages/natives run build`. Skip
-	// validation there so a stale post-pull dev tree boots while the rebuild
-	// completes; install and compiled-binary paths still validate.
-	if (ctx.isWorkspaceLoad) return;
-	if (typeof bindings[ctx.versionSentinelExport] === "function") return;
-	throw new Error(
-		`Loaded ${candidate} but it does not expose the @gajae-code/natives@${ctx.packageVersion} ` +
-			`version sentinel \`${ctx.versionSentinelExport}\`. The .node file on disk is from a different ` +
-			"release than this loader — reinstall to re-sync.",
-	);
+export function validateLoadedBindings(ctx, bindings, candidate) {
+	if (typeof bindings[ctx.versionSentinelExport] !== "function") {
+		throw new Error(
+			`Loaded ${candidate} but it does not expose the @gajae-code/natives@${ctx.packageVersion} ` +
+				`version sentinel \`${ctx.versionSentinelExport}\`. The .node file on disk is from a different ` +
+				"release than this loader — reinstall to re-sync.",
+		);
+	}
+	if (typeof bindings.__piNativesPublishOutcomeV1 !== "function") {
+		throw new Error(
+			`Loaded ${candidate} but it lacks retained-publish capability sentinel ` +
+			"`__piNativesPublishOutcomeV1`; trying the next compatible artifact.",
+		);
+	}
+	if (typeof bindings.renameNoReplacePath !== "function") {
+		throw new Error(`Loaded ${candidate} but it lacks required atomic publish capability \`renameNoReplacePath\`.`);
+	}
+	if (typeof bindings.probeWindowsJobMemory !== "function") {
+		throw new Error(`Loaded ${candidate} but it lacks required memory probe capability \`probeWindowsJobMemory\`.`);
+	}
 }
 
 function buildHelpMessage(ctx) {
@@ -320,7 +428,7 @@ function buildHelpMessage(ctx) {
 		const expectedPaths = ctx.addonFilenames.map(filename => `  ${path.join(ctx.versionedDir, filename)}`).join("\n");
 		const downloadHints = ctx.addonFilenames
 			.map(filename => {
-				const downloadUrl = `https://github.com/can1357/gajae-code/releases/latest/download/${filename}`;
+				const downloadUrl = `https://github.com/Yeachan-Heo/gajae-code/releases/latest/download/${filename}`;
 				const targetPath = path.join(ctx.versionedDir, filename);
 				return `  curl -fsSL "${downloadUrl}" -o "${targetPath}"`;
 			})
@@ -343,7 +451,7 @@ function buildHelpMessage(ctx) {
  * Called from `loadNative()` rather than at module scope so importing pure
  * helpers from this file doesn't trigger AVX2 detection or filesystem probes.
  */
-function initLoaderContext() {
+function initLoaderContext(require_) {
 	const platformTag = `${process.platform}-${process.arch}`;
 	const packageVersion = packageJson.version;
 	const nativeDir = path.join(import.meta.dir, "..", "native");
@@ -364,15 +472,24 @@ function initLoaderContext() {
 		isCompiledBinary,
 		nativeDir,
 	});
+	const isWorkspaceLoad =
+		!isCompiledBinary && !nativeDir.includes("\\node_modules\\") && !nativeDir.includes("/node_modules/");
 
 	const selectedVariant = resolveCpuVariant(getVariantOverride());
 	const addonFilenames = getAddonFilenames({ tag: platformTag, arch: process.arch, variant: selectedVariant });
 	const addonLabel = selectedVariant ? `${platformTag} (${selectedVariant})` : platformTag;
+	const optionalPackageNativeDirs = resolveOptionalPackageNativeDirs({
+		packageNames: getOptionalPackageNames(platformTag),
+		requireResolve: id => require_.resolve(id),
+	});
+
 
 	const candidates = resolveLoaderCandidates({
 		addonFilenames,
 		isCompiledBinary,
 		stageFromNodeModules,
+		isWorkspaceLoad,
+		optionalPackageNativeDirs,
 		nativeDir,
 		execDir,
 		versionedDir,
@@ -387,8 +504,6 @@ function initLoaderContext() {
 	// turns the silent `<sym> is not a function` crash from a Windows
 	// locked-file update into an actionable load-time error.
 	const versionSentinelExport = `__piNativesV${packageVersion.replace(/[^A-Za-z0-9]/g, "_")}`;
-	const isWorkspaceLoad =
-		!isCompiledBinary && !nativeDir.includes("\\node_modules\\") && !nativeDir.includes("/node_modules/");
 
 	return {
 		platformTag,
@@ -399,33 +514,41 @@ function initLoaderContext() {
 		stageFromNodeModules,
 		selectedVariant,
 		addonFilenames,
+		optionalPackageNativeDirs,
 		addonLabel,
 		candidates,
 		versionSentinelExport,
-		isWorkspaceLoad,
 	};
 }
 
-export function loadNative() {
-	const ctx = initLoaderContext();
-	const require_ = createRequire(import.meta.url);
+/** Embedded standalone payloads are the complete trust boundary for their matching build. */
+export function embeddedAddonIsAuthoritative(ctx, addon = embeddedAddon) {
+	return (
+		ctx.isCompiledBinary && addon?.platformTag === ctx.platformTag && addon.version === ctx.packageVersion
+	);
+}
+
+export function loadNative(options = {}) {
+	const require_ = options.requireCandidate ? null : createRequire(import.meta.url);
+	const ctx = options.context ?? initLoaderContext(require_);
 
 	const errors = [];
-	const embeddedCandidate = maybeExtractEmbeddedAddon(ctx, errors);
-	const stagedCandidate = embeddedCandidate ? null : maybeStageNodeModulesAddon(ctx, errors);
-	const prepended = [embeddedCandidate, stagedCandidate].filter(c => typeof c === "string");
-	const runtimeCandidates = prepended.length > 0 ? [...prepended, ...ctx.candidates] : ctx.candidates;
-
-	for (const candidate of runtimeCandidates) {
-		try {
-			const bindings = require_(candidate);
-			validateLoadedBindings(ctx, bindings, candidate);
-			return bindings;
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			errors.push(`${candidate}: ${message}`);
-		}
-	}
+	const embeddedCandidates = (options.extractEmbeddedAddons ?? maybeExtractEmbeddedAddons)(ctx, errors);
+	const embeddedIsAuthoritative = embeddedAddonIsAuthoritative(ctx);
+	const stagedCandidate =
+		embeddedCandidates.length > 0 || embeddedIsAuthoritative
+			? null
+			: (options.stageNodeModulesAddon ?? maybeStageNodeModulesAddon)(ctx, errors);
+	const prepended = [...embeddedCandidates, stagedCandidate].filter(c => typeof c === "string");
+	const runtimeCandidates = embeddedIsAuthoritative ? prepended : prepended.length > 0 ? [...prepended, ...ctx.candidates] : ctx.candidates;
+	const loaded = loadFromCandidates({
+		candidates: runtimeCandidates,
+		requireCandidate: options.requireCandidate ?? (candidate => require_(candidate)),
+		validateCandidate: options.validateCandidate ?? ((bindings, candidate) => validateLoadedBindings(ctx, bindings, candidate)),
+		describeCandidate: candidate => candidate,
+	});
+	if (loaded.bindings) return loaded.bindings;
+	errors.push(...loaded.errors);
 
 	if (!SUPPORTED_PLATFORMS.includes(ctx.platformTag)) {
 		throw new Error(

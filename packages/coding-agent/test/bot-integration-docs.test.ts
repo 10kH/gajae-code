@@ -29,14 +29,21 @@ describe("external controller integration docs", () => {
 		expect(guide).toContain("Dry-run lifecycle smoke");
 		expect(guide).toContain("Optional live smoke");
 		expect(guide).toContain("not privileged integration modes");
-		expect(guide).toContain("gjc --mode rpc");
+		expect(guide).toContain("SDK WebSocket integration");
+		expect(guide).toContain("have been removed");
+		expect(guide).not.toContain("RPC lifecycle below");
+		expect(guide).not.toContain("gjc --mode " + "rpc");
+		expect(guide).not.toContain("docs/rpc.md");
+		expect(guide).not.toContain("docs/bridge.md");
 		expect(guide).toContain("gjc_coordinator_register_session");
-		expect(guide).toContain("visible tmux fallback");
+		expect(guide).toContain("SDK-discoverable session");
+		expect(guide).toContain("advisory process metadata only");
+		expect(guide).not.toContain("visible tmux fallback");
 		expect(guide).toContain("active_turn_exists");
 		expect(guide).toContain("Provider/auth failure");
 		expect(guide).toContain("Coordinator cancellation");
 		expect(guide).toContain('status: "cancelled"');
-		expect(guide).toContain("not a tmux process kill");
+		expect(guide).toContain("not process control");
 
 		for (const toolName of COORDINATOR_MCP_TOOL_NAMES) {
 			expect(guide).toContain(toolName);
@@ -92,51 +99,35 @@ describe("external controller integration docs", () => {
 
 	it("classifies external control surface readiness against code and smoke coverage", async () => {
 		const readiness = await readRepoFile("docs", "external-control-readiness.md");
+		const cli = await readRepoFile("packages", "coding-agent", "src", "cli.ts");
 		const cliArgs = await readRepoFile("packages", "coding-agent", "src", "cli", "args.ts");
 		const acpCommand = await readRepoFile("packages", "coding-agent", "src", "commands", "acp.ts");
 		const mcpCommand = await readRepoFile("packages", "coding-agent", "src", "commands", "mcp-serve.ts");
-		const bridgeMode = await readRepoFile("packages", "coding-agent", "src", "modes", "bridge", "bridge-mode.ts");
 
-		expect(readiness).toContain("# External control surface readiness");
-		expect(readiness).toContain("Coordinator MCP | Preferred multi-session bot/control-plane surface");
-		expect(readiness).toContain("RPC stdio | Stable subprocess worker surface");
-		expect(readiness).toContain("ACP mode | Editor/ACP client surface");
-		expect(readiness).toContain("Bridge HTTPS | Experimental, fail-closed remote session-control surface");
-		expect(readiness).toContain(
-			"Do not document events, commands, controller ownership, UI responses, host tool results, or host URI results as enabled by default",
-		);
-		expect(readiness).toContain("Optional live smokes are useful diagnostics");
+		expect(readiness).toContain("# External control readiness");
+		expect(readiness).toContain("SDK WebSocket");
+		expect(readiness).toContain("Coordinator MCP");
+		expect(readiness).toContain("ACP");
+		expect(readiness).toContain("have been removed");
 
-		for (const command of [
-			"gjc mcp-serve coordinator",
-			"gjc --mode rpc",
-			"gjc --mode acp",
-			"gjc acp",
-			"gjc --mode bridge",
-		]) {
+		for (const command of ["gjc mcp-serve coordinator", "gjc --mode acp", "gjc acp"]) {
 			expect(readiness).toContain(command);
 		}
 
 		for (const smoke of [
-			"packages/coding-agent/test/coordinator-mcp.test.ts",
-			"packages/coding-agent/test/setup-cli.test.ts",
-			"packages/coding-agent/test/rpc-unattended-stdio.test.ts",
-			"packages/coding-agent/test/rpc-client.start.test.ts",
-			"packages/coding-agent/test/acp-initialize-conformance.test.ts",
-			"packages/coding-agent/test/acp-stdout-hygiene.test.ts",
-			"packages/coding-agent/test/bridge/bridge-mode-handler.test.ts",
-			"packages/bridge-client/test/bridge-client.test.ts",
+			"packages/coding-agent/test/sdk-",
+			"packages/coding-agent/test/acp-",
+			"packages/coding-agent/test/workflow-gate-broker.test.ts",
+			"packages/coding-agent/test/workflow-gate-schema.test.ts",
 		]) {
 			expect(readiness).toContain(smoke);
 		}
 
-		expect(cliArgs).toContain('export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui" | "bridge"');
+		expect(cliArgs).toContain('export type Mode = "text" | "json" | "acp"');
+		expect(cliArgs).toContain("was removed; external control now uses the Gajae-Code SDK");
+		expect(cli).toContain('{ name: "acp", load: () => import("./commands/acp").then(m => m.default) }');
 		expect(acpCommand).toContain("Run Gajae Code as an ACP (Agent Client Protocol) server over stdio");
 		expect(mcpCommand).toContain('server !== "coordinator" && server !== "hermes"');
-		expect(bridgeMode).toContain("const FAIL_CLOSED_BRIDGE_ENDPOINTS");
-		for (const endpoint of ["events", "commands", "control", "uiResponses", "hostToolResults", "hostUriResults"]) {
-			expect(bridgeMode).toContain(`${endpoint}: false`);
-		}
 	});
 
 	it("documents public-safe lifecycle notification forwarding", async () => {
@@ -153,6 +144,28 @@ describe("external controller integration docs", () => {
 		expect(guide).toContain("Do not forward raw prompts, transcripts, tool outputs");
 		expect(guide).not.toContain("webhook.site");
 		expect(guide).not.toContain("discord.com/api/webhooks");
+	});
+
+	it("documents the observational coordinator and hermes check contract", async () => {
+		const guide = await readRepoFile("docs", "bot-integration.md");
+		const bridge = await readRepoFile("docs", "hermes-mcp-bridge.md");
+
+		for (const content of [guide, bridge]) {
+			expect(content).toContain("discovery-only");
+			expect(content).toContain("non-mutating");
+			expect(content).toContain("catalog");
+			expect(content).toContain("broker.discovery_status");
+			expect(content).toContain("operational_ready");
+			expect(content).toContain("bootstrap_supported");
+			expect(content).toContain("bootstrap_attempted");
+			expect(content).toContain("unsupported_state_version");
+			expect(content).toContain("discovery_access_denied");
+			expect(content).toContain("discovery_read_failed");
+			expect(content).toContain("does not connect, ensure/bootstrap, write, repair, or delete");
+			expect(content).toContain("human output remains the server/tools summary");
+		}
+		expect(bridge).toContain("identical coordinator check payload");
+		expect(guide).toContain("SDK check behavior is separate and unchanged");
 	});
 
 	it("keeps bot integration docs free of local-only operator details", async () => {

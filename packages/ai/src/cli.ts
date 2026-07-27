@@ -111,12 +111,15 @@ Providers:
   zai               Z.AI (GLM Coding Plan)
   glm-zcode         GLM ZCode OAuth (unofficial, opt-in; at your own risk)
   deepseek          DeepSeek
+  deepinfra         DeepInfra
   xai               xAI
   nanogpt           NanoGPT
   minimax-code      MiniMax Coding Plan (International)
   minimax-code-cn   MiniMax Coding Plan (China)
   cursor            Cursor (Anthropic, GPT, etc.)
   zenmux            ZenMux
+  opengateway       OpenGateway by Sionic AI
+  bizrouter         BizRouter
   ollama-cloud      Ollama Cloud
 
 Examples:

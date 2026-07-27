@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { $ } from "bun";
 import { detectHostAvx2Support } from "../../../scripts/host-detect";
+import { assertRequiredSymbols } from "./embed-guard";
 import { generateEnumExports } from "./gen-enums";
 
 const repoRoot = path.join(import.meta.dir, "../../..");
@@ -146,9 +147,79 @@ async function installGeneratedBindings(outputDir: string): Promise<void> {
 	}
 }
 
+async function ensurePublishDiagnosticDeclaration(): Promise<void> {
+	const declarationPath = path.join(nativeDir, "index.d.ts");
+	const bindings = await Bun.file(declarationPath).text();
+	if (bindings.includes("export interface NativePublishDiagnostic")) return;
+	if (!bindings.includes("diagnostic: NativePublishDiagnostic"))
+		throw new Error("napi build did not generate the native publish diagnostic reference");
+	const declaration = `\n/** Bounded, path-free evidence for a parent-directory durability failure. */
+export interface NativePublishSyncFailure {
+  phase: string
+  parentRole: string
+  osCode: number
+  kind: string
+}
+
+/** Bounded, path-free evidence for one atomic publication. */
+export interface NativePublishDiagnostic {
+  schemaVersion: number
+  collectionState: string
+  osCode?: number
+  syncFailures?: Array<NativePublishSyncFailure>
+}
+`;
+	await Bun.write(declarationPath, `${bindings.trimEnd()}\n${declaration}`);
+}
+
+const requiredGeneratedBindingSymbols = [
+	"RecoveryFsRoot",
+	"RecoveryFsIdentity",
+	"RecoveryFsResult",
+	"NativePublishDiagnostic",
+	"NativePublishSyncFailure",
+	"openRecoveryFsRoot",
+	"repairOwnerOnlyPathSecurityExpected",
+	"verifyOwnerOnlyPathSecurityExpected",
+	"probeWindowsJobMemory",
+] as const;
+
+export function validateGeneratedBindingSource(bindings: string): void {
+	assertRequiredSymbols(bindings, requiredGeneratedBindingSymbols);
+}
+
+async function validateGeneratedBindings(): Promise<void> {
+	const bindings = await Bun.file(path.join(nativeDir, "index.d.ts")).text();
+	validateGeneratedBindingSource(bindings);
+}
+
+type NativeBuildProfile = "local" | "ci" | "dist";
+
+export function resolveNativeBuildProfile(options: {
+	isCI: boolean;
+	isCrossCompile: boolean;
+	explicitProfile?: string;
+}): NativeBuildProfile {
+	if (options.explicitProfile !== undefined && options.explicitProfile !== "") {
+		if (
+			options.explicitProfile === "local" ||
+			options.explicitProfile === "ci" ||
+			options.explicitProfile === "dist"
+		) {
+			return options.explicitProfile;
+		}
+		throw new Error(`Unsupported PI_NATIVE_PROFILE: ${options.explicitProfile}. Expected "local", "ci", or "dist".`);
+	}
+
+	return !options.isCI && !options.isCrossCompile ? "local" : "ci";
+}
+
 const isCI = Boolean(Bun.env.CI);
-const useLocalProfile = !isCI && !isCrossCompile;
-const profileLabel = useLocalProfile ? "local" : "ci";
+const profileLabel = resolveNativeBuildProfile({
+	isCI,
+	isCrossCompile,
+	explicitProfile: Bun.env.PI_NATIVE_PROFILE,
+});
 const profileSuffix = ` (${profileLabel})`;
 
 const buildOutputDirPrefix = resolveBuildOutputDirPrefix(profileLabel);
@@ -210,10 +281,12 @@ try {
 
 	await Bun.write(
 		`${canonicalAddonPath}.build.json`,
-		`${JSON.stringify({ languageSet, builtAt: new Date().toISOString() }, null, 2)}\n`,
+		`${JSON.stringify({ languageSet, profile: profileLabel, builtAt: new Date().toISOString() }, null, 2)}\n`,
 	);
 
 	await generateEnumExports();
+	await ensurePublishDiagnosticDeclaration();
+	await validateGeneratedBindings();
 
 	console.log("Build complete.");
 } finally {

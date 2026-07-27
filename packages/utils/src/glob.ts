@@ -70,20 +70,25 @@ function parseGitignorePatterns(content: string, gitignoreDir: string, baseDir: 
 			} else {
 				patterns.push(pattern);
 			}
+		} else if (pattern.includes("/") && !pattern.startsWith("**/")) {
+			// Separator in the middle: git anchors these to the .gitignore's
+			// directory, same as rooted patterns
+			const absolutePattern = path.join(gitignoreDir, pattern);
+			const relativeToBase = path.relative(baseDir, absolutePattern);
+			if (relativeToBase.startsWith("..")) {
+				// Pattern is outside the search directory, skip
+				continue;
+			}
+			pattern = relativeToBase.replace(/\\/g, "/");
+			patterns.push(pattern);
+			if (isDirectoryOnly) {
+				patterns.push(`${pattern}/**`);
+			}
 		} else {
-			// Unrooted pattern: match anywhere in the tree
-			if (pattern.includes("/")) {
-				// Contains slash: match from any directory level
-				patterns.push(`**/${pattern}`);
-				if (isDirectoryOnly) {
-					patterns.push(`**/${pattern}/**`);
-				}
-			} else {
-				// No slash: match file/dir name anywhere
-				patterns.push(`**/${pattern}`);
-				if (isDirectoryOnly) {
-					patterns.push(`**/${pattern}/**`);
-				}
+			// No middle separator: match file/dir name anywhere in the tree
+			patterns.push(`**/${pattern}`);
+			if (isDirectoryOnly) {
+				patterns.push(`**/${pattern}/**`);
 			}
 		}
 	}
@@ -145,8 +150,13 @@ export async function globPaths(patterns: string | string[], options: GlobPathsO
 		effectiveExclude = [...effectiveExclude, ...gitignorePatterns];
 	}
 
+	const excludeGlobs = effectiveExclude.map(pattern => new Glob(pattern));
+
 	const base = cwd ?? getProjectDir();
 	const allResults: string[] = [];
+	// Overlapping patterns (e.g. `["**/*.ts", "src/*.ts"]`) can both match the same
+	// file; dedupe so a path is returned at most once regardless of pattern overlap.
+	const seen = new Set<string>();
 
 	// Combine timeout and abort signals
 	const timeoutSignal = timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined;
@@ -171,17 +181,14 @@ export async function globPaths(patterns: string | string[], options: GlobPathsO
 
 			// Check exclusion patterns
 			const normalized = entry.replace(/\\/g, "/");
-			let excluded = false;
-			for (const excludePattern of effectiveExclude) {
-				const excludeGlob = new Glob(excludePattern);
-				if (excludeGlob.match(normalized)) {
-					excluded = true;
-					break;
-				}
+			if (excludeGlobs.some(excludeGlob => excludeGlob.match(normalized))) {
+				continue;
 			}
-			if (!excluded) {
-				allResults.push(normalized);
+			if (seen.has(normalized)) {
+				continue;
 			}
+			seen.add(normalized);
+			allResults.push(normalized);
 		}
 	}
 

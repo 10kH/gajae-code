@@ -1,5 +1,7 @@
 import { type Component, padding, TERMINAL, truncateToWidth, visibleWidth } from "@gajae-code/tui";
 import { APP_NAME } from "@gajae-code/utils";
+import { formatBuildLabel } from "../../build-metadata";
+import { formatKeyHint, type KeyDisplayContext } from "../../config/keybindings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
 
 export interface RecentSession {
@@ -9,11 +11,40 @@ export interface RecentSession {
 
 export interface LspServerInfo {
 	name: string;
-	status: "ready" | "error" | "connecting";
+	status: "idle" | "ready" | "error" | "connecting";
 	fileTypes: string[];
 }
 
 export type WelcomeLogoMode = "unicode" | "square" | "ascii";
+export interface WelcomeComponentOptions {
+	getViewportRows?: () => number | undefined;
+	getReservedBottomRows?: (termWidth: number) => number;
+	changelogMarkdown?: string;
+	rightGutterWidth?: number;
+	collapseChangelog?: boolean;
+	buildLabel?: string;
+	keyDisplayContext?: KeyDisplayContext;
+}
+
+const WELCOME_STATIC_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS = 9;
+const DEFAULT_WHATS_NEW_ROWS = 3;
+const MAX_WHATS_NEW_ROWS = 12;
+
+function flowKeyItems(context: KeyDisplayContext): ReadonlyArray<{ key: string; label: string }> {
+	const newlineKey = context.platform === "win32" ? "alt+enter" : "ctrl+j";
+	return [
+		{ key: "/", label: "commands" },
+		{ key: "#", label: "actions" },
+		{ key: "!", label: "shell" },
+		{ key: "$", label: "python" },
+		{ key: "?", label: "keymap" },
+		{ key: "ctrl+l", label: "model" },
+		{ key: "shift+tab", label: "reasoning" },
+		{ key: "tab", label: "complete" },
+		{ key: newlineKey, label: "newline" },
+		{ key: "ctrl+c", label: "clear" },
+	];
+}
 
 /**
  * GJC-native launch surface with compact command affordances, project
@@ -30,6 +61,7 @@ export class WelcomeComponent implements Component {
 		private recentSessions: RecentSession[] = [],
 		private lspServers: LspServerInfo[] = [],
 		private readonly logoMode: WelcomeLogoMode = "unicode",
+		private readonly options: WelcomeComponentOptions = {},
 	) {}
 
 	invalidate(): void {}
@@ -50,6 +82,11 @@ export class WelcomeComponent implements Component {
 			}
 			requestRender();
 		}, INTRO_TICK_MS);
+		this.#animTimer.unref?.();
+	}
+
+	dispose(): void {
+		this.#stopAnimation();
 	}
 
 	#stopAnimation(): void {
@@ -74,15 +111,20 @@ export class WelcomeComponent implements Component {
 	}
 
 	render(termWidth: number): string[] {
-		// Box dimensions track the live viewport so wide terminals feel intentionally full-screen.
-		const boxWidth = Math.max(0, termWidth - 2);
+		const rightGutterWidth = this.#rightGutterWidth(termWidth);
+		const boxWidth = Math.max(0, termWidth - rightGutterWidth);
 		if (boxWidth < 4) {
 			return [];
 		}
+
+		const targetRows = this.#targetRows(termWidth);
+		if (targetRows !== undefined && targetRows <= 0) {
+			return [];
+		}
+		const targetContentRows = targetRows === undefined ? undefined : Math.max(0, targetRows - 2);
 		const dualContentWidth = boxWidth - 3; // 3 = │ + │ + │
-		const preferredLeftCol = 36;
-		const minLeftCol = 18; // claw mark plus GJC identity labels
-		const minRightCol = 20;
+		const minLeftCol = 20; // logo mark plus GJC identity labels
+		const minRightCol = 24;
 		const modelPill = this.#pill(theme.icon.model || "model", this.modelName, "statusLineModel");
 		const providerPill = this.#pill(theme.icon.package || "provider", this.providerName, "statusLinePath");
 		const logoLines = this.#logoLines();
@@ -90,15 +132,17 @@ export class WelcomeComponent implements Component {
 		const leftMinContentWidth = Math.max(
 			minLeftCol,
 			logoMinWidth,
-			visibleWidth("Gajae forge"),
+			visibleWidth("GJC Forge"),
 			visibleWidth("shape · act · prove"),
 			visibleWidth(modelPill),
 			visibleWidth(providerPill),
 		);
-		const desiredLeftCol = Math.min(preferredLeftCol, Math.max(minLeftCol, Math.floor(dualContentWidth * 0.35)));
+		const evenLeftCol = Math.floor(dualContentWidth / 2);
+		const maxLeftColWithRightMinimum = Math.max(1, dualContentWidth - minRightCol);
+		const desiredLeftCol = Math.max(leftMinContentWidth, evenLeftCol);
 		const dualLeftCol =
 			dualContentWidth >= minRightCol + 1
-				? Math.min(desiredLeftCol, dualContentWidth - minRightCol)
+				? Math.min(desiredLeftCol, maxLeftColWithRightMinimum)
 				: Math.max(1, dualContentWidth - 1);
 		const dualRightCol = Math.max(1, dualContentWidth - dualLeftCol);
 		const showRightColumn = dualLeftCol >= leftMinContentWidth && dualRightCol >= minRightCol;
@@ -107,77 +151,65 @@ export class WelcomeComponent implements Component {
 
 		const logoColored = this.#currentLogoFrame(logoLines);
 
-		// Left column - centered content
 		const leftLines = [
 			"",
-			this.#centerText(theme.bold(theme.fg("accent", "Gajae forge")), leftCol),
+			this.#centerText(theme.bold(theme.fg("accent", "GJC Forge")), leftCol),
 			this.#centerText(theme.fg("dim", "shape · act · prove"), leftCol),
 			"",
 			...logoColored.map(l => this.#centerText(l, leftCol)),
 			"",
+			this.#centerText(this.#loadingLine(), leftCol),
 			this.#centerText(modelPill, leftCol),
 			this.#centerText(providerPill, leftCol),
+			"",
 		];
 
-		// Right column separator
-		const separatorWidth = Math.max(0, rightCol - 2); // padding on each side
-		const separator = ` ${theme.fg("dim", theme.boxRound.horizontal.repeat(separatorWidth))}`;
+		const buildSeparator = (columnWidth: number): string =>
+			` ${theme.fg("dim", theme.boxRound.horizontal.repeat(Math.max(0, columnWidth - 2)))}`;
 
-		// Recent sessions content
-		const sessionLines: string[] = [];
-		if (this.recentSessions.length === 0) {
-			sessionLines.push(` ${theme.fg("dim", "No saved trails")}`);
-		} else {
-			// Reserve width for the bullet prefix (" • ") and the trailing " (timeAgo)"
-			// so the relative time is never the part that gets truncated. The name
-			// absorbs whatever space is left.
-			const bulletPrefix = ` ${theme.md.bullet} `;
-			const prefixWidth = visibleWidth(bulletPrefix);
-			for (const session of this.recentSessions.slice(0, 3)) {
-				const timeSuffixRaw = ` (${session.timeAgo})`;
-				const timeWidth = visibleWidth(timeSuffixRaw);
-				const nameBudget = Math.max(1, rightCol - prefixWidth - timeWidth);
-				const nameVis = visibleWidth(session.name);
-				const name = nameVis > nameBudget ? truncateToWidth(session.name, nameBudget) : session.name;
-				sessionLines.push(
-					`${theme.fg("dim", bulletPrefix)}${theme.fg("muted", name)}${theme.fg("dim", timeSuffixRaw)}`,
-				);
-			}
-		}
-
-		// LSP servers content
+		const rightColumnWidth = showRightColumn ? rightCol : leftCol;
+		const separator = buildSeparator(rightColumnWidth);
 		const lspLines: string[] = [];
 		if (this.lspServers.length === 0) {
 			lspLines.push(` ${theme.fg("dim", "No LSP servers")}`);
 		} else {
-			for (const server of this.lspServers) {
+			for (const server of this.lspServers.slice(0, 4)) {
 				const icon =
 					server.status === "ready"
 						? theme.styledSymbol("status.success", "success")
-						: server.status === "connecting"
-							? theme.styledSymbol("status.pending", "muted")
-							: theme.styledSymbol("status.error", "error");
+						: server.status === "error"
+							? theme.styledSymbol("status.error", "error")
+							: theme.styledSymbol("status.pending", "muted");
 				const exts = server.fileTypes.slice(0, 3).join(" ");
 				lspLines.push(` ${icon} ${theme.fg("muted", server.name)} ${theme.fg("dim", exts)}`);
 			}
 		}
 
-		// Right column
+		const flowPreferredRows = this.#flowKeyRows(rightColumnWidth).length;
+		const changelogRowLimit = this.#whatsNewRowLimit(targetContentRows, lspLines.length, flowPreferredRows);
+		const changelogLines = this.#whatsNewLines(rightColumnWidth, changelogRowLimit);
+		const flowRowLimit = this.#flowKeyRowLimit(
+			targetContentRows,
+			changelogLines.length,
+			lspLines.length,
+			rightColumnWidth,
+		);
+		const flowLines = this.#flowKeyLines(rightColumnWidth, flowRowLimit);
+		const sessionLimit = this.#sessionTrailLimit(
+			targetContentRows,
+			changelogLines.length,
+			lspLines.length,
+			flowLines.length,
+		);
+		const sessionLines = this.#sessionTrailLines(rightColumnWidth, sessionLimit);
+
 		const rightLines = [
+			"",
+			` ${theme.bold(theme.fg("accent", "What's New"))}`,
+			...changelogLines,
+			separator,
 			` ${theme.bold(theme.fg("accent", "Flow keys"))}`,
-			` ${theme.fg("dim", "/")}${theme.fg("muted", " commands")} ${theme.fg("dim", "·")} ${theme.fg(
-				"dim",
-				"#",
-			)}${theme.fg("muted", " actions")}`,
-			` ${theme.fg("dim", "!")}${theme.fg("muted", " shell")} ${theme.fg("dim", "·")} ${theme.fg("dim", "$")}${theme.fg(
-				"muted",
-				" python",
-			)}`,
-			` ${theme.fg("dim", "?")}${theme.fg("muted", " keymap")} ${theme.fg("dim", "·")} ${theme.fg(
-				"dim",
-				"ctrl+l",
-			)}${theme.fg("muted", " model")}`,
-			` ${theme.fg("dim", "shift+tab")}${theme.fg("muted", " reasoning")}`,
+			...flowLines,
 			separator,
 			` ${theme.bold(theme.fg("accent", "Project pulse"))}`,
 			...lspLines,
@@ -187,7 +219,12 @@ export class WelcomeComponent implements Component {
 			"",
 		];
 
-		// Border characters (dim)
+		const contentRows =
+			targetContentRows ??
+			(showRightColumn ? Math.max(leftLines.length, rightLines.length) : leftLines.length + rightLines.length);
+		const outputRows = targetRows === undefined ? Math.max(3, contentRows + 2) : targetRows;
+		const bodyRows = Math.max(0, outputRows - 2);
+
 		const hChar = theme.boxRound.horizontal;
 		const h = theme.fg("dim", hChar);
 		const v = theme.fg("dim", theme.boxRound.vertical);
@@ -197,9 +234,8 @@ export class WelcomeComponent implements Component {
 		const br = theme.fg("dim", theme.boxRound.bottomRight);
 
 		const lines: string[] = [];
-
-		// Top border with embedded title
-		const title = ` ${APP_NAME} v${this.version} · GJC forge `;
+		const buildLabel = this.options.buildLabel ?? formatBuildLabel();
+		const title = ` ${APP_NAME} v${this.version} · ${buildLabel} · GJC Forge `;
 		const titlePrefixRaw = hChar.repeat(3);
 		const titleStyled = theme.fg("dim", titlePrefixRaw) + theme.fg("muted", title);
 		const titleVisLen = visibleWidth(titlePrefixRaw) + visibleWidth(title);
@@ -210,26 +246,36 @@ export class WelcomeComponent implements Component {
 			const afterTitle = titleSpace - titleVisLen;
 			lines.push(tl + titleStyled + theme.fg("dim", hChar.repeat(afterTitle)) + tr);
 		}
-
-		// Content rows
-		const maxRows = showRightColumn ? Math.max(leftLines.length, rightLines.length) : leftLines.length;
-		for (let i = 0; i < maxRows; i++) {
-			const left = this.#fitToWidth(leftLines[i] ?? "", leftCol);
-			if (showRightColumn) {
-				const right = this.#fitToWidth(rightLines[i] ?? "", rightCol);
-				lines.push(v + left + v + right + v);
-			} else {
-				lines.push(v + left + v);
-			}
+		if (outputRows === 1) {
+			return this.#withRightGutter(lines, rightGutterWidth);
 		}
-		// Bottom border
+
 		if (showRightColumn) {
+			const leftBlock = this.#fitBlock(leftLines, bodyRows, "center");
+			const rightBlock = this.#fitBlock(rightLines, bodyRows, "top");
+			for (let i = 0; i < bodyRows; i++) {
+				const left = this.#fitToWidth(leftBlock[i] ?? "", leftCol);
+				const right = this.#fitToWidth(rightBlock[i] ?? "", rightCol);
+				lines.push(v + left + v + right + v);
+			}
 			lines.push(bl + h.repeat(leftCol) + theme.fg("dim", theme.boxSharp.teeUp) + h.repeat(rightCol) + br);
 		} else {
+			const compactLeftLines =
+				bodyRows < 14
+					? [
+							this.#centerText(theme.bold(theme.fg("accent", "GJC Forge")), leftCol),
+							this.#centerText(this.#loadingLine(), leftCol),
+							this.#centerText(modelPill, leftCol),
+						]
+					: leftLines;
+			const singleBlock = this.#fitBlock([...compactLeftLines, separator, ...rightLines], bodyRows, "top");
+			for (let i = 0; i < bodyRows; i++) {
+				lines.push(v + this.#fitToWidth(singleBlock[i] ?? "", leftCol) + v);
+			}
 			lines.push(bl + h.repeat(leftCol) + br);
 		}
 
-		return lines;
+		return this.#withRightGutter(lines, rightGutterWidth);
 	}
 
 	/** Center text within a given width */
@@ -250,6 +296,235 @@ export class WelcomeComponent implements Component {
 			return truncateToWidth(str, width, null, true);
 		}
 		return str + padding(width - visLen);
+	}
+	#rightGutterWidth(termWidth: number): number {
+		const configured = this.options.rightGutterWidth ?? 0;
+		if (!Number.isFinite(configured) || configured <= 0) return 0;
+		const gutterWidth = Math.floor(configured);
+		return Math.min(gutterWidth, Math.max(0, termWidth - 4));
+	}
+
+	#withRightGutter(lines: string[], rightGutterWidth: number): string[] {
+		if (rightGutterWidth <= 0) return lines;
+		const gutter = padding(rightGutterWidth);
+		return lines.map(line => line + gutter);
+	}
+
+	#targetRows(termWidth: number): number | undefined {
+		const viewportRows = this.options.getViewportRows?.();
+		if (typeof viewportRows !== "number" || !Number.isFinite(viewportRows) || viewportRows <= 0) {
+			return undefined;
+		}
+		const reservedRows = Math.max(0, Math.floor(this.options.getReservedBottomRows?.(termWidth) ?? 0));
+		return Math.max(0, Math.floor(viewportRows) - reservedRows);
+	}
+
+	#loadingLine(): string {
+		const frames = theme.spinnerFrames;
+		const elapsed = this.#animStart == null ? 0 : performance.now() - this.#animStart;
+		const frame = frames.length > 0 ? (frames[Math.floor(elapsed / 100) % frames.length] ?? "*") : "*";
+		const label = this.#animStart == null ? "ready" : "warming workspace";
+		return `${theme.fg("warning", frame)} ${theme.fg("muted", label)}`;
+	}
+
+	#fitBlock(lines: string[], rows: number, align: "top" | "center"): string[] {
+		if (rows <= 0) return [];
+		const clipped =
+			lines.length > rows
+				? rows === 1
+					? [theme.fg("dim", " …")]
+					: [...lines.slice(0, rows - 1), theme.fg("dim", " …")]
+				: lines;
+		const missingRows = rows - clipped.length;
+		if (missingRows <= 0) return clipped;
+		const topPad = align === "center" ? Math.floor(missingRows / 2) : 0;
+		const bottomPad = missingRows - topPad;
+		return [...Array.from({ length: topPad }, () => ""), ...clipped, ...Array.from({ length: bottomPad }, () => "")];
+	}
+
+	#flowKeyItemText(item: { key: string; label: string }): string {
+		const context = this.options.keyDisplayContext ?? { platform: process.platform };
+		return `${theme.fg("dim", formatKeyHint(item.key, context))}${theme.fg("muted", ` ${item.label}`)}`;
+	}
+
+	#flowKeyRows(width: number): string[] {
+		const contentWidth = Math.max(1, width - 1);
+		const separator = ` ${theme.fg("dim", "·")} `;
+		const rows: string[] = [];
+		let current = "";
+		for (const item of flowKeyItems(this.options.keyDisplayContext ?? { platform: process.platform })) {
+			const segment = this.#flowKeyItemText(item);
+			const next = current ? `${current}${separator}${segment}` : segment;
+			if (current && visibleWidth(next) > contentWidth) {
+				rows.push(` ${current}`);
+				current = segment;
+			} else {
+				current = next;
+			}
+		}
+		if (current) rows.push(` ${current}`);
+		return rows.length > 0 ? rows : [` ${theme.fg("dim", "No flow keys")}`];
+	}
+
+	#flowKeyLines(width: number, maxRows: number): string[] {
+		const rows = this.#flowKeyRows(width);
+		const rowLimit = Math.max(1, Math.floor(maxRows));
+		if (rows.length <= rowLimit) return rows;
+		if (rowLimit === 1) {
+			const firstItem = flowKeyItems(this.options.keyDisplayContext ?? { platform: process.platform })[0];
+			const firstSegment = firstItem ? this.#flowKeyItemText(firstItem) : theme.fg("dim", "keys");
+			return [this.#fitToWidth(` ${firstSegment} ${theme.fg("dim", "· … ")}${theme.bold("/help")}`, width)];
+		}
+		return [...rows.slice(0, rowLimit - 1), ` ${theme.fg("dim", `… ${theme.bold("/help")} for more`)}`];
+	}
+
+	#flowKeyRowLimit(
+		targetContentRows: number | undefined,
+		changelogLineCount: number,
+		lspLineCount: number,
+		rightColumnWidth: number,
+	): number {
+		const preferredRows = this.#flowKeyRows(rightColumnWidth).length;
+		if (targetContentRows === undefined) return preferredRows;
+
+		const sessionBaselineRows = this.recentSessions.length === 0 ? 1 : Math.min(3, this.recentSessions.length);
+		const availableRows =
+			targetContentRows -
+			WELCOME_STATIC_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS -
+			changelogLineCount -
+			lspLineCount -
+			sessionBaselineRows;
+		return Math.max(1, Math.min(preferredRows, availableRows));
+	}
+
+	#whatsNewRowLimit(targetContentRows: number | undefined, lspLineCount: number, flowLineCount: number): number {
+		if (targetContentRows === undefined) return 5;
+
+		const sessionBaselineRows = this.recentSessions.length === 0 ? 1 : Math.min(3, this.recentSessions.length);
+		const dynamicRows = Math.max(
+			1,
+			targetContentRows - WELCOME_STATIC_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS - flowLineCount - lspLineCount,
+		);
+		const rowsAfterBaselineSessions = Math.max(1, dynamicRows - sessionBaselineRows);
+		const spareRows = Math.max(0, rowsAfterBaselineSessions - DEFAULT_WHATS_NEW_ROWS);
+		return Math.max(
+			1,
+			Math.min(MAX_WHATS_NEW_ROWS, rowsAfterBaselineSessions, DEFAULT_WHATS_NEW_ROWS + Math.floor(spareRows / 2)),
+		);
+	}
+
+	#sessionTrailLimit(
+		targetContentRows: number | undefined,
+		changelogLineCount: number,
+		lspLineCount: number,
+		flowLineCount: number,
+	): number {
+		if (this.recentSessions.length === 0) return 0;
+
+		const defaultLimit = Math.min(3, this.recentSessions.length);
+		if (targetContentRows === undefined) return defaultLimit;
+
+		const rowsWithDefaultTrail =
+			WELCOME_STATIC_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS +
+			changelogLineCount +
+			flowLineCount +
+			lspLineCount +
+			defaultLimit;
+		const extraRows = Math.max(0, targetContentRows - rowsWithDefaultTrail);
+		return Math.min(this.recentSessions.length, defaultLimit + extraRows);
+	}
+
+	#sessionTrailLines(rightColumnWidth: number, limit: number): string[] {
+		if (this.recentSessions.length === 0) {
+			return [` ${theme.fg("dim", "No saved trails")}`];
+		}
+
+		const bulletPrefix = ` ${theme.md.bullet} `;
+		const prefixWidth = visibleWidth(bulletPrefix);
+		const lines: string[] = [];
+		for (const session of this.recentSessions.slice(0, limit)) {
+			const timeSuffixRaw = ` (${session.timeAgo})`;
+			const timeWidth = visibleWidth(timeSuffixRaw);
+			const nameBudget = Math.max(1, rightColumnWidth - prefixWidth - timeWidth);
+			const nameVis = visibleWidth(session.name);
+			const name = nameVis > nameBudget ? truncateToWidth(session.name, nameBudget) : session.name;
+			lines.push(`${theme.fg("dim", bulletPrefix)}${theme.fg("muted", name)}${theme.fg("dim", timeSuffixRaw)}`);
+		}
+		return lines;
+	}
+
+	#whatsNewLines(width: number, maxRows: number): string[] {
+		const rowLimit = Math.max(1, Math.floor(maxRows));
+		const changelog = this.options.changelogMarkdown?.trim();
+		if (!changelog) {
+			return [` ${theme.fg("dim", "Ready for your next prompt")}`];
+		}
+
+		const version = this.#latestChangelogVersion(changelog);
+		if (this.options.collapseChangelog) {
+			return [
+				` ${theme.fg("muted", `Updated to v${version}`)}`,
+				` ${theme.fg("dim", `Use ${theme.bold("/changelog")} for details`)}`,
+			].slice(0, rowLimit);
+		}
+
+		const items = this.#changelogItems(changelog);
+		if (items.length === 0) {
+			return [
+				` ${theme.fg("muted", `Updated to v${version}`)}`,
+				` ${theme.fg("dim", `Use ${theme.bold("/changelog")} for details`)}`,
+			].slice(0, rowLimit);
+		}
+
+		const prefix = ` ${theme.md.bullet} `;
+		const textWidth = Math.max(1, width - visibleWidth(prefix));
+		const visibleItemCount = items.length > rowLimit ? Math.max(1, rowLimit - 1) : rowLimit;
+		const visibleItems = items.slice(0, visibleItemCount).map(item => {
+			const text = visibleWidth(item) > textWidth ? truncateToWidth(item, textWidth) : item;
+			return `${theme.fg("dim", prefix)}${theme.fg("muted", text)}`;
+		});
+		if (items.length > visibleItems.length && visibleItems.length < rowLimit) {
+			visibleItems.push(` ${theme.fg("dim", `… ${theme.bold("/changelog")} for full notes`)}`);
+		}
+		return visibleItems;
+	}
+
+	#latestChangelogVersion(markdown: string): string {
+		const versionMatch = markdown.match(/##\s+\[?(\d+\.\d+\.\d+)\]?/);
+		return versionMatch?.[1] ?? this.version;
+	}
+
+	#changelogItems(markdown: string): string[] {
+		const items: string[] = [];
+		let inFence = false;
+		for (const rawLine of markdown.split(/\r?\n/)) {
+			const line = rawLine.trim();
+			if (line.startsWith("```")) {
+				inFence = !inFence;
+				continue;
+			}
+			if (inFence || !line || /^#{1,6}\s+/.test(line) || /^-{3,}$/.test(line)) {
+				continue;
+			}
+			const withoutBullet = line
+				.replace(/^[-*]\s+/, "")
+				.replace(/^\d+\.\s+/, "")
+				.replace(/^>\s*/, "");
+			const cleaned = this.#stripMarkdown(withoutBullet);
+			if (cleaned) items.push(cleaned);
+		}
+		return items;
+	}
+
+	#stripMarkdown(text: string): string {
+		return text
+			.replace(/`([^`]+)`/g, "$1")
+			.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+			.replace(/\*\*([^*]+)\*\*/g, "$1")
+			.replace(/__([^_]+)__/g, "$1")
+			.replace(/\*([^*]+)\*/g, "$1")
+			.replace(/[_~]/g, "")
+			.trim();
 	}
 
 	#pill(icon: string, text: string, color: ThemeColor): string {
@@ -336,7 +611,6 @@ interface ShineConfig {
 	/** Center of the shine band along the diagonal, in [0, 1]. */
 	pos: number;
 }
-
 /**
  * Apply a multi-stop diagonal gradient (bottom-left → top-right) plus an
  * optional sliding shine band across multi-line art. `phase` (0..1) shifts the
@@ -406,8 +680,16 @@ function gradientLogo(lines: readonly string[], phase = 0, shine?: ShineConfig):
 
 /** Total length of the intro animation. */
 const INTRO_MS = 3000;
-/** Render cadence during the intro (~30fps). */
-const INTRO_TICK_MS = 33;
+/** Resolve the intro cadence without making tests mutate global process state. */
+export function resolveWelcomeIntroTickMs(
+	platform: NodeJS.Platform = process.platform,
+	tmux = process.env.TMUX,
+): number {
+	return platform === "win32" && tmux ? 100 : 33;
+}
+
+/** Render at 30fps directly, but cap native Windows multiplexers at 10fps to avoid ConPTY output backpressure. */
+const INTRO_TICK_MS = resolveWelcomeIntroTickMs();
 /** Number of full gradient rotations the sweep performs before settling. */
 const INTRO_SWEEPS = 2.5;
 /** Number of times the shine highlight crosses the diagonal across the intro. */

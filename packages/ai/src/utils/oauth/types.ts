@@ -9,12 +9,14 @@ export type OAuthCredentials = {
 };
 
 export type OAuthProvider =
-	| "alibaba-coding-plan"
+	| "alibaba-token-plan"
 	| "anthropic"
+	| "bizrouter"
 	| "cerebras"
 	| "cloudflare-ai-gateway"
 	| "cursor"
 	| "deepseek"
+	| "deepinfra"
 	| "fireworks"
 	| "firepass"
 	| "fugu"
@@ -39,6 +41,7 @@ export type OAuthProvider =
 	| "openai-codex-device"
 	| "opencode-go"
 	| "opencode-zen"
+	| "opengateway"
 	| "parallel"
 	| "perplexity"
 	| "qianfan"

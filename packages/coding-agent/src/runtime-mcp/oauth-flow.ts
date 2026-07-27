@@ -12,7 +12,6 @@ import type { OAuthController, OAuthCredentials } from "@gajae-code/ai/utils/oau
 const DEFAULT_PORT = 3000;
 const CALLBACK_PATH = "/callback";
 const CALLBACK_BIND_HOSTNAME = "127.0.0.1";
-
 function isLoopbackHostname(hostname: string): boolean {
 	return hostname === "localhost" || hostname === "127.0.0.1";
 }
@@ -365,45 +364,4 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 			// Ignore network/probe failures to avoid blocking flows that still work.
 		}
 	}
-}
-
-/**
- * Refresh an MCP OAuth token using the standard refresh_token grant.
- * Returns updated credentials; preserves the old refresh token if the server doesn't rotate it.
- */
-export async function refreshMCPOAuthToken(
-	tokenUrl: string,
-	refreshToken: string,
-	clientId?: string,
-	clientSecret?: string,
-): Promise<OAuthCredentials> {
-	const params = new URLSearchParams({
-		grant_type: "refresh_token",
-		refresh_token: refreshToken,
-	});
-	if (clientId) params.set("client_id", clientId);
-	if (clientSecret) params.set("client_secret", clientSecret);
-
-	const response = await fetch(tokenUrl, {
-		method: "POST",
-		headers: { "Content-Type": "application/x-www-form-urlencoded" },
-		body: params.toString(),
-	});
-
-	if (!response.ok) {
-		const text = await response.text();
-		throw new Error(`MCP OAuth refresh failed: ${response.status} ${text}`);
-	}
-
-	const data = (await response.json()) as {
-		access_token: string;
-		refresh_token?: string;
-		expires_in?: number;
-	};
-	const expiresIn = data.expires_in ?? 3600;
-	return {
-		access: data.access_token,
-		refresh: data.refresh_token ?? refreshToken,
-		expires: Date.now() + expiresIn * 1000,
-	};
 }

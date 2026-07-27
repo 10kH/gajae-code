@@ -1,5 +1,12 @@
 import { describe, expect, it } from "bun:test";
-import { agentLoop, agentLoopContinue, INTENT_FIELD } from "@gajae-code/agent-core/agent-loop";
+import {
+	agentLoop,
+	agentLoopContinue,
+	agentLoopDetailed,
+	INTENT_FIELD,
+	normalizeTools,
+} from "@gajae-code/agent-core/agent-loop";
+import { AppendOnlyContextManager } from "@gajae-code/agent-core/append-only-context";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -9,7 +16,7 @@ import type {
 	AgentToolContext,
 	ToolCallContext,
 } from "@gajae-code/agent-core/types";
-import type { AssistantMessage, Message, ToolResultMessage } from "@gajae-code/ai";
+import type { AssistantMessage, Context, Message, ToolResultMessage } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import * as z from "zod/v4";
@@ -378,6 +385,520 @@ describe("agentLoop with AgentMessage", () => {
 		}
 	});
 
+	it("recovers without tools after repeated malformed tool calls", async () => {
+		const toolSchema = z.object({ value: z.string() });
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute() {
+				throw new Error("invalid calls must not execute");
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: {} }] },
+				{ content: [{ type: "toolCall", id: "tool-2", name: "echo", arguments: {} }] },
+				{ content: ["answered without tools"] },
+			],
+		});
+		const streamedToolCounts: number[] = [];
+		const streamedMessages: Message[][] = [];
+		const inspectingStream = (...args: Parameters<typeof mock.stream>) => {
+			streamedToolCounts.push(args[1].tools?.length ?? 0);
+			streamedMessages.push(args[1].messages);
+			return mock.stream(...args);
+		};
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("echo something")],
+			context,
+			{ model: mock.model, convertToLlm: identityConverter },
+			undefined,
+			inspectingStream,
+		);
+
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		expect(events.filter(event => event.type === "tool_execution_end")).toHaveLength(2);
+		expect(streamedToolCounts).toEqual([1, 1, 0]);
+		expect(streamedMessages[2].at(-1)).toMatchObject({
+			role: "user",
+			content: expect.stringContaining("Do not call any tools"),
+			synthetic: true,
+		});
+		expect(events.at(-1)).toMatchObject({ type: "agent_end", stopReason: "completed" });
+		expect(
+			events.findLast(
+				event =>
+					event.type === "message_end" &&
+					event.message.role === "assistant" &&
+					event.message.content.some(block => block.type === "text" && block.text === "answered without tools"),
+			),
+		).toBeDefined();
+	});
+	it("keeps the recovery assistant in the next request's durable history", async () => {
+		const toolSchema = z.object({ value: z.string() });
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute() {
+				throw new Error("invalid calls must not execute");
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: {} }] },
+				{ content: [{ type: "toolCall", id: "tool-2", name: "echo", arguments: {} }] },
+				{ content: ["recovery assistant"] },
+				{ content: ["follow-up answer"] },
+			],
+		});
+		const requests: Context[] = [];
+		const inspectingStream = (...args: Parameters<typeof mock.stream>) => {
+			requests.push(args[1]);
+			return mock.stream(...args);
+		};
+		let suppliedFollowUp = false;
+		const stream = agentLoop(
+			[createUserMessage("echo something")],
+			context,
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				getFollowUpMessages: async () => {
+					if (suppliedFollowUp) return [];
+					suppliedFollowUp = true;
+					return [createUserMessage("follow-up")];
+				},
+			},
+			undefined,
+			inspectingStream,
+		);
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(requests[2]?.messages.at(-1)).toMatchObject({
+			role: "user",
+			content: expect.stringContaining("Do not call any tools"),
+			synthetic: true,
+		});
+		expect(
+			requests[3]?.messages.some(
+				message =>
+					message.role === "assistant" &&
+					message.content.some(block => block.type === "text" && block.text === "recovery assistant"),
+			),
+		).toBe(true);
+	});
+
+	it("forces static tool choice to none on the recovery request", async () => {
+		const toolSchema = z.object({ value: z.string() });
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute() {
+				throw new Error("invalid calls must not execute");
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: {} }] },
+				{ content: [{ type: "toolCall", id: "tool-2", name: "echo", arguments: {} }] },
+				{ content: ["recovered"] },
+			],
+		});
+		const requests: Context[] = [];
+		const toolChoices: unknown[] = [];
+		const inspectingStream = (...args: Parameters<typeof mock.stream>) => {
+			requests.push(args[1]);
+			toolChoices.push(args[2]?.toolChoice);
+			return mock.stream(...args);
+		};
+		const stream = agentLoop(
+			[createUserMessage("echo something")],
+			{ systemPrompt: [""], messages: [], tools: [tool] },
+			{ model: mock.model, convertToLlm: identityConverter, toolChoice: "required" },
+			undefined,
+			inspectingStream,
+		);
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(requests[2]?.tools).toEqual([]);
+		expect(requests[2]?.messages.at(-1)).toMatchObject({
+			content: expect.stringContaining("Do not call any tools"),
+		});
+		expect(toolChoices[2]).toBe("none");
+	});
+
+	it("does not consume dynamic tool choice during recovery", async () => {
+		const toolSchema = z.object({ value: z.string() });
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute() {
+				throw new Error("invalid calls must not execute");
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: {} }] },
+				{ content: [{ type: "toolCall", id: "tool-2", name: "echo", arguments: {} }] },
+				{ content: ["recovered"] },
+				{ content: ["follow-up answer"] },
+			],
+		});
+		const queuedChoices: NonNullable<AgentLoopConfig["toolChoice"]>[] = ["auto", "any", "required"];
+		const consumedChoices: NonNullable<AgentLoopConfig["toolChoice"]>[] = [];
+		const requests: Context[] = [];
+		const toolChoices: unknown[] = [];
+		const inspectingStream = (...args: Parameters<typeof mock.stream>) => {
+			requests.push(args[1]);
+			toolChoices.push(args[2]?.toolChoice);
+			return mock.stream(...args);
+		};
+		let suppliedFollowUp = false;
+		const stream = agentLoop(
+			[createUserMessage("echo something")],
+			{ systemPrompt: [""], messages: [], tools: [tool] },
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				getToolChoice: () => {
+					const choice = queuedChoices.shift();
+					if (choice) consumedChoices.push(choice);
+					return choice;
+				},
+				getFollowUpMessages: async () => {
+					if (suppliedFollowUp) return [];
+					suppliedFollowUp = true;
+					return [createUserMessage("follow-up")];
+				},
+			},
+			undefined,
+			inspectingStream,
+		);
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(requests[2]?.tools).toEqual([]);
+		expect(requests[2]?.messages.at(-1)).toMatchObject({
+			content: expect.stringContaining("Do not call any tools"),
+		});
+		expect(toolChoices).toEqual(["auto", "any", "none", "required"]);
+		expect(consumedChoices).toEqual(["auto", "any", "required"]);
+		expect(queuedChoices).toEqual([]);
+	});
+
+	it("preserves append-only prefix identity across recovery", async () => {
+		const toolSchema = z.object({ value: z.string() });
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute() {
+				throw new Error("invalid calls must not execute");
+			},
+		};
+		const appendOnlyContext = new AppendOnlyContextManager();
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: {} }] },
+				{ content: [{ type: "toolCall", id: "tool-2", name: "echo", arguments: {} }] },
+				{ content: ["recovered"] },
+			],
+		});
+		const requests: Context[] = [];
+		let beforeRecovery: { fingerprint: string; version: number } | undefined;
+		const inspectingStream = (...args: Parameters<typeof mock.stream>) => {
+			requests.push(args[1]);
+			if (requests.length === 2) {
+				beforeRecovery = {
+					fingerprint: appendOnlyContext.prefix.fingerprint,
+					version: appendOnlyContext.prefix.version,
+				};
+			}
+			return mock.stream(...args);
+		};
+		const stream = agentLoop(
+			[createUserMessage("echo something")],
+			{ systemPrompt: [""], messages: [], tools: [tool] },
+			{ model: mock.model, convertToLlm: identityConverter, appendOnlyContext },
+			undefined,
+			inspectingStream,
+		);
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(requests[2]?.tools).toEqual([]);
+		expect(requests[2]?.messages.at(-1)).toMatchObject({
+			content: expect.stringContaining("Do not call any tools"),
+		});
+		expect(beforeRecovery).toBeDefined();
+		if (!beforeRecovery) throw new Error("Expected prefix snapshot before recovery");
+		expect(appendOnlyContext.prefix.fingerprint).toBe(beforeRecovery.fingerprint);
+		expect(appendOnlyContext.prefix.version).toBe(beforeRecovery.version);
+	});
+
+	it("does not persist the recovery synthetic in the append-only log", async () => {
+		const toolSchema = z.object({ value: z.string() });
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute() {
+				throw new Error("invalid calls must not execute");
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const appendOnlyContext = new AppendOnlyContextManager();
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: {} }] },
+				{ content: [{ type: "toolCall", id: "tool-2", name: "echo", arguments: {} }] },
+				{ content: ["recovered"] },
+				{ content: ["follow-up answer"] },
+			],
+		});
+		const requests: Context[] = [];
+		const inspectingStream = (...args: Parameters<typeof mock.stream>) => {
+			requests.push(args[1]);
+			return mock.stream(...args);
+		};
+		let suppliedFollowUp = false;
+		const stream = agentLoop(
+			[createUserMessage("echo something")],
+			context,
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				appendOnlyContext,
+				getFollowUpMessages: async () => {
+					if (suppliedFollowUp) return [];
+					suppliedFollowUp = true;
+					return [createUserMessage("follow-up")];
+				},
+			},
+			undefined,
+			inspectingStream,
+		);
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(requests[2]?.tools).toEqual([]);
+		expect(requests[2]?.messages.at(-1)).toMatchObject({
+			content: expect.stringContaining("Do not call any tools"),
+		});
+		expect(
+			appendOnlyContext.log
+				.entries()
+				.some(message => typeof message.content === "string" && message.content.includes("Do not call any tools")),
+		).toBe(false);
+		expect(appendOnlyContext.log.entries()).toEqual(requests[3]?.messages);
+	});
+
+	// The converted-context cache is keyed by provider-visible content hashes and
+	// does not carry its suffix-reuse state across separate `agentLoopContinue`
+	// invocations, so a fresh run legitimately converts its whole history. The
+	// recovery-specific invariant is therefore NOT "the next turn converts exactly
+	// the durable suffix" — it is that a recovery turn leaves the durable
+	// conversion input IDENTICAL to a run that never recovered, i.e. the
+	// request-only synthetic never inflates later durable conversions.
+	it("does not leak the recovery synthetic into later durable conversions", async () => {
+		const tool: AgentTool = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: {
+				type: "object",
+				properties: { value: { type: "string" } },
+				required: ["value"],
+			},
+			async execute() {
+				throw new Error("invalid calls must not execute");
+			},
+		};
+		const context: AgentContext = {
+			systemPrompt: [""],
+			messages: [createUserMessage("echo something")],
+			tools: [tool],
+		};
+		const appendOnlyContext = new AppendOnlyContextManager();
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: {} }] },
+				{ content: [{ type: "toolCall", id: "tool-2", name: "echo", arguments: {} }] },
+				{ content: ["recovered"] },
+				{ content: ["follow-up answer"] },
+			],
+		});
+		const requests: Context[] = [];
+		const conversionSizes: number[] = [];
+		const inspectingStream = (...args: Parameters<typeof mock.stream>) => {
+			requests.push(args[1]);
+			return mock.stream(...args);
+		};
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			appendOnlyContext,
+			convertToLlm: messages => {
+				conversionSizes.push(messages.length);
+				return identityConverter(messages);
+			},
+		};
+		const recovery = agentLoopContinue(context, config, undefined, inspectingStream);
+		for await (const _event of recovery) {
+			// drain
+		}
+		await recovery.result();
+
+		context.messages.push(createUserMessage("follow-up one"), createUserMessage("follow-up two"));
+		const ordinary = agentLoopContinue(context, config, undefined, inspectingStream);
+		for await (const _event of ordinary) {
+			// drain
+		}
+		await ordinary.result();
+
+		const recoveryRequest = requests[2];
+		const nextOrdinaryRequest = requests[3];
+		expect(recoveryRequest?.tools).toEqual([]);
+		expect(recoveryRequest?.messages.at(-1)).toMatchObject({
+			content: expect.stringContaining("Do not call any tools"),
+		});
+
+		// The recovery turn itself converts ONLY the synthetic in append-only mode.
+		const recoveryConversionSize = conversionSizes[3];
+		expect(recoveryConversionSize).toBe(1);
+
+		// The next ordinary turn converts exactly the durable history and nothing
+		// more: the synthetic is absent, so the conversion input equals the real
+		// durable message count rather than durable + 1.
+		expect(conversionSizes.at(-1)).toBe(context.messages.length - 1);
+		expect(nextOrdinaryRequest?.messages).not.toContainEqual(
+			expect.objectContaining({ content: expect.stringContaining("Do not call any tools") }),
+		);
+	});
+
+	it("skips recovery-turn tool calls while preserving paired result accounting", async () => {
+		const toolSchema = z.object({ value: z.string() });
+		let executions = 0;
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute() {
+				executions += 1;
+				return { content: [{ type: "text", text: "executed" }], details: { value: "recovery" } };
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: {} }] },
+				{ content: [{ type: "toolCall", id: "tool-2", name: "echo", arguments: {} }] },
+				{ content: [{ type: "toolCall", id: "tool-3", name: "echo", arguments: { value: "recovery" } }] },
+				{ content: ["recovery acknowledged"] },
+			],
+		});
+		const requests: Context[] = [];
+		const inspectingStream = (...args: Parameters<typeof mock.stream>) => {
+			requests.push(args[1]);
+			return mock.stream(...args);
+		};
+		const detailed = agentLoopDetailed(
+			[createUserMessage("echo something")],
+			{ systemPrompt: [""], messages: [], tools: [tool] },
+			{ model: mock.model, convertToLlm: identityConverter },
+			undefined,
+			inspectingStream,
+		);
+		const events: AgentEvent[] = [];
+		for await (const event of detailed.stream) {
+			events.push(event);
+		}
+		const { telemetry, coverage } = await detailed.detailed();
+
+		expect(requests[2]?.tools).toEqual([]);
+		expect(requests[2]?.messages.at(-1)).toMatchObject({
+			content: expect.stringContaining("Do not call any tools"),
+		});
+		expect(executions).toBe(0);
+		const recoveryResult = events.find(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
+				event.type === "message_end" &&
+				event.message.role === "toolResult" &&
+				event.message.toolCallId === "tool-3",
+		);
+		if (recoveryResult?.message.role !== "toolResult") {
+			throw new Error("Expected paired tool result for recovery call");
+		}
+		expect(recoveryResult.message.isError).toBe(true);
+		expect(telemetry?.tools.skipped).toBe(1);
+		expect(telemetry?.tools.byName.echo?.skipped).toBe(1);
+		expect(coverage?.toolsInvoked).toEqual(["echo"]);
+	});
+
+	it("keeps tools available when repeated calls fail during execution", async () => {
+		const toolSchema = z.object({ value: z.string() });
+		let executions = 0;
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute() {
+				executions += 1;
+				throw new Error("transient execution failure");
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "same" } }] },
+				{ content: [{ type: "toolCall", id: "tool-2", name: "echo", arguments: { value: "same" } }] },
+				{ content: ["recovered normally"] },
+			],
+		});
+		const streamedToolCounts: number[] = [];
+		const inspectingStream = (...args: Parameters<typeof mock.stream>) => {
+			streamedToolCounts.push(args[1].tools?.length ?? 0);
+			return mock.stream(...args);
+		};
+		const stream = agentLoop(
+			[createUserMessage("echo something")],
+			context,
+			{ model: mock.model, convertToLlm: identityConverter },
+			undefined,
+			inspectingStream,
+		);
+
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(executions).toBe(2);
+		expect(streamedToolCounts).toEqual([1, 1, 1]);
+	});
+
 	it("injects and strips intent when intent tracing is enabled", async () => {
 		const toolSchema = z.object({ value: z.string() });
 		const executedParams: Record<string, unknown>[] = [];
@@ -435,11 +956,131 @@ describe("agentLoop with AgentMessage", () => {
 			value: { type: "string" },
 			[INTENT_FIELD]: { type: "string" },
 		});
-		expect(firstRequestToolSchema?.required).toEqual(expect.arrayContaining([INTENT_FIELD]));
+		expect(firstRequestToolSchema?.required ?? []).not.toContain(INTENT_FIELD);
 		expect(executedParams).toEqual([{ value: "hello" }]);
 		expect(tracedToolCall?.type).toBe("toolCall");
 		if (tracedToolCall?.type === "toolCall") {
 			expect(tracedToolCall.intent).toBe("Read one file");
+		}
+	});
+
+	it("runs intent-traced tools when the model omits intent", async () => {
+		const toolSchema = z.object({ value: z.string() });
+		const executedParams: Record<string, unknown>[] = [];
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executedParams.push(params as Record<string, unknown>);
+				return { content: [{ type: "text", text: `echoed: ${params.value}` }] };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "hello" } }] },
+				{ content: ["done"] },
+			],
+		});
+
+		const stream = agentLoop(
+			[createUserMessage("run")],
+			context,
+			{ model: mock.model, convertToLlm: identityConverter, intentTracing: true },
+			undefined,
+			mock.stream,
+		);
+		for await (const _ of stream) {
+			// drain
+		}
+
+		expect(executedParams).toEqual([{ value: "hello" }]);
+	});
+
+	it("normalizes intent schemas according to per-tool mode and PI_NO_INTENT", () => {
+		const previousNoIntent = Bun.env.PI_NO_INTENT;
+		try {
+			delete Bun.env.PI_NO_INTENT;
+			const optionalParameters = {
+				type: "object",
+				properties: { value: { type: "string" } },
+			};
+			const requiredPathParameters = {
+				type: "object",
+				properties: { path: { type: "string" } },
+				required: ["path"],
+			};
+			const defaultTool: AgentTool = {
+				name: "default",
+				label: "Default",
+				description: "Default tool",
+				parameters: optionalParameters,
+				execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+			};
+			const requiredPathTool: AgentTool = {
+				...defaultTool,
+				name: "required-path",
+				parameters: requiredPathParameters,
+			};
+			const requireTool: AgentTool = { ...defaultTool, name: "require", intent: "require" };
+			const omitTool: AgentTool = { ...defaultTool, name: "omit", intent: "omit" };
+			const functionIntentTool: AgentTool = { ...defaultTool, name: "function-intent", intent: () => "Tool intent" };
+
+			const normalized =
+				normalizeTools([defaultTool, requiredPathTool, requireTool, omitTool, functionIntentTool], true) ?? [];
+			const defaultParams = normalized[0]?.parameters as {
+				properties?: Record<string, unknown>;
+				required?: string[];
+			};
+			const requiredPathParams = normalized[1]?.parameters as {
+				properties?: Record<string, unknown>;
+				required?: string[];
+			};
+			const requireParams = normalized[2]?.parameters as {
+				properties?: Record<string, unknown>;
+				required?: string[];
+			};
+			const omitParams = normalized[3]?.parameters as { properties?: Record<string, unknown>; required?: string[] };
+			const functionIntentParams = normalized[4]?.parameters as {
+				properties?: Record<string, unknown>;
+				required?: string[];
+			};
+
+			expect(defaultParams.properties?.[INTENT_FIELD]).toEqual({ type: "string" });
+			expect(Object.keys(defaultParams.properties ?? {})[0]).toBe(INTENT_FIELD);
+			expect(defaultParams.required ?? []).not.toContain(INTENT_FIELD);
+			expect(requiredPathParams.properties?.[INTENT_FIELD]).toEqual({ type: "string" });
+			expect(requiredPathParams.required ?? []).toEqual(["path"]);
+			expect(requireParams.properties?.[INTENT_FIELD]).toEqual({ type: "string" });
+			expect(Object.keys(requireParams.properties ?? {})[0]).toBe(INTENT_FIELD);
+			expect(requireParams.required ?? []).toContain(INTENT_FIELD);
+			expect(omitParams.properties?.[INTENT_FIELD]).toBeUndefined();
+			expect(omitParams.required ?? []).not.toContain(INTENT_FIELD);
+			expect(functionIntentParams.properties?.[INTENT_FIELD]).toBeUndefined();
+			expect(functionIntentParams.required ?? []).not.toContain(INTENT_FIELD);
+
+			Bun.env.PI_NO_INTENT = "1";
+			const disabled = normalizeTools([defaultTool, requireTool], true) ?? [];
+			const disabledDefault = disabled[0]?.parameters as {
+				properties?: Record<string, unknown>;
+				required?: string[];
+			};
+			const disabledRequired = disabled[1]?.parameters as {
+				properties?: Record<string, unknown>;
+				required?: string[];
+			};
+			expect(disabledDefault.properties?.[INTENT_FIELD]).toBeUndefined();
+			expect(disabledDefault.required ?? []).not.toContain(INTENT_FIELD);
+			expect(disabledRequired.properties?.[INTENT_FIELD]).toBeUndefined();
+			expect(disabledRequired.required ?? []).not.toContain(INTENT_FIELD);
+		} finally {
+			if (previousNoIntent === undefined) {
+				delete Bun.env.PI_NO_INTENT;
+			} else {
+				Bun.env.PI_NO_INTENT = previousNoIntent;
+			}
 		}
 	});
 

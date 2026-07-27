@@ -13,7 +13,7 @@ export type RateLimitReason =
 const QUOTA_EXHAUSTED_BACKOFF_MS = 30 * 60 * 1000; // 30 min
 const RATE_LIMIT_EXCEEDED_BACKOFF_MS = 30 * 1000; // 30s
 const MODEL_CAPACITY_BASE_MS = 45 * 1000; // 45s base
-const MODEL_CAPACITY_JITTER_MS = 30 * 1000; // ±15s
+const MODEL_CAPACITY_JITTER_MS = 30 * 1000; // uniform +0–30s above base → 45–75s total
 const SERVER_ERROR_BACKOFF_MS = 20 * 1000; // 20s
 
 /**
@@ -34,6 +34,14 @@ export function parseRateLimitReason(errorMessage: string): RateLimitReason {
 		lower.includes("resource exhausted")
 	) {
 		return "MODEL_CAPACITY_EXHAUSTED";
+	}
+
+	if (
+		lower.includes("out_of_credits") ||
+		lower.includes("request would exceed your account's rate limit") ||
+		lower.includes("request would exceed your accounts rate limit")
+	) {
+		return "QUOTA_EXHAUSTED";
 	}
 
 	if (
@@ -85,9 +93,10 @@ export function calculateRateLimitBackoffMs(reason: RateLimitReason): number {
 }
 
 /** Detect usage/quota limit errors in error messages (persistent, requires credential switch). */
+// ZAI reports durable token exhaustion as "[1310][Weekly/Monthly Limit Exhausted...]".
+// Keep this explicit so generic "rate limit exhausted, retry..." throttles remain retryable.
 const USAGE_LIMIT_PATTERN =
-	/usage.?limit|usage_limit_reached|usage_not_included|limit_reached|model.?limit|model_limit_reached|message.?limit|message_limit_reached|limit for this model|quota.?exceeded|resource has been exhausted[^\n]*(?:quota|limit)/i;
-
+	/usage.?limit|usage_limit_reached|usage_not_included|limit_reached|model.?limit|model_limit_reached|message.?limit|message_limit_reached|limit for this model|weekly\/monthly\s+limit\s+exhausted|quota.?exceeded|out_of_credits|request would exceed your account.?s rate limit|resource has been exhausted[^\n]*(?:quota|limit)/i;
 export function isUsageLimitError(errorMessage: string): boolean {
 	return USAGE_LIMIT_PATTERN.test(errorMessage);
 }

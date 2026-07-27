@@ -183,8 +183,7 @@ function timeoutSecondsFromMs(timeoutMs: number): number {
 }
 
 async function resolveBackend(session: ToolSession, language: EvalLanguage): Promise<ResolvedBackend> {
-	const allowPy = (session.settings.get("eval.py") as boolean | undefined) ?? true;
-	const allowJs = (session.settings.get("eval.js") as boolean | undefined) ?? true;
+	const { python: allowPy, js: allowJs } = resolveEvalBackends(session);
 
 	if (language === "python") {
 		if (!allowPy) throw new ToolError("Python backend is disabled (eval.py = false).");
@@ -754,8 +753,8 @@ function formatStatusEventExpanded(event: EvalStatusEvent, theme: Theme): string
 		case "git_log":
 			if (data.entries) {
 				addItems(data.entries as unknown[], e => {
-					const entry = e as { sha: string; subject: string };
-					return `${entry.sha} ${truncateToWidth(entry.subject, 50)}`;
+					const entry = e as { sha?: string; subject?: string };
+					return `${String(entry.sha ?? "")} ${truncateToWidth(String(entry.subject ?? ""), 50)}`;
 				});
 			}
 			break;

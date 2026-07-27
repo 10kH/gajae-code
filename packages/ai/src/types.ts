@@ -28,6 +28,7 @@ import type { OpenAICodexResponsesOptions } from "./providers/openai-codex-respo
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
 import type { OpenAIResponsesOptions } from "./providers/openai-responses";
 import type { AssistantMessageEventStream } from "./utils/event-stream";
+import type { FallbackAttemptToken, TransportFailureFacts } from "./utils/fallback-transport";
 
 export type { AssistantMessageEventStream } from "./utils/event-stream";
 
@@ -77,6 +78,23 @@ export type ThinkingControlMode =
 	| "anthropic-adaptive"
 	| "anthropic-budget-effort";
 
+/** Canonical runtime vocabulary for provider thinking transports. */
+export const THINKING_CONTROL_MODES = [
+	"effort",
+	"budget",
+	"google-level",
+	"anthropic-adaptive",
+	"anthropic-budget-effort",
+] as const satisfies readonly ThinkingControlMode[];
+
+type _CheckThinkingControlModes = [
+	Exclude<ThinkingControlMode, (typeof THINKING_CONTROL_MODES)[number]>,
+	Exclude<(typeof THINKING_CONTROL_MODES)[number], ThinkingControlMode>,
+] extends [never, never]
+	? true
+	: false;
+true satisfies _CheckThinkingControlModes;
+
 /** Per-model thinking capabilities used to clamp and map user-facing effort levels. */
 export interface ThinkingConfig {
 	/** Least intensive supported user-facing effort level. */
@@ -96,7 +114,7 @@ export interface ThinkingConfig {
 }
 
 export type KnownProvider =
-	| "alibaba-coding-plan"
+	| "alibaba-token-plan"
 	| "amazon-bedrock"
 	| "azure-openai"
 	| "anthropic"
@@ -116,6 +134,7 @@ export type KnownProvider =
 	| "gitlab-duo"
 	| "cursor"
 	| "deepseek"
+	| "deepinfra"
 	| "xai"
 	| "groq"
 	| "cerebras"
@@ -128,6 +147,8 @@ export type KnownProvider =
 	| "minimax"
 	| "opencode-go"
 	| "opencode-zen"
+	| "opengateway"
+	| "bizrouter"
 	| "synthetic"
 	| "cloudflare-ai-gateway"
 	| "huggingface"
@@ -186,7 +207,7 @@ export type CacheRetention = "none" | "short" | "long";
  *
  * The unscoped values (`"auto"`, `"default"`, `"flex"`, `"scale"`,
  * `"priority"`) are passed through to providers that understand them
- * (OpenAI's `service_tier` field directly; Anthropic translates
+ * (OpenAI and DeepInfra's `service_tier` field directly; Anthropic translates
  * `"priority"` into `speed: "fast"` on supported Opus models).
  *
  * The scoped values target a specific provider family and behave as the
@@ -223,17 +244,17 @@ export function resolveServiceTier(
 }
 
 /**
- * True when the (possibly scoped) tier should be sent as OpenAI's
- * `service_tier` request field for the given provider. Non-OpenAI
- * providers, unsupported tiers (`"auto"`, `"default"`), and scope
- * mismatches all return false.
+ * True when the (possibly scoped) tier should be sent as an OpenAI-compatible
+ * `service_tier` request field for providers that support it. Unsupported tiers
+ * (`"auto"`, `"default"`) and scope mismatches all return false.
  */
 export function shouldSendServiceTier(
 	serviceTier: ServiceTier | null | undefined,
 	provider: Provider | undefined,
 ): boolean {
-	if (provider !== "openai" && provider !== "openai-codex") return false;
 	const resolved = resolveServiceTier(serviceTier, provider);
+	if (provider === "deepinfra") return resolved === "priority";
+	if (provider !== "openai" && provider !== "openai-codex") return false;
 	return resolved === "flex" || resolved === "scale" || resolved === "priority";
 }
 
@@ -252,7 +273,9 @@ export function getPriorityPremiumRequests(
 	if (resolveServiceTier(serviceTier, provider) !== "priority") return 0;
 	// Only providers that realize `priority` on the wire bill the user.
 	// Everywhere else, the field is silently dropped and nothing is charged.
-	return provider === "openai" || provider === "openai-codex" || provider === "anthropic" ? 1 : 0;
+	return provider === "openai" || provider === "openai-codex" || provider === "anthropic" || provider === "deepinfra"
+		? 1
+		: 0;
 }
 
 export interface ProviderSessionState {
@@ -303,6 +326,10 @@ export interface StreamOptions {
 	maxTokens?: number;
 	signal?: AbortSignal;
 	apiKey?: string;
+	/** Disables all transport-level replay; the fallback controller owns retries. */
+	fallbackManaged?: boolean;
+	/** Opaque token returned by beginAttempt for a managed transport invocation. */
+	fallbackAttempt?: FallbackAttemptToken;
 	/**
 	 * Called when a provider returns 401 before any replay-unsafe assistant
 	 * event has been emitted. Returning a different key retries the provider
@@ -463,6 +490,9 @@ export interface ThinkingContent {
 	thinking: string;
 	thinkingSignature?: string; // e.g., for OpenAI responses, the reasoning item ID
 	itemId?: string; // item.id from output_item.added, used to match output_item.done
+	readonly provenance?: "summary" | "raw" | "mixed";
+	readonly summaryText?: string;
+	readonly rawText?: string;
 }
 
 export interface RedactedThinkingContent {
@@ -549,6 +579,7 @@ export interface Usage {
 }
 
 export type StopReason = "stop" | "length" | "toolUse" | "error" | "aborted";
+export type AssistantErrorKind = "provider_safety_stop";
 
 export interface OpenAIResponsesHistoryPayload {
 	type: "openaiResponsesHistory";
@@ -591,8 +622,11 @@ export interface AssistantMessage {
 	usage: Usage;
 	stopReason: StopReason;
 	errorMessage?: string;
+	errorKind?: AssistantErrorKind;
 	/** HTTP status surfaced by the provider when the request failed. Populated by every provider's catch block alongside `errorMessage` so consumers (auth retry, telemetry, UI) can branch without regex-scraping the message. */
 	errorStatus?: number;
+	/** Typed upstream failure facts retained for retry classification without parsing errorMessage. */
+	transportFailure?: TransportFailureFacts;
 	/**
 	 * Stable identifiers for request features the provider silently dropped
 	 * during this turn (e.g. `"priority"`). Set when a server-side rejection
@@ -677,10 +711,22 @@ export type TSchema = ZodType | TJsonSchema;
 /** Resolve parameter types for tool execution / handlers. */
 export type Static<S> = S extends ZodType ? z.infer<S> : S extends { static: infer T } ? T : unknown;
 
+export type RawArgumentRejectionCode =
+	| "ask-intent-review-requires-positive-round"
+	| "ask-intent-contract-requires-non-empty-authority"
+	| "ask-deep-interview-metadata-requires-deep-interview-gate";
+
+export type RawArgumentValidationResult =
+	| { outcome: "passthrough" }
+	| { outcome: "accept"; arguments: ToolCall["arguments"] }
+	| { outcome: "reject"; code?: RawArgumentRejectionCode };
+
 export interface Tool<TParameters extends TSchema = TSchema> {
 	name: string;
 	description: string;
 	parameters: TParameters;
+	/** Optional pre-coercion adapter for narrowly scoped raw argument recovery or rejection. */
+	rawArgumentValidation?: (arguments_: ToolCall["arguments"]) => RawArgumentValidationResult;
 	/** If true, tool is strictly typed and validated against the parameters schema before execution */
 	strict?: boolean;
 	/**
@@ -700,6 +746,13 @@ export interface Tool<TParameters extends TSchema = TSchema> {
 	 * calls route correctly. Absent for regular JSON function tools.
 	 */
 	customWireName?: string;
+	/**
+	 * Optional safe projection for tool arguments or results. Extensions use this
+	 * only for explicitly opt-in, display-safe summaries.
+	 */
+	safeSummary?: (kind: "args" | "result", value: unknown) => string | undefined;
+	/** Allowlisted argument/result field names for a safe fallback summary. */
+	safeSummaryFields?: { args?: string[]; result?: string[] };
 }
 
 export interface Context {
@@ -716,6 +769,9 @@ export type AssistantMessageEvent =
 	| { type: "thinking_start"; contentIndex: number; partial: AssistantMessage }
 	| { type: "thinking_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 	| { type: "thinking_end"; contentIndex: number; content: string; partial: AssistantMessage }
+	| { type: "reasoning_summary_start"; contentIndex: number; partial: AssistantMessage }
+	| { type: "reasoning_summary_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
+	| { type: "reasoning_summary_end"; contentIndex: number; content: string; partial: AssistantMessage }
 	| { type: "toolcall_start"; contentIndex: number; partial: AssistantMessage }
 	| { type: "toolcall_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 	| { type: "toolcall_end"; contentIndex: number; toolCall: ToolCall; partial: AssistantMessage }
@@ -860,6 +916,12 @@ export interface AnthropicCompat extends ToolChoiceCompat {
 	supportsForcedToolChoice?: boolean;
 	/** Whether long prompt-cache retention (`ttl: "1h"`) is supported. Default: true for canonical Anthropic API. */
 	supportsLongCacheRetention?: boolean;
+	/**
+	 * Prompt-cache transport accepted by this Anthropic-compatible endpoint.
+	 * Canonical Anthropic defaults to `"automatic"`; noncanonical endpoints default
+	 * to `"none"` and must explicitly opt into generated `"explicit"` markers.
+	 */
+	promptCacheMode?: "none" | "explicit" | "automatic";
 }
 
 /**
@@ -934,10 +996,9 @@ export interface Model<TApi extends Api = any> {
 	 * (or compatible) host; `headers.Authorization` (or `apiKey` resolved by
 	 * the registry) carries the gateway bearer.
 	 *
-	 * Used by containerized gjc installs (e.g. robogjc slots) to route every
-	 * LLM call through a sidecar gateway that holds the real provider
-	 * credentials. The model's other metadata (pricing, context window,
-	 * thinking config, …) still resolves locally; only the streaming
+	 * Used by containerized GJC installs to route every LLM call through a
+	 * sidecar gateway that holds the real provider credentials. The model's other
+	 * metadata (pricing, context window, thinking config, …) still resolves locally; only the streaming
 	 * dispatch is redirected.
 	 */
 	transport?: "pi-native";

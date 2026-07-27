@@ -11,6 +11,7 @@ import {
 	type WorkflowStateMutationOwner,
 	type WorkflowStateReceipt,
 } from "../skill-state/workflow-state-contract";
+import { validateDeepInterviewV1Envelope } from "./deep-interview-state";
 import {
 	activeEntryPath as layoutActiveEntryPath,
 	activeSnapshotPath as layoutActiveSnapshotPath,
@@ -50,7 +51,7 @@ export interface StateWriterReceiptContext {
 	skill: CanonicalGjcWorkflowSkill;
 	owner: WorkflowStateMutationOwner;
 	command: string;
-	sessionId?: string;
+	sessionId: string;
 	mutationId?: string;
 	nowIso?: string;
 	verb?: string;
@@ -77,6 +78,47 @@ export interface WorkflowEnvelopeIntegrityMismatch {
 	expected: string;
 	actual: string;
 }
+export type WorkflowReceiptVerification =
+	| "legacy"
+	| "native-valid"
+	| "receipt-malformed"
+	| "receipt-missing"
+	| "checksum-mismatch";
+
+export interface GuardedWorkflowEnvelopeTransformOptions extends StateWriterOptions {
+	expectedRevision: number;
+	/** Additional native schema validation applied to both current and candidate envelopes. */
+	validate?: (value: Record<string, unknown>, legacy: boolean) => void;
+	transform: (
+		current: Record<string, unknown>,
+		context: { revision: number; legacy: boolean },
+	) =>
+		| { kind: "noop" }
+		| { kind: "write"; value: Record<string, unknown> }
+		| Promise<{ kind: "noop" } | { kind: "write"; value: Record<string, unknown> }>;
+}
+
+export interface GuardedWorkflowEnvelopeWarning {
+	code: "DI_POST_COMMIT_AUDIT_FAILED";
+	message: string;
+}
+
+export type GuardedWorkflowEnvelopeTransformResult =
+	| { path: string; written: false; reason: "noop"; revision: number; warnings: [] }
+	| {
+			path: string;
+			written: true;
+			revision: number;
+			stamped: Record<string, unknown>;
+			warnings: GuardedWorkflowEnvelopeWarning[];
+	  };
+
+export class GuardedWorkflowEnvelopeError extends Error {
+	constructor(public readonly code: string) {
+		super(code);
+		this.name = "GuardedWorkflowEnvelopeError";
+	}
+}
 
 export interface WorkflowTransactionJournal {
 	version: 1;
@@ -96,10 +138,11 @@ export interface GuardedStateWriterOptions extends StateWriterOptions {
 	policy: StateWritePolicy;
 	expectedRevision?: number;
 	sourceRevision?: number;
+	lockHeld?: boolean;
 }
 
 export type GuardedWriteResult =
-	| { path: string; written: true; revision: number }
+	| { path: string; written: true; revision: number; stamped: unknown }
 	| { path: string; written: false; reason: "stale-skip"; revision: number };
 
 export interface StateWriterOptions {
@@ -107,6 +150,7 @@ export interface StateWriterOptions {
 	receipt?: StateWriterReceiptContext;
 	audit?: StateWriterAuditContext;
 	sourceRevision?: number;
+	orderingRevision?: number;
 	/**
 	 * Cross-process lock tuning for read-modify-write paths that route through
 	 * `withWorkflowStateLock` / `updateJsonAtomic`. Omit for the hardened
@@ -254,6 +298,49 @@ export function workflowEnvelopeContentSha256(value: unknown): string {
 		.update(JSON.stringify(canonicalizeJson(withoutReceiptChecksum(value))))
 		.digest("hex");
 }
+export function isNativeDeepInterviewV1(value: Record<string, unknown>): boolean {
+	if (value.skill !== "deep-interview") return false;
+	return value.schema_version === 1 || (isPlainObject(value.state) && value.state.schema_version === 1);
+}
+
+export function verifyWorkflowEnvelopeReceiptValue(value: unknown, filePath: string): WorkflowReceiptVerification {
+	if (!isPlainObject(value)) return "receipt-malformed";
+	const native = isNativeDeepInterviewV1(value);
+	if (!Object.hasOwn(value, "receipt")) return native ? "receipt-missing" : "legacy";
+	if (!isPlainObject(value.receipt) || !isPlainObject(value.receipt.content_sha256)) return "receipt-malformed";
+
+	const receipt = value.receipt as Record<string, unknown>;
+	const checksum = receipt.content_sha256 as Record<string, unknown>;
+	if (
+		typeof value.skill !== "string" ||
+		receipt.version !== 1 ||
+		receipt.skill !== value.skill ||
+		(receipt.skill !== "deep-interview" &&
+			receipt.skill !== "ralplan" &&
+			receipt.skill !== "ultragoal" &&
+			receipt.skill !== "team") ||
+		(receipt.owner !== "gjc-state-cli" && receipt.owner !== "gjc-runtime" && receipt.owner !== "gjc-hook") ||
+		typeof receipt.command !== "string" ||
+		typeof receipt.state_path !== "string" ||
+		typeof receipt.storage_path !== "string" ||
+		typeof receipt.mutated_at !== "string" ||
+		!Number.isFinite(Date.parse(receipt.mutated_at)) ||
+		typeof receipt.fresh_until !== "string" ||
+		!Number.isFinite(Date.parse(receipt.fresh_until)) ||
+		(receipt.status !== "fresh" && receipt.status !== "stale") ||
+		typeof receipt.mutation_id !== "string" ||
+		checksum.algorithm !== "sha256" ||
+		typeof checksum.value !== "string" ||
+		!/^[0-9a-f]{64}$/.test(checksum.value) ||
+		typeof checksum.covered_path !== "string" ||
+		path.resolve(checksum.covered_path) !== path.resolve(filePath) ||
+		typeof checksum.computed_at !== "string" ||
+		!Number.isFinite(Date.parse(checksum.computed_at))
+	) {
+		return "receipt-malformed";
+	}
+	return workflowEnvelopeContentSha256(value) === checksum.value ? "native-valid" : "checksum-mismatch";
+}
 
 export function stampWorkflowEnvelopeChecksum<T>(value: T, filePath: string, computedAt = new Date().toISOString()): T {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return value;
@@ -267,7 +354,7 @@ export function stampWorkflowEnvelopeChecksum<T>(value: T, filePath: string, com
 		content_sha256: {
 			algorithm: "sha256",
 			value: workflowEnvelopeContentSha256(envelope),
-			covered_path: filePath,
+			covered_path: path.resolve(filePath),
 			computed_at: computedAt,
 		},
 	};
@@ -302,6 +389,18 @@ function requireSessionId(sessionScope: string | ActiveSessionScope | undefined,
 
 function activeStateDir(cwd: string, sessionScope?: string | ActiveSessionScope): string {
 	return layoutActiveStateDir(cwd, requireSessionId(sessionScope, "activeStateDir"));
+}
+
+type ActiveStateCacheInvalidator = (cwd?: string, sessionId?: string) => void;
+var activeStateCacheInvalidator: ActiveStateCacheInvalidator | undefined;
+
+export function setActiveStateCacheInvalidator(invalidator: ActiveStateCacheInvalidator): void {
+	activeStateCacheInvalidator = invalidator;
+}
+
+function invalidateActiveStateCacheForScope(cwd: string, sessionScope?: string | ActiveSessionScope): void {
+	const sessionId = typeof sessionScope === "string" ? sessionScope : sessionScope?.sessionId;
+	activeStateCacheInvalidator?.(cwd, sessionId);
 }
 
 function activeSnapshotPath(cwd: string, sessionScope?: string | ActiveSessionScope): string {
@@ -408,6 +507,11 @@ function persistedSourceRevision(value: unknown): number {
 	const revision = value.source_state_revision;
 	return typeof revision === "number" && Number.isFinite(revision) ? revision : persistedStateRevision(value);
 }
+function persistedCommittedModeRevision(value: unknown): number {
+	if (!isPlainObject(value)) return 0;
+	const revision = value.committed_mode_state_revision;
+	return typeof revision === "number" && Number.isFinite(revision) ? revision : 0;
+}
 
 function withoutCandidateRevision(value: unknown): unknown {
 	if (!isPlainObject(value)) return value;
@@ -511,12 +615,17 @@ async function writeGuardedResolvedJsonAtomic(
 				const next = stampStateRevision(withWorkflowReceipt(value, buildReceipt(options)), currentRevision + 1);
 				await atomicWrite(filePath, jsonText(next));
 				await maybeAudit(filePath, options);
-				return { path: filePath, written: true, revision: currentRevision + 1 };
+				return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
 			}
 
 			const incomingSourceRevision =
 				options.sourceRevision ?? (isPlainObject(value) ? persistedStateRevision(value) : 0);
-			if (current !== undefined && incomingSourceRevision <= persistedSourceRevision(current)) {
+			if (
+				current !== undefined &&
+				(options.orderingRevision !== undefined
+					? options.orderingRevision <= persistedCommittedModeRevision(current)
+					: incomingSourceRevision <= persistedSourceRevision(current))
+			) {
 				return { path: filePath, written: false, reason: "stale-skip", revision: currentRevision };
 			}
 			const next = stampStateRevision(
@@ -526,7 +635,7 @@ async function writeGuardedResolvedJsonAtomic(
 			);
 			await atomicWrite(filePath, jsonText(next));
 			await maybeAudit(filePath, options);
-			return { path: filePath, written: true, revision: currentRevision + 1 };
+			return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
 		},
 		options.lock,
 	);
@@ -547,46 +656,19 @@ export async function writeGuardedWorkflowEnvelopeAtomic(
 	options: GuardedStateWriterOptions,
 ): Promise<GuardedWriteResult> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	return lockResolvedWorkflowTarget(
-		filePath,
-		async () => {
-			const current = await readJsonIfPresentTolerant(filePath);
-			const currentRevision = persistedStateRevision(current);
+	const write = async (): Promise<GuardedWriteResult> => {
+		const current = await readJsonIfPresentTolerant(filePath);
+		const currentRevision = persistedStateRevision(current);
 
-			if (options.policy === "source") {
-				if (options.expectedRevision !== undefined && options.expectedRevision !== currentRevision) {
-					throw new StateWriteConflictError(filePath, options.expectedRevision, currentRevision);
-				}
-				const next = stampWorkflowEnvelopeRevisionAndChecksum(
-					value,
-					filePath,
-					currentRevision + 1,
-					undefined,
-					options,
-				);
-				const parsed = RequiredOnWriteEnvelopeSchema.safeParse(next);
-				if (!parsed.success) {
-					throw new Error(
-						`Refusing to write invalid workflow state envelope to ${filePath}: ${parsed.error.issues
-							.map(issue => `${issue.path.join(".") || "<root>"}: ${issue.message}`)
-							.join("; ")}`,
-					);
-				}
-				await atomicWrite(filePath, jsonText(next));
-				await maybeAudit(filePath, options);
-				return { path: filePath, written: true, revision: currentRevision + 1 };
-			}
-
-			const incomingSourceRevision =
-				options.sourceRevision ?? (isPlainObject(value) ? persistedStateRevision(value) : 0);
-			if (current !== undefined && incomingSourceRevision <= persistedSourceRevision(current)) {
-				return { path: filePath, written: false, reason: "stale-skip", revision: currentRevision };
+		if (options.policy === "source") {
+			if (options.expectedRevision !== undefined && options.expectedRevision !== currentRevision) {
+				throw new StateWriteConflictError(filePath, options.expectedRevision, currentRevision);
 			}
 			const next = stampWorkflowEnvelopeRevisionAndChecksum(
 				value,
 				filePath,
 				currentRevision + 1,
-				incomingSourceRevision,
+				undefined,
 				options,
 			);
 			const parsed = RequiredOnWriteEnvelopeSchema.safeParse(next);
@@ -599,7 +681,97 @@ export async function writeGuardedWorkflowEnvelopeAtomic(
 			}
 			await atomicWrite(filePath, jsonText(next));
 			await maybeAudit(filePath, options);
-			return { path: filePath, written: true, revision: currentRevision + 1 };
+			return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
+		}
+
+		const incomingSourceRevision =
+			options.sourceRevision ?? (isPlainObject(value) ? persistedStateRevision(value) : 0);
+		if (
+			current !== undefined &&
+			(options.orderingRevision !== undefined
+				? options.orderingRevision <= persistedCommittedModeRevision(current)
+				: incomingSourceRevision <= persistedSourceRevision(current))
+		) {
+			return { path: filePath, written: false, reason: "stale-skip", revision: currentRevision };
+		}
+		const next = stampWorkflowEnvelopeRevisionAndChecksum(
+			value,
+			filePath,
+			currentRevision + 1,
+			incomingSourceRevision,
+			options,
+		);
+		const parsed = RequiredOnWriteEnvelopeSchema.safeParse(next);
+		if (!parsed.success) {
+			throw new Error(
+				`Refusing to write invalid workflow state envelope to ${filePath}: ${parsed.error.issues
+					.map(issue => `${issue.path.join(".") || "<root>"}: ${issue.message}`)
+					.join("; ")}`,
+			);
+		}
+		await atomicWrite(filePath, jsonText(next));
+		await maybeAudit(filePath, options);
+		return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
+	};
+	return options.lockHeld ? write() : lockResolvedWorkflowTarget(filePath, write, options.lock);
+}
+export async function transformGuardedWorkflowEnvelopeAtomic(
+	targetPath: string,
+	options: GuardedWorkflowEnvelopeTransformOptions,
+): Promise<GuardedWorkflowEnvelopeTransformResult> {
+	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
+	return lockResolvedWorkflowTarget(
+		filePath,
+		async () => {
+			const read = await readExistingStateForMutation(filePath);
+			if (read.kind === "absent") throw new GuardedWorkflowEnvelopeError("DI_STATE_ABSENT");
+			if (read.kind === "corrupt") throw new GuardedWorkflowEnvelopeError("DI_STATE_CORRUPT");
+			const receipt = verifyWorkflowEnvelopeReceiptValue(read.value, filePath);
+			if (receipt === "receipt-malformed") throw new GuardedWorkflowEnvelopeError("DI_RECEIPT_MALFORMED");
+			if (receipt === "receipt-missing") throw new GuardedWorkflowEnvelopeError("DI_RECEIPT_MISSING");
+			if (receipt === "checksum-mismatch") throw new GuardedWorkflowEnvelopeError("DI_RECEIPT_CHECKSUM_MISMATCH");
+			const legacy = receipt === "legacy";
+			try {
+				if (isNativeDeepInterviewV1(read.value)) validateDeepInterviewV1Envelope(read.value);
+				options.validate?.(read.value, legacy);
+			} catch {
+				throw new GuardedWorkflowEnvelopeError("DI_STATE_SCHEMA_INVALID");
+			}
+			const phase = read.value.current_phase;
+			if (phase === "complete" || phase === "handoff" || read.value.active === false) {
+				throw new GuardedWorkflowEnvelopeError("DI_PHASE_NOT_REPAIRABLE");
+			}
+			const revision = persistedStateRevision(read.value);
+			if (revision !== options.expectedRevision) throw new GuardedWorkflowEnvelopeError("DI_REVISION_CONFLICT");
+			const transformed = await options.transform(read.value, { revision, legacy });
+			if (transformed.kind === "noop")
+				return { path: filePath, written: false, reason: "noop", revision, warnings: [] };
+			try {
+				if (isNativeDeepInterviewV1(transformed.value)) validateDeepInterviewV1Envelope(transformed.value);
+				options.validate?.(transformed.value, false);
+			} catch {
+				throw new GuardedWorkflowEnvelopeError("DI_STATE_SCHEMA_INVALID");
+			}
+			const stamped = stampWorkflowEnvelopeRevisionAndChecksum(
+				transformed.value,
+				filePath,
+				revision + 1,
+				undefined,
+				options,
+			) as Record<string, unknown>;
+			const parsed = RequiredOnWriteEnvelopeSchema.safeParse(stamped);
+			if (!parsed.success) throw new GuardedWorkflowEnvelopeError("DI_STATE_SCHEMA_INVALID");
+			await atomicWrite(filePath, jsonText(stamped));
+			const warnings: GuardedWorkflowEnvelopeWarning[] = [];
+			try {
+				await maybeAudit(filePath, options);
+			} catch (error) {
+				warnings.push({
+					code: "DI_POST_COMMIT_AUDIT_FAILED",
+					message: error instanceof Error ? error.message : String(error),
+				});
+			}
+			return { path: filePath, written: true, revision: revision + 1, stamped, warnings };
 		},
 		options.lock,
 	);
@@ -979,6 +1151,7 @@ export async function writeActiveEntry(
 				persistedSourceRevision(entry) || persistedSourceRevision(await readJsonIfPresent(filePath)) + 1,
 		},
 	);
+	invalidateActiveStateCacheForScope(cwd, sessionScope);
 	return filePath;
 }
 
@@ -1003,6 +1176,7 @@ export async function removeActiveEntry(
 			}
 			const deleted = await atomicRemove(filePath);
 			if (deleted) await maybeAudit(filePath, options);
+			if (deleted) invalidateActiveStateCacheForScope(cwd, sessionScope);
 			return { path: filePath, deleted };
 		},
 		options?.lock,
@@ -1049,6 +1223,7 @@ export async function rebuildActiveSnapshot(
 			...entries.map(entry => persistedSourceRevision(entry)),
 		),
 	});
+	invalidateActiveStateCacheForScope(cwd, sessionScope);
 	return snapshotPath;
 }
 

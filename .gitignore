@@ -65,6 +65,8 @@ packages/ai/test/.temp-images/
 compaction-results/
 changes/
 __pycache__/
+*.egg-info/
+.pytest_cache/
 
 # Scratch files
 syntax.jsonl
@@ -75,16 +77,12 @@ pi-*.html
 # Generated files
 packages/coding-agent/src/internal-urls/docs-index.generated.ts
 /runs/
-python/gjc-rpc/src/gjc_rpc.egg-info/
 # parallel-agent worktrees
 .wt/
 CPU*.md
 packages/coding-agent/binaries/
 
-# robogjc runtime state
-python/robogjc/data/
-python/robogjc/.cache/
-python/robogjc/src/robogjc/static/
-python/robogjc/web/dist/
-python/robogjc/.env
 .release-040-artifacts/
+
+# Python SDK build output
+python/gjc-sdk/build/

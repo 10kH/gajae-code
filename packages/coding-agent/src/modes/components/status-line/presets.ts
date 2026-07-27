@@ -3,7 +3,18 @@ import type { PresetDef, StatusLinePreset } from "./types";
 export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 	default: {
 		leftSegments: ["model", "mode", "git", "pr", "path"],
-		rightSegments: ["session_name", "jobs", "token_rate", "context_pct", "cost"],
+		rightSegments: ["session_name", "jobs", "token_rate", "cost"],
+		separator: "slash",
+		segmentOptions: {
+			model: { showThinkingLevel: true },
+			path: { abbreviate: true, maxLength: 32, stripWorkPrefix: true },
+			git: { showBranch: true, showStaged: true, showUnstaged: true, showUntracked: true },
+		},
+	},
+
+	"default-usage": {
+		leftSegments: ["model", "mode", "git", "pr", "path"],
+		rightSegments: ["session_name", "jobs", "token_rate", "usage", "cost"],
 		separator: "slash",
 		segmentOptions: {
 			model: { showThinkingLevel: true },
@@ -24,7 +35,7 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 
 	compact: {
 		leftSegments: ["model", "mode", "git", "pr"],
-		rightSegments: ["session_name", "jobs", "cost", "context_pct"],
+		rightSegments: ["session_name", "jobs", "cost"],
 		separator: "slash",
 		segmentOptions: {
 			model: { showThinkingLevel: false },
@@ -42,7 +53,6 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 			"token_rate",
 			"cache_read",
 			"cost",
-			"context_pct",
 			"time_spent",
 			"time",
 		],
@@ -67,7 +77,6 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 			"cache_write",
 			"token_rate",
 			"cost",
-			"context_pct",
 			"context_total",
 			"time_spent",
 			"time",
@@ -84,7 +93,7 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 	ascii: {
 		// No Nerd Font dependencies
 		leftSegments: ["model", "mode", "path", "git", "pr"],
-		rightSegments: ["session_name", "jobs", "token_total", "cost", "context_pct"],
+		rightSegments: ["session_name", "jobs", "token_total", "cost"],
 		separator: "ascii",
 		segmentOptions: {
 			model: { showThinkingLevel: true },
@@ -96,7 +105,7 @@ export const STATUS_LINE_PRESETS: Record<StatusLinePreset, PresetDef> = {
 	custom: {
 		// User-defined - these are just defaults that get overridden
 		leftSegments: ["model", "mode", "path", "git", "pr"],
-		rightSegments: ["session_name", "jobs", "token_total", "cost", "context_pct"],
+		rightSegments: ["session_name", "jobs", "token_total", "cost"],
 		separator: "slash",
 		segmentOptions: {},
 	},

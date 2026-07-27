@@ -32,6 +32,43 @@ describe("StdinBuffer", () => {
 			processInput("hello \u4e16\u754c");
 			expect(emittedSequences).toEqual(["h", "e", "l", "l", "o", " ", "\u4e16", "\u754c"]);
 		});
+		it("emits supplementary characters as complete code points", () => {
+			processInput("\u{1f389}");
+			expect(emittedSequences).toEqual(["\u{1f389}"]);
+		});
+
+		it("preserves ASCII, supplementary, and BMP character ordering", () => {
+			processInput("a\u{1f389}\u4e16b");
+			expect(emittedSequences).toEqual(["a", "\u{1f389}", "\u4e16", "b"]);
+		});
+
+		it("treats ESC plus a supplementary character as one Meta sequence", () => {
+			processInput("\x1b\u{1f389}");
+			expect(emittedSequences).toEqual(["\x1b\u{1f389}"]);
+		});
+		it("reassembles a Meta supplementary character split across string chunks", () => {
+			processInput("\x1b\ud83c");
+			expect(emittedSequences).toEqual([]);
+
+			processInput("\udf89");
+			expect(emittedSequences).toEqual(["\x1b\u{1f389}"]);
+		});
+
+		it("does not consume input following a malformed Meta high surrogate", () => {
+			processInput("\x1b\ud83c");
+			expect(emittedSequences).toEqual([]);
+
+			processInput("x");
+			expect(emittedSequences).toEqual(["\x1b\ud83c", "x"]);
+		});
+
+		it("reassembles a surrogate pair split across string chunks", () => {
+			processInput("\ud83c");
+			expect(emittedSequences).toEqual([]);
+
+			processInput("\udf89");
+			expect(emittedSequences).toEqual(["\u{1f389}"]);
+		});
 	});
 
 	describe("Partial Escape Sequences", () => {
@@ -76,14 +113,49 @@ describe("StdinBuffer", () => {
 			expect(emittedSequences).toEqual(["\x1b[<35;20;5m"]);
 		});
 
-		it("should flush incomplete sequence after timeout", async () => {
+		it("should discard incomplete SGR mouse reports after timeout", async () => {
 			processInput("\x1b[<35");
 			expect(emittedSequences).toEqual([]);
 
 			// Wait for timeout
 			await Bun.sleep(15);
 
-			expect(emittedSequences).toEqual(["\x1b[<35"]);
+			expect(emittedSequences).toEqual([]);
+		});
+
+		it("quarantines delayed SGR suffix chunks and preserves trailing text", async () => {
+			processInput("\x1b[<0;4");
+			await Bun.sleep(15);
+			processInput(";5Mtail");
+			expect(emittedSequences).toEqual(["t", "a", "i", "l"]);
+		});
+
+		it("resynchronizes after a bounded SGR quarantine", async () => {
+			processInput("\x1b[<0;");
+			await Bun.sleep(15);
+			processInput(`${"1".repeat(256)}tail`);
+			expect(emittedSequences).toEqual(["t", "a", "i", "l"]);
+		});
+
+		it("resynchronizes immediately when the timed-out SGR suffix is already invalid", async () => {
+			processInput("\x1b[<0;x");
+			await Bun.sleep(15);
+			expect(emittedSequences).toEqual(["x"]);
+		});
+
+		it("preserves ordinary input and bracketed paste after a malformed delayed SGR report", async () => {
+			processInput("\x1b[<0;4");
+			await Bun.sleep(15);
+			processInput("xtext");
+			expect(emittedSequences).toEqual(["x", "t", "e", "x", "t"]);
+
+			const pasted: string[] = [];
+			buffer.on("paste", text => pasted.push(text));
+			emittedSequences = [];
+			processInput("\x1b[<0;4");
+			await Bun.sleep(15);
+			processInput("\x1b[200~pasted\x1b[201~");
+			expect(pasted).toEqual(["pasted"]);
 		});
 	});
 
@@ -103,6 +175,19 @@ describe("StdinBuffer", () => {
 			// Press 'a', release 'a' batched together (common over SSH)
 			processInput("\x1b[97u\x1b[97;1:3u");
 			expect(emittedSequences).toEqual(["\x1b[97u", "\x1b[97;1:3u"]);
+		});
+		it("deduplicates raw supplementary characters after matching Kitty events", () => {
+			processInput("\x1b[127881u\u{1f389}");
+			expect(emittedSequences).toEqual(["\x1b[127881u"]);
+		});
+		it("continues to deduplicate matching BMP characters after Kitty events", () => {
+			processInput("\x1b[97ua");
+			expect(emittedSequences).toEqual(["\x1b[97u"]);
+		});
+
+		it("does not deduplicate a different supplementary character after a Kitty event", () => {
+			processInput("\x1b[127881u\u{1f38a}");
+			expect(emittedSequences).toEqual(["\x1b[127881u", "\u{1f38a}"]);
 		});
 
 		it("should handle multiple batched Kitty events", () => {
@@ -146,6 +231,11 @@ describe("StdinBuffer", () => {
 			processInput("5;");
 			processInput("10m");
 			expect(emittedSequences).toEqual(["\x1b[<35;15;10m"]);
+		});
+
+		it("keeps trailing text after a malformed SGR report", () => {
+			processInput("\x1b[<-1;4;5Mtail");
+			expect(emittedSequences).toEqual(["t", "a", "i", "l"]);
 		});
 
 		it("should handle multiple mouse events", () => {
@@ -207,10 +297,10 @@ describe("StdinBuffer", () => {
 	});
 
 	describe("Flush", () => {
-		it("should flush incomplete sequences", () => {
+		it("should discard incomplete SGR mouse reports on flush", () => {
 			processInput("\x1b[<35");
 			const flushed = buffer.flush();
-			expect(flushed).toEqual(["\x1b[<35"]);
+			expect(flushed).toEqual([]);
 			expect(buffer.getBuffer()).toBe("");
 		});
 
@@ -218,15 +308,21 @@ describe("StdinBuffer", () => {
 			const flushed = buffer.flush();
 			expect(flushed).toEqual([]);
 		});
+		it("returns a malformed trailing high surrogate on flush", () => {
+			processInput("\ud83c");
 
-		it("should emit flushed data via timeout", async () => {
+			expect(buffer.flush()).toEqual(["\ud83c"]);
+			expect(buffer.getBuffer()).toBe("");
+		});
+
+		it("should not emit incomplete SGR mouse reports via timeout", async () => {
 			processInput("\x1b[<35");
 			expect(emittedSequences).toEqual([]);
 
 			// Wait for timeout to flush
 			await Bun.sleep(15);
 
-			expect(emittedSequences).toEqual(["\x1b[<35"]);
+			expect(emittedSequences).toEqual([]);
 		});
 	});
 
@@ -238,6 +334,13 @@ describe("StdinBuffer", () => {
 			buffer.clear();
 			expect(buffer.getBuffer()).toBe("");
 			expect(emittedSequences).toEqual([]);
+		});
+		it("drops a malformed trailing high surrogate on clear", () => {
+			processInput("\ud83c");
+			buffer.clear();
+
+			processInput("\udf89");
+			expect(emittedSequences).toEqual(["\udf89"]);
 		});
 	});
 
@@ -290,6 +393,14 @@ describe("StdinBuffer", () => {
 
 			expect(emittedSequences).toEqual(["a", "b"]);
 			expect(emittedPaste).toEqual(["pasted"]);
+		});
+
+		it("emits incomplete input before a bracketed paste marker instead of dropping it", () => {
+			processInput("\x1b[<35\x1b[200~pasted\x1b[201~");
+
+			expect(emittedSequences).toEqual(["\x1b[<35"]);
+			expect(emittedPaste).toEqual(["pasted"]);
+			expect(buffer.getBuffer()).toBe("");
 		});
 
 		it("should handle paste with newlines", () => {
@@ -352,6 +463,26 @@ describe("StdinBuffer", () => {
 
 			processInput(bytes.subarray(2));
 			expect(emittedSequences.join("")).toBe(source);
+			expect(emittedSequences.join("")).not.toContain("\uFFFD");
+		});
+
+		it("reassembles a Korean syllable when the completing chunk is one byte", () => {
+			const bytes = Buffer.from("화", "utf8");
+			processInput(bytes.subarray(0, 2));
+			expect(emittedSequences).toEqual([]);
+
+			processInput(bytes.subarray(2, 3));
+			expect(emittedSequences.join("")).toBe("화");
+			expect(emittedSequences.join("")).not.toContain("\uFFFD");
+		});
+
+		it("reassembles a Korean syllable when the leading chunk is one byte", () => {
+			const bytes = Buffer.from("화", "utf8");
+			processInput(bytes.subarray(0, 1));
+			expect(emittedSequences).toEqual([]);
+
+			processInput(bytes.subarray(1));
+			expect(emittedSequences.join("")).toBe("화");
 			expect(emittedSequences.join("")).not.toContain("\uFFFD");
 		});
 
@@ -428,11 +559,29 @@ describe("StdinBuffer", () => {
 			expect(emittedSequences.join("")).not.toBe("화");
 		});
 
-		it("preserves legacy single-high-byte meta conversion (ESC + byte-128)", () => {
-			// An isolated high byte is read as Alt/meta, not fed to the UTF-8
-			// decoder. 0xE1 (225) -> ESC + char(97) = ESC + "a".
+		it("preserves pending single-byte UTF-8 lead as meta before ASCII input", () => {
 			processInput(Buffer.from([0xe1]));
-			expect(emittedSequences).toEqual(["\x1ba"]);
+			expect(emittedSequences).toEqual([]);
+
+			processInput(Buffer.from("x"));
+			expect(emittedSequences).toEqual(["\x1ba", "x"]);
+			expect(emittedSequences.join("")).not.toContain("\uFFFD");
+		});
+
+		it("preserves pending single-byte UTF-8 lead as meta before control input", () => {
+			processInput(Buffer.from([0xe1]));
+			expect(emittedSequences).toEqual([]);
+
+			processInput(Buffer.from("\x1b[A"));
+			expect(emittedSequences).toEqual(["\x1ba", "\x1b[A"]);
+			expect(emittedSequences.join("")).not.toContain("\uFFFD");
+		});
+
+		it("preserves legacy invalid single-high-byte meta conversion (ESC + byte-128)", () => {
+			// Invalid UTF-8 high bytes are read as Alt/meta, not fed to the
+			// decoder. 0xC1 (193) -> ESC + char(65) = ESC + "A".
+			processInput(Buffer.from([0xc1]));
+			expect(emittedSequences).toEqual(["\x1bA"]);
 			expect(emittedSequences.join("")).not.toContain("\uFFFD");
 		});
 	});

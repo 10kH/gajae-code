@@ -15,10 +15,10 @@ import { pluralize } from "@gajae-code/utils";
 import { settings } from "../config/settings";
 import type { Theme } from "../modes/theme/theme";
 import { Hasher } from "../tui/utils";
-import { formatDimensionNote, type ResizedImage } from "../utils/image-resize";
 
 export { Ellipsis } from "@gajae-code/natives";
 export { replaceTabs, truncateToWidth, wrapTextWithAnsi } from "@gajae-code/tui";
+export { formatScreenshot } from "./browser/screenshot-format";
 
 // =============================================================================
 // Standardized Display Constants
@@ -86,6 +86,7 @@ export const EXPAND_HINT = "(Ctrl+O for more)";
  * Get first N lines of text as preview, with each line truncated.
  */
 export function getPreviewLines(text: string, maxLines: number, maxLineLen: number, ellipsis?: Ellipsis): string[] {
+	if (typeof text !== "string") return [];
 	const lines = text.split("\n").filter(l => l.trim());
 	return lines.slice(0, maxLines).map(l => truncateToWidth(l.trim(), maxLineLen, ellipsis));
 }
@@ -568,8 +569,15 @@ export function truncateDiffByHunk(
 // =============================================================================
 
 export function shortenPath(filePath: string, homeDir?: string): string {
+	if (typeof filePath !== "string") return "";
 	const home = homeDir ?? os.homedir();
-	if (home && filePath.startsWith(home)) {
+	if (!home) return filePath;
+	// Only abbreviate paths that are exactly home or genuinely inside it. A bare
+	// startsWith(home) also matches siblings that merely share the prefix
+	// (e.g. "/home/woodyx/notes.txt" for home "/home/woody"), which would corrupt
+	// them into "~x/notes.txt"; require a path-separator boundary after home.
+	const boundary = home.endsWith(path.sep) ? home : home + path.sep;
+	if (filePath === home || filePath.startsWith(boundary)) {
 		return `~${filePath.slice(home.length)}`;
 	}
 	return filePath;
@@ -587,32 +595,6 @@ export function formatToolWorkingDirectory(workdir: string | undefined, projectD
 		relativePath.length > 0 && !relativePath.startsWith("..") && !relativePath.startsWith(`..${path.sep}`);
 	const displayWorkdir = isWithinProject ? relativePath : shortenPath(resolvedWorkdir);
 	return replaceTabs(displayWorkdir);
-}
-
-export function formatScreenshot(opts: {
-	saveFullRes: boolean;
-	savedMimeType: string;
-	savedByteLength: number;
-	dest: string;
-	resized: ResizedImage;
-}): string[] {
-	const lines = ["Screenshot captured"];
-	if (opts.saveFullRes) {
-		lines.push(
-			`Saved: ${opts.savedMimeType} (${(opts.savedByteLength / 1024).toFixed(2)} KB) to ${shortenPath(opts.dest)}`,
-		);
-		lines.push(
-			`Model: ${opts.resized.mimeType} (${(opts.resized.buffer.length / 1024).toFixed(2)} KB, ${opts.resized.width}x${opts.resized.height})`,
-		);
-	} else {
-		lines.push(`Format: ${opts.resized.mimeType} (${(opts.resized.buffer.length / 1024).toFixed(2)} KB)`);
-		lines.push(`Dimensions: ${opts.resized.width}x${opts.resized.height}`);
-	}
-	const dimensionNote = formatDimensionNote(opts.resized);
-	if (dimensionNote) {
-		lines.push(dimensionNote);
-	}
-	return lines;
 }
 
 export function wrapBrackets(text: string, theme: Theme): string {

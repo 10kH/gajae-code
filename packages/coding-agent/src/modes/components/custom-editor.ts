@@ -9,6 +9,7 @@ type ConfigurableEditorAction = Extract<
 	| "app.exit"
 	| "app.suspend"
 	| "app.thinking.cycle"
+	| "app.commandPalette.open"
 	| "app.model.cycleForward"
 	| "app.model.cycleBackward"
 	| "app.model.select"
@@ -33,6 +34,7 @@ const CONFIGURABLE_EDITOR_ACTIONS = [
 	"app.exit",
 	"app.suspend",
 	"app.thinking.cycle",
+	"app.commandPalette.open",
 	"app.model.cycleForward",
 	"app.model.cycleBackward",
 	"app.model.select",
@@ -57,8 +59,21 @@ const DEFAULT_ACTION_KEYS = Object.fromEntries(
 
 const PASTE_DECISION_TIMEOUT_MS = 5_000;
 const PENDING_PASTE_INPUT_MAX = 64;
+const PENDING_PASTE_INPUT_MAX_BYTES = 256 * 1024;
 
 type PastePendingClearReason = "timeout" | "queue-limit";
+
+export interface PasteTextContext {
+	readonly signal: AbortSignal;
+	/** Run one synchronous composer mutation only while this paste transaction is current. */
+	commit(commit: () => boolean): boolean;
+}
+
+interface PendingPasteDecision {
+	readonly controller: AbortController;
+	readonly pasteContent: string;
+	readonly remaining: string;
+}
 
 /**
  * Custom editor that handles configurable app-level shortcuts for coding-agent.
@@ -76,6 +91,7 @@ export class CustomEditor extends Editor {
 	onClear?: () => void;
 	onExit?: () => void;
 	onCycleThinkingLevel?: () => void;
+	onOpenCommandPalette?: () => void;
 	onCycleModelForward?: () => void;
 	onCycleModelBackward?: () => void;
 	onSelectModel?: () => void;
@@ -91,15 +107,19 @@ export class CustomEditor extends Editor {
 	/** Called when the configured image-paste shortcut is pressed. */
 	onPasteImage?: () => Promise<boolean>;
 	/** Called before bracketed paste content is inserted. Return true to consume it. */
-	onPasteText?: (text: string) => boolean | Promise<boolean>;
-	/** Called when async paste handling drops queued input instead of replaying it. */
-	onPastePendingInputCleared?: (reason: PastePendingClearReason, droppedInputCount: number) => void;
+	onPasteText?: (text: string, context: PasteTextContext) => boolean | Promise<boolean>;
+	/** Called when pending paste handling is cancelled after restoring queued input. */
+	onPastePendingInputCleared?: (reason: PastePendingClearReason, restoredInputCount: number) => void;
 	/** Called when the configured dequeue shortcut is pressed. */
 	onDequeue?: () => void;
 	/** Called when the configured queue shortcut is pressed. */
 	onQueue?: () => void;
 	/** Called when Caps Lock is pressed. */
 	onCapsLock?: () => void;
+	/** Called when PageUp/PageDown should scroll the transcript viewport instead of prompt history. */
+	onViewportPageScroll?: (direction: -1 | 1) => void;
+	/** Called before regular composer input should return the transcript viewport to the live bottom. */
+	onViewportFollowLive?: () => void;
 
 	/** Custom key handlers from extensions and non-built-in app actions. */
 	#customKeyHandlers = new Map<KeyId, () => boolean | undefined>();
@@ -110,10 +130,17 @@ export class CustomEditor extends Editor {
 	#pasteDecisionPending = false;
 	#pasteDecisionToken = 0;
 	#pasteDecisionTimeout: NodeJS.Timeout | undefined;
+	#pendingPasteDecision: PendingPasteDecision | undefined;
 	#pendingPasteInput: string[] = [];
+	#pendingPasteInputBytes = 0;
 
 	setActionKeys(action: ConfigurableEditorAction, keys: KeyId[]): void {
 		this.#actionKeys.set(action, [...keys]);
+	}
+
+	/** Returns whether a built-in editor action consumes this configured key before custom handlers. */
+	hasActionKey(key: KeyId): boolean {
+		return [...this.#actionKeys.values()].some(keys => keys.includes(key));
 	}
 
 	#matchesAction(data: string, action: ConfigurableEditorAction): boolean {
@@ -153,74 +180,127 @@ export class CustomEditor extends Editor {
 		}
 	}
 
-	#clearPendingPasteState(): number {
+	#resetPendingPasteState(abortReason?: Error): string[] {
 		this.#clearPasteDecisionTimeout();
+		if (abortReason) this.#pendingPasteDecision?.controller.abort(abortReason);
 		this.#pasteDecisionPending = false;
 		this.#pasteDecisionToken += 1;
-		const droppedInputCount = this.#pendingPasteInput.length;
+		this.#pendingPasteDecision = undefined;
+		const queuedInput = this.#pendingPasteInput;
 		this.#pendingPasteInput = [];
-		return droppedInputCount;
+		this.#pendingPasteInputBytes = 0;
+		return queuedInput;
+	}
+
+	#pendingPasteEventCount(): number {
+		return this.#pendingPasteInput.length + (this.#pendingPasteDecision?.remaining ? 1 : 0);
+	}
+
+	#restoreCancelledPaste(reason: PastePendingClearReason, overflowInput?: string): void {
+		const decision = this.#pendingPasteDecision;
+		const queuedInput = this.#resetPendingPasteState(new Error(`Paste handling cancelled: ${reason}`));
+		if (decision) {
+			super.handleInput(`\x1b[200~${decision.pasteContent}\x1b[201~`);
+			this.#drainPendingPasteInput(decision.remaining, queuedInput);
+			if (overflowInput !== undefined) this.handleInput(overflowInput);
+		}
+		this.onPastePendingInputCleared?.(
+			reason,
+			queuedInput.length + (decision?.remaining ? 1 : 0) + (overflowInput === undefined ? 0 : 1),
+		);
 	}
 
 	#startPasteDecisionTimeout(token: number): void {
 		this.#clearPasteDecisionTimeout();
 		this.#pasteDecisionTimeout = setTimeout(() => {
 			if (token !== this.#pasteDecisionToken) return;
-			const droppedInputCount = this.#clearPendingPasteState();
-			this.onPastePendingInputCleared?.("timeout", droppedInputCount);
+			this.#restoreCancelledPaste("timeout");
 		}, PASTE_DECISION_TIMEOUT_MS);
 		this.#pasteDecisionTimeout.unref?.();
 	}
 
 	dispose(): void {
-		this.#clearPendingPasteState();
+		this.#resetPendingPasteState(new Error("Editor disposed during paste handling"));
 		this.#pasteHandler = new BracketedPasteHandler();
+		super.dispose();
 	}
 
-	#drainPendingPasteInput(initialInput?: string): void {
+	#drainPendingPasteInput(initialInput: string | undefined, queuedInput: readonly string[]): void {
 		if (initialInput && initialInput.length > 0) {
 			this.handleInput(initialInput);
 		}
-		while (!this.#pasteDecisionPending) {
-			const nextInput = this.#pendingPasteInput.shift();
-			if (nextInput === undefined) break;
-			this.handleInput(nextInput);
+		for (const input of queuedInput) {
+			this.handleInput(input);
 		}
 	}
 
 	#handleBracketedPaste(pasteContent: string, remaining: string): void {
-		const applyPasteResult = (token: number, handled: boolean | undefined) => {
+		const remainingBytes = Buffer.byteLength(remaining);
+		if (remainingBytes > PENDING_PASTE_INPUT_MAX_BYTES) {
+			super.handleInput(`\x1b[200~${pasteContent}\x1b[201~`);
+			if (remaining.length > 0) this.handleInput(remaining);
+			this.onPastePendingInputCleared?.("queue-limit", 1);
+			return;
+		}
+		const token = this.#pasteDecisionToken + 1;
+		const controller = new AbortController();
+		this.#pasteDecisionToken = token;
+		this.#pasteDecisionPending = true;
+		this.#pendingPasteDecision = { controller, pasteContent, remaining };
+		this.#pendingPasteInputBytes = remainingBytes;
+		let commitUsed = false;
+
+		const applyPasteResult = (handled: boolean | undefined) => {
 			if (token !== this.#pasteDecisionToken) return;
-			this.#clearPasteDecisionTimeout();
+			const queuedInput = this.#resetPendingPasteState();
 			if (!handled) {
 				super.handleInput(`\x1b[200~${pasteContent}\x1b[201~`);
 			}
-			this.#pasteDecisionPending = false;
-			this.#drainPendingPasteInput(remaining);
+			this.#drainPendingPasteInput(remaining, queuedInput);
 		};
-		const pasteResult = this.onPasteText?.(pasteContent);
+
+		let pasteResult: boolean | Promise<boolean> | undefined;
+		try {
+			pasteResult = this.onPasteText?.(pasteContent, {
+				signal: controller.signal,
+				commit: commit => {
+					if (
+						commitUsed ||
+						token !== this.#pasteDecisionToken ||
+						!this.#pasteDecisionPending ||
+						controller.signal.aborted
+					) {
+						return false;
+					}
+					commitUsed = true;
+					return commit();
+				},
+			});
+		} catch {
+			applyPasteResult(false);
+			return;
+		}
 
 		if (pasteResult instanceof Promise) {
-			const token = this.#pasteDecisionToken + 1;
-			this.#pasteDecisionToken = token;
-			this.#pasteDecisionPending = true;
 			this.#startPasteDecisionTimeout(token);
-			void pasteResult.then(
-				handled => applyPasteResult(token, handled),
-				() => applyPasteResult(token, false),
-			);
+			void pasteResult.then(applyPasteResult, () => applyPasteResult(false));
 		} else {
-			applyPasteResult(this.#pasteDecisionToken, pasteResult);
+			applyPasteResult(pasteResult);
 		}
 	}
 
 	handleInput(data: string): void {
 		if (this.#pasteDecisionPending) {
-			this.#pendingPasteInput.push(data);
-			if (this.#pendingPasteInput.length > PENDING_PASTE_INPUT_MAX) {
-				const droppedInputCount = this.#clearPendingPasteState();
-				this.onPastePendingInputCleared?.("queue-limit", droppedInputCount);
+			const inputBytes = Buffer.byteLength(data);
+			if (
+				this.#pendingPasteEventCount() >= PENDING_PASTE_INPUT_MAX ||
+				this.#pendingPasteInputBytes + inputBytes > PENDING_PASTE_INPUT_MAX_BYTES
+			) {
+				this.#restoreCancelledPaste("queue-limit", data);
+				return;
 			}
+			this.#pendingPasteInput.push(data);
+			this.#pendingPasteInputBytes += inputBytes;
 			return;
 		}
 
@@ -232,13 +312,32 @@ export class CustomEditor extends Editor {
 		}
 
 		if (this.onPasteText) {
-			const paste = this.#pasteHandler.process(data);
+			const paste =
+				data === "\x1b" && !this.#pasteHandler.hasPendingFrame
+					? ({ handled: false } as const)
+					: this.#pasteHandler.process(data);
 			if (paste.handled) {
+				if (paste.leading.length > 0) this.handleInput(paste.leading);
 				if (paste.pasteContent !== undefined) {
+					this.onViewportFollowLive?.();
 					this.#handleBracketedPaste(paste.pasteContent, paste.remaining);
 				}
 				return;
 			}
+		}
+		if (!this.isShowingAutocomplete()) {
+			if (matchesKey(data, "pageUp") && this.onViewportPageScroll) {
+				this.onViewportPageScroll(-1);
+				return;
+			}
+			if (matchesKey(data, "pageDown") && this.onViewportPageScroll) {
+				this.onViewportPageScroll(1);
+				return;
+			}
+		}
+
+		if (!matchesKey(data, "pageUp") && !matchesKey(data, "pageDown")) {
+			this.onViewportFollowLive?.();
 		}
 		// Intercept configured image paste (async - fires and handles result)
 		if (this.#matchesAction(data, "app.clipboard.pasteImage") && this.onPasteImage) {
@@ -288,6 +387,11 @@ export class CustomEditor extends Editor {
 			return;
 		}
 
+		// Intercept configured command palette shortcut before model cycling (Ctrl+P default).
+		if (this.#matchesAction(data, "app.commandPalette.open") && this.onOpenCommandPalette) {
+			this.onOpenCommandPalette();
+			return;
+		}
 		// Intercept configured backward model cycling (check before forward cycling)
 		if (this.#matchesAction(data, "app.model.cycleBackward") && this.onCycleModelBackward) {
 			this.onCycleModelBackward();
@@ -369,7 +473,7 @@ export class CustomEditor extends Editor {
 			}
 		}
 
-		// Pass to parent for normal handling
+		// Pass to parent for normal handling.
 		super.handleInput(data);
 	}
 }

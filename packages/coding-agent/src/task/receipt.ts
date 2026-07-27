@@ -1,5 +1,4 @@
-import type { SingleResult, TaskToolDetails } from "./types";
-
+import { hasCompleteUsageCostBreakdown, type SingleResult, type TaskToolDetails } from "./types";
 export interface TaskRoi {
 	tokens: number;
 	contextTokens?: number;
@@ -32,6 +31,7 @@ export interface TaskResultReceipt {
 	modelSubstitutionWarning?: SingleResult["modelSubstitutionWarning"];
 	usage?: SingleResult["usage"];
 	cost?: number;
+	usageCostBreakdownComplete?: true;
 	branchName?: string;
 	retryFailure?: { attempt: number; errorSummary: string };
 	errorSummary?: string;
@@ -48,6 +48,8 @@ export interface TaskResultReceipt {
 	extractedToolCounts?: Record<string, number>;
 	forkContext?: SingleResult["forkContext"];
 	forkContextAdvisory?: SingleResult["forkContextAdvisory"];
+	/** Resolved repository identity for this delegated lane (#2901). */
+	repositoryBinding?: SingleResult["repositoryBinding"];
 	roi?: TaskRoi;
 }
 
@@ -75,6 +77,28 @@ const BANNED_RAW_TASK_KEYS = new Set([
 function truncateText(value: string | undefined, maxChars: number): string | undefined {
 	if (!value) return undefined;
 	return value.length > maxChars ? value.slice(0, maxChars) : value;
+}
+
+const SAFE_REVIEW_SEVERITIES = new Set(["blocker", "critical", "error", "high", "medium", "warning", "low", "info"]);
+const SAFE_REVIEW_PRIORITIES = new Set(["P0", "P1", "P2", "P3"]);
+
+function normalizeReviewFindingSeverity(severity: unknown, priority: unknown): string | undefined {
+	if (typeof severity === "string") {
+		const normalizedPriority = severity.toUpperCase();
+		if (SAFE_REVIEW_PRIORITIES.has(normalizedPriority)) return normalizedPriority;
+		const normalizedSeverity = severity.toLowerCase();
+		if (SAFE_REVIEW_SEVERITIES.has(normalizedSeverity)) return normalizedSeverity;
+	}
+	if (typeof priority === "string") {
+		const normalizedPriority = priority.toUpperCase();
+		if (SAFE_REVIEW_PRIORITIES.has(normalizedPriority)) return normalizedPriority;
+		const normalizedSeverity = priority.toLowerCase();
+		if (SAFE_REVIEW_SEVERITIES.has(normalizedSeverity)) return normalizedSeverity;
+	}
+	if (typeof priority === "number" && Number.isInteger(priority) && priority >= 0 && priority <= 3) {
+		return `P${priority}`;
+	}
+	return undefined;
 }
 
 function buildSafeSynopsis(raw: SingleResult, outputRef: TaskResultReceipt["outputRef"]): string {
@@ -117,19 +141,16 @@ function buildReview(raw: SingleResult): TaskResultReceipt["review"] | undefined
 	const rawFindings = Array.isArray(data.report_finding) ? data.report_finding : [];
 	const findings = rawFindings.slice(0, 20).map(item => {
 		const value = item && typeof item === "object" ? (item as Record<string, unknown>) : {};
-		const severity =
-			typeof value.severity === "string"
-				? value.severity
-				: typeof value.priority === "string"
-					? value.priority
-					: undefined;
+		const severity = normalizeReviewFindingSeverity(value.severity, value.priority);
 		const summaryValue = value.summary ?? value.title ?? value.message ?? value.body ?? "finding";
 		return { severity, summary: truncateText(String(summaryValue), 200) ?? "finding" };
 	});
 	if (!reviewYield && findings.length === 0) return undefined;
 	return {
-		overallCorrectness:
+		overallCorrectness: truncateText(
 			typeof reviewYield?.overall_correctness === "string" ? reviewYield.overall_correctness : undefined,
+			200,
+		),
 		findingCount: rawFindings.length,
 		findings: findings.length > 0 ? findings : undefined,
 	};
@@ -227,6 +248,8 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		modelSubstitutionWarning: raw.modelSubstitutionWarning,
 		usage: raw.usage,
 		cost: raw.usage?.cost.total,
+		usageCostBreakdownComplete:
+			raw.usageCostBreakdownComplete === true && hasCompleteUsageCostBreakdown(raw.usage) ? true : undefined,
 		branchName: raw.branchName,
 		retryFailure: raw.retryFailure
 			? { attempt: raw.retryFailure.attempt, errorSummary: "Retry failure recorded." }
@@ -241,6 +264,7 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		extractedToolCounts,
 		forkContext: raw.forkContext,
 		forkContextAdvisory: raw.forkContextAdvisory,
+		repositoryBinding: raw.repositoryBinding,
 		roi: buildTaskRoi(raw),
 	};
 }
@@ -255,6 +279,7 @@ export interface RawTaskToolDetails {
 	results: SingleResult[];
 	totalDurationMs: number;
 	usage?: TaskToolDetails["usage"];
+	usageCostBreakdownComplete?: TaskToolDetails["usageCostBreakdownComplete"];
 	async?: TaskToolDetails["async"];
 	forkContextClonedTokens?: number;
 	roiSummary?: TaskToolDetails["roiSummary"];
@@ -267,6 +292,8 @@ export function sanitizeTaskToolDetails(raw: RawTaskToolDetails): TaskToolDetail
 		results: raw.results.map(buildTaskReceipt),
 		totalDurationMs: raw.totalDurationMs,
 		usage: raw.usage,
+		usageCostBreakdownComplete:
+			raw.usageCostBreakdownComplete === true && hasCompleteUsageCostBreakdown(raw.usage) ? true : undefined,
 		forkContextClonedTokens: raw.forkContextClonedTokens,
 		roiSummary: raw.roiSummary ?? buildTaskRoiSummary(raw.results.map(buildTaskReceipt)),
 		async: raw.async,

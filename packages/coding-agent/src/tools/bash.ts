@@ -8,7 +8,10 @@ import { AsyncJobManager } from "../async";
 import { type BashResult, executeBash } from "../exec/bash-executor";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { buildGjcRuntimeSessionEnv } from "../gjc-runtime/goal-mode-request";
-import { GJC_RESTRICTED_ROLE_AGENT_BASH_ENV } from "../gjc-runtime/restricted-role-agent-bash";
+import {
+	GJC_RALPLAN_ARTIFACT_ENV,
+	GJC_RESTRICTED_ROLE_AGENT_BASH_ENV,
+} from "../gjc-runtime/restricted-role-agent-bash";
 import { InternalUrlRouter } from "../internal-urls";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { highlightCode, type Theme } from "../modes/theme/theme";
@@ -94,6 +97,43 @@ export interface BashToolDetails {
 		jobId: string;
 		type: "bash";
 	};
+}
+
+/** Project only a bare executable name; commands and their output are never notification-safe. */
+export function summarizeBashToolActivity(kind: "args" | "result", value: unknown): string | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const record = value as Record<string, unknown>;
+	if (kind === "args") {
+		const command = record.command;
+		if (typeof command !== "string") return undefined;
+		const program = command.trim().match(/^([A-Za-z][A-Za-z0-9_.+-]*)\b/)?.[1];
+		if (
+			!program ||
+			program.length > 80 ||
+			/(?:api[-_ ]?key|access[-_ ]?token|bearer|secret|password|\b(?:sk|pk|rk)-)/i.test(program)
+		) {
+			return undefined;
+		}
+		return program;
+	}
+
+	const output =
+		typeof record.output === "string"
+			? record.output
+			: Array.isArray(record.content)
+				? record.content
+						.filter(
+							(block): block is { type: unknown; text: unknown } =>
+								typeof block === "object" && block !== null && "type" in block && "text" in block,
+						)
+						.filter(block => block.type === "text" && typeof block.text === "string")
+						.map(block => block.text as string)
+						.join("\n")
+				: undefined;
+	if (output === undefined) return undefined;
+	const exitCode = typeof record.exitCode === "number" ? `exit=${record.exitCode}` : "completed";
+	const lines = output.length === 0 ? 0 : output.split("\n").length;
+	return `${exitCode}, ${lines} lines, ${Buffer.byteLength(output, "utf-8")} bytes`;
 }
 
 export interface BashToolOptions {}
@@ -245,6 +285,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	readonly parameters: BashToolSchema;
 	readonly concurrency = "exclusive";
 	readonly strict = true;
+	readonly safeSummary = summarizeBashToolActivity;
 	readonly #asyncEnabled: boolean;
 	readonly #autoBackgroundEnabled: boolean;
 	readonly #autoBackgroundThresholdMs: number;
@@ -530,13 +571,24 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 		const rawCommand = input.command;
 		const allowedPrefixes = this.session.bashAllowedPrefixes;
+		const isRestrictedRalplanArtifactEnv =
+			allowedPrefixes &&
+			allowedPrefixes.length > 0 &&
+			this.session.bashRestrictionProfile !== "read-only" &&
+			env &&
+			Object.keys(env).length === 1 &&
+			Object.hasOwn(env, GJC_RALPLAN_ARTIFACT_ENV) &&
+			rawCommand.includes(`--artifact-env ${GJC_RALPLAN_ARTIFACT_ENV}`);
 		if (
 			(this.session.bashRestrictionProfile === "read-only" || (allowedPrefixes && allowedPrefixes.length > 0)) &&
 			env &&
-			Object.keys(env).length > 0
+			Object.keys(env).length > 0 &&
+			!isRestrictedRalplanArtifactEnv
 		) {
 			const mode = this.session.bashRestrictionProfile === "read-only" ? "Read-only" : "Restricted role-agent";
-			throw new ToolError(`${mode} bash does not allow per-command env overrides.`);
+			throw new ToolError(
+				`${mode} bash only allows the ${GJC_RALPLAN_ARTIFACT_ENV} env override for --artifact-env.`,
+			);
 		}
 		if (allowedPrefixes && allowedPrefixes.length > 0) {
 			const commandsToCheck = rawCommand === command ? [command] : [rawCommand, command];
@@ -584,6 +636,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			internalRouter: InternalUrlRouter.instance(),
 			localOptions: {
 				getArtifactsDir: this.session.getArtifactsDir,
+				isManagedDestination: this.session.isManagedSessionDestination,
 				getSessionId: this.session.getSessionId,
 			},
 		};
@@ -591,24 +644,25 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			...internalUrlOptions,
 			ensureLocalParentDirs: this.session.bashRestrictionProfile !== "read-only",
 		});
-		const sessionFile = this.session.getSessionFile?.() ?? null;
 		const expandedEnv = env
 			? Object.fromEntries(
 					await Promise.all(
 						Object.entries(env).map(async ([key, value]) => [
 							key,
-							await expandInternalUrls(value, {
-								...internalUrlOptions,
-								ensureLocalParentDirs: true,
-								noEscape: true,
-							}),
+							key === GJC_RALPLAN_ARTIFACT_ENV
+								? value
+								: await expandInternalUrls(value, {
+										...internalUrlOptions,
+										ensureLocalParentDirs: true,
+										noEscape: true,
+									}),
 						]),
 					),
 				)
 			: undefined;
 		const resolvedEnv = {
 			...buildGjcRuntimeSessionEnv({
-				sessionFile,
+				sessionFile: null,
 				sessionId: this.session.getSessionId?.(),
 				cwd: this.session.cwd,
 			}),
@@ -817,9 +871,22 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			});
 		}
 
+		// Route through the client terminal when the client advertises the terminal capability.
+		// Skip when pty=true (PTY needs the local terminal UI).
+		const clientBridge =
+			this.session.bashRestrictionProfile === "read-only" ? undefined : this.session.getClientBridge?.();
+		const clientTerminalActive = Boolean(clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty);
+
 		const autoBgManager = AsyncJobManager.instance();
-		if (this.#autoBackgroundEnabled && !pty && autoBgManager) {
-			const autoBackgroundWaitMs = this.#resolveAutoBackgroundWaitMs(timeoutMs);
+		// Run non-PTY bash through the managed job path so Ctrl+B-twice fold-on-demand works
+		// even when auto-background is disabled. When a client terminal will handle the
+		// command, keep the existing bridge path unless auto-background is enabled.
+		if (!pty && autoBgManager && (this.#autoBackgroundEnabled || !clientTerminalActive)) {
+			// With auto-background off, wait past the command's own timeout so the job only
+			// leaves the foreground on an explicit Ctrl+B fold, never on an auto-background timer.
+			const autoBackgroundWaitMs = this.#autoBackgroundEnabled
+				? this.#resolveAutoBackgroundWaitMs(timeoutMs)
+				: timeoutMs + 1_000;
 			const startBackgrounded = autoBackgroundWaitMs === 0;
 			const job = this.#startManagedBashJob({
 				command,
@@ -875,10 +942,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			});
 		}
 
-		// Route through the client terminal when the client advertises the terminal capability.
-		// Skip when pty=true (PTY needs the local terminal UI).
-		const clientBridge =
-			this.session.bashRestrictionProfile === "read-only" ? undefined : this.session.getClientBridge?.();
 		if (clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty) {
 			const handle = await clientBridge.createTerminal({
 				command,

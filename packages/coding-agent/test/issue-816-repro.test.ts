@@ -71,20 +71,21 @@ describe("issue #816 — plan mode pendingModelSwitch leak", () => {
 		});
 		// Avoid kicking off real session work during plan mode entry.
 		vi.spyOn(session, "sendPlanModeContext").mockResolvedValue(undefined);
+		vi.spyOn(session, "abort").mockResolvedValue(undefined);
 
 		const setModelSpy = vi.spyOn(session, "setModelTemporary").mockResolvedValue(undefined);
 
 		// Enter plan mode → snapshots default, queues pending switch to plan model.
-		await mode.handlePlanModeCommand();
-		expect(mode.planModeEnabled).toBe(true);
+		await mode.planModeController.handleCommand();
+		expect(mode.planModeController.enabled).toBe(true);
 
 		// User confirms exit (e.g., approves plan / pauses plan mode).
 		vi.spyOn(mode, "showHookConfirm").mockResolvedValue(true);
-		await mode.handlePlanModeCommand();
-		expect(mode.planModeEnabled).toBe(false);
+		await mode.planModeController.handleCommand();
+		expect(mode.planModeController.enabled).toBe(false);
 
 		// Stream ends → event-controller flushes any queued model switch.
-		await mode.flushPendingModelSwitch();
+		await mode.planModeController.flushPendingModelSwitch();
 
 		// Contract: the deferred plan-role switch must be discarded on exit.
 		// Otherwise the next user turn lands on the plan-role model even though
@@ -92,26 +93,63 @@ describe("issue #816 — plan mode pendingModelSwitch leak", () => {
 		expect(setModelSpy).not.toHaveBeenCalled();
 	});
 
+	it("issue #1588: toggling plan mode off aborts before retiring plan-mode resolve state", async () => {
+		await mode.planModeController.handleCommand();
+		expect(mode.planModeController.enabled).toBe(true);
+		expect(session.getPlanModeState()?.enabled).toBe(true);
+		expect(session.peekStandingResolveHandler()).toBeDefined();
+
+		vi.spyOn(mode, "showHookConfirm").mockResolvedValue(true);
+		const abortSpy = vi.spyOn(session, "abort").mockImplementation(async () => {
+			expect(mode.planModeController.enabled).toBe(true);
+			expect(session.getPlanModeState()?.enabled).toBe(true);
+			expect(session.peekStandingResolveHandler()).toBeDefined();
+		});
+
+		await mode.planModeController.handleCommand();
+
+		expect(abortSpy).toHaveBeenCalledWith({ timeoutMs: 5_000 });
+		expect(mode.planModeController.enabled).toBe(false);
+		expect(mode.planModeController.paused).toBe(true);
+		expect(session.getPlanModeState()).toBeUndefined();
+		expect(session.peekStandingResolveHandler()).toBeUndefined();
+	});
+
+	it("issue #1588: cancelled plan-mode exit keeps the in-flight turn and resolve handler intact", async () => {
+		await mode.planModeController.handleCommand();
+		expect(session.peekStandingResolveHandler()).toBeDefined();
+
+		vi.spyOn(mode, "showHookConfirm").mockResolvedValue(false);
+		const abortSpy = vi.spyOn(session, "abort").mockResolvedValue(undefined);
+
+		await mode.planModeController.handleCommand();
+
+		expect(abortSpy).not.toHaveBeenCalled();
+		expect(mode.planModeController.enabled).toBe(true);
+		expect(session.getPlanModeState()?.enabled).toBe(true);
+		expect(session.peekStandingResolveHandler()).toBeDefined();
+	});
+
 	it("does not enter plan mode when plan.enabled is false", async () => {
 		session.settings.set("plan.enabled", false);
 		const warning = vi.spyOn(mode, "showWarning").mockImplementation(() => {});
 
-		await mode.handlePlanModeCommand();
+		await mode.planModeController.handleCommand();
 
-		expect(mode.planModeEnabled).toBe(false);
+		expect(mode.planModeController.enabled).toBe(false);
 		expect(warning).toHaveBeenCalledWith("Plan mode is disabled. Enable it in settings (plan.enabled).");
 	});
 
 	it("allows /plan to pause an active plan mode after plan.enabled is disabled", async () => {
-		await mode.handlePlanModeCommand();
-		expect(mode.planModeEnabled).toBe(true);
+		await mode.planModeController.handleCommand();
+		expect(mode.planModeController.enabled).toBe(true);
 
 		session.settings.set("plan.enabled", false);
 		vi.spyOn(mode, "showHookConfirm").mockResolvedValue(true);
 
-		await mode.handlePlanModeCommand();
+		await mode.planModeController.handleCommand();
 
-		expect(mode.planModeEnabled).toBe(false);
-		expect(mode.planModePaused).toBe(true);
+		expect(mode.planModeController.enabled).toBe(false);
+		expect(mode.planModeController.paused).toBe(true);
 	});
 });

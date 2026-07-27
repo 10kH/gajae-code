@@ -15,6 +15,7 @@ export function getExtraHelpText(): string {
   ${APP_NAME} deep-interview       - Run requirements interview workflow
   ${APP_NAME} skills               - List/read embedded workflow skills
   ${APP_NAME} config               - List, get, and set configuration values
+  ${APP_NAME} stats                - View AI usage statistics (tokens, cost, requests)
   ${APP_NAME} notify               - Send or test notifications
   ${APP_NAME} daemon               - Manage background daemon helpers
   ${APP_NAME} mcp                  - Manage MCP server registrations
@@ -83,7 +84,7 @@ Environment Variables:
   GJC_LAUNCH_POLICY           - Launch policy for --tmux startup: tmux or direct
   GJC_TMUX_SESSION            - Explicit tmux session name override for --tmux startup
   GJC_TMUX_PROFILE            - Apply GJC tmux scroll/mouse/clipboard profile to --tmux sessions (set 0/off to skip)
-  GJC_MOUSE                   - Mouse-wheel scroll in --tmux sessions (set 0/off to let the host terminal scroll)
+  GJC_MOUSE                   - Apply tmux copy-mode mouse capture in --tmux sessions (set 0/off to skip)
 
   For complete environment variable reference, see:
   docs/environment-variables.md

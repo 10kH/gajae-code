@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type { Tool, ToolCall } from "@gajae-code/ai/types";
+import type { RawArgumentValidationResult, Tool, ToolCall } from "@gajae-code/ai/types";
 import { validateToolArguments } from "@gajae-code/ai/utils/validation";
 import * as z from "zod/v4";
 
@@ -969,5 +969,67 @@ describe("Tool argument coercion", () => {
 
 		const result = validateToolArguments(tool, toolCall) as Record<string, unknown>;
 		expect(result.op).toBe("fix");
+	});
+	it("runs an opt-in raw argument adapter before null normalization and terminal rejection", () => {
+		let observed: unknown;
+		const tool: Tool = {
+			name: "raw-adapter",
+			description: "",
+			parameters: z.object({ value: z.string().optional() }),
+			rawArgumentValidation: arguments_ => {
+				observed = arguments_.value;
+				return arguments_.value === "null" ? { outcome: "reject" } : { outcome: "passthrough" };
+			},
+		};
+
+		expect(() =>
+			validateToolArguments(tool, {
+				type: "toolCall",
+				id: "call-raw-adapter",
+				name: "raw-adapter",
+				arguments: { value: "null" },
+			}),
+		).toThrow("raw arguments rejected before coercion");
+		expect(observed).toBe("null");
+	});
+	it("emits only authority-controlled raw rejection guidance and preserves the generic fallback", () => {
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "call-raw-guidance",
+			name: "raw-guidance",
+			arguments: {},
+		};
+		const tool = (result: RawArgumentValidationResult): Tool => ({
+			name: "raw-guidance",
+			description: "",
+			parameters: z.object({}),
+			rawArgumentValidation: () => result,
+		});
+
+		expect(() => validateToolArguments(tool({ outcome: "reject" }), toolCall)).toThrow(
+			'Validation failed for tool "raw-guidance": raw arguments rejected before coercion',
+		);
+		expect(() =>
+			validateToolArguments(
+				tool({
+					outcome: "reject",
+					code: "ask-intent-review-requires-positive-round",
+				}),
+				toolCall,
+			),
+		).toThrow("deepInterview.intent_review is post-Round-0 only and requires a positive round");
+
+		const untrusted = "untrusted-".repeat(2_000);
+		let message = "";
+		try {
+			validateToolArguments(
+				tool({ outcome: "reject", code: untrusted } as unknown as RawArgumentValidationResult),
+				toolCall,
+			);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		expect(message).toBe('Validation failed for tool "raw-guidance": raw arguments rejected before coercion');
+		expect(message).not.toContain("untrusted-");
 	});
 });

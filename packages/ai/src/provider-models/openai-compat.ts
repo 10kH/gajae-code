@@ -665,6 +665,17 @@ export function deepseekModelManagerOptions(
 ): ModelManagerOptions<"openai-completions"> {
 	return createSimpleOpenAICompletionsOptions("deepseek", "https://api.deepseek.com", config);
 }
+
+export interface DeepInfraModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+export function deepinfraModelManagerOptions(
+	config?: DeepInfraModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	return createSimpleOpenAICompletionsOptions("deepinfra", "https://api.deepinfra.com/v1/openai", config);
+}
 // ---------------------------------------------------------------------------
 // 7.5 Fireworks
 // ---------------------------------------------------------------------------
@@ -1089,6 +1100,81 @@ export function zenmuxModelManagerOptions(config?: ZenMuxModelManagerConfig): Mo
 }
 
 // ---------------------------------------------------------------------------
+// 10.5.1 OpenGateway by Sionic AI
+// ---------------------------------------------------------------------------
+
+export interface OpenGatewayModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+/**
+ * OpenGateway by Sionic AI — an OpenAI-compatible gateway that fronts OpenAI,
+ * Anthropic, and Google models behind one API key. Models are discovered from
+ * the OpenAI-compatible `/v1/models` endpoint.
+ */
+export function opengatewayModelManagerOptions(
+	config?: OpenGatewayModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	return createSimpleOpenAICompletionsOptions("opengateway", "https://apis.opengateway.ai/v1", config);
+}
+
+// ---------------------------------------------------------------------------
+// 10.5.2 BizRouter
+// ---------------------------------------------------------------------------
+
+const BIZROUTER_BASE_URL = "https://api.bizrouter.ai/v1";
+
+function toBizRouterPrice(value: unknown, fallback: number): number {
+	const parsed = toNumber(value);
+	return parsed === undefined || parsed < 0 ? fallback : parsed;
+}
+
+export interface BizRouterModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+export function bizrouterModelManagerOptions(
+	config?: BizRouterModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	const apiKey = config?.apiKey;
+	const baseUrl = config?.baseUrl ?? BIZROUTER_BASE_URL;
+	const references = createBundledReferenceMap<"openai-completions">("bizrouter");
+	return {
+		providerId: "bizrouter",
+		...(apiKey && {
+			fetchDynamicModels: () =>
+				fetchOpenAICompatibleModels({
+					api: "openai-completions",
+					provider: "bizrouter",
+					baseUrl,
+					apiKey,
+					mapModel: (entry, defaults) => {
+						const mapped = mapWithBundledReference(entry, defaults, references.get(defaults.id));
+						return {
+							...mapped,
+							name: toModelName(entry.display_name, mapped.name),
+							contextWindow: toPositiveNumber(entry.context_length, mapped.contextWindow),
+							maxTokens: toPositiveNumber(entry.max_output_tokens, mapped.maxTokens),
+							input: toInputCapabilities(entry.input_modalities),
+							cost: {
+								input: toBizRouterPrice(entry.input_price_per_1m_usd, mapped.cost.input),
+								output: toBizRouterPrice(entry.output_price_per_1m_usd, mapped.cost.output),
+								cacheRead: mapped.cost.cacheRead,
+								cacheWrite: mapped.cost.cacheWrite,
+							},
+							api: "openai-completions",
+							provider: "bizrouter",
+							baseUrl,
+						};
+					},
+				}),
+		}),
+	};
+}
+
+// ---------------------------------------------------------------------------
 // 10.6 Kilo Gateway
 // ---------------------------------------------------------------------------
 
@@ -1113,26 +1199,26 @@ export function kiloModelManagerOptions(config?: KiloModelManagerConfig): ModelM
 }
 
 // ---------------------------------------------------------------------------
-// Alibaba Coding Plan
+// Alibaba Token Plan
 // ---------------------------------------------------------------------------
 
-export interface AlibabaCodingPlanModelManagerConfig {
+export interface AlibabaTokenPlanModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
 }
 
-export function alibabaCodingPlanModelManagerOptions(
-	config?: AlibabaCodingPlanModelManagerConfig,
+export function alibabaTokenPlanModelManagerOptions(
+	config?: AlibabaTokenPlanModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? "https://coding-intl.dashscope.aliyuncs.com/v1";
-	const references = createBundledReferenceMap<"openai-completions">("alibaba-coding-plan");
+	const baseUrl = config?.baseUrl ?? "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
+	const references = createBundledReferenceMap<"openai-completions">("alibaba-token-plan");
 	return {
-		providerId: "alibaba-coding-plan",
+		providerId: "alibaba-token-plan",
 		fetchDynamicModels: () =>
 			fetchOpenAICompatibleModels({
 				api: "openai-completions",
-				provider: "alibaba-coding-plan",
+				provider: "alibaba-token-plan",
 				baseUrl,
 				apiKey,
 				mapModel: (entry, defaults) => {
@@ -1709,7 +1795,7 @@ export interface GithubCopilotModelManagerConfig {
 }
 
 function inferCopilotApi(modelId: string): Api {
-	if (/^claude-(haiku|sonnet|opus)-4([.-]|$)/.test(modelId)) {
+	if (/^claude-(haiku|sonnet|opus)-(?:4|5)([.-]|$)/.test(modelId)) {
 		return "anthropic-messages";
 	}
 	if (modelId.startsWith("gpt-5") || modelId.startsWith("oswe")) {
@@ -2138,7 +2224,7 @@ const COPILOT_DEFAULT_RESOLUTION = {
 
 const COPILOT_API_RESOLUTION_RULES: readonly ApiResolutionRule[] = [
 	{
-		matches: modelId => /^claude-(haiku|sonnet|opus)-4([.-]|$)/.test(modelId),
+		matches: modelId => /^claude-(haiku|sonnet|opus)-(?:4|5)([.-]|$)/.test(modelId),
 		resolved: { api: "anthropic-messages", baseUrl: COPILOT_BASE_URL },
 	},
 	{
@@ -2282,6 +2368,8 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_CORE: readonly ModelsDevProviderDescriptor
 			requiresAssistantContentForToolCalls: true,
 		},
 	}),
+	// --- DeepInfra ---
+	openAiCompletionsDescriptor("deepinfra", "deepinfra", "https://api.deepinfra.com/v1/openai"),
 ];
 
 const MODELS_DEV_PROVIDER_DESCRIPTORS_CODING_PLANS: readonly ModelsDevProviderDescriptor[] = [
@@ -2343,11 +2431,11 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_CODING_PLANS: readonly ModelsDevProviderDe
 			reasoningContentField: "reasoning_content",
 		},
 	}),
-	// --- Alibaba Coding Plan ---
+	// --- Alibaba Token Plan ---
 	openAiCompletionsDescriptor(
-		"alibaba-coding-plan",
-		"alibaba-coding-plan",
-		"https://coding-intl.dashscope.aliyuncs.com/v1",
+		"alibaba-token-plan",
+		"alibaba-token-plan",
+		"https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
 		{
 			compat: {
 				supportsDeveloperRole: false,

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { getWorktreesDir } from "@gajae-code/utils/dirs";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildTeamHudSummary as buildWorkflowTeamHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
@@ -13,32 +14,104 @@ import {
 	appendJsonl as appendJsonlAudited,
 	appendText,
 	createJsonNoClobber,
-	deleteIfOwned,
 	removeFileAudited,
 	writeJsonAtomic,
 	writeReport,
 	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
+import { buildWorkerCommand, startGjcTeamLaunch } from "./team-launch";
+import {
+	listTeamMailbox,
+	markTeamMailboxMessage,
+	reconcileTeamNotifications,
+	replayTeamNotifications,
+	sendTeamMessage,
+	summarizeTeamNotifications,
+	type TeamNotificationRuntime,
+} from "./team-notify";
+import type {
+	GjcTeamApiClaimResult,
+	GjcTeamMailboxDeliveryTransport,
+	GjcTeamNotification,
+	GjcTeamNotificationDeliveryState,
+	GjcTeamNotificationSummary,
+	GjcTeamPaneAttemptResult,
+	GjcTeamTask,
+	GjcTeamTaskClaim,
+	GjcTeamTaskMetadataInput,
+	GjcTeamTaskMutationCapability,
+	GjcTeamTaskStatus,
+} from "./team-store";
+import {
+	findGjcTeamClaimedTaskForWorker,
+	GjcTeamTaskStore,
+	isCanonicalPersistedGjcTeamTask,
+	isCanonicalPersistedGjcTeamTaskClaim,
+	isGjcTeamTaskCompletionVerified,
+	readGjcTeamTasksFromDir as readTasks,
+	taskMetadataFromInput,
+	withGjcTeamMutationFence,
+	withGjcTeamTaskMutation,
+} from "./team-store";
+import {
+	appendTeamWorkerMemoryGuardLedgerEntry,
+	createInitialGjcTeamWorkerMemoryGuardLedger,
+	type GjcTeamWorkerMemoryGuardCheckpoint,
+	type GjcTeamWorkerMemoryGuardLedger,
+	type GjcTeamWorkerMemoryGuardSelectionCandidate,
+	isCanonicalGjcTeamWorkerMemoryGuardLedger,
+	nextTeamWorkerMemoryGuardAttempt,
+	normalizeGjcTeamWorkerMemoryGuardPidProbe,
+	readTeamWorkerMemoryGuardLedger,
+	selectGjcTeamWorkerMemoryGuardCandidate,
+	workerMemoryGuardLedgerPath,
+} from "./team-worker-memory-guard";
+import {
+	GJC_TEAM_CONTINUATION_PROMPT,
+	type GjcTeamWorkerOrchestrationRuntime,
+	type GjcTeamWorkerRuntime,
+	gjcContinuationReservationDigest,
+	isValidGjcContinuationOutcome,
+	isValidGjcContinuationReservation,
+	readGjcShutdownAuthority,
+	readWorkerLifecycleById as readLifecycleById,
+	readGjcShutdownAck as readShutdownAck,
+	readGjcWorkerHeartbeat as readWorkerHeartbeat,
+	readGjcWorkerStatus as readWorkerStatus,
+	reconcileGjcTeamStaleClaimsUnlocked,
+	shutdownGjcTeamWorkers,
+	updateGjcWorkerHeartbeat as updateWorkerHeartbeat,
+	updateGjcWorkerStatus as updateWorkerStatus,
+	writeWorkerLifecycleForConfig as writeLifecycleForConfig,
+	writeWorkerLifecycleRecord as writeLifecycleRecord,
+	writeGjcShutdownRequest as writeShutdownRequest,
+	writeGjcWorkerStartupAck as writeWorkerStartupAck,
+} from "./team-workers";
 import {
 	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxUntaggedSessionHint,
+	GJC_TMUX_ACTIVE_SESSION_ENV,
 	GJC_TMUX_PROFILE_OPTION,
 	GJC_TMUX_PROFILE_VALUE,
+	resolveGjcTmuxBinary,
 	resolveGjcTmuxCommand,
 } from "./tmux-common";
 
-export type GjcTeamPhase = "starting" | "running" | "awaiting_integration" | "complete" | "failed" | "cancelled";
-export type GjcTeamTaskStatus = "pending" | "blocked" | "in_progress" | "completed" | "failed";
-export type GjcWorkerStatusState = "idle" | "working" | "blocked" | "done" | "failed" | "draining" | "unknown";
-export type GjcTeamWorkerLifecycleState =
-	| "starting"
-	| "ready"
-	| "working"
-	| "draining"
-	| "stopped"
-	| "failed"
-	| "unknown";
-export type GjcTeamShutdownMode = "graceful" | "force" | "abort";
+export type {
+	GjcTeamApiClaimResult,
+	GjcTeamMailboxDeliveryInput,
+	GjcTeamMailboxDeliveryResult,
+	GjcTeamMailboxDeliveryTransport,
+	GjcTeamMailboxDeliveryTransportKind,
+	GjcTeamNotification,
+	GjcTeamNotificationDeliveryState,
+	GjcTeamNotificationSummary,
+	GjcTeamPaneAttemptResult,
+	GjcTeamTask,
+	GjcTeamTaskClaim,
+	GjcTeamTaskMetadataInput,
+	GjcTeamTaskStatus,
+} from "./team-store";
 
 export const GJC_TEAM_DEFAULT_WORKERS = 3;
 export const GJC_TEAM_MAX_WORKERS = 20;
@@ -72,57 +145,17 @@ export interface GjcTeamWorker {
 	worktree_base_ref?: string;
 	team_state_root?: string;
 }
-
-export interface GjcTeamTaskClaim {
-	owner: string;
-	token: string;
-	leased_until: string;
-}
-export type GjcTeamTaskCompletionEvidenceKind = "command" | "inspection" | "artifact";
-export type GjcTeamTaskCompletionEvidenceStatus = "passed" | "failed" | "not_run" | "verified" | "rejected";
-
-export interface GjcTeamTaskCompletionEvidenceItem {
-	kind: GjcTeamTaskCompletionEvidenceKind;
-	status: GjcTeamTaskCompletionEvidenceStatus;
-	summary: string;
-	command?: string;
-	artifact?: string;
-	location?: string;
-	output?: string;
-}
-
-export interface GjcTeamTaskCompletionEvidence {
-	summary: string;
-	items: GjcTeamTaskCompletionEvidenceItem[];
-	files?: string[];
-	notes?: string;
-	recorded_by: string;
-	recorded_at: string;
-}
-
-export interface GjcTeamTask {
-	id: string;
-	subject: string;
-	description: string;
-	title: string;
-	objective: string;
-	status: GjcTeamTaskStatus;
-	assignee?: string;
-	owner?: string;
-	result?: string;
-	completion_evidence?: GjcTeamTaskCompletionEvidence;
-	error?: string;
-	blocked_by?: string[];
-	depends_on?: string[];
-	lane?: string;
-	required_role?: string;
-	allowed_roles?: string[];
-	version: number;
-	claim?: GjcTeamTaskClaim;
-	created_at: string;
-	updated_at: string;
-	completed_at?: string;
-}
+export type GjcTeamPhase = "starting" | "running" | "awaiting_integration" | "complete" | "failed" | "cancelled";
+export type GjcWorkerStatusState = "idle" | "working" | "blocked" | "done" | "failed" | "draining" | "unknown";
+export type GjcTeamWorkerLifecycleState =
+	| "starting"
+	| "ready"
+	| "working"
+	| "draining"
+	| "stopped"
+	| "failed"
+	| "unknown";
+export type GjcTeamShutdownMode = "graceful" | "force" | "abort";
 
 export type GjcTeamWorktreeMode =
 	| { enabled: false }
@@ -138,6 +171,7 @@ export interface GjcTeamConfig {
 	worker_count: number;
 	max_workers: number;
 	state_root: string;
+	gjc_session_id?: string;
 	worker_command: string;
 	worker_cli_plan: GjcTeamWorkerCli[];
 	tmux_command: string;
@@ -194,39 +228,6 @@ export interface GjcTeamWorkerLifecycle {
 	shutdown_mode?: GjcTeamShutdownMode;
 }
 
-export type GjcTeamNotificationDeliveryState =
-	| "pending"
-	| "sent"
-	| "queued"
-	| "deferred"
-	| "failed"
-	| "delivered"
-	| "acknowledged";
-
-export type GjcTeamPaneAttemptResult = "sent" | "queued" | "deferred" | "failed";
-
-export interface GjcTeamNotification {
-	id: string;
-	kind: "mailbox_message" | "worker_lifecycle" | "invalid_attempt";
-	team_name: string;
-	recipient: string;
-	source: { type: "message" | "task" | "worker" | "event"; id: string };
-	idempotency_key?: string;
-	delivery_state: GjcTeamNotificationDeliveryState;
-	pane_attempt_result?: GjcTeamPaneAttemptResult;
-	pane_attempt_reason?: string;
-	pane_attempt_at?: string;
-	created_at: string;
-	updated_at: string;
-	replay_count: number;
-}
-
-export interface GjcTeamNotificationSummary {
-	total: number;
-	replay_eligible: number;
-	by_state: Record<GjcTeamNotificationDeliveryState, number>;
-}
-
 export interface GjcTeamSnapshot {
 	team_name: string;
 	display_name: string;
@@ -256,15 +257,10 @@ export interface GjcTeamStartOptions {
 	cwd?: string;
 	env?: NodeJS.ProcessEnv;
 	dryRun?: boolean;
+	platform?: NodeJS.Platform;
+	mailboxDeliveryTransport?: GjcTeamMailboxDeliveryTransport;
 }
 
-export interface GjcTeamApiClaimResult {
-	ok: boolean;
-	task?: GjcTeamTask;
-	worker_id?: string;
-	claim_token?: string;
-	reason?: string;
-}
 export type GjcTeamLivenessRecoveryReason =
 	| "claim_expired"
 	| "stale_heartbeat"
@@ -333,7 +329,10 @@ function notificationReceiptFields(notification: GjcTeamNotification): Record<st
 
 function notificationSummaryReceipt(
 	teamName: string,
-	result: { notifications: GjcTeamNotification[]; summary: GjcTeamNotificationSummary },
+	result: {
+		notifications: GjcTeamNotification[];
+		summary: GjcTeamNotificationSummary;
+	},
 ): Record<string, unknown> {
 	return {
 		team_name: teamName,
@@ -438,17 +437,18 @@ export interface GjcTeamTraceEvent {
 	evidence_refs?: string[];
 	data?: Record<string, unknown>;
 }
-interface WorkerStatusFile {
+export interface WorkerStatusFile {
 	state: GjcWorkerStatusState;
 	current_task_id?: string;
 	reason?: string;
 	updated_at: string;
 }
-interface WorkerHeartbeatFile {
+export interface WorkerHeartbeatFile {
 	pid: number;
 	last_turn_at: string;
 	turn_count: number;
 	alive: boolean;
+	process_start_time?: string;
 }
 interface GitResult {
 	ok: boolean;
@@ -493,6 +493,10 @@ export interface GjcWorkerIntegrationAttemptRequestResult {
 	status?: GjcWorkerCheckpointClassification["kind"];
 }
 
+export interface GjcWorkerIntegrationAttemptOptions {
+	signal?: AbortSignal;
+}
+
 function isGjcTeamTaskStatus(value: string): value is GjcTeamTaskStatus {
 	return ["pending", "blocked", "in_progress", "completed", "failed"].includes(value);
 }
@@ -530,6 +534,9 @@ export const GJC_TEAM_API_OPERATIONS = [
 	"read-worker-heartbeat",
 	"recover-stale-claims",
 	"update-worker-heartbeat",
+	"read-worker-memory-guard",
+	"update-worker-memory-guard",
+	"apply-worker-memory-guard",
 	"write-worker-inbox",
 	"write-worker-identity",
 	"append-event",
@@ -544,9 +551,28 @@ export const GJC_TEAM_API_OPERATIONS = [
 	"write-task-approval",
 ] as const;
 
-function now(): string {
-	return new Date().toISOString();
+function currentTimeMs(): number {
+	return gjcTeamRuntimeTestSeams?.nowMs?.() ?? Date.now();
 }
+
+function now(): string {
+	return new Date(currentTimeMs()).toISOString();
+}
+
+export interface GjcTeamRuntimeTestSeams {
+	nowMs?: () => number;
+	continuationTmuxDispatch?: (command: string, args: readonly string[]) => { exitCode?: number };
+
+	continuationBeforeDispatch?: () => Promise<void>;
+}
+
+let gjcTeamRuntimeTestSeams: GjcTeamRuntimeTestSeams | undefined;
+
+/** @internal Test-only seam; production code leaves the real clock and tmux dispatch intact. */
+export function __setGjcTeamRuntimeTestSeamsForTests(seams: GjcTeamRuntimeTestSeams | undefined): void {
+	gjcTeamRuntimeTestSeams = seams;
+}
+
 function isEnoent(error: unknown): error is FsError {
 	return typeof error === "object" && error !== null && "code" in error && (error as FsError).code === "ENOENT";
 }
@@ -562,7 +588,12 @@ function stateWriterOptions(filePath: string, category: "state" | "ledger" | "re
 	// Session-scoped audit requires a GJC session. When an explicit env-root override
 	// (e.g. GJC_TEAM_STATE_ROOT) is in effect with no resolvable session, omit the audit
 	// context entirely so the override write does not fail on a session-scoped audit.
-	return sessionId ? { cwd, audit: { category, verb, owner: "gjc-runtime" as const, sessionId } } : { cwd };
+	return sessionId
+		? {
+				cwd,
+				audit: { category, verb, owner: "gjc-runtime" as const, sessionId },
+			}
+		: { cwd };
 }
 
 function sanitizeName(value: string): string {
@@ -608,9 +639,6 @@ function powershellQuote(value: string): string {
 function safePathSegment(kind: string, value: string): string {
 	assertSafeId(kind, value);
 	return value;
-}
-function taskPath(dir: string, taskId: string): string {
-	return path.join(dir, "tasks", `${safePathSegment("task_id", taskId)}.json`);
 }
 function mailboxPath(dir: string, worker: string): string {
 	return path.join(dir, "mailbox", `${safePathSegment("worker_id", worker)}.json`);
@@ -686,7 +714,9 @@ function workerIntegrationDedupePath(dir: string, worker: string): string {
 export function resolveGjcTeamStateRoot(cwd = process.cwd(), env: NodeJS.ProcessEnv = process.env): string {
 	const explicit = env.GJC_TEAM_STATE_ROOT?.trim();
 	if (explicit) return path.resolve(cwd, explicit);
-	const session = resolveGjcSessionForWrite(cwd, { envSessionId: env.GJC_SESSION_ID });
+	const session = resolveGjcSessionForWrite(cwd, {
+		envSessionId: env.GJC_SESSION_ID,
+	});
 	return teamStateRoot(cwd, session.gjcSessionId);
 }
 
@@ -698,6 +728,110 @@ async function readJsonFile<T>(filePath: string): Promise<T | null> {
 		throw error;
 	}
 }
+
+async function readContinuationJson<T>(filePath: string): Promise<T | null> {
+	try {
+		return await readJsonFile<T>(filePath);
+	} catch {
+		return null;
+	}
+}
+type GjcContinuationAuthorityInventory =
+	| { valid: true; tasks: GjcTeamTask[]; claims: Map<string, GjcTeamTaskClaim> }
+	| { valid: false };
+
+async function readGjcContinuationAuthorityInventory(dir: string): Promise<GjcContinuationAuthorityInventory> {
+	let taskNames: string[];
+	try {
+		taskNames = (await fs.readdir(path.join(dir, "tasks"), { withFileTypes: true }))
+			.filter(entry => entry.isFile() && entry.name.endsWith(".json") && !entry.name.endsWith(".evidence.json"))
+			.map(entry => entry.name);
+	} catch {
+		return { valid: false };
+	}
+	const tasks: GjcTeamTask[] = [];
+	const taskIds = new Set<string>();
+	for (const name of taskNames) {
+		const id = name.slice(0, -".json".length);
+		try {
+			const task = await Bun.file(path.join(dir, "tasks", name)).json();
+			if (!isCanonicalPersistedGjcTeamTask(task, id) || taskIds.has(task.id)) return { valid: false };
+			taskIds.add(task.id);
+			tasks.push(task);
+		} catch {
+			return { valid: false };
+		}
+	}
+	let claimNames: string[];
+	try {
+		claimNames = (await fs.readdir(path.join(dir, "claims"), { withFileTypes: true }))
+			.filter(entry => entry.isFile() && entry.name.endsWith(".json"))
+			.map(entry => entry.name);
+	} catch (error) {
+		if (!isEnoent(error)) return { valid: false };
+		claimNames = [];
+	}
+	const claims = new Map<string, GjcTeamTaskClaim>();
+	for (const name of claimNames) {
+		const id = name.slice(0, -".json".length);
+		if (!taskIds.has(id) || claims.has(id)) return { valid: false };
+		try {
+			const claim = await Bun.file(path.join(dir, "claims", name)).json();
+			if (!isCanonicalPersistedGjcTeamTaskClaim(claim)) return { valid: false };
+			claims.set(id, claim);
+		} catch {
+			return { valid: false };
+		}
+	}
+	for (const task of tasks) {
+		const claim = claims.get(task.id);
+		if ((task.claim === undefined) !== (claim === undefined)) return { valid: false };
+		if (
+			task.claim !== undefined &&
+			(!claim ||
+				claim.owner !== task.claim.owner ||
+				claim.token !== task.claim.token ||
+				claim.leased_until !== task.claim.leased_until)
+		)
+			return { valid: false };
+	}
+	return { valid: true, tasks, claims };
+}
+
+type GjcContinuationWorkerAuthority =
+	| { valid: true; task: GjcTeamTask & { claim: GjcTeamTaskClaim }; claim: GjcTeamTaskClaim }
+	| { valid: false; taskCount: number; claimCount: number };
+
+function selectGjcContinuationWorkerAuthority(
+	inventory: Extract<GjcContinuationAuthorityInventory, { valid: true }>,
+	worker: string,
+): GjcContinuationWorkerAuthority {
+	const tasks = inventory.tasks.filter(
+		task =>
+			task.status === "in_progress" &&
+			task.claim?.owner === worker &&
+			task.assignee === worker &&
+			task.owner === worker,
+	);
+	const claims = [...inventory.claims.entries()]
+		.filter(([, claim]) => claim.owner === worker)
+		.map(([taskId, claim]) => ({ taskId, claim }));
+	if (tasks.length !== 1 || claims.length !== 1)
+		return { valid: false, taskCount: tasks.length, claimCount: claims.length };
+	const task = tasks[0];
+	const stored = claims[0];
+	if (
+		!task?.claim ||
+		!stored ||
+		stored.taskId !== task.id ||
+		stored.claim.owner !== task.claim.owner ||
+		stored.claim.token !== task.claim.token ||
+		stored.claim.leased_until !== task.claim.leased_until
+	)
+		return { valid: false, taskCount: tasks.length, claimCount: claims.length };
+	return { valid: true, task: { ...task, claim: task.claim }, claim: stored.claim };
+}
+
 function isPositivePid(value: unknown): value is number {
 	return typeof value === "number" && Number.isInteger(value) && value > 0;
 }
@@ -726,7 +860,10 @@ interface TeamGcPidClassification {
  */
 function classifyTeamGcWorkerPids(pids: number[], probe: GcPidProbe): TeamGcPidClassification {
 	if (pids.length === 0) return { removable: false, pidStatus: "none" };
-	const statuses = pids.map(pid => ({ pid, status: gcProbeStatus(probe, pid) }));
+	const statuses = pids.map(pid => ({
+		pid,
+		status: gcProbeStatus(probe, pid),
+	}));
 	const kept = statuses.find(entry => entry.status !== "dead");
 	if (kept) return { removable: false, pidStatus: kept.status, pid: kept.pid };
 	return { removable: true, pidStatus: "dead", pid: statuses[0]?.pid };
@@ -758,7 +895,9 @@ export async function listTeamWorkerGcRecords(teamRoot: string, probe: GcPidProb
 		const teamDirPath = path.join(teamRoot, teamName);
 		let workerEntries: import("node:fs").Dirent[];
 		try {
-			workerEntries = await fs.readdir(path.join(teamDirPath, "workers"), { withFileTypes: true });
+			workerEntries = await fs.readdir(path.join(teamDirPath, "workers"), {
+				withFileTypes: true,
+			});
 		} catch (error) {
 			if (isEnoent(error)) continue;
 			throw error;
@@ -827,6 +966,18 @@ export async function listTeamWorkerGcRecords(teamRoot: string, probe: GcPidProb
 /** @internal */
 export async function pruneTeamWorkerGcRecord(record: GcRecord, probe: GcPidProbe): Promise<boolean> {
 	if (!record.path || !record.id.includes("/")) return false;
+	const teamDirPath = path.dirname(path.dirname(record.path));
+	return withGjcTeamTaskMutation(taskStore(teamDirPath), capability =>
+		pruneTeamWorkerGcRecordUnlocked(record, probe, capability),
+	);
+}
+
+async function pruneTeamWorkerGcRecordUnlocked(
+	record: GcRecord,
+	probe: GcPidProbe,
+	capability: GjcTeamTaskMutationCapability,
+): Promise<boolean> {
+	if (!record.path || !record.id.includes("/")) return false;
 	const [teamName, workerId] = record.id.split("/", 2);
 	if (!teamName || !workerId) return false;
 	const teamDirPath = path.dirname(path.dirname(record.path));
@@ -851,7 +1002,7 @@ export async function pruneTeamWorkerGcRecord(record: GcRecord, probe: GcPidProb
 	for (const task of await readTasks(teamDirPath)) {
 		if (task.claim?.owner !== workerId && task.assignee !== workerId) continue;
 		if (task.status === "completed" || task.status === "failed") continue;
-		await writeTask(teamDirPath, {
+		await capability.writeRecovered({
 			...task,
 			status: "pending",
 			assignee: undefined,
@@ -1028,7 +1179,11 @@ async function appendTraceForEvent(dir: string, event: GjcTeamEvent): Promise<vo
 	}
 }
 async function appendEvent(dir: string, event: Omit<GjcTeamEvent, "ts" | "event_id">): Promise<GjcTeamEvent> {
-	const full = { event_id: `evt-${Date.now()}-${Math.random().toString(16).slice(2)}`, ts: now(), ...event };
+	const full = {
+		event_id: `evt-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+		ts: now(),
+		...event,
+	};
 	await appendJsonl(path.join(dir, "events.jsonl"), full);
 	await appendTraceForEvent(dir, full);
 	return full;
@@ -1056,138 +1211,911 @@ async function readConfig(dir: string): Promise<GjcTeamConfig> {
 		worker_cli_plan: config.worker_cli_plan ?? Array.from({ length: config.worker_count }, () => "gjc"),
 	};
 }
+const WORKER_INTEGRATION_CONFIG_CACHE_TTL_MS = 100;
+type WorkerIntegrationConfigCacheEntry = {
+	checkedAt: number;
+	mtimeMs: number;
+	config: GjcTeamConfig;
+};
+const workerIntegrationConfigCache = new Map<string, WorkerIntegrationConfigCacheEntry>();
+
+async function readConfigForWorkerIntegration(dir: string): Promise<GjcTeamConfig> {
+	const configPath = path.join(dir, "config.json");
+	const nowMs = Date.now();
+	const stat = await fs.stat(configPath);
+	const cached = workerIntegrationConfigCache.get(configPath);
+	if (cached && cached.mtimeMs === stat.mtimeMs && nowMs - cached.checkedAt <= WORKER_INTEGRATION_CONFIG_CACHE_TTL_MS)
+		return cached.config;
+	const config = await readConfig(dir);
+	workerIntegrationConfigCache.set(configPath, {
+		checkedAt: nowMs,
+		mtimeMs: stat.mtimeMs,
+		config,
+	});
+
+	return config;
+}
+function manifestPath(dir: string): string {
+	return path.join(dir, "manifest.v2.json");
+}
+
+function manifestRecordFromConfig(config: GjcTeamConfig): Record<string, unknown> {
+	return {
+		version: 2,
+		team_name: config.team_name,
+		display_name: config.display_name,
+		requested_name: config.requested_name,
+		tmux_session: config.tmux_session,
+		tmux_session_name: config.tmux_session_name,
+		tmux_target: config.tmux_target,
+		worker_command: config.worker_command,
+		worker_cli_plan: config.worker_cli_plan,
+		tmux_command: config.tmux_command,
+		leader: config.leader,
+		workers: config.workers,
+		workspace_mode: config.workspace_mode,
+		dry_run: config.dry_run,
+		created_at: config.created_at,
+		updated_at: config.updated_at,
+	};
+}
+
+async function syncTeamConfigAndManifest(dir: string, config: GjcTeamConfig): Promise<void> {
+	await writeJsonFile(path.join(dir, "config.json"), config);
+	await writeJsonFile(manifestPath(dir), manifestRecordFromConfig(config));
+}
+
+async function readWorkerMemoryGuardLedger(
+	dir: string,
+	workerId: string,
+	platform: string,
+): Promise<GjcTeamWorkerMemoryGuardLedger> {
+	const ledgerPath = workerMemoryGuardLedgerPath(dir, workerId);
+	const existing = await readJsonFile<unknown>(ledgerPath);
+	if (isCanonicalGjcTeamWorkerMemoryGuardLedger(existing) && existing.worker_id === workerId) return existing;
+	const ledger = createInitialGjcTeamWorkerMemoryGuardLedger({ workerId, platform, now: now() });
+	await writeJsonFile(ledgerPath, ledger);
+	return ledger;
+}
+
+async function writeWorkerMemoryGuardLedger(
+	dir: string,
+	ledger: GjcTeamWorkerMemoryGuardLedger,
+): Promise<GjcTeamWorkerMemoryGuardLedger> {
+	await writeJsonFile(workerMemoryGuardLedgerPath(dir, ledger.worker_id), ledger);
+	return ledger;
+}
+
+async function appendWorkerMemoryGuardAction(input: {
+	dir: string;
+	teamName: string;
+	cwd: string;
+	workerId: string;
+	task?: GjcTeamTask;
+	incidentId: string;
+	action: "advisory" | "replace" | "blocked";
+	result: "noop" | "scheduled" | "succeeded" | "failed" | "blocked";
+	reason: string;
+}): Promise<void> {
+	const workerPath = path.join(input.dir, "workers", safePathSegment("worker_id", input.workerId));
+	const entries = await readTeamWorkerMemoryGuardLedger(workerPath);
+	await appendTeamWorkerMemoryGuardLedgerEntry(
+		workerPath,
+		{
+			schema_version: 1,
+			recorded_at: now(),
+			incident_id: input.incidentId,
+			team_name: input.teamName,
+			worker_id: input.workerId,
+			task_id: input.task?.id ?? "unclaimed",
+			claim_token: input.task?.claim?.token ?? "unclaimed",
+			attempt: nextTeamWorkerMemoryGuardAttempt(entries, input.incidentId),
+			platform: process.platform,
+			action: input.action,
+			result: input.result,
+			reason: input.reason,
+		},
+		{ cwd: input.cwd },
+	);
+}
+
+function normalizeWorkerMemoryGuardPlatform(value: unknown): string {
+	return typeof value === "string" && value.trim() ? value.trim() : process.platform;
+}
+
+async function readLinuxProcessStartTime(pid: number): Promise<string | undefined> {
+	if (process.platform !== "linux" || !Number.isSafeInteger(pid) || pid <= 0) return undefined;
+	try {
+		const stat = await Bun.file(`/proc/${pid}/stat`).text();
+		const commandEnd = stat.lastIndexOf(")");
+		if (commandEnd < 0) return undefined;
+		const fields = stat
+			.slice(commandEnd + 2)
+			.trim()
+			.split(/\s+/);
+		const startTime = fields[19];
+		return startTime && /^\d+$/.test(startTime) ? startTime : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function normalizeWorkerMemoryGuardSelectionCandidates(
+	value: unknown,
+	ledgers: Map<string, GjcTeamWorkerMemoryGuardLedger>,
+): GjcTeamWorkerMemoryGuardSelectionCandidate[] {
+	if (!Array.isArray(value)) return [];
+	const candidates: GjcTeamWorkerMemoryGuardSelectionCandidate[] = [];
+	for (const entry of value) {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+		const record = entry as Record<string, unknown>;
+		const workerId =
+			typeof record.worker_id === "string"
+				? record.worker_id.trim()
+				: typeof record.workerId === "string"
+					? record.workerId.trim()
+					: "";
+		if (!workerId) continue;
+		const ledger = ledgers.get(workerId);
+		const excessBytes = Number(record.excess_bytes ?? record.excessBytes ?? 0);
+		if (!Number.isFinite(excessBytes)) continue;
+		candidates.push({
+			worker_id: workerId,
+			platform:
+				typeof record.platform === "string" && record.platform.trim()
+					? record.platform.trim()
+					: (ledger?.platform ?? process.platform),
+			excess_bytes: excessBytes,
+			retry_count:
+				typeof record.retry_count === "number" && Number.isInteger(record.retry_count)
+					? record.retry_count
+					: (ledger?.retry_count ?? 0),
+			retry_limit:
+				typeof record.retry_limit === "number" && Number.isInteger(record.retry_limit) && record.retry_limit > 0
+					? record.retry_limit
+					: (ledger?.retry_limit ?? 2),
+			blocked: typeof record.blocked === "boolean" ? record.blocked : ledger?.state === "blocked",
+			current_task_id:
+				typeof record.current_task_id === "string"
+					? record.current_task_id
+					: typeof record.currentTaskId === "string"
+						? record.currentTaskId
+						: ledger?.current_task_id,
+		});
+	}
+	return candidates;
+}
+
+function withMemoryGuardRetry(
+	ledger: GjcTeamWorkerMemoryGuardLedger,
+	input: {
+		platform: string;
+		reason: string;
+		incidentId: string;
+		currentTaskId?: string;
+		pidProbe?: GjcTeamWorkerMemoryGuardLedger["last_pid_probe"];
+		nowIso: string;
+	},
+): { ledger: GjcTeamWorkerMemoryGuardLedger; finalBlocked: boolean } {
+	const retryCount = Math.min(ledger.retry_count + 1, ledger.retry_limit);
+	const finalBlocked = retryCount >= ledger.retry_limit;
+	return {
+		ledger: {
+			...ledger,
+			platform: input.platform,
+			state: finalBlocked ? "blocked" : "retrying",
+			retry_count: retryCount,
+			current_task_id: input.currentTaskId,
+			last_incident_id: input.incidentId,
+			last_reason: input.reason,
+			last_pid_probe: input.pidProbe,
+			updated_at: input.nowIso,
+		},
+		finalBlocked,
+	};
+}
+
+async function finalizeWorkerMemoryGuardBlockedState(input: {
+	teamName: string;
+	dir: string;
+	worker: GjcTeamWorker;
+	task: GjcTeamTask | undefined;
+	taskMutation: GjcTeamTaskMutationCapability;
+	reason: string;
+	cwd: string;
+	env: NodeJS.ProcessEnv;
+}): Promise<void> {
+	await updateWorkerStatus(
+		workerRuntime,
+		input.teamName,
+		input.worker.id,
+		"blocked",
+		input.cwd,
+		input.env,
+		input.task?.id,
+		input.reason,
+	);
+	await writeLifecycleRecord(workerRuntime, input.dir, input.worker, "failed", { stop_reason: input.reason });
+	const task = input.task;
+	if (!task?.claim) return;
+	await input.taskMutation.transition(task.id, "blocked", task.claim.token, input.worker.id);
+}
+
+async function checkpointWorkerForMemoryGuard(
+	worker: GjcTeamWorker,
+	taskId: string | undefined,
+): Promise<{ ok: true; checkpoint: GjcTeamWorkerMemoryGuardCheckpoint } | { ok: false; reason: string }> {
+	if (!worker.worktree_path) return { ok: false, reason: "worker_worktree_missing" };
+	let classification: GjcWorkerCheckpointClassification;
+	try {
+		classification = classifyWorkerCheckpointStatus(worker.worktree_path);
+	} catch {
+		return { ok: false, reason: "checkpoint_git_error" };
+	}
+	if (
+		classification.kind !== "clean" &&
+		classification.kind !== "eligible" &&
+		classification.kind !== "protected_only"
+	)
+		return { ok: false, reason: `checkpoint_${classification.kind}` };
+	let commit: string | null = null;
+	if (classification.kind === "eligible") {
+		const added = runGitResult(worker.worktree_path, ["add", "--", ...classification.files]);
+		if (!added.ok) return { ok: false, reason: "checkpoint_git_add_failed" };
+		const message = `gjc(team): memory-guard checkpoint ${worker.id} [${taskId ?? "unknown"}]`;
+		const committed = runGitResult(worker.worktree_path, [
+			"commit",
+			"--no-verify",
+			"--only",
+			"-m",
+			message,
+			"--",
+			...classification.files,
+		]);
+		if (!committed.ok) return { ok: false, reason: "checkpoint_git_commit_failed" };
+		commit = resolveHead(worker.worktree_path);
+	}
+	return {
+		ok: true,
+		checkpoint: {
+			kind: classification.kind,
+			files: classification.files,
+			head: resolveHead(worker.worktree_path),
+			commit,
+			recorded_at: now(),
+		},
+	};
+}
+
+async function relaunchWorkerPaneForMemoryGuard(input: {
+	config: GjcTeamConfig;
+	worker: GjcTeamWorker;
+	platform: NodeJS.Platform;
+	startupAckPath: string;
+	replacementToken: string;
+	startupAckTimeoutMs: number;
+}): Promise<string> {
+	if (input.config.dry_run)
+		return `%memory-guard-${input.worker.id}-${stableHash(`${input.worker.id}:${now()}`).slice(0, 8)}`;
+	const workerCommand = buildWorkerCommand(
+		input.config,
+		input.worker,
+		input.platform,
+		`Send startup ACK before resuming: gjc team api worker-startup-ack --input '{"team_name":"${input.config.team_name}","worker_id":"${input.worker.id}","protocol_version":"1","replacement_token":"${input.replacementToken}"}' --json. ${GJC_TEAM_CONTINUATION_PROMPT}`,
+	);
+	const workerCwd = input.worker.worktree_path ?? input.config.leader.cwd;
+	const useSendKeysFallback = shouldDispatchWorkerWithSendKeys(input.config.tmux_command, input.platform);
+	const splitTarget =
+		input.worker.pane_id && paneBelongsToTeamTarget(input.config, input.worker.pane_id)
+			? input.worker.pane_id
+			: input.config.tmux_target;
+	const split = Bun.spawnSync(
+		[
+			input.config.tmux_command,
+			"split-window",
+			"-v",
+			"-t",
+			splitTarget,
+			"-d",
+			"-P",
+			"-F",
+			"#{pane_id}",
+			"-c",
+			workerCwd,
+			...(useSendKeysFallback ? [] : [workerCommand]),
+		],
+		{ stdout: "pipe", stderr: "pipe" },
+	);
+	if (split.exitCode !== 0)
+		throw new Error(split.stderr.toString().trim() || `memory_guard_split_failed:${input.worker.id}`);
+	const newPaneId = split.stdout.toString().trim().split(/\r?\n/)[0]?.trim() ?? "";
+	if (!newPaneId.startsWith("%")) throw new Error(`memory_guard_split_missing_pane:${input.worker.id}`);
+	if (useSendKeysFallback) {
+		Bun.spawnSync([input.config.tmux_command, "send-keys", "-l", "-t", newPaneId, workerCommand], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		Bun.spawnSync([input.config.tmux_command, "send-keys", "-t", newPaneId, "Enter"], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+	}
+	const startupDeadline = Date.now() + input.startupAckTimeoutMs;
+	while (true) {
+		try {
+			const ack = await Bun.file(input.startupAckPath).json();
+			if (
+				ack &&
+				typeof ack === "object" &&
+				"replacement_token" in ack &&
+				ack.replacement_token === input.replacementToken
+			)
+				break;
+		} catch {
+			// The successor may still be publishing its generation-bound ACK.
+		}
+		if (Date.now() >= startupDeadline) {
+			Bun.spawnSync([input.config.tmux_command, "kill-pane", "-t", newPaneId], {
+				stdout: "ignore",
+				stderr: "ignore",
+			});
+			throw new Error(`memory_guard_successor_startup_timeout:${input.worker.id}`);
+		}
+		await Bun.sleep(50);
+	}
+	const successorPane = probePaneTeamTarget(input.config, newPaneId);
+	if (!successorPane.exists || !successorPane.belongsToTeamTarget) {
+		Bun.spawnSync([input.config.tmux_command, "kill-pane", "-t", newPaneId], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		throw new Error(`memory_guard_successor_pane_unavailable:${input.worker.id}`);
+	}
+	if (input.worker.pane_id) {
+		const oldPane = probePaneTeamTarget(input.config, input.worker.pane_id);
+		if (oldPane.exists && !oldPane.belongsToTeamTarget) {
+			Bun.spawnSync([input.config.tmux_command, "kill-pane", "-t", newPaneId], {
+				stdout: "ignore",
+				stderr: "ignore",
+			});
+			throw new Error(`memory_guard_old_pane_outside_team_target:${input.worker.id}`);
+		}
+	}
+	Bun.spawnSync([input.config.tmux_command, "select-layout", "-t", input.config.tmux_target, "main-vertical"], {
+		stdout: "ignore",
+		stderr: "ignore",
+	});
+	return newPaneId;
+}
+
+async function applyWorkerMemoryGuardUnlocked(input: {
+	teamName: string;
+	workerId?: string;
+	requestedWorkerId: string;
+	reason?: string;
+	incidentId?: string;
+	platform: string;
+	pidProbe?: GjcTeamWorkerMemoryGuardLedger["last_pid_probe"];
+	candidates?: unknown;
+	cwd: string;
+	env: NodeJS.ProcessEnv;
+	allowAutomaticAction?: boolean;
+	replacementToken?: string;
+	dir: string;
+	taskMutation: GjcTeamTaskMutationCapability;
+}): Promise<Record<string, unknown>> {
+	const dir = input.dir;
+	const config = await readConfig(dir);
+	const ledgers = new Map<string, GjcTeamWorkerMemoryGuardLedger>();
+	for (const candidate of config.workers)
+		ledgers.set(candidate.id, await readWorkerMemoryGuardLedger(dir, candidate.id, input.platform));
+	let workerId = input.workerId ?? input.requestedWorkerId;
+	const parsedCandidates = normalizeWorkerMemoryGuardSelectionCandidates(input.candidates, ledgers);
+	if (!input.workerId && Array.isArray(input.candidates)) {
+		const selected = selectGjcTeamWorkerMemoryGuardCandidate(parsedCandidates);
+		if (!selected)
+			return {
+				ok: true,
+				result: "advisory",
+				lifecycle_mutated: false,
+				reason: "no_eligible_worker_memory_guard_candidate",
+			};
+		workerId = selected.worker_id;
+	}
+	const worker = findKnownWorker(config, workerId);
+	const authorityInventory = await readGjcContinuationAuthorityInventory(dir);
+	const authority = authorityInventory.valid
+		? selectGjcContinuationWorkerAuthority(authorityInventory, worker.id)
+		: { valid: false as const, taskCount: 0, claimCount: 0 };
+	const task = authority.valid ? authority.task : undefined;
+	const leaseExpiresAt = authority.valid ? Date.parse(authority.claim.leased_until) : Number.NaN;
+	let ledger = ledgers.get(worker.id) ?? (await readWorkerMemoryGuardLedger(dir, worker.id, input.platform));
+	const nowIso = now();
+	const currentTaskId = task?.id;
+	const incidentId = input.incidentId ?? stableHash(`${worker.id}:${currentTaskId ?? "none"}:${nowIso}`).slice(0, 16);
+	const baseReason = input.reason?.trim() || "memory_guard_requested";
+	if (!authority.valid || !Number.isFinite(leaseExpiresAt) || leaseExpiresAt <= currentTimeMs()) {
+		const noClaimReason =
+			process.platform !== "linux" || input.platform !== "linux"
+				? `unsupported_platform:${input.platform}:host:${process.platform}:${baseReason}`
+				: "worker_has_no_exact_active_claim";
+		ledger = {
+			...ledger,
+			platform: input.platform,
+			state: "advisory",
+			current_task_id: undefined,
+			last_incident_id: incidentId,
+			last_reason: noClaimReason,
+			last_pid_probe: input.pidProbe,
+			updated_at: nowIso,
+		};
+		await writeWorkerMemoryGuardLedger(dir, ledger);
+		await appendWorkerMemoryGuardAction({
+			dir,
+			teamName: input.teamName,
+			cwd: input.cwd,
+			workerId: worker.id,
+			task,
+			incidentId,
+			action: "advisory",
+			result: "noop",
+			reason: noClaimReason,
+		});
+		return {
+			ok: true,
+			result: "advisory",
+			lifecycle_mutated: false,
+			ledger,
+			reason: noClaimReason,
+		};
+	}
+	if (ledger.state === "blocked" || ledger.retry_count >= ledger.retry_limit) {
+		await appendWorkerMemoryGuardAction({
+			dir,
+			teamName: input.teamName,
+			cwd: input.cwd,
+			workerId: worker.id,
+			task,
+			incidentId,
+			action: "blocked",
+			result: "blocked",
+			reason: ledger.last_reason ?? "retry_limit",
+		});
+		return { ok: true, result: "blocked", lifecycle_mutated: false, ledger };
+	}
+	if (input.allowAutomaticAction !== undefined)
+		ledger = {
+			...ledger,
+			automatic_action_allowed: input.allowAutomaticAction,
+			updated_at: nowIso,
+		};
+	if (process.platform !== "linux" || input.platform !== "linux") {
+		ledger = {
+			...ledger,
+			platform: input.platform,
+			state: "advisory",
+			current_task_id: currentTaskId,
+			last_incident_id: incidentId,
+			last_reason: `unsupported_platform:${input.platform}:host:${process.platform}:${baseReason}`,
+			last_pid_probe: input.pidProbe,
+			updated_at: nowIso,
+		};
+		await writeWorkerMemoryGuardLedger(dir, ledger);
+		await appendWorkerMemoryGuardAction({
+			dir,
+			teamName: input.teamName,
+			cwd: input.cwd,
+			workerId: worker.id,
+			task,
+			incidentId,
+			action: "advisory",
+			result: "noop",
+			reason: ledger.last_reason ?? "unsupported_platform",
+		});
+		return { ok: true, result: "advisory", lifecycle_mutated: false, ledger };
+	}
+	if (!ledger.automatic_action_allowed) {
+		ledger = {
+			...ledger,
+			platform: input.platform,
+			state: "advisory",
+			current_task_id: currentTaskId,
+			last_incident_id: incidentId,
+			last_reason: "automatic_linux_action_disabled",
+			last_pid_probe: input.pidProbe,
+			updated_at: nowIso,
+		};
+		await writeWorkerMemoryGuardLedger(dir, ledger);
+		await appendWorkerMemoryGuardAction({
+			dir,
+			teamName: input.teamName,
+			cwd: input.cwd,
+			workerId: worker.id,
+			task,
+			incidentId,
+			action: "advisory",
+			result: "noop",
+			reason: "automatic_linux_action_disabled",
+		});
+		return { ok: true, result: "advisory", lifecycle_mutated: false, ledger };
+	}
+	const controllerPath = path.join(dir, "memory-guard-controller.json");
+	const controllerProcessStart = await readLinuxProcessStartTime(process.pid);
+	const controllerId = `pid:${process.pid}:start:${controllerProcessStart ?? "unknown"}`;
+	const controllerNow = currentTimeMs();
+	const controllerCooldownMs = parseDurationEnv(input.env, "GJC_TEAM_MEMORY_GUARD_ACTION_COOLDOWN_MS", 120_000);
+	const existingController = await readJsonFile<{
+		controller_id?: string;
+		cooldown_until?: string;
+	}>(controllerPath);
+	const existingCooldownUntil = Date.parse(existingController?.cooldown_until ?? "");
+	if (
+		existingController?.controller_id &&
+		existingController.controller_id !== controllerId &&
+		Number.isFinite(existingCooldownUntil) &&
+		existingCooldownUntil > controllerNow
+	)
+		return {
+			ok: true,
+			result: "advisory",
+			lifecycle_mutated: false,
+			reason: "team_memory_guard_controller_active",
+		};
+	await writeJsonFile(controllerPath, {
+		schema_version: 1,
+		controller_id: controllerId,
+		worker_id: worker.id,
+		incident_id: incidentId,
+		reserved_at: new Date(controllerNow).toISOString(),
+		cooldown_until: new Date(controllerNow + controllerCooldownMs).toISOString(),
+	});
+	const checkpoint = await checkpointWorkerForMemoryGuard(worker, currentTaskId);
+	if (!checkpoint.ok) {
+		const retried = withMemoryGuardRetry(ledger, {
+			platform: input.platform,
+			reason: checkpoint.reason,
+			incidentId,
+			currentTaskId,
+			pidProbe: input.pidProbe,
+			nowIso,
+		});
+		ledger = retried.ledger;
+		await writeWorkerMemoryGuardLedger(dir, ledger);
+		if (retried.finalBlocked)
+			await finalizeWorkerMemoryGuardBlockedState({
+				teamName: input.teamName,
+				dir,
+				worker,
+				task,
+				taskMutation: input.taskMutation,
+				reason: checkpoint.reason,
+				cwd: input.cwd,
+				env: input.env,
+			});
+		await appendWorkerMemoryGuardAction({
+			dir,
+			teamName: input.teamName,
+			cwd: input.cwd,
+			workerId: worker.id,
+			task,
+			incidentId,
+			action: retried.finalBlocked ? "blocked" : "replace",
+			result: retried.finalBlocked ? "blocked" : "failed",
+			reason: checkpoint.reason,
+		});
+		return {
+			ok: true,
+			result: retried.finalBlocked ? "blocked" : "retrying",
+			lifecycle_mutated: retried.finalBlocked,
+			ledger,
+		};
+	}
+	const refreshedInventory = await readGjcContinuationAuthorityInventory(dir);
+	const refreshedAuthority = refreshedInventory.valid
+		? selectGjcContinuationWorkerAuthority(refreshedInventory, worker.id)
+		: { valid: false as const, taskCount: 0, claimCount: 0 };
+	if (
+		!refreshedAuthority.valid ||
+		refreshedAuthority.task.id !== task?.id ||
+		refreshedAuthority.claim.token !== task?.claim?.token ||
+		refreshedAuthority.claim.leased_until !== task?.claim?.leased_until ||
+		Date.parse(refreshedAuthority.claim.leased_until) <= currentTimeMs()
+	)
+		return {
+			ok: true,
+			result: "advisory",
+			lifecycle_mutated: false,
+			reason: "worker_claim_authority_changed",
+		};
+	const startupAckPath = path.join(dir, "workers", safePathSegment("worker_id", worker.id), "startup-ack.json");
+	const previousStartupAck = (await Bun.file(startupAckPath).exists())
+		? await Bun.file(startupAckPath).text()
+		: undefined;
+	const lifecyclePath = workerLifecyclePath(dir, worker.id);
+	const previousLifecycle = (await Bun.file(lifecyclePath).exists())
+		? await Bun.file(lifecyclePath).text()
+		: undefined;
+	const restorePredecessorStartupState = async (): Promise<void> => {
+		if (previousLifecycle === undefined) await fs.rm(lifecyclePath, { force: true });
+		else await Bun.write(lifecyclePath, previousLifecycle);
+		if (previousStartupAck === undefined) await fs.rm(startupAckPath, { force: true });
+		else await Bun.write(startupAckPath, previousStartupAck);
+	};
+	await fs.rm(startupAckPath, { force: true });
+	const replacementToken = input.replacementToken ?? randomUUID();
+	const startupAckTimeoutMs = parseDurationEnv(input.env, "GJC_TEAM_MEMORY_GUARD_STARTUP_TIMEOUT_MS", 120_000);
+	let newPaneId: string;
+	try {
+		newPaneId = await relaunchWorkerPaneForMemoryGuard({
+			config,
+			worker,
+			platform: process.platform,
+			startupAckPath,
+			replacementToken,
+			startupAckTimeoutMs,
+		});
+	} catch (error) {
+		await restorePredecessorStartupState();
+		const reason = error instanceof Error && error.message ? `relaunch_failed:${error.message}` : "relaunch_failed";
+		const retried = withMemoryGuardRetry(ledger, {
+			platform: input.platform,
+			reason,
+			incidentId,
+			currentTaskId,
+			pidProbe: input.pidProbe,
+			nowIso,
+		});
+		ledger = retried.ledger;
+		await writeWorkerMemoryGuardLedger(dir, ledger);
+		if (retried.finalBlocked)
+			await finalizeWorkerMemoryGuardBlockedState({
+				teamName: input.teamName,
+				dir,
+				worker,
+				task,
+				taskMutation: input.taskMutation,
+				reason,
+				cwd: input.cwd,
+				env: input.env,
+			});
+		await appendWorkerMemoryGuardAction({
+			dir,
+			teamName: input.teamName,
+			cwd: input.cwd,
+			workerId: worker.id,
+			task,
+			incidentId,
+			action: retried.finalBlocked ? "blocked" : "replace",
+			result: retried.finalBlocked ? "blocked" : "failed",
+			reason,
+		});
+		return {
+			ok: true,
+			result: retried.finalBlocked ? "blocked" : "retrying",
+			lifecycle_mutated: retried.finalBlocked,
+			ledger,
+		};
+	}
+	const postAckInventory = await readGjcContinuationAuthorityInventory(dir);
+	const postAckAuthority = postAckInventory.valid
+		? selectGjcContinuationWorkerAuthority(postAckInventory, worker.id)
+		: { valid: false as const, taskCount: 0, claimCount: 0 };
+	if (
+		!postAckAuthority.valid ||
+		postAckAuthority.task.id !== task?.id ||
+		postAckAuthority.claim.token !== task?.claim?.token ||
+		postAckAuthority.claim.leased_until !== task?.claim?.leased_until ||
+		Date.parse(postAckAuthority.claim.leased_until) <= currentTimeMs()
+	) {
+		Bun.spawnSync([config.tmux_command, "kill-pane", "-t", newPaneId], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		await restorePredecessorStartupState();
+		return {
+			ok: true,
+			result: "advisory",
+			lifecycle_mutated: false,
+			reason: "worker_claim_authority_changed_after_startup",
+		};
+	}
+	const successorPane = probePaneTeamTarget(config, newPaneId);
+	if (!successorPane.exists || !successorPane.belongsToTeamTarget || !successorPane.pid) {
+		Bun.spawnSync([config.tmux_command, "kill-pane", "-t", newPaneId], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		await restorePredecessorStartupState();
+		return {
+			ok: true,
+			result: "advisory",
+			lifecycle_mutated: false,
+			reason: "successor_pane_unavailable_after_startup",
+		};
+	}
+	const heartbeatPath = path.join(dir, "workers", safePathSegment("worker_id", worker.id), "heartbeat.json");
+	const previousHeartbeat = (await Bun.file(heartbeatPath).exists())
+		? await Bun.file(heartbeatPath).text()
+		: undefined;
+	const successorHeartbeat: WorkerHeartbeatFile = {
+		pid: successorPane.pid,
+		last_turn_at: now(),
+		turn_count: 0,
+		alive: true,
+		process_start_time: await readLinuxProcessStartTime(successorPane.pid),
+	};
+	const nextConfig: GjcTeamConfig = {
+		...config,
+		workers: config.workers.map(candidate =>
+			candidate.id === worker.id
+				? { ...candidate, pane_id: newPaneId, last_heartbeat: nowIso, status: "idle" }
+				: candidate,
+		),
+		updated_at: nowIso,
+	};
+	const rollbackReplacement = async (): Promise<void> => {
+		Bun.spawnSync([config.tmux_command, "kill-pane", "-t", newPaneId], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		if (previousHeartbeat === undefined) await fs.rm(heartbeatPath, { force: true });
+		else await Bun.write(heartbeatPath, previousHeartbeat);
+		await syncTeamConfigAndManifest(dir, config);
+		await restorePredecessorStartupState();
+	};
+	try {
+		await writeJsonFile(heartbeatPath, successorHeartbeat);
+		await syncTeamConfigAndManifest(dir, nextConfig);
+		await writeLifecycleRecord(workerRuntime, dir, { ...worker, pane_id: newPaneId }, "ready", {
+			pane_id: newPaneId,
+			started_at: nowIso,
+			stop_reason: undefined,
+			stopped_at: undefined,
+		});
+		const cutoverPane = probePaneTeamTarget(config, newPaneId);
+		if (!cutoverPane.exists || !cutoverPane.belongsToTeamTarget || cutoverPane.pid !== successorHeartbeat.pid)
+			throw new Error(`memory_guard_successor_pane_changed:${worker.id}`);
+		if (worker.pane_id && !config.dry_run) {
+			const killed = Bun.spawnSync([config.tmux_command, "kill-pane", "-t", worker.pane_id], {
+				stdout: "ignore",
+				stderr: "pipe",
+			});
+			if (killed.exitCode !== 0 && probePaneTeamTarget(config, worker.pane_id).exists)
+				throw new Error(killed.stderr.toString().trim() || `memory_guard_kill_failed:${worker.id}`);
+		}
+	} catch (error) {
+		await rollbackReplacement();
+		throw new Error(
+			error instanceof Error && error.message
+				? `memory_guard_replacement_commit_failed:${error.message}`
+				: "memory_guard_replacement_commit_failed",
+		);
+	}
+	ledger = {
+		...ledger,
+		platform: input.platform,
+		state: "replaced",
+		retry_count: 0,
+		current_task_id: currentTaskId,
+		last_incident_id: incidentId,
+		last_reason: baseReason,
+		last_pid_probe: input.pidProbe,
+		last_checkpoint: checkpoint.checkpoint,
+		last_replacement: {
+			old_pane_id: worker.pane_id,
+			new_pane_id: newPaneId,
+			recorded_at: nowIso,
+		},
+		updated_at: nowIso,
+	};
+	await writeWorkerMemoryGuardLedger(dir, ledger);
+	await appendWorkerMemoryGuardAction({
+		dir,
+		teamName: input.teamName,
+		cwd: input.cwd,
+		workerId: worker.id,
+		task,
+		incidentId,
+		action: "replace",
+		result: "succeeded",
+		reason: baseReason,
+	});
+	await appendEvent(dir, {
+		type: "worker_memory_guard_replaced",
+		worker: worker.id,
+		task_id: currentTaskId,
+		message: `Replaced ${worker.id} after memory-guard checkpoint`,
+		data: {
+			incident_id: incidentId,
+			checkpoint_kind: checkpoint.checkpoint.kind,
+			checkpoint_commit: checkpoint.checkpoint.commit,
+			old_pane_id: worker.pane_id,
+			new_pane_id: newPaneId,
+		},
+	});
+	return {
+		ok: true,
+		result: "replaced",
+		lifecycle_mutated: true,
+		ledger,
+		checkpoint: checkpoint.checkpoint,
+	};
+}
+
+async function applyWorkerMemoryGuard(
+	input: Omit<Parameters<typeof applyWorkerMemoryGuardUnlocked>[0], "dir" | "taskMutation">,
+): Promise<Record<string, unknown>> {
+	const dir = await findTeamDir(input.teamName, input.cwd, input.env);
+	return withGjcTeamTaskMutation(taskStore(dir), taskMutation =>
+		applyWorkerMemoryGuardUnlocked({ ...input, dir, taskMutation }),
+	);
+}
 async function readPhase(dir: string): Promise<GjcTeamPhase> {
-	const phase = await readJsonFile<{ current_phase?: GjcTeamPhase }>(path.join(dir, "phase.json"));
-	return phase?.current_phase ?? "running";
+	try {
+		const phase = await readJsonFile<{ current_phase?: GjcTeamPhase }>(path.join(dir, "phase.json"));
+		return phase?.current_phase ?? "running";
+	} catch (error) {
+		if (error instanceof SyntaxError) return "running";
+		throw error;
+	}
 }
 async function writePhase(dir: string, phase: GjcTeamPhase): Promise<void> {
-	await writeJsonFile(path.join(dir, "phase.json"), { current_phase: phase, updated_at: now() });
+	await writeJsonFile(path.join(dir, "phase.json"), {
+		current_phase: phase,
+		updated_at: now(),
+	});
 }
 function isGjcWorkerStatusState(value: string): value is GjcWorkerStatusState {
 	return ["idle", "working", "blocked", "done", "failed", "draining", "unknown"].includes(value);
-}
-
-function parseGjcWorkerStatusState(value: unknown): GjcWorkerStatusState {
-	return typeof value === "string" && isGjcWorkerStatusState(value) ? value : "unknown";
 }
 function parseRequiredGjcWorkerStatusState(value: unknown): GjcWorkerStatusState {
 	const raw = typeof value === "string" ? value.trim() : "";
 	if (isGjcWorkerStatusState(raw)) return raw;
 	throw new Error(`invalid_worker_status:${raw}`);
 }
-
-function lifecycleStateForWorkerStatus(status: GjcWorkerStatusState): GjcTeamWorkerLifecycleState {
-	switch (status) {
-		case "working":
-			return "working";
-		case "draining":
-			return "draining";
-		case "failed":
-			return "failed";
-		case "unknown":
-			return "unknown";
-		case "idle":
-		case "blocked":
-		case "done":
-			return "ready";
-	}
-}
-
 function parseGjcTeamShutdownMode(value: unknown): GjcTeamShutdownMode {
 	const raw = typeof value === "string" ? value.trim() : "graceful";
 	if (raw === "graceful" || raw === "force" || raw === "abort") return raw;
 	throw new Error(`invalid_shutdown_mode:${raw}`);
 }
+const workerRuntime: GjcTeamWorkerRuntime = {
+	findTeamDir,
+	readConfig,
+	assertKnownWorker,
+	assertKnownParticipant,
+	findKnownWorker,
+	workerDir,
+	readJson: readJsonFile,
+	writeJson: writeJsonFile,
+	appendEvent,
+	now,
+	nowMs: currentTimeMs,
+	stableHash,
+};
 
-function isGjcTeamWorkerLifecycleState(value: string): value is GjcTeamWorkerLifecycleState {
-	return ["starting", "ready", "working", "draining", "stopped", "failed", "unknown"].includes(value);
-}
-
-function parseGjcTeamWorkerLifecycleState(value: unknown): GjcTeamWorkerLifecycleState {
-	return typeof value === "string" && isGjcTeamWorkerLifecycleState(value) ? value : "unknown";
-}
-
-async function readWorkerStatusFile(dir: string, worker: string): Promise<WorkerStatusFile> {
-	return (
-		(await readJsonFile<WorkerStatusFile>(path.join(workerDir(dir, worker), "status.json"))) ?? {
-			state: "unknown",
-			updated_at: now(),
-		}
-	);
-}
-
-async function readWorkerLifecycleRecord(dir: string, worker: GjcTeamWorker): Promise<GjcTeamWorkerLifecycle> {
-	const workerStatus = await readWorkerStatusFile(dir, worker.id);
-	const heartbeat = await readJsonFile<WorkerHeartbeatFile>(path.join(workerDir(dir, worker.id), "heartbeat.json"));
-	const rawLifecycle = await readJsonFile<Partial<GjcTeamWorkerLifecycle>>(workerLifecyclePath(dir, worker.id));
-	const shutdownAck = await readJsonFile<Record<string, unknown>>(
-		path.join(workerDir(dir, worker.id), "shutdown-ack.json"),
-	);
-	const lifecycle: GjcTeamWorkerLifecycle = {
-		worker: worker.id,
-		lifecycle_state: parseGjcTeamWorkerLifecycleState(rawLifecycle?.lifecycle_state),
-		worker_status_state: parseGjcWorkerStatusState(workerStatus.state),
-		pane_id: worker.pane_id ?? rawLifecycle?.pane_id,
-		updated_at: rawLifecycle?.updated_at ?? workerStatus.updated_at ?? now(),
-	};
-	if (typeof rawLifecycle?.pid === "number") lifecycle.pid = rawLifecycle.pid;
-	else if (typeof heartbeat?.pid === "number") lifecycle.pid = heartbeat.pid;
-	if (rawLifecycle?.started_at) lifecycle.started_at = rawLifecycle.started_at;
-	if (rawLifecycle?.stopped_at) lifecycle.stopped_at = rawLifecycle.stopped_at;
-	if (rawLifecycle?.stop_reason) lifecycle.stop_reason = rawLifecycle.stop_reason;
-	if (rawLifecycle?.shutdown_request_id) lifecycle.shutdown_request_id = rawLifecycle.shutdown_request_id;
-	if (rawLifecycle?.shutdown_requested_at) lifecycle.shutdown_requested_at = rawLifecycle.shutdown_requested_at;
-	if (
-		rawLifecycle?.shutdown_mode === "graceful" ||
-		rawLifecycle?.shutdown_mode === "force" ||
-		rawLifecycle?.shutdown_mode === "abort"
-	)
-		lifecycle.shutdown_mode = rawLifecycle.shutdown_mode;
-	if (typeof shutdownAck?.acknowledged_at === "string")
-		lifecycle.shutdown_acknowledged_at = shutdownAck.acknowledged_at;
-	if (typeof shutdownAck?.status === "string") lifecycle.shutdown_ack_status = shutdownAck.status;
-	return lifecycle;
-}
-
-async function readWorkerLifecycleById(
+const readWorkerLifecycleById = (dir: string, config: GjcTeamConfig) => readLifecycleById(workerRuntime, dir, config);
+const writeWorkerLifecycleForConfig = (
 	dir: string,
 	config: GjcTeamConfig,
-): Promise<Record<string, GjcTeamWorkerLifecycle>> {
-	const entries = await Promise.all(config.workers.map(worker => readWorkerLifecycleRecord(dir, worker)));
-	return Object.fromEntries(entries.map(entry => [entry.worker, entry]));
-}
-
-async function writeWorkerLifecycleRecord(
-	dir: string,
-	worker: GjcTeamWorker,
-	lifecycleState: GjcTeamWorkerLifecycleState,
-	updates: Partial<GjcTeamWorkerLifecycle> = {},
-): Promise<GjcTeamWorkerLifecycle> {
-	const current = await readWorkerLifecycleRecord(dir, worker);
-	const next: GjcTeamWorkerLifecycle = {
-		...current,
-		...updates,
-		worker: worker.id,
-		lifecycle_state: lifecycleState,
-		worker_status_state: current.worker_status_state,
-		pane_id: updates.pane_id ?? worker.pane_id ?? current.pane_id,
-		updated_at: now(),
-	};
-	await writeJsonFile(workerLifecyclePath(dir, worker.id), next);
-	return next;
-}
-
-async function writeWorkerLifecycleForConfig(
-	dir: string,
-	config: GjcTeamConfig,
-	lifecycleState: GjcTeamWorkerLifecycleState,
+	state: GjcTeamWorkerLifecycleState,
 	updatesFor: (worker: GjcTeamWorker) => Partial<GjcTeamWorkerLifecycle> = () => ({}),
-): Promise<Record<string, GjcTeamWorkerLifecycle>> {
-	const entries = await Promise.all(
-		config.workers.map(worker => writeWorkerLifecycleRecord(dir, worker, lifecycleState, updatesFor(worker))),
-	);
-	return Object.fromEntries(entries.map(entry => [entry.worker, entry]));
-}
+) => writeLifecycleForConfig(workerRuntime, dir, config, state, updatesFor);
+
+const workerOrchestrationRuntime: GjcTeamWorkerOrchestrationRuntime = {
+	...workerRuntime,
+	readTasks,
+	withTaskMutation: (dir, fn) => withGjcTeamTaskMutation(taskStore(dir), fn),
+	appendTelemetry,
+	paneBelongsToTeamTarget,
+	parseDurationEnv,
+	parseHeartbeatStaleMs,
+	killWorkerPanes,
+	removeCleanCreatedWorktrees,
+	readMonitorSnapshot: dir => readJsonFile<GjcTeamMonitorSnapshot>(monitorSnapshotPath(dir)),
+	hasPendingIntegration: hasPendingGjcTeamIntegration,
+	writePhase,
+	readSnapshot: readGjcTeamSnapshot,
+};
 
 function teamModeStatePath(cwd: string, sessionId: string): string {
 	return modeStatePath(cwd, sessionId, "team");
@@ -1196,7 +2124,9 @@ function teamModeStatePath(cwd: string, sessionId: string): string {
 export async function persistGjcTeamModeStateSummary(snapshot: GjcTeamSnapshot, cwd = process.cwd()): Promise<void> {
 	const active = snapshot.phase !== "complete" && snapshot.phase !== "cancelled";
 	const updatedAt = now();
-	const sessionId = resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
+	const sessionId = resolveGjcSessionForWrite(cwd, {
+		envSessionId: process.env.GJC_SESSION_ID,
+	}).gjcSessionId;
 	const statePath = teamModeStatePath(cwd, sessionId);
 	await writeWorkflowEnvelopeAtomic(
 		statePath,
@@ -1219,25 +2149,24 @@ export async function persistGjcTeamModeStateSummary(snapshot: GjcTeamSnapshot, 
 				sessionId,
 				nowIso: updatedAt,
 			},
-			audit: { category: "state", verb: "sync-team-summary", owner: "gjc-runtime", skill: "team", sessionId },
+			audit: {
+				category: "state",
+				verb: "sync-team-summary",
+				owner: "gjc-runtime",
+				skill: "team",
+				sessionId,
+			},
 		},
 	);
-	await writeSessionActivityMarker(cwd, sessionId, { writer: "team-runtime", path: statePath });
+	await writeSessionActivityMarker(cwd, sessionId, {
+		writer: "team-runtime",
+		path: statePath,
+	});
 }
 
-function appendLivenessRecoveryReason(
-	reasons: GjcTeamLivenessRecoveryReason[],
-	reason: GjcTeamLivenessRecoveryReason,
-): void {
-	if (!reasons.includes(reason)) reasons.push(reason);
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value != null;
 }
-
-function isPastTimestamp(value: string | undefined): boolean {
-	if (!value) return false;
-	const timestamp = Date.parse(value);
-	return Number.isFinite(timestamp) && timestamp <= Date.now();
-}
-
 function readClaimRecord(value: unknown): GjcTeamTaskClaim | undefined {
 	if (!isRecord(value)) return undefined;
 	const owner = typeof value.owner === "string" ? value.owner : "";
@@ -1247,162 +2176,17 @@ function readClaimRecord(value: unknown): GjcTeamTaskClaim | undefined {
 	return { owner, token, leased_until: leasedUntil };
 }
 
-function isWorkerHeartbeatStale(
-	worker: GjcTeamWorker,
-	heartbeat: WorkerHeartbeatFile | null,
-	env: NodeJS.ProcessEnv,
-): boolean {
-	const thresholdMs = parseDurationEnv(env, "GJC_TEAM_HEARTBEAT_STALE_MS", 120_000);
-	if (thresholdMs <= 0) return false;
-	const heartbeatAt = Date.parse(heartbeat?.last_turn_at ?? worker.last_heartbeat);
-	return Number.isFinite(heartbeatAt) && Date.now() - heartbeatAt >= thresholdMs;
-}
-
-async function detectGjcTeamWorkerLivenessReasons(
-	dir: string,
-	config: GjcTeamConfig,
-	worker: GjcTeamWorker,
-	env: NodeJS.ProcessEnv,
-): Promise<GjcTeamLivenessRecoveryReason[]> {
-	const reasons: GjcTeamLivenessRecoveryReason[] = [];
-	const lifecycle = await readWorkerLifecycleRecord(dir, worker);
-	const heartbeat = await readJsonFile<WorkerHeartbeatFile>(path.join(workerDir(dir, worker.id), "heartbeat.json"));
-	if (lifecycle.lifecycle_state === "failed") appendLivenessRecoveryReason(reasons, "worker_lifecycle_failed");
-	if (lifecycle.lifecycle_state === "stopped") appendLivenessRecoveryReason(reasons, "worker_lifecycle_stopped");
-	if (isWorkerHeartbeatStale(worker, heartbeat, env)) appendLivenessRecoveryReason(reasons, "stale_heartbeat");
-	if (!config.dry_run && (!worker.pane_id?.startsWith("%") || !paneBelongsToTeamTarget(config, worker.pane_id)))
-		appendLivenessRecoveryReason(reasons, "missing_pane");
-	return reasons;
-}
-
-async function reconcileGjcTeamStaleClaims(
-	teamName: string,
-	dir: string,
-	config: GjcTeamConfig,
-	env: NodeJS.ProcessEnv,
-): Promise<GjcTeamLivenessRecoveryResult> {
-	const staleWorkers: Record<string, GjcTeamLivenessRecoveryReason[]> = {};
-	for (const worker of config.workers) {
-		const reasons = await detectGjcTeamWorkerLivenessReasons(dir, config, worker, env);
-		if (reasons.length === 0) continue;
-		staleWorkers[worker.id] = reasons;
-		if (reasons.includes("missing_pane") && reasons.includes("worker_lifecycle_stopped") === false) {
-			await writeWorkerLifecycleRecord(dir, worker, "failed", { stop_reason: "pane_missing" });
-		}
-	}
-
-	const recoveredClaims: GjcTeamRecoveredClaim[] = [];
-	for (const task of await readTasks(dir)) {
-		if (task.status === "completed" || task.status === "failed") continue;
-		const claimPath = path.join(dir, "claims", `${task.id}.json`);
-		const diskClaim = readClaimRecord(await readJsonFile<unknown>(claimPath));
-		const claim = task.claim ?? diskClaim;
-		if (!claim) continue;
-
-		const reasons = [...(staleWorkers[claim.owner] ?? [])];
-		if (isPastTimestamp(claim.leased_until)) appendLivenessRecoveryReason(reasons, "claim_expired");
-		if (reasons.length === 0) continue;
-
-		await fs.rm(claimPath, { force: true });
-		recoveredClaims.push({ task_id: task.id, worker: claim.owner, reasons });
-		if (task.status !== "in_progress") {
-			await appendEvent(dir, {
-				type: "task_claim_recovered",
-				task_id: task.id,
-				worker: claim.owner,
-				message: "Removed stale task claim file",
-				data: { reasons },
-			});
-			continue;
-		}
-
-		const recoveredTask = normalizeTask({
-			...task,
-			status: "pending",
-			assignee: undefined,
-			claim: undefined,
-			version: task.version + 1,
-			updated_at: now(),
-		});
-		await writeTask(dir, recoveredTask);
-		await appendEvent(dir, {
-			type: "task_claim_recovered",
-			task_id: task.id,
-			worker: claim.owner,
-			message: "Recovered task from stale worker claim",
-			data: { reasons },
-		});
-	}
-
-	if (recoveredClaims.length > 0)
-		await appendTelemetry(dir, {
-			type: "team_liveness_recovery",
-			message: `Recovered ${recoveredClaims.length} stale team task claim(s)`,
-			data: { team_name: teamName, recovered_claims: recoveredClaims },
-		});
-
-	return { recovered_claims: recoveredClaims, stale_workers: staleWorkers };
-}
-
 export async function recoverGjcTeamStaleClaims(
 	teamName: string,
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<GjcTeamLivenessRecoveryResult> {
 	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	return reconcileGjcTeamStaleClaims(teamName, dir, config, env);
+	return withGjcTeamTaskMutation(taskStore(dir), async capability => {
+		const config = await readConfig(dir);
+		return reconcileGjcTeamStaleClaimsUnlocked(workerOrchestrationRuntime, teamName, dir, config, env, capability);
+	});
 }
-function normalizeOptionalTaskString(value: unknown): string | undefined {
-	if (typeof value !== "string") return undefined;
-	const trimmed = value.trim();
-	return trimmed || undefined;
-}
-
-function normalizeOptionalTaskStringArray(value: unknown): string[] | undefined {
-	if (!Array.isArray(value)) return undefined;
-	const items = Array.from(
-		new Set(value.map(item => (typeof item === "string" ? item.trim() : "")).filter(item => item.length > 0)),
-	).sort();
-	return items.length > 0 ? items : undefined;
-}
-type GjcTeamTaskMetadataInput = Partial<
-	Pick<GjcTeamTask, "owner" | "lane" | "required_role" | "allowed_roles" | "depends_on" | "blocked_by">
->;
-
-function taskMetadataFromInput(input: Record<string, unknown>, includeOwner = false): GjcTeamTaskMetadataInput {
-	const metadata: GjcTeamTaskMetadataInput = {};
-	const owner = normalizeOptionalTaskString(input.owner);
-	const lane = normalizeOptionalTaskString(input.lane);
-	const requiredRole = normalizeOptionalTaskString(input.required_role ?? input.requiredRole);
-	const allowedRoles = normalizeOptionalTaskStringArray(input.allowed_roles ?? input.allowedRoles);
-	const dependsOn = normalizeOptionalTaskStringArray(input.depends_on ?? input.dependsOn);
-	const blockedBy = normalizeOptionalTaskStringArray(input.blocked_by ?? input.blockedBy);
-	if (includeOwner && owner) metadata.owner = owner;
-	if (lane) metadata.lane = lane;
-	if (requiredRole) metadata.required_role = requiredRole;
-	if (allowedRoles) metadata.allowed_roles = allowedRoles;
-	if (dependsOn) metadata.depends_on = dependsOn;
-	if (blockedBy) metadata.blocked_by = blockedBy;
-	return metadata;
-}
-
-function normalizeTask(raw: GjcTeamTask): GjcTeamTask {
-	const status = raw.status === ("complete" as GjcTeamTaskStatus) ? "completed" : raw.status;
-	return {
-		...raw,
-		status,
-		subject: raw.subject ?? raw.title,
-		description: raw.description ?? raw.objective,
-		title: raw.title ?? raw.subject,
-		objective: raw.objective ?? raw.description,
-		version: raw.version ?? 1,
-		lane: normalizeOptionalTaskString(raw.lane),
-		required_role: normalizeOptionalTaskString(raw.required_role),
-		allowed_roles: normalizeOptionalTaskStringArray(raw.allowed_roles),
-	};
-}
-
 const GJC_TEAM_INTEGRATION_ATTENTION_STATUSES = new Set<GjcTeamIntegrationStatus>([
 	"integration_failed",
 	"merge_conflict",
@@ -1447,218 +2231,6 @@ async function resolveGjcTeamSnapshotPhase(
 	return (await hasPendingGjcTeamIntegration(dir, config, monitor)) ? "awaiting_integration" : storedPhase;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value != null;
-}
-const GJC_TEAM_COMPLETION_EVIDENCE_SUMMARY_MAX = 4_000;
-const GJC_TEAM_COMPLETION_EVIDENCE_OUTPUT_MAX = 8_000;
-const GJC_TEAM_COMMAND_EVIDENCE_STATUSES = new Set<GjcTeamTaskCompletionEvidenceStatus>([
-	"passed",
-	"failed",
-	"not_run",
-]);
-const GJC_TEAM_VERIFICATION_EVIDENCE_STATUSES = new Set<GjcTeamTaskCompletionEvidenceStatus>(["verified", "rejected"]);
-
-function completionEvidenceError(taskId: string, field: string): Error {
-	return new Error(`invalid_completion_evidence:${taskId}:${field}`);
-}
-
-function trimRequiredCompletionEvidenceString(
-	taskId: string,
-	field: string,
-	value: unknown,
-	maxLength = GJC_TEAM_COMPLETION_EVIDENCE_SUMMARY_MAX,
-): string {
-	if (typeof value !== "string") throw completionEvidenceError(taskId, field);
-	const trimmed = value.trim();
-	if (!trimmed || trimmed.length > maxLength) throw completionEvidenceError(taskId, field);
-	return trimmed;
-}
-
-function trimOptionalCompletionEvidenceString(
-	taskId: string,
-	field: string,
-	value: unknown,
-	maxLength = GJC_TEAM_COMPLETION_EVIDENCE_OUTPUT_MAX,
-): string | undefined {
-	if (value == null) return undefined;
-	if (typeof value !== "string") throw completionEvidenceError(taskId, field);
-	const trimmed = value.trim();
-	if (!trimmed) return undefined;
-	if (trimmed.length > maxLength) throw completionEvidenceError(taskId, field);
-	return trimmed;
-}
-
-function normalizeGjcTeamCompletionEvidenceStatus(
-	taskId: string,
-	kind: GjcTeamTaskCompletionEvidenceKind,
-	value: unknown,
-): GjcTeamTaskCompletionEvidenceStatus {
-	const status = trimRequiredCompletionEvidenceString(taskId, "items.status", value);
-	const allowed = kind === "command" ? GJC_TEAM_COMMAND_EVIDENCE_STATUSES : GJC_TEAM_VERIFICATION_EVIDENCE_STATUSES;
-	if (!allowed.has(status as GjcTeamTaskCompletionEvidenceStatus))
-		throw completionEvidenceError(taskId, "items.status");
-	return status as GjcTeamTaskCompletionEvidenceStatus;
-}
-
-function normalizeGjcTeamCompletionEvidenceItem(taskId: string, value: unknown): GjcTeamTaskCompletionEvidenceItem {
-	if (!isRecord(value) || Array.isArray(value)) throw completionEvidenceError(taskId, "items");
-	const kind = trimRequiredCompletionEvidenceString(taskId, "items.kind", value.kind);
-	if (kind !== "command" && kind !== "inspection" && kind !== "artifact")
-		throw completionEvidenceError(taskId, "items.kind");
-	const status = normalizeGjcTeamCompletionEvidenceStatus(taskId, kind, value.status);
-	const item: GjcTeamTaskCompletionEvidenceItem = {
-		kind,
-		status,
-		summary: trimRequiredCompletionEvidenceString(taskId, "items.summary", value.summary),
-	};
-	const command = trimOptionalCompletionEvidenceString(taskId, "items.command", value.command);
-	const artifact = trimOptionalCompletionEvidenceString(taskId, "items.artifact", value.artifact);
-	const location = trimOptionalCompletionEvidenceString(taskId, "items.location", value.location);
-	const output = trimOptionalCompletionEvidenceString(taskId, "items.output", value.output);
-	if (kind === "command" && !command) throw completionEvidenceError(taskId, "items.command");
-	if (command) item.command = command;
-	if (artifact) item.artifact = artifact;
-	if (location) item.location = location;
-	if (output) item.output = output;
-	return item;
-}
-
-function normalizeGjcTeamCompletionEvidenceFiles(taskId: string, value: unknown): string[] | undefined {
-	if (value == null) return undefined;
-	if (!Array.isArray(value)) throw completionEvidenceError(taskId, "files");
-	const files = new Set<string>();
-	for (const entry of value) {
-		if (typeof entry !== "string") throw completionEvidenceError(taskId, "files");
-		const filePath = entry.trim().replace(/\\/g, "/");
-		if (!filePath || filePath.includes("\0") || path.isAbsolute(filePath) || filePath.split("/").includes("..")) {
-			throw completionEvidenceError(taskId, "files");
-		}
-		files.add(filePath);
-	}
-	return files.size > 0 ? [...files].sort() : undefined;
-}
-
-function isGjcTeamCompletionEvidenceItemVerified(item: GjcTeamTaskCompletionEvidenceItem): boolean {
-	return (
-		(item.kind === "command" && item.status === "passed") ||
-		((item.kind === "inspection" || item.kind === "artifact") && item.status === "verified")
-	);
-}
-
-function normalizeGjcTeamTaskCompletionEvidence(
-	taskId: string,
-	owner: string,
-	input: unknown,
-	recordedAt = now(),
-): GjcTeamTaskCompletionEvidence {
-	if (!isRecord(input) || Array.isArray(input)) throw new Error(`completion_evidence_required:${taskId}`);
-	const itemsValue = input.items;
-	if (!Array.isArray(itemsValue) || itemsValue.length === 0) throw completionEvidenceError(taskId, "items");
-	const items = itemsValue.map(item => normalizeGjcTeamCompletionEvidenceItem(taskId, item));
-	if (!items.some(isGjcTeamCompletionEvidenceItemVerified))
-		throw new Error(`completion_evidence_no_verified_item:${taskId}`);
-	const evidence: GjcTeamTaskCompletionEvidence = {
-		summary: trimRequiredCompletionEvidenceString(taskId, "summary", input.summary),
-		items,
-		recorded_by: owner,
-		recorded_at: recordedAt,
-	};
-	const files = normalizeGjcTeamCompletionEvidenceFiles(taskId, input.files);
-	const notes = trimOptionalCompletionEvidenceString(taskId, "notes", input.notes);
-	if (files) evidence.files = files;
-	if (notes) evidence.notes = notes;
-	return evidence;
-}
-
-function getGjcTeamTaskCompletionEvidenceFailure(task: GjcTeamTask): string | null {
-	if (task.status !== "completed") return `task_not_completed:${task.id}`;
-	const evidence = task.completion_evidence;
-	if (!isRecord(evidence) || Array.isArray(evidence)) return `completion_evidence_required:${task.id}`;
-	if (typeof evidence.recorded_by !== "string" || evidence.recorded_by.trim().length === 0)
-		return `invalid_completion_evidence:${task.id}:recorded_by`;
-	if (typeof evidence.recorded_at !== "string" || evidence.recorded_at.trim().length === 0)
-		return `invalid_completion_evidence:${task.id}:recorded_at`;
-	try {
-		normalizeGjcTeamTaskCompletionEvidence(task.id, evidence.recorded_by.trim(), evidence, evidence.recorded_at);
-		return null;
-	} catch (error) {
-		return error instanceof Error ? error.message : `invalid_completion_evidence:${task.id}:unknown`;
-	}
-}
-
-function isGjcTeamTaskCompletionVerified(task: GjcTeamTask): boolean {
-	return getGjcTeamTaskCompletionEvidenceFailure(task) == null;
-}
-function roleValuesForWorker(worker: GjcTeamWorker): Set<string> {
-	return new Set([worker.role, worker.agent_type].map(value => value.trim()).filter(value => value.length > 0));
-}
-
-function getGjcTeamTaskClaimEligibilityReason(
-	task: GjcTeamTask,
-	worker: GjcTeamWorker,
-	tasks: GjcTeamTask[],
-): string | null {
-	if (task.status !== "pending") return `task_not_pending:${task.id}`;
-	if (task.owner && task.owner !== worker.id) return `task_owner_mismatch:${task.id}:${task.owner}`;
-	if (task.assignee && task.assignee !== worker.id) return `task_assignee_mismatch:${task.id}:${task.assignee}`;
-
-	const workerRoles = roleValuesForWorker(worker);
-	if (task.required_role && !workerRoles.has(task.required_role))
-		return `task_role_mismatch:${task.id}:${task.required_role}`;
-	if (task.allowed_roles?.length && !task.allowed_roles.some(role => workerRoles.has(role)))
-		return `task_role_mismatch:${task.id}:${task.allowed_roles.join(",")}`;
-
-	if (task.blocked_by?.length) return `task_blocked:${task.id}:${task.blocked_by.join(",")}`;
-	for (const dependencyId of task.depends_on ?? []) {
-		const dependency = tasks.find(candidate => candidate.id === dependencyId);
-		if (!dependency || !isGjcTeamTaskCompletionVerified(dependency))
-			return `task_dependency_incomplete:${task.id}:${dependencyId}`;
-	}
-
-	return null;
-}
-
-async function getActiveClaimReason(dir: string, task: GjcTeamTask): Promise<string | null> {
-	const claimPath = path.join(dir, "claims", `${task.id}.json`);
-	const diskClaim = readClaimRecord(await readJsonFile<unknown>(claimPath));
-	const claim = task.claim ?? diskClaim;
-	if (!claim || isPastTimestamp(claim.leased_until)) return null;
-	return `task_already_claimed:${task.id}`;
-}
-function isGjcTeamTaskRecord(value: unknown): value is GjcTeamTask {
-	return (
-		isRecord(value) &&
-		typeof value.id === "string" &&
-		typeof value.status === "string" &&
-		(isGjcTeamTaskStatus(value.status) || value.status === "complete") &&
-		(typeof value.subject === "string" || typeof value.title === "string") &&
-		(typeof value.description === "string" || typeof value.objective === "string")
-	);
-}
-function isGjcTeamTaskFile(entry: { isFile(): boolean; name: string }): boolean {
-	return entry.isFile() && entry.name.endsWith(".json") && !entry.name.endsWith(".evidence.json");
-}
-
-async function readTasks(dir: string): Promise<GjcTeamTask[]> {
-	try {
-		const entries = await fs.readdir(path.join(dir, "tasks"), { withFileTypes: true });
-		const tasks = await Promise.all(
-			entries.filter(isGjcTeamTaskFile).map(entry => readJsonFile<unknown>(path.join(dir, "tasks", entry.name))),
-		);
-		return tasks
-			.filter(isGjcTeamTaskRecord)
-			.map(normalizeTask)
-			.sort((a, b) => a.id.localeCompare(b.id));
-	} catch (error) {
-		if (isEnoent(error)) return [];
-		throw error;
-	}
-}
-async function writeTask(dir: string, task: GjcTeamTask): Promise<void> {
-	await writeJsonFile(taskPath(dir, task.id), normalizeTask(task));
-}
-
 async function findTeamDir(
 	teamName: string,
 	cwd = process.cwd(),
@@ -1697,12 +2269,44 @@ function sanitizePathToken(value: string): string {
 	return sanitizeName(value) || "default";
 }
 function runGitResult(cwd: string, args: string[]): GitResult {
-	const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	const result = Bun.spawnSync(["git", ...args], {
+		cwd,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
 	return {
 		ok: result.exitCode === 0,
 		stdout: result.stdout.toString().trim(),
 		stderr: result.stderr.toString().trim(),
 	};
+}
+async function runGitResultAsync(cwd: string, args: string[], signal?: AbortSignal): Promise<GitResult> {
+	const result = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	const kill = () => {
+		try {
+			result.kill("SIGKILL");
+		} catch {}
+	};
+	if (signal?.aborted) kill();
+	else signal?.addEventListener("abort", kill, { once: true });
+	try {
+		const [exitCode, stdout, stderr] = await Promise.all([
+			result.exited,
+			new Response(result.stdout).text(),
+			new Response(result.stderr).text(),
+		]);
+		return {
+			ok: exitCode === 0 && !signal?.aborted,
+			stdout: stdout.trim(),
+			stderr: signal?.aborted ? "worker integration request aborted" : stderr.trim(),
+		};
+	} finally {
+		signal?.removeEventListener("abort", kill);
+	}
+}
+async function tryRunGitAsync(cwd: string, args: string[], signal?: AbortSignal): Promise<string | null> {
+	const result = await runGitResultAsync(cwd, args, signal);
+	return result.ok ? result.stdout : null;
 }
 function runGit(cwd: string, args: string[]): string {
 	const result = runGitResult(cwd, args);
@@ -1717,7 +2321,10 @@ function isGitRepository(cwd: string): boolean {
 	return tryRunGit(cwd, ["rev-parse", "--show-toplevel"]) != null;
 }
 
-function parseWorktreeMode(args: string[]): { mode: GjcTeamWorktreeMode; remainingArgs: string[] } {
+function parseWorktreeMode(args: string[]): {
+	mode: GjcTeamWorktreeMode;
+	remainingArgs: string[];
+} {
 	let mode: GjcTeamWorktreeMode = { enabled: false };
 	const remainingArgs: string[] = [];
 	for (let index = 0; index < args.length; index += 1) {
@@ -1778,18 +2385,41 @@ function findWorktreePath(repoRoot: string, worktreePath: string): string | null
 		if (line.startsWith("worktree ") && path.resolve(line.slice("worktree ".length)) === resolved) return resolved;
 	return null;
 }
+export function resolveWorkerWorktreePath(input: {
+	repoRoot: string;
+	stateDir: string;
+	teamName: string;
+	workerId: string;
+	platform: NodeJS.Platform;
+	isPsmux: boolean;
+}): string {
+	if (input.platform === "win32" && input.isPsmux) {
+		const slug = stableHash([input.repoRoot, input.stateDir, input.teamName].join("\0")).slice(0, 12);
+		return path.join(getWorktreesDir(), `team-${slug}-${input.workerId}`);
+	}
+	return path.join(input.stateDir, "worktrees", input.workerId);
+}
 async function ensureWorkerWorktree(
 	cwd: string,
 	dir: string,
 	teamName: string,
 	worker: GjcTeamWorker,
 	mode: GjcTeamWorktreeMode,
+	platform: NodeJS.Platform,
+	isPsmux: boolean,
 ): Promise<GjcTeamWorker> {
 	if (!mode.enabled) return worker;
 	if (!isGitRepository(cwd)) throw new Error(`team_worktree_requires_git_repo:${cwd}`);
 	const repoRoot = runGit(cwd, ["rev-parse", "--show-toplevel"]);
 	const baseRef = runGit(repoRoot, ["rev-parse", "HEAD"]);
-	const worktreePath = path.join(dir, "worktrees", worker.id);
+	const worktreePath = resolveWorkerWorktreePath({
+		repoRoot,
+		stateDir: dir,
+		teamName,
+		workerId: worker.id,
+		platform,
+		isPsmux,
+	});
 	const existing = findWorktreePath(repoRoot, worktreePath);
 	let created = false;
 	const branchName = mode.detached
@@ -1857,16 +2487,25 @@ function tagTmuxSessionAsGjcLeader(tmuxCommand: string, sessionName: string): bo
 function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEnv): GjcTmuxLeaderContext {
 	if (Bun.which(tmuxCommand) === null)
 		throw new Error(buildTeamTmuxLeaderRequirementMessage(`tmux_not_installed:${tmuxCommand}`));
-	const paneTarget = env.TMUX_PANE?.trim();
-	const args = paneTarget
-		? ["display-message", "-p", "-t", paneTarget, "#S:#I #{pane_id}"]
+	// Prefer the explicit GJC-managed session name propagated by `gjc --tmux`
+	// (GJC_TMUX_ACTIVE_SESSION). Under psmux on Windows the inherited TMUX_PANE
+	// can resolve to the wrong/default session, so querying the tagged session
+	// by name is authoritative for GJC-launched leaders. Fall back to TMUX_PANE,
+	// then to the ambient session, to keep native tmux/WSL flows unchanged.
+	const activeSession = env[GJC_TMUX_ACTIVE_SESSION_ENV]?.trim();
+	const displayTarget = activeSession ? buildGjcTmuxExactOptionTarget(activeSession, { env }) : env.TMUX_PANE?.trim();
+	const args = displayTarget
+		? ["display-message", "-p", "-t", displayTarget, "#S:#I #{pane_id}"]
 		: ["display-message", "-p", "#S:#I #{pane_id}"];
-	const result = Bun.spawnSync([tmuxCommand, ...args], { stdout: "pipe", stderr: "pipe" });
+	const result = Bun.spawnSync([tmuxCommand, ...args], {
+		stdout: "pipe",
+		stderr: "pipe",
+	});
 	if (result.exitCode !== 0) {
 		// Distinguish "you are not inside any tmux session" from a genuine tmux
 		// query failure so the caller gets actionable guidance instead of raw
 		// tmux stderr. `gjc team` needs a tmux leader; outside tmux there is none.
-		const insideTmux = Boolean(env.TMUX?.trim() || env.TMUX_PANE?.trim());
+		const insideTmux = Boolean(env.TMUX?.trim() || env.TMUX_PANE?.trim() || activeSession);
 		const stderr = result.stderr.toString().trim();
 		throw new Error(
 			buildTeamTmuxLeaderRequirementMessage(
@@ -1894,8 +2533,41 @@ function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEn
 				),
 			);
 	}
-	return { sessionName, windowIndex, leaderPaneId, target: `${sessionName}:${windowIndex}` };
+	return {
+		sessionName,
+		windowIndex,
+		leaderPaneId,
+		target: `${sessionName}:${windowIndex}`,
+	};
 }
+function isBunVirtualPath(candidate: string | undefined): boolean {
+	const normalized = candidate?.trim().replace(/\\/g, "/").toLowerCase();
+	return (
+		normalized === "/$bunfs" ||
+		normalized?.startsWith("/$bunfs/") === true ||
+		normalized === "b:/~bun" ||
+		normalized?.startsWith("b:/~bun/") === true
+	);
+}
+
+function isAbsoluteRealPath(candidate: string | undefined, pathModule: typeof path): candidate is string {
+	const normalized = candidate?.trim();
+	return Boolean(normalized && !isBunVirtualPath(normalized) && pathModule.isAbsolute(normalized));
+}
+function isGjcExecutablePath(candidate: string | undefined, pathModule: typeof path): candidate is string {
+	return isAbsoluteRealPath(candidate, pathModule) && /^gjc(?:[._-]|$)/i.test(pathModule.basename(candidate.trim()));
+}
+
+function formatWorkerExecutable(platform: NodeJS.Platform, executable: string): string {
+	return (platform === "win32" ? powershellQuote : shellQuote)(executable);
+}
+
+function unresolvedWorkerAuthorityError(): Error {
+	return new Error(
+		"Unable to determine the GJC worker executable from this invocation. Set GJC_TEAM_WORKER_COMMAND to the exact GJC command, or launch GJC from a real executable path instead of a Bun virtual path.",
+	);
+}
+
 export function resolveGjcWorkerCommand(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
@@ -1904,56 +2576,41 @@ export function resolveGjcWorkerCommand(
 	execPath = process.execPath,
 ): string {
 	const explicit = env.GJC_TEAM_WORKER_COMMAND?.trim();
-	if (explicit) return explicit;
-	const entrypoint = argv[1];
-	if (!entrypoint) return "gjc";
-	const pathModule = platform === "win32" ? path.win32 : path;
-	const resolvedEntrypoint = pathModule.isAbsolute(entrypoint) ? entrypoint : pathModule.resolve(cwd, entrypoint);
-	if (platform === "win32") {
-		if (entrypoint.endsWith(".ts") || entrypoint.endsWith(".js") || entrypoint.endsWith(".mjs"))
-			return `${powershellQuote(execPath)} ${powershellQuote(resolvedEntrypoint)}`;
-		if (pathModule.basename(entrypoint).startsWith("gjc")) return powershellQuote(resolvedEntrypoint);
-		return "gjc";
+	if (explicit) {
+		if (isBunVirtualPath(explicit)) throw unresolvedWorkerAuthorityError();
+		return explicit;
 	}
-	if (entrypoint.endsWith(".ts")) return `${shellQuote(execPath)} ${shellQuote(resolvedEntrypoint)}`;
-	if (path.basename(entrypoint).startsWith("gjc")) return shellQuote(path.resolve(cwd, entrypoint));
-	return "gjc";
+
+	const pathModule = platform === "win32" ? path.win32 : path.posix;
+	const runtime = argv[0]?.trim();
+	const entrypoint = argv[1]?.trim();
+	const sourceEntrypoint = entrypoint && !isBunVirtualPath(entrypoint) && /\.(?:[cm]?[jt]s)$/i.test(entrypoint);
+
+	if (sourceEntrypoint) {
+		const sourceRuntime = isAbsoluteRealPath(runtime, pathModule)
+			? runtime
+			: isAbsoluteRealPath(execPath, pathModule)
+				? execPath.trim()
+				: undefined;
+		if (!sourceRuntime) throw unresolvedWorkerAuthorityError();
+		const absoluteEntrypoint = pathModule.isAbsolute(entrypoint) ? entrypoint : pathModule.resolve(cwd, entrypoint);
+		if (!isAbsoluteRealPath(absoluteEntrypoint, pathModule)) throw unresolvedWorkerAuthorityError();
+		return `${formatWorkerExecutable(platform, sourceRuntime)} ${formatWorkerExecutable(platform, absoluteEntrypoint)}`;
+	}
+
+	const executable =
+		(isGjcExecutablePath(entrypoint, pathModule) ? entrypoint : undefined) ??
+		(isGjcExecutablePath(execPath, pathModule) ? execPath.trim() : undefined) ??
+		(isGjcExecutablePath(runtime, pathModule) ? runtime : undefined);
+	if (!executable) throw unresolvedWorkerAuthorityError();
+	return formatWorkerExecutable(platform, executable);
 }
-/** @internal Exported for unit tests. */
-export function buildWorkerCommand(
-	config: GjcTeamConfig,
-	worker: GjcTeamWorker,
-	platform: NodeJS.Platform = process.platform,
-): string {
-	const quote = platform === "win32" ? powershellQuote : shellQuote;
-	const envAssignment = (key: string, value: string): string =>
-		platform === "win32" ? `$env:${key} = ${quote(value)};` : `${key}=${quote(value)}`;
-	const workspace = worker.worktree_path
-		? `Worker worktree: ${worker.worktree_path}.`
-		: `Worker cwd: ${config.leader.cwd}.`;
-	const prompt = [
-		`You are ${worker.id} in gjc team ${config.team_name}.`,
-		`Team state root: ${config.state_root}.`,
-		workspace,
-		`Team brief (context only): ${config.task}`,
-		"Before implementation, claim your worker-owned task and treat the claimed task record as the source of truth. Do not implement directly from the broad team brief.",
-		`Before claiming work, send startup ACK: gjc team api worker-startup-ack --input '{"team_name":"${config.team_name}","worker_id":"${worker.id}","protocol_version":"1"}' --json.`,
-		`Use gjc team api update-worker-status to report task-local activity, then claim-task/transition-task-status with this worker id; keep heartbeat current during long work, record completion_evidence (summary plus a passed command or verified inspection/artifact item) before completed, and do not mutate leader-owned goal state.`,
-	].join("\n");
-	const envLines = [
-		envAssignment("GJC_TEAM_WORKER", `${config.team_name}/${worker.id}`),
-		envAssignment("GJC_TEAM_INTERNAL_WORKER", `${config.team_name}/${worker.id}`),
-		envAssignment("GJC_TEAM_NAME", config.team_name),
-		envAssignment("GJC_TEAM_WORKER_ID", worker.id),
-		envAssignment("GJC_TEAM_STATE_ROOT", config.state_root),
-		envAssignment("GJC_TEAM_LEADER_CWD", config.leader.cwd),
-		envAssignment("GJC_TEAM_DISPLAY_NAME", config.display_name),
-		...(worker.worktree_path ? [envAssignment("GJC_TEAM_WORKTREE_PATH", worker.worktree_path)] : []),
-	];
-	const joined = platform === "win32" ? envLines.join(" ") : envLines.join(" ");
-	const invocation = platform === "win32" ? `& ${config.worker_command}` : config.worker_command;
-	return `${joined} ${invocation} ${quote(prompt)}`;
+export { buildWorkerCommand } from "./team-launch";
+
+function shouldDispatchWorkerWithSendKeys(tmuxCommand: string, platform: NodeJS.Platform = process.platform): boolean {
+	return platform === "win32" || path.basename(tmuxCommand).toLowerCase() === "psmux";
 }
+
 interface GjcTeamInitialLane {
 	label: string;
 	title: string;
@@ -2048,7 +2705,11 @@ async function startTmuxSession(
 	dryRun: boolean,
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<GjcTeamWorker[]> {
-	if (dryRun) return config.workers.map(worker => ({ ...worker, pane_id: `%dry-run-${worker.id}` }));
+	if (dryRun)
+		return config.workers.map(worker => ({
+			...worker,
+			pane_id: `%dry-run-${worker.id}`,
+		}));
 	const rollbackPaneIds: string[] = [];
 	try {
 		const workers: GjcTeamWorker[] = [];
@@ -2056,24 +2717,25 @@ async function startTmuxSession(
 		for (const worker of config.workers) {
 			const splitDirection: string = worker.index === 1 ? "-h" : "-v";
 			const splitTarget: string =
-				worker.index === 1 ? config.leader.pane_id : (rightStackRootPaneId ?? config.leader.pane_id);
-			const split: Bun.SyncSubprocess<"pipe", "pipe"> = Bun.spawnSync(
-				[
-					config.tmux_command,
-					"split-window",
-					splitDirection,
-					"-t",
-					splitTarget,
-					"-d",
-					"-P",
-					"-F",
-					"#{pane_id}",
-					"-c",
-					worker.worktree_path ?? config.leader.cwd,
-					buildWorkerCommand(config, worker),
-				],
-				{ stdout: "pipe", stderr: "pipe" },
-			);
+				worker.index === 1 ? config.tmux_target : (rightStackRootPaneId ?? config.tmux_target);
+			const workerCommand = buildWorkerCommand(config, worker);
+			const workerCwd = worker.worktree_path ?? config.leader.cwd;
+			const useSendKeysFallback = shouldDispatchWorkerWithSendKeys(config.tmux_command);
+			const splitArgs = [
+				config.tmux_command,
+				"split-window",
+				splitDirection,
+				"-t",
+				splitTarget,
+				"-d",
+				"-P",
+				"-F",
+				"#{pane_id}",
+				"-c",
+				workerCwd,
+				...(useSendKeysFallback ? [] : [workerCommand]),
+			];
+			const split: Bun.SyncSubprocess<"pipe", "pipe"> = Bun.spawnSync(splitArgs, { stdout: "pipe", stderr: "pipe" });
 			if (split.exitCode !== 0)
 				throw new Error(split.stderr.toString().trim() || `tmux_split_failed:${config.tmux_target}:${worker.id}`);
 			const paneId: string = split.stdout.toString().trim().split(/\r?\n/)[0]?.trim() ?? "";
@@ -2081,6 +2743,31 @@ async function startTmuxSession(
 			rollbackPaneIds.push(paneId);
 			if (worker.index === 1) rightStackRootPaneId = paneId;
 			workers.push({ ...worker, pane_id: paneId });
+			if (useSendKeysFallback) {
+				// On psmux/ConPTY (Windows pwsh default-shell) panes, tmux writes the
+				// split-window command argv to the new pane's stdin but pwsh's readline
+				// never receives an Enter, so the worker never starts. Create the pane
+				// without a command, then dispatch the worker command through send-keys +
+				// Enter so it actually executes.
+				// Two-step dispatch because tmux's `-l` (literal mode) flag is global per
+				// send-keys invocation, not per arg: passing `-l <body> Enter` would treat
+				// "Enter" as literal text too. Sending the body in literal mode first and
+				// the Enter keypress second keeps the body verbatim while still submitting
+				// the prompt as a keystroke.
+				Bun.spawnSync([config.tmux_command, "send-keys", "-l", "-t", paneId, workerCommand], {
+					stdout: "ignore",
+					stderr: "ignore",
+				});
+				const sendKeys = Bun.spawnSync([config.tmux_command, "send-keys", "-t", paneId, "Enter"], {
+					stdout: "ignore",
+					stderr: "ignore",
+				});
+				// void-cast the exit code so the linter does not flag an unused expression;
+				// the value is intentionally discarded here because the actual spawn outcome
+				// is recovered by the leader through the worker startup-ack watcher, not via
+				// the spawn exit code.
+				void sendKeys.exitCode;
+			}
 		}
 		Bun.spawnSync([config.tmux_command, "select-layout", "-t", config.tmux_target, "main-vertical"], {
 			stdout: "ignore",
@@ -2128,24 +2815,42 @@ async function startTmuxSession(
 		await appendTelemetry(dir, {
 			type: "tmux_started",
 			message: "Started gjc team worker panes in current tmux window",
-			data: { tmux_target: config.tmux_target, panes: workers.map(worker => worker.pane_id).filter(Boolean) },
+			data: {
+				tmux_target: config.tmux_target,
+				panes: workers.map(worker => worker.pane_id).filter(Boolean),
+			},
 		});
 		return workers;
 	} catch (error) {
 		for (const paneId of rollbackPaneIds)
-			Bun.spawnSync([config.tmux_command, "kill-pane", "-t", paneId], { stdout: "ignore", stderr: "ignore" });
+			Bun.spawnSync([config.tmux_command, "kill-pane", "-t", paneId], {
+				stdout: "ignore",
+				stderr: "ignore",
+			});
 		throw error;
 	}
 }
+function probePaneTeamTarget(
+	config: GjcTeamConfig,
+	paneId: string,
+): { exists: boolean; belongsToTeamTarget: boolean; pid?: number } {
+	if (paneId === config.leader.pane_id) return { exists: true, belongsToTeamTarget: false };
+	const result = Bun.spawnSync(
+		[config.tmux_command, "display-message", "-p", "-t", paneId, "#S:#I #{pane_id} #{pane_pid}"],
+		{ stdout: "pipe", stderr: "ignore" },
+	);
+	if (result.exitCode !== 0) return { exists: false, belongsToTeamTarget: false };
+	const [target = "", detectedPaneId = "", rawPid = ""] = result.stdout.toString().trim().split(/\s+/);
+	const pid = Number(rawPid);
+	return {
+		exists: true,
+		belongsToTeamTarget: target === config.tmux_target && detectedPaneId === paneId,
+		pid: Number.isInteger(pid) && pid > 0 ? pid : undefined,
+	};
+}
+
 function paneBelongsToTeamTarget(config: GjcTeamConfig, paneId: string): boolean {
-	if (paneId === config.leader.pane_id) return false;
-	const result = Bun.spawnSync([config.tmux_command, "display-message", "-p", "-t", paneId, "#S:#I #{pane_id}"], {
-		stdout: "pipe",
-		stderr: "ignore",
-	});
-	if (result.exitCode !== 0) return false;
-	const [target = "", detectedPaneId = ""] = result.stdout.toString().trim().split(/\s+/);
-	return target === config.tmux_target && detectedPaneId === paneId;
+	return probePaneTeamTarget(config, paneId).belongsToTeamTarget;
 }
 function killWorkerPanes(config: GjcTeamConfig): void {
 	for (const worker of config.workers)
@@ -2184,7 +2889,9 @@ function commitHygieneLedgerPath(config: GjcTeamConfig): string {
 	return path.join(
 		sessionReportsDir(
 			config.leader_cwd,
-			resolveGjcSessionForWrite(config.leader_cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId,
+			resolveGjcSessionForWrite(config.leader_cwd, {
+				envSessionId: process.env.GJC_SESSION_ID,
+			}).gjcSessionId,
 		),
 		"team-commit-hygiene",
 		`${config.team_name}.ledger.json`,
@@ -2197,7 +2904,12 @@ function integrationNowState(
 }
 async function appendIntegrationReport(
 	dir: string,
-	entry: { worker: string; operation: "merge" | "cherry-pick" | "rebase"; files: string[]; detail: string },
+	entry: {
+		worker: string;
+		operation: "merge" | "cherry-pick" | "rebase";
+		files: string[];
+		detail: string;
+	},
 ): Promise<void> {
 	const line = `- [${now()}] ${entry.worker}: ${entry.operation}; files=${entry.files.join(",") || "unknown"}; ${entry.detail}\n`;
 	if (await pathExists(integrationReportPath(dir)))
@@ -2216,14 +2928,23 @@ async function appendIntegrationReport(
 async function appendCommitHygieneEntries(config: GjcTeamConfig, entries: GjcTeamCommitHygieneEntry[]): Promise<void> {
 	if (entries.length === 0) return;
 	const ledgerPath = commitHygieneLedgerPath(config);
-	const existing = (await readJsonFile<{ version: number; entries: GjcTeamCommitHygieneEntry[] }>(ledgerPath)) ?? {
+	const existing = (await readJsonFile<{
+		version: number;
+		entries: GjcTeamCommitHygieneEntry[];
+	}>(ledgerPath)) ?? {
 		version: 1,
 		entries: [],
 	};
-	await writeJsonFile(ledgerPath, { version: 1, entries: [...existing.entries, ...entries] });
+	await writeJsonFile(ledgerPath, {
+		version: 1,
+		entries: [...existing.entries, ...entries],
+	});
 }
 function resolveHead(cwd: string): string | null {
 	return tryRunGit(cwd, ["rev-parse", "HEAD"]);
+}
+async function resolveHeadAsync(cwd: string, signal?: AbortSignal): Promise<string | null> {
+	return tryRunGitAsync(cwd, ["rev-parse", "HEAD"], signal);
 }
 function isAncestor(cwd: string, ancestor: string, descendant: string): boolean {
 	return runGitResult(cwd, ["merge-base", "--is-ancestor", ancestor, descendant]).ok;
@@ -2244,6 +2965,14 @@ function listConflictFiles(cwd: string): string[] {
 		.map(line => line.trim())
 		.filter(Boolean);
 }
+async function listConflictFilesAsync(cwd: string, signal?: AbortSignal): Promise<string[]> {
+	const result = await runGitResultAsync(cwd, ["diff", "--name-only", "--diff-filter=U"], signal);
+	if (!result.ok || !result.stdout) return [];
+	return result.stdout
+		.split(/\r?\n/)
+		.map(line => line.trim())
+		.filter(Boolean);
+}
 
 export type GjcWorkerCheckpointClassification =
 	| { kind: "clean"; files: string[] }
@@ -2253,32 +2982,43 @@ export type GjcWorkerCheckpointClassification =
 	| { kind: "git_error"; files: string[]; detail: string };
 
 const UNMERGED_GIT_STATUS_CODES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]);
-const PROTECTED_WORKER_CHECKPOINT_PREFIXES = [
-	".gjc/_session-*/state/",
-	".gjc/_session-*/logs/",
-	".gjc/_session-*/reports/",
-	".gjc/_session-*/runtime/",
-	".gjc/_session-*/ultragoal/",
-	".gjc/_session-*/plans/",
-	".gjc/_session-*/specs/",
-	".gjc/_session-*/rlm/",
-	".gjc/_session-*/audit/",
-];
+// Every generated/runtime artifact for a GJC session lives under
+// `.gjc/_session-{id}/...` (see session-layout.ts), so worker auto-checkpoints
+// exclude the whole session subtree instead of enumerating its subdirectories.
+// The enumerated form drifted: subtrees outside the list (for example the
+// extragoal gate receipts from docs/extragoal-skill-template.md, or the
+// session-root `.session-activity.json` marker) were auto-committed and merged
+// into the leader branch on projects that do not gitignore `.gjc/_session-*/`.
+const PROTECTED_WORKER_CHECKPOINT_PREFIXES = [".gjc/_session-*/"];
 
-function parsePorcelainStatusFiles(stdout: string): string[] {
-	return stdout
-		.split(/\r?\n/)
-		.map(line => line.trimEnd())
-		.filter(Boolean)
-		.map(line => line.slice(3).trim())
-		.filter(Boolean);
+function parsePorcelainStatus(stdout: string): { files: string[]; statusCodes: string[] } {
+	const records = stdout.split("\0");
+	const files: string[] = [];
+	const statusCodes: string[] = [];
+	for (let index = 0; index < records.length; index++) {
+		const record = records[index];
+		if (!record) continue;
+		const statusCode = record.slice(0, 2);
+		const file = record.slice(3);
+		if (!file) continue;
+		statusCodes.push(statusCode);
+		files.push(file);
+		if (statusCode.includes("R") || statusCode.includes("C")) {
+			const source = records[++index];
+			if (source) files.push(source);
+		}
+	}
+	return { files: [...new Set(files)], statusCodes };
 }
 
 function normalizeGitStatusPath(filePath: string): string {
 	return (filePath.split(" -> ").at(-1) ?? filePath).replace(/\\/g, "/").replace(/^\.\//, "");
 }
 
-export function classifyGjcTeamCheckpointFiles(files: string[]): { eligible: string[]; protected: string[] } {
+export function classifyGjcTeamCheckpointFiles(files: string[]): {
+	eligible: string[];
+	protected: string[];
+} {
 	const eligible: string[] = [];
 	const protectedFiles: string[] = [];
 	for (const file of files) {
@@ -2295,19 +3035,52 @@ export function classifyGjcTeamCheckpointFiles(files: string[]): { eligible: str
 }
 
 export function classifyWorkerCheckpointStatus(cwd: string): GjcWorkerCheckpointClassification {
-	const status = runGitResult(cwd, ["status", "--porcelain", "-uall"]);
+	const status = runGitResult(cwd, ["status", "--porcelain=v1", "-z", "-uall"]);
 	if (!status.ok) {
-		return { kind: "git_error", files: [], detail: status.stderr || status.stdout || "git status failed" };
+		return {
+			kind: "git_error",
+			files: [],
+			detail: status.stderr || status.stdout || "git status failed",
+		};
 	}
 	if (!status.stdout.trim()) return { kind: "clean", files: [] };
-	const files = parsePorcelainStatusFiles(status.stdout);
-	const hasUnmergedStatus = status.stdout
-		.split(/\r?\n/)
-		.filter(Boolean)
-		.some(line => UNMERGED_GIT_STATUS_CODES.has(line.slice(0, 2)));
+	const parsed = parsePorcelainStatus(status.stdout);
+	const files = parsed.files;
+	const hasUnmergedStatus = parsed.statusCodes.some(code => UNMERGED_GIT_STATUS_CODES.has(code));
 	const conflictFiles = listConflictFiles(cwd);
 	if (hasUnmergedStatus || conflictFiles.length > 0) {
-		return { kind: "conflicted", files: conflictFiles.length > 0 ? conflictFiles : files };
+		return {
+			kind: "conflicted",
+			files: conflictFiles.length > 0 ? conflictFiles : files,
+		};
+	}
+	const classified = classifyGjcTeamCheckpointFiles(files);
+	if (classified.eligible.length === 0 && classified.protected.length > 0)
+		return { kind: "protected_only", files: classified.protected };
+	return { kind: "eligible", files: classified.eligible };
+}
+export async function classifyWorkerCheckpointStatusAsync(
+	cwd: string,
+	signal?: AbortSignal,
+): Promise<GjcWorkerCheckpointClassification> {
+	const status = await runGitResultAsync(cwd, ["status", "--porcelain=v1", "-z", "-uall"], signal);
+	if (!status.ok) {
+		return {
+			kind: "git_error",
+			files: [],
+			detail: status.stderr || status.stdout || "git status failed",
+		};
+	}
+	if (!status.stdout.trim()) return { kind: "clean", files: [] };
+	const parsed = parsePorcelainStatus(status.stdout);
+	const files = parsed.files;
+	const hasUnmergedStatus = parsed.statusCodes.some(code => UNMERGED_GIT_STATUS_CODES.has(code));
+	const conflictFiles = await listConflictFilesAsync(cwd, signal);
+	if (hasUnmergedStatus || conflictFiles.length > 0) {
+		return {
+			kind: "conflicted",
+			files: conflictFiles.length > 0 ? conflictFiles : files,
+		};
 	}
 	const classified = classifyGjcTeamCheckpointFiles(files);
 	if (classified.eligible.length === 0 && classified.protected.length > 0)
@@ -2369,7 +3142,11 @@ function autoCommitDirtyWorker(worker: GjcTeamWorker): {
 	const message = `gjc(team): auto-checkpoint ${worker.id} [${worker.assigned_tasks[0] ?? "unknown"}]`;
 	if (!runGitResult(worker.worktree_path, ["commit", "--no-verify", "-m", message]).ok)
 		return { ...empty, classification };
-	return { committed: true, commit: resolveHead(worker.worktree_path), classification };
+	return {
+		committed: true,
+		commit: resolveHead(worker.worktree_path),
+		classification,
+	};
 }
 function workerMergeRef(worker: GjcTeamWorker, workerHead: string): string {
 	if (!worker.worktree_path) return workerHead;
@@ -2475,7 +3252,10 @@ async function integrateGjcWorkerCommits(
 						detail: "Leader created a runtime merge commit to integrate worker history.",
 					});
 				} else {
-					integrationByWorker[worker.id] = { ...state, ...integrationNowState("integration_failed") };
+					integrationByWorker[worker.id] = {
+						...state,
+						...integrationNowState("integration_failed"),
+					};
 					hygieneEntries.push({
 						recorded_at: now(),
 						operation: "integration_merge",
@@ -2594,7 +3374,10 @@ async function integrateGjcWorkerCommits(
 			}
 			const newLeaderHead = resolveHead(leaderCwd);
 			if (!newLeaderHead || newLeaderHead === leaderHead) {
-				integrationByWorker[worker.id] = { ...state, ...integrationNowState("integration_failed") };
+				integrationByWorker[worker.id] = {
+					...state,
+					...integrationNowState("integration_failed"),
+				};
 				hygieneEntries.push({
 					recorded_at: now(),
 					operation: "integration_cherry_pick",
@@ -2763,151 +3546,43 @@ async function integrateGjcWorkerCommits(
 	return integrationByWorker;
 }
 
-async function initializeStateDirs(dir: string, workers: GjcTeamWorker[]): Promise<void> {
-	// Empty mailbox directories are runtime state, so they must exist before messages arrive.
-	await fs.mkdir(path.join(dir, "mailbox"), { recursive: true });
-	for (const worker of workers) {
-		await fs.mkdir(mailboxDirPath(dir, worker.id), { recursive: true });
-		await writeJsonFile(mailboxPath(dir, worker.id), { messages: [] });
-		await writeJsonFile(path.join(workerDir(dir, worker.id), "status.json"), { state: "idle", updated_at: now() });
-		await writeJsonFile(workerLifecyclePath(dir, worker.id), {
-			worker: worker.id,
-			lifecycle_state: "starting",
-			worker_status_state: "idle",
-			updated_at: now(),
-		} satisfies GjcTeamWorkerLifecycle);
-		await writeJsonFile(path.join(workerDir(dir, worker.id), "heartbeat.json"), {
-			pid: 0,
-			last_turn_at: now(),
-			turn_count: 0,
-			alive: true,
-		});
-	}
-	// Empty leader mailbox directory is runtime state, so it must exist before messages arrive.
-	await fs.mkdir(mailboxDirPath(dir, "leader-fixed"), { recursive: true });
-	await writeJsonFile(mailboxPath(dir, "leader-fixed"), { messages: [] });
-}
+const writeInitialGjcTeamTask = (dir: string, task: GjcTeamTask) =>
+	withGjcTeamTaskMutation(taskStore(dir), capability => capability.writeRecovered(task));
 
 export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTeamSnapshot> {
-	const cwd = options.cwd ?? process.cwd();
-	const env = options.env ?? process.env;
-	if (!Number.isInteger(options.workerCount) || options.workerCount < 1 || options.workerCount > GJC_TEAM_MAX_WORKERS)
-		throw new Error(`invalid_team_worker_count:${options.workerCount}:expected_1_${GJC_TEAM_MAX_WORKERS}`);
-	const workerCliPlan = resolveGjcTeamWorkerCliPlan(options.workerCount, env);
-	const stateRoot = resolveGjcTeamStateRoot(cwd, env);
-	const teamName = sanitizeName(options.teamName ?? makeTeamName(options.task, env));
-	const displayName = sanitizeName(options.teamName ?? options.task).slice(0, 30) || teamName;
-	const dir = teamDir(stateRoot, teamName);
-	const createdAt = now();
-	const worktreeMode = resolveDefaultWorktreeMode(options.worktreeMode);
-	const tmuxCommand = resolveGjcTmuxCommand(env);
-	const tmuxContext = options.dryRun
-		? { sessionName: "dry-run", windowIndex: "0", leaderPaneId: "%dry-run-leader", target: "dry-run:0" }
-		: readCurrentTmuxLeaderContext(tmuxCommand, env);
-	const initialWorkers = buildWorkers(options.workerCount, options.agentType, stateRoot);
-	const initialTasks = buildInitialTasks(options.task, initialWorkers);
-	const workers: GjcTeamWorker[] = [];
-	try {
-		for (const worker of initialWorkers)
-			workers.push(options.dryRun ? worker : await ensureWorkerWorktree(cwd, dir, teamName, worker, worktreeMode));
-	} catch (error) {
-		await rollbackCreatedWorktrees(workers);
-		throw error;
-	}
-	const config: GjcTeamConfig = {
-		team_name: teamName,
-		display_name: displayName,
-		requested_name: options.teamName ?? displayName,
-		task: options.task,
-		agent_type: options.agentType,
-		worker_count: options.workerCount,
-		max_workers: GJC_TEAM_MAX_WORKERS,
-		state_root: stateRoot,
-		worker_command: resolveGjcWorkerCommand(cwd, env),
-		worker_cli_plan: workerCliPlan,
-		tmux_command: tmuxCommand,
-		tmux_session: tmuxContext.sessionName,
-		tmux_session_name: tmuxContext.sessionName,
-		tmux_target: tmuxContext.target,
-		workspace_mode: worktreeMode.enabled ? "worktree" : "direct",
-		dry_run: options.dryRun ?? false,
-		leader: { session_id: env.GJC_SESSION_ID ?? env.CODEX_SESSION_ID ?? "", pane_id: tmuxContext.leaderPaneId, cwd },
-		leader_cwd: cwd,
-		team_state_root: stateRoot,
-		workers,
-		created_at: createdAt,
-		updated_at: createdAt,
-	};
-	await initializeStateDirs(dir, config.workers);
-	await writeJsonFile(path.join(dir, "config.json"), config);
-	await writeJsonFile(path.join(dir, "manifest.v2.json"), {
-		version: 2,
-		team_name: config.team_name,
-		display_name: config.display_name,
-		requested_name: config.requested_name,
-		tmux_session: config.tmux_session,
-		tmux_session_name: config.tmux_session_name,
-		tmux_target: config.tmux_target,
-		worker_command: config.worker_command,
-		worker_cli_plan: config.worker_cli_plan,
-		tmux_command: config.tmux_command,
-		leader: config.leader,
-		workers: config.workers,
-		workspace_mode: config.workspace_mode,
-		dry_run: config.dry_run,
-		created_at: createdAt,
-		updated_at: createdAt,
-	});
-	await writePhase(dir, "starting");
-	for (const task of initialTasks) await writeTask(dir, task);
-	await appendEvent(dir, {
-		type: "team_started",
-		message: options.dryRun
-			? "Created native gjc team dry-run state without starting tmux workers"
-			: "Started native gjc team runtime",
-		data: {
-			worker_count: options.workerCount,
-			agent_type: options.agentType,
-			workspace_mode: config.workspace_mode,
-			dry_run: config.dry_run,
+	return startGjcTeamLaunch(
+		{
+			maxWorkers: GJC_TEAM_MAX_WORKERS,
+			resolveWorkerCliPlan: resolveGjcTeamWorkerCliPlan,
+			resolveStateRoot: resolveGjcTeamStateRoot,
+			sanitizeName,
+			makeTeamName,
+			teamDir,
+			resolveDefaultWorktreeMode,
+			resolveTmuxBinary: resolveGjcTmuxBinary,
+			readTmuxLeaderContext: readCurrentTmuxLeaderContext,
+			buildWorkers,
+			buildInitialTasks,
+			ensureWorkerWorktree,
+			rollbackCreatedWorktrees,
+			resolveWorkerCommand: resolveGjcWorkerCommand,
+			mailboxDirPath,
+			mailboxPath,
+			workerDir,
+			workerLifecyclePath,
+			writeJson: writeJsonFile,
+			now,
+			writePhase,
+			writeTask: writeInitialGjcTeamTask,
+			appendEvent,
+			appendTelemetry,
+			startTmuxSession,
+			killWorkerPanes,
+			writeWorkerLifecycleForConfig,
+			readSnapshot: readGjcTeamSnapshot,
 		},
-	});
-	await appendTelemetry(dir, {
-		type: "team_runtime",
-		message: options.dryRun ? "Native gjc team dry-run state initialized" : "Native gjc team runtime initialized",
-		data: {
-			state_root: stateRoot,
-			worker_command: config.worker_command,
-			worker_cli_plan: workerCliPlan,
-			workspace_mode: config.workspace_mode,
-			dry_run: config.dry_run,
-		},
-	});
-	let tmuxWorkers: GjcTeamWorker[];
-	try {
-		tmuxWorkers = await startTmuxSession(config, dir, options.dryRun ?? false, env);
-	} catch (error) {
-		await writePhase(dir, "failed");
-		await appendEvent(dir, {
-			type: "team_start_failed",
-			message: error instanceof Error ? error.message : String(error),
-		});
-		killWorkerPanes(config);
-		await rollbackCreatedWorktrees(config.workers);
-		throw error;
-	}
-	const runningConfig = {
-		...config,
-		workers: tmuxWorkers.map(worker => ({ ...worker, status: "idle" as const, last_heartbeat: now() })),
-		updated_at: now(),
-	};
-	await writeJsonFile(path.join(dir, "config.json"), runningConfig);
-	await writeWorkerLifecycleForConfig(dir, runningConfig, "starting", worker => ({
-		pane_id: worker.pane_id,
-		started_at: runningConfig.created_at,
-	}));
-	await writePhase(dir, "running");
-	return readGjcTeamSnapshot(teamName, cwd, env);
+		options,
+	);
 }
 
 export async function readGjcTeamSnapshot(
@@ -2932,8 +3607,8 @@ export async function readGjcTeamSnapshot(
 	const workerLifecycleById = await readWorkerLifecycleById(dir, config);
 	const notificationSummary =
 		options.reconcileNotifications === true
-			? await reconcileTeamNotifications(dir, config)
-			: summarizeNotifications(await listNotificationRecords(dir));
+			? await reconcileTeamNotifications(teamNotificationRuntime, dir, config)
+			: summarizeTeamNotifications(await listNotificationRecords(dir));
 	const phase = await resolveGjcTeamSnapshotPhase(dir, config, storedPhase, tasks, monitor);
 	return {
 		team_name: config.team_name,
@@ -2967,26 +3642,73 @@ function workerIntegrationFingerprint(head: string | null, classification: GjcWo
 export async function requestGjcWorkerIntegrationAttempt(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
+	options: GjcWorkerIntegrationAttemptOptions = {},
 ): Promise<GjcWorkerIntegrationAttemptRequestResult> {
 	const teamName = env.GJC_TEAM_NAME?.trim();
 	const worker = env.GJC_TEAM_WORKER_ID?.trim() || env.GJC_TEAM_INTERNAL_WORKER?.split("/").pop()?.trim();
 	if (!teamName || !worker) return { requested: false, reason: "not_worker" };
 	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
+	const config = await readConfigForWorkerIntegration(dir);
 	const configuredWorker = config.workers.find(candidate => candidate.id === worker);
 	const worktreePath = env.GJC_TEAM_WORKTREE_PATH?.trim() || configuredWorker?.worktree_path;
 	if (!worktreePath || !(await pathExists(worktreePath)))
-		return { requested: false, reason: "missing_worktree", worker, team_name: teamName };
-	const classification = classifyWorkerCheckpointStatus(worktreePath);
-	const head = resolveHead(worktreePath);
+		return {
+			requested: false,
+			reason: "missing_worktree",
+			worker,
+			team_name: teamName,
+		};
+	const [classification, head] = await Promise.all([
+		classifyWorkerCheckpointStatusAsync(worktreePath, options.signal),
+		resolveHeadAsync(worktreePath, options.signal),
+	]);
 	if (classification.kind === "git_error") {
+		const reportWorker = configuredWorker ?? {
+			id: worker,
+			name: worker,
+			index: 0,
+			agent_type: "unknown",
+			role: "unknown",
+			status: "idle",
+			last_heartbeat: now(),
+			assigned_tasks: [],
+		};
+		const detail = classification.detail;
+		await appendIntegrationEvent(dir, "worker_integration_attempt_failed", reportWorker, {
+			worker_name: worker,
+			worktree_path: worktreePath,
+			detail,
+			retryable: true,
+			summary: `retryable worker integration request failure for ${worker}: ${detail}`,
+		});
+		await notifyLeader(
+			config,
+			reportWorker,
+			`INTEGRATION RETRYABLE FAILURE: ${worker} git inspection failed (${detail}). A later turn can retry.`,
+			cwd,
+			env,
+		);
 		return { requested: false, reason: "git_error", worker, team_name: teamName, head, status: classification.kind };
 	}
 	if (classification.kind === "protected_only") {
-		return { requested: false, reason: "no_changes", worker, team_name: teamName, head, status: classification.kind };
+		return {
+			requested: false,
+			reason: "no_changes",
+			worker,
+			team_name: teamName,
+			head,
+			status: classification.kind,
+		};
 	}
 	if (classification.kind === "clean" && configuredWorker?.worktree_base_ref === head) {
-		return { requested: false, reason: "no_changes", worker, team_name: teamName, head, status: classification.kind };
+		return {
+			requested: false,
+			reason: "no_changes",
+			worker,
+			team_name: teamName,
+			head,
+			status: classification.kind,
+		};
 	}
 	const fingerprint = workerIntegrationFingerprint(head, classification);
 	const dedupePath = workerIntegrationDedupePath(dir, worker);
@@ -3012,7 +3734,12 @@ export async function requestGjcWorkerIntegrationAttempt(
 		type: "worker_integration_attempt_requested",
 		worker,
 		message: `Worker ${worker} requested leader integration attempt`,
-		data: { worker_name: worker, worker_head: head, status: classification.kind, files: classification.files },
+		data: {
+			worker_name: worker,
+			worker_head: head,
+			status: classification.kind,
+			files: classification.files,
+		},
 	});
 	await sendGjcTeamMessage(
 		teamName,
@@ -3062,6 +3789,403 @@ export async function buildTeamHudSummary(
 	});
 }
 
+const GJC_TEAM_AUTO_CONTINUE_STALLED_WORKERS_ENV = "GJC_TEAM_AUTO_CONTINUE_STALLED_WORKERS";
+const GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS = 5_000;
+
+async function validateGjcContinuationEligibility(
+	dir: string,
+	config: GjcTeamConfig,
+	worker: GjcTeamWorker,
+	task: GjcTeamTask,
+	heartbeatAt: string,
+	staleMs: number,
+	env: NodeJS.ProcessEnv,
+	reservedHoldUntil?: string,
+): Promise<string | null> {
+	const phase = await readContinuationJson<Record<string, unknown>>(path.join(dir, "phase.json"));
+	if (
+		phase?.current_phase !== "running" ||
+		typeof phase.updated_at !== "string" ||
+		!Number.isFinite(Date.parse(phase.updated_at))
+	)
+		return "invalid_or_absent_running_phase";
+	if (
+		!worker.pane_id ||
+		!/^%\d+$/.test(worker.pane_id) ||
+		worker.pane_id === config.leader.pane_id ||
+		!paneBelongsToTeamTarget(config, worker.pane_id)
+	)
+		return "invalid_pane_authority";
+	const shutdownAuthority = await readGjcShutdownAuthority(
+		workerRuntime,
+		path.join(workerDir(dir, worker.id), "shutdown-request.json"),
+	);
+	if (shutdownAuthority.state === "valid_present") return "shutdown_requested";
+	if (shutdownAuthority.state === "invalid_or_unreadable") return "invalid_shutdown_authority";
+	const heartbeat = await readWorkerHeartbeat(workerRuntime, config.team_name, worker.id, config.leader_cwd, env);
+	if (!heartbeat || heartbeat.last_turn_at !== heartbeatAt || currentTimeMs() - Date.parse(heartbeatAt) < staleMs)
+		return "heartbeat_changed";
+	const lifecycle = (await readLifecycleById(workerRuntime, dir, config))[worker.id];
+	const status = await readWorkerStatus(workerRuntime, config.team_name, worker.id, config.leader_cwd, env);
+	if (
+		(lifecycle?.lifecycle_state !== "ready" && lifecycle?.lifecycle_state !== "working") ||
+		!["idle", "working", "blocked", "done"].includes(status.state) ||
+		typeof status.updated_at !== "string" ||
+		!Number.isFinite(Date.parse(status.updated_at))
+	)
+		return "invalid_worker_lifecycle_or_status";
+	const inventory = await readGjcContinuationAuthorityInventory(dir);
+	if (!inventory.valid) return "invalid_authority_inventory";
+	const authority = selectGjcContinuationWorkerAuthority(inventory, worker.id);
+	if (
+		!authority.valid ||
+		authority.task.id !== task.id ||
+		authority.task.version !== task.version ||
+		authority.task.claim?.owner !== task.claim?.owner ||
+		authority.task.claim?.token !== task.claim?.token ||
+		authority.task.claim?.leased_until !== task.claim?.leased_until
+	)
+		return "claim_changed";
+	const leaseUntil = Date.parse(task.claim?.leased_until ?? "");
+	const holdUntil = reservedHoldUntil === undefined ? undefined : Date.parse(reservedHoldUntil);
+	if (!Number.isFinite(leaseUntil) || leaseUntil <= currentTimeMs()) return "invalid_or_expired_lease";
+	if (holdUntil !== undefined && (!Number.isFinite(holdUntil) || leaseUntil < holdUntil))
+		return "lease_does_not_cover_hold";
+	if (reservedHoldUntil !== undefined && shouldDispatchWorkerWithSendKeys(config.tmux_command))
+		return "unsupported_send_keys_transport";
+	return null;
+}
+function normalizeGjcContinuationDispatchError(value: unknown, fallback: string, maxLength: number): string {
+	try {
+		const normalized = String(value ?? "")
+			.replace(/(token|secret|password|authorization)\s*[:=]\s*\S+/gi, "$1=[redacted]")
+			.trim()
+			.slice(0, maxLength);
+		return normalized || fallback;
+	} catch {
+		return fallback;
+	}
+}
+
+function readGjcContinuationDispatchErrorField(error: unknown, field: "name" | "code" | "message"): unknown {
+	try {
+		return typeof error === "object" && error !== null ? (error as Record<string, unknown>)[field] : undefined;
+	} catch {
+		return undefined;
+	}
+}
+async function continueStalledGjcTeamWorkers(
+	dir: string,
+	config: GjcTeamConfig,
+	env: NodeJS.ProcessEnv,
+): Promise<void> {
+	if (env[GJC_TEAM_AUTO_CONTINUE_STALLED_WORKERS_ENV] !== "1" || config.dry_run) return;
+	const phase = await readContinuationJson<unknown>(path.join(dir, "phase.json"));
+
+	if (
+		typeof phase !== "object" ||
+		phase === null ||
+		Array.isArray(phase) ||
+		(phase as Record<string, unknown>).current_phase !== "running" ||
+		typeof (phase as Record<string, unknown>).updated_at !== "string" ||
+		!Number.isFinite(Date.parse(String((phase as Record<string, unknown>).updated_at)))
+	) {
+		await appendEvent(dir, {
+			type: "continuation_skipped",
+			message: "Continuation requires a valid running team phase record",
+			data: { reason: "invalid_or_absent_running_phase" },
+		});
+		return;
+	}
+	const staleMs = parseHeartbeatStaleMs(env);
+	if (staleMs <= 0) return;
+	const inventory = await readGjcContinuationAuthorityInventory(dir);
+	if (!inventory.valid) {
+		await appendEvent(dir, {
+			type: "continuation_skipped",
+			message: "Continuation requires a complete canonical task and claim authority inventory",
+			data: { reason: "invalid_authority_inventory" },
+		});
+		return;
+	}
+	for (const worker of config.workers) {
+		const heartbeat = await readWorkerHeartbeat(workerRuntime, config.team_name, worker.id, config.leader_cwd, env);
+		const heartbeatAt = Date.parse(heartbeat?.last_turn_at ?? "");
+		if (!heartbeat || !Number.isFinite(heartbeatAt) || currentTimeMs() - heartbeatAt < staleMs) continue;
+		if (!worker.pane_id || !/^%\d+$/.test(worker.pane_id) || worker.pane_id === config.leader.pane_id) continue;
+		if (!paneBelongsToTeamTarget(config, worker.pane_id)) continue;
+		const shutdownAuthority = await readGjcShutdownAuthority(
+			workerRuntime,
+			path.join(workerDir(dir, worker.id), "shutdown-request.json"),
+		);
+		if (shutdownAuthority.state !== "proven_absent") {
+			await appendEvent(dir, {
+				type: "continuation_skipped",
+				worker: worker.id,
+				message: "Continuation requires a readable absent shutdown authority record",
+				data: {
+					reason:
+						shutdownAuthority.state === "valid_present" ? "shutdown_requested" : "invalid_shutdown_authority",
+				},
+			});
+			continue;
+		}
+
+		const lifecycle = (await readLifecycleById(workerRuntime, dir, config))[worker.id];
+		const status = await readWorkerStatus(workerRuntime, config.team_name, worker.id, config.leader_cwd, env);
+		if (
+			(lifecycle?.lifecycle_state !== "ready" && lifecycle?.lifecycle_state !== "working") ||
+			!["idle", "working", "blocked", "done"].includes(status.state) ||
+			typeof status.updated_at !== "string" ||
+			!Number.isFinite(Date.parse(status.updated_at))
+		) {
+			await appendEvent(dir, {
+				type: "continuation_skipped",
+				worker: worker.id,
+				message: "Continuation requires valid worker lifecycle and status records",
+				data: { reason: "invalid_worker_lifecycle_or_status" },
+			});
+			continue;
+		}
+
+		const authority = selectGjcContinuationWorkerAuthority(inventory, worker.id);
+		if (!authority.valid) {
+			await appendEvent(dir, {
+				type: "continuation_skipped",
+				worker: worker.id,
+				message: "Continuation requires exactly one canonical current in-progress claim",
+				data: { reason: "invalid_claim_count", task_count: authority.taskCount, claim_count: authority.claimCount },
+			});
+			continue;
+		}
+		const task = authority.task;
+		const eligibilityReason = await validateGjcContinuationEligibility(
+			dir,
+			config,
+			worker,
+			task,
+			heartbeat.last_turn_at,
+			staleMs,
+			env,
+		);
+		if (eligibilityReason) {
+			await appendEvent(dir, {
+				type: "continuation_skipped",
+				worker: worker.id,
+				message: "Continuation eligibility changed or contains an invalid mutable record",
+				data: { reason: eligibilityReason },
+			});
+			continue;
+		}
+
+		const incident = stableHash(
+			[
+				config.team_name,
+				worker.id,
+				task.id,
+				task.claim.owner,
+				task.claim.token,
+				task.version,
+				heartbeat.last_turn_at,
+				worker.pane_id,
+				config.tmux_target,
+			].join(":"),
+		);
+		const journalDir = path.join(workerDir(dir, worker.id), "continuations", incident);
+		const firstReservationPath = path.join(journalDir, "attempt-01.reservation.json");
+		const firstOutcomePath = path.join(journalDir, "attempt-01.outcome.json");
+		const firstReservation = await readContinuationJson<Record<string, unknown>>(firstReservationPath);
+
+		const firstOutcome = await readContinuationJson<Record<string, unknown>>(firstOutcomePath);
+
+		let attempt = 1;
+		if (firstReservation) {
+			if (
+				!isValidGjcContinuationReservation(
+					firstReservation,
+					incident,
+					1,
+					config,
+					worker.id,
+					task,
+					task.claim,
+					heartbeat.last_turn_at,
+					worker.pane_id,
+				)
+			)
+				continue;
+			if (
+				!isValidGjcContinuationOutcome(firstOutcome, firstReservation, incident, 1) ||
+				firstOutcome.result !== "sent"
+			)
+				continue;
+			const firstHold = Date.parse(String(firstOutcome.hold_until));
+			const leaseUntil = Date.parse(task.claim.leased_until);
+			if (
+				!Number.isFinite(firstHold) ||
+				!Number.isFinite(leaseUntil) ||
+				leaseUntil < firstHold ||
+				currentTimeMs() < firstHold
+			)
+				continue;
+			if (await readContinuationJson(path.join(journalDir, "attempt-02.reservation.json"))) continue;
+
+			attempt = 2;
+		}
+		const holdMs = attempt === 1 ? 30_000 : 120_000;
+		const reservedAtMs = currentTimeMs();
+		const reservedAt = new Date(reservedAtMs).toISOString();
+		const holdUntil = new Date(reservedAtMs + holdMs).toISOString();
+		const leaseUntil = Date.parse(task.claim.leased_until);
+		if (!Number.isFinite(leaseUntil) || leaseUntil < Date.parse(holdUntil)) continue;
+		const reservation = {
+			schema_version: 1,
+			incident_hash: incident,
+			team_name: config.team_name,
+			worker: worker.id,
+			task_id: task.id,
+			owner: task.claim.owner,
+			claim_token: task.claim.token,
+			task_version: task.version,
+			leased_until: task.claim.leased_until,
+			heartbeat_at: heartbeat.last_turn_at,
+			pane_id: worker.pane_id,
+			tmux_target: config.tmux_target,
+			attempt,
+			reserved_at: reservedAt,
+			hold_until: holdUntil,
+			prompt_version: 1,
+			prompt_sha256: createHash("sha256").update(GJC_TEAM_CONTINUATION_PROMPT).digest("hex"),
+			dispatch_protocol: "tmux_command_sequence_v1",
+		};
+		const reservationPath = path.join(journalDir, `attempt-0${attempt}.reservation.json`);
+		try {
+			await createJsonNoClobber(
+				reservationPath,
+				reservation,
+				stateWriterOptions(reservationPath, "state", "continuation-reservation"),
+			);
+		} catch (error) {
+			if (error instanceof AlreadyExistsError) continue;
+			throw error;
+		}
+		let result: "sent" | "unknown" = "unknown";
+		let outcomeReason = "tmux_missing_exit_code";
+		let tmuxExitCode: number | undefined;
+		let tmuxError: { name: string; code?: string; message: string } | undefined;
+		let dispatchedAt: string | undefined;
+		let dispatchHoldUntil: string | undefined;
+		if (gjcTeamRuntimeTestSeams?.continuationBeforeDispatch)
+			await gjcTeamRuntimeTestSeams.continuationBeforeDispatch();
+		const revalidationReason = await validateGjcContinuationEligibility(
+			dir,
+			config,
+			worker,
+			task,
+			heartbeat.last_turn_at,
+			staleMs,
+			env,
+			new Date(currentTimeMs() + GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS + holdMs).toISOString(),
+		);
+		if (revalidationReason) {
+			const skippedPath = path.join(journalDir, `attempt-0${attempt}.outcome.json`);
+			await createJsonNoClobber(
+				skippedPath,
+				{
+					schema_version: 1,
+					incident_hash: incident,
+					attempt,
+					reservation_sha256: gjcContinuationReservationDigest(reservation),
+					recorded_at: now(),
+					result: "skipped",
+					reason: revalidationReason,
+				},
+				stateWriterOptions(skippedPath, "state", "continuation-outcome"),
+			);
+			return;
+		}
+		try {
+			const args = Object.freeze([
+				"send-keys",
+				"-l",
+				"-t",
+				worker.pane_id,
+				GJC_TEAM_CONTINUATION_PROMPT,
+				";",
+				"send-keys",
+				"-t",
+				worker.pane_id,
+				"Enter",
+			]);
+			const dispatch = gjcTeamRuntimeTestSeams?.continuationTmuxDispatch
+				? gjcTeamRuntimeTestSeams.continuationTmuxDispatch(config.tmux_command, args)
+				: Bun.spawnSync([config.tmux_command, ...args], {
+						stdout: "ignore",
+						stderr: "ignore",
+						timeout: GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS,
+					});
+			const dispatchAtMs = currentTimeMs();
+			tmuxExitCode = dispatch.exitCode;
+			if (dispatch.exitCode === 0) {
+				result = "sent";
+				outcomeReason = "tmux_sent";
+				dispatchedAt = new Date(dispatchAtMs).toISOString();
+				dispatchHoldUntil = new Date(dispatchAtMs + holdMs).toISOString();
+			} else if (typeof dispatch.exitCode === "number") {
+				outcomeReason = "tmux_nonzero_exit";
+			}
+		} catch (error) {
+			outcomeReason = "tmux_dispatch_threw";
+			const name = normalizeGjcContinuationDispatchError(
+				readGjcContinuationDispatchErrorField(error, "name"),
+				"Error",
+				120,
+			);
+			const code = normalizeGjcContinuationDispatchError(
+				readGjcContinuationDispatchErrorField(error, "code"),
+				"",
+				120,
+			);
+			tmuxError = {
+				name,
+				...(code ? { code } : {}),
+				message: normalizeGjcContinuationDispatchError(
+					readGjcContinuationDispatchErrorField(error, "message") ?? error,
+					"tmux_dispatch_error",
+					400,
+				),
+			};
+		}
+		const outcomePath = path.join(journalDir, `attempt-0${attempt}.outcome.json`);
+		try {
+			await createJsonNoClobber(
+				outcomePath,
+				{
+					schema_version: 1,
+					incident_hash: incident,
+					attempt,
+					reservation_sha256: gjcContinuationReservationDigest(reservation),
+					recorded_at: now(),
+					result,
+					reason: outcomeReason,
+					...(tmuxExitCode === undefined ? {} : { tmux_exit_code: tmuxExitCode }),
+					...(dispatchedAt === undefined || dispatchHoldUntil === undefined
+						? {}
+						: { dispatched_at: dispatchedAt, hold_until: dispatchHoldUntil }),
+					...(tmuxError ? { tmux_error: tmuxError } : {}),
+				},
+				stateWriterOptions(outcomePath, "state", "continuation-outcome"),
+			);
+		} catch (error) {
+			if (!(error instanceof AlreadyExistsError)) throw error;
+			const existing = await readContinuationJson<Record<string, unknown>>(outcomePath);
+			if (!isValidGjcContinuationOutcome(existing, reservation, incident, attempt))
+				throw new Error(`invalid_continuation_outcome:${incident}:${attempt}`);
+		}
+		return;
+	}
+}
+
 export async function monitorGjcTeam(
 	teamName: string,
 	cwd = process.cwd(),
@@ -3070,11 +4194,18 @@ export async function monitorGjcTeam(
 	const dir = await findTeamDir(teamName, cwd, env);
 	const config = await readConfig(dir);
 	const previous = await readJsonFile<GjcTeamMonitorSnapshot>(monitorSnapshotPath(dir));
-	await reconcileGjcTeamStaleClaims(teamName, dir, config, env);
+	await withGjcTeamTaskMutation(taskStore(dir), async capability => {
+		const config = await readConfig(dir);
+		await continueStalledGjcTeamWorkers(dir, config, env);
+		await reconcileGjcTeamStaleClaimsUnlocked(workerOrchestrationRuntime, teamName, dir, config, env, capability);
+		await computeLifecycleNudges(config, dir, cwd, env);
+	});
 	const integrationByWorker = await integrateGjcWorkerCommits(config, dir, previous, cwd, env);
-	await writeJsonFile(monitorSnapshotPath(dir), { integration_by_worker: integrationByWorker, updated_at: now() });
+	await writeJsonFile(monitorSnapshotPath(dir), {
+		integration_by_worker: integrationByWorker,
+		updated_at: now(),
+	});
 	await replayGjcTeamNotifications(teamName, cwd, env);
-	await computeLifecycleNudges(config, dir, cwd, env);
 	return readGjcTeamSnapshot(teamName, cwd, env);
 }
 export async function listGjcTeams(
@@ -3107,30 +4238,20 @@ async function writeGjcWorkerStartupAck(
 	env: NodeJS.ProcessEnv,
 	input: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	const teamWorker = findKnownWorker(config, worker);
-	const ack = {
-		worker,
-		pid: typeof input.pid === "number" ? input.pid : undefined,
-		session: typeof input.session === "string" ? input.session : undefined,
-		protocol_version: String(input.protocol_version ?? "1"),
-		ack_at: now(),
-	};
-	await writeJsonFile(path.join(workerDir(dir, worker), "startup-ack.json"), ack);
-	await writeWorkerLifecycleRecord(dir, teamWorker, "ready", {
-		pane_id: teamWorker.pane_id,
-		pid: typeof input.pid === "number" ? input.pid : undefined,
-		started_at: ack.ack_at,
-	});
-	await appendEvent(dir, { type: "worker_startup_ack", worker, message: `Worker ${worker} acknowledged startup` });
-	return ack;
+	return writeWorkerStartupAck(workerRuntime, teamName, worker, cwd, env, input);
 }
 function parseDurationEnv(env: NodeJS.ProcessEnv, name: string, fallbackMs: number): number {
 	const raw = env[name]?.trim();
 	if (!raw) return fallbackMs;
 	const parsed = Number(raw);
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallbackMs;
+}
+
+function parseHeartbeatStaleMs(env: NodeJS.ProcessEnv): number {
+	const raw = env.GJC_TEAM_HEARTBEAT_STALE_MS?.trim();
+	if (!raw) return 120_000;
+	const parsed = Number(raw);
+	return Number.isFinite(parsed) ? parsed : 120_000;
 }
 async function writeLifecycleNudge(
 	dir: string,
@@ -3161,7 +4282,12 @@ async function writeLifecycleNudge(
 		suggested_action: suggestedAction,
 		auto_action_taken: false,
 	};
-	await writeJsonFile(nudgePath, record);
+	try {
+		await writeJsonFile(nudgePath, record);
+	} catch (error) {
+		if (isEnoent(error)) return;
+		throw error;
+	}
 	await appendEvent(dir, {
 		type: "worker_lifecycle_nudge",
 		worker,
@@ -3187,10 +4313,16 @@ async function computeLifecycleNudges(
 	env: NodeJS.ProcessEnv,
 ): Promise<void> {
 	const startupGraceMs = parseDurationEnv(env, "GJC_TEAM_STARTUP_GRACE_MS", 30_000);
-	const heartbeatStaleMs = parseDurationEnv(env, "GJC_TEAM_HEARTBEAT_STALE_MS", 120_000);
+	const heartbeatStaleMs = parseHeartbeatStaleMs(env);
 	const createdAt = Date.parse(config.created_at);
 	const ageMs = Date.now() - (Number.isFinite(createdAt) ? createdAt : Date.now());
 	for (const worker of config.workers) {
+		try {
+			await fs.access(workerDir(dir, worker.id));
+		} catch (error) {
+			if (isEnoent(error)) continue;
+			throw error;
+		}
 		const ack = await readJsonFile<Record<string, unknown>>(path.join(workerDir(dir, worker.id), "startup-ack.json"));
 		if (!ack && ageMs >= startupGraceMs) {
 			await writeLifecycleNudge(
@@ -3207,7 +4339,7 @@ async function computeLifecycleNudges(
 			GJC_TEAM_STATE_ROOT: config.state_root,
 		});
 		const heartbeatAt = Date.parse(heartbeat?.last_turn_at ?? worker.last_heartbeat);
-		if (Number.isFinite(heartbeatAt) && Date.now() - heartbeatAt >= heartbeatStaleMs) {
+		if (heartbeatStaleMs > 0 && Number.isFinite(heartbeatAt) && Date.now() - heartbeatAt >= heartbeatStaleMs) {
 			await writeLifecycleNudge(
 				dir,
 				worker.id,
@@ -3236,87 +4368,13 @@ export async function shutdownGjcTeam(
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<GjcTeamSnapshot> {
 	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	const tasks = await readTasks(dir);
-	const evidenceFailures = tasks
-		.map(task => {
-			const reason = task.status === "completed" ? getGjcTeamTaskCompletionEvidenceFailure(task) : null;
-			return reason ? { task_id: task.id, reason } : null;
-		})
-		.filter((failure): failure is { task_id: string; reason: string } => failure != null);
-	const shutdownRequestId = `shutdown-${stableHash([config.team_name, now(), randomUUID()].join(":"))}`;
-	const shutdownRequestedAt = now();
-	await Promise.all(
-		config.workers.map(worker =>
-			writeGjcShutdownRequest(
-				teamName,
-				worker.id,
-				"leader-fixed",
-				cwd,
-				env,
-				shutdownRequestId,
-				"graceful",
-				shutdownRequestedAt,
-			),
-		),
-	);
-	const monitor = await readJsonFile<GjcTeamMonitorSnapshot>(monitorSnapshotPath(dir));
-	const completionVerified = tasks.length === 0 || tasks.every(isGjcTeamTaskCompletionVerified);
-	const pendingIntegration = completionVerified ? await hasPendingGjcTeamIntegration(dir, config, monitor) : false;
-	killWorkerPanes(config);
-	await removeCleanCreatedWorktrees(config.workers);
-	const stopped = {
-		...config,
-		workers: config.workers.map(worker => ({ ...worker, status: "stopped" as const, last_heartbeat: now() })),
-		updated_at: now(),
-	};
-	await writeJsonFile(path.join(dir, "config.json"), stopped);
-	await writeWorkerLifecycleForConfig(dir, stopped, "stopped", worker => ({
-		pane_id: worker.pane_id,
-		stopped_at: stopped.updated_at,
-		stop_reason: "graceful_shutdown",
-		shutdown_request_id: shutdownRequestId,
-		shutdown_requested_at: shutdownRequestedAt,
-		shutdown_mode: "graceful",
-	}));
-	const workerLifecycleById = await readWorkerLifecycleById(dir, stopped);
-	const gracefulShutdownComplete = stopped.workers.every(worker => {
-		const lifecycle = workerLifecycleById[worker.id];
-		return (
-			lifecycle?.lifecycle_state === "stopped" &&
-			lifecycle.shutdown_request_id === shutdownRequestId &&
-			lifecycle.shutdown_mode === "graceful"
-		);
+	return withGjcTeamMutationFence(dir, () => shutdownGjcTeamWorkers(workerOrchestrationRuntime, teamName, cwd, env));
+}
+
+function taskStore(dir: string): GjcTeamTaskStore {
+	return new GjcTeamTaskStore(dir, async event => {
+		await appendEvent(dir, event);
 	});
-	const shutdownPhase: GjcTeamPhase =
-		completionVerified && gracefulShutdownComplete
-			? pendingIntegration
-				? "awaiting_integration"
-				: "complete"
-			: evidenceFailures.length > 0 || tasks.some(task => task.status === "failed" || task.status === "blocked")
-				? "failed"
-				: "cancelled";
-	await writePhase(dir, shutdownPhase);
-	const shutdownData: Record<string, unknown> = {
-		phase: shutdownPhase,
-		shutdown_request_id: shutdownRequestId,
-		graceful_shutdown_complete: gracefulShutdownComplete,
-	};
-	if (evidenceFailures.length > 0) shutdownData.evidence_failures = evidenceFailures;
-	await appendEvent(dir, {
-		type: "team_shutdown",
-		message:
-			shutdownPhase === "complete"
-				? "Shut down native gjc team runtime after completed tasks"
-				: "Shut down native gjc team runtime with incomplete tasks",
-		data: shutdownData,
-	});
-	await appendTelemetry(dir, {
-		type: "team_shutdown",
-		message: `Native gjc team runtime stopped with phase ${shutdownPhase}`,
-		data: { shutdown_request_id: shutdownRequestId, graceful_shutdown_complete: gracefulShutdownComplete },
-	});
-	return readGjcTeamSnapshot(config.team_name, cwd, env);
 }
 
 export async function listGjcTeamTasks(
@@ -3324,7 +4382,7 @@ export async function listGjcTeamTasks(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<GjcTeamTask[]> {
-	return readTasks(await findTeamDir(teamName, cwd, env));
+	return taskStore(await findTeamDir(teamName, cwd, env)).list();
 }
 export async function readGjcTeamTask(
 	teamName: string,
@@ -3332,9 +4390,7 @@ export async function readGjcTeamTask(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<GjcTeamTask> {
-	const task = (await listGjcTeamTasks(teamName, cwd, env)).find(candidate => candidate.id === taskId);
-	if (!task) throw new Error(`task_not_found:${taskId}`);
-	return task;
+	return taskStore(await findTeamDir(teamName, cwd, env)).read(taskId);
 }
 export async function createGjcTeamTask(
 	teamName: string,
@@ -3345,32 +4401,14 @@ export async function createGjcTeamTask(
 	taskOptions: GjcTeamTaskMetadataInput = {},
 ): Promise<GjcTeamTask> {
 	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	if (taskOptions.owner) assertKnownWorker(config, taskOptions.owner);
-	const tasks = await readTasks(dir);
-	const next = tasks.length + 1;
-	const task: GjcTeamTask = {
-		id: `task-${next}`,
-		subject,
-		description,
-		title: subject,
-		objective: description,
-		status: "pending",
-		...(taskOptions.owner ? { owner: taskOptions.owner } : {}),
-		...(taskOptions.lane ? { lane: taskOptions.lane } : {}),
-		...(taskOptions.required_role ? { required_role: taskOptions.required_role } : {}),
-		...(taskOptions.allowed_roles ? { allowed_roles: taskOptions.allowed_roles } : {}),
-		...(taskOptions.depends_on ? { depends_on: taskOptions.depends_on } : {}),
-		...(taskOptions.blocked_by ? { blocked_by: taskOptions.blocked_by } : {}),
-		version: 1,
-		created_at: now(),
-		updated_at: now(),
-	};
-	await writeTask(dir, task);
-	config.updated_at = now();
-	await writeJsonFile(path.join(dir, "config.json"), config);
-	await appendEvent(dir, { type: "task_created", task_id: task.id, message: subject });
-	return task;
+	return withGjcTeamTaskMutation(taskStore(dir), async capability => {
+		const config = await readConfig(dir);
+		if (taskOptions.owner) assertKnownWorker(config, taskOptions.owner);
+		const task = await capability.create(subject, description, taskOptions);
+		config.updated_at = now();
+		await writeJsonFile(path.join(dir, "config.json"), config);
+		return task;
+	});
 }
 export async function updateGjcTeamTask(
 	teamName: string,
@@ -3385,18 +4423,7 @@ export async function updateGjcTeamTask(
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<GjcTeamTask> {
 	const dir = await findTeamDir(teamName, cwd, env);
-	const task = await readGjcTeamTask(teamName, taskId, cwd, env);
-	const updated = normalizeTask({
-		...task,
-		...updates,
-		title: updates.subject ?? task.title,
-		objective: updates.description ?? task.objective,
-		version: task.version + 1,
-		updated_at: now(),
-	});
-	await writeTask(dir, updated);
-	await appendEvent(dir, { type: "task_updated", task_id: taskId, message: updated.subject });
-	return updated;
+	return taskStore(dir).update(taskId, updates);
 }
 export async function claimGjcTeamTask(
 	teamName: string,
@@ -3406,68 +4433,28 @@ export async function claimGjcTeamTask(
 	taskId?: string,
 ): Promise<GjcTeamApiClaimResult> {
 	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	const teamWorker = findKnownWorker(config, workerId);
-	const livenessRecovery = await reconcileGjcTeamStaleClaims(teamName, dir, config, env);
-	const staleWorkerReasons = livenessRecovery.stale_workers[workerId];
-	if (staleWorkerReasons?.length)
-		return { ok: false, reason: `worker_not_live:${workerId}:${staleWorkerReasons.join(",")}` };
-	const tasks = await readTasks(dir);
-	const task = taskId
-		? tasks.find(candidate => candidate.id === taskId)
-		: tasks.find(candidate => getGjcTeamTaskClaimEligibilityReason(candidate, teamWorker, tasks) == null);
-	if (!task) return { ok: false, reason: taskId ? `task_not_found:${taskId}` : "no_pending_task" };
-	const eligibilityReason = getGjcTeamTaskClaimEligibilityReason(task, teamWorker, tasks);
-	if (eligibilityReason) return { ok: false, reason: eligibilityReason };
-	const activeClaimReason = await getActiveClaimReason(dir, task);
-	if (activeClaimReason) return { ok: false, reason: activeClaimReason };
-	const token = randomUUID();
-	const claim: GjcTeamTaskClaim = {
-		owner: workerId,
-		token,
-		leased_until: new Date(Date.now() + 30 * 60_000).toISOString(),
-	};
-	const claimPath = path.join(dir, "claims", `${task.id}.json`);
-	const created = await writeJsonFileNoClobber(claimPath, claim);
-	if (!created) return { ok: false, reason: `task_already_claimed:${task.id}` };
-	const current = await readGjcTeamTask(teamName, task.id, cwd, env);
-	const currentEligibilityReason = getGjcTeamTaskClaimEligibilityReason(current, teamWorker, await readTasks(dir));
-	if (currentEligibilityReason) {
-		await fs.rm(claimPath, { force: true });
-		return { ok: false, reason: currentEligibilityReason };
-	}
-	if (current.status !== "pending") {
-		await deleteIfOwned(claimPath, {
-			...stateWriterOptions(claimPath, "prune", "rollback"),
-			predicate: current => (current as GjcTeamTaskClaim).token === token,
-		});
-		return { ok: false, reason: `task_not_pending:${task.id}` };
-	}
-	const updated: GjcTeamTask = {
-		...current,
-		status: "in_progress",
-		assignee: workerId,
-		owner: workerId,
-		claim,
-		version: current.version + 1,
-		updated_at: now(),
-	};
-	try {
-		await writeTask(dir, updated);
-	} catch (error) {
-		await deleteIfOwned(claimPath, {
-			...stateWriterOptions(claimPath, "prune", "rollback"),
-			predicate: current => (current as GjcTeamTaskClaim).token === token,
-		});
-		throw error;
-	}
-	await appendEvent(dir, {
-		type: "task_claimed",
-		task_id: updated.id,
-		worker: workerId,
-		message: "Worker claimed task",
+	return withGjcTeamTaskMutation(taskStore(dir), async capability => {
+		const config = await readConfig(dir);
+		const worker = findKnownWorker(config, workerId);
+		const recovered = await reconcileGjcTeamStaleClaimsUnlocked(
+			workerOrchestrationRuntime,
+			teamName,
+			dir,
+			config,
+			env,
+			capability,
+		);
+		const reasons = recovered.stale_workers[workerId];
+		if (reasons?.length) return { ok: false, reason: `worker_not_live:${workerId}:${reasons.join(",")}` };
+		const status = await readWorkerStatus(workerRuntime, teamName, workerId, cwd, env);
+		if (
+			!["idle", "working", "blocked", "done"].includes(status.state) ||
+			typeof status.updated_at !== "string" ||
+			!Number.isFinite(Date.parse(status.updated_at))
+		)
+			return { ok: false, reason: `worker_not_live:${workerId}:invalid_status` };
+		return capability.claim(worker, taskId);
 	});
-	return { ok: true, task: updated, worker_id: workerId, claim_token: token };
 }
 export async function transitionGjcTeamTaskStatus(
 	teamName: string,
@@ -3480,51 +4467,10 @@ export async function transitionGjcTeamTaskStatus(
 	completionEvidenceInput?: unknown,
 ): Promise<GjcTeamTask> {
 	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	const task = await readGjcTeamTask(teamName, taskId, cwd, env);
-	if (workerId) assertKnownWorker(config, workerId);
-	if (status === "pending") throw new Error(`invalid_task_transition:${taskId}:pending_requires_release`);
-	if (task.status === "completed" || task.status === "failed") throw new Error(`task_terminal:${taskId}`);
-	if (!task.claim) throw new Error(`claim_token_required:${taskId}`);
-	if (!claimToken) throw new Error(`claim_token_required:${taskId}`);
-	if (task.claim.token !== claimToken) throw new Error(`claim_token_mismatch:${taskId}`);
-	if (workerId && task.claim.owner !== workerId) throw new Error(`claim_owner_mismatch:${taskId}`);
-	const terminal = status === "completed" || status === "failed";
-	const transitionedAt = now();
-	const completionEvidence =
-		status === "completed"
-			? normalizeGjcTeamTaskCompletionEvidence(taskId, task.claim.owner, completionEvidenceInput, transitionedAt)
-			: undefined;
-	const updated: GjcTeamTask = {
-		...task,
-		status,
-		claim: terminal ? undefined : task.claim,
-		version: task.version + 1,
-		updated_at: transitionedAt,
-		...(terminal ? { completed_at: transitionedAt } : {}),
-		...(completionEvidence ? { completion_evidence: completionEvidence } : {}),
-	};
-	await writeTask(dir, updated);
-	if (terminal) {
-		const claimPath = path.join(dir, "claims", `${taskId}.json`);
-		await removeFileAudited(claimPath, stateWriterOptions(claimPath, "prune", "terminal"));
-	}
-	const eventData: Record<string, unknown> = { status };
-	if (completionEvidence) {
-		eventData.completion_evidence = {
-			recorded_by: completionEvidence.recorded_by,
-			item_count: completionEvidence.items.length,
-			verified_item_count: completionEvidence.items.filter(isGjcTeamCompletionEvidenceItemVerified).length,
-			files_count: completionEvidence.files?.length ?? 0,
-		};
-	}
-	await appendEvent(dir, {
-		type: "task_transitioned",
-		task_id: taskId,
-		message: "Task status changed",
-		data: eventData,
+	return withGjcTeamTaskMutation(taskStore(dir), async capability => {
+		if (workerId) assertKnownWorker(await readConfig(dir), workerId);
+		return capability.transition(taskId, status, claimToken, workerId, completionEvidenceInput);
 	});
-	return updated;
 }
 export async function transitionGjcTeamTask(
 	teamName: string,
@@ -3555,59 +4501,9 @@ export async function releaseGjcTeamTaskClaim(
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<GjcTeamTask> {
 	const dir = await findTeamDir(teamName, cwd, env);
-	const task = await readGjcTeamTask(teamName, taskId, cwd, env);
-	if (!task.claim || task.claim.token !== claimToken || task.claim.owner !== workerId)
-		throw new Error(`claim_token_mismatch:${taskId}`);
-	const updated: GjcTeamTask = {
-		...task,
-		status: "pending",
-		assignee: undefined,
-		claim: undefined,
-		version: task.version + 1,
-		updated_at: now(),
-	};
-	await writeTask(dir, updated);
-	const claimPath = path.join(dir, "claims", `${taskId}.json`);
-	await deleteIfOwned(claimPath, {
-		...stateWriterOptions(claimPath, "prune", "release"),
-		predicate: current => (current as GjcTeamTaskClaim).token === claimToken,
-	});
-	await appendEvent(dir, {
-		type: "task_claim_released",
-		task_id: taskId,
-		worker: workerId,
-		message: "Task claim released",
-	});
-	return updated;
+	return taskStore(dir).release(taskId, claimToken, workerId);
 }
 
-function emptyNotificationSummary(): GjcTeamNotificationSummary {
-	return {
-		total: 0,
-		replay_eligible: 0,
-		by_state: {
-			pending: 0,
-			sent: 0,
-			queued: 0,
-			deferred: 0,
-			failed: 0,
-			delivered: 0,
-			acknowledged: 0,
-		},
-	};
-}
-function isReplayEligibleNotification(state: GjcTeamNotificationDeliveryState): boolean {
-	return state === "pending" || state === "queued" || state === "deferred" || state === "failed";
-}
-function summarizeNotifications(notifications: GjcTeamNotification[]): GjcTeamNotificationSummary {
-	const summary = emptyNotificationSummary();
-	for (const notification of notifications) {
-		summary.total += 1;
-		summary.by_state[notification.delivery_state] += 1;
-		if (isReplayEligibleNotification(notification.delivery_state)) summary.replay_eligible += 1;
-	}
-	return summary;
-}
 async function listNotificationRecords(dir: string): Promise<GjcTeamNotification[]> {
 	const notificationsDir = path.join(dir, "notifications");
 	try {
@@ -3661,26 +4557,6 @@ async function writeNotificationRecord(dir: string, notification: GjcTeamNotific
 	await writeJsonFile(notificationPath(dir, merged.id), merged);
 	return merged;
 }
-async function createMessageNotification(
-	dir: string,
-	teamName: string,
-	message: GjcTeamMailboxMessage,
-	state: GjcTeamNotificationDeliveryState = "pending",
-): Promise<GjcTeamNotification> {
-	const id = messageNotificationId(teamName, message.to_worker, message.message_id);
-	return writeNotificationRecord(dir, {
-		id,
-		kind: "mailbox_message",
-		team_name: teamName,
-		recipient: message.to_worker,
-		source: { type: "message", id: message.message_id },
-		idempotency_key: message.idempotency_key,
-		delivery_state: state,
-		created_at: message.created_at,
-		updated_at: now(),
-		replay_count: 0,
-	});
-}
 async function readLegacyMailbox(dir: string, worker: string): Promise<{ messages: GjcTeamMailboxMessage[] }> {
 	return (await readJsonFile<{ messages: GjcTeamMailboxMessage[] }>(mailboxPath(dir, worker))) ?? { messages: [] };
 }
@@ -3689,7 +4565,9 @@ async function readMailbox(dir: string, worker: string): Promise<{ messages: Gjc
 	const byId = new Map<string, GjcTeamMailboxMessage>();
 	for (const message of (await readLegacyMailbox(dir, worker)).messages ?? []) byId.set(message.message_id, message);
 	try {
-		const entries = await fs.readdir(mailboxDirPath(dir, worker), { withFileTypes: true });
+		const entries = await fs.readdir(mailboxDirPath(dir, worker), {
+			withFileTypes: true,
+		});
 		const records = await Promise.all(
 			entries
 				.filter(entry => entry.isFile() && entry.name.endsWith(".json"))
@@ -3699,7 +4577,9 @@ async function readMailbox(dir: string, worker: string): Promise<{ messages: Gjc
 	} catch (error) {
 		if (!isEnoent(error)) throw error;
 	}
-	return { messages: [...byId.values()].sort((a, b) => a.created_at.localeCompare(b.created_at)) };
+	return {
+		messages: [...byId.values()].sort((a, b) => a.created_at.localeCompare(b.created_at)),
+	};
 }
 async function writeLegacyMailboxView(dir: string, worker: string): Promise<void> {
 	const current = await readMailbox(dir, worker);
@@ -3736,73 +4616,36 @@ async function writeMailboxMessage(
 	await writeLegacyMailboxView(dir, worker);
 	return message;
 }
-async function reconcileTeamNotifications(dir: string, config: GjcTeamConfig): Promise<GjcTeamNotificationSummary> {
-	for (const recipient of ["leader-fixed", ...config.workers.map(worker => worker.id)]) {
-		const mailbox = await readMailbox(dir, recipient);
-		for (const message of mailbox.messages) {
-			const state = message.delivered_at ? "acknowledged" : message.notified_at ? "delivered" : "pending";
-			await createMessageNotification(dir, config.team_name, message, state);
-		}
-	}
-	return summarizeNotifications(await listNotificationRecords(dir));
-}
-async function attemptPaneNotification(
-	dir: string,
-	config: GjcTeamConfig,
-	notification: GjcTeamNotification,
-	env: NodeJS.ProcessEnv,
-): Promise<GjcTeamNotification> {
-	const paneId =
-		notification.recipient === "leader-fixed"
-			? config.leader.pane_id
-			: config.workers.find(worker => worker.id === notification.recipient)?.pane_id;
-	let result: GjcTeamPaneAttemptResult = "deferred";
-	let reason = "pane_missing";
-	if (paneId) {
-		if (config.tmux_session === "dry-run" || env.GJC_TEAM_FAKE_PANE_ATTEMPT === "sent") {
-			result = "sent";
-			reason = "dry_run_or_fake_tmux";
-		} else {
-			result = "queued";
-			reason = "tmux_delivery_recorded_without_injection";
-		}
-	}
-	return writeNotificationRecord(dir, {
-		...notification,
-		delivery_state: result,
-		pane_attempt_result: result,
-		pane_attempt_reason: reason,
-		pane_attempt_at: now(),
-		updated_at: now(),
-	});
-}
+const teamNotificationRuntime: TeamNotificationRuntime = {
+	findTeamDir,
+	readConfig,
+	assertKnownParticipant,
+	messageId: messageIdFor,
+	messageNotificationId,
+	now,
+	randomId: randomUUID,
+	appendEvent: async (dir, event) => {
+		await appendEvent(dir, event);
+	},
+	readMailbox,
+	writeMailboxMessage,
+	listNotifications: listNotificationRecords,
+	readNotification: readNotificationRecord,
+	writeNotification: writeNotificationRecord,
+};
+
 export async function replayGjcTeamNotifications(
 	teamName: string,
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
-): Promise<{ notifications: GjcTeamNotification[]; summary: GjcTeamNotificationSummary }> {
-	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	await reconcileTeamNotifications(dir, config);
-	const next: GjcTeamNotification[] = [];
-	for (const notification of await listNotificationRecords(dir)) {
-		if (!isReplayEligibleNotification(notification.delivery_state)) {
-			next.push(notification);
-			continue;
-		}
-		const attempted = await attemptPaneNotification(
-			dir,
-			config,
-			{
-				...notification,
-				replay_count: (notification.replay_count ?? 0) + 1,
-			},
-			env,
-		);
-		next.push(attempted);
-	}
-	return { notifications: next, summary: summarizeNotifications(next) };
+	transport?: GjcTeamMailboxDeliveryTransport,
+): Promise<{
+	notifications: GjcTeamNotification[];
+	summary: GjcTeamNotificationSummary;
+}> {
+	return replayTeamNotifications(teamNotificationRuntime, teamName, cwd, env, transport);
 }
+
 export async function sendGjcTeamMessage(
 	teamName: string,
 	fromWorker: string,
@@ -3811,31 +4654,21 @@ export async function sendGjcTeamMessage(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 	idempotencyKey?: string,
+	transport?: GjcTeamMailboxDeliveryTransport,
 ): Promise<GjcTeamMailboxMessage> {
-	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	assertKnownParticipant(config, fromWorker);
-	assertKnownParticipant(config, toWorker);
-	const createdKey = idempotencyKey ?? randomUUID();
-	const message: GjcTeamMailboxMessage = {
-		message_id: messageIdFor({ teamName: config.team_name, fromWorker, toWorker, body, idempotencyKey, createdKey }),
-		from_worker: fromWorker,
-		to_worker: toWorker,
+	return sendTeamMessage(
+		teamNotificationRuntime,
+		teamName,
+		fromWorker,
+		toWorker,
 		body,
-		created_at: now(),
-		...(idempotencyKey ? { idempotency_key: idempotencyKey } : {}),
-	};
-	const written = await writeMailboxMessage(dir, toWorker, message);
-	const notification = await createMessageNotification(dir, config.team_name, written);
-	await attemptPaneNotification(dir, config, notification, env);
-	await appendEvent(dir, {
-		type: "message_sent",
-		worker: fromWorker,
-		message: body,
-		data: { to_worker: toWorker, message_id: written.message_id },
-	});
-	return written;
+		cwd,
+		env,
+		idempotencyKey,
+		transport,
+	);
 }
+
 export async function broadcastGjcTeamMessage(
 	teamName: string,
 	fromWorker: string,
@@ -3859,17 +4692,16 @@ export async function broadcastGjcTeamMessage(
 		),
 	);
 }
+
 export async function listGjcTeamMailbox(
 	teamName: string,
 	worker: string,
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<GjcTeamMailboxMessage[]> {
-	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	assertKnownParticipant(config, worker);
-	return (await readMailbox(dir, worker)).messages;
+	return listTeamMailbox(teamNotificationRuntime, teamName, worker, cwd, env);
 }
+
 export async function markGjcTeamMailboxMessage(
 	teamName: string,
 	worker: string,
@@ -3879,40 +4711,14 @@ export async function markGjcTeamMailboxMessage(
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<GjcTeamMailboxMessage> {
 	assertSafeId("message_id", messageId);
-	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	assertKnownParticipant(config, worker);
-	const mailbox = await readMailbox(dir, worker);
-	const message = mailbox.messages.find(candidate => candidate.message_id === messageId);
-	if (!message) throw new Error(`message_not_found:${messageId}`);
-	const updated = { ...message, [field]: message[field] ?? now() };
-	const written = await writeMailboxMessage(dir, worker, updated);
-	const notificationId = messageNotificationId(config.team_name, worker, messageId);
-	const existing =
-		(await readJsonFile<GjcTeamNotification>(notificationPath(dir, notificationId))) ??
-		(await createMessageNotification(dir, config.team_name, written));
-	const nextState: GjcTeamNotificationDeliveryState = field === "delivered_at" ? "acknowledged" : "delivered";
-	const before = existing.delivery_state;
-	await writeNotificationRecord(dir, { ...existing, delivery_state: nextState, updated_at: now() });
-	if (mergeNotificationState(before, nextState) !== before)
-		await appendEvent(dir, {
-			type: `message_${field === "delivered_at" ? "acknowledged" : "notified"}`,
-			worker,
-			message: messageId,
-		});
-	return written;
+	return markTeamMailboxMessage(teamNotificationRuntime, teamName, worker, messageId, field, cwd, env);
 }
-export async function readGjcWorkerStatus(
+export const readGjcWorkerStatus = (
 	teamName: string,
 	worker: string,
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
-): Promise<WorkerStatusFile> {
-	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	assertKnownWorker(config, worker);
-	return readWorkerStatusFile(dir, worker);
-}
+): Promise<WorkerStatusFile> => readWorkerStatus(workerRuntime, teamName, worker, cwd, env);
 export async function updateGjcWorkerStatus(
 	teamName: string,
 	worker: string,
@@ -3923,43 +4729,16 @@ export async function updateGjcWorkerStatus(
 	reason?: string,
 ): Promise<WorkerStatusFile> {
 	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	const teamWorker = findKnownWorker(config, worker);
-	if (currentTaskId) assertSafeId("task_id", currentTaskId);
-	const trimmedReason = reason?.trim();
-	const value: WorkerStatusFile = {
-		state: status,
-		...(currentTaskId ? { current_task_id: currentTaskId } : {}),
-		...(trimmedReason ? { reason: trimmedReason } : {}),
-		updated_at: now(),
-	};
-	await writeJsonFile(path.join(workerDir(dir, worker), "status.json"), value);
-	const currentLifecycle = await readWorkerLifecycleRecord(dir, teamWorker);
-	const lifecycleState =
-		currentLifecycle.lifecycle_state === "stopped" ? "stopped" : lifecycleStateForWorkerStatus(status);
-	await writeWorkerLifecycleRecord(dir, teamWorker, lifecycleState);
-	await appendEvent(dir, {
-		type: "worker_status_updated",
-		worker,
-		message: `Worker ${worker} reported ${status}`,
-		data: {
-			status,
-			current_task_id: currentTaskId,
-		},
-	});
-	return value;
+	return withGjcTeamMutationFence(dir, () =>
+		updateWorkerStatus(workerRuntime, teamName, worker, status, cwd, env, currentTaskId, reason),
+	);
 }
-export async function readGjcWorkerHeartbeat(
+export const readGjcWorkerHeartbeat = (
 	teamName: string,
 	worker: string,
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
-): Promise<WorkerHeartbeatFile | null> {
-	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	assertKnownWorker(config, worker);
-	return readJsonFile<WorkerHeartbeatFile>(path.join(workerDir(dir, worker), "heartbeat.json"));
-}
+): Promise<WorkerHeartbeatFile | null> => readWorkerHeartbeat(workerRuntime, teamName, worker, cwd, env);
 export async function updateGjcWorkerHeartbeat(
 	teamName: string,
 	worker: string,
@@ -3968,11 +4747,9 @@ export async function updateGjcWorkerHeartbeat(
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<WorkerHeartbeatFile> {
 	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	assertKnownWorker(config, worker);
-	const value = { ...heartbeat, last_turn_at: heartbeat.last_turn_at || now() };
-	await writeJsonFile(path.join(workerDir(dir, worker), "heartbeat.json"), value);
-	return value;
+	return withGjcTeamMutationFence(dir, () =>
+		updateWorkerHeartbeat(workerRuntime, teamName, worker, heartbeat, cwd, env),
+	);
 }
 export async function writeGjcWorkerInbox(
 	teamName: string,
@@ -4102,35 +4879,16 @@ export async function writeGjcShutdownRequest(
 	requestedAt = now(),
 ): Promise<Record<string, unknown>> {
 	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	const teamWorker = findKnownWorker(config, worker);
-	assertKnownParticipant(config, requestedBy);
-	const value = { worker, requested_by: requestedBy, request_id: requestId, mode, requested_at: requestedAt };
-	await writeJsonFile(path.join(workerDir(dir, worker), "shutdown-request.json"), value);
-	await writeWorkerLifecycleRecord(dir, teamWorker, "draining", {
-		shutdown_request_id: requestId,
-		shutdown_requested_at: requestedAt,
-		shutdown_mode: mode,
-	});
-	await appendEvent(dir, {
-		type: "worker_shutdown_requested",
-		worker,
-		message: `Worker ${worker} shutdown requested`,
-		data: { requested_by: requestedBy, request_id: requestId, mode },
-	});
-	return value;
+	return withGjcTeamMutationFence(dir, () =>
+		writeShutdownRequest(workerRuntime, teamName, worker, requestedBy, cwd, env, requestId, mode, requestedAt),
+	);
 }
-export async function readGjcShutdownAck(
+export const readGjcShutdownAck = (
 	teamName: string,
 	worker: string,
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
-): Promise<Record<string, unknown> | null> {
-	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	assertKnownWorker(config, worker);
-	return readJsonFile<Record<string, unknown>>(path.join(workerDir(dir, worker), "shutdown-ack.json"));
-}
+): Promise<Record<string, unknown> | null> => readShutdownAck(workerRuntime, teamName, worker, cwd, env);
 
 export async function executeGjcTeamApiOperation(
 	operation: string,
@@ -4147,7 +4905,9 @@ export async function executeGjcTeamApiOperation(
 		case "list-tasks":
 			return { tasks: await listGjcTeamTasks(teamName, cwd, env) };
 		case "read-task":
-			return { task: await readGjcTeamTask(teamName, String(input.task_id ?? input.taskId), cwd, env) };
+			return {
+				task: await readGjcTeamTask(teamName, String(input.task_id ?? input.taskId), cwd, env),
+			};
 		case "create-task": {
 			const task = await createGjcTeamTask(
 				teamName,
@@ -4218,7 +4978,11 @@ export async function executeGjcTeamApiOperation(
 				cwd,
 				env,
 			);
-			return { ok: true, ...taskReceiptFields(teamName, task), worker_id: worker };
+			return {
+				ok: true,
+				...taskReceiptFields(teamName, task),
+				worker_id: worker,
+			};
 		}
 		case "send-message": {
 			const message = await sendGjcTeamMessage(
@@ -4280,9 +5044,12 @@ export async function executeGjcTeamApiOperation(
 		case "notification-list": {
 			const dir = await findTeamDir(teamName, cwd, env);
 			const config = await readConfig(dir);
-			await reconcileTeamNotifications(dir, config);
+			await reconcileTeamNotifications(teamNotificationRuntime, dir, config);
 			const notifications = await listNotificationRecords(dir);
-			const result = { notifications, summary: summarizeNotifications(notifications) };
+			const result = {
+				notifications,
+				summary: summarizeTeamNotifications(notifications),
+			};
 			return notificationSummaryReceipt(teamName, result);
 		}
 		case "notification-read":
@@ -4331,19 +5098,106 @@ export async function executeGjcTeamApiOperation(
 			return readGjcWorkerHeartbeat(teamName, worker, cwd, env);
 		case "recover-stale-claims":
 			return recoverGjcTeamStaleClaims(teamName, cwd, env);
-		case "update-worker-heartbeat":
+		case "update-worker-heartbeat": {
+			const pid = Number(input.pid ?? 0);
 			return updateGjcWorkerHeartbeat(
 				teamName,
 				worker,
 				{
-					pid: Number(input.pid ?? 0),
+					pid,
 					last_turn_at: now(),
 					turn_count: Number(input.turn_count ?? 0),
 					alive: Boolean(input.alive ?? true),
+					process_start_time: await readLinuxProcessStartTime(pid),
 				},
 				cwd,
 				env,
 			);
+		}
+		case "read-worker-memory-guard": {
+			const dir = await findTeamDir(teamName, cwd, env);
+			const config = await readConfig(dir);
+			assertKnownWorker(config, worker);
+			return readWorkerMemoryGuardLedger(dir, worker, normalizeWorkerMemoryGuardPlatform(input.platform));
+		}
+		case "update-worker-memory-guard": {
+			const dir = await findTeamDir(teamName, cwd, env);
+			return withGjcTeamMutationFence(dir, async () => {
+				const config = await readConfig(dir);
+				assertKnownWorker(config, worker);
+				const platform = normalizeWorkerMemoryGuardPlatform(input.platform);
+				const tasks = await readTasks(dir);
+				const currentTaskIdInput = input.current_task_id ?? input.currentTaskId;
+				if (typeof currentTaskIdInput === "string" && !currentTaskIdInput.trim())
+					throw new Error("invalid_worker_memory_guard_task_id");
+				const currentTaskId =
+					typeof currentTaskIdInput === "string"
+						? currentTaskIdInput.trim()
+						: findGjcTeamClaimedTaskForWorker(tasks, worker)?.id;
+				const existing = await readWorkerMemoryGuardLedger(dir, worker, platform);
+				const retryLimitInput = Number(input.retry_limit ?? input.retryLimit ?? existing.retry_limit);
+				if (!Number.isInteger(retryLimitInput) || retryLimitInput <= 0)
+					throw new Error(`invalid_worker_memory_guard_retry_limit:${retryLimitInput}`);
+				const pidProbe = normalizeGjcTeamWorkerMemoryGuardPidProbe(input.pid_probe ?? input.pidProbe);
+				const stateInput = typeof input.state === "string" ? input.state.trim() : existing.state;
+				if (!["idle", "advisory", "retrying", "checkpointed", "replaced", "blocked"].includes(stateInput))
+					throw new Error(`invalid_worker_memory_guard_state:${stateInput}`);
+				const updated: GjcTeamWorkerMemoryGuardLedger = {
+					...existing,
+					platform,
+					state: stateInput as GjcTeamWorkerMemoryGuardLedger["state"],
+					automatic_action_allowed:
+						typeof input.automatic_action_allowed === "boolean"
+							? input.automatic_action_allowed
+							: typeof input.automaticActionAllowed === "boolean"
+								? input.automaticActionAllowed
+								: existing.automatic_action_allowed,
+					retry_limit: retryLimitInput,
+					current_task_id: currentTaskId,
+					last_incident_id:
+						typeof input.incident_id === "string"
+							? input.incident_id
+							: typeof input.incidentId === "string"
+								? input.incidentId
+								: existing.last_incident_id,
+					last_reason:
+						typeof input.reason === "string" && input.reason.trim() ? input.reason.trim() : existing.last_reason,
+					last_pid_probe: pidProbe ?? existing.last_pid_probe,
+					updated_at: now(),
+				};
+				return writeWorkerMemoryGuardLedger(dir, updated);
+			});
+		}
+		case "apply-worker-memory-guard":
+			return applyWorkerMemoryGuard({
+				teamName,
+				workerId: explicitWorker,
+				requestedWorkerId: worker,
+				reason: typeof input.reason === "string" ? input.reason : undefined,
+				incidentId:
+					typeof input.incident_id === "string"
+						? input.incident_id
+						: typeof input.incidentId === "string"
+							? input.incidentId
+							: undefined,
+				platform: normalizeWorkerMemoryGuardPlatform(input.platform),
+				pidProbe: normalizeGjcTeamWorkerMemoryGuardPidProbe(input.pid_probe ?? input.pidProbe),
+				candidates: input.candidates,
+				cwd,
+				env,
+				allowAutomaticAction:
+					typeof input.automatic_action_allowed === "boolean"
+						? input.automatic_action_allowed
+						: typeof input.automaticActionAllowed === "boolean"
+							? input.automaticActionAllowed
+							: undefined,
+				replacementToken:
+					typeof input.replacement_token === "string"
+						? input.replacement_token
+						: typeof input.replacementToken === "string"
+							? input.replacementToken
+							: undefined,
+			});
 		case "write-worker-inbox":
 			return writeGjcWorkerInbox(teamName, worker, String(input.content ?? ""), cwd, env);
 		case "write-worker-identity":
@@ -4423,5 +5277,11 @@ export function parseTeamLaunchArgs(argv: string[]): GjcTeamStartOptions {
 	if (!task) throw new Error("missing_team_task");
 	if (!Number.isInteger(workerCount) || workerCount < 1 || workerCount > GJC_TEAM_MAX_WORKERS)
 		throw new Error(`invalid_team_worker_count:${workerCount}:expected_1_${GJC_TEAM_MAX_WORKERS}`);
-	return { workerCount, agentType, task, dryRun, worktreeMode: resolveDefaultWorktreeMode(parsedWorktree.mode) };
+	return {
+		workerCount,
+		agentType,
+		task,
+		dryRun,
+		worktreeMode: resolveDefaultWorktreeMode(parsedWorktree.mode),
+	};
 }

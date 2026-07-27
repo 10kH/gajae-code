@@ -58,12 +58,22 @@ export interface HookSelectorOptions {
 		optionLabel: string;
 		onSubmit: (text: string) => void;
 	};
+	clarificationInput?: {
+		optionLabel: string;
+		onSubmit: (text: string) => void;
+		allowEmpty?: boolean;
+	};
 	/**
 	 * Autocomplete provider for the inline custom-input editor. When present,
 	 * the "Other (type your own)" editor gains the same `@` file-link and `/`
 	 * completion behavior as the main prompt editor.
 	 */
 	autocompleteProvider?: AutocompleteProvider;
+	/**
+	 * Maps raw single-key accelerators to option labels. Unset maps preserve
+	 * the legacy selector key handling exactly.
+	 */
+	acceleratorMap?: Readonly<Record<string, string>>;
 }
 
 class OutlinedList extends Container {
@@ -338,12 +348,15 @@ export class HookSelectorComponent extends Container {
 	#outline: boolean;
 	#scrollTitleRows: number | undefined;
 	#customInput: { optionLabel: string; onSubmit: (text: string) => void } | undefined;
+	#clarificationInput: { optionLabel: string; onSubmit: (text: string) => void; allowEmpty?: boolean } | undefined;
+	#activeInput: { onSubmit: (text: string) => void; allowEmpty?: boolean } | undefined;
 	#inputArea: Container;
 	#inlineEditor: Editor | undefined;
 	#helpTextComponent: Text;
 	#baseHelpText: string;
 	#tui: TUI | undefined;
 	#autocompleteProvider: AutocompleteProvider | undefined;
+	#acceleratorMap: Readonly<Record<string, string>> | undefined;
 	constructor(
 		title: string,
 		options: string[],
@@ -365,8 +378,10 @@ export class HookSelectorComponent extends Container {
 		this.#wrapFocused = opts?.wrapFocused === true;
 		this.#outline = opts?.outline === true;
 		this.#customInput = opts?.customInput;
+		this.#clarificationInput = opts?.clarificationInput;
 		this.#tui = opts?.tui;
 		this.#autocompleteProvider = opts?.autocompleteProvider;
+		this.#acceleratorMap = opts?.acceleratorMap;
 
 		this.addChild(new DynamicBorder());
 		this.addChild(new Spacer(1));
@@ -424,6 +439,10 @@ export class HookSelectorComponent extends Container {
 		this.addChild(new DynamicBorder());
 
 		this.#updateList();
+	}
+
+	hasActiveInlineInput(): boolean {
+		return this.#inlineEditor !== undefined;
 	}
 
 	#updateList(): void {
@@ -490,6 +509,11 @@ export class HookSelectorComponent extends Container {
 			this.#handleInputModeKey(keyData, this.#inlineEditor);
 			return;
 		}
+		const acceleratedOption = this.#acceleratorMap?.[keyData.toLowerCase()];
+		if (acceleratedOption && this.#options.includes(acceleratedOption)) {
+			this.#onSelectCallback(acceleratedOption);
+			return;
+		}
 		if (matchesKey(keyData, "up") || keyData === "k") {
 			this.#selectedIndex = Math.max(0, this.#selectedIndex - 1);
 			this.#updateList();
@@ -500,7 +524,11 @@ export class HookSelectorComponent extends Container {
 			const selected = this.#options[this.#selectedIndex];
 			if (!selected) return;
 			if (this.#customInput && selected === this.#customInput.optionLabel) {
-				this.#enterInputMode();
+				this.#enterInputMode(this.#customInput);
+				return;
+			}
+			if (this.#clarificationInput && selected === this.#clarificationInput.optionLabel) {
+				this.#enterInputMode(this.#clarificationInput);
 				return;
 			}
 			this.#onSelectCallback(selected);
@@ -535,14 +563,19 @@ export class HookSelectorComponent extends Container {
 			return;
 		}
 		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return")) {
-			this.#customInput?.onSubmit(editor.getExpandedText());
+			const text = editor.getExpandedText();
+			if (this.#activeInput?.allowEmpty === false && text.trim() === "") {
+				return;
+			}
+			this.#activeInput?.onSubmit(text);
 			return;
 		}
 		editor.handleInput(keyData);
 	}
 
-	#enterInputMode(): void {
+	#enterInputMode(input: { onSubmit: (text: string) => void; allowEmpty?: boolean }): void {
 		if (this.#inlineEditor) return;
+		this.#activeInput = input;
 		// Stop the auto-select countdown for good: the user is actively typing,
 		// matching the old behavior where the separate editor had no timeout.
 		if (this.#countdown) {
@@ -577,6 +610,7 @@ export class HookSelectorComponent extends Container {
 	#exitInputMode(): void {
 		if (!this.#inlineEditor) return;
 		this.#inlineEditor = undefined;
+		this.#activeInput = undefined;
 		this.#inputArea.clear();
 		this.#helpTextComponent.setText(theme.fg("dim", this.#baseHelpText));
 		this.invalidate();

@@ -10,6 +10,7 @@ import {
 	isUltragoalAskBlocked,
 	isUltragoalBypassPrompt,
 	isUltragoalPauseBlocked,
+	readUltragoalVerificationState,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
 import {
 	countUltragoalNudges,
@@ -18,6 +19,7 @@ import {
 	readUltragoalLedger,
 	readUltragoalPlan,
 	recordUltragoalBlockerClassification,
+	recordUltragoalCriticVerdict,
 	recordUltragoalNudgeIfBudgetRemaining,
 	resolveUltragoalNudgeBudget,
 	selectUltragoalNudgeTarget,
@@ -59,6 +61,36 @@ afterEach(async () => {
 });
 
 describe("ultragoal nudge guard", () => {
+	it("links a reworded goal to its ultragoal run through provenance", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
+
+		const diagnostic = await readUltragoalVerificationState({
+			cwd,
+			sessionId: TEST_SESSION_ID,
+			currentGoal: {
+				objective: "Reworded after plan creation",
+				provenance: { source: "ultragoal", runId: TEST_SESSION_ID, goalId: "G001" },
+			},
+		});
+
+		expect(diagnostic.state).toBe("active_missing_final_receipt");
+	});
+
+	it("preserves legacy objective matching when goal provenance is absent", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
+
+		const diagnostic = await readUltragoalVerificationState({
+			cwd,
+			sessionId: TEST_SESSION_ID,
+			currentGoal: { objective: "Unrelated reworded objective" },
+		});
+
+		expect(diagnostic.state).toBe("unrelated_goal");
+	});
 	// AC5: the escalating refusal text must never trip the bypass detector.
 	it("AC5: formatted nudge text never trips isUltragoalBypassPrompt for any surface", () => {
 		const surfaces: UltragoalNudgeSurface[] = ["pause", "drop", "ask", "premature_complete"];
@@ -91,19 +123,21 @@ describe("ultragoal nudge guard", () => {
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await setProjectBudget(cwd, 1);
 		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
-		await recordUltragoalBlockerClassification({
-			cwd,
-			classification: "human_blocked",
-			evidence: "User must provide production API credentials",
-		});
-		// Budget 1: first pause attempt is nudged even though the blocker is human_blocked.
+		// Budget 1: the first pause attempt is nudged before the human-only blocker is classified.
 		await expect(assertUltragoalPauseAllowed(cwd)).rejects.toThrow(/try-harder nudge \(1\/1\)/);
-		// Re-record human_blocked as the latest event, then exhausted budget falls back to today's allowance.
-		await recordUltragoalBlockerClassification({
+		const classification = await recordUltragoalBlockerClassification({
 			cwd,
 			classification: "human_blocked",
 			evidence: "User must provide production API credentials",
 		});
+		await recordUltragoalCriticVerdict({
+			cwd,
+			terminus: "pause",
+			verdict: "OKAY",
+			evidence: "critic confirms the remaining blocker requires human action",
+			classificationEventId: classification.eventId,
+		});
+		// The exhausted budget now falls back to the bound clean human-blocked allowance.
 		await expect(assertUltragoalPauseAllowed(cwd)).resolves.toBeUndefined();
 	});
 
@@ -144,9 +178,7 @@ describe("ultragoal nudge guard", () => {
 		).rejects.toThrow(/try-harder nudge/);
 		await expect(
 			assertCanCompleteCurrentGoal({ cwd, currentGoal: DEFAULT_OBJECTIVE_GOAL, sessionId: TEST_SESSION_ID }),
-		).rejects.toThrow(
-			/strict `gjc ultragoal checkpoint --status complete --quality-gate-json <file> --gjc-goal-json <file>`/,
-		);
+		).rejects.toThrow(/`gjc ultragoal checkpoint --status complete --quality-gate-json <file>`/);
 		const ledger = await readUltragoalLedger(cwd, TEST_SESSION_ID);
 		expect(ledger.filter(event => event.event === "nudge" && event.surface === "premature_complete").length).toBe(1);
 	});

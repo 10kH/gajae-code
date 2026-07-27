@@ -1,7 +1,8 @@
-import type { GjcModelAssignmentTargetId } from "./model-registry";
-import type { ModelsConfig } from "./models-config-schema";
+import { sanitizeText } from "@gajae-code/utils";
+import { type ModelSelectorValue, normalizeModelSelectorValue } from "./model-selector-value";
+import type { GJC_MODEL_ASSIGNMENT_TARGET_IDS, ModelsConfig } from "./models-config-schema";
 
-export type ModelProfileRole = GjcModelAssignmentTargetId;
+export type ModelProfileRole = (typeof GJC_MODEL_ASSIGNMENT_TARGET_IDS)[number];
 
 export interface ModelProfileDefinition {
 	name: string;
@@ -17,14 +18,14 @@ export interface ModelProfileDefinition {
 	 * means any single xiaomi credential satisfies the group.
 	 */
 	alternativeProviderGroups?: readonly (readonly string[])[];
-	modelMapping: Partial<Record<ModelProfileRole, string>>;
+	modelMapping: Partial<Record<ModelProfileRole, ModelSelectorValue>>;
 	source: "builtin" | "user";
 }
 
 export interface ResolvedProfileBinding {
-	defaultSelector?: string;
-	modelRoles: Record<string, string>;
-	agentModelOverrides: Partial<Record<Exclude<ModelProfileRole, "default">, string>>;
+	defaultSelector?: ModelSelectorValue;
+	modelRoles: Record<string, ModelSelectorValue>;
+	agentModelOverrides: Partial<Record<Exclude<ModelProfileRole, "default">, ModelSelectorValue>>;
 }
 
 function parseModelSelectorProvider(selector: string): string | undefined {
@@ -35,29 +36,31 @@ function parseModelSelectorProvider(selector: string): string | undefined {
 
 export function deriveModelProfileMappedProviders(definition: Pick<ModelProfileDefinition, "modelMapping">): string[] {
 	const providers = new Set<string>();
-	for (const selector of Object.values(definition.modelMapping)) {
-		if (!selector) continue;
-		const provider = parseModelSelectorProvider(selector);
-		if (provider) providers.add(provider);
+	for (const selectorValue of Object.values(definition.modelMapping)) {
+		for (const selector of normalizeModelSelectorValue(selectorValue)) {
+			const provider = parseModelSelectorProvider(selector);
+			if (provider) providers.add(provider);
+		}
 	}
 	return [...providers].sort((a, b) => a.localeCompare(b));
 }
 
+/**
+ * Return the providers explicitly declared as hard prerequisites.
+ * Model mappings may reference fallback providers, but those references are
+ * resolution-time candidates rather than activation requirements.
+ */
 export function aggregateModelProfileRequiredProviders(
 	requiredProviders: readonly string[],
-	definition: Pick<ModelProfileDefinition, "modelMapping">,
+	_definition: Pick<ModelProfileDefinition, "modelMapping">,
 ): string[] {
-	const providers = new Set(requiredProviders);
-	for (const provider of deriveModelProfileMappedProviders(definition)) {
-		providers.add(provider);
-	}
-	return [...providers];
+	return [...new Set(requiredProviders)];
 }
 
 const profile = (
 	name: string,
 	requiredProviders: string[],
-	modelMapping: Partial<Record<ModelProfileRole, string>>,
+	modelMapping: Partial<Record<ModelProfileRole, ModelSelectorValue>>,
 	alternativeProviderGroups?: readonly (readonly string[])[],
 ): ModelProfileDefinition => ({
 	name,
@@ -69,25 +72,25 @@ const profile = (
 
 export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 	profile("codex-eco", ["openai-codex"], {
-		default: "openai-codex/gpt-5.5:low",
-		executor: "openai-codex/gpt-5.5:minimal",
-		planner: "openai-codex/gpt-5.5:low",
-		critic: "openai-codex/gpt-5.5:medium",
-		architect: "openai-codex/gpt-5.5:high",
+		default: "openai-codex/gpt-5.6-terra:low",
+		executor: "openai-codex/gpt-5.6-luna:low",
+		planner: "openai-codex/gpt-5.6-luna:high",
+		critic: "openai-codex/gpt-5.6-terra:xhigh",
+		architect: "openai-codex/gpt-5.6-terra:high",
 	}),
 	profile("codex-medium", ["openai-codex"], {
-		default: "openai-codex/gpt-5.5:medium",
-		executor: "openai-codex/gpt-5.5:low",
-		planner: "openai-codex/gpt-5.5:medium",
-		critic: "openai-codex/gpt-5.5:high",
-		architect: "openai-codex/gpt-5.5:xhigh",
+		default: "openai-codex/gpt-5.6-sol:low",
+		executor: "openai-codex/gpt-5.6-terra:low",
+		planner: "openai-codex/gpt-5.6-terra:high",
+		critic: "openai-codex/gpt-5.6-sol:xhigh",
+		architect: "openai-codex/gpt-5.6-sol:high",
 	}),
 	profile("codex-pro", ["openai-codex"], {
-		default: "openai-codex/gpt-5.5:xhigh",
-		executor: "openai-codex/gpt-5.5:medium",
-		planner: "openai-codex/gpt-5.5:high",
-		critic: "openai-codex/gpt-5.5:xhigh",
-		architect: "openai-codex/gpt-5.5:xhigh",
+		default: "openai-codex/gpt-5.6-sol:medium",
+		executor: "openai-codex/gpt-5.6-terra:medium",
+		planner: "openai-codex/gpt-5.6-sol:high",
+		critic: "openai-codex/gpt-5.6-sol:max",
+		architect: "openai-codex/gpt-5.6-sol:xhigh",
 	}),
 	profile("opencodego", ["opencode-go"], {
 		default: "opencode-go/kimi-k2.6",
@@ -97,11 +100,18 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		architect: "opencode-go/deepseek-v4-pro",
 	}),
 	profile("claude-opus", ["anthropic"], {
-		default: "anthropic/claude-opus-4-8:xhigh",
-		executor: "anthropic/claude-sonnet-4-6",
-		planner: "anthropic/claude-opus-4-8:low",
-		critic: "anthropic/claude-opus-4-8:high",
-		architect: "anthropic/claude-opus-4-8:xhigh",
+		default: "anthropic/claude-opus-5:xhigh",
+		executor: "anthropic/claude-sonnet-5",
+		planner: "anthropic/claude-opus-5:low",
+		critic: "anthropic/claude-opus-5:high",
+		architect: "anthropic/claude-opus-5:xhigh",
+	}),
+	profile("claude-fable", ["anthropic"], {
+		default: "anthropic/claude-fable-5:xhigh",
+		executor: "anthropic/claude-sonnet-5",
+		planner: "anthropic/claude-fable-5:low",
+		critic: "anthropic/claude-fable-5:high",
+		architect: "anthropic/claude-fable-5:xhigh",
 	}),
 	profile("glm-eco", ["zai"], {
 		default: "zai/glm-5.2:low",
@@ -125,25 +135,25 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		architect: "zai/glm-5.2:xhigh",
 	}),
 	profile("kimi-coding-plan-eco", ["kimi-code"], {
-		default: "kimi-code/kimi-k2.7-code:low",
-		executor: "kimi-code/kimi-k2.7-code:minimal",
-		planner: "kimi-code/kimi-k2.7-code:low",
-		critic: "kimi-code/kimi-k2.7-code:medium",
-		architect: "kimi-code/kimi-k2.7-code:high",
+		default: "kimi-code/k3:low",
+		executor: "kimi-code/k3:low",
+		planner: "kimi-code/k3:low",
+		critic: "kimi-code/k3:high",
+		architect: "kimi-code/k3:high",
 	}),
 	profile("kimi-coding-plan-medium", ["kimi-code"], {
-		default: "kimi-code/kimi-k2.7-code:medium",
-		executor: "kimi-code/kimi-k2.7-code:low",
-		planner: "kimi-code/kimi-k2.7-code:medium",
-		critic: "kimi-code/kimi-k2.7-code:high",
-		architect: "kimi-code/kimi-k2.7-code:xhigh",
+		default: "kimi-code/k3:high",
+		executor: "kimi-code/k3:low",
+		planner: "kimi-code/k3:high",
+		critic: "kimi-code/k3:high",
+		architect: "kimi-code/k3:max",
 	}),
 	profile("kimi-coding-plan-pro", ["kimi-code"], {
-		default: "kimi-code/kimi-k2.7-code:xhigh",
-		executor: "kimi-code/kimi-k2.7-code:medium",
-		planner: "kimi-code/kimi-k2.7-code:high",
-		critic: "kimi-code/kimi-k2.7-code:xhigh",
-		architect: "kimi-code/kimi-k2.7-code:xhigh",
+		default: "kimi-code/k3:max",
+		executor: "kimi-code/k3:high",
+		planner: "kimi-code/k3:high",
+		critic: "kimi-code/k3:max",
+		architect: "kimi-code/k3:max",
 	}),
 	profile("mimo-eco", ["xiaomi"], {
 		default: "xiaomi/mimo-v2.5-pro:low",
@@ -197,6 +207,27 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "xai/grok-4.3:xhigh",
 		architect: "xai/grok-4.3:xhigh",
 	}),
+	profile("grok-45-eco", ["xai"], {
+		default: "xai/grok-4.5:low",
+		executor: "xai/grok-4.5:minimal",
+		planner: "xai/grok-4.5:low",
+		critic: "xai/grok-4.5:medium",
+		architect: "xai/grok-4.5:high",
+	}),
+	profile("grok-45-medium", ["xai"], {
+		default: "xai/grok-4.5:medium",
+		executor: "xai/grok-4.5:low",
+		planner: "xai/grok-4.5:medium",
+		critic: "xai/grok-4.5:high",
+		architect: "xai/grok-4.5:high",
+	}),
+	profile("grok-45-pro", ["xai"], {
+		default: "xai/grok-4.5:high",
+		executor: "xai/grok-4.5:medium",
+		planner: "xai/grok-4.5:high",
+		critic: "xai/grok-4.5:high",
+		architect: "xai/grok-4.5:high",
+	}),
 	profile("grok-build-pro", ["grok-build"], {
 		default: "grok-build/grok-composer-2.5-fast",
 		executor: "grok-build/grok-build",
@@ -246,19 +277,40 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "minimax-code/minimax-m3:xhigh",
 		architect: "minimax-code/minimax-m3:xhigh",
 	}),
+	profile("alibaba-token-plan-balanced", ["alibaba-token-plan"], {
+		default: "alibaba-token-plan/qwen3.8-max-preview:medium",
+		executor: "alibaba-token-plan/deepseek-v4-pro:xhigh",
+		planner: "alibaba-token-plan/glm-5.2:high",
+		architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+		critic: "alibaba-token-plan/glm-5.2:high",
+	}),
+	profile("alibaba-token-plan-qwenmaxxing", ["alibaba-token-plan"], {
+		default: "alibaba-token-plan/qwen3.8-max-preview:medium",
+		executor: "alibaba-token-plan/qwen3.8-max-preview:low",
+		planner: "alibaba-token-plan/qwen3.8-max-preview:medium",
+		architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+		critic: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+	}),
 	profile("opus-codex", ["anthropic", "openai-codex"], {
-		default: "anthropic/claude-opus-4-8:xhigh",
-		executor: "openai-codex/gpt-5.5:low",
-		planner: "openai-codex/gpt-5.5:medium",
-		critic: "openai-codex/gpt-5.5:high",
-		architect: "openai-codex/gpt-5.5:xhigh",
+		default: "anthropic/claude-opus-5:xhigh",
+		executor: "openai-codex/gpt-5.6-terra:low",
+		planner: "anthropic/claude-sonnet-5",
+		critic: "openai-codex/gpt-5.6-sol:xhigh",
+		architect: "openai-codex/gpt-5.6-sol:high",
 	}),
 	profile("codex-opencodego", ["openai-codex", "opencode-go"], {
-		default: "openai-codex/gpt-5.5:medium",
+		default: "openai-codex/gpt-5.6-sol:low",
 		executor: "opencode-go/deepseek-v4-pro",
 		planner: "opencode-go/kimi-k2.6",
 		critic: "opencode-go/mimo-v2.5-pro",
-		architect: "openai-codex/gpt-5.5:xhigh",
+		architect: "openai-codex/gpt-5.6-sol:high",
+	}),
+	profile("fable-opus-codex", ["anthropic", "openai-codex"], {
+		default: "anthropic/claude-fable-5:high",
+		executor: "openai-codex/gpt-5.6-terra:medium",
+		planner: "anthropic/claude-opus-5:medium",
+		critic: "anthropic/claude-opus-5:high",
+		architect: "openai-codex/gpt-5.6-sol:xhigh",
 	}),
 ];
 
@@ -267,12 +319,17 @@ export interface ModelProfilePresentation {
 	providerGroup: string;
 }
 
+function sanitizeModelProfileLabel(value: string): string {
+	return sanitizeText(value).replace(/\s+/g, " ").trim();
+}
+
 const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"codex-eco": { displayName: "Codex Eco", providerGroup: "CODEX" },
 	"codex-medium": { displayName: "Codex Medium", providerGroup: "CODEX" },
 	"codex-pro": { displayName: "Codex Pro", providerGroup: "CODEX" },
 	opencodego: { displayName: "OpenCodeGo", providerGroup: "OPENCODEGO" },
 	"claude-opus": { displayName: "Claude Opus", providerGroup: "CLAUDE" },
+	"claude-fable": { displayName: "Claude Fable", providerGroup: "CLAUDE" },
 	"glm-eco": { displayName: "GLM Eco", providerGroup: "GLM" },
 	"glm-medium": { displayName: "GLM Medium", providerGroup: "GLM" },
 	"glm-pro": { displayName: "GLM Pro", providerGroup: "GLM" },
@@ -285,6 +342,9 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"grok-eco": { displayName: "Grok Eco", providerGroup: "GROK" },
 	"grok-medium": { displayName: "Grok Medium", providerGroup: "GROK" },
 	"grok-pro": { displayName: "Grok Pro", providerGroup: "GROK" },
+	"grok-45-eco": { displayName: "Grok 4.5 Eco", providerGroup: "GROK" },
+	"grok-45-medium": { displayName: "Grok 4.5 Medium", providerGroup: "GROK" },
+	"grok-45-pro": { displayName: "Grok 4.5 Pro", providerGroup: "GROK" },
 	"grok-build-pro": { displayName: "Grok Build Pro", providerGroup: "GROK" },
 	"cursor-eco": { displayName: "Cursor Eco", providerGroup: "CURSOR" },
 	"cursor-medium": { displayName: "Cursor Medium", providerGroup: "CURSOR" },
@@ -292,8 +352,11 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"minimax-eco": { displayName: "MiniMax Eco", providerGroup: "MINIMAX" },
 	"minimax-medium": { displayName: "MiniMax Medium", providerGroup: "MINIMAX" },
 	"minimax-pro": { displayName: "MiniMax Pro", providerGroup: "MINIMAX" },
+	"alibaba-token-plan-balanced": { displayName: "Balanced", providerGroup: "ALIBABA TOKEN PLAN" },
+	"alibaba-token-plan-qwenmaxxing": { displayName: "QwenMaxxing", providerGroup: "ALIBABA TOKEN PLAN" },
 	"opus-codex": { displayName: "Opus + Codex", providerGroup: "COMBOS" },
 	"codex-opencodego": { displayName: "Codex + OpenCodeGo", providerGroup: "COMBOS" },
+	"fable-opus-codex": { displayName: "Fable + Opus + Codex", providerGroup: "COMBOS" },
 };
 
 const PROFILE_GROUP_ORDER = [
@@ -306,6 +369,7 @@ const PROFILE_GROUP_ORDER = [
 	"GROK",
 	"CURSOR",
 	"MINIMAX",
+	"ALIBABA TOKEN PLAN",
 	"COMBOS",
 ];
 
@@ -323,6 +387,7 @@ const PROFILE_RECOMMENDATIONS: Record<string, string> = {
 	"grok-build": "grok-build-pro",
 	cursor: "cursor-medium",
 	"minimax-code": "minimax-medium",
+	"alibaba-token-plan": "alibaba-token-plan-balanced",
 };
 
 export function getModelProfilePresentation(
@@ -332,7 +397,15 @@ export function getModelProfilePresentation(
 	const displayName = typeof profile === "string" ? undefined : profile.displayName;
 	const presentation = PROFILE_PRESENTATION[name];
 	if (presentation) return presentation;
-	return { displayName: displayName ?? name, providerGroup: "CUSTOM" };
+	return { displayName: formatModelProfileDisplayLabel({ name, displayName }), providerGroup: "CUSTOM" };
+}
+
+export function formatModelProfileDisplayLabel(profile: Pick<ModelProfileDefinition, "name" | "displayName">): string {
+	return (
+		sanitizeModelProfileLabel(profile.displayName ?? profile.name) ||
+		sanitizeModelProfileLabel(profile.name) ||
+		"Unnamed profile"
+	);
 }
 
 export function groupModelProfilesForPresetLanding(

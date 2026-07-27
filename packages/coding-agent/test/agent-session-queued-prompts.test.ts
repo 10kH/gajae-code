@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
 import { Agent } from "@gajae-code/agent-core";
@@ -10,6 +10,26 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
+
+function isRetryableRemoveError(error: unknown): boolean {
+	if (typeof error !== "object" || error === null) return false;
+	const code = (error as { code?: unknown }).code;
+	return code === "EBUSY" || code === "ENOTEMPTY";
+}
+
+async function removeTempDirWithRetry(dir: TempDir): Promise<void> {
+	for (let attempt = 0; attempt < 20; attempt += 1) {
+		try {
+			dir.removeSync();
+			return;
+		} catch (error) {
+			if (attempt === 19 || !isRetryableRemoveError(error)) {
+				throw error;
+			}
+			await Bun.sleep(50 * (attempt + 1));
+		}
+	}
+}
 
 /**
  * Issue #434 — queued prompts while the agent is busy.
@@ -39,10 +59,13 @@ describe("AgentSession queued prompts (issue #434)", () => {
 			session = undefined;
 		}
 		authStorage.close();
-		tempDir.removeSync();
+		await removeTempDirWithRetry(tempDir);
 	});
 
-	function buildSession(responses: MockHandler[]): AgentSession {
+	function buildSession(
+		responses: MockHandler[],
+		settings = Settings.isolated({ "compaction.enabled": false }),
+	): AgentSession {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
 		const mock = createMockModel({ responses });
@@ -51,7 +74,6 @@ describe("AgentSession queued prompts (issue #434)", () => {
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: mock.stream,
 		});
-		const settings = Settings.isolated({ "compaction.enabled": false });
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 		return new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
 	}
@@ -82,6 +104,34 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		}
 	}
 
+	it("rejects persisted queue modes before changing the live agent", () => {
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			steeringMode: "one-at-a-time",
+			followUpMode: "one-at-a-time",
+			interruptMode: "immediate",
+		});
+		session = buildSession([], settings);
+		const canWrite = spyOn(settings, "canWriteDurableConfig").mockReturnValue(false);
+		const set = spyOn(settings, "set");
+
+		try {
+			expect(() => session!.setSteeringMode("all")).toThrow("Repair config.yml");
+			expect(() => session!.setFollowUpMode("all")).toThrow("Repair config.yml");
+			expect(() => session!.setInterruptMode("wait")).toThrow("Repair config.yml");
+
+			expect(session.agent.getSteeringMode()).toBe("one-at-a-time");
+			expect(session.agent.getFollowUpMode()).toBe("one-at-a-time");
+			expect(session.agent.getInterruptMode()).toBe("immediate");
+			expect(settings.getGlobal("steeringMode")).toBe("one-at-a-time");
+			expect(settings.getGlobal("followUpMode")).toBe("one-at-a-time");
+			expect(settings.getGlobal("interruptMode")).toBe("immediate");
+			expect(set).not.toHaveBeenCalled();
+		} finally {
+			canWrite.mockRestore();
+			set.mockRestore();
+		}
+	});
 	it("runs prompts queued while busy after the active turn, in submission order", async () => {
 		const gate = Promise.withResolvers<void>();
 		session = buildSession([
@@ -106,6 +156,35 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		expect(session.getQueuedMessages().followUp).toEqual(["p2", "p3"]);
 		expect(session.getQueuedMessages().steering).toEqual([]);
 		expect(assistantCount(session)).toBe(0);
+
+		gate.resolve();
+		await first;
+		await session.waitForIdle();
+
+		expect(userTexts(session)).toEqual(["p1", "p2", "p3"]);
+		expect(assistantCount(session)).toBe(3);
+		expect(session.queuedMessageCount).toBe(0);
+	});
+
+	it("keeps explicit composer queue prompts sequential even when follow-up mode batches", async () => {
+		const gate = Promise.withResolvers<void>();
+		session = buildSession([
+			async () => {
+				await gate.promise;
+				return { content: ["turn 1"] };
+			},
+			{ content: ["turn 2"] },
+			{ content: ["turn 3"] },
+		]);
+		session.setFollowUpMode("all");
+
+		const first = session.prompt("p1");
+		await waitUntil(() => session!.isStreaming);
+
+		await session.prompt("p2", { streamingBehavior: "followUp", followUpQueuePolicy: "sequential" });
+		await session.prompt("p3", { streamingBehavior: "followUp", followUpQueuePolicy: "sequential" });
+
+		expect(session.getQueuedMessages().followUp).toEqual(["p2", "p3"]);
 
 		gate.resolve();
 		await first;
@@ -146,5 +225,67 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		// Steering interrupted/continued the active turn; the queued prompt ran
 		// after it. Submission order across both is preserved.
 		expect(userTexts(session)).toEqual(["p1", "steer me", "queue me"]);
+	});
+
+	it("removes an arbitrary queued prompt selected for editing", async () => {
+		const gate = Promise.withResolvers<void>();
+		session = buildSession([
+			async () => {
+				await gate.promise;
+				return { content: ["turn 1"] };
+			},
+			{ content: ["after steer"] },
+			{ content: ["after remaining queue"] },
+		]);
+
+		const first = session.prompt("p1");
+		await waitUntil(() => session!.isStreaming);
+
+		await session.prompt("steer me", { streamingBehavior: "steer" });
+		await session.prompt("queue older", { streamingBehavior: "followUp" });
+		await session.prompt("queue newest", { streamingBehavior: "followUp" });
+
+		const entries = session.getQueuedMessageEntries();
+		expect(entries.map(entry => entry.text)).toEqual(["steer me", "queue older", "queue newest"]);
+		const removed = session.removeQueuedMessageForEditing(entries[1]?.id ?? "");
+
+		expect(removed).toBe("queue older");
+		expect(session.getQueuedMessages().steering).toEqual(["steer me"]);
+		expect(session.getQueuedMessages().followUp).toEqual(["queue newest"]);
+
+		gate.resolve();
+		await first;
+		await session.waitForIdle();
+
+		expect(userTexts(session)).toEqual(["p1", "steer me", "queue newest"]);
+	});
+
+	it("reorders queued follow-up prompts selected for editing", async () => {
+		const gate = Promise.withResolvers<void>();
+		session = buildSession([
+			async () => {
+				await gate.promise;
+				return { content: ["turn 1"] };
+			},
+			{ content: ["after moved queue"] },
+			{ content: ["after remaining queue"] },
+		]);
+
+		const first = session.prompt("p1");
+		await waitUntil(() => session!.isStreaming);
+
+		await session.prompt("queue older", { streamingBehavior: "followUp" });
+		await session.prompt("queue newest", { streamingBehavior: "followUp" });
+
+		const entries = session.getQueuedMessageEntries();
+		expect(entries.map(entry => entry.text)).toEqual(["queue older", "queue newest"]);
+		expect(session.moveQueuedMessageForEditing(entries[1]?.id ?? "", "up")).toBe(true);
+		expect(session.getQueuedMessages().followUp).toEqual(["queue newest", "queue older"]);
+
+		gate.resolve();
+		await first;
+		await session.waitForIdle();
+
+		expect(userTexts(session)).toEqual(["p1", "queue newest", "queue older"]);
 	});
 });

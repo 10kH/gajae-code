@@ -8,129 +8,32 @@ on:
       branches: [main]
    workflow_dispatch:
       inputs:
-         skip_npm:
-            description: "Skip npm publish"
-            type: boolean
-            default: false
+         rehearsal:
+            description: "Rehearsal mode: run the exact tag build/verify graph (native -> binaries) with publish excluded, or the non-tag main graph."
+            required: true
+            type: choice
+            options: [tag-build-verify, main-nontag]
+
+# Least privilege by default: only `publish` needs write, and it declares its
+# own job-level `contents: write` override. This keeps rehearsal dispatches
+# (and every build/verify job) on a read-scoped GITHUB_TOKEN.
+permissions:
+   contents: read
 
 concurrency:
-   group: ${{ github.workflow }}-${{ github.ref }}
-   cancel-in-progress: true
+   # Release tags never cancel; ordinary CI is cancellable per ref.
+   group: ci-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.rehearsal || 'event' }}
+   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
 
 jobs:
-   # Compute a stable hash of every input that affects the native cdylib output,
-   # then look for any prior successful main run that already uploaded the linux-x64
-   # artifacts for this hash. If found, test jobs reuse those artifacts instead of
-   # rebuilding them on non-release commits. The non-tag native_linux job is skipped
-   # in that case, so the canary's retention window (see build-native action) is the
-   # effective TTL of a cache hit before main rebuilds anyway.
-   rust-hash:
-      timeout-minutes: 15
-      if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-      runs-on: ubuntu-22.04
-      outputs:
-         hash: ${{ steps.compute.outputs.hash }}
-         run-id: ${{ steps.find.outputs.run-id }}
-      steps:
-         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-         - name: Compute rust source hash
-           id: compute
-           shell: bash
-           run: |
-              hash=$(find crates Cargo.toml Cargo.lock rust-toolchain.toml \
-                      packages/natives/scripts packages/natives/package.json \
-                      scripts/ci-build-native.ts scripts/host-detect.ts \
-                      -type f -print0 \
-                    | sort -z \
-                    | xargs -0 sha256sum \
-                    | sha256sum \
-                    | cut -c1-16)
-              echo "hash=$hash" >> "$GITHUB_OUTPUT"
-              echo "Rust source hash: $hash"
-         - name: Find prior main build with matching hash
-           id: find
-           env:
-              GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-           shell: bash
-           run: |
-              hash="${{ steps.compute.outputs.hash }}"
-              # Canary artifact: native_linux builds baseline + modern together,
-              # so the modern artifact's presence on any prior main run implies
-              # both linux x64 test artifacts are cached and downloadable.
-              canary="pi-natives-linux-x64-modern-h${hash}"
-              run_id=""
-              for candidate in $(gh run list \
-                  --workflow=ci.yml --branch=main --status=success --event=push \
-                  --limit=20 --json databaseId --jq='.[].databaseId'); do
-                if gh api "/repos/${{ github.repository }}/actions/runs/$candidate/artifacts?per_page=100" \
-                    --jq ".artifacts[] | select(.name == \"$canary\") | select(.expired == false) | .id" \
-                    | grep -q .; then
-                  run_id="$candidate"
-                  break
-                fi
-              done
-              if [ -n "$run_id" ]; then
-                echo "Reusing native artifacts from run $run_id"
-              else
-                echo "No cached native artifacts for hash $hash; native job will rebuild."
-              fi
-              echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
-
-   # Single conservative changed-path relevance decision, shared by the
-   # expensive PR jobs below via needs.relevance.outputs.relevant. Fail-open:
-   # non-pull_request events, a missing base SHA, or any error => relevant=true.
-   relevance:
-      name: relevance
-      timeout-minutes: 10
-      if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-      runs-on: ubuntu-22.04
-      outputs:
-         relevant: ${{ steps.relevance.outputs.relevant }}
-      steps:
-         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
-           with:
-              bun-version: "1.3"
-         - name: Check changed-path relevance
-           id: relevance
-           env:
-              GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-           run: bun scripts/ci-job-relevance.ts
-
-   # Branch protection must add the always-present `gjc-state-gates` status as required.
-   gjc-state-gates:
-      name: gjc-state-gates
-      if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-      runs-on: ubuntu-22.04
-      timeout-minutes: 15
-      env:
-         GITHUB_EVENT_BEFORE: ${{ github.event.before }}
-         GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-      steps:
-         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-           with:
-              fetch-depth: 0
-         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
-           with:
-              node-version: "24"
-         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
-           with:
-              bun-version: "1.3"
-         - name: Cache bun dependencies
-           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
-           with:
-              path: ~/.bun/install/cache
-              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
-         - run: bun install --frozen-lockfile
-         - name: Run GJC state gates
-           run: bun scripts/ci-gjc-state-gates.ts
-
-   # Fast lint + type check (no Rust, no native build needed)
+   # ---------------------------------------------------------------------------
+   # PR + main branch: lint/typecheck (native-free) and the test suite.
+   # These never run on tags — a tag is cut from an already-green main.
+   # ---------------------------------------------------------------------------
    check:
-      timeout-minutes: 30
-      needs: [relevance]
-      if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+      if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.rehearsal == 'main-nontag') }}
       runs-on: ubuntu-22.04
+      timeout-minutes: 20
       steps:
          - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
          - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
@@ -138,273 +41,234 @@ jobs:
               node-version: "24"
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
-              bun-version: "1.3"
+              bun-version: "1.3.14"
          - name: Cache bun dependencies
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
               path: ~/.bun/install/cache
-              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
-         - if: needs.relevance.outputs.relevant == 'true'
-           run: bun install --frozen-lockfile
-         - name: Type check workspace
-           if: needs.relevance.outputs.relevant == 'true'
+              key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+         - run: bun install --frozen-lockfile
+         - name: Lint and type check (native-free)
            run: bun run ci:check:full
 
-   # Linux x64 baseline + modern: required by `test`, so it runs on every PR
-   # unless rust-hash found a cached run. Tags always rebuild for fresh artifacts.
-   native_linux:
-      timeout-minutes: 60
-      needs: [rust-hash, relevance]
-      if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
-         (startsWith(github.ref, 'refs/tags/v') || needs.rust-hash.outputs.run-id == '') }}
+   # ---------------------------------------------------------------------------
+   # PR + main branch: sharded full test suite. Unlike dev CI (changed-path
+   # affected), Main CI runs the COMPLETE task union via CI_FORCE_FULL. Long-tail
+   # tasks are sub-split (coding-agent tests 16-way, rust-test 4 nextest
+   # partitions) so no single shard dominates wall-time. The `test` aggregate job
+   # keeps the stable branch-protection status name.
+   # ---------------------------------------------------------------------------
+   main_plan:
+      if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.rehearsal == 'main-nontag') }}
       runs-on: ubuntu-22.04
+      timeout-minutes: 10
+      env:
+         CI_FORCE_FULL: "1"
+         CI_CODING_AGENT_TEST_SHARDS: "16"
+         CI_RUST_TEST_PARTITIONS: "4"
+      outputs:
+         matrix: ${{ steps.plan.outputs.matrix }}
+         has_tasks: ${{ steps.plan.outputs.has_tasks }}
+         has_native: ${{ steps.plan.outputs.has_native }}
+         has_python: ${{ steps.plan.outputs.has_python }}
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.3.14"
+         - name: Compute full Main CI task matrix
+           id: plan
+           run: bun scripts/ci-dev-affected.ts --matrix-json
+
+   main_native:
+      if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.rehearsal == 'main-nontag') && needs.main_plan.outputs.has_native == 'true' }}
+      needs: [main_plan]
+      runs-on: ubuntu-22.04
+      timeout-minutes: 30
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+           with:
+              node-version: "24"
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.3.14"
+         - name: Cache bun dependencies
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+           with:
+              path: ~/.bun/install/cache
+              key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+         - run: bun install --frozen-lockfile
+         - name: Build native addon (linux-x64 baseline + modern)
+           env:
+              TARGET_PLATFORM: linux
+              TARGET_ARCH: x64
+              TARGET_VARIANTS: baseline modern
+           run: bun run ci:build:native
+         - name: Verify required native addon variants
+           run: |
+              test -f packages/natives/native/pi_natives.linux-x64-baseline.node
+              test -f packages/natives/native/pi_natives.linux-x64-modern.node
+         - name: Upload native addon(s)
+           uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+           with:
+              name: main-native-${{ github.run_id }}
+              path: |
+                 packages/natives/native/pi_natives.linux-x64-baseline.node
+                 packages/natives/native/pi_natives.linux-x64-modern.node
+              if-no-files-found: error
+              retention-days: 1
+              overwrite: true
+
+   main_python_matrix:
+      name: Python SDK / ${{ matrix.python-version }}
+      needs: [main_plan, main_native]
+      if: ${{ always() && !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.rehearsal == 'main-nontag') && needs.main_plan.outputs.has_python == 'true' && needs.main_native.result != 'failure' && needs.main_native.result != 'cancelled' }}
+      runs-on: ubuntu-22.04
+      timeout-minutes: 30
       strategy:
          fail-fast: false
          matrix:
-            include:
-               - { variant: baseline, rust_checks: true }
-               - { variant: modern }
-      steps:
-         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-         - uses: ./.github/actions/build-native
-           if: needs.relevance.outputs.relevant == 'true'
-           with:
-              hash: ${{ needs.rust-hash.outputs.hash }}
-              platform: linux
-              arch: x64
-              variant: ${{ matrix.variant }}
-              rust_checks: ${{ matrix.rust_checks && 'true' || 'false' }}
-              save_cache: ${{ github.event_name == 'push' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') || startsWith(github.ref, 'refs/tags/v')) }}
-
-   # Windows-latest smoke for the `bun install -g gajae-code` runtime path
-   # (issue #525): build the win32-x64 native addon, then exercise the bun-run
-   # CLI surface a native install hits — bun + gjc version, help, `gjc team
-   # --help`, and the native/worker smoke probe. Runs on PRs and branch pushes
-   # so Windows regressions surface before release; release tags already run the
-   # Windows release-binary smoke in the publishing gate.
-   windows_smoke:
-      timeout-minutes: 60
-      needs: [relevance]
-      if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-      runs-on: windows-latest
+            python-version: ["3.10", "3.11", "3.12", "3.13"]
+      env:
+         GJC_REAL_SESSION_TESTS: "1"
       steps:
          - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
               bun-version: "1.3"
+         - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+           with:
+              python-version: ${{ matrix.python-version }}
+         - name: Download native addon(s)
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              name: main-native-${{ github.run_id }}
+              path: packages/natives/native
+         - run: bun install --frozen-lockfile
+         - run: bun run check:py-sdk
+         - run: bun run test:py-sdk
+         - run: bun run ci:test:py-sdk-build
+           if: ${{ matrix.python-version == '3.12' }}
+
+   main_shards:
+      name: test-shard / ${{ matrix.key }}
+      if: ${{ always() && !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.rehearsal == 'main-nontag') && needs.main_plan.outputs.has_tasks == 'true' && needs.main_native.result != 'failure' && needs.main_native.result != 'cancelled' }}
+      needs: [main_plan, main_native]
+      runs-on: ubuntu-22.04
+      timeout-minutes: ${{ matrix.rust && 90 || 60 }}
+      strategy:
+         fail-fast: false
+         max-parallel: 16
+         matrix: ${{ fromJSON(needs.main_plan.outputs.matrix) }}
+      env:
+         CI_FORCE_FULL: "1"
+         CI_CODING_AGENT_TEST_SHARDS: "16"
+         CI_RUST_TEST_PARTITIONS: "4"
+         AFFECTED_TASK_KEY: ${{ matrix.key }}
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+           with:
+              node-version: "24"
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.3.14"
          - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
-           if: needs.relevance.outputs.relevant == 'true'
+           if: ${{ matrix.rust }}
            with:
               toolchain: nightly-2026-04-29
-         - name: Prepend rustup toolchain bin to PATH
-           if: needs.relevance.outputs.relevant == 'true'
-           shell: bash
-           run: |
-              toolchain_bin="$(dirname "$(rustup which cargo)")"
-              echo "$toolchain_bin" >> "$GITHUB_PATH"
-         - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
-           if: needs.relevance.outputs.relevant == 'true'
+         - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e  # v2
+           if: ${{ matrix.nextest }}
            with:
-              shared-key: windows-smoke-win32-x64
-              cache-on-failure: true
-              save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+              tool: nextest@0.9.137
+         - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+           if: ${{ matrix.rust }}
+           with:
+              shared-key: main-rust-linux-x64
+              save-if: ${{ github.ref == 'refs/heads/main' }}
               cache-workspace-crates: true
          - name: Cache bun dependencies
-           if: needs.relevance.outputs.relevant == 'true'
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
               path: ~/.bun/install/cache
-              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
-         - if: needs.relevance.outputs.relevant == 'true'
-           run: bun install --frozen-lockfile
-         - name: Build native addon (win32-x64 baseline)
-           if: needs.relevance.outputs.relevant == 'true'
+              key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+         - run: bun install --frozen-lockfile
+         - name: Download native addon(s)
+           if: ${{ matrix.native }}
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              name: main-native-${{ github.run_id }}
+              path: packages/natives/native
+         - name: Run task shard
            env:
-              TARGET_PLATFORM: win32
-              TARGET_ARCH: x64
-              TARGET_VARIANTS: baseline
-           run: bun run ci:build:native
-         - name: Smoke bun + gjc CLI (source runtime)
-           if: needs.relevance.outputs.relevant == 'true'
-           shell: pwsh
-           run: |
-              bun --version
-              bun packages/coding-agent/src/cli.ts --version
-              bun packages/coding-agent/src/cli.ts --help
-              bun packages/coding-agent/src/cli.ts team --help
-              bun packages/coding-agent/src/cli.ts --smoke-test
+              GITHUB_ACTIONS: ""
+           run: bun scripts/ci-dev-affected.ts --task="$AFFECTED_TASK_KEY"
 
-   # Remaining platforms only ship in release tags; PRs and main never build them.
-   native_release:
+   # Branch protection must keep requiring this stable aggregate status.
+   test:
+      if: ${{ always() && !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.rehearsal == 'main-nontag') }}
+      needs: [main_plan, main_native, main_python_matrix, main_shards]
+      runs-on: ubuntu-22.04
+      timeout-minutes: 5
+      steps:
+         - name: Fail closed unless every shard succeeded
+           run: |
+              plan='${{ needs.main_plan.result }}'
+              native='${{ needs.main_native.result }}'
+              shards='${{ needs.main_shards.result }}'
+              python='${{ needs.main_python_matrix.result }}'
+              echo "main_plan=$plan main_native=$native main_python_matrix=$python main_shards=$shards"
+              test "$plan" = success
+              case "$native" in success|skipped) ;; *) echo "native gate failed"; exit 1;; esac
+              case "$python" in success|skipped) ;; *) echo "Python gate failed"; exit 1;; esac
+              test "$shards" = success
+
+   # ---------------------------------------------------------------------------
+   # Tag (vX.Y.Z) graph: build native addons for every published platform, then
+   # build the standalone binaries. The tag-only publish job then publishes to npm
+   # and cuts the GitHub Release; rehearsals stop after binary verification.
+   # ---------------------------------------------------------------------------
+   native:
+      if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'tag-build-verify') }}
       timeout-minutes: 90
-      needs: [rust-hash]
-      if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+      runs-on: ${{ matrix.os }}
       strategy:
          fail-fast: false
          matrix:
             include:
+               - { os: ubuntu-22.04, platform: linux, arch: x64, variant: baseline, rust_checks: true }
+               - { os: ubuntu-22.04, platform: linux, arch: x64, variant: modern }
                - { os: ubuntu-22.04, platform: linux, arch: arm64, target: aarch64-unknown-linux-gnu }
                - { os: macos-14, platform: darwin, arch: arm64 }
-               - { os: macos-15-intel, platform: darwin, arch: x64 }
+               - { os: macos-15-intel, platform: darwin, arch: x64, variant: baseline }
                - { os: windows-latest, platform: win32, arch: x64, variant: baseline }
-      runs-on: ${{ matrix.os }}
       steps:
          - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
          - uses: ./.github/actions/build-native
            with:
-              hash: ${{ needs.rust-hash.outputs.hash }}
+              hash: ${{ github.sha }}
               platform: ${{ matrix.platform }}
               arch: ${{ matrix.arch }}
               variant: ${{ matrix.variant }}
               target: ${{ matrix.target }}
-              save_cache: ${{ github.event_name == 'push' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') || startsWith(github.ref, 'refs/tags/v')) }}
+              rust_checks: ${{ matrix.rust_checks && 'true' || 'false' }}
+              save_cache: "true"
 
-   test:
-      runs-on: ubuntu-22.04
-      needs: [native_linux, rust-hash, relevance]
-      if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
-         !startsWith(github.ref, 'refs/tags/v') && needs.native_linux.result != 'failure' }}
-      timeout-minutes: 30
-      steps:
-         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
-           with:
-              node-version: "24"
-         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
-           with:
-              bun-version: "1.3"
-         - name: Cache bun dependencies
-           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
-           with:
-              path: ~/.bun/install/cache
-              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
-         - name: Install system deps
-           if: needs.relevance.outputs.relevant == 'true'
-           run: bash scripts/ci-install-system-deps.sh
-         - if: needs.relevance.outputs.relevant == 'true'
-           run: bun install --frozen-lockfile
-         - name: Resolve native source run
-           if: needs.relevance.outputs.relevant == 'true'
-           id: source
-           shell: bash
-           run: |
-              if [ "${{ needs.native_linux.result }}" = "success" ]; then
-                echo "run-id=${{ github.run_id }}" >> "$GITHUB_OUTPUT"
-              else
-                echo "run-id=${{ needs.rust-hash.outputs.run-id }}" >> "$GITHUB_OUTPUT"
-              fi
-         - name: Download native addons
-           if: needs.relevance.outputs.relevant == 'true'
-           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
-           with:
-              pattern: pi-natives-linux-x64-*-h${{ needs.rust-hash.outputs.hash }}
-              path: packages/natives/native
-              merge-multiple: true
-              run-id: ${{ steps.source.outputs.run-id }}
-              github-token: ${{ secrets.GITHUB_TOKEN }}
-         - name: Test workspace (TS)
-           if: needs.relevance.outputs.relevant == 'true'
-           env:
-              # Bun's `bun test` emits `::group::`/`::endgroup::` per file under
-              # GHA. `--workspaces` prefixes each output line with `<pkg> test: `,
-              # which breaks GHA's column-0 parsing and leaks the markers as
-              # literal text. Unset for this step only — the annotations would be
-              # equally broken by the prefix, so we lose nothing.
-              GITHUB_ACTIONS: ""
-           run: bun run test:ts
-         - name: CLI smoke test
-           if: needs.relevance.outputs.relevant == 'true'
-           run: bun run ci:test:smoke
-
-   install_methods:
-      timeout-minutes: 45
-      needs: [relevance]
-      if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-      runs-on: ubuntu-22.04
-      steps:
-         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
-           with:
-              bun-version: "1.3"
-         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
-           if: needs.relevance.outputs.relevant == 'true'
-           with:
-              node-version: "24"
-         - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
-           if: needs.relevance.outputs.relevant == 'true'
-           with:
-              toolchain: nightly-2026-04-29
-         - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
-           if: needs.relevance.outputs.relevant == 'true'
-           with:
-              shared-key: install-methods-linux-x64
-              cache-on-failure: true
-              save-if: ${{ github.event_name == 'push' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') ||
-                 startsWith(github.ref, 'refs/tags/v')) }}
-              cache-workspace-crates: true
-         - name: Cache bun dependencies
-           if: needs.relevance.outputs.relevant == 'true'
-           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
-           with:
-              path: ~/.bun/install/cache
-              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
-         - name: Install system deps
-           if: needs.relevance.outputs.relevant == 'true'
-           run: bash scripts/ci-install-system-deps.sh
-         - if: needs.relevance.outputs.relevant == 'true'
-           run: bun install --frozen-lockfile
-         - name: Install method smoke tests
-           if: needs.relevance.outputs.relevant == 'true'
-           run: bun run ci:test:install-methods
-
-   release_binary:
+   binaries:
+      if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'tag-build-verify') }}
+      needs: [native]
       timeout-minutes: 60
-      if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
-         needs.native_linux.result == 'success' && needs.native_release.result ==
-         'success' && (needs.check.result == 'success' || needs.check.result == 'skipped') }}
-      needs: [check, native_linux, native_release, rust-hash]
+      runs-on: ${{ matrix.os }}
       strategy:
          fail-fast: false
          matrix:
             include:
-               - {
-                    os: ubuntu-22.04,
-                    platform: linux,
-                    arch: x64,
-                    target_id: linux-x64,
-                    binary_path: packages/coding-agent/binaries/gjc-linux-x64,
-                 }
-               - {
-                    os: ubuntu-24.04-arm,
-                    platform: linux,
-                    arch: arm64,
-                    target_id: linux-arm64,
-                    binary_path: packages/coding-agent/binaries/gjc-linux-arm64,
-                 }
-               - {
-                    os: macos-14,
-                    platform: darwin,
-                    arch: arm64,
-                    target_id: darwin-arm64,
-                    binary_path: packages/coding-agent/binaries/gjc-darwin-arm64,
-                 }
-               - {
-                    os: macos-15-intel,
-                    platform: darwin,
-                    arch: x64,
-                    target_id: darwin-x64,
-                    binary_path: packages/coding-agent/binaries/gjc-darwin-x64,
-                 }
-               - {
-                    os: windows-latest,
-                    platform: win32,
-                    arch: x64,
-                    target_id: win32-x64,
-                    binary_path: packages/coding-agent/binaries/gjc-windows-x64.exe,
-                 }
-      runs-on: ${{ matrix.os }}
-      permissions:
-         contents: read
+               - { os: ubuntu-22.04, platform: linux, arch: x64, target_id: linux-x64, binary_path: packages/coding-agent/binaries/gjc-linux-x64 }
+               - { os: ubuntu-24.04-arm, platform: linux, arch: arm64, target_id: linux-arm64, binary_path: packages/coding-agent/binaries/gjc-linux-arm64 }
+               - { os: macos-14, platform: darwin, arch: arm64, target_id: darwin-arm64, binary_path: packages/coding-agent/binaries/gjc-darwin-arm64 }
+               - { os: macos-15-intel, platform: darwin, arch: x64, target_id: darwin-x64, binary_path: packages/coding-agent/binaries/gjc-darwin-x64 }
+               - { os: windows-latest, platform: win32, arch: x64, target_id: win32-x64, binary_path: packages/coding-agent/binaries/gjc-windows-x64.exe }
       steps:
          - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
          - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
@@ -412,23 +276,44 @@ jobs:
               node-version: "24"
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
-              bun-version: "1.3"
+              bun-version: "1.3.14"
          - name: Cache bun dependencies
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
               path: ~/.bun/install/cache
-              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+              key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - run: bun install --frozen-lockfile
          - name: Download native addon(s)
            uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
            with:
-              pattern: pi-natives-${{ matrix.platform }}-${{ matrix.arch }}*-h${{ needs.rust-hash.outputs.hash }}
+              pattern: pi-natives-${{ matrix.platform }}-${{ matrix.arch }}*
               path: packages/natives/native
               merge-multiple: true
+         - name: Verify memory-guard native loader export
+           run: bun test packages/natives/test/memory-guard-native.test.ts
+
          - name: Build release binary
            env:
               RELEASE_TARGETS: ${{ matrix.target_id }}
            run: bun run ci:release:build-binaries
+         - name: Smoke memory-guard native route (Windows)
+           if: runner.os == 'Windows'
+           shell: pwsh
+           run: |
+              $json = & "${{ matrix.binary_path }}" internal memory-guard-native-smoke --json
+              $data = $json | ConvertFrom-Json
+              if ($data.api -ne "memory_guard_windows_job_probe_v1") {
+                 throw "unexpected api: $($data.api)"
+              }
+              if ($data.source -ne "pi_natives") {
+                 throw "unexpected source: $($data.source)"
+              }
+              if ($data.result.platform -ne "win32") {
+                 throw "unexpected platform: $($data.result.platform)"
+              }
+              if (@("job_snapshot", "not_in_job", "api_error") -notcontains $data.result.kind) {
+                 throw "unexpected result kind: $($data.result.kind)"
+              }
          - name: Smoke release binary
            if: runner.os != 'Windows'
            run: |
@@ -451,88 +336,60 @@ jobs:
               name: gjc-binary-${{ matrix.target_id }}
               path: ${{ matrix.binary_path }}
 
-   release-github:
-      timeout-minutes: 30
-      if: ${{ (github.event_name != 'pull_request' ||
-         github.event.pull_request.head.repo.full_name == github.repository) &&
-         startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
-         needs.release_binary.result == 'success' }}
-      needs: [release_binary]
+   publish:
+      if: ${{ startsWith(github.ref, 'refs/tags/v') && github.event_name != 'workflow_dispatch' }}
+      needs: [native, binaries]
+      timeout-minutes: 45
       runs-on: ubuntu-22.04
       permissions:
          contents: write
       steps:
          - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-         - name: Download release binaries
-           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
-           with:
-              pattern: gjc-binary-*
-              path: packages/coding-agent/binaries
-              merge-multiple: true
-         - name: Create GitHub Release
-           uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
-           with:
-              files: |
-                 packages/coding-agent/binaries/gjc-*
-              generate_release_notes: true
-
-
-   release_github_verify:
-      timeout-minutes: 15
-      if: ${{ startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
-         needs['release-github'].result == 'success' }}
-      needs: [release-github]
-      runs-on: macos-14
-      permissions:
-         contents: read
-      steps:
-         - name: Download published macOS arm64 binary
-           run: |
-              curl -fsSL -o gjc-darwin-arm64 "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/gjc-darwin-arm64"
-              chmod +x gjc-darwin-arm64
-         - name: Verify published macOS arm64 binary
-           run: |
-              codesign -dv ./gjc-darwin-arm64
-              runtime_dir="$(mktemp -d)"
-              HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" ./gjc-darwin-arm64 --version
-
-   release-npm:
-      timeout-minutes: 30
-      if: ${{ (github.event_name != 'pull_request' ||
-         github.event.pull_request.head.repo.full_name == github.repository) &&
-         startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
-         needs.release_binary.result == 'success' &&
-         needs.release_github_verify.result == 'success' &&
-         !inputs.skip_npm }}
-      needs: [release_binary, release_github_verify, rust-hash]
-      runs-on: ubuntu-22.04
-      steps:
-         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
          - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
            with:
               node-version: "24"
-              registry-url: "https://registry.npmjs.org"
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
-              bun-version: "1.3"
+              bun-version: "1.3.14"
          - name: Cache bun dependencies
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
               path: ~/.bun/install/cache
-              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+              key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - run: bun install --frozen-lockfile
-         - name: Download native addons
+         - name: Download all native addons
            uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
            with:
-              pattern: pi-natives-*-h${{ needs.rust-hash.outputs.hash }}
+              pattern: pi-natives-*
               path: packages/natives/native
               merge-multiple: true
-         - name: Configure npm auth
+         - name: Publish packages to npm
            env:
               NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-           run: printf "//registry.npmjs.org/:_authToken=%s\n" "$NPM_TOKEN" > ~/.npmrc
-         - name: Publish to npm
-           env:
-              NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-              NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-           run: bun run ci:release:publish
+           shell: bash
+           run: |
+              set -euo pipefail
+              evidence_dir="$RUNNER_TEMP/release-evidence"
+              mkdir -p "$evidence_dir"
+              bun scripts/ci-release-publish.ts --prepare-evidence --evidence-dir "$evidence_dir"
+              npm_config="$(mktemp "$RUNNER_TEMP/npmrc.XXXXXX")"
+              trap 'rm -f "$npm_config"' EXIT
+              printf "//registry.npmjs.org/:_authToken=%s\n" "$NPM_TOKEN" > "$npm_config"
+              NPM_CONFIG_USERCONFIG="$npm_config" NODE_AUTH_TOKEN="$NPM_TOKEN" \
+                 bun scripts/ci-release-publish.ts --publish-from-evidence \
+                    --evidence-dir "$evidence_dir" \
+                    --release-serialization-key gajae-production-release
+         - name: Download release binaries
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              pattern: gjc-binary-*
+              path: release-binaries
+              merge-multiple: true
+         - name: Create GitHub Release
+           uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+           with:
+              tag_name: ${{ github.ref_name }}
+              draft: false
+              prerelease: false
+              generate_release_notes: true
+              files: release-binaries/gjc-*

@@ -1,16 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
-import { Agent } from "@gajae-code/agent-core";
-import { type AssistantMessage, getBundledModel, type Model } from "@gajae-code/ai";
+import { Agent, type AgentTool, type StreamFn } from "@gajae-code/agent-core";
+import { type AssistantMessage, getBundledModel, type Model, type ToolCall } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
+import type { Extension } from "@gajae-code/coding-agent/extensibility/extensions/types";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
+import * as z from "zod/v4";
 
 type AutoRetryStartEvent = Extract<AgentSessionEvent, { type: "auto_retry_start" }>;
 type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
@@ -23,9 +26,35 @@ function lastAssistant(session: AgentSession): AssistantMessage {
 	return message as AssistantMessage;
 }
 
+function assistantMessage(
+	model: Model,
+	content: AssistantMessage["content"],
+	stopReason: AssistantMessage["stopReason"],
+	errorMessage?: string,
+): AssistantMessage {
+	return {
+		role: "assistant",
+		content,
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason,
+		...(errorMessage === undefined ? {} : { errorMessage }),
+		timestamp: Date.now(),
+	};
+}
+
 /**
  * Resilient-retry contract (deep-interview spec):
- *  - transient + unknown/no-code errors retry forever (past retry.maxRetries),
+ *  - configured transient + unknown/no-code errors retry according to the legacy policy,
  *    capped at retry.maxDelayMs (ceiling, not give-up);
  *  - clearly-terminal coded errors (auth/400/not-found) surface immediately;
  *  - retry.enabled=false surfaces immediately;
@@ -83,18 +112,31 @@ describe("AgentSession resilient retry", () => {
 	}
 
 	function buildStatusErrorSession(options: {
-		errorMessage: string;
-		errorStatus: number;
+		model?: Model;
+		errorMessage?: string;
+		errorStatus?: number;
+		errorKind?: AssistantMessage["errorKind"];
+		transportFailure?: AssistantMessage["transportFailure"];
 		recoveredContent?: string;
+		partialContent?: string;
+		bareDefault?: boolean;
+		messageApi?: AssistantMessage["api"];
+		messageProvider?: string;
+		messageModel?: string;
+		requestedModels?: string[];
+		settingsOverrides?: Record<string, unknown>;
 	}): AgentSession {
-		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
-		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const model = options.model ?? getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled test model to exist");
+		authStorage.setRuntimeApiKey(model.provider, `${model.provider}-test-key`);
+		const requestedModels = options.requestedModels ?? [];
 		let calls = 0;
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: (requestedModel, context, opts) => {
 				calls++;
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
 				if (calls > 1 && options.recoveredContent) {
 					return createMockModel({ responses: [{ content: [options.recoveredContent] }] }).stream(
 						requestedModel,
@@ -106,10 +148,10 @@ describe("AgentSession resilient retry", () => {
 				queueMicrotask(() => {
 					const message: AssistantMessage = {
 						role: "assistant",
-						content: [],
-						api: requestedModel.api,
-						provider: requestedModel.provider,
-						model: requestedModel.id,
+						content: options.partialContent ? [{ type: "text", text: options.partialContent }] : [],
+						api: options.messageApi ?? requestedModel.api,
+						provider: options.messageProvider ?? requestedModel.provider,
+						model: options.messageModel ?? requestedModel.id,
 						usage: {
 							input: 0,
 							output: 0,
@@ -119,8 +161,10 @@ describe("AgentSession resilient retry", () => {
 							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 						},
 						stopReason: "error",
-						errorMessage: options.errorMessage,
-						errorStatus: options.errorStatus,
+						...(options.errorMessage === undefined ? {} : { errorMessage: options.errorMessage }),
+						...(options.errorStatus === undefined ? {} : { errorStatus: options.errorStatus }),
+						...(options.errorKind === undefined ? {} : { errorKind: options.errorKind }),
+						...(options.transportFailure === undefined ? {} : { transportFailure: options.transportFailure }),
 						timestamp: Date.now(),
 					};
 					stream.push({ type: "start", partial: message });
@@ -131,9 +175,14 @@ describe("AgentSession resilient retry", () => {
 		});
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
-			"retry.baseDelayMs": 1,
-			"retry.maxDelayMs": 10,
-			"retry.maxRetries": 1,
+			...(options.bareDefault
+				? {}
+				: {
+						"retry.baseDelayMs": 1,
+						"retry.maxDelayMs": 10,
+						"retry.maxRetries": 1,
+					}),
+			...options.settingsOverrides,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 		return new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
@@ -141,13 +190,14 @@ describe("AgentSession resilient retry", () => {
 
 	// Builds a session pinned to an explicit model (e.g. ollama-cloud) so
 	// provider-scoped retry behavior can be exercised. The mock streams as
-	// itself, so the active model's API — not the errored message's API — is
-	// what the classifier reads.
+	// itself, so the active model's API remains authoritative for provider-scoped
+	// policies that intentionally use active-model state (such as #713).
 	function buildModelSession(options: {
 		model: Model;
 		responses: Array<{ throw: string } | { content: string[] }>;
 		settingsOverrides?: Record<string, unknown>;
 		requestedModels?: string[];
+		bareDefault?: boolean;
 	}): AgentSession {
 		const { model } = options;
 		authStorage.setRuntimeApiKey(model.provider, `${model.provider}-test-key`);
@@ -163,13 +213,103 @@ describe("AgentSession resilient retry", () => {
 		});
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
-			"retry.baseDelayMs": 1,
-			"retry.maxDelayMs": 10,
-			"retry.maxRetries": 1,
+			...(options.bareDefault
+				? {}
+				: {
+						"retry.baseDelayMs": 1,
+						"retry.maxDelayMs": 10,
+						"retry.maxRetries": 1,
+					}),
 			...options.settingsOverrides,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 		return new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+	}
+	// Builds a single-model session with a BARE default retry configuration:
+	// no explicit retry.* keys are set, so `legacyRetryConfigured` is false.
+	// This mirrors the real-world default and guards the regression where
+	// provider stream timeouts silently failed without retrying (agent idle).
+	function buildBareRetrySession(options: {
+		responses: Array<{ throw: string; responseHeaders?: Record<string, string> } | { content: string[] }>;
+		requestedModels?: string[];
+		onStreamStart?: (agent: Agent) => void;
+		emitProviderPayload?: boolean;
+		extensionRunner?: ExtensionRunner;
+	}): AgentSession {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const mock = createMockModel({ responses: options.responses });
+		const extensionRunner = options.extensionRunner;
+		const requestedModels = options.requestedModels ?? [];
+		const sessionManager = SessionManager.inMemory();
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			transformContext: extensionRunner ? messages => extensionRunner.emitContext(messages) : undefined,
+			onPayload: extensionRunner ? payload => extensionRunner.emitBeforeProviderRequest(payload) : undefined,
+			streamFn: (requestedModel, context, opts) => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				options.onStreamStart?.(agent);
+				if (options.emitProviderPayload) void opts?.onPayload?.({});
+				return mock.stream(requestedModel, context, opts);
+			},
+		});
+		// Only compaction is disabled; no retry.* keys are seeded.
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		return new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			extensionRunner,
+			onResponse: extensionRunner
+				? async (response, model) => {
+						await extensionRunner.emitAfterProviderResponse(response, model);
+					}
+				: undefined,
+		});
+	}
+	function buildBareStreamingSession(options: {
+		tools?: AgentTool[];
+		streamFn: StreamFn;
+		extensionRunner?: ExtensionRunner;
+	}): AgentSession {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: options.tools ?? [], messages: [] },
+			streamFn: options.streamFn,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		return new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			extensionRunner: options.extensionRunner,
+		});
+	}
+	function createExtensionRunner(handlers = new Map<string, Array<() => Promise<void>>>()) {
+		const extension: Extension = {
+			path: "test-extension",
+			resolvedPath: "test-extension",
+			handlers: handlers as Extension["handlers"],
+			tools: new Map(),
+			messageRenderers: new Map(),
+			commands: new Map(),
+			flags: new Map(),
+			shortcuts: new Map(),
+		};
+		return new ExtensionRunner(
+			handlers.size === 0 ? [] : [extension],
+			{ flagValues: new Map(), pendingProviderRegistrations: [] } as never,
+			tempDir.path(),
+			SessionManager.inMemory(),
+			modelRegistry,
+		);
 	}
 	function track(s: AgentSession) {
 		const retryStartEvents: AutoRetryStartEvent[] = [];
@@ -208,7 +348,7 @@ describe("AgentSession resilient retry", () => {
 		expect(waitSpy).toHaveBeenCalled();
 	});
 
-	it("retries unknown / no-code errors", async () => {
+	it("retries unknown / no-code errors within retry.maxRetries", async () => {
 		session = buildSession({
 			responses: [{ throw: "weird unclassified glitch zzz" }, { content: ["recovered"] }],
 		});
@@ -219,7 +359,7 @@ describe("AgentSession resilient retry", () => {
 		await session.waitForIdle();
 
 		expect(retryStartEvents).toHaveLength(1);
-		expect(retryStartEvents[0].unbounded).toBe(true);
+		expect(retryStartEvents[0].unbounded).toBe(false);
 		expect(retryEndEvents).toHaveLength(1);
 		expect(retryEndEvents[0]).toMatchObject({ success: true });
 		expect(lastAssistant(session).stopReason).toBe("stop");
@@ -240,6 +380,112 @@ describe("AgentSession resilient retry", () => {
 		expect(last.stopReason).toBe("error");
 		expect(last.errorMessage).toContain("401");
 	});
+	it("surfaces typed provider safety stops without text and without retrying", async () => {
+		session = buildStatusErrorSession({
+			errorKind: "provider_safety_stop",
+			recoveredContent: "should not retry",
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("trigger typed provider safety stop");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		const last = lastAssistant(session);
+		expect(last.stopReason).toBe("error");
+		expect(last.errorKind).toBe("provider_safety_stop");
+		expect(last.errorMessage).toBeUndefined();
+	});
+	it("surfaces persisted legacy provider safety stops without retrying", async () => {
+		session = buildStatusErrorSession({
+			errorMessage: "Refusal (no details provided)",
+			recoveredContent: "should not retry",
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("trigger persisted legacy provider safety stop");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		const last = lastAssistant(session);
+		expect(last.stopReason).toBe("error");
+		expect(last.errorKind).toBeUndefined();
+		expect(last.errorMessage).toBe("Refusal (no details provided)");
+	});
+
+	it("surfaces provider safety refusals without retrying", async () => {
+		// Anthropic stop_reason "refusal"/"sensitive" maps to stopReason "error"
+		// with an engine-generated label (packages/ai anthropic.ts). Refusals are
+		// deterministic for the submitted context, so every retry re-sends the
+		// full conversation and deterministically refuses again (#1655).
+		const refusals = [
+			"Refusal (cyber): This request triggered restrictions on violative cyber content and was blocked under Anthropic's Usage Policy. To learn more, see https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback.",
+			"Refusal (no details provided)",
+			"Content flagged by safety filters",
+			"Blocked under Anthropic's Usage Policy.",
+			"Provider finish_reason: content_filter",
+			"provider FINISH_REASON: CONTENT_FILTER\t",
+		];
+		for (const refusal of refusals) {
+			session = buildSession({ responses: [{ throw: refusal }] });
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const { retryStartEvents } = track(session);
+
+			await session.prompt("trigger provider refusal");
+			await session.waitForIdle();
+
+			expect(retryStartEvents).toHaveLength(0);
+			const last = lastAssistant(session);
+			expect(last.stopReason).toBe("error");
+			expect(last.errorMessage).toBe(refusal);
+			await session.dispose();
+			session = undefined;
+		}
+	});
+
+	it("retries errors that merely mention legacy safety-stop labels mid-sentence", async () => {
+		const incidentalMessages = [
+			"connection error after upstream refusal handshake",
+			"connection error: content flagged by safety filters in a prior response",
+			"connection error: request was blocked under Anthropic's Usage Policy while retrying",
+			"connection error: Provider finish_reason: content_filter",
+			"Provider finish_reason: content_filter timeout",
+			"Content flagged by safety filtersXYZ",
+			"Blocked under vendor Usage Policymaker timeout",
+			"Refusal (unterminated transient transport error",
+			" Provider finish_reason: content_filter",
+			"Provider finish_reason: content_filter\n",
+			"Provider finish_reason: content_filter\r\n",
+			"Refusal: ",
+			"Refusal (cyber): ",
+			"Refusal( cyber )",
+			"Refusal ( cyber)",
+			"Refusal (cyber )",
+			"Refusal (cy(ber))",
+			"Blocked under xUsage Policy",
+			"Provider finish_reason:content_filter",
+			"Provider finish_reason:\tcontent_filter",
+			"Provider finish_reason:  content_filter",
+			"Provider finish_reason: \tcontent_filter",
+		];
+		for (const errorMessage of incidentalMessages) {
+			session = buildSession({
+				responses: [{ throw: errorMessage }, { content: ["recovered"] }],
+			});
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const { retryStartEvents } = track(session);
+
+			await session.prompt("mid-sentence legacy safety-stop label");
+			await session.waitForIdle();
+
+			expect(retryStartEvents.length).toBeGreaterThanOrEqual(1);
+			expect(lastAssistant(session).stopReason).toBe("stop");
+			await session.dispose();
+			session = undefined;
+		}
+	}, 30_000);
 
 	it("surfaces deliberate request aborts without retrying", async () => {
 		session = buildSession({ responses: [{ throw: "Request was aborted." }] });
@@ -301,15 +547,15 @@ describe("AgentSession resilient retry", () => {
 			resolveEnded = r;
 		});
 		session.subscribe(event => {
-			if (event.type === "auto_retry_start") resolveStarted();
+			if (event.type === "auto_retry_start") {
+				resolveStarted();
+				session?.retryNow();
+			}
 			if (event.type === "auto_retry_end") resolveEnded();
 		});
 
 		const prompt = session.prompt("trigger retry then retry-now").catch(() => {});
 		await started;
-		// Let the backoff wait be entered and the abort controller be assigned.
-		await Bun.sleep(50);
-		session.retryNow();
 		await ended;
 		await prompt;
 		await session.waitForIdle();
@@ -335,14 +581,15 @@ describe("AgentSession resilient retry", () => {
 			resolveEnded = r;
 		});
 		session.subscribe(event => {
-			if (event.type === "auto_retry_start") resolveStarted();
+			if (event.type === "auto_retry_start") {
+				resolveStarted();
+				session?.abortRetry();
+			}
 			if (event.type === "auto_retry_end") resolveEnded();
 		});
 
 		const prompt = session.prompt("trigger retry then cancel").catch(() => {});
 		await started;
-		await Bun.sleep(50);
-		session.abortRetry();
 		await ended;
 		await prompt;
 		await session.waitForIdle();
@@ -514,6 +761,177 @@ describe("AgentSession resilient retry", () => {
 		expect(lastAssistant(sess).stopReason).toBe("stop");
 	});
 
+	it("surfaces exact Alibaba Token Plan first-event timeouts without duplicate model retries", async () => {
+		const responsesModel = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
+		const completionsModel = getBundledModel("alibaba-token-plan", "deepseek-v4-pro");
+		if (!responsesModel || !completionsModel) throw new Error("Expected bundled Alibaba Token Plan models");
+		expect(responsesModel.api).toBe("openai-responses");
+
+		const cases = [
+			{
+				model: responsesModel,
+				errorMessage: "Provider stream timed out while waiting for the first event",
+				settingsOverrides: { "retry.maxRetries": 10 },
+				bareDefault: false,
+			},
+			{
+				model: responsesModel,
+				errorMessage: "OpenAI responses stream timed out while waiting for the first event",
+				settingsOverrides: { "retry.maxRetries": 10 },
+				bareDefault: false,
+			},
+			{
+				model: completionsModel,
+				errorMessage: "Provider stream timed out while waiting for the first event",
+				settingsOverrides: undefined,
+				bareDefault: true,
+			},
+			{
+				model: completionsModel,
+				errorMessage: "OpenAI completions stream timed out while waiting for the first event",
+				settingsOverrides: undefined,
+				bareDefault: true,
+			},
+		] as const;
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		for (const testCase of cases) {
+			const requestedModels: string[] = [];
+			session = buildStatusErrorSession({
+				model: testCase.model,
+				errorMessage: testCase.errorMessage,
+				recoveredContent: "unused retry",
+				requestedModels,
+				bareDefault: testCase.bareDefault,
+				settingsOverrides: testCase.settingsOverrides,
+			});
+			const { retryStartEvents, retryEndEvents } = track(session);
+
+			await session.prompt(`Alibaba ${testCase.model.api} first-event timeout`);
+			await session.waitForIdle();
+
+			expect(requestedModels).toEqual([`${testCase.model.provider}/${testCase.model.id}`]);
+			expect(new Set(requestedModels).size).toBe(requestedModels.length);
+			expect(retryStartEvents).toHaveLength(0);
+			expect(retryEndEvents).toHaveLength(0);
+			expect(waitSpy).not.toHaveBeenCalled();
+			const final = lastAssistant(session);
+			expect(final).toMatchObject({
+				stopReason: "error",
+				provider: testCase.model.provider,
+				api: testCase.model.api,
+				model: testCase.model.id,
+				errorMessage: testCase.errorMessage,
+			});
+			expect(session.isRetrying).toBe(false);
+			expect(session.isStreaming).toBe(false);
+
+			await session.dispose();
+			session = undefined;
+			waitSpy.mockClear();
+		}
+	});
+
+	it("uses failed AssistantMessage identity rather than the active model for Alibaba timeout policy", async () => {
+		const alibabaModel = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
+		const anthropicModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!alibabaModel || !anthropicModel) throw new Error("Expected bundled test models");
+		const timeoutMessage = "Provider stream timed out while waiting for the first event";
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		const retryRequestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			model: alibabaModel,
+			errorMessage: timeoutMessage,
+			messageProvider: "openai",
+			messageApi: "openai-responses",
+			recoveredContent: "recovered after provider mismatch",
+			requestedModels: retryRequestedModels,
+		});
+		const retryEvents = track(session);
+		await session.prompt("Alibaba active model with non-Alibaba failed message");
+		await session.waitForIdle();
+		expect(retryRequestedModels).toHaveLength(2);
+		expect(retryEvents.retryStartEvents).toHaveLength(1);
+		expect(lastAssistant(session).stopReason).toBe("stop");
+		await session.dispose();
+		session = undefined;
+		waitSpy.mockClear();
+
+		const terminalRequestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			model: anthropicModel,
+			errorMessage: timeoutMessage,
+			messageProvider: "alibaba-token-plan",
+			messageApi: "openai-responses",
+			messageModel: alibabaModel.id,
+			recoveredContent: "should-not-reach",
+			requestedModels: terminalRequestedModels,
+		});
+		const terminalEvents = track(session);
+		await session.prompt("Non-Alibaba active model with Alibaba failed message");
+		await session.waitForIdle();
+		expect(terminalRequestedModels).toHaveLength(1);
+		expect(terminalEvents.retryStartEvents).toHaveLength(0);
+		expect(waitSpy).not.toHaveBeenCalled();
+		expect(lastAssistant(session)).toMatchObject({
+			stopReason: "error",
+			provider: "alibaba-token-plan",
+			api: "openai-responses",
+			model: alibabaModel.id,
+			errorMessage: timeoutMessage,
+		});
+	});
+
+	it("keeps Alibaba near misses, cross-API text, and unrelated transient failures retryable", async () => {
+		const responsesModel = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
+		const completionsModel = getBundledModel("alibaba-token-plan", "deepseek-v4-pro");
+		if (!responsesModel || !completionsModel) throw new Error("Expected bundled Alibaba Token Plan models");
+		const cases = [
+			{
+				model: responsesModel,
+				errorMessage: "Error: OpenAI responses stream timed out while waiting for the first event",
+			},
+			{
+				model: responsesModel,
+				errorMessage: "OpenAI responses stream timed out while waiting for the first event.",
+			},
+			{
+				model: responsesModel,
+				errorMessage: "OpenAI completions stream timed out while waiting for the first event",
+			},
+			{
+				model: completionsModel,
+				errorMessage: "OpenAI responses stream timed out while waiting for the first event",
+			},
+			{ model: completionsModel, errorMessage: "Alibaba stream stalled while waiting for the next event" },
+			{ model: completionsModel, errorMessage: "503 service unavailable" },
+			{ model: completionsModel, errorMessage: "429 rate limit exceeded" },
+			{ model: completionsModel, errorMessage: "network error: connection reset" },
+		] as const;
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		for (const testCase of cases) {
+			const requestedModels: string[] = [];
+			session = buildModelSession({
+				model: testCase.model,
+				responses: [{ throw: testCase.errorMessage }, { content: ["recovered"] }],
+				requestedModels,
+			});
+			const { retryStartEvents, retryEndEvents } = track(session);
+			await session.prompt(`Alibaba non-terminal ${testCase.errorMessage}`);
+			await session.waitForIdle();
+			expect(requestedModels).toHaveLength(2);
+			expect(retryStartEvents).toHaveLength(1);
+			expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
+			expect(lastAssistant(session).stopReason).toBe("stop");
+			expect(waitSpy).toHaveBeenCalled();
+			await session.dispose();
+			session = undefined;
+			waitSpy.mockClear();
+		}
+	});
+
 	it("bounds ollama-cloud first-event timeout retries instead of looping unbounded (#713)", async () => {
 		// ollama-cloud (ollama-chat API) can stall before its first token even
 		// for tiny prompts. Unbounded continuation retries re-issue the full
@@ -547,6 +965,26 @@ describe("AgentSession resilient retry", () => {
 		expect(last.errorMessage).toContain("first event");
 		expect(waitSpy).toHaveBeenCalled();
 	});
+	it("surfaces a Kimi Code first-event timeout after its continuous wait without replaying the request", async () => {
+		const model = getBundledModel("kimi-code", "kimi-k2.5");
+		if (!model) throw new Error("Expected bundled Kimi Code test model to exist");
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			model,
+			errorMessage: "Provider stream timed out while waiting for the first event",
+			requestedModels,
+		});
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt("slow Kimi request");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		expect(retryEndEvents).toHaveLength(0);
+		expect(requestedModels).toHaveLength(1);
+		expect(lastAssistant(session).stopReason).toBe("error");
+		expect(lastAssistant(session).errorMessage).toContain("first event");
+	});
 
 	it("keeps first-party first-event timeout retries unbounded (#713 scope guard)", async () => {
 		// The fix is scoped to ollama-cloud: first-party providers keep their
@@ -574,5 +1012,450 @@ describe("AgentSession resilient retry", () => {
 		expect(retryEndEvents).toHaveLength(1);
 		expect(retryEndEvents[0]).toMatchObject({ success: true });
 		expect(lastAssistant(session).stopReason).toBe("stop");
+	});
+	it("retries provider stream first-event timeouts under a bare default config (single model)", async () => {
+		// Regression: with a single default model and NO explicit retry.* keys,
+		// a provider stream timeout used to fail the turn without retrying and
+		// leave the agent idle. Clearly-transient stream timeouts must retry even
+		// under the default configuration.
+		const requestedModels: string[] = [];
+		session = buildBareRetrySession({
+			responses: [
+				{ throw: "Example Provider Watchdog stream timed out while waiting for the first event" },
+				{ content: ["recovered"] },
+			],
+			requestedModels,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt("bare-config first-event timeout");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(1);
+		expect(requestedModels).toHaveLength(2);
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: true });
+		expect(lastAssistant(session).stopReason).toBe("stop");
+	});
+	it("retries a bare-default watchdog with an empty extension runner", async () => {
+		const requestedModels: string[] = [];
+		session = buildBareRetrySession({
+			responses: [
+				{ throw: "Example Provider Watchdog stream timed out while waiting for the first event" },
+				{ content: ["recovered"] },
+			],
+			requestedModels,
+			extensionRunner: createExtensionRunner(),
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt("bare-config empty extension watchdog");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(1);
+		expect(requestedModels).toHaveLength(2);
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
+		expect(lastAssistant(session).stopReason).toBe("stop");
+	});
+	it("does not replay a bare-default watchdog after a reasoning summary start hook participates", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let hookCalls = 0;
+		let streamCalls = 0;
+		session = buildBareStreamingSession({
+			streamFn: () => {
+				streamCalls++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const failure = assistantMessage(
+						model,
+						[],
+						"error",
+						"Example Provider Watchdog stream stalled while waiting for the next event",
+					);
+					stream.push({ type: "start", partial: failure });
+					stream.push({ type: "reasoning_summary_start", contentIndex: 0, partial: failure });
+					stream.push({ type: "error", reason: "error", error: failure });
+				});
+				return stream;
+			},
+			extensionRunner: createExtensionRunner(
+				new Map([
+					[
+						"reasoning_summary_start",
+						[
+							async () => {
+								hookCalls++;
+							},
+						],
+					],
+				]),
+			),
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("bare-config reasoning summary start watchdog");
+		await session.waitForIdle();
+
+		expect(hookCalls).toBe(1);
+		expect(retryStartEvents).toHaveLength(0);
+		expect(streamCalls).toBe(1);
+		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+	it("does not replay a bare-default watchdog after an extension hook participates", async () => {
+		let hookCalls = 0;
+		const requestedModels: string[] = [];
+		session = buildBareRetrySession({
+			responses: [
+				{ throw: "Example Provider Watchdog stream timed out while waiting for the first event" },
+				{ content: ["should-not-reach"] },
+			],
+			requestedModels,
+			extensionRunner: createExtensionRunner(
+				new Map([
+					[
+						"agent_start",
+						[
+							async () => {
+								hookCalls++;
+							},
+						],
+					],
+				]),
+			),
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("bare-config extension hook watchdog");
+		await session.waitForIdle();
+
+		expect(hookCalls).toBe(1);
+		expect(retryStartEvents).toHaveLength(0);
+		expect(requestedModels).toHaveLength(1);
+		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+	it("does not replay bare-default watchdogs after provider lifecycle handlers participate", async () => {
+		for (const eventType of ["context", "before_provider_request", "after_provider_response"] as const) {
+			let hookCalls = 0;
+			const requestedModels: string[] = [];
+			session = buildBareRetrySession({
+				responses: [
+					{
+						throw: "Example Provider Watchdog stream timed out while waiting for the first event",
+						...(eventType === "after_provider_response" ? { responseHeaders: { "x-request-id": "test" } } : {}),
+					},
+					{ content: ["should-not-reach"] },
+				],
+				requestedModels,
+				emitProviderPayload: eventType === "before_provider_request",
+				extensionRunner: createExtensionRunner(
+					new Map([
+						[
+							eventType,
+							[
+								async () => {
+									hookCalls++;
+								},
+							],
+						],
+					]),
+				),
+			});
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const { retryStartEvents } = track(session);
+
+			await session.prompt(`bare-config ${eventType} lifecycle watchdog`);
+			await session.waitForIdle();
+
+			expect(hookCalls).toBe(1);
+			expect(retryStartEvents).toHaveLength(0);
+			expect(requestedModels).toHaveLength(1);
+			expect(lastAssistant(session).stopReason).toBe("error");
+			await session.dispose();
+			session = undefined;
+		}
+	});
+	it("does not replay a second bare-default watchdog after auto_retry_start handlers participate", async () => {
+		let hookCalls = 0;
+		const requestedModels: string[] = [];
+		session = buildBareRetrySession({
+			responses: [
+				{ throw: "Example Provider Watchdog stream timed out while waiting for the first event" },
+				{ throw: "Example Provider Watchdog stream timed out while waiting for the first event" },
+				{ content: ["should-not-reach"] },
+			],
+			requestedModels,
+			extensionRunner: createExtensionRunner(
+				new Map([
+					[
+						"auto_retry_start",
+						[
+							async () => {
+								hookCalls++;
+							},
+						],
+					],
+				]),
+			),
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("bare-config auto-retry lifecycle watchdog");
+		await session.waitForIdle();
+
+		expect(hookCalls).toBe(1);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(requestedModels).toHaveLength(2);
+		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+
+	it("retries provider stream idle stalls under a bare default config (single model)", async () => {
+		const requestedModels: string[] = [];
+		session = buildBareRetrySession({
+			responses: [
+				{ throw: "Anthropic stream stalled while waiting for the next event" },
+				{ content: ["recovered"] },
+			],
+			requestedModels,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt("bare-config idle stall");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(1);
+		expect(requestedModels).toHaveLength(2);
+		expect(retryEndEvents[0]).toMatchObject({ success: true });
+		expect(lastAssistant(session).stopReason).toBe("stop");
+	});
+	it("fails closed on structured watchdog facts and actual streamed partial output under bare defaults", async () => {
+		for (const partialOutput of [false, true]) {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+			const streamedDeltas: string[] = [];
+			session = buildBareStreamingSession({
+				streamFn: () => {
+					const stream = new AssistantMessageEventStream();
+					queueMicrotask(() => {
+						const empty = assistantMessage(
+							model,
+							[],
+							"error",
+							"Example Provider Watchdog stream timed out while waiting for the first event",
+						);
+						if (!partialOutput) empty.transportFailure = { kind: "transport", status: 503 };
+						stream.push({ type: "start", partial: empty });
+						if (partialOutput) {
+							const visible = assistantMessage(
+								model,
+								[{ type: "text", text: "already visible" }],
+								"error",
+								"Example Provider Watchdog stream timed out while waiting for the first event",
+							);
+							stream.push({ type: "text_start", contentIndex: 0, partial: empty });
+							stream.push({ type: "text_delta", contentIndex: 0, delta: "already ", partial: visible });
+							stream.push({ type: "text_delta", contentIndex: 0, delta: "visible", partial: visible });
+							streamedDeltas.push("already ", "visible");
+							stream.push({ type: "error", reason: "error", error: visible });
+							return;
+						}
+						stream.push({ type: "error", reason: "error", error: empty });
+					});
+					return stream;
+				},
+			});
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const { retryStartEvents } = track(session);
+			const observedDeltas: string[] = [];
+			session.subscribe(event => {
+				if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+					observedDeltas.push(event.assistantMessageEvent.delta);
+				}
+			});
+
+			await session.prompt("bare-config unsafe watchdog");
+			await session.waitForIdle();
+
+			expect(retryStartEvents).toHaveLength(0);
+			expect(lastAssistant(session).stopReason).toBe("error");
+			if (partialOutput) {
+				expect(observedDeltas).toEqual(streamedDeltas);
+				expect(lastAssistant(session).content).toEqual([{ type: "text", text: "already visible" }]);
+			}
+			await session.dispose();
+			session = undefined;
+		}
+	});
+	it("does not replay a bare-default watchdog after a registered tool completes and continues", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const toolCall: ToolCall = { type: "toolCall", id: "counted-tool-call", name: "counted", arguments: {} };
+		let toolRuns = 0;
+		let streamCalls = 0;
+		const countedTool: AgentTool = {
+			name: "counted",
+			label: "Counted",
+			description: "Counts real executions for replay-safety coverage",
+			parameters: z.object({}),
+			execute: async () => {
+				toolRuns++;
+				return { content: [{ type: "text" as const, text: "counted result" }] };
+			},
+		};
+		session = buildBareStreamingSession({
+			tools: [countedTool],
+			streamFn: () => {
+				streamCalls++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (streamCalls === 1) {
+						const response = assistantMessage(model, [toolCall], "toolUse");
+						stream.push({ type: "start", partial: response });
+						stream.push({ type: "done", reason: "toolUse", message: response });
+						return;
+					}
+					const failure = assistantMessage(
+						model,
+						[],
+						"error",
+						"Example Provider Watchdog stream timed out while waiting for the first event",
+					);
+					stream.push({ type: "start", partial: failure });
+					stream.push({ type: "error", reason: "error", error: failure });
+				});
+				return stream;
+			},
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("real counted tool watchdog");
+		await session.waitForIdle();
+
+		expect(toolRuns).toBe(1);
+		expect(session.agent.state.messages).toContainEqual(
+			expect.objectContaining({ role: "toolResult", toolCallId: toolCall.id, toolName: "counted" }),
+		);
+		expect(streamCalls).toBe(2);
+		expect(retryStartEvents).toHaveLength(0);
+		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+	it("gives an active cancel-and-submit replacement a clean retry epoch", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const originalStarted = Promise.withResolvers<void>();
+		const originalAborted = Promise.withResolvers<void>();
+		const originalStream = new AssistantMessageEventStream();
+		let streamCalls = 0;
+		session = buildBareStreamingSession({
+			streamFn: (_requestedModel, _context, options) => {
+				streamCalls++;
+				if (streamCalls === 1) {
+					queueMicrotask(() => {
+						originalStream.push({ type: "start", partial: assistantMessage(model, [], "stop") });
+						originalStarted.resolve();
+						options?.signal?.addEventListener(
+							"abort",
+							() => {
+								originalAborted.resolve();
+								const aborted = assistantMessage(model, [], "aborted", "Aborted");
+								originalStream.push({ type: "error", reason: "aborted", error: aborted });
+							},
+							{ once: true },
+						);
+					});
+					return originalStream;
+				}
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (streamCalls === 2) {
+						const failure = assistantMessage(
+							model,
+							[],
+							"error",
+							"Example Provider Watchdog stream timed out while waiting for the first event",
+						);
+						stream.push({ type: "start", partial: failure });
+						stream.push({ type: "error", reason: "error", error: failure });
+						return;
+					}
+					const recovered = assistantMessage(model, [{ type: "text", text: "replacement recovered" }], "stop");
+					stream.push({ type: "start", partial: recovered });
+					stream.push({ type: "done", reason: "stop", message: recovered });
+				});
+				return stream;
+			},
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		const originalPrompt = session.prompt("original");
+		await originalStarted.promise;
+		expect(await session.cancelAndSubmit("replacement")).toEqual({ kind: "submitted" });
+		await originalAborted.promise;
+		await originalPrompt;
+		await session.waitForIdle();
+		originalStream.push({
+			type: "done",
+			reason: "stop",
+			message: assistantMessage(model, [{ type: "text", text: "late original" }], "stop"),
+		});
+		await Promise.resolve();
+
+		expect(streamCalls).toBe(3);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
+		expect(session.agent.state.messages.some(message => JSON.stringify(message).includes("late original"))).toBe(
+			false,
+		);
+		expect(lastAssistant(session).content).toEqual([{ type: "text", text: "replacement recovered" }]);
+	});
+	it("fails closed on non-canonical watchdog prose under bare defaults", async () => {
+		const nearMisses = [
+			"stream timed out while waiting for the first event",
+			"Error: Provider stream timed out while waiting for the first event",
+			"Provider stream timed out while waiting for the first event.",
+			"Provider stream timeout waiting for first event",
+		];
+		for (const errorMessage of nearMisses) {
+			const requestedModels: string[] = [];
+			session = buildBareRetrySession({
+				responses: [{ throw: errorMessage }, { content: ["should-not-reach"] }],
+				requestedModels,
+			});
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const { retryStartEvents } = track(session);
+
+			await session.prompt("bare-config watchdog near miss");
+			await session.waitForIdle();
+
+			expect(retryStartEvents).toHaveLength(0);
+			expect(requestedModels).toHaveLength(1);
+			expect(lastAssistant(session).stopReason).toBe("error");
+			await session.dispose();
+			session = undefined;
+		}
+	});
+
+	it("still fails closed on generic unknown errors under a bare default config", async () => {
+		// The fix is scoped to clearly-transient failures. Generic unknown
+		// provider errors preserve the historical fail-closed behavior when no
+		// explicit retry.* settings opt into the resilient legacy retry path.
+		const requestedModels: string[] = [];
+		session = buildBareRetrySession({
+			responses: [{ throw: "some unexpected provider explosion" }, { content: ["should-not-reach"] }],
+			requestedModels,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("bare-config unknown error");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		expect(requestedModels).toHaveLength(1);
+		expect(lastAssistant(session).stopReason).toBe("error");
 	});
 });

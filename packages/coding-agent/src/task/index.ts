@@ -17,13 +17,12 @@ import * as os from "node:os";
 import path from "node:path";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { Model, Usage } from "@gajae-code/ai";
-import { $env, prompt, Snowflake } from "@gajae-code/utils";
+import { $pickenv, prompt, Snowflake } from "@gajae-code/utils";
 import type { ToolSession } from "..";
-import { AsyncJobManager } from "../async";
+import { AsyncJobManager, OwnerSubagentShutdownError, type ResumeRunner } from "../async";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { Theme } from "../modes/theme/theme";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
-import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import type { ForkContextSeed } from "../session/agent-session";
@@ -34,24 +33,37 @@ import {
 	type ForkContextMode,
 	type ForkContextPolicy,
 	getTaskSchema,
+	hasCompleteAggregateUsageCostBreakdown,
 	type SingleResult,
 	type TaskItem,
 	type TaskParams,
 	type TaskToolDetails,
 	type TaskToolSchemaInstance,
 } from "./types";
+
 // Import review tools for side effects (registers subagent tool handlers)
 import "../tools/review";
-import type { LocalProtocolOptions } from "../internal-urls";
+import {
+	assertExecutionRootMatchesRepositoryBinding,
+	assertPathUnderRepositoryBinding,
+	captureRepositoryBinding,
+	publicRepositoryBinding,
+	type RepositoryBinding,
+	RepositoryBindingError,
+	resolveTaskRepositoryBinding,
+} from "../gjc-runtime/repository-binding";
+import { initializeLocalRoot, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
 import { discoverAgents, filterVisibleAgents, getAgent } from "./discovery";
-import { runSubprocess } from "./executor";
+import { createManagedTaskPersistence, renderSubagentUserPrompt, runSubprocess } from "./executor";
 import { adviseForkContextMode } from "./fork-context-advisory";
+import { FORK_CONTEXT_TOKEN_BUDGET_BY_MODE } from "./fork-context-budget";
 import { getTaskIdValidationError, validateAllocatedTaskId } from "./id";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimit, Semaphore } from "./parallel";
 import { assertNoRawTaskFields, buildTaskReceipt, buildTaskRoiSummary } from "./receipt";
+
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { reconcileSpawnRoi } from "./roi-reconciliation";
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "./simple-mode";
@@ -83,11 +95,8 @@ interface TaskResumeDescriptor {
 function isTaskResumeDescriptor(value: unknown): value is TaskResumeDescriptor {
 	return typeof value === "object" && value !== null && "task" in value && "params" in value;
 }
-function renderSubagentUserPrompt(assignment: string, simpleMode: TaskSimpleMode): string {
-	return prompt.render(subagentUserPromptTemplate, {
-		assignment: assignment.trim(),
-		independentMode: simpleMode === "independent",
-	});
+function renderTaskAssignment(assignment: string, simpleMode: TaskSimpleMode): string {
+	return renderSubagentUserPrompt(assignment, simpleMode === "independent");
 }
 function createUsageTotals(): Usage {
 	return {
@@ -126,6 +135,43 @@ function addUsageTotals(target: Usage, usage: Partial<Usage>): void {
 	target.cost.cacheRead += cost.cacheRead;
 	target.cost.cacheWrite += cost.cacheWrite;
 	target.cost.total += cost.total;
+}
+
+/**
+ * Stamp/resolve repository authority for every task before agent discovery or spawn.
+ * Omitted bindings inherit the session worktree; declared ones must match it.
+ */
+async function resolveTaskItemsWithRepositoryBindings(
+	cwd: string,
+	tasks: readonly TaskItem[],
+): Promise<{ tasks: TaskItem[]; error?: string }> {
+	const resolved: TaskItem[] = [];
+	for (const task of tasks) {
+		try {
+			const binding = await resolveTaskRepositoryBinding(cwd, task.repositoryBinding);
+			if (binding.relativeSubdir) {
+				assertPathUnderRepositoryBinding(binding, ".");
+			}
+			resolved.push({
+				...task,
+				repositoryBinding: binding,
+			});
+		} catch (error) {
+			const id = task.id?.trim() ? task.id : "(missing-id)";
+			if (error instanceof RepositoryBindingError) {
+				return { tasks: [], error: `Task "${id}" repository binding rejected: ${error.message}` };
+			}
+			return {
+				tasks: [],
+				error: `Task "${id}" repository binding rejected: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
+	}
+	return { tasks: resolved };
+}
+
+function repositoryBindingFromTask(task: TaskItem): RepositoryBinding | undefined {
+	return task.repositoryBinding ? publicRepositoryBinding(task.repositoryBinding as RepositoryBinding) : undefined;
 }
 
 function validateTaskIdsForScheduling(tasks: readonly TaskItem[]): string | undefined {
@@ -178,6 +224,10 @@ export {
 /**
  * Render the tool description from a cached agent list and current settings.
  */
+function hasAvailableIrcTool(session: ToolSession): boolean {
+	return session.settings.get("irc.enabled") === true && session.getToolByName?.("irc") !== undefined;
+}
+
 function renderDescription(
 	agents: AgentDefinition[],
 	maxConcurrency: number,
@@ -285,25 +335,32 @@ function requestsForkContext(
 	return FORK_CONTEXT_REQUEST_MODE_SET.has(task.inheritContext);
 }
 
+function normalizeForkContextCap(value: number | undefined, fallback: number, maximum: number): number {
+	if (value === undefined || !Number.isFinite(value) || value <= 0) return fallback;
+	return Math.min(maximum, Math.max(1, Math.trunc(value)));
+}
+
 function resolveForkSeedParamsForMode(
 	mode: ForkContextMode,
 	configuredMaxMessages: number | undefined,
 	configuredMaxTokens: number,
 	model: Model | undefined,
-): { maxMessages: number; maxTokens: number } | undefined {
+): { maxMessages: number; maxTokens: number; preserveLatestUser?: boolean } | undefined {
 	const capMessages = (defaultMaxMessages: number): number =>
-		configuredMaxMessages === undefined
-			? defaultMaxMessages
-			: Math.min(defaultMaxMessages, Math.max(0, Math.trunc(configuredMaxMessages)));
+		normalizeForkContextCap(configuredMaxMessages, defaultMaxMessages, defaultMaxMessages);
 	switch (mode) {
 		case "none":
 			return undefined;
 		case "receipt":
-			return { maxMessages: 1, maxTokens: 64 };
+			return { maxMessages: 1, maxTokens: FORK_CONTEXT_TOKEN_BUDGET_BY_MODE.receipt };
 		case "last-turn":
-			return { maxMessages: 2, maxTokens: 250 };
+			return {
+				maxMessages: 2,
+				maxTokens: FORK_CONTEXT_TOKEN_BUDGET_BY_MODE["last-turn"],
+				preserveLatestUser: true,
+			};
 		case "bounded":
-			return { maxMessages: capMessages(50), maxTokens: 250 };
+			return { maxMessages: capMessages(50), maxTokens: FORK_CONTEXT_TOKEN_BUDGET_BY_MODE.bounded };
 		case "full":
 			return { maxMessages: capMessages(500), maxTokens: resolveForkContextMaxTokens(configuredMaxTokens, model) };
 		default:
@@ -335,9 +392,12 @@ function validateForkContextRequests(
 }
 
 export function resolveForkContextMaxTokens(configured: number, model: Model | undefined): number {
-	if (configured > 0) return Math.trunc(configured);
-	const contextWindow = model?.contextWindow ?? 0;
-	return contextWindow > 0 ? Math.max(1, Math.floor(contextWindow * 0.15)) : 15_000;
+	const contextWindow = model?.contextWindow;
+	const fallback =
+		contextWindow && Number.isFinite(contextWindow) && contextWindow > 0
+			? Math.max(1, Math.floor(contextWindow * 0.15))
+			: 15_000;
+	return normalizeForkContextCap(configured, fallback, Number.MAX_SAFE_INTEGER);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -381,16 +441,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			true,
 			disabledAgents,
 			this.#getTaskSimpleMode(),
-			this.session.settings.get("irc.enabled") === true,
+			hasAvailableIrcTool(this.session),
 			this.session.getSessionSpawns() ?? "*",
 		);
 	}
+	readonly #sessionRepositoryBinding: RepositoryBinding;
+
 	private constructor(
 		private readonly session: ToolSession,
 		discoveredAgents: AgentDefinition[],
+		sessionRepositoryBinding: RepositoryBinding,
 	) {
-		this.#blockedAgent = $env.PI_BLOCKED_AGENT;
+		this.#blockedAgent = $pickenv("GJC_BLOCKED_AGENT", "PI_BLOCKED_AGENT");
 		this.#discoveredAgents = discoveredAgents;
+		this.#sessionRepositoryBinding = sessionRepositoryBinding;
 	}
 
 	#getTaskSimpleMode(): TaskSimpleMode {
@@ -398,11 +462,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	}
 
 	/**
-	 * Create a TaskTool instance with async agent discovery.
+	 * Create a TaskTool instance.
+	 * Repository authority is captured from session cwd *before* agent discovery so
+	 * multi-repo workspaces fail closed prior to context/discovery (#2901).
 	 */
 	static async create(session: ToolSession): Promise<TaskTool> {
+		const sessionRepositoryBinding = await captureRepositoryBinding(session.cwd, { displayPath: session.cwd });
+		// Authority check before discovery: session cwd must resolve to a stable binding.
+		await assertExecutionRootMatchesRepositoryBinding(session.cwd, sessionRepositoryBinding);
 		const { agents } = await discoverAgents(session.cwd);
-		return new TaskTool(session, agents);
+		return new TaskTool(session, agents, publicRepositoryBinding(sessionRepositoryBinding));
 	}
 
 	async execute(
@@ -418,13 +487,32 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			return createTaskModeError(validationError);
 		}
 
-		const taskItems = params.tasks ?? [];
-		const taskIdValidationError = validateTaskIdsForScheduling(taskItems);
+		// Re-verify session authority before using any discovered agents or scheduling work.
+		try {
+			await assertExecutionRootMatchesRepositoryBinding(this.session.cwd, this.#sessionRepositoryBinding);
+		} catch (error) {
+			const message =
+				error instanceof RepositoryBindingError
+					? error.message
+					: error instanceof Error
+						? error.message
+						: String(error);
+			return createTaskModeError(`Session repository binding rejected before task discovery: ${message}`);
+		}
+
+		const rawTaskItems = params.tasks ?? [];
+		const taskIdValidationError = validateTaskIdsForScheduling(rawTaskItems);
 		if (taskIdValidationError) {
 			return createTaskModeError(taskIdValidationError);
 		}
+		const bindingResolution = await resolveTaskItemsWithRepositoryBindings(this.session.cwd, rawTaskItems);
+		if (bindingResolution.error) {
+			return createTaskModeError(bindingResolution.error);
+		}
+		const taskItems = bindingResolution.tasks;
+		const paramsWithBindings: TaskParams = { ...params, tasks: taskItems };
 		if (taskItems.length === 0) {
-			return this.#executeSync(_toolCallId, params, signal, onUpdate);
+			return this.#executeSync(_toolCallId, paramsWithBindings, signal, onUpdate);
 		}
 		const agent = getAgent(this.#discoveredAgents, params.agent);
 		if (!agent) {
@@ -499,7 +587,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				agent: params.agent,
 				agentSource: fallbackAgentSource,
 				status: "pending",
-				task: renderSubagentUserPrompt(assignment, simpleMode),
+				task: renderTaskAssignment(assignment, simpleMode),
 				assignment,
 				description: taskItem.description,
 				recentTools: [],
@@ -539,8 +627,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		};
 
 		const maxConcurrency = this.session.settings.get("task.maxConcurrency");
+		let resumeRunner: ResumeRunner | undefined;
 		if (typeof manager.setResumeRunner === "function") {
-			manager.setResumeRunner((_subagentId, message, resumeDescriptor) => {
+			resumeRunner = (_subagentId, message, resumeDescriptor) => {
 				const descriptor = isTaskResumeDescriptor(resumeDescriptor?.data) ? resumeDescriptor.data : undefined;
 				if (!descriptor) return undefined;
 				const forkSeeds = descriptor.forkContextSeed
@@ -566,7 +655,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						);
 						const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
 						const singleResult = result.details?.results[0];
-						return singleResult?.paused ? { kind: "paused" } : finalText;
+						if (singleResult?.paused) return { kind: "paused" };
+						// A resumed subprocess that aborted or exited non-zero is a failed
+						// resume, not a completed one. Throw the rendered failure summary
+						// (finalText) so the leg is reported failed instead of being
+						// returned as successful continuation.
+						if (singleResult && ((singleResult.aborted ?? false) || singleResult.exitCode !== 0)) {
+							throw new Error(finalText);
+						}
+						return finalText;
 					},
 					{
 						id: `${descriptor.task.id}-resume-${Snowflake.next()}`,
@@ -582,7 +679,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						},
 					},
 				);
-			});
+			};
+			manager.setResumeRunner(resumeRunner);
 		}
 		const semaphore = new Semaphore(maxConcurrency);
 		const buildForkContextSeedForTask = async (task: TaskItem): Promise<ForkContextSeed | undefined> => {
@@ -607,8 +705,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			});
 		};
 		const frozenForkSeeds = new Map<string, ForkContextSeed>();
+		const asyncParentArtifactManager = this.session.getArtifactManager?.() ?? undefined;
 		const parentSessionFileForBatch = this.session.getSessionFile();
 		const batchArtifactsDir = parentSessionFileForBatch ? parentSessionFileForBatch.slice(0, -6) : null;
+		let externalTaskSessionsDir: string | undefined;
+		if (!batchArtifactsDir) {
+			const asyncLocalOptions: LocalProtocolOptions = {
+				getArtifactsDir: this.session.getArtifactsDir ?? (() => null),
+				isManagedDestination: this.session.isManagedSessionDestination,
+				getSessionId: this.session.getSessionId ?? (() => null),
+			};
+			await initializeLocalRoot(asyncLocalOptions);
+			externalTaskSessionsDir = resolveLocalUrlToPath("local://subagents/sessions", asyncLocalOptions);
+			await fs.mkdir(externalTaskSessionsDir, { recursive: true, mode: 0o700 });
+		}
 
 		for (let i = 0; i < taskItems.length; i++) {
 			const taskItem = taskItems[i];
@@ -623,11 +733,25 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 			const uniqueId = validateAllocatedTaskId(uniqueIds[i] ?? "");
 			const frozenForkSeed = await buildForkContextSeedForTask(taskItem);
+			if (signal?.aborted) {
+				for (let skippedIndex = i; skippedIndex < taskItems.length; skippedIndex++) {
+					const skippedTask = taskItems[skippedIndex]!;
+					failedSchedules.push(`${skippedTask.id}: cancelled before scheduling`);
+					const skippedProgress = progressByTaskId.get(skippedTask.id);
+					if (skippedProgress) skippedProgress.status = "aborted";
+				}
+				break;
+			}
 			if (frozenForkSeed) frozenForkSeeds.set(uniqueId, frozenForkSeed);
 			const singleParams: TaskParams = { ...params, tasks: [taskItem] };
 			const label = uniqueId;
 			try {
-				const subtaskSessionFile = batchArtifactsDir ? path.join(batchArtifactsDir, `${uniqueId}.jsonl`) : null;
+				const managedPersistence = asyncParentArtifactManager?.getManagedStore()
+					? createManagedTaskPersistence(asyncParentArtifactManager, uniqueId)
+					: undefined;
+				const subtaskSessionFile = managedPersistence
+					? null
+					: path.join(batchArtifactsDir ?? externalTaskSessionsDir!, `${uniqueId}.jsonl`);
 				const jobId = manager.register(
 					"task",
 					label,
@@ -762,18 +886,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				);
 				startedJobs.push({ jobId, taskId: taskItem.id });
 				if (typeof manager.registerResumeDescriptor === "function") {
-					manager.registerResumeDescriptor({
-						subagentId: uniqueId,
-						ownerId: this.session.getAgentId?.() ?? undefined,
-						data: {
-							toolCallId: _toolCallId,
-							params,
-							task: { ...taskItem, id: uniqueId },
-							sessionFile: subtaskSessionFile,
-							forkContextSeed: frozenForkSeed,
-							agentSource: fallbackAgentSource,
-						} satisfies TaskResumeDescriptor,
-					});
+					manager.registerResumeDescriptor(
+						{
+							subagentId: uniqueId,
+							ownerId: this.session.getAgentId?.() ?? undefined,
+							data: {
+								toolCallId: _toolCallId,
+								params,
+								task: { ...taskItem, id: uniqueId },
+								sessionFile: subtaskSessionFile,
+								forkContextSeed: frozenForkSeed,
+								agentSource: fallbackAgentSource,
+							} satisfies TaskResumeDescriptor,
+						},
+						resumeRunner,
+					);
 				}
 				if (typeof manager.registerSubagentRecord === "function") {
 					manager.registerSubagentRecord({
@@ -782,12 +909,17 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						currentJobId: jobId,
 						historicalJobIds: [],
 						status: manager.getJob(jobId)?.status ?? "running",
-						sessionFile: subtaskSessionFile,
-						resumable: !!batchArtifactsDir,
+						sessionFile: null,
+						resumable: true,
 					});
 				}
 			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
+				const message =
+					error instanceof OwnerSubagentShutdownError
+						? error.message
+						: error instanceof Error
+							? error.message
+							: String(error);
 				failedSchedules.push(`${taskItem.id}: ${message}`);
 				const progress = progressByTaskId.get(taskItem.id);
 				if (progress) {
@@ -814,7 +946,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				? ` Failed to schedule ${failedSchedules.length} task${failedSchedules.length === 1 ? "" : "s"}.`
 				: "";
 
-		const ircEnabled = this.session.settings.get("irc.enabled") === true;
+		const ircEnabled = hasAvailableIrcTool(this.session);
 		const taskIdByItemId = new Map<string, string>();
 		for (let i = 0; i < taskItems.length; i++) {
 			taskIdByItemId.set(taskItems[i].id, uniqueIds[i]);
@@ -868,13 +1000,31 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		},
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
+		// Pre-discovery authority: session cwd must still match the capture from create().
+		try {
+			await assertExecutionRootMatchesRepositoryBinding(this.session.cwd, this.#sessionRepositoryBinding);
+		} catch (error) {
+			const message =
+				error instanceof RepositoryBindingError
+					? error.message
+					: error instanceof Error
+						? error.message
+						: String(error);
+			return createTaskModeError(`Session repository binding rejected before task discovery: ${message}`);
+		}
+		const bindingResolution = await resolveTaskItemsWithRepositoryBindings(this.session.cwd, params.tasks ?? []);
+		if (bindingResolution.error) {
+			return createTaskModeError(bindingResolution.error);
+		}
+		const boundParams: TaskParams = { ...params, tasks: bindingResolution.tasks };
+
 		const { agents, projectAgentsDir } = await discoverAgents(this.session.cwd);
-		const { agent: agentName, context, schema: outputSchema } = params;
+		const { agent: agentName, context, schema: outputSchema } = boundParams;
 		const simpleMode = this.#getTaskSimpleMode();
 		const { contextEnabled, customSchemaEnabled } = getTaskSimpleModeCapabilities(simpleMode);
 		const sharedContext = contextEnabled ? context?.trim() : undefined;
 		const isolationMode = this.session.settings.get("task.isolation.mode");
-		const isolationRequested = "isolated" in params ? params.isolated === true : false;
+		const isolationRequested = "isolated" in boundParams ? boundParams.isolated === true : false;
 		const isIsolated = isolationMode !== "none" && isolationRequested;
 		const mergeMode = this.session.settings.get("task.isolation.merge");
 		const commitStyle = this.session.settings.get("task.isolation.commits");
@@ -882,7 +1032,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const taskDepth = this.session.taskDepth ?? 0;
 		const subagentLspEnabled = (this.session.enableLsp ?? true) && this.session.settings.get("task.enableLsp");
 
-		if (isolationMode === "none" && "isolated" in params) {
+		if (isolationMode === "none" && "isolated" in boundParams) {
 			return {
 				content: [
 					{
@@ -942,7 +1092,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		const forkContextValidationError = validateForkContextRequests(
-			params.tasks ?? [],
+			boundParams.tasks ?? [],
 			agent,
 			this.session.settings.get("task.forkContext.enabled"),
 		);
@@ -981,7 +1131,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			: (effectiveAgent.output ?? this.session.outputSchema);
 
 		// Handle empty or missing tasks
-		if (!params.tasks || params.tasks.length === 0) {
+		if (!boundParams.tasks || boundParams.tasks.length === 0) {
 			return {
 				content: [
 					{
@@ -999,7 +1149,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			};
 		}
 
-		const tasks = params.tasks;
+		const tasks = boundParams.tasks;
 		const missingTaskIndexes: number[] = [];
 		const idIndexes = new Map<string, number[]>();
 
@@ -1099,6 +1249,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// Share the parent session's local:// root with subagents so they read/write the same scratch space
 		const localProtocolOptions: LocalProtocolOptions = {
 			getArtifactsDir: this.session.getArtifactsDir ?? (() => null),
+			isManagedDestination: this.session.isManagedSessionDestination,
 			getSessionId: this.session.getSessionId ?? (() => null),
 		};
 
@@ -1108,12 +1259,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 		// Initialize progress tracking
 		const progressMap = new Map<number, AgentProgress>();
+		const isolatedPatchBytes = new Map<string, Buffer>();
 
 		// Update callback
 		const emitProgress = () => {
 			const progress = Array.from(progressMap.values()).sort((a, b) => a.index - b.index);
 			onUpdate?.({
-				content: [{ type: "text", text: `Running ${params.tasks.length} agents...` }],
+				content: [{ type: "text", text: `Running ${tasks.length} agents...` }],
 				details: {
 					projectAgentsDir,
 					results: [],
@@ -1168,14 +1320,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				};
 			}
 
-			// Write parent conversation context for subagents. When IRC is available,
-			// subagents should ask live peers instead of reading a stale markdown dump.
-			await fs.mkdir(effectiveArtifactsDir, { recursive: true });
-			const shouldWriteConversationContext = this.session.settings.get("irc.enabled") !== true;
+			// Place fork-context handoff material in the session-scoped external local
+			// root. Subagent prompts may expose this path to subprocesses, so it must
+			// never carry managed transcript/artifact authority.
+			const shouldWriteConversationContext = !hasAvailableIrcTool(this.session);
 			const compactContext = shouldWriteConversationContext ? this.session.getCompactContext?.() : undefined;
 			let contextFilePath: string | undefined;
 			if (compactContext) {
-				contextFilePath = path.join(effectiveArtifactsDir, "context.md");
+				await initializeLocalRoot(localProtocolOptions);
+				contextFilePath = resolveLocalUrlToPath("local://subagents/context.md", localProtocolOptions);
+				await fs.mkdir(path.dirname(contextFilePath), { recursive: true, mode: 0o700 });
 				await Bun.write(contextFilePath, compactContext);
 			}
 
@@ -1214,7 +1368,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					agent: agentName,
 					agentSource: agent.source,
 					status: "pending",
-					task: renderSubagentUserPrompt(assignment, simpleMode),
+					task: renderTaskAssignment(assignment, simpleMode),
 					assignment,
 					recentTools: [],
 					recentOutput: [],
@@ -1274,13 +1428,25 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					recommendedMode: advisory.recommendedMode,
 					reasons: advisory.reasons,
 				};
-				const taskSessionFile = overrides?.sessionFile ?? executionOverrides?.sessionFiles?.get(task.id) ?? null;
+				const managedPersistence = parentArtifactManager?.getManagedStore()
+					? createManagedTaskPersistence(parentArtifactManager, task.id)
+					: undefined;
+				const taskSessionFile = managedPersistence
+					? null
+					: (overrides?.sessionFile ?? executionOverrides?.sessionFiles?.get(task.id) ?? null);
+				const taskRepositoryBinding = repositoryBindingFromTask(task) ?? this.#sessionRepositoryBinding;
+				// Declared paths (relativeSubdir) must stay under the bound root before spawn.
+				if (taskRepositoryBinding.relativeSubdir) {
+					assertPathUnderRepositoryBinding(taskRepositoryBinding, ".");
+				}
 				if (!isIsolated) {
+					await assertExecutionRootMatchesRepositoryBinding(this.session.cwd, taskRepositoryBinding);
 					const result = await runSubprocess({
 						cwd: this.session.cwd,
 						agent: effectiveAgent,
-						task: renderSubagentUserPrompt(task.assignment, simpleMode),
+						task: renderTaskAssignment(task.assignment, simpleMode),
 						assignment: task.assignment.trim(),
+						executionMode: task.executionMode,
 						context: sharedContext,
 						description: task.description,
 						index,
@@ -1297,7 +1463,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						sessionFile: taskSessionFile,
 						persistArtifacts: !!artifactsDir,
 						artifactsDir: effectiveArtifactsDir,
+						managedPersistence,
 						contextFile: contextFilePath,
+						ircAvailable: hasAvailableIrcTool(this.session),
 						enableLsp: subagentLspEnabled,
 						signal,
 						eventBus: this.session.eventBus,
@@ -1310,6 +1478,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						},
 						authStorage: this.session.authStorage,
 						modelRegistry: this.session.modelRegistry,
+						agentRegistry: this.session.agentRegistry,
 						settings: this.session.settings,
 						inheritedServiceTier: this.session.serviceTier,
 						contextFiles,
@@ -1323,7 +1492,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentTelemetry: this.session.getTelemetry?.(),
 						forkContextSeed,
 					});
-					return { ...result, ...(forkContext ? { forkContext } : {}), forkContextAdvisory };
+					return {
+						...result,
+						...(forkContext ? { forkContext } : {}),
+						forkContextAdvisory,
+						repositoryBinding: publicRepositoryBinding(taskRepositoryBinding),
+					};
 				}
 
 				const taskStart = Date.now();
@@ -1336,13 +1510,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 					isolationHandle = await ensureIsolation(repoRoot, task.id, preferredIsolationBackend);
 					const isolationDir = isolationHandle.mergedDir;
+					// Isolated worktrees must preserve the source repository identity (#2901).
+					await assertExecutionRootMatchesRepositoryBinding(isolationDir, taskRepositoryBinding);
 
 					const result = await runSubprocess({
 						cwd: this.session.cwd,
 						worktree: isolationDir,
 						agent: effectiveAgent,
-						task: renderSubagentUserPrompt(task.assignment, simpleMode),
+						task: renderTaskAssignment(task.assignment, simpleMode),
 						assignment: task.assignment.trim(),
+						executionMode: task.executionMode,
 						context: sharedContext,
 						description: task.description,
 						index,
@@ -1359,7 +1536,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						sessionFile: taskSessionFile,
 						persistArtifacts: !!artifactsDir,
 						artifactsDir: effectiveArtifactsDir,
+						managedPersistence,
 						contextFile: contextFilePath,
+						ircAvailable: hasAvailableIrcTool(this.session),
 						enableLsp: subagentLspEnabled,
 						signal,
 						eventBus: this.session.eventBus,
@@ -1372,6 +1551,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						},
 						authStorage: this.session.authStorage,
 						modelRegistry: this.session.modelRegistry,
+						agentRegistry: this.session.agentRegistry,
 						settings: this.session.settings,
 						inheritedServiceTier: this.session.serviceTier,
 						contextFiles,
@@ -1389,6 +1569,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						...result,
 						...(forkContext ? { forkContext } : {}),
 						forkContextAdvisory,
+						repositoryBinding: publicRepositoryBinding(taskRepositoryBinding),
 					};
 					if (mergeMode === "branch" && resultWithForkContext.exitCode === 0) {
 						try {
@@ -1428,9 +1609,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					if (resultWithForkContext.exitCode === 0) {
 						try {
 							const delta = await captureDeltaPatch(isolationDir, taskBaseline);
+							await initializeLocalRoot(localProtocolOptions);
 							const artifactId = validateAllocatedTaskId(task.id);
-							const patchPath = path.join(effectiveArtifactsDir, `${artifactId}.patch`);
+							const patchPath = resolveLocalUrlToPath(
+								`local://subagents/${artifactId}.patch`,
+								localProtocolOptions,
+							);
+							await fs.mkdir(path.dirname(patchPath), { recursive: true, mode: 0o700 });
 							await Bun.write(patchPath, delta.rootPatch);
+							isolatedPatchBytes.set(patchPath, Buffer.from(delta.rootPatch, "utf8"));
 							const producedChanges = Boolean(delta.rootPatch.trim() || delta.nestedPatches.length);
 							return {
 								...resultWithForkContext,
@@ -1452,7 +1639,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						id: task.id,
 						agent: agent.name,
 						agentSource: agent.source,
-						task: renderSubagentUserPrompt(assignment, simpleMode),
+						task: renderTaskAssignment(assignment, simpleMode),
 						assignment,
 						description: task.description,
 						exitCode: 1,
@@ -1492,7 +1679,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					id: task.id,
 					agent: agentName,
 					agentSource: agent.source,
-					task: renderSubagentUserPrompt(assignment, simpleMode),
+					task: renderTaskAssignment(assignment, simpleMode),
 					assignment,
 					description: task.description,
 					exitCode: 1,
@@ -1522,6 +1709,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			// Aggregate usage from executor results (already accumulated incrementally)
 			const aggregatedUsage = createUsageTotals();
 			let hasAggregatedUsage = false;
+
 			for (const result of results) {
 				if (result.usage) {
 					addUsageTotals(aggregatedUsage, result.usage);
@@ -1584,19 +1772,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							changesApplied = false;
 							hadAnyChanges = false;
 						} else {
-							const patchStats = await Promise.all(
-								patchesInOrder.map(async patchPath => ({
-									patchPath,
-									size: (await fs.stat(patchPath)).size,
-								})),
-							);
+							const patchStats = patchesInOrder.map(patchPath => ({
+								patchPath,
+								size: isolatedPatchBytes.get(patchPath)?.byteLength ?? -1,
+							}));
+							if (patchStats.some(patch => patch.size < 0)) {
+								throw new Error("Captured isolated patch bytes are unavailable");
+							}
 							const nonEmptyPatches = patchStats.filter(patch => patch.size > 0).map(patch => patch.patchPath);
 							if (nonEmptyPatches.length === 0) {
 								changesApplied = true;
 								hadAnyChanges = false;
 							} else {
-								const patchTexts = await Promise.all(
-									nonEmptyPatches.map(async patchPath => Bun.file(patchPath).text()),
+								const patchTexts = nonEmptyPatches.map(patchPath =>
+									isolatedPatchBytes.get(patchPath)!.toString("utf8"),
 								);
 								const combinedPatch = patchTexts
 									.map(text => (text.endsWith("\n") ? text : `${text}\n`))
@@ -1727,6 +1916,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				results: receipts,
 				totalDurationMs: totalDuration,
 				usage: hasAggregatedUsage ? aggregatedUsage : undefined,
+				usageCostBreakdownComplete:
+					hasAggregatedUsage && hasCompleteAggregateUsageCostBreakdown(results) ? true : undefined,
 				forkContextClonedTokens: forkContextClonedTokens > 0 ? forkContextClonedTokens : undefined,
 				roiSummary,
 				roiReconciliation,

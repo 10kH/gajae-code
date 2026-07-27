@@ -1,5 +1,4 @@
 import { describe, expect, it } from "bun:test";
-import type { RpcJsonSchema } from "@gajae-code/coding-agent/modes/rpc/rpc-types";
 import {
 	assertSupportedGateSchema,
 	compileGateSchema,
@@ -7,19 +6,20 @@ import {
 	schemaHash,
 	validateGateAnswer,
 	WorkflowGateSchemaError,
-} from "@gajae-code/coding-agent/modes/shared/agent-wire/workflow-gate-schema";
+} from "../src/modes/shared/agent-wire/workflow-gate-schema";
+import type { JsonSchema } from "../src/modes/shared/agent-wire/workflow-gate-types";
 
 describe("workflow-gate-schema", () => {
 	it("rejects unsupported keywords at construction", () => {
-		const schema = { type: "string", pattern: "^x" } as unknown as RpcJsonSchema;
+		const schema = { type: "string", format: "email" } as unknown as JsonSchema;
 		expect(() => assertSupportedGateSchema(schema)).toThrow(WorkflowGateSchemaError);
 	});
 
 	it("rejects unsupported types and oversized schemas", () => {
-		expect(() => assertSupportedGateSchema({ type: "tuple" } as unknown as RpcJsonSchema)).toThrow(
+		expect(() => assertSupportedGateSchema({ type: "tuple" } as unknown as JsonSchema)).toThrow(
 			WorkflowGateSchemaError,
 		);
-		const huge: RpcJsonSchema = {
+		const huge: JsonSchema = {
 			type: "string",
 			enum: Array.from({ length: GATE_SCHEMA_LIMITS.maxEnumValues + 1 }, (_, i) => `v${i}`),
 		};
@@ -39,15 +39,17 @@ describe("workflow-gate-schema", () => {
 			{ type: "array", uniqueItems: "yes" }, // non-boolean
 			{ type: "number", minimum: Number.POSITIVE_INFINITY }, // non-finite
 			{ type: "string", title: 5 }, // non-string meta
+			{ type: "string", pattern: 5 }, // non-string pattern
+			{ type: "string", pattern: "[" }, // invalid pattern
 		];
 		for (const c of cases) {
-			expect(() => assertSupportedGateSchema(c as RpcJsonSchema)).toThrow(WorkflowGateSchemaError);
+			expect(() => assertSupportedGateSchema(c as JsonSchema)).toThrow(WorkflowGateSchemaError);
 		}
 	});
 
 	it("produces a stable schema hash regardless of key order", () => {
-		const a: RpcJsonSchema = { type: "object", properties: { a: { type: "string" }, b: { type: "number" } } };
-		const b: RpcJsonSchema = { properties: { b: { type: "number" }, a: { type: "string" } }, type: "object" };
+		const a: JsonSchema = { type: "object", properties: { a: { type: "string" }, b: { type: "number" } } };
+		const b: JsonSchema = { properties: { b: { type: "number" }, a: { type: "string" } }, type: "object" };
 		expect(schemaHash(a)).toBe(schemaHash(b));
 	});
 
@@ -59,6 +61,12 @@ describe("workflow-gate-schema", () => {
 		expect(err?.code).toBe("invalid_workflow_gate_answer");
 		expect(err?.gate_id).toBe("g1");
 		expect(err?.errors[0]?.keyword).toBe("enum");
+	});
+
+	it("validates string patterns", () => {
+		const compiled = compileGateSchema({ type: "string", pattern: "\\S" });
+		expect(validateGateAnswer(compiled, "g-pattern", "has text")).toBeNull();
+		expect(validateGateAnswer(compiled, "g-pattern", "   ")?.errors[0]?.keyword).toBe("pattern");
 	});
 
 	it("validates object required + additionalProperties:false", () => {
@@ -91,7 +99,7 @@ describe("workflow-gate-schema", () => {
 	});
 
 	it("caches compiled schemas by hash", () => {
-		const schema: RpcJsonSchema = { type: "boolean" };
+		const schema: JsonSchema = { type: "boolean" };
 		expect(compileGateSchema(schema)).toBe(compileGateSchema(schema));
 	});
 });

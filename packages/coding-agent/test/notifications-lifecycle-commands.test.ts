@@ -8,7 +8,7 @@ import {
 	normalizeLifecyclePath,
 	parseLifecycleCommand,
 	validateLifecycleTarget,
-} from "@gajae-code/coding-agent/notifications/lifecycle-commands";
+} from "@gajae-code/coding-agent/sdk/bus/lifecycle-commands";
 
 describe("lifecycle command parser (G009)", () => {
 	it("detects lifecycle command text", () => {
@@ -63,6 +63,45 @@ describe("lifecycle command parser (G009)", () => {
 		});
 		expect(parseLifecycleCommand("/session_recent")).toEqual({ kind: "recent", which: "all" });
 		expect(parseLifecycleCommand("/session_recent create")).toEqual({ kind: "recent", which: "create" });
+	});
+	it("accepts only this bot's Telegram username suffix in non-private chats", () => {
+		const groupCtx = { chatType: "supergroup", botUsername: "GajaeCodeBot" };
+		expect(isLifecycleCommandText("/session_recent@GajaeCodeBot", groupCtx)).toBe(true);
+		expect(parseLifecycleCommand("/session_recent@GajaeCodeBot", groupCtx)).toEqual({
+			kind: "recent",
+			which: "all",
+		});
+		expect(parseLifecycleCommand("/session_create@GajaeCodeBot path /repo", groupCtx)).toEqual({
+			kind: "create",
+			target: { kind: "existing_path", path: "/repo" },
+		});
+		expect(parseLifecycleCommand("/session_create@GajaeCodeBot worktree /repo feat/x", groupCtx)).toEqual({
+			kind: "create",
+			target: { kind: "worktree", repo: "/repo", branch: "feat/x" },
+		});
+		expect(parseLifecycleCommand("/session_create@GajaeCodeBot dir /new/dir", groupCtx)).toEqual({
+			kind: "create",
+			target: { kind: "plain_dir", path: "/new/dir" },
+		});
+		expect(parseLifecycleCommand("/session_close@GajaeCodeBot sess-1", groupCtx)).toEqual({
+			kind: "close",
+			target: { sessionId: "sess-1" },
+		});
+		expect(parseLifecycleCommand("/session_resume@GajaeCodeBot abc", groupCtx)).toEqual({
+			kind: "resume",
+			target: { sessionIdOrPrefix: "abc" },
+		});
+		expect(
+			parseLifecycleCommand("/session_recent@GajaeCodeBot", { chatType: "group", botUsername: "gajaecodebot" }),
+		).toEqual({
+			kind: "recent",
+			which: "all",
+		});
+		expect(parseLifecycleCommand("/session_recent", groupCtx)).toEqual({ kind: "none" });
+		expect(parseLifecycleCommand("/session_recent@OtherBot", groupCtx)).toEqual({ kind: "none" });
+		expect(parseLifecycleCommand("/session_recent@GajaeCodeBot", { chatType: "supergroup" })).toEqual({
+			kind: "none",
+		});
 	});
 
 	it("rejects an initial prompt (MVP) with usage and no frame", () => {
@@ -162,6 +201,7 @@ describe("lifecycle command parser (G009)", () => {
 			"close_refused",
 			"not_found",
 			"terminal_uncertain",
+			"unsupported_platform",
 		] as const;
 		for (const reason of reasons) {
 			const out = formatLifecycleOutcome({
@@ -185,6 +225,28 @@ describe("lifecycle command parser (G009)", () => {
 			}),
 		).toMatch(/in progress/i);
 
+		const uncertain = {
+			type: "session_lifecycle_error",
+			requestId: "r",
+			status: "error",
+			reason: "terminal_uncertain",
+			message: "outcome unknown",
+		} as const;
+		const createUncertain = formatLifecycleOutcome(uncertain, "session_create");
+		expect(createUncertain).toContain("already be starting");
+		expect(createUncertain).toContain("starting it twice");
+
+		const closeUncertain = formatLifecycleOutcome(uncertain, "session_close");
+		expect(closeUncertain).toContain("already be closed");
+		expect(closeUncertain).not.toContain("starting it twice");
+
+		const resumeUncertain = formatLifecycleOutcome(uncertain, "session_resume");
+		expect(resumeUncertain).toContain("reattached or restarting");
+		expect(resumeUncertain).not.toContain("starting it twice");
+
+		const genericUncertain = formatLifecycleOutcome(uncertain);
+		expect(genericUncertain).not.toContain("starting it twice");
+
 		// ambiguous_target lists candidates.
 		const amb = formatLifecycleOutcome({
 			type: "session_lifecycle_error",
@@ -196,5 +258,84 @@ describe("lifecycle command parser (G009)", () => {
 		});
 		expect(amb).toContain("a");
 		expect(amb).toContain("b");
+	});
+	it("formats unsupported platform with the exact safe lifecycle copy", () => {
+		const output = formatLifecycleOutcome({
+			type: "session_lifecycle_error",
+			requestId: "request-1",
+			status: "error",
+			reason: "unsupported_platform",
+			message: "ignored",
+		});
+		expect(output).toBe(
+			"Remote session lifecycle is unavailable on this psmux host because GJC cannot prove immutable session identity. No lifecycle action was performed. Use a local GJC terminal with a supported tmux provider.",
+		);
+		expect(output).not.toContain("request-1");
+		expect(output).not.toContain("chat");
+		expect(output).not.toContain("token");
+		expect(output).not.toContain("/");
+	});
+
+	it("preserves legacy ambiguous candidate path output", () => {
+		const output = formatLifecycleOutcome({
+			type: "session_lifecycle_error",
+			requestId: "r",
+			status: "error",
+			reason: "ambiguous_target",
+			message: "multiple",
+			candidates: [{ sessionId: "a", path: "/legacy/path" }],
+		});
+		expect(output).toBe("❓ Multiple sessions match — reply with the exact id:\n• a (/legacy/path)");
+	});
+
+	it("parses --mpreset for all create target kinds (space-separated)", () => {
+		expect(parseLifecycleCommand("/session_create path /repo --mpreset codex-eco")).toEqual({
+			kind: "create",
+			target: { kind: "existing_path", path: "/repo" },
+			modelPreset: "codex-eco",
+		});
+		expect(parseLifecycleCommand("/session_create dir /new/dir --mpreset claude-opus")).toEqual({
+			kind: "create",
+			target: { kind: "plain_dir", path: "/new/dir" },
+			modelPreset: "claude-opus",
+		});
+		expect(parseLifecycleCommand("/session_create worktree /repo feat/x --mpreset opencodego")).toEqual({
+			kind: "create",
+			target: { kind: "worktree", repo: "/repo", branch: "feat/x" },
+			modelPreset: "opencodego",
+		});
+	});
+
+	it("parses --mpreset=<name> (equals-separated) form", () => {
+		expect(parseLifecycleCommand("/session_create path /repo --mpreset=codex-medium")).toEqual({
+			kind: "create",
+			target: { kind: "existing_path", path: "/repo" },
+			modelPreset: "codex-medium",
+		});
+	});
+
+	it("omits modelPreset when --mpreset is not given", () => {
+		const out = parseLifecycleCommand("/session_create path /repo");
+		expect(out.kind).toBe("create");
+		if (out.kind === "create") {
+			expect(out.modelPreset).toBeUndefined();
+		}
+	});
+
+	it("preserves quoted and punctuation-bearing exact --mpreset IDs without shell interpretation", () => {
+		expect(parseLifecycleCommand(`/session_create path /repo --mpreset "custom profile/한글 !"`)).toEqual({
+			kind: "create",
+			target: { kind: "existing_path", path: "/repo" },
+			modelPreset: "custom profile/한글 !",
+		});
+		expect(parseLifecycleCommand("/session_create path /repo --mpreset 'bad;rm'")).toMatchObject({
+			kind: "create",
+			modelPreset: "bad;rm",
+		});
+		expect(parseLifecycleCommand(`/session_create path /repo --mpreset "unterminated`).kind).toBe("usage");
+	});
+
+	it("usage text includes --mpreset", () => {
+		expect(lifecycleUsage()).toContain("--mpreset");
 	});
 });

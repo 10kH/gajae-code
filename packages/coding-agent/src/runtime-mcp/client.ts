@@ -15,15 +15,12 @@ import type {
 	MCPInitializeParams,
 	MCPInitializeResult,
 	MCPPrompt,
-	MCPPromptsListResult,
 	MCPRequestOptions,
 	MCPResource,
 	MCPResourceReadParams,
 	MCPResourceReadResult,
 	MCPResourceSubscribeParams,
-	MCPResourcesListResult,
 	MCPResourceTemplate,
-	MCPResourceTemplatesListResult,
 	MCPServerCapabilities,
 	MCPServerConfig,
 	MCPServerConnection,
@@ -35,6 +32,7 @@ import type {
 	MCPToolsListResult,
 	MCPTransport,
 } from "./types";
+import { MCPExpectedFailure } from "./types";
 
 /** MCP protocol version we support */
 const PROTOCOL_VERSION = "2025-03-26";
@@ -42,11 +40,108 @@ const PROTOCOL_VERSION = "2025-03-26";
 /** Default connection timeout in ms */
 const CONNECTION_TIMEOUT_MS = 30_000;
 
+const MAX_PAGINATION_PAGES = 100,
+	MAX_PAGINATION_ITEMS = 10_000;
+
 /** Client info sent during initialization */
 const CLIENT_INFO = {
 	name: "gjc-coding-agent",
 	version: "1.0.0",
 };
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function decodeInitializeResult(value: unknown): MCPInitializeResult {
+	if (
+		!isRecord(value) ||
+		typeof value.protocolVersion !== "string" ||
+		!isRecord(value.capabilities) ||
+		!isRecord(value.serverInfo) ||
+		typeof value.serverInfo.name !== "string" ||
+		typeof value.serverInfo.version !== "string" ||
+		(value.instructions !== undefined && typeof value.instructions !== "string")
+	) {
+		throw new MCPExpectedFailure();
+	}
+
+	return {
+		protocolVersion: value.protocolVersion,
+		capabilities: value.capabilities as MCPServerCapabilities,
+		serverInfo: {
+			name: value.serverInfo.name,
+			version: value.serverInfo.version,
+		},
+		...(value.instructions === undefined ? {} : { instructions: value.instructions }),
+	};
+}
+
+function decodeToolsListResult(value: unknown): MCPToolsListResult {
+	if (
+		!isRecord(value) ||
+		!Array.isArray(value.tools) ||
+		(value.nextCursor !== undefined && typeof value.nextCursor !== "string")
+	) {
+		throw new MCPExpectedFailure();
+	}
+
+	const tools = value.tools.map(tool => {
+		if (
+			!isRecord(tool) ||
+			typeof tool.name !== "string" ||
+			!isRecord(tool.inputSchema) ||
+			tool.inputSchema.type !== "object" ||
+			(tool.inputSchema.properties !== undefined && !isRecord(tool.inputSchema.properties)) ||
+			(tool.inputSchema.required !== undefined &&
+				(!Array.isArray(tool.inputSchema.required) ||
+					!tool.inputSchema.required.every(item => typeof item === "string"))) ||
+			(tool.description !== undefined && typeof tool.description !== "string")
+		) {
+			throw new MCPExpectedFailure();
+		}
+		return {
+			name: tool.name,
+			inputSchema: { ...tool.inputSchema, type: "object" as const },
+			...(tool.description === undefined ? {} : { description: tool.description }),
+		};
+	});
+
+	return value.nextCursor === undefined ? { tools } : { tools, nextCursor: value.nextCursor };
+}
+
+async function collectPaginated<T>(
+	connection: MCPServerConnection,
+	options: MCPRequestOptions | undefined,
+	method: string,
+	itemKey: string,
+	items: T[],
+	decode?: (value: unknown) => unknown,
+): Promise<void> {
+	const seenCursors = new Set<string>();
+	const failure = (detail: string) => new MCPExpectedFailure(new Error(`MCP ${method} pagination ${detail}`));
+	let cursor: string | undefined;
+	for (let page = 1; page <= MAX_PAGINATION_PAGES; page++) {
+		const value = await connection.transport.request<unknown>(method, cursor ? { cursor } : {}, options);
+		const result = decode ? decode(value) : value;
+		if (
+			!isRecord(result) ||
+			!Array.isArray(result[itemKey]) ||
+			(result.nextCursor !== undefined && typeof result.nextCursor !== "string")
+		)
+			throw new MCPExpectedFailure();
+		const nextCursor = result.nextCursor as string | undefined;
+		if (nextCursor && seenCursors.has(nextCursor)) throw failure("repeated a cursor");
+		const pageItems = result[itemKey] as T[];
+		const itemCount = items.length + pageItems.length;
+		if (itemCount > MAX_PAGINATION_ITEMS || (itemCount === MAX_PAGINATION_ITEMS && nextCursor))
+			throw failure("did not complete within the 10000-item budget");
+		items.push(...pageItems);
+		if (!nextCursor) return;
+		if (page === MAX_PAGINATION_PAGES) throw failure("did not complete within the 100-page budget");
+		seenCursors.add(nextCursor);
+		cursor = nextCursor;
+	}
+}
 
 /**
  * Default handler for standard MCP server-to-client requests.
@@ -93,22 +188,22 @@ async function initializeConnection(
 	transport: MCPTransport,
 	options?: {
 		signal?: AbortSignal;
+		/** Whether to advertise the roots/list capability (default: true). */
+		advertiseRoots?: boolean;
 		/** Called after the initialize response (which sets the session ID) but before notifications/initialized. */
 		onInitialized?: () => void | Promise<void>;
 	},
 ): Promise<MCPInitializeResult> {
 	const params: MCPInitializeParams = {
 		protocolVersion: PROTOCOL_VERSION,
-		capabilities: {
-			roots: { listChanged: false },
-		},
+		capabilities: options?.advertiseRoots === false ? {} : { roots: { listChanged: false } },
 		clientInfo: CLIENT_INFO,
 	};
 
-	const result = await transport.request<MCPInitializeResult>(
-		"initialize",
-		params as unknown as Record<string, unknown>,
-		{ signal: options?.signal },
+	const result = decodeInitializeResult(
+		await transport.request<unknown>("initialize", params as unknown as Record<string, unknown>, {
+			signal: options?.signal,
+		}),
 	);
 
 	if (options?.signal?.aborted) {
@@ -135,6 +230,8 @@ export async function connectToServer(
 	config: MCPServerConfig,
 	options?: {
 		signal?: AbortSignal;
+		/** Whether to advertise the roots/list capability (default: true). */
+		advertiseRoots?: boolean;
 		onNotification?: (method: string, params: unknown) => void;
 		onRequest?: (method: string, params: unknown) => Promise<unknown>;
 	},
@@ -150,14 +247,14 @@ export async function connectToServer(
 			transport.onNotification = options.onNotification;
 		}
 
-		// Always handle standard MCP server-to-client requests (ping, roots/list).
-		// The initialize request declares roots capability, so we must respond to
-		// roots/list — even for short-lived test connections.
+		// Always install a handler for standard MCP server-to-client requests.
+		// Callers that do not advertise roots can reject roots/list via onRequest.
 		transport.onRequest = options?.onRequest ?? defaultRequestHandler;
 
 		try {
 			const initResult = await initializeConnection(transport, {
 				signal: connectSignal,
+				advertiseRoots: options?.advertiseRoots,
 				async onInitialized() {
 					// Open the SSE stream before sending initialized, so server-to-client
 					// requests triggered by on_initialized (e.g. roots/list) are delivered.
@@ -176,24 +273,36 @@ export async function connectToServer(
 				instructions: initResult.instructions,
 			};
 		} catch (error) {
-			await transport.close();
+			try {
+				await transport.close();
+			} catch {
+				// Preserve the initialization failure when cleanup also fails.
+			}
 			throw error;
 		}
 	};
 
+	const connectionTimeoutMessage = `Connection to MCP server "${name}" timed out after ${timeoutMs}ms`;
+
 	try {
-		return await withTimeout(
-			connect(),
-			timeoutMs,
-			`Connection to MCP server "${name}" timed out after ${timeoutMs}ms`,
-			connectSignal,
-		);
+		return await withTimeout(connect(), timeoutMs, connectionTimeoutMessage, connectSignal);
 	} catch (error) {
 		// If withTimeout rejected (timeout/abort) while connect() was still pending,
 		// abort initialization and wait for transport cleanup before returning.
+		const aborted = options?.signal?.aborted === true;
 		connectAbort.abort(error);
 		if (transport) {
-			await transport.close().catch(() => {});
+			try {
+				await transport.close();
+			} catch {
+				// Preserve the primary connection failure when cleanup also fails.
+			}
+		}
+		if (error instanceof MCPExpectedFailure) {
+			throw error;
+		}
+		if (aborted || (error instanceof Error && error.message === connectionTimeoutMessage)) {
+			throw new MCPExpectedFailure(error);
 		}
 		throw error;
 	}
@@ -217,18 +326,7 @@ export async function listTools(
 	}
 
 	const allTools: MCPToolDefinition[] = [];
-	let cursor: string | undefined;
-
-	do {
-		const params: Record<string, unknown> = {};
-		if (cursor) {
-			params.cursor = cursor;
-		}
-
-		const result = await connection.transport.request<MCPToolsListResult>("tools/list", params, options);
-		allTools.push(...result.tools);
-		cursor = result.nextCursor;
-	} while (cursor);
+	await collectPaginated(connection, options, "tools/list", "tools", allTools, decodeToolsListResult);
 
 	// Cache tools
 	connection.tools = allTools;
@@ -287,18 +385,7 @@ export async function listResources(
 	}
 
 	const allResources: MCPResource[] = [];
-	let cursor: string | undefined;
-
-	do {
-		const params: Record<string, unknown> = {};
-		if (cursor) {
-			params.cursor = cursor;
-		}
-
-		const result = await connection.transport.request<MCPResourcesListResult>("resources/list", params, options);
-		allResources.push(...result.resources);
-		cursor = result.nextCursor;
-	} while (cursor);
+	await collectPaginated(connection, options, "resources/list", "resources", allResources);
 
 	connection.resources = allResources;
 	return allResources;
@@ -320,22 +407,7 @@ export async function listResourceTemplates(
 	}
 
 	const allTemplates: MCPResourceTemplate[] = [];
-	let cursor: string | undefined;
-
-	do {
-		const params: Record<string, unknown> = {};
-		if (cursor) {
-			params.cursor = cursor;
-		}
-
-		const result = await connection.transport.request<MCPResourceTemplatesListResult>(
-			"resources/templates/list",
-			params,
-			options,
-		);
-		allTemplates.push(...result.resourceTemplates);
-		cursor = result.nextCursor;
-	} while (cursor);
+	await collectPaginated(connection, options, "resources/templates/list", "resourceTemplates", allTemplates);
 
 	connection.resourceTemplates = allTemplates;
 	return allTemplates;
@@ -439,18 +511,7 @@ export async function listPrompts(
 	}
 
 	const allPrompts: MCPPrompt[] = [];
-	let cursor: string | undefined;
-
-	do {
-		const params: Record<string, unknown> = {};
-		if (cursor) {
-			params.cursor = cursor;
-		}
-
-		const result = await connection.transport.request<MCPPromptsListResult>("prompts/list", params, options);
-		allPrompts.push(...result.prompts);
-		cursor = result.nextCursor;
-	} while (cursor);
+	await collectPaginated(connection, options, "prompts/list", "prompts", allPrompts);
 
 	connection.prompts = allPrompts;
 	return allPrompts;

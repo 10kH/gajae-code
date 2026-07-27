@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import type Anthropic from "@anthropic-ai/sdk";
 import { streamAnthropic } from "../src/providers/anthropic";
-import type { Context, Model } from "../src/types";
+import type { Context, FetchImpl, Model } from "../src/types";
 import { waitForDelayOrAbort } from "./helpers";
 
 const model: Model<"anthropic-messages"> = {
@@ -162,6 +162,50 @@ describe("anthropic first-event timeout retries", () => {
 		expect(result.responseId).toBe("msg_retry_success");
 	});
 
+	it("surfaces large retry-after Anthropic 429s instead of first-event timeouts", async () => {
+		let attempts = 0;
+		const fetchMock = (async () => {
+			attempts += 1;
+			return new Response(
+				JSON.stringify({
+					type: "error",
+					error: {
+						type: "rate_limit_error",
+						message: "This request would exceed your account's rate limit. Please try again later.",
+					},
+				}),
+				{
+					status: 429,
+					headers: {
+						"content-type": "application/json",
+						"retry-after": "62291",
+						"anthropic-ratelimit-unified-status": "rejected",
+						"anthropic-ratelimit-unified-7d-status": "rejected",
+						"anthropic-ratelimit-unified-overage-disabled-reason": "out_of_credits",
+					},
+				},
+			);
+		}) as FetchImpl;
+		const providerRetryWait = vi.fn(async () => {});
+
+		const result = await streamAnthropic(model, context, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			streamFirstEventTimeoutMs: 1,
+			providerRetryWait,
+		}).result();
+
+		expect(attempts).toBe(1);
+		expect(providerRetryWait).not.toHaveBeenCalled();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorStatus).toBe(429);
+		expect(result.errorMessage).toContain("rate_limit_error");
+		expect(result.errorMessage).toContain("This request would exceed your account's rate limit");
+		expect(result.errorMessage).toContain("retry-after-ms=62291000");
+		expect(result.errorMessage).toContain("anthropic-ratelimit-unified-overage-disabled-reason=out_of_credits");
+		expect(result.errorMessage).not.toContain("timed out while waiting for the first event");
+	});
+
 	it("does not arm the Anthropic first-event watchdog before the stream connects", async () => {
 		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
 			return createAnthropicMockStream({
@@ -255,5 +299,56 @@ describe("anthropic first-event timeout retries", () => {
 				arguments: {},
 			},
 		]);
+	});
+
+	it("does not let Anthropic ping events keep a stalled response alive", async () => {
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+			const response = new Response(null, { status: 200, headers: { "request-id": "req_ping_stall" } });
+			const data: MockAnthropicStream = {
+				async *[Symbol.asyncIterator]() {
+					yield {
+						type: "message_start",
+						message: {
+							id: "msg_ping_stall",
+							usage: {
+								input_tokens: 12,
+								output_tokens: 0,
+								cache_read_input_tokens: 0,
+								cache_creation_input_tokens: 0,
+							},
+						},
+					};
+					yield {
+						type: "content_block_start",
+						index: 0,
+						content_block: { type: "text", text: "" },
+					};
+					yield {
+						type: "content_block_delta",
+						index: 0,
+						delta: { type: "text_delta", text: "checking" },
+					};
+					while (!requestOptions?.signal?.aborted) {
+						await Bun.sleep(1);
+						yield { type: "ping" };
+					}
+				},
+			};
+			return {
+				async withResponse() {
+					return { data, response, request_id: "req_ping_stall" };
+				},
+			} as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+
+		const result = await streamAnthropic(model, context, {
+			client,
+			streamFirstEventTimeoutMs: 5000,
+			streamIdleTimeoutMs: 5,
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Anthropic stream stalled while waiting for the next event");
 	});
 });

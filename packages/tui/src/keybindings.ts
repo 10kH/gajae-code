@@ -170,7 +170,16 @@ const SHIFTED_SYMBOL_KEYS = new Set<string>([
 	"~",
 ]);
 
-const normalizeKeyId = (key: KeyId): KeyId => key.toLowerCase() as KeyId;
+const normalizeKeyId = (key: KeyId): KeyId => {
+	const normalized = key.toLowerCase();
+	if (normalized.endsWith("pageup")) {
+		return `${normalized.slice(0, -6)}pageUp` as KeyId;
+	}
+	if (normalized.endsWith("pagedown")) {
+		return `${normalized.slice(0, -8)}pageDown` as KeyId;
+	}
+	return normalized as KeyId;
+};
 
 function normalizeKeys(keys: KeyId | KeyId[] | undefined): KeyId[] {
 	if (keys === undefined) return [];
@@ -187,6 +196,14 @@ function normalizeKeys(keys: KeyId | KeyId[] | undefined): KeyId[] {
 	return result;
 }
 
+function cloneKeybindingsConfig(config: KeybindingsConfig): KeybindingsConfig {
+	const clone: KeybindingsConfig = {};
+	for (const [keybinding, keys] of Object.entries(config)) {
+		clone[keybinding] = Array.isArray(keys) ? [...keys] : keys;
+	}
+	return clone;
+}
+
 export class KeybindingsManager {
 	#definitions: KeybindingDefinitions;
 	#userBindings: KeybindingsConfig;
@@ -195,7 +212,7 @@ export class KeybindingsManager {
 
 	constructor(definitions: KeybindingDefinitions, userBindings: KeybindingsConfig = {}) {
 		this.#definitions = definitions;
-		this.#userBindings = userBindings;
+		this.#userBindings = cloneKeybindingsConfig(userBindings);
 		this.#rebuild();
 	}
 
@@ -253,12 +270,12 @@ export class KeybindingsManager {
 	}
 
 	setUserBindings(userBindings: KeybindingsConfig): void {
-		this.#userBindings = userBindings;
+		this.#userBindings = cloneKeybindingsConfig(userBindings);
 		this.#rebuild();
 	}
 
 	getUserBindings(): KeybindingsConfig {
-		return { ...this.#userBindings };
+		return cloneKeybindingsConfig(this.#userBindings);
 	}
 
 	getResolvedBindings(): KeybindingsConfig {

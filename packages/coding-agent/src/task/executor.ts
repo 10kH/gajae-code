@@ -5,11 +5,17 @@
  */
 
 import { createHash } from "node:crypto";
-import * as fs from "node:fs/promises";
 import path from "node:path";
-import type { AgentEvent, AgentIdentity, AgentTelemetryConfig, ThinkingLevel } from "@gajae-code/agent-core";
+import type {
+	AgentEvent,
+	AgentIdentity,
+	AgentMessage,
+	AgentTelemetryConfig,
+	ThinkingLevel,
+} from "@gajae-code/agent-core";
 import { recordHandoff, resolveTelemetry } from "@gajae-code/agent-core";
-import type { ServiceTier } from "@gajae-code/ai";
+import { estimateMessageTokensHeuristic } from "@gajae-code/agent-core/compaction";
+import type { AssistantMessage, Message, Model, ServiceTier } from "@gajae-code/ai";
 import { type JsonSchemaValidationIssue, validateJsonSchemaValue } from "@gajae-code/ai/utils/schema";
 import { logger, prompt, untilAborted } from "@gajae-code/utils";
 import { AsyncJobManager } from "../async";
@@ -22,9 +28,11 @@ import { runExtensionCompact, runExtensionSetModel } from "../extensibility/exte
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
 import { buildAgentSubskillInjection, renderAgentPromptAdditions } from "../extensibility/gjc-plugins";
 import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
+import { sessionRoot } from "../gjc-runtime/session-layout";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
+import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
 import { AgentRegistry } from "../registry/agent-registry";
 import { createAgentSession, discoverAuthStorage } from "../sdk";
@@ -41,10 +49,14 @@ import { ToolAbortError } from "../tools/tool-errors";
 import type { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
+import { validateAllocatedTaskId } from "./id";
+import { classifyProviderRetry, providerNameFromModel } from "./provider-retry-status";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
+import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
 import {
 	type AgentDefinition,
 	type AgentProgress,
+	hasCompleteUsageCostBreakdown,
 	MAX_OUTPUT_BYTES,
 	MAX_OUTPUT_LINES,
 	type ModelSubstitutionWarning,
@@ -55,6 +67,7 @@ import {
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
 	type TaskToolDetails,
 } from "./types";
+import { type ExecutorExecutionMode, resolveUltragoalRedTeamActivation } from "./ultragoal-redteam-activation";
 
 /** Agent event types to forward for progress tracking. */
 const agentEventTypes = new Set<AgentEvent["type"]>([
@@ -68,6 +81,21 @@ const agentEventTypes = new Set<AgentEvent["type"]>([
 	"tool_execution_start",
 	"tool_execution_update",
 	"tool_execution_end",
+]);
+
+const providerStreamingUpdateTypes = new Set<string>([
+	"text_start",
+	"text_delta",
+	"text_end",
+	"thinking_start",
+	"thinking_delta",
+	"thinking_end",
+	"reasoning_summary_start",
+	"reasoning_summary_delta",
+	"reasoning_summary_end",
+	"toolcall_start",
+	"toolcall_delta",
+	"toolcall_end",
 ]);
 
 const isAgentEvent = (event: AgentSessionEvent): event is AgentEvent =>
@@ -84,8 +112,13 @@ function normalizeModelPatterns(value: string | string[] | undefined): string[] 
 		.filter(Boolean);
 }
 
-function renderIrcPeerRoster(selfId: string): string {
-	const peers = AgentRegistry.global()
+function getSubagentCanonicalScope(parentSessionId: string | undefined, subagentId: string): string | undefined {
+	if (!parentSessionId) return undefined;
+	return JSON.stringify(["subagent-canonical", parentSessionId, subagentId]);
+}
+
+function renderIrcPeerRoster(agentRegistry: AgentRegistry, selfId: string): string {
+	const peers = agentRegistry
 		.list()
 		.filter(ref => ref.id !== selfId && (ref.status === "running" || ref.status === "idle"));
 	if (peers.length === 0) return "- (no other live agents)";
@@ -106,6 +139,51 @@ function getReportFindingKey(value: unknown): string | null {
 	return `${filePath}:${lineStart}:${lineEnd}:${priority ?? ""}:${title}`;
 }
 
+const FORK_CONTEXT_MINIMUM_RESERVED_OUTPUT_TOKENS = 4_096;
+const FORK_CONTEXT_FIXED_PROMPT_AND_TOOL_OVERHEAD_TOKENS = 4_096;
+
+export function trimForkContextSeedForModel(seed: ForkContextSeed, model: Model | undefined): ForkContextSeed {
+	const contextWindow = model?.contextWindow;
+	if (!contextWindow || contextWindow <= 0) return seed;
+	const reservedOutputTokens = Math.max(
+		FORK_CONTEXT_MINIMUM_RESERVED_OUTPUT_TOKENS,
+		model && Number.isFinite(model.maxTokens) ? Math.max(0, Math.trunc(model.maxTokens)) : 0,
+	);
+	const ceiling = Math.max(
+		0,
+		Math.trunc(contextWindow) - reservedOutputTokens - FORK_CONTEXT_FIXED_PROMPT_AND_TOOL_OVERHEAD_TOKENS,
+	);
+	const maxTokens = Math.min(seed.metadata.maxTokens, ceiling);
+	const skippedReasons = { ...seed.metadata.skippedReasons };
+	let skippedMessages = seed.metadata.skippedMessages;
+	let approximateTokens = 0;
+	const messages: Message[] = [];
+	for (let i = seed.messages.length - 1; i >= 0; i--) {
+		const message = seed.messages[i]!;
+		const tokens = estimateMessageTokensHeuristic(message);
+		if (maxTokens <= 0 || approximateTokens + tokens > maxTokens) {
+			skippedMessages++;
+			skippedReasons["child-context-ceiling"] = (skippedReasons["child-context-ceiling"] ?? 0) + 1;
+			continue;
+		}
+		messages.unshift(message);
+		approximateTokens += tokens;
+	}
+	return {
+		...seed,
+		messages,
+		agentMessages: messages.map(message => structuredClone(message) as AgentMessage),
+		metadata: {
+			...seed.metadata,
+			includedMessages: messages.length,
+			skippedMessages,
+			approximateTokens,
+			maxTokens,
+			skippedReasons,
+		},
+	};
+}
+
 /** Options for subagent execution */
 export interface ExecutorOptions {
 	cwd: string;
@@ -113,6 +191,11 @@ export interface ExecutorOptions {
 	agent: AgentDefinition;
 	task: string;
 	assignment?: string;
+	/**
+	 * Typed executor execution mode. When set, overrides assignment-text heuristics
+	 * for ultragoal red-team prompt injection (#2698 / #2456).
+	 */
+	executionMode?: ExecutorExecutionMode;
 	context?: string;
 	description?: string;
 	index: number;
@@ -139,6 +222,8 @@ export interface ExecutorOptions {
 	artifactsDir?: string;
 	/** Path to parent conversation context file */
 	contextFile?: string;
+	/** Whether the parent runtime actually exposes IRC coordination. */
+	ircAvailable?: boolean;
 	eventBus?: EventBus;
 	contextFiles?: ContextFileEntry[];
 	skills?: Skill[];
@@ -147,6 +232,8 @@ export interface ExecutorOptions {
 	authStorage?: AuthStorage;
 	modelRegistry?: ModelRegistry;
 	settings?: Settings;
+	/** Parent session's registry; shared by child sessions for IRC routing and roster visibility. */
+	agentRegistry?: AgentRegistry;
 	/**
 	 * Live service-tier intent of the parent session (`AgentSession.serviceTier`),
 	 * used as the inherited tier when `task.serviceTier === "inherit"`. Passing the
@@ -162,6 +249,7 @@ export interface ExecutorOptions {
 	 * artifacts directory (no per-subagent subdir).
 	 */
 	parentArtifactManager?: ArtifactManager;
+	managedPersistence?: ManagedTaskPersistence;
 	parentHindsightSessionState?: HindsightSessionState;
 	/**
 	 * Parent agent's OpenTelemetry configuration. When defined, the subagent's
@@ -175,6 +263,49 @@ export interface ExecutorOptions {
 	/** Skills to autoload via sendCustomMessage before the first prompt */
 	autoloadSkills?: Skill[];
 	forkContextSeed?: ForkContextSeed;
+}
+
+export class ManagedTaskPersistence {
+	readonly #artifacts: ArtifactManager;
+	readonly #taskId: string;
+
+	constructor(artifacts: ArtifactManager, taskId: string) {
+		this.#artifacts = artifacts;
+		this.#taskId = validateAllocatedTaskId(taskId);
+		if (!artifacts.getManagedSubtreeRootAuthority())
+			throw new Error("Managed task persistence authority is unavailable");
+	}
+
+	async openSession(): Promise<SessionManager> {
+		const store = this.#artifacts.getManagedStore();
+		if (!store) throw new Error("Managed task persistence authority is unavailable");
+		this.#artifacts.assertManagedBinding();
+		const sessionFile = path.join(this.#artifacts.dir, `${this.#taskId}.jsonl`);
+		const session = await SessionManager.openNestedManaged(
+			sessionFile,
+			SessionManager.nestedManagedDestination(store, this.#artifacts.dir),
+			store,
+		);
+		this.#artifacts.assertManagedBinding();
+		return session;
+	}
+
+	async publishOutput(rawOutput: string, metadata: Uint8Array): Promise<void> {
+		await this.#artifacts.publishManagedOutputGeneration(
+			`${this.#taskId}.md.selector.json`,
+			`${this.#taskId}.md`,
+			Buffer.from(rawOutput, "utf8"),
+			metadata,
+		);
+	}
+}
+
+export function createManagedTaskPersistence(artifacts: ArtifactManager, taskId: string): ManagedTaskPersistence {
+	return new ManagedTaskPersistence(artifacts, taskId);
+}
+
+export function renderSubagentUserPrompt(assignment: string, independentMode: boolean): string {
+	return prompt.render(subagentUserPromptTemplate, { assignment: assignment.trim(), independentMode });
 }
 
 function parseStringifiedJson(value: unknown): unknown {
@@ -242,6 +373,51 @@ function previewOffendingData(value: unknown, maxLength = 500): string {
 		serialized = String(value);
 	}
 	return serialized.length > maxLength ? `${serialized.slice(0, maxLength)}…` : serialized;
+}
+const PLACEHOLDER_YIELD_PATTERNS = [
+	/^see (?:the )?message body(?:\b|[\s—:.,-])/i,
+	/^(?:complete\s+\w+\s+)?returned inline(?:\b|[\s—:.,-])/i,
+	/^leader persists(?:\b|[\s—:.,-])/i,
+	/^caller persists(?:\b|[\s—:.,-])/i,
+];
+
+const PLACEHOLDER_YIELD_FIELD_NAMES = new Set([
+	"artifactmarkdown",
+	"finalmarkdown",
+	"fullplan",
+	"markdown",
+	"planmarkdown",
+]);
+
+function looksLikePlaceholderYieldString(value: string): boolean {
+	const trimmed = value.trim();
+	if (trimmed.length === 0 || trimmed.length > 500) return false;
+	return PLACEHOLDER_YIELD_PATTERNS.some(pattern => pattern.test(trimmed));
+}
+
+function normalizePlaceholderYieldFieldName(key: string): string {
+	return key.replace(/[^a-z0-9]/gi, "").toLowerCase();
+}
+
+function findPlaceholderYieldPath(value: unknown, path = "$", depth = 0, inspectStrings = true): string | undefined {
+	if (typeof value === "string") {
+		return inspectStrings && looksLikePlaceholderYieldString(value) ? path : undefined;
+	}
+	if (!value || typeof value !== "object" || depth > 4) return undefined;
+	if (Array.isArray(value)) {
+		for (let i = 0; i < value.length; i++) {
+			const found = findPlaceholderYieldPath(value[i], `${path}[${i}]`, depth + 1, false);
+			if (found) return found;
+		}
+		return undefined;
+	}
+	const record = value as Record<string, unknown>;
+	for (const [key, item] of Object.entries(record)) {
+		const shouldInspectString = PLACEHOLDER_YIELD_FIELD_NAMES.has(normalizePlaceholderYieldFieldName(key));
+		const found = findPlaceholderYieldPath(item, `${path}.${key}`, depth + 1, shouldInspectString);
+		if (found) return found;
+	}
+	return undefined;
 }
 
 function tryParseJsonOutput(text: string): unknown | undefined {
@@ -319,6 +495,8 @@ interface FinalizeSubprocessOutputResult {
 export const SUBAGENT_WARNING_NULL_YIELD = "SYSTEM WARNING: Subagent called yield with null data.";
 export const SUBAGENT_WARNING_MISSING_YIELD =
 	"SYSTEM WARNING: Subagent exited without calling yield tool after 3 reminders.";
+export const SUBAGENT_WARNING_PLACEHOLDER_YIELD =
+	"SYSTEM WARNING: Subagent yield data contains a placeholder instead of the actual result.";
 
 /** Build a schema_violation outcome — surfaced as a non-zero exit so callers treat it as a failure. */
 function buildSchemaViolationOutcome(
@@ -330,11 +508,12 @@ function buildSchemaViolationOutcome(
 		missing.length > 0
 			? `schema_violation: missing required fields: ${missing.join(", ")}`
 			: `schema_violation: ${failure.message}`;
+	const dataPreview = previewOffendingData(data);
 	const payload = {
 		error: "schema_violation",
 		message: failure.message,
 		missingRequired: missing,
-		data: previewOffendingData(data),
+		data,
 	};
 	let rawOutput: string;
 	try {
@@ -342,7 +521,22 @@ function buildSchemaViolationOutcome(
 	} catch {
 		rawOutput = `{"error":"schema_violation","message":${JSON.stringify(headline)}}`;
 	}
-	return { rawOutput, stderr: headline, exitCode: 1 };
+	return { rawOutput, stderr: `${headline}. Offending data preview: ${dataPreview}`, exitCode: 1 };
+}
+
+function buildPlaceholderYieldOutcome(
+	placeholderPath: string,
+	data: unknown,
+): { rawOutput: string; stderr: string; exitCode: number } {
+	return buildSchemaViolationOutcome(
+		{
+			message:
+				`${SUBAGENT_WARNING_PLACEHOLDER_YIELD} Offending path: ${placeholderPath}. ` +
+				"Return the real payload in yield.result.data or persist a durable artifact receipt.",
+			missingRequired: [],
+		},
+		data,
+	);
 }
 
 export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): FinalizeSubprocessOutputResult {
@@ -370,25 +564,40 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 				const completeData = normalizeCompleteData(submitData, reportFindings);
 				const { validator, error: schemaError } = buildOutputValidator(outputSchema);
 				if (schemaError) {
-					rawOutput = `{"error":"schema_violation","message":"invalid output schema: ${schemaError.replace(/"/g, '\\"')}"}`;
-					stderr = `schema_violation: invalid output schema: ${schemaError}`;
-					exitCode = 1;
+					const outcome = buildSchemaViolationOutcome(
+						{
+							message: `invalid output schema: ${schemaError}`,
+							missingRequired: [],
+						},
+						completeData,
+					);
+					rawOutput = outcome.rawOutput;
+					stderr = outcome.stderr;
+					exitCode = outcome.exitCode;
 				} else {
-					const verdict = validator ? validator.validate(completeData) : { ok: true as const };
-					if (!verdict.ok) {
-						const outcome = buildSchemaViolationOutcome(verdict, completeData);
+					const placeholderPath = findPlaceholderYieldPath(completeData);
+					if (placeholderPath) {
+						const outcome = buildPlaceholderYieldOutcome(placeholderPath, completeData);
 						rawOutput = outcome.rawOutput;
 						stderr = outcome.stderr;
 						exitCode = outcome.exitCode;
 					} else {
-						try {
-							rawOutput = JSON.stringify(completeData, null, 2) ?? "null";
-						} catch (err) {
-							const errorMessage = err instanceof Error ? err.message : String(err);
-							rawOutput = `{"error":"Failed to serialize yield data: ${errorMessage}"}`;
+						const verdict = validator ? validator.validate(completeData) : { ok: true as const };
+						if (!verdict.ok) {
+							const outcome = buildSchemaViolationOutcome(verdict, completeData);
+							rawOutput = outcome.rawOutput;
+							stderr = outcome.stderr;
+							exitCode = outcome.exitCode;
+						} else {
+							try {
+								rawOutput = JSON.stringify(completeData, null, 2) ?? "null";
+							} catch (err) {
+								const errorMessage = err instanceof Error ? err.message : String(err);
+								rawOutput = `{"error":"Failed to serialize yield data: ${errorMessage}"}`;
+							}
+							exitCode = 0;
+							stderr = "";
 						}
-						exitCode = 0;
-						stderr = "";
 					}
 				}
 			}
@@ -401,21 +610,29 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 		if (fallback) {
 			const completeData = normalizeCompleteData(fallback.data, reportFindings);
 			const { validator } = buildOutputValidator(outputSchema);
-			const verdict = validator ? validator.validate(completeData) : { ok: true as const };
-			if (!verdict.ok) {
-				const outcome = buildSchemaViolationOutcome(verdict, completeData);
+			const placeholderPath = findPlaceholderYieldPath(completeData);
+			if (placeholderPath) {
+				const outcome = buildPlaceholderYieldOutcome(placeholderPath, completeData);
 				rawOutput = outcome.rawOutput;
 				stderr = outcome.stderr;
 				exitCode = outcome.exitCode;
 			} else {
-				try {
-					rawOutput = JSON.stringify(completeData, null, 2) ?? "null";
-				} catch (err) {
-					const errorMessage = err instanceof Error ? err.message : String(err);
-					rawOutput = `{"error":"Failed to serialize fallback completion: ${errorMessage}"}`;
+				const verdict = validator ? validator.validate(completeData) : { ok: true as const };
+				if (!verdict.ok) {
+					const outcome = buildSchemaViolationOutcome(verdict, completeData);
+					rawOutput = outcome.rawOutput;
+					stderr = outcome.stderr;
+					exitCode = outcome.exitCode;
+				} else {
+					try {
+						rawOutput = JSON.stringify(completeData, null, 2) ?? "null";
+					} catch (err) {
+						const errorMessage = err instanceof Error ? err.message : String(err);
+						rawOutput = `{"error":"Failed to serialize fallback completion: ${errorMessage}"}`;
+					}
+					exitCode = 0;
+					stderr = "";
 				}
-				exitCode = 0;
-				stderr = "";
 			}
 		} else if (!hasOutputSchema && allowFallback && rawOutput.trim().length > 0) {
 			exitCode = 0;
@@ -623,7 +840,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				: agent.spawns.join(",");
 
 	const lspEnabled = enableLsp ?? true;
-	const ircEnabled = subagentSettings.get("irc.enabled") === true;
+	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
+	const ircEnabled = options.ircAvailable === true;
 	const contextFileForPrompt = ircEnabled ? undefined : options.contextFile;
 	const skipPythonPreflight = Array.isArray(toolNames) && !toolNames.includes("eval");
 
@@ -649,7 +867,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	let modelSubstitutionWarning: ModelSubstitutionWarning | undefined;
 	let resolvedModelString: string | undefined;
 	let lastAssistantModelString: string | undefined;
+	let activeProviderModelString: string | undefined;
 	let effectiveThinkingLevelForWarning: ThinkingLevel | undefined;
+	let lastProviderProgressAtMs: number | undefined;
+	let sessionEventOrdinal = 0;
+	let retryStartOrdinal = 0;
+	const seenAssistantMessages = new WeakSet<AgentMessage>();
+	const seenAssistantMessageIdentities = new Set<string>();
 
 	// Accumulate usage incrementally from message_end events (no memory for streaming events)
 	const accumulatedUsage = {
@@ -661,6 +885,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
 	let hasUsage = false;
+	let usageCostBreakdownComplete = true;
 
 	const requestAbort = (reason: AbortReason) => {
 		if (reason === "timeout") {
@@ -730,7 +955,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 	const emitProgressNow = () => {
 		progress.durationMs = Date.now() - startTime;
-		onProgress?.({ ...progress });
+		const progressSnapshot = structuredClone(progress);
+		onProgress?.(progressSnapshot);
 		if (options.eventBus) {
 			options.eventBus.emit(TASK_SUBAGENT_PROGRESS_CHANNEL, {
 				index,
@@ -738,8 +964,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				agentSource: agent.source,
 				task,
 				assignment,
-				progress: { ...progress },
-				sessionFile: subtaskSessionFile,
+				progress: progressSnapshot,
+				sessionFile: null,
 			});
 		}
 		lastProgressEmitMs = Date.now();
@@ -793,6 +1019,79 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			: undefined;
 	};
 
+	const getAssistantMessageIdentity = (message: AgentMessage): string | undefined => {
+		if (message.role !== "assistant") return undefined;
+		const model = getMessageModelString(message);
+		const timestamp = "timestamp" in message ? message.timestamp : undefined;
+		if (!model || typeof timestamp !== "number") return undefined;
+		const responseId = "responseId" in message && typeof message.responseId === "string" ? message.responseId : "";
+		return JSON.stringify([model, timestamp, responseId]);
+	};
+
+	const rememberAssistantMessage = (message: AgentMessage): void => {
+		seenAssistantMessages.add(message);
+		const identity = getAssistantMessageIdentity(message);
+		if (identity) seenAssistantMessageIdentities.add(identity);
+	};
+
+	const isProviderAssistantMessage = (message: AgentMessage): message is AssistantMessage =>
+		message.role === "assistant" &&
+		"stopReason" in message &&
+		Array.isArray(message.content) &&
+		getMessageModelString(message) !== undefined;
+
+	const isSuccessfulProviderAssistantMessage = (message: AgentMessage): message is AssistantMessage =>
+		isProviderAssistantMessage(message) &&
+		message.stopReason !== "error" &&
+		message.stopReason !== "aborted" &&
+		message.errorMessage === undefined &&
+		message.errorKind === undefined &&
+		message.transportFailure === undefined;
+
+	const hasMatchingActiveProviderModel = (message: AgentMessage): message is AssistantMessage =>
+		isProviderAssistantMessage(message) &&
+		activeProviderModelString !== undefined &&
+		getMessageModelString(message) === activeProviderModelString;
+
+	const isProviderStreamingUpdate = (event: Extract<AgentEvent, { type: "message_update" }>): boolean => {
+		const update = event.assistantMessageEvent;
+		if (!update || typeof update !== "object" || !providerStreamingUpdateTypes.has(update.type)) return false;
+		if (!("partial" in update) || getMessageModelString(update.partial) !== activeProviderModelString) return false;
+		switch (update.type) {
+			case "text_delta":
+			case "thinking_delta":
+			case "reasoning_summary_delta":
+			case "toolcall_delta":
+				return typeof update.delta === "string";
+			default:
+				return typeof update.contentIndex === "number";
+		}
+	};
+
+	const getProviderTextDelta = (event: Extract<AgentEvent, { type: "message_update" }>): string | undefined => {
+		const update = (event as { assistantMessageEvent?: unknown }).assistantMessageEvent;
+		if (!update || typeof update !== "object") return undefined;
+		const record = update as { type?: unknown; delta?: unknown };
+		return record.type === "text_delta" && typeof record.delta === "string" ? record.delta : undefined;
+	};
+
+	const isProviderBackedRecoveryEvent = (
+		event: Extract<AgentEvent, { type: "message_start" | "message_update" }>,
+		eventOrdinal: number,
+	): boolean => {
+		const messageIdentity = getAssistantMessageIdentity(event.message);
+		if (
+			!progress.retryState ||
+			eventOrdinal <= retryStartOrdinal ||
+			seenAssistantMessages.has(event.message) ||
+			(messageIdentity !== undefined && seenAssistantMessageIdentities.has(messageIdentity))
+		)
+			return false;
+		if (!hasMatchingActiveProviderModel(event.message)) return false;
+		if (event.type === "message_start") return isSuccessfulProviderAssistantMessage(event.message);
+		return isProviderStreamingUpdate(event);
+	};
+
 	const updateRecentOutputLines = () => {
 		const lines = recentOutputTail.split("\n").filter(line => line.trim());
 		progress.recentOutput = lines.slice(-8).reverse();
@@ -807,49 +1106,51 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		updateRecentOutputLines();
 	};
 
-	const replaceRecentOutputFromContent = (content: unknown[]) => {
-		recentOutputTail = "";
-		for (const block of content) {
-			if (!block || typeof block !== "object") continue;
-			const record = block as { type?: unknown; text?: unknown };
-			if (record.type !== "text" || typeof record.text !== "string") continue;
-			if (!record.text) continue;
-			recentOutputTail += record.text;
-			if (recentOutputTail.length > RECENT_OUTPUT_TAIL_BYTES) {
-				recentOutputTail = recentOutputTail.slice(-RECENT_OUTPUT_TAIL_BYTES);
-			}
-		}
-		updateRecentOutputLines();
-	};
-
 	const resetRecentOutput = () => {
 		recentOutputTail = "";
 		progress.recentOutput = [];
 	};
 
-	const processEvent = (event: AgentEvent) => {
+	const forwardSubagentEvent = (
+		event: AgentEvent | Extract<AgentSessionEvent, { type: "model_fallback_switched" }>,
+	) => {
+		if (!options.eventBus) return;
+		options.eventBus.emit(TASK_SUBAGENT_EVENT_CHANNEL, {
+			index,
+			agent: agent.name,
+			agentSource: agent.source,
+			task,
+			assignment,
+			event,
+		});
+	};
+
+	const processEvent = (event: AgentEvent, eventOrdinal: number) => {
 		if (resolved) return;
 
-		if (options.eventBus) {
-			options.eventBus.emit(TASK_SUBAGENT_EVENT_CHANNEL, {
-				index,
-				agent: agent.name,
-				agentSource: agent.source,
-				task,
-				assignment,
-				event,
-			});
-		}
+		forwardSubagentEvent(event);
 
 		const now = Date.now();
 		let flushProgress = false;
+		// A retry is recovered at the first assistant provider event, before the
+		// session emits auto_retry_end after message completion.
 
 		switch (event.type) {
-			case "message_start":
-				if (event.message?.role === "assistant") {
+			case "message_start": {
+				if (event.message.role !== "assistant") break;
+				const retryWasActive = Boolean(progress.retryState);
+				const recoversRetry = isProviderBackedRecoveryEvent(event, eventOrdinal);
+				rememberAssistantMessage(event.message);
+				if (recoversRetry || !retryWasActive) {
+					lastProviderProgressAtMs = now;
 					resetRecentOutput();
 				}
+				if (recoversRetry) {
+					progress.retryState = undefined;
+					flushProgress = true;
+				}
 				break;
+			}
 
 			case "tool_execution_start": {
 				progress.toolCount++;
@@ -961,24 +1262,17 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 
 			case "message_update": {
-				if (event.message?.role !== "assistant") break;
-				const assistantEvent = (
-					event as AgentEvent & {
-						assistantMessageEvent?: { type?: string; delta?: string };
-					}
-				).assistantMessageEvent;
-				if (assistantEvent?.type === "text_delta" && typeof assistantEvent.delta === "string") {
-					appendRecentOutputTail(assistantEvent.delta);
-					break;
+				if (event.message.role !== "assistant") break;
+				const retryWasActive = Boolean(progress.retryState);
+				const recoversRetry = isProviderBackedRecoveryEvent(event, eventOrdinal);
+				if (!retryWasActive) rememberAssistantMessage(event.message);
+				if (recoversRetry || !retryWasActive) lastProviderProgressAtMs = now;
+				if (recoversRetry) {
+					progress.retryState = undefined;
+					flushProgress = true;
 				}
-				if (assistantEvent && assistantEvent.type !== "text_delta") {
-					break;
-				}
-				const updateContent =
-					getMessageContent(event.message) || (event as AgentEvent & { content?: unknown }).content;
-				if (updateContent && Array.isArray(updateContent)) {
-					replaceRecentOutputFromContent(updateContent);
-				}
+				const textDelta = getProviderTextDelta(event);
+				if (textDelta !== undefined) appendRecentOutputTail(textDelta);
 				break;
 			}
 
@@ -986,6 +1280,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				// Extract text from assistant and toolResult messages (not user prompts)
 				const role = event.message?.role;
 				if (role === "assistant") {
+					if (isSuccessfulProviderAssistantMessage(event.message)) lastProviderProgressAtMs = now;
 					const messageContent =
 						getMessageContent(event.message) || (event as AgentEvent & { content?: unknown }).content;
 					if (messageContent && Array.isArray(messageContent)) {
@@ -998,6 +1293,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					const assistantModel = getMessageModelString(event.message);
 					if (assistantModel) {
 						lastAssistantModelString = assistantModel;
+						activeProviderModelString = assistantModel;
 						if (resolvedModelString && assistantModel !== resolvedModelString && !modelSubstitutionWarning) {
 							modelSubstitutionWarning = {
 								requested: resolvedModelString,
@@ -1027,6 +1323,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						const usageRecord = messageUsage as Record<string, unknown>;
 						const costRecord = (messageUsage as { cost?: Record<string, unknown> }).cost;
 						hasUsage = true;
+						usageCostBreakdownComplete &&= hasCompleteUsageCostBreakdown(usageRecord);
 						accumulatedUsage.input += getNumberField(usageRecord, "input") ?? 0;
 						accumulatedUsage.output += getNumberField(usageRecord, "output") ?? 0;
 						accumulatedUsage.cacheRead += getNumberField(usageRecord, "cacheRead") ?? 0;
@@ -1139,6 +1436,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 			checkAbort();
 
+			const canonicalChildScope = getSubagentCanonicalScope(options.parentSessionId, options.subagentId ?? id);
+
 			const {
 				model,
 				thinkingLevel: resolvedThinkingLevel,
@@ -1146,6 +1445,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				authFallbackUsed,
 				requestedModel,
 				fallbackReason,
+				activeIndex,
+				parentFallbackSelector,
+				skips,
 			} = await awaitAbortable(
 				resolveModelOverrideWithAuthFallback(
 					modelPatterns,
@@ -1153,10 +1455,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					modelRegistry,
 					settings,
 					options.parentSessionId,
+					{ managedFallback: true },
+					canonicalChildScope,
 				),
 			);
 			if (model) {
 				resolvedModelString = formatModelString(model);
+				activeProviderModelString = resolvedModelString;
 			}
 			if (authFallbackUsed && model && requestedModel) {
 				modelSubstitutionWarning = {
@@ -1184,14 +1489,21 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			if (model?.contextWindow && model.contextWindow > 0) {
 				progress.contextWindow = model.contextWindow;
 			}
+			const forkContextSeed = options.forkContextSeed
+				? trimForkContextSeedForModel(options.forkContextSeed, model)
+				: undefined;
 			const effectiveThinkingLevel = explicitThinkingLevel
 				? resolvedThinkingLevel
 				: (thinkingLevel ?? resolvedThinkingLevel);
 			effectiveThinkingLevelForWarning = effectiveThinkingLevel;
 
-			const sessionManager = sessionFile
-				? await awaitAbortable(SessionManager.open(sessionFile))
-				: SessionManager.inMemory(worktree ?? cwd);
+			const sessionManager = options.managedPersistence
+				? await awaitAbortable(options.managedPersistence.openSession())
+				: sessionFile
+					? await awaitAbortable(
+							SessionManager.open(sessionFile, SessionManager.explicitDestination(path.dirname(sessionFile))),
+						)
+					: SessionManager.inMemory(worktree ?? cwd);
 			if (options.parentArtifactManager) {
 				sessionManager.adoptArtifactManager(options.parentArtifactManager);
 			}
@@ -1207,6 +1519,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const subagentAgentIdentity: AgentIdentity | undefined = options.parentTelemetry
 				? { id, name: agent.name, description: agent.description }
 				: undefined;
+			let subagentTokenTurn = 0;
+			const tokenLogDir = options.parentSessionId
+				? path.join(sessionRoot(cwd, options.parentSessionId), "token-logs")
+				: undefined;
 			const subagentTelemetry: AgentTelemetryConfig | undefined =
 				options.parentTelemetry && subagentAgentIdentity
 					? {
@@ -1215,6 +1531,27 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							// Clear parent's conversationId; the child loop falls back to
 							// its own AgentLoopConfig.sessionId.
 							conversationId: undefined,
+							// Intentionally REPLACES (does not chain) the parent's onChatUsage:
+							// the parent handler attributes turns to subagentId "root", so
+							// chaining it here would double-log every subagent turn under root.
+							// Subagent turns are attributed to this child's id instead.
+							onChatUsage: async event => {
+								if (!tokenLogDir) return;
+								subagentTokenTurn += 1;
+								await persistTaskTokenLog(
+									taskTokenLogFromUsage(event.usage, {
+										subagentId: id,
+										agent: agent.name,
+										// Monotonic 1-based sequence per subagent session
+										// (event.stepNumber is 0-based and -1 for oneshots).
+										turn: subagentTokenTurn,
+										at: new Date().toISOString(),
+										model: event.model,
+										cost: event.cost,
+									}),
+									{ dir: tokenLogDir },
+								);
+							},
 						}
 					: undefined;
 
@@ -1231,9 +1568,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 			const { normalized: normalizedOutputSchema } = normalizeSchema(outputSchema);
 
-			const forkContextNotice = options.forkContextSeed
-				? `This subagent was started with a forked snapshot of the parent conversation. Included ${options.forkContextSeed.metadata.includedMessages} message(s), skipped ${options.forkContextSeed.metadata.skippedMessages}, approximately ${options.forkContextSeed.metadata.approximateTokens} tokens. The snapshot is not live; use IRC for live coordination when enabled.`
-				: "";
+			const forkContextNotice =
+				forkContextSeed && forkContextSeed.metadata.includedMessages > 0
+					? `This subagent was started with a forked snapshot of the parent conversation. Included ${forkContextSeed.metadata.includedMessages} message(s), skipped ${forkContextSeed.metadata.skippedMessages}, approximately ${forkContextSeed.metadata.approximateTokens} tokens. The snapshot is not live.${ircEnabled ? " Use IRC for live coordination." : " Rely on the explicit assignment and supplied context for coordination."}`
+					: "";
 
 			const agentSubskillBlock = await buildAgentSubskillInjection({
 				cwd,
@@ -1261,6 +1599,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							? { requestedModel, reason: modelSubstitutionWarning.reason }
 							: undefined,
 					toolNames,
+					alwaysActiveToolNames: ircEnabled ? ["irc"] : undefined,
 					outputSchema,
 					requireYieldTool: true,
 					contextFiles: options.contextFiles,
@@ -1269,12 +1608,18 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					workspaceTree: options.workspaceTree,
 					systemPrompt: defaultPrompt => {
 						const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
-							agent: agent.systemPrompt,
+							agent: prompt.render(agent.systemPrompt, {
+								// Typed executionMode wins; assignment text is compatibility-only (#2698 / #2456).
+								ultragoalRedTeam: resolveUltragoalRedTeamActivation({
+									executionMode: options.executionMode,
+									assignment: options.assignment ?? task,
+								}),
+							}),
 							context: options.context?.trim() ?? "",
 							worktree: worktree ?? "",
 							outputSchema: normalizedOutputSchema,
 							contextFile: contextFileForPrompt,
-							ircPeers: ircEnabled ? renderIrcPeerRoster(id) : "",
+							ircPeers: ircEnabled ? renderIrcPeerRoster(agentRegistry, id) : "",
 							ircSelfId: ircEnabled ? id : "",
 							forkContext: forkContextNotice,
 						});
@@ -1303,18 +1648,35 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					parentTaskPrefix: id,
 					agentId: id,
 					agentDisplayName: agent.name,
+					agentRosterLabel: options.description,
 					bashAllowedPrefixes: agent.bashAllowedPrefixes,
 					enableLsp: lspEnabled,
 					skipPythonPreflight,
 					enableMCP,
 					localProtocolOptions: options.localProtocolOptions,
 					telemetry: subagentTelemetry,
-					forkContextSeed: options.forkContextSeed,
+					forkContextSeed,
+					agentRegistry,
 					shouldPause: () => pauseRequested,
 				}),
 			);
 
 			activeSession = session;
+			// Each subagent invocation owns a fresh controller; its configured chain
+			// is scoped to this child session and never shares parent sticky state.
+			// Auth-aware resolution can substitute the parent model only after every
+			// override entry was unavailable. Rebase the controller to that concrete
+			// parent selector so its request is never charged to override index zero.
+			session.setConfiguredModelChain(
+				"default",
+				parentFallbackSelector ? [parentFallbackSelector] : modelPatterns,
+				"subagent",
+				agent.name,
+				true,
+			);
+			if (activeIndex !== undefined && !parentFallbackSelector) {
+				session.seedDefaultFallbackResolution(activeIndex, skips);
+			}
 			const liveSubagentId = options.subagentId ?? id;
 			const manager = AsyncJobManager.instance();
 			if (manager) {
@@ -1344,7 +1706,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					agentSource: agent.source,
 					description: options.description,
 					status: "started",
-					sessionFile: subtaskSessionFile,
+					sessionFile: null,
 					index,
 				});
 			}
@@ -1392,12 +1754,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							pendingExtensionMessages.push(sendPromise);
 						},
 						sendUserMessage: (content, options) => {
-							const sendPromise = session.sendUserMessage(content, options).catch(e => {
+							const send = session.sendUserMessage(content, options);
+							const observedSend = send.catch(e => {
 								logger.error("Extension sendUserMessage failed", {
 									error: e instanceof Error ? e.message : String(e),
 								});
 							});
-							pendingExtensionMessages.push(sendPromise);
+							pendingExtensionMessages.push(observedSend);
+							return send;
 						},
 						appendEntry: (customType, data) => {
 							session.sessionManager.appendCustomEntry(customType, data);
@@ -1407,12 +1771,28 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						},
 						getActiveTools: () => session.getActiveToolNames(),
 						getAllTools: () => session.getAllToolNames(),
+						resolveTool: name => {
+							const tool = session.getToolByName(name);
+							return tool
+								? { safeSummary: tool.safeSummary, safeSummaryFields: tool.safeSummaryFields }
+								: undefined;
+						},
 						setActiveTools: (toolNames: string[]) =>
 							session.setActiveToolsByName(toolNames.filter(name => !parentOwnedToolNames.has(name))),
 						getCommands: () => getSessionSlashCommands(session),
 						setModel: model => runExtensionSetModel(session, model),
 						getThinkingLevel: () => session.thinkingLevel,
-						setThinkingLevel: level => session.setThinkingLevel(level),
+						setThinkingLevel: (level, persist) => session.setThinkingLevel(level, persist),
+						getThinkingVisibility: () => session.getThinkingVisibility(),
+						setThinkingVisibility: (visibility, persist) => session.setThinkingVisibility(visibility, persist),
+						cycleThinkingLevel: () => session.cycleThinkingLevel(),
+						setThinkingLevelForControl: (level, persist) => session.setThinkingLevelForControl(level, persist),
+						setThinkingVisibilityForControl: (visibility, persist) =>
+							session.setThinkingVisibilityForControl(visibility, persist),
+						setModelTemporaryForControl: (model, expectedSessionId) =>
+							session.setModelTemporaryForControl(model, expectedSessionId),
+						fetchUsageReportsForControl: () => session.fetchUsageReportsForControl(),
+						getThinkingScopeForControl: () => session.getThinkingScopeForControl(),
 						getSessionName: () => session.sessionManager.getSessionName(),
 						setSessionName: async name => {
 							await session.sessionManager.setSessionName(name, "user");
@@ -1423,10 +1803,25 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						isIdle: () => !session.isStreaming,
 						abort: () => session.abort(),
 						hasPendingMessages: () => session.queuedMessageCount > 0,
+						getPendingMessageCounts: () => session.pendingMessageCounts,
+						getTranscript: () => session.getTranscript(),
+						getTranscriptBody: entryId => session.getTranscriptBody(entryId),
+						getGoalState: () => session.getGoalModeState(),
+						getTodoState: () => session.getTodoPhases(),
+						getQueuedMessages: () => session.getQueuedMessageEntries(),
+						getActiveTools: () => session.getActiveToolNames(),
+						getAllTools: () => session.getAllToolNames(),
+						resolveTool: name => {
+							const tool = session.getToolByName(name);
+							return tool
+								? { safeSummary: tool.safeSummary, safeSummaryFields: tool.safeSummaryFields }
+								: undefined;
+						},
 						shutdown: () => {},
 						getContextUsage: () => session.getContextUsage(),
 						getSystemPrompt: () => session.systemPrompt,
 						compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
+						clearContext: () => session.clearContext(),
 					},
 				);
 				extensionRunner.onError(err => {
@@ -1440,11 +1835,22 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 			const MAX_YIELD_RETRIES = 3;
 			unsubscribe = session.subscribe(event => {
+				sessionEventOrdinal += 1;
+				const eventOrdinal = sessionEventOrdinal;
 				if (event.type === "auto_retry_start") {
+					retryStartOrdinal = eventOrdinal;
+					for (const message of session.messages) {
+						if (message.role === "assistant") rememberAssistantMessage(message);
+					}
 					progress.retryState = {
 						attempt: event.attempt,
 						maxAttempts: event.maxAttempts,
 						unbounded: event.unbounded,
+						kind: classifyProviderRetry(event.errorMessage),
+						provider: providerNameFromModel(
+							activeProviderModelString ?? lastAssistantModelString ?? resolvedModelString,
+						),
+						lastProviderProgressAtMs,
 						delayMs: event.delayMs,
 						errorMessage: event.errorMessage,
 						startedAtMs: Date.now(),
@@ -1465,9 +1871,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					scheduleProgress(true);
 					return;
 				}
+				if (event.type === "model_fallback_switched") {
+					activeProviderModelString = event.to;
+					forwardSubagentEvent(event);
+					return;
+				}
 				if (isAgentEvent(event)) {
 					try {
-						processEvent(event);
+						processEvent(event, eventOrdinal);
 					} catch (err) {
 						logger.error("Subagent event processing failed", {
 							error: err instanceof Error ? err.message : String(err),
@@ -1535,6 +1946,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					);
 					await awaitAbortable(session.waitForIdle());
 				} catch (err) {
+					// An abort (parent cancel, session shutdown, timeout) rejects
+					// awaitAbortable with ToolAbortError — a cancellation, not a prompt
+					// failure. Mirror the outer catch's `!abortSignal.aborted` guard so
+					// expected cancellations aren't logged at error level.
+					if (abortSignal.aborted || err instanceof ToolAbortError) break;
 					logger.error("Subagent prompt failed", {
 						error: err instanceof Error ? err.message : String(err),
 					});
@@ -1661,37 +2077,38 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	// Write output artifact (input and jsonl already written in real-time)
 	// Compute output metadata for agent:// URL integration
 	let outputMeta: { lineCount: number; charCount: number; byteSize?: number; sha256?: string } | undefined;
-	let outputPath: string | undefined;
-	if (options.artifactsDir) {
-		const candidateOutputPath = path.join(options.artifactsDir, `${id}.md`);
+	// Never overwrite the artifact with empty output: a failed/no-op resume leg
+	// carries no new information and must preserve the previous retained output.
+	if (options.artifactsDir && rawOutput.length > 0) {
+		const managedPersistence = options.managedPersistence;
 		try {
-			await Bun.write(candidateOutputPath, rawOutput);
 			const byteSize = Buffer.byteLength(rawOutput, "utf8");
 			const lineCount = rawOutput.split("\n").length;
 			const sha256 = createHash("sha256").update(rawOutput).digest("hex");
 			const createdAt = new Date().toISOString();
-			await Bun.write(
-				`${candidateOutputPath}.meta.json`,
+			if (!managedPersistence) await Bun.write(path.join(options.artifactsDir, `${id}.md`), rawOutput);
+			const metadataBytes = Buffer.from(
 				JSON.stringify({ id, kind: "agent-output", sizeBytes: byteSize, lineCount, sha256, createdAt }, null, 2),
+				"utf8",
 			);
-			outputPath = candidateOutputPath;
+			if (managedPersistence) await managedPersistence.publishOutput(rawOutput, metadataBytes);
+			else await Bun.write(path.join(options.artifactsDir, `${id}.md.meta.json`), metadataBytes);
 			outputMeta = {
 				lineCount,
 				charCount: rawOutput.length,
 				byteSize,
 				sha256,
 			};
-		} catch {
-			// Output or metadata write failed: never advertise an unverifiable
-			// artifact. Best-effort remove any orphaned `.md`/sidecar so a later
-			// agent:// read cannot serve unverified content. Non-fatal.
-			outputPath = undefined;
-			outputMeta = undefined;
-			try {
-				await fs.rm(candidateOutputPath, { force: true });
-				await fs.rm(`${candidateOutputPath}.meta.json`, { force: true });
-			} catch {
-				// best-effort cleanup; ignore
+		} catch (error) {
+			if (!managedPersistence) {
+				// A missing sidecar keeps a partial immutable output invisible to agent://.
+				outputMeta = undefined;
+			} else {
+				const message = error instanceof Error ? error.message : String(error);
+				stderr = `${stderr}${stderr ? "\n" : ""}Managed output publication failed: ${message}`;
+				exitCode = 1;
+				paused = false;
+				progress.retryFailure = { attempt: 0, errorMessage: `Managed output publication failed: ${message}` };
 			}
 		}
 	}
@@ -1724,7 +2141,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			agentSource: agent.source,
 			description: options.description,
 			status: progress.status as "completed" | "failed" | "aborted" | "paused",
-			sessionFile: subtaskSessionFile,
+			sessionFile: null,
 			index,
 		});
 	}
@@ -1753,7 +2170,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		abortReason: finalAbortReason,
 		paused,
 		usage: hasUsage ? accumulatedUsage : undefined,
-		outputPath,
+		usageCostBreakdownComplete: hasUsage && usageCostBreakdownComplete ? true : undefined,
+		outputPath: undefined,
 		extractedToolData: progress.extractedToolData,
 		retryFailure: progress.retryFailure,
 		outputMeta,

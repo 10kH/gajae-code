@@ -1,8 +1,8 @@
 ---
 name: deep-interview
 description: Socratic deep interview with mathematical ambiguity gating before explicit execution approval
-argument-hint: "[--quick|--standard|--deep] <idea or vague description>"
-pipeline: [deep-interview, plan]
+argument-hint: "[--trace] [--quick|--standard|--deep] <idea or vague description>"
+pipeline: [deep-interview, ralplan]
 handoff-policy: approval-required
 handoff: .gjc/_session-{sessionid}/specs/deep-interview-{slug}.md
 level: 3
@@ -10,53 +10,70 @@ level: 3
 source: "forked from upstream deep-interview skill and rebranded for GJC"
 ---
 
-<Purpose>
-Deep Interview implements Ouroboros-inspired Socratic questioning with mathematical ambiguity scoring. It replaces vague ideas with crystal-clear specifications by asking targeted questions that expose hidden assumptions, measuring clarity across weighted dimensions, and refusing to proceed until ambiguity drops below the resolved threshold for this run. The output feeds into a gated pipeline: **deep-interview → ralplan consensus refinement → pending approval → explicitly approved execution**, ensuring maximum clarity before any mutation starts.
-</Purpose>
+<Purpose_And_Principles>
+**DIPP-1 — Purpose.** Deep Interview applies Socratic questioning with mathematical ambiguity scoring to replace vague ideas with crystal-clear specifications: it exposes hidden assumptions, measures clarity across weighted dimensions, and refuses to proceed until ambiguity drops below the resolved threshold for this run. The output feeds into a gated pipeline: **deep-interview → ralplan consensus refinement → pending approval → explicitly approved execution**, ensuring maximum clarity before any mutation starts. AI can build anything. The hard part is knowing what to build. GJC planning Phase 0 expands ideas into specs via analyst + architect, but this single-pass approach struggles with genuinely vague inputs: it asks "what do you want?" instead of "what are you assuming?" Deep Interview iteratively exposes assumptions and mathematically gates readiness, ensuring the AI has genuine clarity before spending execution cycles. Inspired by the [Ouroboros project](https://github.com/Q00/ouroboros), which demonstrated that specification quality is the primary bottleneck in AI-assisted development.
 
-<Use_When>
-- User has a vague idea and wants thorough requirements gathering before execution
-- User says "deep interview", "interview me", "ask me everything", "don't assume", "make sure you understand"
-- User says "ouroboros", "socratic", "I have a vague idea", "not sure exactly what I want"
-- User wants to avoid "that's not what I meant" outcomes from autonomous execution
-- Task is complex enough that jumping to code would waste cycles on scope discovery
-- User wants mathematically-validated clarity before committing to execution
-</Use_When>
+**DIPP-2 — Use when.**
+
+> **Use when** the user wants requirements clarified before execution: a vague or exploratory idea ("I have a vague idea", "not sure exactly what I want"); an explicit request to interview ("deep interview", "interview me", "ask me everything", "don't assume", "make sure you understand", "ouroboros", "socratic"); a wish to avoid "that's not what I meant" outcomes from autonomous execution or to reach mathematically-validated clarity before committing to execution; a task complex enough that jumping to code would waste cycles on scope discovery; an implementation ask whose target, scope, acceptance criteria, or safety boundary is ambiguous enough that mutation would require guessing; or an explicit deep-interview request even after being told the request is already clear, bounded, and low-risk.
+> - User requests a trace/research pre-step before the interview, e.g. `/skill:deep-interview --trace <idea>`
+
+**DIPP-3 — Question pacing.**
+
+- Ask ONE question at a time -- never batch multiple questions
+
+**DIPP-4 — Language.**
+
+- Default to English when no language preference is explicit or obvious. Preserve the user/session language for every user-facing announcement, topology confirmation, option label, and interview question when state includes `language.instruction`; do not add language-specific special cases
+
+**DIPP-5 — Self-proofread.**
+
+- Before emitting any user-facing natural-language prose governed by `language.instruction`, perform one silent, best-effort self-proofread in the preserved session language for obvious spelling, spacing, grammar, inflection/particle, and word-choice errors, using the same language-agnostic pass for whatever language is active rather than special-casing any single language. Apply it only to newly generated prose and never announce the proofreading, show before/after text, apologize for it, or re-emit a corrected copy. Do not alter code blocks or identifiers, file paths, CLI commands, JSON/configuration keys, `ask` metadata keys, table/round structure, fixed labels, numeric scores, component ids, status tokens, user quotes or source text, Phase 0 threshold markers such as `Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThresholdSource>)`, or fixed paths such as `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md`; still apply the self-proofread to generated natural-language clauses or cells inside those structures, including Why now rationale, gap text, next-target phrasing, and coverage notes
+
+**DIPP-6 — Weakest dimension.**
+
+- Target the WEAKEST clarity dimension with each question. Make weakest-dimension targeting explicit every round: name the weakest dimension, state its score/gap, and explain why the next question is aimed there
+
+**DIPP-7 — Prompt budget.**
+
+> Keep prompt payloads budgeted: summarize or trim oversized initial context/history before composing question, scoring, spec, or handoff prompts. If the user's initial context is oversized or likely to crowd out downstream prompts, create a concise prompt-safe summary first — one that preserves user intent, decisions, constraints, unknowns, cited files/symbols, and any explicit non-goals — and wait until that summary exists before ambiguity scoring, weakest-dimension selection, question generation, brownfield exploration prompts, spec crystallization, or any downstream execution handoff (bridge to `ralplan`, `ultragoal`, or `team`).
+
+**DIPP-8 — Artifact writes.**
+
+- Use the active GJC workflow/state CLI as the only sanctioned writer for `.gjc/` interview artifacts; do not edit `.gjc/` directly without an explicit force override.
+
+**DIPP-9 — Execution threshold.**
+
+- Do not proceed to execution until ambiguity ≤ the resolved threshold for this run and the user explicitly approves a scoped execution path
+</Purpose_And_Principles>
 
 <Do_Not_Use_When>
 - User has a detailed, specific request with file paths, function names, or acceptance criteria -- execute directly
+- User has an explicit concrete low-risk implementation request with enough target, scope, and acceptance criteria to execute safely -- execute directly
 - User wants to explore options or brainstorm -- use `ralplan` skill instead
-- User wants a quick fix or single change -- delegate to executor or execution
-- User says "just do it" or "skip the questions" without an explicit execution path -- respect their intent by ending interview and writing a `pending approval` spec, not by mutating files or delegating execution
+- User wants a quick fix or single change -- use direct execution, not deep-interview or role-agent delegation
+- User says "just do it" or "skip the questions" without an explicit execution path -- respect their intent by exiting deep-interview, not by writing a `pending approval` spec
 - User already has a PRD or plan file and explicitly asks to execute it -- use the requested execution skill with that plan
 </Do_Not_Use_When>
 
-<Why_This_Exists>
-AI can build anything. The hard part is knowing what to build. GJC planning Phase 0 expands ideas into specs via analyst + architect, but this single-pass approach struggles with genuinely vague inputs. It asks "what do you want?" instead of "what are you assuming?" Deep Interview applies Socratic methodology to iteratively expose assumptions and mathematically gate readiness, ensuring the AI has genuine clarity before spending execution cycles.
-
-Inspired by the [Ouroboros project](https://github.com/Q00/ouroboros) which demonstrated that specification quality is the primary bottleneck in AI-assisted development.
-</Why_This_Exists>
-
 <Execution_Policy>
-- Ask ONE question at a time -- never batch multiple questions
-- Default to English when no language preference is explicit or obvious. Preserve the user/session language for every user-facing announcement, topology confirmation, option label, and interview question when state includes `language.instruction`; do not add language-specific special cases
-- Before emitting any user-facing natural-language prose governed by `language.instruction`, perform one silent, best-effort self-proofread in the preserved session language for obvious spelling, spacing, grammar, inflection/particle, and word-choice errors, using the same language-agnostic pass for whatever language is active rather than special-casing any single language. Apply it only to newly generated prose and never announce the proofreading, show before/after text, apologize for it, or re-emit a corrected copy. Do not alter code blocks or identifiers, file paths, CLI commands, JSON/configuration keys, `ask` metadata keys, table/round structure, fixed labels, numeric scores, component ids, status tokens, user quotes or source text, Phase 0 threshold markers such as `Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThresholdSource>)`, or fixed paths such as `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md`; still apply the self-proofread to generated natural-language clauses or cells inside those structures, including Why now rationale, gap text, next-target phrasing, and coverage notes
-- Target the WEAKEST clarity dimension with each question
 - Before Round 1 ambiguity scoring, run a one-time Round 0 topology enumeration gate that confirms the top-level component list and locks it into state
-- Make weakest-dimension targeting explicit every round: name the weakest dimension, state its score/gap, and explain why the next question is aimed there
 - Gather codebase facts via focused read/search tools or a canonical read-only role agent (`planner`/`architect`) BEFORE asking the user about them
 - For brownfield confirmation questions, cite the repo evidence that triggered the question (file path, symbol, or pattern) instead of asking the user to rediscover it
 - Score ambiguity after every answer -- display the score transparently
 - When the locked topology has multiple active components, score and target each component explicitly so depth-first clarity on one component cannot hide ambiguity in siblings
-- Keep prompt payloads budgeted: summarize or trim oversized initial context/history before composing question, scoring, spec, or handoff prompts
-- If the user's initial context is oversized, create a concise prompt-safe summary first and wait for that summary before ambiguity scoring, question generation, or downstream execution handoff
-- Do not proceed to execution until ambiguity ≤ the resolved threshold for this run and the user explicitly approves a scoped execution path
+- Route ambiguous implementation asks to clarification, deep-interview, or downstream `ralplan` before mutation; do not infer missing target, scope, acceptance criteria, or safety boundary just to start coding.
+- Treat user wording such as `implementation`, "implementation plan", Korean `구현`, or "구현 계획" as describing the eventual target, not permission to implement now.
+- While still in deep-interview, do not implement, edit/write code, launch implementation workers, or start task/skill/ultragoal implementation; continue interviewing for scope, risks, acceptance criteria, and unknowns.
+- When the user wants interview output for eventual implementation, say: "I can interview for an implementation plan, but I won't implement during deep-interview." Then continue clarifying scope, risks, acceptance criteria, and unknowns.
+- Implementation requires an explicit phase transition/approval after the interview: deep-interview must first produce its spec/handoff, the workflow phase must explicitly transition out of deep-interview, and execution approval must be captured by a downstream execution path.
 - Allow early exit with a clear warning if ambiguity is still high
 - Persist interview state for resume across session interruptions
 - A multi-persona lateral-review panel convenes at ambiguity-milestone transitions (and before synthesizing any agent-supplied answer) to expose blind spots from independent perspectives
 - Refine free-text answers into a structured interpretation and confirm nothing is lost before scoring
 - After 3 consecutive agent-resolved answers (accepted auto-research candidates or auto-answers), route the next question to the user (dialectic rhythm guard)
 - Run an independent closure audit and a one-sentence goal restatement, each requiring explicit user confirmation, before crystallizing the spec
+- When `--trace` is active, use the bounded trace evidence summary as pre-question context; never dump raw logs, raw files, or unbounded search output into questions, scoring, specs, or handoffs
 </Execution_Policy>
 
 <Internal_Auto_Mode_Protocol>
@@ -74,38 +91,74 @@ Inspired by the [Ouroboros project](https://github.com/Q00/ouroboros) which demo
 
 ## Native Plugin Invocation Guard (Issue #3030)
 
-If this raw bundled skill is loaded by GJC's native skill loader through `/skill:deep-interview`, do not treat that path as permission to skip rendered GJC setup. The user-facing invocation is `/skill:deep-interview`; do not recommend or advertise CLI bridge commands as the deep-interview entrypoint. Regardless of invocation path, Phase 0 below remains blocking and must resolve `gjc.deepInterview.ambiguityThreshold` from settings before any announcement, state write, question, or ambiguity score.
+If this raw bundled skill is loaded by GJC's native skill loader through `/skill:deep-interview`, do not treat that path as permission to skip rendered GJC setup. The user-facing invocation is `/skill:deep-interview`; do not recommend or advertise CLI bridge commands as the deep-interview entrypoint. Regardless of invocation path, Phase 0 below remains blocking and must resolve `gjc.deepInterview.ambiguityThreshold` from pre-resolved native state or settings before any announcement, state write, question, or ambiguity score.
 
 ## Corrupt current-session state recovery
 
 When deep-interview detects its own current-session state is corrupt, tampered, unreadable, or stale on resume, run `gjc state clear --force --mode deep-interview` before reseeding or restarting. Scope the clear to the current session via `--session-id`, the command payload, or `GJC_SESSION_ID`; it clears only deep-interview state for that session and never clears other skills or sessions.
+For ordinary diagnosis, run `gjc deep-interview sanity-check --session-id <id> --json` first, then use the issue's selector with `inspect` to read only the affected summary, topology, pending shell, round, facts, triggers, or floor. Repair a healthy, repairable local issue with its matching typed operation (`initialize-context`, `confirm-topology`, `record-answer`, or `apply-round-result`) and the current revision. Do not use grep/sed edits, direct `.gjc/` edits, generic envelope replacement, or `--force` as a repair mechanism; use generic `gjc state` only for the compatibility clear/handoff paths documented here.
 
 ## Phase 0: Resolve Ambiguity Threshold (blocking prerequisite)
 
 Complete this phase before Phase 1, before brownfield exploration, before GJC state persistence, before Round 0, and before any ambiguity scoring. Do not continue if the resolved threshold and source are unknown.
 
-1. **Read threshold settings in precedence order**:
-   - User settings: `[$GJC_CONFIG_DIR|~/.gjc]/settings.json`
-   - Project settings: `./.gjc/settings.json` (overrides user settings)
-2. **Resolve threshold and source**:
-   - Read `gjc.deepInterview.ambiguityThreshold` from both files when present.
-   - Use the project value when valid; otherwise use the user value when valid; otherwise use the default `0.05`.
-   - Set these run variables exactly: `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>` (for example `./.gjc/settings.json`, `[$GJC_CONFIG_DIR|~/.gjc]/settings.json`, or `default`).
-3. **Emit the required first line to the user before any other interview announcement**:
+1. **Inspect the native summary first**:
+   - Run `gjc deep-interview inspect --session-id <id> --selector summary --json`.
+   - If the summary contains a finite `threshold` and its preserved source is available from native state, use those values, set `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>`, and skip optional settings-file reads. This is the normal `/skill:deep-interview` path because the native hook already resolved settings quietly before loading the skill.
+2. **Only if native state lacks a resolved threshold, read threshold settings in runtime precedence order**:
+   - YAML config first: read the **single** modern config path the environment selects — `$GJC_CODING_AGENT_DIR/config.yml` when `GJC_CODING_AGENT_DIR` is set, else `$GJC_CONFIG_DIR/agent/config.yml` when `GJC_CONFIG_DIR` is set, else `~/.gjc/agent/config.yml`. Do not cascade through the other YAML locations when the selected one is absent or invalid.
+   - Then JSON settings: project settings `./.gjc/settings.json`, then user settings `[$GJC_CONFIG_DIR|~/.gjc]/settings.json`.
+   - Read `gjc.deepInterview.ambiguityThreshold` only from files that are known to exist; optional config/settings-file absence is expected and must not be surfaced as failed `Read` calls.
+   - Do not probe arbitrary ancestor candidates such as `../../.gjc/settings.json`; use the current project `.gjc/settings.json` and user settings only.
+3. **Resolve threshold and source**:
+   - Use the first valid configured value in the precedence order above; otherwise use the mode default when a resolution flag was passed: `--quick` = `0.6`, `--standard` = `0.5`, `--deep` = `0.35`; with no resolution flag, use the base default `0.05`.
+   - Set these run variables exactly: `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>` (for example `GJC_CODING_AGENT_DIR/config.yml`, `$GJC_CONFIG_DIR/agent/config.yml`, `~/.gjc/agent/config.yml`, `./.gjc/settings.json`, `[$GJC_CONFIG_DIR|~/.gjc]/settings.json`, or the selected mode default).
+4. **Emit the required first line to the user before any other interview announcement**:
 
 ```
 Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThresholdSource>)
 ```
 
-4. **Carry threshold source forward mechanically**:
-   - Substitute `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>` throughout the remaining instructions before continuing.
-   - Include `threshold_source` in the first `gjc state write` payload and preserve it on later state updates; do not edit `.gjc/_session-{sessionid}/state` files directly unless an explicit force override is active.
+5. **Carry threshold source forward mechanically**:
+   - Pass threshold/source only as bounded setup evidence to `initialize-context`; native state owns the envelope, revision, receipt, lifecycle, derived ambiguity, and later updates. Do not reconstruct or submit a generic state envelope during normal flow.
    - Include both threshold and source in the final spec metadata.
 - Read any `language` object from active deep-interview state and carry `language.instruction` forward mechanically. If absent, default to English unless `{{ARGUMENTS}}` makes another user/session language obvious or the user explicitly requests another language. Do not add language-specific special cases.
 
+## Phase 0.5: Suitability Gate
+
+Run this gate after the Phase 0 threshold marker and before Phase 1, brownfield exploration, typed initialization, Round 0, ambiguity scoring, or spec writing.
+
+If the user request appended after this skill as the final `User:` line is already clear, bounded, low-risk, and asks for a quick fix, single change, known file/symbol edit, explicit command, or direct answer:
+
+1. **Stop deep-interview immediately**:
+   - First inspect current-session state with `gjc deep-interview inspect --session-id <current-session-id> --selector summary --json`.
+   - For compatibility-only recovery where typed inspection is unavailable, `gjc state read --mode deep-interview --json` may confirm whether this narrow clear is safe; never use it to rebuild or replace state.
+   - Clear through `gjc state clear --force --mode deep-interview --json` only when the state is a newly seeded empty interview: no recorded `rounds`, no `spec_path`, no `handoff_from`, no final/pending spec, and no user-confirmed topology.
+   - If state already contains rounds, a spec path, handoff metadata, pending approval, or confirmed topology, do not clear it. Preserve the active interview and ask the user whether to continue, cancel, or explicitly clear the workflow.
+   - Do not initialize deep-interview state.
+   - Do not run Round 0.
+   - Do not write a pending-approval spec.
+   - Do not hand off to `ralplan`, `ultragoal`, `team`, or a role agent.
+2. **Return the request to direct implementation**:
+   - Say briefly that deep-interview is unnecessary because the request is already clear and small.
+   - State the direct implementation path the normal coding agent should take.
+   - If the user explicitly insists on deep-interview anyway, continue to Phase 1.
+
+This gate exists to prevent deep-interview from making easy problems harder. A small verification need does not make a request interview-worthy.
+
+## Phase 0.75: Optional Trace Pre-Step
+
+Run this phase only when the active deep-interview state or invocation indicates `--trace` / `state.trace.enabled === true`. It is a pre-interview research step, not an implementation phase.
+
+1. Read the native trace summary from active deep-interview state (`trace`, `state.trace`, or `state.trace_summary`). The native seed must have produced this summary before any interview question.
+2. Treat the summary as compact evidence: project hints, relevant paths, and path-level findings only. Do not expand it by dumping raw files, raw logs, or unbounded command output.
+3. Store or preserve it under `state.trace_summary` and fold it into `codebase_context` with citations to the summarized paths.
+4. Use trace findings to influence Round 0 topology, Phase 2 question targeting, requirement wording, acceptance criteria, and final Technical Context. Normal no-trace interviews must behave exactly as before.
+5. If `--trace` was requested but no valid bounded summary exists, increment `architect_failures` or record an internal audit note, then continue with the normal no-trace path without surfacing tool noise.
+
 ## Phase 1: Initialize
 
-1. **Parse the user's idea** from `{{ARGUMENTS}}`
+1. **Parse the user's idea** from the user request appended after this skill as the final `User:` line
 2. **Detect brownfield vs greenfield**:
    - Use focused read/search tools or a canonical read-only role agent (`planner`/`architect`) to check if cwd has existing source code, package files, or git history
    - If source files exist AND the user's idea references modifying/extending something: **brownfield**
@@ -120,9 +173,8 @@ Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThreshold
    - If any value is missing, return to Phase 0 instead of using a hardcoded threshold.
 3.6. **Normalize oversized initial context before state init**:
    - Inspect the initial idea plus any pasted artifacts, logs, transcripts, or file excerpts for prompt-budget risk before writing state or generating the first question.
-   - If the initial context is oversized or likely to crowd out downstream prompts, produce a concise prompt-safe summary that preserves user intent, decisions, constraints, unknowns, cited files/symbols, and any explicit non-goals.
+   - Apply the oversize summarize-first principle (DIPP-7) to produce the prompt-safe summary before state init.
    - Treat the summary as the canonical `initial_idea` and store the raw oversized material only as external/advisory context if it can be referenced safely; do not paste the raw oversized context into question-generation, ambiguity-scoring, spec-crystallization, or execution-handoff prompts.
-   - Wait until the summary exists before ambiguity scoring, weakest-dimension selection, brownfield exploration prompts, or any bridge to `ralplan`, `execution`, `execution`, or `team`.
 3.7. **Artifact path discipline**:
    - Final specs MUST resolve to `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` exactly.
    - Write final specs and all ephemeral interview artifacts through the active GJC workflow/state CLI when available.
@@ -130,45 +182,17 @@ Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThreshold
    - Preferred: pass the spec markdown **inline** to the native deep-interview write command (`--write … --spec "<markdown>"`) — no scratch file is needed. The CLI is the only sanctioned writer for `.gjc/_session-{sessionid}/specs`.
    - Only if a spec is too large to pass inline, stage it with the `write` tool to a system temp directory (`os.tmpdir()`/`$TMPDIR`, `/tmp`, `/var/tmp`) outside the project tree, then pass that path to `--spec`. The planning phase-boundary block tolerates these neutral temp writes; never stage interview artifacts inside the repo or under `.gjc/`, and do not improvise repo-relative scratch files.
 
-4. **Initialize state** via `gjc state write`:
-
-```json
-{
-  "active": true,
-  "current_phase": "interviewing",
-  "state": {
-    "interview_id": "<uuid>",
-    "type": "greenfield|brownfield",
-    "initial_idea": "<prompt-safe initial-context summary or user input>",
-    "initial_context_summary": "<summary if oversized, else null>",
-    "rounds": [],
-    "established_facts": [],
-    "current_ambiguity": 1.0,
-    "threshold": <resolvedThreshold>,
-    "threshold_source": "<resolvedThresholdSource>",
-    "language": "<existing language object from active state, if present>",
-    "codebase_context": null,
-    "topology": {
-      "status": "pending|confirmed|legacy_missing",
-      "confirmed_at": null,
-      "components": [],
-      "deferrals": [],
-      "last_targeted_component_id": null
-    },
-    "ontology_snapshots": [],
-    "auto_researched_rounds": [],
-    "auto_answered_rounds": [],
-    "lateral_reviews": [],
-    "lateral_panel_failures": 0,
-    "auto_answer_streak": 0,
-    "refined_rounds": [],
-    "closure_overrides": [],
-    "restated_goal": null,
-    "ambiguity_milestone": "initial",
-    "architect_failures": 0
-  }
-}
+4. **Initialize through a CLI-owned draft.** Create an `initialize-context` draft, edit only its bounded fields, check it, then consume it through the typed command. Never serialize a setup request, envelope, or derived values inline:
+```sh
+gjc deep-interview draft create --for initialize-context --session-id <id> --json
+# Capture draft_id and draft_revision from the response.
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <draft_revision> --op set --path /type --value greenfield --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /initial_idea --value "<prompt-safe idea>" --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /threshold_source --value "<source>" --json
+gjc deep-interview draft check --draft-id <draft_id> --json
+gjc deep-interview initialize-context --draft-id <draft_id> --expected-draft-revision <latest_draft_revision> --json
 ```
+`draft create` records the state base revision; every edit returns the next `draft_revision`. The native runtime validates, consumes, stamps, and owns the complete state. Retain the returned state revision for inspection only; mutations consume their own checked draft.
 
 5. **Announce the interview** to the user:
 
@@ -182,7 +206,7 @@ The first line of this announcement MUST be exactly the Phase 0 threshold marker
 > **Project type:** {greenfield|brownfield}
 > **Current ambiguity:** 100% (we haven't started yet)
 
-Before emitting the prose lines in this announcement, apply the `<Execution_Policy>` self-proofread once; keep the required threshold marker and the quoted `{initial_idea}` unchanged.
+Before emitting the prose lines in this announcement, apply the self-proofread once (DIPP-5); keep the required threshold marker and the quoted `{initial_idea}` unchanged.
 
 ## Round 0: Topology Enumeration Gate
 
@@ -192,6 +216,7 @@ Run this gate exactly once after Phase 1 initialization and before any Phase 2 a
    - Extract top-level verbs/nouns, workstreams, surfaces, integrations, or deliverables that can succeed or fail independently.
    - Prefer 1-6 components. If more than 6 candidates appear, group siblings at the highest useful level and note the grouping rationale.
    - Do not treat implementation tasks, fields, or sub-features as top-level components unless the user framed them as independent outcomes.
+   - When `--trace` is active, include trace-summarized paths as topology evidence, but do not add implementation sub-tasks as top-level components solely because trace found files.
 2. **Ask one confirmation question** before Round 1:
 
 ```
@@ -201,47 +226,33 @@ I'm reading this as {N} top-level component(s):
 1. {component_name}: {one_sentence_description}
 2. ...
 
-Is that topology right? Should any component be added, removed, merged, split, or explicitly deferred?
+Locked intent:
+- Artifacts: {category-prefixed IDs and concrete outputs}
+- Surfaces: {category-prefixed IDs and user-visible surfaces}
+- Integrations: {category-prefixed IDs and external/system boundaries}
+- Constraints: {category-prefixed IDs and user-locked constraints}
+
+Is that topology and locked intent right? Should any component or intent be added, removed, merged, split, or explicitly deferred?
 ```
 
 Options should include contextually relevant choices such as **Looks right**, **Add/remove/merge components**, **Defer one or more components**, plus free-text, translated/localized according to `language.instruction` when present. This is the only pre-scoring question and preserves the one-question-per-round rule.
 
-3. **Lock topology into state** after the answer. Store a normalized component list and confirmation timestamp:
+The Round 0 `ask` call MUST include `deepInterview.round = 0`, `deepInterview.component = "review-topology"`, `deepInterview.dimension = "topology"`, `deepInterview.intent_contract.items` containing the exact displayed locked-intent items, and `deepInterview.intent_contract.confirmation_options` listing only the displayed affirmative labels that lock the proposal (normally **Looks right**). The runtime recorder canonicalizes and locks this contract only when the user selects one of those labels; correction, deferral, free-text, and clarification answers never lock the pre-question proposal. Do not manually copy raw free text into intent evidence, and do not continue if this required recorder write fails.
 
-```json
-{
-  "topology": {
-    "status": "confirmed",
-    "confirmed_at": "<ISO-8601 timestamp>",
-    "components": [
-      {
-        "id": "component-slug",
-        "name": "Component Name",
-        "description": "Confirmed top-level outcome",
-        "status": "active|deferred",
-        "evidence": ["initial prompt phrase or brownfield citation"],
-        "clarity_scores": {
-          "goal": null,
-          "constraints": null,
-          "criteria": null,
-          "context": null
-        },
-        "weakest_dimension": null
-      }
-    ],
-    "deferrals": [
-      {
-        "component_id": "component-slug",
-        "reason": "User-confirmed deferral reason",
-        "confirmed_at": "<ISO-8601 timestamp>"
-      }
-    ],
-    "last_targeted_component_id": null
-  }
-}
+3. **Lock topology through a CLI-owned draft** after the answer. Create a `confirm-topology` draft, use a valueless append on a missing object-item array to add an `{}` scaffold, set scalar leaves, and check it. A valueless append on a missing scalar-item array initializes `[]`; on an existing scalar-item array, append still requires `--value` or `--value-file`. For a topology with zero deferrals, initialize `/deferred_components` with that valueless scalar-array append, then consume it:
+```sh
+gjc deep-interview draft create --for confirm-topology --session-id <id> --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <draft_revision> --op append --path /components --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /components/0/id --value <component_id> --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /components/0/name --value "<component name>" --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op append --path /deferred_components --json
+gjc deep-interview draft check --draft-id <draft_id> --json
+gjc deep-interview confirm-topology --draft-id <draft_id> --expected-draft-revision <latest_draft_revision> --json
 ```
+The recorder still persists `state.intent_contract` from the Round 0 `ask` answer. The runtime validates pending/legacy state, preserves declared ordering, detects conflicting confirmations, derives component state, and returns the new revision. Do not replace `topology` through `gjc state write`.
+It contains the four exact categories `artifact`, `surface`, `integration`, and `constraint`; every item has a unique category-prefixed ID (for example `surface:review`). The recorder canonically sorts items, persists the full SHA-256 manifest digest, and binds confirmation to a redacted answer-hash reference. Before spec persistence, include every preserved locked ID literally in the final spec. For a proposed missing locked ID, ask one intent-review question through `ask`; the runtime records `pending` unless the user selects an exact approval option, and spec persistence/handoff fail closed for missing, stale, or unrecorded reduction-review evidence. Intent review authorizes only that output reduction, never execution or handoff.
 
-4. **Legacy state migration:** When resuming an existing `deep-interview` state file that lacks `topology`, treat it as `"status": "legacy_missing"`. If no final `spec_path` exists yet, run Round 0 before the next ambiguity scoring pass and then continue with the existing transcript. If a final spec already exists, do not rewrite history; note in any handoff that topology was not captured for that legacy interview.
+4. **Legacy state migration:** When a resumed legacy interview lacks confirmed topology and no final `spec_path` exists, run Round 0 and use `confirm-topology` before the next ambiguity scoring pass. If a final spec already exists, do not rewrite history; note in any handoff that topology was not captured for that legacy interview.
 
 5. **Single-component pass-through:** If the user confirms one active component, Phase 2 proceeds with the existing flow while still carrying `topology.components[0]` into scoring and spec output.
 
@@ -259,11 +270,12 @@ Build the question generation prompt with:
 - Current clarity scores per dimension (which is weakest?)
 - Lateral-review panel findings (if convened this round -- see Phase 3)
 - Brownfield codebase context (if applicable), summarized to cited paths/symbols/patterns instead of raw dumps
+- Bounded trace summary (when `--trace` is active): project hints, relevant paths, and findings only; cite paths instead of raw content
 - Locked topology from Round 0, including active components, deferred components, prior per-component scores, and `last_targeted_component_id`
 
 - `language` from active state when present; apply `language.instruction` to all natural-language user-facing question text, rationale, and options
 
-If any prompt input is too large, summarize it first and then continue from the summary. Do not ask the next the `ask` tool, score ambiguity, or hand off to execution from an over-budget raw transcript.
+If any prompt input is too large, summarize it first and then continue from the summary. Do not ask the next question, score ambiguity, or hand off to execution from an over-budget raw transcript.
 
 **Question targeting strategy:**
 - Identify the active component + dimension pair with the LOWEST clarity score across the locked topology
@@ -302,9 +314,21 @@ Round {n} | Component: {target_component_name} | Targeting: {weakest_dimension} 
 
 Options should include contextually relevant choices plus free-text, translated/localized according to `language.instruction` when present.
 
-After applying `language.instruction` to the visible question, options, and generated rationale, apply the self-proofread once to new prose only; preserve only the Round/Component/Targeting/Ambiguity line structure, fixed labels, numeric ambiguity value, component/target identifiers, and `deepInterview.*` metadata keys. Do not exempt generated natural-language rationale such as Why now.
+After applying `language.instruction` to the visible question, options, and generated rationale, apply the self-proofread once to new prose only (DIPP-5); preserve only the Round/Component/Targeting/Ambiguity line structure, fixed labels, numeric ambiguity value, component/target identifiers, and `deepInterview.*` metadata keys. Do not exempt generated natural-language rationale such as Why now.
 
-When calling `ask`, SHOULD include optional structured metadata so the runtime can record the round without manual state writes: `deepInterview.round_id?`, `deepInterview.round`, `deepInterview.component`, `deepInterview.dimension`, and `deepInterview.ambiguity`. Keep this metadata aligned with the visible Round/Component/Targeting/Ambiguity line; if metadata cannot be supplied, the legacy formatted question text remains the fallback.
+When calling `ask`, SHOULD include optional structured metadata so the runtime can record the round without manual state writes: `deepInterview.round_id?`, `deepInterview.round`, `deepInterview.component`, `deepInterview.dimension`, and `deepInterview.ambiguity`. Keep this metadata aligned with the visible Round/Component/Targeting/Ambiguity line. Recorder-first remains mandatory. If the runtime did not record the answer shell, inspect `pending` or `round` to obtain its identity, then create a `record-answer` draft with that identity, edit scalar leaves, scaffold option arrays, and consume it:
+```sh
+gjc deep-interview draft create --for record-answer --session-id <id> --round <n> --question-id <id> [--round-id <id>] [--component-id <id>] [--dimension <dimension>] --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <draft_revision> --op set --path /question --value "<question>" --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op append --path /answer/selected_options --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /answer/selected_options/0 --value "<selected option>" --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /answer/custom_input --null --json
+gjc deep-interview draft check --draft-id <draft_id> --json
+gjc deep-interview record-answer --draft-id <draft_id> --expected-draft-revision <latest_draft_revision> --json
+```
+Do not recreate transcript, rounds, or generic state JSON.
+
+If the `ask` tool returns `clarificationQuestion`, treat it as a non-answer about the displayed choices. Answer the clarification briefly from the current interview context, then call `ask` again with the exact original question, options, and `deepInterview.*` metadata. A clarification bypasses Step 2b′ auto-answer, Step 2b″ free-text refine, Step 2c ambiguity scoring, Step 2d apply-and-report, and Step 2e soft-limit checks; it must not be recorded as a round answer. This does not violate the one-question-per-round rule because the round remains unresolved until the user submits a real listed option or `Other` answer.
 
 ### Step 2b′: Auto-Answer Opted-Out Questions
 
@@ -314,7 +338,7 @@ Auto-answer has a clarity cap: unless the architect confidence is `high` and unc
 
 ### Step 2b″: Refine Free-Text Answers
 
-When the user's answer is free-text that carries reasoning, constraints, or scope decisions, do not forward it to scoring as a lossy one-line label. First structure it into a compact interpretation using the canonical sections — **Decision**, **Reasoning**, **Constraints (user-stated)**, **Out of scope (user-stated)**, and **Codebase context (verified)** (omit empty sections) — then confirm with exactly one `ask` that nothing is lost or misrepresented. Apply `language.instruction` when present.
+When the user's answer is free-text that carries reasoning, constraints, or scope decisions, do not forward it to scoring as a lossy one-line label. First structure it into a compact interpretation using the canonical sections — **Decision**, **Reasoning**, **Constraints (user-stated)**, **Out of scope (user-stated)**, and **Codebase context (verified)** (omit empty sections). Then confirm with exactly one `ask` that nothing is lost or misrepresented: the `ask` question body MUST render the full structured interpretation — every non-empty canonical section, verbatim — before the confirmation prompt. The user is approving that specific interpretation, so it must be visible inside the question body; never ask "does this capture it?" / "이 해석이 맞아?" without first displaying the interpretation itself. A confirmation `ask` whose body omits the interpretation it is asking about is a hard error: re-issue it with the interpretation shown. Apply `language.instruction` when present.
 
 Offer options such as **Send as-is**, **Add a constraint**, **Mark something out of scope**, **Add context**, and **Rewrite**, plus free-text. If the user picks anything other than "Send as-is", collect the exact missing text with one follow-up `ask` (never infer it from the option label), fold it into the structured interpretation, and re-confirm. Do not advance to scoring while the user is still saying something is missing.
 
@@ -338,13 +362,17 @@ Ambiguity-raising triggers:
 
 Use **mechanism A** for every ambiguity rise: a trigger LOWERS the affected component/dimension clarity score, and the existing weighted formula raises ambiguity. There is **no separate penalty term**; ambiguity remains bounded by the same greenfield/brownfield formula.
 
+**Native ambiguity and floor.** Submit candidate component scores, trigger/fact operations, ontology evidence, targeting, and bookkeeping in `RoundResult`; the runtime alone derives weighted ambiguity, floor, effective ambiguity, milestone, ontology stability, trigger correspondence, rotation, and auto-resolution streak. Do not calculate, assert, or persist any of those derived values in the request.
+
+The native floor retains contradiction pressure, unscored active-component pressure, and auto-answer dilution. A disputed fact blocks convergence until it is resolved through the typed fact operation; never delete contradicted history. When the response reports a clamp, show the returned floor and dominant cause rather than inventing a score.
+
 The rise is SILENT: no modal, no forced-resolution step, and no dedicated conflict UI. Surface it through the normal per-round report and by targeting the next question at the affected component/dimension.
 
-Structured scorer output is required. Include `triggers`, `trigger_status`, `affected_component`, `affected_dimension`, `prior_dimension_score`, `new_dimension_score`, `prior_ambiguity`, `new_ambiguity`, `evidence`, `contradicted_established_fact` when relevant, and `disputed_unresolved_rationale` when applicable.
+Structured scorer output is required. Include `triggers`, `trigger_status`, `affected_component`, `affected_dimension`, `prior_dimension_score`, `new_dimension_score`, `evidence`, `contradicted_established_fact` when relevant, and `disputed_unresolved_rationale` when applicable. Do not include prior/new ambiguity, floor, effective ambiguity, or milestone assertions.
 
-Established-facts maintenance: promote stable confirmed decisions into `state.established_facts` with source/evidence; when a new answer contradicts an established fact, mark the fact disputed and preserve the contradicted fact instead of deleting it.
+Established-facts maintenance: promote stable confirmed decisions into `state.established_facts` with source/evidence; when a new answer contradicts an established fact, mark the fact disputed and preserve the contradicted fact instead of deleting it. When the user later confirms the new direction, record the superseding decision as a new established fact and set `superseded_by: <new fact id>` on the disputed fact — that is the only way to release the deterministic floor pressure while keeping the audit trail.
 
-TRANSITION VALIDATION: if a trigger is present, the affected dimension must not improve and overall ambiguity must rise vs the prior scored round, unless the trigger is explicitly marked disputed or unresolved with rationale.
+TRANSITION VALIDATION: if a trigger is present, the affected dimension must not improve unless the trigger is explicitly marked disputed or unresolved with rationale. The runtime validates and returns the authoritative ambiguity transition.
 
 Convergence Pacing deferral: do not add a min-round floor, score-drop cap, confidence dampening, or other explicit pacing brake. Bidirectional scoring is the pacing mechanism.
 
@@ -364,6 +392,9 @@ Locked topology:
 Established facts:
 {state.established_facts}
 
+Trace summary:
+{state.trace_summary if --trace was active, else "not requested"}
+
 Score each active component on each dimension, then provide the overall dimension scores as the minimum or coverage-weighted weakest score across active components. Deferred components are excluded from ambiguity math but must remain listed in topology and the final spec.
 
 Score each dimension:
@@ -382,7 +413,7 @@ Also identify:
 - weakest_dimension: the single lowest-confidence dimension for that component this round
 - weakest_dimension_rationale: one sentence explaining why this component/dimension pair is the highest-leverage target for the next question
 - component_scores: object keyed by component id, with per-dimension scores and gaps
-- structured_scorer_output: object containing triggers, trigger_status, affected_component, affected_dimension, prior_dimension_score, new_dimension_score, prior_ambiguity, new_ambiguity, evidence, contradicted_established_fact when relevant, and disputed_unresolved_rationale when applicable
+- structured_scorer_output: object containing triggers, trigger_status, affected_component, affected_dimension, prior_dimension_score, new_dimension_score, evidence, contradicted_established_fact when relevant, and disputed_unresolved_rationale when applicable; do not include ambiguity, floor, or milestone values
 
 5. Ontology Extraction: Identify all key entities (nouns) discussed in the transcript.
 
@@ -397,79 +428,51 @@ For each entity provide:
 Respond as JSON. Include an additional "ontology" key containing the entities array alongside the dimension scores.
 ```
 
-**Calculate ambiguity:**
+**Ontology input:** provide entities, relationships, and concise reasoning in `RoundResult`. The runtime determines first-round/no-entity handling, exact-name stability, deterministic renamed matching, counts, ratio, and snapshot persistence. Report the returned ontology result; do not send caller-computed counts, ratios, or snapshots.
 
-Greenfield: `ambiguity = 1 - (goal × 0.40 + constraints × 0.30 + criteria × 0.30)`
-Brownfield: `ambiguity = 1 - (goal × 0.35 + constraints × 0.25 + criteria × 0.25 + context × 0.15)`
-
-**Calculate ontology stability:**
-
-**Round 1 special case:** For the first round, skip stability comparison. All entities are "new". Set stability_ratio = N/A. If any round produces zero entities, set stability_ratio = N/A (avoids division by zero).
-
-For rounds 2+, compare with the previous round's entity list:
-- `stable_entities`: entities present in both rounds with the same name
-- `changed_entities`: entities with different names but the same type AND >50% field overlap (treated as renamed, not new+removed)
-- `new_entities`: entities in this round not matched by name or fuzzy-match to any previous entity
-- `removed_entities`: entities in the previous round not matched to any current entity
-- `stability_ratio`: (stable + changed) / total_entities (0.0 to 1.0, where 1.0 = fully converged)
-
-This formula counts renamed entities (changed) toward stability. Renamed entities indicate the concept persists even if the name shifted — this is convergence, not instability. Two entities with different names but the same `type` and >50% field overlap should be classified as "changed" (renamed), not as one removed and one added.
-
-**Show your work:** Before reporting stability numbers, briefly list which entities were matched (by name or fuzzy) and which are new/removed. This lets the user sanity-check the matching.
-
-Store the ontology snapshot (entities + stability_ratio + matching_reasoning) in `state.ontology_snapshots[]`.
-
-### Step 2d: Report Progress
-
-After scoring, show the user their progress:
-
+### Step 2d: Apply Round Result and Report Progress
+After `ask` has recorded (or `record-answer` has recovered) the answer shell, inspect `pending` or `round` for its identity. Create an `apply-round-result` draft, edit only bounded scorer evidence, check it, and consume it once:
+```sh
+gjc deep-interview draft create --for apply-round-result --session-id <id> --round-key <round_key> --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <draft_revision> --op set --path /global_scores/goal --value 0.8 --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op append --path /component_updates --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /component_updates/0/component_id --value <component_id> --json
+gjc deep-interview draft check --draft-id <draft_id> --json
+gjc deep-interview apply-round-result --draft-id <draft_id> --expected-draft-revision <latest_draft_revision> --json
 ```
+`RoundResult` remains candidate scores, component updates, triggers, fact operations, ontology input, targeting, and bookkeeping only. The runtime performs one authoritative transaction, returns native-derived scoring and the new revision, and rejects stale, conflicting, malformed, or unrecoverable state. Never enrich a round through `gjc state write`.
+
+After the typed transaction succeeds, consume `<native>.native_projection` as the version 1 native projection. Render only the paths listed below; do not report candidate values, inspect-state values, locally calculated values, names, weights, gaps, thresholds, ratios, causes, or milestone transitions that the projection does not expose.
+
+```text
 Round {n} complete.
 
-| Dimension | Score | Weight | Weighted | Gap |
-|-----------|-------|--------|----------|-----|
-| Goal | {s} | {w} | {s*w} | {gap or "Clear"} |
-| Constraints | {s} | {w} | {s*w} | {gap or "Clear"} |
-| Success Criteria | {s} | {w} | {s*w} | {gap or "Clear"} |
-| Context (brownfield) | {s} | {w} | {s*w} | {gap or "Clear"} |
-| **Ambiguity** | | | **{prior_score}% -> {score}% {up|down|flat}** | {if up: trigger name such as "A direct contradiction"} |
-
-**Topology:** Targeted {target_component_name} | Active: {active_component_count} | Deferred: {deferred_component_count} | Next rotation after: {last_targeted_component_id}
-
-**Ontology:** {entity_count} entities | Stability: {stability_ratio} | New: {new} | Changed: {changed} | Stable: {stable}
-**Milestone:** {prior_milestone} → {current_milestone}{milestone_transition ? " — lateral panel convened" : ""}
-
-**Next target:** {target_component_name} / {weakest_dimension} — {weakest_dimension_rationale}
-
-{score <= threshold ? "Clarity threshold met! Ready to proceed." : "Focusing next question on: {weakest_dimension}"}
-
+Ambiguity: prior {<native>.native_projection.prior_effective_ambiguity}; current {<native>.native_projection.effective_ambiguity} ({<native>.native_projection.direction})
+Floor: {<native>.native_projection.floor}
+Milestone: {<native>.native_projection.ambiguity_milestone}
+Topology: target {<native>.native_projection.targeting.target_component_id}; active {<native>.native_projection.topology_counts.active}; deferred {<native>.native_projection.topology_counts.deferred}; total {<native>.native_projection.topology_counts.total}
+Ontology: stable {<native>.native_projection.ontology_counts.stable}; changed {<native>.native_projection.ontology_counts.changed}; new {<native>.native_projection.ontology_counts.new}
+Next target: {<native>.native_projection.targeting.target_component_id} / {<native>.native_projection.targeting.target_dimension}
+Auto-answer streak: {<native>.native_projection.transition.auto_answer_streak}
 ```
 
-Apply `language.instruction` when present before showing this progress report so status text, gaps, and next-target phrasing stay in the preserved session language.
+`prior_effective_ambiguity` may be `null` on the first scored round; show that returned value rather than inventing a prior percentage. The transition lifecycle and round identity remain available at `<native>.native_projection.transition.lifecycle` and `<native>.native_projection.transition.round_key` for control flow, but are not progress prose.
 
-Then apply the self-proofread once to narrative status text, generated prose cells, gaps, and next-target phrasing; preserve only table structure, fixed status labels, scores, weights, component ids, and trigger tokens.
+Apply `language.instruction` when present before showing this progress report; apply the self-proofread once (DIPP-5) to narrative status text, generated prose cells, gaps, and next-target phrasing while preserving the real native projection paths and fixed report structure.
 
-### Step 2e: Update State
+### Step 2e: Check Tiered Confirmation Cadence
 
-Update state in two phases. The `ask` answer is first recorded by the runtime as an `answered` shell. Scoring then enriches the same round record to `scored` with global scores, per-component `topology.components[].clarity_scores`, `topology.components[].weakest_dimension`, trigger metadata, established-facts changes, ontology snapshot, `topology.last_targeted_component_id`, `auto_researched_rounds`, `auto_answered_rounds`, and `architect_failures`. When `deepInterview` ask metadata is present, no manual per-round `gjc state write` is required for the answer shell; only scoring enrichment/state maintenance remains. When metadata is absent, use the legacy `gjc state write` path to persist the new round and never patch `.gjc/_session-{sessionid}/state` directly unless an explicit force override is active.
-Also recompute and persist `ambiguity_milestone` each round (detect band transitions for the Phase 3 panel), and persist `auto_answer_streak`, `refined_rounds`, `lateral_reviews`, and `lateral_panel_failures` alongside the existing fields.
+Confirmation cadence is tiered by round, adopted from ouroboros's ooo interview, while the hard safety cap is retained:
 
-### Step 2f: Check Soft Limits
-
-- **Round 3+**: Allow early exit if user says "enough", "let's go", "build it"
-- **Round 10**: Show soft warning: "We're at 10 rounds. Current ambiguity: {score}%. Continue or proceed with current clarity?"
-- **Round 100**: Hard cap: "Maximum interview rounds reached. Proceeding with current clarity level ({score}%)."
+- **Rounds 1-3 (auto-continue)**: minimum context gathering — proceed to the next question without a "continue?" prompt.
+- **Rounds 4-15 (ask to continue)**: after each round, ask "Continue, or proceed with current clarity ({<native>.native_projection.effective_ambiguity}%)?" so the user controls depth.
+- **Rounds 16+ (diminishing-returns warning)**: keep asking "Continue?" but prefix a diminishing-returns warning: "We're at {n} rounds (ambiguity: {<native>.native_projection.effective_ambiguity}%); each further round yields less. Continue or proceed?"
+- **Round 3+ early exit**: still allow immediate exit if the user says "enough", "let's go", "build it".
+- **Round 100 (hard cap)**: "Maximum interview rounds reached. Proceeding with current clarity level ({<native>.native_projection.effective_ambiguity}%)." The tiered cadence never removes this hard safety cap.
 
 ## Phase 3: Lateral Review Panel (milestone-triggered)
 
-The interview convenes a short multi-persona panel at **ambiguity-milestone transitions** instead of at fixed round numbers. Define milestone bands from the round's ambiguity score:
-
-| Band | Ambiguity |
-|------|-----------|
-| `initial` | > 0.60 |
-| `progress` | 0.60 ≥ a > 0.30 |
-| `refined` | 0.30 ≥ a > threshold |
-| `ready` | ≤ threshold |
+The runtime returns the sole ready-first milestone mapping: `ready` when effective ambiguity is at or below the frozen threshold; otherwise `initial` above 0.60, `progress` above 0.30, and `refined` at or below 0.30. Use the returned milestone rather than recalculating bands.
 
 A transition occurs whenever the band changes versus the prior scored round — in either direction, since bidirectional scoring can move the band back up. On a transition, and also before synthesizing any agent-supplied answer (auto-research candidates, an auto-answer, or a code/brownfield auto-confirm that carries real interpretation), convene the panel before generating or asking the next question.
 
@@ -487,19 +490,37 @@ A transition occurs whenever the band changes versus the prior scored round — 
 
 **Bookkeeping:** record each convened panel in `state.lateral_reviews` (round, milestone transition or pre-answer trigger, personas dispatched, findings folded). On panel spawn or validation failure, fall back silently to the normal generated question and increment `lateral_panel_failures`; do not expose tool noise unless it changes the next user-facing question. The panel is a prompt-budgeted assist layer — summarize oversized context before dispatch.
 
+### Per-question advisory fanout lanes (distinct from the milestone panel)
+
+Separate from the milestone-triggered lateral panel above, a lightweight **advisory fanout** may assist any single question the main session is about to synthesize or route — especially when the user is terse, uncertain, or would benefit from selectable options instead of another open-ended prompt. Adopted from ouroboros's ooo interview, the standard lanes are:
+
+- `code_context` — inspect repo-local facts and reuse existing exploration before asking the user.
+- `web_context` — browse/search only when current external facts genuinely affect the answer.
+- `ambiguity_contrarian` — find hidden assumptions, vague terms, missing decisions, and risky defaults.
+- `answer_simplifier` — turn the question into 2-3 easy choices or one concise draft answer.
+- `architecture_implications` — check whether the answer changes ownership, interfaces, rollout, or system shape.
+
+Advisory fanout is an assist layer, not a decision maker: it never replaces or delays the single user-facing question, never adds a second question, and never forwards a synthesized answer without the user's approval, edit, or explicit auto-confirm request. It differs from the milestone panel in trigger (per-question, not band-transition) and intent (help the human answer this one question). When both would fire on the same round, run the milestone panel and fold advisory lanes into the same single question. Runtimes without a parallel subagent primitive process lanes sequentially; on lane failure, fall back silently to the normal generated question.
+
+### Structured adapter context and input safety (confused_terms / references / FREETEXT_FIELDS)
+
+`confused_terms` and `references` are optional structured adapter context queued at interview start. They are **non-behavioral**: they MUST NOT alter the first question, are never inferred from vocabulary density, and glossary help is limited to explicitly-confused terms while references are used only for contrast questions. Referenced `url`/`excerpt` values are inert strings that are **never auto-fetched**. These fields ride the `ask` tool `deepInterview` metadata and are carried into the gate `stage_state` as bounded, optional values.
+
+Input safety: user-facing free-text fields (an allowlist including `initial_context`, `user_response`, `goal`, `prompt`, `description`, `statement`) legitimately carry prose with shell metacharacters (`;`, `|`, `&`, backticks, `$()`) and must not be rejected as injection; structural fields (ids, categories, hashes) stay strictly validated. Runtime-ingested initial context, user responses, and each incoming structured adapter/LLM response are bounded by character-count DoS caps of 50,000, 10,000, and 100,000 characters respectively rather than by content inspection.
+
 ## Phase 4: Crystallize Spec
 
 When ambiguity ≤ threshold (or hard cap / early exit):
 
 **Before generating the spec, two gates must pass, in order:**
 
-**4a. Closure / Acceptance Guard.** Even when ambiguity ≤ threshold, do not treat the math as completion. Run an independent readiness audit from the full main-session perspective (including explore findings, established facts, and triggers the scorer may not have fully weighed). Confirm every active topology component has goal/constraint/criteria coverage, no unresolved or disputed trigger remains on a path that matters, and no low-confidence auto-answer is standing in for user-confirmed truth above the clarity cap. If a material gap exists, explicitly override the gate to the user — "The math says ready, but I am not accepting it yet because {gap}" — and ask the single highest-impact follow-up, returning to Phase 2. Record any override in `state.closure_overrides`.
+**4a. Closure / Acceptance Guard.** Even when ambiguity ≤ threshold, do not treat the math as completion. Run an independent readiness audit from the full main-session perspective (including explore findings, established facts, and triggers the scorer may not have fully weighed). Confirm every active topology component has goal/constraint/criteria coverage, no unresolved or disputed trigger remains on a path that matters, no disputed established fact lacks a `superseded_by` resolution, and no low-confidence auto-answer is standing in for user-confirmed truth above the clarity cap. If a material gap exists, explicitly override the gate to the user — "The math says ready, but I am not accepting it yet because {gap}" — and ask the single highest-impact follow-up, returning to Phase 2. Record any override in `state.closure_overrides`.
 
-**4b. Restate gate.** Once closure passes, collapse the agreed answers into ONE sentence goal that covers every active component, and confirm it with a single `ask`: "If someone read only this line, would they reach the same outcome you have in mind?" Offer **Yes, crystallize**, **Adjust wording**, and **Missing scope**, plus free-text, applying `language.instruction` when present. Because this gate has options, it MUST go through `ask`: do not print the Restate question and options as assistant prose with `Question:`/`Options:` labels. If the Restate gate was already printed that way, immediately call `ask` with the same question/options before accepting or waiting for any answer. On "Adjust wording" / "Missing scope", collect the exact correction with one follow-up `ask`, route it back through Step 2c scoring and established-facts maintenance (a correction can change ambiguity), then re-run closure and ask the Restate gate again. Cap at two loops; if alignment is not reached, return to Phase 2 with a targeted question instead of forcing a goal line. Persist the confirmed line as `state.restated_goal`.
+**4b. Restate gate.** Once closure passes, collapse the agreed answers into ONE sentence goal that covers every active component, and confirm it with a single `ask` whose body MUST begin by stating that one-sentence goal verbatim, followed by: "If someone read only this line, would they reach the same outcome you have in mind?" The goal line must be visible inside the `ask` body; never ask the confirmation without first displaying the collapsed goal it refers to. Offer **Yes, crystallize**, **Adjust wording**, and **Missing scope**, plus free-text, applying `language.instruction` when present. Because this gate has options, it MUST go through `ask`: do not print the Restate question and options as assistant prose with `Question:`/`Options:` labels. If the Restate gate was already printed that way, immediately call `ask` with the same question/options before accepting or waiting for any answer. On "Adjust wording" / "Missing scope", collect the exact correction with one follow-up `ask`, route it back through Step 2c scoring and established-facts maintenance (a correction can change ambiguity), then re-run closure and ask the Restate gate again. Cap at two loops; if alignment is not reached, return to Phase 2 with a targeted question instead of forcing a goal line. Persist the confirmed line as `state.restated_goal`.
 
 1. **Generate the specification** using opus model with the prompt-safe transcript. If the full interview transcript or initial context is too large, include the summary plus all concrete decisions, acceptance criteria, unresolved gaps, and ontology snapshots; never overflow the prompt with raw oversized context.
    - Apply `language.instruction` when present so user-facing prose in the spec preserves the session language; keep code identifiers, file paths, commands, JSON/settings keys, and quoted source text unchanged.
-   - Apply the self-proofread once to newly generated spec prose before persistence, including generated natural-language table cells such as coverage notes, while preserving transcript answers, quoted/source text, code identifiers, file paths, commands, JSON/settings keys, table structure/fixed labels, and `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` unchanged.
+   - Apply the self-proofread once (DIPP-5) to newly generated spec prose before persistence, including generated natural-language table cells such as coverage notes, while preserving transcript answers, quoted/source text, code identifiers, file paths, commands, JSON/settings keys, table structure/fixed labels, and `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` unchanged.
 2. **Write the final spec through the workflow CLI**: persist the artifact at `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md`
    - Always use this exact final spec path. Prefer passing the spec markdown **inline** as the `--spec` value; only when it is too large to pass inline, stage it as a file in a system temp directory (`os.tmpdir()`/`$TMPDIR`, `/tmp`, `/var/tmp`) outside the project tree and pass that path — never write scratch specs to the repo root, the project tree, or `.gjc/`.
    - Use the native deep-interview write command with `--write --stage final --slug {slug} --spec <markdown-or-path> [--json]` for artifact and state persistence; direct `.gjc/` file edits are forbidden unless an explicit force override is active.
@@ -551,7 +572,7 @@ Spec structure:
 {List stable confirmed decisions promoted into `state.established_facts`, including source round, evidence, and disputed status when any fact was contradicted.}
 
 ## Trigger Metadata
-{Summarize per-round trigger metadata: trigger label/status, affected component/dimension, prior -> new ambiguity direction, evidence, contradicted established fact when relevant, and disputed/unresolved rationale when applicable.}
+{Summarize per-round trigger metadata: trigger label/status, affected component/dimension, native-returned effective ambiguity transition, evidence, contradicted established fact when relevant, and disputed/unresolved rationale when applicable.}
 
 ## Lateral Review Panel
 {Summarize convened panels: round, milestone transition or pre-answer trigger, personas dispatched, and the concrete findings folded into questions. Note any lateral_panel_failures.}
@@ -583,8 +604,8 @@ Spec structure:
 | {assumption} | {how it was questioned} | {what was decided} |
 
 ## Technical Context
-{brownfield: relevant codebase findings from focused repo inspection or canonical role-agent fact-finding}
-{greenfield: technology choices and constraints}
+{brownfield: relevant codebase findings from focused repo inspection, canonical role-agent fact-finding, and bounded trace summary when --trace was active}
+{greenfield: technology choices and constraints, plus bounded trace findings when --trace was active and relevant}
 
 ## Ontology (Key Entities)
 {Fill from the FINAL round's ontology extraction, not just crystallization-time generation}
@@ -618,7 +639,6 @@ Spec structure:
 
 ## Phase 5: Execution Bridge
 
-**Research workflow override:** if `--research-setup` is active, skip the standard execution options below and write a pending-approval spec that names research setup as an unresolved follow-up. Do not invoke deprecated research workflow shims.
 
 After the spec is written, mark it `pending approval` and present execution options via the `ask` tool. Until the user selects an execution option, the deep-interview module MUST NOT run mutation-oriented shell commands, edit source files, commit, push, open PRs, invoke execution skills, or delegate implementation tasks:
 
@@ -695,7 +715,7 @@ Skipping any stage is possible but reduces quality assurance:
 - Use `read/search/find exploration or a bounded read-only planner/architect subagent` for brownfield codebase exploration (run BEFORE asking user about codebase)
 - Use opus model (temperature 0.1) for ambiguity scoring — consistency is critical
 - Round 0 topology confirmation happens before ambiguity scoring; Phase 2 scoring must honor locked topology and rotate targeting across active components when more than one is present
-- Use `gjc state write` / `gjc state read` for interview state persistence; the initial and subsequent deep-interview state payloads must include `threshold_source` alongside `threshold`; do not edit `.gjc/_session-{sessionid}/state` directly without force override.
+- Normal interview persistence uses CLI-owned drafts: `gjc deep-interview draft create|edit|show|check|rebase|discard`, followed by the matching typed command with `--draft-id --expected-draft-revision <latest_draft_revision> --json`. All public draft commands require standalone `--json`; value-taking flags use exactly `--name value`, while `--json` and `--null` take no value, and there is no public `draft consume` command. Use `--value`, standalone `--null`, and append scaffolds for bounded payload fields: valueless append on a missing object-item array appends `{}`, valueless append on a missing scalar-item array initializes `[]`, and appending to an existing scalar-item array requires `--value` or `--value-file`. Retain each returned `draft_revision`. `check` reports a stale state base but does not mutate; explicitly `rebase` only with the caller-observed `--to-state-revision` and then check again. Inline JSON request flags are compatibility-only. Never construct a full payload or generic `gjc state write --input` envelope. Generic `gjc state` remains compatibility/recovery-only for the explicit clear and final handoff paths; never edit `.gjc/_session-{sessionid}/state` directly without force override.
 - Use the GJC workflow CLI to save the final spec at `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` exactly; do not use `write`, `edit`, or `ast_edit` directly on `.gjc/` paths without force override.
 - Use public GJC workflow entrypoints to bridge to ralplan, ultragoal, or team only after explicit execution approval — never implement directly. Implementation handoff defaults to ultragoal; reserve team for when tmux-based interactive worker parallelization is genuinely required.
 - The lateral-review panel spawns read-only persona subagents (Task tool) in parallel with independent context; it is an assist layer, never an executor and never the completion authority
@@ -789,7 +809,7 @@ Why bad: 45% ambiguity means nearly half the requirements are unclear. The mathe
 
 <Escalation_And_Stop_Conditions>
 - **Hard cap at 100 rounds**: Proceed with whatever clarity exists, noting the risk
-- **Soft warning at 10 rounds**: Offer to continue or proceed
+- **Tiered confirmation cadence**: rounds 1-3 auto-continue, rounds 4-15 ask to continue, rounds 16+ ask with a diminishing-returns warning
 - **Early exit (round 3+)**: Allow with warning if ambiguity > threshold
 - **User says "stop", "cancel", "abort"**: Stop immediately, save state for resume
 - **Ambiguity stalls** (same score +-0.05 for 3 rounds): Activate Ontologist mode to reframe
@@ -824,7 +844,7 @@ Optional settings in `.gjc/settings.json`:
     "deepInterview": {
       "ambiguityThreshold": <resolvedThreshold>,
       "maxRounds": 100,
-      "softWarningRounds": 10,
+      "softWarningRounds": 16,
       "minRoundsBeforeExit": 3,
       "enableChallengeAgents": true,
       "autoExecuteOnComplete": false,
@@ -837,7 +857,7 @@ Optional settings in `.gjc/settings.json`:
 
 ## Resume
 
-If interrupted, run `/skill:deep-interview` again. The skill resumes from GJC workflow state via `gjc state read`; do not read or edit `.gjc/_session-{sessionid}/state` files directly unless an explicit force override is active.
+If interrupted, run `/skill:deep-interview` again. Resume through `gjc deep-interview inspect --session-id <id> --selector summary --json`, then selectively inspect topology, pending shells, recent scored rounds, facts, triggers, or floor as needed; do not read or edit `.gjc/_session-{sessionid}/state` files directly unless an explicit force override is active.
 
 ## Integration with staged team routing
 
@@ -863,14 +883,6 @@ The ralplan pre-approval gate already redirects vague prompts to planning. Deep 
 Vague prompt → ralplan gate → deep-interview (if extremely vague) → ralplan (with clear spec) → pending approval → explicitly approved execution
 ```
 
-## Brownfield vs Greenfield Weights
-
-See "Calculate ambiguity" in Step 2c for the weighted formulas. Brownfield adds a 15% Context Clarity dimension (Goal/Constraint/Criteria become 35/25/25) because safely modifying existing code requires understanding the system being changed.
-
-## Lateral Review Panel
-
-See Phase 3 for the full persona set (researcher/contrarian/simplifier, plus architect on scope change), the milestone bands, and the parallel independent-context dispatch.
-
 ## Ambiguity Score Interpretation
 
 | Score Range | Meaning | Action |
@@ -883,4 +895,4 @@ See Phase 3 for the full persona set (researcher/contrarian/simplifier, plus arc
 | Extreme ambiguity | Almost nothing known | Early stages, keep going |
 </Advanced>
 
-Task: {{ARGUMENTS}}
+Task: Use the user request appended after this skill as the final `User:` line.

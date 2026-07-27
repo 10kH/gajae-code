@@ -1,10 +1,11 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import {
 	type Keybinding,
 	type KeybindingDefinitions,
 	type KeybindingsConfig,
 	type KeyId,
+	parseKeyId,
 	setKeybindings,
 	TUI_KEYBINDINGS,
 	KeybindingsManager as TuiKeybindingsManager,
@@ -22,6 +23,7 @@ interface AppKeybindings {
 	"app.suspend": true;
 	"app.thinking.cycle": true;
 	"app.thinking.toggle": true;
+	"app.commandPalette.open": true;
 	"app.model.cycleForward": true;
 	"app.model.cycleBackward": true;
 	"app.model.select": true;
@@ -40,6 +42,7 @@ interface AppKeybindings {
 	"app.session.fork": true;
 	"app.session.resume": true;
 	"app.session.observe": true;
+	"app.session.dashboard": true;
 	"app.jobs.open": true;
 	"app.session.togglePath": true;
 	"app.session.toggleSort": true;
@@ -51,12 +54,28 @@ interface AppKeybindings {
 	"app.plan.toggle": true;
 	"app.history.search": true;
 	"app.stt.toggle": true;
+	"app.irc.sidebar.toggle": true;
+	"app.transcript.browse": true;
+	"app.transcript.prevTurn": true;
+	"app.transcript.nextTurn": true;
+	"app.mode.cycle": true;
+	"app.tasks.toggle": true;
+	"app.queue.togglePane": true;
+	"app.message.sendNow": true;
 }
 
 export type AppKeybinding = keyof AppKeybindings;
 
 declare module "@gajae-code/tui" {
 	interface Keybindings extends AppKeybindings {}
+}
+
+export function defaultMessageQueueKeysForPlatform(platform: NodeJS.Platform = process.platform): KeyId {
+	return platform === "win32" || platform === "darwin" ? "alt+q" : "alt+enter";
+}
+
+export function defaultClipboardPasteImageKeysForPlatform(platform: NodeJS.Platform = process.platform): KeyId {
+	return platform === "win32" ? "alt+v" : "ctrl+v";
 }
 
 /**
@@ -88,12 +107,16 @@ export const KEYBINDINGS = {
 		defaultKeys: "ctrl+t",
 		description: "Toggle thinking mode",
 	},
-	"app.model.cycleForward": {
+	"app.commandPalette.open": {
 		defaultKeys: "ctrl+p",
+		description: "Open command palette",
+	},
+	"app.model.cycleForward": {
+		defaultKeys: "alt+n",
 		description: "Cycle to next model",
 	},
 	"app.model.cycleBackward": {
-		defaultKeys: "shift+ctrl+p",
+		defaultKeys: "alt+shift+n",
 		description: "Cycle to previous model",
 	},
 	"app.model.select": {
@@ -118,18 +141,18 @@ export const KEYBINDINGS = {
 	},
 	"app.message.followUp": {
 		defaultKeys: [],
-		description: "Send follow-up message (no default; Ctrl+Enter inserts a newline)",
+		description: "Send follow-up message (no default; Ctrl+Enter submits)",
 	},
 	"app.message.queue": {
-		defaultKeys: "alt+enter",
+		defaultKeys: defaultMessageQueueKeysForPlatform(),
 		description: "Queue message for next turn",
 	},
 	"app.message.dequeue": {
-		defaultKeys: "alt+up",
-		description: "Dequeue message",
+		defaultKeys: ["alt+up", "alt+down"],
+		description: "Select queued message to edit",
 	},
 	"app.clipboard.pasteImage": {
-		defaultKeys: process.platform === "win32" ? "alt+v" : "ctrl+v",
+		defaultKeys: defaultClipboardPasteImageKeysForPlatform(),
 		description: "Paste image from clipboard",
 	},
 	"app.clipboard.copyLine": {
@@ -141,8 +164,8 @@ export const KEYBINDINGS = {
 		description: "Copy prompt",
 	},
 	"app.session.new": {
-		defaultKeys: [],
-		description: "Create new session",
+		defaultKeys: "ctrl+n",
+		description: "Start a new session",
 	},
 	"app.session.tree": {
 		defaultKeys: [],
@@ -150,7 +173,7 @@ export const KEYBINDINGS = {
 	},
 	"app.session.fork": {
 		defaultKeys: [],
-		description: "Fork session",
+		description: "Branch from message",
 	},
 	"app.session.resume": {
 		defaultKeys: [],
@@ -159,6 +182,10 @@ export const KEYBINDINGS = {
 	"app.session.observe": {
 		defaultKeys: "ctrl+s",
 		description: "Observe subagent sessions",
+	},
+	"app.session.dashboard": {
+		defaultKeys: [],
+		description: "Show all persisted sessions dashboard",
 	},
 
 	"app.jobs.open": {
@@ -179,11 +206,11 @@ export const KEYBINDINGS = {
 	},
 	"app.session.delete": {
 		defaultKeys: "ctrl+d",
-		description: "Delete session",
+		description: "Delete current session transcript/artifacts",
 	},
 	"app.session.deleteNoninvasive": {
 		defaultKeys: "ctrl+backspace",
-		description: "Delete session (non-invasive)",
+		description: "Delete selected session transcript/artifacts (non-invasive)",
 	},
 	"app.tree.foldOrUp": {
 		defaultKeys: ["ctrl+left", "alt+left"],
@@ -204,6 +231,38 @@ export const KEYBINDINGS = {
 	"app.stt.toggle": {
 		defaultKeys: "alt+h",
 		description: "Toggle speech-to-text",
+	},
+	"app.irc.sidebar.toggle": {
+		defaultKeys: "alt+i",
+		description: "Toggle IRC sidebar",
+	},
+	"app.transcript.browse": {
+		defaultKeys: [],
+		description: "Browse the transcript",
+	},
+	"app.transcript.prevTurn": {
+		defaultKeys: [],
+		description: "Jump to previous user turn",
+	},
+	"app.transcript.nextTurn": {
+		defaultKeys: [],
+		description: "Jump to next user turn",
+	},
+	"app.mode.cycle": {
+		defaultKeys: [],
+		description: "Cycle interaction mode",
+	},
+	"app.tasks.toggle": {
+		defaultKeys: "alt+t",
+		description: "Toggle tasks pane",
+	},
+	"app.queue.togglePane": {
+		defaultKeys: [],
+		description: "Toggle message queue pane",
+	},
+	"app.message.sendNow": {
+		defaultKeys: [],
+		description: "Send message immediately",
 	},
 } as const satisfies KeybindingDefinitions;
 
@@ -290,13 +349,33 @@ function toKeybindingsConfig(value: unknown): KeybindingsConfig {
 
 	const config: KeybindingsConfig = {};
 	for (const [key, val] of Object.entries(value)) {
+		if (!(key in KEYBINDINGS) && !isLegacyKeybindingName(key)) {
+			logger.info("Ignoring unknown keybinding entry", { key });
+			continue;
+		}
 		if (val === undefined) {
 			config[key] = undefined;
-		} else if (typeof val === "string") {
-			config[key] = val as KeyId;
-		} else if (Array.isArray(val) && val.every(v => typeof v === "string")) {
-			config[key] = val as KeyId[];
+			continue;
 		}
+
+		const keys = typeof val === "string" ? [val] : Array.isArray(val) ? val : undefined;
+		if (!keys?.every(keyValue => typeof keyValue === "string")) {
+			logger.info("Ignoring malformed keybinding entry", { key });
+			continue;
+		}
+
+		const normalizedKeys: KeyId[] = [];
+		for (const keyValue of keys) {
+			const parsedKey = parseKeyId(keyValue);
+			if (!parsedKey) {
+				logger.info("Ignoring invalid keybinding entry", { key, category: "invalid-keybinding" });
+				normalizedKeys.length = 0;
+				break;
+			}
+			normalizedKeys.push(parsedKey.keyId);
+		}
+		if (normalizedKeys.length !== keys.length) continue;
+		config[key] = typeof val === "string" ? normalizedKeys[0] : normalizedKeys;
 	}
 	return config;
 }
@@ -367,28 +446,27 @@ function loadRawConfig(filePath: string): unknown {
 	}
 }
 
-/**
- * Migrate keybindings config file from old format to new.
- * Reads from agentDir/keybindings.json, migrates old names, and writes back.
- */
+/** Migrate legacy keybindings once, preserving the original file as .bak. */
 function loadKeybindingsConfig(filePath: string, writeBack: boolean): KeybindingsConfig {
 	const rawConfig = loadRawConfig(filePath);
-
-	if (rawConfig === null) {
-		return {};
-	}
-
-	const { config: migratedConfig, migrated } = migrateKeybindingNames(rawConfig);
+	if (rawConfig === null) return {};
+	const markerPath = `${filePath}.migration-v1`;
+	const { config: migratedConfig, migrated } = existsSync(markerPath)
+		? { config: toKeybindingsConfig(rawConfig), migrated: false }
+		: migrateKeybindingNames(rawConfig);
 	if (writeBack && migrated) {
 		const ordered = orderKeybindingsConfig(migratedConfig);
+		const tempPath = `${filePath}.${process.pid}.tmp`;
 		try {
-			writeFileSync(filePath, `${JSON.stringify(ordered, null, 2)}\n`, "utf-8");
+			copyFileSync(filePath, `${filePath}.bak`);
+			writeFileSync(tempPath, `${JSON.stringify(ordered, null, 2)}\n`, "utf-8");
+			renameSync(tempPath, filePath);
+			writeFileSync(markerPath, "v1\n", "utf-8");
 			logger.debug("Migrated keybindings config", { path: filePath });
 		} catch (error) {
 			logger.warn("Failed to write migrated keybindings config", { path: filePath, error: String(error) });
 		}
 	}
-
 	return migratedConfig;
 }
 
@@ -403,10 +481,17 @@ function migrateKeybindingsConfigFile(agentDir: string): void {
  */
 export class KeybindingsManager extends TuiKeybindingsManager {
 	#configPath: string | undefined;
+	#displayContext: KeyDisplayContext = runtimeKeyDisplayContext;
 
 	constructor(userBindings: KeybindingsConfig = {}, configPath?: string) {
-		super(KEYBINDINGS, userBindings);
+		super(KEYBINDINGS, toKeybindingsConfig(userBindings));
 		this.#configPath = configPath;
+	}
+	/**
+	 * Replace user bindings only after canonical grammar validation.
+	 */
+	override setUserBindings(userBindings: KeybindingsConfig): void {
+		super.setUserBindings(toKeybindingsConfig(userBindings));
 	}
 
 	/**
@@ -427,6 +512,13 @@ export class KeybindingsManager extends TuiKeybindingsManager {
 	static inMemory(userBindings: KeybindingsConfig = {}): KeybindingsManager {
 		return new KeybindingsManager(userBindings);
 	}
+	/**
+	 * Set the default display context used by composed surfaces that do not
+	 * supply an explicit context.
+	 */
+	setDisplayContext(context: KeyDisplayContext): void {
+		this.#displayContext = context;
+	}
 
 	/**
 	 * Reload keybindings from the config file.
@@ -446,9 +538,29 @@ export class KeybindingsManager extends TuiKeybindingsManager {
 	/**
 	 * Get display string for a keybinding (e.g., "ctrl+c/escape").
 	 */
-	getDisplayString(keybinding: Keybinding): string {
+	getDisplayString(keybinding: Keybinding, context: KeyDisplayContext = this.#displayContext): string {
 		const keys = this.getKeys(keybinding);
-		return formatKeyHints(keys.length === 0 ? [] : keys);
+		return formatKeyHints(keys, context);
+	}
+	/**
+	 * Get an accessibility-oriented display string for help surfaces.
+	 * Darwin chords include both the concise glyphs and expanded key names.
+	 */
+	getAccessibleDisplayString(keybinding: Keybinding, context: KeyDisplayContext = this.#displayContext): string {
+		const keys = this.getKeys(keybinding);
+		return formatAccessibleKeyHints(keys, context);
+	}
+	/**
+	 * Format a fixed key chord using this manager's display context.
+	 */
+	formatKeyHint(key: string): string {
+		return formatKeyHint(key, this.#displayContext);
+	}
+	/**
+	 * Format a fixed key chord for accessibility-oriented help surfaces.
+	 */
+	formatAccessibleKeyHint(key: string): string {
+		return formatAccessibleKeyHint(key, this.#displayContext);
 	}
 
 	/**
@@ -462,13 +574,20 @@ export class KeybindingsManager extends TuiKeybindingsManager {
 /**
  * Key hint formatting utilities for UI labels.
  */
-const MODIFIER_LABELS: Record<string, string> = {
+export interface KeyDisplayContext {
+	platform: NodeJS.Platform;
+}
+
+const runtimeKeyDisplayContext: KeyDisplayContext = { platform: process.platform };
+
+const TEXTUAL_MODIFIER_LABELS: Record<string, string> = {
 	ctrl: "Ctrl",
-	shift: "Shift",
 	alt: "Alt",
+	shift: "Shift",
+	super: "Super",
 };
 
-const KEY_LABELS: Record<string, string> = {
+const TEXTUAL_KEY_LABELS: Record<string, string> = {
 	esc: "Esc",
 	escape: "Esc",
 	enter: "Enter",
@@ -477,33 +596,105 @@ const KEY_LABELS: Record<string, string> = {
 	tab: "Tab",
 	backspace: "Backspace",
 	delete: "Delete",
+	insert: "Insert",
+	clear: "Clear",
 	home: "Home",
 	end: "End",
-	pageup: "PgUp",
-	pagedown: "PgDn",
+	pageUp: "PgUp",
+	pageDown: "PgDn",
 	up: "Up",
 	down: "Down",
 	left: "Left",
 	right: "Right",
 };
 
-function formatKeyPart(part: string): string {
-	const lower = part.toLowerCase();
-	const modifier = MODIFIER_LABELS[lower];
-	if (modifier) return modifier;
-	const label = KEY_LABELS[lower];
+const DARWIN_MODIFIER_LABELS: Record<string, string> = {
+	ctrl: "⌃",
+	alt: "⌥",
+	shift: "⇧",
+	super: "⌘",
+};
+
+const DARWIN_KEY_LABELS: Record<string, string> = {
+	...TEXTUAL_KEY_LABELS,
+	esc: "⎋",
+	escape: "⎋",
+	enter: "↩",
+	return: "↩",
+	tab: "⇥",
+	backspace: "⌫",
+	delete: "⌦",
+	up: "↑",
+	down: "↓",
+	left: "←",
+	right: "→",
+};
+const DARWIN_ACCESSIBLE_MODIFIER_LABELS: Record<string, string> = {
+	ctrl: "Control",
+	alt: "Option",
+	shift: "Shift",
+	super: "Command",
+};
+
+const DARWIN_ACCESSIBLE_KEY_LABELS: Record<string, string> = {
+	...TEXTUAL_KEY_LABELS,
+	esc: "Escape",
+	escape: "Escape",
+	pageUp: "Page Up",
+	pageDown: "Page Down",
+};
+
+const DISPLAY_MODIFIER_ORDER = ["ctrl", "alt", "shift", "super"] as const;
+const INVALID_KEYBINDING_DISPLAY = "Invalid keybinding";
+
+function formatBaseKey(baseKey: string, labels: Record<string, string>): string {
+	const label = labels[baseKey];
 	if (label) return label;
-	if (part.length === 1) return part.toUpperCase();
-	return `${part.charAt(0).toUpperCase()}${part.slice(1)}`;
+	if (baseKey.length === 1) return baseKey.toUpperCase();
+	return `${baseKey.charAt(0).toUpperCase()}${baseKey.slice(1)}`;
 }
 
-export function formatKeyHint(key: KeyId): string {
-	return key.split("+").map(formatKeyPart).join("+");
+export function formatKeyHint(key: string, context: KeyDisplayContext = runtimeKeyDisplayContext): string {
+	const parsed = parseKeyId(key);
+	if (!parsed) return INVALID_KEYBINDING_DISPLAY;
+
+	const darwin = context.platform === "darwin";
+	const modifierLabels = darwin ? DARWIN_MODIFIER_LABELS : TEXTUAL_MODIFIER_LABELS;
+	const baseLabels = darwin ? DARWIN_KEY_LABELS : TEXTUAL_KEY_LABELS;
+	const modifiers = DISPLAY_MODIFIER_ORDER.filter(modifier => parsed.modifiers.includes(modifier)).map(
+		modifier => modifierLabels[modifier],
+	);
+	const parts = [...modifiers, formatBaseKey(parsed.baseKey, baseLabels)];
+	return parts.join(darwin ? "" : "+");
 }
 
-export function formatKeyHints(keys: KeyId | KeyId[]): string {
-	const list = Array.isArray(keys) ? keys : [keys];
-	return list.map(formatKeyHint).join("/");
+export function formatAccessibleKeyHint(key: string, context: KeyDisplayContext = runtimeKeyDisplayContext): string {
+	const concise = formatKeyHint(key, context);
+	if (context.platform !== "darwin" || concise === INVALID_KEYBINDING_DISPLAY) return concise;
+
+	const parsed = parseKeyId(key);
+	if (!parsed) return INVALID_KEYBINDING_DISPLAY;
+	const modifiers = DISPLAY_MODIFIER_ORDER.filter(modifier => parsed.modifiers.includes(modifier)).map(
+		modifier => DARWIN_ACCESSIBLE_MODIFIER_LABELS[modifier],
+	);
+	const expanded = [...modifiers, formatBaseKey(parsed.baseKey, DARWIN_ACCESSIBLE_KEY_LABELS)].join("+");
+	return concise === expanded ? concise : `${concise} (${expanded})`;
+}
+
+export function formatKeyHints(
+	keys: string | readonly string[],
+	context: KeyDisplayContext = runtimeKeyDisplayContext,
+): string {
+	const list: readonly string[] = typeof keys === "string" ? [keys] : keys;
+	return list.map(key => formatKeyHint(key, context)).join("/");
+}
+
+export function formatAccessibleKeyHints(
+	keys: string | readonly string[],
+	context: KeyDisplayContext = runtimeKeyDisplayContext,
+): string {
+	const list: readonly string[] = typeof keys === "string" ? [keys] : keys;
+	return list.map(key => formatAccessibleKeyHint(key, context)).join("/");
 }
 
 export type { Keybinding, KeybindingsConfig, KeyId };

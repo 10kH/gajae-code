@@ -241,12 +241,17 @@ function passingQualityGate(): Record<string, unknown> {
 			rerunCommands: ["bun test:e2e"],
 			blockers: [],
 		},
+		criticReview: {
+			verdict: "OKAY",
+			evidence: "critic approved final aggregate",
+			blockers: [],
+		},
 	};
 }
 
 async function completeSingleGoal(root: string): Promise<void> {
 	await writeStructuralArtifacts(root);
-	const created = await createUltragoalPlan({ cwd: root, brief: "Ship review reconcile" });
+	await createUltragoalPlan({ cwd: root, brief: "Ship review reconcile" });
 	await startNextUltragoalGoal({ cwd: root });
 	const checkpoint = await runNativeUltragoalCommand(
 		[
@@ -257,10 +262,6 @@ async function completeSingleGoal(root: string): Promise<void> {
 			"complete",
 			"--evidence",
 			"final story verified with targeted regression coverage",
-			"--gjc-goal-json",
-			JSON.stringify({
-				goal: { threadId: "test", objective: created.gjcObjective, status: "active", updatedAt: Date.now() },
-			}),
 			"--quality-gate-json",
 			JSON.stringify(passingQualityGate()),
 		],
@@ -270,7 +271,7 @@ async function completeSingleGoal(root: string): Promise<void> {
 }
 
 describe("ultragoal review command", () => {
-	it("parses branch and worktree sources and falls back when gh is unavailable for pr", async () => {
+	it("parses branch and worktree sources and falls back when gh cannot resolve a pr", async () => {
 		const root = await tempDir();
 		await writeStructuralArtifacts(root);
 		const qaPath = await writeQa(root, validExecutorQa());
@@ -278,11 +279,11 @@ describe("ultragoal review command", () => {
 		expect((await review(root, ["--branch", "HEAD", "--executor-qa-json", qaPath])).source).toMatchObject({
 			kind: "branch",
 		});
-		expect((await review(root, ["--pr", "123", "--executor-qa-json", qaPath])).source).toMatchObject({
+		expect((await review(root, ["--pr", "999999999", "--executor-qa-json", qaPath])).source).toMatchObject({
 			kind: "pr",
 			prSource: "gh-unavailable",
 		});
-	});
+	}, 15_000);
 
 	it("uses spec override as a strong contract and allows clean pass", async () => {
 		const root = await tempDir();
@@ -365,7 +366,7 @@ describe("ultragoal review command", () => {
 		const root = await tempDir();
 		const qa = invalidInlineOnlyExecutorQa();
 		const reviewOutput = await review(root, ["--executor-qa-json", await writeQa(root, qa)]);
-		const created = await createUltragoalPlan({ cwd: root, brief: "Ship review gate" });
+		await createUltragoalPlan({ cwd: root, brief: "Ship review gate" });
 		await startNextUltragoalGoal({ cwd: root });
 		const checkpoint = await runNativeUltragoalCommand(
 			[
@@ -376,10 +377,6 @@ describe("ultragoal review command", () => {
 				"complete",
 				"--evidence",
 				"review gate parity check",
-				"--gjc-goal-json",
-				JSON.stringify({
-					goal: { threadId: "test", objective: created.gjcObjective, status: "active", updatedAt: Date.now() },
-				}),
 				"--quality-gate-json",
 				JSON.stringify({
 					architectReview: {
@@ -397,6 +394,11 @@ describe("ultragoal review command", () => {
 						evidence: "no verification findings remain after steering iterations",
 						fullRerun: true,
 						rerunCommands: ["bun test:e2e"],
+						blockers: [],
+					},
+					criticReview: {
+						verdict: "OKAY",
+						evidence: "critic approved final aggregate",
 						blockers: [],
 					},
 				}),

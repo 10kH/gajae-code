@@ -1,7 +1,16 @@
 import { describe, expect, it } from "bun:test";
+import * as fsSync from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
+import {
+	injectManagedFileRename,
+	injectManagedTreeFsync,
+	injectManagedTreeRename,
+	injectManagedTreeSnapshot,
+	publishFailure,
+} from "./managed-failure-injection";
 
 const UUID_V7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
@@ -43,6 +52,29 @@ describe("SessionManager session ids", () => {
 		expect(branchedId).not.toBe(firstId);
 	});
 
+	it("persists managed hot-path appends before returning", async () => {
+		using tempDir = TempDir.createSync("@pi-session-managed-sync-append-");
+		const destination = SessionManager.managedDestination(tempDir.path(), tempDir.path());
+		const session = SessionManager.create(tempDir.path(), destination);
+		try {
+			session.appendMessage({ role: "user", content: "first", timestamp: 1 });
+			await session.ensureOnDisk();
+			const sessionFile = session.getSessionFile();
+			if (!sessionFile) throw new Error("Expected managed session file");
+			session.appendMessage({ role: "user", content: "durable immediately", timestamp: 2 });
+			for (let index = 0; index < 5; index++)
+				session.appendMessage({ role: "user", content: `additional ${index}`, timestamp: 3 + index });
+			const persisted = fsSync.readFileSync(sessionFile, "utf8");
+			expect(persisted).toContain("durable immediately");
+			const recoveryCopies = fsSync
+				.readdirSync(tempDir.path(), { recursive: true, encoding: "utf8" })
+				.filter(entry => path.basename(entry).startsWith(".gjc-managed-replace-"));
+			expect(recoveryCopies).toEqual([]);
+		} finally {
+			await session.close();
+		}
+	});
+
 	it("generates a UUIDv7 when forking a persisted session", async () => {
 		using tempDir = TempDir.createSync("@pi-session-id-fork-");
 		const session = SessionManager.create(tempDir.path(), tempDir.path());
@@ -58,6 +90,166 @@ describe("SessionManager session ids", () => {
 		expect(session.getHeader()?.parentSession).toBe(firstId);
 	});
 
+	it("rolls back fork identity before publishing a transcript when artifact import fails", async () => {
+		using tempDir = TempDir.createSync("@pi-session-fork-rollback-");
+		const destination = SessionManager.managedDestination(tempDir.path(), tempDir.path());
+		const session = SessionManager.create(tempDir.path(), destination);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		await session.ensureOnDisk();
+		await session.flush();
+		await session.saveArtifact("artifact", "test");
+		const oldSessionFile = session.getSessionFile();
+		const oldSessionId = session.getSessionId();
+		if (!oldSessionFile) throw new Error("Expected session file");
+		const injection = injectManagedTreeRename((source, _destination) =>
+			source.includes(".fork-staging") ? publishFailure("io_error", "io_failure") : "passthrough",
+		);
+		try {
+			await expect(session.fork()).rejects.toThrow("io_error");
+			injection.assertHit();
+			expect(session.getSessionFile()).toBe(oldSessionFile);
+			expect(session.getSessionId()).toBe(oldSessionId);
+			const entries = await fs.readdir(path.dirname(oldSessionFile));
+			expect(entries.filter(entry => entry.endsWith(".jsonl"))).toEqual([path.basename(oldSessionFile)]);
+			expect(entries.some(entry => entry.includes("fork-staging"))).toBe(false);
+		} finally {
+			injection.restore();
+			await session.close();
+		}
+	});
+
+	it("forks managed artifacts above the recovery-state size cap", async () => {
+		using tempDir = TempDir.createSync("@pi-session-fork-large-artifact-");
+		const destination = SessionManager.managedDestination(tempDir.path(), tempDir.path());
+		const session = SessionManager.create(tempDir.path(), destination);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		await session.ensureOnDisk();
+		const payload = "x".repeat(2 * 1024 * 1024);
+		await session.saveArtifact(payload, "test");
+		const forked = await session.fork();
+		if (!forked) throw new Error("Expected fork result");
+		expect((await fs.stat(path.join(forked.newSessionFile.slice(0, -6), "0.test.log"))).size).toBe(
+			Buffer.byteLength(payload),
+		);
+		await session.close();
+	});
+
+	it("rejects a fork when the published artifact tree changes at the rename boundary", async () => {
+		using tempDir = TempDir.createSync("@pi-session-fork-terminal-manifest-");
+		const destination = SessionManager.managedDestination(tempDir.path(), tempDir.path());
+		const session = SessionManager.create(tempDir.path(), destination);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		await session.ensureOnDisk();
+		await session.saveArtifact("artifact", "test");
+		const oldSessionFile = session.getSessionFile();
+		const oldSessionId = session.getSessionId();
+		if (!oldSessionFile) throw new Error("Expected session file");
+		const injection = injectManagedTreeRename(() => publishFailure("identity_mismatch", "identity_violation"));
+		try {
+			await expect(session.fork()).rejects.toThrow("identity_mismatch");
+			injection.assertHit();
+			expect(session.getSessionFile()).toBe(oldSessionFile);
+			expect(session.getSessionId()).toBe(oldSessionId);
+		} finally {
+			injection.restore();
+			await session.close();
+		}
+	});
+
+	it("rejects a byte-identical whole-root fork artifact replacement", async () => {
+		using tempDir = TempDir.createSync("@pi-session-fork-root-replacement-");
+		const destination = SessionManager.managedDestination(tempDir.path(), tempDir.path());
+		const session = SessionManager.create(tempDir.path(), destination);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		await session.ensureOnDisk();
+		await session.saveArtifact("artifact", "test");
+		const oldSessionFile = session.getSessionFile();
+		if (!oldSessionFile) throw new Error("Expected session file");
+		const injection = injectManagedTreeRename(() => publishFailure("identity_mismatch", "identity_violation"));
+		try {
+			await expect(session.fork()).rejects.toThrow("identity_mismatch");
+			injection.assertHit();
+			expect(session.getSessionFile()).toBe(oldSessionFile);
+		} finally {
+			injection.restore();
+			await session.close();
+		}
+	});
+
+	it("fails closed when retained artifact capture rejects a substituted tree", async () => {
+		using tempDir = TempDir.createSync("@pi-session-fork-post-snapshot-");
+		const destination = SessionManager.managedDestination(tempDir.path(), tempDir.path());
+		const session = SessionManager.create(tempDir.path(), destination);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		await session.ensureOnDisk();
+		await session.saveArtifact("artifact", "test");
+		const oldSessionFile = session.getSessionFile();
+		if (!oldSessionFile) throw new Error("Expected session file");
+		const injection = injectManagedTreeSnapshot({ ok: false, code: "identity_mismatch" });
+		try {
+			await expect(session.fork()).rejects.toThrow("identity_mismatch");
+			injection.assertHit();
+			expect(session.getSessionFile()).toBe(oldSessionFile);
+		} finally {
+			injection.restore();
+			await session.close();
+		}
+	});
+
+	it("rejects an artifact identity mismatch during retained tree fsync", async () => {
+		using tempDir = TempDir.createSync("@pi-session-fork-fsync-replacement-");
+		const destination = SessionManager.managedDestination(tempDir.path(), tempDir.path());
+		const session = SessionManager.create(tempDir.path(), destination);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		await session.ensureOnDisk();
+		await session.saveArtifact("artifact", "test");
+		const oldSessionFile = session.getSessionFile();
+		if (!oldSessionFile) throw new Error("Expected session file");
+		const injection = injectManagedTreeFsync({
+			shouldFail: relativePath => relativePath.endsWith(".log"),
+			code: "identity_mismatch",
+		});
+		try {
+			await expect(session.fork()).rejects.toThrow("identity_mismatch");
+			injection.assertHit();
+			expect(session.getSessionFile()).toBe(oldSessionFile);
+		} finally {
+			injection.restore();
+			await session.close();
+		}
+	});
+
+	it("removes published fork artifacts when transcript publication fails", async () => {
+		using tempDir = TempDir.createSync("@pi-session-fork-transcript-failure-");
+		const destination = SessionManager.managedDestination(tempDir.path(), tempDir.path());
+		const session = SessionManager.create(tempDir.path(), destination);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		await session.ensureOnDisk();
+		await session.saveArtifact("artifact", "test");
+		const oldSessionFile = session.getSessionFile();
+		const oldSessionId = session.getSessionId();
+		if (!oldSessionFile) throw new Error("Expected session file");
+		const injection = injectManagedFileRename((_source, destination) =>
+			destination.endsWith(".jsonl") ? publishFailure("io_error", "io_failure") : "passthrough",
+		);
+		try {
+			await expect(session.fork()).rejects.toThrow("io_error");
+			injection.assertHit();
+			expect(session.getSessionFile()).toBe(oldSessionFile);
+			expect(session.getSessionId()).toBe(oldSessionId);
+			const entries = await fs.readdir(path.dirname(oldSessionFile));
+			expect(entries.filter(entry => entry.endsWith(".jsonl"))).toEqual([path.basename(oldSessionFile)]);
+			const artifactDirectories = entries.filter(
+				entry => !entry.startsWith(".") && entry !== path.basename(oldSessionFile),
+			);
+			expect(artifactDirectories).toContain(path.basename(oldSessionFile, ".jsonl"));
+			expect(artifactDirectories).toHaveLength(1);
+		} finally {
+			injection.restore();
+			await session.close();
+		}
+	});
+
 	it("preserves existing session ids when reopening a saved session", async () => {
 		using tempDir = TempDir.createSync("@pi-session-id-open-");
 		const sessionFile = path.join(tempDir.path(), "existing.jsonl");
@@ -71,5 +263,21 @@ describe("SessionManager session ids", () => {
 
 		expect(session.getSessionId()).toBe(existingId);
 		expect(session.getHeader()?.id).toBe(existingId);
+	});
+});
+
+describe("context clear", () => {
+	it("preserves session id while clearing the active branch context", () => {
+		const session = SessionManager.inMemory();
+		const sessionId = expectUuidV7SessionId(session);
+		session.appendMessage({ role: "user", content: "before clear", timestamp: 1 });
+
+		session.appendContextClearEntry({ sessionId });
+		session.appendMessage({ role: "user", content: "after clear", timestamp: 2 });
+
+		expect(session.getSessionId()).toBe(sessionId);
+		expect(session.getHeader()?.id).toBe(sessionId);
+		expect(session.getEntries().filter(entry => entry.type === "message")).toHaveLength(2);
+		expect(session.buildSessionContext().messages).toEqual([{ role: "user", content: "after clear", timestamp: 2 }]);
 	});
 });

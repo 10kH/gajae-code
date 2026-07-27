@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "bun:test";
-import { ProcessTerminal, type Terminal, type TerminalAppearance } from "@gajae-code/tui/terminal";
+import {
+	__stdoutErrorDispatcherInstalledForTests,
+	__stdoutErrorSubscriberCountForTests,
+	ProcessTerminal,
+	type Terminal,
+	type TerminalAppearance,
+} from "@gajae-code/tui/terminal";
 import { type Component, CURSOR_MARKER, TUI } from "@gajae-code/tui/tui";
 
 class StaticComponent implements Component {
@@ -36,6 +42,11 @@ class DetachingTerminal implements Terminal {
 
 	setHideCursorFails(fails: boolean): void {
 		this.#hideCursorFails = fails;
+	}
+
+	setWriteFailureAt(writeFailureAt: number | undefined): void {
+		this.#writeFailureAt = writeFailureAt;
+		if (writeFailureAt === undefined) this.#available = true;
 	}
 
 	start(_onInput: (data: string) => void, _onResize: () => void): void {}
@@ -155,6 +166,66 @@ describe("terminal detach handling", () => {
 		}
 	});
 
+	it("enables SGR mouse reporting inside tmux", () => {
+		const terminal = new ProcessTerminal();
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		const resumeSpy = vi.spyOn(process.stdin, "resume").mockImplementation(() => process.stdin);
+		const pauseSpy = vi.spyOn(process.stdin, "pause").mockImplementation(() => process.stdin);
+		const previousTmux = process.env.TMUX;
+		process.env.TMUX = "/tmp/tmux/default,1,0";
+
+		try {
+			withStdoutProperty("isTTY", true, () => {
+				terminal.setMouseEnabled(true);
+				terminal.start(
+					() => {},
+					() => {},
+				);
+				const output = writeSpy.mock.calls.map(call => String(call[0])).join("");
+				expect(output).toContain("\x1b[?1002h");
+				expect(output).toContain("\x1b[?1006h");
+			});
+		} finally {
+			terminal.stop();
+			writeSpy.mockRestore();
+			resumeSpy.mockRestore();
+			pauseSpy.mockRestore();
+			if (previousTmux === undefined) delete process.env.TMUX;
+			else process.env.TMUX = previousTmux;
+		}
+	});
+	it("disables stale SGR mouse reporting inside tmux when mouse support is off", () => {
+		const terminal = new ProcessTerminal();
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		const resumeSpy = vi.spyOn(process.stdin, "resume").mockImplementation(() => process.stdin);
+		const pauseSpy = vi.spyOn(process.stdin, "pause").mockImplementation(() => process.stdin);
+		const previousTmux = process.env.TMUX;
+		process.env.TMUX = "/tmp/tmux/default,1,0";
+
+		try {
+			withStdoutProperty("isTTY", true, () => {
+				terminal.setMouseEnabled(false);
+				terminal.start(
+					() => {},
+					() => {},
+				);
+				const output = writeSpy.mock.calls.map(call => String(call[0])).join("");
+				expect(output).toContain("\x1b[?1000l");
+				expect(output).toContain("\x1b[?1002l");
+				expect(output).toContain("\x1b[?1006l");
+				expect(output).not.toContain("\x1b[?1000h");
+				expect(output).not.toContain("\x1b[?1002h");
+				expect(output).not.toContain("\x1b[?1006h");
+			});
+		} finally {
+			terminal.stop();
+			writeSpy.mockRestore();
+			resumeSpy.mockRestore();
+			pauseSpy.mockRestore();
+			if (previousTmux === undefined) delete process.env.TMUX;
+			else process.env.TMUX = previousTmux;
+		}
+	});
 	it("marks ProcessTerminal unavailable when stdout emits an async EIO", () => {
 		const terminal = new ProcessTerminal();
 		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
@@ -181,6 +252,91 @@ describe("terminal detach handling", () => {
 			writeSpy.mockRestore();
 			resumeSpy.mockRestore();
 			pauseSpy.mockRestore();
+		}
+	});
+	it("keeps stdout error listener armed briefly after stop restore writes", async () => {
+		const terminal = new ProcessTerminal();
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		const resumeSpy = vi.spyOn(process.stdin, "resume").mockImplementation(() => process.stdin);
+		const pauseSpy = vi.spyOn(process.stdin, "pause").mockImplementation(() => process.stdin);
+		const ambientListener = (): void => {};
+		process.stdout.on("error", ambientListener);
+		await Bun.sleep(300);
+		const listenersBeforeStart = new Set(process.stdout.listeners("error"));
+		const subscribersBeforeStart = __stdoutErrorSubscriberCountForTests();
+		const dispatcherWasInstalled = __stdoutErrorDispatcherInstalledForTests();
+
+		try {
+			withStdoutProperty("isTTY", true, () => {
+				terminal.start(
+					() => {},
+					() => {},
+				);
+				const listenersAfterStart = process.stdout.listeners("error");
+				const listenersAddedByStart = listenersAfterStart.filter(listener => !listenersBeforeStart.has(listener));
+				expect(listenersAddedByStart).toHaveLength(dispatcherWasInstalled ? 0 : 1);
+				expect(__stdoutErrorDispatcherInstalledForTests()).toBe(true);
+				expect(__stdoutErrorSubscriberCountForTests()).toBe(subscribersBeforeStart + 1);
+				terminal.stop();
+				expect(process.stdout.listeners("error")).toEqual(listenersAfterStart);
+				expect(() => {
+					process.stdout.emit("error", Object.assign(new Error("pty vanished after stop"), { code: "EIO" }));
+				}).not.toThrow();
+				expect(terminal.available).toBe(false);
+			});
+			await Bun.sleep(300);
+			expect(__stdoutErrorSubscriberCountForTests()).toBe(subscribersBeforeStart);
+			expect(process.stdout.listeners("error")).toContain(ambientListener);
+			expect(__stdoutErrorDispatcherInstalledForTests()).toBe(dispatcherWasInstalled);
+		} finally {
+			terminal.stop();
+			writeSpy.mockRestore();
+			resumeSpy.mockRestore();
+			pauseSpy.mockRestore();
+			process.stdout.removeListener("error", ambientListener);
+		}
+	});
+	it("shares one stdout error listener across terminals during cleanup grace periods", async () => {
+		const terminals = Array.from({ length: 12 }, () => new ProcessTerminal());
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		const resumeSpy = vi.spyOn(process.stdin, "resume").mockImplementation(() => process.stdin);
+		const pauseSpy = vi.spyOn(process.stdin, "pause").mockImplementation(() => process.stdin);
+		const ambientListener = (): void => {};
+		process.stdout.on("error", ambientListener);
+		await Bun.sleep(300);
+		const listenersBeforeStart = new Set(process.stdout.listeners("error"));
+		const subscribersBeforeStart = __stdoutErrorSubscriberCountForTests();
+		const dispatcherWasInstalled = __stdoutErrorDispatcherInstalledForTests();
+
+		try {
+			withStdoutProperty("isTTY", true, () => {
+				for (const terminal of terminals) {
+					terminal.start(
+						() => {},
+						() => {},
+					);
+					terminal.stop();
+				}
+				const listenersAfterStart = process.stdout.listeners("error");
+				const listenersAddedByStarts = listenersAfterStart.filter(listener => !listenersBeforeStart.has(listener));
+				expect(listenersAddedByStarts).toHaveLength(dispatcherWasInstalled ? 0 : 1);
+				expect(__stdoutErrorDispatcherInstalledForTests()).toBe(true);
+				expect(__stdoutErrorSubscriberCountForTests()).toBe(subscribersBeforeStart + terminals.length);
+				expect(() => {
+					process.stdout.emit("error", Object.assign(new Error("shared detached stdout"), { code: "EIO" }));
+				}).not.toThrow();
+				expect(terminals.every(terminal => !terminal.available)).toBe(true);
+			});
+			await Bun.sleep(300);
+			expect(__stdoutErrorSubscriberCountForTests()).toBe(subscribersBeforeStart);
+			expect(process.stdout.listeners("error")).toContain(ambientListener);
+			expect(__stdoutErrorDispatcherInstalledForTests()).toBe(dispatcherWasInstalled);
+		} finally {
+			for (const terminal of terminals) terminal.stop();
+			writeSpy.mockRestore();
+			resumeSpy.mockRestore();
+			pauseSpy.mockRestore();
+			process.stdout.removeListener("error", ambientListener);
 		}
 	});
 
@@ -237,5 +393,21 @@ describe("terminal detach handling", () => {
 		expect(() => tui.requestRender(true)).not.toThrow();
 		await settle();
 		expect(terminal.writes.length).toBe(writesBeforeCursorFailure);
+	});
+	it("retries component cleanup after terminal recovery", async () => {
+		const terminal = new DetachingTerminal(1);
+		const tui = new TUI(terminal);
+		const delivered = vi.fn();
+
+		tui.queueTerminalCleanup("pet-cleanup", delivered);
+		expect(delivered).not.toHaveBeenCalled();
+		expect(terminal.writes).toEqual([]);
+
+		terminal.setWriteFailureAt(undefined);
+		tui.start();
+		await settle();
+		expect(delivered).toHaveBeenCalledTimes(1);
+		expect(terminal.writes).toContain("pet-cleanup");
+		tui.stop();
 	});
 });

@@ -1,13 +1,22 @@
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import * as logger from "@gajae-code/utils/logger";
-import { activeSnapshotPath, assertNonEmptyGjcSessionId, modeStatePath } from "../gjc-runtime/session-layout";
+import {
+	activeSnapshotPath,
+	activeStateDir,
+	assertNonEmptyGjcSessionId,
+	modeStatePath,
+} from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead, SessionResolutionError } from "../gjc-runtime/session-resolution";
 import {
 	type ActiveSessionScope,
 	readActiveEntries,
 	rebuildActiveSnapshot,
 	removeActiveEntry,
+	setActiveStateCacheInvalidator,
 	writeActiveEntry,
 } from "../gjc-runtime/state-writer";
+import { getSkillManifest } from "../gjc-runtime/workflow-manifest";
 import { CANONICAL_GJC_WORKFLOW_SKILLS, type CanonicalGjcWorkflowSkill } from "./canonical-skills";
 import type { WorkflowStateReceipt } from "./workflow-state-contract";
 
@@ -62,6 +71,8 @@ export interface SkillActiveEntry {
 	handoff_at?: string;
 	active_subskills?: ActiveSubskillEntry[];
 	source_state_revision?: number;
+	/** Durable ordering token from the source workflow mode-state, not this cache file's revision. */
+	committed_mode_state_revision?: number;
 }
 
 export interface SkillActiveState {
@@ -105,6 +116,8 @@ export interface SyncSkillActiveStateOptions {
 	handoff_at?: string;
 	active_subskills?: ActiveSubskillEntry[];
 	sourceRevision?: number;
+	/** Durable ordering token from the source workflow mode-state, not this cache file's revision. */
+	committedModeRevision?: number;
 }
 
 const HUD_TEXT_LIMIT = 80;
@@ -437,29 +450,18 @@ async function readModeStatePhase(
 		const record = parsed as Record<string, unknown>;
 		const phase = safeString(record.current_phase).trim();
 		if (!phase) return undefined;
-		if (record.active === false && !RALPLAN_CANONICAL_PHASE_OVERRIDES.has(phase)) return undefined;
+		if (record.active === false && !getSkillManifest("ralplan").canonicalOverrides.includes(phase)) return undefined;
 		return phase;
 	} catch {
 		return undefined;
 	}
 }
 
-const RALPLAN_CANONICAL_PHASE_OVERRIDES = new Set([
-	"final",
-	"handoff",
-	"complete",
-	"completed",
-	"failed",
-	"cancelled",
-	"canceled",
-	"inactive",
-]);
-
 function withCanonicalRalplanPhase(entry: SkillActiveEntry, canonicalPhase: string | undefined): SkillActiveEntry {
 	if (
 		entry.skill !== "ralplan" ||
 		!canonicalPhase ||
-		!RALPLAN_CANONICAL_PHASE_OVERRIDES.has(canonicalPhase) ||
+		!getSkillManifest("ralplan").canonicalOverrides.includes(canonicalPhase) ||
 		entry.phase === canonicalPhase
 	) {
 		return entry;
@@ -614,14 +616,108 @@ async function mergeVisibleEntries(
 	return collapsePlanningPipeline(visibleEntries).toSorted(comparePipelineEntry);
 }
 
-export async function readVisibleSkillActiveState(cwd: string, sessionId?: string): Promise<SkillActiveState | null> {
-	let resolvedSessionId: string;
+export type VisibleSkillActiveStateCacheTier = "security" | "hud";
+export interface ReadVisibleSkillActiveStateOptions {
+	tier?: VisibleSkillActiveStateCacheTier;
+}
+
+interface ActiveStateStatSignature {
+	path: string;
+	mtimeMs: number;
+	size: number;
+}
+
+interface ActiveStateSignature {
+	sessionPath: ActiveStateStatSignature | null;
+	activeDir: ActiveStateStatSignature | null;
+	activeEntries: ActiveStateStatSignature[];
+	ralplanModeState: ActiveStateStatSignature | null;
+}
+
+interface VisibleSkillActiveStateCacheEntry {
+	signature: ActiveStateSignature;
+	value: SkillActiveState | null;
+	cachedAtMs: number;
+}
+
+const HUD_VISIBLE_STATE_TTL_MS = 500;
+const SECURITY_VISIBLE_STATE_TTL_MS = 30_000;
+const visibleSkillActiveStateCache = new Map<string, VisibleSkillActiveStateCacheEntry>();
+
+async function statSignature(filePath: string): Promise<ActiveStateStatSignature | null> {
 	try {
-		resolvedSessionId = await resolveBoundarySessionId(cwd, sessionId);
+		const stat = await fs.stat(filePath);
+		return { path: filePath, mtimeMs: stat.mtimeMs, size: stat.size };
 	} catch (error) {
-		if (error instanceof SessionResolutionError && error.code === "no_session") return null;
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
 		throw error;
 	}
+}
+
+function signaturesEqual(a: ActiveStateSignature, b: ActiveStateSignature): boolean {
+	const statEqual = (left: ActiveStateStatSignature | null, right: ActiveStateStatSignature | null): boolean =>
+		left === right ||
+		(Boolean(left) &&
+			Boolean(right) &&
+			left?.path === right?.path &&
+			left?.mtimeMs === right?.mtimeMs &&
+			left?.size === right?.size);
+	if (!statEqual(a.sessionPath, b.sessionPath)) return false;
+	if (!statEqual(a.activeDir, b.activeDir)) return false;
+	if (!statEqual(a.ralplanModeState, b.ralplanModeState)) return false;
+	if (a.activeEntries.length !== b.activeEntries.length) return false;
+	return a.activeEntries.every((entry, index) => statEqual(entry, b.activeEntries[index] ?? null));
+}
+
+export async function computeActiveStateSignature(cwd: string, sessionId: string): Promise<ActiveStateSignature> {
+	const resolvedCwd = path.resolve(cwd);
+	const { sessionPath } = getSkillActiveStatePaths(resolvedCwd, sessionId);
+	const activeDirPath = activeStateDir(resolvedCwd, sessionId);
+	const activeDir = await statSignature(activeDirPath);
+	let activeEntries: ActiveStateStatSignature[] = [];
+	try {
+		const names = await fs.readdir(activeDirPath);
+		activeEntries = (
+			await Promise.all(
+				names
+					.filter(name => name.endsWith(".json"))
+					.sort()
+					.map(name => statSignature(path.join(activeDirPath, name))),
+			)
+		).filter((entry): entry is ActiveStateStatSignature => entry !== null);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	return {
+		sessionPath: await statSignature(sessionPath),
+		activeDir,
+		activeEntries,
+		ralplanModeState: await statSignature(modeStatePath(resolvedCwd, sessionId, "ralplan")),
+	};
+}
+
+function visibleActiveStateCacheKey(cwd: string, sessionId: string): string {
+	return `${path.resolve(cwd)}\0${sessionId}`;
+}
+
+export function invalidateVisibleSkillActiveStateCache(cwd?: string, sessionId?: string): void {
+	if (!cwd && !sessionId) {
+		visibleSkillActiveStateCache.clear();
+		return;
+	}
+	const resolvedCwd = cwd ? path.resolve(cwd) : undefined;
+	const suffix = sessionId ? `\0${sessionId}` : undefined;
+	for (const key of [...visibleSkillActiveStateCache.keys()]) {
+		if (resolvedCwd && !key.startsWith(`${resolvedCwd}\0`)) continue;
+		if (suffix && !key.endsWith(suffix)) continue;
+		visibleSkillActiveStateCache.delete(key);
+	}
+}
+
+async function readVisibleSkillActiveStateUncached(
+	cwd: string,
+	resolvedSessionId: string,
+): Promise<SkillActiveState | null> {
 	const { sessionPath } = getSkillActiveStatePaths(cwd, resolvedSessionId);
 	const sessionState = await readRawActiveStateForHandoff(sessionPath, false);
 	const activeSkills = await mergeVisibleEntries(cwd, sessionState, resolvedSessionId);
@@ -637,6 +733,40 @@ export async function readVisibleSkillActiveState(cwd: string, sessionId?: strin
 		active_skills: activeSkills,
 		active_subskills: activeSkills.flatMap(entry => entry.active_subskills ?? []),
 	};
+}
+
+setActiveStateCacheInvalidator(invalidateVisibleSkillActiveStateCache);
+
+export async function readVisibleSkillActiveState(
+	cwd: string,
+	sessionId?: string,
+	opts?: ReadVisibleSkillActiveStateOptions,
+): Promise<SkillActiveState | null> {
+	let resolvedSessionId: string;
+	try {
+		resolvedSessionId = await resolveBoundarySessionId(cwd, sessionId);
+	} catch (error) {
+		if (error instanceof SessionResolutionError && error.code === "no_session") return null;
+		throw error;
+	}
+	const resolvedCwd = path.resolve(cwd);
+	const cacheKey = visibleActiveStateCacheKey(resolvedCwd, resolvedSessionId);
+	const tier = opts?.tier ?? "security";
+	const now = Date.now();
+	const cached = visibleSkillActiveStateCache.get(cacheKey);
+	if (tier === "hud" && cached && now - cached.cachedAtMs < HUD_VISIBLE_STATE_TTL_MS) return cached.value;
+
+	const signature = await computeActiveStateSignature(resolvedCwd, resolvedSessionId);
+	if (
+		cached &&
+		signaturesEqual(cached.signature, signature) &&
+		(tier === "hud" || now - cached.cachedAtMs < SECURITY_VISIBLE_STATE_TTL_MS)
+	) {
+		return cached.value;
+	}
+	const value = await readVisibleSkillActiveStateUncached(resolvedCwd, resolvedSessionId);
+	visibleSkillActiveStateCache.set(cacheKey, { signature, value, cachedAtMs: now });
+	return value;
 }
 
 function activeStateWriterAudit(verb: string, sessionScope?: ActiveSessionScope | string) {
@@ -659,6 +789,9 @@ async function persistActiveEntry(
 		await writeActiveEntry(cwd, sessionScope, entry.skill, entry, {
 			cwd,
 			audit: activeStateWriterAudit("write-active-entry", sessionScope),
+			...(typeof entry.committed_mode_state_revision === "number"
+				? { orderingRevision: entry.committed_mode_state_revision }
+				: {}),
 		});
 	}
 }
@@ -737,6 +870,9 @@ export async function syncSkillActiveState(options: SyncSkillActiveStateOptions)
 				? { active_subskills: preservedActiveSubskills }
 				: {}),
 		...(typeof options.sourceRevision === "number" ? { source_state_revision: options.sourceRevision } : {}),
+		...(typeof options.committedModeRevision === "number"
+			? { committed_mode_state_revision: options.committedModeRevision }
+			: {}),
 	};
 	const sessionScope = { sessionId: options.sessionId };
 	await removeSupersededPlanningPipelineEntries(options.cwd, sessionScope, entry);

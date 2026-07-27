@@ -11,6 +11,7 @@ import type {
 	RawMessageStreamEvent,
 } from "@anthropic-ai/sdk/resources/messages";
 import {
+	$credentialEnv,
 	$env,
 	extractHttpStatusFromError,
 	isEnoent,
@@ -21,6 +22,7 @@ import {
 } from "@gajae-code/utils";
 import { hasOpus47ApiRestrictions, mapEffortToAnthropicAdaptiveEffort } from "../model-thinking";
 import { calculateCost } from "../models";
+import { isUsageLimitError } from "../rate-limit-utils";
 import { getEnvApiKey, OUTPUT_FALLBACK_BUFFER } from "../stream";
 import type {
 	Api,
@@ -52,16 +54,24 @@ import {
 	normalizeSystemPrompts,
 	normalizeToolCallId,
 	resolveCacheRetention,
+	sanitizeJsonStrings,
 } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { transportFailureFacts } from "../utils/fallback-transport";
 import { isFoundryEnabled } from "../utils/foundry";
 import { finalizeErrorMessage, type RawHttpRequestDump, rewriteCopilotError } from "../utils/http-inspector";
-import { getStreamFirstEventTimeoutMs, getStreamIdleTimeoutMs, iterateWithIdleTimeout } from "../utils/idle-iterator";
+import {
+	getProviderFirstEventTimeoutFallbackMs,
+	getStreamFirstEventTimeoutMs,
+	getStreamIdleTimeoutMs,
+	iterateWithIdleTimeout,
+} from "../utils/idle-iterator";
 import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { isCopilotTransientModelError } from "../utils/retry";
+import { getRetryAfterMsFromHeaders } from "../utils/retry-after";
 import { resolveRetryBudget } from "../utils/retry-budget";
 import {
 	COMBINATOR_KEYS,
@@ -302,8 +312,12 @@ let warnedStopSequencesTrim = false;
 /**
  * Adaptive thinking `display` is supported starting with Anthropic model Opus 4.7.
  * Older adaptive-thinking models (Opus 4.6, Sonnet 4.6+) reject the field.
+ * Fable (5+) postdates Opus 4.7, accepts `display`, and defaults it to
+ * "omitted" — thinking tokens are billed but no content streams back — so it
+ * must opt in like Opus 4.7+ (issue #2791).
  */
 function supportsAdaptiveThinkingDisplay(modelId: string): boolean {
+	if (/claude-fable-\d/.test(modelId)) return true;
 	const match = /claude-opus-(\d+)-(\d+)/.exec(modelId);
 	if (!match) return false;
 	const major = Number(match[1]);
@@ -403,6 +417,23 @@ export function isAnthropicThinkingBlockMutationError(error: unknown): boolean {
 	);
 }
 
+/**
+ * 400 shape where a replayed `thinking`/`redacted_thinking` block fails signature
+ * validation, e.g. `messages.5.content.24: Invalid \`signature\` in \`thinking\` block`.
+ * Unlike the latest-assistant mutation error above, the cited block can sit anywhere
+ * in the replayed history, so recovery must repair every assistant message rather
+ * than only the latest one.
+ */
+export function isAnthropicThinkingSignatureInvalidError(error: unknown): boolean {
+	if (extractHttpStatusFromError(error) !== 400) return false;
+	const message = error instanceof Error ? error.message : String(error);
+	return (
+		/invalid_request_error/i.test(message) &&
+		/thinking|redacted_thinking/i.test(message) &&
+		/invalid\s+`?signature`?/i.test(message)
+	);
+}
+
 function hasStrictAnthropicTools(params: MessageCreateParamsStreaming): boolean {
 	const tools = params.tools as Array<{ strict?: unknown }> | undefined;
 	return tools?.some(tool => tool.strict === true) ?? false;
@@ -431,32 +462,37 @@ function getCacheControl(
 	model: Model<"anthropic-messages">,
 	baseUrl: string,
 	cacheRetention?: CacheRetention,
-): { retention: CacheRetention; cacheControl?: AnthropicCacheControl } {
-	// Default Anthropic prompt caching to long (1h) retention. The provider
-	// default of ~5m is too fragile for long-running Codex/Gajae-Code subagent
-	// workflows, where the prefix is frequently evicted between turns. Explicit
-	// request/model `cacheRetention` and the GJC_CACHE_RETENTION /
-	// PI_CACHE_RETENTION env overrides still win.
+): { mode: AnthropicCacheMode; cacheControl?: AnthropicCacheControl } {
 	const retention = resolveCacheRetention(cacheRetention, "long");
-	if (retention === "none") {
-		return { retention };
-	}
-	// `ttl: "1h"` is only honoured on the canonical Anthropic API for models
-	// that advertise long-cache support. Everywhere else (proxies, gateways,
-	// models without the capability) we fall back to the default ephemeral
-	// breakpoint, which Anthropic services at the standard ~5m TTL.
-	const ttl =
-		retention === "long" && isAnthropicApiBaseUrl(baseUrl) && getAnthropicCompat(model).supportsLongCacheRetention
-			? "1h"
-			: undefined;
+	if (retention === "none") return { mode: "none" };
+
+	const isCanonicalApi = isAnthropicApiBaseUrl(baseUrl);
+	const promptCacheMode = model.compat?.promptCacheMode;
+	const mode: AnthropicCacheMode =
+		promptCacheMode === "none"
+			? "none"
+			: promptCacheMode === "explicit"
+				? "explicit"
+				: isCanonicalApi
+					? "automatic"
+					: "none";
+	if (mode === "none") return { mode };
+
+	const supportsLongCacheRetention = isCanonicalApi
+		? getAnthropicCompat(model).supportsLongCacheRetention
+		: model.compat?.supportsLongCacheRetention === true;
 	return {
-		retention,
-		cacheControl: { type: "ephemeral", ...(ttl && { ttl }) },
+		mode,
+		cacheControl: {
+			type: "ephemeral",
+			...(retention === "long" && supportsLongCacheRetention ? { ttl: "1h" } : {}),
+		},
 	};
 }
 
 // Stealth mode: Mimic Anthropic Code headers and tool prefixing.
-export const claudeCodeVersion = "2.1.63";
+export const claudeCodeVersion = "2.1.219";
+export const claudeCodeEntrypoint = "sdk-cli";
 export const claudeToolPrefix: string = "proxy_";
 export const claudeCodeSystemInstruction = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 
@@ -532,7 +568,7 @@ function createClaudeBillingHeader(payload: unknown): string {
 	const buildHash = Array.from(randomBytes, byte => byte.toString(16).padStart(2, "0"))
 		.join("")
 		.slice(0, 3);
-	return `${CLAUDE_BILLING_HEADER_PREFIX} cc_version=${claudeCodeVersion}.${buildHash}; cc_entrypoint=cli; cch=${cch};`;
+	return `${CLAUDE_BILLING_HEADER_PREFIX} cc_version=${claudeCodeVersion}.${buildHash}; cc_entrypoint=${claudeCodeEntrypoint}; cch=${cch};`;
 }
 
 const CLAUDE_CLOAKING_USER_ID_REGEX =
@@ -583,17 +619,32 @@ const ANTHROPIC_BUILTIN_TOOL_NAMES = new Set(["web_search", "code_execution", "t
 export const applyClaudeToolPrefix = (name: string, prefixOverride: string = claudeToolPrefix) => {
 	if (!prefixOverride) return name;
 	if (ANTHROPIC_BUILTIN_TOOL_NAMES.has(name.toLowerCase())) return name;
-	const prefix = prefixOverride.toLowerCase();
-	if (name.toLowerCase().startsWith(prefix)) return name;
 	return `${prefixOverride}${name}`;
 };
 
 export const stripClaudeToolPrefix = (name: string, prefixOverride: string = claudeToolPrefix) => {
 	if (!prefixOverride) return name;
-	const prefix = prefixOverride.toLowerCase();
-	if (!name.toLowerCase().startsWith(prefix)) return name;
+	if (!name.startsWith(prefixOverride)) return name;
 	return name.slice(prefixOverride.length);
 };
+
+// Anthropic requires image `data` to be standard (RFC 4648) base64: the standard
+// alphabet only, correct quartet grouping, and padding (when present) confined to
+// a trailing `=`/`==`. A resident image whose blob went missing bakes a
+// human-readable placeholder into `data` (e.g. "[Session resident imageData blob
+// missing: …]"), and other callers can pass whitespace, data URLs, or URL-safe
+// variants — all of which the API rejects with a 400 `invalid base64 data` that
+// fails the *entire* request and bricks the session. Validate the wire format
+// strictly and degrade anything that is not standard base64 to text.
+//
+// Accepts canonical padded forms and their unpadded equivalents; rejects
+// length % 4 === 1, misplaced/overlong padding, whitespace, data URLs, URL-safe
+// (`-`/`_`) alphabets, prose, and empty input. The pattern has no nested
+// quantifier, so even oversized inputs are rejected in linear time.
+const ANTHROPIC_BASE64_IMAGE_DATA = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}(?:==)?|[A-Za-z0-9+/]{3}=?)?$/;
+function isAnthropicBase64ImageData(data: string): boolean {
+	return data.length > 0 && data.length % 4 !== 1 && ANTHROPIC_BASE64_IMAGE_DATA.test(data);
+}
 
 /**
  * Convert content blocks to Anthropic API format
@@ -618,7 +669,18 @@ function convertContentBlocks(
 		.filter((block): block is TextContent => block.type === "text")
 		.map(block => block.text.toWellFormed())
 		.filter(text => text.trim().length > 0);
-	const imageBlocks = content.filter((block): block is ImageContent => block.type === "image");
+	const imageBlocks: ImageContent[] = [];
+	for (const block of content) {
+		if (block.type !== "image") continue;
+		if (isAnthropicBase64ImageData(block.data)) {
+			imageBlocks.push(block);
+			continue;
+		}
+		// Non-base64 image payload (e.g. a missing-blob placeholder): degrade to
+		// text so one lost image cannot invalidate the entire request.
+		const text = block.data.toWellFormed().trim();
+		if (text.length > 0) textBlocks.push(text);
+	}
 	const omittedImages = !supportsImages && imageBlocks.length > 0;
 	if (imageBlocks.length === 0 || !supportsImages) {
 		if (omittedImages) {
@@ -724,6 +786,7 @@ export type AnthropicClientOptionsArgs = {
 	onSseEvent?: AnthropicOptions["onSseEvent"];
 	fetch?: FetchImpl;
 	requestMaxRetries?: number;
+	maxRetryDelayMs?: number;
 };
 
 export type AnthropicClientOptionsResult = {
@@ -755,10 +818,12 @@ function resolveAnthropicBaseUrl(model: Model<"anthropic-messages">, apiKey?: st
 	// calls api.z.ai directly (no zcode.z.ai gateway, no captcha). Pin the base so dynamic
 	// discovery / stale bundled catalogs / model cache can't redirect it elsewhere.
 	if (model.provider === "glm-zcode") {
-		return normalizeAnthropicBaseUrl(process.env.ZCODE_PLAN_ANTHROPIC_BASE_URL) ?? "https://api.z.ai/api/anthropic";
+		return (
+			normalizeAnthropicBaseUrl($credentialEnv("ZCODE_PLAN_ANTHROPIC_BASE_URL")) ?? "https://api.z.ai/api/anthropic"
+		);
 	}
 	if (model.provider === "anthropic" && isFoundryEnabled()) {
-		const foundryBaseUrl = normalizeAnthropicBaseUrl($env.FOUNDRY_BASE_URL);
+		const foundryBaseUrl = normalizeAnthropicBaseUrl($credentialEnv("FOUNDRY_BASE_URL"));
 		if (foundryBaseUrl) {
 			return foundryBaseUrl;
 		}
@@ -877,6 +942,101 @@ function mergeHeaders(...headerSources: (Record<string, string> | undefined)[]):
 	return merged;
 }
 
+const ANTHROPIC_RETRY_DELAY_CAP_MS = 60_000;
+const ANTHROPIC_RATE_LIMIT_HEADER_PREFIX = "anthropic-ratelimit-";
+
+function getSafeAnthropicHeaderEvidence(headers: Headers): string[] {
+	const evidence: string[] = [];
+	for (const [name, value] of headers) {
+		const lowerName = name.toLowerCase();
+		if (
+			lowerName === "retry-after" ||
+			lowerName === "retry-after-ms" ||
+			lowerName.startsWith(ANTHROPIC_RATE_LIMIT_HEADER_PREFIX)
+		) {
+			evidence.push(`${lowerName}=${value}`);
+		}
+	}
+	return evidence.sort();
+}
+
+function getStringProperty(source: unknown, key: string): string | undefined {
+	if (!isRecord(source)) return undefined;
+	const value = source[key];
+	return typeof value === "string" ? value : undefined;
+}
+
+function appendAnthropicRateLimitEvidence(bodyText: string, headers: Headers): string {
+	const evidence = getSafeAnthropicHeaderEvidence(headers);
+	if (evidence.length === 0) return bodyText;
+
+	const suffix = ` Anthropic rate-limit evidence: ${evidence.join(", ")}`;
+	try {
+		const parsed = JSON.parse(bodyText) as unknown;
+		if (isRecord(parsed)) {
+			const error = parsed.error;
+			if (isRecord(error) && typeof error.message === "string" && !error.message.includes(suffix)) {
+				return JSON.stringify({ ...parsed, error: { ...error, message: `${error.message}${suffix}` } });
+			}
+			if (typeof parsed.message === "string" && !parsed.message.includes(suffix)) {
+				return JSON.stringify({ ...parsed, message: `${parsed.message}${suffix}` });
+			}
+		}
+	} catch {}
+
+	return bodyText.includes(suffix) ? bodyText : `${bodyText}${suffix}`;
+}
+
+function isAnthropicUsageExhaustionResponse(
+	bodyText: string,
+	headers: Headers,
+	retryAfterMs: number | undefined,
+	retryDelayCapMs: number,
+): boolean {
+	const overageReason = headers.get("anthropic-ratelimit-unified-overage-disabled-reason")?.toLowerCase();
+	if (overageReason === "out_of_credits") return true;
+	if (retryAfterMs !== undefined && retryAfterMs > retryDelayCapMs) return true;
+
+	try {
+		const parsed = JSON.parse(bodyText) as unknown;
+		const error = isRecord(parsed) ? parsed.error : undefined;
+		const type = getStringProperty(error, "type") ?? getStringProperty(parsed, "type");
+		const message = getStringProperty(error, "message") ?? getStringProperty(parsed, "message") ?? bodyText;
+		return (
+			/rate_limit_error/i.test(type ?? "") &&
+			(/request would exceed your account.?s rate limit/i.test(message) || /out_of_credits/i.test(message))
+		);
+	} catch {
+		return /request would exceed your account.?s rate limit|out_of_credits/i.test(bodyText);
+	}
+}
+
+function wrapAnthropicFetchForBoundedRateLimits(baseFetch: FetchImpl, maxRetryDelayMs: number | undefined): FetchImpl {
+	const retryDelayCapMs = maxRetryDelayMs ?? ANTHROPIC_RETRY_DELAY_CAP_MS;
+	return Object.assign(
+		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			const response = await baseFetch(input, init);
+			if (response.status !== 429 || retryDelayCapMs === 0) return response;
+
+			const headers = new Headers(response.headers);
+			const retryAfterMs = getRetryAfterMsFromHeaders(headers);
+			const bodyText = await response
+				.clone()
+				.text()
+				.catch(() => "");
+			if (!isAnthropicUsageExhaustionResponse(bodyText, headers, retryAfterMs, retryDelayCapMs)) return response;
+
+			headers.set("x-should-retry", "false");
+			return new Response(appendAnthropicRateLimitEvidence(bodyText, headers), {
+				status: response.status,
+				statusText: response.statusText,
+				headers,
+			});
+		},
+		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
+	);
+}
+
 // The Anthropic SDK logs malformed SSE frames directly before rethrowing them.
 // We surface the resulting provider error ourselves, so keep the SDK quiet.
 const ANTHROPIC_SDK_LOG_LEVEL = "off" as const;
@@ -984,6 +1144,7 @@ function getAnthropicCompat(
 		supportsLongCacheRetention: model.compat?.supportsLongCacheRetention ?? true,
 		supportsToolChoice: model.compat?.supportsToolChoice ?? true,
 		supportsForcedToolChoice: model.compat?.supportsForcedToolChoice ?? true,
+		promptCacheMode: model.compat?.promptCacheMode ?? "none",
 		toolChoiceSupport: model.compat?.toolChoiceSupport,
 	};
 }
@@ -1025,6 +1186,40 @@ function shouldIgnoreAnthropicPreambleEvent(eventType: unknown): boolean {
 	return !ANTHROPIC_PRE_MESSAGE_START_EVENT_TYPES.has(eventType);
 }
 
+function createAnthropicStreamProgressPredicate(): (event: unknown) => boolean {
+	let outputTokens = -1;
+
+	return event => {
+		if (!isRecord(event) || typeof event.type !== "string") return false;
+		if (
+			event.type === "message_start" ||
+			event.type === "content_block_start" ||
+			event.type === "content_block_stop" ||
+			event.type === "message_stop"
+		) {
+			return true;
+		}
+		if (event.type === "content_block_delta") {
+			if (!isRecord(event.delta)) return false;
+			const delta = event.delta;
+			return (
+				(typeof delta.text === "string" && delta.text.length > 0) ||
+				(typeof delta.thinking === "string" && delta.thinking.length > 0) ||
+				(typeof delta.partial_json === "string" && delta.partial_json.length > 0) ||
+				(typeof delta.signature === "string" && delta.signature.length > 0)
+			);
+		}
+		if (event.type === "message_delta") {
+			if (isRecord(event.delta) && event.delta.stop_reason != null) return true;
+			if (!isRecord(event.usage) || typeof event.usage.output_tokens !== "number") return false;
+			if (event.usage.output_tokens <= outputTokens) return false;
+			outputTokens = event.usage.output_tokens;
+			return true;
+		}
+		return false;
+	};
+}
+
 function isTransientStreamEnvelopeError(error: unknown): boolean {
 	if (!(error instanceof Error)) return false;
 	return (
@@ -1042,6 +1237,7 @@ export function isProviderRetryableError(error: unknown, provider?: string): boo
 	if (!(error instanceof Error)) return false;
 	if (provider === "github-copilot" && isCopilotTransientModelError(error)) return true;
 	const msg = error.message.toLowerCase();
+	if (isUsageLimitError(error.message)) return false;
 	if (
 		isUnexpectedSocketCloseMessage(msg) ||
 		/rate.?limit|too many requests|overloaded|service.?unavailable|internal_error|stream error.*received from peer|1302|timed?\s*out while waiting for the first event|timeout waiting for first/i.test(
@@ -1166,6 +1362,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					onSseEvent: options?.onSseEvent,
 					fetch: options?.fetch,
 					requestMaxRetries: options?.requestMaxRetries,
+					maxRetryDelayMs: options?.maxRetryDelayMs,
 				});
 				client = created.client;
 				isOAuthToken = created.isOAuthToken;
@@ -1179,20 +1376,19 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			let strictFallbackErrorMessage: string | undefined;
 			let dropFastMode = providerSessionState?.fastModeDisabled ?? false;
 			let droppedForcedToolChoice = false;
-			const prepareParams = async (paramsOptions?: {
-				repairLatestAssistantThinking?: boolean;
-				dropForcedToolChoice?: boolean;
-			}): Promise<MessageCreateParamsStreaming> => {
-				let nextParams = buildParams(
-					model,
-					baseUrl,
-					context,
-					isOAuthToken,
-					options,
-					disableStrictTools,
-					paramsOptions?.repairLatestAssistantThinking === true,
-				);
-				if (paramsOptions?.dropForcedToolChoice === true) {
+			let repairLatestAssistantThinking = false;
+			let repairAllAssistantThinking = false;
+			const prepareParams = async (): Promise<MessageCreateParamsStreaming> => {
+				// Degradation state is cumulative: every fallback rebuild must merge all
+				// repairs activated so far. Rebuilding from only the immediate call lets
+				// a later strict/forced-tool/fast-mode fallback reintroduce the rejected
+				// shape (e.g. invalid thinking signatures or forced tool_choice), and
+				// the one-shot thinking-repair guard then blocks recovery.
+				let nextParams = buildParams(model, baseUrl, context, isOAuthToken, options, disableStrictTools, {
+					repairLatestAssistantThinking,
+					repairAllAssistantThinking,
+				});
+				if (droppedForcedToolChoice) {
 					delete nextParams.tool_choice;
 				}
 				if (disableStrictTools) {
@@ -1205,6 +1401,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				if (replacementPayload !== undefined) {
 					nextParams = replacementPayload as typeof nextParams;
 				}
+				validateCacheControls(nextParams as AnthropicCacheParams);
 				rawRequestDump = {
 					provider: model.provider,
 					api: output.api,
@@ -1224,8 +1421,47 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				| (ToolCall & { partialJson: string })
 			) & { index: number };
 			const blocks = output.content as Block[];
+			const blocksByAnthropicIndex = new Map<number, Block>();
+			// Derive from the ACTUAL request shape, not the option default: the request
+			// only sends `display: "summarized"` on specific paths (adaptive display is
+			// omitted for models where supportsAdaptiveThinkingDisplay is false). Defaulting
+			// to summarized would mislabel raw thinking as a provider-displayable summary.
+			const summarizedThinking =
+				(params.thinking as { display?: AnthropicThinkingDisplay } | undefined)?.display === "summarized";
+			const reasoningBuffers = new WeakMap<object, string>();
+			const getBlockByAnthropicIndex = (anthropicIndex: number) => {
+				const block = blocksByAnthropicIndex.get(anthropicIndex);
+				if (!block) return { block: undefined, contentIndex: -1 };
+				return { block, contentIndex: blocks.indexOf(block) };
+			};
+			const trackBlockByAnthropicIndex = (anthropicIndex: number, block: Block) => {
+				// A duplicate start for an active index is a provider-envelope violation;
+				// finalize the orphaned block so no internal stream fields leak into output.
+				const orphaned = blocksByAnthropicIndex.get(anthropicIndex);
+				if (orphaned) {
+					if (orphaned.type === "toolCall" && orphaned.partialJson.trim()) {
+						orphaned.arguments = parseStreamingJson(orphaned.partialJson);
+					}
+					delete (orphaned as { index?: number }).index;
+					delete (orphaned as { partialJson?: string }).partialJson;
+				}
+				blocksByAnthropicIndex.set(anthropicIndex, block);
+			};
+			const resetOutputForRetry = () => {
+				output.content.length = 0;
+				output.responseId = undefined;
+				output.errorKind = undefined;
+				output.errorStatus = undefined;
+				output.errorMessage = strictFallbackErrorMessage;
+				output.providerPayload = undefined;
+				output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
+				output.stopReason = "stop";
+				firstTokenTime = undefined;
+			};
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
-			const firstEventTimeoutMs = options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs);
+			const firstEventFallbackMs = getProviderFirstEventTimeoutFallbackMs(model.provider);
+			const firstEventTimeoutMs =
+				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs, firstEventFallbackMs);
 			stream.push({ type: "start", partial: output });
 			// Retry loop for transient errors from the stream.
 			// Provider-level transport/rate-limit failures: only before any streamed content starts.
@@ -1233,6 +1469,8 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			let providerRetryAttempt = 0;
 			let thinkingRepairAttempted = false;
 			while (true) {
+				// Retries reset output.content; drop stale block correlations from the aborted attempt.
+				blocksByAnthropicIndex.clear();
 				activeAbortTracker = createAbortSourceTracker(options?.signal);
 				const firstEventTimeoutAbortError = new Error(
 					"Anthropic stream timed out while waiting for the first event",
@@ -1241,6 +1479,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				const { requestSignal } = activeAbortTracker;
 				const anthropicRequest = client.messages.create({ ...params, stream: true }, { signal: requestSignal });
 				let streamedReplayUnsafeContent = false;
+				let sawProviderSafetyStop = false;
 
 				try {
 					const {
@@ -1256,6 +1495,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					let sawEvent = false;
 					let sawMessageStart = false;
 					let sawTerminalEnvelope = false;
+					const isProgressEvent = createAnthropicStreamProgressPredicate();
 
 					for await (const event of iterateWithIdleTimeout(anthropicStream, {
 						idleTimeoutMs,
@@ -1265,8 +1505,15 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						onIdle: () => activeAbortTracker.abortLocally(idleTimeoutAbortError),
 						onFirstItemTimeout: () => activeAbortTracker.abortLocally(firstEventTimeoutAbortError),
 						abortSignal: options?.signal,
+						isProgressItem: isProgressEvent,
 					})) {
 						sawEvent = true;
+						if (sawProviderSafetyStop) {
+							if (event.type === "message_stop") {
+								sawTerminalEnvelope = true;
+							}
+							continue;
+						}
 
 						if (event.type === "message_start") {
 							if (sawMessageStart) {
@@ -1302,6 +1549,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 									index: event.index,
 								};
 								output.content.push(block);
+								trackBlockByAnthropicIndex(event.index, block);
 								stream.push({
 									type: "text_start",
 									contentIndex: output.content.length - 1,
@@ -1315,11 +1563,25 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 									index: event.index,
 								};
 								output.content.push(block);
+								trackBlockByAnthropicIndex(event.index, block);
+								// Emit thinking_start FIRST so a reasoning item is open before any
+								// summary-start: the Responses SSE encoder only accepts a summary
+								// start when state.open.kind === "reasoning", otherwise the
+								// reasoning_summary_part.added frame is dropped and deltas arrive
+								// out of order.
 								stream.push({
 									type: "thinking_start",
 									contentIndex: output.content.length - 1,
 									partial: output,
 								});
+								if (summarizedThinking) {
+									reasoningBuffers.set(block, "");
+									stream.push({
+										type: "reasoning_summary_start",
+										contentIndex: output.content.length - 1,
+										partial: output,
+									});
+								}
 							} else if (event.content_block.type === "redacted_thinking") {
 								const block: Block = {
 									type: "redactedThinking",
@@ -1327,6 +1589,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 									index: event.index,
 								};
 								output.content.push(block);
+								trackBlockByAnthropicIndex(event.index, block);
 							} else if (event.content_block.type === "tool_use") {
 								streamedReplayUnsafeContent = true;
 								const block: Block = {
@@ -1340,6 +1603,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 									index: event.index,
 								};
 								output.content.push(block);
+								trackBlockByAnthropicIndex(event.index, block);
 								stream.push({
 									type: "toolcall_start",
 									contentIndex: output.content.length - 1,
@@ -1348,8 +1612,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							}
 						} else if (event.type === "content_block_delta") {
 							if (event.delta.type === "text_delta") {
-								const index = blocks.findIndex(b => b.index === event.index);
-								const block = blocks[index];
+								const { block, contentIndex: index } = getBlockByAnthropicIndex(event.index);
 								if (block && block.type === "text") {
 									block.text += event.delta.text;
 									stream.push({
@@ -1360,20 +1623,29 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 									});
 								}
 							} else if (event.delta.type === "thinking_delta") {
-								const index = blocks.findIndex(b => b.index === event.index);
-								const block = blocks[index];
+								const { block, contentIndex: index } = getBlockByAnthropicIndex(event.index);
 								if (block && block.type === "thinking") {
 									block.thinking += event.delta.thinking;
-									stream.push({
-										type: "thinking_delta",
-										contentIndex: index,
-										delta: event.delta.thinking,
-										partial: output,
-									});
+									if (summarizedThinking) {
+										const summary = (reasoningBuffers.get(block) ?? "") + event.delta.thinking;
+										reasoningBuffers.set(block, summary);
+										stream.push({
+											type: "reasoning_summary_delta",
+											contentIndex: index,
+											delta: event.delta.thinking,
+											partial: output,
+										});
+									} else {
+										stream.push({
+											type: "thinking_delta",
+											contentIndex: index,
+											delta: event.delta.thinking,
+											partial: output,
+										});
+									}
 								}
 							} else if (event.delta.type === "input_json_delta") {
-								const index = blocks.findIndex(b => b.index === event.index);
-								const block = blocks[index];
+								const { block, contentIndex: index } = getBlockByAnthropicIndex(event.index);
 								if (block && block.type === "toolCall") {
 									block.partialJson += event.delta.partial_json;
 									block.arguments = parseStreamingJson(block.partialJson);
@@ -1385,17 +1657,16 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 									});
 								}
 							} else if (event.delta.type === "signature_delta") {
-								const index = blocks.findIndex(b => b.index === event.index);
-								const block = blocks[index];
+								const { block } = getBlockByAnthropicIndex(event.index);
 								if (block && block.type === "thinking") {
 									block.thinkingSignature = block.thinkingSignature || "";
 									block.thinkingSignature += event.delta.signature;
 								}
 							}
 						} else if (event.type === "content_block_stop") {
-							const index = blocks.findIndex(b => b.index === event.index);
-							const block = blocks[index];
+							const { block, contentIndex: index } = getBlockByAnthropicIndex(event.index);
 							if (block) {
+								blocksByAnthropicIndex.delete(event.index);
 								delete (block as { index?: number }).index;
 								if (block.type === "text") {
 									stream.push({
@@ -1405,6 +1676,21 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 										partial: output,
 									});
 								} else if (block.type === "thinking") {
+									if (summarizedThinking) {
+										const summaryText = reasoningBuffers.get(block) ?? "";
+										const mutable = block as {
+											provenance?: "summary" | "raw" | "mixed";
+											summaryText?: string;
+										};
+										if (mutable.summaryText === undefined) mutable.summaryText = summaryText;
+										if (mutable.provenance === undefined) mutable.provenance = "summary";
+										stream.push({
+											type: "reasoning_summary_end",
+											contentIndex: index,
+											content: summaryText,
+											partial: output,
+										});
+									}
 									stream.push({
 										type: "thinking_end",
 										contentIndex: index,
@@ -1412,7 +1698,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 										partial: output,
 									});
 								} else if (block.type === "toolCall") {
-									block.arguments = parseStreamingJson(block.partialJson);
+									if (block.partialJson.trim()) {
+										block.arguments = parseStreamingJson(block.partialJson);
+									}
 									delete (block as { partialJson?: string }).partialJson;
 									stream.push({
 										type: "toolcall_end",
@@ -1424,26 +1712,34 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							}
 						} else if (event.type === "message_delta") {
 							const rawStopReason = event.delta.stop_reason as string | null | undefined;
+							const stopDetails = event.delta.stop_details;
+							const isProviderSafetyStop =
+								rawStopReason === "refusal" || rawStopReason === "sensitive" || stopDetails?.type === "refusal";
 							if (rawStopReason) {
-								output.stopReason = mapStopReason(rawStopReason);
+								output.stopReason = isProviderSafetyStop ? "error" : mapStopReason(rawStopReason);
 								sawTerminalEnvelope = true;
 							}
-							const stopDetails = event.delta.stop_details;
-							if (stopDetails && stopDetails.type === "refusal") {
-								const explanation = stopDetails.explanation?.trim();
-								const category = stopDetails.category;
-								const label = category ? `Refusal (${category})` : "Refusal";
-								output.errorMessage = explanation ? `${label}: ${explanation}` : label;
+							if (isProviderSafetyStop) {
+								sawProviderSafetyStop = true;
+								sawTerminalEnvelope = true;
+								output.stopReason = "error";
+								output.errorKind = "provider_safety_stop";
+								if (stopDetails?.type === "refusal") {
+									const explanation = stopDetails.explanation?.trim();
+									const category = stopDetails.category;
+									const label = category ? `Refusal (${category})` : "Refusal";
+									output.errorMessage = explanation ? `${label}: ${explanation}` : label;
+								} else if (!output.errorMessage) {
+									output.errorMessage =
+										rawStopReason === "refusal"
+											? "Refusal (no details provided)"
+											: "Content flagged by safety filters";
+								}
 							} else if (output.stopReason === "error" && !output.errorMessage) {
-								// Anthropic flagged an error-class stop (refusal / sensitive) without
-								// populating stop_details. Surface the raw reason instead of falling
-								// through to the generic "unknown error" string when we throw below.
-								output.errorMessage =
-									rawStopReason === "refusal"
-										? "Refusal (no details provided)"
-										: rawStopReason === "sensitive"
-											? "Content flagged by safety filters"
-											: `Anthropic stream ended with stop_reason: ${rawStopReason ?? "unknown"}`;
+								// Anthropic flagged an error-class stop without populating stop_details.
+								// Surface the raw reason instead of falling through to the generic
+								// "unknown error" string when we throw below.
+								output.errorMessage = `Anthropic stream ended with stop_reason: ${rawStopReason ?? "unknown"}`;
 							}
 							if (event.usage.input_tokens != null) {
 								output.usage.input = event.usage.input_tokens;
@@ -1486,31 +1782,30 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					break;
 				} catch (streamError) {
 					const streamFailure = activeAbortTracker.getLocalAbortReason() ?? streamError;
+					if (sawProviderSafetyStop) {
+						throw streamFailure;
+					}
 					if (
+						!options?.fallbackManaged &&
 						!disableStrictTools &&
 						firstTokenTime === undefined &&
 						hasStrictAnthropicTools(params) &&
 						isAnthropicStrictGrammarTooLargeError(streamFailure)
 					) {
 						strictFallbackErrorMessage = await finalizeErrorMessage(streamFailure, rawRequestDump);
-						output.errorMessage = strictFallbackErrorMessage;
 						if (providerSessionState) {
 							providerSessionState.strictToolsDisabled = true;
 						}
 						disableStrictTools = true;
 						params = await prepareParams();
 						providerRetryAttempt = 0;
-						output.content.length = 0;
-						output.responseId = undefined;
-						output.providerPayload = undefined;
-						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
-						output.stopReason = "stop";
-						firstTokenTime = undefined;
+						resetOutputForRetry();
 						continue;
 					}
 					if (
 						!droppedForcedToolChoice &&
 						firstTokenTime === undefined &&
+						!options?.fallbackManaged &&
 						isSentForcedAnthropicToolChoice(params.tool_choice) &&
 						isForcedToolChoiceUnsupportedError(streamFailure, true)
 					) {
@@ -1531,37 +1826,36 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							registryKey: resolveToolChoice(model, options?.toolChoice).registryKey,
 						});
 						droppedForcedToolChoice = true;
-						params = await prepareParams({ dropForcedToolChoice: true });
+						params = await prepareParams();
 						providerRetryAttempt = 0;
-						output.content.length = 0;
-						output.responseId = undefined;
-						output.providerPayload = undefined;
-						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
-						output.stopReason = "stop";
-						firstTokenTime = undefined;
+						resetOutputForRetry();
 						continue;
 					}
+					const thinkingSignatureInvalid = isAnthropicThinkingSignatureInvalidError(streamFailure);
 					if (
+						!options?.fallbackManaged &&
 						!thinkingRepairAttempted &&
 						firstTokenTime === undefined &&
-						isAnthropicThinkingBlockMutationError(streamFailure)
+						(thinkingSignatureInvalid || isAnthropicThinkingBlockMutationError(streamFailure))
 					) {
-						logger.debug("anthropic: repairing latest assistant thinking replay after provider rejection", {
+						logger.debug("anthropic: repairing assistant thinking replay after provider rejection", {
 							model: model.id,
+							scope: thinkingSignatureInvalid ? "all" : "latest",
 							error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
 						});
 						thinkingRepairAttempted = true;
-						params = await prepareParams({ repairLatestAssistantThinking: true });
+						if (thinkingSignatureInvalid) {
+							repairAllAssistantThinking = true;
+						} else {
+							repairLatestAssistantThinking = true;
+						}
+						params = await prepareParams();
 						providerRetryAttempt = 0;
-						output.content.length = 0;
-						output.responseId = undefined;
-						output.providerPayload = undefined;
-						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
-						output.stopReason = "stop";
-						firstTokenTime = undefined;
+						resetOutputForRetry();
 						continue;
 					}
 					if (
+						!options?.fallbackManaged &&
 						!dropFastMode &&
 						resolveServiceTier(options?.serviceTier, model.provider) === "priority" &&
 						firstTokenTime === undefined &&
@@ -1577,12 +1871,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						dropFastMode = true;
 						params = await prepareParams();
 						providerRetryAttempt = 0;
-						output.content.length = 0;
-						output.responseId = undefined;
-						output.providerPayload = undefined;
-						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
-						output.stopReason = "stop";
-						firstTokenTime = undefined;
+						resetOutputForRetry();
 						continue;
 					}
 					const isTransientEnvelopeFailure =
@@ -1604,13 +1893,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					} else {
 						await scheduler.wait(delayMs, { signal: options?.signal });
 					}
-					output.content.length = 0;
-					output.responseId = undefined;
-					output.errorMessage = strictFallbackErrorMessage;
-					output.providerPayload = undefined;
-					output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
-					output.stopReason = "stop";
-					firstTokenTime = undefined;
+					resetOutputForRetry();
 				}
 			}
 
@@ -1629,7 +1912,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			const firstEventTimeoutError = activeAbortTracker.getLocalAbortReason();
 			output.stopReason = activeAbortTracker.wasCallerAbort() ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(error);
-			output.errorMessage = firstEventTimeoutError?.message ?? (await finalizeErrorMessage(error, rawRequestDump));
+			output.transportFailure = transportFailureFacts(error);
+			if (output.errorKind !== "provider_safety_stop" || !output.errorMessage) {
+				output.errorMessage =
+					firstEventTimeoutError?.message ?? (await finalizeErrorMessage(error, rawRequestDump));
+			}
 			output.errorMessage = rewriteCopilotError(output.errorMessage, error, model.provider);
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
@@ -1723,11 +2010,8 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 	const foundryCustomHeaders = resolveAnthropicCustomHeaders(model);
 	const tlsFetchOptions = buildClaudeCodeTlsFetchOptions(model, baseUrl);
 	const baseFetch = args.fetch ?? fetch;
-	const debugFetch = onSseEvent
-		? wrapFetchForSseDebug(baseFetch, event => onSseEvent(event, model))
-		: args.fetch
-			? baseFetch
-			: undefined;
+	const boundedFetch = wrapAnthropicFetchForBoundedRateLimits(baseFetch, args.maxRetryDelayMs);
+	const debugFetch = onSseEvent ? wrapFetchForSseDebug(boundedFetch, event => onSseEvent(event, model)) : boundedFetch;
 	if (model.provider === "github-copilot") {
 		const copilotApiKey = parseGitHubCopilotApiKey(apiKey).accessToken;
 		const betaFeatures = [...extraBetas];
@@ -1755,7 +2039,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 			dangerouslyAllowBrowser: true,
 			defaultHeaders,
 			logLevel: ANTHROPIC_SDK_LOG_LEVEL,
-			...(debugFetch ? { fetch: debugFetch } : {}),
+			fetch: debugFetch,
 			...(tlsFetchOptions ? { fetchOptions: tlsFetchOptions } : {}),
 		};
 	}
@@ -1789,7 +2073,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 			dangerouslyAllowBrowser: true,
 			defaultHeaders,
 			logLevel: ANTHROPIC_SDK_LOG_LEVEL,
-			...(debugFetch ? { fetch: debugFetch } : {}),
+			fetch: debugFetch,
 		};
 	}
 
@@ -1802,7 +2086,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		dangerouslyAllowBrowser: true,
 		defaultHeaders,
 		logLevel: ANTHROPIC_SDK_LOG_LEVEL,
-		...(debugFetch ? { fetch: debugFetch } : {}),
+		fetch: debugFetch,
 		...(tlsFetchOptions ? { fetchOptions: tlsFetchOptions } : {}),
 	};
 }
@@ -1868,232 +2152,159 @@ type CacheControlBlock = {
 	cache_control?: AnthropicCacheControl | null;
 };
 
-function applyCacheControlToLastBlock<T extends CacheControlBlock>(
-	blocks: T[],
-	cacheControl: AnthropicCacheControl,
-): void {
-	if (blocks.length === 0) return;
-	const lastIndex = blocks.length - 1;
-	blocks[lastIndex] = { ...blocks[lastIndex], cache_control: cacheControl };
+type AnthropicCacheParams = MessageCreateParamsStreaming & {
+	cache_control?: AnthropicCacheControl;
+};
+
+type AnthropicCacheMode = "automatic" | "explicit" | "none";
+
+function isCacheableContentBlock(block: ContentBlockParam): boolean {
+	if (block.type === "thinking" || block.type === "redacted_thinking") return false;
+	return block.type !== "text" || block.text.trim().length > 0;
 }
 
-function applyCacheControlToLastTextBlock(
-	blocks: Array<ContentBlockParam & CacheControlBlock>,
-	cacheControl: AnthropicCacheControl,
-): void {
-	if (blocks.length === 0) return;
-	for (let i = blocks.length - 1; i >= 0; i--) {
-		if (blocks[i].type === "text") {
-			blocks[i] = { ...blocks[i], cache_control: cacheControl };
-			return;
-		}
-	}
-	applyCacheControlToLastBlock(blocks, cacheControl);
+function cacheControlError(path: string, reason: string): Error {
+	return new Error(`Invalid Anthropic cache_control at ${path}: ${reason}`);
 }
 
-function applyPromptCaching(params: MessageCreateParamsStreaming, cacheControl?: AnthropicCacheControl): void {
-	if (!cacheControl) return;
-
-	// Skip if cache_control breakpoints were already placed externally on messages.
-	for (const message of params.messages) {
-		if (Array.isArray(message.content)) {
-			if ((message.content as Array<ContentBlockParam & CacheControlBlock>).some(b => b.cache_control != null))
-				return;
-		}
+function validateCacheControl(control: unknown, path: string, seenFiveMinute: { value: boolean }): void {
+	if (!isRecord(control) || control.type !== "ephemeral") {
+		throw cacheControlError(path, 'expected { type: "ephemeral" }');
 	}
-
-	const MAX_CACHE_BREAKPOINTS = 4;
-	let cacheBreakpointsUsed = 0;
-
-	if (params.tools && params.tools.length > 0) {
-		applyCacheControlToLastBlock(params.tools as Array<CacheControlBlock>, cacheControl);
-		cacheBreakpointsUsed++;
+	if (control.ttl !== undefined && control.ttl !== "5m" && control.ttl !== "1h") {
+		throw cacheControlError(path, 'ttl must be "5m" or "1h"');
 	}
-
-	if (cacheBreakpointsUsed >= MAX_CACHE_BREAKPOINTS) return;
-
-	if (params.system && Array.isArray(params.system) && params.system.length > 0) {
-		applyCacheControlToLastBlock(params.system, cacheControl);
-		cacheBreakpointsUsed++;
-	}
-
-	if (cacheBreakpointsUsed >= MAX_CACHE_BREAKPOINTS) return;
-
-	const userIndexes = params.messages
-		.map((message, index) => (message.role === "user" ? index : -1))
-		.filter(index => index >= 0);
-
-	if (userIndexes.length >= 2) {
-		const penultimateUserIndex = userIndexes[userIndexes.length - 2];
-		const penultimateUser = params.messages[penultimateUserIndex];
-		if (penultimateUser) {
-			if (typeof penultimateUser.content === "string") {
-				const contentBlock: ContentBlockParam & CacheControlBlock = {
-					type: "text",
-					text: penultimateUser.content,
-					cache_control: cacheControl,
-				};
-				penultimateUser.content = [contentBlock];
-				cacheBreakpointsUsed++;
-			} else if (Array.isArray(penultimateUser.content) && penultimateUser.content.length > 0) {
-				applyCacheControlToLastTextBlock(
-					penultimateUser.content as Array<ContentBlockParam & CacheControlBlock>,
-					cacheControl,
-				);
-				cacheBreakpointsUsed++;
-			}
-		}
-	}
-
-	if (cacheBreakpointsUsed >= MAX_CACHE_BREAKPOINTS) return;
-
-	if (userIndexes.length >= 1) {
-		const lastUserIndex = userIndexes[userIndexes.length - 1];
-		const lastUser = params.messages[lastUserIndex];
-		if (lastUser) {
-			if (typeof lastUser.content === "string") {
-				const contentBlock: ContentBlockParam & CacheControlBlock = {
-					type: "text",
-					text: lastUser.content,
-					cache_control: cacheControl,
-				};
-				lastUser.content = [contentBlock];
-			} else if (Array.isArray(lastUser.content) && lastUser.content.length > 0) {
-				applyCacheControlToLastTextBlock(
-					lastUser.content as Array<ContentBlockParam & CacheControlBlock>,
-					cacheControl,
-				);
-			}
-		}
-	}
-}
-
-function normalizeCacheControlBlockTtl(block: CacheControlBlock, seenFiveMinute: { value: boolean }): void {
-	const cacheControl = block.cache_control;
-	if (!cacheControl) return;
-	if (cacheControl.ttl !== "1h") {
-		seenFiveMinute.value = true;
+	if (control.ttl === "1h") {
+		if (seenFiveMinute.value) throw cacheControlError(path, "1h TTL must precede 5m TTL");
 		return;
 	}
-	if (seenFiveMinute.value) {
-		delete cacheControl.ttl;
-	}
+	seenFiveMinute.value = true;
 }
 
-function normalizeCacheControlTtlOrdering(params: MessageCreateParamsStreaming): void {
+function validateCacheControls(params: AnthropicCacheParams): void {
 	const seenFiveMinute = { value: false };
-	if (params.tools) {
-		for (const tool of params.tools as Array<Anthropic.Messages.Tool & CacheControlBlock>) {
-			normalizeCacheControlBlockTtl(tool, seenFiveMinute);
+	let count = 0;
+	const validate = (control: unknown, path: string): void => {
+		if (control == null) return;
+		count++;
+		validateCacheControl(control, path, seenFiveMinute);
+	};
+	if (!Array.isArray(params.messages)) throw cacheControlError("messages", "must be an array");
+
+	validate(params.cache_control, "cache_control");
+	for (const [index, tool] of (params.tools ?? []).entries()) {
+		validate((tool as CacheControlBlock).cache_control, `tools[${index}].cache_control`);
+	}
+	if (Array.isArray(params.system)) {
+		for (const [index, block] of params.system.entries()) {
+			validate((block as CacheControlBlock).cache_control, `system[${index}].cache_control`);
 		}
 	}
-	if (params.system && Array.isArray(params.system)) {
-		for (const block of params.system as Array<AnthropicSystemBlock & CacheControlBlock>) {
-			normalizeCacheControlBlockTtl(block, seenFiveMinute);
-		}
-	}
-	for (const message of params.messages) {
+	for (const [messageIndex, message] of params.messages.entries()) {
 		if (!Array.isArray(message.content)) continue;
-		for (const block of message.content as Array<ContentBlockParam & CacheControlBlock>) {
-			normalizeCacheControlBlockTtl(block, seenFiveMinute);
+		for (const [blockIndex, block] of message.content.entries()) {
+			const control = (block as CacheControlBlock).cache_control;
+			if (control != null && !isCacheableContentBlock(block)) {
+				throw cacheControlError(
+					`messages[${messageIndex}].content[${blockIndex}].cache_control`,
+					"block is not cacheable",
+				);
+			}
+			validate(control, `messages[${messageIndex}].content[${blockIndex}].cache_control`);
 		}
 	}
+	if (count > 4) throw cacheControlError("cache_control", "at most four total breakpoints are allowed");
 }
 
-function findLastCacheControlIndex<T extends CacheControlBlock>(blocks: T[]): number {
+function applyCacheControlToLastCacheableBlock(
+	blocks: Array<ContentBlockParam & CacheControlBlock>,
+	cacheControl: AnthropicCacheControl,
+): boolean {
 	for (let index = blocks.length - 1; index >= 0; index--) {
-		if (blocks[index]?.cache_control != null) return index;
+		const block = blocks[index];
+		if (!isCacheableContentBlock(block)) continue;
+		blocks[index] = { ...block, cache_control: { ...cacheControl } };
+		return true;
 	}
-	return -1;
+	return false;
 }
 
-function stripCacheControlExceptIndex<T extends CacheControlBlock>(
-	blocks: T[],
-	preserveIndex: number,
-	excessCounter: { value: number },
+function isHumanUserMessage(message: MessageCreateParamsStreaming["messages"][number]): boolean {
+	if (message.role !== "user") return false;
+	if (typeof message.content === "string") return true;
+	return message.content.some(block => block.type !== "tool_result");
+}
+
+function applyExplicitPromptCaching(params: AnthropicCacheParams, cacheControl: AnthropicCacheControl): void {
+	if (countCacheControlBreakpoints(params) >= 4) return;
+
+	const currentUserIndex = params.messages.findLastIndex(isHumanUserMessage);
+	if (currentUserIndex < 0) return;
+	const currentUser = params.messages[currentUserIndex];
+	if (!currentUser) return;
+
+	// A tool result is encoded as role "user" on the wire, but belongs to the
+	// preceding assistant turn. Anchor that assistant turn, not the tool result,
+	// so changing tool output does not invalidate the reusable conversation prefix.
+	for (let index = currentUserIndex - 1; index >= 0; index--) {
+		const message = params.messages[index];
+		if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+		if (
+			applyCacheControlToLastCacheableBlock(
+				message.content as Array<ContentBlockParam & CacheControlBlock>,
+				cacheControl,
+			)
+		) {
+			break;
+		}
+	}
+
+	if (countCacheControlBreakpoints(params) >= 4) return;
+	if (typeof currentUser.content === "string" && currentUser.content.trim()) {
+		currentUser.content = [{ type: "text", text: currentUser.content, cache_control: { ...cacheControl } }];
+	} else if (Array.isArray(currentUser.content)) {
+		applyCacheControlToLastCacheableBlock(
+			currentUser.content as Array<ContentBlockParam & CacheControlBlock>,
+			cacheControl,
+		);
+	}
+}
+
+function applyPromptCaching(
+	params: AnthropicCacheParams,
+	cacheMode: AnthropicCacheMode,
+	cacheControl?: AnthropicCacheControl,
 ): void {
-	for (let index = 0; index < blocks.length && excessCounter.value > 0; index++) {
-		if (index === preserveIndex) continue;
-		if (!blocks[index]?.cache_control) continue;
-		delete blocks[index].cache_control;
-		excessCounter.value--;
+	if (!cacheControl || cacheMode === "none") return;
+	validateCacheControls(params);
+	if (cacheMode === "automatic") {
+		params.cache_control = { ...cacheControl };
+		return;
 	}
+	applyExplicitPromptCaching(params, cacheControl);
+	validateCacheControls(params);
 }
 
-function stripAllCacheControl<T extends CacheControlBlock>(blocks: T[], excessCounter: { value: number }): void {
-	for (const block of blocks) {
-		if (excessCounter.value <= 0) return;
-		if (!block.cache_control) continue;
-		delete block.cache_control;
-		excessCounter.value--;
-	}
+export function normalizeCacheControlTtlOrdering(params: MessageCreateParamsStreaming): void {
+	validateCacheControls(params as AnthropicCacheParams);
 }
 
-function stripMessageCacheControl(
-	messages: MessageCreateParamsStreaming["messages"],
-	excessCounter: { value: number },
-): void {
-	for (const message of messages) {
-		if (excessCounter.value <= 0) return;
-		if (!Array.isArray(message.content)) continue;
-		for (const block of message.content as Array<ContentBlockParam & CacheControlBlock>) {
-			if (excessCounter.value <= 0) return;
-			if (!block.cache_control) continue;
-			delete block.cache_control;
-			excessCounter.value--;
-		}
-	}
-}
-
-function countCacheControlBreakpoints(params: MessageCreateParamsStreaming): number {
-	let total = 0;
-	if (params.tools) {
-		for (const tool of params.tools as Array<Anthropic.Messages.Tool & CacheControlBlock>) {
-			if (tool.cache_control) total++;
-		}
-	}
-	if (params.system && Array.isArray(params.system)) {
-		for (const block of params.system as Array<AnthropicSystemBlock & CacheControlBlock>) {
-			if (block.cache_control) total++;
-		}
+function countCacheControlBreakpoints(params: AnthropicCacheParams): number {
+	let total = params.cache_control ? 1 : 0;
+	for (const tool of params.tools ?? []) if ((tool as CacheControlBlock).cache_control) total++;
+	if (Array.isArray(params.system)) {
+		for (const block of params.system) if ((block as CacheControlBlock).cache_control) total++;
 	}
 	for (const message of params.messages) {
 		if (!Array.isArray(message.content)) continue;
-		for (const block of message.content as Array<ContentBlockParam & CacheControlBlock>) {
-			if (block.cache_control) total++;
-		}
+		for (const block of message.content) if ((block as CacheControlBlock).cache_control) total++;
 	}
 	return total;
 }
 
 function enforceCacheControlLimit(params: MessageCreateParamsStreaming, maxBreakpoints: number): void {
-	const total = countCacheControlBreakpoints(params);
-	if (total <= maxBreakpoints) return;
-	const excessCounter = { value: total - maxBreakpoints };
-	const systemBlocks =
-		params.system && Array.isArray(params.system)
-			? (params.system as Array<AnthropicSystemBlock & CacheControlBlock>)
-			: [];
-	const toolBlocks = (params.tools ?? []) as Array<Anthropic.Messages.Tool & CacheControlBlock>;
-	const lastSystemIndex = findLastCacheControlIndex(systemBlocks);
-	const lastToolIndex = findLastCacheControlIndex(toolBlocks);
-	if (systemBlocks.length > 0) {
-		stripCacheControlExceptIndex(systemBlocks, lastSystemIndex, excessCounter);
-	}
-	if (excessCounter.value <= 0) return;
-	if (toolBlocks.length > 0) {
-		stripCacheControlExceptIndex(toolBlocks, lastToolIndex, excessCounter);
-	}
-	if (excessCounter.value <= 0) return;
-	stripMessageCacheControl(params.messages, excessCounter);
-	if (excessCounter.value <= 0) return;
-	if (systemBlocks.length > 0) {
-		stripAllCacheControl(systemBlocks, excessCounter);
-	}
-	if (excessCounter.value <= 0) return;
-	if (toolBlocks.length > 0) {
-		stripAllCacheControl(toolBlocks, excessCounter);
-	}
+	if (maxBreakpoints !== 4) throw new Error("Anthropic supports exactly four cache breakpoints");
+	validateCacheControls(params as AnthropicCacheParams);
 }
 function buildParams(
 	model: Model<"anthropic-messages">,
@@ -2102,12 +2313,13 @@ function buildParams(
 	isOAuthToken: boolean,
 	options?: AnthropicOptions,
 	disableStrictTools = false,
-	repairLatestAssistantThinking = false,
+	thinkingRepair?: { repairLatestAssistantThinking?: boolean; repairAllAssistantThinking?: boolean },
 ): MessageCreateParamsStreaming {
-	const { cacheControl } = getCacheControl(model, baseUrl, options?.cacheRetention);
+	const { mode: cacheMode, cacheControl } = getCacheControl(model, baseUrl, options?.cacheRetention);
+
 	const params: AnthropicSamplingParams = {
 		model: model.id,
-		messages: convertAnthropicMessages(context.messages, model, isOAuthToken, { repairLatestAssistantThinking }),
+		messages: convertAnthropicMessages(context.messages, model, isOAuthToken, thinkingRepair),
 		max_tokens: options?.maxTokens || (model.maxTokens / 3) | 0,
 		stream: true,
 	};
@@ -2145,7 +2357,11 @@ function buildParams(
 		params.tools = convertTools(
 			context.tools,
 			isOAuthToken,
-			disableStrictTools || model.provider === "github-copilot",
+			// The Claude Code OAuth surface mishandles `strict: true` tools:
+			// streamed tool_use blocks arrive with empty/undefined arguments and
+			// occasionally corrupted names (works with PI_NO_STRICT=1). Never
+			// request strict tool use on OAuth requests.
+			disableStrictTools || isOAuthToken || model.provider === "github-copilot",
 			getAnthropicCompat(model).supportsEagerToolInputStreaming,
 		);
 	}
@@ -2183,8 +2399,6 @@ function buildParams(
 					params.output_config = { effort } as typeof params.output_config;
 				}
 			}
-		} else if (options?.thinkingEnabled === false) {
-			params.thinking = { type: "disabled" };
 		}
 	}
 
@@ -2233,7 +2447,7 @@ function buildParams(
 	}
 	disableThinkingIfToolChoiceForced(params);
 	ensureMaxTokensForThinking(params, model);
-	applyPromptCaching(params, cacheControl);
+	applyPromptCaching(params as AnthropicCacheParams, cacheMode, cacheControl);
 	enforceCacheControlLimit(params, 4);
 	normalizeCacheControlTtlOrdering(params);
 
@@ -2296,7 +2510,7 @@ export function convertAnthropicMessages(
 	messages: Message[],
 	model: Model<"anthropic-messages">,
 	isOAuthToken: boolean,
-	options?: { repairLatestAssistantThinking?: boolean },
+	options?: { repairLatestAssistantThinking?: boolean; repairAllAssistantThinking?: boolean },
 ): MessageParam[] {
 	const params: MessageParam[] = [];
 
@@ -2394,7 +2608,7 @@ export function convertAnthropicMessages(
 						type: "tool_use",
 						id: block.id,
 						name: isOAuthToken ? applyClaudeToolPrefix(block.name) : block.name,
-						input: block.arguments ?? {},
+						input: sanitizeJsonStrings(block.arguments ?? {}),
 					});
 				}
 			}

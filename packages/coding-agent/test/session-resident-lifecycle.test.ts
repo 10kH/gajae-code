@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { exportSessionToHtml } from "@gajae-code/coding-agent/export/html";
 import { SessionManager, type SessionMessageEntry } from "@gajae-code/coding-agent/session/session-manager";
+import * as native from "@gajae-code/natives";
+import { getConfigRootDir } from "@gajae-code/utils";
 
 const tempDirs: string[] = [];
 afterEach(async () => {
@@ -13,9 +14,24 @@ afterEach(async () => {
 });
 
 function tempRoot(prefix = "gjc-resident-life-"): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	const parent = getConfigRootDir();
+	fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+	const dir = fs.mkdtempSync(path.join(parent, prefix));
 	tempDirs.push(dir);
 	return dir;
+}
+
+function failedNativeRename(): native.NativeNoReplaceResult {
+	return {
+		ok: false,
+		code: "io_error",
+		mutationState: "not_committed",
+		durabilityState: "not_attempted",
+		reason: "io_failure",
+		primitive: "unknown",
+		phase: "rename",
+		diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+	};
 }
 
 function assistant(text: string): AssistantMessage {
@@ -116,9 +132,20 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 
 		const deletion = await makeLargeSession(`delete cleanup ${"e".repeat(2048)}`);
 		expect(fs.existsSync(deletion.cacheDir)).toBe(true);
+		const foreignSessionFile = path.join(path.dirname(deletion.sessionFile), "foreign.jsonl");
+		const foreignArtifactsDir = foreignSessionFile.slice(0, -6);
+		fs.writeFileSync(foreignSessionFile, "foreign transcript");
+		fs.mkdirSync(foreignArtifactsDir);
+		fs.writeFileSync(path.join(foreignArtifactsDir, "foreign.txt"), "foreign artifact");
+		await deletion.sm.setSessionFile(sessionFile);
+		expect(fs.existsSync(deletion.cacheDir)).toBe(false);
 		await deletion.sm.dropSession(deletion.sessionFile);
 		expect(fs.existsSync(deletion.artifactsDir)).toBe(false);
 		expect(fs.existsSync(deletion.cacheDir)).toBe(false);
+		expect(fs.existsSync(deletion.sessionFile)).toBe(false);
+		expect(fs.existsSync(foreignSessionFile)).toBe(true);
+		expect(fs.existsSync(foreignArtifactsDir)).toBe(true);
+		expect(fs.existsSync(path.join(foreignArtifactsDir, "foreign.txt"))).toBe(true);
 		expect(fs.existsSync(sessionFile)).toBe(true);
 	});
 
@@ -181,17 +208,16 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 		await sm.close();
 	});
 
-	it("keeps live resident text readable when moveTo session-file rename fails", async () => {
-		const sentinel = `failed session rename ${"r".repeat(2048)}`;
+	it("keeps live resident text readable when moveTo session-file publication fails", async () => {
+		const sentinel = `failed session publication ${"r".repeat(2048)}`;
 		const { sm, root, sessionFile } = await makeLargeSession(sentinel);
 		const newRoot = tempRoot("gjc-resident-failed-move-");
-		const realRename = fs.promises.rename.bind(fs.promises);
-		vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
-			if (String(source) === sessionFile) throw new Error("simulated session rename failure");
-			return realRename(source, target);
-		});
+		const realRename = native.renameNoReplacePath;
+		vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, target) =>
+			String(source) === sessionFile ? failedNativeRename() : realRename(source, target),
+		);
 
-		await expect(sm.moveTo(newRoot)).rejects.toThrow("simulated session rename failure");
+		await expect(sm.moveTo(newRoot)).rejects.toThrow("Atomic session rename failed: io_error");
 		expect(sm.getCwd()).toBe(root);
 		expect(sm.getSessionFile()).toBe(sessionFile);
 		expect(fs.existsSync(sessionFile)).toBe(true);
@@ -202,18 +228,19 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 		await sm.close();
 	});
 
-	it("keeps live resident text readable when moveTo artifact rename fails after session rollback", async () => {
-		const sentinel = `failed artifact rename ${"a".repeat(2048)}`;
+	it("keeps live resident text readable when artifact publication fails after session rollback", async () => {
+		const sentinel = `failed artifact publication ${"a".repeat(2048)}`;
 		const { sm, root, sessionFile } = await makeLargeSession(sentinel);
 		const oldArtifactDir = sessionFile.slice(0, -6);
+		fs.mkdirSync(oldArtifactDir, { recursive: true });
+		fs.writeFileSync(path.join(oldArtifactDir, "fixture.txt"), "artifact");
 		const newRoot = tempRoot("gjc-resident-failed-artifact-move-");
-		const realRename = fs.promises.rename.bind(fs.promises);
-		vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
-			if (String(source) === oldArtifactDir) throw new Error("simulated artifact rename failure");
-			return realRename(source, target);
-		});
+		const realRename = native.renameNoReplacePath;
+		vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, target) =>
+			String(source) === oldArtifactDir ? failedNativeRename() : realRename(source, target),
+		);
 
-		await expect(sm.moveTo(newRoot)).rejects.toThrow("simulated artifact rename failure");
+		await expect(sm.moveTo(newRoot)).rejects.toThrow("Atomic session rename failed: io_error");
 		expect(sm.getCwd()).toBe(root);
 		expect(sm.getSessionFile()).toBe(sessionFile);
 		expect(fs.existsSync(sessionFile)).toBe(true);

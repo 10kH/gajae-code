@@ -1,19 +1,30 @@
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
-import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import {
 	answerHash,
+	applyDeepInterviewRoundResultV1,
+	assertDeepInterviewInputWithinLimit,
+	assertDeepInterviewIntentManifest,
+	assertDeepInterviewStructuredResponseWithinLimit,
+	createDeepInterviewIntentManifest,
 	type DeepInterviewEstablishedFact,
+	type DeepInterviewIntentItem,
+	type DeepInterviewIntentSubstitution,
 	type DeepInterviewRoundRecord,
+	type DeepInterviewRoundResultV1,
 	type DeepInterviewStateEnvelope,
 	type DeepInterviewTriggerMetadata,
+	deepInterviewAnswerIdentityEqual,
 	deriveRoundKey,
+	MAX_USER_RESPONSE_LENGTH,
 	normalizeDeepInterviewEnvelope,
 	questionHash,
+	reviewDeepInterviewIntent,
 } from "./deep-interview-state";
 import { writeSessionActivityMarker } from "./session-resolution";
-import { readExistingStateForMutation, writeGuardedWorkflowEnvelopeAtomic } from "./state-writer";
+import { readExistingStateForMutation, transformGuardedWorkflowEnvelopeAtomic } from "./state-writer";
 
+export * from "./deep-interview-ambiguity";
 export * from "./deep-interview-state";
 
 /**
@@ -42,6 +53,12 @@ export interface DeepInterviewAnswerInput {
 	ambiguity?: number;
 	selectedOptions?: string[];
 	customInput?: string;
+	intent_contract?: { items: DeepInterviewIntentItem[]; confirmation_options: string[] };
+	intent_review?: {
+		observed_items: DeepInterviewIntentItem[];
+		supporting_substitutions: DeepInterviewIntentSubstitution[];
+		approval_options: string[];
+	};
 }
 
 export interface DeepInterviewScoringInput {
@@ -52,6 +69,8 @@ export interface DeepInterviewScoringInput {
 	scores: Record<string, number>;
 	ambiguity: number;
 	triggers?: DeepInterviewTriggerMetadata[];
+	/** Complete native round result for typed callers. */
+	roundResult?: DeepInterviewRoundResultV1;
 }
 
 export type AppendOrMergeAction = "created" | "noop" | "replaced";
@@ -82,6 +101,21 @@ export interface TransitionValidationResult {
 // Pure helpers: records
 // =============================================================================
 
+/**
+ * `deepInterview.dimension` is agent-supplied free text on post-topology asks, but the persisted
+ * envelope only accepts canonical dimension ids. Fold obvious case/label variants down, and drop
+ * anything unrecognized rather than persisting a value the validator rejects.
+ */
+function canonicalDimension(value: string | undefined): string | undefined {
+	if (value === undefined) return undefined;
+	const normalized = value.trim().toLowerCase();
+	if (normalized === "topology") return "topology";
+	for (const dimension of ["goal", "constraints", "criteria", "context"]) {
+		if (normalized === dimension || normalized.startsWith(`${dimension} `)) return dimension;
+	}
+	return undefined;
+}
+
 export function buildAnswerShell(
 	input: DeepInterviewAnswerInput,
 	now: string = new Date().toISOString(),
@@ -97,7 +131,7 @@ export function buildAnswerShell(
 		selected_options: input.selectedOptions,
 		custom_input: input.customInput,
 		component: input.component,
-		dimension: input.dimension,
+		dimension: canonicalDimension(input.dimension),
 		ambiguity_at_ask: input.ambiguity,
 		lifecycle: "answered",
 		answered_at: now,
@@ -105,11 +139,9 @@ export function buildAnswerShell(
 }
 
 /**
- * Append-or-merge by `round_key`. Exactly one record per key:
- * - no existing record -> append (`created`);
- * - identical question_hash + answer_hash -> deterministic no-op (`noop`);
- * - same key, different hashes -> deterministic replacement of the prior shell
- *   (`replaced`); the prior answer for that key is superseded and lifecycle resets.
+ * Append-or-merge by `round_key`. An answer is a no-op only when its complete
+ * canonical shell identity matches; a scored record is immutable evidence and
+ * cannot be replaced by a late answer.
  */
 export function appendOrMergeRound(
 	rounds: readonly DeepInterviewRoundRecord[],
@@ -122,9 +154,10 @@ export function appendOrMergeRound(
 		return { rounds: next, action: "created", record: shell };
 	}
 	const existing = next[index];
-	if (existing.question_hash === shell.question_hash && existing.answer_hash === shell.answer_hash) {
+	if (deepInterviewAnswerIdentityEqual(existing, shell) && existing.answer_hash === shell.answer_hash) {
 		return { rounds: next, action: "noop", record: existing };
 	}
+	if (existing.lifecycle === "scored") throw new Error("DI_ANSWER_LIFECYCLE_CONFLICT");
 	next[index] = shell;
 	return { rounds: next, action: "replaced", record: shell };
 }
@@ -204,10 +237,10 @@ export function validateDeepInterviewScoredTransition(
 				`active trigger ${trigger.kind} did not raise ambiguity (${prior.ambiguity} -> ${next.ambiguity})`,
 			);
 		}
-		// Affected dimension must not improve. Prefer record scores, fall back to the trigger's
-		// own prior/new dimension scores; absent metrics cannot prove non-improvement.
-		const priorDim = prior.scores?.[trigger.dimension] ?? trigger.priorDimensionScore;
-		const nextDim = next.scores?.[trigger.dimension] ?? trigger.newDimensionScore;
+		// The runtime derives both dimension values from scored records; callers cannot
+		// provide parallel trigger metrics.
+		const priorDim = prior.scores?.[trigger.dimension];
+		const nextDim = next.scores?.[trigger.dimension];
 		if (typeof priorDim !== "number" || typeof nextDim !== "number") {
 			violations.push(
 				`active trigger ${trigger.kind} is missing dimension "${trigger.dimension}" scores to prove non-improvement`,
@@ -284,19 +317,16 @@ export function projectCompactState(value: unknown, options: { lastN?: number } 
 // Persistence wrappers (state-writer backed; runtime-owned)
 // =============================================================================
 
+interface RecorderMutationOptions {
+	sessionId?: string;
+	expectedRevision?: number;
+}
+
 async function readEnvelope(statePath: string): Promise<DeepInterviewStateEnvelope> {
 	const read = await readExistingStateForMutation(statePath);
 	if (read.kind === "valid") return ensureDeepInterviewStateShape(read.value);
-	if (read.kind === "corrupt") {
-		// Fail closed: never silently overwrite a corrupt/tampered state file. Callers
-		// (e.g. the ask tool) catch this and warn without mutating, preserving the file
-		// for recovery. Only a genuinely absent file is defaulted below.
-		throw new Error(
-			`deep-interview state at ${statePath} is corrupt or tampered (${read.error}); refusing to overwrite`,
-		);
-	}
-	// Absent: start from a defaulted shape.
-	return ensureDeepInterviewStateShape(undefined);
+	if (read.kind === "absent") throw new Error("DI_STATE_ABSENT");
+	throw new Error(`deep-interview state at ${statePath} is corrupt or tampered (${read.error})`);
 }
 
 function existingStateRevision(value: unknown): number | undefined {
@@ -309,49 +339,16 @@ function interviewIdOf(envelope: DeepInterviewStateEnvelope): string | undefined
 	const inner = (envelope.state ?? {}) as Record<string, unknown>;
 	return typeof inner.interview_id === "string" ? inner.interview_id : undefined;
 }
-
-async function persistEnvelope(
-	cwd: string,
-	statePath: string,
-	envelope: DeepInterviewStateEnvelope,
-	sessionId: string | undefined,
-	command: string,
-): Promise<void> {
-	if (!sessionId) throw new Error("deep-interview recorder requires a session id");
-	const now = new Date().toISOString();
-	const payload: Record<string, unknown> = { ...normalizeDeepInterviewEnvelope(envelope), updated_at: now };
-	// Guarantee RequiredOnWriteEnvelopeSchema fields for the fresh/absent fallback;
-	// existing real state already carries these and is preserved by the spread above.
-	payload.skill ??= "deep-interview";
-	payload.version ??= WORKFLOW_STATE_VERSION;
-	payload.active ??= true;
-	payload.current_phase ??= "interviewing";
-	const expectedRevision = existingStateRevision(envelope);
-	const writeResult = await writeGuardedWorkflowEnvelopeAtomic(statePath, payload, {
-		cwd,
-		policy: "source",
-		expectedRevision,
-		receipt: { cwd, skill: "deep-interview", owner: "gjc-runtime", command, sessionId, nowIso: now },
-		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "deep-interview", sessionId },
-	});
-	// Reflect the freshly written revision back onto the in-memory envelope so a
-	// follow-up HUD sync derives its `sourceRevision` from the persisted revision
-	// (not the stale pre-write value), otherwise the active-state writer treats the
-	// newer HUD as stale and skips it (e.g. dropping the ambiguity chip after scoring).
-	if (writeResult.written && typeof expectedRevision === "number") {
-		(envelope as Record<string, unknown>).state_revision = expectedRevision + 1;
-	}
-	await writeSessionActivityMarker(cwd, sessionId, { writer: "deep-interview-recorder", path: statePath });
+interface RecorderHudSyncSlot {
+	latestCommittedRevision: number;
+	tail: Promise<void>;
 }
 
-/**
- * Best-effort active-state/HUD cache refresh for the deep-interview rail, derived
- * from the complete normalized mode-state envelope. HUD is a cache; a failure here
- * must never change durable record semantics.
- */
+const recorderHudSyncSlots = new Map<string, RecorderHudSyncSlot>();
+
 async function syncRecorderHud(
 	cwd: string,
-	envelope: DeepInterviewStateEnvelope,
+	envelope: Record<string, unknown>,
 	sessionId: string | undefined,
 ): Promise<void> {
 	const phase = typeof envelope.current_phase === "string" ? envelope.current_phase : "interviewing";
@@ -362,26 +359,65 @@ async function syncRecorderHud(
 		phase,
 		sessionId,
 		source: "gjc-runtime-deep-interview-recorder",
-		hud: deriveDeepInterviewHud(normalizeDeepInterviewEnvelope(envelope) as Record<string, unknown>, { phase }),
-		sourceRevision: (existingStateRevision(envelope) ?? 0) + 1,
+		hud: deriveDeepInterviewHud(envelope, { phase }),
+		...(typeof envelope.state_revision === "number" ? { committedModeRevision: envelope.state_revision } : {}),
 	});
 }
 
-/**
- * Repair the cached HUD after a no-op append. A no-op writes no mode-state, so the
- * HUD is derived from a fresh read of the current persisted state (never from the
- * pre-noop in-memory envelope) to avoid overwriting newer active-state with stale values.
- */
-async function repairRecorderHudFromPersisted(
+async function syncRecorderHudAtCommittedRevision(
 	cwd: string,
-	statePath: string,
-	sessionId: string | undefined,
+	envelope: Record<string, unknown>,
+	sessionId: string,
+	revision: number,
 ): Promise<void> {
+	const key = `${cwd}\0${sessionId}`;
+	const slot = recorderHudSyncSlots.get(key) ?? { latestCommittedRevision: -1, tail: Promise.resolve() };
+	recorderHudSyncSlots.set(key, slot);
+	const sync = slot.tail
+		.catch(() => undefined)
+		.then(async () => {
+			if (revision <= slot.latestCommittedRevision) return;
+			await syncRecorderHud(cwd, { ...envelope, state_revision: revision }, sessionId);
+			slot.latestCommittedRevision = revision;
+		});
+	slot.tail = sync;
+	await sync;
+}
+export interface DeepInterviewPostCommitWarning {
+	code: "DI_POST_COMMIT_AUDIT_FAILED" | "DI_POST_COMMIT_ACTIVITY_FAILED" | "DI_POST_COMMIT_HUD_FAILED";
+	message: string;
+}
+
+export async function runDeepInterviewPostCommitEffects(options: {
+	cwd: string;
+	statePath: string;
+	sessionId: string;
+	envelope: Record<string, unknown>;
+	revision: number;
+	writer: string;
+	auditWarnings?: readonly { code: "DI_POST_COMMIT_AUDIT_FAILED"; message: string }[];
+}): Promise<DeepInterviewPostCommitWarning[]> {
+	const warnings: DeepInterviewPostCommitWarning[] = [...(options.auditWarnings ?? [])];
 	try {
-		await syncDeepInterviewRecorderHud(cwd, statePath, sessionId);
-	} catch {
-		// HUD sync is best-effort cache maintenance and must not change record semantics.
+		await writeSessionActivityMarker(options.cwd, options.sessionId, {
+			writer: options.writer,
+			path: options.statePath,
+		});
+	} catch (error) {
+		warnings.push({
+			code: "DI_POST_COMMIT_ACTIVITY_FAILED",
+			message: error instanceof Error ? error.message : String(error),
+		});
 	}
+	try {
+		await syncRecorderHudAtCommittedRevision(options.cwd, options.envelope, options.sessionId, options.revision);
+	} catch (error) {
+		warnings.push({
+			code: "DI_POST_COMMIT_HUD_FAILED",
+			message: error instanceof Error ? error.message : String(error),
+		});
+	}
+	return warnings;
 }
 
 /** Refresh the best-effort HUD cache from persisted deep-interview state. */
@@ -392,33 +428,129 @@ export async function syncDeepInterviewRecorderHud(
 ): Promise<void> {
 	const read = await readExistingStateForMutation(statePath);
 	if (read.kind !== "valid") return;
-	await syncRecorderHud(cwd, normalizeDeepInterviewEnvelope(read.value), sessionId);
+	const envelope = normalizeDeepInterviewEnvelope(read.value);
+	const revision = existingStateRevision(read.value);
+	if (revision === undefined || !sessionId) return;
+	await syncRecorderHudAtCommittedRevision(cwd, envelope, sessionId, revision);
 }
 
-/** Record an `answered` shell for one round (append-or-merge by durable key). */
+/**
+ * Record an `answered` shell for one round (append-or-merge by durable key).
+ *
+ * Replacing an already-scored answer is rejected with
+ * `DI_ANSWER_LIFECYCLE_CONFLICT`; scored evidence is immutable.
+ */
 export async function appendOrMergeDeepInterviewRound(
 	cwd: string,
 	statePath: string,
 	input: DeepInterviewAnswerInput,
-	options: { sessionId?: string } = {},
-): Promise<{ action: AppendOrMergeAction; record: DeepInterviewRoundRecord }> {
-	const envelope = await readEnvelope(statePath);
-	const interviewId = input.interviewId ?? interviewIdOf(envelope);
-	const shell = buildAnswerShell({ ...input, interviewId });
-	const rounds = readRounds(envelope);
-	const result = appendOrMergeRound(rounds, shell);
-	if (result.action === "noop") {
-		await repairRecorderHudFromPersisted(cwd, statePath, options.sessionId);
-		return { action: result.action, record: result.record };
-	}
-	(envelope.state as Record<string, unknown>).rounds = result.rounds;
-	await persistEnvelope(cwd, statePath, envelope, options.sessionId, "gjc deep-interview record-answer");
-	try {
-		await syncRecorderHud(cwd, envelope, options.sessionId);
-	} catch {
-		// HUD sync is best-effort cache maintenance and must not change record semantics.
-	}
-	return { action: result.action, record: result.record };
+	options: RecorderMutationOptions = {},
+): Promise<{
+	action: AppendOrMergeAction;
+	record: DeepInterviewRoundRecord;
+	warnings: DeepInterviewPostCommitWarning[];
+}> {
+	assertDeepInterviewStructuredResponseWithinLimit(input);
+	if (input.customInput !== undefined)
+		assertDeepInterviewInputWithinLimit(input.customInput, MAX_USER_RESPONSE_LENGTH, "user_response");
+	if (!options.sessionId) throw new Error("deep-interview recorder requires a session id");
+	const initial = await readEnvelope(statePath);
+	let result: AppendOrMergeResult | undefined;
+	const now = new Date().toISOString();
+	const committed = await transformGuardedWorkflowEnvelopeAtomic(statePath, {
+		cwd,
+		expectedRevision: options.expectedRevision ?? existingStateRevision(initial) ?? 0,
+		receipt: {
+			cwd,
+			skill: "deep-interview",
+			owner: "gjc-runtime",
+			command: "gjc deep-interview record-answer",
+			sessionId: options.sessionId,
+			nowIso: now,
+		},
+		audit: {
+			category: "state",
+			verb: "write",
+			owner: "gjc-runtime",
+			skill: "deep-interview",
+			sessionId: options.sessionId,
+		},
+		transform: current => {
+			const envelope = ensureDeepInterviewStateShape(current);
+			const shell = buildAnswerShell(
+				{
+					...input,
+					interviewId: input.interviewId ?? interviewIdOf(envelope),
+					customInput: input.intent_contract || input.intent_review ? undefined : input.customInput,
+				},
+				now,
+			);
+			result = appendOrMergeRound(readRounds(envelope), shell);
+			const state = envelope.state as Record<string, unknown>;
+			let intentStateChanged = false;
+			if (input.intent_contract) {
+				if (input.round !== 0 || input.component !== "review-topology" || input.dimension !== "topology")
+					throw new Error("intent contract requires Round 0 topology metadata");
+				const confirmed =
+					input.selectedOptions?.length === 1 &&
+					input.intent_contract.confirmation_options.includes(input.selectedOptions[0]);
+				if (confirmed) {
+					const contract = createDeepInterviewIntentManifest(input.intent_contract.items, {
+						round: 0,
+						answer_hash: shell.answer_hash,
+					});
+					const existingContract = state.intent_contract;
+					if (existingContract !== undefined) {
+						assertDeepInterviewIntentManifest(existingContract);
+						if (
+							existingContract.digest !== contract.digest ||
+							existingContract.confirmation_answer_hash !== contract.confirmation_answer_hash
+						)
+							throw new Error("locked intent contract cannot be replaced");
+					} else {
+						state.intent_contract = contract;
+						intentStateChanged = true;
+					}
+				}
+			}
+			if (input.intent_review) {
+				if (input.round <= 0) throw new Error("intent review requires a post-Round-0 answer");
+				const locked = state.intent_contract;
+				assertDeepInterviewIntentManifest(locked);
+				const approved =
+					input.selectedOptions?.length === 1 &&
+					input.intent_review.approval_options.includes(input.selectedOptions[0]);
+				state.intent_review = reviewDeepInterviewIntent(locked, input.intent_review.observed_items, {
+					status: approved ? "approved" : "pending",
+					supporting_substitutions: input.intent_review.supporting_substitutions,
+					...(approved
+						? {
+								approval_round: input.round,
+								answer_hash: shell.answer_hash,
+								user_answer_evidence: `answer_hash:${shell.answer_hash}`,
+							}
+						: {}),
+				});
+				intentStateChanged = true;
+			}
+			if (result.action === "noop" && !intentStateChanged) return { kind: "noop" as const };
+			state.rounds = result.rounds;
+			return { kind: "write" as const, value: { ...envelope, updated_at: now } as Record<string, unknown> };
+		},
+	});
+	if (!result) throw new Error("DI_STATE_SCHEMA_INVALID");
+	const warnings = committed.written
+		? await runDeepInterviewPostCommitEffects({
+				cwd,
+				statePath,
+				sessionId: options.sessionId,
+				envelope: committed.stamped,
+				revision: committed.revision,
+				writer: "deep-interview-recorder",
+				auditWarnings: committed.warnings,
+			})
+		: [];
+	return { action: result.action, record: result.record, warnings };
 }
 
 /**
@@ -432,21 +564,58 @@ export async function appendOrMergeDeepInterviewRound(
  * not finite, that comparison is treated as non-matching, so no prior is selected
  * rather than risking a spurious comparison against an unrelated round.
  */
-function latestPriorScoredRound(
-	rounds: readonly DeepInterviewRoundRecord[],
-	currentKey: string,
-	currentRound: number,
-): DeepInterviewRoundRecord | undefined {
-	if (!Number.isFinite(currentRound)) return undefined;
-	let prior: DeepInterviewRoundRecord | undefined;
-	for (const candidate of rounds) {
-		if (candidate.lifecycle !== "scored") continue;
-		if (candidate.round_key === currentKey) continue;
-		if (!Number.isFinite(candidate.round)) continue;
-		if (!(candidate.round < currentRound)) continue;
-		if (prior === undefined || candidate.round > prior.round) prior = candidate;
+function legacyScoringRoundResult(
+	envelope: DeepInterviewStateEnvelope,
+	input: DeepInterviewScoringInput,
+): DeepInterviewRoundResultV1 {
+	if (input.roundResult) return input.roundResult;
+	const state = envelope.state as Record<string, unknown>;
+	const type = state.type;
+	const dimensions =
+		type === "brownfield"
+			? ["goal", "constraints", "criteria", "context"]
+			: type === "greenfield"
+				? ["goal", "constraints", "criteria"]
+				: undefined;
+	if (
+		!dimensions?.every(
+			dimension => typeof input.scores[dimension] === "number" && Number.isFinite(input.scores[dimension]),
+		)
+	) {
+		throw new Error(
+			"DI_LEGACY_SCORING_INPUT_INSUFFICIENT: provide roundResult with complete global and component scores",
+		);
 	}
-	return prior;
+	const topology = state.topology;
+	const hasActiveComponents =
+		!!topology &&
+		typeof topology === "object" &&
+		!Array.isArray(topology) &&
+		(() => {
+			const topologyRecord = topology as Record<string, unknown>;
+			if (!Array.isArray(topologyRecord.components)) return false;
+			const components = topologyRecord.components as unknown[];
+			return components.some(
+				(component: unknown) =>
+					component &&
+					typeof component === "object" &&
+					!Array.isArray(component) &&
+					(component as Record<string, unknown>).active !== false &&
+					(component as Record<string, unknown>).status !== "deferred",
+			);
+		})();
+	if (hasActiveComponents) {
+		throw new Error(
+			"DI_LEGACY_SCORING_INPUT_INSUFFICIENT: provide roundResult with complete global and component scores",
+		);
+	}
+	return {
+		global_scores: Object.fromEntries(
+			dimensions.map(dimension => [dimension, input.scores[dimension]]),
+		) as DeepInterviewRoundResultV1["global_scores"],
+		component_scores: {},
+		...(input.triggers === undefined ? {} : { triggers: input.triggers }),
+	};
 }
 
 /** Merge scoring output into the same round record, transitioning to `scored`. */
@@ -454,29 +623,64 @@ export async function enrichDeepInterviewRoundScoring(
 	cwd: string,
 	statePath: string,
 	input: DeepInterviewScoringInput,
-	options: { sessionId?: string } = {},
-): Promise<{ record: DeepInterviewRoundRecord }> {
-	const envelope = await readEnvelope(statePath);
-	const interviewId = input.interviewId ?? interviewIdOf(envelope);
-	const rounds = readRounds(envelope);
-	const { rounds: nextRounds, record } = enrichRoundWithScoring(rounds, { ...input, interviewId });
-	// Fail closed: a scored transition that violates the bidirectional invariant
-	// (an active trigger that improves the affected dimension or fails to raise
-	// overall ambiguity, or a disputed/unresolved trigger lacking a rationale) must
-	// never be persisted — storing it lets the interview falsely converge. Validate
-	// against the most recent prior scored round before writing any durable state.
-	const prior = latestPriorScoredRound(rounds, record.round_key, record.round);
-	const validation = validateDeepInterviewScoredTransition(prior, record);
-	if (!validation.ok) {
-		throw new Error(
-			`deep-interview scored transition for round ${record.round} is invalid and was refused: ${validation.violations.join("; ")}`,
-		);
-	}
-	(envelope.state as Record<string, unknown>).rounds = nextRounds;
-	(envelope.state as Record<string, unknown>).current_ambiguity = input.ambiguity;
-	await persistEnvelope(cwd, statePath, envelope, options.sessionId, "gjc deep-interview score-round");
-	await syncRecorderHud(cwd, envelope, options.sessionId);
-	return { record };
+	options: RecorderMutationOptions = {},
+): Promise<{ record: DeepInterviewRoundRecord; warnings: DeepInterviewPostCommitWarning[] }> {
+	assertDeepInterviewStructuredResponseWithinLimit(input);
+	if (!options.sessionId) throw new Error("deep-interview recorder requires a session id");
+	const initial = await readEnvelope(statePath);
+	const now = new Date().toISOString();
+	let record: DeepInterviewRoundRecord | undefined;
+	const committed = await transformGuardedWorkflowEnvelopeAtomic(statePath, {
+		cwd,
+		expectedRevision: options.expectedRevision ?? existingStateRevision(initial) ?? 0,
+		receipt: {
+			cwd,
+			skill: "deep-interview",
+			owner: "gjc-runtime",
+			command: "gjc deep-interview score-round",
+			sessionId: options.sessionId,
+			nowIso: now,
+		},
+		audit: {
+			category: "state",
+			verb: "write",
+			owner: "gjc-runtime",
+			skill: "deep-interview",
+			sessionId: options.sessionId,
+		},
+		transform: current => {
+			const envelope = ensureDeepInterviewStateShape(current);
+			const interviewId = input.interviewId ?? interviewIdOf(envelope);
+			const roundKey = deriveRoundKey(interviewId, input);
+			const outcome = applyDeepInterviewRoundResultV1(
+				envelope,
+				roundKey,
+				legacyScoringRoundResult(envelope, input),
+				now,
+			);
+			const next = ensureDeepInterviewStateShape(outcome.envelope);
+			record = readRounds(next).find(round => round.round_key === roundKey);
+			if (!record) throw new Error("DI_STATE_SCHEMA_INVALID");
+			if (outcome.kind === "noop") return { kind: "noop" as const };
+			return {
+				kind: "write" as const,
+				value: { ...next, schema_version: 1, updated_at: now } as Record<string, unknown>,
+			};
+		},
+	});
+	if (!record) throw new Error("DI_STATE_SCHEMA_INVALID");
+	const warnings = committed.written
+		? await runDeepInterviewPostCommitEffects({
+				cwd,
+				statePath,
+				sessionId: options.sessionId,
+				envelope: committed.stamped,
+				revision: committed.revision,
+				writer: "deep-interview-recorder",
+				auditWarnings: committed.warnings,
+			})
+		: [];
+	return { record, warnings };
 }
 
 /** Compact projection so callers read a slice instead of the full transcript. */

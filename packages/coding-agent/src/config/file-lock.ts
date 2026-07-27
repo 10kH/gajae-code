@@ -1,4 +1,6 @@
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { isEnoent } from "@gajae-code/utils/fs-error";
 
 export interface FileLockOptions {
@@ -13,8 +15,86 @@ const DEFAULT_OPTIONS: Required<FileLockOptions> = {
 	retryDelayMs: 100,
 };
 
-interface LockInfo {
+type LockInfo = FileLockOwnerToken;
+
+/**
+ * Returns the OS-provided process start timestamp for PID-reuse detection.
+ * `ps` is available on the supported Unix hosts (macOS and Linux), unlike
+ * Linux's `/proc/<pid>/stat` pseudo-file.
+ */
+export function processStartTime(pid: number): string | null {
+	try {
+		const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
+		if (result.exitCode !== 0) return null;
+		const startTime = new TextDecoder().decode(result.stdout).trim();
+		return startTime || null;
+	} catch {
+		return null;
+	}
+}
+
+let ownProcessStartTime: string | undefined;
+
+function currentProcessStartTime(): string {
+	if (ownProcessStartTime === undefined) ownProcessStartTime = processStartTime(process.pid) ?? "unknown";
+	return ownProcessStartTime;
+}
+
+function cachedProcessStartTime(owner: FileLockOwnerToken, cache?: Map<string, string | null>): string | null {
+	if (!cache) return processStartTime(owner.pid);
+	const key = `${owner.pid}:${owner.start_time ?? ""}`;
+	const cached = cache.get(key);
+	if (cached !== undefined || cache.has(key)) return cached ?? null;
+	const startTime = processStartTime(owner.pid);
+	cache.set(key, startTime);
+	return startTime;
+}
+
+function ownerIsAlive(owner: FileLockOwnerToken, startTimeCache?: Map<string, string | null>): boolean {
+	if (ownerLiveness(owner.pid) !== "alive") return false;
+	if (!owner.start_time) return true;
+	const currentStartTime = cachedProcessStartTime(owner, startTimeCache);
+	return currentStartTime === null || currentStartTime === owner.start_time;
+}
+
+function writeLockInfo(lockPath: string): Promise<LockInfo> {
+	const info: LockInfo = { pid: process.pid, start_time: currentProcessStartTime(), timestamp: Date.now() };
+	return Bun.write(`${lockPath}/info`, JSON.stringify(info)).then(() => info);
+}
+
+async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(await fs.readFile(`${lockPath}/info`, "utf-8"));
+	} catch (error) {
+		if (isEnoent(error) || error instanceof SyntaxError) return null;
+		throw error;
+	}
+
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+	const { pid, start_time, timestamp } = parsed as Partial<LockInfo>;
+	if (
+		typeof pid !== "number" ||
+		!Number.isInteger(pid) ||
+		pid <= 0 ||
+		typeof timestamp !== "number" ||
+		!Number.isFinite(timestamp) ||
+		(start_time !== undefined && (typeof start_time !== "string" || !start_time))
+	)
+		return null;
+	return { pid, start_time, timestamp };
+}
+
+/** @internal */
+export async function readFileLockInfoForGc(lockDir: string): Promise<FileLockOwnerToken | null> {
+	return await readLockInfo(lockDir);
+}
+
+/** Owner identity stamped into a `<file>.lock/info` record. */
+export interface FileLockOwnerToken {
 	pid: number;
+	start_time?: string;
+
 	timestamp: number;
 }
 
@@ -22,46 +102,30 @@ function getLockPath(filePath: string): string {
 	return `${filePath}.lock`;
 }
 
-async function writeLockInfo(lockPath: string): Promise<void> {
-	const info: LockInfo = { pid: process.pid, timestamp: Date.now() };
-	await Bun.write(`${lockPath}/info`, JSON.stringify(info));
-}
-
-async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
-	try {
-		const content = await fs.readFile(`${lockPath}/info`, "utf-8");
-		return JSON.parse(content) as LockInfo;
-	} catch {
-		return null;
-	}
-}
-
-/** @internal */
-export async function readFileLockInfoForGc(lockDir: string): Promise<{ pid: number; timestamp: number } | null> {
-	const info = await readLockInfo(lockDir);
-	if (!info) return null;
-	if (!Number.isFinite(info.pid) || info.pid <= 0) return null;
-	if (!Number.isFinite(info.timestamp)) return null;
-	return info;
-}
-
-/** Owner identity stamped into a `<file>.lock/info` record. */
-export interface FileLockOwnerToken {
-	pid: number;
-	timestamp: number;
-}
-
-/** Outcome of a guarded GC removal attempt (`removeFileLockDirForGc`). */
+/** Outcome of a guarded lock-dir removal attempt (`removeFileLockDirForGc`). */
 export type FileLockGcRemoval = "removed" | "owner_changed" | "missing";
+
+interface LockDirStatToken {
+	dev: number;
+	ino: number;
+	mtimeMs: number;
+	ctimeMs: number;
+}
+
+type LockStaleSnapshot =
+	| { stale: false }
+	| { stale: true; owner: FileLockOwnerToken }
+	| { stale: true; owner: null; stat: LockDirStatToken };
 
 /**
  * @internal
- * Fail-closed removal of a dead lock dir for GC. Re-reads the on-disk owner
- * token as close to the unlink as possible and only deletes the dir when it
- * STILL holds the exact `{pid, timestamp}` identity the caller observed dead.
+ * Fail-closed removal of a lock dir whose owner is expected to be dead or
+ * finished. Re-reads the on-disk owner token as close to the unlink as possible
+ * and only deletes the dir when it STILL holds the exact `{pid, timestamp}`
+ * identity the caller observed.
  *
- * Closes the prune-time TOCTOU window (#606): between GC's dead re-read/probe
- * and the unlink, a live process can reclaim a stale lock at the same path
+ * Closes stale-cleanup TOCTOU windows (#606): between a dead/stale re-read and
+ * the unlink, a live process can reclaim a stale lock at the same path
  * (`acquireLock` rms the stale dir, then re-`mkdir`s and rewrites `info` with a
  * fresh pid+timestamp). Deleting by path alone would reap that LIVE lock. Any
  * mismatch (`owner_changed`) or absent/unreadable info (`missing` — e.g. a
@@ -76,7 +140,11 @@ export async function removeFileLockDirForGc(
 ): Promise<FileLockGcRemoval> {
 	const current = await readLockInfo(lockDir);
 	if (!current) return "missing";
-	if (current.pid !== expected.pid || current.timestamp !== expected.timestamp) {
+	if (
+		current.pid !== expected.pid ||
+		(expected.start_time !== undefined && current.start_time !== expected.start_time) ||
+		current.timestamp !== expected.timestamp
+	) {
 		return "owner_changed";
 	}
 	await fs.rm(lockDir, { recursive: true, force: true });
@@ -99,14 +167,32 @@ function ownerLiveness(pid: number): OwnerLiveness {
 	}
 }
 
-async function isLockStale(lockPath: string, staleMs: number): Promise<boolean> {
+function statToken(stats: Stats): LockDirStatToken {
+	return {
+		dev: stats.dev,
+		ino: stats.ino,
+		mtimeMs: stats.mtimeMs,
+		ctimeMs: stats.ctimeMs,
+	};
+}
+
+function sameStatToken(a: LockDirStatToken, b: LockDirStatToken): boolean {
+	return a.dev === b.dev && a.ino === b.ino && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
+}
+
+async function staleLockSnapshot(
+	lockPath: string,
+	staleMs: number,
+	startTimeCache?: Map<string, string | null>,
+): Promise<LockStaleSnapshot> {
 	const info = await readLockInfo(lockPath);
 	if (!info) {
 		try {
 			const stats = await fs.stat(lockPath);
-			return Date.now() - stats.mtimeMs > staleMs;
+			if (Date.now() - stats.mtimeMs <= staleMs) return { stale: false };
+			return { stale: true, owner: null, stat: statToken(stats) };
 		} catch (err) {
-			if (isEnoent(err)) return false;
+			if (isEnoent(err)) return { stale: false };
 			throw err;
 		}
 	}
@@ -114,36 +200,25 @@ async function isLockStale(lockPath: string, staleMs: number): Promise<boolean> 
 	// Never reap a live owner by elapsed time: a long legitimate critical section must
 	// not have its lock stolen (#652). Reclaim a dead owner immediately. Only when owner
 	// liveness is indeterminate do we fall back to the staleMs elapsed-time heuristic.
-	const liveness = ownerLiveness(info.pid);
-	if (liveness === "dead") return true;
-	if (liveness === "alive") return false;
-	return Date.now() - info.timestamp > staleMs;
-}
-
-async function tryAcquireLock(lockPath: string): Promise<boolean> {
-	try {
-		await fs.mkdir(lockPath);
-		await writeLockInfo(lockPath);
-		return true;
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-			return false;
-		}
-		throw error;
+	if (ownerIsAlive(info, startTimeCache)) return { stale: false };
+	if (ownerLiveness(info.pid) === "dead" || Date.now() - info.timestamp > staleMs) {
+		return { stale: true, owner: info };
 	}
+	return { stale: false };
 }
 
-async function releaseLock(lockPath: string): Promise<void> {
-	try {
-		await fs.rm(lockPath, { recursive: true });
-	} catch {
-		// Ignore errors on release
+async function removeStaleLockForAcquire(lockPath: string, snapshot: LockStaleSnapshot): Promise<boolean> {
+	if (!snapshot.stale) return false;
+	if (snapshot.owner) {
+		return (await removeFileLockDirForGc(lockPath, snapshot.owner)) === "removed";
 	}
-}
 
-async function lockExists(lockPath: string): Promise<boolean> {
+	const currentInfo = await readLockInfo(lockPath);
+	if (currentInfo) return false;
 	try {
-		await fs.stat(lockPath);
+		const currentStats = await fs.stat(lockPath);
+		if (!sameStatToken(statToken(currentStats), snapshot.stat)) return false;
+		await fs.rm(lockPath, { recursive: true, force: true });
 		return true;
 	} catch (err) {
 		if (isEnoent(err)) return false;
@@ -151,35 +226,61 @@ async function lockExists(lockPath: string): Promise<boolean> {
 	}
 }
 
+async function tryAcquireLock(lockPath: string): Promise<LockInfo | null> {
+	await fs.mkdir(path.dirname(lockPath), { recursive: true });
+	try {
+		await fs.mkdir(lockPath);
+		return await writeLockInfo(lockPath);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+			return null;
+		}
+		throw error;
+	}
+}
+
+async function releaseLock(lockPath: string, owner: FileLockOwnerToken): Promise<void> {
+	const outcome = await removeFileLockDirForGc(lockPath, owner);
+	if (outcome !== "removed") throw new Error(`Failed to release file lock: ${outcome}.`);
+}
 async function acquireLock(filePath: string, options: FileLockOptions = {}): Promise<() => Promise<void>> {
 	const opts = { ...DEFAULT_OPTIONS, ...options };
 	const lockPath = getLockPath(filePath);
-
+	const contentionStartTimes = new Map<string, string | null>();
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
-		if (await tryAcquireLock(lockPath)) {
-			return () => releaseLock(lockPath);
-		}
+		const owner = await tryAcquireLock(lockPath);
+		if (owner) return () => releaseLock(lockPath, owner);
 
-		if ((await lockExists(lockPath)) && (await isLockStale(lockPath, opts.staleMs))) {
-			await releaseLock(lockPath);
-			continue;
-		}
-
+		const stale = await staleLockSnapshot(lockPath, opts.staleMs, contentionStartTimes);
+		if (await removeStaleLockForAcquire(lockPath, stale)) continue;
 		await Bun.sleep(opts.retryDelayMs);
 	}
-
 	throw new Error(`Failed to acquire lock for ${filePath} after ${opts.retries} attempts`);
 }
 
+/**
+ * Serializes all contenders, including callers in the same process. Because this
+ * API exposes no ownership token, recursive acquisition is indistinguishable
+ * from independent async contention; code that already holds the lock must pass
+ * that fact through its own `lockHeld` path instead of acquiring it again.
+ */
 export async function withFileLock<T>(
 	filePath: string,
 	fn: () => Promise<T>,
 	options: FileLockOptions = {},
 ): Promise<T> {
 	const release = await acquireLock(filePath, options);
+	let result: T;
 	try {
-		return await fn();
-	} finally {
-		await release();
+		result = await fn();
+	} catch (operationError) {
+		try {
+			await release();
+		} catch (releaseError) {
+			throw new AggregateError([operationError, releaseError], "File lock operation and release both failed.");
+		}
+		throw operationError;
 	}
+	await release();
+	return result;
 }

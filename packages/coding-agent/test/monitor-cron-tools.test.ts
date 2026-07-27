@@ -349,6 +349,14 @@ describe("Cron tools", () => {
 		expect(cron.parameters.safeParse({ op: "bogus" }).success).toBe(false);
 	});
 
+	it("routes silent recurring polling to monitor instead of cron", () => {
+		const { cron } = makeTools();
+		expect(cron.description).toContain("Cron is not a silent polling primitive");
+		expect(cron.description).toContain("use `monitor`");
+		expect(cron.description).toContain("set `persistent: true`");
+		expect(cron.description).toContain("Do not schedule a cron prompt that asks the agent to suppress routine polls");
+	});
+
 	it("schedules a recurring task, lists it with human schedule, and returns an 8-character id", async () => {
 		const { create, list } = makeTools();
 		const result = expectText(
@@ -410,6 +418,7 @@ describe("Cron tools", () => {
 			expect(steered).toHaveLength(1);
 			expect(steered[0]?.customType).toBe("cron-fire");
 			expect(steered[0]?.content).toContain("run one");
+			await Promise.resolve();
 			expect(expectText(await list.execute("call", {})).details.jobs).toHaveLength(0);
 		});
 	});
@@ -433,6 +442,7 @@ describe("Cron tools", () => {
 				nowMs: clock.now(),
 			});
 			clock.tick(fireAt - clock.now());
+			await Promise.resolve();
 			expect(expectText(await list.execute("call", {})).details.jobs).toHaveLength(0);
 
 			const deleteResult = await del.execute("call", { id });

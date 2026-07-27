@@ -45,21 +45,28 @@ function countMatches(lines: string[], pattern: RegExp): number {
 
 describe("TUI terminal-state regressions", () => {
 	let monotonicNow = 0;
-	let previousTmux: string | undefined;
-	let previousSty: string | undefined;
-	let previousZellij: string | undefined;
-	let previousLegacyFullRender: string | undefined;
+	const hostEnvKeys = [
+		"SSH_CONNECTION",
+		"TERM",
+		"COLORTERM",
+		"WT_SESSION",
+		"TERM_PROGRAM",
+		"TMUX",
+		"TMUX_PANE",
+		"STY",
+		"ZELLIJ",
+		"GJC_TMUX_LAUNCHED",
+		"TERMUX_VERSION",
+		"PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER",
+		"PI_CLEAR_ON_SHRINK",
+		"PI_TUI_VIRTUAL_VIEWPORT",
+	] as const;
+	let previousHostEnv = new Map<string, string | undefined>();
 	// Keep TUI's 16ms render throttle deterministic without sleeping a real frame per render.
 
 	beforeEach(() => {
-		previousTmux = Bun.env.TMUX;
-		previousSty = Bun.env.STY;
-		previousZellij = Bun.env.ZELLIJ;
-		previousLegacyFullRender = Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
-		delete Bun.env.TMUX;
-		delete Bun.env.STY;
-		delete Bun.env.ZELLIJ;
-		delete Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
+		previousHostEnv = new Map(hostEnvKeys.map(key => [key, Bun.env[key]]));
+		for (const key of hostEnvKeys) delete Bun.env[key];
 		monotonicNow = 0;
 		vi.spyOn(performance, "now").mockImplementation(() => {
 			monotonicNow += 20;
@@ -69,25 +76,10 @@ describe("TUI terminal-state regressions", () => {
 
 	afterEach(() => {
 		vi.restoreAllMocks();
-		if (previousTmux === undefined) {
-			delete Bun.env.TMUX;
-		} else {
-			Bun.env.TMUX = previousTmux;
-		}
-		if (previousSty === undefined) {
-			delete Bun.env.STY;
-		} else {
-			Bun.env.STY = previousSty;
-		}
-		if (previousZellij === undefined) {
-			delete Bun.env.ZELLIJ;
-		} else {
-			Bun.env.ZELLIJ = previousZellij;
-		}
-		if (previousLegacyFullRender === undefined) {
-			delete Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
-		} else {
-			Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER = previousLegacyFullRender;
+		for (const key of hostEnvKeys) {
+			const value = previousHostEnv.get(key);
+			if (value === undefined) delete Bun.env[key];
+			else Bun.env[key] = value;
 		}
 	});
 
@@ -166,6 +158,169 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
+		it("does not retain a duplicated row when streaming reflow pulls history back into the viewport", async () => {
+			const term = new VirtualTerminal(64, 10, { isProcessTerminal: true });
+			const tui = new TUI(term);
+			const repeated = "이 요구사항은 작은 인증 변경이 아니라 제품 아키텍처 변경입니다.";
+			const prefix = ["context-0", "context-1", "context-2", "context-3", "현재 PRD에 미치는 영향", repeated];
+			const component = new MutableLinesComponent([...prefix, ...rows("initial-", 6)]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				expect(countMatches(visible(term), /제품 아키텍처 변경입니다/)).toBe(1);
+
+				component.setLines([...prefix, ...rows("draft-", 14)]);
+				tui.requestRender();
+				await settle(term);
+				expect(countMatches(term.getScrollBuffer(), /제품 아키텍처 변경입니다/)).toBe(1);
+
+				component.setLines([...prefix, ...rows("reflowed-", 6)]);
+				tui.requestRender();
+				await settle(term);
+				expect(countMatches(visible(term), /제품 아키텍처 변경입니다/)).toBe(1);
+
+				component.setLines([...prefix, ...rows("final-", 18)]);
+				tui.requestRender();
+				await settle(term);
+
+				expect(countMatches(term.getScrollBuffer(), /제품 아키텍처 변경입니다/)).toBe(1);
+				expect(countMatches(term.getScrollBuffer(), /final-4/)).toBe(1);
+
+				component.setLines([...prefix, ...rows("final-", 22)]);
+				tui.requestRender();
+				await settle(term);
+
+				expect(countMatches(term.getScrollBuffer(), /제품 아키텍처 변경입니다/)).toBe(1);
+				expect(countMatches(term.getScrollBuffer(), /final-8/)).toBe(1);
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("re-enables native scrollback admission after transcript identity replacement", async () => {
+			const term = new VirtualTerminal(40, 6, { isProcessTerminal: true });
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent(rows("old-", 8));
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				component.setLines(rows("old-expanded-", 14));
+				tui.requestRender();
+				await settle(term);
+				component.setLines(rows("old-contracted-", 8));
+				tui.requestRender();
+				await settle(term);
+
+				tui.resetViewportAnchorIntent();
+				const replacement = ["new-0", "new-1", "new-2", "new-sentinel", ...rows("new-tail-", 4)];
+				component.setLines(replacement);
+				tui.requestRender();
+				await settle(term);
+				component.setLines([...replacement, ...rows("new-growth-", 6)]);
+				tui.requestRender();
+				await settle(term);
+
+				expect(countMatches(term.getScrollBuffer(), /new-sentinel/)).toBe(1);
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("keeps scrollback admission suspended across a preserving forced contraction", async () => {
+			Bun.env.TMUX = "1";
+			Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER = "1";
+			const term = new VirtualTerminal(48, 8, { isProcessTerminal: true });
+			const tui = new TUI(term);
+			const marker = "forced-reflow-marker";
+			const prefix = ["a", "b", "c", marker];
+			const component = new MutableLinesComponent([...prefix, ...rows("initial-", 6)]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				component.setLines([...prefix, ...rows("expanded-", 14)]);
+				tui.requestRender();
+				await settle(term);
+				expect(countMatches(term.getScrollBuffer(), /forced-reflow-marker/)).toBe(1);
+
+				component.setLines([...prefix, ...rows("contracted-", 6)]);
+				tui.requestRender(true);
+				await settle(term);
+				component.setLines([...prefix, ...rows("regrown-", 18)]);
+				tui.requestRender();
+				await settle(term);
+
+				expect(countMatches(term.getScrollBuffer(), /forced-reflow-marker/)).toBe(1);
+				expect(countMatches(term.getScrollBuffer(), /regrown-6/)).toBe(1);
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("uses the native committed frontier after manual viewport contraction", async () => {
+			const term = new VirtualTerminal(40, 10, { isProcessTerminal: true });
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent(rows("history-", 20));
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				component.setLines(rows("history-", 30));
+				tui.requestRender();
+				await settle(term);
+				expect(countMatches(term.getScrollBuffer(), /history-12/)).toBe(1);
+				expect(tui.scrollViewportPages(-1)).toBe(true);
+				await term.flush();
+
+				component.setLines(rows("history-", 20));
+				tui.requestRender();
+				await settle(term);
+				component.setLines([...rows("history-", 20), ...rows("growth-", 14)]);
+				tui.requestRender();
+				await settle(term);
+				expect(tui.followLiveViewport()).toBe(true);
+				await term.flush();
+
+				component.setLines([...rows("history-", 20), ...rows("growth-", 15)]);
+				tui.requestRender();
+				await settle(term);
+				expect(visible(term)).toEqual(rows("growth-", 15).slice(-10));
+
+				expect(countMatches(term.getScrollBuffer(), /history-12/)).toBe(1);
+				expect(countMatches(term.getScrollBuffer(), /growth-0/)).toBe(1);
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("repaints live viewport when overflowed content shrinks only at the tail", async () => {
+			const term = new VirtualTerminal(20, 5);
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent(rows("row-", 10));
+			tui.setClearOnShrink(false);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				expect(visible(term)).toEqual(["row-5", "row-6", "row-7", "row-8", "row-9"]);
+
+				component.setLines(rows("row-", 8));
+				tui.requestRender(false, "test.tail-shrink");
+				await settle(term);
+
+				expect(visible(term)).toEqual(["row-3", "row-4", "row-5", "row-6", "row-7"]);
+			} finally {
+				tui.stop();
+			}
+		});
+
 		it("clears row 0 when content shrinks to empty without clearOnShrink", async () => {
 			const term = new VirtualTerminal(40, 10);
 			const tui = new TUI(term);
@@ -186,6 +341,32 @@ describe("TUI terminal-state regressions", () => {
 			} finally {
 				tui.stop();
 			}
+		});
+
+		describe("overflow contraction", () => {
+			it("repaints a clean process terminal instead of clearing and replaying overflow history", async () => {
+				Bun.env.SSH_CONNECTION = "203.0.113.10 54321 198.51.100.20 22";
+				Bun.env.TERM = "xterm-256color";
+				Bun.env.COLORTERM = "truecolor";
+				Bun.env.PI_TUI_VIRTUAL_VIEWPORT = "1";
+				const term = new VirtualTerminal(20, 5, { isProcessTerminal: true });
+				const tui = new TUI(term);
+				const component = new MutableLinesComponent(rows("line-", 12));
+				tui.addChild(component);
+				try {
+					tui.start();
+					await settle(term);
+					term.clearWriteLog();
+					component.setLines(rows("line-", 8));
+					tui.setClearOnShrink(true);
+					tui.requestRender();
+					await settle(term);
+					expect(visible(term)).toEqual(["line-3", "line-4", "line-5", "line-6", "line-7"]);
+					expect(term.getWriteLog().join("")).not.toContain("\x1b[2J\x1b[H");
+				} finally {
+					tui.stop();
+				}
+			});
 		});
 	});
 	describe("render line cache bounds", () => {
@@ -723,7 +904,7 @@ describe("TUI terminal-state regressions", () => {
 			Bun.env.TMUX = "1";
 			delete Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
 
-			const term = new VirtualTerminal(32, 5);
+			const term = new VirtualTerminal(32, 5, { isProcessTerminal: true });
 			const tui = new TUI(term);
 			const lines = rows("line-", 80);
 			const component = new MutableLinesComponent(lines);
@@ -756,7 +937,7 @@ describe("TUI terminal-state regressions", () => {
 			Bun.env.TMUX = "1";
 			Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER = "1";
 
-			const term = new VirtualTerminal(32, 5);
+			const term = new VirtualTerminal(32, 5, { isProcessTerminal: true });
 			const tui = new TUI(term);
 			const lines = rows("line-", 80);
 			const component = new MutableLinesComponent(lines);
@@ -786,7 +967,7 @@ describe("TUI terminal-state regressions", () => {
 			Bun.env.TMUX = "1";
 			delete Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
 
-			const term = new VirtualTerminal(32, 5);
+			const term = new VirtualTerminal(32, 5, { isProcessTerminal: true });
 			const tui = new TUI(term);
 			const lines = rows("line-", 80);
 			const component = new MutableLinesComponent(lines);

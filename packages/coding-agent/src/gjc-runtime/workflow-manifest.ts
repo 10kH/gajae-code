@@ -1,7 +1,6 @@
 /**
  * TypeScript is the authoritative source of truth for GJC workflow manifests.
- * Any JSON manifest projection is derived from this module and must never be
- * hand-edited.
+ * Keep the checked-in JSON projection synchronized manually with this module.
  */
 
 import { CANONICAL_GJC_WORKFLOW_SKILLS, type CanonicalGjcWorkflowSkill } from "../skill-state/canonical-skills";
@@ -23,7 +22,9 @@ export interface WorkflowVerb {
 	name: string;
 	planned?: boolean;
 	/** Invocation surface that exposes this verb in the real CLI parser. */
-	surface?: "state-action" | "command-positional" | "command-flag";
+	surface?: "state-action" | "command-positional" | "command-flag" | "draft-action";
+	/** Legacy surface retained for callers that have not migrated to normal typed commands. */
+	compatibilityOnly?: boolean;
 }
 
 export interface TypedArgSpec {
@@ -32,6 +33,7 @@ export interface TypedArgSpec {
 	enumValues?: string[];
 	required?: boolean;
 	appliesToVerbs?: string[];
+	compatibilityOnly?: boolean;
 	planned?: boolean;
 }
 
@@ -52,6 +54,9 @@ export interface SkillManifest {
 	retention: RetentionPolicy[];
 	hudFields: string[];
 	graphLabel: string;
+	stopReleasingPhases: readonly string[];
+	phaseLock: readonly string[];
+	canonicalOverrides: readonly string[];
 }
 
 const STATE_RETENTION: RetentionPolicy = { category: "state", keep: 1 };
@@ -72,13 +77,7 @@ const COMMON_TYPED_ARGS: TypedArgSpec[] = [
 	{ name: "session-id", type: "string", appliesToVerbs: [...STATE_VERBS, "kickoff", "write-spec", "write-artifact"] },
 	{ name: "thread-id", type: "string", appliesToVerbs: ["write", "clear", "handoff"] },
 	{ name: "turn-id", type: "string", appliesToVerbs: ["write", "clear", "handoff"] },
-	{
-		name: "to",
-		type: "enum",
-		enumValues: [...CANONICAL_GJC_WORKFLOW_SKILLS],
-		required: true,
-		appliesToVerbs: ["handoff"],
-	},
+	{ name: "to", type: "string", required: true, appliesToVerbs: ["handoff"] },
 	{ name: "replace", type: "boolean", appliesToVerbs: ["write"] },
 	{ name: "force", type: "boolean", appliesToVerbs: ["write", "clear", "handoff"] },
 	{ name: "skill", type: "enum", enumValues: [...CANONICAL_GJC_WORKFLOW_SKILLS], appliesToVerbs: ["doctor"] },
@@ -95,6 +94,9 @@ function stateVerbs(): WorkflowVerb[] {
 
 function positionalVerbs(names: readonly string[]): WorkflowVerb[] {
 	return names.map(name => verb(name, "command-positional"));
+}
+function draftVerbs(names: readonly string[]): WorkflowVerb[] {
+	return names.map(name => verb(name, "draft-action"));
 }
 
 function flagVerbs(names: readonly string[]): WorkflowVerb[] {
@@ -122,6 +124,9 @@ function manifest(input: {
 	retention: RetentionPolicy[];
 	hudFields: string[];
 	graphLabel: string;
+	stopReleasingPhases?: readonly string[];
+	phaseLock?: readonly string[];
+	canonicalOverrides?: readonly string[];
 	initialState?: string;
 }): SkillManifest {
 	const staleInitialState = initialPhaseForSkill(input.skill);
@@ -137,6 +142,16 @@ function manifest(input: {
 		retention: input.retention,
 		hudFields: input.hudFields,
 		graphLabel: input.graphLabel,
+		stopReleasingPhases: input.stopReleasingPhases ?? [
+			"complete",
+			"completed",
+			"failed",
+			"cancelled",
+			"canceled",
+			"inactive",
+		],
+		phaseLock: input.phaseLock ?? [],
+		canonicalOverrides: input.canonicalOverrides ?? [],
 	};
 }
 
@@ -150,19 +165,200 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{ from: "handoff", to: "complete", verb: "clear" },
 			{ from: "interviewing", to: "complete", verb: "clear" },
 		],
-		verbs: [...stateVerbs(), ...flagVerbs(["kickoff", "write-spec"]), ...plannedVerbs(PLANNED_ADMIN_VERBS)],
+		verbs: [
+			...stateVerbs(),
+			...flagVerbs(["kickoff", "write-spec"]),
+			...draftVerbs(["draft create", "draft edit", "draft show", "draft check", "draft rebase", "draft discard"]),
+			...positionalVerbs([
+				"initialize-context",
+				"confirm-topology",
+				"record-answer",
+				"apply-round-result",
+				"inspect",
+				"sanity-check",
+			]),
+			...plannedVerbs(PLANNED_ADMIN_VERBS),
+		],
 		typedArgs: [
 			{ name: "quick", type: "boolean", appliesToVerbs: ["kickoff"] },
 			{ name: "standard", type: "boolean", appliesToVerbs: ["kickoff"] },
 			{ name: "deep", type: "boolean", appliesToVerbs: ["kickoff"] },
 			{ name: "threshold", type: "number", appliesToVerbs: ["kickoff"] },
 			{ name: "threshold-source", type: "string", appliesToVerbs: ["kickoff"] },
+			{ name: "trace", type: "boolean", appliesToVerbs: ["kickoff"] },
+			{ name: "json", type: "boolean", appliesToVerbs: ["kickoff", "write-spec"] },
 			{ name: "stage", type: "enum", enumValues: ["final"], appliesToVerbs: ["write-spec"] },
 			{ name: "slug", type: "string", appliesToVerbs: ["write-spec"] },
 			{ name: "spec", type: "string", required: true, appliesToVerbs: ["write-spec"] },
 			{ name: "handoff", type: "enum", enumValues: ["ralplan"], appliesToVerbs: ["write-spec"] },
 			{ name: "deliberate", type: "boolean", appliesToVerbs: ["write-spec"] },
-			{ name: "json", type: "boolean", appliesToVerbs: ["write-spec"] },
+			{
+				name: "session-id",
+				type: "string",
+				required: true,
+				appliesToVerbs: ["draft create"],
+			},
+			{
+				name: "for",
+				type: "enum",
+				enumValues: ["initialize-context", "confirm-topology", "record-answer", "apply-round-result"],
+				required: true,
+				appliesToVerbs: ["draft create"],
+			},
+			{ name: "round-key", type: "string", appliesToVerbs: ["draft create"] },
+			{ name: "round", type: "number", appliesToVerbs: ["draft create"] },
+			{ name: "question-id", type: "string", appliesToVerbs: ["draft create"] },
+			{ name: "round-id", type: "string", appliesToVerbs: ["draft create"] },
+			{ name: "component-id", type: "string", appliesToVerbs: ["draft create"] },
+			{ name: "dimension", type: "string", appliesToVerbs: ["draft create"] },
+			{
+				name: "draft-id",
+				type: "string",
+				required: true,
+				appliesToVerbs: [
+					"draft edit",
+					"draft show",
+					"draft check",
+					"draft rebase",
+					"draft discard",
+					"initialize-context",
+					"confirm-topology",
+					"record-answer",
+					"apply-round-result",
+				],
+			},
+			{
+				name: "expected-draft-revision",
+				type: "number",
+				required: true,
+				appliesToVerbs: [
+					"draft edit",
+					"draft rebase",
+					"draft discard",
+					"initialize-context",
+					"confirm-topology",
+					"record-answer",
+					"apply-round-result",
+				],
+			},
+			{
+				name: "op",
+				type: "enum",
+				enumValues: ["set", "append", "remove"],
+				required: true,
+				appliesToVerbs: ["draft edit"],
+			},
+			{ name: "path", type: "string", required: true, appliesToVerbs: ["draft edit"] },
+			{ name: "value", type: "string", appliesToVerbs: ["draft edit"] },
+			{ name: "value-file", type: "string", appliesToVerbs: ["draft edit"] },
+			{ name: "null", type: "boolean", appliesToVerbs: ["draft edit"] },
+			{ name: "to-state-revision", type: "number", required: true, appliesToVerbs: ["draft rebase"] },
+			{
+				name: "json",
+				type: "boolean",
+				required: true,
+				appliesToVerbs: [
+					"draft create",
+					"draft edit",
+					"draft show",
+					"draft check",
+					"draft rebase",
+					"draft discard",
+					"initialize-context",
+					"confirm-topology",
+					"record-answer",
+					"apply-round-result",
+					"inspect",
+					"sanity-check",
+				],
+			},
+			{
+				name: "session-id",
+				type: "string",
+				required: true,
+				appliesToVerbs: ["inspect", "sanity-check"],
+			},
+			{
+				name: "session-id",
+				type: "string",
+				required: true,
+				compatibilityOnly: true,
+				appliesToVerbs: ["initialize-context", "confirm-topology", "record-answer", "apply-round-result"],
+			},
+			{
+				name: "schema-version",
+				type: "number",
+				required: true,
+				compatibilityOnly: true,
+				appliesToVerbs: ["initialize-context", "confirm-topology", "record-answer", "apply-round-result"],
+			},
+			{
+				name: "expected-revision",
+				type: "number",
+				required: true,
+				compatibilityOnly: true,
+				appliesToVerbs: ["initialize-context", "confirm-topology", "record-answer", "apply-round-result"],
+			},
+			{
+				name: "input-json",
+				type: "object",
+				required: true,
+				compatibilityOnly: true,
+				appliesToVerbs: ["initialize-context", "confirm-topology"],
+			},
+			{
+				name: "round",
+				type: "number",
+				required: true,
+				compatibilityOnly: true,
+				appliesToVerbs: ["record-answer", "apply-round-result"],
+			},
+			{
+				name: "question-id",
+				type: "string",
+				required: true,
+				compatibilityOnly: true,
+				appliesToVerbs: ["record-answer", "apply-round-result"],
+			},
+			{
+				name: "round-id",
+				type: "string",
+				compatibilityOnly: true,
+				appliesToVerbs: ["record-answer", "apply-round-result"],
+			},
+			{ name: "component-id", type: "string", compatibilityOnly: true, appliesToVerbs: ["record-answer"] },
+			{ name: "dimension", type: "string", compatibilityOnly: true, appliesToVerbs: ["record-answer"] },
+			{
+				name: "answer-json",
+				type: "object",
+				required: true,
+				compatibilityOnly: true,
+				appliesToVerbs: ["record-answer"],
+			},
+			{
+				name: "question-json",
+				type: "string",
+				required: true,
+				compatibilityOnly: true,
+				appliesToVerbs: ["record-answer"],
+			},
+			{
+				name: "result-json",
+				type: "object",
+				required: true,
+				compatibilityOnly: true,
+				appliesToVerbs: ["apply-round-result"],
+			},
+			{
+				name: "selector",
+				type: "enum",
+				enumValues: ["summary", "recent-scored", "pending", "round", "topology", "facts", "triggers", "floor"],
+				required: true,
+				appliesToVerbs: ["inspect"],
+			},
+			{ name: "round-key", type: "string", appliesToVerbs: ["inspect"] },
+			{ name: "cursor", type: "string", appliesToVerbs: ["inspect"] },
+			{ name: "limit", type: "number", appliesToVerbs: ["inspect"] },
 			{ name: "args", type: "string", planned: true },
 			{ name: "metadata-json", type: "string", planned: true },
 		],
@@ -213,6 +409,8 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 		retention: [STATE_RETENTION, ARTIFACT_RETENTION, LEDGER_RETENTION, PRUNE_RETENTION, FORCE_RETENTION],
 		hudFields: ["current_phase", "mode", "run_id", "stage", "stage_n", "plan_path"],
 		graphLabel: "Ralplan",
+		phaseLock: ["final", "handoff", "complete", "completed", "failed", "cancelled", "canceled", "inactive"],
+		canonicalOverrides: ["final", "handoff", "complete", "completed", "failed", "cancelled", "canceled", "inactive"],
 	}),
 	ultragoal: manifest({
 		skill: "ultragoal",
@@ -243,6 +441,11 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 				"record-review-blockers",
 				"steer",
 				"classify-blocker",
+				"record-critic-verdict",
+				"record-critic-gate-override",
+				"start-pipeline-overlap",
+				"join-pipeline-overlap",
+				"rebaseline-pipeline-overlap",
 			]),
 			...plannedVerbs(PLANNED_ADMIN_VERBS),
 		],
@@ -256,6 +459,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 				enumValues: ["aggregate", "per-story"],
 				appliesToVerbs: ["create-goals"],
 			},
+			{ name: "validation-batch-json", type: "string", appliesToVerbs: ["create-goals"] },
 			{ name: "retry-failed", type: "boolean", appliesToVerbs: ["complete-goals"] },
 			{ name: "goal-id", type: "string", required: true, appliesToVerbs: ["checkpoint", "record-review-blockers"] },
 			{
@@ -269,12 +473,96 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 				name: "evidence",
 				type: "string",
 				required: true,
-				appliesToVerbs: ["checkpoint", "record-review-blockers", "steer", "classify-blocker"],
+				appliesToVerbs: [
+					"checkpoint",
+					"record-review-blockers",
+					"steer",
+					"classify-blocker",
+					"record-critic-verdict",
+					"record-critic-gate-override",
+					"rebaseline-pipeline-overlap",
+				],
 			},
-			{ name: "gjc-goal-json", type: "string", appliesToVerbs: ["checkpoint", "record-review-blockers"] },
+			{
+				name: "terminus",
+				type: "enum",
+				enumValues: ["completion", "pause"],
+				required: true,
+				appliesToVerbs: ["record-critic-verdict"],
+			},
+			{
+				name: "verdict",
+				type: "enum",
+				enumValues: ["OKAY", "ITERATE", "REJECT"],
+				required: true,
+				appliesToVerbs: ["record-critic-verdict"],
+			},
+			{ name: "blockers-json", type: "string", appliesToVerbs: ["record-critic-verdict"] },
+			{ name: "goal-id", type: "string", appliesToVerbs: ["record-critic-verdict"] },
+			{ name: "classification-event-id", type: "string", appliesToVerbs: ["record-critic-verdict"] },
+			{
+				name: "goal-metadata-json",
+				type: "string",
+				appliesToVerbs: ["create-goals"],
+			},
+			{
+				name: "prior-goal-id",
+				type: "string",
+				required: true,
+				appliesToVerbs: ["start-pipeline-overlap"],
+			},
+			{
+				name: "next-goal-id",
+				type: "string",
+				required: true,
+				appliesToVerbs: ["start-pipeline-overlap"],
+			},
+			{
+				name: "review-handles-json",
+				type: "string",
+				required: true,
+				appliesToVerbs: ["start-pipeline-overlap"],
+			},
+			{
+				name: "qa-handles-json",
+				type: "string",
+				required: true,
+				appliesToVerbs: ["start-pipeline-overlap"],
+			},
+			{
+				name: "implementation-handle-json",
+				type: "string",
+				required: true,
+				appliesToVerbs: ["start-pipeline-overlap"],
+			},
+			{
+				name: "overlap-id",
+				type: "string",
+				required: true,
+				appliesToVerbs: ["join-pipeline-overlap", "rebaseline-pipeline-overlap"],
+			},
+			{
+				name: "review-result-json",
+				type: "string",
+				required: true,
+				appliesToVerbs: ["join-pipeline-overlap"],
+			},
+			{
+				name: "qa-result-json",
+				type: "string",
+				required: true,
+				appliesToVerbs: ["join-pipeline-overlap"],
+			},
+			{
+				name: "target-state-json",
+				type: "string",
+				required: true,
+				appliesToVerbs: ["rebaseline-pipeline-overlap"],
+			},
 			{ name: "quality-gate-json", type: "string", appliesToVerbs: ["checkpoint"] },
 			{ name: "goal-id", type: "string", appliesToVerbs: ["steer"] },
 			{ name: "goal-id", type: "string", appliesToVerbs: ["classify-blocker"] },
+			{ name: "goal-id", type: "string", required: true, appliesToVerbs: ["rebaseline-pipeline-overlap"] },
 			{
 				name: "classification",
 				type: "enum",
@@ -322,6 +610,11 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 					"record-review-blockers",
 					"steer",
 					"classify-blocker",
+					"record-critic-verdict",
+					"record-critic-gate-override",
+					"start-pipeline-overlap",
+					"join-pipeline-overlap",
+					"rebaseline-pipeline-overlap",
 				],
 			},
 			{ name: "directive-json", type: "string", appliesToVerbs: ["steer"], planned: true },
@@ -386,6 +679,9 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 					"read-worker-status",
 					"read-worker-heartbeat",
 					"update-worker-heartbeat",
+					"read-worker-memory-guard",
+					"update-worker-memory-guard",
+					"apply-worker-memory-guard",
 					"write-worker-inbox",
 					"write-worker-identity",
 					"append-event",
@@ -412,6 +708,11 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			},
 			{ name: "completion_evidence", type: "object", appliesToVerbs: ["api"] },
 			{ name: "completionEvidence", type: "object", appliesToVerbs: ["api"] },
+			{ name: "platform", type: "string", appliesToVerbs: ["api"] },
+			{ name: "automatic-action-allowed", type: "boolean", appliesToVerbs: ["api"] },
+			{ name: "incident-id", type: "string", appliesToVerbs: ["api"] },
+			{ name: "pid-probe", type: "object", appliesToVerbs: ["api"] },
+			{ name: "candidates", type: "object", appliesToVerbs: ["api"] },
 			{ name: "args", type: "string", planned: true },
 			{ name: "metadata-json", type: "string", planned: true },
 		],

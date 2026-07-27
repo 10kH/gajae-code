@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { Browser } from "puppeteer-core";
 import { Settings } from "../../src/config/settings";
 import type { BrowserHandle, BrowserKindTag } from "../../src/tools/browser/registry";
@@ -44,12 +44,20 @@ function baseDeps(over: Partial<ResourceGcDeps> = {}): ResourceGcDeps {
 	return {
 		now: () => NOW,
 		rssBytes: () => 1,
+		memorySnapshot: async () => ({
+			hardCapBytes: 1024 * 1024 * 1024,
+			totalUsageBytes: 1,
+			parentBytes: 1,
+			source: "host",
+		}),
+		runGc: vi.fn(),
 		logWarn: vi.fn(),
 		listTabs: () => [],
 		releaseTab: vi.fn(async () => true),
 		cleanupScreenshots: vi.fn(async () => ({ scanned: 0, removed: 0 })),
 		screenshotArmed: () => false,
 		...over,
+		monotonicNow: over.monotonicNow ?? over.now ?? (() => NOW),
 	};
 }
 
@@ -141,6 +149,10 @@ function registerSession(overrides: Record<string, unknown> = {}): void {
 }
 
 describe("resource GC red-team safety invariants", () => {
+	beforeEach(() => {
+		clearTabsForTest();
+		__resetResourceGcForTest();
+	});
 	afterEach(() => {
 		clearTabsForTest();
 		__resetResourceGcForTest();

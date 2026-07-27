@@ -1227,6 +1227,8 @@ fn should_skip_env_var(key: &str) -> bool {
 		"BASH_ENV"
 			| "ENV"
 			| "HISTFILE"
+			| "GJC_SESSION_FILE"
+			| "GJC_MANAGED_OWNER_TRANSCRIPT_PATH"
 			| "HISTTIMEFORMAT"
 			| "HISTCMD"
 			| "PS0"
@@ -1870,6 +1872,17 @@ mod tests {
 
 	#[cfg(unix)]
 	static PROCESS_TEST_LOCK: TokioMutex<()> = TokioMutex::const_new(());
+	#[cfg(unix)]
+	async fn wait_until_descendant_visible(pid: i32) {
+		for _ in 0..100 {
+			if process::current_descendant_pids().contains(&pid) {
+				return;
+			}
+			time::sleep(Duration::from_millis(10)).await;
+		}
+
+		panic!("descendant {pid} did not become visible to process discovery");
+	}
 
 	/// Truth-table coverage for `brush_core::commands::child_session_action`.
 	///
@@ -2343,12 +2356,12 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn timeout_builtin_reaps_reparented_same_group_grandchild_and_preserves_sibling() {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
-		let sibling = std::process::Command::new("/bin/sh")
-			.arg("-c")
-			.arg("sleep 30")
+		let sibling = std::process::Command::new("sleep")
+			.arg("30")
 			.spawn()
 			.expect("spawn unrelated sibling");
 		let sibling_pid = i32::try_from(sibling.id()).expect("sibling pid should fit i32");
+		wait_until_descendant_visible(sibling_pid).await;
 		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 		let command = "timeout 0.2 perl -e 'if (($pid = fork()) == 0) { $SIG{TERM} = \"IGNORE\"; \
 		               print qq(grandchild=$$ ppid=) . getppid() . qq( pgid=) . getpgrp() . \
@@ -2404,12 +2417,12 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn cancelled_command_reaps_reparented_same_group_grandchild() {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
-		let sibling = std::process::Command::new("/bin/sh")
-			.arg("-c")
-			.arg("sleep 30")
+		let sibling = std::process::Command::new("sleep")
+			.arg("30")
 			.spawn()
 			.expect("spawn unrelated sibling");
 		let sibling_pid = i32::try_from(sibling.id()).expect("sibling pid should fit i32");
+		wait_until_descendant_visible(sibling_pid).await;
 		let cancel = CancelToken::default();
 		let abort = cancel.clone().emplace_abort_token();
 		let (tx, mut rx) = mpsc::unbounded_channel::<String>();

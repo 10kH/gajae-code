@@ -1,12 +1,49 @@
+import { createHash } from "node:crypto";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { coordinatorMcpStateRoot, gjcRoot } from "../gjc-runtime/session-layout";
+import {
+	DEFAULT_SESSION_IDLE_TTL_MS,
+	DEFAULT_SESSION_SWEEP_INTERVAL_MS,
+	MIN_SESSION_IDLE_TTL_MS,
+	MIN_SESSION_SWEEP_INTERVAL_MS,
+} from "./session-reaper";
 
 export type CoordinatorMutationClass = "sessions" | "questions" | "reports";
 
 export interface CoordinatorNamespace {
 	profile: string | null;
 	repo: string | null;
+	identity: string;
+}
+
+function canonicalJson(value: unknown): string {
+	if (value === null || typeof value === "boolean" || typeof value === "number") return JSON.stringify(value);
+	if (typeof value === "string") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	if (typeof value === "object") {
+		const record = value as Record<string, unknown>;
+		return `{${Object.keys(record)
+			.sort()
+			.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+			.join(",")}}`;
+	}
+	throw new Error("coordinator_namespace_invalid");
+}
+
+export function coordinatorNamespaceIdentity(env: NodeJS.ProcessEnv = process.env): string {
+	return `ns1_${createHash("sha256")
+		.update(
+			canonicalJson({
+				profile_exact: env.GJC_COORDINATOR_MCP_PROFILE ?? null,
+				profile_present: env.GJC_COORDINATOR_MCP_PROFILE !== undefined,
+				repo_exact: env.GJC_COORDINATOR_MCP_REPO ?? null,
+				repo_present: env.GJC_COORDINATOR_MCP_REPO !== undefined,
+			}),
+		)
+		.digest("hex")
+		.slice(0, 32)}`;
 }
 
 export interface CoordinatorMcpConfig {
@@ -16,6 +53,9 @@ export interface CoordinatorMcpConfig {
 	namespace: CoordinatorNamespace;
 	stateRoot: string;
 	sessionCommand: string | null;
+	sessionIdleTtlMs: number;
+	sessionSweepIntervalMs: number;
+	forceStopEnabled: boolean;
 }
 
 export interface CoordinatorMutationRequest {
@@ -31,6 +71,16 @@ const LEGACY_MUTATION_CLASS_ALIASES = new Map<string, CoordinatorMutationClass>(
 	["question", "questions"],
 	["report", "reports"],
 ]);
+
+function parsePositiveIntMs(value: string | undefined, fallback: number, floor: number): number {
+	const parsed = Number.parseInt((value ?? "").trim(), 10);
+	if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+	return Math.max(floor, parsed);
+}
+
+function parseBool(value: string | undefined): boolean {
+	return /^(1|true|yes|on)$/i.test((value ?? "").trim());
+}
 
 function parseList(value: string | undefined): string[] {
 	return (value ?? "")
@@ -95,19 +145,38 @@ export function buildCoordinatorMcpConfig(env: NodeJS.ProcessEnv = process.env):
 		namespace: {
 			profile: cleanScope(env.GJC_COORDINATOR_MCP_PROFILE),
 			repo: cleanScope(env.GJC_COORDINATOR_MCP_REPO),
+			identity: coordinatorNamespaceIdentity(env),
 		},
 		stateRoot: path.resolve(stateRoot),
 		sessionCommand: env.GJC_COORDINATOR_MCP_SESSION_COMMAND?.trim() || null,
+		sessionIdleTtlMs: parsePositiveIntMs(
+			env.GJC_COORDINATOR_MCP_SESSION_IDLE_TTL_MS,
+			DEFAULT_SESSION_IDLE_TTL_MS,
+			MIN_SESSION_IDLE_TTL_MS,
+		),
+		sessionSweepIntervalMs: parsePositiveIntMs(
+			env.GJC_COORDINATOR_MCP_SESSION_SWEEP_INTERVAL_MS,
+			DEFAULT_SESSION_SWEEP_INTERVAL_MS,
+			MIN_SESSION_SWEEP_INTERVAL_MS,
+		),
+		forceStopEnabled: parseBool(env.GJC_COORDINATOR_MCP_FORCE_STOP),
 	};
 }
 
 async function realpathIfExists(value: string): Promise<string> {
-	try {
-		return await fs.realpath(value);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		const parent = await fs.realpath(path.dirname(value));
-		return path.join(parent, path.basename(value));
+	let current = path.resolve(value);
+	const missing: string[] = [];
+	while (true) {
+		try {
+			const canonical = await fs.realpath(current);
+			return path.join(canonical, ...missing.reverse());
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			const parent = path.dirname(current);
+			if (parent === current) throw error;
+			missing.push(path.basename(current));
+			current = parent;
+		}
 	}
 }
 
@@ -142,6 +211,8 @@ export async function assertCoordinatorArtifactPath(
 	if (config.allowedRoots.length === 0) throw new Error("coordinator_artifact_roots_required");
 	const requested = path.resolve(artifactPath);
 	const canonicalRequested = await realpathIfExists(requested);
+	const canonicalStateRoot = await realpathIfExists(config.stateRoot);
+	if (isInside(canonicalRequested, canonicalStateRoot)) throw new Error("coordinator_artifact_state_root_denied");
 	const roots = await canonicalAllowedRoots(config);
 	if (!roots.some(root => isInside(canonicalRequested, root))) {
 		throw new Error(`coordinator_artifact_outside_allowed_roots:${requested}`);
@@ -160,9 +231,33 @@ export function requireCoordinatorMutation(
 }
 
 export function coordinatorNamespacePath(config: CoordinatorMcpConfig): string {
-	return path.join(
-		config.stateRoot,
-		config.namespace.profile ?? "unscoped-profile",
-		config.namespace.repo ?? "unscoped-repo",
-	);
+	return path.join(config.stateRoot, "v1", config.namespace.identity);
+}
+
+/** Opens and authorizes an artifact by the opened handle identity, not a racy pathname. */
+export async function safeOpenCoordinatorArtifact(
+	config: CoordinatorMcpConfig,
+	artifactPath: unknown,
+): Promise<fs.FileHandle> {
+	if (typeof artifactPath !== "string" || artifactPath.trim().length === 0)
+		throw new Error("coordinator_artifact_path_required");
+	if (config.allowedRoots.length === 0) throw new Error("coordinator_artifact_roots_required");
+	if (process.platform !== "linux") throw new Error("artifact_identity_unavailable");
+	const requested = path.resolve(artifactPath);
+	await assertCoordinatorArtifactPath(config, requested);
+	const handle = await fs.open(requested, nodeFs.constants.O_RDONLY | nodeFs.constants.O_NOFOLLOW);
+	try {
+		const opened = await handle.stat({ bigint: true });
+		if (!opened.isFile()) throw new Error("artifact_identity_unavailable");
+		const canonicalTarget = await fs.realpath(`/proc/self/fd/${handle.fd}`);
+		const canonicalStateRoot = await realpathIfExists(config.stateRoot);
+		const roots = await canonicalAllowedRoots(config);
+		if (isInside(canonicalTarget, canonicalStateRoot)) throw new Error("coordinator_artifact_state_root_denied");
+		if (!roots.some(root => isInside(canonicalTarget, root)))
+			throw new Error(`coordinator_artifact_outside_allowed_roots:${requested}`);
+		return handle;
+	} catch (error) {
+		await handle.close();
+		throw error;
+	}
 }

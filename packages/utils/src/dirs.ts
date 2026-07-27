@@ -15,6 +15,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { engines, version } from "../package.json" with { type: "json" };
+import { parseEnvFile } from "./env-file";
 
 /** App name (e.g. "gjc") */
 export const APP_NAME: string = "gjc";
@@ -108,16 +109,22 @@ export function resolveEquivalentPath(inputPath: string): string {
 	}
 }
 
-export function normalizePathForComparison(inputPath: string): string {
-	const resolvedPath = resolveEquivalentPath(inputPath);
-	return process.platform === "win32" ? resolvedPath.toLowerCase() : resolvedPath;
+export function normalizePathForComparison(inputPath: string, platform: NodeJS.Platform = process.platform): string {
+	const pathApi = platform === "win32" ? path.win32 : path;
+	const resolvedPath = platform === process.platform ? resolveEquivalentPath(inputPath) : pathApi.resolve(inputPath);
+	return platform === "win32" ? resolvedPath.toLowerCase() : resolvedPath;
+}
+
+/** Return whether a relative path crosses above its root or is unexpectedly absolute. */
+export function relativePathEscapesRoot(relative: string): boolean {
+	return relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
 }
 
 export function pathIsWithin(root: string, candidate: string): boolean {
 	const normalizedRoot = normalizePathForComparison(root);
 	const normalizedCandidate = normalizePathForComparison(candidate);
 	const relative = path.relative(normalizedRoot, normalizedCandidate);
-	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+	return !relativePathEscapesRoot(relative);
 }
 
 export function relativePathWithinRoot(root: string, candidate: string): string | null {
@@ -142,8 +149,29 @@ export function setProjectDir(dir: string): void {
 }
 
 /** Get the config directory name relative to home (e.g. ".gjc" or PI_CONFIG_DIR override). */
+/**
+ * Config-directory name, rejected when it comes from the caller's project `.env`.
+ *
+ * The name is joined with the home directory to build the config root, and that
+ * root plus the agent directory beneath it supply two of the `.env` files
+ * `$credentialEnv` treats as trusted. Bun loads `cwd/.env` into `process.env`
+ * before any module runs, so a repository could otherwise point the config root
+ * at a directory it ships and have its own `.env` treated as trusted —
+ * recovering every endpoint and credential redirect the boundary rejects.
+ *
+ * `env.ts` imports this module, so the check cannot go through `$credentialEnv`;
+ * it applies the same conservative ambiguity rule directly, matching how
+ * `GJC_CODING_AGENT_DIR` is treated.
+ */
+function trustedConfigDirName(name: "GJC_CONFIG_DIR" | "PI_CONFIG_DIR"): string | undefined {
+	const value = process.env[name];
+	if (!value) return undefined;
+	if (parseEnvFile(path.join(process.cwd(), ".env"))[name] === value) return undefined;
+	return value;
+}
+
 export function getConfigDirName(): string {
-	return process.env.GJC_CONFIG_DIR ?? process.env.PI_CONFIG_DIR ?? CONFIG_DIR_NAME;
+	return trustedConfigDirName("GJC_CONFIG_DIR") ?? trustedConfigDirName("PI_CONFIG_DIR") ?? CONFIG_DIR_NAME;
 }
 
 /** Get the config agent directory name relative to home (e.g. ".gjc/agent" or PI_CONFIG_DIR + "/agent"). */
@@ -242,7 +270,31 @@ class DirResolver {
 	}
 }
 
-let dirs = new DirResolver(process.env.GJC_CODING_AGENT_DIR);
+/**
+ * Agent-directory override, rejected when it comes from the caller's project
+ * `.env`.
+ *
+ * This directory selects the agent's own `.env`, which is one of the trusted
+ * sources `$credentialEnv` consults. Bun loads `cwd/.env` into `process.env`
+ * before any module runs, so a repository could otherwise point this at a
+ * directory it ships and have its own `.env` treated as trusted — recovering
+ * every redirect the credential boundary is meant to reject.
+ *
+ * `env.ts` imports this module, so the check cannot go through `$credentialEnv`;
+ * it applies the same conservative ambiguity rule directly: a value that matches
+ * what the project `.env` sets is not honoured. An operator whose environment
+ * happens to carry the identical value loses the override, which is the same
+ * trade-off `resolveLiveCredentialEnvValue` already makes.
+ */
+function trustedAgentDirOverride(): string | undefined {
+	const value = process.env.GJC_CODING_AGENT_DIR;
+	if (!value) return undefined;
+	const projectValue = parseEnvFile(path.join(process.cwd(), ".env")).GJC_CODING_AGENT_DIR;
+	if (projectValue !== undefined && projectValue === value) return undefined;
+	return value;
+}
+
+let dirs = new DirResolver(trustedAgentDirOverride());
 
 // Anchor home for the resolver. Captured at module load to stay stable across
 // test mocks of `os.homedir()`. `getPluginsDir(home)` compares against this so

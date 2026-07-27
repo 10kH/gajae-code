@@ -38,16 +38,19 @@ pub mod highlight;
 pub mod html;
 pub mod keys;
 pub mod linediff;
-pub mod notifications;
+pub mod memory;
+pub mod sdk;
 pub mod sixel;
 pub use pi_ast::language;
 
 pub mod power;
 
 pub mod iso;
+pub mod path_identity;
 pub mod prof;
 pub mod ps;
 pub mod pty;
+pub mod recovery_fs;
 pub mod shell;
 pub mod summary;
 pub mod task;
@@ -73,5 +76,13 @@ use napi_derive::napi;
 /// MUST stay in sync with `VERSION_SENTINEL_EXPORT` in
 /// `packages/natives/native/index.js` (which derives the name from
 /// `package.json#version`).
-#[napi(js_name = "__piNativesV0_7_8")]
+#[napi(js_name = "__piNativesV0_11_11")]
 pub const fn pi_natives_version_sentinel() {}
+
+/// Publish-result wire-contract sentinel.
+///
+/// The loader requires this in addition to the release sentinel, so a
+/// same-version modern artifact built before the retained-publish contract
+/// cannot be selected over a compatible baseline.
+#[napi(js_name = "__piNativesPublishOutcomeV1")]
+pub const fn pi_natives_publish_outcome_sentinel() {}

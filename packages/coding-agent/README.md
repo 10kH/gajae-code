@@ -4,7 +4,7 @@ Core implementation package for the `gjc` coding agent in the `gajae-code` monor
 
 For installation, setup, provider configuration, model roles, slash commands, and full CLI reference, see:
 - [Monorepo README (local)](../../README.md)
-- [Monorepo README (GitHub)](https://github.com/can1357/gajae-code#readme)
+- [Monorepo README (GitHub)](https://github.com/Yeachan-Heo/gajae-code#readme)
 
 Package-specific references:
 - [CHANGELOG](./CHANGELOG.md)
@@ -22,6 +22,14 @@ For simple local side effects that do not need a full extension, set the user-le
 
 ```sh
 gjc config set completion.notifyCommand 'cmux notify --title "$GJC_NOTIFICATION_TITLE" --body "$GJC_NOTIFICATION_BODY"'
+```
+
+When GJC runs inside a cmux terminal (`CMUX_WORKSPACE_ID` is set), GJC best-effort renames that cmux workspace to the current GJC session name (with a `GJC: ` prefix) — but only when the workspace still has its default title, so a name you pinned (or one set by a peer session sharing the workspace) is never overwritten. Opt out with `GJC_NO_CMUX_RENAME=1`.
+
+Windows Terminal may keep BEL (`[Console]::Write([char]7)`) silent depending on profile and system sound settings even when `notifications.terminalBell` is enabled. For an audible Windows completion beep, configure a user-level PowerShell command hook instead:
+
+```powershell
+gjc config set completion.notifyCommand 'powershell.exe -NoProfile -Command "[Console]::Beep(880, 300)"'
 ```
 
 `cmux notify` returning successfully means GJC handed the completion event to cmux. cmux may still suppress the native desktop banner when the app/window is focused, the emitting workspace is active, or the notification panel is open. In those cases, check cmux's notification panel or unread workspace state instead of treating the missing banner as a GJC delivery failure.

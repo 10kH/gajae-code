@@ -1,10 +1,16 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Effort, type Model, type OpenAICompat, type ThinkingConfig, writeModelCache } from "@gajae-code/ai";
 import { kNoAuth, MODEL_ROLE_IDS, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
-import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import {
+	type ModelLookupRegistry,
+	resolveModelFromString,
+	resolveModelOverride,
+	resolveModelOverrideWithAuthFallback,
+} from "@gajae-code/coding-agent/config/model-resolver";
+import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { addApiCompatibleProvider } from "@gajae-code/coding-agent/setup/provider-onboarding";
 import { $credentialEnv, hookFetch, Snowflake } from "@gajae-code/utils";
@@ -13,6 +19,19 @@ describe("model roles", () => {
 	test("default is the only built-in model role", () => {
 		expect(MODEL_ROLE_IDS).toEqual(["default"]);
 	});
+});
+
+test("package exports keep extracted model helpers internal", () => {
+	const packageJson = JSON.parse(fs.readFileSync(path.resolve(import.meta.dir, "../package.json"), "utf8")) as {
+		exports: Record<string, unknown>;
+	};
+
+	expect(packageJson.exports["./config/model-auth"]).toBeNull();
+	expect(packageJson.exports["./config/model-bindings-applier"]).toBeNull();
+	expect(packageJson.exports["./config/model-discovery-manager"]).toBeNull();
+	expect(packageJson.exports["./config/model-equivalence"]).toBeUndefined();
+	expect(packageJson.exports["./config/*"]).toBeDefined();
+	expect(packageJson.exports["./*"]).toBeDefined();
 });
 
 describe("ModelRegistry", () => {
@@ -137,6 +156,40 @@ describe("ModelRegistry", () => {
 			}
 		};
 	}
+
+	test("forwards caller cancellation through model and provider key lookups", async () => {
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		const model = registry.find("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic model");
+		const controller = new AbortController();
+		const credentialSelector = { kind: "email" as const, value: "worker@example.com" };
+		const getApiKey = vi.spyOn(authStorage, "getApiKey").mockResolvedValue("test-key");
+
+		try {
+			await registry.getApiKey(model, "model-session", {
+				credentialSelector,
+				signal: controller.signal,
+			});
+			await registry.getApiKeyForProvider("anthropic", "provider-session", "https://proxy.example.com", {
+				credentialSelector,
+				signal: controller.signal,
+			});
+
+			expect(getApiKey).toHaveBeenNthCalledWith(1, "anthropic", "model-session", {
+				baseUrl: model.baseUrl,
+				modelId: model.id,
+				credentialSelector,
+				signal: controller.signal,
+			});
+			expect(getApiKey).toHaveBeenNthCalledWith(2, "anthropic", "provider-session", {
+				baseUrl: "https://proxy.example.com",
+				credentialSelector,
+				signal: controller.signal,
+			});
+		} finally {
+			getApiKey.mockRestore();
+		}
+	});
 
 	function mockOpenAiCompatibleModels(url: string, modelIds: string[]) {
 		return hookFetch(input => {
@@ -473,7 +526,7 @@ describe("ModelRegistry", () => {
 			});
 
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
-			const opusVariants = registry.getCanonicalVariants("claude-opus-4-8");
+			const opusVariants = registry.getCanonicalVariants("claude-opus-5");
 			const haikuVariants = registry.getCanonicalVariants("claude-haiku-4-5");
 
 			expect(opusVariants.some(variant => variant.selector === "demo/anthropic/claude-opus-latest")).toBe(true);
@@ -625,6 +678,87 @@ describe("ModelRegistry", () => {
 			expect(resolved?.provider).toBe("demo");
 			expect(resolved?.id).toBe("anthropic/claude-sonnet-4.5");
 		});
+		/** Hermetic candidate set for fixture providers only (excludes ambient host providers). */
+		function fixtureCandidates(
+			registry: ModelRegistry,
+			providers: readonly string[] = ["alpha", "beta"],
+			modelId = "anthropic/claude-sonnet-4.5",
+		) {
+			return providers
+				.map(provider => registry.find(provider, modelId))
+				.filter((model): model is NonNullable<typeof model> => model !== undefined);
+		}
+
+		test("keeps available canonical variants sticky across refreshes and releases unavailable variants", async () => {
+			const alpha = providerConfig("https://alpha.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]);
+			const beta = providerConfig("https://beta.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]);
+			writeRawModelsJson({ alpha, beta });
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const candidates = () => fixtureCandidates(registry);
+			const initial = registry.resolveCanonicalModel("claude-sonnet-4-5", {
+				availableOnly: true,
+				candidates: candidates(),
+				sessionId: "session-a",
+			});
+			expect(initial).toBeDefined();
+			expect(["alpha", "beta"]).toContain(initial!.provider);
+
+			await Bun.sleep(10);
+			writeRawModelsJson({ beta, alpha });
+			await registry.refresh("offline");
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: true,
+					candidates: candidates(),
+					sessionId: "session-a",
+				}),
+			).toMatchObject({ provider: initial!.provider, id: initial!.id });
+
+			const { apiKey: _apiKey, ...unavailableInitialProvider } = initial!.provider === "alpha" ? alpha : beta;
+			await Bun.sleep(10);
+			writeRawModelsJson(
+				initial!.provider === "alpha"
+					? { beta, alpha: unavailableInitialProvider }
+					: { beta: unavailableInitialProvider, alpha },
+			);
+			await registry.refresh("offline");
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: true,
+					candidates: candidates(),
+					sessionId: "session-a",
+				})?.provider,
+			).not.toBe(initial!.provider);
+		});
+
+		test("bounds session canonical variants to 64 entries", () => {
+			writeRawModelsJson({
+				alpha: providerConfig("https://alpha.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
+				beta: providerConfig("https://beta.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const candidates = () => fixtureCandidates(registry);
+			const initial = registry.resolveCanonicalModel("claude-sonnet-4-5", {
+				availableOnly: true,
+				candidates: candidates(),
+				sessionId: "session-0",
+			});
+			for (let index = 1; index < 65; index += 1) {
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: true,
+					candidates: candidates(),
+					sessionId: `session-${index}`,
+				});
+			}
+			const reversedCandidates = [...candidates()].reverse();
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: true,
+					candidates: reversedCandidates,
+					sessionId: "session-0",
+				}),
+			).not.toBe(initial);
+		});
 
 		test("prefers vision-capable variant over configured provider order", async () => {
 			await Settings.init({
@@ -648,6 +782,184 @@ describe("ModelRegistry", () => {
 
 			expect(resolved?.input.includes("image")).toBe(true);
 			expect(resolved?.provider).toBe("anthropic");
+		});
+		test("ranks bare aliases and canonical ids identically across provider order conflicts", async () => {
+			await Settings.init({
+				inMemory: true,
+				overrides: { modelProviderOrder: ["beta", "alpha"] },
+			});
+			writeRawModelsJson({
+				alpha: providerConfig("https://alpha.example.com/v1", [{ id: "claude-sonnet-4.5" }]),
+				beta: providerConfig("https://beta.example.com/v1", [{ id: "claude-sonnet-4.5" }]),
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const candidates = [registry.find("alpha", "claude-sonnet-4.5")!, registry.find("beta", "claude-sonnet-4.5")!];
+			const variants = registry.getCanonicalVariants("claude-sonnet-4-5", { candidates });
+			const canonical = registry.resolveCanonicalModel("claude-sonnet-4-5", {
+				availableOnly: false,
+				candidates,
+			});
+			const bare = resolveModelFromString("claude-sonnet-4.5", candidates, undefined, registry);
+
+			// Vision, canonical exactness, source, and input plus cache-read cost all tie.
+			// Provider rank must win even though alpha appears first in catalog order.
+			expect(variants).toHaveLength(2);
+			expect(variants.every(variant => variant.model.id !== "claude-sonnet-4-5")).toBe(true);
+			expect(new Set(variants.map(variant => variant.source)).size).toBe(1);
+			expect(variants.map(variant => variant.model.cost.input + variant.model.cost.cacheRead)).toEqual([0, 0]);
+			expect(canonical).toMatchObject({ provider: "beta", id: "claude-sonnet-4.5" });
+			expect(bare).toBe(canonical);
+		});
+		test("keeps an explicitly seeded canonical variant sticky for a session", () => {
+			writeRawModelsJson({
+				demo: providerConfig("https://demo.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const demoVariant = registry
+				.getCanonicalVariants("claude-sonnet-4-5")
+				.find(entry => entry.model.provider === "demo");
+
+			expect(demoVariant).toBeDefined();
+			expect(registry.seedCanonicalVariant("session", demoVariant!.model)).toBe(true);
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: false,
+					candidates: registry.getAll(),
+					sessionId: "session",
+				}),
+			).toBe(demoVariant!.model);
+		});
+		test("caches available models until disabled providers change", async () => {
+			await Settings.init({ inMemory: true });
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const initial = registry.getAvailable();
+			expect(registry.getAvailable()).toBe(initial);
+
+			settings.setDisabledProviders(["anthropic"]);
+			expect(registry.getAvailable()).not.toBe(initial);
+		});
+
+		test("invalidates available models when a runtime API-key override is set", async () => {
+			await Settings.init({ inMemory: true });
+			const previous = process.env.XAI_API_KEY;
+			delete process.env.XAI_API_KEY;
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const initial = registry.getAvailable();
+				expect(initial.some(model => model.provider === "xai")).toBe(false);
+				authStorage.setRuntimeApiKey("xai", "runtime-test-key");
+				expect(registry.getAvailable()).not.toBe(initial);
+				expect(registry.getAvailable().some(model => model.provider === "xai")).toBe(true);
+			} finally {
+				if (previous === undefined) delete process.env.XAI_API_KEY;
+				else process.env.XAI_API_KEY = previous;
+			}
+		});
+
+		test("refreshes available models when an API-key environment variable changes", async () => {
+			await Settings.init({ inMemory: true });
+			const previous = process.env.XAI_API_KEY;
+			delete process.env.XAI_API_KEY;
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const initial = registry.getAvailable();
+				expect(initial.some(model => model.provider === "xai")).toBe(false);
+				process.env.XAI_API_KEY = "environment-test-key";
+				expect(registry.getAvailable()).not.toBe(initial);
+				expect(registry.getAvailable().some(model => model.provider === "xai")).toBe(true);
+			} finally {
+				if (previous === undefined) delete process.env.XAI_API_KEY;
+				else process.env.XAI_API_KEY = previous;
+			}
+		});
+
+		test("keeps a session canonical variant while it remains available", () => {
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const initial = registry.resolveCanonicalModel("claude-sonnet-4-5", {
+				availableOnly: false,
+				candidates: registry.getAll(),
+				sessionId: "sticky-session",
+			});
+			const resolved = registry.resolveCanonicalModel("claude-sonnet-4-5", {
+				availableOnly: false,
+				candidates: registry.getAll().reverse(),
+				sessionId: "sticky-session",
+			});
+			expect(resolved).toBe(initial);
+		});
+		test("seeds isolated child canonical scopes from a concrete parent model", async () => {
+			const alpha = providerConfig("https://alpha.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]);
+			const beta = providerConfig("https://beta.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]);
+			writeRawModelsJson({ alpha, beta });
+			const parentRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+			const parentModel = parentRegistry.find("alpha", "anthropic/claude-sonnet-4.5");
+			expect(parentModel).toBeDefined();
+			const parentActiveModelPattern = `${parentModel!.provider}/${parentModel!.id}`;
+
+			// A fresh registry has no in-memory parent session stickiness, but its
+			// persisted concrete active model still seeds the child scope.
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const alphaModel = registry.find("alpha", "anthropic/claude-sonnet-4.5")!;
+			const betaModel = registry.find("beta", "anthropic/claude-sonnet-4.5")!;
+			const fixtureModels = () => fixtureCandidates(registry);
+			const childA = "subagent:parent-session:child-a";
+			const childB = "subagent:parent-session:child-b";
+			const lookup: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey"> = {
+				// Pin availability to fixture providers so ambient host credentials
+				// (e.g. OpenGateway) cannot change canonical resolution in this test.
+				getAvailable: () => fixtureModels(),
+				resolveCanonicalModel: registry.resolveCanonicalModel.bind(registry),
+				seedCanonicalVariant: registry.seedCanonicalVariant.bind(registry),
+				getApiKey: async model => (model.provider === "alpha" ? "test-key" : undefined),
+			};
+			const resumed = await resolveModelOverrideWithAuthFallback(
+				["claude-sonnet-4-5"],
+				parentActiveModelPattern,
+				lookup,
+				undefined,
+				"parent-session",
+				undefined,
+				childA,
+			);
+			expect(resumed.model).toBe(alphaModel);
+			// The child-first canonical lookup must not populate the parent scope.
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: true,
+					candidates: [...fixtureModels()].reverse(),
+					sessionId: "parent-session",
+				}),
+			).toBe(betaModel);
+			expect(registry.seedCanonicalVariant(childB, betaModel)).toBe(true);
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: true,
+					candidates: fixtureModels(),
+					sessionId: childB,
+				}),
+			).toBe(betaModel);
+			// Repeated attempts for a child retain its own seeded variant.
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: true,
+					candidates: [...fixtureModels()].reverse(),
+					sessionId: childA,
+				}),
+			).toBe(alphaModel);
+
+			const explicit = resolveModelOverride(["beta/anthropic/claude-sonnet-4.5"], registry, undefined, childA);
+			expect(explicit.model).toBe(betaModel);
+			const fallback = await resolveModelOverrideWithAuthFallback(
+				["beta/anthropic/claude-sonnet-4.5"],
+				parentActiveModelPattern,
+				lookup,
+				undefined,
+				"parent-session",
+				undefined,
+				childA,
+			);
+			expect(fallback.model).toBe(alphaModel);
+			expect(fallback.authFallbackUsed).toBe(true);
 		});
 	});
 
@@ -1149,6 +1461,90 @@ describe("ModelRegistry", () => {
 
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			expect(registry.find("openai", "gpt-5.4")?.contextWindow).toBe(256000);
+		});
+
+		test("custom-only gpt-5.5 completions provider defaults to the Codex-safe context window", () => {
+			writeRawModelsJson({
+				"my-proxy": {
+					baseUrl: "http://127.0.0.1:8317/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [{ id: "gpt-5.5" }],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.find("my-proxy", "gpt-5.5");
+			expect(model?.contextWindow).toBe(272_000);
+			expect(model?.baseUrl).toBe("http://127.0.0.1:8317/v1");
+		});
+		test("id-only custom OpenAI-compatible models default to text-only input", () => {
+			writeRawModelsJson({
+				ali: {
+					baseUrl: "https://token-plan.example.com/compatible-mode/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [{ id: "qwen3.8-max-preview" }],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.find("ali", "qwen3.8-max-preview");
+			// No bundled reference and no explicit input → safe text-only default.
+			// Vision backends must set input: [text, image] or images are stripped.
+			expect(model?.input).toEqual(["text"]);
+			expect(model?.input.includes("image")).toBe(false);
+		});
+
+		test("custom OpenAI-compatible models honor explicit vision input", () => {
+			writeRawModelsJson({
+				ali: {
+					baseUrl: "https://token-plan.example.com/compatible-mode/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [
+						{
+							id: "qwen3.8-max-preview",
+							name: "Qwen3.8 Max Preview",
+							reasoning: true,
+							input: ["text", "image"],
+						},
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.find("ali", "qwen3.8-max-preview");
+			expect(model?.input).toEqual(["text", "image"]);
+			expect(model?.input.includes("image")).toBe(true);
+		});
+
+		test("custom gpt-5.5 responses provider keeps the first-party context window when contextWindow is omitted", () => {
+			writeRawModelsJson({
+				"my-proxy": {
+					baseUrl: "https://my-proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-responses",
+					models: [{ id: "gpt-5.5" }],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.find("my-proxy", "gpt-5.5")?.contextWindow).toBe(1_000_000);
+		});
+
+		test("custom gpt-5.5 completions provider preserves its explicit context window", () => {
+			writeRawModelsJson({
+				"my-proxy": {
+					baseUrl: "http://127.0.0.1:8317/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [{ id: "gpt-5.5", contextWindow: 400000 }],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.find("my-proxy", "gpt-5.5")?.contextWindow).toBe(400000);
 		});
 
 		test("modelOverrides can still patch a custom gpt-5.4 replacement", () => {
@@ -2074,6 +2470,48 @@ describe("ModelRegistry", () => {
 			expect(gemma?.reasoning).toBe(false);
 		});
 
+		test("keeps the newest same-provider discovery result when overlapping refreshes complete out of order", async () => {
+			writeRawModelsJson({
+				race: {
+					baseUrl: "https://race.example.com/v1",
+					api: "openai-completions",
+					auth: "none",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			const firstResponse = Promise.withResolvers<Response>();
+			const firstRequest = Promise.withResolvers<void>();
+			let requests = 0;
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("https://race.example.com/v1/models");
+				requests += 1;
+				if (requests === 1) {
+					firstRequest.resolve();
+					return firstResponse.promise;
+				}
+				return new Response(JSON.stringify({ data: [{ id: "new-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const firstRefresh = registry.refreshProvider("race", "online");
+			await firstRequest.promise;
+			await registry.refreshProvider("race", "online");
+			firstResponse.resolve(
+				new Response(JSON.stringify({ data: [{ id: "old-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+			await firstRefresh;
+
+			expect(registry.getProviderDiscoveryState("race")?.models).toEqual(["new-model"]);
+			expect(registry.find("race", "new-model")).toBeDefined();
+			expect(registry.find("race", "old-model")).toBeUndefined();
+		});
+
 		test("discovery failure does not fail model registry refresh", async () => {
 			writeRawModelsJson({
 				ollama: {
@@ -2664,6 +3102,28 @@ describe("ModelRegistry", () => {
 		});
 		expect(Settings.instance.getModelRole("default")).toBe("proxy/local-selector:high");
 		expect(Settings.instance.get("task.agentModelOverrides").executor).toBe("proxy/executor-selector");
+	});
+
+	test("applies full fallback chains from model bindings", async () => {
+		await Settings.init({ inMemory: true });
+		writeRawModelsConfig({
+			modelBindings: {
+				modelRoles: { default: ["proxy/primary", "proxy/fallback"] },
+				agentModelOverrides: { executor: ["proxy/executor", "proxy/executor-fallback"] },
+			},
+			providers: {
+				proxy: providerConfig("https://proxy.example/v1", [{ id: "primary" }], "openai-completions"),
+			},
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		registry.applyConfiguredModelBindings(Settings.instance);
+
+		expect(Settings.instance.get("modelRoles").default).toEqual(["proxy/primary", "proxy/fallback"]);
+		expect(Settings.instance.get("task.agentModelOverrides").executor).toEqual([
+			"proxy/executor",
+			"proxy/executor-fallback",
+		]);
 	});
 
 	test("defers model bindings until settings are initialized", () => {

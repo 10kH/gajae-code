@@ -1,3 +1,4 @@
+import { CODEX_GPT_5_6_CONTEXT_CAP, isCodexGpt56Tier, isCodexProductTransport } from "./context-cap-policy";
 import { resolveOpenAICompat } from "./providers/openai-completions-compat";
 import type { Api, Model as ApiModel, ThinkingConfig } from "./types";
 import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-capability";
@@ -47,7 +48,9 @@ const DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX: readonly Effort[] = [
 const GEMINI_3_PRO_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High];
 const GEMINI_3_FLASH_EFFORTS: readonly Effort[] = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High];
 const GPT_5_2_PLUS_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh];
+const GPT_5_6_PLUS_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max];
 const GPT_5_5_DEFAULT_EFFORT = Effort.XHigh;
+const KIMI_K3_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max];
 
 const GPT_5_1_CODEX_MINI_EFFORTS: readonly Effort[] = [Effort.Medium, Effort.High];
 const CLOUDFLARE_AI_GATEWAY_BASE_URL = "https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic";
@@ -59,8 +62,19 @@ type SemVer = {
 };
 
 type GeminiKind = "pro" | "flash";
-type AnthropicKind = "opus" | "sonnet";
-type OpenAIVariant = "base" | "codex" | "codex-max" | "codex-mini" | "codex-spark" | "mini" | "max" | "nano";
+type AnthropicKind = "opus" | "sonnet" | "fable";
+type OpenAIVariant =
+	| "base"
+	| "codex"
+	| "codex-max"
+	| "codex-mini"
+	| "codex-spark"
+	| "luna"
+	| "mini"
+	| "max"
+	| "nano"
+	| "sol"
+	| "terra";
 
 const CODEX_GPT_5_4_PRIORITY_BY_VARIANT: Partial<Record<OpenAIVariant, number>> = {
 	base: 0,
@@ -465,9 +479,21 @@ function applyGpt55ContextWindow(model: ApiModel<Api>, parsedModel: OpenAIModel)
 	}
 	return false;
 }
+function applyGpt56ContextWindow(model: ApiModel<Api>): boolean {
+	if (!isCodexGpt56Tier(model) || !isCodexProductTransport(model)) {
+		return false;
+	}
+	// Codex product metadata is bounded by the currently enforced prompt cap.
+	// Smaller observed limits remain authoritative; first-party OpenAI is untouched.
+	model.contextWindow = Math.min(model.contextWindow, CODEX_GPT_5_6_CONTEXT_CAP.ceiling);
+	return true;
+}
 
 function applyOpenAICatalogPolicy(model: ApiModel<Api>, parsedModel: OpenAIModel): void {
 	if (applyGpt55ContextWindow(model, parsedModel)) {
+		return;
+	}
+	if (applyGpt56ContextWindow(model)) {
 		return;
 	}
 	// OpenAI code backend models: 400K figure includes output budget; input window is 272K.
@@ -491,6 +517,9 @@ function applyOpenAICatalogPolicy(model: ApiModel<Api>, parsedModel: OpenAIModel
 }
 
 function inferDefaultEffort<TApi extends Api>(model: ApiModel<TApi>, parsedModel: ParsedModel): Effort | undefined {
+	if (model.provider === "kimi-code" && model.id === "k3") {
+		return Effort.High;
+	}
 	if (
 		parsedModel.family === "openai" &&
 		model.provider === "openai-codex" &&
@@ -566,6 +595,9 @@ function expandEffortRange(thinking: ThinkingConfig): readonly Effort[] {
 }
 
 function inferSupportedEfforts<TApi extends Api>(parsedModel: ParsedModel, model: ApiModel<TApi>): readonly Effort[] {
+	if (model.provider === "kimi-code" && model.id === "k3") {
+		return KIMI_K3_EFFORTS;
+	}
 	switch (parsedModel.family) {
 		case "openai":
 			return inferOpenAISupportedEfforts(parsedModel);
@@ -581,6 +613,9 @@ function inferSupportedEfforts<TApi extends Api>(parsedModel: ParsedModel, model
 function inferOpenAISupportedEfforts(model: OpenAIModel): readonly Effort[] {
 	if (model.variant === "codex-mini" && semverEqual(model.version, "5.1")) {
 		return GPT_5_1_CODEX_MINI_EFFORTS;
+	}
+	if (semverGte(model.version, "5.6")) {
+		return GPT_5_6_PLUS_EFFORTS;
 	}
 	if (semverGte(model.version, "5.2")) {
 		return GPT_5_2_PLUS_EFFORTS;
@@ -603,6 +638,11 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 		(model.api === "anthropic-messages" || model.api === "bedrock-converse-stream") &&
 		semverGte(parsedModel.version, "4.6")
 	) {
+		if (parsedModel.kind === "fable") {
+			// Fable exposes Anthropic's Messages-only xhigh preset; Bedrock
+			// Converse lacks it (same split as Opus 4.7+ below).
+			return model.api === "anthropic-messages" ? DEFAULT_REASONING_EFFORTS_WITH_XHIGH : DEFAULT_REASONING_EFFORTS;
+		}
 		if (parsedModel.kind !== "opus") return DEFAULT_REASONING_EFFORTS;
 		return anthropicModelHasRealXHighEffort(model)
 			? DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX
@@ -662,7 +702,10 @@ function inferThinkingControlMode<TApi extends Api>(
 
 		case "bedrock-converse-stream":
 			if (parsedModel.family === "anthropic") {
-				if (semverGte(parsedModel.version, "4.6") && parsedModel.kind === "opus") {
+				if (
+					semverGte(parsedModel.version, "4.6") &&
+					(parsedModel.kind === "opus" || parsedModel.kind === "fable")
+				) {
 					return "anthropic-adaptive";
 				}
 				if (semverGte(parsedModel.version, "4.5")) {
@@ -702,7 +745,7 @@ function parseGeminiModel(modelId: string): GeminiModel | null {
 }
 
 function parseAnthropicModel(modelId: string): AnthropicModel | null {
-	const match = /claude-(opus|sonnet)-(\d{1,2}(?:[.-]\d{1,2}){0,2})\b/.exec(modelId);
+	const match = /claude-(opus|sonnet|fable)-(\d{1,2}(?:[.-]\d{1,2}){0,2})\b/.exec(modelId);
 	if (!match) {
 		return null;
 	}
@@ -714,7 +757,10 @@ function parseAnthropicModel(modelId: string): AnthropicModel | null {
 }
 
 function parseOpenAIModel(modelId: string): OpenAIModel | null {
-	const match = /gpt-(\d+(?:\.\d+){0,2})(?:-(codex-spark|codex-mini|codex-max|codex|mini|max|nano))?$/.exec(modelId);
+	const match =
+		/gpt-(\d+(?:\.\d+){0,2})(?:-(codex-spark|codex-mini|codex-max|codex|luna|mini|max|nano|sol|terra))?$/.exec(
+			modelId,
+		);
 	if (!match) {
 		return null;
 	}

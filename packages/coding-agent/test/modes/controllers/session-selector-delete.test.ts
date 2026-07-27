@@ -26,10 +26,13 @@ function createSession(id: string, title: string): SessionInfo {
 	};
 }
 
-function createSelector(onDelete: (session: SessionInfo) => Promise<boolean>): SessionSelectorComponent {
+function createSelector(
+	onDelete: (session: SessionInfo) => Promise<boolean>,
+	onSelect: (sessionPath: string) => void = () => {},
+): SessionSelectorComponent {
 	return new SessionSelectorComponent(
 		[createSession("session-a", "Alpha"), createSession("session-b", "Beta")],
-		() => {},
+		onSelect,
 		() => {},
 		() => {},
 		onDelete,
@@ -37,7 +40,7 @@ function createSelector(onDelete: (session: SessionInfo) => Promise<boolean>): S
 }
 
 function renderText(selector: SessionSelectorComponent): string {
-	return selector.render(120).join("\n");
+	return Bun.stripANSI(selector.render(120).join("\n"));
 }
 
 describe("SessionSelectorComponent delete confirmation", () => {
@@ -48,8 +51,11 @@ describe("SessionSelectorComponent delete confirmation", () => {
 		const selector = createSelector(onDelete);
 
 		selector.handleInput("\x1b[3~");
-		expect(renderText(selector)).toContain("Delete session?");
+		expect(renderText(selector)).toContain("Delete selected session transcript and artifacts?");
 		expect(renderText(selector)).toContain("Alpha");
+		expect(renderText(selector)).toContain(
+			"This cannot be undone. Other sessions and topic/history metadata are not deleted.",
+		);
 
 		selector.handleInput("\n");
 		await Bun.sleep(0);
@@ -59,7 +65,7 @@ describe("SessionSelectorComponent delete confirmation", () => {
 		expect(rendered).toContain("Error: disk failed");
 		expect(rendered).toContain("Alpha");
 		expect(rendered).toContain("Beta");
-		expect(rendered).not.toContain("Delete session?");
+		expect(rendered).not.toContain("Delete selected session transcript and artifacts?");
 	});
 
 	it("keeps the session visible when delete is canceled upstream", async () => {
@@ -89,5 +95,44 @@ describe("SessionSelectorComponent delete confirmation", () => {
 		expect(onDelete).toHaveBeenCalledTimes(1);
 		expect(rendered).not.toContain("Alpha");
 		expect(rendered).toContain("Beta");
+	});
+
+	it("runs an accepted delete at most once while it is pending", async () => {
+		const pending = Promise.withResolvers<boolean>();
+		const onDelete = vi.fn(() => pending.promise);
+		const selector = createSelector(onDelete);
+
+		selector.handleInput("\x1b[3~");
+		selector.handleInput("\n");
+		selector.handleInput("\n");
+		selector.handleInput("\x1b");
+		expect(onDelete).toHaveBeenCalledTimes(1);
+		expect(renderText(selector)).toContain("Delete selected session transcript and artifacts?");
+
+		pending.resolve(true);
+		await pending.promise;
+		await Bun.sleep(0);
+		expect(renderText(selector)).not.toContain("Alpha");
+		expect(renderText(selector)).not.toContain("Delete selected session transcript and artifacts?");
+	});
+	it("keeps selection valid after navigating empty search results", async () => {
+		const onSelect = vi.fn();
+		const selector = createSelector(async () => false, onSelect);
+
+		for (const char of "zzz") selector.handleInput(char);
+		expect(renderText(selector)).toContain("No sessions in current folder");
+
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[6~");
+		for (let i = 0; i < 3; i++) selector.handleInput("\x7f");
+
+		const rendered = renderText(selector);
+		expect(rendered).toContain("Alpha");
+		expect(rendered).toContain("❯ Alpha");
+
+		selector.handleInput("\n");
+		await Bun.sleep(0);
+
+		expect(onSelect).toHaveBeenCalledWith("/tmp/session-a.jsonl");
 	});
 });

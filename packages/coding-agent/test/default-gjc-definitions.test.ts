@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import DeepInterview from "@gajae-code/coding-agent/commands/deep-interview";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
 	GJC_MODEL_ASSIGNMENT_TARGETS,
@@ -14,17 +15,31 @@ import {
 	installDefaultGjcDefinitions,
 } from "@gajae-code/coding-agent/defaults/gjc-defaults";
 import { loadSkills, resetActiveSkillsForTests, setActiveSkills } from "@gajae-code/coding-agent/extensibility/skills";
+import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
+import { WORKFLOW_MANIFEST } from "@gajae-code/coding-agent/gjc-runtime/workflow-manifest";
 import { parseInternalUrl } from "@gajae-code/coding-agent/internal-urls/parse";
 import { SkillProtocolHandler } from "@gajae-code/coding-agent/internal-urls/skill-protocol";
 import { getBundledAgent } from "@gajae-code/coding-agent/task/agents";
 import { discoverAgents } from "@gajae-code/coding-agent/task/discovery";
+import { checkBashAllowedPrefixes } from "@gajae-code/coding-agent/tools/bash-allowed-prefixes";
+import { prompt } from "@gajae-code/utils";
 
 const tempRoots: string[] = [];
 const roleAgentNames = ["architect", "critic", "executor", "planner"] as const;
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 
+function extractPromptSection(content: string, sectionName: string): string {
+	const sectionMatch = content.match(new RegExp(`<${sectionName}>\\n([\\s\\S]*?)\\n</${sectionName}>`));
+	const sectionContent = sectionMatch?.[1];
+	if (sectionContent === undefined) throw new Error(`missing <${sectionName}> section`);
+	return sectionContent;
+}
+
 async function makeTempRoot(): Promise<string> {
-	const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-default-definitions-"));
+	// Keep project-discovery fixtures outside the real user HOME even when
+	// TMPDIR points at ~/tmp; otherwise walk-up discovery can pick up
+	// ~/.gjc/agents as a project config directory.
+	const tempRoot = await fs.mkdtemp(path.join(path.sep, "tmp", "gjc-default-definitions-"));
 	tempRoots.push(tempRoot);
 	return tempRoot;
 }
@@ -34,9 +49,11 @@ async function withTempHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
 	const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-default-home-"));
 	tempRoots.push(home);
 	process.env.HOME = home;
+	const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(home);
 	try {
 		return await fn(home);
 	} finally {
+		homedirSpy.mockRestore();
 		if (originalHome === undefined) {
 			delete process.env.HOME;
 		} else {
@@ -60,14 +77,15 @@ describe("default GJC definitions", () => {
 
 		expect(skills).toEqual(expected);
 		expect(workflowDefinitions).toHaveLength(4);
-		expect(definitions).toHaveLength(8);
+		expect(definitions).toHaveLength(9);
 		expect(workflowDefinitions.every(definition => definition.relativePath.startsWith("skills/"))).toBe(true);
 		expect(workflowDefinitions.every(definition => definition.content.includes(definition.name))).toBe(true);
-		expect(fragmentDefinitions).toHaveLength(4);
+		expect(fragmentDefinitions).toHaveLength(5);
 		expect(fragmentDefinitions.map(definition => definition.parentSkillName).sort()).toEqual([
 			"deep-interview",
 			"deep-interview",
 			"deep-interview",
+			"ultragoal",
 			"ultragoal",
 		]);
 		expect(fragmentDefinitions.map(definition => definition.relativePath).sort()).toEqual([
@@ -75,7 +93,213 @@ describe("default GJC definitions", () => {
 			"skill-fragments/deep-interview/auto-research-greenfield.md",
 			"skill-fragments/deep-interview/lateral-review-panel.md",
 			"skill-fragments/ultragoal/ai-slop-cleaner.md",
+			"skill-fragments/ultragoal/pipeline-validation-contracts.md",
 		]);
+		const team = workflowDefinitions.find(definition => definition.name === "team");
+		expect(team?.content).toContain("supported surfaces only");
+		expect(team?.content).toContain("`planner` for broad context mapping/sequencing");
+		expect(team?.content).toContain("`architect` for architecture or external-doc-risk assessment");
+		expect(team?.content).not.toMatch(/auto-delegate `researcher`|`researcher` as an evidence lane/i);
+	});
+	it("keeps deep-interview normal flow typed and its generated manifest aligned", async () => {
+		const deepInterview = getDefaultGjcDefinitions().find(
+			definition => definition.kind === "skill" && definition.name === "deep-interview",
+		);
+		if (!deepInterview) throw new Error("missing deep-interview skill");
+
+		const phaseFiveIndex = deepInterview.content.indexOf("## Phase 5: Execution Bridge");
+		const normalFlow = deepInterview.content.slice(0, phaseFiveIndex);
+		expect(normalFlow).toContain("initialize-context");
+		expect(normalFlow).toContain("confirm-topology");
+		expect(normalFlow).toContain("record-answer");
+		expect(normalFlow).toContain("apply-round-result");
+		expect(normalFlow).toContain("sanity-check");
+		expect(normalFlow).not.toMatch(/gjc state(?: deep-interview)? write --input/);
+
+		const publicExamples = DeepInterview.examples;
+		expect(publicExamples).toContain(
+			"$ gjc deep-interview initialize-context --draft-id <id> --expected-draft-revision <n> --json",
+		);
+		expect(publicExamples.every(example => /(?:^|\s)--json(?:\s|$)/.test(example))).toBe(true);
+		expect(publicExamples.join("\n")).not.toMatch(
+			/draft consume|--input-json|--question-json|--answer-json|--result-json|\{.*\}/,
+		);
+
+		const verbs = WORKFLOW_MANIFEST["deep-interview"].verbs;
+		expect(verbs.filter(verb => verb.name.startsWith("draft ")).map(verb => verb.name)).toEqual([
+			"draft create",
+			"draft edit",
+			"draft show",
+			"draft check",
+			"draft rebase",
+			"draft discard",
+		]);
+		expect(verbs.find(verb => verb.name === "draft consume")).toBeUndefined();
+		expect(
+			verbs
+				.filter(verb =>
+					["initialize-context", "confirm-topology", "record-answer", "apply-round-result"].includes(verb.name),
+				)
+				.every(verb => !verb.compatibilityOnly),
+		).toBe(true);
+
+		const generated = JSON.parse(
+			await fs.readFile(
+				path.join(repoRoot, "packages/coding-agent/src/gjc-runtime/workflow-manifest.generated.json"),
+				"utf8",
+			),
+		) as Record<string, unknown>;
+		expect(generated["deep-interview"]).toEqual(WORKFLOW_MANIFEST["deep-interview"]);
+	});
+	it("routes draft commands and typed draft consumption before kickoff parsing while preserving --write precedence", async () => {
+		const cwd = await makeTempRoot();
+		const draftRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-deep-interview-draft-root-"));
+		tempRoots.push(draftRoot);
+		const previousRoot = process.env.GJC_DEEP_INTERVIEW_DRAFT_ROOT;
+		process.env.GJC_DEEP_INTERVIEW_DRAFT_ROOT = draftRoot;
+		try {
+			const kickoff = await runNativeDeepInterviewCommand(
+				["--session-id", "draft-routing", "--json", "draft routing state"],
+				cwd,
+			);
+			expect(kickoff.status).toBe(0);
+			const created = await runNativeDeepInterviewCommand(
+				["draft", "create", "--for", "initialize-context", "--session-id", "draft-routing", "--json"],
+				cwd,
+			);
+			expect(created.status).toBe(0);
+			expect(JSON.parse(created.stdout ?? "{}").draft.kind).toBe("initialize-context");
+			const consumed = await runNativeDeepInterviewCommand(
+				[
+					"initialize-context",
+					"--draft-id",
+					JSON.parse(created.stdout ?? "{}").draft.id,
+					"--expected-draft-revision",
+					"1",
+					"--json",
+				],
+				cwd,
+			);
+			expect(consumed.stderr).toContain("DI_INVALID_INPUT_JSON");
+			expect(await runNativeDeepInterviewCommand(["draft", "create", "--write"], cwd)).toEqual({
+				status: 2,
+				stderr: "--spec is required for deep-interview --write\n",
+			});
+		} finally {
+			if (previousRoot === undefined) delete process.env.GJC_DEEP_INTERVIEW_DRAFT_ROOT;
+			else process.env.GJC_DEEP_INTERVIEW_DRAFT_ROOT = previousRoot;
+		}
+	});
+	it("keeps the public typed deep-interview repair CLI contract documented", async () => {
+		const documentation = await fs.readFile(path.join(repoRoot, "docs/deep-interview-repair-cli.md"), "utf8");
+
+		for (const verb of WORKFLOW_MANIFEST["deep-interview"].verbs.filter(
+			verb => verb.surface === "command-positional",
+		)) {
+			expect(documentation).toContain(`gjc deep-interview ${verb.name}`);
+		}
+		expect(documentation).toContain('"global_scores"');
+		expect(documentation).toContain("greenfield");
+		expect(documentation).toContain("brownfield");
+		expect(documentation).toContain("TextView");
+		expect(documentation).toContain("DI_POST_COMMIT_AUDIT_FAILED");
+		expect(documentation).toContain("Do **not** use `grep`, `sed`, direct `.gjc/` edits");
+	});
+	it("declares the complete typed deep-interview verb argument matrix", () => {
+		const typedArgs = WORKFLOW_MANIFEST["deep-interview"].typedArgs;
+		const argsFor = (verb: string, compatibilityOnly = false) =>
+			typedArgs
+				.filter(arg => (arg.compatibilityOnly ?? false) === compatibilityOnly && arg.appliesToVerbs?.includes(verb))
+				.map(arg => ({ name: arg.name, type: arg.type, required: arg.required ?? false }))
+				.sort((left, right) => left.name.localeCompare(right.name));
+		expect(argsFor("draft create")).toEqual([
+			{ name: "component-id", type: "string", required: false },
+			{ name: "dimension", type: "string", required: false },
+			{ name: "for", type: "enum", required: true },
+			{ name: "json", type: "boolean", required: true },
+			{ name: "question-id", type: "string", required: false },
+			{ name: "round", type: "number", required: false },
+			{ name: "round-id", type: "string", required: false },
+			{ name: "round-key", type: "string", required: false },
+			{ name: "session-id", type: "string", required: true },
+		]);
+		expect(argsFor("draft edit")).toEqual([
+			{ name: "draft-id", type: "string", required: true },
+			{ name: "expected-draft-revision", type: "number", required: true },
+			{ name: "json", type: "boolean", required: true },
+			{ name: "null", type: "boolean", required: false },
+			{ name: "op", type: "enum", required: true },
+			{ name: "path", type: "string", required: true },
+			{ name: "value", type: "string", required: false },
+			{ name: "value-file", type: "string", required: false },
+		]);
+		expect(argsFor("draft rebase")).toEqual([
+			{ name: "draft-id", type: "string", required: true },
+			{ name: "expected-draft-revision", type: "number", required: true },
+			{ name: "json", type: "boolean", required: true },
+			{ name: "to-state-revision", type: "number", required: true },
+		]);
+		for (const verb of ["draft show", "draft check"]) {
+			expect(argsFor(verb)).toEqual([
+				{ name: "draft-id", type: "string", required: true },
+				{ name: "json", type: "boolean", required: true },
+			]);
+		}
+		expect(argsFor("draft discard")).toEqual([
+			{ name: "draft-id", type: "string", required: true },
+			{ name: "expected-draft-revision", type: "number", required: true },
+			{ name: "json", type: "boolean", required: true },
+		]);
+
+		for (const verb of ["initialize-context", "confirm-topology", "record-answer", "apply-round-result"]) {
+			expect(argsFor(verb)).toEqual([
+				{ name: "draft-id", type: "string", required: true },
+				{ name: "expected-draft-revision", type: "number", required: true },
+				{ name: "json", type: "boolean", required: true },
+			]);
+		}
+		expect(argsFor("initialize-context", true)).toEqual([
+			{ name: "expected-revision", type: "number", required: true },
+			{ name: "input-json", type: "object", required: true },
+			{ name: "schema-version", type: "number", required: true },
+			{ name: "session-id", type: "string", required: true },
+		]);
+		expect(argsFor("confirm-topology", true)).toEqual(argsFor("initialize-context", true));
+		expect(argsFor("record-answer", true)).toEqual([
+			{ name: "answer-json", type: "object", required: true },
+			{ name: "component-id", type: "string", required: false },
+			{ name: "dimension", type: "string", required: false },
+			{ name: "expected-revision", type: "number", required: true },
+			{ name: "question-id", type: "string", required: true },
+			{ name: "question-json", type: "string", required: true },
+			{ name: "round", type: "number", required: true },
+			{ name: "round-id", type: "string", required: false },
+			{ name: "schema-version", type: "number", required: true },
+			{ name: "session-id", type: "string", required: true },
+		]);
+		expect(argsFor("apply-round-result", true)).toEqual([
+			{ name: "expected-revision", type: "number", required: true },
+			{ name: "question-id", type: "string", required: true },
+			{ name: "result-json", type: "object", required: true },
+			{ name: "round", type: "number", required: true },
+			{ name: "round-id", type: "string", required: false },
+			{ name: "schema-version", type: "number", required: true },
+			{ name: "session-id", type: "string", required: true },
+		]);
+		expect(argsFor("inspect")).toEqual([
+			{ name: "cursor", type: "string", required: false },
+			{ name: "json", type: "boolean", required: true },
+			{ name: "limit", type: "number", required: false },
+			{ name: "round-key", type: "string", required: false },
+			{ name: "selector", type: "enum", required: true },
+			{ name: "session-id", type: "string", required: true },
+		]);
+		expect(argsFor("sanity-check")).toEqual([
+			{ name: "json", type: "boolean", required: true },
+			{ name: "session-id", type: "string", required: true },
+		]);
+		expect(argsFor("inspect", true)).toEqual([]);
+		expect(argsFor("sanity-check", true)).toEqual([]);
 	});
 
 	it("exposes deep-interview fragments only through the parent-scoped fragment accessor", () => {
@@ -96,7 +320,7 @@ describe("default GJC definitions", () => {
 		expect(fragments.every(fragment => fragment.content.includes("read-only architect"))).toBe(true);
 	});
 
-	it("exposes the ultragoal ai-slop-cleaner fragment only through the parent-scoped fragment accessor", () => {
+	it("exposes the ultragoal fragments only through the parent-scoped fragment accessor", () => {
 		const fragments = getEmbeddedDefaultGjcSkillFragments("ultragoal");
 
 		expect(
@@ -104,17 +328,24 @@ describe("default GJC definitions", () => {
 				.map(skill => skill.name)
 				.sort(),
 		).toEqual([...DEFAULT_GJC_DEFINITION_NAMES].sort());
-		expect(fragments).toHaveLength(1);
-		expect(fragments.map(fragment => fragment.kind)).toEqual(["skill-fragment"]);
-		expect(fragments.map(fragment => fragment.relativePath)).toEqual([
+		expect(fragments).toHaveLength(2);
+		expect(fragments.map(fragment => fragment.kind)).toEqual(["skill-fragment", "skill-fragment"]);
+		expect(fragments.map(fragment => fragment.relativePath).sort()).toEqual([
 			"skill-fragments/ultragoal/ai-slop-cleaner.md",
+			"skill-fragments/ultragoal/pipeline-validation-contracts.md",
 		]);
-		expect(fragments[0]!.content).toContain("AI SLOP CLEANUP REPORT");
-		expect(fragments[0]!.content).toContain("read-only detector");
+		const cleaner = fragments.find(fragment => fragment.relativePath.endsWith("ai-slop-cleaner.md"))!;
+		expect(cleaner.content).toContain("AI SLOP CLEANUP REPORT");
+		expect(cleaner.content).toContain("read-only detector");
+		const contracts = fragments.find(fragment => fragment.relativePath.endsWith("pipeline-validation-contracts.md"))!;
+		expect(contracts.content).toContain("never user-facing");
+		expect(contracts.content).toContain("fails closed");
 	});
 
 	it("authors the ai-slop-cleaner fragment with the mandated report labels and full taxonomy", () => {
-		const fragment = getEmbeddedDefaultGjcSkillFragments("ultragoal")[0]!;
+		const fragment = getEmbeddedDefaultGjcSkillFragments("ultragoal").find(candidate =>
+			candidate.relativePath.endsWith("ai-slop-cleaner.md"),
+		)!;
 		const content = fragment.content;
 
 		for (const label of [
@@ -214,7 +445,19 @@ describe("default GJC definitions", () => {
 			expect(agent?.tools).toContain("bash");
 			expect(agent?.tools).not.toContain("edit");
 			expect(agent?.tools).not.toContain("write");
-			expect(agent?.bashAllowedPrefixes).toEqual(["gjc ralplan --write", "gjc state"]);
+			expect(agent?.bashAllowedPrefixes).toEqual([
+				"gjc ralplan --write",
+				"gjc state",
+				"git status",
+				"git log",
+				"git show",
+				"git diff",
+				"git blame",
+				"git rev-parse",
+				"git ls-files",
+			]);
+			expect(agent?.tools).toContain("web_search");
+			expect(agent?.tools).toContain("irc");
 		}
 		for (const agent of [executor, architect, planner, critic]) {
 			expect(agent?.model).toBeUndefined();
@@ -225,6 +468,63 @@ describe("default GJC definitions", () => {
 		expect(planner?.systemPrompt).toContain("you do not implement");
 		expect(critic?.systemPrompt).toContain("OKAY");
 		expect(critic?.systemPrompt).toContain("REJECT");
+	});
+	it("allows read-only git and blocks mutating git for role agents through the real prefix check", () => {
+		const allowed = [
+			"git status",
+			"git log --oneline -20",
+			"git log -p src/a.ts",
+			"git show HEAD^",
+			"git diff",
+			"git diff 'HEAD~1'",
+			"git blame src/foo.ts",
+			"git rev-parse HEAD",
+			"git ls-files",
+			"gjc ralplan --write --stage architect --stage_n 1 --artifact 'verdict'",
+		];
+		const blocked = [
+			"git commit -m x",
+			"git push",
+			"git push --force origin main",
+			"git reset --hard",
+			"git checkout .",
+			"git branch -D main",
+			"git config user.name x",
+			"git status; rm -rf .gjc",
+			"rm -rf .gjc",
+			"echo verdict",
+		];
+
+		for (const name of ["architect", "planner", "critic"] as const) {
+			const prefixes = getBundledAgent(name)?.bashAllowedPrefixes;
+			expect(prefixes).toBeDefined();
+
+			for (const command of allowed) {
+				expect({ name, command, ...checkBashAllowedPrefixes(command, prefixes) }).toMatchObject({
+					allowed: true,
+				});
+			}
+			for (const command of blocked) {
+				expect({ name, command, ...checkBashAllowedPrefixes(command, prefixes) }).toMatchObject({
+					allowed: false,
+				});
+			}
+		}
+	});
+	it("renders shared ralplan partials while keeping the default executor prompt unchanged", () => {
+		const executor = getBundledAgent("executor");
+		const planner = getBundledAgent("planner");
+		const architect = getBundledAgent("architect");
+		const critic = getBundledAgent("critic");
+
+		expect(prompt.render(executor?.systemPrompt ?? "", { ultragoalRedTeam: false })).not.toContain(
+			"<ultragoal_red_team_mode>",
+		);
+		for (const agent of [planner, architect, critic]) {
+			expect(agent?.systemPrompt).toContain("GJC_RALPLAN_ARTIFACT");
+			expect(agent?.systemPrompt).toContain(`--stage ${agent?.name}`);
+			expect(agent?.systemPrompt).toContain("restricted `bash`");
+		}
 	});
 
 	it("makes installed project workflow skills discoverable without installing project agent stubs", async () => {
@@ -279,7 +579,7 @@ Project executor override body.
 		});
 	});
 
-	it("documents role-agent delegation in system and ultragoal prompts", async () => {
+	it("keeps role-agent routing concise in the system prompt", async () => {
 		const systemPrompt = await Bun.file(
 			path.join(repoRoot, "packages", "coding-agent", "src", "prompts", "system", "system-prompt.md"),
 		).text();
@@ -287,19 +587,105 @@ Project executor override body.
 			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ultragoal", "SKILL.md"),
 		).text();
 
-		for (const name of roleAgentNames) {
-			expect(systemPrompt).toContain(name);
-			expect(ultragoal).toContain(name);
-		}
-		expect(systemPrompt).toContain("delegate bounded slices to `executor`");
-		expect(systemPrompt).toContain("committed repo-visible `.gjc` defaults are not the source of truth");
-		expect(ultragoal).toContain("run `ralplan` first");
+		expect(systemPrompt).toContain("Delegate large implementation slices to `executor`");
+		expect(systemPrompt).not.toContain("<role-agent-surface>");
 		expect(ultragoal).toContain("Role agents return implementation/review evidence");
-		expect(ultragoal).toContain("await timeout only limits the leader's wait");
-		expect(ultragoal).toContain("must not be used as a cancellation reason");
-		expect(ultragoal).toContain("the subagent has actually failed");
-		expect(ultragoal).toContain("gone off-track");
-		expect(ultragoal).toContain("become unrecoverably wrong");
+	});
+
+	it("documents validation-batch granularity, contract, and intra-goal lane parallelism in the ultragoal prompt", async () => {
+		const ultragoal = await Bun.file(
+			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ultragoal", "SKILL.md"),
+		).text();
+
+		// A: create-goals granularity — merge validation-coupled stories, fan out executor slices.
+		expect(ultragoal).toContain("validation-coupled");
+		expect(ultragoal).toContain("Merge validation-coupled stories into one goal");
+		expect(ultragoal).toContain("fan out executor slices");
+		expect(ultragoal).toContain("the same feature stack");
+		expect(ultragoal).toContain("the same red-team surface");
+		expect(ultragoal).toContain("the same final review boundary");
+
+		// B: validation-batch contract summary in the SKILL; full contract in the fragment.
+		expect(ultragoal).toContain("## Validation batches (aggregate-only)");
+		expect(ultragoal).toContain("--validation-batch-json");
+		expect(ultragoal).toContain("aggregate-only");
+		expect(ultragoal).toContain("fail-closed");
+		expect(ultragoal).toContain("deferredToBatch");
+		expect(ultragoal).toContain("validation-batch-deferred");
+		expect(ultragoal).toContain("validationBatchClose");
+		expect(ultragoal).toContain("mutually exclusive");
+		expect(ultragoal).toContain("no batch/pipeline mixing");
+		expect(ultragoal).toContain("out-of-order close is rejected");
+		expect(ultragoal).toContain("append-only proof");
+		expect(ultragoal).toContain("cumulative-since-base");
+		expect(ultragoal).toContain("skill-fragments/ultragoal/pipeline-validation-contracts.md");
+
+		const contracts = getEmbeddedDefaultGjcSkillFragments("ultragoal").find(fragment =>
+			fragment.relativePath.endsWith("pipeline-validation-contracts.md"),
+		)!;
+		expect(contracts.content).toContain("deferredToBatch");
+		expect(contracts.content).toContain("validation-batch-deferred");
+		expect(contracts.content).toContain("validationBatchClose");
+		expect(contracts.content).toContain("out-of-order close is rejected");
+		expect(contracts.content).toContain("append-only proof");
+		expect(contracts.content).toContain("Never stamp");
+		expect(contracts.content).toContain("cumulative-since-base");
+		expect(contracts.content).toContain("`cumulativeFromBase: true`");
+		expect(contracts.content).toContain("`memberGoalId` is a label not a per-path attribution");
+		expect(contracts.content).toContain("Batch invalidation is fail-closed");
+
+		// B: receipts freshness for deferred members.
+		expect(ultragoal).toContain(
+			"Deferred per-goal receipts (validation-batch members) are incomplete until a matching fresh batch-close receipt exists",
+		);
+
+		// C: intra-goal validation-lane parallelism.
+		expect(ultragoal).toContain("### Intra-goal validation-lane parallelism");
+		expect(ultragoal).toContain("frozen post-cleaner change set");
+		expect(ultragoal).toContain("architect review and the executor QA/red-team lane MAY run in parallel");
+		expect(ultragoal).toContain("join before checkpoint");
+		expect(ultragoal).toContain("Fall back to **sequential** lanes");
+		expect(ultragoal).toContain("red-team lane depends on architect fixes");
+	});
+
+	it("routes simple clear implementation requests directly without contradictory workflow escalation", async () => {
+		const systemPrompt = await Bun.file(
+			path.join(repoRoot, "packages", "coding-agent", "src", "prompts", "system", "system-prompt.md"),
+		).text();
+		const routing = extractPromptSection(systemPrompt, "routing");
+		const decomposition = extractPromptSection(systemPrompt, "decomposition");
+
+		expect(routing).toContain("Clear, low-risk implementation requests use direct tools");
+		expect(routing).toContain("Small verification needs do not turn a clear request into a planning workflow");
+		expect(routing).toContain(
+			"Ambiguous implementation asks with a missing target, scope, acceptance criteria, or safety boundary",
+		);
+		expect(routing).toContain("Informational questions are answer-only/read-only");
+		expect(routing).toContain("Vague requirements use `/skill:deep-interview`");
+		expect(routing).toContain("requirements-only workflow that must not mutate product code");
+		expect(routing).toContain("Deep-interview state is runtime-owned");
+		expect(routing).toContain("gjc deep-interview sanity-check");
+		expect(routing).toContain("repair through typed operations using CLI-generated/edited drafts");
+		expect(routing).toContain("normal flow must never reconstruct a payload or full envelope");
+		expect(routing).toContain("`/skill:ralplan --deliberate`");
+		expect(routing).toContain("`/skill:ultragoal`");
+		expect(routing).toContain("`/skill:team`");
+		expect(routing).toContain("Delegate large implementation slices to `executor`");
+		expect(routing).toContain("read the full skill text and follow it exactly");
+		expect(routing).toContain(
+			"Before explicit execution approval, planning and interview workflows NEVER edit product source",
+		);
+		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(10);
+		expect(decomposition).toMatch(/skip it for one-step or obvious two-step fixes/i);
+	});
+
+	it("honors explicit ultragoal/team naming as ralplan execution approval", async () => {
+		const ralplan = await Bun.file(
+			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ralplan", "SKILL.md"),
+		).text();
+		expect(ralplan).toContain("explicit-execution exception");
+		expect(ralplan).toContain("counts as opting into execution for that skill");
+		expect(ralplan).toContain("skip the re-ask and proceed to step 9");
 	});
 
 	it("documents leader-owned Ultragoal checkpoints for Team bridge workers", async () => {
@@ -334,14 +720,13 @@ Project executor override body.
 		expect(content).toContain("/skill:team");
 		expect(content).toContain("`gjc ralplan` is a native CLI");
 		expect(content).toContain("Direct `.gjc/` file edits are forbidden unless an explicit force override is active");
-		expect(content).toContain("do not edit `.gjc/_session-{sessionid}/state` directly without force override");
+		expect(content).toContain("Normal interview persistence uses CLI-owned drafts");
 		expect(content).toContain("gjc state clear --force --mode deep-interview");
 		expect(content).toContain("default `0.05`");
 		expect(content).toContain("language.instruction");
 		expect(content).toContain(
 			"default to English unless `{{ARGUMENTS}}` makes another user/session language obvious",
 		);
-		expect(content).toContain('"language": "<existing language object from active state, if present>"');
 		expect(content).toContain("progress reports, and spec prose");
 		expect(content).toContain("translated/localized according to `language.instruction`");
 		expect(content).toContain("must not print `Question:`/`Options:` blocks as assistant prose");
@@ -357,7 +742,6 @@ Project executor override body.
 			"Skill(",
 			"gajae-code:",
 			"/gajae-code",
-			"gjc deep-interview",
 		]) {
 			expect(content).not.toContain(forbidden);
 		}
@@ -376,6 +760,8 @@ Project executor override body.
 		expect(content).toContain("--stage critic");
 		expect(content).toContain("do not directly edit `.gjc/_session-{sessionid}/plans`");
 		expect(content).toContain("gjc state clear --force --mode ralplan");
+		expect(content).toContain('workflowGate: { stage: "ralplan", kind: "approval" }');
+		expect(content).toContain("RPC/headless clients receive a `ralplan`/`approval` workflow gate");
 		expect(content).toContain(
 			"Direct `write`, `edit`, or `ast_edit` calls against `.gjc/_session-{sessionid}/specs`, `.gjc/_session-{sessionid}/plans`, `.gjc/_session-{sessionid}/state`, or any other `.gjc/` path are forbidden",
 		);
@@ -387,10 +773,10 @@ Project executor override body.
 		const deepInterviewSkillPath = path.join(targetRoot, "skills", "deep-interview", "SKILL.md");
 		const installedDeepInterview = await Bun.file(deepInterviewSkillPath).text();
 
-		expect(initial.written).toBe(8);
-		expect(initial.total).toBe(8);
+		expect(initial.written).toBe(9);
+		expect(initial.total).toBe(9);
 		expect(initial.skipped).toBe(0);
-		expect(initial.files.filter(file => file.kind === "skill-fragment")).toHaveLength(4);
+		expect(initial.files.filter(file => file.kind === "skill-fragment")).toHaveLength(5);
 
 		const installedResearchFragment = await Bun.file(
 			path.join(targetRoot, "skill-fragments", "deep-interview", "auto-research-greenfield.md"),
@@ -399,19 +785,47 @@ Project executor override body.
 		await Bun.write(deepInterviewSkillPath, "local edit");
 		const skipped = await installDefaultGjcDefinitions({ targetRoot });
 		expect(skipped.written).toBe(0);
-		expect(skipped.skipped).toBe(8);
+		expect(skipped.skipped).toBe(9);
 		expect(await Bun.file(deepInterviewSkillPath).text()).toBe("local edit");
 
 		const check = await installDefaultGjcDefinitions({ targetRoot, check: true });
 		expect(check.different).toBe(1);
-		expect(check.matching).toBe(7);
+		expect(check.matching).toBe(8);
 
 		const forced = await installDefaultGjcDefinitions({ targetRoot, force: true });
-		expect(forced.written).toBe(8);
+		expect(forced.written).toBe(9);
 		expect(await Bun.file(deepInterviewSkillPath).text()).toBe(installedDeepInterview);
 		expect(
 			forced.files.some(file => file.kind === "skill-fragment" && file.parentSkillName === "deep-interview"),
 		).toBe(true);
+	});
+
+	it("refreshOnly rewrites stale local copies but never materializes missing ones", async () => {
+		const targetRoot = await makeTempRoot();
+		const deepInterviewSkillPath = path.join(targetRoot, "skills", "deep-interview", "SKILL.md");
+
+		// No files on disk yet: refreshOnly must not create any (opt-in preserved).
+		const untouched = await installDefaultGjcDefinitions({ targetRoot, refreshOnly: true });
+		expect(untouched.written).toBe(0);
+		expect(untouched.missing).toBe(9);
+		expect(await Bun.file(deepInterviewSkillPath).exists()).toBe(false);
+
+		// User opted in, then a local file went stale relative to the embedded default.
+		const installed = await installDefaultGjcDefinitions({ targetRoot });
+		const canonicalDeepInterview = await Bun.file(deepInterviewSkillPath).text();
+		expect(installed.written).toBe(9);
+		await Bun.write(deepInterviewSkillPath, "stale content");
+
+		const refreshed = await installDefaultGjcDefinitions({ targetRoot, refreshOnly: true });
+		expect(refreshed.written).toBe(1);
+		expect(refreshed.matching).toBe(8);
+		expect(refreshed.missing).toBe(0);
+		expect(await Bun.file(deepInterviewSkillPath).text()).toBe(canonicalDeepInterview);
+
+		// Second refresh is a no-op once everything matches.
+		const stable = await installDefaultGjcDefinitions({ targetRoot, refreshOnly: true });
+		expect(stable.written).toBe(0);
+		expect(stable.matching).toBe(9);
 	});
 
 	it("does not make installed fragments reachable as skill-relative internal URL assets", async () => {
@@ -523,7 +937,7 @@ Project executor override body.
 		expect(await jsonProc.exited).toBe(0);
 		expect(jsonStderr).toBe("");
 		expect(jsonStdout).not.toContain("gjc skills list");
-		expect(JSON.parse(jsonStdout) as { skipped: number }).toMatchObject({ skipped: 8 });
+		expect(JSON.parse(jsonStdout) as { skipped: number }).toMatchObject({ skipped: 9 });
 	});
 });
 

@@ -1,6 +1,6 @@
 import { dlopen, FFIType, ptr } from "bun:ffi";
 import * as fs from "node:fs";
-import { $env, $flag } from "@gajae-code/utils";
+import { $env, $flag, $pickenv } from "@gajae-code/utils";
 import { setKittyProtocolActive } from "./keys";
 import { StdinBuffer } from "./stdin-buffer";
 
@@ -51,6 +51,7 @@ export function emergencyTerminalRestore(): void {
 			process.stdout.write(
 				"\x1b[?2004l" + // Disable bracketed paste
 					"\x1b[?1000l" + // Disable normal mouse reporting
+					"\x1b[?1002l" + // Disable button-event mouse reporting
 					"\x1b[?1006l" + // Disable SGR extended mouse reporting
 					"\x1b[?2031l" + // Disable Mode 2031 appearance notifications
 					"\x1b[<u" + // Pop kitty keyboard protocol
@@ -73,6 +74,9 @@ export interface Terminal {
 
 	// Stop the terminal and restore state
 	stop(): void;
+	// Enable or disable opt-in SGR mouse reporting. Implementations that do not
+	// own a real terminal may ignore this.
+	setMouseEnabled?(enabled: boolean): void;
 
 	/**
 	 * Drain stdin before exiting to prevent Kitty key release events from
@@ -87,6 +91,9 @@ export interface Terminal {
 
 	// Whether terminal output is still writable
 	get available(): boolean;
+
+	// True for the real process stdin/stdout terminal (not virtual test terminals).
+	readonly isProcessTerminal?: boolean;
 
 	// Get terminal dimensions
 	get columns(): number;
@@ -167,6 +174,27 @@ export function resolveTerminalRows(
 function isWindowsSubsystemForLinux(): boolean {
 	return process.platform === "linux" && (!!$env.WSL_DISTRO_NAME || !!$env.WSL_INTEROP);
 }
+const STDOUT_ERROR_HANDLER_GRACE_MS = 250;
+const stdoutErrorSubscribers = new Set<(err: Error) => void>();
+export function __stdoutErrorSubscriberCountForTests(): number {
+	return stdoutErrorSubscribers.size;
+}
+export function __stdoutErrorDispatcherInstalledForTests(): boolean {
+	return process.stdout.listeners("error").includes(dispatchStdoutError);
+}
+const dispatchStdoutError = (err: Error): void => {
+	for (const subscriber of stdoutErrorSubscribers) subscriber(err);
+};
+
+function subscribeToStdoutErrors(subscriber: (err: Error) => void): void {
+	if (stdoutErrorSubscribers.size === 0) process.stdout.on("error", dispatchStdoutError);
+	stdoutErrorSubscribers.add(subscriber);
+}
+
+function unsubscribeFromStdoutErrors(subscriber: (err: Error) => void): void {
+	stdoutErrorSubscribers.delete(subscriber);
+	if (stdoutErrorSubscribers.size === 0) process.stdout.removeListener("error", dispatchStdoutError);
+}
 
 /**
  * Real terminal using process.stdin/stdout
@@ -181,10 +209,11 @@ export class ProcessTerminal implements Terminal {
 	#stdinBuffer?: StdinBuffer;
 	#stdinDataHandler?: (data: string | Buffer) => void;
 	#dead = false;
-	#writeLogPath = $env.PI_TUI_WRITE_LOG || "";
+	#writeLogPath = $pickenv("GJC_TUI_WRITE_LOG", "PI_TUI_WRITE_LOG") || "";
 	#detachLogPath = $env.PI_TUI_TERMINAL_DETACH_LOG || "";
 	#windowsVTInputRestore?: () => void;
 	#stdoutErrorHandler?: (err: Error) => void;
+	#stdoutErrorHandlerCleanupTimer?: Timer;
 	#appearanceCallbacks: Array<(appearance: TerminalAppearance) => void> = [];
 	#appearance: TerminalAppearance | undefined;
 	#osc11Pending = false;
@@ -195,6 +224,12 @@ export class ProcessTerminal implements Terminal {
 	#osc11PollTimer?: Timer;
 	#mode2031DebounceTimer?: Timer;
 	#progressTimer?: ReturnType<typeof setInterval>;
+	#mouseEnabled = false;
+	#started = false;
+
+	get isProcessTerminal(): boolean {
+		return true;
+	}
 
 	get kittyProtocolActive(): boolean {
 		return this.#kittyProtocolActive;
@@ -208,9 +243,18 @@ export class ProcessTerminal implements Terminal {
 		this.#appearanceCallbacks.push(callback);
 	}
 
+	setMouseEnabled(enabled: boolean): void {
+		this.#mouseEnabled = enabled;
+		if (this.#started)
+			this.#safeWrite(
+				this.#mouseEnabled ? "\x1b[?1000l\x1b[?1002h\x1b[?1006h" : "\x1b[?1000l\x1b[?1002l\x1b[?1006l",
+			);
+	}
+
 	start(onInput: (data: string) => void, onResize: () => void): void {
 		this.#inputHandler = onInput;
 		this.#resizeHandler = onResize;
+		this.#started = true;
 
 		// Register for emergency cleanup
 		activeTerminal = this;
@@ -230,13 +274,22 @@ export class ProcessTerminal implements Terminal {
 
 		// Enable bracketed paste mode - terminal will wrap pastes in \x1b[200~ ... \x1b[201~
 		this.#safeWrite("\x1b[?2004h");
+		// Button-event reporting preserves wheel input while also letting the TUI implement drag selection.
+		// Clear both tracking variants first so stale modes from another application cannot leak across startup.
+		this.#safeWrite(this.#mouseEnabled ? "\x1b[?1000l\x1b[?1002h\x1b[?1006h" : "\x1b[?1000l\x1b[?1002l\x1b[?1006l");
 
 		// Set up resize handler immediately
 		process.stdout.on("resize", this.#resizeHandler);
-		this.#stdoutErrorHandler = (err: Error) => {
-			this.#markUnavailable(err, "stdout-error");
-		};
-		process.stdout.on("error", this.#stdoutErrorHandler);
+		if (this.#stdoutErrorHandlerCleanupTimer) {
+			clearTimeout(this.#stdoutErrorHandlerCleanupTimer);
+			this.#stdoutErrorHandlerCleanupTimer = undefined;
+		}
+		if (!this.#stdoutErrorHandler) {
+			this.#stdoutErrorHandler = (err: Error) => {
+				this.#markUnavailable(err, "stdout-error");
+			};
+			subscribeToStdoutErrors(this.#stdoutErrorHandler);
+		}
 
 		// Refresh terminal dimensions - they may be stale after suspend/resume
 		// (SIGWINCH is lost while process is stopped). Unix only.
@@ -578,6 +631,20 @@ export class ProcessTerminal implements Terminal {
 			return;
 		}
 		this.#safeWrite("\x1b[?u");
+		// Windows Terminal and conhost do not implement the Kitty keyboard
+		// protocol, so the query above never activates it there. They do honor the
+		// modifyOtherKeys fallback below — but that mode breaks Windows CJK/Hangul
+		// IME composition: Alt+Enter (and other chords) bypass the IME commit, so
+		// the syllable still being composed is never delivered to the app and the
+		// action fires on empty text (e.g. queue-message no-ops unless the user
+		// types a trailing space to force a commit first). Skip the fallback on
+		// win32; legacy encodings still deliver Alt+Enter (ESC CR) and the newline
+		// chords, and IME composition works again. Opt back in with
+		// GJC_TUI_KEYBOARD_PROTOCOL=0 disabling all enhancement, or force-enable
+		// elsewhere if a Kitty-capable Windows terminal appears.
+		if (process.platform === "win32") {
+			return;
+		}
 		this.#modifyOtherKeysTimeout = setTimeout(() => {
 			this.#modifyOtherKeysTimeout = undefined;
 			if (this.#kittyProtocolActive || this.#modifyOtherKeysActive) {
@@ -641,8 +708,11 @@ export class ProcessTerminal implements Terminal {
 		}
 
 		// Disable bracketed paste mode
+		this.#started = false;
+		this.#mouseEnabled = false;
 		this.#safeWrite("\x1b[?2004l");
 		this.#safeWrite("\x1b[?1000l");
+		this.#safeWrite("\x1b[?1002l");
 		this.#safeWrite("\x1b[?1006l");
 
 		// Disable Mode 2031 appearance change notifications
@@ -692,10 +762,7 @@ export class ProcessTerminal implements Terminal {
 			process.stdout.removeListener("resize", this.#resizeHandler);
 			this.#resizeHandler = undefined;
 		}
-		if (this.#stdoutErrorHandler) {
-			process.stdout.removeListener("error", this.#stdoutErrorHandler);
-			this.#stdoutErrorHandler = undefined;
-		}
+		this.#scheduleStdoutErrorHandlerCleanup();
 
 		// Pause stdin to prevent any buffered input (e.g., Ctrl+D) from being
 		// re-interpreted after raw mode is disabled. This fixes a race condition
@@ -706,6 +773,23 @@ export class ProcessTerminal implements Terminal {
 		if (process.stdin.setRawMode) {
 			process.stdin.setRawMode(this.#wasRaw);
 		}
+	}
+
+	#scheduleStdoutErrorHandlerCleanup(): void {
+		if (!this.#stdoutErrorHandler) return;
+		if (this.#stdoutErrorHandlerCleanupTimer) clearTimeout(this.#stdoutErrorHandlerCleanupTimer);
+		// Terminal restore writes above can fail asynchronously after stop() returns
+		// when an SSH/Windows Terminal PTY disappears. Keep the stdout error listener
+		// armed briefly so late EIO/EPIPE events mark the terminal unavailable instead
+		// of surfacing as uncaught exceptions that kill the tmux pane.
+		this.#stdoutErrorHandlerCleanupTimer = setTimeout(() => {
+			if (this.#stdoutErrorHandler) {
+				unsubscribeFromStdoutErrors(this.#stdoutErrorHandler);
+				this.#stdoutErrorHandler = undefined;
+			}
+			this.#stdoutErrorHandlerCleanupTimer = undefined;
+		}, STDOUT_ERROR_HANDLER_GRACE_MS);
+		this.#stdoutErrorHandlerCleanupTimer.unref?.();
 	}
 
 	write(data: string): void {

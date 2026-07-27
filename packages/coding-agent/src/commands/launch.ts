@@ -9,23 +9,28 @@ import { APP_NAME, setProjectDir } from "@gajae-code/utils";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { parseArgs } from "../cli/args";
 import { launchDefaultTmuxIfNeeded } from "../gjc-runtime/launch-tmux";
-import { prepareLaunchWorktree } from "../gjc-runtime/launch-worktree";
+import { type PreparedLaunchWorktree, prepareLaunchWorktree } from "../gjc-runtime/launch-worktree";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+	GJC_TMUX_OWNER_GENERATION_ENV,
 } from "../gjc-runtime/session-state-sidecar";
 import { runRootCommand } from "../main";
 import { prepareAcpTerminalAuthArgs } from "../modes/acp/terminal-auth";
 
-async function persistCoordinatorLaunchFailure(error: unknown, cwd: string): Promise<void> {
-	const stateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
+export async function persistCoordinatorLaunchFailure(
+	error: unknown,
+	cwd: string,
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+	const stateFile = env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
 	if (!stateFile) return;
 	const message = error instanceof Error ? error.message : String(error);
 	const code = message.split(":", 1)[0] || "launch_failed";
 	const now = new Date().toISOString();
 	const payload = {
 		schema_version: 1,
-		session_id: process.env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || null,
+		session_id: env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || null,
 		state: "errored",
 		ready_for_input: false,
 		updated_at: now,
@@ -45,6 +50,9 @@ async function persistCoordinatorLaunchFailure(error: unknown, cwd: string): Pro
 			truncated: false,
 		},
 		error: { code, message, recoverable: true },
+		...(env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim()
+			? { owner_generation: env[GJC_TMUX_OWNER_GENERATION_ENV] ?? null }
+			: {}),
 	};
 	await fs.mkdir(path.dirname(stateFile), { recursive: true });
 	await Bun.write(stateFile, `${JSON.stringify(payload, null, 2)}\n`);
@@ -87,18 +95,25 @@ export default class Index extends Command {
 		"api-key": Flags.string({
 			description: "API key (defaults to env vars)",
 		}),
+		credential: Flags.string({
+			description:
+				"Stored credential selector: email:<addr>, id:<n>, account:<id>, project:<id>, or provider/email:<addr>",
+		}),
 		"system-prompt": Flags.string({
 			description: "System prompt (default: coding assistant prompt)",
 		}),
 		"append-system-prompt": Flags.string({
 			description: "Append text or file contents to the system prompt",
 		}),
+		"mcp-config": Flags.string({
+			description: "Tools-only MCP config file (absolute path)",
+		}),
 		"allow-home": Flags.boolean({
 			description: "Allow starting in ~ without auto-switching to a temp dir",
 		}),
 		mode: Flags.string({
-			description: "Output mode: text (default), json, rpc, acp, rpc-ui, or bridge",
-			options: ["text", "json", "rpc", "acp", "rpc-ui", "bridge"],
+			description: "Output mode: text (default), json, or acp",
+			options: ["text", "json", "acp"],
 		}),
 		print: Flags.boolean({
 			char: "p",
@@ -113,13 +128,14 @@ export default class Index extends Command {
 			description: "Resume a session (by ID prefix, path, or picker if omitted)",
 		}),
 		"session-dir": Flags.string({
-			description: "Directory for session storage and lookup",
+			description:
+				"Explicit session storage directory and lookup override (default uses managed v2 workspace scope)",
 		}),
 		"no-session": Flags.boolean({
 			description: "Don't save session (ephemeral)",
 		}),
 		models: Flags.string({
-			description: "Comma-separated model patterns for Ctrl+P cycling",
+			description: "Comma-separated model patterns for Alt+N cycling",
 		}),
 		"no-tools": Flags.boolean({
 			description: "Disable all built-in tools",
@@ -181,9 +197,11 @@ export default class Index extends Command {
 		`# Launch in a sibling git worktree\n  ${APP_NAME} --worktree`,
 		`# Use different model (fuzzy matching)\n  ${APP_NAME} --model opus "Help me refactor this code"`,
 		`# Limit model cycling to specific models\n  ${APP_NAME} --models claude-sonnet,claude-haiku,gpt-4o`,
+		`# Pin a stored credential for this session\n  ${APP_NAME} --credential email:me@example.com`,
 		`# Activate a model profile for this session\n  ${APP_NAME} --mpreset codex-medium`,
 		`# Persist a model profile as the default\n  ${APP_NAME} --mpreset opencodego --default`,
-		`# Export a session file to HTML\n  ${APP_NAME} --export ~/.gjc/agent/sessions/--path--/session.jsonl`,
+		`# Export a session file to HTML\n  ${APP_NAME} --export ~/.gjc/agent/sessions/v2-<scope>/session.jsonl`,
+		`# Use an explicit session storage directory\n  ${APP_NAME} --session-dir ./sessions`,
 	];
 
 	static strict = false;
@@ -196,7 +214,7 @@ export default class Index extends Command {
 			return;
 		}
 
-		let launch: ReturnType<typeof prepareLaunchWorktree>;
+		let launch: PreparedLaunchWorktree;
 		try {
 			launch = prepareLaunchWorktree(process.cwd(), args);
 		} catch (error) {

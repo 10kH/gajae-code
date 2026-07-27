@@ -47,6 +47,29 @@ function writeSkillFile(dir: string, skillName: string, body: string): string {
 	return skillPath;
 }
 
+function isBusyRmError(error: unknown): boolean {
+	return typeof error === "object" && error !== null && "code" in error && error.code === "EBUSY";
+}
+
+async function removeTempDirWithRetry(tempDir: TempDir): Promise<void> {
+	for (let attempt = 0; attempt < 10; attempt += 1) {
+		try {
+			await fs.promises.rm(tempDir.path(), { recursive: true, force: true });
+			return;
+		} catch (error) {
+			if (!isBusyRmError(error)) {
+				throw error;
+			}
+			if (attempt === 9) {
+				// Windows can keep the SQLite temp directory busy after close; do
+				// not fail queue-behavior assertions on best-effort cleanup.
+				return;
+			}
+			await Bun.sleep(100);
+		}
+	}
+}
+
 // ============================================================================
 // E1-E3: InputController tag generation with a stubbed session.
 // ============================================================================
@@ -117,6 +140,7 @@ function createStubInputControllerContext(opts: {
 		compactionQueuedMessages: [],
 		locallySubmittedUserSignatures: new Set<string>(),
 		withLocalSubmission: async (_text: string, fn: () => unknown) => fn(),
+		hasActiveBtw: () => false,
 	} as unknown as InteractiveModeContext;
 
 	return { ctx, editor, enqueueCustomMessageDisplay, promptCustomMessage, sendCustomMessage, prompt };
@@ -222,6 +246,30 @@ describe("InputController #invokeSkillCommand (E1-E3)", () => {
 		expect(ctx.showError).not.toHaveBeenCalled();
 	});
 
+	it("E3c: compaction queue flush replays /skill entries through the skill custom-message path", async () => {
+		const { ctx, prompt, promptCustomMessage } = createStubInputControllerContext({
+			skillCommands,
+			isStreaming: false,
+		});
+		ctx.compactionQueuedMessages.push({ text: "/skill:test-skill from compaction", mode: "followUp" });
+
+		const uiHelpers = new UiHelpers(ctx);
+		await uiHelpers.flushCompactionQueue();
+
+		expect(prompt).not.toHaveBeenCalled();
+		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
+		const firstCall = promptCustomMessage.mock.calls[0];
+		expect(firstCall).toBeDefined();
+		if (!firstCall) {
+			throw new Error("expected promptCustomMessage to be called");
+		}
+		const messageArg = firstCall[0];
+		expect(messageArg.content).toContain("Do the thing.");
+		expect(messageArg.content).toContain("User: from compaction");
+		expect(firstCall[1]).toEqual({ streamingBehavior: "followUp", followUpQueuePolicy: "sequential" });
+		expect(ctx.compactionQueuedMessages).toEqual([]);
+	});
+
 	it("E3: not streaming -> enqueueCustomMessageDisplay NOT called and tag absent", async () => {
 		const { ctx, editor, enqueueCustomMessageDisplay, promptCustomMessage } = createStubInputControllerContext({
 			skillCommands,
@@ -241,6 +289,22 @@ describe("InputController #invokeSkillCommand (E1-E3)", () => {
 		}
 		const messageArg = firstCall[0];
 		expect(messageArg.details.__pendingDisplayTag).toBeUndefined();
+	});
+
+	it("dispatches inline canonical skill commands with surrounding prompt text as args", async () => {
+		const { ctx, editor, promptCustomMessage } = createStubInputControllerContext({
+			skillCommands,
+			isStreaming: false,
+		});
+
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+		editor.setText("please use /skill:test-skill for this plan");
+		await editor.onSubmit?.("please use /skill:test-skill for this plan");
+
+		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
+		expect(promptCustomMessage.mock.calls[0]?.[0].content).toContain("Do the thing.");
+		expect(promptCustomMessage.mock.calls[0]?.[0].content).toContain("User: please use for this plan");
 	});
 
 	it("dispatches chained canonical skill commands in order while idle", async () => {
@@ -393,7 +457,7 @@ describe("AgentSession custom-role tag dequeue (E4-E7)", () => {
 		if (fixture) {
 			await fixture.session.dispose();
 			fixture.authStorage.close();
-			fixture.tempDir.removeSync();
+			await removeTempDirWithRetry(fixture.tempDir);
 			fixture = undefined;
 		}
 		vi.restoreAllMocks();
@@ -481,6 +545,21 @@ describe("AgentSession custom-role tag dequeue (E4-E7)", () => {
 		await Promise.resolve();
 		expect(session.getQueuedMessages().steering).toEqual([]);
 	});
+	it("E7b: popLastQueuedMessage follows newest cross-queue insertion order", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+
+		await session.steer("first steer");
+		await session.followUp("latest follow-up");
+
+		expect(session.popLastQueuedMessage()).toBe("latest follow-up");
+		expect(session.getQueuedMessages().steering).toEqual(["first steer"]);
+		expect(session.getQueuedMessages().followUp).toEqual([]);
+
+		expect(session.popLastQueuedMessage()).toBe("first steer");
+		expect(session.getQueuedMessages().steering).toEqual([]);
+		expect(session.getQueuedMessages().followUp).toEqual([]);
+	});
 });
 
 // ============================================================================
@@ -488,7 +567,7 @@ describe("AgentSession custom-role tag dequeue (E4-E7)", () => {
 // enqueueCustomMessageDisplay.
 // ============================================================================
 
-function createStubInteractiveModeContextForUiHelpers(session: AgentSession) {
+function createStubInteractiveModeContextForUiHelpers(session: AgentSession, dequeueDisplay = "Alt+Up") {
 	let editorText = "";
 	const editor: StubEditor = {
 		setText(text) {
@@ -510,10 +589,11 @@ function createStubInteractiveModeContextForUiHelpers(session: AgentSession) {
 		session,
 		compactionQueuedMessages: [],
 		keybindings: {
-			getDisplayString: (_action: string) => "Alt+Up",
+			getDisplayString: (_action: string) => dequeueDisplay,
 		},
 		updatePendingMessagesDisplay,
 		locallySubmittedUserSignatures: new Set<string>(),
+		hasActiveBtw: () => false,
 	} as unknown as InteractiveModeContext;
 
 	return { ctx, editor, pendingMessagesContainer };
@@ -541,7 +621,7 @@ describe("UiHelpers / InputController against the queued-display layer (E8-E9)",
 		if (fixture) {
 			await fixture.session.dispose();
 			fixture.authStorage.close();
-			fixture.tempDir.removeSync();
+			await removeTempDirWithRetry(fixture.tempDir);
 			fixture = undefined;
 		}
 		vi.restoreAllMocks();
@@ -560,6 +640,27 @@ describe("UiHelpers / InputController against the queued-display layer (E8-E9)",
 		// chip appears verbatim. Matches the user-facing "Steer: /skill:..." format.
 		const rendered = pendingMessagesContainer.render(120).join("\n");
 		expect(rendered).toMatch(/Steer: \/skill:test-skill arg1 arg2/);
+	});
+	it("E8a: dequeue guidance uses effective display text and omits unbound controls", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		await session.followUp("queue this message");
+
+		const darwin = createStubInteractiveModeContextForUiHelpers(session, "⌥↑/⌥↓");
+		new UiHelpers(darwin.ctx).updatePendingMessagesDisplay();
+		expect(darwin.pendingMessagesContainer.render(120).join("\n")).toContain("⌥↑/⌥↓ to select/edit/reorder");
+
+		const textual = createStubInteractiveModeContextForUiHelpers(session, "Alt+Up/Alt+Down");
+		new UiHelpers(textual.ctx).updatePendingMessagesDisplay();
+		expect(textual.pendingMessagesContainer.render(120).join("\n")).toContain(
+			"Alt+Up/Alt+Down to select/edit/reorder",
+		);
+
+		const unbound = createStubInteractiveModeContextForUiHelpers(session, "");
+		new UiHelpers(unbound.ctx).updatePendingMessagesDisplay();
+		const unboundRendered = unbound.pendingMessagesContainer.render(120).join("\n");
+		expect(unboundRendered).not.toContain("to select/edit/reorder");
+		expect(unboundRendered).not.toContain("Alt+Up/Alt+Down");
 	});
 
 	it("E8b: updatePendingMessagesDisplay labels normal follow-up prompts as queued", async () => {
@@ -627,6 +728,7 @@ function createEventControllerFixtureForE10() {
 		addMessageToChat,
 		updatePendingMessagesDisplay,
 		session: {},
+		hasActiveBtw: () => false,
 	} as unknown as InteractiveModeContext;
 
 	const controller = new EventController(ctx);

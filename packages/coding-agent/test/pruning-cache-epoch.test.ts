@@ -88,8 +88,9 @@ describe("pruning cache-epoch invariant", () => {
 			sessionManager,
 			modelRegistry,
 		);
-		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
-		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const bundledModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!bundledModel) throw new Error("Expected built-in anthropic model to exist");
+		const model = { ...bundledModel, contextWindow: 200_000 };
 		const agent = new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } });
 		session = new AgentSession({
 			agent,
@@ -118,6 +119,11 @@ describe("pruning cache-epoch invariant", () => {
 		for (let i = 0; i < 25; i++) {
 			sessionManager.appendMessage(toolResultMessage(i, 12_000));
 		}
+	}
+
+	function seedSubMinimumPrunableHistory(): void {
+		sessionManager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		for (let i = 0; i < 18; i++) sessionManager.appendMessage(toolResultMessage(i, 12_000));
 	}
 
 	function prunedEntryCount(): number {
@@ -158,5 +164,14 @@ describe("pruning cache-epoch invariant", () => {
 		// maintenance (pruning, then compaction if still over) is sanctioned.
 		await driveTurnEnd(assistantMessage(190_000));
 		expect(prunedEntryCount()).toBeGreaterThan(0);
+	});
+
+	it("uses sub-normal-minimum output savings to avert threshold compaction", async () => {
+		await createSession();
+		seedSubMinimumPrunableHistory();
+		session.settings.set("compaction.thresholdTokens", 187_000);
+		await driveTurnEnd(assistantMessage(188_000));
+		expect(prunedEntryCount()).toBeGreaterThan(0);
+		expect(sessionManager.getBranch().some(entry => entry.type === "compaction")).toBe(false);
 	});
 });
