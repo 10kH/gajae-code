@@ -32,6 +32,11 @@ import {
 	validatePerfThresholdLedger,
 } from "../bench/perf-threshold.ledger";
 
+// Mirrors resolveGitProvenance()'s repository-root resolution so precondition
+// checks below never depend on the ambient process cwd (CI shard tasks run
+// `bun test` with cwd pinned to a package subdirectory, not the repo root).
+const repositoryRoot = path.resolve(import.meta.dir, "../../..");
+
 const memoryControlKeys = ["GJC_MEMORY_PROFILE", "GJC_MEMORY_ITERATIONS", "GJC_MEMORY_DURATION_MS"] as const;
 let originalMemoryControls = new Map<(typeof memoryControlKeys)[number], string | undefined>();
 
@@ -84,9 +89,29 @@ describe("perf corpus schema + runner", () => {
 			expect(Number.isFinite(fixture.rssMemory.growthBytes)).toBe(true);
 		}
 	});
+	test("git provenance precondition survives a subdirectory ambient cwd (regression for dev CI run 30291963270)", () => {
+		// CI runs coding-agent test shards with process cwd pinned to
+		// packages/coding-agent (a subdirectory), not the repo root. This test
+		// pins process.cwd() to that same subdirectory before invoking the
+		// shared repositoryRoot-based precondition helper, so a future
+		// regression that drops the explicit { cwd: repositoryRoot } option
+		// (and silently falls back to ambient cwd) is caught even when this
+		// suite happens to run from the repo root.
+		const previousCwd = process.cwd();
+		try {
+			process.chdir(path.join(repositoryRoot, "packages", "coding-agent"));
+			const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repositoryRoot });
+			expect(revision.exitCode).toBe(0);
+			expect(new TextDecoder().decode(revision.stdout).trim()).toMatch(/^[0-9a-f]{40}$/);
+		} finally {
+			process.chdir(previousCwd);
+		}
+	});
 	test("prefers checked-out HEAD over workflow SHA provenance", () => {
-		const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"]);
-		if (revision.exitCode !== 0) throw new Error("git revision unavailable");
+		const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repositoryRoot });
+		if (revision.exitCode !== 0) {
+			throw new Error(`git revision unavailable: ${new TextDecoder().decode(revision.stderr)}`);
+		}
 		const expectedSha = new TextDecoder().decode(revision.stdout).trim();
 		const previousGitSha = process.env.GITHUB_SHA;
 		process.env.GITHUB_SHA = "b".repeat(40);
@@ -116,8 +141,10 @@ describe("perf corpus schema + runner", () => {
 		}
 	});
 	test("resolves provenance from the benchmark checkout instead of the caller cwd", () => {
-		const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"]);
-		if (revision.exitCode !== 0) throw new Error("git revision unavailable");
+		const revision = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repositoryRoot });
+		if (revision.exitCode !== 0) {
+			throw new Error(`git revision unavailable: ${new TextDecoder().decode(revision.stderr)}`);
+		}
 		const expectedSha = new TextDecoder().decode(revision.stdout).trim();
 		const previousCwd = process.cwd();
 		try {
