@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Fixed
+- Fast CLI help now advertises the active `search` built-in tool instead of the retired `grep` name.
 
 - Align managed fallback abort-after-exhaustion expectations with #3257 ownership release: a subscriber abort at terminal `message_end` no longer expects a second `requestRunTerminal(cancelled)` because the logical-run owner is already cleared.
 - Python eval timeout annotations now prefer the caller-configured `timeoutMs` over remaining wall-clock budget so async setup cannot flake second formatting in CI.
