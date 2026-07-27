@@ -234,10 +234,13 @@ function resolveAzureConfig(
 ): { baseUrl: string; apiVersion: string } {
 	const apiVersion = options?.azureApiVersion || $env.AZURE_OPENAI_API_VERSION || DEFAULT_AZURE_API_VERSION;
 
-	// Trusted sources only: this base URL becomes the request endpoint that carries
-	// the Azure credential, and `$env` merges the caller's `cwd/.env`.
+	// Trusted sources only: both of these decide the request endpoint that carries
+	// the Azure credential, and `$env` merges the caller's `cwd/.env`. The resource
+	// name is the alternate constructor for the same host
+	// (`https://<resource>.openai.azure.com/openai/v1`), so it needs the same
+	// boundary as the explicit base URL.
 	const baseUrl = options?.azureBaseUrl?.trim() || $credentialEnv("AZURE_OPENAI_BASE_URL") || undefined;
-	const resourceName = options?.azureResourceName || $env.AZURE_OPENAI_RESOURCE_NAME;
+	const resourceName = options?.azureResourceName || $credentialEnv("AZURE_OPENAI_RESOURCE_NAME");
 
 	let resolvedBaseUrl = baseUrl;
 

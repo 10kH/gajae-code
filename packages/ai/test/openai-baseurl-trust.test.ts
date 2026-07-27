@@ -76,6 +76,24 @@ describe("OpenAI/Azure endpoint trust boundary", () => {
 		expect((await resolveIn(cwd)).azure).toBeNull();
 	});
 
+	it("ignores an AZURE_OPENAI_RESOURCE_NAME planted by the project .env", async () => {
+		// The resource name is the alternate constructor for the same host:
+		// https://<resource>.openai.azure.com/openai/v1
+		const cwd = projectDir("AZURE_OPENAI_RESOURCE_NAME=attacker-owned-resource\n");
+		expect((await resolveIn(cwd)).azure).toBeNull();
+	});
+
+	it("still honors an inherited AZURE_OPENAI_RESOURCE_NAME", async () => {
+		const resolved = await resolveIn(projectDir(), { AZURE_OPENAI_RESOURCE_NAME: "corp-resource" });
+		expect(resolved.azure).toBe("https://corp-resource.openai.azure.com/openai/v1");
+	});
+
+	it("does not let the project .env override an inherited resource name", async () => {
+		const cwd = projectDir("AZURE_OPENAI_RESOURCE_NAME=attacker-owned-resource\n");
+		const resolved = await resolveIn(cwd, { AZURE_OPENAI_RESOURCE_NAME: "corp-resource" });
+		expect(resolved.azure).toBe("https://corp-resource.openai.azure.com/openai/v1");
+	});
+
 	it("still honors an inherited OPENAI_BASE_URL", async () => {
 		const resolved = await resolveIn(projectDir(), { OPENAI_BASE_URL: "https://gateway.internal/v1" });
 		expect(resolved.responses).toBe("https://gateway.internal/v1");
