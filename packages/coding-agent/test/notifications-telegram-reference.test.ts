@@ -130,6 +130,35 @@ describe("telegram reference client helpers", () => {
 		expect(m.inline_keyboard?.[0]?.[1]?.text).toBe("2");
 		expect(decodeCallbackData(m.inline_keyboard![0]![0]!.callback_data)).toEqual({ id: "a1", index: 0 });
 	});
+	test.each(["\n", "\r\n", "\r"])("buildActionMarkdown preserves multiline asks with %j line endings", lineEnding => {
+		const question = [
+			"Deep Interview · Round 4 · Ambiguity 39.5%",
+			"Component: 칸반·이슈 관리",
+			"Target: 제약 명확성",
+			"Why now: 동시 수정 규칙이 필요해요.",
+			"동일 이슈의 충돌은 어떻게 처리할까요?",
+		].join(lineEnding);
+
+		expect(buildActionMarkdown({ kind: "ask", question })).toBe(
+			[
+				"❓ **Deep Interview · Round 4 · Ambiguity 39.5%**  ",
+				"**Component: 칸반·이슈 관리**  ",
+				"**Target: 제약 명확성**  ",
+				"**Why now: 동시 수정 규칙이 필요해요.**  ",
+				"**동일 이슈의 충돌은 어떻게 처리할까요?**",
+				"",
+				"(reply with text)",
+			].join("\n"),
+		);
+	});
+	test("buildActionMarkdown keeps the single-line ask wire shape", () => {
+		expect(buildActionMarkdown({ kind: "ask", question: "Proceed?" })).toBe("❓ **Proceed?**\n\n(reply with text)");
+	});
+	test("buildActionMarkdown keeps blank lines without malformed emphasis", () => {
+		expect(buildActionMarkdown({ kind: "ask", question: "A \t\n\n \t\nB" })).toBe(
+			"❓ **A**  \n  \n  \n**B**\n\n(reply with text)",
+		);
+	});
 	test("renders only a valid recommended option in copied HTML and Markdown labels", () => {
 		const longSensitiveLabel = "<&_*".repeat(1024);
 		const options = ["First", longSensitiveLabel, "Third"];
