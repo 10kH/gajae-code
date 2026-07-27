@@ -1,7 +1,7 @@
 # Changelog
 
 ## [Unreleased]
-### Fixed
+### Resume fixes
 
 - Memory consolidation redacts GitHub tokens. The scrubber covered AWS ids, JWTs and keyword-prefixed keys, but GitHub tokens carry none of those keywords, so they reached `MEMORY.md` and `memory_summary.md` verbatim — and the summary is injected into every later session. Now covers the same three prefixes the contribution-prep scrubber already handled.
 - Align managed fallback abort-after-exhaustion expectations with #3257 ownership release: a subscriber abort at terminal `message_end` no longer expects a second `requestRunTerminal(cancelled)` because the logical-run owner is already cleared.
@@ -42,10 +42,14 @@
 
 ### Changed
 
+- When GJC owns mouse input (`mouse.enabled: true`), mouse-wheel scrolling moves the session viewport by three rows per notch instead of a full page. PageUp/PageDown keep page-sized transcript-lane steps.
+- While reviewing transcript history, the status line and composer stay fixed at the bottom. Semantic assistant/tool output and visible capped-sidebar changes show `New output — type to follow`; duplicate, elided, hidden, geometry-only, and theme-only changes do not. Ordinary typing or paste returns to live output before editing without changing editor focus.
 - Telegram per-tool activity is now opt-in and remains durably controllable with `/toolactivity on|off` or the Notifications preferences UI; disabling it suppresses tool start/completion success and error bubbles without hiding assistant, ask, or session notifications.
 - Model preset landing now shows explicit `Enter: apply` and `d: set as default` hints; pressing `d` applies the highlighted profile as the default while Enter keeps the session-only apply path (#3161).
 
 ### Fixed
+
+- Session Observer now reads stable source snapshots, publishes only complete JSONL appends, validates replacement candidates, and clears stale transcript/model/tool content on source replacement, truncation, deletion, unreadability, or malformed candidates. Its transcript projection remains eager full-history work; this does not add virtualization or bounded full-history memory.
 - Session-manager fork/moveTo failure-injection tests now use a platform-aware hermetic seam: retained `RecoveryFsRoot` prototype spies on Linux and the direct native/fs fallbacks off Linux, with a required hit counter so a dead injection fails closed (#3209).
 - The #3216 win32 cleanup-producer regression no longer hardcodes divergent directory size `4096`; it injects `nativeRoot.size + 1` so the test stays hermetic when Linux directory size is already `4096` (post-merge Dev CI red on `79f0de870`).
 

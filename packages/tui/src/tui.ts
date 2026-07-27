@@ -39,6 +39,8 @@ const SEGMENT_RESET = "\x1b[0m";
  */
 const LINE_TERMINATOR = "\x1b[0m\x1b]8;;\x07";
 const MOUSE_SELECTION_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+/** Discrete mouse-wheel notch size in terminal rows (xterm/less-style). */
+export const DEFAULT_WHEEL_LINES = 3;
 
 function stripTerminalControls(text: string): string {
 	return Bun.stripANSI(text)
@@ -190,6 +192,11 @@ export interface ViewportAnchorSource {
 	id: ViewportAnchorId;
 }
 
+/** Identity and monotonic revision of the logical output producer. */
+export type ViewportOutputSource = {
+	identity: string;
+	revision: bigint;
+};
 export interface ViewportAnchorSourceRenderer extends Component {
 	renderWithViewportAnchorSource(width: number, source: ViewportAnchorSource): ViewportAnchorRender;
 }
@@ -706,6 +713,12 @@ export class TUI extends Container {
 	#mouseSelectionStart: MouseSelectionPoint | null = null;
 	#mouseSelectionEnd: MouseSelectionPoint | null = null;
 	#mouseSelectionDragged = false;
+	#viewportOutputSource: ViewportOutputSource | null = null;
+	#manualOutputNotice = false;
+	#manualTranscriptLineCount = 0;
+	#manualSuffixLineCount = 0;
+	#committedTranscriptRows: Array<number | null> = [];
+	#paintedManualOutputNotice = false;
 
 	#unsubscribeTabWidthChange?: () => void;
 	static #renderCounters: TuiRenderCounterSnapshot = {
@@ -825,8 +838,55 @@ export class TUI extends Container {
 		}
 	}
 
+	override removeChild(component: Component): void {
+		this.#invalidateFocusForRemovedTree(component);
+		super.removeChild(component);
+	}
+
+	override clear(): void {
+		for (const child of this.children) this.#invalidateFocusForRemovedTree(child);
+		super.clear();
+	}
+
+	#invalidateFocusForRemovedTree(component: Component): void {
+		if (this.#focusedComponent !== null && this.#containsComponent(component, this.#focusedComponent)) {
+			this.setFocus(null);
+		}
+	}
+
+	#containsComponent(root: Component, target: Component): boolean {
+		if (root === target) return true;
+		return root instanceof Container && root.children.some(child => this.#containsComponent(child, target));
+	}
+
 	setBottomPinnedComponent(component: Component | null): void {
 		this.#bottomPinnedComponent = component;
+		this.requestRender();
+	}
+
+	/** Report the logical output producer revision without coupling TUI to message types. */
+	setViewportOutputSource(source: ViewportOutputSource | null): void {
+		const previous = this.#viewportOutputSource;
+		if (
+			(source === null && previous === null) ||
+			(source !== null &&
+				previous !== null &&
+				source.identity === previous.identity &&
+				source.revision === previous.revision)
+		) {
+			renderMetrics.recordStructuralCounter("viewportOutputSourceEqualNoops");
+			return;
+		}
+		const identityReset = source === null || previous === null || previous.identity !== source.identity;
+		// Same-identity revisions are a high-water mark. A delayed stale observation
+		// must not lower it, because observing that revision again would otherwise
+		// look like fresh output while the user owns the manual viewport.
+		if (!identityReset && source.revision < previous.revision) return;
+		if (!identityReset && source.revision > previous.revision && this.#manualViewportTop !== undefined) {
+			this.#manualOutputNotice = true;
+		}
+		if (identityReset || this.#manualViewportTop === undefined) this.#manualOutputNotice = false;
+		this.#viewportOutputSource = source;
 		this.requestRender();
 	}
 
@@ -850,6 +910,9 @@ export class TUI extends Container {
 		this.#scrollbackResumeViewportTop = undefined;
 		this.#nativeScrollbackViewportTop = 0;
 		this.#transcriptIdentityResetPending = true;
+		this.#manualOutputNotice = false;
+		this.#paintedManualOutputNotice = false;
+		this.#committedTranscriptRows = [];
 	}
 
 	/** Allow one semantic-neighbor reconciliation after a definitive same-transcript rebuild. */
@@ -862,22 +925,36 @@ export class TUI extends Container {
 		const height = this.terminal.rows;
 		const width = this.terminal.columns;
 		const frame = this.#viewportAnchorFrame;
-		if (height <= 0 || width <= 0 || this.#previousLines.length === 0 || frame === null) return false;
+		const transcriptCapacity = this.#manualTranscriptCapacity(height);
+		if (height <= 0 || width <= 0 || transcriptCapacity === 0 || this.#previousLines.length === 0 || frame === null)
+			return false;
 
-		const selectedRow = frame.anchors.findIndex(anchor => anchor?.id === id);
+		let selectedRow = frame.anchors.findIndex(anchor => anchor?.id === id);
+		if (alignment === "bottom") {
+			for (let row = frame.anchors.length - 1; row >= 0; row--) {
+				if (frame.anchors[row]?.id === id) {
+					selectedRow = row;
+					break;
+				}
+			}
+		}
 		const selected = selectedRow < 0 ? null : frame.anchors[selectedRow];
 		if (selected === null) return false;
 
-		const desiredScreenRow = alignment === "top" ? 0 : alignment === "center" ? Math.floor(height / 2) : height - 1;
+		const desiredScreenRow =
+			alignment === "top" ? 0 : alignment === "center" ? Math.floor(transcriptCapacity / 2) : transcriptCapacity - 1;
 		const targetViewportTop = Math.max(0, frame.startRow + selectedRow - desiredScreenRow);
 		this.#manualViewportAnchor = {
 			id: selected.id,
-			graphemeIndex: selected.graphemeStart,
-			cellOffset: selected.cellStart,
+			graphemeIndex:
+				alignment === "bottom"
+					? Math.max(selected.graphemeStart, selected.graphemeEnd - 1)
+					: selected.graphemeStart,
+			cellOffset: alignment === "bottom" ? Math.max(selected.cellStart, selected.cellEnd - 1) : selected.cellStart,
 			desiredScreenRow,
 		};
 		const firstCandidateRow = Math.max(0, targetViewportTop - frame.startRow);
-		const lastCandidateRow = Math.min(frame.anchors.length, targetViewportTop + height - frame.startRow);
+		const lastCandidateRow = Math.min(frame.anchors.length, targetViewportTop + transcriptCapacity - frame.startRow);
 		const fallbacks: ManualViewportAnchor[] = [];
 		for (let row = firstCandidateRow; row < lastCandidateRow; row++) {
 			const anchor = frame.anchors[row];
@@ -901,11 +978,24 @@ export class TUI extends Container {
 		return true;
 	}
 
-	scrollViewportPages(direction: -1 | 1): boolean {
+	scrollViewportBy(
+		deltaRows: number,
+		options?: {
+			/** edge: PageUp/PageDown pin; stable: preserve/center pin for fine wheel motion */
+			pin?: "edge" | "stable";
+		},
+	): boolean {
 		const height = this.terminal.rows;
 		const width = this.terminal.columns;
 		if (height <= 0 || width <= 0 || this.#previousLines.length === 0) return false;
-		const maxViewportTop = Math.max(0, this.#previousLines.length - height);
+		if (!Number.isFinite(deltaRows)) return false;
+		const delta = Math.trunc(deltaRows);
+		if (delta === 0) return false;
+
+		const direction: -1 | 1 = delta < 0 ? -1 : 1;
+		const pin = options?.pin ?? "stable";
+		const transcriptCapacity = this.#manualTranscriptCapacity(height);
+		const maxViewportTop = Math.max(0, this.#manualTranscriptLineCount - transcriptCapacity);
 		let currentViewportTop = Math.max(0, Math.min(maxViewportTop, this.#manualViewportTop ?? this.#viewportTopRow));
 		const frame = this.#viewportAnchorFrame;
 		if (this.#manualViewportAnchor !== null) {
@@ -914,16 +1004,29 @@ export class TUI extends Container {
 			if (resolvedViewportTop === null) return false;
 			currentViewportTop = Math.max(0, Math.min(maxViewportTop, resolvedViewportTop));
 		}
-		const targetViewportTop = Math.max(
-			0,
-			Math.min(maxViewportTop, currentViewportTop + direction * Math.max(1, height - 1)),
-		);
+		const targetViewportTop = Math.max(0, Math.min(maxViewportTop, currentViewportTop + delta));
+		// Downward input at an already-live bottom is a no-op; it must not silently
+		// acquire manual ownership and freeze the next semantic output. Manual owners
+		// that reach the same boundary transition through the existing live transaction.
+		if (direction > 0 && targetViewportTop === maxViewportTop) {
+			if (this.#manualViewportTop === undefined && currentViewportTop === maxViewportTop) return true;
+			if (this.#manualViewportTop !== undefined) return this.followLiveViewport();
+		}
 		if (frame !== null) {
-			const desiredScreenRow = this.#manualViewportAnchor?.desiredScreenRow ?? (direction < 0 ? 0 : height - 1);
+			const desiredScreenRow =
+				this.#manualViewportAnchor?.desiredScreenRow ??
+				(pin === "edge"
+					? direction < 0
+						? 0
+						: Math.max(0, transcriptCapacity - 1)
+					: Math.floor(transcriptCapacity / 2));
 			const targetRow = targetViewportTop + desiredScreenRow - frame.startRow;
 			let selected: { row: number; anchor: ViewportAnchorRow } | undefined;
 			const firstCandidateRow = Math.max(0, targetViewportTop - frame.startRow);
-			const lastCandidateRow = Math.min(frame.anchors.length, targetViewportTop + height - frame.startRow);
+			const lastCandidateRow = Math.min(
+				frame.anchors.length,
+				targetViewportTop + transcriptCapacity - frame.startRow,
+			);
 			for (let row = firstCandidateRow; row < lastCandidateRow; row++) {
 				const anchor = frame.anchors[row];
 				if (anchor === null) continue;
@@ -989,26 +1092,55 @@ export class TUI extends Container {
 		);
 	}
 
+	scrollViewportPages(direction: -1 | 1): boolean {
+		const height = this.terminal.rows;
+		return this.scrollViewportBy(direction * Math.max(1, this.#manualTranscriptCapacity(height) - 1), {
+			pin: "edge",
+		});
+	}
+
 	followLiveViewport(): boolean {
 		if (this.#manualViewportTop === undefined) return false;
 		const height = this.terminal.rows;
 		const width = this.terminal.columns;
-		const liveLines = this.#latestRenderedLines;
+		const paddedLiveLines = this.#padBeforeBottomPinnedComponent(
+			this.#latestRenderedLines,
+			height,
+			this.#manualSuffixLineCount,
+		);
+		const liveLines = paddedLiveLines.lines;
+		let liveCursorPosition = this.#lastCursorPosition;
+		if (liveCursorPosition !== null && liveCursorPosition.row >= paddedLiveLines.insertionRow) {
+			liveCursorPosition = {
+				...liveCursorPosition,
+				row: liveCursorPosition.row + paddedLiveLines.insertedBlankRows,
+			};
+		}
 		const liveViewportTop = Math.max(0, liveLines.length - height);
-		this.#manualViewportTop = undefined;
-		this.#manualViewportAnchor = null;
-		this.#manualViewportFallbackAnchors = [];
-		this.#reconcileMissingViewportAnchor = false;
-		const repainted = this.#repaintViewportFromLines(
+		return this.#repaintViewportFromLines(
 			liveLines,
 			width,
 			height,
 			liveViewportTop,
-			this.#lastCursorPosition,
+			liveCursorPosition,
 			"manual viewport follow live",
+			false,
+			() => {
+				this.#manualViewportTop = undefined;
+				this.#manualViewportAnchor = null;
+				this.#manualViewportFallbackAnchors = [];
+				this.#reconcileMissingViewportAnchor = false;
+				this.#manualOutputNotice = false;
+				this.#committedTranscriptRows = [];
+				this.#paintedManualOutputNotice = false;
+				this.#lastCursorPosition = liveCursorPosition;
+				this.#previousLines = liveLines;
+				if (this.#scrollbackResumeViewportTop === undefined) {
+					this.#nativeScrollbackViewportTop = liveViewportTop;
+				}
+			},
+			true,
 		);
-		if (repainted) this.#previousLines = liveLines;
-		return repainted;
 	}
 
 	/**
@@ -1613,7 +1745,7 @@ export class TUI extends Container {
 			if (mouse.x > this.terminal.columns || mouse.y > this.terminal.rows) return;
 			if (mouse.kind === "wheel") {
 				this.#clearMouseSelection();
-				this.scrollViewportPages(mouse.direction!);
+				this.scrollViewportBy(mouse.direction! * DEFAULT_WHEEL_LINES, { pin: "stable" });
 			} else if (mouse.kind === "click") {
 				this.#beginMouseSelection(mouse);
 				const focusedOverlay = this.overlayStack.find(o => o.component === this.#focusedComponent);
@@ -1689,16 +1821,23 @@ export class TUI extends Container {
 		}
 	}
 
-	#mouseSelectionPoint(mouse: MouseEvent): MouseSelectionPoint {
-		return {
-			line: this.#viewportTopRow + mouse.y - 1,
-			column: mouse.x - 1,
-		};
+	#mouseSelectionPoint(mouse: MouseEvent): MouseSelectionPoint | null {
+		if (this.#manualViewportTop === undefined) {
+			return { line: this.#viewportTopRow + mouse.y - 1, column: mouse.x - 1 };
+		}
+		const line = this.#committedTranscriptRows[mouse.y - 1];
+		return line === null || line === undefined || line < 0 || line >= this.#manualTranscriptLineCount
+			? null
+			: { line, column: mouse.x - 1 };
 	}
 
 	#beginMouseSelection(mouse: MouseEvent): void {
 		if (!this.options.copySelection) return;
 		const point = this.#mouseSelectionPoint(mouse);
+		if (point === null) {
+			this.#clearMouseSelection();
+			return;
+		}
 		this.#mouseSelectionStart = point;
 		this.#mouseSelectionEnd = point;
 		this.#mouseSelectionDragged = false;
@@ -1706,13 +1845,16 @@ export class TUI extends Container {
 
 	#updateMouseSelection(mouse: MouseEvent): void {
 		if (this.#mouseSelectionStart === null) return;
-		this.#mouseSelectionEnd = this.#mouseSelectionPoint(mouse);
+		const point = this.#mouseSelectionPoint(mouse);
+		if (point === null) return;
+		this.#mouseSelectionEnd = point;
 		this.#mouseSelectionDragged = true;
 	}
 
 	#finishMouseSelection(mouse: MouseEvent): void {
 		if (this.#mouseSelectionStart === null) return;
-		this.#mouseSelectionEnd = this.#mouseSelectionPoint(mouse);
+		const point = this.#mouseSelectionPoint(mouse);
+		if (point !== null) this.#mouseSelectionEnd = point;
 		if (!this.#mouseSelectionDragged || !this.options.copySelection) {
 			this.#clearMouseSelection();
 			return;
@@ -2244,33 +2386,108 @@ export class TUI extends Container {
 		return lines;
 	}
 
-	#padBeforeBottomPinnedComponent(
-		lines: string[],
-		height: number,
-		renderedChildren: Map<Component, string[]>,
-	): string[] {
-		const component = this.#bottomPinnedComponent;
-		if (component === null || lines.length >= height) return lines;
+	#pinnedChildLines(component: Component, renderedChildren: Map<Component, string[]>): string[] {
+		const lines = renderedChildren.get(component);
+		if (lines === undefined) throw new Error("Missing rendered direct child for pinned suffix");
+		return lines;
+	}
 
-		let pinnedStart = -1;
-		for (let i = this.children.length - 1; i >= 0; i--) {
-			if (this.children[i] === component) {
-				pinnedStart = i;
+	#constrainedPinnedChildLines(lines: string[], remaining: number): string[] {
+		let cursorLine = -1;
+		for (let index = 0; index < lines.length; index++) {
+			if (lines[index].includes(CURSOR_MARKER)) {
+				cursorLine = index;
 				break;
 			}
 		}
+		if (cursorLine < 0) return lines.slice(-remaining);
+		const start = Math.max(0, Math.min(cursorLine, lines.length - remaining));
+		return lines.slice(start, start + remaining);
+	}
+
+	#componentContains(root: Component, target: Component | null): boolean {
+		if (target === null) return false;
+		if (root === target) return true;
+		return root instanceof Container && root.children.some(child => this.#componentContains(child, target));
+	}
+
+	#constrainPinnedSuffix(lines: string[], height: number, renderedChildren: Map<Component, string[]>): string[] {
+		const component = this.#bottomPinnedComponent;
+		if (component === null || height <= 0) return lines;
+		const pinnedStart = this.children.indexOf(component);
 		if (pinnedStart < 0) return lines;
 
-		let pinnedLineCount = 0;
-		for (let i = pinnedStart; i < this.children.length; i++) {
-			pinnedLineCount += (renderedChildren.get(this.children[i]) ?? []).length;
+		let suffixRowCount = 0;
+		for (let index = pinnedStart; index < this.children.length; index++) {
+			suffixRowCount += this.#pinnedChildLines(this.children[index], renderedChildren).length;
+		}
+		if (suffixRowCount <= height) return lines;
+
+		renderMetrics.recordStructuralCounter("pinnedSuffixOverflowFrames");
+		let focusedChild: Component | null = null;
+		for (let index = pinnedStart; index < this.children.length; index++) {
+			const child = this.children[index];
+			if (this.#componentContains(child, this.#focusedComponent)) {
+				focusedChild = child;
+				break;
+			}
+		}
+		const selectedRowCounts = new Map<Component, number>();
+		let remaining = height;
+		const allocate = (child: Component, maximumRows?: number): void => {
+			if (remaining === 0) return;
+			const rows = this.#pinnedChildLines(child, renderedChildren);
+			const alreadySelected = selectedRowCounts.get(child) ?? 0;
+			const count = Math.min(rows.length - alreadySelected, maximumRows ?? rows.length, remaining);
+			if (count === 0) return;
+			selectedRowCounts.set(child, alreadySelected + count);
+			remaining -= count;
+		};
+
+		// Reserve the focused cursor row before the status boundary, then let later
+		// decorative children compete in reverse order. A deferred allocation lets the
+		// focused child retain adjacent rows only after those priorities are satisfied.
+		if (focusedChild !== null) allocate(focusedChild, 1);
+		if (component !== focusedChild) allocate(component);
+		for (let index = this.children.length - 1; index >= pinnedStart; index--) {
+			const child = this.children[index];
+			if (child !== focusedChild && child !== component) allocate(child);
+		}
+		if (focusedChild !== null) allocate(focusedChild);
+
+		const transcriptEnd = lines.length - suffixRowCount;
+		lines.length = transcriptEnd;
+		let selectedRows = 0;
+		for (let index = pinnedStart; index < this.children.length; index++) {
+			const child = this.children[index];
+			const count = selectedRowCounts.get(child);
+			if (count === undefined) continue;
+			const constrained = this.#constrainedPinnedChildLines(this.#pinnedChildLines(child, renderedChildren), count);
+			selectedRows += constrained.length;
+			for (const row of constrained) lines.push(row);
+		}
+		renderMetrics.recordStructuralCounter("pinnedSuffixSelectedRows", selectedRows);
+		return lines;
+	}
+
+	#padBeforeBottomPinnedComponent(
+		lines: string[],
+		height: number,
+		pinnedLineCount: number,
+	): { lines: string[]; insertionRow: number; insertedBlankRows: number } {
+		if (pinnedLineCount <= 0 || lines.length >= height) {
+			return { lines, insertionRow: lines.length, insertedBlankRows: 0 };
 		}
 
-		const blankRows = height - lines.length;
-		const insertAt = Math.max(0, lines.length - pinnedLineCount);
+		const insertedBlankRows = height - lines.length;
+		const insertionRow = Math.max(0, lines.length - pinnedLineCount);
 		const padded = [...lines];
-		padded.splice(insertAt, 0, ...Array.from({ length: blankRows }, () => ""));
-		return padded;
+		padded.splice(insertionRow, 0, ...Array.from({ length: insertedBlankRows }, () => ""));
+		return { lines: padded, insertionRow, insertedBlankRows };
+	}
+	#manualTranscriptCapacity(height: number): number {
+		const noticeRows = this.#manualOutputNotice && height > this.#manualSuffixLineCount ? 1 : 0;
+		return Math.max(0, height - this.#manualSuffixLineCount - noticeRows);
 	}
 	#resolveManualAnchor(frame: ViewportAnchorFrame): number | null {
 		const anchor = this.#manualViewportAnchor;
@@ -2329,9 +2546,19 @@ export class TUI extends Container {
 		cursorPos: { row: number; col: number } | null,
 		reason: string,
 		allowPastLiveBottom = false,
+		onPainted?: () => void,
+		paintLive = false,
 	): boolean {
+		const paintManual = this.#manualViewportTop !== undefined && !paintLive;
 		if (height <= 0 || width <= 0) return false;
-		const maxViewportTop = Math.max(0, lines.length - (allowPastLiveBottom ? 1 : height));
+		const maxViewportTop = Math.max(
+			0,
+			!paintManual
+				? lines.length - (allowPastLiveBottom ? 1 : height)
+				: allowPastLiveBottom
+					? lines.length - 1
+					: this.#manualTranscriptLineCount - this.#manualTranscriptCapacity(height),
+		);
 		const nextViewportTop = Math.max(0, Math.min(maxViewportTop, viewportTop));
 		const currentScreenRow = Math.max(0, Math.min(height - 1, this.#hardwareCursorRow - this.#viewportTopRow));
 		let buffer = "\x1b[?2026h";
@@ -2340,12 +2567,25 @@ export class TUI extends Container {
 		}
 		buffer += "\r";
 
+		const transcriptCapacity = paintManual ? this.#manualTranscriptCapacity(height) : height;
+		const noticeRows = paintManual && this.#manualOutputNotice && height > this.#manualSuffixLineCount ? 1 : 0;
+		const committedTranscriptRows: Array<number | null> = [];
 		for (let screenRow = 0; screenRow < height; screenRow++) {
 			if (screenRow > 0) buffer += "\r\n";
 			buffer += "\x1b[2K";
 			const lineIndex = nextViewportTop + screenRow;
-			if (lineIndex >= lines.length) continue;
-			const line = lines[lineIndex];
+			const suffixRow = screenRow - transcriptCapacity - noticeRows;
+			const line =
+				paintManual && screenRow === transcriptCapacity && noticeRows > 0
+					? "New output — type to follow"
+					: paintManual && suffixRow >= 0
+						? (lines[this.#manualTranscriptLineCount + suffixRow] ?? "")
+						: paintManual && lineIndex >= this.#manualTranscriptLineCount
+							? ""
+							: (lines[lineIndex] ?? "");
+			committedTranscriptRows.push(
+				screenRow < transcriptCapacity && lineIndex < this.#manualTranscriptLineCount ? lineIndex : null,
+			);
 			const isImage = TERMINAL.isImageLine(line);
 			if (!isImage && this.#visibleWidthForDifferentialGuard(line) > width) {
 				let truncatedLine = truncateToWidth(line, width, Ellipsis.Omit);
@@ -2364,19 +2604,24 @@ export class TUI extends Container {
 			cursorSeq = cursor.seq;
 			cursorToRow = cursor.toRow;
 		}
-		this.#hardwareCursorRow = cursorToRow;
 		buffer += cursorSeq;
 		buffer += "\x1b[?2026l";
-		if (!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, lines.length)) return false;
+		if (
+			!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, lines.length, () => {
+				this.#hardwareCursorRow = cursorToRow;
+				this.#committedTranscriptRows = committedTranscriptRows;
+				this.#cursorRow = Math.max(0, lines.length - 1);
+				this.#maxLinesRendered = lines.length;
+				this.#viewportTopRow = nextViewportTop;
+				onPainted?.();
+			})
+		)
+			return false;
 
 		if (this.#debugRedraw) {
 			const msg = `[${new Date().toISOString()}] viewportRepaint: ${reason} (lines=${lines.length}, height=${height}, viewportTop=${nextViewportTop})\n`;
 			this.#appendDebugRedrawLog(msg);
 		}
-
-		this.#cursorRow = Math.max(0, lines.length - 1);
-		this.#maxLinesRendered = lines.length;
-		this.#viewportTopRow = nextViewportTop;
 		return true;
 	}
 
@@ -2407,13 +2652,30 @@ export class TUI extends Container {
 			}
 			for (const line of rendered.lines) renderedLines.push(line);
 		}
+		let pinnedChildIndex = -1;
+		for (let index = 0; index < this.children.length; index++) {
+			if (this.children[index] === this.#bottomPinnedComponent) {
+				pinnedChildIndex = index;
+				break;
+			}
+		}
+		const hasStickySuffix = pinnedChildIndex >= 0;
+		const sourceTranscriptLineCount = hasStickySuffix
+			? this.children
+					.slice(0, pinnedChildIndex)
+					.reduce((count, child) => count + this.#pinnedChildLines(child, renderedChildren).length, 0)
+			: renderedLines.length;
 		const anchorRenderFailed = viewportAnchorRenderFailureCount !== anchorRenderFailureCountBefore;
-		let newLines = renderedLines;
+		let newLines = this.#constrainPinnedSuffix(renderedLines, height, renderedChildren);
 		this.#viewportAnchorFrame = anchorFrame;
 		if (renderMetrics.enabled) renderMetrics.recordHelper("renderTree", renderMetrics.now() - renderTreeStart);
 
-		if (this.#bottomPinnedComponent !== null && height > 0) {
-			newLines = this.#padBeforeBottomPinnedComponent(newLines, height, renderedChildren);
+		if (hasStickySuffix && height > 0 && this.#manualViewportTop === undefined) {
+			newLines = this.#padBeforeBottomPinnedComponent(
+				newLines,
+				height,
+				newLines.length - sourceTranscriptLineCount,
+			).lines;
 		}
 
 		// Composite overlays into the rendered lines (before differential compare)
@@ -2435,9 +2697,9 @@ export class TUI extends Container {
 		const widthChanged = this.#previousWidth !== 0 && this.#previousWidth !== width;
 		const heightChanged = this.#previousHeight !== 0 && this.#previousHeight !== height;
 
-		// Normalize/truncate lines for emission. With the opt-in virtual-viewport flag
-		// (PI_TUI_VIRTUAL_VIEWPORT) we reuse the previous frame's normalized prefix when the
-		// off-screen raw prefix is unchanged (raw value equality per line; fast reference
+		// Normalize/truncate lines for emission. The virtual viewport is default-on;
+		// PI_TUI_VIRTUAL_VIEWPORT=0 opts out. When enabled, reuse the previous frame's
+		// normalized prefix when the off-screen raw prefix is unchanged (raw value equality
 		// short-circuit for cached components), so only the visible window is
 		// re-normalized and the diff starts at the window. Output is byte-identical to the
 		// full path (reused entries are deterministic normalizations of identical raw lines).
@@ -2487,6 +2749,8 @@ export class TUI extends Container {
 			if (usedWindowNormalize) renderMetrics.recordLineCount("offscreenScan", diffStart);
 		}
 		this.#latestRenderedLines = newLines;
+		this.#manualTranscriptLineCount = sourceTranscriptLineCount;
+		this.#manualSuffixLineCount = Math.max(0, newLines.length - sourceTranscriptLineCount);
 		const naturalViewportTop = Math.max(0, newLines.length - height);
 		const priorLogicalLineCount = Math.max(this.#previousLines.length, this.#maxLinesRendered);
 		if (this.#transcriptIdentityResetPending) {
@@ -2555,6 +2819,7 @@ export class TUI extends Container {
 				this.#previousWidth === width &&
 				this.#previousHeight === height &&
 				nextViewportTop === this.#manualViewportTop &&
+				this.#manualOutputNotice === this.#paintedManualOutputNotice &&
 				newLines.length === this.#previousLines.length &&
 				newLines.every((line, index) => line === this.#previousLines[index])
 			) {
@@ -2576,6 +2841,7 @@ export class TUI extends Container {
 				this.#previousLines = newLines;
 				this.#previousWidth = width;
 				this.#previousHeight = height;
+				this.#paintedManualOutputNotice = this.#manualOutputNotice;
 			}
 			return;
 		}
@@ -2603,28 +2869,28 @@ export class TUI extends Container {
 				// lines were left untouched there.
 				buffer += newLines[i];
 			}
-			this.#cursorRow = Math.max(0, newLines.length - 1);
-			const { seq, toRow } = this.#cursorControlSequence(cursorPos, newLines.length, this.#cursorRow);
-			this.#hardwareCursorRow = toRow;
+			const cursorRow = Math.max(0, newLines.length - 1);
+			const { seq, toRow } = this.#cursorControlSequence(cursorPos, newLines.length, cursorRow);
 			buffer += seq;
 			buffer += "\x1b[?2026l"; // End synchronized output
-			if (!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, newLines.length)) return;
-			// Reset max lines when clearing, otherwise track growth
-			if (clear) {
-				this.#maxLinesRendered = newLines.length;
-			} else {
-				this.#maxLinesRendered = Math.max(this.#maxLinesRendered, newLines.length);
-			}
-			this.#viewportTopRow = Math.max(0, this.#maxLinesRendered - height);
-			this.#nativeScrollbackViewportTop = clear
-				? this.#viewportTopRow
-				: Math.max(this.#nativeScrollbackViewportTop, this.#viewportTopRow);
-			if (clear && !shouldPreserveScrollbackOnFullClear(this.terminal)) {
-				this.#scrollbackResumeViewportTop = undefined;
-			}
-			this.#previousLines = newLines;
-			this.#previousWidth = width;
-			this.#previousHeight = height;
+			if (
+				!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, newLines.length, () => {
+					this.#cursorRow = cursorRow;
+					this.#hardwareCursorRow = toRow;
+					this.#maxLinesRendered = clear ? newLines.length : Math.max(this.#maxLinesRendered, newLines.length);
+					this.#viewportTopRow = Math.max(0, this.#maxLinesRendered - height);
+					this.#nativeScrollbackViewportTop = clear
+						? this.#viewportTopRow
+						: Math.max(this.#nativeScrollbackViewportTop, this.#viewportTopRow);
+					if (clear && !shouldPreserveScrollbackOnFullClear(this.terminal)) {
+						this.#scrollbackResumeViewportTop = undefined;
+					}
+					this.#previousLines = newLines;
+					this.#previousWidth = width;
+					this.#previousHeight = height;
+				})
+			)
+				return;
 		};
 
 		viewportRepaint = (reason: string, targetViewportTop = Math.max(0, newLines.length - height)): void => {
@@ -2661,25 +2927,25 @@ export class TUI extends Container {
 				cursorSeq = cursor.seq;
 				cursorToRow = cursor.toRow;
 			}
-			this.#hardwareCursorRow = cursorToRow;
 			buffer += cursorSeq;
 			buffer += "\x1b[?2026l";
-			if (!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, newLines.length)) return;
+			if (
+				!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, newLines.length, () => {
+					this.#hardwareCursorRow = cursorToRow;
+					this.#cursorRow = Math.max(0, newLines.length - 1);
+					this.#maxLinesRendered = newLines.length;
+					this.#viewportTopRow = nextViewportTop;
+					this.#previousLines = newLines;
+					this.#previousWidth = width;
+					this.#previousHeight = height;
+				})
+			)
+				return;
 
 			if (this.#debugRedraw) {
 				const msg = `[${new Date().toISOString()}] viewportRepaint: ${reason} (prev=${this.#previousLines.length}, new=${newLines.length}, height=${height}, viewportTop=${nextViewportTop})\n`;
 				this.#appendDebugRedrawLog(msg);
 			}
-			// Viewport repaint deliberately prioritizes the live viewport over
-			// historical scrollback repair. After offscreen changes, #previousLines
-			// tracks the desired logical transcript, not every byte emitted into the
-			// terminal scrollback.
-			this.#cursorRow = Math.max(0, newLines.length - 1);
-			this.#maxLinesRendered = newLines.length;
-			this.#viewportTopRow = nextViewportTop;
-			this.#previousLines = newLines;
-			this.#previousWidth = width;
-			this.#previousHeight = height;
 		};
 
 		const debugRedraw = this.#debugRedraw;
@@ -2839,12 +3105,21 @@ export class TUI extends Container {
 				if (moveUp > 0) {
 					buffer += `\x1b[${moveUp}A`;
 				}
-				this.#cursorRow = targetRow;
 				const { seq, toRow } = this.#cursorControlSequence(cursorPos, newLines.length, targetRow);
-				this.#hardwareCursorRow = toRow;
 				buffer += seq;
 				buffer += "\x1b[?2026l";
-				if (!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, newLines.length)) return;
+				if (
+					!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, newLines.length, () => {
+						this.#cursorRow = targetRow;
+						this.#hardwareCursorRow = toRow;
+						this.#previousLines = newLines;
+						this.#previousWidth = width;
+						this.#previousHeight = height;
+						this.#maxLinesRendered = newLines.length;
+						this.#viewportTopRow = Math.max(0, newLines.length - height);
+					})
+				)
+					return;
 			}
 			this.#previousLines = newLines;
 			this.#previousWidth = width;
@@ -2959,7 +3234,6 @@ export class TUI extends Container {
 		}
 
 		const { seq, toRow } = this.#cursorControlSequence(cursorPos, newLines.length, finalCursorRow);
-		this.#hardwareCursorRow = toRow;
 		buffer += seq;
 		buffer += "\x1b[?2026l"; // End synchronized output
 
@@ -2993,21 +3267,22 @@ export class TUI extends Container {
 			fs.writeFileSync(debugPath, debugData);
 		}
 
-		// Write entire buffer at once
-		if (!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, newLines.length)) return;
-
-		// Track cursor position for next render.
-		// cursorRow tracks end of content (for viewport calculation).
-		// #hardwareCursorRow was already updated by #cursorControlSequence above.
-		this.#cursorRow = Math.max(0, newLines.length - 1);
-		// Track content height for viewport calculation
-		this.#maxLinesRendered = newLines.length;
-		this.#viewportTopRow = Math.max(0, newLines.length - height);
-		this.#nativeScrollbackViewportTop = Math.max(this.#nativeScrollbackViewportTop, this.#viewportTopRow);
-
-		this.#previousLines = newLines;
-		this.#previousWidth = width;
-		this.#previousHeight = height;
+		// Write entire buffer at once. Once those bytes are accepted, the painted
+		// frame and geometry are authoritative even when the optional IME cursor
+		// write subsequently detaches the terminal.
+		if (
+			!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, newLines.length, () => {
+				this.#hardwareCursorRow = toRow;
+				this.#cursorRow = Math.max(0, newLines.length - 1);
+				this.#maxLinesRendered = newLines.length;
+				this.#viewportTopRow = Math.max(0, newLines.length - height);
+				this.#nativeScrollbackViewportTop = Math.max(this.#nativeScrollbackViewportTop, this.#viewportTopRow);
+				this.#previousLines = newLines;
+				this.#previousWidth = width;
+				this.#previousHeight = height;
+			})
+		)
+			return;
 	}
 
 	/**
@@ -3082,6 +3357,7 @@ export class TUI extends Container {
 		buffer: string,
 		cursorPos: { row: number; col: number } | null,
 		totalLines: number,
+		onBufferWritten?: () => void,
 	): boolean {
 		const overlay = this.#postRenderEmitter?.();
 		if (overlay) {
@@ -3091,6 +3367,7 @@ export class TUI extends Container {
 			buffer += `\x1b[?2026h\x1b7${overlay}\x1b8\x1b[?2026l`;
 		}
 		if (!this.#writeTerminal(buffer)) return false;
+		onBufferWritten?.();
 		if (!this.#imeCursorActive) {
 			this.#lastRenderWriteSucceeded = true;
 			return true;
@@ -3110,8 +3387,9 @@ export class TUI extends Container {
 			return this.#hideCursor();
 		}
 		const { seq, toRow } = this.#cursorControlSequence(cursorPos, totalLines, this.#hardwareCursorRow);
-		this.#hardwareCursorRow = toRow;
 		// No \x1b[?2026h/l wrapper: synchronized output flushes terminal state and discards macOS IME composition.
-		return this.#writeTerminal(seq);
+		if (!this.#writeTerminal(seq)) return false;
+		this.#hardwareCursorRow = toRow;
+		return true;
 	}
 }
