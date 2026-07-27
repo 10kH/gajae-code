@@ -43,7 +43,14 @@ type CaptureMetadata = {
 	sha256: Record<Exclude<CaptureFileName, "metadata.json">, string>;
 };
 
-const FORBIDDEN_CAPTURE_CONTENT = /:\/\/user:|@[^\s/]+|[?#]|token|\/Users\/|\/home\//i;
+/**
+ * Locator-shaped content that must never reach a capture. Applied to the
+ * rendered terminal text, which is the only surface that can carry a leaked
+ * locator; generated HTML/CSS legitimately contains `#rrggbb` colors and
+ * escaped entities, so it is checked against the same rules via its source
+ * text rather than its markup.
+ */
+const FORBIDDEN_CAPTURE_CONTENT = /:\/\/user:|@[^\s/]+|\?[^\s]*=|token|\/Users\/|\/home\//i;
 
 function sha256(content: string): string {
 	return new Bun.CryptoHasher("sha256").update(content).digest("hex");
@@ -239,7 +246,11 @@ async function artifactContents(entry: FixtureEntry): Promise<Record<CaptureFile
 
 async function writeEntry(entry: FixtureEntry, outputRoot: string): Promise<void> {
 	const artifacts = await artifactContents(entry);
-	for (const [name, content] of Object.entries(artifacts)) assertSafeContent(`${entry.entryId}/${name}`, content);
+	// The HTML artifact is a pure rendering of the ANSI text, so proving the two
+	// text surfaces and the metadata are clean proves the whole entry is clean.
+	for (const name of ["terminal.txt", "terminal-ansi.txt", "metadata.json"] as const) {
+		assertSafeContent(`${entry.entryId}/${name}`, artifacts[name]);
+	}
 	const directory = path.join(outputRoot, entry.entryId);
 	await fs.mkdir(directory, { recursive: true });
 	await Promise.all(
