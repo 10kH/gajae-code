@@ -1,11 +1,4 @@
-import {
-	$credentialEnv,
-	$env,
-	$inheritedEnv,
-	extractHttpStatusFromError,
-	logger,
-	structuredCloneJSON,
-} from "@gajae-code/utils";
+import { $credentialEnv, extractHttpStatusFromError, logger, structuredCloneJSON } from "@gajae-code/utils";
 import OpenAI from "openai";
 import type {
 	Tool as OpenAITool,
@@ -159,12 +152,23 @@ function resolveOpenAIProviderBaseUrl(
 	authCredentialType: "api_key" | "oauth" | undefined,
 ): string {
 	if (authCredentialType === "oauth") return OPENAI_DEFAULT_BASE_URL;
-	const envBaseUrl = $inheritedEnv("OPENAI_BASE_URL") ?? $env.OPENAI_BASE_URL?.trim();
+	// Trusted sources only: this base URL becomes the request endpoint that carries
+	// the OpenAI credential, and `$env` merges the caller's `cwd/.env`, so reading it
+	// there would let repository content redirect authenticated traffic.
+	const envBaseUrl = $credentialEnv("OPENAI_BASE_URL");
 	const configuredBaseUrl = baseUrl?.trim();
 	if (envBaseUrl && (!configuredBaseUrl || isDefaultOpenAIBaseUrl(configuredBaseUrl))) {
 		return envBaseUrl;
 	}
 	return configuredBaseUrl || envBaseUrl || OPENAI_DEFAULT_BASE_URL;
+}
+
+/** Test seam: the provider base URL as resolved from trusted env. */
+export function resolveOpenAIProviderBaseUrlForTest(
+	baseUrl: string | undefined,
+	authCredentialType: "api_key" | "oauth" | undefined,
+): string {
+	return resolveOpenAIProviderBaseUrl(baseUrl, authCredentialType);
 }
 
 const OPENAI_RESPONSES_PROGRESS_EVENT_TYPES = new Set([

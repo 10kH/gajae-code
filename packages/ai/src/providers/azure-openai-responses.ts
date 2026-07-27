@@ -1,4 +1,4 @@
-import { $env, extractHttpStatusFromError, logger } from "@gajae-code/utils";
+import { $credentialEnv, $env, extractHttpStatusFromError, logger } from "@gajae-code/utils";
 import { AzureOpenAI } from "openai";
 import type {
 	Tool as OpenAITool,
@@ -234,7 +234,9 @@ function resolveAzureConfig(
 ): { baseUrl: string; apiVersion: string } {
 	const apiVersion = options?.azureApiVersion || $env.AZURE_OPENAI_API_VERSION || DEFAULT_AZURE_API_VERSION;
 
-	const baseUrl = options?.azureBaseUrl?.trim() || $env.AZURE_OPENAI_BASE_URL?.trim() || undefined;
+	// Trusted sources only: this base URL becomes the request endpoint that carries
+	// the Azure credential, and `$env` merges the caller's `cwd/.env`.
+	const baseUrl = options?.azureBaseUrl?.trim() || $credentialEnv("AZURE_OPENAI_BASE_URL") || undefined;
 	const resourceName = options?.azureResourceName || $env.AZURE_OPENAI_RESOURCE_NAME;
 
 	let resolvedBaseUrl = baseUrl;
@@ -257,6 +259,14 @@ function resolveAzureConfig(
 		baseUrl: normalizeAzureBaseUrl(resolvedBaseUrl),
 		apiVersion,
 	};
+}
+
+/** Test seam: the Azure endpoint config as resolved from trusted env. */
+export function resolveAzureConfigForTest(
+	model: Model<"azure-openai-responses">,
+	options?: AzureOpenAIResponsesOptions,
+): { baseUrl: string; apiVersion: string } {
+	return resolveAzureConfig(model, options);
 }
 
 function createClient(model: Model<"azure-openai-responses">, apiKey: string, options?: AzureOpenAIResponsesOptions) {
