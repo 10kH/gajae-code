@@ -104,6 +104,16 @@
 							},
 							"additionalProperties": false
 						},
+						"sound": {
+							"type": "string",
+							"enum": [
+								"all",
+								"important",
+								"none"
+							],
+							"description": "Choose which Telegram notifications play a sound.",
+							"default": "all"
+						},
 						"rich": {
 							"type": "object",
 							"properties": {
