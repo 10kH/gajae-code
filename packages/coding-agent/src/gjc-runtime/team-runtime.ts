@@ -2518,7 +2518,11 @@ function tagTmuxSessionAsGjcLeader(tmuxCommand: string, sessionName: string): bo
 	return result.exitCode === 0;
 }
 
-function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEnv): GjcTmuxLeaderContext {
+function readCurrentTmuxLeaderContext(
+	tmuxCommand: string,
+	env: NodeJS.ProcessEnv,
+	adoptUnmanagedSession = true,
+): GjcTmuxLeaderContext {
 	if (Bun.which(tmuxCommand) === null)
 		throw new Error(buildTeamTmuxLeaderRequirementMessage(`tmux_not_installed:${tmuxCommand}`));
 	// Prefer the explicit GJC-managed session name propagated by `gjc --tmux`
@@ -2551,7 +2555,7 @@ function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEn
 	const [sessionName = "", windowIndex = ""] = sessionAndWindow.split(":");
 	if (!sessionName || !windowIndex || !leaderPaneId.startsWith("%"))
 		throw new Error(buildTeamTmuxLeaderRequirementMessage(`invalid_tmux_context:${result.stdout.toString().trim()}`));
-	if (readGjcTmuxProfileValue(tmuxCommand, sessionName) !== GJC_TMUX_PROFILE_VALUE) {
+	if (adoptUnmanagedSession && readGjcTmuxProfileValue(tmuxCommand, sessionName) !== GJC_TMUX_PROFILE_VALUE) {
 		// Adopt any real tmux leader as a GJC team leader — including a session
 		// the user created outside `gjc --tmux` — by writing GJC's @gjc-profile
 		// ownership tag and reading it back. A provider that round-trips tmux
@@ -2573,6 +2577,20 @@ function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEn
 		leaderPaneId,
 		target: `${sessionName}:${windowIndex}`,
 	};
+}
+/**
+ * Check whether the current process can launch a team without changing tmux state.
+ * Unlike the launch path, this never adopts or tags an unmanaged tmux session.
+ */
+export function probeGjcTeamAvailability(
+	env: NodeJS.ProcessEnv = process.env,
+): { available: true } | { available: false; reason: string } {
+	try {
+		readCurrentTmuxLeaderContext(resolveGjcTmuxCommand(env), env, false);
+		return { available: true };
+	} catch (error) {
+		return { available: false, reason: error instanceof Error ? error.message : String(error) };
+	}
 }
 function isBunVirtualPath(candidate: string | undefined): boolean {
 	const normalized = candidate?.trim().replace(/\\/g, "/").toLowerCase();
