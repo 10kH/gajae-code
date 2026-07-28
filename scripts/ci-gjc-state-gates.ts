@@ -10,15 +10,15 @@ delete process.env.GJC_SESSION_ID;
 delete process.env.GJC_STATE_SESSION_ID;
 
 const relevantPathPrefixes = [
-	"docs/deep-interview-repair-cli.md",
 	"packages/coding-agent/",
 	".github/workflows/dev-ci.yml",
 	".github/workflows/ci.yml",
 	"scripts/ci-gjc-state-gates.ts",
 	"scripts/verify-gjc-state-writers.ts",
 	"scripts/generate-gjc-workflow-manifest.ts",
-	"scripts/generate-deep-interview-draft-reference.ts",
 	"scripts/verify-gjc-skill-docs.ts",
+	"scripts/verify-deep-interview-docs.ts",
+	"docs/deep-interview-repair-cli.md",
 	"scripts/verify-g002-gates.ts",
 	"package.json",
 	"bun.lock",
@@ -31,8 +31,8 @@ const boundedGateGroups: Record<string, readonly (readonly string[])[]> = {
 	static: [
 	["bun", "scripts/verify-gjc-state-writers.ts", "--fail"],
 	["bun", "scripts/generate-gjc-workflow-manifest.ts", "--check"],
-	["bun", "scripts/generate-deep-interview-draft-reference.ts", "--check"],
 	["bun", "scripts/verify-gjc-skill-docs.ts", "--fail"],
+	["bun", "scripts/verify-deep-interview-docs.ts", "--fail"],
 	["bun", "test", "packages/coding-agent/test/gjc-runtime/state-schema.test.ts"],
 	["bun", "test", "packages/coding-agent/test/gjc-runtime/state-migrations.test.ts"],
 	["bun", "test", "packages/coding-agent/test/gjc-runtime/state-schema-corpus.test.ts"],
