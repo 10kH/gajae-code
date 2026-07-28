@@ -706,7 +706,10 @@ describe("CLI-owned deep-interview draft consumption", () => {
 				expected: "greenfield",
 				actual: "brownfield",
 			});
-			expect(String(issue.recovery)).toContain("--op remove --path /type");
+			// `/type` is a required field, so recovery must offer `set`, never `remove`
+			// (which would contradict DI_DRAFT_FIELD_REQUIRED).
+			expect(String(issue.recovery)).toContain("--op set --path /type");
+			expect(String(issue.recovery)).not.toContain("--op remove --path /type");
 
 			// Removing a required field reports that it is required, not an invalid path.
 			const removeRequired = await native(env.cwd, [
@@ -730,6 +733,7 @@ describe("CLI-owned deep-interview draft consumption", () => {
 
 			// Applying the named correction makes the same draft valid and consumable.
 			created = draft(await native(env.cwd, ["draft", "show", "--draft-id", created.id, "--json"]));
+			// Applying the exact correction the recovery names resolves the conflict.
 			created = await edit(env.cwd, created.id, created.draft_revision, "set", "/type", "greenfield");
 			expect(json(await native(env.cwd, ["draft", "check", "--draft-id", created.id, "--json"]))).toMatchObject({
 				valid: true,

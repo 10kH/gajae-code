@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { computeAmbiguityFloor, scoreToUnits } from "./deep-interview-ambiguity";
-import type { DeepInterviewDraftKind } from "./deep-interview-payload";
+import { type DeepInterviewDraftKind, deepInterviewDraftSchema } from "./deep-interview-payload";
 import { runDeepInterviewPostCommitEffects } from "./deep-interview-recorder";
 import {
 	answerHash,
@@ -173,13 +173,37 @@ const PAYLOAD_INVARIANT_RECOVERY =
 const STATE_INVARIANT_RECOVERY =
 	"The violated invariant is in persisted state, not the draft payload. Inspect it (gjc deep-interview inspect --session-id <session> --selector summary|pending|recent-scored --json) and complete the missing lifecycle step (e.g. score earlier pending rounds first); if the state itself is corrupt, follow the documented state repair path via sanity-check — never edit .gjc state files directly.";
 /**
+ * Top-level `initialize-context` payload pointers that the draft schema marks
+ * required. `draft edit --op remove` refuses these, so conflict recovery must
+ * not suggest removing one. Derived from the descriptors to avoid drift.
+ */
+let requiredSetupPointers: ReadonlySet<string> | undefined;
+function isRequiredSetupPointer(pointer: string): boolean {
+	// Computed on first use: this module and the payload descriptors import each
+	// other, so reading DRAFT_SCHEMAS at module scope would hit a TDZ error.
+	requiredSetupPointers ??= new Set(
+		Object.entries(deepInterviewDraftSchema("initialize-context").fields)
+			.filter(([, descriptor]) => descriptor.kind === "leaf" && !descriptor.optional)
+			.map(([field]) => `/${field}`),
+	);
+	return requiredSetupPointers.has(pointer);
+}
+/**
  * Invariant detail paths starting with `/state/` point at the persisted
  * envelope; everything else (`/global_scores/...`, `/triggers...`, `/fact_ops...`,
  * `/bookkeeping/...`, `/targeting`, `/ontology/...`) is payload-addressable.
  */
 function invariantRecovery(detail: DeepInterviewInvariantDetail): string {
-	if (detail.invariant === "setup_fields_are_immutable")
-		return `State already has ${detail.path}; initialized setup fields cannot be changed. Drop it from the draft (gjc deep-interview draft edit --draft-id <id> --expected-draft-revision latest --op remove --path ${detail.path} --json) or set it to the existing value, then rerun gjc deep-interview draft check --draft-id <id> --json.`;
+	if (detail.invariant === "setup_fields_are_immutable") {
+		// `remove` only works on optional payload fields; recommending it for a
+		// required one would contradict DI_DRAFT_FIELD_REQUIRED.
+		const existing = detail.expected === undefined ? "<existing>" : JSON.stringify(detail.expected);
+		const removable = !isRequiredSetupPointer(detail.path);
+		const correction = removable
+			? `drop it from the draft (gjc deep-interview draft edit --draft-id <id> --expected-draft-revision latest --op remove --path ${detail.path} --json) or set it to ${existing}`
+			: `set it back to ${existing} (gjc deep-interview draft edit --draft-id <id> --expected-draft-revision latest --op set --path ${detail.path} --value ${existing} --json)`;
+		return `State already initialized ${detail.path}; setup fields cannot be changed. To proceed, ${correction}, then rerun gjc deep-interview draft check --draft-id <id> --json.`;
+	}
 	return detail.path.startsWith("/state/") ? STATE_INVARIANT_RECOVERY : PAYLOAD_INVARIANT_RECOVERY;
 }
 function issue(code: string, detail?: DeepInterviewInvariantDetail) {
