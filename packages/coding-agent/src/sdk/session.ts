@@ -2364,6 +2364,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				(options.alwaysActiveToolNames ?? []).map(name => name.toLowerCase()),
 			);
 			const essentialBuiltinNames = new Set(computeEssentialBuiltinNames(settings));
+			// `task.eager` promises delegation preference. In discovery mode the task tool
+			// would otherwise be hidden, making the matching prompt instruction unreachable.
+			if (eagerTasks) essentialBuiltinNames.add("task");
 			const allowedDiscoveredBuiltinNames = options.discoverableToolAllowedNames
 				? new Set(options.discoverableToolAllowedNames.map(name => name.toLowerCase()))
 				: undefined;
