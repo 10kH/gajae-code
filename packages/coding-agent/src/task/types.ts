@@ -283,6 +283,8 @@ export interface AgentProgress {
 	durationMs: number;
 	modelOverride?: string | string[];
 	modelSubstitutionWarning?: ModelSubstitutionWarning;
+	/** Whether the resolved subagent model runs under the effective fast service tier. */
+	fastMode?: boolean;
 	/** Data extracted by registered subprocess tool handlers (keyed by tool name) */
 	extractedToolData?: Record<string, unknown[]>;
 	/**
@@ -346,6 +348,8 @@ export interface SingleResult {
 	contextWindow?: number;
 	modelOverride?: string | string[];
 	modelSubstitutionWarning?: ModelSubstitutionWarning;
+	/** Whether the resolved subagent model ran under the effective fast service tier. */
+	fastMode?: boolean;
 	error?: string;
 	aborted?: boolean;
 	abortReason?: string;

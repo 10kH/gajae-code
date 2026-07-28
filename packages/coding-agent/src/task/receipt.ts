@@ -29,6 +29,7 @@ export interface TaskResultReceipt {
 	contextWindow?: number;
 	modelOverride?: string | string[];
 	modelSubstitutionWarning?: SingleResult["modelSubstitutionWarning"];
+	fastMode?: boolean;
 	usage?: SingleResult["usage"];
 	cost?: number;
 	usageCostBreakdownComplete?: true;
@@ -251,6 +252,7 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		usageCostBreakdownComplete:
 			raw.usageCostBreakdownComplete === true && hasCompleteUsageCostBreakdown(raw.usage) ? true : undefined,
 		branchName: raw.branchName,
+		fastMode: raw.fastMode,
 		retryFailure: raw.retryFailure
 			? { attempt: raw.retryFailure.attempt, errorSummary: "Retry failure recorded." }
 			: undefined,

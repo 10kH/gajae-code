@@ -5,6 +5,7 @@
 ### Fixed
 
 - Coordinator MCP now reconciles canonical structured questions from every workflow stage without misclassifying row-level gate diagnostics as malformed pagination, and unwraps accepted SDK gate-answer envelopes before reporting the terminal resolution.
+- Subagent task panels now show the fast-mode glyph for the resolved provider in both live and completed states (#3402).
 
 ## [0.12.0] - 2026-07-28
 ### Resume fixes
