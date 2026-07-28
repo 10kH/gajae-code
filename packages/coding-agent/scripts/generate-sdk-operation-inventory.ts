@@ -125,6 +125,7 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:getActiveModelProfile": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getSessionDefaultModelSelector": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:recordResumeDefaultModel": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:resolveConfiguredDefaultModel": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setModelTemporary": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setModelTemporaryForControl":
 		"internal Telegram control wrapper over the reviewed model.set seam, not an independent public SDK operation",
