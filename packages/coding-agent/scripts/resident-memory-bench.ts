@@ -37,6 +37,7 @@
  * secure O_EXCL|O_NOFOLLOW, owner-only, lazy-EEXIST verification contract.
  */
 
+import type * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
@@ -778,7 +779,7 @@ function entriesPerSecond(entries: number, wallMs: number): number {
 
 function measureFsyncCalls<T>(operation: () => T): { result: T; fsyncCalls: number } {
 	const require = createRequire(import.meta.url);
-	const mutableFs = require("node:fs") as typeof import("node:fs");
+	const mutableFs = require("node:fs") as typeof nodeFs;
 	const originalFsyncSync = mutableFs.fsyncSync;
 	let fsyncCalls = 0;
 	mutableFs.fsyncSync = ((fileDescriptor: number): void => {
