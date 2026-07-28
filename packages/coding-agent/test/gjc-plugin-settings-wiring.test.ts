@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { GjcRuntimeSnapshotStore } from "../src/extensibility/gjc-plugins/runtime-quarantine";
 
 /**
  * The Settings surface is only useful if the runtime evidence the session
@@ -62,5 +63,34 @@ describe("GJC bundle Settings runtime wiring", () => {
 		expect(beginPass).toBeGreaterThan(-1);
 		expect(beginPass).toBeLessThan(appendix);
 		expect(source.split("gjcRuntimeStore.beginPass()").length - 1).toBe(1);
+	});
+
+	test("an overlapping or failed pass can never publish over a newer one", () => {
+		const snapshot = (generation: number) => ({ generation, findings: [] });
+
+		// A slow earlier pass must not publish after a newer pass has begun.
+		const store = new GjcRuntimeSnapshotStore();
+		const passA = store.beginPass();
+		const passB = store.beginPass();
+		store.publish(snapshot(1), passA);
+		expect(store.current().status).toBe("unavailable");
+		store.publish(snapshot(2), passB);
+		expect(store.current()).toMatchObject({ status: "current", snapshot: { generation: 2 } });
+
+		// And it must not overwrite a newer pass that already published.
+		const raced = new GjcRuntimeSnapshotStore();
+		const older = raced.beginPass();
+		const newer = raced.beginPass();
+		raced.publish(snapshot(20), newer);
+		raced.publish(snapshot(10), older);
+		expect(raced.current()).toMatchObject({ status: "current", snapshot: { generation: 20 } });
+
+		// A pass that begins and then fails leaves consumers at unavailable rather
+		// than reading the generation it superseded.
+		const failed = new GjcRuntimeSnapshotStore();
+		failed.publish(snapshot(1), failed.beginPass());
+		expect(failed.current().status).toBe("current");
+		failed.beginPass();
+		expect(failed.current().status).toBe("unavailable");
 	});
 });
