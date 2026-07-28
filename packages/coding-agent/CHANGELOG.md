@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Resume fixes
+
+- Eager todo initialization now gives the model the actual phased `todo_write` payload shape (`ops` → `init` → `list` → `phase`/`items`) instead of instructing it to send unsupported `content`, `details`, and status fields, preventing the first forced todo call from failing validation (#3403).
+
 ### Fixed
 
 - Coordinator MCP now reconciles canonical structured questions from every workflow stage without misclassifying row-level gate diagnostics as malformed pagination, and unwraps accepted SDK gate-answer envelopes before reporting the terminal resolution.
