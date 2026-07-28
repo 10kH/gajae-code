@@ -18,6 +18,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
+import * as util from "node:util";
 import {
 	type AfterToolCallContext,
 	type AfterToolCallResult,
@@ -244,6 +245,7 @@ import { resolveCurrentPhaseForParent } from "../extensibility/gjc-plugins/injec
 import { readActiveSubskillsForParent, toActiveSubskillEntry } from "../extensibility/gjc-plugins/state";
 import { loadActiveSubskillTools } from "../extensibility/gjc-plugins/tools";
 import type { HookCommandContext } from "../extensibility/hooks/types";
+import type { SessionSwitchEvent } from "../extensibility/shared-events";
 import {
 	buildSkillPromptMessage,
 	getSkillSlashCommandName,
@@ -254,6 +256,11 @@ import {
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { assertDeepInterviewIntentManifest } from "../gjc-runtime/deep-interview-state";
 import { buildGjcRuntimeSessionEnv, consumePendingGoalModeRequest } from "../gjc-runtime/goal-mode-request";
+import {
+	isMemoryGuardClaimsLease,
+	isMemoryGuardClaimsLeaseForStateDir,
+	type MemoryGuardClaimsLease,
+} from "../gjc-runtime/memory-guard-owner-claims";
 import {
 	assertNonEmptyGjcSessionId,
 	modeStatePath as sessionModeStatePath,
@@ -368,6 +375,7 @@ import {
 	prepareContributionPrep,
 } from "./contribution-prep";
 import { pruneStaleFileMentions } from "./file-mention-pruning";
+import type { MemoryGuardRestoreResult } from "./memory-guard-checkpoint-participant";
 import {
 	type BashExecutionMessage,
 	type CompactionSummaryMessage,
@@ -613,6 +621,24 @@ export interface AgentSessionConfig {
 	providerCacheSessionId?: string;
 }
 
+export interface AgentSessionMemoryGuardRestoreInput
+	extends Omit<AgentSessionConfig, "sessionManager" | "recoveryHydrationContext"> {
+	staged: Extract<MemoryGuardRestoreResult, { kind: "staged" }>;
+	claimsLease: MemoryGuardClaimsLease;
+	claimsStateDir: string;
+}
+
+export interface AgentMemoryGuardPromotionFence extends RecoveryHydrationPromotionFence {
+	readonly claimsLease: MemoryGuardClaimsLease;
+}
+
+export type AgentMemoryGuardRestoreResult =
+	| { kind: "staged"; session: AgentSession; promotionFence: AgentMemoryGuardPromotionFence }
+	| {
+			kind: "blocked";
+			reason: "transcript-mismatch" | "hydration-context-mismatch" | "claim-mismatch" | "agent-messages-mismatch";
+	  };
+
 type MidRunMaintenanceLifecycle = Parameters<NonNullable<AgentLoopConfig["maintainContext"]>>[1];
 
 type AutoCompactionTerminalStatus =
@@ -642,8 +668,16 @@ export interface PromptOptions {
 	/**
 	 * Invoked after all prompt preflight checks pass and immediately before agent execution begins.
 	 * Cancellation before this callback rejects the prompt.
+	 * Prefer `onPreflightAcceptCommit` for async durable acceptance (#3031/#3032).
 	 */
 	onPreflightAccepted?: () => void;
+	/**
+	 * Awaitable durable-accept fence. Called after preflight and before queue mutation
+	 * or `#promptAgentWithIdleRetry`. SDK bus installs a closure that fsyncs acceptance.
+	 */
+	onPreflightAcceptCommit?: () => void | Promise<void>;
+	/** Skill-only: prepared metadata before the durable fence (path/lineCount/cleanedArgs). */
+	onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 }
 
 function promptPreflightCancelledError(): Error {
@@ -1538,6 +1572,47 @@ export class AgentSession {
 	#sessionAdmissionClosed = false;
 	#sessionAdmissionContext = new AsyncLocalStorage<SessionAdmissionEntry>();
 	#defaultModelSelectionMutationRevision = 0;
+	#thinkingLevelMutationRevision = 0;
+	#thinkingVisibilityMutationRevision = 0;
+	#thinkingLevelLiveMutationRevision = 0;
+	#thinkingVisibilityLiveMutationRevision = 0;
+	#reasoningControlContextGeneration = 0;
+	#pendingThinkingLevelControlSuccess:
+		| {
+				level: ThinkingLevel;
+				mutationRevision: number;
+				sessionId: string;
+				model: Model | undefined;
+				contextGeneration: number;
+		  }
+		| undefined;
+	#pendingThinkingVisibilityControlSuccess:
+		| {
+				visibility: "visible" | "hidden";
+				mutationRevision: number;
+				sessionId: string;
+				model: Model | undefined;
+				contextGeneration: number;
+		  }
+		| undefined;
+	#pendingThinkingLevelControlFailure:
+		| {
+				mutationRevision: number;
+				liveMutationRevision: number;
+				sessionId: string;
+				model: Model | undefined;
+				contextGeneration: number;
+		  }
+		| undefined;
+	#pendingThinkingVisibilityControlFailure:
+		| {
+				mutationRevision: number;
+				liveMutationRevision: number;
+				sessionId: string;
+				model: Model | undefined;
+				contextGeneration: number;
+		  }
+		| undefined;
 	#promptTemplates: PromptTemplate[];
 	#slashCommands: FileSlashCommand[];
 
@@ -1789,6 +1864,7 @@ export class AgentSession {
 	#constructorMCPToolSelection: string[] | undefined;
 	#constructorDiscoveredBuiltinToolSelection: string[] | undefined;
 	#recoveryHydrationContext: RecoveryHydrationContext | undefined;
+	#memoryGuardClaimsLease: MemoryGuardClaimsLease | undefined;
 
 	// TTSR manager for time-traveling stream rules
 	#ttsrManager: TtsrManager | undefined = undefined;
@@ -2244,6 +2320,7 @@ export class AgentSession {
 			this.#unregisterResourceGc = registerResourceGcSession({
 				sessionId: resourceGcSessionId,
 				settings: this.settings,
+				cwd: () => this.sessionManager.getCwd(),
 			});
 		}
 		this.#unregisterRuntimeStateFinalizer = registerCoordinatorRuntimeStateFinalizer({
@@ -2671,9 +2748,15 @@ export class AgentSession {
 		this.#defaultFallbackController = scope.fallbackController;
 		const previousEditMode = this.#resolveActiveEditMode();
 		if (scope.model) {
-			this.agent.setModel(scope.model);
+			this.#setAgentModelWithReasoningContext(scope.model);
 			this.#syncAppendOnlyContext(scope.model);
 		}
+		this.#thinkingLevelMutationRevision++;
+		this.#thinkingLevelLiveMutationRevision++;
+		this.#pendingThinkingLevelControlSuccess = undefined;
+		this.#pendingThinkingLevelControlFailure = undefined;
+		this.#pendingThinkingVisibilityControlSuccess = undefined;
+		this.#pendingThinkingVisibilityControlFailure = undefined;
 		this.#thinkingLevel = scope.thinkingLevel;
 		this.agent.setThinkingLevel(toReasoningEffort(scope.thinkingLevel));
 		void this.#syncEditToolModeAfterModelChange(previousEditMode);
@@ -5117,6 +5200,7 @@ export class AgentSession {
 	 * such event.
 	 */
 	#syncAgentSessionId(sessionId?: string): void {
+		this.#reasoningControlContextGeneration++;
 		const sid = this.#providerSessionId ?? sessionId ?? this.sessionManager.getSessionId();
 		this.agent.sessionId = sid;
 		this.agent.providerSessionId = this.#providerCacheSessionId ?? sid;
@@ -6441,17 +6525,65 @@ export class AgentSession {
 		return this.#promptGeneration;
 	}
 
+	static async restoreFromMemoryGuardCheckpoint(
+		input: AgentSessionMemoryGuardRestoreInput,
+	): Promise<AgentMemoryGuardRestoreResult> {
+		const { staged, claimsLease, claimsStateDir, ...config } = input;
+		if (
+			staged.manager.getSessionId() !== staged.transcriptIdentity.sessionId ||
+			staged.hydrationContext.identity.sessionId !== staged.transcriptIdentity.sessionId
+		) {
+			await staged.cleanup();
+			return { kind: "blocked", reason: "transcript-mismatch" };
+		}
+		if (
+			!isMemoryGuardClaimsLeaseForStateDir(claimsLease, claimsStateDir) ||
+			claimsLease.owner.sessionId !== staged.transcriptIdentity.sessionId
+		) {
+			await staged.cleanup();
+			return { kind: "blocked", reason: "claim-mismatch" };
+		}
+		const checkpointMessages = staged.manager.buildSessionContext().messages;
+		if (!util.isDeepStrictEqual(config.agent.state.messages, checkpointMessages)) {
+			await staged.cleanup();
+			return { kind: "blocked", reason: "agent-messages-mismatch" };
+		}
+		const session = new AgentSession({
+			...config,
+			sessionManager: staged.manager,
+			recoveryHydrationContext: staged.hydrationContext,
+		});
+		session.#memoryGuardClaimsLease = claimsLease;
+		if (session.recoveryHydrationContext !== staged.hydrationContext) {
+			await session.dispose();
+			await staged.cleanup();
+			return { kind: "blocked", reason: "hydration-context-mismatch" };
+		}
+		return {
+			kind: "staged",
+			session,
+			promotionFence: Object.freeze({ ownershipReady: true, claimsLease }),
+		};
+	}
+
 	/** The immutable recovery authority, present only before external ownership promotion. */
 	get recoveryHydrationContext(): RecoveryHydrationContext | undefined {
 		return this.#recoveryHydrationContext;
 	}
 
 	/** Enables normal session mutations after the owner has published its durable fence and writer lease. */
-	async promoteRecoveryHydrationAfterOwnershipReadyFence(fence: RecoveryHydrationPromotionFence): Promise<void> {
+	async promoteRecoveryHydrationAfterOwnershipReadyFence(fence: AgentMemoryGuardPromotionFence): Promise<void> {
 		const context = this.#recoveryHydrationContext;
 		if (!context) throw new Error("Agent session is not awaiting recovery hydration promotion.");
+		if (!isMemoryGuardClaimsLease(fence.claimsLease)) {
+			throw new Error("Recovery hydration promotion requires a live memory-guard claims lease.");
+		}
+		if (this.#memoryGuardClaimsLease !== fence.claimsLease) {
+			throw new Error("Recovery hydration promotion requires the acquired memory-guard claims lease.");
+		}
 		await this.sessionManager.promoteRecoveryHydrationAfterOwnershipReadyFence(context, fence);
 		this.#recoveryHydrationContext = undefined;
+		this.#memoryGuardClaimsLease = undefined;
 	}
 
 	/** Recovery hydration must not start a continuation before ownership promotion. */
@@ -6662,7 +6794,7 @@ export class AgentSession {
 	async invokeSkill(
 		name: string,
 		args = "",
-		options?: Pick<PromptOptions, "onPreflightAccepted">,
+		options?: Pick<PromptOptions, "onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared">,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
 		const skillName = name.trim();
 		if (!skillName) throw Object.assign(new Error("skill.invoke requires a skill name."), { code: "invalid_input" });
@@ -6695,6 +6827,12 @@ export class AgentSession {
 			attribution: "user" as const,
 		};
 		this.#deepInterviewPreclaimedCustomInputEpochs.set(skillPromptMessage, deepInterviewUserIntentEpoch);
+		options?.onSkillPrepared?.({
+			name: skill.name,
+			path: skill.filePath,
+			lineCount: built.details.lineCount,
+			cleanedArgs: activation.cleanedArgs || undefined,
+		});
 		await this.promptCustomMessage(skillPromptMessage, options);
 		return {
 			name: skill.name,
@@ -7350,6 +7488,7 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		this.#assertRecoveryHydrationPromoted();
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 
 		if (expandPromptTemplates && text.startsWith("/skill:") && !options?.images?.length) {
@@ -7361,7 +7500,14 @@ export class AgentSession {
 					await this.invokeSkill(
 						invocation.skill.name,
 						invocation.args,
-						options?.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : undefined,
+						options?.onPreflightAccepted || options?.onPreflightAcceptCommit
+							? {
+									...(options.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : {}),
+									...(options.onPreflightAcceptCommit
+										? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
+										: {}),
+								}
+							: undefined,
 					);
 					return;
 				}
@@ -7415,7 +7561,8 @@ export class AgentSession {
 			if (workflowIntentDiff) {
 				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
 			}
-			options?.onPreflightAccepted?.();
+			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+			else options?.onPreflightAccepted?.();
 			return;
 		}
 
@@ -7547,7 +7694,10 @@ export class AgentSession {
 
 	async promptCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
-		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice" | "followUpQueuePolicy" | "onPreflightAccepted">,
+		options?: Pick<
+			PromptOptions,
+			"streamingBehavior" | "toolChoice" | "followUpQueuePolicy" | "onPreflightAccepted" | "onPreflightAcceptCommit"
+		>,
 	): Promise<void> {
 		const textContent =
 			typeof message.content === "string"
@@ -7609,7 +7759,10 @@ export class AgentSession {
 	async #promptWithMessage(
 		message: AgentMessage,
 		expandedText: string,
-		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck" | "onPreflightAccepted"> & {
+		options?: Pick<
+			PromptOptions,
+			"toolChoice" | "images" | "skipCompactionCheck" | "onPreflightAccepted" | "onPreflightAcceptCommit"
+		> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			predecessorAgentEndHold?: symbol;
@@ -7716,7 +7869,7 @@ export class AgentSession {
 				// A newer abort/prompt cycle superseded this preflight. Callers awaiting
 				// acceptance (onPreflightAccepted) must be told it never ran; direct
 				// callers (e.g. prompt() aborted during a TTSR wait) resolve gracefully.
-				if (options?.onPreflightAccepted) throw promptPreflightCancelledError();
+				if (options?.onPreflightAccepted || options?.onPreflightAcceptCommit) throw promptPreflightCancelledError();
 				return;
 			}
 
@@ -7830,7 +7983,7 @@ export class AgentSession {
 				this.#resetInjectedContextSignatures();
 				// Ack-waiting callers are told the preflight never ran; direct callers
 				// (aborted after setup) resolve gracefully as before f24f46ff5.
-				if (options?.onPreflightAccepted) throw promptPreflightCancelledError();
+				if (options?.onPreflightAccepted || options?.onPreflightAcceptCommit) throw promptPreflightCancelledError();
 				return;
 			}
 
@@ -7843,7 +7996,8 @@ export class AgentSession {
 					if (hindsightRecall) this.getHindsightSessionState()?.markRecallSnippetInjected(hindsightRecall);
 				},
 			};
-			options?.onPreflightAccepted?.();
+			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+			else options?.onPreflightAccepted?.();
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 			await this.#promptAgentWithIdleRetry(messages, agentPromptOptions, predecessorAgentEndHold);
 			const terminalAssistant = this.#findLastAssistantMessage();
@@ -7862,7 +8016,12 @@ export class AgentSession {
 			// Session identity changes historically cancel local setup silently. Only SDK
 			// submissions provide an acceptance callback and require an explicit terminal
 			// preflight failure for their remote request authority.
-			if (isPromptPreflightCancelledError(error) && !options?.onPreflightAccepted) return;
+			if (
+				isPromptPreflightCancelledError(error) &&
+				!options?.onPreflightAccepted &&
+				!options?.onPreflightAcceptCommit
+			)
+				return;
 			throw error;
 		} finally {
 			this.#removeEphemeralCustomMessages();
@@ -7963,7 +8122,7 @@ export class AgentSession {
 				}
 				return false;
 			},
-			invokeSkill: (name, args) => this.invokeSkill(name, args),
+			invokeSkill: (name, args, options) => this.invokeSkill(name, args, options),
 			setPlanMode: on => this.setSdkPlanMode(on),
 			operateGoal: (op, objective) => this.operateGoal(op, objective),
 			getSkillState: () => this.skills.map(skill => ({ name: skill.name, description: skill.description })),
@@ -8078,6 +8237,7 @@ export class AgentSession {
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
 	async steer(text: string, images?: ImageContent[]): Promise<void> {
+		this.#assertRecoveryHydrationPromoted();
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -8095,6 +8255,7 @@ export class AgentSession {
 		images?: ImageContent[],
 		options?: Pick<PromptOptions, "followUpQueuePolicy">,
 	): Promise<void> {
+		this.#assertRecoveryHydrationPromoted();
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -8329,6 +8490,7 @@ export class AgentSession {
 			followUpQueuePolicy?: "respect-mode" | "sequential";
 		},
 	): Promise<void> {
+		this.#assertRecoveryHydrationPromoted();
 		const appMessage: CustomMessage<T> = {
 			role: "custom",
 			customType: message.customType,
@@ -8470,8 +8632,13 @@ export class AgentSession {
 	 */
 	async sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp"; onPreflightAccepted?: () => void },
+		options?: {
+			deliverAs?: "steer" | "followUp";
+			onPreflightAccepted?: () => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+		},
 	): Promise<void> {
+		this.#assertRecoveryHydrationPromoted();
 		// Normalize content to text string + optional images
 		let text: string;
 		let images: ImageContent[] | undefined;
@@ -8493,11 +8660,13 @@ export class AgentSession {
 		}
 
 		if (options?.deliverAs === "followUp") {
+			if (options.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 			await this.#queueFollowUp(text, images, { claimsGenuineUserIntent: true });
 			options.onPreflightAccepted?.();
 			return;
 		}
 		if (options?.deliverAs === "steer") {
+			if (options.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 			await this.#queueSteer(text, images, { claimsGenuineUserIntent: true });
 			options.onPreflightAccepted?.();
 			return;
@@ -8509,6 +8678,7 @@ export class AgentSession {
 		// in-flight compaction internally, and #queueSteer would otherwise park
 		// the message in the steering queue with no turn to consume it.
 		if (this.isStreaming) {
+			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 			await this.#queueSteer(text, images, { claimsGenuineUserIntent: true });
 			options?.onPreflightAccepted?.();
 			return;
@@ -8519,6 +8689,7 @@ export class AgentSession {
 			expandPromptTemplates: false,
 			images,
 			onPreflightAccepted: options?.onPreflightAccepted,
+			onPreflightAcceptCommit: options?.onPreflightAcceptCommit,
 		});
 	}
 
@@ -9258,6 +9429,12 @@ export class AgentSession {
 	): Promise<void> {
 		this.#clearConstructorToolSelectionAuthority();
 		const inheritedThinkingLevel = resolveThinkingLevelForModel(this.model, this.#getInheritedThinkingLevel());
+		this.#thinkingLevelMutationRevision++;
+		this.#thinkingLevelLiveMutationRevision++;
+		this.#pendingThinkingLevelControlSuccess = undefined;
+		this.#pendingThinkingLevelControlFailure = undefined;
+		this.#pendingThinkingVisibilityControlSuccess = undefined;
+		this.#pendingThinkingVisibilityControlFailure = undefined;
 		this.#thinkingLevel = inheritedThinkingLevel;
 		this.agent.setThinkingLevel(toReasoningEffort(inheritedThinkingLevel));
 		this.sessionManager.appendThinkingLevelChange(ThinkingLevel.Inherit);
@@ -9607,7 +9784,7 @@ export class AgentSession {
 		const ownsScope = scope !== undefined && !suppliedScope;
 		try {
 			if (isTemporaryOperation) {
-				this.agent.setModel(model);
+				this.#setAgentModelWithReasoningContext(model);
 				this.#syncAppendOnlyContext(model);
 			} else {
 				this.#setModelAuthoritatively(model, options?.cause ?? "temporary-operation");
@@ -9692,6 +9869,12 @@ export class AgentSession {
 		this.#clearActiveRetryFallback();
 		this.#setModelWithProviderSessionReset(model);
 		const thinkingLevelChanged = this.#thinkingLevel !== thinkingLevel;
+		this.#thinkingLevelMutationRevision++;
+		this.#thinkingLevelLiveMutationRevision++;
+		this.#pendingThinkingLevelControlSuccess = undefined;
+		this.#pendingThinkingLevelControlFailure = undefined;
+		this.#pendingThinkingVisibilityControlSuccess = undefined;
+		this.#pendingThinkingVisibilityControlFailure = undefined;
 		this.#thinkingLevel = thinkingLevel;
 		this.agent.setThinkingLevel(toReasoningEffort(thinkingLevel));
 		if (thinkingLevelChanged) {
@@ -10000,7 +10183,19 @@ export class AgentSession {
 	 * Set thinking level.
 	 * Saves the effective metadata-clamped level to the session, and to settings when requested.
 	 */
+	#assertDurableSettingsWritable(): void {
+		if (this.settings.canWriteDurableConfig()) return;
+		throw new Error(
+			"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+		);
+	}
+
 	setThinkingLevel(level: ThinkingLevel | undefined, persist: boolean = false): void {
+		if (persist) this.#assertDurableSettingsWritable();
+		this.#thinkingLevelMutationRevision++;
+		this.#thinkingLevelLiveMutationRevision++;
+		this.#pendingThinkingLevelControlSuccess = undefined;
+		this.#pendingThinkingLevelControlFailure = undefined;
 		const effectiveLevel = resolveThinkingLevelForModel(this.model, level);
 		const isChanging = effectiveLevel !== this.#thinkingLevel;
 
@@ -10020,11 +10215,10 @@ export class AgentSession {
 	}
 
 	/**
-	 * Set thinking level from a control surface. Global changes are durable or rolled back.
+	 * Set thinking level from a control surface. Global changes commit before affecting live state.
 	 */
 	async setThinkingLevelForControl(level: ThinkingLevel, persist: boolean): Promise<void> {
 		const previousThinkingLevel = this.thinkingLevel;
-		const previousScope = this.getThinkingScopeForControl();
 		if (!persist) {
 			this.setThinkingLevel(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level);
 			if (level === ThinkingLevel.Inherit || this.thinkingLevel === previousThinkingLevel) {
@@ -10033,26 +10227,99 @@ export class AgentSession {
 			return;
 		}
 
-		const previousDefaultThinkingLevel = this.settings.getGlobal("defaultThinkingLevel");
-		if (level === ThinkingLevel.Inherit) {
-			const defaultLevel = getDefault("defaultThinkingLevel");
-			this.settings.set("defaultThinkingLevel", defaultLevel);
-			this.setThinkingLevel(this.#getInheritedThinkingLevel());
-		} else {
-			this.setThinkingLevel(level, true);
-		}
+		this.#assertDurableSettingsWritable();
+		const effectiveLevel = resolveThinkingLevelForModel(
+			this.model,
+			level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level,
+		);
+		const persistedLevel = level === ThinkingLevel.Inherit ? getDefault("defaultThinkingLevel") : effectiveLevel;
+		const mutationRevision = ++this.#thinkingLevelMutationRevision;
+		const expectedLiveMutationRevision = this.#thinkingLevelLiveMutationRevision;
+		const expectedSessionId = this.sessionManager.getSessionId();
+		const expectedModel = this.model;
+		const expectedContextGeneration = this.#reasoningControlContextGeneration;
 		try {
-			await this.settings.flushOrThrow();
-			this.sessionManager.appendThinkingLevelChange(ThinkingLevel.Inherit);
+			await this.settings.commitAtomicBatch([{ path: "defaultThinkingLevel", op: "set", value: persistedLevel }]);
 		} catch {
-			this.settings.set("defaultThinkingLevel", previousDefaultThinkingLevel ?? getDefault("defaultThinkingLevel"));
-			this.setThinkingLevel(previousThinkingLevel);
-			this.sessionManager.appendThinkingLevelChange(
-				previousScope === "global config" ? ThinkingLevel.Inherit : previousThinkingLevel,
-			);
-			await this.settings.flushOrThrow().catch(() => {});
+			if (
+				mutationRevision === this.#thinkingLevelMutationRevision &&
+				this.#reasoningControlContextGeneration === expectedContextGeneration &&
+				this.sessionManager.getSessionId() === expectedSessionId &&
+				this.model === expectedModel
+			) {
+				const pending = this.#pendingThinkingLevelControlSuccess;
+				this.#pendingThinkingLevelControlSuccess = undefined;
+				if (
+					pending &&
+					pending.contextGeneration === expectedContextGeneration &&
+					this.sessionManager.getSessionId() === pending.sessionId &&
+					this.model === pending.model
+				) {
+					this.setThinkingLevel(
+						pending.level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : pending.level,
+					);
+					this.sessionManager.appendThinkingLevelChange(ThinkingLevel.Inherit);
+				} else {
+					this.#pendingThinkingLevelControlFailure = {
+						mutationRevision,
+						liveMutationRevision: expectedLiveMutationRevision,
+						sessionId: expectedSessionId,
+						model: expectedModel,
+						contextGeneration: expectedContextGeneration,
+					};
+				}
+			}
 			throw new Error("Unable to persist reasoning settings.");
 		}
+
+		if (
+			mutationRevision === this.#thinkingLevelMutationRevision &&
+			this.#thinkingLevelLiveMutationRevision === expectedLiveMutationRevision
+		) {
+			this.setThinkingLevel(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level);
+			this.sessionManager.appendThinkingLevelChange(ThinkingLevel.Inherit);
+			return;
+		}
+		if (
+			mutationRevision !== this.#thinkingLevelMutationRevision ||
+			this.#reasoningControlContextGeneration !== expectedContextGeneration ||
+			this.sessionManager.getSessionId() !== expectedSessionId ||
+			this.model !== expectedModel
+		) {
+			if (
+				this.#thinkingLevelLiveMutationRevision === expectedLiveMutationRevision &&
+				this.#reasoningControlContextGeneration === expectedContextGeneration &&
+				this.sessionManager.getSessionId() === expectedSessionId &&
+				this.model === expectedModel &&
+				(this.#pendingThinkingLevelControlSuccess?.mutationRevision ?? -1) < mutationRevision
+			) {
+				this.#pendingThinkingLevelControlSuccess = {
+					level,
+					mutationRevision,
+					sessionId: expectedSessionId,
+					model: expectedModel,
+					contextGeneration: expectedContextGeneration,
+				};
+				const failure = this.#pendingThinkingLevelControlFailure;
+				if (
+					failure &&
+					failure.mutationRevision === this.#thinkingLevelMutationRevision &&
+					failure.liveMutationRevision === expectedLiveMutationRevision &&
+					failure.sessionId === expectedSessionId &&
+					failure.model === expectedModel &&
+					failure.contextGeneration === expectedContextGeneration
+				) {
+					this.#pendingThinkingLevelControlFailure = undefined;
+					this.setThinkingLevel(
+						level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : effectiveLevel,
+					);
+					this.sessionManager.appendThinkingLevelChange(ThinkingLevel.Inherit);
+				}
+			}
+			return;
+		}
+		this.setThinkingLevel(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : effectiveLevel);
+		this.sessionManager.appendThinkingLevelChange(ThinkingLevel.Inherit);
 	}
 
 	getThinkingScopeForControl(): "session" | "global config" {
@@ -10068,6 +10335,11 @@ export class AgentSession {
 	}
 
 	setThinkingVisibility(visibility: "visible" | "hidden", persist: boolean = false): void {
+		if (persist) this.#assertDurableSettingsWritable();
+		this.#thinkingVisibilityMutationRevision++;
+		this.#thinkingVisibilityLiveMutationRevision++;
+		this.#pendingThinkingVisibilityControlSuccess = undefined;
+		this.#pendingThinkingVisibilityControlFailure = undefined;
 		this.agent.hideThinkingSummary = visibility === "hidden";
 		if (persist) {
 			this.settings.set("hideThinkingBlock", visibility === "hidden");
@@ -10075,7 +10347,7 @@ export class AgentSession {
 	}
 
 	/**
-	 * Set thinking visibility from a control surface. Global changes are durable or rolled back.
+	 * Set thinking visibility from a control surface. Global changes commit before affecting live state.
 	 */
 	async setThinkingVisibilityForControl(visibility: "visible" | "hidden", persist: boolean): Promise<void> {
 		if (!persist) {
@@ -10083,17 +10355,88 @@ export class AgentSession {
 			return;
 		}
 
-		const previousVisibility = this.getThinkingVisibility();
-		const previousHideThinkingBlock = this.settings.getGlobal("hideThinkingBlock");
-		this.setThinkingVisibility(visibility, true);
+		this.#assertDurableSettingsWritable();
+		const mutationRevision = ++this.#thinkingVisibilityMutationRevision;
+		const expectedLiveMutationRevision = this.#thinkingVisibilityLiveMutationRevision;
+		const expectedSessionId = this.sessionManager.getSessionId();
+		const expectedModel = this.model;
+		const expectedContextGeneration = this.#reasoningControlContextGeneration;
 		try {
-			await this.settings.flushOrThrow();
+			await this.settings.commitAtomicBatch([
+				{ path: "hideThinkingBlock", op: "set", value: visibility === "hidden" },
+			]);
 		} catch {
-			this.settings.set("hideThinkingBlock", previousHideThinkingBlock ?? getDefault("hideThinkingBlock"));
-			this.setThinkingVisibility(previousVisibility);
-			await this.settings.flushOrThrow().catch(() => {});
+			if (
+				mutationRevision === this.#thinkingVisibilityMutationRevision &&
+				this.#reasoningControlContextGeneration === expectedContextGeneration &&
+				this.sessionManager.getSessionId() === expectedSessionId &&
+				this.model === expectedModel
+			) {
+				const pending = this.#pendingThinkingVisibilityControlSuccess;
+				this.#pendingThinkingVisibilityControlSuccess = undefined;
+				if (
+					pending &&
+					pending.contextGeneration === expectedContextGeneration &&
+					this.sessionManager.getSessionId() === pending.sessionId &&
+					this.model === pending.model
+				) {
+					this.setThinkingVisibility(pending.visibility);
+				} else {
+					this.#pendingThinkingVisibilityControlFailure = {
+						mutationRevision,
+						liveMutationRevision: expectedLiveMutationRevision,
+						sessionId: expectedSessionId,
+						model: expectedModel,
+						contextGeneration: expectedContextGeneration,
+					};
+				}
+			}
 			throw new Error("Unable to persist reasoning settings.");
 		}
+		if (
+			mutationRevision === this.#thinkingVisibilityMutationRevision &&
+			this.#thinkingVisibilityLiveMutationRevision === expectedLiveMutationRevision
+		) {
+			this.setThinkingVisibility(visibility);
+			return;
+		}
+
+		if (
+			mutationRevision !== this.#thinkingVisibilityMutationRevision ||
+			this.#reasoningControlContextGeneration !== expectedContextGeneration ||
+			this.sessionManager.getSessionId() !== expectedSessionId ||
+			this.model !== expectedModel
+		) {
+			if (
+				this.#thinkingVisibilityLiveMutationRevision === expectedLiveMutationRevision &&
+				this.#reasoningControlContextGeneration === expectedContextGeneration &&
+				this.sessionManager.getSessionId() === expectedSessionId &&
+				this.model === expectedModel &&
+				(this.#pendingThinkingVisibilityControlSuccess?.mutationRevision ?? -1) < mutationRevision
+			) {
+				this.#pendingThinkingVisibilityControlSuccess = {
+					visibility,
+					mutationRevision,
+					sessionId: expectedSessionId,
+					model: expectedModel,
+					contextGeneration: expectedContextGeneration,
+				};
+				const failure = this.#pendingThinkingVisibilityControlFailure;
+				if (
+					failure &&
+					failure.mutationRevision === this.#thinkingVisibilityMutationRevision &&
+					failure.liveMutationRevision === expectedLiveMutationRevision &&
+					failure.sessionId === expectedSessionId &&
+					failure.model === expectedModel &&
+					failure.contextGeneration === expectedContextGeneration
+				) {
+					this.#pendingThinkingVisibilityControlFailure = undefined;
+					this.setThinkingVisibility(visibility);
+				}
+			}
+			return;
+		}
+		this.setThinkingVisibility(visibility);
 	}
 
 	/**
@@ -10270,6 +10613,7 @@ export class AgentSession {
 	 * Saves to settings.
 	 */
 	setSteeringMode(mode: "all" | "one-at-a-time"): void {
+		this.#assertDurableSettingsWritable();
 		this.agent.setSteeringMode(mode);
 		this.settings.set("steeringMode", mode);
 	}
@@ -10279,6 +10623,7 @@ export class AgentSession {
 	 * Saves to settings.
 	 */
 	setFollowUpMode(mode: "all" | "one-at-a-time"): void {
+		this.#assertDurableSettingsWritable();
 		this.agent.setFollowUpMode(mode);
 		this.settings.set("followUpMode", mode);
 	}
@@ -10288,6 +10633,7 @@ export class AgentSession {
 	 * Saves to settings.
 	 */
 	setInterruptMode(mode: "immediate" | "wait"): void {
+		this.#assertDurableSettingsWritable();
 		this.agent.setInterruptMode(mode);
 		this.settings.set("interruptMode", mode);
 	}
@@ -10955,7 +11301,11 @@ export class AgentSession {
 	 * @param assistantMessage The assistant message to check
 	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
 	 */
-	async #checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
+	async #checkCompaction(
+		assistantMessage: AssistantMessage,
+		skipAbortedCheck = true,
+		onTerminalOverflowNoop?: () => void,
+	): Promise<boolean> {
 		// Safety stops are terminal and must not trigger context maintenance.
 		if (
 			assistantMessage.errorKind === "provider_safety_stop" ||
@@ -10991,8 +11341,10 @@ export class AgentSession {
 			// Remove the error message from agent state (it IS saved to session for history,
 			// but we don't want it in context for the retry)
 			const messages = this.agent.state.messages;
+			let removedOverflowAssistant = false;
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
 				this.agent.replaceMessages(messages.slice(0, -1));
+				removedOverflowAssistant = true;
 			}
 
 			// Try context promotion first - switch to a larger model and retry without compacting
@@ -11007,7 +11359,15 @@ export class AgentSession {
 			// No promotion target available fall through to compaction
 			const compactionSettings = this.settings.getGroup("compaction");
 			if (compactionSettings.enabled && compactionSettings.strategy !== "off") {
-				const status = await this.#runAutoCompaction("overflow", true);
+				const status = await this.#runAutoCompaction("overflow", true, false, {
+					beforeTerminalOverflowNoop: () => {
+						if (onTerminalOverflowNoop) {
+							onTerminalOverflowNoop();
+						} else if (removedOverflowAssistant) {
+							this.agent.appendMessage(assistantMessage);
+						}
+					},
+				});
 				return "continuationScheduled" in status && status.continuationScheduled === true;
 			}
 			return this.#scheduleOverflowRetryContinuation(generation);
@@ -11775,13 +12135,18 @@ export class AgentSession {
 		this.#defaultFallbackExhaustedLastTurn = false;
 	}
 
+	#setAgentModelWithReasoningContext(model: Model | undefined): void {
+		this.#reasoningControlContextGeneration++;
+		this.agent.setModel(model);
+	}
+
 	#setModelWithProviderSessionReset(model: Model | undefined): void {
 		this.#defaultModelSelectionMutationRevision++;
 		const currentModel = this.model;
 		if (currentModel) {
 			this.#closeProviderSessionsForModelSwitch(currentModel, model);
 		}
-		this.agent.setModel(model);
+		this.#setAgentModelWithReasoningContext(model);
 	}
 
 	#setModelAuthoritatively(model: Model, cause: ModelChangeCause): void {
@@ -11790,7 +12155,7 @@ export class AgentSession {
 		if (cause !== "temporary-operation") this.#commitAllTemporaryProviderSessionScopes();
 		const currentModel = this.model;
 		if (currentModel) this.#closeProviderSessionsForModelSwitch(currentModel, model);
-		this.agent.setModel(model);
+		this.#setAgentModelWithReasoningContext(model);
 		this.#syncAppendOnlyContext(model);
 	}
 
@@ -12316,6 +12681,7 @@ export class AgentSession {
 			deferHandoffMaintenance?: boolean;
 			force?: boolean;
 			signal?: AbortSignal;
+			beforeTerminalOverflowNoop?: () => void;
 		},
 	): Promise<AutoCompactionTerminalStatus> {
 		const compactionSettings = this.settings.getGroup("compaction");
@@ -12453,16 +12819,42 @@ export class AgentSession {
 			if (autoCompactionSignal.aborted) return await emitAborted();
 
 			if (!preparation) {
-				const continuationSkipReason = willRetry ? this.#detectOverflowRetryContinuationSkip() : undefined;
+				// #checkCompaction removes the failed overflow assistant before entering
+				// this path. A resumable tail would therefore resend the same oversized
+				// request even though maintenance made no change. Non-resumable tails
+				// retain the existing synthetic auto-continue recovery, which changes
+				// the request and is covered by the continuation contract.
+				const overflowNoopWouldReplay = reason === "overflow" && willRetry && this.#isResumableAgentTail();
+				const continuationSkipReason =
+					!overflowNoopWouldReplay && willRetry ? this.#detectOverflowRetryContinuationSkip() : undefined;
+				if (overflowNoopWouldReplay) {
+					options?.beforeTerminalOverflowNoop?.();
+				}
 				await this.#emitSessionEvent({
 					type: "auto_compaction_end",
 					action,
 					result: undefined,
 					aborted: false,
-					willRetry: willRetry && !continuationSkipReason,
+					willRetry: overflowNoopWouldReplay ? false : willRetry && !continuationSkipReason,
+					errorMessage: overflowNoopWouldReplay
+						? "Context overflow recovery skipped: nothing eligible to compact. Run /clear to preserve this session ID, or switch to a larger-context model before retrying."
+						: undefined,
 					skipped: true,
 					continuationSkipReason,
 				});
+				if (overflowNoopWouldReplay) {
+					if (continueAfterMaintenance && this.agent.hasQueuedMessages()) {
+						this.#scheduleAgentContinue({
+							delayMs: 100,
+							generation,
+							shouldContinue: () => this.agent.hasQueuedMessages(),
+							onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
+							onError: error => this.#logCompactionContinuationError("queued_continue", error),
+						});
+						return { kind: "skipped", continuationScheduled: true };
+					}
+					return { kind: "skipped" };
+				}
 				if (willRetry) {
 					return { kind: "skipped", continuationScheduled: this.#scheduleOverflowRetryContinuation(generation) };
 				}
@@ -13169,8 +13561,15 @@ export class AgentSession {
 				type: "maintenance",
 				continuation: async ownership => {
 					if (!ownership.isCurrent()) return;
-					const successorScheduled = await this.#checkCompaction(outcome.message);
-					if (successorScheduled || !ownership.isCurrent()) return;
+					let terminalized = false;
+					const successorScheduled = await this.#checkCompaction(outcome.message, true, () => {
+						terminalized = true;
+						this.agent.requestRunTerminal(ownership.logicalRunId, {
+							stopReason: "error",
+							messages: [outcome.message],
+						});
+					});
+					if (terminalized || successorScheduled || !ownership.isCurrent()) return;
 					this.agent.requestRunTerminal(ownership.logicalRunId, {
 						stopReason: "error",
 						messages: [outcome.message],
@@ -14656,7 +15055,10 @@ export class AgentSession {
 	 * Listeners are preserved and will continue receiving events.
 	 * @returns true if switch completed, false if cancelled by hook
 	 */
-	async switchSession(sessionPath: string): Promise<boolean> {
+	async switchSession(
+		sessionPath: string,
+		options?: { transition?: SessionSwitchEvent["transition"] },
+	): Promise<boolean> {
 		this.#beginSessionTransition("switch-session");
 		try {
 			const previousSessionFile = this.sessionManager.getSessionFile();
@@ -14782,6 +15184,12 @@ export class AgentSession {
 						? this.#getInheritedThinkingLevel()
 						: persistedThinkingLevel,
 				);
+				this.#thinkingLevelMutationRevision++;
+				this.#thinkingLevelLiveMutationRevision++;
+				this.#pendingThinkingLevelControlSuccess = undefined;
+				this.#pendingThinkingLevelControlFailure = undefined;
+				this.#pendingThinkingVisibilityControlSuccess = undefined;
+				this.#pendingThinkingVisibilityControlFailure = undefined;
 				this.#thinkingLevel = nextThinkingLevel;
 				this.agent.setThinkingLevel(toReasoningEffort(nextThinkingLevel));
 				this.agent.serviceTier = hasServiceTierEntry
@@ -14792,6 +15200,7 @@ export class AgentSession {
 				// Establish the successor's durable session identity only after every
 				// restored state facet is live. Identity-bound extension hooks run below.
 				await this.sessionManager.ensureOnDisk();
+				if (!switchingToDifferentSession) await initializeLocalRoot(this.#localProtocolOptions());
 
 				if (switchingToDifferentSession) {
 					// The local:// migration gate for this successor already ran above,
@@ -14814,6 +15223,7 @@ export class AgentSession {
 						type: "session_switch",
 						reason: "resume",
 						previousSessionFile,
+						...(options?.transition ? { transition: options.transition } : {}),
 					});
 				}
 				return true;
@@ -14849,8 +15259,14 @@ export class AgentSession {
 				this.agent.restoreSteering(previousAgentSteeringQueue);
 				this.agent.restoreFollowUp(previousAgentFollowUpQueue);
 				if (previousModel) {
-					this.agent.setModel(previousModel);
+					this.#setAgentModelWithReasoningContext(previousModel);
 				}
+				this.#thinkingLevelMutationRevision++;
+				this.#thinkingLevelLiveMutationRevision++;
+				this.#pendingThinkingLevelControlSuccess = undefined;
+				this.#pendingThinkingLevelControlFailure = undefined;
+				this.#pendingThinkingVisibilityControlSuccess = undefined;
+				this.#pendingThinkingVisibilityControlFailure = undefined;
 				this.#thinkingLevel = previousThinkingLevel;
 				this.agent.setThinkingLevel(toReasoningEffort(previousThinkingLevel));
 				this.agent.serviceTier = previousServiceTier;

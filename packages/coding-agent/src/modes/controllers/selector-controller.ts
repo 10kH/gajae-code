@@ -30,6 +30,7 @@ import {
 	getPluginsCacheDir,
 	MarketplaceManager,
 } from "../../extensibility/plugins/marketplace";
+import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../../extensibility/shared-events";
 import {
 	getAvailableThemes,
 	getCurrentThemeName,
@@ -165,6 +166,7 @@ import type { JobsObserver } from "../jobs-observer";
 import type { SessionObserverRegistry } from "../session-observer-registry";
 import type { TasksAggregator } from "../tasks-aggregator";
 import type { TranscriptItemRegistry } from "../transcript-item-registry";
+import { acquireResumeProgressLease } from "../utils/ui-helpers";
 
 const CALLBACK_SERVER_PROVIDERS = new Set<string>([
 	"anthropic",
@@ -1151,6 +1153,12 @@ export class SelectorController {
 		);
 		if (scope === undefined) return;
 		const persistDefault = scope.trim().toLowerCase() === "default";
+		if (persistDefault && !this.ctx.settings.canWriteDurableConfig()) {
+			this.ctx.showError(
+				"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+			);
+			return;
+		}
 
 		const imageProvider = normalized as
 			| "auto"
@@ -1224,13 +1232,18 @@ export class SelectorController {
 			const selector = new ThinkingSelectorComponent(
 				this.ctx.session.thinkingLevel,
 				availableLevels,
-				selection => {
-					done();
-
+				async selection => {
 					const { level, persistDefault } = selection;
 					const configuredDefault = this.ctx.settings.get("defaultThinkingLevel");
 					const levelToApply = level === ThinkingLevel.Inherit ? configuredDefault : level;
-					this.ctx.session.setThinkingLevel(levelToApply, persistDefault);
+					try {
+						await this.ctx.session.setThinkingLevelForControl(level, persistDefault);
+					} catch (error) {
+						this.ctx.showError(error instanceof Error ? error.message : String(error));
+						return;
+					}
+					done();
+
 					const effectiveLevel = this.ctx.session.thinkingLevel ?? ThinkingLevel.Off;
 					const requestedLabel =
 						level === ThinkingLevel.Inherit ? `${level} (configured default: ${configuredDefault})` : level;
@@ -1270,6 +1283,7 @@ export class SelectorController {
 					},
 					{
 						onChange: (id, value) => this.handleSettingChange(id, value),
+						onError: message => this.ctx.showError(message),
 						onThemePreview: themeName => {
 							return previewTheme(themeName).then(result => {
 								if (!result.success && result.error && !isThemePreviewSuperseded(result)) {
@@ -1289,6 +1303,7 @@ export class SelectorController {
 						onPetPreview: mode => {
 							this.ctx.previewPetMode(mode as PetMode);
 						},
+						onPetCommit: mode => this.ctx.commitPetPreviewMode(mode as PetMode),
 						onStatusLinePreview: previewSettings => {
 							// Update status line with preview settings
 							this.ctx.statusLine.updateSettings({
@@ -1332,24 +1347,40 @@ export class SelectorController {
 		getAvailableThemes().then(availableThemes => {
 			const initialTheme = getCurrentThemeName() ?? "red-claw";
 			this.showSelector(done => {
+				const restoreAndClose = () => {
+					void restoreThemePreview(initialTheme).then(result => {
+						if (!result.success && result.error) {
+							this.ctx.showError(`Failed to restore theme preview: ${result.error}`);
+						}
+						this.#refreshThemeUi();
+					});
+					done();
+				};
 				const selector = new ThemeSelectorComponent(
 					initialTheme,
 					availableThemes,
 					themeName => {
-						const settingPath = getDetectedThemeSettingsPath();
-						settings.set(settingPath, themeName);
+						if (!settings.canWriteDurableConfig()) {
+							this.ctx.showError(
+								"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+							);
+							restoreAndClose();
+							return;
+						}
+						try {
+							settings.set(getDetectedThemeSettingsPath(), themeName);
+						} catch (error) {
+							if (!settings.canWriteDurableConfig()) {
+								this.ctx.showError(error instanceof Error ? error.message : String(error));
+								restoreAndClose();
+								return;
+							}
+							throw error;
+						}
 						this.#refreshThemeUi();
 						done();
 					},
-					() => {
-						void restoreThemePreview(initialTheme).then(result => {
-							if (!result.success && result.error) {
-								this.ctx.showError(`Failed to restore theme preview: ${result.error}`);
-							}
-							this.#refreshThemeUi();
-						});
-						done();
-					},
+					restoreAndClose,
 					themeName => {
 						void previewTheme(themeName).then(result => {
 							if (!result.success && result.error) {
@@ -1373,8 +1404,9 @@ export class SelectorController {
 			const selector = new PetSelectorComponent(
 				initial,
 				mode => {
-					this.ctx.setPetMode(mode);
-					done();
+					if (this.ctx.setPetMode(mode)) {
+						done();
+					}
 				},
 				() => {
 					this.ctx.previewPetMode(initial);
@@ -2262,28 +2294,42 @@ export class SelectorController {
 	async handleResumeSession(sessionPath: string): Promise<void> {
 		const previousSessionId = this.ctx.sessionManager.getSessionId();
 		this.#clearTransientSessionUi();
-		const migrationPolicy =
-			this.ctx.settings?.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
-		let writableSessionPath = sessionPath;
-		if (this.ctx.sessionManager.isManagedDestination()) {
-			const inspection = await SessionManager.inspectSessionTailReadOnly(sessionPath);
-			if (inspection.kind === "error") throw new Error(`Could not inspect selected session: ${inspection.reason}`);
-			writableSessionPath = await this.ctx.sessionManager.prepareManagedCandidateForStrictAdoption(
-				sessionPath,
-				migrationPolicy,
-				inspection.identity,
-			);
-		}
-		// Switch session via AgentSession (emits hook and tool session events)
-		if (!(await this.ctx.session.switchSession(writableSessionPath))) return;
-		const switchingToDifferentSession = previousSessionId !== this.ctx.sessionManager.getSessionId();
-		if (switchingToDifferentSession) this.ctx.resetIrcSidebarSession();
-		this.#refreshSessionTerminalTitle();
-		this.ctx.updateEditorBorderColor();
+		const progressLease = acquireResumeProgressLease(this.ctx);
+		try {
+			await progressLease.committed;
+			const migrationPolicy =
+				this.ctx.settings?.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
+			let writableSessionPath = sessionPath;
+			if (this.ctx.sessionManager.isManagedDestination()) {
+				const inspection = await SessionManager.inspectSessionTailReadOnly(sessionPath);
+				if (inspection.kind === "error")
+					throw new Error(`Could not inspect selected session: ${inspection.reason}`);
+				writableSessionPath = await this.ctx.sessionManager.prepareManagedCandidateForStrictAdoption(
+					sessionPath,
+					migrationPolicy,
+					inspection.identity,
+				);
+			}
+			// Switch session via AgentSession (emits hook and tool session events)
+			if (
+				!(await this.ctx.session.switchSession(writableSessionPath, {
+					transition: { origin: INTERACTIVE_SELECTOR_RESUME_ORIGIN },
+				}))
+			)
+				return;
+			const switchingToDifferentSession = previousSessionId !== this.ctx.sessionManager.getSessionId();
+			if (switchingToDifferentSession) this.ctx.resetIrcSidebarSession();
+			this.#refreshSessionTerminalTitle();
+			this.ctx.updateEditorBorderColor();
 
-		this.ctx.rebuildInitialMessages(switchingToDifferentSession ? "replace-identity" : "reconcile-same-transcript");
-		await this.ctx.reloadTodos();
-		this.ctx.showStatus("Resumed session");
+			this.ctx.rebuildInitialMessages(
+				switchingToDifferentSession ? "replace-identity" : "reconcile-same-transcript",
+			);
+			await this.ctx.reloadTodos();
+			this.ctx.showStatus("Resumed session");
+		} finally {
+			progressLease.clear();
+		}
 	}
 
 	async handleSessionDeleteCommand(): Promise<void> {

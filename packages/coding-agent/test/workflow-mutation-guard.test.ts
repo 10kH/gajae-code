@@ -754,6 +754,10 @@ describe("workflow mutation guard", () => {
 			"dd if=/dev/null of=src/product.ts",
 			"truncate -s 0 src/product.ts",
 			'python <<PY\nopen("src/product.ts", "w").write("x")\nPY',
+			// A literal nested shell script is a real command list; its mutations count.
+			"bash -c 'rm src/product.ts'",
+			"sh -c 'touch src/product.ts'",
+			'zsh -c "echo x > src/product.ts"',
 		]) {
 			const decision = await getWorkflowMutationDecision({
 				cwd,
@@ -767,6 +771,15 @@ describe("workflow mutation guard", () => {
 		for (const command of [
 			"gjc ralplan --write --stage planner --artifact /tmp/p.md",
 			"cat sample.md > .gjc/specs/deep-interview-sample.md",
+			// Reading and inspecting must never be blocked during a planning phase,
+			// including commands the scanner does not model and read-only wrappers.
+			"gjc deep-interview inspect --selector summary --json",
+			"cat package.json | jq .name",
+			"git status --short",
+			"bash -c 'gjc deep-interview inspect --json'",
+			'bun -e \'const p=Bun.spawnSync(["gjc","state","read"]); process.stdout.write(p.stdout)\'',
+			// Shell metacharacters inside a single-quoted argument value are inert data.
+			"gjc deep-interview draft edit --op set --path /a --value 'uses `bun run release`; a > b | c'",
 		]) {
 			const allowed = await getWorkflowMutationDecision({
 				cwd,

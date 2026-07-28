@@ -19,8 +19,13 @@ Most runtime lookups use `$env` from `@gajae-code/utils` (`packages/utils/src/en
 3. Agent `.env` (`~/.gjc/agent/.env`, respecting `GJC_CONFIG_DIR` / `GJC_CODING_AGENT_DIR`) for keys not already set
 4. Config-root `.env` (`~/.gjc/.env`, respecting `GJC_CONFIG_DIR`) for keys not already set
 5. Home `.env` (`~/.env`) for keys not already set
+6. Login shell rc files (`~/.zshenv`, `~/.zprofile`, `~/.zshrc`, `~/.bash_profile`, `~/.bashrc`) for keys not already set
 
-Additional rule inside each `.env` file: `GJC_*` keys are mirrored to `GJC_*` keys in that parsed file.
+Step 6 does not execute those files. Each is scanned line by line for literal `export NAME=value` or `NAME=value` assignments, and surrounding quotes are stripped. Values that are not literal are dropped rather than resolved: a command substitution such as `export FOO=$(...)` is discarded.
+
+Because the scan is per line and has no notion of shell block structure, it does not reflect whether an assignment would actually run. An assignment nested in an `if` or a function body is read exactly like a top-level one, so a value you guarded behind something like `if [ -n "$CI" ]` in `~/.zshrc` still reaches `$env` unconditionally. Only assignments that do not start their own line — for example one packed after `case ... in` on the same line — are missed.
+
+Keys are used exactly as written. A `PI_`-prefixed key in a `.env` file is not mirrored to its `GJC_` counterpart, or the reverse — where both spellings are accepted it is because the reading code asks for both names.
 
 ---
 
@@ -34,7 +39,7 @@ These are consumed via `getEnvApiKey()` (`packages/ai/src/stream.ts`) unless not
 | ------------------------------- | ------------------------------------------------ | -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | `ANTHROPIC_OAUTH_TOKEN`         | Anthropic API auth                               | Using Anthropic with OAuth token auth                          | Takes precedence over `ANTHROPIC_API_KEY` for provider auth resolution                              |
 | `ANTHROPIC_API_KEY`             | Anthropic API auth                               | Using Anthropic without OAuth token                            | Fallback after `ANTHROPIC_OAUTH_TOKEN`                                                              |
-| `ANTHROPIC_FOUNDRY_API_KEY`     | Anthropic via Azure Foundry / enterprise gateway | `ANTHROPIC_MODEL_CODE_USE_FOUNDRY` enabled                              | Takes precedence over `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` when Foundry mode is enabled  |
+| `ANTHROPIC_FOUNDRY_API_KEY`     | Anthropic via Azure Foundry / enterprise gateway | `CLAUDE_CODE_USE_FOUNDRY` enabled                              | Takes precedence over `ANTHROPIC_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` when Foundry mode is enabled  |
 | `OPENAI_API_KEY`                | OpenAI auth                                      | Using OpenAI-family providers without explicit apiKey argument | Used by OpenAI Completions/Responses providers                                                      |
 | `GEMINI_API_KEY`                | Google Gemini auth                               | Using `google` provider models                                 | Primary key for Gemini provider mapping                                                             |
 | `GOOGLE_API_KEY`                | Gemini image tool auth fallback                  | Using `gemini_image` tool without `GEMINI_API_KEY`             | Used by coding-agent image tool fallback path                                                       |
@@ -69,6 +74,7 @@ These are consumed via `getEnvApiKey()` (`packages/ai/src/stream.ts`) unless not
 | `QWEN_PORTAL_API_KEY`           | Qwen Portal auth                                 | Using `qwen-portal` with API key                               | Fallback after `QWEN_OAUTH_TOKEN`                                                                   |
 | `ZENMUX_API_KEY`                | ZenMux auth                                      | Using `zenmux` provider                                        | Used for ZenMux OpenAI and Anthropic-compatible routes                                              |
 | `OPENGATEWAY_API_KEY`           | OpenGateway (by Sionic AI) auth                  | Using `opengateway` provider                                  | OpenAI-compatible gateway; models discovered via `/v1/models`                                       |
+| `BIZROUTER_API_KEY`             | BizRouter auth                                    | Using `bizrouter` provider                                    | Korean enterprise LLM gateway; OpenAI-compatible, models discovered via `/v1/models`                |
 | `VLLM_API_KEY`                  | vLLM auth/discovery opt-in                       | Using `vllm` provider (local OpenAI-compatible servers)        | Any non-empty value works for no-auth local servers                                                 |
 | `CURSOR_ACCESS_TOKEN`           | Cursor provider auth                             | Using Cursor provider                                          |                                                                                                     |
 | `AI_GATEWAY_API_KEY`            | Vercel AI Gateway auth                           | Using `vercel-ai-gateway` provider                             |                                                                                                     |
@@ -112,27 +118,27 @@ When more than one OAuth credential is stored for the same provider (e.g. severa
 
 ### Anthropic Foundry Gateway (Azure / enterprise proxy)
 
-When `ANTHROPIC_MODEL_CODE_USE_FOUNDRY` is enabled, Anthropic requests switch to Foundry mode:
+When `CLAUDE_CODE_USE_FOUNDRY` is enabled, Anthropic requests switch to Foundry mode:
 
 - Base URL resolves from `FOUNDRY_BASE_URL` (fallback remains model/default base URL if unset).
 - API key resolution for provider `anthropic` becomes:
   `ANTHROPIC_FOUNDRY_API_KEY` → `ANTHROPIC_OAUTH_TOKEN` → `ANTHROPIC_API_KEY`.
 - `ANTHROPIC_CUSTOM_HEADERS` is parsed as comma/newline-separated `key: value` pairs and merged into request headers.
 - TLS client/server material can be injected from env values:
-  `NODE_EXTRA_CA_CERTS`, `ANTHROPIC_MODEL_CODE_CLIENT_CERT`, `ANTHROPIC_MODEL_CODE_CLIENT_KEY`.
+  `NODE_EXTRA_CA_CERTS`, `CLAUDE_CODE_CLIENT_CERT`, `CLAUDE_CODE_CLIENT_KEY`.
   Each accepts either:
   - a filesystem path to PEM content, or
   - inline PEM (including escaped `\n` sequences).
 
 | Variable                    | Value type                                     | Behavior                                                                      |
 | --------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------- |
-| `ANTHROPIC_MODEL_CODE_USE_FOUNDRY`   | Boolean-like string (`1`, `true`, `yes`, `on`) | Enables Foundry mode for Anthropic provider                                   |
+| `CLAUDE_CODE_USE_FOUNDRY`   | Boolean-like string (`1`, `true`, `yes`, `on`) | Enables Foundry mode for Anthropic provider                                   |
 | `FOUNDRY_BASE_URL`          | URL string                                     | Anthropic endpoint base URL in Foundry mode                                   |
 | `ANTHROPIC_FOUNDRY_API_KEY` | Token string                                   | Used for `Authorization: Bearer <token>`                                      |
 | `ANTHROPIC_CUSTOM_HEADERS`  | Header list string                             | Extra headers; format `header-a: value, header-b: value` or newline-separated |
 | `NODE_EXTRA_CA_CERTS`       | PEM path or inline PEM                         | Extra CA chain for server certificate validation                              |
-| `ANTHROPIC_MODEL_CODE_CLIENT_CERT`   | PEM path or inline PEM                         | mTLS client certificate                                                       |
-| `ANTHROPIC_MODEL_CODE_CLIENT_KEY`    | PEM path or inline PEM                         | mTLS client private key (must be paired with cert)                            |
+| `CLAUDE_CODE_CLIENT_CERT`   | PEM path or inline PEM                         | mTLS client certificate                                                       |
+| `CLAUDE_CODE_CLIENT_KEY`    | PEM path or inline PEM                         | mTLS client private key (must be paired with cert)                            |
 
 ### Amazon Bedrock
 
@@ -242,7 +248,7 @@ providers:
 
 This profile is applied on macOS, Linux, WSL (Linux), and native Windows when a compatible tmux provider is available. It is applied **only to sessions GJC itself creates**. If you start tmux yourself and then run `gjc` inside it, GJC leaves your tmux configuration untouched. GJC's own mouse support is disabled by default, so the host terminal or tmux retains wheel and selection behavior. Add `set -g mouse on` to your own `~/.tmux.conf` when you want tmux copy-mode scrolling.
 
-Set `mouse.enabled: true` to let GJC capture the wheel for virtual session scrolling. When GJC owns mouse input, dragging across rendered text highlights the selection and copies it to the system clipboard on release.
+Set `mouse.enabled: true` to let GJC capture the wheel for virtual session scrolling (three rows per notch, not a full page). When GJC owns mouse input, dragging across rendered text highlights the selection and copies it to the system clipboard on release.
 
 | Variable | Behavior |
 | --- | --- |
@@ -273,7 +279,7 @@ GJC does not currently expose a supported `GJC_TMUX_NAMESPACE` runtime knob or p
 
 GJC's SGR mouse support is disabled by default, so tmux or Windows Terminal retains wheel ownership. In a GJC-managed tmux session, the default profile's `mouse on` enters tmux copy-mode and scrolls pane history.
 
-Set `mouse.enabled: true` to make the wheel scroll GJC's virtual session viewport, including inside `gjc --tmux`. Set `GJC_MOUSE=off` as well as leaving GJC mouse support disabled to skip tmux mouse capture and let Windows Terminal handle its native scrollback. Keyboard fallback for tmux copy-mode remains `Ctrl-b [`, followed by `PgUp`/arrows; press `q` to exit.
+Set `mouse.enabled: true` to make the wheel scroll GJC's virtual session viewport three rows at a time, including inside `gjc --tmux`. PageUp/PageDown page the visible transcript lane, moving by its height minus one row. Set `GJC_MOUSE=off` as well as leaving GJC mouse support disabled to skip tmux mouse capture and let Windows Terminal handle its native scrollback. Keyboard fallback for tmux copy-mode remains `Ctrl-b [`, followed by `PgUp`/arrows; press `q` to exit.
 
 ### Team tmux backend, dry-run, and state paths
 
@@ -393,7 +399,7 @@ SearXNG also reads the equivalent `searxng.endpoint`, `searxng.token`, `searxng.
 Anthropic web search uses `findAnthropicAuth()` from `packages/ai/src/utils/anthropic-auth.ts` in this order:
 
 1. `ANTHROPIC_SEARCH_API_KEY` (+ optional `ANTHROPIC_SEARCH_BASE_URL`)
-2. `ANTHROPIC_FOUNDRY_API_KEY` when `ANTHROPIC_MODEL_CODE_USE_FOUNDRY` is enabled
+2. `ANTHROPIC_FOUNDRY_API_KEY` when `CLAUDE_CODE_USE_FOUNDRY` is enabled
 3. Anthropic OAuth credentials from `agent.db` (must not expire within 5-minute buffer)
 4. Anthropic API-key credentials from `agent.db`
 5. Generic Anthropic env fallback: provider key (`ANTHROPIC_FOUNDRY_API_KEY` in Foundry mode, otherwise `ANTHROPIC_OAUTH_TOKEN`/`ANTHROPIC_API_KEY`) + optional `ANTHROPIC_BASE_URL` (`FOUNDRY_BASE_URL` when Foundry mode is enabled)
@@ -486,15 +492,17 @@ These are consumed via `@gajae-code/utils/dirs` and affect where coding-agent st
 | Variable                   | Behavior                                                                       |
 | -------------------------- | ------------------------------------------------------------------------------ |
 | `GJC_BASH_NO_CI`            | Suppresses automatic `CI=true` injection into spawned shell env                |
-| `ANTHROPIC_MODEL_BASH_NO_CI`        | Legacy alias fallback for `GJC_BASH_NO_CI`                                      |
+| `PI_BASH_NO_CI`             | Legacy alias fallback for `GJC_BASH_NO_CI`                                     |
+| `CLAUDE_BASH_NO_CI`         | Legacy alias fallback for `GJC_BASH_NO_CI`                                     |
 | `GJC_BASH_NO_LOGIN`         | Disables login-shell mode; shell args become `['-c']` instead of `['-l','-c']` |
-| `ANTHROPIC_MODEL_BASH_NO_LOGIN`     | Legacy alias fallback for `GJC_BASH_NO_LOGIN`                                   |
-| `GJC_SHELL_PREFIX`          | Optional command prefix wrapper                                                |
-| `ANTHROPIC_MODEL_CODE_SHELL_PREFIX` | Legacy alias fallback for `GJC_SHELL_PREFIX`                                    |
+| `PI_BASH_NO_LOGIN`          | Legacy alias fallback for `GJC_BASH_NO_LOGIN`                                  |
+| `CLAUDE_BASH_NO_LOGIN`      | Legacy alias fallback for `GJC_BASH_NO_LOGIN`                                  |
+| `PI_SHELL_PREFIX`           | Optional command prefix wrapper                                                |
+| `CLAUDE_CODE_SHELL_PREFIX`  | Legacy alias fallback for `PI_SHELL_PREFIX`                                    |
 | `VISUAL`                   | Preferred external editor command                                              |
 | `EDITOR`                   | Fallback external editor command                                               |
 
-Current implementation: `GJC_BASH_NO_LOGIN`/`ANTHROPIC_MODEL_BASH_NO_LOGIN` are active; when either is set, `getShellArgs()` returns `['-c']`.
+Current implementation: `GJC_BASH_NO_CI` and `GJC_BASH_NO_LOGIN` are resolved first, then the `PI_*` and `CLAUDE_*` aliases above. Both are boolean-like: only `1`/`Y`/`TRUE`/`YES`/`ON` (case-insensitive) enable them, so an explicit `GJC_BASH_NO_LOGIN=0` keeps the login shell even when a legacy alias is truthy. The shell prefix is read from `PI_SHELL_PREFIX`/`CLAUDE_CODE_SHELL_PREFIX` only; `GJC_SHELL_PREFIX` is not currently honored.
 
 ---
 
@@ -588,6 +596,6 @@ Treat these as secrets; do not log or commit them:
 - Provider/API keys and OAuth/bearer credentials (all `*_API_KEY`, `*_TOKEN`, OAuth access/refresh tokens)
 - Cloud credentials (`AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS` path may expose service-account material)
 - Search/provider auth vars (`EXA_API_KEY`, `BRAVE_API_KEY`, `PERPLEXITY_API_KEY`, Anthropic search keys)
-- Foundry mTLS material (`ANTHROPIC_MODEL_CODE_CLIENT_CERT`, `ANTHROPIC_MODEL_CODE_CLIENT_KEY`, `NODE_EXTRA_CA_CERTS` when it points to private CA bundles)
+- Foundry mTLS material (`CLAUDE_CODE_CLIENT_CERT`, `CLAUDE_CODE_CLIENT_KEY`, `NODE_EXTRA_CA_CERTS` when it points to private CA bundles)
 
 Python runtime also explicitly strips many common key vars before spawning kernel subprocesses (`packages/coding-agent/src/eval/py/runtime.ts`).
