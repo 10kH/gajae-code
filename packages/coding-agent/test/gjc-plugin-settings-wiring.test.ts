@@ -47,16 +47,20 @@ describe("GJC bundle Settings runtime wiring", () => {
 		const publish = source.indexOf("gjcRuntimeStore.publish(");
 		expect(appendix).toBeGreaterThan(-1);
 		expect(publish).toBeGreaterThan(appendix);
-		// Exactly one publication site, guarded by the completeness flag.
+		// Exactly one publication site, guarded by the completeness flag and
+		// fenced by the pass epoch so an older overlapping rebuild cannot publish
+		// over a newer one.
 		expect(source.split("gjcRuntimeStore.publish(").length - 1).toBe(1);
-		expect(source).toContain("if (gjcProducersComplete) gjcRuntimeStore.publish(");
+		expect(source).toContain(
+			"if (gjcProducersComplete) gjcRuntimeStore.publish(gjcFindings.snapshot(), gjcPassEpoch)",
+		);
 		// The rebuild callback is reused, so the previous generation must be
 		// retired at callback ENTRY. Invalidating next to the publish would leave
 		// stale evidence readable across every await in between, or entirely if
 		// an earlier step throws.
-		const invalidate = source.indexOf("gjcRuntimeStore.invalidate()");
-		expect(invalidate).toBeGreaterThan(-1);
-		expect(invalidate).toBeLessThan(appendix);
-		expect(source.split("gjcRuntimeStore.invalidate()").length - 1).toBe(1);
+		const beginPass = source.indexOf("gjcRuntimeStore.beginPass()");
+		expect(beginPass).toBeGreaterThan(-1);
+		expect(beginPass).toBeLessThan(appendix);
+		expect(source.split("gjcRuntimeStore.beginPass()").length - 1).toBe(1);
 	});
 });

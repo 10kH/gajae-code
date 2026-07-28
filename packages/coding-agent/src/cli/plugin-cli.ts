@@ -469,6 +469,15 @@ async function handleUpgrade(args: string[], flags: PluginCommandArgs["flags"]):
 	}
 }
 
+/**
+ * Stable, non-identifying reason for an install failure. The raw spec and the
+ * underlying cause can both carry credentials, a query string, or an absolute
+ * home path, so neither is ever printed.
+ */
+function describeInstallFailure(error: unknown): string {
+	return error instanceof GjcPluginLoadError ? error.code : "install_failed";
+}
+
 async function handleInstall(
 	manager: PluginManager,
 	packages: string[],
@@ -496,7 +505,14 @@ async function handleInstall(
 	for (const spec of packages) {
 		// GJC plugin bundle classifier: a source containing gajae-plugin.json (or a
 		// git/tarball source) routes to the bundle installer BEFORE marketplace/npm.
-		if (await isGjcPluginBundleSource(spec)) {
+		// An explicitly scoped install is a GJC bundle request by declaration, so
+		// route it to the lifecycle BEFORE probing the source. Probing first means
+		// a deleted or unreachable source fails the probe and silently falls
+		// through to npm/marketplace, which loses the create-only refusal the
+		// lifecycle owes for an already-installed target.
+		const explicitGjcScope =
+			(flags.user || flags.project) && classifyInstallTarget(spec, knownMarketplaces).type !== "marketplace";
+		if (explicitGjcScope || (await isGjcPluginBundleSource(spec))) {
 			if (flags.user === flags.project) {
 				console.error(
 					// The spec can carry credentials or an absolute home path, so name
@@ -553,7 +569,9 @@ async function handleInstall(
 					),
 				);
 			} catch (err) {
-				console.error(chalk.red(`${theme.status.error} Failed to install ${spec}: ${err}`));
+				// The spec can carry credentials, a query string, or an absolute home
+				// path, so report the failure without echoing it or the raw cause.
+				console.error(chalk.red(`${theme.status.error} Failed to install plugin (${describeInstallFailure(err)})`));
 				process.exit(1);
 			}
 			continue;
@@ -588,7 +606,9 @@ async function handleInstall(
 				}
 			}
 		} catch (err) {
-			console.error(chalk.red(`${theme.status.error} Failed to install ${spec}: ${err}`));
+			// The spec can carry credentials, a query string, or an absolute home
+			// path, so report the failure without echoing it or the raw cause.
+			console.error(chalk.red(`${theme.status.error} Failed to install plugin (${describeInstallFailure(err)})`));
 			process.exit(1);
 		}
 	}

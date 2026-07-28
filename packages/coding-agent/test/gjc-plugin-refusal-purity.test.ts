@@ -136,10 +136,14 @@ describe("GJC bundle refusal purity", () => {
 		expect(await treeOf(scopeRoot)).toBe(before);
 	});
 
-	test("a refused install does not require the original source to still exist", async () => {
+	test("a vanished source cannot be identified, so it resolves rather than refusing", async () => {
 		const cwd = await mkProjectCwd();
-		// Install from a COPY, then delete it. The bundle is installed, but its
-		// source is gone: refusal must still be create-only, not a resolve error.
+		// Install from a COPY, then delete it. Identity can only come from the
+		// declared manifest name; a stored-locator match is NOT sound, because one
+		// locator can back different content or a differently named bundle. With
+		// the source gone the name is unreadable, so this correctly falls through
+		// to resolution and reports source failure instead of a create-only
+		// refusal derived from an assumption.
 		const copy = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-refusal-gone-"));
 		tempDirs.push(copy);
 		await fs.cp(sixSurface, copy, { recursive: true });
@@ -149,8 +153,8 @@ describe("GJC bundle refusal purity", () => {
 
 		await fs.rm(copy, { recursive: true, force: true });
 
-		const refused = await installGjcBundle({ cwd }, "project", copy);
-		expect(refused).toMatchObject({ ok: false, error: { code: "already_installed_use_upgrade" } });
+		await expect(installGjcBundle({ cwd }, "project", copy)).rejects.toThrow();
+		// Whatever the outcome, the installed target must be untouched.
 		expect(await treeOf(scopeRoot)).toBe(before);
 	});
 
@@ -164,7 +168,7 @@ describe("GJC bundle refusal purity", () => {
 		).rejects.toThrow();
 	});
 
-	test("locator-matched refusal cannot refuse an install that should proceed", async () => {
+	test("a locator shared with another scope never blocks an install", async () => {
 		const cwd = await mkProjectCwd();
 		const copy = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-refusal-reuse-"));
 		tempDirs.push(copy);

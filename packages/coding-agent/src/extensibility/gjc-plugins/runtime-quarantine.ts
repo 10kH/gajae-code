@@ -60,14 +60,33 @@ export interface GjcRuntimeSnapshotProvider {
 }
 
 /**
- * Single-writer publisher. Only the session coordinator constructs this, and it
- * publishes one complete snapshot per activation generation. Replacing or
- * disposing invalidates the previous snapshot immediately.
+ * Single-writer publisher for runtime evidence.
+ *
+ * Passes can overlap: the session's prompt rebuild is re-entrant, so a second
+ * pass may start while a first is still awaiting its producers. Publication is
+ * therefore fenced by a monotonic epoch. A pass reserves an epoch when it
+ * begins, which immediately retires whatever was published before, and its
+ * later publish is accepted only if no newer pass has reserved since. A slow or
+ * failed older pass can never overwrite a newer one, and an incomplete pass
+ * simply never publishes, leaving consumers at `unavailable`.
  */
 export class GjcRuntimeSnapshotStore implements GjcRuntimeSnapshotProvider {
 	private state: GjcRuntimeSnapshotState = { status: "unavailable" };
+	private epoch = 0;
 
-	publish(snapshot: GjcRuntimeSnapshot): void {
+	/**
+	 * Begin a pass. Retires the current snapshot and returns the epoch token the
+	 * caller must present to publish.
+	 */
+	beginPass(): number {
+		this.epoch += 1;
+		this.state = { status: "unavailable" };
+		return this.epoch;
+	}
+
+	/** Publish only if `epoch` is still the newest reserved pass. */
+	publish(snapshot: GjcRuntimeSnapshot, epoch?: number): void {
+		if (epoch !== undefined && epoch !== this.epoch) return;
 		this.state = { status: "current", snapshot };
 	}
 

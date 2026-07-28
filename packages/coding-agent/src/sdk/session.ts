@@ -2229,8 +2229,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// complete pass republishes, consumers must read `unavailable` rather
 			// than a snapshot describing a generation that no longer applies.
 			// Invalidating at entry (not beside the publish) means an await or a
-			// throw in between cannot leave stale evidence readable.
-			gjcRuntimeStore.invalidate();
+			// throw in between cannot leave stale evidence readable. The reserved
+			// epoch additionally fences overlapping rebuilds, so a slower earlier
+			// pass cannot publish over a newer one.
+			const gjcPassEpoch = gjcRuntimeStore.beginPass();
 			toolContextStore.setToolNames(toolNames);
 			const promptTools = (() => {
 				const previousPromptMetadataModel = promptMetadataModel;
@@ -2273,7 +2275,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// The previous generation was already retired at callback entry, so a
 			// partial pass simply never republishes and consumers keep reading
 			// `unavailable` rather than a stale generation.
-			if (gjcProducersComplete) gjcRuntimeStore.publish(gjcFindings.snapshot());
+			if (gjcProducersComplete) gjcRuntimeStore.publish(gjcFindings.snapshot(), gjcPassEpoch);
 			const defaultPrompt = await buildSystemPromptInternal({
 				cwd,
 				skills,

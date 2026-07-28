@@ -342,16 +342,20 @@ export async function installGjcBundle(
 	source: string,
 ): Promise<GjcLifecycleResult<GjcInstallResult>> {
 	// A create-only refusal must not depend on the source being reachable, so
-	// identify the target before resolving anything. Two locators can do that:
-	// a local directory declares its name in the manifest, and any source that
-	// exactly matches an installed entry's stored locator names that entry.
-	// Otherwise the transaction's own pre-lock preflight refuses after resolve.
-	const registry = await readRegistry(scope, ctx.cwd);
+	// identify the target before resolving anything. Only the declared manifest
+	// name can do that: it IS the canonical identity component.
+	//
+	// A stored-locator match deliberately does NOT qualify. One locator can
+	// resolve to different content over time, and the same URI can back two
+	// differently named bundles, so matching on it would refuse installs that
+	// should proceed. When the name cannot be read the transaction's own
+	// pre-lock preflight refuses after resolving.
 	const declared = await declaredBundleName(source);
-	const existing = declared
-		? registry.plugins.find(p => p.name === declared)
-		: registry.plugins.find(p => storedSourceLocator(p.source) === source || p.source.uri === source);
-	if (existing) return { ok: false, error: alreadyInstalled(existing.name, scope) };
+	if (declared) {
+		const registry = await readRegistry(scope, ctx.cwd);
+		const existing = registry.plugins.find(p => p.name === declared);
+		if (existing) return { ok: false, error: alreadyInstalled(existing.name, scope) };
+	}
 
 	const result = await runGjcBundleTransaction(source, {
 		scope,
