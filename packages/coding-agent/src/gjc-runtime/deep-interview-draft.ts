@@ -884,7 +884,8 @@ async function runDeepInterviewDraftCommandInternal(
 				const suppliedKinds = [flags.has("--for"), flags.has("--kind")].filter(Boolean).length;
 				if (suppliedKinds !== 1) throw new Error("DI_INVALID_ARGUMENT");
 				const kind = (flags.get("--for") ?? flags.get("--kind")) as DeepInterviewDraftKind;
-				const session = required(flags, "--session-id");
+				const session = flags.get("--session-id") ?? process.env.GJC_SESSION_ID?.trim();
+				if (!session) throw new Error("DI_INVALID_ARGUMENT");
 				if (!DEEP_INTERVIEW_DRAFT_KINDS.includes(kind) || !ID.test(session)) throw new Error("DI_INVALID_ARGUMENT");
 				const current = await revision(cwd, session);
 				const now = new Date();

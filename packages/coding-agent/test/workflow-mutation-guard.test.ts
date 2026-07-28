@@ -401,7 +401,7 @@ describe("workflow mutation guard", () => {
 				tool: tool("bash"),
 				args: { command },
 			});
-			expect(decision.blocked).toBe(true);
+			expect(decision.blocked, command).toBe(true);
 		}
 	});
 
@@ -867,6 +867,8 @@ describe("workflow mutation guard", () => {
 			"GJC_SESSION_ID=s1 gjc deep-interview sanity-check --session-id s1 --json",
 			"echo hi | gjc deep-interview draft check --draft-id abc --json",
 			'gjc deep-interview draft edit --draft-id abc --expected-draft-revision 1 --op set --path /question --value "What?" --json',
+			"gjc deep-interview draft edit --draft-id abc --expected-draft-revision 1 --op set --path /type --value brownfield --op set --path /codebase_context --value 'Release uses `bun run release`; output may contain >, <, |, and $(literal) as inert text.' --json",
+			'bun -e \'const p=Bun.spawnSync(["gjc","deep-interview","inspect","--selector","round","--json"]); process.stdout.write(p.stdout); process.stderr.write(p.stderr); process.exit(p.exitCode)\'',
 			'gjc deep-interview draft create --for apply-round-result --session-id s1 --json <<\'EOF\'\n{"unused": "stdin data with open( and writeFile( text"}\nEOF',
 		]) {
 			const decision = await getWorkflowMutationDecision({

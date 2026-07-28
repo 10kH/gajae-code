@@ -780,8 +780,9 @@ function parse(args: readonly string[]): ParsedRepairCommand {
 		flags.set(token, value);
 	}
 	if (!hasJson) throw new RepairError("DI_JSON_REQUIRED");
-	const session = flags.get("--session-id");
+	const session = flags.get("--session-id") ?? process.env.GJC_SESSION_ID?.trim();
 	if (!session || !ID.test(session)) throw new RepairError("DI_INVALID_SESSION_ID");
+	flags.set("--session-id", session);
 	return { verb, flags };
 }
 function safeInt(value: string | undefined, code: string, positive = false): number {
