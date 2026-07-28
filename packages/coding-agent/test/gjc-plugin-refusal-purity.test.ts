@@ -12,6 +12,7 @@ import {
 } from "../src/extensibility/gjc-plugins";
 import { isGjcPluginSourceShape } from "../src/extensibility/gjc-plugins/installer";
 import { isLocalDirectorySourceForTest, storedSourceLocatorForTest } from "../src/extensibility/gjc-plugins/lifecycle";
+import { GjcPluginLoadError } from "../src/extensibility/gjc-plugins/types";
 
 /**
  * A refused install must be observable as a pure read. The transaction used to
@@ -154,8 +155,13 @@ describe("GJC bundle refusal purity", () => {
 
 		await fs.rm(copy, { recursive: true, force: true });
 
-		await expect(installGjcBundle({ cwd }, "project", copy)).rejects.toThrow();
-		// Whatever the outcome, the installed target must be untouched.
+		// Assert the SPECIFIC contract, not merely that something threw: the
+		// failure must be the typed source error, and it must name the missing
+		// source rather than silently succeeding or refusing on a guess.
+		await expect(installGjcBundle({ cwd }, "project", copy)).rejects.toMatchObject({
+			code: "missing_file",
+		});
+		// The installed target must be untouched.
 		expect(await treeOf(scopeRoot)).toBe(before);
 	});
 
@@ -164,9 +170,10 @@ describe("GJC bundle refusal purity", () => {
 		expect((await installGjcBundle({ cwd }, "project", sixSurface)).ok).toBe(true);
 		// A remote locator that names no installed bundle must NOT be swallowed by
 		// the preflight; it has to reach resolution and fail there instead.
-		await expect(
-			installGjcBundle({ cwd }, "project", "https://example.invalid/nobody/nothing.git"),
-		).rejects.toThrow();
+		// It must reach resolution and fail there, as a GjcPluginLoadError, rather
+		// than being absorbed by the preflight as an already-installed refusal.
+		const attempt = installGjcBundle({ cwd }, "project", "https://example.invalid/nobody/nothing.git");
+		await expect(attempt).rejects.toBeInstanceOf(GjcPluginLoadError);
 	});
 
 	test("a locator shared with another scope never blocks an install", async () => {
