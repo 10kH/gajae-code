@@ -106,6 +106,7 @@ import {
 	classifyFallbackTrigger,
 	type FallbackAttemptToken,
 	type FallbackTriggerClass,
+	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
 import {
 	BTW_MAX_ANSWER_UTF8_BYTES,
@@ -1703,6 +1704,7 @@ export class AgentSession {
 	#resetRetryReplaySafety(): void {
 		this.#retryReplayEpoch++;
 		this.#retryReplayUnsafeEpoch = undefined;
+		this.#firstEventTimeoutRetryStartedAt = Date.now();
 		if (
 			this.#extensionRunner?.hasHandlers("context") ||
 			this.#extensionRunner?.hasHandlers("before_provider_request") ||
@@ -1736,6 +1738,7 @@ export class AgentSession {
 	// Retry state
 	#retryAbortController: AbortController | undefined = undefined;
 	#retryNowRequested = false;
+	#firstEventTimeoutRetryStartedAt: number | undefined;
 	#retryAttempt = 0;
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
@@ -13315,6 +13318,10 @@ export class AgentSession {
 		return false;
 	}
 
+	#isTypedFirstEventTimeout(message: AssistantMessage): boolean {
+		return message.transportFailure?.providerCode?.toLowerCase() === STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE;
+	}
+
 	#isTerminalProviderFirstEventTimeout(message: AssistantMessage): boolean {
 		return this.#isKimiCodeFirstEventTimeout(message) || this.#isAlibabaTokenPlanFirstEventTimeout(message);
 	}
@@ -13440,6 +13447,7 @@ export class AgentSession {
 	#classifyErrorForRetry(message: AssistantMessage): RetryErrorClassification {
 		if (message.stopReason !== "error") return "none";
 		if (message.errorKind === "provider_safety_stop") return "terminal";
+		if (this.#isTypedFirstEventTimeout(message)) return "first_event_timeout";
 		if (!message.errorMessage) return "none";
 		const err = message.errorMessage;
 		// Provider safety refusals (e.g. Anthropic stop_reason "refusal" /
@@ -13480,10 +13488,8 @@ export class AgentSession {
 		if (this.#isTerminalProviderFirstEventTimeout(message)) {
 			return "terminal";
 		}
-		// A first-event timeout on ollama-cloud (the ollama-chat API) must not
-		// join the unbounded transient class: each continuation retry re-issues
-		// the full request to a remote, billable backend, so an unbounded loop
-		// can silently spike usage (#713). Bound it to retry.maxRetries instead.
+		// Legacy providers that have not yet stamped the typed timeout fact retain
+		// their existing bounded ollama-cloud behavior.
 		if (this.#isFirstEventTimeoutErrorMessage(err) && this.#shouldFailClosedOnFirstEventTimeout(message)) {
 			return "first_event_timeout";
 		}
@@ -13858,12 +13864,24 @@ export class AgentSession {
 		// user opt-out.
 		if (!managedFallback && !retrySettings.enabled) return false;
 		const classification = managedFallback ? undefined : this.#classifyErrorForRetry(message);
+		if (classification === "first_event_timeout") {
+			this.#firstEventTimeoutRetryStartedAt ??= Date.now();
+		}
+		// First-event timeouts are replay-safe only before any model progress,
+		// abort, or extension/provider lifecycle participation.
+		if (
+			classification === "first_event_timeout" &&
+			(!this.#hasCleanRetryReplaySafety || assistantMessageHasVisibleOrToolContent(message))
+		) {
+			return false;
+		}
 		// Bare defaults admit only clean, side-effect-free canonical stream watchdog failures.
 		if (!managedFallback && !legacyRetryConfigured) {
 			if (
-				hasBareDefaultRetryDisqualifyingFacts(message) ||
-				(classification !== "transient" && classification !== "first_event_timeout") ||
-				!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? "") ||
+				(!this.#isTypedFirstEventTimeout(message) &&
+					(hasBareDefaultRetryDisqualifyingFacts(message) ||
+						(classification !== "transient" && classification !== "first_event_timeout") ||
+						!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))) ||
 				!this.#hasCleanRetryReplaySafety
 			) {
 				return false;
@@ -13898,6 +13916,10 @@ export class AgentSession {
 				this.#defaultFallbackExhaustedLastTurn = true;
 				controller.resetSticky();
 				return managedOutcome ? this.#managedFallbackExhaustionDecision(message, errorMessage) : false;
+			}
+			if (classification === "first_event_timeout") {
+				const elapsedMs = Date.now() - (this.#firstEventTimeoutRetryStartedAt ?? Date.now());
+				message.errorMessage = `First-event stream timeout exhausted after ${attemptsUsed} attempts; waited ${elapsedMs}ms total: ${message.errorMessage ?? "Unknown error"}`;
 			}
 			return false;
 		}
@@ -13962,7 +13984,12 @@ export class AgentSession {
 			await this.#emitSessionEvent({
 				type: "auto_retry_start",
 				attempt: this.#retryAttempt,
-				maxAttempts: managedFallback ? controller.maxAttempts : retrySettings.maxRetries,
+				maxAttempts:
+					classification === "first_event_timeout"
+						? retrySettings.maxRetries + 1
+						: managedFallback
+							? controller.maxAttempts
+							: retrySettings.maxRetries,
 				delayMs,
 				errorMessage,
 				unbounded: managedFallback ? false : legacyUnbounded,
@@ -13972,7 +13999,6 @@ export class AgentSession {
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
 				this.agent.replaceMessages(messages.slice(0, -1));
 			}
-
 			try {
 				await scheduler.wait(delayMs, { signal: retryAbortController.signal });
 			} catch {

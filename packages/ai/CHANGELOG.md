@@ -1,6 +1,7 @@
 # Changelog
 
 ## [Unreleased]
+- Provider streams now surface first-event watchdog expiry as a typed timeout so callers can apply bounded retry policy without parsing error prose.
 
 ## [0.12.0] - 2026-07-28
 

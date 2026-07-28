@@ -2633,6 +2633,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			maxRetryDelayMs: retrySettings.maxDelayMs,
 			requestMaxRetries: retrySettings.requestMaxRetries,
 			streamMaxRetries: retrySettings.streamMaxRetries,
+			streamFirstEventTimeoutMs: settings.has("retry.streamFirstEventTimeoutMs")
+				? retrySettings.streamFirstEventTimeoutMs
+				: undefined,
 			kimiApiFormat: settings.get("providers.kimiApiFormat") ?? "anthropic",
 			shouldPause: options.shouldPause,
 			preferWebsockets: preferOpenAICodexWebsockets,
