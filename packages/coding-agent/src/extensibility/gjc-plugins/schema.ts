@@ -191,10 +191,14 @@ function parseHooks(value: unknown, manifestPath: string): GjcPluginHookManifest
 			);
 		}
 		const name = manifestSafeName(entry.name, `hooks[${index}].name`, manifestPath);
-		const event = manifestString(entry.event, `hooks[${index}].event`, manifestPath);
+		// event/target become part of the hook surface ID
+		// (`hook:<event>:<phase>:<target>:<name>`), which is rendered and printed.
+		const event = manifestSafeName(entry.event, `hooks[${index}].event`, manifestPath);
 		const path = manifestString(entry.path, `hooks[${index}].path`, manifestPath);
 		const target =
-			entry.target === undefined ? undefined : manifestString(entry.target, `hooks[${index}].target`, manifestPath);
+			entry.target === undefined
+				? undefined
+				: manifestSafeName(entry.target, `hooks[${index}].target`, manifestPath);
 		let phase: "before" | "after" | undefined;
 		if (entry.phase !== undefined) {
 			if (entry.phase !== "before" && entry.phase !== "after") {

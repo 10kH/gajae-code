@@ -200,34 +200,38 @@ describe("GJC bundle refusal purity", () => {
 			/^(https?|ssh|git):\/\//i.test(s) || /^git@/.test(s) || s.startsWith("git:");
 		const isTarball = (s: string): boolean => /\.(tgz|tar\.gz|tar)$/i.test(s);
 
-		const locators = [
-			"git:host/path",
-			"git@h:o/r.git",
-			"https://h/o/r.git",
-			"ssh://g@h/o/r",
-			"file:///tmp/b",
-			"https://h/o/pkg.tgz",
-			"/tmp/pkg.tgz",
-			"./local.tar.gz",
-			"/tmp/plain.tar",
-			"host:8080/path",
-			"C:\\Users\\me\\b",
-			"./rel",
-			"../esc",
-			"/abs/path",
-			"weird:name",
-			"/tmp/a:b",
-		];
-		for (const locator of locators) {
-			const installerTreatsAsRemote = looksLikeGit(locator) || isTarball(locator);
-			if (installerTreatsAsRemote) {
-				expect(isLocalDirectorySourceForTest(locator)).toBe(false);
+		// Bidirectional: every locator asserts an exact expectation, so a case can
+		// never silently assert nothing. A remote-looking locator must never be
+		// read as a local directory, and a genuine local path always must be.
+		const expectedLocal: Record<string, boolean> = {
+			"git:host/path": false,
+			"git@h:o/r.git": false,
+			"https://h/o/r.git": false,
+			"ssh://g@h/o/r": false,
+			"file:///tmp/b": false,
+			"https://h/o/pkg.tgz": false,
+			"host:8080/path": false,
+			"user@host:path/repo": false,
+			// Local archives are extracted, not read in place, so they are NOT
+			// local directories for the preflight's purposes.
+			"/tmp/pkg.tgz": false,
+			"./local.tar.gz": false,
+			"/tmp/plain.tar": false,
+			"C:\\Users\\me\\b": true,
+			"./rel": true,
+			"../esc": true,
+			"/abs/path": true,
+			"weird:name": true,
+			"/tmp/a:b": true,
+		};
+		for (const [locator, isLocal] of Object.entries(expectedLocal)) {
+			expect({ locator, local: isLocalDirectorySourceForTest(locator) }).toEqual({ locator, local: isLocal });
+			// A locator the installer resolves remotely must never be classified
+			// as a local directory, or the preflight would read the wrong manifest.
+			if (looksLikeGit(locator) || isTarball(locator)) {
+				expect({ locator, local: isLocalDirectorySourceForTest(locator) }).toEqual({ locator, local: false });
 			}
 		}
-		// Ordinary local directories must still qualify, or refusal would stop
-		// being source-independent for the common case.
-		expect(isLocalDirectorySourceForTest("/abs/path")).toBe(true);
-		expect(isLocalDirectorySourceForTest("./rel")).toBe(true);
 	});
 
 	test("a vanished stored source yields typed source_unavailable, never a throw", async () => {
