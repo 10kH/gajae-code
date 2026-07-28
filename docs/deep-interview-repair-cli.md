@@ -9,7 +9,7 @@ This is the native repair and inspection surface for an existing GJC deep-interv
 All commands require standalone `--json`. Value-taking flags use exactly `--name value`; `--json` and `--null` are standalone flags and take no value. Except for `draft edit` operation groups, flags cannot repeat, and identifiers match `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`. Normal mutations use CLI-owned drafts, never caller-serialized JSON:
 
 ```text
-gjc deep-interview draft create  --for initialize-context|confirm-topology|record-answer|apply-round-result --session-id ID [identity flags] --json
+gjc deep-interview draft create  --for initialize-context|confirm-topology|record-answer|apply-round-result [--session-id ID] [identity flags] --json
 gjc deep-interview draft edit    --draft-id ID --expected-draft-revision N|latest (--op set|append|remove --path /pointer [--value SCALAR|--value-file PATH|--null])... --json
 gjc deep-interview draft show    --draft-id ID --json
 gjc deep-interview draft check   --draft-id ID --json
@@ -18,6 +18,7 @@ gjc deep-interview draft discard --draft-id ID --expected-draft-revision N --jso
 ```
 
 Create returns `draft_id`, `draft_revision`, and state `base_revision`. Every edit/rebase is CAS on `draft_revision` and returns its next value; `draft edit` alone also accepts the literal `latest` (edits are payload-local — consume CAS stays strict). Each `--op` opens one operation group owning the `--path`/`--value`/`--value-file`/`--null` flags that follow it; several groups in one call apply atomically — either every operation lands in one draft write or the stored draft is untouched. `check` validates the complete bounded payload against current state without consuming or mutating it — including a read-only dry-run of the exact consume-side state transform (`apply-round-result` runs the same state invariants consume runs), so a `valid: true` check at a given `state_revision` cannot fail consume-side validation at that same revision; it also reports when the draft base is stale. To rebase a state-stale active draft, pass the caller-observed current state revision as `--to-state-revision`, then check again. Drafts are private workspace/session-bound CLI storage, atomically written with restrictive permissions, automatically expired/cleaned up, and retained briefly after consumption for idempotent receipts. Do not read, copy, or reconstruct draft storage.
+`--session-id` is optional when the process has a valid `GJC_SESSION_ID`; an explicit flag wins. This applies to every typed deep-interview command and `draft create`, so commands issued inside the active GJC session do not need client-side session-id discovery.
 
 Use only kind-allowed JSON-pointer paths. `set` writes one scalar: use `--value` for strings/numbers/booleans, `--null` for null, and `--value-file` only for bounded text. A valueless `append` on a missing object-item array appends an `{}` scaffold; on a missing scalar-item array it initializes `[]`. An existing scalar-item array still requires `--value` or `--value-file` for `append`. `remove` takes no value. Build arrays and nested objects with scaffolds and scalar edits, never inline JSON.
 
@@ -25,8 +26,8 @@ After check, consume through the matching typed command: `gjc deep-interview ini
 
 `inspect` and `sanity-check` stay direct bounded reads:
 ```text
-gjc deep-interview inspect --session-id ID --selector summary|recent-scored|pending|round|topology|facts|triggers|floor [--round-key KEY] [--limit 1..25] [--cursor CURSOR] --json
-gjc deep-interview sanity-check --session-id ID --json
+gjc deep-interview inspect [--session-id ID] --selector summary|recent-scored|pending|round|topology|facts|triggers|floor [--round-key KEY] [--limit 1..25] [--cursor CURSOR] --json
+gjc deep-interview sanity-check [--session-id ID] --json
 ```
 
 ## Legacy compatibility: inline JSON request forms

@@ -122,6 +122,7 @@ const REQUIRED_CONTRACT_PHRASES: { phrase: string; why: string }[] = [
 	{ phrase: "dry-run", why: "check runs the exact consume-side validation" },
 	{ phrase: '"recovery"', why: "error payloads carry deterministic recovery commands" },
 	{ phrase: '"invariant"', why: "state-invariant errors name the violated invariant" },
+	{ phrase: "GJC_SESSION_ID", why: "typed commands inherit the active session" },
 ];
 
 function checkContractPhrases(doc: string, content: string): void {
@@ -136,6 +137,7 @@ const SKILL_REQUIRED_PHRASES: { phrase: string; why: string }[] = [
 	{ phrase: "applied atomically", why: "batch --op groups are atomic" },
 	{ phrase: "dry-runs the exact consume-side validation", why: "check==consume parity" },
 	{ phrase: "recovery command", why: "invariant errors carry recovery" },
+	{ phrase: "defaults its session from `GJC_SESSION_ID`", why: "typed commands inherit the active session" },
 ];
 
 function main(): void {

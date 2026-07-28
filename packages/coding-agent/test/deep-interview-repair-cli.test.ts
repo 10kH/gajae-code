@@ -636,6 +636,31 @@ describe("deep-interview typed repair CLI", () => {
 		}
 	});
 
+	it("defaults typed commands to GJC_SESSION_ID when --session-id is omitted", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-deep-interview-repair-"));
+		const session = "env-repair-session";
+		const priorSession = process.env.GJC_SESSION_ID;
+		process.env.GJC_SESSION_ID = session;
+		try {
+			const stateFile = modeStatePath(cwd, session, "deep-interview");
+			await fs.mkdir(path.dirname(stateFile), { recursive: true });
+			await Bun.write(
+				stateFile,
+				JSON.stringify({
+					state_revision: 1,
+					state: { interview_id: "env", type: "greenfield", threshold: 0.05, rounds: [] },
+				}),
+			);
+			const result = await runDeepInterviewRepairCommand(["inspect", "--selector", "summary", "--json"], cwd);
+			expect(result.status, result.stderr).toBe(0);
+			expect(JSON.parse(result.stdout!).state_revision).toBe(1);
+		} finally {
+			if (priorSession === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = priorSession;
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	it("rejects typed invocations without the required JSON mode", async () => {
 		const result = await runDeepInterviewRepairCommand(
 			["inspect", "--session-id", "repair-test", "--selector", "summary"],
