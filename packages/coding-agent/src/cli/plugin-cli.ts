@@ -16,6 +16,7 @@ import {
 	getGjcBundle,
 	installGjcBundle,
 	isGjcPluginBundleSource,
+	isGjcPluginSourceShape,
 	listGjcBundles,
 	previewGjcBundleUpdate,
 } from "../extensibility/gjc-plugins";
@@ -503,16 +504,15 @@ async function handleInstall(
 	const knownMarketplaces = new Set((await mktMgr.listMarketplaces()).map(m => m.name));
 
 	for (const spec of packages) {
-		// GJC plugin bundle classifier: a source containing gajae-plugin.json (or a
-		// git/tarball source) routes to the bundle installer BEFORE marketplace/npm.
-		// An explicitly scoped install is a GJC bundle request by declaration, so
-		// route it to the lifecycle BEFORE probing the source. Probing first means
-		// a deleted or unreachable source fails the probe and silently falls
-		// through to npm/marketplace, which loses the create-only refusal the
+		// A GJC bundle is identified by the SHAPE of its source: a filesystem path,
+		// a git locator, or a tarball. npm and marketplace specs are never any of
+		// those, so shape alone separates the two worlds without resolving.
+		//
+		// Shape is checked BEFORE `isGjcPluginBundleSource`, which resolves the
+		// source: a deleted or unreachable GJC source fails that probe and would
+		// otherwise fall through to npm, losing the create-only refusal the
 		// lifecycle owes for an already-installed target.
-		const explicitGjcScope =
-			(flags.user || flags.project) && classifyInstallTarget(spec, knownMarketplaces).type !== "marketplace";
-		if (explicitGjcScope || (await isGjcPluginBundleSource(spec))) {
+		if (isGjcPluginSourceShape(spec) || (await isGjcPluginBundleSource(spec))) {
 			if (flags.user === flags.project) {
 				console.error(
 					// The spec can carry credentials or an absolute home path, so name

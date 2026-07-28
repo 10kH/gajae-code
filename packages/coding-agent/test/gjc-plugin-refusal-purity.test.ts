@@ -10,6 +10,7 @@ import {
 	installGjcBundle,
 	previewGjcBundleUpdate,
 } from "../src/extensibility/gjc-plugins";
+import { isGjcPluginSourceShape } from "../src/extensibility/gjc-plugins/installer";
 import { isLocalDirectorySourceForTest, storedSourceLocatorForTest } from "../src/extensibility/gjc-plugins/lifecycle";
 
 /**
@@ -256,6 +257,28 @@ describe("GJC bundle refusal purity", () => {
 		expect(applied).toMatchObject({ ok: false, error: { code: "source_unavailable" } });
 		if (applied.ok) throw new Error("expected refusal");
 		expect(applied.error.message).not.toContain(copy);
+	});
+
+	test("source-shape routing never steals npm or marketplace specs", () => {
+		// The CLI routes on source SHAPE before resolving, so a deleted GJC source
+		// still reaches the lifecycle's typed refusal. That routing must not claim
+		// anything npm or marketplace owns, or scoped installs of ordinary
+		// packages would break.
+		for (const npmSpec of ["@gajae-code/exa", "pkg@1.2.3", "pkg@latest", "bare-npm-name", "name@official"]) {
+			expect(isGjcPluginSourceShape(npmSpec)).toBe(false);
+		}
+		for (const gjcSpec of [
+			"./local-bundle",
+			"/abs/bundle",
+			"../rel",
+			"~/home-bundle",
+			"https://h/o/r.git",
+			"git@h:o/r.git",
+			"/tmp/pkg.tgz",
+			"./b.tar.gz",
+		]) {
+			expect(isGjcPluginSourceShape(gjcSpec)).toBe(true);
+		}
 	});
 
 	test("a git ref is preserved when rebuilding the stored locator", () => {

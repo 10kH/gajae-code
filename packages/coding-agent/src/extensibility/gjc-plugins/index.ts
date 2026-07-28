@@ -9,7 +9,7 @@ export * from "./injection";
  * modules. Re-exporting them would let a caller commit a replacement and
  * bypass the create-only rule.
  */
-export { isGjcPluginBundleSource } from "./installer";
+export { isGjcPluginBundleSource, isGjcPluginSourceShape } from "./installer";
 export * from "./lifecycle";
 export * from "./lifecycle-reconciliation";
 export * from "./loader";

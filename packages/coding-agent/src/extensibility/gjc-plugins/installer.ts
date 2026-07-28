@@ -505,6 +505,25 @@ export function candidateRegistryEntry(
 	return bundleToRegistryEntry(bundle, finalDir, scope, source, now);
 }
 
+/**
+ * True when a spec has the SHAPE of a GJC bundle source: a filesystem path, a
+ * git locator, or a tarball. This is a pure string test that never touches the
+ * filesystem or the network, so a deleted or unreachable source is still
+ * recognised as GJC-intent and can reach the lifecycle's typed refusal instead
+ * of falling through to npm.
+ *
+ * npm and marketplace specs are never path/git/tarball shaped, so this cleanly
+ * separates the two install worlds.
+ */
+export function isGjcPluginSourceShape(source: string): boolean {
+	if (looksLikeGit(source) || isTarball(source)) return true;
+	if (source.startsWith("/") || source.startsWith("./") || source.startsWith("../") || source.startsWith("~/")) {
+		return true;
+	}
+	// Windows drive and UNC paths.
+	return /^[a-zA-Z]:[\\/]/.test(source) || source.startsWith("\\\\");
+}
+
 /** True only when the source actually resolves to a GJC plugin bundle (root gajae-plugin.json). */
 export async function isGjcPluginBundleSource(source: string): Promise<boolean> {
 	if (!isTarball(source) && !looksLikeGit(source)) {
