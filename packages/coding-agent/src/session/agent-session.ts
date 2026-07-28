@@ -2225,6 +2225,15 @@ export class AgentSession {
 		this.#flushPendingAgentEnd();
 	}
 
+	#retainDeferredAgentEndAfterContinuationBusy(
+		hold: symbol | undefined,
+		pending: AgentSessionEvent | undefined,
+	): void {
+		if (!hold || !pending) return;
+		this.#pendingAgentEndEmit = pending;
+		this.#pendingAgentEndContinuationHolds.set(hold, pending);
+	}
+
 	#releaseDeferredAgentEndContinuation(hold: symbol | undefined): void {
 		if (!hold) return;
 		const pending = this.#pendingAgentEndContinuationHolds.get(hold);
@@ -4134,6 +4143,10 @@ export class AgentSession {
 		return scheduled;
 	}
 
+	#isAgentBusyError(error: unknown): error is AgentBusyError {
+		return error instanceof AgentBusyError;
+	}
+
 	#scheduleAgentContinue(options?: {
 		delayMs?: number;
 		generation?: number;
@@ -4142,6 +4155,7 @@ export class AgentSession {
 		shouldContinue?: () => boolean;
 		onSkip?: (reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress") => void;
 		allowDuringCancelAndSubmit?: boolean;
+		rescheduleOnBusy?: boolean;
 		onError?: (error: unknown) => void;
 		resourceRunId?: string;
 	}): Promise<void> {
@@ -4166,82 +4180,92 @@ export class AgentSession {
 		};
 		const scheduledGeneration = options?.generation;
 		const signal = this.#postPromptTasksAbortController.signal;
-		return this.#schedulePostPromptTask(
-			async () => {
-				const canContinue = (): boolean => {
-					if (signal.aborted || this.#isDisposed) {
-						skip("aborted_signal");
-						return false;
-					}
-					if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
-						skip("generation_changed");
-						return false;
-					}
-					if (this.#cancelAndSubmitInProgress && !options?.allowDuringCancelAndSubmit) {
-						skip("queue_drained");
-						return false;
-					}
-					if (options?.shouldContinue && !options.shouldContinue()) {
-						skip("queue_drained");
-						return false;
-					}
-					return true;
-				};
-				if (!canContinue()) return;
-				try {
-					if (!options?.skipCompactionCheck) {
-						await this.#checkEstimatedContextBeforePrompt();
-						if (!canContinue()) return;
-					}
-					if (signal.aborted) {
-						skip("aborted_signal");
-						return;
-					}
-					if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
-						skip("generation_changed");
-						return;
-					}
-					if (options?.shouldContinue && !options.shouldContinue()) {
-						skip("queue_drained");
-						return;
-					}
-					// A continuation scheduled before a handoff engaged must not start a
-					// turn against the session being handed off (or the restored
-					// predecessor). rearmIdle / normal delivery resumes after the fence.
-					if (this.#handoffTransitionActive) {
-						skip("handoff_in_progress");
-						return;
-					}
-					const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
-					const startsQueuedSuccessor =
-						this.agent.state.messages.at(-1)?.role === "assistant" && this.agent.hasQueuedMessages();
+		const scheduleAttempt = (delayMs = options?.delayMs): Promise<void> =>
+			this.#schedulePostPromptTask(
+				async () => {
+					const canContinue = (): boolean => {
+						if (signal.aborted || this.#isDisposed) {
+							skip("aborted_signal");
+							return false;
+						}
+						if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
+							skip("generation_changed");
+							return false;
+						}
+						if (this.#cancelAndSubmitInProgress && !options?.allowDuringCancelAndSubmit) {
+							skip("queue_drained");
+							return false;
+						}
+						if (options?.shouldContinue && !options.shouldContinue()) {
+							skip("queue_drained");
+							return false;
+						}
+						return true;
+					};
+					if (!canContinue()) return;
 					try {
-						await this.agent.continue({
-							...this.#managedFallbackPromptOptions(),
-							// Reset only after continue() has claimed the queued turn. Skipped or stale
-							// continuations retain predecessor accounting, and resetAttemptBudget keeps
-							// the sticky fallback cursor unchanged.
-							onRunAccepted: startsQueuedSuccessor
-								? () => {
-										this.#defaultFallbackChain().resetAttemptBudget();
-										this.#overflowMaintenanceAttempts = 0;
-									}
-								: undefined,
-						});
+						if (!options?.skipCompactionCheck) {
+							await this.#checkEstimatedContextBeforePrompt();
+							if (!canContinue()) return;
+						}
+						if (signal.aborted) {
+							skip("aborted_signal");
+							return;
+						}
+						if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
+							skip("generation_changed");
+							return;
+						}
+						if (options?.shouldContinue && !options.shouldContinue()) {
+							skip("queue_drained");
+							return;
+						}
+						// A continuation scheduled before a handoff engaged must not start a
+						// turn against the session being handed off (or the restored
+						// predecessor). rearmIdle / normal delivery resumes after the fence.
+						if (this.#handoffTransitionActive) {
+							skip("handoff_in_progress");
+							return;
+						}
+						const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
+						const startsQueuedSuccessor =
+							this.agent.state.messages.at(-1)?.role === "assistant" && this.agent.hasQueuedMessages();
+						try {
+							await this.agent.continue({
+								...this.#managedFallbackPromptOptions(),
+								// Reset only after continue() has claimed the queued turn. Skipped or stale
+								// continuations retain predecessor accounting, and resetAttemptBudget keeps
+								// the sticky fallback cursor unchanged.
+								onRunAccepted: startsQueuedSuccessor
+									? () => {
+											this.#defaultFallbackChain().resetAttemptBudget();
+											this.#overflowMaintenanceAttempts = 0;
+										}
+									: undefined,
+							});
+						} catch (error) {
+							if (options?.rescheduleOnBusy && this.#isAgentBusyError(error) && !terminalized && canContinue()) {
+								this.#retainDeferredAgentEndAfterContinuationBusy(predecessorAgentEndHold, predecessorAgentEnd);
+								logger.debug("agent.continue busy after scheduling; rescheduling", {
+									error: error.message,
+								});
+								void scheduleAttempt(100);
+								return;
+							}
+							this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
+							throw error;
+						}
 					} catch (error) {
-						this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
-						throw error;
+						fail(error);
 					}
-				} catch (error) {
-					fail(error);
-				}
-			},
-			{
-				delayMs: options?.delayMs,
-				onSkip: () => skip("aborted_signal"),
-				resourceRunId: options?.resourceRunId,
-			},
-		);
+				},
+				{
+					delayMs,
+					onSkip: () => skip("aborted_signal"),
+					resourceRunId: options?.resourceRunId,
+				},
+			);
+		return scheduleAttempt();
 	}
 
 	#logCompactionContinuationSkipped(
@@ -4257,7 +4281,7 @@ export class AgentSession {
 	): void {
 		logger.warn("Auto-compaction continuation failed", {
 			source,
-			reason: error instanceof Error && error.name === "AgentBusyError" ? "queue_drained" : "not_resumable_tail",
+			reason: "not_resumable_tail",
 			error: error instanceof Error ? error.message : String(error),
 		});
 	}
@@ -4293,6 +4317,7 @@ export class AgentSession {
 				generation,
 				suppressPredecessorAgentEnd: true,
 				resourceRunId,
+				rescheduleOnBusy: true,
 				onSkip: reason => this.#logCompactionContinuationSkipped("overflow_retry", reason),
 				onError: error => this.#logCompactionContinuationError("overflow_retry", error),
 			});
@@ -4329,9 +4354,11 @@ export class AgentSession {
 		};
 		const scheduledGeneration = generation;
 		const signal = this.#postPromptTasksAbortController.signal;
-		this.#trackPostPromptTask(
-			(async () => {
+		const scheduleAttempt = (delayMs = 0) => {
+			const attempt = (async () => {
+				let rescheduled = false;
 				try {
+					if (delayMs > 0) await scheduler.wait(delayMs, { signal });
 					await Promise.resolve();
 					if (signal.aborted) {
 						this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
@@ -4343,12 +4370,28 @@ export class AgentSession {
 					}
 					await continuePrompt();
 				} catch (error) {
+					if (signal.aborted) {
+						this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
+						return;
+					}
+					if (this.#isAgentBusyError(error) && this.#promptGeneration === scheduledGeneration) {
+						logger.debug("Auto-compaction continuation busy; rescheduling", {
+							source: "auto_continue_prompt",
+							reason: "queue_drained",
+							error: error.message,
+						});
+						rescheduled = true;
+						scheduleAttempt(100);
+						return;
+					}
 					this.#logCompactionContinuationError("auto_continue_prompt", error);
 				} finally {
-					this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
+					if (!rescheduled) this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
 				}
-			})(),
-		);
+			})();
+			this.#trackPostPromptTask(attempt);
+		};
+		scheduleAttempt();
 	}
 
 	async #cancelPostPromptTasks(): Promise<void> {
@@ -13013,6 +13056,7 @@ export class AgentSession {
 							delayMs: 100,
 							generation,
 							shouldContinue: () => this.agent.hasQueuedMessages(),
+							rescheduleOnBusy: true,
 							onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 							onError: error => this.#logCompactionContinuationError("queued_continue", error),
 						});
@@ -13030,6 +13074,7 @@ export class AgentSession {
 						suppressPredecessorAgentEnd: true,
 
 						shouldContinue: () => this.agent.hasQueuedMessages(),
+						rescheduleOnBusy: true,
 						onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 						onError: error => this.#logCompactionContinuationError("queued_continue", error),
 					});
@@ -13274,6 +13319,7 @@ export class AgentSession {
 					generation,
 					suppressPredecessorAgentEnd: true,
 					shouldContinue: () => this.agent.hasQueuedMessages(),
+					rescheduleOnBusy: true,
 					onSkip: reason => this.#logCompactionContinuationSkipped("queued_continue", reason),
 					onError: error => this.#logCompactionContinuationError("queued_continue", error),
 				});
