@@ -1,6 +1,6 @@
 import * as crypto from "node:crypto";
-import * as os from "node:os";
 import * as path from "node:path";
+import { getConfigRootDir } from "@gajae-code/utils";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "../skill-state/workflow-hud";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
@@ -490,8 +490,7 @@ export async function resolveUltragoalNudgeBudget(cwd: string): Promise<{ budget
 	const projectPath = path.join(gjcRoot(cwd), "settings.json");
 	const project = await readSettingsNudgeBudget(projectPath);
 	if (project !== null) return { budget: project, source: projectPath };
-	const userDir = process.env.GJC_CONFIG_DIR?.trim() || path.join(os.homedir(), ".gjc");
-	const userPath = path.join(userDir, "settings.json");
+	const userPath = path.join(getConfigRootDir(), "settings.json");
 	const user = await readSettingsNudgeBudget(userPath);
 	if (user !== null) return { budget: user, source: userPath };
 	return { budget: DEFAULT_ULTRAGOAL_NUDGE_BUDGET, source: "default" };

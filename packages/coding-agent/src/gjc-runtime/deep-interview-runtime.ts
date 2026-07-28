@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
+import { getConfigRootDir } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import { scoreToUnits } from "./deep-interview-ambiguity";
@@ -383,9 +383,7 @@ async function readSettingsAmbiguityThreshold(
 function modernSettingsPath(): string {
 	const configDir = process.env.GJC_CODING_AGENT_DIR?.trim() || process.env.PI_CODING_AGENT_DIR?.trim();
 	if (configDir) return path.join(configDir, "config.yml");
-	const configRoot = process.env.GJC_CONFIG_DIR?.trim() || process.env.PI_CONFIG_DIR?.trim();
-	if (configRoot) return path.join(configRoot, "agent", "config.yml");
-	return path.join(os.homedir(), ".gjc", "agent", "config.yml");
+	return path.join(getConfigRootDir(), "agent", "config.yml");
 }
 
 async function readModernSettingsAmbiguityThreshold(): Promise<{ threshold: number; source: string } | undefined> {
@@ -418,8 +416,7 @@ async function resolveConfiguredAmbiguityThreshold(
 	const projectSettings = path.join(cwd, ".gjc", "settings.json");
 	const projectValue = await readSettingsAmbiguityThreshold(projectSettings);
 	if (projectValue) return projectValue;
-	const configDir = process.env.GJC_CONFIG_DIR?.trim() || path.join(os.homedir(), ".gjc");
-	const userSettings = path.join(configDir, "settings.json");
+	const userSettings = path.join(getConfigRootDir(), "settings.json");
 	return await readSettingsAmbiguityThreshold(userSettings);
 }
 

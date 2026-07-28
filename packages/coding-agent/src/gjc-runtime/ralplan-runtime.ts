@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
+import { getConfigRootDir } from "@gajae-code/utils";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { buildRalplanHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
@@ -386,8 +386,7 @@ export async function resolveRalplanMaxIterations(cwd: string): Promise<{ maxIte
 	const projectPath = path.join(gjcRoot(cwd), "settings.json");
 	const project = await readSettingsMaxIterations(projectPath);
 	if (project !== null) return { maxIterations: project, source: projectPath };
-	const userDir = process.env.GJC_CONFIG_DIR?.trim() || path.join(os.homedir(), ".gjc");
-	const userPath = path.join(userDir, "settings.json");
+	const userPath = path.join(getConfigRootDir(), "settings.json");
 	const user = await readSettingsMaxIterations(userPath);
 	if (user !== null) return { maxIterations: user, source: userPath };
 	return { maxIterations: RALPLAN_DEFAULT_MAX_ITERATIONS, source: "default" };
@@ -462,8 +461,7 @@ export async function resolveRalplanMaxReviewPassesPerLane(
 		throw new RalplanCommandError(2, `invalid ralplan settings at ${projectPath}: ${project.reason}`);
 	}
 	if (project.kind === "valid") return { maxReviewPassesPerLane: project.value, source: projectPath };
-	const userDir = process.env.GJC_CONFIG_DIR?.trim() || path.join(os.homedir(), ".gjc");
-	const userPath = path.join(userDir, "settings.json");
+	const userPath = path.join(getConfigRootDir(), "settings.json");
 	const user = await readSettingsMaxReviewPassesPerLane(userPath);
 	if (user.kind === "invalid") {
 		throw new RalplanCommandError(2, `invalid ralplan settings at ${userPath}: ${user.reason}`);
