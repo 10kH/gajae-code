@@ -29,6 +29,12 @@ interface RalplanHudState extends WorkflowGateHudState {
 	verdict?: string;
 	latestSummary?: string;
 	pendingApproval?: boolean;
+	autoHandoff?: {
+		configuredTarget: string;
+		effectiveTarget: string;
+		degradationReason: string | null;
+	};
+	planningStuck?: boolean;
 	updatedAt?: string;
 }
 
@@ -222,6 +228,16 @@ export function buildRalplanHudSummary(state: RalplanHudState): WorkflowHudSumma
 		}
 		return chip(label, `${passes}/${state.reviewPassBudget}`, priority);
 	};
+	const handoffValue = state.autoHandoff
+		? `${state.autoHandoff.configuredTarget}→${state.autoHandoff.effectiveTarget}${
+				state.autoHandoff.degradationReason ? `:${state.autoHandoff.degradationReason}` : ""
+			}`
+		: undefined;
+	const handoffSeverity = state.planningStuck
+		? "blocked"
+		: state.autoHandoff?.degradationReason
+			? "warning"
+			: undefined;
 	return {
 		version: 1,
 		summary: state.latestSummary,
@@ -241,6 +257,7 @@ export function buildRalplanHudSummary(state: RalplanHudState): WorkflowHudSumma
 			reviewPassChip("arch", state.architectPasses, 36),
 			reviewPassChip("crit", state.criticPasses, 38),
 			chip("verdict", verdict, 40, verdictSeverity),
+			chip("handoff", handoffValue, 45, handoffSeverity),
 		]),
 		...(state.updatedAt ? { updated_at: state.updatedAt } : {}),
 	};

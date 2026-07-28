@@ -1,6 +1,7 @@
 # Changelog
 
 ## [Unreleased]
+- Ralplan supports opt-in automatic handoff to ultragoal or team through a durable runtime-owned final receipt, with read-only team preflight and PLANNING-STUCK dominance.
 
 ### Resume fixes
 
