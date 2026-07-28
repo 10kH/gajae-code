@@ -787,6 +787,37 @@ Skipping any stage is possible but reduces quality assurance:
   /triggers/N/status: enum(active|disputed|unresolved) required
 ```
 <!-- END GENERATED: deep-interview-draft-schemas -->
+
+<!-- BEGIN GENERATED: deep-interview-state-invariants (scripts/verify-deep-interview-docs.ts) -->
+### Stable state-invariant identifiers
+
+| Invariant | Description |
+| --- | --- |
+| `round_lifecycle_must_be_known` | Target round lifecycle must be answered, pending_scoring, or scored. |
+| `round_question_id_required` | Target round must carry a non-empty question_id. |
+| `state_type_must_be_interview_type` | state.type must be greenfield or brownfield. |
+| `global_scores_must_be_valid_scores` | Every required dimension in global_scores must be a number in [0,1]. |
+| `rounds_must_be_scored_in_order` | All earlier non-round-0 rounds must be scored before this round. |
+| `active_components_must_have_scores` | Every active topology component must have scores for all required dimensions. |
+| `global_scores_must_equal_component_min` | global_scores[d] must equal the minimum of that dimension across active component scores. |
+| `fact_op_id_required` | Every fact operation must carry a non-empty string id. |
+| `fact_add_requires_statement_and_new_id` | fact add requires a statement and an id that is not already established. |
+| `fact_dispute_requires_existing_fact` | fact dispute must reference an existing fact id. |
+| `fact_supersede_requires_existing_fact_and_target` | fact supersede must reference an existing fact id and an existing target_id. |
+| `trigger_fields_must_be_valid` | Trigger kind must be A-D, status known, name/component non-empty, and dimension valid for the interview type. |
+| `non_active_trigger_requires_rationale` | Disputed or unresolved triggers must carry a rationale. |
+| `trigger_contradicted_fact_must_exist` | trigger.contradictedFactId must reference an existing fact. |
+| `trigger_component_must_exist_in_topology` | trigger.component must reference a component present in the confirmed topology. |
+| `ontology_entities_must_be_well_formed` | Every ontology entity needs string id/name/type (name non-empty) plus fields and relationships arrays. |
+| `ontology_snapshot_rounds_must_increase` | The prior ontology snapshot round must be a safe integer smaller than the round being scored. |
+| `targeting_must_match_derived_target` | Optional targeting assertions must equal the natively derived target component/dimension. |
+| `bookkeeping_round_ids_must_reference_rounds` | bookkeeping.round_ids must be unique and reference durable round keys or round ids. |
+| `counter_deltas_must_be_safe_integers` | Every counter delta and existing counter value must be a safe integer. |
+| `threshold_must_be_valid_score` | state.threshold must be a number in [0,1] with 4-decimal precision. |
+| `threshold_units_must_match_threshold` | state.threshold_units must be a safe integer in [1,10000] equal to scoreToUnits(threshold). |
+| `active_trigger_requires_score_regression` | An active trigger requires a prior scored round whose dimension score did not improve and whose effective ambiguity increased. |
+| `envelope_schema_invalid` | The persisted deep-interview envelope failed native v1 schema validation at the reported path. |
+<!-- END GENERATED: deep-interview-state-invariants -->
 - Use the GJC workflow CLI to save the final spec at `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` exactly; do not use `write`, `edit`, or `ast_edit` directly on `.gjc/` paths without force override.
 - Use public GJC workflow entrypoints to bridge to ralplan, ultragoal, or team only after explicit execution approval — never implement directly. Implementation handoff defaults to ultragoal; reserve team for when tmux-based interactive worker parallelization is genuinely required.
 - The lateral-review panel spawns read-only persona subagents (Task tool) in parallel with independent context; it is an assist layer, never an executor and never the completion authority

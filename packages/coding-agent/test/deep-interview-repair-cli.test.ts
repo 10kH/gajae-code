@@ -1409,10 +1409,34 @@ describe("deep-interview typed repair CLI", () => {
 				ok: false,
 				issue: {
 					code: "DI_STATE_SCHEMA_INVALID",
-					message: "The persisted deep-interview state violates a native v1 invariant.",
+					message: "envelope_schema_invalid violated at /state/threshold_units",
 					recovery:
-						"Fix the named invariant at the reported path (gjc deep-interview draft edit --draft-id <id> --expected-draft-revision latest --op set --path <path> --value <expected> --json), rerun gjc deep-interview draft check --draft-id <id> --json, then retry consume.",
+						"The violated invariant is in persisted state. Run gjc deep-interview sanity-check --json and inspect the reported state path; never edit .gjc state files directly.",
+					invariant: "envelope_schema_invalid",
+					path: "/state/threshold_units",
+					expected: 500,
+					actual: 499,
 				},
+			});
+			const sanity = await runDeepInterviewRepairCommand(["sanity-check", "--session-id", session, "--json"], cwd);
+			expect(JSON.parse(sanity.stdout!).issues[0]).toMatchObject({
+				code: "DI_STATE_SCHEMA_INVALID",
+				invariant: "envelope_schema_invalid",
+				path: "/state/threshold_units",
+				expected: 500,
+				actual: 499,
+			});
+			const inspect = await runDeepInterviewRepairCommand(
+				["inspect", "--session-id", session, "--selector", "summary", "--json"],
+				cwd,
+			);
+			expect(inspect.status).toBe(3);
+			expect(JSON.parse(inspect.stderr!).issue).toMatchObject({
+				code: "DI_STATE_SCHEMA_INVALID",
+				invariant: "envelope_schema_invalid",
+				path: "/state/threshold_units",
+				expected: 500,
+				actual: 499,
 			});
 		} finally {
 			await fs.rm(cwd, { recursive: true, force: true });

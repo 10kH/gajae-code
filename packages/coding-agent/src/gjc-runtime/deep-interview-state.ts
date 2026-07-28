@@ -1732,8 +1732,17 @@ export function applyDeepInterviewRoundResultV1(
 	};
 }
 export function validateDeepInterviewV1Envelope(value: Record<string, unknown>): void {
-	const invalid = (): never => {
-		throw new Error("DI_STATE_SCHEMA_INVALID");
+	const invalid = (
+		path = "/state",
+		expected: unknown = "valid native deep-interview v1 state",
+		actual?: unknown,
+	): never => {
+		throw new DeepInterviewInvariantError("DI_STATE_SCHEMA_INVALID", {
+			invariant: "envelope_schema_invalid",
+			path,
+			expected,
+			...(actual === undefined ? {} : { actual }),
+		});
 	};
 	const validDate = (candidate: unknown): candidate is string =>
 		typeof candidate === "string" && Number.isFinite(Date.parse(candidate));
@@ -1747,10 +1756,12 @@ export function validateDeepInterviewV1Envelope(value: Record<string, unknown>):
 		}
 	};
 	const stateValue = value.state;
-	if (value.skill !== "deep-interview" || value.schema_version !== 1 || !isPlainObject(stateValue)) return invalid();
+	if (value.skill !== "deep-interview") return invalid("/skill", "deep-interview", value.skill);
+	if (value.schema_version !== 1) return invalid("/schema_version", 1, value.schema_version);
+	if (!isPlainObject(stateValue)) return invalid("/state", "object", stateValue);
 	const state = stateValue as Record<string, unknown>;
 	const type = state.type;
-	if (type !== "greenfield" && type !== "brownfield") return invalid();
+	if (type !== "greenfield" && type !== "brownfield") return invalid("/state/type", "greenfield | brownfield", type);
 	const dimensions: DeepInterviewDimension[] =
 		type === "brownfield" ? ["goal", "constraints", "criteria", "context"] : ["goal", "constraints", "criteria"];
 	const isDimension = (candidate: unknown): candidate is DeepInterviewDimension =>
@@ -1759,17 +1770,19 @@ export function validateDeepInterviewV1Envelope(value: Record<string, unknown>):
 	const factsValue = state.established_facts;
 	const threshold = state.threshold ?? value.threshold;
 	const thresholdUnits = state.threshold_units;
+	if (!validScore(threshold)) return invalid("/state/threshold", "score in [0,1] with 4-decimal precision", threshold);
 	if (
-		!validScore(threshold) ||
 		typeof thresholdUnits !== "number" ||
 		!Number.isSafeInteger(thresholdUnits) ||
 		thresholdUnits < 1 ||
-		thresholdUnits > 10_000 ||
-		scoreToUnits(threshold) !== thresholdUnits ||
-		!Array.isArray(roundsValue) ||
-		!Array.isArray(factsValue)
+		thresholdUnits > 10_000
 	)
-		return invalid();
+		return invalid("/state/threshold_units", "safe integer in [1,10000]", thresholdUnits);
+	const expectedThresholdUnits = scoreToUnits(threshold);
+	if (expectedThresholdUnits !== thresholdUnits)
+		return invalid("/state/threshold_units", expectedThresholdUnits, thresholdUnits);
+	if (!Array.isArray(roundsValue)) return invalid("/state/rounds", "array", roundsValue);
+	if (!Array.isArray(factsValue)) return invalid("/state/established_facts", "array", factsValue);
 	const rounds = roundsValue as unknown[];
 	const facts = factsValue as unknown[];
 

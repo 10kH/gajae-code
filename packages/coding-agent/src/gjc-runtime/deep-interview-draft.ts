@@ -18,7 +18,12 @@ import {
 	dryRunDeepInterviewRepairMutation,
 	runDeepInterviewRepairCommand,
 } from "./deep-interview-repair";
-import { canonicalDeepInterviewJson, validateDeepInterviewV1Envelope } from "./deep-interview-state";
+import {
+	canonicalDeepInterviewJson,
+	DeepInterviewInvariantError,
+	deepInterviewInvariantDetail,
+	validateDeepInterviewV1Envelope,
+} from "./deep-interview-state";
 import { modeStatePath } from "./session-layout";
 import {
 	isNativeDeepInterviewV1,
@@ -210,9 +215,11 @@ function draftIssue(errorCode: string): { code: string; message: string; recover
 
 function response(status: number, value: unknown): DeepInterviewDraftResult {
 	if (status === 0) return { status, stdout: `${JSON.stringify(value)}\n` };
+	const renderedIssue =
+		value && typeof value === "object" && !Array.isArray(value) ? value : draftIssue(String(value));
 	return {
 		status,
-		stderr: `${JSON.stringify({ ok: false, issue: draftIssue(String(value)) })}\n`,
+		stderr: `${JSON.stringify({ ok: false, issue: renderedIssue })}\n`,
 	};
 }
 const EDIT_OP_FLAGS = ["--op", "--path", "--value", "--value-file", "--null"] as const;
@@ -491,7 +498,8 @@ async function revision(cwd: string, session: string): Promise<{ revision: numbe
 	if (receipt === "checksum-mismatch") throw new Error("DI_RECEIPT_CHECKSUM_MISMATCH");
 	try {
 		if (isNativeDeepInterviewV1(observed.value)) validateDeepInterviewV1Envelope(observed.value);
-	} catch {
+	} catch (error) {
+		if (error instanceof DeepInterviewInvariantError) throw error;
 		throw new Error("DI_STATE_SCHEMA_INVALID");
 	}
 	if (
@@ -1069,6 +1077,15 @@ async function runDeepInterviewDraftCommandInternal(
 			return response(0, { ok: true, draft_id: id, consumed: true, receipt: draft.receipt });
 		});
 	} catch (error) {
+		if (error instanceof DeepInterviewInvariantError) {
+			return response(2, {
+				code: error.code,
+				message: `${error.invariant} violated at ${error.path}`,
+				recovery:
+					"The violated invariant is in persisted state. Run gjc deep-interview sanity-check --json and inspect the reported state path; never edit .gjc state files directly.",
+				...deepInterviewInvariantDetail(error),
+			});
+		}
 		return response(code(error) === "DI_STATE_REVISION_CONFLICT" ? 3 : 2, code(error));
 	}
 }

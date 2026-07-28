@@ -274,7 +274,6 @@
           "draft create"
         ],
         "name": "session-id",
-        "required": true,
         "type": "string"
       },
       {
@@ -438,7 +437,6 @@
           "sanity-check"
         ],
         "name": "session-id",
-        "required": true,
         "type": "string"
       },
       {
@@ -450,7 +448,6 @@
         ],
         "compatibilityOnly": true,
         "name": "session-id",
-        "required": true,
         "type": "string"
       },
       {
