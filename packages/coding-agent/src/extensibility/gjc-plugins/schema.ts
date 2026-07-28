@@ -5,6 +5,7 @@ import {
 	type GjcPluginAppendixManifestEntry,
 	type GjcPluginHookManifestEntry,
 	GjcPluginLoadError,
+	type GjcPluginLoadErrorCode,
 	type GjcPluginManifest,
 	type GjcPluginMcpManifestEntry,
 	type GjcPluginMcpTransport,
@@ -60,15 +61,41 @@ function requireNonEmptyString(value: unknown, field: string, filePath: string):
  * sequences, path separators, whitespace, or credential-looking text — is
  * rejected before it can ever be stored.
  */
-function manifestSafeName(value: unknown, field: string, manifestPath: string): string {
-	const name = manifestString(value, field, manifestPath);
+function manifestSafeName(
+	value: unknown,
+	field: string,
+	manifestPath: string,
+	code: GjcPluginLoadErrorCode = "invalid_manifest",
+): string {
+	const name =
+		code === "invalid_frontmatter"
+			? requireNonEmptyString(value, field, manifestPath)
+			: manifestString(value, field, manifestPath);
 	if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(name)) {
 		throw new GjcPluginLoadError(
-			"invalid_manifest",
+			code,
 			`GJC plugin ${field} must be 1-128 characters of letters, digits, dot, underscore, or hyphen (${manifestPath})`,
 		);
 	}
 	return name;
+}
+
+/**
+ * Free-form prose that is rendered into prompts or UI. It is not constrained to
+ * the identifier grammar, but control and ANSI characters are rejected so a
+ * manifest cannot inject escape sequences into a rendered surface.
+ */
+function manifestSafeProse(
+	value: unknown,
+	field: string,
+	manifestPath: string,
+	code: GjcPluginLoadErrorCode = "invalid_manifest",
+): string {
+	const text = requireNonEmptyString(value, field, manifestPath);
+	if (/[\u0000-\u001f\u007f]/.test(text)) {
+		throw new GjcPluginLoadError(code, `GJC plugin ${field} must not contain control characters (${manifestPath})`);
+	}
+	return text;
 }
 
 /**
@@ -333,10 +360,16 @@ export function parseManifest(raw: unknown, manifestPath: string): GjcPluginMani
 
 export function parseSubskillFrontmatter(fm: Record<string, unknown>, filePath: string): SubskillFrontmatter {
 	return {
-		name: requireNonEmptyString(fm.name, "name", filePath),
+		// Name and activation_arg become part of the surface ID
+		// (`subskill:<parent>:<phase>:<arg>`) and are rendered, so they share the
+		// identifier grammar. binds_to and phase are separately checked against
+		// the known parent/phase sets. The description is prose and may not be
+		// constrained to that grammar, but must not carry control characters into
+		// a rendered prompt.
+		name: manifestSafeName(fm.name, "name", filePath, "invalid_frontmatter"),
 		binds_to: requireNonEmptyString(fm.binds_to, "binds_to", filePath),
 		phase: requireNonEmptyString(fm.phase, "phase", filePath),
-		activation_arg: requireNonEmptyString(fm.activation_arg, "activation_arg", filePath),
-		description: requireNonEmptyString(fm.description, "description", filePath),
+		activation_arg: manifestSafeName(fm.activation_arg, "activation_arg", filePath, "invalid_frontmatter"),
+		description: manifestSafeProse(fm.description, "description", filePath, "invalid_frontmatter"),
 	};
 }

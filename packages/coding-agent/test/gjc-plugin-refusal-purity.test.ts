@@ -378,4 +378,26 @@ describe("GJC bundle refusal purity", () => {
 			version: "1.0.0-beta.1",
 		});
 	});
+
+	test("a git spawn failure is a typed, sanitized source failure", async () => {
+		// git missing from PATH surfaces as a raw system error on the child
+		// process. It must become a typed load error carrying no errno, no path,
+		// and no remote URL, so the lifecycle can report source_unavailable.
+		const cwd = await mkProjectCwd();
+		const originalPath = process.env.PATH;
+		process.env.PATH = "/nonexistent";
+		try {
+			const attempt = installGjcBundle({ cwd }, "project", "https://example.invalid/owner/repo.git");
+			await expect(attempt).rejects.toBeInstanceOf(GjcPluginLoadError);
+			await expect(attempt).rejects.toMatchObject({ code: "missing_file" });
+			await attempt.catch((error: unknown) => {
+				const message = error instanceof Error ? error.message : String(error);
+				expect(message).not.toContain("example.invalid");
+				expect(message).not.toContain("ENOENT");
+				expect(message).not.toContain(cwd);
+			});
+		} finally {
+			process.env.PATH = originalPath;
+		}
+	});
 });

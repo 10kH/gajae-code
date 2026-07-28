@@ -244,17 +244,23 @@ function runGit(args: string[], cwd?: string): Promise<string> {
 	// argv array (no shell) — repo/ref are passed as discrete args, not interpolated.
 	const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
 	let stdout = "";
-	let stderr = "";
 	child.stdout.on("data", d => {
 		stdout += d;
 	});
-	child.stderr.on("data", d => {
-		stderr += d;
+	// stderr is drained but never surfaced: git writes the remote URL into it,
+	// which can carry credentials.
+	child.stderr.resume();
+	// A spawn failure (git missing, ENOENT, EACCES) arrives as a raw system
+	// error. Convert it so the lifecycle can report a typed, sanitized source
+	// failure instead of letting an errno escape to the CLI.
+	child.on("error", () => {
+		reject(new GjcPluginLoadError("missing_file", "git is unavailable or could not be started"));
 	});
-	child.on("error", reject);
 	child.on("close", code => {
 		if (code === 0) resolve(stdout.trim());
-		else reject(new GjcPluginLoadError("install_conflict", `git ${args[0]} failed: ${stderr.trim()}`));
+		// git writes the remote URL into stderr, which can carry credentials, so
+		// the operation is named without echoing the underlying output.
+		else reject(new GjcPluginLoadError("install_conflict", `git ${args[0]} failed`));
 	});
 	return promise;
 }
