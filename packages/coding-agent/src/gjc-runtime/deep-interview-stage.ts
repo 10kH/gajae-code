@@ -9,17 +9,13 @@ import {
 	normalizeDeepInterviewEnvelope,
 } from "./deep-interview-state";
 import { sessionStateDir } from "./session-layout";
-import {
-	resolveGjcSessionForRead,
-	resolveGjcSessionForWrite,
-	SessionResolutionError,
-	writeSessionActivityMarker,
-} from "./session-resolution";
+import { resolveGjcSessionForWrite, SessionResolutionError, writeSessionActivityMarker } from "./session-resolution";
 import {
 	persistedStateRevision,
 	readExistingStateForMutation,
 	StateWriteConflictError,
 	withWorkflowStateLock,
+	workflowEnvelopeContentSha256,
 	writeGuardedWorkflowEnvelopeAtomic,
 	writeJsonAtomic,
 } from "./state-writer";
@@ -86,6 +82,12 @@ export interface DeepInterviewStageDraft {
 	transition: DeepInterviewStageTransition;
 	/** State revision the draft was staged against; `apply` CAS-checks this. */
 	staged_against_revision: number;
+	/**
+	 * Canonical content SHA-256 of the state the draft was staged against. Revision
+	 * alone cannot catch sanctioned writers that do not bump `state_revision`
+	 * (seed/spec-persistence), so `apply` requires BOTH to match.
+	 */
+	staged_against_sha256: string;
 	payload: Record<string, unknown>;
 	created_at: string;
 }
@@ -108,13 +110,30 @@ function statePathFor(cwd: string, sessionId: string): string {
 // Input parsing
 // -----------------------------------------------------------------------------
 
+/** Bytes cap for `@file` payloads — conservative for the 100k-char structured-response limit. */
+const MAX_INPUT_FILE_BYTES = 1_000_000;
+
 async function parseJsonInput(rawInput: string, cwd: string): Promise<Record<string, unknown>> {
 	let text = rawInput;
 	if (rawInput.startsWith("@")) {
 		const filePath = path.resolve(cwd, rawInput.slice(1));
 		try {
+			const stat = await fs.stat(filePath);
+			if (!stat.isFile()) {
+				throw new DeepInterviewStageError(
+					"DI_STAGE_INPUT_INVALID",
+					`--input file is not a regular file: ${filePath}`,
+				);
+			}
+			if (stat.size > MAX_INPUT_FILE_BYTES) {
+				throw new DeepInterviewStageError(
+					"DI_STAGE_INPUT_INVALID",
+					`--input file exceeds ${MAX_INPUT_FILE_BYTES} bytes (${stat.size}); staged payloads are bounded`,
+				);
+			}
 			text = await fs.readFile(filePath, "utf-8");
 		} catch (error) {
+			if (error instanceof DeepInterviewStageError) throw error;
 			throw new DeepInterviewStageError(
 				"DI_STAGE_INPUT_INVALID",
 				`failed to read --input file ${filePath}: ${error instanceof Error ? error.message : String(error)}`,
@@ -134,6 +153,39 @@ async function parseJsonInput(rawInput: string, cwd: string): Promise<Record<str
 		throw new DeepInterviewStageError("DI_STAGE_INPUT_INVALID", "--input must be a JSON object");
 	}
 	return parsed;
+}
+
+/**
+ * Envelope lifecycle fields the runtime owns exclusively. A staged payload may
+ * carry interview data only; phase transitions go through their dedicated verbs
+ * (`--write`, `gjc state handoff/clear`), never through a staged patch.
+ */
+const RUNTIME_OWNED_ENVELOPE_KEYS = [
+	"current_phase",
+	"active",
+	"skill",
+	"version",
+	"state_revision",
+	"source_state_revision",
+	"receipt",
+	"updated_at",
+	"last_applied_draft_id",
+] as const;
+
+/** Strip runtime-owned keys from a staged payload; returns the ignored key names. */
+function sanitizeStagedPayload(payload: Record<string, unknown>): {
+	payload: Record<string, unknown>;
+	ignoredKeys: string[];
+} {
+	const next = { ...payload };
+	const ignoredKeys: string[] = [];
+	for (const key of RUNTIME_OWNED_ENVELOPE_KEYS) {
+		if (key in next) {
+			delete next[key];
+			ignoredKeys.push(key);
+		}
+	}
+	return { payload: next, ignoredKeys };
 }
 
 function parseTransition(raw: string | undefined): DeepInterviewStageTransition {
@@ -201,6 +253,7 @@ async function readDraft(cwd: string, sessionId: string): Promise<DraftReadResul
 		typeof parsed.transition !== "string" ||
 		!(DEEP_INTERVIEW_STAGE_TRANSITIONS as readonly string[]).includes(parsed.transition) ||
 		typeof parsed.staged_against_revision !== "number" ||
+		typeof parsed.staged_against_sha256 !== "string" ||
 		!isPlainObject(parsed.payload)
 	) {
 		return { kind: "corrupt", error: "draft file does not match the staged-draft shape" };
@@ -208,7 +261,17 @@ async function readDraft(cwd: string, sessionId: string): Promise<DraftReadResul
 	return { kind: "valid", draft: parsed as unknown as DeepInterviewStageDraft };
 }
 
-async function removeDraft(cwd: string, sessionId: string): Promise<boolean> {
+/**
+ * Remove the session draft only when it still holds `draftId`. Prevents a stale
+ * handle (e.g. a concurrent apply/discard that already consumed the draft and a
+ * new one was staged) from deleting a draft it never read.
+ */
+async function removeDraftIfMatches(cwd: string, sessionId: string, draftId?: string): Promise<boolean> {
+	if (draftId !== undefined) {
+		const current = await readDraft(cwd, sessionId);
+		if (current.kind === "valid" && current.draft.draft_id !== draftId) return false;
+		if (current.kind === "absent") return false;
+	}
 	try {
 		await fs.rm(deepInterviewDraftPath(cwd, sessionId));
 		return true;
@@ -225,6 +288,7 @@ async function removeDraft(cwd: string, sessionId: string): Promise<boolean> {
 interface CurrentState {
 	value: Record<string, unknown>;
 	revision: number;
+	sha256: string;
 	exists: boolean;
 }
 
@@ -237,8 +301,19 @@ async function readCurrentState(cwd: string, sessionId: string): Promise<Current
 			'repair or clear it with `gjc state clear --force --mode deep-interview`, then re-seed with `gjc deep-interview "<idea>"`',
 		);
 	}
-	if (read.kind === "absent") return { value: {}, revision: 0, exists: false };
-	return { value: read.value, revision: persistedStateRevision(read.value), exists: true };
+	if (read.kind === "absent")
+		return { value: {}, revision: 0, sha256: workflowEnvelopeContentSha256({}), exists: false };
+	return {
+		value: read.value,
+		revision: persistedStateRevision(read.value),
+		sha256: workflowEnvelopeContentSha256(read.value),
+		exists: true,
+	};
+}
+
+/** Both anchors must hold: revision (fast path) AND content sha (writers that skip revision stamping). */
+function draftIsStale(draft: DeepInterviewStageDraft, current: CurrentState): boolean {
+	return draft.staged_against_revision !== current.revision || draft.staged_against_sha256 !== current.sha256;
 }
 
 /**
@@ -314,18 +389,29 @@ function deriveRuntimeAmbiguity(merged: Record<string, unknown>): Record<string,
 // Verbs
 // -----------------------------------------------------------------------------
 
+/**
+ * One explicit session boundary for every staged verb: `--session-id` flag,
+ * payload `session_id` (stage only), or `GJC_SESSION_ID`. Mutating verbs never
+ * fall back to latest-session auto-detect.
+ */
+function resolveStageSession(args: readonly string[], cwd: string, payloadSessionId?: unknown): string {
+	const session = resolveGjcSessionForWrite(cwd, {
+		flagValue: flagValue(args, "--session-id"),
+		payloadSessionId,
+		envSessionId: process.env.GJC_SESSION_ID,
+	});
+	return session.gjcSessionId;
+}
+
 async function handleStage(args: readonly string[], cwd: string): Promise<Record<string, unknown>> {
 	const rawInput = flagValue(args, "--input");
 	if (rawInput === undefined || rawInput === "") {
 		throw new DeepInterviewStageError("DI_STAGE_USAGE", "--input '<json>' (or @file) is required for stage");
 	}
-	const payload = await parseJsonInput(rawInput, cwd);
+	const rawPayload = await parseJsonInput(rawInput, cwd);
 	const transition = parseTransition(flagValue(args, "--for"));
-	const session = resolveGjcSessionForWrite(cwd, {
-		payloadSessionId: payload.session_id,
-		envSessionId: process.env.GJC_SESSION_ID,
-	});
-	const sessionId = session.gjcSessionId;
+	const sessionId = resolveStageSession(args, cwd, rawPayload.session_id);
+	const { payload, ignoredKeys } = sanitizeStagedPayload(rawPayload);
 	assertCorePayloadSchema(payload);
 
 	const statePath = statePathFor(cwd, sessionId);
@@ -357,6 +443,7 @@ async function handleStage(args: readonly string[], cwd: string): Promise<Record
 				session_id: sessionId,
 				transition,
 				staged_against_revision: current.revision,
+				staged_against_sha256: current.sha256,
 				payload,
 				created_at: nowIso,
 			};
@@ -381,21 +468,14 @@ async function handleStage(args: readonly string[], cwd: string): Promise<Record
 				session_id: sessionId,
 				staged_against_revision: draft.staged_against_revision,
 				draft_path: deepInterviewDraftPath(cwd, sessionId),
+				...(ignoredKeys.length > 0 ? { ignored_runtime_owned_keys: ignoredKeys } : {}),
 			};
 		},
 		{ cwd },
 	);
 }
 
-interface RequiredDraftContext {
-	sessionId: string;
-	draft: DeepInterviewStageDraft;
-}
-
-async function requireDraft(cwd: string): Promise<RequiredDraftContext> {
-	const session = await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID });
-	const sessionId = session.gjcSessionId;
-	const read = await readDraft(cwd, sessionId);
+function requireDraftRead(read: DraftReadResult, sessionId: string): DeepInterviewStageDraft {
 	if (read.kind === "absent") {
 		throw new DeepInterviewStageError(
 			"DI_STAGE_NO_DRAFT",
@@ -410,11 +490,12 @@ async function requireDraft(cwd: string): Promise<RequiredDraftContext> {
 			"discard it (`gjc deep-interview discard`) and re-stage",
 		);
 	}
-	return { sessionId, draft: read.draft };
+	return read.draft;
 }
 
-async function handleCheck(cwd: string): Promise<Record<string, unknown>> {
-	const { sessionId, draft } = await requireDraft(cwd);
+async function handleCheck(args: readonly string[], cwd: string): Promise<Record<string, unknown>> {
+	const sessionId = resolveStageSession(args, cwd);
+	const draft = requireDraftRead(await readDraft(cwd, sessionId), sessionId);
 	const current = await readCurrentState(cwd, sessionId);
 	const summaryBase = {
 		verb: "check",
@@ -424,7 +505,7 @@ async function handleCheck(cwd: string): Promise<Record<string, unknown>> {
 		staged_against_revision: draft.staged_against_revision,
 		current_revision: current.revision,
 	};
-	if (current.revision !== draft.staged_against_revision) {
+	if (draftIsStale(draft, current)) {
 		return {
 			...summaryBase,
 			ok: false,
@@ -445,32 +526,50 @@ async function handleCheck(cwd: string): Promise<Record<string, unknown>> {
 	};
 }
 
-async function handleApply(cwd: string): Promise<Record<string, unknown>> {
-	const { sessionId, draft } = await requireDraft(cwd);
+async function handleApply(args: readonly string[], cwd: string): Promise<Record<string, unknown>> {
+	const sessionId = resolveStageSession(args, cwd);
 	const statePath = statePathFor(cwd, sessionId);
 	return withWorkflowStateLock(
 		statePath,
 		async () => {
+			// Re-read the draft INSIDE the lock so a concurrent discard/stage cannot
+			// hand us a draft that no longer exists or was replaced.
+			const draft = requireDraftRead(await readDraft(cwd, sessionId), sessionId);
 			const current = await readCurrentState(cwd, sessionId);
-			if (current.revision !== draft.staged_against_revision) {
+			// Replay safety: a prior apply that committed but crashed before draft
+			// removal leaves `last_applied_draft_id` in state. Recognize the commit,
+			// finish the cleanup, and settle as an idempotent no-op.
+			if (current.value.last_applied_draft_id === draft.draft_id) {
+				await removeDraftIfMatches(cwd, sessionId, draft.draft_id);
+				return {
+					ok: true,
+					verb: "apply",
+					draft_id: draft.draft_id,
+					transition: draft.transition,
+					session_id: sessionId,
+					applied_revision: current.revision,
+					state_path: statePath,
+					already_applied: true,
+				};
+			}
+			if (draftIsStale(draft, current)) {
 				// CAS conflict: the draft can never legally apply, so auto-invalidate it.
-				// Keeping it around only invites the client-side revision arithmetic this
-				// surface exists to eliminate.
-				await removeDraft(cwd, sessionId);
+				await removeDraftIfMatches(cwd, sessionId, draft.draft_id);
 				throw new DeepInterviewStageError(
 					"DI_STAGE_REVISION_CONFLICT",
-					`state revision moved from ${draft.staged_against_revision} to ${current.revision} since staging; the draft was invalidated`,
+					`state moved since staging (revision ${draft.staged_against_revision} -> ${current.revision} or content changed); the draft was invalidated`,
 					"re-stage against current state: `gjc deep-interview stage --for <transition> --input '<json>'`",
 				);
 			}
 			const nowIso = new Date().toISOString();
 			const merged = computeMergedEnvelope(current.value, draft, nowIso);
+			merged.last_applied_draft_id = draft.draft_id;
 			let appliedRevision: number;
 			try {
 				const written = await writeGuardedWorkflowEnvelopeAtomic(statePath, merged, {
 					cwd,
 					policy: "source",
-					expectedRevision: draft.staged_against_revision,
+					expectedRevision: current.revision,
 					lockHeld: true,
 					receipt: {
 						cwd,
@@ -479,6 +578,7 @@ async function handleApply(cwd: string): Promise<Record<string, unknown>> {
 						command: `gjc deep-interview apply (${draft.transition})`,
 						sessionId,
 						nowIso,
+						mutationId: draft.draft_id,
 					},
 					audit: {
 						category: "state",
@@ -492,7 +592,7 @@ async function handleApply(cwd: string): Promise<Record<string, unknown>> {
 				appliedRevision = written.revision;
 			} catch (error) {
 				if (error instanceof StateWriteConflictError) {
-					await removeDraft(cwd, sessionId);
+					await removeDraftIfMatches(cwd, sessionId, draft.draft_id);
 					throw new DeepInterviewStageError(
 						"DI_STAGE_REVISION_CONFLICT",
 						`state revision moved since staging; the draft was invalidated (${error.message})`,
@@ -501,8 +601,14 @@ async function handleApply(cwd: string): Promise<Record<string, unknown>> {
 				}
 				throw error;
 			}
-			await removeDraft(cwd, sessionId);
-			await writeSessionActivityMarker(cwd, sessionId, { writer: "deep-interview-stage", path: statePath });
+			// Post-commit cleanup is best-effort: the commit already happened, and a
+			// replay recognizes it via last_applied_draft_id instead of failing.
+			try {
+				await removeDraftIfMatches(cwd, sessionId, draft.draft_id);
+				await writeSessionActivityMarker(cwd, sessionId, { writer: "deep-interview-stage", path: statePath });
+			} catch {
+				// Swallow: state is committed; the next apply/discard settles the draft.
+			}
 			const appliedState = isPlainObject(merged.state) ? (merged.state as Record<string, unknown>) : {};
 			return {
 				ok: true,
@@ -522,18 +628,30 @@ async function handleApply(cwd: string): Promise<Record<string, unknown>> {
 	);
 }
 
-async function handleDiscard(cwd: string): Promise<Record<string, unknown>> {
-	const session = await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID });
-	const sessionId = session.gjcSessionId;
-	const read = await readDraft(cwd, sessionId);
-	const removed = await removeDraft(cwd, sessionId);
-	return {
-		ok: true,
-		verb: "discard",
-		session_id: sessionId,
-		removed,
-		...(read.kind === "valid" ? { draft_id: read.draft.draft_id, transition: read.draft.transition } : {}),
-	};
+async function handleDiscard(args: readonly string[], cwd: string): Promise<Record<string, unknown>> {
+	const sessionId = resolveStageSession(args, cwd);
+	const statePath = statePathFor(cwd, sessionId);
+	// Same lock as stage/apply: a discard racing an in-flight apply must not
+	// delete the draft mid-consumption or return a torn read.
+	return withWorkflowStateLock(
+		statePath,
+		async () => {
+			const read = await readDraft(cwd, sessionId);
+			const removed = await removeDraftIfMatches(
+				cwd,
+				sessionId,
+				read.kind === "valid" ? read.draft.draft_id : undefined,
+			);
+			return {
+				ok: true,
+				verb: "discard",
+				session_id: sessionId,
+				removed,
+				...(read.kind === "valid" ? { draft_id: read.draft.draft_id, transition: read.draft.transition } : {}),
+			};
+		},
+		{ cwd },
+	);
 }
 
 // -----------------------------------------------------------------------------
@@ -560,13 +678,13 @@ export async function runDeepInterviewStageCommand(
 				summary = await handleStage(args, cwd);
 				break;
 			case "check":
-				summary = await handleCheck(cwd);
+				summary = await handleCheck(args, cwd);
 				break;
 			case "apply":
-				summary = await handleApply(cwd);
+				summary = await handleApply(args, cwd);
 				break;
 			case "discard":
-				summary = await handleDiscard(cwd);
+				summary = await handleDiscard(args, cwd);
 				break;
 		}
 		const status = summary.ok === false ? 3 : 0;
@@ -584,7 +702,7 @@ export async function runDeepInterviewStageCommand(
 					? new DeepInterviewStageError(
 							"DI_STAGE_SESSION_REQUIRED",
 							error.message,
-							"set GJC_SESSION_ID (or include session_id in the staged payload) and retry",
+							"pass --session-id, set GJC_SESSION_ID, or include session_id in the staged payload, then retry",
 						)
 					: undefined;
 		if (staged) {
