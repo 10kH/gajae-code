@@ -226,16 +226,16 @@ jobs:
       - name: Verify Windows workspace shim and doctor
         shell: pwsh
         run: |
-          bun test scripts/dev-link.test.ts
+          bun test ./scripts/dev-link.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun run dev:doctor
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Windows session-path canonicalization regression
         shell: pwsh
         run: |
-          bun test packages/coding-agent/test/session-manager/windows-canonical-path.test.ts
+          bun test ./packages/coding-agent/test/session-manager/windows-canonical-path.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          bun test packages/coding-agent/test/session/resident-cache-win32-gate.windows.test.ts
+          bun test ./packages/coding-agent/test/session/resident-cache-win32-gate.windows.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 
@@ -317,11 +317,11 @@ jobs:
       - name: Run Windows daemon provenance safety contract
         shell: pwsh
         run: |
-          bun test packages/coding-agent/test/daemon-control.test.ts --test-name-pattern 'incarnation|captured-owner|owner-lock|poll overlap|configured chat providers|hard Windows authority'
+          bun test ./packages/coding-agent/test/daemon-control.test.ts --test-name-pattern 'incarnation|captured-owner|owner-lock|poll overlap|configured chat providers|hard Windows authority'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          bun test packages/coding-agent/test/notifications-telegram-daemon.test.ts --test-name-pattern 'Windows production preflight|Windows legacy cooperative handoff|promoted generation-3 hybrid|concurrent ensureTelegramDaemonRunning|stale dead-pid lock|lock written before|parent-format|transition lock|provisional|readiness|reload failure|pre-upgrade owner|current-generation live owner|v0.10.2|historical pretty|exact unlink|rollback preserves legacy unmanaged root|runDaemonInternal rewrites persisted owner pid|heartbeat fails closed'
+          bun test ./packages/coding-agent/test/notifications-telegram-daemon.test.ts --test-name-pattern 'Windows production preflight|Windows legacy cooperative handoff|promoted generation-3 hybrid|concurrent ensureTelegramDaemonRunning|stale dead-pid lock|lock written before|parent-format|transition lock|provisional|readiness|reload failure|pre-upgrade owner|current-generation live owner|v0.10.2|historical pretty|exact unlink|rollback preserves legacy unmanaged root|runDaemonInternal rewrites persisted owner pid|heartbeat fails closed'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          bun test packages/natives/test/native.test.ts --test-name-pattern 'signals only the pinned root process'
+          bun test ./packages/natives/test/native.test.ts --test-name-pattern 'signals only the pinned root process'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   # Native addon build runs at most once per run and publishes the built `.node`
