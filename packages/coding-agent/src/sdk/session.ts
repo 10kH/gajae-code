@@ -2224,6 +2224,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			tools: Map<string, AgentTool>,
 			candidateModel?: Model,
 		): Promise<BuildSystemPromptResult> => {
+			// This callback is reused for later prompt/tool/model rebuilds. Retire
+			// the previous generation's evidence up front: from here until a
+			// complete pass republishes, consumers must read `unavailable` rather
+			// than a snapshot describing a generation that no longer applies.
+			// Invalidating at entry (not beside the publish) means an await or a
+			// throw in between cannot leave stale evidence readable.
+			gjcRuntimeStore.invalidate();
 			toolContextStore.setToolNames(toolNames);
 			const promptTools = (() => {
 				const previousPromptMetadataModel = promptMetadataModel;
@@ -2263,11 +2270,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// Publication point for GJC bundle runtime evidence. Appendix rendering
 			// is the last producer, so only here is the generation complete.
 			//
-			// This callback is reused for later prompt/tool/model rebuilds, so a
-			// republish must never leave a stale snapshot readable: invalidate
-			// first, then publish only a complete pass. A partial pass therefore
-			// resolves to `unavailable` instead of the previous generation.
-			gjcRuntimeStore.invalidate();
+			// The previous generation was already retired at callback entry, so a
+			// partial pass simply never republishes and consumers keep reading
+			// `unavailable` rather than a stale generation.
 			if (gjcProducersComplete) gjcRuntimeStore.publish(gjcFindings.snapshot());
 			const defaultPrompt = await buildSystemPromptInternal({
 				cwd,
