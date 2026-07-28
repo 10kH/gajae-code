@@ -817,6 +817,7 @@ Skipping any stage is possible but reduces quality assurance:
 | `threshold_units_must_match_threshold` | state.threshold_units must be a safe integer in [1,10000] equal to scoreToUnits(threshold). |
 | `active_trigger_requires_score_regression` | An active trigger requires a prior scored round whose dimension score did not improve and whose effective ambiguity increased. |
 | `envelope_schema_invalid` | The persisted deep-interview envelope failed native v1 schema validation at the reported path. |
+| `setup_fields_are_immutable` | initialize-context cannot change a setup field the state already initialized. |
 <!-- END GENERATED: deep-interview-state-invariants -->
 - Use the GJC workflow CLI to save the final spec at `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` exactly; do not use `write`, `edit`, or `ast_edit` directly on `.gjc/` paths without force override.
 - Use public GJC workflow entrypoints to bridge to ralplan, ultragoal, or team only after explicit execution approval — never implement directly. Implementation handoff defaults to ultragoal; reserve team for when tmux-based interactive worker parallelization is genuinely required.

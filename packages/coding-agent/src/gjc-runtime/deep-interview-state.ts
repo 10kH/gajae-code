@@ -1168,6 +1168,10 @@ export const DEEP_INTERVIEW_STATE_INVARIANTS: readonly { id: string; description
 		id: "envelope_schema_invalid",
 		description: "The persisted deep-interview envelope failed native v1 schema validation at the reported path.",
 	},
+	{
+		id: "setup_fields_are_immutable",
+		description: "initialize-context cannot change a setup field the state already initialized.",
+	},
 ] as const;
 
 /** Apply one closed v1 scoring round. The input contains evidence only; all convergence state is derived here. */
@@ -1222,9 +1226,31 @@ export function applyDeepInterviewRoundResultV1(
 		fail("state_type_must_be_interview_type", "/state/type", "greenfield|brownfield", type);
 	const dimensions: DeepInterviewDimension[] =
 		type === "brownfield" ? ["goal", "constraints", "criteria", "context"] : ["goal", "constraints", "criteria"];
+	/**
+	 * A round only needs to carry the components it actually rescored. Components
+	 * already scored in the confirmed topology keep their persisted scores, so an
+	 * unrelated component never forces the caller to restate scores it did not change.
+	 */
+	const persistedComponentScores: Record<string, Record<string, number>> = {};
+	const topologyForScores = isPlainObject(state.topology) ? state.topology : undefined;
+	for (const component of Array.isArray(topologyForScores?.components) ? topologyForScores.components : []) {
+		if (!isPlainObject(component) || typeof component.id !== "string") continue;
+		const scores = component.clarity_scores ?? component.scores;
+		if (!isPlainObject(scores)) continue;
+		const numeric: Record<string, number> = {};
+		for (const [dimension, score] of Object.entries(scores))
+			if (typeof score === "number" && Number.isFinite(score) && score >= 0 && score <= 1)
+				numeric[dimension] = score;
+		if (Object.keys(numeric).length > 0) persistedComponentScores[component.id] = numeric;
+	}
 	const componentScores =
 		result.component_scores ??
-		Object.fromEntries((result.component_updates ?? []).map(update => [update.component_id, update.scores]));
+		Object.fromEntries(
+			Object.entries({
+				...persistedComponentScores,
+				...Object.fromEntries((result.component_updates ?? []).map(update => [update.component_id, update.scores])),
+			}),
+		);
 	const finiteScore = (value: unknown): value is number =>
 		typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
 	for (const dimension of dimensions) {
@@ -1275,13 +1301,19 @@ export function applyDeepInterviewRoundResultV1(
 				typeof id !== "string" ||
 				!isPlainObject(componentScores[id]) ||
 				!dimensions.every(d => finiteScore(componentScores[id][d]))
-			)
+			) {
+				const updateIndex = (result.component_updates ?? []).findIndex(
+					update => update.component_id === String(id),
+				);
 				fail(
 					"active_components_must_have_scores",
-					`/component_updates[component_id=${String(id)}]/scores`,
-					`scores for every dimension of ${dimensions.join(",")}`,
+					updateIndex >= 0
+						? `/component_updates/${updateIndex}/scores`
+						: `/component_updates/${(result.component_updates ?? []).length}/scores`,
+					`scores for every dimension of ${dimensions.join(",")} for component ${String(id)}`,
 					componentScores[String(id)],
 				);
+			}
 		}
 		for (const dimension of dimensions) {
 			const weakest = Math.min(
