@@ -431,4 +431,35 @@ describe("GJC bundle refusal purity", () => {
 			process.env.PATH = originalPath;
 		}
 	});
+
+	test("C1 controls are rejected in prose and stripped from rendered appendices", async () => {
+		// U+009B is a single-byte CSI: it introduces an escape sequence with no
+		// preceding ESC, so a validator that rejects only C0 leaves the same
+		// injection open. Carriage return can also rewrite a rendered line.
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-c1-"));
+		tempDirs.push(dir);
+		await fs.mkdir(path.join(dir, "subskills", "design"), { recursive: true });
+		await fs.writeFile(
+			path.join(dir, "gajae-plugin.json"),
+			JSON.stringify({
+				kind: "gajae-code-plugin",
+				name: "ok-bundle",
+				version: "1.0.0",
+				subskills: ["subskills/design/SKILL.md"],
+			}),
+		);
+		const writeSkill = (description: string) =>
+			fs.writeFile(
+				path.join(dir, "subskills", "design", "SKILL.md"),
+				`---\nname: design\nbinds_to: ralplan\nphase: planner\nactivation_arg: design\ndescription: "${description}"\n---\nbody\n`,
+			);
+
+		await writeSkill("bad\u009b31m desc");
+		await expect(compileGjcPluginBundle(dir)).rejects.toBeInstanceOf(GjcPluginLoadError);
+
+		// Ordinary non-ASCII prose must still compile: the rule targets control
+		// blocks, not everything outside ASCII.
+		await writeSkill("Ordinary prose with Unicode - café, 日本語");
+		await expect(compileGjcPluginBundle(dir)).resolves.toMatchObject({ name: "ok-bundle" });
+	});
 });

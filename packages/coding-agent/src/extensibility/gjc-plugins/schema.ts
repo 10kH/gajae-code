@@ -92,7 +92,9 @@ function manifestSafeProse(
 	code: GjcPluginLoadErrorCode = "invalid_manifest",
 ): string {
 	const text = requireNonEmptyString(value, field, manifestPath);
-	if (/[\u0000-\u001f\u007f]/.test(text)) {
+	// C0, DEL, and the C1 block: a single-byte CSI (U+009B) is an escape
+	// introducer on its own, so rejecting only C0 leaves the same injection open.
+	if (/[\u0000-\u001f\u007f-\u009f]/.test(text)) {
 		throw new GjcPluginLoadError(code, `GJC plugin ${field} must not contain control characters (${manifestPath})`);
 	}
 	return text;
