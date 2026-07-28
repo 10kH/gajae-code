@@ -184,7 +184,7 @@ describe("GJC bundle lifecycle adversarial invariants", () => {
 		expect(JSON.stringify(await summary(cwd, project))).toBe(afterFirstApply);
 	});
 
-	test("EXPOSES that the exported transaction primitive bypasses create-only install policy", async () => {
+	test("the transaction primitive is not publicly reachable, so create-only cannot be bypassed", async () => {
 		const cwd = await mkProjectCwd();
 		const source = await mkSource();
 		const identity = await install(cwd, "project", source);
@@ -194,13 +194,23 @@ describe("GJC bundle lifecycle adversarial invariants", () => {
 		expect(publicInstall).toMatchObject({ ok: false, error: { code: "already_installed_use_upgrade" } });
 		expect((await summary(cwd, identity)).targetFingerprint).toBe(before.targetFingerprint);
 
+		// The primitive still exists internally and, given a permissive decision,
+		// will commit a replacement. That is precisely why it must not be publicly
+		// reachable: the policy lives in the caller, not in the primitive.
 		const bypass = await runGjcBundleTransaction(source, {
 			scope: "project",
 			cwd,
 			decide: async ({ candidate }) => ({ kind: "commit", entry: candidate }),
 		});
 		expect(bypass.status).toBe("committed");
-		expect((await summary(cwd, identity)).targetFingerprint).not.toBe(before.targetFingerprint);
+
+		// Barrel and package-export boundaries are what actually close this; see
+		// gjc-plugin-public-boundary.test.ts. Assert the barrel here too, so this
+		// test fails if the primitive is ever re-exported.
+		const barrel: Record<string, unknown> = await import("../src/extensibility/gjc-plugins");
+		for (const forbidden of ["runGjcBundleTransaction", "resolveGjcBundleCandidate", "candidateRegistryEntry"]) {
+			expect(Object.keys(barrel)).not.toContain(forbidden);
+		}
 	});
 
 	test("reconciles disjoint and re-added surfaces while deduplicating quarantine", async () => {
