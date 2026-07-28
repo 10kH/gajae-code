@@ -623,6 +623,79 @@ describe("SessionObserverOverlayComponent incremental projection", () => {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
+
+	test("resets projection state when cycling between observed sessions", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "observer-projection-cycle-"));
+		try {
+			const fileA = path.join(dir, "a.jsonl");
+			const fileB = path.join(dir, "b.jsonl");
+			const callA = assistantRecord("call-a", [
+				{ type: "toolCall", id: "shared-call", name: "read", arguments: { path: "a" } },
+			]);
+			const callB = assistantRecord("call-b", [
+				{ type: "toolCall", id: "shared-call", name: "read", arguments: { path: "b" } },
+			]);
+			fs.writeFileSync(
+				fileA,
+				source(
+					"a",
+					`${record("user-a", "session A only")}\n${callA}\n${toolResultRecord("result-a", "shared-call", "result A")}\n`,
+				),
+			);
+			fs.writeFileSync(
+				fileB,
+				source(
+					"b",
+					`${record("user-b", "session B only")}\n${callB}\n${toolResultRecord("result-b", "shared-call", "result B")}\n`,
+				),
+			);
+			const sessions: ObservableSession[] = [
+				{
+					id: "a",
+					kind: "subagent",
+					label: "Session A",
+					status: "active",
+					sessionFile: fileA,
+					lastUpdate: 2,
+				},
+				{
+					id: "b",
+					kind: "subagent",
+					label: "Session B",
+					status: "active",
+					sessionFile: fileB,
+					lastUpdate: 1,
+				},
+			];
+			const cycleRegistry = { getSessions: () => sessions } as unknown as SessionObserverRegistry;
+			const overlay = new SessionObserverOverlayComponent(cycleRegistry, () => {}, ["ctrl+s"]);
+			expect(rendered(overlay)).toContain("session A only");
+			fs.appendFileSync(fileA, `${record("append-a", "A appended")}\n`);
+			overlay.refreshFromRegistry();
+			expect(rendered(overlay)).toContain("A appended");
+
+			__sessionObserverProjectionCounters.reset();
+			__sessionObserverProjectionCounters.enable();
+			overlay.handleInput("]");
+			const cycled = rendered(overlay);
+			expect(cycled).toContain("session B only");
+			expect(cycled).toContain("result B");
+			expect(cycled).not.toContain("session A only");
+			expect(cycled).not.toContain("result A");
+			expect(__sessionObserverProjectionCounters.snapshot()).toMatchObject({
+				projectionFullRuns: 1,
+				projectionIncrementalRuns: 0,
+			});
+
+			fs.appendFileSync(fileB, `${record("append-b", "B appended once")}\n`);
+			overlay.refreshFromRegistry();
+			expect(occurrences(rendered(overlay), "B appended once")).toBe(1);
+			expect(__sessionObserverProjectionCounters.snapshot().projectionIncrementalRuns).toBe(1);
+		} finally {
+			__sessionObserverProjectionCounters.disable();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
 });
 
 test("falls back to full projection for an appended v5 entry patch, then resumes incremental appends", () => {
