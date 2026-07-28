@@ -341,11 +341,41 @@ describe("GJC bundle refusal purity", () => {
 			await expect(compileGjcPluginBundle(dir)).rejects.toBeInstanceOf(GjcPluginLoadError);
 		}
 
+		// The bundle name is not the only manifest-controlled string that reaches
+		// an output surface: surface names become extension IDs (`tool:<name>`)
+		// and the version is rendered beside the bundle everywhere it appears.
+		await fs.mkdir(path.join(dir, "tools"), { recursive: true });
+		await fs.writeFile(path.join(dir, "tools", "t.ts"), "export default {}\n");
+		const hostileText = "evil\u001b[31mANSI tok=s3cr3t";
+		await fs.writeFile(
+			path.join(dir, "gajae-plugin.json"),
+			JSON.stringify({
+				kind: "gajae-code-plugin",
+				name: "ok-bundle",
+				version: "1.0.0",
+				tools: [{ name: hostileText, path: "tools/t.ts", description: "d" }],
+			}),
+		);
+		await expect(compileGjcPluginBundle(dir)).rejects.toBeInstanceOf(GjcPluginLoadError);
+		await fs.writeFile(
+			path.join(dir, "gajae-plugin.json"),
+			JSON.stringify({ kind: "gajae-code-plugin", name: "ok-bundle", version: hostileText }),
+		);
+		await expect(compileGjcPluginBundle(dir)).rejects.toBeInstanceOf(GjcPluginLoadError);
+
 		// A legitimate name still compiles, so the constraint is not vacuous.
 		await fs.writeFile(
 			path.join(dir, "gajae-plugin.json"),
-			JSON.stringify({ kind: "gajae-code-plugin", name: "ordinary-bundle_1.0", version: "1.0.0" }),
+			JSON.stringify({
+				kind: "gajae-code-plugin",
+				name: "ordinary-bundle_1.0",
+				version: "1.0.0-beta.1",
+				tools: [{ name: "good_tool", path: "tools/t.ts", description: "d" }],
+			}),
 		);
-		await expect(compileGjcPluginBundle(dir)).resolves.toMatchObject({ name: "ordinary-bundle_1.0" });
+		await expect(compileGjcPluginBundle(dir)).resolves.toMatchObject({
+			name: "ordinary-bundle_1.0",
+			version: "1.0.0-beta.1",
+		});
 	});
 });

@@ -60,15 +60,30 @@ function requireNonEmptyString(value: unknown, field: string, filePath: string):
  * sequences, path separators, whitespace, or credential-looking text — is
  * rejected before it can ever be stored.
  */
-function manifestBundleName(value: unknown, manifestPath: string): string {
-	const name = manifestString(value, "name", manifestPath);
+function manifestSafeName(value: unknown, field: string, manifestPath: string): string {
+	const name = manifestString(value, field, manifestPath);
 	if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(name)) {
 		throw new GjcPluginLoadError(
 			"invalid_manifest",
-			`GJC plugin name must be 1-128 characters of letters, digits, dot, underscore, or hyphen (${manifestPath})`,
+			`GJC plugin ${field} must be 1-128 characters of letters, digits, dot, underscore, or hyphen (${manifestPath})`,
 		);
 	}
 	return name;
+}
+
+/**
+ * A version string is rendered next to the bundle name everywhere the bundle
+ * appears, so it is constrained to printable version-like characters.
+ */
+function manifestSafeVersion(value: unknown, manifestPath: string): string {
+	const version = manifestString(value, "version", manifestPath);
+	if (!/^[a-zA-Z0-9][a-zA-Z0-9._+-]{0,63}$/.test(version)) {
+		throw new GjcPluginLoadError(
+			"invalid_manifest",
+			`GJC plugin version must be 1-64 characters of letters, digits, dot, plus, underscore, or hyphen (${manifestPath})`,
+		);
+	}
+	return version;
 }
 
 function manifestString(value: unknown, field: string, manifestPath: string): string {
@@ -127,7 +142,7 @@ function parseTools(value: unknown, manifestPath: string): GjcPluginToolManifest
 				`Invalid GJC plugin manifest at ${manifestPath}: tools[${index}] must be a string or object`,
 			);
 		}
-		const name = manifestString(entry.name, `tools[${index}].name`, manifestPath);
+		const name = manifestSafeName(entry.name, `tools[${index}].name`, manifestPath);
 		const path = manifestString(entry.path, `tools[${index}].path`, manifestPath);
 		const description =
 			entry.description === undefined
@@ -148,7 +163,7 @@ function parseHooks(value: unknown, manifestPath: string): GjcPluginHookManifest
 				`Invalid GJC plugin manifest at ${manifestPath}: hooks[${index}] must be an object`,
 			);
 		}
-		const name = manifestString(entry.name, `hooks[${index}].name`, manifestPath);
+		const name = manifestSafeName(entry.name, `hooks[${index}].name`, manifestPath);
 		const event = manifestString(entry.event, `hooks[${index}].event`, manifestPath);
 		const path = manifestString(entry.path, `hooks[${index}].path`, manifestPath);
 		const target =
@@ -178,7 +193,7 @@ function parseMcps(value: unknown, manifestPath: string): GjcPluginMcpManifestEn
 				`Invalid GJC plugin manifest at ${manifestPath}: mcps[${index}] must be an object`,
 			);
 		}
-		const name = manifestString(entry.name, `mcps[${index}].name`, manifestPath);
+		const name = manifestSafeName(entry.name, `mcps[${index}].name`, manifestPath);
 		const transport = entry.transport;
 		if (typeof transport !== "string" || !MCP_TRANSPORTS.includes(transport as GjcPluginMcpTransport)) {
 			throw new GjcPluginLoadError(
@@ -225,7 +240,7 @@ function parseAppendixEntry(entry: unknown, field: string, manifestPath: string)
 			`Invalid GJC plugin manifest at ${manifestPath}: ${field} must be an object`,
 		);
 	}
-	const name = manifestString(entry.name, `${field}.name`, manifestPath);
+	const name = manifestSafeName(entry.name, `${field}.name`, manifestPath);
 	const path = entry.path === undefined ? undefined : manifestString(entry.path, `${field}.path`, manifestPath);
 	// Content may be empty/whitespace here; the compiler enforces non-empty and
 	// maps emptiness to invalid_appendix (not invalid_manifest).
@@ -300,8 +315,8 @@ export function parseManifest(raw: unknown, manifestPath: string): GjcPluginMani
 		);
 	}
 
-	const name = manifestBundleName(raw.name, manifestPath);
-	const version = manifestString(raw.version, "version", manifestPath);
+	const name = manifestSafeName(raw.name, "name", manifestPath);
+	const version = manifestSafeVersion(raw.version, manifestPath);
 
 	return {
 		name,
