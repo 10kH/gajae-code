@@ -72,10 +72,16 @@ describe("GJC plugin scope-qualified identities", () => {
 		// otherwise the supported dual-scope install would be self-colliding.
 		expect(() => validateInstallPlan(bundle("foo", { tools: [tool] }), [])).not.toThrow();
 
-		// The opt-in scope-aware form exists for callers that genuinely need a
-		// cross-scope universe, and there it is a collision.
+		// The same bundle already installed in the opposite scope is the same
+		// logical bundle, so its surfaces are not collisions against itself.
 		expect(() =>
-			validateInstallPlan(bundle("foo", { tools: [tool] }), [entry("user", "foo", { tools: [tool] })], "project"),
+			validateInstallPlan(bundle("foo", { tools: [tool] }), [entry("user", "foo", { tools: [tool] })]),
+		).not.toThrow();
+
+		// A DIFFERENTLY named bundle in the opposite scope claiming the same
+		// surface ID is a genuine collision and must fail closed at install time.
+		expect(() =>
+			validateInstallPlan(bundle("foo", { tools: [tool] }), [entry("user", "other", { tools: [tool] })]),
 		).toThrow(GjcPluginLoadError);
 	});
 

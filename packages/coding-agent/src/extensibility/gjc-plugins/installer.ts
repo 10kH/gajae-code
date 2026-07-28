@@ -421,13 +421,12 @@ export async function runGjcBundleTransaction(
 			await fs.mkdir(root, { recursive: true });
 			await cleanupOrphans(root, dirName);
 
-			// Hard install-time collision + MCP security validation. The target
-			// scope's registry is the collision authority: surface IDs derive from
-			// the bundle name, so the same bundle installed into both scopes shares
-			// them by design, and every same-name entry is excluded as the entry
-			// being replaced. Widening this to the effective cross-scope registry
-			// would make the supported dual-scope install self-colliding.
-			validateInstallPlan(bundle, targetRegistry.plugins);
+			// Hard install-time collision + MCP security validation against the
+			// effective registry across BOTH scopes. Surface IDs derive from the
+			// surface name, not the bundle name, so a differently named bundle in
+			// the opposite scope can claim the same ID; only the exact target
+			// identity is excluded, since that is the entry being replaced.
+			validateInstallPlan(bundle, effective);
 
 			const unique = `${process.pid}-${randomBytes(6).toString("hex")}`;
 			const stagingDir = `${finalDir}.installing-${unique}`;
