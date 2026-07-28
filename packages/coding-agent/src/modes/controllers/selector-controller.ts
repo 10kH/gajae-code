@@ -2343,9 +2343,9 @@ export class SelectorController {
 	 * the two models already match, or either model can't be resolved.
 	 */
 	#maybePromptResumeModelChoice(): void {
-		if (this.ctx.settings.get("session.resumeModelBehavior") !== "ask") return;
+		if (this.ctx.settings?.get("session.resumeModelBehavior") !== "ask") return;
 		const sessionModel = this.ctx.session.model;
-		const currentDefault = this.ctx.session.resolveConfiguredDefaultModel();
+		const currentDefault = this.ctx.session.resolveConfiguredDefaultModel?.();
 		if (!sessionModel || !currentDefault) return;
 		if (sessionModel.provider === currentDefault.provider && sessionModel.id === currentDefault.id) return;
 
