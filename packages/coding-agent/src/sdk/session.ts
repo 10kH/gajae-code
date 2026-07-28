@@ -2900,6 +2900,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// microtask (the ToolSession closure needs `session` assigned). Await it
 		// so a resumed canonical workflow session returns with `ask` resident.
 		await session.workflowGateToolRestoration;
+		// Expose the published evidence on the session itself so UI surfaces that
+		// only hold a session (Settings) can consume it without threading the
+		// creation result through every controller.
+		session.gjcRuntimeSnapshot = gjcRuntimeStore;
+		session.gjcActivationGeneration = gjcActivationGeneration;
 		return {
 			session,
 			extensionsResult,
