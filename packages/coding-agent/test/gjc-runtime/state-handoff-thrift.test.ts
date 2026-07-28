@@ -124,6 +124,7 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 			displayPath: root,
 		});
 		assertKeys(ralplanReceiptPayload, [
+			"session_id",
 			"run_id",
 			"path",
 			"stage",
@@ -138,6 +139,7 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 		]);
 		expect(scrub(ralplanReceipt.stdout ?? "")).toMatchInlineSnapshot(`
 			"{
+			  "session_id": "test-session",
 			  "run_id": "run-b",
 			  "path": "/tmp/SCRUBBED",
 			  "stage": "final",
@@ -172,6 +174,7 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 		expect(deduplicatedPayload.deduplicated).toBe(true);
 		expect(deduplicatedPayload.repository_binding).toEqual(ralplanReceiptBinding);
 		assertKeys(deduplicatedPayload, [
+			"session_id",
 			"run_id",
 			"path",
 			"stage",
@@ -187,7 +190,7 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 		const ralplanSeedPayload = parseRequiredJson(ralplanSeed.stdout, "ralplan seed stdout");
 		expect(ralplanSeedPayload.repository_binding).toEqual(ralplanReceiptBinding);
 		expect(scrub(ralplanSeed.stdout ?? "")).toMatchInlineSnapshot(`
-			"{"ok":true,"skill":"ralplan","mode":"short","state_path":"/tmp/SCRUBBED","run_id":"run-b","handoff":"/skill:ralplan","repository_binding":{"schema":"gjc.repository_binding.v1","worktreeRoot":"/tmp/SCRUBBED","commonDir":null,"displayPath":"/tmp/SCRUBBED"}}
+			"{"ok":true,"session_id":"test-session","skill":"ralplan","mode":"short","state_path":"/tmp/SCRUBBED","run_id":"run-b","handoff":"/skill:ralplan","repository_binding":{"schema":"gjc.repository_binding.v1","worktreeRoot":"/tmp/SCRUBBED","commonDir":null,"displayPath":"/tmp/SCRUBBED"}}
 			"
 			`);
 
