@@ -6,6 +6,10 @@
 - Telegram notification sound can be set to all, important, or none; the reference CLI exposes this with `--sound <all|important|none>`, defaulting to all. Important (ask/idle only) and none are explicit opt-ins for quieter notifications.
 - First-event provider timeouts are configurable and replayed only by AgentSession with a bounded attempt budget, progress-aware safety checks, and measured exhaustion details.
 
+### Changed
+
+- Session Observer now incrementally projects append-only session messages and narrowly patches late tool results, avoiding repeated full-history transcript projection while preserving eager output parity and safe full-projection fallback for ambiguous source changes.
+
 ### Resume fixes
 
 - Eager todo initialization now gives the model the actual phased `todo_write` payload shape (`ops` → `init` → `list` → `phase`/`items`) instead of instructing it to send unsupported `content`, `details`, and status fields, preventing the first forced todo call from failing validation (#3403).
