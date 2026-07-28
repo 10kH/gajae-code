@@ -31,7 +31,7 @@ import type {
 	GjcUpdateApplyResult,
 	GjcUpdatePreview,
 } from "./types";
-import { GJC_PLUGIN_MANIFEST_FILENAME } from "./types";
+import { GJC_PLUGIN_MANIFEST_FILENAME, GjcPluginLoadError } from "./types";
 
 /**
  * GJC bundle lifecycle service.
@@ -255,7 +255,12 @@ async function withSourceAvailability<T>(
 ): Promise<GjcLifecycleResult<T>> {
 	try {
 		return await run();
-	} catch {
+	} catch (error) {
+		// Only a source-resolution failure becomes `source_unavailable`. A
+		// programming bug, an out-of-memory, or a write/rollback fault must keep
+		// propagating: mislabelling those as an unreachable source would hide real
+		// failures behind a benign-looking, retryable error.
+		if (!(error instanceof GjcPluginLoadError)) throw error;
 		return {
 			ok: false,
 			error: fail(

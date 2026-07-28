@@ -337,3 +337,25 @@ the focused row and scroll position.
 This Settings surface does not install or uninstall bundles, edit sources, or
 repair quarantine. It supports only list/detail, update review/apply,
 bundle-toggle, and eligible-surface-toggle actions.
+
+### Create-only refusal and source reachability
+
+An already-installed target is refused with `already_installed_use_upgrade`,
+independently of `--force`, and the refusal performs no filesystem mutation:
+it is decided before any registry lock is acquired, because acquiring a lock
+itself creates the scope root.
+
+Refusal is bound to the bundle name declared in the manifest, because that name
+*is* the identity component. When the source is a local directory the name is
+read without resolving, so a deleted-and-recreated or offline-but-present source
+still refuses correctly.
+
+When the source cannot be read at all — a deleted directory, an unreachable git
+remote, a missing tarball — the target's identity is genuinely unknowable before
+resolution, so the operation resolves and reports the source failure instead of
+refusing. Matching on the stored locator was tried and rejected as unsound: one
+locator can resolve to different content over time, the same URI can back two
+differently named bundles, and a stored `uri#ref` differs from a bare `uri`, so
+locator-based refusal would refuse installs that should proceed. Refusing on a
+guess is worse than reporting the real failure, so identity must be readable for
+refusal to apply.
