@@ -271,7 +271,18 @@ describe("GJC bundle refusal purity", () => {
 		// still reaches the lifecycle's typed refusal. That routing must not claim
 		// anything npm or marketplace owns, or scoped installs of ordinary
 		// packages would break.
-		for (const npmSpec of ["@gajae-code/exa", "pkg@1.2.3", "pkg@latest", "bare-npm-name", "name@official"]) {
+		// npm package names may contain dots, so an archive SUFFIX alone must not
+		// claim a spec: `foo.tgz` and `@scope/foo.tar.gz` are legal npm names.
+		for (const npmSpec of [
+			"@gajae-code/exa",
+			"pkg@1.2.3",
+			"pkg@latest",
+			"bare-npm-name",
+			"name@official",
+			"foo.tgz",
+			"@scope/foo.tar.gz",
+			"my.pkg.tar",
+		]) {
 			expect(isGjcPluginSourceShape(npmSpec)).toBe(false);
 		}
 		for (const gjcSpec of [
@@ -283,6 +294,11 @@ describe("GJC bundle refusal purity", () => {
 			"git@h:o/r.git",
 			"/tmp/pkg.tgz",
 			"./b.tar.gz",
+			"https://h/p.tgz",
+			".\\bundle",
+			"..\\esc",
+			"C:\\x\\y",
+			"\\\\srv\\share",
 		]) {
 			expect(isGjcPluginSourceShape(gjcSpec)).toBe(true);
 		}

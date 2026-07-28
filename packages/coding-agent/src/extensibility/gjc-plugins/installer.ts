@@ -129,8 +129,21 @@ function tarHeaderChecksumOk(header: Uint8Array): boolean {
 
 /** Minimal, traversal/symlink-safe, resource-bounded extraction of a tar(.gz). */
 async function extractTarball(tarPath: string, destRoot: string): Promise<void> {
-	const raw = await fs.readFile(tarPath);
-	const buf = /\.(tgz|tar\.gz)$/i.test(tarPath) ? gunzipSync(raw) : raw;
+	// A missing or corrupt archive surfaces as a native fs/zlib error. Translate
+	// it here so callers see the same typed source failure they get for every
+	// other unreachable source, instead of a raw errno escaping the lifecycle.
+	let raw: Buffer;
+	try {
+		raw = await fs.readFile(tarPath);
+	} catch {
+		throw new GjcPluginLoadError("missing_file", "GJC plugin tarball could not be read");
+	}
+	let buf: Buffer;
+	try {
+		buf = /\.(tgz|tar\.gz)$/i.test(tarPath) ? gunzipSync(raw) : raw;
+	} catch {
+		throw new GjcPluginLoadError("invalid_manifest", "GJC plugin tarball could not be decompressed");
+	}
 	const resolvedRoot = path.resolve(destRoot);
 	const decoder = new TextDecoder();
 	let offset = 0;
@@ -516,12 +529,22 @@ export function candidateRegistryEntry(
  * separates the two install worlds.
  */
 export function isGjcPluginSourceShape(source: string): boolean {
-	if (looksLikeGit(source) || isTarball(source)) return true;
-	if (source.startsWith("/") || source.startsWith("./") || source.startsWith("../") || source.startsWith("~/")) {
-		return true;
-	}
-	// Windows drive and UNC paths.
-	return /^[a-zA-Z]:[\\/]/.test(source) || source.startsWith("\\\\");
+	if (looksLikeGit(source)) return true;
+	// Explicit path forms, POSIX and Windows.
+	const isPathShaped =
+		source.startsWith("/") ||
+		source.startsWith("./") ||
+		source.startsWith("../") ||
+		source.startsWith("~/") ||
+		source.startsWith(".\\") ||
+		source.startsWith("..\\") ||
+		/^[a-zA-Z]:[\\/]/.test(source) ||
+		source.startsWith("\\\\");
+	if (isPathShaped) return true;
+	// A tarball SUFFIX alone is not enough: npm package names may contain dots,
+	// so `foo.tgz` and `@scope/foo.tar.gz` are legal npm specs. Only claim an
+	// archive when the locator is also path- or URL-shaped.
+	return isTarball(source) && /^[a-z][a-z0-9+.-]*:\/\//i.test(source);
 }
 
 /** True only when the source actually resolves to a GJC plugin bundle (root gajae-plugin.json). */

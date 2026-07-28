@@ -105,17 +105,36 @@ describe("Plugin command scope parsing", () => {
 		// CLI surface, in text or JSON mode.
 		const hostile = "https://user:s3cr3t-token@example.invalid/owner/repo.git?auth=abc#frag";
 
-		const install = await runPluginCommand(["install", hostile, "--project"], cwd);
-		const upgrade = await runPluginCommand(["upgrade", "definitely-not-installed", "--project"], cwd);
-		const installJson = await runPluginCommand(["install", hostile, "--project", "--json"], cwd);
+		// Install a real bundle from a source that is then deleted, so `upgrade`
+		// actually reaches the GJC lifecycle and fails re-resolving a stored
+		// locator. Upgrading a name that is not installed would fall through to
+		// the marketplace and never exercise this surface at all.
+		const stagedSource = path.join(cwd, "staged-bundle");
+		await fs.cp(path.join(import.meta.dir, "fixtures/gjc-plugins/valid-six-surface-bundle"), stagedSource, {
+			recursive: true,
+		});
+		const seeded = await runPluginCommand(["install", stagedSource, "--project"], cwd);
+		expect(seeded.exitCode).toBe(0);
+		await fs.rm(stagedSource, { recursive: true, force: true });
 
-		for (const result of [install, upgrade, installJson]) {
+		const install = await runPluginCommand(["install", hostile, "--project"], cwd);
+		const installJson = await runPluginCommand(["install", hostile, "--project", "--json"], cwd);
+		const upgrade = await runPluginCommand(["upgrade", "valid-six-surface-bundle", "--project"], cwd);
+		const upgradeJson = await runPluginCommand(["upgrade", "valid-six-surface-bundle", "--project", "--json"], cwd);
+
+		// The upgrade must reach the lifecycle and report a typed failure, not a
+		// marketplace fallthrough and not an unhandled crash.
+		expect(`${upgrade.stdout}${upgrade.stderr}`).not.toContain("marketplace");
+		expect(`${upgradeJson.stdout}${upgradeJson.stderr}`).toContain("source_unavailable");
+
+		for (const result of [install, installJson, upgrade, upgradeJson]) {
 			const output = `${result.stdout}${result.stderr}`;
 			expect(output).not.toContain("s3cr3t-token");
 			expect(output).not.toContain("user:");
 			expect(output).not.toContain("auth=abc");
 			expect(output).not.toContain("#frag");
 			expect(output).not.toContain(os.homedir());
+			expect(output).not.toContain(stagedSource);
 		}
 	});
 });

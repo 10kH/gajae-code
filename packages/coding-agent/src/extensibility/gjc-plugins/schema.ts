@@ -53,6 +53,24 @@ function requireNonEmptyString(value: unknown, field: string, filePath: string):
 	return value;
 }
 
+/**
+ * A bundle name is echoed by the CLI, rendered in Settings, and used to derive
+ * a directory segment, so it is constrained at the parse boundary rather than
+ * sanitized at every display site. Anything outside this set — control or ANSI
+ * sequences, path separators, whitespace, or credential-looking text — is
+ * rejected before it can ever be stored.
+ */
+function manifestBundleName(value: unknown, manifestPath: string): string {
+	const name = manifestString(value, "name", manifestPath);
+	if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(name)) {
+		throw new GjcPluginLoadError(
+			"invalid_manifest",
+			`GJC plugin name must be 1-128 characters of letters, digits, dot, underscore, or hyphen (${manifestPath})`,
+		);
+	}
+	return name;
+}
+
 function manifestString(value: unknown, field: string, manifestPath: string): string {
 	if (typeof value !== "string" || value.trim().length === 0) {
 		throw new GjcPluginLoadError(
@@ -282,7 +300,7 @@ export function parseManifest(raw: unknown, manifestPath: string): GjcPluginMani
 		);
 	}
 
-	const name = manifestString(raw.name, "name", manifestPath);
+	const name = manifestBundleName(raw.name, manifestPath);
 	const version = manifestString(raw.version, "version", manifestPath);
 
 	return {
