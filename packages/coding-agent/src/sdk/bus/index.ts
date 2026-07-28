@@ -30,7 +30,7 @@ import { promisify } from "node:util";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { ImageContent, TextContent, Tool } from "@gajae-code/ai";
 import { NotificationServer, nativeBuildInfo } from "@gajae-code/natives";
-import { logger, postmortem, VERSION } from "@gajae-code/utils";
+import { $credentialEnv, logger, postmortem, VERSION } from "@gajae-code/utils";
 import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../../config/model-profile-contract";
 import { isAuthenticated, kNoAuth } from "../../config/model-registry";
 import { Settings } from "../../config/settings";
@@ -1160,8 +1160,17 @@ const defaultConfig: NotificationConfig = {
 	btw: { enabled: true },
 };
 
+/**
+ * Whether the notifications control channel is enabled.
+ *
+ * Trusted sources only: enabling it opens the session control/answer channel, so
+ * a repository must not be able to turn it on. `$env` merges the caller's
+ * `cwd/.env` into `process.env`; the sibling resolvers in `config.ts` and
+ * `session-control.ts` already read an injected env record rather than the merged
+ * view, and this direct read was the outlier.
+ */
 export function notificationsEnabled(): boolean {
-	return process.env.GJC_NOTIFICATIONS === "1" || Boolean(process.env.GJC_NOTIFICATIONS_TOKEN);
+	return $credentialEnv("GJC_NOTIFICATIONS") === "1" || Boolean($credentialEnv("GJC_NOTIFICATIONS_TOKEN"));
 }
 
 function streamIntervalMs(): number {
