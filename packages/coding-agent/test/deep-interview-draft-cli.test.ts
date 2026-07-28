@@ -308,7 +308,7 @@ describe("deep-interview drafts", () => {
 				["edit", "--draft-id", id, "--expected-draft-revision", "1", "--op", "remove", "--path", "/question"],
 				cwd,
 			);
-			expect(requiredRemoval.stderr).toContain("DI_DRAFT_INVALID_PATH");
+			expect(requiredRemoval.stderr).toContain("DI_DRAFT_FIELD_REQUIRED");
 		} finally {
 			if (prior === undefined) delete process.env.GJC_DEEP_INTERVIEW_DRAFT_ROOT;
 			else process.env.GJC_DEEP_INTERVIEW_DRAFT_ROOT = prior;

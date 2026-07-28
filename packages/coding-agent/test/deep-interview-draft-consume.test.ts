@@ -578,6 +578,167 @@ describe("CLI-owned deep-interview draft consumption", () => {
 			await env.restore();
 		}
 	});
+	it("lets a round rescore one component without restating the others", async () => {
+		const env = await workspace();
+		try {
+			await kickoff(env.cwd, "partial-scores");
+			const setup = await setSetup(env.cwd, await create(env.cwd, "initialize-context", "partial-scores"));
+			json(await consume(env.cwd, "initialize-context", setup));
+
+			let topology = await create(env.cwd, "confirm-topology", "partial-scores");
+			for (const [index, id] of ["core", "second"].entries()) {
+				topology = await edit(env.cwd, topology.id, topology.draft_revision, "append", "/components");
+				topology = await edit(env.cwd, topology.id, topology.draft_revision, "set", `/components/${index}/id`, id);
+			}
+			topology = await edit(env.cwd, topology.id, topology.draft_revision, "append", "/deferred_components");
+			json(await consume(env.cwd, "confirm-topology", topology));
+
+			const scoreRound = async (round: string, roundId: string, updates: [string, string][]) => {
+				let answer = await create(env.cwd, "record-answer", "partial-scores", [
+					"--round",
+					round,
+					"--question-id",
+					`q${round}`,
+					"--round-id",
+					roundId,
+					"--component-id",
+					"core",
+					"--dimension",
+					"goal",
+				]);
+				answer = await edit(env.cwd, answer.id, answer.draft_revision, "set", "/question", JSON.stringify("Q?"));
+				answer = await edit(env.cwd, answer.id, answer.draft_revision, "append", "/answer/selected_options", "yes");
+				answer = draft(
+					await native(env.cwd, [
+						"draft",
+						"edit",
+						"--draft-id",
+						answer.id,
+						"--expected-draft-revision",
+						String(answer.draft_revision),
+						"--op",
+						"set",
+						"--path",
+						"/answer/custom_input",
+						"--null",
+						"--json",
+					]),
+				);
+				json(await consume(env.cwd, "record-answer", answer));
+
+				let result = await create(env.cwd, "apply-round-result", "partial-scores", [
+					"--round-key",
+					`interview-1::rid:${roundId}`,
+				]);
+				for (const [index, [id]] of updates.entries()) {
+					result = await edit(env.cwd, result.id, result.draft_revision, "append", "/component_updates");
+					result = await edit(
+						env.cwd,
+						result.id,
+						result.draft_revision,
+						"set",
+						`/component_updates/${index}/component_id`,
+						id,
+					);
+				}
+				for (const dimension of ["goal", "constraints", "criteria"]) {
+					const lowest = Math.min(...updates.map(([, score]) => Number(score)));
+					result = await edit(
+						env.cwd,
+						result.id,
+						result.draft_revision,
+						"set",
+						`/global_scores/${dimension}`,
+						String(lowest),
+					);
+					for (const [index, [, score]] of updates.entries())
+						result = await edit(
+							env.cwd,
+							result.id,
+							result.draft_revision,
+							"set",
+							`/component_updates/${index}/scores/${dimension}`,
+							score,
+						);
+				}
+				return result;
+			};
+
+			// Round 1 scores both components.
+			const first = await scoreRound("1", "r1", [
+				["core", "0.5"],
+				["second", "0.5"],
+			]);
+			expect(json(await native(env.cwd, ["draft", "check", "--draft-id", first.id, "--json"]))).toMatchObject({
+				valid: true,
+			});
+			json(await consume(env.cwd, "apply-round-result", first));
+
+			// Round 2 rescores only `core`; `second` keeps its persisted scores.
+			const second = await scoreRound("2", "r2", [["core", "0.5"]]);
+			expect(json(await native(env.cwd, ["draft", "check", "--draft-id", second.id, "--json"]))).toMatchObject({
+				valid: true,
+			});
+			expect(json(await consume(env.cwd, "apply-round-result", second))).toMatchObject({ consumed: true });
+		} finally {
+			await env.restore();
+		}
+	});
+
+	it("names the conflicting setup field instead of forcing field-by-field probing", async () => {
+		const env = await workspace();
+		try {
+			await kickoff(env.cwd, "setup-conflict");
+			// Initialize setup once; those fields then become immutable.
+			const seeded = await setSetup(env.cwd, await create(env.cwd, "initialize-context", "setup-conflict"));
+			json(await consume(env.cwd, "initialize-context", seeded));
+			// A second draft asserting a different type must name `/type`, not fail opaquely.
+			let created = await create(env.cwd, "initialize-context", "setup-conflict");
+			created = await edit(env.cwd, created.id, created.draft_revision, "set", "/type", "brownfield");
+			created = await edit(env.cwd, created.id, created.draft_revision, "set", "/threshold", "0.05");
+			const checked = json(await native(env.cwd, ["draft", "check", "--draft-id", created.id, "--json"]));
+			expect(checked).toMatchObject({ valid: false });
+			const issue = (checked.issues as Record<string, unknown>[])[0];
+			expect(issue).toMatchObject({
+				code: "DI_SETUP_CONFLICT",
+				invariant: "setup_fields_are_immutable",
+				path: "/type",
+				expected: "greenfield",
+				actual: "brownfield",
+			});
+			expect(String(issue.recovery)).toContain("--op remove --path /type");
+
+			// Removing a required field reports that it is required, not an invalid path.
+			const removeRequired = await native(env.cwd, [
+				"draft",
+				"edit",
+				"--draft-id",
+				created.id,
+				"--expected-draft-revision",
+				"latest",
+				"--op",
+				"remove",
+				"--path",
+				"/type",
+				"--json",
+			]);
+			expect(removeRequired.status).not.toBe(0);
+			const removeIssue = (JSON.parse(removeRequired.stderr!) as { issue: Record<string, string> }).issue;
+			expect(removeIssue.code).toBe("DI_DRAFT_FIELD_REQUIRED");
+			expect(removeIssue.message).not.toBe("DI_DRAFT_FIELD_REQUIRED");
+			expect(removeIssue.recovery).toContain("--op set");
+
+			// Applying the named correction makes the same draft valid and consumable.
+			created = draft(await native(env.cwd, ["draft", "show", "--draft-id", created.id, "--json"]));
+			created = await edit(env.cwd, created.id, created.draft_revision, "set", "/type", "greenfield");
+			expect(json(await native(env.cwd, ["draft", "check", "--draft-id", created.id, "--json"]))).toMatchObject({
+				valid: true,
+			});
+		} finally {
+			await env.restore();
+		}
+	});
+
 	it("check dry-runs the exact consume-side state invariants and names the violated invariant", async () => {
 		const env = await workspace();
 		try {

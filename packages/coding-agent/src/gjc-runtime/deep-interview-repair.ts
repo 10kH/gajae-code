@@ -178,6 +178,8 @@ const STATE_INVARIANT_RECOVERY =
  * `/bookkeeping/...`, `/targeting`, `/ontology/...`) is payload-addressable.
  */
 function invariantRecovery(detail: DeepInterviewInvariantDetail): string {
+	if (detail.invariant === "setup_fields_are_immutable")
+		return `State already has ${detail.path}; initialized setup fields cannot be changed. Drop it from the draft (gjc deep-interview draft edit --draft-id <id> --expected-draft-revision latest --op remove --path ${detail.path} --json) or set it to the existing value, then rerun gjc deep-interview draft check --draft-id <id> --json.`;
 	return detail.path.startsWith("/state/") ? STATE_INVARIANT_RECOVERY : PAYLOAD_INVARIANT_RECOVERY;
 }
 function issue(code: string, detail?: DeepInterviewInvariantDetail) {
@@ -954,16 +956,25 @@ function buildMutationTransform(
 				(state.setup as Record<string, unknown>).status === "unresolved";
 			const missing: Record<string, unknown> = {};
 			for (const [key, value] of Object.entries(input)) {
+				// A conflict must name the offending field so the caller can make exactly
+				// one correction instead of probing fields one at a time.
+				const conflict = (): never => {
+					throw new RepairError("DI_SETUP_CONFLICT", 4, {
+						invariant: "setup_fields_are_immutable",
+						path: `/${key}`,
+						expected: state[key],
+						actual: value,
+					});
+				};
 				if (key === "type" && unresolvedSetup) {
 					if (
 						current.trace !== undefined &&
 						canonicalDeepInterviewJson(state.type) !== canonicalDeepInterviewJson(value)
 					)
-						throw new RepairError("DI_SETUP_CONFLICT", 4);
+						conflict();
 					if (canonicalDeepInterviewJson(state.type) !== canonicalDeepInterviewJson(value)) missing[key] = value;
 				} else if (Object.hasOwn(state, key)) {
-					if (canonicalDeepInterviewJson(state[key]) !== canonicalDeepInterviewJson(value))
-						throw new RepairError("DI_SETUP_CONFLICT", 4);
+					if (canonicalDeepInterviewJson(state[key]) !== canonicalDeepInterviewJson(value)) conflict();
 				} else {
 					missing[key] = value;
 				}

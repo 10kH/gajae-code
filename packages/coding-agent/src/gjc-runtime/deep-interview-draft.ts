@@ -97,6 +97,11 @@ const DRAFT_CODE_MESSAGES: Record<string, { message: string; recovery?: string }
 	DI_DRAFT_INVALID_PATH: {
 		message: "The --path pointer does not address a schema-valid location in this draft kind's payload.",
 	},
+	DI_DRAFT_FIELD_REQUIRED: {
+		message: "That payload field is required for this draft kind, so it cannot be removed.",
+		recovery:
+			"Set it to the value the state already holds (gjc deep-interview draft edit --draft-id <id> --expected-draft-revision latest --op set --path <path> --value <existing> --json), or discard the draft and create a fresh one.",
+	},
 	DI_DRAFT_INVALID_VALUE: {
 		message: "The supplied value fails the leaf descriptor (type, enum, range, or byte limit).",
 	},
@@ -651,7 +656,7 @@ async function editPayload(draft: Draft, flags: Map<string, string>): Promise<vo
 			throw new Error("DI_INVALID_ARGUMENT");
 		if (Array.isArray(parent)) parent.splice(index(key, parent.length), 1);
 		else {
-			if (!descriptor.optional) throw new Error("DI_DRAFT_INVALID_PATH");
+			if (!descriptor.optional) throw new Error("DI_DRAFT_FIELD_REQUIRED");
 			delete parent[key];
 		}
 		return;
