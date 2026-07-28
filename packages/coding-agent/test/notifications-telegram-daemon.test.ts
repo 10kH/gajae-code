@@ -13666,7 +13666,7 @@ describe("telegram daemon rich overflow boundary (G006)", () => {
 });
 
 describe("telegram daemon action-needed rich delivery (G004)", () => {
-	function makeAskDaemon(bot: FakeBotApi, rich: { enabled: boolean }, sound?: "all" | "important" | "none") {
+	function makeAskDaemon(bot: FakeBotApi, rich?: { enabled: boolean }, sound?: "all" | "important" | "none") {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const daemon = new TelegramNotificationDaemon({
@@ -13676,22 +13676,29 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 			chatId: "42",
 			botApi: bot as any,
 			WebSocketImpl: FakeWs as any,
-			rich,
+			...(rich ? { rich } : {}),
 			...(sound ? { sound } : {}),
 		});
 		daemon.connectSession("S", "ws://s", "ts");
 		return daemon;
 	}
 
-	test("ask rich success: one sendRichMessage with reply_markup, route registered, callback + free-text reply route", async () => {
+	test("default-on ask rich success preserves multiline payload, keyboard, callback, and free-text routing", async () => {
 		FakeWs.instances = [];
 		const bot = new RichFakeBotApi();
-		const daemon = makeAskDaemon(bot, { enabled: true });
+		const daemon = makeAskDaemon(bot);
+		const question = [
+			"Deep Interview · Round 4 · Ambiguity 39.5%",
+			"Component: 칸반·이슈 관리",
+			"Target: 제약 명확성",
+			"Why now: 동시 수정 규칙이 필요해요.",
+			"동일 이슈의 충돌은 어떻게 처리할까요?",
+		].join("\n");
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "action_needed",
 			kind: "ask",
 			id: "ask",
-			question: "Q",
+			question,
 			options: ["Y", "N"],
 			recommendedIndex: 1,
 		});
@@ -13702,8 +13709,18 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 			signal: expect.any(AbortSignal),
 		});
 		expect(countMethod(bot, "sendMessage")).toBe(0);
-		expect(rich[0]!.body.rich_message.markdown).toContain("Q");
-		expect(rich[0]!.body.rich_message.markdown).toContain("2. N (Recommended)");
+		expect(rich[0]!.body.rich_message.markdown).toBe(
+			[
+				"❓ **Deep Interview · Round 4 · Ambiguity 39.5%**  ",
+				"**Component: 칸반·이슈 관리**  ",
+				"**Target: 제약 명확성**  ",
+				"**Why now: 동시 수정 규칙이 필요해요.**  ",
+				"**동일 이슈의 충돌은 어떻게 처리할까요?**",
+				"",
+				"1. Y",
+				"2. N (Recommended)",
+			].join("\n"),
+		);
 		expect(rich[0]!.body.reply_markup.inline_keyboard.flat().map((button: { text: string }) => button.text)).toEqual([
 			"1",
 			"2",

@@ -209,7 +209,12 @@ export function buildActionMarkdown(action: {
 	if (action.kind === "idle") {
 		return action.summary ? `🟢 Agent idle\n${action.summary}` : "🟢 Agent idle";
 	}
-	const heading = `❓ **${action.question ?? "Question"}**`;
+	const question = (action.question ?? "Question")
+		.split(/\r\n|\r|\n/)
+		.map(line => line.trimEnd())
+		.map(line => (line ? `**${line}**` : ""))
+		.join("  \n");
+	const heading = `❓ ${question}`;
 	const options = action.options ?? [];
 	const displayOptions = withRecommendedOptionLabel(options, action.recommendedIndex);
 	if (options.length === 0) return `${heading}\n\n(reply with text)`;
