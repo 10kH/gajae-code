@@ -1280,6 +1280,8 @@ export class SelectorController {
 						availableThemes,
 						availableModelProfiles: [...this.ctx.session.modelRegistry.getModelProfiles().keys()],
 						cwd: getProjectDir(),
+						gjcRuntimeSnapshot: this.ctx.session.gjcRuntimeSnapshot,
+						gjcActivationGeneration: this.ctx.session.gjcActivationGeneration,
 					},
 					{
 						onChange: (id, value) => this.handleSettingChange(id, value),
