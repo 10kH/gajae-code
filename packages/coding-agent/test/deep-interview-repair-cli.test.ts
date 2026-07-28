@@ -1411,7 +1411,7 @@ describe("deep-interview typed repair CLI", () => {
 					code: "DI_STATE_SCHEMA_INVALID",
 					message: "envelope_schema_invalid violated at /state/threshold_units",
 					recovery:
-						"The violated invariant is in persisted state. Run gjc deep-interview sanity-check --json and inspect the reported state path; never edit .gjc state files directly.",
+						"The violated invariant is in persisted state. Run gjc deep-interview sanity-check --session-id malformed-native-draft --json and inspect the reported state path; never edit .gjc state files directly.",
 					invariant: "envelope_schema_invalid",
 					path: "/state/threshold_units",
 					expected: 500,

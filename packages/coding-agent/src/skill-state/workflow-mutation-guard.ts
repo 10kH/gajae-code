@@ -53,7 +53,10 @@ const BASH_MUTATION_COMMAND_RE =
 	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:(?:command|exec)\s+)?(?:[^\s;&|]*\/)?['"]?(?:tee|touch|rm|mkdir|cp|mv|install|truncate)['"]?\b([^;&|\n]*)|(?:^|[^<>])(?:>>?|\d>>?)\s*([^\s;&|]+)/gi;
 const BASH_IN_PLACE_MUTATION_COMMAND_RE = /(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:sed|perl)\b([^;&|\n]*)/gi;
 /** Literal filesystem targets passed to common interpreter write APIs. */
-const BASH_INTERPRETER_FILE_TARGET_RE = /(?:Bun\.write|open|writeFile(?:Sync)?)\s*\(\s*["']([^"']+)["']/gi;
+const BASH_INTERPRETER_FILE_TARGET_RE = /(?:open|writeFile(?:Sync)?)\s*\(\s*["']([^"']+)["']/gi;
+const BASH_BUN_WRITE_CALL_RE = /\bBun\.write\s*\(/g;
+const BASH_BUN_WRITE_STRING_TARGET_RE = /\bBun\.write\s*\(\s*["']([^"']+)["']/g;
+const BASH_BUN_WRITE_TEMPLATE_TARGET_RE = /\bBun\.write\s*\(\s*`([^`$\\]*)`/g;
 const BASH_DD_OUTPUT_RE = /(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|]*\/)?dd\b([^;&|\n]*)/gi;
 /** `sort -o <file>` / `sort --output=<file>` writes the named file without any shell redirection. */
 const BASH_SORT_OUTPUT_RE =
@@ -544,6 +547,20 @@ function extractBashTargets(args: unknown): ExtractedTargets {
 	// workflow-sanctioned CLI is never blocked as unknown-target (#guard-vs-cli conflict).
 	if (isPureGjcReadOnlyBashCommand(command)) {
 		return targets;
+	}
+	const bunWriteCallCount = [...command.matchAll(BASH_BUN_WRITE_CALL_RE)].length;
+	let classifiedBunWriteCount = 0;
+	for (const matcher of [BASH_BUN_WRITE_STRING_TARGET_RE, BASH_BUN_WRITE_TEMPLATE_TARGET_RE]) {
+		for (const match of command.matchAll(matcher)) {
+			targets.explicitMutation = true;
+			classifiedBunWriteCount++;
+			const target = match[1]?.trim();
+			if (target && !isDeviceSinkPath(target)) addPath(targets, target);
+		}
+	}
+	if (classifiedBunWriteCount < bunWriteCallCount) {
+		targets.explicitMutation = true;
+		targets.unknown = true;
 	}
 	for (const match of command.matchAll(BASH_INTERPRETER_FILE_TARGET_RE)) {
 		targets.explicitMutation = true;
