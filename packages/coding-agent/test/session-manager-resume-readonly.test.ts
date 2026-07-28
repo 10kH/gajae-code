@@ -20,7 +20,13 @@ import {
 	type SessionStorageWriter,
 } from "@gajae-code/coding-agent/session/session-storage";
 import * as native from "@gajae-code/natives";
-import { getAgentDir, getResidentCacheRootDir, getSessionsDir, getTerminalSessionsDir, setAgentDir } from "@gajae-code/utils";
+import {
+	getAgentDir,
+	getResidentCacheRootDir,
+	getSessionsDir,
+	getTerminalSessionsDir,
+	setAgentDir,
+} from "@gajae-code/utils";
 import { resolveManagedScope } from "../src/session/internal/managed-session-scope";
 import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 
