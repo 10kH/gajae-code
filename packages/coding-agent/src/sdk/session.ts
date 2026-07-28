@@ -2260,10 +2260,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				logger.warn("Failed to render GJC plugin system appendices", { error });
 			}
 
-			// Sole publication point for GJC bundle runtime evidence. Appendix
-			// rendering is the last producer, so only here is the generation
-			// complete. A partial pass publishes nothing: consumers must see
-			// `unavailable` rather than a half-generation that looks clear.
+			// Publication point for GJC bundle runtime evidence. Appendix rendering
+			// is the last producer, so only here is the generation complete.
+			//
+			// This callback is reused for later prompt/tool/model rebuilds, so a
+			// republish must never leave a stale snapshot readable: invalidate
+			// first, then publish only a complete pass. A partial pass therefore
+			// resolves to `unavailable` instead of the previous generation.
+			gjcRuntimeStore.invalidate();
 			if (gjcProducersComplete) gjcRuntimeStore.publish(gjcFindings.snapshot());
 			const defaultPrompt = await buildSystemPromptInternal({
 				cwd,

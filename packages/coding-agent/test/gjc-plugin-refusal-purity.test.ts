@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -37,9 +38,10 @@ async function mkProjectCwd(): Promise<string> {
 }
 
 /**
- * Existence- and metadata-sensitive snapshot. A plain entry listing cannot
- * distinguish a missing root from an empty one, and acquiring a scope lock
- * creates the root and mutates its mtime without changing the entry list.
+ * Byte- and metadata-sensitive snapshot. A plain entry listing cannot
+ * distinguish a missing root from an empty one, acquiring a scope lock mutates
+ * the root's mtime without changing the entry list, and a same-size rewrite
+ * would be invisible without hashing file contents.
  */
 async function treeOf(root: string): Promise<string> {
 	try {
@@ -48,8 +50,14 @@ async function treeOf(root: string): Promise<string> {
 		const rows = await Promise.all(
 			entries.map(async entry => {
 				const full = path.join(entry.parentPath ?? root, entry.name);
-				const child = await fs.stat(full);
-				return `${path.relative(root, full)}:${child.isDirectory() ? "d" : "f"}:${child.size}`;
+				const child = await fs.lstat(full);
+				const kind = child.isDirectory() ? "d" : child.isSymbolicLink() ? "l" : "f";
+				const digest = child.isFile()
+					? createHash("sha256")
+							.update(await fs.readFile(full))
+							.digest("hex")
+					: "";
+				return `${path.relative(root, full)}:${kind}:${child.size}:${child.mtimeMs}:${digest}`;
 			}),
 		);
 		return `present:${stat.mtimeMs}:${rows.sort().join("|")}`;
@@ -121,6 +129,34 @@ describe("GJC bundle refusal purity", () => {
 		const refused = await installGjcBundle({ cwd }, "project", broken);
 		expect(refused).toMatchObject({ ok: false, error: { code: "already_installed_use_upgrade" } });
 		expect(await treeOf(scopeRoot)).toBe(before);
+	});
+
+	test("a refused install does not require the original source to still exist", async () => {
+		const cwd = await mkProjectCwd();
+		// Install from a COPY, then delete it. The bundle is installed, but its
+		// source is gone: refusal must still be create-only, not a resolve error.
+		const copy = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-refusal-gone-"));
+		tempDirs.push(copy);
+		await fs.cp(sixSurface, copy, { recursive: true });
+		expect((await installGjcBundle({ cwd }, "project", copy)).ok).toBe(true);
+		const scopeRoot = path.join(cwd, ".gjc", "gjc-plugins");
+		const before = await treeOf(scopeRoot);
+
+		await fs.rm(copy, { recursive: true, force: true });
+
+		const refused = await installGjcBundle({ cwd }, "project", copy);
+		expect(refused).toMatchObject({ ok: false, error: { code: "already_installed_use_upgrade" } });
+		expect(await treeOf(scopeRoot)).toBe(before);
+	});
+
+	test("an unreachable remote locator matching no installed entry is not silently refused", async () => {
+		const cwd = await mkProjectCwd();
+		expect((await installGjcBundle({ cwd }, "project", sixSurface)).ok).toBe(true);
+		// A remote locator that names no installed bundle must NOT be swallowed by
+		// the preflight; it has to reach resolution and fail there instead.
+		await expect(
+			installGjcBundle({ cwd }, "project", "https://example.invalid/nobody/nothing.git"),
+		).rejects.toThrow();
 	});
 
 	test("a git ref is preserved when rebuilding the stored locator", () => {

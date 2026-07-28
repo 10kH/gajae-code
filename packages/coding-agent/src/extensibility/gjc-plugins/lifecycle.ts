@@ -1,3 +1,4 @@
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type GjcBundleTransactionDecision, resolveGjcBundleCandidate, runGjcBundleTransaction } from "./installer";
@@ -236,6 +237,17 @@ function alreadyInstalled(name: string, scope: GjcPluginScope): GjcLifecycleErro
 	);
 }
 
+/**
+ * True only for strings that name a local directory rather than a remote
+ * locator. A scheme-qualified or scp-style source must never be treated as a
+ * relative path, or a local directory could shadow it.
+ */
+function isLocalDirectorySource(source: string): boolean {
+	if (/^[a-z][a-z0-9+.-]*:\/\//i.test(source)) return false;
+	if (/^[^@/\s]+@[^:/\s]+:/.test(source)) return false;
+	return true;
+}
+
 /** Largest manifest this preflight will read before giving up. */
 const PREFLIGHT_MANIFEST_MAX_BYTES = 64 * 1024;
 
@@ -251,20 +263,30 @@ const PREFLIGHT_MANIFEST_MAX_BYTES = 64 * 1024;
  * re-derives the identity from the compiled bundle.
  */
 async function declaredBundleName(source: string): Promise<string | undefined> {
+	// Classify the locator BEFORE touching the filesystem. On POSIX a remote
+	// locator like `https://host/repo` is also a valid relative path
+	// (`https:/host/repo`), so statting first would let a locally created
+	// directory shadow a remote source and refuse an install that should have
+	// resolved remotely.
+	if (!isLocalDirectorySource(source)) return undefined;
+	let handle: fs.FileHandle | undefined;
 	try {
-		// Only a real local directory qualifies. A remote locator must not be
-		// coerced into a relative path where a local file could shadow it.
 		const dir = await fs.stat(source);
 		if (!dir.isDirectory()) return undefined;
 		const manifestPath = path.join(source, GJC_PLUGIN_MANIFEST_FILENAME);
-		// Reject symlinks: following one escapes the source tree.
-		const manifest = await fs.lstat(manifestPath);
+		// Open without following a final symlink, then stat the OPEN handle so a
+		// concurrent rename cannot swap in a symlink or an oversized file between
+		// the check and the read.
+		handle = await fs.open(manifestPath, nodeFs.constants.O_RDONLY | nodeFs.constants.O_NOFOLLOW);
+		const manifest = await handle.stat();
 		if (!manifest.isFile() || manifest.size > PREFLIGHT_MANIFEST_MAX_BYTES) return undefined;
-		const parsed: unknown = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+		const parsed: unknown = JSON.parse(await handle.readFile("utf8"));
 		const name = (parsed as { name?: unknown }).name;
 		return typeof name === "string" && name.length > 0 ? name : undefined;
 	} catch {
 		return undefined;
+	} finally {
+		await handle?.close().catch(() => {});
 	}
 }
 
@@ -279,15 +301,16 @@ export async function installGjcBundle(
 	source: string,
 ): Promise<GjcLifecycleResult<GjcInstallResult>> {
 	// A create-only refusal must not depend on the source being reachable, so
-	// resolve the identity from a path source before touching the network or
-	// the filesystem. Non-path sources still refuse inside the transaction,
-	// which preflights before acquiring any lock.
+	// identify the target before resolving anything. Two locators can do that:
+	// a local directory declares its name in the manifest, and any source that
+	// exactly matches an installed entry's stored locator names that entry.
+	// Otherwise the transaction's own pre-lock preflight refuses after resolve.
+	const registry = await readRegistry(scope, ctx.cwd);
 	const declared = await declaredBundleName(source);
-	if (declared) {
-		const registry = await readRegistry(scope, ctx.cwd);
-		const existing = registry.plugins.find(p => p.name === declared);
-		if (existing) return { ok: false, error: alreadyInstalled(existing.name, scope) };
-	}
+	const existing = declared
+		? registry.plugins.find(p => p.name === declared)
+		: registry.plugins.find(p => storedSourceLocator(p.source) === source || p.source.uri === source);
+	if (existing) return { ok: false, error: alreadyInstalled(existing.name, scope) };
 
 	const result = await runGjcBundleTransaction(source, {
 		scope,

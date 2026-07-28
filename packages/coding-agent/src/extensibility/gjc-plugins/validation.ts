@@ -7,7 +7,6 @@ import {
 	GJC_SUBSKILL_PARENT_SKILLS,
 	GjcPluginLoadError,
 	type GjcPluginRegistryEntry,
-	type GjcPluginScope,
 	type GjcSubskillParentAgent,
 	type LoadedSubskillBinding,
 	type NormalizedGjcPluginBundle,
