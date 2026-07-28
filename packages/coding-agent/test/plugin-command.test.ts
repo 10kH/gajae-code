@@ -88,6 +88,14 @@ describe("Plugin command scope parsing", () => {
 		// Safe summaries never expose the raw source locator or the install path.
 		expect(jsonList.stdout).not.toContain("pluginRoot");
 		expect(jsonList.stdout).not.toContain("copiedFiles");
+		// Assert on the `gjc` envelope specifically. The sibling `npm` and
+		// `marketplace` arrays are pre-existing surfaces owned elsewhere, so a
+		// whole-document scan would conflate their behavior with this one.
+		const listed = JSON.parse(jsonList.stdout) as { gjc?: unknown[] };
+		const gjcJson = JSON.stringify(listed.gjc ?? []);
+		expect(gjcJson).not.toContain("manifestPath");
+		expect(gjcJson).not.toContain(os.homedir());
+		expect(gjcJson).not.toMatch(/"uri"\s*:/);
 	});
 
 	it("GJC install and upgrade failures never echo the source or its cause", async () => {
