@@ -64,11 +64,33 @@ describe("GJC plugin scope-qualified identities", () => {
 		expect(result.active).toEqual([projectFoo]);
 	});
 
-	test("scope-aware installation validation retains opposite-scope same-name peers", () => {
+	test("install validation keeps the supported dual-scope same-name install legal", () => {
 		const tool = { extensionId: "tool:shared", name: "shared", relativePath: "tool.ts", sha256: "c".repeat(64) };
+		// Surface IDs derive from the bundle name, so the SAME bundle installed
+		// into both scopes necessarily shares them. Production passes only the
+		// target scope's registry, so this must not be an install-time collision;
+		// otherwise the supported dual-scope install would be self-colliding.
+		expect(() => validateInstallPlan(bundle("foo", { tools: [tool] }), [])).not.toThrow();
+
+		// The opt-in scope-aware form exists for callers that genuinely need a
+		// cross-scope universe, and there it is a collision.
 		expect(() =>
 			validateInstallPlan(bundle("foo", { tools: [tool] }), [entry("user", "foo", { tools: [tool] })], "project"),
 		).toThrow(GjcPluginLoadError);
+	});
+
+	test("runtime fail-closes on a cross-scope collision install validation allows", () => {
+		// This is the real defense for dual-scope same-name bundles: install-time
+		// validation is per-scope, and the session validator sees both scopes and
+		// quarantines the collision rather than letting two bundles shadow.
+		const tool = { extensionId: "tool:shared", name: "shared", relativePath: "tool.ts", sha256: "c".repeat(64) };
+		const result = validateSessionBundles([
+			entry("user", "foo", { tools: [tool] }),
+			entry("project", "foo", { tools: [tool] }),
+		]);
+		expect(result.active).toHaveLength(1);
+		expect(result.quarantine).toHaveLength(1);
+		expect(result.quarantine[0]).toMatchObject({ code: "session_collision", surfaceId: "tool:shared" });
 	});
 
 	test("recomputes candidate quarantine while retaining enablement intent", () => {
