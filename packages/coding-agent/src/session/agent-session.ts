@@ -242,6 +242,7 @@ import {
 	resolveSubskillActivationForSkillInvocation,
 } from "../extensibility/gjc-plugins";
 import { resolveCurrentPhaseForParent } from "../extensibility/gjc-plugins/injection";
+import type { GjcRuntimeSnapshotProvider } from "../extensibility/gjc-plugins/runtime-quarantine";
 import { readActiveSubskillsForParent, toActiveSubskillEntry } from "../extensibility/gjc-plugins/state";
 import { loadActiveSubskillTools } from "../extensibility/gjc-plugins/tools";
 import type { HookCommandContext } from "../extensibility/hooks/types";
@@ -10613,6 +10614,16 @@ export class AgentSession {
 		if (!this.model) return [];
 		return getSupportedEfforts(this.model);
 	}
+
+	/**
+	 * Runtime evidence published for the current GJC bundle activation
+	 * generation, set once by `createAgentSession` after every producer has run.
+	 * Undefined until that publication happens, so consumers report runtime
+	 * status as unavailable rather than falsely clear.
+	 */
+	gjcRuntimeSnapshot?: GjcRuntimeSnapshotProvider;
+	/** Activation generation a published snapshot must match to be merged. */
+	gjcActivationGeneration?: number;
 
 	// =========================================================================
 	// Message Queue Mode Management

@@ -1,8 +1,9 @@
 /**
  * Centralized path helpers for gajae-code config directories.
  *
- * Uses PI_CONFIG_DIR (default ".gjc") for the config root and
- * PI_CODING_AGENT_DIR to override the agent directory.
+ * Uses GJC_CONFIG_DIR (legacy alias PI_CONFIG_DIR, default ".gjc") for the
+ * config root and GJC_CODING_AGENT_DIR (legacy alias PI_CODING_AGENT_DIR) to
+ * override the agent directory.
  *
  * On Linux, if XDG_DATA_HOME / XDG_STATE_HOME / XDG_CACHE_HOME environment
  * variables are set, paths are redirected to XDG-compliant locations under
@@ -148,6 +149,26 @@ export function setProjectDir(dir: string): void {
 	process.chdir(projectDir);
 }
 
+/**
+ * Reject a configured config-directory name that would escape the home-relative
+ * root it is documented to stay under.
+ *
+ * The configured value names a directory beneath `<home>` — the discovery docs
+ * state that "even an absolute-looking configured name is joined beneath
+ * `<home>`", which `path.join` delivers for a leading separator but not for
+ * `..` segments. Consumers join this name with `<home>` (and with project
+ * ancestors) to locate user-level `mcp.json`, `SYSTEM.md`, skills, agents and
+ * installed plugins, so a `..` segment would point that discovery at a
+ * directory outside the config root entirely. Fall back to the default name
+ * instead of honoring an escaping value.
+ */
+function sanitizeConfigDirName(value: string | undefined): string | undefined {
+	const trimmed = value?.trim();
+	if (!trimmed) return undefined;
+	if (path.normalize(trimmed).split(/[\\/]/).includes("..")) return undefined;
+	return trimmed;
+}
+
 /** Get the config directory name relative to home (e.g. ".gjc" or PI_CONFIG_DIR override). */
 /**
  * Config-directory name, rejected when it comes from the caller's project `.env`.
@@ -171,7 +192,14 @@ function trustedConfigDirName(name: "GJC_CONFIG_DIR" | "PI_CONFIG_DIR"): string 
 }
 
 export function getConfigDirName(): string {
-	return trustedConfigDirName("GJC_CONFIG_DIR") ?? trustedConfigDirName("PI_CONFIG_DIR") ?? CONFIG_DIR_NAME;
+	// Both guards apply: the value must come from a trusted source (not the
+	// caller's project `.env`), and it must still be a single name that stays
+	// beneath home once joined.
+	return (
+		sanitizeConfigDirName(trustedConfigDirName("GJC_CONFIG_DIR")) ??
+		sanitizeConfigDirName(trustedConfigDirName("PI_CONFIG_DIR")) ??
+		CONFIG_DIR_NAME
+	);
 }
 
 /** Get the config agent directory name relative to home (e.g. ".gjc/agent" or PI_CONFIG_DIR + "/agent"). */
@@ -286,12 +314,24 @@ class DirResolver {
  * happens to carry the identical value loses the override, which is the same
  * trade-off `resolveLiveCredentialEnvValue` already makes.
  */
-function trustedAgentDirOverride(): string | undefined {
-	const value = process.env.GJC_CODING_AGENT_DIR;
+function trustedAgentDirOverrideFor(name: "GJC_CODING_AGENT_DIR" | "PI_CODING_AGENT_DIR"): string | undefined {
+	const value = process.env[name];
 	if (!value) return undefined;
-	const projectValue = parseEnvFile(path.join(process.cwd(), ".env")).GJC_CODING_AGENT_DIR;
-	if (projectValue !== undefined && projectValue === value) return undefined;
+	if (parseEnvFile(path.join(process.cwd(), ".env"))[name] === value) return undefined;
 	return value;
+}
+
+/**
+ * Both spellings are honoured, mirroring `getConfigDirName`.
+ *
+ * `PI_CODING_AGENT_DIR` is the legacy alias this module's own header documents,
+ * and parts of the product already resolve it (`gc-runtime.ts:370`,
+ * `deep-interview-runtime.ts:384`). Reading only the `GJC_` spelling here split
+ * the agent directory in two: `gjc gc` operated on the aliased directory while
+ * everything reaching `getAgentDir()` stayed on the default.
+ */
+function trustedAgentDirOverride(): string | undefined {
+	return trustedAgentDirOverrideFor("GJC_CODING_AGENT_DIR") ?? trustedAgentDirOverrideFor("PI_CODING_AGENT_DIR");
 }
 
 let dirs = new DirResolver(trustedAgentDirOverride());
