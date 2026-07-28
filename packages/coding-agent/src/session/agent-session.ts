@@ -2574,7 +2574,24 @@ export class AgentSession {
 
 	/** Advance the tool-choice queue and return the next directive for the upcoming LLM call. */
 	nextToolChoice(): ToolChoice | undefined {
-		return this.#toolChoiceQueue.nextToolChoice();
+		const choice = this.#toolChoiceQueue.nextToolChoice();
+		if (!choice || typeof choice === "string") return choice;
+
+		const toolName = choice.type === "tool" ? choice.name : "function" in choice ? choice.function.name : choice.name;
+		const activeTool = this.agent.state.tools.find(
+			tool => tool.name === toolName || tool.customWireName === toolName,
+		);
+		if (!activeTool) {
+			this.#toolChoiceQueue.degradeInFlight(`Tool "${toolName}" is no longer active.`);
+			return undefined;
+		}
+
+		const refreshed = buildNamedToolChoiceResult(activeTool.name, this.model);
+		if (!refreshed.exactNamed || !refreshed.choice) {
+			this.#toolChoiceQueue.degradeInFlight(refreshed.resolved?.reason ?? "Named tool choice is unavailable.");
+			return undefined;
+		}
+		return refreshed.choice;
 	}
 
 	/**
