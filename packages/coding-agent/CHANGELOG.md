@@ -4,6 +4,7 @@
 - Ralplan supports opt-in automatic handoff to ultragoal or team through a durable runtime-owned final receipt, with read-only team preflight and PLANNING-STUCK dominance.
 - Subagent setup failures now retain a bounded, redacted cause through live progress, async snapshots, inspect/await, and terminal receipts instead of reporting an empty generic failure.
 - Telegram notification sound can be set to all, important, or none; the reference CLI exposes this with `--sound <all|important|none>`, defaulting to all. Important (ask/idle only) and none are explicit opt-ins for quieter notifications.
+- First-event provider timeouts are configurable and replayed only by AgentSession with a bounded attempt budget, progress-aware safety checks, and measured exhaustion details.
 
 ### Resume fixes
 

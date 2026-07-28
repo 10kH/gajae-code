@@ -237,6 +237,8 @@ export interface AgentOptions {
 	requestMaxRetries?: number;
 	/** Provider stream replay retry budget. Counts retries, not the initial attempt. */
 	streamMaxRetries?: number;
+	/** Explicit first-event stream watchdog override in milliseconds. Set to 0 to disable. */
+	streamFirstEventTimeoutMs?: number;
 
 	/**
 	 * Provides tool execution context, resolved per tool call.
@@ -356,6 +358,7 @@ export class Agent {
 	#maxRetryDelayMs?: number;
 	#requestMaxRetries?: number;
 	#streamMaxRetries?: number;
+	#streamFirstEventTimeoutMs?: number;
 	#getToolContext?: (toolCall?: ToolCallContext) => AgentToolContext | undefined;
 	#cursorExecHandlers?: CursorExecHandlers;
 	#cursorOnToolResult?: CursorToolResultHandler;
@@ -430,6 +433,7 @@ export class Agent {
 		this.#maxRetryDelayMs = opts.maxRetryDelayMs;
 		this.#requestMaxRetries = opts.requestMaxRetries;
 		this.#streamMaxRetries = opts.streamMaxRetries;
+		this.#streamFirstEventTimeoutMs = opts.streamFirstEventTimeoutMs;
 		this.getApiKey = opts.getApiKey;
 		this.getAuthCredentialType = opts.getAuthCredentialType;
 		this.#onPayload = opts.onPayload;
@@ -673,6 +677,14 @@ export class Agent {
 
 	set streamMaxRetries(value: number | undefined) {
 		this.#streamMaxRetries = value;
+	}
+
+	get streamFirstEventTimeoutMs(): number | undefined {
+		return this.#streamFirstEventTimeoutMs;
+	}
+
+	set streamFirstEventTimeoutMs(value: number | undefined) {
+		this.#streamFirstEventTimeoutMs = value;
 	}
 
 	get state(): AgentState {
@@ -1444,6 +1456,7 @@ export class Agent {
 			maxRetryDelayMs: this.#maxRetryDelayMs,
 			requestMaxRetries: this.#requestMaxRetries,
 			streamMaxRetries: this.#streamMaxRetries,
+			streamFirstEventTimeoutMs: this.#streamFirstEventTimeoutMs,
 			...(fallbackManaged
 				? {
 						fallbackManaged: true,

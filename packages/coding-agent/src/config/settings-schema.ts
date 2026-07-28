@@ -1263,6 +1263,16 @@ export const SETTINGS_SCHEMA = {
 				"Maximum provider stream replay retries for replay-safe transient stream failures. Counts retries, not the first attempt. Set to 0 to disable provider stream retries.",
 		},
 	},
+	"retry.streamFirstEventTimeoutMs": {
+		type: "number",
+		default: 100_000,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+		ui: {
+			tab: "model",
+			label: "First Event Timeout",
+			description: "Maximum wait for the first provider stream event, in ms. Set to 0 to disable the watchdog.",
+		},
+	},
 	"retry.fallbackChains": { type: "record", default: {} as Record<string, string[]> },
 	"retry.fallbackRevertPolicy": {
 		type: "enum",
@@ -3849,6 +3859,7 @@ export interface RetrySettings {
 	maxDelayMs: number;
 	requestMaxRetries: number;
 	streamMaxRetries: number;
+	streamFirstEventTimeoutMs: number;
 }
 
 export interface MemoriesSettings {
