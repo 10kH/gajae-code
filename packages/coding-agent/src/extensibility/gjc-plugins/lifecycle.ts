@@ -238,13 +238,20 @@ function alreadyInstalled(name: string, scope: GjcPluginScope): GjcLifecycleErro
 }
 
 /**
- * True only for strings that name a local directory rather than a remote
- * locator. A scheme-qualified or scp-style source must never be treated as a
- * relative path, or a local directory could shadow it.
+ * True only for strings the installer would treat as a local path rather than
+ * a remote locator. This deliberately mirrors the installer's own `looksLikeGit`
+ * predicate: if the two ever disagreed, a remote locator could be read as a
+ * relative path and shadowed by a local directory of the same shape.
  */
 function isLocalDirectorySource(source: string): boolean {
+	if (/^(https?|ssh|git):\/\//i.test(source)) return false;
+	if (/^git@/.test(source)) return false;
+	if (source.startsWith("git:")) return false;
+	// Any other scheme-qualified locator is likewise not a local directory.
 	if (/^[a-z][a-z0-9+.-]*:\/\//i.test(source)) return false;
+	// scp-style `user@host:path` and bare `host:port/path` forms are remote.
 	if (/^[^@/\s]+@[^:/\s]+:/.test(source)) return false;
+	if (/^[^/\s:]+:\d+\//.test(source)) return false;
 	return true;
 }
 
