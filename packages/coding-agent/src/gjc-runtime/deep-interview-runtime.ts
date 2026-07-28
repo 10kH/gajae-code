@@ -6,6 +6,7 @@ import { YAML } from "bun";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
+import { isDeepInterviewStageVerb, runDeepInterviewStageCommand } from "./deep-interview-stage";
 import {
 	assertDeepInterviewInputWithinLimit,
 	assertDeepInterviewIntentReview,
@@ -891,6 +892,8 @@ export async function runNativeDeepInterviewCommand(
 	cwd = process.cwd(),
 ): Promise<DeepInterviewCommandResult> {
 	try {
+		const [firstArg, ...restArgs] = args;
+		if (isDeepInterviewStageVerb(firstArg)) return await runDeepInterviewStageCommand(firstArg, restArgs, cwd);
 		if (isDeepInterviewSpecWriteInvocation(args)) return await handleSpecWrite(args, cwd);
 		const resolved = await resolveDeepInterviewArgs(args, cwd);
 		if (!resolved.idea) {

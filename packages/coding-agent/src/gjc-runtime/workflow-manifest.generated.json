@@ -256,10 +256,36 @@
       },
       {
         "appliesToVerbs": [
-          "write-spec"
+          "write-spec",
+          "stage",
+          "check",
+          "apply",
+          "discard"
         ],
         "name": "json",
         "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "stage"
+        ],
+        "name": "input",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "stage"
+        ],
+        "enumValues": [
+          "initialize-context",
+          "record-round",
+          "update-facts",
+          "merge-state"
+        ],
+        "name": "for",
+        "required": true,
+        "type": "enum"
       },
       {
         "name": "args",
@@ -304,6 +330,22 @@
       {
         "name": "write-spec",
         "surface": "command-flag"
+      },
+      {
+        "name": "stage",
+        "surface": "command-positional"
+      },
+      {
+        "name": "check",
+        "surface": "command-positional"
+      },
+      {
+        "name": "apply",
+        "surface": "command-positional"
+      },
+      {
+        "name": "discard",
+        "surface": "command-positional"
       },
       {
         "name": "graph",
