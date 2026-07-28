@@ -1,6 +1,7 @@
 /**
  * TypeScript is the authoritative source of truth for GJC workflow manifests.
- * Keep the checked-in JSON projection synchronized manually with this module.
+ * Any JSON manifest projection is derived from this module and must never be
+ * hand-edited.
  */
 
 import { CANONICAL_GJC_WORKFLOW_SKILLS, type CanonicalGjcWorkflowSkill } from "../skill-state/canonical-skills";
@@ -22,9 +23,7 @@ export interface WorkflowVerb {
 	name: string;
 	planned?: boolean;
 	/** Invocation surface that exposes this verb in the real CLI parser. */
-	surface?: "state-action" | "command-positional" | "command-flag" | "draft-action";
-	/** Legacy surface retained for callers that have not migrated to normal typed commands. */
-	compatibilityOnly?: boolean;
+	surface?: "state-action" | "command-positional" | "command-flag";
 }
 
 export interface TypedArgSpec {
@@ -33,7 +32,6 @@ export interface TypedArgSpec {
 	enumValues?: string[];
 	required?: boolean;
 	appliesToVerbs?: string[];
-	compatibilityOnly?: boolean;
 	planned?: boolean;
 }
 
@@ -94,9 +92,6 @@ function stateVerbs(): WorkflowVerb[] {
 
 function positionalVerbs(names: readonly string[]): WorkflowVerb[] {
 	return names.map(name => verb(name, "command-positional"));
-}
-function draftVerbs(names: readonly string[]): WorkflowVerb[] {
-	return names.map(name => verb(name, "draft-action"));
 }
 
 function flagVerbs(names: readonly string[]): WorkflowVerb[] {
@@ -168,15 +163,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 		verbs: [
 			...stateVerbs(),
 			...flagVerbs(["kickoff", "write-spec"]),
-			...draftVerbs(["draft create", "draft edit", "draft show", "draft check", "draft rebase", "draft discard"]),
-			...positionalVerbs([
-				"initialize-context",
-				"confirm-topology",
-				"record-answer",
-				"apply-round-result",
-				"inspect",
-				"sanity-check",
-			]),
+			...positionalVerbs(["stage", "check", "apply", "discard"]),
 			...plannedVerbs(PLANNED_ADMIN_VERBS),
 		],
 		typedArgs: [
@@ -185,179 +172,20 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{ name: "deep", type: "boolean", appliesToVerbs: ["kickoff"] },
 			{ name: "threshold", type: "number", appliesToVerbs: ["kickoff"] },
 			{ name: "threshold-source", type: "string", appliesToVerbs: ["kickoff"] },
-			{ name: "trace", type: "boolean", appliesToVerbs: ["kickoff"] },
-			{ name: "json", type: "boolean", appliesToVerbs: ["kickoff", "write-spec"] },
 			{ name: "stage", type: "enum", enumValues: ["final"], appliesToVerbs: ["write-spec"] },
 			{ name: "slug", type: "string", appliesToVerbs: ["write-spec"] },
 			{ name: "spec", type: "string", required: true, appliesToVerbs: ["write-spec"] },
 			{ name: "handoff", type: "enum", enumValues: ["ralplan"], appliesToVerbs: ["write-spec"] },
 			{ name: "deliberate", type: "boolean", appliesToVerbs: ["write-spec"] },
-			{
-				name: "session-id",
-				type: "string",
-				appliesToVerbs: ["draft create"],
-			},
+			{ name: "json", type: "boolean", appliesToVerbs: ["write-spec", "stage", "check", "apply", "discard"] },
+			{ name: "input", type: "string", required: true, appliesToVerbs: ["stage"] },
 			{
 				name: "for",
 				type: "enum",
-				enumValues: ["initialize-context", "confirm-topology", "record-answer", "apply-round-result"],
+				enumValues: ["initialize-context", "record-round", "update-facts", "merge-state"],
 				required: true,
-				appliesToVerbs: ["draft create"],
+				appliesToVerbs: ["stage"],
 			},
-			{ name: "round-key", type: "string", appliesToVerbs: ["draft create"] },
-			{ name: "round", type: "number", appliesToVerbs: ["draft create"] },
-			{ name: "question-id", type: "string", appliesToVerbs: ["draft create"] },
-			{ name: "round-id", type: "string", appliesToVerbs: ["draft create"] },
-			{ name: "component-id", type: "string", appliesToVerbs: ["draft create"] },
-			{ name: "dimension", type: "string", appliesToVerbs: ["draft create"] },
-			{
-				name: "draft-id",
-				type: "string",
-				required: true,
-				appliesToVerbs: [
-					"draft edit",
-					"draft show",
-					"draft check",
-					"draft rebase",
-					"draft discard",
-					"initialize-context",
-					"confirm-topology",
-					"record-answer",
-					"apply-round-result",
-				],
-			},
-			{
-				name: "expected-draft-revision",
-				// `draft edit` additionally accepts the literal `latest`; all other verbs require the exact number.
-				type: "string",
-				required: true,
-				appliesToVerbs: [
-					"draft edit",
-					"draft rebase",
-					"draft discard",
-					"initialize-context",
-					"confirm-topology",
-					"record-answer",
-					"apply-round-result",
-				],
-			},
-			{
-				name: "op",
-				type: "enum",
-				enumValues: ["set", "append", "remove"],
-				required: true,
-				// Repeatable: each `--op` opens a new operation group ({--path,--value,--value-file,--null}) applied atomically in one call.
-				appliesToVerbs: ["draft edit"],
-			},
-			{ name: "path", type: "string", required: true, appliesToVerbs: ["draft edit"] },
-			{ name: "value", type: "string", appliesToVerbs: ["draft edit"] },
-			{ name: "value-file", type: "string", appliesToVerbs: ["draft edit"] },
-			{ name: "null", type: "boolean", appliesToVerbs: ["draft edit"] },
-			{ name: "to-state-revision", type: "number", required: true, appliesToVerbs: ["draft rebase"] },
-			{
-				name: "json",
-				type: "boolean",
-				required: true,
-				appliesToVerbs: [
-					"draft create",
-					"draft edit",
-					"draft show",
-					"draft check",
-					"draft rebase",
-					"draft discard",
-					"initialize-context",
-					"confirm-topology",
-					"record-answer",
-					"apply-round-result",
-					"inspect",
-					"sanity-check",
-				],
-			},
-			{
-				name: "session-id",
-				type: "string",
-				appliesToVerbs: ["inspect", "sanity-check"],
-			},
-			{
-				name: "session-id",
-				type: "string",
-				compatibilityOnly: true,
-				appliesToVerbs: ["initialize-context", "confirm-topology", "record-answer", "apply-round-result"],
-			},
-			{
-				name: "schema-version",
-				type: "number",
-				required: true,
-				compatibilityOnly: true,
-				appliesToVerbs: ["initialize-context", "confirm-topology", "record-answer", "apply-round-result"],
-			},
-			{
-				name: "expected-revision",
-				type: "number",
-				required: true,
-				compatibilityOnly: true,
-				appliesToVerbs: ["initialize-context", "confirm-topology", "record-answer", "apply-round-result"],
-			},
-			{
-				name: "input-json",
-				type: "object",
-				required: true,
-				compatibilityOnly: true,
-				appliesToVerbs: ["initialize-context", "confirm-topology"],
-			},
-			{
-				name: "round",
-				type: "number",
-				required: true,
-				compatibilityOnly: true,
-				appliesToVerbs: ["record-answer", "apply-round-result"],
-			},
-			{
-				name: "question-id",
-				type: "string",
-				required: true,
-				compatibilityOnly: true,
-				appliesToVerbs: ["record-answer", "apply-round-result"],
-			},
-			{
-				name: "round-id",
-				type: "string",
-				compatibilityOnly: true,
-				appliesToVerbs: ["record-answer", "apply-round-result"],
-			},
-			{ name: "component-id", type: "string", compatibilityOnly: true, appliesToVerbs: ["record-answer"] },
-			{ name: "dimension", type: "string", compatibilityOnly: true, appliesToVerbs: ["record-answer"] },
-			{
-				name: "answer-json",
-				type: "object",
-				required: true,
-				compatibilityOnly: true,
-				appliesToVerbs: ["record-answer"],
-			},
-			{
-				name: "question-json",
-				type: "string",
-				required: true,
-				compatibilityOnly: true,
-				appliesToVerbs: ["record-answer"],
-			},
-			{
-				name: "result-json",
-				type: "object",
-				required: true,
-				compatibilityOnly: true,
-				appliesToVerbs: ["apply-round-result"],
-			},
-			{
-				name: "selector",
-				type: "enum",
-				enumValues: ["summary", "recent-scored", "pending", "round", "topology", "facts", "triggers", "floor"],
-				required: true,
-				appliesToVerbs: ["inspect"],
-			},
-			{ name: "round-key", type: "string", appliesToVerbs: ["inspect"] },
-			{ name: "cursor", type: "string", appliesToVerbs: ["inspect"] },
-			{ name: "limit", type: "number", appliesToVerbs: ["inspect"] },
 			{ name: "args", type: "string", planned: true },
 			{ name: "metadata-json", type: "string", planned: true },
 		],
