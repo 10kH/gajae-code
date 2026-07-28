@@ -1,12 +1,18 @@
 # Changelog
 
 ## [Unreleased]
-### Fixed
+### Resume fixes
 
+- Memory consolidation redacts GitHub tokens. The scrubber covered AWS ids, JWTs and keyword-prefixed keys, but GitHub tokens carry none of those keywords, so they reached `MEMORY.md` and `memory_summary.md` verbatim — and the summary is injected into every later session. Now covers the same three prefixes the contribution-prep scrubber already handled.
+- Align managed fallback abort-after-exhaustion expectations with #3257 ownership release: a subscriber abort at terminal `message_end` no longer expects a second `requestRunTerminal(cancelled)` because the logical-run owner is already cleared.
+- Python eval timeout annotations now prefer the caller-configured `timeoutMs` over remaining wall-clock budget so async setup cannot flake second formatting in CI.
 - Overflow maintenance now stops cleanly when no-op compaction would replay the same oversized request; the runtime status explains that `/clear` preserves the current session ID before retrying.
+- The Smithery origin, API base and API key (`SMITHERY_URL`, `SMITHERY_API_URL`, `SMITHERY_API_KEY`) are now resolved from trusted environment sources only. The origin serves the CLI auth session the user is sent to, the API base receives `Authorization: Bearer <apiKey>` on every call and returns the connection records the agent consumes, and the key is that credential — all three were read through the merged view that includes the caller's `cwd/.env`. Shell, config and stored-credential paths are unchanged.
+- `gjc gc` now reports and prunes stale session local roots. Every session gets its own `<tmp>/gjc-local/<session-id>` directory seeded with a migration marker, and nothing ever removed them, so machines accumulated one per session indefinitely. Only marker-only directories past a 24h grace window are eligible, so a root holding real content or belonging to a session that just started is never touched, and prune re-validates immediately before removing.
 - The `ask` tool no longer rejects a JSON-string-encoded single-sided Round 0 payload before coercion; only the retired contract+review pair stays terminal, so a provider that serializes `questions` as a string no longer drives the model into an unbounded retry loop.
 - Browser launch overrides (`PUPPETEER_EXECUTABLE_PATH`, `PUPPETEER_PROXY`, `PUPPETEER_PROXY_BYPASS_LOOPBACK`, `PUPPETEER_PROXY_IGNORE_CERT_ERRORS`) are now resolved from trusted environment sources only. `Bun.env` is `process.env` and the env module merges the caller's `cwd/.env` into it, so a repository could previously plant a `.env` that chose the browser binary, routed every request through its own proxy, and disabled certificate validation. Resolution now goes through the non-project resolver (launching shell plus GJC/user-owned `.env` files); shell-level configuration is unchanged.
 - The tab-worker native-free import contract no longer invents import edges: its re-export scanner matched a bare `export` declaration followed anywhere later in the file by ` from "…"`, so a `from` inside a comment or string produced a phantom dependency. It now matches real re-export syntax (`export * from`, `export * as ns from`, `export { … } from`) only, and still fails on genuine barrel imports and re-exports.
+- The spawned command overrides `GJC_SDK_SESSION_COMMAND` (broker session host) and `GJC_HARNESS_PROCESS_START_COMMAND` (harness process-start probe) are now resolved from trusted environment sources only. `Bun.env` is `process.env` and the env module merges the caller's `cwd/.env` into it, so a repository could previously plant a `.env` choosing which binary those paths execute. Resolution now goes through the non-project resolver (launching shell plus GJC/user-owned `.env` files); operator and test usage is unchanged, and a malformed harness override stays fatal rather than falling back to `ps`.
 - macOS screenshot paths now recover the narrow no-break space before `AM`/`PM` for any following separator, so IDE-attached files such as `Screenshot … 11.23.30 PM-1785075812409.png` resolve instead of failing with `ENOENT`; word continuations like ` PMX` are left untouched.
 - ACP failures now reach the client with a real JSON-RPC code instead of collapsing to an opaque `-32603 Internal error`: internal string codes with an ACP counterpart map onto auth-required, resource-not-found, and invalid-params, the rest keep their discriminator in `data`, and translation happens once at the connection boundary. An unrecognized `extMethod` now returns `-32601` rather than a resolved `{ok:false}` payload.
 - ACP `Diff.path` is emitted absolute as the schema specifies, `ResourceLink.size` is forwarded only when it is a safe non-negative integer, and a failed tool update no longer overwrites `kind` with `other`, so clients keep the category they use for icons while failure stays carried by `status`.
@@ -18,6 +24,7 @@
 ### Added
 
 - Deterministic tests for session_switch await policy (selector defer vs default/branch await), control-drain ordering, host pre-response readiness gating, and resume progress lease-before-switch behavior (#2914).
+- Added an isolated Bun memory-baseline corpus with short/soak profiles across CLI, AgentSession, blob buffers, workers, Telegram, TUI, and shared/native boundaries; reports keep RSS, heap, external buffers, process-tree endpoints, active resources, throughput, and teardown evidence separate and advisory until variance is characterized.
 - Telegram per-tool activity is now opt-in and remains durably controllable with `/toolactivity on|off` or the Notifications preferences UI; disabling it suppresses tool start/completion success and error bubbles without hiding assistant, ask, or session notifications.
 - `/model`, `/login`, and `/provider` now order providers through one shared ranking: providers you already have (valid auth, in-flight validation, or a configured non-OAuth provider) come first, then providers whose stored credentials failed validation, then a curated list of well-known providers with regional and device variants grouped behind their primary, then everything else by display name. In `/model` rows, role/default rank and recent usage still take precedence over provider order (#3243).
 
@@ -35,10 +42,14 @@
 
 ### Changed
 
+- When GJC owns mouse input (`mouse.enabled: true`), mouse-wheel scrolling moves the session viewport by three rows per notch instead of a full page. PageUp/PageDown keep page-sized transcript-lane steps.
+- While reviewing transcript history, the status line and composer stay fixed at the bottom. Semantic assistant/tool output and visible capped-sidebar changes show `New output — type to follow`; duplicate, elided, hidden, geometry-only, and theme-only changes do not. Ordinary typing or paste returns to live output before editing without changing editor focus.
 - Telegram per-tool activity is now opt-in and remains durably controllable with `/toolactivity on|off` or the Notifications preferences UI; disabling it suppresses tool start/completion success and error bubbles without hiding assistant, ask, or session notifications.
 - Model preset landing now shows explicit `Enter: apply` and `d: set as default` hints; pressing `d` applies the highlighted profile as the default while Enter keeps the session-only apply path (#3161).
 
 ### Fixed
+
+- Session Observer now reads stable source snapshots, publishes only complete JSONL appends, validates replacement candidates, and clears stale transcript/model/tool content on source replacement, truncation, deletion, unreadability, or malformed candidates. Its transcript projection remains eager full-history work; this does not add virtualization or bounded full-history memory.
 - Session-manager fork/moveTo failure-injection tests now use a platform-aware hermetic seam: retained `RecoveryFsRoot` prototype spies on Linux and the direct native/fs fallbacks off Linux, with a required hit counter so a dead injection fails closed (#3209).
 - The #3216 win32 cleanup-producer regression no longer hardcodes divergent directory size `4096`; it injects `nativeRoot.size + 1` so the test stays hermetic when Linux directory size is already `4096` (post-merge Dev CI red on `79f0de870`).
 
