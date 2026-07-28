@@ -4695,6 +4695,8 @@ type ManagedDestinationTransition = {
 	readonly destination: SessionDestination;
 	readonly store: ManagedSessionDescendantStore;
 	adopt(): void;
+	/** Release the superseded authority once rollback is no longer possible. */
+	settle(): void;
 	rollback(): void;
 	dispose(): void;
 };
@@ -5532,6 +5534,7 @@ export class SessionManager {
 					prepared.dispose();
 					throw error;
 				}
+				managedTransition?.settle();
 				this.#pendingStrictAdoption = undefined;
 				this.#flushed = true;
 				this.#ensuredOnDisk = true;
@@ -5590,6 +5593,7 @@ export class SessionManager {
 				prepared.dispose();
 				throw error;
 			}
+			managedTransition?.settle();
 			this.#pendingStrictAdoption = undefined;
 			await this.#rewriteFile();
 			this.#flushed = true;
@@ -7197,7 +7201,14 @@ export class SessionManager {
 				this.destination = destination;
 				this.#managedTranscriptStoreCache = { directory: path.resolve(candidateDirectory), store };
 				this.#ownedManagedAuthority = store;
-				// Supersede: exactly one owned authority per manager.
+				// A superseded authority is NOT closed here: rollback() may still have to
+				// restore it. Closing at adoption time would hand a closed store back to
+				// the manager when a later cross-workspace switch fails after adoption.
+			},
+			settle: () => {
+				if (!adopted) return;
+				// The transition can no longer be rolled back, so the superseded authority
+				// is now unreachable. Release it to keep exactly one owned fd per manager.
 				if (previousOwned && previousOwned !== store) previousOwned.close();
 			},
 			rollback: () => {
