@@ -852,6 +852,7 @@ async function runDeepInterviewDraftCommandInternal(
 	cwd: string,
 	allowInternalConsume: boolean,
 ): Promise<DeepInterviewDraftResult> {
+	let recoverySessionId: string | undefined;
 	try {
 		const action = input[0];
 		if (
@@ -895,6 +896,7 @@ async function runDeepInterviewDraftCommandInternal(
 				const session = flags.get("--session-id") ?? process.env.GJC_SESSION_ID?.trim();
 				if (!session) throw new Error("DI_INVALID_ARGUMENT");
 				if (!DEEP_INTERVIEW_DRAFT_KINDS.includes(kind) || !ID.test(session)) throw new Error("DI_INVALID_ARGUMENT");
+				recoverySessionId = session;
 				const current = await revision(cwd, session);
 				const now = new Date();
 				const draft: Draft = {
@@ -941,6 +943,7 @@ async function runDeepInterviewDraftCommandInternal(
 			}
 			const id = required(flags, "--draft-id");
 			const draft = await read(cwd, id);
+			recoverySessionId = draft.session_id;
 			await cleanup(cwd);
 			if (action === "show") return response(0, { ok: true, draft });
 			if (action === "discard") {
@@ -1081,8 +1084,7 @@ async function runDeepInterviewDraftCommandInternal(
 			return response(2, {
 				code: error.code,
 				message: `${error.invariant} violated at ${error.path}`,
-				recovery:
-					"The violated invariant is in persisted state. Run gjc deep-interview sanity-check --json and inspect the reported state path; never edit .gjc state files directly.",
+				recovery: `The violated invariant is in persisted state. Run gjc deep-interview sanity-check --session-id ${recoverySessionId ?? "<session>"} --json and inspect the reported state path; never edit .gjc state files directly.`,
 				...deepInterviewInvariantDetail(error),
 			});
 		}
