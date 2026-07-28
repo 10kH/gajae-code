@@ -9777,6 +9777,16 @@ export class AgentSession {
 	getSessionDefaultModelSelector(): string | undefined {
 		return getSessionContextForInternalRead(this.sessionManager).models.default;
 	}
+	/**
+	 * Resolve the model that `modelRoles.default` currently points to, independent
+	 * of whatever model this session's log last recorded. Used by the TUI resume
+	 * flow's `session.resumeModelBehavior: "ask"` prompt to offer the currently
+	 * configured default as an alternative to the session's saved model.
+	 */
+	resolveConfiguredDefaultModel(): Model | undefined {
+		const availableModels = this.#modelRegistry.getAvailable();
+		return this.#resolveRoleModelFull("default", availableModels, undefined).model;
+	}
 
 	/**
 	 * Re-assert the session resume default ("provider/id") in the session log
@@ -15223,9 +15233,13 @@ export class AgentSession {
 					this.#rebindProviderSessionState(new Map());
 				}
 
+				const resumeModelBehavior = this.settings.get("session.resumeModelBehavior");
 				const configuredDefaultChain = sessionContext.configuredModelChains.default?.entries;
+				const settingsDefaultEntries = normalizeModelSelectorValue(this.settings.getModelRole("default"));
 				const defaultEntries =
-					configuredDefaultChain ?? (sessionContext.models.default ? [sessionContext.models.default] : []);
+					resumeModelBehavior === "useCurrentDefault"
+						? settingsDefaultEntries
+						: (configuredDefaultChain ?? (sessionContext.models.default ? [sessionContext.models.default] : []));
 				this.#defaultFallbackController = undefined;
 				if (defaultEntries.length > 0) {
 					const resolution = await resolveModelChainWithAuth(

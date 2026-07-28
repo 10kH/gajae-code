@@ -1082,6 +1082,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			"options.authStorage and options.modelRegistry.authStorage must be the same instance when both are provided",
 		);
 	}
+
 	let agent: Agent;
 	let session!: AgentSession;
 	let hasSession = false;
@@ -1293,13 +1294,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		);
 		let model = options.model;
 		let modelFallbackMessage: string | undefined;
+		const resumeModelBehavior = settings.get("session.resumeModelBehavior");
 		const persistedDefaultChain = existingSession.configuredModelChains.default?.entries;
 		const defaultModelEntries =
-			persistedDefaultChain && persistedDefaultChain.length > 0
-				? persistedDefaultChain
-				: existingSession.models.default
-					? [existingSession.models.default]
-					: [];
+			resumeModelBehavior === "useCurrentDefault"
+				? []
+				: persistedDefaultChain && persistedDefaultChain.length > 0
+					? persistedDefaultChain
+					: existingSession.models.default
+						? [existingSession.models.default]
+						: [];
 		// If session has data, restore its configured default chain rather than the
 		// scalar runtime model, which may be a stale fallback from the prior run.
 		if (!hasExplicitModel && !model && hasExistingSession && defaultModelEntries.length > 0) {
