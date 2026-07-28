@@ -133,6 +133,54 @@ setInterval(() => {}, 1000);
 		}
 	});
 
+	test("honors default and configured connection timeouts for an explicit tools-only config", async () => {
+		const cwd = await mkdtempExact("gjc-mcp-explicit-timeout-");
+		const configPath = join(cwd, "mcp.json");
+		const delayedServer = `
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', line => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    setTimeout(() => {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'slow-exact', version: '1' } } }) + '\\n');
+    }, 2200);
+  } else if (msg.method === 'tools/list') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [] } }) + '\\n');
+  }
+});
+setInterval(() => {}, 1000);
+`;
+		const manager = new MCPManager(cwd, null, { toolsOnly: true });
+
+		try {
+			await Bun.write(
+				configPath,
+				JSON.stringify({
+					mcpServers: {
+						"slow-exact": {
+							command: process.execPath,
+							args: ["-e", delayedServer],
+							timeout: 5_000,
+						},
+						"slow-default": {
+							command: process.execPath,
+							args: ["-e", delayedServer],
+						},
+					},
+				}),
+			);
+
+			const result = await manager.discoverAndConnect({ configPath });
+
+			expect(result.errors).toEqual(new Map());
+			expect(result.connectedServers).toEqual(["slow-exact", "slow-default"]);
+		} finally {
+			await manager.disconnectAll();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	// The same slow gateway must NOT be able to hang an ordinary consumer for
 	// ~30s: without an ACP budget the short default ceiling applies and startup
 	// gives up quickly instead of waiting out the configured `timeout`.
