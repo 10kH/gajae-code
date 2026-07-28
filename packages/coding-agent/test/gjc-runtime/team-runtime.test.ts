@@ -18,6 +18,7 @@ import {
 	monitorGjcTeam,
 	monitorGjcTeamSnapshot,
 	parseTeamLaunchArgs,
+	probeGjcTeamAvailability,
 	pruneTeamWorkerGcRecord,
 	readGjcTeamSnapshot,
 	readGjcTeamTask,
@@ -1228,6 +1229,40 @@ describe("native gjc team runtime", () => {
 		expect(await Bun.file(path.join(teamStateDir(cleanupRoot, "outside-tmux-team"), "phase.json")).exists()).toBe(
 			false,
 		);
+	});
+	it("probes a managed leader without mutating tmux", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
+
+		expect(
+			probeGjcTeamAvailability({
+				GJC_TMUX_COMMAND: fakeTmux,
+				TMUX: "/tmp/tmux-501/default,1,0",
+			}),
+		).toEqual({ available: true });
+
+		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
+		expect(tmuxLog).toContain("display-message -p #S:#I #{pane_id}");
+		expect(tmuxLog).not.toContain("show-options");
+		expect(tmuxLog).not.toContain("set-option");
+		expect(tmuxLog).not.toContain("split-window");
+	});
+	it("probes an unmanaged leader without inspecting or changing its ownership tag", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot, { gjcProfile: false });
+
+		expect(
+			probeGjcTeamAvailability({
+				GJC_TMUX_COMMAND: fakeTmux,
+				TMUX: "/tmp/tmux-501/default,1,0",
+			}),
+		).toEqual({ available: true });
+
+		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
+		expect(tmuxLog).toContain("display-message -p #S:#I #{pane_id}");
+		expect(tmuxLog).not.toContain("show-options");
+		expect(tmuxLog).not.toContain("set-option");
+		expect(tmuxLog).not.toContain("split-window");
 	});
 
 	it("rejects a tmux provider that cannot persist GJC's ownership tag (e.g. psmux)", async () => {

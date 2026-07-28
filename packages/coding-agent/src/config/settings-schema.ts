@@ -524,6 +524,11 @@ export const SETTINGS_SCHEMA = {
 		default: 0.05,
 		validate: (value: number) => Number.isFinite(value) && value > 0 && value <= 1,
 	},
+	"gjc.ralplan.autoHandoff": {
+		type: "enum",
+		values: ["off", "ultragoal", "team"],
+		default: "off",
+	},
 	"gjc.ralplan.maxIterations": {
 		type: "number",
 		default: 5,

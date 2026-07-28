@@ -33,6 +33,7 @@ import {
 	writeArtifact,
 	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
+import { probeGjcTeamAvailability } from "./team-runtime";
 import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
 import { getSkillManifest } from "./workflow-manifest";
 
@@ -74,6 +75,16 @@ export const PLANNING_STUCK_MARKER = "PLANNING-STUCK";
 export const RALPLAN_DEFAULT_MAX_REVIEW_PASSES_PER_LANE = 1;
 /** Inclusive upper bound for `gjc.ralplan.maxReviewPassesPerLane` settings overrides. */
 export const RALPLAN_MAX_REVIEW_PASSES_PER_LANE_LIMIT = 10;
+export type RalplanAutoHandoffTarget = "off" | "ultragoal" | "team";
+
+export interface RalplanAutoHandoffResolution {
+	configuredTarget: RalplanAutoHandoffTarget;
+	effectiveTarget: RalplanAutoHandoffTarget;
+	degradationReason: string | null;
+	source: string;
+}
+
+const RALPLAN_AUTO_HANDOFF_TARGETS = new Set<RalplanAutoHandoffTarget>(["off", "ultragoal", "team"]);
 
 const RALPLAN_ITERATION_OPENER_STAGES = new Set<RalplanStage>(["planner", "revision"]);
 
@@ -390,6 +401,115 @@ export async function resolveRalplanMaxIterations(cwd: string): Promise<{ maxIte
 	const user = await readSettingsMaxIterations(userPath);
 	if (user !== null) return { maxIterations: user, source: userPath };
 	return { maxIterations: RALPLAN_DEFAULT_MAX_ITERATIONS, source: "default" };
+}
+function parseRalplanAutoHandoffTarget(value: unknown): RalplanAutoHandoffTarget | undefined {
+	return typeof value === "string" && RALPLAN_AUTO_HANDOFF_TARGETS.has(value as RalplanAutoHandoffTarget)
+		? (value as RalplanAutoHandoffTarget)
+		: undefined;
+}
+
+type RalplanAutoHandoffOptions = {
+	planningStuck?: boolean;
+	teamAvailabilityProbe?: () => { available: true } | { available: false; reason: string };
+};
+
+type RalplanAutoHandoffSetting =
+	| { kind: "absent" }
+	| { kind: "valid"; value: RalplanAutoHandoffTarget }
+	| { kind: "invalid"; reason: string };
+
+function parsePresentRalplanAutoHandoff(value: unknown): RalplanAutoHandoffSetting {
+	const target = parseRalplanAutoHandoffTarget(value);
+	return target === undefined
+		? {
+				kind: "invalid",
+				reason: "expected gjc.ralplan.autoHandoff to be one of off, ultragoal, team",
+			}
+		: { kind: "valid", value: target };
+}
+
+function parseRalplanAutoHandoffSettings(parsed: unknown): RalplanAutoHandoffSetting {
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { kind: "absent" };
+	const settings = parsed as Record<string, unknown>;
+	if (Object.hasOwn(settings, "gjc.ralplan.autoHandoff")) {
+		return parsePresentRalplanAutoHandoff(settings["gjc.ralplan.autoHandoff"]);
+	}
+	const gjc = settings.gjc;
+	if (!gjc || typeof gjc !== "object" || Array.isArray(gjc)) return { kind: "absent" };
+	const ralplan = (gjc as Record<string, unknown>).ralplan;
+	if (!ralplan || typeof ralplan !== "object" || Array.isArray(ralplan)) return { kind: "absent" };
+	const ralplanSettings = ralplan as Record<string, unknown>;
+	if (!Object.hasOwn(ralplanSettings, "autoHandoff")) return { kind: "absent" };
+	return parsePresentRalplanAutoHandoff(ralplanSettings.autoHandoff);
+}
+
+async function readSettingsAutoHandoff(settingsPath: string): Promise<RalplanAutoHandoffSetting> {
+	let raw: string;
+	try {
+		raw = await Bun.file(settingsPath).text();
+	} catch (error) {
+		if (getErrorCode(error) === "ENOENT") return { kind: "absent" };
+		return {
+			kind: "invalid",
+			reason: `unable to read settings: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (error) {
+		return {
+			kind: "invalid",
+			reason: `malformed JSON: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+	return parseRalplanAutoHandoffSettings(parsed);
+}
+
+export async function resolveRalplanAutoHandoff(
+	cwd: string,
+	options: RalplanAutoHandoffOptions = {},
+): Promise<RalplanAutoHandoffResolution> {
+	const projectPath = path.join(gjcRoot(cwd), "settings.json");
+	const project = await readSettingsAutoHandoff(projectPath);
+	if (project.kind === "invalid") {
+		throw new RalplanCommandError(2, `invalid ralplan settings at ${projectPath}: ${project.reason}`);
+	}
+	if (project.kind === "valid") {
+		return resolveRalplanAutoHandoffTarget(project.value, projectPath, options);
+	}
+	const userPath = path.join(getConfigRootDir(), "settings.json");
+	const user = await readSettingsAutoHandoff(userPath);
+	if (user.kind === "invalid") {
+		throw new RalplanCommandError(2, `invalid ralplan settings at ${userPath}: ${user.reason}`);
+	}
+	return resolveRalplanAutoHandoffTarget(
+		user.kind === "valid" ? user.value : "off",
+		user.kind === "valid" ? userPath : "default",
+		options,
+	);
+}
+
+function resolveRalplanAutoHandoffTarget(
+	configuredTarget: RalplanAutoHandoffTarget,
+	source: string,
+	options: RalplanAutoHandoffOptions,
+): RalplanAutoHandoffResolution {
+	if (options.planningStuck) {
+		return { configuredTarget, effectiveTarget: "off", degradationReason: "planning_stuck", source };
+	}
+	if (configuredTarget !== "team")
+		return { configuredTarget, effectiveTarget: configuredTarget, degradationReason: null, source };
+
+	const availability = (options.teamAvailabilityProbe ?? probeGjcTeamAvailability)();
+	return availability.available
+		? { configuredTarget, effectiveTarget: "team", degradationReason: null, source }
+		: {
+				configuredTarget,
+				effectiveTarget: "off",
+				degradationReason: `team_unavailable:${availability.reason}`,
+				source,
+			};
 }
 
 function parseMaxReviewPassesPerLaneValue(value: unknown): number | null {
@@ -763,6 +883,8 @@ async function persistActiveRunId(cwd: string, sessionId: string, runId: string,
 				for (const key of Object.keys(existing)) {
 					if (key.startsWith("last_review_verdict")) delete existing[key];
 				}
+				delete existing.planning_stuck;
+				delete existing.auto_handoff;
 			}
 			if (
 				existing.run_id === runId &&
@@ -1094,6 +1216,131 @@ async function applyLaneVerdictUpdate(
 		{ cwd },
 	);
 }
+function ralplanPlanningStuckIndexKey(entry: unknown): string | undefined {
+	if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+	const record = entry as Record<string, unknown>;
+	return record.planning_stuck === true ? "planning_stuck" : undefined;
+}
+
+async function recordRalplanPlanningStuck(
+	cwd: string,
+	sessionId: string,
+	runId: string,
+	reason: string,
+): Promise<void> {
+	const runDir = path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId);
+	await appendJsonlIdempotent(
+		path.join(runDir, "index.jsonl"),
+		{
+			event: "planning_stuck",
+			planning_stuck: true,
+			marker: PLANNING_STUCK_MARKER,
+			reason,
+			created_at: new Date().toISOString(),
+		},
+		{
+			cwd,
+			audit: {
+				category: "ledger",
+				verb: "append",
+				owner: "gjc-runtime",
+				skill: "ralplan",
+				sessionId,
+			},
+			key: ralplanPlanningStuckIndexKey,
+		},
+	);
+	const statePath = ralplanStatePath(cwd, sessionId);
+	await withWorkflowStateLock(
+		statePath,
+		async () => {
+			const existingRead = await readExistingStateForMutation(statePath);
+			if (existingRead.kind === "corrupt") return;
+			let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
+			if (existing.run_id !== runId) return;
+			existing.planning_stuck = { marker: PLANNING_STUCK_MARKER, reason };
+			existing = migrateWorkflowState(existing, "ralplan").state;
+			existing.updated_at = new Date().toISOString();
+			await writeWorkflowEnvelopeAtomic(statePath, existing, {
+				cwd,
+				lockHeld: true,
+				receipt: { cwd, skill: "ralplan", owner: "gjc-runtime", command: "gjc ralplan planning-stuck", sessionId },
+				audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", sessionId },
+			});
+		},
+		{ cwd },
+	);
+}
+
+async function readRalplanFinalAdmission(
+	cwd: string,
+	sessionId: string,
+	runId: string,
+): Promise<RalplanAutoHandoffResolution | undefined> {
+	const index = await loadRalplanIndexForCap(cwd, sessionId, runId);
+	if (index.rawText === undefined) return undefined;
+	let finalAdmission: RalplanAutoHandoffResolution | undefined;
+	for (const line of index.rawText.split(/\r?\n/)) {
+		try {
+			const row = JSON.parse(line) as Record<string, unknown>;
+			if (row.stage === "final" && typeof row.path === "string" && typeof row.sha256 === "string") {
+				finalAdmission = parseRalplanFinalAdmission(row.auto_handoff) ?? unavailableRalplanFinalAdmission();
+			}
+		} catch {
+			// The artifact dedupe guard handles malformed ledger records separately.
+		}
+	}
+	return finalAdmission;
+}
+
+async function readRalplanPlanningStuck(cwd: string, sessionId: string, runId: string): Promise<boolean> {
+	const index = await loadRalplanIndexForCap(cwd, sessionId, runId);
+	if (index.rawText === undefined) return index.indexPresent;
+	if (index.indexPresent && index.rawLineCount > 0 && index.parseableLines === 0) return true;
+	for (const line of index.rawText.split(/\r?\n/)) {
+		if (!line.trim()) continue;
+		try {
+			const row = JSON.parse(line) as Record<string, unknown>;
+			if (row.planning_stuck === true) return true;
+		} catch {
+			return true;
+		}
+	}
+	return false;
+}
+
+async function persistRalplanFinalAdmission(
+	cwd: string,
+	sessionId: string,
+	runId: string,
+	admission: RalplanAutoHandoffResolution,
+): Promise<void> {
+	const statePath = ralplanStatePath(cwd, sessionId);
+	await withWorkflowStateLock(
+		statePath,
+		async () => {
+			const existingRead = await readExistingStateForMutation(statePath);
+			if (existingRead.kind === "corrupt") {
+				throw new RalplanCommandError(
+					2,
+					`existing ralplan state is corrupt or tampered (${existingRead.error}); refusing to record final admission`,
+				);
+			}
+			let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
+			if (existing.run_id !== runId) return;
+			existing.auto_handoff = admission;
+			existing = migrateWorkflowState(existing, "ralplan").state;
+			existing.updated_at = new Date().toISOString();
+			await writeWorkflowEnvelopeAtomic(statePath, existing, {
+				cwd,
+				lockHeld: true,
+				receipt: { cwd, skill: "ralplan", owner: "gjc-runtime", command: "gjc ralplan final-admission", sessionId },
+				audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", sessionId },
+			});
+		},
+		{ cwd },
+	);
+}
 
 async function resolveArtifactArgs(args: readonly string[], cwd: string): Promise<ResolvedArtifactArgs> {
 	const stage = flagValue(args, "--stage");
@@ -1170,6 +1417,7 @@ async function persistArtifact(
 	cwd: string,
 	content: string,
 	sha256: string,
+	finalAdmission?: RalplanAutoHandoffResolution,
 ): Promise<PersistedArtifact> {
 	const runDir = path.join(sessionPlansDir(cwd, resolved.sessionId), "ralplan", resolved.runId);
 
@@ -1193,6 +1441,7 @@ async function persistArtifact(
 		path: filePath,
 		created_at: createdAt,
 		sha256,
+		...(finalAdmission ? { auto_handoff: finalAdmission } : {}),
 	};
 	await appendJsonlIdempotent(path.join(runDir, "index.jsonl"), indexEntry, {
 		cwd,
@@ -1237,6 +1486,35 @@ interface ExistingStageArtifact {
 	path: string;
 	sha256: string;
 	createdAt: string;
+	autoHandoff?: RalplanAutoHandoffResolution;
+}
+
+function parseRalplanFinalAdmission(value: unknown): RalplanAutoHandoffResolution | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const admission = value as Record<string, unknown>;
+	if (
+		!RALPLAN_AUTO_HANDOFF_TARGETS.has(admission.configuredTarget as RalplanAutoHandoffTarget) ||
+		!RALPLAN_AUTO_HANDOFF_TARGETS.has(admission.effectiveTarget as RalplanAutoHandoffTarget) ||
+		(typeof admission.degradationReason !== "string" && admission.degradationReason !== null) ||
+		typeof admission.source !== "string"
+	) {
+		return undefined;
+	}
+	return {
+		configuredTarget: admission.configuredTarget as RalplanAutoHandoffTarget,
+		effectiveTarget: admission.effectiveTarget as RalplanAutoHandoffTarget,
+		degradationReason: typeof admission.degradationReason === "string" ? admission.degradationReason : null,
+		source: admission.source,
+	};
+}
+
+function unavailableRalplanFinalAdmission(): RalplanAutoHandoffResolution {
+	return {
+		configuredTarget: "off",
+		effectiveTarget: "off",
+		degradationReason: "admission_unavailable",
+		source: "ledger",
+	};
 }
 
 /**
@@ -1269,6 +1547,7 @@ function findExistingStageArtifact(
 			path: record.path,
 			sha256: record.sha256,
 			createdAt: typeof record.created_at === "string" ? record.created_at : "",
+			...(stage === "final" ? { autoHandoff: parseRalplanFinalAdmission(record.auto_handoff) } : {}),
 		};
 	}
 	return match;
@@ -1354,6 +1633,7 @@ async function repairMissingStageArtifactLedger(
 	cwd: string,
 	resolved: Pick<ResolvedArtifactArgs, "sessionId" | "runId" | "stage" | "stageN">,
 	onDisk: OnDiskStageArtifact,
+	finalAdmission?: RalplanAutoHandoffResolution,
 ): Promise<ExistingStageArtifact> {
 	const createdAt = new Date().toISOString();
 	const indexEntry = {
@@ -1362,6 +1642,7 @@ async function repairMissingStageArtifactLedger(
 		path: onDisk.path,
 		created_at: createdAt,
 		sha256: onDisk.sha256,
+		...(finalAdmission ? { auto_handoff: finalAdmission } : {}),
 	};
 	const result = await appendJsonlIdempotent(
 		path.join(sessionPlansDir(cwd, resolved.sessionId), "ralplan", resolved.runId, "index.jsonl"),
@@ -1386,10 +1667,18 @@ async function repairMissingStageArtifactLedger(
 				path: record.path,
 				sha256: record.sha256,
 				createdAt: typeof record.created_at === "string" ? record.created_at : createdAt,
+				...(resolved.stage === "final"
+					? { autoHandoff: parseRalplanFinalAdmission(record.auto_handoff) ?? unavailableRalplanFinalAdmission() }
+					: {}),
 			};
 		}
 	}
-	return { path: onDisk.path, sha256: onDisk.sha256, createdAt };
+	return {
+		path: onDisk.path,
+		sha256: onDisk.sha256,
+		createdAt,
+		...(resolved.stage === "final" ? { autoHandoff: finalAdmission ?? unavailableRalplanFinalAdmission() } : {}),
+	};
 }
 
 /**
@@ -1463,12 +1752,18 @@ async function buildRalplanHud(options: {
 	let architectPasses: number | undefined;
 	let criticPasses: number | undefined;
 	let verdict: string | undefined;
+	let autoHandoff: RalplanAutoHandoffResolution | undefined;
+	let planningStuck = false;
 	if (options.runId && options.sessionId) {
-		const [rows, lastReviewVerdict] = await Promise.all([
+		const [rows, lastReviewVerdict, persistedAutoHandoff, persistedPlanningStuck] = await Promise.all([
 			readRalplanIndexRows(options.cwd, options.sessionId, options.runId),
 			readRalplanLastReviewVerdict(options.cwd, options.sessionId),
+			readRalplanFinalAdmission(options.cwd, options.sessionId, options.runId),
+			readRalplanPlanningStuck(options.cwd, options.sessionId, options.runId),
 		]);
 		verdict = lastReviewVerdict;
+		autoHandoff = persistedAutoHandoff;
+		planningStuck = persistedPlanningStuck;
 		if (rows.length > 0) {
 			const summary = summarizeRalplanIndex(rows);
 			iterationFromIndex = summary.iteration;
@@ -1486,6 +1781,8 @@ async function buildRalplanHud(options: {
 		criticPasses,
 		reviewPassBudget: options.reviewPassBudget,
 		verdict,
+		autoHandoff,
+		planningStuck,
 		pendingApproval: options.pendingApproval,
 		latestSummary: options.latestSummary,
 		updatedAt: new Date().toISOString(),
@@ -1534,7 +1831,7 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 			);
 		}
 		if (resolved.stage === "final") await ensureFinalPendingApproval(cwd, resolved, existingArtifact);
-		return buildDeduplicatedResult(resolved, existingArtifact, sha256, cwd, repositoryBinding);
+		return await buildDeduplicatedResult(resolved, existingArtifact, sha256, cwd, repositoryBinding);
 	}
 
 	// `persistArtifact` writes the artifact before its ledger row. If a process crashed
@@ -1549,7 +1846,12 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 			);
 		}
 		if (resolved.stage === "final") await ensureFinalPendingApproval(cwd, resolved, onDiskArtifact);
-		const repairedArtifact = await repairMissingStageArtifactLedger(cwd, resolved, onDiskArtifact);
+		const repairedArtifact = await repairMissingStageArtifactLedger(
+			cwd,
+			resolved,
+			onDiskArtifact,
+			resolved.stage === "final" ? unavailableRalplanFinalAdmission() : undefined,
+		);
 		let appliedPersistedRoleState: PersistedRoleStateUpdate | undefined;
 		if (
 			persistedRoleState &&
@@ -1561,7 +1863,7 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 		if (laneVerdict && (await applyLaneVerdictUpdate(cwd, resolved.sessionId, laneVerdict, resolved.runId))) {
 			appliedLaneVerdict = laneVerdict;
 		}
-		return buildDeduplicatedResult(
+		return await buildDeduplicatedResult(
 			resolved,
 			repairedArtifact,
 			sha256,
@@ -1595,6 +1897,7 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 		iterationFloor: onDiskOpeners,
 	});
 	if (!capDecision.allowed) {
+		await recordRalplanPlanningStuck(cwd, resolved.sessionId, resolved.runId, capDecision.reason);
 		return buildPlanningStuckResult({
 			json: resolved.json,
 			stage: resolved.stage,
@@ -1611,6 +1914,7 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 		onDiskLaneCounts: onDiskLaneArtifacts,
 	});
 	if (!laneBudgetDecision.allowed) {
+		await recordRalplanPlanningStuck(cwd, resolved.sessionId, resolved.runId, laneBudgetDecision.reason);
 		return buildLaneBudgetStuckResult({
 			json: resolved.json,
 			stage: resolved.stage,
@@ -1621,14 +1925,26 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 		});
 	}
 
+	let autoHandoff: RalplanAutoHandoffResolution | undefined;
+	if (resolved.stage === "final") {
+		// Resolve and validate the configured admission before any final artifact or
+		// state write. The ledger row below is the durable receipt for deduplicated
+		// retries; state is only a current-session projection.
+		autoHandoff = await resolveRalplanAutoHandoff(cwd, {
+			planningStuck: await readRalplanPlanningStuck(cwd, resolved.sessionId, resolved.runId),
+		});
+	}
 	// Keep run-state `current_phase` coherent with the stage being persisted.
 	await persistActiveRunId(cwd, resolved.sessionId, resolved.runId, resolved.stage);
-	const persisted = await persistArtifact(resolved, cwd, content, sha256);
+	const persisted = await persistArtifact(resolved, cwd, content, sha256, autoHandoff);
 	if (persistedRoleState) {
 		await applyPersistedRoleStateUpdate(cwd, resolved.sessionId, persistedRoleState);
 	}
 	if (laneVerdict) {
 		await applyLaneVerdictUpdate(cwd, resolved.sessionId, laneVerdict);
+	}
+	if (autoHandoff) {
+		await persistRalplanFinalAdmission(cwd, resolved.sessionId, resolved.runId, autoHandoff);
 	}
 	await writeSessionActivityMarker(cwd, resolved.sessionId, { writer: "ralplan-runtime", path: persisted.path });
 	await syncRalplanHud({
@@ -1663,6 +1979,7 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 	if (persistedRoleState) payload[`${persistedRoleState.role}_state`] = persistedRoleStatePayload(persistedRoleState);
 	if (reviewBudgetWarning) payload.review_budget_warning = reviewBudgetWarning;
 	if (laneVerdict) payload.lane_verdict = { lane: laneVerdict.lane, verdict: laneVerdict.verdict };
+	if (autoHandoff) payload.auto_handoff = autoHandoff;
 
 	const stdout = resolved.json
 		? `${JSON.stringify(payload, null, 2)}\n`
@@ -1675,7 +1992,14 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
  * do not rewrite artifacts, append rows, or churn run state; a crash-gap repair may
  * complete riding persisted role/lane metadata before returning this receipt.
  */
-function buildDeduplicatedResult(
+function applyRalplanPlanningStuckOverride(
+	admission: RalplanAutoHandoffResolution,
+	planningStuck: boolean,
+): RalplanAutoHandoffResolution {
+	return planningStuck ? { ...admission, effectiveTarget: "off", degradationReason: "planning_stuck" } : admission;
+}
+
+async function buildDeduplicatedResult(
 	resolved: ResolvedArtifactArgs,
 	existing: ExistingStageArtifact,
 	sha256: string,
@@ -1683,7 +2007,7 @@ function buildDeduplicatedResult(
 	repositoryBinding: RepositoryBinding,
 	laneVerdict?: LaneVerdictUpdate,
 	persistedRoleState?: PersistedRoleStateUpdate,
-): RalplanCommandResult {
+): Promise<RalplanCommandResult> {
 	const payload: Record<string, unknown> = {
 		run_id: resolved.runId,
 		path: existing.path,
@@ -1704,6 +2028,11 @@ function buildDeduplicatedResult(
 			"ralplan",
 			resolved.runId,
 			"pending-approval.md",
+		);
+		const planningStuck = await readRalplanPlanningStuck(cwd, resolved.sessionId, resolved.runId);
+		payload.auto_handoff = applyRalplanPlanningStuckOverride(
+			existing.autoHandoff ?? unavailableRalplanFinalAdmission(),
+			planningStuck,
 		);
 	}
 	const stdout = resolved.json
