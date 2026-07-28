@@ -11,7 +11,12 @@ import {
 	type WorkflowStateMutationOwner,
 	type WorkflowStateReceipt,
 } from "../skill-state/workflow-state-contract";
-import { validateDeepInterviewV1Envelope } from "./deep-interview-state";
+import {
+	type DeepInterviewInvariantDetail,
+	DeepInterviewInvariantError,
+	deepInterviewInvariantDetail,
+	validateDeepInterviewV1Envelope,
+} from "./deep-interview-state";
 import {
 	activeEntryPath as layoutActiveEntryPath,
 	activeSnapshotPath as layoutActiveSnapshotPath,
@@ -114,7 +119,10 @@ export type GuardedWorkflowEnvelopeTransformResult =
 	  };
 
 export class GuardedWorkflowEnvelopeError extends Error {
-	constructor(public readonly code: string) {
+	constructor(
+		public readonly code: string,
+		public readonly detail?: DeepInterviewInvariantDetail,
+	) {
 		super(code);
 		this.name = "GuardedWorkflowEnvelopeError";
 	}
@@ -734,7 +742,9 @@ export async function transformGuardedWorkflowEnvelopeAtomic(
 			try {
 				if (isNativeDeepInterviewV1(read.value)) validateDeepInterviewV1Envelope(read.value);
 				options.validate?.(read.value, legacy);
-			} catch {
+			} catch (error) {
+				if (error instanceof DeepInterviewInvariantError)
+					throw new GuardedWorkflowEnvelopeError(error.code, deepInterviewInvariantDetail(error));
 				throw new GuardedWorkflowEnvelopeError("DI_STATE_SCHEMA_INVALID");
 			}
 			const phase = read.value.current_phase;
@@ -749,7 +759,9 @@ export async function transformGuardedWorkflowEnvelopeAtomic(
 			try {
 				if (isNativeDeepInterviewV1(transformed.value)) validateDeepInterviewV1Envelope(transformed.value);
 				options.validate?.(transformed.value, false);
-			} catch {
+			} catch (error) {
+				if (error instanceof DeepInterviewInvariantError)
+					throw new GuardedWorkflowEnvelopeError(error.code, deepInterviewInvariantDetail(error));
 				throw new GuardedWorkflowEnvelopeError("DI_STATE_SCHEMA_INVALID");
 			}
 			const stamped = stampWorkflowEnvelopeRevisionAndChecksum(

@@ -152,6 +152,7 @@ function main(): void {
 	const skillDoc = read(SKILL_DOC);
 
 	checkInvariantTable(REPAIR_CLI_DOC, repairDoc);
+	checkInvariantTable(SKILL_DOC, skillDoc);
 	checkDraftSchemas(REPAIR_CLI_DOC, repairDoc);
 	checkDraftSchemas(SKILL_DOC, skillDoc);
 	checkContractPhrases(REPAIR_CLI_DOC, repairDoc);

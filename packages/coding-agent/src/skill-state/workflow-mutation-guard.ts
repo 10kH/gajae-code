@@ -53,7 +53,7 @@ const BASH_MUTATION_COMMAND_RE =
 	/(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:(?:command|exec)\s+)?(?:[^\s;&|]*\/)?['"]?(?:tee|touch|rm|mkdir|cp|mv|install|truncate)['"]?\b([^;&|\n]*)|(?:^|[^<>])(?:>>?|\d>>?)\s*([^\s;&|]+)/gi;
 const BASH_IN_PLACE_MUTATION_COMMAND_RE = /(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:sed|perl)\b([^;&|\n]*)/gi;
 /** Literal filesystem targets passed to common interpreter write APIs. */
-const BASH_INTERPRETER_FILE_TARGET_RE = /(?:open|writeFile(?:Sync)?)\s*\(\s*["']([^"']+)["']/gi;
+const BASH_INTERPRETER_FILE_TARGET_RE = /(?:Bun\.write|open|writeFile(?:Sync)?)\s*\(\s*["']([^"']+)["']/gi;
 const BASH_DD_OUTPUT_RE = /(?:^|[;&|\n])\s*(?:\w+=[^\s]+\s+)*(?:sudo\s+)?(?:[^\s;&|]*\/)?dd\b([^;&|\n]*)/gi;
 /** `sort -o <file>` / `sort --output=<file>` writes the named file without any shell redirection. */
 const BASH_SORT_OUTPUT_RE =

@@ -195,7 +195,6 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{
 				name: "session-id",
 				type: "string",
-				required: true,
 				appliesToVerbs: ["draft create"],
 			},
 			{
@@ -277,13 +276,11 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{
 				name: "session-id",
 				type: "string",
-				required: true,
 				appliesToVerbs: ["inspect", "sanity-check"],
 			},
 			{
 				name: "session-id",
 				type: "string",
-				required: true,
 				compatibilityOnly: true,
 				appliesToVerbs: ["initialize-context", "confirm-topology", "record-answer", "apply-round-result"],
 			},

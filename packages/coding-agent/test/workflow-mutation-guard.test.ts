@@ -890,6 +890,7 @@ describe("workflow mutation guard", () => {
 			// non-whitelisted writing segment alongside gjc
 			'gjc state read --json && python -c \'open("src/product.ts", "w").write("x")\'',
 			"gjc state read --json; tee src/product.ts",
+			'bun -e \'await Bun.write("src/product.ts", "x")\'',
 			// redirection disqualifies the whitelist
 			"gjc deep-interview inspect --session-id s1 --json > src/product.ts",
 			// command substitution disqualifies

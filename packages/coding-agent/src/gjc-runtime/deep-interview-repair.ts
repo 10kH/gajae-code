@@ -8,6 +8,7 @@ import {
 	canonicalDeepInterviewJson,
 	type DeepInterviewFactOperation,
 	type DeepInterviewInvariantDetail,
+	DeepInterviewInvariantError,
 	type DeepInterviewResolution,
 	type DeepInterviewRoundResultV1,
 	deepInterviewAnswerIdentityEqual,
@@ -206,6 +207,7 @@ function errorResult(error: unknown): DeepInterviewRepairResult {
 							error.code === "DI_SHELL_CONFLICT"
 							? 4
 							: 3,
+						error.detail,
 					)
 				: new RepairError("DI_INTERNAL_ERROR", 3);
 	return {
@@ -1111,7 +1113,8 @@ export async function dryRunDeepInterviewRepairMutation(
 				: undefined;
 		const path = statePath(cwd, session);
 		const diagnostic = diagnoseDeepInterviewState(await readExistingStateForMutation(path), path);
-		if (diagnostic.code || !diagnostic.value) throw new RepairError(diagnostic.code ?? "DI_INTERNAL_ERROR", 3);
+		if (diagnostic.code || !diagnostic.value)
+			throw new RepairError(diagnostic.code ?? "DI_INTERNAL_ERROR", 3, diagnostic.detail);
 		// Revision binding: the dry-run must validate the exact revision the caller
 		// observed. If the state advanced between the caller's read and this reread,
 		// report the same retryable conflict a real consume would.
@@ -1592,7 +1595,9 @@ function inspectState(read: Record<string, unknown>, legacy: boolean): Record<st
 	try {
 		if (legacy) validateLegacyDeepInterviewEnvelope(read);
 		else validateDeepInterviewV1Envelope(read);
-	} catch {
+	} catch (error) {
+		if (error instanceof DeepInterviewInvariantError)
+			throw new RepairError(error.code, 3, deepInterviewInvariantDetail(error));
 		throw new RepairError("DI_STATE_SCHEMA_INVALID", 3);
 	}
 	return read.state as Record<string, unknown>;
@@ -1600,6 +1605,7 @@ function inspectState(read: Record<string, unknown>, legacy: boolean): Record<st
 
 type DeepInterviewDiagnostic = {
 	code?: string;
+	detail?: DeepInterviewInvariantDetail;
 	legacy: boolean;
 	state?: Record<string, unknown>;
 	value?: Record<string, unknown>;
@@ -1628,7 +1634,11 @@ function diagnoseDeepInterviewState(
 	try {
 		state = inspectState(read.value, legacy);
 	} catch (error) {
-		return { code: error instanceof RepairError ? error.code : "DI_STATE_SCHEMA_INVALID", legacy };
+		return {
+			code: error instanceof RepairError ? error.code : "DI_STATE_SCHEMA_INVALID",
+			detail: error instanceof RepairError ? error.detail : undefined,
+			legacy,
+		};
 	}
 
 	if (read.value.current_phase === "complete" || read.value.current_phase === "handoff" || read.value.active === false)
@@ -1659,7 +1669,7 @@ async function inspect(parsed: ParsedRepairCommand, cwd: string): Promise<DeepIn
 	const path = statePath(cwd, session);
 	const diagnostic = diagnoseDeepInterviewState(await readExistingStateForMutation(path), path);
 	if (diagnostic.code || !diagnostic.state || !diagnostic.value)
-		throw new RepairError(diagnostic.code ?? "DI_INTERNAL_ERROR", 3);
+		throw new RepairError(diagnostic.code ?? "DI_INTERNAL_ERROR", 3, diagnostic.detail);
 	const { legacy, state, value } = diagnostic;
 	const revision =
 		typeof value.state_revision === "number" && Number.isSafeInteger(value.state_revision) ? value.state_revision : 0;
@@ -1868,7 +1878,7 @@ async function sanity(parsed: ParsedRepairCommand, cwd: string): Promise<DeepInt
 	const { session } = validateMutation(parsed, ["--session-id"], false);
 	const path = statePath(cwd, session);
 	const diagnostic = diagnoseDeepInterviewState(await readExistingStateForMutation(path), path);
-	const issues = diagnostic.code ? [issue(diagnostic.code)] : [];
+	const issues = diagnostic.code ? [issue(diagnostic.code, diagnostic.detail)] : [];
 	return {
 		status: 0,
 		stdout: `${JSON.stringify({

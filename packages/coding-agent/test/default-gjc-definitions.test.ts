@@ -221,7 +221,7 @@ describe("default GJC definitions", () => {
 			{ name: "round", type: "number", required: false },
 			{ name: "round-id", type: "string", required: false },
 			{ name: "round-key", type: "string", required: false },
-			{ name: "session-id", type: "string", required: true },
+			{ name: "session-id", type: "string", required: false },
 		]);
 		expect(argsFor("draft edit")).toEqual([
 			{ name: "draft-id", type: "string", required: true },
@@ -262,7 +262,7 @@ describe("default GJC definitions", () => {
 			{ name: "expected-revision", type: "number", required: true },
 			{ name: "input-json", type: "object", required: true },
 			{ name: "schema-version", type: "number", required: true },
-			{ name: "session-id", type: "string", required: true },
+			{ name: "session-id", type: "string", required: false },
 		]);
 		expect(argsFor("confirm-topology", true)).toEqual(argsFor("initialize-context", true));
 		expect(argsFor("record-answer", true)).toEqual([
@@ -275,7 +275,7 @@ describe("default GJC definitions", () => {
 			{ name: "round", type: "number", required: true },
 			{ name: "round-id", type: "string", required: false },
 			{ name: "schema-version", type: "number", required: true },
-			{ name: "session-id", type: "string", required: true },
+			{ name: "session-id", type: "string", required: false },
 		]);
 		expect(argsFor("apply-round-result", true)).toEqual([
 			{ name: "expected-revision", type: "number", required: true },
@@ -284,7 +284,7 @@ describe("default GJC definitions", () => {
 			{ name: "round", type: "number", required: true },
 			{ name: "round-id", type: "string", required: false },
 			{ name: "schema-version", type: "number", required: true },
-			{ name: "session-id", type: "string", required: true },
+			{ name: "session-id", type: "string", required: false },
 		]);
 		expect(argsFor("inspect")).toEqual([
 			{ name: "cursor", type: "string", required: false },
@@ -292,11 +292,11 @@ describe("default GJC definitions", () => {
 			{ name: "limit", type: "number", required: false },
 			{ name: "round-key", type: "string", required: false },
 			{ name: "selector", type: "enum", required: true },
-			{ name: "session-id", type: "string", required: true },
+			{ name: "session-id", type: "string", required: false },
 		]);
 		expect(argsFor("sanity-check")).toEqual([
 			{ name: "json", type: "boolean", required: true },
-			{ name: "session-id", type: "string", required: true },
+			{ name: "session-id", type: "string", required: false },
 		]);
 		expect(argsFor("inspect", true)).toEqual([]);
 		expect(argsFor("sanity-check", true)).toEqual([]);
