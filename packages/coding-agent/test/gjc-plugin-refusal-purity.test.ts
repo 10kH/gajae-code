@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { installGjcBundle } from "../src/extensibility/gjc-plugins";
-import { storedSourceLocatorForTest } from "../src/extensibility/gjc-plugins/lifecycle";
+import { isLocalDirectorySourceForTest, storedSourceLocatorForTest } from "../src/extensibility/gjc-plugins/lifecycle";
 
 /**
  * A refused install must be observable as a pure read. The transaction used to
@@ -171,6 +171,45 @@ describe("GJC bundle refusal purity", () => {
 		// entry that happens to share the source.
 		const userInstall = await installGjcBundle({ cwd }, "user", copy);
 		expect(userInstall.ok).toBe(true);
+	});
+
+	test("source classification never disagrees with the installer predicates", () => {
+		// The installer decides remote-vs-local with these exact predicates. If the
+		// refusal preflight ever classifies something as a local DIRECTORY that the
+		// installer treats as git or a tarball, the preflight reads a manifest that
+		// does not belong to that source, which is the shadowing hole this guards.
+		const looksLikeGit = (s: string): boolean =>
+			/^(https?|ssh|git):\/\//i.test(s) || /^git@/.test(s) || s.startsWith("git:");
+		const isTarball = (s: string): boolean => /\.(tgz|tar\.gz|tar)$/i.test(s);
+
+		const locators = [
+			"git:host/path",
+			"git@h:o/r.git",
+			"https://h/o/r.git",
+			"ssh://g@h/o/r",
+			"file:///tmp/b",
+			"https://h/o/pkg.tgz",
+			"/tmp/pkg.tgz",
+			"./local.tar.gz",
+			"/tmp/plain.tar",
+			"host:8080/path",
+			"C:\\Users\\me\\b",
+			"./rel",
+			"../esc",
+			"/abs/path",
+			"weird:name",
+			"/tmp/a:b",
+		];
+		for (const locator of locators) {
+			const installerTreatsAsRemote = looksLikeGit(locator) || isTarball(locator);
+			if (installerTreatsAsRemote) {
+				expect(isLocalDirectorySourceForTest(locator)).toBe(false);
+			}
+		}
+		// Ordinary local directories must still qualify, or refusal would stop
+		// being source-independent for the common case.
+		expect(isLocalDirectorySourceForTest("/abs/path")).toBe(true);
+		expect(isLocalDirectorySourceForTest("./rel")).toBe(true);
 	});
 
 	test("a git ref is preserved when rebuilding the stored locator", () => {

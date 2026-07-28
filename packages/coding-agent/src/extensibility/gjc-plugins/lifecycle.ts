@@ -200,6 +200,9 @@ function storedSourceLocator(source: GjcPluginRegistrySource): string {
 /** Exposed for locator-reconstruction tests; not part of the lifecycle API. */
 export const storedSourceLocatorForTest = storedSourceLocator;
 
+/** Exposed so a test can pin parity with the installer's source predicates. */
+export const isLocalDirectorySourceForTest = isLocalDirectorySource;
+
 async function readEffective(cwd: string): Promise<GjcPluginRegistryEntry[]> {
 	const [user, project] = await Promise.all([readRegistry("user", cwd), readRegistry("project", cwd)]);
 	return sortRegistryEntries([...user.plugins, ...project.plugins]);
@@ -244,9 +247,13 @@ function alreadyInstalled(name: string, scope: GjcPluginScope): GjcLifecycleErro
  * relative path and shadowed by a local directory of the same shape.
  */
 function isLocalDirectorySource(source: string): boolean {
+	// Mirrors installer `looksLikeGit`.
 	if (/^(https?|ssh|git):\/\//i.test(source)) return false;
 	if (/^git@/.test(source)) return false;
 	if (source.startsWith("git:")) return false;
+	// Mirrors installer `isTarball`: a local archive is extracted, not read in
+	// place, so its manifest is not at `<source>/gajae-plugin.json`.
+	if (/\.(tgz|tar\.gz|tar)$/i.test(source)) return false;
 	// Any other scheme-qualified locator is likewise not a local directory.
 	if (/^[a-z][a-z0-9+.-]*:\/\//i.test(source)) return false;
 	// scp-style `user@host:path` and bare `host:port/path` forms are remote.
