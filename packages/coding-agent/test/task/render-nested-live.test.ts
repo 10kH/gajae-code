@@ -105,6 +105,23 @@ describe("task renderer: nested live rendering", () => {
 		);
 		return Bun.stripANSI(component.render(160).join("\n"));
 	}
+	it("renders the fast-mode glyph in live and final subagent panels", async () => {
+		const theme = (await getThemeByName("red-claw"))!;
+		const liveText = await render(
+			makeRunningProgress({
+				id: "2-FastLive",
+				description: "Fast live child",
+				fastMode: true,
+			}),
+		);
+		const finalText = await renderResult({
+			...makeCompletedSubResult("3-FastFinal", "Fast final child"),
+			fastMode: true,
+		});
+
+		expect(liveText).toContain(`Fast live child ${theme.icon.fast}`);
+		expect(finalText).toContain(`Fast final child ${theme.icon.fast}`);
+	});
 
 	it("renders completed nested task results stored in extractedToolData.task while parent is in-progress", async () => {
 		const parent = makeRunningProgress({

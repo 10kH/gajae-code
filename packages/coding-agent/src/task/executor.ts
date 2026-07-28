@@ -241,6 +241,8 @@ export interface ExecutorOptions {
 	 * subagents, and a main-model fast-mode auto-disable does not clobber it.
 	 */
 	inheritedServiceTier?: ServiceTier;
+	/** Resolve whether the effective subagent tier grants fast mode for the selected provider. */
+	isFastForSubagentProvider?: (provider?: string) => boolean;
 	/** Override local:// protocol options so subagent shares parent's local:// root */
 	localProtocolOptions?: LocalProtocolOptions;
 	/**
@@ -1463,6 +1465,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				resolvedModelString = formatModelString(model);
 				activeProviderModelString = resolvedModelString;
 			}
+			progress.fastMode = model ? (options.isFastForSubagentProvider?.(model.provider) ?? false) : false;
 			if (authFallbackUsed && model && requestedModel) {
 				modelSubstitutionWarning = {
 					requested: formatModelString(requestedModel),
@@ -2167,6 +2170,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		contextWindow: progress.contextWindow,
 		modelOverride,
 		modelSubstitutionWarning,
+		fastMode: progress.fastMode,
 		error: exitCode !== 0 && stderr ? stderr : undefined,
 		aborted: wasAborted,
 		abortReason: finalAbortReason,
