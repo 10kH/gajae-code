@@ -14,6 +14,7 @@
 
 - Coordinator MCP now reconciles canonical structured questions from every workflow stage without misclassifying row-level gate diagnostics as malformed pagination, and unwraps accepted SDK gate-answer envelopes before reporting the terminal resolution.
 - Subagent task panels now show the fast-mode glyph for the resolved provider in both live and completed states (#3402).
+- Auto-retry now strips the whole trailing run of failed assistant attempts before continuing. A turn wedged by an `invalid_prompt` repair leaves two error assistant messages behind, and dropping only the last one left an assistant tail that `agent.continue()` refuses, so the retry died with "Retry continuation failed to start" and the turn was lost.
 
 ## [0.12.0] - 2026-07-28
 ### Resume fixes
