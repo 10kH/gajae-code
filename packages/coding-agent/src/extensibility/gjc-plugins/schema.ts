@@ -174,7 +174,7 @@ function parseTools(value: unknown, manifestPath: string): GjcPluginToolManifest
 		const description =
 			entry.description === undefined
 				? undefined
-				: manifestString(entry.description, `tools[${index}].description`, manifestPath);
+				: manifestSafeProse(entry.description, `tools[${index}].description`, manifestPath);
 		const sha256 =
 			entry.sha256 === undefined ? undefined : manifestString(entry.sha256, `tools[${index}].sha256`, manifestPath);
 		return { name, path, description, sha256, surface: "always-on" };
