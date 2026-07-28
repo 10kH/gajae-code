@@ -313,4 +313,207 @@ describe("deep-interview staged transitions", () => {
 			process.env.GJC_SESSION_ID = saved;
 		}
 	});
+
+	it("merges an incremental round patch without resending prior rounds", async () => {
+		const root = await tempDir();
+		await seed(root);
+		const stageRound = (record: Record<string, unknown>) =>
+			run(root, [
+				"stage",
+				"--for",
+				"record-round",
+				"--input",
+				JSON.stringify({ state: { rounds: [record] } }),
+				"--json",
+			]);
+		await stageRound({ round: 1, round_key: "r1", question_text: "q1", lifecycle: "answered" });
+		await run(root, ["apply", "--json"]);
+		// Second patch carries ONLY round 2 — round 1 must survive the merge.
+		await stageRound({ round: 2, round_key: "r2", question_text: "q2", lifecycle: "answered" });
+		await run(root, ["apply", "--json"]);
+		// Third patch enriches ONLY round 1 to scored — still no resend of round 2.
+		await stageRound({ round: 1, round_key: "r1", lifecycle: "scored", ambiguity: 0.3 });
+		const applied = parse((await run(root, ["apply", "--json"])).stdout);
+		expect(applied.ok).toBe(true);
+		const after = await readState(root);
+		const rounds = (after.state as Record<string, unknown>).rounds as Record<string, unknown>[];
+		expect(rounds.length).toBe(2);
+		const round1 = rounds.find(r => r.round_key === "r1");
+		expect(round1?.lifecycle).toBe("scored");
+		expect(round1?.question_text).toBe("q1");
+	});
+
+	it("derives current_ambiguity from the latest scored round, ignoring hand-set values", async () => {
+		const root = await tempDir();
+		await seed(root);
+		await run(root, [
+			"stage",
+			"--for",
+			"record-round",
+			"--input",
+			JSON.stringify({
+				state: {
+					// Agent tries to hand-set an unrelated current_ambiguity.
+					current_ambiguity: 0.01,
+					rounds: [{ round: 1, round_key: "r1", lifecycle: "scored", ambiguity: 0.37 }],
+				},
+			}),
+			"--json",
+		]);
+		const checked = parse((await run(root, ["check", "--json"])).stdout);
+		expect(checked.result_ambiguity).toBe(0.37);
+		const applied = parse((await run(root, ["apply", "--json"])).stdout);
+		expect(applied.current_ambiguity).toBe(0.37);
+		const after = await readState(root);
+		expect((after.state as Record<string, unknown>).current_ambiguity).toBe(0.37);
+	});
+
+	it("clamps derived ambiguity to the deterministic floor on disputed facts", async () => {
+		const root = await tempDir();
+		await seed(root);
+		await run(root, [
+			"stage",
+			"--for",
+			"merge-state",
+			"--input",
+			JSON.stringify({
+				state: {
+					established_facts: [{ id: "f1", statement: "disputed fact", round: 1, disputed: true }],
+					rounds: [{ round: 1, round_key: "r1", lifecycle: "scored", ambiguity: 0.02 }],
+				},
+			}),
+			"--json",
+		]);
+		const applied = parse((await run(root, ["apply", "--json"])).stdout);
+		// One unresolved disputed fact => floor 0.10 > reported 0.02.
+		expect(applied.current_ambiguity).toBe(0.1);
+		const after = await readState(root);
+		const state = after.state as Record<string, unknown>;
+		expect(state.current_ambiguity).toBe(0.1);
+		const round = (state.rounds as Record<string, unknown>[]).find(r => r.round_key === "r1");
+		expect(round?.reported_ambiguity).toBe(0.02);
+		expect(round?.ambiguity).toBe(0.1);
+	});
+
+	it("invalidates a draft when a sanctioned writer changes state without bumping revision", async () => {
+		const root = await tempDir();
+		await seed(root);
+		await run(root, [
+			"stage",
+			"--for",
+			"merge-state",
+			"--input",
+			JSON.stringify({ state: { note: "staged before reseed" } }),
+			"--json",
+		]);
+		// Re-seed goes through writeWorkflowEnvelopeAtomic, which does NOT bump
+		// state_revision — only the content sha catches this writer.
+		await seed(root);
+		const applied = await run(root, ["apply", "--json"]);
+		expect(applied.status).toBe(2);
+		expect(parse(applied.stderr)).toMatchObject({ ok: false, code: "DI_STAGE_REVISION_CONFLICT" });
+	});
+
+	it("strips runtime-owned lifecycle keys from staged payloads", async () => {
+		const root = await tempDir();
+		await seed(root);
+		const staged = await run(root, [
+			"stage",
+			"--for",
+			"merge-state",
+			"--input",
+			JSON.stringify({
+				current_phase: "handoff",
+				active: false,
+				skill: "ralplan",
+				state_revision: 999,
+				state: { note: "phase smuggle attempt" },
+			}),
+			"--json",
+		]);
+		expect(staged.status).toBe(0);
+		const stagedSummary = parse(staged.stdout);
+		expect(stagedSummary.ignored_runtime_owned_keys).toEqual(
+			expect.arrayContaining(["current_phase", "active", "skill", "state_revision"]),
+		);
+		const applied = await run(root, ["apply", "--json"]);
+		expect(applied.status).toBe(0);
+		const after = await readState(root);
+		expect(after.current_phase).toBe("interviewing");
+		expect(after.active).toBe(true);
+		expect(after.skill).toBe("deep-interview");
+	});
+
+	it("settles an apply replay after commit as an idempotent no-op", async () => {
+		const root = await tempDir();
+		await seed(root);
+		await run(root, [
+			"stage",
+			"--for",
+			"merge-state",
+			"--input",
+			JSON.stringify({ state: { note: "replay target" } }),
+			"--json",
+		]);
+		const first = parse((await run(root, ["apply", "--json"])).stdout);
+		expect(first.ok).toBe(true);
+		// Simulate a crash between commit and draft removal: re-create the exact
+		// consumed draft file, then replay apply.
+		const after = await readState(root);
+		expect(after.last_applied_draft_id).toBe(first.draft_id);
+		const draftPath = deepInterviewDraftPath(root, TEST_SESSION_ID);
+		await fs.writeFile(
+			draftPath,
+			`${JSON.stringify({
+				version: 1,
+				draft_id: first.draft_id,
+				session_id: TEST_SESSION_ID,
+				transition: "merge-state",
+				staged_against_revision: 0,
+				staged_against_sha256: "stale",
+				payload: { state: { note: "replay target" } },
+				created_at: new Date().toISOString(),
+			})}\n`,
+			"utf-8",
+		);
+		const replay = await run(root, ["apply", "--json"]);
+		expect(replay.status).toBe(0);
+		expect(parse(replay.stdout)).toMatchObject({ ok: true, already_applied: true, draft_id: first.draft_id });
+		// Draft settled.
+		await expect(fs.stat(draftPath)).rejects.toThrow();
+	});
+
+	it("honors an explicit --session-id on staged verbs", async () => {
+		const root = await tempDir();
+		await seed(root);
+		const other = "other-session";
+		const staged = await run(root, [
+			"stage",
+			"--for",
+			"initialize-context",
+			"--input",
+			JSON.stringify({ state: { initial_idea: "second session" } }),
+			"--session-id",
+			other,
+			"--json",
+		]);
+		expect(staged.status).toBe(0);
+		expect(parse(staged.stdout).session_id).toBe(other);
+		const applied = await run(root, ["apply", "--session-id", other, "--json"]);
+		expect(applied.status).toBe(0);
+		// Default-session draft state untouched; env-session check finds no draft.
+		const checked = await run(root, ["check", "--json"]);
+		expect(parse(checked.stderr)).toMatchObject({ ok: false, code: "DI_STAGE_NO_DRAFT" });
+	});
+
+	it("rejects oversized and non-regular @file inputs before reading", async () => {
+		const root = await tempDir();
+		await seed(root);
+		const bigPath = path.join(root, "big-payload.json");
+		await fs.writeFile(bigPath, `{"state":{"note":"${"x".repeat(1_100_000)}"}}`, "utf-8");
+		const oversized = await run(root, ["stage", "--for", "merge-state", "--input", `@${bigPath}`, "--json"]);
+		expect(parse(oversized.stderr)).toMatchObject({ ok: false, code: "DI_STAGE_INPUT_INVALID" });
+		const dirInput = await run(root, ["stage", "--for", "merge-state", "--input", `@${root}`, "--json"]);
+		expect(parse(dirInput.stderr)).toMatchObject({ ok: false, code: "DI_STAGE_INPUT_INVALID" });
+	});
 });

@@ -110,7 +110,11 @@
           "doctor",
           "kickoff",
           "write-spec",
-          "write-artifact"
+          "write-artifact",
+          "stage",
+          "check",
+          "apply",
+          "discard"
         ],
         "name": "session-id",
         "type": "string"
@@ -576,7 +580,11 @@
           "doctor",
           "kickoff",
           "write-spec",
-          "write-artifact"
+          "write-artifact",
+          "stage",
+          "check",
+          "apply",
+          "discard"
         ],
         "name": "session-id",
         "type": "string"
@@ -964,7 +972,11 @@
           "doctor",
           "kickoff",
           "write-spec",
-          "write-artifact"
+          "write-artifact",
+          "stage",
+          "check",
+          "apply",
+          "discard"
         ],
         "name": "session-id",
         "type": "string"
@@ -1450,7 +1462,11 @@
           "doctor",
           "kickoff",
           "write-spec",
-          "write-artifact"
+          "write-artifact",
+          "stage",
+          "check",
+          "apply",
+          "discard"
         ],
         "name": "session-id",
         "type": "string"
