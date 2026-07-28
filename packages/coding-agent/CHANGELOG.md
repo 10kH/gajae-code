@@ -11,6 +11,7 @@
 - Eager todo initialization now gives the model the actual phased `todo_write` payload shape (`ops` → `init` → `list` → `phase`/`items`) instead of instructing it to send unsupported `content`, `details`, and status fields, preventing the first forced todo call from failing validation (#3403).
 
 ### Fixed
+- Fast CLI help now advertises the active `search` built-in tool instead of the retired `grep` name.
 
 - Coordinator MCP now reconciles canonical structured questions from every workflow stage without misclassifying row-level gate diagnostics as malformed pagination, and unwraps accepted SDK gate-answer envelopes before reporting the terminal resolution.
 - Queued named tool choices are revalidated against the live model and active tool set before each request, preventing first-turn eager todo, resolve, or yield flows from sending a stale forced choice after preflight tool changes.
