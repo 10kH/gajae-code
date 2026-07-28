@@ -10,6 +10,7 @@ import {
 	installGjcBundle,
 	previewGjcBundleUpdate,
 } from "../src/extensibility/gjc-plugins";
+import { compileGjcPluginBundle } from "../src/extensibility/gjc-plugins/compiler";
 import { isGjcPluginSourceShape } from "../src/extensibility/gjc-plugins/installer";
 import { isLocalDirectorySourceForTest, storedSourceLocatorForTest } from "../src/extensibility/gjc-plugins/lifecycle";
 import { GjcPluginLoadError } from "../src/extensibility/gjc-plugins/types";
@@ -315,5 +316,36 @@ describe("GJC bundle refusal purity", () => {
 		expect(storedSourceLocatorForTest({ kind: "path", uri: "/tmp/b", ref: "ignored", resolvedAt: "t" })).toBe(
 			"/tmp/b",
 		);
+	});
+
+	test("hostile manifest bundle names are rejected before they can be stored or printed", async () => {
+		// The bundle name is echoed by the CLI, rendered in Settings, and used to
+		// derive a directory segment. Constraining it at the parse boundary means
+		// no display site can ever receive control sequences, path separators,
+		// whitespace, or credential-looking text.
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hostile-name-"));
+		tempDirs.push(dir);
+		for (const hostile of [
+			"evil\u001b[31mANSI",
+			"../../escape",
+			"tok=s3cr3t",
+			"with space",
+			"a".repeat(200),
+			"/abs/path",
+			"",
+		]) {
+			await fs.writeFile(
+				path.join(dir, "gajae-plugin.json"),
+				JSON.stringify({ kind: "gajae-code-plugin", name: hostile, version: "1.0.0" }),
+			);
+			await expect(compileGjcPluginBundle(dir)).rejects.toBeInstanceOf(GjcPluginLoadError);
+		}
+
+		// A legitimate name still compiles, so the constraint is not vacuous.
+		await fs.writeFile(
+			path.join(dir, "gajae-plugin.json"),
+			JSON.stringify({ kind: "gajae-code-plugin", name: "ordinary-bundle_1.0", version: "1.0.0" }),
+		);
+		await expect(compileGjcPluginBundle(dir)).resolves.toMatchObject({ name: "ordinary-bundle_1.0" });
 	});
 });
