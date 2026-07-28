@@ -4,7 +4,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
-import { installGjcBundle } from "../src/extensibility/gjc-plugins";
+import {
+	applyGjcBundleUpdate,
+	bundleIdentity,
+	installGjcBundle,
+	previewGjcBundleUpdate,
+} from "../src/extensibility/gjc-plugins";
 import { isLocalDirectorySourceForTest, storedSourceLocatorForTest } from "../src/extensibility/gjc-plugins/lifecycle";
 
 /**
@@ -210,6 +215,43 @@ describe("GJC bundle refusal purity", () => {
 		// being source-independent for the common case.
 		expect(isLocalDirectorySourceForTest("/abs/path")).toBe(true);
 		expect(isLocalDirectorySourceForTest("./rel")).toBe(true);
+	});
+
+	test("a vanished stored source yields typed source_unavailable, never a throw", async () => {
+		// Upstream review B2: with the stored source deleted, upgrade threw an
+		// uncaught GjcPluginLoadError whose message embedded the absolute source
+		// path. It must be a typed refusal with no locator in the message.
+		const cwd = await mkProjectCwd();
+		const copy = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-b2-src-"));
+		tempDirs.push(copy);
+		await fs.cp(sixSurface, copy, { recursive: true });
+		expect((await installGjcBundle({ cwd }, "project", copy)).ok).toBe(true);
+		const identity = bundleIdentity("project", "valid-six-surface-bundle");
+
+		await fs.rm(copy, { recursive: true, force: true });
+
+		const preview = await previewGjcBundleUpdate({ cwd }, identity);
+		expect(preview).toMatchObject({ ok: false, error: { code: "source_unavailable" } });
+		if (preview.ok) throw new Error("expected refusal");
+		expect(preview.error.message).not.toContain(copy);
+		expect(preview.error.message).not.toContain("/Users/");
+		expect(preview.error.message).not.toContain(os.tmpdir());
+
+		// Apply must fail the same way rather than throwing, using a token whose
+		// shape is valid but whose source no longer resolves.
+		const applied = await applyGjcBundleUpdate(
+			{ cwd },
+			{
+				identity,
+				candidateFingerprint: "0".repeat(64),
+				baselineFingerprint: "0".repeat(64),
+				decisionContextFingerprint: "0".repeat(64),
+				reviewedAt: new Date().toISOString(),
+			},
+		);
+		expect(applied).toMatchObject({ ok: false, error: { code: "source_unavailable" } });
+		if (applied.ok) throw new Error("expected refusal");
+		expect(applied.error.message).not.toContain(copy);
 	});
 
 	test("a git ref is preserved when rebuilding the stored locator", () => {

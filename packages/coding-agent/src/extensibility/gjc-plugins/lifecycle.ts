@@ -241,6 +241,33 @@ function alreadyInstalled(name: string, scope: GjcPluginScope): GjcLifecycleErro
 }
 
 /**
+ * Run a source-resolving operation and convert a resolution failure into the
+ * typed `source_unavailable` result the lifecycle contract promises.
+ *
+ * Re-resolution reaches the network and the filesystem, so it can throw with a
+ * message carrying the stored locator. Letting that escape would both crash the
+ * CLI with an unhandled rejection and echo an absolute path, which is the exact
+ * leak class the safe DTOs exist to prevent.
+ */
+async function withSourceAvailability<T>(
+	identity: GjcBundleIdentity,
+	run: () => Promise<GjcLifecycleResult<T>>,
+): Promise<GjcLifecycleResult<T>> {
+	try {
+		return await run();
+	} catch {
+		return {
+			ok: false,
+			error: fail(
+				"source_unavailable",
+				`The stored source for GJC bundle "${identity.name}" could not be resolved`,
+				`gjc plugin install <source> --${identity.scope}`,
+			),
+		};
+	}
+}
+
+/**
  * True only for strings the installer would treat as a local path rather than
  * a remote locator. This deliberately mirrors the installer's own `looksLikeGit`
  * predicate: if the two ever disagreed, a remote locator could be read as a
@@ -371,44 +398,50 @@ export async function previewGjcBundleUpdate(
 	}
 
 	const effective = await readEffective(ctx.cwd);
-	return await resolveGjcBundleCandidate(storedSourceLocator(entry.source), async ({ bundle }) => {
-		if (bundle.name !== entry.name) {
-			return {
-				ok: false as const,
-				error: fail(
-					"identity_mismatch",
-					`Source now declares "${bundle.name}" but "${entry.name}" is installed; install the new bundle and uninstall the old one`,
-					`gjc plugin install <source> --${identity.scope}`,
-				),
-			};
-		}
-		const candidateIds = surfaceIdsOf(bundle.surfaces);
-		const delta = diffSurfaceIds(surfaceIdsOf(entry.surfaces), candidateIds);
-		const candidateHash = candidateFingerprint(identity.scope, bundle);
-		const baselineHash = baselineFingerprint(entry);
-		const contextHash = decisionContextFingerprint(identity, effective);
-		const token: GjcReviewedUpdateToken = {
-			identity,
-			candidateFingerprint: candidateHash,
-			baselineFingerprint: baselineHash,
-			decisionContextFingerprint: contextHash,
-			reviewedAt: new Date().toISOString(),
-		};
-		return {
-			ok: true as const,
-			value: {
+	// Re-resolution reaches the network and the filesystem, so it can throw with
+	// a cause carrying the raw locator. Convert that into the typed
+	// `source_unavailable` result the contract promises, rather than letting an
+	// exception escape and echo the stored path.
+	return await withSourceAvailability(identity, async () =>
+		resolveGjcBundleCandidate(storedSourceLocator(entry.source), async ({ bundle }) => {
+			if (bundle.name !== entry.name) {
+				return {
+					ok: false as const,
+					error: fail(
+						"identity_mismatch",
+						`Source now declares "${bundle.name}" but "${entry.name}" is installed; install the new bundle and uninstall the old one`,
+						`gjc plugin install <source> --${identity.scope}`,
+					),
+				};
+			}
+			const candidateIds = surfaceIdsOf(bundle.surfaces);
+			const delta = diffSurfaceIds(surfaceIdsOf(entry.surfaces), candidateIds);
+			const candidateHash = candidateFingerprint(identity.scope, bundle);
+			const baselineHash = baselineFingerprint(entry);
+			const contextHash = decisionContextFingerprint(identity, effective);
+			const token: GjcReviewedUpdateToken = {
 				identity,
-				current: toBundleSummary(entry),
-				candidateVersion: bundle.version,
-				candidateManifestHash: bundle.manifestHash,
-				addedSurfaceIds: delta.addedSurfaceIds,
-				removedSurfaceIds: delta.removedSurfaceIds,
-				retainedSurfaceIds: delta.retainedSurfaceIds,
-				changed: candidateHash !== targetFingerprint(entry),
-				token,
-			},
-		};
-	});
+				candidateFingerprint: candidateHash,
+				baselineFingerprint: baselineHash,
+				decisionContextFingerprint: contextHash,
+				reviewedAt: new Date().toISOString(),
+			};
+			return {
+				ok: true as const,
+				value: {
+					identity,
+					current: toBundleSummary(entry),
+					candidateVersion: bundle.version,
+					candidateManifestHash: bundle.manifestHash,
+					addedSurfaceIds: delta.addedSurfaceIds,
+					removedSurfaceIds: delta.removedSurfaceIds,
+					retainedSurfaceIds: delta.retainedSurfaceIds,
+					changed: candidateHash !== targetFingerprint(entry),
+					token,
+				},
+			};
+		}),
+	);
 }
 
 /**
@@ -434,73 +467,78 @@ export async function applyGjcBundleUpdate(
 		};
 	}
 
-	const result = await runGjcBundleTransaction(storedSourceLocator(entry.source), {
-		scope: identity.scope,
-		cwd: ctx.cwd,
-		decide: async ({ existing, effective, bundle, candidate }): Promise<GjcBundleTransactionDecision> => {
-			if (!existing) return { kind: "abort", error: notInstalled(identity) };
-			if (bundle.name !== existing.name || !identityEquals(bundleIdentity(identity.scope, bundle.name), identity)) {
-				return {
-					kind: "abort",
-					error: fail(
-						"identity_mismatch",
-						`Source now declares "${bundle.name}" but "${existing.name}" is installed; install the new bundle and uninstall the old one`,
-						`gjc plugin install <source> --${identity.scope}`,
-					),
-				};
-			}
-			const candidateHash = candidateFingerprint(identity.scope, bundle);
-			if (candidateHash !== token.candidateFingerprint) {
-				return {
-					kind: "abort",
-					error: fail("stale_candidate", "The source changed since it was reviewed; preview the update again"),
-				};
-			}
-			const baselineHash = baselineFingerprint(existing);
-			if (baselineHash !== token.baselineFingerprint) {
-				return {
-					kind: "abort",
-					error: fail(
-						"stale_baseline",
-						"The installed bundle changed since it was reviewed; preview the update again",
-					),
-				};
-			}
-			const contextHash = decisionContextFingerprint(identity, effective);
-			if (contextHash !== token.decisionContextFingerprint) {
-				return {
-					kind: "abort",
-					error: fail(
-						"stale_decision_context",
-						"Installed bundles changed since the update was reviewed; preview the update again",
-					),
-				};
-			}
-			if (candidateHash === targetFingerprint(existing)) return { kind: "noop", entry: existing };
+	return await withSourceAvailability<GjcUpdateApplyResult>(identity, async () => {
+		const result = await runGjcBundleTransaction(storedSourceLocator(entry.source), {
+			scope: identity.scope,
+			cwd: ctx.cwd,
+			decide: async ({ existing, effective, bundle, candidate }): Promise<GjcBundleTransactionDecision> => {
+				if (!existing) return { kind: "abort", error: notInstalled(identity) };
+				if (
+					bundle.name !== existing.name ||
+					!identityEquals(bundleIdentity(identity.scope, bundle.name), identity)
+				) {
+					return {
+						kind: "abort",
+						error: fail(
+							"identity_mismatch",
+							`Source now declares "${bundle.name}" but "${existing.name}" is installed; install the new bundle and uninstall the old one`,
+							`gjc plugin install <source> --${identity.scope}`,
+						),
+					};
+				}
+				const candidateHash = candidateFingerprint(identity.scope, bundle);
+				if (candidateHash !== token.candidateFingerprint) {
+					return {
+						kind: "abort",
+						error: fail("stale_candidate", "The source changed since it was reviewed; preview the update again"),
+					};
+				}
+				const baselineHash = baselineFingerprint(existing);
+				if (baselineHash !== token.baselineFingerprint) {
+					return {
+						kind: "abort",
+						error: fail(
+							"stale_baseline",
+							"The installed bundle changed since it was reviewed; preview the update again",
+						),
+					};
+				}
+				const contextHash = decisionContextFingerprint(identity, effective);
+				if (contextHash !== token.decisionContextFingerprint) {
+					return {
+						kind: "abort",
+						error: fail(
+							"stale_decision_context",
+							"Installed bundles changed since the update was reviewed; preview the update again",
+						),
+					};
+				}
+				if (candidateHash === targetFingerprint(existing)) return { kind: "noop", entry: existing };
 
-			// Quarantine is recomputed against the candidate, never carried forward,
-			// so a surface the update fixes is not left permanently blocked.
-			const reconciled = reconcileEnablement(existing.disabledSurfaceIds, surfaceIdsOf(bundle.surfaces));
-			const next: GjcPluginRegistryEntry = {
-				...candidate,
-				enabled: existing.enabled,
-				installedAt: existing.installedAt,
-				disabledSurfaceIds: reconciled.disabledSurfaceIds,
-			};
-			if (reconciled.quarantine.length > 0) next.quarantine = reconciled.quarantine;
-			else delete next.quarantine;
-			return { kind: "commit", entry: next };
-		},
+				// Quarantine is recomputed against the candidate, never carried forward,
+				// so a surface the update fixes is not left permanently blocked.
+				const reconciled = reconcileEnablement(existing.disabledSurfaceIds, surfaceIdsOf(bundle.surfaces));
+				const next: GjcPluginRegistryEntry = {
+					...candidate,
+					enabled: existing.enabled,
+					installedAt: existing.installedAt,
+					disabledSurfaceIds: reconciled.disabledSurfaceIds,
+				};
+				if (reconciled.quarantine.length > 0) next.quarantine = reconciled.quarantine;
+				else delete next.quarantine;
+				return { kind: "commit", entry: next };
+			},
+		});
+
+		if (result.status === "aborted") return { ok: false, error: result.error };
+		if (result.status === "noop") {
+			return { ok: true, value: { status: "unchanged", summary: toBundleSummary(result.entry), remnantCount: 0 } };
+		}
+		return {
+			ok: true,
+			value: { status: "updated", summary: toBundleSummary(result.entry), remnantCount: result.remnants.length },
+		};
 	});
-
-	if (result.status === "aborted") return { ok: false, error: result.error };
-	if (result.status === "noop") {
-		return { ok: true, value: { status: "unchanged", summary: toBundleSummary(result.entry), remnantCount: 0 } };
-	}
-	return {
-		ok: true,
-		value: { status: "updated", summary: toBundleSummary(result.entry), remnantCount: result.remnants.length },
-	};
 }
 
 async function mutateEntry(
