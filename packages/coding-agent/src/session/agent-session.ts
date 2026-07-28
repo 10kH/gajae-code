@@ -163,12 +163,15 @@ export interface ForkContextSeedOptions {
 import { MacOSPowerAssertion } from "@gajae-code/natives";
 import {
 	extractRetryHint,
+	hasFsCode,
+	isEacces,
 	isEnoent,
 	isUnexpectedSocketCloseMessage,
 	logger,
 	prompt,
 	Snowflake,
 } from "@gajae-code/utils";
+
 import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append-only-mode";
 import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager } from "../async";
 import { reset as resetCapabilities } from "../capability";
@@ -4769,6 +4772,19 @@ export class AgentSession {
 				prepared?.managedLegacyLocalMigrationSource ?? this.sessionManager.getManagedLegacyLocalMigrationSource(),
 			getSessionId: () => prepared?.sessionId ?? this.sessionManager.getSessionId(),
 		};
+	}
+
+	/** Defer local:// provisioning when a read-only session load cannot create its artifact root. */
+	async #initializeLocalRootForLoadedSession(): Promise<void> {
+		try {
+			await initializeLocalRoot(this.#localProtocolOptions());
+		} catch (error) {
+			if (!isEacces(error) && !hasFsCode(error, "EPERM") && !hasFsCode(error, "EROFS")) throw error;
+			logger.debug("Deferred local root initialization for read-only session load", {
+				sessionFile: this.sessionManager.getSessionFile(),
+				error: String(error),
+			});
+		}
 	}
 
 	#maybeAbortStreamingEdit(event: AgentEvent, generation: number): void {
@@ -9760,6 +9776,16 @@ export class AgentSession {
 	 */
 	getSessionDefaultModelSelector(): string | undefined {
 		return getSessionContextForInternalRead(this.sessionManager).models.default;
+	}
+	/**
+	 * Resolve the model that `modelRoles.default` currently points to, independent
+	 * of whatever model this session's log last recorded. Used by the TUI resume
+	 * flow's `session.resumeModelBehavior: "ask"` prompt to offer the currently
+	 * configured default as an alternative to the session's saved model.
+	 */
+	resolveConfiguredDefaultModel(): Model | undefined {
+		const availableModels = this.#modelRegistry.getAvailable();
+		return this.#resolveRoleModelFull("default", availableModels, undefined).model;
 	}
 
 	/**
@@ -15185,7 +15211,7 @@ export class AgentSession {
 				// workflow-gate emitter, and hooks cannot resolve against an ungated
 				// root. The manager-rotation window itself is tracked in #3138
 				// (#2797 / #2925).
-				if (switchingToDifferentSession) await initializeLocalRoot(this.#localProtocolOptions());
+				if (switchingToDifferentSession) await this.#initializeLocalRootForLoadedSession();
 				this.#syncAgentSessionId();
 				this.#rekeyHindsightMemoryForCurrentSessionId();
 
@@ -15207,9 +15233,13 @@ export class AgentSession {
 					this.#rebindProviderSessionState(new Map());
 				}
 
+				const resumeModelBehavior = this.settings.get("session.resumeModelBehavior");
 				const configuredDefaultChain = sessionContext.configuredModelChains.default?.entries;
+				const settingsDefaultEntries = normalizeModelSelectorValue(this.settings.getModelRole("default"));
 				const defaultEntries =
-					configuredDefaultChain ?? (sessionContext.models.default ? [sessionContext.models.default] : []);
+					resumeModelBehavior === "useCurrentDefault"
+						? settingsDefaultEntries
+						: (configuredDefaultChain ?? (sessionContext.models.default ? [sessionContext.models.default] : []));
 				this.#defaultFallbackController = undefined;
 				if (defaultEntries.length > 0) {
 					const resolution = await resolveModelChainWithAuth(
@@ -15266,7 +15296,7 @@ export class AgentSession {
 				// Establish the successor's durable session identity only after every
 				// restored state facet is live. Identity-bound extension hooks run below.
 				await this.sessionManager.ensureOnDisk();
-				if (!switchingToDifferentSession) await initializeLocalRoot(this.#localProtocolOptions());
+				if (!switchingToDifferentSession) await this.#initializeLocalRootForLoadedSession();
 
 				if (switchingToDifferentSession) {
 					// The local:// migration gate for this successor already ran above,
