@@ -546,6 +546,11 @@ export function getBlobsDir(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "blobs", "data");
 }
 
+/** Get the resident-text cache root for a profile agent directory. */
+export function getResidentCacheRootDir(profileAgentDir: string): string {
+	return dirs.agentSubdir(profileAgentDir, "resident-cache", "cache");
+}
+
 /** Get the custom themes directory (~/.gjc/agent/themes). */
 export function getCustomThemesDir(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "themes");

@@ -1039,6 +1039,7 @@ describe("runSubprocess yield reminders", () => {
 			],
 			getApiKey: async (model: { id: string }) => (model.id === "gpt-5.5" ? "sk-test" : undefined),
 		} as unknown as import("../../src/config/model-registry").ModelRegistry;
+		const isFastForSubagentProvider = vi.fn((provider?: string) => provider === "openai-codex");
 
 		const result = await runSubprocess({
 			...baseOptions,
@@ -1046,6 +1047,7 @@ describe("runSubprocess yield reminders", () => {
 			modelOverride: "openai-codex/gpt-5.3-codex:high",
 			parentActiveModelPattern: "openai-codex/gpt-5.5",
 			modelRegistry,
+			isFastForSubagentProvider,
 		});
 
 		expect(result.modelSubstitutionWarning).toEqual({
@@ -1053,6 +1055,8 @@ describe("runSubprocess yield reminders", () => {
 			effective: "openai-codex/gpt-5.5",
 			reason: "auth_unavailable",
 		});
+		expect(isFastForSubagentProvider).toHaveBeenCalledWith("openai-codex");
+		expect(result.fastMode).toBe(true);
 		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.model?.id).toBe("gpt-5.5");
 		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.modelSubstitution).toMatchObject({
 			reason: "auth_unavailable",

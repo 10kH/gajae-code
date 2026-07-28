@@ -551,6 +551,40 @@ export const GJC_TEAM_API_OPERATIONS = [
 	"write-task-approval",
 ] as const;
 
+export type GjcTeamApiOperation = (typeof GJC_TEAM_API_OPERATIONS)[number];
+
+export class UnknownGjcTeamApiOperationError extends Error {
+	readonly code = "unknown_team_api_operation";
+	readonly operation: string;
+	readonly suggestions: readonly string[];
+
+	constructor(operation: string, suggestions: readonly string[]) {
+		const guidance =
+			suggestions.length > 0
+				? `did you mean ${suggestions.join(" or ")}?`
+				: "run gjc team api --help for supported operations";
+		super(`unknown_team_api_operation:${operation}; ${guidance}`);
+		this.name = "UnknownGjcTeamApiOperationError";
+		this.operation = operation;
+		this.suggestions = suggestions;
+	}
+}
+
+function isGjcTeamApiOperation(operation: string): operation is GjcTeamApiOperation {
+	return (GJC_TEAM_API_OPERATIONS as readonly string[]).includes(operation);
+}
+
+function unknownGjcTeamApiOperationSuggestions(operation: string): readonly string[] {
+	if (operation === "heartbeat") return ["read-worker-heartbeat", "update-worker-heartbeat"];
+	if (operation === "get-task") return ["read-task"];
+	return [];
+}
+
+function resolveGjcTeamApiOperation(operation: string): GjcTeamApiOperation {
+	if (isGjcTeamApiOperation(operation)) return operation;
+	throw new UnknownGjcTeamApiOperationError(operation, unknownGjcTeamApiOperationSuggestions(operation));
+}
+
 function currentTimeMs(): number {
 	return gjcTeamRuntimeTestSeams?.nowMs?.() ?? Date.now();
 }
@@ -2487,7 +2521,11 @@ function tagTmuxSessionAsGjcLeader(tmuxCommand: string, sessionName: string): bo
 	return result.exitCode === 0;
 }
 
-function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEnv): GjcTmuxLeaderContext {
+function readCurrentTmuxLeaderContext(
+	tmuxCommand: string,
+	env: NodeJS.ProcessEnv,
+	adoptUnmanagedSession = true,
+): GjcTmuxLeaderContext {
 	if (Bun.which(tmuxCommand) === null)
 		throw new Error(buildTeamTmuxLeaderRequirementMessage(`tmux_not_installed:${tmuxCommand}`));
 	// Prefer the explicit GJC-managed session name propagated by `gjc --tmux`
@@ -2520,7 +2558,7 @@ function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEn
 	const [sessionName = "", windowIndex = ""] = sessionAndWindow.split(":");
 	if (!sessionName || !windowIndex || !leaderPaneId.startsWith("%"))
 		throw new Error(buildTeamTmuxLeaderRequirementMessage(`invalid_tmux_context:${result.stdout.toString().trim()}`));
-	if (readGjcTmuxProfileValue(tmuxCommand, sessionName) !== GJC_TMUX_PROFILE_VALUE) {
+	if (adoptUnmanagedSession && readGjcTmuxProfileValue(tmuxCommand, sessionName) !== GJC_TMUX_PROFILE_VALUE) {
 		// Adopt any real tmux leader as a GJC team leader — including a session
 		// the user created outside `gjc --tmux` — by writing GJC's @gjc-profile
 		// ownership tag and reading it back. A provider that round-trips tmux
@@ -2542,6 +2580,20 @@ function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEn
 		leaderPaneId,
 		target: `${sessionName}:${windowIndex}`,
 	};
+}
+/**
+ * Check whether the current process can launch a team without changing tmux state.
+ * Unlike the launch path, this never adopts or tags an unmanaged tmux session.
+ */
+export function probeGjcTeamAvailability(
+	env: NodeJS.ProcessEnv = process.env,
+): { available: true } | { available: false; reason: string } {
+	try {
+		readCurrentTmuxLeaderContext(resolveGjcTmuxCommand(env), env, false);
+		return { available: true };
+	} catch (error) {
+		return { available: false, reason: error instanceof Error ? error.message : String(error) };
+	}
 }
 function isBunVirtualPath(candidate: string | undefined): boolean {
 	const normalized = candidate?.trim().replace(/\\/g, "/").toLowerCase();
@@ -4936,12 +4988,13 @@ export async function executeGjcTeamApiOperation(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<unknown> {
+	const resolvedOperation = resolveGjcTeamApiOperation(operation);
 	const teamName = String(input.team_name ?? input.teamName ?? "").trim();
 	if (!teamName) throw new Error("missing_team_name");
 	const workerInput = input.worker ?? input.worker_id ?? input.workerId;
 	const worker = String(workerInput ?? "worker-1");
 	const explicitWorker = workerInput == null ? undefined : String(workerInput);
-	switch (operation) {
+	switch (resolvedOperation) {
 		case "list-tasks":
 			return { tasks: await listGjcTeamTasks(teamName, cwd, env) };
 		case "read-task":
@@ -5287,7 +5340,8 @@ export async function executeGjcTeamApiOperation(
 		case "read-shutdown-ack":
 			return readGjcShutdownAck(teamName, worker, cwd, env);
 		default:
-			throw new Error(`unknown_team_api_operation:${operation}`);
+			resolvedOperation satisfies never;
+			throw new UnknownGjcTeamApiOperationError(operation, []);
 	}
 }
 

@@ -227,8 +227,18 @@ describe("system Handlebars prompt templates", () => {
 		expect(rendered).toContain("<tool-discovery>");
 		expect(rendered).toContain("`search_tool_bm25`");
 		expect(rendered).toContain("Discoverable capabilities include browser automation");
+		expect(rendered).toContain("Activation makes a tool available, but does not perform its action.");
+		expect(rendered).toContain("call `task` before saying agents are running");
+		expect(rendered).toContain("Do not claim a web search, browser action, integration, or subagent ran");
 		expect(rendered).not.toContain("Discoverable tools:");
 		expect(rendered).not.toContain("Control a headless browser");
+
+		const withoutTask = prompt.render(template, {
+			...baseRenderContext,
+			toolDiscoveryActive: true,
+			tools: ["read", "bash", "search_tool_bm25"],
+		});
+		expect(withoutTask).toContain("search for `subagent delegation` before saying agents are running");
 
 		const disabled = prompt.render(template, { ...baseRenderContext, toolDiscoveryActive: false });
 		expect(disabled).not.toContain("<tool-discovery>");
