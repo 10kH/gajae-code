@@ -321,6 +321,19 @@ describe("workflow mutation guard", () => {
 			`cat <<-'TABDOC' > /tmp/spec.md\n\tindented body a > b\n\tTABDOC`,
 			`cat <<'CNT' | wc -l\n${specBody}\nCNT`,
 			`cat <<'PIPE' | grep -c retrieval | sort\n${specBody}\nPIPE`,
+			// A stray quote inside a comment must not poison cross-line quote state (Codex P2).
+			`# don't trip on this apostrophe\ncat <<'CMT' > /tmp/spec.md\n${specBody}\nCMT`,
+			// `#` after `)` is a comment boundary too (Codex P2).
+			`(true)# don't trip here either\ncat <<'PRN' > /tmp/spec.md\n${specBody}\nPRN`,
+			// A spec body DOCUMENTING a shadow definition is inert data, not a real shadow (Codex P2).
+			`cat <<'SHD' > /tmp/spec.md\nexample: cat() { bash -s; } and alias cat=evil\n${specBody}\nSHD`,
+			// eval/source/. in ARGUMENT position never trip the evaluated-payload fail-close (Codex P2).
+			`find . -name '*.md'\ncat <<'ARG' > /tmp/spec.md\n${specBody}\nARG`,
+			`echo eval source .\ncat <<'TOK' > /tmp/spec.md\n${specBody}\nTOK`,
+			// `function cat` in ARGUMENT position is not a shadow declaration (Codex P2).
+			`echo function cat\ncat <<'FNC' > /tmp/spec.md\n${specBody}\nFNC`,
+			// `command -v eval` only DESCRIBES eval; it is not an evaluated command (Codex P2).
+			`command -v eval\ncat <<'CMV' > /tmp/spec.md\n${specBody}\nCMV`,
 		]) {
 			const decision = await getWorkflowMutationDecision({
 				cwd,
@@ -354,6 +367,40 @@ describe("workflow mutation guard", () => {
 			// A downstream pipe stage can execute the body even when the opener is inert (Codex P1).
 			"cat <<'EOF' | bash\nrm src/product.ts\nEOF",
 			"cat <<'EOF' | grep -v noop | sh\nrm src/product.ts\nEOF",
+			// Escaped `|` keeps `cat` as an ARGUMENT to bash -s, not a pipe stage (Codex P1).
+			"bash -s \\| cat <<'EOF'\nrm src/product.ts\nEOF",
+			// A shadowed allowlisted name executes the body through its function body (Codex P1).
+			"cat() { bash -s; }; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// `)` closing a $() substitution is a word char, so `#` stays literal and the shadow stays live (Codex P1).
+			"x=$(true)#lit; cat() { bash -s; }; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// Arithmetic $(( )) has nested parens: depth must stay balanced (Codex P1).
+			"x=$((1))#lit; cat() { bash -s; }\ncat <<'EOF'\nrm src/product.ts\nEOF",
+			// eval after a reserved word is still a command position (Codex P1).
+			"if eval 'cat(){ bash -s; }'; then :; fi\ncat <<'EOF'\nrm src/product.ts\nEOF",
+			// `builtin`/`command` wrappers still reach the evaluated command (Codex P1).
+			"builtin eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			"command -- eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// Leading redirections precede the command word — attached or separated (Codex P1).
+			"</dev/null eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			"< /dev/null eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// Bash's `function name()` hybrid form is still a declaration (Codex P1).
+			"function cat() { bash -s; }; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// Function shadows after reserved words are still declarations (Codex P1).
+			"if true; then cat() { bash -s; }; fi\ncat <<'EOF'\nrm src/product.ts\nEOF",
+			// A nested subshell's `)` is an operator: `#` after it comments out the fake opener (Codex P1).
+			"x=$( (true)# ; cat <<'EOF'\n)\nrm src/product.ts\nEOF",
+			// `case` pattern `)` desyncs the depth scanner — fail closed (Codex P1).
+			"x=$(case x in x) true;; esac)#lit; cat() { bash -s; }\ncat <<'EOF'\nrm src/product.ts\nEOF",
+			// eval/source can install a shadow from quoted data the syntax view blanked (Codex P1).
+			"eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			"source /dev/stdin <<'DEF'\ncat(){ bash -s; }\nDEF\ncat <<'EOF'\nrm src/product.ts\nEOF",
+			// Quoted/escaped spellings of eval must still be recognized after quote removal (Codex P1).
+			"e\\val 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			"'ev'al 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// A line-continued opener hides the downstream interpreter stage (Codex P1).
+			"cat <<'EOF' \\\n| bash\nrm src/product.ts\nEOF",
+			// A multiline double-quoted string containing `cat <<'EOF'` is data, not an opener (Codex P1).
+			"printf '%s' \"\ncat <<'EOF'\n\" > /dev/null\nrm src/product.ts\nEOF",
 			// Unquoted delimiter + command substitution in body expands at runtime — fail closed.
 			"cat <<EOF > /tmp/out.md\n$(rm src/product.ts)\nEOF",
 			// Unterminated heredoc is unparseable — body scanned as before, mutation caught.
