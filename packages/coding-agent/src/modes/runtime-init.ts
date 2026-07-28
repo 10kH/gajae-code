@@ -94,6 +94,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 		{
 			getModel: () => session.model,
 			isIdle: () => !session.isStreaming,
+			getActivePromptHandle: () => session.activePromptHandle,
 			abort: () => session.abort(),
 			abortPromptAndWait: (handle, abortOptions) => session.abortPromptAndWait(handle, abortOptions),
 			hasPendingMessages: () => session.queuedMessageCount > 0,

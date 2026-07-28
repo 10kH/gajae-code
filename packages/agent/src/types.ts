@@ -41,9 +41,14 @@ export interface RunResourceEntry {
 export type RunSettlementProof = { status: "settled" } | { status: "unfenced"; pending: RunResourceEntry[] };
 
 export interface RunResourceLedger {
+	/** Reserve a run handle before publishing its `agent_start` event. */
+	open(resourceRunId: string): void;
 	track(resourceRunId: string, kind: RunResourceKind, label: string, settled: PromiseLike<unknown>): void;
 	pending(resourceRunId: string): RunResourceEntry[];
+	/** Seal a run after terminal event publication; only sealed empty runs settle. */
+	seal(resourceRunId: string): void;
 	waitForSettlement(resourceRunId: string, options: { graceMs: number }): Promise<RunSettlementProof>;
+	/** Terminally detach a run; its bounded tombstone remains unfenced forever. */
 	quarantine(resourceRunId: string): RunResourceEntry[];
 }
 
@@ -372,8 +377,8 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 */
 	telemetry?: AgentTelemetryConfig;
 	/**
-	 * Optional prompt-run resource ownership ledger. When present, provider and
-	 * tool work is tracked until its underlying promise settles.
+	 * Optional prompt-run resource ownership ledger. Provider and scheduler-level tool
+	 * work is tracked until its owned lifecycle promise settles.
 	 */
 	resourceLedger?: RunResourceLedger;
 	/** Stable resource ownership identifier for this prompt run. */

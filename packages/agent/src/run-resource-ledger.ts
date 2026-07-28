@@ -1,97 +1,209 @@
 import type { RunResourceEntry, RunResourceLedger, RunSettlementProof } from "./types";
 
+const MAX_TOMBSTONE_ENTRIES = 256;
+
+type RunLifecycle = "open" | "sealed" | "quarantined";
+
 interface TrackedResource {
 	entry: RunResourceEntry;
-	/** Current owning key; quarantine rebinds it so real settlement still releases the entry. */
-	runKey: string;
+}
+
+interface RunState {
+	lifecycle: RunLifecycle;
+	resources: Map<string, TrackedResource>;
+	/** Bounded public snapshot retained after quarantine. */
+	tombstone: RunResourceEntry[];
+	waiters: Set<SettlementWaiter>;
+}
+
+interface SettlementWaiter {
+	resolve: (proof: RunSettlementProof) => void;
+	timer: NodeJS.Timeout;
+}
+
+function copyEntries(entries: readonly RunResourceEntry[]): RunResourceEntry[] {
+	return entries.map(entry => ({ ...entry }));
 }
 
 export function createRunResourceLedger(): RunResourceLedger {
-	const runs = new Map<string, Map<string, TrackedResource>>();
-	const waiters = new Map<string, Set<() => void>>();
+	const runs = new Map<string, RunState>();
 	let sequence = 0;
 
-	const notifySettled = (resourceRunId: string): void => {
-		// The run map is deleted once empty, so an absent map also means settled; keying
-		// only on `size === 0` would leave waiters asleep until their grace timer fired.
-		if ((runs.get(resourceRunId)?.size ?? 0) !== 0) return;
-		for (const resolve of waiters.get(resourceRunId) ?? []) resolve();
-		waiters.delete(resourceRunId);
+	const snapshot = (state: RunState): RunResourceEntry[] => {
+		if (state.lifecycle === "quarantined") return copyEntries(state.tombstone);
+		return [...state.resources.values()].map(resource => ({ ...resource.entry }));
 	};
 
-	const remove = (resourceRunId: string, id: string): void => {
-		// Quarantine moves entries to a private key, so resolve the entry's current owner
-		// instead of trusting the key captured when the resource was tracked.
-		let ownerKey = resourceRunId;
-		let resources = runs.get(ownerKey);
-		if (!resources?.has(id)) {
-			ownerKey = "";
-			for (const [key, candidate] of runs)
-				if (candidate.get(id)?.runKey === key) {
-					ownerKey = key;
-					resources = candidate;
-					break;
-				}
-			if (!ownerKey) return;
+	const settlementProof = (state: RunState): RunSettlementProof | undefined => {
+		if (state.lifecycle === "quarantined") {
+			return { status: "unfenced", pending: copyEntries(state.tombstone) };
 		}
-		if (!resources?.delete(id)) return;
-		if (resources.size === 0) {
-			runs.delete(ownerKey);
-			notifySettled(ownerKey);
+		if (state.lifecycle === "sealed" && state.resources.size === 0) {
+			return { status: "settled" };
 		}
+		return undefined;
+	};
+
+	const removeWaiter = (state: RunState, waiter: SettlementWaiter): void => {
+		clearTimeout(waiter.timer);
+		state.waiters.delete(waiter);
+	};
+
+	const notify = (state: RunState): void => {
+		const proof = settlementProof(state);
+		if (!proof) return;
+		for (const waiter of state.waiters) {
+			removeWaiter(state, waiter);
+			waiter.resolve(
+				proof.status === "unfenced"
+					? { status: "unfenced", pending: copyEntries(proof.pending) }
+					: { status: "settled" },
+			);
+		}
+	};
+
+	const settleTracked = (state: RunState, id: string): void => {
+		if (!state.resources.delete(id)) return;
+		notify(state);
+	};
+
+	const observeSettlement = (settled: PromiseLike<unknown>, onSettled: () => void): void => {
+		// Assimilate the settlement promise once and consume both outcomes so a
+		// rejected resource cannot become an unhandled rejection.
+		let promise: Promise<unknown>;
+		try {
+			promise = Promise.resolve(settled);
+		} catch {
+			onSettled();
+			return;
+		}
+		void promise.then(onSettled, onSettled);
+	};
+
+	const appendTombstone = (state: RunState, entry: RunResourceEntry): void => {
+		state.tombstone.push({ ...entry });
+		if (state.tombstone.length > MAX_TOMBSTONE_ENTRIES) {
+			state.tombstone.splice(0, state.tombstone.length - MAX_TOMBSTONE_ENTRIES);
+		}
+	};
+
+	const quarantineState = (state: RunState): RunResourceEntry[] => {
+		if (state.lifecycle !== "quarantined") {
+			state.lifecycle = "quarantined";
+			state.tombstone = [];
+			for (const resource of state.resources.values()) appendTombstone(state, resource.entry);
+			state.resources.clear();
+		}
+		notify(state);
+		return copyEntries(state.tombstone);
 	};
 
 	return {
+		open(resourceRunId) {
+			const existing = runs.get(resourceRunId);
+			if (existing) return;
+			runs.set(resourceRunId, {
+				lifecycle: "open",
+				resources: new Map<string, TrackedResource>(),
+				tombstone: [],
+				waiters: new Set<SettlementWaiter>(),
+			});
+		},
+
 		track(resourceRunId, kind, label, settled) {
-			const id = `${++sequence}`;
-			const resources = runs.get(resourceRunId) ?? new Map<string, TrackedResource>();
-			runs.set(resourceRunId, resources);
-			resources.set(id, { entry: { id, kind, label, registeredAt: Date.now() }, runKey: resourceRunId });
-			Promise.resolve(settled).then(
-				() => remove(resourceRunId, id),
-				() => remove(resourceRunId, id),
-			);
-		},
-		pending(resourceRunId) {
-			return [...(runs.get(resourceRunId)?.values() ?? [])].map(resource => resource.entry);
-		},
-		waitForSettlement(resourceRunId, { graceMs }) {
-			if (runs.get(resourceRunId)?.size === undefined) {
-				return Promise.resolve({ status: "settled" });
+			let state = runs.get(resourceRunId);
+			if (!state) {
+				// Keep track() usable for low-level callers while making the lifecycle
+				// explicit for settlement: an implicitly-created run is still open and
+				// therefore cannot settle until seal() is called.
+				state = {
+					lifecycle: "open",
+					resources: new Map<string, TrackedResource>(),
+					tombstone: [],
+					waiters: new Set<SettlementWaiter>(),
+				};
+				runs.set(resourceRunId, state);
 			}
+
+			const id = `${++sequence}`;
+			const entry: RunResourceEntry = { id, kind, label, registeredAt: Date.now() };
+
+			if (state.lifecycle === "quarantined") {
+				// Quarantine is terminal: late work is retained only in the bounded
+				// tombstone and never re-enters normal settlement accounting.
+				appendTombstone(state, entry);
+				observeSettlement(settled, () => {});
+				return;
+			}
+
+			if (state.lifecycle === "sealed") {
+				// A sealed run cannot be reopened. Late registration is fenced as
+				// quarantine rather than creating a false settled run.
+				quarantineState(state);
+				appendTombstone(state, entry);
+				observeSettlement(settled, () => {});
+				return;
+			}
+
+			state.resources.set(id, { entry });
+			observeSettlement(settled, () => settleTracked(state!, id));
+		},
+
+		pending(resourceRunId) {
+			const state = runs.get(resourceRunId);
+			return state ? snapshot(state) : [];
+		},
+
+		seal(resourceRunId) {
+			const state = runs.get(resourceRunId);
+			if (state?.lifecycle !== "open") return;
+			state.lifecycle = "sealed";
+			notify(state);
+		},
+
+		waitForSettlement(resourceRunId, { graceMs }) {
+			const state = runs.get(resourceRunId);
+			if (!state) {
+				return Promise.resolve({ status: "unfenced", pending: [] });
+			}
+
+			const immediate = settlementProof(state);
+			if (immediate) return Promise.resolve(immediate);
+
 			const { promise, resolve } = Promise.withResolvers<RunSettlementProof>();
-			let timer: ReturnType<typeof setTimeout> | undefined;
-			const settle = (): void => {
-				clearTimeout(timer);
-				waiters.get(resourceRunId)?.delete(onSettled);
-				resolve({ status: "settled" });
+			let waiter!: SettlementWaiter;
+			waiter = {
+				resolve,
+				timer: setTimeout(
+					() => {
+						state.waiters.delete(waiter);
+						const settled = settlementProof(state);
+						resolve(
+							settled ?? {
+								status: "unfenced",
+								pending: snapshot(state),
+							},
+						);
+					},
+					Math.max(0, graceMs),
+				),
 			};
-			const onSettled = (): void => settle();
-			const resourceWaiters = waiters.get(resourceRunId) ?? new Set<() => void>();
-			resourceWaiters.add(onSettled);
-			waiters.set(resourceRunId, resourceWaiters);
-			timer = setTimeout(
-				() => {
-					resourceWaiters.delete(onSettled);
-					if (resourceWaiters.size === 0) waiters.delete(resourceRunId);
-					const pending = this.pending(resourceRunId);
-					resolve(pending.length === 0 ? { status: "settled" } : { status: "unfenced", pending });
-				},
-				Math.max(0, graceMs),
-			);
+			state.waiters.add(waiter);
 			return promise;
 		},
+
 		quarantine(resourceRunId) {
-			const resources = runs.get(resourceRunId);
-			if (!resources) return [];
-			// Quarantine detaches the run from settlement accounting, but the entries stay
-			// tracked under a private key so their real promises still release them and can
-			// never re-enter the original run.
-			const quarantineKey = `quarantined:${resourceRunId}:${++sequence}`;
-			runs.delete(resourceRunId);
-			runs.set(quarantineKey, resources);
-			for (const resource of resources.values()) resource.runKey = quarantineKey;
-			return [...resources.values()].map(resource => resource.entry);
+			let state = runs.get(resourceRunId);
+			if (!state) {
+				state = {
+					lifecycle: "quarantined",
+					resources: new Map<string, TrackedResource>(),
+					tombstone: [],
+					waiters: new Set<SettlementWaiter>(),
+				};
+				runs.set(resourceRunId, state);
+			}
+			return quarantineState(state);
 		},
 	};
 }

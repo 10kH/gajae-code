@@ -416,6 +416,7 @@ export class ExtensionUiController {
 		const contextActions: ExtensionContextActions = {
 			getModel: () => this.ctx.session.model,
 			isIdle: () => !this.ctx.session.isStreaming,
+			getActivePromptHandle: () => this.ctx.session.activePromptHandle,
 			abort: () => this.ctx.session.abort(),
 			abortPromptAndWait: (handle, options) => this.ctx.session.abortPromptAndWait(handle, options),
 			hasPendingMessages: () => this.ctx.session.queuedMessageCount > 0,
@@ -717,6 +718,7 @@ export class ExtensionUiController {
 		const contextActions: ExtensionContextActions = {
 			getModel: () => this.ctx.session.model,
 			isIdle: () => !this.ctx.session.isStreaming,
+			getActivePromptHandle: () => this.ctx.session.activePromptHandle,
 			abort: () => this.ctx.session.abort(),
 			abortPromptAndWait: (handle, options) => this.ctx.session.abortPromptAndWait(handle, options),
 			hasPendingMessages: () => this.ctx.session.queuedMessageCount > 0,
@@ -939,6 +941,7 @@ export class ExtensionUiController {
 						sessionManager: createReadonlySessionManager(this.ctx.session.sessionManager),
 						modelRegistry: this.ctx.session.modelRegistry,
 						model: this.ctx.session.model,
+						getActivePromptHandle: () => this.ctx.session.activePromptHandle,
 						isIdle: () => !this.ctx.session.isStreaming,
 						hasPendingMessages: () => this.ctx.session.queuedMessageCount > 0,
 						getPendingMessageCounts: () => this.ctx.session.pendingMessageCounts,

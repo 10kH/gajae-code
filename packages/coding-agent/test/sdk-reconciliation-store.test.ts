@@ -116,6 +116,105 @@ describe("reconciliation-store", () => {
 		await fs.rm(root, { recursive: true, force: true });
 	});
 
+	test("quarantines terminal_ok records with failed outcomes", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "recon-terminal-mismatch-"));
+		const sessionFile = path.join(root, "s.jsonl");
+		await fs.writeFile(sessionFile, "");
+		const storePath = reconciliationStorePath(sessionFile, "s1");
+		await fs.mkdir(path.dirname(storePath), { recursive: true });
+		await fs.writeFile(
+			storePath,
+			JSON.stringify({
+				version: 1,
+				sessionId: "s1",
+				records: [
+					{
+						kind: "prompt",
+						commandId: "c1",
+						turnId: "t1",
+						status: "terminal_ok",
+						acceptedAt: 1,
+						terminalAt: 2,
+						outcome: {
+							kind: "failed",
+							code: "prompt_failed",
+							message: "failed",
+							provenance: "agent_failed",
+						},
+					},
+				],
+			}),
+		);
+		const store = createReconciliationStore({ sessionFile, sessionId: "s1" });
+		expect(await store.load()).toEqual([]);
+		const entries = await fs.readdir(path.dirname(storePath));
+		expect(entries.some(name => name.includes("corrupt"))).toBe(true);
+		await fs.rm(root, { recursive: true, force: true });
+	});
+
+	test("quarantines failed records with terminal_ok outcomes", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "recon-status-mismatch-"));
+		const sessionFile = path.join(root, "s.jsonl");
+		await fs.writeFile(sessionFile, "");
+		const storePath = reconciliationStorePath(sessionFile, "s1");
+		await fs.mkdir(path.dirname(storePath), { recursive: true });
+		await fs.writeFile(
+			storePath,
+			JSON.stringify({
+				version: 1,
+				sessionId: "s1",
+				records: [
+					{
+						kind: "prompt",
+						commandId: "c1",
+						turnId: "t1",
+						status: "failed",
+						acceptedAt: 1,
+						terminalAt: 2,
+						outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+					},
+				],
+			}),
+		);
+		const store = createReconciliationStore({ sessionFile, sessionId: "s1" });
+		expect(await store.load()).toEqual([]);
+		const entries = await fs.readdir(path.dirname(storePath));
+		expect(entries.some(name => name.includes("corrupt"))).toBe(true);
+		await fs.rm(root, { recursive: true, force: true });
+	});
+
+	test("accepts outcome-less terminal records", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "recon-outcome-less-"));
+		const sessionFile = path.join(root, "s.jsonl");
+		await fs.writeFile(sessionFile, "");
+		const storePath = reconciliationStorePath(sessionFile, "s1");
+		await fs.mkdir(path.dirname(storePath), { recursive: true });
+		await fs.writeFile(
+			storePath,
+			JSON.stringify({
+				version: 1,
+				sessionId: "s1",
+				records: [
+					{
+						kind: "prompt",
+						commandId: "c1",
+						turnId: "t1",
+						status: "terminal_ok",
+						acceptedAt: 1,
+						terminalAt: 2,
+					},
+				],
+			}),
+		);
+		const store = createReconciliationStore({ sessionFile, sessionId: "s1" });
+		expect(await store.load()).toMatchObject([
+			{ kind: "prompt", commandId: "c1", status: "terminal_ok", terminalAt: 2 },
+		]);
+		const entries = await fs.readdir(path.dirname(storePath));
+		expect(entries.some(name => name.includes("corrupt"))).toBe(false);
+		await fs.rm(root, { recursive: true, force: true });
+	});
+
 	test("memory-only when no session file", async () => {
 		const store = createReconciliationStore({ sessionFile: null, sessionId: "x" });
 		expect(store.path).toBeNull();

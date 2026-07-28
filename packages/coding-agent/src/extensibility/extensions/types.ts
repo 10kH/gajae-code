@@ -362,6 +362,8 @@ export interface ExtensionContext {
 	model: Model | undefined;
 	/** Whether the agent is idle (not streaming) */
 	isIdle(): boolean;
+	/** Stable resource ownership identifier for the active prompt run. */
+	getActivePromptHandle(): string | undefined;
 	/** Abort the current agent operation */
 	abort(): void;
 	/** Abort and prove whether resources for a specific prompt settled. */
@@ -1447,6 +1449,8 @@ export interface ExtensionActions {
 export interface ExtensionContextActions {
 	getModel: () => Model | undefined;
 	isIdle: () => boolean;
+	/** Stable resource ownership identifier for the active prompt run. */
+	getActivePromptHandle?: () => string | undefined;
 	abort: () => void;
 	abortPromptAndWait?: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
 	hasPendingMessages: () => boolean;

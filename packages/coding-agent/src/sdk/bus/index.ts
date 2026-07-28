@@ -2530,7 +2530,16 @@ function sdkControlSurface(
 			const commandId = crypto.randomUUID();
 			const turnId = crypto.randomUUID();
 			const correlation = { commandId, turnId };
-			if (skillRecon) skillRecon.admit(trimmedClientRef);
+			if (skillRecon) {
+				try {
+					await awaitReconciliationReady();
+				} catch {
+					throw Object.assign(new Error("Skill reconciliation state is unavailable; retry after restart."), {
+						code: "unavailable",
+					});
+				}
+				skillRecon.admit(trimmedClientRef);
+			}
 			const { promise: acceptedP, resolve, reject } = Promise.withResolvers<Record<string, unknown>>();
 			let phase: "pending" | "accepted" | "rejected" = "pending";
 			const settleAccept = (value: Record<string, unknown>) => {
@@ -3503,11 +3512,15 @@ export function createNotificationsExtension(
 			validateProviderDefinitions(capability, definitions);
 			if (capability === "permission") {
 				ctx.setSdkPermissionProvider?.(async (toolCall, permissionOptions, signal) => {
-					const result = await host!.reverse.request("permission", "request", {
-						toolCall,
-						options: permissionOptions,
-						aborted: signal?.aborted === true,
-					});
+					const result = await host!.reverse.request(
+						"permission",
+						"request",
+						{
+							toolCall,
+							options: permissionOptions,
+						},
+						signal,
+					);
 					if (!result || typeof result !== "object")
 						throw new Error("permission provider returned an invalid response");
 					const response = result as { outcome?: unknown; optionId?: unknown; kind?: unknown };
@@ -3627,6 +3640,7 @@ export function createNotificationsExtension(
 		const promptSubmissions = new Map<string, PromptSubmission>();
 		/** Connections fenced by a fatal prompt closure; their later frames are refused. */
 		const fencedConnections = new Set<string>();
+		let cancelPreflightsForConnection: ((connectionId: string) => void) | undefined;
 		const promptTerminalTombstones = new Map<string, { connectionId: string; expiresAt: number }>();
 		// Authoritative bounded reconciliation state for Q26 turn.prompt_status
 		// (contract documented in ./prompt-reconciliation and ../prompt-status).
@@ -3887,10 +3901,20 @@ export function createNotificationsExtension(
 			// connection is marked failed (every later inbound frame from it is refused),
 			// its reverse leases are released, and its deliveries are abandoned. The durable
 			// record stays active for Q26 and restart recovery.
+			cancelPreflightsForConnection?.(submission.connectionId);
 			fencedConnections.add(submission.connectionId);
 			host?.handleDisconnect(submission.connectionId);
-			for (const owned of promptSubmissions.values())
-				if (owned.connectionId === submission.connectionId) abandonPrompt(owned);
+			for (const [key, owned] of promptSubmissions)
+				if (owned.connectionId === submission.connectionId) {
+					abandonPrompt(owned);
+					const [commandId, turnId] = key.split(":", 2);
+					if (commandId && turnId) removePendingPromptCorrelation({ commandId, turnId });
+				}
+			if (
+				runtime?.activePromptCorrelation?.commandId === correlation.commandId &&
+				runtime.activePromptCorrelation.turnId === correlation.turnId
+			)
+				runtime.activePromptCorrelation = undefined;
 		};
 		const bindPromptExecutionHandle = (
 			correlation: { commandId: string; turnId: string },
@@ -3933,22 +3957,41 @@ export function createNotificationsExtension(
 				};
 				// Only the handle captured for this correlation may be fenced; a later run
 				// must never be aborted by an older prompt's cleanup.
-				if (typeof seam.abortPromptAndWait === "function" && submission.executionHandle) {
-					const proof = await seam.abortPromptAndWait(submission.executionHandle, {
+				if (typeof seam.abortPromptAndWait !== "function" || !submission.executionHandle) {
+					failPromptClosed(
+						correlation,
+						submission,
+						"terminal_uncertain",
+						"Prompt resources could not be fenced with an exact run handle.",
+					);
+					return;
+				}
+				let proof: { status: "settled" } | { status: "unfenced" };
+				try {
+					proof = await seam.abortPromptAndWait(submission.executionHandle, {
 						graceMs: PROMPT_TERMINALIZATION_GRACE_MS,
 					});
-					if (proof.status === "unfenced") {
-						// No settlement proof: never publish a normal terminal. The durable
-						// pending claim stays active so restart recovery finalizes it.
-						failPromptClosed(
-							correlation,
-							submission,
-							"terminal_uncertain",
-							"Prompt resources did not settle before the terminalization grace expired.",
-						);
-						return;
-					}
-				} else if (typeof ctx.abort === "function") ctx.abort();
+				} catch (error) {
+					logger.warn(`sdk: prompt resource fencing failed: ${String(error)}`);
+					failPromptClosed(
+						correlation,
+						submission,
+						"terminal_uncertain",
+						"Prompt resources could not be settled before terminalization.",
+					);
+					return;
+				}
+				if (proof?.status !== "settled") {
+					// No settlement proof: never publish a normal terminal. The durable
+					// pending claim stays active so restart recovery finalizes it.
+					failPromptClosed(
+						correlation,
+						submission,
+						"terminal_uncertain",
+						"Prompt resources did not settle before the terminalization grace expired.",
+					);
+					return;
+				}
 			}
 			try {
 				await kindReconciliation.finalizePromptOutcome(correlation, winner, extra?.error);
@@ -4082,6 +4125,7 @@ export function createNotificationsExtension(
 				lookup: selector => kindReconciliation.lookup("skill", selector),
 			},
 		);
+		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
 		const abandonPromptResponse = (connectionId: string, frame: Record<string, unknown>) => {
 			if (
 				frame.type !== "control_response" ||
@@ -4420,30 +4464,36 @@ export function createNotificationsExtension(
 		});
 		initializedRuntime.abortEphemeralTurns = () => ephemeralTurns.dispose();
 		initializedRuntime.disableEphemeralTurns = () => ephemeralTurns.disable();
+		const sendEndpointStale = (connectionId: string, frame: Record<string, unknown>) => {
+			const id = typeof frame.id === "string" ? frame.id : undefined;
+			if (!id) return;
+			const error = { code: "endpoint_stale", message: "session endpoint is stale." };
+			const responseType =
+				frame.type === "control_request"
+					? "control_response"
+					: frame.type === "query_request"
+						? "query_response"
+						: frame.type === "global_request"
+							? "global_response"
+							: undefined;
+			if (!responseType) return;
+			try {
+				server.sendTo(connectionId, JSON.stringify({ type: responseType, id, ok: false, error }));
+			} catch {}
+		};
 		try {
 			server.onSdkFrame((err, inbound) => {
 				if (err || !inbound) return;
-				// A connection fenced by a fatal prompt closure is no longer usable: refuse its
-				// frames instead of letting it keep driving the session.
-				if (inbound.connectionId && fencedConnections.has(inbound.connectionId)) return;
 				try {
 					const frame = JSON.parse(inbound.json) as unknown;
 					if (!frame || typeof frame !== "object") return;
 					const typedFrame = frame as Record<string, unknown>;
+					if (inbound.connectionId && fencedConnections.has(inbound.connectionId)) {
+						sendEndpointStale(inbound.connectionId, typedFrame);
+						return;
+					}
 					if (initializedRuntime.inboundFenced) {
-						if (typedFrame.type === "control_request" && typeof typedFrame.id === "string") {
-							try {
-								server.sendTo(
-									inbound.connectionId,
-									JSON.stringify({
-										type: "control_response",
-										id: typedFrame.id,
-										ok: false,
-										error: { code: "endpoint_stale", message: "session endpoint is draining." },
-									}),
-								);
-							} catch {}
-						}
+						sendEndpointStale(inbound.connectionId, typedFrame);
 						return;
 					}
 					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;
@@ -5590,11 +5640,7 @@ export function createNotificationsExtension(
 		rt.busy = true;
 		const correlation = rt.pendingPromptCorrelations.shift();
 		rt.activePromptCorrelation = correlation;
-		if (correlation)
-			rt.bindPromptExecutionHandle(
-				correlation,
-				(ctx as typeof ctx & { activePromptHandle?: string }).activePromptHandle,
-			);
+		if (correlation) rt.bindPromptExecutionHandle(correlation, ctx.getActivePromptHandle());
 		rt.notePromptReconciliation(correlation, { type: "agent_start" });
 		rt.emitPromptLifecycle(correlation, { type: "agent_start", sessionId: id, ...correlation });
 		try {

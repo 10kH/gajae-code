@@ -305,6 +305,7 @@ export function agentLoop(
 			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model)
 			: undefined;
 		const attemptStream = transaction ?? stream;
+		openResourceRun(config);
 		if (!config.fallbackManaged || emitManagedAgentStart) stream.push({ type: "agent_start" });
 		attemptStream.push({ type: "turn_start" });
 		for (const prompt of prompts) {
@@ -315,6 +316,7 @@ export function agentLoop(
 		try {
 			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, transaction);
 		} catch (err) {
+			if (config.resourceLedger && config.resourceRunId) config.resourceLedger.seal(config.resourceRunId);
 			stream.fail(err);
 		}
 	})();
@@ -354,12 +356,14 @@ export function agentLoopContinue(
 			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model)
 			: undefined;
 		const attemptStream = transaction ?? stream;
+		openResourceRun(config);
 		if (!config.fallbackManaged || emitManagedAgentStart) stream.push({ type: "agent_start" });
 		attemptStream.push({ type: "turn_start" });
 
 		try {
 			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, transaction);
 		} catch (err) {
+			if (config.resourceLedger && config.resourceRunId) config.resourceLedger.seal(config.resourceRunId);
 			stream.fail(err);
 		}
 	})();
@@ -372,6 +376,21 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 		(event: AgentEvent) => event.type === "agent_end",
 		(event: AgentEvent) => (event.type === "agent_end" ? event.messages : []),
 	);
+}
+
+function openResourceRun(config: AgentLoopConfig): void {
+	if (config.resourceLedger && config.resourceRunId) config.resourceLedger.open(config.resourceRunId);
+}
+
+function publishAgentEnd(
+	stream: EventStream<AgentEvent, AgentMessage[]>,
+	config: AgentLoopConfig,
+	event: Extract<AgentEvent, { type: "agent_end" }>,
+): void {
+	stream.push(event);
+	if (event.stopReason !== "maintenance" && config.resourceLedger && config.resourceRunId) {
+		config.resourceLedger.seal(config.resourceRunId);
+	}
 }
 
 /**
@@ -1558,7 +1577,7 @@ async function runLoopBody(
 					});
 				}
 				stream.push({ type: "turn_end", message, toolResults });
-				stream.push(buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
+				publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
 				stream.end(newMessages);
 				return;
 			}
@@ -1638,7 +1657,7 @@ async function runLoopBody(
 			pendingMessages = (await config.getSteeringMessages?.()) || [];
 			if (pendingMessages.length > 0) continue;
 			if (config.shouldPause?.()) {
-				stream.push(buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "paused"));
+				publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "paused"));
 				stream.end(newMessages);
 				return;
 			}
@@ -1659,7 +1678,7 @@ async function runLoopBody(
 				message.errorMessage = message.errorMessage
 					? `${message.errorMessage} | ${breakerMessage}`
 					: breakerMessage;
-				stream.push(buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
+				publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
 				stream.end(newMessages);
 				return;
 			}
@@ -1668,7 +1687,7 @@ async function runLoopBody(
 		// Agent would stop here. Check for follow-up messages.
 		await config.onBeforeYield?.();
 		if (config.shouldPause?.()) {
-			stream.push(buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "paused"));
+			publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "paused"));
 			stream.end(newMessages);
 			return;
 		}
@@ -1683,7 +1702,7 @@ async function runLoopBody(
 		break;
 	}
 
-	stream.push(buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
+	publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
 	stream.end(newMessages);
 }
 
@@ -1846,43 +1865,49 @@ async function streamAssistantResponse(
 					onResponse: captureOnResponse,
 				}),
 			);
+			const { promise: iteratorSettled, resolve: settleIterator } = Promise.withResolvers<void>();
+			let responseResultPromise: Promise<AssistantMessage> | undefined;
+			let responseForResult: { result(): Promise<AssistantMessage> } | undefined;
+			const getResponseResult = (): Promise<AssistantMessage> =>
+				(responseResultPromise ??= Promise.resolve().then(() => responseForResult!.result()));
+			const providerLifecycle = responsePromise.then(async response => {
+				responseForResult = response;
+				await iteratorSettled;
+				await Promise.allSettled([getResponseResult()]);
+			});
 			if (config.resourceLedger && config.resourceRunId) {
+				// One ownership spans factory creation, iterator close, and trailing result.
 				config.resourceLedger.track(
 					config.resourceRunId,
 					"provider_factory",
 					`${config.model.provider}/${config.model.id}`,
-					responsePromise,
+					providerLifecycle,
 				);
 			}
 			const response = await responsePromise;
+			responseForResult = response;
 
 			let partialMessage: AssistantMessage | null = null;
 			let addedPartial = false;
 
 			const responseIterator = response[Symbol.asyncIterator]();
-			const { promise: iteratorSettled, resolve: settleIterator } = Promise.withResolvers<void>();
 			let iteratorClosed = false;
 			const closeIterator = (): void => {
 				if (iteratorClosed) return;
 				iteratorClosed = true;
 
-				void Promise.resolve(responseIterator.return?.()).then(
-					() => settleIterator(),
-					() => settleIterator(),
-				);
+				void Promise.resolve()
+					.then(() => responseIterator.return?.())
+					.then(
+						() => settleIterator(),
+						() => settleIterator(),
+					);
 			};
-			if (config.resourceLedger && config.resourceRunId) {
-				// The lease covers the iterator AND the trailing `response.result()`: a
-				// hanging result must never look like settled provider work.
-				config.resourceLedger.track(
-					config.resourceRunId,
-					"provider_iterator",
-					`${config.model.provider}/${config.model.id}`,
-					iteratorSettled.then(async () => {
-						await Promise.allSettled([Promise.resolve(response.result())]);
-					}),
-				);
-			}
+			const finishResponse = async (): Promise<AssistantMessage> => {
+				closeIterator();
+				await iteratorSettled;
+				return getResponseResult();
+			};
 
 			// Set up a single abort race: register the abort listener once for the whole
 			// stream and reuse the same race promise for every iterator.next() instead of
@@ -1976,8 +2001,8 @@ async function streamAssistantResponse(
 						case "done":
 						case "error": {
 							const finalMessage = config.fallbackManaged
-								? managedAssistantShell(await response.result(), config.model)
-								: await response.result();
+								? managedAssistantShell(await finishResponse(), config.model)
+								: await finishResponse();
 							if (addedPartial) {
 								context.messages[context.messages.length - 1] = finalMessage;
 							} else {
@@ -1998,8 +2023,8 @@ async function streamAssistantResponse(
 			}
 
 			const trailing = config.fallbackManaged
-				? managedAssistantShell(await response.result(), config.model)
-				: await response.result();
+				? managedAssistantShell(await finishResponse(), config.model)
+				: await finishResponse();
 			await finishChat(trailing);
 			return trailing;
 		});
@@ -2182,10 +2207,8 @@ async function executeToolCalls(
 	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
 		if (interruptState.triggered) {
 			// Skip both span emission and the collector orphan record here. The
-			// tail sweep below (after `Promise.allSettled`) is the single path
-			// that handles "no result message was produced" — it calls
-			// `recordSkippedTool` and `emitToolResult` once per record, so any
-			// work we did here would double-count.
+			// scheduler-task finalizer emits the skipped result and collector record;
+			// the tail sweep below remains a defensive fallback for unexpected throws.
 			record.skipped = true;
 			return;
 		}
@@ -2316,9 +2339,6 @@ async function executeToolCalls(
 					},
 					toolContext,
 				);
-				if (config.resourceLedger && config.resourceRunId) {
-					config.resourceLedger.track(config.resourceRunId, "tool", `${toolCall.name}:${toolCall.id}`, execution);
-				}
 				const rawResult = await execution;
 				const coerced = coerceToolResult(rawResult);
 				result = coerced.result;
@@ -2403,8 +2423,30 @@ async function executeToolCalls(
 		const record = records[index];
 		const concurrency = record.tool?.concurrency ?? "shared";
 		const start = concurrency === "exclusive" ? Promise.all([lastExclusive, ...sharedTasks]) : lastExclusive;
-		const task = start.then(() => runTool(record, index));
+		const task = start
+			.then(() => runTool(record, index))
+			.finally(() => {
+				// Scheduler ownership includes dependency waits and the fallback skip
+				// emission, not only tool.execute().
+				if (!record.toolResultMessage) {
+					record.skipped = true;
+					recordSkippedTool(telemetry, {
+						toolCallId: record.toolCall.id,
+						toolName: record.toolCall.name,
+						status: "skipped",
+					});
+					emitToolResult(record, createSkippedToolResult(), true);
+				}
+			});
 		tasks.push(task);
+		if (config.resourceLedger && config.resourceRunId) {
+			config.resourceLedger.track(
+				config.resourceRunId,
+				"tool",
+				`${record.toolCall.name}:${record.toolCall.id}`,
+				task,
+			);
+		}
 		if (concurrency === "exclusive") {
 			lastExclusive = task;
 			sharedTasks = [];

@@ -205,6 +205,7 @@ function context(
 		getContextUsage: () => ({ tokens: 3, contextWindow: 100, percent: 3 }),
 		model: { provider: "fixture-provider", id: "reasoning-model" },
 		getThinkingLevel: () => "low",
+		getActivePromptHandle: () => undefined,
 		modelRegistry: {
 			getAll: () => [
 				{
@@ -2644,6 +2645,45 @@ test("SDK host routes pure ACP permission prompts through a live reverse provide
 		}),
 	);
 	expect(await requested).toEqual({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
+	const cancelledPermissionAbort = new AbortController();
+	const cancelledPermission = permissionProvider!(
+		{ toolCallId: "call-2", toolName: "bash", title: "printf cancelled", status: "pending" },
+		[{ optionId: "reject_once", name: "Reject once", kind: "reject_once" }],
+		cancelledPermissionAbort.signal,
+	).catch(error => error);
+	await waitFor(
+		() => frames.filter(frame => frame.type === "reverse_request").length >= 2,
+		"second reverse permission request",
+	);
+	const cancelledRequest = frames.filter(frame => frame.type === "reverse_request")[1]!;
+	cancelledPermissionAbort.abort();
+	await waitFor(
+		() => frames.some(frame => frame.type === "reverse_cancel" && frame.id === cancelledRequest.id),
+		"permission reverse cancellation",
+	);
+	expect(await cancelledPermission).toMatchObject({ message: "request_cancelled" });
+	socket.send(
+		JSON.stringify({
+			type: "reverse_response",
+			id: cancelledRequest.id,
+			connectionId,
+			leaseId: cancelledRequest.leaseId,
+			ok: true,
+			result: { outcome: "selected", optionId: "reject_once", kind: "reject_once" },
+		}),
+	);
+	await waitFor(
+		() =>
+			frames.some(
+				frame => frame.type === "reverse_response" && frame.id === cancelledRequest.id && frame.ok === false,
+			),
+		"stale reverse permission response",
+	);
+	expect(frames.filter(frame => frame.type === "reverse_cancel" && frame.id === cancelledRequest.id)).toHaveLength(1);
+	expect(frames.find(frame => frame.type === "reverse_response" && frame.id === cancelledRequest.id)).toMatchObject({
+		ok: false,
+		error: { code: "unknown_request" },
+	});
 	socket.close();
 	await waitFor(() => permissionProvider === undefined, "permission provider removal after disconnect");
 });

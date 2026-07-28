@@ -256,13 +256,6 @@ function correlationFrom(...values: unknown[]): PromptCorrelation {
 	return correlation;
 }
 
-function correlationsConflict(expected: PromptCorrelation, actual: PromptCorrelation): boolean {
-	return (
-		(expected.commandId !== undefined && actual.commandId !== undefined && expected.commandId !== actual.commandId) ||
-		(expected.turnId !== undefined && actual.turnId !== undefined && expected.turnId !== actual.turnId)
-	);
-}
-
 function hasCorrelation(correlation: PromptCorrelation): boolean {
 	return correlation.commandId !== undefined || correlation.turnId !== undefined;
 }
@@ -272,6 +265,65 @@ function correlationsMatch(expected: PromptCorrelation, actual: PromptCorrelatio
 		(expected.commandId === undefined || expected.commandId === actual.commandId) &&
 		(expected.turnId === undefined || expected.turnId === actual.turnId)
 	);
+}
+
+function hasCompleteCorrelation(correlation: PromptCorrelation): correlation is { commandId: string; turnId: string } {
+	return (
+		typeof correlation.commandId === "string" &&
+		correlation.commandId.trim().length > 0 &&
+		typeof correlation.turnId === "string" &&
+		correlation.turnId.trim().length > 0
+	);
+}
+
+function correlationsExactlyMatch(expected: PromptCorrelation, actual: PromptCorrelation): boolean {
+	return (
+		hasCompleteCorrelation(expected) &&
+		hasCompleteCorrelation(actual) &&
+		expected.commandId === actual.commandId &&
+		expected.turnId === actual.turnId
+	);
+}
+
+function promptAcknowledgement(value: unknown): PromptCorrelation | undefined {
+	const candidate = object(value);
+	if (
+		!candidate ||
+		candidate.ok === false ||
+		candidate.error !== undefined ||
+		(candidate.accepted !== undefined && candidate.accepted !== true)
+	)
+		return undefined;
+	const payload = object(candidate.result) ?? candidate;
+	if (payload.accepted !== true) return undefined;
+	if (typeof payload.commandId !== "string" || payload.commandId.trim().length === 0) return undefined;
+	if (typeof payload.turnId !== "string" || payload.turnId.trim().length === 0) return undefined;
+	return { commandId: payload.commandId, turnId: payload.turnId };
+}
+function strictCorrelationFrom(...values: unknown[]): PromptCorrelation | undefined {
+	const correlation: PromptCorrelation = {};
+	let malformed = false;
+	for (const value of values) {
+		const candidate = object(value);
+		if (!candidate) continue;
+		for (const [field, aliases] of [
+			["commandId", ["commandId", "command_id"]],
+			["turnId", ["turnId", "turn_id"]],
+		] as const) {
+			for (const alias of aliases) {
+				if (!Object.hasOwn(candidate, alias)) continue;
+				const identity = candidate[alias];
+				if (typeof identity !== "string" || identity.trim().length === 0) {
+					malformed = true;
+					continue;
+				}
+				const previous = correlation[field];
+				if (previous !== undefined && previous !== identity) malformed = true;
+				correlation[field] = identity;
+			}
+		}
+	}
+	return malformed ? undefined : correlation;
 }
 
 function terminalOutcome(event: JsonObject): SdkPromptTerminalOutcome | undefined {
@@ -603,10 +655,12 @@ export function acpProviderRegistrations(
 
 export function createAcpReverseConnection(connection: AgentSideConnection, sessionId: string): AcpReverseConnection {
 	const methods: Record<string, string> = {
-		"fs.readTextFile": "readTextFile",
-		"fs.writeTextFile": "writeTextFile",
-		"terminal.create": "createTerminal",
-		"permission.request": "requestPermission",
+		request: "session/request_permission",
+		"permission.request": "session/request_permission",
+		"fs.readTextFile": "fs/read_text_file",
+		"fs.writeTextFile": "fs/write_text_file",
+		"terminal.create": "terminal/create",
+		"ui.elicit": "elicitation/create",
 	};
 	return {
 		request: async (
@@ -614,30 +668,19 @@ export function createAcpReverseConnection(connection: AgentSideConnection, sess
 			params: JsonObject,
 			options?: { cancellationSignal?: AbortSignal },
 		): Promise<unknown> => {
-			// Form elicitation must use the raw request surface so SDK cancellation
-			// reaches Air as ACP `$/cancel_request`.
-			if (method === "ui.elicit") {
-				const rawRequest = (connection as unknown as Record<string, unknown>).request;
-				if (typeof rawRequest !== "function")
-					throw new AcpSdkAdapterError("acp_reverse_unavailable", "ACP elicitation request is unavailable.");
-				return await (
-					rawRequest as (
-						method: string,
-						input: JsonObject,
-						options?: { cancellationSignal?: AbortSignal },
-					) => Promise<unknown>
-				).call(connection, "elicitation/create", { ...params, sessionId }, options);
-			}
-			const name = methods[method] ?? method;
-			const target = (connection as unknown as Record<string, unknown>)[name];
-			if (typeof target !== "function")
+			const name = methods[method];
+			if (!name)
 				throw new AcpSdkAdapterError("acp_reverse_unavailable", `ACP reverse method is unavailable: ${method}`);
-			// Every ACP client request is session-scoped; the SDK host only supplies the
-			// method payload, so the session identity is attached here.
-			const request = method.startsWith("terminal.") ? params : { ...params, sessionId };
-			// Call through the connection so `this` stays bound; extracting the method
-			// loses its receiver and the ACP SDK then fails on `this.connection`.
-			return await (target as (input: JsonObject) => Promise<unknown>).call(connection, request);
+			const rawRequest = (connection as unknown as Record<string, unknown>).request;
+			if (typeof rawRequest !== "function")
+				throw new AcpSdkAdapterError("acp_reverse_unavailable", "ACP reverse request surface is unavailable.");
+			return await (
+				rawRequest as (
+					method: string,
+					input: JsonObject,
+					options?: { cancellationSignal?: AbortSignal },
+				) => Promise<unknown>
+			).call(connection, name, { ...params, sessionId }, options);
 		},
 	};
 }
@@ -973,20 +1016,29 @@ export class AcpAgent implements Agent {
 				text: payload.text,
 				...(payload.images.length ? { images: payload.images } : {}),
 			});
-			// Retain the acknowledgement ingress boundary with its correlation.
+			const acknowledgementCorrelation = promptAcknowledgement(acknowledgement);
+			if (!acknowledgementCorrelation)
+				throw new AcpSdkAdapterError(
+					"invalid_prompt_acknowledgement",
+					"SDK prompt acknowledgement must accept the prompt and include commandId and turnId.",
+				);
+			// Retain the acknowledgement ingress boundary with its complete correlation.
 			waiter.boundary = record.inboundSequence;
-			waiter.correlation = correlationFrom(acknowledgement);
+			waiter.correlation = acknowledgementCorrelation;
 			waiter.acknowledged = true;
 			// Frames held while ownership was unknown belong to this prompt only when the
-			// acknowledgement correlates with them; otherwise they stay dropped.
+			// acknowledgement proves their complete correlation matches exactly.
 			const deferred = waiter.deferredFrames.splice(0);
 			for (const deferredFrame of deferred)
-				if (correlationsMatch(waiter.correlation, correlationFrom(deferredFrame)))
+				if (correlationsExactlyMatch(waiter.correlation, correlationFrom(deferredFrame)))
 					record.frameTail = record.frameTail.then(
 						async () => await this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame),
 					);
 			this.#settlePrompt(record, waiter);
 		} catch (error) {
+			waiter.deferredFrames.length = 0;
+			waiter.terminal = undefined;
+			waiter.settled = true;
 			if (record.activePrompt === waiter) record.activePrompt = undefined;
 			throw error;
 		}
@@ -1500,6 +1552,34 @@ export class AcpAgent implements Agent {
 		const received = receivedSdkEvent(frame);
 		if (!received) return;
 		const { event, wirePayload } = received;
+		const isTerminal = event.type === "agent_end" || event.type === "agent_failed";
+		const correlation = (isTerminal ? strictCorrelationFrom(frame, event) : correlationFrom(frame, event)) ?? {};
+		const activePrompt = record.activePrompt;
+		const outcome = isTerminal ? terminalOutcome(event) : undefined;
+		if (isTerminal) {
+			// Terminal ownership requires a complete identity. Unowned, partial, and
+			// duplicate terminals are never allowed to publish or query anything.
+			if (!hasCompleteCorrelation(correlation) || !activePrompt || activePrompt.settled) return;
+			if (!activePrompt.acknowledged) {
+				// Hold the entire frame until the prompt acknowledgement proves ownership.
+				activePrompt.deferredFrames.push(frame);
+				return;
+			}
+			if (!correlationsExactlyMatch(activePrompt.correlation, correlation) || activePrompt.terminal) return;
+			if (!outcome) {
+				const detail =
+					typeof (event as { error?: { message?: unknown } }).error?.message === "string"
+						? (event as { error: { message: string } }).error.message
+						: "the prompt terminal omitted a valid normalized outcome";
+				this.#rejectPrompt(
+					record,
+					activePrompt,
+					new AcpSdkAdapterError("connection_closed", `ACP prompt terminal was invalid: ${detail}`),
+				);
+				return;
+			}
+			activePrompt.terminal = { outcome, correlation };
+		}
 		const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
 		if (
 			toolCallId &&
@@ -1508,61 +1588,18 @@ export class AcpAgent implements Agent {
 		) {
 			record.toolArgs.set(toolCallId, event.args);
 		}
-		const correlation = correlationFrom(frame, event);
-		const activePrompt = record.activePrompt;
-		const outcome =
-			frame.type !== "activity" && (event.type === "agent_end" || event.type === "agent_failed")
-				? terminalOutcome(event)
-				: undefined;
 		const settledCorrelation = record.settledPromptCorrelations.some(settled =>
 			correlationsMatch(settled, correlation),
 		);
 		if (settledCorrelation) {
-			// The frame belongs to an already-settled correlation. It may only be replayed
-			// by a prompt that has been acknowledged with exactly that correlation; while a
-			// prompt is still pre-acknowledgement its ownership is unknown, so hold the
-			// frame instead of publishing it into the wrong prompt.
+			// Frames for an already-settled correlation stay closed until an active prompt
+			// acknowledges the exact same identity.
 			if (activePrompt && !activePrompt.settled && !activePrompt.acknowledged) {
 				activePrompt.deferredFrames.push(frame);
 				return;
 			}
 			if (!activePrompt || activePrompt.settled || !correlationsMatch(activePrompt.correlation, correlation)) return;
 		}
-		// A terminal that arrives before acknowledgement is captured provisionally; the
-		// eventual acknowledgement decides in `#settlePrompt` whether it really belongs to
-		// this prompt. This keeps the legitimate fast pre-ack terminal working.
-		// An infrastructure failure frame carries no normalized outcome: the durable claim
-		// remains authoritative, so the local waiter is rejected as a transport loss.
-		if (
-			activePrompt &&
-			!activePrompt.settled &&
-			!outcome &&
-			event.type === "agent_failed" &&
-			hasCorrelation(correlation) &&
-			!correlationsConflict(activePrompt.correlation, correlation)
-		) {
-			const detail =
-				typeof (event as { error?: { message?: unknown } }).error?.message === "string"
-					? (event as { error: { message: string } }).error.message
-					: "the prompt could not be completed";
-			activePrompt.settled = true;
-			record.activePrompt = undefined;
-			if (hasCorrelation(activePrompt.correlation)) {
-				record.settledPromptCorrelations.push(activePrompt.correlation);
-				while (record.settledPromptCorrelations.length > SETTLED_PROMPT_CORRELATION_RETENTION)
-					record.settledPromptCorrelations.shift();
-			}
-			activePrompt.reject(new AcpSdkAdapterError("connection_closed", `ACP prompt transport failed: ${detail}`));
-			return;
-		}
-		if (
-			activePrompt &&
-			!activePrompt.settled &&
-			outcome &&
-			hasCorrelation(correlation) &&
-			!correlationsConflict(activePrompt.correlation, correlation)
-		)
-			activePrompt.terminal = { outcome, correlation };
 		// After a correlated settlement with no active prompt, correlationless wire frames
 		// have no prompt to belong to and must not publish further updates.
 		if (!record.activePrompt && record.settledPromptCorrelations.length > 0 && !hasCorrelation(correlation)) return;
@@ -1637,11 +1674,25 @@ export class AcpAgent implements Agent {
 		if (activePrompt) this.#settlePrompt(record, activePrompt);
 	}
 
+	#rejectPrompt(record: SessionRecord, waiter: PromptWaiter, error: AcpSdkAdapterError): void {
+		if (record.activePrompt !== waiter || waiter.settled) return;
+		record.activePrompt = undefined;
+		waiter.settled = true;
+		waiter.deferredFrames.length = 0;
+		waiter.terminal = undefined;
+		if (hasCompleteCorrelation(waiter.correlation)) {
+			record.settledPromptCorrelations.push(waiter.correlation);
+			while (record.settledPromptCorrelations.length > SETTLED_PROMPT_CORRELATION_RETENTION)
+				record.settledPromptCorrelations.shift();
+		}
+		waiter.reject(error);
+	}
+
 	#settlePrompt(record: SessionRecord, waiter: PromptWaiter): void {
 		if (record.activePrompt !== waiter || waiter.settled || !waiter.acknowledged || !waiter.terminal) return;
 		// A terminal captured before acknowledgement is only this prompt's terminal when the
 		// eventual acknowledgement correlates with it; otherwise it belonged to an earlier prompt.
-		if (!correlationsMatch(waiter.correlation, waiter.terminal.correlation)) {
+		if (!correlationsExactlyMatch(waiter.correlation, waiter.terminal.correlation)) {
 			waiter.terminal = undefined;
 			return;
 		}

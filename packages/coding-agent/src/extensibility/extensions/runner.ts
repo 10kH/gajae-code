@@ -179,6 +179,7 @@ export class ExtensionRunner {
 
 	#getModel: () => Model | undefined = () => undefined;
 	#isIdleFn: () => boolean = () => true;
+	#getActivePromptHandleFn: () => string | undefined = () => undefined;
 	#waitForIdleFn: () => Promise<void> = async () => {};
 	#abortFn: () => void = () => {};
 	#abortPromptAndWaitFn: NonNullable<ExtensionContextActions["abortPromptAndWait"]> = async () => {
@@ -301,6 +302,7 @@ export class ExtensionRunner {
 		// Context actions (required)
 		this.#getModel = contextActions.getModel;
 		this.#isIdleFn = contextActions.isIdle;
+		this.#getActivePromptHandleFn = contextActions.getActivePromptHandle ?? (() => undefined);
 		this.#abortFn = contextActions.abort;
 		this.#abortPromptAndWaitFn =
 			contextActions.abortPromptAndWait ??
@@ -561,6 +563,7 @@ export class ExtensionRunner {
 			get model() {
 				return getModel();
 			},
+			getActivePromptHandle: () => this.#getActivePromptHandleFn(),
 			isIdle: () => this.#isIdleFn(),
 			abort: () => this.#abortFn(),
 			abortPromptAndWait: (handle, options) => this.#abortPromptAndWaitFn(handle, options),

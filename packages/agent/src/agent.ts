@@ -1357,6 +1357,7 @@ export class Agent {
 		const managedLogicalRunOwner = fallbackManaged ? (this.#managedLogicalRunOwner ?? runId) : undefined;
 		const startsManagedLogicalRun = fallbackManaged && this.#managedLogicalRunOwner === undefined;
 		this.#activeResourceRunId = String(managedLogicalRunOwner ?? runId);
+		this.resourceLedger.open(this.#activeResourceRunId);
 		options?.onRunAccepted?.();
 		if (startsManagedLogicalRun) {
 			this.#managedLogicalRunOwner = managedLogicalRunOwner;
@@ -1773,8 +1774,13 @@ export class Agent {
 		if (this.#terminalizedLogicalRunIds.size > 256) {
 			this.#terminalizedLogicalRunIds.delete(this.#terminalizedLogicalRunIds.values().next().value!);
 		}
-		beforeEvent?.();
-		if (event) this.#emit(event);
+		try {
+			beforeEvent?.();
+			if (event) this.#emit(event);
+		} finally {
+			// Publish terminal lifecycle synchronously before sealing the stable handle.
+			this.resourceLedger.seal(String(logicalRunId));
+		}
 	}
 
 	#getAssistantTextLength(message: AgentMessage | null): number {

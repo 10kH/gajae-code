@@ -217,14 +217,17 @@ export class ReverseLeaseRuntime {
 			if (signal) {
 				outstanding.onAbort = () => {
 					if (this.#takeOutstanding(id) !== outstanding) return;
-					void Promise.resolve(
-						this.#sendFrame(lease.connectionId, {
+					try {
+						const cancellation = this.#sendFrame(lease.connectionId, {
 							type: "reverse_cancel",
 							id,
 							connectionId: lease.connectionId,
 							leaseId: lease.leaseId,
-						}),
-					).catch(() => {});
+						});
+						void Promise.resolve(cancellation).catch(() => {});
+					} catch {
+						// Cancellation is best effort; the caller is already settled locally.
+					}
 					reject(Object.assign(new Error("request_cancelled"), { name: "request_cancelled" }));
 				};
 				signal.addEventListener("abort", outstanding.onAbort, { once: true });

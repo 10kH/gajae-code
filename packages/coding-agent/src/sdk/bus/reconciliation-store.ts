@@ -98,6 +98,12 @@ function isValidRecord(value: unknown): boolean {
 	const isTerminalStatus = status === "terminal_ok" || status === "failed";
 	if (isTerminalStatus !== (terminalAt !== undefined)) return false;
 	if (outcome !== undefined && !isTerminalStatus) return false;
+	if (
+		outcome !== undefined &&
+		((status === "terminal_ok" && (!isRecord(outcome) || outcome.kind !== "stopped")) ||
+			(status === "failed" && (!isRecord(outcome) || outcome.kind !== "failed")))
+	)
+		return false;
 	if (value.startedAt !== undefined && (typeof value.startedAt !== "number" || !Number.isFinite(value.startedAt)))
 		return false;
 	if (value.clientRef !== undefined && typeof value.clientRef !== "string") return false;

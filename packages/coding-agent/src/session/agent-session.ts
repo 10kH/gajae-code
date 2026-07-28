@@ -36,8 +36,8 @@ import {
 	type ManagedAttemptDecision,
 	type ManagedAttemptOutcome,
 	type MidRunMaintenanceOutcome,
-	resolveTelemetry,
 	type RunSettlementProof,
+	resolveTelemetry,
 	type StablePrefixSnapshot,
 	ThinkingLevel,
 } from "@gajae-code/agent-core";
@@ -3197,19 +3197,26 @@ export class AgentSession {
 		return queued;
 	}
 
-	#trackAgentEvent = async (event: AgentEvent): Promise<void> => {
+	#trackAgentEvent = (event: AgentEvent): Promise<void> => {
+		const activePromptHandle = this.activePromptHandle;
 		const agentEndHandled = event.type === "agent_end" ? Promise.withResolvers<void>() : undefined;
 		if (agentEndHandled) this.#agentEndHandlingPromise = agentEndHandled.promise;
 		this.#agentEventHandlersInFlight++;
-		try {
-			await this.#handleAgentEvent(event);
-		} catch (error) {
-			logger.warn("Agent event handler failed", { event: event.type, error: String(error) });
-		} finally {
-			this.#agentEventHandlersInFlight = Math.max(0, this.#agentEventHandlersInFlight - 1);
-			this.#flushPendingAgentEnd();
-			agentEndHandled?.resolve();
+		const handler = (async (): Promise<void> => {
+			try {
+				await this.#handleAgentEvent(event, activePromptHandle);
+			} catch (error) {
+				logger.warn("Agent event handler failed", { event: event.type, error: String(error) });
+			} finally {
+				this.#agentEventHandlersInFlight = Math.max(0, this.#agentEventHandlersInFlight - 1);
+				this.#flushPendingAgentEnd();
+				agentEndHandled?.resolve();
+			}
+		})();
+		if (activePromptHandle) {
+			this.agent.resourceLedger.track(activePromptHandle, "post_prompt", "agent-session-event", handler);
 		}
+		return handler;
 	};
 
 	#persistRuntimeStateInBackground(event: AgentSessionEvent): void {
@@ -3348,7 +3355,7 @@ export class AgentSession {
 	}
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
-	#handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+	#handleAgentEvent = async (event: AgentEvent, activePromptHandle?: string): Promise<void> => {
 		if (this.#extensionRunner?.hasHandlers(event.type)) this.#markRetryReplayUnsafe();
 		if (
 			event.type === "tool_execution_start" ||
@@ -3697,9 +3704,10 @@ export class AgentSession {
 											this.#ttsrAbortPending = false;
 											this.#resolveTtsrResume();
 										},
+										resourceRunId: activePromptHandle,
 									});
 								},
-								{ delayMs: 50 },
+								{ delayMs: 50, resourceRunId: activePromptHandle },
 							);
 							return;
 						}
@@ -3858,7 +3866,11 @@ export class AgentSession {
 					maintenanceGeneration !== undefined &&
 					this.#promptGeneration === maintenanceGeneration
 				) {
-					this.#scheduleAgentContinue({ generation: maintenanceGeneration, skipCompactionCheck: true });
+					this.#scheduleAgentContinue({
+						generation: maintenanceGeneration,
+						skipCompactionCheck: true,
+						resourceRunId: activePromptHandle,
+					});
 				}
 				return;
 			}
@@ -3938,8 +3950,11 @@ export class AgentSession {
 			}
 			this.#resolveRetry();
 
-			const compactionTask = this.#checkCompaction(msg);
-			this.#trackPostPromptTask(compactionTask.then(() => undefined));
+			const compactionTask = this.#checkCompaction(msg, true, undefined, activePromptHandle);
+			this.#trackPostPromptTask(
+				compactionTask.then(() => undefined),
+				activePromptHandle,
+			);
 			await compactionTask;
 			// Check for incomplete todos only after a final assistant stop, not intermediate tool-use turns.
 			const hasToolCalls = msg.content.some(content => content.type === "toolCall");
@@ -4003,8 +4018,7 @@ export class AgentSession {
 		this.#postPromptTasksPromise = undefined;
 	}
 
-	#trackPostPromptTask(task: Promise<void>): void {
-		const resourceRunId = this.agent.activeResourceRunId;
+	#trackPostPromptTask(task: Promise<void>, resourceRunId = this.activePromptHandle): void {
 		this.#postPromptTasks.add(task);
 		this.#ensurePostPromptTasksPromise();
 		if (resourceRunId) {
@@ -4022,7 +4036,7 @@ export class AgentSession {
 
 	#schedulePostPromptTask(
 		task: (signal: AbortSignal) => Promise<void>,
-		options?: { delayMs?: number; generation?: number; onSkip?: () => void },
+		options?: { delayMs?: number; generation?: number; onSkip?: () => void; resourceRunId?: string },
 	): Promise<void> {
 		const delayMs = options?.delayMs ?? 0;
 		const signal = this.#postPromptTasksAbortController.signal;
@@ -4045,7 +4059,7 @@ export class AgentSession {
 			}
 			await task(signal);
 		})();
-		this.#trackPostPromptTask(scheduled);
+		this.#trackPostPromptTask(scheduled, options?.resourceRunId);
 		return scheduled;
 	}
 
@@ -4058,6 +4072,7 @@ export class AgentSession {
 		onSkip?: (reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress") => void;
 		allowDuringCancelAndSubmit?: boolean;
 		onError?: (error: unknown) => void;
+		resourceRunId?: string;
 	}): Promise<void> {
 		const predecessorAgentEndHold = options?.suppressPredecessorAgentEnd
 			? this.#reserveDeferredAgentEndForContinuation()
@@ -4153,6 +4168,7 @@ export class AgentSession {
 			{
 				delayMs: options?.delayMs,
 				onSkip: () => skip("aborted_signal"),
+				resourceRunId: options?.resourceRunId,
 			},
 		);
 	}
@@ -4198,14 +4214,14 @@ export class AgentSession {
 		return compactionSettings.autoContinue === false ? "auto_continue_disabled_non_resumable_tail" : undefined;
 	}
 
-	#scheduleOverflowRetryContinuation(generation: number): boolean {
+	#scheduleOverflowRetryContinuation(generation: number, resourceRunId?: string): boolean {
 		this.#stripOverflowFailedTurnForRetry();
 		if (this.#isResumableAgentTail()) {
 			this.#scheduleAgentContinue({
 				delayMs: 100,
 				generation,
 				suppressPredecessorAgentEnd: true,
-
+				resourceRunId,
 				onSkip: reason => this.#logCompactionContinuationSkipped("overflow_retry", reason),
 				onError: error => this.#logCompactionContinuationError("overflow_retry", error),
 			});
@@ -8097,6 +8113,7 @@ export class AgentSession {
 			sessionManager: createReadonlySessionManager(this.sessionManager),
 			modelRegistry: this.#modelRegistry,
 			model: this.model ?? undefined,
+			getActivePromptHandle: () => this.activePromptHandle,
 			isIdle: () => !this.isStreaming,
 			abort: () => {
 				void this.abort();
@@ -11335,6 +11352,7 @@ export class AgentSession {
 		assistantMessage: AssistantMessage,
 		skipAbortedCheck = true,
 		onTerminalOverflowNoop?: () => void,
+		resourceRunId?: string,
 	): Promise<boolean> {
 		// Safety stops are terminal and must not trigger context maintenance.
 		if (
@@ -11381,7 +11399,12 @@ export class AgentSession {
 			const promoted = await this.#tryContextPromotion(assistantMessage);
 			if (promoted) {
 				// Retry on the promoted (larger) model without compacting
-				this.#scheduleAgentContinue({ delayMs: 100, generation, suppressPredecessorAgentEnd: true });
+				this.#scheduleAgentContinue({
+					delayMs: 100,
+					generation,
+					suppressPredecessorAgentEnd: true,
+					resourceRunId,
+				});
 
 				return true;
 			}
@@ -11397,10 +11420,11 @@ export class AgentSession {
 							this.agent.appendMessage(assistantMessage);
 						}
 					},
+					resourceRunId,
 				});
 				return "continuationScheduled" in status && status.continuationScheduled === true;
 			}
-			return this.#scheduleOverflowRetryContinuation(generation);
+			return this.#scheduleOverflowRetryContinuation(generation, resourceRunId);
 		}
 		const compactionSettings = this.settings.getGroup("compaction");
 		if (!compactionSettings.enabled || compactionSettings.strategy === "off") return false;
@@ -12712,6 +12736,7 @@ export class AgentSession {
 			force?: boolean;
 			signal?: AbortSignal;
 			beforeTerminalOverflowNoop?: () => void;
+			resourceRunId?: string;
 		},
 	): Promise<AutoCompactionTerminalStatus> {
 		const compactionSettings = this.settings.getGroup("compaction");
@@ -12733,7 +12758,7 @@ export class AgentSession {
 					if (signal.aborted) return;
 					await this.#runAutoCompaction(reason, willRetry, true, options);
 				},
-				{ generation },
+				{ generation, resourceRunId: options?.resourceRunId },
 			);
 			return { kind: "skipped" };
 		}
