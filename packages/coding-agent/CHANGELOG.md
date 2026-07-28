@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.12.0] - 2026-07-28
 ### Resume fixes
 
 - The typed deep-interview repair CLI (#3040 and its follow-ups) was reverted and replaced with a minimal staged-transition surface: `gjc deep-interview stage --for <transition> --input '<json>'` (or `@file`), `check`, `apply`, and `discard`. The payload is one JSON document merged losslessly into current state — no per-field flag grammar. The session resolves from `GJC_SESSION_ID`, exactly one pending draft exists per session (no `--draft-id`), and the draft records the state revision it was staged against so `apply` CAS-checks it runtime-side; a stale draft is auto-invalidated with typed recovery guidance. `check` dry-runs the identical merge `apply` performs. Validation is core-schema only (envelope shape, bounded input sizes, locked intent-contract immutability); free-form interview fields pass through untouched.
