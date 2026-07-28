@@ -8,6 +8,7 @@ import { TempDir } from "@gajae-code/utils";
 import {
 	injectManagedFileRename,
 	injectManagedTreeFsync,
+	injectManagedTreeRemove,
 	injectManagedTreeRename,
 	injectManagedTreeSnapshot,
 	publishFailure,
@@ -251,6 +252,76 @@ describe("SessionManager session ids", () => {
 		}
 	});
 
+	it("preserves the primary fork failure when publication cleanup only reports an authorized POSIX quarantine", async () => {
+		// `removeManagedTree` / `exact_remove_directory_tree` cannot bind the final unlink
+		// to the verified root descriptor on POSIX, so they detach to `<name>.removing`
+		// and report `cleanup_pending`. No live artifact survives, so that is a SUCCESSFUL
+		// cleanup and must never mask the failure that triggered it.
+		using tempDir = TempDir.createSync("@pi-session-fork-cleanup-pending-");
+		const destination = SessionManager.managedDestination(tempDir.path(), tempDir.path());
+		const session = SessionManager.create(tempDir.path(), destination);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		await session.ensureOnDisk();
+		await session.saveArtifact("artifact", "test");
+		const oldSessionFile = session.getSessionFile();
+		if (!oldSessionFile) throw new Error("Expected session file");
+		const publish = injectManagedFileRename((_source, target) =>
+			target.endsWith(".jsonl") ? publishFailure("io_error", "io_failure") : "passthrough",
+		);
+		const cleanup = injectManagedTreeRemove({ ok: false, code: "cleanup_pending" });
+		try {
+			const error = await session.fork().then(
+				() => undefined,
+				(caught: unknown) => caught as Error,
+			);
+			publish.assertHit();
+			cleanup.assertHit();
+			// The PRIMARY error survives verbatim.
+			expect(String(error?.message)).toContain("io_error");
+			// The cleanup outcome must NOT have superseded it.
+			expect(String(error?.message)).not.toContain("Failed to clean up fork publication");
+			expect(error?.cause).toBeUndefined();
+		} finally {
+			cleanup.restore();
+			publish.restore();
+			await session.close();
+		}
+	});
+
+	it("escalates a real fork publication cleanup failure with the primary failure as its cause", async () => {
+		// An independently real cleanup failure (not the authorized quarantine) leaves a
+		// live artifact behind, so it MUST supersede - while still preserving the primary
+		// failure as `cause` so no evidence is lost.
+		using tempDir = TempDir.createSync("@pi-session-fork-cleanup-real-failure-");
+		const destination = SessionManager.managedDestination(tempDir.path(), tempDir.path());
+		const session = SessionManager.create(tempDir.path(), destination);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		await session.ensureOnDisk();
+		await session.saveArtifact("artifact", "test");
+		const oldSessionFile = session.getSessionFile();
+		if (!oldSessionFile) throw new Error("Expected session file");
+		const publish = injectManagedFileRename((_source, target) =>
+			target.endsWith(".jsonl") ? publishFailure("io_error", "io_failure") : "passthrough",
+		);
+		const cleanup = injectManagedTreeRemove({ ok: false, code: "identity_mismatch" });
+		try {
+			const error = await session.fork().then(
+				() => undefined,
+				(caught: unknown) => caught as Error,
+			);
+			publish.assertHit();
+			cleanup.assertHit();
+			expect(String(error?.message)).toContain("Failed to clean up fork publication");
+			expect(String(error?.message)).toContain("identity_mismatch");
+			// The primary failure is preserved rather than discarded.
+			expect(error?.cause).toBeInstanceOf(Error);
+			expect(String((error?.cause as Error).message)).toContain("io_error");
+		} finally {
+			cleanup.restore();
+			publish.restore();
+			await session.close();
+		}
+	});
 	it("removes the owned staging directory and leaves no destination when the fork artifact copy fails mid-copy", async () => {
 		using tempDir = TempDir.createSync("@pi-session-fork-partial-copy-");
 		const session = SessionManager.create(tempDir.path(), tempDir.path());

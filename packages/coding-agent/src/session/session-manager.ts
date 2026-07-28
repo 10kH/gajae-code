@@ -1859,6 +1859,19 @@ function retainedTreeSnapshotEqualsAfterRename(
 }
 
 /**
+ * True when a cleanup error only reports the authorized POSIX quarantine.
+ *
+ * `exact_remove_directory_tree` and `removeManagedTree` cannot bind the final
+ * unlink to the verified root descriptor on POSIX, so they detach the tree to a
+ * no-replace `<name>.removing` name and report `cleanup_pending`. No live
+ * artifact survives that outcome, so it is a SUCCESSFUL cleanup and must never
+ * supersede the primary failure that triggered it.
+ */
+function isAuthorizedPendingCleanup(cleanupError: Error): boolean {
+	return cleanupError.message === "cleanup_pending";
+}
+
+/**
  * Remove a fork-staging root this process created, re-proving ownership first.
  * Returns undefined when the root is gone or authorized-pending; otherwise returns
  * a stable cleanup code the caller wraps with the original failure as `cause`.
@@ -6322,8 +6335,15 @@ export class SessionManager {
 					cleanupErrors.push(toError(cleanupError));
 				}
 			}
-			if (cleanupErrors.length > 0) {
-				throw new Error(`Failed to clean up fork publication: ${cleanupErrors[0]!.message}`, { cause: failure });
+			// A POSIX quarantine (`cleanup_pending` with a retained recovery path) IS a
+			// successful cleanup: the tree was detached to `<name>.removing` and no live
+			// artifact survives. Only an independently real cleanup failure may supersede
+			// the primary error; otherwise the original failure must reach the caller.
+			const realCleanupErrors = cleanupErrors.filter(cleanupError => !isAuthorizedPendingCleanup(cleanupError));
+			if (realCleanupErrors.length > 0) {
+				throw new Error(`Failed to clean up fork publication: ${realCleanupErrors[0]!.message}`, {
+					cause: failure,
+				});
 			}
 			throw failure;
 		}
