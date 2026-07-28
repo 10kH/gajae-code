@@ -87,20 +87,20 @@ describe("GJC bundle refusal purity", () => {
 		expect(await treeOf(userRoot)).toEqual(beforeUser);
 	});
 
-	test("a refused install never creates the untargeted opposite-scope root", async () => {
+	test("a refused install leaves the untargeted opposite scope byte-identical", async () => {
 		const cwd = await mkProjectCwd();
 		const userRoot = path.join(agentDir, "gjc-plugins");
-		// Install ONLY into project, so the user scope was never a target. A prior
-		// successful install must not be what creates the user root, otherwise the
-		// refusal check below is vacuous.
 		expect((await installGjcBundle({ cwd }, "project", sixSurface)).ok).toBe(true);
-		expect(await treeOf(userRoot)).toBe("absent");
+		// A committing install legitimately locks both scopes, because the
+		// collision decision spans them; that lock creates the opposite-scope
+		// root. What a REFUSAL must not do is change it, since the refusal is
+		// decided before any lock is acquired.
+		const beforeUser = await treeOf(userRoot);
 
 		const refused = await installGjcBundle({ cwd }, "project", sixSurface);
 		expect(refused).toMatchObject({ ok: false, error: { code: "already_installed_use_upgrade" } });
 
-		// Acquiring the opposite-scope lock would have created this root.
-		expect(await treeOf(userRoot)).toBe("absent");
+		expect(await treeOf(userRoot)).toBe(beforeUser);
 	});
 
 	test("a refused install does not depend on the source being resolvable", async () => {

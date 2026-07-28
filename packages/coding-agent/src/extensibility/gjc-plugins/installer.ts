@@ -421,8 +421,12 @@ export async function runGjcBundleTransaction(
 			await fs.mkdir(root, { recursive: true });
 			await cleanupOrphans(root, dirName);
 
-			// Hard install-time collision + MCP security validation against the
-			// effective installed registry (registry is the collision authority).
+			// Hard install-time collision + MCP security validation. The target
+			// scope's registry is the collision authority: surface IDs derive from
+			// the bundle name, so the same bundle installed into both scopes shares
+			// them by design, and every same-name entry is excluded as the entry
+			// being replaced. Widening this to the effective cross-scope registry
+			// would make the supported dual-scope install self-colliding.
 			validateInstallPlan(bundle, targetRegistry.plugins);
 
 			const unique = `${process.pid}-${randomBytes(6).toString("hex")}`;
@@ -465,13 +469,12 @@ export async function runGjcBundleTransaction(
 			}
 		};
 
-		// Only the committing scope is locked. Acquiring the opposite scope's lock
-		// would create that scope's root even when it is never written, breaking
-		// the zero-mutation guarantee for refusals. The opposite scope is only
-		// read, and registry writes are atomic (temp + rename), so an unlocked
-		// read still observes a consistent snapshot; cross-scope drift between
-		// preview and apply is caught by the decision-context fingerprint.
-		return await withRegistryLock(options.scope, options.cwd, critical);
+		// Surface IDs are globally unique, so the collision decision spans both
+		// scopes and must be serialized against every other writer. Both locks are
+		// therefore held, in a fixed user->project order to avoid deadlock,
+		// regardless of which scope commits. Refusal purity is preserved by the
+		// pre-lock preflight above, which returns before any lock is acquired.
+		return await withRegistryLock("user", options.cwd, () => withRegistryLock("project", options.cwd, critical));
 	} finally {
 		await resolved.cleanup();
 	}

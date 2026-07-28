@@ -236,15 +236,31 @@ function alreadyInstalled(name: string, scope: GjcPluginScope): GjcLifecycleErro
 	);
 }
 
+/** Largest manifest this preflight will read before giving up. */
+const PREFLIGHT_MANIFEST_MAX_BYTES = 64 * 1024;
+
 /**
- * Bundle name declared by a local path source, without resolving or compiling
- * it. Returns undefined for remote sources and for anything unreadable, so the
- * caller falls through to the transaction's own preflight.
+ * Bundle name declared by a local directory source, read without resolving or
+ * compiling it so a create-only refusal does not depend on the source being
+ * fetchable. Returns undefined for anything that is not a plain local
+ * directory, for symlinked or oversized manifests, and for unreadable or
+ * malformed content, in which case the caller falls through to the
+ * transaction's own pre-lock preflight.
+ *
+ * This can only cause a refusal, never a commit, and the locked decision
+ * re-derives the identity from the compiled bundle.
  */
 async function declaredBundleName(source: string): Promise<string | undefined> {
 	try {
-		const manifest = await fs.readFile(path.join(source, GJC_PLUGIN_MANIFEST_FILENAME), "utf8");
-		const parsed: unknown = JSON.parse(manifest);
+		// Only a real local directory qualifies. A remote locator must not be
+		// coerced into a relative path where a local file could shadow it.
+		const dir = await fs.stat(source);
+		if (!dir.isDirectory()) return undefined;
+		const manifestPath = path.join(source, GJC_PLUGIN_MANIFEST_FILENAME);
+		// Reject symlinks: following one escapes the source tree.
+		const manifest = await fs.lstat(manifestPath);
+		if (!manifest.isFile() || manifest.size > PREFLIGHT_MANIFEST_MAX_BYTES) return undefined;
+		const parsed: unknown = JSON.parse(await fs.readFile(manifestPath, "utf8"));
 		const name = (parsed as { name?: unknown }).name;
 		return typeof name === "string" && name.length > 0 ? name : undefined;
 	} catch {
