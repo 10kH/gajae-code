@@ -19,8 +19,13 @@ Most runtime lookups use `$env` from `@gajae-code/utils` (`packages/utils/src/en
 3. Agent `.env` (`~/.gjc/agent/.env`, respecting `GJC_CONFIG_DIR` / `GJC_CODING_AGENT_DIR`) for keys not already set
 4. Config-root `.env` (`~/.gjc/.env`, respecting `GJC_CONFIG_DIR`) for keys not already set
 5. Home `.env` (`~/.env`) for keys not already set
+6. Login shell rc files (`~/.zshenv`, `~/.zprofile`, `~/.zshrc`, `~/.bash_profile`, `~/.bashrc`) for keys not already set
 
-Additional rule inside each `.env` file: `GJC_*` keys are mirrored to `GJC_*` keys in that parsed file.
+Step 6 does not execute those files. Each is scanned line by line for literal `export NAME=value` or `NAME=value` assignments, and surrounding quotes are stripped. Values that are not literal are dropped rather than resolved: a command substitution such as `export FOO=$(...)` is discarded.
+
+Because the scan is per line and has no notion of shell block structure, it does not reflect whether an assignment would actually run. An assignment nested in an `if` or a function body is read exactly like a top-level one, so a value you guarded behind something like `if [ -n "$CI" ]` in `~/.zshrc` still reaches `$env` unconditionally. Only assignments that do not start their own line — for example one packed after `case ... in` on the same line — are missed.
+
+Keys are used exactly as written. A `PI_`-prefixed key in a `.env` file is not mirrored to its `GJC_` counterpart, or the reverse — where both spellings are accepted it is because the reading code asks for both names.
 
 ---
 

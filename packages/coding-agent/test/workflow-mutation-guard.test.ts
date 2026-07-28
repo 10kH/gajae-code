@@ -297,6 +297,78 @@ describe("workflow mutation guard", () => {
 		}
 	});
 
+	it("does not misread heredoc document bodies as mutations during active deep-interview (#false-positive)", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveDeepInterview(cwd);
+
+		// Markdown spec bodies contain `>` quotes, `a > b` prose, apostrophes, and
+		// even shell-looking lines — all inert data when the heredoc feeds a data
+		// consumer writing to neutral temp scratch.
+		const specBody = [
+			"# Spec: Memory System",
+			"",
+			"- retrieval: session > project > global precedence",
+			"- don't hardcode `~/.gjc`; user's overrides matter",
+			"| Round | Prior → New | 66.5% → 62.3% |",
+			"rm -rf src is what we must never do",
+			"echo x > src/product.ts (quoted example, not a command)",
+		].join("\n");
+
+		for (const command of [
+			`cat > /tmp/mem-spec.md <<'SPECEOF'\n${specBody}\nSPECEOF\nwc -l /tmp/mem-spec.md`,
+			`cat <<'EOF' > /tmp/plan-draft.md\n${specBody}\nEOF`,
+			`tee /tmp/spec.md >/dev/null <<'DOC'\n${specBody}\nDOC`,
+			`cat <<-'TABDOC' > /tmp/spec.md\n\tindented body a > b\n\tTABDOC`,
+			`cat <<'CNT' | wc -l\n${specBody}\nCNT`,
+			`cat <<'PIPE' | grep -c retrieval | sort\n${specBody}\nPIPE`,
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked).toBe(false);
+		}
+	});
+
+	it("still blocks heredocs that mutate product paths or execute their body", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveDeepInterview(cwd);
+
+		for (const command of [
+			// Redirect target on the OPENER line is product code — blocked regardless of body.
+			"cat <<'EOF' > src/product.ts\ninert body\nEOF",
+			// Script consumers keep their bodies live: mutations inside count.
+			"bash <<'EOF'\nrm src/product.ts\nEOF",
+			'python3 <<PY\nopen("src/product.ts", "w").write("x")\nPY',
+			"patch -p1 <<'EOF'\n--- a/src/product.ts\n+++ b/src/product.ts\nEOF",
+			// Unknown/non-allowlisted consumers keep their bodies live too (Codex P1).
+			"awk -f - <<'EOF'\nBEGIN { x } # rm src/product.ts via body\necho x > src/product.ts\nEOF",
+			// A `<<` inside a comment is not an opener; the following live line still mutates (Codex P1).
+			"# <<'EOF'\nrm src/product.ts\nEOF",
+			// A `<<` inside double-quoted argument data is not an opener either.
+			'printf "%s" "<<\'EOF\'"\nrm src/product.ts\nEOF',
+			// Escaped quotes must not re-expose a quoted `<<` as an opener (Codex P1).
+			'cat "a \\" <<\'EOF\' \\" b"\nrm src/product.ts\nEOF',
+			// A downstream pipe stage can execute the body even when the opener is inert (Codex P1).
+			"cat <<'EOF' | bash\nrm src/product.ts\nEOF",
+			"cat <<'EOF' | grep -v noop | sh\nrm src/product.ts\nEOF",
+			// Unquoted delimiter + command substitution in body expands at runtime — fail closed.
+			"cat <<EOF > /tmp/out.md\n$(rm src/product.ts)\nEOF",
+			// Unterminated heredoc is unparseable — body scanned as before, mutation caught.
+			"cat <<'EOF' > /tmp/out.md\necho x > src/product.ts",
+		]) {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(decision.blocked).toBe(true);
+		}
+	});
+
 	it("blocks mutating bash targets during active deep-interview", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveDeepInterview(cwd);
@@ -754,6 +826,10 @@ describe("workflow mutation guard", () => {
 			"dd if=/dev/null of=src/product.ts",
 			"truncate -s 0 src/product.ts",
 			'python <<PY\nopen("src/product.ts", "w").write("x")\nPY',
+			// A literal nested shell script is a real command list; its mutations count.
+			"bash -c 'rm src/product.ts'",
+			"sh -c 'touch src/product.ts'",
+			'zsh -c "echo x > src/product.ts"',
 		]) {
 			const decision = await getWorkflowMutationDecision({
 				cwd,
@@ -767,6 +843,15 @@ describe("workflow mutation guard", () => {
 		for (const command of [
 			"gjc ralplan --write --stage planner --artifact /tmp/p.md",
 			"cat sample.md > .gjc/specs/deep-interview-sample.md",
+			// Reading and inspecting must never be blocked during a planning phase,
+			// including commands the scanner does not model and read-only wrappers.
+			"gjc deep-interview inspect --selector summary --json",
+			"cat package.json | jq .name",
+			"git status --short",
+			"bash -c 'gjc deep-interview inspect --json'",
+			'bun -e \'const p=Bun.spawnSync(["gjc","state","read"]); process.stdout.write(p.stdout)\'',
+			// Shell metacharacters inside a single-quoted argument value are inert data.
+			"gjc deep-interview draft edit --op set --path /a --value 'uses `bun run release`; a > b | c'",
 		]) {
 			const allowed = await getWorkflowMutationDecision({
 				cwd,
