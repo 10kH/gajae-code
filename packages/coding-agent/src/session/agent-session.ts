@@ -13970,7 +13970,18 @@ export class AgentSession {
 
 			const messages = this.agent.state.messages;
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
-				this.agent.replaceMessages(messages.slice(0, -1));
+				let end = messages.length - 1;
+				// A wedged turn can leave more than one assistant tail behind (e.g. the
+				// agent loop's invalid_prompt repair resend commits its own rejected
+				// message). agent.continue() refuses ANY assistant tail, so strip the
+				// whole trailing run of failed attempts, not just the last one.
+				while (end > 0) {
+					const previous = messages[end - 1];
+					if (previous.role !== "assistant") break;
+					if (previous.stopReason !== "error" && previous.stopReason !== "aborted") break;
+					end--;
+				}
+				this.agent.replaceMessages(messages.slice(0, end));
 			}
 
 			try {

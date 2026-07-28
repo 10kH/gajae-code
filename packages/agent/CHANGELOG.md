@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The `invalid_prompt` circuit breaker no longer replays the rejected turn on its repaired resend. The streaming path commits the failed assistant message to the context before the breaker runs, so the one repaired resend re-sent that errored turn as if the model had spoken it — re-triggering `Request blocked (code=invalid_prompt)` and leaving a second assistant tail that no continuation can resume from. The breaker now repairs and resends only the history that preceded the rejection.
+
 ## [0.12.0] - 2026-07-28
 
 ## [0.11.11] - 2026-07-26
