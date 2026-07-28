@@ -17,6 +17,8 @@
 - Subagent task panels now show the fast-mode glyph for the resolved provider in both live and completed states (#3402).
 - Auto-retry now strips the whole trailing run of failed assistant attempts before continuing. A turn wedged by an `invalid_prompt` repair leaves two error assistant messages behind, and dropping only the last one left an assistant tail that `agent.continue()` refuses, so the retry died with "Retry continuation failed to start" and the turn was lost.
 
+- Session Observer now receives persisted subagent session paths on lifecycle and progress events, so active ralplan reviewer transcripts render instead of remaining at `No transcript entries yet`.
+
 ## [0.12.0] - 2026-07-28
 ### Resume fixes
 
