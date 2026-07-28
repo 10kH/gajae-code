@@ -1858,6 +1858,38 @@ function retainedTreeSnapshotEqualsAfterRename(
 	);
 }
 
+/**
+ * Remove a fork-staging root this process created, re-proving ownership first.
+ * Returns undefined when the root is gone or authorized-pending; otherwise returns
+ * a stable cleanup code the caller wraps with the original failure as `cause`.
+ */
+function removeOwnedForkStaging(stagingDir: string, ownedRoot: native.NativeDirectoryTreeSnapshot): string | undefined {
+	let current: native.NativeDirectoryTreeResult;
+	try {
+		current = native.snapshotDirectoryTree(stagingDir);
+	} catch (snapshotError) {
+		return `staging_snapshot_threw:${toError(snapshotError).message}`;
+	}
+	if (!current.ok || !current.snapshot) {
+		// Only VERIFIED ABSENCE means there is nothing to clean.
+		return current.code === "not_found" ? undefined : (current.code ?? "staging_snapshot_failed");
+	}
+	// Rule R: identity, not pathname, authorizes the delete. Entries may be enumerated
+	// now because they live inside a root we created; the ROOT must be the one we made.
+	if (current.snapshot.rootDev !== ownedRoot.rootDev || current.snapshot.rootIno !== ownedRoot.rootIno)
+		return "staging_identity_mismatch";
+	const removed = native.exactRemoveDirectoryTree(stagingDir, current.snapshot);
+	if (removed.ok) return undefined;
+	if (removed.code === "not_found") return undefined;
+	const cleanupPending =
+		removed.code === "cleanup_pending" &&
+		(removed.detachedPath ??
+			removed.retainedSuccessorPath ??
+			removed.retainedPlaceholderPath ??
+			removed.retainedUnknownPath) !== undefined;
+	return cleanupPending ? undefined : (removed.code ?? "staging_remove_failed");
+}
+
 function managedFileSnapshotEquals(left: ManagedFileSnapshot | null, right: ManagedFileSnapshot | null): boolean {
 	return (
 		left !== null &&
@@ -5510,58 +5542,58 @@ export class SessionManager {
 			const prepared = this.#prepareFreshSessionTransition(fresh, "retain-and-throw");
 			try {
 				await this.#closePersistWriter();
-		} catch (error) {
-			prepared.dispose();
-			throw error;
-		}
-		const previous = {
-			lifecycleIdAdopted: this.#lifecycleIdAdopted,
-			persistChain: this.#persistChain,
-			persistError: this.#persistError,
-			persistErrorReported: this.#persistErrorReported,
-			sessionId: this.#sessionId,
-			sessionName: this.#sessionName,
-			titleSource: this.#titleSource,
-			sessionFile: this.#sessionFile,
-			flushed: this.#flushed,
-			needsFullRewriteOnNextPersist: this.#needsFullRewriteOnNextPersist,
-			ensuredOnDisk: this.#ensuredOnDisk,
-			inMemoryArtifacts: this.#inMemoryArtifacts,
-			inMemoryArtifactCounter: this.#inMemoryArtifactCounter,
-			artifactManager: this.#artifactManager,
-			artifactManagerSessionFile: this.#artifactManagerSessionFile,
-			adoptedArtifactManager: this.#adoptedArtifactManager,
-		};
-		this.#applyFreshSessionMetadata(fresh);
-		try {
-			managedTransition?.adopt();
-			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
-			this.#commitResidentTextStoreTransition(prepared);
-		} catch (error) {
-			managedTransition?.rollback();
-			this.#lifecycleIdAdopted = previous.lifecycleIdAdopted;
-			this.#persistChain = previous.persistChain;
-			this.#persistError = previous.persistError;
-			this.#persistErrorReported = previous.persistErrorReported;
-			this.#sessionId = previous.sessionId;
-			this.#sessionName = previous.sessionName;
-			this.#titleSource = previous.titleSource;
-			this.#sessionFile = previous.sessionFile;
-			this.#flushed = previous.flushed;
-			this.#needsFullRewriteOnNextPersist = previous.needsFullRewriteOnNextPersist;
-			this.#ensuredOnDisk = previous.ensuredOnDisk;
-			this.#inMemoryArtifacts = previous.inMemoryArtifacts;
-			this.#inMemoryArtifactCounter = previous.inMemoryArtifactCounter;
-			this.#artifactManager = previous.artifactManager;
-			this.#artifactManagerSessionFile = previous.artifactManagerSessionFile;
-			this.#adoptedArtifactManager = previous.adoptedArtifactManager;
-			prepared.dispose();
-			throw error;
-		}
-		this.#pendingStrictAdoption = undefined;
-		await this.#rewriteFile();
-		this.#flushed = true;
-		this.#ensuredOnDisk = true;
+			} catch (error) {
+				prepared.dispose();
+				throw error;
+			}
+			const previous = {
+				lifecycleIdAdopted: this.#lifecycleIdAdopted,
+				persistChain: this.#persistChain,
+				persistError: this.#persistError,
+				persistErrorReported: this.#persistErrorReported,
+				sessionId: this.#sessionId,
+				sessionName: this.#sessionName,
+				titleSource: this.#titleSource,
+				sessionFile: this.#sessionFile,
+				flushed: this.#flushed,
+				needsFullRewriteOnNextPersist: this.#needsFullRewriteOnNextPersist,
+				ensuredOnDisk: this.#ensuredOnDisk,
+				inMemoryArtifacts: this.#inMemoryArtifacts,
+				inMemoryArtifactCounter: this.#inMemoryArtifactCounter,
+				artifactManager: this.#artifactManager,
+				artifactManagerSessionFile: this.#artifactManagerSessionFile,
+				adoptedArtifactManager: this.#adoptedArtifactManager,
+			};
+			this.#applyFreshSessionMetadata(fresh);
+			try {
+				managedTransition?.adopt();
+				writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+				this.#commitResidentTextStoreTransition(prepared);
+			} catch (error) {
+				managedTransition?.rollback();
+				this.#lifecycleIdAdopted = previous.lifecycleIdAdopted;
+				this.#persistChain = previous.persistChain;
+				this.#persistError = previous.persistError;
+				this.#persistErrorReported = previous.persistErrorReported;
+				this.#sessionId = previous.sessionId;
+				this.#sessionName = previous.sessionName;
+				this.#titleSource = previous.titleSource;
+				this.#sessionFile = previous.sessionFile;
+				this.#flushed = previous.flushed;
+				this.#needsFullRewriteOnNextPersist = previous.needsFullRewriteOnNextPersist;
+				this.#ensuredOnDisk = previous.ensuredOnDisk;
+				this.#inMemoryArtifacts = previous.inMemoryArtifacts;
+				this.#inMemoryArtifactCounter = previous.inMemoryArtifactCounter;
+				this.#artifactManager = previous.artifactManager;
+				this.#artifactManagerSessionFile = previous.artifactManagerSessionFile;
+				this.#adoptedArtifactManager = previous.adoptedArtifactManager;
+				prepared.dispose();
+				throw error;
+			}
+			this.#pendingStrictAdoption = undefined;
+			await this.#rewriteFile();
+			this.#flushed = true;
+			this.#ensuredOnDisk = true;
 		} catch (error) {
 			managedTransition?.dispose();
 			throw error;
@@ -6328,25 +6360,43 @@ export class SessionManager {
 				if (!isEnoent(error)) throw error;
 			}
 			const expectedManifest = pruneResidentCacheEntries(sourceSnapshot);
-			let destinationSnapshot: native.NativeDirectoryTreeSnapshot | undefined;
+			const parentDir = path.dirname(finalDestinationDir);
+			const stagingDir = path.join(
+				parentDir,
+				`.${path.basename(finalDestinationDir)}.${crypto.randomUUID()}.fork-staging`,
+			);
+			// Establish deletion authority BEFORE any content exists: we create this root
+			// ourselves under an unguessable name and capture its identity while empty.
+			// Only a root whose identity still matches this capture may ever be removed.
+			fs.mkdirSync(stagingDir, { mode: 0o700 });
+			const ownedStaging = native.snapshotDirectoryTree(stagingDir);
+			if (!ownedStaging.ok || !ownedStaging.snapshot) {
+				throw new Error(ownedStaging.code ?? "artifact_staging_snapshot_failed");
+			}
+			const ownedStagingRoot = ownedStaging.snapshot;
+			let published = false;
 			try {
-				await fs.promises.cp(sourceDir, finalDestinationDir, {
+				await fs.promises.cp(sourceDir, stagingDir, {
 					recursive: true,
 					filter: source => {
 						const relativePath = path.relative(sourceDir, source);
 						return relativePath !== "resident-cache" && !relativePath.startsWith(`resident-cache${path.sep}`);
 					},
 				});
-				const capturedDestination = native.snapshotDirectoryTree(finalDestinationDir);
-				if (!capturedDestination.ok || !capturedDestination.snapshot)
-					throw new Error(capturedDestination.code ?? "artifact_destination_snapshot_failed");
-				destinationSnapshot = capturedDestination.snapshot;
+				const capturedStaging = native.snapshotDirectoryTree(stagingDir);
+				if (!capturedStaging.ok || !capturedStaging.snapshot)
+					throw new Error(capturedStaging.code ?? "artifact_destination_snapshot_failed");
+				const stagedSnapshot = capturedStaging.snapshot;
+				if (
+					stagedSnapshot.rootDev !== ownedStagingRoot.rootDev ||
+					stagedSnapshot.rootIno !== ownedStagingRoot.rootIno
+				)
+					throw new Error("artifact_staging_identity_changed");
 				const terminalSource = native.snapshotDirectoryTree(sourceDir);
 				if (!terminalSource.ok || !terminalSource.snapshot)
 					throw new Error(terminalSource.code ?? "artifact_source_changed");
 				if (JSON.stringify(terminalSource.snapshot) !== JSON.stringify(sourceSnapshot))
 					throw new Error("artifact_source_changed");
-
 				const comparable = (tree: native.NativeDirectoryTreeSnapshot) =>
 					tree.entries.map(entry => ({
 						relativePath: entry.relativePath,
@@ -6354,20 +6404,29 @@ export class SessionManager {
 						size: entry.kind === "file" ? entry.size : undefined,
 						sha256: entry.sha256,
 					}));
-				if (JSON.stringify(comparable(destinationSnapshot)) !== JSON.stringify(comparable(expectedManifest)))
+				if (JSON.stringify(comparable(stagedSnapshot)) !== JSON.stringify(comparable(expectedManifest)))
 					throw new Error("artifact_destination_terminal_mismatch");
-				return { kind: "explicit", artifactsDir: finalDestinationDir, snapshot: destinationSnapshot };
+				// No-replace publication: a directory that appeared at the final name after the
+				// preflight is never replaced and never touched.
+				const outcome = classifyNativePublishOutcome(native.renameNoReplacePath(stagingDir, finalDestinationDir));
+				if (!outcome.ok) {
+					if (outcome.reason === "destination_exists") throw new Error("destination_conflict");
+					throw new Error(outcome.code ?? "artifact_destination_publish_failed");
+				}
+				published = true;
+				const terminal = native.snapshotDirectoryTree(finalDestinationDir);
+				if (
+					!terminal.ok ||
+					!terminal.snapshot ||
+					!retainedTreeSnapshotEqualsAfterRename(terminal.snapshot, stagedSnapshot)
+				)
+					throw new Error("artifact_destination_terminal_mismatch");
+				return { kind: "explicit", artifactsDir: finalDestinationDir, snapshot: terminal.snapshot };
 			} catch (error) {
-				if (destinationSnapshot) {
-					const removed = native.exactRemoveDirectoryTree(finalDestinationDir, destinationSnapshot);
-					const cleanupPending =
-						removed.code === "cleanup_pending" &&
-						(removed.detachedPath ??
-							removed.retainedSuccessorPath ??
-							removed.retainedPlaceholderPath ??
-							removed.retainedUnknownPath) !== undefined;
-					if (!removed.ok && !cleanupPending) {
-						throw new Error(`Failed to clean up explicit fork artifacts: ${removed.code ?? "unknown"}`, {
+				if (!published) {
+					const cleanupError = removeOwnedForkStaging(stagingDir, ownedStagingRoot);
+					if (cleanupError) {
+						throw new Error(`Failed to clean up explicit fork artifacts: ${cleanupError}`, {
 							cause: toError(error),
 						});
 					}
