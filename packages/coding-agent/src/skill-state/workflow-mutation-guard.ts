@@ -459,6 +459,8 @@ interface HeredocMaskResult {
 interface ShellQuoteState {
 	inSingle: boolean;
 	inDouble: boolean;
+	/** The open single quote is ANSI-C (`$'…'`): backslash escapes inside it decode at runtime. */
+	inAnsiC: boolean;
 	/**
 	 * Paren stack inside substitutions: `true` for a `$(`/`<(`/`>(` opener
 	 * (its `)` is a word character), `false` for a plain nested paren (its `)`
@@ -480,25 +482,34 @@ interface ShellQuoteState {
  * `dequoted` applies bash-like QUOTE REMOVAL instead — quote/backslash marks
  * drop, quoted word characters stay, quoted metacharacters neutralize to `_` —
  * so obfuscated spellings (`e\val`, `'ev'al`) reassemble into their real
- * command word without quoted data ever forming fake command boundaries.
+ * command word without quoted data ever forming fake command boundaries. A
+ * leading `$` immediately before `'…'` (ANSI-C) or `"…"` (locale-translated)
+ * is stripped during quote removal too, so `$'eval'`/`$"eval"` dequote to
+ * plain `eval`, matching real bash quote-removal semantics for both forms.
  * `continued` reports an unescaped trailing backslash outside quotes (logical
  * line continuation).
  */
 function maskLineForSyntax(
 	line: string,
 	state: ShellQuoteState,
-): { masked: string; dequoted: string; continued: boolean } {
+): { masked: string; dequoted: string; continued: boolean; ansiCEscape: boolean } {
 	let masked = "";
 	let dequoted = "";
 	let escaped = false;
 	let previous = "";
+	let ansiCEscape = false;
 	// Quoted data keeps word characters (so `'ev'al` reassembles to `eval`) but
 	// neutralizes everything else to `_` so it can never form a command boundary.
 	const dequoteData = (character: string): string => (/[\w./-]/.test(character) ? character : "_");
 	for (const character of line) {
 		if (state.inSingle) {
-			if (character === "'") state.inSingle = false;
-			else {
+			if (character === "'") {
+				state.inSingle = false;
+				state.inAnsiC = false;
+			} else {
+				// ANSI-C escapes (`$'\145val'`) decode at runtime into characters the
+				// dequoted view cannot reproduce — flag them so the caller fails closed.
+				if (state.inAnsiC && character === "\\") ansiCEscape = true;
 				masked += " ";
 				dequoted += dequoteData(character);
 				previous = character;
@@ -560,17 +571,26 @@ function maskLineForSyntax(
 		) {
 			// Comment: blank the remainder without evaluating quotes inside it.
 			masked += " ".repeat(line.length - masked.length);
-			return { masked, dequoted, continued: false };
+			return { masked, dequoted, continued: false, ansiCEscape };
 		}
 		if (character === "'") {
 			state.inSingle = true;
 			masked += "'";
+			// ANSI-C quoting `$'…'`: bash strips the `$` during quote removal, and
+			// escapes inside decode at runtime.
+			if (dequoted.endsWith("$")) {
+				dequoted = dequoted.slice(0, -1);
+				state.inAnsiC = true;
+			}
 			previous = character;
 			continue;
 		}
 		if (character === '"') {
 			state.inDouble = true;
 			masked += '"';
+			// `$"…"` locale-translated strings undergo the same quote removal as
+			// ANSI-C `$'…'`: bash drops the `$`, so `$"eval"` dequotes to `eval`.
+			if (dequoted.endsWith("$")) dequoted = dequoted.slice(0, -1);
 			previous = character;
 			continue;
 		}
@@ -578,7 +598,7 @@ function maskLineForSyntax(
 		dequoted += character;
 		previous = character;
 	}
-	return { masked, dequoted, continued: escaped };
+	return { masked, dequoted, continued: escaped, ansiCEscape };
 }
 
 const DATA_CONSUMER_NAMES = new Set(HEREDOC_DATA_CONSUMERS);
@@ -783,7 +803,7 @@ function maskHeredocBodies(command: string): HeredocMaskResult {
 	// (`e\val`, `'ev'al`) cannot hide the word, while heredoc bodies and
 	// comments stay excluded — a spec that merely DOCUMENTS `cat() { … }` or
 	// mentions "eval" in prose stays inert.
-	if (hasDataConsumerShadow(first.dequotedView) || hasShellEvaluatedCommand(first.dequotedView)) {
+	if (first.ansiCEscape || hasDataConsumerShadow(first.dequotedView) || hasShellEvaluatedCommand(first.dequotedView)) {
 		return maskHeredocBodiesPass(command, true).result;
 	}
 	return first.result;
@@ -792,23 +812,43 @@ function maskHeredocBodies(command: string): HeredocMaskResult {
 function maskHeredocBodiesPass(
 	command: string,
 	shadowed: boolean,
-): { result: HeredocMaskResult; dequotedView: string } {
+): { result: HeredocMaskResult; dequotedView: string; ansiCEscape: boolean } {
 	const lines = command.split("\n");
 	const out: string[] = [];
 	const dequotedLines: string[] = [];
-	const state: ShellQuoteState = { inSingle: false, inDouble: false, parenStack: [] };
+	const state: ShellQuoteState = { inSingle: false, inDouble: false, inAnsiC: false, parenStack: [] };
 	let previousContinued = false;
 	let opaqueExpansion = false;
 	let mutatingConsumer = false;
+	let sawAnsiCEscape = false;
 	for (let index = 0; index < lines.length; index++) {
 		const line = lines[index] ?? "";
 		out.push(line);
 		// Cross-line quote masking decides whether a `<<` is real syntax or inert
 		// data — even when the enclosing quote opened on a previous line.
-		const { masked, dequoted, continued } = maskLineForSyntax(line, state);
+		const { masked, dequoted, continued, ansiCEscape } = maskLineForSyntax(line, state);
+		if (ansiCEscape) sawAnsiCEscape = true;
 		const syntax = masked;
-		dequotedLines.push(dequoted);
 		const isContinuationLine = previousContinued;
+		// Bash removes a backslash-newline pair entirely: fold a continuation into
+		// the previous dequoted line so split command words (`e\` + `val`)
+		// reassemble for command/shadow detection.
+		if (isContinuationLine && dequotedLines.length > 0) {
+			let previousDequoted = dequotedLines[dequotedLines.length - 1] ?? "";
+			// A continuation can also split ANSI-C/locale quoting (`$\` + `'eval'` or
+			// `$\` + `"eval"`): the rejoined `$'`/`$"` still drops its `$` during
+			// quote removal.
+			if (previousDequoted.endsWith("$") && (line.startsWith("'") || line.startsWith('"'))) {
+				previousDequoted = previousDequoted.slice(0, -1);
+				// The masker already opened this quote as ordinary (it ran before the
+				// fold), so re-check the rejoined ANSI-C span for runtime-decoding
+				// escapes (`$\` + `'\145val'`) it could not have flagged.
+				if (line.startsWith("'") && /^'[^']*\\/.test(line)) sawAnsiCEscape = true;
+			}
+			dequotedLines[dequotedLines.length - 1] = previousDequoted + dequoted;
+		} else {
+			dequotedLines.push(dequoted);
+		}
 		previousContinued = continued;
 		for (const match of line.matchAll(BASH_HEREDOC_OPEN_RE)) {
 			const at = match.index ?? 0;
@@ -835,6 +875,7 @@ function maskHeredocBodiesPass(
 				return {
 					result: { masked: command, opaqueExpansion, mutatingConsumer },
 					dequotedView: dequotedLines.join("\n"),
+					ansiCEscape: sawAnsiCEscape,
 				};
 			}
 			const maskBody = kind === "data" || kind === "mutating";
@@ -853,6 +894,7 @@ function maskHeredocBodiesPass(
 	return {
 		result: { masked: out.join("\n"), opaqueExpansion, mutatingConsumer },
 		dequotedView: dequotedLines.join("\n"),
+		ansiCEscape: sawAnsiCEscape,
 	};
 }
 
