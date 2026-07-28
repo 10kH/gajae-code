@@ -46,6 +46,7 @@
 - Prompt terminalization now exposes exactly one normalized outcome per accepted prompt, preserving the terminal reason or controlled failure code across SDK and ACP clients.
 - ACP clients can reconnect to a live session while replaying their MCP server declarations. The live session keeps its immutable MCP configuration instead of rejecting the reconnect as a configuration mutation.
 - ACP `AskUserQuestion` now routes through the registered SDK UI provider as a schema-valid form elicitation, including selector, free-text, and navigation-control responses for Air.
+- Telegram `/session_create` and cold resume no longer route macOS or other non-Linux hosts through the Linux-only managed-owner supervisor. Non-Linux launches now bind success and cleanup to the exact tmux server, native session, and live pane process identities, scrub inherited managed-owner authority, and reject children that die during launch stabilization; Linux keeps its existing owner-isolation transaction.
 
 ### Changed
 
