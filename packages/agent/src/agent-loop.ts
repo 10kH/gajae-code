@@ -1494,7 +1494,19 @@ async function runLoopBody(
 				isInvalidPromptError(message)
 			) {
 				invalidPromptRepairAttempted = true;
-				if (repairInvalidPromptHistory(currentContext.messages)) {
+				// The rejected turn was already committed to the context by the
+				// streaming path. Repair (and resend) only the history that
+				// preceded it: replaying an errored assistant turn re-poisons the
+				// request and leaves a second assistant tail behind, which no
+				// continuation can resume from.
+				const rejectedIndex = currentContext.messages.length - 1;
+				const rejectedCommitted =
+					rejectedIndex >= 0 && currentContext.messages[rejectedIndex]?.role === "assistant";
+				const retained = rejectedCommitted
+					? currentContext.messages.slice(0, rejectedIndex)
+					: currentContext.messages;
+				if (repairInvalidPromptHistory(retained)) {
+					if (rejectedCommitted) currentContext.messages.splice(rejectedIndex, 1);
 					continue;
 				}
 			}

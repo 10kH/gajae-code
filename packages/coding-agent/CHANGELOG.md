@@ -4,6 +4,7 @@
 - Ralplan supports opt-in automatic handoff to ultragoal or team through a durable runtime-owned final receipt, with read-only team preflight and PLANNING-STUCK dominance.
 - Subagent setup failures now retain a bounded, redacted cause through live progress, async snapshots, inspect/await, and terminal receipts instead of reporting an empty generic failure.
 - Telegram notification sound can be set to all, important, or none; the reference CLI exposes this with `--sound <all|important|none>`, defaulting to all. Important (ask/idle only) and none are explicit opt-ins for quieter notifications.
+- First-event provider timeouts are configurable and replayed only by AgentSession with a bounded attempt budget, progress-aware safety checks, and measured exhaustion details.
 
 ### Resume fixes
 
@@ -12,7 +13,9 @@
 ### Fixed
 
 - Coordinator MCP now reconciles canonical structured questions from every workflow stage without misclassifying row-level gate diagnostics as malformed pagination, and unwraps accepted SDK gate-answer envelopes before reporting the terminal resolution.
+- Queued named tool choices are revalidated against the live model and active tool set before each request, preventing first-turn eager todo, resolve, or yield flows from sending a stale forced choice after preflight tool changes.
 - Subagent task panels now show the fast-mode glyph for the resolved provider in both live and completed states (#3402).
+- Auto-retry now strips the whole trailing run of failed assistant attempts before continuing. A turn wedged by an `invalid_prompt` repair leaves two error assistant messages behind, and dropping only the last one left an assistant tail that `agent.continue()` refuses, so the retry died with "Retry continuation failed to start" and the turn was lost.
 
 - Session Observer now receives persisted subagent session paths on lifecycle and progress events, so active ralplan reviewer transcripts render instead of remaining at `No transcript entries yet`.
 
@@ -20,6 +23,7 @@
 ### Resume fixes
 
 - Status-line pull-request discovery no longer lets the background `gh pr view` process inherit the interactive TUI's stdin, preventing a misconfigured or prompting `gh` executable from stealing keystrokes; the lookup now also fails closed when `gh` is unavailable and terminates after a bounded timeout (#3354).
+- Completed `!` shell commands issued during an active agent turn now leave the bottom-pinned pending surface immediately instead of obscuring the live status area until the next prompt; the completed command is still retained for normal transcript insertion.
 - The typed deep-interview repair CLI (#3040 and its follow-ups) was reverted and replaced with a minimal staged-transition surface: `gjc deep-interview stage --for <transition> --input '<json>'` (or `@file`), `check`, `apply`, and `discard`. The payload is one JSON document merged losslessly into current state — no per-field flag grammar. The session resolves from `GJC_SESSION_ID`, exactly one pending draft exists per session (no `--draft-id`), and the draft records the state revision it was staged against so `apply` CAS-checks it runtime-side; a stale draft is auto-invalidated with typed recovery guidance. `check` dry-runs the identical merge `apply` performs. Validation is core-schema only (envelope shape, bounded input sizes, locked intent-contract immutability); free-form interview fields pass through untouched.
 - With all-tool discovery enabled, `task.eager` now keeps the `task` tool active so its delegation instruction can actually be followed; discovery guidance now distinguishes activating a tool from executing it and directs explicit parallel/delegation requests to discover the subagent capability before claiming workers started.
 - Unknown `gjc team api` operations now fail as normal CLI usage errors instead of invoking the global uncaught-exception crash reporter. JSON mode returns a compact typed receipt with the invalid operation and suggestions; text mode prints one actionable line. Common mistakes such as `heartbeat` now point to `read-worker-heartbeat` or `update-worker-heartbeat`, and operation validation runs before team-state lookup so a missing `team_name` cannot hide the actual command error.

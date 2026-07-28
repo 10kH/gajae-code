@@ -383,6 +383,22 @@ describe("workflow mutation guard", () => {
 			// Leading redirections precede the command word — attached or separated (Codex P1).
 			"</dev/null eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
 			"< /dev/null eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// Backslash-newline folds away: a split `e\`+`val` is still eval (Codex P1).
+			"e\\\nval 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// ANSI-C quoting strips the `$` during quote removal: $'eval' is eval (Codex P1).
+			"$'eval' 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// A continuation between `$` and its ANSI-C quote still yields eval (Codex P1).
+			"$\\\n'eval' 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// Locale-translated `$"…"` strips the `$` too: $"eval" is eval (Codex P1).
+			"$\"eval\" 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// A continuation between `$` and its locale-translated quote also yields eval (Codex P1).
+			"$\\\n\"eval\" 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// ANSI-C escape sequences decode at runtime — fail closed (Codex P1).
+			"$'\\145val' 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// ANSI-C opener split by a continuation still carries runtime escapes (Codex P1).
+			"$\\\n'\\145val' 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
+			// A continuation inside double quotes still splits a command word (Codex P1).
+			"\"e\\\nval\" 'cat(){ bash -s; }'; cat <<'EOF'\nrm src/product.ts\nEOF",
 			// Bash's `function name()` hybrid form is still a declaration (Codex P1).
 			"function cat() { bash -s; }; cat <<'EOF'\nrm src/product.ts\nEOF",
 			// Function shadows after reserved words are still declarations (Codex P1).
