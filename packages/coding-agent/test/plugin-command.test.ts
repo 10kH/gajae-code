@@ -89,4 +89,25 @@ describe("Plugin command scope parsing", () => {
 		expect(jsonList.stdout).not.toContain("pluginRoot");
 		expect(jsonList.stdout).not.toContain("copiedFiles");
 	});
+
+	it("GJC install and upgrade failures never echo the source or its cause", async () => {
+		const cwd = await makeTempProject();
+		// A hostile locator carrying credentials, a query string, a fragment, and
+		// an absolute home path. None of it may reach stdout or stderr on any GJC
+		// CLI surface, in text or JSON mode.
+		const hostile = "https://user:s3cr3t-token@example.invalid/owner/repo.git?auth=abc#frag";
+
+		const install = await runPluginCommand(["install", hostile, "--project"], cwd);
+		const upgrade = await runPluginCommand(["upgrade", "definitely-not-installed", "--project"], cwd);
+		const installJson = await runPluginCommand(["install", hostile, "--project", "--json"], cwd);
+
+		for (const result of [install, upgrade, installJson]) {
+			const output = `${result.stdout}${result.stderr}`;
+			expect(output).not.toContain("s3cr3t-token");
+			expect(output).not.toContain("user:");
+			expect(output).not.toContain("auth=abc");
+			expect(output).not.toContain("#frag");
+			expect(output).not.toContain(os.homedir());
+		}
+	});
 });
