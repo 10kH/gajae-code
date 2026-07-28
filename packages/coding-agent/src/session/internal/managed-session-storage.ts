@@ -453,6 +453,8 @@ export class ManagedSessionDescendantStore {
 	readonly #baseDir: string;
 	readonly #policy: ManagedSessionSecurityPolicy;
 	readonly #authority: RecoveryFsRoot | undefined;
+	#ownsAuthority = false;
+	#closed = false;
 	readonly #authorityBaseDir: string;
 	/** Logical profile root inherited by nested managed session destinations. */
 	readonly #profileAgentDir: string;
@@ -505,6 +507,7 @@ export class ManagedSessionDescendantStore {
 				throw new Error("Managed descendant root identity changed");
 			}
 			this.#authority = authority;
+			this.#ownsAuthority = true;
 		}
 	}
 
@@ -557,6 +560,16 @@ export class ManagedSessionDescendantStore {
 			this.#subtreeRoot.dev.toString(),
 			this.#subtreeRoot.ino.toString(),
 		);
+	}
+
+	/**
+	 * Release an authority this store opened itself. Retained authorities are owned by
+	 * the security context that supplied them and are never closed here. Idempotent.
+	 */
+	close(): void {
+		if (this.#closed || !this.#ownsAuthority || !this.#authority) return;
+		this.#closed = true;
+		this.#authority.close();
 	}
 
 	assertBound(): void {

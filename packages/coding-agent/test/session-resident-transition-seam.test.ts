@@ -17,6 +17,7 @@ import {
 import { MemorySessionStorage } from "@gajae-code/coding-agent/session/session-storage";
 
 import type { RecoveryFsRoot } from "@gajae-code/natives";
+import * as native from "@gajae-code/natives";
 import { getAgentDir, getResidentCacheRootDir, getTerminalSessionsDir, setAgentDir } from "@gajae-code/utils";
 import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 
@@ -424,6 +425,104 @@ async function stageMemoryGuardRecovery(
 }
 
 describe("resident-store transition seam", () => {
+	it("B1-T1 adopts a managed session from a different workspace under the same agent directory and persists to it", async () => {
+		const aText = `cross-workspace A ${"a".repeat(4096)}`;
+		const a = await createManagedPersistedSession(aText);
+		await a.sm.close();
+		const bText = `cross-workspace B ${"b".repeat(4096)}`;
+		const b = await createManagedPersistedSession(bText);
+		try {
+			expect(path.dirname(a.sessionFile)).not.toBe(path.dirname(b.sessionFile));
+			expect(a.cwd).not.toBe(b.cwd);
+			await expect(b.sm.setSessionFile(a.sessionFile)).resolves.toBeUndefined();
+			expect(b.sm.getSessionFile()).toBe(a.sessionFile);
+			expectReadable(b.sm, aText);
+			const appended = `cross-workspace appended ${"x".repeat(4096)}`;
+			b.sm.appendMessage(assistantMessage(appended));
+			await b.sm.flush();
+			expect(fs.readFileSync(a.sessionFile, "utf8")).toContain(appended);
+			expect(residentCacheDirs()).toHaveLength(1);
+			await b.sm.close();
+			const reopened = await SessionManager.open(a.sessionFile);
+			try {
+				expectReadable(reopened, aText);
+				expectReadable(reopened, appended);
+			} finally {
+				await reopened.close();
+			}
+		} finally {
+			await b.sm.close().catch(() => {});
+		}
+	});
+
+	it.skipIf(process.platform !== "linux")(
+		"B1-T2 releases the derived managed authority when a cross-workspace switch fails",
+		async () => {
+			const a = await createManagedPersistedSession(`cross-workspace rollback A ${"a".repeat(4096)}`);
+			await a.sm.close();
+			const bText = `cross-workspace rollback B ${"b".repeat(4096)}`;
+			const b = await createManagedPersistedSession(bText);
+			const closes = vi.spyOn(native.RecoveryFsRoot.prototype, "close");
+			try {
+				fs.chmodSync(residentCacheRoot(), 0o777);
+				try {
+					await expect(b.sm.setSessionFile(a.sessionFile)).rejects.toThrow(
+						"Resident cache trust validation failed",
+					);
+				} finally {
+					fs.chmodSync(residentCacheRoot(), 0o700);
+				}
+				expect(closes).toHaveBeenCalledTimes(1);
+				expect(b.sm.getSessionFile()).toBe(b.sessionFile);
+				expectReadable(b.sm, bText);
+				const appended = `cross-workspace rollback appended ${"r".repeat(4096)}`;
+				b.sm.appendMessage(assistantMessage(appended));
+				await b.sm.flush();
+				expect(fs.readFileSync(b.sessionFile, "utf8")).toContain(appended);
+			} finally {
+				await b.sm.close().catch(() => {});
+			}
+		},
+	);
+
+	it("B1-T3 rejects a managed session-file switch to a directory outside the managed root", async () => {
+		const managedText = `containment ${"c".repeat(4096)}`;
+		const managed = await createManagedPersistedSession(managedText);
+		const outsideCwd = makeTempDir("gjc-resident-transition-outside-");
+		const outside = SessionManager.create(outsideCwd, path.join(outsideCwd, "sessions"));
+		outside.appendMessage(assistantMessage(`outside ${"o".repeat(4096)}`));
+		await outside.ensureOnDisk();
+		await outside.flush();
+		const outsideFile = outside.getSessionFile();
+		if (!outsideFile) throw new Error("Expected outside session file");
+		await outside.close();
+		const closes = vi.spyOn(native.RecoveryFsRoot.prototype, "close");
+		try {
+			await expect(managed.sm.setSessionFile(outsideFile)).rejects.toThrow();
+			expect(managed.sm.getSessionFile()).toBe(managed.sessionFile);
+			expectReadable(managed.sm, managedText);
+			if (process.platform === "linux") expect(closes).toHaveBeenCalledTimes(0);
+		} finally {
+			await managed.sm.close().catch(() => {});
+		}
+	});
+
+	it("B1-T4 fails closed when a new session is started after a cross-workspace adoption", async () => {
+		const aText = `cross-workspace fork A ${"a".repeat(4096)}`;
+		const a = await createManagedPersistedSession(aText);
+		await a.sm.close();
+		const b = await createManagedPersistedSession(`cross-workspace fork B ${"b".repeat(4096)}`);
+		try {
+			await expect(b.sm.setSessionFile(a.sessionFile)).resolves.toBeUndefined();
+			await expect(b.sm.fork()).rejects.toThrow("Managed transcript escaped its session directory");
+			expect(b.sm.getSessionFile()).toBe(a.sessionFile);
+			expect(fs.readFileSync(a.sessionFile, "utf8")).toContain(aText);
+			expect(fs.readdirSync(path.dirname(a.sessionFile)).filter(name => name.includes("fork-staging"))).toEqual([]);
+		} finally {
+			await b.sm.close().catch(() => {});
+		}
+	});
+
 	it("T5a installs the staged prepared-session pair after candidate disk failure and disposes the predecessor", async () => {
 		const predecessor = await createPersistedSession(`prepared predecessor ${"p".repeat(4096)}`);
 		const prepared = await predecessor.sm.prepareNewSession();

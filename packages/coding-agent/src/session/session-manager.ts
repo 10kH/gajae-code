@@ -1885,10 +1885,14 @@ function managedStoreFromContext(
 	securityContext: ManagedSessionSecurityContext,
 	directory: string,
 ): ManagedSessionDescendantStore {
+	// A retained fd authority is bound to the exact directory it was retained for.
+	// For any other directory the store must re-derive its own authority from the
+	// shared root instead of inheriting a binding that describes a different inode.
+	const ownsRetainedAuthority = path.resolve(directory) === path.resolve(securityContext.sessionDir);
 	return new ManagedSessionDescendantStore(
 		securityContext.rootAuthority,
 		directory,
-		securityContext.retainedAuthority
+		securityContext.retainedAuthority && ownsRetainedAuthority
 			? { authority: securityContext.retainedAuthority, authorityBaseDir: directory }
 			: undefined,
 		managedSecurityPolicyForContext(securityContext),
@@ -4654,6 +4658,15 @@ function materializedCacheMaxBytes(): number {
 	return override;
 }
 
+type ManagedDestinationTransition = {
+	readonly directory: string;
+	readonly destination: SessionDestination;
+	readonly store: ManagedSessionDescendantStore;
+	adopt(): void;
+	rollback(): void;
+	dispose(): void;
+};
+
 export class SessionManager {
 	#sessionId: string = "";
 	/** True once a lifecycle pre-allocated id has been adopted (consume-once). */
@@ -4692,6 +4705,7 @@ export class SessionManager {
 	#artifactManager: ArtifactManager | null = null;
 	#artifactManagerSessionFile: string | null = null;
 	#managedTranscriptStoreCache: { directory: string; store: ManagedSessionDescendantStore } | null = null;
+	#ownedManagedAuthority: ManagedSessionDescendantStore | undefined;
 	// When set, take precedence over the lazily-derived per-session manager.
 	// Subagents adopt the parent's manager so artifact IDs are unique across the
 	// whole agent tree and all files land in the parent's artifacts dir.
@@ -5403,94 +5417,99 @@ export class SessionManager {
 		this.#assertRecoveryHydrationWritable();
 		const resolvedSessionFile = this.storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
 		const strictAdoption = this.#pendingStrictAdoption;
+		let managedTransition: ManagedDestinationTransition | undefined;
 		if (this.destination.kind === "managed") {
 			const candidateDirectory = path.resolve(path.dirname(resolvedSessionFile));
-			const candidateStore =
-				candidateDirectory === path.resolve(this.destination.directory)
-					? this.#managedTranscriptStore(resolvedSessionFile)
-					: managedStoreFromContext(this.destination.securityContext, candidateDirectory);
-			candidateStore.verifyRootSecurity();
-			candidateStore.assertBound();
+			if (candidateDirectory === path.resolve(this.destination.directory)) {
+				const candidateStore = this.#managedTranscriptStore(resolvedSessionFile);
+				candidateStore.verifyRootSecurity();
+				candidateStore.assertBound();
+			} else {
+				managedTransition = this.#prepareManagedDestinationTransition(candidateDirectory);
+			}
 		}
-		if (strictAdoption && resolvedSessionFile === strictAdoption.canonicalPath) {
-			const inspected = inspectResumeSessionFile(resolvedSessionFile, this.storage);
-			if ("kind" in inspected || !sameResumeIdentity(strictAdoption.identity, inspected.identity))
-				throw new Error("Prepared managed session changed before strict adoption.");
-		}
-		let entries: FileEntry[];
-		let candidateMigrationApplied = false;
-		if (this.storage.existsSync(resolvedSessionFile)) {
-			const inspected = inspectResumeSessionFile(resolvedSessionFile, this.storage);
-			if ("kind" in inspected) throw new Error(`Could not switch session: ${inspected.reason}`);
-			entries = inspected.entries;
-			candidateMigrationApplied = inspected.migrationApplied;
-		} else {
-			entries = await loadEntriesFromFile(resolvedSessionFile, this.storage);
-		}
-		if (strictAdoption) {
-			const inspected = inspectResumeSessionFile(resolvedSessionFile, this.storage);
-			if ("kind" in inspected || !sameResumeIdentity(strictAdoption.identity, inspected.identity))
-				throw new Error("Prepared managed session changed during strict adoption.");
-		}
-		if (entries.length > 0) {
-			const header = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
-			const sessionId = header?.id ?? createSessionId();
-			const migrationApplied = candidateMigrationApplied || migrateToCurrentVersion(entries);
-			await resolveBlobRefsInEntries(entries, this.#blobStore);
-			const prepared = this.#prepareResidentTextStoreTransition(
-				{
-					target: { sessionId, sessionFile: resolvedSessionFile },
-					allowUnwritableResidentCacheFallback: true,
-					primary: {
-						mode: "materialize",
-						sourceEntries: entries,
-						sourceStores: { textStore: null, imageStore: this.#residentImageBlobStore },
+		try {
+			if (strictAdoption && resolvedSessionFile === strictAdoption.canonicalPath) {
+				const inspected = inspectResumeSessionFile(resolvedSessionFile, this.storage);
+				if ("kind" in inspected || !sameResumeIdentity(strictAdoption.identity, inspected.identity))
+					throw new Error("Prepared managed session changed before strict adoption.");
+			}
+			let entries: FileEntry[];
+			let candidateMigrationApplied = false;
+			if (this.storage.existsSync(resolvedSessionFile)) {
+				const inspected = inspectResumeSessionFile(resolvedSessionFile, this.storage);
+				if ("kind" in inspected) throw new Error(`Could not switch session: ${inspected.reason}`);
+				entries = inspected.entries;
+				candidateMigrationApplied = inspected.migrationApplied;
+			} else {
+				entries = await loadEntriesFromFile(resolvedSessionFile, this.storage);
+			}
+			if (strictAdoption) {
+				const inspected = inspectResumeSessionFile(resolvedSessionFile, this.storage);
+				if ("kind" in inspected || !sameResumeIdentity(strictAdoption.identity, inspected.identity))
+					throw new Error("Prepared managed session changed during strict adoption.");
+			}
+			if (entries.length > 0) {
+				const header = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
+				const sessionId = header?.id ?? createSessionId();
+				const migrationApplied = candidateMigrationApplied || migrateToCurrentVersion(entries);
+				await resolveBlobRefsInEntries(entries, this.#blobStore);
+				const prepared = this.#prepareResidentTextStoreTransition(
+					{
+						target: { sessionId, sessionFile: resolvedSessionFile },
+						allowUnwritableResidentCacheFallback: true,
+						primary: {
+							mode: "materialize",
+							sourceEntries: entries,
+							sourceStores: { textStore: null, imageStore: this.#residentImageBlobStore },
+						},
 					},
-				},
-				"retain-and-throw",
-			);
+					"retain-and-throw",
+				);
+				try {
+					await this.#closePersistWriter();
+				} catch (error) {
+					prepared.dispose();
+					throw error;
+				}
+				const previous = {
+					sessionId: this.#sessionId,
+					sessionName: this.#sessionName,
+					titleSource: this.#titleSource,
+					sessionFile: this.#sessionFile,
+					needsFullRewriteOnNextPersist: this.#needsFullRewriteOnNextPersist,
+				};
+				this.#persistError = undefined;
+				this.#persistErrorReported = false;
+				this.#sessionFile = resolvedSessionFile;
+				this.#sessionId = sessionId;
+				this.#sessionName = header?.title;
+				this.#titleSource = header?.titleSource;
+				this.#needsFullRewriteOnNextPersist = migrationApplied;
+				try {
+					managedTransition?.adopt();
+					writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+					this.#commitResidentTextStoreTransition(prepared);
+				} catch (error) {
+					managedTransition?.rollback();
+					this.#sessionId = previous.sessionId;
+					this.#sessionName = previous.sessionName;
+					this.#titleSource = previous.titleSource;
+					this.#sessionFile = previous.sessionFile;
+					this.#needsFullRewriteOnNextPersist = previous.needsFullRewriteOnNextPersist;
+					prepared.dispose();
+					throw error;
+				}
+				this.#pendingStrictAdoption = undefined;
+				this.#flushed = true;
+				this.#ensuredOnDisk = true;
+				await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
+				return;
+			}
+			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
+			const prepared = this.#prepareFreshSessionTransition(fresh, "retain-and-throw");
 			try {
 				await this.#closePersistWriter();
-			} catch (error) {
-				prepared.dispose();
-				throw error;
-			}
-			const previous = {
-				sessionId: this.#sessionId,
-				sessionName: this.#sessionName,
-				titleSource: this.#titleSource,
-				sessionFile: this.#sessionFile,
-				needsFullRewriteOnNextPersist: this.#needsFullRewriteOnNextPersist,
-			};
-			this.#persistError = undefined;
-			this.#persistErrorReported = false;
-			this.#sessionFile = resolvedSessionFile;
-			this.#sessionId = sessionId;
-			this.#sessionName = header?.title;
-			this.#titleSource = header?.titleSource;
-			this.#needsFullRewriteOnNextPersist = migrationApplied;
-			try {
-				writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
-				this.#commitResidentTextStoreTransition(prepared);
-			} catch (error) {
-				this.#sessionId = previous.sessionId;
-				this.#sessionName = previous.sessionName;
-				this.#titleSource = previous.titleSource;
-				this.#sessionFile = previous.sessionFile;
-				this.#needsFullRewriteOnNextPersist = previous.needsFullRewriteOnNextPersist;
-				prepared.dispose();
-				throw error;
-			}
-			this.#pendingStrictAdoption = undefined;
-			this.#flushed = true;
-			this.#ensuredOnDisk = true;
-			await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
-			return;
-		}
-		const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
-		const prepared = this.#prepareFreshSessionTransition(fresh, "retain-and-throw");
-		try {
-			await this.#closePersistWriter();
 		} catch (error) {
 			prepared.dispose();
 			throw error;
@@ -5515,9 +5534,11 @@ export class SessionManager {
 		};
 		this.#applyFreshSessionMetadata(fresh);
 		try {
+			managedTransition?.adopt();
 			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			this.#commitResidentTextStoreTransition(prepared);
 		} catch (error) {
+			managedTransition?.rollback();
 			this.#lifecycleIdAdopted = previous.lifecycleIdAdopted;
 			this.#persistChain = previous.persistChain;
 			this.#persistError = previous.persistError;
@@ -5541,6 +5562,10 @@ export class SessionManager {
 		await this.#rewriteFile();
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
+		} catch (error) {
+			managedTransition?.dispose();
+			throw error;
+		}
 	}
 
 	/** Start a new session. Closes any existing writer first. */
@@ -7067,6 +7092,75 @@ export class SessionManager {
 		}
 	}
 
+	/**
+	 * Verify a foreign managed candidate directory under this manager's own root and
+	 * prepare an owned destination rebind for it. Returns undefined when the candidate
+	 * is this manager's current managed directory (nothing to rebind).
+	 */
+	#prepareManagedDestinationTransition(candidateDirectory: string): ManagedDestinationTransition | undefined {
+		if (this.destination.kind !== "managed") throw new Error("Managed transcript authority is unavailable");
+		const current = this.destination;
+		if (path.resolve(candidateDirectory) === path.resolve(current.directory)) return undefined;
+		// Independent verification: the non-retained constructor applies managedRelativePath
+		// containment, assertManagedDirectoryRoot, full-chain ensureManagedDirectory owner-only
+		// ACL verification, and a fresh fd identity binding on linux.
+		const store = managedStoreFromContext(current.securityContext, candidateDirectory);
+		let adopted = false;
+		try {
+			store.verifyRootSecurity();
+			store.assertBound();
+		} catch (error) {
+			store.close();
+			throw error;
+		}
+		const securityContext = createManagedSessionSecurityContext({
+			agentDir: current.securityContext.agentDir,
+			profileAgentDir: current.securityContext.profileAgentDir,
+			sessionsRoot: current.securityContext.sessionsRoot,
+			sessionDir: candidateDirectory,
+			rootAuthority: current.securityContext.rootAuthority,
+			// The candidate store owns its own authority; the context must not hand out a
+			// borrowed retained fd for a directory it was not retained for.
+			retainedAuthority: undefined,
+		});
+		managedSecurityPolicies.set(securityContext, managedSecurityPolicyForContext(current.securityContext));
+		const destination = Object.freeze({ kind: "managed" as const, directory: candidateDirectory, securityContext });
+		trustedSessionDestinations.add(destination);
+		const previousDestination = current;
+		const previousCache = this.#managedTranscriptStoreCache;
+		const previousOwned = this.#ownedManagedAuthority;
+		return {
+			directory: candidateDirectory,
+			destination,
+			store,
+			adopt: () => {
+				adopted = true;
+				this.destination = destination;
+				this.#managedTranscriptStoreCache = { directory: path.resolve(candidateDirectory), store };
+				this.#ownedManagedAuthority = store;
+				// Supersede: exactly one owned authority per manager.
+				if (previousOwned && previousOwned !== store) previousOwned.close();
+			},
+			rollback: () => {
+				if (!adopted) return;
+				adopted = false;
+				this.destination = previousDestination;
+				this.#managedTranscriptStoreCache = previousCache;
+				this.#ownedManagedAuthority = previousOwned;
+				store.close();
+			},
+			dispose: () => {
+				if (adopted) return;
+				store.close();
+			},
+		};
+	}
+
+	#releaseOwnedManagedAuthority(): void {
+		this.#ownedManagedAuthority?.close();
+		this.#ownedManagedAuthority = undefined;
+	}
+
 	#managedTranscriptStore(sessionFile = this.#sessionFile): ManagedSessionDescendantStore {
 		if (this.destination.kind !== "managed" || !sessionFile) {
 			throw new Error("Managed transcript authority is unavailable");
@@ -7397,6 +7491,7 @@ export class SessionManager {
 			}
 		});
 		this.#releaseResidentTextStore();
+		this.#releaseOwnedManagedAuthority();
 		if (this.#persistError) throw this.#persistError;
 	}
 	/** Flush while open, then strictly close; retryable close skips the invalid second flush. */
