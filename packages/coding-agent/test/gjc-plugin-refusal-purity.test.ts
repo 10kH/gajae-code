@@ -159,6 +159,20 @@ describe("GJC bundle refusal purity", () => {
 		).rejects.toThrow();
 	});
 
+	test("locator-matched refusal cannot refuse an install that should proceed", async () => {
+		const cwd = await mkProjectCwd();
+		const copy = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-refusal-reuse-"));
+		tempDirs.push(copy);
+		await fs.cp(sixSurface, copy, { recursive: true });
+		expect((await installGjcBundle({ cwd }, "project", copy)).ok).toBe(true);
+
+		// Same locator, but the target scope has no such entry: the locator match
+		// is scoped, so a user-scope install must NOT be refused by the project
+		// entry that happens to share the source.
+		const userInstall = await installGjcBundle({ cwd }, "user", copy);
+		expect(userInstall.ok).toBe(true);
+	});
+
 	test("a git ref is preserved when rebuilding the stored locator", () => {
 		expect(storedSourceLocatorForTest({ kind: "git", uri: "https://h/o/r.git", ref: "v2", resolvedAt: "t" })).toBe(
 			"https://h/o/r.git#v2",
