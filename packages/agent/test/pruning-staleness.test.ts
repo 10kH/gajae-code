@@ -714,8 +714,8 @@ describe("assistant edit argument pruning", () => {
 			path: "src/a.ts",
 			old_string: "a",
 			new_string: "b".repeat(2000),
-		});
-		const message = (oldEdits as SessionMessageEntry).message as AssistantMessage;
+		}) as SessionMessageEntry;
+		const message = oldEdits.message as AssistantMessage;
 		message.content.push({
 			type: "toolCall",
 			id: "multi-b",
