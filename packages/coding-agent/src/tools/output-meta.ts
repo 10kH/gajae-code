@@ -53,8 +53,12 @@ export interface TruncationMeta {
 	elidedBytes?: number;
 	/** Lines elided from the middle. */
 	elidedLines?: number;
-	/** Artifact ID if full output was saved */
+	/** Artifact ID when output was persisted; completeness is tracked separately below. */
 	artifactId?: string;
+	/** Bytes omitted from an artifact after its hard storage cap was reached. */
+	artifactTruncatedBytes?: number;
+	/** Bounded diagnostic when artifact writer creation, write, or finalization failed. */
+	artifactFailureDiagnostic?: string;
 	/** Next offset for pagination (head truncation only) */
 	nextOffset?: number;
 }
@@ -323,13 +327,30 @@ export class OutputMetaBuilder {
 		return this;
 	}
 
-	/** Add truncation info from OutputSummary. No-op if not truncated. */
+	/** Add truncation info from OutputSummary. No-op if not truncated or artifact evidence is absent. */
 	truncationFromSummary(summary: OutputSummary, options: TruncationSummaryOptions): this {
-		if (!summary.truncated) return this;
+		const artifactFailureDiagnostic = summary.artifactFailureDiagnostic;
+		const artifactTruncatedBytes =
+			summary.artifactTruncatedBytes != null && summary.artifactTruncatedBytes > 0
+				? summary.artifactTruncatedBytes
+				: undefined;
+		const hasArtifactEvidence =
+			summary.artifactId !== undefined ||
+			artifactFailureDiagnostic !== undefined ||
+			artifactTruncatedBytes !== undefined;
+		if (!summary.truncated && !hasArtifactEvidence) return this;
 
 		const { direction, startLine = 1, totalFileLines, noticeOwner } = options;
 		const totalLines = totalFileLines ?? summary.totalLines;
-		const owner = noticeOwner !== undefined ? { noticeOwner } : {};
+		const bodyHasArtifact =
+			summary.artifactId !== undefined && summary.output.includes(`artifact://${summary.artifactId}`);
+		const bodyOwnsArtifact =
+			bodyHasArtifact &&
+			(artifactTruncatedBytes === undefined ||
+				(summary.artifactId !== undefined &&
+					summary.output.includes(formatArtifactReference(summary.artifactId, artifactTruncatedBytes))));
+		const owner =
+			noticeOwner !== undefined ? { noticeOwner } : bodyOwnsArtifact ? { noticeOwner: "body" as const } : {};
 
 		// Middle elision: the sink retained head + tail with an elision marker.
 		if (summary.elidedBytes != null && summary.elidedBytes > 0) {
@@ -350,6 +371,8 @@ export class OutputMetaBuilder {
 				elidedBytes: summary.elidedBytes,
 				elidedLines,
 				artifactId: summary.artifactId,
+				artifactTruncatedBytes,
+				artifactFailureDiagnostic,
 			};
 			return this;
 		}
@@ -382,6 +405,8 @@ export class OutputMetaBuilder {
 			outputBytes: summary.outputBytes,
 			shownRange: { start: shownStart, end: shownEnd },
 			artifactId: summary.artifactId,
+			artifactTruncatedBytes,
+			artifactFailureDiagnostic,
 			nextOffset: direction === "head" ? shownEnd + 1 : undefined,
 		};
 
@@ -524,6 +549,37 @@ export function formatFullOutputReference(artifactId: string): string {
 	return `Read artifact://${artifactId} for full output`;
 }
 
+/**
+ * Format an artifact reference without claiming completeness when storage was hard-capped.
+ */
+export function formatArtifactReference(artifactId: string, artifactTruncatedBytes?: number): string {
+	if (artifactTruncatedBytes != null && artifactTruncatedBytes > 0) {
+		return `Read artifact://${artifactId} for retained output (at least ${formatBytes(artifactTruncatedBytes)} omitted by the artifact storage cap)`;
+	}
+	return formatFullOutputReference(artifactId);
+}
+
+function formatTruncationArtifactNotice(truncation: TruncationMeta): string {
+	const reference = truncation.artifactId
+		? formatArtifactReference(truncation.artifactId, truncation.artifactTruncatedBytes)
+		: undefined;
+	if (truncation.artifactFailureDiagnostic) {
+		const failure = `Artifact storage failed: ${truncation.artifactFailureDiagnostic}`;
+		if (reference) return `${reference}; ${failure}`;
+		return failure;
+	}
+	if (reference) return reference;
+	return `Artifact storage omitted at least ${formatBytes(truncation.artifactTruncatedBytes ?? 0)}; no artifact reference is available`;
+}
+
+function hasArtifactNotice(truncation: TruncationMeta): boolean {
+	return (
+		truncation.artifactId != null ||
+		(truncation.artifactTruncatedBytes ?? 0) > 0 ||
+		truncation.artifactFailureDiagnostic != null
+	);
+}
+
 function formatTruncationRangeTotal(truncation: TruncationMeta): string {
 	return truncation.rangeBase === "window"
 		? `the selected ${truncation.totalLines}-line range`
@@ -537,8 +593,8 @@ export function formatTruncationMetaNotice(truncation: TruncationMeta): string {
 		if (truncation.partialLine.sourceBytes > truncation.partialLine.bytes) {
 			notice += ` (line is ${formatBytes(truncation.partialLine.sourceBytes)})`;
 		}
-		if (truncation.artifactId != null) {
-			notice += `. ${formatFullOutputReference(truncation.artifactId)}`;
+		if (hasArtifactNotice(truncation)) {
+			notice += `. ${formatTruncationArtifactNotice(truncation)}`;
 		}
 		return notice;
 	}
@@ -553,13 +609,15 @@ export function formatTruncationMetaNotice(truncation: TruncationMeta): string {
 		const elidedLines = truncation.elidedLines ?? Math.max(0, totalLines - truncation.outputLines);
 		const headPart = head ? `lines ${head.start}-${head.end}` : "";
 		const tailPart = tail ? `${tail.start}-${tail.end}` : "";
-		if (headPart && tailPart) {
+		if (head && tail && elidedLines === 0 && head.start === tail.start && head.end === tail.end) {
+			notice = `Showing head and tail of line ${head.start} of ${rangeTotal}; ${formatBytes(elidedBytes)} middle bytes elided`;
+		} else if (headPart && tailPart) {
 			notice = `Showing ${headPart} and ${tailPart} of ${rangeTotal}; ${elidedLines.toLocaleString()} middle line${elidedLines === 1 ? "" : "s"} (${formatBytes(elidedBytes)}) elided`;
 		} else {
-			notice = `Showing ${truncation.outputLines} of ${rangeTotal}${truncation.rangeBase === "window" ? "" : " lines"}; middle elided`;
+			notice = `Showing ${truncation.outputLines} of ${rangeTotal}${truncation.rangeBase === "window" ? "" : " lines"}; ${formatBytes(elidedBytes)} middle bytes elided`;
 		}
-		if (truncation.artifactId != null) {
-			notice += `. ${formatFullOutputReference(truncation.artifactId)}`;
+		if (hasArtifactNotice(truncation)) {
+			notice += `. ${formatTruncationArtifactNotice(truncation)}`;
 		}
 		return notice;
 	}
@@ -580,8 +638,8 @@ export function formatTruncationMetaNotice(truncation: TruncationMeta): string {
 		notice += `. Use :${truncation.nextOffset} to continue`;
 	}
 
-	if (truncation.artifactId != null) {
-		notice += `. ${formatFullOutputReference(truncation.artifactId)}`;
+	if (hasArtifactNotice(truncation)) {
+		notice += `. ${formatTruncationArtifactNotice(truncation)}`;
 	}
 
 	return notice;
@@ -642,8 +700,25 @@ export function formatOutputNotice(meta: OutputMeta | undefined): string {
  * Returns null if no truncation metadata present.
  */
 export function formatStyledTruncationWarning(meta: OutputMeta | undefined, theme: Theme): string | null {
-	if (!meta?.truncation) return null;
-	const message = formatTruncationMetaNotice(meta.truncation);
+	const truncation = meta?.truncation;
+	if (!truncation) return null;
+	if (
+		truncation.noticeOwner === "body" &&
+		truncation.totalBytes === truncation.outputBytes &&
+		truncation.totalLines === truncation.outputLines
+	) {
+		return null;
+	}
+	const warningMeta =
+		truncation.noticeOwner === "body"
+			? {
+					...truncation,
+					artifactId: undefined,
+					artifactTruncatedBytes: undefined,
+					artifactFailureDiagnostic: undefined,
+				}
+			: truncation;
+	const message = formatTruncationMetaNotice(warningMeta);
 	return theme.fg("warning", wrapBrackets(message, theme));
 }
 
@@ -733,6 +808,25 @@ function getSpillConfig(s: Settings | undefined) {
  */
 export function resolveOutputSinkHeadBytes(s: Settings | undefined): number {
 	return getSpillConfig(s).headBytes;
+}
+
+export const BASH_DEFAULT_OUTPUT_TAIL_BYTES = 1024;
+
+/**
+ * Bash uses a deliberately small tail window to nudge callers toward focused
+ * commands and dedicated search tools. An explicitly configured shared tail
+ * budget still wins.
+ */
+export function resolveBashOutputSinkTailBytes(s: Settings): number {
+	return s.has("tools.artifactTailBytes") ? s.get("tools.artifactTailBytes") * 1024 : BASH_DEFAULT_OUTPUT_TAIL_BYTES;
+}
+/**
+ * Bash keeps only the tail unless the user explicitly opts into the shared
+ * head-retention setting. Schema defaults still apply to other streaming
+ * tools without silently turning Bash back into middle-elision mode.
+ */
+export function resolveBashOutputSinkHeadBytes(s: Settings): number {
+	return s.has("tools.artifactHeadBytes") ? resolveOutputSinkHeadBytes(s) : 0;
 }
 
 /**

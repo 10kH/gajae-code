@@ -28,6 +28,27 @@ const NL = "\n";
 
 const ELLIPSIS = "…";
 
+const ARTIFACT_WRITER_DIAGNOSTIC_MAX_BYTES = 256;
+
+/**
+ * Terminal publisher used when managed artifact storage exposes an ID but no
+ * writable pathname. The sink supplies raw content retained up to its artifact
+ * hard cap; `omittedBytes` is the source-byte count already omitted by that cap.
+ * A successful publisher may report additional omitted bytes (for example, a
+ * downstream storage cap); those counts are added to the sink summary. Failed
+ * and unavailable results are surfaced through the bounded artifact diagnostic
+ * without exposing an unresolvable artifact URL.
+ */
+export type TerminalArtifactPublishResult =
+	| { status: "published"; artifactId: string; omittedBytes?: number }
+	| { status: "unavailable" }
+	| { status: "failed"; diagnostic: string };
+
+export type TerminalArtifactPublisher = (
+	content: string,
+	info: { totalBytes: number; omittedBytes: number },
+) => Promise<TerminalArtifactPublishResult>;
+
 // =============================================================================
 // Interfaces
 // =============================================================================
@@ -47,10 +68,12 @@ export interface OutputSummary {
 	columnDroppedBytes?: number;
 	/** Number of distinct lines that hit the per-line column cap. */
 	columnTruncatedLines?: number;
-	/** Artifact ID for internal URL access (artifact://<id>) when truncated */
+	/** Artifact ID for internal URL access (artifact://<id>) when output was persisted. */
 	artifactId?: string;
 	/** Bytes omitted from artifact storage after the artifact hard cap was reached. */
 	artifactTruncatedBytes?: number;
+	/** Bounded diagnostic when artifact writer or terminal publisher creation, write, finalization, or publication failed. */
+	artifactFailureDiagnostic?: string;
 }
 
 export interface OutputSinkOptions {
@@ -60,6 +83,12 @@ export interface OutputSinkOptions {
 	 */
 	artifactPath?: string;
 	artifactId?: string;
+	/**
+	 * Optional terminal publisher for managed artifact stores that do not expose a
+	 * writable path. It is invoked only when visible spill/truncation requires an
+	 * artifact, and receives raw content bounded by `artifactMaxBytes`.
+	 */
+	artifactPublisher?: TerminalArtifactPublisher;
 	/** Tail buffer budget (bytes). Default DEFAULT_MAX_BYTES. */
 	spillThreshold?: number;
 	/**
@@ -913,6 +942,9 @@ export class OutputSink {
 	#artifactBytes = 0;
 	#artifactTruncatedBytes = 0;
 	#artifactTruncationNoticeWritten = false;
+	#artifactFailureDiagnostic?: string;
+	#publishedArtifactId?: string;
+	#artifactFinalizationFailed = false;
 
 	// Per-line column cap streaming state (persists across `push` calls so a
 	// long line split across chunks still trips the same trigger).
@@ -927,9 +959,13 @@ export class OutputSink {
 	};
 
 	// Raw prefix chunks not yet confirmed written to the file sink. This queue is
-	// the only artifact replay source; retained head/tail windows are lossy views.
+	// the pathname-backed artifact replay source; retained head/tail windows are lossy views.
 	#pendingFileWrites?: string[];
 	#pendingFileWriteBytes = 0;
+	// Raw chunks retained for a terminal publisher. This queue is capped by
+	// `#artifactMaxBytes` and is never used by pathname-backed sinks.
+	#pendingArtifactContent?: string[];
+	#artifactPublishAttempted = false;
 	#finalized = false;
 
 	#fileReady = false;
@@ -943,6 +979,7 @@ export class OutputSink {
 	readonly #chunkThrottleMs: number;
 	readonly #maxColumns: number;
 	readonly #artifactMaxBytes: number;
+	readonly #artifactPublisher?: TerminalArtifactPublisher;
 	readonly #coalesceSanitize: boolean;
 	#coalesceBuf = "";
 
@@ -957,6 +994,7 @@ export class OutputSink {
 			chunkThrottleMs = 0,
 			onRawChunk,
 			artifactMaxBytes = DEFAULT_ARTIFACT_MAX_BYTES,
+			artifactPublisher,
 			coalesceSanitize = process.env.PI_OUTPUT_SANITIZE_COALESCE === "1",
 		} = options ?? {};
 		// Managed callers omit artifactPath at the allocation boundary; explicit callers
@@ -970,6 +1008,7 @@ export class OutputSink {
 		this.#onRawChunk = onRawChunk;
 		this.#chunkThrottleMs = chunkThrottleMs;
 		this.#artifactMaxBytes = Math.max(0, artifactMaxBytes);
+		this.#artifactPublisher = artifactPublisher;
 		this.#coalesceSanitize = coalesceSanitize;
 	}
 
@@ -1060,11 +1099,14 @@ export class OutputSink {
 		// open, keep an independent raw replay prefix because retained head/tail
 		// windows are trimmed and cannot reconstruct byte-correct artifacts.
 		if (this.#artifactPath && this.#maxColumns === 0) this.#enqueueFileWrite(rawChunk, rawBytes);
+		else if (this.#artifactPublisher && this.#maxColumns === 0)
+			this.#enqueueTerminalArtifactChunk(rawChunk, rawBytes);
 
 		if (rawBytes === 0) return;
 
 		const visibleChunk = this.#maxColumns > 0 ? this.#applyColumnCap(sanitizedChunk) : sanitizedChunk;
 		if (this.#artifactPath && this.#maxColumns > 0) this.#enqueueFileWrite(rawChunk, rawBytes);
+		else if (this.#artifactPublisher && this.#maxColumns > 0) this.#enqueueTerminalArtifactChunk(rawChunk, rawBytes);
 		if (this.#columnDroppedBytes > 0) this.#createFileSink();
 		const visibleBytes = Buffer.byteLength(visibleChunk, "utf-8");
 		if (visibleChunk.length > 0) {
@@ -1186,6 +1228,45 @@ export class OutputSink {
 		return `\n[artifact truncated after ${this.#artifactBytes} bytes; omitted at least ${droppedBytes} bytes]\n`;
 	}
 
+	#recordArtifactFailure(phase: "create" | "write" | "end", error: unknown): void {
+		if (this.#artifactFailureDiagnostic) return;
+		const message = (error instanceof Error ? error.message : String(error)).replace(/\s+/gu, " ").trim();
+		const normalized = message || "unknown storage error";
+		this.#artifactFailureDiagnostic = truncateHeadBytes(
+			`${phase}: ${normalized}`,
+			ARTIFACT_WRITER_DIAGNOSTIC_MAX_BYTES,
+		).text;
+	}
+
+	#recordTerminalArtifactDiagnostic(kind: "unavailable" | "failed", error?: unknown): void {
+		if (this.#artifactFailureDiagnostic) return;
+		const message =
+			error === undefined
+				? "terminal artifact publisher unavailable"
+				: (error instanceof Error ? error.message : String(error)).replace(/\s+/gu, " ").trim() ||
+					"unknown publication error";
+		this.#artifactFailureDiagnostic = truncateHeadBytes(
+			`${kind}: ${message}`,
+			ARTIFACT_WRITER_DIAGNOSTIC_MAX_BYTES,
+		).text;
+	}
+
+	// A failed write may have committed only a prefix, so the replay queue is no longer trustworthy.
+	#failArtifact(phase: "create" | "write" | "end", error: unknown, sink?: Bun.FileSink): void {
+		this.#recordArtifactFailure(phase, error);
+		this.#artifactFinalizationFailed = true;
+		this.#file = undefined;
+		this.#fileReady = false;
+		this.#pendingFileWrites = undefined;
+		this.#pendingFileWriteBytes = 0;
+		if (!sink) return;
+		try {
+			void Promise.resolve(sink.end()).catch(endError => this.#recordArtifactFailure("end", endError));
+		} catch (endError) {
+			this.#recordArtifactFailure("end", endError);
+		}
+	}
+
 	#capArtifactChunk(chunk: string, bytes: number): { chunk: string; bytes: number } | null {
 		if (bytes === 0) return null;
 		if (this.#artifactMaxBytes <= 0 || this.#artifactBytes >= this.#artifactMaxBytes) {
@@ -1201,18 +1282,23 @@ export class OutputSink {
 		return kept.bytes > 0 ? { chunk: kept.text, bytes: kept.bytes } : null;
 	}
 
-	#writeArtifactTruncationNotice(): void {
-		if (this.#artifactTruncatedBytes <= 0 || this.#artifactTruncationNoticeWritten) return;
+	async #writeArtifactTruncationNotice(): Promise<void> {
+		if (
+			this.#artifactFinalizationFailed ||
+			this.#artifactTruncatedBytes <= 0 ||
+			this.#artifactTruncationNoticeWritten
+		)
+			return;
 		const notice = this.#artifactTruncationNotice(this.#artifactTruncatedBytes);
 		try {
 			if (this.#fileReady && this.#file) {
-				this.#file.sink.write(notice);
+				await this.#file.sink.write(notice);
 			} else {
 				this.#queuePendingFileWrite(notice, Buffer.byteLength(notice, "utf-8"));
 			}
 			this.#artifactTruncationNoticeWritten = true;
-		} catch {
-			/* ignore */
+		} catch (error) {
+			this.#failArtifact("write", error, this.#file?.sink);
 		}
 	}
 
@@ -1224,6 +1310,7 @@ export class OutputSink {
 	}
 
 	#enqueueFileWrite(chunk: string, bytes: number): void {
+		if (this.#artifactFinalizationFailed || this.#finalized) return;
 		const capped = this.#capArtifactChunk(chunk, bytes);
 		if (!capped) return;
 		this.#artifactBytes += capped.bytes;
@@ -1235,51 +1322,113 @@ export class OutputSink {
 
 		try {
 			this.#file.sink.write(capped.chunk);
-		} catch {
-			try {
-				void this.#file.sink.end();
-			} catch {
-				/* ignore */
-			}
-			this.#file = undefined;
-			this.#fileReady = false;
-			this.#queuePendingFileWrite(capped.chunk, capped.bytes);
-			this.#createFileSink();
+		} catch (error) {
+			this.#failArtifact("write", error, this.#file.sink);
+		}
+	}
+
+	#enqueueTerminalArtifactChunk(chunk: string, bytes: number): void {
+		if (this.#artifactFinalizationFailed || this.#finalized) return;
+		const capped = this.#capArtifactChunk(chunk, bytes);
+		if (!capped) return;
+		this.#artifactBytes += capped.bytes;
+		if (!this.#pendingArtifactContent) this.#pendingArtifactContent = [capped.chunk];
+		else this.#pendingArtifactContent.push(capped.chunk);
+		const pending = this.#pendingArtifactContent;
+		if (!pending) return;
+		if (pending.length > MAX_PENDING) {
+			pending[0] = pending.join("");
+			pending.length = 1;
 		}
 	}
 
 	#createFileSink(): boolean {
-		if (this.#finalized) return false;
+		if (this.#finalized || this.#artifactFinalizationFailed) return false;
 
 		if (!this.#artifactPath) return false;
 		if (this.#fileReady) return this.#file != null;
-		try {
-			const sink = Bun.file(this.#artifactPath).writer();
-			this.#file = { path: this.#artifactPath, artifactId: this.#artifactId, sink };
 
+		let sink: Bun.FileSink;
+		try {
+			sink = Bun.file(this.#artifactPath).writer();
+		} catch (error) {
+			this.#recordArtifactFailure("create", error);
+			return false;
+		}
+		this.#file = { path: this.#artifactPath, artifactId: this.#artifactId, sink };
+
+		try {
 			const pending = this.#pendingFileWrites;
 			if (pending) {
 				for (const chunk of pending) sink.write(chunk);
 			}
-
-			this.#fileReady = true;
-			this.#pendingFileWrites = undefined;
-			this.#pendingFileWriteBytes = 0;
-
-			return true;
-		} catch {
-			try {
-				void this.#file?.sink?.end();
-			} catch {
-				/* ignore */
-			}
-			this.#file = undefined;
-			// Keep #pendingFileWriteBytes in sync with the preserved queue so
-			// later retry/threshold decisions don't undercount retained bytes.
-			this.#pendingFileWriteBytes = this.#pendingFileWrites
-				? this.#pendingFileWrites.reduce((sum, chunk) => sum + Buffer.byteLength(chunk), 0)
-				: 0;
+		} catch (error) {
+			this.#failArtifact("write", error, sink);
 			return false;
+		}
+
+		this.#fileReady = true;
+		this.#pendingFileWrites = undefined;
+		this.#pendingFileWriteBytes = 0;
+		return true;
+	}
+
+	#shouldPublishTerminalArtifact(): boolean {
+		return (
+			this.#artifactPublisher !== undefined &&
+			this.#artifactPath === undefined &&
+			(this.#truncated || this.#columnDroppedBytes > 0 || this.#artifactTruncatedBytes > 0)
+		);
+	}
+
+	async #publishTerminalArtifact(): Promise<string | undefined> {
+		if (
+			!this.#shouldPublishTerminalArtifact() ||
+			this.#artifactPublishAttempted ||
+			this.#artifactFinalizationFailed
+		) {
+			return this.#publishedArtifactId;
+		}
+		this.#artifactPublishAttempted = true;
+		const content = this.#pendingArtifactContent?.join("") ?? "";
+		const omittedBytes = this.#artifactTruncatedBytes;
+		try {
+			const published = await this.#artifactPublisher!(content, {
+				totalBytes: this.#totalBytes,
+				omittedBytes,
+			});
+			if (published.status === "unavailable") {
+				this.#recordTerminalArtifactDiagnostic("unavailable");
+				this.#artifactFinalizationFailed = true;
+				return undefined;
+			}
+			if (published.status === "failed") {
+				this.#recordTerminalArtifactDiagnostic("failed", published.diagnostic);
+				this.#artifactFinalizationFailed = true;
+				return undefined;
+			}
+			if (published.artifactId.length === 0) {
+				this.#recordTerminalArtifactDiagnostic("failed", "storage returned no artifact id");
+				this.#artifactFinalizationFailed = true;
+				return undefined;
+			}
+			if (published.omittedBytes !== undefined) {
+				if (!Number.isSafeInteger(published.omittedBytes) || published.omittedBytes < 0) {
+					this.#recordTerminalArtifactDiagnostic("failed", "publisher returned invalid omitted-byte accounting");
+					this.#artifactFinalizationFailed = true;
+					return undefined;
+				}
+				this.#artifactTruncatedBytes += published.omittedBytes;
+			}
+			this.#publishedArtifactId = published.artifactId;
+			this.#finalized = true;
+			return this.#publishedArtifactId;
+		} catch (error) {
+			this.#recordTerminalArtifactDiagnostic("failed", error);
+			this.#artifactFinalizationFailed = true;
+			return undefined;
+		} finally {
+			this.#pendingArtifactContent = undefined;
 		}
 	}
 
@@ -1302,25 +1451,34 @@ export class OutputSink {
 	 * minimizer rewrites the captured output after the raw bytes have already
 	 * been streamed.
 	 *
-	 * After this call the buffer is authoritative: streaming counters realign
-	 * to the replacement, the retained head window is cleared, and head
-	 * retention is disabled so subsequent `push()` calls append directly to the
-	 * tail buffer instead of repopulating the (now meaningless) head window
-	 * — which would otherwise reorder content and trip the middle-elision
-	 * branch in `dump()` against stale totals.
+	 * After this call the replacement is authoritative: counters reflect its full
+	 * size, the configured head+tail byte windows are retained with UTF-8-safe
+	 * boundaries, and future head accumulation is disabled so later `push()` calls
+	 * append directly to the tail without reordering the replacement.
 	 */
 	replace(text: string): void {
 		this.#coalesceBuf = "";
-		this.#setTail(text);
+		const replacementBytes = Buffer.byteLength(text, "utf-8");
 		this.#head = "";
 		this.#headBytes = 0;
+		this.#setTail("");
+
+		if (this.#headLimit > 0) {
+			const head = truncateHeadBytes(text, this.#headLimit);
+			this.#appendHead(head.text, head.bytes);
+			const tailText = text.substring(head.text.length);
+			this.#setTail(tailText, replacementBytes - head.bytes);
+		} else {
+			this.#setTail(text, replacementBytes);
+		}
+		this.#trimTailTo(this.#spillThreshold);
 		this.#headRetentionDisabled = true;
-		this.#totalBytes = this.#bufferBytes;
-		this.#processedBytes = this.#bufferBytes;
+		this.#totalBytes = replacementBytes;
+		this.#processedBytes = replacementBytes;
 		this.#totalLines = countNewlines(text);
 		this.#processedLines = this.#totalLines;
 		this.#sawData = text.length > 0;
-		this.#truncated = false;
+		this.#truncated = replacementBytes > this.#headBytes + this.#bufferBytes;
 		this.#currentLineBytes = 0;
 		this.#columnEllipsisAdded = false;
 		this.#columnDroppedBytes = 0;
@@ -1333,18 +1491,35 @@ export class OutputSink {
 		const totalLines = this.#sawData ? this.#totalLines + 1 : 0;
 
 		let artifactId: string | undefined;
-		if (this.#artifactTruncatedBytes > 0) this.#createFileSink();
-		this.#writeArtifactTruncationNotice();
-		if (this.#file) {
-			artifactId = this.#file.artifactId;
-			await this.#file.sink.end();
-			this.#finalized = true;
+		if (this.#finalized) {
+			artifactId = this.#publishedArtifactId ?? this.#artifactId;
+		} else if (!this.#artifactFinalizationFailed) {
+			if (this.#artifactPublisher && !this.#artifactPath) {
+				artifactId = await this.#publishTerminalArtifact();
+			}
+			if (!this.#artifactFinalizationFailed && this.#artifactPath) {
+				if (this.#artifactTruncatedBytes > 0) this.#createFileSink();
+				await this.#writeArtifactTruncationNotice();
+				if (this.#file) {
+					try {
+						await this.#file.sink.end();
+						artifactId = this.#file.artifactId;
+						this.#finalized = true;
+					} catch (error) {
+						this.#recordArtifactFailure("end", error);
+						this.#artifactFinalizationFailed = true;
+						this.#file = undefined;
+						this.#fileReady = false;
+					}
+				}
+			}
 		}
 		if (this.#finalized) {
 			// Terminal: the artifact is closed; replay state is no longer needed.
 			this.#pendingFileWrites = undefined;
 			this.#pendingFileWriteBytes = 0;
 			this.#fileReady = false;
+			this.#pendingArtifactContent = undefined;
 		}
 		// Non-finalized dumps (no artifact sink ever opened) keep the raw replay
 		// queue so a later post-dump push that spills produces a CUMULATIVE
@@ -1370,24 +1545,18 @@ export class OutputSink {
 		let elidedLines: number | undefined;
 
 		if (headBytes > 0 && effectiveTotalBytes > headBytes + tailBytes) {
-			// Middle was elided. Emit head + marker + tail.
+			// Middle was elided. Emit both explicit windows, including when they are
+			// fragments of one source line (the marker still carries byte evidence).
 			elidedBytes = Math.max(0, effectiveTotalBytes - headBytes - tailBytes);
 			elidedLines = Math.max(0, processedTotalLines - headLines - tailLines);
-			if (elidedLines === 0) {
-				body = headText;
-				outputBytes = headBytes;
-				outputLines = headLines;
-				this.#truncated = true;
-			} else {
-				const marker = formatMiddleElisionMarker(elidedLines, elidedBytes);
-				const markerBytes = Buffer.byteLength(marker, "utf-8");
-				const headSep = headText.endsWith("\n") ? "" : "\n";
-				const tailSep = tailBuf.startsWith("\n") ? "" : "\n";
-				body = `${headText}${headSep}${marker}${tailSep}${tailBuf}`;
-				outputBytes = headBytes + markerBytes + tailBytes + headSep.length + tailSep.length;
-				outputLines = headLines + 1 + tailLines;
-				this.#truncated = true;
-			}
+			const marker = formatMiddleElisionMarker(elidedLines, elidedBytes);
+			const markerBytes = Buffer.byteLength(marker, "utf-8");
+			const headSep = headText.endsWith("\n") ? "" : "\n";
+			const tailSep = tailBuf.startsWith("\n") ? "" : "\n";
+			body = `${headText}${headSep}${marker}${tailSep}${tailBuf}`;
+			outputBytes = headBytes + markerBytes + tailBytes + headSep.length + tailSep.length;
+			outputLines = headLines + 1 + tailLines;
+			this.#truncated = true;
 		} else if (headBytes > 0) {
 			// Head + tail combine into the full buffered output (no overlap or elision).
 			body = `${headText}${tailBuf}`;
@@ -1412,6 +1581,7 @@ export class OutputSink {
 			columnDroppedBytes: this.#columnDroppedBytes > 0 ? this.#columnDroppedBytes : undefined,
 			columnTruncatedLines: this.#columnTruncatedLines > 0 ? this.#columnTruncatedLines : undefined,
 			artifactTruncatedBytes: this.#artifactTruncatedBytes > 0 ? this.#artifactTruncatedBytes : undefined,
+			artifactFailureDiagnostic: this.#artifactFailureDiagnostic,
 			artifactId,
 		};
 	}
