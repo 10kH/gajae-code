@@ -119,6 +119,7 @@ import {
 	truncateUtf8,
 	utf8ByteLength,
 } from "./btw-contract";
+import { DEFAULT_ARTIFACT_MAX_BYTES, truncateHeadBytes } from "./streaming-output";
 
 export interface ForkContextSeedMetadata {
 	sourceSessionId: string;
@@ -214,7 +215,7 @@ import {
 	executePython as executePythonCommand,
 	type PythonResult,
 } from "../eval/py/executor";
-import { type BashResult, executeBash as executeBashCommand } from "../exec/bash-executor";
+import { type BashArtifactSaveResult, type BashResult, executeBash as executeBashCommand } from "../exec/bash-executor";
 import { exportSessionToHtml } from "../export/html";
 import type { TtsrManager, TtsrMatchContext } from "../export/ttsr";
 import type { LoadedCustomCommand } from "../extensibility/custom-commands";
@@ -1005,6 +1006,50 @@ interface EphemeralTurnResult {
  * subprocess (wedged Chrome renderer, stuck Python cell) refuses to settle.
  */
 const SIGNAL_TEARDOWN_TIMEOUT_MS = 5_000;
+
+const AGENT_BASH_ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES = 256;
+
+function boundAgentBashArtifactSaveDiagnostic(error: unknown): string {
+	const message = (error instanceof Error ? error.message : String(error)).replace(/\s+/gu, " ").trim();
+	const normalized = message || "unknown storage error";
+	return truncateHeadBytes(normalized, AGENT_BASH_ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES).text;
+}
+
+function summarizeAgentBashArtifactSave(
+	artifactId: string,
+	originalText: string,
+): Extract<BashArtifactSaveResult, { status: "saved" }> {
+	const originalBytes = utf8ByteLength(originalText);
+	if (originalBytes <= DEFAULT_ARTIFACT_MAX_BYTES) {
+		return { status: "saved", artifactId, complete: true };
+	}
+	const retainedBytes = truncateHeadBytes(originalText, DEFAULT_ARTIFACT_MAX_BYTES).bytes;
+	return {
+		status: "saved",
+		artifactId,
+		complete: false,
+		omittedBytes: originalBytes - retainedBytes,
+	};
+}
+
+export interface AgentBashArtifactStore {
+	saveArtifact(content: string, toolType: string): Promise<string | undefined>;
+	getArtifactPath(id: string): Promise<string | null>;
+}
+
+export async function saveAgentBashOriginalArtifact(
+	store: AgentBashArtifactStore,
+	originalText: string,
+): Promise<BashArtifactSaveResult> {
+	try {
+		const artifactId = await store.saveArtifact(originalText, "bash-original");
+		if (!artifactId) return { status: "failed", diagnostic: "storage returned no artifact id" };
+		const artifactPath = await store.getArtifactPath(artifactId);
+		return artifactPath ? summarizeAgentBashArtifactSave(artifactId, originalText) : { status: "unavailable" };
+	} catch (error) {
+		return { status: "failed", diagnostic: boundAgentBashArtifactSaveDiagnostic(error) };
+	}
+}
 
 /**
  * Throttle window for the per-turn volatile workspace-tree scan. Date/cwd are
@@ -14692,12 +14737,8 @@ export class AgentSession {
 	// Bash Execution
 	// =========================================================================
 
-	async #saveBashOriginalArtifact(originalText: string): Promise<string | undefined> {
-		try {
-			return await this.sessionManager.saveArtifact(originalText, "bash-original");
-		} catch {
-			return undefined;
-		}
+	async #saveBashOriginalArtifact(originalText: string): Promise<BashArtifactSaveResult> {
+		return saveAgentBashOriginalArtifact(this.sessionManager, originalText);
 	}
 
 	/**

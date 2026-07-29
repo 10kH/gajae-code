@@ -17,6 +17,7 @@ import {
 	truncateTail,
 	truncateTailBytes,
 } from "../src/session/streaming-output";
+import { formatOutputNotice, outputMeta } from "../src/tools/output-meta";
 
 const createdTempDirs: string[] = [];
 const originalForceProtocol = Bun.env.PI_FORCE_IMAGE_PROTOCOL;
@@ -282,6 +283,30 @@ describe("OutputSink", () => {
 		expect(dumped.output).toBe("bcdef");
 	});
 
+	test("propagates hard-capped artifact omissions into metadata and notices", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "partial.log");
+		const sink = new OutputSink({
+			artifactPath,
+			artifactId: "partial-artifact",
+			spillThreshold: 4,
+			artifactMaxBytes: 8,
+		});
+		await sink.push("abcdefghij");
+		const dumped = await sink.dump();
+		const artifactText = await Bun.file(artifactPath).text();
+		expect(artifactText).toBe("abcdefgh\n[artifact truncated after 8 bytes; omitted at least 2 bytes]\n");
+
+		expect(dumped.artifactId).toBe("partial-artifact");
+		expect(dumped.artifactTruncatedBytes).toBe(2);
+		const meta = outputMeta().truncationFromSummary(dumped, { direction: "tail" }).get();
+		expect(meta?.truncation?.artifactTruncatedBytes).toBe(2);
+		const notice = formatOutputNotice(meta);
+		expect(notice).toContain("at least 2B omitted");
+		expect(notice).toContain("retained output");
+		expect(notice).not.toContain("full output");
+	});
+
 	test("artifact mirror keeps raw ANSI controls and sixel bytes while metadata stays stable", async () => {
 		const dir = await createTempDir();
 		const artifactPath = path.join(dir, "raw-output.log");
@@ -386,6 +411,64 @@ describe("OutputSink", () => {
 		expect(await Bun.file(artifactPath).text()).toBe(`small-${large}`);
 	});
 
+	test("terminal publisher persists pathless managed spill output", async () => {
+		let publishedContent = "";
+		let publishedInfo: { totalBytes: number; omittedBytes: number } | undefined;
+		const sink = new OutputSink({
+			spillThreshold: 4,
+			artifactPublisher: async (content, info) => {
+				publishedContent = content;
+				publishedInfo = info;
+				return { status: "published", artifactId: "managed-output" };
+			},
+		});
+		sink.push("HEAD-TAIL");
+
+		const summary = await sink.dump();
+
+		expect(summary.output).toBe("TAIL");
+		expect(summary.artifactId).toBe("managed-output");
+		expect(summary.artifactFailureDiagnostic).toBeUndefined();
+		expect(publishedContent).toBe("HEAD-TAIL");
+		expect(publishedInfo).toEqual({ totalBytes: 9, omittedBytes: 0 });
+	});
+
+	test("terminal publisher combines UTF-8-safe source and downstream omissions", async () => {
+		let publishedContent = "";
+		let publishedInfo: { totalBytes: number; omittedBytes: number } | undefined;
+		const sink = new OutputSink({
+			spillThreshold: 2,
+			artifactMaxBytes: 4,
+			artifactPublisher: async (content, info) => {
+				publishedContent = content;
+				publishedInfo = info;
+				return { status: "published", artifactId: "managed-capped", omittedBytes: 2 };
+			},
+		});
+		sink.push("界界");
+
+		const summary = await sink.dump();
+
+		expect(publishedContent).toBe("界");
+		expect(Buffer.byteLength(publishedContent, "utf-8")).toBe(3);
+		expect(publishedInfo).toEqual({ totalBytes: 6, omittedBytes: 3 });
+		expect(summary.artifactId).toBe("managed-capped");
+		expect(summary.artifactTruncatedBytes).toBe(5);
+	});
+
+	test("terminal publisher failure never exposes an artifact id", async () => {
+		const sink = new OutputSink({
+			spillThreshold: 4,
+			artifactPublisher: async () => ({ status: "failed", diagnostic: "managed store offline" }),
+		});
+		sink.push("HEAD-TAIL");
+
+		const summary = await sink.dump();
+
+		expect(summary.artifactId).toBeUndefined();
+		expect(summary.artifactFailureDiagnostic).toBe("failed: managed store offline");
+	});
+
 	test("artifact late-open replay remains byte-correct after tail trimming", async () => {
 		const dir = await createTempDir();
 		const artifactPath = path.join(dir, "late-open.log");
@@ -398,9 +481,9 @@ describe("OutputSink", () => {
 		expect(await Bun.file(artifactPath).text()).toBe(input);
 	});
 
-	test("artifact write failure retries from the raw replay queue without duplicating bytes", async () => {
+	test("artifact write failure after partial replay permanently disables publication", async () => {
 		const dir = await createTempDir();
-		const artifactPath = path.join(dir, "retry.log");
+		const artifactPath = path.join(dir, "partial-write.log");
 		const originalFile = Bun.file;
 		let writes = 0;
 		let failed = false;
@@ -432,13 +515,16 @@ describe("OutputSink", () => {
 				});
 			}) as typeof Bun.file;
 
-			const sink = new OutputSink({ artifactPath, artifactId: "retry", spillThreshold: 5 });
+			const sink = new OutputSink({ artifactPath, artifactId: "partial-write", spillThreshold: 5 });
 			const input = "abcde" + "fghij" + "klmno";
 			for (let offset = 0; offset < input.length; offset += 5) sink.push(input.slice(offset, offset + 5));
-			await sink.dump();
+			const summary = await sink.dump();
 
 			Bun.file = originalFile;
-			expect(await Bun.file(artifactPath).text()).toBe(input);
+			expect(writes).toBe(2);
+			expect(summary.artifactId).toBeUndefined();
+			expect(summary.output).not.toContain("artifact://partial-write");
+			expect(summary.artifactFailureDiagnostic).toBe("write: simulated write failure");
 		} finally {
 			Bun.file = originalFile;
 		}
@@ -755,6 +841,42 @@ describe("OutputSink head-retain mode", () => {
 		expect(dumped.truncated).toBe(false);
 		// Counters realign to the authoritative buffer + the subsequent push.
 		expect(dumped.totalBytes).toBe(byteLength("OK\n[raw output: artifact://8]\n"));
+	});
+
+	test("replace keeps both explicit UTF-8-safe head and tail windows for one long line", async () => {
+		const sink = new OutputSink({ spillThreshold: 16, headBytes: 8 });
+		const replacement = `😀HEAD-${"x".repeat(80)}-TAIL🚀`;
+		sink.replace(replacement);
+		const dumped = await sink.dump();
+
+		expect(dumped.output).toContain("😀HEAD");
+		expect(dumped.output).toContain("TAIL🚀");
+		expect(dumped.output).not.toContain(replacement);
+		expect(dumped.output).not.toContain("�");
+		expect(dumped.outputBytes).toBeGreaterThan(16);
+		expect(dumped.totalBytes).toBe(byteLength(replacement));
+		expect(dumped.elidedBytes).toBeGreaterThan(0);
+		expect(dumped.truncated).toBe(true);
+
+		const meta = outputMeta().truncationFromSummary(dumped, { direction: "tail" }).get();
+		const notice = formatOutputNotice(meta);
+		expect(notice).toContain("head and tail");
+		expect(notice).toContain("middle bytes");
+		expect(notice).not.toContain("full output");
+	});
+
+	test("replace preserves explicit head retention and the artifact footer", async () => {
+		const sink = new OutputSink({ spillThreshold: 64, headBytes: 8 });
+		const replacement = ["HEAD", ...Array.from({ length: 30 }, (_, index) => `middle-${index}`), "TAIL"].join("\n");
+		sink.replace(replacement);
+		sink.push("\n[raw output: artifact://9]\n");
+		const dumped = await sink.dump();
+
+		expect(dumped.output).toContain("HEAD");
+		expect(dumped.output).toContain("TAIL");
+		expect(dumped.output).toContain("[raw output: artifact://9]");
+		expect(dumped.output).toContain("elided");
+		expect(dumped.truncated).toBe(true);
 	});
 });
 
