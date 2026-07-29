@@ -20,7 +20,11 @@ import {
 	logger,
 	readSseEvents,
 } from "@gajae-code/utils";
-import { hasOpus47ApiRestrictions, mapEffortToAnthropicAdaptiveEffort } from "../model-thinking";
+import {
+	hasOpus47ApiRestrictions,
+	mapEffortToAnthropicAdaptiveEffort,
+	supportsAnthropicAdaptiveThinkingDisplay as supportsAdaptiveThinkingDisplay,
+} from "../model-thinking";
 import { calculateCost } from "../models";
 import { isUsageLimitError } from "../rate-limit-utils";
 import { getEnvApiKey, OUTPUT_FALLBACK_BUFFER } from "../stream";
@@ -309,22 +313,6 @@ type AnthropicSamplingParams = MessageCreateParamsStreaming & {
 
 const ANTHROPIC_STOP_SEQUENCES_MAX = 4;
 let warnedStopSequencesTrim = false;
-
-/**
- * Adaptive thinking `display` is supported starting with Anthropic model Opus 4.7.
- * Older adaptive-thinking models (Opus 4.6, Sonnet 4.6+) reject the field.
- * Fable (5+) postdates Opus 4.7, accepts `display`, and defaults it to
- * "omitted" — thinking tokens are billed but no content streams back — so it
- * must opt in like Opus 4.7+ (issue #2791).
- */
-function supportsAdaptiveThinkingDisplay(modelId: string): boolean {
-	if (/claude-fable-\d/.test(modelId)) return true;
-	const match = /claude-opus-(\d+)-(\d+)/.exec(modelId);
-	if (!match) return false;
-	const major = Number(match[1]);
-	const minor = Number(match[2]);
-	return major > 4 || (major === 4 && minor >= 7);
-}
 
 const ANTHROPIC_PROVIDER_SESSION_STATE_KEY = "anthropic-messages";
 
@@ -1478,7 +1466,6 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			// Provider-level transport/rate-limit failures: only before any streamed content starts.
 			// Malformed envelopes/JSON: only before replay-unsafe text/tool events are visible on this stream.
 			let providerRetryAttempt = 0;
-			let thinkingRepairAttempted = false;
 			while (true) {
 				// Retries reset output.content; drop stale block correlations from the aborted attempt.
 				blocksByAnthropicIndex.clear();
@@ -1856,21 +1843,22 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					const thinkingSignatureInvalid = isAnthropicThinkingSignatureInvalidError(streamFailure);
 					if (
 						!options?.fallbackManaged &&
-						!thinkingRepairAttempted &&
+						!repairAllAssistantThinking &&
 						firstTokenTime === undefined &&
 						(thinkingSignatureInvalid || isAnthropicThinkingBlockMutationError(streamFailure))
 					) {
+						// The mutation 400 blames the "latest assistant message", but its cited
+						// `messages.N.content.M` path can point at an EARLIER replayed turn, so the
+						// latest-only repair gets rejected identically. Escalate to the full-history
+						// repair instead of burning the single retry on one scope.
+						const escalateToAll: boolean = thinkingSignatureInvalid || repairLatestAssistantThinking;
 						logger.debug("anthropic: repairing assistant thinking replay after provider rejection", {
 							model: model.id,
-							scope: thinkingSignatureInvalid ? "all" : "latest",
+							scope: escalateToAll ? "all" : "latest",
 							error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
 						});
-						thinkingRepairAttempted = true;
-						if (thinkingSignatureInvalid) {
-							repairAllAssistantThinking = true;
-						} else {
-							repairLatestAssistantThinking = true;
-						}
+						repairLatestAssistantThinking = !escalateToAll;
+						repairAllAssistantThinking = escalateToAll;
 						params = await prepareParams();
 						providerRetryAttempt = 0;
 						resetOutputForRetry();
@@ -2139,13 +2127,26 @@ function createClient(
 	return { client, isOAuthToken: oauthToken };
 }
 
-function disableThinkingIfToolChoiceForced(params: MessageCreateParamsStreaming): void {
+/**
+ * Anthropic rejects extended thinking combined with a forced tool choice, so such a
+ * request drops `thinking`/`output_config`. Reports whether the forced-choice branch
+ * applied so the caller can keep the replayed history consistent with it.
+ */
+function disableThinkingIfToolChoiceForced(params: MessageCreateParamsStreaming): boolean {
 	const toolChoice = params.tool_choice;
-	if (!toolChoice) return;
-	if (toolChoice.type === "any" || toolChoice.type === "tool") {
-		delete params.thinking;
-		delete params.output_config;
-	}
+	if (!toolChoice) return false;
+	if (toolChoice.type !== "any" && toolChoice.type !== "tool") return false;
+	delete params.thinking;
+	delete params.output_config;
+	return true;
+}
+
+function hasNativeThinkingBlocks(messages: MessageParam[]): boolean {
+	return messages.some(
+		message =>
+			Array.isArray(message.content) &&
+			message.content.some(block => block.type === "thinking" || block.type === "redacted_thinking"),
+	);
 }
 
 function mapAnthropicToolChoice(
@@ -2469,6 +2470,18 @@ function buildParams(
 		}
 	}
 
+	// A forced tool choice strips `thinking` from the request. Signed thinking blocks
+	// replayed from history belong to a thinking-enabled request, and Anthropic rejects
+	// that pair with `thinking`/`redacted_thinking` blocks "cannot be modified", so the
+	// replay has to degrade in the same rebuild. Runs before the billing/system payload
+	// snapshot so the attribution hash covers the messages actually sent.
+	if (disableThinkingIfToolChoiceForced(params) && hasNativeThinkingBlocks(params.messages)) {
+		params.messages = convertAnthropicMessages(context.messages, model, isOAuthToken, {
+			...thinkingRepair,
+			repairAllAssistantThinking: true,
+		});
+	}
+
 	const shouldInjectClaudeCodeInstruction = isOAuthToken && !model.id.startsWith("claude-3-5-haiku");
 	const billingSystemPrompts = normalizeSystemPrompts(context.systemPrompt);
 	const billingPayload = shouldInjectClaudeCodeInstruction
@@ -2484,7 +2497,6 @@ function buildParams(
 	if (systemBlocks) {
 		params.system = systemBlocks;
 	}
-	disableThinkingIfToolChoiceForced(params);
 	ensureMaxTokensForThinking(params, model);
 	applyPromptCaching(params as AnthropicCacheParams, cacheMode, cacheControl);
 	enforceCacheControlLimit(params, 4);
