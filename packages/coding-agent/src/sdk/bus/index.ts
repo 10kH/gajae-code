@@ -5102,6 +5102,7 @@ export function createNotificationsExtension(
 								type: "file_attachment",
 								sessionId: runtime.id,
 								name: path.basename(file.path),
+								mime: file.mime,
 								caption: file.caption,
 							},
 							data,

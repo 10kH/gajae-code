@@ -9131,7 +9131,7 @@ test("ensureTelegramDaemonRunning spawns the daemon subcommand with owner-id and
 	expect(ai).toBeGreaterThanOrEqual(0);
 	expect(captured!.args[ai + 1]).toBe(agentDir);
 });
-test("image_attachment frame uploads via sendPhoto into an identified session topic", async () => {
+test("image_attachment routes PNG as a photo and WebP as a document", async () => {
 	const agentDir = tempAgentDir();
 	const bot = new FakeBotApi();
 	const daemon = new TelegramNotificationDaemon({
@@ -9160,6 +9160,13 @@ test("image_attachment frame uploads via sendPhoto into an identified session to
 		mime: "image/png",
 		data: "AAAA",
 	});
+	await daemon.handleSessionMessage(session as any, {
+		type: "image_attachment",
+		sessionId: "S",
+		source: "agent",
+		mime: "image/webp",
+		data: "V0VCUA==",
+	});
 	const createTopic = bot.calls.find(c => c.method === "createForumTopic");
 	const photo = bot.calls.find(c => c.method === "sendPhoto");
 	expect(createTopic).toBeTruthy();
@@ -9167,6 +9174,12 @@ test("image_attachment frame uploads via sendPhoto into an identified session to
 	expect(photo).toBeTruthy();
 	expect(photo!.body.photo).toBe("AAAA");
 	expect(Number(photo!.body.message_thread_id)).toBeGreaterThan(0);
+	const document = bot.calls.find(c => c.method === "sendDocument");
+	expect(document).toBeTruthy();
+	expect(document!.body.document).toBe("V0VCUA==");
+	expect(document!.body.mime).toBe("image/webp");
+	expect(document!.body.fileName).toBe("image.webp");
+	expect(document!.body.message_thread_id).toBe(photo!.body.message_thread_id);
 });
 
 describe("telegram topic name template (#1909)", () => {
