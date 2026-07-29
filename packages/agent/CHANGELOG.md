@@ -6,6 +6,7 @@
 ### Fixed
 
 - The `invalid_prompt` circuit breaker no longer replays the rejected turn on its repaired resend. The streaming path commits the failed assistant message to the context before the breaker runs, so the one repaired resend re-sent that errored turn as if the model had spoken it — re-triggering `Request blocked (code=invalid_prompt)` and leaving a second assistant tail that no continuation can resume from. The breaker now repairs and resends only the history that preceded the rejection.
+- Compaction pruning now protects the newest two user/`bashExecution` turns, uses conservative read supersession, preserves bounded error-first diagnostics, and exposes reversible artifact-backed originals with exact savings accounting.
 
 ## [0.12.0] - 2026-07-28
 
@@ -23,9 +24,6 @@
 ### Fixed
 
 - Managed model fallback now accepts `reasoning_summary_start`, `reasoning_summary_delta`, and `reasoning_summary_end` assistant events instead of failing them as local snapshot errors.
-- `pruneAssistantToolArguments` now applies the same `protectRecentTurns` newest-turn fence as tool-output pruning before collecting argument candidates, so edit/`apply_patch` arguments in the active (or otherwise protected) turn are never replaced with a `stale_tool_arguments` sentinel even when a later call in that same turn superseded their path. Older superseded arguments outside the fence still prune.
-## [0.11.7] - 2026-07-22
-
 ## [0.11.3] - 2026-07-19
 
 ### Fixed
