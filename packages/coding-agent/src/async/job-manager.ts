@@ -146,7 +146,11 @@ export interface SubagentRecord {
 	historicalJobIds: string[];
 	status: SubagentLifecycle;
 	sessionFile: string | null;
-	/** False for ephemeral sessions (no persistent artifacts dir). */
+	/**
+	 * Explicit veto, not a complete availability result. False always denies;
+	 * true still requires an owner-compatible descriptor or non-blank session
+	 * file, followed by a separately available runner (`no_runner` otherwise).
+	 */
 	resumable: boolean;
 	queued?: { ownerId?: string; seq: number; message?: string; createdAt: number };
 	/** Resolved model the subagent was asked to use, e.g. "openai-codex/gpt-5.5". */
@@ -174,6 +178,22 @@ function sessionFileFromResumeDescriptorData(data: unknown): string | null {
 	if (typeof data !== "object" || data === null) return null;
 	const sessionFile = (data as { sessionFile?: unknown }).sessionFile;
 	return typeof sessionFile === "string" && sessionFile.trim().length > 0 ? sessionFile : null;
+}
+
+/**
+ * Derive retained context from an already owner-compatible descriptor or a
+ * legacy session file. A descriptor is sufficient even when `sessionFile` is
+ * null because the descriptor is the payload the resume runner consumes.
+ */
+function hasRetainedResumeContext(input: {
+	resumable: boolean;
+	sessionFile: string | null;
+	descriptor: ResumeDescriptor | undefined;
+}): boolean {
+	if (!input.resumable) return false;
+	return (
+		input.descriptor !== undefined || (typeof input.sessionFile === "string" && input.sessionFile.trim().length > 0)
+	);
 }
 
 /** A pending resume awaiting a free concurrency slot. */
@@ -509,7 +529,7 @@ export class AsyncJobManager {
 				if (outcome.kind === "paused") {
 					// Sole canonical writer of the running -> paused transition. No
 					// delivery and no eviction scheduling: a paused subagent stays
-					// listed and resumable from its sessionFile.
+					// listed and resumable from its retained resume context.
 					job.status = "paused";
 					this.#freezeEndTime(job);
 					if (outcome.note) job.resultText = outcome.note;
@@ -684,7 +704,9 @@ export class AsyncJobManager {
 			historicalJobIds: [],
 			status: "completed",
 			sessionFile,
-			resumable: sessionFile !== null,
+			// The synthesized record copies this descriptor's owner, so the
+			// descriptor is owner-compatible with the record by construction.
+			resumable: hasRetainedResumeContext({ resumable: true, sessionFile, descriptor }),
 		};
 		this.#subagentRecords.set(record.subagentId, record);
 		return record;
@@ -765,13 +787,24 @@ export class AsyncJobManager {
 	}
 
 	/**
-	 * Resolve the resume runner for a subagent: prefer the per-descriptor runner
-	 * captured at registration time (the originating parent's execution authority),
-	 * falling back to the process-global runner only for descriptors registered
-	 * without one.
+	 * Resolve a descriptor only when `ownerId` matches the record by strict
+	 * equality. Two undefined owners match; a distinguishably foreign descriptor
+	 * is treated as absent for eligibility, runner selection, and execution.
 	 */
-	#resolveResumeRunner(subagentId: string): ResumeRunner | undefined {
-		return this.#descriptorResumeRunners.get(subagentId) ?? this.#resumeRunner;
+	#descriptorForRecord(rec: SubagentRecord): ResumeDescriptor | undefined {
+		const descriptor = this.#resumeDescriptors.get(rec.subagentId);
+		return descriptor !== undefined && descriptor.ownerId === rec.ownerId ? descriptor : undefined;
+	}
+
+	/**
+	 * Resolve the resume runner for a record and its already owner-compatible
+	 * descriptor. Per-descriptor authority is unavailable when the descriptor is foreign.
+	 */
+	#resolveResumeRunner(rec: SubagentRecord, descriptor: ResumeDescriptor | undefined): ResumeRunner | undefined {
+		return (
+			(descriptor !== undefined ? this.#descriptorResumeRunners.get(rec.subagentId) : undefined) ??
+			this.#resumeRunner
+		);
 	}
 
 	getResumeDescriptor(subagentId: string, filter?: AsyncJobFilter): ResumeDescriptor | undefined {
@@ -1045,7 +1078,11 @@ export class AsyncJobManager {
 		return { ok: true, status: rec.status };
 	}
 
-	/** Resume a non-running subagent from its sessionFile, optionally injecting a message first. */
+	/**
+	 * Resume a non-running subagent from retained context: an owner-compatible
+	 * descriptor or a legacy session file. Workflow routing keeps `not_found`,
+	 * `context_unavailable`, `no_runner`, and `resume_failed` distinct.
+	 */
 	resumeSubagent(
 		subagentId: string,
 		filter?: AsyncJobFilter,
@@ -1066,8 +1103,11 @@ export class AsyncJobManager {
 			}
 			return { ok: false, status: "queued", reason: "already_queued" };
 		}
-		if (!rec.resumable || !rec.sessionFile) return { ok: false, reason: "context_unavailable" };
-		if (!this.#resolveResumeRunner(rec.subagentId)) return { ok: false, reason: "no_runner" };
+		const descriptor = this.#descriptorForRecord(rec);
+		if (!hasRetainedResumeContext({ resumable: rec.resumable, sessionFile: rec.sessionFile, descriptor })) {
+			return { ok: false, reason: "context_unavailable" };
+		}
+		if (!this.#resolveResumeRunner(rec, descriptor)) return { ok: false, reason: "no_runner" };
 		if (this.getRunningJobs().length >= this.#maxRunningJobs) {
 			const seq = ++this.#resumeSeq;
 			rec.status = "queued";
@@ -1081,12 +1121,13 @@ export class AsyncJobManager {
 			});
 			return { ok: true, queued: true, status: "queued" };
 		}
-		return this.#startResume(rec, message);
+		return this.#startResume(rec, message, descriptor);
 	}
 
 	#startResume(
 		rec: SubagentRecord,
-		message?: string,
+		message: string | undefined,
+		descriptor: ResumeDescriptor | undefined,
 	): { ok: boolean; status?: SubagentLifecycle; jobId?: string; reason?: string } {
 		if (this.#isOwnerSubagentShutdownFenced(rec.ownerId)) {
 			return { ok: false, status: rec.status, reason: "owner_shutdown_in_progress" };
@@ -1095,8 +1136,8 @@ export class AsyncJobManager {
 		// Clear any retained progress from the previous run so a resumed subagent
 		// never renders the prior run's tool/output as live before it emits again.
 		this.#subagentProgress.delete(rec.subagentId);
-		const runner = this.#resolveResumeRunner(rec.subagentId);
-		const newJobId = runner?.(rec.subagentId, message, this.#resumeDescriptors.get(rec.subagentId));
+		const runner = this.#resolveResumeRunner(rec, descriptor);
+		const newJobId = runner?.(rec.subagentId, message, descriptor);
 		if (!newJobId) return { ok: false, reason: "resume_failed" };
 		if (prevJobId && prevJobId !== newJobId) rec.historicalJobIds.push(prevJobId);
 		rec.currentJobId = newJobId;
@@ -1122,7 +1163,7 @@ export class AsyncJobManager {
 				continue;
 			}
 			try {
-				const result = this.#startResume(rec, entry.message);
+				const result = this.#startResume(rec, entry.message, this.#descriptorForRecord(rec));
 				if (result.reason === "owner_shutdown_in_progress") {
 					index += 1;
 					continue;

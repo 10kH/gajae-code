@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Detached subagents spawned by the `task` tool are resumable again. The resume gate treated a missing record-level `sessionFile` as missing context even though task and managed-persistence sessions retain the descriptor consumed by the resume runner, so persisted role agents always fell back with `context_unavailable`. Resume eligibility now accepts an owner-compatible retained descriptor while preserving `not_found`, explicit `context_unavailable`, missing-runner `no_runner`, and `resume_failed` outcomes.
 
 ## [0.12.0] - 2026-07-28
 ### Resume fixes
