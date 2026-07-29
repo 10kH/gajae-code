@@ -19,18 +19,6 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 });
 
-async function managedDirectories(root: string): Promise<string[]> {
-	const directories = [root];
-	for (const entry of await fs.readdir(root, { withFileTypes: true })) {
-		if (entry.isDirectory()) directories.push(...(await managedDirectories(path.join(root, entry.name))));
-	}
-	return directories;
-}
-
-function normalizedWindowsPath(pathname: string): string {
-	return path.resolve(pathname).toLowerCase();
-}
-
 it("skips unsupported managed directory fsync on Windows", () => {
 	expect(shouldFsyncManagedDirectory("win32")).toBe(false);
 	expect(shouldFsyncManagedDirectory("linux")).toBe(true);
@@ -110,7 +98,7 @@ describe.skipIf(process.platform !== "win32")("Windows managed session directory
 		},
 	);
 
-	it("uses verify-first preparation for a real second session-manager startup", async () => {
+	it("fails closed on an invalid required directory and succeeds after exact restore", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-directory-windows-startup-"));
 		temporaryDirectories.push(root);
 		const cwd = path.join(root, "workspace");
@@ -126,67 +114,40 @@ describe.skipIf(process.platform !== "win32")("Windows managed session directory
 		await first.flush();
 		await first.close();
 
-		const sessionsDirectory = path.join(agentDir, "sessions");
-		const preExistingManagedDirectories = new Map(
-			(await managedDirectories(sessionsDirectory)).map(directory => [
-				normalizedWindowsPath(directory),
-				path.relative(sessionsDirectory, directory) || ".",
-			]),
+		const internal = path.join(firstDirectory, ".gjc-managed-session-internal");
+		const locks = path.join(internal, "locks");
+		const retainedLocks = path.join(internal, "locks.retained-for-test");
+		await fs.rename(locks, retainedLocks);
+		const invalidContent = "required directory replaced by a file\n";
+		await fs.writeFile(locks, invalidContent, { mode: 0o600 });
+		const faultTree = (await fs.readdir(internal)).sort();
+
+		let failure: unknown;
+		try {
+			SessionManager.getDefaultSessionDir(cwd, agentDir);
+		} catch (error) {
+			failure = error;
+		}
+
+		expect(failure).toBeInstanceOf(Error);
+		const startupError = failure as Error;
+		expect(startupError.message).toBe(
+			"Could not prepare managed session scope (binding_invalid: prepare:locks_directory).",
 		);
-		// Install explicit passthrough wrappers after first-start initialization. A
-		// property-only spy does not replace the live ESM function consumed by the
-		// session modules, so it can report zero calls even while native verification
-		// runs. The passthrough preserves product behavior while observing that binding.
-		const applyImplementation = native.applyOwnerOnlyPathSecurity;
-		const verifyImplementation = native.verifyOwnerOnlyPathSecurity;
-		const verifyExpectedImplementation = native.verifyOwnerOnlyPathSecurityExpected;
-		const repairImplementation = native.repairOwnerOnlyPathSecurityExpected;
-		const apply = vi
-			.spyOn(native, "applyOwnerOnlyPathSecurity")
-			.mockImplementation((pathname, kind) => applyImplementation(pathname, kind));
-		const verify = vi
-			.spyOn(native, "verifyOwnerOnlyPathSecurity")
-			.mockImplementation((pathname, kind) => verifyImplementation(pathname, kind));
-		const verifyExpected = vi
-			.spyOn(native, "verifyOwnerOnlyPathSecurityExpected")
-			.mockImplementation((pathname, kind, expectedDev, expectedIno) =>
-				verifyExpectedImplementation(pathname, kind, expectedDev, expectedIno),
-			);
-		const repair = vi
-			.spyOn(native, "repairOwnerOnlyPathSecurityExpected")
-			.mockImplementation((pathname, kind, expectedDev, expectedIno) =>
-				repairImplementation(pathname, kind, expectedDev, expectedIno),
-			);
-		expect(native.verifyOwnerOnlyPathSecurityExpected).not.toBe(verifyExpectedImplementation);
+		expect(startupError.message).not.toContain(firstDirectory);
+		expect(JSON.stringify(startupError.cause)).not.toContain(firstDirectory);
+		expect(await fs.readFile(locks, "utf8")).toBe(invalidContent);
+		expect((await fs.readdir(internal)).sort()).toEqual(faultTree);
+		expect((await fs.stat(retainedLocks)).isDirectory()).toBe(true);
+		expect((await fs.stat(path.join(internal, "receipts"))).isDirectory()).toBe(true);
+		expect((await fs.stat(path.join(internal, "tombstones"))).isDirectory()).toBe(true);
+
+		await fs.rm(locks);
+		await fs.rename(retainedLocks, locks);
 		const secondDirectory = SessionManager.getDefaultSessionDir(cwd, agentDir);
 		const secondDestination = SessionManager.managedDestination(cwd, agentDir);
 		expect(secondDirectory).toBe(firstDirectory);
 		expect(secondDestination.directory).toBe(firstDirectory);
-		const second = SessionManager.create(cwd, secondDestination);
-		second.appendMessage({ role: "user", content: "second startup", timestamp: 1 });
-		await second.ensureOnDisk();
-		await second.flush();
-		await second.close();
-		expect(verifyExpected).toHaveBeenCalled();
-
-		expect(
-			apply.mock.calls.filter(
-				([pathname, kind]) =>
-					kind === "directory" && preExistingManagedDirectories.has(normalizedWindowsPath(pathname)),
-			),
-		).toHaveLength(0);
-		expect(repair.mock.calls).toHaveLength(0);
-		const verifiedDirectories = new Set(
-			verifyExpected.mock.calls
-				.filter(([, kind]) => kind === "directory")
-				.map(([pathname]) => normalizedWindowsPath(pathname)),
-		);
-		const missingVerifications = [...preExistingManagedDirectories]
-			.filter(([normalized]) => !verifiedDirectories.has(normalized))
-			.map(([, relative]) => relative)
-			.sort();
-		expect(missingVerifications).toEqual([]);
-		expect(verify.mock.calls.filter(([, kind]) => kind === "directory")).toHaveLength(0);
 	});
 
 	it("preserves verify-first policy through nested managed destinations", async () => {
