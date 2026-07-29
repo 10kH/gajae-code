@@ -10,13 +10,19 @@
  * Run: `bun packages/coding-agent/bench/perf-corpus.bench.ts`
  */
 
+import * as childProcess from "node:child_process";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import * as url from "node:url";
 import { APPLIED_PERF_THRESHOLDS } from "./perf-threshold.ledger";
 import { createMemoryBaselineWorkloads, type MemoryWorkload, workloadIterations } from "./memory-baseline-workloads";
 import {
 	calculateMemorySlope,
+	memoryRuntimeControlIdentity,
+	isExactMemorySurfaceOrder,
+	MEMORY_CAPTURE_SEMANTICS_ID,
 	type MemoryUsageSample,
+	type MemoryObservedExtrema,
 	type MemoryWorkloadProfile,
 	type MemorySurface,
 	type PerfCorpusFixtureResult,
@@ -29,6 +35,140 @@ import {
 	validatePerfCorpusReport,
 	type WallClockPhaseMetric,
 } from "./perf-corpus-schema";
+
+export interface MeasurementRuntimeProvenance {
+	bunVersion: string;
+	bunExecutable: string;
+	bunExecutableSha256: string;
+	closureDigest: string;
+	closureManifest: readonly string[];
+}
+
+const MEASUREMENT_CLOSURE_SELECTORS: readonly string[] = [
+	"bun.lock",
+	"Cargo.lock",
+	"Cargo.toml",
+	"package.json",
+	"packages/agent/package.json",
+	"packages/agent/src",
+	"packages/ai/package.json",
+	"packages/ai/src",
+	"packages/coding-agent/package.json",
+	"packages/coding-agent/bench",
+	"packages/coding-agent/src",
+	"packages/natives/package.json",
+	"packages/natives/native",
+	"packages/tui/package.json",
+	"packages/tui/src",
+	"packages/utils/package.json",
+	"packages/utils/src",
+];
+const LOGICAL_RUNNER_SCRIPT = "packages/coding-agent/bench/perf-corpus.bench.ts";
+const CANONICAL_RUNNER_MODULE_MAIN = import.meta.main;
+const CANONICAL_RUNNER_EXEC_ARGV: readonly (readonly string[])[] = [
+	[],
+	["--smol"],
+	["--expose-gc"],
+	["--smol", "--expose-gc"],
+];
+
+function isCanonicalRunnerExecArgv(value: readonly string[]): boolean {
+	return CANONICAL_RUNNER_EXEC_ARGV.some(
+		expected => value.length === expected.length && value.every((argument, index) => argument === expected[index]),
+	);
+}
+
+function kernelProcessArguments(): string[] {
+	if (process.platform === "linux") {
+		return fs
+			.readFileSync(`/proc/${process.pid}/cmdline`, "utf8")
+			.split("\0")
+			.filter(Boolean);
+	}
+	if (process.platform === "darwin") {
+		const result = childProcess.spawnSync("/bin/ps", ["-ww", "-p", String(process.pid), "-o", "args="]);
+		if (result.status !== 0) {
+			throw new Error("kernel process arguments unavailable");
+		}
+		return new TextDecoder()
+			.decode(result.stdout)
+			.trim()
+			.split(/\s+/)
+			.filter(Boolean);
+	}
+	throw new Error("kernel process arguments unavailable");
+}
+
+function authenticateCanonicalRunnerEntrypoint(): readonly string[] {
+	if (!CANONICAL_RUNNER_MODULE_MAIN) {
+		throw new Error("benchmark runner invocation is outside the frozen public contract");
+	}
+	const actualEntrypoint = Bun.main;
+	const argvEntrypoint = process.argv[1];
+	let canonicalEntrypoint: string;
+	let resolvedActualEntrypoint: string;
+	let resolvedArgvEntrypoint: string;
+	let kernelExecArgv: string[];
+	let resolvedKernelEntrypoint: string;
+	try {
+		canonicalEntrypoint = fs.realpathSync(import.meta.path);
+		resolvedActualEntrypoint = fs.realpathSync(actualEntrypoint);
+		resolvedArgvEntrypoint = fs.realpathSync(argvEntrypoint ?? "");
+		const kernelArguments = kernelProcessArguments();
+		const kernelEntrypoint = kernelArguments.at(-1);
+		kernelExecArgv = kernelArguments.slice(1, -1);
+		resolvedKernelEntrypoint = fs.realpathSync(kernelEntrypoint ?? "");
+	} catch (error) {
+		throw new Error("benchmark runner invocation is outside the frozen public contract", { cause: error });
+	}
+	if (
+		resolvedActualEntrypoint !== canonicalEntrypoint ||
+		resolvedArgvEntrypoint !== canonicalEntrypoint ||
+		resolvedKernelEntrypoint !== canonicalEntrypoint ||
+		process.argv.length !== 2 ||
+		!isCanonicalRunnerExecArgv(process.execArgv) ||
+		!isCanonicalRunnerExecArgv(kernelExecArgv) ||
+		process.execArgv.join("\0") !== kernelExecArgv.join("\0")
+	) {
+		throw new Error("benchmark runner invocation is outside the frozen public contract");
+	}
+	return kernelExecArgv;
+}
+
+function sha256Bytes(value: Uint8Array | string): string {
+	return new Bun.CryptoHasher("sha256").update(value).digest("hex");
+}
+
+export function resolveMeasurementRuntimeProvenance(repositoryRoot: string): MeasurementRuntimeProvenance {
+	const bunVersion = process.versions.bun;
+	if (!bunVersion) throw new Error("Bun version unavailable");
+	const bunExecutable = fs.realpathSync(process.execPath);
+	const trackedClosure = Bun.spawnSync(
+		["git", "ls-files", "-z", "--error-unmatch", "--", ...MEASUREMENT_CLOSURE_SELECTORS],
+		{ cwd: repositoryRoot },
+	);
+	if (trackedClosure.exitCode !== 0) {
+		throw new Error("measurement closure contains an untracked or missing source");
+	}
+	const closurePaths = new TextDecoder()
+		.decode(trackedClosure.stdout)
+		.split("\0")
+		.filter(Boolean);
+	const uniqueClosurePaths = [...new Set(closurePaths)].sort();
+	const closureManifest = uniqueClosurePaths
+		.map(relativePath => {
+			const sourcePath = path.join(repositoryRoot, relativePath);
+			return `${relativePath}:${sha256Bytes(fs.readFileSync(sourcePath))}`;
+		})
+		.sort();
+	return {
+		bunVersion,
+		bunExecutable,
+		bunExecutableSha256: sha256Bytes(fs.readFileSync(bunExecutable)),
+		closureDigest: sha256Bytes(`${closureManifest.join("\n")}\n`),
+		closureManifest,
+	};
+}
 
 /** Deterministic PRNG (mulberry32) so fixtures are identical on every run. */
 function mulberry32(seed: number): () => number {
@@ -112,38 +252,38 @@ export function gitWorktreeFingerprint(repositoryRoot: string): { dirty: boolean
 }
 
 export function resolveGitProvenance(): { sha: string; dirty: boolean; worktreeFingerprint: string } {
-	const environmentSha = process.env.GITHUB_SHA?.trim();
 	const repositoryRoot = path.resolve(import.meta.dir, "../../..");
-	let sha = "";
-	let dirty = true;
-	let worktreeFingerprint = "unavailable";
-	let revision: Bun.SyncSubprocess<"pipe", "pipe"> | null = null;
+	let revision: Bun.SyncSubprocess<"pipe", "pipe">;
 	try {
 		revision = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repositoryRoot });
-	} catch {
-		// Exported source bundles may provide GITHUB_SHA without shipping Git.
+	} catch (error) {
+		throw new Error("git HEAD provenance unavailable", { cause: error });
 	}
-	if (revision?.exitCode === 0) {
-		sha = new TextDecoder().decode(revision.stdout).trim();
-		const worktree = gitWorktreeFingerprint(repositoryRoot);
-		worktreeFingerprint = worktree.fingerprint;
-		dirty = worktree.dirty;
+	if (revision.exitCode !== 0) {
+		throw new Error("git HEAD provenance unavailable");
 	}
-	if (!sha) sha = environmentSha ?? "";
-	return { sha, dirty, worktreeFingerprint };
+	const sha = new TextDecoder().decode(revision.stdout).trim();
+	if (!/^[0-9a-f]{40}$/i.test(sha)) {
+		throw new Error("git HEAD provenance is not a full commit SHA");
+	}
+	const worktree = gitWorktreeFingerprint(repositoryRoot);
+	return { sha, dirty: worktree.dirty, worktreeFingerprint: worktree.fingerprint };
 }
 
 function reproductionInvocation(
+	runnerExecArgv: readonly string[],
 	profile: MemoryWorkloadProfile,
 	durationTargetMs: number,
 	iterationsTarget: number,
+	memorySurfaceOrder: readonly MemorySurface[],
 ): { command: string; argv: string[]; environment: Record<string, string> } {
 	const environment: Record<string, string> = {
 		GJC_MEMORY_PROFILE: profile,
 		GJC_MEMORY_ITERATIONS: String(iterationsTarget),
+		GJC_MEMORY_SURFACE_ORDER: memorySurfaceOrder.join(","),
 	};
 	if (profile === "soak") environment.GJC_MEMORY_DURATION_MS = String(durationTargetMs);
-	const argv = [process.execPath, ...process.execArgv, ...process.argv.slice(1)];
+	const argv = ["bun", ...runnerExecArgv, LOGICAL_RUNNER_SCRIPT];
 	return { command: argv.join(" "), argv, environment };
 }
 const MEMORY_CHILD_ARGUMENT = "--gjc-memory-child";
@@ -159,18 +299,28 @@ function memorySample(startedAt: number): MemoryUsageSample {
 		activeResourceCount: process.getActiveResourcesInfo().length,
 	};
 }
-interface MemoryHighWaterSamples {
-	rss: MemoryUsageSample;
-	heap: MemoryUsageSample;
-	external: MemoryUsageSample;
-	arrayBuffers: MemoryUsageSample;
+function createMemoryObservedExtrema(sample: MemoryUsageSample): MemoryObservedExtrema {
+	return {
+		rssBytes: { valueBytes: sample.rssBytes, elapsedMs: sample.elapsedMs },
+		heapUsedBytes: { valueBytes: sample.heapUsedBytes, elapsedMs: sample.elapsedMs },
+		externalBytes: { valueBytes: sample.externalBytes, elapsedMs: sample.elapsedMs },
+		arrayBuffersBytes: { valueBytes: sample.arrayBuffersBytes, elapsedMs: sample.elapsedMs },
+	};
 }
 
-export function updateMemoryHighWaterSamples(peaks: MemoryHighWaterSamples, sample: MemoryUsageSample): void {
-	if (sample.rssBytes > peaks.rss.rssBytes) peaks.rss = sample;
-	if (sample.heapUsedBytes > peaks.heap.heapUsedBytes) peaks.heap = sample;
-	if (sample.externalBytes > peaks.external.externalBytes) peaks.external = sample;
-	if (sample.arrayBuffersBytes > peaks.arrayBuffers.arrayBuffersBytes) peaks.arrayBuffers = sample;
+export function updateMemoryObservedExtrema(extrema: MemoryObservedExtrema, sample: MemoryUsageSample): void {
+	if (sample.rssBytes > extrema.rssBytes.valueBytes) {
+		extrema.rssBytes = { valueBytes: sample.rssBytes, elapsedMs: sample.elapsedMs };
+	}
+	if (sample.heapUsedBytes > extrema.heapUsedBytes.valueBytes) {
+		extrema.heapUsedBytes = { valueBytes: sample.heapUsedBytes, elapsedMs: sample.elapsedMs };
+	}
+	if (sample.externalBytes > extrema.externalBytes.valueBytes) {
+		extrema.externalBytes = { valueBytes: sample.externalBytes, elapsedMs: sample.elapsedMs };
+	}
+	if (sample.arrayBuffersBytes > extrema.arrayBuffersBytes.valueBytes) {
+		extrema.arrayBuffersBytes = { valueBytes: sample.arrayBuffersBytes, elapsedMs: sample.elapsedMs };
+	}
 }
 
 export { calculateMemorySlope };
@@ -226,6 +376,16 @@ export function normalizeProcessTreeRss(
 	return { baselineBytes, postTeardownBytes, sampler: "ps" };
 }
 
+function surfaceOrdinal(surface: MemorySurface): number {
+	const configured = process.argv.includes(MEMORY_CHILD_ARGUMENT)
+		? Number(process.env.GJC_MEMORY_SURFACE_ORDINAL)
+		: Number.NaN;
+	if (Number.isSafeInteger(configured) && configured >= 0 && configured < REQUIRED_MEMORY_SURFACES.length) {
+		return configured;
+	}
+	return REQUIRED_MEMORY_SURFACES.indexOf(surface);
+}
+
 export function buildMemoryFixture(
 	workload: MemoryWorkload,
 	profile: MemoryWorkloadProfile,
@@ -240,47 +400,63 @@ export function buildMemoryFixture(
 	const baselineSample = { ...memorySample(performance.now()), elapsedMs: 0 };
 	const startedAt = performance.now();
 	const cpuStart = process.cpuUsage();
-	const samples = [baselineSample];
-	const highWaterSamples = {
-		rss: baselineSample,
-		heap: baselineSample,
-		external: baselineSample,
-		arrayBuffers: baselineSample,
-	};
+	const periodicSamples = [baselineSample];
+	const observedExtrema = createMemoryObservedExtrema(baselineSample);
 	let operations = 0;
 	let iterations = 0;
 	const chunkSize = profile === "soak" ? 1 : Math.max(1, Math.ceil(minimumIterations / 20));
-	const sampleIntervalMs = profile === "soak" ? 50 : 0;
-	const highWaterIntervalMs = profile === "soak" ? 10 : 0;
+	const periodicCadenceTargetMs = profile === "soak" ? 50 : 0;
+	const highWaterCadenceTargetMs = profile === "soak" ? 10 : 0;
+	let nextPeriodicDeadlineMs = periodicCadenceTargetMs;
+	let periodicDeadlinesMissed = 0;
+	let highWaterCallbacks = 0;
+	let highWaterProbes = 0;
+	let forcedHighWaterProbes = 0;
+	let throttledHighWaterCallbacks = 0;
 	let lastHighWaterSampleAt = Number.NEGATIVE_INFINITY;
-	const captureHighWater = (force = false) => {
-		const now = performance.now();
-		if (!force && now - lastHighWaterSampleAt < highWaterIntervalMs) return;
-		lastHighWaterSampleAt = now;
+	const capturePeriodic = () => {
 		const sample = memorySample(startedAt);
-		updateMemoryHighWaterSamples(highWaterSamples, sample);
+		periodicSamples.push(sample);
+		updateMemoryObservedExtrema(observedExtrema, sample);
+	};
+	const captureHighWater = (force = false) => {
+		highWaterCallbacks++;
+		const now = performance.now();
+		if (!force && now - lastHighWaterSampleAt < highWaterCadenceTargetMs) {
+			throttledHighWaterCallbacks++;
+			return;
+		}
+		lastHighWaterSampleAt = now;
+		highWaterProbes++;
+		if (force) forcedHighWaterProbes++;
+		updateMemoryObservedExtrema(observedExtrema, memorySample(startedAt));
 	};
 	while (iterations < minimumIterations || performance.now() - startedAt < targetDurationMs) {
 		operations += workload.run(chunkSize, captureHighWater);
 		iterations += chunkSize;
-		const elapsedSinceLastSample = performance.now() - startedAt - (samples.at(-1)?.elapsedMs ?? 0);
-		if (elapsedSinceLastSample >= sampleIntervalMs) samples.push(memorySample(startedAt));
+		if (periodicCadenceTargetMs === 0) {
+			capturePeriodic();
+			continue;
+		}
+		const elapsedMs = performance.now() - startedAt;
+		if (elapsedMs >= nextPeriodicDeadlineMs) {
+			const deadlinesReached = Math.floor((elapsedMs - nextPeriodicDeadlineMs) / periodicCadenceTargetMs) + 1;
+			periodicDeadlinesMissed += deadlinesReached - 1;
+			nextPeriodicDeadlineMs += deadlinesReached * periodicCadenceTargetMs;
+			capturePeriodic();
+		}
 	}
-	const elapsedMs = performance.now() - startedAt;
-	if ((samples.at(-1)?.elapsedMs ?? 0) < elapsedMs) samples.push(memorySample(startedAt));
-	const slopeSamples = [...samples];
-	for (const sample of new Set(Object.values(highWaterSamples))) {
-		if (sample !== baselineSample && !samples.includes(sample)) samples.push(sample);
-	}
-	samples.sort((left, right) => left.elapsedMs - right.elapsedMs);
+	const loopCompletedElapsedMs = performance.now() - startedAt;
+	if ((periodicSamples.at(-1)?.elapsedMs ?? 0) < loopCompletedElapsedMs) capturePeriodic();
+	const elapsedMs = periodicSamples.at(-1)?.elapsedMs ?? loopCompletedElapsedMs;
 	const cpu = process.cpuUsage(cpuStart);
 	workload.teardown();
 	gc?.();
 	const postTeardown = memorySample(startedAt);
 	const processTreePostTeardownRssBytes = processTreeRssBytes();
 	const processTree = normalizeProcessTreeRss(processTreeBaselineRssBytes, processTreePostTeardownRssBytes);
-	const baselineBytes = samples[0]?.rssBytes ?? null;
-	const peakBytes = samples.reduce((peak, sample) => Math.max(peak, sample.rssBytes), 0);
+	const baselineBytes = periodicSamples[0]?.rssBytes ?? null;
+	const peakBytes = observedExtrema.rssBytes.valueBytes;
 	const fixtureClass =
 		workload.surface === "cli"
 			? "startup-session-load"
@@ -311,7 +487,7 @@ export function buildMemoryFixture(
 			peakBytes,
 			growthBytes: peakBytes - (baselineBytes ?? peakBytes),
 			returnBytes: gc ? postTeardown.rssBytes : null,
-			heapBaselineBytes: samples[0]?.heapUsedBytes ?? null,
+			heapBaselineBytes: periodicSamples[0]?.heapUsedBytes ?? null,
 			heapReturnBytes: gc ? postTeardown.heapUsedBytes : null,
 		},
 		byteParity: {
@@ -322,15 +498,28 @@ export function buildMemoryFixture(
 		},
 		memoryBaseline: {
 			surface: workload.surface,
+			ordinal: surfaceOrdinal(workload.surface),
+			childPid: process.pid,
+			parentPid: process.ppid,
+			captureSemanticsId: MEMORY_CAPTURE_SEMANTICS_ID,
 			profile,
 			iterations,
 			operations,
 			operationsPerSecond: operations / Math.max(elapsedMs / 1_000, 1e-6),
-			samples,
-			slopeSamples,
+			periodicSamples,
+			observedExtrema,
+			sampling: {
+				periodicCadenceTargetMs,
+				highWaterCadenceTargetMs,
+				periodicDeadlinesMissed,
+				highWaterCallbacks,
+				highWaterProbes,
+				forcedHighWaterProbes,
+				throttledHighWaterCallbacks,
+			},
 			postTeardown,
-			rssSlopeBytesPerSecond: calculateMemorySlope(slopeSamples, "rssBytes"),
-			heapSlopeBytesPerSecond: calculateMemorySlope(slopeSamples, "heapUsedBytes"),
+			rssSlopeBytesPerSecond: calculateMemorySlope(periodicSamples, "rssBytes"),
+			heapSlopeBytesPerSecond: calculateMemorySlope(periodicSamples, "heapUsedBytes"),
 			processTreeBaselineRssBytes: processTree.baselineBytes,
 			processTreePostTeardownRssBytes: processTree.postTeardownBytes,
 			processTreeSampler: processTree.sampler,
@@ -348,6 +537,18 @@ function buildMemoryFixtures(
 function isMemorySurface(value: string | undefined): value is MemorySurface {
 	return value !== undefined && (REQUIRED_MEMORY_SURFACES as readonly string[]).includes(value);
 }
+function resolveMemorySurfaceOrder(isolatedMemory: boolean): MemorySurface[] {
+	if (!isolatedMemory) return [...REQUIRED_MEMORY_SURFACES];
+	const configured = process.env.GJC_MEMORY_SURFACE_ORDER;
+	if (configured === undefined) return [...REQUIRED_MEMORY_SURFACES];
+	const order = configured.split(",");
+	if (!isExactMemorySurfaceOrder(order)) {
+		throw new Error(
+			`GJC_MEMORY_SURFACE_ORDER must be an exact comma-separated permutation of: ${REQUIRED_MEMORY_SURFACES.join(",")}`,
+		);
+	}
+	return order;
+}
 
 function isolatedMemoryEntry(surface: MemorySurface): string {
 	if (surface === "agent-session") {
@@ -362,14 +563,16 @@ function isolatedMemoryEntry(surface: MemorySurface): string {
 function buildIsolatedMemoryFixtures(
 	profile: MemoryWorkloadProfile,
 	targetDurationMs: number,
+	memorySurfaceOrder: readonly MemorySurface[],
 ): PerfCorpusFixtureResult[] {
-	return REQUIRED_MEMORY_SURFACES.map(surface => {
+	return memorySurfaceOrder.map((surface, ordinal) => {
 		const result = Bun.spawnSync([process.execPath, "--smol", "--expose-gc", isolatedMemoryEntry(surface), MEMORY_CHILD_ARGUMENT], {
 			env: {
 				...process.env,
 				GJC_MEMORY_CHILD_SURFACE: surface,
 				GJC_MEMORY_PROFILE: profile,
 				GJC_MEMORY_DURATION_MS: String(targetDurationMs),
+				GJC_MEMORY_SURFACE_ORDINAL: String(ordinal),
 			},
 		});
 		if (result.exitCode !== 0) {
@@ -438,7 +641,10 @@ function buildFixture(
 	};
 }
 
-export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {}): PerfCorpusReport {
+function computePerfCorpusBenchmark(
+	runnerExecArgv: readonly string[],
+	options: { isolatedMemory?: boolean } = {},
+): PerfCorpusReport {
 	const profile: MemoryWorkloadProfile = process.env.GJC_MEMORY_PROFILE === "soak" ? "soak" : "short";
 	const configuredDurationMs = Number(process.env.GJC_MEMORY_DURATION_MS);
 	const durationTargetMs =
@@ -448,46 +654,65 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 				: 1_000
 			: 0;
 	const iterationsTarget = workloadIterations(profile);
+	const memorySurfaceOrder = resolveMemorySurfaceOrder(options.isolatedMemory === true);
 	const initialGit = resolveGitProvenance();
+	const repositoryRoot = path.resolve(import.meta.dir, "../../..");
+	const initialRuntime = resolveMeasurementRuntimeProvenance(repositoryRoot);
 	const fixtures: PerfCorpusFixtureResult[] = [
 		buildFixture("startup-load", "startup-session-load", ["startup", "session-load"], startupWorkload, 0x51ed),
 		buildFixture("streaming-ttft", "streaming-ttft", ["streaming", "ttft"], streamingWorkload, 0x9e37),
 		buildFixture("large-transcript", "large-transcript", ["transcript", "scroll"], largeTranscriptWorkload, 0xc0de),
 		...(options.isolatedMemory
-			? buildIsolatedMemoryFixtures(profile, durationTargetMs)
+			? buildIsolatedMemoryFixtures(profile, durationTargetMs, memorySurfaceOrder)
 			: buildMemoryFixtures(profile, durationTargetMs)),
 	];
 	const finalGit = resolveGitProvenance();
+	const finalRuntime = resolveMeasurementRuntimeProvenance(repositoryRoot);
 	if (
 		initialGit.sha !== finalGit.sha ||
 		initialGit.dirty !== finalGit.dirty ||
-		initialGit.worktreeFingerprint !== finalGit.worktreeFingerprint
+		initialGit.worktreeFingerprint !== finalGit.worktreeFingerprint ||
+		initialRuntime.bunVersion !== finalRuntime.bunVersion ||
+		initialRuntime.bunExecutable !== finalRuntime.bunExecutable ||
+		initialRuntime.bunExecutableSha256 !== finalRuntime.bunExecutableSha256 ||
+		initialRuntime.closureDigest !== finalRuntime.closureDigest
 	) {
 		throw new Error("benchmark checkout provenance changed while workloads were running");
 	}
 	const git = initialGit;
-	const invocation = reproductionInvocation(profile, durationTargetMs, iterationsTarget);
+	const invocation = reproductionInvocation(runnerExecArgv, profile, durationTargetMs, iterationsTarget, memorySurfaceOrder);
+	const runner: PerfCorpusReport["runner"] = {
+		command: invocation.command,
+		runtimeCommand: invocation.command,
+		runtimeControlIdentity: "",
+		argv: invocation.argv,
+		environment: invocation.environment,
+		platform: process.platform,
+		arch: process.arch,
+		bunVersion: initialRuntime.bunVersion,
+		bunExecutable: "bun",
+		bunExecutableSha256: initialRuntime.bunExecutableSha256,
+		worktreeFingerprint: git.worktreeFingerprint,
+		closureDigest: initialRuntime.closureDigest,
+		closureManifest: initialRuntime.closureManifest,
+		ci: process.env.CI === "true",
+		profile,
+		durationTargetMs,
+		memoryIsolation: options.isolatedMemory ? "process-per-surface" : "in-process",
+		memorySurfaceOrder,
+		iterationsTarget,
+		gcExposed: typeof globalThis.gc === "function",
+		memoryChildGcExposed: options.isolatedMemory ? true : typeof globalThis.gc === "function",
+		memoryChildExecArgv: options.isolatedMemory ? ["--smol", "--expose-gc"] : [],
+		runnerPid: process.pid,
+	};
+	runner.runtimeControlIdentity = memoryRuntimeControlIdentity(runner);
 	const report: PerfCorpusReport = {
 		schema: PERF_CORPUS_SCHEMA,
 		generatedAt: new Date().toISOString(),
 		gitSha: git.sha,
 		gitDirty: git.dirty,
-		runner: {
-			command: invocation.command,
-			argv: invocation.argv,
-			environment: invocation.environment,
-			platform: process.platform,
-			arch: process.arch,
-			bunVersion: process.versions.bun,
-			ci: process.env.CI === "true",
-			profile,
-			durationTargetMs,
-			memoryIsolation: options.isolatedMemory ? "process-per-surface" : "in-process",
-			iterationsTarget,
-			gcExposed: typeof globalThis.gc === "function",
-			memoryChildGcExposed: options.isolatedMemory ? true : typeof globalThis.gc === "function",
-			memoryChildExecArgv: options.isolatedMemory ? ["--smol", "--expose-gc"] : [],
-		},
+		runner,
 		fixtures,
 		hotspotClassifications: [...V1_V3_RECLASSIFICATION],
 		thresholdLedger: APPLIED_PERF_THRESHOLDS.map(t => ({ name: t.name, advisoryOrEnforced: t.advisoryOrEnforced })),
@@ -499,7 +724,11 @@ export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {
 	return report;
 }
 
-if (import.meta.main) {
+export function runPerfCorpusBenchmark(options: { isolatedMemory?: boolean } = {}): PerfCorpusReport {
+	return computePerfCorpusBenchmark(authenticateCanonicalRunnerEntrypoint(), options);
+}
+
+if (CANONICAL_RUNNER_MODULE_MAIN) {
 	const childSurface = process.argv.includes(MEMORY_CHILD_ARGUMENT) ? process.env.GJC_MEMORY_CHILD_SURFACE : undefined;
 	if (isMemorySurface(childSurface)) {
 		const profile: MemoryWorkloadProfile = process.env.GJC_MEMORY_PROFILE === "soak" ? "soak" : "short";

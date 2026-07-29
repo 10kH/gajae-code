@@ -23,6 +23,7 @@
 - Resuming a session no longer crashes with an unhandled rejection when another session transition is already running. The session picker dispatches resume through a void-returning callback, and `handleResumeSession` had no re-entrancy guard, so a second selection (or a resume issued while compaction, handoff, or a fork was in flight) reached `switchSession` and the `{ code: "busy" }` transition error rejected a promise nobody awaited. Resume now ignores an overlapping request with a status message, reports a busy transition as status, and still propagates every other failure. The progress lease is released on all paths.
 
 ### Added
+- Published bounded, redacted, hash-bound sealed perf-corpus memory evidence and an output-free replay notebook. The authenticated analysis identifies sustained heap growth on the `agent-session` and `tui` surfaces while keeping RSS/native allocation and p95 claims explicitly out of scope.
 
 - User-created Telegram forum topics can now start a GJC session by selecting the home folder, choosing a verified recent work folder, or entering an explicit folder path. The selected topic is adopted by the new session without creating or deleting a separate Telegram topic.
 - The interactive terminal’s responsive IRC/todo work-lane contract now covers exact narrow/wide geometry, requested versus effective IRC visibility, direct-root pin ordering, todo lane bounds, remapped IRC toggles, and live composer shortcut hints.
