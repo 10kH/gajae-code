@@ -326,12 +326,8 @@ type ReadLineRange = { start: number; end: number };
 
 /** Parse only explicit, provably bounded trailing read ranges. */
 function readLineRanges(path: string): ReadLineRange[] {
-	if (/(?:^|:)raw(?:$|:)/.test(path)) return [];
-	let target = path;
-	while (/:(?:raw|conflicts)$/.test(target)) {
-		target = target.replace(/:(?:raw|conflicts)$/, "");
-	}
-	const match = target.match(/:(\d+(?:[-+]\d+)?(?:,\d+(?:[-+]\d+)?)*)$/);
+	if (/(?:^|:)(?:raw|conflicts)(?:$|:)/.test(path)) return [];
+	const match = path.match(/:(\d+(?:[-+]\d+)?(?:,\d+(?:[-+]\d+)?)*)$/);
 	if (!match) return [];
 	return match[1].split(",").flatMap(part => {
 		const range = part.match(/^(\d+)([-+])(\d+)$/);
@@ -583,7 +579,6 @@ export function pruneAssistantToolArguments(
 	config: PruneConfig = DEFAULT_PRUNE_CONFIG,
 ): AssistantArgumentPruneResult {
 	let accumulatedTokens = 0;
-	let argumentTokensSaved = 0;
 	const { latestSuccessfulMutationByPathGroup, failedCallIds } = buildAssistantArgumentStalenessIndex(entries);
 	const argumentFenceStart = recentTurnFenceStart(entries, config.protectRecentTurns ?? 2);
 	const candidates: Array<{
@@ -591,7 +586,6 @@ export function pruneAssistantToolArguments(
 		call: ToolCall;
 		pathHints: string[];
 		originalChars: number;
-		savings: number;
 	}> = [];
 
 	for (let i = entries.length - 1; i >= 0; i--) {
@@ -619,54 +613,85 @@ export function pruneAssistantToolArguments(
 			// concrete path group to be stale from a later successful mutation.
 			// A group with no later success (failed/unknown/ambiguous) protects the
 			// whole call rather than dropping non-stale multi-file patch evidence.
-			const isStale =
-				groups.length > 0 &&
-				groups.every(group => {
-					const latest = latestSuccessfulMutationByPathGroup.get(pathGroupKey(group));
-					return latest !== undefined && latest.index > i && latest.callId !== content.id;
-				});
+			const isStale = groups.every(group => {
+				const latest = latestSuccessfulMutationByPathGroup.get(pathGroupKey(group));
+				return latest !== undefined && latest.index > i && latest.callId !== content.id;
+			});
 			if (!isStale) continue;
-			const sentinelChars = JSON.stringify({
-				pruned: true,
-				reason: "stale_tool_arguments",
-				pathHints: pathHintsForGroups(groups),
-				originalChars,
-				prunedAt: 0,
-			} satisfies PrunedToolArgumentsSentinel).length;
 			candidates.push({
 				entry: entry as SessionMessageEntry,
 				call: content,
 				pathHints: pathHintsForGroups(groups),
 				originalChars,
-				savings: Math.max(0, Math.ceil((originalChars - sentinelChars) / 4)),
 			});
 		}
 	}
 
-	for (const candidate of candidates) {
-		argumentTokensSaved += candidate.savings;
-	}
-	if (argumentTokensSaved < config.minimumSavings || candidates.length === 0) {
+	if (candidates.length === 0) {
 		return { argumentPrunedCount: 0, argumentTokensSaved: 0, prunedEntries: [] };
 	}
 
 	const prunedAt = Date.now();
-	const prunedEntries: SessionMessageEntry[] = [];
-	const prunedEntryIds = new Set<string>();
+	const candidatesByEntry = new Map<SessionMessageEntry, typeof candidates>();
 	for (const candidate of candidates) {
-		candidate.call.arguments = {
-			pruned: true,
-			reason: "stale_tool_arguments",
-			pathHints: candidate.pathHints,
-			originalChars: candidate.originalChars,
-			prunedAt,
-		};
-		if (!prunedEntryIds.has(candidate.entry.id)) {
-			prunedEntries.push(candidate.entry);
-			prunedEntryIds.add(candidate.entry.id);
-		}
+		const group = candidatesByEntry.get(candidate.entry);
+		if (group) group.push(candidate);
+		else candidatesByEntry.set(candidate.entry, [candidate]);
 	}
-	return { argumentPrunedCount: candidates.length, argumentTokensSaved, prunedEntries };
+
+	let argumentTokensSaved = 0;
+	const admittedGroups: Array<{ entry: SessionMessageEntry; candidates: typeof candidates }> = [];
+	for (const [entry, entryCandidates] of candidatesByEntry) {
+		const candidateByCallId = new Map(entryCandidates.map(candidate => [candidate.call.id, candidate]));
+		const message = entry.message as AgentMessage;
+		if (message.role !== "assistant") continue;
+		const stagedEntry = {
+			...entry,
+			message: {
+				...message,
+				content: message.content.map(content => {
+					if (content.type !== "toolCall") return content;
+					const candidate = candidateByCallId.get(content.id);
+					if (!candidate) return content;
+					return {
+						...content,
+						arguments: {
+							pruned: true,
+							reason: "stale_tool_arguments",
+							pathHints: candidate.pathHints,
+							originalChars: candidate.originalChars,
+							prunedAt,
+						} satisfies PrunedToolArgumentsSentinel,
+					};
+				}),
+			},
+		} as SessionMessageEntry;
+		const savings = Math.max(0, estimateEntryTokens(entry) - estimateEntryTokens(stagedEntry));
+		if (savings === 0) continue;
+		argumentTokensSaved += savings;
+		admittedGroups.push({ entry, candidates: entryCandidates });
+	}
+
+	if (argumentTokensSaved < config.minimumSavings || admittedGroups.length === 0) {
+		return { argumentPrunedCount: 0, argumentTokensSaved: 0, prunedEntries: [] };
+	}
+
+	let argumentPrunedCount = 0;
+	const prunedEntries: SessionMessageEntry[] = [];
+	for (const group of admittedGroups) {
+		for (const candidate of group.candidates) {
+			candidate.call.arguments = {
+				pruned: true,
+				reason: "stale_tool_arguments",
+				pathHints: candidate.pathHints,
+				originalChars: candidate.originalChars,
+				prunedAt,
+			};
+			argumentPrunedCount++;
+		}
+		prunedEntries.push(group.entry);
+	}
+	return { argumentPrunedCount, argumentTokensSaved, prunedEntries };
 }
 
 interface ToolOutputPruneCandidate {
@@ -781,20 +806,24 @@ function minimumSavings(config: PruneConfig, options: PruneToolOutputsOptions = 
 }
 
 /**
- * Estimate the token savings {@link pruneToolOutputs} would achieve, without
- * mutating any entry. Returns 0 savings when below the configured minimum so the
- * caller sees the same gate the real prune enforces.
+ * Estimate the conservative final token savings {@link pruneToolOutputs} would
+ * achieve, without mutating entries or invoking the artifact-reference planner.
+ * When `artifactRefMaxChars` is present, the estimate budgets that full length
+ * for every complete candidate so the real artifact-backed prune cannot save
+ * less than the estimate.
  */
 export function estimateToolOutputPruneSavings(
 	entries: SessionEntry[],
 	config: PruneConfig = DEFAULT_PRUNE_CONFIG,
 	options: PruneToolOutputsOptions = {},
 ): { prunableCount: number; tokensSaved: number } {
-	const { candidates, tokensSaved } = collectToolOutputPruneCandidates(entries, config);
-	if (tokensSaved < minimumSavings(config, options) || candidates.length === 0) {
-		return { prunableCount: 0, tokensSaved: 0 };
-	}
-	return { prunableCount: candidates.length, tokensSaved };
+	const { candidates, tokensSaved: baseTokensSaved } = collectToolOutputPruneCandidates(entries, config);
+	const minimum = minimumSavings(config, options);
+	if (baseTokensSaved < minimum || candidates.length === 0) return { prunableCount: 0, tokensSaved: 0 };
+	const planned = planToolOutputPruneCandidates(candidates, options);
+	const tokensSaved = planned.reduce((total, candidate) => total + candidate.savings, 0);
+	if (tokensSaved < minimum || planned.length === 0) return { prunableCount: 0, tokensSaved: 0 };
+	return { prunableCount: planned.length, tokensSaved };
 }
 
 /**
@@ -815,11 +844,67 @@ export function shouldRunMaintenancePrune(args: {
 	return args.estimatedSavings > args.cacheEpochResetCost;
 }
 
+const MAX_ARTIFACT_REF_CHARS = 16_384;
+
 export interface PruneToolOutputsOptions {
 	/** Lower the usual minimum only when the caller is already over its compaction threshold. */
 	relaxedMinimum?: number;
-	/** Return a reversible artifact reference for a candidate's original text. */
+	/**
+	 * Conservative maximum length of every planned artifact reference. Required
+	 * when `artifactRef` is provided so estimation and final admission use the
+	 * same worst-case notice size.
+	 */
+	artifactRefMaxChars?: number;
+	/**
+	 * Plan a reversible artifact reference for a candidate's original text. This
+	 * callback MUST be side-effect-free: publish only the originals returned by a
+	 * successful {@link pruneToolOutputs} result.
+	 */
 	artifactRef?: (candidate: PrunedOriginal) => string | undefined;
+}
+
+interface PlannedToolOutputPruneCandidate extends ToolOutputPruneCandidate {
+	original: PrunedOriginal;
+}
+
+function artifactRefMaxChars(options: PruneToolOutputsOptions): number {
+	const maxChars = options.artifactRefMaxChars;
+	if (maxChars === undefined) {
+		if (options.artifactRef) throw new Error("artifactRefMaxChars is required when artifactRef is provided");
+		return 0;
+	}
+	if (!Number.isSafeInteger(maxChars) || maxChars <= 0 || maxChars > MAX_ARTIFACT_REF_CHARS) {
+		throw new RangeError(`artifactRefMaxChars must be an integer between 1 and ${MAX_ARTIFACT_REF_CHARS}`);
+	}
+	return maxChars;
+}
+
+function planToolOutputPruneCandidates(
+	candidates: ToolOutputPruneCandidate[],
+	options: PruneToolOutputsOptions,
+): PlannedToolOutputPruneCandidate[] {
+	const maxArtifactChars = artifactRefMaxChars(options);
+	const artifactBudget = maxArtifactChars > 0 ? "x".repeat(maxArtifactChars) : undefined;
+	return candidates.flatMap(candidate => {
+		const original: PrunedOriginal = {
+			entryId: candidate.entry.id,
+			toolName: (candidate.entry.message as ToolResultMessage).toolName,
+			originalText: candidate.originalText,
+			tokens: candidate.tokens,
+			complete: candidate.complete,
+		};
+		const notice = createPrunedNotice(
+			candidate.tokens,
+			candidate.entry.message as ToolResultMessage,
+			candidate.call,
+			candidate.complete ? artifactBudget : undefined,
+		);
+		const savings = estimatePrunedSavings(candidate.tokens, notice);
+		const errorNoticeGrows =
+			(candidate.entry.message as ToolResultMessage).isError === true &&
+			notice.length > original.originalText.length;
+		return savings > 0 && !errorNoticeGrows ? [{ ...candidate, notice, savings, original }] : [];
+	});
 }
 
 export function pruneToolOutputs(
@@ -834,30 +919,29 @@ export function pruneToolOutputs(
 		return { prunedCount: 0, tokensSaved: 0, originals: [], prunedEntries: [] };
 	}
 
-	const candidatesWithArtifacts = candidates.flatMap(candidate => {
-		const original: PrunedOriginal = {
-			entryId: candidate.entry.id,
-			toolName: (candidate.entry.message as ToolResultMessage).toolName,
-			originalText: candidate.originalText,
-			tokens: candidate.tokens,
-			complete: candidate.complete,
-		};
-		const artifact = candidate.complete ? options.artifactRef?.(original) : undefined;
+	const plannedCandidates = planToolOutputPruneCandidates(candidates, options);
+	const plannedTokensSaved = plannedCandidates.reduce((total, candidate) => total + candidate.savings, 0);
+	if (plannedTokensSaved < minimum || plannedCandidates.length === 0) {
+		return { prunedCount: 0, tokensSaved: 0, originals: [], prunedEntries: [] };
+	}
+
+	const maxArtifactChars = artifactRefMaxChars(options);
+	const candidatesWithArtifacts = plannedCandidates.map(candidate => {
+		const artifact = candidate.complete ? options.artifactRef?.(candidate.original) : undefined;
+		if (artifact !== undefined && artifact.length > maxArtifactChars) {
+			throw new Error(`artifactRef exceeded artifactRefMaxChars for entry ${candidate.original.entryId}`);
+		}
 		const notice = createPrunedNotice(
 			candidate.tokens,
 			candidate.entry.message as ToolResultMessage,
 			candidate.call,
 			artifact,
 		);
-		const savings = estimatePrunedSavings(candidate.tokens, notice);
-		const errorNoticeGrows =
-			(candidate.entry.message as ToolResultMessage).isError === true &&
-			notice.length > original.originalText.length;
-		return savings > 0 && !errorNoticeGrows ? [{ ...candidate, notice, savings, original }] : [];
+		return { ...candidate, notice, savings: estimatePrunedSavings(candidate.tokens, notice) };
 	});
 	const tokensSaved = candidatesWithArtifacts.reduce((total, candidate) => total + candidate.savings, 0);
-	if (tokensSaved < minimum || candidatesWithArtifacts.length === 0) {
-		return { prunedCount: 0, tokensSaved: 0, originals: [], prunedEntries: [] };
+	if (tokensSaved < minimum) {
+		throw new Error("artifact-backed prune savings fell below the conservative admission estimate");
 	}
 
 	const prunedAt = Date.now();

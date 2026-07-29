@@ -445,6 +445,13 @@ function sanitizeCompactionStateText(value: string, maxLength: number): string {
 		.slice(0, maxLength);
 }
 
+function appendCompactionStateContext(summary: string, stateContext: string[]): string {
+	if (stateContext.length === 0) return summary;
+	return `${summary}\n\n<compaction-state>\n${stateContext.join("\n")}\n</compaction-state>`;
+}
+
+const PRUNED_ARTIFACT_REF_MAX_CHARS = 64;
+
 /** Session-specific events that extend the core AgentEvent */
 export type AutoCompactionContinuationSkipReason = "auto_continue_disabled_non_resumable_tail";
 
@@ -4347,7 +4354,7 @@ export class AgentSession {
 
 		const compactionSettings = this.settings.getGroup("compaction");
 		if (compactionSettings.autoContinue !== false) {
-			this.#scheduleAutoContinuePrompt(generation);
+			this.#scheduleAutoContinuePrompt(generation, false);
 			return true;
 		}
 
@@ -4355,7 +4362,7 @@ export class AgentSession {
 		return false;
 	}
 
-	#scheduleAutoContinuePrompt(generation: number): void {
+	#scheduleAutoContinuePrompt(generation: number, requireUnfinishedWork = true): void {
 		const predecessorAgentEndHold = this.#reserveDeferredAgentEndForContinuation();
 		const continuePrompt = async () => {
 			await this.#promptWithMessage(
@@ -4388,6 +4395,24 @@ export class AgentSession {
 					if (this.#promptGeneration !== scheduledGeneration) {
 						this.#logCompactionContinuationSkipped("auto_continue_prompt", "generation_changed");
 						return;
+					}
+					if (requireUnfinishedWork) {
+						const snapshot = await this.#compactionStateSnapshot();
+						if (signal.aborted) {
+							this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
+							return;
+						}
+						if (this.#isDisposed || this.#promptGeneration !== scheduledGeneration) {
+							this.#logCompactionContinuationSkipped(
+								"auto_continue_prompt",
+								this.#isDisposed ? "session_disposed" : "generation_changed",
+							);
+							return;
+						}
+						if (!this.#hasUnfinishedWork(snapshot)) {
+							this.emitNotice("info", "Auto-continue skipped: no unfinished work detected");
+							return;
+						}
 					}
 					await continuePrompt();
 				} catch (error) {
@@ -9052,10 +9077,13 @@ export class AgentSession {
 			lastAssistantStopReason: undefined,
 		};
 		try {
-			const goal = this.getGoalModeState()?.goal;
+			const goalState = this.getGoalModeState();
+			const goal = goalState?.enabled ? goalState.goal : undefined;
 			if (goal) snapshot.goal = { objective: goal.objective, status: goal.status };
-		} catch {
-			// State snapshot is best-effort.
+		} catch (error) {
+			logger.warn("Failed to read goal state for compaction snapshot", {
+				error: error instanceof Error ? error.message : String(error),
+			});
 		}
 		try {
 			const todos = this.getTodoPhases()
@@ -9064,8 +9092,10 @@ export class AgentSession {
 				.slice(0, 10)
 				.map(task => task.content);
 			snapshot.openTodos = todos;
-		} catch {
-			// State snapshot is best-effort.
+		} catch (error) {
+			logger.warn("Failed to read todo state for compaction snapshot", {
+				error: error instanceof Error ? error.message : String(error),
+			});
 		}
 		try {
 			const state = await readVisibleSkillActiveState(this.sessionManager.getCwd(), this.sessionId, { tier: "hud" });
@@ -9073,13 +9103,17 @@ export class AgentSession {
 				.filter(entry => entry.active !== false)
 				.slice(0, 5)
 				.map(entry => ({ skill: entry.skill, phase: entry.phase ?? "unknown" }));
-		} catch {
-			// State snapshot is best-effort.
+		} catch (error) {
+			logger.warn("Failed to read workflow state for compaction snapshot", {
+				error: error instanceof Error ? error.message : String(error),
+			});
 		}
 		try {
 			snapshot.queuedMessages = this.agent.hasQueuedMessages();
-		} catch {
-			// State snapshot is best-effort.
+		} catch (error) {
+			logger.warn("Failed to read queued-message state for compaction snapshot", {
+				error: error instanceof Error ? error.message : String(error),
+			});
 		}
 		try {
 			for (let index = this.messages.length - 1; index >= 0; index--) {
@@ -9088,8 +9122,10 @@ export class AgentSession {
 				snapshot.lastAssistantStopReason = (message as AssistantMessage).stopReason;
 				break;
 			}
-		} catch {
-			// State snapshot is best-effort.
+		} catch (error) {
+			logger.warn("Failed to read assistant stop state for compaction snapshot", {
+				error: error instanceof Error ? error.message : String(error),
+			});
 		}
 		return snapshot;
 	}
@@ -9160,6 +9196,14 @@ export class AgentSession {
 		fromExtension?: boolean,
 	): Promise<CompactionEntry | undefined> {
 		return this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
+	}
+
+	/** Test seam: stage and commit tool-output pruning under a caller-owned abort signal. */
+	pruneToolOutputsForTests(
+		signal?: AbortSignal,
+		overThreshold = true,
+	): Promise<{ prunedCount: number; tokensSaved: number; committed: boolean } | undefined> {
+		return this.#pruneToolOutputs(signal, overThreshold);
 	}
 
 	/** Read-only test seam for active mid-run EventStream drain barriers. */
@@ -10963,6 +11007,7 @@ export class AgentSession {
 		}
 		const result = pruneToolOutputs(branchEntries, DEFAULT_PRUNE_CONFIG, {
 			relaxedMinimum: overThreshold ? 0 : undefined,
+			artifactRefMaxChars: PRUNED_ARTIFACT_REF_MAX_CHARS,
 			artifactRef: candidate => {
 				if (!artifactManager) return undefined;
 				const id = reservedArtifactId ?? String(artifactManager.allocateId());
@@ -10973,6 +11018,7 @@ export class AgentSession {
 			},
 		});
 		const failedArtifactEntryIds = new Set<string>();
+		const publishedArtifacts: typeof prunedArtifacts = [];
 		for (const artifact of prunedArtifacts.filter(artifact =>
 			result.originals.some(original => original.entryId === artifact.entryId),
 		)) {
@@ -10981,6 +11027,7 @@ export class AgentSession {
 					`${artifact.id}.${artifact.toolType}.log`,
 					new TextEncoder().encode(artifact.originalText),
 				);
+				publishedArtifacts.push(artifact);
 			} catch (error) {
 				failedArtifactEntryIds.add(artifact.entryId);
 				logger.warn("Failed to persist pruned tool output artifact", {
@@ -10989,6 +11036,27 @@ export class AgentSession {
 				});
 			}
 		}
+		const rollbackPublishedArtifacts = async (reason: "aborted" | "commit_gate_rejected") => {
+			let removedArtifacts = 0;
+			let unremovedArtifacts = 0;
+			for (const artifact of publishedArtifacts) {
+				const filename = `${artifact.id}.${artifact.toolType}.log`;
+				let removed = false;
+				for (let attempt = 0; attempt < 3 && !removed; attempt++) {
+					removed = (await artifactManager?.removeNamedBestEffort(filename)) ?? false;
+					if (!removed && attempt < 2) await Bun.sleep(10);
+				}
+				if (removed) removedArtifacts++;
+				else {
+					unremovedArtifacts++;
+					logger.warn("Failed to roll back staged pruned-output artifact after retries", {
+						artifactId: artifact.id,
+						reason,
+					});
+				}
+			}
+			return { removedArtifacts, unremovedArtifacts };
+		};
 		let toolTokensSaved = result.tokensSaved;
 		let toolPrunedCount = result.prunedCount;
 		const committedToolEntries = result.prunedEntries.filter(entry => {
@@ -11009,7 +11077,6 @@ export class AgentSession {
 			delete message.prunedAt;
 			return false;
 		});
-		if (result.prunedEntries.length > 0 && committedToolEntries.length === 0) return undefined;
 		const argumentResult = pruneAssistantToolArguments(branchEntries, DEFAULT_PRUNE_CONFIG);
 		const fileMentionResult = pruneStaleFileMentions(branchEntries, p =>
 			resolveReadPath(p, this.sessionManager.getCwd()),
@@ -11027,28 +11094,22 @@ export class AgentSession {
 			volatileContextResult.changed.length +
 			reminderResult.changed.length;
 		if (prunedCount === 0 || signal?.aborted) {
+			if (publishedArtifacts.length > 0) await rollbackPublishedArtifacts("aborted");
 			return undefined;
 		}
 		if (options?.commitGate && !options.commitGate({ prunedCount, tokensSaved })) {
-			// Roll back staged artifact publications; removal failures are logged,
-			// never masked as a clean rollback.
-			let unremovedArtifacts = 0;
-			for (const artifact of prunedArtifacts) {
-				if (failedArtifactEntryIds.has(artifact.entryId)) continue;
-				const removed =
-					(await artifactManager?.removeNamedBestEffort(`${artifact.id}.${artifact.toolType}.log`)) ?? false;
-				if (!removed) {
-					unremovedArtifacts++;
-					logger.warn("Failed to roll back staged pruned-output artifact", { artifactId: artifact.id });
-				}
-			}
+			const rollback = await rollbackPublishedArtifacts("commit_gate_rejected");
 			logger.info("Below-threshold maintenance pruning staged but not committed", {
 				prunedCount,
 				tokensSaved,
-				rolledBackArtifacts: prunedArtifacts.length - failedArtifactEntryIds.size - unremovedArtifacts,
-				unremovedArtifacts,
+				rolledBackArtifacts: rollback.removedArtifacts,
+				unremovedArtifacts: rollback.unremovedArtifacts,
 			});
 			return { prunedCount, tokensSaved, committed: false };
+		}
+		if (signal?.aborted) {
+			await rollbackPublishedArtifacts("aborted");
+			return undefined;
 		}
 
 		// getBranch() returns materialized copies for blob-externalized entries, so
@@ -11097,7 +11158,9 @@ export class AgentSession {
 		const compactionSettings = this.settings.getGroup("compaction");
 		if (!compactionSettings.maintenancePruningEnabled) return;
 
-		const estimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG);
+		const estimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG, {
+			artifactRefMaxChars: PRUNED_ARTIFACT_REF_MAX_CHARS,
+		});
 		const cacheEpochResetCost = this.#lastCacheEpochResetCost();
 		if (
 			!shouldRunMaintenancePrune({
@@ -11802,6 +11865,7 @@ export class AgentSession {
 			return true;
 		const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG, {
 			relaxedMinimum: 0,
+			artifactRefMaxChars: PRUNED_ARTIFACT_REF_MAX_CHARS,
 		});
 		if (
 			pruneEstimate.tokensSaved > 0 &&
@@ -11906,6 +11970,7 @@ export class AgentSession {
 			//    prompt-cache epoch via #closeCodexProviderSessionsForHistoryRewrite.
 			const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG, {
 				relaxedMinimum: 0,
+				artifactRefMaxChars: PRUNED_ARTIFACT_REF_MAX_CHARS,
 			});
 			let pruneResult: { prunedCount: number; tokensSaved: number } | undefined;
 			if (
@@ -12087,6 +12152,7 @@ export class AgentSession {
 
 		const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG, {
 			relaxedMinimum: 0,
+			artifactRefMaxChars: PRUNED_ARTIFACT_REF_MAX_CHARS,
 		});
 		if (
 			pruneEstimate.tokensSaved > 0 &&
@@ -13076,7 +13142,7 @@ export class AgentSession {
 			preserveData ??= hookCompaction.preserveData;
 			return {
 				kind: "fromHook",
-				summary: hookCompaction.summary,
+				summary: appendCompactionStateContext(hookCompaction.summary, stateContext),
 				shortSummary: hookCompaction.shortSummary,
 				firstKeptEntryId: hookCompaction.firstKeptEntryId,
 				tokensBefore: hookCompaction.tokensBefore,
@@ -13110,8 +13176,6 @@ export class AgentSession {
 		if (!options?.force && compactionSettings.strategy === "off") return { kind: "skipped" };
 		if (!options?.force && reason !== "idle" && !compactionSettings.enabled) return { kind: "skipped" };
 		const generation = this.#promptGeneration;
-		const compactionStateSnapshot = await this.#compactionStateSnapshot();
-		const hadUnfinishedWork = this.#hasUnfinishedWork(compactionStateSnapshot);
 		if (
 			options?.deferHandoffMaintenance !== false &&
 			!deferred &&
@@ -13157,6 +13221,10 @@ export class AgentSession {
 			if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
 			await this.#emitSessionEvent({ type: "auto_compaction_start", reason, action });
 			if (autoCompactionSignal.aborted) return await emitAborted();
+			const compactionStateSnapshot = await this.#compactionStateSnapshot();
+			if (autoCompactionSignal.aborted || this.#isDisposed || this.#promptGeneration !== generation) {
+				return await emitAborted();
+			}
 
 			if (compactionSettings.strategy === "handoff" && reason !== "overflow") {
 				const handoffFocus = AUTO_HANDOFF_THRESHOLD_FOCUS;
@@ -13194,9 +13262,7 @@ export class AgentSession {
 					});
 					if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
 					if (continueAfterMaintenance && reason !== "idle" && compactionSettings.autoContinue !== false) {
-						if (hadUnfinishedWork || this.#hasUnfinishedWork(await this.#compactionStateSnapshot()))
-							this.#scheduleAutoContinuePrompt(generation);
-						else this.emitNotice("info", "Auto-continue skipped: no unfinished work detected");
+						this.#scheduleAutoContinuePrompt(generation);
 					}
 
 					if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
@@ -13296,9 +13362,7 @@ export class AgentSession {
 						onError: error => this.#logCompactionContinuationError("queued_continue", error),
 					});
 				} else if (continueAfterMaintenance && reason !== "idle" && compactionSettings.autoContinue !== false) {
-					if (hadUnfinishedWork || this.#hasUnfinishedWork(await this.#compactionStateSnapshot()))
-						this.#scheduleAutoContinuePrompt(generation);
-					else this.emitNotice("info", "Auto-continue skipped: no unfinished work detected");
+					this.#scheduleAutoContinuePrompt(generation);
 				}
 				return { kind: "skipped" };
 			}
@@ -13547,9 +13611,7 @@ export class AgentSession {
 					onError: error => this.#logCompactionContinuationError("queued_continue", error),
 				});
 			} else if (continueAfterMaintenance && reason !== "idle" && compactionSettings.autoContinue !== false) {
-				if (hadUnfinishedWork || this.#hasUnfinishedWork(await this.#compactionStateSnapshot()))
-					this.#scheduleAutoContinuePrompt(generation);
-				else this.emitNotice("info", "Auto-continue skipped: no unfinished work detected");
+				this.#scheduleAutoContinuePrompt(generation);
 			}
 			return { kind: "compacted" };
 		} catch (error) {

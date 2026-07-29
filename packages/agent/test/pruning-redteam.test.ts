@@ -213,6 +213,7 @@ describe("pruneToolOutputs red-team boundaries", () => {
 		const originalTokens = tokens(output);
 
 		const result = pruneToolOutputs([output], config(), {
+			artifactRefMaxChars: 64,
 			artifactRef: candidate => {
 				expect(candidate).toEqual({
 					entryId: "artifact",
@@ -428,7 +429,10 @@ describe("pruneToolOutputs red-team boundaries", () => {
 			.map(block => block.text)
 			.join("\n");
 
-		const result = pruneToolOutputs([output], config(), { artifactRef: () => "artifact://complete" });
+		const result = pruneToolOutputs([output], config(), {
+			artifactRefMaxChars: 64,
+			artifactRef: () => "artifact://complete",
+		});
 
 		expect(result.originals).toHaveLength(1);
 		expect(result.originals[0]).toMatchObject({ originalText, complete: true });
@@ -445,6 +449,7 @@ describe("pruneToolOutputs red-team boundaries", () => {
 		let artifactCalls = 0;
 
 		const result = pruneToolOutputs([output], config(), {
+			artifactRefMaxChars: 64,
 			artifactRef: () => {
 				artifactCalls++;
 				return "artifact://must-not-publish";

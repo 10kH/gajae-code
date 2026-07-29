@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import type { SessionEntry, SessionMessageEntry } from "@gajae-code/agent-core/compaction/entries";
-import { type PruneConfig, pruneToolOutputs } from "@gajae-code/agent-core/compaction/pruning";
+import {
+	estimateToolOutputPruneSavings,
+	type PruneConfig,
+	pruneToolOutputs,
+} from "@gajae-code/agent-core/compaction/pruning";
 import type { ToolResultMessage } from "@gajae-code/ai/types";
 
 let sequence = 0;
@@ -151,6 +155,9 @@ describe("compaction pruning QA red-team gates", () => {
 			["file.ts:2-4:raw", "file.ts:2-4:raw", true],
 			["file.ts:5-16", "file.ts:5-16,960-973", false],
 			["file.ts:960-973", "file.ts:5-16,960-973", false],
+			["file.ts:50-60", "file.ts:1-500:conflicts", false],
+			["file.ts:50-60:conflicts", "file.ts:1-500", false],
+			["file.ts:50-60:conflicts", "file.ts:50-60:conflicts", true],
 		] as const) {
 			const entries: SessionEntry[] = [];
 			const earlier = pair(entries, `earlier-${earlierPath}`, "read", { path: earlierPath });
@@ -165,7 +172,7 @@ describe("compaction pruning QA red-team gates", () => {
 		const artifactResult = pruneToolOutputs(
 			entries,
 			{ ...EAGER, protectedTools: [] },
-			{ artifactRef: original => `artifact://${original.entryId}` },
+			{ artifactRefMaxChars: 64, artifactRef: original => `artifact://${original.entryId}` },
 		);
 		expect(textOf(old)).toContain(`full output: artifact://${old.id}]`);
 		expect(artifactResult.originals).toEqual([
@@ -188,11 +195,26 @@ describe("compaction pruning QA red-team gates", () => {
 			...EAGER,
 			protectedTools: [],
 		});
+		let artifactCalls = 0;
+		const options = {
+			artifactRefMaxChars: 10_000,
+			artifactRef: () => {
+				artifactCalls++;
+				return `artifact://${"x".repeat(9_980)}`;
+			},
+		};
+		const estimate = estimateToolOutputPruneSavings(
+			gatedEntries,
+			{ ...EAGER, protectedTools: [], minimumSavings: baseline.tokensSaved },
+			options,
+		);
 		const blocked = pruneToolOutputs(
 			gatedEntries,
 			{ ...EAGER, protectedTools: [], minimumSavings: baseline.tokensSaved },
-			{ artifactRef: () => `artifact://${"x".repeat(10_000)}` },
+			options,
 		);
+		expect(estimate).toEqual({ prunableCount: 0, tokensSaved: 0 });
+		expect(artifactCalls).toBe(0);
 		expect(blocked.prunedCount).toBe(0);
 		expect(blocked.originals).toEqual([]);
 		expect(textOf(gated)).toBe("small output ".repeat(30));
@@ -205,12 +227,36 @@ describe("compaction pruning QA red-team gates", () => {
 				entries,
 				{ ...EAGER, protectedTools: [] },
 				{
+					artifactRefMaxChars: 64,
 					artifactRef: () => {
 						throw new Error("artifact store unavailable");
 					},
 				},
 			),
 		).toThrow("artifact store unavailable");
+	});
+
+	test("C3 planner failures leave every candidate unmodified", () => {
+		const entries = [result("artifact-first", "bash"), result("artifact-second", "bash")];
+		const before = entries.map(entry => textOf(entry));
+		let calls = 0;
+		expect(() =>
+			pruneToolOutputs(
+				entries,
+				{ ...EAGER, protectedTools: [] },
+				{
+					artifactRefMaxChars: 64,
+					artifactRef: original => {
+						calls++;
+						if (original.entryId === entries[0].id) throw new Error("second planner failed");
+						return "artifact://first";
+					},
+				},
+			),
+		).toThrow("second planner failed");
+		expect(calls).toBe(2);
+		expect(entries.map(entry => textOf(entry))).toEqual(before);
+		expect(entries.every(entry => (entry.message as ToolResultMessage).prunedAt === undefined)).toBe(true);
 	});
 
 	test("C3 captures all text blocks completely and publishes an artifact notice", () => {
@@ -224,6 +270,7 @@ describe("compaction pruning QA red-team gates", () => {
 			[output],
 			{ ...EAGER, protectedTools: [] },
 			{
+				artifactRefMaxChars: 64,
 				artifactRef: () => {
 					artifactCalls++;
 					return "artifact://multi-text";
@@ -252,6 +299,7 @@ describe("compaction pruning QA red-team gates", () => {
 			[output],
 			{ ...EAGER, protectedTools: [] },
 			{
+				artifactRefMaxChars: 64,
 				artifactRef: () => {
 					artifactCalls++;
 					return "artifact://must-not-exist";

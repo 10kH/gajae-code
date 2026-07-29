@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type { ToolCall, ToolResultMessage } from "@gajae-code/ai";
+import type { AssistantMessage, ToolCall, ToolResultMessage } from "@gajae-code/ai";
 import { estimateEntryTokens } from "../src/compaction/compaction";
 import type { SessionEntry, SessionMessageEntry } from "../src/compaction/entries";
 import {
@@ -688,7 +688,67 @@ describe("assistant edit argument pruning", () => {
 		expect(first.argumentPrunedCount).toBe(1);
 		expect(first.argumentTokensSaved).toBeGreaterThan(0);
 		expect(afterTokens).toBeLessThan(beforeTokens);
+		expect(first.argumentTokensSaved).toBe(beforeTokens - afterTokens);
 		expect(second).toEqual({ argumentPrunedCount: 0, argumentTokensSaved: 0, prunedEntries: [] });
+	});
+
+	it("accounts exactly for multiple stale tool calls in one assistant entry", () => {
+		const entries: SessionEntry[] = [];
+		const oldEdits = assistantCallEntry("multi-a", "edit", {
+			path: "src/a.ts",
+			old_string: "a",
+			new_string: "b".repeat(2000),
+		});
+		const message = (oldEdits as SessionMessageEntry).message as AssistantMessage;
+		message.content.push({
+			type: "toolCall",
+			id: "multi-b",
+			name: "edit",
+			arguments: { path: "src/b.ts", old_string: "x", new_string: "y".repeat(2000) },
+		});
+		entries.push(oldEdits, toolResultEntry("multi-a", "edit", 100), toolResultEntry("multi-b", "edit", 100));
+		pair(entries, "later-a", "write", { path: "src/a.ts", content: "c" }, 100);
+		pair(entries, "later-b", "write", { path: "src/b.ts", content: "d" }, 100);
+		const beforeTokens = estimateEntryTokens(oldEdits);
+
+		const result = pruneAssistantToolArguments(entries, EAGER);
+		const afterTokens = estimateEntryTokens(oldEdits);
+
+		expect(result.argumentPrunedCount).toBe(2);
+		expect(result.argumentTokensSaved).toBe(beforeTokens - afterTokens);
+		expect(result.prunedEntries).toEqual([oldEdits]);
+		expect(
+			message.content
+				.filter(content => content.type === "toolCall")
+				.every(content => content.type === "toolCall" && content.arguments.pruned === true),
+		).toBe(true);
+	});
+
+	it("uses exact entry-token savings at the minimum boundary", () => {
+		const makeEntries = (): { entries: SessionEntry[]; oldEdit: SessionEntry } => {
+			const entries: SessionEntry[] = [];
+			const oldEdit = assistantCallEntry("boundary-edit", "edit", {
+				path: "src/boundary.ts",
+				old_string: "a",
+				new_string: "b".repeat(2003),
+			});
+			entries.push(oldEdit, toolResultEntry("boundary-edit", "edit", 100));
+			pair(entries, "boundary-write", "write", { path: "src/boundary.ts", content: "c" }, 100);
+			return { entries, oldEdit };
+		};
+		const probe = makeEntries();
+		const threshold = pruneAssistantToolArguments(probe.entries, EAGER).argumentTokensSaved;
+		expect(threshold).toBeGreaterThan(0);
+
+		const atThreshold = makeEntries();
+		const admitted = pruneAssistantToolArguments(atThreshold.entries, { ...EAGER, minimumSavings: threshold });
+		expect(admitted.argumentPrunedCount).toBe(1);
+		expect(admitted.argumentTokensSaved).toBe(threshold);
+
+		const aboveThreshold = makeEntries();
+		const blocked = pruneAssistantToolArguments(aboveThreshold.entries, { ...EAGER, minimumSavings: threshold + 1 });
+		expect(blocked).toEqual({ argumentPrunedCount: 0, argumentTokensSaved: 0, prunedEntries: [] });
+		expect(argumentSentinel(aboveThreshold.oldEdit).reason).not.toBe("stale_tool_arguments");
 	});
 
 	it("does not prune a multi-file apply_patch when only one touched file is later mutated", () => {

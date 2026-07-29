@@ -17,13 +17,13 @@ describe("isWorkflowContinuationInert", () => {
 		expect(isWorkflowContinuationInert("ultragoal", "failed")).toBe(true);
 	});
 
-	test("human-blocked nonterminal phases are inert", () => {
+	test("explicit nonterminal integration phases are inert", () => {
 		expect(isWorkflowContinuationInert("team", "awaiting_integration")).toBe(true);
-		expect(isWorkflowContinuationInert("ultragoal", "blocked")).toBe(true);
 	});
 
 	test("known active nonterminal phases are not inert", () => {
 		expect(isWorkflowContinuationInert("ultragoal", "active")).toBe(false);
+		expect(isWorkflowContinuationInert("ultragoal", "blocked")).toBe(false);
 		expect(isWorkflowContinuationInert("deep-interview", "interviewing")).toBe(false);
 		expect(isWorkflowContinuationInert("ralplan", "planner")).toBe(false);
 		expect(isWorkflowContinuationInert("team", "running")).toBe(false);

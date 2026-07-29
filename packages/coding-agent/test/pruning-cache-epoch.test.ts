@@ -231,6 +231,30 @@ describe("pruning cache-epoch invariant", () => {
 		expect((await artifactManager.listFiles()).filter(file => file.endsWith(".bash.log"))).toEqual([]);
 	});
 
+	it("rolls back staged artifacts when pruning aborts during publication", async () => {
+		await createSession();
+		seedPrunableHistory();
+		const artifactManager = sessionManager.getArtifactManager();
+		if (!artifactManager) throw new Error("expected a managed artifact manager for this session");
+		const publish = artifactManager.publishNamedNoReplace.bind(artifactManager);
+		const abortController = new AbortController();
+		let aborted = false;
+		vi.spyOn(artifactManager, "publishNamedNoReplace").mockImplementation(async (filename, bytes) => {
+			await publish(filename, bytes);
+			if (!aborted) {
+				aborted = true;
+				abortController.abort();
+			}
+		});
+
+		const result = await session.pruneToolOutputsForTests(abortController.signal);
+
+		expect(aborted).toBe(true);
+		expect(result).toBeUndefined();
+		expect(prunedEntryCount()).toBe(0);
+		expect((await artifactManager.listFiles()).filter(file => file.endsWith(".bash.log"))).toEqual([]);
+	});
+
 	it("commits maintenance pruning when actual savings clear the cache-epoch cost", async () => {
 		await createSession(true);
 		seedTransactionalPrunableHistory();

@@ -303,27 +303,28 @@ export function isCanonicalGjcWorkflowSkill(skill: string): skill is CanonicalGj
 }
 
 /**
- * Phases that are not manifest-terminal but are blocked on a human or leader
- * action, so an autonomous compaction continuation must not wake them.
+ * Nonterminal phases that intentionally await workflow-specific integration
+ * rather than a generic synthetic compaction continuation.
  */
-const HUMAN_BLOCKED_WORKFLOW_PHASES: Readonly<Partial<Record<CanonicalGjcWorkflowSkill, ReadonlySet<string>>>> = {
+const CONTINUATION_INERT_WORKFLOW_PHASES: Readonly<Partial<Record<CanonicalGjcWorkflowSkill, ReadonlySet<string>>>> = {
 	team: new Set(["awaiting_integration"]),
-	ultragoal: new Set(["blocked"]),
 };
 
 /**
  * Continuation inertness for compaction auto-continue, derived from each
- * workflow's manifest contract: manifest-terminal and human-blocked phases are
- * inert; unknown skills or phases unknown to the skill's manifest are
+ * workflow's manifest contract: manifest-terminal and explicitly inert phases
+ * are inert; unknown skills or phases unknown to the skill's manifest are
  * conservatively inert so a synthetic continuation never wakes an unrecognized
- * workflow.
+ * workflow. Generic Ultragoal `blocked` remains continuation-active because its
+ * blocker may be autonomously resolvable; verified human pauses are represented
+ * by the inline goal's `paused` status instead.
  */
 export function isWorkflowContinuationInert(skill: string, phase: string): boolean {
 	const normalizedPhase = phase.trim().toLowerCase();
 	if (!isCanonicalGjcWorkflowSkill(skill)) return true;
 	const manifest = getSkillManifest(skill);
 	if (manifest.terminalStates.some(terminal => terminal.toLowerCase() === normalizedPhase)) return true;
-	if (HUMAN_BLOCKED_WORKFLOW_PHASES[skill]?.has(normalizedPhase)) return true;
+	if (CONTINUATION_INERT_WORKFLOW_PHASES[skill]?.has(normalizedPhase)) return true;
 	return !manifest.states.some(state => state.id.toLowerCase() === normalizedPhase);
 }
 

@@ -11,7 +11,7 @@ import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensio
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { getSkillActiveStatePaths } from "@gajae-code/coding-agent/skill-state/active-state";
+import * as activeStateModule from "@gajae-code/coding-agent/skill-state/active-state";
 import { getProjectAgentDir, TempDir } from "@gajae-code/utils";
 
 function assistantMessage(stopReason: "stop" | "length" = "stop"): AssistantMessage {
@@ -118,7 +118,7 @@ describe("AgentSession state-aware compaction", () => {
 	}
 
 	async function seedActiveSkillState(phase: string, skill = "ultragoal"): Promise<void> {
-		const { sessionPath } = getSkillActiveStatePaths(tempDir.path(), session.sessionId);
+		const { sessionPath } = activeStateModule.getSkillActiveStatePaths(tempDir.path(), session.sessionId);
 		await Bun.write(
 			sessionPath,
 			JSON.stringify({
@@ -158,6 +158,55 @@ describe("AgentSession state-aware compaction", () => {
 		await compact();
 		expect(promptSpy).toHaveBeenCalledTimes(1);
 	});
+
+	it("rechecks an active goal that completes while compaction is running", async () => {
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "goal-transition",
+				objective: "Finish before compaction ends",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: 0,
+				updatedAt: 0,
+			},
+		});
+		const compactionStarted = Promise.withResolvers<void>();
+		const releaseCompaction = Promise.withResolvers<void>();
+		compactSpy.mockImplementationOnce(async preparation => {
+			compactionStarted.resolve();
+			await releaseCompaction.promise;
+			return {
+				summary: "compacted",
+				shortSummary: undefined,
+				firstKeptEntryId: preparation.firstKeptEntryId,
+				tokensBefore: preparation.tokensBefore,
+				details: {},
+			};
+		});
+		seedCompactionHistory();
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		const compactionRun = compact();
+		await compactionStarted.promise;
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "goal-transition",
+				objective: "Finish before compaction ends",
+				status: "complete",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: 0,
+				updatedAt: 1,
+			},
+		});
+		releaseCompaction.resolve();
+		await compactionRun;
+		expect(promptSpy).not.toHaveBeenCalled();
+	});
 	it("skips synthetic auto-continue when the only goal is paused", async () => {
 		session.setGoalModeState({
 			enabled: true,
@@ -180,6 +229,48 @@ describe("AgentSession state-aware compaction", () => {
 		await compact();
 		expect(promptSpy).not.toHaveBeenCalled();
 		expect(notices).toContain("Auto-continue skipped: no unfinished work detected");
+	});
+
+	it("ignores an active stored goal when goal mode is disabled", async () => {
+		session.setGoalModeState({
+			enabled: false,
+			mode: "active",
+			goal: {
+				id: "goal-disabled",
+				objective: "Disabled goal must not authorize work",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: 0,
+				updatedAt: 0,
+			},
+		});
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		await compact();
+		expect(promptSpy).not.toHaveBeenCalled();
+	});
+
+	it("installs the auto-compaction abort controller before asynchronous state reads", async () => {
+		const stateReadStarted = Promise.withResolvers<void>();
+		const releaseStateRead = Promise.withResolvers<void>();
+		vi.spyOn(activeStateModule, "readVisibleSkillActiveState").mockImplementationOnce(async () => {
+			stateReadStarted.resolve();
+			await releaseStateRead.promise;
+			return null;
+		});
+		const message = assistantMessage();
+		sessionManager.appendMessage(message);
+		session.agent.emitExternalEvent({ type: "message_end", message });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [message] });
+		await stateReadStarted.promise;
+		expect(session.isCompacting).toBe(true);
+		session.abortCompaction();
+		releaseStateRead.resolve();
+		await session.waitForIdle();
+		await Bun.sleep(25);
+		await session.waitForIdle();
+		expect(compactSpy).not.toHaveBeenCalled();
+		expect(session.isCompacting).toBe(false);
 	});
 
 	it("passes active goal and open todos to the summarizer", async () => {
@@ -269,6 +360,13 @@ describe("AgentSession state-aware compaction", () => {
 
 	it("continues synthetic auto-continue for an active nonterminal workflow", async () => {
 		await seedActiveSkillState("active");
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		await compact();
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("continues synthetic auto-continue for a resolvable Ultragoal blocker", async () => {
+		await seedActiveSkillState("blocked");
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
 		await compact();
 		expect(promptSpy).toHaveBeenCalledTimes(1);

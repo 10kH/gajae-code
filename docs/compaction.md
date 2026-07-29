@@ -126,7 +126,7 @@ Default prune policy:
 - Protect newest `40_000` tool-output tokens.
 - Protect the newest `2` real user turns (`protectRecentTurns`; user or bashExecution boundaries) — nothing in those turns is pruned, including stale-classified entries.
 - Require at least `20_000` total estimated savings.
-- Never prune tool results from `skill` or `read` (a `read` result loses immunity only when a later read provably covers it — exact same-target repeats or explicit bounded ranges that contain the earlier explicit ranges; open-ended and `:raw` selectors never claim range coverage).
+- Never prune tool results from `skill` or `read` (a `read` result loses immunity only when a later read provably covers it — exact same-target repeats or explicit bounded ranges that contain the earlier explicit ranges; open-ended, `:raw`, `:conflicts`, and multi-range selectors never claim range coverage).
 
 Pruned tool results are replaced with a notice that keeps the highest-signal fields, error-first (exit status, error line, path hint, then tail/counts), under an absolute digest budget:
 
@@ -143,7 +143,7 @@ Auto and manual compaction append best-effort session-state lines to the summari
 
 ### Unfinished-work-gated auto-continue
 
-When `compaction.autoContinue` is enabled, the post-compaction synthetic continue prompt is only scheduled when there is evidence of unfinished work: an active (non-complete/non-dropped) goal, pending/in-progress todos, queued messages, or an overflow/mid-run retry. Otherwise the continue is skipped with an info notice, avoiding a full cold-context request after already-completed work.
+When `compaction.autoContinue` is enabled, the post-compaction synthetic continue prompt is only scheduled when there is evidence of unfinished work: a goal whose status is exactly `active`, pending/in-progress todos, queued messages, the most recent assistant turn stopping on `length`, or a recognized workflow skill in an active nonterminal phase. Paused goals, terminal phases, explicitly continuation-inert integration phases, and unknown skills/phases do not qualify. Generic Ultragoal `blocked` remains active because blockers may be autonomously resolvable; a verified human wait is represented by a paused inline goal. When no qualifying evidence remains, continuation is skipped with an info notice, avoiding a full cold-context request after already-completed work.
 
 ### Boundary and cut-point logic
 

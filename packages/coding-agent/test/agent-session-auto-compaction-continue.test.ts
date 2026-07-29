@@ -152,6 +152,39 @@ describe("AgentSession auto-compaction continuation", () => {
 		expect(promptSpy.mock.invocationCallOrder[0]).toBeGreaterThan(0);
 	});
 
+	it("appends canonical work state to hook-provided compaction summaries", async () => {
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "goal-hook-summary",
+				objective: "Preserve hook compaction state",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: 0,
+				updatedAt: 0,
+			},
+		});
+		for (let index = 0; index < 8; index++) {
+			sessionManager.appendMessage({
+				role: "user",
+				content: "hook summary context ".repeat(10_000),
+				timestamp: Date.now() + index,
+			});
+		}
+		vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		await driveCompaction();
+		await advancePostPrompt(50);
+		await session.waitForIdle();
+		const compactionEntry = sessionManager.getBranch().findLast(entry => entry.type === "compaction");
+		if (compactionEntry?.type !== "compaction") throw new Error("Expected compaction entry");
+		expect(compactionEntry.summary).toContain("compacted");
+		expect(compactionEntry.summary).toContain("<compaction-state>");
+		expect(compactionEntry.summary).toContain("Active goal: Preserve hook compaction state");
+		expect(compactionEntry.summary).toContain("Open todos: Keep working");
+	});
+
 	it("discards the compaction-triggering agent_end so it never leaks as terminal readiness", async () => {
 		// Regression: the async event-handler / extension barriers added to defer
 		// agent_end must not resurrect the pre-compaction turn's agent_end after
