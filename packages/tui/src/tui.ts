@@ -2958,18 +2958,22 @@ export class TUI extends Container {
 				// replacement, eviction, or object deletion). Keep the last resolved frame
 				// instead of silently reinterpreting manual intent as a numeric viewport.
 				const retainedLines = this.#previousLines.length > 0 ? this.#previousLines : newLines;
-				this.#repaintViewportFromLines(
-					retainedLines,
-					width,
-					height,
-					this.#manualViewportTop,
-					null,
-					"unresolved semantic viewport render",
-					true,
-					undefined,
-					false,
-					previousKittyPlacementSpans,
-				);
+				if (
+					this.#repaintViewportFromLines(
+						retainedLines,
+						width,
+						height,
+						this.#manualViewportTop,
+						null,
+						"unresolved semantic viewport render",
+						true,
+						undefined,
+						false,
+						previousKittyPlacementSpans,
+					)
+				) {
+					this.#kittyPlacementSpans = previousKittyPlacementSpans;
+				}
 				this.#previousWidth = width;
 				this.#previousHeight = height;
 				return;

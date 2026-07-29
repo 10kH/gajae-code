@@ -531,13 +531,24 @@ export function extractKittyPlacementReferences(line: string): KittyPlacementRef
 			if (separator > 0) params.set(part.slice(0, separator), part.slice(separator + 1));
 		}
 		if (params.get("a") !== "p") continue;
-		const imageId = Number.parseInt(params.get("i") ?? "", 10);
-		const placementId = Number.parseInt(params.get("p") ?? "", 10);
-		const rows = Number.parseInt(params.get("r") ?? "1", 10);
-		if (!Number.isSafeInteger(imageId) || imageId <= 0 || !Number.isSafeInteger(placementId) || placementId <= 0) {
+		const imageIdRaw = params.get("i") ?? "";
+		const placementIdRaw = params.get("p") ?? "";
+		const rowsRaw = params.get("r") ?? "1";
+		if (!/^\d+$/u.test(imageIdRaw) || !/^\d+$/u.test(placementIdRaw) || !/^\d+$/u.test(rowsRaw)) continue;
+		const imageId = Number(imageIdRaw);
+		const placementId = Number(placementIdRaw);
+		const rows = Number(rowsRaw);
+		if (
+			!Number.isSafeInteger(imageId) ||
+			imageId <= 0 ||
+			!Number.isSafeInteger(placementId) ||
+			placementId <= 0 ||
+			!Number.isSafeInteger(rows) ||
+			rows <= 0
+		) {
 			continue;
 		}
-		placements.push({ imageId, placementId, rows: Number.isSafeInteger(rows) && rows > 0 ? rows : 1 });
+		placements.push({ imageId, placementId, rows });
 	}
 	return placements;
 }

@@ -5,9 +5,16 @@ import {
 	CURSOR_MARKER,
 	DEFAULT_WHEEL_LINES,
 	Editor,
+	encodeKittyPlacementDelete,
+	extractKittyPlacementReferences,
+	getCellDimensions,
+	Image,
 	ImageProtocol,
 	Markdown,
 	renderComponentWithViewportAnchors,
+	resetKittyTransmissions,
+	setCellDimensions,
+	setKittyTransmitWriter,
 	setTerminalImageProtocol,
 	shouldUseViewportRepaintForHost,
 	TERMINAL,
@@ -1534,6 +1541,62 @@ describe("registered viewport anchor", () => {
 			expect(visible(term).some(line => line === "history-9")).toBe(false);
 		} finally {
 			tui.stop();
+		}
+	});
+
+	it("cleans a retained Kitty placement when following live after an unresolved anchor", async () => {
+		const originalProtocol = TERMINAL.imageProtocol;
+		const originalCellDimensions = getCellDimensions();
+		setCellDimensions({ widthPx: 10, heightPx: 10 });
+		setTerminalImageProtocol(ImageProtocol.Kitty);
+		resetKittyTransmissions();
+		setKittyTransmitWriter(() => {});
+
+		const term = new VirtualTerminal(30, 6);
+		const tui = new TUI(term);
+		const transcript = new AnchoredTranscript();
+		for (let index = 0; index < 10; index++) transcript.addRow(`history-${index}`, `history-${index}`);
+		transcript.addChild(
+			new Image(
+				"AA==",
+				"image/png",
+				{ fallbackColor: value => value },
+				{ maxWidthCells: 4, maxHeightCells: 2 },
+				{ widthPx: 20, heightPx: 20 },
+			),
+		);
+		for (let index = 10; index < 30; index++) transcript.addRow(`history-${index}`, `history-${index}`);
+		tui.addChild(transcript);
+		tui.setViewportAnchorComponent(transcript);
+
+		try {
+			tui.start();
+			await settle(term);
+			expect(tui.revealViewportAnchor("history-9", "top")).toBe(true);
+			await settle(term);
+			const [placement] = extractKittyPlacementReferences(term.getWriteLog().join(""));
+			expect(placement).toBeDefined();
+
+			term.clearWriteLog();
+			transcript.removeFirst(11);
+			tui.requestRender();
+			await settle(term);
+			const retainedOutput = term.getWriteLog().join("");
+			expect(retainedOutput).toContain(encodeKittyPlacementDelete(placement!));
+			expect(extractKittyPlacementReferences(retainedOutput)).toContainEqual(placement);
+
+			term.clearWriteLog();
+			expect(tui.followLiveViewport()).toBe(true);
+			await term.flush();
+			const followedOutput = term.getWriteLog().join("");
+			expect(followedOutput).toContain(encodeKittyPlacementDelete(placement!));
+			expect(extractKittyPlacementReferences(followedOutput)).toEqual([]);
+		} finally {
+			tui.stop();
+			setCellDimensions(originalCellDimensions);
+			setTerminalImageProtocol(originalProtocol);
+			resetKittyTransmissions();
+			setKittyTransmitWriter(sequence => process.stdout.write(sequence));
 		}
 	});
 	it("retains unresolved intent through provider removal and resolves a replacement", async () => {

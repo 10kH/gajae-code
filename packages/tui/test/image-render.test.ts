@@ -2,7 +2,9 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Image } from "@gajae-code/tui/components/image";
 import {
 	type CellDimensions,
+	encodeKittyPlacementDelete,
 	encodeKittyTransmit,
+	extractKittyPlacementReferences,
 	getCellDimensions,
 	ImageProtocol,
 	isTerminalGraphicsFallbackActive,
@@ -85,6 +87,18 @@ class KittyTerminalModel {
 					if (imageKey && this.images.has(imageKey)) {
 						const placementId = params.get("p") ?? `auto${++this.#autoPlacementCounter}`;
 						this.placements.set(`${imageKey}:${placementId}`, imageKey);
+					}
+				} else if (action === "d" && params.get("d")?.toLowerCase() === "i") {
+					const imageKey = params.get("i");
+					if (imageKey) {
+						const placementId = params.get("p");
+						if (placementId) {
+							this.placements.delete(`${imageKey}:${placementId}`);
+						} else {
+							for (const key of Array.from(this.placements.keys())) {
+								if (key.startsWith(`${imageKey}:`)) this.placements.delete(key);
+							}
+						}
 					}
 				}
 			}
@@ -389,6 +403,39 @@ describe("kitty transmit/placement split (dedup on repaint)", () => {
 		expect(model.placements.size).toBe(2);
 		expect(new Set(model.placements.keys())).toEqual(placementsBefore);
 		expect(transmitted).toHaveLength(1);
+	});
+
+	it("soft-deletes only the named placement for identical-content siblings", () => {
+		const makeImage = () =>
+			new Image(
+				BASE64_DUMMY,
+				"image/png",
+				{ fallbackColor: text => text },
+				{ maxWidthCells: 10, maxHeightCells: 2 },
+				SQUARE_DIMENSIONS,
+			);
+		const componentA = makeImage();
+		const componentB = makeImage();
+		const model = new KittyTerminalModel();
+		const linesA = componentA.render(20).join("\n");
+		const linesB = componentB.render(20).join("\n");
+		for (const transmit of transmitted) model.apply(transmit);
+		model.apply(linesA);
+		model.apply(linesB);
+
+		const [placementA] = extractKittyPlacementReferences(linesA);
+		const [placementB] = extractKittyPlacementReferences(linesB);
+		expect(placementA).toBeDefined();
+		expect(placementB).toBeDefined();
+		model.apply(encodeKittyPlacementDelete(placementA!));
+
+		expect(model.images.size).toBe(1);
+		expect(new Set(model.placements.keys())).toEqual(new Set([`${placementB!.imageId}:${placementB!.placementId}`]));
+	});
+
+	it("ignores malformed Kitty placement identifiers", () => {
+		expect(extractKittyPlacementReferences("\x1b_Ga=p,i=123junk,p=7,r=2,C=1,q=2\x1b\\")).toEqual([]);
+		expect(extractKittyPlacementReferences("\x1b_Ga=p,i=123,p=7,r=2junk,C=1,q=2\x1b\\")).toEqual([]);
 	});
 
 	it("legacy a=T emission stacks placements in the terminal model (regression contrast)", () => {
