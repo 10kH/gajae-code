@@ -117,10 +117,6 @@ describe.skipIf(process.platform !== "win32")("Windows managed session directory
 		const agentDir = path.join(root, "agent");
 		await fs.mkdir(cwd);
 
-		const apply = vi.spyOn(native, "applyOwnerOnlyPathSecurity");
-		const verify = vi.spyOn(native, "verifyOwnerOnlyPathSecurity");
-		const verifyExpected = vi.spyOn(native, "verifyOwnerOnlyPathSecurityExpected");
-		const repair = vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected");
 		const firstDirectory = SessionManager.getDefaultSessionDir(cwd, agentDir);
 		const firstDestination = SessionManager.managedDestination(cwd, agentDir);
 		expect(firstDestination.directory).toBe(firstDirectory);
@@ -137,10 +133,31 @@ describe.skipIf(process.platform !== "win32")("Windows managed session directory
 				path.relative(sessionsDirectory, directory) || ".",
 			]),
 		);
-		const applyCallsBeforeSecondStartup = apply.mock.calls.length;
-		const verifyCallsBeforeSecondStartup = verify.mock.calls.length;
-		const repairCallsBeforeSecondStartup = repair.mock.calls.length;
-		const verifyExpectedCallsBeforeSecondStartup = verifyExpected.mock.calls.length;
+		// Install explicit passthrough wrappers after first-start initialization. A
+		// property-only spy does not replace the live ESM function consumed by the
+		// session modules, so it can report zero calls even while native verification
+		// runs. The passthrough preserves product behavior while observing that binding.
+		const applyImplementation = native.applyOwnerOnlyPathSecurity;
+		const verifyImplementation = native.verifyOwnerOnlyPathSecurity;
+		const verifyExpectedImplementation = native.verifyOwnerOnlyPathSecurityExpected;
+		const repairImplementation = native.repairOwnerOnlyPathSecurityExpected;
+		const apply = vi
+			.spyOn(native, "applyOwnerOnlyPathSecurity")
+			.mockImplementation((pathname, kind) => applyImplementation(pathname, kind));
+		const verify = vi
+			.spyOn(native, "verifyOwnerOnlyPathSecurity")
+			.mockImplementation((pathname, kind) => verifyImplementation(pathname, kind));
+		const verifyExpected = vi
+			.spyOn(native, "verifyOwnerOnlyPathSecurityExpected")
+			.mockImplementation((pathname, kind, expectedDev, expectedIno) =>
+				verifyExpectedImplementation(pathname, kind, expectedDev, expectedIno),
+			);
+		const repair = vi
+			.spyOn(native, "repairOwnerOnlyPathSecurityExpected")
+			.mockImplementation((pathname, kind, expectedDev, expectedIno) =>
+				repairImplementation(pathname, kind, expectedDev, expectedIno),
+			);
+		expect(native.verifyOwnerOnlyPathSecurityExpected).not.toBe(verifyExpectedImplementation);
 		const secondDirectory = SessionManager.getDefaultSessionDir(cwd, agentDir);
 		const secondDestination = SessionManager.managedDestination(cwd, agentDir);
 		expect(secondDirectory).toBe(firstDirectory);
@@ -150,19 +167,17 @@ describe.skipIf(process.platform !== "win32")("Windows managed session directory
 		await second.ensureOnDisk();
 		await second.flush();
 		await second.close();
+		expect(verifyExpected).toHaveBeenCalled();
 
-		const secondApplyCalls = apply.mock.calls.slice(applyCallsBeforeSecondStartup);
-		const secondVerifyCalls = verify.mock.calls.slice(verifyCallsBeforeSecondStartup);
-		const secondVerifyExpectedCalls = verifyExpected.mock.calls.slice(verifyExpectedCallsBeforeSecondStartup);
 		expect(
-			secondApplyCalls.filter(
+			apply.mock.calls.filter(
 				([pathname, kind]) =>
 					kind === "directory" && preExistingManagedDirectories.has(normalizedWindowsPath(pathname)),
 			),
 		).toHaveLength(0);
-		expect(repair.mock.calls.slice(repairCallsBeforeSecondStartup)).toHaveLength(0);
+		expect(repair.mock.calls).toHaveLength(0);
 		const verifiedDirectories = new Set(
-			secondVerifyExpectedCalls
+			verifyExpected.mock.calls
 				.filter(([, kind]) => kind === "directory")
 				.map(([pathname]) => normalizedWindowsPath(pathname)),
 		);
@@ -171,7 +186,7 @@ describe.skipIf(process.platform !== "win32")("Windows managed session directory
 			.map(([, relative]) => relative)
 			.sort();
 		expect(missingVerifications).toEqual([]);
-		expect(secondVerifyCalls.filter(([, kind]) => kind === "directory")).toHaveLength(0);
+		expect(verify.mock.calls.filter(([, kind]) => kind === "directory")).toHaveLength(0);
 	});
 
 	it("preserves verify-first policy through nested managed destinations", async () => {
