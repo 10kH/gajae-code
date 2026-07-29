@@ -5,6 +5,9 @@
 - User-created Telegram forum topics can now start a GJC session by selecting the home folder, choosing a verified recent work folder, or entering an explicit folder path. The selected topic is adopted by the new session without creating or deleting a separate Telegram topic.
 
 ## [Unreleased]
+### Fixed
+
+- Detached subagents spawned by the `task` tool are resumable again. The resume gate treated a missing record-level `sessionFile` as missing context even though task and managed-persistence sessions retain the descriptor consumed by the resume runner, so persisted role agents always fell back with `context_unavailable`. Resume eligibility now accepts an owner-compatible retained descriptor while preserving `not_found`, explicit `context_unavailable`, missing-runner `no_runner`, and `resume_failed` outcomes.
 - Ralplan supports opt-in automatic handoff to ultragoal or team through a durable runtime-owned final receipt, with read-only team preflight and PLANNING-STUCK dominance.
 - Subagent setup failures now retain a bounded, redacted cause through live progress, async snapshots, inspect/await, and terminal receipts instead of reporting an empty generic failure.
 - Telegram notification sound can be set to all, important, or none; the reference CLI exposes this with `--sound <all|important|none>`, defaulting to all. Important (ask/idle only) and none are explicit opt-ins for quieter notifications.
