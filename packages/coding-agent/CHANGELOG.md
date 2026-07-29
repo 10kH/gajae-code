@@ -4,6 +4,9 @@
 ### Fixed
 
 - Team Linux worker memory-guard replacement no longer holds the team task-mutation fence across the successor startup-ack wait, so concurrent `worker-startup-ack` can publish and selector-replacement no longer hangs under CI contention.
+- Kitty/Ghostty inline images no longer remain visually pinned when transcript, pinned, or overlay rows are replaced, removed, scrolled, resized, or fully repainted. The TUI now parses only bounded named placements, soft-deletes overwritten placements from the previously committed physical frame, retains transmitted pixels, and restores placements from application scrollback without retransmitting image data.
+- Reviewer `report_finding` evidence is no longer injected into caller-owned strict JTD completion data; full findings are published separately through a bounded artifact reference, and failed evidence publication now fails the task closed (#2893).
+- Managed-session startup failures now include their bounded preparation classification (and path-free native durability diagnostic when available), so Windows launch crashes no longer collapse to an unactionable generic error while filesystem paths and raw OS messages remain redacted (#3383).
 
 ### Added
 
@@ -50,6 +53,9 @@
 - Auto-retry now strips the whole trailing run of failed assistant attempts before continuing. A turn wedged by an `invalid_prompt` repair leaves two error assistant messages behind, and dropping only the last one left an assistant tail that `agent.continue()` refuses, so the retry died with "Retry continuation failed to start" and the turn was lost.
 
 - Session Observer now receives persisted subagent session paths on lifecycle and progress events, so active ralplan reviewer transcripts render instead of remaining at `No transcript entries yet`.
+### Changed
+
+- Bash tool output now keeps only the last 1 KiB when it exceeds the inline capture budget, reducing noisy model input and nudging callers toward focused commands and dedicated search tools. Users who explicitly configure `tools.artifactTailBytes` or `tools.artifactHeadBytes` can set the tail budget or opt into head+tail middle elision. Complete streams received by the Bash tool remain artifact-backed when storage is available; client-truncated ACP tails stay explicitly marked incomplete and cannot be reconstructed locally. Direct user `!` commands retain the existing shared executor window.
 
 ## [0.12.0] - 2026-07-28
 ### Resume fixes

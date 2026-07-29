@@ -1,4 +1,9 @@
-import { hasCompleteUsageCostBreakdown, type SingleResult, type TaskToolDetails } from "./types";
+import {
+	hasCompleteUsageCostBreakdown,
+	type ReviewFindingsArtifactRef,
+	type SingleResult,
+	type TaskToolDetails,
+} from "./types";
 export interface TaskRoi {
 	tokens: number;
 	contextTokens?: number;
@@ -46,6 +51,8 @@ export interface TaskResultReceipt {
 		overallCorrectness?: string;
 		findingCount: number;
 		findings?: Array<{ severity?: string; summary: string }>;
+		/** Canonical full-fidelity findings; inline summaries are display-only. */
+		findingsRef?: ReviewFindingsArtifactRef;
 	};
 	extractedToolCounts?: Record<string, number>;
 	forkContext?: SingleResult["forkContext"];
@@ -136,32 +143,34 @@ function getStatus(raw: SingleResult): TaskResultReceipt["status"] {
 
 function buildReview(raw: SingleResult): TaskResultReceipt["review"] | undefined {
 	const data = raw.extractedToolData;
-	if (!data) return undefined;
-	const yields = Array.isArray(data.yield) ? data.yield : [];
+	const findingsRef = raw.reviewFindingsRef;
+	const yields = Array.isArray(data?.yield) ? data.yield : [];
 	const reviewYield = yields
 		.map(item => (item && typeof item === "object" ? (item as { data?: unknown }).data : undefined))
 		.findLast(item => item && typeof item === "object" && "overall_correctness" in item) as
 		| { overall_correctness?: unknown }
 		| undefined;
-	const rawFindings = Array.isArray(data.report_finding) ? data.report_finding : [];
+	const rawFindings = Array.isArray(data?.report_finding) ? data.report_finding : [];
 	const findings = rawFindings.slice(0, 20).map(item => {
 		const value = item && typeof item === "object" ? (item as Record<string, unknown>) : {};
 		const severity = normalizeReviewFindingSeverity(value.severity, value.priority);
 		const summaryValue = value.summary ?? value.title ?? value.message ?? value.body ?? "finding";
 		return { severity, summary: truncateText(String(summaryValue), 200) ?? "finding" };
 	});
-	if (!reviewYield && findings.length === 0) return undefined;
+	if (!reviewYield && findings.length === 0 && !findingsRef) return undefined;
 	return {
 		overallCorrectness: truncateText(
 			typeof reviewYield?.overall_correctness === "string" ? reviewYield.overall_correctness : undefined,
 			200,
 		),
-		findingCount: rawFindings.length,
+		findingCount: findingsRef?.findingCount ?? rawFindings.length,
 		findings: findings.length > 0 ? findings : undefined,
+		findingsRef,
 	};
 }
 
 function hasReviewFindings(raw: SingleResult): boolean {
+	if (raw.reviewFindingsRef) return true;
 	const findings = raw.extractedToolData?.report_finding;
 	return Array.isArray(findings) && findings.length > 0;
 }

@@ -1,8 +1,22 @@
 import { describe, expect, test } from "bun:test";
+import { Settings } from "../../src/config/settings";
 import { truncateHead, truncateMiddleWindows } from "../../src/session/streaming-output";
-import { formatOutputNotice, outputMeta } from "../../src/tools/output-meta";
+import {
+	BASH_DEFAULT_OUTPUT_TAIL_BYTES,
+	formatOutputNotice,
+	outputMeta,
+	resolveBashOutputSinkHeadBytes,
+	resolveBashOutputSinkTailBytes,
+} from "../../src/tools/output-meta";
 
 describe("output truncation metadata plumbing", () => {
+	test("defaults Bash capture to a 1 KiB tail while preserving explicit retention budgets", () => {
+		expect(BASH_DEFAULT_OUTPUT_TAIL_BYTES).toBe(1024);
+		expect(resolveBashOutputSinkTailBytes(Settings.isolated())).toBe(1024);
+		expect(resolveBashOutputSinkTailBytes(Settings.isolated({ "tools.artifactTailBytes": 7 }))).toBe(7 * 1024);
+		expect(resolveBashOutputSinkHeadBytes(Settings.isolated())).toBe(0);
+		expect(resolveBashOutputSinkHeadBytes(Settings.isolated({ "tools.artifactHeadBytes": 7 }))).toBe(7 * 1024);
+	});
 	test("forwards noticeOwner on ordinary truncation builders", () => {
 		const result = truncateHead("one\ntwo\nthree", { maxLines: 2, maxBytes: 100 });
 		const meta = outputMeta().truncation(result, { direction: "head", noticeOwner: "body" }).get();
