@@ -416,8 +416,7 @@ export function needsDarwinArm64TabWorkerSmoke(paths: readonly string[]): boolea
 // Linux shard cannot verify the ENOENT fix; dev-ci consumes this emitted flag to
 // run and require the windows-latest job whenever any of these change.
 export function isWindowsSessionPathRegressionPath(changedPath: string): boolean {
-	return changedPath === ".github/workflows/dev-ci.yml" ||
-		changedPath === "packages/coding-agent/src/session/internal/managed-session-scope.ts" ||
+	return changedPath === "packages/coding-agent/src/session/internal/managed-session-scope.ts" ||
 		changedPath === "packages/coding-agent/src/session/internal/managed-session-storage.ts" ||
 		changedPath === "packages/coding-agent/src/session/blob-store.ts" ||
 		changedPath === "packages/coding-agent/src/sdk/session-directory.ts" ||

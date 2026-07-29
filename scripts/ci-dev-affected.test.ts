@@ -64,8 +64,10 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		const guard = workflow.slice(guardStart, guardEnd);
 		expect(guardStart).toBeGreaterThan(0);
 		expect(guard).toContain("if: ${{ github.event_name == 'pull_request' }}");
-		expect(guard).toContain('git fetch --no-tags origin "${GITHUB_BASE_SHA}"');
-		expect(guard).toContain('git merge-base --is-ancestor "${GITHUB_BASE_SHA}" HEAD');
+		expect(guard).toContain('if ! git fetch --no-tags origin "${GITHUB_BASE_SHA}"; then');
+		expect(guard).toContain("Could not fetch immutable event base ${GITHUB_BASE_SHA}");
+		expect(guard).toContain('if git merge-base --is-ancestor "${GITHUB_BASE_SHA}" HEAD; then');
+		expect(guard).toContain("merge-base exit ${status}");
 		expect(guard).toContain("rebase onto current ${GITHUB_BASE_REF}");
 	});
 
@@ -1062,7 +1064,6 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 
 	test("routes the Windows session-path regression for session I/O sources and its regression test", () => {
 		for (const changedPath of [
-			".github/workflows/dev-ci.yml",
 			"packages/coding-agent/src/session/internal/managed-session-scope.ts",
 			"packages/coding-agent/src/session/internal/managed-session-storage.ts",
 			"packages/coding-agent/src/session/blob-store.ts",
