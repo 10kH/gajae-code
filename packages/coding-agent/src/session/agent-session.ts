@@ -7996,6 +7996,7 @@ export class AgentSession {
 		const preflightSignal = this.#promptPreflightAbortController.signal;
 		const rosterClaim = this.#claimIrcRosterCandidate();
 		let hasPendingNextTurnMessages = false;
+		let pendingNextTurnMessageCount = 0;
 		let hindsightRecall: string | undefined;
 		try {
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
@@ -8087,12 +8088,11 @@ export class AgentSession {
 			}
 
 			// Inject any pending "nextTurn" messages as context alongside the user message
-			hasPendingNextTurnMessages = this.#pendingNextTurnMessages.length > 0;
-			for (const msg of this.#pendingNextTurnMessages) {
+			pendingNextTurnMessageCount = this.#pendingNextTurnMessages.length;
+			hasPendingNextTurnMessages = pendingNextTurnMessageCount > 0;
+			for (const msg of this.#pendingNextTurnMessages.slice(0, pendingNextTurnMessageCount)) {
 				messages.push(msg);
 			}
-			this.#pendingNextTurnMessages = [];
-			if (this.#cancelAndSubmitInProgress) this.#cancelAndSubmitPendingNextTurnDrained = true;
 
 			// Auto-read @filepath mentions
 			const fileMentions = extractFileMentions(expandedText);
@@ -8217,6 +8217,10 @@ export class AgentSession {
 				return;
 			}
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
+			if (pendingNextTurnMessageCount > 0) {
+				this.#pendingNextTurnMessages.splice(0, pendingNextTurnMessageCount);
+			}
+			if (this.#cancelAndSubmitInProgress) this.#cancelAndSubmitPendingNextTurnDrained = true;
 			await this.#promptAgentWithIdleRetry(messages, agentPromptOptions, predecessorAgentEndHold);
 			const terminalAssistant = this.#findLastAssistantMessage();
 			if (
