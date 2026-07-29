@@ -1544,7 +1544,7 @@ describe("registered viewport anchor", () => {
 		}
 	});
 
-	it("cleans a retained Kitty placement when following live after an unresolved anchor", async () => {
+	it("tracks retained and replacement Kitty placements across unresolved follow-live", async () => {
 		const originalProtocol = TERMINAL.imageProtocol;
 		const originalCellDimensions = getCellDimensions();
 		setCellDimensions({ widthPx: 10, heightPx: 10 });
@@ -1565,7 +1565,11 @@ describe("registered viewport anchor", () => {
 				{ widthPx: 20, heightPx: 20 },
 			),
 		);
-		for (let index = 10; index < 30; index++) transcript.addRow(`history-${index}`, `history-${index}`);
+		let firstLiveRow: Text | undefined;
+		for (let index = 10; index < 20; index++) {
+			const row = transcript.addRow(`history-${index}`, `history-${index}`);
+			if (index === 10) firstLiveRow = row;
+		}
 		tui.addChild(transcript);
 		tui.setViewportAnchorComponent(transcript);
 
@@ -1574,23 +1578,44 @@ describe("registered viewport anchor", () => {
 			await settle(term);
 			expect(tui.revealViewportAnchor("history-9", "top")).toBe(true);
 			await settle(term);
-			const [placement] = extractKittyPlacementReferences(term.getWriteLog().join(""));
-			expect(placement).toBeDefined();
+			const [retainedPlacement] = extractKittyPlacementReferences(term.getWriteLog().join(""));
+			expect(retainedPlacement).toBeDefined();
 
 			term.clearWriteLog();
 			transcript.removeFirst(11);
+			transcript.addChild(
+				new Image(
+					"AQ==",
+					"image/png",
+					{ fallbackColor: value => value },
+					{ maxWidthCells: 4, maxHeightCells: 2 },
+					{ widthPx: 20, heightPx: 20 },
+				),
+			);
+			for (let index = 0; index < 4; index++) transcript.addRow(`tail-${index}`, `tail-${index}`);
 			tui.requestRender();
 			await settle(term);
 			const retainedOutput = term.getWriteLog().join("");
-			expect(retainedOutput).toContain(encodeKittyPlacementDelete(placement!));
-			expect(extractKittyPlacementReferences(retainedOutput)).toContainEqual(placement);
+			expect(retainedOutput).toContain(encodeKittyPlacementDelete(retainedPlacement!));
+			expect(extractKittyPlacementReferences(retainedOutput)).toContainEqual(retainedPlacement);
 
 			term.clearWriteLog();
 			expect(tui.followLiveViewport()).toBe(true);
 			await term.flush();
 			const followedOutput = term.getWriteLog().join("");
-			expect(followedOutput).toContain(encodeKittyPlacementDelete(placement!));
-			expect(extractKittyPlacementReferences(followedOutput)).toEqual([]);
+			expect(followedOutput).toContain(encodeKittyPlacementDelete(retainedPlacement!));
+			const [replacementPlacement] = extractKittyPlacementReferences(followedOutput);
+			expect(replacementPlacement).toBeDefined();
+			expect(replacementPlacement?.imageId).not.toBe(retainedPlacement?.imageId);
+
+			term.clearWriteLog();
+			firstLiveRow!.setText("history-10 updated");
+			transcript.addRow("tail-4", "tail-4");
+			tui.requestRender();
+			await settle(term);
+			const grownOutput = term.getWriteLog().join("");
+			expect(grownOutput).toContain(encodeKittyPlacementDelete(replacementPlacement!));
+			expect(extractKittyPlacementReferences(grownOutput)).toEqual([]);
 		} finally {
 			tui.stop();
 			setCellDimensions(originalCellDimensions);

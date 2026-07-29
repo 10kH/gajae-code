@@ -660,6 +660,7 @@ export class TUI extends Container {
 	 */
 	#previousRaw: string[] = [];
 	#kittyPlacementSpans: KittyPlacementSpan[] = [];
+	#latestKittyPlacementSpans: KittyPlacementSpan[] = [];
 	#lineNormalizationCache = new Map<string, LineNormalizationCacheEntry>();
 	#lineEmitWidthCache = new Map<string, number>();
 	#lineTruncationCache = new Map<string, string>();
@@ -1181,6 +1182,7 @@ export class TUI extends Container {
 				this.#paintedManualOutputNotice = false;
 				this.#lastCursorPosition = liveCursorPosition;
 				this.#previousLines = liveLines;
+				this.#kittyPlacementSpans = this.#latestKittyPlacementSpans;
 				if (this.#scrollbackResumeViewportTop === undefined) {
 					this.#nativeScrollbackViewportTop = liveViewportTop;
 				}
@@ -1623,6 +1625,8 @@ export class TUI extends Container {
 		this.#previousLines = [];
 		this.#latestRenderedLines = [];
 		this.#previousRaw = [];
+		this.#kittyPlacementSpans = [];
+		this.#latestKittyPlacementSpans = [];
 		this.#lineNormalizationCache.clear();
 		this.#lineTruncationCache.clear();
 		this.#lineEmitWidthCache.clear();
@@ -2902,6 +2906,7 @@ export class TUI extends Container {
 			if (usedWindowNormalize) renderMetrics.recordLineCount("offscreenScan", diffStart);
 		}
 		this.#latestRenderedLines = newLines;
+		this.#latestKittyPlacementSpans = nextKittyPlacementSpans;
 		this.#kittyPlacementSpans = nextKittyPlacementSpans;
 		this.#manualTranscriptLineCount = sourceTranscriptLineCount;
 		this.#manualSuffixLineCount = Math.max(0, newLines.length - sourceTranscriptLineCount);
