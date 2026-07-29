@@ -187,4 +187,44 @@ describe.skipIf(process.platform !== "win32")("Windows managed session directory
 			),
 		).toBe(true);
 	});
+
+	it("surfaces a path-free native security classification for the tombstones directory", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-directory-windows-diagnostic-"));
+		temporaryDirectories.push(root);
+		const cwd = path.join(root, "workspace");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd);
+
+		const first = SessionManager.managedDestination(cwd, agentDir);
+		const tombstones = path.join(first.directory, ".gjc-managed-session-internal", "tombstones");
+		const verifyExpected = native.verifyOwnerOnlyPathSecurityExpected;
+		const verify = vi
+			.spyOn(native, "verifyOwnerOnlyPathSecurityExpected")
+			.mockImplementation((pathname, kind, expectedDev, expectedIno) =>
+				path.resolve(pathname) === path.resolve(tombstones)
+					? { ok: false, code: "acl_denied", operation: "query", attribute: "access" }
+					: verifyExpected(pathname, kind, expectedDev, expectedIno),
+			);
+
+		let failure: unknown;
+		try {
+			SessionManager.managedDestination(cwd, agentDir);
+		} catch (error) {
+			failure = error;
+		} finally {
+			verify.mockRestore();
+		}
+
+		expect(failure).toBeInstanceOf(Error);
+		const startupError = failure as Error;
+		expect(startupError.message).toBe(
+			"Could not prepare managed session scope (acl_denied: prepare:tombstones_directory).",
+		);
+		expect(startupError.message).not.toContain(tombstones);
+		expect(JSON.stringify(startupError.cause)).not.toContain(first.directory);
+		expect(startupError.cause).toEqual({
+			classification: "acl_denied",
+			diagnostic: "prepare:tombstones_directory",
+		});
+	});
 });
