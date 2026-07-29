@@ -276,6 +276,23 @@ describe("compaction pruning QA red-team gates", () => {
 		expect((dense.message as ToolResultMessage).prunedAt).toBeUndefined();
 	});
 
+	test("C3 rejects numeric artifact references with trailing line terminators", () => {
+		const output = result("artifact-newline", "bash");
+		const original = textOf(output);
+		expect(() =>
+			pruneToolOutputs(
+				[output],
+				{ ...EAGER, protectedTools: [] },
+				{
+					artifactRefMaxChars: 64,
+					artifactRef: () => "artifact://123\n",
+				},
+			),
+		).toThrow("numeric artifact://<id>");
+		expect(textOf(output)).toBe(original);
+		expect((output.message as ToolResultMessage).prunedAt).toBeUndefined();
+	});
+
 	test("C3 ASCII max-length planning never overstates final savings", () => {
 		const estimateEntry = result("artifact-estimate", "bash");
 		const actualEntry = result("artifact-actual", "bash");

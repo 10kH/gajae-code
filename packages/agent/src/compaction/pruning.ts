@@ -311,7 +311,7 @@ function buildAssistantArgumentStalenessIndex(entries: SessionEntry[]): Assistan
  * `:raw`, `:conflicts`), possibly stacked (`:2-4:raw`). Stripped to resolve
  * the underlying file for edit invalidation.
  */
-const READ_SELECTOR_SUFFIX = /:(?:raw|conflicts|\d+(?:[-+]\d+)?(?:,\d+(?:[-+]\d+)?)*)$/;
+const READ_SELECTOR_SUFFIX = /:(?:raw|conflicts|\d+(?:(?:\+\d+)|(?:-\d*))?(?:,\d+(?:(?:\+\d+)|(?:-\d*))?)*)$/;
 
 /** Base file path of a read target with any line/mode selectors stripped. */
 function readBasePath(path: string): string {
@@ -327,7 +327,7 @@ type ReadLineRange = { start: number; end: number };
 /** Parse only explicit, provably bounded trailing read ranges. */
 function readLineRanges(path: string): ReadLineRange[] {
 	if (/(?:^|:)(?:raw|conflicts)(?:$|:)/.test(path)) return [];
-	const match = path.match(/:(\d+(?:[-+]\d+)?(?:,\d+(?:[-+]\d+)?)*)$/);
+	const match = path.match(/:(\d+(?:(?:\+\d+)|(?:-\d*))?(?:,\d+(?:(?:\+\d+)|(?:-\d*))?)*)$/);
 	if (!match) return [];
 	return match[1].split(",").flatMap(part => {
 		const range = part.match(/^(\d+)([-+])(\d+)$/);
@@ -838,7 +838,11 @@ export function shouldRunMaintenancePrune(args: {
 }
 
 const MAX_ARTIFACT_REF_CHARS = 16_384;
-const ARTIFACT_REF_PATTERN = /^artifact:\/\/\d+$/;
+const ARTIFACT_REF_PREFIX_PATTERN = /^artifact:\/\/\d+/;
+
+function isValidArtifactRef(value: string): boolean {
+	return ARTIFACT_REF_PREFIX_PATTERN.exec(value)?.[0] === value;
+}
 
 export interface PruneToolOutputsOptions {
 	/** Lower the usual minimum only when the caller is already over its compaction threshold. */
@@ -923,7 +927,7 @@ export function pruneToolOutputs(
 	const maxArtifactChars = artifactRefMaxChars(options);
 	const candidatesWithArtifacts = plannedCandidates.map(candidate => {
 		const artifact = candidate.complete ? options.artifactRef?.(candidate.original) : undefined;
-		if (artifact !== undefined && !ARTIFACT_REF_PATTERN.test(artifact)) {
+		if (artifact !== undefined && !isValidArtifactRef(artifact)) {
 			throw new Error(
 				`artifactRef must be a numeric artifact://<id> reference for entry ${candidate.original.entryId}`,
 			);

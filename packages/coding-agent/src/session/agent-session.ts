@@ -4364,6 +4364,30 @@ export class AgentSession {
 
 	#scheduleAutoContinuePrompt(generation: number, requireUnfinishedWork = true): void {
 		const predecessorAgentEndHold = this.#reserveDeferredAgentEndForContinuation();
+		const scheduledGeneration = generation;
+		const signal = this.#postPromptTasksAbortController.signal;
+		const continuationAuthorized = async (hasPendingNextTurnMessages = false): Promise<boolean> => {
+			const snapshot = await this.#compactionStateSnapshot();
+			if (signal.aborted) {
+				this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
+				return false;
+			}
+			if (this.#isDisposed || this.#promptGeneration !== scheduledGeneration) {
+				this.#logCompactionContinuationSkipped(
+					"auto_continue_prompt",
+					this.#isDisposed ? "session_disposed" : "generation_changed",
+				);
+				return false;
+			}
+			const authorized = requireUnfinishedWork
+				? this.#hasUnfinishedWork(snapshot) || hasPendingNextTurnMessages
+				: snapshot.queuedMessages ||
+					hasPendingNextTurnMessages ||
+					snapshot.lastAssistantStopReason === "length" ||
+					snapshot.goal?.status !== "paused";
+			if (!authorized) this.emitNotice("info", "Auto-continue skipped: no unfinished work detected");
+			return authorized;
+		};
 		const continuePrompt = async () => {
 			await this.#promptWithMessage(
 				{
@@ -4377,11 +4401,10 @@ export class AgentSession {
 					skipPostPromptRecoveryWait: true,
 					skipCompactionCheck: true,
 					predecessorAgentEndHold,
+					onFinalPreflight: ({ hasPendingNextTurnMessages }) => continuationAuthorized(hasPendingNextTurnMessages),
 				},
 			);
 		};
-		const scheduledGeneration = generation;
-		const signal = this.#postPromptTasksAbortController.signal;
 		const scheduleAttempt = (delayMs = 0) => {
 			const attempt = (async () => {
 				let rescheduled = false;
@@ -4396,24 +4419,7 @@ export class AgentSession {
 						this.#logCompactionContinuationSkipped("auto_continue_prompt", "generation_changed");
 						return;
 					}
-					if (requireUnfinishedWork) {
-						const snapshot = await this.#compactionStateSnapshot();
-						if (signal.aborted) {
-							this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
-							return;
-						}
-						if (this.#isDisposed || this.#promptGeneration !== scheduledGeneration) {
-							this.#logCompactionContinuationSkipped(
-								"auto_continue_prompt",
-								this.#isDisposed ? "session_disposed" : "generation_changed",
-							);
-							return;
-						}
-						if (!this.#hasUnfinishedWork(snapshot)) {
-							this.emitNotice("info", "Auto-continue skipped: no unfinished work detected");
-							return;
-						}
-					}
+					if (!(await continuationAuthorized())) return;
 					await continuePrompt();
 				} catch (error) {
 					if (signal.aborted) {
@@ -7973,6 +7979,7 @@ export class AgentSession {
 			predecessorAgentEndHold?: symbol;
 			admissionLease?: SessionAdmissionLease;
 			onRunAccepted?: () => void;
+			onFinalPreflight?: (context: { hasPendingNextTurnMessages: boolean }) => Promise<boolean>;
 			resetRetryReplaySafety?: boolean;
 		},
 	): Promise<void> {
@@ -7988,6 +7995,7 @@ export class AgentSession {
 		const generation = this.#promptGeneration;
 		const preflightSignal = this.#promptPreflightAbortController.signal;
 		const rosterClaim = this.#claimIrcRosterCandidate();
+		let hasPendingNextTurnMessages = false;
 		let hindsightRecall: string | undefined;
 		try {
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
@@ -8079,6 +8087,7 @@ export class AgentSession {
 			}
 
 			// Inject any pending "nextTurn" messages as context alongside the user message
+			hasPendingNextTurnMessages = this.#pendingNextTurnMessages.length > 0;
 			for (const msg of this.#pendingNextTurnMessages) {
 				messages.push(msg);
 			}
@@ -8203,6 +8212,10 @@ export class AgentSession {
 			};
 			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 			else options?.onPreflightAccepted?.();
+			if (options?.onFinalPreflight && !(await options.onFinalPreflight({ hasPendingNextTurnMessages }))) {
+				this.#resetInjectedContextSignatures();
+				return;
+			}
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 			await this.#promptAgentWithIdleRetry(messages, agentPromptOptions, predecessorAgentEndHold);
 			const terminalAssistant = this.#findLastAssistantMessage();
@@ -9098,7 +9111,9 @@ export class AgentSession {
 			});
 		}
 		try {
-			const state = await readVisibleSkillActiveState(this.sessionManager.getCwd(), this.sessionId);
+			const state = await readVisibleSkillActiveState(this.sessionManager.getCwd(), this.sessionId, {
+				bypassCache: true,
+			});
 			snapshot.activeSkills = (state?.active_skills ?? [])
 				.filter(entry => entry.active !== false)
 				.slice(0, 5)
@@ -9109,7 +9124,7 @@ export class AgentSession {
 			});
 		}
 		try {
-			snapshot.queuedMessages = this.agent.hasQueuedMessages();
+			snapshot.queuedMessages = this.agent.hasQueuedMessages() || this.#pendingNextTurnMessages.length > 0;
 		} catch (error) {
 			logger.warn("Failed to read queued-message state for compaction snapshot", {
 				error: error instanceof Error ? error.message : String(error),

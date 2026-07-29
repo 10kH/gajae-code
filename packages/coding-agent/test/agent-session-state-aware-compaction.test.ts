@@ -207,6 +207,41 @@ describe("AgentSession state-aware compaction", () => {
 		await compactionRun;
 		expect(promptSpy).not.toHaveBeenCalled();
 	});
+
+	it("rechecks goal state after before-agent-start contributors run", async () => {
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "goal-final-preflight",
+				objective: "Complete during prompt preflight",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: 0,
+				updatedAt: 0,
+			},
+		});
+		session.registerBeforeAgentStartContributor(async () => {
+			session.setGoalModeState({
+				enabled: true,
+				mode: "active",
+				goal: {
+					id: "goal-final-preflight",
+					objective: "Complete during prompt preflight",
+					status: "complete",
+					tokensUsed: 0,
+					timeUsedSeconds: 0,
+					createdAt: 0,
+					updatedAt: 1,
+				},
+			});
+			return undefined;
+		});
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		await compact();
+		expect(promptSpy).not.toHaveBeenCalled();
+	});
 	it("skips synthetic auto-continue for a paused goal with a blocked Ultragoal workflow", async () => {
 		await seedActiveSkillState("blocked");
 		session.setGoalModeState({

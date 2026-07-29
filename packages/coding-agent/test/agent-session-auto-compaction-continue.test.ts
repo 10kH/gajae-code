@@ -234,6 +234,33 @@ describe("AgentSession auto-compaction continuation", () => {
 		).toBe(false);
 	});
 
+	it("overflow retry stays parked for a paused human-wait goal", async () => {
+		session.setGoalModeState({
+			enabled: false,
+			mode: "active",
+			goal: {
+				id: "goal-overflow-paused",
+				objective: "Wait for human input",
+				status: "paused",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: 0,
+				updatedAt: 0,
+			},
+		});
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		const overflow = assistantMessage({
+			stopReason: "error",
+			errorMessage: "prompt is too long: 1000001 tokens > 1000000 maximum",
+		});
+		await driveCompaction(overflow);
+		await advancePostPrompt(50);
+		await session.waitForIdle();
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(promptSpy).not.toHaveBeenCalled();
+	});
+
 	it("overflow with compaction disabled skips compaction and starts one synthetic auto-continue prompt", async () => {
 		await session.dispose();
 		authStorage.close();

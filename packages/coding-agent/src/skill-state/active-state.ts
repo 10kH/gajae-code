@@ -641,6 +641,8 @@ async function mergeVisibleEntries(
 export type VisibleSkillActiveStateCacheTier = "security" | "hud";
 export interface ReadVisibleSkillActiveStateOptions {
 	tier?: VisibleSkillActiveStateCacheTier;
+	/** Bypass all signature/TTL caches for authorization decisions. */
+	bypassCache?: boolean;
 }
 
 interface ActiveStateStatSignature {
@@ -773,6 +775,10 @@ export async function readVisibleSkillActiveState(
 	}
 	const resolvedCwd = path.resolve(cwd);
 	const cacheKey = visibleActiveStateCacheKey(resolvedCwd, resolvedSessionId);
+	if (opts?.bypassCache) {
+		visibleSkillActiveStateCache.delete(cacheKey);
+		return await readVisibleSkillActiveStateUncached(resolvedCwd, resolvedSessionId);
+	}
 	const tier = opts?.tier ?? "security";
 	const now = Date.now();
 	const cached = visibleSkillActiveStateCache.get(cacheKey);

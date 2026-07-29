@@ -331,11 +331,13 @@ describe("staleness supersession ordering", () => {
 		const entries: SessionEntry[] = [];
 		const rangeRead = pair(entries, "c1", "read", { path: "src/a.ts:50-100" });
 		const rawRead = pair(entries, "c2", "read", { path: "src/a.ts:2-4:raw" });
+		const openRead = pair(entries, "c-open", "read", { path: "src/a.ts:50-" });
 		const otherFile = pair(entries, "c3", "read", { path: "src/b.ts:50-100" });
 		pair(entries, "c4", "edit", { path: "src/a.ts" }, 100);
 		const ids = prunedIds(entries, EAGER);
 		expect(ids).toContain(rangeRead.id);
 		expect(ids).toContain(rawRead.id);
+		expect(ids).toContain(openRead.id);
 		expect(ids).not.toContain(otherFile.id);
 	});
 
