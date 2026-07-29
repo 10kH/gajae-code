@@ -191,6 +191,36 @@ describe.skipIf(process.platform !== "linux")("managed session scope shared stic
 		expect(startupError.cause).toEqual({ classification: "binding_invalid", diagnostic: "prepare:binding_validate" });
 	});
 
+	it("preserves native security failure classification without exposing the rejected path", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const agentDir = path.dirname(sessionsRoot);
+		const verify = vi.spyOn(native, "verifyOwnerOnlyPathSecurity").mockReturnValue({
+			ok: false,
+			code: "acl_denied",
+			operation: "query",
+			attribute: "access",
+		});
+
+		let failure: unknown;
+		try {
+			SessionManager.managedDestination(cwd, agentDir);
+		} catch (error) {
+			failure = error;
+		} finally {
+			verify.mockRestore();
+		}
+
+		expect(failure).toBeInstanceOf(Error);
+		const startupError = failure as Error;
+		expect(startupError.message).toBe(
+			"Could not prepare managed session scope (acl_denied: prepare:root_authority).",
+		);
+		expect(startupError.message).not.toContain(cwd);
+		expect(startupError.message).not.toContain(scope.directoryPath);
+		expect(JSON.stringify(startupError.cause)).not.toContain(cwd);
+		expect(startupError.cause).toEqual({ classification: "acl_denied", diagnostic: "prepare:root_authority" });
+	});
+
 	it("surfaces bounded native durability diagnostics without raw path detail", async () => {
 		const { cwd, sessionsRoot } = await fixture();
 		const agentDir = path.dirname(sessionsRoot);

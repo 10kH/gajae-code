@@ -33,6 +33,7 @@ import {
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
 	type ManagedStorageLock,
+	managedSecurityFailureClassification,
 	prepareManagedDirectoryRoot,
 	publishManagedFileNoReplace,
 	publishManagedTombstone,
@@ -992,13 +993,14 @@ export function prepareManagedSessionScopeForWriteSync(
 			message === "durability_not_provable"
 				? message
 				: "binding_invalid";
+		const securityClassification = managedSecurityFailureClassification(error);
 		return {
 			kind: "error",
 			code,
 			message,
 			cause: publication
 				? { classification: publication.classification, diagnostic: publication.diagnostic }
-				: { classification: code, diagnostic: `prepare:${stage}` },
+				: { classification: securityClassification ?? code, diagnostic: `prepare:${stage}` },
 		};
 	}
 }
