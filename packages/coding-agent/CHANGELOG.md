@@ -1,6 +1,10 @@
 # Changelog
 ## [Unreleased]
 
+### Added
+
+- `gjc ultragoal quality-gate init` scaffolds a multi-surface quality-gate template (`--surface` repeatable, `--out` required) so agents can fill evidence once and use read-only `quality-gate validate` multi-error diagnostics instead of discovering missing fields one checkpoint at a time (#3474).
+
 ### Fixed
 
 - Provider retry classification prefers the typed `stream_first_event_timeout` transport fact when present, falling back to error-message regex for message-only callers (#3496).
