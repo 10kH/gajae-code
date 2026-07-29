@@ -11,12 +11,16 @@
 
 ### Fixed
 
+- Broker artifact cleanup no longer promotes a non-empty `cleanup_pending` quarantine to transcript-phase completion. The broker advances only when the retained quarantine is root-only/empty or when the lower layer returns `artifacts_removed`, so artifact bytes cannot vanish behind a success receipt (#3489).
+- POSIX parent identity reproof/fsync is now centralized before every promotable artifact-phase result, preventing a crash-window where a rename is lost after durable retirement is recorded (#3489).
+- Artifact retirement, planned paths, retained authority, and transcript retry in both managed reconciliation and deletion now bind to the newest published `pendingEvidence` attempt, preventing stranded detached transcripts at paths absent from the newest receipt after a crash (#3489).
 - Provider retry classification prefers the typed `stream_first_event_timeout` transport fact when present, falling back to error-message regex for message-only callers (#3496).
 - Detached task receipts for in-memory parent sessions no longer advertise dead `agent://` output URIs. TaskTool allocates a session-lifetime durable artifact root under the process temp directory, persists child outputs there, authorizes parent and same-session descendants for scoped resolution, and omits the URI entirely when durable allocation fails (#3471).
 - Team Linux worker memory-guard replacement no longer holds the team task-mutation fence across the successor startup-ack wait, so concurrent `worker-startup-ack` can publish and selector-replacement no longer hangs under CI contention.
 - Kitty/Ghostty inline images no longer remain visually pinned when transcript, pinned, or overlay rows are replaced, removed, scrolled, resized, or fully repainted. The TUI now parses only bounded named placements, soft-deletes overwritten placements from the previously committed physical frame, retains transmitted pixels, and restores placements from application scrollback without retransmitting image data.
 - Reviewer `report_finding` evidence is no longer injected into caller-owned strict JTD completion data; full findings are published separately through a bounded artifact reference, and failed evidence publication now fails the task closed (#2893).
 - Managed-session startup failures now include their bounded preparation classification (and path-free native durability diagnostic when available), so Windows launch crashes no longer collapse to an unactionable generic error while filesystem paths and raw OS messages remain redacted (#3383).
+- Managed-session replacement and cleanup now bind Windows destination mutation to exact native identity, keep lock acquisition/release retryable without reviving lost ownership, and report retained artifact payloads as `cleanup_pending` until only the verified root remains.
 - Single-model sessions now rotate immediately to another stored provider credential after a content-free quota or rate-limit failure, without requiring a synthetic model fallback chain. Credential rotation is replay-safe for content-free failures regardless of extension lifecycle participation, and traverses the full credential pool independent of `retry.maxRetries` (#3491).
 - External credential discovery now follows `CLAUDE_CONFIG_DIR` and `CODEX_HOME` instead of always reading `~/.claude` and `~/.codex`, so importing from an account switcher (or any relocated Claude Code / Codex CLI config root) picks up the account the launching shell selected. Both variables resolve through the credential env trust boundary and must be absolute; redacted summaries name the variable, never the resolved path.
 - The `acp_conformance` CI job runs again. The pinned upstream `acpx` checkout resolves its own imports (`@agentclientprotocol/sdk`, `zod`) from its own tree, but its dependencies were never installed, so the corpus runner aborted with `Cannot find module 'zod/v4'` before executing a single case. The checkout is now installed after provenance verification, and the reused warm cache still skips the reinstall.
@@ -27,6 +31,7 @@
 
 - User-created Telegram forum topics can now start a GJC session by selecting the home folder, choosing a verified recent work folder, or entering an explicit folder path. The selected topic is adopted by the new session without creating or deleting a separate Telegram topic.
 - The interactive terminal’s responsive IRC/todo work-lane contract now covers exact narrow/wide geometry, requested versus effective IRC visibility, direct-root pin ordering, todo lane bounds, remapped IRC toggles, and live composer shortcut hints.
+- Managed-session startup now preserves bounded Windows ACL and identity failure classifications in path-redacted recovery guidance without broadening permissions, elevation, or unsafe fallback.
 
 ## [Unreleased]
 ### Fixed

@@ -8,7 +8,7 @@ import {
 	verifyOwnerOnlyPathSecurity,
 	verifyOwnerOnlyPathSecurityExpected,
 } from "@gajae-code/natives";
-import { logger, pathIsWithin } from "@gajae-code/utils";
+import { hasFsCode, logger, pathIsWithin } from "@gajae-code/utils";
 import type { ResumeSessionIdentity } from "../session-manager";
 import {
 	FileSessionStorage,
@@ -31,6 +31,7 @@ import {
 	type ManagedFileSnapshot,
 	ManagedPublishError,
 	ManagedSessionDescendantStore,
+	ManagedSessionSecurityError,
 	type ManagedSessionSecurityPolicy,
 	type ManagedStorageLock,
 	managedSecurityFailureClassification,
@@ -127,7 +128,7 @@ function configuredRootPath(scope: ManagedScope): string {
 			const canonical = fs.realpathSync.native(candidate);
 			return suffix.length === 0 ? canonical : path.join(canonical, ...suffix);
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			if (!hasFsCode(error, "ENOENT")) throw error;
 			const parent = path.dirname(candidate);
 			if (parent === candidate) throw new Error("Configured managed root is unavailable.");
 			suffix.unshift(path.basename(candidate));
@@ -176,6 +177,23 @@ export type ManagedScopeResolution =
 			message: string;
 			cause?: { readonly classification: string; readonly diagnostic?: string };
 	  };
+
+function managedScopeFailureCause(error: unknown): { readonly classification: string } {
+	return { classification: managedSecurityFailureClassification(error) ?? "binding_invalid" };
+}
+
+const managedScopeFailureCodes = new Set([
+	"atomic_unavailable",
+	"invalid_request",
+	"durability_failed",
+	"durability_not_provable",
+]);
+
+function managedScopeFailureMessage(error: unknown, fallback: string): string {
+	const classification = managedSecurityFailureClassification(error);
+	if (classification) return classification;
+	return error instanceof Error && managedScopeFailureCodes.has(error.message) ? error.message : fallback;
+}
 
 export interface ManagedCandidate {
 	sessionId: string;
@@ -277,7 +295,7 @@ function identityFor(cwd: string): NativeIdentity {
 function verifyExistingManagedScopeDirectory(pathname: string) {
 	if (process.platform !== "win32") return verifyOwnerOnlyPathSecurity(pathname, "directory");
 	const expected = fs.lstatSync(pathname, { bigint: true });
-	if (!expected.isDirectory() || expected.isSymbolicLink()) throw new Error("Unsafe managed directory");
+	if (!expected.isDirectory() || expected.isSymbolicLink()) throw new ManagedSessionSecurityError("reparse_point");
 	const verified = verifyOwnerOnlyPathSecurityExpected(pathname, "directory", expected.dev, expected.ino);
 	const current = fs.lstatSync(pathname, { bigint: true });
 	if (
@@ -286,7 +304,7 @@ function verifyExistingManagedScopeDirectory(pathname: string) {
 		current.dev !== expected.dev ||
 		current.ino !== expected.ino
 	)
-		throw new Error("Managed session directory changed");
+		throw new ManagedSessionSecurityError("identity_mismatch");
 	return verified;
 }
 
@@ -405,8 +423,18 @@ function validateExistingBinding(scope: ManagedScope): ManagedScopeResolution | 
 	try {
 		raw = captureManagedFileNoFollow(bindingPath).bytes.toString("utf8");
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-		return { kind: "error", code: "binding_invalid", message: "The managed scope binding is invalid JSON." };
+		if (hasFsCode(error, "ENOENT")) return undefined;
+		const classification = hasFsCode(error, "EACCES")
+			? "EACCES"
+			: hasFsCode(error, "EPERM")
+				? "EPERM"
+				: "binding_invalid";
+		return {
+			kind: "error",
+			code: "binding_invalid",
+			message: "The managed scope binding is invalid JSON.",
+			cause: { classification },
+		};
 	}
 	return validateBindingRaw(scope, raw);
 }
@@ -429,14 +457,16 @@ function resolveManagedScopeInternal(
 				kind: "error",
 				code: "sessions_root_unavailable",
 				message: "The sessions root is not a safe directory.",
+				cause: { classification: "reparse_point" },
 			};
 		}
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+		if (!hasFsCode(error, "ENOENT")) {
 			return {
 				kind: "error",
 				code: "sessions_root_unavailable",
 				message: "The sessions root could not be inspected.",
+				cause: managedScopeFailureCause(error),
 			};
 		}
 	}
@@ -462,21 +492,28 @@ function resolveManagedScopeInternal(
 				kind: "error",
 				code: "sessions_root_unavailable",
 				message: "The sessions root is not a safe directory.",
+				cause: { classification: "reparse_point" },
 			};
 		}
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+		if (!hasFsCode(error, "ENOENT")) {
 			return {
 				kind: "error",
 				code: "sessions_root_unavailable",
 				message: "The sessions root could not be inspected.",
+				cause: managedScopeFailureCause(error),
 			};
 		}
 	}
 	try {
 		const directory = fs.lstatSync(scope.directoryPath);
 		if (!directory.isDirectory() || directory.isSymbolicLink()) {
-			return { kind: "error", code: "binding_invalid", message: "The managed scope path is not a safe directory." };
+			return {
+				kind: "error",
+				code: "binding_invalid",
+				message: "The managed scope path is not a safe directory.",
+				cause: { classification: "reparse_point" },
+			};
 		}
 		const security = validateNativeSecurityResult(
 			verifyExistingManagedScopeDirectory(scope.directoryPath),
@@ -488,11 +525,17 @@ function resolveManagedScopeInternal(
 				kind: "error",
 				code: "binding_invalid",
 				message: "The managed scope security could not be verified.",
+				cause: { classification: security.code ?? "acl_verify_failed" },
 			};
 		}
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-			return { kind: "error", code: "binding_invalid", message: "The managed scope path could not be inspected." };
+		if (!hasFsCode(error, "ENOENT")) {
+			return {
+				kind: "error",
+				code: "binding_invalid",
+				message: "The managed scope path could not be inspected.",
+				cause: managedScopeFailureCause(error),
+			};
 		}
 	}
 	return validateExistingBinding(scope) ?? { kind: "resolved", scope };
@@ -557,7 +600,7 @@ function fsyncManagedParent(pathname: string): void {
 		try {
 			descriptor = fs.openSync(parent, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT" && path.dirname(parent) !== parent) {
+			if (hasFsCode(error, "ENOENT") && path.dirname(parent) !== parent) {
 				parent = path.dirname(parent);
 				continue;
 			}
@@ -779,7 +822,7 @@ export async function ensureManagedScope(
 		try {
 			await publishManagedFileNoReplace(bindingPath, new TextEncoder().encode(binding), undefined, root, policy);
 		} catch (error) {
-			if ((error as Error).message !== "destination_conflict") throw error;
+			if (!(error instanceof Error) || error.message !== "destination_conflict") throw error;
 			bindingCollision = true;
 		}
 		const validated = validateExistingBinding(scope);
@@ -788,14 +831,14 @@ export async function ensureManagedScope(
 
 		const preparedDirectory = fs.lstatSync(scope.directoryPath, { bigint: true });
 		if (!preparedDirectory.isDirectory() || preparedDirectory.isSymbolicLink())
-			throw new Error("Managed session directory changed");
+			throw new ManagedSessionSecurityError("reparse_point");
 		managedDirectoryIdentities.set(scope, { dev: preparedDirectory.dev, ino: preparedDirectory.ino });
 		return { kind: "resolved", scope };
 	} catch (error) {
 		const publication = error instanceof ManagedPublishError ? error : undefined;
 		const message =
 			publication?.classification ??
-			(error instanceof Error ? error.message : "The managed scope could not be initialized.");
+			managedScopeFailureMessage(error, "The managed scope could not be initialized.");
 		const code =
 			message === "atomic_unavailable" ||
 			message === "invalid_request" ||
@@ -803,14 +846,13 @@ export async function ensureManagedScope(
 			message === "durability_not_provable"
 				? message
 				: "binding_invalid";
-
 		return {
 			kind: "error",
 			code,
 			message,
-			...(publication
-				? { cause: { classification: publication.classification, diagnostic: publication.diagnostic } }
-				: { cause: { classification: code } }),
+			cause: publication
+				? { classification: publication.classification, diagnostic: publication.diagnostic }
+				: managedScopeFailureCause(error),
 		};
 	}
 }
@@ -946,7 +988,7 @@ export function prepareManagedSessionScopeForWriteSync(
 		try {
 			store.publishNoReplaceSync(MANAGED_SESSION_BINDING_FILE, binding);
 		} catch (error) {
-			if ((error as Error).message !== "destination_conflict") throw error;
+			if (!(error instanceof Error) || error.message !== "destination_conflict") throw error;
 		}
 		stage = "binding_read";
 		const capturedBinding = store.readExpected(MANAGED_SESSION_BINDING_FILE);
@@ -984,8 +1026,7 @@ export function prepareManagedSessionScopeForWriteSync(
 	} catch (error) {
 		const publication = error instanceof ManagedPublishError ? error : undefined;
 		const message =
-			publication?.classification ??
-			(error instanceof Error ? error.message : "Managed write protocol setup failed.");
+			publication?.classification ?? managedScopeFailureMessage(error, "Managed write protocol setup failed.");
 		const code =
 			message === "atomic_unavailable" ||
 			message === "invalid_request" ||
@@ -993,14 +1034,14 @@ export function prepareManagedSessionScopeForWriteSync(
 			message === "durability_not_provable"
 				? message
 				: "binding_invalid";
-		const securityClassification = managedSecurityFailureClassification(error);
+
 		return {
 			kind: "error",
 			code,
 			message,
 			cause: publication
 				? { classification: publication.classification, diagnostic: publication.diagnostic }
-				: { classification: securityClassification ?? code, diagnostic: `prepare:${stage}` },
+				: { ...managedScopeFailureCause(error), diagnostic: `prepare:${stage}` },
 		};
 	}
 }
@@ -1763,6 +1804,14 @@ function sameArtifactTreeSnapshot(left: NativeDirectoryTreeSnapshot, right: Nati
 	return leftEntries.every((entry, index) => entry === rightEntries[index]);
 }
 
+function artifactTreePayloadAbsent(snapshot: NativeDirectoryTreeSnapshot): boolean {
+	return (
+		snapshot.entries.length === 1 &&
+		snapshot.entries[0]?.relativePath === "" &&
+		snapshot.entries[0].kind === "directory"
+	);
+}
+
 function assertRetainedArtifactsAuthority(pending: CleanupReceipt): void {
 	if (!pending.detachedArtifactsPath) return;
 	if (!pending.expectedArtifactsIdentity || !pending.expectedArtifactsTree) throw new Error("durability_failed");
@@ -1773,10 +1822,12 @@ function assertRetainedArtifactsAuthority(pending: CleanupReceipt): void {
 		throw new Error("durability_failed");
 	}
 	const observed = artifactIdentityAt(pending.detachedArtifactsPath);
+	const observedTree = snapshotArtifactTree(pending.detachedArtifactsPath);
 	if (
 		!observed ||
 		!sameArtifactRootIdentity(observed, pending.expectedArtifactsIdentity) ||
-		!sameArtifactTreeSnapshot(snapshotArtifactTree(pending.detachedArtifactsPath), pending.expectedArtifactsTree)
+		(!sameArtifactTreeSnapshot(observedTree, pending.expectedArtifactsTree) &&
+			!artifactTreePayloadAbsent(observedTree))
 	)
 		throw new Error("binding_invalid");
 }
@@ -2000,6 +2051,15 @@ function snapshotArtifactTree(pathname: string): NativeDirectoryTreeSnapshot {
 	const result = (native as unknown as NativeDirectorySnapshotApi).snapshotDirectoryTree(pathname);
 	if (!result.ok || !result.snapshot) throw new Error(result.ok ? "unsafe_artifacts" : result.code);
 	return result.snapshot;
+}
+
+function retainedArtifactPayloadAbsent(pathname: string): boolean {
+	try {
+		return artifactTreePayloadAbsent(snapshotArtifactTree(pathname));
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+		throw error;
+	}
 }
 
 function nextCleanupReceipt(target: RetiredTarget, pending: CleanupReceipt | undefined): CleanupReceipt {
@@ -2962,53 +3022,44 @@ export async function reconcileManagedTombstones(
 					}
 					if (deletion.kind === "cleanup_pending") {
 						const retry = nextCleanupReceipt(target, active);
-						await publishCleanupPending(
-							scope,
-							tombstone,
-							{
-								...retry,
-								expectedArtifactsIdentity:
-									deletion.phase === "artifacts"
-										? deletion.artifactsIdentity
-										: active.expectedArtifactsIdentity,
-								expectedArtifactsTree:
-									deletion.phase === "artifacts" ? deletion.artifactsTree : active.expectedArtifactsTree,
-								detachedArtifactsPath:
-									deletion.phase === "artifacts"
-										? deletion.detachedArtifactsPath
-										: active.detachedArtifactsPath,
+						const pendingEvidence = cleanupPendingEvidence(retry, active, deletion);
+						await publishCleanupPending(scope, tombstone, pendingEvidence, lock);
+						if (deletion.phase === "artifacts") {
+							if (!retainedArtifactPayloadAbsent(deletion.detachedArtifactsPath)) continue;
+							await publishCleanupArtifactsRemoved(scope, tombstone, pendingEvidence, lock);
+							deletion = await new FileSessionStorage().deleteSessionVerified({
+								sessionsRoot: scope.sessionsRoot,
+								transcriptPath: target.path,
+								sessionId: target.sessionId,
+								cwd: target.cwd,
+								transcriptIdentity: target.identity,
+								plannedArtifactsPath: pendingEvidence.plannedArtifactsPath,
+								plannedTranscriptPath: pendingEvidence.plannedTranscriptPath,
 								detachedTranscriptPath:
-									deletion.phase === "transcript"
-										? deletion.detachedTranscriptPath
-										: active.detachedTranscriptPath,
-								retainedArtifactsSuccessorPath:
-									deletion.phase === "artifacts"
-										? deletion.retainedSuccessorPath
-										: active.retainedArtifactsSuccessorPath,
-								retainedArtifactsPlaceholderPath:
-									deletion.phase === "artifacts"
-										? deletion.retainedPlaceholderPath
-										: active.retainedArtifactsPlaceholderPath,
-								retainedArtifactsUnknownPath:
-									deletion.phase === "artifacts"
-										? deletion.retainedUnknownPath
-										: active.retainedArtifactsUnknownPath,
-								retainedTranscriptSuccessorPath:
-									deletion.phase === "transcript"
-										? deletion.retainedSuccessorPath
-										: active.retainedTranscriptSuccessorPath,
-								retainedTranscriptPlaceholderPath:
-									deletion.phase === "transcript"
-										? deletion.retainedPlaceholderPath
-										: active.retainedTranscriptPlaceholderPath,
-								retainedTranscriptUnknownPath:
-									deletion.phase === "transcript"
-										? deletion.retainedUnknownPath
-										: active.retainedTranscriptUnknownPath,
-							},
-							lock,
-						);
-						continue;
+									pendingEvidence.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
+								retainedArtifactsSuccessorPath: pendingEvidence.retainedArtifactsSuccessorPath,
+								retainedArtifactsPlaceholderPath: pendingEvidence.retainedArtifactsPlaceholderPath,
+								retainedArtifactsUnknownPath: pendingEvidence.retainedArtifactsUnknownPath,
+								retainedTranscriptSuccessorPath: pendingEvidence.retainedTranscriptSuccessorPath,
+								retainedTranscriptPlaceholderPath: pendingEvidence.retainedTranscriptPlaceholderPath,
+								retainedTranscriptUnknownPath: pendingEvidence.retainedTranscriptUnknownPath,
+								artifactsRemoved: true,
+							});
+							if (deletion.kind === "cleanup_pending") {
+								if (
+									deletion.phase !== "transcript" ||
+									deletion.detachedTranscriptPath !== pendingEvidence.plannedTranscriptPath
+								)
+									throw new Error("durability_failed");
+								const followup = nextCleanupReceipt(target, pendingEvidence);
+								await publishCleanupPending(
+									scope,
+									tombstone,
+									cleanupPendingEvidence(followup, pendingEvidence, deletion),
+									lock,
+								);
+							}
+						}
 					}
 					fsyncManagedParent(target.path);
 					await publishCleanupCompleted(scope, tombstone, target, lock);
@@ -3022,7 +3073,7 @@ export async function reconcileManagedTombstones(
 				}
 			}
 		} finally {
-			if (lock) await lock.release().catch(() => undefined);
+			if (lock) await lock.release();
 		}
 	}
 }
@@ -3051,8 +3102,7 @@ export async function prepareManagedSessionScopeForWrite(
 	} catch (error) {
 		const publication = error instanceof ManagedPublishError ? error : undefined;
 		const message =
-			publication?.classification ??
-			(error instanceof Error ? error.message : "Managed write protocol setup failed.");
+			publication?.classification ?? managedScopeFailureMessage(error, "Managed write protocol setup failed.");
 		const code =
 			message === "atomic_unavailable" ||
 			message === "invalid_request" ||
@@ -3064,9 +3114,9 @@ export async function prepareManagedSessionScopeForWrite(
 			kind: "error",
 			code,
 			message,
-			...(publication
-				? { cause: { classification: publication.classification, diagnostic: publication.diagnostic } }
-				: { cause: { classification: code } }),
+			cause: publication
+				? { classification: publication.classification, diagnostic: publication.diagnostic }
+				: managedScopeFailureCause(error),
 		};
 	}
 }
@@ -3396,7 +3446,7 @@ export async function openManagedCandidateForWrite(
 						: "Managed migration failed.",
 		};
 	} finally {
-		if (lock) await lock.release().catch(() => undefined);
+		if (lock) await lock.release();
 	}
 }
 
@@ -3548,51 +3598,52 @@ export async function deleteManagedSessionCandidate(
 				)
 					throw new Error("durability_failed");
 				const retry = nextCleanupReceipt(target, active);
-				await publishCleanupPending(scope, tombstone, cleanupPendingEvidence(retry, active, deletion), lock);
+				const pendingEvidence = cleanupPendingEvidence(retry, active, deletion);
+				await publishCleanupPending(scope, tombstone, pendingEvidence, lock);
 				if (deletion.phase === "artifacts") {
-					// A typed retained artifact root proves durable canonical absence; advance
-					// to the transcript phase instead of stalling on the retained evidence.
-					await publishCleanupArtifactsRemoved(scope, tombstone, active, lock);
+					if (!retainedArtifactPayloadAbsent(deletion.detachedArtifactsPath))
+						return {
+							kind: "cleanup_pending",
+							tombstonePath: tombstone,
+							phase: deletion.phase,
+							message: "Exact cleanup remains pending because descriptor-bound final deletion is unavailable.",
+						};
+					await publishCleanupArtifactsRemoved(scope, tombstone, pendingEvidence, lock);
 					deletion = await new FileSessionStorage().deleteSessionVerified({
 						sessionsRoot: scope.sessionsRoot,
 						transcriptPath: target.path,
 						sessionId: target.sessionId,
 						cwd: target.cwd,
 						transcriptIdentity: target.identity,
-						plannedArtifactsPath: active.plannedArtifactsPath,
-						plannedTranscriptPath: active.plannedTranscriptPath,
-						detachedTranscriptPath: active.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
-						retainedArtifactsSuccessorPath: active.retainedArtifactsSuccessorPath,
-						retainedArtifactsPlaceholderPath: active.retainedArtifactsPlaceholderPath,
-						retainedArtifactsUnknownPath: active.retainedArtifactsUnknownPath,
-						retainedTranscriptSuccessorPath: active.retainedTranscriptSuccessorPath,
-						retainedTranscriptPlaceholderPath: active.retainedTranscriptPlaceholderPath,
-						retainedTranscriptUnknownPath: active.retainedTranscriptUnknownPath,
+						plannedArtifactsPath: pendingEvidence.plannedArtifactsPath,
+						plannedTranscriptPath: pendingEvidence.plannedTranscriptPath,
+						detachedTranscriptPath:
+							pendingEvidence.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
+						retainedArtifactsSuccessorPath: pendingEvidence.retainedArtifactsSuccessorPath,
+						retainedArtifactsPlaceholderPath: pendingEvidence.retainedArtifactsPlaceholderPath,
+						retainedArtifactsUnknownPath: pendingEvidence.retainedArtifactsUnknownPath,
+						retainedTranscriptSuccessorPath: pendingEvidence.retainedTranscriptSuccessorPath,
+						retainedTranscriptPlaceholderPath: pendingEvidence.retainedTranscriptPlaceholderPath,
+						retainedTranscriptUnknownPath: pendingEvidence.retainedTranscriptUnknownPath,
 						artifactsRemoved: true,
 					});
 					if (deletion.kind === "cleanup_pending") {
-						const followup = nextCleanupReceipt(target, active);
+						if (
+							deletion.phase !== "transcript" ||
+							deletion.detachedTranscriptPath !== pendingEvidence.plannedTranscriptPath
+						)
+							throw new Error("durability_failed");
+						const followup = nextCleanupReceipt(target, pendingEvidence);
 						await publishCleanupPending(
 							scope,
 							tombstone,
-							cleanupPendingEvidence(followup, active, deletion),
+							cleanupPendingEvidence(followup, pendingEvidence, deletion),
 							lock,
 						);
-						if (
-							deletion.phase !== "transcript" ||
-							deletion.detachedTranscriptPath !== active.plannedTranscriptPath
-						)
-							return {
-								kind: "cleanup_pending",
-								tombstonePath: tombstone,
-								phase: deletion.phase,
-								message:
-									"Exact cleanup remains pending because descriptor-bound final deletion is unavailable.",
-							};
 					}
 				}
-				// A typed retained transcript quarantine is durable canonical-absence
-				// evidence — never a terminal byte-deletion claim; complete the receipt.
+				// A retained transcript quarantine proves canonical absence and remains
+				// identity-bound in the durable pending receipt.
 			}
 			fsyncManagedParent(target.path);
 			await publishCleanupCompleted(scope, tombstone, target, lock);
@@ -3602,6 +3653,6 @@ export async function deleteManagedSessionCandidate(
 		const code = expectedFailure(error);
 		return { kind: "error", code, message: error instanceof Error ? error.message : "Managed deletion failed." };
 	} finally {
-		if (lock) await lock.release().catch(() => undefined);
+		if (lock) await lock.release();
 	}
 }
