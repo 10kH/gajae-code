@@ -15,7 +15,6 @@
 
 - User-created Telegram forum topics can now start a GJC session by selecting the home folder, choosing a verified recent work folder, or entering an explicit folder path. The selected topic is adopted by the new session without creating or deleting a separate Telegram topic.
 
-## [Unreleased]
 ### Fixed
 
 - Detached subagents spawned by the `task` tool are resumable again. The resume gate treated a missing record-level `sessionFile` as missing context even though task and managed-persistence sessions retain the descriptor consumed by the resume runner, so persisted role agents always fell back with `context_unavailable`. Resume eligibility now accepts an owner-compatible retained descriptor while preserving `not_found`, explicit `context_unavailable`, missing-runner `no_runner`, and `resume_failed` outcomes.
