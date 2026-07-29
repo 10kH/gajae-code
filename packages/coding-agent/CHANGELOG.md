@@ -20,6 +20,7 @@
 
 ### Fixed
 - Fast CLI help now advertises the active `search` built-in tool instead of the retired `grep` name.
+- `bun run restart:sdk-broker` no longer crashes with an uncaught `unknown broker operation` error when the live broker predates the `broker.shutdown` operation; the restart now falls back to an identity-fenced `SIGTERM` on the published broker pid, which stops that process through the same rollback path before the replacement is started.
 
 - Coordinator MCP now reconciles canonical structured questions from every workflow stage without misclassifying row-level gate diagnostics as malformed pagination, and unwraps accepted SDK gate-answer envelopes before reporting the terminal resolution.
 - Queued named tool choices are revalidated against the live model and active tool set before each request, preventing first-turn eager todo, resolve, or yield flows from sending a stale forced choice after preflight tool changes.

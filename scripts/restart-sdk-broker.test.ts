@@ -18,10 +18,15 @@ function deps(overrides: Partial<RestartSdkBrokerDeps> = {}): RestartSdkBrokerDe
 	return {
 		readDiscovery: async () => null,
 		shutdown: async () => {},
+		signal: () => {},
 		ensure: async () => discovery(2, "darwin:2:0"),
 		sleep: async () => {},
 		...overrides,
 	};
+}
+
+class UnknownOperationError extends Error {
+	readonly code = "unknown_operation";
 }
 
 test("starts an SDK broker when no owner is published", async () => {
@@ -87,6 +92,49 @@ test("does not start a replacement when authenticated shutdown fails", async () 
 		),
 	).rejects.toThrow("connection refused");
 	expect(ensured).toBe(false);
+});
+
+test("falls back to an identity-fenced signal when the broker lacks broker.shutdown", async () => {
+	const previous = discovery(1, "darwin:1:0");
+	const replacement = discovery(2, "darwin:2:0");
+	const discoveries = [previous, null, null];
+	const signalled: BrokerDiscoveryLike[] = [];
+	const result = await restartSdkBroker(
+		{ agentDir: "/agent" },
+		deps({
+			readDiscovery: async () => discoveries.shift() ?? null,
+			shutdown: async () => {
+				throw new UnknownOperationError("unknown broker operation");
+			},
+			signal: value => {
+				signalled.push(value);
+			},
+			ensure: async () => replacement,
+		}),
+	);
+
+	expect(signalled).toEqual([previous]);
+	expect(result).toEqual({ previousPid: 1, pid: 2 });
+});
+
+test("does not signal when authenticated shutdown fails for another reason", async () => {
+	const previous = discovery(1, "darwin:1:0");
+	let signalled = false;
+	await expect(
+		restartSdkBroker(
+			{ agentDir: "/agent" },
+			deps({
+				readDiscovery: async () => previous,
+				shutdown: async () => {
+					throw new Error("connection refused");
+				},
+				signal: () => {
+					signalled = true;
+				},
+			}),
+		),
+	).rejects.toThrow("connection refused");
+	expect(signalled).toBe(false);
 });
 
 test("does not start a replacement until the old discovery identity disappears", async () => {

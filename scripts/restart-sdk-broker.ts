@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { getAgentDir } from "@gajae-code/utils";
-import { readBrokerDiscovery } from "../packages/coding-agent/src/sdk/broker/discovery";
+import { brokerProcessIncarnation, readBrokerDiscovery } from "../packages/coding-agent/src/sdk/broker/discovery";
 import { ensureBroker } from "../packages/coding-agent/src/sdk/broker/ensure";
 import { SdkClient } from "../packages/coding-agent/src/sdk/client";
 import {
@@ -19,6 +19,10 @@ const defaultDeps: RestartSdkBrokerDeps = {
 		} finally {
 			await client.close();
 		}
+	},
+	signal: discovery => {
+		if (brokerProcessIncarnation(discovery.pid) !== discovery.incarnation) return;
+		process.kill(discovery.pid, "SIGTERM");
 	},
 	ensure: async agentDir => await ensureBroker({ agentDir }),
 	sleep: Bun.sleep,

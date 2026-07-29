@@ -21,8 +21,27 @@ export interface RestartSdkBrokerResult {
 export interface RestartSdkBrokerDeps {
 	readDiscovery(agentDir: string, heartbeatTtlMs: number): Promise<BrokerDiscoveryLike | null>;
 	shutdown(discovery: BrokerDiscoveryLike): Promise<void>;
+	/** Identity-fenced SIGTERM for brokers that predate the `broker.shutdown` operation. */
+	signal(discovery: BrokerDiscoveryLike): void;
 	ensure(agentDir: string): Promise<BrokerDiscoveryLike>;
 	sleep(ms: number): Promise<void>;
+}
+
+function isUnknownOperation(error: unknown): boolean {
+	return (error as { code?: unknown } | null)?.code === "unknown_operation";
+}
+
+/**
+ * Older published brokers answer `broker.shutdown` with `unknown_operation`; their
+ * process still stops its published identity on SIGTERM, so fall back to that.
+ */
+async function stopPreviousBroker(discovery: BrokerDiscoveryLike, deps: RestartSdkBrokerDeps): Promise<void> {
+	try {
+		await deps.shutdown(discovery);
+	} catch (error) {
+		if (!isUnknownOperation(error)) throw error;
+		deps.signal(discovery);
+	}
 }
 
 export async function restartSdkBroker(
@@ -36,7 +55,7 @@ export async function restartSdkBroker(
 
 	const previous = await deps.readDiscovery(options.agentDir, Number.POSITIVE_INFINITY);
 	if (previous) {
-		await deps.shutdown(previous);
+		await stopPreviousBroker(previous, deps);
 		const deadline = Date.now() + gracefulTimeoutMs;
 		while (Date.now() < deadline) {
 			const current = await deps.readDiscovery(options.agentDir, Number.POSITIVE_INFINITY);
