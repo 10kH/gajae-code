@@ -1053,6 +1053,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/coding-agent/src/session/internal/managed-session-scope.ts",
 			"packages/coding-agent/src/session/internal/managed-session-storage.ts",
 			"packages/coding-agent/src/session/blob-store.ts",
+			"packages/coding-agent/src/sdk/session-directory.ts",
 			"packages/coding-agent/src/session/session-manager.ts",
 			"packages/coding-agent/test/session-manager/windows-canonical-path.test.ts",
 			"packages/coding-agent/test/sdk-session-directory.windows.test.ts",
