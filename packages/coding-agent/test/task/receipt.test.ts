@@ -150,6 +150,65 @@ describe("task result receipts", () => {
 		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
 	});
 
+	it("exposes a canonical findings reference without leaking full findings", () => {
+		const receipt = buildTaskReceipt(
+			makeRaw({
+				reviewFindingsRef: {
+					uri: "artifact://7",
+					sizeBytes: 4096,
+					sha256: "a".repeat(64),
+					findingCount: 21,
+				},
+				extractedToolData: {
+					report_finding: Array.from({ length: 21 }, (_, index) => ({
+						priority: "P1",
+						title: `finding ${index}`,
+						body: `${"detail ".repeat(40)}${index === 20 ? "FULL-FINDING-TAIL-SENTINEL" : ""}`,
+						file_path: "/tmp/private/example.ts",
+					})),
+				},
+			}),
+		);
+
+		expect(receipt.review?.findingCount).toBe(21);
+		expect(receipt.review?.findings).toHaveLength(20);
+		expect(receipt.review?.findingsRef).toEqual({
+			uri: "artifact://7",
+			sizeBytes: 4096,
+			sha256: "a".repeat(64),
+			findingCount: 21,
+		});
+		expect(JSON.stringify(receipt)).not.toContain("FULL-FINDING-TAIL-SENTINEL");
+		expect(JSON.stringify(receipt)).not.toContain("/tmp/private");
+		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
+	});
+
+	it("keeps review metadata visible when only the canonical reference remains", () => {
+		const receipt = buildTaskReceipt(
+			makeRaw({
+				reviewFindingsRef: {
+					uri: "artifact://8",
+					sizeBytes: 128,
+					sha256: "b".repeat(64),
+					findingCount: 2,
+				},
+			}),
+		);
+
+		expect(receipt.review).toEqual({
+			overallCorrectness: undefined,
+			findingCount: 2,
+			findings: undefined,
+			findingsRef: {
+				uri: "artifact://8",
+				sizeBytes: 128,
+				sha256: "b".repeat(64),
+				findingCount: 2,
+			},
+		});
+		expect(receipt.roi?.materialContribution).toBe(true);
+	});
+
 	it("buildTaskReceipt marks output unavailable when no artifact metadata is present", () => {
 		const receipt = buildTaskReceipt(makeRaw());
 		expect(receipt.outputRef).toBeUndefined();
