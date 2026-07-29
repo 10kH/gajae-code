@@ -2,11 +2,11 @@
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-07-29
+
 ### Fixed
 
 - The crash-log credential scrubber recognizes GitHub fine-grained PATs (`github_pat_`) and complete AWS STS credentials. It already had rules for both vendors, but matched only the classic `gh[opsur]_` and long-term `AKIA` shapes. It now also covers the temporary `ASIA` key id and, critically, the `SecretAccessKey` / `SessionToken` values that ship alongside it — the id alone is not the credential, and neither canonical field name matched the existing labeled-value rule. All of these previously survived into a file the module keeps indefinitely.
-
-## [0.12.0] - 2026-07-28
 
 ## [0.11.11] - 2026-07-26
 

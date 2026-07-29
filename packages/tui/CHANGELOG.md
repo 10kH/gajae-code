@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-07-29
+
 ### Fixed
 
 - Kitty/Ghostty inline images no longer remain visually pinned when sticky or semantic viewport repaints move their anchors into application scrollback. The renderer now soft-deletes only the named placement from the old viewport, retains uploaded pixels for history replay, and keeps placement tracking aligned across unresolved-anchor and follow-live transitions.
