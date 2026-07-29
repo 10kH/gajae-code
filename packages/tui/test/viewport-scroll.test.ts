@@ -5,9 +5,16 @@ import {
 	CURSOR_MARKER,
 	DEFAULT_WHEEL_LINES,
 	Editor,
+	encodeKittyPlacementDelete,
+	extractKittyPlacementReferences,
+	getCellDimensions,
+	Image,
 	ImageProtocol,
 	Markdown,
 	renderComponentWithViewportAnchors,
+	resetKittyTransmissions,
+	setCellDimensions,
+	setKittyTransmitWriter,
 	setTerminalImageProtocol,
 	shouldUseViewportRepaintForHost,
 	TERMINAL,
@@ -1534,6 +1541,87 @@ describe("registered viewport anchor", () => {
 			expect(visible(term).some(line => line === "history-9")).toBe(false);
 		} finally {
 			tui.stop();
+		}
+	});
+
+	it("tracks retained and replacement Kitty placements across unresolved follow-live", async () => {
+		const originalProtocol = TERMINAL.imageProtocol;
+		const originalCellDimensions = getCellDimensions();
+		setCellDimensions({ widthPx: 10, heightPx: 10 });
+		setTerminalImageProtocol(ImageProtocol.Kitty);
+		resetKittyTransmissions();
+		setKittyTransmitWriter(() => {});
+
+		const term = new VirtualTerminal(30, 6);
+		const tui = new TUI(term);
+		const transcript = new AnchoredTranscript();
+		for (let index = 0; index < 10; index++) transcript.addRow(`history-${index}`, `history-${index}`);
+		transcript.addChild(
+			new Image(
+				"AA==",
+				"image/png",
+				{ fallbackColor: value => value },
+				{ maxWidthCells: 4, maxHeightCells: 2 },
+				{ widthPx: 20, heightPx: 20 },
+			),
+		);
+		let firstLiveRow: Text | undefined;
+		for (let index = 10; index < 20; index++) {
+			const row = transcript.addRow(`history-${index}`, `history-${index}`);
+			if (index === 10) firstLiveRow = row;
+		}
+		tui.addChild(transcript);
+		tui.setViewportAnchorComponent(transcript);
+
+		try {
+			tui.start();
+			await settle(term);
+			expect(tui.revealViewportAnchor("history-9", "top")).toBe(true);
+			await settle(term);
+			const [retainedPlacement] = extractKittyPlacementReferences(term.getWriteLog().join(""));
+			expect(retainedPlacement).toBeDefined();
+
+			term.clearWriteLog();
+			transcript.removeFirst(11);
+			transcript.addChild(
+				new Image(
+					"AQ==",
+					"image/png",
+					{ fallbackColor: value => value },
+					{ maxWidthCells: 4, maxHeightCells: 2 },
+					{ widthPx: 20, heightPx: 20 },
+				),
+			);
+			for (let index = 0; index < 4; index++) transcript.addRow(`tail-${index}`, `tail-${index}`);
+			tui.requestRender();
+			await settle(term);
+			const retainedOutput = term.getWriteLog().join("");
+			expect(retainedOutput).toContain(encodeKittyPlacementDelete(retainedPlacement!));
+			expect(extractKittyPlacementReferences(retainedOutput)).toContainEqual(retainedPlacement);
+
+			term.clearWriteLog();
+			expect(tui.followLiveViewport()).toBe(true);
+			await term.flush();
+			const followedOutput = term.getWriteLog().join("");
+			expect(followedOutput).toContain(encodeKittyPlacementDelete(retainedPlacement!));
+			const [replacementPlacement] = extractKittyPlacementReferences(followedOutput);
+			expect(replacementPlacement).toBeDefined();
+			expect(replacementPlacement?.imageId).not.toBe(retainedPlacement?.imageId);
+
+			term.clearWriteLog();
+			firstLiveRow!.setText("history-10 updated");
+			transcript.addRow("tail-4", "tail-4");
+			tui.requestRender();
+			await settle(term);
+			const grownOutput = term.getWriteLog().join("");
+			expect(grownOutput).toContain(encodeKittyPlacementDelete(replacementPlacement!));
+			expect(extractKittyPlacementReferences(grownOutput)).toEqual([]);
+		} finally {
+			tui.stop();
+			setCellDimensions(originalCellDimensions);
+			setTerminalImageProtocol(originalProtocol);
+			resetKittyTransmissions();
+			setKittyTransmitWriter(sequence => process.stdout.write(sequence));
 		}
 	});
 	it("retains unresolved intent through provider removal and resolves a replacement", async () => {

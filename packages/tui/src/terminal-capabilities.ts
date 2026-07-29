@@ -514,6 +514,50 @@ export function encodeKittyPlacement(options: {
 	return `\x1b_Ga=p,i=${options.imageId},p=${options.placementId},c=${options.columns},r=${options.rows},C=1,q=2\x1b\\`;
 }
 
+export interface KittyPlacementReference {
+	imageId: number;
+	placementId: number;
+	rows: number;
+}
+
+/** Extract named kitty placements from a rendered line. */
+export function extractKittyPlacementReferences(line: string): KittyPlacementReference[] {
+	if (!line.includes(ImageProtocol.Kitty)) return [];
+	const placements: KittyPlacementReference[] = [];
+	for (const match of line.matchAll(/\x1b_G([^;\x1b]*)(?:;[^\x1b]*)?\x1b\\/gu)) {
+		const params = new Map<string, string>();
+		for (const part of (match[1] ?? "").split(",")) {
+			const separator = part.indexOf("=");
+			if (separator > 0) params.set(part.slice(0, separator), part.slice(separator + 1));
+		}
+		if (params.get("a") !== "p") continue;
+		const imageIdRaw = params.get("i") ?? "";
+		const placementIdRaw = params.get("p") ?? "";
+		const rowsRaw = params.get("r") ?? "1";
+		if (!/^\d+$/u.test(imageIdRaw) || !/^\d+$/u.test(placementIdRaw) || !/^\d+$/u.test(rowsRaw)) continue;
+		const imageId = Number(imageIdRaw);
+		const placementId = Number(placementIdRaw);
+		const rows = Number(rowsRaw);
+		if (
+			!Number.isSafeInteger(imageId) ||
+			imageId <= 0 ||
+			!Number.isSafeInteger(placementId) ||
+			placementId <= 0 ||
+			!Number.isSafeInteger(rows) ||
+			rows <= 0
+		) {
+			continue;
+		}
+		placements.push({ imageId, placementId, rows });
+	}
+	return placements;
+}
+
+/** Soft-delete one named kitty placement while retaining its transmitted pixels. */
+export function encodeKittyPlacementDelete(reference: KittyPlacementReference): string {
+	return `\x1b_Ga=d,d=i,i=${reference.imageId},p=${reference.placementId},q=2\x1b\\`;
+}
+
 export function encodeITerm2(
 	base64Data: string,
 	options: {
