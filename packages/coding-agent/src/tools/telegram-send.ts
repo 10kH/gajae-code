@@ -31,9 +31,10 @@ export class TelegramSendTool implements AgentTool<typeof telegramSendSchema, Te
 	readonly summary = "Send a workspace file to Telegram";
 	readonly loadMode = "discoverable";
 	readonly description =
-		"Send a file from the current workspace to the connected Telegram chat as a document. Recognized file types " +
-		"keep their MIME type so Telegram can render supported image formats, including WebP. The path must resolve " +
-		"(after following symlinks) to a regular file inside the project root; paths outside the workspace are rejected.";
+		"Send a file from the current workspace to the connected Telegram chat. Recognized images are converted to " +
+		"Telegram-compatible photos when possible, including WebP; other files are sent as documents with their MIME " +
+		"type preserved. The path must resolve (after following symlinks) to a regular file inside the project root; " +
+		"paths outside the workspace are rejected.";
 	readonly parameters = telegramSendSchema;
 	readonly strict = true;
 

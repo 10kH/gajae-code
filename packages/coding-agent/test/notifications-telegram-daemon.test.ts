@@ -9131,7 +9131,7 @@ test("ensureTelegramDaemonRunning spawns the daemon subcommand with owner-id and
 	expect(ai).toBeGreaterThanOrEqual(0);
 	expect(captured!.args[ai + 1]).toBe(agentDir);
 });
-test("image_attachment routes PNG as a photo and WebP as a document", async () => {
+test("image_attachment converts WebP to photo and falls back safely", async () => {
 	const agentDir = tempAgentDir();
 	const bot = new FakeBotApi();
 	const daemon = new TelegramNotificationDaemon({
@@ -9153,6 +9153,11 @@ test("image_attachment routes PNG as a photo and WebP as a document", async () =
 		repo: "gajae-code",
 		branch: "dev",
 	});
+	const seed = Buffer.from(
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+		"base64",
+	);
+	const webpData = await new Bun.Image(seed).resize(32, 32, { filter: "nearest" }).webp({ quality: 90 }).toBase64();
 	await daemon.handleSessionMessage(session as any, {
 		type: "image_attachment",
 		sessionId: "S",
@@ -9165,21 +9170,32 @@ test("image_attachment routes PNG as a photo and WebP as a document", async () =
 		sessionId: "S",
 		source: "agent",
 		mime: "image/webp",
-		data: "V0VCUA==",
+		data: webpData,
 	});
 	const createTopic = bot.calls.find(c => c.method === "createForumTopic");
-	const photo = bot.calls.find(c => c.method === "sendPhoto");
+	const photos = bot.calls.filter(c => c.method === "sendPhoto");
 	expect(createTopic).toBeTruthy();
 	expect(createTopic!.body.name).toBe("gajae-code/dev");
-	expect(photo).toBeTruthy();
-	expect(photo!.body.photo).toBe("AAAA");
-	expect(Number(photo!.body.message_thread_id)).toBeGreaterThan(0);
-	const document = bot.calls.find(c => c.method === "sendDocument");
-	expect(document).toBeTruthy();
-	expect(document!.body.document).toBe("V0VCUA==");
-	expect(document!.body.mime).toBe("image/webp");
-	expect(document!.body.fileName).toBe("image.webp");
-	expect(document!.body.message_thread_id).toBe(photo!.body.message_thread_id);
+	expect(photos).toHaveLength(2);
+	expect(photos[0]!.body.photo).toBe("AAAA");
+	expect(Number(photos[0]!.body.message_thread_id)).toBeGreaterThan(0);
+	const convertedPhoto = photos[1]!;
+	expect(convertedPhoto.body.photo).not.toBe(webpData);
+	expect(["image/jpeg", "image/png"]).toContain(convertedPhoto.body.mime);
+	expect(convertedPhoto.body.message_thread_id).toBe(photos[0]!.body.message_thread_id);
+	expect(bot.calls.find(c => c.method === "sendDocument")).toBeUndefined();
+	await daemon.handleSessionMessage(session as any, {
+		type: "image_attachment",
+		sessionId: "S",
+		source: "agent",
+		mime: "image/webp",
+		data: "V0VCUA==",
+	});
+	const fallbackDocument = bot.calls.find(c => c.method === "sendDocument");
+	expect(fallbackDocument).toBeTruthy();
+	expect(fallbackDocument!.body.document).toBe("V0VCUA==");
+	expect(fallbackDocument!.body.mime).toBe("image/webp");
+	expect(fallbackDocument!.body.fileName).toBe("image.webp");
 });
 
 describe("telegram topic name template (#1909)", () => {

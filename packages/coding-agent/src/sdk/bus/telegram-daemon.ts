@@ -9,6 +9,7 @@ import { withFileLock } from "../../config/file-lock";
 import type { Settings } from "../../config/settings";
 import type { DaemonRuntimeInfo } from "../../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
+import { resizeImageBuffer } from "../../utils/image-resize";
 import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
 import { getNotificationConfig, isTelegramConfigured, tokenFingerprint } from "./config";
 import {
@@ -97,7 +98,7 @@ import {
 	telegramDisableNotification,
 } from "./telegram-reference";
 import { decideThreadedInbound, type InboundAttachment } from "./threaded-inbound";
-import { renderThreadedFrame, type ThreadedSend } from "./threaded-render";
+import { renderThreadedFrame, supportsTelegramPhotoUpload, type ThreadedSend } from "./threaded-render";
 import { type TopicEndpointBinding, TopicRegistry, type TopicRegistryState } from "./topic-registry";
 
 export type EnsureDaemonResult = "owner_spawned" | "attached" | "disabled" | "blocked";
@@ -312,10 +313,44 @@ const TELEGRAM_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024;
 const TELEGRAM_SESSION_ATTACHMENT_MAX_COUNT = 20;
 const TELEGRAM_SESSION_ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024;
 const TELEGRAM_ATTACHMENT_DOWNLOAD_TIMEOUT_MS = 60_000;
+const TELEGRAM_PHOTO_MAX_BYTES = 10 * 1024 * 1024;
+const TELEGRAM_PHOTO_MAX_DIMENSION = 10_000;
+const TELEGRAM_PHOTO_MAX_ASPECT_RATIO = 20;
 const BTW_QUESTION_LIMIT_TEXT = "Question must be at most 4096 Unicode scalar values and 16384 UTF-8 bytes.";
 type ParsedBtwCommand = { kind: "question"; question: string } | { kind: "ignored" };
 type TelegramFileDownload = { bytes: Buffer } | { failure: "download_failed" | "too_large" };
 class ThreadedModeCapabilityRefusal extends Error {}
+
+async function prepareTelegramImageAttachment(frame: Record<string, unknown>): Promise<Record<string, unknown>> {
+	if (frame.type !== "image_attachment") return frame;
+	const mime = typeof frame.mime === "string" ? frame.mime : undefined;
+	const data = typeof frame.data === "string" ? frame.data : undefined;
+	if (!data || supportsTelegramPhotoUpload(mime) || !mime?.toLowerCase().startsWith("image/")) return frame;
+	try {
+		const converted = await resizeImageBuffer(Buffer.from(data, "base64"), mime, {
+			maxWidth: TELEGRAM_PHOTO_MAX_DIMENSION,
+			maxHeight: TELEGRAM_PHOTO_MAX_DIMENSION,
+			maxBytes: TELEGRAM_PHOTO_MAX_BYTES,
+			jpegQuality: 90,
+			excludeWebP: true,
+			forceReencode: true,
+		});
+		const shortestEdge = Math.min(converted.width, converted.height);
+		const longestEdge = Math.max(converted.width, converted.height);
+		if (
+			!supportsTelegramPhotoUpload(converted.mimeType) ||
+			converted.buffer.byteLength > TELEGRAM_PHOTO_MAX_BYTES ||
+			shortestEdge <= 0 ||
+			longestEdge / shortestEdge > TELEGRAM_PHOTO_MAX_ASPECT_RATIO
+		) {
+			return frame;
+		}
+		return { ...frame, mime: converted.mimeType, data: converted.data };
+	} catch (error) {
+		logger.warn(`notifications: image conversion failed; falling back to document: ${String(error)}`);
+		return frame;
+	}
+}
 
 /** Only an explicit Bot API capability refusal may enable flat private-chat delivery. */
 function isThreadedModeCapabilityRefusal(response: unknown): boolean {
@@ -8604,7 +8639,8 @@ export class TelegramNotificationDaemon {
 				toolActivity?.phase === "terminal" && !this.toolActivitySummariesAreCurrent(toolActivity)
 					? summaryFreeToolFrame
 					: threadedFrame;
-			const send = this.renderThreadedFrame(renderedFrame);
+			const preparedFrame = await prepareTelegramImageAttachment(renderedFrame);
+			const send = this.renderThreadedFrame(preparedFrame);
 			if (toolActivity?.phase === "terminal") {
 				const summaryFreeSend = this.renderThreadedFrame(summaryFreeToolFrame);
 				if (summaryFreeSend) toolActivity.summaryFreeSend = summaryFreeSend;
