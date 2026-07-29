@@ -22,7 +22,6 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
 import {
-	createWatchdog,
 	getOpenAIStreamIdleTimeoutMs,
 	getStreamFirstEventTimeoutMs,
 	iterateWithIdleTimeout,
@@ -118,7 +117,6 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 		);
 		let rawRequestDump: RawHttpRequestDump | undefined;
 		const abortTracker = createAbortSourceTracker(options?.signal);
-		const firstEventTimeoutAbortError = new Error(AZURE_OPENAI_RESPONSES_FIRST_EVENT_TIMEOUT_MESSAGE);
 		const { requestAbortController, requestSignal } = abortTracker;
 
 		try {
@@ -127,7 +125,7 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 			const client = createClient(model, apiKey, options);
 			const { baseUrl } = resolveAzureConfig(model, options);
 			const params = buildParams(model, context, options, deploymentName, baseUrl);
-			const idleTimeoutMs = getOpenAIStreamIdleTimeoutMs();
+			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs();
 			options?.onPayload?.(params);
 			rawRequestDump = {
 				provider: model.provider,
@@ -164,18 +162,17 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 				rawRequestDump = { ...rawRequestDump, body: params };
 				openaiStream = await client.responses.create(params, { signal: requestSignal });
 			}
-			const firstEventWatchdog = createWatchdog(
-				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs),
-				() => abortTracker.abortLocally(firstEventTimeoutAbortError),
-			);
+			const firstEventTimeoutMs = options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs);
 			stream.push({ type: "start", partial: output });
 
 			await processResponsesStream(
 				iterateWithIdleTimeout(openaiStream, {
-					watchdog: firstEventWatchdog,
+					firstItemTimeoutMs: firstEventTimeoutMs,
+					firstItemErrorMessage: AZURE_OPENAI_RESPONSES_FIRST_EVENT_TIMEOUT_MESSAGE,
 					idleTimeoutMs,
 					errorMessage: "Azure OpenAI responses stream stalled while waiting for the next event",
 					onIdle: () => requestAbortController.abort(),
+					onFirstItemTimeout: () => requestAbortController.abort(),
 				}),
 				output,
 				stream,
@@ -272,16 +269,31 @@ export function resolveAzureConfigForTest(
 	return resolveAzureConfig(model, options);
 }
 
+/**
+ * Azure API key for the client, from trusted environment sources only.
+ *
+ * `$env` merges the caller's `cwd/.env`, so reading the key there would let
+ * repository content supply the credential this client authenticates with.
+ * Provider credentials are resolved from the launching shell plus GJC/user-owned
+ * `.env` files, never the project `.env` — this fallback now matches that rule.
+ */
+function resolveAzureClientApiKey(apiKey: string): string | undefined {
+	if (apiKey) return apiKey;
+	return $credentialEnv("AZURE_OPENAI_API_KEY");
+}
+
+/** Test seam: the client API key as resolved from a caller value plus trusted env. */
+export function resolveAzureClientApiKeyForTest(apiKey: string): string | undefined {
+	return resolveAzureClientApiKey(apiKey);
+}
 function createClient(model: Model<"azure-openai-responses">, apiKey: string, options?: AzureOpenAIResponsesOptions) {
-	if (!apiKey) {
-		const envKey = $env.AZURE_OPENAI_API_KEY;
-		if (!envKey) {
-			throw new Error(
-				"Azure OpenAI API key is required. Set AZURE_OPENAI_API_KEY environment variable or pass it as an argument.",
-			);
-		}
-		apiKey = envKey;
+	const resolvedApiKey = resolveAzureClientApiKey(apiKey);
+	if (!resolvedApiKey) {
+		throw new Error(
+			"Azure OpenAI API key is required. Set AZURE_OPENAI_API_KEY environment variable or pass it as an argument.",
+		);
 	}
+	apiKey = resolvedApiKey;
 
 	const headers = { ...(model.headers ?? {}) };
 

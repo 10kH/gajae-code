@@ -275,6 +275,13 @@ export const SETTINGS_SCHEMA = {
 		values: ["copy-retain", "disabled"] as const,
 		default: "copy-retain",
 	},
+	// SDK-owned prompt deadline. Hidden from the UI; ACP has no separate timeout.
+	"sdk.promptDeadlineMs": {
+		type: "number",
+		default: 1_800_000,
+		description: "SDK-owned prompt deadline; ACP has no separate timeout.",
+		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 86_400_000,
+	},
 
 	// Notifications (shared daemon with Telegram/Discord/Slack presentation adapters)
 	"notifications.enabled": { type: "boolean", default: false },
@@ -287,6 +294,17 @@ export const SETTINGS_SCHEMA = {
 	"notifications.telegram.activation": { type: "record", default: {} as Record<string, unknown> },
 	"notifications.telegram.btw.enabled": { type: "boolean", default: true },
 	"notifications.telegram.streaming.enabled": { type: "boolean", default: true },
+	"notifications.telegram.sound": {
+		type: "enum",
+		values: ["all", "important", "none"] as const,
+		default: "all",
+		ui: {
+			tab: "notifications",
+			label: "Telegram Notification Sounds",
+			description: "Choose which Telegram notifications play a sound.",
+			editing: "notification-atomic",
+		},
+	},
 	"notifications.telegram.rich.enabled": {
 		type: "boolean",
 		default: true,
@@ -489,6 +507,22 @@ export const SETTINGS_SCHEMA = {
 			options: "runtime",
 		},
 	},
+	"session.resumeModelBehavior": {
+		type: "enum",
+		values: ["keepSessionModel", "useCurrentDefault", "ask"] as const,
+		default: "keepSessionModel",
+		ui: {
+			tab: "model",
+			label: "Resume Model Behavior",
+			description:
+				"When resuming a session: keep the model that session last used, switch to the currently configured default model, or ask (TUI only; falls back to keeping the session's model in headless/CLI resume).",
+			options: [
+				{ value: "keepSessionModel", label: "Keep session's saved model" },
+				{ value: "useCurrentDefault", label: "Use current default model" },
+				{ value: "ask", label: "Ask on resume (TUI only)" },
+			],
+		},
+	},
 
 	modelTags: { type: "record", default: EMPTY_MODEL_TAGS_RECORD },
 
@@ -500,6 +534,11 @@ export const SETTINGS_SCHEMA = {
 		type: "number",
 		default: 0.05,
 		validate: (value: number) => Number.isFinite(value) && value > 0 && value <= 1,
+	},
+	"gjc.ralplan.autoHandoff": {
+		type: "enum",
+		values: ["off", "ultragoal", "team"],
+		default: "off",
 	},
 	"gjc.ralplan.maxIterations": {
 		type: "number",
@@ -1222,6 +1261,16 @@ export const SETTINGS_SCHEMA = {
 			label: "Provider Stream Retries",
 			description:
 				"Maximum provider stream replay retries for replay-safe transient stream failures. Counts retries, not the first attempt. Set to 0 to disable provider stream retries.",
+		},
+	},
+	"retry.streamFirstEventTimeoutMs": {
+		type: "number",
+		default: 100_000,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+		ui: {
+			tab: "model",
+			label: "First Event Timeout",
+			description: "Maximum wait for the first provider stream event, in ms. Set to 0 to disable the watchdog.",
 		},
 	},
 	"retry.fallbackChains": { type: "record", default: {} as Record<string, string[]> },
@@ -3810,6 +3859,7 @@ export interface RetrySettings {
 	maxDelayMs: number;
 	requestMaxRetries: number;
 	streamMaxRetries: number;
+	streamFirstEventTimeoutMs: number;
 }
 
 export interface MemoriesSettings {
@@ -3929,6 +3979,7 @@ export interface NotificationsSettings {
 	telegram: {
 		botToken: string | undefined;
 		chatId: string | undefined;
+		sound: "all" | "important" | "none";
 		btw: {
 			enabled: boolean;
 		};

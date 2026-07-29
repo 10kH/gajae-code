@@ -38,6 +38,56 @@ describe("workflow HUD summary builders", () => {
 		expect(hud.chips?.find(chip => chip.label === "verdict")?.severity).toBe("warning");
 		expect(hud.chips?.[0]).toEqual({ label: "pending", value: "approval", priority: 5, severity: "warning" });
 	});
+	it("renders a normal ralplan automatic handoff target", () => {
+		const handoff = buildRalplanHudSummary({
+			autoHandoff: {
+				configuredTarget: "ultragoal",
+				effectiveTarget: "ultragoal",
+				degradationReason: null,
+			},
+		}).chips?.find(chip => chip.label === "handoff");
+
+		expect(handoff).toEqual({
+			label: "handoff",
+			value: "ultragoal→ultragoal",
+			priority: 45,
+		});
+	});
+
+	it("renders a degraded ralplan automatic handoff target as a warning", () => {
+		const handoff = buildRalplanHudSummary({
+			autoHandoff: {
+				configuredTarget: "team",
+				effectiveTarget: "off",
+				degradationReason: "team_unavailable:no_tmux_leader",
+			},
+		}).chips?.find(chip => chip.label === "handoff");
+
+		expect(handoff).toEqual({
+			label: "handoff",
+			value: "team→off:team_unavailable:no_tmux_leader",
+			priority: 45,
+			severity: "warning",
+		});
+	});
+
+	it("makes PLANNING-STUCK dominate a ralplan automatic handoff severity", () => {
+		const handoff = buildRalplanHudSummary({
+			planningStuck: true,
+			autoHandoff: {
+				configuredTarget: "ultragoal",
+				effectiveTarget: "off",
+				degradationReason: "planning_stuck",
+			},
+		}).chips?.find(chip => chip.label === "handoff");
+
+		expect(handoff).toEqual({
+			label: "handoff",
+			value: "ultragoal→off:planning_stuck",
+			priority: 45,
+			severity: "blocked",
+		});
+	});
 
 	it("renders ralplan iteration-from-index and stage presence chips", () => {
 		const hud = buildRalplanHudSummary({

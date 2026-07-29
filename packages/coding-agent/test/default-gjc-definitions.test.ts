@@ -488,21 +488,38 @@ Project executor override body.
 		expect(routing).toContain("`/skill:ultragoal`");
 		expect(routing).toContain("`/skill:team`");
 		expect(routing).toContain("Delegate large implementation slices to `executor`");
+		expect(routing).toContain('explicit user request to use a worktree (for example, "use worktree")');
+		expect(routing).toContain("delegate implementation through `task` with `isolated: true`");
 		expect(routing).toContain("read the full skill text and follow it exactly");
+		expect(routing).toContain("Before explicit execution approval or a valid non-off ralplan final runtime receipt");
 		expect(routing).toContain(
-			"Before explicit execution approval, planning and interview workflows NEVER edit product source",
+			"reconciliation must persist its final receipt before choosing approval or an admitted handoff",
 		);
-		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(9);
+		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(10);
 		expect(decomposition).toMatch(/skip it for one-step or obvious two-step fixes/i);
 	});
 
-	it("honors explicit ultragoal/team naming as ralplan execution approval", async () => {
+	it("locks ralplan automatic-admission approval and handoff paths", async () => {
 		const ralplan = await Bun.file(
 			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ralplan", "SKILL.md"),
 		).text();
-		expect(ralplan).toContain("explicit-execution exception");
 		expect(ralplan).toContain("counts as opting into execution for that skill");
-		expect(ralplan).toContain("skip the re-ask and proceed to step 9");
+		expect(ralplan).toContain("gjc.ralplan.autoHandoff");
+		expect(ralplan).toContain("`off` (default), `ultragoal`, or `team`");
+		expect(ralplan).toContain("A `team` target degrades to `off`");
+		expect(ralplan).toContain("`team_unavailable:<reason>`");
+		expect(ralplan).toContain("Invalid settings reject the final write before any final artifact is persisted");
+		expect(ralplan).toContain("ledger-backed runtime-owned `auto_handoff.effectiveTarget`");
+		expect(ralplan).toContain("Reconciliation must first reach the successful final receipt");
+		expect(ralplan).toContain("valid non-off receipt is explicit operator admission");
+		expect(ralplan).toContain("do not choose an approval or handoff path before its final receipt exists");
+		expect(ralplan).toContain("planning_stuck");
+		expect(ralplan).toContain("never dispatch");
+		expect(ralplan).toContain("ordinary `off`/degraded approval flow");
+		expect(ralplan).toContain("do not issue an approval `ask`");
+		expect(ralplan).toContain(
+			"mark ralplan ready for handoff so the skill tool's chain guard permits the transition",
+		);
 	});
 
 	it("documents leader-owned Ultragoal checkpoints for Team bridge workers", async () => {
@@ -579,13 +596,16 @@ Project executor override body.
 		expect(ralplan).toBeDefined();
 		const content = ralplan?.content ?? "";
 
-		expect(content).toContain("gjc ralplan --write --stage <type> --stage_n <N> --artifact");
+		expect(content).toContain(
+			"gjc ralplan --write --session-id <owner-session-id> --run-id <run-id> --stage <type> --stage_n <N> --artifact",
+		);
 		expect(content).toContain("--stage planner");
 		expect(content).toContain("--stage architect");
 		expect(content).toContain("--stage critic");
 		expect(content).toContain("do not directly edit `.gjc/_session-{sessionid}/plans`");
 		expect(content).toContain("gjc state clear --force --mode ralplan");
 		expect(content).toContain('workflowGate: { stage: "ralplan", kind: "approval" }');
+		expect(content).toContain("A role subagent's own session id is transcript/resume identity only");
 		expect(content).toContain("RPC/headless clients receive a `ralplan`/`approval` workflow gate");
 		expect(content).toContain(
 			"Direct `write`, `edit`, or `ast_edit` calls against `.gjc/_session-{sessionid}/specs`, `.gjc/_session-{sessionid}/plans`, `.gjc/_session-{sessionid}/state`, or any other `.gjc/` path are forbidden",

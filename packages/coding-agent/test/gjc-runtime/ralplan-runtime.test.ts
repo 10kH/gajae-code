@@ -8,6 +8,7 @@ import {
 	PLANNING_STUCK_MARKER,
 	RALPLAN_DEFAULT_MAX_ITERATIONS,
 	RALPLAN_DEFAULT_MAX_REVIEW_PASSES_PER_LANE,
+	resolveRalplanAutoHandoff,
 	resolveRalplanMaxReviewPassesPerLane,
 	runNativeRalplanCommand,
 } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
@@ -33,6 +34,7 @@ const ralplanRunDir = (root: string, runId: string) =>
 	path.join(sessionPlansDir(root, TEST_SESSION_ID), "ralplan", runId);
 const ralplanPlanPath = (root: string, runId: string, ...parts: string[]) =>
 	path.join(ralplanRunDir(root, runId), ...parts);
+const CONFIG_ROOT_SETTINGS_PROBE = path.join(import.meta.dir, "..", "fixtures", "config-root-settings-probe.ts");
 
 beforeAll(() => {
 	previousGjcSessionId = process.env.GJC_SESSION_ID;
@@ -344,6 +346,95 @@ describe("native gjc ralplan runtime — --write artifact path", () => {
 		expect(JSON.parse(indexLine).sha256).toBe(payload.sha256);
 	});
 
+	it("keeps role-subagent writes in the seeded owner session", async () => {
+		const root = await tempDir();
+		const ownerSessionId = "owner-session";
+		const childSessionId = "planner-subagent-session";
+		const seed = await runNativeRalplanCommand(
+			["--session-id", ownerSessionId, "--json", "plan without fragmenting artifacts"],
+			root,
+		);
+		expect(seed.status).toBe(0);
+		const seedReceipt = JSON.parse(seed.stdout ?? "{}") as { session_id: string; run_id: string };
+		expect(seedReceipt).toMatchObject({ session_id: ownerSessionId, run_id: ownerSessionId });
+
+		const previousSessionId = process.env.GJC_SESSION_ID;
+		process.env.GJC_SESSION_ID = childSessionId;
+		try {
+			const result = await runNativeRalplanCommand(
+				[
+					"--write",
+					"--stage",
+					"planner",
+					"--stage_n",
+					"1",
+					"--artifact",
+					"# Owner-scoped plan",
+					"--run-id",
+					seedReceipt.run_id,
+					"--json",
+				],
+				root,
+			);
+			expect(result.status).toBe(0);
+			expect(JSON.parse(result.stdout ?? "{}")).toMatchObject({
+				session_id: ownerSessionId,
+				run_id: seedReceipt.run_id,
+			});
+		} finally {
+			process.env.GJC_SESSION_ID = previousSessionId;
+		}
+
+		const ownerArtifact = path.join(
+			sessionPlansDir(root, ownerSessionId),
+			"ralplan",
+			seedReceipt.run_id,
+			"stage-01-planner.md",
+		);
+		const childArtifact = path.join(
+			sessionPlansDir(root, childSessionId),
+			"ralplan",
+			seedReceipt.run_id,
+			"stage-01-planner.md",
+		);
+		expect(await fs.readFile(ownerArtifact, "utf-8")).toBe("# Owner-scoped plan\n");
+		expect(existsSync(childArtifact)).toBe(false);
+		expect(existsSync(modeStatePath(root, childSessionId, "ralplan"))).toBe(false);
+	});
+
+	it("rejects an explicit session that conflicts with an existing run owner", async () => {
+		const root = await tempDir();
+		const ownerSessionId = "owner-session";
+		const childSessionId = "critic-subagent-session";
+		const seed = await runNativeRalplanCommand(
+			["--session-id", ownerSessionId, "--json", "preserve immutable run ownership"],
+			root,
+		);
+		const { run_id: runId } = JSON.parse(seed.stdout ?? "{}") as { run_id: string };
+
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--session-id",
+				childSessionId,
+				"--run-id",
+				runId,
+				"--stage",
+				"critic",
+				"--stage_n",
+				"1",
+				"--artifact",
+				"# Critic",
+				"--json",
+			],
+			root,
+		);
+
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain(`run ${runId} is owned by session ${ownerSessionId}, not ${childSessionId}`);
+		expect(existsSync(modeStatePath(root, childSessionId, "ralplan"))).toBe(false);
+	});
+
 	it("--artifact <file> reads contents from disk", async () => {
 		const root = await tempDir();
 		const artifactPath = path.join(root, "draft.md");
@@ -456,6 +547,7 @@ describe("native gjc ralplan runtime — --write artifact path", () => {
 		expect(result.status).toBe(0);
 		const payload = JSON.parse(result.stdout ?? "{}");
 		expect(typeof payload.pending_approval_path).toBe("string");
+		expect(payload.auto_handoff).toMatchObject({ configuredTarget: "off", effectiveTarget: "off" });
 		const pendingApproval = await fs.readFile(ralplanPlanPath(root, "final-run", "pending-approval.md"), "utf-8");
 		expect(pendingApproval).toBe("# Final Plan\n");
 	});
@@ -1431,6 +1523,269 @@ describe("native gjc ralplan runtime — post-clear re-activation (#644)", () =>
 		expect(after.current_phase).toBe("complete");
 	});
 });
+describe("ralplan automatic handoff admission (#3398)", () => {
+	it("defaults to off when project and user settings are absent", async () => {
+		const root = await tempDir();
+		const userDir = await tempDir();
+		const previousConfigDir = process.env.GJC_CONFIG_DIR;
+		try {
+			process.env.GJC_CONFIG_DIR = userDir;
+			expect(await resolveRalplanAutoHandoff(root)).toEqual({
+				configuredTarget: "off",
+				effectiveTarget: "off",
+				degradationReason: null,
+				source: "default",
+			});
+		} finally {
+			if (previousConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
+			else process.env.GJC_CONFIG_DIR = previousConfigDir;
+		}
+	});
+
+	it("rejects malformed project settings rather than falling through to user settings", async () => {
+		const root = await tempDir();
+		const userDir = await tempDir();
+		const projectPath = path.join(root, ".gjc", "settings.json");
+		const previousConfigDir = process.env.GJC_CONFIG_DIR;
+		try {
+			process.env.GJC_CONFIG_DIR = userDir;
+			await fs.writeFile(
+				path.join(userDir, "settings.json"),
+				JSON.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }),
+				"utf-8",
+			);
+			await fs.mkdir(path.dirname(projectPath), { recursive: true });
+			await fs.writeFile(projectPath, "{invalid JSON", "utf-8");
+
+			await expect(resolveRalplanAutoHandoff(root)).rejects.toThrow(
+				`invalid ralplan settings at ${projectPath}: malformed JSON`,
+			);
+		} finally {
+			if (previousConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
+			else process.env.GJC_CONFIG_DIR = previousConfigDir;
+		}
+	});
+
+	it("rejects malformed user settings instead of treating automatic handoff as off", async () => {
+		const root = await tempDir();
+		const home = await tempDir();
+		const configDir = ".test-gjc";
+		const userPath = path.join(home, configDir, "settings.json");
+		await fs.mkdir(path.dirname(userPath), { recursive: true });
+		await fs.writeFile(userPath, "{invalid JSON", "utf-8");
+
+		const proc = Bun.spawn([process.execPath, CONFIG_ROOT_SETTINGS_PROBE, "--ralplan-auto-handoff"], {
+			cwd: root,
+			env: { ...process.env, HOME: home, GJC_CONFIG_DIR: configDir },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+
+		expect(await proc.exited).not.toBe(0);
+		expect(stderr).toContain(`invalid ralplan settings at ${userPath}: malformed JSON`);
+	});
+	it("rejects an invalid configured automatic handoff target", async () => {
+		const root = await tempDir();
+		const projectPath = path.join(root, ".gjc", "settings.json");
+		await fs.mkdir(path.dirname(projectPath), { recursive: true });
+		await fs.writeFile(projectPath, JSON.stringify({ gjc: { ralplan: { autoHandoff: "later" } } }), "utf-8");
+
+		await expect(resolveRalplanAutoHandoff(root)).rejects.toThrow(
+			`invalid ralplan settings at ${projectPath}: expected gjc.ralplan.autoHandoff to be one of off, ultragoal, team`,
+		);
+	});
+	it("rejects invalid final admission settings before writing final artifacts", async () => {
+		const root = await tempDir();
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "settings.json"),
+			JSON.stringify({ gjc: { ralplan: { autoHandoff: "later" } } }),
+			"utf-8",
+		);
+
+		const result = await writeRalplanArtifact(root, "invalid-final-admission", "final", 1, "# final");
+		expect(result.status).toBe(2);
+		expect(existsSync(ralplanPlanPath(root, "invalid-final-admission", "stage-01-final.md"))).toBe(false);
+		expect(existsSync(ralplanPlanPath(root, "invalid-final-admission", "pending-approval.md"))).toBe(false);
+		expect(existsSync(ralplanPlanPath(root, "invalid-final-admission", "index.jsonl"))).toBe(false);
+	});
+	it("resolves ultragoal and a usable team target from project settings", async () => {
+		const root = await tempDir();
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "settings.json"),
+			JSON.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }),
+			"utf-8",
+		);
+		expect(await resolveRalplanAutoHandoff(root)).toMatchObject({
+			configuredTarget: "ultragoal",
+			effectiveTarget: "ultragoal",
+			source: path.join(root, ".gjc", "settings.json"),
+		});
+
+		await fs.writeFile(
+			path.join(root, ".gjc", "settings.json"),
+			JSON.stringify({ gjc: { ralplan: { autoHandoff: "team" } } }),
+			"utf-8",
+		);
+		expect(
+			await resolveRalplanAutoHandoff(root, { teamAvailabilityProbe: () => ({ available: true }) }),
+		).toMatchObject({ configuredTarget: "team", effectiveTarget: "team" });
+	});
+
+	it("degrades an unavailable team target without changing tmux state", async () => {
+		const root = await tempDir();
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "settings.json"),
+			JSON.stringify({ gjc: { ralplan: { autoHandoff: "team" } } }),
+			"utf-8",
+		);
+		expect(
+			await resolveRalplanAutoHandoff(root, {
+				teamAvailabilityProbe: () => ({ available: false, reason: "no_tmux_leader" }),
+			}),
+		).toMatchObject({
+			configuredTarget: "team",
+			effectiveTarget: "off",
+			degradationReason: "team_unavailable:no_tmux_leader",
+		});
+	});
+
+	it("persists a final admission and returns it on an identical final dedupe", async () => {
+		const root = await tempDir();
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "settings.json"),
+			JSON.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }),
+			"utf-8",
+		);
+		const args = ["--write", "--stage", "final", "--stage_n", "1", "--artifact", "# final", "--json"];
+		const first = await runNativeRalplanCommand(args, root);
+		const second = await runNativeRalplanCommand(args, root);
+		expect(JSON.parse(first.stdout ?? "{}").auto_handoff).toMatchObject({
+			configuredTarget: "ultragoal",
+			effectiveTarget: "ultragoal",
+		});
+		expect(JSON.parse(second.stdout ?? "{}")).toMatchObject({
+			deduplicated: true,
+			auto_handoff: { configuredTarget: "ultragoal", effectiveTarget: "ultragoal" },
+		});
+		const state = JSON.parse(await fs.readFile(ralplanStatePath(root), "utf-8"));
+		expect(state.auto_handoff).toMatchObject({ configuredTarget: "ultragoal", effectiveTarget: "ultragoal" });
+		expect((await readRalplanHudChips(root)).find(chip => chip.label === "handoff")).toMatchObject({
+			value: "ultragoal→ultragoal",
+		});
+	});
+	it("overlays a later durable PLANNING-STUCK marker on final dedupe", async () => {
+		const root = await tempDir();
+		const runId = "final-then-stuck";
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "settings.json"),
+			JSON.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal", maxIterations: 1 } } }),
+			"utf-8",
+		);
+
+		expect((await writeRalplanArtifact(root, runId, "final", 1, "# final")).status).toBe(0);
+		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(3);
+		expect((await writeRalplanArtifact(root, runId, "revision", 2, "# blocked")).status).toBe(3);
+
+		const deduplicated = JSON.parse((await writeRalplanArtifact(root, runId, "final", 1, "# final")).stdout ?? "{}");
+		expect(deduplicated).toMatchObject({
+			deduplicated: true,
+			auto_handoff: {
+				configuredTarget: "ultragoal",
+				effectiveTarget: "off",
+				degradationReason: "planning_stuck",
+			},
+		});
+	});
+	it("uses the final ledger admission after state loss and settings changes", async () => {
+		const root = await tempDir();
+		const runId = "durable-final-admission";
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "settings.json"),
+			JSON.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }),
+			"utf-8",
+		);
+		expect((await writeRalplanArtifact(root, runId, "final", 1, "# final")).status).toBe(0);
+
+		await fs.rm(ralplanStatePath(root));
+		expect((await writeRalplanArtifact(root, "another-run", "planner", 1, "# other")).status).toBe(0);
+		await fs.writeFile(
+			path.join(root, ".gjc", "settings.json"),
+			JSON.stringify({ gjc: { ralplan: { autoHandoff: "off" } } }),
+			"utf-8",
+		);
+		const retry = JSON.parse((await writeRalplanArtifact(root, runId, "final", 1, "# final")).stdout ?? "{}");
+		expect(retry).toMatchObject({
+			deduplicated: true,
+			auto_handoff: { configuredTarget: "ultragoal", effectiveTarget: "ultragoal" },
+		});
+	});
+
+	it("makes persisted PLANNING-STUCK dominate automatic handoff", async () => {
+		const root = await tempDir();
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "settings.json"),
+			JSON.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal", maxIterations: 1 } } }),
+			"utf-8",
+		);
+		expect((await writeRalplanArtifact(root, "stuck-ledger", "planner", 1, "# plan")).status).toBe(0);
+		expect((await writeRalplanArtifact(root, "stuck-ledger", "revision", 2, "# blocked")).status).toBe(3);
+		await fs.rm(ralplanStatePath(root));
+		const final = JSON.parse(
+			(await writeRalplanArtifact(root, "stuck-ledger", "final", 2, "# best effort")).stdout ?? "{}",
+		);
+		expect(final.auto_handoff).toMatchObject({
+			configuredTarget: "ultragoal",
+			effectiveTarget: "off",
+			degradationReason: "planning_stuck",
+		});
+		expect((await readRalplanHudChips(root)).find(chip => chip.label === "handoff")).toMatchObject({
+			value: "ultragoal→off:planning_stuck",
+			severity: "blocked",
+		});
+	});
+	it("fails closed when an existing ledger cannot be read for automatic handoff", async () => {
+		const root = await tempDir();
+		const runId = "unreadable-handoff-ledger";
+		const indexPath = path.join(ralplanRunDir(root, runId), "index.jsonl");
+		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "settings.json"),
+			JSON.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }),
+			"utf-8",
+		);
+		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
+
+		const originalReadFile = fs.readFile;
+		let indexReads = 0;
+		const injectedError = Object.assign(new Error("EIO: injected unreadable ledger"), { code: "EIO" });
+		const readSpy = spyOn(fs, "readFile").mockImplementation(async (...args: any[]) => {
+			const target = typeof args[0] === "string" ? args[0] : String(args[0]);
+			if (path.resolve(target) === indexPath && ++indexReads === 2) throw injectedError;
+			return await (originalReadFile as (...readArgs: any[]) => Promise<any>)(...args);
+		});
+		try {
+			const final = JSON.parse(
+				(await writeRalplanArtifact(root, runId, "final", 2, "# best effort")).stdout ?? "{}",
+			);
+			expect(final.auto_handoff).toMatchObject({
+				configuredTarget: "ultragoal",
+				effectiveTarget: "off",
+				degradationReason: "planning_stuck",
+			});
+		} finally {
+			readSpy.mockRestore();
+		}
+		expect(indexReads).toBeGreaterThanOrEqual(2);
+	});
+});
 describe("ralplan consensus iteration cap (#3165)", () => {
 	it("evaluateRalplanIterationCap allows openers up to max and rejects the next", () => {
 		const rows = [
@@ -2041,16 +2396,35 @@ describe("ralplan crash-gap dedupe repair", () => {
 
 		const repaired = await writeRalplanArtifact(root, runId, "final", 2, "# recovered final");
 		expect(repaired.status).toBe(0);
-		expect(JSON.parse(repaired.stdout ?? "{}")).toMatchObject({
+		const repairedPayload = JSON.parse(repaired.stdout ?? "{}");
+		expect(repairedPayload).toMatchObject({
 			deduplicated: true,
 			pending_approval_path: pendingApprovalPath,
+			auto_handoff: {
+				configuredTarget: "off",
+				effectiveTarget: "off",
+				degradationReason: "admission_unavailable",
+				source: "ledger",
+			},
 		});
 		expect(await fs.readFile(pendingApprovalPath, "utf-8")).toBe("# recovered final\n");
 		const repairedRows = (await fs.readFile(path.join(runDir, "index.jsonl"), "utf-8"))
 			.trim()
 			.split("\n")
 			.map(line => JSON.parse(line));
-		expect(repairedRows).toEqual([expect.objectContaining({ stage: "final", stage_n: 2, path: artifactPath })]);
+		expect(repairedRows).toEqual([
+			expect.objectContaining({
+				stage: "final",
+				stage_n: 2,
+				path: artifactPath,
+				auto_handoff: {
+					configuredTarget: "off",
+					effectiveTarget: "off",
+					degradationReason: "admission_unavailable",
+					source: "ledger",
+				},
+			}),
+		]);
 	});
 
 	it("recreates a missing pending approval for ledger-backed final dedupe and refuses a mismatch", async () => {
@@ -2549,10 +2923,17 @@ describe("ralplan HUD lane verdict carriage", () => {
 		expect(reviewChips).toHaveLength(6);
 		expect(reviewChips.map(chip => chip.label)).toEqual(["stage", "iter", "stages", "arch", "crit", "verdict"]);
 
-		expect((await writeRalplanArtifact(root, runId, "final", 4, "# final")).status).toBe(0);
+		const final = await writeRalplanArtifact(root, runId, "final", 4, "# final");
+		expect(final.status).toBe(0);
+		expect(JSON.parse(final.stdout ?? "{}").auto_handoff).toMatchObject({
+			configuredTarget: "off",
+			effectiveTarget: "off",
+			degradationReason: null,
+		});
 		const finalChips = await readRalplanHudChips(root);
 		expect(finalChips.length).toBeLessThanOrEqual(6);
-		expect(finalChips.map(chip => chip.label)).toEqual(["pending", "stage", "iter", "stages", "verdict"]);
+		expect(finalChips.map(chip => chip.label)).toEqual(["pending", "stage", "iter", "stages", "verdict", "handoff"]);
+		expect(finalChips.find(chip => chip.label === "handoff")?.value).toBe("off→off");
 	});
 
 	it("rejects invalid, wrong-lane, and non-lane --lane-verdict values", async () => {
