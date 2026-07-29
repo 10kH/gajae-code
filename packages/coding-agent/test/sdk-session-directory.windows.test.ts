@@ -19,6 +19,14 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 });
 
+function durableTreeEvidence(snapshot: native.NativeDirectoryTreeSnapshot): unknown[] {
+	return snapshot.entries.map(entry =>
+		entry.kind === "directory"
+			? { relativePath: entry.relativePath, kind: entry.kind, dev: entry.dev, ino: entry.ino }
+			: entry,
+	);
+}
+
 it("skips unsupported managed directory fsync on Windows", () => {
 	expect(shouldFsyncManagedDirectory("win32")).toBe(false);
 	expect(shouldFsyncManagedDirectory("linux")).toBe(true);
@@ -112,15 +120,31 @@ describe.skipIf(process.platform !== "win32")("Windows managed session directory
 		first.appendMessage({ role: "user", content: "first startup", timestamp: 0 });
 		await first.ensureOnDisk();
 		await first.flush();
+		const firstSessionFile = first.getSessionFile();
+		if (!firstSessionFile) throw new Error("Expected persisted first-session transcript");
 		await first.close();
 
 		const internal = path.join(firstDirectory, ".gjc-managed-session-internal");
 		const locks = path.join(internal, "locks");
 		const retainedLocks = path.join(internal, "locks.retained-for-test");
+		const receipts = path.join(internal, "receipts");
+		const tombstones = path.join(internal, "tombstones");
 		await fs.rename(locks, retainedLocks);
+		const retainedMarker = path.join(retainedLocks, "retained-marker");
+		const receiptMarker = path.join(receipts, "receipt-marker");
+		const tombstoneMarker = path.join(tombstones, "tombstone-marker");
+		await fs.writeFile(retainedMarker, "retained-lock-state\n", { mode: 0o600 });
+		await fs.writeFile(receiptMarker, "receipt-state\n", { mode: 0o600 });
+		await fs.writeFile(tombstoneMarker, "tombstone-state\n", { mode: 0o600 });
 		const invalidContent = "required directory replaced by a file\n";
 		await fs.writeFile(locks, invalidContent, { mode: 0o600 });
-		const faultTree = (await fs.readdir(internal)).sort();
+		const firstSessionContent = await fs.readFile(firstSessionFile);
+		const retainedLocksBefore = native.snapshotDirectoryTree(retainedLocks);
+		const faultTreeBefore = native.snapshotDirectoryTree(firstDirectory);
+		if (!retainedLocksBefore.ok || !retainedLocksBefore.snapshot) {
+			throw new Error("Expected retained locks snapshot");
+		}
+		if (!faultTreeBefore.ok || !faultTreeBefore.snapshot) throw new Error("Expected managed fault snapshot");
 
 		let failure: unknown;
 		try {
@@ -137,17 +161,28 @@ describe.skipIf(process.platform !== "win32")("Windows managed session directory
 		expect(startupError.message).not.toContain(firstDirectory);
 		expect(JSON.stringify(startupError.cause)).not.toContain(firstDirectory);
 		expect(await fs.readFile(locks, "utf8")).toBe(invalidContent);
-		expect((await fs.readdir(internal)).sort()).toEqual(faultTree);
-		expect((await fs.stat(retainedLocks)).isDirectory()).toBe(true);
-		expect((await fs.stat(path.join(internal, "receipts"))).isDirectory()).toBe(true);
-		expect((await fs.stat(path.join(internal, "tombstones"))).isDirectory()).toBe(true);
+		const faultTreeAfter = native.snapshotDirectoryTree(firstDirectory);
+		if (!faultTreeAfter.ok || !faultTreeAfter.snapshot) throw new Error("Expected post-failure managed snapshot");
+		expect(durableTreeEvidence(faultTreeAfter.snapshot)).toEqual(durableTreeEvidence(faultTreeBefore.snapshot));
+		expect(await fs.readFile(firstSessionFile)).toEqual(firstSessionContent);
+		expect(await fs.readFile(retainedMarker, "utf8")).toBe("retained-lock-state\n");
+		expect(await fs.readFile(receiptMarker, "utf8")).toBe("receipt-state\n");
+		expect(await fs.readFile(tombstoneMarker, "utf8")).toBe("tombstone-state\n");
 
 		await fs.rm(locks);
 		await fs.rename(retainedLocks, locks);
+		const restoredLocks = native.snapshotDirectoryTree(locks);
+		if (!restoredLocks.ok || !restoredLocks.snapshot) throw new Error("Expected restored locks snapshot");
+		expect(restoredLocks.snapshot.rootDev).toBe(retainedLocksBefore.snapshot.rootDev);
+		expect(restoredLocks.snapshot.rootIno).toBe(retainedLocksBefore.snapshot.rootIno);
 		const secondDirectory = SessionManager.getDefaultSessionDir(cwd, agentDir);
 		const secondDestination = SessionManager.managedDestination(cwd, agentDir);
 		expect(secondDirectory).toBe(firstDirectory);
 		expect(secondDestination.directory).toBe(firstDirectory);
+		expect(await fs.readFile(firstSessionFile)).toEqual(firstSessionContent);
+		expect(await fs.readFile(path.join(locks, "retained-marker"), "utf8")).toBe("retained-lock-state\n");
+		expect(await fs.readFile(receiptMarker, "utf8")).toBe("receipt-state\n");
+		expect(await fs.readFile(tombstoneMarker, "utf8")).toBe("tombstone-state\n");
 	});
 
 	it("preserves verify-first policy through nested managed destinations", async () => {
