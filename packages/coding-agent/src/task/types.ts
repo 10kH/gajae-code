@@ -212,6 +212,14 @@ export interface ReviewFinding {
 	line_end: number;
 }
 
+/** Durable full-fidelity review findings artifact associated with a task result. */
+export interface ReviewFindingsArtifactRef {
+	uri: `artifact://${string}`;
+	sizeBytes: number;
+	sha256: string;
+	findingCount: number;
+}
+
 /** Review summary submitted by the reviewer agent */
 export interface ReviewSummary {
 	overall_correctness: "correct" | "incorrect";
@@ -464,6 +472,8 @@ export interface SingleResult {
 	producedChanges?: boolean;
 	/** Data extracted by registered subprocess tool handlers (keyed by tool name) */
 	extractedToolData?: Record<string, unknown[]>;
+	/** Full wrapper-owned review evidence, kept separate from caller completion data. */
+	reviewFindingsRef?: ReviewFindingsArtifactRef;
 	/**
 	 * Terminal retry failure, when the subagent exited because the auto-retry
 	 * loop gave up (retry-after exceeded the cap, or all attempts exhausted).
