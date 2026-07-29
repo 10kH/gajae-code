@@ -378,7 +378,7 @@ function managedRelativePath(root: ManagedDirectoryRoot, pathname: string): read
 const PROCESS_START_ID = randomUUID();
 
 class ManagedSecurityError extends Error {
-	readonly classification: string;
+	readonly #classification: string;
 
 	constructor(pathname: string, result: NativeSecurity) {
 		const classification = result.ok ? "unexpected_security_state" : result.code;
@@ -388,12 +388,16 @@ class ManagedSecurityError extends Error {
 				: `Owner-only security rejected ${pathname}: ${classification}`,
 		);
 		this.name = "ManagedSecurityError";
-		this.classification = classification;
+		this.#classification = classification;
+	}
+
+	getClassification(): string {
+		return this.#classification;
 	}
 }
 
 export function managedSecurityFailureClassification(error: unknown): string | undefined {
-	return error instanceof ManagedSecurityError ? error.classification : undefined;
+	return error instanceof ManagedSecurityError ? error.getClassification() : undefined;
 }
 
 function securityError(pathname: string, result: NativeSecurity): Error {
