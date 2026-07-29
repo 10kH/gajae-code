@@ -259,6 +259,41 @@ describe("compaction pruning QA red-team gates", () => {
 		expect(entries.every(entry => (entry.message as ToolResultMessage).prunedAt === undefined)).toBe(true);
 	});
 
+	test("C3 rejects dense or malformed artifact references before mutation", () => {
+		const dense = result("artifact-dense", "bash");
+		const original = textOf(dense);
+		expect(() =>
+			pruneToolOutputs(
+				[dense],
+				{ ...EAGER, protectedTools: [] },
+				{
+					artifactRefMaxChars: 64,
+					artifactRef: () => `artifact://${"界".repeat(20)}`,
+				},
+			),
+		).toThrow("ASCII-safe artifact://<id>");
+		expect(textOf(dense)).toBe(original);
+		expect((dense.message as ToolResultMessage).prunedAt).toBeUndefined();
+	});
+
+	test("C3 ASCII max-length planning never overstates final savings", () => {
+		const estimateEntry = result("artifact-estimate", "bash");
+		const actualEntry = result("artifact-actual", "bash");
+		const options = { artifactRefMaxChars: 64 };
+		const estimate = estimateToolOutputPruneSavings([estimateEntry], { ...EAGER, protectedTools: [] }, options);
+		const actual = pruneToolOutputs(
+			[actualEntry],
+			{ ...EAGER, protectedTools: [] },
+			{
+				...options,
+				artifactRef: () => `artifact://${"x".repeat(53)}`,
+			},
+		);
+		expect(estimate.prunableCount).toBe(1);
+		expect(actual.prunedCount).toBe(1);
+		expect(actual.tokensSaved).toBeGreaterThanOrEqual(estimate.tokensSaved);
+	});
+
 	test("C3 captures all text blocks completely and publishes an artifact notice", () => {
 		const output = result("multi-text", "bash");
 		(output.message as ToolResultMessage).content = [

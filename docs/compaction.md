@@ -111,7 +111,7 @@ The automatic paths are intentionally different:
   - Context promotion is tried before compaction.
   - If promotion is unavailable, auto maintenance runs with `reason: "threshold"` and `willRetry: false`.
   - With `compaction.strategy: "handoff"`, threshold maintenance starts a new handoff session instead of writing a compaction entry; if handoff returns no document without aborting, it falls back to context-full compaction.
-  - On success, if `compaction.autoContinue !== false` and unfinished work existed before maintenance or remains afterward, schedules an agent-authored developer auto-continue prompt from `prompts/system/auto-continue.md`.
+  - On success, if `compaction.autoContinue !== false`, schedules an agent-authored developer prompt from `prompts/system/auto-continue.md`; immediately before that prompt executes, live enabled goal/todo/queue/length/workflow state is re-read and the prompt is skipped if no unfinished work remains.
 
 - **Idle maintenance**
   - Trigger: `runIdleCompaction()` when not streaming or already compacting.

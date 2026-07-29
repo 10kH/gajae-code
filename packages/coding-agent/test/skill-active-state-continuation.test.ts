@@ -3,8 +3,9 @@ import { isWorkflowContinuationInert } from "@gajae-code/coding-agent/skill-stat
 
 /**
  * Continuation-inertness policy for compaction auto-continue: manifest-terminal
- * and human-blocked phases are inert; unknown skills and phases unknown to the
- * skill's manifest fail closed (inert); known active phases are not inert.
+ * and explicitly integration-inert phases are inert; unknown skills and phases
+ * fail closed. Generic Ultragoal blockers remain active, while verified human
+ * waits are represented by a paused inline goal.
  */
 describe("isWorkflowContinuationInert", () => {
 	test("manifest-terminal phases are inert", () => {

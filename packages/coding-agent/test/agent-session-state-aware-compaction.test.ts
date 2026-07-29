@@ -207,9 +207,10 @@ describe("AgentSession state-aware compaction", () => {
 		await compactionRun;
 		expect(promptSpy).not.toHaveBeenCalled();
 	});
-	it("skips synthetic auto-continue when the only goal is paused", async () => {
+	it("skips synthetic auto-continue for a paused goal with a blocked Ultragoal workflow", async () => {
+		await seedActiveSkillState("blocked");
 		session.setGoalModeState({
-			enabled: true,
+			enabled: false,
 			mode: "active",
 			goal: {
 				id: "goal-paused",

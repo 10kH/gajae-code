@@ -427,7 +427,7 @@ import { pruneSupersededMaintenanceReminders, pruneSupersededVolatileProjectCont
 import { YieldQueue } from "./yield-queue";
 
 interface CompactionStateSnapshot {
-	goal: { objective: string; status: Goal["status"] } | undefined;
+	goal: { objective: string; status: Goal["status"]; enabled: boolean } | undefined;
 	openTodos: string[];
 	activeSkills: Array<{ skill: string; phase: string }>;
 	queuedMessages: boolean;
@@ -9078,8 +9078,8 @@ export class AgentSession {
 		};
 		try {
 			const goalState = this.getGoalModeState();
-			const goal = goalState?.enabled ? goalState.goal : undefined;
-			if (goal) snapshot.goal = { objective: goal.objective, status: goal.status };
+			const goal = goalState?.goal;
+			if (goal) snapshot.goal = { objective: goal.objective, status: goal.status, enabled: goalState.enabled };
 		} catch (error) {
 			logger.warn("Failed to read goal state for compaction snapshot", {
 				error: error instanceof Error ? error.message : String(error),
@@ -9132,10 +9132,13 @@ export class AgentSession {
 
 	#compactionStateContext(snapshot: CompactionStateSnapshot): string[] {
 		const context: string[] = [];
-		if (snapshot.goal) {
+		const goal = snapshot.goal;
+		if (goal?.enabled) {
 			context.push(
-				`Active goal: ${sanitizeCompactionStateText(snapshot.goal.objective, 160)} (status: ${sanitizeCompactionStateText(snapshot.goal.status, 40)})`,
+				`Active goal: ${sanitizeCompactionStateText(goal.objective, 160)} (status: ${sanitizeCompactionStateText(goal.status, 40)})`,
 			);
+		} else if (goal?.status === "paused") {
+			context.push(`Paused goal: ${sanitizeCompactionStateText(goal.objective, 160)} (status: paused)`);
 		}
 		for (const entry of snapshot.activeSkills) {
 			const skill = sanitizeCompactionStateText(entry.skill, 100);
@@ -9150,12 +9153,13 @@ export class AgentSession {
 	}
 
 	#hasUnfinishedWork(snapshot: CompactionStateSnapshot): boolean {
-		// A paused goal is parked on human input; it must not drive autonomous
-		// continuation (matching goal-mode pause semantics).
-		if (snapshot.goal?.status === "active") return true;
-		if (snapshot.openTodos.length > 0) return true;
 		if (snapshot.queuedMessages) return true;
 		if (snapshot.lastAssistantStopReason === "length") return true;
+		// A verified paused goal is a human-wait terminus. It suppresses stale
+		// todo/workflow activity until a queued user message resumes the run.
+		if (snapshot.goal?.status === "paused") return false;
+		if (snapshot.goal?.enabled && snapshot.goal.status === "active") return true;
+		if (snapshot.openTodos.length > 0) return true;
 		return snapshot.activeSkills.some(entry => !isWorkflowContinuationInert(entry.skill, entry.phase));
 	}
 

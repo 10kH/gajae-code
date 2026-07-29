@@ -845,20 +845,21 @@ export function shouldRunMaintenancePrune(args: {
 }
 
 const MAX_ARTIFACT_REF_CHARS = 16_384;
+const ARTIFACT_REF_PATTERN = /^artifact:\/\/[a-zA-Z0-9._-]+$/;
 
 export interface PruneToolOutputsOptions {
 	/** Lower the usual minimum only when the caller is already over its compaction threshold. */
 	relaxedMinimum?: number;
 	/**
-	 * Conservative maximum length of every planned artifact reference. Required
-	 * when `artifactRef` is provided so estimation and final admission use the
-	 * same worst-case notice size.
+	 * Conservative maximum ASCII length of every planned artifact reference.
+	 * Required when `artifactRef` is provided so estimation and final admission
+	 * use the same worst-case notice size.
 	 */
 	artifactRefMaxChars?: number;
 	/**
-	 * Plan a reversible artifact reference for a candidate's original text. This
-	 * callback MUST be side-effect-free: publish only the originals returned by a
-	 * successful {@link pruneToolOutputs} result.
+	 * Plan an ASCII-safe `artifact://<id>` reference for a candidate's original
+	 * text. This callback MUST be side-effect-free: publish only the originals
+	 * returned by a successful {@link pruneToolOutputs} result.
 	 */
 	artifactRef?: (candidate: PrunedOriginal) => string | undefined;
 }
@@ -928,6 +929,11 @@ export function pruneToolOutputs(
 	const maxArtifactChars = artifactRefMaxChars(options);
 	const candidatesWithArtifacts = plannedCandidates.map(candidate => {
 		const artifact = candidate.complete ? options.artifactRef?.(candidate.original) : undefined;
+		if (artifact !== undefined && !ARTIFACT_REF_PATTERN.test(artifact)) {
+			throw new Error(
+				`artifactRef must be an ASCII-safe artifact://<id> reference for entry ${candidate.original.entryId}`,
+			);
+		}
 		if (artifact !== undefined && artifact.length > maxArtifactChars) {
 			throw new Error(`artifactRef exceeded artifactRefMaxChars for entry ${candidate.original.entryId}`);
 		}
