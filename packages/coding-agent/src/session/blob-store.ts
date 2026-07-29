@@ -2,7 +2,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
-import { isEnoent, logger } from "@gajae-code/utils";
+import { isEnoent, logger, postmortem } from "@gajae-code/utils";
 
 const BLOB_PREFIX = "blob:sha256:";
 const TAKE_BLOB_BUFFER_OWNERSHIP = Symbol("takeBlobBufferOwnership");
@@ -1026,6 +1026,38 @@ interface EphemeralBlobStoreOptions {
 	readonly adoptVerifiedDir?: boolean;
 }
 
+/**
+ * Resident-cache directories this process created and has not disposed.
+ *
+ * The directory name embeds the pid (`<session>-<pid>-<n>`), so a run that never
+ * reaches `dispose()` cannot be cleaned by a later run: the next process picks a
+ * different name, and the constructor's wipe only ever clears its own path. The
+ * leftovers are therefore permanent. A developer machine held seven of them from
+ * dead pids, up to 26 days old, totalling 13.4 MB of externalized session text.
+ */
+const liveResidentCacheDirs = new Set<string>();
+
+/** Resident-cache directories still tracked by this process. Test seam. */
+export function trackedResidentCacheDirsForTest(): string[] {
+	return [...liveResidentCacheDirs];
+}
+
+/**
+ * Sweep the directories this process created when it exits abnormally, matching
+ * `shell-snapshot` and `python-runner-artifact`. Best-effort by contract: a
+ * postmortem handler must not throw.
+ */
+postmortem.register("session-resident-cache", () => {
+	for (const dir of [...liveResidentCacheDirs]) {
+		try {
+			fs.rmSync(dir, { recursive: true, force: true });
+		} catch {
+			// Exit path: a failed removal must not mask the original fault.
+		}
+		liveResidentCacheDirs.delete(dir);
+	}
+});
+
 export class EphemeralBlobStore extends BlobStore {
 	/**
 	 * Bounded LRU byte budget for the in-memory buffer cache. Keeps recent
@@ -1045,6 +1077,7 @@ export class EphemeralBlobStore extends BlobStore {
 		if (this.#adoptedVerifiedDir) return;
 		fs.rmSync(dir, { recursive: true, force: true });
 		fs.mkdirSync(dir, { recursive: true, mode: BLOB_DIR_MODE });
+		liveResidentCacheDirs.add(dir);
 	}
 
 	/**
@@ -1202,6 +1235,8 @@ export class EphemeralBlobStore extends BlobStore {
 			this.#disposed = true;
 			return;
 		}
+		// Untrack before removing so the sweep cannot race a clean disposal.
+		liveResidentCacheDirs.delete(this.dir);
 		fs.rmSync(this.dir, { recursive: true, force: true });
 	}
 }
