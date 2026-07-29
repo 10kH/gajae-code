@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
+import { Agent, type AgentContext } from "@gajae-code/agent-core";
 import type { AssistantMessage, ToolResultMessage } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -247,10 +247,18 @@ describe("pruning cache-epoch invariant", () => {
 			}
 		});
 
-		const result = await session.pruneToolOutputsForTests(abortController.signal);
+		const context: AgentContext = {
+			systemPrompt: session.state.systemPrompt,
+			messages: [...session.messages, assistantMessage(190_000)],
+			tools: [],
+		};
+		const result = await session.runMidRunMaintenanceForTests(context, {
+			signal: abortController.signal,
+			awaitEventDrain: async () => {},
+		});
 
 		expect(aborted).toBe(true);
-		expect(result).toBeUndefined();
+		expect(result).toBe("aborted");
 		expect(prunedEntryCount()).toBe(0);
 		expect((await artifactManager.listFiles()).filter(file => file.endsWith(".bash.log"))).toEqual([]);
 	});

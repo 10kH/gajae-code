@@ -9198,14 +9198,6 @@ export class AgentSession {
 		return this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
 	}
 
-	/** Test seam: stage and commit tool-output pruning under a caller-owned abort signal. */
-	pruneToolOutputsForTests(
-		signal?: AbortSignal,
-		overThreshold = true,
-	): Promise<{ prunedCount: number; tokensSaved: number; committed: boolean } | undefined> {
-		return this.#pruneToolOutputs(signal, overThreshold);
-	}
-
 	/** Read-only test seam for active mid-run EventStream drain barriers. */
 	get activeMidRunBarrierCountForTests(): number {
 		return this.#activeMidRunBarrierControllers.size;
