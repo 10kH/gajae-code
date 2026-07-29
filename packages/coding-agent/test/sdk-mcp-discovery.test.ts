@@ -87,7 +87,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		authStorage = await AuthStorage.create(":memory:");
 		modelRegistry = new ModelRegistry(authStorage);
 	});
-	function createIsolatedSessionOptions() {
+	function createIsolatedSessionOptions(toolNames: string[] | null = ["read"]) {
 		return {
 			cwd: tempDir,
 			agentDir: tempDir,
@@ -101,7 +101,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			promptTemplates: [],
 			slashCommands: [],
 			enableLsp: false,
-			toolNames: ["read"],
+			toolNames: toolNames ?? undefined,
 		};
 	}
 	async function expectExactConfigLoadFailureWarning(configPath: string, sensitiveValues: string[]): Promise<void> {
@@ -185,6 +185,31 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 
 			expect(getServerInstructions).not.toHaveBeenCalled();
 			expect(session.systemPrompt.join("\n")).not.toContain(instructionMarker);
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("preserves default built-in tools when explicit MCP config omits toolNames", async () => {
+		const configPath = path.join(tempDir, "explicit-mcp.json");
+		vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockResolvedValue(
+			createMcpLoadResult([createMcpCustomTool("mcp__exact_lookup", "exact", "lookup")]),
+		);
+
+		const { session } = await createAgentSession({
+			...createIsolatedSessionOptions(null),
+			mcpConfigPath: configPath,
+		});
+		try {
+			expect(session.getActiveToolNames()).toEqual(
+				expect.arrayContaining([
+					"read",
+					"bash",
+					"skill",
+					"skill_discovery",
+					"search_tool_bm25",
+					"mcp__exact_lookup",
+				]),
+			);
 		} finally {
 			await session.dispose();
 		}
