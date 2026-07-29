@@ -2901,7 +2901,13 @@ describe("telegram daemon", () => {
 		// Generation 30 adds capability-versioned tool activity; generation 31
 		// rolls out lifecycle cleanup; generation 32 adds sound-policy
 		// configuration and delivery without changing the wire protocol.
-		expect(DAEMON_GENERATION).toBe(32);
+		expect(DAEMON_GENERATION).toBe(33);
+	});
+	test("keeps wire protocol 3 while generation 33 adds replay-safe multi-select state", () => {
+		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
+		// Generation 32 adds sound-policy configuration and delivery; generation
+		// 33 adds action-bound multi-select state without changing the wire protocol.
+		expect(DAEMON_GENERATION).toBe(33);
 	});
 	test.each([
 		"1",
@@ -6008,6 +6014,57 @@ describe("telegram daemon", () => {
 		expect(FakeWs.instances[0]!.sent).toHaveLength(0);
 		expect(JSON.parse(FakeWs.instances[1]!.sent[0]!)).toEqual({ type: "reply", id: "askB", answer: 0, token: "tb" });
 		expect(bot.calls.some(c => c.method === "answerCallbackQuery")).toBe(true);
+	});
+
+	test("multi-select state decorates Telegram labels without changing callback values", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: setPrivateAgentDir(settings(agentDir), agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			rich: { enabled: false },
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "initial",
+			question: "Pick all",
+			options: ["Alpha", "Beta"],
+			selectedOptionIndices: [],
+		});
+		const initial = bot.calls.find(call => call.method === "sendMessage")!.body;
+		expect(initial.text).toContain("☐ Alpha");
+		expect(initial.text).toContain("☐ Beta");
+
+		bot.calls.length = 0;
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask",
+			question: "Pick all",
+			options: ["Alpha", "Beta"],
+			selectedOptionIndices: [1],
+		});
+		const sent = bot.calls.find(call => call.method === "sendMessage")!.body;
+		expect(sent.text).toContain("☐ Alpha");
+		expect(sent.text).toContain("☑ Beta");
+		const alias = sent.reply_markup.inline_keyboard.flat()[1].callback_data;
+		await daemon.handleTelegramUpdate({
+			update_id: 1,
+			callback_query: { id: "cb", data: alias, message: { chat: { id: 42 } } },
+		});
+		expect(JSON.parse(FakeWs.instances[0]!.sent[0]!)).toEqual({
+			type: "reply",
+			id: "ask",
+			answer: 1,
+			token: "ts",
+		});
 	});
 
 	test("callback alias reply is delivered when Telegram callback ack fails", async () => {
