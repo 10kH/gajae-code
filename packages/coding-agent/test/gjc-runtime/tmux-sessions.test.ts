@@ -760,6 +760,9 @@ describe("GJC tmux session management", () => {
 		// Non-Linux probes report a placeholder PID. Pinning `#{pid}` to it builds a
 		// predicate no live tmux server can satisfy, which used to refuse profile
 		// tagging (and its cleanup) on every non-Linux host.
+		// Force `platform: "darwin"` so planTmuxOwnerIsolationSync accepts the
+		// not_applicable cgroup proof (isSafeServerProof rejects that shape on linux)
+		// and the create path reaches the guarded tag/cleanup contract under test.
 		__setMutationServerProofForTests(() => ({ pid: 1, startTime: "not-applicable", pidProven: false }));
 		__setCreateOwnerIsolationForTests({
 			probe: {
@@ -801,11 +804,14 @@ describe("GJC tmux session management", () => {
 			return spawnResult(0, "");
 		});
 		expect(() =>
-			createGjcTmuxSession({
-				GJC_TMUX_COMMAND: "tmux",
-				GJC_TMUX_SESSION: "managed",
-				GJC_COORDINATOR_SESSION_STATE_FILE: path.join(os.tmpdir(), `gjc-unproven-${crypto.randomUUID()}.json`),
-			}),
+			createGjcTmuxSession(
+				{
+					GJC_TMUX_COMMAND: "tmux",
+					GJC_TMUX_SESSION: "managed",
+					GJC_COORDINATOR_SESSION_STATE_FILE: path.join(os.tmpdir(), `gjc-unproven-${crypto.randomUUID()}.json`),
+				},
+				{ platform: "darwin" },
+			),
 		).toThrow("gjc_tmux_profile_tag_failed_cleanup_failed");
 		const guarded = calls.find(command => command[1] === "if-shell");
 		expect(guarded?.slice(0, 5)).toEqual(["tmux", "if-shell", "-t", "$1", "-F"]);
