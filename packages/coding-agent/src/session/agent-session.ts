@@ -4337,8 +4337,17 @@ export class AgentSession {
 		return compactionSettings.autoContinue === false ? "auto_continue_disabled_non_resumable_tail" : undefined;
 	}
 
-	#scheduleOverflowRetryContinuation(generation: number, resourceRunId?: string): boolean {
+	async #scheduleOverflowRetryContinuation(generation: number, resourceRunId?: string): Promise<boolean> {
 		this.#stripOverflowFailedTurnForRetry();
+		const snapshot = await this.#compactionStateSnapshot();
+		if (
+			snapshot.goal?.status === "paused" &&
+			!snapshot.queuedMessages &&
+			snapshot.lastAssistantStopReason !== "length"
+		) {
+			this.#logCompactionContinuationSkipped("overflow_retry", "paused_goal");
+			return false;
+		}
 		if (this.#isResumableAgentTail()) {
 			this.#scheduleAgentContinue({
 				delayMs: 100,
@@ -11860,7 +11869,7 @@ export class AgentSession {
 				});
 				return "continuationScheduled" in status && status.continuationScheduled === true;
 			}
-			return this.#scheduleOverflowRetryContinuation(generation, resourceRunId);
+			return await this.#scheduleOverflowRetryContinuation(generation, resourceRunId);
 		}
 		const compactionSettings = this.settings.getGroup("compaction");
 		if (!compactionSettings.enabled || compactionSettings.strategy === "off") return false;
@@ -13363,7 +13372,10 @@ export class AgentSession {
 					return { kind: "skipped" };
 				}
 				if (willRetry) {
-					return { kind: "skipped", continuationScheduled: this.#scheduleOverflowRetryContinuation(generation) };
+					return {
+						kind: "skipped",
+						continuationScheduled: await this.#scheduleOverflowRetryContinuation(generation),
+					};
 				}
 				if (continueAfterMaintenance && reason !== "idle" && this.agent.hasQueuedMessages()) {
 					this.#scheduleAgentContinue({
@@ -13611,7 +13623,10 @@ export class AgentSession {
 			if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
 
 			if (willRetry) {
-				return { kind: "compacted", continuationScheduled: this.#scheduleOverflowRetryContinuation(generation) };
+				return {
+					kind: "compacted",
+					continuationScheduled: await this.#scheduleOverflowRetryContinuation(generation),
+				};
 			}
 			if (continueAfterMaintenance && reason !== "idle" && this.agent.hasQueuedMessages()) {
 				// Auto-compaction can complete while follow-up/steering/custom messages are waiting.

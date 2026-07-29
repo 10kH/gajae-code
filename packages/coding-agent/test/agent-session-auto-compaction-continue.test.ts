@@ -234,7 +234,11 @@ describe("AgentSession auto-compaction continuation", () => {
 		).toBe(false);
 	});
 
-	it("overflow retry stays parked for a paused human-wait goal", async () => {
+	it("resumable overflow retry stays parked for a paused human-wait goal", async () => {
+		await session.dispose();
+		authStorage.close();
+		tempDir.removeSync();
+		await createSession({ "compaction.keepRecentTokens": 1 });
 		session.setGoalModeState({
 			enabled: false,
 			mode: "active",
@@ -250,12 +254,39 @@ describe("AgentSession auto-compaction continuation", () => {
 		});
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		for (let index = 0; index < 4; index++) {
+			sessionManager.appendMessage({
+				role: "user",
+				content: `paused seed user ${index}`,
+				timestamp: Date.now() + index * 2,
+			});
+			sessionManager.appendMessage(assistantMessage({ timestamp: Date.now() + index * 2 + 1 }));
+		}
+		sessionManager.appendMessage({
+			role: "user",
+			content: "paused resumable retry boundary",
+			timestamp: Date.now() + 100,
+		});
 		const overflow = assistantMessage({
 			stopReason: "error",
 			errorMessage: "prompt is too long: 1000001 tokens > 1000000 maximum",
+			timestamp: Date.now() + 101,
+		});
+		const originalReplaceMessages = session.agent.replaceMessages.bind(session.agent);
+		vi.spyOn(session.agent, "replaceMessages").mockImplementation(messages => {
+			originalReplaceMessages(messages);
+			const tail = session.agent.state.messages.at(-1);
+			if (tail?.role === "assistant" && tail.stopReason === "error") {
+				session.agent.appendMessage({
+					role: "user",
+					content: "paused resumable retry boundary",
+					timestamp: Date.now() + 102,
+				});
+				session.agent.appendMessage(overflow);
+			}
 		});
 		await driveCompaction(overflow);
-		await advancePostPrompt(50);
+		await advancePostPrompt(200);
 		await session.waitForIdle();
 		expect(continueSpy).not.toHaveBeenCalled();
 		expect(promptSpy).not.toHaveBeenCalled();
