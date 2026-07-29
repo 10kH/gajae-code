@@ -10,6 +10,7 @@
 - Ralplan can persist a typed `disposition` stage (`ralplan.review_conflicts.v1`) when Architect and Critic prescribe incompatible actions on the same plan target. Writes fail closed until every conflict has an explicit disposition, and source receipts must resolve against the same-pass Architect/Critic rows in the run index (#2902).
 
 ### Fixed
+- Terminal input now normalizes Option/Meta navigation and psmux modified-Enter encodings through the native key parser, keeping legacy, Kitty CSI-u, and modifyOtherKeys behavior consistent.
 
 - Broker artifact cleanup no longer promotes a non-empty `cleanup_pending` quarantine to transcript-phase completion. The broker advances only when the retained quarantine is root-only/empty or when the lower layer returns `artifacts_removed`, so artifact bytes cannot vanish behind a success receipt (#3489).
 - POSIX parent identity reproof/fsync is now centralized before every promotable artifact-phase result, preventing a crash-window where a rename is lost after durable retirement is recorded (#3489).
