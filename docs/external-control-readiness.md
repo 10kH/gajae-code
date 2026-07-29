@@ -58,7 +58,9 @@ The following example starts the `opus-codex` model preset and allows tool calls
 Air supplies MCP servers through ACP session requests. GJC accepts client-supplied stdio, HTTP, and SSE definitions for new sessions and offline resume. Do not add `--mcp-config` to the ACP command: that CLI option is intentionally unsupported for broker-backed ACP. A live session's MCP configuration is immutable; reconnect declarations from Air attach to the existing configuration instead of attempting to replace it. Close or resume the offline session to change its MCP configuration.
 Air clients that advertise form elicitation receive `AskUserQuestion` selections and free-text prompts through ACP; declining or cancelling the form leaves the ask unanswered.
 
-For local development, `bun run restart:sdk-broker` asks the published broker to shut down over its authenticated loopback channel, waits for that broker identity to disappear, and starts a replacement. Use `--agent-dir <path>` when testing an isolated agent directory.
+For local development, `bun run restart:sdk-broker` asks the published broker to shut down over its authenticated loopback channel, waits for that broker identity to disappear, and starts a replacement. A broker that predates the `broker.shutdown` operation answers `unknown_operation`; the restart then falls back to a `SIGTERM` sent only when the published pid still carries the published process incarnation. Use `--agent-dir <path>` when testing an isolated agent directory.
+
+Restarting the broker alone leaves the session-host processes it spawned running, so ACP clients keep reattaching to sessions that still execute the previous source. Pass `--close-session-hosts` to close those sessions through the live broker first; only sessions served by a `sdk session-host-internal` process are selected, so interactive sessions publishing their own endpoint are never closed.
 
 Air-created Git worktrees are supported because each ACP request's absolute `cwd` becomes the session workspace. Additional ACP workspace roots are not currently supported and are rejected instead of being advertised.
 
