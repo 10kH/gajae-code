@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 - Provider streams now surface first-event watchdog expiry as a typed timeout so callers can apply bounded retry policy without parsing error prose.
+- Codex websocket first-event timeouts now discard the timed-out connection before the outer retry/fallback layer handles the typed failure, preventing late frames from the abandoned request from being consumed by the replayed turn.
 - Codex named-tool requests now recognize provider `Tool choice '<name>' not found in 'tools' parameter` errors as runtime capability failures and retry once without forcing the choice.
 - The Kimi OAuth host (`KIMI_CODE_OAUTH_HOST` / `KIMI_OAUTH_HOST`) is now resolved from trusted environment sources only. That host receives the device-authorization request, the authorization-code exchange, and the refresh call that carries the existing refresh token, so reading it through the merged view that includes the caller's `cwd/.env` let a repository redirect the login flow and collect the user's Kimi credentials. Resolution now uses the non-project resolver; shell and user-level configuration is unchanged.
 - The documented `GJC_NO_STRICT` environment variable now takes effect. `adaptSchemaForStrict` read only the legacy `PI_NO_STRICT`, so an operator hitting a provider that rejects strict function schemas set the documented name and strict mode stayed on. Both names are honoured, canonical name first, and `GJC_NO_STRICT` is now listed in the environment-variable reference rather than only in the schema-normalisation note.
