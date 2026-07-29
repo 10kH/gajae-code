@@ -2458,6 +2458,9 @@ class CodexWebSocketConnection {
 			await promise;
 			if (timeout) clearTimeout(timeout);
 			if (timedOut && this.#queue.length === 0) {
+				if (providerCode === STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE) {
+					this.close("first-event-timeout");
+				}
 				return createCodexWebSocketTransportError(timeoutReason, providerCode);
 			}
 		}
