@@ -1,5 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import { type Component, TUI } from "@gajae-code/tui";
+import {
+	type Component,
+	encodeKittyPlacementDelete,
+	extractKittyPlacementReferences,
+	getCellDimensions,
+	Image,
+	ImageProtocol,
+	resetKittyTransmissions,
+	setCellDimensions,
+	setKittyTransmitWriter,
+	setTerminalImageProtocol,
+	TERMINAL,
+	TUI,
+} from "@gajae-code/tui";
 import { visibleWidth } from "@gajae-code/tui/utils";
 import { VirtualTerminal } from "./virtual-terminal";
 
@@ -18,6 +31,27 @@ class MutableLinesComponent implements Component {
 
 	render(width: number): string[] {
 		return this.#lines.map(line => line.slice(0, width));
+	}
+}
+
+class StreamingImageTranscript implements Component {
+	#revision = 0;
+	#tailCount = 3;
+	#image: Image;
+
+	constructor(image: Image) {
+		this.#image = image;
+	}
+
+	append(): void {
+		this.#revision += 1;
+		this.#tailCount += 1;
+	}
+
+	invalidate(): void {}
+
+	render(width: number): string[] {
+		return [`status-${this.#revision}`, ...this.#image.render(width), ...rows("tail-", this.#tailCount)];
 	}
 }
 
@@ -196,6 +230,64 @@ describe("TUI terminal-state regressions", () => {
 				expect(countMatches(term.getScrollBuffer(), /final-8/)).toBe(1);
 			} finally {
 				tui.stop();
+			}
+		});
+
+		it("removes a Kitty placement when sticky live viewport repaint moves its anchor into scrollback", async () => {
+			const originalProtocol = TERMINAL.imageProtocol;
+			const originalCellDimensions = getCellDimensions();
+			setCellDimensions({ widthPx: 10, heightPx: 10 });
+			setTerminalImageProtocol(ImageProtocol.Kitty);
+			resetKittyTransmissions();
+			setKittyTransmitWriter(() => {});
+
+			const term = new VirtualTerminal(40, 6, { isProcessTerminal: true });
+			const tui = new TUI(term);
+			const transcript = new StreamingImageTranscript(
+				new Image(
+					"AA==",
+					"image/png",
+					{ fallbackColor: value => value },
+					{ maxWidthCells: 4, maxHeightCells: 2 },
+					{ widthPx: 20, heightPx: 20 },
+				),
+			);
+			const composer = new MutableLinesComponent(["composer"]);
+			tui.addChild(transcript);
+			tui.addChild(composer);
+			tui.setBottomPinnedComponent(composer);
+
+			try {
+				tui.start();
+				await settle(term);
+				const [placement] = extractKittyPlacementReferences(term.getWriteLog().join(""));
+				expect(placement).toBeDefined();
+
+				term.clearWriteLog();
+				transcript.append();
+				tui.requestRender();
+				await settle(term);
+				const liveOutput = term.getWriteLog().join("");
+				expect(liveOutput).toContain(encodeKittyPlacementDelete(placement!));
+				expect(extractKittyPlacementReferences(liveOutput)).toEqual([]);
+
+				term.clearWriteLog();
+				expect(tui.scrollViewportPages(-1)).toBe(true);
+				await term.flush();
+				expect(extractKittyPlacementReferences(term.getWriteLog().join(""))).toEqual([placement]);
+
+				term.clearWriteLog();
+				expect(tui.followLiveViewport()).toBe(true);
+				await term.flush();
+				const followedOutput = term.getWriteLog().join("");
+				expect(followedOutput).toContain(encodeKittyPlacementDelete(placement!));
+				expect(extractKittyPlacementReferences(followedOutput)).toEqual([]);
+			} finally {
+				tui.stop();
+				setCellDimensions(originalCellDimensions);
+				setTerminalImageProtocol(originalProtocol);
+				resetKittyTransmissions();
+				setKittyTransmitWriter(sequence => process.stdout.write(sequence));
 			}
 		});
 

@@ -10,9 +10,12 @@ import { isKeyRelease } from "./keys";
 import { renderMetrics } from "./metrics";
 import type { Terminal } from "./terminal";
 import {
+	encodeKittyPlacementDelete,
+	extractKittyPlacementReferences,
 	ImageProtocol,
 	isImageProtocolForced,
 	isUnderTerminalMultiplexer,
+	type KittyPlacementReference,
 	setCellDimensions,
 	setTerminalImageProtocol,
 	TERMINAL,
@@ -638,6 +641,10 @@ type RenderCommitWaiter = {
 	timer: NodeJS.Timeout;
 };
 
+type KittyPlacementSpan = KittyPlacementReference & {
+	row: number;
+};
+
 /**
  * TUI - Main class for managing terminal UI with differential rendering
  */
@@ -652,6 +659,7 @@ export class TUI extends Container {
 	 * return stable string instances) so its normalized form can be reused (bounded normalize).
 	 */
 	#previousRaw: string[] = [];
+	#kittyPlacementSpans: KittyPlacementSpan[] = [];
 	#lineNormalizationCache = new Map<string, LineNormalizationCacheEntry>();
 	#lineEmitWidthCache = new Map<string, number>();
 	#lineTruncationCache = new Map<string, string>();
@@ -2507,6 +2515,21 @@ export class TUI extends Container {
 		return lines;
 	}
 
+	#kittyViewportCleanup(placements: KittyPlacementSpan[], viewportTop: number, height: number): string {
+		if (TERMINAL.imageProtocol !== ImageProtocol.Kitty || height <= 0) return "";
+		const viewportBottom = viewportTop + height;
+		const deleted = new Set<string>();
+		let output = "";
+		for (const placement of placements) {
+			if (placement.row >= viewportBottom || placement.row + placement.rows <= viewportTop) continue;
+			const key = `${placement.imageId}:${placement.placementId}`;
+			if (deleted.has(key)) continue;
+			deleted.add(key);
+			output += encodeKittyPlacementDelete(placement);
+		}
+		return output;
+	}
+
 	#pinnedChildLines(component: Component, renderedChildren: Map<Component, string[]>): string[] {
 		const lines = renderedChildren.get(component);
 		if (lines === undefined) throw new Error("Missing rendered direct child for pinned suffix");
@@ -2669,6 +2692,7 @@ export class TUI extends Container {
 		allowPastLiveBottom = false,
 		onPainted?: () => void,
 		paintLive = false,
+		placementsToClear: KittyPlacementSpan[] = this.#kittyPlacementSpans,
 	): boolean {
 		const paintManual = this.#manualViewportTop !== undefined && !paintLive;
 		if (height <= 0 || width <= 0) return false;
@@ -2683,6 +2707,7 @@ export class TUI extends Container {
 		const nextViewportTop = Math.max(0, Math.min(maxViewportTop, viewportTop));
 		const currentScreenRow = Math.max(0, Math.min(height - 1, this.#hardwareCursorRow - this.#viewportTopRow));
 		let buffer = "\x1b[?2026h";
+		buffer += this.#kittyViewportCleanup(placementsToClear, this.#viewportTopRow, height);
 		if (currentScreenRow > 0) {
 			buffer += `\x1b[${currentScreenRow}A`;
 		}
@@ -2764,23 +2789,30 @@ export class TUI extends Container {
 		const renderedLines: string[] = [];
 		const renderedChildren = new Map<Component, string[]>();
 		let anchorFrame: ViewportAnchorFrame | null = null;
+		const previousKittyPlacementSpans = this.#kittyPlacementSpans;
+		const nextKittyPlacementSpans: KittyPlacementSpan[] = [];
+		const pinnedChildIndex =
+			this.#bottomPinnedComponent === null ? -1 : this.children.indexOf(this.#bottomPinnedComponent);
+		const hasStickySuffix = pinnedChildIndex >= 0;
 		const anchorRenderFailureCountBefore = viewportAnchorRenderFailureCount;
-		for (const child of this.children) {
+		for (let childIndex = 0; childIndex < this.children.length; childIndex++) {
+			const child = this.children[childIndex];
 			const rendered = safeRenderComponentWithViewportAnchors(child, width, "tui-child");
 			renderedChildren.set(child, rendered.lines);
 			if (child === this.#viewportAnchorComponent && rendered.anchors.some(anchor => anchor !== null)) {
 				anchorFrame = { startRow: renderedLines.length, anchors: rendered.anchors };
 			}
-			for (const line of rendered.lines) renderedLines.push(line);
-		}
-		let pinnedChildIndex = -1;
-		for (let index = 0; index < this.children.length; index++) {
-			if (this.children[index] === this.#bottomPinnedComponent) {
-				pinnedChildIndex = index;
-				break;
+			const trackPlacements = !hasStickySuffix || childIndex < pinnedChildIndex;
+			for (const line of rendered.lines) {
+				if (trackPlacements && line.includes(ImageProtocol.Kitty)) {
+					const row = renderedLines.length;
+					for (const placement of extractKittyPlacementReferences(line)) {
+						nextKittyPlacementSpans.push({ ...placement, row });
+					}
+				}
+				renderedLines.push(line);
 			}
 		}
-		const hasStickySuffix = pinnedChildIndex >= 0;
 		const sourceTranscriptLineCount = hasStickySuffix
 			? this.children
 					.slice(0, pinnedChildIndex)
@@ -2870,6 +2902,7 @@ export class TUI extends Container {
 			if (usedWindowNormalize) renderMetrics.recordLineCount("offscreenScan", diffStart);
 		}
 		this.#latestRenderedLines = newLines;
+		this.#kittyPlacementSpans = nextKittyPlacementSpans;
 		this.#manualTranscriptLineCount = sourceTranscriptLineCount;
 		this.#manualSuffixLineCount = Math.max(0, newLines.length - sourceTranscriptLineCount);
 		const naturalViewportTop = Math.max(0, newLines.length - height);
@@ -2912,6 +2945,9 @@ export class TUI extends Container {
 						null,
 						"failed semantic viewport render",
 						true,
+						undefined,
+						false,
+						previousKittyPlacementSpans,
 					);
 					this.#previousLines = newLines;
 					this.#previousWidth = width;
@@ -2930,6 +2966,9 @@ export class TUI extends Container {
 					null,
 					"unresolved semantic viewport render",
 					true,
+					undefined,
+					false,
+					previousKittyPlacementSpans,
 				);
 				this.#previousWidth = width;
 				this.#previousHeight = height;
@@ -2957,6 +2996,9 @@ export class TUI extends Container {
 					null,
 					"manual viewport render",
 					this.#manualViewportAnchor !== null,
+					undefined,
+					false,
+					previousKittyPlacementSpans,
 				)
 			) {
 				this.#previousLines = newLines;
@@ -2981,6 +3023,7 @@ export class TUI extends Container {
 			this.#fullRedrawCount += 1;
 			if (renderMetrics.enabled) renderMetrics.recordFullRedraw(reason);
 			let buffer = "\x1b[?2026h"; // Begin synchronized output
+			if (clear) buffer += this.#kittyViewportCleanup(previousKittyPlacementSpans, prevViewportTop, height);
 			// Skip clearing scrollback (3J) in hosts where clear/replay can snap the
 			// native viewport away from the live prompt (tmux/screen, Windows ConPTY) —
 			// unless the caller explicitly needs history erased (the settled width
@@ -3027,6 +3070,7 @@ export class TUI extends Container {
 			const nextViewportTop = targetViewportTop;
 			const currentScreenRow = Math.max(0, Math.min(height - 1, hardwareCursorRow - prevViewportTop));
 			let buffer = "\x1b[?2026h";
+			buffer += this.#kittyViewportCleanup(previousKittyPlacementSpans, prevViewportTop, height);
 			if (currentScreenRow > 0) {
 				buffer += `\x1b[${currentScreenRow}A`;
 			}
