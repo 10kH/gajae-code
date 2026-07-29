@@ -18,6 +18,8 @@ function deps(overrides: Partial<RestartSdkBrokerDeps> = {}): RestartSdkBrokerDe
 	return {
 		readDiscovery: async () => null,
 		shutdown: async () => {},
+		listSessionHosts: async () => [],
+		closeSession: async () => {},
 		signal: () => {},
 		ensure: async () => discovery(2, "darwin:2:0"),
 		sleep: async () => {},
@@ -114,6 +116,55 @@ test("falls back to an identity-fenced signal when the broker lacks broker.shutd
 	);
 
 	expect(signalled).toEqual([previous]);
+	expect(result).toEqual({ previousPid: 1, pid: 2 });
+});
+
+test("closes session hosts through the live broker before shutting it down", async () => {
+	const previous = discovery(1, "darwin:1:0");
+	const discoveries = [previous, null, null];
+	const calls: unknown[] = [];
+	const result = await restartSdkBroker(
+		{ agentDir: "/agent", closeSessionHosts: true },
+		deps({
+			readDiscovery: async () => discoveries.shift() ?? null,
+			listSessionHosts: async value => {
+				calls.push({ kind: "list", pid: value.pid });
+				return ["session-a", "session-b"];
+			},
+			closeSession: async (value, sessionId) => {
+				calls.push({ kind: "close", pid: value.pid, sessionId });
+			},
+			shutdown: async value => {
+				calls.push({ kind: "shutdown", pid: value.pid });
+			},
+		}),
+	);
+
+	expect(calls).toEqual([
+		{ kind: "list", pid: 1 },
+		{ kind: "close", pid: 1, sessionId: "session-a" },
+		{ kind: "close", pid: 1, sessionId: "session-b" },
+		{ kind: "shutdown", pid: 1 },
+	]);
+	expect(result).toEqual({ previousPid: 1, pid: 2, closedSessionIds: ["session-a", "session-b"] });
+});
+
+test("leaves session hosts running unless closing them was requested", async () => {
+	const previous = discovery(1, "darwin:1:0");
+	const discoveries = [previous, null, null];
+	let listed = false;
+	const result = await restartSdkBroker(
+		{ agentDir: "/agent" },
+		deps({
+			readDiscovery: async () => discoveries.shift() ?? null,
+			listSessionHosts: async () => {
+				listed = true;
+				return ["session-a"];
+			},
+		}),
+	);
+
+	expect(listed).toBe(false);
 	expect(result).toEqual({ previousPid: 1, pid: 2 });
 });
 

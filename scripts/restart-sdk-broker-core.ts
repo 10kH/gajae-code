@@ -11,15 +11,21 @@ export interface BrokerDiscoveryLike {
 export interface RestartSdkBrokerOptions {
 	agentDir: string;
 	gracefulTimeoutMs?: number;
+	/** Close the broker-hosted session processes before replacing the broker. */
+	closeSessionHosts?: boolean;
 }
 
 export interface RestartSdkBrokerResult {
 	previousPid?: number;
 	pid: number;
+	closedSessionIds?: string[];
 }
 
 export interface RestartSdkBrokerDeps {
 	readDiscovery(agentDir: string, heartbeatTtlMs: number): Promise<BrokerDiscoveryLike | null>;
+	/** Live sessions served by a `sdk session-host-internal` process; never interactive sessions. */
+	listSessionHosts(discovery: BrokerDiscoveryLike): Promise<string[]>;
+	closeSession(discovery: BrokerDiscoveryLike, sessionId: string): Promise<void>;
 	shutdown(discovery: BrokerDiscoveryLike): Promise<void>;
 	/** Identity-fenced SIGTERM for brokers that predate the `broker.shutdown` operation. */
 	signal(discovery: BrokerDiscoveryLike): void;
@@ -44,6 +50,17 @@ async function stopPreviousBroker(discovery: BrokerDiscoveryLike, deps: RestartS
 	}
 }
 
+/**
+ * Session hosts outlive the broker that spawned them, so a broker-only restart keeps
+ * serving whatever source those processes started with. Closing them through the live
+ * broker reuses its verified-identity teardown instead of signalling pids from here.
+ */
+async function closeSessionHosts(discovery: BrokerDiscoveryLike, deps: RestartSdkBrokerDeps): Promise<string[]> {
+	const sessionIds = await deps.listSessionHosts(discovery);
+	for (const sessionId of sessionIds) await deps.closeSession(discovery, sessionId);
+	return sessionIds;
+}
+
 export async function restartSdkBroker(
 	options: RestartSdkBrokerOptions,
 	deps: RestartSdkBrokerDeps,
@@ -54,7 +71,9 @@ export async function restartSdkBroker(
 	}
 
 	const previous = await deps.readDiscovery(options.agentDir, Number.POSITIVE_INFINITY);
+	let closedSessionIds: string[] | undefined;
 	if (previous) {
+		if (options.closeSessionHosts) closedSessionIds = await closeSessionHosts(previous, deps);
 		await stopPreviousBroker(previous, deps);
 		const deadline = Date.now() + gracefulTimeoutMs;
 		while (Date.now() < deadline) {
@@ -72,5 +91,9 @@ export async function restartSdkBroker(
 	if (previous && replacement.pid === previous.pid && replacement.incarnation === previous.incarnation) {
 		throw new Error("SDK broker restart returned the previous process identity.");
 	}
-	return { ...(previous ? { previousPid: previous.pid } : {}), pid: replacement.pid };
+	return {
+		...(previous ? { previousPid: previous.pid } : {}),
+		pid: replacement.pid,
+		...(closedSessionIds ? { closedSessionIds } : {}),
+	};
 }

@@ -60,6 +60,8 @@ Air clients that advertise form elicitation receive `AskUserQuestion` selections
 
 For local development, `bun run restart:sdk-broker` asks the published broker to shut down over its authenticated loopback channel, waits for that broker identity to disappear, and starts a replacement. A broker that predates the `broker.shutdown` operation answers `unknown_operation`; the restart then falls back to a `SIGTERM` sent only when the published pid still carries the published process incarnation. Use `--agent-dir <path>` when testing an isolated agent directory.
 
+Restarting the broker alone leaves the session-host processes it spawned running, so ACP clients keep reattaching to sessions that still execute the previous source. Pass `--close-session-hosts` to close those sessions through the live broker first; only sessions served by a `sdk session-host-internal` process are selected, so interactive sessions publishing their own endpoint are never closed.
+
 Air-created Git worktrees are supported because each ACP request's absolute `cwd` becomes the session workspace. Additional ACP workspace roots are not currently supported and are rejected instead of being advertised.
 
 Session title and update metadata are advisory state for the active ACP process. Text, thought, tool-call, and tool-result history is replayed on load, but historical binary image bytes are not replayed.
