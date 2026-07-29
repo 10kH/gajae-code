@@ -44,9 +44,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * non-Linux direct tmux lifecycle cleanup semantics. Generation 32 applies
  * Telegram sound-notification policy across daemon delivery paths. Generation
  * 33 adds action-bound multi-select state rendering and replay-safe option
- * snapshots.
+ * snapshots. Generation 34 converts non-photo image formats (including WebP)
+ * into Telegram-compatible photo uploads when possible.
  */
-export const DAEMON_GENERATION = 33;
+export const DAEMON_GENERATION = 34;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 1 covers
