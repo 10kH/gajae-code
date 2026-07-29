@@ -52,6 +52,9 @@
 - Auto-retry now strips the whole trailing run of failed assistant attempts before continuing. A turn wedged by an `invalid_prompt` repair leaves two error assistant messages behind, and dropping only the last one left an assistant tail that `agent.continue()` refuses, so the retry died with "Retry continuation failed to start" and the turn was lost.
 
 - Session Observer now receives persisted subagent session paths on lifecycle and progress events, so active ralplan reviewer transcripts render instead of remaining at `No transcript entries yet`.
+### Changed
+
+- Bash tool output now keeps only the last 1 KiB when it exceeds the inline capture budget, reducing noisy model input and nudging callers toward focused commands and dedicated search tools. Users who explicitly configure `tools.artifactTailBytes` or `tools.artifactHeadBytes` can set the tail budget or opt into head+tail middle elision. Complete streams received by the Bash tool remain artifact-backed when storage is available; client-truncated ACP tails stay explicitly marked incomplete and cannot be reconstructed locally. Direct user `!` commands retain the existing shared executor window.
 
 ## [0.12.0] - 2026-07-28
 ### Resume fixes
