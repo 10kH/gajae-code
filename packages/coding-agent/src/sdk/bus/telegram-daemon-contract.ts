@@ -45,9 +45,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Telegram sound-notification policy across daemon delivery paths. Generation
  * 33 adds action-bound multi-select state rendering and replay-safe option
  * snapshots. Generation 34 converts non-photo image formats (including WebP)
- * into Telegram-compatible photo uploads when possible.
+ * into Telegram-compatible photo uploads when possible. Generation 35 adds
+ * user-created topic adoption (forum-topic folder picker).
  */
-export const DAEMON_GENERATION = 34;
+export const DAEMON_GENERATION = 35;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 1 covers
