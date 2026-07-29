@@ -27,6 +27,10 @@ async function managedDirectories(root: string): Promise<string[]> {
 	return directories;
 }
 
+function normalizedWindowsPath(pathname: string): string {
+	return path.resolve(pathname).toLowerCase();
+}
+
 it("skips unsupported managed directory fsync on Windows", () => {
 	expect(shouldFsyncManagedDirectory("win32")).toBe(false);
 	expect(shouldFsyncManagedDirectory("linux")).toBe(true);
@@ -47,8 +51,14 @@ describe.skipIf(process.platform !== "win32")("Windows managed session directory
 		]);
 
 		expect(direct.kind).toBe("resolved");
-		expect(viaAlias).toEqual(direct);
-		if (direct.kind === "resolved") {
+		expect(viaAlias.kind).toBe("resolved");
+		if (direct.kind === "resolved" && viaAlias.kind === "resolved") {
+			const { legacyLexicalCwd: directLegacyCwd, ...directManagedIdentity } = direct.scope;
+			const { legacyLexicalCwd: aliasLegacyCwd, ...aliasManagedIdentity } = viaAlias.scope;
+			expect(aliasManagedIdentity).toEqual(directManagedIdentity);
+			expect(directLegacyCwd).toBe(path.resolve(workspace));
+			expect(aliasLegacyCwd).toBe(path.resolve(alias));
+			expect(aliasLegacyCwd).not.toBe(directLegacyCwd);
 			expect(direct.scope.canonicalCwd).toStartWith("\\\\?\\Volume{");
 			expect(direct.scope.directoryName).toMatch(/^v2-[a-z2-7]{52}$/);
 		}
@@ -120,8 +130,12 @@ describe.skipIf(process.platform !== "win32")("Windows managed session directory
 		await first.flush();
 		await first.close();
 
-		const preExistingManagedDirectories = new Set(
-			(await managedDirectories(path.join(agentDir, "sessions"))).map(directory => path.resolve(directory)),
+		const sessionsDirectory = path.join(agentDir, "sessions");
+		const preExistingManagedDirectories = new Map(
+			(await managedDirectories(sessionsDirectory)).map(directory => [
+				normalizedWindowsPath(directory),
+				path.relative(sessionsDirectory, directory) || ".",
+			]),
 		);
 		const applyCallsBeforeSecondStartup = apply.mock.calls.length;
 		const verifyCallsBeforeSecondStartup = verify.mock.calls.length;
@@ -142,17 +156,21 @@ describe.skipIf(process.platform !== "win32")("Windows managed session directory
 		const secondVerifyExpectedCalls = verifyExpected.mock.calls.slice(verifyExpectedCallsBeforeSecondStartup);
 		expect(
 			secondApplyCalls.filter(
-				([pathname, kind]) => kind === "directory" && preExistingManagedDirectories.has(path.resolve(pathname)),
+				([pathname, kind]) =>
+					kind === "directory" && preExistingManagedDirectories.has(normalizedWindowsPath(pathname)),
 			),
 		).toHaveLength(0);
 		expect(repair.mock.calls.slice(repairCallsBeforeSecondStartup)).toHaveLength(0);
-		expect(
-			[...preExistingManagedDirectories].every(directory =>
-				secondVerifyExpectedCalls.some(
-					([pathname, kind]) => kind === "directory" && path.resolve(pathname) === directory,
-				),
-			),
-		).toBe(true);
+		const verifiedDirectories = new Set(
+			secondVerifyExpectedCalls
+				.filter(([, kind]) => kind === "directory")
+				.map(([pathname]) => normalizedWindowsPath(pathname)),
+		);
+		const missingVerifications = [...preExistingManagedDirectories]
+			.filter(([normalized]) => !verifiedDirectories.has(normalized))
+			.map(([, relative]) => relative)
+			.sort();
+		expect(missingVerifications).toEqual([]);
 		expect(secondVerifyCalls.filter(([, kind]) => kind === "directory")).toHaveLength(0);
 	});
 
