@@ -6,7 +6,7 @@ import { logger } from "@gajae-code/utils";
 import * as configValue from "../../src/config/resolve-config-value";
 import { loadMCPJsonFile } from "../../src/discovery/mcp-json";
 import * as mcpClient from "../../src/runtime-mcp/client";
-import { createMCPManager, MCPManager } from "../../src/runtime-mcp/manager";
+import { createMCPManager, MCPManager, resolveExactConfigStartupTimeoutMs } from "../../src/runtime-mcp/manager";
 import { MCPTool } from "../../src/runtime-mcp/tool-bridge";
 import type { JsonRpcMessage, MCPServerConfig, MCPServerConnection, MCPTransport } from "../../src/runtime-mcp/types";
 import { MCPExpectedFailure } from "../../src/runtime-mcp/types";
@@ -131,6 +131,21 @@ setInterval(() => {}, 1000);
 		} finally {
 			await manager.disconnectAll();
 		}
+	});
+
+	test("uses the 30-second default only for exact-config servers that omit timeout", () => {
+		expect(
+			resolveExactConfigStartupTimeoutMs([
+				{ command: "configured-long", timeout: 5_000 },
+				{ command: "configured-short", timeout: 1_000 },
+			]),
+		).toBe(5_500);
+		expect(
+			resolveExactConfigStartupTimeoutMs([{ command: "configured", timeout: 5_000 }, { command: "default" }]),
+		).toBe(30_500);
+		expect(resolveExactConfigStartupTimeoutMs([{ command: "configured-long", timeout: 35_000 }])).toBe(35_500);
+		expect(resolveExactConfigStartupTimeoutMs([{ command: "invalid", timeout: 0 }])).toBe(30_500);
+		expect(resolveExactConfigStartupTimeoutMs([])).toBe(250);
 	});
 
 	test("honors default and configured connection timeouts for an explicit tools-only config", async () => {

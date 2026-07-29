@@ -89,11 +89,15 @@ export function resolveStartupTimeoutMs(configs: MCPServerConfig[], maxStartupTi
 	return Math.min(ceiling, Math.max(STARTUP_TIMEOUT_MS, Math.max(...configuredTimeouts) + STARTUP_TIMEOUT_GRACE_MS));
 }
 
-function resolveExactConfigStartupTimeoutMs(configs: MCPServerConfig[]): number {
-	const configuredTimeouts = configs
-		.map(config => config.timeout)
-		.filter((timeout): timeout is number => typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0);
-	return Math.max(DEFAULT_EXACT_CONFIG_STARTUP_TIMEOUT_MS, ...configuredTimeouts) + STARTUP_TIMEOUT_GRACE_MS;
+export function resolveExactConfigStartupTimeoutMs(configs: MCPServerConfig[]): number {
+	const effectiveTimeouts = configs.map(config => {
+		const timeout = config.timeout;
+		return typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0
+			? timeout
+			: DEFAULT_EXACT_CONFIG_STARTUP_TIMEOUT_MS;
+	});
+	if (effectiveTimeouts.length === 0) return STARTUP_TIMEOUT_MS;
+	return Math.max(...effectiveTimeouts) + STARTUP_TIMEOUT_GRACE_MS;
 }
 
 function trackPromise<T>(promise: Promise<T>): TrackedPromise<T> {
