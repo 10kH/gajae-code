@@ -348,6 +348,7 @@ OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth
 | Variable                             | Behavior                                             |
 | ------------------------------------ | ---------------------------------------------------- |
 | `GJC_OPENAI_CODE_DEBUG`                     | `1`/`true` enables OpenAI code provider debug logging      |
+| `GJC_NO_STRICT`                       | Global bypass for OpenAI-style strict schema enforcement (`adaptSchemaForStrict`); legacy alias `PI_NO_STRICT` |
 | `GJC_OPENAI_CODE_WEBSOCKET`                 | `1`/`true` enables websocket transport preference    |
 | `GJC_OPENAI_CODE_WEBSOCKET_V2`              | `1`/`true` enables websocket v2 path                 |
 | `GJC_OPENAI_CODE_WEBSOCKET_IDLE_TIMEOUT_MS` | Positive integer override (default 300000)           |
