@@ -302,6 +302,32 @@ export function isCanonicalGjcWorkflowSkill(skill: string): skill is CanonicalGj
 	return (CANONICAL_GJC_WORKFLOW_SKILLS as readonly string[]).includes(skill);
 }
 
+/**
+ * Nonterminal phases that intentionally await workflow-specific integration
+ * rather than a generic synthetic compaction continuation.
+ */
+const CONTINUATION_INERT_WORKFLOW_PHASES: Readonly<Partial<Record<CanonicalGjcWorkflowSkill, ReadonlySet<string>>>> = {
+	team: new Set(["awaiting_integration"]),
+};
+
+/**
+ * Continuation inertness for compaction auto-continue, derived from each
+ * workflow's manifest contract: manifest-terminal and explicitly inert phases
+ * are inert; unknown skills or phases unknown to the skill's manifest are
+ * conservatively inert so a synthetic continuation never wakes an unrecognized
+ * workflow. Generic Ultragoal `blocked` remains continuation-active because its
+ * blocker may be autonomously resolvable; verified human pauses are represented
+ * by the inline goal's `paused` status instead.
+ */
+export function isWorkflowContinuationInert(skill: string, phase: string): boolean {
+	const normalizedPhase = phase.trim().toLowerCase();
+	if (!isCanonicalGjcWorkflowSkill(skill)) return true;
+	const manifest = getSkillManifest(skill);
+	if (manifest.terminalStates.some(terminal => terminal.toLowerCase() === normalizedPhase)) return true;
+	if (CONTINUATION_INERT_WORKFLOW_PHASES[skill]?.has(normalizedPhase)) return true;
+	return !manifest.states.some(state => state.id.toLowerCase() === normalizedPhase);
+}
+
 export function listActiveSkills(raw: unknown): SkillActiveEntry[] {
 	if (!raw || typeof raw !== "object") return [];
 	const state = raw as SkillActiveState;
@@ -615,6 +641,8 @@ async function mergeVisibleEntries(
 export type VisibleSkillActiveStateCacheTier = "security" | "hud";
 export interface ReadVisibleSkillActiveStateOptions {
 	tier?: VisibleSkillActiveStateCacheTier;
+	/** Bypass all signature/TTL caches for authorization decisions. */
+	bypassCache?: boolean;
 }
 
 interface ActiveStateStatSignature {
@@ -747,6 +775,10 @@ export async function readVisibleSkillActiveState(
 	}
 	const resolvedCwd = path.resolve(cwd);
 	const cacheKey = visibleActiveStateCacheKey(resolvedCwd, resolvedSessionId);
+	if (opts?.bypassCache) {
+		visibleSkillActiveStateCache.delete(cacheKey);
+		return await readVisibleSkillActiveStateUncached(resolvedCwd, resolvedSessionId);
+	}
 	const tier = opts?.tier ?? "security";
 	const now = Date.now();
 	const cached = visibleSkillActiveStateCache.get(cacheKey);

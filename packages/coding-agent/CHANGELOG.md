@@ -28,6 +28,7 @@
 ### Changed
 
 - Session Observer now incrementally projects append-only session messages and narrowly patches late tool results, avoiding repeated full-history transcript projection while preserving eager output parity and safe full-projection fallback for ambiguous source changes.
+- Compaction now publishes complete pruned tool outputs as session artifacts transactionally, carries active goal/workflow/todo state into summaries, and skips synthetic auto-continue when no unfinished work remains.
 
 ### Resume fixes
 
