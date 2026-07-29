@@ -8,6 +8,10 @@
 ### Fixed
 - A same-tree detached/resumed subagent could not read a verified `agent://`/`artifact://` reference its parent could read (`No session - agent outputs unavailable`), even though parent/child/sibling tree reads are an explicit acceptance criterion of #326: the runtime never supplied `ToolSession.getAuthorizedArtifactsDirs`, so an adopted subagent (whose own `getArtifactsDir()` intentionally collapses to `null`) reached the scoped resolver with zero authorized directories. `ToolSession` now exposes `getAuthorizedArtifactsDirs`, derived only from the session's own explicitly adopted/shared `ArtifactManager` directory, and it is threaded through `read`, `find`, `search`, `ast_grep`, and `ast_edit`'s internal-URL resolution. No registry-wide session enumeration was added; unrelated sessions, missing metadata, and integrity failures remain denied and fail-closed exactly as before (#3302).
 
+### Changed
+
+- Session Observer now incrementally projects append-only session messages and narrowly patches late tool results, avoiding repeated full-history transcript projection while preserving eager output parity and safe full-projection fallback for ambiguous source changes.
+
 ### Resume fixes
 
 - Eager todo initialization now gives the model the actual phased `todo_write` payload shape (`ops` → `init` → `list` → `phase`/`items`) instead of instructing it to send unsupported `content`, `details`, and status fields, preventing the first forced todo call from failing validation (#3403).

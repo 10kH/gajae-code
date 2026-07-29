@@ -116,11 +116,11 @@ export class TranscriptViewerOverlay extends Container {
 	get isFullscreen(): boolean {
 		return this.#fullscreen;
 	}
-	refresh(identityMap?: ReadonlyMap<string, string>): void {
+	refresh(identityMap?: ReadonlyMap<string, string>, preserveLayoutCache = false): void {
 		if (__transcriptViewerPerfCounters.enabled) __transcriptViewerPerfCounters.refreshRuns++;
-		// Same-id entries may carry new payloads and getDisplayText closures after a source
-		// refresh, so the entire layout cache is dropped before the entries are replaced.
-		this.#layoutCache.clear();
+		// Incremental sources explicitly invalidate same-id payload patches before requesting a
+		// preserving refresh. Other source changes conservatively drop all layout variants.
+		if (!preserveLayoutCache) this.#layoutCache.clear();
 		const previous = this.selectedEntryId;
 		const previousPosition = this.#selected;
 		const reconciledPrevious = previous ? (identityMap?.get(previous) ?? previous) : undefined;
