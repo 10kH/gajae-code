@@ -306,31 +306,48 @@ function buildAssistantArgumentStalenessIndex(entries: SessionEntry[]): Assistan
 	return { latestSuccessfulMutationByPathGroup, failedCallIds };
 }
 
-/**
- * Trailing read selectors (`:50`, `:50-200`, `:50+150`, `:5-16,960-973`,
- * `:raw`, `:conflicts`), possibly stacked (`:2-4:raw`). Stripped to resolve
- * the underlying file for edit invalidation.
- */
-const READ_SELECTOR_SUFFIX = /:(?:raw|conflicts|\d+(?:(?:\+\d+)|(?:-\d*))?(?:,\d+(?:(?:\+\d+)|(?:-\d*))?)*)$/;
+/** Exact read selector grammar mirrored from the read tool without importing its package layer. */
+const READ_SELECTOR_RE = /^(?:L?\d+(?:[-+]L?\d+|-)?(?:,L?\d+(?:[-+]L?\d+|-)?)*|raw|conflicts)$/i;
+const READ_RANGE_SELECTOR_RE = /^L?\d+(?:[-+]L?\d+|-)?(?:,L?\d+(?:[-+]L?\d+|-)?)*$/i;
+const READ_RAW_SELECTOR_RE = /^raw$/i;
 
-/** Base file path of a read target with any line/mode selectors stripped. */
-function readBasePath(path: string): string {
-	let base = path;
-	while (READ_SELECTOR_SUFFIX.test(base)) {
-		base = base.replace(READ_SELECTOR_SUFFIX, "");
+type ReadTarget = { basePath: string; selector?: string };
+
+function splitReadTarget(path: string): ReadTarget {
+	const outerColon = path.lastIndexOf(":");
+	if (outerColon <= 0) return { basePath: path };
+	const outer = path.slice(outerColon + 1);
+	if (!READ_SELECTOR_RE.test(outer)) return { basePath: path };
+
+	let basePath = path.slice(0, outerColon);
+	let selector = outer;
+	const innerColon = basePath.lastIndexOf(":");
+	if (innerColon > 0) {
+		const inner = basePath.slice(innerColon + 1);
+		const compoundRawRange =
+			(READ_RAW_SELECTOR_RE.test(inner) && READ_RANGE_SELECTOR_RE.test(outer)) ||
+			(READ_RANGE_SELECTOR_RE.test(inner) && READ_RAW_SELECTOR_RE.test(outer));
+		if (compoundRawRange) {
+			selector = `${inner}:${outer}`;
+			basePath = basePath.slice(0, innerColon);
+		}
 	}
-	return base;
+	return { basePath, selector };
+}
+
+/** Base file path of a read target with its one valid selector stripped. */
+function readBasePath(path: string): string {
+	return splitReadTarget(path).basePath;
 }
 
 type ReadLineRange = { start: number; end: number };
 
-/** Parse only explicit, provably bounded trailing read ranges. */
+/** Parse only one explicit, provably bounded trailing read range. */
 function readLineRanges(path: string): ReadLineRange[] {
-	if (/(?:^|:)(?:raw|conflicts)(?:$|:)/.test(path)) return [];
-	const match = path.match(/:(\d+(?:(?:\+\d+)|(?:-\d*))?(?:,\d+(?:(?:\+\d+)|(?:-\d*))?)*)$/);
-	if (!match) return [];
-	return match[1].split(",").flatMap(part => {
-		const range = part.match(/^(\d+)([-+])(\d+)$/);
+	const selector = splitReadTarget(path).selector;
+	if (!selector || /(?:^|:)raw(?:$|:)/i.test(selector) || /^conflicts$/i.test(selector)) return [];
+	return selector.split(",").flatMap(part => {
+		const range = part.match(/^L?(\d+)([-+])L?(\d+)$/i);
 		if (!range) return [];
 		const start = Number(range[1]);
 		const end = range[2] === "+" ? start + Number(range[3]) - 1 : Number(range[3]);

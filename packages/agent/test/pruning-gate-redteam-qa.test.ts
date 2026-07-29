@@ -158,6 +158,8 @@ describe("compaction pruning QA red-team gates", () => {
 			["file.ts:50-60", "file.ts:1-500:conflicts", false],
 			["file.ts:50-60:conflicts", "file.ts:1-500", false],
 			["file.ts:50-60:conflicts", "file.ts:50-60:conflicts", true],
+			["file.ts:L50-L60", "file.ts:L1-L500", true],
+			["file.ts:L50-L60", "file.ts:RAW", false],
 		] as const) {
 			const entries: SessionEntry[] = [];
 			const earlier = pair(entries, `earlier-${earlierPath}`, "read", { path: earlierPath });
