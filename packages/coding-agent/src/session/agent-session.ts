@@ -9098,7 +9098,7 @@ export class AgentSession {
 			});
 		}
 		try {
-			const state = await readVisibleSkillActiveState(this.sessionManager.getCwd(), this.sessionId, { tier: "hud" });
+			const state = await readVisibleSkillActiveState(this.sessionManager.getCwd(), this.sessionId);
 			snapshot.activeSkills = (state?.active_skills ?? [])
 				.filter(entry => entry.active !== false)
 				.slice(0, 5)

@@ -431,12 +431,12 @@ describe("pruneToolOutputs red-team boundaries", () => {
 
 		const result = pruneToolOutputs([output], config(), {
 			artifactRefMaxChars: 64,
-			artifactRef: () => "artifact://complete",
+			artifactRef: () => "artifact://13",
 		});
 
 		expect(result.originals).toHaveLength(1);
 		expect(result.originals[0]).toMatchObject({ originalText, complete: true });
-		expect(textOf(output)).toContain("full output: artifact://complete");
+		expect(textOf(output)).toContain("full output: artifact://13");
 	});
 
 	test("does not publish incomplete multi-modal tool results as artifacts", () => {

@@ -449,6 +449,22 @@ describe("staleness supersession ordering", () => {
 		expect(ids).not.toContain(readFailed.id);
 	});
 
+	it("ambiguous per-file edit rows do not stale reads", () => {
+		const entries: SessionEntry[] = [];
+		const read = pair(entries, "ambiguous-read", "read", { path: "src/ambiguous.ts" });
+		const envelope = ["*** Begin Patch", "*** Update File: src/ambiguous.ts", "@@", "-a", "+b", "*** End Patch"].join(
+			"\n",
+		);
+		entries.push(assistantCallEntry("ambiguous-edit", "apply_patch", { input: envelope }));
+		const patchResult = toolResultEntry("ambiguous-edit", "apply_patch", 100);
+		(patchResult.message as ToolResultMessage & { details?: unknown }).details = {
+			perFileResults: [{ path: "src/ambiguous.ts" }],
+		};
+		entries.push(patchResult);
+
+		expect(prunedIds(entries, EAGER)).not.toContain(read.id);
+	});
+
 	it("a same-path edit that partly succeeds still invalidates its reads", () => {
 		const entries: SessionEntry[] = [];
 		const read = pair(entries, "c1", "read", { path: "src/multi.ts" });

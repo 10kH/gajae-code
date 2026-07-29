@@ -366,6 +366,31 @@ describe("AgentSession state-aware compaction", () => {
 		expect(promptSpy).toHaveBeenCalledTimes(1);
 	});
 
+	it("rechecks a workflow that becomes terminal while compaction is running", async () => {
+		await seedActiveSkillState("active");
+		seedCompactionHistory();
+		const compactionStarted = Promise.withResolvers<void>();
+		const releaseCompaction = Promise.withResolvers<void>();
+		compactSpy.mockImplementationOnce(async preparation => {
+			compactionStarted.resolve();
+			await releaseCompaction.promise;
+			return {
+				summary: "compacted",
+				shortSummary: undefined,
+				firstKeptEntryId: preparation.firstKeptEntryId,
+				tokensBefore: preparation.tokensBefore,
+				details: {},
+			};
+		});
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		const compactionRun = compact();
+		await compactionStarted.promise;
+		await seedActiveSkillState("handoff");
+		releaseCompaction.resolve();
+		await compactionRun;
+		expect(promptSpy).not.toHaveBeenCalled();
+	});
+
 	it("continues synthetic auto-continue for a resolvable Ultragoal blocker", async () => {
 		await seedActiveSkillState("blocked");
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();

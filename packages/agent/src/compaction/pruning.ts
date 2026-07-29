@@ -294,10 +294,10 @@ function buildAssistantArgumentStalenessIndex(entries: SessionEntry[]): Assistan
 			failedCallIds.add(call.id);
 			continue;
 		}
-		const failed = failedEditPaths(message);
+		const successfulPaths = successfulEditPaths(message);
 		let mutated = false;
 		for (const group of groups) {
-			if (group.some(groupPath => failed.has(groupPath))) continue;
+			if (successfulPaths !== undefined && !group.some(groupPath => successfulPaths.has(groupPath))) continue;
 			latestSuccessfulMutationByPathGroup.set(pathGroupKey(group), { index: i, callId: call.id });
 			mutated = true;
 		}
@@ -418,32 +418,26 @@ function resultDetailFiles(message: ToolResultMessage): string[] {
 }
 
 /**
- * Paths that FAILED in a per-file edit result (`details.perFileResults`) and
- * were NOT mutated by any same-path entry. Multi-file apply_patch catches
- * per-file failures and still returns a non-error result; a purely-failed
- * path was not mutated and must not stale reads. But apply_patch can emit
- * multiple entries for the same path (e.g. several hunks): if any same-path
- * entry succeeded the file still mutated, so it must NOT be suppressed.
- * Conservative: only an entry explicitly marked `isError === true` counts as
- * a failure; anything else (including ambiguous/malformed entries) counts as
- * a success and keeps the path out of the suppression set.
+ * Paths that a per-file edit result proves were mutated. Multi-file
+ * `apply_patch` can return a non-error envelope while individual files fail, so
+ * only explicit success (`isError === false`) or the normal successful result
+ * shape (a string `diff` with no error flag) counts. Ambiguous/malformed rows
+ * fail closed. If no per-file result array exists, return undefined so ordinary
+ * single-file successful tool results retain their established behavior.
  */
-function failedEditPaths(message: ToolResultMessage): Set<string> {
+function successfulEditPaths(message: ToolResultMessage): Set<string> | undefined {
 	const details = message.details as { perFileResults?: unknown } | undefined;
 	const perFile = details?.perFileResults;
-	if (!Array.isArray(perFile)) return new Set();
-	const failed = new Set<string>();
+	if (!Array.isArray(perFile)) return undefined;
 	const succeeded = new Set<string>();
 	for (const item of perFile) {
-		const entry = item as { path?: unknown; isError?: unknown };
+		const entry = item as { path?: unknown; isError?: unknown; diff?: unknown };
 		if (typeof entry?.path !== "string") continue;
-		if (entry.isError === true) failed.add(entry.path);
-		else succeeded.add(entry.path);
+		if (entry.isError === false || (entry.isError === undefined && typeof entry.diff === "string")) {
+			succeeded.add(entry.path);
+		}
 	}
-	// A path mutated if any same-path entry succeeded, even when another
-	// same-path entry failed; drop those from the suppression set.
-	for (const path of succeeded) failed.delete(path);
-	return failed;
+	return succeeded;
 }
 
 /**
@@ -506,12 +500,11 @@ function buildStalenessIndex(entries: SessionEntry[]): StalenessIndex {
 		resultMeta.set(i, { key, call, message });
 		if (key !== undefined) lastResultIndexByKey.set(key, i);
 		if (EDIT_TOOL_NAMES.has(call.name)) {
-			// Per-file edit results record failures in details.perFileResults;
-			// a failed hunk mutated nothing, so exclude its whole path group
-			// (rename destination included) from touched paths.
-			const failed = failedEditPaths(message);
+			// Per-file edit results prove which path groups actually mutated. A
+			// malformed or ambiguous row cannot invalidate earlier read evidence.
+			const successfulPaths = successfulEditPaths(message);
 			for (const group of editToolPathGroups(call)) {
-				if (group.some(groupPath => failed.has(groupPath))) continue;
+				if (successfulPaths !== undefined && !group.some(groupPath => successfulPaths.has(groupPath))) continue;
 				for (const editPath of group) {
 					lastEditIndexByPath.set(editPath, i);
 				}
@@ -845,7 +838,7 @@ export function shouldRunMaintenancePrune(args: {
 }
 
 const MAX_ARTIFACT_REF_CHARS = 16_384;
-const ARTIFACT_REF_PATTERN = /^artifact:\/\/[a-zA-Z0-9._-]+$/;
+const ARTIFACT_REF_PATTERN = /^artifact:\/\/\d+$/;
 
 export interface PruneToolOutputsOptions {
 	/** Lower the usual minimum only when the caller is already over its compaction threshold. */
@@ -857,9 +850,10 @@ export interface PruneToolOutputsOptions {
 	 */
 	artifactRefMaxChars?: number;
 	/**
-	 * Plan an ASCII-safe `artifact://<id>` reference for a candidate's original
-	 * text. This callback MUST be side-effect-free: publish only the originals
-	 * returned by a successful {@link pruneToolOutputs} result.
+	 * Plan a numeric `artifact://<id>` reference for a candidate's original
+	 * text. The callback may reserve an in-memory identifier, but MUST NOT publish
+	 * files or mutate session entries; publish only the originals returned by a
+	 * successful {@link pruneToolOutputs} result.
 	 */
 	artifactRef?: (candidate: PrunedOriginal) => string | undefined;
 }
@@ -931,7 +925,7 @@ export function pruneToolOutputs(
 		const artifact = candidate.complete ? options.artifactRef?.(candidate.original) : undefined;
 		if (artifact !== undefined && !ARTIFACT_REF_PATTERN.test(artifact)) {
 			throw new Error(
-				`artifactRef must be an ASCII-safe artifact://<id> reference for entry ${candidate.original.entryId}`,
+				`artifactRef must be a numeric artifact://<id> reference for entry ${candidate.original.entryId}`,
 			);
 		}
 		if (artifact !== undefined && artifact.length > maxArtifactChars) {

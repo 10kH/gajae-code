@@ -172,9 +172,9 @@ describe("compaction pruning QA red-team gates", () => {
 		const artifactResult = pruneToolOutputs(
 			entries,
 			{ ...EAGER, protectedTools: [] },
-			{ artifactRefMaxChars: 64, artifactRef: original => `artifact://${original.entryId}` },
+			{ artifactRefMaxChars: 64, artifactRef: () => "artifact://1" },
 		);
-		expect(textOf(old)).toContain(`full output: artifact://${old.id}]`);
+		expect(textOf(old)).toContain("full output: artifact://1]");
 		expect(artifactResult.originals).toEqual([
 			{
 				entryId: old.id,
@@ -249,7 +249,7 @@ describe("compaction pruning QA red-team gates", () => {
 					artifactRef: original => {
 						calls++;
 						if (original.entryId === entries[0].id) throw new Error("second planner failed");
-						return "artifact://first";
+						return "artifact://1";
 					},
 				},
 			),
@@ -271,7 +271,7 @@ describe("compaction pruning QA red-team gates", () => {
 					artifactRef: () => `artifact://${"界".repeat(20)}`,
 				},
 			),
-		).toThrow("ASCII-safe artifact://<id>");
+		).toThrow("numeric artifact://<id>");
 		expect(textOf(dense)).toBe(original);
 		expect((dense.message as ToolResultMessage).prunedAt).toBeUndefined();
 	});
@@ -286,7 +286,7 @@ describe("compaction pruning QA red-team gates", () => {
 			{ ...EAGER, protectedTools: [] },
 			{
 				...options,
-				artifactRef: () => `artifact://${"x".repeat(53)}`,
+				artifactRef: () => `artifact://${"1".repeat(53)}`,
 			},
 		);
 		expect(estimate.prunableCount).toBe(1);
@@ -308,7 +308,7 @@ describe("compaction pruning QA red-team gates", () => {
 				artifactRefMaxChars: 64,
 				artifactRef: () => {
 					artifactCalls++;
-					return "artifact://multi-text";
+					return "artifact://2";
 				},
 			},
 		);
@@ -319,7 +319,7 @@ describe("compaction pruning QA red-team gates", () => {
 			originalText: `${"first block ".repeat(1_000)}\n${"second block ".repeat(1_000)}`,
 			complete: true,
 		});
-		expect(textOf(output)).toContain("full output: artifact://multi-text");
+		expect(textOf(output)).toContain("full output: artifact://2");
 	});
 
 	test("C3 does not publish incomplete image-containing results as full artifacts", () => {
