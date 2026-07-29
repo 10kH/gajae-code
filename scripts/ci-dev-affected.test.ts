@@ -57,6 +57,20 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(hash(noShardReceipt)).toBe("7f3cb1ebf7ca106b8030dd79353dabbc57ed22137ac41e169cc5700d29493091");
 		expect(hash(multiShardReceipt)).toBe("2c298faf1d92681cef1499a7526d1df0e8aee947694804d50aa47e015b222e26");
 	});
+	test("requires a pull request exact head to contain the event base before planning", async () => {
+		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
+		const guardStart = workflow.indexOf("      - name: Verify PR head contains exact base");
+		const guardEnd = workflow.indexOf("\n      - ", guardStart + 1);
+		const guard = workflow.slice(guardStart, guardEnd);
+		expect(guardStart).toBeGreaterThan(0);
+		expect(guard).toContain("if: ${{ github.event_name == 'pull_request' }}");
+		expect(guard).toContain('if ! git fetch --no-tags origin "${GITHUB_BASE_SHA}"; then');
+		expect(guard).toContain("Could not fetch immutable event base ${GITHUB_BASE_SHA}");
+		expect(guard).toContain('if git merge-base --is-ancestor "${GITHUB_BASE_SHA}" HEAD; then');
+		expect(guard).toContain("merge-base exit ${status}");
+		expect(guard).toContain("rebase onto current ${GITHUB_BASE_REF}");
+	});
+
 	test("uses a detached finalized evidence producer and artifact-ID consumer", async () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
 		expect(workflow).toContain("affected-evidence-producer:");
