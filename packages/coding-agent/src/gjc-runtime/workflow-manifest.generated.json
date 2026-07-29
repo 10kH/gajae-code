@@ -1649,7 +1649,7 @@
           "classify-blocker",
           "record-critic-verdict",
           "record-critic-gate-override",
-          "rebaseline-pipeline-overlap"
+          "quality-gate"
         ],
         "name": "evidence",
         "required": true,
@@ -1703,89 +1703,17 @@
       },
       {
         "appliesToVerbs": [
-          "create-goals"
-        ],
-        "name": "goal-metadata-json",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "start-pipeline-overlap"
-        ],
-        "name": "prior-goal-id",
-        "required": true,
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "start-pipeline-overlap"
-        ],
-        "name": "next-goal-id",
-        "required": true,
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "start-pipeline-overlap"
-        ],
-        "name": "review-handles-json",
-        "required": true,
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "start-pipeline-overlap"
-        ],
-        "name": "qa-handles-json",
-        "required": true,
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "start-pipeline-overlap"
-        ],
-        "name": "implementation-handle-json",
-        "required": true,
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "join-pipeline-overlap",
-          "rebaseline-pipeline-overlap"
-        ],
-        "name": "overlap-id",
-        "required": true,
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "join-pipeline-overlap"
-        ],
-        "name": "review-result-json",
-        "required": true,
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "join-pipeline-overlap"
-        ],
-        "name": "qa-result-json",
-        "required": true,
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "rebaseline-pipeline-overlap"
-        ],
-        "name": "target-state-json",
-        "required": true,
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "checkpoint"
+          "checkpoint",
+          "quality-gate"
         ],
         "name": "quality-gate-json",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "quality-gate"
+        ],
+        "name": "goal-id",
         "type": "string"
       },
       {
@@ -1800,14 +1728,6 @@
           "classify-blocker"
         ],
         "name": "goal-id",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
-          "rebaseline-pipeline-overlap"
-        ],
-        "name": "goal-id",
-        "required": true,
         "type": "string"
       },
       {
@@ -1924,10 +1844,7 @@
           "steer",
           "classify-blocker",
           "record-critic-verdict",
-          "record-critic-gate-override",
-          "start-pipeline-overlap",
-          "join-pipeline-overlap",
-          "rebaseline-pipeline-overlap"
+          "record-critic-gate-override"
         ],
         "name": "json",
         "type": "boolean"
@@ -2021,15 +1938,7 @@
         "surface": "command-positional"
       },
       {
-        "name": "start-pipeline-overlap",
-        "surface": "command-positional"
-      },
-      {
-        "name": "join-pipeline-overlap",
-        "surface": "command-positional"
-      },
-      {
-        "name": "rebaseline-pipeline-overlap",
+        "name": "quality-gate",
         "surface": "command-positional"
       },
       {
