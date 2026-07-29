@@ -3640,6 +3640,8 @@ describe("team worker memory guard wiring", () => {
 			GJC_TEAM_WORKER_COMMAND: "true",
 			GJC_TEAM_TMUX_COMMAND: fakeTmux,
 			GJC_TEAM_AUTO_CONTINUE_STALLED_WORKERS: "0",
+			// Fail fast if successor ack never arrives; production default is 120s.
+			GJC_TEAM_MEMORY_GUARD_STARTUP_TIMEOUT_MS: "5000",
 		};
 		const snapshot = await startGjcTeam({
 			workerCount: 2,
@@ -3718,7 +3720,7 @@ describe("team worker memory guard wiring", () => {
 		expect(committedPaths).not.toContain(protectedPath);
 		expect(runGit(workerWorktree!, ["diff", "--cached", "--name-only"]).split(/\r?\n/)).toContain(protectedPath);
 		expect(task.claim?.owner).toBe("worker-2");
-	});
+	}, 15_000);
 
 	it("caps Linux replacement retries and blocks the claimed task on the terminal failure", async () => {
 		cleanupRoot = await createGitRepo();

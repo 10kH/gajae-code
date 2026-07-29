@@ -1638,7 +1638,12 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 	allowAutomaticAction?: boolean;
 	replacementToken?: string;
 	dir: string;
-	taskMutation: GjcTeamTaskMutationCapability;
+	/**
+	 * Acquire the team task-mutation fence only for the blocked-state transition.
+	 * Must not be held across the successor startup-ack wait: concurrent
+	 * `worker-startup-ack` must publish while replacement is in flight.
+	 */
+	withTaskMutation: <T>(fn: (capability: GjcTeamTaskMutationCapability) => Promise<T>) => Promise<T>;
 }): Promise<Record<string, unknown>> {
 	const dir = input.dir;
 	const config = await readConfig(dir);
@@ -1818,16 +1823,18 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		ledger = retried.ledger;
 		await writeWorkerMemoryGuardLedger(dir, ledger);
 		if (retried.finalBlocked)
-			await finalizeWorkerMemoryGuardBlockedState({
-				teamName: input.teamName,
-				dir,
-				worker,
-				task,
-				taskMutation: input.taskMutation,
-				reason: checkpoint.reason,
-				cwd: input.cwd,
-				env: input.env,
-			});
+			await input.withTaskMutation(taskMutation =>
+				finalizeWorkerMemoryGuardBlockedState({
+					teamName: input.teamName,
+					dir,
+					worker,
+					task,
+					taskMutation,
+					reason: checkpoint.reason,
+					cwd: input.cwd,
+					env: input.env,
+				}),
+			);
 		await appendWorkerMemoryGuardAction({
 			dir,
 			teamName: input.teamName,
@@ -1905,16 +1912,18 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 		ledger = retried.ledger;
 		await writeWorkerMemoryGuardLedger(dir, ledger);
 		if (retried.finalBlocked)
-			await finalizeWorkerMemoryGuardBlockedState({
-				teamName: input.teamName,
-				dir,
-				worker,
-				task,
-				taskMutation: input.taskMutation,
-				reason,
-				cwd: input.cwd,
-				env: input.env,
-			});
+			await input.withTaskMutation(taskMutation =>
+				finalizeWorkerMemoryGuardBlockedState({
+					teamName: input.teamName,
+					dir,
+					worker,
+					task,
+					taskMutation,
+					reason,
+					cwd: input.cwd,
+					env: input.env,
+				}),
+			);
 		await appendWorkerMemoryGuardAction({
 			dir,
 			teamName: input.teamName,
@@ -2080,12 +2089,17 @@ async function applyWorkerMemoryGuardUnlocked(input: {
 }
 
 async function applyWorkerMemoryGuard(
-	input: Omit<Parameters<typeof applyWorkerMemoryGuardUnlocked>[0], "dir" | "taskMutation">,
+	input: Omit<Parameters<typeof applyWorkerMemoryGuardUnlocked>[0], "dir" | "withTaskMutation">,
 ): Promise<Record<string, unknown>> {
 	const dir = await findTeamDir(input.teamName, input.cwd, input.env);
-	return withGjcTeamTaskMutation(taskStore(dir), taskMutation =>
-		applyWorkerMemoryGuardUnlocked({ ...input, dir, taskMutation }),
-	);
+	// Do not hold withGjcTeamTaskMutation across relaunchWorkerPaneForMemoryGuard's
+	// startup-ack poll (default 120s). That fence would serialize concurrent
+	// worker-startup-ack publication and hang selector-replacement under CI load.
+	return applyWorkerMemoryGuardUnlocked({
+		...input,
+		dir,
+		withTaskMutation: fn => withGjcTeamTaskMutation(taskStore(dir), fn),
+	});
 }
 async function readPhase(dir: string): Promise<GjcTeamPhase> {
 	try {
