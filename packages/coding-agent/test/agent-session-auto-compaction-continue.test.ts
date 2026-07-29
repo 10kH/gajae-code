@@ -254,6 +254,10 @@ describe("AgentSession auto-compaction continuation", () => {
 		});
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		const endEvents: Extract<AgentSessionEvent, { type: "auto_compaction_end" }>[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") endEvents.push(event);
+		});
 		for (let index = 0; index < 4; index++) {
 			sessionManager.appendMessage({
 				role: "user",
@@ -290,6 +294,7 @@ describe("AgentSession auto-compaction continuation", () => {
 		await session.waitForIdle();
 		expect(continueSpy).not.toHaveBeenCalled();
 		expect(promptSpy).not.toHaveBeenCalled();
+		expect(endEvents.at(-1)?.willRetry).toBe(false);
 	});
 
 	it("overflow with compaction disabled skips compaction and starts one synthetic auto-continue prompt", async () => {

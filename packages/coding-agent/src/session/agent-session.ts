@@ -13342,15 +13342,22 @@ export class AgentSession {
 				const overflowNoopWouldReplay = reason === "overflow" && willRetry && this.#isResumableAgentTail();
 				const continuationSkipReason =
 					!overflowNoopWouldReplay && willRetry ? this.#detectOverflowRetryContinuationSkip() : undefined;
+				if (continuationSkipReason) {
+					this.#logCompactionContinuationSkipped("overflow_retry", continuationSkipReason);
+				}
 				if (overflowNoopWouldReplay) {
 					options?.beforeTerminalOverflowNoop?.();
 				}
+				const overflowContinuationScheduled =
+					!overflowNoopWouldReplay && willRetry && !continuationSkipReason
+						? await this.#scheduleOverflowRetryContinuation(generation)
+						: false;
 				await this.#emitSessionEvent({
 					type: "auto_compaction_end",
 					action,
 					result: undefined,
 					aborted: false,
-					willRetry: overflowNoopWouldReplay ? false : willRetry && !continuationSkipReason,
+					willRetry: overflowContinuationScheduled,
 					errorMessage: overflowNoopWouldReplay
 						? "Context overflow recovery skipped: nothing eligible to compact. Run /clear to preserve this session ID, or switch to a larger-context model before retrying."
 						: undefined,
@@ -13372,10 +13379,9 @@ export class AgentSession {
 					return { kind: "skipped" };
 				}
 				if (willRetry) {
-					return {
-						kind: "skipped",
-						continuationScheduled: await this.#scheduleOverflowRetryContinuation(generation),
-					};
+					return overflowContinuationScheduled
+						? { kind: "skipped", continuationScheduled: true }
+						: { kind: "skipped" };
 				}
 				if (continueAfterMaintenance && reason !== "idle" && this.agent.hasQueuedMessages()) {
 					this.#scheduleAgentContinue({
@@ -13612,21 +13618,25 @@ export class AgentSession {
 			this.#lastOversizedAutoMaintenanceAttemptSignature = undefined;
 
 			const continuationSkipReason = willRetry ? this.#detectOverflowRetryContinuationSkip() : undefined;
+			if (continuationSkipReason) {
+				this.#logCompactionContinuationSkipped("overflow_retry", continuationSkipReason);
+			}
+			const overflowContinuationScheduled =
+				willRetry && !continuationSkipReason ? await this.#scheduleOverflowRetryContinuation(generation) : false;
 			await this.#emitSessionEvent({
 				type: "auto_compaction_end",
 				action,
 				result,
 				aborted: false,
-				willRetry: willRetry && !continuationSkipReason,
+				willRetry: overflowContinuationScheduled,
 				continuationSkipReason,
 			});
 			if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
 
 			if (willRetry) {
-				return {
-					kind: "compacted",
-					continuationScheduled: await this.#scheduleOverflowRetryContinuation(generation),
-				};
+				return overflowContinuationScheduled
+					? { kind: "compacted", continuationScheduled: true }
+					: { kind: "compacted" };
 			}
 			if (continueAfterMaintenance && reason !== "idle" && this.agent.hasQueuedMessages()) {
 				// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
