@@ -292,6 +292,8 @@ export interface ToolSession {
 	strictToolNames?: boolean;
 	/** Get artifacts directory for artifact:// URLs */
 	getArtifactsDir?: () => string | null;
+	/** Additional artifacts directories explicitly authorized for this session's tree (parent/child/sibling reads). Derived only from the explicitly adopted/shared `ArtifactManager`; never enumerates unrelated live sessions. */
+	getAuthorizedArtifactsDirs?: () => readonly string[];
 	/** Get the ArtifactManager backing this session (shared across parent + subagents). */
 	getArtifactManager?: () => ArtifactManager | null;
 	/** Allocate a new artifact path and ID for session-scoped truncated output. */

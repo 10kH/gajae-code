@@ -3413,6 +3413,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const resource = await internalRouter.resolve(url, {
 			cwd: this.session.cwd,
 			getArtifactsDir: this.session.getArtifactsDir,
+			getAuthorizedArtifactsDirs: this.session.getAuthorizedArtifactsDirs,
 			settings: this.session.settings,
 			signal,
 		});

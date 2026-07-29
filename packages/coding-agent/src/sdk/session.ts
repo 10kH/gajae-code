@@ -1632,10 +1632,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		// Wire process-wide internal URL singletons owned by their real classes.
 		// Top-level sessions install the active snapshots; subagents inherit them.
-		// Artifact and agent-output URLs resolve via `AgentRegistry.global()` —
-		// the protocol handlers walk each ref's `sessionManager.getArtifactsDir()`,
-		// which collapses to the parent's dir for subagents (they adopt the
-		// parent's ArtifactManager) so one lookup hits everything.
+		// Artifact and agent-output URLs resolve against explicitly authorized
+		// directories only (see `authorizedArtifactsDirsFromContext`): the
+		// caller's own `sessionManager.getArtifactsDir()` plus, when this session
+		// adopted a shared `ArtifactManager` (subagent tree membership),
+		// `getAuthorizedArtifactsDirs` below. There is no registry-wide lookup.
 		const getArtifactsDir = () => sessionManager.getArtifactsDir();
 		const localProtocolOptions = options.localProtocolOptions ?? {
 			getArtifactsDir,
@@ -1653,6 +1654,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			disposeLocalProtocolOverride = LocalProtocolHandler.installOverride(options.localProtocolOptions);
 		}
 		toolSession.getArtifactsDir = getArtifactsDir;
+		toolSession.getAuthorizedArtifactsDirs = () => {
+			const manager = sessionManager.getArtifactManager();
+			return manager ? [manager.dir] : [];
+		};
 		toolSession.agentOutputManager = new AgentOutputManager(
 			getArtifactsDir,
 			options.parentTaskPrefix ? { parentPrefix: options.parentTaskPrefix } : undefined,

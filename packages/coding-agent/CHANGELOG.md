@@ -5,6 +5,8 @@
 - Subagent setup failures now retain a bounded, redacted cause through live progress, async snapshots, inspect/await, and terminal receipts instead of reporting an empty generic failure.
 - Telegram notification sound can be set to all, important, or none; the reference CLI exposes this with `--sound <all|important|none>`, defaulting to all. Important (ask/idle only) and none are explicit opt-ins for quieter notifications.
 - First-event provider timeouts are configurable and replayed only by AgentSession with a bounded attempt budget, progress-aware safety checks, and measured exhaustion details.
+### Fixed
+- A same-tree detached/resumed subagent could not read a verified `agent://`/`artifact://` reference its parent could read (`No session - agent outputs unavailable`), even though parent/child/sibling tree reads are an explicit acceptance criterion of #326: the runtime never supplied `ToolSession.getAuthorizedArtifactsDirs`, so an adopted subagent (whose own `getArtifactsDir()` intentionally collapses to `null`) reached the scoped resolver with zero authorized directories. `ToolSession` now exposes `getAuthorizedArtifactsDirs`, derived only from the session's own explicitly adopted/shared `ArtifactManager` directory, and it is threaded through `read`, `find`, `search`, `ast_grep`, and `ast_edit`'s internal-URL resolution. No registry-wide session enumeration was added; unrelated sessions, missing metadata, and integrity failures remain denied and fail-closed exactly as before (#3302).
 
 ### Resume fixes
 
