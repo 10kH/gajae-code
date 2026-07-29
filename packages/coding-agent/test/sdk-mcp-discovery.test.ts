@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ThinkingLevel } from "@gajae-code/agent-core";
+import { type AgentTool, ThinkingLevel } from "@gajae-code/agent-core";
 import { AuthStorage, Effort, getBundledModel, type Model } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -13,6 +13,7 @@ import { getAgentDir, logger, Snowflake, setAgentDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { installGjcBundle } from "../src/extensibility/gjc-plugins";
 import { createMCPToolName, type MCPLoadResult, MCPManager } from "../src/runtime-mcp";
+import { BUILTIN_TOOLS } from "../src/tools";
 
 function createMcpCustomTool(name: string, serverName: string, mcpToolName: string): CustomTool {
 	return {
@@ -87,7 +88,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		authStorage = await AuthStorage.create(":memory:");
 		modelRegistry = new ModelRegistry(authStorage);
 	});
-	function createIsolatedSessionOptions() {
+	function createIsolatedSessionOptions(toolNames: string[] | null = ["read"]) {
 		return {
 			cwd: tempDir,
 			agentDir: tempDir,
@@ -101,7 +102,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			promptTemplates: [],
 			slashCommands: [],
 			enableLsp: false,
-			toolNames: ["read"],
+			toolNames: toolNames ?? undefined,
 		};
 	}
 	async function expectExactConfigLoadFailureWarning(configPath: string, sensitiveValues: string[]): Promise<void> {
@@ -185,6 +186,33 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 
 			expect(getServerInstructions).not.toHaveBeenCalled();
 			expect(session.systemPrompt.join("\n")).not.toContain(instructionMarker);
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("preserves default built-in tools when explicit MCP config omits toolNames", async () => {
+		const configPath = path.join(tempDir, "explicit-mcp.json");
+		const defaultBuiltinToolNames = ["read", "bash", "skill", "skill_discovery", "search_tool_bm25"];
+		// Exercise the real undefined-toolNames selection path without constructing every
+		// production tool. The full registry exceeded Bun's 5s test lifetime on CI,
+		// allowing afterEach to restore the MCP spy while the timed-out callback continued.
+		for (const name of Object.keys(BUILTIN_TOOLS)) {
+			vi.spyOn(BUILTIN_TOOLS, name).mockImplementation(() =>
+				defaultBuiltinToolNames.includes(name) ? (createLocalCustomTool(name) as unknown as AgentTool) : null,
+			);
+		}
+		vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockResolvedValue(
+			createMcpLoadResult([createMcpCustomTool("mcp__exact_lookup", "exact", "lookup")]),
+		);
+
+		const { session } = await createAgentSession({
+			...createIsolatedSessionOptions(null),
+			mcpConfigPath: configPath,
+		});
+		try {
+			expect(session.getActiveToolNames()).toEqual(
+				expect.arrayContaining([...defaultBuiltinToolNames, "mcp__exact_lookup"]),
+			);
 		} finally {
 			await session.dispose();
 		}

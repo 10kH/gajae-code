@@ -30,6 +30,10 @@
 - Session Observer now incrementally projects append-only session messages and narrowly patches late tool results, avoiding repeated full-history transcript projection while preserving eager output parity and safe full-projection fallback for ambiguous source changes.
 - Compaction now publishes complete pruned tool outputs as session artifacts transactionally, carries active goal/workflow/todo state into summaries, and skips synthetic auto-continue when no unfinished work remains.
 
+### Fixed
+
+- Explicit `--mcp-config` sessions now honor each server's configured connection timeout during startup instead of aborting otherwise healthy tools-only servers at the ordinary 1.75-second startup ceiling; sessions without an explicit config retain the existing bounded startup policy.
+
 ### Resume fixes
 
 - Eager todo initialization now gives the model the actual phased `todo_write` payload shape (`ops` → `init` → `list` → `phase`/`items`) instead of instructing it to send unsupported `content`, `details`, and status fields, preventing the first forced todo call from failing validation (#3403).
