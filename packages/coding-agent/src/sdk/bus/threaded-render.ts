@@ -104,7 +104,7 @@ function baseMimeType(mime: string): string {
 	return mime.split(";", 1)[0]!.trim().toLowerCase();
 }
 
-function supportsTelegramPhotoUpload(mime: string | undefined): boolean {
+export function supportsTelegramPhotoUpload(mime: string | undefined): boolean {
 	if (mime === undefined) return true;
 	const normalized = baseMimeType(mime);
 	return normalized === "image/jpeg" || normalized === "image/png";

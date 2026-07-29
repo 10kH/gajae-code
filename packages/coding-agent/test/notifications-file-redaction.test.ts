@@ -122,7 +122,7 @@ function expectRedactionBlocked(result: { ok: boolean; error?: string }) {
 	expect(result.error).toContain("redaction is on");
 }
 
-test("telegram file sink forwards image MIME types", async () => {
+test("telegram file sink routes image files through image attachments", async () => {
 	await withNotifications(async () => {
 		const harness = await createHarness(false);
 		const { frames } = await startAndConnect(harness);
@@ -135,12 +135,11 @@ test("telegram file sink forwards image MIME types", async () => {
 
 		expect(result.ok).toBe(true);
 		await waitFor(
-			() => frames.some(frame => frame.type === "file_attachment" && frame.name === "image.webp"),
+			() => frames.some(frame => frame.type === "image_attachment" && frame.mime === "image/webp"),
 			3000,
-			"WebP attachment",
+			"WebP image attachment",
 		);
-		expect(frames.find(frame => frame.type === "file_attachment")).toMatchObject({
-			name: "image.webp",
+		expect(frames.find(frame => frame.type === "image_attachment")).toMatchObject({
 			mime: "image/webp",
 		});
 

@@ -5096,17 +5096,28 @@ export function createNotificationsExtension(
 						if (!canDeliverAsync(runtime, generation)) {
 							return { ok: false, error: TELEGRAM_FILE_REDACTION_ERROR };
 						}
-						pushFileAttachment(
-							runtime,
-							{
-								type: "file_attachment",
+						if (file.mime?.startsWith("image/")) {
+							pushSessionFrame(runtime, {
+								type: "image_attachment",
 								sessionId: runtime.id,
-								name: path.basename(file.path),
+								source: "telegram_send",
 								mime: file.mime,
 								caption: file.caption,
-							},
-							data,
-						);
+								data: data.toString("base64"),
+							});
+						} else {
+							pushFileAttachment(
+								runtime,
+								{
+									type: "file_attachment",
+									sessionId: runtime.id,
+									name: path.basename(file.path),
+									mime: file.mime,
+									caption: file.caption,
+								},
+								data,
+							);
+						}
 						return { ok: true };
 					} catch (e) {
 						return { ok: false, error: e instanceof Error ? e.message : String(e) };
