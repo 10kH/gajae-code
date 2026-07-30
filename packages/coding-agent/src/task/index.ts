@@ -1222,7 +1222,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			content: [
 				{
 					type: "text",
-					text: `Started ${startedJobs.length} background task job${startedJobs.length === 1 ? "" : "s"} using ${params.agent}.${scheduleFailureSummary} Results will be delivered when complete.\n${startedListing}\n${coordinationHint}`,
+					text:
+						asyncState === "running"
+							? `Started ${startedJobs.length} background task job${startedJobs.length === 1 ? "" : "s"} using ${params.agent}.${scheduleFailureSummary} Results will be delivered when complete.\n${startedListing}\n${coordinationHint}`
+							: `Background task batch ${asyncState}: ${completedJobs}/${taskItems.length} finished.${scheduleFailureSummary}\n${startedListing}`,
 				},
 			],
 			details: {
@@ -1230,7 +1233,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				results: [],
 				totalDurationMs: 0,
 				progress: getProgressSnapshot(),
-				async: { state: "running", jobId: startedJobs[0].jobId, type: "task" },
+				async: { state: asyncState, jobId: startedJobs[0].jobId, type: "task" },
 			},
 		};
 	}
