@@ -15,6 +15,7 @@ import {
 	verifyNestedPatchesApplied,
 	verifyRootPatchesApplied,
 } from "../../src/task/worktree";
+import * as gitUtils from "../../src/utils/git";
 
 const tempDirs: string[] = [];
 
@@ -252,5 +253,35 @@ describe("worktree isolation helpers", () => {
 		expect(status).toContain(" M task.txt");
 		expect(status).toContain(" M unstaged.txt");
 		expect(status).toContain("?? untracked.txt");
+	});
+
+	it("rolls back earlier nested repositories when a later apply fails", async () => {
+		const { repo } = await createGitRepo();
+		const nestedDirs = [path.join(repo, "nested-a"), path.join(repo, "nested-b")];
+		const patches: Array<{ relativePath: string; patch: string }> = [];
+		for (const [index, nested] of nestedDirs.entries()) {
+			await fs.mkdir(nested, { recursive: true });
+			await runGit(nested, ["init"]);
+			await runGit(nested, ["config", "user.email", "nested@example.com"]);
+			await runGit(nested, ["config", "user.name", "Nested"]);
+			await fs.writeFile(path.join(nested, "value.txt"), `base-${index}\n`);
+			await runGit(nested, ["add", "value.txt"]);
+			await runGit(nested, ["commit", "-m", "base"]);
+			await fs.writeFile(path.join(nested, "value.txt"), `task-${index}\n`);
+			patches.push({
+				relativePath: path.basename(nested),
+				patch: `${await runGit(nested, ["diff", "--binary", "--", "value.txt"])}\n`,
+			});
+			await runGit(nested, ["checkout", "--", "value.txt"]);
+		}
+		const realApply = gitUtils.patch.applyText.bind(gitUtils.patch);
+		vi.spyOn(gitUtils.patch, "applyText").mockImplementation(async (cwd, patch, options = {}) => {
+			if (!options.reverse && cwd === nestedDirs[1]) throw new Error("simulated later apply failure");
+			await realApply(cwd, patch, options);
+		});
+
+		await expect(applyNestedPatches(repo, patches)).rejects.toThrow("earlier nested patches were rolled back");
+		expect(await fs.readFile(path.join(nestedDirs[0]!, "value.txt"), "utf8")).toBe("base-0\n");
+		expect(await fs.readFile(path.join(nestedDirs[1]!, "value.txt"), "utf8")).toBe("base-1\n");
 	});
 });

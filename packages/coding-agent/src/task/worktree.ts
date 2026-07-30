@@ -249,28 +249,53 @@ export async function captureDeltaPatch(isolationDir: string, baseline: Worktree
 	return { rootPatch, nestedPatches, ...(captureErrors.length ? { captureErrors } : {}) };
 }
 
-/** Apply nested repo patches without staging or committing unrelated owner state. */
+/** Preflight every nested delta, then roll back earlier repositories if a later apply fails. */
 export async function applyNestedPatches(repoRoot: string, patches: NestedRepoPatch[]): Promise<void> {
-	// Group patches by target repo so each task delta is applied in order.
 	const byRepo = new Map<string, NestedRepoPatch[]>();
-	for (const p of patches) {
-		if (!p.patch.trim()) continue;
-		const group = byRepo.get(p.relativePath) ?? [];
-		group.push(p);
-		byRepo.set(p.relativePath, group);
+	for (const patch of patches) {
+		if (!patch.patch.trim()) continue;
+		const group = byRepo.get(patch.relativePath) ?? [];
+		group.push(patch);
+		byRepo.set(patch.relativePath, group);
 	}
 
-	for (const [relativePath, repoPatches] of byRepo) {
+	const prepared: Array<{ relativePath: string; nestedDir: string; combinedPatch: string }> = [];
+	for (const [relativePath, repoPatches] of [...byRepo.entries()].sort(([left], [right]) =>
+		left.localeCompare(right),
+	)) {
 		const nestedDir = path.join(repoRoot, relativePath);
 		try {
 			await fs.access(path.join(nestedDir, ".git"));
 		} catch {
 			throw new Error(`Nested repository is unavailable: ${relativePath}`);
 		}
-
-		for (const { patch } of repoPatches) {
-			await git.patch.applyText(nestedDir, patch);
+		const combinedPatch = git.patch.join(repoPatches.map(entry => entry.patch));
+		if (!(await git.patch.canApplyText(nestedDir, combinedPatch))) {
+			throw new Error(`Nested repository patch does not apply cleanly: ${relativePath}`);
 		}
+		prepared.push({ relativePath, nestedDir, combinedPatch });
+	}
+
+	const applied: typeof prepared = [];
+	try {
+		for (const entry of prepared) {
+			await git.patch.applyText(entry.nestedDir, entry.combinedPatch);
+			applied.push(entry);
+		}
+	} catch (error) {
+		const rollbackFailures: string[] = [];
+		for (const entry of applied.reverse()) {
+			try {
+				await git.patch.applyText(entry.nestedDir, entry.combinedPatch, { reverse: true });
+			} catch {
+				rollbackFailures.push(entry.relativePath);
+			}
+		}
+		const message = error instanceof Error ? error.message : String(error);
+		const rollback = rollbackFailures.length
+			? `; rollback failed for: ${rollbackFailures.join(", ")}`
+			: "; earlier nested patches were rolled back";
+		throw new Error(`Nested repository patch application failed: ${message}${rollback}`);
 	}
 }
 
