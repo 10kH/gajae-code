@@ -1350,6 +1350,112 @@ describe("native GJC ultragoal runtime", () => {
 		expect((await readUltragoalPlan(root))?.goals.find(goal => goal.id === "G001")?.status).toBe("complete");
 	});
 
+	it("boundary default: a minimal deferred gate omits every derivable field and is hydrated by the runtime", async () => {
+		const root = await batchTempDir();
+		await writeStructuralArtifacts(root);
+		await createUltragoalPlan({ cwd: root, brief: "@goal: A\na\n@goal: B\nb\n@goal: C\nc" });
+		await startNextUltragoalGoal({ cwd: root });
+
+		const minimal = JSON.stringify({
+			deferredToBatch: {
+				ranLanes: ["targetedVerification"],
+				targetedVerification: {
+					status: "passed",
+					commands: ["bun test targeted"],
+					evidence: "targeted suite passed for G001",
+				},
+			},
+		});
+		// Read-only validate and checkpoint apply identical hydration rules.
+		expect(
+			await validateUltragoalQualityGateReadOnly({ cwd: root, qualityGateJson: minimal, goalId: "G001" }),
+		).toEqual({ valid: true, errors: [] });
+		await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "minimal deferred gate hydrated by the runtime",
+			qualityGateJson: minimal,
+		});
+		expect((await readUltragoalPlan(root))?.goals.find(goal => goal.id === "G001")?.status).toBe("complete");
+	});
+
+	it("validation batch deferred: a minimal member gate is auto-hydrated with the batch tuple and change-set hash", async () => {
+		const root = await batchTempDir();
+		await writeStructuralArtifacts(root);
+		await createUltragoalPlan({
+			cwd: root,
+			brief: "@goal: A\na\n@goal: B\nb\n@goal: C\nc",
+			validationBatches: [
+				{ schemaVersion: 1, batchId: "VB001", memberIds: ["G001", "G002", "G003"], finalGoalId: "G003" },
+			],
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		const accepted = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "minimal member gate",
+			qualityGateJson: JSON.stringify({
+				deferredToBatch: {
+					targetedVerification: {
+						status: "passed",
+						commands: ["bun test targeted"],
+						evidence: "targeted suite passed for G001",
+					},
+				},
+			}),
+		});
+		const batch = accepted.goals[0]!.completionVerification?.validationBatch;
+		if (batch?.role !== "deferred-member") throw new Error("expected a deferred-member receipt");
+		// The runtime computed and stamped the change-set hash; no hand-computed hash was supplied.
+		expect(batch.changeSetHash).toMatch(/^[0-9a-f]{64}$/);
+	});
+
+	it("validation batch close: a minimal close gate is auto-hydrated from durable receipts", async () => {
+		const root = await batchTempDir();
+		await writeStructuralArtifacts(root);
+		let plan = await createUltragoalPlan({
+			cwd: root,
+			brief: "@goal: A\na\n@goal: B\nb\n@goal: C\nc",
+			validationBatches: [
+				{ schemaVersion: 1, batchId: "VB001", memberIds: ["G001", "G002", "G003"], finalGoalId: "G003" },
+			],
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		plan = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G001",
+			status: "complete",
+			evidence: "g001 deferred",
+			qualityGateJson: deferredBatchGate("G001", plan.goals[0]!.validationBatch!),
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		plan = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G002",
+			status: "complete",
+			evidence: "g002 deferred",
+			qualityGateJson: deferredBatchGate("G002", plan.goals[1]!.validationBatch!),
+		});
+		await startNextUltragoalGoal({ cwd: root });
+		const closed = await checkpointUltragoalGoal({
+			cwd: root,
+			goalId: "G003",
+			status: "complete",
+			evidence: "minimal close hydrated by the runtime",
+			qualityGateJson: JSON.stringify({
+				...JSON.parse(passingQualityGate()),
+				validationBatchClose: { coverageEvidence: "Union validation covered the validation batch." },
+			}),
+		});
+		const batch = closed.goals[2]!.completionVerification?.validationBatch;
+		if (batch?.role !== "batch-close") throw new Error("expected a batch-close receipt");
+		// unionHash and member hashes were derived by the runtime, not hand-computed.
+		expect(batch.unionHash).toMatch(/^[0-9a-f]{64}$/);
+		expect(Object.keys(batch.memberChangeSetHashes).sort()).toEqual(["G001", "G002", "G003"]);
+	});
+
 	it("boundary default: declaration and evidence must agree in both directions", async () => {
 		const root = await batchTempDir();
 		await writeStructuralArtifacts(root);

@@ -2252,6 +2252,163 @@ function validateDeferredLaneDeclaration(deferred: JsonObject, fieldName: string
 	}
 }
 
+/**
+ * Agent-friendly deferred-gate hydration: the runtime already stores the durable
+ * batch tuple and computes the cumulative change set itself, so a deferred gate
+ * only has to prove what the runtime cannot know — that targeted verification ran.
+ * Every mechanical field (`kind`, the batch tuple, `deferredLanes`, and the whole
+ * `changeSet` block including `paths` and `changeSetHash`) is auto-filled when
+ * omitted. Explicitly supplied values are never overwritten, so a wrong
+ * declaration still fails closed.
+ */
+function hydrateDeferredGateDefaults(
+	gate: JsonObject,
+	goal: UltragoalGoal,
+	changeSet: UltragoalChangeSet | undefined,
+): JsonObject {
+	const deferred = qualityGateObject(gate.deferredToBatch);
+	if (!deferred) return gate;
+	const metadata = goal.validationBatch;
+	// The final member must carry the full strict gate; never help it defer.
+	if (metadata && goal.id === metadata.finalGoalId) return gate;
+	const hydrated: JsonObject = { ...deferred };
+	if (hydrated.kind === undefined) hydrated.kind = "validation-batch-deferred";
+	if (metadata) {
+		if (hydrated.schemaVersion === undefined) hydrated.schemaVersion = metadata.schemaVersion;
+		if (hydrated.batchId === undefined) hydrated.batchId = metadata.batchId;
+		if (hydrated.memberIds === undefined) hydrated.memberIds = [...metadata.memberIds];
+		if (hydrated.finalGoalId === undefined) hydrated.finalGoalId = metadata.finalGoalId;
+		if (hydrated.metadataHash === undefined) hydrated.metadataHash = metadata.metadataHash;
+	}
+	if (hydrated.deferredLanes === undefined) hydrated.deferredLanes = ["architectReview", "executorQa"];
+	const computedRows = (changeSet?.paths ?? []).map(row => ({
+		path: row.path,
+		status: row.status,
+		...(row.oldPath ? { oldPath: row.oldPath } : {}),
+	}));
+	const computedByPath = new Map(computedRows.map(row => [row.path, row]));
+	const declared = qualityGateObject(hydrated.changeSet);
+	const changeSetRecord: JsonObject = declared ? { ...declared } : {};
+	if (changeSetRecord.memberGoalId === undefined) changeSetRecord.memberGoalId = goal.id;
+	if (changeSetRecord.cumulativeFromBase === undefined) changeSetRecord.cumulativeFromBase = true;
+	if (changeSetRecord.paths === undefined) {
+		changeSetRecord.paths = computedRows;
+	} else if (Array.isArray(changeSetRecord.paths)) {
+		// Accept plain-string rows and rows without a status; resolve the status
+		// from the computed change set instead of demanding git trivia.
+		changeSetRecord.paths = changeSetRecord.paths.map(row => {
+			const record = typeof row === "string" ? { path: row } : qualityGateObject(row);
+			if (!record) return row;
+			const pathValue = nonEmptyString(record.path);
+			if (!pathValue || nonEmptyString(record.status)) return record;
+			const computed = computedByPath.get(normalizeRepoPath(pathValue));
+			return {
+				...record,
+				status: computed?.status ?? "unknown",
+				...(computed?.oldPath && record.oldPath === undefined ? { oldPath: computed.oldPath } : {}),
+			};
+		});
+	}
+	if (changeSetRecord.changeSetHash === undefined) {
+		try {
+			changeSetRecord.changeSetHash = changeSetHashForPaths(
+				canonicalChangeSetRows(changeSetRecord.paths, "deferredToBatch.changeSet.paths"),
+			);
+		} catch {
+			// Malformed rows: leave the hash unset so validation reports the row defect.
+		}
+	}
+	hydrated.changeSet = changeSetRecord;
+	return { ...gate, deferredToBatch: hydrated };
+}
+
+/**
+ * Agent-friendly batch-close hydration, mirroring `hydrateDeferredGateDefaults`:
+ * every `validationBatchClose` field except `coverageEvidence` is derivable from
+ * durable state (batch metadata, member receipts) and the computed cumulative
+ * change set, so it is auto-filled when omitted. Supplied values are never
+ * overwritten and still fail closed when wrong. The minimal close is the full
+ * strict gate plus `{"validationBatchClose":{"coverageEvidence":"..."}}`.
+ */
+function hydrateBatchCloseDefaults(input: {
+	gate: JsonObject;
+	plan: UltragoalPlan;
+	goal: UltragoalGoal;
+	ledger: readonly UltragoalLedgerEvent[];
+	changeSet?: UltragoalChangeSet;
+}): JsonObject {
+	const metadata = input.goal.validationBatch;
+	if (!metadata || input.goal.id !== metadata.finalGoalId) return input.gate;
+	const requested = qualityGateObject(input.gate.validationBatchClose);
+	if (!requested) return input.gate;
+	// The replacement-close kind has its own dedicated hydrator.
+	if (requested.kind === "review-blocker-replacement-close") return input.gate;
+	const close: JsonObject = { ...requested };
+	if (close.schemaVersion === undefined) close.schemaVersion = 1;
+	if (close.kind === undefined) close.kind = "validation-batch-close";
+	if (close.batchId === undefined) close.batchId = metadata.batchId;
+	if (close.finalGoalId === undefined) close.finalGoalId = metadata.finalGoalId;
+	if (close.memberIds === undefined) close.memberIds = [...metadata.memberIds];
+	const derivedMetadataHashes: Record<string, string> = {};
+	const derivedChangeSetHashes: Record<string, string> = {};
+	const derivedReceipts: JsonObject[] = [];
+	for (const memberId of metadata.memberIds) {
+		const member = input.plan.goals.find(goal => goal.id === memberId);
+		if (member?.validationBatch) derivedMetadataHashes[memberId] = member.validationBatch.metadataHash;
+		if (!member || memberId === input.goal.id) continue;
+		try {
+			const receipt = requireDeferredMemberReceiptFresh(input.plan, input.ledger, member, "validationBatchClose hydration");
+			derivedChangeSetHashes[memberId] = receipt.validationBatch.changeSetHash;
+			derivedReceipts.push({
+				goalId: memberId,
+				receiptId: receipt.receiptId,
+				checkpointLedgerEventId: receipt.checkpointLedgerEventId,
+				qualityGateHash: receipt.qualityGateHash,
+				changeSetHash: receipt.validationBatch.changeSetHash,
+				role: "deferred-member",
+			});
+		} catch {
+			// Member not fresh/complete: omit it so validation reports the real defect.
+		}
+	}
+	const suppliedMetadataHashes = qualityGateObject(close.memberMetadataHashes);
+	if (close.memberMetadataHashes === undefined) close.memberMetadataHashes = derivedMetadataHashes;
+	else if (suppliedMetadataHashes) close.memberMetadataHashes = { ...derivedMetadataHashes, ...suppliedMetadataHashes };
+	if (close.memberReceipts === undefined) close.memberReceipts = derivedReceipts;
+	const requestedUnion = qualityGateObject(close.unionChangeSet);
+	const union: JsonObject = requestedUnion ? { ...requestedUnion } : {};
+	if (union.source === undefined) union.source = "validation-batch";
+	if (union.paths === undefined) {
+		union.paths = (input.changeSet?.paths ?? []).map(row => ({
+			path: row.path,
+			status: row.status,
+			...(row.oldPath ? { oldPath: row.oldPath } : {}),
+		}));
+	}
+	try {
+		const unionRows = canonicalChangeSetRows(union.paths, "validationBatchClose.unionChangeSet.paths");
+		const suppliedChangeSetHashes = qualityGateObject(union.memberChangeSetHashes);
+		const memberChangeSetHashes: Record<string, unknown> = {
+			...derivedChangeSetHashes,
+			[metadata.finalGoalId]: changeSetHashForPaths(unionRows),
+			...suppliedChangeSetHashes,
+		};
+		if (union.memberChangeSetHashes === undefined || suppliedChangeSetHashes) {
+			union.memberChangeSetHashes = memberChangeSetHashes;
+		}
+		if (union.unionHash === undefined) {
+			union.unionHash = hashStructuredValue({
+				memberChangeSetHashes: qualityGateObject(union.memberChangeSetHashes) ?? memberChangeSetHashes,
+				paths: unionRows.map(row => ({ path: row.path, status: row.status, oldPath: row.oldPath })),
+			});
+		}
+	} catch {
+		// Malformed rows: leave derived hashes unset so validation reports the row defect.
+	}
+	close.unionChangeSet = union;
+	return { ...input.gate, validationBatchClose: close };
+}
+
 function validateDeferredCompletionQualityGate(
 	gate: JsonObject,
 	goal: UltragoalGoal,
@@ -2273,7 +2430,9 @@ function validateDeferredCompletionQualityGate(
 	}
 	const deferredLanes = stringArray(deferred.deferredLanes)?.filter(Boolean).sort();
 	if (deferredLanes?.join(",") !== "architectReview,executorQa")
-		throw new Error("deferredToBatch.deferredLanes must be architectReview and executorQa");
+		throw new Error(
+			"deferredToBatch.deferredLanes must be architectReview and executorQa (or omitted; the runtime fills it)",
+		);
 	const targeted = qualityGateObject(deferred.targetedVerification);
 	if (!targeted || targeted.status !== PASSED_STATUS || !nonEmptyStringArray(targeted.commands))
 		throw new Error("deferredToBatch.targetedVerification must pass with non-empty commands");
@@ -2298,13 +2457,19 @@ function validateDeferredCompletionQualityGate(
 	const declaredChangeSet = qualityGateObject(deferred.changeSet);
 	if (!declaredChangeSet) throw new Error("deferredToBatch.changeSet is required");
 	if (declaredChangeSet.memberGoalId !== goal.id)
-		throw new Error("deferredToBatch.changeSet.memberGoalId must label the checkpointed goal");
+		throw new Error(
+			`deferredToBatch.changeSet.memberGoalId must label the checkpointed goal ${goal.id} (or be omitted; the runtime fills it)`,
+		);
 	if (declaredChangeSet.cumulativeFromBase !== true)
-		throw new Error("deferredToBatch.changeSet.cumulativeFromBase must be true");
+		throw new Error(
+			"deferredToBatch.changeSet.cumulativeFromBase must be true (or omitted; the runtime fills it)",
+		);
 	const paths = canonicalChangeSetRows(declaredChangeSet.paths, "deferredToBatch.changeSet.paths");
 	requireChangeSetCoverage(changeSet, paths, "deferredToBatch.changeSet.paths");
 	if (declaredChangeSet.changeSetHash !== changeSetHashForPaths(paths))
-		throw new Error("deferredToBatch.changeSet.changeSetHash does not match declared paths");
+		throw new Error(
+			"deferredToBatch.changeSet.changeSetHash does not match declared paths; omit changeSetHash and the runtime computes it",
+		);
 }
 const COHORT_LANE_KEYS = ["cleaner", "architect", "qa"] as const;
 
@@ -3005,8 +3170,12 @@ export async function validateUltragoalQualityGateReadOnly(input: {
 	}
 	const ledger = plan ? await readUltragoalLedger(input.cwd, sessionId) : undefined;
 	const changeSet = await computeCheckpointChangeSet(input.cwd);
+	let hydratedGate = goal ? hydrateDeferredGateDefaults(gate, goal, changeSet) : gate;
+	if (goal && plan && ledger) {
+		hydratedGate = hydrateBatchCloseDefaults({ gate: hydratedGate, plan, goal, ledger, changeSet });
+	}
 	try {
-		await validateCompletionQualityGate(input.cwd, gate, { changeSet, plan: plan ?? undefined, goal, ledger });
+		await validateCompletionQualityGate(input.cwd, hydratedGate, { changeSet, plan: plan ?? undefined, goal, ledger });
 		return { valid: true, errors: [] };
 	} catch (error) {
 		if (error instanceof UltragoalQualityGateError) return { valid: false, errors: error.diagnostics };
@@ -3053,13 +3222,25 @@ async function readRequiredCompletionQualityGate(
 					changeSet: options.changeSet,
 				})
 			: gateObject;
-	await validateCompletionQualityGate(cwd, hydratedGate, {
+	let completionGate = options.goal
+		? hydrateDeferredGateDefaults(hydratedGate, options.goal, options.changeSet)
+		: hydratedGate;
+	if (options.goal && options.plan && options.ledger) {
+		completionGate = hydrateBatchCloseDefaults({
+			gate: completionGate,
+			plan: options.plan,
+			goal: options.goal,
+			ledger: options.ledger,
+			changeSet: options.changeSet,
+		});
+	}
+	await validateCompletionQualityGate(cwd, completionGate, {
 		changeSet: options.changeSet,
 		plan: options.plan,
 		goal: options.goal,
 		ledger: options.ledger,
 	});
-	return hydratedGate;
+	return completionGate;
 }
 
 function validateCompleteCheckpointTargetGoal(goal: UltragoalGoal): void {
