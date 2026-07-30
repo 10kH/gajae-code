@@ -151,6 +151,29 @@ Avoid placeholder tests, tautologies, broad `not.toThrow()` assertions, duplicat
 
 ## Commit, changelog, release
 
-- Never commit unless explicitly asked.
+- Always commit incrementally; atomic commits are preferred. One logical change per commit — never batch unrelated work.
+- For targeted branch / PR-like work, always open a PR targeting `dev`.
+- Commit messages use the lore format: conventional-commit subject, a short why-focused body, then structured trailers. Include only the trailers that apply.
+
+  ```
+  feat(auth): switch session store from JWT to server-side sessions
+
+  Client-side JWTs leaked user roles into browser storage.
+  Server-side sessions let us revoke access instantly on permission changes.
+
+  Lore-id: a1b2c3d4
+  Constraint: must support horizontal scaling -- use Redis-backed store
+  Constraint: session TTL must not exceed 24h per compliance policy
+  Rejected: JWT with short expiry | still leaks roles to client
+  Rejected: encrypted JWT | adds decryption overhead on every request
+  Confidence: high
+  Scope-risk: wide
+  Reversibility: migration-needed
+  Directive: do not cache session objects at the application layer
+  Tested: concurrent session creation under load
+  Not-tested: Redis failover behavior
+  Supersedes: f7e8d9c0
+  ```
+
 - Package changelogs live at `packages/*/CHANGELOG.md`; add entries under `## [Unreleased]`, never edit released sections.
 - Release flow: `bun run release` (scripts/release.ts) after changelogs and verification are complete.
