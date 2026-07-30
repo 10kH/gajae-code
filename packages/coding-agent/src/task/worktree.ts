@@ -200,7 +200,7 @@ export async function captureDeltaPatch(isolationDir: string, baseline: Worktree
 		try {
 			await fs.access(path.join(nestedDir, ".git"));
 		} catch {
-			continue;
+			throw new Error(`Nested repository is unavailable during delta capture: ${relativePath}`);
 		}
 		const patch = await captureRepoDeltaPatch(nestedDir, nb);
 		if (patch.trim()) nestedPatches.push({ relativePath, patch });

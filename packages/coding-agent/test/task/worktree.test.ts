@@ -194,4 +194,23 @@ describe("worktree isolation helpers", () => {
 			applyNestedPatches(repo, [{ relativePath: "missing-nested", patch: "nested patch bytes" }]),
 		).rejects.toThrow("Nested repository is unavailable: missing-nested");
 	});
+
+	it("fails closed when a baseline nested repository disappears before capture", async () => {
+		const { repo } = await createGitRepo();
+		const nested = path.join(repo, "nested");
+		await fs.mkdir(nested, { recursive: true });
+		await runGit(nested, ["init"]);
+		await runGit(nested, ["config", "user.email", "nested@example.com"]);
+		await runGit(nested, ["config", "user.name", "Nested"]);
+		await fs.writeFile(path.join(nested, "nested.txt"), "nested base\n");
+		await runGit(nested, ["add", "nested.txt"]);
+		await runGit(nested, ["commit", "-m", "nested base"]);
+		const baseline = await captureBaseline(repo);
+		expect(baseline.nested.some(entry => entry.relativePath === "nested")).toBe(true);
+
+		await fs.rm(path.join(nested, ".git"), { recursive: true, force: true });
+		await expect(captureDeltaPatch(repo, baseline)).rejects.toThrow(
+			"Nested repository is unavailable during delta capture: nested",
+		);
+	});
 });

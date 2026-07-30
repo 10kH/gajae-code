@@ -141,6 +141,64 @@ describe("isolated task persistence recovery", () => {
 		expect(resultText).toContain("local://subagents/");
 	});
 
+	it("uses a fresh recovery URI for repeated executions of the same task id", async () => {
+		mockIsolation();
+		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("Repeated", 1));
+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
+			rootPatch: "repeated recovery patch",
+			nestedPatches: [],
+		});
+		const tool = await TaskTool.create(createSession("branch"));
+
+		const first = await runTask(tool, [task("Repeated")]);
+		const second = await runTask(tool, [task("Repeated")]);
+		const firstUri = first.match(/local:\/\/subagents\/[^\s<]+\.patch/)?.[0];
+		const secondUri = second.match(/local:\/\/subagents\/[^\s<]+\.patch/)?.[0];
+
+		expect(firstUri).toBeTruthy();
+		expect(secondUri).toBeTruthy();
+		expect(secondUri).not.toBe(firstUri);
+	});
+
+	it("reports an exit-zero merge failure as a failed async batch", async () => {
+		mockIsolation();
+		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("AsyncConflict", 0));
+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
+			rootPatch: "conflicting patch",
+			nestedPatches: [],
+		});
+		vi.spyOn(git.patch, "canApplyText").mockResolvedValue(false);
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		AsyncJobManager.setInstance(manager);
+		const states: string[] = [];
+		const tool = await TaskTool.create(createSession());
+
+		await tool.execute(
+			"tool-call",
+			{ agent: "executor", tasks: [task("AsyncConflict")], isolated: true },
+			undefined,
+			update => {
+				if (update.details?.async?.state) states.push(update.details.async.state);
+			},
+		);
+		await manager.waitForAll();
+		await manager.dispose({ timeoutMs: 100 });
+
+		expect(states.at(-1)).toBe("failed");
+	});
+
+	it("does not label patch-capture failures as owner-applied no-change", async () => {
+		mockIsolation();
+		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("CaptureFailure", 0));
+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockRejectedValue(new Error("nested capture unavailable"));
+
+		const resultText = await runTask(await TaskTool.create(createSession()), [task("CaptureFailure")]);
+
+		expect(resultText).toContain("merge failed");
+		expect(resultText).not.toContain("no changes to persist");
+		expect(resultText).not.toContain("changes persisted to the owner worktree");
+	});
+
 	it("applies only successful root patches and retains failed-task recovery", async () => {
 		mockIsolation();
 		vi.spyOn(executorModule, "runSubprocess")

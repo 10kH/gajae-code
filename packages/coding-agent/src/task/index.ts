@@ -1044,7 +1044,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								progress.setupFailure = singleResult?.setupFailure;
 							}
 							completedJobs += 1;
-							if (singleResult && ((singleResult.aborted ?? false) || singleResult.exitCode !== 0)) {
+							if (singleResult && singleResult.status !== "completed") {
 								failedJobs += 1;
 							}
 							const remaining = taskItems.length - completedJobs;
@@ -1853,7 +1853,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						const delta = await captureDeltaPatch(isolationDir, taskBaseline);
 						await initializeLocalRoot(localProtocolOptions);
 						const artifactId = validateAllocatedTaskId(task.id);
-						const patchUri = `local://subagents/${artifactId}.patch`;
+						const patchUri = `local://subagents/${artifactId}-${Snowflake.next()}.patch`;
 						const patchPath = resolveLocalUrlToPath(patchUri, localProtocolOptions);
 						const rootPatchBytes = Buffer.from(delta.rootPatch, "utf8");
 						const recoveryBytes = Buffer.from(serializeRecoveryPatchBundle(delta), "utf8");
@@ -2027,7 +2027,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								result.branchName || result.nestedPatches?.length || result.recoveryRef,
 							);
 							if (!hasChanges) {
-								result.persistence = { outcome: "no_changes", ownerWorktreeApplied: true };
+								if (result.exitCode === 0 && !result.error && !result.aborted && !result.paused) {
+									result.persistence = { outcome: "no_changes", ownerWorktreeApplied: true };
+								}
 								continue;
 							}
 							if (
@@ -2114,10 +2116,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 									(result.nestedPatches && result.nestedPatches.length > 0),
 							);
 							if (!hasChanges) {
-								result.persistence = {
-									outcome: "no_changes",
-									ownerWorktreeApplied: true,
-								};
+								if (result.exitCode === 0 && !result.error && !result.aborted && !result.paused) {
+									result.persistence = {
+										outcome: "no_changes",
+										ownerWorktreeApplied: true,
+									};
+								}
 								continue;
 							}
 							if (
