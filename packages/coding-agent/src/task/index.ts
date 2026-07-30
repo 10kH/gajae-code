@@ -2045,7 +2045,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								continue;
 							}
 							if (
-								changesApplied &&
 								result.branchName &&
 								mergedBranchesForNestedPatches?.has(result.branchName) &&
 								result.exitCode === 0 &&
