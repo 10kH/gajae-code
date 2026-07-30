@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-07-29
+
 ### Fixed
 
 - Lazy-stream first-event timeouts now abort with `FirstEventTimeoutError` so `transportFailure.providerCode` is `stream_first_event_timeout` on the outer watchdog path shared by all bundled providers via `createLazyStream`. Idle stalls remain bare `Error`s (distinct class intentionally) (#3496).
