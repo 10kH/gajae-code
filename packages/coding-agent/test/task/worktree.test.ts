@@ -214,9 +214,10 @@ describe("worktree isolation helpers", () => {
 		await fs.rm(path.join(nested, ".git"), { recursive: true, force: true });
 		const delta = await captureDeltaPatch(repo, baseline);
 		expect(delta.rootPatch).toContain("root change survives partial capture");
-		expect(delta.captureErrors?.[0]).toContain("Nested repository capture failed (nested):");
+		expect(delta.captureErrors?.[0]).toBe("Nested repository capture failed (nested): ENOENT");
 		const bundle = JSON.parse(serializeRecoveryPatchBundle(delta)) as { captureErrors?: string[] };
 		expect(bundle.captureErrors).toEqual(delta.captureErrors);
+		expect(JSON.stringify(bundle)).not.toContain(repo);
 	});
 
 	it("applies nested task patches without committing pre-existing owner state", async () => {

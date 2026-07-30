@@ -193,6 +193,11 @@ export interface RecoveryPatchBundle {
 	captureErrors?: string[];
 }
 
+function captureErrorCode(error: unknown): string {
+	const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+	return typeof code === "string" && code.length > 0 ? code : "unknown_error";
+}
+
 export function serializeRecoveryPatchBundle(delta: DeltaPatchResult): string {
 	if (delta.nestedPatches.length === 0 && !delta.captureErrors?.length) return delta.rootPatch;
 	return `${JSON.stringify({
@@ -241,8 +246,7 @@ export async function captureDeltaPatch(isolationDir: string, baseline: Worktree
 			const patch = await captureRepoDeltaPatch(nestedDir, nb);
 			if (patch.trim()) nestedPatches.push({ relativePath, patch });
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			captureErrors.push(`Nested repository capture failed (${relativePath}): ${message}`);
+			captureErrors.push(`Nested repository capture failed (${relativePath}): ${captureErrorCode(error)}`);
 		}
 	}
 
