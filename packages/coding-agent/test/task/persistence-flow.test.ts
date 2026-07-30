@@ -182,6 +182,8 @@ describe("isolated task persistence recovery", () => {
 			},
 		);
 		await manager.waitForAll();
+		const asyncJob = manager.getJob("0-AsyncConflict");
+		expect(asyncJob?.status).toBe("failed");
 		await manager.dispose({ timeoutMs: 100 });
 
 		expect(states.at(-1)).toBe("failed");

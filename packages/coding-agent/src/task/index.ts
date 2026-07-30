@@ -64,7 +64,7 @@ import { FORK_CONTEXT_TOKEN_BUDGET_BY_MODE } from "./fork-context-budget";
 import { getTaskIdValidationError, validateAllocatedTaskId } from "./id";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimit, Semaphore } from "./parallel";
-import { assertNoRawTaskFields, buildTaskReceipt, buildTaskRoiSummary } from "./receipt";
+import { assertNoRawTaskFields, buildTaskReceipt, buildTaskRoiSummary, type TaskResultReceipt } from "./receipt";
 
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { reconcileSpawnRoi } from "./roi-reconciliation";
@@ -106,9 +106,21 @@ function renderTaskAssignment(assignment: string, simpleMode: TaskSimpleMode): s
 
 export function subagentRunOutcomeFromSingleResult(
 	finalText: string,
-	singleResult: Pick<SingleResult, "aborted" | "exitCode" | "paused" | "setupFailure"> | undefined,
+	singleResult:
+		| (Pick<SingleResult, "aborted" | "exitCode" | "paused" | "setupFailure"> &
+				Partial<Pick<TaskResultReceipt, "status">>)
+		| undefined,
 ): string | SubagentRunOutcome {
 	if (singleResult?.paused) return { kind: "paused" };
+	if (singleResult?.status && singleResult.status !== "completed") {
+		return {
+			kind: "failed",
+			text: finalText,
+			...(singleResult.setupFailure && !singleResult.aborted
+				? { setupFailureSummary: singleResult.setupFailure.summary }
+				: {}),
+		};
+	}
 	if (singleResult && ((singleResult.aborted ?? false) || singleResult.exitCode !== 0)) {
 		return {
 			kind: "failed",
