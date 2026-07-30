@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-07-30
+
 ### Added
 
 - `gjc ultragoal quality-gate init` scaffolds a multi-surface quality-gate template (`--surface` repeatable, `--out` required) so agents can fill evidence once and use read-only `quality-gate validate` multi-error diagnostics instead of discovering missing fields one checkpoint at a time (#3474).
