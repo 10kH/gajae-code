@@ -83,13 +83,19 @@ async function captureUntrackedPatch(repoRoot: string, untracked: readonly strin
 	if (untracked.length === 0) return "";
 	const nullPath = getGitNoIndexNullPath();
 	const untrackedDiffs = await Promise.all(
-		untracked.map(entry =>
-			git.diff(repoRoot, {
+		untracked.map(async entry => {
+			const absolutePath = path.join(repoRoot, entry);
+			const stat = await fs.lstat(absolutePath);
+			if (stat.isFile()) {
+				const handle = await fs.open(absolutePath, "r");
+				await handle.close();
+			}
+			return await git.diff(repoRoot, {
 				allowFailure: true,
 				binary: true,
 				noIndex: { left: nullPath, right: entry },
-			}),
-		),
+			});
+		}),
 	);
 	return untrackedDiffs.filter(diff => diff.trim()).join("\n");
 }
@@ -149,7 +155,6 @@ async function captureRepoDeltaPatch(repoDir: string, rb: RepoBaseline): Promise
 	const currentTree = await captureRepoCurrentTree(repoDir);
 
 	return git.diff.tree(repoDir, baselineTree, currentTree, {
-		allowFailure: true,
 		binary: true,
 	});
 }
@@ -178,48 +183,49 @@ export interface NestedRepoPatch {
 export interface DeltaPatchResult {
 	rootPatch: string;
 	nestedPatches: NestedRepoPatch[];
+	captureErrors?: string[];
 }
 
 export interface RecoveryPatchBundle {
 	version: 1;
 	rootPatch: string;
 	nestedPatches: NestedRepoPatch[];
+	captureErrors?: string[];
 }
 
 export function serializeRecoveryPatchBundle(delta: DeltaPatchResult): string {
-	if (delta.nestedPatches.length === 0) return delta.rootPatch;
-	return `${JSON.stringify({ version: 1, rootPatch: delta.rootPatch, nestedPatches: delta.nestedPatches } satisfies RecoveryPatchBundle)}\n`;
+	if (delta.nestedPatches.length === 0 && !delta.captureErrors?.length) return delta.rootPatch;
+	return `${JSON.stringify({
+		version: 1,
+		rootPatch: delta.rootPatch,
+		nestedPatches: delta.nestedPatches,
+		...(delta.captureErrors?.length ? { captureErrors: delta.captureErrors } : {}),
+	} satisfies RecoveryPatchBundle)}\n`;
 }
 
 export async function captureDeltaPatch(isolationDir: string, baseline: WorktreeBaseline): Promise<DeltaPatchResult> {
 	const rootPatch = await captureRepoDeltaPatch(isolationDir, baseline.root);
 	const nestedPatches: NestedRepoPatch[] = [];
+	const captureErrors: string[] = [];
 
 	for (const { relativePath, baseline: nb } of baseline.nested) {
 		const nestedDir = path.join(isolationDir, relativePath);
 		try {
 			await fs.access(path.join(nestedDir, ".git"));
 		} catch {
-			throw new Error(`Nested repository is unavailable during delta capture: ${relativePath}`);
+			captureErrors.push(`Nested repository is unavailable during delta capture: ${relativePath}`);
+			continue;
 		}
 		const patch = await captureRepoDeltaPatch(nestedDir, nb);
 		if (patch.trim()) nestedPatches.push({ relativePath, patch });
 	}
 
-	return { rootPatch, nestedPatches };
+	return { rootPatch, nestedPatches, ...(captureErrors.length ? { captureErrors } : {}) };
 }
 
-/**
- * Apply nested repo patches directly to their working directories after parent merge.
- * @param commitMessage Optional async function to generate a commit message from the combined diff.
- *                      If omitted or returns null, falls back to a generic message.
- */
-export async function applyNestedPatches(
-	repoRoot: string,
-	patches: NestedRepoPatch[],
-	commitMessage?: (diff: string) => Promise<string | null>,
-): Promise<void> {
-	// Group patches by target repo to apply all at once and commit
+/** Apply nested repo patches without staging or committing unrelated owner state. */
+export async function applyNestedPatches(repoRoot: string, patches: NestedRepoPatch[]): Promise<void> {
+	// Group patches by target repo so each task delta is applied in order.
 	const byRepo = new Map<string, NestedRepoPatch[]>();
 	for (const p of patches) {
 		if (!p.patch.trim()) continue;
@@ -236,16 +242,8 @@ export async function applyNestedPatches(
 			throw new Error(`Nested repository is unavailable: ${relativePath}`);
 		}
 
-		const combinedDiff = repoPatches.map(p => p.patch).join("\n");
 		for (const { patch } of repoPatches) {
 			await git.patch.applyText(nestedDir, patch);
-		}
-
-		// Commit so nested repo history reflects the task changes
-		if ((await git.status(nestedDir)).trim().length > 0) {
-			const msg = (await commitMessage?.(combinedDiff)) ?? "changes from isolated task(s)";
-			await git.stage.files(nestedDir);
-			await git.commit(nestedDir, msg);
 		}
 	}
 }

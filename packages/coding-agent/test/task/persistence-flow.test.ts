@@ -245,7 +245,7 @@ describe("isolated task persistence recovery", () => {
 
 		const resultText = await runTask(await TaskTool.create(createSession("branch")), [task("BranchNested")]);
 
-		expect(applyNested).toHaveBeenCalledWith("/repo", nestedPatches, undefined);
+		expect(applyNested).toHaveBeenCalledWith("/repo", nestedPatches);
 		expect(resultText).toContain("changes persisted to the owner worktree");
 		expect(resultText).not.toContain("merge failed");
 	});
@@ -253,18 +253,21 @@ describe("isolated task persistence recovery", () => {
 	it("downgrades branch results when merge setup throws before apply", async () => {
 		mockIsolation();
 		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("BranchThrow", 0));
+		const nestedPatches = [{ relativePath: "vendor/nested", patch: "nested recovery patch" }];
 		vi.spyOn(worktreeModule, "commitToBranch").mockResolvedValue({
 			branchName: "gjc/task/BranchThrow",
-			nestedPatches: [],
+			nestedPatches,
 		});
 		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
 			rootPatch: "branch recovery patch",
-			nestedPatches: [],
+			nestedPatches,
 		});
 		vi.spyOn(worktreeModule, "mergeTaskBranches").mockRejectedValue(new Error("stash setup failed"));
+		const applyNested = vi.spyOn(worktreeModule, "applyNestedPatches").mockResolvedValue();
 
 		const resultText = await runTask(await TaskTool.create(createSession("branch")), [task("BranchThrow")]);
 
+		expect(applyNested).not.toHaveBeenCalled();
 		expect(resultText).toContain("merge failed");
 		expect(resultText).toContain("changes were not persisted to the owner worktree");
 		expect(resultText).toContain("local://subagents/");
@@ -289,6 +292,24 @@ describe("isolated task persistence recovery", () => {
 		expect(resultText).toContain("merge failed");
 		expect(resultText).toContain("changes were not persisted to the owner worktree");
 		expect(resultText).toContain("local://subagents/");
+	});
+
+	it("preserves root recovery when nested capture is incomplete", async () => {
+		mockIsolation();
+		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("PartialCapture", 0));
+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
+			rootPatch: "root patch retained",
+			nestedPatches: [],
+			captureErrors: ["Nested repository is unavailable during delta capture: vendor/nested"],
+		});
+		const canApply = vi.spyOn(git.patch, "canApplyText");
+
+		const resultText = await runTask(await TaskTool.create(createSession()), [task("PartialCapture")]);
+
+		expect(canApply).not.toHaveBeenCalled();
+		expect(resultText).toContain("merge failed");
+		expect(resultText).toContain("local://subagents/");
+		expect(resultText).not.toContain("no changes to persist");
 	});
 
 	it("keeps a legitimate isolated no-change task completed", async () => {

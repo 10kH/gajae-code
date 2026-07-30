@@ -112,6 +112,7 @@ export function subagentRunOutcomeFromSingleResult(
 		| undefined,
 ): string | SubagentRunOutcome {
 	if (singleResult?.paused) return { kind: "paused" };
+	if (!singleResult) return { kind: "failed", text: finalText };
 	if (singleResult?.status && singleResult.status !== "completed") {
 		return {
 			kind: "failed",
@@ -1872,7 +1873,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						await fs.mkdir(path.dirname(patchPath), { recursive: true, mode: 0o700 });
 						await Bun.write(patchPath, recoveryBytes);
 						isolatedPatchBytes.set(patchPath, rootPatchBytes);
-						const producedChanges = Boolean(delta.rootPatch.trim() || delta.nestedPatches.length);
+						const producedChanges = Boolean(
+							delta.rootPatch.trim() || delta.nestedPatches.length || delta.captureErrors?.length,
+						);
 						const recoveryRef =
 							recoveryBytes.byteLength > 0
 								? {
@@ -1882,8 +1885,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 										durability: "session" as const,
 									}
 								: undefined;
+						const captureError = delta.captureErrors?.length
+							? `Patch capture incomplete: ${delta.captureErrors.join("; ")}`
+							: undefined;
+						const resultError = captureError
+							? `${capturedResult.error ? `${capturedResult.error}; ` : ""}${captureError}`
+							: capturedResult.error;
 						return {
 							...capturedResult,
+							...(resultError ? { error: resultError } : {}),
 							patchPath,
 							nestedPatches: delta.nestedPatches,
 							producedChanges,
@@ -1995,6 +2005,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			let hadAnyChanges = false;
 			let rootPatchTexts: string[] = [];
 			let mergedBranchesForNestedPatches: Set<string> | null = null;
+			let mergePhaseFailed = false;
 			const setRecoveryAvailable = (result: SingleResult): void => {
 				if (!result.recoveryRef) return;
 				result.persistence = {
@@ -2124,7 +2135,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							const patchBytes = result.patchPath ? isolatedPatchBytes.get(result.patchPath) : undefined;
 							const hasChanges = Boolean(
 								patchBytes?.toString("utf8").trim() ||
-									(result.nestedPatches && result.nestedPatches.length > 0),
+									(result.nestedPatches && result.nestedPatches.length > 0) ||
+									result.recoveryRef,
 							);
 							if (!hasChanges) {
 								if (result.exitCode === 0 && !result.error && !result.aborted && !result.paused) {
@@ -2173,6 +2185,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					const msg = mergeErr instanceof Error ? mergeErr.message : String(mergeErr);
 					changesApplied = false;
 					hadAnyChanges = false;
+					mergePhaseFailed = true;
 					for (const result of results) {
 						if (result.producedChanges || result.recoveryRef || result.nestedPatches?.length) {
 							setRecoveryAvailable(result);
@@ -2183,7 +2196,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			}
 
 			// Apply nested repo patches (separate from parent git)
-			if (isIsolated && repoRoot && (mergeMode === "branch" || changesApplied !== false)) {
+			if (isIsolated && repoRoot && !mergePhaseFailed && (mergeMode === "branch" || changesApplied !== false)) {
 				const allNestedPatches = results
 					.filter(r => {
 						if (
@@ -2210,26 +2223,19 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					.flatMap(r => r.nestedPatches!);
 				if (allNestedPatches.length > 0) {
 					try {
-						const commitMsg =
-							commitStyle === "ai" && this.session.modelRegistry
-								? async (diff: string) => {
-										return generateCommitMessage(
-											diff,
-											this.session.modelRegistry!,
-											this.session.settings,
-											this.session.getSessionId?.() ?? undefined,
-										);
-									}
-								: undefined;
-						await applyNestedPatches(repoRoot, allNestedPatches, commitMsg);
+						await applyNestedPatches(repoRoot, allNestedPatches);
 						for (const result of results) {
+							const rootApplied =
+								mergeMode !== "branch"
+									? changesApplied !== false
+									: !result.branchName || Boolean(mergedBranchesForNestedPatches?.has(result.branchName));
 							if (
 								result.nestedPatches?.length &&
 								result.exitCode === 0 &&
 								!result.error &&
 								!result.aborted &&
 								!result.paused &&
-								changesApplied !== false
+								rootApplied
 							) {
 								result.persistence = {
 									outcome: "applied",

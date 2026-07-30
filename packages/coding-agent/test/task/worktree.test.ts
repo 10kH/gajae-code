@@ -208,9 +208,44 @@ describe("worktree isolation helpers", () => {
 		const baseline = await captureBaseline(repo);
 		expect(baseline.nested.some(entry => entry.relativePath === "nested")).toBe(true);
 
+		await fs.writeFile(path.join(repo, "merged.txt"), "root change survives partial capture\n");
 		await fs.rm(path.join(nested, ".git"), { recursive: true, force: true });
-		await expect(captureDeltaPatch(repo, baseline)).rejects.toThrow(
-			"Nested repository is unavailable during delta capture: nested",
-		);
+		const delta = await captureDeltaPatch(repo, baseline);
+		expect(delta.rootPatch).toContain("root change survives partial capture");
+		expect(delta.captureErrors).toEqual(["Nested repository is unavailable during delta capture: nested"]);
+		const bundle = JSON.parse(serializeRecoveryPatchBundle(delta)) as { captureErrors?: string[] };
+		expect(bundle.captureErrors).toEqual(delta.captureErrors);
+	});
+
+	it("applies nested task patches without committing pre-existing owner state", async () => {
+		const { repo } = await createGitRepo();
+		const nested = path.join(repo, "nested-owner-state");
+		await fs.mkdir(nested, { recursive: true });
+		await runGit(nested, ["init"]);
+		await runGit(nested, ["config", "user.email", "nested@example.com"]);
+		await runGit(nested, ["config", "user.name", "Nested"]);
+		for (const file of ["task.txt", "staged.txt", "unstaged.txt"]) {
+			await fs.writeFile(path.join(nested, file), `${file} base\n`);
+		}
+		await runGit(nested, ["add", "."]);
+		await runGit(nested, ["commit", "-m", "nested base"]);
+
+		await fs.writeFile(path.join(nested, "staged.txt"), "owner staged\n");
+		await runGit(nested, ["add", "staged.txt"]);
+		await fs.writeFile(path.join(nested, "unstaged.txt"), "owner unstaged\n");
+		await fs.writeFile(path.join(nested, "untracked.txt"), "owner untracked\n");
+		await fs.writeFile(path.join(nested, "task.txt"), "task change\n");
+		const taskPatch = `${await runGit(nested, ["diff", "--binary", "--", "task.txt"])}\n`;
+		await runGit(nested, ["checkout", "--", "task.txt"]);
+		const headBefore = await runGit(nested, ["rev-parse", "HEAD"]);
+
+		await applyNestedPatches(repo, [{ relativePath: "nested-owner-state", patch: taskPatch }]);
+
+		expect(await runGit(nested, ["rev-parse", "HEAD"])).toBe(headBefore);
+		const status = await runGit(nested, ["status", "--porcelain=v1"]);
+		expect(status).toContain("M  staged.txt");
+		expect(status).toContain(" M task.txt");
+		expect(status).toContain(" M unstaged.txt");
+		expect(status).toContain("?? untracked.txt");
 	});
 });
