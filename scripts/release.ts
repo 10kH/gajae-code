@@ -275,17 +275,13 @@ function hasUnreleasedContent(content: string): boolean {
 	return sectionContent.length > 0;
 }
 
-function removeEmptyVersionEntries(content: string): string {
-	// Remove version entries that have no content (just whitespace until next ## [ or EOF)
-	return content.replace(/## \[\d+\.\d+\.\d+\] - \d{4}-\d{2}-\d{2}\s*\n(?=## \[|\s*$)/g, "");
-}
-
 export function releasedChangelogContent(content: string, version: string, date: string, changelog: string): string {
-	// Remove stale empty version entries before inserting the new release entry.
 	// A release with no unreleased notes still needs a semver heading: the
 	// embedded changelog must identify the version shipped by the package.
+	// Previously released headings are immutable history and stay in place even
+	// when their body is empty, so the new heading is always inserted above them.
 	const unreleasedHasContent = hasUnreleasedContent(content);
-	let next = removeEmptyVersionEntries(content);
+	let next = content;
 
 	if (unreleasedHasContent) {
 		next = next.replace("## [Unreleased]", `## [${version}] - ${date}`);

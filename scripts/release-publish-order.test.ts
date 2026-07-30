@@ -542,6 +542,27 @@ describe("changelog release cut", () => {
 		expect(next).toContain("## [Unreleased]\n\n## [0.2.0] - 2026-02-02");
 	});
 
+	test("preserves a prior empty released heading instead of replacing it", () => {
+		const content = "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-01-01\n\n## [0.0.9] - 2025-12-31\n\n### Fixed\n\n- An older fix.\n";
+
+		const next = releasedChangelogContent(content, "0.2.0", "2026-02-02", "packages/x/CHANGELOG.md");
+
+		expect(next).toContain("## [0.2.0] - 2026-02-02");
+		expect(next).toContain("## [0.1.0] - 2026-01-01");
+		expect(next.indexOf("## [0.2.0] - 2026-02-02")).toBeLessThan(next.indexOf("## [0.1.0] - 2026-01-01"));
+		expect(next.slice(next.indexOf("## [0.0.9] - 2025-12-31"))).toBe(content.slice(content.indexOf("## [0.0.9] - 2025-12-31")));
+	});
+
+	test("preserves a prior empty released heading when [Unreleased] has content", () => {
+		const content = `# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n${bullet}\n## [0.1.0] - 2026-01-01\n\n## [0.0.9] - 2025-12-31\n`;
+
+		const next = releasedChangelogContent(content, "0.2.0", "2026-02-02", "packages/x/CHANGELOG.md");
+
+		expect(next).toContain("## [0.1.0] - 2026-01-01");
+		expect(next).toContain("## [0.0.9] - 2025-12-31");
+		expect(next.indexOf("## [0.2.0] - 2026-02-02")).toBeLessThan(next.indexOf("## [0.1.0] - 2026-01-01"));
+	});
+
 	test("a malformed header fails closed instead of dropping [Unreleased]", () => {
 		const content = `## [Unreleased]\n\n### Fixed\n\n${bullet}`;
 

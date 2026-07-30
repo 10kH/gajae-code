@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The release cut no longer deletes previously released changelog headings whose body is empty. `releasedChangelogContent` ran `removeEmptyVersionEntries` before transforming `## [Unreleased]`, so cutting a release replaced the prior empty semver heading instead of inserting the new one above it — v0.12.2 dropped the `## [0.12.1] - 2026-07-29` heading from four package changelogs. Released sections are now immutable history and are always preserved.
+
 ## [0.12.2] - 2026-07-30
 
 ### Added
