@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.3] - 2026-07-30
+
 ### Added
 
 - Added first-class support for **Mara Cloud**, an OpenAI-compatible enterprise AI inference platform. Registers the `mara` provider descriptor, `/login` entry (API-key paste validated against `https://api.cloud.mara.com/v1/models`), `MARA_API_KEY` environment resolution, and bundled `models.json` seed models. Models are discovered dynamically from `GET /v1/models` (base URL `https://api.cloud.mara.com/v1`).
