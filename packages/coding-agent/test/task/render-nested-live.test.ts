@@ -131,7 +131,7 @@ describe("task renderer: nested live rendering", () => {
 				outcome: "recovery_available",
 				ownerWorktreeApplied: false,
 				recoveryRef: {
-					uri: "local://subagents/4-Recovery.patch",
+					uri: `local://subagents/${"x".repeat(120)}\t\u0000.patch`,
 					sizeBytes: 256,
 					sha256: "c".repeat(64),
 					durability: "session",
@@ -139,7 +139,10 @@ describe("task renderer: nested live rendering", () => {
 			},
 		});
 
-		expect(text).toContain("Unapplied recovery patch: local://subagents/4-Recovery.patch");
+		expect(text).toContain("Unapplied recovery patch: local://subagents/");
+		expect(text).not.toContain("\t");
+		expect(text).not.toContain("\u0000");
+		expect(text).not.toContain("x".repeat(100));
 	});
 
 	it("renders completed nested task results stored in extractedToolData.task while parent is in-progress", async () => {

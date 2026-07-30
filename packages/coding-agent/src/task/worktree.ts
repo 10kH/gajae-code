@@ -180,6 +180,17 @@ export interface DeltaPatchResult {
 	nestedPatches: NestedRepoPatch[];
 }
 
+export interface RecoveryPatchBundle {
+	version: 1;
+	rootPatch: string;
+	nestedPatches: NestedRepoPatch[];
+}
+
+export function serializeRecoveryPatchBundle(delta: DeltaPatchResult): string {
+	if (delta.nestedPatches.length === 0) return delta.rootPatch;
+	return `${JSON.stringify({ version: 1, rootPatch: delta.rootPatch, nestedPatches: delta.nestedPatches } satisfies RecoveryPatchBundle)}\n`;
+}
+
 export async function captureDeltaPatch(isolationDir: string, baseline: WorktreeBaseline): Promise<DeltaPatchResult> {
 	const rootPatch = await captureRepoDeltaPatch(isolationDir, baseline.root);
 	const nestedPatches: NestedRepoPatch[] = [];
@@ -222,7 +233,7 @@ export async function applyNestedPatches(
 		try {
 			await fs.access(path.join(nestedDir, ".git"));
 		} catch {
-			continue;
+			throw new Error(`Nested repository is unavailable: ${relativePath}`);
 		}
 
 		const combinedDiff = repoPatches.map(p => p.patch).join("\n");

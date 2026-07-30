@@ -4,12 +4,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as natives from "@gajae-code/natives";
 import {
+	applyNestedPatches,
 	captureBaseline,
 	captureDeltaPatch,
 	ensureIsolation,
 	getGitNoIndexNullPath,
 	mergeTaskBranches,
 	parseIsolationMode,
+	serializeRecoveryPatchBundle,
 	verifyRootPatchesApplied,
 } from "../../src/task/worktree";
 
@@ -167,5 +169,29 @@ describe("worktree isolation helpers", () => {
 
 		await fs.writeFile(path.join(repo, "merged.txt"), "owner conflict\n");
 		expect(await verifyRootPatchesApplied(repo, baseline, [delta.rootPatch])).toBe(false);
+	});
+
+	it("serializes nested-only changes into a durable recovery bundle", () => {
+		const bundle = serializeRecoveryPatchBundle({
+			rootPatch: "",
+			nestedPatches: [{ relativePath: "vendor/nested", patch: "nested patch bytes" }],
+		});
+		const parsed = JSON.parse(bundle) as {
+			version: number;
+			rootPatch: string;
+			nestedPatches: Array<{ relativePath: string; patch: string }>;
+		};
+		expect(parsed).toEqual({
+			version: 1,
+			rootPatch: "",
+			nestedPatches: [{ relativePath: "vendor/nested", patch: "nested patch bytes" }],
+		});
+	});
+
+	it("fails closed when a captured nested repository is unavailable", async () => {
+		const { repo } = await createGitRepo();
+		await expect(
+			applyNestedPatches(repo, [{ relativePath: "missing-nested", patch: "nested patch bytes" }]),
+		).rejects.toThrow("Nested repository is unavailable: missing-nested");
 	});
 });
