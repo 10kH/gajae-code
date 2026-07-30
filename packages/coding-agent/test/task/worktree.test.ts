@@ -10,6 +10,7 @@ import {
 	getGitNoIndexNullPath,
 	mergeTaskBranches,
 	parseIsolationMode,
+	verifyRootPatchesApplied,
 } from "../../src/task/worktree";
 
 const tempDirs: string[] = [];
@@ -155,5 +156,16 @@ describe("worktree isolation helpers", () => {
 		expect(delta.rootPatch).toContain("+task output");
 		expect(delta.rootPatch).not.toContain("baseline dirty change");
 		expect(delta.rootPatch).not.toContain("preexisting.txt");
+	});
+
+	it("verifies the owner worktree exactly matches captured patches", async () => {
+		const { repo } = await createGitRepo();
+		const baseline = await captureBaseline(repo);
+		await fs.writeFile(path.join(repo, "merged.txt"), "child version\n");
+		const delta = await captureDeltaPatch(repo, baseline);
+		expect(await verifyRootPatchesApplied(repo, baseline, [delta.rootPatch])).toBe(true);
+
+		await fs.writeFile(path.join(repo, "merged.txt"), "owner conflict\n");
+		expect(await verifyRootPatchesApplied(repo, baseline, [delta.rootPatch])).toBe(false);
 	});
 });

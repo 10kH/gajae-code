@@ -12,7 +12,7 @@
  *   - Progress tracking via JSON events
  *   - Session artifacts for debugging
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
@@ -82,6 +82,7 @@ import {
 	type IsolationHandle,
 	mergeTaskBranches,
 	parseIsolationMode,
+	verifyRootPatchesApplied,
 	type WorktreeBaseline,
 } from "./worktree";
 
@@ -1807,7 +1808,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						forkContextAdvisory,
 						repositoryBinding: publicRepositoryBinding(taskRepositoryBinding),
 					};
-					if (mergeMode === "branch" && resultWithForkContext.exitCode === 0) {
+					const taskSucceeded =
+						resultWithForkContext.exitCode === 0 &&
+						!resultWithForkContext.error &&
+						!resultWithForkContext.aborted &&
+						!resultWithForkContext.paused;
+					if (mergeMode === "branch" && taskSucceeded) {
 						try {
 							const commitMsg =
 								commitStyle === "ai" && this.session.modelRegistry
@@ -1842,31 +1848,38 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							return { ...resultWithForkContext, error: `Merge failed: ${msg}` };
 						}
 					}
-					if (resultWithForkContext.exitCode === 0) {
-						try {
-							const delta = await captureDeltaPatch(isolationDir, taskBaseline);
-							await initializeLocalRoot(localProtocolOptions);
-							const artifactId = validateAllocatedTaskId(task.id);
-							const patchPath = resolveLocalUrlToPath(
-								`local://subagents/${artifactId}.patch`,
-								localProtocolOptions,
-							);
-							await fs.mkdir(path.dirname(patchPath), { recursive: true, mode: 0o700 });
-							await Bun.write(patchPath, delta.rootPatch);
-							isolatedPatchBytes.set(patchPath, Buffer.from(delta.rootPatch, "utf8"));
-							const producedChanges = Boolean(delta.rootPatch.trim() || delta.nestedPatches.length);
-							return {
-								...resultWithForkContext,
-								patchPath,
-								nestedPatches: delta.nestedPatches,
-								producedChanges,
-							};
-						} catch (patchErr) {
-							const msg = patchErr instanceof Error ? patchErr.message : String(patchErr);
-							return { ...resultWithForkContext, error: `Patch capture failed: ${msg}` };
-						}
+					try {
+						const delta = await captureDeltaPatch(isolationDir, taskBaseline);
+						await initializeLocalRoot(localProtocolOptions);
+						const artifactId = validateAllocatedTaskId(task.id);
+						const patchUri = `local://subagents/${artifactId}.patch`;
+						const patchPath = resolveLocalUrlToPath(patchUri, localProtocolOptions);
+						const patchBytes = Buffer.from(delta.rootPatch, "utf8");
+						await fs.mkdir(path.dirname(patchPath), { recursive: true, mode: 0o700 });
+						await Bun.write(patchPath, patchBytes);
+						isolatedPatchBytes.set(patchPath, patchBytes);
+						const producedChanges = Boolean(delta.rootPatch.trim() || delta.nestedPatches.length);
+						const recoveryRef =
+							patchBytes.byteLength > 0
+								? {
+										uri: patchUri,
+										sizeBytes: patchBytes.byteLength,
+										sha256: createHash("sha256").update(patchBytes).digest("hex"),
+										durability: "session" as const,
+									}
+								: undefined;
+						return {
+							...resultWithForkContext,
+							patchPath,
+							nestedPatches: delta.nestedPatches,
+							producedChanges,
+							recoveryRef,
+						};
+					} catch (patchErr) {
+						const msg = patchErr instanceof Error ? patchErr.message : String(patchErr);
+						const existingError = resultWithForkContext.error ? `${resultWithForkContext.error}; ` : "";
+						return { ...resultWithForkContext, error: `${existingError}Patch capture failed: ${msg}` };
 					}
-					return resultWithForkContext;
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					const assignment = task.assignment.trim();
@@ -1966,6 +1979,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			let mergeSummary = "";
 			let changesApplied: boolean | null = null;
 			let hadAnyChanges = false;
+			let rootPatchTexts: string[] = [];
 			let mergedBranchesForNestedPatches: Set<string> | null = null;
 			if (isIsolated && repoRoot) {
 				try {
@@ -2004,9 +2018,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							await cleanupTaskBranches(repoRoot, allBranches);
 						}
 					} else {
-						// Patch mode: combine and apply patches
-						const patchesInOrder = results.map(result => result.patchPath).filter(Boolean) as string[];
-						const missingPatch = results.some(result => !result.patchPath);
+						// Patch mode: combine and apply only successful task patches. Failed/interrupted patches remain recovery-only.
+						const successfulPatchResults = results.filter(
+							result => result.exitCode === 0 && !result.error && !result.aborted && !result.paused,
+						);
+						const patchesInOrder = successfulPatchResults
+							.map(result => result.patchPath)
+							.filter(Boolean) as string[];
+						const missingPatch = successfulPatchResults.some(result => !result.patchPath);
 						if (missingPatch) {
 							changesApplied = false;
 							hadAnyChanges = false;
@@ -2023,10 +2042,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								changesApplied = true;
 								hadAnyChanges = false;
 							} else {
-								const patchTexts = nonEmptyPatches.map(patchPath =>
+								rootPatchTexts = nonEmptyPatches.map(patchPath =>
 									isolatedPatchBytes.get(patchPath)!.toString("utf8"),
 								);
-								const combinedPatch = patchTexts
+								const combinedPatch = rootPatchTexts
 									.map(text => (text.endsWith("\n") ? text : `${text}\n`))
 									.join("");
 								if (!combinedPatch.trim()) {
@@ -2044,6 +2063,45 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 										}
 									}
 								}
+							}
+						}
+
+						if (changesApplied && rootPatchTexts.length > 0 && baseline) {
+							changesApplied = await verifyRootPatchesApplied(repoRoot, baseline, rootPatchTexts);
+						}
+
+						for (const result of results) {
+							const patchBytes = result.patchPath ? isolatedPatchBytes.get(result.patchPath) : undefined;
+							const hasChanges = Boolean(
+								patchBytes?.toString("utf8").trim() ||
+									(result.nestedPatches && result.nestedPatches.length > 0),
+							);
+							if (!hasChanges) {
+								result.persistence = {
+									outcome: "no_changes",
+									ownerWorktreeApplied: true,
+								};
+								continue;
+							}
+							if (
+								changesApplied &&
+								patchBytes &&
+								result.exitCode === 0 &&
+								!result.error &&
+								!result.aborted &&
+								!result.paused
+							) {
+								result.persistence = {
+									outcome: "applied",
+									ownerWorktreeApplied: true,
+									recoveryRef: result.recoveryRef,
+								};
+							} else {
+								result.persistence = {
+									outcome: "recovery_available",
+									ownerWorktreeApplied: false,
+									recoveryRef: result.recoveryRef,
+								};
 							}
 						}
 
@@ -2106,11 +2164,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			}
 
 			// Build final output - match plugin format
-			const cancelledCount = results.filter(r => r.aborted).length;
-			const successCount = results.filter(r => r.exitCode === 0 && !r.error && !r.aborted).length;
 			const totalDuration = Date.now() - startTime;
-
 			const receipts = results.map(buildTaskReceipt);
+			const cancelledCount = receipts.filter(r => r.status === "aborted").length;
+			const successCount = receipts.filter(r => r.status === "completed").length;
 			const roiSummary = buildTaskRoiSummary(receipts);
 			const roiReconciliation = executionOverrides?.suppressRoiReconciliation
 				? undefined

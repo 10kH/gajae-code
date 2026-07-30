@@ -135,24 +135,39 @@ export async function captureBaseline(repoRoot: string): Promise<WorktreeBaselin
 	return { root, nested };
 }
 
-async function captureRepoDeltaPatch(repoDir: string, rb: RepoBaseline): Promise<string> {
+async function captureRepoCurrentTree(repoDir: string): Promise<string> {
 	const currentHead = (await git.head.sha(repoDir)) ?? "";
 	const currentStaged = await git.diff(repoDir, { binary: true, cached: true });
 	const currentUnstaged = await git.diff(repoDir, { binary: true });
 	const currentUntracked = await git.ls.untracked(repoDir);
 	const currentUntrackedPatch = await captureUntrackedPatch(repoDir, currentUntracked);
+	return await writeSyntheticTree(repoDir, currentHead, [currentStaged, currentUnstaged, currentUntrackedPatch]);
+}
 
+async function captureRepoDeltaPatch(repoDir: string, rb: RepoBaseline): Promise<string> {
 	const baselineTree = await writeSyntheticTree(repoDir, rb.headCommit, [rb.staged, rb.unstaged, rb.untrackedPatch]);
-	const currentTree = await writeSyntheticTree(repoDir, currentHead, [
-		currentStaged,
-		currentUnstaged,
-		currentUntrackedPatch,
-	]);
+	const currentTree = await captureRepoCurrentTree(repoDir);
 
 	return git.diff.tree(repoDir, baselineTree, currentTree, {
 		allowFailure: true,
 		binary: true,
 	});
+}
+
+/** Confirm that applying patches to the captured owner baseline exactly matches the current owner worktree. */
+export async function verifyRootPatchesApplied(
+	repoRoot: string,
+	baseline: WorktreeBaseline,
+	patches: readonly string[],
+): Promise<boolean> {
+	const baselineTree = await writeSyntheticTree(repoRoot, baseline.root.headCommit, [
+		baseline.root.staged,
+		baseline.root.unstaged,
+		baseline.root.untrackedPatch,
+	]);
+	const expectedTree = await writeSyntheticTree(repoRoot, baselineTree, patches);
+	const currentTree = await captureRepoCurrentTree(repoRoot);
+	return expectedTree === currentTree;
 }
 
 export interface NestedRepoPatch {

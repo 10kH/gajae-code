@@ -917,6 +917,16 @@ function renderAgentResult(result: TaskResultReceipt, isLast: boolean, expanded:
 		lines.push(`${continuePrefix}${theme.fg("warning", "low ROI: produced no material contribution")}`);
 	}
 
+	if (result.persistence?.recoveryRef) {
+		const label = result.persistence.ownerWorktreeApplied ? "Recovery patch" : "Unapplied recovery patch";
+		lines.push(
+			`${continuePrefix}${theme.fg(
+				result.persistence.ownerWorktreeApplied ? "dim" : "warning",
+				`${label}: ${result.persistence.recoveryRef.uri} (${formatBytes(result.persistence.recoveryRef.sizeBytes)})`,
+			)}`,
+		);
+	}
+
 	if (result.outputRef) {
 		lines.push(
 			`${continuePrefix}${theme.fg(

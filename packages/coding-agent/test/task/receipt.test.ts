@@ -402,6 +402,52 @@ describe("task result receipts", () => {
 		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
 	});
 
+	it("exposes identity-bound isolated persistence and recovery outcomes", () => {
+		const applied = buildTaskReceipt(
+			makeRaw({
+				persistence: {
+					outcome: "applied",
+					ownerWorktreeApplied: true,
+					recoveryRef: {
+						uri: "local://subagents/0-Applied.patch",
+						sizeBytes: 64,
+						sha256: "b".repeat(64),
+						durability: "session",
+					},
+				},
+			}),
+		);
+		expect(applied.status).toBe("completed");
+		expect(applied.persistence).toMatchObject({ outcome: "applied", ownerWorktreeApplied: true });
+		expect(applied.preview).toContain("persisted to the owner worktree");
+		expect(applied.persistence?.recoveryRef?.uri).toBe("local://subagents/0-Applied.patch");
+
+		const recovery = buildTaskReceipt(
+			makeRaw({
+				recoveryRef: {
+					uri: "local://subagents/0-Recovery.patch",
+					sizeBytes: 128,
+					sha256: "a".repeat(64),
+					durability: "session",
+				},
+				persistence: {
+					outcome: "recovery_available",
+					ownerWorktreeApplied: false,
+					recoveryRef: {
+						uri: "local://subagents/0-Recovery.patch",
+						sizeBytes: 128,
+						sha256: "a".repeat(64),
+						durability: "session",
+					},
+				},
+			}),
+		);
+		expect(recovery.status).toBe("merge_failed");
+		expect(recovery.persistence?.recoveryRef?.uri).toBe("local://subagents/0-Recovery.patch");
+		expect(recovery.preview).toContain("changes were not persisted");
+		expect(recovery.preview).toContain("local://subagents/0-Recovery.patch");
+	});
+
 	it("renders task-summary with synopsis refs and without raw payloads or paths", () => {
 		const sentinel = "LEAK_SENTINEL_DO_NOT_DIGEST";
 		const receipt = buildTaskReceipt(
