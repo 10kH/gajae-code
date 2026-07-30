@@ -2158,6 +2158,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					const msg = mergeErr instanceof Error ? mergeErr.message : String(mergeErr);
 					changesApplied = false;
 					hadAnyChanges = false;
+					for (const result of results) {
+						if (result.producedChanges || result.recoveryRef || result.nestedPatches?.length) {
+							setRecoveryAvailable(result);
+						}
+					}
 					mergeSummary = `\n\n<system-notification>Merge phase failed: ${msg}\nTask outputs are preserved but changes were not applied.</system-notification>`;
 				}
 			}

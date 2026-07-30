@@ -448,6 +448,27 @@ describe("task result receipts", () => {
 		expect(recovery.preview).toContain("local://subagents/0-Recovery.patch");
 	});
 
+	it.each(["paused", "aborted"] as const)("keeps %s recovery identity in the public receipt", status => {
+		const ref = {
+			uri: `local://subagents/0-${status}.patch`,
+			sizeBytes: 96,
+			sha256: "d".repeat(64),
+			durability: "session" as const,
+		};
+		const receipt = buildTaskReceipt(
+			makeRaw({
+				...(status === "paused" ? { paused: true } : { aborted: true, abortReason: "test abort" }),
+				recoveryRef: ref,
+				persistence: { outcome: "recovery_available", ownerWorktreeApplied: false, recoveryRef: ref },
+			}),
+		);
+
+		expect(receipt.status).toBe(status);
+		expect(receipt.persistence?.recoveryRef?.uri).toBe(ref.uri);
+		expect(receipt.preview).toContain("changes were not persisted");
+		expect(receipt.preview).toContain(ref.uri);
+	});
+
 	it("renders task-summary with synopsis refs and without raw payloads or paths", () => {
 		const sentinel = "LEAK_SENTINEL_DO_NOT_DIGEST";
 		const receipt = buildTaskReceipt(

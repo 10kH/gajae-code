@@ -190,6 +190,97 @@ describe("isolated task persistence recovery", () => {
 		expect(resultText).not.toContain("merge failed");
 	});
 
+	it("downgrades branch results when merge setup throws before apply", async () => {
+		mockIsolation();
+		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("BranchThrow", 0));
+		vi.spyOn(worktreeModule, "commitToBranch").mockResolvedValue({
+			branchName: "gjc/task/BranchThrow",
+			nestedPatches: [],
+		});
+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
+			rootPatch: "branch recovery patch",
+			nestedPatches: [],
+		});
+		vi.spyOn(worktreeModule, "mergeTaskBranches").mockRejectedValue(new Error("stash setup failed"));
+
+		const resultText = await runTask(await TaskTool.create(createSession("branch")), [task("BranchThrow")]);
+
+		expect(resultText).toContain("merge failed");
+		expect(resultText).toContain("changes were not persisted to the owner worktree");
+		expect(resultText).toContain("local://subagents/");
+	});
+
+	it("downgrades root and nested recovery after a post-apply proof throws", async () => {
+		mockIsolation();
+		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("ProofThrow", 0));
+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
+			rootPatch: "root patch applied before proof",
+			nestedPatches: [{ relativePath: "vendor/nested", patch: "nested patch" }],
+		});
+		vi.spyOn(git.patch, "canApplyText").mockResolvedValue(true);
+		const applyText = vi.spyOn(git.patch, "applyText").mockResolvedValue();
+		vi.spyOn(worktreeModule, "verifyRootPatchesApplied").mockRejectedValue(new Error("git inspection failed"));
+		const applyNested = vi.spyOn(worktreeModule, "applyNestedPatches").mockResolvedValue();
+
+		const resultText = await runTask(await TaskTool.create(createSession()), [task("ProofThrow")]);
+
+		expect(applyText).toHaveBeenCalledTimes(1);
+		expect(applyNested).not.toHaveBeenCalled();
+		expect(resultText).toContain("merge failed");
+		expect(resultText).toContain("changes were not persisted to the owner worktree");
+		expect(resultText).toContain("local://subagents/");
+	});
+
+	it("keeps a legitimate isolated no-change task completed", async () => {
+		mockIsolation();
+		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("NoChange", 0));
+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({ rootPatch: "", nestedPatches: [] });
+
+		const resultText = await runTask(await TaskTool.create(createSession()), [task("NoChange")]);
+
+		expect(resultText).toContain("no changes to persist");
+		expect(resultText).not.toContain("merge failed");
+	});
+
+	it("downgrades a root patch conflict to recovery", async () => {
+		mockIsolation();
+		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("RootConflict", 0));
+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
+			rootPatch: "conflicting root patch",
+			nestedPatches: [],
+		});
+		vi.spyOn(git.patch, "canApplyText").mockResolvedValue(false);
+		const applyText = vi.spyOn(git.patch, "applyText");
+
+		const resultText = await runTask(await TaskTool.create(createSession()), [task("RootConflict")]);
+
+		expect(applyText).not.toHaveBeenCalled();
+		expect(resultText).toContain("merge failed");
+		expect(resultText).toContain("local://subagents/");
+	});
+
+	it.each(["paused", "aborted"] as const)("preserves %s branch edits as recovery", async state => {
+		mockIsolation();
+		const raw = makeResult(`Branch-${state}`, 0);
+		if (state === "paused") raw.paused = true;
+		else {
+			raw.aborted = true;
+			raw.abortReason = "test abort";
+		}
+		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(raw);
+		const captureDelta = vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
+			rootPatch: `${state} branch patch`,
+			nestedPatches: [],
+		});
+		const mergeBranches = vi.spyOn(worktreeModule, "mergeTaskBranches");
+
+		const resultText = await runTask(await TaskTool.create(createSession("branch")), [task(`Branch-${state}`)]);
+
+		expect(mergeBranches).not.toHaveBeenCalled();
+		expect(captureDelta).toHaveBeenCalledTimes(1);
+		if (state === "aborted") expect(resultText).toContain("local://subagents/");
+	});
+
 	it("downgrades completed tasks when nested patch application fails", async () => {
 		mockIsolation();
 		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("NestedConflict", 0));
