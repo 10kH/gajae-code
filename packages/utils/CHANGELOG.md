@@ -5,6 +5,10 @@
 
 - Positive-integer environment helpers now reject malformed, fractional, exponent-form, non-positive, and unsafe values instead of silently accepting their numeric prefixes (#3593).
 
+### Fixed
+
+- Retryable responses discarded before another fetch attempt now begin body cancellation without blocking retry progress on transport cleanup, releasing buffered response data without consuming responses returned to callers.
+
 ## [0.12.4] - 2026-07-30
 
 ## [0.12.3] - 2026-07-30
