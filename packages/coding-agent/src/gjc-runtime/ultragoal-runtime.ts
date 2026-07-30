@@ -2357,7 +2357,12 @@ function hydrateBatchCloseDefaults(input: {
 		if (member?.validationBatch) derivedMetadataHashes[memberId] = member.validationBatch.metadataHash;
 		if (!member || memberId === input.goal.id) continue;
 		try {
-			const receipt = requireDeferredMemberReceiptFresh(input.plan, input.ledger, member, "validationBatchClose hydration");
+			const receipt = requireDeferredMemberReceiptFresh(
+				input.plan,
+				input.ledger,
+				member,
+				"validationBatchClose hydration",
+			);
 			derivedChangeSetHashes[memberId] = receipt.validationBatch.changeSetHash;
 			derivedReceipts.push({
 				goalId: memberId,
@@ -2373,7 +2378,8 @@ function hydrateBatchCloseDefaults(input: {
 	}
 	const suppliedMetadataHashes = qualityGateObject(close.memberMetadataHashes);
 	if (close.memberMetadataHashes === undefined) close.memberMetadataHashes = derivedMetadataHashes;
-	else if (suppliedMetadataHashes) close.memberMetadataHashes = { ...derivedMetadataHashes, ...suppliedMetadataHashes };
+	else if (suppliedMetadataHashes)
+		close.memberMetadataHashes = { ...derivedMetadataHashes, ...suppliedMetadataHashes };
 	if (close.memberReceipts === undefined) close.memberReceipts = derivedReceipts;
 	const requestedUnion = qualityGateObject(close.unionChangeSet);
 	const union: JsonObject = requestedUnion ? { ...requestedUnion } : {};
@@ -2461,9 +2467,7 @@ function validateDeferredCompletionQualityGate(
 			`deferredToBatch.changeSet.memberGoalId must label the checkpointed goal ${goal.id} (or be omitted; the runtime fills it)`,
 		);
 	if (declaredChangeSet.cumulativeFromBase !== true)
-		throw new Error(
-			"deferredToBatch.changeSet.cumulativeFromBase must be true (or omitted; the runtime fills it)",
-		);
+		throw new Error("deferredToBatch.changeSet.cumulativeFromBase must be true (or omitted; the runtime fills it)");
 	const paths = canonicalChangeSetRows(declaredChangeSet.paths, "deferredToBatch.changeSet.paths");
 	requireChangeSetCoverage(changeSet, paths, "deferredToBatch.changeSet.paths");
 	if (declaredChangeSet.changeSetHash !== changeSetHashForPaths(paths))
@@ -3175,7 +3179,12 @@ export async function validateUltragoalQualityGateReadOnly(input: {
 		hydratedGate = hydrateBatchCloseDefaults({ gate: hydratedGate, plan, goal, ledger, changeSet });
 	}
 	try {
-		await validateCompletionQualityGate(input.cwd, hydratedGate, { changeSet, plan: plan ?? undefined, goal, ledger });
+		await validateCompletionQualityGate(input.cwd, hydratedGate, {
+			changeSet,
+			plan: plan ?? undefined,
+			goal,
+			ledger,
+		});
 		return { valid: true, errors: [] };
 	} catch (error) {
 		if (error instanceof UltragoalQualityGateError) return { valid: false, errors: error.diagnostics };
