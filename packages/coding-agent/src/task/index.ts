@@ -1173,6 +1173,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			}
 		}
 
+		if (failedSchedules.length > 0) {
+			completedJobs += failedSchedules.length;
+			failedJobs += failedSchedules.length;
+		}
+
 		if (startedJobs.length === 0) {
 			const failureText = `Failed to start background task jobs: ${failedSchedules.join("; ")}`;
 			return {
@@ -1181,9 +1186,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			};
 		}
 
+		const asyncState = completedJobs === taskItems.length ? (failedJobs > 0 ? "failed" : "completed") : "running";
 		emitAsyncUpdate(
-			"running",
-			`Launching ${startedJobs.length} background ${startedJobs.length === 1 ? "task" : "tasks"}...`,
+			asyncState,
+			asyncState === "running"
+				? `Launching ${startedJobs.length} background ${startedJobs.length === 1 ? "task" : "tasks"}...`
+				: asyncState === "completed"
+					? `Background task batch complete: ${completedJobs}/${taskItems.length} finished.`
+					: `Background task batch complete with failures: ${failedJobs} failed.`,
 		);
 
 		const scheduleFailureSummary =

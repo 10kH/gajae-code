@@ -189,6 +189,38 @@ describe("isolated task persistence recovery", () => {
 		expect(states.at(-1)).toBe("failed");
 	});
 
+	it("emits a terminal failed batch when cancellation skips later schedules", async () => {
+		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("AsyncStarted", 0));
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		AsyncJobManager.setInstance(manager);
+		const controller = new AbortController();
+		const originalRegister = manager.register.bind(manager);
+		let firstRegistration = true;
+		vi.spyOn(manager, "register").mockImplementation((...args) => {
+			const jobId = originalRegister(...args);
+			if (firstRegistration) {
+				firstRegistration = false;
+				controller.abort();
+			}
+			return jobId;
+		});
+		const states: string[] = [];
+		const tool = await TaskTool.create(createSession());
+
+		await tool.execute(
+			"partial-schedule-cancel",
+			{ agent: "executor", tasks: [task("AsyncStarted"), task("AsyncSkipped")] },
+			controller.signal,
+			update => {
+				if (update.details?.async?.state) states.push(update.details.async.state);
+			},
+		);
+		await manager.waitForAll();
+		await manager.dispose({ timeoutMs: 100 });
+
+		expect(states.at(-1)).toBe("failed");
+	});
+
 	it("does not label patch-capture failures as owner-applied no-change", async () => {
 		mockIsolation();
 		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("CaptureFailure", 0));
