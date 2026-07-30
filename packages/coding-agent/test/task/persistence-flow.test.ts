@@ -229,6 +229,7 @@ describe("isolated task persistence recovery", () => {
 			nestedPatches: [{ relativePath: "vendor/nested", patch: "nested patch" }],
 		});
 		vi.spyOn(worktreeModule, "applyNestedPatches").mockResolvedValue();
+		vi.spyOn(worktreeModule, "verifyNestedPatchesApplied").mockResolvedValue(true);
 
 		const resultText = await runTask(await TaskTool.create(createSession()), [task("NestedOnly")]);
 
@@ -242,6 +243,7 @@ describe("isolated task persistence recovery", () => {
 		vi.spyOn(worktreeModule, "commitToBranch").mockResolvedValue({ nestedPatches });
 		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({ rootPatch: "", nestedPatches });
 		const applyNested = vi.spyOn(worktreeModule, "applyNestedPatches").mockResolvedValue();
+		vi.spyOn(worktreeModule, "verifyNestedPatchesApplied").mockResolvedValue(true);
 
 		const resultText = await runTask(await TaskTool.create(createSession("branch")), [task("BranchNested")]);
 
@@ -268,6 +270,28 @@ describe("isolated task persistence recovery", () => {
 		const resultText = await runTask(await TaskTool.create(createSession("branch")), [task("BranchThrow")]);
 
 		expect(applyNested).not.toHaveBeenCalled();
+		expect(resultText).toContain("merge failed");
+		expect(resultText).toContain("changes were not persisted to the owner worktree");
+		expect(resultText).toContain("local://subagents/");
+	});
+
+	it("keeps stash-pop-conflicted merged branches recovery-only", async () => {
+		mockIsolation();
+		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("StashConflict", 0));
+		const branchName = "gjc/task/StashConflict";
+		vi.spyOn(worktreeModule, "commitToBranch").mockResolvedValue({ branchName, nestedPatches: [] });
+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
+			rootPatch: "stash conflict recovery patch",
+			nestedPatches: [],
+		});
+		vi.spyOn(worktreeModule, "mergeTaskBranches").mockResolvedValue({
+			merged: [branchName],
+			failed: [branchName],
+			conflict: "stash pop: conflict with owner changes",
+		});
+
+		const resultText = await runTask(await TaskTool.create(createSession("branch")), [task("StashConflict")]);
+
 		expect(resultText).toContain("merge failed");
 		expect(resultText).toContain("changes were not persisted to the owner worktree");
 		expect(resultText).toContain("local://subagents/");
@@ -372,6 +396,23 @@ describe("isolated task persistence recovery", () => {
 		vi.spyOn(worktreeModule, "applyNestedPatches").mockRejectedValue(new Error("nested conflict"));
 
 		const resultText = await runTask(await TaskTool.create(createSession()), [task("NestedConflict")]);
+
+		expect(resultText).toContain("merge failed");
+		expect(resultText).toContain("changes were not persisted to the owner worktree");
+		expect(resultText).toContain("local://subagents/");
+	});
+
+	it("downgrades nested changes when exact post-apply proof fails", async () => {
+		mockIsolation();
+		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("NestedProof", 0));
+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
+			rootPatch: "",
+			nestedPatches: [{ relativePath: "vendor/nested", patch: "nested patch" }],
+		});
+		vi.spyOn(worktreeModule, "applyNestedPatches").mockResolvedValue();
+		vi.spyOn(worktreeModule, "verifyNestedPatchesApplied").mockResolvedValue(false);
+
+		const resultText = await runTask(await TaskTool.create(createSession()), [task("NestedProof")]);
 
 		expect(resultText).toContain("merge failed");
 		expect(resultText).toContain("changes were not persisted to the owner worktree");

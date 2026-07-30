@@ -12,6 +12,7 @@ import {
 	mergeTaskBranches,
 	parseIsolationMode,
 	serializeRecoveryPatchBundle,
+	verifyNestedPatchesApplied,
 	verifyRootPatchesApplied,
 } from "../../src/task/worktree";
 
@@ -212,7 +213,7 @@ describe("worktree isolation helpers", () => {
 		await fs.rm(path.join(nested, ".git"), { recursive: true, force: true });
 		const delta = await captureDeltaPatch(repo, baseline);
 		expect(delta.rootPatch).toContain("root change survives partial capture");
-		expect(delta.captureErrors).toEqual(["Nested repository is unavailable during delta capture: nested"]);
+		expect(delta.captureErrors?.[0]).toContain("Nested repository capture failed (nested):");
 		const bundle = JSON.parse(serializeRecoveryPatchBundle(delta)) as { captureErrors?: string[] };
 		expect(bundle.captureErrors).toEqual(delta.captureErrors);
 	});
@@ -234,12 +235,16 @@ describe("worktree isolation helpers", () => {
 		await runGit(nested, ["add", "staged.txt"]);
 		await fs.writeFile(path.join(nested, "unstaged.txt"), "owner unstaged\n");
 		await fs.writeFile(path.join(nested, "untracked.txt"), "owner untracked\n");
+		const baseline = await captureBaseline(repo);
 		await fs.writeFile(path.join(nested, "task.txt"), "task change\n");
 		const taskPatch = `${await runGit(nested, ["diff", "--binary", "--", "task.txt"])}\n`;
 		await runGit(nested, ["checkout", "--", "task.txt"]);
 		const headBefore = await runGit(nested, ["rev-parse", "HEAD"]);
 
 		await applyNestedPatches(repo, [{ relativePath: "nested-owner-state", patch: taskPatch }]);
+		expect(
+			await verifyNestedPatchesApplied(repo, baseline, [{ relativePath: "nested-owner-state", patch: taskPatch }]),
+		).toBe(true);
 
 		expect(await runGit(nested, ["rev-parse", "HEAD"])).toBe(headBefore);
 		const status = await runGit(nested, ["status", "--porcelain=v1"]);

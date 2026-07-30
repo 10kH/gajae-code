@@ -203,6 +203,32 @@ export function serializeRecoveryPatchBundle(delta: DeltaPatchResult): string {
 	} satisfies RecoveryPatchBundle)}\n`;
 }
 
+export async function verifyNestedPatchesApplied(
+	repoRoot: string,
+	baseline: WorktreeBaseline,
+	patches: readonly NestedRepoPatch[],
+): Promise<boolean> {
+	const grouped = new Map<string, string[]>();
+	for (const patch of patches) {
+		const current = grouped.get(patch.relativePath) ?? [];
+		current.push(patch.patch);
+		grouped.set(patch.relativePath, current);
+	}
+	for (const [relativePath, repoPatches] of grouped) {
+		const nestedBaseline = baseline.nested.find(entry => entry.relativePath === relativePath)?.baseline;
+		if (!nestedBaseline) return false;
+		const nestedDir = path.join(repoRoot, relativePath);
+		const baselineTree = await writeSyntheticTree(nestedDir, nestedBaseline.headCommit, [
+			nestedBaseline.staged,
+			nestedBaseline.unstaged,
+			nestedBaseline.untrackedPatch,
+		]);
+		const expectedTree = await writeSyntheticTree(nestedDir, baselineTree, repoPatches);
+		if ((await captureRepoCurrentTree(nestedDir)) !== expectedTree) return false;
+	}
+	return true;
+}
+
 export async function captureDeltaPatch(isolationDir: string, baseline: WorktreeBaseline): Promise<DeltaPatchResult> {
 	const rootPatch = await captureRepoDeltaPatch(isolationDir, baseline.root);
 	const nestedPatches: NestedRepoPatch[] = [];
@@ -212,12 +238,12 @@ export async function captureDeltaPatch(isolationDir: string, baseline: Worktree
 		const nestedDir = path.join(isolationDir, relativePath);
 		try {
 			await fs.access(path.join(nestedDir, ".git"));
-		} catch {
-			captureErrors.push(`Nested repository is unavailable during delta capture: ${relativePath}`);
-			continue;
+			const patch = await captureRepoDeltaPatch(nestedDir, nb);
+			if (patch.trim()) nestedPatches.push({ relativePath, patch });
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			captureErrors.push(`Nested repository capture failed (${relativePath}): ${message}`);
 		}
-		const patch = await captureRepoDeltaPatch(nestedDir, nb);
-		if (patch.trim()) nestedPatches.push({ relativePath, patch });
 	}
 
 	return { rootPatch, nestedPatches, ...(captureErrors.length ? { captureErrors } : {}) };

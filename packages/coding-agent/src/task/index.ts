@@ -83,6 +83,7 @@ import {
 	mergeTaskBranches,
 	parseIsolationMode,
 	serializeRecoveryPatchBundle,
+	verifyNestedPatchesApplied,
 	verifyRootPatchesApplied,
 	type WorktreeBaseline,
 } from "./worktree";
@@ -1057,7 +1058,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								progress.setupFailure = singleResult?.setupFailure;
 							}
 							completedJobs += 1;
-							if (singleResult && singleResult.status !== "completed") {
+							if (singleResult?.status !== "completed") {
 								failedJobs += 1;
 							}
 							const remaining = taskItems.length - completedJobs;
@@ -2028,7 +2029,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							mergeSummary = "\n\nNo changes to apply.";
 						} else {
 							const mergeResult = await mergeTaskBranches(repoRoot, branchEntries);
-							mergedBranchesForNestedPatches = new Set(mergeResult.merged);
+							mergedBranchesForNestedPatches = new Set(
+								mergeResult.merged.filter(branchName => !mergeResult.failed.includes(branchName)),
+							);
 							changesApplied = mergeResult.failed.length === 0;
 							hadAnyChanges = changesApplied && mergeResult.merged.length > 0;
 
@@ -2224,6 +2227,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				if (allNestedPatches.length > 0) {
 					try {
 						await applyNestedPatches(repoRoot, allNestedPatches);
+						if (!baseline || !(await verifyNestedPatchesApplied(repoRoot, baseline, allNestedPatches))) {
+							throw new Error("Nested repository persistence proof failed");
+						}
 						for (const result of results) {
 							const rootApplied =
 								mergeMode !== "branch"
