@@ -9731,7 +9731,9 @@ export class AgentSession {
 			]);
 			if (outcome.kind === "timeout") {
 				this.#abandonPostPromptTasks();
-				this.agent.forceAbort("Abort cleanup timed out", this.#activeLogicalRunId!);
+				const forceAbortLogicalRunId = this.agent.currentManagedLogicalRunId ?? this.#activeLogicalRunId;
+				if (forceAbortLogicalRunId !== undefined)
+					this.agent.forceAbort("Abort cleanup timed out", forceAbortLogicalRunId);
 				this.emitNotice(
 					"warning",
 					"Abort cleanup timed out; forced session recovery. The previous provider stream or tool may still be unwinding in the background.",
