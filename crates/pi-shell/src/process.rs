@@ -567,11 +567,15 @@ mod platform {
 		}
 
 		pub fn kill(&self, signal: i32) -> bool {
-			// macOS has no atomic "signal this exact process incarnation" primitive.
-			// Revalidating the start time and then issuing a bare PID signal leaves a
-			// PID-reuse window, so fail closed instead of risking an unrelated process.
-			let _ = (signal, self.live_bsdinfo());
-			false
+			// Re-validate identity immediately before signaling. macOS has no atomic
+			// "kill iff start_time matches" primitive, but this check prevents a
+			// recycled PID from being targeted in the normal case.
+			if self.live_bsdinfo().is_none() {
+				return false;
+			}
+			// SAFETY: `kill` takes integer identifiers by value and does not access
+			// caller-owned memory.
+			unsafe { libc::kill(self.pid, signal) == 0 }
 		}
 
 		pub fn group_id(&self) -> Option<i32> {
@@ -763,7 +767,9 @@ mod platform {
 			if pid <= 0 {
 				continue;
 			}
-			let info = read_bsdinfo(pid)?;
+			let Some(info) = read_bsdinfo(pid) else {
+				continue;
+			};
 			let ppid = i32::try_from(info.pbi_ppid).ok()?;
 			if ppid <= 0 {
 				continue;
