@@ -3368,6 +3368,7 @@ mod tests {
 			"root exit without descendant closure was neither disclosed nor rejected: {result:?}"
 		);
 	}
+	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn cancelling_after_group_leader_exit_fails_closed_without_anchor() {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
