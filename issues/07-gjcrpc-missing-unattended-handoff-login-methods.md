@@ -48,3 +48,7 @@ with dataclasses for `UnattendedDeclaration` / `UnattendedBudget` /
 `UnattendedAccepted`, and typed exceptions (or result variants) for
 `scope_denied`, `action_denied`, and `budget_exceeded` so hosts can react to the
 control-plane refusals programmatically.
+
+## Resolution
+
+**Resolved on current `dev`.** The typed Python client now exposes unattended negotiation, handoff, login, and login-provider methods with corresponding models.

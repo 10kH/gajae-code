@@ -76,3 +76,7 @@ never blocked:
 3. Make long-running handlers (`bash`, `compact`, `handoff`) cancellable so
    `abort_bash`/`abort` actually reach them, and make `login` fail fast / be
    abortable in RPC mode instead of awaiting an interactive callback forever.
+
+## Resolution
+
+**Obsolete on current `dev`.** The RPC mode implementation described by this finding was retired. No new fix should target the removed stdio RPC loop; replacement control-plane behavior belongs to the current SDK surface.

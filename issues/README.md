@@ -32,18 +32,28 @@ Deferred (designed; tracked as follow-ups, NOT claimed fixed):
 Plan + consensus artifacts: `.gjc/plans/ralplan/2026-06-13-1236-71f5/` (`pending-approval.md`).
 
 
-| # | Severity | Scope (primary file) | Summary |
-|---|----------|----------------------|---------|
-| [01](01-command-dispatch-handler-exceptions-lose-id.md) | High | `packages/coding-agent/src/modes/shared/agent-wire/command-dispatch.ts` | Handler exceptions escape to the generic input-loop catch → `id` dropped, command mislabeled `parse`. Breaks request/response correlation for many commands. |
-| [13](13-rpc-serial-input-loop-head-of-line-blocking.md) | High | `packages/coding-agent/src/modes/rpc/rpc-mode.ts` | Input loop is strictly serial: a blocking command (`bash`, `compact`, `handoff`, `login`) head-of-line-blocks everything, so `abort_bash` cannot cancel a running bash and `login` can wedge the session forever. |
-| [02](02-command-dispatch-missing-enum-validation.md) | High | `packages/coding-agent/src/modes/shared/agent-wire/command-dispatch.ts` | No validation for `set_thinking_level` / `set_steering_mode` / `set_follow_up_mode` / `set_interrupt_mode`; bogus values accepted with `success:true` and corrupt session state. |
-| [03](03-unattended-negotiate-unvalidated-scopes-actions.md) | High | `packages/coding-agent/src/modes/shared/agent-wire/unattended-run-controller.ts` | `negotiate_unattended` accepts unknown/misspelled scopes and action classes (fail-open declaration). |
-| [04](04-unattended-control-commands-consume-tool-call-budget.md) | High | `packages/coding-agent/src/modes/shared/agent-wire/unattended-session.ts` | Every RPC command (incl. read-only `get_state`) consumes the `max_tool_calls` budget; polling aborts the unattended run. |
-| [05](05-unattended-mandatory-floor-not-enforced.md) | Medium | `packages/coding-agent/src/modes/shared/agent-wire/scopes.ts` | `MANDATORY_FLOOR_COMMAND_SCOPES` is defined/tested/documented but never applied in `negotiate()`; hosts omitting `prompt` scope are locked out of prompting and gate answers. |
-| [06](06-gjcrpc-sessionstate-missing-contextusage.md) | Medium | `python/gjc-rpc/src/gjc_rpc/protocol.py` | `SessionState` drops `contextUsage`; the typed client gives hosts no access to context pressure. |
-| [07](07-gjcrpc-missing-unattended-handoff-login-methods.md) | High | `python/gjc-rpc/src/gjc_rpc/client.py` | No typed methods for `negotiate_unattended`, `handoff`, `login`, `get_login_providers`; the unattended control plane is unreachable from the public client API. |
-| [08](08-gjcrpc-tested-only-against-fake-server.md) | Medium | `python/gjc-rpc/tests/test_client.py` | The client is only tested against a hand-written fake server; real-gjc drift (06/07 etc.) goes uncaught. |
-| [09](09-rpc-no-persistent-detached-session.md) | High | `packages/coding-agent/src/modes/rpc/rpc-mode.ts` + `python/gjc-rpc/src/gjc_rpc/client.py` | No persistent/detached session: gjc exits on stdin EOF and `gjc_rpc` runs a foreground child that dies with the client. No daemon/reattach. |
-| [10](10-rpc-no-session-registry.md) | High | `python/gjc-rpc/src/gjc_rpc/client.py` (new module) | No session registry to enumerate/discover/reattach running RPC sessions. |
-| [11](11-docs-rpc-workflow-gate-stale-contradictory.md) | Low | `docs/rpc.md` | The first "Workflow Gate Sub-Protocol" section contradicts the source-of-truth `RpcWorkflowGate` type and the later doc section (options shape, context fields, `gate_id` format). |
-| [12](12-rpc-emit-title-env-var-mismatch.md) | Low | `packages/coding-agent/src/modes/rpc/rpc-mode.ts` | Code reads `PI_RPC_EMIT_TITLE`; docs document `GJC_RPC_EMIT_TITLE`. The documented variable has no effect. |
+| # | Severity | Disposition | Scope (primary file) | Summary |
+|---|----------|-------------|----------------------|---------|
+| [01](01-command-dispatch-handler-exceptions-lose-id.md) | High | Resolved | `packages/coding-agent/src/modes/shared/agent-wire/command-dispatch.ts` | Handler exceptions now return correlated command-specific failures. |
+| [02](02-command-dispatch-missing-enum-validation.md) | High | Resolved | `packages/coding-agent/src/modes/shared/agent-wire/command-dispatch.ts` | RPC mode setters now validate enum values at the boundary. |
+| [03](03-unattended-negotiate-unvalidated-scopes-actions.md) | High | Resolved | `packages/coding-agent/src/modes/shared/agent-wire/unattended-run-controller.ts` | Unknown unattended scopes and action classes are rejected. |
+| [04](04-unattended-control-commands-consume-tool-call-budget.md) | High | Resolved | `packages/coding-agent/src/modes/shared/agent-wire/unattended-session.ts` | Read-only/control commands no longer consume the tool-call budget. |
+| [05](05-unattended-mandatory-floor-not-enforced.md) | Medium | Resolved | `packages/coding-agent/src/modes/shared/agent-wire/scopes.ts` | Negotiation now merges the mandatory prompt floor. |
+| [06](06-gjcrpc-sessionstate-missing-contextusage.md) | Medium | Resolved | `python/gjc-rpc/src/gjc_rpc/protocol.py` | Typed Python context-usage parsing is present. |
+| [07](07-gjcrpc-missing-unattended-handoff-login-methods.md) | High | Resolved | `python/gjc-rpc/src/gjc_rpc/client.py` | Typed unattended, handoff, login, and provider methods are present. |
+| [08](08-gjcrpc-tested-only-against-fake-server.md) | Medium | Resolved | `python/gjc-rpc/tests/test_client.py` | An environment-gated real-binary integration lane is present. |
+| [09](09-rpc-no-persistent-detached-session.md) | High | Deferred architecture | RPC transport/session design | Persistent detached sessions require a replacement transport design. |
+| [10](10-rpc-no-session-registry.md) | High | Deferred architecture | RPC transport/session design | Cross-process discovery depends on persistent-session support. |
+| [11](11-docs-rpc-workflow-gate-stale-contradictory.md) | Low | Obsolete | Retired RPC docs | The retired RPC documentation is no longer an active surface. |
+| [12](12-rpc-emit-title-env-var-mismatch.md) | Low | Obsolete | Retired RPC configuration | The retired RPC configuration is no longer a supported surface. |
+| [13](13-rpc-serial-input-loop-head-of-line-blocking.md) | High | Obsolete | Retired RPC transport | The retired stdio RPC loop is no longer an implementation target. |
+
+## Reconciled status
+
+Audited on 2026-07-31 against current source, tests, and docs:
+
+- **Resolved:** issues **01–08, 14–18, 20–21**, plus low-fruit fixes **#3594** and **#3470**.
+- **Obsolete:** issues **11–13, 19** because the stdio RPC mode was retired.
+- **Deferred architectural follow-ups:** issues **09–10**; they require a replacement persistent transport/session design.
+- **Not active backlog:** historical issue descriptions remain for provenance, but only the categories above represent current work.
+- Existing dirty work in the checkout was preserved and not reset.

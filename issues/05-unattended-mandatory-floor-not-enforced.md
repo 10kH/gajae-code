@@ -64,3 +64,7 @@ Decide and align on one behavior:
 
 Cross-reference: see issue 03 (negotiation validation) — both stem from
 `negotiate()` not reconciling the declaration against the scope contract.
+
+## Resolution
+
+**Resolved on current `dev`.** Negotiation merges the mandatory prompt scope and `command.prompt` action floor into accepted unattended declarations.

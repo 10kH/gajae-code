@@ -37,3 +37,7 @@ fail-closed gap for unexpected probe errors.
 2. In `isUnixSocketAlive`, return `false` only for known stale/missing codes
    (`ENOENT`/`ECONNREFUSED`); refuse or surface unexpected probe errors before
    unlinking. Add platform-aware tests.
+
+## Resolution
+
+**Obsolete on current `dev`.** The RPC mode surface described by this finding has been retired; `docs/environment-variables.md` states that `--mode rpc`, `--mode rpc-ui`, and `--mode bridge` were removed. No product fix should be made against the retired path.

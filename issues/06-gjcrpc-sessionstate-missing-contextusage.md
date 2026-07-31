@@ -72,3 +72,7 @@ context_usage = ContextUsage(
 
 This drift was only observed because the client was driven against real gjc
 rather than the fake test server — see issue 08.
+
+## Resolution
+
+**Resolved on current `dev`.** The Python RPC client exposes typed `SessionState.context_usage` parsing for the wire-level `contextUsage` payload.

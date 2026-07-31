@@ -499,6 +499,34 @@ describe("LocalProtocolHandler", () => {
 		});
 	});
 
+	it("preserves literal percent escapes in the authority while decoding only the pathname", async () => {
+		await withTempDir(async tempDir => {
+			const sessionId = `percent-authority-${path.basename(tempDir)}`;
+			await withLocalRoot(sessionId, async localRoot => {
+				const literalPercent = path.join(localRoot, "report%3Araw.txt");
+				const decodedSibling = path.join(localRoot, "report:raw.txt");
+				await fs.writeFile(literalPercent, "literal");
+				await fs.writeFile(decodedSibling, "decoded");
+				const options = localOptions(sessionId, path.join(tempDir, "artifacts"));
+
+				expect(resolveLocalUrlToPath("local://report%253Araw.txt", options)).toBe(literalPercent);
+				expect(resolveLocalUrlToPath("local://report:raw.txt", options)).toBe(decodedSibling);
+			});
+		});
+	});
+
+	it("rejects malformed pathname escapes without decoding the authority again", async () => {
+		await withTempDir(async tempDir => {
+			const sessionId = `percent-malformed-${path.basename(tempDir)}`;
+			await withLocalRoot(sessionId, async () => {
+				const options = localOptions(sessionId, path.join(tempDir, "artifacts"));
+				expect(() => resolveLocalUrlToPath("local://report%253Araw.txt/%ZZ", options)).toThrow(
+					"Invalid URL encoding in local:// path",
+				);
+			});
+		});
+	});
+
 	it("resolves a stable external path before initialization", async () => {
 		const options = {
 			getSessionId: () => "session/fallback",

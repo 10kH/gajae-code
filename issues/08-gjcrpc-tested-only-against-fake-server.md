@@ -45,3 +45,7 @@ already demonstrates is feasible:
   contract guard.
 
 Reference harness used for these findings: `/tmp/gjcdf/harness.py`.
+
+## Resolution
+
+**Resolved on current `dev`.** An environment-gated real-binary integration lane now exercises the typed client against the live RPC surface while retaining fast fake-server unit tests.

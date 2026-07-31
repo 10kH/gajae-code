@@ -31,3 +31,7 @@ Make the provider-id mapping path honor the same local-baseUrl / `webSearch`
 auto gate as `inferNativeProviderFromModel`, or route all native selection
 through the guarded inference. Add a test: provider `openai` + local baseUrl +
 Codex OAuth + `webSearch:"auto"` → no hosted provider in the chain.
+
+## Resolution
+
+**Resolved on current `dev`.** The direct provider mapping now passes through `canUseDirectProviderMapping()`, which applies the local-baseUrl and `webSearch` guard before appending Codex.

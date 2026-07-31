@@ -72,3 +72,7 @@ calls. Options:
 
 Either way, read-only control-plane traffic must not consume — and must not be
 able to abort via — the agent tool-call budget.
+
+## Resolution
+
+**Resolved on current `dev`.** Read-only and control-plane commands no longer consume the unattended `max_tool_calls` budget; wall-time enforcement remains active.

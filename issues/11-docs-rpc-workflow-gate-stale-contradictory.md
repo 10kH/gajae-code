@@ -60,3 +60,7 @@ Delete/replace the stale first "Workflow Gate Sub-Protocol" block (383-447) so a
 single description matches `RpcWorkflowGate` / `RpcWorkflowGateOption` /
 `RpcWorkflowGateContext` and the later section. Generate the example from the
 types if possible to prevent re-drift.
+
+## Resolution
+
+**Obsolete on current `dev`.** The documented RPC mode was retired. Current SDK workflow-gate documentation is maintained under `docs/sdk.md`; this historical finding should not be treated as an active documentation backlog item.
