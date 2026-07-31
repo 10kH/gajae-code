@@ -116,6 +116,7 @@ const createTaskItemSchema = (_contextEnabled: boolean) =>
 				"authoritative repository identity; omitted items are stamped from session cwd before discovery/spawn and still fail closed on sibling drift",
 			),
 		reviewSource: reviewSourceSchema.optional(),
+		duplicate_policy: z.enum(["warn", "supersede"]).optional().describe("duplicate launch policy; defaults to warn"),
 	});
 
 const reviewSourceSchema = z
@@ -218,6 +219,7 @@ export interface TaskParams {
 	spawnPlan?: SpawnPlanReceipt;
 	tasks: TaskItem[];
 	isolated?: boolean;
+	duplicate_policy?: "warn" | "supersede";
 }
 
 /** A code review finding reported by the reviewer agent */
@@ -452,6 +454,12 @@ export interface TaskRecoveryArtifactRef {
 	durability: "session";
 }
 
+/** Bounded duplicate-launch disposition carried into task receipts. */
+export interface DuplicateDisposition {
+	action: "warned" | "superseded";
+	predecessorIds: string[];
+}
+
 export interface TaskPersistenceResult {
 	outcome: "applied" | "no_changes" | "recovery_available";
 	ownerWorktreeApplied: boolean;
@@ -488,6 +496,8 @@ export interface SingleResult {
 	setupFailure?: SetupFailureSummary;
 	aborted?: boolean;
 	abortReason?: string;
+
+	duplicateDisposition?: DuplicateDisposition;
 	paused?: boolean;
 	/** Aggregated usage from the subprocess, accumulated incrementally from message_end events. */
 	usage?: Usage;

@@ -91,6 +91,18 @@ import {
 	type WorktreeBaseline,
 } from "./worktree";
 
+interface DuplicateIdentity {
+	role: string;
+	ownerId?: string;
+	parentSession: string | null;
+	repository: { root: string; relativeSubdir: string | null };
+}
+
+interface DuplicateDisposition {
+	action: "warned" | "superseded";
+	predecessorIds: string[];
+}
+
 interface TaskResumeDescriptor {
 	toolCallId: string;
 	params: TaskParams;
@@ -99,6 +111,11 @@ interface TaskResumeDescriptor {
 	durableOutputAllowed?: boolean;
 	forkContextSeed?: ForkContextSeed;
 	agentSource: AgentDefinition["source"];
+	repositoryBinding: RepositoryBinding;
+	duplicateIdentity: DuplicateIdentity;
+	duplicatePolicy: "warn" | "supersede";
+	initialDisposition?: DuplicateDisposition;
+	lastAdmissionFailure?: string;
 }
 
 function isTaskResumeDescriptor(value: unknown): value is TaskResumeDescriptor {
@@ -188,18 +205,12 @@ async function resolveTaskItemsWithRepositoryBindings(
 	for (const task of tasks) {
 		try {
 			const binding = await resolveTaskRepositoryBinding(cwd, task.repositoryBinding);
-			if (binding.relativeSubdir) {
-				assertPathUnderRepositoryBinding(binding, ".");
-			}
-			resolved.push({
-				...task,
-				repositoryBinding: binding,
-			});
+			if (binding.relativeSubdir) assertPathUnderRepositoryBinding(binding, ".");
+			resolved.push({ ...task, repositoryBinding: binding });
 		} catch (error) {
 			const id = task.id?.trim() ? task.id : "(missing-id)";
-			if (error instanceof RepositoryBindingError) {
+			if (error instanceof RepositoryBindingError)
 				return { tasks: [], error: `Task "${id}" repository binding rejected: ${error.message}` };
-			}
 			return {
 				tasks: [],
 				error: `Task "${id}" repository binding rejected: ${error instanceof Error ? error.message : String(error)}`,
@@ -207,6 +218,31 @@ async function resolveTaskItemsWithRepositoryBindings(
 		}
 	}
 	return { tasks: resolved };
+}
+
+function duplicateIdentityForTask(
+	task: TaskItem,
+	role: string,
+	ownerId: string | undefined,
+	parentSession: string | null,
+): DuplicateIdentity {
+	const binding = task.repositoryBinding as RepositoryBinding;
+	return {
+		role: role.trim(),
+		ownerId,
+		parentSession,
+		repository: { root: binding.commonDir ?? binding.worktreeRoot, relativeSubdir: binding.relativeSubdir ?? null },
+	};
+}
+
+function duplicateIdentityKey(identity: DuplicateIdentity): string {
+	return JSON.stringify([
+		identity.role,
+		identity.ownerId ?? null,
+		identity.parentSession,
+		identity.repository.root,
+		identity.repository.relativeSubdir,
+	]);
 }
 
 function repositoryBindingFromTask(task: TaskItem): RepositoryBinding | undefined {
@@ -859,7 +895,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		const startedJobs: Array<{ jobId: string; taskId: string }> = [];
-		const failedSchedules: string[] = [];
+		const failedSchedules: Array<{
+			task: TaskItem & { id: string };
+			taskIndex: number;
+			message: string;
+			signalSkip: boolean;
+			duplicateDisposition?: DuplicateDisposition;
+		}> = [];
 		let completedJobs = 0;
 		let failedJobs = 0;
 
@@ -886,21 +928,106 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		};
 
 		const maxConcurrency = this.session.settings.get("task.maxConcurrency");
+		const ownerId = this.session.getAgentId?.() ?? undefined;
+		const parentSession = this.session.getSessionFile();
+		const admitDuplicateLaunch = (
+			subagentId: string,
+			task: TaskItem,
+			policy: "warn" | "supersede",
+			selfSubagentId?: string,
+		): { ok: boolean; disposition?: DuplicateDisposition; error?: string; identity: DuplicateIdentity } => {
+			const identity = duplicateIdentityForTask(task, params.agent, ownerId, parentSession);
+			const key = duplicateIdentityKey(identity);
+			const predecessors = manager
+				.getSubagentRecords({ ownerId })
+				.filter(record => {
+					if (record.subagentId === selfSubagentId || record.subagentId === subagentId) return false;
+					if (record.status !== "running" && record.status !== "paused" && record.status !== "queued")
+						return false;
+					return record.duplicateIdentity === key;
+				})
+				.sort(
+					(a, b) =>
+						(b.currentJobId ? (manager.getJob(b.currentJobId)?.startTime ?? 0) : 0) -
+							(a.currentJobId ? (manager.getJob(a.currentJobId)?.startTime ?? 0) : 0) ||
+						a.subagentId.localeCompare(b.subagentId),
+				);
+			if (predecessors.length === 0) return { ok: true, identity };
+			if (policy === "warn")
+				return {
+					ok: true,
+					identity,
+					disposition: { action: "warned", predecessorIds: predecessors.map(record => record.subagentId) },
+				};
+			for (const predecessor of predecessors)
+				if (!manager.cancelSubagent(predecessor.subagentId, { ownerId }))
+					return { ok: false, identity, error: "duplicate_supersede_failed" };
+			return {
+				ok: true,
+				identity,
+				disposition: { action: "superseded", predecessorIds: predecessors.map(record => record.subagentId) },
+			};
+		};
 		let resumeRunner: ResumeRunner | undefined;
 		if (typeof manager.setResumeRunner === "function") {
 			resumeRunner = (_subagentId, message, resumeDescriptor) => {
 				const descriptor = isTaskResumeDescriptor(resumeDescriptor?.data) ? resumeDescriptor.data : undefined;
 				if (!descriptor) return undefined;
+				const admission = (() => {
+					const identity = descriptor.duplicateIdentity;
+					const key = duplicateIdentityKey(identity);
+					const predecessors = manager
+						.getSubagentRecords({ ownerId })
+						.filter(record => {
+							if (
+								record.subagentId === descriptor.task.id ||
+								!["running", "paused", "queued"].includes(record.status)
+							)
+								return false;
+							return record.duplicateIdentity === key;
+						})
+						.sort(
+							(a, b) =>
+								(b.currentJobId ? (manager.getJob(b.currentJobId)?.startTime ?? 0) : 0) -
+									(a.currentJobId ? (manager.getJob(a.currentJobId)?.startTime ?? 0) : 0) ||
+								a.subagentId.localeCompare(b.subagentId),
+						);
+					if (predecessors.length === 0) return { ok: true, identity };
+					if (descriptor.duplicatePolicy === "warn")
+						return {
+							ok: true,
+							identity,
+							disposition: { action: "warned", predecessorIds: predecessors.map(record => record.subagentId) },
+						};
+					for (const predecessor of predecessors)
+						if (!manager.cancelSubagent(predecessor.subagentId, { ownerId }))
+							return { ok: false, identity, error: "duplicate_supersede_failed" };
+					return {
+						ok: true,
+						identity,
+						disposition: { action: "superseded", predecessorIds: predecessors.map(record => record.subagentId) },
+					};
+				})();
+				if (!admission.ok) {
+					descriptor.lastAdmissionFailure = admission.error;
+					return undefined;
+				}
+				if (!descriptor) return undefined;
 				const forkSeeds = descriptor.forkContextSeed
 					? new Map([[descriptor.task.id, descriptor.forkContextSeed]])
 					: undefined;
+				const resumedTask = {
+					...descriptor.task,
+					repositoryBinding: descriptor.repositoryBinding,
+					duplicate_policy: descriptor.duplicatePolicy,
+				};
 				return manager.register(
 					"task",
 					descriptor.task.id,
 					async ({ signal: runSignal }) => {
 						const result = await this.#executeSync(
 							descriptor.toolCallId,
-							{ ...descriptor.params, tasks: [descriptor.task] },
+							{ ...descriptor.params, tasks: [resumedTask] },
 							runSignal,
 							undefined,
 							[descriptor.task.id],
@@ -921,7 +1048,22 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							},
 						);
 						const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
-						const singleResult = result.details?.results[0];
+						const rawSingleResult = result.details?.results[0];
+						const singleResult = rawSingleResult
+							? {
+									...rawSingleResult,
+									duplicateDisposition: (() => {
+										const initial = descriptor.initialDisposition;
+										const current = admission.disposition;
+										if (!initial) return current;
+										if (!current) return initial;
+										return {
+											action: current.action,
+											predecessorIds: [...new Set([...initial.predecessorIds, ...current.predecessorIds])],
+										};
+									})(),
+								}
+							: rawSingleResult;
 						return subagentRunOutcomeFromSingleResult(finalText, singleResult);
 					},
 					{
@@ -932,6 +1074,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								id: descriptor.task.id,
 								agent: descriptor.params.agent,
 								agentSource: descriptor.agentSource,
+								duplicateIdentity: duplicateIdentityKey(descriptor.duplicateIdentity),
+								duplicateDisposition: (admission.disposition?.action ??
+									descriptor.initialDisposition?.action) as DuplicateDisposition["action"] | undefined,
 								description: descriptor.task.description,
 								assignment: descriptor.task.assignment.trim(),
 							},
@@ -968,7 +1113,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		for (let i = 0; i < taskItems.length; i++) {
 			const taskItem = taskItems[i];
 			if (signal?.aborted) {
-				failedSchedules.push(`${taskItem.id}: cancelled before scheduling`);
+				failedSchedules.push({
+					task: taskItem as TaskItem & { id: string },
+					taskIndex: i,
+					message: "cancelled before scheduling",
+					signalSkip: true,
+				});
 				const progress = progressByTaskId.get(taskItem.id);
 				if (progress) {
 					progress.status = "aborted";
@@ -981,7 +1131,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			if (signal?.aborted) {
 				for (let skippedIndex = i; skippedIndex < taskItems.length; skippedIndex++) {
 					const skippedTask = taskItems[skippedIndex]!;
-					failedSchedules.push(`${skippedTask.id}: cancelled before scheduling`);
+					failedSchedules.push({
+						task: skippedTask as TaskItem & { id: string },
+						taskIndex: skippedIndex,
+						message: "cancelled before scheduling",
+						signalSkip: true,
+					});
 					const skippedProgress = progressByTaskId.get(skippedTask.id);
 					if (skippedProgress) skippedProgress.status = "aborted";
 				}
@@ -997,6 +1152,17 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				const subtaskSessionFile = managedPersistence
 					? null
 					: path.join(batchArtifactsDir ?? externalTaskSessionsDir!, `${uniqueId}.jsonl`);
+				const admission = admitDuplicateLaunch(uniqueId, taskItem, taskItem.duplicate_policy ?? "warn");
+				if (!admission.ok) {
+					failedSchedules.push({
+						task: taskItem as TaskItem & { id: string },
+						taskIndex: i,
+						message: admission.error ?? "duplicate_supersede_failed",
+						signalSkip: false,
+						duplicateDisposition: admission.disposition,
+					});
+					continue;
+				}
 				const jobId = manager.register(
 					"task",
 					label,
@@ -1036,7 +1202,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								},
 							);
 							const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
-							const singleResult = result.details?.results[0];
+							const rawSingleResult = result.details?.results[0];
+							const singleResult = rawSingleResult
+								? {
+										...rawSingleResult,
+										duplicateDisposition: rawSingleResult.duplicateDisposition ?? admission.disposition,
+									}
+								: rawSingleResult;
 							if (progress) {
 								progress.status = singleResult?.paused
 									? "paused"
@@ -1119,6 +1291,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								id: uniqueId,
 								agent: params.agent,
 								agentSource: fallbackAgentSource,
+								duplicateIdentity: duplicateIdentityKey(admission.identity),
+								duplicateDisposition: admission.disposition?.action,
 								description: taskItem.description,
 								assignment: taskItem.assignment.trim(),
 							},
@@ -1145,6 +1319,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								durableOutputAllowed: Boolean(batchArtifactsDir),
 								forkContextSeed: frozenForkSeed,
 								agentSource: fallbackAgentSource,
+								repositoryBinding: taskItem.repositoryBinding as RepositoryBinding,
+								duplicateIdentity: admission.identity,
+								duplicatePolicy: taskItem.duplicate_policy ?? "warn",
+								initialDisposition: admission.disposition,
 							} satisfies TaskResumeDescriptor,
 						},
 						resumeRunner,
@@ -1155,10 +1333,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						subagentId: uniqueId,
 						ownerId: this.session.getAgentId?.() ?? undefined,
 						currentJobId: jobId,
+						currentJobGeneration: manager.getJob(jobId)?.generation,
 						historicalJobIds: [],
 						status: manager.getJob(jobId)?.status ?? "running",
 						sessionFile: null,
 						resumable: true,
+						duplicateIdentity: duplicateIdentityKey(admission.identity),
+						duplicateDisposition: admission.disposition?.action,
 					});
 				}
 			} catch (error) {
@@ -1168,7 +1349,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						: error instanceof Error
 							? error.message
 							: String(error);
-				failedSchedules.push(`${taskItem.id}: ${message}`);
+				failedSchedules.push({
+					task: taskItem as TaskItem & { id: string },
+					taskIndex: i,
+					message,
+					signalSkip: false,
+				});
 				const progress = progressByTaskId.get(taskItem.id);
 				if (progress) {
 					progress.status = "failed";
@@ -1181,11 +1367,36 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			failedJobs += failedSchedules.length;
 		}
 
+		const scheduleFailureReceipts = failedSchedules
+			.slice()
+			.sort((a, b) => a.taskIndex - b.taskIndex)
+			.map((entry, index) =>
+				buildTaskReceipt({
+					index,
+					id: entry.task.id,
+					agent: params.agent,
+					agentSource: fallbackAgentSource,
+					task: renderTaskAssignment(entry.task.assignment, simpleMode),
+					assignment: entry.task.assignment,
+					description: entry.task.description,
+					status: "failed",
+					exitCode: 1,
+					aborted: entry.signalSkip ? true : undefined,
+					abortReason: entry.signalSkip ? "Cancelled before start" : undefined,
+					truncated: false,
+					durationMs: 0,
+					tokens: 0,
+					output: "",
+					stderr: entry.message,
+					error: entry.message,
+					duplicateDisposition: entry.duplicateDisposition,
+				} as SingleResult),
+			);
 		if (startedJobs.length === 0) {
-			const failureText = `Failed to start background task jobs: ${failedSchedules.join("; ")}`;
+			const failureText = `Failed to start background task jobs: ${failedSchedules.map(entry => `${entry.task.id}: ${entry.message}`).join("; ")}`;
 			return {
 				content: [{ type: "text", text: failureText }],
-				details: { projectAgentsDir: null, results: [], totalDurationMs: 0 },
+				details: { projectAgentsDir: null, results: scheduleFailureReceipts, totalDurationMs: 0 },
 			};
 		}
 
@@ -1233,7 +1444,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			],
 			details: {
 				projectAgentsDir: null,
-				results: [],
+				results: scheduleFailureReceipts,
 				totalDurationMs: 0,
 				progress: getProgressSnapshot(),
 				async: { state: asyncState, jobId: startedJobs[0].jobId, type: "task" },

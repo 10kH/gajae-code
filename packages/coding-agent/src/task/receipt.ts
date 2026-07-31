@@ -43,6 +43,7 @@ export interface TaskResultReceipt {
 	retryFailure?: { attempt: number; errorSummary: string };
 	setupFailure?: { summary: string };
 	errorSummary?: string;
+	duplicateDisposition?: SingleResult["duplicateDisposition"];
 	abortSummary?: string;
 	preview: string;
 	previewTruncated: boolean;
@@ -296,6 +297,7 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		retryFailure: raw.retryFailure
 			? { attempt: raw.retryFailure.attempt, errorSummary: "Retry failure recorded." }
 			: undefined,
+		duplicateDisposition: raw.duplicateDisposition,
 		errorSummary:
 			raw.setupFailure?.summary ??
 			(raw.error
