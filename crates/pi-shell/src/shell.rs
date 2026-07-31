@@ -212,7 +212,7 @@ impl CommandProcessGroups {
 				process.status() == process::ProcessStatus::Running
 					&& process.group_id() == Some(*pgid)
 					&& process.incarnation() == *incarnation
-			})
+			}) || Self::group_has_recorded_member(&processes, *pgid)
 		});
 		before != anchors.len()
 	}
@@ -332,6 +332,16 @@ impl CommandProcessGroups {
 			process.status() == process::ProcessStatus::Running
 				&& process.group_id() == Some(pgid)
 				&& process.incarnation() == incarnation
+		}) || Self::group_has_recorded_member(&processes, pgid)
+	}
+
+	/// A recorded, still-running process whose live kernel process group is
+	/// `pgid` is exact proof that the group is still ours. A pipeline leader
+	/// that exits normally while later members keep running does not retire the
+	/// group, so leader liveness alone must not decide ownership.
+	fn group_has_recorded_member(processes: &HashMap<i32, process::Process>, pgid: i32) -> bool {
+		processes.values().any(|process| {
+			process.status() == process::ProcessStatus::Running && process.group_id() == Some(pgid)
 		})
 	}
 
@@ -4406,5 +4416,38 @@ mod tests {
 			stdout.extend_from_slice(&chunk);
 		}
 		assert_eq!(stdout, b"prod:8080");
+	}
+	/// Regression test for fast-exiting external pipelines being misreported
+	/// as "Shell process ownership incomplete". The second pipeline member
+	/// joins the first member's process group; when the leader exits before
+	/// the member's spawn callback validates the anchor, the group was wrongly
+	/// treated as retired (OWNERSHIP_RETIRED_GROUP) and ownership failed.
+	/// `cat <file> | grep -c <pat>` exits both members almost instantly; every
+	/// run must succeed.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn fast_external_pipeline_settles_ownership() {
+		let dir = std::env::temp_dir().join(format!("pi-shell-pipe-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).expect("temp dir");
+		let file = dir.join("input.txt");
+		std::fs::write(&file, "alpha\nsession one\nsession two\nomega\n").expect("write input");
+		let command = format!("cat {} | grep -c session", file.display());
+
+		for attempt in 0..40 {
+			let options = ShellExecuteOptions { command: command.clone(), ..Default::default() };
+			let (tx, mut rx) = mpsc::channel::<ShellOutputChunk>(64);
+			let result = execute_shell(options, Some(tx), CancelToken::default())
+				.await
+				.unwrap_or_else(|err| {
+					panic!("attempt {attempt}: fast pipeline must not fail ownership: {err}")
+				});
+			assert_eq!(result.exit_code, Some(0), "attempt {attempt}");
+			let mut output = String::new();
+			while let Some(chunk) = rx.recv().await {
+				output.push_str(&chunk.text);
+			}
+			assert!(output.contains('2'), "attempt {attempt}: output={output:?}");
+		}
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 }
