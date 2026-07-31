@@ -4886,6 +4886,21 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 		].join("\n");
 	}
 
+	if (subject === "review-source") {
+		return [
+			"Run native GJC Ultragoal workflow commands",
+			"",
+			"USAGE",
+			"  $ gjc ultragoal review-source freeze [--json]",
+			"  $ gjc ultragoal review-source dispatch --cohort-id <id> --task-id <id> --lane <cleaner|architect|qa|critic> --rerun-command <command> [--json]",
+			"",
+			"DESCRIPTION",
+			"  Freeze derives and persists a runtime-owned source snapshot before review dispatch.",
+			"  Dispatch returns the leader-issued reviewSource object required by source-aware task lanes.",
+			"",
+		].join("\n");
+	}
+
 	if (subject === "quality-gate") {
 		return [
 			"Run native GJC Ultragoal workflow commands",
@@ -4927,9 +4942,11 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 		"  record-critic-gate-override",
 		"  quality-gate init",
 		"  quality-gate validate",
+		"  review-source freeze",
+		"  review-source dispatch",
 
 		"",
-		"Run `gjc ultragoal checkpoint --help`, `gjc ultragoal review --help`, `gjc ultragoal classify-blocker --help`, `gjc ultragoal record-critic-verdict --help`, or `gjc ultragoal record-critic-gate-override --help`, or `gjc ultragoal quality-gate --help` for command-specific requirements.",
+		"Run `gjc ultragoal checkpoint --help`, `gjc ultragoal review --help`, `gjc ultragoal review-source --help`, `gjc ultragoal classify-blocker --help`, `gjc ultragoal record-critic-verdict --help`, `gjc ultragoal record-critic-gate-override --help`, or `gjc ultragoal quality-gate --help` for command-specific requirements.",
 		"",
 	].join("\n");
 }
