@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "kind": "package-test-report",
   "issue": 3670,
-  "commit": "650e1d474fb2f73bb2fb77f433e2c85e59e7642e",
+  "commit": "572f8a53c17c917d735ae113be10947acc134c97",
   "commands": [
     "bun test packages/coding-agent/test/async-yield-queue.test.ts packages/coding-agent/test/session/yield-queue.test.ts packages/coding-agent/test/task-fork-context.test.ts packages/coding-agent/test/task/fork-context-advisory.test.ts packages/coding-agent/test/task/fork-context-seed.test.ts packages/ai/test/anthropic-cache-eval.integration.test.ts packages/ai/test/anthropic-cache.test.ts",
     "bun --cwd=packages/coding-agent run check:types",
@@ -25,10 +25,10 @@
     "artifacts/issue-3670-anthropic-cache-eval.json"
   ],
   "atomicCommits": [
-    "1f77b51b407194195ab8231d480523d47089dc49",
-    "1548b31dca076d269fe5cbe36f7c87be5d5516c4",
-    "3a999e14bee2d91d4ef5636e9bd0fd3ed7076d30",
-    "650e1d474fb2f73bb2fb77f433e2c85e59e7642e"
+    "ec3ae11e93ecc6e49a12149bc48682309c7ef72c",
+    "23b86677d7e8bc60af48983a344afab789e8353b",
+    "ab7b461da93d54a6c0aee2702b41e15daf2aa463",
+    "ba52d8989ff1aa6b710df76921e80f6811cafac1"
   ],
   "limitations": [
     "No external Anthropic API calls; cache evidence is deterministic local provider-payload simulation."
