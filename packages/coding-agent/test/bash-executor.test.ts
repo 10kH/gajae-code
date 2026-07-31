@@ -568,6 +568,53 @@ describe("executeBash", () => {
 		expect(result.sourceCaptureIncomplete).toBe(true);
 	});
 
+	it("emits the raw-output artifact footer for lossless minimized saves", async () => {
+		vi.spyOn(piNatives.Shell.prototype, "run").mockResolvedValue({
+			exitCode: 0,
+			cancelled: false,
+			timedOut: false,
+			minimized: {
+				filter: "test",
+				text: "minimized output",
+				originalText: "original output",
+				inputBytes: 15,
+				outputBytes: 16,
+			},
+		});
+		const result = await executeBash("ignored", {
+			cwd: tempDir,
+			timeout: 5000,
+			sessionKey: "minimized-clean-save",
+			onMinimizedSave: async () => ({ status: "saved", artifactId: "42", complete: true }),
+		});
+		expect(result.output).toContain("[raw output: artifact://42]");
+		expect(result.output).not.toContain("artifact save could not be verified");
+		expect(result.sourceCaptureIncomplete).toBeFalsy();
+	});
+
+	it("labels capped lossless minimized saves with omitted byte counts", async () => {
+		vi.spyOn(piNatives.Shell.prototype, "run").mockResolvedValue({
+			exitCode: 0,
+			cancelled: false,
+			timedOut: false,
+			minimized: {
+				filter: "test",
+				text: "minimized output",
+				originalText: "original output",
+				inputBytes: 15,
+				outputBytes: 16,
+			},
+		});
+		const result = await executeBash("ignored", {
+			cwd: tempDir,
+			timeout: 5000,
+			sessionKey: "minimized-capped-save",
+			onMinimizedSave: async () => ({ status: "saved", artifactId: "43", complete: false, omittedBytes: 7 }),
+		});
+		expect(result.output).toContain("[raw output retained (7 bytes omitted): artifact://43]");
+		expect(result.output).not.toContain("artifact save could not be verified");
+	});
+
 	it("fails closed on malformed native capture-status flags", async () => {
 		for (const malformed of [null, 0]) {
 			vi.spyOn(piNatives.Shell.prototype, "run").mockResolvedValueOnce({

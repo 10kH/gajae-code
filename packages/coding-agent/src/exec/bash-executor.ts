@@ -244,6 +244,17 @@ function minimizedSaveNotice(
 	if (result.status === "unavailable" && !completeRawArtifactAvailable(summary)) {
 		return "Bash output artifact unavailable: full original output could not be stored because artifact storage is unavailable.";
 	}
+	if (result.status === "saved") {
+		// A save can only be presented as raw-output evidence when the source
+		// capture itself was lossless; otherwise the artifact provably cannot
+		// contain the full original stream.
+		if ((summary.sourceTruncatedBytes ?? 0) > 0 || summary.sourceCaptureIncomplete) {
+			return "Bash output artifact save failed: artifact save could not be verified in the current session";
+		}
+		return result.complete
+			? `[raw output: artifact://${result.artifactId}]`
+			: `[raw output retained (${result.omittedBytes} bytes omitted): artifact://${result.artifactId}]`;
+	}
 	return undefined;
 }
 
@@ -704,12 +715,6 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 						}),
 					)
 				: { status: "unavailable" };
-			if (minimizedSaveResult.status === "saved") {
-				minimizedSaveResult = {
-					status: "failed",
-					diagnostic: "artifact save could not be verified in the current session",
-				};
-			}
 		}
 
 		const crashReport = await writeCrashReport(
