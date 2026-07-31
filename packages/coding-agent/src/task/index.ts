@@ -53,6 +53,9 @@ import {
 	RepositoryBindingError,
 	resolveTaskRepositoryBinding,
 } from "../gjc-runtime/repository-binding";
+import { reconcileReviewSourceDelivery } from "../gjc-runtime/ultragoal-review-source";
+import { recordUltragoalReviewDelivery, validateUltragoalReviewDispatch } from "../gjc-runtime/ultragoal-runtime";
+
 import { initializeLocalRoot, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { ArtifactManager } from "../session/artifacts";
 import { generateCommitMessage } from "../utils/commit-message-generator";
@@ -1702,6 +1705,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				if (taskRepositoryBinding.relativeSubdir) {
 					assertPathUnderRepositoryBinding(taskRepositoryBinding, ".");
 				}
+				if (task.reviewSource) {
+					await validateUltragoalReviewDispatch({
+						cwd: this.session.cwd,
+						dispatchId: task.reviewSource.dispatchId,
+						cohortId: task.reviewSource.cohortId,
+						taskId: task.id,
+						lane: task.reviewSource.lane,
+						snapshotId: task.reviewSource.snapshotId,
+					});
+				}
 				if (!isIsolated) {
 					await assertExecutionRootMatchesRepositoryBinding(this.session.cwd, taskRepositoryBinding);
 					const result = await runSubprocess({
@@ -1756,11 +1769,32 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentTelemetry: this.session.getTelemetry?.(),
 						forkContextSeed,
 					});
+					const reviewSourceDisposition = task.reviewSource
+						? await reconcileReviewSourceDelivery({
+								cwd: this.session.cwd,
+								repositoryBinding: taskRepositoryBinding,
+								reviewSource: task.reviewSource,
+							})
+						: undefined;
+					const reviewSource =
+						task.reviewSource && reviewSourceDisposition
+							? {
+									...task.reviewSource,
+									...reviewSourceDisposition,
+									deliveryId: await recordUltragoalReviewDelivery({
+										cwd: this.session.cwd,
+										cohortId: task.reviewSource.cohortId,
+										dispatchId: task.reviewSource.dispatchId,
+										disposition: reviewSourceDisposition.disposition,
+									}),
+								}
+							: undefined;
 					return {
 						...result,
 						...(forkContext ? { forkContext } : {}),
 						forkContextAdvisory,
 						repositoryBinding: publicRepositoryBinding(taskRepositoryBinding),
+						...(reviewSource ? { reviewSource } : {}),
 					};
 				}
 

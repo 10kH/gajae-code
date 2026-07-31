@@ -2,6 +2,7 @@ import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Usage } from "@gajae-code/ai";
 import { $env } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import type { ReviewDeliveryDisposition, ReviewSourceLane } from "../gjc-runtime/ultragoal-review-source";
 import { isValidTaskId, TASK_ID_DESCRIPTION } from "./id";
 import type { TaskResultReceipt } from "./receipt";
 import type { SpawnRoiReconciliation } from "./roi-reconciliation";
@@ -114,7 +115,23 @@ const createTaskItemSchema = (_contextEnabled: boolean) =>
 			.describe(
 				"authoritative repository identity; omitted items are stamped from session cwd before discovery/spawn and still fail closed on sibling drift",
 			),
+		reviewSource: reviewSourceSchema.optional(),
 	});
+
+const reviewSourceSchema = z
+	.object({
+		schema: z.literal("gjc.review_source_dispatch.v1"),
+		cohortId: z.string().min(1),
+		generation: z.number().int().min(1),
+		lane: z.enum(["cleaner", "architect", "qa", "critic"]),
+		snapshotId: z.string().startsWith("sha256:"),
+		repositoryBindingDigest: z.string().startsWith("sha256:"),
+		stateRevision: z.number().int().min(0),
+		dispatchId: z.string().min(1),
+		rerunCommand: z.string().min(1),
+	})
+	.strict()
+	.describe("leader-issued immutable review source identity; review lanes only");
 
 /** Single task item for parallel execution (default shape with context enabled). */
 export const taskItemSchema = createTaskItemSchema(true);
@@ -523,6 +540,21 @@ export interface SingleResult {
 		displayPath?: string;
 		head?: string;
 		branch?: string;
+	};
+	/** Leader-issued immutable source identity for source-aware review lanes (#3469). */
+	reviewSource?: {
+		schema: "gjc.review_source_dispatch.v1";
+		cohortId: string;
+		generation: number;
+		lane: ReviewSourceLane;
+		snapshotId: string;
+		repositoryBindingDigest: string;
+		stateRevision: number;
+		dispatchId: string;
+		rerunCommand: string;
+		disposition: ReviewDeliveryDisposition;
+		currentSnapshotId?: string;
+		deliveryId?: string;
 	};
 }
 
