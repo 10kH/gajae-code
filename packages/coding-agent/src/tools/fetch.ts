@@ -10,15 +10,9 @@ import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { type Theme, theme } from "../modes/theme/theme";
 import type { ToolSession } from "../sdk";
 import type { AgentStorage } from "../session/agent-storage";
-import {
-	DEFAULT_ARTIFACT_MAX_BYTES,
-	DEFAULT_MAX_BYTES,
-	type TruncationDirection,
-	truncateContent,
-} from "../session/streaming-output";
+import { DEFAULT_MAX_BYTES, type TruncationDirection, truncateContent } from "../session/streaming-output";
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
-import { isValidArtifactId } from "../utils/artifact-id";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import { parseHtmlLazy } from "../utils/linkedom";
 import { INSANE_NOTES } from "../web/insane/bridge";
@@ -28,7 +22,7 @@ import type { RenderResult } from "../web/scrapers/types";
 import { finalizeOutput, loadPage, looksLikeHtml, MAX_OUTPUT_CHARS } from "../web/scrapers/types";
 import { convertWithMarkit, fetchBinary } from "../web/scrapers/utils";
 import { applyListLimit } from "./list-limit";
-import { formatArtifactEvidenceNotice, type OutputMeta } from "./output-meta";
+import { formatStyledArtifactReference, type OutputMeta } from "./output-meta";
 import { formatExpandHint, getDomain, replaceTabs } from "./render-utils";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
@@ -1150,9 +1144,6 @@ export interface ReadUrlToolDetails {
 
 interface ReadUrlCacheEntry {
 	artifactId?: string;
-	artifactVerified?: boolean;
-	artifactFailureDiagnostic?: string;
-	artifactStorageIncomplete?: boolean;
 	details: ReadUrlToolDetails;
 	image?: FetchImagePayload;
 	/** Complete URL output, including its preamble and body. */
@@ -1189,7 +1180,7 @@ async function materializeReadUrlCacheEntry(
 	entry: ReadUrlCacheEntry,
 ): Promise<ReadUrlCacheEntry | null> {
 	if (entry.output.length > 0) return entry;
-	if (isValidArtifactId(entry.artifactId) && entry.artifactVerified === true) {
+	if (entry.artifactId) {
 		const artifactOutput = await readArtifactOutput(session, entry.artifactId);
 		if (artifactOutput !== null) {
 			// Artifacts retain their trust-boundary wrapper. Keep the raw preamble
@@ -1197,7 +1188,6 @@ async function materializeReadUrlCacheEntry(
 			return {
 				...entry,
 				output: artifactOutput,
-				artifactVerified: true,
 				...(entry.wrappedPreambleChars !== undefined ? { wrappedPreambleChars: entry.wrappedPreambleChars } : {}),
 			};
 		}
@@ -1205,60 +1195,17 @@ async function materializeReadUrlCacheEntry(
 	return null;
 }
 
-const READ_URL_ARTIFACT_WAIT_MS = 500;
-const READ_URL_ARTIFACT_PENDING_LIMIT = 64;
-const pendingReadUrlArtifactWrites = new Set<Promise<unknown>>();
-
-async function persistReadUrlArtifact(
-	session: ToolSession,
-	output: string,
-): Promise<{ artifactId?: string; diagnostic?: string; storageIncomplete?: boolean }> {
-	if (pendingReadUrlArtifactWrites.size >= READ_URL_ARTIFACT_PENDING_LIMIT) {
-		return { diagnostic: "pending URL artifact persistence limit reached" };
-	}
-	const promise = Promise.resolve().then(async () => {
-		const wrapped = wrapUntrustedContent(output);
-		const artifactManager = session.getArtifactManager?.();
-		if (artifactManager?.getManagedStore()) {
-			const artifactId = await artifactManager.save(wrapped, "read");
-			const contentBytes = Buffer.byteLength(wrapped, "utf8");
-			return {
-				artifactId,
-				storageIncomplete: contentBytes > DEFAULT_ARTIFACT_MAX_BYTES || undefined,
-			};
-		}
-		const { path: artifactPath, id } = (await session.allocateOutputArtifact?.("read")) ?? {};
-		if (!artifactPath || !isValidArtifactId(id)) {
-			return { diagnostic: "artifact storage is unavailable or returned an invalid artifact id" };
-		}
-		await Bun.write(artifactPath, wrapped);
-		return { artifactId: id };
-	});
-	pendingReadUrlArtifactWrites.add(promise);
-	void promise.then(
-		() => pendingReadUrlArtifactWrites.delete(promise),
-		() => pendingReadUrlArtifactWrites.delete(promise),
-	);
-	return Promise.race([
-		promise.catch(error => ({
-			diagnostic: error instanceof Error ? error.message.slice(0, 512) : String(error).slice(0, 512),
-		})),
-		Bun.sleep(READ_URL_ARTIFACT_WAIT_MS).then(() => ({
-			diagnostic: `did not settle within ${READ_URL_ARTIFACT_WAIT_MS}ms`,
-		})),
-	]);
+async function persistReadUrlArtifact(session: ToolSession, output: string): Promise<string | undefined> {
+	const { path: artifactPath, id } = (await session.allocateOutputArtifact?.("read")) ?? {};
+	if (!artifactPath) return undefined;
+	await Bun.write(artifactPath, wrapUntrustedContent(output));
+	return id;
 }
 
 async function ensureReadUrlCacheArtifact(session: ToolSession, entry: ReadUrlCacheEntry): Promise<ReadUrlCacheEntry> {
-	if (isValidArtifactId(entry.artifactId) && entry.artifactVerified === true) return entry;
-	const persisted = await persistReadUrlArtifact(session, entry.output);
-	return {
-		...entry,
-		artifactId: persisted.artifactId,
-		artifactVerified: persisted.artifactId !== undefined,
-		artifactFailureDiagnostic: persisted.diagnostic,
-		artifactStorageIncomplete: persisted.storageIncomplete,
-	};
+	if (entry.artifactId) return entry;
+	const artifactId = await persistReadUrlArtifact(session, entry.output);
+	return artifactId ? { ...entry, artifactId } : entry;
 }
 
 function cacheReadUrlEntry(session: ToolSession, requestedUrl: string, raw: boolean, entry: ReadUrlCacheEntry): void {
@@ -1283,13 +1230,10 @@ async function buildReadUrlCacheEntry(
 	const storage = session.settings.getStorage();
 	const result = await renderUrl(url, effectiveTimeout, raw, session.settings, signal, storage);
 	const built = buildUrlReadOutput(result, result.content);
-	const persistedArtifact = options?.ensureArtifact ? await persistReadUrlArtifact(session, built.output) : {};
+	const artifactId = options?.ensureArtifact ? await persistReadUrlArtifact(session, built.output) : undefined;
 
 	return {
-		artifactId: persistedArtifact.artifactId,
-		artifactVerified: persistedArtifact.artifactId !== undefined,
-		artifactFailureDiagnostic: persistedArtifact.diagnostic,
-		artifactStorageIncomplete: persistedArtifact.storageIncomplete,
+		artifactId,
 		details: {
 			kind: "url",
 			url: result.url,
@@ -1427,7 +1371,7 @@ export async function executeReadUrl(
 		direction: effectiveDirection,
 	});
 	const needsArtifact = truncation.truncated;
-	if (needsArtifact && (!isValidArtifactId(cacheEntry.artifactId) || cacheEntry.artifactVerified !== true)) {
+	if (needsArtifact && !cacheEntry.artifactId) {
 		cacheEntry = await ensureReadUrlCacheArtifact(session, cacheEntry);
 		cacheReadUrlEntry(session, params.path, params.raw ?? false, cacheEntry);
 	}
@@ -1454,9 +1398,6 @@ export async function executeReadUrl(
 		resultBuilder.truncation(truncation, {
 			direction: effectiveDirection === "both" ? "middle" : effectiveDirection === "last" ? "tail" : "head",
 			artifactId: cacheEntry.artifactId,
-			artifactVerified: cacheEntry.artifactVerified === true || undefined,
-			artifactFailureDiagnostic: cacheEntry.artifactFailureDiagnostic,
-			sourceCaptureIncomplete: cacheEntry.details.truncated || cacheEntry.artifactStorageIncomplete || undefined,
 			...(effectiveDirection !== "head" ? { maxBytes: DEFAULT_MAX_BYTES } : {}),
 		});
 	} else if (cacheEntry.details.truncated) {
@@ -1560,10 +1501,7 @@ export function renderReadUrlResult(
 	metadataLines.push(`${uiTheme.fg("muted", "Chars:")} ${charCount}`);
 	if (truncated) {
 		metadataLines.push(uiTheme.fg("warning", `${uiTheme.status.warning} Output truncated`));
-		if (truncation?.artifactId && truncation.artifactVerified === true) {
-			const artifactNotice = formatArtifactEvidenceNotice(truncation);
-			if (artifactNotice) metadataLines.push(uiTheme.fg("warning", artifactNotice));
-		}
+		if (truncation?.artifactId) metadataLines.push(formatStyledArtifactReference(truncation.artifactId, uiTheme));
 	}
 	if (hasNotes) {
 		metadataLines.push(`${uiTheme.fg("muted", "Notes:")} ${details.notes.join("; ")}`);

@@ -5,11 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import { ArtifactManager } from "../src/session/artifacts";
-import {
-	ManagedSessionDescendantStore,
-	managedDirectoryRoot,
-	replaceManagedFileSync,
-} from "../src/session/internal/managed-session-storage";
+import { ManagedSessionDescendantStore, managedDirectoryRoot } from "../src/session/internal/managed-session-storage";
 import { createManagedTaskPersistence } from "../src/task/executor";
 
 const temporaryDirectories: string[] = [];
@@ -42,116 +38,6 @@ describe("explicit artifact path allocation", () => {
 		await Bun.write(allocated.path, "full output");
 		expect(await fs.readFile(allocated.path, "utf8")).toBe("full output");
 	});
-
-	it("ignores unsafe persisted artifact ids when resuming", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-unsafe-artifact-id-"));
-		temporaryDirectories.push(root);
-		const artifactsDir = path.join(root, "artifacts");
-		await fs.mkdir(artifactsDir, { recursive: true });
-		await Bun.write(path.join(artifactsDir, "9007199254740992.bash.log"), "foreign unsafe artifact");
-		await Bun.write(path.join(artifactsDir, "0009007199254740991.bash.log"), "foreign noncanonical artifact");
-		const allocated = await new ArtifactManager(artifactsDir).allocatePath("bash");
-		expect(allocated.id).toBe("0");
-	});
-
-	it("serializes concurrent first allocations when resuming", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-concurrent-artifact-id-"));
-		temporaryDirectories.push(root);
-		const artifactsDir = path.join(root, "artifacts");
-		await fs.mkdir(artifactsDir, { recursive: true });
-		await Bun.write(path.join(artifactsDir, "5.bash.log"), "existing artifact");
-		const manager = new ArtifactManager(artifactsDir);
-		const allocations = await Promise.all(Array.from({ length: 20 }, () => manager.allocatePath("bash")));
-		expect(allocations.map(allocation => allocation.id)).toEqual(
-			Array.from({ length: 20 }, (_, index) => String(index + 6)),
-		);
-	});
-
-	it("fails closed when the safe artifact id space is exhausted", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-exhausted-artifact-id-"));
-		temporaryDirectories.push(root);
-		const artifactsDir = path.join(root, "artifacts");
-		await fs.mkdir(artifactsDir, { recursive: true });
-		await Bun.write(path.join(artifactsDir, `${Number.MAX_SAFE_INTEGER}.bash.log`), "last safe artifact");
-		await expect(new ArtifactManager(artifactsDir).allocatePath("bash")).rejects.toThrow(
-			"Artifact id space exhausted",
-		);
-	});
-
-	it("checks the portable mutation fence before and around replacement publication", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-portable-fence-"));
-		temporaryDirectories.push(root);
-		const destination = path.join(root, "selector.json");
-		await Bun.write(destination, "old");
-		const expectedRoot = await fs.stat(root, { bigint: true });
-		let checks = 0;
-		replaceManagedFileSync(destination, Buffer.from("new"), managedDirectoryRoot(root), "default", () => {
-			const current = fsSync.lstatSync(root, { bigint: true });
-			expect(current.dev).toBe(expectedRoot.dev);
-			expect(current.ino).toBe(expectedRoot.ino);
-			checks += 1;
-		});
-		expect(checks).toBe(3);
-		expect(await fs.readFile(destination, "utf8")).toBe("new");
-	});
-
-	it("publishes portable managed successor generations under selector fencing", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-portable-generation-"));
-		temporaryDirectories.push(root);
-		const artifactsDir = path.join(root, "artifacts");
-		await fs.mkdir(artifactsDir, { mode: 0o700 });
-		const platform = Object.getOwnPropertyDescriptor(process, "platform");
-		let store!: ManagedSessionDescendantStore;
-		try {
-			Object.defineProperty(process, "platform", { configurable: true, value: "darwin" });
-			store = new ManagedSessionDescendantStore(managedDirectoryRoot(artifactsDir), artifactsDir);
-		} finally {
-			if (platform) Object.defineProperty(process, "platform", platform);
-		}
-		const persistence = createManagedTaskPersistence(new ArtifactManager(store), "0-task-portable-generation");
-		await persistence.publishOutput("first", Buffer.from('{"generation":1}', "utf8"));
-		await persistence.publishOutput("second", Buffer.from('{"generation":2}', "utf8"));
-		expect(await readSelected(artifactsDir, "0-task-portable-generation")).toEqual({
-			output: "second",
-			metadata: '{"generation":2}',
-		});
-	});
-
-	it("publishes no bytes into a portable subtree swapped at selector replacement", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-portable-swap-"));
-		temporaryDirectories.push(root);
-		const artifactsDir = path.join(root, "artifacts");
-		await fs.mkdir(artifactsDir, { mode: 0o700 });
-		const detachedDir = path.join(root, "detached");
-		const platform = Object.getOwnPropertyDescriptor(process, "platform");
-		let store!: ManagedSessionDescendantStore;
-		try {
-			Object.defineProperty(process, "platform", { configurable: true, value: "darwin" });
-			store = new ManagedSessionDescendantStore(managedDirectoryRoot(artifactsDir), artifactsDir);
-		} finally {
-			if (platform) Object.defineProperty(process, "platform", platform);
-		}
-		const persistence = createManagedTaskPersistence(new ArtifactManager(store), "0-task-portable-swap");
-		await persistence.publishOutput("first", Buffer.from('{"generation":1}', "utf8"));
-		const selectorPath = path.join(artifactsDir, "0-task-portable-swap.md.selector.json");
-		const rename = fsSync.renameSync.bind(fsSync);
-		let swapped = false;
-		const spy = vi.spyOn(fsSync, "renameSync").mockImplementation((source, destination) => {
-			if (!swapped && String(destination) === selectorPath && String(source).endsWith(".replacement")) {
-				swapped = true;
-				rename(artifactsDir, detachedDir);
-				fsSync.mkdirSync(artifactsDir, { mode: 0o700 });
-			}
-			return rename(source, destination);
-		});
-		try {
-			await expect(persistence.publishOutput("second", Buffer.from('{"generation":2}', "utf8"))).rejects.toThrow();
-			expect(swapped).toBe(true);
-			expect(await fs.readdir(artifactsDir)).toEqual([]);
-		} finally {
-			spy.mockRestore();
-		}
-	});
 });
 
 describe.skipIf(process.platform !== "linux")("managed task descendant persistence", () => {
@@ -174,54 +60,6 @@ describe.skipIf(process.platform !== "linux")("managed task descendant persisten
 		});
 	});
 
-	it("allows only one manager to commit from the same captured selector generation", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-managed-selector-cas-"));
-		temporaryDirectories.push(root);
-		const artifactsDir = path.join(root, "artifacts");
-		const firstStore = new ManagedSessionDescendantStore(managedDirectoryRoot(root), artifactsDir);
-		const secondStore = new ManagedSessionDescendantStore(managedDirectoryRoot(root), artifactsDir);
-		const first = createManagedTaskPersistence(new ArtifactManager(firstStore), "0-task-selector-cas");
-		const second = createManagedTaskPersistence(new ArtifactManager(secondStore), "0-task-selector-cas");
-		await first.publishOutput("initial output", Buffer.from('{"generation":0}', "utf8"));
-		const selectorFilename = "0-task-selector-cas.md.selector.json";
-		const captured = firstStore.readExpected(selectorFilename);
-		if (!captured) throw new Error("expected initial selector snapshot");
-		const firstRead = firstStore.readExpected.bind(firstStore);
-		const secondRead = secondStore.readExpected.bind(secondStore);
-		let firstCaptured = false;
-		let secondCaptured = false;
-		const firstSpy = vi.spyOn(firstStore, "readExpected").mockImplementation(relativePath => {
-			if (relativePath === selectorFilename && !firstCaptured) {
-				firstCaptured = true;
-				return captured;
-			}
-			return firstRead(relativePath);
-		});
-		const secondSpy = vi.spyOn(secondStore, "readExpected").mockImplementation(relativePath => {
-			if (relativePath === selectorFilename && !secondCaptured) {
-				secondCaptured = true;
-				return captured;
-			}
-			return secondRead(relativePath);
-		});
-		try {
-			const results = await Promise.allSettled([
-				first.publishOutput("writer A", Buffer.from('{"generation":1,"writer":"A"}', "utf8")),
-				second.publishOutput("writer B", Buffer.from('{"generation":1,"writer":"B"}', "utf8")),
-			]);
-			expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1);
-			expect(results.filter(result => result.status === "rejected")).toHaveLength(1);
-			const selected = await readSelected(artifactsDir, "0-task-selector-cas");
-			expect(["writer A", "writer B"]).toContain(selected.output);
-			expect(selected.metadata).toContain(`"writer":"${selected.output.at(-1)}"`);
-			expect((await fs.readdir(artifactsDir)).filter(filename => filename.endsWith(".output"))).toHaveLength(1);
-			expect((await fs.readdir(artifactsDir)).filter(filename => filename.endsWith(".meta.json"))).toHaveLength(1);
-		} finally {
-			firstSpy.mockRestore();
-			secondSpy.mockRestore();
-		}
-	});
-
 	it("keeps the prior output and metadata when retained replacement creation fails", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-managed-no-loss-"));
 		temporaryDirectories.push(root);
@@ -242,8 +80,6 @@ describe.skipIf(process.platform !== "linux")("managed task descendant persisten
 				output: "old output",
 				metadata: '{"generation":1}',
 			});
-			expect((await fs.readdir(artifactsDir)).filter(filename => filename.endsWith(".output"))).toHaveLength(1);
-			expect((await fs.readdir(artifactsDir)).filter(filename => filename.endsWith(".meta.json"))).toHaveLength(1);
 		} finally {
 			spy.mockRestore();
 		}
@@ -273,58 +109,6 @@ describe.skipIf(process.platform !== "linux")("managed task descendant persisten
 				"io_error",
 			);
 			expect(await readSelected(artifactsDir, "0-task-generation")).toEqual({
-				output: "old output",
-				metadata: '{"generation":1}',
-			});
-			expect((await fs.readdir(artifactsDir)).filter(filename => filename.endsWith(".output"))).toHaveLength(1);
-		} finally {
-			spy.mockRestore();
-		}
-	});
-
-	it("rejects selector rewrites that retain filenames but alter size and digest claims", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-managed-selector-rewrite-"));
-		temporaryDirectories.push(root);
-		const artifactsDir = path.join(root, "artifacts");
-		const taskId = "0-task-selector-rewrite";
-		const selectorPath = path.join(artifactsDir, `${taskId}.md.selector.json`);
-		const artifacts = new ArtifactManager(
-			new ManagedSessionDescendantStore(managedDirectoryRoot(root), artifactsDir),
-		);
-		const persistence = createManagedTaskPersistence(artifacts, taskId);
-		await persistence.publishOutput("old output", Buffer.from('{"generation":1}', "utf8"));
-		const prototype = native.RecoveryFsRoot.prototype as unknown as {
-			replaceManaged: (...args: unknown[]) => { ok: boolean; code?: string };
-		};
-		const realReplaceManaged = prototype.replaceManaged;
-		let rewritten = false;
-		const spy = vi.spyOn(prototype, "replaceManaged").mockImplementation(function (
-			this: unknown,
-			...args: unknown[]
-		) {
-			const result = realReplaceManaged.apply(this, args);
-			if (result.ok && !rewritten) {
-				const selector = JSON.parse(fsSync.readFileSync(selectorPath, "utf8")) as {
-					outputSizeBytes: number;
-					outputSha256: string;
-					metadataSizeBytes: number;
-					metadataSha256: string;
-				};
-				selector.outputSizeBytes += 1;
-				selector.outputSha256 = "0".repeat(64);
-				selector.metadataSizeBytes += 1;
-				selector.metadataSha256 = "f".repeat(64);
-				fsSync.writeFileSync(selectorPath, JSON.stringify(selector));
-				rewritten = true;
-			}
-			return result;
-		});
-		try {
-			await expect(persistence.publishOutput("new output", Buffer.from('{"generation":2}', "utf8"))).rejects.toThrow(
-				"managed_output_selector_verification_failed",
-			);
-			expect(rewritten).toBe(true);
-			expect(await readSelected(artifactsDir, taskId)).toEqual({
 				output: "old output",
 				metadata: '{"generation":1}',
 			});

@@ -14,7 +14,6 @@ import type {
 	ToolResultMessage,
 } from "@gajae-code/ai";
 import { sanitizeText } from "@gajae-code/utils";
-import { finalizeToolResultForDelivery } from "./tools/output-meta";
 import { resolveToCwd } from "./tools/path-utils";
 
 interface CursorExecBridgeOptions {
@@ -49,14 +48,6 @@ function buildToolErrorResult(message: string): AgentToolResult<unknown> {
 	};
 }
 
-async function buildFinalToolErrorResult(
-	options: CursorExecBridgeOptions,
-	toolName: string,
-	message: string,
-): Promise<AgentToolResult<unknown>> {
-	return finalizeToolResultForDelivery(buildToolErrorResult(message), toolName, options.getToolContext?.());
-}
-
 async function executeTool(
 	options: CursorExecBridgeOptions,
 	toolName: string,
@@ -65,12 +56,11 @@ async function executeTool(
 ): Promise<ToolResultMessage> {
 	const tool = options.tools.get(toolName);
 	if (!tool) {
-		const result = await buildFinalToolErrorResult(options, toolName, `Tool "${toolName}" not available`);
+		const result = buildToolErrorResult(`Tool "${toolName}" not available`);
 		return createToolResultMessage(toolCallId, toolName, result, true);
 	}
 
 	options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args });
-	const context = options.getToolContext?.();
 
 	let result: AgentToolResult<unknown>;
 	let isError = false;
@@ -92,10 +82,16 @@ async function executeTool(
 		: undefined;
 
 	try {
-		result = await tool.execute(toolCallId, args as Record<string, unknown>, undefined, onUpdate, context);
+		result = await tool.execute(
+			toolCallId,
+			args as Record<string, unknown>,
+			undefined,
+			onUpdate,
+			options.getToolContext?.(),
+		);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		result = await buildFinalToolErrorResult(options, toolName, message);
+		result = buildToolErrorResult(message);
 		isError = true;
 	}
 
@@ -137,7 +133,6 @@ async function executeDelete(options: CursorExecBridgeOptions, pathArg: string, 
 		result = buildToolErrorResult(message);
 		isError = true;
 	}
-	result = await finalizeToolResultForDelivery(result, toolName, options.getToolContext?.());
 
 	options.emitEvent?.({ type: "tool_execution_end", toolCallId, toolName, result, isError });
 	return createToolResultMessage(toolCallId, toolName, result, isError);
@@ -227,9 +222,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 				const globPath = `${args.path || "."}/${args.glob}`;
 				return executeTool(this.#optionsForCall(), "find", toolCallId, { paths: [globPath] });
 			}
-			const result = await buildFinalToolErrorResult(
-				this.#optionsForCall(),
-				"search",
+			const result = buildToolErrorResult(
 				"Cursor grep request rejected: pattern must not be empty. Provide a non-empty search pattern.",
 			);
 			return createToolResultMessage(toolCallId, "search", result, true);
@@ -279,7 +272,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		const toolName = "bash";
 		const tool = options.tools.get(toolName);
 		if (!tool) {
-			const result = await buildFinalToolErrorResult(options, toolName, `Tool "${toolName}" not available`);
+			const result = buildToolErrorResult(`Tool "${toolName}" not available`);
 			return createToolResultMessage(toolCallId, toolName, result, true);
 		}
 
@@ -338,7 +331,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			result = await tool.execute(toolCallId, toolArgs, undefined, onUpdate, options.getToolContext?.());
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			result = await buildFinalToolErrorResult(options, toolName, message);
+			result = buildToolErrorResult(message);
 			isError = true;
 		}
 
@@ -388,7 +381,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		if (!tool) {
 			const availableTools = Array.from(options.tools.keys()).filter(name => name.startsWith("mcp__"));
 			const message = formatMcpToolErrorMessage(toolName, availableTools);
-			const result = await buildFinalToolErrorResult(options, toolName, message);
+			const result = buildToolErrorResult(message);
 			return createToolResultMessage(toolCallId, toolName, result, true);
 		}
 

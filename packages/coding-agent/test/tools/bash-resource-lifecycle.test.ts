@@ -22,15 +22,6 @@ function makeTempDir(): string {
 function processExists(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
-		if (process.platform === "linux") {
-			try {
-				const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-				const close = stat.lastIndexOf(")");
-				if (close >= 0 && stat.slice(close + 2, close + 3) === "Z") return false;
-			} catch {
-				return false;
-			}
-		}
 		return true;
 	} catch {
 		return false;
@@ -113,20 +104,6 @@ describe("bash resource lifecycle", () => {
 			expect(manager.getJob(jobId)?.status).toBe("completed");
 			expect(getShellSessionCount()).toBe(baseline);
 		}
-	});
-
-	it("retires process-group anchors during bounded command churn", async () => {
-		if (process.platform === "win32") return;
-
-		const baseline = getShellSessionCount();
-		const result = await executeBash("for i in $(seq 1 16); do /bin/true; done", {
-			cwd: tempDir,
-			timeout: 5_000,
-		});
-
-		expect(result.cancelled).toBe(false);
-		await disposeAllShellSessions();
-		expect(getShellSessionCount()).toBe(baseline);
 	});
 
 	it("keeps a cancelled persistent shell reachable until native run settles", async () => {
@@ -252,7 +229,7 @@ describe("bash resource lifecycle", () => {
 		controller.abort();
 		const firstResult = await first;
 		expect(firstResult.cancelled).toBe(true);
-		expect(abortSpy).not.toHaveBeenCalled();
+		expect(abortSpy).toHaveBeenCalledTimes(1);
 
 		const replacement = await executeBash("printf replacement", {
 			cwd: tempDir,

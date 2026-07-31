@@ -43,6 +43,7 @@ export interface TaskResultReceipt {
 	retryFailure?: { attempt: number; errorSummary: string };
 	setupFailure?: { summary: string };
 	errorSummary?: string;
+	duplicateDisposition?: SingleResult["duplicateDisposition"];
 	abortSummary?: string;
 	preview: string;
 	previewTruncated: boolean;
@@ -67,9 +68,6 @@ export interface TaskResultReceipt {
 	forkContextAdvisory?: SingleResult["forkContextAdvisory"];
 	/** Resolved repository identity for this delegated lane (#2901). */
 	repositoryBinding?: SingleResult["repositoryBinding"];
-	/** Runtime-derived review source disposition and rerun guidance (#3469). */
-	reviewSource?: SingleResult["reviewSource"];
-
 	roi?: TaskRoi;
 }
 
@@ -296,6 +294,7 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		retryFailure: raw.retryFailure
 			? { attempt: raw.retryFailure.attempt, errorSummary: "Retry failure recorded." }
 			: undefined,
+		duplicateDisposition: raw.duplicateDisposition,
 		errorSummary:
 			raw.setupFailure?.summary ??
 			(raw.error
@@ -314,7 +313,6 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		forkContext: raw.forkContext,
 		forkContextAdvisory: raw.forkContextAdvisory,
 		repositoryBinding: raw.repositoryBinding,
-		reviewSource: raw.reviewSource,
 		roi: buildTaskRoi(raw),
 	};
 }

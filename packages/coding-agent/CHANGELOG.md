@@ -10,6 +10,7 @@
 ### Fixed
 
 - Settings now requests a repaint after asynchronous GJC bundle and plugin views rebuild, so loaded content and mutation results appear without an extra keypress (#3643).
+- `todo_write` now rejects unsupported operation keys and treats a bare `done` or `drop` as an error instead of completing or abandoning every task (#3640).
 - Deferred `agent_end` publication again settles public session readiness before slow extension handlers finish, while retaining exact cancellation leases through queued extension delivery and draining that delivery before session shutdown.
 - Ultragoal validation-batch hydration now fails closed unless deferred and final-close evidence exactly matches a complete authoritative cumulative Git/CI inventory and durable batch tuple. Explicit malformed, partial, unknown, reordered, or stale receipt data is rejected; Git path capture is byte-safe, NUL-delimited, and includes untracked files; incomplete capture conservatively requires computer-control QA; shared settings and tool registries cannot use partial diffs to bypass that suite; validate/checkpoint replacement hydration is identical; and current/replacement receipts are byte-bound to ledger payloads (#3541).
 - Fixture quality gates that complete intermediate Ultragoal stories now write file-backed adversarial artifact proof; skill-state hooks and computer red-team fixtures match the unconditional adversarial path check so #3543 CI stays fail-closed without weakening hydration exactness (#3543).
@@ -68,7 +69,6 @@
 - The interactive `Working…` indicator now remains visible and explicitly labels owner-scoped detached background work across foreground completion, provider errors, pending-submission aborts, and job completion, without resurrecting after TUI disposal (#3479).
 - Activity-indicator suspension now detaches and restores the exact owned loader instead of stopping foreign transition UI; optimistic pre-init prompts still show and clear their spinner, context clear retains its eager teardown contract, and resume cancellation preserves transient state until session mutation actually begins.
 - Activity-indicator stop and suspension helpers now fail safely for lightweight controller contexts with absent or partial status rails, while full interactive contexts retain exact loader detach/restore ownership.
-- Bash now uses bounded core-to-native and N-API callback backpressure plus a 64 KiB terminal tail after the core 8 MiB stream budget, emits at most one typed aggregate loss marker, carries source-loss evidence through merged and raw stream cancellation/error paths, bounds ACP terminal lifecycle/output RPC settlement, cleans settled native sessions, labels every combined omission honestly through inline backstops and failure paths, omits false source ranges, and rejects malformed artifact IDs/counts.
 
 ## [0.12.1] - 2026-07-29
 

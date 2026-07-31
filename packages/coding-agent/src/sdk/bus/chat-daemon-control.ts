@@ -40,13 +40,11 @@ export type ChatDaemonAction = "stop" | "reload";
  * daemon transports. Generation 16 applies Telegram sound-policy configuration
  * through shared notification parsing. Generation 17 bound managed-session
  * replacement to exact native filesystem authority; generation 18 retired that
- * binding, generation 19 bound exact cleanup to parent/link-count authority,
- * generation 20 refreshed retained cleanup semantics, and generation 21 hardens
- * exact Bash process-tree ownership shared by chat daemon cleanup.
+ * binding, and generation 19 binds exact cleanup to parent/link-count authority.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 21,
-	slack: 21,
+	discord: 20,
+	slack: 20,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

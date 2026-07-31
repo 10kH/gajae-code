@@ -37,7 +37,7 @@ import { assertSafePathComponent } from "../gjc-runtime/session-layout";
 import { writeTextAtomic } from "../gjc-runtime/state-writer";
 import type { ManagedLegacyLocalMigrationSource } from "../internal-urls/local-protocol";
 import * as git from "../utils/git";
-import { ArtifactManager, type ArtifactSaveReceipt } from "./artifacts";
+import { ArtifactManager } from "./artifacts";
 import {
 	type BlobPutResult,
 	BlobStore,
@@ -1133,7 +1133,7 @@ export function createReadonlySessionManager(manager: SessionManager): ReadonlyS
 
 /** Internal artifact-writing capability. Read-only facades expose it only through a private weak-map lookup. */
 export type SessionArtifactCapability = Readonly<
-	Pick<SessionManager, "allocateArtifactPath" | "saveArtifact" | "getArtifactPath" | "putBlob">
+	Pick<SessionManager, "allocateArtifactPath" | "saveArtifact" | "putBlob">
 >;
 
 const sessionArtifactCapabilities = new WeakMap<SessionManager, SessionArtifactCapability>();
@@ -1150,7 +1150,6 @@ export function sessionArtifactCapability(value: unknown): SessionArtifactCapabi
 			capability = Object.freeze({
 				allocateArtifactPath: value.allocateArtifactPath.bind(value),
 				saveArtifact: value.saveArtifact.bind(value),
-				getArtifactPath: value.getArtifactPath.bind(value),
 				putBlob: value.putBlob.bind(value),
 			});
 			sessionArtifactCapabilities.set(value, capability);
@@ -4772,6 +4771,10 @@ export class SessionManager {
 	// Subagents adopt the parent's manager so artifact IDs are unique across the
 	// whole agent tree and all files land in the parent's artifacts dir.
 	#adoptedArtifactManager: ArtifactManager | null = null;
+	// In-memory artifact fallback for non-persistent sessions (persist=false).
+	// Keyed by sequential numeric ID string; mirrors the file-based ArtifactManager ID scheme.
+	#inMemoryArtifacts: Map<string, string> | null = null;
+	#inMemoryArtifactCounter = 0;
 	readonly #blobStore: BlobStore;
 	#residentTextBlobStore: BlobStore = new MemoryBlobStore();
 	#residentImageBlobStore: BlobStore;
@@ -5365,6 +5368,8 @@ export class SessionManager {
 		this.#flushed = false;
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#ensuredOnDisk = false;
+		this.#inMemoryArtifacts = null;
+		this.#inMemoryArtifactCounter = 0;
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 		this.#adoptedArtifactManager = null;
@@ -5583,6 +5588,8 @@ export class SessionManager {
 				flushed: this.#flushed,
 				needsFullRewriteOnNextPersist: this.#needsFullRewriteOnNextPersist,
 				ensuredOnDisk: this.#ensuredOnDisk,
+				inMemoryArtifacts: this.#inMemoryArtifacts,
+				inMemoryArtifactCounter: this.#inMemoryArtifactCounter,
 				artifactManager: this.#artifactManager,
 				artifactManagerSessionFile: this.#artifactManagerSessionFile,
 				adoptedArtifactManager: this.#adoptedArtifactManager,
@@ -5605,6 +5612,8 @@ export class SessionManager {
 				this.#flushed = previous.flushed;
 				this.#needsFullRewriteOnNextPersist = previous.needsFullRewriteOnNextPersist;
 				this.#ensuredOnDisk = previous.ensuredOnDisk;
+				this.#inMemoryArtifacts = previous.inMemoryArtifacts;
+				this.#inMemoryArtifactCounter = previous.inMemoryArtifactCounter;
 				this.#artifactManager = previous.artifactManager;
 				this.#artifactManagerSessionFile = previous.artifactManagerSessionFile;
 				this.#adoptedArtifactManager = previous.adoptedArtifactManager;
@@ -6050,6 +6059,8 @@ export class SessionManager {
 		this.#flushed = stage.flushed;
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#ensuredOnDisk = stage.flushed;
+		this.#inMemoryArtifacts = null;
+		this.#inMemoryArtifactCounter = 0;
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 		this.#adoptedArtifactManager = null;
@@ -7979,19 +7990,17 @@ export class SessionManager {
 	}
 
 	/**
-	 * Save artifact content under the current persisted session and return its artifact ID.
-	 * In-memory sessions cannot produce protocol-resolvable artifact references.
+	 * Save artifact content under the current session and return artifact ID.
+	 * Returns an artifact ID for all sessions (file-backed for persistent, in-memory fallback otherwise).
 	 */
 	async saveArtifact(content: string, toolType: string): Promise<string | undefined> {
 		const manager = this.#getOrCreateArtifactManager();
 		if (manager) return manager.save(content, toolType);
-		return undefined;
-	}
-
-	async saveArtifactReceipt(content: string, toolType: string): Promise<ArtifactSaveReceipt | undefined> {
-		const manager = this.#getOrCreateArtifactManager();
-		if (!manager) return undefined;
-		return manager.saveWithReceipt(content, toolType);
+		// Non-persistent session: store in memory so spill truncation can proceed.
+		if (!this.#inMemoryArtifacts) this.#inMemoryArtifacts = new Map();
+		const id = String(this.#inMemoryArtifactCounter++);
+		this.#inMemoryArtifacts.set(id, content);
+		return id;
 	}
 
 	/**

@@ -306,7 +306,6 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 				"record-critic-verdict",
 				"record-critic-gate-override",
 				"quality-gate",
-				"review-source",
 			]),
 			...plannedVerbs(PLANNED_ADMIN_VERBS),
 		],
@@ -363,16 +362,6 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{ name: "classification-event-id", type: "string", appliesToVerbs: ["record-critic-verdict"] },
 			{ name: "quality-gate-json", type: "string", appliesToVerbs: ["checkpoint", "quality-gate"] },
 			{ name: "goal-id", type: "string", appliesToVerbs: ["quality-gate"] },
-			{ name: "cohort-id", type: "string", appliesToVerbs: ["review-source"] },
-			{ name: "task-id", type: "string", appliesToVerbs: ["review-source"] },
-			{
-				name: "lane",
-				type: "enum",
-				enumValues: ["cleaner", "architect", "qa", "critic"],
-				appliesToVerbs: ["review-source"],
-			},
-			{ name: "rerun-command", type: "string", appliesToVerbs: ["review-source"] },
-
 			{ name: "goal-id", type: "string", appliesToVerbs: ["steer"] },
 			{ name: "goal-id", type: "string", appliesToVerbs: ["classify-blocker"] },
 			{
@@ -424,7 +413,6 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 					"classify-blocker",
 					"record-critic-verdict",
 					"record-critic-gate-override",
-					"review-source",
 				],
 			},
 			{ name: "directive-json", type: "string", appliesToVerbs: ["steer"], planned: true },

@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- Glob scans now reject already-aborted and zero-result cancellations instead of returning a misleading successful empty result.
 - Retryable responses discarded before another fetch attempt now begin body cancellation without blocking retry progress on transport cleanup, releasing buffered response data without consuming responses returned to callers.
 
 ## [0.12.5] - 2026-07-30

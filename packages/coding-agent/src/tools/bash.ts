@@ -18,12 +18,7 @@ import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { highlightCode, type Theme } from "../modes/theme/theme";
 import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
 import type { ArtifactManager } from "../session/artifacts";
-import type {
-	ClientBridge,
-	ClientBridgeTerminalExitStatus,
-	ClientBridgeTerminalHandle,
-	ClientBridgeTerminalOutput,
-} from "../session/client-bridge";
+import type { ClientBridgeTerminalExitStatus, ClientBridgeTerminalOutput } from "../session/client-bridge";
 import {
 	DEFAULT_ARTIFACT_MAX_BYTES,
 	OutputSink,
@@ -48,10 +43,8 @@ import { canUseInteractiveBashPty } from "./bash-pty-selection";
 import { expandInternalUrls, type InternalUrlExpansionOptions } from "./bash-skill-urls";
 import { checkComposerBashPolicy } from "./composer-bash-policy";
 import {
-	formatArtifactEvidenceNotice,
 	formatArtifactReference,
 	formatStyledTruncationWarning,
-	isValidArtifactId,
 	type OutputMeta,
 	resolveBashOutputSinkHeadBytes,
 	resolveBashOutputSinkTailBytes,
@@ -69,81 +62,6 @@ const BASH_ERROR_MAX_BYTES = 4096;
 const ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES = 256;
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS = 60_000;
-
-function maxBashErrorBytes(session: ToolSession): number {
-	const configuredKiB = session.settings.get("tools.maxInlineResultBytes");
-	if (configuredKiB <= 0) return BASH_ERROR_MAX_BYTES;
-	return Math.min(BASH_ERROR_MAX_BYTES, Math.max(1024, Math.floor(configuredKiB * 1024)));
-}
-const CLIENT_TERMINAL_RPC_WAIT_MS = 500;
-const BASH_PENDING_OPERATION_LIMIT = 64;
-const pendingBashOperations = new Set<Promise<unknown>>();
-interface BashCleanupOwner {
-	pending: Set<Promise<unknown>>;
-	reservations: number;
-}
-const pendingBashCleanupOwners = new WeakMap<object, BashCleanupOwner>();
-
-function getBashCleanupOwner(owner: object): BashCleanupOwner {
-	let state = pendingBashCleanupOwners.get(owner);
-	if (!state) {
-		state = { pending: new Set(), reservations: 0 };
-		pendingBashCleanupOwners.set(owner, state);
-	}
-	return state;
-}
-
-function reserveBashCleanup(owner: object): boolean {
-	const state = getBashCleanupOwner(owner);
-	if (state.pending.size + state.reservations >= BASH_PENDING_OPERATION_LIMIT) return false;
-	state.reservations++;
-	return true;
-}
-
-function consumeBashCleanupReservation(owner: object): void {
-	const state = getBashCleanupOwner(owner);
-	state.reservations = Math.max(0, state.reservations - 1);
-}
-interface BashReleaseOwner {
-	pending: Set<Promise<unknown>>;
-	reservations: number;
-}
-const pendingBashReleaseOwners = new WeakMap<object, BashReleaseOwner>();
-
-function getBashReleaseOwner(owner: object): BashReleaseOwner {
-	let state = pendingBashReleaseOwners.get(owner);
-	if (!state) {
-		state = { pending: new Set(), reservations: 0 };
-		pendingBashReleaseOwners.set(owner, state);
-	}
-	return state;
-}
-
-function reserveBashRelease(owner: object): boolean {
-	const state = getBashReleaseOwner(owner);
-	if (state.pending.size + state.reservations >= BASH_PENDING_OPERATION_LIMIT) return false;
-	state.reservations++;
-	return true;
-}
-
-function consumeBashReleaseReservation(owner: object): void {
-	const state = getBashReleaseOwner(owner);
-	state.reservations = Math.max(0, state.reservations - 1);
-}
-
-function trackPendingOperation<T>(pending: Set<Promise<unknown>>, limit: number, promise: Promise<T>): boolean {
-	if (pending.size >= limit) return false;
-	pending.add(promise);
-	void promise.then(
-		() => pending.delete(promise),
-		() => pending.delete(promise),
-	);
-	return true;
-}
-
-function hasBoundedOperationCapacity(): boolean {
-	return pendingBashOperations.size < BASH_PENDING_OPERATION_LIMIT;
-}
 const READ_ONLY_BASH_ENV: Record<string, string> = {
 	GREP_OPTIONS: "",
 	GREP_COLOR: "",
@@ -159,118 +77,10 @@ function boundArtifactSaveDiagnostic(error: unknown): string {
 	return truncateHeadBytes(normalized, ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES).text;
 }
 
-type BoundedOperationOutcome<T> =
-	| { status: "ok"; value: T }
-	| { status: "failed"; diagnostic: string }
-	| { status: "timeout"; diagnostic: string };
-
-async function awaitBoundedOperationIn<T>(
-	pending: Set<Promise<unknown>>,
-	operation: () => Promise<T>,
-	limitDiagnostic: string,
-	reserved = false,
-): Promise<BoundedOperationOutcome<T>> {
-	const operationLimit = reserved ? BASH_PENDING_OPERATION_LIMIT + 1 : BASH_PENDING_OPERATION_LIMIT;
-	if (pending.size >= operationLimit) {
-		return { status: "failed", diagnostic: limitDiagnostic };
-	}
-	const promise = Promise.resolve().then(operation);
-	if (!trackPendingOperation(pending, operationLimit, promise)) {
-		return { status: "failed", diagnostic: limitDiagnostic };
-	}
-	return Promise.race([
-		promise.then(
-			value => ({ status: "ok", value }) satisfies BoundedOperationOutcome<T>,
-			error =>
-				({ status: "failed", diagnostic: boundArtifactSaveDiagnostic(error) }) satisfies BoundedOperationOutcome<T>,
-		),
-		Bun.sleep(CLIENT_TERMINAL_RPC_WAIT_MS).then(
-			() => ({ status: "timeout", diagnostic: `did not settle within ${CLIENT_TERMINAL_RPC_WAIT_MS}ms` }) as const,
-		),
-	]);
-}
-
-function awaitBoundedOperation<T>(operation: () => Promise<T>): Promise<BoundedOperationOutcome<T>> {
-	return awaitBoundedOperationIn(pendingBashOperations, operation, "pending operation limit reached");
-}
-
-function awaitBoundedCleanup<T>(
-	owner: object,
-	operation: () => Promise<T>,
-	reserved = false,
-): Promise<BoundedOperationOutcome<T>> {
-	return awaitBoundedOperationIn(
-		getBashCleanupOwner(owner).pending,
-		operation,
-		"pending cleanup limit reached",
-		reserved,
-	);
-}
-
-function awaitBoundedRelease<T>(owner: object, operation: () => Promise<T>): Promise<BoundedOperationOutcome<T>> {
-	return awaitBoundedOperationIn(getBashReleaseOwner(owner).pending, operation, "pending release limit reached");
-}
-
-async function quarantineClientTerminalLease(
-	bridge: ClientBridge,
-	handle: ClientBridgeTerminalHandle,
-	reason: string,
-): Promise<BoundedOperationOutcome<void>> {
-	if (!bridge.quarantineProviderLease) {
-		return { status: "failed", diagnostic: "terminal provider lease quarantine is unavailable" };
-	}
-	return awaitBoundedCleanup(bridge, () =>
-		bridge.quarantineProviderLease!(handle.providerLeaseIdentity ?? handle.providerLeaseId, reason),
-	);
-}
-const quarantinedClientTerminalProviders = new WeakMap<ClientBridge, Set<string>>();
-
-function clientTerminalProviderKey(handle: ClientBridgeTerminalHandle): string {
-	const identity = handle.providerLeaseIdentity;
-	return identity
-		? `${identity.leaseId}\0${identity.connectionId}\0${identity.connectionGeneration}\0${identity.fence}`
-		: handle.providerLeaseId;
-}
-
-function markClientTerminalProviderQuarantined(bridge: ClientBridge, handle: ClientBridgeTerminalHandle): void {
-	let quarantined = quarantinedClientTerminalProviders.get(bridge);
-	if (!quarantined) {
-		quarantined = new Set();
-		quarantinedClientTerminalProviders.set(bridge, quarantined);
-	}
-	quarantined.add(clientTerminalProviderKey(handle));
-}
-
-function hasQuarantinedClientTerminalProvider(bridge: ClientBridge): boolean {
-	return (quarantinedClientTerminalProviders.get(bridge)?.size ?? 0) > 0;
-}
-function clearClientTerminalProviderQuarantine(bridge: ClientBridge, handle: ClientBridgeTerminalHandle): void {
-	const quarantined = quarantinedClientTerminalProviders.get(bridge);
-	if (!quarantined) return;
-	quarantined.delete(clientTerminalProviderKey(handle));
-	if (quarantined.size === 0) quarantinedClientTerminalProviders.delete(bridge);
-}
-
-async function recoverClientTerminalOutput(
-	handle: ClientBridgeTerminalHandle,
-	phase: string,
-	readCurrentOutput: () => Promise<BoundedOperationOutcome<ClientBridgeTerminalOutput>> = () =>
-		awaitBoundedOperation(() => handle.currentOutput()),
-): Promise<{ current: ClientBridgeTerminalOutput; diagnostic?: string }> {
-	const outcome = await readCurrentOutput();
-	if (outcome.status === "ok") return { current: outcome.value };
-	logger.warn("ACP terminal output recovery failed", {
-		terminalId: handle.terminalId,
-		phase,
-		diagnostic: outcome.diagnostic,
-	});
-	return { current: { output: "", truncated: true }, diagnostic: outcome.diagnostic };
-}
-
-function summarizeOriginalArtifactSave(artifactId: string, originalText: string): BashOriginalArtifactSaveResult {
-	if (!isValidArtifactId(artifactId)) {
-		return { status: "failed", diagnostic: "storage returned an invalid artifact id" };
-	}
+function summarizeOriginalArtifactSave(
+	artifactId: string,
+	originalText: string,
+): Extract<BashOriginalArtifactSaveResult, { status: "saved" }> {
 	const originalBytes = Buffer.byteLength(originalText, "utf-8");
 	if (originalBytes <= DEFAULT_ARTIFACT_MAX_BYTES) {
 		return { status: "saved", artifactId, complete: true };
@@ -282,26 +92,6 @@ function summarizeOriginalArtifactSave(artifactId: string, originalText: string)
 		complete: false,
 		omittedBytes: originalBytes - retainedBytes,
 	};
-}
-
-async function allocateBashOutputArtifact(
-	session: ToolSession,
-	toolType: "bash" | "bash-original",
-): Promise<{ id?: string; path?: string }> {
-	const allocateOutputArtifact = session.allocateOutputArtifact;
-	if (!allocateOutputArtifact) return {};
-	const outcome = await awaitBoundedOperation(() => allocateOutputArtifact(toolType));
-	if (outcome.status !== "ok") {
-		logger.warn("Bash artifact allocation failed", { toolType, error: outcome.diagnostic });
-		return {};
-	}
-	const allocation = outcome.value;
-	if (!allocation) return {};
-	if (!isValidArtifactId(allocation.id)) {
-		logger.warn("Bash artifact allocation returned an invalid id", { toolType });
-		return {};
-	}
-	return allocation;
 }
 
 function artifactSaveResultNotice(
@@ -320,51 +110,36 @@ function artifactTruncatedBytesForResult(result: BashResult | BashInteractiveRes
 	return typeof bytes === "number" && bytes > 0 ? bytes : undefined;
 }
 
-function sourceTruncatedBytesForResult(result: BashResult | BashInteractiveResult): number | undefined {
-	const bytes = (result as OutputSummary).sourceTruncatedBytes;
-	return typeof bytes === "number" && bytes > 0 ? bytes : undefined;
-}
-
-function sourceCaptureIncompleteForResult(result: BashResult | BashInteractiveResult): boolean {
-	return (result as OutputSummary).sourceCaptureIncomplete === true;
-}
-
 function artifactReferenceForResult(result: BashResult | BashInteractiveResult): string | undefined {
 	return result.artifactId
-		? formatArtifactReference(
-				result.artifactId,
-				artifactTruncatedBytesForResult(result),
-				sourceTruncatedBytesForResult(result),
-				sourceCaptureIncompleteForResult(result),
-			)
+		? formatArtifactReference(result.artifactId, artifactTruncatedBytesForResult(result))
 		: undefined;
+}
+
+function rawArtifactReferenceForSavedResult(
+	result: Extract<BashOriginalArtifactSaveResult, { status: "saved" }>,
+): string {
+	return result.complete
+		? `artifact://${result.artifactId}`
+		: formatArtifactReference(result.artifactId, result.omittedBytes);
 }
 
 function appendRawArtifactFooter(
 	summary: OutputSummary,
 	result: Extract<BashOriginalArtifactSaveResult, { status: "saved" }>,
 ): void {
-	summary.artifactFailureDiagnostic = "artifact save could not be proven at the current delivery boundary";
 	summary.artifactId = result.artifactId;
-	summary.artifactVerified = false;
 	if (!result.complete) summary.artifactTruncatedBytes = result.omittedBytes;
+	const separator = summary.output.endsWith("\n") ? "" : "\n";
+	summary.output = `${summary.output}${separator}[raw output: ${rawArtifactReferenceForSavedResult(result)}]`;
 }
 
 function artifactReferenceIsReachable(text: string, result: BashResult | BashInteractiveResult): boolean {
 	if (!result.artifactId || !text.includes(`artifact://${result.artifactId}`)) return false;
 	const artifactTruncatedBytes = artifactTruncatedBytesForResult(result);
-	const sourceTruncatedBytes = sourceTruncatedBytesForResult(result);
-	const sourceCaptureIncomplete = sourceCaptureIncompleteForResult(result);
 	return (
-		(artifactTruncatedBytes === undefined && sourceTruncatedBytes === undefined && !sourceCaptureIncomplete) ||
-		text.includes(
-			formatArtifactReference(
-				result.artifactId,
-				artifactTruncatedBytes,
-				sourceTruncatedBytes,
-				sourceCaptureIncomplete,
-			),
-		)
+		artifactTruncatedBytes === undefined ||
+		text.includes(formatArtifactReference(result.artifactId, artifactTruncatedBytes))
 	);
 }
 
@@ -384,20 +159,11 @@ function artifactWriterFailureNotice(result: BashResult | BashInteractiveResult)
 }
 
 function completeOutputArtifactAvailable(
-	result: Pick<
-		OutputSummary,
-		| "artifactId"
-		| "artifactTruncatedBytes"
-		| "sourceTruncatedBytes"
-		| "sourceCaptureIncomplete"
-		| "artifactFailureDiagnostic"
-	>,
+	result: Pick<OutputSummary, "artifactId" | "artifactTruncatedBytes" | "artifactFailureDiagnostic">,
 ): boolean {
 	return (
 		result.artifactId !== undefined &&
 		(typeof result.artifactTruncatedBytes !== "number" || result.artifactTruncatedBytes <= 0) &&
-		(typeof result.sourceTruncatedBytes !== "number" || result.sourceTruncatedBytes <= 0) &&
-		!result.sourceCaptureIncomplete &&
 		(typeof result.artifactFailureDiagnostic !== "string" || result.artifactFailureDiagnostic.length === 0)
 	);
 }
@@ -430,57 +196,29 @@ function formatBashFailureMessage(
 	result: BashResult | BashInteractiveResult,
 	text: string,
 	explicitCause?: string,
-	maxBytes = BASH_ERROR_MAX_BYTES,
 ): string {
 	const statusCause = failureStatusCause(result, text, explicitCause);
 	const bodyText = removeTrailingFailureCause(text, statusCause);
-	const bodyStatusEvidence = Array.from(
-		bodyText.matchAll(/Command (?:timed out(?: after \d+ seconds?)?|cancelled|aborted)/gu),
-	)
-		.map(match => match[0])
-		.findLast(candidate => candidate !== statusCause);
 	const suffixParts: string[] = [];
-	const artifactEvidence = formatArtifactEvidenceNotice({ ...result, artifactFailureDiagnostic: undefined });
-	if (artifactEvidence) suffixParts.push(artifactEvidence);
+	const reference = artifactReferenceForResult(result);
+	if (reference) suffixParts.push(reference);
 	const writerNotice = artifactWriterFailureNotice(result);
 	if (writerNotice) suffixParts.push(writerNotice);
-	if (bodyStatusEvidence) suffixParts.push(bodyStatusEvidence);
 	if (statusCause) suffixParts.push(statusCause);
 	const suffix = suffixParts.join("\n\n");
 	const separator = bodyText.length > 0 && suffix.length > 0 ? "\n\n" : "";
 	const bodyBudget = Math.max(
 		0,
-		maxBytes - Buffer.byteLength(suffix, "utf-8") - Buffer.byteLength(separator, "utf-8"),
+		BASH_ERROR_MAX_BYTES - Buffer.byteLength(suffix, "utf-8") - Buffer.byteLength(separator, "utf-8"),
 	);
 	const body = truncateTailBytes(bodyText, bodyBudget).text;
 	return `${body}${body.length > 0 ? separator : ""}${suffix}`;
-}
-
-function normalizeClientTerminalOutput(current: ClientBridgeTerminalOutput): {
-	current: ClientBridgeTerminalOutput;
-	malformed: boolean;
-} {
-	const runtimeCurrent = current as unknown;
-	const outputRecord =
-		typeof runtimeCurrent === "object" && runtimeCurrent !== null
-			? (runtimeCurrent as Record<string, unknown>)
-			: undefined;
-	const outputValid = typeof outputRecord?.output === "string";
-	const truncatedValid = typeof outputRecord?.truncated === "boolean";
-	return {
-		current: {
-			output: outputValid ? (outputRecord.output as string) : "",
-			truncated: truncatedValid ? (outputRecord.truncated as boolean) : true,
-		},
-		malformed: !outputValid || !truncatedValid,
-	};
 }
 
 async function boundClientTerminalOutput(
 	output: string,
 	alreadyTruncated: boolean,
 	settings: ToolSession["settings"],
-	sourceMalformed = false,
 ): Promise<{ summary: OutputSummary; locallyTruncated: boolean }> {
 	const tailBytes = resolveBashOutputSinkTailBytes(settings);
 	const headBytes = resolveBashOutputSinkHeadBytes(settings);
@@ -490,8 +228,7 @@ async function boundClientTerminalOutput(
 	return {
 		summary: {
 			...bounded,
-			truncated: alreadyTruncated || sourceMalformed || bounded.truncated,
-			...(alreadyTruncated || sourceMalformed ? { sourceCaptureIncomplete: true } : {}),
+			truncated: alreadyTruncated || bounded.truncated,
 		},
 		locallyTruncated: bounded.truncated,
 	};
@@ -508,52 +245,27 @@ interface PreparedClientTerminalOutput {
 async function prepareClientTerminalOutput(
 	session: ToolSession,
 	current: ClientBridgeTerminalOutput,
-	forceSourceIncomplete = false,
 ): Promise<PreparedClientTerminalOutput> {
-	const normalized = normalizeClientTerminalOutput(current);
-	const normalizedCurrent = normalized.current;
-	const sourceMalformed = normalized.malformed;
 	const { summary, locallyTruncated } = await boundClientTerminalOutput(
-		normalizedCurrent.output,
-		normalizedCurrent.truncated,
+		current.output,
+		current.truncated,
 		session.settings,
-		sourceMalformed,
 	);
-	if (forceSourceIncomplete) {
-		summary.truncated = true;
-		summary.sourceCaptureIncomplete = true;
-	}
 	let artifactSaveResult: BashOriginalArtifactSaveResult | undefined;
-	if (locallyTruncated && !normalizedCurrent.truncated && !sourceMalformed) {
-		artifactSaveResult = await saveBashOriginalArtifact(session, normalizedCurrent.output);
+	if (locallyTruncated && !current.truncated) {
+		artifactSaveResult = await saveBashOriginalArtifact(session, current.output);
 		if (artifactSaveResult.status === "saved") appendRawArtifactFooter(summary, artifactSaveResult);
 	}
 	const artifactSaveNotice = artifactSaveResult
 		? artifactSaveResultNotice(artifactSaveResult, completeOutputArtifactAvailable(summary))
 		: undefined;
-	return { current: normalizedCurrent, summary, locallyTruncated, artifactSaveResult, artifactSaveNotice };
-}
-
-function markClientTerminalSourceIncomplete(prepared: PreparedClientTerminalOutput): void {
-	prepared.summary.truncated = true;
-	prepared.summary.sourceCaptureIncomplete = true;
-	if (!prepared.summary.artifactId) return;
-	const fullFooter = `[raw output: artifact://${prepared.summary.artifactId}]`;
-	if (!prepared.summary.output.endsWith(fullFooter)) return;
-	const retainedReference = formatArtifactReference(
-		prepared.summary.artifactId,
-		prepared.summary.artifactTruncatedBytes,
-		prepared.summary.sourceTruncatedBytes,
-		true,
-	);
-	prepared.summary.output = `${prepared.summary.output.slice(0, -fullFooter.length)}${retainedReference}`;
+	return { current, summary, locallyTruncated, artifactSaveResult, artifactSaveNotice };
 }
 
 function formatClientTerminalAbortFailure(
 	prepared: PreparedClientTerminalOutput,
 	readDiagnostic?: string,
 	pendingNotices: readonly string[] = [],
-	maxBytes = BASH_ERROR_MAX_BYTES,
 ): string {
 	const notices = [
 		...pendingNotices,
@@ -568,27 +280,7 @@ function formatClientTerminalAbortFailure(
 		exitCode: undefined,
 		cancelled: true,
 	};
-	return formatBashFailureMessage(result, outputText, "Command aborted", maxBytes);
-}
-
-function formatClientTerminalOwnershipFailure(
-	prepared: PreparedClientTerminalOutput,
-	diagnostic: string,
-	maxBytes = BASH_ERROR_MAX_BYTES,
-): string {
-	markClientTerminalSourceIncomplete(prepared);
-	const notices = [
-		...(prepared.current.truncated || prepared.locallyTruncated ? ["(output truncated)"] : []),
-		...(prepared.artifactSaveNotice ? [prepared.artifactSaveNotice] : []),
-		`Terminal release failed: ${diagnostic}`,
-	];
-	const outputText = [prepared.summary.output || "(no output)", ...notices].filter(Boolean).join("\n");
-	const result: BashResult = {
-		...prepared.summary,
-		exitCode: undefined,
-		cancelled: false,
-	};
-	return formatBashFailureMessage(result, outputText, "Terminal release ownership incomplete", maxBytes);
+	return formatBashFailureMessage(result, outputText, "Command aborted");
 }
 
 function appendArtifactDetails(text: string, result: BashResult | BashInteractiveResult): string {
@@ -611,41 +303,41 @@ async function saveBashOriginalArtifact(
 		return { status: "failed", diagnostic: boundArtifactSaveDiagnostic(error) };
 	}
 	if (manager) {
-		const outcome = await awaitBoundedOperation(() => manager.save(originalText, "bash-original"));
-		if (outcome.status !== "ok") return { status: "failed", diagnostic: outcome.diagnostic };
-		return outcome.value
-			? summarizeOriginalArtifactSave(outcome.value, originalText)
-			: { status: "failed", diagnostic: "storage returned no artifact id" };
+		try {
+			const artifactId = await manager.save(originalText, "bash-original");
+			return artifactId
+				? summarizeOriginalArtifactSave(artifactId, originalText)
+				: { status: "failed", diagnostic: "storage returned no artifact id" };
+		} catch (error) {
+			return { status: "failed", diagnostic: boundArtifactSaveDiagnostic(error) };
+		}
 	}
 
 	if (!session.allocateOutputArtifact) return { status: "unavailable" };
-	const allocateOutputArtifact = session.allocateOutputArtifact;
-	const allocation = await awaitBoundedOperation(() => allocateOutputArtifact("bash-original"));
-	if (allocation.status !== "ok") return { status: "failed", diagnostic: allocation.diagnostic };
-	const alloc = allocation.value;
-	if (!alloc?.path || !alloc.id) return { status: "unavailable" };
-	if (!isValidArtifactId(alloc.id)) {
-		return { status: "failed", diagnostic: "storage returned an invalid artifact id" };
+	let alloc: { id?: string; path?: string } | undefined;
+	try {
+		alloc = await session.allocateOutputArtifact("bash-original");
+	} catch (error) {
+		return { status: "failed", diagnostic: boundArtifactSaveDiagnostic(error) };
 	}
-	const artifactPath = alloc.path;
-	const saveResult = summarizeOriginalArtifactSave(alloc.id, originalText);
-	if (saveResult.status !== "saved") return saveResult;
-	const payload = saveResult.complete
-		? originalText
-		: (() => {
-				const retained = truncateHeadBytes(originalText, DEFAULT_ARTIFACT_MAX_BYTES);
-				return `${retained.text}\n[artifact truncated after ${retained.bytes} bytes; omitted at least ${saveResult.omittedBytes} bytes]\n`;
-			})();
-	const writeOutcome = await awaitBoundedOperation(() => Bun.write(artifactPath, payload));
-	return writeOutcome.status === "ok" ? saveResult : { status: "failed", diagnostic: writeOutcome.diagnostic };
+	if (!alloc?.path || !alloc.id) return { status: "unavailable" };
+	try {
+		const saveResult = summarizeOriginalArtifactSave(alloc.id, originalText);
+		const payload = saveResult.complete
+			? originalText
+			: (() => {
+					const retained = truncateHeadBytes(originalText, DEFAULT_ARTIFACT_MAX_BYTES);
+					return `${retained.text}\n[artifact truncated after ${retained.bytes} bytes; omitted at least ${saveResult.omittedBytes} bytes]\n`;
+				})();
+		await Bun.write(alloc.path, payload);
+		return saveResult;
+	} catch (error) {
+		return { status: "failed", diagnostic: boundArtifactSaveDiagnostic(error) };
+	}
 }
 
-const bashArtifactPublishers = new WeakMap<ToolSession, TerminalArtifactPublisher>();
-
 function createBashArtifactPublisher(session: ToolSession): TerminalArtifactPublisher {
-	const existing = bashArtifactPublishers.get(session);
-	if (existing) return existing;
-	const publisher: TerminalArtifactPublisher = async (content, _info): Promise<TerminalArtifactPublishResult> => {
+	return async (content, _info): Promise<TerminalArtifactPublishResult> => {
 		let manager: ArtifactManager | null | undefined;
 		try {
 			manager = session.getArtifactManager?.();
@@ -653,15 +345,15 @@ function createBashArtifactPublisher(session: ToolSession): TerminalArtifactPubl
 			return { status: "failed", diagnostic: boundArtifactSaveDiagnostic(error) };
 		}
 		if (!manager) return { status: "unavailable" };
-		const outcome = await awaitBoundedOperation(() => manager.save(content, "bash"));
-		if (outcome.status !== "ok") return { status: "failed", diagnostic: outcome.diagnostic };
-		return isValidArtifactId(outcome.value)
-			? { status: "published", artifactId: outcome.value }
-			: { status: "failed", diagnostic: "storage returned an invalid artifact id" };
+		try {
+			const artifactId = await manager.save(content, "bash");
+			return artifactId
+				? { status: "published", artifactId }
+				: { status: "failed", diagnostic: "storage returned no artifact id" };
+		} catch (error) {
+			return { status: "failed", diagnostic: boundArtifactSaveDiagnostic(error) };
+		}
 	};
-	Object.defineProperty(publisher, "owner", { value: session });
-	bashArtifactPublishers.set(session, publisher);
-	return publisher;
 }
 
 export async function saveBashOriginalArtifactForTests(
@@ -1079,7 +771,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			"bash",
 			label,
 			async ({ jobId, signal: runSignal, reportProgress }) => {
-				const { path: artifactPath, id: artifactId } = await allocateBashOutputArtifact(this.session, "bash");
+				const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
 				const artifactPublisher = createBashArtifactPublisher(this.session);
 				const spillThreshold = resolveBashOutputSinkTailBytes(this.session.settings);
 				const headBytes = resolveBashOutputSinkHeadBytes(this.session.settings);
@@ -1437,7 +1129,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			"bash",
 			label,
 			async ({ jobId: id, signal, reportProgress }) => {
-				const { path: artifactPath, id: artifactId } = await allocateBashOutputArtifact(this.session, "bash");
+				const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
 				const artifactPublisher = createBashArtifactPublisher(this.session);
 				const spillThreshold = resolveBashOutputSinkTailBytes(this.session.settings);
 				const headBytes = resolveBashOutputSinkHeadBytes(this.session.settings);
@@ -1489,7 +1181,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	}
 
 	async execute(
-		toolCallId: string,
+		_toolCallId: string,
 		{
 			command: rawCommand,
 			env: rawEnv,
@@ -1624,207 +1316,39 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 
 		if (clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty) {
-			const createTerminal = clientBridge.createTerminal;
-			if (hasQuarantinedClientTerminalProvider(clientBridge)) {
-				throw new ToolError("ACP terminal creation failed: provider cleanup ownership incomplete");
-			}
-			if (signal?.aborted) {
-				throw new ToolAbortError("Command aborted before ACP terminal creation");
-			}
-			if (!hasBoundedOperationCapacity()) {
-				throw new ToolError("ACP terminal creation failed: pending operation limit reached");
-			}
-			if (!reserveBashRelease(clientBridge)) {
-				throw new ToolError("ACP terminal creation failed: pending release limit reached");
-			}
-			if (!reserveBashCleanup(clientBridge)) {
-				consumeBashReleaseReservation(clientBridge);
-				throw new ToolError("ACP terminal creation failed: pending cleanup limit reached");
-			}
-			let killReserved = true;
-			const killHandle = (handle: ClientBridgeTerminalHandle): Promise<BoundedOperationOutcome<void>> => {
-				if (killReserved) {
-					killReserved = false;
-					consumeBashCleanupReservation(clientBridge);
-				}
-				return awaitBoundedCleanup(clientBridge, () => handle.kill());
-			};
-			let releaseReserved = true;
-			const releaseHandle = (handle: ClientBridgeTerminalHandle): Promise<BoundedOperationOutcome<void>> => {
-				if (releaseReserved) {
-					releaseReserved = false;
-					consumeBashReleaseReservation(clientBridge);
-				}
-				return awaitBoundedRelease(clientBridge, () => handle.release());
-			};
-			const terminalCreateAbort = new AbortController();
-			const terminalCreateSignal = signal
-				? AbortSignal.any([signal, terminalCreateAbort.signal])
-				: terminalCreateAbort.signal;
-			const terminalCreatePromise = Promise.resolve().then(() =>
-				createTerminal({
-					toolCallId,
-					command,
-					cwd: commandCwd,
-					env: resolvedEnv
-						? Object.entries(resolvedEnv).map(([name, value]) => ({ name, value: value as string }))
-						: undefined,
-					outputByteLimit: DEFAULT_ARTIFACT_MAX_BYTES,
-					signal: terminalCreateSignal,
-				}),
-			);
-			const terminalCreateOperation = awaitBoundedOperation(() => terminalCreatePromise);
-			const createAborted = Promise.withResolvers<{ status: "aborted" }>();
-			const onCreateAbort = () => createAborted.resolve({ status: "aborted" });
-			signal?.addEventListener("abort", onCreateAbort, { once: true });
-			const terminalCreate = signal
-				? await Promise.race([terminalCreateOperation, createAborted.promise])
-				: await terminalCreateOperation;
-			signal?.removeEventListener("abort", onCreateAbort);
-			terminalCreateAbort.abort();
-			if (terminalCreate.status !== "ok") {
-				void terminalCreatePromise.then(
-					async lateHandle => {
-						const killOutcome = await killHandle(lateHandle);
-						const releaseOutcome = await releaseHandle(lateHandle);
-						const cleanupFailed = killOutcome.status !== "ok" || releaseOutcome.status !== "ok";
-						if (cleanupFailed) markClientTerminalProviderQuarantined(clientBridge, lateHandle);
-						const quarantineOutcome = cleanupFailed
-							? await quarantineClientTerminalLease(
-									clientBridge,
-									lateHandle,
-									"late ACP terminal creation cleanup did not settle",
-								)
-							: undefined;
-						if (cleanupFailed) {
-							logger.warn("Late ACP terminal cleanup failed", {
-								terminalId: lateHandle.terminalId,
-								killDiagnostic: killOutcome.status === "ok" ? undefined : killOutcome.diagnostic,
-								releaseDiagnostic: releaseOutcome.status === "ok" ? undefined : releaseOutcome.diagnostic,
-								quarantineDiagnostic:
-									quarantineOutcome?.status === "ok" ? undefined : quarantineOutcome?.diagnostic,
-							});
-						}
-					},
-					() => {
-						if (releaseReserved) {
-							releaseReserved = false;
-							consumeBashReleaseReservation(clientBridge);
-						}
-						if (killReserved) {
-							killReserved = false;
-							consumeBashCleanupReservation(clientBridge);
-						}
-					},
-				);
-				if (terminalCreate.status === "aborted") {
-					throw new ToolAbortError("Command aborted during ACP terminal creation");
-				}
-				throw new ToolError(`ACP terminal creation failed: ${terminalCreate.diagnostic}`);
-			}
-			const handle = terminalCreate.value;
-			pendingBashOperations.delete(terminalCreatePromise);
-			if (!hasBoundedOperationCapacity()) {
-				const killOutcome = await killHandle(handle);
-				const releaseOutcome = await releaseHandle(handle);
-				if (killOutcome.status !== "ok" || releaseOutcome.status !== "ok") {
-					const quarantineOutcome = await quarantineClientTerminalLease(
-						clientBridge,
-						handle,
-						"terminal exit observation admission failed after cleanup uncertainty",
-					);
-					if (quarantineOutcome.status !== "ok")
-						throw new ToolError(`ACP terminal cleanup ownership incomplete: ${quarantineOutcome.diagnostic}`);
-				}
-				throw new ToolError("ACP terminal exit observation failed: pending operation limit reached");
-			}
-			let clientOutputCaptureIncomplete = false;
-			let currentOutputOperation:
-				| {
-						raw: Promise<ClientBridgeTerminalOutput>;
-						bounded: Promise<BoundedOperationOutcome<ClientBridgeTerminalOutput>>;
-				  }
-				| undefined;
-			let latestPreparedOutput: PreparedClientTerminalOutput | undefined;
-			const prepareOutput = async (
-				current: ClientBridgeTerminalOutput,
-				forceSourceIncomplete = false,
-			): Promise<PreparedClientTerminalOutput> => {
-				const prepared = await prepareClientTerminalOutput(this.session, current, forceSourceIncomplete);
-				latestPreparedOutput = prepared;
-				return prepared;
-			};
-			const readCurrentOutput = (): Promise<BoundedOperationOutcome<ClientBridgeTerminalOutput>> => {
-				if (currentOutputOperation) return currentOutputOperation.bounded;
-				if (!hasBoundedOperationCapacity()) {
-					return Promise.resolve({ status: "failed", diagnostic: "pending operation limit reached" });
-				}
-				const raw = Promise.resolve().then(() => handle.currentOutput());
-				const bounded = awaitBoundedOperation(() => raw);
-				currentOutputOperation = { raw, bounded };
-				void raw.then(
-					() => {
-						if (currentOutputOperation?.raw === raw) currentOutputOperation = undefined;
-					},
-					() => {
-						if (currentOutputOperation?.raw === raw) currentOutputOperation = undefined;
-					},
-				);
-				return bounded;
-			};
+			const clientHeadBytes = resolveBashOutputSinkHeadBytes(this.session.settings);
+			const clientTailBytes = resolveBashOutputSinkTailBytes(this.session.settings);
+			const handle = await clientBridge.createTerminal({
+				command,
+				cwd: commandCwd,
+				env: resolvedEnv
+					? Object.entries(resolvedEnv).map(([name, value]) => ({ name, value: value as string }))
+					: undefined,
+				outputByteLimit: clientHeadBytes > 0 ? undefined : clientTailBytes,
+			});
+
+			// Emit partial update so the editor can embed the live terminal card.
+			onUpdate?.({ content: [], details: { terminalId: handle.terminalId } });
+
+			const exitPromise = handle.waitForExit();
+			let exitStatus!: ClientBridgeTerminalExitStatus;
 
 			type BridgeRaceResult =
 				| { kind: "exit"; status: ClientBridgeTerminalExitStatus }
-				| { kind: "exit-error"; diagnostic: string }
 				| { kind: "poll" }
 				| { kind: "timeout" }
 				| { kind: "aborted" };
-			const rawExitPromise = Promise.resolve().then(() => handle.waitForExit());
-			if (!trackPendingOperation(pendingBashOperations, BASH_PENDING_OPERATION_LIMIT, rawExitPromise)) {
-				const killOutcome = await killHandle(handle);
-				const releaseOutcome = await releaseHandle(handle);
-				if (killOutcome.status !== "ok" || releaseOutcome.status !== "ok") {
-					const quarantineOutcome = await quarantineClientTerminalLease(
-						clientBridge,
-						handle,
-						"terminal exit observation registration failed after cleanup uncertainty",
-					);
-					if (quarantineOutcome.status !== "ok")
-						throw new ToolError(`ACP terminal cleanup ownership incomplete: ${quarantineOutcome.diagnostic}`);
-				}
-				throw new ToolError("ACP terminal exit observation failed: pending operation limit reached");
-			}
-			const exitPromise: Promise<BridgeRaceResult> = rawExitPromise.then(
-				status => ({ kind: "exit", status }),
-				error => ({ kind: "exit-error", diagnostic: boundArtifactSaveDiagnostic(error) }),
-			);
-			let exitStatus!: ClientBridgeTerminalExitStatus;
 
 			// Set up abort listener before entering the poll loop. The listener
 			// kicks off `handle.kill()` synchronously so a `session/cancel`
 			// arriving mid-poll terminates the remote command immediately,
 			// instead of waiting for the next `currentOutput()` to return.
 			const { promise: abortedP, resolve: resolveAborted } = Promise.withResolvers<void>();
-			let killPromise: Promise<string | undefined> | undefined;
-			const fireKill = (): Promise<string | undefined> => {
+			let killPromise: Promise<void> | undefined;
+			const fireKill = (): Promise<void> => {
 				if (killPromise) return killPromise;
-				killPromise = killHandle(handle).then(async outcome => {
-					if (outcome.status === "ok") return undefined;
-					markClientTerminalProviderQuarantined(clientBridge, handle);
-					const quarantineOutcome = await quarantineClientTerminalLease(
-						clientBridge,
-						handle,
-						"terminal kill did not settle",
-					);
-					if (quarantineOutcome.status === "ok") clearClientTerminalProviderQuarantine(clientBridge, handle);
-					logger.warn("ACP terminal kill failed", {
-						terminalId: handle.terminalId,
-						diagnostic: outcome.diagnostic,
-						quarantineDiagnostic: quarantineOutcome.status === "ok" ? undefined : quarantineOutcome.diagnostic,
-					});
-					return quarantineOutcome.status === "ok"
-						? outcome.diagnostic
-						: `${outcome.diagnostic}; lease quarantine failed: ${quarantineOutcome.diagnostic}`;
+				killPromise = handle.kill().catch((error: unknown) => {
+					logger.warn("ACP terminal kill failed", { terminalId: handle.terminalId, error });
 				});
 				return killPromise;
 			};
@@ -1834,282 +1358,179 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			};
 			signal?.addEventListener("abort", onAbortSignal, { once: true });
 
-			let operationError: unknown;
-			let operationResult: AgentToolResult<BashToolDetails> | undefined;
-			let releaseFailure: ToolError | undefined;
 			try {
-				operationResult = await (async (): Promise<AgentToolResult<BashToolDetails>> => {
-					// Emit partial update only after the release guard owns the handle.
-					onUpdate?.({ content: [], details: { terminalId: handle.terminalId } });
-					try {
-						if (signal?.aborted) {
-							const killDiagnostic = await fireKill();
-							const recovered = await recoverClientTerminalOutput(handle, "pre-aborted", readCurrentOutput);
-							const prepared = await prepareOutput(recovered.current, true);
-							throw new ToolAbortError(
-								formatClientTerminalAbortFailure(
-									prepared,
-									recovered.diagnostic,
-									[...pendingNotices, ...(killDiagnostic ? [`Terminal kill failed: ${killDiagnostic}`] : [])],
-									maxBashErrorBytes(this.session),
-								),
-							);
-						}
-
-						const timeoutPromise = Bun.sleep(timeoutMs).then(() => ({ kind: "timeout" as const }));
-						// Poll until the process exits, times out, or the caller aborts.
-						for (;;) {
-							const racers: Array<Promise<BridgeRaceResult>> = [
-								exitPromise,
-								timeoutPromise,
-								Bun.sleep(250).then(() => ({ kind: "poll" as const })),
-							];
-							if (signal) {
-								racers.push(abortedP.then(() => ({ kind: "aborted" as const })));
-							}
-							const raced = await Promise.race(racers);
-
-							if (raced.kind === "aborted" || signal?.aborted) {
-								const killDiagnostic = await fireKill();
-								const recovered = await recoverClientTerminalOutput(handle, "aborted", readCurrentOutput);
-								const prepared = await prepareOutput(recovered.current, true);
-								throw new ToolAbortError(
-									formatClientTerminalAbortFailure(
-										prepared,
-										recovered.diagnostic,
-										[
-											...pendingNotices,
-											...(killDiagnostic ? [`Terminal kill failed: ${killDiagnostic}`] : []),
-										],
-										maxBashErrorBytes(this.session),
-									),
-								);
-							}
-
-							if (raced.kind === "timeout") {
-								// Kill before reading final output so a slow `terminal/output`
-								// RPC cannot let a timed-out command keep running past the
-								// enforced timeout. The handle stays valid post-kill so the
-								// buffered output is still readable.
-								const killDiagnostic = await fireKill();
-								const recovered = await recoverClientTerminalOutput(handle, "timeout", readCurrentOutput);
-								const prepared = await prepareOutput(recovered.current, true);
-								const timeoutNotices = [
-									...pendingNotices,
-									...(recovered.current.truncated || prepared.locallyTruncated ? ["(output truncated)"] : []),
-									...(prepared.artifactSaveNotice ? [prepared.artifactSaveNotice] : []),
-									...(killDiagnostic ? [`Terminal kill failed: ${killDiagnostic}`] : []),
-									...(recovered.diagnostic
-										? [`Terminal output recovery failed: ${recovered.diagnostic}`]
-										: []),
-								];
-								const timedOutResult: BashInteractiveResult = {
-									...prepared.summary,
-									exitCode: undefined,
-									cancelled: false,
-									timedOut: true,
-								};
-								return this.#buildCompletedResult(timedOutResult, timeoutSec, {
-									requestedTimeoutSec,
-									notices: timeoutNotices,
-									terminalId: handle.terminalId,
-								});
-							}
-
-							if (raced.kind === "exit-error") {
-								const killDiagnostic = await fireKill();
-								const recovered = await recoverClientTerminalOutput(handle, "exit-error", readCurrentOutput);
-								const prepared = await prepareOutput(recovered.current, true);
-								const failureNotices = [
-									...pendingNotices,
-									...(killDiagnostic ? [`Terminal kill failed: ${killDiagnostic}`] : []),
-									...(recovered.diagnostic
-										? [`Terminal output recovery failed: ${recovered.diagnostic}`]
-										: []),
-								];
-								const failureCause = `Terminal exit wait failed: ${raced.diagnostic}`;
-								throw new ToolError(
-									formatBashFailureMessage(
-										{ ...prepared.summary, exitCode: undefined, cancelled: true },
-										[prepared.summary.output || "(no output)", ...failureNotices, failureCause].join("\n"),
-										failureCause,
-									),
-								);
-							}
-
-							if (raced.kind === "exit") {
-								exitStatus = raced.status;
-								break;
-							}
-
-							// Poll tick: push current output so agent-loop transcript stays consistent.
-							// Race the read against abort so a stuck `terminal/output` RPC does not
-							// delay cancellation.
-							const pollRecovered = await Promise.race([
-								recoverClientTerminalOutput(handle, "poll", readCurrentOutput),
-								abortedP.then(() => undefined),
-							]);
-							if (pollRecovered === undefined) {
-								// Abort fired during the poll-tick read; let the next loop iteration
-								// observe `signal?.aborted` and exit via the abort branch.
-								continue;
-							}
-							const normalizedPoll = normalizeClientTerminalOutput(pollRecovered.current);
-							const pollOutput = normalizedPoll.current;
-							if (pollRecovered.diagnostic || normalizedPoll.malformed || pollOutput.truncated) {
-								clientOutputCaptureIncomplete = true;
-							}
-							const { summary, locallyTruncated } = await boundClientTerminalOutput(
-								pollOutput.output,
-								pollOutput.truncated,
-								this.session.settings,
-								normalizedPoll.malformed,
-							);
-							const pollText =
-								summary.truncated || locallyTruncated
-									? `${summary.output}${summary.output.endsWith("\n") ? "" : "\n"}(output truncated)`
-									: summary.output;
-							onUpdate?.({
-								content: [{ type: "text", text: pollText }],
-								details: { terminalId: handle.terminalId },
+				try {
+					if (signal?.aborted) {
+						await fireKill();
+						let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
+						let readDiagnostic: string | undefined;
+						try {
+							current = await handle.currentOutput();
+						} catch (error) {
+							readDiagnostic = boundArtifactSaveDiagnostic(error);
+							logger.warn("ACP terminal aborted output read failed", {
+								terminalId: handle.terminalId,
+								error,
 							});
 						}
-					} finally {
-						// Keep the abort listener active through final output recovery and artifact save.
+						const prepared = await prepareClientTerminalOutput(this.session, current);
+						throw new ToolAbortError(formatClientTerminalAbortFailure(prepared, readDiagnostic, pendingNotices));
 					}
 
-					if (signal?.aborted) {
-						const killDiagnostic = await fireKill();
-						const recovered = await recoverClientTerminalOutput(handle, "post-exit-abort", readCurrentOutput);
-						const prepared = await prepareOutput(
-							recovered.current,
-							clientOutputCaptureIncomplete || killDiagnostic !== undefined,
+					const timeoutPromise = Bun.sleep(timeoutMs).then(() => ({ kind: "timeout" as const }));
+					// Poll until the process exits, times out, or the caller aborts.
+					for (;;) {
+						const racers: Array<Promise<BridgeRaceResult>> = [
+							exitPromise.then(s => ({ kind: "exit" as const, status: s })),
+							timeoutPromise,
+							Bun.sleep(250).then(() => ({ kind: "poll" as const })),
+						];
+						if (signal) {
+							racers.push(abortedP.then(() => ({ kind: "aborted" as const })));
+						}
+						const raced = await Promise.race(racers);
+
+						if (raced.kind === "aborted" || signal?.aborted) {
+							await fireKill();
+							let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
+							let readDiagnostic: string | undefined;
+							try {
+								current = await handle.currentOutput();
+							} catch (error) {
+								readDiagnostic = boundArtifactSaveDiagnostic(error);
+								logger.warn("ACP terminal aborted output read failed", {
+									terminalId: handle.terminalId,
+									error,
+								});
+							}
+							const prepared = await prepareClientTerminalOutput(this.session, current);
+							throw new ToolAbortError(
+								formatClientTerminalAbortFailure(prepared, readDiagnostic, pendingNotices),
+							);
+						}
+
+						if (raced.kind === "timeout") {
+							// Kill before reading final output so a slow `terminal/output`
+							// RPC cannot let a timed-out command keep running past the
+							// enforced timeout. The handle stays valid post-kill so the
+							// buffered output is still readable.
+							await fireKill();
+							let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
+							let readDiagnostic: string | undefined;
+							try {
+								current = await handle.currentOutput();
+							} catch (error) {
+								readDiagnostic = boundArtifactSaveDiagnostic(error);
+								logger.warn("ACP terminal final output read failed", {
+									terminalId: handle.terminalId,
+									error,
+								});
+							}
+							const prepared = await prepareClientTerminalOutput(this.session, current);
+							const timeoutNotices = [
+								...pendingNotices,
+								...(current.truncated || prepared.locallyTruncated ? ["(output truncated)"] : []),
+								...(prepared.artifactSaveNotice ? [prepared.artifactSaveNotice] : []),
+								...(readDiagnostic ? [`Terminal output recovery failed: ${readDiagnostic}`] : []),
+							];
+							const timedOutResult: BashInteractiveResult = {
+								...prepared.summary,
+								exitCode: undefined,
+								cancelled: false,
+								timedOut: true,
+							};
+							return this.#buildCompletedResult(timedOutResult, timeoutSec, {
+								requestedTimeoutSec,
+								notices: timeoutNotices,
+								terminalId: handle.terminalId,
+							});
+						}
+
+						if (raced.kind === "exit") {
+							exitStatus = raced.status;
+							break;
+						}
+
+						// Poll tick: push current output so agent-loop transcript stays consistent.
+						// Race the read against abort so a stuck `terminal/output` RPC does not
+						// delay cancellation.
+						const pollOutput = await Promise.race([
+							handle.currentOutput(),
+							abortedP.then(() => undefined as ClientBridgeTerminalOutput | undefined),
+						]);
+						if (pollOutput === undefined) {
+							// Abort fired during the poll-tick read; let the next loop iteration
+							// observe `signal?.aborted` and exit via the abort branch.
+							continue;
+						}
+						const { summary, locallyTruncated } = await boundClientTerminalOutput(
+							pollOutput.output,
+							pollOutput.truncated,
+							this.session.settings,
 						);
-						throw new ToolAbortError(
-							formatClientTerminalAbortFailure(
-								prepared,
-								recovered.diagnostic,
-								[...pendingNotices, ...(killDiagnostic ? [`Terminal kill failed: ${killDiagnostic}`] : [])],
-								maxBashErrorBytes(this.session),
-							),
-						);
+						const pollText =
+							pollOutput.truncated || locallyTruncated
+								? `${summary.output}${summary.output.endsWith("\n") ? "" : "\n"}(output truncated)`
+								: summary.output;
+						onUpdate?.({
+							content: [{ type: "text", text: pollText }],
+							details: { terminalId: handle.terminalId },
+						});
 					}
+				} finally {
+					signal?.removeEventListener("abort", onAbortSignal);
+				}
 
-					// Fetch final output; the terminal is released in the outer finally.
-					const finalRecovered = await recoverClientTerminalOutput(handle, "final", readCurrentOutput);
-					const finalOutput = finalRecovered.current;
-
-					// Map exit status: null exitCode with a signal → treat as signal kill (137).
-					const rawExitCode = exitStatus.exitCode;
-					const exitCode: number | undefined =
-						rawExitCode != null ? rawExitCode : exitStatus.signal ? 137 : undefined;
-
-					const prepared = await prepareOutput(finalOutput, clientOutputCaptureIncomplete);
-					if (signal?.aborted) {
-						const killDiagnostic = await fireKill();
-						markClientTerminalSourceIncomplete(prepared);
-						throw new ToolAbortError(
-							formatClientTerminalAbortFailure(
-								prepared,
-								finalRecovered.diagnostic,
-								[...pendingNotices, ...(killDiagnostic ? [`Terminal kill failed: ${killDiagnostic}`] : [])],
-								maxBashErrorBytes(this.session),
-							),
-						);
+				if (signal?.aborted) {
+					await fireKill();
+					let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
+					let readDiagnostic: string | undefined;
+					try {
+						current = await handle.currentOutput();
+					} catch (error) {
+						readDiagnostic = boundArtifactSaveDiagnostic(error);
+						logger.warn("ACP terminal aborted output read failed", {
+							terminalId: handle.terminalId,
+							error,
+						});
 					}
+					const prepared = await prepareClientTerminalOutput(this.session, current);
+					throw new ToolAbortError(formatClientTerminalAbortFailure(prepared, readDiagnostic, pendingNotices));
+				}
 
-					const bridgeResult: BashResult = {
-						...prepared.summary,
-						exitCode,
-						cancelled: false,
-					};
+				// Fetch final output; the terminal is released in the outer finally.
+				const finalOutput = await handle.currentOutput();
 
-					const bridgeNotices: string[] = [];
-					if (finalOutput.truncated || prepared.locallyTruncated) bridgeNotices.push("(output truncated)");
-					for (const notice of pendingNotices) bridgeNotices.push(notice);
-					if (prepared.artifactSaveNotice) bridgeNotices.push(prepared.artifactSaveNotice);
-					if (finalRecovered.diagnostic) {
-						bridgeNotices.push(`Terminal output recovery failed: ${finalRecovered.diagnostic}`);
-					}
+				// Map exit status: null exitCode with a signal → treat as signal kill (137).
+				const rawExitCode = exitStatus.exitCode;
+				const exitCode: number | undefined =
+					rawExitCode != null ? rawExitCode : exitStatus.signal ? 137 : undefined;
 
-					return this.#buildCompletedResult(bridgeResult, timeoutSec, {
-						requestedTimeoutSec,
-						notices: bridgeNotices,
-						terminalId: handle.terminalId,
-					});
-				})();
-			} catch (error) {
-				operationError = error;
+				const prepared = await prepareClientTerminalOutput(this.session, finalOutput);
+
+				const bridgeResult: BashResult = {
+					...prepared.summary,
+					exitCode,
+					cancelled: false,
+				};
+
+				const bridgeNotices: string[] = [];
+				if (finalOutput.truncated || prepared.locallyTruncated) bridgeNotices.push("(output truncated)");
+				for (const notice of pendingNotices) bridgeNotices.push(notice);
+				if (prepared.artifactSaveNotice) bridgeNotices.push(prepared.artifactSaveNotice);
+
+				return this.#buildCompletedResult(bridgeResult, timeoutSec, {
+					requestedTimeoutSec,
+					notices: bridgeNotices,
+					terminalId: handle.terminalId,
+				});
 			} finally {
-				signal?.removeEventListener("abort", onAbortSignal);
-				if (killReserved) {
-					killReserved = false;
-					consumeBashCleanupReservation(clientBridge);
-				}
-				const releaseOutcome = await releaseHandle(handle);
-				if (releaseOutcome.status !== "ok") {
-					markClientTerminalProviderQuarantined(clientBridge, handle);
-					const quarantineOutcome = await quarantineClientTerminalLease(
-						clientBridge,
-						handle,
-						"terminal release did not settle",
-					);
-					if (quarantineOutcome.status === "ok") clearClientTerminalProviderQuarantine(clientBridge, handle);
-					const ownershipDiagnostic =
-						quarantineOutcome.status === "ok"
-							? releaseOutcome.diagnostic
-							: `${releaseOutcome.diagnostic}; lease quarantine failed: ${quarantineOutcome.diagnostic}`;
-					logger.warn("ACP terminal release failed", {
-						terminalId: handle.terminalId,
-						diagnostic: releaseOutcome.diagnostic,
-						quarantineDiagnostic: quarantineOutcome.status === "ok" ? undefined : quarantineOutcome.diagnostic,
-					});
-					if (latestPreparedOutput) {
-						releaseFailure = new ToolError(
-							formatClientTerminalOwnershipFailure(
-								latestPreparedOutput,
-								ownershipDiagnostic,
-								maxBashErrorBytes(this.session),
-							),
-						);
-					} else {
-						releaseFailure = new ToolError(
-							truncateHeadBytes(
-								`Terminal release ownership incomplete: ${ownershipDiagnostic}`,
-								maxBashErrorBytes(this.session),
-							).text,
-						);
-					}
+				try {
+					await handle.release();
+				} catch (error) {
+					logger.warn("ACP terminal release failed", { terminalId: handle.terminalId, error });
 				}
 			}
-			if (operationError) {
-				if (releaseFailure && operationError instanceof Error) {
-					const operationCause = Array.from(
-						operationError.message.matchAll(/Command (?:timed out(?: after \d+ seconds?)?|cancelled|aborted)/gu),
-					).at(-1)?.[0];
-					operationError.message = formatBashFailureMessage(
-						{
-							...(latestPreparedOutput?.summary ?? {
-								totalLines: 0,
-								totalBytes: 0,
-								outputLines: 0,
-								outputBytes: 0,
-							}),
-							output: operationError.message,
-							truncated: true,
-							exitCode: undefined,
-							cancelled: true,
-						},
-						`${removeTrailingFailureCause(operationError.message, operationCause)}\n\n${releaseFailure.message}`,
-						operationCause,
-						maxBashErrorBytes(this.session),
-					);
-				}
-				throw operationError;
-			}
-			if (releaseFailure) throw releaseFailure;
-			if (!operationResult) throw new ToolError("ACP terminal execution did not settle");
-			return operationResult;
 		}
 
 		const spillThreshold = resolveBashOutputSinkTailBytes(this.session.settings);
@@ -2119,7 +1540,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const tailBuffer = new TailBuffer(spillThreshold);
 
 		// Allocate artifact for truncated output storage
-		const { path: artifactPath, id: artifactId } = await allocateBashOutputArtifact(this.session, "bash");
+		const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
 		const artifactPublisher = createBashArtifactPublisher(this.session);
 
 		const interactiveUi =

@@ -660,10 +660,6 @@ export function createAcpReverseConnection(connection: AgentSideConnection, sess
 		"fs.readTextFile": "fs/read_text_file",
 		"fs.writeTextFile": "fs/write_text_file",
 		"terminal.create": "terminal/create",
-		"terminal.output": "terminal/output",
-		"terminal.waitForExit": "terminal/wait_for_exit",
-		"terminal.kill": "terminal/kill",
-		"terminal.release": "terminal/release",
 		"ui.elicit": "elicitation/create",
 	};
 	return {
@@ -672,26 +668,6 @@ export function createAcpReverseConnection(connection: AgentSideConnection, sess
 			params: JsonObject,
 			options?: { cancellationSignal?: AbortSignal },
 		): Promise<unknown> => {
-			if (method === "terminal.publish") {
-				const toolCallId = typeof params.toolCallId === "string" ? params.toolCallId : undefined;
-				const terminalId = typeof params.terminalId === "string" ? params.terminalId : undefined;
-				if (!toolCallId || !terminalId) {
-					throw new AcpSdkAdapterError(
-						"invalid_params",
-						"ACP terminal publication requires toolCallId and terminalId.",
-					);
-				}
-				await connection.sessionUpdate({
-					sessionId,
-					update: {
-						sessionUpdate: "tool_call_update",
-						toolCallId,
-						status: "in_progress",
-						content: [{ type: "terminal", terminalId }],
-					},
-				});
-				return {};
-			}
 			const name = methods[method];
 			if (!name)
 				throw new AcpSdkAdapterError("acp_reverse_unavailable", `ACP reverse method is unavailable: ${method}`);

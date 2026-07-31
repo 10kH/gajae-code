@@ -53,11 +53,10 @@ describe("stripOutputNotice", () => {
 		expect(stripOutputNotice(combined, truncation)).toBe(body);
 	});
 
-	it("removes the notice while suppressing an unproven artifact reference", () => {
+	it("removes the notice for tail truncation including artifact reference", () => {
 		const body = "long output…";
 		const notice = formatOutputNotice(tailTruncation);
-		expect(notice).not.toContain("artifact://abc123");
-		expect(notice).toContain("Artifact availability could not be proven");
+		expect(notice).toContain("artifact://abc123");
 
 		expect(stripOutputNotice(body + notice, tailTruncation)).toBe(body);
 	});

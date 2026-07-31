@@ -2,7 +2,6 @@ import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Usage } from "@gajae-code/ai";
 import { $env } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import type { ReviewDeliveryDisposition, ReviewSourceLane } from "../gjc-runtime/ultragoal-review-source";
 import { isValidTaskId, TASK_ID_DESCRIPTION } from "./id";
 import type { TaskResultReceipt } from "./receipt";
 import type { SpawnRoiReconciliation } from "./roi-reconciliation";
@@ -115,25 +114,8 @@ const createTaskItemSchema = (_contextEnabled: boolean) =>
 			.describe(
 				"authoritative repository identity; omitted items are stamped from session cwd before discovery/spawn and still fail closed on sibling drift",
 			),
-		reviewSource: reviewSourceSchema.optional(),
+		duplicate_policy: z.enum(["warn", "supersede"]).optional().describe("duplicate launch policy; defaults to warn"),
 	});
-
-const reviewSourceSchema = z
-	.object({
-		schema: z.literal("gjc.review_source_dispatch.v1"),
-		cohortId: z.string().min(1),
-		generation: z.number().int().min(1),
-		lane: z.enum(["cleaner", "architect", "qa", "critic"]),
-		snapshotId: z.string().startsWith("sha256:"),
-		repositoryBindingDigest: z.string().startsWith("sha256:"),
-		stateRevision: z.number().int().min(0),
-		dispatchId: z.string().min(1),
-		rerunCommand: z.string().min(1),
-		taskId: z.string().min(1),
-		createdAt: z.string().min(1),
-	})
-	.strict()
-	.describe("leader-issued immutable review source identity; review lanes only");
 
 /** Single task item for parallel execution (default shape with context enabled). */
 export const taskItemSchema = createTaskItemSchema(true);
@@ -218,6 +200,7 @@ export interface TaskParams {
 	spawnPlan?: SpawnPlanReceipt;
 	tasks: TaskItem[];
 	isolated?: boolean;
+	duplicate_policy?: "warn" | "supersede";
 }
 
 /** A code review finding reported by the reviewer agent */
@@ -452,6 +435,12 @@ export interface TaskRecoveryArtifactRef {
 	durability: "session";
 }
 
+/** Bounded duplicate-launch disposition carried into task receipts. */
+export interface DuplicateDisposition {
+	action: "warned" | "superseded";
+	predecessorIds: string[];
+}
+
 export interface TaskPersistenceResult {
 	outcome: "applied" | "no_changes" | "recovery_available";
 	ownerWorktreeApplied: boolean;
@@ -488,6 +477,8 @@ export interface SingleResult {
 	setupFailure?: SetupFailureSummary;
 	aborted?: boolean;
 	abortReason?: string;
+
+	duplicateDisposition?: DuplicateDisposition;
 	paused?: boolean;
 	/** Aggregated usage from the subprocess, accumulated incrementally from message_end events. */
 	usage?: Usage;
@@ -542,21 +533,6 @@ export interface SingleResult {
 		displayPath?: string;
 		head?: string;
 		branch?: string;
-	};
-	/** Leader-issued immutable source identity for source-aware review lanes (#3469). */
-	reviewSource?: {
-		schema: "gjc.review_source_dispatch.v1";
-		cohortId: string;
-		generation: number;
-		lane: ReviewSourceLane;
-		snapshotId: string;
-		repositoryBindingDigest: string;
-		stateRevision: number;
-		dispatchId: string;
-		rerunCommand: string;
-		disposition: ReviewDeliveryDisposition;
-		currentSnapshotId?: string;
-		deliveryId?: string;
 	};
 }
 
