@@ -86,10 +86,12 @@ mod platform {
 			// every task subdir and union the lists, then re-validate parentage.
 			let task_dir = format!("/proc/{}/task", self.pid);
 			let Ok(entries) = fs::read_dir(&task_dir) else {
-				// The directory vanishing because the process exited is an expected
-				// race; failing to read it while the process is still live means the
-				// child set is genuinely unknown.
-				return if self.live_identity() { None } else { Some(Vec::new()) };
+				// Identity was already proven above, so the only benign explanation is
+				// that the process exited in between. Anything else is an observation
+				// failure. `live_identity()` must not be used here: it also reports
+				// false for an unreadable start time, which is exactly the
+				// failure-as-empty hole this function exists to close.
+				return if self.status() == ProcessStatus::Exited { Some(Vec::new()) } else { None };
 			};
 
 			let mut seen: HashSet<i32> = HashSet::new();
@@ -128,10 +130,17 @@ mod platform {
 						// The child exited before we could pin it — expected race.
 						continue;
 					};
-					if child.status() == ProcessStatus::Running
-						&& current_parent_pid(child.pid) == Some(self.pid)
-					{
-						out.push(child);
+					// Parentage must be positively observed. An unreadable
+					// `/proc/<pid>/status` for a live child means we cannot tell whether
+					// it is ours, so the walk is incomplete rather than child-free.
+					match current_parent_pid(child.pid) {
+						Some(parent) if parent == self.pid => out.push(child),
+						// Positively observed as someone else's child.
+						Some(_) => {},
+						None if child.status() == ProcessStatus::Exited => {
+							// Exited mid-walk — expected race.
+						},
+						None => return None,
 					}
 				}
 			}

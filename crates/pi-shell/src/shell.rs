@@ -1124,7 +1124,16 @@ async fn capture_new_process_group(
 async fn terminate_new_descendants(baseline: &process::DescendantBaseline, command_pgid: i32) {
 	const WAVES: u32 = 3;
 	// An unproven baseline cannot be differenced safely: pre-existing processes
-	// would look newly spawned. Fall back to the one target we know is ours.
+	// would look newly spawned, so a pid diff could signal unrelated work. Fall
+	// back to the one target we know is exclusively ours.
+	//
+	// KNOWN PLATFORM LIMITATION (pre-existing, Windows only): `kill_process_group`
+	// is a no-op on Windows and no pgid is assigned there, so an unproven baseline
+	// leaves a cancelled/timed-out Windows tree unterminated. Differencing against
+	// an empty baseline is *not* a safe substitute — on Windows it would sweep up
+	// concurrent commands' processes. A correct Windows fix needs per-command
+	// ownership (a job object or retained child handles), which is a separate
+	// design change and is tracked as follow-up rather than patched here.
 	if !baseline.observed() {
 		if command_pgid > 0 {
 			let _ = process::kill_process_group(command_pgid, process::TERM_SIGNAL);
