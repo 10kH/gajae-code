@@ -110,6 +110,33 @@ describe("task result receipts", () => {
 		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
 	});
 
+	it("preserves runtime-derived stale review disposition and rerun guidance", () => {
+		const receipt = buildTaskReceipt(
+			makeRaw({
+				reviewSource: {
+					schema: "gjc.review_source_dispatch.v1",
+					cohortId: "cohort-r1",
+					generation: 1,
+					lane: "architect",
+					snapshotId: "sha256:r1",
+					repositoryBindingDigest: "sha256:binding",
+					stateRevision: 7,
+					dispatchId: "dispatch-r1",
+					rerunCommand: "rerun architect",
+					disposition: "stale_review_delivery",
+					currentSnapshotId: "sha256:r3",
+				},
+			}),
+		);
+		expect(receipt.reviewSource).toMatchObject({
+			disposition: "stale_review_delivery",
+			snapshotId: "sha256:r1",
+			currentSnapshotId: "sha256:r3",
+			rerunCommand: "rerun architect",
+		});
+		expect(findRawTaskLeakKeys(receipt)).toEqual([]);
+	});
+
 	it("bounds child-controlled overall correctness in review receipts", () => {
 		const oversizedCorrectness = `${"safe ".repeat(40)}LEAK_SENTINEL_DO_NOT_DIGEST`;
 		const receipt = buildTaskReceipt(

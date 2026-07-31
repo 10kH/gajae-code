@@ -1747,6 +1747,40 @@
       },
       {
         "appliesToVerbs": [
+          "review-source"
+        ],
+        "name": "cohort-id",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "review-source"
+        ],
+        "name": "task-id",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "review-source"
+        ],
+        "enumValues": [
+          "cleaner",
+          "architect",
+          "qa",
+          "critic"
+        ],
+        "name": "lane",
+        "type": "enum"
+      },
+      {
+        "appliesToVerbs": [
+          "review-source"
+        ],
+        "name": "rerun-command",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
           "steer"
         ],
         "name": "goal-id",
@@ -1873,7 +1907,8 @@
           "steer",
           "classify-blocker",
           "record-critic-verdict",
-          "record-critic-gate-override"
+          "record-critic-gate-override",
+          "review-source"
         ],
         "name": "json",
         "type": "boolean"
@@ -1968,6 +2003,10 @@
       },
       {
         "name": "quality-gate",
+        "surface": "command-positional"
+      },
+      {
+        "name": "review-source",
         "surface": "command-positional"
       },
       {
