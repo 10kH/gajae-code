@@ -1565,18 +1565,26 @@ async function reapNotificationLeakArtifact(input: {
 	now: number;
 	graceMs: number;
 }): Promise<NotificationArtifactReapOutcome> {
-	if (path.basename(input.file).startsWith(".gjc-exact-unlink-placeholder-")) return "retained";
-	if (!input.fs.readEndpointFile || !input.fs.exactUnlink) return "unchanged";
-	const endpoint = await input.fs.readEndpointFile(input.file);
-	if (!(await isSingleLinkRegularFile(input.fs, input.file))) return "unchanged";
-	const age = input.now - Number(endpoint.identity.mtimeNs / 1_000_000n);
-	if (age < input.graceMs) return "unchanged";
-	return await reapNotificationArtifactExactly(
-		input.fs,
-		input.file,
-		endpoint.identity,
-		`.gjc-exact-unlink-placeholder-${crypto.randomUUID()}.json`,
-	);
+	const name = path.basename(input.file);
+	if (name.startsWith(".gjc-exact-unlink-placeholder-")) return "retained";
+	if (name.startsWith(".gjc-delete-notification-staging-temp-")) {
+		if (!input.fs.readEndpointFile || !input.fs.exactUnlink) return "unchanged";
+		const endpoint = await input.fs.readEndpointFile(input.file);
+		if (!(await isSingleLinkRegularFile(input.fs, input.file))) return "unchanged";
+		const age = input.now - Number(endpoint.identity.mtimeNs / 1_000_000n);
+		if (age < input.graceMs) return "unchanged";
+		return await reapNotificationArtifactExactly(
+			input.fs,
+			input.file,
+			endpoint.identity,
+			`.gjc-exact-unlink-placeholder-${crypto.randomUUID()}.json`,
+		);
+	}
+	if (!input.fs.stat) return "unchanged";
+	const stat = await input.fs.stat(input.file);
+	if (Number.isFinite(stat.mtimeMs) && input.now - stat.mtimeMs < input.graceMs) return "unchanged";
+	await input.fs.unlink(input.file);
+	return "removed";
 }
 
 /**
