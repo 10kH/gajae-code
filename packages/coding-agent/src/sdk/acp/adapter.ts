@@ -42,6 +42,9 @@ export type AcpReconnectFailedHandler = (error: SdkClientError) => void;
 export type AcpFrameHandler = (frame: SdkFrame) => void;
 type ReverseRequest = {
 	state: "pending" | "cancelled";
+	connectionId?: string;
+	capability?: string;
+	leaseId?: string;
 	controller?: AbortController;
 	cancelTimer?: NodeJS.Timeout;
 };
@@ -65,6 +68,15 @@ function isLifecycleOperation(operation: string): boolean {
 	);
 }
 
+const MAX_PENDING_REVERSE_PROVIDER_CALLS = 64;
+
+type ProviderCallToken = {
+	method: string;
+	promise?: Promise<unknown>;
+};
+
+const PROVIDER_CLOSE_SETTLEMENT_MS = 1_000;
+
 /**
  * Pure ACP-to-SDK adapter. It deliberately owns neither an AgentSession nor an
  * ACP bridge: all session work is performed through authenticated v3 frames.
@@ -83,10 +95,13 @@ export class AcpSdkAdapter {
 	#reclaiming?: Promise<void>;
 	#reverseRequests = new Map<string, ReverseRequest>();
 	#reconnectFailedHandlers = new Set<AcpReconnectFailedHandler>();
+	#pendingReverseProviderCalls = new Set<ProviderCallToken>();
 	#frameHandlers = new Set<AcpFrameHandler>();
 
 	#reverseCancelTtlMs: number;
 	#closed = false;
+	#closePromise?: Promise<void>;
+	#terminalCleanupUncertain = false;
 
 	constructor(options: AcpSdkAdapterOptions) {
 		this.#client = options.client ?? new SdkClient(options.url, options.token);
@@ -140,10 +155,16 @@ export class AcpSdkAdapter {
 	}
 
 	async close(): Promise<void> {
+		this.#closePromise ??= this.#closeInternal();
+		await this.#closePromise;
+	}
+
+	async #closeInternal(): Promise<void> {
 		if (this.#closed) return;
 		this.#closed = true;
 		if (this.#heartbeat) clearInterval(this.#heartbeat);
-		for (const request of this.#reverseRequests.values()) {
+		for (const [id, request] of this.#reverseRequests) {
+			if (request.state === "pending") this.#sendReverseCancellation(id, request);
 			request.controller?.abort();
 			if (request.cancelTimer) clearTimeout(request.cancelTimer);
 		}
@@ -151,7 +172,21 @@ export class AcpSdkAdapter {
 		this.#unsubscribe?.();
 		this.#unsubscribeReconnect?.();
 		this.#unsubscribeReconnectFailed?.();
-		await this.#client.close();
+
+		const terminalSettled = await this.#awaitTerminalProviderSettlement();
+		let clientError: unknown;
+		try {
+			await this.#client.close();
+		} catch (error) {
+			clientError = error;
+		}
+		if (!terminalSettled) {
+			throw new AcpSdkAdapterError(
+				"ownership_uncertain",
+				"ACP terminal provider cleanup did not settle before adapter close.",
+			);
+		}
+		if (clientError) throw clientError;
 	}
 
 	async prompt(params: JsonObject | string): Promise<unknown> {
@@ -355,7 +390,7 @@ export class AcpSdkAdapter {
 		)
 			return;
 		const controller = new AbortController();
-		const active: ReverseRequest = { state: "pending", controller };
+		const active: ReverseRequest = { state: "pending", connectionId, capability, leaseId, controller };
 		this.#reverseRequests.set(id, active);
 		try {
 			const request = frame.payload as JsonObject | undefined;
@@ -423,19 +458,175 @@ export class AcpSdkAdapter {
 
 	#abortActiveReverseRequests(): void {
 		for (const [id, request] of this.#reverseRequests) {
+			if (request.state === "pending") this.#sendReverseCancellation(id, request);
 			request.state = "cancelled";
 			request.controller?.abort();
 			this.#finishReverse(id, request);
 		}
 	}
 
+	#sendReverseCancellation(id: string, request: ReverseRequest): void {
+		if (!request.connectionId || !request.leaseId) return;
+		try {
+			const cancellation = this.#client.send({
+				type: "reverse_cancel",
+				id,
+				connectionId: request.connectionId,
+				leaseId: request.leaseId,
+			});
+			void Promise.resolve(cancellation).catch(() => {});
+		} catch {
+			// Cancellation is best effort while local retirement remains authoritative.
+		}
+	}
+
+	async #awaitTerminalProviderSettlement(): Promise<boolean> {
+		const deadline = Date.now() + PROVIDER_CLOSE_SETTLEMENT_MS;
+		for (;;) {
+			const pending = [...this.#pendingReverseProviderCalls].filter(token =>
+				["terminal.create", "terminal.kill", "terminal.release"].includes(token.method),
+			);
+			if (pending.length === 0) return !this.#terminalCleanupUncertain;
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) return false;
+			const promises = pending.flatMap(token => (token.promise ? [token.promise] : []));
+			if (promises.length === 0) {
+				await Bun.sleep(Math.min(remaining, 1));
+				continue;
+			}
+			await Promise.race([Promise.allSettled(promises), Bun.sleep(remaining)]);
+		}
+	}
+
+	#reserveProviderCalls(method: string): { call: ProviderCallToken; cleanup: ProviderCallToken[] } {
+		const cleanup =
+			method === "terminal.create"
+				? ([{ method: "terminal.kill" }, { method: "terminal.release" }] satisfies ProviderCallToken[])
+				: [];
+		const required = 1 + cleanup.length;
+		if (this.#pendingReverseProviderCalls.size + required > MAX_PENDING_REVERSE_PROVIDER_CALLS)
+			throw new AcpSdkAdapterError("acp_reverse_capacity", "ACP reverse provider call capacity reached.");
+		const call: ProviderCallToken = { method };
+		this.#pendingReverseProviderCalls.add(call);
+		for (const token of cleanup) this.#pendingReverseProviderCalls.add(token);
+		return { call, cleanup };
+	}
+
+	#releaseReservedProviderCalls(tokens: readonly ProviderCallToken[]): void {
+		for (const token of tokens) {
+			if (!token.promise) this.#pendingReverseProviderCalls.delete(token);
+		}
+	}
+
+	#startProviderCall(
+		method: string,
+		payload: JsonObject,
+		signal: AbortSignal | undefined,
+		token: ProviderCallToken,
+	): Promise<unknown> {
+		let providerCall: Promise<unknown>;
+		try {
+			if (!this.#connection) throw new AcpSdkAdapterError("acp_reverse_unavailable");
+			if (this.#connection.request)
+				providerCall = Promise.resolve(this.#connection.request(method, payload, { cancellationSignal: signal }));
+			else {
+				const target = this.#connection[method];
+				if (typeof target !== "function")
+					throw new AcpSdkAdapterError("acp_reverse_unsupported", `ACP client does not support ${method}.`);
+				providerCall = Promise.resolve((target as (params: JsonObject) => Promise<unknown>)(payload));
+			}
+		} catch (error) {
+			if (token.method === "terminal.kill" || token.method === "terminal.release")
+				this.#terminalCleanupUncertain = true;
+			this.#pendingReverseProviderCalls.delete(token);
+			return Promise.reject(error);
+		}
+		token.promise = providerCall;
+		void providerCall.then(
+			() => this.#pendingReverseProviderCalls.delete(token),
+			() => {
+				if (token.method === "terminal.kill" || token.method === "terminal.release")
+					this.#terminalCleanupUncertain = true;
+				this.#pendingReverseProviderCalls.delete(token);
+			},
+		);
+		return providerCall;
+	}
+
 	async #forwardReverse(method: string, payload: JsonObject, signal: AbortSignal): Promise<unknown> {
 		if (!method || !this.#connection) throw new AcpSdkAdapterError("acp_reverse_unavailable");
-		if (this.#connection.request)
-			return await this.#connection.request(method, payload, { cancellationSignal: signal });
-		const target = this.#connection[method];
-		if (typeof target !== "function")
-			throw new AcpSdkAdapterError("acp_reverse_unsupported", `ACP client does not support ${method}.`);
-		return await (target as (params: JsonObject) => Promise<unknown>)(payload);
+		if (signal.aborted) throw new AcpSdkAdapterError("request_cancelled", "Reverse request was cancelled.");
+		const reservation = this.#reserveProviderCalls(method);
+		const providerCall = this.#startProviderCall(method, payload, signal, reservation.call);
+		const cancelled = Promise.withResolvers<{ status: "cancelled" }>();
+		const onAbort = () => cancelled.resolve({ status: "cancelled" });
+		signal.addEventListener("abort", onAbort, { once: true });
+		if (signal.aborted) cancelled.resolve({ status: "cancelled" });
+		let outcome:
+			| { status: "resolved"; result: unknown }
+			| { status: "rejected"; error: unknown }
+			| { status: "cancelled" };
+		try {
+			outcome = await Promise.race([
+				providerCall.then(
+					result => ({ status: "resolved" as const, result }),
+					error => ({ status: "rejected" as const, error }),
+				),
+				cancelled.promise,
+			]);
+		} finally {
+			signal.removeEventListener("abort", onAbort);
+		}
+		if (outcome.status === "cancelled" || signal.aborted) {
+			if (method === "terminal.create") {
+				void providerCall
+					.then(
+						result => this.#cleanupCancelledTerminalCreate(result, reservation.cleanup),
+						() => {
+							this.#releaseReservedProviderCalls(reservation.cleanup);
+						},
+					)
+					.catch(() => {
+						this.#terminalCleanupUncertain = true;
+						this.#releaseReservedProviderCalls(reservation.cleanup);
+					});
+			} else this.#releaseReservedProviderCalls(reservation.cleanup);
+			throw new AcpSdkAdapterError("request_cancelled", "Reverse request was cancelled.");
+		}
+		this.#releaseReservedProviderCalls(reservation.cleanup);
+		if (outcome.status === "rejected") throw outcome.error;
+		return outcome.result;
+	}
+
+	async #cleanupCancelledTerminalCreate(result: unknown, cleanupTokens: readonly ProviderCallToken[]): Promise<void> {
+		const terminalId =
+			result && typeof result === "object" && typeof (result as { terminalId?: unknown }).terminalId === "string"
+				? (result as { terminalId: string }).terminalId
+				: undefined;
+		if (!terminalId || !this.#connection) {
+			this.#terminalCleanupUncertain = true;
+			this.#releaseReservedProviderCalls(cleanupTokens);
+			return;
+		}
+		for (const [index, method] of (["terminal.kill", "terminal.release"] as const).entries()) {
+			const token = cleanupTokens[index];
+			if (!token) continue;
+			let providerCall: Promise<unknown>;
+			try {
+				providerCall = this.#startProviderCall(method, { terminalId }, AbortSignal.timeout(500), token);
+			} catch {
+				this.#terminalCleanupUncertain = true;
+				this.#releaseReservedProviderCalls([token]);
+				continue;
+			}
+			const cleanupOutcome = await Promise.race([
+				providerCall.then(
+					() => "settled" as const,
+					() => "failed" as const,
+				),
+				Bun.sleep(500).then(() => "timeout" as const),
+			]);
+			if (cleanupOutcome === "failed") this.#terminalCleanupUncertain = true;
+		}
 	}
 }

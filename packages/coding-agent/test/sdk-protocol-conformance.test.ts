@@ -16,6 +16,7 @@ import {
 import {
 	MAX_REVERSE_OUTSTANDING,
 	MAX_REVERSE_PAYLOAD_BYTES,
+	MAX_REVERSE_TERMINAL_OUTPUT_PAYLOAD_BYTES,
 	REVERSE_HEARTBEAT_MS,
 	REVERSE_LEASE_TTL_MS,
 } from "../src/sdk/host/reverse-leases.js";
@@ -201,6 +202,7 @@ describe("SDK v3 TypeScript/Rust wire conformance", () => {
 			REVERSE_HEARTBEAT_MS / 1000,
 			MAX_REVERSE_OUTSTANDING,
 			MAX_REVERSE_PAYLOAD_BYTES,
-		]).toEqual([15, 5, 64, 256 * 1024]);
+			MAX_REVERSE_TERMINAL_OUTPUT_PAYLOAD_BYTES,
+		]).toEqual([15, 5, 64, 256 * 1024, 64 * 1024 * 1024]);
 	});
 });

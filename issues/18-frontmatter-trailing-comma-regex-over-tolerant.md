@@ -35,3 +35,7 @@ intended Cursor-compat fix while not masking real YAML errors.
 Restrict stripping to quoted or plain scalar-shaped values (skip lines whose
 value begins with a flow indicator `[`/`{` or a block indicator `|`/`>`). Add
 negative tests for flow collections and block scalars with trailing commas.
+
+## Resolution
+
+**Resolved on current `dev`.** The loose fallback skips values beginning with flow or block indicators (`[`, `{`, `|`, `>`), while preserving the intended scalar trailing-comma compatibility behavior.

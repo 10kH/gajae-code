@@ -32,16 +32,21 @@ import {
 	type AgentTool,
 	assertImagePlaceholdersHavePayload,
 	canContinuePersistedHistory,
+	getAgentTerminalOwnerContext,
 	type ManagedAttemptContinuationOwnership,
 	type ManagedAttemptDecision,
 	type ManagedAttemptOutcome,
 	type MidRunMaintenanceOutcome,
+	type RunCancellationDomain,
+	type RunCancellationDomainBridge,
+	type RunResourceProducerLease,
 	type RunSettlementProof,
 	resolveTelemetry,
 	type StablePrefixSnapshot,
 	ThinkingLevel,
 } from "@gajae-code/agent-core";
 import { normalizeMessagesForProvider } from "@gajae-code/agent-core/agent-loop";
+import type { AttemptRunHandle, AttemptScope, AttemptScopeAuthority } from "@gajae-code/agent-core/attempt-scope";
 import {
 	AUTO_HANDOFF_THRESHOLD_FOCUS,
 	CompactionCancelledError,
@@ -73,6 +78,7 @@ import {
 } from "@gajae-code/agent-core/compaction/pruning";
 import type {
 	AssistantMessage,
+	AttemptScopeRef,
 	Context,
 	DeveloperMessage,
 	Effort,
@@ -109,6 +115,7 @@ import {
 	type FallbackTriggerClass,
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
+import { AttemptRecordStore } from "./attempt-record-store";
 import {
 	BTW_MAX_ANSWER_UTF8_BYTES,
 	BTW_MAX_QUESTION_UTF8_BYTES,
@@ -342,7 +349,12 @@ import {
 import { assertEditableFile } from "../tools/auto-generated-guard";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import type { CheckpointState } from "../tools/checkpoint";
-import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
+import {
+	createArtifactFailurePreview,
+	type OutputMeta,
+	outputMeta,
+	wrapToolWithMetaNotice,
+} from "../tools/output-meta";
 import { normalizeLocalScheme, resolveReadPath, resolveToCwd } from "../tools/path-utils";
 import { registerResourceGcSession } from "../tools/resource-gc";
 import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo-write";
@@ -564,7 +576,11 @@ export interface AgentSessionConfig {
 	/** Tool-session factory context used to lazily attach workflow-gate-only tools. */
 	workflowGateToolSession?: ToolSession;
 	/** Current session pre-LLM message transform pipeline */
-	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
+	transformContext?: (
+		messages: AgentMessage[],
+		signal?: AbortSignal,
+		scope?: AttemptScopeRef,
+	) => AgentMessage[] | Promise<AgentMessage[]>;
 	/** Provider payload hook used by the active session request path */
 	onPayload?: SimpleStreamOptions["onPayload"];
 	/** Provider response hook used by the active session request path */
@@ -869,14 +885,17 @@ type RetryErrorClassification =
 
 const BARE_DEFAULT_WATCHDOG_ERROR =
 	/^(?:[A-Za-z][A-Za-z0-9-]*(?: [A-Za-z][A-Za-z0-9-]*){0,3} )stream (?:timed out while waiting for the first event|stalled while waiting for the next event)$/;
+const PROVIDER_FIRST_EVENT_TIMEOUT_ERROR = "Provider stream timed out while waiting for the first event";
+const WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR = `Error: ${PROVIDER_FIRST_EVENT_TIMEOUT_ERROR}`;
+const PROVIDER_FIRST_EVENT_TIMEOUT_WITHOUT_ARTICLE_ERROR = "Provider stream timed out while waiting for first event";
 const BARE_DEFAULT_CODEX_OVERLOAD_ERROR = /^Codex error event(?:: .*)? \(code=server_is_overloaded(?:, [^)]+)*\)$/;
 const KIMI_CODE_FIRST_EVENT_TIMEOUT_MESSAGES = {
 	"anthropic-messages": new Set([
-		"Provider stream timed out while waiting for the first event",
+		PROVIDER_FIRST_EVENT_TIMEOUT_ERROR,
 		"Anthropic stream timed out while waiting for the first event",
 	]),
 	"openai-completions": new Set([
-		"Provider stream timed out while waiting for the first event",
+		PROVIDER_FIRST_EVENT_TIMEOUT_ERROR,
 		"OpenAI completions stream timed out while waiting for the first event",
 	]),
 } as const;
@@ -884,11 +903,11 @@ const KIMI_CODE_FIRST_EVENT_TIMEOUT_MESSAGES = {
 const ALIBABA_TOKEN_PLAN_PROVIDER = "alibaba-token-plan";
 const ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MESSAGES = {
 	"openai-responses": new Set([
-		"Provider stream timed out while waiting for the first event",
+		PROVIDER_FIRST_EVENT_TIMEOUT_ERROR,
 		"OpenAI responses stream timed out while waiting for the first event",
 	]),
 	"openai-completions": new Set([
-		"Provider stream timed out while waiting for the first event",
+		PROVIDER_FIRST_EVENT_TIMEOUT_ERROR,
 		"OpenAI completions stream timed out while waiting for the first event",
 	]),
 } as const;
@@ -904,6 +923,25 @@ function hasBareDefaultRetryDisqualifyingFacts(message: AssistantMessage): boole
 		facts.anthropicErrorType !== undefined ||
 		facts.openaiErrorCode !== undefined ||
 		(facts.headers !== undefined && Object.keys(facts.headers).length > 0)
+	);
+}
+function terminalProviderFirstEventTimeoutIdentity(errorMessage: string): string {
+	return errorMessage === WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR
+		? PROVIDER_FIRST_EVENT_TIMEOUT_ERROR
+		: errorMessage;
+}
+function isMessageOnlyFirstEventTimeout(message: AssistantMessage): boolean {
+	if (hasBareDefaultRetryDisqualifyingFacts(message)) return false;
+	return (
+		message.errorMessage === WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR ||
+		message.errorMessage === PROVIDER_FIRST_EVENT_TIMEOUT_WITHOUT_ARTICLE_ERROR
+	);
+}
+
+function isBareDefaultWrappedFirstEventTimeout(message: AssistantMessage): boolean {
+	return (
+		message.errorMessage === WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR &&
+		!hasBareDefaultRetryDisqualifyingFacts(message)
 	);
 }
 function isBareDefaultCodexOverload(message: AssistantMessage): boolean {
@@ -1022,6 +1060,102 @@ function boundAgentBashArtifactSaveDiagnostic(error: unknown): string {
 	const message = (error instanceof Error ? error.message : String(error)).replace(/\s+/gu, " ").trim();
 	const normalized = message || "unknown storage error";
 	return truncateHeadBytes(normalized, AGENT_BASH_ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES).text;
+}
+
+const PRE_ADMISSION_ARTIFACT_SAVE_WAIT_MS = 500;
+const PRE_ADMISSION_ARTIFACT_MAX_PENDING_SAVES = 2;
+
+type PreAdmissionArtifactSaveOutcome =
+	| { kind: "saved"; saved: Awaited<ReturnType<SessionManager["saveArtifactReceipt"]>> }
+	| { kind: "failed"; error: unknown };
+
+interface PreAdmissionArtifactSaveAdmission {
+	readonly pending: Set<Promise<PreAdmissionArtifactSaveOutcome>>;
+}
+
+/**
+ * Pre-admission spills are owned by their concrete SessionManager. A stalled
+ * save remains admitted until its promise settles, so timeout does not turn
+ * each subsequent tool result into another retained full payload.
+ */
+const preAdmissionArtifactSaveAdmissions = new WeakMap<SessionManager, PreAdmissionArtifactSaveAdmission>();
+
+function preAdmissionArtifactSaveAdmissionFor(sessionManager: SessionManager): PreAdmissionArtifactSaveAdmission {
+	let admission = preAdmissionArtifactSaveAdmissions.get(sessionManager);
+	if (!admission) {
+		admission = { pending: new Set() };
+		preAdmissionArtifactSaveAdmissions.set(sessionManager, admission);
+	}
+	return admission;
+}
+
+function beginPreAdmissionArtifactSave(
+	sessionManager: SessionManager,
+	content: string,
+	toolType: string,
+): { kind: "capacity" } | { kind: "started"; outcome: Promise<PreAdmissionArtifactSaveOutcome> } {
+	const admission = preAdmissionArtifactSaveAdmissionFor(sessionManager);
+	if (admission.pending.size >= PRE_ADMISSION_ARTIFACT_MAX_PENDING_SAVES) return { kind: "capacity" };
+
+	let outcome: Promise<PreAdmissionArtifactSaveOutcome>;
+	try {
+		outcome = sessionManager.saveArtifactReceipt(content, toolType).then(
+			saved => ({ kind: "saved" as const, saved }),
+			error => ({ kind: "failed" as const, error }),
+		);
+	} catch (error) {
+		return { kind: "started", outcome: Promise.resolve({ kind: "failed", error }) };
+	}
+	admission.pending.add(outcome);
+	void outcome.then(
+		() => admission.pending.delete(outcome),
+		() => admission.pending.delete(outcome),
+	);
+	return { kind: "started", outcome };
+}
+
+function replaceToolResultWithArtifactFailurePreview(
+	message: ToolResultMessage,
+	fullText: string,
+	maxInlineBytes: number | undefined,
+	diagnostic: string,
+): void {
+	const preview = createArtifactFailurePreview(fullText, maxInlineBytes, diagnostic);
+	const existingDetails =
+		message.details && typeof message.details === "object" ? (message.details as Record<string, unknown>) : {};
+	const existingMeta =
+		existingDetails.meta && typeof existingDetails.meta === "object" ? (existingDetails.meta as OutputMeta) : {};
+	const existingTruncation = existingMeta.truncation;
+	const totalLines = fullText.length > 0 ? fullText.split("\n").length : 0;
+	const outputLines = preview.text.length > 0 ? preview.text.split("\n").length : 0;
+	const outputBytes = Buffer.byteLength(preview.text, "utf-8");
+	const truncation: NonNullable<OutputMeta["truncation"]> = {
+		...(existingTruncation ?? {}),
+		direction: "tail",
+		truncatedBy: "bytes",
+		noticeOwner: undefined,
+		totalLines,
+		totalBytes: Buffer.byteLength(fullText, "utf-8"),
+		outputLines,
+		outputBytes,
+		maxBytes: maxInlineBytes,
+		shownRange: undefined,
+		headRange: undefined,
+		tailRange: undefined,
+		nextOffset: undefined,
+		artifactId: undefined,
+		artifactVerified: false,
+		sourceCaptureIncomplete: true,
+		artifactFailureDiagnostic: diagnostic,
+	};
+	message.details = {
+		...existingDetails,
+		meta: { ...existingMeta, truncation },
+	};
+	message.content = [
+		...message.content.filter((block): block is ImageContent => block.type === "image"),
+		{ type: "text", text: preview.text },
+	];
 }
 
 function summarizeAgentBashArtifactSave(
@@ -1629,6 +1763,49 @@ export class StreamingEditFileCache {
 	}
 }
 type SessionAdmissionKind = "prompt" | "selection";
+class SessionRunCancellationDomainBridge implements RunCancellationDomainBridge {
+	#domains = new Map<string, { domain: RunCancellationDomain; controller: AbortController }>();
+	#released = new Set<string>();
+	#quarantined = new Set<string>();
+
+	open(resourceRunId: string) {
+		if (this.#quarantined.has(resourceRunId)) return { ok: false as const, reason: "quarantined" as const };
+		const existing = this.#domains.get(resourceRunId);
+		if (existing) return { ok: true as const, domain: existing.domain, created: false };
+		if (this.#released.has(resourceRunId)) return { ok: false as const, reason: "duplicate_identity" as const };
+		const controller = new AbortController();
+		const domain: RunCancellationDomain = { resourceRunId, signal: controller.signal };
+		this.#domains.set(resourceRunId, { domain, controller });
+		return { ok: true as const, domain, created: true };
+	}
+
+	lookup(resourceRunId: string): RunCancellationDomain | undefined {
+		return this.#domains.get(resourceRunId)?.domain;
+	}
+
+	abort(resourceRunId: string, reason?: unknown) {
+		const record = this.#domains.get(resourceRunId);
+		if (!record)
+			return {
+				ok: false as const,
+				reason: this.#quarantined.has(resourceRunId) ? ("quarantined" as const) : ("unknown_run" as const),
+			};
+		const newlyAborted = !record.controller.signal.aborted;
+		if (newlyAborted) record.controller.abort(reason);
+		return { ok: true as const, newlyAborted };
+	}
+
+	release(resourceRunId: string, disposition: "settled" | "quarantined"): void {
+		const record = this.#domains.get(resourceRunId);
+		if (!record) return;
+		if (disposition === "quarantined") {
+			this.#quarantined.add(resourceRunId);
+			if (!record.controller.signal.aborted) record.controller.abort();
+		}
+		this.#domains.delete(resourceRunId);
+		this.#released.add(resourceRunId);
+	}
+}
 
 type SessionAdmissionEntry = {
 	kind: SessionAdmissionKind;
@@ -1888,6 +2065,15 @@ export class AgentSession {
 	#newSessionTransition: Promise<boolean> | undefined;
 	// Extension system
 	#extensionRunner: ExtensionRunner | undefined = undefined;
+	#attemptAuthority!: AttemptScopeAuthority;
+	#attemptRecordStore!: AttemptRecordStore;
+	#activeLogicalRunId: AttemptRunHandle["logicalRunId"] | undefined;
+	#acceptRunHandle(handle: AttemptRunHandle | undefined): void {
+		// Integration doubles can accept a run without minting a handle; keep the
+		// previously recorded run id rather than throwing inside the callback.
+		if (!handle) return;
+		this.#activeLogicalRunId = handle.logicalRunId;
+	}
 
 	#turnIndex = 0;
 	#workerIntegrationScheduler: WorkerIntegrationRequestScheduler;
@@ -1917,7 +2103,11 @@ export class AgentSession {
 	// Tool registry and prompt builder for extensions
 	#toolRegistry: Map<string, AgentTool>;
 	#workflowGateToolSession: ToolSession | undefined;
-	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
+	#transformContext: (
+		messages: AgentMessage[],
+		signal?: AbortSignal,
+		scope?: AttemptScopeRef,
+	) => AgentMessage[] | Promise<AgentMessage[]>;
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
 	#onResponse: SimpleStreamOptions["onResponse"] | undefined;
 	#onSseEvent: SimpleStreamOptions["onSseEvent"] | undefined;
@@ -2009,6 +2199,10 @@ export class AgentSession {
 	#postPromptTasksPromise: Promise<void> | undefined = undefined;
 	#postPromptTasksResolve: (() => void) | undefined = undefined;
 	#postPromptTasksAbortController = new AbortController();
+	#runCancellationDomains = new SessionRunCancellationDomainBridge();
+	#postPromptLeases = new Map<string, RunResourceProducerLease>();
+	#runResourceLeaseContext = new AsyncLocalStorage<RunResourceProducerLease>();
+	#agentSessionClaimKey = {};
 
 	#streamingEditAbortTriggered = false;
 	#streamingEditCheckedLineCounts = new Map<string, number>();
@@ -2051,6 +2245,7 @@ export class AgentSession {
 	// the successor or proves it cannot. Holds prevent a false idle event while
 	// preserving the predecessor for cancellation and preflight failures.
 	#pendingAgentEndContinuationHolds = new Map<symbol, AgentSessionEvent>();
+	#deferredAgentEndLeases = new WeakMap<AgentSessionEvent, RunResourceProducerLease>();
 	#sessionSettlementPromise: Promise<void> | undefined;
 	#sessionSettlementResolve: (() => void) | undefined;
 	#agentEndPublicationInFlight = 0;
@@ -2334,6 +2529,17 @@ export class AgentSession {
 		this.#restoreDeferredAgentEndAfterContinuationFailure(pending);
 	}
 
+	#releaseDeferredAgentEndLease(pending: AgentSessionEvent | undefined): void {
+		if (!pending) return;
+		const lease = this.#deferredAgentEndLeases.get(pending);
+		if (!lease) return;
+		this.#deferredAgentEndLeases.delete(pending);
+		if (this.#postPromptLeases.get(lease.resourceRunId) === lease) {
+			this.#postPromptLeases.delete(lease.resourceRunId);
+		}
+		lease.closeDiscovery();
+	}
+
 	#isSessionSettlementPending(): boolean {
 		return (
 			this.#promptInFlightCount > 0 ||
@@ -2397,13 +2603,26 @@ export class AgentSession {
 			return;
 		}
 		this.#pendingAgentEndEmit = undefined;
+		const lease = this.#deferredAgentEndLeases.get(pending);
+		if (lease) this.#deferredAgentEndLeases.delete(pending);
 		this.#agentEndPublicationInFlight++;
-		this.#agentEndPublicationPromise = this.#publishDeferredAgentEnd(pending);
+		this.#agentEndPublicationPromise = this.#publishDeferredAgentEnd(pending, lease);
 		void this.#agentEndPublicationPromise;
 	}
 
-	async #publishDeferredAgentEnd(pending: AgentSessionEvent): Promise<void> {
-		try {
+	async #publishDeferredAgentEnd(
+		pending: AgentSessionEvent,
+		lease: RunResourceProducerLease | undefined,
+	): Promise<void> {
+		let extensionDelivery: Promise<void> | undefined;
+		const releaseLease = () => {
+			if (!lease) return;
+			if (this.#postPromptLeases.get(lease.resourceRunId) === lease) {
+				this.#postPromptLeases.delete(lease.resourceRunId);
+			}
+			lease.closeDiscovery();
+		};
+		const publish = async () => {
 			// Worker integration is first-party lifecycle persistence, not an extension
 			// hook. Make it durable before publishing the terminal boundary while user
 			// extension delivery remains asynchronous.
@@ -2411,10 +2630,21 @@ export class AgentSession {
 			// Persist before notifying synchronous subscribers: a subscriber may start a
 			// successor prompt from agent_end, whose running state must serialize after
 			// this terminal boundary rather than be overwritten by it.
-			this.#persistRuntimeStateInBackground(pending);
+			void this.#persistRuntimeStateInBackground(pending);
 			this.#emit(pending);
-			void this.#queueExtensionEvent(pending, undefined, true);
+			extensionDelivery = this.#queueExtensionEvent(
+				pending,
+				undefined,
+				true,
+				(pending as AgentSessionEvent & { scope?: AttemptScopeRef }).scope,
+			);
+		};
+		try {
+			if (lease) await this.#runResourceLeaseContext.run(lease, publish);
+			else await publish();
 		} finally {
+			if (extensionDelivery) void extensionDelivery.then(releaseLease, releaseLease);
+			else releaseLease();
 			this.#agentEndPublicationInFlight = Math.max(0, this.#agentEndPublicationInFlight - 1);
 			this.#resolveSessionSettlement();
 		}
@@ -2422,6 +2652,7 @@ export class AgentSession {
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
+		this.agent.bindRunCancellationDomainBridge(this.#runCancellationDomains, this.#agentSessionClaimKey);
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
 		this.#workerIntegrationScheduler = new WorkerIntegrationRequestScheduler(
@@ -2471,6 +2702,11 @@ export class AgentSession {
 		this.#promptTemplates = config.promptTemplates ?? [];
 		this.#slashCommands = config.slashCommands ?? [];
 		this.#extensionRunner = config.extensionRunner;
+		this.#attemptAuthority = this.agent.getAttemptScopeAuthority();
+		this.#attemptRecordStore = new AttemptRecordStore(this.#attemptAuthority);
+		if (this.#extensionRunner && typeof this.#extensionRunner.setAttemptRecordStore === "function") {
+			this.#extensionRunner.setAttemptRecordStore(this.#attemptRecordStore);
+		}
 		this.#skills = config.skills ?? [];
 		this.#skillWarnings = config.skillWarnings ?? [];
 		this.#customCommands = config.customCommands ?? [];
@@ -2483,7 +2719,10 @@ export class AgentSession {
 		this.#workflowGateToolSession = config.workflowGateToolSession;
 		this.#requestedToolNames = config.requestedToolNames;
 		this.#transformContext = config.transformContext ?? (messages => messages);
-		this.#onPayload = config.onPayload;
+		const configuredOnPayload = config.onPayload;
+		this.#onPayload = configuredOnPayload
+			? (payload, model, scope) => configuredOnPayload(payload, model, scope)
+			: undefined;
 		this.rawSseDebugBuffer = config.rawSseDebugBuffer ?? new RawSseDebugBuffer();
 		// Avoid wrapping in an `async` closure when no user callback is configured: the
 		// outer await on `#onResponse` (provider-response.ts) tolerates a sync void return,
@@ -2491,20 +2730,20 @@ export class AgentSession {
 		// shows up as ~3.5% self time in streaming profiles.
 		const configuredOnResponse = config.onResponse;
 		this.#onResponse = configuredOnResponse
-			? async (response, model) => {
+			? async (response, model, scope) => {
 					this.rawSseDebugBuffer.recordResponse(response, model);
-					await configuredOnResponse(response, model);
+					await configuredOnResponse(response, model, scope);
 				}
-			: (response, model) => {
+			: (response, model, _scope) => {
 					this.rawSseDebugBuffer.recordResponse(response, model);
 				};
 		const configuredOnSseEvent = config.onSseEvent;
 		this.#onSseEvent = configuredOnSseEvent
-			? (event, model) => {
+			? (event, model, scope) => {
 					this.rawSseDebugBuffer.recordEvent(event, model);
-					configuredOnSseEvent(event, model);
+					configuredOnSseEvent(event, model, scope);
 				}
-			: (event, model) => {
+			: (event, model, _scope) => {
 					this.rawSseDebugBuffer.recordEvent(event, model);
 				};
 		this.agent.setProviderResponseInterceptor(this.#onResponse);
@@ -3336,6 +3575,7 @@ export class AgentSession {
 		event: AgentSessionEvent,
 		turnGeneration?: number,
 		workerIntegrationSettled = false,
+		scope?: AttemptScopeRef,
 	): Promise<void> {
 		// Streaming events observed after turn_end belong to no live extension turn.
 		// Events already queued before that boundary must drain in FIFO order, unless
@@ -3351,7 +3591,7 @@ export class AgentSession {
 			turnGeneration === undefined || turnGeneration === this.#extensionTurnGeneration;
 		const emit = async () => {
 			if (!belongsToCurrentTurn()) return;
-			await this.#emitExtensionEvent(event, belongsToCurrentTurn, workerIntegrationSettled);
+			await this.#emitExtensionEvent(event, belongsToCurrentTurn, workerIntegrationSettled, scope);
 		};
 		const queued = this.#queuedExtensionEvents.then(emit, emit);
 		this.#queuedExtensionEvents = queued.catch(() => {});
@@ -3364,38 +3604,103 @@ export class AgentSession {
 	}
 
 	#trackAgentEvent = (event: AgentEvent): Promise<void> => {
-		const activePromptHandle = this.activePromptHandle;
+		const terminalOwner = event.type === "agent_end" ? getAgentTerminalOwnerContext(event) : undefined;
+		const maintenanceCheckpoint =
+			event.type === "agent_end" && event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted";
+		const terminalClaim =
+			maintenanceCheckpoint || !terminalOwner
+				? undefined
+				: this.agent.resourceLedger.claimProducer(
+						terminalOwner.resourceRunId,
+						terminalOwner.domain,
+						this.#agentSessionClaimKey,
+					);
+		// A maintenance checkpoint is not a terminal publication. Capture the current
+		// logical handle synchronously, then reserve its producer before this listener
+		// creates any async work. True terminals must never fall back to this mutable
+		// session state: their owner context is the only authority.
+		const activePromptHandle = maintenanceCheckpoint
+			? this.activePromptHandle
+			: event.type === "agent_end"
+				? terminalOwner?.resourceRunId
+				: this.activePromptHandle;
+		const domain = activePromptHandle ? this.#runCancellationDomains.lookup(activePromptHandle) : undefined;
+		const eventReservation = terminalClaim?.ok
+			? terminalClaim
+			: activePromptHandle && domain
+				? this.agent.resourceLedger.reserveProducer(
+						activePromptHandle,
+						domain,
+						"post_prompt",
+						"agent-session-event",
+					)
+				: undefined;
+		const eventLease = eventReservation?.ok ? eventReservation.lease : undefined;
 		const agentEndHandled = event.type === "agent_end" ? Promise.withResolvers<void>() : undefined;
 		if (agentEndHandled) this.#agentEndHandlingPromise = agentEndHandled.promise;
 		this.#agentEventHandlersInFlight++;
 		const handler = (async (): Promise<void> => {
 			try {
-				await this.#handleAgentEvent(event, activePromptHandle);
+				// A terminal that carries owner context must win the exact producer claim;
+				// a superseded run's late agent_end never falls back to a successor's
+				// handle. Externally emitted terminals carry no owner context and own no
+				// run resources, so they keep the ownerless handling path unless a
+				// prompt-owned run is actually active.
+				if (event.type === "agent_end" && !maintenanceCheckpoint) {
+					if (terminalOwner ? !terminalClaim?.ok : this.activePromptHandle !== undefined) return;
+				}
+				// A prompt-owned event with a captured handle must have obtained an exact
+				// producer lease before its handler was created. Failed ownership never
+				// schedules prompt work or falls back to a successor's handle.
+				if (activePromptHandle && !eventLease) return;
+				if (eventLease && event.type === "agent_end")
+					this.#postPromptLeases.set(eventLease.resourceRunId, eventLease);
+				if (eventLease) {
+					await this.#runResourceLeaseContext.run(eventLease, () =>
+						this.#handleAgentEvent(event, activePromptHandle),
+					);
+				} else {
+					await this.#handleAgentEvent(event, activePromptHandle);
+				}
 			} catch (error) {
 				logger.warn("Agent event handler failed", { event: event.type, error: String(error) });
 			} finally {
+				if (eventLease) {
+					const pendingAgentEnd =
+						event.type === "agent_end" && !maintenanceCheckpoint && this.#pendingAgentEndEmit === event
+							? this.#pendingAgentEndEmit
+							: undefined;
+					if (pendingAgentEnd) {
+						this.#deferredAgentEndLeases.set(pendingAgentEnd, eventLease);
+					} else {
+						if (event.type === "agent_end" && this.#postPromptLeases.get(eventLease.resourceRunId) === eventLease)
+							this.#postPromptLeases.delete(eventLease.resourceRunId);
+						eventLease.closeDiscovery();
+					}
+				}
 				this.#agentEventHandlersInFlight = Math.max(0, this.#agentEventHandlersInFlight - 1);
 				this.#flushPendingAgentEnd();
 				agentEndHandled?.resolve();
 			}
 		})();
-		if (activePromptHandle) {
-			this.agent.resourceLedger.track(activePromptHandle, "post_prompt", "agent-session-event", handler);
-		}
+		if (eventLease) eventLease.track("post_prompt", "agent-session-event", handler);
 		return handler;
 	};
 
-	#persistRuntimeStateInBackground(event: AgentSessionEvent): void {
-		void persistCoordinatorRuntimeStateFromEvent(event, {
-			sessionId: this.sessionId,
-			cwd: this.sessionManager.getCwd(),
-			sessionFile: this.sessionManager.getSessionFile(),
-		}).catch(() => {
+	async #persistRuntimeStateInBackground(event: AgentSessionEvent): Promise<void> {
+		try {
+			await persistCoordinatorRuntimeStateFromEvent(event, {
+				sessionId: this.sessionId,
+				cwd: this.sessionManager.getCwd(),
+				sessionFile: this.sessionManager.getSessionFile(),
+			});
+		} catch {
 			logger.warn("Failed to persist coordinator runtime state", { event: event.type });
-		});
+		}
 	}
 
 	async #emitSessionEvent(event: AgentSessionEvent): Promise<void> {
+		const attemptScope = (event as AgentSessionEvent & { scope?: AttemptScope }).scope;
 		if (event.type === "turn_start") {
 			this.#extensionTurnGeneration++;
 			this.#closedExtensionTurnGeneration = undefined;
@@ -3420,7 +3725,7 @@ export class AgentSession {
 			this.#emit(event);
 			if (this.#hasStreamingExtensionHandlers()) {
 				__agentSessionPerfCounters.messageUpdateExtensionQueues += 1;
-				void this.#queueExtensionEvent(event, this.#extensionTurnGeneration);
+				void this.#queueExtensionEvent(event, this.#extensionTurnGeneration, false, attemptScope);
 			}
 			return;
 		}
@@ -3449,7 +3754,7 @@ export class AgentSession {
 		if (event.type === "agent_end") {
 			// Start the durable terminal write before synchronous subscribers can
 			// re-enter prompt(), so a successor's running transition serializes after it.
-			void persistRuntimeState();
+			await persistRuntimeState();
 			this.#emit(event);
 			await this.#emitExtensionEvent(event);
 			return;
@@ -3477,39 +3782,101 @@ export class AgentSession {
 		const textParts = message.content.flatMap(block => (block.type === "text" ? [block.text] : []));
 		if (textParts.length === 0) return;
 		const fullText = textParts.join("\n");
+		const configuredInlineKiB = this.settings.get("tools.maxInlineResultBytes");
+		const maxInlineBytes =
+			configuredInlineKiB > 0 ? Math.max(1024, Math.floor(configuredInlineKiB * 1024)) : undefined;
+		const totalBytes = Buffer.byteLength(fullText, "utf-8");
+		const exceedsInlineCap = maxInlineBytes !== undefined && totalBytes > maxInlineBytes;
 		const contextWindow = this.model?.contextWindow;
 		const thresholdTokens = Math.min(
 			8_000,
 			contextWindow && contextWindow > 0 ? Math.floor(contextWindow * 0.05) : 8_000,
 		);
-		if (thresholdTokens <= 0 || estimateTextTokensHeuristic(fullText) <= thresholdTokens) return;
+		// The inline byte cap is an independent admission bound and must be checked
+		// before token heuristics can opt this result out of spilling.
+		if (!exceedsInlineCap && (thresholdTokens <= 0 || estimateTextTokensHeuristic(fullText) <= thresholdTokens))
+			return;
 
+		const saveAdmission = beginPreAdmissionArtifactSave(this.sessionManager, fullText, "tool-result");
+		if (saveAdmission.kind === "capacity") {
+			replaceToolResultWithArtifactFailurePreview(
+				message,
+				fullText,
+				maxInlineBytes,
+				"artifact save capacity exhausted; the previous save is still settling",
+			);
+			return;
+		}
 		try {
-			const artifactId = await this.sessionManager.saveArtifact(fullText, "tool-result");
-			if (!artifactId) return;
-			const digest = crypto.createHash("sha256").update(fullText).digest("hex");
-			const preview = createPreAdmissionArtifactSpillPreview(fullText, artifactId, digest);
-			const spillMeta = outputMeta()
-				.truncationFromText(preview, {
-					direction: "middle",
-					totalLines: fullText.split("\n").length,
-					totalBytes: Buffer.byteLength(fullText, "utf-8"),
-					artifactId,
-				})
-				.get();
+			const saveOutcome = await Promise.race([
+				saveAdmission.outcome,
+				Bun.sleep(PRE_ADMISSION_ARTIFACT_SAVE_WAIT_MS).then(() => ({ kind: "timeout" as const })),
+			]);
+			if (saveOutcome.kind !== "saved" || !saveOutcome.saved) {
+				const diagnostic =
+					saveOutcome.kind === "timeout"
+						? `did not settle within ${PRE_ADMISSION_ARTIFACT_SAVE_WAIT_MS}ms`
+						: saveOutcome.kind === "failed"
+							? boundAgentBashArtifactSaveDiagnostic(saveOutcome.error)
+							: "artifact storage is unavailable";
+				replaceToolResultWithArtifactFailurePreview(message, fullText, maxInlineBytes, diagnostic);
+				return;
+			}
+			const saved = saveOutcome.saved;
 			const existingDetails = message.details;
 			const detailRecord =
 				existingDetails && typeof existingDetails === "object" ? (existingDetails as Record<string, unknown>) : {};
 			const existingMeta =
-				detailRecord.meta && typeof detailRecord.meta === "object"
-					? (detailRecord.meta as Record<string, unknown>)
-					: {};
-			message.details = { ...detailRecord, meta: { ...existingMeta, ...spillMeta } };
+				detailRecord.meta && typeof detailRecord.meta === "object" ? (detailRecord.meta as OutputMeta) : {};
+			const existingTruncation = existingMeta.truncation;
+			const priorLoss = existingTruncation !== undefined;
+			const digest = crypto.createHash("sha256").update(fullText).digest("hex");
+			const sourceCaptureIncomplete = priorLoss || !saved.complete || undefined;
+			const preview = createPreAdmissionArtifactSpillPreview(fullText, saved.id, digest, {
+				maxInlineBytes,
+				fullOutput: saved.complete && !priorLoss,
+			});
+			const spillMeta = outputMeta()
+				.truncationFromText(preview, {
+					direction: "middle",
+					totalLines: fullText.split("\n").length,
+					totalBytes,
+					artifactId: saved.id,
+					artifactVerified: true,
+					sourceCaptureIncomplete,
+					...(maxInlineBytes !== undefined ? { maxBytes: maxInlineBytes } : {}),
+				})
+				.get();
+			const spillTruncation = spillMeta?.truncation;
+			const artifactTruncatedBytes =
+				Math.max(existingTruncation?.artifactTruncatedBytes ?? 0, saved.omittedBytes ?? 0) || undefined;
+			const mergedTruncation = spillTruncation
+				? {
+						...existingTruncation,
+						...spillTruncation,
+						artifactId: saved.id,
+						artifactVerified: true,
+						artifactTruncatedBytes,
+						sourceTruncatedBytes: existingTruncation?.sourceTruncatedBytes,
+						sourceCaptureIncomplete,
+						columnDroppedBytes: existingTruncation?.columnDroppedBytes,
+						shownRange: sourceCaptureIncomplete ? undefined : spillTruncation.shownRange,
+						headRange: sourceCaptureIncomplete ? undefined : spillTruncation.headRange,
+						tailRange: sourceCaptureIncomplete ? undefined : spillTruncation.tailRange,
+						nextOffset: sourceCaptureIncomplete ? undefined : spillTruncation.nextOffset,
+					}
+				: existingTruncation;
+			message.details = {
+				...detailRecord,
+				meta: { ...existingMeta, ...spillMeta, truncation: mergedTruncation },
+			};
 			message.content = [
 				...message.content.filter((block): block is ImageContent => block.type === "image"),
 				{ type: "text", text: preview },
 			];
 		} catch (error) {
+			const diagnostic = boundAgentBashArtifactSaveDiagnostic(error);
+			replaceToolResultWithArtifactFailurePreview(message, fullText, maxInlineBytes, diagnostic);
 			logger.warn("Failed to spill oversized tool result before context admission", {
 				toolName: message.toolName,
 				error: error instanceof Error ? error.message : String(error),
@@ -3534,6 +3901,11 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	#handleAgentEvent = async (event: AgentEvent, activePromptHandle?: string): Promise<void> => {
+		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
+		if ((event.type === "agent_start" || event.type === "turn_start") && attemptScope) {
+			this.#attemptRecordStore.register(attemptScope);
+			this.#attemptRecordStore.establishClean(attemptScope);
+		}
 		if (this.#extensionRunner?.hasHandlers(event.type)) this.#markRetryReplayUnsafe();
 		if (
 			event.type === "tool_execution_start" ||
@@ -4048,6 +4420,7 @@ export class AgentSession {
 						generation: maintenanceGeneration,
 						skipCompactionCheck: true,
 						resourceRunId: activePromptHandle,
+						maintenanceContinuation: true,
 					});
 				}
 				return;
@@ -4128,10 +4501,11 @@ export class AgentSession {
 			}
 			this.#resolveRetry();
 
-			const compactionTask = this.#checkCompaction(msg, true, undefined, activePromptHandle);
-			this.#trackPostPromptTask(
-				compactionTask.then(() => undefined),
-				activePromptHandle,
+			const compactionTask = this.#schedulePostPromptTask(
+				async () => {
+					await this.#checkCompaction(msg, true, undefined, activePromptHandle);
+				},
+				{ resourceRunId: activePromptHandle },
 			);
 			await compactionTask;
 			// Check for incomplete todos only after a final assistant stop, not intermediate tool-use turns.
@@ -4196,29 +4570,52 @@ export class AgentSession {
 		this.#postPromptTasksPromise = undefined;
 	}
 
-	#trackPostPromptTask(task: Promise<void>, resourceRunId = this.activePromptHandle): void {
+	#trackPostPromptTask(task: Promise<void>, lease?: RunResourceProducerLease, leaseTask: Promise<void> = task): void {
 		this.#postPromptTasks.add(task);
 		this.#ensurePostPromptTasksPromise();
-		if (resourceRunId) {
-			this.agent.resourceLedger.track(resourceRunId, "post_prompt", "agent-session", task);
+		if (lease) {
+			lease.track("post_prompt", "agent-session", leaseTask);
+			void leaseTask.catch(() => {}).finally(() => lease.closeDiscovery());
 		}
 		void task
 			.catch(() => {})
 			.finally(() => {
 				this.#postPromptTasks.delete(task);
-				if (this.#postPromptTasks.size === 0) {
-					this.#resolvePostPromptTasks();
-				}
+				if (this.#postPromptTasks.size === 0) this.#resolvePostPromptTasks();
 			});
 	}
 
 	#schedulePostPromptTask(
 		task: (signal: AbortSignal) => Promise<void>,
-		options?: { delayMs?: number; generation?: number; onSkip?: () => void; resourceRunId?: string },
+		options?: {
+			delayMs?: number;
+			generation?: number;
+			onSkip?: () => void;
+			resourceRunId?: string;
+			leaseTask?: Promise<void>;
+		},
 	): Promise<void> {
 		const delayMs = options?.delayMs ?? 0;
-		const signal = this.#postPromptTasksAbortController.signal;
-		const scheduled = (async () => {
+		const resourceRunId = options?.resourceRunId;
+		const contextualLease = this.#runResourceLeaseContext.getStore();
+		const parentLease =
+			resourceRunId && contextualLease?.resourceRunId === resourceRunId
+				? contextualLease
+				: resourceRunId
+					? this.#postPromptLeases.get(resourceRunId)
+					: undefined;
+		const domain = resourceRunId ? this.#runCancellationDomains.lookup(resourceRunId) : undefined;
+		const reservation = parentLease
+			? parentLease.fork(parentLease.domain, "post_prompt", "agent-session")
+			: resourceRunId && domain
+				? this.agent.resourceLedger.reserveProducer(resourceRunId, domain, "post_prompt", "agent-session")
+				: undefined;
+		if (resourceRunId && !reservation?.ok) {
+			options?.onSkip?.();
+			return Promise.resolve();
+		}
+		const signal = reservation?.ok ? reservation.lease.signal : this.#postPromptTasksAbortController.signal;
+		const runScheduled = async () => {
 			if (delayMs > 0) {
 				try {
 					await scheduler.wait(delayMs, { signal });
@@ -4236,8 +4633,11 @@ export class AgentSession {
 				return;
 			}
 			await task(signal);
-		})();
-		this.#trackPostPromptTask(scheduled, options?.resourceRunId);
+		};
+		const scheduled = reservation?.ok
+			? this.#runResourceLeaseContext.run(reservation.lease, runScheduled)
+			: runScheduled();
+		this.#trackPostPromptTask(scheduled, reservation?.ok ? reservation.lease : undefined, options?.leaseTask);
 		return scheduled;
 	}
 
@@ -4256,6 +4656,7 @@ export class AgentSession {
 		rescheduleOnBusy?: boolean;
 		onError?: (error: unknown) => void;
 		resourceRunId?: string;
+		maintenanceContinuation?: boolean;
 	}): Promise<void> {
 		const predecessorAgentEndHold = options?.suppressPredecessorAgentEnd
 			? this.#reserveDeferredAgentEndForContinuation()
@@ -4277,12 +4678,13 @@ export class AgentSession {
 			options?.onError?.(error);
 		};
 		const scheduledGeneration = options?.generation;
-		const signal = this.#postPromptTasksAbortController.signal;
-		const scheduleAttempt = (delayMs = options?.delayMs): Promise<void> =>
-			this.#schedulePostPromptTask(
-				async () => {
+		const scheduleAttempt = (delayMs = options?.delayMs): Promise<void> => {
+			const leaseSettlement = Promise.withResolvers<void>();
+			const settleLease = () => leaseSettlement.resolve();
+			return this.#schedulePostPromptTask(
+				async scheduledSignal => {
 					const canContinue = (): boolean => {
-						if (signal.aborted || this.#isDisposed) {
+						if (scheduledSignal.aborted || this.#isDisposed) {
 							skip("aborted_signal");
 							return false;
 						}
@@ -4300,13 +4702,16 @@ export class AgentSession {
 						}
 						return true;
 					};
-					if (!canContinue()) return;
+					if (!canContinue()) {
+						settleLease();
+						return;
+					}
 					try {
 						if (!options?.skipCompactionCheck) {
 							await this.#checkEstimatedContextBeforePrompt();
 							if (!canContinue()) return;
 						}
-						if (signal.aborted) {
+						if (scheduledSignal.aborted) {
 							skip("aborted_signal");
 							return;
 						}
@@ -4326,23 +4731,40 @@ export class AgentSession {
 							return;
 						}
 						const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
+						let predecessorAccepted = false;
+						const releasePredecessor = () => {
+							if (predecessorAccepted) return;
+							predecessorAccepted = true;
+							this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
+						};
 						const startsQueuedSuccessor =
 							this.agent.state.messages.at(-1)?.role === "assistant" && this.agent.hasQueuedMessages();
 						try {
 							await this.agent.continue({
 								...this.#managedFallbackPromptOptions(),
+								maintenanceContinuation: options?.maintenanceContinuation,
 								// Reset only after continue() has claimed the queued turn. Skipped or stale
 								// continuations retain predecessor accounting, and resetAttemptBudget keeps
 								// the sticky fallback cursor unchanged.
-								onRunAccepted: startsQueuedSuccessor
-									? () => {
-											this.#defaultFallbackChain().resetAttemptBudget();
-											this.#overflowMaintenanceAttempts = 0;
-										}
-									: undefined,
+								onRunAccepted: (handle: AttemptRunHandle) => {
+									this.#acceptRunHandle(handle);
+									settleLease();
+									releasePredecessor();
+									if (startsQueuedSuccessor) {
+										this.#defaultFallbackChain().resetAttemptBudget();
+										this.#overflowMaintenanceAttempts = 0;
+									}
+								},
 							});
+							releasePredecessor();
 						} catch (error) {
-							if (options?.rescheduleOnBusy && this.#isAgentBusyError(error) && !terminalized && canContinue()) {
+							if (
+								options?.rescheduleOnBusy &&
+								this.#isAgentBusyError(error) &&
+								!predecessorAccepted &&
+								!terminalized &&
+								canContinue()
+							) {
 								this.#retainDeferredAgentEndAfterContinuationBusy(predecessorAgentEndHold, predecessorAgentEnd);
 								logger.debug("agent.continue busy after scheduling; rescheduling", {
 									error: error.message,
@@ -4350,19 +4772,27 @@ export class AgentSession {
 								void scheduleAttempt(100);
 								return;
 							}
-							this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
+							if (!predecessorAccepted)
+								this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
 							throw error;
 						}
 					} catch (error) {
 						fail(error);
+					} finally {
+						settleLease();
 					}
 				},
 				{
 					delayMs,
-					onSkip: () => skip("aborted_signal"),
+					onSkip: () => {
+						settleLease();
+						skip("aborted_signal");
+					},
 					resourceRunId: options?.resourceRunId,
+					leaseTask: leaseSettlement.promise,
 				},
 			);
+		};
 		return scheduleAttempt();
 	}
 
@@ -4433,7 +4863,7 @@ export class AgentSession {
 
 		const compactionSettings = this.settings.getGroup("compaction");
 		if (compactionSettings.autoContinue !== false) {
-			this.#scheduleAutoContinuePrompt(generation, false);
+			this.#scheduleAutoContinuePrompt(generation, false, resourceRunId);
 			return true;
 		}
 
@@ -4441,11 +4871,13 @@ export class AgentSession {
 		return false;
 	}
 
-	#scheduleAutoContinuePrompt(generation: number, requireUnfinishedWork = true): void {
+	#scheduleAutoContinuePrompt(generation: number, requireUnfinishedWork = true, resourceRunId?: string): void {
 		const predecessorAgentEndHold = this.#reserveDeferredAgentEndForContinuation();
 		const scheduledGeneration = generation;
-		const signal = this.#postPromptTasksAbortController.signal;
-		const continuationAuthorized = async (hasPendingNextTurnMessages = false): Promise<boolean> => {
+		const continuationAuthorized = async (
+			signal: AbortSignal,
+			hasPendingNextTurnMessages = false,
+		): Promise<boolean> => {
 			const snapshot = await this.#compactionStateSnapshot();
 			if (signal.aborted) {
 				this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
@@ -4467,60 +4899,67 @@ export class AgentSession {
 			if (!authorized) this.emitNotice("info", "Auto-continue skipped: no unfinished work detected");
 			return authorized;
 		};
-		const continuePrompt = async () => {
-			await this.#promptWithMessage(
-				{
-					role: "developer",
-					content: [{ type: "text", text: autoContinuePrompt }],
-					attribution: "agent",
-					timestamp: Date.now(),
+		const scheduleAttempt = (delayMs = 0) => {
+			let rescheduled = false;
+			void this.#schedulePostPromptTask(
+				async signal => {
+					try {
+						await Promise.resolve();
+						if (signal.aborted) {
+							this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
+							return;
+						}
+						if (this.#promptGeneration !== scheduledGeneration) {
+							this.#logCompactionContinuationSkipped("auto_continue_prompt", "generation_changed");
+							return;
+						}
+						if (!(await continuationAuthorized(signal))) return;
+						await this.#promptWithMessage(
+							{
+								role: "developer",
+								content: [{ type: "text", text: autoContinuePrompt }],
+								attribution: "agent",
+								timestamp: Date.now(),
+							},
+							autoContinuePrompt,
+							{
+								skipPostPromptRecoveryWait: true,
+								skipCompactionCheck: true,
+								predecessorAgentEndHold,
+								onFinalPreflight: ({ hasPendingNextTurnMessages }) =>
+									continuationAuthorized(signal, hasPendingNextTurnMessages),
+							},
+						);
+					} catch (error) {
+						if (signal.aborted) {
+							this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
+							return;
+						}
+						if (this.#isAgentBusyError(error) && this.#promptGeneration === scheduledGeneration) {
+							logger.debug("Auto-compaction continuation busy; rescheduling", {
+								source: "auto_continue_prompt",
+								reason: "queue_drained",
+								error: error.message,
+							});
+							rescheduled = true;
+							scheduleAttempt(100);
+							return;
+						}
+						this.#logCompactionContinuationError("auto_continue_prompt", error);
+					} finally {
+						if (!rescheduled) this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
+					}
 				},
-				autoContinuePrompt,
 				{
-					skipPostPromptRecoveryWait: true,
-					skipCompactionCheck: true,
-					predecessorAgentEndHold,
-					onFinalPreflight: ({ hasPendingNextTurnMessages }) => continuationAuthorized(hasPendingNextTurnMessages),
+					delayMs,
+					generation: scheduledGeneration,
+					resourceRunId,
+					onSkip: () => {
+						this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
+						this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
+					},
 				},
 			);
-		};
-		const scheduleAttempt = (delayMs = 0) => {
-			const attempt = (async () => {
-				let rescheduled = false;
-				try {
-					if (delayMs > 0) await scheduler.wait(delayMs, { signal });
-					await Promise.resolve();
-					if (signal.aborted) {
-						this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
-						return;
-					}
-					if (this.#promptGeneration !== scheduledGeneration) {
-						this.#logCompactionContinuationSkipped("auto_continue_prompt", "generation_changed");
-						return;
-					}
-					if (!(await continuationAuthorized())) return;
-					await continuePrompt();
-				} catch (error) {
-					if (signal.aborted) {
-						this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
-						return;
-					}
-					if (this.#isAgentBusyError(error) && this.#promptGeneration === scheduledGeneration) {
-						logger.debug("Auto-compaction continuation busy; rescheduling", {
-							source: "auto_continue_prompt",
-							reason: "queue_drained",
-							error: error.message,
-						});
-						rescheduled = true;
-						scheduleAttempt(100);
-						return;
-					}
-					this.#logCompactionContinuationError("auto_continue_prompt", error);
-				} finally {
-					if (!rescheduled) this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
-				}
-			})();
-			this.#trackPostPromptTask(attempt);
 		};
 		scheduleAttempt();
 	}
@@ -5266,163 +5705,200 @@ export class AgentSession {
 		event: AgentSessionEvent,
 		continueWhile?: () => boolean,
 		workerIntegrationSettled = false,
+		scope?: AttemptScopeRef,
 	): Promise<void> {
 		if (event.type === "agent_end" && !workerIntegrationSettled) {
 			await this.#flushWorkerIntegrationForAgentEnd();
 		}
-		if (!this.#extensionRunner) return;
-		if (event.type === "agent_start") {
-			this.#turnIndex = 0;
-			await this.#extensionRunner.emit({ type: "agent_start" });
-		} else if (event.type === "agent_end") {
-			await this.#extensionRunner.emit({
-				type: "agent_end",
-				messages: event.messages,
-				stopReason: event.stopReason,
-			});
-		} else if (event.type === "turn_start") {
-			const hookEvent: TurnStartEvent = {
-				type: "turn_start",
-				turnIndex: this.#turnIndex,
-				timestamp: Date.now(),
-			};
-			await this.#extensionRunner.emit(hookEvent);
-		} else if (event.type === "turn_end") {
-			const hookEvent: TurnEndEvent = {
-				type: "turn_end",
-				turnIndex: this.#turnIndex,
-				message: event.message,
-				toolResults: event.toolResults,
-			};
-			await this.#extensionRunner.emit(hookEvent);
-			this.#turnIndex++;
-		} else if (event.type === "message_start") {
-			const extensionEvent: MessageStartEvent = {
-				type: "message_start",
-				message: event.message,
-			};
-			await this.#extensionRunner.emit(extensionEvent);
-		} else if (event.type === "message_update") {
-			const extensionEvent: MessageUpdateEvent = {
-				type: "message_update",
-				message: event.message,
-				assistantMessageEvent: event.assistantMessageEvent,
-			};
-			await this.#extensionRunner.emit(extensionEvent, continueWhile);
-			if (continueWhile && !continueWhile()) return;
-			if (event.assistantMessageEvent.type === "reasoning_summary_start") {
-				const reasoningEvent: ReasoningSummaryStartEvent = {
-					type: "reasoning_summary_start",
-					message: event.message,
-					contentIndex: event.assistantMessageEvent.contentIndex,
+		const deliveryScope = scope ?? (event as AgentSessionEvent & { scope?: AttemptScopeRef }).scope;
+		const isTerminalAgentEnd =
+			event.type === "agent_end" && !(event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted");
+		const finishAttempt = () => {
+			if (!isTerminalAgentEnd) return;
+			if (deliveryScope) this.#attemptRecordStore.retire(deliveryScope as AttemptScope);
+			this.#activeLogicalRunId = undefined;
+		};
+		if (!this.#extensionRunner) {
+			finishAttempt();
+			return;
+		}
+
+		try {
+			if (event.type === "agent_start") {
+				this.#turnIndex = 0;
+				await this.#extensionRunner.emit({ type: "agent_start" }, undefined, deliveryScope);
+			} else if (event.type === "agent_end") {
+				await this.#extensionRunner.emit(
+					{
+						type: "agent_end",
+						messages: event.messages,
+						stopReason: event.stopReason,
+					},
+					undefined,
+					deliveryScope,
+				);
+			} else if (event.type === "turn_start") {
+				const hookEvent: TurnStartEvent = {
+					type: "turn_start",
+					turnIndex: this.#turnIndex,
+					timestamp: Date.now(),
 				};
-				if (this.#extensionRunner.hasHandlers("reasoning_summary_start")) this.#markRetryReplayUnsafe();
-				await this.#extensionRunner.emit(reasoningEvent, continueWhile);
-			} else if (event.assistantMessageEvent.type === "reasoning_summary_delta") {
-				const reasoningEvent: ReasoningSummaryDeltaEvent = {
-					type: "reasoning_summary_delta",
+				await this.#extensionRunner.emit(hookEvent, undefined, deliveryScope);
+			} else if (event.type === "turn_end") {
+				const hookEvent: TurnEndEvent = {
+					type: "turn_end",
+					turnIndex: this.#turnIndex,
 					message: event.message,
-					contentIndex: event.assistantMessageEvent.contentIndex,
-					delta: event.assistantMessageEvent.delta,
+					toolResults: event.toolResults,
 				};
-				if (this.#extensionRunner.hasHandlers("reasoning_summary_delta")) this.#markRetryReplayUnsafe();
-				await this.#extensionRunner.emit(reasoningEvent, continueWhile);
-			} else if (event.assistantMessageEvent.type === "reasoning_summary_end") {
-				const reasoningEvent: ReasoningSummaryEndEvent = {
-					type: "reasoning_summary_end",
+				await this.#extensionRunner.emit(hookEvent, undefined, deliveryScope);
+				this.#turnIndex++;
+			} else if (event.type === "message_start") {
+				const extensionEvent: MessageStartEvent = {
+					type: "message_start",
 					message: event.message,
-					contentIndex: event.assistantMessageEvent.contentIndex,
-					content: event.assistantMessageEvent.content,
 				};
-				if (this.#extensionRunner.hasHandlers("reasoning_summary_end")) this.#markRetryReplayUnsafe();
-				await this.#extensionRunner.emit(reasoningEvent, continueWhile);
+				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
+			} else if (event.type === "message_update") {
+				const extensionEvent: MessageUpdateEvent = {
+					type: "message_update",
+					message: event.message,
+					assistantMessageEvent: event.assistantMessageEvent,
+				};
+				await this.#extensionRunner.emit(extensionEvent, continueWhile, deliveryScope);
+				if (continueWhile && !continueWhile()) return;
+				if (event.assistantMessageEvent.type === "reasoning_summary_start") {
+					const reasoningEvent: ReasoningSummaryStartEvent = {
+						type: "reasoning_summary_start",
+						message: event.message,
+						contentIndex: event.assistantMessageEvent.contentIndex,
+					};
+					if (this.#extensionRunner.hasHandlers("reasoning_summary_start")) this.#markRetryReplayUnsafe();
+					await this.#extensionRunner.emit(reasoningEvent, continueWhile, deliveryScope);
+				} else if (event.assistantMessageEvent.type === "reasoning_summary_delta") {
+					const reasoningEvent: ReasoningSummaryDeltaEvent = {
+						type: "reasoning_summary_delta",
+						message: event.message,
+						contentIndex: event.assistantMessageEvent.contentIndex,
+						delta: event.assistantMessageEvent.delta,
+					};
+					if (this.#extensionRunner.hasHandlers("reasoning_summary_delta")) this.#markRetryReplayUnsafe();
+					await this.#extensionRunner.emit(reasoningEvent, continueWhile, deliveryScope);
+				} else if (event.assistantMessageEvent.type === "reasoning_summary_end") {
+					const reasoningEvent: ReasoningSummaryEndEvent = {
+						type: "reasoning_summary_end",
+						message: event.message,
+						contentIndex: event.assistantMessageEvent.contentIndex,
+						content: event.assistantMessageEvent.content,
+					};
+					if (this.#extensionRunner.hasHandlers("reasoning_summary_end")) this.#markRetryReplayUnsafe();
+					await this.#extensionRunner.emit(reasoningEvent, continueWhile, deliveryScope);
+				}
+			} else if (event.type === "message_end") {
+				const extensionEvent: MessageEndEvent = {
+					type: "message_end",
+					message: event.message,
+				};
+				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
+			} else if (event.type === "tool_execution_start") {
+				const extensionEvent: ToolExecutionStartEvent = {
+					type: "tool_execution_start",
+					toolCallId: event.toolCallId,
+					toolName: event.toolName,
+					args: event.args,
+					intent: event.intent,
+				};
+				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
+			} else if (event.type === "tool_execution_update") {
+				const extensionEvent: ToolExecutionUpdateEvent = {
+					type: "tool_execution_update",
+					toolCallId: event.toolCallId,
+					toolName: event.toolName,
+					args: event.args,
+					partialResult: event.partialResult,
+				};
+				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
+			} else if (event.type === "tool_execution_end") {
+				const extensionEvent: ToolExecutionEndEvent = {
+					type: "tool_execution_end",
+					toolCallId: event.toolCallId,
+					toolName: event.toolName,
+					result: event.result,
+					isError: event.isError ?? false,
+				};
+				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
+			} else if (event.type === "auto_compaction_start") {
+				await this.#extensionRunner.emit(
+					{ type: "auto_compaction_start", reason: event.reason, action: event.action },
+					undefined,
+					deliveryScope,
+				);
+			} else if (event.type === "auto_compaction_end") {
+				await this.#extensionRunner.emit(
+					{
+						type: "auto_compaction_end",
+						action: event.action,
+						result: event.result,
+						aborted: event.aborted,
+						willRetry: event.willRetry,
+						errorMessage: event.errorMessage,
+						skipped: event.skipped,
+						continuationSkipReason: event.continuationSkipReason,
+					},
+					undefined,
+					deliveryScope,
+				);
+			} else if (event.type === "auto_retry_start") {
+				if (this.#extensionRunner.hasHandlers("auto_retry_start")) this.#markRetryReplayUnsafe();
+				await this.#extensionRunner.emit(
+					{
+						type: "auto_retry_start",
+						attempt: event.attempt,
+						maxAttempts: event.maxAttempts,
+						delayMs: event.delayMs,
+						errorMessage: event.errorMessage,
+						unbounded: event.unbounded,
+					},
+					undefined,
+					deliveryScope,
+				);
+			} else if (event.type === "auto_retry_end") {
+				await this.#extensionRunner.emit(
+					{
+						type: "auto_retry_end",
+						success: event.success,
+						attempt: event.attempt,
+						finalError: event.finalError,
+					},
+					undefined,
+					deliveryScope,
+				);
+			} else if (event.type === "ttsr_triggered") {
+				await this.#extensionRunner.emit({ type: "ttsr_triggered", rules: event.rules }, undefined, deliveryScope);
+			} else if (event.type === "todo_reminder") {
+				await this.#extensionRunner.emit(
+					{
+						type: "todo_reminder",
+						todos: event.todos,
+						attempt: event.attempt,
+						maxAttempts: event.maxAttempts,
+					},
+					undefined,
+					deliveryScope,
+				);
+			} else if (event.type === "goal_updated") {
+				try {
+					await this.#extensionRunner.emit(
+						{ type: "goal_updated", goal: event.goal, state: event.state },
+						undefined,
+						deliveryScope,
+					);
+				} catch (error) {
+					logger.warn("Goal updated extension hook failed", { error: String(error) });
+				}
 			}
-		} else if (event.type === "message_end") {
-			const extensionEvent: MessageEndEvent = {
-				type: "message_end",
-				message: event.message,
-			};
-			await this.#extensionRunner.emit(extensionEvent);
-		} else if (event.type === "tool_execution_start") {
-			const extensionEvent: ToolExecutionStartEvent = {
-				type: "tool_execution_start",
-				toolCallId: event.toolCallId,
-				toolName: event.toolName,
-				args: event.args,
-				intent: event.intent,
-			};
-			await this.#extensionRunner.emit(extensionEvent);
-		} else if (event.type === "tool_execution_update") {
-			const extensionEvent: ToolExecutionUpdateEvent = {
-				type: "tool_execution_update",
-				toolCallId: event.toolCallId,
-				toolName: event.toolName,
-				args: event.args,
-				partialResult: event.partialResult,
-			};
-			await this.#extensionRunner.emit(extensionEvent);
-		} else if (event.type === "tool_execution_end") {
-			const extensionEvent: ToolExecutionEndEvent = {
-				type: "tool_execution_end",
-				toolCallId: event.toolCallId,
-				toolName: event.toolName,
-				result: event.result,
-				isError: event.isError ?? false,
-			};
-			await this.#extensionRunner.emit(extensionEvent);
-		} else if (event.type === "auto_compaction_start") {
-			await this.#extensionRunner.emit({
-				type: "auto_compaction_start",
-				reason: event.reason,
-				action: event.action,
-			});
-		} else if (event.type === "auto_compaction_end") {
-			await this.#extensionRunner.emit({
-				type: "auto_compaction_end",
-				action: event.action,
-				result: event.result,
-				aborted: event.aborted,
-				willRetry: event.willRetry,
-				errorMessage: event.errorMessage,
-				skipped: event.skipped,
-				continuationSkipReason: event.continuationSkipReason,
-			});
-		} else if (event.type === "auto_retry_start") {
-			if (this.#extensionRunner.hasHandlers("auto_retry_start")) this.#markRetryReplayUnsafe();
-			await this.#extensionRunner.emit({
-				type: "auto_retry_start",
-				attempt: event.attempt,
-				maxAttempts: event.maxAttempts,
-				delayMs: event.delayMs,
-				errorMessage: event.errorMessage,
-				unbounded: event.unbounded,
-			});
-		} else if (event.type === "auto_retry_end") {
-			await this.#extensionRunner.emit({
-				type: "auto_retry_end",
-				success: event.success,
-				attempt: event.attempt,
-				finalError: event.finalError,
-			});
-		} else if (event.type === "ttsr_triggered") {
-			await this.#extensionRunner.emit({ type: "ttsr_triggered", rules: event.rules });
-		} else if (event.type === "todo_reminder") {
-			await this.#extensionRunner.emit({
-				type: "todo_reminder",
-				todos: event.todos,
-				attempt: event.attempt,
-				maxAttempts: event.maxAttempts,
-			});
-		} else if (event.type === "goal_updated") {
-			try {
-				await this.#extensionRunner.emit({
-					type: "goal_updated",
-					goal: event.goal,
-					state: event.state,
-				});
-			} catch (error) {
-				logger.warn("Goal updated extension hook failed", { error: String(error) });
-			}
+		} finally {
+			finishAttempt();
 		}
 	}
 
@@ -5545,7 +6021,15 @@ export class AgentSession {
 			),
 			Bun.sleep(2_000).then(() => false),
 		]);
-		if (!disposeIdleSettled) this.agent.forceAbort("Session disposed");
+		if (!disposeIdleSettled) {
+			try {
+				this.agent.forceAbort("Session disposed", this.#activeLogicalRunId);
+			} catch {
+				// AttemptScope handle may not be registered for sessions
+				// that don't participate in the facility (e.g. test mocks).
+				this.agent.forceAbort("Session disposed");
+			}
+		}
 		await admissionClosed;
 		await this.#agentEndPublicationPromise;
 		await this.#queuedExtensionEvents;
@@ -6929,7 +7413,8 @@ export class AgentSession {
 			this.#assertNoHandoffTransition();
 			await this.agent.continue({
 				...this.#managedFallbackPromptOptions(),
-				onRunAccepted: () => {
+				onRunAccepted: (handle: AttemptRunHandle) => {
+					this.#acceptRunHandle(handle);
 					if (hindsightRecall) hindsightState?.markRecallSnippetInjected(hindsightRecall);
 				},
 			});
@@ -6956,20 +7441,32 @@ export class AgentSession {
 	}
 
 	/** Convert session messages using the same pre-LLM pipeline as the active session. */
-	async convertMessagesToLlm(messages: AgentMessage[], signal?: AbortSignal): Promise<Message[]> {
-		const transformedMessages = await this.#transformContext(messages, signal);
+	async convertMessagesToLlm(
+		messages: AgentMessage[],
+		signal?: AbortSignal,
+		scope?: AttemptScope,
+	): Promise<Message[]> {
+		const transformedMessages =
+			scope === undefined
+				? await this.#transformContext(messages, signal)
+				: await this.#transformContext(messages, signal, scope);
 		return await this.#convertToLlm(transformedMessages);
 	}
 
 	/** Apply session-level stream hooks to a direct side request. */
-	prepareSimpleStreamOptions(options: SimpleStreamOptions, provider = "anthropic"): SimpleStreamOptions {
+	prepareSimpleStreamOptions(
+		options: SimpleStreamOptions,
+		provider = "anthropic",
+		scope?: AttemptScope,
+	): SimpleStreamOptions {
 		const sessionOnPayload = this.#onPayload;
 		const sessionOnResponse = this.#onResponse;
 		const sessionMetadata = this.agent.metadataForProvider(provider);
 		const sessionOnSseEvent = this.#onSseEvent;
-		if (!sessionOnPayload && !sessionOnResponse && !sessionMetadata && !sessionOnSseEvent) return options;
+		if (!sessionOnPayload && !sessionOnResponse && !sessionMetadata && !sessionOnSseEvent && !scope) return options;
 
 		const preparedOptions: SimpleStreamOptions = { ...options };
+		if (scope) preparedOptions.attemptScope = scope;
 
 		// Stamp session metadata (e.g. user_id={session_id}) onto direct-call requests so
 		// they share the same session bucket as Agent.prompt-routed requests on Anthropic
@@ -6983,10 +7480,10 @@ export class AgentSession {
 				preparedOptions.onPayload = sessionOnPayload;
 			} else {
 				const requestOnPayload = options.onPayload;
-				preparedOptions.onPayload = async (payload, model) => {
-					const sessionPayload = await sessionOnPayload(payload, model);
+				preparedOptions.onPayload = async (payload, model, callbackScope) => {
+					const sessionPayload = await sessionOnPayload(payload, model, callbackScope);
 					const sessionResolvedPayload = sessionPayload ?? payload;
-					const requestPayload = await requestOnPayload(sessionResolvedPayload, model);
+					const requestPayload = await requestOnPayload(sessionResolvedPayload, model, callbackScope);
 					return requestPayload ?? sessionResolvedPayload;
 				};
 			}
@@ -6997,9 +7494,9 @@ export class AgentSession {
 				preparedOptions.onResponse = sessionOnResponse;
 			} else {
 				const requestOnResponse = options.onResponse;
-				preparedOptions.onResponse = async (response, model) => {
-					await sessionOnResponse(response, model);
-					await requestOnResponse(response, model);
+				preparedOptions.onResponse = async (response, model, callbackScope) => {
+					await sessionOnResponse(response, model, callbackScope);
+					await requestOnResponse(response, model, callbackScope);
 				};
 			}
 		}
@@ -7009,9 +7506,9 @@ export class AgentSession {
 				preparedOptions.onSseEvent = sessionOnSseEvent;
 			} else {
 				const requestOnSseEvent = options.onSseEvent;
-				preparedOptions.onSseEvent = (event, model) => {
-					sessionOnSseEvent(event, model);
-					requestOnSseEvent(event, model);
+				preparedOptions.onSseEvent = (event, model, callbackScope) => {
+					sessionOnSseEvent(event, model, callbackScope);
+					requestOnSseEvent(event, model, callbackScope);
 				};
 			}
 		}
@@ -8058,7 +8555,7 @@ export class AgentSession {
 			skipPostPromptRecoveryWait?: boolean;
 			predecessorAgentEndHold?: symbol;
 			admissionLease?: SessionAdmissionLease;
-			onRunAccepted?: () => void;
+			onRunAccepted?: (handle: AttemptRunHandle) => void;
 			onFinalPreflight?: (context: { hasPendingNextTurnMessages: boolean }) => Promise<boolean>;
 			resetRetryReplaySafety?: boolean;
 		},
@@ -8284,8 +8781,9 @@ export class AgentSession {
 			const agentPromptOptions = {
 				...(options?.toolChoice ? { toolChoice: options.toolChoice } : undefined),
 				...this.#managedFallbackPromptOptions(),
-				onRunAccepted: () => {
-					options?.onRunAccepted?.();
+				onRunAccepted: (handle: AttemptRunHandle) => {
+					this.#acceptRunHandle(handle);
+					options?.onRunAccepted?.(handle);
 					options?.admissionLease?.release();
 					if (hindsightRecall) this.getHindsightSessionState()?.markRecallSnippetInjected(hindsightRecall);
 				},
@@ -9408,7 +9906,14 @@ export class AgentSession {
 			]);
 			if (outcome.kind === "timeout") {
 				this.#abandonPostPromptTasks();
-				this.agent.forceAbort("Abort cleanup timed out");
+				const forceAbortLogicalRunId = this.agent.currentManagedLogicalRunId ?? this.#activeLogicalRunId;
+				try {
+					if (forceAbortLogicalRunId !== undefined)
+						this.agent.forceAbort("Abort cleanup timed out", forceAbortLogicalRunId);
+					else this.agent.forceAbort("Abort cleanup timed out");
+				} catch {
+					this.agent.forceAbort("Abort cleanup timed out");
+				}
 				this.emitNotice(
 					"warning",
 					"Abort cleanup timed out; forced session recovery. The previous provider stream or tool may still be unwinding in the background.",
@@ -9465,20 +9970,16 @@ export class AgentSession {
 	 * Abort a specific active prompt and prove whether its tracked resources settled.
 	 */
 	async abortPromptAndWait(handle: string, options: { graceMs: number }): Promise<RunSettlementProof> {
-		// Only the abort trigger is gated on active ownership; settlement is always proven
-		// from the ledger, because a run can go inactive while its resources still run.
-		if (handle === this.agent.activeResourceRunId)
-			// Awaiting the abort unboundedly would let a provider or tool that ignores
-			// cancellation defer the grace forever, so the proof races the fixed grace
-			// independently of abort completion.
-			void this.abort({ timeoutMs: options.graceMs }).catch(() => {});
-
-		const proof = await this.agent.resourceLedger.waitForSettlement(handle, { graceMs: options.graceMs });
-		if (proof.status === "unfenced") {
-			// Detach the unsettled resources so they can never re-enter this run; their real
-			// promises still release them inside the ledger.
-			this.agent.resourceLedger.quarantine(handle);
+		const aborted = this.#runCancellationDomains.abort(handle);
+		if (!aborted.ok) {
+			if (aborted.reason === "quarantined") {
+				return await this.agent.resourceLedger.waitForSettlement(handle, { graceMs: 0 });
+			}
+			return { status: "unfenced", reason: "unknown_run", pending: [] };
 		}
+		if (handle === this.agent.activeResourceRunId) this.agent.abort();
+		const proof = await this.agent.resourceLedger.waitForSettlement(handle, { graceMs: options.graceMs });
+		if (proof.status === "unfenced") this.agent.resourceLedger.quarantine(handle);
 		return proof;
 	}
 
@@ -11870,6 +12371,7 @@ export class AgentSession {
 		skipAbortedCheck = true,
 		onTerminalOverflowNoop?: () => void,
 		resourceRunId?: string,
+		ownershipSignal?: AbortSignal,
 	): Promise<boolean> {
 		// Safety stops are terminal and must not trigger context maintenance.
 		if (
@@ -11913,7 +12415,8 @@ export class AgentSession {
 			}
 
 			// Try context promotion first - switch to a larger model and retry without compacting
-			const promoted = await this.#tryContextPromotion(assistantMessage);
+			const promoted = await this.#tryContextPromotion(assistantMessage, ownershipSignal);
+			if (ownershipSignal?.aborted) return false;
 			if (promoted) {
 				// Retry on the promoted (larger) model without compacting
 				this.#scheduleAgentContinue({
@@ -11938,6 +12441,7 @@ export class AgentSession {
 						}
 					},
 					resourceRunId,
+					signal: ownershipSignal,
 				});
 				return "continuationScheduled" in status && status.continuationScheduled === true;
 			}
@@ -11972,14 +12476,16 @@ export class AgentSession {
 				autoCompactionOutputReserveTokens,
 			)
 		) {
-			const pruneResult = await this.#pruneToolOutputs(undefined, true);
+			const pruneResult = await this.#pruneToolOutputs(ownershipSignal, true);
+			if (ownershipSignal?.aborted) return false;
 			if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
 		if (shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
 			// Try promotion first — if a larger model is available, switch instead of compacting
-			const promoted = await this.#tryContextPromotion(assistantMessage);
+			const promoted = await this.#tryContextPromotion(assistantMessage, ownershipSignal);
+			if (ownershipSignal?.aborted) return false;
 			if (!promoted) {
-				await this.#runAutoCompaction("threshold", false);
+				await this.#runAutoCompaction("threshold", false, false, { resourceRunId, signal: ownershipSignal });
 			}
 		}
 		return true;
@@ -13358,7 +13864,7 @@ export class AgentSession {
 					});
 					if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
 					if (continueAfterMaintenance && reason !== "idle" && compactionSettings.autoContinue !== false) {
-						this.#scheduleAutoContinuePrompt(generation);
+						this.#scheduleAutoContinuePrompt(generation, true, options?.resourceRunId);
 					}
 
 					if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
@@ -13422,7 +13928,7 @@ export class AgentSession {
 				}
 				const overflowContinuationScheduled =
 					!overflowNoopWouldReplay && willRetry && !continuationSkipReason
-						? await this.#scheduleOverflowRetryContinuation(generation)
+						? await this.#scheduleOverflowRetryContinuation(generation, options?.resourceRunId)
 						: false;
 				await this.#emitSessionEvent({
 					type: "auto_compaction_end",
@@ -13445,6 +13951,7 @@ export class AgentSession {
 							rescheduleOnBusy: true,
 							onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 							onError: error => this.#logCompactionContinuationError("queued_continue", error),
+							resourceRunId: options?.resourceRunId,
 						});
 						return { kind: "skipped", continuationScheduled: true };
 					}
@@ -13465,9 +13972,10 @@ export class AgentSession {
 						rescheduleOnBusy: true,
 						onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 						onError: error => this.#logCompactionContinuationError("queued_continue", error),
+						resourceRunId: options?.resourceRunId,
 					});
 				} else if (continueAfterMaintenance && reason !== "idle" && compactionSettings.autoContinue !== false) {
-					this.#scheduleAutoContinuePrompt(generation);
+					this.#scheduleAutoContinuePrompt(generation, true, options?.resourceRunId);
 				}
 				return { kind: "skipped" };
 			}
@@ -13694,7 +14202,9 @@ export class AgentSession {
 				this.#logCompactionContinuationSkipped("overflow_retry", continuationSkipReason);
 			}
 			const overflowContinuationScheduled =
-				willRetry && !continuationSkipReason ? await this.#scheduleOverflowRetryContinuation(generation) : false;
+				willRetry && !continuationSkipReason
+					? await this.#scheduleOverflowRetryContinuation(generation, options?.resourceRunId)
+					: false;
 			await this.#emitSessionEvent({
 				type: "auto_compaction_end",
 				action,
@@ -13721,9 +14231,10 @@ export class AgentSession {
 					rescheduleOnBusy: true,
 					onSkip: reason => this.#logCompactionContinuationSkipped("queued_continue", reason),
 					onError: error => this.#logCompactionContinuationError("queued_continue", error),
+					resourceRunId: options?.resourceRunId,
 				});
 			} else if (continueAfterMaintenance && reason !== "idle" && compactionSettings.autoContinue !== false) {
-				this.#scheduleAutoContinuePrompt(generation);
+				this.#scheduleAutoContinuePrompt(generation, true, options?.resourceRunId);
 			}
 			return { kind: "compacted" };
 		} catch (error) {
@@ -13788,7 +14299,7 @@ export class AgentSession {
 
 	#isKimiCodeFirstEventTimeout(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error" || message.provider !== "kimi-code") return false;
-		const errorMessage = message.errorMessage ?? "";
+		const errorMessage = terminalProviderFirstEventTimeoutIdentity(message.errorMessage ?? "");
 		if (message.api === "anthropic-messages") {
 			return KIMI_CODE_FIRST_EVENT_TIMEOUT_MESSAGES["anthropic-messages"].has(errorMessage);
 		}
@@ -13815,7 +14326,8 @@ export class AgentSession {
 	#isAlibabaTokenPlanFirstEventTimeout(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error" || message.provider !== ALIBABA_TOKEN_PLAN_PROVIDER) return false;
 		const timeoutMessages = this.#alibabaTokenPlanTimeoutMessagesForApi(message.api);
-		return timeoutMessages?.has(message.errorMessage ?? "") ?? false;
+		const errorMessage = terminalProviderFirstEventTimeoutIdentity(message.errorMessage ?? "");
+		return timeoutMessages?.has(errorMessage) ?? false;
 	}
 
 	#isAlibabaTokenPlanCompactionTimeout(candidate: Model, errorMessage: string): boolean {
@@ -14003,6 +14515,7 @@ export class AgentSession {
 		if (this.#isTerminalProviderFirstEventTimeout(message)) {
 			return "terminal";
 		}
+		if (isMessageOnlyFirstEventTimeout(message)) return "first_event_timeout";
 		// Legacy providers that have not yet stamped the typed timeout fact retain
 		// their existing bounded ollama-cloud behavior.
 		if (this.#isFirstEventTimeoutErrorMessage(err) && this.#shouldFailClosedOnFirstEventTimeout(message)) {
@@ -14173,20 +14686,37 @@ export class AgentSession {
 			return {
 				type: "maintenance",
 				continuation: async ownership => {
-					if (!ownership.isCurrent()) return;
-					let terminalized = false;
-					const successorScheduled = await this.#checkCompaction(outcome.message, true, () => {
-						terminalized = true;
-						this.agent.requestRunTerminal(ownership.logicalRunId, {
+					if (!ownership.isCurrent() || ownership.lease.signal.aborted) return;
+					const resourceRunId = String(ownership.logicalRunId);
+					const previousLease = this.#postPromptLeases.get(resourceRunId);
+					this.#postPromptLeases.set(resourceRunId, ownership.lease);
+					try {
+						let terminalized = false;
+						const successorScheduled = await this.#checkCompaction(
+							outcome.message,
+							true,
+							() => {
+								terminalized = true;
+								this.agent.requestRunTerminal(ownership.handle.logicalRunId, {
+									stopReason: "error",
+									messages: [outcome.message],
+								});
+							},
+							resourceRunId,
+							ownership.lease.signal,
+						);
+						if (terminalized || successorScheduled || !ownership.isCurrent() || ownership.lease.signal.aborted)
+							return;
+						this.agent.requestRunTerminal(ownership.handle.logicalRunId, {
 							stopReason: "error",
 							messages: [outcome.message],
 						});
-					});
-					if (terminalized || successorScheduled || !ownership.isCurrent()) return;
-					this.agent.requestRunTerminal(ownership.logicalRunId, {
-						stopReason: "error",
-						messages: [outcome.message],
-					});
+					} finally {
+						if (this.#postPromptLeases.get(resourceRunId) === ownership.lease) {
+							if (previousLease) this.#postPromptLeases.set(resourceRunId, previousLease);
+							else this.#postPromptLeases.delete(resourceRunId);
+						}
+					}
 				},
 			};
 		}
@@ -14378,17 +14908,20 @@ export class AgentSession {
 		// retry.enabled=false always surfaces immediately, matching the explicit
 		// user opt-out.
 		if (!managedFallback && !retrySettings.enabled) return false;
-		const classification = managedFallback ? undefined : this.#classifyErrorForRetry(message);
-		if (classification === "first_event_timeout") {
+		const classification = this.#classifyErrorForRetry(message);
+		const firstEventTimeout = classification === "first_event_timeout";
+		if (!managedFallback && firstEventTimeout) {
 			this.#firstEventTimeoutRetryStartedAt ??= Date.now();
 		}
 		// First-event timeouts are replay-safe only before any model progress,
 		// abort, or extension/provider lifecycle participation.
-		if (
-			classification === "first_event_timeout" &&
-			(!this.#hasCleanRetryReplaySafety || assistantMessageHasVisibleOrToolContent(message))
-		) {
-			return false;
+		if (firstEventTimeout && (!this.#hasCleanRetryReplaySafety || assistantMessageHasVisibleOrToolContent(message))) {
+			return managedOutcome
+				? {
+						type: "terminal",
+						terminal: { stopReason: "error", messages: [message] },
+					}
+				: false;
 		}
 		const trigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
 		if (!trigger) {
@@ -14415,12 +14948,14 @@ export class AgentSession {
 		// capacity-overload event.
 		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential) {
 			const bareDefaultCodexOverload = isBareDefaultCodexOverload(message);
+			const bareDefaultWrappedFirstEventTimeout = isBareDefaultWrappedFirstEventTimeout(message);
 			// Content-free Codex overload is replay-safe by the same reasoning as
 			// credential rotation: no partial output means no observable state.
 			const canReplayCodexOverload = bareDefaultCodexOverload;
 			if (
 				(!canReplayCodexOverload &&
 					!this.#isTypedFirstEventTimeout(message) &&
+					!bareDefaultWrappedFirstEventTimeout &&
 					(hasBareDefaultRetryDisqualifyingFacts(message) ||
 						(classification !== "transient" && classification !== "first_event_timeout") ||
 						!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))) ||
@@ -14429,7 +14964,7 @@ export class AgentSession {
 				return false;
 			}
 		}
-		const legacyUnbounded = classification === "transient";
+		const legacyUnbounded = !managedFallback && classification === "transient";
 		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome = managedFallback
@@ -14496,7 +15031,7 @@ export class AgentSession {
 					: this.#fallbackExhaustionError(controller);
 				this.emitNotice("error", errorMessage, "fallback");
 				if (managedOutcome && ownership) {
-					this.agent.requestRunTerminal(ownership.logicalRunId, {
+					this.agent.requestRunTerminal(ownership.handle.logicalRunId, {
 						stopReason: "exhausted",
 						messages: [this.#managedFallbackExhaustionMessage(message, errorMessage)],
 					});
@@ -14522,12 +15057,11 @@ export class AgentSession {
 			await this.#emitSessionEvent({
 				type: "auto_retry_start",
 				attempt: this.#retryAttempt,
-				maxAttempts:
-					classification === "first_event_timeout"
+				maxAttempts: managedFallback
+					? controller.maxAttempts
+					: firstEventTimeout
 						? retrySettings.maxRetries + 1
-						: managedFallback
-							? controller.maxAttempts
-							: retrySettings.maxRetries,
+						: retrySettings.maxRetries,
 				delayMs,
 				errorMessage,
 				unbounded: managedFallback ? false : legacyUnbounded,
@@ -14548,8 +15082,13 @@ export class AgentSession {
 				}
 				this.agent.replaceMessages(messages.slice(0, end));
 			}
+			const retrySignal = ownership
+				? AbortSignal.any([retryAbortController.signal, ownership.lease.signal])
+				: retryAbortController.signal;
+			const ownershipCancelled = () =>
+				Boolean(ownership && (!ownership.isCurrent() || ownership.lease.signal.aborted));
 			try {
-				await scheduler.wait(delayMs, { signal: retryAbortController.signal });
+				await scheduler.wait(delayMs, { signal: retrySignal });
 			} catch {
 				if (this.#retryAbortController !== retryAbortController) return;
 				this.#retryAbortController = undefined;
@@ -14568,7 +15107,10 @@ export class AgentSession {
 					return;
 				}
 			}
-			if (retryAbortController.signal.aborted && !this.#retryNowRequested) {
+			if (
+				(retryAbortController.signal.aborted || ownershipCancelled()) &&
+				!(this.#retryNowRequested && !ownershipCancelled())
+			) {
 				if (this.#retryAbortController !== retryAbortController) return;
 				this.#retryAbortController = undefined;
 				const attempt = this.#retryAttempt;
@@ -14588,7 +15130,7 @@ export class AgentSession {
 			if (managedOutcome) {
 				try {
 					await this.#checkEstimatedContextBeforePrompt();
-					if (!ownership?.isCurrent()) {
+					if (ownershipCancelled()) {
 						const attempt = this.#retryAttempt;
 						this.#retryAttempt = 0;
 						await this.#emitSessionEvent({
@@ -14619,10 +15161,13 @@ export class AgentSession {
 				}
 			}
 
+			const resourceRunId = this.#runResourceLeaseContext.getStore()?.resourceRunId;
 			this.#scheduleAgentContinue({
 				delayMs: 1,
 				generation,
 				allowDuringCancelAndSubmit: true,
+				suppressPredecessorAgentEnd: resourceRunId !== undefined,
+				resourceRunId,
 				onError: () => this.#failRetryRecovery("Retry continuation failed to start"),
 				onSkip: () => this.#failRetryRecovery("Retry continuation was superseded"),
 			});
@@ -14677,7 +15222,11 @@ export class AgentSession {
 
 	async #promptAgentWithIdleRetry(
 		messages: AgentMessage[],
-		options?: { toolChoice?: ToolChoice; fallbackManaged?: boolean; onRunAccepted?: () => void },
+		options?: {
+			toolChoice?: ToolChoice;
+			fallbackManaged?: boolean;
+			onRunAccepted?: (handle: AttemptRunHandle) => void;
+		},
 		predecessorAgentEndHold?: symbol,
 	): Promise<void> {
 		const deadline = Date.now() + 30_000;
@@ -14690,6 +15239,7 @@ export class AgentSession {
 				continuationHold = undefined;
 				try {
 					await this.agent.prompt(messages, options);
+					this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
 					return;
 				} catch (error) {
 					this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
@@ -15441,19 +15991,30 @@ export class AgentSession {
 			!rosterClaim || this.#isCurrentIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 		const prependMessagesValid = () => rosterClaimIsCurrent() && args.prependMessagesValid?.() !== false;
 		const rosterMessage = !callerOwnsRosterClaim && rosterClaimIsCurrent() ? rosterClaim?.message : undefined;
+		let sideAttempt: { scope: AttemptScope; dispose: () => void } | undefined;
 		try {
 			const model = this.model;
 			if (!model) throw new Error("No active model on session");
 			const apiKey = await awaitEphemeralAbort(this.#modelRegistry.getApiKey(model, this.sessionId), args.signal);
 			if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
+			sideAttempt = this.agent.mintSideAttemptScope();
+			const sideScope = sideAttempt.scope;
+			this.#attemptRecordStore.register(sideScope);
+			this.#attemptRecordStore.establishClean(sideScope);
 			const prependMessages = prependMessagesValid()
 				? [...(rosterMessage ? [rosterMessage] : []), ...(args.prependMessages ?? [])]
 				: undefined;
 			let snapshot = this.#buildEphemeralSnapshot(args.promptText, prependMessages);
-			let llmMessages = await awaitEphemeralAbort(this.convertMessagesToLlm(snapshot, args.signal), args.signal);
+			let llmMessages = await awaitEphemeralAbort(
+				this.convertMessagesToLlm(snapshot, args.signal, sideScope),
+				args.signal,
+			);
 			if (prependMessages && !prependMessagesValid()) {
 				snapshot = this.#buildEphemeralSnapshot(args.promptText);
-				llmMessages = await awaitEphemeralAbort(this.convertMessagesToLlm(snapshot, args.signal), args.signal);
+				llmMessages = await awaitEphemeralAbort(
+					this.convertMessagesToLlm(snapshot, args.signal, sideScope),
+					args.signal,
+				);
 			}
 			const context: Context = { systemPrompt: this.systemPrompt, messages: llmMessages, tools: [] };
 			const ephemeralSessionId = crypto.randomUUID();
@@ -15474,6 +16035,7 @@ export class AgentSession {
 					toolChoice: "none",
 				},
 				model.provider,
+				sideScope,
 			);
 			args.signal?.throwIfAborted();
 			let replyText = "";
@@ -15501,6 +16063,10 @@ export class AgentSession {
 			}
 			return { replyText: replyText.trim(), assistantMessage };
 		} finally {
+			if (sideAttempt) {
+				sideAttempt.dispose();
+				this.#attemptRecordStore.retire(sideAttempt.scope);
+			}
 			if (!callerOwnsRosterClaim && rosterClaim) this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 		}
 	}
@@ -15514,8 +16080,15 @@ export class AgentSession {
 		}
 		const apiKey = await awaitEphemeralAbort(this.#modelRegistry.getApiKey(model, credentialSessionId), args.signal);
 		if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
+		const sideAttempt = this.agent.mintSideAttemptScope();
+		this.#attemptRecordStore.register(sideAttempt.scope);
+		this.#attemptRecordStore.establishClean(sideAttempt.scope);
 		const scope = args.turn.scope;
-		if (!scope) throw new Error("The /btw conversation scope was scrubbed.");
+		if (!scope) {
+			sideAttempt.dispose();
+			this.#attemptRecordStore.retire(sideAttempt.scope);
+			throw new Error("The /btw conversation scope was scrubbed.");
+		}
 		const messages = scope.messages.map(message => ({
 			role: message.role,
 			content: [{ type: "text" as const, text: message.text }],
@@ -15548,6 +16121,7 @@ export class AgentSession {
 			requestMaxRetries: 0,
 			streamMaxRetries: 0,
 			streamFirstEventTimeoutMs: 0,
+			attemptScope: sideAttempt.scope,
 		};
 		const iterator = streamSimple(scope.model, context, options)[Symbol.asyncIterator]();
 		let replyText = "";
@@ -15607,6 +16181,8 @@ export class AgentSession {
 			if (idleTimer) clearTimeout(idleTimer);
 			clearTimeout(totalTimer);
 			void iterator.return?.().catch(() => undefined);
+			sideAttempt.dispose();
+			this.#attemptRecordStore.retire(sideAttempt.scope);
 		}
 	}
 

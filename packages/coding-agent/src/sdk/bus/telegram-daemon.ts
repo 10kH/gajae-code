@@ -6814,17 +6814,18 @@ export class TelegramNotificationDaemon {
 					acceptedTopicId = String(tid);
 					this.#malformedTopicCreateEndpoints.delete(sessionId);
 					if (capturedCreationLease && !(await this.#awaitCreationLeaseAuthority(capturedCreationLease))) {
-						if (
-							!this.topics.fenceAcceptedCreateForLease(
-								sessionId,
-								acceptedTopicId,
-								creationLeaseEpoch,
-								this.opts.now,
-								name,
-								creationBinding,
-							)
-						)
-							throw new Error("topic authority was revoked during creation");
+						const fencedCreate = this.topics.fenceAcceptedCreateForLease(
+							sessionId,
+							acceptedTopicId,
+							creationLeaseEpoch,
+							this.opts.now,
+							name,
+							creationBinding,
+						);
+						if (!fencedCreate) throw new Error("topic authority was revoked during creation");
+						// Epoch held when the compensating delete is dispatched below; a
+						// concurrent re-fence must not be settled by this delete's result.
+						const fencedCreateEpoch = fencedCreate.authorityEpoch ?? 0;
 						try {
 							await this.persistTopics();
 						} finally {
@@ -6833,11 +6834,27 @@ export class TelegramNotificationDaemon {
 								chat_id: this.opts.chatId,
 								message_thread_id: tid,
 							});
-							acceptedTopicCompensated = topicDeleteSettled(deletion);
-
+							// Remote compensation succeeded, but the transaction is not complete
+							// until the registry clear is durable. `acceptedTopicCompensated` is
+							// what tells outer recovery to stop supervising the fence, so it is
+							// set only after the phase-2 commit: a failed clear persist leaves
+							// the fence supervised instead of stranding a cleared memory state
+							// against a `delete_pending` disk state.
 							if (topicDeleteSettled(deletion)) {
-								this.topics.settleDelete(sessionId, acceptedTopicId);
-								await this.persistTopics();
+								const settled = this.topics.settleDelete(sessionId, acceptedTopicId, fencedCreateEpoch);
+								if (!settled) {
+									this.#superviseCompensationFence(sessionId);
+									await this.#persistTopicsWithRetry().catch(() => undefined);
+								} else
+									try {
+										await this.persistTopics();
+										this.topics.commitSettledDelete(settled);
+										acceptedTopicCompensated = true;
+									} catch {
+										this.topics.rollbackSettledDelete(settled);
+										this.#superviseCompensationFence(sessionId);
+										await this.#persistTopicsWithRetry().catch(() => undefined);
+									}
 							} else {
 								this.#superviseCompensationFence(sessionId);
 								await this.#persistTopicsWithRetry().catch(() => undefined);
@@ -6916,16 +6933,18 @@ export class TelegramNotificationDaemon {
 			) {
 				// A failed initial commit must never make compensation conditional on
 				// successfully publishing its fence.
-				if (
-					this.topics.fenceAcceptedCreateForLease(
-						sessionId,
-						acceptedTopicId,
-						creationLeaseEpoch,
-						this.opts.now,
-						name,
-						creationBinding,
-					)
-				) {
+				const fencedCompensation = this.topics.fenceAcceptedCreateForLease(
+					sessionId,
+					acceptedTopicId,
+					creationLeaseEpoch,
+					this.opts.now,
+					name,
+					creationBinding,
+				);
+				if (fencedCompensation) {
+					// Epoch held when the compensating delete is dispatched below; a
+					// concurrent re-fence must not be settled by this delete's result.
+					const fencedCompensationEpoch = fencedCompensation.authorityEpoch ?? 0;
 					try {
 						await this.#persistTopicsWithRetry();
 					} catch {
@@ -6938,8 +6957,19 @@ export class TelegramNotificationDaemon {
 							message_thread_id: Number(acceptedTopicId),
 						});
 						if (topicDeleteSettled(deletion)) {
-							this.topics.settleDelete(sessionId, acceptedTopicId);
-							await this.persistTopics();
+							const settled = this.topics.settleDelete(sessionId, acceptedTopicId, fencedCompensationEpoch);
+							if (!settled) {
+								this.#superviseCompensationFence(sessionId);
+								await this.#persistTopicsWithRetry().catch(() => undefined);
+							} else
+								try {
+									await this.persistTopics();
+									this.topics.commitSettledDelete(settled);
+								} catch {
+									this.topics.rollbackSettledDelete(settled);
+									this.#superviseCompensationFence(sessionId);
+									await this.#persistTopicsWithRetry().catch(() => undefined);
+								}
 						} else {
 							this.#superviseCompensationFence(sessionId);
 							await this.#persistTopicsWithRetry().catch(() => undefined);
@@ -6989,8 +7019,11 @@ export class TelegramNotificationDaemon {
 		socketLease?: { session: SessionSocket; token: number; logicalSessionId: string },
 		deleteFenceAlreadyPublished = false,
 	): Promise<"pre_dispatch_cancelled" | "post_dispatch_pending" | "settled"> {
-		const deleteSnapshot = this.topics.captureDeleteAuthority(sessionId);
 		let record = deleteFenceAlreadyPublished ? this.topics.get(sessionId) : this.topics.beginDelete(sessionId);
+		// Authority epoch held for this delete. Captured before any dispatch so a
+		// concurrent scan/close re-fence of the same session cannot be settled by
+		// this delete's definite result.
+		const dispatchedAuthorityEpoch = this.topics.authorityEpoch(sessionId);
 		if (socketLease && !this.#deleteLeaseAllows(socketLease)) return "pre_dispatch_cancelled";
 		await this.persistTopics();
 		if (socketLease && !this.#deleteLeaseAllows(socketLease)) return "pre_dispatch_cancelled";
@@ -7013,7 +7046,13 @@ export class TelegramNotificationDaemon {
 			await this.flushPool();
 			if (socketLease && !this.#deleteLeaseAllows(socketLease)) return "pre_dispatch_cancelled";
 			if (record.topicOrigin === "user_created") {
-				this.topics.settleDelete(sessionId, record.topicId);
+				// Phase 1: drop the record but keep the topic id quarantined. Routes are
+				// only republished by `commitSettledDelete` once the clear is durable.
+				const settled = this.topics.settleDelete(sessionId, record.topicId, dispatchedAuthorityEpoch);
+				if (!settled) {
+					await this.#persistTopicsWithRetry().catch(() => undefined);
+					return "post_dispatch_pending";
+				}
 				for (const k of [...this.liveMessages.keys()])
 					if (k.startsWith(`${sessionId}:`)) {
 						this.liveMessages.delete(k);
@@ -7025,9 +7064,10 @@ export class TelegramNotificationDaemon {
 				this.pendingThreadedFrames.delete(sessionId);
 				try {
 					await this.persistTopics();
+					this.topics.commitSettledDelete(settled);
 					return "settled";
 				} catch {
-					this.topics.restoreDeleteFence(deleteSnapshot);
+					this.topics.rollbackSettledDelete(settled);
 					await this.#persistTopicsWithRetry().catch(() => undefined);
 					return "post_dispatch_pending";
 				}
@@ -7037,7 +7077,11 @@ export class TelegramNotificationDaemon {
 				message_thread_id: Number(record.topicId),
 			})) as { ok?: boolean };
 			if (!topicDeleteSettled(res)) return "post_dispatch_pending";
-			this.topics.settleDelete(sessionId, record.topicId);
+			const settled = this.topics.settleDelete(sessionId, record.topicId, dispatchedAuthorityEpoch);
+			if (!settled) {
+				await this.#persistTopicsWithRetry().catch(() => undefined);
+				return "post_dispatch_pending";
+			}
 			for (const k of [...this.liveMessages.keys()])
 				if (k.startsWith(`${sessionId}:`)) {
 					this.liveMessages.delete(k);
@@ -7049,9 +7093,10 @@ export class TelegramNotificationDaemon {
 			this.pendingThreadedFrames.delete(sessionId);
 			try {
 				await this.persistTopics();
+				this.topics.commitSettledDelete(settled);
 				return "settled";
 			} catch {
-				this.topics.restoreDeleteFence(deleteSnapshot);
+				this.topics.rollbackSettledDelete(settled);
 				await this.#persistTopicsWithRetry().catch(() => undefined);
 				return "post_dispatch_pending";
 			}

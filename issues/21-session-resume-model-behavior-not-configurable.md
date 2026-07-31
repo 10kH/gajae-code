@@ -55,6 +55,10 @@ there (the `sdk.ts` gate already only special-cases `"useCurrentDefault"`).
 ## Status
 Stage 1 and Stage 2 both landed. See PR https://github.com/Yeachan-Heo/gajae-code/pull/3293.
 
+## Resolution
+
+**Implemented on current `dev`.** Stage 1 and Stage 2 are landed through PR #3293, including `keepSessionModel`, `useCurrentDefault`, and the TUI `ask` behavior. This record is retained for provenance and should be closed or reclassified in the remote issue tracker rather than treated as an active backlog item.
+
 ## Non-goal
 - `task.agentModelOverrides` / `modelRoles` are out of scope — already global/live, no session
   persistence involved.

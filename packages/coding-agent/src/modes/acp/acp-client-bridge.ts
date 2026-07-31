@@ -4,6 +4,8 @@
  * `AgentSession`) can route through the client when it advertises the
  * relevant capabilities at `initialize` time.
  */
+
+import { randomUUID } from "node:crypto";
 import type {
 	PermissionOption as AcpPermissionOption,
 	TerminalHandle as AcpTerminalHandle,
@@ -19,9 +21,24 @@ import type {
 	ClientBridgePermissionOption,
 	ClientBridgePermissionOutcome,
 	ClientBridgePermissionToolCall,
+	ClientBridgeProviderLeaseIdentity,
 	ClientBridgeTerminalHandle,
 } from "../../session/client-bridge";
 import { resolveAcpPermissionMode } from "./permission-mode";
+
+const ACP_TERMINAL_PUBLICATION_WAIT_MS = 500;
+
+async function settleTerminalCleanup(operation: () => Promise<unknown>): Promise<boolean> {
+	return await Promise.race([
+		Promise.resolve()
+			.then(operation)
+			.then(
+				() => true,
+				() => false,
+			),
+		Bun.sleep(ACP_TERMINAL_PUBLICATION_WAIT_MS).then(() => false),
+	]);
+}
 
 export { type AcpPermissionMode, resolveAcpPermissionMode } from "./permission-mode";
 
@@ -39,6 +56,15 @@ export function createAcpClientBridge(
 	};
 
 	const bridge: ClientBridge = { capabilities, deferAgentInitiatedTurns: true };
+	const connectionId = `acp:${sessionId}`;
+	const connectionGeneration = 1;
+	const terminalProviderLeaseId = `${connectionId}:${randomUUID()}`;
+	const terminalProviderIdentity: ClientBridgeProviderLeaseIdentity = {
+		leaseId: terminalProviderLeaseId,
+		connectionId,
+		connectionGeneration,
+		fence: randomUUID(),
+	};
 
 	if (capabilities.readTextFile) {
 		bridge.readTextFile = async params => {
@@ -63,8 +89,49 @@ export function createAcpClientBridge(
 	}
 
 	if (capabilities.terminal) {
+		let terminalPublicationFailed = false;
+		bridge.quarantineProviderLease = async (providerLease, _reason) => {
+			if (
+				typeof providerLease === "string" ||
+				providerLease.leaseId !== terminalProviderIdentity.leaseId ||
+				providerLease.connectionId !== terminalProviderIdentity.connectionId ||
+				providerLease.connectionGeneration !== terminalProviderIdentity.connectionGeneration ||
+				providerLease.fence !== terminalProviderIdentity.fence
+			)
+				throw new Error("terminal provider lease mismatch");
+			terminalPublicationFailed = true;
+		};
+		let terminalCreationTail = Promise.resolve();
+		const withTerminalCreationAdmission = async <T>(operation: () => Promise<T>): Promise<T> => {
+			const previous = terminalCreationTail;
+			const release = Promise.withResolvers<void>();
+			terminalCreationTail = previous.then(() => release.promise);
+			await previous;
+			try {
+				return await operation();
+			} finally {
+				release.resolve();
+			}
+		};
 		bridge.createTerminal = (params: ClientBridgeCreateTerminalParams) =>
-			createTerminalHandle(connection, sessionId, params);
+			withTerminalCreationAdmission(async () => {
+				if (terminalPublicationFailed) throw new Error("terminal provider quarantined after publication failure");
+				const creationTimeout = AbortSignal.timeout(ACP_TERMINAL_PUBLICATION_WAIT_MS);
+				const creationSignal = params.signal ? AbortSignal.any([params.signal, creationTimeout]) : creationTimeout;
+				return await createTerminalHandle(
+					connection,
+					sessionId,
+					params,
+					creationSignal,
+					terminalProviderIdentity,
+					() => {
+						terminalPublicationFailed = true;
+					},
+					() => {
+						terminalPublicationFailed = true;
+					},
+				);
+			});
 	}
 
 	if (promptPermission) {
@@ -79,21 +146,97 @@ async function createTerminalHandle(
 	connection: AgentSideConnection,
 	sessionId: string,
 	params: ClientBridgeCreateTerminalParams,
+	creationSignal: AbortSignal,
+	providerIdentity: ClientBridgeProviderLeaseIdentity,
+	onCreationUncertain: () => void,
+	onPublicationFailure: () => void,
 ): Promise<ClientBridgeTerminalHandle> {
-	const handle = await connection.createTerminal({
-		sessionId,
-		command: params.command,
-		...(params.args ? { args: params.args } : {}),
-		...(params.env ? { env: params.env } : {}),
-		...(params.cwd ? { cwd: params.cwd } : {}),
-		...(typeof params.outputByteLimit === "number" ? { outputByteLimit: params.outputByteLimit } : {}),
-	});
-	return wrapTerminalHandle(handle);
+	if (creationSignal.aborted) throw new Error("terminal creation aborted");
+	const creation = Promise.resolve().then(() =>
+		connection.createTerminal({
+			sessionId,
+			command: params.command,
+			...(params.args ? { args: params.args } : {}),
+			...(params.env ? { env: params.env } : {}),
+			...(params.cwd ? { cwd: params.cwd } : {}),
+			...(typeof params.outputByteLimit === "number" ? { outputByteLimit: params.outputByteLimit } : {}),
+		}),
+	);
+	const creationAborted = Promise.withResolvers<"aborted">();
+	const onCreationAbort = () => creationAborted.resolve("aborted");
+	creationSignal.addEventListener("abort", onCreationAbort, { once: true });
+	if (creationSignal.aborted) creationAborted.resolve("aborted");
+	const creationOutcome = await Promise.race([
+		creation.then(
+			handle => ({ status: "created" as const, handle }),
+			error => ({ status: "failed" as const, error }),
+		),
+		creationAborted.promise.then(() => ({ status: "aborted" as const })),
+	]);
+	creationSignal.removeEventListener("abort", onCreationAbort);
+	if (creationOutcome.status === "aborted") {
+		onCreationUncertain();
+		void creation.then(
+			async handle => {
+				await settleTerminalCleanup(() => handle.kill());
+				await settleTerminalCleanup(() => handle.release());
+			},
+			() => undefined,
+		);
+		throw new Error("terminal creation aborted");
+	}
+	if (creationOutcome.status === "failed") {
+		onCreationUncertain();
+		throw creationOutcome.error;
+	}
+	const handle = creationOutcome.handle;
+	const publication = Promise.resolve().then(() =>
+		connection.sessionUpdate({
+			sessionId,
+			update: {
+				sessionUpdate: "tool_call_update",
+				toolCallId: params.toolCallId,
+				status: "in_progress",
+				content: [{ type: "terminal", terminalId: handle.id }],
+			},
+		}),
+	);
+	const aborted = Promise.withResolvers<"aborted">();
+	const onAbort = () => aborted.resolve("aborted");
+	params.signal?.addEventListener("abort", onAbort, { once: true });
+	if (params.signal?.aborted) aborted.resolve("aborted");
+	const outcome = await Promise.race([
+		publication.then(
+			() => ({ status: "published" as const }),
+			error => ({ status: "failed" as const, error }),
+		),
+		Bun.sleep(ACP_TERMINAL_PUBLICATION_WAIT_MS).then(() => ({ status: "timeout" as const })),
+		aborted.promise.then(() => ({ status: "aborted" as const })),
+	]);
+	params.signal?.removeEventListener("abort", onAbort);
+	if (outcome.status !== "published") {
+		const killed = await settleTerminalCleanup(() => handle.kill());
+		const released = await settleTerminalCleanup(() => handle.release());
+		if (!params.signal?.aborted || !killed || !released) onPublicationFailure();
+		if (outcome.status === "failed") throw outcome.error;
+		throw new Error(
+			outcome.status === "aborted"
+				? "terminal publication aborted"
+				: `terminal publication did not settle within ${ACP_TERMINAL_PUBLICATION_WAIT_MS}ms`,
+		);
+	}
+	return wrapTerminalHandle(handle, providerIdentity.leaseId, providerIdentity);
 }
 
-function wrapTerminalHandle(handle: AcpTerminalHandle): ClientBridgeTerminalHandle {
+function wrapTerminalHandle(
+	handle: AcpTerminalHandle,
+	providerLeaseId: string,
+	providerLeaseIdentity: ClientBridgeProviderLeaseIdentity,
+): ClientBridgeTerminalHandle {
 	return {
 		terminalId: handle.id,
+		providerLeaseId,
+		providerLeaseIdentity,
 		async currentOutput() {
 			const out = await handle.currentOutput();
 			return {

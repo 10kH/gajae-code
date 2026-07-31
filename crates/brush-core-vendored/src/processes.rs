@@ -1,14 +1,14 @@
 //! Process management
 
 use futures::FutureExt;
-use std::io::Write;
+use std::{io::Write, sync::Arc, time::Duration};
 
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::{error, openfiles::OpenFile, sys};
+use crate::{error, interp::ExternalCommandProcessObserver, openfiles::OpenFile, sys};
 
 struct CompletionMarker {
 	output:            OpenFile,
@@ -37,6 +37,9 @@ pub struct ChildProcess {
 	#[cfg(windows)]
 	kill_handle: Option<OwnedHandle>,
 	completion_marker: Option<CompletionMarker>,
+	observer: Option<Arc<dyn ExternalCommandProcessObserver>>,
+	/// Whether settlement has already been reported to the ownership observer.
+	settled_notified: bool,
 }
 
 impl ChildProcess {
@@ -45,6 +48,7 @@ impl ChildProcess {
 		child: sys::process::Child,
 		pid: Option<sys::process::ProcessId>,
 		pgid: Option<sys::process::ProcessId>,
+		observer: Option<Arc<dyn ExternalCommandProcessObserver>>,
 	) -> Self {
 		#[cfg(windows)]
 		let kill_handle = child.raw_handle().and_then(duplicate_handle);
@@ -57,6 +61,8 @@ impl ChildProcess {
 			#[cfg(windows)]
 			kill_handle,
 			completion_marker: None,
+			observer,
+			settled_notified: false,
 		}
 	}
 
@@ -87,6 +93,16 @@ impl ChildProcess {
 			Some(CompletionMarker { output, end_marker_prefix, end_marker_suffix });
 	}
 
+	fn notify_settled(&mut self) {
+		if self.settled_notified {
+			return;
+		}
+		self.settled_notified = true;
+		if let Some(observer) = &self.observer {
+			observer.external_command_settled(self.pid);
+		}
+	}
+
 	/// Waits for the process to exit.
 	///
 	/// If a cancellation token is provided and triggered, the process will be killed.
@@ -111,14 +127,36 @@ impl ChildProcess {
 		loop {
 			tokio::select! {
 				output = &mut self.exec_future => {
-					let output = output?;
-					let marker_exit_code = completion_exit_code(&output.status);
-					self.reaped = true;
-					self.write_completion_marker(marker_exit_code);
-					break Ok(ProcessWaitResult::Completed(output))
+					match output {
+						Ok(output) => {
+							let marker_exit_code = completion_exit_code(&output.status);
+							self.reaped = true;
+							self.notify_settled();
+							self.write_completion_marker(marker_exit_code);
+							break Ok(ProcessWaitResult::Completed(output));
+						}
+						Err(error) => {
+							break Err(error.into());
+						}
+					}
 				},
 				_ = &mut cancelled => {
-					self.kill();
+					if self.observer.is_none() {
+						// The exact observer owns cancellation signalling for observed children.
+						// Do not issue a portable/raw-PID fallback here.
+						self.kill();
+					}
+					match tokio::time::timeout(Duration::from_millis(500), &mut self.exec_future).await {
+						Ok(Ok(output)) => {
+							let _output = output;
+							self.reaped = true;
+							self.notify_settled();
+						}
+						Ok(Err(error)) => {
+							return Err(error.into());
+						}
+						Err(_) => {}
+					}
 					self.write_completion_marker(130);
 					break Ok(ProcessWaitResult::Cancelled)
 				},
@@ -141,7 +179,7 @@ impl ChildProcess {
 
 	/// Sends a kill signal if the process has not already been reaped.
 	fn kill(&mut self) {
-		if self.reaped {
+		if self.reaped || self.observer.is_some() {
 			return;
 		}
 		#[cfg(unix)]
@@ -184,6 +222,7 @@ impl ChildProcess {
 			Ok(output) => {
 				let marker_exit_code = completion_exit_code(&output.status);
 				self.reaped = true;
+				self.notify_settled();
 				self.write_completion_marker(marker_exit_code);
 				Ok(output)
 			},
@@ -194,8 +233,73 @@ impl ChildProcess {
 
 impl Drop for ChildProcess {
 	fn drop(&mut self) {
-		// Ensure we do not leave an unreaped child running when the handle is dropped.
-		self.kill();
+		// Observed children are owned by the exact observer. Dropping this handle
+		// must not fall back to a raw PID signal, which could target a recycled
+		// process after the observer has already signaled its pinned reference.
+		if self.observer.is_none() {
+			self.kill();
+		} else if !self.reaped {
+			// Dropping an observed but unreaped child is not settlement. The exact
+			// observer retains its unsettled ownership record so shell cleanup must
+			// terminate the pinned process or fail closed.
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::{
+		atomic::{AtomicUsize, Ordering},
+		Arc,
+	};
+
+	use super::{sys, ChildProcess};
+	use crate::interp::ExternalCommandProcessObserver;
+
+	#[derive(Default)]
+	struct TestObserver {
+		settled: AtomicUsize,
+	}
+
+	impl ExternalCommandProcessObserver for TestObserver {
+		fn external_command_spawned(&self, _pid: Option<i32>, _process_group_id: Option<i32>) {}
+
+		fn external_command_settled(&self, _pid: Option<i32>) {
+			self.settled.fetch_add(1, Ordering::SeqCst);
+		}
+	}
+
+	fn successful_command() -> std::process::Command {
+		#[cfg(windows)]
+		{
+			let mut command = std::process::Command::new("cmd");
+			command.args(["/C", "exit", "0"]);
+			command
+		}
+		#[cfg(not(windows))]
+		{
+			std::process::Command::new("true")
+		}
+	}
+
+	#[tokio::test]
+	async fn poll_settles_observer_once() {
+		let child = sys::process::spawn(successful_command()).expect("spawn test child");
+		let pid = child.id().and_then(|id| i32::try_from(id).ok());
+		let observer = Arc::new(TestObserver::default());
+		let mut process = ChildProcess::new(child, pid, None, Some(observer.clone()));
+
+		for _ in 0..1_000 {
+			if process.poll().is_some() {
+				break;
+			}
+			tokio::task::yield_now().await;
+		}
+
+		assert!(process.reaped, "poll should reap the completed child");
+		assert_eq!(observer.settled.load(Ordering::SeqCst), 1);
+		drop(process);
+		assert_eq!(observer.settled.load(Ordering::SeqCst), 1);
 	}
 }
 

@@ -70,3 +70,7 @@ if (unknownActions.length) {
 
 (Export a runtime `RPC_UNATTENDED_ACTION_CLASSES` array alongside the
 `RpcUnattendedActionClass` type for the membership check.)
+
+## Resolution
+
+**Resolved on current `dev`.** Unrecognized unattended scopes and action classes are rejected during negotiation with `invalid_unattended_declaration`.

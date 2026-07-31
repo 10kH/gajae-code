@@ -2911,13 +2911,14 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 through generation 37 retiring the native authority binding", () => {
+	test("keeps wire protocol 3 through generation 39 process authority hardening", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
 		// Generations 34 and 35 add media conversion and topic adoption; generation
-		// 36 bound managed-session replacement to exact native filesystem authority
-		// and generation 37 retires that binding (revert of #3489) without changing
-		// the wire protocol.
-		expect(DAEMON_GENERATION).toBe(37);
+		// 36 bound managed-session replacement to exact native filesystem authority,
+		// generation 37 retired that binding, generation 38 bound exact cleanup to
+		// parent/link-count authority, and generation 39 hardens exact Bash process
+		// ownership without changing the wire protocol.
+		expect(DAEMON_GENERATION).toBe(39);
 	});
 	test.each([
 		"1",
@@ -10501,6 +10502,56 @@ test("topic persistence failures fail closed without flat delivery", async () =>
 	expect((daemon as any).topics.get("S")?.authorityState).not.toBe("active");
 });
 
+test("first-create compensation persists a failed durable clear for restart replay", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	let topicWrites = 0;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		fs: topicStateFs(async () => {
+			topicWrites++;
+			if (topicWrites === 1) throw new Error("initial topic persistence failed");
+			if (topicWrites === 3) throw new Error("durable compensation clear failed");
+		}),
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+
+	await expect(
+		daemon.handleSessionMessage(session as never, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		}),
+	).rejects.toThrow("initial topic persistence failed");
+
+	const topicId = bot.createdTopicThreadIds[0]!;
+	expect(
+		bot.calls.filter(call => call.method === "deleteForumTopic").map(call => call.body.message_thread_id),
+	).toEqual([topicId]);
+	const retained = await readTopicAuthorityState(agentDir);
+	expect(retained.topics.S).toMatchObject({
+		topicId: String(topicId),
+		authorityState: "delete_pending",
+	});
+	expect((retained as { fences?: Record<string, number> }).fences?.S).toBeGreaterThan(0);
+
+	const restarted = recoveryDaemon(agentDir, bot);
+	await restarted.loadTopics();
+	bot.calls.length = 0;
+	await restarted.scanRoots();
+
+	expect(
+		bot.calls.filter(call => call.method === "deleteForumTopic").map(call => call.body.message_thread_id),
+	).toEqual([topicId]);
+	expect((await readTopicAuthorityState(agentDir)).topics.S).toBeUndefined();
+});
+
 test("threaded mode off: multiple sessions share a single fallback notice", async () => {
 	const agentDir = tempAgentDir();
 	const bot = new FakeBotApi();
@@ -11251,6 +11302,54 @@ test("session_closed revokes persisted ask aliases and pending replies before se
 	expect((restarted as any).aliasTable.get(alias)).toBeUndefined();
 	releaseDelete.resolve();
 	await close;
+});
+test("a concurrent delete re-fence keeps a definite remote delete under durable supervision", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const deleteStarted = Promise.withResolvers<void>();
+	const releaseDelete = Promise.withResolvers<void>();
+	const call = bot.call.bind(bot);
+	bot.call = async (method, body, options) => {
+		if (method === "deleteForumTopic") {
+			bot.calls.push({ method, body, options });
+			deleteStarted.resolve();
+			await releaseDelete.promise;
+			return { ok: true, result: true };
+		}
+		return call(method, body, options);
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+		rich: { enabled: false },
+	});
+	daemon.connectSession("S", "ws://s", "token");
+	await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+		type: "action_needed",
+		kind: "ask",
+		id: "ask",
+		question: "Continue?",
+		options: ["yes"],
+	});
+	const topicId = String((daemon as any).topics.get("S").topicId);
+
+	const deleting = (daemon as any).deleteTopic("S");
+	await deleteStarted.promise;
+	(daemon as any).topics.beginDelete("S");
+	releaseDelete.resolve();
+
+	await expect(deleting).resolves.toBe("post_dispatch_pending");
+	expect((daemon as any).topics.get("S")).toMatchObject({
+		topicId,
+		authorityState: "delete_pending",
+	});
+	const persisted = JSON.parse(fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"));
+	expect(persisted.topics.S).toMatchObject({ topicId, authorityState: "delete_pending" });
 });
 test("closing endpoint stays fenced after delete settlement until final persistence and teardown", async () => {
 	FakeWs.instances = [];

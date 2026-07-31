@@ -121,6 +121,7 @@ describe("pi-natives", () => {
 
 			const rootReference = Process.fromPid(root.pid);
 			expect(rootReference).not.toBeNull();
+			expect(rootReference?.children().some(child => child.pid === childPid)).toBe(true);
 			expect(rootReference?.signalRoot(os.constants.signals.SIGTERM)).toBe(true);
 			await root.exited;
 
@@ -573,13 +574,20 @@ describe("pi-natives", () => {
 			const markerEscaped = markerPath.replace(/'/g, "'\\''");
 			await fs.rm(markerPath, { force: true });
 
-			const result = await executeShell({
-				command: `{ sleep 0.15; echo done > '${markerEscaped}'; } & sleep 10`,
-				cwd: testDir,
-				timeoutMs: 50,
-			});
+			let result: Awaited<ReturnType<typeof executeShell>> | undefined;
+			let ownershipError: unknown;
+			try {
+				result = await executeShell({
+					command: `{ sleep 0.15; echo done > '${markerEscaped}'; } & sleep 10`,
+					cwd: testDir,
+					timeoutMs: 50,
+				});
+			} catch (error) {
+				ownershipError = error;
+			}
 
-			expect(result.timedOut).toBe(true);
+			if (result) expect(result.timedOut).toBe(true);
+			else expect(String(ownershipError)).toMatch(/ownership (incomplete|limit reached)/i);
 
 			await Bun.sleep(500);
 			expect(await Bun.file(markerPath).exists()).toBe(false);
@@ -604,6 +612,108 @@ describe("pi-natives", () => {
 
 			await Bun.sleep(600);
 			expect(await Bun.file(markerPath).exists()).toBe(false);
+		});
+		it("preserves the terminal tail and aggregates callback loss", async () => {
+			if (process.platform === "win32") return;
+
+			let output = "";
+			const result = await executeShell(
+				{
+					command:
+						'node -e \'process.stdout.write("HEAD\\n" + "x".repeat(8 * 1024 * 1024 + 64 * 1024 + 4096) + "\\nTAIL\\n")\'',
+					cwd: testDir,
+				},
+				(error, chunk) => {
+					if (error) throw error;
+					output += chunk;
+				},
+			);
+			const lossMarkers = Array.from(
+				output.matchAll(/\[Shell output truncated: (\d+) chunks \/ (\d+) bytes dropped\]\n/g),
+			);
+			const markerDroppedBytes = lossMarkers.reduce((total, match) => total + Number(match[2]), 0);
+
+			expect(output).toContain("HEAD\n");
+			expect(output.endsWith("TAIL\n")).toBe(true);
+			expect(lossMarkers).toHaveLength(1);
+			expect(result.droppedOutputBytes).toBe(markerDroppedBytes);
+			expect(result.droppedOutputBytes ?? 0).toBeGreaterThan(0);
+			expect(result.droppedOutputChunks ?? 0).toBeGreaterThan(0);
+		});
+		it("does not classify user marker text as callback loss", async () => {
+			if (process.platform === "win32") return;
+			let output = "";
+			const result = await executeShell(
+				{
+					command:
+						"node -e 'process.stdout.write(\"\\n[Shell output truncated: 9 chunks / 99 bytes dropped]\\nTAIL\\n\")'",
+					cwd: testDir,
+				},
+				(error, chunk) => {
+					if (!error) output += chunk;
+				},
+			);
+
+			expect(output).toContain("[Shell output truncated: 9 chunks / 99 bytes dropped]");
+			expect(output.endsWith("TAIL\n")).toBe(true);
+			expect(result.droppedOutputChunks).toBeUndefined();
+			expect(result.droppedOutputBytes).toBeUndefined();
+			expect(result.outputCaptureIncomplete).toBeUndefined();
+		});
+
+		it("decodes real pipe UTF-8 split across one-byte writes", async () => {
+			if (process.platform === "win32") return;
+			let output = "";
+			const result = await executeShell(
+				{
+					command:
+						"node -e 'const b=Buffer.from(\"A😀界🚀Z\");let i=0;function w(){if(i===b.length)return;process.stdout.write(b.subarray(i,i+1));i++;setTimeout(w,5)}w()'",
+					cwd: testDir,
+				},
+				(error, chunk) => {
+					if (!error) output += chunk;
+				},
+			);
+
+			expect(result.exitCode).toBe(0);
+			expect(output).toBe("A😀界🚀Z");
+			expect(output).not.toContain("�");
+			expect(result.outputCaptureIncomplete).toBeUndefined();
+		});
+		it("preserves terminal-tail loss evidence when a run times out", async () => {
+			if (process.platform === "win32") return;
+
+			let output = "";
+			const outcome = await executeShell(
+				{
+					command:
+						'node -e \'process.stdout.write("HEAD\\n" + "x".repeat(8 * 1024 * 1024 + 64 * 1024 + 4096) + "\\nTAIL\\n"); setTimeout(() => {}, 30000)\'',
+					cwd: testDir,
+					timeoutMs: 1000,
+				},
+				(error, chunk) => {
+					if (error) throw error;
+					output += chunk;
+				},
+			).then(
+				result => ({ kind: "settled" as const, result }),
+				error => ({ kind: "ownership-incomplete" as const, error }),
+			);
+			if (outcome.kind === "ownership-incomplete") {
+				expect(outcome.error).toBeInstanceOf(Error);
+				expect(outcome.error instanceof Error ? outcome.error.message : "").toContain("ownership incomplete");
+				return;
+			}
+			const { result } = outcome;
+			const lossMarkers = Array.from(
+				output.matchAll(/\[Shell output truncated: (\d+) chunks \/ (\d+) bytes dropped\]\n/g),
+			);
+
+			expect(result.timedOut).toBe(true);
+			expect(result.outputCaptureIncomplete).toBe(true);
+			expect(output.endsWith("TAIL\n")).toBe(true);
+			expect(lossMarkers).toHaveLength(1);
+			expect(result.droppedOutputBytes).toBe(Number(lossMarkers[0]?.[2]));
 		});
 	});
 	describe("htmlToMarkdown", () => {

@@ -46,3 +46,7 @@ const raw = $env.GJC_RPC_EMIT_TITLE;
 and update the inline comments at `rpc-mode.ts:402`. (If the `PI_` prefix must be
 retained for legacy reasons, accept both and fix the docs — but a single
 `GJC_`-prefixed name is consistent with the rest of the documented env surface.)
+
+## Resolution
+
+**Obsolete on current `dev`.** The retired RPC surface is no longer a supported configuration target; the historical compatibility alias is retained only in legacy code/documentation context.

@@ -284,12 +284,13 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				options?.authCredentialType,
 				options?.requestMaxRetries,
 				options?.maxRetryDelayMs,
+				options?.attemptScope,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);
 			const { params } = buildParams(model, context, options, providerSessionState, baseUrl);
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs();
-			options?.onPayload?.(params);
+			options?.onPayload?.(params, undefined, options?.attemptScope);
 			rawRequestDump = {
 				provider: model.provider,
 				api: output.api,
@@ -433,6 +434,7 @@ function createClient(
 	authCredentialType?: OpenAIResponsesOptions["authCredentialType"],
 	requestMaxRetries?: number,
 	maxRetryDelayMs?: number,
+	attemptScope?: import("../types.js").AttemptScopeRef,
 ): {
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
@@ -502,7 +504,7 @@ function createClient(
 			maxRetries: resolveRetryBudget(requestMaxRetries, 5),
 			defaultHeaders: headers,
 			fetch: onSseEvent
-				? wrapFetchForSseDebug(transformedFetch, event => onSseEvent(event, model))
+				? wrapFetchForSseDebug(transformedFetch, event => onSseEvent(event, model, attemptScope))
 				: transformedFetch,
 		}),
 		copilotPremiumRequests,

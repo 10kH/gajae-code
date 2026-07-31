@@ -110,7 +110,7 @@ const nativeAuthoritySources = {
 		"exact_remove_directory_tree",
 	],
 	"crates/pi-natives/src/ps.rs": ["napi impl Process"],
-	"crates/pi-shell/src/process.rs": ["impl Process", "kill_process_group", "current_descendant_pids", "add_new_descendants"],
+	"crates/pi-shell/src/process.rs": ["impl Process", "kill_process_group", "process_group_members", "current_descendant_pids", "add_new_descendants"],
 	"packages/natives/native/index.d.ts": ["Process"],
 	"packages/coding-agent/src/sdk/broker/process-incarnation.ts": ["isProcessIncarnation", "processIncarnation"],
 } as const;
@@ -127,7 +127,7 @@ function nativeAuthorityFiles(): Array<[string, string]> {
 		["crates/pi-natives/src/ps.rs", "#[napi]\nimpl Process {}"],
 		[
 			"crates/pi-shell/src/process.rs",
-			"impl Process { pub fn incarnation(&self) {} }\npub fn kill_process_group() {}\npub fn current_descendant_pids() {}\npub fn add_new_descendants() {}",
+			"impl Process { pub fn incarnation(&self) {} }\npub fn kill_process_group() {}\npub fn process_group_members() {}\npub fn current_descendant_pids() {}\npub fn add_new_descendants() {}",
 		],
 		["packages/natives/native/index.d.ts", "export declare class Process {}"],
 		["packages/coding-agent/src/sdk/broker/process-incarnation.ts", "export function isProcessIncarnation() {}\nexport function processIncarnation() {}"],
@@ -606,6 +606,8 @@ test("fails closed when a protected native authority declaration is missing or m
 			"impl Process {}",
 			"#[cfg(unix)] pub fn kill_process_group() { let normal = \"}\"; let raw = r###\"{ not a body }\"###; let byte = br#\"} not a body {\"#; let character = '{'; /* { nested /* } */ still comment } */ // }\n return 1; }",
 			"#[cfg(windows)] pub fn kill_process_group() { return 2; }",
+			"#[cfg(unix)] pub fn process_group_members() { return 5; }",
+			"#[cfg(windows)] pub fn process_group_members() { return 6; }",
 			"pub fn current_descendant_pids() { return 3; }",
 			"pub fn add_new_descendants() { return 4; }",
 		].join("\n");
@@ -624,6 +626,48 @@ test("fails closed when a protected native authority declaration is missing or m
 		const malformed = new Map(base);
 		malformed.set(source, platformSource.replace('r###"{ not a body }"###', 'r###"{ unterminated'));
 		expect(decide(base, malformed).malformedDeclarations).toContain(source + ":authority");
+	});
+
+	test("hashes shell process and run ownership capacities", () => {
+		const source = "crates/pi-shell/src/shell.rs";
+		const shellAuthority = [
+			"const MAX_OWNED_COMMAND_PROCESSES: usize = 4096;",
+			"const MAX_PENDING_SHELL_RUNS: usize = 64;",
+			"impl Shell { fn run() { let admission = 1; } }",
+			"impl CommandProcessGroups {}",
+			"impl ExternalCommandProcessObserver for CommandProcessGroups {}",
+			"async fn run_shell_session() { let wrapper = 1; }",
+			"async fn run_shell_oneshot() { let oneshot = 1; }",
+			"async fn run_shell_oneshot_streams() { let streams = 1; }",
+			"async fn run_shell_command() {}",
+			"async fn run_shell_command_streams() {}",
+			"async fn terminate_owned_process_groups() {}",
+			"impl builtins::Command for TimeoutCommand { fn execute() { let timeout = 1; } }",
+		].join("\n");
+		const base = files({ telegramGeneration: 6, discordGeneration: 4, slackGeneration: 4 });
+		base.set(source, shellAuthority);
+		const head = new Map(base);
+		head.set(source, shellAuthority.replace("4096", "8192"));
+		expect(decide(base, head).nativeAuthorityChanges).toEqual([
+			`telegram:${source}:authority`,
+			`discord:${source}:authority`,
+			`slack:${source}:authority`,
+		]);
+		for (const [before, after] of [
+			["admission = 1", "admission = 2"],
+			["wrapper = 1", "wrapper = 2"],
+			["oneshot = 1", "oneshot = 2"],
+			["streams = 1", "streams = 2"],
+			["timeout = 1", "timeout = 2"],
+		] as const) {
+			const changed = new Map(base);
+			changed.set(source, shellAuthority.replace(before, after));
+			expect(decide(base, changed).nativeAuthorityChanges).toEqual([
+				`telegram:${source}:authority`,
+				`discord:${source}:authority`,
+				`slack:${source}:authority`,
+			]);
+		}
 	});
 
 	test("semantic manifest rejects duplicate, moved, and narrowed inventories", () => {

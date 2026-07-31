@@ -22,6 +22,7 @@ import {
 } from "@gajae-code/ai";
 import { isInvalidPromptError, neutralizeReservedControlTokens } from "@gajae-code/ai/utils";
 import { sanitizeText } from "@gajae-code/utils";
+import type { AttemptScope } from "./attempt-scope";
 import {
 	createHarmonyAuditEvent,
 	detectHarmonyLeakInAssistantMessage,
@@ -57,8 +58,10 @@ import type {
 	AgentLoopConfig,
 	AgentMessage,
 	AgentTool,
+	AgentToolContext,
 	AgentToolResult,
 	ManagedAttemptOutcome,
+	StandaloneRunOwnership,
 	StreamFn,
 } from "./types";
 
@@ -102,6 +105,13 @@ class ManagedAttemptSnapshotError extends Error {
 const managedAttemptTextEncoder = new TextEncoder();
 
 const ABORTED: unique symbol = Symbol("agent-loop-aborted");
+interface StandaloneOwnershipState {
+	continuationAvailable: boolean;
+	continuationClaimed: boolean;
+	terminal: boolean;
+}
+
+const standaloneOwnershipStates = new WeakMap<StandaloneRunOwnership, StandaloneOwnershipState>();
 
 /**
  * Terminal bound for argument-validation loops: how many CONSECUTIVE turns may
@@ -181,15 +191,16 @@ function repairInvalidPromptHistory(messages: AgentMessage[]): boolean {
 	return changed;
 }
 
-function managedFailureOutcome(message: AssistantMessage): ManagedAttemptOutcome {
+function managedFailureOutcome(message: AssistantMessage, scope?: AttemptScope): ManagedAttemptOutcome {
 	return {
 		type: "retryable_discarded",
 		failure: { message, transportFailure: managedTransportFailure(message) },
+		scope,
 	};
 }
 
-function managedContextOverflowOutcome(message: AssistantMessage): ManagedAttemptOutcome {
-	return { type: "context_overflow_discarded", message };
+function managedContextOverflowOutcome(message: AssistantMessage, scope?: AttemptScope): ManagedAttemptOutcome {
+	return { type: "context_overflow_discarded", message, scope };
 }
 
 function managedFailureMessage(error: unknown, config: AgentLoopConfig): AssistantMessage {
@@ -291,7 +302,8 @@ export function agentLoop(
 	config: AgentLoopConfig,
 	signal?: AbortSignal,
 	streamFn?: StreamFn,
-	emitManagedAgentStart = true,
+	emitAgentStart = true,
+	initialScope?: AttemptScope,
 ): EventStream<AgentEvent, AgentMessage[]> {
 	const stream = createAgentStream();
 
@@ -301,22 +313,24 @@ export function agentLoop(
 			...context,
 			messages: [...context.messages, ...prompts],
 		};
+		// Allocate before constructing the provisional transaction so every first turn
+		// has one stable scope for lifecycle events, transform hooks, and transport.
+		const scope = initialScope ?? config.initialScope ?? config.attemptMinter?.mint("main");
 		const transaction = config.fallbackManaged
-			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model)
+			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model, scope)
 			: undefined;
 		const attemptStream = transaction ?? stream;
-		openResourceRun(config);
-		if (!config.fallbackManaged || emitManagedAgentStart) stream.push({ type: "agent_start" });
-		attemptStream.push({ type: "turn_start" });
-		for (const prompt of prompts) {
-			stream.push({ type: "message_start", message: prompt });
-			stream.push({ type: "message_end", message: prompt });
-		}
-
 		try {
-			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, transaction);
+			prepareResourceOwnership(config, false);
+			if (emitAgentStart) stream.push({ type: "agent_start", ...(scope ? { scope } : {}) });
+			attemptStream.push({ type: "turn_start", ...(scope ? { scope } : {}) });
+			for (const prompt of prompts) {
+				stream.push({ type: "message_start", message: prompt, scope });
+				stream.push({ type: "message_end", message: prompt, scope });
+			}
+			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, transaction, scope);
 		} catch (err) {
-			if (config.resourceLedger && config.resourceRunId) config.resourceLedger.seal(config.resourceRunId);
+			sealStandaloneOnError(config);
 			stream.fail(err);
 		}
 	})();
@@ -337,7 +351,8 @@ export function agentLoopContinue(
 	config: AgentLoopConfig,
 	signal?: AbortSignal,
 	streamFn?: StreamFn,
-	emitManagedAgentStart = true,
+	emitAgentStart = true,
+	initialScope?: AttemptScope,
 ): EventStream<AgentEvent, AgentMessage[]> {
 	if (context.messages.length === 0) {
 		throw new Error("Cannot continue: no messages in context");
@@ -352,18 +367,20 @@ export function agentLoopContinue(
 	(async () => {
 		const newMessages: AgentMessage[] = [];
 		const currentContext: AgentContext = { ...context };
+		// Allocate before constructing the provisional transaction so every first turn
+		// has one stable scope for lifecycle events, transform hooks, and transport.
+		const scope = initialScope ?? config.initialScope ?? config.attemptMinter?.mint("main");
 		const transaction = config.fallbackManaged
-			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model)
+			? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model, scope)
 			: undefined;
 		const attemptStream = transaction ?? stream;
-		openResourceRun(config);
-		if (!config.fallbackManaged || emitManagedAgentStart) stream.push({ type: "agent_start" });
-		attemptStream.push({ type: "turn_start" });
-
 		try {
-			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, transaction);
+			prepareResourceOwnership(config, true);
+			if (emitAgentStart) stream.push({ type: "agent_start", ...(scope ? { scope } : {}) });
+			attemptStream.push({ type: "turn_start", ...(scope ? { scope } : {}) });
+			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, transaction, scope);
 		} catch (err) {
-			if (config.resourceLedger && config.resourceRunId) config.resourceLedger.seal(config.resourceRunId);
+			sealStandaloneOnError(config);
 			stream.fail(err);
 		}
 	})();
@@ -378,17 +395,121 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 	);
 }
 
-function openResourceRun(config: AgentLoopConfig): void {
-	if (config.resourceLedger && config.resourceRunId) config.resourceLedger.open(config.resourceRunId);
+function prepareResourceOwnership(config: AgentLoopConfig, continuation: boolean): void {
+	if (!config.resourceLedger || !config.resourceRunId) return;
+	if (config.resourceSealOwner === "caller") {
+		const existing = config.resourceLedger.lookupDomain(config.resourceRunId);
+		if (config.resourceCancellationDomain && existing && config.resourceCancellationDomain !== existing) {
+			config.resourceLedger.quarantine(config.resourceRunId);
+			throw new Error("Prompt resource cancellation domain is unavailable");
+		}
+		const domain = config.resourceCancellationDomain ?? existing ?? config.resourceLedger.open(config.resourceRunId);
+		if (!domain) throw new Error("Prompt resource cancellation domain is unavailable");
+		config.resourceCancellationDomain = domain;
+		return;
+	}
+
+	const existing = config.resourceLedger.lookupDomain(config.resourceRunId);
+	const supplied = config.standaloneRunOwnership;
+	if (supplied) {
+		if (!continuation && existing) {
+			config.resourceLedger.quarantine(config.resourceRunId);
+			throw new Error("Standalone prompt continuation ownership is unavailable");
+		}
+		const state = standaloneOwnershipStates.get(supplied);
+		if (
+			!state ||
+			supplied.resourceRunId !== config.resourceRunId ||
+			supplied.domain !== existing ||
+			(config.resourceCancellationDomain !== undefined && config.resourceCancellationDomain !== existing)
+		) {
+			if (existing) config.resourceLedger.quarantine(config.resourceRunId);
+			throw new Error("Standalone prompt ownership is unavailable");
+		}
+		if (continuation && (!state.continuationClaimed || state.terminal)) {
+			config.resourceLedger.quarantine(config.resourceRunId);
+			throw new Error("Standalone prompt continuation ownership is unavailable");
+		}
+		if (continuation) {
+			state.continuationClaimed = false;
+			state.continuationAvailable = false;
+		}
+		config.resourceCancellationDomain = existing;
+		return;
+	}
+	if (existing) {
+		config.resourceLedger.quarantine(config.resourceRunId);
+		throw new Error("Standalone prompt continuation ownership is unavailable");
+	}
+
+	const domain = config.resourceLedger.open(config.resourceRunId);
+	if (!domain) throw new Error("Prompt resource cancellation domain is unavailable");
+	config.resourceCancellationDomain = domain;
+	const state: StandaloneOwnershipState = {
+		continuationAvailable: false,
+		continuationClaimed: false,
+		terminal: false,
+	};
+	const ownership: StandaloneRunOwnership = {
+		resourceRunId: config.resourceRunId,
+		domain,
+		claimContinuation: () => {
+			if (domain.signal.aborted) {
+				state.terminal = true;
+				return { ok: false, reason: "quarantined" };
+			}
+			if (state.terminal) return { ok: false, reason: "terminal" };
+			if (!state.continuationAvailable || state.continuationClaimed) return { ok: false, reason: "already_claimed" };
+			state.continuationClaimed = true;
+			return { ok: true, ownership };
+		},
+		abandon: reason => {
+			if (state.terminal) return;
+			state.terminal = true;
+			config.resourceLedger?.quarantine(config.resourceRunId!);
+			void reason;
+		},
+	};
+	standaloneOwnershipStates.set(ownership, state);
+	config.standaloneRunOwnership = ownership;
+}
+
+function sealStandaloneOnError(config: AgentLoopConfig): void {
+	const standalone = config.standaloneRunOwnership
+		? standaloneOwnershipStates.get(config.standaloneRunOwnership)
+		: undefined;
+	if (standalone) standalone.terminal = true;
+	if (config.resourceSealOwner !== "caller" && config.resourceLedger && config.resourceRunId) {
+		config.resourceLedger.seal(config.resourceRunId);
+	}
 }
 
 function publishAgentEnd(
 	stream: EventStream<AgentEvent, AgentMessage[]>,
 	config: AgentLoopConfig,
 	event: Extract<AgentEvent, { type: "agent_end" }>,
+	scope?: AttemptScope,
 ): void {
-	stream.push(event);
-	if (event.stopReason !== "maintenance" && config.resourceLedger && config.resourceRunId) {
+	// Aborted maintenance yields no continuation, so it is terminal for standalone
+	// ownership and resource sealing. The event itself keeps its `maintenance`
+	// stopReason so AgentSession can still report the aborted maintenance
+	// settlement to its consumers.
+	const publishedEvent = scope ? { ...event, scope } : event;
+	const maintenanceContinues =
+		publishedEvent.stopReason === "maintenance" && publishedEvent.maintenanceOutcome !== "aborted";
+	stream.push(publishedEvent);
+	const standalone = config.standaloneRunOwnership
+		? standaloneOwnershipStates.get(config.standaloneRunOwnership)
+		: undefined;
+	if (maintenanceContinues) {
+		if (standalone) {
+			standalone.continuationAvailable = true;
+			standalone.continuationClaimed = false;
+		}
+		return;
+	}
+	if (standalone) standalone.terminal = true;
+	if (config.resourceSealOwner !== "caller" && config.resourceLedger && config.resourceRunId) {
 		config.resourceLedger.seal(config.resourceRunId);
 	}
 }
@@ -741,6 +862,7 @@ class ManagedAttemptTransaction {
 			| ((message: AssistantMessage, event: AssistantMessageEvent) => void)
 			| undefined,
 		private readonly model: AgentLoopConfig["model"],
+		readonly scope?: AttemptScope,
 	) {}
 
 	push(event: AgentEvent): void {
@@ -883,8 +1005,9 @@ function buildAgentEndEvent(
 	telemetry: AgentTelemetry | undefined,
 	stepCount: number,
 	stopReason: "completed" | "paused" = "completed",
+	scope?: AttemptScope,
 ): Extract<AgentEvent, { type: "agent_end" }> {
-	const base = { type: "agent_end" as const, messages, stopReason };
+	const base = { type: "agent_end" as const, messages, stopReason, ...(scope ? { scope } : {}) };
 	if (!telemetry) return base;
 	const snapshot = telemetry.collector.snapshot({ stepCount });
 	if (telemetry.collector.markRunEnded()) {
@@ -1215,6 +1338,7 @@ async function runLoop(
 	stream: EventStream<AgentEvent, AgentMessage[]>,
 	streamFn?: StreamFn,
 	initialTransaction?: ManagedAttemptTransaction,
+	initialScope?: AttemptScope,
 ): Promise<void> {
 	const loopSignal = signal ?? new AbortController().signal;
 
@@ -1236,6 +1360,7 @@ async function runLoop(
 				stepCounter,
 				streamFn,
 				initialTransaction,
+				initialScope,
 			),
 		);
 	} catch (err) {
@@ -1265,8 +1390,10 @@ async function runLoopBody(
 	stepCounter: StepCounter,
 	streamFn?: StreamFn,
 	initialTransaction?: ManagedAttemptTransaction,
+	initialScope?: AttemptScope,
 ): Promise<void> {
 	let firstTurn = true;
+	let lastAttemptScope: AttemptScope | undefined;
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 	let harmonyRetryAttempt = 0;
@@ -1301,15 +1428,20 @@ async function runLoopBody(
 
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0) {
+			const scope =
+				initialScope ?? (firstTurn ? config.initialScope : undefined) ?? config.attemptMinter?.mint("main");
+			initialScope = undefined;
 			const transaction =
 				initialTransaction ??
 				(config.fallbackManaged
-					? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model)
+					? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model, scope)
 					: undefined);
 			initialTransaction = undefined;
+			const attemptScope = transaction?.scope ?? scope;
+			lastAttemptScope = attemptScope;
 			const attemptStream = transaction ?? stream;
 			if (!firstTurn) {
-				attemptStream.push({ type: "turn_start" });
+				attemptStream.push({ type: "turn_start", ...(attemptScope ? { scope: attemptScope } : {}) });
 			} else {
 				firstTurn = false;
 			}
@@ -1318,8 +1450,8 @@ async function runLoopBody(
 			// discarded managed attempt cannot lose it before its retry continuation.
 			if (pendingMessages.length > 0) {
 				for (const message of pendingMessages) {
-					stream.push({ type: "message_start", message });
-					stream.push({ type: "message_end", message });
+					stream.push({ type: "message_start", message, scope: attemptScope });
+					stream.push({ type: "message_end", message, scope: attemptScope });
 					currentContext.messages.push(message);
 					newMessages.push(message);
 				}
@@ -1347,12 +1479,17 @@ async function runLoopBody(
 				const outcome = loopSignal.aborted ? "aborted" : maintenanceOutcome;
 
 				if (outcome !== "not-needed") {
-					stream.push({
-						type: "agent_end",
-						messages: newMessages,
-						stopReason: "maintenance",
-						maintenanceOutcome: outcome,
-					});
+					publishAgentEnd(
+						stream,
+						config,
+						{
+							type: "agent_end",
+							messages: newMessages,
+							stopReason: "maintenance",
+							maintenanceOutcome: outcome,
+						},
+						attemptScope,
+					);
 					stream.end(newMessages);
 					return;
 				}
@@ -1395,6 +1532,7 @@ async function runLoopBody(
 					telemetry,
 					invokeAgentSpan,
 					stepCounter,
+					attemptScope,
 					streamFn,
 					harmonyRetryAttempt,
 					recoveryState.pending && recoveryState.syntheticMessage
@@ -1416,7 +1554,9 @@ async function runLoopBody(
 						transaction.discard();
 						currentContext.messages.splice(contextMessageCount);
 						newMessages.splice(newMessageCount);
-						await config.onManagedAttemptOutcome?.(managedContextOverflowOutcome(failureMessage));
+						await config.onManagedAttemptOutcome?.(
+							managedContextOverflowOutcome(failureMessage, transaction.scope),
+						);
 						stream.end(newMessages);
 						return;
 					}
@@ -1424,7 +1564,7 @@ async function runLoopBody(
 						transaction.discard();
 						currentContext.messages.splice(contextMessageCount);
 						newMessages.splice(newMessageCount);
-						await config.onManagedAttemptOutcome?.(managedFailureOutcome(failureMessage));
+						await config.onManagedAttemptOutcome?.(managedFailureOutcome(failureMessage, transaction.scope));
 						stream.end(newMessages);
 						return;
 					}
@@ -1516,7 +1656,7 @@ async function runLoopBody(
 				transaction?.discard();
 				currentContext.messages.splice(contextMessageCount);
 				newMessages.splice(newMessageCount);
-				await config.onManagedAttemptOutcome?.(managedContextOverflowOutcome(message));
+				await config.onManagedAttemptOutcome?.(managedContextOverflowOutcome(message, transaction?.scope));
 				stream.end(newMessages);
 				return;
 			}
@@ -1537,7 +1677,7 @@ async function runLoopBody(
 				transaction?.discard();
 				currentContext.messages.splice(contextMessageCount);
 				newMessages.splice(newMessageCount);
-				await config.onManagedAttemptOutcome?.(managedFailureOutcome(message));
+				await config.onManagedAttemptOutcome?.(managedFailureOutcome(message, transaction?.scope));
 				stream.end(newMessages);
 				return;
 			}
@@ -1546,7 +1686,11 @@ async function runLoopBody(
 				transaction?.discard();
 				currentContext.messages.splice(contextMessageCount);
 				newMessages.splice(newMessageCount);
-				await config.onManagedAttemptOutcome?.({ type: "run_terminal", reason: "cancelled" });
+				await config.onManagedAttemptOutcome?.({
+					type: "run_terminal",
+					reason: "cancelled",
+					scope: transaction?.scope,
+				});
 				stream.end(newMessages);
 				return;
 			}
@@ -1588,8 +1732,13 @@ async function runLoopBody(
 						status: message.stopReason === "aborted" ? "aborted" : "error",
 					});
 				}
-				stream.push({ type: "turn_end", message, toolResults });
-				publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
+				stream.push({ type: "turn_end", message, toolResults, scope: attemptScope });
+				publishAgentEnd(
+					stream,
+					config,
+					buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", attemptScope),
+					attemptScope,
+				);
 				stream.end(newMessages);
 				return;
 			}
@@ -1627,6 +1776,7 @@ async function runLoopBody(
 						config,
 						telemetry,
 						invokeAgentSpan,
+						attemptScope,
 					);
 
 					toolResults.push(...executionResult.toolResults);
@@ -1660,7 +1810,7 @@ async function runLoopBody(
 				recoveryState.syntheticMessage = undefined;
 			}
 
-			stream.push({ type: "turn_end", message, toolResults });
+			stream.push({ type: "turn_end", message, toolResults, scope: attemptScope });
 
 			if (steeringMessagesFromExecution && steeringMessagesFromExecution.length > 0) {
 				pendingMessages = steeringMessagesFromExecution;
@@ -1669,7 +1819,12 @@ async function runLoopBody(
 			pendingMessages = (await config.getSteeringMessages?.()) || [];
 			if (pendingMessages.length > 0) continue;
 			if (config.shouldPause?.()) {
-				publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "paused"));
+				publishAgentEnd(
+					stream,
+					config,
+					buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "paused", attemptScope),
+					attemptScope,
+				);
 				stream.end(newMessages);
 				return;
 			}
@@ -1690,7 +1845,12 @@ async function runLoopBody(
 				message.errorMessage = message.errorMessage
 					? `${message.errorMessage} | ${breakerMessage}`
 					: breakerMessage;
-				publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
+				publishAgentEnd(
+					stream,
+					config,
+					buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", attemptScope),
+					attemptScope,
+				);
 				stream.end(newMessages);
 				return;
 			}
@@ -1699,7 +1859,12 @@ async function runLoopBody(
 		// Agent would stop here. Check for follow-up messages.
 		await config.onBeforeYield?.();
 		if (config.shouldPause?.()) {
-			publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "paused"));
+			publishAgentEnd(
+				stream,
+				config,
+				buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "paused", lastAttemptScope),
+				lastAttemptScope,
+			);
 			stream.end(newMessages);
 			return;
 		}
@@ -1714,7 +1879,12 @@ async function runLoopBody(
 		break;
 	}
 
-	publishAgentEnd(stream, config, buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
+	publishAgentEnd(
+		stream,
+		config,
+		buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", lastAttemptScope),
+		lastAttemptScope,
+	);
 	stream.end(newMessages);
 }
 
@@ -1747,6 +1917,7 @@ async function streamAssistantResponse(
 	telemetry: AgentTelemetry | undefined,
 	invokeAgentSpan: Span | undefined,
 	stepCounter: StepCounter,
+	scope?: AttemptScope,
 	streamFn?: StreamFn,
 	harmonyRetryAttempt = 0,
 	recoveryMode?: { syntheticMessage: UserMessage },
@@ -1754,7 +1925,7 @@ async function streamAssistantResponse(
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
 	if (config.transformContext) {
-		messages = await config.transformContext(messages, signal);
+		messages = await config.transformContext(messages, signal, scope);
 	}
 
 	// Convert to LLM-compatible messages (AgentMessage[] → Message[]) and normalize at the LLM boundary.
@@ -1810,11 +1981,17 @@ async function streamAssistantResponse(
 	const dynamicReasoning = config.getReasoning?.();
 	const harmonyMitigationEnabled = isHarmonyLeakMitigationTarget(config.model);
 	const harmonyAbortController = harmonyMitigationEnabled ? new AbortController() : undefined;
-	const requestSignal = harmonyAbortController
-		? signal
-			? AbortSignal.any([signal, harmonyAbortController.signal])
-			: harmonyAbortController.signal
-		: signal;
+	const requestSignals = [
+		...(signal ? [signal] : []),
+		...(config.resourceCancellationDomain ? [config.resourceCancellationDomain.signal] : []),
+		...(harmonyAbortController ? [harmonyAbortController.signal] : []),
+	];
+	const requestSignal =
+		requestSignals.length === 0
+			? undefined
+			: requestSignals.length === 1
+				? requestSignals[0]
+				: AbortSignal.any(requestSignals);
 	const effectiveTemperature =
 		harmonyRetryAttempt > 0 && config.temperature !== undefined ? config.temperature + 0.05 : config.temperature;
 	const effectiveToolChoice = recoveryMode ? "none" : (dynamicToolChoice ?? config.toolChoice);
@@ -1845,9 +2022,9 @@ async function streamAssistantResponse(
 	// stealing them from the configured hook.
 	let capturedHeaders: Readonly<Record<string, string>> | undefined;
 	const userOnResponse = config.onResponse;
-	const captureOnResponse: AgentLoopConfig["onResponse"] = (response, modelInfo) => {
+	const captureOnResponse: AgentLoopConfig["onResponse"] = (response, modelInfo, scope) => {
 		capturedHeaders = response.headers;
-		return userOnResponse?.(response, modelInfo);
+		return userOnResponse?.(response, modelInfo, scope);
 	};
 
 	const finishChat = async (message: AssistantMessage): Promise<void> => {
@@ -1862,21 +2039,45 @@ async function streamAssistantResponse(
 	try {
 		return await runInActiveSpan(chatSpan, async () => {
 			const fallbackAttempt = config.fallbackManaged ? config.nextFallbackAttempt?.(config.model) : undefined;
-			const responsePromise = Promise.resolve().then(() =>
-				streamFunction(config.model, llmContext, {
-					...config,
-					fallbackAttempt,
-					apiKey: resolvedApiKey,
-					authCredentialType,
-					metadata: resolvedMetadata,
-					sessionId: config.providerSessionId ?? config.sessionId,
-					toolChoice: effectiveToolChoice,
-					reasoning: effectiveReasoning,
-					temperature: effectiveTemperature,
-					signal: requestSignal,
-					onResponse: captureOnResponse,
-				}),
-			);
+			const providerReservation =
+				config.resourceLedger && config.resourceRunId
+					? config.resourceLedger.reserveProducer(
+							config.resourceRunId,
+							config.resourceCancellationDomain,
+							"provider_factory",
+							`${config.model.provider}/${config.model.id}`,
+						)
+					: undefined;
+			if (providerReservation && !providerReservation.ok)
+				throw new Error("Prompt resource ownership is unavailable");
+			if (requestSignal?.aborted) {
+				providerReservation?.ok && providerReservation.lease.closeDiscovery();
+				const aborted = emitAbortedAssistantMessage(null, false, context, config, stream, scope);
+				await finishChat(aborted);
+				return aborted;
+			}
+			let responsePromise: Promise<Awaited<ReturnType<StreamFn>>>;
+			try {
+				responsePromise = Promise.resolve(
+					streamFunction(config.model, llmContext, {
+						...config,
+						attemptScope: scope,
+						fallbackAttempt,
+						apiKey: resolvedApiKey,
+						authCredentialType,
+						metadata: resolvedMetadata,
+						sessionId: config.providerSessionId ?? config.sessionId,
+						toolChoice: effectiveToolChoice,
+						reasoning: effectiveReasoning,
+						temperature: effectiveTemperature,
+						signal: requestSignal,
+						onResponse: captureOnResponse,
+					}),
+				);
+			} catch (error) {
+				providerReservation?.ok && providerReservation.lease.closeDiscovery();
+				throw error;
+			}
 			const { promise: iteratorSettled, resolve: settleIterator } = Promise.withResolvers<void>();
 			let responseResultPromise: Promise<AssistantMessage> | undefined;
 			let responseForResult: { result(): Promise<AssistantMessage> } | undefined;
@@ -1887,16 +2088,55 @@ async function streamAssistantResponse(
 				await iteratorSettled;
 				await Promise.allSettled([getResponseResult()]);
 			});
-			if (config.resourceLedger && config.resourceRunId) {
-				// One ownership spans factory creation, iterator close, and trailing result.
-				config.resourceLedger.track(
-					config.resourceRunId,
-					"provider_factory",
-					`${config.model.provider}/${config.model.id}`,
-					providerLifecycle,
+			const closeLateFactoryResponse = (): void => {
+				void responsePromise.then(
+					response => {
+						responseForResult = response;
+						try {
+							const iterator = response[Symbol.asyncIterator]();
+							try {
+								const returned = iterator.return?.();
+								void Promise.resolve(returned).then(
+									() => settleIterator(),
+									() => settleIterator(),
+								);
+							} catch {
+								settleIterator();
+							}
+						} catch {
+							settleIterator();
+						}
+					},
+					() => settleIterator(),
+				);
+			};
+			if (providerReservation?.ok) {
+				providerReservation.lease.track("provider_iterator", "provider-lifecycle", providerLifecycle);
+				void providerLifecycle.then(
+					() => providerReservation.lease.closeDiscovery(),
+					() => providerReservation.lease.closeDiscovery(),
 				);
 			}
-			const response = await responsePromise;
+			let response: Awaited<typeof responsePromise>;
+			if (requestSignal) {
+				const { promise: factoryAbort, resolve: resolveFactoryAbort } = Promise.withResolvers<typeof ABORTED>();
+				const onFactoryAbort = () => resolveFactoryAbort(ABORTED);
+				requestSignal.addEventListener("abort", onFactoryAbort, { once: true });
+				try {
+					const responseOrAbort = await Promise.race([responsePromise, factoryAbort]);
+					if (responseOrAbort === ABORTED) {
+						const aborted = emitAbortedAssistantMessage(null, false, context, config, stream, scope);
+						await finishChat(aborted);
+						closeLateFactoryResponse();
+						return aborted;
+					}
+					response = responseOrAbort;
+				} finally {
+					requestSignal.removeEventListener("abort", onFactoryAbort);
+				}
+			} else {
+				response = await responsePromise;
+			}
 			responseForResult = response;
 
 			let partialMessage: AssistantMessage | null = null;
@@ -1929,7 +2169,14 @@ async function streamAssistantResponse(
 			if (requestSignal) {
 				if (requestSignal.aborted) {
 					closeIterator();
-					const aborted = emitAbortedAssistantMessage(partialMessage, addedPartial, context, config, stream);
+					const aborted = emitAbortedAssistantMessage(
+						partialMessage,
+						addedPartial,
+						context,
+						config,
+						stream,
+						scope,
+					);
 					await finishChat(aborted);
 					return aborted;
 				}
@@ -1947,7 +2194,14 @@ async function streamAssistantResponse(
 						const result = await Promise.race([responseIterator.next(), abortRacePromise]);
 						if (result === ABORTED) {
 							closeIterator();
-							const aborted = emitAbortedAssistantMessage(partialMessage, addedPartial, context, config, stream);
+							const aborted = emitAbortedAssistantMessage(
+								partialMessage,
+								addedPartial,
+								context,
+								config,
+								stream,
+								scope,
+							);
 							await finishChat(aborted);
 							return aborted;
 						}
@@ -1956,7 +2210,14 @@ async function streamAssistantResponse(
 						next = await responseIterator.next();
 					}
 					if (requestSignal?.aborted) {
-						const aborted = emitAbortedAssistantMessage(partialMessage, addedPartial, context, config, stream);
+						const aborted = emitAbortedAssistantMessage(
+							partialMessage,
+							addedPartial,
+							context,
+							config,
+							stream,
+							scope,
+						);
 						await finishChat(aborted);
 						return aborted;
 					}
@@ -1975,7 +2236,7 @@ async function streamAssistantResponse(
 								: event.partial;
 							context.messages.push(partialMessage);
 							addedPartial = true;
-							stream.push({ type: "message_start", message: { ...partialMessage } });
+							stream.push({ type: "message_start", message: { ...partialMessage }, scope });
 							break;
 
 						case "toolChoiceIncapability":
@@ -2006,6 +2267,7 @@ async function streamAssistantResponse(
 									type: "message_update",
 									assistantMessageEvent: partialEvent,
 									message: { ...partialMessage },
+									scope,
 								});
 							}
 							break;
@@ -2021,9 +2283,9 @@ async function streamAssistantResponse(
 								context.messages.push(finalMessage);
 							}
 							if (!addedPartial) {
-								stream.push({ type: "message_start", message: { ...finalMessage } });
+								stream.push({ type: "message_start", message: { ...finalMessage }, scope });
 							}
-							stream.push({ type: "message_end", message: finalMessage });
+							stream.push({ type: "message_end", message: finalMessage, scope });
 							await finishChat(finalMessage);
 							return finalMessage;
 						}
@@ -2056,6 +2318,7 @@ function emitAbortedAssistantMessage(
 	context: AgentContext,
 	config: AgentLoopConfig,
 	stream: EventStream<AgentEvent, AgentMessage[]>,
+	scope?: AttemptScope,
 ): AssistantMessage {
 	const errorMessage = "Request was aborted";
 	const now = Date.now();
@@ -2080,9 +2343,9 @@ function emitAbortedAssistantMessage(
 	if (addedPartial) {
 		context.messages.pop();
 	} else {
-		stream.push({ type: "message_start", message: { ...abortedMessage } });
+		stream.push({ type: "message_start", message: { ...abortedMessage }, scope });
 	}
-	stream.push({ type: "message_end", message: abortedMessage });
+	stream.push({ type: "message_end", message: abortedMessage, scope });
 	return abortedMessage;
 }
 
@@ -2108,6 +2371,7 @@ async function executeToolCalls(
 	config: AgentLoopConfig,
 	telemetry: AgentTelemetry | undefined,
 	invokeAgentSpan: Span | undefined,
+	scope?: AttemptScope,
 ): Promise<{
 	toolResults: ToolResultMessage[];
 	steeringMessages?: AgentMessage[];
@@ -2130,9 +2394,12 @@ async function executeToolCalls(
 	const batchId = `${assistantMessage.timestamp ?? Date.now()}_${toolCalls[0]?.id ?? "batch"}`;
 	const shouldInterruptImmediately = interruptMode !== "wait";
 	const steeringAbortController = new AbortController();
-	const toolSignal = signal
-		? AbortSignal.any([signal, steeringAbortController.signal])
-		: steeringAbortController.signal;
+	const toolSignals = [
+		...(signal ? [signal] : []),
+		...(config.resourceCancellationDomain ? [config.resourceCancellationDomain.signal] : []),
+		steeringAbortController.signal,
+	];
+	const toolSignal = toolSignals.length === 1 ? toolSignals[0] : AbortSignal.any(toolSignals);
 	const interruptState = { triggered: false };
 	let steeringMessages: AgentMessage[] | undefined;
 	let steeringCheck: Promise<void> | null = null;
@@ -2187,6 +2454,7 @@ async function executeToolCalls(
 				toolName: toolCall.name,
 				args: record.args,
 				intent: toolCall.intent,
+				scope,
 			});
 		}
 		stream.push({
@@ -2195,6 +2463,7 @@ async function executeToolCalls(
 			toolName: toolCall.name,
 			result,
 			isError,
+			scope,
 		});
 
 		const toolResultMessage: ToolResultMessage = {
@@ -2212,8 +2481,8 @@ async function executeToolCalls(
 		record.resultEmitted = true;
 		emittedToolResults.push(toolResultMessage);
 
-		stream.push({ type: "message_start", message: toolResultMessage });
-		stream.push({ type: "message_end", message: toolResultMessage });
+		stream.push({ type: "message_start", message: toolResultMessage, scope });
+		stream.push({ type: "message_end", message: toolResultMessage, scope });
 	};
 
 	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
@@ -2251,6 +2520,7 @@ async function executeToolCalls(
 			toolName: toolCall.name,
 			args: argsForExecution,
 			intent: toolCall.intent,
+			scope,
 		});
 
 		const toolSpan = startExecuteToolSpan(telemetry, {
@@ -2328,7 +2598,7 @@ async function executeToolCalls(
 				// Reflect post-hook args so emitted tool results / afterToolCall see what actually executed.
 				record.args = effectiveArgs;
 
-				const toolContext = getToolContext
+				const baseToolContext = getToolContext
 					? getToolContext({
 							batchId,
 							index,
@@ -2336,6 +2606,9 @@ async function executeToolCalls(
 							toolCalls: toolCallInfos,
 						})
 					: undefined;
+				const toolContext = scope
+					? (Object.assign(baseToolContext ?? {}, { attemptScope: scope }) as AgentToolContext)
+					: baseToolContext;
 				const execution = tool.execute(
 					toolCall.id,
 					transformToolCallArguments ? transformToolCallArguments(effectiveArgs, toolCall.name) : effectiveArgs,
@@ -2347,6 +2620,7 @@ async function executeToolCalls(
 							toolName: toolCall.name,
 							args: effectiveArgs,
 							partialResult: coerceToolResult(partialResult).result,
+							scope,
 						});
 					},
 					toolContext,
@@ -2435,11 +2709,28 @@ async function executeToolCalls(
 		const record = records[index];
 		const concurrency = record.tool?.concurrency ?? "shared";
 		const start = concurrency === "exclusive" ? Promise.all([lastExclusive, ...sharedTasks]) : lastExclusive;
+		const reservation =
+			config.resourceLedger && config.resourceRunId
+				? config.resourceLedger.reserveProducer(
+						config.resourceRunId,
+						config.resourceCancellationDomain,
+						"tool",
+						`${record.toolCall.name}:${record.toolCall.id}`,
+					)
+				: undefined;
+		if (reservation && !reservation.ok) {
+			record.skipped = true;
+			recordSkippedTool(telemetry, {
+				toolCallId: record.toolCall.id,
+				toolName: record.toolCall.name,
+				status: "skipped",
+			});
+			emitToolResult(record, createSkippedToolResult(), true);
+			continue;
+		}
 		const task = start
 			.then(() => runTool(record, index))
 			.finally(() => {
-				// Scheduler ownership includes dependency waits and the fallback skip
-				// emission, not only tool.execute().
 				if (!record.toolResultMessage) {
 					record.skipped = true;
 					recordSkippedTool(telemetry, {
@@ -2450,15 +2741,14 @@ async function executeToolCalls(
 					emitToolResult(record, createSkippedToolResult(), true);
 				}
 			});
-		tasks.push(task);
-		if (config.resourceLedger && config.resourceRunId) {
-			config.resourceLedger.track(
-				config.resourceRunId,
-				"tool",
-				`${record.toolCall.name}:${record.toolCall.id}`,
-				task,
+		if (reservation?.ok) {
+			reservation.lease.track("tool", `${record.toolCall.name}:${record.toolCall.id}`, task);
+			void task.then(
+				() => reservation.lease.closeDiscovery(),
+				() => reservation.lease.closeDiscovery(),
 			);
 		}
+		tasks.push(task);
 		if (concurrency === "exclusive") {
 			lastExclusive = task;
 			sharedTasks = [];

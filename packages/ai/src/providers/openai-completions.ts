@@ -482,6 +482,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				options?.requestMaxRetries,
 				options?.sessionId,
 				options?.maxRetryDelayMs,
+				options?.attemptScope,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			getCapturedErrorResponse = captureErrorResponse;
@@ -504,7 +505,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					effectiveToolStrictModeOverride,
 				);
 				appliedToolStrictMode = toolStrictMode;
-				options?.onPayload?.(params);
+				options?.onPayload?.(params, undefined, options?.attemptScope);
 				rawRequestDump = {
 					provider: model.provider,
 					api: output.api,
@@ -1023,6 +1024,7 @@ async function createClient(
 	requestMaxRetries?: number,
 	sessionId?: string,
 	maxRetryDelayMs?: number,
+	attemptScope?: import("../types.js").AttemptScopeRef,
 ): Promise<{
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
@@ -1145,7 +1147,7 @@ async function createClient(
 		`Gajae-Code/${packageJson.version}`,
 	);
 	const debugFetch = onSseEvent
-		? wrapFetchForSseDebug(transformedFetch, event => onSseEvent(event, model))
+		? wrapFetchForSseDebug(transformedFetch, event => onSseEvent(event, model, attemptScope))
 		: transformedFetch;
 	// Bound HTTP request timeout to roughly the first-event watchdog window.
 	// The OpenAI SDK's default is 10 minutes per attempt × `maxRetries`, which

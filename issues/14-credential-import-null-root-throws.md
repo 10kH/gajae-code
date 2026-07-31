@@ -60,3 +60,7 @@ if (typeof parsed !== "object" || parsed === null) {
 
 Add negative tests for `null`, number, string, and array roots in
 `credential-import.test.ts`.
+
+## Resolution
+
+**Resolved on current `dev`.** Both credential parsers reject non-object and array roots before dereferencing. The guards are present at `packages/coding-agent/src/setup/credential-import.ts:190-192` and `:291-293`.

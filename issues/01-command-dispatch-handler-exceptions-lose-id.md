@@ -92,3 +92,7 @@ Keep the input-loop catch only for genuine pre-dispatch failures (it already
 handles `JSON.parse`). This makes every routable command return
 `{ id, command: <type>, success: false, error }` and removes the special-case
 guards now scattered across individual handlers.
+
+## Resolution
+
+**Resolved on current `dev`.** Dispatch exceptions now produce correlated command-specific RPC errors, and the real-binary RPC integration lane covers the behavior.

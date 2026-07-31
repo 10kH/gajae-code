@@ -11,8 +11,17 @@ import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { getMarkdownTheme, type Theme } from "../modes/theme/theme";
 import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
-import { DEFAULT_MAX_BYTES, OutputSink, type OutputSummary, TailBuffer } from "../session/streaming-output";
+import {
+	DEFAULT_ARTIFACT_MAX_BYTES,
+	DEFAULT_MAX_BYTES,
+	OutputSink,
+	type OutputSummary,
+	TailBuffer,
+	type TerminalArtifactPublisher,
+	truncateHeadBytes,
+} from "../session/streaming-output";
 import { getTreeBranch, getTreeContinuePrefix, renderCodeCell } from "../tui";
+import { isValidArtifactId } from "../utils/artifact-id";
 import { resolveEvalBackends, type ToolSession } from ".";
 import {
 	formatStyledTruncationWarning,
@@ -163,6 +172,55 @@ interface ResolvedEvalCell {
 	resolved: ResolvedBackend;
 }
 
+const EVAL_ARTIFACT_ALLOCATION_WAIT_MS = 500;
+const EVAL_ARTIFACT_ALLOCATION_LIMIT = 64;
+const pendingEvalArtifactAllocations = new Set<Promise<unknown>>();
+
+async function allocateEvalArtifact(
+	session: ToolSession,
+	signal?: AbortSignal,
+): Promise<{ path?: string; id?: string; diagnostic?: string }> {
+	if (!session.allocateOutputArtifact) return {};
+	if (signal?.aborted) throw new ToolAbortError();
+	if (pendingEvalArtifactAllocations.size >= EVAL_ARTIFACT_ALLOCATION_LIMIT) {
+		return { diagnostic: "pending Eval artifact allocation limit reached" };
+	}
+	const allocation = Promise.resolve().then(() => session.allocateOutputArtifact!("eval"));
+	pendingEvalArtifactAllocations.add(allocation);
+	void allocation.then(
+		() => pendingEvalArtifactAllocations.delete(allocation),
+		() => pendingEvalArtifactAllocations.delete(allocation),
+	);
+	const aborted = Promise.withResolvers<{ status: "aborted" }>();
+	const onAbort = () => aborted.resolve({ status: "aborted" });
+	signal?.addEventListener("abort", onAbort, { once: true });
+	try {
+		const outcome = await Promise.race([
+			allocation.then(
+				value => ({ status: "ok" as const, value }),
+				error => ({
+					status: "failed" as const,
+					diagnostic: error instanceof Error ? error.message : String(error),
+				}),
+			),
+			Bun.sleep(EVAL_ARTIFACT_ALLOCATION_WAIT_MS).then(() => ({
+				status: "timeout" as const,
+				diagnostic: `did not settle within ${EVAL_ARTIFACT_ALLOCATION_WAIT_MS}ms`,
+			})),
+			aborted.promise,
+		]);
+		if (outcome.status === "aborted") throw new ToolAbortError();
+		if (outcome.status !== "ok") return { diagnostic: outcome.diagnostic.slice(0, 512) };
+		const { path, id } = outcome.value ?? {};
+		if (!path || !isValidArtifactId(id)) {
+			return { diagnostic: "artifact storage is unavailable or returned an invalid artifact id" };
+		}
+		return { path, id };
+	} finally {
+		signal?.removeEventListener("abort", onAbort);
+	}
+}
+
 function uniqueEvalLanguages(cells: ResolvedEvalCell[]): EvalLanguage[] {
 	return [...new Set(cells.map(cell => cell.resolved.backend.id))];
 }
@@ -265,10 +323,12 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		const sessionAbortController = new AbortController();
 		let outputSink: OutputSink | undefined;
 		let outputSummary: OutputSummary | undefined;
+		let artifactAllocationDiagnostic: string | undefined;
 		let outputDumped = false;
 		const finalizeOutput = async (): Promise<OutputSummary | undefined> => {
 			if (outputDumped || !outputSink) return outputSummary;
 			outputSummary = await outputSink.dump();
+			if (artifactAllocationDiagnostic) outputSummary.artifactFailureDiagnostic = artifactAllocationDiagnostic;
 			outputDumped = true;
 			return outputSummary;
 		};
@@ -334,11 +394,34 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 
 				const sessionFile = session.getSessionFile?.() ?? undefined;
 				const kernelOwnerId = session.getEvalKernelOwnerId?.() ?? undefined;
-				const { path: artifactPath, id: artifactId } = (await session.allocateOutputArtifact?.("eval")) ?? {};
+				const artifactManager = session.getArtifactManager?.();
+				const managedArtifactPublisher: TerminalArtifactPublisher | undefined = artifactManager?.getManagedStore()
+					? Object.assign(
+							async (content: string) => {
+								const contentBytes = Buffer.byteLength(content, "utf8");
+								const artifactId = await artifactManager.save(content, "eval");
+								if (contentBytes <= DEFAULT_ARTIFACT_MAX_BYTES) {
+									return { status: "published" as const, artifactId };
+								}
+								const retainedBytes = truncateHeadBytes(content, DEFAULT_ARTIFACT_MAX_BYTES).bytes;
+								return {
+									status: "published" as const,
+									artifactId,
+									omittedBytes: contentBytes - retainedBytes,
+								};
+							},
+							{ owner: artifactManager },
+						)
+					: undefined;
+				const allocation = managedArtifactPublisher ? {} : await allocateEvalArtifact(session, signal);
+				artifactAllocationDiagnostic = allocation.diagnostic;
+				const { path: artifactPath, id: artifactId } = allocation;
+				if (signal?.aborted) throw new ToolAbortError();
 				session.assertEvalExecutionAllowed?.();
 				outputSink = new OutputSink({
 					artifactPath,
 					artifactId,
+					artifactPublisher: managedArtifactPublisher,
 					headBytes: resolveOutputSinkHeadBytes(session.settings),
 					maxColumns: resolveOutputMaxColumns(session.settings),
 					onChunk: chunk => {
@@ -376,8 +459,6 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						session,
 						deadlineMs,
 						reset: cell.reset,
-						artifactPath,
-						artifactId,
 						onChunk: chunk => {
 							outputSink!.push(chunk);
 						},
@@ -545,6 +626,7 @@ async function summarizeFinal(
 	const outputBytes = Buffer.byteLength(combinedOutput, "utf-8");
 	const missingLines = Math.max(0, rawSummary.totalLines - rawSummary.outputLines);
 	const missingBytes = Math.max(0, rawSummary.totalBytes - rawSummary.outputBytes);
+	const artifactRepresentationIncomplete = rawSummary.output !== combinedOutput || rawSummary.artifactId !== undefined;
 	return {
 		output: combinedOutput,
 		truncated: rawSummary.truncated,
@@ -553,6 +635,19 @@ async function summarizeFinal(
 		outputLines,
 		outputBytes,
 		artifactId: rawSummary.artifactId,
+		artifactVerified: rawSummary.artifactVerified,
+		artifactTruncatedBytes: rawSummary.artifactTruncatedBytes,
+		sourceTruncatedBytes: rawSummary.sourceTruncatedBytes,
+		sourceCaptureIncomplete:
+			rawSummary.sourceCaptureIncomplete === true || artifactRepresentationIncomplete || undefined,
+		headRange: rawSummary.headRange,
+		tailRange: rawSummary.tailRange,
+		elidedBytes: rawSummary.elidedBytes,
+		elidedLines: rawSummary.elidedLines,
+		columnDroppedBytes: rawSummary.columnDroppedBytes,
+		columnTruncatedLines: rawSummary.columnTruncatedLines,
+		columnMax: rawSummary.columnMax,
+		artifactFailureDiagnostic: rawSummary.artifactFailureDiagnostic,
 	};
 }
 

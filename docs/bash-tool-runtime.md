@@ -67,8 +67,9 @@ Timeout is clamped to `[1, 3600]` seconds and converted to milliseconds.
 
 Before execution, the tool allocates an artifact path/id (best-effort) for truncated output storage.
 
-- artifact allocation failure is non-fatal (execution continues without artifact spill file),
-- artifact id/path are passed into execution path for full-output persistence on truncation.
+- artifact allocation rejection is caught on direct, async, and monitor paths so execution continues without a spill file,
+- only decimal session artifact ids are accepted before an `artifact://` reference is emitted,
+- valid artifact id/path pairs are passed into execution for full-output persistence on truncation.
 
 ## 5) PTY vs non-PTY execution selection
 
@@ -121,10 +122,11 @@ If `prefix` is configured, command becomes:
 Cancellation:
 
 - aborted signal triggers `shellSession.abort(...)`,
-- timeout from native result is mapped to `cancelled: true` + annotation text,
-- explicit cancellation similarly returns `cancelled: true` + annotation.
+- timeout or explicit cancellation returns a structured `cancelled: true` result only when every observed process owner settles within the bounded cleanup window,
+- missing, ambiguous, stale, escaped, late, or platform-uncontained process evidence fails explicitly with `Shell process ownership incomplete`,
+- terminal-provider execution likewise fails with `Terminal release ownership incomplete` when exact release does not settle, while retaining bounded output evidence.
 
-No exception is thrown inside executor for timeout/cancel; it returns structured `BashResult` and lets caller map error semantics.
+The executor maps proven native timeout/cancellation results into `BashResult`; ownership uncertainty is an error and is never converted into successful cancellation.
 
 ## Interactive PTY path (`runInteractiveBashPty`)
 
@@ -168,12 +170,16 @@ Both PTY and non-PTY paths use `OutputSink`.
 - `truncated`,
 - `totalLines/totalBytes`,
 - `outputLines/outputBytes`,
-- `artifactId` if artifact file was active.
-- `artifactTruncatedBytes` when the artifact hard cap omitted bytes.
+- `artifactId` if artifact file was active,
+- `artifactTruncatedBytes` when the artifact hard cap omitted bytes,
+- `sourceTruncatedBytes` when the native shell path omitted bytes before the Bash executor received them.
+- `sourceCaptureIncomplete` when a native reader, cancellation/timeout cleanup, client-owned terminal capture, or loss counter cannot prove complete exact source capture.
 
 ### Long-output caveat
 
 `BashTool` supplies a 1 KiB byte threshold to `OutputSink` by default, overridden by an explicit `tools.artifactTailBytes` setting. Direct user bang commands continue to use the executor's shared 50 KiB tail plus configured head window. Neither path enforces a hard line-count cap.
+
+The native shell path bounds both the core-to-native relay and the actual N-API callback queue at 1,024 entries and applies backpressure instead of dropping queue-full chunks. The core callback stream keeps an 8 MiB prefix budget; output beyond it is reduced to a UTF-8-safe 64 KiB terminal tail, with at most one typed aggregate loss marker inserted before that tail and exact dropped chunk/byte metadata returned within JavaScript's safe integer range. Counter saturation is surfaced as incomplete capture instead of an exact claim. Final status tokens therefore remain observable. Bash results carrying loss or unsettled-capture metadata remain truncated, notices identify an incomplete Bash capture instead of inventing original-source line coordinates, and any artifact reference is labeled as retained partial output rather than full output.
 
 ## Live tool updates and async jobs
 
@@ -189,6 +195,8 @@ When the connected client owns terminal execution, GJC requests the same bounded
 - an explicit `tools.artifactTailBytes` value sets that requested tail limit,
 - an explicit `tools.artifactHeadBytes` value omits the client-side byte limit so GJC can receive the complete returned stream, apply local head+tail middle elision, and save the full returned output when artifact storage is available,
 - if the client itself reports `truncated: true`, the returned bytes are already incomplete and GJC does not label an artifact made from that partial value as the full capture,
+- terminal creation, kill, output-recovery, and release RPCs each have a 500 ms settlement bound; failures or stalls cannot hold the Bash tool open indefinitely,
+- exit-wait rejection and failed/stalled kill or output recovery fail closed with explicit source-capture uncertainty instead of reporting a terminal result as complete,
 - poll updates and timeout output use the same local retention policy; a complete oversized timeout capture is saved before the bounded error is surfaced when artifact storage is available.
 
 For an ACP result where the client reports `truncated: true`, a truncation notice without an `artifact://` link means GJC never received the full stream. Separately, when artifact allocation is unavailable, a complete local capture can remain without a link or diagnostic because SDK allocation wrappers may return an empty value; if an artifact writer/save operation is attempted and fails, it emits a bounded diagnostic without inventing an artifact URI.
@@ -214,10 +222,10 @@ Success payload structure:
 - `content`: text output,
 - `details.meta.truncation` when truncated, including:
   - `direction`, `truncatedBy`, total/output line+byte counts,
-  - `shownRange`,
-  - `artifactId` when available.
+  - `shownRange` only when the captured stream has complete source coordinates,
+  - `artifactId`, `artifactTruncatedBytes`, `sourceTruncatedBytes`, `sourceCaptureIncomplete`, and `artifactFailureDiagnostic` when available.
 
-Because built-in tools are wrapped with `wrapToolWithMetaNotice()`, truncation notice text is appended to final text content automatically; when truncation metadata includes an artifact reference, that notice can include an example such as `Full: artifact://<id>`.
+Because built-in tools are wrapped with `wrapToolWithMetaNotice()`, truncation notice text is appended to final text content automatically. Complete references use `Read artifact://<id> for full output`; source-loss, unsettled-capture, and storage-cap references use `Read artifact://<id> for retained output (...)` with every known omission disclosed.
 
 ## Rendering paths
 

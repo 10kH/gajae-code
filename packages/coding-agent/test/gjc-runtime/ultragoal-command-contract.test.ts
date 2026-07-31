@@ -67,4 +67,24 @@ describe("ultragoal terminal critic command contract", () => {
 		expect(classifyBlocker.stdout).toContain("later bound clean pause terminal critic OKAY verdict");
 		expect(classifyBlocker.stdout).not.toContain("latest ledger event");
 	});
+
+	describe("review source command contract", () => {
+		it("publishes the manifest verb, typed arguments, and black-box help", async () => {
+			expect(getSkillManifest("ultragoal").verbs).toContainEqual({
+				name: "review-source",
+				surface: "command-positional",
+			});
+			expect(publicTypedArgs("review-source")).toEqual([
+				{ name: "cohort-id", type: "string" },
+				{ name: "json", type: "boolean" },
+				{ name: "lane", type: "enum", enumValues: ["cleaner", "architect", "qa", "critic"] },
+				{ name: "rerun-command", type: "string" },
+				{ name: "task-id", type: "string" },
+			]);
+			const help = await runNativeUltragoalCommand(["review-source", "--help"], process.cwd());
+			expect(help.status).toBe(0);
+			expect(help.stdout).toContain("gjc ultragoal review-source freeze");
+			expect(help.stdout).toContain("gjc ultragoal review-source dispatch");
+		});
+	});
 });
