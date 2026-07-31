@@ -56,6 +56,7 @@ export interface GjcBundleSettingsDependencies {
 export interface GjcBundleSettingsCallbacks {
 	onClose: () => void;
 	onBundlesChanged?: () => void;
+	onRenderRequested?: () => void;
 }
 
 export type GjcBundleSettingsState =
@@ -187,6 +188,7 @@ export class GjcBundleSettingsComponent extends Container {
 			),
 		);
 		this.addChild(new DynamicBorder());
+		this.callbacks.onRenderRequested?.();
 	}
 
 	#renderList(): void {
