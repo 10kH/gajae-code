@@ -455,6 +455,7 @@ export function declaration(source: string, name: string): string | undefined {
 const AST_METADATA = new Set(["start", "end", "loc", "comments", "leadingComments", "trailingComments", "innerComments", "extra"]);
 
 function canonicalAst(value: unknown): unknown {
+	if (typeof value === "bigint") return `${value}n`;
 	if (Array.isArray(value)) return value.map(canonicalAst);
 	if (!value || typeof value !== "object") return value;
 	return Object.fromEntries(
