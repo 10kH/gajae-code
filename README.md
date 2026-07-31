@@ -248,6 +248,12 @@ gjc setup defaults --check
 
 For evaluating Aside as an opt-in search/context retrieval sidecar, see [`docs/aside-integration.md`](docs/aside-integration.md). For generic third-party bot setup and provider-independent smokes, see [`docs/bot-integration.md`](docs/bot-integration.md). For external-control readiness, see [`docs/external-control-readiness.md`](docs/external-control-readiness.md). For the wire protocol and machine interfaces, see [`docs/sdk.md`](docs/sdk.md).
 
+## Plugins and extensions
+
+- [gjc-remote](https://github.com/kogangdon/gjc-remote) — control allowlisted GJC sessions on remote hosts from Discord.
+- [oh-my-gajae-code](https://github.com/devswha/oh-my-gajae-code) — a community plugin marketplace for installing additional workflow skills and slash commands.
+- [GJC multivendor setup guide](https://github.com/project820/gjc-multivendor-setup-guide) — role-based provider profiles and installable model bundles for multivendor GJC setups.
+
 ## Configuration
 
 Provider retry budgets live in `~/.gjc/config.yml`:
