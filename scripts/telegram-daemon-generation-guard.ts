@@ -320,8 +320,16 @@ export async function validateCurrentTreeManifest(): Promise<void> {
 	if (manifest.contractVersion !== actual.contractVersion)
 		throw new Error("telegram-daemon-generation-guard: semantic manifest contract version does not match the current guard");
 	const expected = JSON.stringify(Object.entries(manifest.digests).sort());
-	if (JSON.stringify(Object.entries(actual.digests).sort()) !== expected)
-		throw new Error("telegram-daemon-generation-guard: semantic manifest declaration digests do not byte-match the current tree");
+	const generated = JSON.stringify(Object.entries(actual.digests).sort());
+	if (generated !== expected) {
+		const expectedDigests = Object.fromEntries(Object.entries(manifest.digests));
+		const mismatches = Object.keys(actual.digests)
+			.filter(key => actual.digests[key] !== expectedDigests[key])
+			.map(key => `${key}: manifest=${expectedDigests[key] ?? "<missing>"} actual=${actual.digests[key]}`);
+		throw new Error(
+			`telegram-daemon-generation-guard: semantic manifest declaration digests do not byte-match the current tree (${mismatches.join(", ")})`,
+		);
+	}
 	if (JSON.stringify(actual.nativeAuthoritySha256) !== JSON.stringify(manifest.nativeAuthoritySha256))
 		throw new Error("telegram-daemon-generation-guard: native authority digests do not byte-match the current tree");
 }

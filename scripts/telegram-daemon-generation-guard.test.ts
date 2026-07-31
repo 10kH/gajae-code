@@ -921,6 +921,17 @@ test("fails closed when a protected native authority declaration is missing or m
 		expect(stableEntries(stale)).not.toBe(stableEntries(digests));
 	}, 20000);
 
+	test("canonicalizes BigInt literals without colliding with numeric or string literals", () => {
+		const bigint = declaration("function probe() { return 1n === -2n; }", "probe");
+		const numeric = declaration("function probe() { return 1 === -2; }", "probe");
+		const string = declaration('function probe() { return "1n" === "-2n"; }', "probe");
+		expect(bigint).not.toBe("<malformed>");
+		expect(bigint).not.toBe(numeric);
+		expect(bigint).not.toBe(string);
+		expect(bigint).toContain("1n");
+		expect(bigint).toContain("2n");
+	});
+
 	test("writes a stable current-tree manifest atomically without changing the committed attestation", async () => {
 		const directory = await mkdtemp(path.join(os.tmpdir(), "telegram-daemon-generation-manifest-"));
 		const target = path.join(directory, "manifest.json");
