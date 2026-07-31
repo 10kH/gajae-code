@@ -1773,12 +1773,26 @@ pub struct DescendantBaseline {
 }
 
 impl DescendantBaseline {
+	/// Captures the current descendant set, retrying a bounded number of times
+	/// before giving up.
+	///
+	/// Process-table reads fail transiently (a momentary libproc/Toolhelp
+	/// hiccup), and an unproven baseline degrades cleanup for the entire command
+	/// — on Windows it disables it outright, since there is no process group to
+	/// fall back to. Retrying converts almost every transient failure into a
+	/// proven baseline instead of paying that cost for the whole command.
 	#[must_use]
 	pub fn capture() -> Self {
-		current_descendant_pids_observed().map_or_else(
-			|| Self { pids: HashSet::new(), observed: false },
-			|pids| Self { pids, observed: true },
-		)
+		const ATTEMPTS: u32 = 3;
+		for attempt in 0..ATTEMPTS {
+			if let Some(pids) = current_descendant_pids_observed() {
+				return Self { pids, observed: true };
+			}
+			if attempt + 1 < ATTEMPTS {
+				std::thread::sleep(std::time::Duration::from_millis(2));
+			}
+		}
+		Self { pids: HashSet::new(), observed: false }
 	}
 
 	#[must_use]
