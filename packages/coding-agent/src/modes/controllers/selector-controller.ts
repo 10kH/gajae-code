@@ -1334,6 +1334,7 @@ export class SelectorController {
 						onPluginsChanged: () => {
 							this.ctx.ui.requestRender();
 						},
+						onRenderRequested: () => this.ctx.ui.requestRender(),
 						onCancel: () => {
 							done();
 							// Restore status line to saved settings

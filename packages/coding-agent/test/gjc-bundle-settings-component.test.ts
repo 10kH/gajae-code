@@ -15,6 +15,7 @@ import type {
 	GjcUpdatePreview,
 } from "../src/extensibility/gjc-plugins/types";
 import { type GjcBundleLifecyclePort, GjcBundleSettingsComponent } from "../src/modes/components/gjc-bundle-settings";
+import { PluginSettingsComponent } from "../src/modes/components/plugin-settings";
 import { setTheme } from "../src/modes/theme/theme";
 import {
 	GJC_BUNDLE_SETTINGS_ENTRIES,
@@ -57,6 +58,7 @@ class InMemoryLifecyclePort implements GjcBundleLifecyclePort {
 	readonly surfaceToggleCalls: Array<{ identity: GjcBundleIdentity; surfaceId: string; enabled: boolean }> = [];
 	readonly previewCalls: GjcBundleIdentity[] = [];
 	bundleToggleGate: Deferred<GjcLifecycleResult<GjcToggleResult>> | null = null;
+	listGate: Deferred<GjcBundleSummary[]> | null = null;
 	previewGate: Deferred<GjcLifecycleResult<GjcUpdatePreview>> | null = null;
 
 	constructor(
@@ -65,6 +67,7 @@ class InMemoryLifecyclePort implements GjcBundleLifecyclePort {
 	) {}
 
 	async listGjcBundles(_ctx: GjcLifecycleContext): Promise<GjcBundleSummary[]> {
+		if (this.listGate) return this.listGate.promise;
 		return this.bundles.map(cloneSummary);
 	}
 
@@ -132,11 +135,16 @@ class InMemoryLifecyclePort implements GjcBundleLifecyclePort {
 
 function componentFor(
 	fixture: GjcBundleSettingsFixture,
-	options: { lifecycle?: InMemoryLifecyclePort; runtime?: GjcRuntimeSnapshotProvider; onClose?: () => void } = {},
+	options: {
+		lifecycle?: InMemoryLifecyclePort;
+		runtime?: GjcRuntimeSnapshotProvider;
+		onClose?: () => void;
+		onRenderRequested?: () => void;
+	} = {},
 ): GjcBundleSettingsComponent {
 	return new GjcBundleSettingsComponent(
 		"/safe/project",
-		{ onClose: options.onClose ?? (() => {}) },
+		{ onClose: options.onClose ?? (() => {}), onRenderRequested: options.onRenderRequested },
 		{
 			lifecycle:
 				options.lifecycle ?? new InMemoryLifecyclePort(fixture.bundles.map(cloneSummary), fixture.updatePreview),
@@ -161,6 +169,29 @@ function select(component: GjcBundleSettingsComponent, down = 0): void {
 }
 
 describe("GJC bundle Settings component", () => {
+	test("requests repaint after async bundle and plugin list loads", async () => {
+		const fixture = GJC_BUNDLE_SETTINGS_STATES.find(state => state.id === "list")!.fixture;
+		const lifecycle = new InMemoryLifecyclePort(fixture.bundles.map(cloneSummary));
+		lifecycle.listGate = deferred<GjcBundleSummary[]>();
+		let bundleRenders = 0;
+		const bundle = componentFor(fixture, { lifecycle, onRenderRequested: () => bundleRenders++ });
+		const loadingRenders = bundleRenders;
+		lifecycle.listGate.resolve(fixture.bundles.map(cloneSummary));
+		await ready(bundle);
+		expect(bundleRenders).toBeGreaterThan(loadingRenders);
+		bundle.dispose();
+
+		let pluginRenders = 0;
+		const plugin = new PluginSettingsComponent("/tmp/does-not-need-to-exist", {
+			onClose: () => {},
+			onPluginChanged: () => {},
+			onRenderRequested: () => pluginRenders++,
+		});
+		for (let attempt = 0; attempt < 100 && pluginRenders === 0; attempt++) await Bun.sleep(5);
+		expect(pluginRenders).toBeGreaterThan(0);
+		plugin.dispose();
+	});
+
 	test("renders every catalog state through the live component and never exposes unsafe locator content", async () => {
 		const captured: string[] = [];
 		for (const state of GJC_BUNDLE_SETTINGS_STATES) {
