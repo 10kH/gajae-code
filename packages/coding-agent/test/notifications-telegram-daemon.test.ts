@@ -10502,6 +10502,56 @@ test("topic persistence failures fail closed without flat delivery", async () =>
 	expect((daemon as any).topics.get("S")?.authorityState).not.toBe("active");
 });
 
+test("first-create compensation persists a failed durable clear for restart replay", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	let topicWrites = 0;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		fs: topicStateFs(async () => {
+			topicWrites++;
+			if (topicWrites === 1) throw new Error("initial topic persistence failed");
+			if (topicWrites === 3) throw new Error("durable compensation clear failed");
+		}),
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+
+	await expect(
+		daemon.handleSessionMessage(session as never, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		}),
+	).rejects.toThrow("initial topic persistence failed");
+
+	const topicId = bot.createdTopicThreadIds[0]!;
+	expect(
+		bot.calls.filter(call => call.method === "deleteForumTopic").map(call => call.body.message_thread_id),
+	).toEqual([topicId]);
+	const retained = await readTopicAuthorityState(agentDir);
+	expect(retained.topics.S).toMatchObject({
+		topicId: String(topicId),
+		authorityState: "delete_pending",
+	});
+	expect((retained as { fences?: Record<string, number> }).fences?.S).toBeGreaterThan(0);
+
+	const restarted = recoveryDaemon(agentDir, bot);
+	await restarted.loadTopics();
+	bot.calls.length = 0;
+	await restarted.scanRoots();
+
+	expect(
+		bot.calls.filter(call => call.method === "deleteForumTopic").map(call => call.body.message_thread_id),
+	).toEqual([topicId]);
+	expect((await readTopicAuthorityState(agentDir)).topics.S).toBeUndefined();
+});
+
 test("threaded mode off: multiple sessions share a single fallback notice", async () => {
 	const agentDir = tempAgentDir();
 	const bot = new FakeBotApi();
