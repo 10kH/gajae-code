@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -288,7 +288,7 @@ describe("OutputSink", () => {
 		const artifactPath = path.join(dir, "partial.log");
 		const sink = new OutputSink({
 			artifactPath,
-			artifactId: "partial-artifact",
+			artifactId: "19",
 			spillThreshold: 4,
 			artifactMaxBytes: 8,
 		});
@@ -297,13 +297,14 @@ describe("OutputSink", () => {
 		const artifactText = await Bun.file(artifactPath).text();
 		expect(artifactText).toBe("abcdefgh\n[artifact truncated after 8 bytes; omitted at least 2 bytes]\n");
 
-		expect(dumped.artifactId).toBe("partial-artifact");
+		expect(dumped.artifactId).toBe("19");
 		expect(dumped.artifactTruncatedBytes).toBe(2);
 		const meta = outputMeta().truncationFromSummary(dumped, { direction: "tail" }).get();
 		expect(meta?.truncation?.artifactTruncatedBytes).toBe(2);
 		const notice = formatOutputNotice(meta);
-		expect(notice).toContain("at least 2B omitted");
-		expect(notice).toContain("retained output");
+		expect(notice).toContain("at least 2B");
+		expect(notice).toContain("Artifact availability could not be proven");
+		expect(notice).toContain("no artifact reference is available");
 		expect(notice).not.toContain("full output");
 	});
 
@@ -376,6 +377,77 @@ describe("OutputSink", () => {
 		expect(second.artifactId).toBe("finalized");
 		expect(before).toBe("abcdef");
 		expect(after).toBe(before);
+		expect(second.output).toBe(first.output);
+		expect(second.totalBytes).toBe(first.totalBytes);
+		expect(second.output).not.toContain("LATE");
+	});
+
+	test("post-dump push cannot mutate a finalized terminal publisher artifact", async () => {
+		const publisher = vi.fn(async () => ({ status: "published" as const, artifactId: "88" }));
+		const sink = new OutputSink({ spillThreshold: 4, artifactPublisher: publisher });
+		sink.push("abcdef");
+		const first = await sink.dump();
+		sink.push("LATE");
+		const second = await sink.dump();
+		expect(publisher).toHaveBeenCalledTimes(1);
+		expect(second.artifactId).toBe("88");
+		expect(second.output).toBe(first.output);
+		expect(second.totalBytes).toBe(first.totalBytes);
+	});
+
+	test("freezes pushes and replacements while terminal publication is in flight", async () => {
+		const publishStarted = Promise.withResolvers<string>();
+		const publishGate = Promise.withResolvers<{ status: "published"; artifactId: string }>();
+		const publisher = vi.fn(async (content: string) => {
+			publishStarted.resolve(content);
+			return publishGate.promise;
+		});
+		const sink = new OutputSink({ spillThreshold: 4, artifactPublisher: publisher });
+		sink.push("abcdef");
+		const dumpPromise = sink.dump();
+		expect(await publishStarted.promise).toBe("abcdef");
+		sink.push("LATE");
+		sink.replace("REPLACED");
+		publishGate.resolve({ status: "published", artifactId: "89" });
+		const summary = await dumpPromise;
+		expect(summary.artifactId).toBe("89");
+		expect(summary.output).not.toContain("LATE");
+		expect(summary.output).not.toContain("REPLACED");
+		expect(summary.totalBytes).toBe(6);
+	});
+
+	test("concurrent dumps await one shared terminal publication", async () => {
+		const publishStarted = Promise.withResolvers<void>();
+		const publishGate = Promise.withResolvers<{ status: "published"; artifactId: string }>();
+		const publisher = vi.fn(async () => {
+			publishStarted.resolve();
+			return publishGate.promise;
+		});
+		const sink = new OutputSink({ spillThreshold: 4, artifactPublisher: publisher });
+		sink.push("abcdef");
+		const first = sink.dump("first");
+		await publishStarted.promise;
+		const second = sink.dump("second");
+		publishGate.resolve({ status: "published", artifactId: "90" });
+		const [firstSummary, secondSummary] = await Promise.all([first, second]);
+		expect(publisher).toHaveBeenCalledTimes(1);
+		expect(firstSummary.artifactId).toBe("90");
+		expect(secondSummary.artifactId).toBe("90");
+		expect(firstSummary.artifactVerified).toBe(true);
+		expect(secondSummary.artifactVerified).toBe(true);
+	});
+
+	test("concurrent dumps end one path-backed artifact exactly once", async () => {
+		const dir = await createTempDir();
+		const artifactPath = path.join(dir, "concurrent-finalization.log");
+		const sink = new OutputSink({ artifactPath, artifactId: "concurrent-finalization", spillThreshold: 4 });
+		sink.push("abcdef");
+		const [first, second] = await Promise.all([sink.dump("first"), sink.dump("second")]);
+		expect(first.artifactId).toBe("concurrent-finalization");
+		expect(second.artifactId).toBe("concurrent-finalization");
+		expect(first.artifactFailureDiagnostic).toBeUndefined();
+		expect(second.artifactFailureDiagnostic).toBeUndefined();
+		expect(await Bun.file(artifactPath).text()).toBe("abcdef");
 	});
 
 	test("post-dump dump remains cumulative like the HEAD lifecycle oracle", async () => {
@@ -419,7 +491,7 @@ describe("OutputSink", () => {
 			artifactPublisher: async (content, info) => {
 				publishedContent = content;
 				publishedInfo = info;
-				return { status: "published", artifactId: "managed-output" };
+				return { status: "published", artifactId: "101" };
 			},
 		});
 		sink.push("HEAD-TAIL");
@@ -427,7 +499,7 @@ describe("OutputSink", () => {
 		const summary = await sink.dump();
 
 		expect(summary.output).toBe("TAIL");
-		expect(summary.artifactId).toBe("managed-output");
+		expect(summary.artifactId).toBe("101");
 		expect(summary.artifactFailureDiagnostic).toBeUndefined();
 		expect(publishedContent).toBe("HEAD-TAIL");
 		expect(publishedInfo).toEqual({ totalBytes: 9, omittedBytes: 0 });
@@ -442,7 +514,7 @@ describe("OutputSink", () => {
 			artifactPublisher: async (content, info) => {
 				publishedContent = content;
 				publishedInfo = info;
-				return { status: "published", artifactId: "managed-capped", omittedBytes: 2 };
+				return { status: "published", artifactId: "102", omittedBytes: 2 };
 			},
 		});
 		sink.push("界界");
@@ -452,7 +524,7 @@ describe("OutputSink", () => {
 		expect(publishedContent).toBe("界");
 		expect(Buffer.byteLength(publishedContent, "utf-8")).toBe(3);
 		expect(publishedInfo).toEqual({ totalBytes: 6, omittedBytes: 3 });
-		expect(summary.artifactId).toBe("managed-capped");
+		expect(summary.artifactId).toBe("102");
 		expect(summary.artifactTruncatedBytes).toBe(5);
 	});
 
@@ -467,6 +539,91 @@ describe("OutputSink", () => {
 
 		expect(summary.artifactId).toBeUndefined();
 		expect(summary.artifactFailureDiagnostic).toBe("failed: managed store offline");
+	});
+
+	test("terminal publisher rejects injected artifact ids", async () => {
+		const sink = new OutputSink({
+			spillThreshold: 4,
+			artifactPublisher: async () => ({ status: "published", artifactId: "bad\nid" }),
+		});
+		sink.push("HEAD-TAIL");
+
+		const summary = await sink.dump();
+		expect(summary.artifactId).toBeUndefined();
+		expect(summary.artifactFailureDiagnostic).toBe("failed: storage returned an invalid artifact id");
+	});
+
+	test("terminal publisher rejects an unknown runtime status", async () => {
+		const sink = new OutputSink({
+			spillThreshold: 4,
+			artifactPublisher: (async () => ({ status: "unknown", artifactId: "101" })) as never,
+		});
+		sink.push("HEAD-TAIL");
+		const summary = await sink.dump();
+		expect(summary.artifactId).toBeUndefined();
+		expect(summary.artifactFailureDiagnostic).toContain("invalid result");
+	});
+
+	test("malformed publisher thenables do not leak pending capacity", async () => {
+		for (let index = 0; index < 65; index++) {
+			const thenKey = ["th", "en"].join("");
+			const sink = new OutputSink({
+				spillThreshold: 4,
+				artifactPublisher: (() =>
+					Object.defineProperty({}, thenKey, {
+						get() {
+							throw new Error("bad thenable");
+						},
+					})) as never,
+			});
+			sink.push("HEAD-TAIL");
+			const summary = await sink.dump();
+			expect(summary.artifactFailureDiagnostic).toContain("bad thenable");
+		}
+	});
+
+	test("terminal publisher timeout marks storage incomplete without hanging dump", async () => {
+		const publishGate = Promise.withResolvers<{
+			status: "published";
+			artifactId: string;
+		}>();
+		const sink = new OutputSink({
+			spillThreshold: 4,
+			artifactPublisher: async () => publishGate.promise,
+		});
+		sink.push("HEAD-TAIL");
+
+		const summary = await sink.dump();
+		expect(summary.artifactId).toBeUndefined();
+		expect(summary.artifactFailureDiagnostic).toBe("failed: did not settle within 500ms");
+		publishGate.resolve({ status: "published", artifactId: "103" });
+		await publishGate.promise;
+	});
+
+	test("terminal publisher admission is capped per stable owner without starving another owner", async () => {
+		const gate = Promise.withResolvers<{ status: "unavailable" }>();
+		const stalledPublisher = async () => gate.promise;
+		const stalledDumps = Array.from({ length: 64 }, () => {
+			const sink = new OutputSink({ spillThreshold: 4, artifactPublisher: stalledPublisher });
+			sink.push("HEAD-TAIL");
+			return sink.dump();
+		});
+		await Bun.sleep(10);
+
+		const saturated = new OutputSink({ spillThreshold: 4, artifactPublisher: stalledPublisher });
+		saturated.push("HEAD-TAIL");
+		const saturatedSummary = await saturated.dump();
+		expect(saturatedSummary.artifactFailureDiagnostic).toContain("pending publisher limit reached for this session");
+
+		const isolated = new OutputSink({
+			spillThreshold: 4,
+			artifactPublisher: async () => ({ status: "published", artifactId: "201" }),
+		});
+		isolated.push("HEAD-TAIL");
+		expect((await isolated.dump()).artifactId).toBe("201");
+
+		gate.resolve({ status: "unavailable" });
+		await Promise.all(stalledDumps);
 	});
 
 	test("artifact late-open replay remains byte-correct after tail trimming", async () => {
@@ -799,6 +956,26 @@ describe("OutputSink head-retain mode", () => {
 		expect(dumped.totalBytes).toBe(byteLength(lines));
 	});
 
+	test("middle elision counts a tail window that begins with a newline", async () => {
+		const sink = new OutputSink({ spillThreshold: 4, headBytes: 3 });
+		await sink.push("abcMIDDLE\nxyz");
+
+		const dumped = await sink.dump();
+		expect(dumped.output.split("\n")).toHaveLength(dumped.outputLines);
+		expect(dumped.outputLines).toBe(3);
+		expect(dumped.elidedLines).toBe(0);
+	});
+
+	test("head-only middle elision counts its trailing empty display line", async () => {
+		const sink = new OutputSink({ spillThreshold: 0, headBytes: 3 });
+		await sink.push("abcdef");
+
+		const dumped = await sink.dump();
+		expect(dumped.output).toMatch(/^abc\n.*elided.*\n$/s);
+		expect(dumped.output.split("\n")).toHaveLength(dumped.outputLines);
+		expect(dumped.outputLines).toBe(3);
+	});
+
 	test("disabled (headBytes=0) preserves tail-only behavior", async () => {
 		const sink = new OutputSink({ spillThreshold: 5, headBytes: 0 });
 		await sink.push("abc");
@@ -857,12 +1034,25 @@ describe("OutputSink head-retain mode", () => {
 		expect(dumped.totalBytes).toBe(byteLength(replacement));
 		expect(dumped.elidedBytes).toBeGreaterThan(0);
 		expect(dumped.truncated).toBe(true);
+		expect(dumped.firstLinePartial).toBe(true);
+		expect(dumped.lastLinePartial).toBe(true);
+		expect(dumped.headRange).toBeUndefined();
+		expect(dumped.tailRange).toBeUndefined();
 
 		const meta = outputMeta().truncationFromSummary(dumped, { direction: "tail" }).get();
 		const notice = formatOutputNotice(meta);
 		expect(notice).toContain("head and tail");
 		expect(notice).toContain("middle bytes");
 		expect(notice).not.toContain("full output");
+	});
+
+	test("omits tail coordinates when byte retention starts inside the final line", async () => {
+		const sink = new OutputSink({ spillThreshold: 8 });
+		await sink.push(`first\n${"x".repeat(40)}TAIL`);
+		const dumped = await sink.dump();
+		expect(dumped.lastLinePartial).toBe(true);
+		const meta = outputMeta().truncationFromSummary(dumped, { direction: "tail" }).get();
+		expect(meta?.truncation?.shownRange).toBeUndefined();
 	});
 
 	test("replace preserves explicit head retention and the artifact footer", async () => {
@@ -896,6 +1086,45 @@ describe("OutputSink maxColumns (per-line cap)", () => {
 		expect(dumped.columnDroppedBytes ?? 0).toBeGreaterThan(0);
 		// totalBytes still reflects the raw stream, not the post-cap view.
 		expect(dumped.totalBytes).toBe(byteLength(`short\n${"x".repeat(50)}\nfooter`));
+		const meta = outputMeta().truncationFromSummary(dumped, { direction: "tail" }).get();
+		const notice = formatOutputNotice(meta);
+		expect(notice).toContain("Some lines truncated to 8 chars");
+		expect(notice).toContain("Visible line caps omitted");
+		expect(notice).toContain("no artifact reference is available");
+	});
+
+	test("body-owned artifact references do not suppress exact column loss", async () => {
+		const sink = new OutputSink({ maxColumns: 4, spillThreshold: 1000 });
+		await sink.push(`head\n${"x".repeat(40)}\ntail`);
+		const dumped = await sink.dump();
+		dumped.artifactId = "1";
+		dumped.artifactVerified = true;
+		dumped.output += "\n[raw output: artifact://1]";
+
+		const meta = outputMeta().truncationFromSummary(dumped, { direction: "tail" }).get();
+		const notice = formatOutputNotice(meta);
+		expect(notice).toContain("Visible line caps omitted");
+		expect(notice).toContain("Read artifact://1 for retained output");
+	});
+
+	test("malformed summary loss counters suppress full artifact claims", () => {
+		const summary = {
+			output: "tail\n[raw output: artifact://1]",
+			truncated: true,
+			totalLines: 2,
+			totalBytes: 100,
+			outputLines: 2,
+			outputBytes: 32,
+			artifactId: "1",
+			artifactVerified: true,
+			artifactTruncatedBytes: Number.NaN,
+			columnDroppedBytes: -1,
+		};
+		const meta = outputMeta().truncationFromSummary(summary, { direction: "tail" }).get();
+		const notice = formatOutputNotice(meta);
+		expect(meta?.truncation?.sourceCaptureIncomplete).toBe(true);
+		expect(notice).toContain("for retained output");
+		expect(notice).not.toContain("for full output");
 	});
 
 	test("persists per-line state across chunk boundaries", async () => {

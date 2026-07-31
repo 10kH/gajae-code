@@ -11,11 +11,16 @@
  * - agent://<id>?q=<query> - JSON extraction via query form
  */
 import { createHash } from "node:crypto";
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@gajae-code/utils";
 import { applyQuery, pathToQuery } from "./json-query";
-import { authorizedArtifactsDirsFromContext } from "./registry-helpers";
+import {
+	type AuthorizedArtifactsRoot,
+	authorizedArtifactsDirsFromContext,
+	closeAuthorizedArtifactsRoot,
+	openAuthorizedArtifactsRoot,
+	readAuthorizedArtifactFile,
+} from "./registry-helpers";
 import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext } from "./types";
 
 interface AgentOutputMetadata {
@@ -34,6 +39,24 @@ interface ManagedOutputSelector {
 	outputSha256: string;
 	metadataSizeBytes: number;
 	metadataSha256: string;
+}
+
+const MAX_AGENT_SELECTOR_BYTES = 64 * 1024;
+const MAX_AGENT_METADATA_BYTES = 1024 * 1024;
+const MAX_AGENT_OUTPUT_BYTES = 16 * 1024 * 1024;
+
+function readRetainedAgentFile(
+	outputId: string,
+	root: AuthorizedArtifactsRoot,
+	filename: string,
+	maxBytes: number,
+): Buffer | null {
+	const captured = readAuthorizedArtifactFile(root, filename, maxBytes);
+	if (!captured) return null;
+	if (captured.size !== captured.bytes.byteLength) {
+		throw new Error(`agent://${outputId} retained file exceeds read capacity`);
+	}
+	return captured.bytes;
 }
 
 function isSafeGenerationFilename(filename: unknown): filename is string {
@@ -56,17 +79,14 @@ function isManagedOutputSelector(value: unknown, outputId: string): value is Man
 	);
 }
 
-async function readManagedOutputSelector(
+function readManagedOutputSelector(
 	outputId: string,
-	selectorPath: string,
-): Promise<ManagedOutputSelector | null> {
-	let raw: string;
-	try {
-		raw = await Bun.file(selectorPath).text();
-	} catch (error) {
-		if (isEnoent(error)) return null;
-		throw error;
-	}
+	root: AuthorizedArtifactsRoot,
+	selectorFilename: string,
+): ManagedOutputSelector | null {
+	const bytes = readRetainedAgentFile(outputId, root, selectorFilename, MAX_AGENT_SELECTOR_BYTES);
+	if (!bytes) return null;
+	const raw = bytes.toString("utf8");
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(raw);
@@ -76,6 +96,18 @@ async function readManagedOutputSelector(
 	if (!isManagedOutputSelector(parsed, outputId)) throw new Error(`agent://${outputId} malformed output selector`);
 	return parsed;
 }
+function sameManagedOutputSelector(left: ManagedOutputSelector, right: ManagedOutputSelector): boolean {
+	return (
+		left.outputFilename === right.outputFilename &&
+		left.metadataFilename === right.metadataFilename &&
+		left.outputSizeBytes === right.outputSizeBytes &&
+		left.outputSha256 === right.outputSha256 &&
+		left.metadataSizeBytes === right.metadataSizeBytes &&
+		left.metadataSha256 === right.metadataSha256
+	);
+}
+
+const MANAGED_SELECTOR_READ_ATTEMPTS = 8;
 
 function isAgentOutputMetadata(value: unknown, outputId: string): value is AgentOutputMetadata {
 	if (!value || typeof value !== "object") return false;
@@ -92,18 +124,11 @@ function isAgentOutputMetadata(value: unknown, outputId: string): value is Agent
 
 async function verifyAgentOutputMetadata(
 	outputId: string,
-	foundPath: string,
-	metadataPath: string,
+	metadataBytes: Buffer,
 	bytes: Buffer,
 	selector?: ManagedOutputSelector,
 ): Promise<void> {
-	let metaRaw: string;
-	try {
-		metaRaw = await Bun.file(metadataPath).text();
-	} catch (err) {
-		if (isEnoent(err)) throw new Error(`agent://${outputId} missing metadata`);
-		throw err;
-	}
+	const metaRaw = metadataBytes.toString("utf8");
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(metaRaw);
@@ -113,9 +138,7 @@ async function verifyAgentOutputMetadata(
 	if (!isAgentOutputMetadata(parsed, outputId)) {
 		throw new Error(`agent://${outputId} malformed metadata`);
 	}
-	const metadataBytes = Buffer.from(metaRaw, "utf8");
-	const stat = await fs.stat(foundPath);
-	if (stat.size !== parsed.sizeBytes || bytes.byteLength !== parsed.sizeBytes) {
+	if (bytes.byteLength !== parsed.sizeBytes) {
 		throw new Error(`agent://${outputId} size mismatch`);
 	}
 	const sha256 = createHash("sha256").update(bytes).digest("hex");
@@ -172,27 +195,64 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		let foundPath: string | undefined;
 		let foundMetadataPath: string | undefined;
 		let foundSelector: ManagedOutputSelector | undefined;
+		let foundBytes: Buffer | undefined;
+		let foundMetadataBytes: Buffer | undefined;
 		let anyDirExists = false;
 
 		for (const dir of dirs) {
+			let root: AuthorizedArtifactsRoot;
 			try {
-				await fs.stat(dir);
+				root = openAuthorizedArtifactsRoot(dir);
 				anyDirExists = true;
 			} catch (err) {
 				if (isEnoent(err)) continue;
 				throw err;
 			}
-			const selector = await readManagedOutputSelector(outputId, path.join(dir, `${outputId}.md.selector.json`));
-			const candidate = selector ? path.join(dir, selector.outputFilename) : path.join(dir, `${outputId}.md`);
-			const metadataPath = selector ? path.join(dir, selector.metadataFilename) : `${candidate}.meta.json`;
 			try {
-				await fs.stat(candidate);
-				if (foundPath) throw new Error(`agent://${outputId} ambiguous id in authorized artifacts`);
-				foundPath = candidate;
-				foundMetadataPath = metadataPath;
-				foundSelector = selector ?? undefined;
-			} catch (err) {
-				if (!isEnoent(err)) throw err;
+				const selectorFilename = `${outputId}.md.selector.json`;
+				let selector = readManagedOutputSelector(outputId, root, selectorFilename);
+				for (let attempt = 0; attempt < MANAGED_SELECTOR_READ_ATTEMPTS; attempt++) {
+					const candidateFilename = selector ? selector.outputFilename : `${outputId}.md`;
+					const metadataFilename = selector ? selector.metadataFilename : `${candidateFilename}.meta.json`;
+					const rawBuffer = readRetainedAgentFile(outputId, root, candidateFilename, MAX_AGENT_OUTPUT_BYTES);
+					const metadataBuffer = readRetainedAgentFile(outputId, root, metadataFilename, MAX_AGENT_METADATA_BYTES);
+					if (rawBuffer && metadataBuffer) {
+						if (selector) {
+							const refreshed = readManagedOutputSelector(outputId, root, selectorFilename);
+							if (!refreshed || !sameManagedOutputSelector(selector, refreshed)) {
+								if (attempt + 1 >= MANAGED_SELECTOR_READ_ATTEMPTS) {
+									throw new Error(`agent://${outputId} generation changed during read`);
+								}
+								if (!refreshed) throw new Error(`agent://${outputId} generation changed during read`);
+								selector = refreshed;
+								continue;
+							}
+						}
+						if (foundPath) throw new Error(`agent://${outputId} ambiguous id in authorized artifacts`);
+						foundPath = path.join(dir, candidateFilename);
+						foundMetadataPath = path.join(dir, metadataFilename);
+						foundSelector = selector ?? undefined;
+						foundBytes = rawBuffer;
+						foundMetadataBytes = metadataBuffer;
+						break;
+					}
+					if (!selector) {
+						if (!rawBuffer) break;
+						throw new Error(`agent://${outputId} missing metadata`);
+					}
+					if (attempt + 1 >= MANAGED_SELECTOR_READ_ATTEMPTS) {
+						throw new Error(`agent://${outputId} generation changed during read`);
+					}
+					const refreshed = readManagedOutputSelector(outputId, root, selectorFilename);
+					if (!refreshed) throw new Error(`agent://${outputId} generation changed during read`);
+					if (sameManagedOutputSelector(selector, refreshed)) {
+						if (!rawBuffer) throw new Error(`agent://${outputId} selected generation unavailable`);
+						throw new Error(`agent://${outputId} missing metadata`);
+					}
+					selector = refreshed;
+				}
+			} finally {
+				closeAuthorizedArtifactsRoot(root);
 			}
 		}
 
@@ -200,12 +260,12 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			throw new Error("No artifacts directory found");
 		}
 
-		if (!foundPath) {
+		if (!foundPath || !foundMetadataPath || !foundBytes || !foundMetadataBytes) {
 			throw new Error(`agent://${outputId} not found`);
 		}
 
-		const rawBytes = Buffer.from(await Bun.file(foundPath).arrayBuffer());
-		await verifyAgentOutputMetadata(outputId, foundPath, foundMetadataPath!, rawBytes, foundSelector);
+		const rawBytes = foundBytes;
+		await verifyAgentOutputMetadata(outputId, foundMetadataBytes, rawBytes, foundSelector);
 		const rawContent = rawBytes.toString("utf8");
 		const notes: string[] = [];
 		let content = rawContent;

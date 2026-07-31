@@ -56,9 +56,11 @@ import {
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import type {
+	ClientBridge,
 	ClientBridgePermissionOption,
 	ClientBridgePermissionOutcome,
 	ClientBridgePermissionToolCall,
+	ClientBridgeTerminalHandle,
 } from "../src/session/client-bridge";
 import { SessionManager } from "../src/session/session-manager";
 import { getAskAnswerSource, registerAskAnswerSource } from "../src/tools/ask-answer-registry";
@@ -2717,6 +2719,383 @@ test("SDK host routes pure ACP permission prompts through a live reverse provide
 	});
 	socket.close();
 	await waitFor(() => permissionProvider === undefined, "permission provider removal after disconnect");
+});
+
+test("SDK host installs and routes a live ACP terminal provider", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-provider-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-terminal-provider-${Date.now()}`;
+	let clientBridge: ClientBridge | undefined;
+	const ctx = {
+		...context(cwd, sessionId),
+		setSdkClientBridge: (bridge: ClientBridge | undefined) => {
+			clientBridge = bridge;
+		},
+	};
+	process.env.GJC_NOTIFICATIONS = "1";
+	start(ctx);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	const frames: Record<string, unknown>[] = [];
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	await waitFor(() => frames.some(frame => frame.type === "hello"), "SDK hello");
+	const connectionId = String(frames.find(frame => frame.type === "hello")?.connectionId);
+	socket.send(
+		JSON.stringify({
+			type: "register_provider",
+			id: "terminal",
+			connectionId,
+			capability: "terminal",
+			definitions: [],
+		}),
+	);
+	await waitFor(() => clientBridge?.capabilities.terminal === true, "terminal provider installation");
+	const created = clientBridge!.createTerminal!({
+		toolCallId: "call-terminal",
+		command: "printf hi",
+		outputByteLimit: 1024,
+	});
+	await waitFor(
+		() =>
+			frames.some(
+				frame =>
+					frame.type === "reverse_request" && (frame.payload as { method?: string })?.method === "terminal.create",
+			),
+		"terminal create request",
+	);
+	const createRequest = frames.find(
+		frame => frame.type === "reverse_request" && (frame.payload as { method?: string })?.method === "terminal.create",
+	)!;
+	socket.send(
+		JSON.stringify({
+			type: "reverse_response",
+			id: createRequest.id,
+			connectionId,
+			leaseId: createRequest.leaseId,
+			ok: true,
+			result: { terminalId: "term-live" },
+		}),
+	);
+	await waitFor(
+		() =>
+			frames.some(
+				frame =>
+					frame.type === "reverse_request" &&
+					(frame.payload as { method?: string })?.method === "terminal.publish",
+			),
+		"terminal publication request",
+	);
+	const publishRequest = frames.find(
+		frame =>
+			frame.type === "reverse_request" && (frame.payload as { method?: string })?.method === "terminal.publish",
+	)!;
+	expect(publishRequest.payload).toMatchObject({
+		method: "terminal.publish",
+		payload: { toolCallId: "call-terminal", terminalId: "term-live" },
+	});
+	socket.send(
+		JSON.stringify({
+			type: "reverse_response",
+			id: publishRequest.id,
+			connectionId,
+			leaseId: publishRequest.leaseId,
+			ok: true,
+			result: {},
+		}),
+	);
+	const handle = await created;
+	expect(handle.terminalId).toBe("term-live");
+	const output = handle.currentOutput();
+	await waitFor(
+		() =>
+			frames.some(
+				frame =>
+					frame.type === "reverse_request" && (frame.payload as { method?: string })?.method === "terminal.output",
+			),
+		"terminal output request",
+	);
+	const outputRequest = frames.find(
+		frame => frame.type === "reverse_request" && (frame.payload as { method?: string })?.method === "terminal.output",
+	)!;
+	socket.send(
+		JSON.stringify({
+			type: "reverse_response",
+			id: outputRequest.id,
+			connectionId,
+			leaseId: outputRequest.leaseId,
+			ok: true,
+			result: { output: "malformed", truncated: null },
+		}),
+	);
+	await expect(output).rejects.toThrow("terminal provider returned an invalid output response");
+	const released = handle.release();
+	await waitFor(
+		() =>
+			frames.some(
+				frame =>
+					frame.type === "reverse_request" &&
+					(frame.payload as { method?: string })?.method === "terminal.release",
+			),
+		"terminal release request",
+	);
+	const releaseRequest = frames.find(
+		frame =>
+			frame.type === "reverse_request" && (frame.payload as { method?: string })?.method === "terminal.release",
+	)!;
+	socket.send(
+		JSON.stringify({
+			type: "reverse_response",
+			id: releaseRequest.id,
+			connectionId,
+			leaseId: releaseRequest.leaseId,
+			ok: true,
+			result: {},
+		}),
+	);
+	await released;
+	socket.close();
+	await waitFor(() => clientBridge === undefined, "terminal provider removal after disconnect");
+});
+
+test("SDK terminal publication cancellation recovers and provider reconnect clears quarantine", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-recovery-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-terminal-recovery-${Date.now()}`;
+	let clientBridge: ClientBridge | undefined;
+	const ctx = {
+		...context(cwd, sessionId),
+		setSdkClientBridge: (bridge: ClientBridge | undefined) => {
+			clientBridge = bridge;
+		},
+	};
+	process.env.GJC_NOTIFICATIONS = "1";
+	start(ctx);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+
+	const connectProvider = async (expectedLeaseId?: string) => {
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		const frames: Record<string, unknown>[] = [];
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		await waitFor(() => frames.some(frame => frame.type === "hello"), "SDK hello");
+		const connectionId = String(frames.find(frame => frame.type === "hello")?.connectionId);
+		socket.send(
+			JSON.stringify({
+				type: "register_provider",
+				id: `terminal-${frames.length}`,
+				connectionId,
+				capability: "terminal",
+				definitions: [],
+				...(expectedLeaseId ? { expectedLeaseId } : {}),
+			}),
+		);
+		await waitFor(() => frames.some(frame => frame.type === "register_provider_result"), "terminal registration");
+		await waitFor(() => clientBridge?.capabilities.terminal === true, "terminal provider installation");
+		return { socket, frames, connectionId };
+	};
+	const requestAfter = async (provider: { frames: Record<string, unknown>[] }, method: string, startIndex: number) => {
+		await waitFor(
+			() =>
+				provider.frames
+					.slice(startIndex)
+					.some(
+						frame =>
+							frame.type === "reverse_request" &&
+							(frame.payload as { method?: string } | undefined)?.method === method,
+					),
+			method,
+		);
+		return provider.frames
+			.slice(startIndex)
+			.find(
+				frame =>
+					frame.type === "reverse_request" &&
+					(frame.payload as { method?: string } | undefined)?.method === method,
+			)!;
+	};
+	const respond = (
+		provider: { socket: WebSocket; connectionId: string },
+		request: Record<string, unknown>,
+		result: Record<string, unknown>,
+		error?: { code: string; message: string },
+	) => {
+		provider.socket.send(
+			JSON.stringify({
+				type: "reverse_response",
+				id: request.id,
+				connectionId: provider.connectionId,
+				leaseId: request.leaseId,
+				ok: error === undefined,
+				...(error ? { error } : { result }),
+			}),
+		);
+	};
+	const completeCleanup = async (
+		provider: { socket: WebSocket; frames: Record<string, unknown>[]; connectionId: string },
+		startIndex: number,
+	) => {
+		const kill = await requestAfter(provider, "terminal.kill", startIndex);
+		respond(provider, kill, {});
+		const release = await requestAfter(provider, "terminal.release", startIndex);
+		respond(provider, release, {});
+	};
+	const completePublishedCreation = async (
+		provider: { socket: WebSocket; frames: Record<string, unknown>[]; connectionId: string },
+		created: Promise<ClientBridgeTerminalHandle>,
+		terminalId: string,
+		startIndex: number,
+	) => {
+		const create = await requestAfter(provider, "terminal.create", startIndex);
+		respond(provider, create, { terminalId });
+		const publish = await requestAfter(provider, "terminal.publish", startIndex);
+		respond(provider, publish, {});
+		return await created;
+	};
+	const releaseHandle = async (
+		provider: { socket: WebSocket; frames: Record<string, unknown>[]; connectionId: string },
+		handle: ClientBridgeTerminalHandle,
+	) => {
+		const startIndex = provider.frames.length;
+		const released = handle.release();
+		const request = await requestAfter(provider, "terminal.release", startIndex);
+		respond(provider, request, {});
+		await released;
+	};
+
+	const firstProvider = await connectProvider();
+	const controller = new AbortController();
+	let startIndex = firstProvider.frames.length;
+	const cancelled = clientBridge!.createTerminal!({
+		toolCallId: "call-cancelled",
+		command: "printf cancelled",
+		signal: controller.signal,
+	});
+	const cancelCreate = await requestAfter(firstProvider, "terminal.create", startIndex);
+	respond(firstProvider, cancelCreate, { terminalId: "term-cancelled" });
+	await requestAfter(firstProvider, "terminal.publish", startIndex);
+	controller.abort();
+	await completeCleanup(firstProvider, startIndex);
+	await expect(cancelled).rejects.toMatchObject({ name: "request_cancelled" });
+
+	startIndex = firstProvider.frames.length;
+	const recoveredCreation = clientBridge!.createTerminal!({
+		toolCallId: "call-recovered",
+		command: "printf recovered",
+	});
+	const recovered = await completePublishedCreation(firstProvider, recoveredCreation, "term-recovered", startIndex);
+	expect(recovered.terminalId).toBe("term-recovered");
+	await releaseHandle(firstProvider, recovered);
+
+	startIndex = firstProvider.frames.length;
+	const failed = clientBridge!.createTerminal!({ toolCallId: "call-failed", command: "printf failed" });
+	const failedCreate = await requestAfter(firstProvider, "terminal.create", startIndex);
+	respond(firstProvider, failedCreate, { terminalId: "term-failed" });
+	const failedPublish = await requestAfter(firstProvider, "terminal.publish", startIndex);
+	respond(firstProvider, failedPublish, {}, { code: "publish_failed", message: "publish failed" });
+	await completeCleanup(firstProvider, startIndex);
+	await expect(failed).rejects.toThrow("publish failed");
+	const createCount = firstProvider.frames.filter(
+		frame =>
+			frame.type === "reverse_request" &&
+			(frame.payload as { method?: string } | undefined)?.method === "terminal.create",
+	).length;
+	await expect(
+		clientBridge!.createTerminal!({ toolCallId: "call-quarantined", command: "printf quarantined" }),
+	).rejects.toThrow("terminal provider quarantined after publication failure");
+	expect(
+		firstProvider.frames.filter(
+			frame =>
+				frame.type === "reverse_request" &&
+				(frame.payload as { method?: string } | undefined)?.method === "terminal.create",
+		).length,
+	).toBe(createCount);
+
+	const leaseId = String(failedCreate.leaseId);
+	firstProvider.socket.close();
+	await waitFor(() => clientBridge === undefined, "terminal provider removal after disconnect");
+	const secondProvider = await connectProvider(leaseId);
+	startIndex = secondProvider.frames.length;
+	const reconnectedCreation = clientBridge!.createTerminal!({
+		toolCallId: "call-reconnected",
+		command: "printf reconnected",
+	});
+	const reconnected = await completePublishedCreation(
+		secondProvider,
+		reconnectedCreation,
+		"term-reconnected",
+		startIndex,
+	);
+	expect(reconnected.terminalId).toBe("term-reconnected");
+	await releaseHandle(secondProvider, reconnected);
+	startIndex = secondProvider.frames.length;
+	const timedOutCreation = clientBridge!.createTerminal!({
+		toolCallId: "call-create-timeout",
+		command: "printf timeout",
+	});
+	const timedOutRequest = await requestAfter(secondProvider, "terminal.create", startIndex);
+	await expect(timedOutCreation).rejects.toThrow("terminal creation did not settle within 500ms");
+	await waitFor(
+		() => secondProvider.frames.some(frame => frame.type === "reverse_cancel" && frame.id === timedOutRequest.id),
+		"terminal create reverse cancellation",
+	);
+	await expect(
+		clientBridge!.createTerminal!({ toolCallId: "call-create-after-timeout", command: "printf blocked" }),
+	).rejects.toThrow("terminal provider quarantined after publication failure");
+	secondProvider.socket.close();
+	await waitFor(() => clientBridge === undefined, "reconnected terminal provider removal");
+	const thirdProvider = await connectProvider(leaseId);
+	startIndex = thirdProvider.frames.length;
+	const oversizedCreation = clientBridge!.createTerminal!({
+		toolCallId: "call-oversized-create",
+		command: "printf oversized",
+	});
+	const oversizedRequest = await requestAfter(thirdProvider, "terminal.create", startIndex);
+	respond(thirdProvider, oversizedRequest, { terminalId: "x".repeat(300 * 1024) });
+	await expect(oversizedCreation).rejects.toThrow("payload_too_large");
+	await expect(
+		clientBridge!.createTerminal!({ toolCallId: "call-after-oversized", command: "printf blocked" }),
+	).rejects.toThrow("terminal provider quarantined after publication failure");
+	thirdProvider.socket.close();
+	await waitFor(() => clientBridge === undefined, "oversized terminal provider removal");
+	const fourthProvider = await connectProvider(leaseId);
+	startIndex = fourthProvider.frames.length;
+	const malformedCreation = clientBridge!.createTerminal!({
+		toolCallId: "call-malformed-create",
+		command: "printf malformed",
+	});
+	const malformedRequest = await requestAfter(fourthProvider, "terminal.create", startIndex);
+	respond(fourthProvider, malformedRequest, {});
+	await expect(malformedCreation).rejects.toThrow("terminal provider returned an invalid create response");
+	const malformedCreateCount = fourthProvider.frames.filter(
+		frame =>
+			frame.type === "reverse_request" &&
+			(frame.payload as { method?: string } | undefined)?.method === "terminal.create",
+	).length;
+	await expect(
+		clientBridge!.createTerminal!({ toolCallId: "call-after-malformed", command: "printf blocked" }),
+	).rejects.toThrow("terminal provider quarantined after publication failure");
+	expect(
+		fourthProvider.frames.filter(
+			frame =>
+				frame.type === "reverse_request" &&
+				(frame.payload as { method?: string } | undefined)?.method === "terminal.create",
+		).length,
+	).toBe(malformedCreateCount);
+	fourthProvider.socket.close();
+	await waitFor(() => clientBridge === undefined, "malformed terminal provider removal");
 });
 
 test("SDK host routes AskUserQuestion through a live ACP form elicitation provider", async () => {

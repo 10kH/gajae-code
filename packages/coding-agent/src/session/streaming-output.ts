@@ -2,6 +2,7 @@ import type { AgentToolUpdateCallback } from "@gajae-code/agent-core";
 
 import { sanitizeText } from "@gajae-code/utils";
 import { formatBytes } from "../tools/render-utils";
+import { isValidArtifactId } from "../utils/artifact-id";
 import { sanitizeWithOptionalSixelPassthrough } from "../utils/sixel";
 
 function sanitizeOutputChunk(rawChunk: string): string {
@@ -49,6 +50,47 @@ export type TerminalArtifactPublisher = (
 	info: { totalBytes: number; omittedBytes: number },
 ) => Promise<TerminalArtifactPublishResult>;
 
+const TERMINAL_ARTIFACT_PUBLISH_WAIT_MS = 500;
+const TERMINAL_ARTIFACT_PENDING_LIMIT = 64;
+const pendingTerminalArtifactPublishesByOwner = new WeakMap<object, Set<Promise<TerminalArtifactPublishResult>>>();
+
+function pendingTerminalArtifactPublishesForOwner(owner: object): Set<Promise<TerminalArtifactPublishResult>> {
+	let pending = pendingTerminalArtifactPublishesByOwner.get(owner);
+	if (!pending) {
+		pending = new Set();
+		pendingTerminalArtifactPublishesByOwner.set(owner, pending);
+	}
+	return pending;
+}
+
+function terminalPublisherOwner(publisher: TerminalArtifactPublisher): object {
+	return (publisher as TerminalArtifactPublisher & { owner?: object }).owner ?? publisher;
+}
+
+async function publishTerminalArtifactBounded(
+	publisher: TerminalArtifactPublisher,
+	content: string,
+	info: { totalBytes: number; omittedBytes: number },
+): Promise<TerminalArtifactPublishResult> {
+	const pendingTerminalArtifactPublishes = pendingTerminalArtifactPublishesForOwner(terminalPublisherOwner(publisher));
+	if (pendingTerminalArtifactPublishes.size >= TERMINAL_ARTIFACT_PENDING_LIMIT) {
+		return { status: "failed", diagnostic: "pending publisher limit reached for this session" };
+	}
+	const promise = Promise.resolve().then(() => publisher(content, info));
+	pendingTerminalArtifactPublishes.add(promise);
+	void promise.then(
+		() => pendingTerminalArtifactPublishes.delete(promise),
+		() => pendingTerminalArtifactPublishes.delete(promise),
+	);
+	return Promise.race([
+		promise,
+		Bun.sleep(TERMINAL_ARTIFACT_PUBLISH_WAIT_MS).then(() => ({
+			status: "failed" as const,
+			diagnostic: `did not settle within ${TERMINAL_ARTIFACT_PUBLISH_WAIT_MS}ms`,
+		})),
+	]);
+}
+
 // =============================================================================
 // Interfaces
 // =============================================================================
@@ -64,16 +106,58 @@ export interface OutputSummary {
 	elidedBytes?: number;
 	/** Lines elided from the middle when head-retain mode is active. */
 	elidedLines?: number;
+	/** Exact source ranges retained by head/tail middle-elision windows. */
+	headRange?: { start: number; end: number };
+	tailRange?: { start: number; end: number };
+	/** The retained tail ends with only a byte fragment of its source line. */
+	lastLinePartial?: boolean;
+	/** The retained head ends with only a byte fragment of its source line. */
+	firstLinePartial?: boolean;
 	/** Bytes dropped by the per-line column cap (sum across all lines). */
 	columnDroppedBytes?: number;
 	/** Number of distinct lines that hit the per-line column cap. */
 	columnTruncatedLines?: number;
+	/** Configured per-line byte/column cap that caused visible omission. */
+	columnMax?: number;
 	/** Artifact ID for internal URL access (artifact://<id>) when output was persisted. */
 	artifactId?: string;
+	/** Artifact existence was proven by successful publication or file finalization. */
+	artifactVerified?: boolean;
 	/** Bytes omitted from artifact storage after the artifact hard cap was reached. */
 	artifactTruncatedBytes?: number;
+	/** Bytes dropped before the Bash executor received the native output stream. */
+	sourceTruncatedBytes?: number;
+	/** Exact source capture completeness could not be proven. */
+	sourceCaptureIncomplete?: boolean;
 	/** Bounded diagnostic when artifact writer or terminal publisher creation, write, finalization, or publication failed. */
 	artifactFailureDiagnostic?: string;
+}
+
+const kCurrentExecutionArtifactProof = Symbol("OutputSink.CurrentExecutionArtifactProof");
+interface CurrentExecutionArtifactProof {
+	artifactId: string;
+	payload: string;
+	consumed: boolean;
+}
+
+/** Verify that this exact OutputSink summary came from a successful current-execution publication. */
+export function hasCurrentExecutionArtifactProof(
+	summary: OutputSummary,
+	artifactId: string,
+	payload?: string,
+): boolean {
+	const proof = (summary as OutputSummary & { [kCurrentExecutionArtifactProof]?: CurrentExecutionArtifactProof })[
+		kCurrentExecutionArtifactProof
+	];
+	if (
+		!proof ||
+		proof.artifactId !== artifactId ||
+		proof.consumed ||
+		(payload !== undefined && proof.payload !== payload)
+	)
+		return false;
+	proof.consumed = true;
+	return true;
 }
 
 export interface OutputSinkOptions {
@@ -141,7 +225,10 @@ export interface TruncationResult {
 	elidedBytes?: number;
 	/** Lines elided from the middle (truncateMiddle only). */
 	elidedLines?: number;
+	headRange?: { start: number; end: number };
+	tailRange?: { start: number; end: number };
 	lastLinePartial?: boolean;
+	firstLinePartial?: boolean;
 	firstLineExceedsLimit?: boolean;
 	lastLineExceedsLimit?: boolean;
 }
@@ -793,7 +880,7 @@ export function truncateMiddle(content: string, options: TruncationOptions = {})
 			const head = windows.head;
 			const tail = windows.tail;
 			if (!head || !tail) return noTruncResult(content, windows.totalLines, windows.totalBytes);
-			if (head.lines + tail.lines >= windows.totalLines)
+			if (head.lines + tail.lines >= windows.totalLines && tail.kind !== "partial-line")
 				return noTruncResult(content, windows.totalLines, windows.totalBytes);
 			const legacyElidedLines = Math.max(0, windows.totalLines - head.lines - tail.lines);
 			const legacyElidedBytes =
@@ -802,7 +889,7 @@ export function truncateMiddle(content: string, options: TruncationOptions = {})
 					: windows.elidedBytes;
 			const marker = formatMiddleElisionMarker(legacyElidedLines, legacyElidedBytes);
 			const markerBytes = Buffer.byteLength(marker, "utf-8");
-			return {
+			const result: TruncationResult = {
 				content: `${head.content}\n${marker}\n${tail.content}`,
 				truncated: true,
 				truncatedBy: "middle",
@@ -816,6 +903,11 @@ export function truncateMiddle(content: string, options: TruncationOptions = {})
 				firstLineExceedsLimit: false,
 				...(tail.lastLinePartial ? { lastLineExceedsLimit: true } : {}),
 			};
+			Object.defineProperties(result, {
+				headRange: { value: { start: head.origin.startLine, end: head.origin.endLine } },
+				tailRange: { value: { start: tail.origin.startLine, end: tail.origin.endLine } },
+			});
+			return result;
 		}
 	}
 }
@@ -932,6 +1024,8 @@ export class OutputSink {
 	#head = "";
 	#headBytes = 0;
 	#headRetentionDisabled = false;
+	#headEndsMidLine = false;
+	#tailStartsMidLine = false;
 	#totalLines = 0; // newline count
 	#totalBytes = 0;
 	#processedBytes = 0;
@@ -967,6 +1061,8 @@ export class OutputSink {
 	#pendingArtifactContent?: string[];
 	#artifactPublishAttempted = false;
 	#finalized = false;
+	#finalizing = false;
+	#artifactFinalization?: Promise<string | undefined>;
 
 	#fileReady = false;
 
@@ -1020,9 +1116,10 @@ export class OutputSink {
 		return this.#buffer;
 	}
 
-	#setTail(text: string, bytes = Buffer.byteLength(text, "utf-8")): void {
+	#setTail(text: string, bytes = Buffer.byteLength(text, "utf-8"), startsMidLine = false): void {
 		this.#buffer = text;
 		this.#bufferBytes = bytes;
+		this.#tailStartsMidLine = startsMidLine;
 	}
 
 	#appendTail(text: string, bytes: number): void {
@@ -1037,9 +1134,12 @@ export class OutputSink {
 
 	#trimTailTo(maxBytes: number): void {
 		if (this.#bufferBytes <= maxBytes) return;
-		const { text, bytes } = truncateTailBytes(this.#buffer, maxBytes);
+		const previous = this.#buffer;
+		const { text, bytes } = truncateTailBytes(previous, maxBytes);
+		const removed = previous.slice(0, previous.length - text.length);
 		this.#buffer = text;
 		this.#bufferBytes = bytes;
+		this.#tailStartsMidLine = removed.length > 0 && !removed.endsWith("\n");
 	}
 
 	/**
@@ -1050,6 +1150,7 @@ export class OutputSink {
 	// F21: with coalescing enabled, accumulate raw chunks and process them in batches; the default
 	// (disabled) path calls #ingest directly and is byte-identical to the historical per-chunk path.
 	push(chunk: string): void {
+		if (this.#finalized || this.#finalizing) return;
 		if (!this.#coalesceSanitize) {
 			this.#ingest(chunk);
 			return;
@@ -1132,6 +1233,10 @@ export class OutputSink {
 			}
 		}
 
+		if (this.#headBytes > 0 && this.#bufferBytes === 0 && tailBytes > 0) {
+			this.#headEndsMidLine = !this.#head.endsWith("\n") && !tailChunk.startsWith("\n");
+			this.#tailStartsMidLine = this.#headEndsMidLine;
+		}
 		this.#pushTail(tailChunk, tailBytes);
 	}
 
@@ -1216,7 +1321,8 @@ export class OutputSink {
 		// Avoid creating a giant intermediate string when chunk alone dominates.
 		if (dataBytes >= threshold) {
 			const { text, bytes } = truncateTailBytes(chunk, threshold);
-			this.#setTail(text, bytes);
+			const removed = chunk.slice(0, chunk.length - text.length);
+			this.#setTail(text, bytes, removed.length > 0 && !removed.endsWith("\n"));
 		} else {
 			// Intermediate size is bounded (<= threshold + dataBytes), safe to concat.
 			this.#appendTail(chunk, dataBytes);
@@ -1390,13 +1496,19 @@ export class OutputSink {
 			return this.#publishedArtifactId;
 		}
 		this.#artifactPublishAttempted = true;
+		this.#finalizing = true;
 		const content = this.#pendingArtifactContent?.join("") ?? "";
 		const omittedBytes = this.#artifactTruncatedBytes;
 		try {
-			const published = await this.#artifactPublisher!(content, {
+			const published = await publishTerminalArtifactBounded(this.#artifactPublisher!, content, {
 				totalBytes: this.#totalBytes,
 				omittedBytes,
 			});
+			if (typeof published !== "object" || published === null || !("status" in published)) {
+				this.#recordTerminalArtifactDiagnostic("failed", "publisher returned an invalid result");
+				this.#artifactFinalizationFailed = true;
+				return undefined;
+			}
 			if (published.status === "unavailable") {
 				this.#recordTerminalArtifactDiagnostic("unavailable");
 				this.#artifactFinalizationFailed = true;
@@ -1407,8 +1519,13 @@ export class OutputSink {
 				this.#artifactFinalizationFailed = true;
 				return undefined;
 			}
-			if (published.artifactId.length === 0) {
-				this.#recordTerminalArtifactDiagnostic("failed", "storage returned no artifact id");
+			if (published.status !== "published") {
+				this.#recordTerminalArtifactDiagnostic("failed", "publisher returned an invalid result");
+				this.#artifactFinalizationFailed = true;
+				return undefined;
+			}
+			if (!isValidArtifactId(published.artifactId)) {
+				this.#recordTerminalArtifactDiagnostic("failed", "storage returned an invalid artifact id");
 				this.#artifactFinalizationFailed = true;
 				return undefined;
 			}
@@ -1430,6 +1547,48 @@ export class OutputSink {
 		} finally {
 			this.#pendingArtifactContent = undefined;
 		}
+	}
+
+	#shouldFinalizeArtifact(): boolean {
+		return (
+			this.#finalized ||
+			this.#artifactFinalizationFailed ||
+			this.#shouldPublishTerminalArtifact() ||
+			this.#file !== undefined ||
+			(this.#artifactPath !== undefined && this.#artifactTruncatedBytes > 0)
+		);
+	}
+
+	async #finalizeArtifact(): Promise<string | undefined> {
+		let artifactId: string | undefined;
+		if (this.#finalized) artifactId = this.#publishedArtifactId ?? this.#artifactId;
+		else if (!this.#artifactFinalizationFailed) {
+			if (this.#artifactPublisher && !this.#artifactPath) artifactId = await this.#publishTerminalArtifact();
+			if (!this.#artifactFinalizationFailed && this.#artifactPath) {
+				if (this.#artifactTruncatedBytes > 0) this.#createFileSink();
+				if (this.#file) {
+					this.#finalizing = true;
+					await this.#writeArtifactTruncationNotice();
+					try {
+						await this.#file.sink.end();
+						artifactId = this.#file.artifactId;
+						this.#finalized = true;
+					} catch (error) {
+						this.#recordArtifactFailure("end", error);
+						this.#artifactFinalizationFailed = true;
+						this.#file = undefined;
+						this.#fileReady = false;
+					}
+				}
+			}
+		}
+		if (this.#finalized) {
+			this.#pendingFileWrites = undefined;
+			this.#pendingFileWriteBytes = 0;
+			this.#fileReady = false;
+			this.#pendingArtifactContent = undefined;
+		}
+		return artifactId;
 	}
 
 	createInput(): WritableStream<Uint8Array | string> {
@@ -1457,17 +1616,20 @@ export class OutputSink {
 	 * append directly to the tail without reordering the replacement.
 	 */
 	replace(text: string): void {
+		if (this.#finalized || this.#finalizing) return;
 		this.#coalesceBuf = "";
 		const replacementBytes = Buffer.byteLength(text, "utf-8");
 		this.#head = "";
 		this.#headBytes = 0;
 		this.#setTail("");
+		this.#headEndsMidLine = false;
 
 		if (this.#headLimit > 0) {
 			const head = truncateHeadBytes(text, this.#headLimit);
 			this.#appendHead(head.text, head.bytes);
 			const tailText = text.substring(head.text.length);
-			this.#setTail(tailText, replacementBytes - head.bytes);
+			this.#headEndsMidLine = tailText.length > 0 && !head.text.endsWith("\n") && !tailText.startsWith("\n");
+			this.#setTail(tailText, replacementBytes - head.bytes, this.#headEndsMidLine);
 		} else {
 			this.#setTail(text, replacementBytes);
 		}
@@ -1491,35 +1653,9 @@ export class OutputSink {
 		const totalLines = this.#sawData ? this.#totalLines + 1 : 0;
 
 		let artifactId: string | undefined;
-		if (this.#finalized) {
-			artifactId = this.#publishedArtifactId ?? this.#artifactId;
-		} else if (!this.#artifactFinalizationFailed) {
-			if (this.#artifactPublisher && !this.#artifactPath) {
-				artifactId = await this.#publishTerminalArtifact();
-			}
-			if (!this.#artifactFinalizationFailed && this.#artifactPath) {
-				if (this.#artifactTruncatedBytes > 0) this.#createFileSink();
-				await this.#writeArtifactTruncationNotice();
-				if (this.#file) {
-					try {
-						await this.#file.sink.end();
-						artifactId = this.#file.artifactId;
-						this.#finalized = true;
-					} catch (error) {
-						this.#recordArtifactFailure("end", error);
-						this.#artifactFinalizationFailed = true;
-						this.#file = undefined;
-						this.#fileReady = false;
-					}
-				}
-			}
-		}
-		if (this.#finalized) {
-			// Terminal: the artifact is closed; replay state is no longer needed.
-			this.#pendingFileWrites = undefined;
-			this.#pendingFileWriteBytes = 0;
-			this.#fileReady = false;
-			this.#pendingArtifactContent = undefined;
+		if (this.#shouldFinalizeArtifact()) {
+			this.#artifactFinalization ??= this.#finalizeArtifact();
+			artifactId = await this.#artifactFinalization;
 		}
 		// Non-finalized dumps (no artifact sink ever opened) keep the raw replay
 		// queue so a later post-dump push that spills produces a CUMULATIVE
@@ -1543,6 +1679,8 @@ export class OutputSink {
 		let outputLines: number;
 		let elidedBytes: number | undefined;
 		let elidedLines: number | undefined;
+		let headRange: { start: number; end: number } | undefined;
+		let tailRange: { start: number; end: number } | undefined;
 
 		if (headBytes > 0 && effectiveTotalBytes > headBytes + tailBytes) {
 			// Middle was elided. Emit both explicit windows, including when they are
@@ -1555,7 +1693,12 @@ export class OutputSink {
 			const tailSep = tailBuf.startsWith("\n") ? "" : "\n";
 			body = `${headText}${headSep}${marker}${tailSep}${tailBuf}`;
 			outputBytes = headBytes + markerBytes + tailBytes + headSep.length + tailSep.length;
-			outputLines = headLines + 1 + tailLines;
+			outputLines = body.length > 0 ? countNewlines(body) + 1 : 0;
+			headRange = headLines > 0 && !this.#headEndsMidLine ? { start: 1, end: headLines } : undefined;
+			tailRange =
+				tailLines > 0 && !this.#tailStartsMidLine
+					? { start: processedTotalLines - tailLines + 1, end: processedTotalLines }
+					: undefined;
 			this.#truncated = true;
 		} else if (headBytes > 0) {
 			// Head + tail combine into the full buffered output (no overlap or elision).
@@ -1569,7 +1712,7 @@ export class OutputSink {
 		}
 
 		if (this.#columnDroppedBytes > 0) this.#truncated = true;
-		return {
+		const summary: OutputSummary = {
 			output: `${noticeLine}${body}`,
 			truncated: this.#truncated,
 			totalLines,
@@ -1578,12 +1721,27 @@ export class OutputSink {
 			outputBytes,
 			elidedBytes,
 			elidedLines,
+			headRange,
+			tailRange,
+			firstLinePartial: this.#headEndsMidLine || undefined,
+			lastLinePartial: this.#tailStartsMidLine || undefined,
 			columnDroppedBytes: this.#columnDroppedBytes > 0 ? this.#columnDroppedBytes : undefined,
 			columnTruncatedLines: this.#columnTruncatedLines > 0 ? this.#columnTruncatedLines : undefined,
+			columnMax: this.#columnDroppedBytes > 0 ? this.#maxColumns : undefined,
 			artifactTruncatedBytes: this.#artifactTruncatedBytes > 0 ? this.#artifactTruncatedBytes : undefined,
 			artifactFailureDiagnostic: this.#artifactFailureDiagnostic,
 			artifactId,
+			artifactVerified: artifactId !== undefined && this.#publishedArtifactId === artifactId,
 		};
+		if (summary.artifactVerified === true && artifactId !== undefined) {
+			Object.defineProperty(summary, kCurrentExecutionArtifactProof, {
+				value: { artifactId, payload: summary.output, consumed: false } satisfies CurrentExecutionArtifactProof,
+				enumerable: true,
+				configurable: false,
+				writable: false,
+			});
+		}
+		return summary;
 	}
 }
 

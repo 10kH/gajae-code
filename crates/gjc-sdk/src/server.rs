@@ -12,12 +12,13 @@
 //!   per-connection tasks and may be called any number of times.
 
 use std::{
+	borrow::Cow,
 	collections::HashMap,
 	net::{IpAddr, Ipv4Addr, SocketAddr},
 	path::PathBuf,
 	sync::{
 		Arc,
-		atomic::{AtomicBool, AtomicU64, Ordering},
+		atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 	},
 	time::{Duration, Instant},
 };
@@ -26,7 +27,7 @@ use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use tokio::{
 	net::{TcpListener, TcpStream},
-	sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot},
+	sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot},
 	task::{JoinHandle, JoinSet},
 	time::{sleep, timeout},
 };
@@ -54,6 +55,167 @@ use crate::{
 	},
 	query::{REQUEST_FRAME_BYTES, RESPONSE_CEILING_BYTES},
 };
+
+const REVERSE_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const FRAME_BACKLOG_CAPACITY: usize = 1;
+const CONNECTION_FRAME_BACKLOG_CAPACITY: usize = 2;
+const MAX_CONNECTION_TASKS: usize = 64;
+const PREAUTH_HANDSHAKE_TASKS: usize = 16;
+const MAX_LARGE_RESPONSE_CONNECTIONS: usize = 2;
+const DIRECT_COMMAND_CAPACITY: usize = 32;
+const CLIENT_HELLO_MAX_CAPABILITIES: usize = 64;
+const CLIENT_HELLO_MAX_CAPABILITY_BYTES: usize = 4096;
+const CAPABILITY_CALLBACK_CAPACITY: usize = 64;
+const INBOUND_GLOBAL_CAPACITY: usize = 64;
+const INBOUND_CONNECTION_CAPACITY: usize = 4;
+const CONNECTION_FRAME_PENDING_BYTES_CAPACITY: usize =
+	REVERSE_RESPONSE_FRAME_BYTES + REQUEST_FRAME_BYTES;
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(2);
+const FRAME_PENDING_BYTES_CAPACITY: usize = MAX_LARGE_RESPONSE_CONNECTIONS
+	* REVERSE_RESPONSE_FRAME_BYTES
+	+ MAX_CONNECTION_TASKS * REQUEST_FRAME_BYTES;
+
+#[derive(Debug)]
+struct FrameBudget {
+	pending_bytes:      AtomicUsize,
+	connection_pending: Mutex<HashMap<String, usize>>,
+}
+
+impl FrameBudget {
+	fn try_reserve(&self, connection_id: &str, bytes: usize) -> bool {
+		if bytes > FRAME_PENDING_BYTES_CAPACITY {
+			return false;
+		}
+		let mut current = self.pending_bytes.load(Ordering::Acquire);
+		loop {
+			if bytes > FRAME_PENDING_BYTES_CAPACITY.saturating_sub(current) {
+				return false;
+			}
+			match self.pending_bytes.compare_exchange_weak(
+				current,
+				current + bytes,
+				Ordering::AcqRel,
+				Ordering::Acquire,
+			) {
+				Ok(_) => break,
+				Err(observed) => current = observed,
+			}
+		}
+		let mut per_connection = self.connection_pending.lock();
+		let current = per_connection.get(connection_id).copied().unwrap_or(0);
+		if bytes > CONNECTION_FRAME_PENDING_BYTES_CAPACITY.saturating_sub(current) {
+			self.pending_bytes.fetch_sub(bytes, Ordering::AcqRel);
+			return false;
+		}
+		per_connection.insert(connection_id.to_owned(), current + bytes);
+		true
+	}
+
+	fn release(&self, connection_id: &str, bytes: usize) {
+		self.pending_bytes.fetch_sub(bytes, Ordering::AcqRel);
+		let mut per_connection = self.connection_pending.lock();
+		if let Some(current) = per_connection.get_mut(connection_id) {
+			*current = current.saturating_sub(bytes);
+			if *current == 0 {
+				per_connection.remove(connection_id);
+			}
+		}
+	}
+}
+
+#[derive(Debug)]
+struct FrameSlot {
+	budget: Arc<FrameBudget>,
+}
+
+#[derive(Debug)]
+struct FrameReservation {
+	slot:          Arc<FrameSlot>,
+	connection_id: String,
+	bytes:         usize,
+}
+
+impl Drop for FrameReservation {
+	fn drop(&mut self) {
+		self.slot.budget.release(&self.connection_id, self.bytes);
+	}
+}
+
+#[derive(Debug)]
+struct PendingFrame {
+	connection_id: String,
+	json:          String,
+	_reservation:  FrameReservation,
+}
+
+#[derive(Debug)]
+struct FrameIngress {
+	tx:   mpsc::Sender<PendingFrame>,
+	slot: Arc<FrameSlot>,
+}
+
+impl FrameIngress {
+	fn try_enqueue(&self, connection_id: &str, json: String) -> bool {
+		let bytes = json.len();
+		let Some(()) = self
+			.slot
+			.budget
+			.try_reserve(connection_id, bytes)
+			.then_some(())
+		else {
+			return false;
+		};
+		let pending = PendingFrame {
+			connection_id: connection_id.to_owned(),
+			json,
+			_reservation: FrameReservation {
+				slot: Arc::clone(&self.slot),
+				connection_id: connection_id.to_owned(),
+				bytes,
+			},
+		};
+		if self.tx.try_send(pending).is_err() {
+			return false;
+		}
+		true
+	}
+}
+
+async fn forward_frames(
+	mut ingress_rx: mpsc::Receiver<PendingFrame>,
+	frame_tx: mpsc::Sender<(String, String)>,
+	cancel: CancellationToken,
+) {
+	while let Some(pending) = tokio::select! {
+		() = cancel.cancelled() => None,
+		pending = ingress_rx.recv() => pending,
+	} {
+		let PendingFrame { connection_id, json, _reservation } = pending;
+		let sent = tokio::select! {
+			() = cancel.cancelled() => false,
+			result = frame_tx.send((connection_id, json)) => result.is_ok(),
+		};
+		if !sent {
+			break;
+		}
+	}
+}
+
+#[derive(serde::Deserialize)]
+struct FrameDiscriminator<'a> {
+	#[serde(borrow, rename = "type")]
+	kind: Cow<'a, str>,
+}
+
+fn frame_kind(text: &str) -> Option<Cow<'_, str>> {
+	serde_json::from_str::<FrameDiscriminator<'_>>(text)
+		.ok()
+		.map(|frame| frame.kind)
+}
+
+fn is_large_reverse_response(text: &str) -> bool {
+	frame_kind(text).as_deref() == Some("reverse_response")
+}
 
 /// Configuration for a per-session notification server.
 #[derive(Debug)]
@@ -113,6 +275,19 @@ enum DirectCommand {
 		requires_tool_activity: bool,
 	},
 	ReevaluateAsk,
+}
+
+fn try_send_direct(
+	tx: &mpsc::Sender<DirectCommand>,
+	close: &CancellationToken,
+	command: DirectCommand,
+) -> bool {
+	if matches!(tx.try_send(command), Ok(())) {
+		true
+	} else {
+		close.cancel();
+		false
+	}
 }
 
 fn prepare_direct_ack(state: &ServerState, message: &ServerMessage) -> bool {
@@ -231,7 +406,8 @@ struct Connection {
 	capabilities: Vec<String>,
 	negotiation:  Negotiation,
 	delivered:    Option<Delivered>,
-	tx:           mpsc::UnboundedSender<DirectCommand>,
+	tx:           mpsc::Sender<DirectCommand>,
+	close:        CancellationToken,
 }
 
 /// A rejected workflow-gate registration.
@@ -403,30 +579,92 @@ pub struct CapabilityUpdate {
 	pub capabilities:  Vec<String>,
 }
 
+#[derive(Debug, Default)]
+struct InboundAdmission {
+	counts: Mutex<HashMap<String, usize>>,
+}
+
+impl InboundAdmission {
+	fn try_reserve(self: &Arc<Self>, connection_id: &str) -> Option<InboundReservation> {
+		let mut counts = self.counts.lock();
+		let total = counts.values().copied().sum::<usize>();
+		let current = counts.get(connection_id).copied().unwrap_or(0);
+		if total >= INBOUND_GLOBAL_CAPACITY || current >= INBOUND_CONNECTION_CAPACITY {
+			return None;
+		}
+		counts.insert(connection_id.to_owned(), current + 1);
+		Some(InboundReservation {
+			admission:     Arc::clone(self),
+			connection_id: connection_id.to_owned(),
+		})
+	}
+
+	fn release(&self, connection_id: &str) {
+		let mut counts = self.counts.lock();
+		if let Some(current) = counts.get_mut(connection_id) {
+			*current = current.saturating_sub(1);
+			if *current == 0 {
+				counts.remove(connection_id);
+			}
+		}
+	}
+}
+
+#[derive(Debug)]
+struct InboundReservation {
+	admission:     Arc<InboundAdmission>,
+	connection_id: String,
+}
+
+impl Drop for InboundReservation {
+	fn drop(&mut self) {
+		self.admission.release(&self.connection_id);
+	}
+}
+
+#[derive(Debug)]
+struct InboundEnvelope {
+	message:      InboundMessage,
+	_reservation: InboundReservation,
+}
+
+#[derive(Debug)]
+pub struct InboundReceiver {
+	rx: mpsc::Receiver<InboundEnvelope>,
+}
+
+impl InboundReceiver {
+	pub async fn recv(&mut self) -> Option<InboundMessage> {
+		self.rx.recv().await.map(|envelope| envelope.message)
+	}
+}
 #[derive(Debug)]
 struct ServerState {
-	token:               String,
-	registry:            Mutex<ActionRegistry>,
-	tx:                  broadcast::Sender<ServerMessage>,
-	resolver_available:  AtomicBool,
+	token:                String,
+	registry:             Mutex<ActionRegistry>,
+	tx:                   broadcast::Sender<ServerMessage>,
+	resolver_available:   AtomicBool,
 	/// Present in forward mode: accepted replies are sent here for the host.
-	reply_tx:            Option<mpsc::UnboundedSender<crate::actions::ClaimedReply>>,
+	reply_tx:             Option<mpsc::UnboundedSender<crate::actions::ClaimedReply>>,
 	/// Always present: authenticated inbound messages paired with the
 	/// server-assigned connection identity that delivered them.
-	inbound_tx:          mpsc::UnboundedSender<InboundMessage>,
+	inbound_tx:           mpsc::Sender<InboundEnvelope>,
+	inbound_admission:    Arc<InboundAdmission>,
 	/// v3 frames, kept raw so the SDK host owns their protocol semantics.
-	frame_tx:            mpsc::UnboundedSender<(String, String)>,
+	frame_tx:             mpsc::Sender<(String, String)>,
+	frame_budget:         Arc<FrameBudget>,
 	/// Negotiated capability snapshots for host-side per-connection policy.
-	cap_tx:              mpsc::UnboundedSender<CapabilityUpdate>,
+	cap_tx:               mpsc::Sender<CapabilityUpdate>,
 	/// Connection lifecycle notifications for provider lease cleanup.
-	close_tx:            mpsc::UnboundedSender<String>,
-	connections:         Mutex<HashMap<String, Connection>>,
-	acks:                Mutex<AckRegistry>,
-	closing:             AtomicBool,
+	close_tx:             mpsc::UnboundedSender<String>,
+	connections:          Mutex<HashMap<String, Connection>>,
+	acks:                 Mutex<AckRegistry>,
+	closing:              AtomicBool,
 	/// Buffered last readiness frame, replayed to late-connecting clients so a
 	/// lifecycle control client can wait for readiness deterministically.
-	session_ready:       Mutex<Option<SessionReady>>,
-	connection_sequence: AtomicU64,
+	session_ready:        Mutex<Option<SessionReady>>,
+	connection_sequence:  AtomicU64,
+	large_response_slots: Arc<Semaphore>,
 }
 
 /// An authenticated inbound message paired with its server-assigned connection
@@ -437,9 +675,8 @@ pub struct InboundMessage {
 	pub message:       ClientMessage,
 }
 
-pub type InboundReceiver = mpsc::UnboundedReceiver<InboundMessage>;
-type FrameReceiver = mpsc::UnboundedReceiver<(String, String)>;
-type CapabilityReceiver = mpsc::UnboundedReceiver<CapabilityUpdate>;
+type FrameReceiver = mpsc::Receiver<(String, String)>;
+type CapabilityReceiver = mpsc::Receiver<CapabilityUpdate>;
 
 /// Handle to a running server. Dropping it does not stop the server; call
 /// [`ServerHandle::stop`] (idempotent) for deterministic shutdown.
@@ -556,10 +793,10 @@ impl ServerHandle {
 			.connections
 			.lock()
 			.values()
-			.map(|connection| connection.tx.clone())
+			.map(|connection| (connection.tx.clone(), connection.close.clone()))
 			.collect::<Vec<_>>();
-		for connection in connections {
-			let _ = connection.send(DirectCommand::ReevaluateAsk);
+		for (tx, close) in connections {
+			let _ = try_send_direct(&tx, &close, DirectCommand::ReevaluateAsk);
 		}
 	}
 
@@ -641,21 +878,24 @@ impl ServerHandle {
 			.connections
 			.lock()
 			.values()
-			.map(|connection| connection.tx.clone())
+			.map(|connection| (connection.tx.clone(), connection.close.clone()))
 			.collect::<Vec<_>>();
 		if senders.is_empty() {
 			return Ok(false);
 		}
 		let mut receipts = Vec::with_capacity(senders.len());
-		for sender in senders {
+		let mut all_queued = true;
+		for (sender, close) in senders {
 			let (delivered_tx, delivered_rx) = oneshot::channel();
-			if sender
-				.send(DirectCommand::Deliver(Box::new(msg.clone()), Some(delivered_tx)))
-				.is_err()
-			{
-				return Ok(false);
+			if try_send_direct(
+				&sender,
+				&close,
+				DirectCommand::Deliver(Box::new(msg.clone()), Some(delivered_tx)),
+			) {
+				receipts.push(delivered_rx);
+			} else {
+				all_queued = false;
 			}
-			receipts.push(delivered_rx);
 		}
 		let delivered = timeout(wait, async move {
 			for receipt in receipts {
@@ -663,7 +903,7 @@ impl ServerHandle {
 					return false;
 				}
 			}
-			true
+			all_queued
 		})
 		.await
 		.unwrap_or(false);
@@ -715,7 +955,7 @@ impl ServerHandle {
 
 	/// Take raw v3 frames paired with their originating connection id.
 	#[must_use]
-	pub fn take_frame_receiver(&self) -> Option<mpsc::UnboundedReceiver<(String, String)>> {
+	pub fn take_frame_receiver(&self) -> Option<mpsc::Receiver<(String, String)>> {
 		self.frame_rx.lock().take()
 	}
 
@@ -729,7 +969,7 @@ impl ServerHandle {
 	/// Take negotiated client capability snapshots paired with their connection
 	/// id. Returns the receiver exactly once; subsequent calls return `None`.
 	#[must_use]
-	pub fn take_capability_receiver(&self) -> Option<mpsc::UnboundedReceiver<CapabilityUpdate>> {
+	pub fn take_capability_receiver(&self) -> Option<mpsc::Receiver<CapabilityUpdate>> {
 		self.capability_rx.lock().take()
 	}
 
@@ -745,15 +985,15 @@ impl ServerHandle {
 			.connections
 			.lock()
 			.get(connection_id)
-			.map(|connection| (connection.tx.clone(), connection.generation.clone()));
-		sender.is_some_and(|(sender, connection_generation)| {
-			sender
-				.send(DirectCommand::DirectedFrame {
-					json,
-					connection_generation,
-					requires_tool_activity,
-				})
-				.is_ok()
+			.map(|connection| {
+				(connection.tx.clone(), connection.close.clone(), connection.generation.clone())
+			});
+		sender.is_some_and(|(sender, close, connection_generation)| {
+			try_send_direct(&sender, &close, DirectCommand::DirectedFrame {
+				json,
+				connection_generation,
+				requires_tool_activity,
+			})
 		})
 	}
 
@@ -981,22 +1221,24 @@ impl ServerHandle {
 			});
 		}
 		let (dispatch_tx, dispatch_rx) = oneshot::channel();
-		let direct_tx = origin.as_ref().and_then(|(id, generation)| {
+		let direct = origin.as_ref().and_then(|(id, generation)| {
 			self
 				.state
 				.connections
 				.lock()
 				.get(id)
 				.filter(|connection| connection.generation == *generation)
-				.map(|connection| connection.tx.clone())
+				.map(|connection| (connection.tx.clone(), connection.close.clone()))
 		});
-		let queued = direct_tx.is_some_and(|direct_tx| {
-			direct_tx
-				.send(DirectCommand::Deliver(
+		let queued = direct.is_some_and(|(direct_tx, close)| {
+			try_send_direct(
+				&direct_tx,
+				&close,
+				DirectCommand::Deliver(
 					Box::new(ServerMessage::AskSelectedAckRequest(request)),
 					Some(dispatch_tx),
-				))
-				.is_ok()
+				),
+			)
 		});
 		if !queued {
 			return self.finish_ack(
@@ -1066,22 +1308,26 @@ impl ServerHandle {
 			(actual, cancel)
 		};
 		if let Some((commit_key, Some((id, generation)))) = cancel {
-			let direct_tx = self
+			let direct = self
 				.state
 				.connections
 				.lock()
 				.get(&id)
 				.filter(|connection| connection.generation == generation)
-				.map(|connection| connection.tx.clone());
-			if let Some(direct_tx) = direct_tx {
-				let _ = direct_tx.send(DirectCommand::Deliver(
-					Box::new(ServerMessage::AskSelectedAckCancel(AskSelectedAckCancel {
-						request_id: request_id.to_owned(),
-						commit_key,
-						reason: cancel_reason,
-					})),
-					None,
-				));
+				.map(|connection| (connection.tx.clone(), connection.close.clone()));
+			if let Some((direct_tx, close)) = direct {
+				let _ = try_send_direct(
+					&direct_tx,
+					&close,
+					DirectCommand::Deliver(
+						Box::new(ServerMessage::AskSelectedAckCancel(AskSelectedAckCancel {
+							request_id: request_id.to_owned(),
+							commit_key,
+							reason: cancel_reason,
+						})),
+						None,
+					),
+				);
 			}
 		}
 		actual
@@ -1098,18 +1344,19 @@ impl ServerHandle {
 			(actual, dispatched)
 		};
 		if let Some(Some((id, generation))) = dispatched {
-			let direct_tx = self
+			let direct = self
 				.state
 				.connections
 				.lock()
 				.get(&id)
 				.filter(|connection| connection.generation == generation)
-				.map(|connection| connection.tx.clone());
-			if let Some(direct_tx) = direct_tx {
-				let _ = direct_tx.send(DirectCommand::Deliver(
-					Box::new(ServerMessage::AskSelectedAckCancel(cancel)),
-					None,
-				));
+				.map(|connection| (connection.tx.clone(), connection.close.clone()));
+			if let Some((direct_tx, close)) = direct {
+				let _ = try_send_direct(
+					&direct_tx,
+					&close,
+					DirectCommand::Deliver(Box::new(ServerMessage::AskSelectedAckCancel(cancel)), None),
+				);
 			}
 		}
 		actual
@@ -1188,9 +1435,15 @@ pub async fn start(config: ServerConfig) -> std::io::Result<ServerHandle> {
 	} else {
 		(None, None)
 	};
-	let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundMessage>();
-	let (frame_tx, frame_rx) = mpsc::unbounded_channel();
-	let (cap_tx, cap_rx) = mpsc::unbounded_channel();
+	let inbound_admission = Arc::new(InboundAdmission::default());
+	let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_GLOBAL_CAPACITY);
+	let (frame_tx, frame_rx) = mpsc::channel(FRAME_BACKLOG_CAPACITY);
+	let frame_budget = Arc::new(FrameBudget {
+		pending_bytes:      AtomicUsize::new(0),
+		connection_pending: Mutex::new(HashMap::new()),
+	});
+
+	let (cap_tx, cap_rx) = mpsc::channel(CAPABILITY_CALLBACK_CAPACITY);
 	let (close_tx, close_rx) = mpsc::unbounded_channel();
 	let state = Arc::new(ServerState {
 		token: config.token,
@@ -1199,7 +1452,9 @@ pub async fn start(config: ServerConfig) -> std::io::Result<ServerHandle> {
 		resolver_available: AtomicBool::new(config.resolver_available),
 		reply_tx,
 		inbound_tx,
+		inbound_admission: Arc::clone(&inbound_admission),
 		frame_tx,
+		frame_budget,
 		cap_tx,
 		close_tx,
 		connections: Mutex::new(HashMap::new()),
@@ -1207,6 +1462,7 @@ pub async fn start(config: ServerConfig) -> std::io::Result<ServerHandle> {
 		closing: AtomicBool::new(false),
 		session_ready: Mutex::new(None),
 		connection_sequence: AtomicU64::new(1),
+		large_response_slots: Arc::new(Semaphore::new(MAX_LARGE_RESPONSE_CONNECTIONS)),
 	});
 	let cancel = CancellationToken::new();
 	let accept_task = tokio::spawn(accept_loop(listener, Arc::clone(&state), cancel.clone()));
@@ -1219,7 +1475,7 @@ pub async fn start(config: ServerConfig) -> std::io::Result<ServerHandle> {
 		session_id: config.session_id,
 		state_root: config.state_root,
 		reply_rx: Arc::new(Mutex::new(reply_rx)),
-		inbound_rx: Arc::new(Mutex::new(Some(inbound_rx))),
+		inbound_rx: Arc::new(Mutex::new(Some(InboundReceiver { rx: inbound_rx }))),
 		frame_rx: Arc::new(Mutex::new(Some(frame_rx))),
 		capability_rx: Arc::new(Mutex::new(Some(cap_rx))),
 		close_rx: Arc::new(Mutex::new(Some(close_rx))),
@@ -1227,24 +1483,51 @@ pub async fn start(config: ServerConfig) -> std::io::Result<ServerHandle> {
 }
 
 async fn accept_loop(listener: TcpListener, state: Arc<ServerState>, cancel: CancellationToken) {
-	let mut connections = JoinSet::new();
+	let mut connections: JoinSet<()> = JoinSet::new();
+	let mut handshakes: JoinSet<Option<HandshakeResult>> = JoinSet::new();
 	loop {
 		tokio::select! {
 			() = cancel.cancelled() => break,
 			joined = connections.join_next(), if !connections.is_empty() => {
 				let _ = joined;
 			},
+			joined = handshakes.join_next(), if !handshakes.is_empty() => {
+				if let Some(Ok(Some(handshake))) = joined
+					&& connections.len() < MAX_CONNECTION_TASKS
+				{
+					connections.spawn(handle_conn(
+						handshake.ws,
+						handshake.large_response_permit,
+						Arc::clone(&state),
+						cancel.clone(),
+					));
+				}
+			},
 			accepted = listener.accept() => {
 				let Ok((stream, _peer)) = accepted else { continue };
-				connections.spawn(handle_conn(stream, Arc::clone(&state), cancel.clone()));
+				if connections.len() >= MAX_CONNECTION_TASKS
+					|| handshakes.len() >= PREAUTH_HANDSHAKE_TASKS
+				{
+					drop(stream);
+					continue;
+				}
+				handshakes.spawn(handshake_conn(stream, Arc::clone(&state), cancel.clone()));
 			}
 		}
 	}
 	cancel.cancel();
+	join_connection_tasks(&mut handshakes).await;
 	join_connection_tasks(&mut connections).await;
 }
 
-async fn join_connection_tasks(connections: &mut JoinSet<()>) {
+struct HandshakeResult {
+	ws:                    ConnectionWebSocket,
+	large_response_permit: Option<OwnedSemaphorePermit>,
+}
+
+type ConnectionWebSocket = tokio_tungstenite::WebSocketStream<TcpStream>;
+
+async fn join_connection_tasks<T: 'static>(connections: &mut JoinSet<T>) {
 	if timeout(CONNECTION_JOIN_GRACE, async { while connections.join_next().await.is_some() {} })
 		.await
 		.is_err()
@@ -1253,15 +1536,21 @@ async fn join_connection_tasks(connections: &mut JoinSet<()>) {
 		while connections.join_next().await.is_some() {}
 	}
 }
-
 #[allow(
 	clippy::result_large_err,
 	reason = "ErrorResponse is the type mandated by tokio-tungstenite's accept_hdr_async callback"
 )]
-async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: CancellationToken) {
+async fn handshake_conn(
+	stream: TcpStream,
+	state: Arc<ServerState>,
+	cancel: CancellationToken,
+) -> Option<HandshakeResult> {
 	let expected = state.token.clone();
+	let authenticated = Arc::new(AtomicBool::new(false));
+	let authenticated_for_auth = Arc::clone(&authenticated);
 	let auth = move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
 		if token_from_query(req.uri().query()).is_some_and(|t| tokens_match(&t, &expected)) {
+			authenticated_for_auth.store(true, Ordering::Release);
 			Ok(resp)
 		} else {
 			let body = ErrorResponse::new(Some("unauthorized".to_owned()));
@@ -1270,24 +1559,47 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 			Err(ErrorResponse::from_parts(parts, body))
 		}
 	};
+	let large_response_permit = state.large_response_slots.clone().try_acquire_owned().ok();
 	// Tungstenite applies the frame ceiling from the frame header, before it
 	// accumulates the payload into a message or this server parses/clones it.
+	// tokio-tungstenite 0.24 cannot upgrade this setting after ClientHello, so
+	// the finite large-message quota is assigned by authenticated connection order;
+	// all other connections retain the normal request bound and cannot assemble a
+	// large body.
+	let max_message_size = large_response_permit
+		.as_ref()
+		.map_or(REQUEST_FRAME_BYTES, |_| REVERSE_RESPONSE_FRAME_BYTES);
 	let ws_config = WebSocketConfig {
-		max_message_size: Some(REQUEST_FRAME_BYTES),
-		max_frame_size: Some(REQUEST_FRAME_BYTES),
+		max_message_size: Some(max_message_size),
+		max_frame_size: Some(max_message_size),
 		..WebSocketConfig::default()
 	};
-	let ws = tokio::select! {
-		() = cancel.cancelled() => return,
-		accepted = tokio_tungstenite::accept_hdr_async_with_config(stream, auth, Some(ws_config)) => {
-			let Ok(ws) = accepted else { return };
-			ws
-		},
+	let accepted = tokio::select! {
+		() = cancel.cancelled() => return None,
+		accepted = timeout(
+			HANDSHAKE_DEADLINE,
+			tokio_tungstenite::accept_hdr_async_with_config(stream, auth, Some(ws_config)),
+		) => accepted,
 	};
+	match accepted {
+		Ok(Ok(ws)) if authenticated.load(Ordering::Acquire) => {
+			Some(HandshakeResult { ws, large_response_permit })
+		},
+		Ok(Ok(_) | Err(_)) | Err(_) => None,
+	}
+}
+
+async fn handle_conn(
+	ws: ConnectionWebSocket,
+	_large_response_permit: Option<OwnedSemaphorePermit>,
+	state: Arc<ServerState>,
+	cancel: CancellationToken,
+) {
+	let connection_cancel = cancel.child_token();
 	let connection_id =
 		format!("connection:{}", state.connection_sequence.fetch_add(1, Ordering::Relaxed));
 	let generation = "0".to_owned();
-	let (direct_tx, mut direct_rx) = mpsc::unbounded_channel::<DirectCommand>();
+	let (direct_tx, mut direct_rx) = mpsc::channel::<DirectCommand>(DIRECT_COMMAND_CAPACITY);
 	let mut rx = state.tx.subscribe();
 	let (mut write, mut read) = ws.split();
 	let hello = ServerMessage::Hello(ServerHello {
@@ -1320,6 +1632,7 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 			negotiation:  Negotiation::AwaitingHello,
 			delivered:    None,
 			tx:           direct_tx.clone(),
+			close:        connection_cancel.clone(),
 		});
 
 	// Replay readiness before ask presentation; the ask itself is tailored by the
@@ -1333,7 +1646,17 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 		state.connections.lock().remove(&connection_id);
 		return;
 	}
-	let _ = direct_tx.send(DirectCommand::ReevaluateAsk);
+	let (frame_ingress_tx, frame_ingress_rx) = mpsc::channel(CONNECTION_FRAME_BACKLOG_CAPACITY);
+	let frame_ingress = FrameIngress {
+		tx:   frame_ingress_tx,
+		slot: Arc::new(FrameSlot { budget: Arc::clone(&state.frame_budget) }),
+	};
+	let frame_forwarder = tokio::spawn(forward_frames(
+		frame_ingress_rx,
+		state.frame_tx.clone(),
+		connection_cancel.clone(),
+	));
+	let _ = try_send_direct(&direct_tx, &connection_cancel, DirectCommand::ReevaluateAsk);
 
 	let grace = sleep(CLIENT_HELLO_GRACE);
 	tokio::pin!(grace);
@@ -1341,7 +1664,7 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 
 	loop {
 		tokio::select! {
-			() = cancel.cancelled() => {
+			() = connection_cancel.cancelled() => {
 				while let Ok(direct) = direct_rx.try_recv() {
 					let sent = match direct {
 						DirectCommand::Deliver(message, dispatched) => {
@@ -1382,12 +1705,13 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 				if let Some(connection) = state.connections.lock().get_mut(&connection_id) {
 					connection.negotiation = Negotiation::TimedOut;
 				}
-				let _ = direct_tx.send(DirectCommand::ReevaluateAsk);
+				let _ = try_send_direct(&direct_tx, &connection_cancel, DirectCommand::ReevaluateAsk);
 			},
 			incoming = read.next() => {
 				match incoming {
 					Some(Ok(Message::Text(text))) => {
-						if text.len() > REQUEST_FRAME_BYTES
+						if text.len() > REVERSE_RESPONSE_FRAME_BYTES
+							|| (text.len() > REQUEST_FRAME_BYTES && !is_large_reverse_response(text.as_str()))
 							|| !handle_text(
 								text.as_str(),
 								&state,
@@ -1396,6 +1720,8 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 								&generation,
 								&mut awaiting,
 								&direct_tx,
+								&connection_cancel,
+								&frame_ingress,
 							).await
 						{
 							let _ = reject_frame(&mut write, CloseCode::Size, "request frame exceeds 256 KiB").await;
@@ -1487,6 +1813,9 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 			},
 		}
 	}
+	drop(frame_ingress);
+	frame_forwarder.abort();
+	let _ = frame_forwarder.await;
 	state.connections.lock().remove(&connection_id);
 	let _ = state.close_tx.send(connection_id.clone());
 	let ids: Vec<_> = state
@@ -1589,6 +1918,31 @@ where
 	true
 }
 
+fn merge_client_capabilities(
+	current: &[String],
+	incoming: impl IntoIterator<Item = String>,
+) -> Option<Vec<String>> {
+	let mut merged = current.to_vec();
+	for capability in incoming {
+		if !merged.contains(&capability) {
+			merged.push(capability);
+		}
+	}
+	let bytes = merged.iter().map(String::len).sum::<usize>();
+	(merged.len() <= CLIENT_HELLO_MAX_CAPABILITIES && bytes <= CLIENT_HELLO_MAX_CAPABILITY_BYTES)
+		.then_some(merged)
+}
+
+fn enqueue_inbound(state: &ServerState, connection_id: &str, message: ClientMessage) {
+	let Some(reservation) = state.inbound_admission.try_reserve(connection_id) else {
+		return;
+	};
+	let _ = state.inbound_tx.try_send(InboundEnvelope {
+		message:      InboundMessage { connection_id: connection_id.to_owned(), message },
+		_reservation: reservation,
+	});
+}
+
 /// Returns `false` when the connection should close.
 async fn handle_text<S>(
 	text: &str,
@@ -1597,19 +1951,16 @@ async fn handle_text<S>(
 	connection_id: &str,
 	generation: &str,
 	awaiting: &mut bool,
-	direct_tx: &mpsc::UnboundedSender<DirectCommand>,
+	direct_tx: &mpsc::Sender<DirectCommand>,
+	connection_cancel: &CancellationToken,
+	frame_ingress: &FrameIngress,
 ) -> bool
 where
 	S: SinkExt<Message> + Unpin,
 {
 	if is_v3_frame(text) {
-		return state
-			.frame_tx
-			.send((
-				connection_id.to_owned(),
-				attach_event_replay_capabilities(text, state, connection_id),
-			))
-			.is_ok();
+		return frame_ingress
+			.try_enqueue(connection_id, attach_event_replay_capabilities(text, state, connection_id));
 	}
 	let Ok(msg) = serde_json::from_str::<ClientMessage>(text) else {
 		// Ignore malformed frames without tearing down the connection.
@@ -1622,46 +1973,31 @@ where
 		// action replies.
 		ClientMessage::UserMessage(u) => {
 			if tokens_match(&u.token, &state.token) {
-				let _ = state.inbound_tx.send(InboundMessage {
-					connection_id: connection_id.to_owned(),
-					message:       ClientMessage::UserMessage(u),
-				});
+				enqueue_inbound(state, connection_id, ClientMessage::UserMessage(u));
 			}
 			return true;
 		},
 		ClientMessage::EphemeralTurn(turn) => {
 			if tokens_match(&turn.token, &state.token) {
-				let _ = state.inbound_tx.send(InboundMessage {
-					connection_id: connection_id.to_owned(),
-					message:       ClientMessage::EphemeralTurn(turn),
-				});
+				enqueue_inbound(state, connection_id, ClientMessage::EphemeralTurn(turn));
 			}
 			return true;
 		},
 		ClientMessage::EphemeralTurnCancel(cancel) => {
 			if tokens_match(&cancel.token, &state.token) {
-				let _ = state.inbound_tx.send(InboundMessage {
-					connection_id: connection_id.to_owned(),
-					message:       ClientMessage::EphemeralTurnCancel(cancel),
-				});
+				enqueue_inbound(state, connection_id, ClientMessage::EphemeralTurnCancel(cancel));
 			}
 			return true;
 		},
 		ClientMessage::ConfigCommand(c) => {
 			if tokens_match(&c.token, &state.token) {
-				let _ = state.inbound_tx.send(InboundMessage {
-					connection_id: connection_id.to_owned(),
-					message:       ClientMessage::ConfigCommand(c),
-				});
+				enqueue_inbound(state, connection_id, ClientMessage::ConfigCommand(c));
 			}
 			return true;
 		},
 		ClientMessage::ControlCommand(c) => {
 			if tokens_match(&c.token, &state.token) {
-				let _ = state.inbound_tx.send(InboundMessage {
-					connection_id: connection_id.to_owned(),
-					message:       ClientMessage::ControlCommand(c),
-				});
+				enqueue_inbound(state, connection_id, ClientMessage::ControlCommand(c));
 			}
 			return true;
 		},
@@ -1678,25 +2014,40 @@ where
 			return true;
 		},
 		ClientMessage::Hello(hello) => {
+			let capability_bytes = hello
+				.capabilities
+				.iter()
+				.try_fold(0usize, |total, capability| total.checked_add(capability.len()));
+			if hello.capabilities.len() > CLIENT_HELLO_MAX_CAPABILITIES
+				|| capability_bytes.is_none_or(|bytes| bytes > CLIENT_HELLO_MAX_CAPABILITY_BYTES)
+			{
+				return false;
+			}
 			*awaiting = false;
 			let capabilities =
 				if let Some(connection) = state.connections.lock().get_mut(connection_id) {
-					for capability in hello.capabilities {
-						if !connection.capabilities.contains(&capability) {
-							connection.capabilities.push(capability);
-						}
-					}
+					let Some(merged) =
+						merge_client_capabilities(&connection.capabilities, hello.capabilities)
+					else {
+						return false;
+					};
+					let first_hello = connection.negotiation != Negotiation::Negotiated;
+					let changed = merged != connection.capabilities;
+					connection.capabilities = merged;
 					connection.negotiation = Negotiation::Negotiated;
-					Some(connection.capabilities.clone())
+					(first_hello || changed).then(|| connection.capabilities.clone())
 				} else {
 					None
 				};
 			if let Some(capabilities) = capabilities {
-				let _ = state
-					.cap_tx
-					.send(CapabilityUpdate { connection_id: connection_id.to_owned(), capabilities });
+				let _ = state.cap_tx.try_send(CapabilityUpdate {
+					connection_id: connection_id.to_owned(),
+					capabilities,
+				});
 			}
-			let _ = direct_tx.send(DirectCommand::ReevaluateAsk);
+			if !try_send_direct(direct_tx, connection_cancel, DirectCommand::ReevaluateAsk) {
+				return false;
+			}
 			return true;
 		},
 		ClientMessage::Unknown => return true,
@@ -1794,6 +2145,9 @@ fn attach_event_replay_capabilities(
 	state: &ServerState,
 	connection_id: &str,
 ) -> String {
+	if frame_kind(text).as_deref() != Some("event_replay") {
+		return text.to_owned();
+	}
 	let Ok(mut frame) = serde_json::from_str::<serde_json::Value>(text) else {
 		return text.to_owned();
 	};
@@ -1821,11 +2175,8 @@ fn attach_event_replay_capabilities(
 }
 
 fn is_v3_frame(text: &str) -> bool {
-	let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-		return false;
-	};
 	matches!(
-		value.get("type").and_then(serde_json::Value::as_str),
+		frame_kind(text).as_deref(),
 		Some(
 			"control_request"
 				| "query_request"
@@ -1863,6 +2214,74 @@ pub(crate) fn tokens_match(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+	#[test]
+	fn large_multi_peer_assembly_admission_is_finite_and_released_after_disconnect() {
+		let slots = std::sync::Arc::new(Semaphore::new(MAX_LARGE_RESPONSE_CONNECTIONS));
+		let first = slots.clone().try_acquire_owned().expect("first slot");
+		let second = slots.clone().try_acquire_owned().expect("second slot");
+		assert!(slots.clone().try_acquire_owned().is_err());
+		drop(first);
+		assert!(slots.try_acquire_owned().is_ok());
+		drop(second);
+	}
+
+	#[test]
+	fn frame_budget_keeps_ingress_fair_between_connections() {
+		let budget = FrameBudget {
+			pending_bytes:      AtomicUsize::new(0),
+			connection_pending: Mutex::new(HashMap::new()),
+		};
+		assert!(budget.try_reserve("producer-a", CONNECTION_FRAME_PENDING_BYTES_CAPACITY));
+		assert!(!budget.try_reserve("producer-a", 1));
+		assert!(budget.try_reserve("producer-b", REQUEST_FRAME_BYTES));
+		budget.release("producer-a", CONNECTION_FRAME_PENDING_BYTES_CAPACITY);
+		budget.release("producer-b", REQUEST_FRAME_BYTES);
+	}
+
+	#[test]
+	fn inbound_admission_is_bounded_per_peer_and_global() {
+		let admission = std::sync::Arc::new(InboundAdmission::default());
+		let mut first = Vec::new();
+		for _ in 0..INBOUND_CONNECTION_CAPACITY {
+			first.push(admission.try_reserve("producer-a").expect("per-peer slot"));
+		}
+		assert!(admission.try_reserve("producer-a").is_none());
+		assert!(admission.try_reserve("producer-b").is_some());
+		drop(first.pop());
+		assert!(admission.try_reserve("producer-a").is_some());
+	}
+
+	#[test]
+	fn directed_output_overflow_cancels_only_the_blocked_connection() {
+		let close = CancellationToken::new();
+		let (tx, mut rx) = mpsc::channel::<DirectCommand>(1);
+		assert!(try_send_direct(&tx, &close, DirectCommand::ReevaluateAsk));
+		assert!(!try_send_direct(&tx, &close, DirectCommand::ReevaluateAsk));
+		assert!(close.is_cancelled());
+		assert!(rx.try_recv().is_ok());
+	}
+
+	#[test]
+	fn repeated_hello_capabilities_cannot_grow_without_bound() {
+		let mut capabilities = vec!["stable".to_owned()];
+		for _ in 0..(CLIENT_HELLO_MAX_CAPABILITIES * 2) {
+			capabilities = merge_client_capabilities(&capabilities, ["stable".to_owned()])
+				.expect("duplicate capability remains bounded");
+		}
+		assert_eq!(capabilities, vec!["stable"]);
+		assert!(
+			merge_client_capabilities(
+				&[],
+				(0..=CLIENT_HELLO_MAX_CAPABILITIES).map(|index| format!("cap-{index}")),
+			)
+			.is_none()
+		);
+		assert!(
+			merge_client_capabilities(&[], ["x".repeat(CLIENT_HELLO_MAX_CAPABILITY_BYTES + 1)])
+				.is_none()
+		);
+	}
 	use futures_util::SinkExt;
 	use tokio_tungstenite::connect_async;
 
@@ -3164,8 +3583,7 @@ mod tests {
 				thread_id:  Some("topic-1".into()),
 				images:     vec![],
 			}))
-			.unwrap()
-			.into(),
+			.unwrap(),
 		))
 		.await
 		.unwrap();
@@ -3207,8 +3625,7 @@ mod tests {
 				"threadId": "11",
 				"question": "What changed?",
 			})
-			.to_string()
-			.into(),
+			.to_string(),
 		))
 		.await
 		.unwrap();
@@ -3261,9 +3678,7 @@ mod tests {
 				"question": "wrong token",
 			}),
 		] {
-			ws.send(Message::Text(frame.to_string().into()))
-				.await
-				.unwrap();
+			ws.send(Message::Text(frame.to_string())).await.unwrap();
 		}
 		assert!(
 			tokio::time::timeout(std::time::Duration::from_millis(300), inbound.recv())
@@ -3298,8 +3713,7 @@ mod tests {
 				"threadId": "11",
 				"reason": "daemon_shutdown",
 			})
-			.to_string()
-			.into(),
+			.to_string(),
 		))
 		.await
 		.unwrap();
@@ -3334,8 +3748,7 @@ mod tests {
 				"question": "strict",
 				"unexpected": true,
 			})
-			.to_string()
-			.into(),
+			.to_string(),
 		))
 		.await
 		.unwrap();
@@ -3350,8 +3763,7 @@ mod tests {
 				"threadId": "11",
 				"question": "strict",
 			})
-			.to_string()
-			.into(),
+			.to_string(),
 		))
 		.await
 		.unwrap();
@@ -3381,8 +3793,7 @@ mod tests {
 				thread_id:  Some("topic-1".into()),
 				command:    serde_json::json!({ "name": "context" }),
 			}))
-			.unwrap()
-			.into(),
+			.unwrap(),
 		))
 		.await
 		.unwrap();
@@ -3418,8 +3829,7 @@ mod tests {
 				thread_id:  None,
 				images:     vec![],
 			}))
-			.unwrap()
-			.into(),
+			.unwrap(),
 		))
 		.await
 		.unwrap();
@@ -3550,7 +3960,7 @@ mod tests {
 		wait_for_clients(&handle, 2).await;
 
 		oversized
-			.send(Message::Text("x".repeat(REQUEST_FRAME_BYTES + 1).into()))
+			.send(Message::Text("x".repeat(REQUEST_FRAME_BYTES + 1)))
 			.await
 			.expect("send oversized text frame");
 		match tokio::time::timeout(std::time::Duration::from_secs(2), oversized.next())
@@ -3566,12 +3976,138 @@ mod tests {
 
 		healthy
 			.send(Message::Text(
-				serde_json::to_string(&ClientMessage::Ping(Ping { nonce: "healthy".into() }))
-					.unwrap()
-					.into(),
+				serde_json::to_string(&ClientMessage::Ping(Ping { nonce: "healthy".into() })).unwrap(),
 			))
 			.await
 			.expect("send healthy request");
+		assert!(
+			matches!(next_server_msg(&mut healthy).await, ServerMessage::Pong(Pong { nonce }) if nonce == "healthy")
+		);
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn large_assembly_quota_preserves_third_peer_ping_after_oversize_rejection() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut first = connect(&handle, "secret").await;
+		next_server_hello(&mut first).await;
+		let mut second = connect(&handle, "secret").await;
+		next_server_hello(&mut second).await;
+		let mut third = connect(&handle, "secret").await;
+		next_server_hello(&mut third).await;
+		wait_for_clients(&handle, 3).await;
+
+		third
+			.send(Message::Text("x".repeat(REQUEST_FRAME_BYTES + 1)))
+			.await
+			.expect("send oversized third-peer frame");
+		match tokio::time::timeout(std::time::Duration::from_secs(2), third.next())
+			.await
+			.expect("third peer was not closed")
+		{
+			Some(Ok(Message::Close(Some(frame)))) => assert_eq!(frame.code, CloseCode::Size),
+			Some(Err(_)) | None => {},
+			Some(Ok(message)) => panic!("unexpected third-peer message: {message:?}"),
+		}
+
+		first
+			.send(Message::Text(
+				serde_json::to_string(&ClientMessage::Ping(Ping { nonce: "first".into() })).unwrap(),
+			))
+			.await
+			.expect("send ping to large-quota peer");
+		assert!(
+			matches!(next_server_msg(&mut first).await, ServerMessage::Pong(Pong { nonce }) if nonce == "first")
+		);
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn large_reverse_response_frame_reaches_protocol_validation() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut socket = connect(&handle, "secret").await;
+		let connection_id = next_server_hello(&mut socket)
+			.await
+			.connection_id
+			.expect("connection id");
+		send_hello(&mut socket, vec![]).await;
+		let frame = serde_json::json!({
+			"type": "reverse_response",
+			"id": "missing-request",
+			"connectionId": connection_id,
+			"leaseId": "missing-lease",
+			"ok": true,
+			"result": { "output": "x".repeat(REQUEST_FRAME_BYTES + 1), "truncated": false },
+		});
+		socket
+			.send(Message::Text(frame.to_string()))
+			.await
+			.expect("send large reverse response");
+		socket
+			.send(Message::Text(
+				serde_json::to_string(&ClientMessage::Ping(Ping { nonce: "healthy".into() })).unwrap(),
+			))
+			.await
+			.expect("send healthy request");
+		assert!(
+			matches!(next_server_msg(&mut socket).await, ServerMessage::Pong(Pong { nonce }) if nonce == "healthy")
+		);
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn reverse_response_backlog_backpressures_without_disconnect_after_recovery() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut frames = handle.take_frame_receiver().expect("frame receiver");
+		let mut stalled = connect(&handle, "secret").await;
+		let stalled_id = next_server_hello(&mut stalled)
+			.await
+			.connection_id
+			.expect("stalled connection id");
+		send_hello(&mut stalled, vec![]).await;
+		let mut healthy = connect(&handle, "secret").await;
+		let healthy_id = next_server_hello(&mut healthy)
+			.await
+			.connection_id
+			.expect("healthy connection id");
+		send_hello(&mut healthy, vec![]).await;
+		let frame = |id: &str, request: &str| {
+			Message::Text(
+				serde_json::json!({
+					"type": "reverse_response",
+					"id": request,
+					"connectionId": id,
+					"leaseId": "missing-lease",
+					"ok": true,
+					"result": { "output": "x", "truncated": false },
+				})
+				.to_string(),
+			)
+		};
+		stalled
+			.send(frame(&stalled_id, "stalled-1"))
+			.await
+			.expect("send first stalled frame");
+		stalled
+			.send(frame(&stalled_id, "stalled-2"))
+			.await
+			.expect("send second stalled frame");
+		healthy
+			.send(frame(&healthy_id, "healthy-1"))
+			.await
+			.expect("send healthy frame");
+		for _ in 0..3 {
+			tokio::time::timeout(Duration::from_secs(2), frames.recv())
+				.await
+				.expect("frame backlog should drain after callback recovery")
+				.expect("frame receiver remains open");
+		}
+		healthy
+			.send(Message::Text(
+				serde_json::to_string(&ClientMessage::Ping(Ping { nonce: "healthy".into() })).unwrap(),
+			))
+			.await
+			.expect("send healthy request after recovery");
 		assert!(
 			matches!(next_server_msg(&mut healthy).await, ServerMessage::Pong(Pong { nonce }) if nonce == "healthy")
 		);
@@ -3585,7 +4121,7 @@ mod tests {
 		next_server_hello(&mut ws).await;
 		wait_for_clients(&handle, 1).await;
 
-		ws.send(Message::Binary(br#"{"type":"ping"}"#.to_vec().into()))
+		ws.send(Message::Binary(br#"{"type":"ping"}"#.to_vec()))
 			.await
 			.expect("send binary protocol frame");
 		let rejected = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
@@ -3602,7 +4138,8 @@ mod tests {
 	#[tokio::test]
 	async fn send_failure_after_dispatch_begins_is_transport_ambiguous() {
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
-		let (tx, mut rx) = mpsc::unbounded_channel::<DirectCommand>();
+		let (tx, mut rx) = mpsc::channel::<DirectCommand>(DIRECT_COMMAND_CAPACITY);
+		let close = CancellationToken::new();
 		handle
 			.state
 			.connections
@@ -3613,6 +4150,7 @@ mod tests {
 				negotiation: Negotiation::Negotiated,
 				delivered: None,
 				tx,
+				close,
 			});
 		let task = {
 			let handle = handle.clone();

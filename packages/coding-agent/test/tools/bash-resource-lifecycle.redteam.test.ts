@@ -26,6 +26,15 @@ function processExists(pid: number): boolean {
 	}
 }
 
+async function waitForGone(pid: number, timeoutMs = 2_500): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (!processExists(pid)) return true;
+		await Bun.sleep(50);
+	}
+	return !processExists(pid);
+}
+
 async function waitForFile(filePath: string, timeoutMs = 3_000): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
@@ -155,6 +164,24 @@ describe("bash resource lifecycle red-team", () => {
 			sibling.kill("SIGKILL");
 			await sibling.exited.catch(() => undefined);
 		}
+	});
+
+	it("fails closed when asynchronous process substitution still owns a child", async () => {
+		if (process.platform === "win32") return;
+
+		const pidFile = path.join(tempDir, "process-substitution.pid");
+		const command = `true <(python3 -c 'import os,time; open(${JSON.stringify(pidFile)}, "w").write(str(os.getpid())); time.sleep(30)')`;
+		await expect(
+			executeBash(command, {
+				cwd: tempDir,
+				timeout: 5_000,
+				sessionKey: "process-substitution-ownership",
+			}),
+		).rejects.toThrow(/ownership (incomplete|limit reached)/i);
+
+		expect(await waitForFile(pidFile)).toBe(true);
+		const childPid = Number(fs.readFileSync(pidFile, "utf8"));
+		expect(await waitForGone(childPid)).toBe(true);
 	});
 
 	it("caps huge bash artifacts with truncation metadata instead of unbounded growth", async () => {

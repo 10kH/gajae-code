@@ -56,18 +56,31 @@ export interface ClientBridgeTerminalOutput {
 
 export interface ClientBridgeTerminalHandle {
 	terminalId: string;
+	/** Exact provider lease/session identity that owns this terminal. */
+	providerLeaseId: string;
 	waitForExit(): Promise<ClientBridgeTerminalExitStatus>;
 	currentOutput(): Promise<ClientBridgeTerminalOutput>;
 	kill(): Promise<void>;
 	release(): Promise<void>;
+	/** Full authenticated provider identity, when supplied by the transport. */
+	providerLeaseIdentity?: ClientBridgeProviderLeaseIdentity;
+}
+
+export interface ClientBridgeProviderLeaseIdentity {
+	leaseId: string;
+	connectionId: string;
+	connectionGeneration: number;
+	fence: string;
 }
 
 export interface ClientBridgeCreateTerminalParams {
+	toolCallId: string;
 	command: string;
 	args?: string[];
 	env?: Array<{ name: string; value: string }>;
 	cwd?: string;
 	outputByteLimit?: number;
+	signal?: AbortSignal;
 }
 
 export interface ClientBridge {
@@ -77,6 +90,8 @@ export interface ClientBridge {
 	readTextFile?(params: { path: string; line?: number; limit?: number }): Promise<string>;
 	writeTextFile?(params: { path: string; content: string }): Promise<void>;
 	createTerminal?(params: ClientBridgeCreateTerminalParams): Promise<ClientBridgeTerminalHandle>;
+	/** Fence the exact provider identity after cleanup ownership becomes uncertain. */
+	quarantineProviderLease?(providerLease: string | ClientBridgeProviderLeaseIdentity, reason: string): Promise<void>;
 	requestPermission?(
 		toolCall: ClientBridgePermissionToolCall,
 		options: ClientBridgePermissionOption[],

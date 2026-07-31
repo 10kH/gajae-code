@@ -12,7 +12,7 @@ use napi_derive::napi;
 use pi_shell::{
 	MinimizerResult as CoreMinimizerResult, Shell as CoreShell,
 	ShellExecuteOptions as CoreShellExecuteOptions, ShellOptions as CoreShellOptions,
-	ShellRunOptions as CoreShellRunOptions, ShellRunResult as CoreShellRunResult,
+	ShellOutputChunk, ShellRunOptions as CoreShellRunOptions, ShellRunResult as CoreShellRunResult,
 	execute_shell as core_execute_shell,
 	fixup::{BashFixupResult as CoreBashFixupResult, apply_bash_fixups as core_apply_bash_fixups},
 	minimizer,
@@ -20,7 +20,16 @@ use pi_shell::{
 
 use crate::task;
 const SHELL_CALLBACK_QUEUE_CAPACITY: usize = 1024;
-const SHELL_LOSS_MARKER_PREFIX: &str = "\n[Shell output truncated: ";
+const JS_SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
+type ShellChunkCallback = ThreadsafeFunction<
+	String,
+	Unknown<'static>,
+	String,
+	napi::Status,
+	true,
+	false,
+	SHELL_CALLBACK_QUEUE_CAPACITY,
+>;
 
 /// N-API opt-in handle for the minimizer.
 #[napi(object)]
@@ -151,30 +160,89 @@ impl From<CoreMinimizerResult> for MinimizerResult {
 	}
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ShellCallbackLoss {
+	dropped_chunks:     u64,
+	dropped_bytes:      u64,
+	capture_incomplete: bool,
+}
+
+impl ShellCallbackLoss {
+	const fn incomplete() -> Self {
+		Self { dropped_chunks: 0, dropped_bytes: 0, capture_incomplete: true }
+	}
+
+	fn record_drop(&mut self, bytes: usize) {
+		self.dropped_chunks = self.dropped_chunks.saturating_add(1);
+		self.dropped_bytes = self
+			.dropped_bytes
+			.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+	}
+
+	const fn record_core_loss(&mut self, chunks: u64, bytes: u64) {
+		self.dropped_chunks = self.dropped_chunks.saturating_add(chunks);
+		self.dropped_bytes = self.dropped_bytes.saturating_add(bytes);
+	}
+
+	fn chunks_js(&self) -> Option<i64> {
+		(self.dropped_chunks > 0).then(|| self.dropped_chunks.min(JS_SAFE_INTEGER_MAX) as i64)
+	}
+
+	fn bytes_js(&self) -> Option<i64> {
+		(self.dropped_bytes > 0).then(|| self.dropped_bytes.min(JS_SAFE_INTEGER_MAX) as i64)
+	}
+
+	const fn count_saturated(&self) -> bool {
+		self.dropped_chunks > JS_SAFE_INTEGER_MAX || self.dropped_bytes > JS_SAFE_INTEGER_MAX
+	}
+}
+
 /// Result of running a shell command.
 #[napi(object)]
 pub struct ShellRunResult {
 	/// Exit code when the command completes normally.
-	pub exit_code: Option<i32>,
+	pub exit_code:                   Option<i32>,
 	/// Whether the command was cancelled via abort.
-	pub cancelled: bool,
+	pub cancelled:                   bool,
 	/// Whether the command timed out before completion.
-	pub timed_out: bool,
+	pub timed_out:                   bool,
+	/// Whether the core output reader failed to settle before execution
+	/// returned.
+	pub output_capture_incomplete:   Option<bool>,
+	/// Chunks dropped before the JavaScript output callback could receive them.
+	pub dropped_output_chunks:       Option<i64>,
+	/// Bytes dropped before the JavaScript output callback could receive them.
+	pub dropped_output_bytes:        Option<i64>,
+	/// Whether a loss counter exceeded JavaScript's exact integer range.
+	pub output_loss_count_saturated: Option<bool>,
 	/// When the minimizer rewrote the captured output, this carries the
 	/// original buffer + telemetry so the session layer can persist it as
 	/// an artifact and splice an `artifact://<id>` reference into the
 	/// minimized text shown to the agent. `None` when nothing was rewritten.
-	pub minimized: Option<MinimizerResult>,
+	pub minimized:                   Option<MinimizerResult>,
+}
+
+impl ShellRunResult {
+	fn from_core(value: CoreShellRunResult, mut callback_loss: ShellCallbackLoss) -> Self {
+		callback_loss.record_core_loss(value.output_truncated_chunks, value.output_truncated_bytes);
+		Self {
+			exit_code:                   value.exit_code,
+			cancelled:                   value.cancelled,
+			timed_out:                   value.timed_out,
+			output_capture_incomplete:   (value.output_capture_incomplete
+				|| callback_loss.capture_incomplete)
+				.then_some(true),
+			dropped_output_chunks:       callback_loss.chunks_js(),
+			dropped_output_bytes:        callback_loss.bytes_js(),
+			output_loss_count_saturated: callback_loss.count_saturated().then_some(true),
+			minimized:                   value.minimized.map(Into::into),
+		}
+	}
 }
 
 impl From<CoreShellRunResult> for ShellRunResult {
 	fn from(value: CoreShellRunResult) -> Self {
-		Self {
-			exit_code: value.exit_code,
-			cancelled: value.cancelled,
-			timed_out: value.timed_out,
-			minimized: value.minimized.map(Into::into),
-		}
+		Self::from_core(value, ShellCallbackLoss::default())
 	}
 }
 
@@ -205,7 +273,7 @@ impl Shell {
 		env: &'env Env,
 		options: ShellRunOptions<'env>,
 		#[napi(ts_arg_type = "((error: Error | null, chunk: string) => void) | undefined | null")]
-		on_chunk: Option<ThreadsafeFunction<String>>,
+		on_chunk: Option<ShellChunkCallback>,
 	) -> Result<PromiseRaw<'env, ShellRunResult>> {
 		let cancel_token = task::CancelToken::new(options.timeout_ms, options.signal);
 		let inner = Arc::clone(&self.inner);
@@ -220,12 +288,14 @@ impl Shell {
 			let result = inner
 				.run(run_options, chunk_tx, cancel_token.into_core())
 				.await
-				.map(Into::into)
 				.map_err(|err| Error::from_reason(err.to_string()));
-			if let Some(handle) = drain_handle {
-				let _ = handle.await;
-			}
-			result
+			let callback_loss = match drain_handle {
+				Some(handle) => handle
+					.await
+					.unwrap_or_else(|_| ShellCallbackLoss::incomplete()),
+				None => ShellCallbackLoss::default(),
+			};
+			result.map(|value| ShellRunResult::from_core(value, callback_loss))
 		})
 	}
 
@@ -249,7 +319,7 @@ pub fn execute_shell<'env>(
 	env: &'env Env,
 	options: ShellExecuteOptions<'env>,
 	#[napi(ts_arg_type = "((error: Error | null, chunk: string) => void) | undefined | null")]
-	on_chunk: Option<ThreadsafeFunction<String>>,
+	on_chunk: Option<ShellChunkCallback>,
 ) -> Result<PromiseRaw<'env, ShellRunResult>> {
 	let cancel_token = task::CancelToken::new(options.timeout_ms, options.signal);
 	let exec_options = CoreShellExecuteOptions {
@@ -265,68 +335,44 @@ pub fn execute_shell<'env>(
 		let (chunk_tx, drain_handle) = bridge_chunks(on_chunk);
 		let result = core_execute_shell(exec_options, chunk_tx, cancel_token.into_core())
 			.await
-			.map(Into::into)
 			.map_err(|err| Error::from_reason(err.to_string()));
-		if let Some(handle) = drain_handle {
-			let _ = handle.await;
-		}
-		result
+		let callback_loss = match drain_handle {
+			Some(handle) => handle
+				.await
+				.unwrap_or_else(|_| ShellCallbackLoss::incomplete()),
+			None => ShellCallbackLoss::default(),
+		};
+		result.map(|value| ShellRunResult::from_core(value, callback_loss))
 	})
 }
 
-fn shell_loss_marker(dropped_chunks: usize, dropped_bytes: usize) -> String {
-	format!("{SHELL_LOSS_MARKER_PREFIX}{dropped_chunks} chunks / {dropped_bytes} bytes dropped]\n")
-}
-
 fn bridge_chunks(
-	on_chunk: Option<ThreadsafeFunction<String>>,
-) -> (Option<mpsc::UnboundedSender<String>>, Option<napi::tokio::task::JoinHandle<()>>) {
+	on_chunk: Option<ShellChunkCallback>,
+) -> (
+	Option<mpsc::Sender<ShellOutputChunk>>,
+	Option<napi::tokio::task::JoinHandle<ShellCallbackLoss>>,
+) {
 	let Some(on_chunk) = on_chunk else {
 		return (None, None);
 	};
-	let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-	let (bounded_tx, mut bounded_rx) = mpsc::channel::<String>(SHELL_CALLBACK_QUEUE_CAPACITY);
+	let (tx, mut rx) = mpsc::channel::<ShellOutputChunk>(SHELL_CALLBACK_QUEUE_CAPACITY);
 	let handle = napi::tokio::spawn(async move {
-		let forwarder = napi::tokio::spawn(async move {
-			let mut dropped_chunks = 0usize;
-			let mut dropped_bytes = 0usize;
-			// The upstream pi_shell sender is unbounded; this bridge re-bounds it and
-			// marks dropped output at the N-API callback boundary instead of silently
-			// losing it, so truncation is always observable to the caller.
-			while let Some(chunk) = rx.recv().await {
-				if dropped_chunks > 0 {
-					match bounded_tx.try_send(shell_loss_marker(dropped_chunks, dropped_bytes)) {
-						Ok(()) => {
-							dropped_chunks = 0;
-							dropped_bytes = 0;
-						},
-						Err(mpsc::error::TrySendError::Full(_)) => {},
-						Err(mpsc::error::TrySendError::Closed(_)) => break,
-					}
+		let mut callback_open = true;
+		let mut callback_loss = ShellCallbackLoss::default();
+		while let Some(chunk) = rx.recv().await {
+			let chunk_bytes = chunk.text.len();
+			if callback_open {
+				let status = on_chunk.call(Ok(chunk.text), ThreadsafeFunctionCallMode::Blocking);
+				if status == napi::Status::Ok {
+					continue;
 				}
-				let chunk_len = chunk.len();
-				match bounded_tx.try_send(chunk) {
-					Ok(()) => {},
-					Err(mpsc::error::TrySendError::Full(_)) => {
-						dropped_chunks = dropped_chunks.saturating_add(1);
-						dropped_bytes = dropped_bytes.saturating_add(chunk_len);
-					},
-					Err(mpsc::error::TrySendError::Closed(_)) => break,
-				}
+				callback_open = false;
 			}
-			if dropped_chunks > 0 {
-				let _ = bounded_tx
-					.send(shell_loss_marker(dropped_chunks, dropped_bytes))
-					.await;
-			}
-		});
-		while let Some(chunk) = bounded_rx.recv().await {
-			if on_chunk.call(Ok(chunk), ThreadsafeFunctionCallMode::NonBlocking) != napi::Status::Ok {
-				forwarder.abort();
-				break;
+			if !chunk.synthetic_loss_marker {
+				callback_loss.record_drop(chunk_bytes);
 			}
 		}
-		let _ = forwarder.await;
+		callback_loss
 	});
 	(Some(tx), Some(handle))
 }
@@ -365,10 +411,11 @@ mod tests {
 		ShellRunOptions as CoreShellRunOptions,
 		cancel::{AbortReason, CancelToken},
 	};
-	use tokio::{sync::mpsc, task::yield_now, time};
+	use tokio::{sync::mpsc, time};
 
 	use super::{
-		CoreShell, SHELL_CALLBACK_QUEUE_CAPACITY, SHELL_LOSS_MARKER_PREFIX, shell_loss_marker,
+		CoreShell, JS_SAFE_INTEGER_MAX, SHELL_CALLBACK_QUEUE_CAPACITY, ShellCallbackLoss,
+		ShellOutputChunk,
 	};
 
 	mod child_session_action_tests {
@@ -411,7 +458,7 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn embedded_external_command_runs_in_its_own_session() {
 		let shell = CoreShell::new(None);
-		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let (tx, mut rx) = mpsc::channel::<ShellOutputChunk>(SHELL_CALLBACK_QUEUE_CAPACITY);
 		let handle = tokio::spawn(async move {
 			shell
 				.run(
@@ -430,6 +477,7 @@ mod tests {
 			.await
 			.expect("timed out waiting for child pid")
 			.expect("missing child pid chunk")
+			.text
 			.trim()
 			.parse::<i32>()
 			.expect("child pid parses");
@@ -451,7 +499,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn read_output_stops_when_cancelled_before_pipe_eof() {
+	async fn read_output_stops_and_reports_unprovable_background_ownership() {
 		let shell = CoreShell::new(None);
 		let mut cancel = CancelToken::default();
 		let abort = cancel.emplace_abort_token();
@@ -472,40 +520,53 @@ mod tests {
 
 		time::sleep(Duration::from_millis(10)).await;
 		abort.abort(AbortReason::Signal);
-		let result = time::timeout(Duration::from_secs(3), handle)
+		let outcome = time::timeout(Duration::from_secs(3), handle)
 			.await
 			.expect("shell run should stop after cancellation")
-			.expect("shell task should not panic")
-			.expect("shell run should return");
-		assert!(result.cancelled);
+			.expect("shell task should not panic");
+		match outcome {
+			Ok(result) => {
+				assert!(result.cancelled);
+				assert!(result.output_capture_incomplete);
+			},
+			Err(error) => {
+				assert!(error.to_string().contains("ownership incomplete"), "error={error:#}");
+			},
+		}
 	}
 
-	#[tokio::test]
-	async fn final_shell_loss_marker_is_delivered_when_callback_queue_is_full() {
-		let (tx, mut rx) = mpsc::channel::<String>(SHELL_CALLBACK_QUEUE_CAPACITY);
-		for i in 0..SHELL_CALLBACK_QUEUE_CAPACITY {
-			tx.try_send(format!("chunk-{i}"))
-				.expect("queue fill should succeed");
-		}
-		let final_sender = tokio::spawn(async move {
-			tx.send(shell_loss_marker(1, "dropped-tail".len()))
-				.await
-				.expect("receiver should remain open");
-		});
+	#[test]
+	fn callback_loss_reports_cumulative_dropped_chunks_and_bytes() {
+		let mut loss = ShellCallbackLoss::default();
+		loss.record_drop(5);
+		loss.record_drop(7);
 
-		yield_now().await;
-		assert!(!final_sender.is_finished(), "final marker send should wait for capacity");
+		assert_eq!(loss.chunks_js(), Some(2));
+		assert_eq!(loss.bytes_js(), Some(12));
+	}
 
-		let mut output = String::new();
-		while let Some(chunk) = rx.recv().await {
-			output.push_str(&chunk);
-			if output.contains(SHELL_LOSS_MARKER_PREFIX) {
-				break;
-			}
-		}
-		final_sender.await.expect("final sender should not panic");
+	#[test]
+	fn callback_loss_combines_core_and_callback_omissions() {
+		let mut loss = ShellCallbackLoss::default();
+		loss.record_drop(5);
+		loss.record_core_loss(3, 9);
 
-		assert!(output.contains(SHELL_LOSS_MARKER_PREFIX));
-		assert!(output.contains("1 chunks / 12 bytes dropped"));
+		assert_eq!(loss.chunks_js(), Some(4));
+		assert_eq!(loss.bytes_js(), Some(14));
+	}
+
+	#[test]
+	fn callback_loss_marks_counts_beyond_javascript_safe_integer_range() {
+		let mut loss = ShellCallbackLoss::default();
+		loss.record_core_loss(JS_SAFE_INTEGER_MAX + 1, JS_SAFE_INTEGER_MAX + 2);
+
+		assert_eq!(loss.chunks_js(), Some(JS_SAFE_INTEGER_MAX as i64));
+		assert_eq!(loss.bytes_js(), Some(JS_SAFE_INTEGER_MAX as i64));
+		assert!(loss.count_saturated());
+	}
+
+	#[test]
+	fn callback_loss_incomplete_fallback_marks_capture_uncertain() {
+		assert!(ShellCallbackLoss::incomplete().capture_incomplete);
 	}
 }

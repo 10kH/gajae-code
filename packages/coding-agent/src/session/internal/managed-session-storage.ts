@@ -479,6 +479,7 @@ export class ManagedSessionDescendantStore {
 	/** Logical profile root inherited by nested managed session destinations. */
 	readonly #profileAgentDir: string;
 	readonly #subtreeRoot: ManagedDirectoryRoot;
+	#portableMutationFence?: ManagedStorageLock;
 
 	constructor(
 		root: ManagedDirectoryRoot,
@@ -547,6 +548,40 @@ export class ManagedSessionDescendantStore {
 		return this.#policy;
 	}
 
+	get hasRetainedAuthority(): boolean {
+		return this.#authority !== undefined;
+	}
+
+	async acquireMutationFence(name: string): Promise<ManagedStorageLock | undefined> {
+		if (this.#authority) return undefined;
+		if (!/^[a-zA-Z0-9_.-]+$/.test(name)) throw new Error("invalid_mutation_fence");
+		this.#assertBound();
+		if (this.#portableMutationFence) throw new Error("migration_busy");
+		const lock = await acquireManagedLock(this.#baseDir, `.gjc-${name}`, this.#subtreeRoot, this.#policy);
+		try {
+			this.#assertBound();
+			lock.assertOwned();
+		} catch (error) {
+			await lock.release();
+			throw error;
+		}
+		this.#portableMutationFence = lock;
+		return {
+			path: lock.path,
+			attemptId: lock.attemptId,
+			assertOwned: () => {
+				this.#assertBound();
+				lock.assertOwned();
+			},
+			release: async () => {
+				try {
+					await lock.release();
+				} finally {
+					if (this.#portableMutationFence === lock) this.#portableMutationFence = undefined;
+				}
+			},
+		};
+	}
 	get profileAgentDir(): string {
 		return this.#profileAgentDir;
 	}
@@ -624,7 +659,18 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 	}
 	#assertBound(): void {
-		if (!this.#authority) return;
+		if (!this.#authority) {
+			const named = fs.lstatSync(this.#baseDir, { bigint: true });
+			if (
+				!named.isDirectory() ||
+				named.isSymbolicLink() ||
+				named.dev !== this.#subtreeRoot.dev ||
+				named.ino !== this.#subtreeRoot.ino
+			) {
+				throw new Error("Managed descendant root binding changed");
+			}
+			return;
+		}
 		const named = fs.lstatSync(this.#baseDir, { bigint: true });
 		const retained =
 			this.#authorityBaseDir === this.#baseDir
@@ -670,24 +716,41 @@ export class ManagedSessionDescendantStore {
 	}
 
 	async publishNoReplace(relativePath: string, bytes: Uint8Array): Promise<void> {
+		this.#assertBound();
+		this.#portableMutationFence?.assertOwned();
 		const resolved = this.#resolve(relativePath);
 		if (this.#authority) {
-			this.#assertBound();
 			this.#publishRetainedNoReplace(this.#relative(resolved), bytes);
 			this.#assertBound();
 			return;
 		}
-		await publishManagedFileNoReplace(resolved, bytes, undefined, this.#root, this.#policy);
+		await publishManagedFileNoReplace(
+			resolved,
+			bytes,
+			this.#portableMutationFence ? () => this.#portableMutationFence?.assertOwned() : undefined,
+			this.#subtreeRoot,
+			this.#policy,
+		);
+		this.#assertBound();
+		this.#portableMutationFence?.assertOwned();
 	}
 
 	publishNoReplaceSync(relativePath: string, bytes: Uint8Array): void {
+		this.#assertBound();
+		this.#portableMutationFence?.assertOwned();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
-			publishManagedFileNoReplaceSync(resolved, bytes, this.#root, this.#policy);
+			publishManagedFileNoReplaceSync(
+				resolved,
+				bytes,
+				this.#subtreeRoot,
+				this.#policy,
+				this.#portableMutationFence ? () => this.#portableMutationFence?.assertOwned() : undefined,
+			);
 			this.#assertBound();
+			this.#portableMutationFence?.assertOwned();
 			return;
 		}
-		this.#assertBound();
 		this.#publishRetainedNoReplace(this.#relative(resolved), bytes);
 		this.#assertBound();
 	}
@@ -702,6 +765,34 @@ export class ManagedSessionDescendantStore {
 		}
 		const relative = this.#relative(resolved);
 		this.#replaceRetained(relative, bytes);
+		this.#assertBound();
+	}
+
+	replaceExpected(relativePath: string, bytes: Uint8Array, expected: ManagedFileSnapshot): void {
+		this.#assertBound();
+		const resolved = this.#resolve(relativePath);
+		if (!this.#authority) {
+			const fence = this.#portableMutationFence;
+			if (!fence) throw new Error("managed_replace_exact_unavailable");
+			fence.assertOwned();
+			const current = captureManagedFileNoFollow(resolved);
+			if (!sameIdentity(current.identity, expected.identity) || current.identity.sha256 !== expected.identity.sha256)
+				throw new Error("managed_replace_identity_mismatch");
+			replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy, () => fence.assertOwned());
+			fence.assertOwned();
+			return;
+		}
+		const replaced = (this.#authority as RecoveryFsRoot & RetainedManagedReplacer).replaceManaged(
+			this.#relative(resolved),
+			bytes,
+			expected.identity.dev.toString(),
+			expected.identity.ino.toString(),
+			String(expected.identity.size),
+			expected.identity.mtimeNs.toString(),
+			expected.identity.ctimeNs.toString(),
+			expected.identity.sha256,
+		);
+		if (!replaced.ok) throw new Error(replaced.code ?? "managed_replace_failed");
 		this.#assertBound();
 	}
 
@@ -1434,6 +1525,7 @@ export function publishManagedFileNoReplaceSync(
 	bytes: Uint8Array,
 	root?: ManagedDirectoryRoot,
 	policy: ManagedSessionSecurityPolicy = "default",
+	assertOwned?: () => void,
 ): void {
 	const parent = path.dirname(destination);
 	ensureManagedDirectory(parent, root, policy);
@@ -1444,6 +1536,7 @@ export function publishManagedFileNoReplaceSync(
 	let outcome: NativePublishOutcome | undefined;
 
 	try {
+		assertOwned?.();
 		fd = fs.openSync(
 			staging,
 			fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
@@ -1457,7 +1550,9 @@ export function publishManagedFileNoReplaceSync(
 		const staged = fs.fstatSync(fd, { bigint: true });
 		stagingIdentity = { dev: staged.dev, ino: staged.ino };
 
+		assertOwned?.();
 		outcome = classifyNativePublishOutcome(renameNoReplacePath(staging, destination));
+		assertOwned?.();
 		if (!outcome.ok) throw publishFailure(outcome);
 
 		const named = fs.lstatSync(destination, { bigint: true });
@@ -1493,6 +1588,7 @@ export function replaceManagedFileSync(
 	bytes: Uint8Array,
 	root: ManagedDirectoryRoot,
 	policy: ManagedSessionSecurityPolicy = "default",
+	assertFence?: () => void,
 ): void {
 	const parent = path.dirname(destination);
 	ensureManagedDirectory(parent, root, policy);
@@ -1500,6 +1596,7 @@ export function replaceManagedFileSync(
 	let fd: number | undefined;
 	let stagedIdentity: { dev: bigint; ino: bigint } | undefined;
 	try {
+		assertFence?.();
 		fd = fs.openSync(
 			staging,
 			fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
@@ -1513,7 +1610,9 @@ export function replaceManagedFileSync(
 		const staged = fs.fstatSync(fd, { bigint: true });
 		stagedIdentity = { dev: staged.dev, ino: staged.ino };
 		assertManagedDirectoryRoot(root);
+		assertFence?.();
 		fs.renameSync(staging, destination);
+		assertFence?.();
 		assertManagedDirectoryRoot(root);
 		const named = fs.lstatSync(destination, { bigint: true });
 		if (!named.isFile() || named.isSymbolicLink() || named.dev !== staged.dev || named.ino !== staged.ino) {

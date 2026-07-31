@@ -349,7 +349,12 @@ import {
 import { assertEditableFile } from "../tools/auto-generated-guard";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import type { CheckpointState } from "../tools/checkpoint";
-import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
+import {
+	createArtifactFailurePreview,
+	type OutputMeta,
+	outputMeta,
+	wrapToolWithMetaNotice,
+} from "../tools/output-meta";
 import { normalizeLocalScheme, resolveReadPath, resolveToCwd } from "../tools/path-utils";
 import { registerResourceGcSession } from "../tools/resource-gc";
 import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo-write";
@@ -1055,6 +1060,102 @@ function boundAgentBashArtifactSaveDiagnostic(error: unknown): string {
 	const message = (error instanceof Error ? error.message : String(error)).replace(/\s+/gu, " ").trim();
 	const normalized = message || "unknown storage error";
 	return truncateHeadBytes(normalized, AGENT_BASH_ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES).text;
+}
+
+const PRE_ADMISSION_ARTIFACT_SAVE_WAIT_MS = 500;
+const PRE_ADMISSION_ARTIFACT_MAX_PENDING_SAVES = 2;
+
+type PreAdmissionArtifactSaveOutcome =
+	| { kind: "saved"; saved: Awaited<ReturnType<SessionManager["saveArtifactReceipt"]>> }
+	| { kind: "failed"; error: unknown };
+
+interface PreAdmissionArtifactSaveAdmission {
+	readonly pending: Set<Promise<PreAdmissionArtifactSaveOutcome>>;
+}
+
+/**
+ * Pre-admission spills are owned by their concrete SessionManager. A stalled
+ * save remains admitted until its promise settles, so timeout does not turn
+ * each subsequent tool result into another retained full payload.
+ */
+const preAdmissionArtifactSaveAdmissions = new WeakMap<SessionManager, PreAdmissionArtifactSaveAdmission>();
+
+function preAdmissionArtifactSaveAdmissionFor(sessionManager: SessionManager): PreAdmissionArtifactSaveAdmission {
+	let admission = preAdmissionArtifactSaveAdmissions.get(sessionManager);
+	if (!admission) {
+		admission = { pending: new Set() };
+		preAdmissionArtifactSaveAdmissions.set(sessionManager, admission);
+	}
+	return admission;
+}
+
+function beginPreAdmissionArtifactSave(
+	sessionManager: SessionManager,
+	content: string,
+	toolType: string,
+): { kind: "capacity" } | { kind: "started"; outcome: Promise<PreAdmissionArtifactSaveOutcome> } {
+	const admission = preAdmissionArtifactSaveAdmissionFor(sessionManager);
+	if (admission.pending.size >= PRE_ADMISSION_ARTIFACT_MAX_PENDING_SAVES) return { kind: "capacity" };
+
+	let outcome: Promise<PreAdmissionArtifactSaveOutcome>;
+	try {
+		outcome = sessionManager.saveArtifactReceipt(content, toolType).then(
+			saved => ({ kind: "saved" as const, saved }),
+			error => ({ kind: "failed" as const, error }),
+		);
+	} catch (error) {
+		return { kind: "started", outcome: Promise.resolve({ kind: "failed", error }) };
+	}
+	admission.pending.add(outcome);
+	void outcome.then(
+		() => admission.pending.delete(outcome),
+		() => admission.pending.delete(outcome),
+	);
+	return { kind: "started", outcome };
+}
+
+function replaceToolResultWithArtifactFailurePreview(
+	message: ToolResultMessage,
+	fullText: string,
+	maxInlineBytes: number | undefined,
+	diagnostic: string,
+): void {
+	const preview = createArtifactFailurePreview(fullText, maxInlineBytes, diagnostic);
+	const existingDetails =
+		message.details && typeof message.details === "object" ? (message.details as Record<string, unknown>) : {};
+	const existingMeta =
+		existingDetails.meta && typeof existingDetails.meta === "object" ? (existingDetails.meta as OutputMeta) : {};
+	const existingTruncation = existingMeta.truncation;
+	const totalLines = fullText.length > 0 ? fullText.split("\n").length : 0;
+	const outputLines = preview.text.length > 0 ? preview.text.split("\n").length : 0;
+	const outputBytes = Buffer.byteLength(preview.text, "utf-8");
+	const truncation: NonNullable<OutputMeta["truncation"]> = {
+		...(existingTruncation ?? {}),
+		direction: "tail",
+		truncatedBy: "bytes",
+		noticeOwner: undefined,
+		totalLines,
+		totalBytes: Buffer.byteLength(fullText, "utf-8"),
+		outputLines,
+		outputBytes,
+		maxBytes: maxInlineBytes,
+		shownRange: undefined,
+		headRange: undefined,
+		tailRange: undefined,
+		nextOffset: undefined,
+		artifactId: undefined,
+		artifactVerified: false,
+		sourceCaptureIncomplete: true,
+		artifactFailureDiagnostic: diagnostic,
+	};
+	message.details = {
+		...existingDetails,
+		meta: { ...existingMeta, truncation },
+	};
+	message.content = [
+		...message.content.filter((block): block is ImageContent => block.type === "image"),
+		{ type: "text", text: preview.text },
+	];
 }
 
 function summarizeAgentBashArtifactSave(
@@ -3677,39 +3778,101 @@ export class AgentSession {
 		const textParts = message.content.flatMap(block => (block.type === "text" ? [block.text] : []));
 		if (textParts.length === 0) return;
 		const fullText = textParts.join("\n");
+		const configuredInlineKiB = this.settings.get("tools.maxInlineResultBytes");
+		const maxInlineBytes =
+			configuredInlineKiB > 0 ? Math.max(1024, Math.floor(configuredInlineKiB * 1024)) : undefined;
+		const totalBytes = Buffer.byteLength(fullText, "utf-8");
+		const exceedsInlineCap = maxInlineBytes !== undefined && totalBytes > maxInlineBytes;
 		const contextWindow = this.model?.contextWindow;
 		const thresholdTokens = Math.min(
 			8_000,
 			contextWindow && contextWindow > 0 ? Math.floor(contextWindow * 0.05) : 8_000,
 		);
-		if (thresholdTokens <= 0 || estimateTextTokensHeuristic(fullText) <= thresholdTokens) return;
+		// The inline byte cap is an independent admission bound and must be checked
+		// before token heuristics can opt this result out of spilling.
+		if (!exceedsInlineCap && (thresholdTokens <= 0 || estimateTextTokensHeuristic(fullText) <= thresholdTokens))
+			return;
 
+		const saveAdmission = beginPreAdmissionArtifactSave(this.sessionManager, fullText, "tool-result");
+		if (saveAdmission.kind === "capacity") {
+			replaceToolResultWithArtifactFailurePreview(
+				message,
+				fullText,
+				maxInlineBytes,
+				"artifact save capacity exhausted; the previous save is still settling",
+			);
+			return;
+		}
 		try {
-			const artifactId = await this.sessionManager.saveArtifact(fullText, "tool-result");
-			if (!artifactId) return;
-			const digest = crypto.createHash("sha256").update(fullText).digest("hex");
-			const preview = createPreAdmissionArtifactSpillPreview(fullText, artifactId, digest);
-			const spillMeta = outputMeta()
-				.truncationFromText(preview, {
-					direction: "middle",
-					totalLines: fullText.split("\n").length,
-					totalBytes: Buffer.byteLength(fullText, "utf-8"),
-					artifactId,
-				})
-				.get();
+			const saveOutcome = await Promise.race([
+				saveAdmission.outcome,
+				Bun.sleep(PRE_ADMISSION_ARTIFACT_SAVE_WAIT_MS).then(() => ({ kind: "timeout" as const })),
+			]);
+			if (saveOutcome.kind !== "saved" || !saveOutcome.saved) {
+				const diagnostic =
+					saveOutcome.kind === "timeout"
+						? `did not settle within ${PRE_ADMISSION_ARTIFACT_SAVE_WAIT_MS}ms`
+						: saveOutcome.kind === "failed"
+							? boundAgentBashArtifactSaveDiagnostic(saveOutcome.error)
+							: "artifact storage is unavailable";
+				replaceToolResultWithArtifactFailurePreview(message, fullText, maxInlineBytes, diagnostic);
+				return;
+			}
+			const saved = saveOutcome.saved;
 			const existingDetails = message.details;
 			const detailRecord =
 				existingDetails && typeof existingDetails === "object" ? (existingDetails as Record<string, unknown>) : {};
 			const existingMeta =
-				detailRecord.meta && typeof detailRecord.meta === "object"
-					? (detailRecord.meta as Record<string, unknown>)
-					: {};
-			message.details = { ...detailRecord, meta: { ...existingMeta, ...spillMeta } };
+				detailRecord.meta && typeof detailRecord.meta === "object" ? (detailRecord.meta as OutputMeta) : {};
+			const existingTruncation = existingMeta.truncation;
+			const priorLoss = existingTruncation !== undefined;
+			const digest = crypto.createHash("sha256").update(fullText).digest("hex");
+			const sourceCaptureIncomplete = priorLoss || !saved.complete || undefined;
+			const preview = createPreAdmissionArtifactSpillPreview(fullText, saved.id, digest, {
+				maxInlineBytes,
+				fullOutput: saved.complete && !priorLoss,
+			});
+			const spillMeta = outputMeta()
+				.truncationFromText(preview, {
+					direction: "middle",
+					totalLines: fullText.split("\n").length,
+					totalBytes,
+					artifactId: saved.id,
+					artifactVerified: true,
+					sourceCaptureIncomplete,
+					...(maxInlineBytes !== undefined ? { maxBytes: maxInlineBytes } : {}),
+				})
+				.get();
+			const spillTruncation = spillMeta?.truncation;
+			const artifactTruncatedBytes =
+				Math.max(existingTruncation?.artifactTruncatedBytes ?? 0, saved.omittedBytes ?? 0) || undefined;
+			const mergedTruncation = spillTruncation
+				? {
+						...existingTruncation,
+						...spillTruncation,
+						artifactId: saved.id,
+						artifactVerified: true,
+						artifactTruncatedBytes,
+						sourceTruncatedBytes: existingTruncation?.sourceTruncatedBytes,
+						sourceCaptureIncomplete,
+						columnDroppedBytes: existingTruncation?.columnDroppedBytes,
+						shownRange: sourceCaptureIncomplete ? undefined : spillTruncation.shownRange,
+						headRange: sourceCaptureIncomplete ? undefined : spillTruncation.headRange,
+						tailRange: sourceCaptureIncomplete ? undefined : spillTruncation.tailRange,
+						nextOffset: sourceCaptureIncomplete ? undefined : spillTruncation.nextOffset,
+					}
+				: existingTruncation;
+			message.details = {
+				...detailRecord,
+				meta: { ...existingMeta, ...spillMeta, truncation: mergedTruncation },
+			};
 			message.content = [
 				...message.content.filter((block): block is ImageContent => block.type === "image"),
 				{ type: "text", text: preview },
 			];
 		} catch (error) {
+			const diagnostic = boundAgentBashArtifactSaveDiagnostic(error);
+			replaceToolResultWithArtifactFailurePreview(message, fullText, maxInlineBytes, diagnostic);
 			logger.warn("Failed to spill oversized tool result before context admission", {
 				toolName: message.toolName,
 				error: error instanceof Error ? error.message : String(error),
