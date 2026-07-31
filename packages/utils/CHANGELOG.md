@@ -9,6 +9,8 @@
 
 - Retryable responses discarded before another fetch attempt now begin body cancellation without blocking retry progress on transport cleanup, releasing buffered response data without consuming responses returned to callers.
 
+## [0.12.5] - 2026-07-30
+
 ## [0.12.4] - 2026-07-30
 
 ## [0.12.3] - 2026-07-30

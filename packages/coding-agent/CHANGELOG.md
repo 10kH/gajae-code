@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added the bundled `lunamaxxing` OpenAI Codex profile, mapping every role to GPT-5.6 Luna with medium default reasoning, maximum executor/planner/architect reasoning, and xhigh critic reasoning.
+
 ### Fixed
 
 - Deferred `agent_end` publication again settles public session readiness before slow extension handlers finish, while retaining exact cancellation leases through queued extension delivery and draining that delivery before session shutdown.
@@ -15,6 +19,7 @@
 - Canonical wrapped first-event timeouts now continue the same clean turn through bounded retries and configured fallback rotation, while preserving replay-safety, cancellation, provider-terminal policies, exact attempt diagnostics, and task/subagent retry-status truth (#3553).
 - Runtime skill discovery now preserves a candidate when its exact skill name appears as a query token, so additional task-specific terms no longer discard an explicitly named skill.
 
+## [0.12.5] - 2026-07-30
 ### Fixed
 
 - ACP and SDK broker session deletion no longer promotes a non-empty retained artifact quarantine to transcript deletion. `cleanup_pending` keeps transcript and exact quarantine authority across retries and restarts while payload bytes survive; root-only transcript preauthorization remains replay-bound and is revalidated after ledger persistence immediately before mutation, while ordinary completion still requires an empty identity-bound root or `artifacts_removed`.

@@ -5,6 +5,8 @@
 
 - Select-list no-match rows now stay within the requested render width instead of wrapping into extra terminal lines after narrow resizes (#3600).
 
+## [0.12.5] - 2026-07-30
+
 ## [0.12.4] - 2026-07-30
 
 ## [0.12.3] - 2026-07-30
