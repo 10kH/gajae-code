@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.12.6] - 2026-07-31
 ### Fixed
 
 - Select-list no-match rows now stay within the requested render width instead of wrapping into extra terminal lines after narrow resizes (#3600).
