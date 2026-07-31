@@ -935,8 +935,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		): { ok: boolean; disposition?: DuplicateDisposition; error?: string; identity: DuplicateIdentity } => {
 			const identity = duplicateIdentityForTask(task, params.agent, ownerId, parentSession);
 			const key = duplicateIdentityKey(identity);
-			const predecessors = manager
-				.getSubagentRecords({ ownerId })
+			const predecessors = (manager.getSubagentRecords?.({ ownerId }) ?? [])
 				.filter(record => {
 					if (record.subagentId === selfSubagentId || record.subagentId === subagentId) return false;
 					if (record.status !== "running" && record.status !== "paused" && record.status !== "queued")
@@ -1139,7 +1138,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				}
 				break;
 			}
-			if (frozenForkSeed) frozenForkSeeds.set(uniqueId, frozenForkSeed);
+			if (frozenForkSeed) {
+				frozenForkSeeds.set(uniqueId, frozenForkSeed);
+				// The async callback may execute through a compatibility path that retains
+				// the caller's task id instead of the allocated artifact id. Preserve the
+				// same immutable seed under both identities so detached execution never
+				// rebuilds context after dispatch.
+				frozenForkSeeds.set(taskItem.id, frozenForkSeed);
+			}
 			const singleParams: TaskParams = { ...params, tasks: [taskItem] };
 			const label = uniqueId;
 			try {

@@ -184,6 +184,7 @@ import {
 
 type AsyncResultEntry = {
 	jobId: string;
+	generation: string;
 	result: string;
 	job: AsyncJob | undefined;
 	durationMs: number | undefined;
@@ -1502,13 +1503,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				? new AsyncJobManager({
 						maxRunningJobs: asyncMaxJobs,
 						onJobComplete: async (jobId, result, job) => {
-							if (!session || asyncJobManager!.isDeliverySuppressed(jobId)) return;
+							if (!session) return;
 							const formattedResult = await formatAsyncResultForFollowUp(result);
-							if (asyncJobManager!.isDeliverySuppressed(jobId)) return;
+							if (asyncJobManager!.isDeliverySuppressed(jobId, job?.generation)) return;
 
 							const durationMs = job ? jobElapsedMs(job) : undefined;
 							session.yieldQueue.enqueue<AsyncResultEntry>("async-result", {
 								jobId,
+								generation: job?.generation ?? "",
 								result: formattedResult,
 								job,
 								durationMs,
@@ -2797,7 +2799,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		hasSession = true;
 		if (asyncJobManager) {
 			session.yieldQueue.register<AsyncResultEntry>("async-result", {
-				isStale: entry => asyncJobManager.isDeliverySuppressed(entry.jobId),
+				isStale: entry => asyncJobManager.isDeliverySuppressed(entry.jobId, entry.generation),
 				build: buildAsyncResultBatchMessage,
 			});
 		}
