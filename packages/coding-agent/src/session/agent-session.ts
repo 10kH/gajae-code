@@ -2600,7 +2600,8 @@ export class AgentSession {
 		this.#extensionRunner = config.extensionRunner;
 		this.#attemptAuthority = this.agent.getAttemptScopeAuthority();
 		this.#attemptRecordStore = new AttemptRecordStore(this.#attemptAuthority);
-		this.#extensionRunner?.setAttemptRecordStore(this.#attemptRecordStore);
+		if (this.#extensionRunner && typeof this.#extensionRunner.setAttemptRecordStore === "function")
+			this.#extensionRunner.setAttemptRecordStore(this.#attemptRecordStore);
 		this.#skills = config.skills ?? [];
 		this.#skillWarnings = config.skillWarnings ?? [];
 		this.#customCommands = config.customCommands ?? [];
