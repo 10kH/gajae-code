@@ -518,6 +518,7 @@ export class TopicRegistry {
 		const pending = this.inflight.get(sessionId);
 		if (pending) return pending;
 		const epoch = this.epochs.get(sessionId) ?? 0;
+		if (epoch >= Number.MAX_SAFE_INTEGER) throw new Error("topic authority epoch exhausted");
 		// Publish the compatible endpoint claim before invoking `create`: the callback
 		// may immediately begin a remote create and identity-less recovery must never
 		// observe a false absence during that await.
@@ -712,7 +713,9 @@ export class TopicRegistry {
 	/** Restore a failed delete fence only while its exact authority mutation remains current. */
 	restoreDeleteAuthority(snapshot: TopicDeleteAuthoritySnapshot): boolean {
 		const record = this.topics.get(snapshot.sessionId);
-		const deleteEpoch = nextAuthorityEpoch(Math.max(snapshot.fenceEpoch ?? 0, snapshot.authorityEpoch ?? 0));
+		const authorityBase = Math.max(snapshot.fenceEpoch ?? 0, snapshot.authorityEpoch ?? 0);
+		if (authorityBase >= Number.MAX_SAFE_INTEGER) return false;
+		const deleteEpoch = nextAuthorityEpoch(authorityBase);
 		if (this.epochs.get(snapshot.sessionId) !== deleteEpoch) return false;
 		if (snapshot.topicId === undefined) {
 			if (record) return false;

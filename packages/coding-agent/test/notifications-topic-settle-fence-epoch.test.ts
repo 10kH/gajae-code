@@ -149,6 +149,44 @@ describe("TopicRegistry delete settlement fencing", () => {
 		expect(reg.settleDelete("A", "42", 1.5)).toBeUndefined();
 	});
 
+	test("a saturated stale restore cannot reactivate a newer delete fence", () => {
+		const max = Number.MAX_SAFE_INTEGER;
+		const reg = new TopicRegistry({
+			topics: { A: boundRecord("A", "42", max, false) },
+			fences: { A: max },
+		});
+		const snapshot = reg.captureDeleteAuthority("A");
+
+		reg.beginDelete("A");
+		reg.beginDelete("A");
+
+		expect(reg.restoreDeleteAuthority(snapshot)).toBe(false);
+		expect(reg.get("A")).toMatchObject({
+			topicId: "42",
+			authorityEpoch: max,
+			authorityState: "delete_pending",
+		});
+		expect(reg.sessionForTopic("42")).toBeUndefined();
+		expect(reg.isTopicIdAvailable("42")).toBe(false);
+	});
+
+	test("a saturated creation epoch refuses remote creation without invoking its callback", async () => {
+		const max = Number.MAX_SAFE_INTEGER;
+		const reg = new TopicRegistry({ topics: {}, fences: { A: max } });
+		let createCalled = false;
+
+		await expect(
+			reg.getOrCreateTopic("A", async () => {
+				createCalled = true;
+				return "42";
+			}),
+		).rejects.toThrow("topic authority epoch exhausted");
+
+		expect(createCalled).toBe(false);
+		expect(reg.get("A")).toBeUndefined();
+		expect(reg.authorityEpoch("A")).toBe(max);
+	});
+
 	test("a rollback refuses any settlement whose post-settlement state no longer holds", async () => {
 		const reg = new TopicRegistry({ topics: { A: boundRecord("A", "42", 1, true) }, fences: { A: 1 } });
 		const settled = requireSettled(reg.settleDelete("A", "42", reg.authorityEpoch("A")));
