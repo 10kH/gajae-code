@@ -36,10 +36,7 @@ const nativeAuthorityDeclarations = {
 		"exact_remove_directory_tree",
 	],
 	"crates/pi-natives/src/ps.rs": ["napi impl Process"],
-	"crates/pi-shell/src/process.rs": ["impl Process", "kill_process_group", "process_group_members", "current_descendant_pids", "add_new_descendants"],
-	"crates/pi-shell/src/shell.rs": ["const MAX_OWNED_COMMAND_PROCESSES", "const MAX_PENDING_SHELL_RUNS", "impl Shell", "impl CommandProcessGroups", "impl ExternalCommandProcessObserver for CommandProcessGroups", "run_shell_session", "run_shell_oneshot", "run_shell_oneshot_streams", "run_shell_command", "run_shell_command_streams", "terminate_owned_process_groups", "impl builtins::Command for TimeoutCommand"],
-	"crates/brush-core-vendored/src/interp.rs": ["trait ExternalCommandProcessObserver", "set_process_group_observer", "notify_external_command_spawned"],
-	"crates/brush-core-vendored/src/commands.rs": ["observed_process_group_id", "execute_external_command"],
+	"crates/pi-shell/src/process.rs": ["impl Process", "kill_process_group", "current_descendant_pids", "add_new_descendants"],
 	"packages/natives/native/index.d.ts": ["Process"],
 	"packages/coding-agent/src/sdk/broker/process-incarnation.ts": ["isProcessIncarnation", "processIncarnation"],
 } as const;
