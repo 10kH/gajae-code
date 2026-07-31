@@ -2747,7 +2747,7 @@ fn quote_arg(arg: &str) -> String {
 mod tests {
 	use super::*;
 
-	#[cfg(unix)]
+	#[cfg(any(unix, windows))]
 	static PROCESS_TEST_LOCK: TokioMutex<()> = TokioMutex::const_new(());
 	#[cfg(unix)]
 	async fn wait_until_descendant_visible(pid: i32) {

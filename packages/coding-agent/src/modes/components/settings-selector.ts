@@ -719,6 +719,8 @@ export interface SettingsCallbacks {
 	getStatusLinePreview?: (width?: number) => string;
 	/** Called when plugins change */
 	onPluginsChanged?: () => void;
+	/** Called when asynchronously rebuilt settings content needs a repaint. */
+	onRenderRequested?: () => void;
 	/** Called when an interactive setting cannot be committed. */
 	onError?: (message: string) => void;
 	/** Called when settings panel is closed */
@@ -1287,6 +1289,7 @@ export class SettingsSelectorComponent extends Container {
 		this.#pluginComponent = new PluginSettingsComponent(this.context.cwd, {
 			onClose: () => this.callbacks.onCancel(),
 			onPluginChanged: () => this.callbacks.onPluginsChanged?.(),
+			onRenderRequested: () => this.callbacks.onRenderRequested?.(),
 		});
 		this.addChild(this.#pluginComponent);
 	}
@@ -1296,6 +1299,7 @@ export class SettingsSelectorComponent extends Container {
 			{
 				onClose: () => this.callbacks.onCancel(),
 				onBundlesChanged: () => this.callbacks.onPluginsChanged?.(),
+				onRenderRequested: () => this.callbacks.onRenderRequested?.(),
 			},
 			{
 				runtimeSnapshotProvider: this.context.gjcRuntimeSnapshot,

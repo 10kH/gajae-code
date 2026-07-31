@@ -160,11 +160,17 @@ export interface TelegramDaemonFs {
 		size?: number;
 		dev?: number;
 		ino?: number;
+		/** Hard-link count; required to prove a staging temp has no second name. */
+		nlink?: number;
 		ctimeMs?: number;
 		isDirectory?: () => boolean;
 	}>;
 	readEndpointFile?(path: string): Promise<NotificationEndpointFile>;
-	exactUnlink?(path: string, identity: NotificationEndpointFileIdentity): Promise<NotificationExactUnlinkResult>;
+	exactUnlink?(
+		path: string,
+		identity: NotificationEndpointFileIdentity,
+		quarantineName?: string,
+	): Promise<NotificationExactUnlinkResult>;
 }
 
 export interface SpawnResult {
@@ -228,8 +234,12 @@ function negotiateToolActivityCapability(
 const nodeFs: TelegramDaemonFs = {
 	...(fs.promises as unknown as TelegramDaemonFs),
 	readEndpointFile: readNotificationEndpointFile,
-	exactUnlink: async (file, identity) =>
-		exactUnlinkNotificationFile(file, identity, `.gjc-delete-daemon-transition-${crypto.randomUUID()}.json`),
+	exactUnlink: async (file, identity, quarantineName) =>
+		exactUnlinkNotificationFile(
+			file,
+			identity,
+			quarantineName ?? `.gjc-delete-daemon-transition-${crypto.randomUUID()}.json`,
+		),
 };
 
 /**
@@ -935,8 +945,9 @@ async function exactUnlinkAcceptedWithRetainedEvidence(
 	fsImpl: TelegramDaemonFs,
 	file: string,
 	identity: NotificationEndpointFileIdentity,
+	quarantineName?: string,
 ): Promise<boolean> {
-	const removed = await fsImpl.exactUnlink!(file, identity);
+	const removed = await fsImpl.exactUnlink!(file, identity, quarantineName);
 	if (removed.ok) return true;
 	return (
 		removed.code === "cleanup_pending" &&
@@ -944,6 +955,27 @@ async function exactUnlinkAcceptedWithRetainedEvidence(
 		removed.detachedPath.length > 0 &&
 		(await fsImpl.readEndpointFile!(file).catch(() => undefined)) === undefined
 	);
+}
+
+type NotificationArtifactReapOutcome = "removed" | "retained" | "unchanged";
+
+/** Distinguish terminal removal from a safely detached artifact that still needs authority-preserving cleanup. */
+async function reapNotificationArtifactExactly(
+	fsImpl: TelegramDaemonFs,
+	file: string,
+	identity: NotificationEndpointFileIdentity,
+	quarantineName: string,
+): Promise<NotificationArtifactReapOutcome> {
+	const removed = await fsImpl.exactUnlink!(file, identity, quarantineName);
+	if (removed.ok) return "removed";
+	if (
+		removed.code === "cleanup_pending" &&
+		typeof removed.detachedPath === "string" &&
+		removed.detachedPath.length > 0 &&
+		(await fsImpl.readEndpointFile!(file).catch(() => undefined)) === undefined
+	)
+		return "retained";
+	return "unchanged";
 }
 
 async function unlinkOwnershipLockExactly(
@@ -1287,6 +1319,7 @@ export const NOTIFICATION_LEAK_ARTIFACT_PREFIXES = [
 	".gjc-delete-daemon-transition-",
 	".gjc-exact-unlink-placeholder-",
 	".gjc-delete-notification-endpoint-",
+	".gjc-delete-notification-staging-temp-",
 ] as const;
 
 /** Grace window before a leak artifact is reaped (covers in-flight unlinks). */
@@ -1298,6 +1331,80 @@ export function isPermanentMissingPathError(error: unknown): boolean {
 	return code === "ENOENT" || code === "ENOTDIR";
 }
 
+/**
+ * Shape of an abandoned `writeJsonAtomic` staging file:
+ * `<published-name>.<pid>.<epoch-ms>.<base36-suffix>.tmp`.
+ *
+ * Publication stages a sibling temp and then renames it over the destination.
+ * If the staging write or the rename fails, or the process dies between the
+ * two, that temp is never published and never read again — no prefix in
+ * {@link NOTIFICATION_LEAK_ARTIFACT_PREFIXES} claimed it, so it accumulated in
+ * the agent notifications directory permanently, once per failed attempt.
+ *
+ * Reaping it here (rather than only unwinding in the writer) also reclaims
+ * temps orphaned by a crash or power loss, which no writer-side cleanup can
+ * reach. Age alone is not proof of abandonment, though: a slow or blocked
+ * publisher (a stalled network write, a rename fenced by an antivirus handle)
+ * can hold a live staged temp well past any grace window. The staged name
+ * therefore carries its publisher's PID, and the reaper only removes a temp
+ * whose publisher is provably dead — see {@link parseNotificationStagingTemp}.
+ */
+const NOTIFICATION_STAGING_TEMP_PATTERN = /^(?<destination>.+)\.(?<pid>\d+)\.(?<stagedAt>\d+)\.[0-9a-z]+\.tmp$/;
+
+/** A publication staging claim recovered from an abandoned temp's name. */
+export interface NotificationStagingTempClaim {
+	/** Published sibling this temp was staged for. */
+	destination: string;
+	/** PID of the process that staged it. */
+	pid: number;
+	/** Wall-clock ms the publisher recorded when it staged the temp. */
+	stagedAtMs: number;
+}
+
+/**
+ * Recover the publication claim encoded in a staging temp's name, or
+ * `undefined` when `name` is not a staging temp or its PID/timestamp fields are
+ * not usable integers. An unparseable claim is never reaped.
+ */
+export function parseNotificationStagingTemp(name: string): NotificationStagingTempClaim | undefined {
+	const groups = NOTIFICATION_STAGING_TEMP_PATTERN.exec(name)?.groups;
+	if (!groups) return undefined;
+	const pid = Number(groups.pid);
+	const stagedAtMs = Number(groups.stagedAt);
+	if (!validDaemonPid(pid) || !Number.isSafeInteger(stagedAtMs) || stagedAtMs < 0) return undefined;
+	return { destination: groups.destination as string, pid, stagedAtMs };
+}
+
+/** Liveness verdict for a staging temp's publisher; `unknown` fails closed. */
+type NotificationPublisherLiveness = "alive" | "dead" | "unknown";
+
+/**
+ * Classify a staging temp publisher against the daemon's liveness seam. A
+ * throwing probe (an unreadable process table, a denied query) is
+ * indeterminate, not dead, so the temp is retained.
+ */
+function classifyNotificationStagingPublisher(
+	claim: NotificationStagingTempClaim,
+	pidAlive: (pid: number) => boolean,
+): NotificationPublisherLiveness {
+	try {
+		return pidAlive(claim.pid) ? "alive" : "dead";
+	} catch {
+		return "unknown";
+	}
+}
+
+/**
+ * True when `file` is a regular file reachable under exactly one name. A
+ * multi-link file shares its inode with another pathname, so unlinking this one
+ * would not reclaim the data and may be another owner's live hardlink. Fails
+ * closed when the `stat` seam cannot report a link count.
+ */
+async function isSingleLinkRegularFile(fsImpl: TelegramDaemonFs, file: string): Promise<boolean> {
+	if (!fsImpl.stat) return false;
+	const stat = await fsImpl.stat(file);
+	return stat.nlink === 1;
+}
 export function isNotificationLeakArtifactName(name: string): boolean {
 	return NOTIFICATION_LEAK_ARTIFACT_PREFIXES.some(prefix => name.startsWith(prefix));
 }
@@ -1409,20 +1516,88 @@ export async function pruneMissingNotificationRoots(input: {
 }
 
 /**
+ * Remove one abandoned publication staging temp under a liveness fence and an
+ * identity-bound delete. Returns whether the temp was removed; `false` means it
+ * was deliberately retained (live/indeterminate publisher, not a single-link
+ * regular file, still inside the grace window, or an identity change between
+ * capture and delete). Filesystem faults propagate to the caller's best-effort
+ * handler.
+ */
+async function reapAbandonedNotificationStagingTemp(input: {
+	fs: TelegramDaemonFs;
+	file: string;
+	claim: NotificationStagingTempClaim;
+	now: number;
+	graceMs: number;
+	pidAlive: (pid: number) => boolean;
+}): Promise<NotificationArtifactReapOutcome> {
+	// A live or blocked publisher can hold a staged temp far past any grace
+	// window; only a provably dead publisher's claim is abandoned. `unknown`
+	// (throwing probe) fails closed.
+	if (classifyNotificationStagingPublisher(input.claim, input.pidAlive) !== "dead") return "unchanged";
+	const readEndpointFile = input.fs.readEndpointFile;
+	// Both seams are optional; without them there is no no-follow capture and no
+	// identity-bound delete, so retain rather than unlink unfenced.
+	if (!readEndpointFile || !input.fs.exactUnlink) return "unchanged";
+	// No-follow capture: rejects symlinks, directories, and anything that changes
+	// while it is read. A reparse point or dangling link is therefore retained.
+	const endpoint = await readEndpointFile(input.file);
+	if (!(await isSingleLinkRegularFile(input.fs, input.file))) return "unchanged";
+	// Age from the captured (no-follow) mtime rather than a second path-following
+	// stat, so the grace decision and the delete bind the same inode. Integer ns
+	// truncation only ever ages the file, never rejuvenates it.
+	const age = input.now - Number(endpoint.identity.mtimeNs / 1_000_000n);
+	if (age < input.graceMs) return "unchanged";
+	// The native verifies dev+ino+size+mtimeNs+sha256 before unlinking, so a
+	// readdir/capture -> replacement ABA cannot delete the fresh generation.
+	return await reapNotificationArtifactExactly(
+		input.fs,
+		input.file,
+		endpoint.identity,
+		`.gjc-delete-notification-staging-temp-${crypto.randomUUID()}.json`,
+	);
+}
+
+/** Reap one retained delete quarantine without following or unlinking a successor. */
+async function reapNotificationLeakArtifact(input: {
+	fs: TelegramDaemonFs;
+	file: string;
+	now: number;
+	graceMs: number;
+}): Promise<NotificationArtifactReapOutcome> {
+	if (path.basename(input.file).startsWith(".gjc-exact-unlink-placeholder-")) return "retained";
+	if (!input.fs.readEndpointFile || !input.fs.exactUnlink) return "unchanged";
+	const endpoint = await input.fs.readEndpointFile(input.file);
+	if (!(await isSingleLinkRegularFile(input.fs, input.file))) return "unchanged";
+	const age = input.now - Number(endpoint.identity.mtimeNs / 1_000_000n);
+	if (age < input.graceMs) return "unchanged";
+	return await reapNotificationArtifactExactly(
+		input.fs,
+		input.file,
+		endpoint.identity,
+		`.gjc-exact-unlink-placeholder-${crypto.randomUUID()}.json`,
+	);
+}
+
+/**
  * Reap retained exact-unlink / ownership-transition quarantine files older than
- * the grace window from the notifications directory.
+ * the grace window from the notifications directory, plus publication staging
+ * temps whose publisher is provably dead.
  */
 export async function reapStaleNotificationArtifacts(input: {
 	settings: Settings;
 	fs?: TelegramDaemonFs;
 	now?: () => number;
 	graceMs?: number;
+	/** Liveness seam used to prove a staging temp's publisher is dead. */
+	pidAlive?: (pid: number) => boolean;
 }): Promise<{ removed: string[]; skipped: number }> {
 	const fsImpl = input.fs ?? nodeFs;
 	const paths = daemonPaths(input.settings.getAgentDir());
 	await ensureDir(fsImpl, paths.dir);
 	const now = input.now?.() ?? Date.now();
 	const graceMs = input.graceMs ?? NOTIFICATION_LEAK_ARTIFACT_GRACE_MS;
+	const pidAlive = input.pidAlive ?? defaultPidAlive;
 	const removed: string[] = [];
 	let skipped = 0;
 	let names: string[];
@@ -1433,17 +1608,33 @@ export async function reapStaleNotificationArtifacts(input: {
 		throw error;
 	}
 	for (const name of names) {
-		if (!isNotificationLeakArtifactName(name)) continue;
+		const stagingTemp = NOTIFICATION_STAGING_TEMP_PATTERN.test(name);
+		if (!isNotificationLeakArtifactName(name) && !stagingTemp) continue;
 		const file = path.join(paths.dir, name);
 		try {
-			const stat = fsImpl.stat ? await fsImpl.stat(file) : undefined;
-			const age = stat ? now - stat.mtimeMs : Number.POSITIVE_INFINITY;
-			if (Number.isFinite(age) && age < graceMs) {
-				skipped += 1;
+			if (stagingTemp) {
+				const claim = parseNotificationStagingTemp(name);
+				// A staging-temp shape whose PID/timestamp will not parse carries no
+				// provable claim, so it is retained.
+				if (!claim) {
+					skipped += 1;
+					continue;
+				}
+				const outcome = await reapAbandonedNotificationStagingTemp({
+					fs: fsImpl,
+					file,
+					claim,
+					now,
+					graceMs,
+					pidAlive,
+				});
+				if (outcome === "removed") removed.push(file);
+				else skipped += 1;
 				continue;
 			}
-			await fsImpl.unlink(file);
-			removed.push(file);
+			const outcome = await reapNotificationLeakArtifact({ fs: fsImpl, file, now, graceMs });
+			if (outcome === "removed") removed.push(file);
+			else skipped += 1;
 		} catch (error) {
 			if (isPermanentMissingPathError(error)) continue;
 			// Best-effort: a busy file must not fail daemon ownership.
@@ -1462,6 +1653,8 @@ export async function healTelegramDaemonNotificationState(input: {
 	fs?: TelegramDaemonFs;
 	now?: () => number;
 	graceMs?: number;
+	/** Liveness seam used to prove a staging temp's publisher is dead. */
+	pidAlive?: (pid: number) => boolean;
 }): Promise<{ prunedRoots: string[]; removedArtifacts: string[] }> {
 	const prune = await pruneMissingNotificationRoots(input);
 	const reap = await reapStaleNotificationArtifacts(input);
@@ -5263,6 +5456,7 @@ export class TelegramNotificationDaemon {
 				settings: this.opts.settings,
 				fs: this.fsImpl,
 				now: this.opts.now,
+				pidAlive: this.opts.pidAlive,
 			});
 		} catch (error) {
 			logger.warn(`notifications: leak-artifact reap failed: ${sanitizeDiagnostic(String(error))}`);
