@@ -17,6 +17,7 @@ import type {
 	TSchema,
 } from "@gajae-code/ai";
 import type { AppendOnlyContextManager } from "./append-only-context";
+import type { AttemptMinter, AttemptRunHandle, AttemptScope } from "./attempt-scope";
 import type { HarmonyAuditEvent } from "./harmony-leak";
 import type { AgentRunCoverage, AgentRunSummary } from "./run-collector";
 import type { AgentTelemetryConfig } from "./telemetry";
@@ -155,6 +156,8 @@ export interface ManagedAttemptContinuationOwnership {
 	readonly generation: number;
 	readonly domain: RunCancellationDomain;
 	readonly lease: RunResourceProducerLease;
+	/** Immutable per-attempt handle used by terminalizers and continuations. */
+	readonly handle: AttemptRunHandle;
 	isCurrent(): boolean;
 }
 
@@ -176,9 +179,10 @@ export type ManagedAttemptOutcome =
 				/** Exact provider transport facts, including retry headers, for fallback policy. */
 				transportFailure?: TransportFailureFacts;
 			};
+			scope?: AttemptScope;
 	  }
-	| { type: "context_overflow_discarded"; message: AssistantMessage }
-	| { type: "run_terminal"; reason: "cancelled" | "error" | "exhausted" };
+	| { type: "context_overflow_discarded"; message: AssistantMessage; scope?: AttemptScope }
+	| { type: "run_terminal"; reason: "cancelled" | "error" | "exhausted"; scope?: AttemptScope };
 
 export type ManagedAttemptOutcomeHandler = (
 	outcome: ManagedAttemptOutcome,
@@ -209,6 +213,10 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 
 	/** Receives a managed invocation outcome without publishing provisional lifecycle events. */
 	onManagedAttemptOutcome?: ManagedAttemptOutcomeHandler;
+	/** Per-attempt scope allocator for direct loop callers. */
+	attemptMinter?: AttemptMinter;
+	/** Scope allocated by the owning Agent for the first attempt in this loop. */
+	initialScope?: AttemptScope;
 
 	/**
 	 * When to interrupt tool execution for steering messages.
@@ -281,7 +289,7 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * }
 	 * ```
 	 */
-	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
+	transformContext?: (messages: AgentMessage[], signal?: AbortSignal, scope?: AttemptScope) => Promise<AgentMessage[]>;
 
 	/**
 	 * Resolves an API key dynamically for each LLM call.
@@ -614,7 +622,8 @@ export interface RenderResultOptions {
  * Apps can extend via declaration merging.
  */
 export interface AgentToolContext {
-	// Empty by default - apps extend via declaration merging
+	/** Per-attempt scope used to attribute tool lifecycle and extension delivery. */
+	attemptScope?: AttemptScope;
 }
 
 export type AgentToolExecFn<TParameters extends TSchema = TSchema, TDetails = any, TTheme = unknown> = (
@@ -685,7 +694,7 @@ export interface AgentContext {
  */
 export type AgentEvent =
 	// Agent lifecycle
-	| { type: "agent_start" }
+	| { type: "agent_start"; scope?: AttemptScope }
 	| {
 			type: "agent_end";
 			messages: AgentMessage[];
@@ -696,16 +705,43 @@ export type AgentEvent =
 			/** Present iff `AgentTelemetryConfig` was supplied on this run. */
 			telemetry?: AgentRunSummary;
 			coverage?: AgentRunCoverage;
+			scope?: AttemptScope;
 	  }
 	// Turn lifecycle - a turn is one assistant response + any tool calls/results
-	| { type: "turn_start" }
-	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }
+	| { type: "turn_start"; scope?: AttemptScope }
+	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[]; scope?: AttemptScope }
 	// Message lifecycle - emitted for user, assistant, and toolResult messages
-	| { type: "message_start"; message: AgentMessage }
+	| { type: "message_start"; message: AgentMessage; scope?: AttemptScope }
 	// Only emitted for assistant messages during streaming
-	| { type: "message_update"; message: AgentMessage; assistantMessageEvent: AssistantMessageEvent }
-	| { type: "message_end"; message: AgentMessage }
+	| {
+			type: "message_update";
+			message: AgentMessage;
+			assistantMessageEvent: AssistantMessageEvent;
+			scope?: AttemptScope;
+	  }
+	| { type: "message_end"; message: AgentMessage; scope?: AttemptScope }
 	// Tool execution lifecycle
-	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any; intent?: string }
-	| { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }
-	| { type: "tool_execution_end"; toolCallId: string; toolName: string; result: any; isError?: boolean };
+	| {
+			type: "tool_execution_start";
+			toolCallId: string;
+			toolName: string;
+			args: any;
+			intent?: string;
+			scope?: AttemptScope;
+	  }
+	| {
+			type: "tool_execution_update";
+			toolCallId: string;
+			toolName: string;
+			args: any;
+			partialResult: any;
+			scope?: AttemptScope;
+	  }
+	| {
+			type: "tool_execution_end";
+			toolCallId: string;
+			toolName: string;
+			result: any;
+			isError?: boolean;
+			scope?: AttemptScope;
+	  };
