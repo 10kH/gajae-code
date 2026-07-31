@@ -57,9 +57,9 @@ function createSession(cwd: string, settings: Settings = Settings.isolated()): T
 	} as unknown as ToolSession;
 }
 
-function createContext(settings: Settings): AgentToolContext {
+function createContext(settings: Settings, cwd: string): AgentToolContext {
 	return {
-		sessionManager: SessionManager.inMemory(),
+		sessionManager: SessionManager.create(cwd, path.join(cwd, "sessions")),
 		settings,
 		toolNames: ["read"],
 		isIdle: () => true,
@@ -103,7 +103,13 @@ describe("read receipt by default", () => {
 
 	async function read(filePath: string, settings = receiptSettings(), params: Record<string, unknown> = {}) {
 		const tool = wrapToolWithMetaNotice(new ReadTool(createSession(testDir, settings)));
-		return tool.execute("read-receipt", { path: filePath, ...params }, undefined, undefined, createContext(settings));
+		return tool.execute(
+			"read-receipt",
+			{ path: filePath, ...params },
+			undefined,
+			undefined,
+			createContext(settings, testDir),
+		);
 	}
 
 	it("returns a bounded, non-spillable receipt for a large prose file", async () => {
@@ -264,7 +270,7 @@ describe("read receipt by default", () => {
 		const sessionManager = SessionManager.create(testDir, path.join(testDir, "sessions"));
 		const tool = wrapToolWithMetaNotice(new ReadTool(createSession(testDir)));
 		const result = await tool.execute("read-receipt", { path: `${file}:raw` }, undefined, undefined, {
-			...createContext(settings),
+			...createContext(settings, testDir),
 			sessionManager,
 		});
 		const artifactId = result.details?.meta?.truncation?.artifactId;
