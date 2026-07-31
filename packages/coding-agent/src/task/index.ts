@@ -53,9 +53,6 @@ import {
 	RepositoryBindingError,
 	resolveTaskRepositoryBinding,
 } from "../gjc-runtime/repository-binding";
-import { reconcileReviewSourceDelivery } from "../gjc-runtime/ultragoal-review-source";
-import { classifyUltragoalReviewDelivery, validateUltragoalReviewDispatch } from "../gjc-runtime/ultragoal-runtime";
-
 import { initializeLocalRoot, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { ArtifactManager } from "../session/artifacts";
 import { generateCommitMessage } from "../utils/commit-message-generator";
@@ -1916,27 +1913,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				if (taskRepositoryBinding.relativeSubdir) {
 					assertPathUnderRepositoryBinding(taskRepositoryBinding, ".");
 				}
-				if (task.reviewSource) {
-					await validateUltragoalReviewDispatch({
-						cwd: this.session.cwd,
-						dispatchId: task.reviewSource.dispatchId,
-						cohortId: task.reviewSource.cohortId,
-						taskId: task.id,
-						lane: task.reviewSource.lane,
-						snapshotId: task.reviewSource.snapshotId,
-						generation: task.reviewSource.generation,
-						repositoryBindingDigest: task.reviewSource.repositoryBindingDigest,
-						stateRevision: task.reviewSource.stateRevision,
-						rerunCommand: task.reviewSource.rerunCommand,
-						taskSourceTaskId: task.reviewSource.taskId,
-						createdAt: task.reviewSource.createdAt,
-					});
-				}
-				if (isIsolated && task.reviewSource) {
-					throw new Error(
-						"source-aware review tasks cannot use generic task isolation; dispatch them against the coordinator-owned source snapshot",
-					);
-				}
 				if (!isIsolated) {
 					await assertExecutionRootMatchesRepositoryBinding(this.session.cwd, taskRepositoryBinding);
 					const result = await runSubprocess({
@@ -1991,32 +1967,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentTelemetry: this.session.getTelemetry?.(),
 						forkContextSeed,
 					});
-					const reviewSourceDisposition = task.reviewSource
-						? await reconcileReviewSourceDelivery({
-								cwd: this.session.cwd,
-								repositoryBinding: taskRepositoryBinding,
-								reviewSource: task.reviewSource,
-							})
-						: undefined;
-					const reviewSource =
-						task.reviewSource && reviewSourceDisposition
-							? {
-									...task.reviewSource,
-									...reviewSourceDisposition,
-									...(await classifyUltragoalReviewDelivery({
-										cwd: this.session.cwd,
-										cohortId: task.reviewSource.cohortId,
-										dispatchId: task.reviewSource.dispatchId,
-										observedDisposition: reviewSourceDisposition.disposition,
-									})),
-								}
-							: undefined;
 					return {
 						...result,
 						...(forkContext ? { forkContext } : {}),
 						forkContextAdvisory,
 						repositoryBinding: publicRepositoryBinding(taskRepositoryBinding),
-						...(reviewSource ? { reviewSource } : {}),
 					};
 				}
 
