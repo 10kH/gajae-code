@@ -2544,13 +2544,18 @@ async function validateReviewCohort(
 	const sourceHash = nonEmptyString(cohort.sourceHash);
 	if (!sourceHash) throw new Error("iteration.reviewCohort.sourceHash is required");
 	const cohortId = nonEmptyString(cohort.cohortId);
-	if (!cohortId) {
+	const lanesForAuthority = qualityGateObject(cohort.lanes);
+	const deliveryBearing = COHORT_LANE_KEYS.some(lane =>
+		nonEmptyString(qualityGateObject(lanesForAuthority?.[lane])?.deliveryId),
+	);
+	const authoritativeReview = Boolean(cohortId || deliveryBearing || plan?.reviewCohorts?.length);
+	if (authoritativeReview && !cohortId) {
 		throw new Error(
 			"iteration.reviewCohort.cohortId is required; reviewer-declared source hashes are not gate authority",
 		);
 	}
-	const authoritative = plan?.reviewCohorts?.find(record => record.cohortId === cohortId);
-	if (!authoritative) {
+	const authoritative = cohortId ? plan?.reviewCohorts?.find(record => record.cohortId === cohortId) : undefined;
+	if (cohortId && !authoritative) {
 		throw new Error("iteration.reviewCohort.cohortId must resolve to a runtime-owned persisted review cohort");
 	}
 	if (authoritative?.status !== undefined && authoritative.status !== "active") {
