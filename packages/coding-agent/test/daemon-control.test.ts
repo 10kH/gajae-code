@@ -1561,7 +1561,10 @@ describe("ChatDaemonController ownership safety", () => {
 		};
 		for (let attempt = 0; attempt < 20; attempt++) {
 			fs.writeFileSync(paths.state, JSON.stringify(state));
-			fs.writeFileSync(paths.lock, JSON.stringify({ pid: state.pid, incarnation: state.incarnation, createdAt: attempt }));
+			fs.writeFileSync(
+				paths.lock,
+				JSON.stringify({ pid: state.pid, incarnation: state.incarnation, createdAt: attempt }),
+			);
 			await expect(
 				releaseChatDaemonOwnership({
 					agentDir,
