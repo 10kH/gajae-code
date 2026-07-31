@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.12.6] - 2026-07-31
 ### Added
 
 - Added the bundled `lunamaxxing` OpenAI Codex profile, mapping every role to GPT-5.6 Luna with medium default reasoning, xhigh executor reasoning, and maximum planner/critic/architect reasoning.
