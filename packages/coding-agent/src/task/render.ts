@@ -922,8 +922,11 @@ function renderAgentResult(result: TaskResultReceipt, isLast: boolean, expanded:
 				"warning",
 				truncateToWidth(
 					replaceTabs(
-						`STALE REVIEW: source advanced after dispatch; excluded from review gates. Rerun: ${result.reviewSource.rerunCommand}`,
+						sanitizeText(
+							`STALE REVIEW: source advanced after dispatch; excluded from review gates. Rerun: ${result.reviewSource.rerunCommand}`,
+						),
 					),
+
 					100,
 				),
 			)}`,
@@ -934,7 +937,9 @@ function renderAgentResult(result: TaskResultReceipt, isLast: boolean, expanded:
 				"error",
 				truncateToWidth(
 					replaceTabs(
-						`INVALID REVIEW PROVENANCE: receipt cannot satisfy review gates. Rerun: ${result.reviewSource.rerunCommand}`,
+						sanitizeText(
+							`INVALID REVIEW PROVENANCE: receipt cannot satisfy review gates. Rerun: ${result.reviewSource.rerunCommand}`,
+						),
 					),
 					100,
 				),

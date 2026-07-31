@@ -2530,7 +2530,12 @@ const COHORT_LANE_KEYS = ["cleaner", "architect", "qa"] as const;
  * generations are delta-only. Cohort state rides the existing `iteration` gate key so
  * no new top-level quality-gate key is introduced.
  */
-function validateReviewCohort(gate: JsonObject, iteration: JsonObject, plan?: UltragoalPlan): void {
+async function validateReviewCohort(
+	cwd: string,
+	gate: JsonObject,
+	iteration: JsonObject,
+	plan?: UltragoalPlan,
+): Promise<void> {
 	const cohort = qualityGateObject(iteration.reviewCohort);
 	if (!cohort) throw new Error("qualityGate iteration.reviewCohort is required at the review boundary");
 	const generation = cohort.reviewGeneration;
@@ -2539,13 +2544,13 @@ function validateReviewCohort(gate: JsonObject, iteration: JsonObject, plan?: Ul
 	const sourceHash = nonEmptyString(cohort.sourceHash);
 	if (!sourceHash) throw new Error("iteration.reviewCohort.sourceHash is required");
 	const cohortId = nonEmptyString(cohort.cohortId);
-	const authoritative = cohortId ? plan?.reviewCohorts?.find(record => record.cohortId === cohortId) : undefined;
-	if (plan?.reviewCohorts?.length && !cohortId) {
+	if (!cohortId) {
 		throw new Error(
-			"iteration.reviewCohort.cohortId is required after a runtime-owned review cohort has been frozen",
+			"iteration.reviewCohort.cohortId is required; reviewer-declared source hashes are not gate authority",
 		);
 	}
-	if (cohortId && !authoritative) {
+	const authoritative = plan?.reviewCohorts?.find(record => record.cohortId === cohortId);
+	if (!authoritative) {
 		throw new Error("iteration.reviewCohort.cohortId must resolve to a runtime-owned persisted review cohort");
 	}
 	if (authoritative?.status !== undefined && authoritative.status !== "active") {
@@ -2557,6 +2562,14 @@ function validateReviewCohort(gate: JsonObject, iteration: JsonObject, plan?: Ul
 		throw new Error(
 			"iteration.reviewCohort generation/sourceHash must match the runtime-owned persisted review cohort",
 		);
+	}
+	if (authoritative && plan?.repositoryBinding) {
+		const current = await captureReviewSourceSnapshot(cwd, plan.repositoryBinding);
+		if (current.snapshotId !== authoritative.snapshotId) {
+			throw new Error(
+				"iteration.reviewCohort source advanced after review delivery; rerun the cohort on the current source snapshot",
+			);
+		}
 	}
 
 	if (cohort.joined !== true)
@@ -2834,8 +2847,8 @@ async function validateCompletionQualityGate(
 	found.check("iteration.blockers", "non_empty_blockers", () =>
 		requireEmptyBlockers(iteration.blockers, "iteration.blockers"),
 	);
-	found.check("iteration.reviewCohort", "review_cohort_invalid", () =>
-		validateReviewCohort(gate, iteration, options.plan),
+	await found.checkAsync("iteration.reviewCohort", "review_cohort_invalid", () =>
+		validateReviewCohort(cwd, gate, iteration, options.plan),
 	);
 	if (batchMode && options.goal && options.plan && options.ledger) {
 		found.check("validationBatchClose", "batch_close_invalid", () =>
@@ -3989,6 +4002,22 @@ async function annotateUltragoalLedger(input: {
 	return { plan: input.plan };
 }
 
+async function mutateReviewCohorts<T>(cwd: string, mutate: (plan: UltragoalPlan) => T): Promise<T> {
+	for (let attempt = 0; attempt < 5; attempt++) {
+		const plan = await readUltragoalPlan(cwd);
+		if (!plan) throw new Error("No ultragoal plan found");
+		const result = mutate(plan);
+		plan.updatedAt = new Date().toISOString();
+		try {
+			await writePlan(cwd, plan);
+			return result;
+		} catch (error) {
+			if (!(error instanceof Error) || !error.message.includes("revision")) throw error;
+		}
+	}
+	throw new Error("review cohort state changed concurrently; rerun the operation");
+}
+
 export async function validateUltragoalReviewDispatch(input: {
 	cwd: string;
 	dispatchId: string;
@@ -3996,6 +4025,10 @@ export async function validateUltragoalReviewDispatch(input: {
 	taskId: string;
 	lane: ReviewSourceLane;
 	snapshotId: string;
+	generation: number;
+	repositoryBindingDigest: string;
+	stateRevision: number;
+	rerunCommand: string;
 }): Promise<void> {
 	const plan = await readUltragoalPlan(input.cwd);
 	const cohort = plan?.reviewCohorts?.find(item => item.cohortId === input.cohortId && item.status === "active");
@@ -4004,7 +4037,11 @@ export async function validateUltragoalReviewDispatch(input: {
 		!dispatch ||
 		dispatch.taskId !== input.taskId ||
 		dispatch.lane !== input.lane ||
-		dispatch.snapshotId !== input.snapshotId
+		dispatch.snapshotId !== input.snapshotId ||
+		dispatch.generation !== input.generation ||
+		dispatch.repositoryBindingDigest !== input.repositoryBindingDigest ||
+		dispatch.stateRevision !== input.stateRevision ||
+		dispatch.rerunCommand !== input.rerunCommand
 	) {
 		throw new Error("reviewSource must resolve to an active runtime-owned dispatch before task launch");
 	}
@@ -4042,20 +4079,18 @@ export async function dispatchUltragoalReviewLane(input: {
 	lane: ReviewSourceLane;
 	rerunCommand: string;
 }): Promise<ReturnType<typeof createReviewSourceDispatch>> {
-	const plan = await readUltragoalPlan(input.cwd);
-	if (!plan) throw new Error("No ultragoal plan found");
-	const cohort = plan.reviewCohorts?.find(item => item.cohortId === input.cohortId);
-	if (!cohort) throw new Error(`Unknown review cohort ${input.cohortId}`);
-	const dispatch = createReviewSourceDispatch({
-		cohort,
-		taskId: input.taskId,
-		lane: input.lane,
-		rerunCommand: input.rerunCommand,
+	return mutateReviewCohorts(input.cwd, plan => {
+		const cohort = plan.reviewCohorts?.find(item => item.cohortId === input.cohortId);
+		if (!cohort) throw new Error(`Unknown review cohort ${input.cohortId}`);
+		const dispatch = createReviewSourceDispatch({
+			cohort,
+			taskId: input.taskId,
+			lane: input.lane,
+			rerunCommand: input.rerunCommand,
+		});
+		cohort.dispatches.push(dispatch);
+		return dispatch;
 	});
-	cohort.dispatches.push(dispatch);
-	plan.updatedAt = new Date().toISOString();
-	await writePlan(input.cwd, plan);
-	return dispatch;
 }
 
 export async function recordUltragoalReviewDelivery(input: {
@@ -4064,25 +4099,23 @@ export async function recordUltragoalReviewDelivery(input: {
 	dispatchId: string;
 	disposition: ReviewDeliveryDisposition;
 }): Promise<string> {
-	const plan = await readUltragoalPlan(input.cwd);
-	if (!plan) throw new Error("No ultragoal plan found");
-	const cohort = plan.reviewCohorts?.find(item => item.cohortId === input.cohortId);
-	if (!cohort) throw new Error(`Unknown review cohort ${input.cohortId}`);
-	const dispatch = cohort.dispatches.find(item => item.dispatchId === input.dispatchId);
-	if (!dispatch) throw new Error(`Unknown review dispatch ${input.dispatchId}`);
-	const deliveryId = crypto.randomUUID();
-	cohort.deliveries.push({
-		deliveryId,
-		taskId: dispatch.taskId,
-		lane: dispatch.lane,
-		snapshotId: dispatch.snapshotId,
-		disposition: input.disposition,
-		receivedAt: new Date().toISOString(),
-		rerunCommand: dispatch.rerunCommand,
+	return mutateReviewCohorts(input.cwd, plan => {
+		const cohort = plan.reviewCohorts?.find(item => item.cohortId === input.cohortId);
+		if (!cohort) throw new Error(`Unknown review cohort ${input.cohortId}`);
+		const dispatch = cohort.dispatches.find(item => item.dispatchId === input.dispatchId);
+		if (!dispatch) throw new Error(`Unknown review dispatch ${input.dispatchId}`);
+		const deliveryId = crypto.randomUUID();
+		cohort.deliveries.push({
+			deliveryId,
+			taskId: dispatch.taskId,
+			lane: dispatch.lane,
+			snapshotId: dispatch.snapshotId,
+			disposition: input.disposition,
+			receivedAt: new Date().toISOString(),
+			rerunCommand: dispatch.rerunCommand,
+		});
+		return deliveryId;
 	});
-	plan.updatedAt = new Date().toISOString();
-	await writePlan(input.cwd, plan);
-	return deliveryId;
 }
 
 async function markBlockedUltragoalSuperseded(input: {

@@ -129,6 +129,8 @@ const reviewSourceSchema = z
 		stateRevision: z.number().int().min(0),
 		dispatchId: z.string().min(1),
 		rerunCommand: z.string().min(1),
+		taskId: z.string().min(1),
+		createdAt: z.string().min(1),
 	})
 	.strict()
 	.describe("leader-issued immutable review source identity; review lanes only");

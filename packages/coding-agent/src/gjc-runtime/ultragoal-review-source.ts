@@ -218,6 +218,57 @@ export function createReviewSourceDispatch(input: {
 	};
 }
 
+function isReviewSourceLane(value: unknown): value is ReviewSourceLane {
+	return value === "cleaner" || value === "architect" || value === "qa" || value === "critic";
+}
+
+function normalizeDispatch(value: unknown, cohort: Record<string, unknown>, index: number): ReviewSourceDispatch {
+	if (!value || typeof value !== "object" || Array.isArray(value))
+		throw new Error(`Invalid ultragoal plan: malformed dispatch ${index}`);
+	const record = value as Record<string, unknown>;
+	if (
+		record.schema !== "gjc.review_source_dispatch.v1" ||
+		typeof record.dispatchId !== "string" ||
+		typeof record.cohortId !== "string" ||
+		record.cohortId !== cohort.cohortId ||
+		record.generation !== cohort.generation ||
+		typeof record.taskId !== "string" ||
+		!isReviewSourceLane(record.lane) ||
+		record.snapshotId !== cohort.snapshotId ||
+		record.repositoryBindingDigest !== cohort.repositoryBindingDigest ||
+		record.stateRevision !== cohort.stateRevision ||
+		typeof record.rerunCommand !== "string" ||
+		typeof record.createdAt !== "string"
+	)
+		throw new Error(`Invalid ultragoal plan: malformed dispatch ${index}`);
+	return record as unknown as ReviewSourceDispatch;
+}
+
+function normalizeDelivery(
+	value: unknown,
+	dispatches: readonly ReviewSourceDispatch[],
+	index: number,
+): ReviewSourceDelivery {
+	if (!value || typeof value !== "object" || Array.isArray(value))
+		throw new Error(`Invalid ultragoal plan: malformed delivery ${index}`);
+	const record = value as Record<string, unknown>;
+	const dispatch = dispatches.find(
+		item => item.taskId === record.taskId && item.lane === record.lane && item.snapshotId === record.snapshotId,
+	);
+	if (
+		typeof record.deliveryId !== "string" ||
+		!dispatch ||
+		!isReviewSourceLane(record.lane) ||
+		(record.disposition !== "current" &&
+			record.disposition !== "stale_review_delivery" &&
+			record.disposition !== "invalid_provenance") ||
+		typeof record.receivedAt !== "string" ||
+		(record.rerunCommand !== undefined && record.rerunCommand !== dispatch.rerunCommand)
+	)
+		throw new Error(`Invalid ultragoal plan: malformed delivery ${index}`);
+	return record as unknown as ReviewSourceDelivery;
+}
+
 export function normalizeReviewSourceCohorts(value: unknown): ReviewSourceCohort[] {
 	if (value === undefined) return [];
 	if (!Array.isArray(value)) throw new Error("Invalid ultragoal plan: reviewCohorts must be an array");
@@ -246,7 +297,13 @@ export function normalizeReviewSourceCohorts(value: unknown): ReviewSourceCohort
 		) {
 			throw new Error(`Invalid ultragoal plan: malformed reviewCohorts[${index}]`);
 		}
-		return record as unknown as ReviewSourceCohort;
+		const dispatches = record.dispatches.map((dispatch, dispatchIndex) =>
+			normalizeDispatch(dispatch, record, dispatchIndex),
+		);
+		const deliveries = record.deliveries.map((delivery, deliveryIndex) =>
+			normalizeDelivery(delivery, dispatches, deliveryIndex),
+		);
+		return { ...(record as unknown as ReviewSourceCohort), dispatches, deliveries };
 	});
 }
 

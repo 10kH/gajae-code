@@ -1713,7 +1713,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						taskId: task.id,
 						lane: task.reviewSource.lane,
 						snapshotId: task.reviewSource.snapshotId,
+						generation: task.reviewSource.generation,
+						repositoryBindingDigest: task.reviewSource.repositoryBindingDigest,
+						stateRevision: task.reviewSource.stateRevision,
+						rerunCommand: task.reviewSource.rerunCommand,
 					});
+				}
+				if (isIsolated && task.reviewSource) {
+					throw new Error(
+						"source-aware review tasks cannot use generic task isolation; dispatch them against the coordinator-owned source snapshot",
+					);
 				}
 				if (!isIsolated) {
 					await assertExecutionRootMatchesRepositoryBinding(this.session.cwd, taskRepositoryBinding);
