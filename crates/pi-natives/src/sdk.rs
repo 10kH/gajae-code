@@ -186,11 +186,6 @@ pub struct SdkFrameEvent {
 /// `ThreadsafeFunction` payload out of complex nested type positions
 /// (`clippy::type_complexity`).
 type NegotiatedCapabilitiesFn = ThreadsafeFunction<(String, Vec<String>)>;
-/// One queued N-API frame plus the currently forwarded frame is the complete
-/// native-to-JS retention budget. Blocking calls preserve that credit instead
-/// of draining the bounded Tokio ingress into an unbounded N-API queue.
-type BoundedSdkFrameFn =
-	ThreadsafeFunction<SdkFrameEvent, Unknown<'static>, SdkFrameEvent, Status, true, false, 1>;
 
 /// In-process notification server handle exposed to TypeScript.
 #[napi]
@@ -202,7 +197,7 @@ pub struct NotificationServer {
 	arbitrated_presentation: Mutex<Option<ActionIdentity>>,
 	on_reply: Mutex<Option<ThreadsafeFunction<ReplyEvent>>>,
 	on_inbound: Mutex<Option<ThreadsafeFunction<InboundEvent>>>,
-	on_frame: Mutex<Option<BoundedSdkFrameFn>>,
+	on_frame: Mutex<Option<ThreadsafeFunction<SdkFrameEvent>>>,
 	on_negotiated_capabilities: Mutex<Option<NegotiatedCapabilitiesFn>>,
 	on_connection_close: Mutex<Option<ThreadsafeFunction<String>>>,
 	pump_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -277,7 +272,7 @@ impl NotificationServer {
 	/// Register the raw v3 SDK frame callback. Must be called before
 	/// [`Self::start`].
 	#[napi(ts_args_type = "callback: (err: null | Error, frame: SdkFrameEvent) => void")]
-	pub fn on_sdk_frame(&self, callback: BoundedSdkFrameFn) {
+	pub fn on_sdk_frame(&self, callback: ThreadsafeFunction<SdkFrameEvent>) {
 		*self.on_frame.lock() = Some(callback);
 	}
 
@@ -427,15 +422,12 @@ impl NotificationServer {
 		let frame_tsfn = self.on_frame.lock().take();
 		let frame_rx = handle.take_frame_receiver();
 		if let (Some(tsfn), Some(mut rx)) = (frame_tsfn, frame_rx) {
-			let task = napi::tokio::task::spawn_blocking(move || {
-				while let Some((connection_id, json)) = rx.blocking_recv() {
-					if tsfn.call(
+			let task = napi::tokio::spawn(async move {
+				while let Some((connection_id, json)) = rx.recv().await {
+					tsfn.call(
 						Ok(SdkFrameEvent { connection_id, json }),
-						ThreadsafeFunctionCallMode::Blocking,
-					) != napi::Status::Ok
-					{
-						break;
-					}
+						ThreadsafeFunctionCallMode::NonBlocking,
+					);
 				}
 			});
 			self.pump_tasks.lock().push(task);

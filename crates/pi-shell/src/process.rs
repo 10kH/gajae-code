@@ -60,88 +60,50 @@ mod platform {
 		}
 
 		pub fn children(&self) -> Vec<Self> {
-			self.children_exact().unwrap_or_default()
-		}
-
-		/// Enumerate direct children without converting an unreadable observation
-		/// into an empty-success result. A failed `/proc` read, identity pin,
-		/// or parentage revalidation means containment is unknown and must be
-		/// reported to callers.
-		pub fn children_exact(&self) -> Option<Vec<Self>> {
 			if !self.live_identity() {
-				return None;
+				return Vec::new();
 			}
 
 			// `/proc/{pid}/task/{tid}/children` is per-task: a child fork()ed from a
 			// worker thread appears under that thread's `tid`, not the tgid. Walk
 			// every task subdir and union the lists, then re-validate parentage.
 			let task_dir = format!("/proc/{}/task", self.pid);
-			let entries = fs::read_dir(&task_dir).ok()?;
+			let Ok(entries) = fs::read_dir(&task_dir) else {
+				return Vec::new();
+			};
+
 			let mut seen: HashSet<i32> = HashSet::new();
 			let mut out = Vec::new();
-			for entry in entries {
-				let entry = entry.ok()?;
+			for entry in entries.flatten() {
 				let name = entry.file_name();
-				let tid_str = name.to_str()?;
-				let _tid = tid_str.parse::<i32>().ok()?;
+				let Some(tid_str) = name.to_str() else {
+					continue;
+				};
+				if tid_str.parse::<i32>().is_err() {
+					continue;
+				}
 				let children_path = format!("/proc/{}/task/{}/children", self.pid, tid_str);
-				let content = fs::read_to_string(&children_path).ok()?;
+				let Ok(content) = fs::read_to_string(&children_path) else {
+					continue;
+				};
 				for part in content.split_whitespace() {
-					let child_pid = part.parse::<i32>().ok()?;
+					let Ok(child_pid) = part.parse::<i32>() else {
+						continue;
+					};
 					if !seen.insert(child_pid) {
 						continue;
 					}
-					let child = Self::from_pid(child_pid)?;
-					if child.status() != ProcessStatus::Running
-						|| current_parent_pid(child.pid) != Some(self.pid)
-					{
-						return None;
-					}
-					out.push(child);
-				}
-			}
-			self.live_identity().then_some(out)
-		}
-
-		fn child_pids_exact_bounded(&self, limit: usize) -> Option<(Vec<i32>, bool)> {
-			if !self.live_identity() {
-				return None;
-			}
-
-			// Read only child PIDs until the caller's bound is reached. Once one
-			// additional unique child is observed, report overflow immediately rather
-			// than retaining more process metadata or opening another process handle.
-			let task_dir = format!("/proc/{}/task", self.pid);
-			let entries = fs::read_dir(&task_dir).ok()?;
-			let mut seen = HashSet::new();
-			let mut out = Vec::new();
-			for entry in entries {
-				let entry = entry.ok()?;
-				let tid_str = entry.file_name().into_string().ok()?;
-				let _tid = tid_str.parse::<i32>().ok()?;
-				let children_path = format!("/proc/{}/task/{}/children", self.pid, tid_str);
-				let content = fs::read_to_string(children_path).ok()?;
-				for part in content.split_whitespace() {
-					let child_pid = part.parse::<i32>().ok()?;
-					if out.len() >= limit {
-						if seen.contains(&child_pid) {
-							continue;
-						}
-						return Some((out, true));
-					}
-					if !seen.insert(child_pid) {
+					let Some(child) = Self::from_pid(child_pid) else {
 						continue;
-					}
-					if read_start_time(child_pid).is_none()
-						|| read_process_state(child_pid) == Some('Z')
-						|| current_parent_pid(child_pid) != Some(self.pid)
+					};
+					if child.status() == ProcessStatus::Running
+						&& current_parent_pid(child.pid) == Some(self.pid)
 					{
-						return None;
+						out.push(child);
 					}
-					out.push(child_pid);
 				}
 			}
-			self.live_identity().then_some((out, false))
+			out
 		}
 
 		pub fn parent_pid(&self) -> Option<i32> {
@@ -233,91 +195,20 @@ mod platform {
 		/// Walk the descendant tree in post-order (leaves first), de-duplicating
 		/// by PID so concurrent reparenting cannot trap us in a cycle.
 		pub fn descendants(&self) -> Vec<Self> {
-			self.descendants_exact().unwrap_or_default()
-		}
-
-		pub fn descendants_exact(&self) -> Option<Vec<Self>> {
-			if !self.live_identity() {
-				return None;
-			}
 			let mut out = Vec::new();
 			let mut visited = HashSet::new();
 			visited.insert(self.pid);
-			if !self.descendants_into(&mut out, &mut visited) || !self.live_identity() {
-				return None;
-			}
-			Some(out)
+			self.descendants_into(&mut out, &mut visited);
+			out
 		}
 
-		pub fn descendants_exact_bounded(&self, limit: usize) -> (Vec<Self>, bool) {
-			if !self.live_identity() {
-				return (Vec::new(), true);
-			}
-			let mut out = Vec::new();
-			let mut visited = HashSet::new();
-			visited.insert(self.pid);
-			let incomplete = self.descendants_into_bounded(&mut out, &mut visited, limit);
-			(out, incomplete || !self.live_identity())
-		}
-
-		fn descendants_into(&self, out: &mut Vec<Self>, visited: &mut HashSet<i32>) -> bool {
-			if !self.live_identity() {
-				return false;
-			}
-			let Some(children) = self.children_exact() else {
-				return false;
-			};
-			for child in children {
-				if !self.live_identity() || child.parent_pid() != Some(self.pid) {
-					return false;
-				}
+		fn descendants_into(&self, out: &mut Vec<Self>, visited: &mut HashSet<i32>) {
+			for child in self.children() {
 				if visited.insert(child.pid) {
-					if !child.descendants_into(out, visited)
-						|| !self.live_identity()
-						|| child.parent_pid() != Some(self.pid)
-					{
-						return false;
-					}
+					child.descendants_into(out, visited);
 					out.push(child);
 				}
 			}
-			self.live_identity()
-		}
-
-		fn descendants_into_bounded(
-			&self,
-			out: &mut Vec<Self>,
-			visited: &mut HashSet<i32>,
-			limit: usize,
-		) -> bool {
-			if !self.live_identity() {
-				return true;
-			}
-			let remaining = limit.saturating_sub(out.len());
-			let Some((children, mut incomplete)) = self.child_pids_exact_bounded(remaining) else {
-				return true;
-			};
-			for child_pid in children {
-				if !visited.insert(child_pid) {
-					continue;
-				}
-				if out.len() >= limit {
-					return true;
-				}
-				let Some(child) = Self::from_pid(child_pid) else {
-					return true;
-				};
-				if child.status() != ProcessStatus::Running
-					|| current_parent_pid(child.pid) != Some(self.pid)
-				{
-					return true;
-				}
-				out.push(child.clone());
-				if child.descendants_into_bounded(out, visited, limit) {
-					incomplete = true;
-				}
-			}
-			incomplete || !self.live_identity()
 		}
 
 		fn live_identity(&self) -> bool {
@@ -425,64 +316,6 @@ mod platform {
 		matches
 	}
 
-	fn open_process_group_member(pid: i32, pgid: i32) -> Result<Option<Process>, ()> {
-		for _ in 0..3 {
-			if let Some(process) = Process::from_pid(pid)
-				&& process.group_id() == Some(pgid)
-			{
-				return Ok(Some(process));
-			}
-			// SAFETY: getpgid reads kernel process metadata for the integer PID.
-			if unsafe { libc::getpgid(pid) } != pgid || read_process_state(pid) == Some('Z') {
-				return Ok(None);
-			}
-			std::thread::yield_now();
-		}
-		Err(())
-	}
-
-	pub fn process_group_members(pgid: i32, limit: usize) -> (Vec<Process>, bool) {
-		let Ok(entries) = fs::read_dir("/proc") else {
-			return (Vec::new(), true);
-		};
-		let mut members = Vec::new();
-		let mut incomplete = false;
-		for entry in entries {
-			let Ok(entry) = entry else {
-				incomplete = true;
-				continue;
-			};
-			let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-				incomplete = true;
-				continue;
-			};
-			let Ok(pid) = name.parse::<i32>() else {
-				continue;
-			};
-			// SAFETY: getpgid reads kernel process metadata for the integer PID.
-			let observed_group = unsafe { libc::getpgid(pid) };
-			if observed_group < 0 {
-				if read_process_state(pid).is_some() {
-					incomplete = true;
-				}
-				continue;
-			}
-			if observed_group != pgid {
-				continue;
-			}
-			if members.len() >= limit {
-				return (members, true);
-			}
-			match open_process_group_member(pid, pgid) {
-				Ok(Some(process)) => members.push(process),
-				Ok(None) => incomplete = true,
-
-				Err(()) => incomplete = true,
-			}
-		}
-		(members, incomplete)
-	}
-
 	#[cfg(test)]
 	mod tests {
 		use super::start_time_observations_match;
@@ -543,15 +376,20 @@ mod platform {
 		}
 
 		pub fn children(&self) -> Vec<Self> {
-			self.children_exact().unwrap_or_default()
-		}
-
-		pub fn children_exact(&self) -> Option<Vec<Self>> {
-			self.live_bsdinfo().as_ref()?;
-			// `proc_listchildpids` is broken for self-queries on recent macOS. Walk
-			// the whole pid table via `proc_listallpids` and filter on `pbi_ppid`.
-			let tree = build_process_tree()?;
-			Self::children_from_tree_exact(self.pid, &tree)
+			if self.live_bsdinfo().is_none() {
+				return Vec::new();
+			}
+			// `proc_listchildpids` (the obvious choice) is broken on recent macOS
+			// kernels when queried for the *calling* process — it returns one byte of
+			// padding regardless of how many children the process actually has, so a
+			// process can never list its own descendants. Confirmed on darwin 25.4
+			// from C, Rust, and Bun callers via `proc_listchildpids(getpid(), …)`,
+			// while `ps -P` and `pgrep -P` still see the same children. Walk the
+			// whole pid table via `proc_listallpids` and filter on `pbi_ppid`
+			// instead; this is the same approach we already use for `find_by_path`
+			// and that the Windows implementation uses via Toolhelp snapshots.
+			let tree = build_process_tree();
+			Self::children_from_tree(self.pid, &tree)
 		}
 
 		pub fn parent_pid(&self) -> Option<i32> {
@@ -567,9 +405,11 @@ mod platform {
 		}
 
 		pub fn kill(&self, signal: i32) -> bool {
-			// Re-validate identity immediately before signaling. macOS has no atomic
-			// "kill iff start_time matches" primitive, but this check prevents a
-			// recycled PID from being targeted in the normal case.
+			// Re-validate identity right before signaling. There is no atomic
+			// "kill iff start_time matches" primitive on macOS, so a vanishingly small
+			// window remains between this check and the syscall — but matching against
+			// the recorded `(pid, start_tvsec, start_tvusec)` triple eliminates the
+			// PID-reuse race in every practical case.
 			if self.live_bsdinfo().is_none() {
 				return false;
 			}
@@ -586,114 +426,49 @@ mod platform {
 		/// Walk the descendant tree in post-order (leaves first), de-duplicating
 		/// by PID so concurrent reparenting cannot trap us in a cycle.
 		pub fn descendants(&self) -> Vec<Self> {
-			self.descendants_exact().unwrap_or_default()
-		}
-
-		pub fn descendants_exact(&self) -> Option<Vec<Self>> {
-			if self.live_bsdinfo().is_none() {
-				return None;
-			}
-			let tree = build_process_tree()?;
+			// One process-table snapshot per walk — building it inside the recursion
+			// would re-scan every pid for every visited node, producing an `O(N · D)`
+			// kernel call pattern. Mirrors the Windows implementation.
+			let tree = build_process_tree();
 			let mut out = Vec::new();
 			let mut visited = HashSet::new();
 			visited.insert(self.pid);
-			if !Self::collect_descendants_from_tree(self, &tree, &mut visited, &mut out)
-				|| self.live_bsdinfo().is_none()
-			{
-				return None;
-			}
-			Some(out)
+			Self::collect_descendants_from_tree(self.pid, &tree, &mut visited, &mut out);
+			out
 		}
 
-		pub fn descendants_exact_bounded(&self, limit: usize) -> (Vec<Self>, bool) {
-			if self.live_bsdinfo().is_none() {
-				return (Vec::new(), true);
-			}
-			let Some(tree) = build_process_tree() else {
-				return (Vec::new(), true);
-			};
-			let mut out = Vec::new();
-			let mut visited = HashSet::new();
-			visited.insert(self.pid);
-			let incomplete =
-				Self::collect_descendants_bounded(self, &tree, &mut visited, &mut out, limit);
-			(out, incomplete || self.live_bsdinfo().is_none())
-		}
-
-		fn children_from_tree_exact(parent: i32, tree: &HashMap<i32, Vec<i32>>) -> Option<Vec<Self>> {
+		fn children_from_tree(parent: i32, tree: &HashMap<i32, Vec<i32>>) -> Vec<Self> {
 			let Some(child_pids) = tree.get(&parent) else {
-				return Some(Vec::new());
+				return Vec::new();
 			};
-			let mut children = Vec::with_capacity(child_pids.len());
-			for &child_pid in child_pids {
-				let child = Self::from_pid(child_pid)?;
-				if child.parent_pid() != Some(parent) {
-					return None;
-				}
-				children.push(child);
-			}
-			Some(children)
+			child_pids
+				.iter()
+				.copied()
+				.filter_map(Self::from_pid)
+				.collect()
 		}
 
 		fn collect_descendants_from_tree(
-			parent: &Self,
+			parent: i32,
 			tree: &HashMap<i32, Vec<i32>>,
 			visited: &mut HashSet<i32>,
 			out: &mut Vec<Self>,
-		) -> bool {
-			let Some(child_pids) = tree.get(&parent.pid) else {
-				return parent.live_bsdinfo().is_some();
+		) {
+			let Some(child_pids) = tree.get(&parent) else {
+				return;
 			};
 			for &child_pid in child_pids {
 				if !visited.insert(child_pid) {
 					continue;
 				}
 				let Some(child) = Self::from_pid(child_pid) else {
-					return false;
+					continue;
 				};
-				if parent.live_bsdinfo().is_none() || child.parent_pid() != Some(parent.pid) {
-					return false;
-				}
-				if !Self::collect_descendants_from_tree(&child, tree, visited, out)
-					|| parent.live_bsdinfo().is_none()
-					|| child.parent_pid() != Some(parent.pid)
-				{
-					return false;
-				}
+				// Post-order: grandchildren first, so leaf processes get signalled
+				// before their parents during tree termination.
+				Self::collect_descendants_from_tree(child_pid, tree, visited, out);
 				out.push(child);
 			}
-			parent.live_bsdinfo().is_some()
-		}
-
-		fn collect_descendants_bounded(
-			parent: &Self,
-			tree: &HashMap<i32, Vec<i32>>,
-			visited: &mut HashSet<i32>,
-			out: &mut Vec<Self>,
-			limit: usize,
-		) -> bool {
-			let Some(child_pids) = tree.get(&parent.pid) else {
-				return parent.live_bsdinfo().is_none();
-			};
-			for &child_pid in child_pids {
-				if !visited.insert(child_pid) {
-					continue;
-				}
-				if out.len() >= limit {
-					return true;
-				}
-				let Some(child) = Self::from_pid(child_pid) else {
-					return true;
-				};
-				if parent.live_bsdinfo().is_none() || child.parent_pid() != Some(parent.pid) {
-					return true;
-				}
-				out.push(child.clone());
-				if Self::collect_descendants_bounded(&child, tree, visited, out, limit) {
-					return true;
-				}
-			}
-			parent.live_bsdinfo().is_none()
 		}
 
 		pub fn status(&self) -> ProcessStatus {
@@ -733,13 +508,13 @@ mod platform {
 	/// silently truncates the second call to the supplied buffer size even
 	/// when the sizing query reports more bytes available, so the buffer is
 	/// padded well beyond the reported count.
-	fn snapshot_all_pids() -> Option<Vec<i32>> {
+	fn snapshot_all_pids() -> Vec<i32> {
 		// SAFETY: Passing a null buffer with size 0 is the documented libproc query
 		// form for obtaining the byte count needed for all PIDs; libproc does not
 		// dereference the null pointer in this mode.
 		let bytes = unsafe { proc_listallpids(ptr::null_mut(), 0) };
 		if bytes <= 0 {
-			return None;
+			return Vec::new();
 		}
 		let count = (bytes as usize) / size_of::<i32>();
 		let cap = count.saturating_mul(4).max(2048);
@@ -749,19 +524,19 @@ mod platform {
 		let actual =
 			unsafe { proc_listallpids(buffer.as_mut_ptr(), (buffer.len() * size_of::<i32>()) as i32) };
 		if actual <= 0 {
-			return None;
+			return Vec::new();
 		}
 		let pid_count = ((actual as usize) / size_of::<i32>()).min(buffer.len());
 		buffer.truncate(pid_count);
-		Some(buffer)
+		buffer
 	}
 
 	/// Build a `ppid -> [pids]` map from a one-shot scan of `proc_listallpids`.
 	///
 	/// Used as the foundation of `Process::children` and `Process::descendants`
 	/// on macOS where `proc_listchildpids` returns no children for self-queries.
-	pub(super) fn build_process_tree() -> Option<HashMap<i32, Vec<i32>>> {
-		let pids = snapshot_all_pids()?;
+	pub(super) fn build_process_tree() -> HashMap<i32, Vec<i32>> {
+		let pids = snapshot_all_pids();
 		let mut tree: HashMap<i32, Vec<i32>> = HashMap::with_capacity(pids.len() / 2);
 		for pid in pids {
 			if pid <= 0 {
@@ -770,21 +545,20 @@ mod platform {
 			let Some(info) = read_bsdinfo(pid) else {
 				continue;
 			};
-			let ppid = i32::try_from(info.pbi_ppid).ok()?;
+			let Ok(ppid) = i32::try_from(info.pbi_ppid) else {
+				continue;
+			};
 			if ppid <= 0 {
 				continue;
 			}
 			tree.entry(ppid).or_default().push(pid);
 		}
-		Some(tree)
+		tree
 	}
 
 	/// Find processes whose libproc-reported executable path equals `target`.
 	pub fn find_by_path(target: &str) -> Vec<Process> {
-		let Some(pids) = snapshot_all_pids() else {
-			return Vec::new();
-		};
-
+		let pids = snapshot_all_pids();
 		let mut path_buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
 		let mut matches = Vec::new();
 		for pid in pids {
@@ -819,45 +593,6 @@ mod platform {
 			}
 		}
 		matches
-	}
-
-	fn open_process_group_member(pid: i32, pgid: i32) -> Result<Option<Process>, ()> {
-		for _ in 0..3 {
-			if let Some(process) = Process::from_pid(pid)
-				&& process.group_id() == Some(pgid)
-			{
-				return Ok(Some(process));
-			}
-			// SAFETY: getpgid reads kernel process metadata for the integer PID.
-			if unsafe { libc::getpgid(pid) } != pgid {
-				return Ok(None);
-			}
-			std::thread::yield_now();
-		}
-		Err(())
-	}
-
-	pub fn process_group_members(pgid: i32, limit: usize) -> (Vec<Process>, bool) {
-		let mut members = Vec::new();
-		let mut incomplete = false;
-		let Some(pids) = snapshot_all_pids() else {
-			return (Vec::new(), true);
-		};
-		for pid in pids {
-			// SAFETY: getpgid reads kernel process metadata for the integer PID.
-			if unsafe { libc::getpgid(pid) } != pgid {
-				continue;
-			}
-			if members.len() >= limit {
-				return (members, true);
-			}
-			match open_process_group_member(pid, pgid) {
-				Ok(Some(process)) => members.push(process),
-				Ok(None) => incomplete = true,
-				Err(()) => incomplete = true,
-			}
-		}
-		(members, incomplete)
 	}
 
 	fn read_bsdinfo(pid: i32) -> Option<libc::proc_bsdinfo> {
@@ -1047,7 +782,6 @@ mod platform {
 	const PROCESS_BASIC_INFORMATION_CLASS: u32 = 0;
 	const STATUS_SUCCESS: NtStatus = 0;
 	const TH32CS_SNAPPROCESS: u32 = 0x00000002;
-	const ERROR_NO_MORE_FILES: u32 = 18;
 	const PROCESS_TERMINATE: u32 = 0x0001;
 	const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 	const SYNCHRONIZE: u32 = 0x00100000;
@@ -1059,7 +793,6 @@ mod platform {
 	unsafe extern "system" {
 		fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> Handle;
 		fn Process32FirstW(hSnapshot: Handle, lppe: *mut PROCESSENTRY32W) -> i32;
-		fn GetLastError() -> u32;
 		fn Process32NextW(hSnapshot: Handle, lppe: *mut PROCESSENTRY32W) -> i32;
 		fn CloseHandle(hObject: Handle) -> i32;
 		fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> Handle;
@@ -1175,12 +908,8 @@ mod platform {
 		}
 
 		pub fn children(&self) -> Vec<Self> {
-			self.children_exact().unwrap_or_default()
-		}
-
-		pub fn children_exact(&self) -> Option<Vec<Self>> {
-			let tree = build_process_tree()?;
-			Self::children_from_tree_exact(self.pid, &tree)
+			let tree = build_process_tree();
+			Self::children_from_tree(self.pid, &tree)
 		}
 
 		/// Walk the entire descendant tree using a single Toolhelp snapshot.
@@ -1189,130 +918,59 @@ mod platform {
 		/// table for every visited descendant, making tree termination
 		/// `O(N · D)` snapshots. One snapshot per termination wave is enough.
 		pub fn descendants(&self) -> Vec<Self> {
-			self.descendants_exact().unwrap_or_default()
-		}
-
-		pub fn descendants_exact(&self) -> Option<Vec<Self>> {
-			if self.status() != ProcessStatus::Running {
-				return None;
-			}
-			let tree = build_process_tree()?;
+			let tree = build_process_tree();
+			let Ok(root) = u32::try_from(self.pid) else {
+				return Vec::new();
+			};
 			let mut visited: HashSet<u32> = HashSet::new();
-			visited.insert(u32::try_from(self.pid).ok()?);
+			visited.insert(root);
 			let mut out = Vec::new();
-			if !Self::collect_descendants_from_tree(self, &tree, &mut visited, &mut out)
-				|| self.status() != ProcessStatus::Running
-			{
-				return None;
-			}
-			Some(out)
+			Self::collect_descendants_from_tree(root, &tree, &mut visited, &mut out);
+			out
 		}
 
-		pub fn descendants_exact_bounded(&self, limit: usize) -> (Vec<Self>, bool) {
-			if self.status() != ProcessStatus::Running {
-				return (Vec::new(), true);
-			}
-			let Some(tree) = build_process_tree() else {
-				return (Vec::new(), true);
+		fn children_from_tree(pid: i32, tree: &HashMap<u32, SmallVec<[u32; 4]>>) -> Vec<Self> {
+			let Ok(pid_u32) = u32::try_from(pid) else {
+				return Vec::new();
 			};
-			let mut visited = HashSet::new();
-			let Ok(root_pid) = u32::try_from(self.pid) else {
-				return (Vec::new(), true);
-			};
-			visited.insert(root_pid);
-			let mut out = Vec::new();
-			let incomplete =
-				Self::collect_descendants_bounded(self, &tree, &mut visited, &mut out, limit);
-			(out, incomplete || self.status() != ProcessStatus::Running)
-		}
-
-		fn children_from_tree_exact(
-			pid: i32,
-			tree: &HashMap<u32, SmallVec<[u32; 4]>>,
-		) -> Option<Vec<Self>> {
-			let pid_u32 = u32::try_from(pid).ok()?;
-			let mut children = Vec::new();
-			for &child_pid in tree.get(&pid_u32).into_iter().flatten() {
-				let child = Self::from_pid(i32::try_from(child_pid).ok()?)?;
-				if child.status() != ProcessStatus::Running || child.parent_pid() != Some(pid) {
-					return None;
-				}
-				children.push(child);
-			}
-			Some(children)
+			tree
+				.get(&pid_u32)
+				.into_iter()
+				.flatten()
+				.filter_map(|&child_pid| {
+					let child = Self::from_pid(i32::try_from(child_pid).ok()?)?;
+					(child.status() == ProcessStatus::Running).then_some(child)
+				})
+				.collect()
 		}
 
 		fn collect_descendants_from_tree(
-			parent: &Self,
+			parent: u32,
 			tree: &HashMap<u32, SmallVec<[u32; 4]>>,
 			visited: &mut HashSet<u32>,
 			out: &mut Vec<Self>,
-		) -> bool {
-			let Ok(parent_pid) = u32::try_from(parent.pid) else {
-				return false;
-			};
-			let Some(children) = tree.get(&parent_pid) else {
-				return parent.status() == ProcessStatus::Running;
+		) {
+			let Some(children) = tree.get(&parent) else {
+				return;
 			};
 			for &child_pid in children {
 				if !visited.insert(child_pid) {
 					continue;
 				}
 				let Ok(child_pid_i) = i32::try_from(child_pid) else {
-					return false;
+					continue;
 				};
 				let Some(child) = Self::from_pid(child_pid_i) else {
-					return false;
+					continue;
 				};
-				if parent.status() != ProcessStatus::Running || child.parent_pid() != Some(parent.pid) {
-					return false;
+				if child.status() != ProcessStatus::Running {
+					continue;
 				}
-				if !Self::collect_descendants_from_tree(&child, tree, visited, out)
-					|| parent.status() != ProcessStatus::Running
-					|| child.parent_pid() != Some(parent.pid)
-				{
-					return false;
-				}
+				// Post-order: collect grandchildren first so leaves are signalled before
+				// their parents during tree termination.
+				Self::collect_descendants_from_tree(child_pid, tree, visited, out);
 				out.push(child);
 			}
-			parent.status() == ProcessStatus::Running
-		}
-
-		fn collect_descendants_bounded(
-			parent: &Self,
-			tree: &HashMap<u32, SmallVec<[u32; 4]>>,
-			visited: &mut HashSet<u32>,
-			out: &mut Vec<Self>,
-			limit: usize,
-		) -> bool {
-			let Ok(parent_pid) = u32::try_from(parent.pid) else {
-				return true;
-			};
-			let Some(children) = tree.get(&parent_pid) else {
-				return parent.status() != ProcessStatus::Running;
-			};
-			for &child_pid in children {
-				if !visited.insert(child_pid) {
-					continue;
-				}
-				if out.len() >= limit {
-					return true;
-				}
-				let Ok(child_pid_i) = i32::try_from(child_pid) else {
-					return true;
-				};
-				let Some(child) = Self::from_pid(child_pid_i) else {
-					return true;
-				};
-				if parent.status() != ProcessStatus::Running || child.parent_pid() != Some(parent.pid) {
-					return true;
-				}
-				out.push(child.clone());
-				if Self::collect_descendants_bounded(&child, tree, visited, out, limit) {
-					return true;
-				}
-			}
-			parent.status() != ProcessStatus::Running
 		}
 
 		pub fn kill(&self, _signal: i32) -> bool {
@@ -1543,18 +1201,18 @@ mod platform {
 	}
 
 	/// Build a map of `parent_pid` -> [`child_pids`] for all processes.
-	///
-	/// Toolhelp failures are containment-unknown observations, not empty trees.
-	fn build_process_tree() -> Option<HashMap<u32, SmallVec<[u32; 4]>>> {
+	fn build_process_tree() -> HashMap<u32, SmallVec<[u32; 4]>> {
 		let mut tree: HashMap<u32, SmallVec<[u32; 4]>> = HashMap::new();
-		let snapshot = create_process_snapshot()?;
+		let Some(snapshot) = create_process_snapshot() else {
+			return tree;
+		};
 
 		let mut entry = process_entry();
 		// SAFETY: `snapshot` is a valid Toolhelp snapshot handle. `entry` points to a
 		// writable `PROCESSENTRY32W` whose `dwSize` field was initialized to the exact
 		// ABI size before the call.
 		if unsafe { Process32FirstW(snapshot.as_raw(), &raw mut entry) } == 0 {
-			return None;
+			return tree;
 		}
 
 		loop {
@@ -1566,29 +1224,17 @@ mod platform {
 			// SAFETY: `snapshot` remains a valid Toolhelp snapshot handle, and `entry`
 			// remains a writable `PROCESSENTRY32W` with its ABI size preserved.
 			if unsafe { Process32NextW(snapshot.as_raw(), &raw mut entry) } == 0 {
-				// A normal end-of-snapshot is the only successful zero return. Any other
-				// error makes the exact descendant set unprovable.
-				if unsafe { GetLastError() } != ERROR_NO_MORE_FILES {
-					return None;
-				}
 				break;
 			}
 		}
 
-		Some(tree)
+		tree
 	}
 
 	/// Process groups are not exposed on Windows.
 	/// Always returns `false`.
 	pub const fn kill_process_group(_pgid: i32, _signal: i32) -> bool {
 		false
-	}
-
-	pub fn process_group_members(_pgid: i32, _limit: usize) -> (Vec<Process>, bool) {
-		// Windows has no ambient process-group primitive. An empty scan is not
-		// evidence of containment; callers must treat this unsupported observation
-		// as incomplete and fail closed unless a Job Object owner is installed.
-		(Vec::new(), true)
 	}
 
 	/// Find processes whose `QueryFullProcessImageNameW` result equals `target`.
@@ -1662,31 +1308,6 @@ impl Process {
 			.collect()
 	}
 
-	/// Snapshot up to `limit` stable members of an operating-system process
-	/// group. Only members whose PID and kernel incarnation appear in `allowed`
-	/// are returned; every other observed member makes the result incomplete.
-	pub fn from_group_bounded(
-		pgid: i32,
-		limit: usize,
-		allowed: &[(i32, String)],
-	) -> (Vec<Self>, bool) {
-		let (members, mut incomplete) = platform::process_group_members(pgid, limit);
-		let mut admitted = Vec::with_capacity(members.len());
-		for member in members {
-			let process = Self::from_inner(member);
-			if allowed.iter().any(|(pid, incarnation)| {
-				*pid == process.pid() && *incarnation == process.incarnation()
-			}) {
-				admitted.push(process);
-			} else {
-				// A live group member that is not backed by spawn/lineage evidence is
-				// never adopted. Preserve the uncertainty for the owner to latch.
-				incomplete = true;
-			}
-		}
-		(admitted, incomplete)
-	}
-
 	/// Operating-system process identifier for this process reference.
 	pub const fn pid(&self) -> i32 {
 		self.inner.pid()
@@ -1713,10 +1334,25 @@ impl Process {
 	/// Send `signal` only to this pinned root process.
 	///
 	/// Linux delivers through the owned pidfd and Windows through the owned
-	/// process handle. Darwin revalidates the captured process start time
-	/// immediately before signaling so a recycled PID is rejected.
+	/// process handle, so PID reuse cannot redirect the signal. Darwin has no
+	/// equivalent stable kernel authority and deliberately fails closed.
+	#[cfg_attr(
+		target_os = "macos",
+		allow(
+			clippy::missing_const_for_fn,
+			reason = "non-macOS implementations call the platform process authority"
+		)
+	)]
 	pub fn signal_root(&self, signal: i32) -> bool {
-		self.inner.kill(signal)
+		#[cfg(target_os = "macos")]
+		{
+			let _ = signal;
+			false
+		}
+		#[cfg(not(target_os = "macos"))]
+		{
+			self.inner.kill(signal)
+		}
 	}
 
 	/// Send `signal` to this process and its descendants, children first.
@@ -1727,47 +1363,6 @@ impl Process {
 	/// hard-kill signal.
 	pub fn kill_tree(&self, signal: Option<i32>) -> u32 {
 		self.signal_tree(signal.unwrap_or(KILL_SIGNAL))
-	}
-
-	/// Signal only this pinned process and pinned descendants within `limit`,
-	/// never the ambient operating-system process group. A failed or
-	/// overflowing descendant observation returns `None` so callers fail
-	/// closed.
-	pub fn kill_tree_exact_bounded(&self, signal: i32, limit: usize) -> Option<u32> {
-		if self.status() != ProcessStatus::Running {
-			return Some(0);
-		}
-		let (descendants, incomplete) = self.descendants_exact_bounded(limit);
-		if incomplete || self.status() != ProcessStatus::Running {
-			return None;
-		}
-		let mut signaled = 0u32;
-		for child in &descendants {
-			if child.status() == ProcessStatus::Exited {
-				continue;
-			}
-			if !child.signal_root(signal) {
-				if child.status() == ProcessStatus::Exited {
-					continue;
-				}
-				return None;
-			}
-			signaled += 1;
-		}
-		if self.status() == ProcessStatus::Running {
-			if !self.signal_root(signal) {
-				if self.status() == ProcessStatus::Exited {
-					return Some(signaled);
-				}
-				return None;
-			}
-			signaled += 1;
-		}
-		Some(signaled)
-	}
-
-	pub fn kill_tree_exact(&self, signal: i32) -> Option<u32> {
-		self.kill_tree_exact_bounded(signal, usize::MAX)
 	}
 
 	/// Process group id for this process, when supported by the platform.
@@ -1830,32 +1425,6 @@ impl Process {
 			.into_iter()
 			.map(Self::from_inner)
 			.collect()
-	}
-
-	/// Enumerate the exact live descendant set. Any unreadable or failed
-	/// observation returns `None`; callers must not interpret that as empty.
-	pub fn descendants_exact(&self) -> Option<Vec<Self>> {
-		Some(
-			self
-				.inner
-				.descendants_exact()?
-				.into_iter()
-				.map(Self::from_inner)
-				.collect(),
-		)
-	}
-
-	/// Enumerate at most `limit` exact descendants. The boolean is true when
-	/// observation failed or additional descendants were detected beyond the
-	/// bound; callers must treat either case as ownership-incomplete.
-	pub fn descendants_exact_bounded(&self, limit: usize) -> (Vec<Self>, bool) {
-		let (descendants, incomplete) = self.inner.descendants_exact_bounded(limit);
-		(descendants.into_iter().map(Self::from_inner).collect(), incomplete)
-	}
-
-	/// Snapshot live descendants as stable process references.
-	pub fn descendants(&self) -> Vec<Self> {
-		self.live_descendants()
 	}
 
 	fn signal_tree(&self, signal: i32) -> u32 {
@@ -2315,15 +1884,5 @@ mod tests {
 			 cancellation cleanup can reach it; this regressed on macOS when the walk relied on the \
 			 broken `proc_listchildpids`",
 		);
-	}
-
-	#[test]
-	fn bounded_descendants_never_exceed_requested_limit() {
-		let self_pid = i32::try_from(std::process::id()).expect("harness pid fits in i32");
-		let harness = Process::from_pid(self_pid).expect("harness Process ref");
-		let (zero, _) = harness.descendants_exact_bounded(0);
-		assert!(zero.is_empty());
-		let (bounded, _) = harness.descendants_exact_bounded(2);
-		assert!(bounded.len() <= 2);
 	}
 }

@@ -69,7 +69,6 @@
 - The interactive `Working…` indicator now remains visible and explicitly labels owner-scoped detached background work across foreground completion, provider errors, pending-submission aborts, and job completion, without resurrecting after TUI disposal (#3479).
 - Activity-indicator suspension now detaches and restores the exact owned loader instead of stopping foreign transition UI; optimistic pre-init prompts still show and clear their spinner, context clear retains its eager teardown contract, and resume cancellation preserves transient state until session mutation actually begins.
 - Activity-indicator stop and suspension helpers now fail safely for lightweight controller contexts with absent or partial status rails, while full interactive contexts retain exact loader detach/restore ownership.
-- Bash now uses bounded core-to-native and N-API callback backpressure plus a 64 KiB terminal tail after the core 8 MiB stream budget, emits at most one typed aggregate loss marker, carries source-loss evidence through merged and raw stream cancellation/error paths, bounds ACP terminal lifecycle/output RPC settlement, cleans settled native sessions, labels every combined omission honestly through inline backstops and failure paths, omits false source ranges, and rejects malformed artifact IDs/counts.
 
 ## [0.12.1] - 2026-07-29
 

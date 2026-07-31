@@ -12,14 +12,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@gajae-code/utils";
-import { isValidArtifactId } from "../utils/artifact-id";
-import {
-	type AuthorizedArtifactsRoot,
-	authorizedArtifactsDirsFromContext,
-	closeAuthorizedArtifactsRoot,
-	openAuthorizedArtifactsRoot,
-	readAuthorizedArtifactFile,
-} from "./registry-helpers";
+import { authorizedArtifactsDirsFromContext } from "./registry-helpers";
 import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext } from "./types";
 
 export class ArtifactProtocolHandler implements ProtocolHandler {
@@ -31,7 +24,7 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 		if (!id) {
 			throw new Error("artifact:// URL requires a numeric ID: artifact://0");
 		}
-		if (!isValidArtifactId(id)) {
+		if (!/^\d+$/.test(id)) {
 			throw new Error(`artifact:// ID must be numeric, got: ${id}`);
 		}
 
@@ -42,33 +35,23 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 		}
 
 		let foundPath: string | undefined;
-		let foundBytes: Buffer | undefined;
-		let foundSize = 0;
 		let anyDirExists = false;
-		const MAX_ARTIFACT_READ_BYTES = 16 * 1024 * 1024;
 
 		for (const dir of dirs) {
-			let root: AuthorizedArtifactsRoot;
+			let files: string[];
 			try {
-				root = openAuthorizedArtifactsRoot(dir);
+				files = await fs.readdir(dir);
 				anyDirExists = true;
 			} catch (err) {
 				if (isEnoent(err)) continue;
 				throw err;
 			}
-			try {
-				const files = await fs.readdir(dir);
-				for (const f of files) {
-					if (f.endsWith(".meta.json") || !f.startsWith(`${id}.`)) continue;
-					const captured = readAuthorizedArtifactFile(root, f, MAX_ARTIFACT_READ_BYTES);
-					if (!captured) continue;
+			for (const f of files) {
+				if (f.endsWith(".meta.json")) continue;
+				if (f.startsWith(`${id}.`)) {
 					if (foundPath) throw new Error(`artifact://${id} ambiguous id in authorized artifacts`);
 					foundPath = path.join(dir, f);
-					foundBytes = captured.bytes;
-					foundSize = captured.size;
 				}
-			} finally {
-				closeAuthorizedArtifactsRoot(root);
 			}
 		}
 
@@ -76,14 +59,20 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 			throw new Error("No artifacts directory found");
 		}
 
-		if (!foundPath || !foundBytes) {
+		if (!foundPath) {
 			throw new Error(`artifact://${id} not found`);
 		}
 
+		// F20: cap the materialized artifact so reading a huge spilled artifact cannot
+		// buffer GBs into memory (the range selector is applied downstream, so without a
+		// cap a `artifact://id:range` over a multi-GB artifact still reads it whole).
+		const MAX_ARTIFACT_READ_BYTES = 16 * 1024 * 1024;
+		const file = Bun.file(foundPath);
+		const fullSize = file.size;
 		const content =
-			foundSize > foundBytes.byteLength
-				? `${foundBytes.toString("utf8")}\n\n[Artifact truncated: first ${foundBytes.byteLength} of ${foundSize} bytes shown; use a narrower range or a specialized tool for the full content.]`
-				: foundBytes.toString("utf8");
+			fullSize > MAX_ARTIFACT_READ_BYTES
+				? `${await file.slice(0, MAX_ARTIFACT_READ_BYTES).text()}\n\n[Artifact truncated: first ${MAX_ARTIFACT_READ_BYTES} of ${fullSize} bytes shown; use a narrower range or a specialized tool for the full content.]`
+				: await file.text();
 		return {
 			url: url.href,
 			content,

@@ -571,30 +571,6 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
 	}
 }
 
-#[cfg(unix)]
-fn observed_process_group_id(
-	new_process_group: bool,
-	detached_session: bool,
-	pid: Option<i32>,
-	inherited_process_group_id: Option<i32>,
-) -> Option<i32> {
-	if new_process_group || detached_session {
-		pid
-	} else {
-		inherited_process_group_id
-	}
-}
-
-#[cfg(not(unix))]
-const fn observed_process_group_id(
-	_new_process_group: bool,
-	_detached_session: bool,
-	_pid: Option<i32>,
-	_inherited_process_group_id: Option<i32>,
-) -> Option<i32> {
-	None
-}
-
 pub(crate) fn execute_external_command(
 	context: ExecutionContext<'_, impl extensions::ShellExtensions>,
 	executable_path: &str,
@@ -689,19 +665,16 @@ pub(crate) fn execute_external_command(
 			// Retrieve the pid.
 			#[expect(clippy::cast_possible_wrap)]
 			let pid = child.id().map(|id| id as i32);
-			let actual_pgid = observed_process_group_id(
-				new_pg,
-				matches!(session_action, ChildSessionAction::DetachSession),
-				pid,
-				process_group_id,
-			);
-			if pid.is_none() {
+			let mut actual_pgid = process_group_id;
+			if let Some(pid) = &pid {
+				if new_pg {
+					actual_pgid = Some(*pid);
+				}
+			} else {
 				tracing::warn!("could not retrieve pid for child process");
 			}
-			context.params.notify_external_command_spawned(pid, actual_pgid);
 
-			let mut child_process =
-				processes::ChildProcess::new(child, pid, actual_pgid, context.params.process_group_observer());
+			let mut child_process = processes::ChildProcess::new(child, pid, actual_pgid);
 			if let Some((output, markers)) = marker_output.take() {
 				child_process.set_completion_marker(
 					output,

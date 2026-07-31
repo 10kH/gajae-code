@@ -194,39 +194,14 @@ function utf8Suffix(text: string, maxBytes: number): string {
  * next provider context is constructed. Byte boundaries never split UTF-8
  * code points, so head/tail recovery remains readable for emoji and CJK text.
  */
-export function createPreAdmissionArtifactSpillPreview(
-	fullText: string,
-	artifactId: string,
-	digest: string,
-	options: { maxInlineBytes?: number; fullOutput?: boolean } = {},
-): string {
+export function createPreAdmissionArtifactSpillPreview(fullText: string, artifactId: string, digest: string): string {
 	const totalBytes = Buffer.byteLength(fullText, "utf-8");
-	const maxInlineBytes = options.maxInlineBytes;
-	const referenceKind = options.fullOutput === false ? "retained output" : "full output";
-	let headBudget = PRE_ADMISSION_ARTIFACT_SPILL_HEAD_BYTES;
-	let tailBudget = PRE_ADMISSION_ARTIFACT_SPILL_TAIL_BYTES;
-	if (maxInlineBytes !== undefined) {
-		const receiptReserve = Buffer.byteLength(
-			`\n\n[${totalBytes} bytes omitted; sha256:${digest}; ${referenceKind}: artifact://${artifactId}]\n\n`,
-			"utf-8",
-		);
-		const contentBudget = Math.max(0, maxInlineBytes - receiptReserve);
-		headBudget = Math.min(headBudget, Math.ceil(contentBudget / 2));
-		tailBudget = Math.min(tailBudget, Math.floor(contentBudget / 2));
-	}
-	for (;;) {
-		const head = utf8Prefix(fullText, headBudget);
-		const tail = utf8Suffix(fullText, tailBudget);
-		const retainedBytes = Buffer.byteLength(head, "utf-8") + Buffer.byteLength(tail, "utf-8");
-		const omittedBytes = Math.max(0, totalBytes - retainedBytes);
-		const receipt = `[${omittedBytes} bytes omitted; sha256:${digest}; ${referenceKind}: artifact://${artifactId}]`;
-		const preview = `${head}\n\n${receipt}\n\n${tail}`;
-		if (maxInlineBytes === undefined || Buffer.byteLength(preview, "utf-8") <= maxInlineBytes) return preview;
-		if (headBudget === 0 && tailBudget === 0) return utf8Prefix(receipt, maxInlineBytes);
-		const overflow = Buffer.byteLength(preview, "utf-8") - maxInlineBytes;
-		if (tailBudget >= headBudget) tailBudget = Math.max(0, tailBudget - overflow);
-		else headBudget = Math.max(0, headBudget - overflow);
-	}
+	const head = utf8Prefix(fullText, PRE_ADMISSION_ARTIFACT_SPILL_HEAD_BYTES);
+	const tail = utf8Suffix(fullText, PRE_ADMISSION_ARTIFACT_SPILL_TAIL_BYTES);
+	const retainedBytes = Buffer.byteLength(head, "utf-8") + Buffer.byteLength(tail, "utf-8");
+	const omittedBytes = Math.max(0, totalBytes - retainedBytes);
+	const receipt = `[${omittedBytes} bytes omitted; sha256:${digest}; full output: artifact://${artifactId}]`;
+	return `${head}\n\n${receipt}\n\n${tail}`;
 }
 
 /**

@@ -36,7 +36,6 @@ export class ToolResultBuilder<TDetails extends DetailsWithMeta> {
 		windows: ReadWindow,
 		options?: {
 			artifactId?: string;
-			artifactVerified?: boolean;
 			noticeOwner?: "body";
 			maxBytes?: number;
 			rangeBase?: "file" | "window";

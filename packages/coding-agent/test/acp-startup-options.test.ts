@@ -42,7 +42,6 @@ test("ACP registers the SDK UI provider only for clients with form elicitation",
 test("ACP reverse requests use canonical names, session scope, and cancellation", async () => {
 	const calls: unknown[][] = [];
 	const typedCalls: string[] = [];
-	let terminalUpdate: unknown;
 	const connection = {
 		request: async (...args: unknown[]) => {
 			calls.push(args);
@@ -63,9 +62,6 @@ test("ACP reverse requests use canonical names, session scope, and cancellation"
 			typedCalls.push("createTerminal");
 			return {};
 		},
-		sessionUpdate: async (notification: unknown) => {
-			terminalUpdate = notification;
-		},
 	} as unknown as AgentSideConnection;
 	const signal = new AbortController().signal;
 	const reverse = createAcpReverseConnection(connection, "session-1");
@@ -74,14 +70,9 @@ test("ACP reverse requests use canonical names, session scope, and cancellation"
 		["fs.readTextFile", { path: "/workspace/README.md" }],
 		["fs.writeTextFile", { path: "/workspace/README.md", content: "updated" }],
 		["terminal.create", { command: "printf", args: ["ok"] }],
-		["terminal.output", { terminalId: "term-1" }],
-		["terminal.waitForExit", { terminalId: "term-1" }],
-		["terminal.kill", { terminalId: "term-1" }],
-		["terminal.release", { terminalId: "term-1" }],
 		["ui.elicit", { mode: "form", message: "Choose" }],
 	] as const;
 	for (const [method, params] of requests) await reverse.request?.(method, params, { cancellationSignal: signal });
-	await reverse.request?.("terminal.publish", { toolCallId: "call-1", terminalId: "term-1" });
 
 	expect(calls).toEqual([
 		["session/request_permission", { toolCallId: "call-1", sessionId: "session-1" }, { cancellationSignal: signal }],
@@ -92,10 +83,6 @@ test("ACP reverse requests use canonical names, session scope, and cancellation"
 			{ cancellationSignal: signal },
 		],
 		["terminal/create", { command: "printf", args: ["ok"], sessionId: "session-1" }, { cancellationSignal: signal }],
-		["terminal/output", { terminalId: "term-1", sessionId: "session-1" }, { cancellationSignal: signal }],
-		["terminal/wait_for_exit", { terminalId: "term-1", sessionId: "session-1" }, { cancellationSignal: signal }],
-		["terminal/kill", { terminalId: "term-1", sessionId: "session-1" }, { cancellationSignal: signal }],
-		["terminal/release", { terminalId: "term-1", sessionId: "session-1" }, { cancellationSignal: signal }],
 		[
 			"elicitation/create",
 			{ mode: "form", message: "Choose", sessionId: "session-1" },
@@ -103,14 +90,6 @@ test("ACP reverse requests use canonical names, session scope, and cancellation"
 		],
 	]);
 	expect(typedCalls).toEqual([]);
-	expect(terminalUpdate).toMatchObject({
-		sessionId: "session-1",
-		update: {
-			sessionUpdate: "tool_call_update",
-			toolCallId: "call-1",
-			content: [{ type: "terminal", terminalId: "term-1" }],
-		},
-	});
 });
 
 test("ACP maps non-prompt permission handling to the SDK allow policy", async () => {

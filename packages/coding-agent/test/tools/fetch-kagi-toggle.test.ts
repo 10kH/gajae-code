@@ -13,11 +13,6 @@ import * as scrapers from "@gajae-code/coding-agent/web/scrapers/types";
 import * as scraperUtils from "@gajae-code/coding-agent/web/scrapers/utils";
 import * as natives from "@gajae-code/natives";
 import { hookFetch, ptree, Snowflake } from "@gajae-code/utils";
-import { ArtifactManager } from "../../src/session/artifacts";
-import {
-	ManagedSessionDescendantStore,
-	managedDirectoryRoot,
-} from "../../src/session/internal/managed-session-storage";
 
 const withMissingSystemPython = () => {
 	const whichSpy = vi.spyOn(Bun, "which").mockImplementation(() => null);
@@ -737,96 +732,6 @@ describe("read tool URL handling", () => {
 		expect(textBlock?.text).not.toContain("selector-0001");
 		expect(result.details?.truncation?.truncated).toBe(true);
 		expect(loadPageSpy).toHaveBeenCalledTimes(1);
-	});
-
-	it("bounds and discloses rejected URL artifact allocation", async () => {
-		const baseSession = createSession();
-		const session: ToolSession = {
-			...baseSession,
-			allocateOutputArtifact: async () => {
-				throw new Error("URL allocator failed");
-			},
-		};
-		const tool = new ReadTool(session);
-		const pageUrl = "https://example.com/rejected-artifact";
-		vi.spyOn(scrapers, "loadPage").mockResolvedValue({
-			ok: true,
-			status: 200,
-			contentType: "text/plain",
-			finalUrl: pageUrl,
-			content: Array.from({ length: 4000 }, (_, index) => `allocation-${index} ${"x".repeat(100)}`).join("\n"),
-		});
-		const result = await tool.execute("rejected-artifact", { path: pageUrl, truncation: "last" });
-		expect(result.details?.meta?.truncation?.artifactId).toBeUndefined();
-		expect(result.details?.meta?.truncation?.artifactFailureDiagnostic).toContain("URL allocator failed");
-	});
-
-	it("bounds a non-settling URL artifact allocator", async () => {
-		const allocationGate = Promise.withResolvers<{ id: string; path: string }>();
-		const baseSession = createSession();
-		const session: ToolSession = { ...baseSession, allocateOutputArtifact: async () => allocationGate.promise };
-		const tool = new ReadTool(session);
-		const pageUrl = "https://example.com/stalled-artifact";
-		vi.spyOn(scrapers, "loadPage").mockResolvedValue({
-			ok: true,
-			status: 200,
-			contentType: "text/plain",
-			finalUrl: pageUrl,
-			content: Array.from({ length: 4000 }, (_, index) => `stalled-${index} ${"x".repeat(100)}`).join("\n"),
-		});
-		const raced = await Promise.race([
-			tool.execute("stalled-artifact", { path: pageUrl, truncation: "last" }),
-			Bun.sleep(750).then(() => undefined),
-		]);
-		expect(raced).toBeDefined();
-		expect(raced?.details?.meta?.truncation?.artifactFailureDiagnostic).toContain("did not settle within 500ms");
-		allocationGate.resolve({ id: "91", path: path.join(testDir, "late.read.log") });
-		await allocationGate.promise;
-	});
-
-	it("labels artifacts from renderer-truncated URL output as retained-only", async () => {
-		const session = createSession();
-		const tool = new ReadTool(session);
-		const pageUrl = "https://example.com/renderer-truncated-artifact";
-		vi.spyOn(scrapers, "loadPage").mockResolvedValue({
-			ok: true,
-			status: 200,
-			contentType: "text/plain",
-			finalUrl: pageUrl,
-			content: Array.from({ length: 12_000 }, (_, index) => `renderer-${index} ${"x".repeat(100)}`).join("\n"),
-		});
-		const result = await tool.execute("renderer-truncated-artifact", { path: pageUrl, truncation: "last" });
-		expect(result.details?.meta?.truncation?.artifactVerified).toBe(true);
-		expect(result.details?.meta?.truncation?.sourceCaptureIncomplete).toBe(true);
-		expect(result.details?.meta?.truncation?.artifactId).toBeDefined();
-	});
-
-	it("publishes truncated URL output through managed artifact authority", async () => {
-		if (process.platform !== "linux") return;
-		const artifactsDir = path.join(testDir, "managed-artifacts");
-		const manager = new ArtifactManager(
-			new ManagedSessionDescendantStore(managedDirectoryRoot(testDir), artifactsDir),
-		);
-		const session: ToolSession = { ...createSession(), getArtifactManager: () => manager };
-		const tool = new ReadTool(session);
-		const pageUrl = "https://example.com/managed-url-artifact";
-		vi.spyOn(scrapers, "loadPage").mockResolvedValue({
-			ok: true,
-			status: 200,
-			contentType: "text/plain",
-			finalUrl: pageUrl,
-			content: Array.from({ length: 5000 }, (_, index) => `managed-url-${index} ${"u".repeat(60)}`).join("\n"),
-		});
-		const result = await tool.execute("managed-url-artifact", { path: pageUrl, truncation: "last" });
-		const artifactId = result.details?.meta?.truncation?.artifactId;
-		expect(artifactId).toBeDefined();
-		expect(result.details?.meta?.truncation?.artifactVerified).toBe(true);
-		const filename = (await manager.listFiles()).find(file => file.startsWith(`${artifactId}.`));
-		expect(filename).toBeDefined();
-		const snapshot = manager.getManagedStore()!.readExpected(filename!);
-		const retained = snapshot?.bytes.toString("utf8") ?? "";
-		expect(retained).toContain("managed-url-0");
-		expect(retained).toContain("managed-url-4999");
 	});
 
 	it("keeps live and rehydrated URL selector windows identical for last and both", async () => {

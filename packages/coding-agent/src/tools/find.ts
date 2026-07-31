@@ -14,7 +14,7 @@ import { type TruncationResult, truncateHead } from "../session/streaming-output
 import { Ellipsis, fileHyperlink, renderFileList, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import type { ToolSession } from ".";
 import { applyListLimit } from "./list-limit";
-import { formatArtifactEvidenceNotice, type OutputMeta } from "./output-meta";
+import { formatFullOutputReference, type OutputMeta } from "./output-meta";
 import {
 	formatPathRelativeToCwd,
 	hasGlobPathChars,
@@ -510,12 +510,8 @@ export const findToolRenderer = {
 		if (details?.resultLimitReached) truncationReasons.push(`limit ${details.resultLimitReached} results`);
 		if (limits?.resultLimit) truncationReasons.push(`limit ${limits.resultLimit.reached} results`);
 		if (truncation) truncationReasons.push(truncation.truncatedBy === "lines" ? "line limit" : "size limit");
-		const artifactEvidence = details?.meta?.truncation
-			? formatArtifactEvidenceNotice(details.meta.truncation)
-			: truncation && "artifactId" in truncation
-				? formatArtifactEvidenceNotice(truncation as NonNullable<OutputMeta["truncation"]>)
-				: undefined;
-		if (artifactEvidence) truncationReasons.push(artifactEvidence);
+		const artifactId = truncation && "artifactId" in truncation ? truncation.artifactId : undefined;
+		if (artifactId) truncationReasons.push(formatFullOutputReference(artifactId));
 
 		const extraLines: string[] = [];
 		if (truncationReasons.length > 0) {

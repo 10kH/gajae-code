@@ -5,7 +5,6 @@ import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { getRuntimeResourceCounts } from "@gajae-code/coding-agent/debug/runtime-gauges";
 import {
-	type BashMinimizedSaveReturn,
 	disposeAllShellSessions,
 	executeBash,
 	getShellSessionCount,
@@ -35,9 +34,8 @@ describe("executeBash", () => {
 		await Settings.init({ inMemory: true, cwd: tempDir });
 	});
 
-	afterEach(async () => {
+	afterEach(() => {
 		resetSettingsForTest();
-		await disposeAllShellSessions();
 		vi.restoreAllMocks();
 		if (fs.existsSync(tempDir)) {
 			fs.rmSync(tempDir, { recursive: true });
@@ -46,53 +44,16 @@ describe("executeBash", () => {
 
 	it("preserves an explicit capped minimizer artifact below the default cap", () => {
 		const result = normalizeMinimizedSaveResultForTests(
-			{ status: "saved", artifactId: "7", complete: false, omittedBytes: 7 },
+			{ status: "saved", artifactId: "lower-cap", complete: false, omittedBytes: 7 },
 			"short original",
 		);
 
 		expect(result).toEqual({
 			status: "saved",
-			artifactId: "7",
+			artifactId: "lower-cap",
 			complete: false,
 			omittedBytes: 7,
 		});
-	});
-
-	it("rejects untyped minimizer artifact ids", () => {
-		for (const artifactId of ["", "abc", "bad id", "bad\nid", "1/path", "1?x", "1#x", "00", "01"]) {
-			expect(normalizeMinimizedSaveResultForTests(artifactId, "original")).toEqual({
-				status: "failed",
-				diagnostic: "artifact save returned an invalid result",
-			});
-		}
-	});
-
-	it("rejects invalid minimizer omission counts", () => {
-		for (const omittedBytes of [Number.NaN, Number.POSITIVE_INFINITY, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
-			expect(
-				normalizeMinimizedSaveResultForTests(
-					{ status: "saved", artifactId: "8", complete: false, omittedBytes },
-					"original",
-				),
-			).toEqual({ status: "failed", diagnostic: "artifact save reported invalid omitted bytes" });
-		}
-	});
-
-	it("rejects malformed minimizer save result shapes", () => {
-		for (const value of [
-			null,
-			false,
-			{ status: "unknown" },
-			{ status: "failed", diagnostic: "" },
-			{ status: "saved", artifactId: 7, complete: true },
-			{ status: "saved", artifactId: "7", complete: "false" },
-			{ artifactId: "7", complete: false, omittedBytes: "9" },
-		]) {
-			expect(normalizeMinimizedSaveResultForTests(value, "original")).toEqual({
-				status: "failed",
-				diagnostic: "artifact save returned an invalid result",
-			});
-		}
 	});
 
 	it("returns non-zero exit codes without cancellation", async () => {
@@ -137,184 +98,6 @@ describe("executeBash", () => {
 		expect(pending).toBeInstanceOf(Promise);
 		await pending;
 		expect(getShellSessionCount()).toBe(0);
-	});
-
-	it("evicts the least-recent idle persistent shell before rejecting a new session key", async () => {
-		await disposeAllShellSessions();
-		for (let index = 0; index < 64; index++) {
-			await executeBash(`export GJC_SHELL_SLOT=${index}`, {
-				cwd: tempDir,
-				timeout: 5000,
-				sessionKey: `idle-cap-${index}`,
-			});
-		}
-		expect(getShellSessionCount()).toBe(64);
-		const active = executeBash("sleep 0.2; printf ACTIVE", {
-			cwd: tempDir,
-			timeout: 5000,
-			sessionKey: "idle-cap-0",
-		});
-		const replacement = executeBash("true", { cwd: tempDir, timeout: 5000, sessionKey: "idle-cap-new" });
-		expect((await active).output).toBe("ACTIVE");
-		await replacement;
-		expect(getShellSessionCount()).toBe(64);
-		const recycled = await executeBash(`printf "%s" "\${GJC_SHELL_SLOT:-unset}"`, {
-			cwd: tempDir,
-			timeout: 5000,
-			sessionKey: "idle-cap-1",
-		});
-		expect(recycled.output).toBe("unset");
-		expect(getShellSessionCount()).toBe(64);
-	});
-
-	it("honors aborts delivered while idle-shell eviction admission is pending", async () => {
-		await disposeAllShellSessions();
-		for (let index = 0; index < 64; index++) {
-			await executeBash("true", { cwd: tempDir, timeout: 5000, sessionKey: `admission-abort-${index}` });
-		}
-		const abortGate = Promise.withResolvers<void>();
-		const realAbort = piNatives.Shell.prototype.abort;
-		const abortSpy = vi.spyOn(piNatives.Shell.prototype, "abort").mockImplementation(async function (this: Shell) {
-			await abortGate.promise;
-			return realAbort.call(this);
-		});
-		const controller = new AbortController();
-		const execution = executeBash("printf SHOULD_NOT_RUN", {
-			cwd: tempDir,
-			timeout: 5000,
-			sessionKey: "admission-abort-new",
-			signal: controller.signal,
-		});
-		while (abortSpy.mock.calls.length === 0) await Bun.sleep(1);
-		controller.abort();
-		abortGate.resolve();
-		const result = await execution;
-		expect(result.cancelled).toBe(true);
-		expect(result.output).not.toContain("SHOULD_NOT_RUN");
-	});
-
-	it("removes persistent sessions after native timeout results", async () => {
-		vi.spyOn(piNatives.Shell.prototype, "run").mockResolvedValue({
-			exitCode: undefined,
-			cancelled: false,
-			timedOut: true,
-		});
-
-		await executeBash("ignored", { cwd: tempDir, timeout: 5000, sessionKey: "native-timeout-result" });
-		expect(getShellSessionCount()).toBe(0);
-	});
-
-	it("removes persistent sessions after native run rejection", async () => {
-		vi.spyOn(piNatives.Shell.prototype, "run").mockRejectedValue(new Error("native run rejected"));
-
-		await expect(
-			executeBash("ignored", { cwd: tempDir, timeout: 5000, sessionKey: "native-rejection" }),
-		).rejects.toThrow("native run rejected");
-		expect(getShellSessionCount()).toBe(0);
-	});
-
-	it("removes persistent sessions after synchronous native run throws", async () => {
-		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation(() => {
-			throw new Error("native sync throw");
-		});
-
-		await expect(
-			executeBash("ignored", { cwd: tempDir, timeout: 5000, sessionKey: "native-sync-throw" }),
-		).rejects.toThrow("native sync throw");
-		expect(getShellSessionCount()).toBe(0);
-	});
-
-	it("surfaces partial output and uncertainty when native run rejects", async () => {
-		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation((_options, onChunk) => {
-			onChunk?.(null, "partial-before-rejection\n");
-			return Promise.reject(new Error("native rejected after output"));
-		});
-
-		await expect(
-			executeBash("ignored", { cwd: tempDir, timeout: 5000, sessionKey: "native-partial-rejection" }),
-		).rejects.toThrow(/partial-before-rejection[\s\S]*Source capture completeness could not be proven/);
-		expect(getShellSessionCount()).toBe(0);
-	});
-
-	it("preserves whitespace-only partial output when native run rejects", async () => {
-		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation((_options, onChunk) => {
-			onChunk?.(null, " \t\n");
-			return Promise.reject(new Error("native whitespace rejection"));
-		});
-		let caught: unknown;
-		try {
-			await executeBash("ignored", { cwd: tempDir, timeout: 5000, sessionKey: "native-whitespace-rejection" });
-		} catch (error) {
-			caught = error;
-		}
-		const message = caught instanceof Error ? caught.message : "";
-		expect(message.startsWith(" \t\n\nSource capture completeness could not be proven")).toBe(true);
-	});
-
-	it("bounds terminal artifact publication while recovering native rejection", async () => {
-		const publishGate = Promise.withResolvers<{
-			status: "published";
-			artifactId: string;
-		}>();
-		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation((_options, onChunk) => {
-			onChunk?.(null, "HEAD-TAIL");
-			return Promise.reject(new Error("native rejected with spill"));
-		});
-		let caught: unknown;
-		try {
-			await executeBash("ignored", {
-				cwd: tempDir,
-				timeout: 5000,
-				sessionKey: "native-rejection-publisher-stall",
-				spillThreshold: 4,
-				headBytes: 0,
-				artifactPublisher: async () => publishGate.promise,
-			});
-		} catch (error) {
-			caught = error;
-		}
-		const message = caught instanceof Error ? caught.message : "";
-		expect(message).toContain("did not settle within 500ms");
-		expect(message).toContain("native rejected with spill");
-		publishGate.resolve({ status: "published", artifactId: "13" });
-		await publishGate.promise;
-	});
-
-	it("bounds multibyte native rejection diagnostics", async () => {
-		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation((_options, onChunk) => {
-			onChunk?.(null, "retained-tail\n");
-			return Promise.reject(new Error("😀".repeat(100_000)));
-		});
-		let caught: unknown;
-		try {
-			await executeBash("ignored", { cwd: tempDir, timeout: 5000, sessionKey: "bounded-native-rejection" });
-		} catch (error) {
-			caught = error;
-		}
-		const message = caught instanceof Error ? caught.message : "";
-		expect(message).toContain("retained-tail");
-		expect(message).toContain("[native error truncated]");
-		expect(Buffer.byteLength(message, "utf-8")).toBeLessThan(5000);
-	});
-
-	it("bounds multibyte native rejection before the first output callback", async () => {
-		vi.spyOn(piNatives.Shell.prototype, "run").mockRejectedValue(new Error("😀".repeat(100_000)));
-		let caught: unknown;
-		try {
-			await executeBash("ignored", { cwd: tempDir, timeout: 5000, sessionKey: "bounded-empty-native-rejection" });
-		} catch (error) {
-			caught = error;
-		}
-		const message = caught instanceof Error ? caught.message : "";
-		expect(message).toContain("before any output was retained");
-		expect(message).toContain("[native error truncated]");
-		expect(Buffer.byteLength(message, "utf-8")).toBeLessThan(2000);
-	});
-
-	it("rejects injected direct executor artifact ids before execution", async () => {
-		for (const artifactId of ["bad\nid", "9007199254740992", "00", "01"]) {
-			await expect(executeBash("ignored", { cwd: tempDir, artifactId })).rejects.toThrow("Invalid Bash artifact id");
-		}
 	});
 
 	it("reports the bash shell-session owner count via runtime resource gauges", async () => {
@@ -401,332 +184,6 @@ describe("executeBash", () => {
 		expect(seenChunk ?? "").toContain("hello");
 	});
 
-	it("marks native callback loss as source truncation", async () => {
-		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation((_options, onChunk) => {
-			onChunk?.(null, "retained-tail\n");
-			return Promise.resolve({
-				exitCode: 0,
-				cancelled: false,
-				timedOut: false,
-				droppedOutputChunks: 2,
-				droppedOutputBytes: 17,
-			});
-		});
-
-		const result = await executeBash("ignored", {
-			cwd: tempDir,
-			timeout: 5000,
-			sessionKey: "native-callback-loss",
-		});
-
-		expect(result.output).toContain("retained-tail");
-		expect(result.truncated).toBe(true);
-		expect(result.sourceTruncatedBytes).toBe(17);
-		await disposeAllShellSessions();
-	});
-
-	it("fails closed when native reports dropped chunks without byte accounting", async () => {
-		vi.spyOn(piNatives.Shell.prototype, "run").mockResolvedValue({
-			exitCode: 0,
-			cancelled: false,
-			timedOut: false,
-			droppedOutputChunks: 1,
-			droppedOutputBytes: 0,
-		});
-
-		const result = await executeBash("ignored", {
-			cwd: tempDir,
-			timeout: 5000,
-			sessionKey: "chunks-only-source-loss",
-		});
-		expect(result.truncated).toBe(true);
-		expect(result.sourceCaptureIncomplete).toBe(true);
-		expect(result.sourceTruncatedBytes).toBeUndefined();
-	});
-
-	it("fails closed when native reports dropped bytes without chunk accounting", async () => {
-		vi.spyOn(piNatives.Shell.prototype, "run").mockResolvedValue({
-			exitCode: 0,
-			cancelled: false,
-			timedOut: false,
-			droppedOutputChunks: 0,
-			droppedOutputBytes: 9,
-		});
-		const result = await executeBash("ignored", {
-			cwd: tempDir,
-			timeout: 5000,
-			sessionKey: "bytes-only-source-loss",
-		});
-		expect(result.sourceTruncatedBytes).toBe(9);
-		expect(result.sourceCaptureIncomplete).toBe(true);
-	});
-
-	it("fails closed on malformed native loss counters", async () => {
-		vi.spyOn(piNatives.Shell.prototype, "run").mockResolvedValue({
-			exitCode: 0,
-			cancelled: false,
-			timedOut: false,
-			droppedOutputChunks: -1,
-			droppedOutputBytes: Number.NaN,
-		});
-
-		const result = await executeBash("ignored", {
-			cwd: tempDir,
-			timeout: 5000,
-			sessionKey: "malformed-source-loss",
-		});
-		expect(result.truncated).toBe(true);
-		expect(result.sourceCaptureIncomplete).toBe(true);
-	});
-
-	it("fails closed on one-sided zero callback-loss counters", async () => {
-		for (const nativeResult of [
-			{ exitCode: 0, cancelled: false, timedOut: false, droppedOutputBytes: 0 },
-			{ exitCode: 0, cancelled: false, timedOut: false, droppedOutputChunks: 0 },
-		]) {
-			vi.spyOn(piNatives.Shell.prototype, "run").mockResolvedValueOnce(nativeResult);
-			const result = await executeBash("ignored", {
-				cwd: tempDir,
-				timeout: 5000,
-				sessionKey: `one-sided-${"droppedOutputBytes" in nativeResult ? "bytes" : "chunks"}`,
-			});
-			expect(result.sourceCaptureIncomplete).toBe(true);
-		}
-	});
-
-	it("marks saturated native loss counters as source-incomplete", async () => {
-		vi.spyOn(piNatives.Shell.prototype, "run").mockResolvedValue({
-			exitCode: 0,
-			cancelled: false,
-			timedOut: false,
-			droppedOutputChunks: Number.MAX_SAFE_INTEGER,
-			droppedOutputBytes: Number.MAX_SAFE_INTEGER,
-			outputLossCountSaturated: true,
-		});
-
-		const result = await executeBash("ignored", {
-			cwd: tempDir,
-			timeout: 5000,
-			sessionKey: "saturated-source-loss",
-		});
-
-		expect(result.sourceTruncatedBytes).toBe(Number.MAX_SAFE_INTEGER);
-		expect(result.sourceCaptureIncomplete).toBe(true);
-	});
-
-	it("does not label minimized source-loss artifacts as complete", async () => {
-		vi.spyOn(piNatives.Shell.prototype, "run").mockResolvedValue({
-			exitCode: 0,
-			cancelled: false,
-			timedOut: false,
-			droppedOutputChunks: 1,
-			droppedOutputBytes: 9,
-			minimized: {
-				filter: "test",
-				text: "minimized output",
-				originalText: "partial raw output",
-				inputBytes: 18,
-				outputBytes: 16,
-			},
-		});
-
-		const result = await executeBash("ignored", {
-			cwd: tempDir,
-			timeout: 5000,
-			sessionKey: "minimized-source-loss",
-			onMinimizedSave: async () => ({ status: "saved", artifactId: "42", complete: true }),
-		});
-
-		expect(result.output).toContain("artifact save could not be verified in the current session");
-		expect(result.output).not.toContain("artifact://42");
-		expect(result.sourceTruncatedBytes).toBe(9);
-	});
-
-	it("does not label chunk-only minimized artifacts as complete", async () => {
-		vi.spyOn(piNatives.Shell.prototype, "run").mockResolvedValue({
-			exitCode: 0,
-			cancelled: false,
-			timedOut: false,
-			droppedOutputChunks: 1,
-			droppedOutputBytes: 0,
-			minimized: {
-				filter: "test",
-				text: "minimized output",
-				originalText: "original output",
-				inputBytes: 15,
-				outputBytes: 16,
-			},
-		});
-		const result = await executeBash("ignored", {
-			cwd: tempDir,
-			timeout: 5000,
-			sessionKey: "minimized-chunks-only",
-			onMinimizedSave: async () => ({ status: "saved", artifactId: "12", complete: true }),
-		});
-		expect(result.output).toContain("artifact save could not be verified in the current session");
-		expect(result.output).not.toContain("artifact://12");
-		expect(result.sourceCaptureIncomplete).toBe(true);
-	});
-
-	it("emits the raw-output artifact footer for lossless minimized saves", async () => {
-		vi.spyOn(piNatives.Shell.prototype, "run").mockResolvedValue({
-			exitCode: 0,
-			cancelled: false,
-			timedOut: false,
-			minimized: {
-				filter: "test",
-				text: "minimized output",
-				originalText: "original output",
-				inputBytes: 15,
-				outputBytes: 16,
-			},
-		});
-		const result = await executeBash("ignored", {
-			cwd: tempDir,
-			timeout: 5000,
-			sessionKey: "minimized-clean-save",
-			onMinimizedSave: async () => ({ status: "saved", artifactId: "42", complete: true }),
-		});
-		expect(result.output).toContain("[raw output: artifact://42]");
-		expect(result.output).not.toContain("artifact save could not be verified");
-		expect(result.sourceCaptureIncomplete).toBeFalsy();
-	});
-
-	it("labels capped lossless minimized saves with omitted byte counts", async () => {
-		vi.spyOn(piNatives.Shell.prototype, "run").mockResolvedValue({
-			exitCode: 0,
-			cancelled: false,
-			timedOut: false,
-			minimized: {
-				filter: "test",
-				text: "minimized output",
-				originalText: "original output",
-				inputBytes: 15,
-				outputBytes: 16,
-			},
-		});
-		const result = await executeBash("ignored", {
-			cwd: tempDir,
-			timeout: 5000,
-			sessionKey: "minimized-capped-save",
-			onMinimizedSave: async () => ({ status: "saved", artifactId: "43", complete: false, omittedBytes: 7 }),
-		});
-		expect(result.output).toContain("[raw output retained (7 bytes omitted): artifact://43]");
-		expect(result.output).not.toContain("artifact save could not be verified");
-	});
-
-	it("fails closed on malformed native capture-status flags", async () => {
-		for (const malformed of [null, 0]) {
-			vi.spyOn(piNatives.Shell.prototype, "run").mockResolvedValueOnce({
-				exitCode: 0,
-				cancelled: false,
-				timedOut: false,
-				outputCaptureIncomplete: malformed,
-				outputLossCountSaturated: malformed,
-			} as never);
-			const result = await executeBash("ignored", {
-				cwd: tempDir,
-				timeout: 5000,
-				sessionKey: `malformed-native-flags-${String(malformed)}`,
-			});
-			expect(result.sourceCaptureIncomplete).toBe(true);
-		}
-	});
-
-	it("rejects inconsistent native minimizer telemetry before saving", async () => {
-		const saveSpy = vi.fn(async () => ({ status: "saved" as const, artifactId: "15", complete: true as const }));
-		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation((_options, onChunk) => {
-			onChunk?.(null, "retained raw output");
-			return Promise.resolve({
-				exitCode: 0,
-				cancelled: false,
-				timedOut: false,
-				minimized: {
-					filter: "test",
-					text: "minimized output",
-					originalText: "partial raw output",
-					inputBytes: 999,
-					outputBytes: 16,
-				},
-			});
-		});
-		const result = await executeBash("ignored", {
-			cwd: tempDir,
-			timeout: 5000,
-			sessionKey: "malformed-minimizer-telemetry",
-			onMinimizedSave: saveSpy,
-		});
-		expect(saveSpy).not.toHaveBeenCalled();
-		expect(result.output).toContain("retained raw output");
-		expect(result.sourceCaptureIncomplete).toBe(true);
-	});
-
-	it("bounds stalled minimized artifact saves", async () => {
-		const saveGate = Promise.withResolvers<BashMinimizedSaveReturn>();
-		vi.spyOn(piNatives.Shell.prototype, "run").mockResolvedValue({
-			exitCode: 0,
-			cancelled: false,
-			timedOut: false,
-			minimized: {
-				filter: "test",
-				text: "minimized output",
-				originalText: "original output",
-				inputBytes: 15,
-				outputBytes: 16,
-			},
-		});
-		const raced = await Promise.race([
-			executeBash("ignored", {
-				cwd: tempDir,
-				timeout: 5000,
-				sessionKey: "stalled-minimizer-save",
-				onMinimizedSave: async () => saveGate.promise,
-			}),
-			Bun.sleep(750).then(() => undefined),
-		]);
-		expect(raced).toBeDefined();
-		expect(raced?.output).toContain("did not settle within 500ms");
-		saveGate.resolve({ status: "unavailable" });
-		await saveGate.promise;
-	});
-
-	it("applies callback loss when native abort settles during cleanup", async () => {
-		const nativeResult = Promise.withResolvers<{
-			exitCode: undefined;
-			cancelled: true;
-			timedOut: false;
-			droppedOutputChunks: number;
-			droppedOutputBytes: number;
-		}>();
-		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation((_options, onChunk) => {
-			onChunk?.(null, "retained-tail\n");
-			return nativeResult.promise;
-		});
-		vi.spyOn(piNatives.Shell.prototype, "abort").mockResolvedValue();
-		const controller = new AbortController();
-		const promise = executeBash("ignored", {
-			cwd: tempDir,
-			timeout: 5000,
-			signal: controller.signal,
-			sessionKey: "settled-abort-loss",
-		});
-
-		await Bun.sleep(10);
-		controller.abort();
-		nativeResult.resolve({
-			exitCode: undefined,
-			cancelled: true,
-			timedOut: false,
-			droppedOutputChunks: 2,
-			droppedOutputBytes: 17,
-		});
-		const result = await promise;
-
-		expect(result.cancelled).toBe(true);
-		expect(result.sourceTruncatedBytes).toBe(17);
-		expect(result.sourceCaptureIncomplete).toBeUndefined();
-	});
-
 	it("returns even if command spawns a background job", async () => {
 		if (process.platform === "win32") {
 			return;
@@ -797,39 +254,18 @@ describe("executeBash", () => {
 		expect(result.output).toContain("Command cancelled");
 	});
 
-	it("keeps timed-out disposal shells counted until abort settles", async () => {
-		await executeBash("printf ready", {
-			cwd: tempDir,
-			timeout: 5000,
-			sessionKey: "stalled-disposal-owner",
-		});
-		expect(getShellSessionCount()).toBe(1);
-		const abortGate = Promise.withResolvers<void>();
-		vi.spyOn(piNatives.Shell.prototype, "abort").mockImplementation(async () => abortGate.promise);
-
-		await disposeAllShellSessions();
-		expect(getShellSessionCount()).toBe(1);
-		abortGate.resolve();
-		await abortGate.promise;
-		await Promise.resolve();
-		await Promise.resolve();
-		await Promise.resolve();
-		expect(getShellSessionCount()).toBe(0);
-	});
-
 	it("returns promptly and quarantines the session key when native abort cleanup stalls", async () => {
 		if (process.platform === "win32") {
 			return;
 		}
 
-		const stalledRun = Promise.withResolvers<piNatives.ShellRunResult>();
 		const originalRun = piNatives.Shell.prototype.run;
 		let runCalls = 0;
 		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation(function (this: Shell, options, onChunk) {
 			runCalls++;
 			if (runCalls === 1) {
 				onChunk?.(null, "started\n");
-				return stalledRun.promise;
+				return new Promise(() => {});
 			}
 			return originalRun.call(this, options, onChunk);
 		});
@@ -854,10 +290,8 @@ describe("executeBash", () => {
 		if (raced.type === "result") {
 			expect(raced.result.cancelled).toBe(true);
 			expect(raced.result.output).toContain("Command cancelled");
-			expect(raced.result.sourceCaptureIncomplete).toBe(true);
 		}
-		expect(abortSpy).not.toHaveBeenCalled();
-		expect(getShellSessionCount()).toBe(1);
+		expect(abortSpy).toHaveBeenCalled();
 
 		const next = await executeBash("echo next", {
 			cwd: tempDir,
@@ -866,130 +300,6 @@ describe("executeBash", () => {
 		});
 		expect(next.output.trim()).toBe("next");
 		expect(runCalls).toBe(1);
-		expect(getShellSessionCount()).toBe(1);
-		stalledRun.resolve({ exitCode: undefined, cancelled: true, timedOut: false });
-		await stalledRun.promise;
-		await Promise.resolve();
-		expect(getShellSessionCount()).toBe(0);
-	});
-
-	it("returns promptly without invoking session-wide abort", async () => {
-		const runStarted = Promise.withResolvers<void>();
-		const stalledRun = Promise.withResolvers<piNatives.ShellRunResult>();
-		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation((_options, onChunk) => {
-			onChunk?.(null, "started\n");
-			runStarted.resolve();
-			return stalledRun.promise;
-		});
-		const abortSpy = vi.spyOn(piNatives.Shell.prototype, "abort").mockImplementation(() => {
-			throw new Error("sync abort failure");
-		});
-		const controller = new AbortController();
-		const promise = executeBash("sleep 10", {
-			cwd: tempDir,
-			timeout: 5000,
-			signal: controller.signal,
-			sessionKey: "sync-native-abort",
-		});
-		await runStarted.promise;
-		controller.abort();
-
-		const raced = await Promise.race([
-			promise.then(result => ({ type: "result" as const, result })),
-			Bun.sleep(750).then(() => ({ type: "timeout" as const })),
-		]);
-		expect(raced.type).toBe("result");
-		if (raced.type === "result") {
-			expect(raced.result.cancelled).toBe(true);
-			expect(raced.result.sourceCaptureIncomplete).toBe(true);
-		}
-		expect(abortSpy).not.toHaveBeenCalled();
-		stalledRun.resolve({ exitCode: undefined, cancelled: true, timedOut: false });
-		await stalledRun.promise;
-		await Promise.resolve();
-	});
-
-	it("keeps a shell retired until a surviving queued run settles", async () => {
-		const firstStarted = Promise.withResolvers<void>();
-		const secondStarted = Promise.withResolvers<void>();
-		const firstResult = Promise.withResolvers<piNatives.ShellRunResult>();
-		const secondResult = Promise.withResolvers<piNatives.ShellRunResult>();
-		let calls = 0;
-		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation(() => {
-			calls++;
-			if (calls === 1) {
-				firstStarted.resolve();
-				return firstResult.promise;
-			}
-			secondStarted.resolve();
-			return secondResult.promise;
-		});
-		vi.spyOn(piNatives.Shell.prototype, "abort").mockResolvedValue();
-		const controller = new AbortController();
-		const first = executeBash("first", {
-			cwd: tempDir,
-			timeout: 5000,
-			signal: controller.signal,
-			sessionKey: "queued-retirement",
-		});
-		await firstStarted.promise;
-		const second = executeBash("second", {
-			cwd: tempDir,
-			timeout: 5000,
-			sessionKey: "queued-retirement",
-		});
-		await secondStarted.promise;
-		controller.abort();
-		firstResult.resolve({ exitCode: undefined, cancelled: true, timedOut: false });
-		await first;
-		expect(getShellSessionCount()).toBe(1);
-		secondResult.resolve({ exitCode: 0, cancelled: false, timedOut: false });
-		await second;
-		await Promise.resolve();
-		expect(getShellSessionCount()).toBe(0);
-	});
-
-	it("queued cancellation does not abort the active shell run", async () => {
-		const firstStarted = Promise.withResolvers<void>();
-		const secondStarted = Promise.withResolvers<void>();
-		const firstResult = Promise.withResolvers<piNatives.ShellRunResult>();
-		let calls = 0;
-		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation(options => {
-			calls++;
-			if (calls === 1) {
-				firstStarted.resolve();
-				return firstResult.promise;
-			}
-			secondStarted.resolve();
-			return new Promise(resolve => {
-				(options as { signal?: AbortSignal }).signal?.addEventListener(
-					"abort",
-					() => resolve({ exitCode: undefined, cancelled: true, timedOut: false }),
-					{ once: true },
-				);
-			});
-		});
-		const abortSpy = vi.spyOn(piNatives.Shell.prototype, "abort").mockResolvedValue();
-		const first = executeBash("first", { cwd: tempDir, timeout: 5000, sessionKey: "queued-cancel-isolation" });
-		await firstStarted.promise;
-		const controller = new AbortController();
-		const second = executeBash("second", {
-			cwd: tempDir,
-			timeout: 5000,
-			signal: controller.signal,
-			sessionKey: "queued-cancel-isolation",
-		});
-		await secondStarted.promise;
-		controller.abort();
-		const secondOutcome = await second;
-		expect(secondOutcome.cancelled).toBe(true);
-		expect(abortSpy).not.toHaveBeenCalled();
-
-		firstResult.resolve({ exitCode: 0, cancelled: false, timedOut: false });
-		const firstOutcome = await first;
-		expect(firstOutcome.cancelled).toBe(false);
-		await Promise.resolve();
-		expect(getShellSessionCount()).toBe(0);
 	});
 
 	it("restores persistent sessions after native abort cleanup settles", async () => {
@@ -1037,10 +347,9 @@ describe("executeBash", () => {
 			return;
 		}
 
-		const stalledRun = Promise.withResolvers<piNatives.ShellRunResult>();
 		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation((_options, onChunk) => {
 			onChunk?.(null, "started\n");
-			return stalledRun.promise;
+			return new Promise(() => {});
 		});
 		const abortSpy = vi.spyOn(piNatives.Shell.prototype, "abort").mockResolvedValue();
 
@@ -1058,12 +367,8 @@ describe("executeBash", () => {
 		if (raced.type === "result") {
 			expect(raced.result.cancelled).toBe(true);
 			expect(raced.result.output).toContain("Command timed out after 1 seconds");
-			expect(raced.result.sourceCaptureIncomplete).toBe(true);
 		}
-		expect(abortSpy).not.toHaveBeenCalled();
-		stalledRun.resolve({ exitCode: undefined, cancelled: true, timedOut: false });
-		await stalledRun.promise;
-		await Promise.resolve();
+		expect(abortSpy).toHaveBeenCalled();
 	});
 
 	it("aborts before follow-up output", async () => {
@@ -1189,12 +494,12 @@ describe("executeBash", () => {
 		expect(result.exitCode).toBe(0);
 		expect(result.cancelled).toBe(false);
 
-		// Native execution bounds pathological streams but preserves a terminal tail
-		// and reports the omitted source bytes explicitly.
+		// Native execution may cap pathological streams before JavaScript sees every
+		// generated line. Keep the regression contract strong enough to prove we
+		// streamed a large bounded capture, not just a tiny non-empty placeholder.
 		expect(result.totalLines).toBeGreaterThan(100_000);
 		expect(result.totalBytes).toBeGreaterThan(DEFAULT_MAX_BYTES * 100);
 		expect(result.truncated).toBe(true);
-		expect(result.sourceTruncatedBytes ?? 0).toBeGreaterThan(0);
 
 		// Direct executor output remains bounded by the shared head+tail window.
 		expect(result.outputBytes).toBeLessThan(result.totalBytes);
@@ -1206,7 +511,7 @@ describe("executeBash", () => {
 			.slice(-1000)
 			.map(line => Number(line.trim()))
 			.filter(Number.isFinite);
-		expect(tailValues.some(value => value >= lineCount - 500 && value <= lineCount)).toBe(true);
+		expect(tailValues.some(value => value >= result.totalLines - 500 && value <= result.totalLines)).toBe(true);
 
 		// With 64KB read buffer, ~40MB should produce ~600 chunks, not 5M.
 		// Allow generous headroom but ensure it's orders of magnitude below lineCount.
@@ -1371,22 +676,15 @@ describe("executeBash", () => {
 		const marker = path.join(tempDir, "marker-bg.txt");
 		const markerEscaped = marker.replace(/'/g, "'\\''");
 
-		const outcome = await executeBash(
+		const result = await executeBash(
 			`{ sleep ${KILL_MARKER_DELAY_SECONDS}; echo done > '${markerEscaped}'; } & sleep 10`,
 			{
 				cwd: tempDir,
 				timeout: 100,
 			},
-		).then(
-			result => ({ kind: "settled" as const, result }),
-			error => ({ kind: "ownership-incomplete" as const, error }),
 		);
 
-		if (outcome.kind === "settled") expect(outcome.result.cancelled).toBe(true);
-		else
-			expect(outcome.error instanceof Error ? outcome.error.message : String(outcome.error)).toMatch(
-				/ownership incomplete/i,
-			);
+		expect(result.cancelled).toBe(true);
 
 		await Bun.sleep(KILL_MARKER_ASSERTION_WAIT_MS);
 		expect(fs.existsSync(marker)).toBe(false);

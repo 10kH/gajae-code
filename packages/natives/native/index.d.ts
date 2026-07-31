@@ -2190,17 +2190,6 @@ export interface ShellRunResult {
   /** Whether the command timed out before completion. */
   timedOut: boolean
   /**
-   * Whether the core output reader failed to settle before execution
-   * returned.
-   */
-  outputCaptureIncomplete?: boolean
-  /** Chunks dropped before the JavaScript output callback could receive them. */
-  droppedOutputChunks?: number
-  /** Bytes dropped before the JavaScript output callback could receive them. */
-  droppedOutputBytes?: number
-  /** Whether a loss counter exceeded JavaScript's exact integer range. */
-  outputLossCountSaturated?: boolean
-  /**
    * When the minimizer rewrote the captured output, this carries the
    * original buffer + telemetry so the session layer can persist it as
    * an artifact and splice an `artifact://<id>` reference into the

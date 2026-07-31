@@ -55,17 +55,6 @@ function hasInteriorMiddleLine(content: string, minimum = 1_000, maximum = 5_000
 	});
 }
 
-const WRITE_BASH_TEST_PAYLOAD_COMMAND = `${JSON.stringify(process.execPath)} -e 'process.stdout.write(process.env.BASH_TEST_PAYLOAD ?? "")'`;
-
-function buildMiddlePayload(count: number, includeTail = true): string {
-	return [
-		"HEAD",
-		...Array.from({ length: count }, (_, index) => `middle-${String(index + 1).padStart(5, "0")}`),
-		...(includeTail ? ["TAIL"] : []),
-		"",
-	].join("\n");
-}
-
 function writeFileWithMtime(filePath: string, content: string, mtimeMs: number): void {
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
 	fs.writeFileSync(filePath, content);
@@ -230,7 +219,7 @@ function createTestToolSession(
 		getArtifactsDir: () => sessionDir,
 		allocateOutputArtifact: async (toolType: string) => {
 			fs.mkdirSync(sessionDir, { recursive: true });
-			const id = String(++artifactCounter);
+			const id = `artifact-${++artifactCounter}`;
 			return { id, path: path.join(sessionDir, `${id}.${toolType}.log`) };
 		},
 		settings,
@@ -1122,32 +1111,9 @@ function b() {
 		});
 
 		it("should keep only the tail of truncated output by default and write the full artifact", async () => {
-			const manager = SessionManager.create(
-				testDir,
-				SessionManager.explicitDestination(path.join(testDir, "verified-session")),
-			);
-			await manager.ensureOnDisk();
-			const verifiedTool = wrapToolWithMetaNotice(
-				new BashTool(
-					createTestToolSession(testDir, Settings.isolated(), {
-						getSessionFile: () => manager.getSessionFile()!,
-						getArtifactsDir: () => manager.getArtifactsDir()!,
-						allocateOutputArtifact: toolType => manager.allocateArtifactPath(toolType),
-					}),
-				),
-			);
-			const payload = buildMiddlePayload(6_000);
-			const command = WRITE_BASH_TEST_PAYLOAD_COMMAND;
-			const result = await verifiedTool.execute(
-				"test-call-8-artifact",
-				{
-					command,
-					env: { BASH_TEST_PAYLOAD: payload },
-				},
-				undefined,
-				undefined,
-				{ ...createTestToolContext(["bash"]), sessionManager: manager },
-			);
+			const result = await bashTool.execute("test-call-8-artifact", {
+				command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..6000}; printf 'TAIL\\n'",
+			});
 			const output = getTextOutput(result);
 			const truncation = result.details?.meta?.truncation;
 
@@ -1157,36 +1123,30 @@ function b() {
 			expect(truncation?.headRange).toBeUndefined();
 			expect(truncation?.outputBytes).toBe(1024);
 			const artifactId = truncation?.artifactId;
-			expect(artifactId).toBeUndefined();
+			expect(artifactId).toBeDefined();
+			if (artifactId) {
+				const artifactPath = path.join(testDir, "session", `${artifactId}.bash.log`);
+				expect(fs.existsSync(artifactPath)).toBe(true);
+				const artifact = fs.readFileSync(artifactPath, "utf-8");
+				expect(artifact).toContain("HEAD");
+				expect(artifact).toContain("middle-03000");
+				expect(artifact).toContain("TAIL");
+			}
 		});
 
 		it("publishes truncated output through managed storage without a writable path", async () => {
-			const sessionManager = SessionManager.create(
-				testDir,
-				SessionManager.explicitDestination(path.join(testDir, "managed-session")),
-			);
-			await sessionManager.ensureOnDisk();
-			const manager = new ArtifactManager(sessionManager.getArtifactsDir()!);
+			const manager = new ArtifactManager(path.join(testDir, "managed-artifacts"));
 			const tool = wrapToolWithMetaNotice(
 				new BashTool(
 					createTestToolSession(testDir, Settings.isolated(), {
-						getSessionFile: () => sessionManager.getSessionFile()!,
-						getArtifactsDir: () => sessionManager.getArtifactsDir()!,
-						allocateOutputArtifact: async () => ({ id: "40" }),
+						allocateOutputArtifact: async () => ({ id: "reserved-managed-id" }),
 						getArtifactManager: () => manager,
 					}),
 				),
 			);
-			const result = await tool.execute(
-				"test-call-managed-artifact",
-				{
-					command: WRITE_BASH_TEST_PAYLOAD_COMMAND,
-					env: { BASH_TEST_PAYLOAD: buildMiddlePayload(400) },
-				},
-				undefined,
-				undefined,
-				{ ...createTestToolContext(["bash"]), sessionManager },
-			);
+			const result = await tool.execute("test-call-managed-artifact", {
+				command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..400}; printf 'TAIL\\n'",
+			});
 			const truncation = result.details?.meta?.truncation;
 			const artifactId = truncation?.artifactId;
 
@@ -1201,23 +1161,6 @@ function b() {
 			expect(artifact).toContain("HEAD");
 			expect(artifact).toContain("middle-00200");
 			expect(artifact).toContain("TAIL");
-		});
-
-		it("rejects metadata-sidecar and symlink matches as artifact path proof", async () => {
-			const artifactDir = path.join(testDir, "artifact-proof");
-			const manager = new ArtifactManager(artifactDir);
-			const id = await manager.save("trusted", "bash");
-			const artifactPath = await manager.getPath(id);
-			expect(artifactPath).not.toBeNull();
-			if (!artifactPath) throw new Error("expected artifact path");
-			const filename = path.basename(artifactPath);
-			const replacement = path.join(artifactDir, "replacement.txt");
-			await Bun.write(replacement, "replacement");
-			fs.unlinkSync(artifactPath);
-			fs.symlinkSync(replacement, artifactPath);
-			await Bun.write(path.join(artifactDir, `${filename}.meta.json`), "{}");
-
-			expect(await manager.getPath(id)).toBeNull();
 		});
 
 		it("reports artifact writer creation failure without publishing an artifact id", async () => {
@@ -1320,7 +1263,7 @@ function b() {
 			const allocationSession = createTestToolSession(testDir, Settings.isolated(), {
 				getArtifactManager: undefined,
 				allocateOutputArtifact: async toolType => {
-					const artifactId = "41";
+					const artifactId = "allocated-bash-original";
 					const artifactPath = path.join(testDir, "session", `${artifactId}.${toolType}.log`);
 					fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
 					return { id: artifactId, path: artifactPath };
@@ -1328,54 +1271,10 @@ function b() {
 			});
 
 			const artifactId = await saveBashOriginalArtifactForTests(allocationSession, originalText);
-			expect(artifactId).toBe("41");
+			expect(artifactId).toBe("allocated-bash-original");
 			if (!artifactId) throw new Error("expected allocated original artifact id");
 			const artifactPath = path.join(testDir, "session", `${artifactId}.bash-original.log`);
 			expect(fs.readFileSync(artifactPath, "utf-8")).toBe(originalText);
-		});
-
-		it("rejects injected original-output artifact IDs", async () => {
-			let saveResult: BashOriginalArtifactSaveResult | undefined;
-			const invalidSession = createTestToolSession(testDir, Settings.isolated(), {
-				getArtifactManager: () => ({ save: async () => "bad\nid" }) as unknown as ArtifactManager,
-			});
-
-			const artifactId = await saveBashOriginalArtifactForTests(invalidSession, "original", result => {
-				saveResult = result;
-			});
-			expect(artifactId).toBeUndefined();
-			expect(saveResult).toEqual({ status: "failed", diagnostic: "storage returned an invalid artifact id" });
-		});
-
-		it("keeps direct, async, and monitor execution nonfatal when artifact allocation rejects", async () => {
-			const manager = new AsyncJobManager({ onJobComplete: async () => {} });
-			AsyncJobManager.setInstance(manager);
-			const tool = new BashTool(
-				createTestToolSession(
-					testDir,
-					Settings.isolated({ "async.enabled": true, "bash.autoBackground.enabled": false }),
-					{
-						getSessionId: () => "allocation-rejection",
-						allocateOutputArtifact: async () => {
-							throw new Error("allocator unavailable");
-						},
-					},
-				),
-			);
-
-			const direct = await tool.execute("allocation-direct", { command: "printf direct" });
-			expect(getTextOutput(direct)).toContain("direct");
-
-			const asyncStarted = await tool.execute("allocation-async", { command: "printf async", async: true });
-			const asyncJobId = asyncStarted.details?.async?.jobId;
-			expect(asyncJobId).toBeDefined();
-			await manager.getJob(asyncJobId!)?.promise;
-			expect(manager.getJob(asyncJobId!)?.status).toBe("completed");
-
-			const monitorStarted = await tool.startMonitorJob({ command: "printf monitor" }, {});
-			await manager.getJob(monitorStarted.jobId)?.promise;
-			expect(manager.getJob(monitorStarted.jobId)?.status).toBe("completed");
-			await manager.dispose();
 		});
 
 		it("surfaces artifact writer diagnostics on successful Bash results", async () => {
@@ -1383,15 +1282,14 @@ function b() {
 				new BashTool(
 					createTestToolSession(testDir, Settings.isolated(), {
 						allocateOutputArtifact: async () => ({
-							id: "42",
+							id: "writer-failure",
 							path: path.join(testDir, "missing-bash-artifact-parent", "output.log"),
 						}),
 					}),
 				),
 			);
 			const result = await failingTool.execute("test-writer-failure", {
-				command: WRITE_BASH_TEST_PAYLOAD_COMMAND,
-				env: { BASH_TEST_PAYLOAD: "x".repeat(2_000) },
+				command: "printf 'x%.0s' {1..2000}",
 			});
 			const text = getTextOutput(result);
 
@@ -1404,7 +1302,7 @@ function b() {
 			const failingTool = new BashTool(
 				createTestToolSession(testDir, Settings.isolated(), {
 					allocateOutputArtifact: async () => ({
-						id: "43",
+						id: "writer-failure-command",
 						path: path.join(testDir, "missing-bash-failure-parent", "output.log"),
 					}),
 				}),
@@ -1413,8 +1311,7 @@ function b() {
 			let caught: unknown;
 			try {
 				await failingTool.execute("test-writer-failure-command", {
-					command: `${WRITE_BASH_TEST_PAYLOAD_COMMAND}; exit 7`,
-					env: { BASH_TEST_PAYLOAD: "x".repeat(2_000) },
+					command: "printf 'x%.0s' {1..2000}; exit 7",
 				});
 			} catch (error) {
 				caught = error;
@@ -1474,8 +1371,7 @@ function b() {
 			let caught: unknown;
 			try {
 				await bashTool.execute("test-call-9-noisy-exit", {
-					command: `${WRITE_BASH_TEST_PAYLOAD_COMMAND}; exit 7`,
-					env: { BASH_TEST_PAYLOAD: buildMiddlePayload(6_000) },
+					command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..6000}; printf 'TAIL\\n'; exit 7",
 				});
 			} catch (error) {
 				caught = error;
@@ -1484,8 +1380,15 @@ function b() {
 			expect(caught).toBeInstanceOf(Error);
 			const message = caught instanceof Error ? caught.message : "";
 			expect(message).toContain("Command exited with code 7");
-			expect(message).not.toContain("artifact://");
-			expect(message).toContain("Command exited with code 7");
+			const artifactId = /artifact:\/\/([A-Za-z0-9_-]+)/.exec(message)?.[1];
+			expect(artifactId).toBeDefined();
+			if (!artifactId) throw new Error("expected noisy-exit artifact id");
+			const artifactPath = path.join(testDir, "session", `${artifactId}.bash.log`);
+			expect(fs.existsSync(artifactPath)).toBe(true);
+			const artifact = fs.readFileSync(artifactPath, "utf-8");
+			expect(artifact).toContain("HEAD");
+			expect(hasInteriorMiddleLine(artifact)).toBe(true);
+			expect(artifact).toContain("TAIL");
 		});
 
 		it("bounds configured noisy errors while retaining status and artifact evidence", async () => {
@@ -1498,8 +1401,7 @@ function b() {
 			let caught: unknown;
 			try {
 				await configuredTool.execute("test-call-9-configured-noisy-exit", {
-					command: `${WRITE_BASH_TEST_PAYLOAD_COMMAND}; exit 23`,
-					env: { BASH_TEST_PAYLOAD: buildMiddlePayload(6_000) },
+					command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..6000}; printf 'TAIL\\n'; exit 23",
 				});
 			} catch (error) {
 				caught = error;
@@ -1509,15 +1411,14 @@ function b() {
 			const message = caught instanceof Error ? caught.message : "";
 			expect(Buffer.byteLength(message, "utf-8")).toBeLessThanOrEqual(4096);
 			expect(message).toContain("Command exited with code 23");
-			expect(message).not.toContain("artifact://");
+			expect(message).toMatch(/Read artifact:\/\/[A-Za-z0-9_-]+/);
 		});
 
 		it("keeps the structured timeout cause when command output says aborted", async () => {
 			let caught: unknown;
 			try {
 				await bashTool.execute("test-call-9-timeout-status-precedence", {
-					command: `${WRITE_BASH_TEST_PAYLOAD_COMMAND}; sleep 5`,
-					env: { BASH_TEST_PAYLOAD: `${"x".repeat(6_000)}\nCommand aborted\n` },
+					command: "printf 'x%.0s' {1..6000}; printf '\nCommand aborted\n'; sleep 5",
 					timeout: 1,
 				});
 			} catch (error) {
@@ -1529,15 +1430,14 @@ function b() {
 			expect(Buffer.byteLength(message, "utf-8")).toBeLessThanOrEqual(4096);
 			expect(message).toContain("Command aborted");
 			expect(message.trimEnd().endsWith("Command timed out after 1 seconds")).toBe(true);
-			expect(message).not.toContain("artifact://");
+			expect(message).toContain("artifact://");
 		});
 
 		it("should keep the artifact reference when noisy output times out", async () => {
 			let caught: unknown;
 			try {
 				await bashTool.execute("test-call-9-noisy-timeout", {
-					command: `${WRITE_BASH_TEST_PAYLOAD_COMMAND}; sleep 5`,
-					env: { BASH_TEST_PAYLOAD: buildMiddlePayload(6_000, false) },
+					command: "printf 'HEAD\\n'; printf 'middle-%05d\\n' {1..6000}; sleep 5",
 					timeout: 1,
 				});
 			} catch (error) {
@@ -1547,7 +1447,14 @@ function b() {
 			expect(caught).toBeInstanceOf(Error);
 			const message = caught instanceof Error ? caught.message : "";
 			expect(message).toContain("Command timed out after 1 seconds");
-			expect(message).not.toContain("artifact://");
+			const artifactId = /artifact:\/\/([A-Za-z0-9_-]+)/.exec(message)?.[1];
+			expect(artifactId).toBeDefined();
+			if (!artifactId) throw new Error("expected noisy-timeout artifact id");
+			const artifactPath = path.join(testDir, "session", `${artifactId}.bash.log`);
+			expect(fs.existsSync(artifactPath)).toBe(true);
+			const artifact = fs.readFileSync(artifactPath, "utf-8");
+			expect(artifact).toContain("HEAD");
+			expect(hasInteriorMiddleLine(artifact)).toBe(true);
 		});
 
 		it("should keep short commands inline when auto-background is enabled", async () => {
@@ -1648,11 +1555,12 @@ function b() {
 					{ getSessionId: () => "test-session" },
 				),
 			);
-			const payload = buildMiddlePayload(400);
-			const command = WRITE_BASH_TEST_PAYLOAD_COMMAND;
-			const env = { BASH_TEST_PAYLOAD: payload };
+			const middle = Array.from({ length: 400 }, (_, index) => `middle-${String(index).padStart(5, "0")}`).join(
+				"\\n",
+			);
+			const command = `printf 'HEAD\\n${middle}\\nTAIL\\n'`;
 
-			const asyncStarted = await tool.execute("test-call-async-tail", { command, env, async: true });
+			const asyncStarted = await tool.execute("test-call-async-tail", { command, async: true });
 			const asyncJobId = asyncStarted.details?.async?.jobId;
 			expect(asyncJobId).toBeDefined();
 			await asyncJobManager.getJob(asyncJobId!)?.promise;
@@ -1673,10 +1581,7 @@ function b() {
 			).filter((id): id is string => id !== undefined);
 			expect(asyncArtifactIds).toHaveLength(1);
 
-			const monitorStarted = await tool.startMonitorJob(
-				{ command, env },
-				{ onRawLine: line => monitorLines.push(line) },
-			);
+			const monitorStarted = await tool.startMonitorJob({ command }, { onRawLine: line => monitorLines.push(line) });
 			await asyncJobManager.getJob(monitorStarted.jobId)?.promise;
 			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
 			const monitorDelivery = deliveries.find(delivery => delivery.jobId === monitorStarted.jobId)?.text ?? "";
@@ -1909,38 +1814,28 @@ function b() {
 			AsyncJobManager.setInstance(manager);
 			try {
 				const controller = new AbortController();
-				const ready = Promise.withResolvers<void>();
 				const promise = bashTool.execute(
 					"test-call-10-abort",
 					{
-						command: `${WRITE_BASH_TEST_PAYLOAD_COMMAND}; sleep 60`,
-						env: { BASH_TEST_PAYLOAD: `${"x".repeat(2_000)}\nREADY\n` },
+						command: "printf 'x%.0s' {1..2000}; printf '\nREADY\n'; sleep 60",
 						timeout: 30,
 					},
 					controller.signal,
-					update => {
-						const text = update.content?.find(part => part.type === "text")?.text ?? "";
-						if (text.includes("READY")) ready.resolve();
-					},
 				);
-				await Promise.race([
-					ready.promise,
-					Bun.sleep(2_000).then(() => {
-						throw new Error("timed out waiting for Bash abort fixture output");
-					}),
-				]);
-				controller.abort("test abort");
+				const abortTimer = setTimeout(() => controller.abort("test abort"), 100);
 
 				let caught: unknown;
 				try {
 					await promise;
 				} catch (error) {
 					caught = error;
+				} finally {
+					clearTimeout(abortTimer);
 				}
 				expect(caught).toBeInstanceOf(Error);
 				const message = caught instanceof Error ? caught.message : "";
 				expect(message).toContain("Command aborted");
-				expect(message).not.toContain("artifact://");
+				expect(message).toContain("artifact://");
 				expect(Buffer.byteLength(message, "utf-8")).toBeLessThanOrEqual(4096);
 				const result = await bashTool.execute("test-call-10-after-abort", { command: "echo ok" });
 				expect(getTextOutput(result)).toContain("ok");

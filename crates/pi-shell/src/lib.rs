@@ -8,6 +8,6 @@ pub mod windows;
 
 pub use brush_core::commands::{ChildSessionAction, child_session_action};
 pub use shell::{
-	MinimizerResult, Shell, ShellExecuteOptions, ShellExecuteResult, ShellOptions, ShellOutputChunk,
-	ShellRunOptions, ShellRunResult, StreamSinks, execute_shell, execute_shell_streams,
+	MinimizerResult, Shell, ShellExecuteOptions, ShellExecuteResult, ShellOptions, ShellRunOptions,
+	ShellRunResult, StreamSinks, execute_shell, execute_shell_streams,
 };
