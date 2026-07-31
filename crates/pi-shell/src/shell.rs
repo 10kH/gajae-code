@@ -365,7 +365,7 @@ async fn run_shell_oneshot(
 	ct: CancelToken,
 ) -> Result<ShellExecuteResult> {
 	let tokio_cancel = CancellationToken::new();
-	let baseline_descendants = process::current_descendant_pids();
+	let baseline_descendants = process::DescendantBaseline::capture();
 
 	let mut task = tokio::spawn({
 		let tokio_cancel = tokio_cancel.clone();
@@ -424,7 +424,7 @@ async fn run_shell_oneshot_streams(
 	ct: CancelToken,
 ) -> Result<ShellExecuteResult> {
 	let tokio_cancel = CancellationToken::new();
-	let baseline_descendants = process::current_descendant_pids();
+	let baseline_descendants = process::DescendantBaseline::capture();
 
 	let mut task = tokio::spawn({
 		let tokio_cancel = tokio_cancel.clone();
@@ -693,7 +693,7 @@ async fn run_shell_command(
 	params.set_fd(OpenFiles::STDERR_FD, stderr_file);
 	params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
 	params.set_cancel_token(cancel_token.clone());
-	let baseline_descendants = process::current_descendant_pids();
+	let baseline_descendants = process::DescendantBaseline::capture();
 	let command_pgid = Arc::new(AtomicI32::new(0));
 	let reader_cancel = CancellationToken::new();
 	let (activity_tx, mut activity_rx) = mpsc::channel::<()>(1);
@@ -893,7 +893,7 @@ async fn run_shell_command_streams(
 	params.set_fd(OpenFiles::STDERR_FD, stderr_file);
 	params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
 	params.set_cancel_token(cancel_token.clone());
-	let baseline_descendants = process::current_descendant_pids();
+	let baseline_descendants = process::DescendantBaseline::capture();
 	let command_pgid = Arc::new(AtomicI32::new(0));
 	let reader_cancel = CancellationToken::new();
 	let (activity_tx, mut activity_rx) = mpsc::channel::<()>(1);
@@ -1101,13 +1101,18 @@ async fn read_output_bytes(
 // Rescan-and-signal loop for cancellation. Each pass picks up descendants
 // spawned during the previous wave's grace period, then exits as soon as no
 // targets remain so unrelated later commands are not swept into old cancels.
-async fn capture_new_process_group<S: std::hash::BuildHasher + Sync>(
-	baseline: HashSet<i32, S>,
+async fn capture_new_process_group(
+	baseline: process::DescendantBaseline,
 	command_pgid: Arc<AtomicI32>,
 ) {
+	if !baseline.observed() {
+		// Without a proven baseline every pre-existing helper looks new, so any
+		// pgid this probe published could belong to an unrelated process.
+		return;
+	}
 	for _ in 0..100 {
 		let mut targets = process::TerminationTargets::new();
-		let _ = process::add_new_descendants(&mut targets, &baseline);
+		let _ = process::add_new_descendants(&mut targets, baseline.pids());
 		if let Some(pgid) = targets.first_pgid() {
 			command_pgid.store(pgid, Ordering::SeqCst);
 			return;
@@ -1116,14 +1121,21 @@ async fn capture_new_process_group<S: std::hash::BuildHasher + Sync>(
 	}
 }
 
-async fn terminate_new_descendants<S: std::hash::BuildHasher + Sync>(
-	baseline: &HashSet<i32, S>,
-	command_pgid: i32,
-) {
+async fn terminate_new_descendants(baseline: &process::DescendantBaseline, command_pgid: i32) {
 	const WAVES: u32 = 3;
+	// An unproven baseline cannot be differenced safely: pre-existing processes
+	// would look newly spawned. Fall back to the one target we know is ours.
+	if !baseline.observed() {
+		if command_pgid > 0 {
+			let _ = process::kill_process_group(command_pgid, process::TERM_SIGNAL);
+			time::sleep(Duration::from_millis(75)).await;
+			let _ = process::kill_process_group(command_pgid, process::KILL_SIGNAL);
+		}
+		return;
+	}
 	for wave in 0..WAVES {
 		let mut targets = process::TerminationTargets::new();
-		let observed = process::add_new_descendants(&mut targets, baseline);
+		let observed = process::add_new_descendants(&mut targets, baseline.pids());
 		// Only an *observed* empty target set proves there is nothing left to kill.
 		// When the process tree could not be read, fall through and keep signalling
 		// the command's process group across every wave instead of reporting a
@@ -1784,7 +1796,7 @@ impl builtins::Command for TimeoutCommand {
 			}
 
 			let cancel_token = context.cancel_token();
-			let baseline_descendants = process::current_descendant_pids();
+			let baseline_descendants = process::DescendantBaseline::capture();
 			let command_pgid = Arc::new(AtomicI32::new(0));
 			let pgid_probe = tokio::spawn(capture_new_process_group(
 				baseline_descendants.clone(),
@@ -2477,7 +2489,7 @@ mod tests {
 		);
 
 		abort.abort(AbortReason::Signal);
-		terminate_new_descendants(&process::current_descendant_pids(), command_pgid).await;
+		terminate_new_descendants(&process::DescendantBaseline::capture(), command_pgid).await;
 		time::sleep(Duration::from_millis(500)).await;
 		run.abort();
 		let _ = run.await;

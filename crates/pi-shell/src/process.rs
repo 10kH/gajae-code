@@ -66,9 +66,19 @@ mod platform {
 		/// `None` when this process is live but its `/proc` task list could not be
 		/// read, i.e. the child set is unknown rather than empty.
 		pub fn children_observed(&self) -> Option<Vec<Self>> {
-			if !self.live_identity() {
-				// Not an observation failure: an exited process has no children.
+			// The pidfd-backed status is authoritative and errs toward `Running`, so
+			// `Exited` is real evidence the process is gone and genuinely has no
+			// children.
+			if self.status() == ProcessStatus::Exited {
 				return Some(Vec::new());
+			}
+			// Still running: the identity must be verifiable. An unreadable start
+			// time means the child set is unknown, not empty.
+			match read_start_time(self.pid) {
+				Some(start_time) if start_time == self.start_time => {},
+				// The pid was recycled, so the process we pinned is gone.
+				Some(_) => return Some(Vec::new()),
+				None => return None,
 			}
 
 			// `/proc/{pid}/task/{tid}/children` is per-task: a child fork()ed from a
@@ -84,26 +94,38 @@ mod platform {
 
 			let mut seen: HashSet<i32> = HashSet::new();
 			let mut out = Vec::new();
-			for entry in entries.flatten() {
+			for entry in entries {
+				// A failed directory entry read is an observation failure, not an
+				// absence of tasks; `flatten()` here would silently shrink the set.
+				let Ok(entry) = entry else {
+					return None;
+				};
 				let name = entry.file_name();
 				let Some(tid_str) = name.to_str() else {
-					continue;
+					return None;
 				};
 				if tid_str.parse::<i32>().is_err() {
+					// Non-numeric entries are not tasks; skipping them loses nothing.
 					continue;
 				}
 				let children_path = format!("/proc/{}/task/{}/children", self.pid, tid_str);
-				let Ok(content) = fs::read_to_string(&children_path) else {
-					continue;
+				let content = match fs::read_to_string(&children_path) {
+					Ok(content) => content,
+					Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+						// The task exited between listing and reading — expected race.
+						continue;
+					},
+					Err(_) => return None,
 				};
 				for part in content.split_whitespace() {
 					let Ok(child_pid) = part.parse::<i32>() else {
-						continue;
+						return None;
 					};
 					if !seen.insert(child_pid) {
 						continue;
 					}
 					let Some(child) = Self::from_pid(child_pid) else {
+						// The child exited before we could pin it — expected race.
 						continue;
 					};
 					if child.status() == ProcessStatus::Running
@@ -228,7 +250,7 @@ mod platform {
 				if visited.insert(child.pid) {
 					// A child that exits mid-walk is an expected race; only a failed
 					// read of a still-live child's task list is incompleteness.
-					if !child.descendants_into(out, visited) && child.live_identity() {
+					if !child.descendants_into(out, visited) {
 						complete = false;
 					}
 					out.push(child);
@@ -821,6 +843,9 @@ mod platform {
 	const PROCESS_BASIC_INFORMATION_CLASS: u32 = 0;
 	const STATUS_SUCCESS: NtStatus = 0;
 	const TH32CS_SNAPPROCESS: u32 = 0x00000002;
+	/// `Process32NextW` sets this once the snapshot is fully enumerated; any
+	/// other error means the walk was cut short.
+	const ERROR_NO_MORE_FILES: u32 = 18;
 	const PROCESS_TERMINATE: u32 = 0x0001;
 	const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 	const SYNCHRONIZE: u32 = 0x00100000;
@@ -833,6 +858,7 @@ mod platform {
 		fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> Handle;
 		fn Process32FirstW(hSnapshot: Handle, lppe: *mut PROCESSENTRY32W) -> i32;
 		fn Process32NextW(hSnapshot: Handle, lppe: *mut PROCESSENTRY32W) -> i32;
+		fn GetLastError() -> u32;
 		fn CloseHandle(hObject: Handle) -> i32;
 		fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> Handle;
 		fn TerminateProcess(hProcess: Handle, uExitCode: u32) -> i32;
@@ -1269,7 +1295,16 @@ mod platform {
 			// SAFETY: `snapshot` remains a valid Toolhelp snapshot handle, and `entry`
 			// remains a writable `PROCESSENTRY32W` with its ABI size preserved.
 			if unsafe { Process32NextW(snapshot.as_raw(), &raw mut entry) } == 0 {
-				break;
+				// Only ERROR_NO_MORE_FILES means the walk finished. Any other error
+				// means the snapshot was truncated mid-enumeration, so the tree is
+				// incomplete and must not be reported as a complete observation.
+				// SAFETY: `GetLastError` reads this thread's last-error value and
+				// takes no caller-owned memory.
+				let last_error = unsafe { GetLastError() };
+				if last_error == ERROR_NO_MORE_FILES {
+					break;
+				}
+				return None;
 			}
 		}
 
@@ -1697,16 +1732,55 @@ impl TerminationTargets {
 
 #[must_use]
 pub fn current_descendant_pids() -> HashSet<i32> {
-	Process::from_pid(i32::try_from(std::process::id()).unwrap_or_default()).map_or_else(
-		HashSet::new,
-		|process| {
-			process
-				.live_descendants()
-				.into_iter()
-				.map(|child| child.pid())
-				.collect()
-		},
+	current_descendant_pids_observed().unwrap_or_default()
+}
+
+/// `None` when the process tree could not be observed, i.e. the returned set
+/// would be an unproven baseline rather than a genuinely empty one.
+#[must_use]
+pub fn current_descendant_pids_observed() -> Option<HashSet<i32>> {
+	let process = Process::from_pid(i32::try_from(std::process::id()).unwrap_or_default())?;
+	Some(
+		process
+			.live_descendants_observed()?
+			.into_iter()
+			.map(|child| child.pid())
+			.collect(),
 	)
+}
+
+/// A snapshot of the descendants that existed before a command started, plus
+/// whether that snapshot was actually observed.
+///
+/// An unproven baseline is dangerous in the opposite direction from an unproven
+/// descendant walk: an empty-because-unreadable baseline makes every
+/// pre-existing helper look like a newly spawned target, so cleanup could
+/// signal unrelated processes. Callers MUST consult [`Self::observed`] before
+/// acting on any pid difference derived from it.
+#[derive(Debug, Clone, Default)]
+pub struct DescendantBaseline {
+	pids:     HashSet<i32>,
+	observed: bool,
+}
+
+impl DescendantBaseline {
+	#[must_use]
+	pub fn capture() -> Self {
+		current_descendant_pids_observed().map_or_else(
+			|| Self { pids: HashSet::new(), observed: false },
+			|pids| Self { pids, observed: true },
+		)
+	}
+
+	#[must_use]
+	pub const fn observed(&self) -> bool {
+		self.observed
+	}
+
+	#[must_use]
+	pub const fn pids(&self) -> &HashSet<i32> {
+		&self.pids
+	}
 }
 
 /// Adds every descendant that is not in `baseline` to `targets`.
