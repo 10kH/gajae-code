@@ -145,7 +145,13 @@ async function captureOnce(cwd: string, repositoryBinding: RepositoryBinding): P
 	});
 	if (!diff.ok) throw new Error(`review source capture failed to read canonical diff: ${diff.stderr}`);
 	const binding = publicRepositoryBinding(repositoryBinding);
-	const repositoryBindingDigest = `sha256:${hashBytes(stableJson(binding))}`;
+	const repositoryIdentity = {
+		schema: binding.schema,
+		worktreeRoot: binding.worktreeRoot,
+		commonDir: binding.commonDir,
+		relativeSubdir: binding.relativeSubdir,
+	};
+	const repositoryBindingDigest = `sha256:${hashBytes(stableJson(repositoryIdentity))}`;
 	const payload = {
 		schema: "gjc.review_source_snapshot.v1",
 		repositoryBindingDigest,

@@ -81,6 +81,19 @@ describe("immutable review source snapshots", () => {
 		expect(late.currentSnapshotId).not.toBe(r1.snapshotId);
 	});
 
+	it("keeps repository identity stable when plan-time HEAD metadata is stale", async () => {
+		const root = await repository();
+		const planBinding = await captureRepositoryBinding(root);
+		await fs.writeFile(path.join(root, "tracked.txt"), "committed implementation\n");
+		await git(root, ["add", "tracked.txt"]);
+		await git(root, ["commit", "-m", "implementation"]);
+		const currentBinding = await captureRepositoryBinding(root);
+		const frozen = await captureReviewSourceSnapshot(root, planBinding);
+		const current = await captureReviewSourceSnapshot(root, currentBinding);
+		expect(current.repositoryBindingDigest).toBe(frozen.repositoryBindingDigest);
+		expect(current.snapshotId).toBe(frozen.snapshotId);
+	});
+
 	it("rejects malformed persisted cohort state and duplicate lane dispatch", async () => {
 		expect(() => normalizeReviewSourceCohorts([{ schema: "wrong" }])).toThrow("malformed reviewCohorts[0]");
 		const cohort = createReviewSourceCohort({
