@@ -1,10 +1,6 @@
 # Changelog
 
 ## [Unreleased]
-
-## [0.12.7] - 2026-07-31
-
-## [0.12.6] - 2026-07-31
 ### Added
 
 - Added the bundled `lunamaxxing` OpenAI Codex profile, mapping every role to GPT-5.6 Luna with medium default reasoning, xhigh executor reasoning, and maximum planner/critic/architect reasoning.
@@ -32,8 +28,6 @@
 ### Fixed
 
 - ACP and SDK broker session deletion no longer promotes a non-empty retained artifact quarantine to transcript deletion. `cleanup_pending` keeps transcript and exact quarantine authority across retries and restarts while payload bytes survive; root-only transcript preauthorization remains replay-bound and is revalidated after ledger persistence immediately before mutation, while ordinary completion still requires an empty identity-bound root or `artifacts_removed`.
-
-## [0.12.5] - 2026-07-30
 
 ## [0.12.5] - 2026-07-30
 
