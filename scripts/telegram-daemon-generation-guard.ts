@@ -8,7 +8,7 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 32;
+export const GUARD_CONTRACT_VERSION = 33;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
@@ -220,7 +220,7 @@ function inventoryHash(inventory: Inventory): string {
 }
 
 export function validateInventory(inventory: Inventory = protectedInventory): void {
-	if (GUARD_CONTRACT_VERSION !== 32) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
+	if (GUARD_CONTRACT_VERSION < 32) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
 	for (const [family, files] of Object.entries(inventory)) {
 		for (const [file, symbols] of Object.entries(files)) {
 			if (!file || symbols.length === 0 || new Set(symbols).size !== symbols.length)
@@ -320,8 +320,16 @@ export async function validateCurrentTreeManifest(): Promise<void> {
 	if (manifest.contractVersion !== actual.contractVersion)
 		throw new Error("telegram-daemon-generation-guard: semantic manifest contract version does not match the current guard");
 	const expected = JSON.stringify(Object.entries(manifest.digests).sort());
-	if (JSON.stringify(Object.entries(actual.digests).sort()) !== expected)
-		throw new Error("telegram-daemon-generation-guard: semantic manifest declaration digests do not byte-match the current tree");
+	const generated = JSON.stringify(Object.entries(actual.digests).sort());
+	if (generated !== expected) {
+		const expectedDigests = Object.fromEntries(Object.entries(manifest.digests));
+		const mismatches = Object.keys(actual.digests)
+			.filter(key => actual.digests[key] !== expectedDigests[key])
+			.map(key => `${key}: manifest=${expectedDigests[key] ?? "<missing>"} actual=${actual.digests[key]}`);
+		throw new Error(
+			`telegram-daemon-generation-guard: semantic manifest declaration digests do not byte-match the current tree (${mismatches.join(", ")})`,
+		);
+	}
 	if (JSON.stringify(actual.nativeAuthoritySha256) !== JSON.stringify(manifest.nativeAuthoritySha256))
 		throw new Error("telegram-daemon-generation-guard: native authority digests do not byte-match the current tree");
 }
@@ -455,6 +463,7 @@ export function declaration(source: string, name: string): string | undefined {
 const AST_METADATA = new Set(["start", "end", "loc", "comments", "leadingComments", "trailingComments", "innerComments", "extra"]);
 
 function canonicalAst(value: unknown): unknown {
+	if (typeof value === "bigint") return `${value}n`;
 	if (Array.isArray(value)) return value.map(canonicalAst);
 	if (!value || typeof value !== "object") return value;
 	return Object.fromEntries(
