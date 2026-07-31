@@ -4029,6 +4029,8 @@ export async function validateUltragoalReviewDispatch(input: {
 	repositoryBindingDigest: string;
 	stateRevision: number;
 	rerunCommand: string;
+	taskSourceTaskId: string;
+	createdAt: string;
 }): Promise<void> {
 	const plan = await readUltragoalPlan(input.cwd);
 	const cohort = plan?.reviewCohorts?.find(item => item.cohortId === input.cohortId && item.status === "active");
@@ -4041,7 +4043,9 @@ export async function validateUltragoalReviewDispatch(input: {
 		dispatch.generation !== input.generation ||
 		dispatch.repositoryBindingDigest !== input.repositoryBindingDigest ||
 		dispatch.stateRevision !== input.stateRevision ||
-		dispatch.rerunCommand !== input.rerunCommand
+		dispatch.rerunCommand !== input.rerunCommand ||
+		dispatch.taskId !== input.taskSourceTaskId ||
+		dispatch.createdAt !== input.createdAt
 	) {
 		throw new Error("reviewSource must resolve to an active runtime-owned dispatch before task launch");
 	}
@@ -4055,6 +4059,12 @@ export async function freezeUltragoalReviewCohort(input: {
 	if (!plan?.repositoryBinding) throw new Error("review cohort freeze requires an authoritative repository binding");
 	const captured = await captureReviewSourceSnapshot(input.cwd, plan.repositoryBinding);
 	const prior = plan.reviewCohorts?.find(cohort => cohort.status === "active");
+	if (
+		prior?.snapshotId === captured.snapshotId &&
+		prior.repositoryBindingDigest === captured.repositoryBindingDigest
+	) {
+		return prior;
+	}
 	const cohort = createReviewSourceCohort({
 		workflow: input.workflow ?? "ultragoal",
 		generation: (prior?.generation ?? 0) + 1,
@@ -4093,28 +4103,42 @@ export async function dispatchUltragoalReviewLane(input: {
 	});
 }
 
-export async function recordUltragoalReviewDelivery(input: {
+export async function classifyUltragoalReviewDelivery(input: {
 	cwd: string;
 	cohortId: string;
 	dispatchId: string;
-	disposition: ReviewDeliveryDisposition;
-}): Promise<string> {
+	observedDisposition: ReviewDeliveryDisposition;
+}): Promise<{ disposition: ReviewDeliveryDisposition; deliveryId: string }> {
 	return mutateReviewCohorts(input.cwd, plan => {
 		const cohort = plan.reviewCohorts?.find(item => item.cohortId === input.cohortId);
+		const active = plan.reviewCohorts?.find(item => item.status === "active");
 		if (!cohort) throw new Error(`Unknown review cohort ${input.cohortId}`);
 		const dispatch = cohort.dispatches.find(item => item.dispatchId === input.dispatchId);
 		if (!dispatch) throw new Error(`Unknown review dispatch ${input.dispatchId}`);
+		const disposition =
+			input.observedDisposition === "invalid_provenance"
+				? "invalid_provenance"
+				: active?.cohortId === cohort.cohortId && cohort.status === "active"
+					? input.observedDisposition
+					: "stale_review_delivery";
+		const existing = cohort.deliveries.find(item => item.dispatchId === dispatch.dispatchId);
+		if (existing) {
+			if (existing.disposition !== disposition) throw new Error("conflicting_review_delivery");
+			return { disposition, deliveryId: existing.deliveryId };
+		}
 		const deliveryId = crypto.randomUUID();
 		cohort.deliveries.push({
 			deliveryId,
+			cohortId: cohort.cohortId,
+			dispatchId: dispatch.dispatchId,
 			taskId: dispatch.taskId,
 			lane: dispatch.lane,
 			snapshotId: dispatch.snapshotId,
-			disposition: input.disposition,
+			disposition,
 			receivedAt: new Date().toISOString(),
 			rerunCommand: dispatch.rerunCommand,
 		});
-		return deliveryId;
+		return { disposition, deliveryId };
 	});
 }
 

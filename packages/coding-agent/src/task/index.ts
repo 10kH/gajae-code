@@ -54,7 +54,7 @@ import {
 	resolveTaskRepositoryBinding,
 } from "../gjc-runtime/repository-binding";
 import { reconcileReviewSourceDelivery } from "../gjc-runtime/ultragoal-review-source";
-import { recordUltragoalReviewDelivery, validateUltragoalReviewDispatch } from "../gjc-runtime/ultragoal-runtime";
+import { classifyUltragoalReviewDelivery, validateUltragoalReviewDispatch } from "../gjc-runtime/ultragoal-runtime";
 
 import { initializeLocalRoot, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { ArtifactManager } from "../session/artifacts";
@@ -1717,6 +1717,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						repositoryBindingDigest: task.reviewSource.repositoryBindingDigest,
 						stateRevision: task.reviewSource.stateRevision,
 						rerunCommand: task.reviewSource.rerunCommand,
+						taskSourceTaskId: task.reviewSource.taskId,
+						createdAt: task.reviewSource.createdAt,
 					});
 				}
 				if (isIsolated && task.reviewSource) {
@@ -1790,12 +1792,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							? {
 									...task.reviewSource,
 									...reviewSourceDisposition,
-									deliveryId: await recordUltragoalReviewDelivery({
+									...(await classifyUltragoalReviewDelivery({
 										cwd: this.session.cwd,
 										cohortId: task.reviewSource.cohortId,
 										dispatchId: task.reviewSource.dispatchId,
-										disposition: reviewSourceDisposition.disposition,
-									}),
+										observedDisposition: reviewSourceDisposition.disposition,
+									})),
 								}
 							: undefined;
 					return {

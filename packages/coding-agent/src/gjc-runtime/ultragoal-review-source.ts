@@ -59,6 +59,8 @@ export interface ReviewSourceDelivery {
 	disposition: ReviewDeliveryDisposition;
 	receivedAt: string;
 	rerunCommand?: string;
+	cohortId: string;
+	dispatchId: string;
 }
 
 export interface ReviewSourceCohort {
@@ -252,13 +254,15 @@ function normalizeDelivery(
 	if (!value || typeof value !== "object" || Array.isArray(value))
 		throw new Error(`Invalid ultragoal plan: malformed delivery ${index}`);
 	const record = value as Record<string, unknown>;
-	const dispatch = dispatches.find(
-		item => item.taskId === record.taskId && item.lane === record.lane && item.snapshotId === record.snapshotId,
-	);
+	const dispatch = dispatches.find(item => item.dispatchId === record.dispatchId && item.cohortId === record.cohortId);
+
 	if (
 		typeof record.deliveryId !== "string" ||
 		!dispatch ||
 		!isReviewSourceLane(record.lane) ||
+		record.taskId !== dispatch.taskId ||
+		record.lane !== dispatch.lane ||
+		record.snapshotId !== dispatch.snapshotId ||
 		(record.disposition !== "current" &&
 			record.disposition !== "stale_review_delivery" &&
 			record.disposition !== "invalid_provenance") ||
@@ -272,7 +276,7 @@ function normalizeDelivery(
 export function normalizeReviewSourceCohorts(value: unknown): ReviewSourceCohort[] {
 	if (value === undefined) return [];
 	if (!Array.isArray(value)) throw new Error("Invalid ultragoal plan: reviewCohorts must be an array");
-	return value.map((item, index) => {
+	const cohorts = value.map((item, index) => {
 		if (!item || typeof item !== "object" || Array.isArray(item)) {
 			throw new Error(`Invalid ultragoal plan: reviewCohorts[${index}] must be an object`);
 		}
@@ -305,6 +309,28 @@ export function normalizeReviewSourceCohorts(value: unknown): ReviewSourceCohort
 		);
 		return { ...(record as unknown as ReviewSourceCohort), dispatches, deliveries };
 	});
+	const cohortIds = new Set<string>();
+	const dispatchIds = new Set<string>();
+	const deliveryIds = new Set<string>();
+	let activeCount = 0;
+	for (const cohort of cohorts) {
+		if (cohortIds.has(cohort.cohortId))
+			throw new Error(`Invalid ultragoal plan: duplicate cohortId ${cohort.cohortId}`);
+		cohortIds.add(cohort.cohortId);
+		if (cohort.status === "active") activeCount++;
+		for (const dispatch of cohort.dispatches) {
+			if (dispatchIds.has(dispatch.dispatchId))
+				throw new Error(`Invalid ultragoal plan: duplicate dispatchId ${dispatch.dispatchId}`);
+			dispatchIds.add(dispatch.dispatchId);
+		}
+		for (const delivery of cohort.deliveries) {
+			if (deliveryIds.has(delivery.deliveryId))
+				throw new Error(`Invalid ultragoal plan: duplicate deliveryId ${delivery.deliveryId}`);
+			deliveryIds.add(delivery.deliveryId);
+		}
+	}
+	if (activeCount > 1) throw new Error("Invalid ultragoal plan: multiple active review cohorts");
+	return cohorts;
 }
 
 export async function reconcileReviewSourceDelivery(input: {
