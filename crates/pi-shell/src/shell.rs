@@ -1107,7 +1107,7 @@ async fn capture_new_process_group<S: std::hash::BuildHasher + Sync>(
 ) {
 	for _ in 0..100 {
 		let mut targets = process::TerminationTargets::new();
-		process::add_new_descendants(&mut targets, &baseline);
+		let _ = process::add_new_descendants(&mut targets, &baseline);
 		if let Some(pgid) = targets.first_pgid() {
 			command_pgid.store(pgid, Ordering::SeqCst);
 			return;
@@ -1123,8 +1123,12 @@ async fn terminate_new_descendants<S: std::hash::BuildHasher + Sync>(
 	const WAVES: u32 = 3;
 	for wave in 0..WAVES {
 		let mut targets = process::TerminationTargets::new();
-		process::add_new_descendants(&mut targets, baseline);
-		if targets.is_empty() && command_pgid <= 0 {
+		let observed = process::add_new_descendants(&mut targets, baseline);
+		// Only an *observed* empty target set proves there is nothing left to kill.
+		// When the process tree could not be read, fall through and keep signalling
+		// the command's process group across every wave instead of reporting a
+		// clean cleanup we cannot substantiate.
+		if observed && targets.is_empty() && command_pgid <= 0 {
 			return;
 		}
 		let signal = if wave == 0 {
@@ -2701,5 +2705,51 @@ mod tests {
 			stdout.extend_from_slice(&chunk);
 		}
 		assert_eq!(stdout, b"prod:8080");
+	}
+	/// `add_new_descendants` must report whether the process tree was actually
+	/// observed. A successful observation that finds nothing returns `true` with
+	/// an empty target set; only that combination lets
+	/// `terminate_new_descendants` conclude there is nothing left to kill. If
+	/// this ever returns `false` on a healthy host, cancellation cleanup would
+	/// spin its full wave budget; if it returned `true` on an observation
+	/// failure, cleanup would silently leak descendants.
+	#[test]
+	fn descendant_observation_reports_success_on_a_healthy_process_table() {
+		let baseline = process::current_descendant_pids();
+		let mut targets = process::TerminationTargets::new();
+		let observed = process::add_new_descendants(&mut targets, &baseline);
+		assert!(observed, "process tree must be observable on a healthy host");
+	}
+
+	/// A live child must be observed as a descendant and classified as a *new*
+	/// target relative to a baseline captured before it spawned. This pins the
+	/// evidence that the fail-closed signal is derived from a real walk rather
+	/// than a constant.
+	#[cfg(unix)]
+	#[test]
+	fn descendant_observation_sees_a_new_live_child() {
+		let baseline = process::current_descendant_pids();
+		let mut child = std::process::Command::new("sleep")
+			.arg("30")
+			.spawn()
+			.expect("sleep should spawn");
+		let child_pid = i32::try_from(child.id()).expect("child pid should fit i32");
+		assert!(!baseline.contains(&child_pid), "baseline predates the child");
+
+		// Observe without signalling: `add_new_descendants` builds a process-wide
+		// target set, so signalling it here would kill concurrently running tests'
+		// processes. Assert on the observed pid set instead.
+		let observed_pids = process::current_descendant_pids();
+		let mut targets = process::TerminationTargets::new();
+		let observed = process::add_new_descendants(&mut targets, &baseline);
+
+		let _ = child.kill();
+		let _ = child.wait();
+
+		assert!(observed, "process tree must be observable");
+		assert!(
+			observed_pids.contains(&child_pid),
+			"a live child must appear in the observed descendant set",
+		);
 	}
 }

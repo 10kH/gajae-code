@@ -60,8 +60,15 @@ mod platform {
 		}
 
 		pub fn children(&self) -> Vec<Self> {
+			self.children_observed().unwrap_or_default()
+		}
+
+		/// `None` when this process is live but its `/proc` task list could not be
+		/// read, i.e. the child set is unknown rather than empty.
+		pub fn children_observed(&self) -> Option<Vec<Self>> {
 			if !self.live_identity() {
-				return Vec::new();
+				// Not an observation failure: an exited process has no children.
+				return Some(Vec::new());
 			}
 
 			// `/proc/{pid}/task/{tid}/children` is per-task: a child fork()ed from a
@@ -69,7 +76,10 @@ mod platform {
 			// every task subdir and union the lists, then re-validate parentage.
 			let task_dir = format!("/proc/{}/task", self.pid);
 			let Ok(entries) = fs::read_dir(&task_dir) else {
-				return Vec::new();
+				// The directory vanishing because the process exited is an expected
+				// race; failing to read it while the process is still live means the
+				// child set is genuinely unknown.
+				return if self.live_identity() { None } else { Some(Vec::new()) };
 			};
 
 			let mut seen: HashSet<i32> = HashSet::new();
@@ -103,7 +113,7 @@ mod platform {
 					}
 				}
 			}
-			out
+			Some(out)
 		}
 
 		pub fn parent_pid(&self) -> Option<i32> {
@@ -195,20 +205,36 @@ mod platform {
 		/// Walk the descendant tree in post-order (leaves first), de-duplicating
 		/// by PID so concurrent reparenting cannot trap us in a cycle.
 		pub fn descendants(&self) -> Vec<Self> {
+			self.descendants_observed().unwrap_or_default()
+		}
+
+		/// `None` when this process's own task list could not be read, i.e. the
+		/// descendant set is unknown rather than empty. Callers that terminate
+		/// descendants MUST NOT treat that as "nothing to kill".
+		pub fn descendants_observed(&self) -> Option<Vec<Self>> {
 			let mut out = Vec::new();
 			let mut visited = HashSet::new();
 			visited.insert(self.pid);
-			self.descendants_into(&mut out, &mut visited);
-			out
+			self.descendants_into(&mut out, &mut visited).then_some(out)
 		}
 
-		fn descendants_into(&self, out: &mut Vec<Self>, visited: &mut HashSet<i32>) {
-			for child in self.children() {
+		/// Returns `false` when a `/proc` read failed, making the walk incomplete.
+		fn descendants_into(&self, out: &mut Vec<Self>, visited: &mut HashSet<i32>) -> bool {
+			let Some(children) = self.children_observed() else {
+				return false;
+			};
+			let mut complete = true;
+			for child in children {
 				if visited.insert(child.pid) {
-					child.descendants_into(out, visited);
+					// A child that exits mid-walk is an expected race; only a failed
+					// read of a still-live child's task list is incompleteness.
+					if !child.descendants_into(out, visited) && child.live_identity() {
+						complete = false;
+					}
 					out.push(child);
 				}
 			}
+			complete
 		}
 
 		fn live_identity(&self) -> bool {
@@ -388,7 +414,9 @@ mod platform {
 			// whole pid table via `proc_listallpids` and filter on `pbi_ppid`
 			// instead; this is the same approach we already use for `find_by_path`
 			// and that the Windows implementation uses via Toolhelp snapshots.
-			let tree = build_process_tree();
+			let Some(tree) = build_process_tree() else {
+				return Vec::new();
+			};
 			Self::children_from_tree(self.pid, &tree)
 		}
 
@@ -426,15 +454,21 @@ mod platform {
 		/// Walk the descendant tree in post-order (leaves first), de-duplicating
 		/// by PID so concurrent reparenting cannot trap us in a cycle.
 		pub fn descendants(&self) -> Vec<Self> {
+			self.descendants_observed().unwrap_or_default()
+		}
+
+		/// `None` when the process table could not be observed at all. Callers that
+		/// terminate descendants MUST NOT treat that as an empty descendant set.
+		pub fn descendants_observed(&self) -> Option<Vec<Self>> {
 			// One process-table snapshot per walk — building it inside the recursion
 			// would re-scan every pid for every visited node, producing an `O(N · D)`
 			// kernel call pattern. Mirrors the Windows implementation.
-			let tree = build_process_tree();
+			let tree = build_process_tree()?;
 			let mut out = Vec::new();
 			let mut visited = HashSet::new();
 			visited.insert(self.pid);
 			Self::collect_descendants_from_tree(self.pid, &tree, &mut visited, &mut out);
-			out
+			Some(out)
 		}
 
 		fn children_from_tree(parent: i32, tree: &HashMap<i32, Vec<i32>>) -> Vec<Self> {
@@ -508,13 +542,16 @@ mod platform {
 	/// silently truncates the second call to the supplied buffer size even
 	/// when the sizing query reports more bytes available, so the buffer is
 	/// padded well beyond the reported count.
-	fn snapshot_all_pids() -> Vec<i32> {
+	fn snapshot_all_pids() -> Option<Vec<i32>> {
 		// SAFETY: Passing a null buffer with size 0 is the documented libproc query
 		// form for obtaining the byte count needed for all PIDs; libproc does not
 		// dereference the null pointer in this mode.
 		let bytes = unsafe { proc_listallpids(ptr::null_mut(), 0) };
 		if bytes <= 0 {
-			return Vec::new();
+			// An observation failure is NOT an empty process table. Returning an
+			// empty Vec here would let descendant termination treat "we could not
+			// look" as "nothing to kill" and leave live children behind.
+			return None;
 		}
 		let count = (bytes as usize) / size_of::<i32>();
 		let cap = count.saturating_mul(4).max(2048);
@@ -524,25 +561,27 @@ mod platform {
 		let actual =
 			unsafe { proc_listallpids(buffer.as_mut_ptr(), (buffer.len() * size_of::<i32>()) as i32) };
 		if actual <= 0 {
-			return Vec::new();
+			return None;
 		}
 		let pid_count = ((actual as usize) / size_of::<i32>()).min(buffer.len());
 		buffer.truncate(pid_count);
-		buffer
+		Some(buffer)
 	}
 
 	/// Build a `ppid -> [pids]` map from a one-shot scan of `proc_listallpids`.
 	///
 	/// Used as the foundation of `Process::children` and `Process::descendants`
 	/// on macOS where `proc_listchildpids` returns no children for self-queries.
-	pub(super) fn build_process_tree() -> HashMap<i32, Vec<i32>> {
-		let pids = snapshot_all_pids();
+	pub(super) fn build_process_tree() -> Option<HashMap<i32, Vec<i32>>> {
+		let pids = snapshot_all_pids()?;
 		let mut tree: HashMap<i32, Vec<i32>> = HashMap::with_capacity(pids.len() / 2);
 		for pid in pids {
 			if pid <= 0 {
 				continue;
 			}
 			let Some(info) = read_bsdinfo(pid) else {
+				// A pid that exited between enumeration and read is an expected
+				// race, not an observation failure: skip it and keep the snapshot.
 				continue;
 			};
 			let Ok(ppid) = i32::try_from(info.pbi_ppid) else {
@@ -553,12 +592,12 @@ mod platform {
 			}
 			tree.entry(ppid).or_default().push(pid);
 		}
-		tree
+		Some(tree)
 	}
 
 	/// Find processes whose libproc-reported executable path equals `target`.
 	pub fn find_by_path(target: &str) -> Vec<Process> {
-		let pids = snapshot_all_pids();
+		let pids = snapshot_all_pids().unwrap_or_default();
 		let mut path_buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
 		let mut matches = Vec::new();
 		for pid in pids {
@@ -908,7 +947,9 @@ mod platform {
 		}
 
 		pub fn children(&self) -> Vec<Self> {
-			let tree = build_process_tree();
+			let Some(tree) = build_process_tree() else {
+				return Vec::new();
+			};
 			Self::children_from_tree(self.pid, &tree)
 		}
 
@@ -918,15 +959,21 @@ mod platform {
 		/// table for every visited descendant, making tree termination
 		/// `O(N · D)` snapshots. One snapshot per termination wave is enough.
 		pub fn descendants(&self) -> Vec<Self> {
-			let tree = build_process_tree();
+			self.descendants_observed().unwrap_or_default()
+		}
+
+		/// `None` when the Toolhelp snapshot could not be taken at all. Callers that
+		/// terminate descendants MUST NOT treat that as an empty descendant set.
+		pub fn descendants_observed(&self) -> Option<Vec<Self>> {
+			let tree = build_process_tree()?;
 			let Ok(root) = u32::try_from(self.pid) else {
-				return Vec::new();
+				return Some(Vec::new());
 			};
 			let mut visited: HashSet<u32> = HashSet::new();
 			visited.insert(root);
 			let mut out = Vec::new();
 			Self::collect_descendants_from_tree(root, &tree, &mut visited, &mut out);
-			out
+			Some(out)
 		}
 
 		fn children_from_tree(pid: i32, tree: &HashMap<u32, SmallVec<[u32; 4]>>) -> Vec<Self> {
@@ -1201,18 +1248,16 @@ mod platform {
 	}
 
 	/// Build a map of `parent_pid` -> [`child_pids`] for all processes.
-	fn build_process_tree() -> HashMap<u32, SmallVec<[u32; 4]>> {
+	fn build_process_tree() -> Option<HashMap<u32, SmallVec<[u32; 4]>>> {
 		let mut tree: HashMap<u32, SmallVec<[u32; 4]>> = HashMap::new();
-		let Some(snapshot) = create_process_snapshot() else {
-			return tree;
-		};
+		let snapshot = create_process_snapshot()?;
 
 		let mut entry = process_entry();
 		// SAFETY: `snapshot` is a valid Toolhelp snapshot handle. `entry` points to a
 		// writable `PROCESSENTRY32W` whose `dwSize` field was initialized to the exact
 		// ABI size before the call.
 		if unsafe { Process32FirstW(snapshot.as_raw(), &raw mut entry) } == 0 {
-			return tree;
+			return None;
 		}
 
 		loop {
@@ -1228,7 +1273,7 @@ mod platform {
 			}
 		}
 
-		tree
+		Some(tree)
 	}
 
 	/// Process groups are not exposed on Windows.
@@ -1425,6 +1470,19 @@ impl Process {
 			.into_iter()
 			.map(Self::from_inner)
 			.collect()
+	}
+
+	/// `None` when the platform could not observe the process tree, i.e. the
+	/// descendant set is unknown rather than empty.
+	fn live_descendants_observed(&self) -> Option<Vec<Self>> {
+		Some(
+			self
+				.inner
+				.descendants_observed()?
+				.into_iter()
+				.map(Self::from_inner)
+				.collect(),
+		)
 	}
 
 	fn signal_tree(&self, signal: i32) -> u32 {
@@ -1651,15 +1709,22 @@ pub fn current_descendant_pids() -> HashSet<i32> {
 	)
 }
 
+/// Adds every descendant that is not in `baseline` to `targets`.
+///
+/// Returns `false` when the process tree could not be observed, meaning the
+/// target set is incomplete. Callers MUST NOT treat an empty `targets` from an
+/// unobserved tree as "nothing to terminate".
 pub fn add_new_descendants<S: std::hash::BuildHasher>(
 	targets: &mut TerminationTargets,
 	baseline: &HashSet<i32, S>,
-) {
+) -> bool {
 	let self_pid = i32::try_from(std::process::id()).unwrap_or_default();
 	let Some(process) = Process::from_pid(self_pid) else {
-		return;
+		return false;
 	};
-	let descendants = process.live_descendants();
+	let Some(descendants) = process.live_descendants_observed() else {
+		return false;
+	};
 	let descendants_info: Vec<DescendantInfo> = descendants
 		.iter()
 		.map(|child| DescendantInfo { pid: child.pid(), pgid: child.group_id() })
@@ -1672,6 +1737,7 @@ pub fn add_new_descendants<S: std::hash::BuildHasher>(
 	for pid in selection.pids {
 		targets.add_pid(pid);
 	}
+	true
 }
 
 /// Light view of a descendant for target classification — just enough to
