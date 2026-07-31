@@ -209,20 +209,40 @@ async function resolveTaskItemsWithRepositoryBindings(
 			resolved.push({ ...task, repositoryBinding: binding });
 		} catch (error) {
 			const id = task.id?.trim() ? task.id : "(missing-id)";
-			if (error instanceof RepositoryBindingError) return { tasks: [], error: `Task "${id}" repository binding rejected: ${error.message}` };
-			return { tasks: [], error: `Task "${id}" repository binding rejected: ${error instanceof Error ? error.message : String(error)}` };
+			if (error instanceof RepositoryBindingError)
+				return { tasks: [], error: `Task "${id}" repository binding rejected: ${error.message}` };
+			return {
+				tasks: [],
+				error: `Task "${id}" repository binding rejected: ${error instanceof Error ? error.message : String(error)}`,
+			};
 		}
 	}
 	return { tasks: resolved };
 }
 
-function duplicateIdentityForTask(task: TaskItem, role: string, ownerId: string | undefined, parentSession: string | null): DuplicateIdentity {
+function duplicateIdentityForTask(
+	task: TaskItem,
+	role: string,
+	ownerId: string | undefined,
+	parentSession: string | null,
+): DuplicateIdentity {
 	const binding = task.repositoryBinding as RepositoryBinding;
-	return { role: role.trim(), ownerId, parentSession, repository: { root: binding.commonDir ?? binding.worktreeRoot, relativeSubdir: binding.relativeSubdir ?? null } };
+	return {
+		role: role.trim(),
+		ownerId,
+		parentSession,
+		repository: { root: binding.commonDir ?? binding.worktreeRoot, relativeSubdir: binding.relativeSubdir ?? null },
+	};
 }
 
 function duplicateIdentityKey(identity: DuplicateIdentity): string {
-	return JSON.stringify([identity.role, identity.ownerId ?? null, identity.parentSession, identity.repository.root, identity.repository.relativeSubdir]);
+	return JSON.stringify([
+		identity.role,
+		identity.ownerId ?? null,
+		identity.parentSession,
+		identity.repository.root,
+		identity.repository.relativeSubdir,
+	]);
 }
 
 function repositoryBindingFromTask(task: TaskItem): RepositoryBinding | undefined {
@@ -875,7 +895,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		const startedJobs: Array<{ jobId: string; taskId: string }> = [];
-		const failedSchedules: Array<{ task: TaskItem & { id: string }; taskIndex: number; message: string; signalSkip: boolean; duplicateDisposition?: DuplicateDisposition }> = [];
+		const failedSchedules: Array<{
+			task: TaskItem & { id: string };
+			taskIndex: number;
+			message: string;
+			signalSkip: boolean;
+			duplicateDisposition?: DuplicateDisposition;
+		}> = [];
 		let completedJobs = 0;
 		let failedJobs = 0;
 
@@ -904,18 +930,43 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const maxConcurrency = this.session.settings.get("task.maxConcurrency");
 		const ownerId = this.session.getAgentId?.() ?? undefined;
 		const parentSession = this.session.getSessionFile();
-		const admitDuplicateLaunch = (subagentId: string, task: TaskItem, policy: "warn" | "supersede", selfSubagentId?: string): { ok: boolean; disposition?: DuplicateDisposition; error?: string; identity: DuplicateIdentity } => {
+		const admitDuplicateLaunch = (
+			subagentId: string,
+			task: TaskItem,
+			policy: "warn" | "supersede",
+			selfSubagentId?: string,
+		): { ok: boolean; disposition?: DuplicateDisposition; error?: string; identity: DuplicateIdentity } => {
 			const identity = duplicateIdentityForTask(task, params.agent, ownerId, parentSession);
 			const key = duplicateIdentityKey(identity);
-			const predecessors = manager.getSubagentRecords({ ownerId }).filter(record => {
-				if (record.subagentId === selfSubagentId || record.subagentId === subagentId) return false;
-				if (record.status !== "running" && record.status !== "paused" && record.status !== "queued") return false;
-				return record.duplicateIdentity === key;
-			}).sort((a, b) => (b.currentJobId ? manager.getJob(b.currentJobId)?.startTime ?? 0 : 0) - (a.currentJobId ? manager.getJob(a.currentJobId)?.startTime ?? 0 : 0) || a.subagentId.localeCompare(b.subagentId));
+			const predecessors = manager
+				.getSubagentRecords({ ownerId })
+				.filter(record => {
+					if (record.subagentId === selfSubagentId || record.subagentId === subagentId) return false;
+					if (record.status !== "running" && record.status !== "paused" && record.status !== "queued")
+						return false;
+					return record.duplicateIdentity === key;
+				})
+				.sort(
+					(a, b) =>
+						(b.currentJobId ? (manager.getJob(b.currentJobId)?.startTime ?? 0) : 0) -
+							(a.currentJobId ? (manager.getJob(a.currentJobId)?.startTime ?? 0) : 0) ||
+						a.subagentId.localeCompare(b.subagentId),
+				);
 			if (predecessors.length === 0) return { ok: true, identity };
-			if (policy === "warn") return { ok: true, identity, disposition: { action: "warned", predecessorIds: predecessors.map(record => record.subagentId) } };
-			for (const predecessor of predecessors) if (!manager.cancelSubagent(predecessor.subagentId, { ownerId })) return { ok: false, identity, error: "duplicate_supersede_failed" };
-			return { ok: true, identity, disposition: { action: "superseded", predecessorIds: predecessors.map(record => record.subagentId) } };
+			if (policy === "warn")
+				return {
+					ok: true,
+					identity,
+					disposition: { action: "warned", predecessorIds: predecessors.map(record => record.subagentId) },
+				};
+			for (const predecessor of predecessors)
+				if (!manager.cancelSubagent(predecessor.subagentId, { ownerId }))
+					return { ok: false, identity, error: "duplicate_supersede_failed" };
+			return {
+				ok: true,
+				identity,
+				disposition: { action: "superseded", predecessorIds: predecessors.map(record => record.subagentId) },
+			};
 		};
 		let resumeRunner: ResumeRunner | undefined;
 		if (typeof manager.setResumeRunner === "function") {
@@ -925,14 +976,37 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				const admission = (() => {
 					const identity = descriptor.duplicateIdentity;
 					const key = duplicateIdentityKey(identity);
-					const predecessors = manager.getSubagentRecords({ ownerId }).filter(record => {
-					if (record.subagentId === descriptor.task.id || !["running", "paused", "queued"].includes(record.status)) return false;
-					return record.duplicateIdentity === key;
-					}).sort((a, b) => (b.currentJobId ? manager.getJob(b.currentJobId)?.startTime ?? 0 : 0) - (a.currentJobId ? manager.getJob(a.currentJobId)?.startTime ?? 0 : 0) || a.subagentId.localeCompare(b.subagentId));
+					const predecessors = manager
+						.getSubagentRecords({ ownerId })
+						.filter(record => {
+							if (
+								record.subagentId === descriptor.task.id ||
+								!["running", "paused", "queued"].includes(record.status)
+							)
+								return false;
+							return record.duplicateIdentity === key;
+						})
+						.sort(
+							(a, b) =>
+								(b.currentJobId ? (manager.getJob(b.currentJobId)?.startTime ?? 0) : 0) -
+									(a.currentJobId ? (manager.getJob(a.currentJobId)?.startTime ?? 0) : 0) ||
+								a.subagentId.localeCompare(b.subagentId),
+						);
 					if (predecessors.length === 0) return { ok: true, identity };
-					if (descriptor.duplicatePolicy === "warn") return { ok: true, identity, disposition: { action: "warned", predecessorIds: predecessors.map(record => record.subagentId) } };
-					for (const predecessor of predecessors) if (!manager.cancelSubagent(predecessor.subagentId, { ownerId })) return { ok: false, identity, error: "duplicate_supersede_failed" };
-					return { ok: true, identity, disposition: { action: "superseded", predecessorIds: predecessors.map(record => record.subagentId) } };
+					if (descriptor.duplicatePolicy === "warn")
+						return {
+							ok: true,
+							identity,
+							disposition: { action: "warned", predecessorIds: predecessors.map(record => record.subagentId) },
+						};
+					for (const predecessor of predecessors)
+						if (!manager.cancelSubagent(predecessor.subagentId, { ownerId }))
+							return { ok: false, identity, error: "duplicate_supersede_failed" };
+					return {
+						ok: true,
+						identity,
+						disposition: { action: "superseded", predecessorIds: predecessors.map(record => record.subagentId) },
+					};
 				})();
 				if (!admission.ok) {
 					descriptor.lastAdmissionFailure = admission.error;
@@ -942,7 +1016,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				const forkSeeds = descriptor.forkContextSeed
 					? new Map([[descriptor.task.id, descriptor.forkContextSeed]])
 					: undefined;
-				const resumedTask = { ...descriptor.task, repositoryBinding: descriptor.repositoryBinding, duplicate_policy: descriptor.duplicatePolicy };
+				const resumedTask = {
+					...descriptor.task,
+					repositoryBinding: descriptor.repositoryBinding,
+					duplicate_policy: descriptor.duplicatePolicy,
+				};
 				return manager.register(
 					"task",
 					descriptor.task.id,
@@ -972,16 +1050,19 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
 						const rawSingleResult = result.details?.results[0];
 						const singleResult = rawSingleResult
-			? {
-					...rawSingleResult,
-						duplicateDisposition: (() => {
-							const initial = descriptor.initialDisposition;
-							const current = admission.disposition;
-							if (!initial) return current;
-							if (!current) return initial;
-							return { action: current.action, predecessorIds: [...new Set([...initial.predecessorIds, ...current.predecessorIds])] };
-						})(),
-			}
+							? {
+									...rawSingleResult,
+									duplicateDisposition: (() => {
+										const initial = descriptor.initialDisposition;
+										const current = admission.disposition;
+										if (!initial) return current;
+										if (!current) return initial;
+										return {
+											action: current.action,
+											predecessorIds: [...new Set([...initial.predecessorIds, ...current.predecessorIds])],
+										};
+									})(),
+								}
 							: rawSingleResult;
 						return subagentRunOutcomeFromSingleResult(finalText, singleResult);
 					},
@@ -994,7 +1075,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								agent: descriptor.params.agent,
 								agentSource: descriptor.agentSource,
 								duplicateIdentity: duplicateIdentityKey(descriptor.duplicateIdentity),
-								duplicateDisposition: (admission.disposition?.action ?? descriptor.initialDisposition?.action) as DuplicateDisposition["action"] | undefined,
+								duplicateDisposition: (admission.disposition?.action ??
+									descriptor.initialDisposition?.action) as DuplicateDisposition["action"] | undefined,
 								description: descriptor.task.description,
 								assignment: descriptor.task.assignment.trim(),
 							},
@@ -1031,7 +1113,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		for (let i = 0; i < taskItems.length; i++) {
 			const taskItem = taskItems[i];
 			if (signal?.aborted) {
-				failedSchedules.push({ task: taskItem as TaskItem & { id: string }, taskIndex: i, message: "cancelled before scheduling", signalSkip: true });
+				failedSchedules.push({
+					task: taskItem as TaskItem & { id: string },
+					taskIndex: i,
+					message: "cancelled before scheduling",
+					signalSkip: true,
+				});
 				const progress = progressByTaskId.get(taskItem.id);
 				if (progress) {
 					progress.status = "aborted";
@@ -1044,7 +1131,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			if (signal?.aborted) {
 				for (let skippedIndex = i; skippedIndex < taskItems.length; skippedIndex++) {
 					const skippedTask = taskItems[skippedIndex]!;
-					failedSchedules.push({ task: skippedTask as TaskItem & { id: string }, taskIndex: skippedIndex, message: "cancelled before scheduling", signalSkip: true });
+					failedSchedules.push({
+						task: skippedTask as TaskItem & { id: string },
+						taskIndex: skippedIndex,
+						message: "cancelled before scheduling",
+						signalSkip: true,
+					});
 					const skippedProgress = progressByTaskId.get(skippedTask.id);
 					if (skippedProgress) skippedProgress.status = "aborted";
 				}
@@ -1062,7 +1154,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					: path.join(batchArtifactsDir ?? externalTaskSessionsDir!, `${uniqueId}.jsonl`);
 				const admission = admitDuplicateLaunch(uniqueId, taskItem, taskItem.duplicate_policy ?? "warn");
 				if (!admission.ok) {
-					failedSchedules.push({ task: taskItem as TaskItem & { id: string }, taskIndex: i, message: admission.error ?? "duplicate_supersede_failed", signalSkip: false, duplicateDisposition: admission.disposition });
+					failedSchedules.push({
+						task: taskItem as TaskItem & { id: string },
+						taskIndex: i,
+						message: admission.error ?? "duplicate_supersede_failed",
+						signalSkip: false,
+						duplicateDisposition: admission.disposition,
+					});
 					continue;
 				}
 				const jobId = manager.register(
@@ -1106,7 +1204,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
 							const rawSingleResult = result.details?.results[0];
 							const singleResult = rawSingleResult
-								? { ...rawSingleResult, duplicateDisposition: rawSingleResult.duplicateDisposition ?? admission.disposition }
+								? {
+										...rawSingleResult,
+										duplicateDisposition: rawSingleResult.duplicateDisposition ?? admission.disposition,
+									}
 								: rawSingleResult;
 							if (progress) {
 								progress.status = singleResult?.paused
@@ -1248,7 +1349,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						: error instanceof Error
 							? error.message
 							: String(error);
-				failedSchedules.push({ task: taskItem as TaskItem & { id: string }, taskIndex: i, message, signalSkip: false });
+				failedSchedules.push({
+					task: taskItem as TaskItem & { id: string },
+					taskIndex: i,
+					message,
+					signalSkip: false,
+				});
 				const progress = progressByTaskId.get(taskItem.id);
 				if (progress) {
 					progress.status = "failed";
@@ -1264,29 +1370,34 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const scheduleFailureReceipts = failedSchedules
 			.slice()
 			.sort((a, b) => a.taskIndex - b.taskIndex)
-			.map((entry, index) => buildTaskReceipt({
-				index,
-				id: entry.task.id,
-				agent: params.agent,
-				agentSource: fallbackAgentSource,
-				task: renderTaskAssignment(entry.task.assignment, simpleMode),
-				assignment: entry.task.assignment,
-				description: entry.task.description,
-				status: "failed",
-				exitCode: 1,
-				aborted: entry.signalSkip ? true : undefined,
-				abortReason: entry.signalSkip ? "Cancelled before start" : undefined,
-				truncated: false,
-				durationMs: 0,
-				tokens: 0,
-				output: "",
-				stderr: entry.message,
-				error: entry.message,
-				duplicateDisposition: entry.duplicateDisposition,
-			} as SingleResult));
+			.map((entry, index) =>
+				buildTaskReceipt({
+					index,
+					id: entry.task.id,
+					agent: params.agent,
+					agentSource: fallbackAgentSource,
+					task: renderTaskAssignment(entry.task.assignment, simpleMode),
+					assignment: entry.task.assignment,
+					description: entry.task.description,
+					status: "failed",
+					exitCode: 1,
+					aborted: entry.signalSkip ? true : undefined,
+					abortReason: entry.signalSkip ? "Cancelled before start" : undefined,
+					truncated: false,
+					durationMs: 0,
+					tokens: 0,
+					output: "",
+					stderr: entry.message,
+					error: entry.message,
+					duplicateDisposition: entry.duplicateDisposition,
+				} as SingleResult),
+			);
 		if (startedJobs.length === 0) {
 			const failureText = `Failed to start background task jobs: ${failedSchedules.map(entry => `${entry.task.id}: ${entry.message}`).join("; ")}`;
-			return { content: [{ type: "text", text: failureText }], details: { projectAgentsDir: null, results: scheduleFailureReceipts, totalDurationMs: 0 } };
+			return {
+				content: [{ type: "text", text: failureText }],
+				details: { projectAgentsDir: null, results: scheduleFailureReceipts, totalDurationMs: 0 },
+			};
 		}
 
 		const asyncState = completedJobs === taskItems.length ? (failedJobs > 0 ? "failed" : "completed") : "running";

@@ -32,8 +32,15 @@ const subagentSchema = z.object({
 	id: z.string().optional().describe("single subagent id or backing job id for resume/steer"),
 	message: z.string().optional().describe("message to deliver when resuming or steering a subagent"),
 	pause: z.boolean().optional().describe("pause after steering a currently running subagent"),
-	condition: z.enum(["all_terminal", "any_terminal"]).optional().describe("terminal wait condition; defaults to all_terminal"),
-	heartbeat_ms: z.number().refine(value => value === 0 || (Number.isInteger(value) && value >= 100 && value <= 5000)).optional().describe("heartbeat interval; 0 disables"),
+	condition: z
+		.enum(["all_terminal", "any_terminal"])
+		.optional()
+		.describe("terminal wait condition; defaults to all_terminal"),
+	heartbeat_ms: z
+		.number()
+		.refine(value => value === 0 || (Number.isInteger(value) && value >= 100 && value <= 5000))
+		.optional()
+		.describe("heartbeat interval; 0 disables"),
 	timeout_ms: z.number().min(0).max(MAX_AWAIT_TIMEOUT_MS).optional().describe("await timeout in milliseconds"),
 	limit: z.number().min(1).max(MAX_LIST_LIMIT).optional().describe("maximum subagents to return"),
 	verbosity: z
@@ -351,22 +358,49 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		signal: AbortSignal | undefined,
 		onUpdate: AgentToolUpdateCallback<SubagentToolDetails> | undefined,
 	): Promise<AgentToolResult<SubagentToolDetails>> {
-		const ids = params.ids?.map(id => id.trim()).filter(Boolean).filter((id, index, all) => all.indexOf(id) === index);
-		const records = ids?.length ? this.#visibleRecordsByIds(manager, ids, ownerFilter) : this.#runningRecords(manager, ownerFilter);
+		const ids = params.ids
+			?.map(id => id.trim())
+			.filter(Boolean)
+			.filter((id, index, all) => all.indexOf(id) === index);
+		const records = ids?.length
+			? this.#visibleRecordsByIds(manager, ids, ownerFilter)
+			: this.#runningRecords(manager, ownerFilter);
 		const notFoundIds = (ids ?? []).filter(id => !this.#findVisibleRecord(manager, id, ownerFilter));
-		if (records.length === 0) return this.#buildSnapshotResult(notFoundIds.map(id => this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id.")), "Subagent await");
-		const targets = records.map(record => manager.resolveSubagentWaitTarget(record.subagentId, ownerFilter)).filter((target): target is NonNullable<typeof target> => target !== undefined);
+		if (records.length === 0)
+			return this.#buildSnapshotResult(
+				notFoundIds.map(id =>
+					this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."),
+				),
+				"Subagent await",
+			);
+		const targets = records
+			.map(record => manager.resolveSubagentWaitTarget(record.subagentId, ownerFilter))
+			.filter((target): target is NonNullable<typeof target> => target !== undefined);
 		if (targets.length === 0) return this.#buildSnapshotResult([], "Subagent await");
 		const condition = params.condition ?? "all_terminal";
 		const handle = manager.subscribeTerminalWait(targets, condition);
-		const timeoutMs = Math.min(MAX_AWAIT_TIMEOUT_MS, Math.max(0, Math.floor(params.timeout_ms ?? DEFAULT_AWAIT_TIMEOUT_MS)));
-		const targetsAlreadyTerminal = targets.every(target => target.initialStatus === "completed" || target.initialStatus === "failed" || target.initialStatus === "cancelled");
+		const timeoutMs = Math.min(
+			MAX_AWAIT_TIMEOUT_MS,
+			Math.max(0, Math.floor(params.timeout_ms ?? DEFAULT_AWAIT_TIMEOUT_MS)),
+		);
+		const targetsAlreadyTerminal = targets.every(
+			target =>
+				target.initialStatus === "completed" ||
+				target.initialStatus === "failed" ||
+				target.initialStatus === "cancelled",
+		);
 		if (targetsAlreadyTerminal) {
 			const waitResult = await handle.result;
 			handle.acknowledge(waitResult.terminalJobIds);
 			handle.close();
 			const terminalJobIds = waitResult.terminalJobIds;
-			return await this.#buildRecordResult(manager, records, { title: "Subagent await", verbosity: params.verbosity ?? "receipt", waitOutcome: "completed", condition, terminalIds: terminalJobIds });
+			return await this.#buildRecordResult(manager, records, {
+				title: "Subagent await",
+				verbosity: params.verbosity ?? "receipt",
+				waitOutcome: "completed",
+				condition,
+				terminalIds: terminalJobIds,
+			});
 		}
 		const watchedJobIds = targets.map(target => target.jobId).filter((jobId): jobId is string => jobId !== null);
 		manager.watchJobs(watchedJobIds);
@@ -380,7 +414,8 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			lastEmittedSignature = signature;
 			onUpdate(result);
 		};
-		const progressTimer = onUpdate && heartbeatMs > 0 ? setInterval(() => emitIfChanged(false), heartbeatMs) : undefined;
+		const progressTimer =
+			onUpdate && heartbeatMs > 0 ? setInterval(() => emitIfChanged(false), heartbeatMs) : undefined;
 		emitIfChanged(true);
 		let waitOutcome: "completed" | "timed_out_wait" | "interrupted";
 		let onAbort: (() => void) | undefined;
@@ -390,13 +425,14 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 				if (signal?.aborted) onAbort();
 				else signal?.addEventListener("abort", onAbort, { once: true });
 			});
-			waitOutcome = targetsAlreadyTerminal && !signal?.aborted
-				? "completed"
-				: await Promise.race([
-						handle.result.then(() => "completed" as const),
-						Bun.sleep(timeoutMs).then(() => "timed_out_wait" as const),
-						abortPromise,
-				  ]);
+			waitOutcome =
+				targetsAlreadyTerminal && !signal?.aborted
+					? "completed"
+					: await Promise.race([
+							handle.result.then(() => "completed" as const),
+							Bun.sleep(timeoutMs).then(() => "timed_out_wait" as const),
+							abortPromise,
+						]);
 		} finally {
 			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
 			if (progressTimer) clearInterval(progressTimer);
@@ -405,8 +441,13 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		if (waitOutcome === "completed") handle.acknowledge(waitResult?.terminalJobIds);
 		manager.unwatchJobs(watchedJobIds);
 		handle.close();
-		const awaitOutcome: SubagentAwaitOutcome = waitOutcome === "completed" ? "completed" : waitOutcome === "timed_out_wait" ? "timed_out" : "interrupted";
-		const finalRecords = this.#visibleRecordsByIds(manager, records.map(record => record.subagentId), ownerFilter);
+		const awaitOutcome: SubagentAwaitOutcome =
+			waitOutcome === "completed" ? "completed" : waitOutcome === "timed_out_wait" ? "timed_out" : "interrupted";
+		const finalRecords = this.#visibleRecordsByIds(
+			manager,
+			records.map(record => record.subagentId),
+			ownerFilter,
+		);
 		return await this.#buildRecordResult(manager, finalRecords, {
 			title: waitOutcome === "interrupted" ? "Subagent await interrupted" : "Subagent await",
 			notFoundIds,
@@ -555,7 +596,8 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		}
 		if (options.awaitOutcome === "interrupted") {
 			for (const snapshot of snapshots) {
-				if (snapshot.status === "running" || snapshot.status === "paused" || snapshot.status === "queued") snapshot.guidance = AWAIT_INTERRUPTED_GUIDANCE;
+				if (snapshot.status === "running" || snapshot.status === "paused" || snapshot.status === "queued")
+					snapshot.guidance = AWAIT_INTERRUPTED_GUIDANCE;
 			}
 		}
 		const details: SubagentToolDetails = {

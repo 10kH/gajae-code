@@ -245,7 +245,6 @@ interface AsyncJobDelivery {
 	promise?: Promise<void>;
 }
 
-
 interface DeadLetteredDelivery {
 	jobId: string;
 	generation: string;
@@ -345,7 +344,6 @@ interface TerminalWaitState {
 	acknowledged: boolean;
 	terminalGenerations: Set<string>;
 }
-
 
 function sliceTextFromUtf8ByteOffset(text: string, offsetBytes: number): string {
 	if (offsetBytes <= 0) return text;
@@ -492,7 +490,7 @@ export class AsyncJobManager {
 	 */
 	readonly #changeListeners = new Set<() => void>();
 
-#pruneTerminalEvents(): void {
+	#pruneTerminalEvents(): void {
 		const cutoff = Date.now() - Math.max(this.#retentionMs, 300_000);
 		for (const [generation, event] of this.#terminalEvents) {
 			if (event.createdAt >= cutoff) continue;
@@ -502,7 +500,7 @@ export class AsyncJobManager {
 		}
 	}
 
-#eventForTarget(target: AsyncJobWaitTarget): TerminalEvent | undefined {
+	#eventForTarget(target: AsyncJobWaitTarget): TerminalEvent | undefined {
 		this.#pruneTerminalEvents();
 		const aliasedGeneration = this.#waitGenerationAliases.get(target.generation);
 		if (aliasedGeneration) return this.#terminalEvents.get(aliasedGeneration);
@@ -510,7 +508,14 @@ export class AsyncJobManager {
 		if (job) {
 			if (job.generation !== target.generation) return undefined;
 			if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
-				return { generation: job.generation, jobId: job.id, subagentId: target.subagentId, ownerId: job.ownerId, status: job.status, createdAt: job.endTime ?? Date.now() };
+				return {
+					generation: job.generation,
+					jobId: job.id,
+					subagentId: target.subagentId,
+					ownerId: job.ownerId,
+					status: job.status,
+					createdAt: job.endTime ?? Date.now(),
+				};
 			}
 			return undefined;
 		}
@@ -546,9 +551,22 @@ export class AsyncJobManager {
 			record.status = status;
 			record.queued = undefined;
 		}
-		this.#terminalEvents.set(generation, { generation, jobId: null, subagentId, ownerId: record?.ownerId, status, createdAt: Date.now() });
+		this.#terminalEvents.set(generation, {
+			generation,
+			jobId: null,
+			subagentId,
+			ownerId: record?.ownerId,
+			status,
+			createdAt: Date.now(),
+		});
 		for (const state of this.#terminalWaits.values()) {
-			if (state.targets.some(target => target.generation === generation || this.#waitGenerationAliases.get(target.generation) === generation)) this.#maybeResolveWait(state);
+			if (
+				state.targets.some(
+					target =>
+						target.generation === generation || this.#waitGenerationAliases.get(target.generation) === generation,
+				)
+			)
+				this.#maybeResolveWait(state);
 		}
 	}
 
@@ -556,11 +574,28 @@ export class AsyncJobManager {
 		if (job.status !== "completed" && job.status !== "failed" && job.status !== "cancelled") return;
 		if (this.#publishedTerminalGenerations.has(job.generation)) return;
 		this.#publishedTerminalGenerations.add(job.generation);
-		const record = Array.from(this.#subagentRecords.values()).find(item => item.currentJobId === job.id && item.currentJobGeneration === job.generation);
+		const record = Array.from(this.#subagentRecords.values()).find(
+			item => item.currentJobId === job.id && item.currentJobGeneration === job.generation,
+		);
 		if (record) record.terminalGeneration = job.generation;
-		this.#terminalEvents.set(job.generation, { generation: job.generation, jobId: job.id, subagentId: record?.subagentId, ownerId: job.ownerId, status: job.status, createdAt: Date.now() });
+		this.#terminalEvents.set(job.generation, {
+			generation: job.generation,
+			jobId: job.id,
+			subagentId: record?.subagentId,
+			ownerId: job.ownerId,
+			status: job.status,
+			createdAt: Date.now(),
+		});
 		for (const state of this.#terminalWaits.values()) {
-			if (state.targets.some(target => target.generation === job.generation || target.jobId === job.id || this.#waitGenerationAliases.get(target.generation) === job.generation)) this.#maybeResolveWait(state);
+			if (
+				state.targets.some(
+					target =>
+						target.generation === job.generation ||
+						target.jobId === job.id ||
+						this.#waitGenerationAliases.get(target.generation) === job.generation,
+				)
+			)
+				this.#maybeResolveWait(state);
 		}
 	}
 
@@ -572,37 +607,96 @@ export class AsyncJobManager {
 		if (record) {
 			if (filter?.ownerId && record.ownerId !== filter.ownerId) return undefined;
 			if (record.status === "queued" && record.queued?.seq !== undefined) {
-				return { targetId, jobId: null, subagentId: record.subagentId, generation: `queued:${record.subagentId}:${record.queued.seq}`, ownerId: record.ownerId, initialStatus: "queued" };
+				return {
+					targetId,
+					jobId: null,
+					subagentId: record.subagentId,
+					generation: `queued:${record.subagentId}:${record.queued.seq}`,
+					ownerId: record.ownerId,
+					initialStatus: "queued",
+				};
 			}
 			if (record.terminalGeneration && this.#terminalEvents.has(record.terminalGeneration)) {
 				const generation = record.terminalGeneration;
 				const event = this.#terminalEvents.get(generation);
 				const current = record.currentJobId ? this.#jobs.get(record.currentJobId) : undefined;
 				if (!current || current.generation !== record.currentJobGeneration || current.generation !== generation) {
-					return { targetId, jobId: event?.jobId ?? null, subagentId: record.subagentId, generation, ownerId: record.ownerId, initialStatus: record.status };
+					return {
+						targetId,
+						jobId: event?.jobId ?? null,
+						subagentId: record.subagentId,
+						generation,
+						ownerId: record.ownerId,
+						initialStatus: record.status,
+					};
 				}
 			}
 			if (record.currentJobId) {
 				const job = this.#jobs.get(record.currentJobId);
-				if (job && record.currentJobGeneration === job.generation) return { targetId, jobId: record.currentJobId, subagentId: record.subagentId, generation: job.generation, ownerId: record.ownerId, initialStatus: job.status };
+				if (job && record.currentJobGeneration === job.generation)
+					return {
+						targetId,
+						jobId: record.currentJobId,
+						subagentId: record.subagentId,
+						generation: job.generation,
+						ownerId: record.ownerId,
+						initialStatus: job.status,
+					};
 			}
 			if (record.terminalGeneration && this.#terminalEvents.has(record.terminalGeneration)) {
 				const generation = record.terminalGeneration;
-				return { targetId, jobId: generation.startsWith("queued:") ? null : generation, subagentId: record.subagentId, generation, ownerId: record.ownerId, initialStatus: record.status };
+				return {
+					targetId,
+					jobId: generation.startsWith("queued:") ? null : generation,
+					subagentId: record.subagentId,
+					generation,
+					ownerId: record.ownerId,
+					initialStatus: record.status,
+				};
 			}
 			return undefined;
 		}
 		const job = this.#jobs.get(targetId);
-		if (job && (!filter?.ownerId || job.ownerId === filter.ownerId)) return { targetId, jobId: job.id, subagentId: job.metadata?.subagent?.id, generation: job.generation, ownerId: job.ownerId, initialStatus: job.status };
-		const metadataJobs = Array.from(this.#jobs.values()).filter(candidate => candidate.metadata?.subagent?.id === targetId && (!filter?.ownerId || candidate.ownerId === filter.ownerId));
+		if (job && (!filter?.ownerId || job.ownerId === filter.ownerId))
+			return {
+				targetId,
+				jobId: job.id,
+				subagentId: job.metadata?.subagent?.id,
+				generation: job.generation,
+				ownerId: job.ownerId,
+				initialStatus: job.status,
+			};
+		const metadataJobs = Array.from(this.#jobs.values()).filter(
+			candidate =>
+				candidate.metadata?.subagent?.id === targetId && (!filter?.ownerId || candidate.ownerId === filter.ownerId),
+		);
 		const metadataJob = metadataJobs.sort((a, b) => b.startTime - a.startTime)[0];
-		if (metadataJob) return { targetId, jobId: metadataJob.id, subagentId: metadataJob.metadata?.subagent?.id, generation: metadataJob.generation, ownerId: metadataJob.ownerId, initialStatus: metadataJob.status };
+		if (metadataJob)
+			return {
+				targetId,
+				jobId: metadataJob.id,
+				subagentId: metadataJob.metadata?.subagent?.id,
+				generation: metadataJob.generation,
+				ownerId: metadataJob.ownerId,
+				initialStatus: metadataJob.status,
+			};
 		const event = this.#terminalEvents.get(targetId);
-		if (event && (!filter?.ownerId || event.ownerId === filter.ownerId)) return { targetId, jobId: event.jobId, subagentId: event.subagentId, generation: event.generation, ownerId: event.ownerId, initialStatus: event.status };
+		if (event && (!filter?.ownerId || event.ownerId === filter.ownerId))
+			return {
+				targetId,
+				jobId: event.jobId,
+				subagentId: event.subagentId,
+				generation: event.generation,
+				ownerId: event.ownerId,
+				initialStatus: event.status,
+			};
 		return undefined;
 	}
 
-	subscribeTerminalWait(targets: readonly AsyncJobWaitTarget[], condition: AsyncJobWaitCondition = "all_terminal"): AsyncJobWaitHandle {
+	subscribeTerminalWait(
+		targets: readonly AsyncJobWaitTarget[],
+		condition: AsyncJobWaitCondition = "all_terminal",
+	): AsyncJobWaitHandle {
 		const deduped: AsyncJobWaitTarget[] = [];
 		const seen = new Set<string>();
 		for (const target of targets) {
@@ -611,8 +705,18 @@ export class AsyncJobManager {
 			deduped.push(target);
 		}
 		let resolve!: (result: AsyncJobWaitResult) => void;
-		const result = new Promise<AsyncJobWaitResult>(resolver => { resolve = resolver; });
-		const state: TerminalWaitState = { token: `wait_${++this.#waitSeq}`, targets: deduped, condition, resolve, settled: false, acknowledged: false, terminalGenerations: new Set() };
+		const result = new Promise<AsyncJobWaitResult>(resolver => {
+			resolve = resolver;
+		});
+		const state: TerminalWaitState = {
+			token: `wait_${++this.#waitSeq}`,
+			targets: deduped,
+			condition,
+			resolve,
+			settled: false,
+			acknowledged: false,
+			terminalGenerations: new Set(),
+		};
 		const handle: AsyncJobWaitHandle = {
 			token: state.token,
 			result,
@@ -631,7 +735,13 @@ export class AsyncJobManager {
 					this.#deliveryAckOwners.set(event.generation, state.token);
 					this.#suppressedDeliveries.add(event.generation);
 				}
-				this.#deliveries.splice(0, this.#deliveries.length, ...this.#deliveries.filter(delivery => !this.#isDeliveryAcknowledged(delivery.jobId, delivery.generation)));
+				this.#deliveries.splice(
+					0,
+					this.#deliveries.length,
+					...this.#deliveries.filter(
+						delivery => !this.#isDeliveryAcknowledged(delivery.jobId, delivery.generation),
+					),
+				);
 				return { acknowledged: ids.length > 0, jobIds: ids };
 			},
 			close: () => {
@@ -1407,7 +1517,8 @@ export class AsyncJobManager {
 		rec.currentJobGeneration = this.#jobs.get(newJobId)?.generation;
 		rec.status = this.#jobs.get(newJobId)?.status ?? "running";
 		rec.queued = undefined;
-		if (queuedGeneration) this.#waitGenerationAliases.set(queuedGeneration, this.#jobs.get(newJobId)?.generation ?? newJobId);
+		if (queuedGeneration)
+			this.#waitGenerationAliases.set(queuedGeneration, this.#jobs.get(newJobId)?.generation ?? newJobId);
 		this.#notifyChange();
 		return { ok: true, status: rec.status, jobId: newJobId };
 	}
@@ -1436,7 +1547,8 @@ export class AsyncJobManager {
 						continue;
 					}
 					const queuedSeq = rec.queued?.seq;
-					if (queuedSeq !== undefined) this.#publishQueuedTerminal(rec.subagentId, `queued:${rec.subagentId}:${queuedSeq}`, "failed");
+					if (queuedSeq !== undefined)
+						this.#publishQueuedTerminal(rec.subagentId, `queued:${rec.subagentId}:${queuedSeq}`, "failed");
 				}
 				this.#resumeQueue.splice(index, 1);
 			} catch (error) {
@@ -1445,7 +1557,8 @@ export class AsyncJobManager {
 					continue;
 				}
 				const queuedSeq = rec.queued?.seq;
-				if (queuedSeq !== undefined) this.#publishQueuedTerminal(rec.subagentId, `queued:${rec.subagentId}:${queuedSeq}`, "failed");
+				if (queuedSeq !== undefined)
+					this.#publishQueuedTerminal(rec.subagentId, `queued:${rec.subagentId}:${queuedSeq}`, "failed");
 				this.#resumeQueue.splice(index, 1);
 			}
 		}
@@ -1475,7 +1588,8 @@ export class AsyncJobManager {
 			const queuedSeq = rec.queued?.seq;
 			if (idx !== -1) this.#resumeQueue.splice(idx, 1);
 			rec.status = "cancelled";
-			if (queuedSeq !== undefined) this.#publishQueuedTerminal(rec.subagentId, `queued:${rec.subagentId}:${queuedSeq}`, "cancelled");
+			if (queuedSeq !== undefined)
+				this.#publishQueuedTerminal(rec.subagentId, `queued:${rec.subagentId}:${queuedSeq}`, "cancelled");
 			rec.queued = undefined;
 			this.#subagentProgress.delete(rec.subagentId);
 			this.#notifyChange();
@@ -1716,7 +1830,11 @@ export class AsyncJobManager {
 			}
 		}
 		const before = this.#deliveries.length;
-		this.#deliveries.splice(0, this.#deliveries.length, ...this.#deliveries.filter(delivery => !this.#isDeliveryAcknowledged(delivery.jobId, delivery.generation)));
+		this.#deliveries.splice(
+			0,
+			this.#deliveries.length,
+			...this.#deliveries.filter(delivery => !this.#isDeliveryAcknowledged(delivery.jobId, delivery.generation)),
+		);
 		return before - this.#deliveries.length;
 	}
 
@@ -1939,7 +2057,7 @@ export class AsyncJobManager {
 		this.#evictionTimers.set(jobId, timer);
 	}
 
-#evictJob(jobId: string): void {
+	#evictJob(jobId: string): void {
 		this.#expireMonitorTombstones();
 		this.#recordMonitorTombstone(jobId);
 		this.#runLifecycle(jobId, "evict");
@@ -1965,17 +2083,21 @@ export class AsyncJobManager {
 
 	#filterDeliveries(filter?: AsyncJobFilter): AsyncJobDelivery[] {
 		const ownerId = filter?.ownerId;
-		if (!ownerId) return this.#deliveries.filter(delivery => !this.isDeliverySuppressed(delivery.jobId, delivery.generation));
+		if (!ownerId)
+			return this.#deliveries.filter(delivery => !this.isDeliverySuppressed(delivery.jobId, delivery.generation));
 		return this.#deliveries.filter(
-		delivery => delivery.ownerId === ownerId && !this.isDeliverySuppressed(delivery.jobId, delivery.generation),
+			delivery => delivery.ownerId === ownerId && !this.isDeliverySuppressed(delivery.jobId, delivery.generation),
 		);
 	}
 
 	#filterInFlightDeliveries(filter?: AsyncJobFilter): AsyncJobDelivery[] {
 		const ownerId = filter?.ownerId;
-		if (!ownerId) return this.#inFlightDeliveries.filter(delivery => !this.isDeliverySuppressed(delivery.jobId, delivery.generation));
+		if (!ownerId)
+			return this.#inFlightDeliveries.filter(
+				delivery => !this.isDeliverySuppressed(delivery.jobId, delivery.generation),
+			);
 		return this.#inFlightDeliveries.filter(
-		delivery => delivery.ownerId === ownerId && !this.isDeliverySuppressed(delivery.jobId, delivery.generation),
+			delivery => delivery.ownerId === ownerId && !this.isDeliverySuppressed(delivery.jobId, delivery.generation),
 		);
 	}
 
@@ -1985,7 +2107,8 @@ export class AsyncJobManager {
 
 	#hasDeliverable(): boolean {
 		return this.#deliveries.some(
-		delivery => !this.isDeliverySuppressed(delivery.jobId, delivery.generation) && !this.#isDeliveryFenced(delivery),
+			delivery =>
+				!this.isDeliverySuppressed(delivery.jobId, delivery.generation) && !this.#isDeliveryFenced(delivery),
 		);
 	}
 
@@ -1994,7 +2117,8 @@ export class AsyncJobManager {
 			let selected: AsyncJobDelivery | undefined;
 			for (const delivery of this.#deliveries) {
 				if (delivery.ownerId !== filter.ownerId) continue;
-				if (this.isDeliverySuppressed(delivery.jobId, delivery.generation) || this.#isDeliveryFenced(delivery)) continue;
+				if (this.isDeliverySuppressed(delivery.jobId, delivery.generation) || this.#isDeliveryFenced(delivery))
+					continue;
 				if (!selected || delivery.nextAttemptAt < selected.nextAttemptAt) {
 					selected = delivery;
 				}
@@ -2022,8 +2146,11 @@ export class AsyncJobManager {
 		}
 	}
 
-#isDeliveryAcknowledged(jobId: string, generation?: string): boolean {
-		return (generation !== undefined && this.#suppressedDeliveries.has(generation)) || this.#suppressedDeliveries.has(jobId);
+	#isDeliveryAcknowledged(jobId: string, generation?: string): boolean {
+		return (
+			(generation !== undefined && this.#suppressedDeliveries.has(generation)) ||
+			this.#suppressedDeliveries.has(jobId)
+		);
 	}
 
 	isDeliverySuppressed(jobId: string, generation?: string): boolean {
@@ -2059,7 +2186,7 @@ export class AsyncJobManager {
 		}
 	}
 
-#enqueueDelivery(jobId: string, text: string): void {
+	#enqueueDelivery(jobId: string, text: string): void {
 		const job = this.#jobs.get(jobId);
 		if (!job || this.#isDeliveryAcknowledged(jobId, job.generation)) return;
 		const deliveryText = this.#boundedDeliveryText(text);
@@ -2115,7 +2242,8 @@ export class AsyncJobManager {
 	async #runDeliveryLoop(): Promise<void> {
 		while (this.#deliveries.length > 0) {
 			const delivery = this.#deliveries.find(
-				candidate => !this.isDeliverySuppressed(candidate.jobId, candidate.generation) && !this.#isDeliveryFenced(candidate),
+				candidate =>
+					!this.isDeliverySuppressed(candidate.jobId, candidate.generation) && !this.#isDeliveryFenced(candidate),
 			);
 			if (!delivery) return;
 			const waitMs = delivery.nextAttemptAt - Date.now();
@@ -2124,7 +2252,8 @@ export class AsyncJobManager {
 			}
 			const index = this.#deliveries.indexOf(delivery);
 			if (index === -1) continue;
-			if (this.isDeliverySuppressed(delivery.jobId, delivery.generation) || this.#isDeliveryFenced(delivery)) continue;
+			if (this.isDeliverySuppressed(delivery.jobId, delivery.generation) || this.#isDeliveryFenced(delivery))
+				continue;
 
 			this.#deliveries.splice(index, 1);
 			await this.#deliverDelivery(delivery);
@@ -2152,7 +2281,10 @@ export class AsyncJobManager {
 				} else {
 					delivery.nextAttemptAt = Date.now() + this.#getRetryDelay(delivery.attempt);
 					const currentJob = this.#jobs.get(delivery.jobId);
-					if (currentJob?.generation === delivery.generation && !this.#isDeliveryAcknowledged(delivery.jobId, delivery.generation)) {
+					if (
+						currentJob?.generation === delivery.generation &&
+						!this.#isDeliveryAcknowledged(delivery.jobId, delivery.generation)
+					) {
 						this.#deliveries.push(delivery);
 					}
 					logger.warn("Async job completion delivery failed", {

@@ -554,13 +554,22 @@ describe("AsyncJobManager", () => {
 		const targets = [manager.resolveSubagentWaitTarget(first)!, manager.resolveSubagentWaitTarget(second)!];
 		const all = manager.subscribeTerminalWait(targets, "all_terminal");
 		const any = manager.subscribeTerminalWait(targets, "any_terminal");
-		expect(await any.result).toMatchObject({ outcome: "completed", condition: "any_terminal", terminalJobIds: [first] });
+		expect(await any.result).toMatchObject({
+			outcome: "completed",
+			condition: "any_terminal",
+			terminalJobIds: [first],
+		});
 		expect(any.acknowledge()).toEqual({ acknowledged: true, jobIds: [first] });
 		expect(any.acknowledge()).toEqual({ acknowledged: false, jobIds: [] });
 
 		secondGate.resolve("two");
 		await manager.getJob(second)?.promise;
-		expect(await all.result).toMatchObject({ outcome: "completed", condition: "all_terminal", terminalJobIds: [first, second], pendingJobIds: [] });
+		expect(await all.result).toMatchObject({
+			outcome: "completed",
+			condition: "all_terminal",
+			terminalJobIds: [first, second],
+			pendingJobIds: [],
+		});
 		expect(all.acknowledge()).toEqual({ acknowledged: true, jobIds: [first, second] });
 		await manager.dispose({ timeoutMs: 100 });
 	});
@@ -580,21 +589,56 @@ describe("AsyncJobManager", () => {
 
 	test("paused and queued cancellation publish terminal wait evidence", async () => {
 		const pausedManager = new AsyncJobManager({ onJobComplete: async () => {} });
-		const pausedJobId = pausedManager.register("task", "pause", async () => ({ kind: "paused", note: "safe boundary" }), { id: "paused-job" });
-		pausedManager.registerSubagentRecord({ subagentId: "paused-subagent", ownerId: "0-Main", currentJobId: pausedJobId, historicalJobIds: [], status: "running", sessionFile: "/tmp/paused.jsonl", resumable: true });
+		const pausedJobId = pausedManager.register(
+			"task",
+			"pause",
+			async () => ({ kind: "paused", note: "safe boundary" }),
+			{ id: "paused-job" },
+		);
+		pausedManager.registerSubagentRecord({
+			subagentId: "paused-subagent",
+			ownerId: "0-Main",
+			currentJobId: pausedJobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: "/tmp/paused.jsonl",
+			resumable: true,
+		});
 		await pausedManager.getJob(pausedJobId)?.promise;
-		const pausedWait = pausedManager.subscribeTerminalWait([pausedManager.resolveSubagentWaitTarget("paused-subagent")!]);
+		const pausedWait = pausedManager.subscribeTerminalWait([
+			pausedManager.resolveSubagentWaitTarget("paused-subagent")!,
+		]);
 		expect(pausedManager.cancelSubagent("paused-subagent", { ownerId: "0-Main" })).toBe(true);
 		expect(await pausedWait.result).toMatchObject({ outcome: "completed", terminalJobIds: ["paused-subagent"] });
 		await pausedManager.dispose({ timeoutMs: 100 });
 
 		const queuedManager = new AsyncJobManager({ maxRunningJobs: 1, onJobComplete: async () => {} });
 		const blockerGate = Promise.withResolvers<void>();
-		const blocker = queuedManager.register("task", "blocker", async () => { await blockerGate.promise; return "released"; }, { id: "queue-blocker", ownerId: "0-Main" });
-		queuedManager.registerSubagentRecord({ subagentId: "queued-subagent", ownerId: "0-Main", currentJobId: null, historicalJobIds: [], status: "completed", sessionFile: "/tmp/queued.jsonl", resumable: true });
-		queuedManager.setResumeRunner(() => queuedManager.register("task", "queued resume", async () => "resumed", { ownerId: "0-Main" }));
+		const blocker = queuedManager.register(
+			"task",
+			"blocker",
+			async () => {
+				await blockerGate.promise;
+				return "released";
+			},
+			{ id: "queue-blocker", ownerId: "0-Main" },
+		);
+		queuedManager.registerSubagentRecord({
+			subagentId: "queued-subagent",
+			ownerId: "0-Main",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "completed",
+			sessionFile: "/tmp/queued.jsonl",
+			resumable: true,
+		});
+		queuedManager.setResumeRunner(() =>
+			queuedManager.register("task", "queued resume", async () => "resumed", { ownerId: "0-Main" }),
+		);
 		expect(queuedManager.resumeSubagent("queued-subagent", { ownerId: "0-Main" }).queued).toBe(true);
-		const queuedWait = queuedManager.subscribeTerminalWait([queuedManager.resolveSubagentWaitTarget("queued-subagent")!]);
+		const queuedWait = queuedManager.subscribeTerminalWait([
+			queuedManager.resolveSubagentWaitTarget("queued-subagent")!,
+		]);
 		expect(queuedManager.cancelSubagent("queued-subagent", { ownerId: "0-Main" })).toBe(true);
 		expect(await queuedWait.result).toMatchObject({ outcome: "completed", terminalJobIds: ["queued-subagent"] });
 		blockerGate.resolve();
