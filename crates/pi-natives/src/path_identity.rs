@@ -1117,9 +1117,9 @@ pub(crate) mod platform {
 	/// pathological signal storm turning a retry loop into a hang.
 	const EINTR_RETRY_LIMIT: u32 = 8;
 
-	/// Test-only fault injection: the next N calls into the no-replace rename
-	/// primitive report a synthetic EINTR before the real syscall runs, letting
-	/// tests exercise the restart loop without racing a real signal.
+	// Test-only fault injection: the next N calls into the no-replace rename
+	// primitive report a synthetic EINTR before the real syscall runs, letting
+	// tests exercise the restart loop without racing a real signal.
 	#[cfg(test)]
 	thread_local! {
 		static RENAME_NO_REPLACE_EINTR_INJECT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };

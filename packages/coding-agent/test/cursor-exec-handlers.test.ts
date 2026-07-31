@@ -8,7 +8,7 @@
  */
 import { describe, expect, it } from "bun:test";
 import { create } from "@bufbuild/protobuf";
-import type { AgentTool } from "@gajae-code/agent-core";
+import type { AgentTool, AgentToolContext } from "@gajae-code/agent-core";
 import {
 	DiagnosticsArgsSchema,
 	GrepArgsSchema,
@@ -17,6 +17,7 @@ import {
 	ShellArgsSchema,
 	WriteArgsSchema,
 } from "@gajae-code/ai/providers/cursor/gen/agent_pb";
+import { Settings } from "../src/config/settings";
 import { CursorExecHandlers } from "../src/cursor";
 
 function makeTool(name: string): AgentTool {
@@ -69,6 +70,32 @@ describe("CursorExecHandlers detached invocation (#484)", () => {
 			expect(result.role).toBe("toolResult");
 			expect(result.isError).toBeFalsy();
 		}
+	});
+
+	it("caps a thrown tool error before final Cursor delivery", async () => {
+		const tool = {
+			name: "read",
+			label: "read",
+			execute: async () => {
+				throw new Error("x".repeat(16 * 1024));
+			},
+		} as unknown as AgentTool;
+		const settings = Settings.isolated({ "tools.maxInlineResultBytes": 1 });
+		const handlers = new CursorExecHandlers({
+			cwd: process.cwd(),
+			tools: new Map([["read", tool]]),
+			getToolContext: () => ({ settings }) as AgentToolContext,
+		});
+
+		const result = await handlers.read(create(ReadArgsSchema, { path: "/tmp/a.txt", toolCallId: "cap" }));
+		const text = result.content
+			.filter(block => block.type === "text")
+			.map(block => block.text)
+			.join("\n");
+
+		expect(result.isError).toBe(true);
+		expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(1024);
+		expect(text).toContain("Artifact storage failed");
 	});
 });
 

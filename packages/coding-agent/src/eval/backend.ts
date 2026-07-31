@@ -11,8 +11,8 @@ export interface ExecutorBackendExecOptions {
 	session: ToolSession;
 	deadlineMs: number;
 	reset: boolean;
-	artifactPath: string | undefined;
-	artifactId: string | undefined;
+	artifactPath?: string;
+	artifactId?: string;
 	onChunk: (chunk: string) => void;
 }
 

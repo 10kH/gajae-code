@@ -66,6 +66,15 @@ pub trait ExternalCommandOutputMarker: Send + Sync {
 	) -> Option<ExternalCommandOutputMarkers>;
 }
 
+/// Optional hook for embedders that must own the exact process groups spawned
+/// by one execution request.
+pub trait ExternalCommandProcessObserver: Send + Sync {
+	/// Records the child PID and effective process group immediately after spawn.
+	fn external_command_spawned(&self, pid: Option<i32>, process_group_id: Option<i32>);
+	/// Records authoritative child reaping after a previously observed spawn.
+	fn external_command_settled(&self, pid: Option<i32>);
+}
+
 /// Parameters for execution.
 #[derive(Clone, Default)]
 pub struct ExecutionParameters {
@@ -77,6 +86,8 @@ pub struct ExecutionParameters {
 	cancel_token:             Option<CancellationToken>,
 	/// Optional command-output marker hook.
 	command_output_marker:    Option<Arc<dyn ExternalCommandOutputMarker>>,
+	/// Optional process-group ownership hook.
+	process_group_observer:  Option<Arc<dyn ExternalCommandProcessObserver>>,
 	/// Whether command-output marking was disabled by shell syntax that can
 	/// consume or redirect command output.
 	command_output_disabled:  bool,
@@ -94,6 +105,21 @@ impl ExecutionParameters {
 	/// Returns the cancellation token, if present.
 	pub fn cancel_token(&self) -> Option<CancellationToken> {
 		self.cancel_token.clone()
+	}
+
+	/// Assigns an observer for exact external-command process ownership.
+	pub fn set_process_group_observer(&mut self, observer: Arc<dyn ExternalCommandProcessObserver>) {
+		self.process_group_observer = Some(observer);
+	}
+
+	pub(crate) fn notify_external_command_spawned(&self, pid: Option<i32>, process_group_id: Option<i32>) {
+		if let Some(observer) = &self.process_group_observer {
+			observer.external_command_spawned(pid, process_group_id);
+		}
+	}
+
+	pub(crate) fn process_group_observer(&self) -> Option<Arc<dyn ExternalCommandProcessObserver>> {
+		self.process_group_observer.clone()
 	}
 
 	/// Returns true when cancellation has been requested.
@@ -2131,12 +2157,19 @@ fn setup_process_substitution(
 	// Asynchronously spawn off the subshell; we intentionally don't block on its
 	// completion.
 	let subshell_cmd = subshell_cmd.to_owned();
+	let process_observer = child_params.process_group_observer();
+	if let Some(observer) = &process_observer {
+		observer.external_command_spawned(None, None);
+	}
 	tokio::spawn(async move {
 		// Intentionally ignore the result of the subshell command.
 		let _ = subshell_cmd
 			.list
 			.execute(&mut subshell, &child_params)
 			.await;
+		if let Some(observer) = process_observer {
+			observer.external_command_settled(None);
+		}
 	});
 
 	// Starting at 63 (a.k.a. 64-1)--and decrementing--look for an

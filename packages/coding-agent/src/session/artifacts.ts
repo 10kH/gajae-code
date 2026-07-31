@@ -9,8 +9,10 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 
 import * as path from "node:path";
+import { isValidArtifactId } from "../utils/artifact-id";
 import {
 	ensureManagedDirectory,
+	type ManagedFileSnapshot,
 	type ManagedSessionDescendantStore,
 	publishManagedFileNoReplace,
 } from "./internal/managed-session-storage";
@@ -33,6 +35,9 @@ function isSafeFilename(filename: string): boolean {
 	return /^[a-zA-Z0-9_.-]+$/.test(filename);
 }
 
+const MANAGED_OUTPUT_GENERATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+
 function parseManagedOutputGeneration(value: Uint8Array, outputFilenamePrefix: string): ManagedOutputGeneration | null {
 	try {
 		const parsed = JSON.parse(Buffer.from(value).toString("utf8")) as Partial<ManagedOutputGeneration>;
@@ -43,10 +48,19 @@ function parseManagedOutputGeneration(value: Uint8Array, outputFilenamePrefix: s
 			typeof parsed.outputSha256 !== "string" ||
 			typeof parsed.metadataSizeBytes !== "number" ||
 			typeof parsed.metadataSha256 !== "string" ||
+			!Number.isSafeInteger(parsed.outputSizeBytes) ||
+			(parsed.outputSizeBytes ?? -1) < 0 ||
+			!Number.isSafeInteger(parsed.metadataSizeBytes) ||
+			(parsed.metadataSizeBytes ?? -1) < 0 ||
+			!SHA256_PATTERN.test(parsed.outputSha256) ||
+			!SHA256_PATTERN.test(parsed.metadataSha256) ||
 			!isSafeFilename(parsed.outputFilename) ||
 			!isSafeFilename(parsed.metadataFilename) ||
 			!parsed.outputFilename.startsWith(`${outputFilenamePrefix}.`) ||
 			!parsed.outputFilename.endsWith(".output") ||
+			!MANAGED_OUTPUT_GENERATION_ID_PATTERN.test(
+				parsed.outputFilename.slice(outputFilenamePrefix.length + 1, -".output".length),
+			) ||
 			parsed.metadataFilename !== `${parsed.outputFilename}.meta.json`
 		)
 			return null;
@@ -57,10 +71,34 @@ function parseManagedOutputGeneration(value: Uint8Array, outputFilenamePrefix: s
 }
 
 function sameGeneration(left: ManagedOutputGeneration, right: ManagedOutputGeneration): boolean {
-	return left.outputFilename === right.outputFilename && left.metadataFilename === right.metadataFilename;
+	return (
+		left.outputFilename === right.outputFilename &&
+		left.metadataFilename === right.metadataFilename &&
+		left.outputSizeBytes === right.outputSizeBytes &&
+		left.outputSha256 === right.outputSha256 &&
+		left.metadataSizeBytes === right.metadataSizeBytes &&
+		left.metadataSha256 === right.metadataSha256
+	);
+}
+
+function referencesGeneration(value: Uint8Array, generation: ManagedOutputGeneration): boolean {
+	try {
+		const parsed = JSON.parse(Buffer.from(value).toString("utf8")) as Partial<ManagedOutputGeneration>;
+		return (
+			parsed.outputFilename === generation.outputFilename && parsed.metadataFilename === generation.metadataFilename
+		);
+	} catch {
+		return false;
+	}
 }
 export interface ArtifactSaveOptions {
 	maxBytes?: number;
+}
+
+export interface ArtifactSaveReceipt {
+	id: string;
+	complete: boolean;
+	omittedBytes?: number;
 }
 
 /**
@@ -79,6 +117,7 @@ export class ArtifactManager {
 	readonly #store: ManagedSessionDescendantStore | undefined;
 	#dirCreated = false;
 	#initialized = false;
+	#initializing: Promise<void> | undefined;
 
 	/**
 	 * @param dir Directory that will hold artifact files. Created lazily on first save.
@@ -113,15 +152,21 @@ export class ArtifactManager {
 	}
 
 	async #ensureDir(): Promise<void> {
-		if (!this.#dirCreated) {
-			if (this.#store) this.#store.ensureDirectory();
-			else ensureManagedDirectory(this.#dir);
-			this.#dirCreated = true;
+		if (this.#initialized) return;
+		if (!this.#initializing) {
+			this.#initializing = (async () => {
+				if (!this.#dirCreated) {
+					if (this.#store) this.#store.ensureDirectory();
+					else ensureManagedDirectory(this.#dir);
+					this.#dirCreated = true;
+				}
+				await this.#scanExistingIds();
+				this.#initialized = true;
+			})().finally(() => {
+				this.#initializing = undefined;
+			});
 		}
-		if (!this.#initialized) {
-			await this.#scanExistingIds();
-			this.#initialized = true;
-		}
+		await this.#initializing;
 	}
 
 	#filename(id: string, toolType: string): string {
@@ -159,58 +204,116 @@ export class ArtifactManager {
 		}
 		await this.#ensureDir();
 		if (!this.#store) throw new Error("Managed output generation requires retained authority");
+		const mutationFence = await this.#store.acquireMutationFence(`${selectorFilename}.publish`);
+		try {
+			const priorSelector = this.#store.readExpected(selectorFilename);
+			const priorGeneration = priorSelector
+				? parseManagedOutputGeneration(priorSelector.bytes, outputFilenamePrefix)
+				: null;
+			const generationId = randomUUID();
+			const outputFilename = `${outputFilenamePrefix}.${generationId}.output`;
+			const metadataFilename = `${outputFilename}.meta.json`;
+			const generation: ManagedOutputGeneration = {
+				outputFilename,
+				metadataFilename,
+				outputSizeBytes: outputBytes.byteLength,
+				outputSha256: sha256(outputBytes),
+				metadataSizeBytes: metadataBytes.byteLength,
+				metadataSha256: sha256(metadataBytes),
+			};
 
-		const priorSelector = this.#store.readExpected(selectorFilename);
-		const priorGeneration = priorSelector
-			? parseManagedOutputGeneration(priorSelector.bytes, outputFilenamePrefix)
-			: null;
-		const generationId = randomUUID();
-		const outputFilename = `${outputFilenamePrefix}.${generationId}.output`;
-		const metadataFilename = `${outputFilename}.meta.json`;
-		const generation: ManagedOutputGeneration = {
-			outputFilename,
-			metadataFilename,
-			outputSizeBytes: outputBytes.byteLength,
-			outputSha256: sha256(outputBytes),
-			metadataSizeBytes: metadataBytes.byteLength,
-			metadataSha256: sha256(metadataBytes),
-		};
+			// Immutable generations are not visible until the selector is replaced.
+			let stagedOutput: ManagedFileSnapshot | undefined;
+			let stagedMetadata: ManagedFileSnapshot | undefined;
+			const removeStaged = () => {
+				for (const [filename, snapshot] of [
+					[metadataFilename, stagedMetadata],
+					[outputFilename, stagedOutput],
+				] as const) {
+					if (!snapshot) continue;
+					try {
+						this.#store!.removeExpected(filename, snapshot);
+					} catch {
+						// An identity mismatch is not authority to remove a successor.
+					}
+				}
+			};
+			try {
+				await this.#store.publishNoReplace(outputFilename, outputBytes);
+				stagedOutput = this.#store.readExpected(outputFilename) ?? undefined;
+				if (
+					!stagedOutput ||
+					stagedOutput.bytes.byteLength !== generation.outputSizeBytes ||
+					sha256(stagedOutput.bytes) !== generation.outputSha256
+				) {
+					throw new Error("managed_output_generation_verification_failed");
+				}
+				await this.#store.publishNoReplace(metadataFilename, metadataBytes);
+				stagedMetadata = this.#store.readExpected(metadataFilename) ?? undefined;
+				if (
+					!stagedMetadata ||
+					stagedMetadata.bytes.byteLength !== generation.metadataSizeBytes ||
+					sha256(stagedMetadata.bytes) !== generation.metadataSha256
+				) {
+					throw new Error("managed_output_generation_verification_failed");
+				}
+			} catch (error) {
+				removeStaged();
+				throw error;
+			}
 
-		// Immutable generations are not visible until the selector is replaced.
-		await this.#store.publishNoReplace(outputFilename, outputBytes);
-		await this.#store.publishNoReplace(metadataFilename, metadataBytes);
-		const stagedOutput = this.#store.readExpected(outputFilename);
-		const stagedMetadata = this.#store.readExpected(metadataFilename);
-		if (
-			!stagedOutput ||
-			!stagedMetadata ||
-			stagedOutput.bytes.byteLength !== generation.outputSizeBytes ||
-			stagedMetadata.bytes.byteLength !== generation.metadataSizeBytes ||
-			sha256(stagedOutput.bytes) !== generation.outputSha256 ||
-			sha256(stagedMetadata.bytes) !== generation.metadataSha256
-		) {
-			throw new Error("managed_output_generation_verification_failed");
-		}
-
-		await this.#store.replace(selectorFilename, Buffer.from(JSON.stringify(generation), "utf8"));
-		const publishedSelector = this.#store.readExpected(selectorFilename);
-		const publishedGeneration = publishedSelector
-			? parseManagedOutputGeneration(publishedSelector.bytes, outputFilenamePrefix)
-			: null;
-		if (!publishedGeneration || !sameGeneration(publishedGeneration, generation)) {
-			throw new Error("managed_output_selector_verification_failed");
-		}
-
-		// Cleanup cannot affect the selected generation or publication outcome.
-		if (priorGeneration && !sameGeneration(priorGeneration, generation)) {
-			for (const filename of [priorGeneration.outputFilename, priorGeneration.metadataFilename]) {
+			const rollbackSelector = (observed: ManagedFileSnapshot | null): boolean => {
+				if (!observed || !referencesGeneration(observed.bytes, generation)) return false;
 				try {
-					const previous = this.#store.readExpected(filename);
-					if (previous) this.#store.removeExpected(filename, previous);
+					if (priorSelector) {
+						this.#store!.replaceExpected(selectorFilename, priorSelector.bytes, observed);
+					} else {
+						this.#store!.removeExpected(selectorFilename, observed);
+					}
+					return true;
 				} catch {
-					// Retain unreachable generations for a later safe cleanup.
+					return false;
+				}
+			};
+			const selectorBytes = Buffer.from(JSON.stringify(generation), "utf8");
+			try {
+				if (priorSelector) this.#store.replaceExpected(selectorFilename, selectorBytes, priorSelector);
+				else await this.#store.publishNoReplace(selectorFilename, selectorBytes);
+			} catch (error) {
+				let observed: ManagedFileSnapshot | null = null;
+				let observedRead = false;
+				try {
+					observed = this.#store.readExpected(selectorFilename);
+					observedRead = true;
+				} catch {
+					// Without an exact selector snapshot, staged files remain quarantined.
+				}
+				if (observedRead && (!observed || !referencesGeneration(observed.bytes, generation))) removeStaged();
+				else if (rollbackSelector(observed)) removeStaged();
+				throw error;
+			}
+			const publishedSelector = this.#store.readExpected(selectorFilename);
+			const publishedGeneration = publishedSelector
+				? parseManagedOutputGeneration(publishedSelector.bytes, outputFilenamePrefix)
+				: null;
+			if (!publishedGeneration || !sameGeneration(publishedGeneration, generation)) {
+				if (rollbackSelector(publishedSelector)) removeStaged();
+				throw new Error("managed_output_selector_verification_failed");
+			}
+
+			// Cleanup cannot affect the selected generation or publication outcome.
+			if (priorGeneration && !sameGeneration(priorGeneration, generation)) {
+				for (const filename of [priorGeneration.outputFilename, priorGeneration.metadataFilename]) {
+					try {
+						const previous = this.#store.readExpected(filename);
+						if (previous) this.#store.removeExpected(filename, previous);
+					} catch {
+						// Retain unreachable generations for a later safe cleanup.
+					}
 				}
 			}
+		} finally {
+			await mutationFence?.release();
 		}
 	}
 	async publishNamedNoReplace(filename: string, bytes: Uint8Array): Promise<void> {
@@ -252,8 +355,8 @@ export class ArtifactManager {
 		for (const file of files) {
 			// Files are named: {id}.{toolType}.log
 			const match = file.match(/^(\d+)\..*\.log$/);
-			if (match) {
-				const id = parseInt(match[1], 10);
+			if (match && isValidArtifactId(match[1])) {
+				const id = Number(match[1]);
 				if (id > maxId) maxId = id;
 			}
 		}
@@ -265,6 +368,9 @@ export class ArtifactManager {
 	 * IDs are sequential within the session.
 	 */
 	allocateId(): number {
+		if (!Number.isSafeInteger(this.#nextId) || this.#nextId < 0) {
+			throw new Error("Artifact id space exhausted");
+		}
 		return this.#nextId++;
 	}
 
@@ -281,25 +387,28 @@ export class ArtifactManager {
 		return { id, path: path.join(this.#dir, this.#filename(id, toolType)) };
 	}
 
-	/**
-	 * Save content as an artifact and return the artifact ID.
-	 * Content is written to a private temporary inode, synced, and linked into
-	 * the artifact directory only after the complete terminal payload exists.
-	 */
-	async save(content: string, toolType: string, options: ArtifactSaveOptions = {}): Promise<string> {
+	/** Save content and return the artifact ID plus exact storage completeness evidence. */
+	async saveWithReceipt(
+		content: string,
+		toolType: string,
+		options: ArtifactSaveOptions = {},
+	): Promise<ArtifactSaveReceipt> {
 		await this.#ensureDir();
 		const id = String(this.allocateId());
 		const maxBytes = Math.max(0, options.maxBytes ?? DEFAULT_ARTIFACT_MAX_BYTES);
 		const contentBytes = Buffer.byteLength(content, "utf-8");
-		const published =
-			contentBytes > maxBytes
-				? (() => {
-						const truncated = truncateHeadBytes(content, maxBytes);
-						return `${truncated.text}\n[artifact truncated after ${truncated.bytes} bytes; omitted at least ${contentBytes - truncated.bytes} bytes]\n`;
-					})()
-				: content;
+		const truncated = contentBytes > maxBytes ? truncateHeadBytes(content, maxBytes) : undefined;
+		const omittedBytes = truncated ? contentBytes - truncated.bytes : undefined;
+		const published = truncated
+			? `${truncated.text}\n[artifact truncated after ${truncated.bytes} bytes; omitted at least ${omittedBytes} bytes]\n`
+			: content;
 		await this.#publish(published, this.#filename(id, toolType));
-		return id;
+		return { id, complete: omittedBytes === undefined, omittedBytes };
+	}
+
+	/** Save content as an artifact and return the artifact ID. */
+	async save(content: string, toolType: string, options: ArtifactSaveOptions = {}): Promise<string> {
+		return (await this.saveWithReceipt(content, toolType, options)).id;
 	}
 
 	/**
@@ -330,8 +439,36 @@ export class ArtifactManager {
 	 * @param id Artifact ID (numeric string)
 	 */
 	async getPath(id: string): Promise<string | null> {
+		if (!isValidArtifactId(id)) return null;
 		const files = await this.listFiles();
-		const match = files.find(f => f.startsWith(`${id}.`));
-		return match ? path.join(this.#dir, match) : null;
+		const matches = files.filter(filename => new RegExp(`^${id}\\.[a-zA-Z0-9_-]+\\.log$`, "u").test(filename));
+		if (matches.length !== 1) return null;
+		const filename = matches[0]!;
+		if (this.#store) {
+			try {
+				return this.#store.readExpected(filename) ? path.join(this.#dir, filename) : null;
+			} catch {
+				return null;
+			}
+		}
+		try {
+			const rootBefore = await fs.lstat(this.#dir, { bigint: true });
+			if (!rootBefore.isDirectory() || rootBefore.isSymbolicLink()) return null;
+			const artifactPath = path.join(this.#dir, filename);
+			const leaf = await fs.lstat(artifactPath, { bigint: true });
+			if (!leaf.isFile() || leaf.isSymbolicLink() || leaf.nlink !== 1n) return null;
+			const rootAfter = await fs.lstat(this.#dir, { bigint: true });
+			if (
+				!rootAfter.isDirectory() ||
+				rootAfter.isSymbolicLink() ||
+				rootAfter.dev !== rootBefore.dev ||
+				rootAfter.ino !== rootBefore.ino
+			) {
+				return null;
+			}
+			return artifactPath;
+		} catch {
+			return null;
+		}
 	}
 }

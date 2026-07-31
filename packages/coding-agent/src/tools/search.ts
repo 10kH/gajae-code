@@ -24,7 +24,7 @@ import {
 import { createFileRecorder, formatResultPath } from "./file-recorder";
 import { formatGroupedFiles } from "./grouped-file-output";
 import { formatMatchLine } from "./match-line-format";
-import { formatFullOutputReference, type OutputMeta } from "./output-meta";
+import { formatArtifactEvidenceNotice, type OutputMeta } from "./output-meta";
 import { resolveReadPath, resolveToolSearchScope } from "./path-utils";
 import {
 	createCachedComponent,
@@ -687,8 +687,9 @@ export const searchToolRenderer = {
 		const matchCount = details?.matchCount ?? 0;
 		const fileCount = details?.fileCount ?? 0;
 		const truncation = details?.meta?.truncation;
+		const directTruncation = details?.truncation;
 		const limits = details?.meta?.limits;
-		const truncated = Boolean(details?.truncated || truncation || limits?.columnTruncated);
+		const truncated = Boolean(details?.truncated || truncation || directTruncation || limits?.columnTruncated);
 
 		const missingPathsList = details?.missingPaths ?? [];
 		const missingNote =
@@ -724,9 +725,13 @@ export const searchToolRenderer = {
 		const truncationReasons: string[] = [];
 		if (renderedFileLimit) truncationReasons.push(`first ${renderedFileLimit} files (skip to paginate)`);
 		if (renderedPerFileLimit) truncationReasons.push(`first ${renderedPerFileLimit} matches per file`);
-		if (truncation) truncationReasons.push(truncation.truncatedBy === "lines" ? "line limit" : "size limit");
+		const displayedTruncation = truncation ?? directTruncation;
+		if (displayedTruncation) {
+			truncationReasons.push(displayedTruncation.truncatedBy === "lines" ? "line limit" : "size limit");
+		}
 		if (limits?.columnTruncated) truncationReasons.push(`line length ${limits.columnTruncated.maxColumn}`);
-		if (truncation?.artifactId) truncationReasons.push(formatFullOutputReference(truncation.artifactId));
+		const artifactEvidence = truncation ? formatArtifactEvidenceNotice(truncation) : undefined;
+		if (artifactEvidence) truncationReasons.push(artifactEvidence);
 
 		const extraLines: string[] = [];
 		if (truncationReasons.length > 0) {

@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
 #[cfg(target_os = "linux")]
-const MAX_CONTENT_BYTES: u64 = 1024 * 1024;
+const MAX_CONTENT_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_MANAGED_CONTENT_BYTES: u64 = 64 * 1024 * 1024;
 #[cfg(target_os = "linux")]

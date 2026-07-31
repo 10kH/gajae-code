@@ -8,7 +8,7 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 28;
+export const GUARD_CONTRACT_VERSION = 32;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
@@ -36,7 +36,10 @@ const nativeAuthorityDeclarations = {
 		"exact_remove_directory_tree",
 	],
 	"crates/pi-natives/src/ps.rs": ["napi impl Process"],
-	"crates/pi-shell/src/process.rs": ["impl Process", "kill_process_group", "current_descendant_pids", "add_new_descendants"],
+	"crates/pi-shell/src/process.rs": ["impl Process", "kill_process_group", "process_group_members", "current_descendant_pids", "add_new_descendants"],
+	"crates/pi-shell/src/shell.rs": ["const MAX_OWNED_COMMAND_PROCESSES", "const MAX_PENDING_SHELL_RUNS", "impl Shell", "impl CommandProcessGroups", "impl ExternalCommandProcessObserver for CommandProcessGroups", "run_shell_session", "run_shell_oneshot", "run_shell_oneshot_streams", "run_shell_command", "run_shell_command_streams", "terminate_owned_process_groups", "impl builtins::Command for TimeoutCommand"],
+	"crates/brush-core-vendored/src/interp.rs": ["trait ExternalCommandProcessObserver", "set_process_group_observer", "notify_external_command_spawned"],
+	"crates/brush-core-vendored/src/commands.rs": ["observed_process_group_id", "execute_external_command"],
 	"packages/natives/native/index.d.ts": ["Process"],
 	"packages/coding-agent/src/sdk/broker/process-incarnation.ts": ["isProcessIncarnation", "processIncarnation"],
 } as const;
@@ -217,7 +220,7 @@ function inventoryHash(inventory: Inventory): string {
 }
 
 export function validateInventory(inventory: Inventory = protectedInventory): void {
-	if (GUARD_CONTRACT_VERSION !== 28) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
+	if (GUARD_CONTRACT_VERSION !== 32) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
 	for (const [family, files] of Object.entries(inventory)) {
 		for (const [file, symbols] of Object.entries(files)) {
 			if (!file || symbols.length === 0 || new Set(symbols).size !== symbols.length)
@@ -498,6 +501,17 @@ function manifestPolicySignature(source: string | undefined): string | undefined
 		return undefined;
 	}
 }
+function manifestNativeAuthoritySources(source: string | undefined): Set<string> {
+	try {
+		const parsed = source ? JSON.parse(source) : undefined;
+		const native = parsed?.nativeAuthoritySha256;
+		if (!native || typeof native !== "object" || Array.isArray(native)) return new Set();
+		return new Set(Object.keys(native));
+	} catch {
+		return new Set();
+	}
+}
+
 
 function malformedDeclaration(): Declaration {
 	return { text: "<malformed>", canonical: "<malformed>", valid: false };
@@ -702,11 +716,29 @@ function rustDeclaration(source: string, selector: string): Declaration {
 	const lexical = rustLexicalSource(source);
 	if (!lexical.valid) return malformedDeclaration();
 	const declarationName = selector;
+	if (declarationName.startsWith("const ")) {
+		const name = declarationName.slice("const ".length);
+		const pattern = new RegExp(`(?:#\\[[^\\]]+\\]\\s*)*(?:pub(?:\\([^)]*\\))?\\s+)?const\\s+${name}\\b`, "g");
+		const matches = [...lexical.code.matchAll(pattern)];
+		if (matches.length === 0) return undefined;
+		const declarations = matches.map(match => {
+			const start = match.index!;
+			const end = lexical.code.indexOf(";", start);
+			return end < 0 ? undefined : source.slice(start, end + 1);
+		});
+		if (declarations.some(declaration => declaration === undefined)) return malformedDeclaration();
+		const text = declarations.join("\n");
+		return { text, canonical: text.replace(/\/\*[\s\S]*?\*\/|\/\/.*|\s+/g, ""), valid: true };
+	}
 	const prefix = declarationName === "napi impl Process"
 		? "#\\[napi\\](?:\\s*#\\[[^\\]]+\\])*\\s*impl\\s+Process\\b"
 		: declarationName === "impl Process"
 			? "impl\\s+Process\\b"
-			: `(?:#\\[[^\\]]+\\]\\s*)*pub(?:\\(super\\))?\\s+(?:async\\s+)?fn\\s+${declarationName}\\b`;
+			: declarationName.startsWith("impl ")
+				? declarationName.replaceAll(" ", "\\s+")
+				: declarationName.startsWith("trait ")
+					? `(?:#\\[[^\\]]+\\]\\s*)*pub\\s+trait\\s+${declarationName.slice("trait ".length)}\\b`
+					: `(?:#\\[[^\\]]+\\]\\s*)*(?:pub(?:\\([^)]*\\))?\\s+)?(?:async\\s+)?fn\\s+${declarationName}\\b`;
 	const pattern = new RegExp(prefix, "g");
 	const matches = [...lexical.code.matchAll(pattern)];
 	if (matches.length === 0) return undefined;
@@ -715,7 +747,7 @@ function rustDeclaration(source: string, selector: string): Declaration {
 		const start = match.index!;
 		const headerEnd = start + match[0].length;
 		const open = lexical.code.indexOf("{", headerEnd);
-		if (open === -1 || /;|\b(?:pub\s+)?(?:async\s+)?fn\b|\bimpl\b/.test(lexical.code.slice(headerEnd, open))) return malformedDeclaration();
+		if (open === -1 || /;|\b(?:pub\s+)?(?:async\s+)?fn\b/.test(lexical.code.slice(headerEnd, open))) return malformedDeclaration();
 		let depth = 0;
 		let end = -1;
 		for (let index = open; index < lexical.code.length; index++) {
@@ -787,12 +819,24 @@ export function evaluate(
 			}
 		}
 	}
+	const baseGuardContractVersion = guardContractVersion(base.get(guardScript));
+	const headGuardContractVersion = guardContractVersion(head.get(guardScript));
+	const guardContractBumped =
+		headGuardContractVersion !== undefined &&
+		headGuardContractVersion > (baseGuardContractVersion ?? Number.POSITIVE_INFINITY);
+	const baseNativeAuthoritySources = manifestNativeAuthoritySources(base.get(manifestScript));
+	const headNativeAuthoritySources = manifestNativeAuthoritySources(head.get(manifestScript));
+	const hasManifestNativeAuthority = baseNativeAuthoritySources.size > 0 || headNativeAuthoritySources.size > 0;
 	for (const source of nativeAuthoritySources) {
 		if (!base.has(source) && !head.has(source)) continue;
 		const before = nativeAuthorityDigest(source, base.get(source));
 		const after = nativeAuthorityDigest(source, head.get(source));
 		const label = `${source}:authority`;
-		if (!before || !after) malformedDeclarations.push(label);
+		if (
+			((!bootstrapping && !guardContractBumped && (!hasManifestNativeAuthority || baseNativeAuthoritySources.has(source))) && !before) ||
+			((!hasManifestNativeAuthority || headNativeAuthoritySources.has(source)) && !after)
+		)
+			malformedDeclarations.push(label);
 		if (before !== after) for (const family of nativeAuthorityFamilies[source]) protectedChanges.push(`${family}:${label}`);
 	}
 	const nativeAuthorityChanges = protectedChanges.filter(change => change.endsWith(":authority"));
@@ -800,11 +844,6 @@ export function evaluate(
 		!bootstrapping &&
 		(canonicalSource(base.get(guardScript) ?? "") !== canonicalSource(head.get(guardScript) ?? "") ||
 			manifestPolicySignature(base.get(manifestScript)) !== manifestPolicySignature(head.get(manifestScript)));
-	const baseGuardContractVersion = guardContractVersion(base.get(guardScript));
-	const headGuardContractVersion = guardContractVersion(head.get(guardScript));
-	const guardContractBumped =
-		headGuardContractVersion !== undefined &&
-		(headGuardContractVersion > (baseGuardContractVersion ?? Number.POSITIVE_INFINITY));
 	const oldTelegramGeneration = generation(base.get(telegramContract));
 	const newTelegramGeneration = generation(head.get(telegramContract));
 	const telegramGenerationBumped =

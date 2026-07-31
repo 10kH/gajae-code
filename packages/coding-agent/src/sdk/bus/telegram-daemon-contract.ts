@@ -49,9 +49,11 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * user-created topic adoption (forum-topic folder picker). Generation 36 bound
  * managed-session replacement to exact native filesystem authority; generation
  * 37 retires that binding (revert of #3489, which stalled POSIX artifact
- * cleanup); generation 38 binds exact cleanup to parent and link-count authority.
+ * cleanup); generation 38 binds exact cleanup to parent and link-count authority;
+ * generation 39 hardens exact Bash process-tree ownership, settlement, and
+ * descendant cleanup authority.
  */
-export const DAEMON_GENERATION = 38;
+export const DAEMON_GENERATION = 39;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 1 covers
