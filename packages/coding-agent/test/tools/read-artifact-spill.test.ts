@@ -29,9 +29,9 @@ function createSession(cwd: string): ToolSession {
 	} as unknown as ToolSession;
 }
 
-function createContext(settings: Settings): AgentToolContext {
+function createContext(settings: Settings, cwd: string): AgentToolContext {
 	return {
-		sessionManager: SessionManager.inMemory(),
+		sessionManager: SessionManager.create(cwd, path.join(cwd, "sessions")),
 		settings,
 		toolNames: ["read"],
 		isIdle: () => true,
@@ -97,6 +97,7 @@ describe("read-tool artifact spill (Finding 4)", () => {
 				"tools.artifactHeadBytes": 2,
 				"tools.artifactTailBytes": 2,
 			}),
+			testDir,
 		);
 
 		const result = await tool.execute("r1", { path: `${bigFile}:1-900` }, undefined, undefined, ctx);
@@ -117,6 +118,7 @@ describe("read-tool artifact spill (Finding 4)", () => {
 				"tools.artifactHeadBytes": 2,
 				"tools.artifactTailBytes": 2,
 			}),
+			testDir,
 		);
 
 		// Two ranges that together exceed the 5KB combined cap.
@@ -136,6 +138,7 @@ describe("read-tool artifact spill (Finding 4)", () => {
 				"tools.readArtifactSpillThreshold": 256,
 				"tools.maxInlineResultBytes": 0,
 			}),
+			testDir,
 		);
 
 		const result = await tool.execute("r3", { path: bigFile }, undefined, undefined, ctx);
