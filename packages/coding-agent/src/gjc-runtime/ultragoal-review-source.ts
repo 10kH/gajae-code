@@ -318,15 +318,25 @@ export function normalizeReviewSourceCohorts(value: unknown): ReviewSourceCohort
 			throw new Error(`Invalid ultragoal plan: duplicate cohortId ${cohort.cohortId}`);
 		cohortIds.add(cohort.cohortId);
 		if (cohort.status === "active") activeCount++;
+		const laneSet = new Set<ReviewSourceLane>();
+		const deliveredDispatches = new Set<string>();
+
 		for (const dispatch of cohort.dispatches) {
 			if (dispatchIds.has(dispatch.dispatchId))
 				throw new Error(`Invalid ultragoal plan: duplicate dispatchId ${dispatch.dispatchId}`);
 			dispatchIds.add(dispatch.dispatchId);
+			if (laneSet.has(dispatch.lane))
+				throw new Error(`Invalid ultragoal plan: duplicate lane dispatch ${dispatch.lane}`);
+			laneSet.add(dispatch.lane);
 		}
 		for (const delivery of cohort.deliveries) {
 			if (deliveryIds.has(delivery.deliveryId))
 				throw new Error(`Invalid ultragoal plan: duplicate deliveryId ${delivery.deliveryId}`);
 			deliveryIds.add(delivery.deliveryId);
+			if (deliveredDispatches.has(delivery.dispatchId)) {
+				throw new Error(`Invalid ultragoal plan: duplicate delivery for dispatch ${delivery.dispatchId}`);
+			}
+			deliveredDispatches.add(delivery.dispatchId);
 		}
 	}
 	if (activeCount > 1) throw new Error("Invalid ultragoal plan: multiple active review cohorts");

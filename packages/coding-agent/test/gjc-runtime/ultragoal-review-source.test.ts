@@ -97,4 +97,40 @@ describe("immutable review source snapshots", () => {
 			createReviewSourceDispatch({ cohort, taskId: "qa-2", lane: "qa", rerunCommand: "rerun qa" }),
 		).toThrow("already dispatched lane qa");
 	});
+
+	it("rejects duplicate persisted lane and delivery authority", () => {
+		const cohort = createReviewSourceCohort({
+			workflow: "ultragoal",
+			generation: 1,
+			snapshotId: "sha256:snapshot",
+			repositoryBindingDigest: "sha256:binding",
+			stateRevision: 1,
+		});
+		const first = createReviewSourceDispatch({
+			cohort,
+			taskId: "architect-1",
+			lane: "architect",
+			rerunCommand: "rerun",
+		});
+		const duplicateLane = { ...first, dispatchId: "duplicate-dispatch", taskId: "architect-2" };
+		expect(() => normalizeReviewSourceCohorts([{ ...cohort, dispatches: [first, duplicateLane] }])).toThrow(
+			"duplicate lane dispatch architect",
+		);
+		const delivery = {
+			deliveryId: "delivery-1",
+			cohortId: cohort.cohortId,
+			dispatchId: first.dispatchId,
+			taskId: first.taskId,
+			lane: first.lane,
+			snapshotId: first.snapshotId,
+			disposition: "current" as const,
+			receivedAt: new Date().toISOString(),
+			rerunCommand: first.rerunCommand,
+		};
+		expect(() =>
+			normalizeReviewSourceCohorts([
+				{ ...cohort, dispatches: [first], deliveries: [delivery, { ...delivery, deliveryId: "delivery-2" }] },
+			]),
+		).toThrow("duplicate delivery for dispatch");
+	});
 });
