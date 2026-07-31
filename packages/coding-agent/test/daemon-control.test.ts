@@ -1543,6 +1543,43 @@ describe("ChatDaemonController ownership safety", () => {
 		expect(fs.existsSync(paths.lock)).toBe(false);
 	});
 
+	test("settles repeated exact ownership releases deterministically within the existing bounded test contract", async () => {
+		const agentDir = tempAgentDir();
+		const paths = chatDaemonPaths(agentDir, "discord");
+		fs.mkdirSync(paths.dir, { recursive: true });
+		const state = {
+			version: 1,
+			kind: "discord",
+			pid: 77,
+			ownerId: "owner-a",
+			identity: "identity",
+			incarnation: "linux:12345",
+			startedAt: 1,
+			heartbeatAt: 1,
+			transportHealthy: true,
+			generation: chatDaemonGeneration("discord"),
+		};
+		for (let attempt = 0; attempt < 20; attempt++) {
+			fs.writeFileSync(paths.state, JSON.stringify(state));
+			fs.writeFileSync(paths.lock, JSON.stringify({ pid: state.pid, incarnation: state.incarnation, createdAt: attempt }));
+			await expect(
+				releaseChatDaemonOwnership({
+					agentDir,
+					kind: "discord",
+					ownerId: state.ownerId,
+					pid: state.pid,
+					incarnation: state.incarnation,
+					pidAlive: pid => pid === state.pid,
+					pidIncarnation: pid => (pid === state.pid ? state.incarnation : undefined),
+				}),
+			).resolves.toBeUndefined();
+			const released = JSON.parse(fs.readFileSync(paths.state, "utf8"));
+			expect(released.transportHealthy).toBe(false);
+			expect(released.stoppedAt).toEqual(expect.any(Number));
+			expect(fs.existsSync(paths.lock)).toBe(false);
+		}
+	});
+
 	test("reports a live PID with a disconnected provider as stale", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(
