@@ -623,6 +623,31 @@ describe("SubagentTool", () => {
 		await manager.dispose({ timeoutMs: 100 });
 	});
 
+	it("accepts terminal wait conditions and heartbeat bounds while retaining child status on timeout", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const gate = Promise.withResolvers<string>();
+		const jobId = manager.register("task", "heartbeat child", async () => gate.promise, {
+			id: "job-heartbeat-bounds",
+			ownerId: "0-Main",
+			metadata: { subagent: { id: "0-HeartbeatBounds", agent: "executor", agentSource: "bundled" } },
+		});
+		const updates: unknown[] = [];
+		const timedOut = await tool.execute(
+			"await-heartbeat-bounds",
+			{ action: "await", ids: ["0-HeartbeatBounds"], condition: "any_terminal", heartbeat_ms: 0, timeout_ms: 1 },
+			undefined,
+			update => updates.push(update),
+		);
+		expect(timedOut.details?.condition).toBe("any_terminal");
+		expect(timedOut.details?.awaitOutcome).toBe("timed_out");
+		expect(manager.getJob(jobId)?.status).toBe("running");
+		expect(updates).toHaveLength(1);
+		gate.resolve("done");
+		await manager.getJob(jobId)?.promise;
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
 	it("await timeout is non-terminal and guides continued observation instead of shutdown", async () => {
 		const manager = createManager();
 		const tool = new SubagentTool(createSession());

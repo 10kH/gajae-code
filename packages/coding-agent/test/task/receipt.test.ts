@@ -533,6 +533,27 @@ describe("task result receipts", () => {
 		expect(rendered).not.toContain("raw ");
 		expect(rendered).not.toContain("stderr");
 	});
+	it("preserves duplicate disposition in a receipt and converts failed scheduling to failure", () => {
+		const warned = buildTaskReceipt(
+			makeRaw({ id: "DuplicateWarned", duplicateDisposition: { action: "warned", predecessorIds: ["Earlier"] } }),
+		);
+		expect(warned.status).toBe("completed");
+		expect(warned.duplicateDisposition).toEqual({ action: "warned", predecessorIds: ["Earlier"] });
+
+		const failedSchedule = buildTaskReceipt(
+			makeRaw({
+				id: "DuplicateSupersedeFailed",
+				exitCode: 1,
+				output: "",
+				stderr: "duplicate_supersede_failed",
+				error: "duplicate_supersede_failed",
+				duplicateDisposition: { action: "superseded", predecessorIds: ["Earlier"] },
+			}),
+		);
+		expect(failedSchedule.status).toBe("failed");
+		expect(failedSchedule.errorSummary).toBe("Error recorded.");
+		expect(failedSchedule.duplicateDisposition).toEqual({ action: "superseded", predecessorIds: ["Earlier"] });
+	});
 });
 
 describe("agent protocol metadata verification", () => {
