@@ -312,6 +312,7 @@ export type VerifiedSessionDeleteResult =
 			artifactsIdentity: SessionStorageFileIdentity | undefined;
 			/** Identity-bound quarantine path retained when recursive cleanup failed. */
 			detachedArtifactsPath: string;
+			artifactsPayloadDurable?: true;
 			/** Native snapshot required for an identity-bound recursive retry. */
 			artifactsTree: NativeDirectoryTreeSnapshot;
 			/** Transcript identity (unchanged) for retry binding. */
@@ -328,6 +329,7 @@ export type VerifiedSessionDeleteResult =
 			transcriptIdentity: SessionStorageFileIdentity;
 			/** Optional identity-bound transcript quarantine path for restart cleanup. */
 			detachedTranscriptPath?: string;
+			transcriptPayloadDurable?: true;
 			retainedSuccessorPath?: string;
 			retainedPlaceholderPath?: string;
 			retainedUnknownPath?: string;
@@ -423,6 +425,7 @@ type NativeDirectoryTreeApi = {
 function nativeDirectoryTreeApi(): NativeDirectoryTreeApi {
 	return native as unknown as NativeDirectoryTreeApi;
 }
+
 function snapshotDirectoryTree(pathname: string): NativeDirectoryTreeSnapshot {
 	const result = nativeDirectoryTreeApi().snapshotDirectoryTree(pathname);
 	if (!result.ok || !result.snapshot)
@@ -438,10 +441,21 @@ function retainedTreeDoesNotExpandAuthority(
 ): boolean {
 	if (expected.rootDev !== retained.rootDev || expected.rootIno !== retained.rootIno) return false;
 	const expectedEntries = new Map(expected.entries.map(entry => [entry.relativePath, entry]));
+	if (retained.entries.length > expected.entries.length) return false;
 	return retained.entries.every(entry => {
 		if (entry.relativePath === "") return entry.kind === "directory";
 		const authorized = expectedEntries.get(entry.relativePath);
-		return authorized !== undefined && JSON.stringify(authorized) === JSON.stringify(entry);
+		if (
+			authorized === undefined ||
+			authorized.kind !== entry.kind ||
+			authorized.dev !== entry.dev ||
+			authorized.ino !== entry.ino ||
+			authorized.nlink !== entry.nlink
+		)
+			return false;
+		if (entry.kind !== "file") return entry.size === authorized.size;
+		const scrubbed = entry.size === "0" && entry.sha256 === createHash("sha256").update("").digest("hex");
+		return scrubbed || (entry.size === authorized.size && entry.sha256 === authorized.sha256);
 	});
 }
 
@@ -938,7 +952,7 @@ export class FileSessionStorage implements SessionStorage {
 				"Transcript parent identity does not match authorization",
 			);
 		const authorizedTranscriptParentIdentity = transcriptParentIdentity ?? parentIdentity;
-		if (detachedArtifactsPath) {
+		if (detachedArtifactsPath && !artifactsRemoved) {
 			if (
 				!expectedArtifactsIdentity ||
 				path.dirname(detachedArtifactsPath) !== path.dirname(transcriptPath) ||
@@ -997,6 +1011,9 @@ export class FileSessionStorage implements SessionStorage {
 					artifactsIdentity: expectedArtifactsIdentity,
 					detachedArtifactsPath: retainedRoot,
 					artifactsTree: retainedTree,
+					...((removal as typeof removal & { payloadDurable?: boolean }).payloadDurable === true
+						? { artifactsPayloadDurable: true as const }
+						: {}),
 					...((removal.retainedSuccessorPath ?? retainedArtifactsSuccessorPath)
 						? { retainedSuccessorPath: removal.retainedSuccessorPath ?? retainedArtifactsSuccessorPath }
 						: {}),
@@ -1044,6 +1061,24 @@ export class FileSessionStorage implements SessionStorage {
 				"artifacts",
 				"Artifact path reappeared after durable artifact-phase completion",
 			);
+		}
+		if (artifactsRemoved && detachedArtifactsPath && expectedArtifactsIdentity && expectedArtifactsTree) {
+			const retainedIdentity = this.#optionalDirectoryIdentity(detachedArtifactsPath);
+			if (
+				!retainedIdentity ||
+				retainedIdentity.dev !== expectedArtifactsIdentity.dev ||
+				retainedIdentity.ino !== expectedArtifactsIdentity.ino
+			)
+				throw new SessionDeleteVerificationError(
+					"artifacts",
+					"Retained artifact root identity changed before transcript cleanup",
+				);
+			const retainedTree = snapshotDirectoryTree(detachedArtifactsPath);
+			if (!retainedTreeDoesNotExpandAuthority(expectedArtifactsTree, retainedTree))
+				throw new SessionDeleteVerificationError(
+					"artifacts",
+					"Partial artifact cleanup expanded retained tree authority",
+				);
 		}
 		if (!artifactsIdentity && expectedArtifactsIdentity && !detachedArtifactsPath && !artifactsRemoved) {
 			// Absence at the original path alone is not completion: native recursive removal
@@ -1116,12 +1151,22 @@ export class FileSessionStorage implements SessionStorage {
 						throw new Error("parent_changed");
 					fs.fsyncSync(descriptor);
 				} catch (error) {
-					throw new SessionDeleteVerificationError("artifacts", "durability_failed", { cause: toError(error) });
+					return {
+						kind: "cleanup_pending",
+						phase: "artifacts",
+						error: new SessionDeleteVerificationError("artifacts", "durability_failed", {
+							cause: toError(error),
+						}),
+						artifactsIdentity,
+						detachedArtifactsPath: detach.detachedPath,
+						artifactsTree,
+						transcriptIdentity,
+					};
 				} finally {
 					if (descriptor !== undefined) fs.closeSync(descriptor);
 				}
 			}
-			if (!detach.ok) {
+			if (!detach.ok && process.platform === "win32") {
 				return {
 					kind: "cleanup_pending",
 					phase: "artifacts",
@@ -1132,7 +1177,6 @@ export class FileSessionStorage implements SessionStorage {
 					...(detach.retainedSuccessorPath ? { retainedSuccessorPath: detach.retainedSuccessorPath } : {}),
 					...(detach.retainedPlaceholderPath ? { retainedPlaceholderPath: detach.retainedPlaceholderPath } : {}),
 					...(detach.retainedUnknownPath ? { retainedUnknownPath: detach.retainedUnknownPath } : {}),
-
 					transcriptIdentity,
 				};
 			}
@@ -1173,6 +1217,9 @@ export class FileSessionStorage implements SessionStorage {
 					artifactsIdentity,
 					detachedArtifactsPath: retainedRoot,
 					artifactsTree: retainedTree,
+					...((removal as typeof removal & { payloadDurable?: boolean }).payloadDurable === true
+						? { artifactsPayloadDurable: true as const }
+						: {}),
 					...((removal.retainedSuccessorPath ?? retainedArtifactsSuccessorPath)
 						? { retainedSuccessorPath: removal.retainedSuccessorPath ?? retainedArtifactsSuccessorPath }
 						: {}),
@@ -1223,6 +1270,13 @@ export class FileSessionStorage implements SessionStorage {
 				quarantineName: path.basename(plannedTranscriptPath),
 			});
 			if (!deletion.ok) {
+				if (
+					deletion.code === "cleanup_pending" &&
+					(deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true &&
+					deletion.retainedSuccessorPath === undefined &&
+					deletion.retainedUnknownPath === undefined
+				)
+					return { kind: "deleted" };
 				const error = exactUnlinkFailure(deletion);
 				const retainedAuthority =
 					deletion.detachedPath ||
@@ -1234,6 +1288,9 @@ export class FileSessionStorage implements SessionStorage {
 					kind: "cleanup_pending",
 					phase: "transcript",
 					error,
+					...((deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true
+						? { transcriptPayloadDurable: true as const }
+						: {}),
 					transcriptIdentity,
 					detachedTranscriptPath: deletion.detachedPath ?? detachedTranscriptPath,
 					...((deletion.retainedSuccessorPath ?? retainedTranscriptSuccessorPath)
@@ -1288,6 +1345,13 @@ export class FileSessionStorage implements SessionStorage {
 			quarantineName: path.basename(plannedTranscriptPath),
 		});
 		if (!deletion.ok) {
+			if (
+				deletion.code === "cleanup_pending" &&
+				(deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true &&
+				deletion.retainedSuccessorPath === undefined &&
+				deletion.retainedUnknownPath === undefined
+			)
+				return { kind: "deleted" };
 			const error = exactUnlinkFailure(deletion);
 			const retainedAuthority =
 				deletion.detachedPath ||
@@ -1299,6 +1363,9 @@ export class FileSessionStorage implements SessionStorage {
 				kind: "cleanup_pending",
 				phase: "transcript",
 				error,
+				...((deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true
+					? { transcriptPayloadDurable: true as const }
+					: {}),
 				transcriptIdentity,
 				detachedTranscriptPath: deletion.detachedPath,
 				...((deletion.retainedSuccessorPath ?? retainedTranscriptSuccessorPath)

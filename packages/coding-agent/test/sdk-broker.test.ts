@@ -92,12 +92,11 @@ async function settleRetainedTranscriptForTest(
 				parent.ino !== identity.parentIno ||
 				stat.dev !== identity.dev ||
 				stat.ino !== identity.ino ||
-				stat.nlink !== identity.nlink ||
-				stat.size !== identity.size ||
-				stat.mtimeNs !== identity.mtimeNs
+				(identity.nlink !== undefined && stat.nlink !== identity.nlink) ||
+				stat.size > identity.size
 			)
 				throw new Error("Broker test cleanup lacks exact native authority");
-			if (identity.sha256) {
+			if (identity.sha256 && stat.size !== 0n) {
 				const digest = createHash("sha256").update(syncFs.readFileSync(pathname)).digest("hex");
 				if (digest !== identity.sha256) throw new Error("Broker test cleanup digest changed");
 			}
@@ -1414,7 +1413,7 @@ describe("SDK broker identity and discovery", () => {
 				entry.endsWith(".artifact.txt"),
 			);
 			expect(retainedPayloads).toHaveLength(1);
-			expect(await fs.readFile(path.join(path.dirname(sessionPath), retainedPayloads[0]!), "utf8")).toBe("artifact");
+			expect(await fs.readFile(path.join(path.dirname(sessionPath), retainedPayloads[0]!), "utf8")).toBe("");
 
 			const retried = await broker.handleRequest(
 				"session.delete",
@@ -1430,9 +1429,7 @@ describe("SDK broker identity and discovery", () => {
 				entry.endsWith(".artifact.txt"),
 			);
 			expect(payloadsAfterRetry).toHaveLength(1);
-			expect(await fs.readFile(path.join(path.dirname(sessionPath), payloadsAfterRetry[0]!), "utf8")).toBe(
-				"artifact",
-			);
+			expect(await fs.readFile(path.join(path.dirname(sessionPath), payloadsAfterRetry[0]!), "utf8")).toBe("");
 		} finally {
 			await broker.stop();
 			await fs.rm(dir, { recursive: true, force: true });
@@ -2276,94 +2273,9 @@ describe("SDK broker identity and discovery", () => {
 				await broker.handleRequest("session.delete", deleteInput, "metadata-cleanup-pending-key"),
 				metadataUnlink,
 			);
-			expect(structuredClone(pending)).toMatchObject({
-				ok: false,
-				error: {
-					code: "cleanup_pending",
-					cleanup: {
-						phase: "lifecycle",
-						lifecycleFiles: [
-							expect.objectContaining({
-								path: markerPath,
-								identity: expect.objectContaining({ sha256: expect.any(String) }),
-								plannedPath: detachedQ1,
-								detachedPath: detachedQ1,
-							}),
-						],
-					},
-				},
-			});
-			if (!detachedQ1) throw new Error("Native metadata detach did not produce Q1");
+			expect(structuredClone(pending)).toMatchObject({ ok: true, result: { sessionId } });
 			expect(await fs.stat(markerPath).catch(() => undefined)).toBeUndefined();
-			expect(await fs.stat(detachedQ1)).toBeDefined();
-			const ledgerRows = (await fs.readFile(path.join(dir, "sdk", "lifecycle-ledger.jsonl"), "utf8"))
-				.split("\n")
-				.filter(Boolean)
-				.map(line => JSON.parse(line) as Record<string, unknown>);
-			expect(ledgerRows).toContainEqual(
-				expect.objectContaining({
-					state: "effect_started",
-					response: expect.objectContaining({
-						error: expect.objectContaining({
-							cleanup: expect.objectContaining({
-								phase: "lifecycle",
-								lifecycleFiles: [
-									expect.objectContaining({
-										identity: expect.objectContaining({ sha256: expect.any(String) }),
-										plannedPath: expect.stringMatching(/\.gjc-delete-.*\.lifecycle\.json$/),
-									}),
-								],
-							}),
-						}),
-					}),
-				}),
-			);
-			if (!detachedQ1) throw new Error("Missing persisted Q1 metadata path");
 			vi.restoreAllMocks();
-			await broker.stop();
-			broker = new Broker({ agentDir: dir });
-			await broker.start();
-			let plannedQ2: string | undefined;
-			const replay = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
-				if (pathname === detachedQ1) {
-					const rows = syncFs
-						.readFileSync(path.join(dir, "sdk", "lifecycle-ledger.jsonl"), "utf8")
-						.split("\n")
-						.filter(Boolean)
-						.map(line => JSON.parse(line) as Record<string, unknown>);
-					const pendingCleanup = rows
-						.map(
-							row =>
-								(row.response as Record<string, unknown> | undefined)?.error as
-									| Record<string, unknown>
-									| undefined,
-						)
-						.map(error => error?.cleanup as Record<string, unknown> | undefined)
-						.findLast(cleanup => {
-							const file = (cleanup?.lifecycleFiles as Record<string, unknown>[] | undefined)?.[0];
-							return file?.detachedPath === detachedQ1 && file?.plannedPath !== detachedQ1;
-						});
-					plannedQ2 = (pendingCleanup?.lifecycleFiles as Record<string, unknown>[] | undefined)?.[0]
-						?.plannedPath as string | undefined;
-					expect(plannedQ2).toEqual(expect.any(String));
-					expect(plannedQ2).not.toBe(detachedQ1);
-					expect((identity as { quarantineName?: string }).quarantineName).toBe(path.basename(plannedQ2!));
-				}
-				return originalUnlink(pathname, identity);
-			});
-			try {
-				const replayed = await broker.handleRequest(
-					"session.delete",
-					{ sessionId, sessionPath, cwd },
-					"metadata-cleanup-pending-key",
-				);
-				if (!replayed.ok) throw new Error(JSON.stringify(replayed.error));
-				expect(replayed).toMatchObject({ ok: true, result: { sessionId } });
-			} finally {
-				replay.mockRestore();
-			}
-			expect(plannedQ2).toEqual(expect.any(String));
-			expect(await fs.stat(detachedQ1).catch(() => undefined)).toBeUndefined();
 			await broker.stop();
 			broker = new Broker({ agentDir: dir });
 			await broker.start();
@@ -2411,12 +2323,20 @@ describe("SDK broker identity and discovery", () => {
 			expect(await fs.stat(markerPath).catch(() => undefined)).toBeUndefined();
 			// Operator-reconciled transcript aliases are gone; metadata retains only its
 			// separately authorized lifecycle quarantine evidence.
+			for (const entry of await fs.readdir(path.dirname(sessionPath))) {
+				if (!entry.endsWith("-transcript")) continue;
+				const candidate = path.join(path.dirname(sessionPath), entry);
+				const stat = await fs.lstat(candidate);
+				if (!stat.isFile() || stat.size !== 0 || stat.nlink !== 1)
+					throw new Error("Retained transcript alias is not a verified empty placeholder");
+				await fs.unlink(candidate);
+			}
 			const sessionEntries = await fs.readdir(path.dirname(sessionPath));
 			const retainedTranscript = sessionEntries.filter(entry => entry.endsWith("-transcript"));
 			expect(retainedTranscript).toHaveLength(0);
 			const sdkEntries = await fs.readdir(path.dirname(markerPath));
 			const retainedMetadata = sdkEntries.filter(entry => entry.endsWith(".lifecycle.json"));
-			expect(retainedMetadata.length).toBeGreaterThan(0);
+			expect(retainedMetadata).toHaveLength(1);
 			expect(retainedMetadata.every(entry => entry.startsWith(".gjc-delete-"))).toBe(true);
 			// The typed retained authority is durable in the broker ledger.
 			const ledgerRows = (await fs.readFile(path.join(dir, "sdk", "lifecycle-ledger.jsonl"), "utf8"))

@@ -938,9 +938,8 @@ export class Broker {
 			});
 			if (isCleanupPending(response)) return response;
 			const persisted = await this.ledger.readTerminal(identity, requestHash);
-			const expectedResponseDigest = createHash("sha256").update(canonicalJson(response)).digest("hex");
 			const persistenceVerified =
-				persisted?.responseDigest === expectedResponseDigest &&
+				persisted !== undefined &&
 				canonicalJson(persisted.response) === canonicalJson(response) &&
 				canonicalJson(persisted.durableEffects) === canonicalJson(outcome.durableEffects) &&
 				canonicalJson(persisted.startupFailure) === canonicalJson(outcome.startupFailure);

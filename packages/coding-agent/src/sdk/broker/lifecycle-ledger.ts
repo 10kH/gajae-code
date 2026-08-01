@@ -666,7 +666,13 @@ export class LifecycleLedger {
 		return this.#mutate(async () => {
 			const previous = this.#byIdentity.get(identity);
 			if (!previous) throw new Error("Unknown lifecycle identity");
-			const next = { ...previous, ...fields, state, ts: Date.now() };
+			const next = {
+				...previous,
+				...fields,
+				state,
+				ts: Date.now(),
+				...(fields.response !== undefined ? { response: fields.response } : {}),
+			};
 			if (this.#isCleanupPending(next)) {
 				next.unresolvedCleanupResponse = undefined;
 				next.unresolvedCleanupResponseDigest = undefined;
@@ -795,5 +801,32 @@ export class LifecycleLedger {
 
 	get(identity: string): LifecycleLedgerEntry | undefined {
 		return this.#byIdentity.get(identity);
+	}
+
+	findPendingCleanupByTarget(
+		sessionId: string,
+		cwd: string,
+		transcriptPath: string,
+	): LifecycleLedgerEntry | undefined {
+		const expectedCwd = path.resolve(cwd);
+		const expectedTranscript = path.resolve(transcriptPath);
+		let latest: LifecycleLedgerEntry | undefined;
+		for (const entry of this.#byIdentity.values()) {
+			if (entry.state !== "effect_started" || !this.#isCleanupPending(entry)) continue;
+			const response = entry.response as {
+				error?: { cleanup?: { sessionId?: unknown; cwd?: unknown; transcriptPath?: unknown } };
+			};
+			const cleanup = response.error?.cleanup;
+			if (
+				cleanup?.sessionId !== sessionId ||
+				typeof cleanup.cwd !== "string" ||
+				typeof cleanup.transcriptPath !== "string" ||
+				path.resolve(cleanup.cwd) !== expectedCwd ||
+				path.resolve(cleanup.transcriptPath) !== expectedTranscript
+			)
+				continue;
+			if (!latest || entry.ts > latest.ts) latest = entry;
+		}
+		return latest;
 	}
 }

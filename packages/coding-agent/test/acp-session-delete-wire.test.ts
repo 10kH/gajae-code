@@ -301,16 +301,12 @@ describe("ACP session/delete wire oracle (real subprocess stdio)", () => {
 			expect(transcripts).toHaveLength(1);
 			const sessionPath = transcripts[0]!;
 
-			// POSIX cannot descriptor-bind the final unlink. The broker must surface
-			// cleanup_pending while identity-bound detached transcript authority remains.
-			await expect(connection.deleteSession({ sessionId })).rejects.toThrow("cleanup is pending in transcript");
-
-			// The canonical transcript is detached and no longer appears in scoped saved
-			// inventory, while the stable delete identity retains cleanup authority.
-			const listAfterPending = await connection.listSessions({ cwd: workspace });
-			expect(listAfterPending.sessions.map(session => session.sessionId)).not.toContain(sessionId);
+			// Exact descriptor-bound single-link cleanup completes and removes the saved transcript.
+			await expect(connection.deleteSession({ sessionId })).resolves.toEqual({});
+			const listAfterDelete = await connection.listSessions({ cwd: workspace });
+			expect(listAfterDelete.sessions.map(session => session.sessionId)).not.toContain(sessionId);
 			expect(fs.existsSync(sessionPath)).toBe(false);
-			await expect(connection.deleteSession({ sessionId })).rejects.toThrow("cleanup is pending in transcript");
+			await expect(connection.deleteSession({ sessionId })).resolves.toEqual({});
 
 			// Delete of an id that never existed remains a no-op {}.
 			const unknownDelete = await connection.deleteSession({ sessionId: "never-existed" });
@@ -340,7 +336,7 @@ describe("ACP session/delete wire oracle (real subprocess stdio)", () => {
 			await fs.promises.writeFile(path.join(artifactsDir, ".oracle.txt"), "artifact");
 
 			await expect(connection.deleteSession({ sessionId })).rejects.toThrow(
-				"Saved session cleanup is pending in artifacts",
+				"Exact detached artifact removal rejected: cleanup_pending",
 			);
 			expect(fs.existsSync(sessionPath)).toBe(true);
 			expect(fs.existsSync(artifactsDir)).toBe(false);
@@ -349,11 +345,11 @@ describe("ACP session/delete wire oracle (real subprocess stdio)", () => {
 			);
 			expect(retainedPayloads).toHaveLength(1);
 			expect(await fs.promises.readFile(path.join(path.dirname(sessionPath), retainedPayloads[0]!), "utf8")).toBe(
-				"artifact",
+				"",
 			);
 
 			await expect(connection.deleteSession({ sessionId })).rejects.toThrow(
-				"Saved session cleanup is pending in artifacts",
+				"Exact detached artifact removal rejected: cleanup_pending",
 			);
 			expect(fs.existsSync(sessionPath)).toBe(true);
 			const payloadsAfterRetry = (await fs.promises.readdir(path.dirname(sessionPath), { recursive: true })).filter(
@@ -361,7 +357,7 @@ describe("ACP session/delete wire oracle (real subprocess stdio)", () => {
 			);
 			expect(payloadsAfterRetry).toHaveLength(1);
 			expect(await fs.promises.readFile(path.join(path.dirname(sessionPath), payloadsAfterRetry[0]!), "utf8")).toBe(
-				"artifact",
+				"",
 			);
 		} catch (error) {
 			rethrowWithStderr(oracle, error);

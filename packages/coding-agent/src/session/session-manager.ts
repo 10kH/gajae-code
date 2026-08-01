@@ -83,8 +83,8 @@ import {
 	mayCleanManagedTreeStaging,
 	retainManagedDirectoryAuthority,
 } from "./internal/managed-session-storage";
-
 import { classifyNativePublishOutcome, formatNativePublishDiagnostic } from "./internal/native-publish-outcome";
+import { SessionMigrationBusyError } from "./internal/session-open-errors";
 import {
 	hasOnlyKeys as hasOnlyMemoryGuardKeys,
 	isMemoryGuardDecimalString,
@@ -940,6 +940,8 @@ export class SessionMigrationPolicyError extends Error {
 }
 
 export class SessionArtifactCapacityError extends Error {
+	readonly code = "artifact_capacity_exceeded";
+
 	constructor(message: string) {
 		super(message);
 		this.name = "SessionArtifactCapacityError";
@@ -954,7 +956,12 @@ export interface StrictSessionOpenSuccess {
 
 export interface StrictSessionOpenFailure {
 	kind: "error";
-	reason: ResumeTailError["reason"] | "identity-mismatch" | "migration-required" | "artifact_capacity_exceeded";
+	reason:
+		| ResumeTailError["reason"]
+		| "identity-mismatch"
+		| "migration-required"
+		| "artifact_capacity_exceeded"
+		| "migration_busy";
 	message?: string;
 }
 
@@ -4707,6 +4714,7 @@ export const MATERIALIZED_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 export const SessionManagerTestHooks: {
 	materializedCacheMaxBytesOverride?: number;
 	beforeResidentTransitionIndexBuild?: () => void;
+	afterForkSnapshot?: () => void | Promise<void>;
 } = {};
 
 function materializedCacheMaxBytes(): number {
@@ -6165,6 +6173,7 @@ export class SessionManager {
 				const candidate = listing.owned.find(candidate => path.resolve(candidate.path) === requestedPath);
 				if (!candidate) throw new Error("Managed session deletion requires exact logical authorization.");
 				const deleted = await deleteManagedSessionCandidate(resolved.scope, candidate);
+				if (deleted.kind === "error" && deleted.code === "migration_busy") throw new SessionMigrationBusyError();
 				if (deleted.kind !== "deleted" && deleted.kind !== "already_deleted")
 					throw new Error(`Could not delete managed session: ${deleted.message}`);
 			} else {
@@ -6248,6 +6257,8 @@ export class SessionManager {
 			newHeader,
 			...materializedEntries.filter((entry): entry is SessionEntry => entry.type !== "session"),
 		];
+		const forkSnapshotHook = SessionManagerTestHooks.afterForkSnapshot;
+		if (forkSnapshotHook) await forkSnapshotHook();
 
 		await this.#closePersistWriter();
 		this.#persistChain = Promise.resolve();
@@ -9603,6 +9614,7 @@ export class SessionManager {
 				authority,
 			);
 		} catch (error) {
+			if (error instanceof Error && error.message === "migration_busy") throw new SessionMigrationBusyError();
 			if (error instanceof Error && error.message.startsWith("Managed root authority changed"))
 				managedDestinationStore.assertBound();
 			throw error;
@@ -9611,6 +9623,7 @@ export class SessionManager {
 			managedDestinationStore.assertBound();
 			if (opened.code === "legacy_migration_disabled") throw new SessionMigrationPolicyError();
 			if (opened.code === "artifact_capacity_exceeded") throw new SessionArtifactCapacityError(opened.message);
+			if (opened.code === "migration_busy") throw new SessionMigrationBusyError();
 			throw new Error(`Could not open managed session: ${opened.message}`);
 		}
 		assertManagedDestinationBound();
@@ -9706,7 +9719,15 @@ export class SessionManager {
 			throw new Error(`Could not open session: ${inspected.reason}`);
 		}
 		const opened = await SessionManager.openExistingStrict(inspected.identity, destination, storage, migrationPolicy);
-		if (opened.kind === "error") throw new Error(`Could not open session: ${opened.reason}`);
+		if (opened.kind === "error") {
+			if (opened.reason === "legacy_migration_disabled") throw new SessionMigrationPolicyError();
+			if (opened.reason === "artifact_capacity_exceeded")
+				throw new SessionArtifactCapacityError(
+					opened.message ?? "Session artifacts exceed the migration capacity.",
+				);
+			if (opened.reason === "migration_busy") throw new SessionMigrationBusyError();
+			throw new Error(`Could not open session: ${opened.reason}`);
+		}
 		return opened.manager;
 	}
 
@@ -9844,6 +9865,7 @@ export class SessionManager {
 		const candidate = listing.owned.find(item => path.resolve(item.path) === path.resolve(sessionPath));
 		if (!candidate) throw new Error("Session is not an authorized managed candidate.");
 		const deleted = await deleteManagedSessionCandidate(resolved.scope, candidate);
+		if (deleted.kind === "error" && deleted.code === "migration_busy") throw new SessionMigrationBusyError();
 		if (deleted.kind !== "deleted" && deleted.kind !== "already_deleted")
 			throw new Error(`Could not delete managed session: ${deleted.message}`);
 	}
@@ -10389,6 +10411,7 @@ export class SessionManager {
 					return { kind: "error", reason: "legacy_migration_disabled" };
 				if (error instanceof SessionArtifactCapacityError)
 					return { kind: "error", reason: "artifact_capacity_exceeded", message: error.message };
+				if (error instanceof SessionMigrationBusyError) return { kind: "error", reason: "migration_busy" };
 				if (
 					error instanceof Error &&
 					(error.message.includes("source_changed") || error.message.includes("changed before migration"))
@@ -10451,6 +10474,7 @@ export class SessionManager {
 					throw new SessionArtifactCapacityError(
 						opened.message ?? "Session artifacts exceed the migration capacity.",
 					);
+				if (opened.reason === "migration_busy") throw new SessionMigrationBusyError();
 				return undefined;
 			}
 			return opened.manager;

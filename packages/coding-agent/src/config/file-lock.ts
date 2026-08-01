@@ -17,6 +17,10 @@ const DEFAULT_OPTIONS: Required<FileLockOptions> = {
 
 type LockInfo = FileLockOwnerToken;
 
+export const FileLockTestHooks: {
+	afterParentMkdir?: (lockPath: string) => void | Promise<void>;
+} = {};
+
 /**
  * Returns the OS-provided process start timestamp for PID-reuse detection.
  * `ps` is available on the supported Unix hosts (macOS and Linux), unlike
@@ -237,6 +241,8 @@ async function removeStaleLockForAcquire(lockPath: string, snapshot: LockStaleSn
 
 async function tryAcquireLock(lockPath: string): Promise<LockInfo | null> {
 	await fs.mkdir(path.dirname(lockPath), { recursive: true });
+	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
+	if (afterParentMkdir) await afterParentMkdir(lockPath);
 	try {
 		await fs.mkdir(lockPath);
 		return await writeLockInfo(lockPath);

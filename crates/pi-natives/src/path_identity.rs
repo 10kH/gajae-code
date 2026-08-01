@@ -167,6 +167,11 @@ struct ExactFileIdentity {
 pub struct NativeExactUnlinkResult {
 	pub ok: bool,
 	pub code: Option<String>,
+	/// True only when retained directory payloads were descriptor-scrubbed and
+	/// every file plus containing directory namespace was fsynced before return.
+	pub payload_durable: Option<bool>,
+	/// On Windows this is returned in the caller's namespace; retained handle
+	/// operations continue to use the volume-GUID canonical path internally.
 	pub detached_path: Option<String>,
 	pub retained_successor_path: Option<String>,
 	/// An internal exchange-placeholder cleanup entry retained after cleanup
@@ -327,6 +332,7 @@ impl NativeExactUnlinkResult {
 		Self {
 			ok: true,
 			code: None,
+			payload_durable: None,
 			detached_path: None,
 			retained_successor_path: None,
 			retained_placeholder_path: None,
@@ -338,6 +344,7 @@ impl NativeExactUnlinkResult {
 		Self {
 			ok: true,
 			code: None,
+			payload_durable: None,
 			detached_path: Some(path),
 			retained_successor_path: None,
 			retained_placeholder_path: None,
@@ -349,9 +356,58 @@ impl NativeExactUnlinkResult {
 		Self {
 			ok: false,
 			code: Some(code.to_owned()),
+			payload_durable: None,
 			detached_path: Some(path),
 			retained_successor_path: None,
 			retained_placeholder_path: None,
+			retained_unknown_path: None,
+		}
+	}
+
+	#[cfg(unix)]
+	fn detached_failure_with_durable_payload(code: &str, path: String) -> Self {
+		Self {
+			ok: false,
+			code: Some(code.to_owned()),
+			payload_durable: Some(true),
+			detached_path: Some(path),
+			retained_successor_path: None,
+			retained_placeholder_path: None,
+			retained_unknown_path: None,
+		}
+	}
+
+	#[cfg(unix)]
+	fn detached_failure_with_durable_payload_and_placeholder(
+		code: &str,
+		path: String,
+		placeholder_path: String,
+	) -> Self {
+		Self {
+			ok: false,
+			code: Some(code.to_owned()),
+			payload_durable: Some(true),
+			detached_path: Some(path),
+			retained_successor_path: None,
+			retained_placeholder_path: Some(placeholder_path),
+			retained_unknown_path: None,
+		}
+	}
+
+	#[cfg(windows)]
+	fn detached_failure_with_successor_and_placeholder(
+		code: &str,
+		detached_path: String,
+		successor_path: String,
+		placeholder_path: String,
+	) -> Self {
+		Self {
+			ok: false,
+			code: Some(code.to_owned()),
+			payload_durable: None,
+			detached_path: Some(detached_path),
+			retained_successor_path: Some(successor_path),
+			retained_placeholder_path: Some(placeholder_path),
 			retained_unknown_path: None,
 		}
 	}
@@ -365,6 +421,7 @@ impl NativeExactUnlinkResult {
 		Self {
 			ok: false,
 			code: Some(code.to_owned()),
+			payload_durable: None,
 			detached_path: Some(path),
 			retained_successor_path: None,
 			retained_placeholder_path: Some(placeholder_path),
@@ -377,6 +434,7 @@ impl NativeExactUnlinkResult {
 		Self {
 			ok: false,
 			code: Some(code.to_owned()),
+			payload_durable: None,
 			detached_path: Some(path),
 			retained_successor_path: None,
 			retained_placeholder_path: None,
@@ -385,10 +443,24 @@ impl NativeExactUnlinkResult {
 	}
 
 	#[cfg(unix)]
+	fn retained_successor_failure(code: &str, successor_path: String) -> Self {
+		Self {
+			ok: false,
+			code: Some(code.to_owned()),
+			payload_durable: None,
+			detached_path: None,
+			retained_successor_path: Some(successor_path),
+			retained_placeholder_path: None,
+			retained_unknown_path: None,
+		}
+	}
+
+	#[cfg(unix)]
 	fn retained_placeholder_failure(code: &str, placeholder_path: String) -> Self {
 		Self {
 			ok: false,
 			code: Some(code.to_owned()),
+			payload_durable: None,
 			detached_path: None,
 			retained_successor_path: None,
 			retained_placeholder_path: Some(placeholder_path),
@@ -401,6 +473,7 @@ impl NativeExactUnlinkResult {
 		Self {
 			ok: false,
 			code: Some(code.to_owned()),
+			payload_durable: None,
 			detached_path: None,
 			retained_successor_path: None,
 			retained_placeholder_path: None,
@@ -412,6 +485,7 @@ impl NativeExactUnlinkResult {
 		Self {
 			ok: false,
 			code: Some(code.to_owned()),
+			payload_durable: None,
 			detached_path: None,
 			retained_successor_path: None,
 			retained_placeholder_path: None,
@@ -798,6 +872,44 @@ pub fn exact_unlink(path: String, identity: NativeExactFileIdentity) -> NativeEx
 	};
 	platform::exact_unlink(Path::new(&path), &identity)
 }
+/// Replace a staged regular file only after validating the exact staged source
+/// and deleting the exact expected destination.
+///
+/// Both identities must describe regular files, not directories or detach-only
+/// requests. Publication uses the retained verified source handle and a
+/// no-replace rename, so source substitution is rejected and a destination
+/// successor is preserved.
+#[napi]
+pub fn exact_replace_path(
+	source_path: String,
+	destination_path: String,
+	expected_source: NativeExactFileIdentity,
+	expected_destination: NativeExactFileIdentity,
+) -> NativeExactUnlinkResult {
+	if source_path.contains('\0') || destination_path.contains('\0') {
+		return NativeExactUnlinkResult::failure("invalid_request");
+	}
+	let Some(expected_source) = exact_file_identity(&expected_source) else {
+		return NativeExactUnlinkResult::failure("identity_mismatch");
+	};
+	let Some(expected_destination) = exact_file_identity(&expected_destination) else {
+		return NativeExactUnlinkResult::failure("identity_mismatch");
+	};
+	#[cfg(windows)]
+	{
+		platform::exact_replace_path(
+			Path::new(&source_path),
+			Path::new(&destination_path),
+			&expected_source,
+			&expected_destination,
+		)
+	}
+	#[cfg(not(windows))]
+	{
+		let _ = (source_path, destination_path, expected_source, expected_destination);
+		NativeExactUnlinkResult::failure("unsupported_platform")
+	}
+}
 
 /// Restore only the detached object that still has the supplied platform
 #[cfg_attr(clippy, doc = "")]
@@ -845,11 +957,12 @@ pub fn snapshot_directory_tree(path: String) -> NativeDirectoryTreeResult {
 	platform::snapshot_directory_tree(Path::new(&path))
 }
 
-/// Remove an already durably planned detached directory only when a fresh
+/// Remove a directory tree only when a fresh descriptor-relative snapshot
 #[cfg_attr(clippy, doc = "")]
-/// descriptor-relative snapshot exactly equals the persisted snapshot. The
-/// caller-planned root remains in place while its opened descriptor is
-/// authoritative throughout recursive removal.
+/// exactly equals the persisted snapshot. POSIX first no-replace detaches the
+/// verified root to its deterministic `.removing` sibling; the reopened
+/// detached descriptor remains authoritative throughout payload scrubbing and
+/// replay.
 #[napi]
 pub fn exact_remove_directory_tree(
 	path: String,
@@ -1117,12 +1230,50 @@ pub(crate) mod platform {
 	/// pathological signal storm turning a retry loop into a hang.
 	const EINTR_RETRY_LIMIT: u32 = 8;
 
-	/// Test-only fault injection: the next N calls into the no-replace rename
-	/// primitive report a synthetic EINTR before the real syscall runs, letting
-	/// tests exercise the restart loop without racing a real signal.
+	// Test-only fault injection: the next N calls into the no-replace rename
+	// primitive report a synthetic EINTR before the real syscall runs, letting
+	// tests exercise the restart loop without racing a real signal.
 	#[cfg(test)]
 	thread_local! {
 		static RENAME_NO_REPLACE_EINTR_INJECT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+	}
+
+	#[cfg(test)]
+	thread_local! {
+		static ROOT_PARENT_FSYNC_FAIL_ON_CALL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+	}
+
+	#[cfg(test)]
+	pub(super) fn inject_root_parent_fsync_failure(call: u32) {
+		ROOT_PARENT_FSYNC_FAIL_ON_CALL.with(|target| target.set(call));
+	}
+
+	#[cfg(test)]
+	fn take_injected_root_parent_fsync_failure() -> bool {
+		ROOT_PARENT_FSYNC_FAIL_ON_CALL.with(|target| {
+			let current = target.get();
+			if current == 0 {
+				return false;
+			}
+			target.set(current - 1);
+			current == 1
+		})
+	}
+
+	#[cfg(not(test))]
+	const fn take_injected_root_parent_fsync_failure() -> bool {
+		false
+	}
+
+	fn fsync_root_parent(fd: libc::c_int) -> Result<(), &'static str> {
+		if take_injected_root_parent_fsync_failure() {
+			return Err("io_error");
+		}
+		// SAFETY: `fd` is a live retained parent directory descriptor.
+		if unsafe { libc::fsync(fd) } != 0 {
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		Ok(())
 	}
 
 	#[cfg(test)]
@@ -1163,10 +1314,23 @@ pub(crate) mod platform {
 	static AFTER_TREE_VALIDATION_HOOK: OnceLock<
 		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 	> = OnceLock::new();
+	#[cfg(test)]
+	static BEFORE_TREE_ROOT_RENAME_HOOK: OnceLock<
+		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+	> = OnceLock::new();
+	#[cfg(test)]
+	static AFTER_TREE_SCRUB_HOOK: OnceLock<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>> =
+		OnceLock::new();
 
 	#[cfg(test)]
-	static AFTER_TREE_RENAME_HOOK: OnceLock<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>> =
-		OnceLock::new();
+	static BEFORE_TREE_CHILD_RENAME_HOOK: OnceLock<
+		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+	> = OnceLock::new();
+
+	#[cfg(test)]
+	static AFTER_TREE_FILE_LINK_CHECK_HOOK: OnceLock<
+		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+	> = OnceLock::new();
 
 	#[cfg(all(test, target_os = "linux"))]
 	pub(super) fn set_after_exchange_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
@@ -1195,8 +1359,48 @@ pub(crate) mod platform {
 	}
 
 	#[cfg(all(test, target_os = "linux"))]
-	pub(super) fn set_after_tree_rename_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
-		*AFTER_TREE_RENAME_HOOK
+	pub(super) fn set_after_tree_validation_hook(
+		hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+	) {
+		*AFTER_TREE_VALIDATION_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+	}
+
+	#[cfg(all(test, target_os = "linux"))]
+	pub(super) fn set_before_tree_root_rename_hook(
+		hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+	) {
+		*BEFORE_TREE_ROOT_RENAME_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+	}
+
+	#[cfg(all(test, target_os = "linux"))]
+	pub(super) fn set_after_tree_scrub_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
+		*AFTER_TREE_SCRUB_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+	}
+
+	#[cfg(all(test, target_os = "linux"))]
+	pub(super) fn set_before_tree_child_rename_hook(
+		hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+	) {
+		*BEFORE_TREE_CHILD_RENAME_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+	}
+
+	#[cfg(all(test, target_os = "linux"))]
+	pub(super) fn set_after_tree_file_link_check_hook(
+		hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+	) {
+		*AFTER_TREE_FILE_LINK_CHECK_HOOK
 			.get_or_init(|| Mutex::new(None))
 			.lock()
 			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
@@ -1255,15 +1459,54 @@ pub(crate) mod platform {
 	}
 
 	#[cfg(test)]
-	fn pause_after_tree_rename_for_test() {
-		if let Some((entered, resume)) = AFTER_TREE_RENAME_HOOK
+	fn pause_before_tree_root_rename_for_test() {
+		if let Some((entered, resume)) = BEFORE_TREE_ROOT_RENAME_HOOK
 			.get_or_init(|| Mutex::new(None))
 			.lock()
 			.unwrap_or_else(|poisoned| poisoned.into_inner())
 			.take()
 		{
-			entered.send(()).expect("tree rename hook receiver");
-			resume.recv().expect("tree rename hook resume");
+			entered.send(()).expect("tree root rename hook receiver");
+			resume.recv().expect("tree root rename hook resume");
+		}
+	}
+
+	#[cfg(test)]
+	fn pause_after_tree_scrub_for_test() {
+		if let Some((entered, resume)) = AFTER_TREE_SCRUB_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take()
+		{
+			entered.send(()).expect("tree scrub hook receiver");
+			resume.recv().expect("tree scrub hook resume");
+		}
+	}
+
+	#[cfg(test)]
+	fn pause_before_tree_child_rename_for_test() {
+		if let Some((entered, resume)) = BEFORE_TREE_CHILD_RENAME_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take()
+		{
+			entered.send(()).expect("tree child rename hook receiver");
+			resume.recv().expect("tree child rename hook resume");
+		}
+	}
+
+	#[cfg(test)]
+	fn pause_after_tree_file_link_check_for_test() {
+		if let Some((entered, resume)) = AFTER_TREE_FILE_LINK_CHECK_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take()
+		{
+			entered.send(()).expect("tree file mutation hook receiver");
+			resume.recv().expect("tree file mutation hook resume");
 		}
 	}
 
@@ -2710,8 +2953,6 @@ pub(crate) mod platform {
 				Err(_) => ExchangePlaceholderRemoval::RetainedMismatch(detached_name),
 			};
 		}
-		// POSIX only unlinks by mutable name. The identity proof cannot authorize
-		// a later unlinkat because a same-kind replacement may win that race.
 		ExchangePlaceholderRemoval::RetainedFailure(detached_name, "cleanup_pending")
 	}
 
@@ -2727,6 +2968,79 @@ pub(crate) mod platform {
 		// SAFETY: this uniquely transfers the live descriptor to `File` ownership.
 		let mut file = unsafe { File::from_raw_fd(fd) };
 		digest_reader(&mut file).map_err(|_| "io_error")
+	}
+
+	fn scrub_regular_file_openat(
+		parent_fd: libc::c_int,
+		name: &CString,
+		identity: &ExactFileIdentity,
+	) -> Result<(), &'static str> {
+		// SAFETY: `parent_fd` and `name` are live; flags request an exact no-follow
+		// regular-file descriptor.
+		let fd = unsafe {
+			libc::openat(parent_fd, name.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+		};
+		if fd < 0 {
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		let result = (|| {
+			let validate = || -> Result<(), &'static str> {
+				// SAFETY: zero is a valid initialized representation for `fstat` output.
+				let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+				// SAFETY: `fd` is live and `stat` is writable for the duration of the call.
+				if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+					return Err(security_code(&std::io::Error::last_os_error()));
+				}
+				if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+					|| stat.st_dev as u64 != identity.dev
+					|| stat.st_ino as u64 != identity.ino
+					|| stat.st_size as u64 != identity.size
+					|| stat_mtime_ns(&stat) != i128::from(identity.mtime_ns)
+				{
+					return Err("identity_mismatch");
+				}
+				if stat.st_nlink != 1 {
+					return Err("hard_link_unsupported");
+				}
+				// SAFETY: `fd` is live and seeking only resets its shared read offset before
+				// digesting.
+				if unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } < 0 {
+					return Err(security_code(&std::io::Error::last_os_error()));
+				}
+				// SAFETY: `fd` is live; the returned descriptor is checked before ownership
+				// transfer.
+				let duplicated = unsafe { libc::dup(fd) };
+				if duplicated < 0 {
+					return Err(security_code(&std::io::Error::last_os_error()));
+				}
+				// SAFETY: `duplicated` is a unique checked descriptor transferred to `File`
+				// exactly once.
+				let mut file = unsafe { File::from_raw_fd(duplicated) };
+				if digest_reader(&mut file).ok().as_ref() != identity.sha256.as_ref() {
+					return Err("identity_mismatch");
+				}
+				Ok(())
+			};
+			validate()?;
+			validate()?;
+			// SAFETY: `fd` is the live, twice-revalidated, single-link transcript
+			// descriptor.
+			if unsafe { libc::ftruncate(fd, 0) } != 0 {
+				return Err(security_code(&std::io::Error::last_os_error()));
+			}
+			// SAFETY: both descriptors remain live and are synchronized before return.
+			let file_synced = unsafe { libc::fsync(fd) } == 0;
+			// SAFETY: `parent_fd` remains live and binds the quarantine namespace.
+			let parent_synced = unsafe { libc::fsync(parent_fd) } == 0;
+			if !file_synced || !parent_synced {
+				return Err("durability_failed");
+			}
+			Ok(())
+		})();
+		// SAFETY: this function owns `fd` and closes it exactly once after the
+		// operation.
+		unsafe { libc::close(fd) };
+		result
 	}
 
 	pub(super) fn exact_unlink(
@@ -2806,19 +3120,15 @@ pub(crate) mod platform {
 			}
 			parent_fd = next_fd;
 		}
-		if let (Some(expected_dev), Some(expected_ino)) = (identity.parent_dev, identity.parent_ino) {
-			// SAFETY: libc::stat is a plain C output record; zero initialization creates a
-			// valid writable buffer for fstat to fill before any field is read.
+		if let Some((expected_dev, expected_ino)) = identity.parent_dev.zip(identity.parent_ino) {
+			// SAFETY: zero is valid initialized storage for `fstat` output.
 			let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
-			// SAFETY: parent_fd is the live directory descriptor owned by this branch, and
-			// parent_stat points to initialized writable storage for the complete fstat
-			// result.
+			// SAFETY: `parent_fd` is the retained walked parent descriptor.
 			if unsafe { libc::fstat(parent_fd, &mut parent_stat) } != 0
 				|| parent_stat.st_dev as u64 != expected_dev
 				|| parent_stat.st_ino as u64 != expected_ino
 			{
-				// SAFETY: the mismatch branch still owns parent_fd and returns immediately
-				// after closing it exactly once.
+				// SAFETY: this branch owns `parent_fd` exactly once.
 				unsafe { libc::close(parent_fd) };
 				return NativeExactUnlinkResult::failure("parent_mismatch");
 			}
@@ -2861,15 +3171,19 @@ pub(crate) mod platform {
 		}
 		if named.st_dev as u64 != identity.dev
 			|| named.st_ino as u64 != identity.ino
-			|| identity
-				.nlink
-				.is_some_and(|nlink| named.st_nlink as u64 != nlink)
 			|| named.st_size as u64 != identity.size
 			|| stat_mtime_ns(&named) != i128::from(identity.mtime_ns)
 		{
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe { libc::close(parent_fd) };
 			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		if !identity.directory
+			&& (named.st_nlink != 1 || identity.nlink.is_some_and(|nlink| nlink != 1))
+		{
+			// SAFETY: this branch owns the live descriptor and closes it exactly once.
+			unsafe { libc::close(parent_fd) };
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
 		}
 		if !identity.directory
 			&& digest_openat(parent_fd, &name).ok().as_ref() != identity.sha256.as_ref()
@@ -2955,9 +3269,6 @@ pub(crate) mod platform {
 		} == 0 && detached.st_mode & libc::S_IFMT == expected_kind
 			&& detached.st_dev as u64 == identity.dev
 			&& detached.st_ino as u64 == identity.ino
-			&& identity
-				.nlink
-				.is_none_or(|nlink| detached.st_nlink as u64 == nlink)
 			&& detached.st_size as u64 == identity.size
 			&& stat_mtime_ns(&detached) == i128::from(identity.mtime_ns);
 		let digest_matches = identity.directory
@@ -3052,11 +3363,18 @@ pub(crate) mod platform {
 			unsafe { libc::close(parent_fd) };
 			return result;
 		}
-		// POSIX has no descriptor-bound unlink. Retain the proven detached object
-		// and exchange placeholder rather than risk unlinking a replacement.
+		// POSIX cannot descriptor-unlink, but it can descriptor-scrub the exact
+		// detached regular file. Durable zero-length retained entries are then
+		// reconciled as internal placeholders without preserving transcript bytes.
+		if let Err(code) = scrub_regular_file_openat(parent_fd, &quarantine, identity) {
+			// SAFETY: this error branch owns `parent_fd` and closes it exactly once.
+			unsafe { libc::close(parent_fd) };
+			return NativeExactUnlinkResult::detached_failure(code, detached_path);
+		}
 		let result = match remove_exchange_placeholder(parent_fd, &name, placeholder) {
+			ExchangePlaceholderRemoval::Removed => NativeExactUnlinkResult::success(),
 			ExchangePlaceholderRemoval::RetainedFailure(retained_name, code) => {
-				NativeExactUnlinkResult::detached_failure_with_placeholder(
+				NativeExactUnlinkResult::detached_failure_with_durable_payload_and_placeholder(
 					code,
 					detached_path,
 					path
@@ -3067,7 +3385,25 @@ pub(crate) mod platform {
 						.into_owned(),
 				)
 			},
-			_ => NativeExactUnlinkResult::detached_failure("cleanup_pending", detached_path),
+			ExchangePlaceholderRemoval::RetainedMismatch(retained_name) => {
+				NativeExactUnlinkResult::detached_failure_with_durable_payload_and_placeholder(
+					"cleanup_pending",
+					detached_path,
+					path
+						.parent()
+						.unwrap_or_else(|| Path::new("."))
+						.join(retained_name.to_string_lossy().as_ref())
+						.to_string_lossy()
+						.into_owned(),
+				)
+			},
+			ExchangePlaceholderRemoval::RestoredMismatch | ExchangePlaceholderRemoval::Failed => {
+				NativeExactUnlinkResult::detached_failure_with_durable_payload_and_placeholder(
+					"cleanup_pending",
+					detached_path,
+					path.to_string_lossy().into_owned(),
+				)
+			},
 		};
 
 		// SAFETY: this branch owns the live descriptor and closes it exactly once.
@@ -3206,6 +3542,21 @@ pub(crate) mod platform {
 			Ok(value) => value,
 			Err(result) => return *result,
 		};
+		if let Some((expected_parent_dev, expected_parent_ino)) =
+			identity.parent_dev.zip(identity.parent_ino)
+		{
+			// SAFETY: zero is valid initialized storage for fstat output.
+			let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
+			// SAFETY: parent_fd is the live retained parent descriptor.
+			if unsafe { libc::fstat(parent_fd, &mut parent_stat) } != 0
+				|| parent_stat.st_dev as u64 != expected_parent_dev
+				|| parent_stat.st_ino as u64 != expected_parent_ino
+			{
+				// SAFETY: this branch owns parent_fd exactly once.
+				unsafe { libc::close(parent_fd) };
+				return NativeExactUnlinkResult::failure("parent_mismatch");
+			}
+		}
 		let Some(original_name_bytes) = original_path.file_name().map(|name| name.as_bytes()) else {
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe { libc::close(parent_fd) };
@@ -3230,9 +3581,6 @@ pub(crate) mod platform {
 		} == 0 && detached.st_mode & libc::S_IFMT == expected_kind
 			&& detached.st_dev as u64 == identity.dev
 			&& detached.st_ino as u64 == identity.ino
-			&& identity
-				.nlink
-				.is_none_or(|nlink| detached.st_nlink as u64 == nlink)
 			&& detached.st_size as u64 == identity.size
 			&& stat_mtime_ns(&detached) == i128::from(identity.mtime_ns)
 			&& (identity.directory
@@ -3242,14 +3590,48 @@ pub(crate) mod platform {
 			unsafe { libc::close(parent_fd) };
 			return NativeExactUnlinkResult::failure("identity_mismatch");
 		}
-		if let Err(code) = rename_no_replace(parent_fd, parent_fd, &detached_name, &original_name) {
+		if !identity.directory && detached.st_nlink != 1 {
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe { libc::close(parent_fd) };
-			return NativeExactUnlinkResult::failure(if code == "quarantine_collision" {
-				"collision"
-			} else {
-				code
-			});
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
+		// Revalidate the name immediately before commit; rename_no_replace remains the
+		// only namespace mutation and any observed substitution fails closed.
+		// SAFETY: zero is valid initialized storage for fstatat output.
+		let mut current: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: parent_fd and detached_name remain live for this no-follow probe.
+		let current_matches = unsafe {
+			libc::fstatat(parent_fd, detached_name.as_ptr(), &mut current, libc::AT_SYMLINK_NOFOLLOW)
+		} == 0 && current.st_mode & libc::S_IFMT == expected_kind
+			&& current.st_dev as u64 == identity.dev
+			&& current.st_ino as u64 == identity.ino
+			&& current.st_size as u64 == identity.size
+			&& stat_mtime_ns(&current) == i128::from(identity.mtime_ns)
+			&& (identity.directory
+				|| digest_openat(parent_fd, &detached_name).ok().as_ref() == identity.sha256.as_ref());
+		if !current_matches {
+			// SAFETY: this branch owns the live parent descriptor exactly once.
+			unsafe { libc::close(parent_fd) };
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		let placeholder =
+			match create_exchange_placeholder(parent_fd, &original_name, identity.directory) {
+				Ok(placeholder) => placeholder,
+				Err(code) => {
+					// SAFETY: this branch owns the live descriptor and closes it exactly once.
+					unsafe { libc::close(parent_fd) };
+					return NativeExactUnlinkResult::failure(if code == "quarantine_collision" {
+						"collision"
+					} else {
+						code
+					});
+				},
+			};
+		if let Err(code) = rename_exchange(parent_fd, parent_fd, &detached_name, &original_name) {
+			let _ = remove_exchange_placeholder(parent_fd, &original_name, placeholder);
+			// SAFETY: this branch owns the live descriptor and closes it exactly once.
+			unsafe { libc::close(parent_fd) };
+			return NativeExactUnlinkResult::failure(code);
 		}
 		// SAFETY: zero is a valid initialized representation for this output struct.
 		let mut restored: libc::stat = unsafe { std::mem::zeroed() };
@@ -3260,9 +3642,6 @@ pub(crate) mod platform {
 		} == 0 && restored.st_mode & libc::S_IFMT == expected_kind
 			&& restored.st_dev as u64 == identity.dev
 			&& restored.st_ino as u64 == identity.ino
-			&& identity
-				.nlink
-				.is_none_or(|nlink| restored.st_nlink as u64 == nlink)
 			&& restored.st_size as u64 == identity.size
 			&& stat_mtime_ns(&restored) == i128::from(identity.mtime_ns)
 			&& (identity.directory
@@ -3277,6 +3656,26 @@ pub(crate) mod platform {
 			} else {
 				"restore_failed"
 			});
+		}
+		match remove_exchange_placeholder(parent_fd, &detached_name, placeholder) {
+			ExchangePlaceholderRemoval::Removed => {},
+			ExchangePlaceholderRemoval::RetainedMismatch(retained_name)
+			| ExchangePlaceholderRemoval::RetainedFailure(retained_name, _) => {
+				// SAFETY: this branch owns the live descriptor and closes it exactly once.
+				unsafe { libc::close(parent_fd) };
+				return NativeExactUnlinkResult::retained_placeholder_failure(
+					"cleanup_pending",
+					retained_name.to_string_lossy().into_owned(),
+				);
+			},
+			ExchangePlaceholderRemoval::RestoredMismatch | ExchangePlaceholderRemoval::Failed => {
+				// SAFETY: this branch owns the live descriptor and closes it exactly once.
+				unsafe { libc::close(parent_fd) };
+				return NativeExactUnlinkResult::retained_unknown_failure(
+					"cleanup_pending",
+					detached_path.to_string_lossy().into_owned(),
+				);
+			},
 		}
 		// SAFETY: this branch owns the live descriptor and closes it exactly once.
 		unsafe { libc::close(parent_fd) };
@@ -3337,8 +3736,16 @@ pub(crate) mod platform {
 	}
 
 	fn directory_names(fd: libc::c_int) -> Result<Vec<Vec<u8>>, &'static str> {
-		// SAFETY: `fd` is live; this function owns the returned duplicate.
-		let duplicate = unsafe { libc::dup(fd) };
+		let current = c".";
+		// SAFETY: `fd` is live and `.` resolves the same directory with an independent
+		// stream offset for each validation or scrub pass.
+		let duplicate = unsafe {
+			libc::openat(
+				fd,
+				current.as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
 		if duplicate < 0 {
 			return Err(security_code(&std::io::Error::last_os_error()));
 		}
@@ -3403,7 +3810,7 @@ pub(crate) mod platform {
 			match stat.st_mode & libc::S_IFMT {
 				libc::S_IFREG => {
 					if stat.st_nlink != 1 {
-						return Err("identity_mismatch");
+						return Err("hard_link_unsupported");
 					}
 					entries.push(entry_from_stat(
 						child_relative,
@@ -3488,41 +3895,94 @@ pub(crate) mod platform {
 			.find(|entry| entry.relative_path == relative)
 	}
 
-	fn detached_entry_matches(
+	fn digest_fd(fd: libc::c_int) -> Result<[u8; 32], &'static str> {
+		// SAFETY: `fd` is live; this function owns the returned duplicate.
+		let duplicate = unsafe { libc::dup(fd) };
+		if duplicate < 0 {
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		// SAFETY: ownership of the live duplicate transfers to `File` exactly once.
+		let mut file = unsafe { File::from_raw_fd(duplicate) };
+		digest_reader(&mut file).map_err(|_| "io_error")
+	}
+
+	fn open_tree_entry(
 		parent_fd: libc::c_int,
 		name: &CString,
 		expected: &NativeDirectoryTreeEntry,
-	) -> Result<bool, &'static str> {
-		// SAFETY: zero is a valid initialized representation for this output struct.
-		let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-		// SAFETY: the descriptor and CString are live; the initialized output struct is
-		// writable.
-		if unsafe { libc::fstatat(parent_fd, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) }
-			!= 0
-		{
+		allow_scrubbed: bool,
+	) -> Result<libc::c_int, &'static str> {
+		let directory = expected.kind == "directory";
+		let flags = libc::O_RDONLY
+			| libc::O_CLOEXEC
+			| libc::O_NOFOLLOW
+			| if directory { libc::O_DIRECTORY } else { 0 };
+		// SAFETY: the parent descriptor and NUL-terminated component are live.
+		let fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
+		if fd < 0 {
 			return Err(security_code(&std::io::Error::last_os_error()));
 		}
-		let kind = match stat.st_mode & libc::S_IFMT {
-			libc::S_IFREG => "file",
-			libc::S_IFDIR => "directory",
-			libc::S_IFLNK => return Ok(false),
-			_ => return Ok(false),
+		// SAFETY: zero is a valid initialized representation for this output struct.
+		let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: `fd` is live and `stat` is writable.
+		if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+			// SAFETY: this branch owns `fd` exactly once.
+			unsafe { libc::close(fd) };
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		if !directory && stat.st_nlink != 1 {
+			// SAFETY: this branch owns `fd` exactly once.
+			unsafe { libc::close(fd) };
+			return Err("hard_link_unsupported");
+		}
+		let expected_kind = if directory {
+			libc::S_IFDIR
+		} else {
+			libc::S_IFREG
 		};
-		if kind != expected.kind.as_str()
-			|| stat.st_dev as u64 != expected.dev.parse().ok().unwrap_or(u64::MAX)
-			|| stat.st_ino as u64 != expected.ino.parse().ok().unwrap_or(u64::MAX)
-			|| stat.st_nlink as u64 != expected.nlink.parse().ok().unwrap_or(u64::MAX)
-			|| (kind == "file"
-				&& (stat.st_size as u64 != expected.size.parse().ok().unwrap_or(u64::MAX)
-					|| stat_mtime_ns(&stat).to_string() != expected.mtime_ns))
-		{
-			return Ok(false);
+		let identity_matches = stat.st_mode & libc::S_IFMT == expected_kind
+			&& stat.st_dev as u64 == expected.dev.parse().ok().unwrap_or(u64::MAX)
+			&& stat.st_ino as u64 == expected.ino.parse().ok().unwrap_or(u64::MAX);
+		let content_matches = if directory {
+			expected.sha256.is_none()
+		} else {
+			let digest = match digest_fd(fd) {
+				Ok(digest) => digest,
+				Err(code) => {
+					// SAFETY: this branch owns `fd` exactly once.
+					unsafe { libc::close(fd) };
+					return Err(code);
+				},
+			};
+			let original = stat.st_size as u64 == expected.size.parse().ok().unwrap_or(u64::MAX)
+				&& stat_mtime_ns(&stat).to_string() == expected.mtime_ns
+				&& expected.sha256.as_deref() == Some(hex_digest(digest).as_str());
+			let scrubbed = allow_scrubbed && stat.st_size == 0 && digest == sha256(b"");
+			original || scrubbed
+		};
+		if !identity_matches || !content_matches {
+			// SAFETY: this branch owns `fd` exactly once.
+			unsafe { libc::close(fd) };
+			return Err("identity_mismatch");
 		}
-		if kind == "file" {
-			let digest = hex_digest(digest_openat(parent_fd, name).map_err(|_| "io_error")?);
-			return Ok(expected.sha256.as_deref() == Some(digest.as_str()));
+		Ok(fd)
+	}
+
+	fn open_tree_entry_unverified(
+		parent_fd: libc::c_int,
+		name: &CString,
+		directory: bool,
+	) -> Result<libc::c_int, &'static str> {
+		let flags = libc::O_RDONLY
+			| libc::O_CLOEXEC
+			| libc::O_NOFOLLOW
+			| if directory { libc::O_DIRECTORY } else { 0 };
+		// SAFETY: the parent descriptor and NUL-terminated component are live.
+		let fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
+		if fd < 0 {
+			return Err(security_code(&std::io::Error::last_os_error()));
 		}
-		Ok(expected.sha256.is_none())
+		Ok(fd)
 	}
 
 	/// Each child quarantine name is a bounded deterministic digest of the
@@ -3557,6 +4017,179 @@ pub(crate) mod platform {
 		matching.next().is_none().then_some(entry)
 	}
 
+	fn scrub_tree_fd(
+		fd: libc::c_int,
+		relative: &str,
+		expected: &[NativeDirectoryTreeEntry],
+	) -> Result<(), &'static str> {
+		let mut names = directory_names(fd)?;
+		names.sort();
+		for name_bytes in names {
+			let physical = CString::new(name_bytes.clone()).map_err(|_| "io_error")?;
+			let direct_name = std::str::from_utf8(&name_bytes).ok();
+			let direct_relative = direct_name.map(|name| {
+				if relative.is_empty() {
+					name.to_owned()
+				} else {
+					format!("{relative}/{name}")
+				}
+			});
+			let expected_direct = direct_relative
+				.as_deref()
+				.and_then(|candidate| expected_tree_entry(expected, candidate));
+			let expected_quarantined =
+				expected_quarantined_tree_entry(expected, relative, &name_bytes);
+			let (expected_child, already_quarantined) = match (expected_direct, expected_quarantined) {
+				(Some(entry), None) => (entry, false),
+				(None, Some(entry)) => (entry, true),
+				_ => return Err("identity_mismatch"),
+			};
+			let child = open_tree_entry(fd, &physical, expected_child, true)?;
+			let retained_name = if already_quarantined {
+				tree_quarantine_name(expected_child)
+			} else {
+				physical.clone()
+			};
+			#[cfg(test)]
+			if !already_quarantined {
+				pause_before_tree_child_rename_for_test();
+			}
+			// Reopen the current retained name and compare it to the authorized
+			// descriptor before recursive or writable access. Children stay under
+			// their direct names inside the already-detached root; no mutable child
+			// pathname is renamed or unlinked by this scrubber.
+			let retained = match open_tree_entry_unverified(
+				fd,
+				&retained_name,
+				expected_child.kind == "directory",
+			) {
+				Ok(retained) => retained,
+				Err(code) => {
+					// SAFETY: this branch owns `child` exactly once.
+					unsafe { libc::close(child) };
+					return Err(code);
+				},
+			};
+			// SAFETY: zero is a valid initialized representation for these output structs.
+			let mut child_stat: libc::stat = unsafe { std::mem::zeroed() };
+			// SAFETY: zero is a valid initialized representation for this output struct.
+			let mut retained_stat: libc::stat = unsafe { std::mem::zeroed() };
+			// SAFETY: both descriptors are live and both output structs are writable.
+			let same_object = unsafe { libc::fstat(child, &mut child_stat) } == 0
+				&& unsafe { libc::fstat(retained, &mut retained_stat) } == 0
+				&& child_stat.st_dev == retained_stat.st_dev
+				&& child_stat.st_ino == retained_stat.st_ino;
+			// SAFETY: this branch owns `retained` exactly once.
+			unsafe { libc::close(retained) };
+			if !same_object {
+				// SAFETY: this branch owns `child` exactly once.
+				unsafe { libc::close(child) };
+				return Err("identity_mismatch");
+			}
+			let result = if expected_child.kind == "directory" {
+				scrub_tree_fd(child, &expected_child.relative_path, expected)
+			} else if child_stat.st_size == 0
+				&& digest_fd(child).is_ok_and(|digest| digest == sha256(b""))
+			{
+				// SAFETY: `child` is a live descriptor authorized by the tree snapshot.
+				if unsafe { libc::fsync(child) } != 0 {
+					Err(security_code(&std::io::Error::last_os_error()))
+				} else {
+					Ok(())
+				}
+			} else {
+				// Reopen writable, then revalidate identity and link count immediately
+				// before any permission or payload mutation. A hard link created after
+				// snapshot/open must preserve every alias unchanged.
+				// SAFETY: `fd` is a live directory descriptor and `retained_name` is a
+				// NUL-terminated child name retained beneath it.
+				let writable = unsafe {
+					libc::openat(
+						fd,
+						retained_name.as_ptr(),
+						libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+					)
+				};
+				if writable < 0 {
+					Err(security_code(&std::io::Error::last_os_error()))
+				} else {
+					// SAFETY: zero is a valid initialized representation for this output struct.
+					let mut writable_stat: libc::stat = unsafe { std::mem::zeroed() };
+					// SAFETY: `writable` is live and `writable_stat` is writable.
+					let writable_matches = unsafe { libc::fstat(writable, &mut writable_stat) } == 0
+						&& writable_stat.st_dev == child_stat.st_dev
+						&& writable_stat.st_ino == child_stat.st_ino;
+					let outcome = if !writable_matches {
+						Err("identity_mismatch")
+					} else if writable_stat.st_nlink != 1 {
+						Err("hard_link_unsupported")
+					} else {
+						// SAFETY: zero is a valid initialized representation for this output struct.
+						let mut truncate_stat: libc::stat = unsafe { std::mem::zeroed() };
+						// SAFETY: `writable` is live and `truncate_stat` is writable.
+						let truncate_matches = unsafe { libc::fstat(writable, &mut truncate_stat) } == 0
+							&& truncate_stat.st_dev == child_stat.st_dev
+							&& truncate_stat.st_ino == child_stat.st_ino;
+						if !truncate_matches {
+							Err("identity_mismatch")
+						} else if truncate_stat.st_nlink != 1 {
+							Err("hard_link_unsupported")
+						} else {
+							#[cfg(test)]
+							pause_after_tree_file_link_check_for_test();
+							// Recheck after the final test/race seam immediately before mutation.
+							// SAFETY: zero is a valid initialized representation for this output struct.
+							let mut commit_stat: libc::stat = unsafe { std::mem::zeroed() };
+							// SAFETY: `writable` is live and `commit_stat` is writable.
+							let commit_matches = unsafe { libc::fstat(writable, &mut commit_stat) } == 0
+								&& commit_stat.st_dev == child_stat.st_dev
+								&& commit_stat.st_ino == child_stat.st_ino
+								&& commit_stat.st_size as u64
+									== expected_child.size.parse().ok().unwrap_or(u64::MAX)
+								&& stat_mtime_ns(&commit_stat)
+									== expected_child.mtime_ns.parse().ok().unwrap_or(i128::MIN)
+								&& digest_fd(writable).ok().is_some_and(|digest| {
+									expected_child
+										.sha256
+										.as_deref()
+										.is_some_and(|expected| hex_digest(digest) == expected)
+								});
+							if !commit_matches {
+								Err("identity_mismatch")
+							} else if commit_stat.st_nlink != 1 {
+								Err("hard_link_unsupported")
+							} else {
+								// SAFETY: `writable` is the live, revalidated, single-link file descriptor.
+								let truncate_result = unsafe { libc::ftruncate(writable, 0) };
+								if truncate_result != 0 {
+									Err(security_code(&std::io::Error::last_os_error()))
+								} else {
+									// SAFETY: `writable` remains live after successful truncation.
+									if unsafe { libc::fsync(writable) } != 0 {
+										Err(security_code(&std::io::Error::last_os_error()))
+									} else {
+										Ok(())
+									}
+								}
+							}
+						}
+					};
+					// SAFETY: this branch owns `writable` exactly once.
+					unsafe { libc::close(writable) };
+					outcome
+				}
+			};
+			// SAFETY: this branch owns `child` exactly once.
+			unsafe { libc::close(child) };
+			result?;
+		}
+		// SAFETY: `fd` is a live directory descriptor.
+		if unsafe { libc::fsync(fd) } != 0 {
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		Ok(())
+	}
+
 	/// Validate the retained tree before atomically detaching its root. Every
 	/// entry still present must map uniquely to its durable logical identity,
 	/// including deterministic names retained by older attempts.
@@ -3583,17 +4216,19 @@ pub(crate) mod platform {
 				.and_then(|candidate| expected_tree_entry(expected, candidate));
 			let expected_quarantined =
 				expected_quarantined_tree_entry(expected, relative, &name_bytes);
-			let (logical_bytes, expected_child) = match (expected_direct, expected_quarantined) {
-				(Some(entry), None) => (name_bytes.clone(), entry),
-				(None, Some(entry)) => (
-					entry.relative_path.rsplit_once('/').map_or_else(
-						|| entry.relative_path.as_bytes().to_vec(),
-						|(_, name)| name.as_bytes().to_vec(),
+			let (logical_bytes, expected_child, _quarantined) =
+				match (expected_direct, expected_quarantined) {
+					(Some(entry), None) => (name_bytes.clone(), entry, false),
+					(None, Some(entry)) => (
+						entry.relative_path.rsplit_once('/').map_or_else(
+							|| entry.relative_path.as_bytes().to_vec(),
+							|(_, name)| name.as_bytes().to_vec(),
+						),
+						entry,
+						true,
 					),
-					entry,
-				),
-				_ => return Err("identity_mismatch"),
-			};
+					_ => return Err("identity_mismatch"),
+				};
 			let logical_name = std::str::from_utf8(&logical_bytes).map_err(|_| "not_utf8")?;
 			let child_relative = if relative.is_empty() {
 				logical_name.to_owned()
@@ -3602,28 +4237,18 @@ pub(crate) mod platform {
 			};
 			if !seen.insert(child_relative.clone())
 				|| expected_tree_entry(expected, &child_relative) != Some(expected_child)
-				|| !detached_entry_matches(fd, &physical, expected_child)?
 			{
 				return Err("identity_mismatch");
 			}
-			if expected_child.kind == "directory" {
-				// SAFETY: the live descriptor, where used, and NUL-terminated path remain
-				// valid.
-				let child = unsafe {
-					libc::openat(
-						fd,
-						physical.as_ptr(),
-						libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-					)
-				};
-				if child < 0 {
-					return Err(security_code(&std::io::Error::last_os_error()));
-				}
-				let result = validate_tree_fd(child, &child_relative, expected);
-				// SAFETY: this branch owns the live descriptor and closes it exactly once.
-				unsafe { libc::close(child) };
-				result?;
-			}
+			let child = open_tree_entry(fd, &physical, expected_child, true)?;
+			let result = if expected_child.kind == "directory" {
+				validate_tree_fd(child, &child_relative, expected)
+			} else {
+				Ok(())
+			};
+			// SAFETY: this branch owns `child` exactly once.
+			unsafe { libc::close(child) };
+			result?;
 		}
 		Ok(())
 	}
@@ -3640,17 +4265,14 @@ pub(crate) mod platform {
 			Err(result) => return *result,
 		};
 		if let Some((expected_dev, expected_ino)) = expected_parent {
-			// SAFETY: libc::stat is a plain C output record; zero initialization creates
-			// writable storage for fstat before any field is read.
+			// SAFETY: zero is valid initialized storage for `fstat` output.
 			let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
-			// SAFETY: parent is the live directory descriptor owned by this branch, and
-			// parent_stat is valid writable output storage.
+			// SAFETY: `parent` is the retained no-follow parent descriptor.
 			if unsafe { libc::fstat(parent, &mut parent_stat) } != 0
 				|| parent_stat.st_dev as u64 != expected_dev
 				|| parent_stat.st_ino as u64 != expected_ino
 			{
-				// SAFETY: this mismatch branch owns parent and returns immediately after
-				// closing it exactly once.
+				// SAFETY: this branch owns `parent` exactly once.
 				unsafe { libc::close(parent) };
 				return NativeExactUnlinkResult::failure("parent_mismatch");
 			}
@@ -3738,15 +4360,49 @@ pub(crate) mod platform {
 		}
 		#[cfg(test)]
 		pause_after_tree_validation_for_test();
+		if !already_final {
+			// Reopen the current source name after the race seam. A successor cannot
+			// become the detached cleanup target merely because it occupies the same path.
+			// SAFETY: `parent` is live and `root_name` is a NUL-terminated direct child.
+			let current_fd = unsafe {
+				libc::openat(
+					parent,
+					root_name.as_ptr(),
+					libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+				)
+			};
+			if current_fd < 0 {
+				// SAFETY: this branch owns the live descriptors and closes each exactly once.
+				unsafe {
+					libc::close(fd);
+					libc::close(parent);
+				}
+				return NativeExactUnlinkResult::detached_failure("identity_mismatch", planned_path);
+			}
+			// SAFETY: zero is a valid initialized representation for this output struct.
+			let mut current_root: libc::stat = unsafe { std::mem::zeroed() };
+			// SAFETY: `current_fd` is live and `current_root` is writable.
+			let current_valid = unsafe { libc::fstat(current_fd, &mut current_root) } == 0
+				&& current_root.st_dev == root.st_dev
+				&& current_root.st_ino == root.st_ino;
+			// SAFETY: this branch owns `current_fd` exactly once.
+			unsafe { libc::close(current_fd) };
+			if !current_valid {
+				// SAFETY: this branch owns the live descriptors and closes each exactly once.
+				unsafe {
+					libc::close(fd);
+					libc::close(parent);
+				}
+				return NativeExactUnlinkResult::detached_failure("identity_mismatch", planned_path);
+			}
+		}
 		let detached_retained_path = if already_final {
 			retained_path
 		} else {
+			#[cfg(test)]
+			pause_before_tree_root_rename_for_test();
 			match rename_no_replace(parent, parent, root_name, &final_name) {
-				Ok(()) => {
-					#[cfg(test)]
-					pause_after_tree_rename_for_test();
-					final_path
-				},
+				Ok(()) => final_path,
 				Err(code) => {
 					// SAFETY: this branch owns the live descriptors and closes each exactly once.
 					unsafe {
@@ -3757,41 +4413,7 @@ pub(crate) mod platform {
 				},
 			}
 		};
-		// The pre-rename descriptor cannot authorize the detached name. Reopen and
-		// revalidate the no-replace retained root before reporting it as replayable.
-		let detached_name = if already_final {
-			root_name
-		} else {
-			&final_name
-		};
-		// SAFETY: the parent descriptor and detached component are live.
-		let detached_fd = unsafe {
-			libc::openat(
-				parent,
-				detached_name.as_ptr(),
-				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-			)
-		};
-		let detached_valid = if detached_fd < 0 {
-			Err("cleanup_pending")
-		} else {
-			// SAFETY: zero is a valid initialized representation for libc::stat.
-
-			let mut detached_root: libc::stat = unsafe { std::mem::zeroed() };
-			// SAFETY: detached_fd is live and detached_root is writable.
-			let result = if unsafe { libc::fstat(detached_fd, &mut detached_root) } != 0
-				|| detached_root.st_dev as u64 != expected.root_dev.parse().ok().unwrap_or(u64::MAX)
-				|| detached_root.st_ino as u64 != expected.root_ino.parse().ok().unwrap_or(u64::MAX)
-			{
-				Err("identity_mismatch")
-			} else {
-				validate_tree_fd(detached_fd, "", &expected.entries)
-			};
-			// SAFETY: this branch owns the detached root descriptor exactly once.
-			unsafe { libc::close(detached_fd) };
-			result
-		};
-		if let Err(code) = detached_valid {
+		if let Err(code) = fsync_root_parent(parent) {
 			// SAFETY: this branch owns the live descriptors and closes each exactly once.
 			unsafe {
 				libc::close(fd);
@@ -3799,16 +4421,156 @@ pub(crate) mod platform {
 			}
 			return NativeExactUnlinkResult::detached_failure(code, detached_retained_path);
 		}
-		// POSIX cannot bind final unlink to the verified root descriptor. The
-		// no-replace detached root preserves the entire validated snapshot for
-		// deterministic replay instead of exchanging any child or root with a
-		// mutable placeholder.
+		let detached_name = if already_final {
+			root_name
+		} else {
+			&final_name
+		};
+		// Reopen and revalidate the detached retained name after the race seam.
+		// A substituted root fails before any recursive or writable mutation.
+		// SAFETY: `parent` is live and `detached_name` is the NUL-terminated retained
+		// tree name validated above.
+		let detached_fd = unsafe {
+			libc::openat(
+				parent,
+				detached_name.as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		if detached_fd < 0 {
+			// SAFETY: this branch owns the original root descriptor exactly once.
+			unsafe { libc::close(fd) };
+			if !already_final {
+				let (code, successor_path) =
+					match rename_no_replace(parent, parent, detached_name, root_name) {
+						Ok(()) => (
+							if fsync_root_parent(parent).is_ok() {
+								"identity_mismatch"
+							} else {
+								"io_error"
+							},
+							planned_path,
+						),
+						Err(_) => ("identity_mismatch", detached_retained_path),
+					};
+				// SAFETY: this branch owns the live parent descriptor exactly once.
+				unsafe { libc::close(parent) };
+				return NativeExactUnlinkResult::retained_successor_failure(code, successor_path);
+			}
+			// SAFETY: this branch owns the live parent descriptor exactly once.
+			unsafe { libc::close(parent) };
+			return NativeExactUnlinkResult::detached_failure(
+				"cleanup_pending",
+				detached_retained_path,
+			);
+		}
+		// SAFETY: zero is a valid initialized representation for this output struct.
+		let mut detached_root: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: `detached_fd` is live and `detached_root` is writable.
+		let detached_valid = unsafe { libc::fstat(detached_fd, &mut detached_root) } == 0
+			&& detached_root.st_dev as u64 == expected.root_dev.parse().ok().unwrap_or(u64::MAX)
+			&& detached_root.st_ino as u64 == expected.root_ino.parse().ok().unwrap_or(u64::MAX);
+		if !detached_valid {
+			// SAFETY: this branch owns the retained root descriptors exactly once.
+			unsafe {
+				libc::close(detached_fd);
+				libc::close(fd);
+			}
+			if !already_final {
+				let (code, successor_path) =
+					match rename_no_replace(parent, parent, detached_name, root_name) {
+						Ok(()) => (
+							if fsync_root_parent(parent).is_ok() {
+								"identity_mismatch"
+							} else {
+								"io_error"
+							},
+							planned_path,
+						),
+						Err(_) => ("identity_mismatch", detached_retained_path),
+					};
+				// SAFETY: this branch owns the live parent descriptor exactly once.
+				unsafe { libc::close(parent) };
+				return NativeExactUnlinkResult::retained_successor_failure(code, successor_path);
+			}
+			// SAFETY: this branch owns the live parent descriptor exactly once.
+			unsafe { libc::close(parent) };
+			return NativeExactUnlinkResult::detached_failure(
+				"identity_mismatch",
+				detached_retained_path,
+			);
+		}
+		if let Err(code) = validate_tree_fd(detached_fd, "", &expected.entries)
+			.and_then(|()| scrub_tree_fd(detached_fd, "", &expected.entries))
+			.and_then(|()| validate_tree_fd(detached_fd, "", &expected.entries))
+		{
+			// SAFETY: this branch owns the live descriptors and closes each exactly once.
+			unsafe {
+				libc::close(detached_fd);
+				libc::close(fd);
+				libc::close(parent);
+			}
+			return NativeExactUnlinkResult::detached_failure(code, detached_retained_path);
+		}
+		#[cfg(test)]
+		pause_after_tree_scrub_for_test();
+		// Rebind the durable receipt to the retained namespace after payload scrub.
+		// SAFETY: zero is a valid initialized representation for this output struct.
+		let mut retained_namespace: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: `parent` is live, `detached_name` is NUL-terminated, and the output
+		// is writable.
+		let retained_status = unsafe {
+			libc::fstatat(
+				parent,
+				detached_name.as_ptr(),
+				&mut retained_namespace,
+				libc::AT_SYMLINK_NOFOLLOW,
+			)
+		};
+		let retained_matches = retained_status == 0
+			&& retained_namespace.st_mode & libc::S_IFMT == libc::S_IFDIR
+			&& retained_namespace.st_dev as u64 == expected.root_dev.parse().ok().unwrap_or(u64::MAX)
+			&& retained_namespace.st_ino as u64 == expected.root_ino.parse().ok().unwrap_or(u64::MAX);
+		if !retained_matches {
+			// SAFETY: this branch owns the live descriptors and closes each exactly once.
+			unsafe {
+				libc::close(detached_fd);
+				libc::close(fd);
+				libc::close(parent);
+			}
+			return if retained_status == 0 {
+				NativeExactUnlinkResult::retained_successor_failure(
+					"identity_mismatch",
+					detached_retained_path,
+				)
+			} else {
+				NativeExactUnlinkResult::detached_failure("identity_mismatch", detached_retained_path)
+			};
+		}
+		if let Err(code) = fsync_root_parent(parent) {
+			// SAFETY: this branch owns the live descriptors and closes each exactly once.
+			unsafe {
+				libc::close(detached_fd);
+				libc::close(fd);
+				libc::close(parent);
+			}
+			return NativeExactUnlinkResult::detached_failure(code, detached_retained_path);
+		}
+		// POSIX cannot bind namespace unlink to a verified descriptor. The fallback
+		// therefore keeps the caller-authorized retained namespace and destroys every
+		// authorized file payload only after direct-name descriptor revalidation.
+		// Replays accept the same identities in original or scrubbed form; publisher
+		// successors are never renamed, unlinked, or truncated.
 		// SAFETY: this branch owns the live descriptors and closes each exactly once.
 		unsafe {
+			libc::close(detached_fd);
 			libc::close(fd);
 			libc::close(parent);
 		}
-		NativeExactUnlinkResult::detached_failure("cleanup_pending", detached_retained_path)
+		NativeExactUnlinkResult::detached_failure_with_durable_payload(
+			"cleanup_pending",
+			detached_retained_path,
+		)
 	}
 }
 
@@ -3825,8 +4587,8 @@ mod platform {
 	use sha2::{Digest, Sha256};
 	use windows_sys::Win32::{
 		Foundation::{
-			CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_ALL, GetLastError,
-			HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+			CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_FILE_NOT_FOUND,
+			ERROR_PATH_NOT_FOUND, GENERIC_ALL, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
 		},
 		Security::{
 			ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
@@ -3855,9 +4617,19 @@ mod platform {
 		NativeOwnerOnlySecurityResult, sha256,
 	};
 
+	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
+
+	#[link(name = "kernel32")]
+	unsafe extern "system" {
+		fn GetModuleHandleW(module_name: *const u16) -> *mut c_void;
+		fn GetProcAddress(module: *mut c_void, procedure_name: *const u8) -> *mut c_void;
+	}
+
 	const SECURITY_OWNER_DACL: u32 = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
 	const SECURITY_OWNER_DACL_PROTECTED: u32 =
 		SECURITY_OWNER_DACL | PROTECTED_DACL_SECURITY_INFORMATION;
+	const SECURITY_DACL_PROTECTED: u32 =
+		DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
 
 	const FILE_RENAME_INFORMATION_CLASS: i32 = 10;
 
@@ -4228,12 +5000,11 @@ mod platform {
 		)
 	}
 
-	fn open_exact_with_parent(
+	fn open_exact_with_share(
 		path: &Path,
 		kind: &str,
 		desired_access: u32,
-		expected_parent: Option<(u64, u64)>,
-		final_share_access: Option<u32>,
+		final_share_access: u32,
 	) -> Result<HeldExact, NativeOwnerOnlySecurityResult> {
 		if !matches!(kind, "directory" | "file") {
 			return Err(NativeOwnerOnlySecurityResult::failure("io_error"));
@@ -4266,39 +5037,20 @@ mod platform {
 		for (index, name) in names.iter().enumerate() {
 			let final_component = index + 1 == names.len();
 			let parent = *ancestors.last().expect("volume root retained");
-			if final_component {
-				if let Some((expected_dev, expected_ino)) = expected_parent {
-					let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-					if unsafe { GetFileInformationByHandle(parent, &mut information) } == 0
-						|| !expected_handle_identity_matches(&information, expected_dev, expected_ino)
-					{
-						close_retained(&mut ancestors);
-						return Err(NativeOwnerOnlySecurityResult::failure("parent_mismatch"));
-					}
-				}
-			}
-			let component_access = if final_component {
-				desired_access | FILE_READ_ATTRIBUTES
-			} else {
-				FILE_READ_ATTRIBUTES | FILE_TRAVERSE
-			};
-			let component_directory = if final_component {
-				kind == "directory"
-			} else {
-				true
-			};
-			let opened = if final_component {
+			let handle = match if final_component {
 				open_relative_with_share(
 					parent,
 					name,
-					component_access,
-					component_directory,
-					final_share_access.unwrap_or(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
+					desired_access | FILE_READ_ATTRIBUTES,
+					kind == "directory",
+					final_share_access,
 				)
 			} else {
-				open_relative(parent, name, component_access, component_directory)
-			};
-			let handle = match opened {
+				// This retained directory becomes RootDirectory for the next
+				// descriptor-relative NtCreateFile, which requires traversal
+				// authority as well as attribute inspection.
+				open_relative(parent, name, FILE_READ_ATTRIBUTES | FILE_TRAVERSE, true)
+			} {
 				Ok(handle) => handle,
 				Err(code) => {
 					close_retained(&mut ancestors);
@@ -4344,7 +5096,12 @@ mod platform {
 		kind: &str,
 		desired_access: u32,
 	) -> Result<HeldExact, NativeOwnerOnlySecurityResult> {
-		open_exact_with_parent(path, kind, desired_access, None, None)
+		open_exact_with_share(
+			path,
+			kind,
+			desired_access,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		)
 	}
 
 	fn open_directory_exact(path: &Path) -> Result<HeldExact, String> {
@@ -4386,27 +5143,32 @@ mod platform {
 		let mtime_ns = i128::from(filetime) * 100 - 11_644_473_600_000_000_000i128;
 		u64::from(information.dwVolumeSerialNumber) == identity.dev
 			&& ino == identity.ino
-			&& identity
-				.nlink
-				.is_none_or(|nlink| u64::from(information.nNumberOfLinks) == nlink)
 			&& size == identity.size
 			&& mtime_ns == i128::from(identity.mtime_ns)
 	}
 
-	fn handles_same_object(left: HANDLE, right: HANDLE) -> bool {
+	fn handles_same_object_checked(left: HANDLE, right: HANDLE) -> Result<bool, &'static str> {
 		let mut left_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
 		let mut right_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-		(unsafe { GetFileInformationByHandle(left, &mut left_information) }) != 0
-			&& (unsafe { GetFileInformationByHandle(right, &mut right_information) }) != 0
-			&& left_information.dwVolumeSerialNumber == right_information.dwVolumeSerialNumber
+		if unsafe { GetFileInformationByHandle(left, &mut left_information) } == 0
+			|| unsafe { GetFileInformationByHandle(right, &mut right_information) } == 0
+		{
+			return Err(last_error_code());
+		}
+		Ok(left_information.dwVolumeSerialNumber == right_information.dwVolumeSerialNumber
 			&& left_information.nFileIndexHigh == right_information.nFileIndexHigh
-			&& left_information.nFileIndexLow == right_information.nFileIndexLow
+			&& left_information.nFileIndexLow == right_information.nFileIndexLow)
 	}
 
-	fn rename_handle_no_replace(
+	fn handles_same_object(left: HANDLE, right: HANDLE) -> bool {
+		handles_same_object_checked(left, right).unwrap_or(false)
+	}
+
+	fn rename_handle(
 		handle: HANDLE,
 		parent_handle: HANDLE,
 		name: &[u16],
+		replace_if_exists: bool,
 	) -> Result<(), &'static str> {
 		let name_bytes = name.len().checked_mul(size_of::<u16>()).ok_or("io_error")?;
 		let file_name_offset = std::mem::offset_of!(HandleRenameInformation, file_name);
@@ -4429,7 +5191,7 @@ mod platform {
 		// computed from the field offset rather than from the one-element flexible
 		// array member, so the copy never creates an out-of-bounds array reference.
 		unsafe {
-			(*rename).replace_if_exists = 0;
+			(*rename).replace_if_exists = u8::from(replace_if_exists);
 			(*rename).root_directory = parent_handle;
 			(*rename).file_name_length = u32::try_from(name_bytes).map_err(|_| "io_error")?;
 			let file_name = storage
@@ -4466,28 +5228,22 @@ mod platform {
 		parent_handle: HANDLE,
 		source_name: &std::ffi::OsStr,
 		quarantine_name: &str,
+		detached_path: String,
 		identity: &ExactFileIdentity,
 	) -> NativeExactUnlinkResult {
-		let detached_parent = match final_path(parent_handle) {
-			Ok(path) => path,
-			Err(code) => return NativeExactUnlinkResult::failure(code),
-		};
 		let name_wide: Vec<u16> = quarantine_name.encode_utf16().collect();
 		let original_name_wide: Vec<u16> = source_name.encode_wide().collect();
-		let result = match rename_handle_no_replace(handle, parent_handle, &name_wide) {
+		let result = match rename_handle(handle, parent_handle, &name_wide, false) {
 			Ok(()) => {
-				let detached_path = Path::new(&detached_parent)
-					.join(quarantine_name)
-					.to_string_lossy()
-					.into_owned();
 				let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
 				let matches = unsafe { GetFileInformationByHandle(handle, &mut information) } != 0
 					&& handle_identity_matches(&information, identity)
 					&& (identity.directory
-						|| digest_handle(handle).ok().as_ref() == identity.sha256.as_ref());
+						|| (information.nNumberOfLinks == 1
+							&& digest_handle(handle).ok().as_ref() == identity.sha256.as_ref()));
 				if matches {
 					NativeExactUnlinkResult::detached(detached_path)
-				} else if rename_handle_no_replace(handle, parent_handle, &original_name_wide).is_ok() {
+				} else if rename_handle(handle, parent_handle, &original_name_wide, false).is_ok() {
 					NativeExactUnlinkResult::failure("identity_mismatch")
 				} else {
 					NativeExactUnlinkResult::detached_failure("restore_failed", detached_path)
@@ -4546,6 +5302,216 @@ mod platform {
 			Err("io_error")
 		}
 	}
+	pub(super) fn exact_replace_path(
+		source_path: &Path,
+		destination_path: &Path,
+		expected_source: &ExactFileIdentity,
+		expected_destination: &ExactFileIdentity,
+	) -> NativeExactUnlinkResult {
+		if expected_source.directory
+			|| expected_source.detach_only
+			|| expected_destination.directory
+			|| expected_destination.detach_only
+		{
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
+		if expected_source.parent_dev.is_none()
+			|| expected_source.parent_ino.is_none()
+			|| expected_destination.parent_dev.is_none()
+			|| expected_destination.parent_ino.is_none()
+		{
+			return NativeExactUnlinkResult::failure("parent_mismatch");
+		}
+		let source_path = match lexical_absolute_path(source_path) {
+			Ok(path) => path,
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		};
+		let destination_path = match lexical_absolute_path(destination_path) {
+			Ok(path) => path,
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		};
+		if source_path.parent() != destination_path.parent() {
+			return NativeExactUnlinkResult::failure("parent_mismatch");
+		}
+		let source = match open_exact_with_share(
+			&source_path,
+			"file",
+			FILE_READ_ATTRIBUTES | FILE_READ_DATA | 0x0001_0000,
+			FILE_SHARE_READ,
+		) {
+			Ok(handle) => handle,
+			Err(result) => {
+				return NativeExactUnlinkResult::failure(result.code.as_deref().unwrap_or("io_error"));
+			},
+		};
+		let mut source_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(source.target, &mut source_information) } == 0
+			|| source_information.dwFileAttributes
+				& (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
+				!= 0 || !handle_identity_matches(&source_information, expected_source)
+			|| digest_handle(source.target).ok().as_ref() != expected_source.sha256.as_ref()
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		if source_information.nNumberOfLinks != 1 {
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
+		let Some(parent_handle) = source.parent() else {
+			return NativeExactUnlinkResult::failure("io_error");
+		};
+		if let Some((expected_parent_dev, expected_parent_ino)) =
+			expected_source.parent_dev.zip(expected_source.parent_ino)
+		{
+			let mut parent_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+			if unsafe { GetFileInformationByHandle(parent_handle, &mut parent_information) } == 0
+				|| u64::from(parent_information.dwVolumeSerialNumber) != expected_parent_dev
+				|| ((u64::from(parent_information.nFileIndexHigh) << 32)
+					| u64::from(parent_information.nFileIndexLow))
+					!= expected_parent_ino
+			{
+				return NativeExactUnlinkResult::failure("parent_mismatch");
+			}
+		}
+		if expected_source.parent_dev != expected_destination.parent_dev
+			|| expected_source.parent_ino != expected_destination.parent_ino
+		{
+			return NativeExactUnlinkResult::failure("parent_mismatch");
+		}
+		let Some(destination_name) = destination_path.file_name() else {
+			return NativeExactUnlinkResult::failure("io_error");
+		};
+		// The destination is opened relative to the source's retained no-follow parent;
+		// no destination pathname is reopened after this point.
+		let destination_handle = match open_relative_with_share(
+			parent_handle,
+			destination_name,
+			FILE_READ_ATTRIBUTES | 0x0001_0000 | FILE_WRITE_ATTRIBUTES | FILE_READ_DATA,
+			false,
+			FILE_SHARE_READ | FILE_SHARE_DELETE,
+		) {
+			Ok(handle) => handle,
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		};
+		let destination = HeldExact { target: destination_handle, ancestors: Vec::new() };
+
+		let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(destination.target, &mut information) } == 0 {
+			return NativeExactUnlinkResult::failure(last_error_code());
+		}
+		if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			return NativeExactUnlinkResult::failure("reparse_point");
+		}
+		if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0
+			|| !handle_identity_matches(&information, expected_destination)
+			|| digest_handle(destination.target).ok().as_ref() != expected_destination.sha256.as_ref()
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		if information.nNumberOfLinks != 1 {
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
+		let mut revalidated: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(destination.target, &mut revalidated) } == 0
+			|| !handle_identity_matches(&revalidated, expected_destination)
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		if revalidated.nNumberOfLinks != 1 {
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
+		match handles_same_object_checked(source.target, destination.target) {
+			Ok(true) => return NativeExactUnlinkResult::failure("identity_mismatch"),
+			Ok(false) => {},
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		}
+		let mut source_revalidated: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(source.target, &mut source_revalidated) } == 0
+			|| !handle_identity_matches(&source_revalidated, expected_source)
+			|| digest_handle(source.target).ok().as_ref() != expected_source.sha256.as_ref()
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		if source_revalidated.nNumberOfLinks != 1 {
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
+		let retained_name_string =
+			format!(".gjc-exact-replace-source-{:x}-{:x}", expected_source.dev, expected_source.ino);
+		let retained_path = source_path.with_file_name(&retained_name_string);
+		let retained_name: Vec<u16> = retained_name_string.encode_utf16().collect();
+		if let Err(code) = rename_handle(source.target, parent_handle, &retained_name, false) {
+			return NativeExactUnlinkResult::failure(code);
+		}
+		let retained_path_string = retained_path.to_string_lossy().into_owned();
+		let mut retained_source: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(source.target, &mut retained_source) } == 0
+			|| !handle_identity_matches(&retained_source, expected_source)
+			|| digest_handle(source.target).ok().as_ref() != expected_source.sha256.as_ref()
+		{
+			return NativeExactUnlinkResult::detached_failure(
+				"identity_mismatch",
+				retained_path_string,
+			);
+		}
+		if retained_source.nNumberOfLinks != 1 {
+			return NativeExactUnlinkResult::detached_failure(
+				"hard_link_unsupported",
+				retained_path_string,
+			);
+		}
+		let mut destination_revalidated: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(destination.target, &mut destination_revalidated) }
+			== 0 || !handle_identity_matches(&destination_revalidated, expected_destination)
+			|| digest_handle(destination.target).ok().as_ref() != expected_destination.sha256.as_ref()
+		{
+			return NativeExactUnlinkResult::detached_failure(
+				"identity_mismatch",
+				retained_path_string,
+			);
+		}
+		if destination_revalidated.nNumberOfLinks != 1 {
+			return NativeExactUnlinkResult::detached_failure(
+				"hard_link_unsupported",
+				retained_path_string,
+			);
+		}
+		let destination_name: Vec<u16> = destination_name.encode_wide().collect();
+		let predecessor_name_string = format!(
+			".gjc-exact-replace-destination-{:x}-{:x}",
+			expected_destination.dev, expected_destination.ino
+		);
+		let predecessor_path = destination_path.with_file_name(&predecessor_name_string);
+		let predecessor_name: Vec<u16> = predecessor_name_string.encode_utf16().collect();
+		if let Err(code) = rename_handle(destination.target, parent_handle, &predecessor_name, false)
+		{
+			return NativeExactUnlinkResult::detached_failure(code, retained_path_string);
+		}
+		let predecessor_path_string = predecessor_path.to_string_lossy().into_owned();
+		match rename_handle(source.target, parent_handle, &destination_name, false) {
+			Ok(()) => match delete_handle(destination.target) {
+				Ok(()) => NativeExactUnlinkResult::success(),
+				Err(code) => NativeExactUnlinkResult::detached_failure_with_successor_and_placeholder(
+					code,
+					predecessor_path_string.clone(),
+					destination_path.to_string_lossy().into_owned(),
+					predecessor_path_string,
+				),
+			},
+			Err(code) => {
+				let restored_destination =
+					rename_handle(destination.target, parent_handle, &destination_name, false).is_ok();
+				if restored_destination {
+					NativeExactUnlinkResult::detached_failure(code, retained_path_string)
+				} else {
+					NativeExactUnlinkResult::detached_failure_with_successor_and_placeholder(
+						code,
+						retained_path_string,
+						destination_path.to_string_lossy().into_owned(),
+						predecessor_path_string,
+					)
+				}
+			},
+		}
+	}
 
 	pub(super) fn rename_path_no_replace(
 		source_path: &Path,
@@ -4587,7 +5553,7 @@ mod platform {
 			Err(code) => return NativeExactUnlinkResult::failure(&code),
 		};
 		let destination_name: Vec<u16> = destination_name.encode_wide().collect();
-		match rename_handle_no_replace(source.target, destination_parent.target, &destination_name) {
+		match rename_handle(source.target, destination_parent.target, &destination_name, false) {
 			Ok(()) => NativeExactUnlinkResult::success(),
 			Err(code) => NativeExactUnlinkResult::failure(code),
 		}
@@ -4614,22 +5580,17 @@ mod platform {
 		} else {
 			FILE_READ_DATA
 		};
-		let handle = match open_exact_with_parent(
-			path,
-			kind,
-			desired_access,
-			identity.parent_dev.zip(identity.parent_ino),
-			if identity.directory || identity.detach_only {
-				None
-			} else {
-				Some(FILE_SHARE_READ)
-			},
-		) {
+		let handle = match if identity.directory {
+			open_exact(path, kind, desired_access)
+		} else {
+			open_exact_with_share(path, kind, desired_access, FILE_SHARE_READ)
+		} {
 			Ok(handle) => handle,
 			Err(result) => {
 				return NativeExactUnlinkResult {
 					ok: false,
 					code: result.code,
+					payload_durable: None,
 					detached_path: None,
 					retained_successor_path: None,
 					retained_placeholder_path: None,
@@ -4644,6 +5605,9 @@ mod platform {
 		if !handle_identity_matches(&information, identity) {
 			return NativeExactUnlinkResult::failure("identity_mismatch");
 		}
+		if !identity.directory && information.nNumberOfLinks != 1 {
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
 		if !identity.directory
 			&& digest_handle(handle.target).ok().as_ref() != identity.sha256.as_ref()
 		{
@@ -4656,14 +5620,35 @@ mod platform {
 			let Some(parent_handle) = handle.parent() else {
 				return NativeExactUnlinkResult::failure("io_error");
 			};
+			if let Some((expected_parent_dev, expected_parent_ino)) =
+				identity.parent_dev.zip(identity.parent_ino)
+			{
+				let mut parent_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+				if unsafe { GetFileInformationByHandle(parent_handle, &mut parent_information) } == 0
+					|| u64::from(parent_information.dwVolumeSerialNumber) != expected_parent_dev
+					|| ((u64::from(parent_information.nFileIndexHigh) << 32)
+						| u64::from(parent_information.nFileIndexLow))
+						!= expected_parent_ino
+				{
+					return NativeExactUnlinkResult::failure("parent_mismatch");
+				}
+			}
 			let Some(original_name) = path.file_name() else {
 				return NativeExactUnlinkResult::failure("io_error");
 			};
+			let Some(parent_path) = path.parent() else {
+				return NativeExactUnlinkResult::failure("io_error");
+			};
+			let detached_path = parent_path
+				.join(quarantine_name)
+				.to_string_lossy()
+				.into_owned();
 			return detach_directory(
 				handle.target,
 				parent_handle,
 				original_name,
 				quarantine_name,
+				detached_path,
 				identity,
 			);
 		}
@@ -4683,22 +5668,24 @@ mod platform {
 		} else {
 			"file"
 		};
-		let handle = match open_exact(
-			detached_path,
-			kind,
-			FILE_READ_ATTRIBUTES
-				| 0x0001_0000
-				| if identity.directory {
-					0
-				} else {
-					FILE_READ_DATA
-				},
-		) {
+		let desired_access = FILE_READ_ATTRIBUTES
+			| 0x0001_0000
+			| if identity.directory {
+				0
+			} else {
+				FILE_READ_DATA
+			};
+		let handle = match if identity.directory {
+			open_exact(detached_path, kind, desired_access)
+		} else {
+			open_exact_with_share(detached_path, kind, desired_access, FILE_SHARE_READ)
+		} {
 			Ok(handle) => handle,
 			Err(result) => {
 				return NativeExactUnlinkResult {
 					ok: false,
 					code: result.code,
+					payload_durable: None,
 					detached_path: None,
 					retained_successor_path: None,
 					retained_placeholder_path: None,
@@ -4715,6 +5702,12 @@ mod platform {
 				&& digest_handle(handle.target).ok().as_ref() != identity.sha256.as_ref())
 		{
 			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		if !identity.directory && information.nNumberOfLinks != 1 {
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
+		if identity.parent_dev.is_none() || identity.parent_ino.is_none() {
+			return NativeExactUnlinkResult::failure("parent_mismatch");
 		}
 		let Some(source_name) = detached_path.file_name() else {
 			return NativeExactUnlinkResult::failure("io_error");
@@ -4735,11 +5728,25 @@ mod platform {
 		if !handles_same_object(detached_parent_handle, original_parent.target) {
 			return NativeExactUnlinkResult::failure("parent_mismatch");
 		}
+		if let Some((expected_parent_dev, expected_parent_ino)) =
+			identity.parent_dev.zip(identity.parent_ino)
+		{
+			let mut parent_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+			if unsafe { GetFileInformationByHandle(original_parent.target, &mut parent_information) }
+				== 0 || u64::from(parent_information.dwVolumeSerialNumber) != expected_parent_dev
+				|| ((u64::from(parent_information.nFileIndexHigh) << 32)
+					| u64::from(parent_information.nFileIndexLow))
+					!= expected_parent_ino
+			{
+				return NativeExactUnlinkResult::failure("parent_mismatch");
+			}
+		}
 		let result = detach_directory(
 			handle.target,
 			original_parent.target,
 			source_name,
 			quarantine_name,
+			original_path.to_string_lossy().into_owned(),
 			identity,
 		);
 		match result {
@@ -5097,11 +6104,46 @@ mod platform {
 		}
 	}
 
+	fn set_owner_only_acl(
+		handle: HANDLE,
+		kind: &str,
+		sid: &[u8],
+		repair_owner: bool,
+	) -> NativeOwnerOnlySecurityResult {
+		let dacl = match owner_only_dacl(sid, kind) {
+			Ok(dacl) => dacl,
+			Err(()) => return NativeOwnerOnlySecurityResult::failure("acl_apply_failed"),
+		};
+		let status = unsafe {
+			SetSecurityInfo(
+				handle,
+				SE_FILE_OBJECT,
+				if repair_owner {
+					SECURITY_OWNER_DACL_PROTECTED
+				} else {
+					SECURITY_DACL_PROTECTED
+				},
+				if repair_owner {
+					sid.as_ptr().cast_mut().cast()
+				} else {
+					null_mut()
+				},
+				null_mut(),
+				dacl.as_ptr().cast(),
+				null_mut(),
+			)
+		};
+		if status == 0 {
+			NativeOwnerOnlySecurityResult::success()
+		} else {
+			NativeOwnerOnlySecurityResult::failure("acl_apply_failed")
+		}
+	}
 	pub(super) fn apply_owner_only_path_security(
 		path: &Path,
 		kind: &str,
 	) -> NativeOwnerOnlySecurityResult {
-		let handle = match open_exact(path, kind, WRITE_OWNER | WRITE_DAC | READ_CONTROL) {
+		let mut handle = match open_exact(path, kind, WRITE_DAC | READ_CONTROL) {
 			Ok(handle) => handle,
 			Err(result) => return result,
 		};
@@ -5109,28 +6151,40 @@ mod platform {
 			Ok(sid) => sid,
 			Err(()) => return NativeOwnerOnlySecurityResult::failure("acl_unavailable"),
 		};
-		let dacl = match owner_only_dacl(&sid, kind) {
-			Ok(dacl) => dacl,
-			Err(()) => return NativeOwnerOnlySecurityResult::failure("acl_apply_failed"),
+		let repair_owner = match inspect_owner_only_acl(handle.target, kind, &sid) {
+			Ok(OwnerOnlyAclState::Clean) => false,
+			Ok(OwnerOnlyAclState::OwnerMismatch) => true,
+			Ok(OwnerOnlyAclState::RepairableMismatch) => false,
+			Ok(OwnerOnlyAclState::UnsafeMismatch) => {
+				return NativeOwnerOnlySecurityResult::failure("acl_verify_failed");
+			},
+			Err(code) => return NativeOwnerOnlySecurityResult::failure(code),
 		};
-		// SAFETY: the retained handle identifies the opened object; `sid` and aligned
-		// `dacl` contain validated, live Windows security structures for this
-		// synchronous call.
-		let status = unsafe {
-			SetSecurityInfo(
-				handle.target,
-				SE_FILE_OBJECT,
-				SECURITY_OWNER_DACL_PROTECTED,
-				sid.as_ptr().cast_mut().cast(),
-				null_mut(),
-				dacl.as_ptr().cast(),
-				null_mut(),
-			)
-		};
-		if status != 0 {
-			return NativeOwnerOnlySecurityResult::failure("acl_apply_failed");
+		if repair_owner {
+			let owner_handle = match open_exact(path, kind, WRITE_OWNER | WRITE_DAC | READ_CONTROL) {
+				Ok(handle) => handle,
+				Err(result) => return result,
+			};
+			match same_file_identity(handle.target, owner_handle.target) {
+				Ok(true) => handle = owner_handle,
+				Ok(false) => return NativeOwnerOnlySecurityResult::failure("identity_mismatch"),
+				Err(result) => return result,
+			}
 		}
-		verify_owner_only_path_security(path, kind)
+		let applied = set_owner_only_acl(handle.target, kind, &sid, repair_owner);
+		if !applied.ok {
+			return applied;
+		}
+		let verified = verify_owner_only_handle(handle.target, kind);
+		let reopened = match open_exact(path, kind, READ_CONTROL) {
+			Ok(handle) => handle,
+			Err(result) => return result,
+		};
+		match same_file_identity(handle.target, reopened.target) {
+			Ok(true) => verified,
+			Ok(false) => NativeOwnerOnlySecurityResult::failure("identity_mismatch"),
+			Err(result) => result,
+		}
 	}
 
 	pub(super) fn verify_owner_only_path_security(
@@ -5170,6 +6224,17 @@ mod platform {
 		if !expected_handle_identity_matches(&final_information, expected_dev, expected_ino) {
 			return NativeOwnerOnlySecurityResult::failure("identity_mismatch");
 		}
+		let reopened = match open_exact(path, kind, READ_CONTROL) {
+			Ok(handle) => handle,
+			Err(result) => return result,
+		};
+		let mut rebound_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(reopened.target, &mut rebound_information) } == 0 {
+			return NativeOwnerOnlySecurityResult::failure(last_error_code());
+		}
+		if !expected_handle_identity_matches(&rebound_information, expected_dev, expected_ino) {
+			return NativeOwnerOnlySecurityResult::failure("identity_mismatch");
+		}
 		verified
 	}
 
@@ -5189,11 +6254,10 @@ mod platform {
 		expected_dev: u64,
 		expected_ino: u64,
 	) -> NativeOwnerOnlySecurityResult {
-		let handle = match open_exact(path, kind, WRITE_DAC | READ_CONTROL) {
+		let mut handle = match open_exact(path, kind, WRITE_DAC | READ_CONTROL) {
 			Ok(handle) => handle,
 			Err(result) => return result,
 		};
-		// SAFETY: zero is a valid initialized representation for this output struct.
 		let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
 		if unsafe { GetFileInformationByHandle(handle.target, &mut information) } == 0 {
 			return NativeOwnerOnlySecurityResult::failure(last_error_code());
@@ -5205,38 +6269,36 @@ mod platform {
 			Ok(sid) => sid,
 			Err(()) => return NativeOwnerOnlySecurityResult::failure("acl_unavailable"),
 		};
-		match inspect_owner_only_acl(handle.target, kind, &sid) {
-			Ok(OwnerOnlyAclState::Clean) => return NativeOwnerOnlySecurityResult::success(),
-			Ok(OwnerOnlyAclState::OwnerMismatch) => {
-				return NativeOwnerOnlySecurityResult::failure("owner_mismatch");
-			},
+		let (requires_apply, repair_owner) = match inspect_owner_only_acl(handle.target, kind, &sid) {
+			Ok(OwnerOnlyAclState::Clean) => (false, false),
+			Ok(OwnerOnlyAclState::OwnerMismatch) => (true, true),
+			Ok(OwnerOnlyAclState::RepairableMismatch) => (true, false),
 			Ok(OwnerOnlyAclState::UnsafeMismatch) => {
 				return NativeOwnerOnlySecurityResult::failure("acl_verify_failed");
 			},
-			Ok(OwnerOnlyAclState::RepairableMismatch) => {},
 			Err(code) => return NativeOwnerOnlySecurityResult::failure(code),
-		}
-		let dacl = match owner_only_dacl(&sid, kind) {
-			Ok(dacl) => dacl,
-			Err(()) => return NativeOwnerOnlySecurityResult::failure("acl_apply_failed"),
 		};
-		// SAFETY: the retained handle identifies the prechecked object; `dacl` contains
-		// a validated, live Windows security structure for this synchronous call.
-		let status = unsafe {
-			SetSecurityInfo(
-				handle.target,
-				SE_FILE_OBJECT,
-				DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-				null_mut(),
-				null_mut(),
-				dacl.as_ptr().cast(),
-				null_mut(),
-			)
-		};
-		if status != 0 {
-			return NativeOwnerOnlySecurityResult::failure("acl_apply_failed");
+		if repair_owner {
+			let owner_handle = match open_exact(path, kind, WRITE_OWNER | WRITE_DAC | READ_CONTROL) {
+				Ok(handle) => handle,
+				Err(result) => return result,
+			};
+			let mut owner_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+			if unsafe { GetFileInformationByHandle(owner_handle.target, &mut owner_information) } == 0
+			{
+				return NativeOwnerOnlySecurityResult::failure(last_error_code());
+			}
+			if !expected_handle_identity_matches(&owner_information, expected_dev, expected_ino) {
+				return NativeOwnerOnlySecurityResult::failure("identity_mismatch");
+			}
+			handle = owner_handle;
 		}
-		// SAFETY: zero is a valid initialized representation for this output struct.
+		if requires_apply {
+			let applied = set_owner_only_acl(handle.target, kind, &sid, repair_owner);
+			if !applied.ok {
+				return applied;
+			}
+		}
 		let mut final_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
 		if unsafe { GetFileInformationByHandle(handle.target, &mut final_information) } == 0 {
 			return NativeOwnerOnlySecurityResult::failure(last_error_code());
@@ -5244,32 +6306,173 @@ mod platform {
 		if !expected_handle_identity_matches(&final_information, expected_dev, expected_ino) {
 			return NativeOwnerOnlySecurityResult::failure("identity_mismatch");
 		}
-		match inspect_owner_only_acl(handle.target, kind, &sid) {
-			Ok(OwnerOnlyAclState::Clean) => NativeOwnerOnlySecurityResult::success(),
-			Ok(OwnerOnlyAclState::OwnerMismatch) => {
-				NativeOwnerOnlySecurityResult::failure("owner_mismatch")
-			},
-			Ok(OwnerOnlyAclState::RepairableMismatch | OwnerOnlyAclState::UnsafeMismatch) => {
-				NativeOwnerOnlySecurityResult::failure("acl_verify_failed")
-			},
-			Err(code) => NativeOwnerOnlySecurityResult::failure(code),
+		let verified = verify_owner_only_handle(handle.target, kind);
+		let reopened = match open_exact(path, kind, READ_CONTROL) {
+			Ok(handle) => handle,
+			Err(result) => return result,
+		};
+		let mut rebound_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(reopened.target, &mut rebound_information) } == 0 {
+			return NativeOwnerOnlySecurityResult::failure(last_error_code());
 		}
+		if !expected_handle_identity_matches(&rebound_information, expected_dev, expected_ino) {
+			return NativeOwnerOnlySecurityResult::failure("identity_mismatch");
+		}
+		verified
+	}
+
+	fn uv_osfhandle(caller_fd: i32) -> Option<isize> {
+		let module = unsafe { GetModuleHandleW(null()) };
+		if module.is_null() {
+			return None;
+		}
+		let procedure = unsafe { GetProcAddress(module, b"uv_get_osfhandle\0".as_ptr()) };
+		if procedure.is_null() {
+			return None;
+		}
+		// SAFETY: `uv_get_osfhandle` is libuv's C ABI descriptor conversion exported
+		// by Node-compatible hosts. Its descriptor table belongs to the host that
+		// supplied `caller_fd`, unlike this addon's CRT table.
+		let conversion: UvGetOsfhandle = unsafe { std::mem::transmute(procedure) };
+		Some(unsafe { conversion(caller_fd) })
+	}
+
+	fn retained_caller_handle(caller_fd: i32) -> Result<HeldExact, NativeOwnerOnlySecurityResult> {
+		if caller_fd < 0 {
+			return Err(NativeOwnerOnlySecurityResult::failure("identity_unavailable"));
+		}
+		let Some(raw_handle) = uv_osfhandle(caller_fd) else {
+			return Err(NativeOwnerOnlySecurityResult::failure("identity_unavailable"));
+		};
+		if raw_handle == -1 {
+			return Err(NativeOwnerOnlySecurityResult::failure("identity_unavailable"));
+		}
+		let handle = raw_handle as HANDLE;
+		if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+			return Err(NativeOwnerOnlySecurityResult::failure("identity_unavailable"));
+		}
+		let process = unsafe { GetCurrentProcess() };
+		let mut retained = INVALID_HANDLE_VALUE;
+		if unsafe {
+			DuplicateHandle(process, handle, process, &mut retained, 0, 0, DUPLICATE_SAME_ACCESS)
+		} == 0
+		{
+			return Err(NativeOwnerOnlySecurityResult::failure("identity_unavailable"));
+		}
+		Ok(HeldExact { target: retained, ancestors: Vec::new() })
+	}
+
+	fn same_file_identity(
+		left: HANDLE,
+		right: HANDLE,
+	) -> Result<bool, NativeOwnerOnlySecurityResult> {
+		let mut left_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		let mut right_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(left, &mut left_information) } == 0
+			|| unsafe { GetFileInformationByHandle(right, &mut right_information) } == 0
+		{
+			return Err(NativeOwnerOnlySecurityResult::failure("identity_unavailable"));
+		}
+		Ok(left_information.dwVolumeSerialNumber == right_information.dwVolumeSerialNumber
+			&& left_information.nFileIndexHigh == right_information.nFileIndexHigh
+			&& left_information.nFileIndexLow == right_information.nFileIndexLow)
+	}
+
+	fn checked_caller_handle(
+		path: &Path,
+		kind: &str,
+		caller_fd: i32,
+		desired_access: u32,
+	) -> Result<(HeldExact, HeldExact), NativeOwnerOnlySecurityResult> {
+		let caller = retained_caller_handle(caller_fd)?;
+		let path_handle = open_exact(path, kind, desired_access)?;
+		if !same_file_identity(path_handle.target, caller.target)? {
+			return Err(NativeOwnerOnlySecurityResult::failure("identity_mismatch"));
+		}
+		Ok((path_handle, caller))
 	}
 
 	pub(super) fn apply_owner_only_fd_security(
-		_: &Path,
-		_: &str,
-		_: i32,
+		path: &Path,
+		kind: &str,
+		caller_fd: i32,
 	) -> NativeOwnerOnlySecurityResult {
-		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
+		let (mut path_handle, caller) =
+			match checked_caller_handle(path, kind, caller_fd, READ_CONTROL | WRITE_DAC) {
+				Ok(handles) => handles,
+				Err(result) => return result,
+			};
+		let sid = match current_user_sid() {
+			Ok(sid) => sid,
+			Err(()) => return NativeOwnerOnlySecurityResult::failure("acl_unavailable"),
+		};
+		let (requires_apply, repair_owner) =
+			match inspect_owner_only_acl(path_handle.target, kind, &sid) {
+				Ok(OwnerOnlyAclState::Clean) => (false, false),
+				Ok(OwnerOnlyAclState::OwnerMismatch) => (true, true),
+				Ok(OwnerOnlyAclState::RepairableMismatch) => (true, false),
+				Ok(OwnerOnlyAclState::UnsafeMismatch) => {
+					return NativeOwnerOnlySecurityResult::failure("acl_verify_failed");
+				},
+				Err(code) => return NativeOwnerOnlySecurityResult::failure(code),
+			};
+		if repair_owner {
+			let owner_handle = match open_exact(path, kind, READ_CONTROL | WRITE_DAC | WRITE_OWNER) {
+				Ok(handle) => handle,
+				Err(result) => return result,
+			};
+			match same_file_identity(owner_handle.target, caller.target) {
+				Ok(true) => path_handle = owner_handle,
+				Ok(false) => return NativeOwnerOnlySecurityResult::failure("identity_mismatch"),
+				Err(result) => return result,
+			}
+		}
+		if requires_apply {
+			let applied = set_owner_only_acl(path_handle.target, kind, &sid, repair_owner);
+			if !applied.ok {
+				return applied;
+			}
+		}
+		match same_file_identity(path_handle.target, caller.target) {
+			Ok(true) => {},
+			Ok(false) => return NativeOwnerOnlySecurityResult::failure("identity_mismatch"),
+			Err(result) => return result,
+		}
+		let reopened = match open_exact(path, kind, READ_CONTROL) {
+			Ok(handle) => handle,
+			Err(result) => return result,
+		};
+		match same_file_identity(reopened.target, caller.target) {
+			Ok(true) => verify_owner_only_handle(path_handle.target, kind),
+			Ok(false) => NativeOwnerOnlySecurityResult::failure("identity_mismatch"),
+			Err(result) => result,
+		}
 	}
 
 	pub(super) fn verify_owner_only_fd_security(
-		_: &Path,
-		_: &str,
-		_: i32,
+		path: &Path,
+		kind: &str,
+		caller_fd: i32,
 	) -> NativeOwnerOnlySecurityResult {
-		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
+		let (path_handle, caller) = match checked_caller_handle(path, kind, caller_fd, READ_CONTROL) {
+			Ok(handles) => handles,
+			Err(result) => return result,
+		};
+		let verified = verify_owner_only_handle(path_handle.target, kind);
+		match same_file_identity(path_handle.target, caller.target) {
+			Ok(true) => {},
+			Ok(false) => return NativeOwnerOnlySecurityResult::failure("identity_mismatch"),
+			Err(result) => return result,
+		}
+		let reopened = match open_exact(path, kind, READ_CONTROL) {
+			Ok(handle) => handle,
+			Err(result) => return result,
+		};
+		match same_file_identity(reopened.target, caller.target) {
+			Ok(true) => verified,
+			Ok(false) => NativeOwnerOnlySecurityResult::failure("identity_mismatch"),
+			Err(result) => result,
+		}
 	}
 	#[cfg(test)]
 	mod tests {
@@ -5406,6 +6609,9 @@ mod platform {
 		if (kind == "directory") != is_directory {
 			return Err("unsupported_entry");
 		}
+		if !is_directory && information.nNumberOfLinks != 1 {
+			return Err("hard_link_unsupported");
+		}
 		let ino =
 			(u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
 		let size = (u64::from(information.nFileSizeHigh) << 32) | u64::from(information.nFileSizeLow);
@@ -5417,7 +6623,7 @@ mod platform {
 			kind: kind.to_owned(),
 			dev: u64::from(information.dwVolumeSerialNumber).to_string(),
 			ino: ino.to_string(),
-			nlink: u64::from(information.nNumberOfLinks).to_string(),
+			nlink: information.nNumberOfLinks.to_string(),
 			size: size.to_string(),
 			mtime_ns: mtime_ns.to_string(),
 			ctime_ns: mtime_ns.to_string(),
@@ -5463,14 +6669,8 @@ mod platform {
 			} else if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
 				snapshot_tree_handle(child, &child_relative, entries)
 			} else {
-				match tree_entry(child, child_relative, kind) {
-					Ok(entry) if entry.nlink == "1" => {
-						entries.push(entry);
-						Ok(())
-					},
-					Ok(_) => Err("identity_mismatch"),
-					Err(code) => Err(code),
-				}
+				entries.push(tree_entry(child, child_relative, kind)?);
+				Ok(())
 			};
 			unsafe { CloseHandle(child) };
 			result?;
@@ -5495,7 +6695,6 @@ mod platform {
 		Ok(actual.kind == expected.kind
 			&& actual.dev == expected.dev
 			&& actual.ino == expected.ino
-			&& actual.nlink == expected.nlink
 			&& (kind == "directory"
 				|| (actual.size == expected.size
 					&& actual.mtime_ns == expected.mtime_ns
@@ -5542,7 +6741,7 @@ mod platform {
 		expected: &NativeDirectoryTreeEntry,
 	) -> Result<(), &'static str> {
 		let name: Vec<u16> = tree_quarantine_name(expected).encode_utf16().collect();
-		rename_handle_no_replace(handle, parent, &name)
+		rename_handle(handle, parent, &name, false)
 	}
 
 	fn set_handle_attributes(handle: HANDLE, attributes: u32) -> Result<(), &'static str> {
@@ -5657,32 +6856,30 @@ mod platform {
 				return Err("identity_mismatch");
 			}
 			let directory = expected_child.kind == "directory";
-			let child = open_relative(
-				handle,
-				&name_os,
-				FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
-				directory,
-			)?;
+			let child = if directory {
+				open_relative(
+					handle,
+					&name_os,
+					FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
+					true,
+				)?
+			} else {
+				open_relative_with_share(
+					handle,
+					&name_os,
+					FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
+					false,
+					FILE_SHARE_READ,
+				)?
+			};
 			if !tree_entry_matches(child, expected_child)? {
 				unsafe { CloseHandle(child) };
 				return Err("identity_mismatch");
 			}
-			let quarantine_name = tree_quarantine_name(expected_child);
-			let already_quarantined = name == quarantine_name;
+			let already_quarantined = name == tree_quarantine_name(expected_child);
 			if !already_quarantined {
-				if let Err(error) = quarantine_tree_child(child, handle, expected_child) {
-					unsafe { CloseHandle(child) };
-					return Err(error);
-				}
+				quarantine_tree_child(child, handle, expected_child)?;
 			}
-			unsafe { CloseHandle(child) };
-			let child = open_relative_with_share(
-				handle,
-				std::ffi::OsStr::new(&quarantine_name),
-				FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
-				directory,
-				FILE_SHARE_READ,
-			)?;
 			if !tree_entry_matches(child, expected_child)? {
 				unsafe { CloseHandle(child) };
 				return Err("identity_mismatch");
@@ -5740,27 +6937,24 @@ mod platform {
 		let mut final_candidate = PathBuf::from(path);
 		final_candidate.set_file_name(OsString::from_wide(&final_name));
 		let input_is_final = planned_path.ends_with(".removing");
-		let (root, retained_path, already_final) = match open_exact_with_parent(
+		let (root, retained_path, already_final) = match open_exact(
 			path,
 			"directory",
 			FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
-			expected_parent,
-			None,
 		) {
 			Ok(root) => (root, planned_path.clone(), input_is_final),
 			Err(result) if !input_is_final && result.code.as_deref() == Some("not_found") => {
-				match open_exact_with_parent(
+				match open_exact(
 					&final_candidate,
 					"directory",
 					FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | 0x0001_0000,
-					expected_parent,
-					None,
 				) {
 					Ok(root) => (root, final_path.clone(), true),
 					Err(result) => {
 						return NativeExactUnlinkResult {
 							ok: false,
 							code: result.code,
+							payload_durable: None,
 							detached_path: None,
 							retained_successor_path: None,
 							retained_placeholder_path: None,
@@ -5773,6 +6967,7 @@ mod platform {
 				return NativeExactUnlinkResult {
 					ok: false,
 					code: result.code,
+					payload_durable: None,
 					detached_path: None,
 					retained_successor_path: None,
 					retained_placeholder_path: None,
@@ -5791,23 +6986,30 @@ mod platform {
 			return NativeExactUnlinkResult::detached_failure(code, retained_path);
 		}
 		let parent = *root.ancestors.last().expect("directory parent retained");
+		if let Some((expected_parent_dev, expected_parent_ino)) = expected_parent {
+			let mut parent_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+			if unsafe { GetFileInformationByHandle(parent, &mut parent_information) } == 0
+				|| u64::from(parent_information.dwVolumeSerialNumber) != expected_parent_dev
+				|| ((u64::from(parent_information.nFileIndexHigh) << 32)
+					| u64::from(parent_information.nFileIndexLow))
+					!= expected_parent_ino
+			{
+				return NativeExactUnlinkResult::detached_failure("parent_mismatch", retained_path);
+			}
+		}
 		match remove_tree_handle(root.target, "", &expected.entries) {
-			Ok(()) if !already_final => {
-				match rename_handle_no_replace(root.target, parent, &final_name) {
-					Ok(()) => match tree_entry(root.target, String::new(), "directory") {
-						Ok(entry) if entry.dev == expected.root_dev && entry.ino == expected.root_ino => {
-							match delete_handle(root.target) {
-								Ok(()) => NativeExactUnlinkResult::success(),
-								Err(code) => NativeExactUnlinkResult::detached_failure(code, final_path),
-							}
-						},
-						Ok(_) => {
-							NativeExactUnlinkResult::detached_failure("identity_mismatch", final_path)
-						},
-						Err(code) => NativeExactUnlinkResult::detached_failure(code, final_path),
+			Ok(()) if !already_final => match rename_handle(root.target, parent, &final_name, false) {
+				Ok(()) => match tree_entry(root.target, String::new(), "directory") {
+					Ok(entry) if entry.dev == expected.root_dev && entry.ino == expected.root_ino => {
+						match delete_handle(root.target) {
+							Ok(()) => NativeExactUnlinkResult::success(),
+							Err(code) => NativeExactUnlinkResult::detached_failure(code, final_path),
+						}
 					},
-					Err(code) => NativeExactUnlinkResult::detached_failure(code, planned_path),
-				}
+					Ok(_) => NativeExactUnlinkResult::detached_failure("identity_mismatch", final_path),
+					Err(code) => NativeExactUnlinkResult::detached_failure(code, final_path),
+				},
+				Err(code) => NativeExactUnlinkResult::detached_failure(code, planned_path),
 			},
 			Ok(()) => match delete_handle(root.target) {
 				Ok(()) => NativeExactUnlinkResult::success(),
@@ -6233,7 +7435,11 @@ mod exact_unlink_placeholder_tests {
 			platform::set_after_exchange_hook(None);
 			platform::set_before_exchange_hook(None);
 			platform::set_after_placeholder_detach_hook(None);
-			platform::set_after_tree_rename_hook(None);
+			platform::set_after_tree_validation_hook(None);
+			platform::set_before_tree_root_rename_hook(None);
+			platform::set_after_tree_scrub_hook(None);
+			platform::set_before_tree_child_rename_hook(None);
+			platform::set_after_tree_file_link_check_hook(None);
 		}
 	}
 
@@ -6267,10 +7473,10 @@ mod exact_unlink_placeholder_tests {
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
 			dev:             metadata.dev(),
+			ino:             metadata.ino(),
 			nlink:           Some(metadata.nlink()),
 			parent_dev:      None,
 			parent_ino:      None,
-			ino:             metadata.ino(),
 			size:            metadata.size(),
 			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
 			directory:       false,
@@ -6297,8 +7503,13 @@ mod exact_unlink_placeholder_tests {
 		assert!(!result.ok);
 		assert_eq!(result.code.as_deref(), Some("cleanup_pending"));
 		assert_eq!(result.detached_path.as_deref(), Some(stale.to_string_lossy().as_ref()));
+		assert_eq!(result.payload_durable, Some(true));
 		assert_eq!(fs::read(&target).expect("successor preserved"), b"live successor");
-		assert_eq!(fs::read(&stale).expect("stale quarantine retained"), b"stale");
+		assert!(
+			fs::read(&stale)
+				.expect("stale quarantine scrubbed")
+				.is_empty()
+		);
 		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
 
@@ -6326,10 +7537,10 @@ mod exact_unlink_placeholder_tests {
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
 			dev:             metadata.dev(),
+			ino:             metadata.ino(),
 			nlink:           Some(metadata.nlink()),
 			parent_dev:      None,
 			parent_ino:      None,
-			ino:             metadata.ino(),
 			size:            metadata.size(),
 			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
 			directory:       target_is_directory,
@@ -6392,10 +7603,10 @@ mod exact_unlink_placeholder_tests {
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
 			dev:             metadata.dev(),
+			ino:             metadata.ino(),
 			nlink:           Some(metadata.nlink()),
 			parent_dev:      None,
 			parent_ino:      None,
-			ino:             metadata.ino(),
 			size:            metadata.size(),
 			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
 			directory:       target_is_directory,
@@ -6463,10 +7674,10 @@ mod exact_unlink_placeholder_tests {
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
 			dev:             metadata.dev(),
+			ino:             metadata.ino(),
 			nlink:           Some(metadata.nlink()),
 			parent_dev:      None,
 			parent_ino:      None,
-			ino:             metadata.ino(),
 			size:            metadata.size(),
 			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
 			directory:       target_is_directory,
@@ -6536,10 +7747,10 @@ mod exact_unlink_placeholder_tests {
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
 			dev: metadata.dev(),
+			ino: metadata.ino(),
 			nlink: Some(metadata.nlink()),
 			parent_dev: None,
 			parent_ino: None,
-			ino: metadata.ino(),
 			size: metadata.size(),
 			mtime_ns: metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
 			directory: false,
@@ -6574,10 +7785,26 @@ mod exact_unlink_placeholder_tests {
 		platform::set_after_placeholder_detach_hook(None);
 
 		assert!(!result.ok);
-		assert!(matches!(result.code.as_deref(), Some("cleanup_pending" | "identity_mismatch")));
+		assert_eq!(
+			result.code.as_deref(),
+			Some(if detach_only {
+				"identity_mismatch"
+			} else {
+				"cleanup_pending"
+			}),
+		);
 		assert_eq!(result.detached_path.as_deref(), Some(stale.to_string_lossy().as_ref()));
+		assert_eq!(result.payload_durable, if detach_only { None } else { Some(true) });
 		assert_eq!(fs::read(&target).expect("read second successor"), b"second");
-		assert_eq!(fs::read(&stale).expect("read detached stale object"), b"stale");
+		if detach_only {
+			assert_eq!(fs::read(&stale).expect("read retained stale object"), b"stale");
+		} else {
+			assert!(
+				fs::read(&stale)
+					.expect("read scrubbed stale object")
+					.is_empty()
+			);
+		}
 		let retained = fs::read_dir(&root)
 			.expect("read temporary directory")
 			.map(|entry| entry.expect("read temporary entry").path())
@@ -6619,10 +7846,10 @@ mod exact_unlink_placeholder_tests {
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
 			dev:             metadata.dev(),
+			ino:             metadata.ino(),
 			nlink:           Some(metadata.nlink()),
 			parent_dev:      None,
 			parent_ino:      None,
-			ino:             metadata.ino(),
 			size:            metadata.size(),
 			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
 			directory:       false,
@@ -6696,31 +7923,38 @@ mod exact_unlink_placeholder_tests {
 		assert!(!result.ok);
 		assert_eq!(result.code.as_deref(), Some("cleanup_pending"));
 		assert_eq!(result.detached_path.as_deref(), Some(detached.to_string_lossy().as_ref()));
+		assert_eq!(result.payload_durable, Some(true));
 		assert!(result.retained_successor_path.is_none());
 		assert!(result.retained_placeholder_path.is_none());
 		assert!(result.retained_unknown_path.is_none());
 	}
 
-	fn same_tree_after_authorized_rename(
-		left: &NativeDirectoryTreeSnapshot,
-		right: &NativeDirectoryTreeSnapshot,
+	fn tree_is_descriptor_scrubbed(
+		observed: &NativeDirectoryTreeSnapshot,
+		expected: &NativeDirectoryTreeSnapshot,
 	) -> bool {
-		left.root_dev == right.root_dev
-			&& left.root_ino == right.root_ino
-			&& left.entries.len() == right.entries.len()
-			&& left
-				.entries
-				.iter()
-				.zip(&right.entries)
-				.all(|(left, right)| {
-					left.relative_path == right.relative_path
-						&& left.kind == right.kind
-						&& left.dev == right.dev
-						&& left.ino == right.ino
-						&& left.size == right.size
-						&& left.mtime_ns == right.mtime_ns
-						&& left.sha256 == right.sha256
-				})
+		let mut observed_identities = observed
+			.entries
+			.iter()
+			.map(|entry| (&entry.kind, &entry.dev, &entry.ino))
+			.collect::<Vec<_>>();
+		let mut expected_identities = expected
+			.entries
+			.iter()
+			.map(|entry| (&entry.kind, &entry.dev, &entry.ino))
+			.collect::<Vec<_>>();
+		observed_identities.sort();
+		expected_identities.sort();
+		observed.root_dev == expected.root_dev
+			&& observed.root_ino == expected.root_ino
+			&& observed_identities == expected_identities
+			&& observed.entries.iter().all(|entry| {
+				(entry.relative_path.is_empty() && entry.kind == "directory")
+					|| entry.kind == "directory"
+					|| (entry.size == "0"
+						&& entry.sha256.as_deref()
+							== Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"))
+			})
 	}
 
 	fn replay_retains_verified_tree(nested: bool) {
@@ -6744,32 +7978,24 @@ mod exact_unlink_placeholder_tests {
 		let snapshot = platform::snapshot_directory_tree(&target)
 			.snapshot
 			.expect("snapshot target");
-		let detached = root.join("target.removing");
+		let detached = std::path::PathBuf::from(format!("{}.removing", target.to_string_lossy()));
 
 		let first = platform::exact_remove_directory_tree(&target, &snapshot, None);
 		assert_tree_replay_result(&first, &detached);
-		assert!(target.symlink_metadata().is_err());
+		let first_snapshot = platform::snapshot_directory_tree(&detached)
+			.snapshot
+			.expect("snapshot detached");
 		assert!(
-			same_tree_after_authorized_rename(
-				&platform::snapshot_directory_tree(&detached)
-					.snapshot
-					.expect("snapshot detached"),
-				&snapshot,
-			),
-			"first retained tree is replayable from the original snapshot"
+			tree_is_descriptor_scrubbed(&first_snapshot, &snapshot),
+			"first retained tree contains no authorized payload",
 		);
 
 		let second = platform::exact_remove_directory_tree(&target, &snapshot, None);
 		assert_tree_replay_result(&second, &detached);
-		assert!(
-			same_tree_after_authorized_rename(
-				&platform::snapshot_directory_tree(&detached)
-					.snapshot
-					.expect("snapshot detached"),
-				&snapshot,
-			),
-			"second call retains the same replayable tree"
-		);
+		let second_snapshot = platform::snapshot_directory_tree(&detached)
+			.snapshot
+			.expect("snapshot detached");
+		assert_eq!(second_snapshot, first_snapshot, "replay does not mutate the scrubbed tree");
 		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
 
@@ -6781,6 +8007,413 @@ mod exact_unlink_placeholder_tests {
 	#[test]
 	fn nested_tree_retention_replays_on_second_call_with_exact_evidence() {
 		replay_retains_verified_tree(true);
+	}
+
+	#[test]
+	fn root_parent_fsync_failures_withhold_durable_marker_and_replay() {
+		let _guard = exchange_hook_test_guard();
+		for fail_on_call in [1, 2] {
+			let root = std::env::temp_dir().join(format!(
+				"gjc-tree-root-fsync-{fail_on_call}-{}-{}",
+				std::process::id(),
+				SystemTime::now()
+					.duration_since(UNIX_EPOCH)
+					.expect("system time")
+					.as_nanos(),
+			));
+			fs::create_dir(&root).expect("create temporary directory");
+			let target = root.join("target");
+			fs::create_dir(&target).expect("create target");
+			fs::write(target.join("payload.bin"), b"authorized payload").expect("write payload");
+			let snapshot = platform::snapshot_directory_tree(&target)
+				.snapshot
+				.expect("snapshot target");
+			let detached = std::path::PathBuf::from(format!("{}.removing", target.to_string_lossy()));
+
+			platform::inject_root_parent_fsync_failure(fail_on_call);
+			let interrupted = platform::exact_remove_directory_tree(&target, &snapshot, None);
+			assert!(!interrupted.ok);
+			assert_eq!(interrupted.code.as_deref(), Some("io_error"));
+			assert_eq!(
+				interrupted.detached_path.as_deref(),
+				Some(detached.to_string_lossy().as_ref())
+			);
+			assert_eq!(interrupted.payload_durable, None);
+
+			platform::inject_root_parent_fsync_failure(0);
+			let replayed = platform::exact_remove_directory_tree(&target, &snapshot, None);
+			assert_tree_replay_result(&replayed, &detached);
+			let replayed_snapshot = platform::snapshot_directory_tree(&detached)
+				.snapshot
+				.expect("snapshot replayed tree");
+			assert!(tree_is_descriptor_scrubbed(&replayed_snapshot, &snapshot));
+			fs::remove_dir_all(root).expect("remove temporary directory");
+		}
+	}
+
+	#[test]
+	fn tree_scrub_preserves_a_substituted_root_successor_after_validation() {
+		let _guard = exchange_hook_test_guard();
+		let root = std::env::temp_dir().join(format!(
+			"gjc-tree-successor-{}-{}",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system time")
+				.as_nanos(),
+		));
+		fs::create_dir(&root).expect("create temporary directory");
+		let target = root.join("target");
+		fs::create_dir(&target).expect("create target");
+		fs::write(target.join("state.json"), b"authorized stale payload")
+			.expect("write stale payload");
+		let snapshot = platform::snapshot_directory_tree(&target)
+			.snapshot
+			.expect("snapshot target");
+		let detached = target.clone();
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_before_tree_root_rename_hook(Some((entered_tx, resume_rx)));
+		let target_for_remove = target.clone();
+		let removal = thread::spawn(move || {
+			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
+		});
+		entered_rx.recv().expect("wait for root validation");
+		let retained_stale = root.join("retained-stale-root");
+		fs::rename(&target, &retained_stale).expect("retain stale root");
+		fs::create_dir(&target).expect("publish successor root");
+		fs::write(target.join("state.json"), b"substituted successor")
+			.expect("write successor payload");
+		resume_tx.send(()).expect("resume tree scrub");
+		let result = removal.join().expect("tree scrub thread");
+		platform::set_before_tree_root_rename_hook(None);
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert!(result.detached_path.is_none());
+		assert_eq!(
+			result.retained_successor_path.as_deref(),
+			Some(detached.to_string_lossy().as_ref())
+		);
+		assert_eq!(
+			fs::read(detached.join("state.json")).expect("read successor"),
+			b"substituted successor"
+		);
+		assert_eq!(
+			fs::read(retained_stale.join("state.json")).expect("read stale object"),
+			b"authorized stale payload"
+		);
+		fs::remove_dir_all(root).expect("remove temporary directory");
+	}
+
+	#[test]
+	fn tree_scrub_restores_a_regular_file_root_successor() {
+		let _guard = exchange_hook_test_guard();
+		let root = std::env::temp_dir().join(format!(
+			"gjc-tree-file-successor-{}-{}",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system time")
+				.as_nanos(),
+		));
+		fs::create_dir(&root).expect("create temporary directory");
+		let target = root.join("target");
+		fs::create_dir(&target).expect("create target");
+		fs::write(target.join("state.json"), b"authorized stale payload")
+			.expect("write stale payload");
+		let snapshot = platform::snapshot_directory_tree(&target)
+			.snapshot
+			.expect("snapshot target");
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_before_tree_root_rename_hook(Some((entered_tx, resume_rx)));
+		let target_for_remove = target.clone();
+		let removal = thread::spawn(move || {
+			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
+		});
+		entered_rx.recv().expect("wait for root validation");
+		let retained_stale = root.join("retained-stale-root");
+		fs::rename(&target, &retained_stale).expect("retain stale root");
+		fs::write(&target, b"regular-file successor").expect("publish file successor");
+		resume_tx.send(()).expect("resume tree scrub");
+		let result = removal.join().expect("tree scrub thread");
+		platform::set_before_tree_root_rename_hook(None);
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(
+			result.retained_successor_path.as_deref(),
+			Some(target.to_string_lossy().as_ref())
+		);
+		assert_eq!(fs::read(&target).expect("read successor"), b"regular-file successor");
+		assert_eq!(
+			fs::read(retained_stale.join("state.json")).expect("read stale object"),
+			b"authorized stale payload"
+		);
+		fs::remove_dir_all(root).expect("remove temporary directory");
+	}
+
+	#[test]
+	fn tree_scrub_rejects_a_post_scrub_retained_root_successor() {
+		let _guard = exchange_hook_test_guard();
+		let root = std::env::temp_dir().join(format!(
+			"gjc-tree-post-scrub-successor-{}-{}",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system time")
+				.as_nanos(),
+		));
+		fs::create_dir(&root).expect("create temporary directory");
+		let target = root.join("target");
+		let detached = std::path::PathBuf::from(format!("{}.removing", target.to_string_lossy()));
+		fs::create_dir(&target).expect("create target");
+		fs::write(target.join("state.json"), b"authorized stale payload")
+			.expect("write stale payload");
+		let snapshot = platform::snapshot_directory_tree(&target)
+			.snapshot
+			.expect("snapshot target");
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_after_tree_scrub_hook(Some((entered_tx, resume_rx)));
+		let target_for_remove = target.clone();
+		let removal = thread::spawn(move || {
+			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
+		});
+		entered_rx
+			.recv()
+			.expect("wait for post-scrub receipt boundary");
+		let retained_scrubbed = root.join("retained-scrubbed-root");
+		fs::rename(&detached, &retained_scrubbed).expect("retain scrubbed root");
+		fs::create_dir(&detached).expect("publish retained-name successor");
+		fs::write(detached.join("state.json"), b"successor payload")
+			.expect("write successor payload");
+		resume_tx.send(()).expect("resume durable receipt");
+		let result = removal.join().expect("tree scrub thread");
+		platform::set_after_tree_scrub_hook(None);
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.payload_durable, None);
+		assert_eq!(
+			result.retained_successor_path.as_deref(),
+			Some(detached.to_string_lossy().as_ref())
+		);
+		assert_eq!(
+			fs::read(detached.join("state.json")).expect("read successor"),
+			b"successor payload"
+		);
+		assert_eq!(
+			fs::read(retained_scrubbed.join("state.json")).expect("read scrubbed original"),
+			b""
+		);
+		fs::remove_dir_all(root).expect("remove temporary directory");
+	}
+
+	#[test]
+	fn tree_scrub_rejects_external_hard_links_without_truncation() {
+		let _guard = exchange_hook_test_guard();
+		let root = std::env::temp_dir().join(format!(
+			"gjc-tree-hard-link-{}-{}",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system time")
+				.as_nanos(),
+		));
+		fs::create_dir(&root).expect("create temporary directory");
+
+		let rejected = root.join("rejected");
+		fs::create_dir(&rejected).expect("create rejected tree");
+		fs::write(rejected.join("payload.bin"), b"shared payload").expect("write rejected payload");
+		fs::hard_link(rejected.join("payload.bin"), root.join("rejected-alias.bin"))
+			.expect("link rejected alias");
+		let rejected_snapshot = platform::snapshot_directory_tree(&rejected);
+		assert!(!rejected_snapshot.ok);
+		assert_eq!(rejected_snapshot.code.as_deref(), Some("hard_link_unsupported"));
+		assert_eq!(
+			fs::read(root.join("rejected-alias.bin")).expect("read rejected alias"),
+			b"shared payload"
+		);
+
+		let raced = root.join("raced");
+		fs::create_dir(&raced).expect("create raced tree");
+		fs::write(raced.join("payload.bin"), b"raced shared payload").expect("write raced payload");
+		let raced_snapshot = platform::snapshot_directory_tree(&raced)
+			.snapshot
+			.expect("snapshot unlinked tree");
+		let alias = root.join("raced-alias.bin");
+		fs::hard_link(raced.join("payload.bin"), &alias).expect("link raced alias");
+		let result = platform::exact_remove_directory_tree(&raced, &raced_snapshot, None);
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("hard_link_unsupported"));
+		assert_eq!(result.payload_durable, None);
+		let detached = std::path::PathBuf::from(
+			result
+				.detached_path
+				.as_deref()
+				.expect("retained detached root"),
+		);
+		assert_eq!(
+			fs::read(detached.join("payload.bin")).expect("read retained payload"),
+			b"raced shared payload"
+		);
+		assert_eq!(fs::read(alias).expect("read external alias"), b"raced shared payload");
+		fs::remove_dir_all(root).expect("remove temporary directory");
+	}
+
+	#[test]
+	fn tree_scrub_rechecks_hard_links_at_truncate_boundary() {
+		let _guard = exchange_hook_test_guard();
+		let root = std::env::temp_dir().join(format!(
+			"gjc-tree-late-hard-link-{}-{}",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system time")
+				.as_nanos(),
+		));
+		fs::create_dir(&root).expect("create temporary directory");
+		let target = root.join("target");
+		fs::create_dir(&target).expect("create target");
+		fs::write(target.join("payload.bin"), b"late shared payload").expect("write payload");
+		let snapshot = platform::snapshot_directory_tree(&target)
+			.snapshot
+			.expect("snapshot target");
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_after_tree_file_link_check_hook(Some((entered_tx, resume_rx)));
+		let target_for_remove = target.clone();
+		let removal = thread::spawn(move || {
+			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
+		});
+		entered_rx
+			.recv()
+			.expect("wait for final hard-link check boundary");
+		let detached = fs::read_dir(&root)
+			.expect("list root")
+			.map(|entry| entry.expect("read entry").path())
+			.find(|entry| entry.is_dir() && entry.join("payload.bin").exists())
+			.expect("find detached root");
+		let alias = root.join("late-alias.bin");
+		fs::hard_link(detached.join("payload.bin"), &alias).expect("link late alias");
+		resume_tx.send(()).expect("resume final hard-link check");
+		let result = removal.join().expect("tree scrub thread");
+		platform::set_after_tree_file_link_check_hook(None);
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("hard_link_unsupported"));
+		assert_eq!(result.payload_durable, None);
+		assert_eq!(fs::read(&alias).expect("read external alias"), b"late shared payload");
+		let retained = detached.join("payload.bin");
+		assert_eq!(fs::read(retained).expect("read retained artifact"), b"late shared payload");
+		fs::remove_dir_all(root).expect("remove temporary directory");
+	}
+
+	#[test]
+	fn tree_scrub_rechecks_payload_digest_at_truncate_boundary() {
+		let _guard = exchange_hook_test_guard();
+		let root = std::env::temp_dir().join(format!(
+			"gjc-tree-late-payload-{}-{}",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system time")
+				.as_nanos(),
+		));
+		fs::create_dir(&root).expect("create temporary directory");
+		let target = root.join("target");
+		fs::create_dir(&target).expect("create target");
+		fs::write(target.join("payload.bin"), b"authorized payload").expect("write payload");
+		let snapshot = platform::snapshot_directory_tree(&target)
+			.snapshot
+			.expect("snapshot target");
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_after_tree_file_link_check_hook(Some((entered_tx, resume_rx)));
+		let target_for_remove = target.clone();
+		let removal = thread::spawn(move || {
+			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
+		});
+		entered_rx
+			.recv()
+			.expect("wait for final payload check boundary");
+		let detached = fs::read_dir(&root)
+			.expect("list root")
+			.map(|entry| entry.expect("read entry").path())
+			.find(|entry| entry.is_dir() && entry.join("payload.bin").exists())
+			.expect("find detached root");
+		fs::write(detached.join("payload.bin"), b"substituted payload")
+			.expect("replace payload bytes");
+		resume_tx.send(()).expect("resume final payload check");
+		let result = removal.join().expect("tree scrub thread");
+		platform::set_after_tree_file_link_check_hook(None);
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(
+			fs::read(detached.join("payload.bin")).expect("read retained artifact"),
+			b"substituted payload"
+		);
+		fs::remove_dir_all(root).expect("remove temporary directory");
+	}
+
+	#[test]
+	fn tree_child_revalidation_preserves_same_name_successor() {
+		let _guard = exchange_hook_test_guard();
+		let root = std::env::temp_dir().join(format!(
+			"gjc-tree-child-successor-{}-{}",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system time")
+				.as_nanos(),
+		));
+		fs::create_dir(&root).expect("create temporary directory");
+		let target = root.join("target");
+		fs::create_dir(&target).expect("create target");
+		fs::write(target.join("state.json"), b"authorized stale payload")
+			.expect("write stale payload");
+		let snapshot = platform::snapshot_directory_tree(&target)
+			.snapshot
+			.expect("snapshot target");
+		let detached = std::path::PathBuf::from(format!("{}.removing", target.to_string_lossy()));
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_before_tree_child_rename_hook(Some((entered_tx, resume_rx)));
+		let target_for_remove = target.clone();
+		let removal = thread::spawn(move || {
+			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
+		});
+		entered_rx.recv().expect("wait for child rename boundary");
+		let retained_stale = detached.join("retained-stale");
+		fs::rename(detached.join("state.json"), &retained_stale).expect("retain authorized object");
+		fs::write(detached.join("state.json"), b"same-name successor").expect("publish successor");
+		let successor_identity = fs::metadata(detached.join("state.json")).expect("stat successor");
+		resume_tx.send(()).expect("resume child rename");
+		let result = removal.join().expect("tree scrub thread");
+		platform::set_before_tree_child_rename_hook(None);
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.payload_durable, None);
+		assert_eq!(
+			fs::read(detached.join("state.json")).expect("read successor"),
+			b"same-name successor"
+		);
+		let restored_identity =
+			fs::metadata(detached.join("state.json")).expect("stat restored successor");
+		assert_eq!(restored_identity.dev(), successor_identity.dev());
+		assert_eq!(restored_identity.ino(), successor_identity.ino());
+		assert_eq!(
+			fs::read(retained_stale).expect("read authorized object"),
+			b"authorized stale payload"
+		);
+		assert!(
+			fs::read_dir(&detached)
+				.expect("list detached root")
+				.all(|entry| !entry
+					.expect("read entry")
+					.file_name()
+					.to_string_lossy()
+					.starts_with(".pi-tree-detached-"))
+		);
+		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
 	#[test]
 	fn aborted_tree_hook_does_not_block_the_next_hook() {
@@ -6802,7 +8435,7 @@ mod exact_unlink_placeholder_tests {
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
 		drop(resume_tx);
-		platform::set_after_tree_rename_hook(Some((entered_tx, resume_rx)));
+		platform::set_after_tree_validation_hook(Some((entered_tx, resume_rx)));
 		let target_for_remove = target.clone();
 		let aborted = thread::spawn(move || {
 			platform::exact_remove_directory_tree(&target_for_remove, &snapshot, None)
@@ -6817,7 +8450,7 @@ mod exact_unlink_placeholder_tests {
 			.expect("snapshot next target");
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
-		platform::set_after_tree_rename_hook(Some((entered_tx, resume_rx)));
+		platform::set_after_tree_validation_hook(Some((entered_tx, resume_rx)));
 		let next_for_remove = next.clone();
 		let removal = thread::spawn(move || {
 			platform::exact_remove_directory_tree(&next_for_remove, &snapshot, None)

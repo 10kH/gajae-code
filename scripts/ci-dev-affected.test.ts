@@ -99,6 +99,9 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain("CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ needs.affected-plan.outputs.relevant }}");
 		expect(workflow).toContain("CI_DEV_TELEGRAM_WINDOWS_RESULT: ${{ needs.windows-telegram-daemon-safety.result }}");
 		expect(workflow).toContain("CI_DEV_TELEGRAM_WINDOWS_REQUIRED:");
+		expect(workflow).toContain("bun test ./packages/natives/test/path-identity-windows.test.ts");
+		expect(workflow).toContain("contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/test/path-identity-windows.test.ts')");
+		expect(workflow).toContain("contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/native/index.js')");
 		expect(workflow).not.toContain("pull_request_target");
 		expect(workflow).not.toContain("github.run_attempt");
 		expect(workflow).toContain("artifact_digest");
@@ -150,6 +153,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		// as a name filter rather than a path, matches nothing, and exits 1. Pinned here
 		// and enforced workflow-wide by dev-ci-guard-topology.test.ts.
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session-manager/windows-canonical-path.test.ts");
+		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session/managed-lock-lease.windows.test.ts");
 		// The required predicate must textually match the job gate so the aggregate
 		// invariant (windowsDoctor === required ? success : skipped) never fails closed.
 		const requiredLines = workflow.split("\n").filter(line => line.includes("CI_DEV_WINDOWS_DOCTOR_REQUIRED:"));
@@ -1074,6 +1078,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/coding-agent/src/sdk/session-directory.ts",
 			"packages/coding-agent/src/session/session-manager.ts",
 			"packages/coding-agent/test/session-manager/windows-canonical-path.test.ts",
+			"packages/coding-agent/test/session/managed-lock-lease.windows.test.ts",
 			"packages/coding-agent/test/sdk-session-directory.windows.test.ts",
 		]) {
 			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);

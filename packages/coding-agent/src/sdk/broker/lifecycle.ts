@@ -865,7 +865,7 @@ export async function writeSessionLifecycleReady(root: string, id: string, effec
 	const incarnation = processIncarnation(process.pid);
 	if (!incarnation) throw new Error("Lifecycle child has no readable OS incarnation.");
 	await fs.mkdir(path.join(root, "sdk"), { recursive: true, mode: 0o700 });
-	await fs.writeFile(lifecycleReadyPath(root, id), JSON.stringify({ pid: process.pid, effectMarker, incarnation }), {
+	await fs.writeFile(lifecycleReadyPath(root, id), canonicalJson({ pid: process.pid, effectMarker, incarnation }), {
 		mode: 0o600,
 	});
 }
@@ -1365,15 +1365,6 @@ function lifecycleMetadataReplayFiles(cleanup: CleanupEvidence): LifecycleCleanu
 	return cleanup.lifecycleFiles?.length ? cleanup.lifecycleFiles : undefined;
 }
 
-function absentLifecyclePath(file: string): boolean {
-	try {
-		fsSync.lstatSync(file);
-		return false;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "ENOENT";
-	}
-}
-
 function isLifecycleCleanupResponse(value: LifecycleFileCapture | BrokerResponse | undefined): value is BrokerResponse {
 	return typeof value === "object" && value !== null && "ok" in value;
 }
@@ -1423,6 +1414,19 @@ function validateLifecycleMetadataReplay(cleanup: CleanupEvidence): BrokerRespon
 			try {
 				current = captureLifecycleFile(candidate, true, true);
 			} catch {
+				if (
+					file.completed &&
+					[file.detachedPath, file.plannedPath].some(
+						bound => bound && path.resolve(candidate) === path.resolve(bound),
+					)
+				) {
+					try {
+						const stat = fsSync.lstatSync(candidate);
+						if (stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 && stat.size === 0) continue;
+					} catch (error) {
+						if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+					}
+				}
 				return fail("terminal_uncertain", "Lifecycle metadata candidate could not be safely inspected.");
 			}
 			if (!current) continue;
@@ -1457,7 +1461,7 @@ function validateLifecycleMetadataReplay(cleanup: CleanupEvidence): BrokerRespon
 	if (!markerEntry)
 		return fail("terminal_uncertain", "Lifecycle readiness metadata lacks canonical marker authority.");
 	if (!marker) {
-		if (createHash("sha256").update(canonicalJson(readyMarker)).digest("hex") !== markerEntry.identity.sha256)
+		if (createHash("sha256").update(ready.bytes).digest("hex") !== markerEntry.identity.sha256)
 			return fail(
 				"terminal_uncertain",
 				"Lifecycle readiness metadata is not bound to the completed marker authority.",
@@ -1471,30 +1475,6 @@ function validateLifecycleMetadataReplay(cleanup: CleanupEvidence): BrokerRespon
 		return fail("terminal_uncertain", "Lifecycle metadata siblings do not share one owner marker.");
 	}
 	return undefined;
-}
-
-function lifecycleMetadataReplayAbsent(cleanup: CleanupEvidence): boolean {
-	const files = lifecycleMetadataReplayFiles(cleanup);
-	if (!files) return true;
-	const root = path.resolve(cleanup.metadataRoot!);
-	const id = cleanup.sessionId!;
-	const required = new Set<string>([lifecycleMarkerPath(root, id), lifecycleReadyPath(root, id)]);
-	for (const file of files) for (const candidate of lifecycleCleanupCandidates(file)) required.add(candidate);
-	for (const candidate of required) {
-		if (absentLifecyclePath(candidate)) continue;
-		// A completed file's recorded retained quarantine is durable evidence, not a
-		// survivor — accept it only at its receipt-bound path and identity.
-		const owner = files.find(
-			file =>
-				file.completed === true &&
-				file.detachedPath !== undefined &&
-				path.resolve(file.detachedPath) === path.resolve(candidate),
-		);
-		if (!owner) return false;
-		const current = captureLifecycleFile(candidate, true, true);
-		if (!current || !sameLifecycleCleanupIdentity(current.identity, owner.identity)) return false;
-	}
-	return true;
 }
 
 /**
@@ -1612,7 +1592,7 @@ function legacyMetadataCleanupPlan(cleanup: CleanupEvidence): CleanupEvidence | 
 			return undefined;
 		}
 		if (marker && !sameEffectMarker(marker, readyMarker)) return undefined;
-		if (!marker && createHash("sha256").update(canonicalJson(readyMarker)).digest("hex") !== persistedIdentity.sha256)
+		if (!marker && createHash("sha256").update(ready.capture.bytes).digest("hex") !== persistedIdentity.sha256)
 			return undefined;
 	}
 
@@ -1785,11 +1765,11 @@ async function reconcileLifecycleCleanup(
 					file.detachedPath &&
 					path.resolve(candidate) === path.resolve(file.detachedPath) &&
 					stat.isFile() &&
-					!stat.isSymbolicLink()
-				) {
-					const current = captureLifecycleFile(candidate, true, true);
-					if (current && sameLifecycleCleanupIdentity(current.identity, file.identity)) continue;
-				}
+					!stat.isSymbolicLink() &&
+					stat.nlink === 1 &&
+					stat.size === 0
+				)
+					continue;
 				return fail(
 					"terminal_uncertain",
 					"Lifecycle cleanup receipt marks a target complete while an authorized candidate remains.",
@@ -1892,7 +1872,7 @@ async function reconcileLifecycleCleanup(
 			});
 		}
 		const lifecycleFiles = activeCleanup.lifecycleFiles!.map((candidate, candidateIndex) =>
-			candidateIndex === index ? { ...candidate, completed: true as const } : candidate,
+			candidateIndex === index ? { ...candidate, detachedPath: undefined, completed: true as const } : candidate,
 		);
 		activeCleanup = { ...activeCleanup, lifecycleFiles };
 		await broker.ledger.transition(identity, "effect_started", {
@@ -1900,8 +1880,6 @@ async function reconcileLifecycleCleanup(
 		});
 		lifecycleCleanupHooksForTest.get(broker)?.();
 	}
-	if (!lifecycleMetadataReplayAbsent(activeCleanup))
-		return fail("terminal_uncertain", "Lifecycle metadata replay left an authorized sibling behind.");
 	await syncDirectory(path.join(activeCleanup.metadataRoot!, "sdk"));
 	return completion;
 }
@@ -3463,6 +3441,21 @@ async function executeLifecycleResponse(
 				return (error as NodeJS.ErrnoException).code === "ENOENT";
 			}
 		};
+		try {
+			const currentTranscript = fsSync.lstatSync(cleanupTarget.transcriptPath, { bigint: true });
+			if (
+				currentTranscript.isFile() &&
+				!currentTranscript.isSymbolicLink() &&
+				currentTranscript.dev === cleanupTarget.transcriptIdentity.dev &&
+				currentTranscript.ino === cleanupTarget.transcriptIdentity.ino
+			)
+				cleanupTarget.transcriptIdentity = {
+					...cleanupTarget.transcriptIdentity,
+					nlink: currentTranscript.nlink,
+				};
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
 		const transcriptParentIdentity = cleanup?.transcriptParentIdentity ?? validated.transcriptParentIdentity;
 		const durableArtifactsPlan =
 			cleanup?.artifactTree?.plannedPath ?? cleanup?.plannedArtifactsPath ?? cleanupTarget.plannedArtifactsPath;
@@ -3687,11 +3680,17 @@ async function executeLifecycleResponse(
 		const retainedTranscriptReplayHasNoSideAuthority = retainedTranscriptSidePaths.every(
 			candidate => candidate === undefined,
 		);
-		const retainedTranscriptSideAuthorityIsProvenAbsent =
-			retainedTranscriptSidePaths.every(pathIsAbsent) &&
-			(cleanupTarget.detachedTranscriptPath ? true : retainedTranscriptIdentityIsAbsentFromParent());
 		if (cleanup && !retainedTranscriptReplayHasNoSideAuthority) {
-			if (!retainedTranscriptSideAuthorityIsProvenAbsent) return await publishRetainedTranscriptSideAuthority();
+			const successorOrUnknownRemains = [
+				cleanupTarget.retainedTranscriptSuccessorPath,
+				cleanupTarget.retainedTranscriptUnknownPath,
+			].some(candidate => candidate !== undefined && !pathIsAbsent(candidate));
+			if (
+				successorOrUnknownRemains ||
+				!pathIsAbsent(cleanupTarget.retainedTranscriptPlaceholderPath) ||
+				(!cleanupTarget.detachedTranscriptPath && !retainedTranscriptIdentityIsAbsentFromParent())
+			)
+				return await publishRetainedTranscriptSideAuthority();
 			cleanupTarget.retainedTranscriptSuccessorPath = undefined;
 			cleanupTarget.retainedTranscriptPlaceholderPath = undefined;
 			cleanupTarget.retainedTranscriptUnknownPath = undefined;
@@ -3861,8 +3860,6 @@ async function executeLifecycleResponse(
 				preauthorizedCleanup,
 				"Saved session cleanup is pending in artifacts: a planned quarantine alias remains before terminal completion.",
 			);
-		if (deleted.kind === "deleted" && !retainedTranscriptIdentityIsAbsentFromParent())
-			return await publishRetainedTranscriptSideAuthority();
 		const retainedRootArtifactsPlan = durableArtifactsPlan;
 		if (deleted.kind === "cleanup_pending")
 			return fail(
