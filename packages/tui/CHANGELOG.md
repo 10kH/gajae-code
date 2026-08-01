@@ -5,6 +5,8 @@
 
 - Temporary TUI restarts now retain their native-scrollback admission frontier when the following viewport repaint fails, preventing newly appended rows from being duplicated on retry.
 
+## [0.12.7] - 2026-07-31
+
 ## [0.12.6] - 2026-07-31
 ### Fixed
 

@@ -5,6 +5,8 @@
 ### Fixed
 
 - Ordinary `ask` selectors now bound long question premises and page through every premise row without skipping rows hidden by overflow indicators (#3675).
+## [0.12.7] - 2026-07-31
+
 ## [0.12.6] - 2026-07-31
 ### Added
 
