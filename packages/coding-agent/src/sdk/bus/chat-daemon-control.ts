@@ -16,7 +16,7 @@ import type {
 } from "../../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
 import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
-import { getNotificationConfig, isDiscordConfigured, isSlackConfigured } from "./config";
+import { getNotificationConfig, isDiscordComplete, isProviderEffectivelyEnabled, isSlackComplete } from "./config";
 
 export type ChatDaemonKind = "discord" | "slack";
 export type ChatDaemonAction = "stop" | "reload";
@@ -40,16 +40,20 @@ export type ChatDaemonAction = "stop" | "reload";
  * daemon transports. Generation 16 applies Telegram sound-policy configuration
  * through shared notification parsing. Generation 17 bound managed-session
  * replacement to exact native filesystem authority; generation 18 retired that
- * binding, and generation 19 binds exact cleanup to parent/link-count authority.
- * Discord generation 21 applies rustfmt and clippy-equivalent cleanup to the
- * pi-shell process-tree authority (#3682). Discord generation 22 / slack
- * generation 21 refreshes retained cleanup semantics; discord generation 23 /
- * slack generation 22 hardens exact Bash process-tree ownership shared by chat
- * daemon cleanup.
+ * binding, and generation 19 binds exact cleanup to parent/link-count authority
+ * while also adding durable provider-intent admission without changing lifecycle
+ * behavior. Generation 20 discovers isolated chat-only session endpoints when
+ * Telegram identity ownership is blocked. Discord generation 21 applies rustfmt
+ * and clippy-equivalent cleanup to the pi-shell process-tree authority (#3682).
+ * Discord generation 22 / slack generation 21 refreshes retained cleanup
+ * semantics; discord generation 23 / slack generation 22 hardens exact Bash
+ * process-tree ownership shared by chat daemon cleanup.
+ * Discord generation 24 / slack generation 23 apply provider-completeness and
+ * effective-enable admission to chat daemon lifecycle controls.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 23,
-	slack: 22,
+	discord: 24,
+	slack: 23,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
@@ -276,7 +280,7 @@ export function chatDaemonPaths(
 function identityFor(settings: Settings, kind: ChatDaemonKind): string | undefined {
 	const cfg = getNotificationConfig(settings);
 	if (kind === "discord") {
-		if (!isDiscordConfigured(cfg)) return undefined;
+		if (!isDiscordComplete(cfg)) return undefined;
 		return fingerprint([
 			cfg.discord.botToken,
 			cfg.discord.applicationId,
@@ -286,7 +290,7 @@ function identityFor(settings: Settings, kind: ChatDaemonKind): string | undefin
 			cfg.verbosity,
 		]);
 	}
-	if (!isSlackConfigured(cfg)) return undefined;
+	if (!isSlackComplete(cfg)) return undefined;
 	return fingerprint([
 		cfg.slack.botToken,
 		cfg.slack.appToken,
@@ -431,6 +435,9 @@ export class ChatDaemonController implements BuiltInDaemonController {
 	private identity(): string | undefined {
 		return identityFor(this.settings, this.kind);
 	}
+	private effectivelyEnabled(): boolean {
+		return isProviderEffectivelyEnabled(getNotificationConfig(this.settings), this.kind);
+	}
 	private alive(pid: number): boolean {
 		return (this.deps.pidAlive ?? defaultPidAlive)(pid);
 	}
@@ -458,6 +465,7 @@ export class ChatDaemonController implements BuiltInDaemonController {
 		return await this.operate("reload", opts);
 	}
 	async ensure(): Promise<EnsureChatDaemonResult> {
+		if (!this.effectivelyEnabled()) return "disabled";
 		const identity = this.identity();
 		if (!identity) return "disabled";
 		const existing = await readChatDaemonState(this.settings.getAgentDir(), this.kind);
@@ -490,6 +498,9 @@ export class ChatDaemonController implements BuiltInDaemonController {
 		const warnings = before.runtime.warning ? [before.runtime.warning] : [];
 		if (!before.configured)
 			return this.result(action, false, `${this.kind} notifications are not configured`, before, before, warnings);
+		if (action === "reload" && !this.effectivelyEnabled()) {
+			return this.result(action, false, `${this.kind} notifications are not enabled`, before, before, warnings);
+		}
 		const state = await readChatDaemonState(this.settings.getAgentDir(), this.kind);
 		const classification = this.classify(state, this.identity());
 		if (classification === "newer")
@@ -525,6 +536,8 @@ export class ChatDaemonController implements BuiltInDaemonController {
 			}
 			if (opts.spawnIfStopped === false)
 				return this.result(action, true, `no running ${this.kind} daemon to reload`, before, before, warnings);
+			if (!this.effectivelyEnabled())
+				return this.result(action, false, `${this.kind} notifications are not enabled`, before, before, warnings);
 			const spawned = await this.spawn();
 			return this.result(
 				action,
@@ -578,6 +591,15 @@ export class ChatDaemonController implements BuiltInDaemonController {
 		await clearChatDaemonControlRequest(this.settings.getAgentDir(), this.kind, requestId);
 		if (action === "stop")
 			return this.result(action, true, `stopped ${this.kind} daemon`, before, await this.status(), warnings);
+		if (!this.effectivelyEnabled())
+			return this.result(
+				action,
+				false,
+				`${this.kind} notifications are not enabled`,
+				before,
+				await this.status(),
+				warnings,
+			);
 		const spawned = await this.spawn();
 		return this.result(
 			action,
@@ -755,6 +777,7 @@ export class ChatDaemonController implements BuiltInDaemonController {
 		return this.deps.sleep ? this.deps.sleep(ms) : new Promise(resolve => setTimeout(resolve, ms));
 	}
 	private async spawn(): Promise<boolean> {
+		if (!this.effectivelyEnabled()) return false;
 		const identity = this.identity();
 		if (!identity) return false;
 		const paths = chatDaemonPaths(this.settings.getAgentDir(), this.kind);
@@ -771,6 +794,7 @@ export class ChatDaemonController implements BuiltInDaemonController {
 			agentDir: this.settings.getAgentDir(),
 			execPath: this.deps.execPath,
 		});
+		if (!this.effectivelyEnabled() || this.identity() !== identity) return false;
 		(this.deps.spawn ?? ((command, args, opts) => childProcessSpawn(command, args, opts)))(command, args, {
 			detached: true,
 			stdio: "ignore",

@@ -11,10 +11,11 @@ import {
 } from "./chat-daemon-control";
 import { type ChatDaemonRuntimeConfig, ChatDaemonRuntime as DefaultChatDaemonRuntime } from "./chat-daemon-runtime";
 import {
-	isDiscordConfigured,
-	isSlackConfigured,
+	isDiscordComplete,
+	isSlackComplete,
 	loadNotificationConfigFile,
 	notificationConfigFromFile,
+	resolveNotificationProvider,
 } from "./config";
 
 export interface ChatDaemonRuntimeHandle {
@@ -60,7 +61,10 @@ async function loadConfig(agentDir: string, kind: ChatDaemonKind): Promise<ChatD
 	const config = notificationConfigFromFile(loaded.value);
 	if (!config.enabled) return undefined;
 	if (kind === "discord") {
-		if (!isDiscordConfigured(config)) {
+		const resolution = resolveNotificationProvider(config, "discord");
+		if (!resolution.desiredEnabled) return undefined;
+		if (resolution.quarantined) throw new Error("Discord notification configuration needs repair");
+		if (!resolution.configured || !isDiscordComplete(config)) {
 			throw new Error("Discord notifications are enabled but configuration is incomplete");
 		}
 		const discord = config.discord;
@@ -78,7 +82,10 @@ async function loadConfig(agentDir: string, kind: ChatDaemonKind): Promise<ChatD
 			presentation: { redact: config.redact, verbosity: config.verbosity },
 		};
 	}
-	if (!isSlackConfigured(config)) {
+	const resolution = resolveNotificationProvider(config, "slack");
+	if (!resolution.desiredEnabled) return undefined;
+	if (resolution.quarantined) throw new Error("Slack notification configuration needs repair");
+	if (!resolution.configured || !isSlackComplete(config)) {
 		throw new Error("Slack notifications are enabled but configuration is incomplete");
 	}
 	const slack = config.slack;
@@ -149,7 +156,7 @@ export async function runChatDaemonInternal(
 
 	let incarnation: string | undefined;
 	let runtime: ChatDaemonRuntimeHandle | undefined;
-	let interval: ReturnType<typeof setInterval> | undefined;
+	let interval: NodeJS.Timeout | number | undefined;
 	let stopping = false;
 	let terminalError: unknown;
 	let runtimeStop: Promise<void> | undefined;
