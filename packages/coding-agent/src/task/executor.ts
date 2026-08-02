@@ -23,6 +23,11 @@ import {
 	modelSupportsServiceTier,
 	type ServiceTier,
 } from "@gajae-code/ai/core";
+import {
+	classifyFallbackTrigger,
+	type TransportFailureFacts,
+	transportFailureFacts,
+} from "@gajae-code/ai/utils/fallback-transport";
 import { type JsonSchemaValidationIssue, validateJsonSchemaValue } from "@gajae-code/ai/utils/schema";
 import * as canonicalSdk from "@gajae-code/coding-agent/sdk";
 import { logger, prompt, untilAborted } from "@gajae-code/utils";
@@ -45,7 +50,7 @@ import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md
 import { AgentRegistry } from "../registry/agent-registry";
 import { discoverAuthStorage } from "../sdk";
 import type { AgentSession, AgentSessionEvent, ForkContextSeed } from "../session/agent-session";
-import type { ArtifactManager } from "../session/artifacts";
+import { ArtifactManager } from "../session/artifacts";
 import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { SessionManager, type SessionMemoryMode } from "../session/session-manager";
@@ -68,6 +73,9 @@ import {
 	type AgentDefinition,
 	type AgentProgress,
 	createLocalErrorSummary,
+	type AutoroutingAttempt,
+	type AutoroutingAttemptCode,
+	type AutoroutingPreflightFailure,
 	assertRoutingEvidenceInvariant,
 	createSetupFailureSummary,
 	hasCompleteUsageCostBreakdown,
@@ -85,6 +93,9 @@ import {
 	type TaskRoutingEvidence,
 	type TaskToolDetails,
 } from "./types";
+
+export type { AutoroutingPreflightFailure } from "./types";
+
 import { type ExecutorExecutionMode, resolveUltragoalRedTeamActivation } from "./ultragoal-redteam-activation";
 
 /** Agent event types to forward for progress tracking. */
@@ -217,6 +228,14 @@ export interface ExecutorOptions {
 	context?: string;
 	description?: string;
 	routing?: TaskRoutingEvidence;
+	/** Ordered, normalized autorouting candidates for the cross-phase preflight ledger. */
+	autoroutingCandidates?: string[];
+	autoroutingSkips?: Array<{ selector: string; code: import("../config/autorouting-contract").AutoroutingReasonCode }>;
+	autoroutingPreflight?: boolean;
+	autoroutingAttemptId?: string;
+	preflightProbe?: boolean;
+	preflightDurable?: boolean;
+	preflightFenceCallback?: () => void;
 
 	index: number;
 	id: string;
@@ -330,6 +349,23 @@ export class ManagedTaskPersistence {
 			cwd,
 			sessionMemoryMode,
 		);
+		this.#artifacts.assertManagedBinding();
+		return session;
+	}
+	async openStagedSession(attemptId = this.#taskId): Promise<SessionManager> {
+		const store = this.#artifacts.getManagedStore();
+		if (!store) throw new Error("Managed task persistence authority is unavailable");
+		this.#artifacts.assertManagedBinding();
+		const sessionFile = path.join(this.#artifacts.dir, `${this.#taskId}.jsonl`);
+		const session = await SessionManager.stagedNestedManaged(
+			sessionFile,
+			SessionManager.nestedManagedDestination(store, this.#artifacts.dir),
+			store,
+			undefined,
+			attemptId,
+		);
+		const stagedArtifacts = this.#artifacts.createAttemptStaging(attemptId);
+		session.adoptArtifactManager(stagedArtifacts, this.#artifacts);
 		this.#artifacts.assertManagedBinding();
 		return session;
 	}
@@ -838,10 +874,15 @@ export function finalizeRoutingEvidence(
 ): TaskRoutingEvidence | undefined {
 	if (!routing) return undefined;
 	const effectiveModel = state.lastAssistantModelString ?? state.resolvedModelString;
-	if (!effectiveModel) return undefined;
 	const substitutions: TaskRoutingEvidence["substitutions"] = [];
 	if (state.authFallbackUsed) substitutions.push("auth_substituted");
 	if (state.assistantModelMismatch) substitutions.push("assistant_model_mismatch");
+	if (!effectiveModel) {
+		if (!routing.notExecuted && !routing.terminal && !routing.attempts) return undefined;
+		const terminalEvidence = { ...routing, substitutions };
+		assertRoutingEvidenceInvariant(terminalEvidence);
+		return terminalEvidence;
+	}
 	const evidence = {
 		...routing,
 		effectiveModel,
@@ -857,7 +898,75 @@ export function finalizeRoutingEvidence(
 /**
  * Run a single agent in-process.
  */
-export async function runSubprocess(options: ExecutorOptions): Promise<SingleResult> {
+class AutoroutingProbeAcceptedError extends Error {
+	readonly code = "autorouting_probe_accepted";
+	constructor() {
+		super("autorouting_probe_accepted");
+	}
+}
+
+function toError(error: unknown): Error {
+	return error instanceof Error ? error : new Error(String(error));
+}
+
+function formatExecutionError(error: unknown): string {
+	if (error instanceof AggregateError) {
+		const causes = error.errors.map(cause => (cause instanceof Error ? cause.message : String(cause))).join("; ");
+		return causes ? `${error.message}: ${causes}` : error.message;
+	}
+	return error instanceof Error ? error.stack || error.message : String(error);
+}
+
+function transportFactsFromError(error: unknown): TransportFailureFacts | undefined {
+	if (!error || typeof error !== "object") return undefined;
+	const value = error as { transportFailure?: unknown };
+	if (!value.transportFailure || typeof value.transportFailure !== "object") return undefined;
+	return value.transportFailure as TransportFailureFacts;
+}
+
+export function classifyAutoroutingPreflightFailure(
+	error: unknown,
+	op: Extract<AutoroutingPreflightFailure, { kind: "local" }>["op"],
+): AutoroutingPreflightFailure {
+	const facts = transportFactsFromError(error) ?? transportFailureFacts(error);
+	if (facts) return { kind: "transport", class: classifyFallbackTrigger(facts).class };
+	const typedTransient =
+		error && typeof error === "object" && typeof (error as { transient?: unknown }).transient === "boolean"
+			? (error as { transient: boolean }).transient
+			: undefined;
+	return {
+		kind: "local",
+		op,
+		// Local setup failures are fail-closed: only an explicit transient marker
+		// can advance a candidate. Unknown session/tool errors are terminal.
+		transient: typedTransient === true,
+	};
+}
+
+/**
+ * Map a preflight failure to the attempt code that is recorded in routing evidence AND whether the
+ * ledger may advance to the next candidate. These are two different questions: a
+ * `config_invalid_terminal` / `unclassified_terminal` code is recorded *and* stops the ledger, so
+ * the caller must never infer "advance" from the mere presence of a code.
+ */
+function autoroutingAttemptDisposition(failure: AutoroutingPreflightFailure): {
+	code: AutoroutingAttemptCode;
+	advance: boolean;
+} {
+	if (failure.kind === "local" && failure.op === "auth_resolve")
+		return { code: "credential_unavailable", advance: true };
+	if (
+		failure.kind === "local" &&
+		(failure.op === "session_open" || failure.op === "tool_bootstrap") &&
+		failure.transient
+	)
+		return { code: "spawn_transient_retry", advance: true };
+	if (failure.kind === "local" && (!failure.transient || failure.op === "preflight_validation"))
+		return { code: "config_invalid_terminal", advance: false };
+	return { code: "unclassified_terminal", advance: false };
+}
+
+export async function runSubprocessOnce(options: ExecutorOptions): Promise<SingleResult> {
 	const {
 		cwd,
 		agent,
@@ -1006,6 +1115,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	let retryStartOrdinal = 0;
 	const seenAssistantMessages = new WeakSet<AgentMessage>();
 	let llmRequestStarted = false;
+	let preflightFenceCrossed = false;
+	let preflightFailure: AutoroutingPreflightFailure | undefined;
+	let preflightCommitFailure = false;
+	let lifecycleStarted = false;
+	let liveHandleRegistered = false;
+	let probeAccepted = false;
+	let preflightOperation: Extract<AutoroutingPreflightFailure, { kind: "local" }>["op"] = "preflight_validation";
 	const seenAssistantMessageIdentities = new Set<string>();
 
 	// Accumulate usage incrementally from message_end events (no memory for streaming events)
@@ -1517,8 +1633,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		aborted?: boolean;
 		abortReason?: string;
 		setupFailure?: SetupFailureSummary;
+		probeAccepted?: boolean;
+		preflightFailure?: AutoroutingPreflightFailure;
+		preflightFenceCrossed?: boolean;
+		preflightCommitFailure?: boolean;
 		durationMs: number;
 	}> => {
+		let openedSessionManager: SessionManager | null = null;
+		let liveHandleManager: AsyncJobManager | undefined;
+		const liveSubagentId = options.subagentId ?? id;
 		const sessionAbortController = new AbortController();
 		let exitCode = 0;
 		let error: string | undefined;
@@ -1577,6 +1700,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 			const canonicalChildScope = getSubagentCanonicalScope(options.parentSessionId, options.subagentId ?? id);
 
+			if (options.preflightProbe || options.preflightDurable) preflightOperation = "auth_resolve";
 			const {
 				model,
 				thinkingLevel: resolvedThinkingLevel,
@@ -1590,7 +1714,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			} = await awaitAbortable(
 				resolveModelOverrideWithAuthFallback(
 					modelPatterns,
-					options.parentActiveModelPattern,
+					options.preflightProbe || options.preflightDurable ? undefined : options.parentActiveModelPattern,
 					modelRegistry,
 					settings,
 					options.parentCredentialSessionId ?? options.parentSessionId,
@@ -1601,6 +1725,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					canonicalChildScope,
 				),
 			);
+			if (
+				(options.preflightProbe || options.preflightDurable) &&
+				model &&
+				typeof modelRegistry.getApiKey === "function"
+			) {
+				preflightOperation = "auth_resolve";
+				const exactKey = await awaitAbortable(modelRegistry.getApiKey(model, options.parentSessionId));
+				if (!exactKey) throw Object.assign(new Error("autorouting credential unavailable"), { transient: false });
+			}
 			authFallbackUsed = resolvedAuthFallbackUsed;
 			if (model) {
 				resolvedModelString = formatModelString(model);
@@ -1642,23 +1775,51 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				: (thinkingLevel ?? resolvedThinkingLevel);
 			effectiveThinkingLevelForWarning = effectiveThinkingLevel;
 
-			const sessionManager = options.managedPersistence
-				? await awaitAbortable(
-						options.managedPersistence.openSession(worktree ?? cwd, subagentSettings.get("sessionMemory.mode")),
-					)
-				: sessionFile
-					? await awaitAbortable(
-							SessionManager.open(
-								sessionFile,
-								SessionManager.explicitDestination(path.dirname(sessionFile)),
-								new FileSessionStorage(),
-								subagentSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain",
-								subagentSettings.get("sessionMemory.mode"),
-							),
-						)
-					: SessionManager.inMemory(worktree ?? cwd);
-			if (options.parentArtifactManager) {
+			preflightOperation = "session_open";
+			const sessionManager = options.preflightProbe
+				? SessionManager.inMemory(worktree ?? cwd)
+				: options.preflightDurable
+					? options.managedPersistence
+						? await awaitAbortable(
+								options.managedPersistence.openStagedSession(options.autoroutingAttemptId ?? id),
+							)
+						: sessionFile
+							? await awaitAbortable(
+									SessionManager.openStaged(sessionFile, undefined, options.autoroutingAttemptId ?? id),
+								)
+							: SessionManager.inMemory(worktree ?? cwd)
+					: options.managedPersistence
+						? await awaitAbortable(
+								options.managedPersistence.openSession(
+									worktree ?? cwd,
+									subagentSettings.get("sessionMemory.mode"),
+								),
+							)
+						: sessionFile
+							? await awaitAbortable(
+									SessionManager.open(
+										sessionFile,
+										SessionManager.explicitDestination(path.dirname(sessionFile)),
+										new FileSessionStorage(),
+										subagentSettings.get("session.directoryMigration") === "disabled"
+											? "disabled"
+											: "copy-retain",
+										subagentSettings.get("sessionMemory.mode"),
+									),
+								)
+							: SessionManager.inMemory(worktree ?? cwd);
+			openedSessionManager = sessionManager;
+			if (options.parentArtifactManager && !options.preflightProbe && !options.preflightDurable) {
 				sessionManager.adoptArtifactManager(options.parentArtifactManager);
+			} else if (options.preflightDurable) {
+				const attemptId = options.autoroutingAttemptId ?? id;
+				const parentArtifacts =
+					options.parentArtifactManager ??
+					(sessionFile
+						? new ArtifactManager(sessionFile.endsWith(".jsonl") ? sessionFile.slice(0, -6) : sessionFile)
+						: undefined);
+				if (parentArtifacts)
+					sessionManager.adoptArtifactManager(parentArtifacts.createAttemptStaging(attemptId), parentArtifacts);
 			}
 
 			// Subagents do not inherit or discover MCP runtime tools in the GJC surface.
@@ -1739,6 +1900,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				logger.warn("Failed to render GJC plugin agent prompt additions", { error });
 			}
 
+			if (options.preflightProbe || options.preflightDurable) preflightOperation = "tool_bootstrap";
 			const { session } = await awaitAbortable(
 				canonicalSdk.createAgentSession({
 					cwd: worktree ?? cwd,
@@ -1827,7 +1989,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 			const liveSubagentId = options.subagentId ?? id;
 			const manager = options.asyncJobManager ?? AsyncJobManager.instance();
-			if (manager) {
+			liveHandleManager = manager ?? undefined;
+			const registerLiveHandle = (): void => {
+				if (options.preflightProbe || liveHandleRegistered || !manager) return;
 				manager.registerLiveHandle(liveSubagentId, {
 					requestPause: () => {
 						pauseRequested = true;
@@ -1844,10 +2008,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						await session.sendUserMessage(content, { deliverAs });
 					},
 				});
-			}
-
-			// Emit lifecycle start event
-			if (options.eventBus) {
+				liveHandleRegistered = true;
+			};
+			const emitLifecycleStart = (): void => {
+				if (options.preflightProbe || lifecycleStarted || !options.eventBus) return;
 				options.eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
 					id,
 					agent: agent.name,
@@ -1857,6 +2021,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					sessionFile: sessionFile ?? undefined,
 					index,
 				});
+				lifecycleStarted = true;
+			};
+			if (!options.preflightProbe && !options.preflightDurable) {
+				registerLiveHandle();
+				emitLifecycleStart();
 			}
 
 			const subagentToolNames = session.getActiveToolNames();
@@ -1866,13 +2035,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				await awaitAbortable(session.setActiveToolsByName(filteredSubagentTools));
 			}
 
-			session.sessionManager.appendSessionInit({
-				systemPrompt: session.agent.state.systemPrompt.join("\n\n"),
-				task,
-				tools: session.getActiveToolNames(),
-				outputSchema,
-				forkContext: options.forkContextSeed?.metadata,
-			});
+			if (!options.preflightProbe && !options.preflightDurable) {
+				session.sessionManager.appendSessionInit({
+					systemPrompt: session.agent.state.systemPrompt.join("\n\n"),
+					task,
+					tools: session.getActiveToolNames(),
+					outputSchema,
+					forkContext: options.forkContextSeed?.metadata,
+				});
+			}
 
 			abortSignal.addEventListener(
 				"abort",
@@ -2075,9 +2246,50 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					);
 				}
 			}
+			if (options.preflightProbe || options.preflightDurable) preflightOperation = "preflight_validation";
 			const runMode = options.runMode ?? "initial";
-			const markLlmRequestStarted = () => {
+			let postFencePublication: Promise<void> | undefined;
+			const publishPostFence = async (): Promise<void> => {
+				if (!options.preflightDurable) return;
+				if (postFencePublication) return postFencePublication;
+				postFencePublication = (async () => {
+					if (!openedSessionManager) throw new Error("preflight session manager unavailable");
+					try {
+						// The staged transcript and artifacts become visible only here, at
+						// the real provider acceptance fence.
+						await openedSessionManager.commitStaged({ deferArtifactFinalize: true });
+						session.sessionManager.appendSessionInit({
+							systemPrompt: session.agent.state.systemPrompt.join("\n\n"),
+							task,
+							tools: session.getActiveToolNames(),
+							outputSchema,
+							forkContext: options.forkContextSeed?.metadata,
+						});
+						await openedSessionManager.refreshStagedCommitSnapshot();
+						registerLiveHandle();
+						emitLifecycleStart();
+						openedSessionManager.finalizeStagedCommit();
+					} catch (error) {
+						preflightCommitFailure = true;
+						try {
+							await openedSessionManager.rollbackCommittedStaged();
+						} catch (cleanupError) {
+							throw new AggregateError(
+								[toError(error), toError(cleanupError)],
+								"Post-fence publication and cleanup both failed.",
+							);
+						}
+						throw error;
+					}
+				})();
+				return postFencePublication;
+			};
+			const markLlmRequestStarted = async () => {
+				if (options.preflightProbe) throw new AutoroutingProbeAcceptedError();
+				if (options.preflightDurable) await publishPostFence();
 				llmRequestStarted = true;
+				preflightFenceCrossed = true;
+				options.preflightFenceCallback?.();
 			};
 			const promptOptions = {
 				attribution: "agent" as const,
@@ -2168,6 +2380,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						);
 					}
 				}
+				if (options.preflightDurable && preflightFenceCrossed) {
+					const facts =
+						(lastAssistant as AssistantMessage & { transportFailure?: TransportFailureFacts }).transportFailure ??
+						transportFailureFacts(lastAssistant);
+					preflightFailure = facts
+						? { kind: "transport", class: classifyFallbackTrigger(facts).class }
+						: { kind: "transport", class: "other" };
+				}
 				if (paused) {
 					exitCode = 0;
 					error = undefined;
@@ -2184,11 +2404,38 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 		} catch (err) {
 			exitCode = 1;
-			if (!abortSignal.aborted) {
-				error = err instanceof Error ? err.stack || err.message : String(err);
-				if (!llmRequestStarted) setupFailure = createSetupFailureSummary(err);
+			if (err instanceof AutoroutingProbeAcceptedError) {
+				probeAccepted = true;
+				exitCode = 0;
+				error = undefined;
+			} else if (!abortSignal.aborted) {
+				error = formatExecutionError(err);
+				if (options.preflightDurable && preflightFenceCrossed) {
+					const facts = transportFactsFromError(err) ?? transportFailureFacts(err);
+					preflightFailure = facts
+						? { kind: "transport", class: classifyFallbackTrigger(facts).class }
+						: { kind: "transport", class: "other" };
+				} else if (options.preflightProbe || options.preflightDurable) {
+					preflightFailure = classifyAutoroutingPreflightFailure(err, preflightOperation);
+				}
+				if (!llmRequestStarted)
+					setupFailure = createSetupFailureSummary(err instanceof AggregateError ? error : err);
 			}
 		} finally {
+			if (options.preflightDurable && !preflightFenceCrossed && openedSessionManager) {
+				try {
+					await openedSessionManager.discardStaged();
+				} catch (cleanupError) {
+					const primary = error ?? "Autorouting preflight candidate failed before acceptance.";
+					error = `${primary}\nCleanup failure: ${formatExecutionError(cleanupError)}`;
+					setupFailure ??= createSetupFailureSummary(error);
+					// Fail closed: a failed pre-fence discard may have left candidate-owned staging
+					// residue behind, so the zero-residue guarantee no longer holds for this attempt.
+					// Downgrade any transient classification to terminal so the ledger stops here
+					// instead of advancing to the next candidate over unknown residue.
+					preflightFailure = { kind: "local", op: "preflight_validation", transient: false };
+				}
+			}
 			if (abortSignal.aborted) {
 				aborted = abortReason === "signal" || runtimeLimitExceeded || abortReason === undefined;
 				if (aborted) {
@@ -2197,7 +2444,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				if (exitCode === 0) exitCode = 1;
 			}
 			sessionAbortController.abort();
-			(options.asyncJobManager ?? AsyncJobManager.instance())?.removeLiveHandle(options.subagentId ?? id);
+			if (liveHandleRegistered) liveHandleManager?.removeLiveHandle(liveSubagentId);
 			if (unsubscribe) {
 				try {
 					unsubscribe();
@@ -2224,6 +2471,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			aborted,
 			abortReason: aborted ? abortReasonText : undefined,
 			setupFailure,
+			probeAccepted,
+			preflightFailure,
+			preflightFenceCrossed,
+			preflightCommitFailure,
 			durationMs: Date.now() - startTime,
 		};
 	};
@@ -2345,10 +2596,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		: undefined;
 	progress.setupFailure = done.setupFailure;
 	progress.status = paused ? "paused" : wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
-	scheduleProgress(true);
+	if (!options.preflightProbe) scheduleProgress(true);
 
 	// Emit lifecycle end event after finalization so yield status is reflected
-	if (options.eventBus) {
+	if (lifecycleStarted && !options.preflightProbe && options.eventBus) {
 		options.eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
 			id,
 			agent: agent.name,
@@ -2391,6 +2642,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		error: exitCode !== 0 && stderr ? stderr : undefined,
 		setupFailure: done.setupFailure,
 		localErrorSummary: done.localErrorSummary,
+		preflightFailure: done.preflightFailure,
+		preflightFenceCrossed: done.preflightFenceCrossed,
+		preflightCommitFailure: done.preflightCommitFailure,
+		preflightProbeAccepted: done.probeAccepted,
 		aborted: wasAborted,
 		abortReason: finalAbortReason,
 		paused,
@@ -2402,4 +2657,183 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		outputMeta,
 		reviewFindingsRef,
 	};
+}
+
+export function boundedSelector(value: string): string {
+	const bounded = value
+		.normalize("NFKC")
+		.replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
+		.slice(0, 256);
+	return bounded || "<omitted-selector>";
+}
+
+export function buildBoundedRoutingSkips(
+	skips: ExecutorOptions["autoroutingSkips"],
+): Pick<TaskRoutingEvidence, "skips" | "omittedSkipCount" | "omittedByCode"> {
+	if (!skips || skips.length === 0) return {};
+	const retained = skips.slice(0, 16).map(skip => ({ selector: boundedSelector(skip.selector), code: skip.code }));
+	const omitted = skips.slice(16);
+	const omittedByCode: NonNullable<TaskRoutingEvidence["omittedByCode"]> = {};
+	for (const skip of omitted) omittedByCode[skip.code] = (omittedByCode[skip.code] ?? 0) + 1;
+	return {
+		skips: retained,
+		...(omitted.length > 0 ? { omittedSkipCount: omitted.length, omittedByCode } : {}),
+	};
+}
+
+function evidenceWithAttempts(
+	routing: TaskRoutingEvidence | undefined,
+	attempts: readonly AutoroutingAttempt[],
+	terminal?: TaskRoutingEvidence["terminal"],
+): TaskRoutingEvidence | undefined {
+	if (!routing) return undefined;
+	const evidence: TaskRoutingEvidence = {
+		...routing,
+		requestedSelector: boundedSelector(routing.requestedSelector),
+		attempts: attempts.map(attempt => ({ ...attempt, selector: boundedSelector(attempt.selector) })),
+		...(terminal ? { terminal, notExecuted: true, effectiveModel: undefined } : {}),
+	};
+	assertRoutingEvidenceInvariant(evidence);
+	return evidence;
+}
+
+function preflightTerminalResult(
+	options: ExecutorOptions,
+	attempts: readonly AutoroutingAttempt[],
+	terminal: "preflight_exhausted" | "all_candidates_skipped",
+	prior?: SingleResult,
+): SingleResult {
+	const result: SingleResult = prior
+		? { ...prior }
+		: {
+				index: options.index,
+				id: options.id,
+				agent: options.agent.name,
+				agentSource: options.agent.source,
+				task: options.task,
+				assignment: options.assignment,
+				description: options.description,
+				exitCode: 1,
+				output: "",
+				stderr: "Autorouting preflight exhausted.",
+				truncated: false,
+				durationMs: 0,
+				tokens: 0,
+			};
+	// Preserve a diagnostic from the last attempt so terminalization does not erase why the candidate
+	// failed (including an appended pre-fence cleanup failure). It MUST go through
+	// createSetupFailureSummary, the established egress sanitizer: it redacts authorization/cookie
+	// headers, URL credentials, API-key labels, bare provider tokens and local/Windows absolute paths,
+	// collapses all whitespace (so CR/LF/TAB cannot survive for newline injection), and caps length.
+	// Never interpolate a raw `error` string here — it may carry a full stack with secrets or paths.
+	const rawDiagnostic =
+		typeof prior?.error === "string" && prior.error.trim().length > 0
+			? prior.error
+			: (prior?.setupFailure?.summary ?? "");
+	const sanitizedDiagnostic = rawDiagnostic.trim() ? createSetupFailureSummary(rawDiagnostic).summary : "";
+	const priorDiagnostic =
+		sanitizedDiagnostic && sanitizedDiagnostic !== "Subagent setup failed." ? sanitizedDiagnostic : "";
+	result.exitCode = 1;
+	result.output = "";
+	result.stderr = priorDiagnostic
+		? `Autorouting preflight exhausted. Last candidate diagnostic: ${priorDiagnostic}`
+		: "Autorouting preflight exhausted.";
+	result.error = result.stderr;
+	result.setupFailure = {
+		summary: priorDiagnostic
+			? `Autorouting preflight did not accept a candidate. Last candidate diagnostic: ${priorDiagnostic}`
+			: "Autorouting preflight did not accept a candidate.",
+	};
+	result.routing = evidenceWithAttempts(options.routing, attempts, terminal);
+	return result;
+}
+
+/** Run routed initial tasks through the bounded probe/durable candidate ledger. */
+export async function runSubprocess(options: ExecutorOptions): Promise<SingleResult> {
+	if (
+		!options.autoroutingPreflight ||
+		(options.runMode ?? "initial") !== "initial" ||
+		!options.autoroutingCandidates
+	) {
+		return runSubprocessOnce(options);
+	}
+	const attempts: AutoroutingAttempt[] = [];
+	const consumed = new Set<string>();
+	const skips = buildBoundedRoutingSkips(options.autoroutingSkips);
+	const candidates = options.autoroutingCandidates.map(boundedSelector).filter(selector => selector.length > 0);
+	const routedOptions = options.routing ? { ...options.routing, ...skips } : options.routing;
+	if (candidates.length === 0)
+		return preflightTerminalResult({ ...options, routing: routedOptions }, attempts, "all_candidates_skipped");
+	let prior: SingleResult | undefined;
+	for (const selector of candidates) {
+		if (consumed.has(selector) || consumed.size >= 3) continue;
+		consumed.add(selector);
+		const probe = await runSubprocessOnce({
+			...options,
+			autoroutingPreflight: false,
+			preflightProbe: true,
+			preflightDurable: false,
+			modelOverride: [selector],
+			parentActiveModelPattern: undefined,
+			autoroutingCandidates: undefined,
+			autoroutingSkips: undefined,
+			sessionFile: null,
+			artifactsDir: undefined,
+			persistArtifacts: false,
+			managedPersistence: undefined,
+			parentArtifactManager: undefined,
+			routing: undefined,
+		});
+		prior = probe;
+		if (!probe.preflightProbeAccepted) {
+			const failure = probe.preflightFailure ?? { kind: "local", op: "preflight_validation", transient: false };
+			const { code, advance } = autoroutingAttemptDisposition(failure);
+			attempts.push({ selector, phase: "probe", code });
+			if (!advance)
+				return preflightTerminalResult(
+					{ ...options, routing: routedOptions },
+					attempts,
+					"preflight_exhausted",
+					probe,
+				);
+			continue;
+		}
+		attempts.push({ selector, phase: "probe", code: "probe_passed" });
+		const durable = await runSubprocessOnce({
+			...options,
+			autoroutingPreflight: false,
+			preflightProbe: false,
+			preflightDurable: true,
+			autoroutingAttemptId: `${options.id}-${consumed.size}`,
+			modelOverride: [selector],
+			parentActiveModelPattern: undefined,
+			autoroutingCandidates: undefined,
+			autoroutingSkips: undefined,
+			routing: undefined,
+		});
+		prior = durable;
+		if (durable.preflightCommitFailure) {
+			attempts.push({ selector, phase: "durable", code: "post_acceptance_failure" });
+			return { ...durable, routing: evidenceWithAttempts(routedOptions, attempts) };
+		}
+		if (durable.preflightFenceCrossed) {
+			if (durable.exitCode === 0) {
+				attempts.push({ selector, phase: "durable", code: "accepted" });
+				return { ...durable, routing: evidenceWithAttempts(routedOptions, attempts) };
+			}
+			attempts.push({ selector, phase: "durable", code: "post_acceptance_failure" });
+			return { ...durable, routing: evidenceWithAttempts(routedOptions, attempts) };
+		}
+		const failure = durable.preflightFailure ?? { kind: "local", op: "preflight_validation", transient: false };
+		const { code, advance } = autoroutingAttemptDisposition(failure);
+		attempts.push({ selector, phase: "durable", code });
+		if (!advance)
+			return preflightTerminalResult(
+				{ ...options, routing: routedOptions },
+				attempts,
+				"preflight_exhausted",
+				durable,
+			);
+	}
+	return preflightTerminalResult({ ...options, routing: routedOptions }, attempts, "preflight_exhausted", prior);
 }
