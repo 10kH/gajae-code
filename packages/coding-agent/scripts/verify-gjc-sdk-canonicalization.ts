@@ -1531,13 +1531,26 @@ function exactTeamRuntimeSendKeysRanges(contents: string): ShellRange[] {
 		return [];
 
 	const continuationBody = contents.slice(continuationRange.start, continuationRange.end);
+	// The frozen argv may address the pane either through `worker.pane_id` directly or
+	// through a local binding that was proven non-empty first (the optional field does
+	// not narrow for the type checker). Either way both send operations must name the
+	// identical pane token, and a local token must come from a checked `worker.pane_id`.
 	const continuationArgs =
-		/const\s+args\s*=\s*Object\.freeze\(\s*\[\s*["']send-keys["']\s*,\s*["']-l["']\s*,\s*["']-t["']\s*,\s*worker\.pane_id\s*,\s*continuationPrompt\s*,\s*["'];["']\s*,\s*["']send-keys["']\s*,\s*["']-t["']\s*,\s*worker\.pane_id\s*,\s*["']Enter["']\s*,?\s*\]\s*\)\s*;/.exec(
+		/const\s+args(?:\s*:\s*readonly\s+string\[\])?\s*=\s*Object\.freeze\(\s*\[\s*["']send-keys["']\s*,\s*["']-l["']\s*,\s*["']-t["']\s*,\s*(worker\.pane_id|[A-Za-z_$][\w$]*)\s*,\s*continuationPrompt\s*,\s*["'];["']\s*,\s*["']send-keys["']\s*,\s*["']-t["']\s*,\s*(worker\.pane_id|[A-Za-z_$][\w$]*)\s*,\s*["']Enter["']\s*,?\s*\]\s*\)\s*;/.exec(
 			continuationBody,
 		);
+	const paneToken = continuationArgs?.[1];
+	const paneTokenIsProvenLocal =
+		paneToken !== undefined &&
+		paneToken !== "worker.pane_id" &&
+		new RegExp(`const\\s+${paneToken}\\s*=\\s*worker\\.pane_id\\s*;`).test(continuationBody) &&
+		new RegExp(`if\\s*\\(\\s*!${paneToken}\\s*\\)\\s*return\\b`).test(continuationBody);
 	if (
 		!continuationArgs ||
+		continuationArgs[1] !== continuationArgs[2] ||
+		!(paneToken === "worker.pane_id" || paneTokenIsProvenLocal) ||
 		!continuationBody.includes("const revalidationReason =") ||
+		!/if\s*\(\s*revalidationReason\s*\)\s*(?:\{\s*return\b[^}]*;?\s*\}|return\b[^;]*;)/.test(continuationBody) ||
 		!continuationBody.includes("await createJsonNoClobber(") ||
 		!continuationBody.includes('type: "literal-send"') ||
 		!continuationBody.includes('type: "key-send"') ||
