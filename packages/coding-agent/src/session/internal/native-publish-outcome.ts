@@ -16,6 +16,8 @@ export type NativePublishOperation = "direct_rename" | "retained_file" | "retain
 
 export type NativePublishPrimitive =
 	| "renameat2_noreplace"
+	| "linkat_noreplace"
+	| "mkdirat_renameat_noreplace"
 	| "renameatx_np_excl"
 	| "windows_rename_noreplace"
 	| "unsupported"
@@ -24,6 +26,7 @@ export type NativePublishPhase =
 	| "preflight"
 	| "file_sync"
 	| "rename"
+	| "source_unlink"
 	| "source_parent_sync"
 	| "destination_parent_sync"
 	| "terminal_identity"
@@ -83,6 +86,8 @@ const reasons = new Set<NativePublishReason>([
 ]);
 const primitives = new Set<NativePublishPrimitive>([
 	"renameat2_noreplace",
+	"linkat_noreplace",
+	"mkdirat_renameat_noreplace",
 	"renameatx_np_excl",
 	"windows_rename_noreplace",
 	"unsupported",
@@ -92,6 +97,7 @@ const phases = new Set<NativePublishPhase>([
 	"preflight",
 	"file_sync",
 	"rename",
+	"source_unlink",
 	"source_parent_sync",
 	"destination_parent_sync",
 	"terminal_identity",
@@ -204,7 +210,7 @@ function legalOutcome(outcome: NativePublishOutcome): boolean {
 		((outcome.reason === "durability_not_provable" &&
 			["file_sync", "source_parent_sync", "destination_parent_sync"].includes(outcome.phase)) ||
 			(outcome.reason === "identity_violation" && outcome.phase === "terminal_identity") ||
-			(outcome.reason === "io_failure" && outcome.phase === "terminal_identity"))
+			(outcome.reason === "io_failure" && ["source_unlink", "terminal_identity"].includes(outcome.phase)))
 	);
 }
 
@@ -247,8 +253,12 @@ export function classifyNativePublishOutcome(
 	const outcome = value as unknown as NativePublishOutcome;
 	if (!legalOutcome(outcome)) return malformed;
 	if (operation === "direct_rename") return outcome;
+	const retainedPrimitiveValid =
+		operation === "retained_file"
+			? outcome.primitive === "renameat2_noreplace" || outcome.primitive === "linkat_noreplace"
+			: outcome.primitive === "renameat2_noreplace" || outcome.primitive === "mkdirat_renameat_noreplace";
 	if (
-		outcome.primitive !== "renameat2_noreplace" ||
+		!retainedPrimitiveValid ||
 		(outcome.ok && (!outcome.identity || outcome.durabilityState !== "proven" || outcome.phase !== "complete"))
 	)
 		return malformed;

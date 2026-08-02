@@ -208,6 +208,56 @@ describe("native publish outcome classification", () => {
 		expect(retained.ok).toBe(true);
 	});
 
+	it("accepts only the fallback primitive for each retained publish shape", () => {
+		const success = {
+			...preMutation,
+			ok: true,
+			code: undefined,
+			identity: { dev: "1", ino: "2", size: "3", mtimeNs: "4", ctimeNs: "5", sha256: "a".repeat(64) },
+			mutationState: "committed",
+			durabilityState: "proven",
+			reason: "none",
+			phase: "complete",
+		};
+		expect(classifyNativePublishOutcome({ ...success, primitive: "linkat_noreplace" }, "retained_file").ok).toBe(
+			true,
+		);
+		expect(
+			classifyNativePublishOutcome({ ...success, primitive: "mkdirat_renameat_noreplace" }, "retained_tree").ok,
+		).toBe(true);
+		expect(
+			classifyNativePublishOutcome({ ...success, primitive: "mkdirat_renameat_noreplace" }, "retained_file")
+				.mutationState,
+		).toBe("unknown");
+		expect(
+			classifyNativePublishOutcome({ ...success, primitive: "linkat_noreplace" }, "retained_tree").mutationState,
+		).toBe("unknown");
+	});
+
+	it("preserves committed linkat unlink failures", () => {
+		const outcome = classifyNativePublishOutcome(
+			{
+				...preMutation,
+				code: "io_error",
+				mutationState: "committed",
+				durabilityState: "not_provable",
+				reason: "io_failure",
+				primitive: "linkat_noreplace",
+				phase: "source_unlink",
+				diagnostic: { schemaVersion: 1, collectionState: "partial", osCode: 13 },
+			},
+			"retained_file",
+		);
+		expect(outcome).toMatchObject({
+			mutationState: "committed",
+			durabilityState: "not_provable",
+			reason: "io_failure",
+			primitive: "linkat_noreplace",
+			phase: "source_unlink",
+		});
+		expect(mayCleanCurrentStaging(outcome)).toBe(false);
+	});
+
 	it("keeps an EINVAL-classified retained request out of atomic-unavailable fallback while allowing exact staging cleanup", () => {
 		const outcome = classifyNativePublishOutcome(
 			{
