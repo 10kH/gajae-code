@@ -9,6 +9,7 @@ import { applyStartupModelProfiles, createSessionManager } from "../main";
 import { initializeExtensions } from "../modes/runtime-init";
 import { ACP_MCP_REQUEST_TIMEOUT_MS, ACP_MCP_STARTUP_HEADROOM_MS } from "../sdk/acp/mcp";
 import { Broker } from "../sdk/broker/broker";
+import { readBrokerDiscovery } from "../sdk/broker/discovery";
 import { completeBrokerProcess } from "../sdk/broker/internal";
 import {
 	type LifecycleTranscriptEvidence,
@@ -56,6 +57,54 @@ export async function lifecycleArgs(
 				}
 			: {}),
 	};
+}
+
+/**
+ * How long a session host tolerates the complete absence of a live broker
+ * publication before treating itself as orphaned. Hosts intentionally survive
+ * broker restarts (a replacement broker republishes discovery within seconds),
+ * so this must comfortably exceed a restart window while still bounding the
+ * lifetime of hosts whose broker is gone for good — otherwise every crashed or
+ * torn-down broker leaks a detached multi-hundred-megabyte host forever.
+ */
+export const SESSION_HOST_BROKER_ABSENCE_GRACE_MS = 10 * 60_000;
+const SESSION_HOST_BROKER_POLL_MS = 15_000;
+
+/**
+ * Resolves only once no live broker publication has been observable in
+ * `agentDir` for the full grace window. A reappearing broker (including a
+ * replacement with a different pid) resets the window; an unreadable
+ * publication is not proof of orphanhood but accrues against the same bound.
+ */
+export async function watchSessionHostBrokerLiveness(deps: {
+	agentDir: string;
+	now?: () => number;
+	sleep?: (ms: number) => Promise<void>;
+	readDiscovery?: (agentDir: string) => Promise<unknown>;
+	graceMs?: number;
+	pollMs?: number;
+}): Promise<void> {
+	const now = deps.now ?? Date.now;
+	const sleep = deps.sleep ?? (async ms => await Bun.sleep(ms));
+	const readDiscovery = deps.readDiscovery ?? readBrokerDiscovery;
+	const graceMs = deps.graceMs ?? SESSION_HOST_BROKER_ABSENCE_GRACE_MS;
+	const pollMs = deps.pollMs ?? SESSION_HOST_BROKER_POLL_MS;
+	let absentSince: number | null = null;
+	for (;;) {
+		let live: unknown = null;
+		try {
+			live = await readDiscovery(deps.agentDir);
+		} catch {
+			// Transient read failures are ambiguity, not proof of orphanhood.
+		}
+		if (live) {
+			absentSince = null;
+		} else {
+			absentSince ??= now();
+			if (now() - absentSince >= graceMs) return;
+		}
+		await sleep(pollMs);
+	}
 }
 
 type LifecycleTranscriptSource = {
@@ -505,6 +554,11 @@ export async function runSessionHost(
 	}
 	process.once("SIGTERM", stop);
 	process.once("SIGINT", stop);
+	// A detached host whose broker is gone for good would otherwise live (and
+	// hold its session's memory) forever; reap it through the same graceful
+	// teardown a SIGTERM would take once the bounded absence grace elapses.
+	await watchSessionHostBrokerLiveness({ agentDir });
+	stop();
 	await new Promise<void>(() => {});
 }
 

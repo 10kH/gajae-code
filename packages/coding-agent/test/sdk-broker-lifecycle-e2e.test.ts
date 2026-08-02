@@ -6,7 +6,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import { NotificationServer } from "@gajae-code/natives";
-import { openLifecycleSessionManager, runSessionHost } from "../src/commands/sdk";
+import { openLifecycleSessionManager, runSessionHost, watchSessionHostBrokerLiveness } from "../src/commands/sdk";
 import { planLaunchWorktree } from "../src/gjc-runtime/launch-worktree";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { Broker, type BrokerCleanupEvidence, type BrokerResponse } from "../src/sdk/broker/broker";
@@ -677,6 +677,40 @@ test("session host fails closed when its lifecycle effect marker is corrupt", as
 		});
 		await fs.rm(root, { recursive: true, force: true });
 	}
+});
+
+test("session host orphan watchdog resolves only after the broker publication stays unobservable for the full grace window", async () => {
+	let nowMs = 0;
+	const observations: (Record<string, unknown> | null | Error)[] = [
+		{ pid: 1 }, // live broker
+		null, // broker vanishes: absence window opens
+		new Error("EACCES"), // unreadable publication accrues against the same bound
+		{ pid: 2 }, // replacement broker resets the window
+		null, // broker vanishes again
+		null,
+		null, // grace elapses here
+	];
+	let reads = 0;
+	await watchSessionHostBrokerLiveness({
+		agentDir: "/unused",
+		now: () => nowMs,
+		sleep: async ms => {
+			nowMs += ms;
+		},
+		readDiscovery: async () => {
+			const observation = observations[reads];
+			reads += 1;
+			if (observation instanceof Error) throw observation;
+			return observation ?? null;
+		},
+		graceMs: 20,
+		pollMs: 10,
+	});
+	// One live read, then two absent polls (window survives the replacement at
+	// read 4 only because it reset), then three consecutive absent polls whose
+	// third crosses the 20ms grace: 7 reads total, never fewer.
+	expect(reads).toBe(7);
+	expect(nowMs).toBe(60);
 });
 
 test("startup failure artifacts reject symlink and oversize collisions while accepting byte-identical owner evidence", async () => {
