@@ -4134,24 +4134,51 @@ export class TUI extends Container {
 		// the mutated off-screen prefix; the latest frame is updated below so each
 		// appended row is emitted exactly once.
 		if (firstChanged < prevViewportTop && appendedLines) {
-			// A same-length substitution above the viewport (a streaming status line,
-			// say) leaves every later row at its original index, so the visible suffix
-			// can still be committed. Growth *inside* the off-screen prefix instead
-			// shifts committed content down across the scrollback frontier: the rows
-			// this frame would commit already sit in native scrollback under their old
+			// A substitution above the viewport (a streaming status line, say) leaves
+			// every later row at its original index, so the visible suffix can still be
+			// committed. An insertion *inside* the off-screen prefix instead displaces
+			// committed content down across the scrollback frontier: the rows this
+			// frame would commit already sit in native scrollback under their old
 			// index, so emitting them appends a second copy — a pending tool block
 			// stranded above its own completed copy, with the rows between duplicated.
-			// The last committed row changing is the observable signal of that shift.
-			const committedBoundary = prevViewportTop - 1;
-			const committedBoundaryShifted =
-				committedBoundary >= diffStart &&
-				(this.#previousLines[committedBoundary] ?? "") !== (newLines[committedBoundary] ?? "");
-			if (committedBoundaryShifted) {
-				const reason = `offscreen growth shifted committed rows (${firstChanged} < ${prevViewportTop})`;
-				logRedraw(reason);
-				if (useViewportRepaintPath) viewportRepaint(reason);
-				else fullRender(true, reason);
-				return;
+			//
+			// Rendered bytes carry no row identity, so no test on them can prove which
+			// logical row moved: a substitution changes rows without moving anything,
+			// an insertion moves everything without necessarily changing any given row,
+			// and a run of repeated rows makes a plain append look exactly like a
+			// displacement. Since the two are not always distinguishable, look for the
+			// harm rather than the cause, and require both halves of it.
+			//
+			// First, a displacement moves the whole visible region down by one uniform
+			// offset, so the previously visible rows must reappear almost intact
+			// `offset` rows lower. Second — and this is what an append behind repeated
+			// rows cannot fake — the rows that displacement pulls into the top of the
+			// visible region must be exactly the last `offset` rows already committed
+			// to native scrollback. That second half is the damage itself: those rows
+			// are about to be emitted a second time. Rows merely rewritten in place
+			// push nothing back into view, so they still commit their suffix.
+			const shift = newLines.length - this.#previousLines.length;
+			const visibleRows = this.#previousLines.length - prevViewportTop;
+			if (shift > 0 && prevViewportTop > diffStart && visibleRows > 1) {
+				for (let offset = 1; offset <= Math.min(shift, prevViewportTop, visibleRows - 1); offset++) {
+					let recommittedRows = 0;
+					for (let j = 0; j < offset; j++) {
+						if (this.#previousLines[prevViewportTop - offset + j] === newLines[prevViewportTop + j]) {
+							recommittedRows += 1;
+						}
+					}
+					if (recommittedRows < offset) continue;
+					let displacedRows = 0;
+					for (let i = prevViewportTop; i < this.#previousLines.length; i++) {
+						if (this.#previousLines[i] === newLines[i + offset]) displacedRows += 1;
+					}
+					if (displacedRows < visibleRows - offset) continue;
+					const reason = `offscreen insertion displaced committed rows (${firstChanged} < ${prevViewportTop}, offset=${offset}/${visibleRows})`;
+					logRedraw(reason);
+					if (useViewportRepaintPath) viewportRepaint(reason);
+					else fullRender(true, reason);
+					return;
+				}
 			}
 			let suffixStart = -1;
 			for (let i = Math.max(diffStart, prevViewportTop); i < maxLines; i++) {

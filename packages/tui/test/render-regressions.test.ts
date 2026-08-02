@@ -1254,6 +1254,248 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
+		for (const isProcessTerminal of [false, true]) {
+			it(`does not re-emit an off-screen block whose boundary row repeats (isProcessTerminal=${isProcessTerminal})`, async () => {
+				// The row at the committed frontier is byte-identical before and after the
+				// insertion, so a single-row boundary check cannot see the shift.
+				const term = new VirtualTerminal(40, 5, { isProcessTerminal });
+				const tui = new TUI(term);
+				const component = new MutableLinesComponent([
+					"prefix",
+					"block-old",
+					"pre-2",
+					"FILL",
+					"FILL",
+					...rows("old-", 5),
+				]);
+				tui.addChild(component);
+
+				try {
+					tui.start();
+					await settle(term);
+
+					component.setLines([
+						"prefix",
+						"block-new-0",
+						"block-new-1",
+						"pre-2",
+						"FILL",
+						"FILL",
+						...rows("old-", 5),
+					]);
+					tui.requestRender();
+					await settle(term);
+
+					const scrollback = term.getScrollBuffer().map(line => line.trimEnd());
+					// The insertion must not push a second copy of the committed FILL rows
+					// into scrollback, and the new block must not be emitted twice.
+					expect(countMatches(scrollback, /^FILL$/)).toBe(2);
+					// A full render replays the frame, so it must reconstruct the block
+					// exactly once; a viewport repaint paints it into the live region.
+					expect(countMatches(scrollback, /^block-new-0$/)).toBe(isProcessTerminal ? 0 : 1);
+					// A viewport repaint cannot retract the already committed stale row, but
+					// it must never remain visible alongside its replacement.
+					expect(visible(term)).toEqual(rows("old-", 5));
+					expect(countMatches(scrollback, /^block-old$/)).toBeLessThanOrEqual(1);
+				} finally {
+					tui.stop();
+				}
+			});
+		}
+
+		// Repeated and blank rows make byte identity ambiguous, so an off-screen
+		// insertion can leave the frontier row, a majority of rows, or every row it
+		// is measured against looking unmoved. Each case duplicates a committed row
+		// unless the displaced run is detected at its own offset.
+		const ambiguousShiftCases = [
+			{
+				id: "a run of identical rows spans the frontier",
+				before: ["p0", "p1", "p2", "p3", "p4", "SAME", "SAME", "keep-a", "keep-b", "keep-c"],
+				after: ["p0", "p1", "INSERT", "p2", "p3", "p4", "SAME", "SAME", "keep-a", "keep-b", "keep-c", "APPEND"],
+				duplicated: /^p4$/,
+				limit: 1,
+			},
+			{
+				id: "most visible rows still match at their own index",
+				before: ["p0", "p1", "p2", "p3", "S", "S", "S", "X", "Y", "Z"],
+				after: ["p0", "p1", "p2", "INSERT", "p3", "S", "S", "S", "X", "Y", "Z", "APPEND"],
+				duplicated: /^S$/,
+				limit: 3,
+			},
+			{
+				id: "aligned and shifted readings are exactly tied",
+				before: ["p0", "p1", "p2", "p3", "p4", "A", "A", "B", "B", "C"],
+				after: ["p0", "p1", "INSERT", "p2", "p3", "p4", "A", "A", "B", "B", "C", "APPEND"],
+				duplicated: /^p4$/,
+				limit: 1,
+			},
+			{
+				// Every measured row matches at its own index, so an alignment count
+				// finds nothing wrong even though the frontier row moved.
+				id: "the displaced rows below the frontier are identical",
+				before: ["p0", "p1", "p2", "p3", "X", "A", "A", "A", "A", "A"],
+				after: ["p0", "p1", "INSERT", "p2", "p3", "X", "A", "A", "A", "A", "A"],
+				duplicated: /^X$/,
+				limit: 1,
+				appended: false,
+			},
+			{
+				// The append is larger than the visible region, so a tolerance scaled to
+				// the growth would permit the frame with no evidence at all.
+				id: "the append is larger than the visible region",
+				before: ["p0", "p1", "p2", "p3", "X", "A", "B", "C", "D", "E"],
+				after: ["p0", "I", "p1", "p2", "p3", "X", "A", "B", "C", "D", "E", "Q0", "Q1", "Q2", "APPEND"],
+				duplicated: /^X$/,
+				limit: 1,
+			},
+		];
+		for (const ambiguous of ambiguousShiftCases) {
+			for (const isProcessTerminal of [false, true]) {
+				it(`repaints an off-screen insertion when ${ambiguous.id} (isProcessTerminal=${isProcessTerminal})`, async () => {
+					const term = new VirtualTerminal(40, 5, { isProcessTerminal });
+					const tui = new TUI(term);
+					const component = new MutableLinesComponent(ambiguous.before);
+					tui.addChild(component);
+
+					try {
+						tui.start();
+						await settle(term);
+
+						component.setLines(ambiguous.after);
+						tui.requestRender();
+						await settle(term);
+
+						const scrollback = term.getScrollBuffer().map(line => line.trimEnd());
+						expect(countMatches(scrollback, ambiguous.duplicated)).toBeLessThanOrEqual(ambiguous.limit);
+						if (ambiguous.appended !== false) expect(countMatches(scrollback, /^APPEND$/)).toBe(1);
+						expect(visible(term)).toEqual(ambiguous.after.slice(-5));
+					} finally {
+						tui.stop();
+					}
+				});
+			}
+		}
+
+		for (const isProcessTerminal of [false, true]) {
+			it(`still commits when every visible row is rewritten in place (isProcessTerminal=${isProcessTerminal})`, async () => {
+				// Nothing moves here: the off-screen row and all five visible rows are
+				// substituted while one row is appended. Rejecting this as "unaligned"
+				// would repaint and silently drop the first replacement row.
+				const term = new VirtualTerminal(40, 5, { isProcessTerminal });
+				const tui = new TUI(term);
+				const component = new MutableLinesComponent(["status-0", ...rows("A", 5)]);
+				tui.addChild(component);
+
+				try {
+					tui.start();
+					await settle(term);
+
+					component.setLines(["status-1", "B0", "B1", "B2", "B3", "A4", "APP"]);
+					tui.requestRender();
+					await settle(term);
+					component.setLines(["status-1", "B0", "B1", "B2", "B3", "A4", "APP", "TAIL"]);
+					tui.requestRender();
+					await settle(term);
+
+					const scrollback = term.getScrollBuffer().map(line => line.trimEnd());
+					for (const row of ["B0", "B1", "APP"]) {
+						expect(countMatches(scrollback, new RegExp(`^${row}$`)), `${row} exactly once`).toBe(1);
+					}
+					expect(visible(term)).toEqual(["B2", "B3", "A4", "APP", "TAIL"]);
+				} finally {
+					tui.stop();
+				}
+			});
+		}
+		for (const isProcessTerminal of [false, true]) {
+			it(`still commits an append behind a run of repeated rows (isProcessTerminal=${isProcessTerminal})`, async () => {
+				// Byte-wise this is indistinguishable from inserting a row above the
+				// viewport: the repeated rows match at a shifted offset. Nothing moved
+				// though, so repainting here would drop the top row from scrollback.
+				const term = new VirtualTerminal(40, 5, { isProcessTerminal });
+				const tui = new TUI(term);
+				const component = new MutableLinesComponent(["status-0", "M", "M", "A", "A", "A"]);
+				tui.addChild(component);
+
+				try {
+					tui.start();
+					await settle(term);
+
+					component.setLines(["status-1", "M", "M", "A", "A", "A", "A"]);
+					tui.requestRender();
+					await settle(term);
+					component.setLines(["status-1", "M", "M", "A", "A", "A", "A", "T"]);
+					tui.requestRender();
+					await settle(term);
+
+					const scrollback = term.getScrollBuffer().map(line => line.trimEnd());
+					expect(countMatches(scrollback, /^M$/)).toBe(2);
+					expect(countMatches(scrollback, /^A$/)).toBe(4);
+					expect(visible(term)).toEqual(["M", "A", "A", "A", "A", "T"].slice(-5));
+				} finally {
+					tui.stop();
+				}
+			});
+		}
+
+		for (const isProcessTerminal of [false, true]) {
+			it(`repaints a two-row off-screen insertion at a two-row frontier (isProcessTerminal=${isProcessTerminal})`, async () => {
+				// Only offset 2 explains this frame, and it needs both committed rows to
+				// re-enter the viewport, so it exercises the upper end of the offset scan.
+				const term = new VirtualTerminal(40, 3, { isProcessTerminal });
+				const tui = new TUI(term);
+				const component = new MutableLinesComponent(["P0", "P1", "V0", "V1", "V2"]);
+				tui.addChild(component);
+
+				try {
+					tui.start();
+					await settle(term);
+
+					component.setLines(["I0", "I1", "P0", "P1", "V0", "V1", "V2"]);
+					tui.requestRender();
+					await settle(term);
+
+					const scrollback = term.getScrollBuffer().map(line => line.trimEnd());
+					expect(countMatches(scrollback, /^P0$/)).toBe(1);
+					expect(countMatches(scrollback, /^P1$/)).toBe(1);
+					expect(visible(term)).toEqual(["V0", "V1", "V2"]);
+				} finally {
+					tui.stop();
+				}
+			});
+		}
+
+		it("still commits appended rows when an off-screen boundary row is substituted", async () => {
+			// The mutated off-screen row is the last committed row, but nothing moves:
+			// the appended rows must still reach native scrollback exactly once.
+			const term = new VirtualTerminal(36, 6, { isProcessTerminal: true });
+			const tui = new TUI(term);
+			const status = new MutableLinesComponent(["status-0"]);
+			const body = new MutableLinesComponent(rows("line-", 6));
+			tui.addChild(status);
+			tui.addChild(body);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				for (let i = 1; i <= 6; i++) {
+					status.setLines([`status-${i}`]);
+					body.setLines(rows("line-", 6 + i));
+					tui.requestRender();
+					await settle(term);
+				}
+
+				const scrollback = term.getScrollBuffer().map(line => line.trimEnd());
+				for (let i = 0; i < 12; i++) {
+					expect(countMatches(scrollback, new RegExp(`^line-${i}$`)), `line-${i} exactly once`).toBe(1);
+				}
+				expect(visible(term)).toEqual(rows("line-", 12).slice(-6));
+			} finally {
+				tui.stop();
+			}
+		});
+
 		it("repaints live viewport when overflowed content shrinks only at the tail", async () => {
 			const term = new VirtualTerminal(20, 5);
 			const tui = new TUI(term);
