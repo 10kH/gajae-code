@@ -224,6 +224,46 @@ function unsubscribeFromStdoutErrors(subscriber: (err: Error) => void): void {
 	if (stdoutErrorSubscribers.size === 0) process.stdout.removeListener("error", dispatchStdoutError);
 }
 
+const STDIN_ERROR_HANDLER_GRACE_MS = 250;
+const stdinErrorSubscribers = new Set<(err: Error) => void>();
+export function __stdinErrorSubscriberCountForTests(): number {
+	return stdinErrorSubscribers.size;
+}
+export function __stdinErrorDispatcherInstalledForTests(): boolean {
+	return process.stdin.listeners("error").includes(dispatchStdinError);
+}
+/**
+ * A vanished controlling terminal fails the in-flight stdin read with EIO.
+ * That is the only stdin error this module owns; every other failure
+ * (EBADF, EPIPE, an unexpected platform error) keeps its default
+ * EventEmitter propagation so it stays observable instead of being
+ * downgraded to a silently retired terminal.
+ */
+function isTerminalDetachStdinError(err: Error): boolean {
+	return (err as NodeJS.ErrnoException).code === "EIO";
+}
+const dispatchStdinError = (err: Error): void => {
+	if (!isTerminalDetachStdinError(err)) {
+		// Our listener must not be the reason a non-EIO error stops propagating.
+		// When no other "error" listener exists, EventEmitter would have thrown;
+		// rethrowing from inside emit() reproduces that exact contract.
+		const hasOtherListener = process.stdin.listeners("error").some(listener => listener !== dispatchStdinError);
+		if (!hasOtherListener) throw err;
+		return;
+	}
+	for (const subscriber of stdinErrorSubscribers) subscriber(err);
+};
+
+function subscribeToStdinErrors(subscriber: (err: Error) => void): void {
+	if (stdinErrorSubscribers.size === 0) process.stdin.on("error", dispatchStdinError);
+	stdinErrorSubscribers.add(subscriber);
+}
+
+function unsubscribeFromStdinErrors(subscriber: (err: Error) => void): void {
+	stdinErrorSubscribers.delete(subscriber);
+	if (stdinErrorSubscribers.size === 0) process.stdin.removeListener("error", dispatchStdinError);
+}
+
 /**
  * Real terminal using process.stdin/stdout
  */
@@ -242,6 +282,8 @@ export class ProcessTerminal implements Terminal {
 	#windowsVTInputRestore?: () => void;
 	#stdoutErrorHandler?: (err: Error) => void;
 	#stdoutErrorHandlerCleanupTimer?: Timer;
+	#stdinErrorHandler?: (err: Error) => void;
+	#stdinErrorHandlerCleanupTimer?: Timer;
 	#appearanceCallbacks: Array<(appearance: TerminalAppearance) => void> = [];
 	#appearance: TerminalAppearance | undefined;
 	#osc11Pending = false;
@@ -329,6 +371,21 @@ export class ProcessTerminal implements Terminal {
 				this.#markUnavailable(err, "stdout-error");
 			};
 			subscribeToStdoutErrors(this.#stdoutErrorHandler);
+		}
+		// stdin carries the same hazard as stdout: when the controlling PTY
+		// disappears (tmux pane killed, SSH dropped, terminal closed) the next
+		// read fails with EIO. `process.stdin` is an EventEmitter, so an
+		// unobserved "error" event is rethrown as an uncaught exception that
+		// kills the whole agent process instead of just retiring the terminal.
+		if (this.#stdinErrorHandlerCleanupTimer) {
+			clearTimeout(this.#stdinErrorHandlerCleanupTimer);
+			this.#stdinErrorHandlerCleanupTimer = undefined;
+		}
+		if (!this.#stdinErrorHandler) {
+			this.#stdinErrorHandler = (err: Error) => {
+				this.#markUnavailable(err, "stdin-error");
+			};
+			subscribeToStdinErrors(this.#stdinErrorHandler);
 		}
 
 		// Refresh terminal dimensions - they may be stale after suspend/resume
@@ -860,6 +917,7 @@ export class ProcessTerminal implements Terminal {
 			this.#resizeHandler = undefined;
 		}
 		this.#scheduleStdoutErrorHandlerCleanup();
+		this.#scheduleStdinErrorHandlerCleanup();
 
 		// Pause stdin to prevent any buffered input (e.g., Ctrl+D) from being
 		// re-interpreted after raw mode is disabled. This fixes a race condition
@@ -887,6 +945,22 @@ export class ProcessTerminal implements Terminal {
 			this.#stdoutErrorHandlerCleanupTimer = undefined;
 		}, STDOUT_ERROR_HANDLER_GRACE_MS);
 		this.#stdoutErrorHandlerCleanupTimer.unref?.();
+	}
+
+	#scheduleStdinErrorHandlerCleanup(): void {
+		if (!this.#stdinErrorHandler) return;
+		if (this.#stdinErrorHandlerCleanupTimer) clearTimeout(this.#stdinErrorHandlerCleanupTimer);
+		// stdin.pause() below does not cancel a read already in flight, so a PTY
+		// that vanishes during teardown still delivers EIO after stop() returns.
+		// Keep the listener armed for the same grace window as stdout.
+		this.#stdinErrorHandlerCleanupTimer = setTimeout(() => {
+			if (this.#stdinErrorHandler) {
+				unsubscribeFromStdinErrors(this.#stdinErrorHandler);
+				this.#stdinErrorHandler = undefined;
+			}
+			this.#stdinErrorHandlerCleanupTimer = undefined;
+		}, STDIN_ERROR_HANDLER_GRACE_MS);
+		this.#stdinErrorHandlerCleanupTimer.unref?.();
 	}
 
 	write(data: string): void {
