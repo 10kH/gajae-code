@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.11] - 2026-08-03
+
 ### Fixed
 
 - Side-effecting native macOS computer input now restores the global cursor after releasing held input on success, cancellation, supervisor rejection, and action failure. Batches containing input execute in one serialized native capture-to-restore transaction, while screenshot/wait-only operations remain cursor-neutral; capture/restore failures are reported distinctly without masking the primary action error, and global focus behavior remains unchanged (#3642, #3781).

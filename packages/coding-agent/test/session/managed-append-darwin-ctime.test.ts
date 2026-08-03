@@ -83,11 +83,7 @@ function installStagingCreateHook(
 		mode?: fs.Mode | undefined,
 	) => {
 		const pathname = typeof file === "string" ? file : file.toString();
-		if (
-			path.dirname(pathname) === destinationDir &&
-			isStagingCreateOpen(file, flags) &&
-			state.calls < maxCalls
-		) {
+		if (path.dirname(pathname) === destinationDir && isStagingCreateOpen(file, flags) && state.calls < maxCalls) {
 			state.calls += 1;
 			hook(destinationPath);
 		}
