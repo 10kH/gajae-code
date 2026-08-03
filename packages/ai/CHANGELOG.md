@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.12.9] - 2026-08-03
 ### Added
 
 - Anthropic OAuth can now pair by pasting the authorization code Anthropic displays (`https://platform.claude.com/oauth/code/callback`) instead of waiting on `http://localhost:54545/callback`, so a browser with no network route back to the machine running gjc can complete the login. Opt in per login with `OAuthLoginOptions.manualCode`; the loopback flow stays the default and is unchanged. Callback flows can now opt out of binding a local listener entirely (`OAuthCallbackFlowOptions.skipCallbackServer`), which fails fast when no manual code handler is supplied instead of idling until the five-minute timeout. The hosted redirect is a hard-coded constant with no env or config override, so it cannot be repointed at an attacker-controlled collector.

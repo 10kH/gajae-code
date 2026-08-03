@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.9] - 2026-08-03
+
 ### Fixed
 
 - Linux retained publish receipts now report the actual `linkat` or `mkdirat` fallback primitive, and a staging `unlinkat` failure after `linkat` publication is reported as committed-but-unproven with bounded errno evidence instead of as a retry-safe pre-mutation failure (#3746).
