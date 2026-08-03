@@ -4,7 +4,8 @@
 
 ### Fixed
 
-- Native shared filesystem scans now enforce strict per-scan entry and successful-snapshot retained-capacity budgets, precharge logical ownership before allocation requests, reject allocator-granted excess with whole-scan errors instead of partial prefixes, share immutable snapshots without full-vector clones, and prevent stale in-flight scans from repopulating invalidated or TTL-expired cache entries. The byte budget does not claim a hard allocator or transient RSS ceiling. Cache retention remains compatible with #3774's 128 MiB default and zero-byte cache bypass, is bounded by both key count and aggregate bytes, and includes symlink-following behavior in cache identity (#3769).
+- Native shared filesystem scans now enforce strict per-scan entry and successful-snapshot retained-capacity budgets, precharge logical ownership before allocation requests, reject allocator-granted excess with whole-scan errors instead of partial prefixes, share immutable snapshots without full-vector clones, and prevent stale in-flight scans from repopulating invalidated or TTL-expired cache entries. The byte budget does not claim a hard allocator or transient RSS ceiling. Cache retention remains compatible with #3774's 128 MiB default and zero-byte cache bypass, is bounded by both key count and aggregate bytes, and includes symlink-following behavior in cache identity (#3769, #3780).
+- Side-effecting macOS computer input now restores the global cursor after releasing held input on success, cancellation, action failure, and panic paths. Batches that include input run in one native capture-to-restore transaction; screenshot/wait-only batches stay cursor-neutral, and capture/restore failures are reported without masking the primary action error (#3642, #3781).
 
 ## [0.12.10] - 2026-08-03
 

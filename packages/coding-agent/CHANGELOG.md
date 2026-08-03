@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Side-effecting native macOS computer input now restores the global cursor after releasing held input on success, cancellation, supervisor rejection, and action failure. Batches containing input execute in one serialized native capture-to-restore transaction, while screenshot/wait-only operations remain cursor-neutral; capture/restore failures are reported distinctly without masking the primary action error, and global focus behavior remains unchanged (#3642, #3781).
+- Managed session rewrites and authority-absent Darwin appends now use native identity-verified atomic replacement instead of deterministically failing with `managed_replace_exact_unavailable` or risking a torn JSONL tail; uncertain readable outcomes are re-fsynced and carried through ctime-bound strict adoption before recovery reports them durable. This unblocks Darwin compaction and session append durability when retained native authority is absent (#3742, #3760).
+- `todo_write` recovery reminders now distinguish rejected payloads from runtime aborts, preserve the available cause, and require durable state reconciliation instead of incorrectly telling the agent to change a valid payload (#3743, #3760).
+- Authority-absent Darwin `appendSync` regression coverage now exercises the replace-based race window (destination mutation during successor staging) instead of the retired in-place `O_APPEND` open path, and documents that ctime-only destination transitions are tolerated by exact replacement.
+
 ## [0.12.10] - 2026-08-03
 
 ### Added
@@ -10,7 +17,6 @@
 
 ### Fixed
 
-- Side-effecting native macOS computer input now restores the global cursor after releasing held input on success, cancellation, supervisor rejection, and action failure. Batches containing input execute in one serialized native capture-to-restore transaction, while screenshot/wait-only operations remain cursor-neutral; capture/restore failures are reported distinctly without masking the primary action error, and global focus behavior remains unchanged (#3642).
 - Composer Bash policy rejections now identify the active provider surface and direct Cursor Composer models to their native repository tools, enabling the agent runtime's bounded automatic recovery instead of leaving a blocked shell attempt as a terminal turn.
 - The `AgentSession retry fallback > invalidates an auth-failed managed credential` test now uses a stored credential instead of a runtime-key override, matching the pin-guard behavior added in #3724 where `--api-key`/`--credential` pinned keys are never invalidated; the shared test fixture installed runtime keys as plumbing, which silently tripped the new guard and blocked the auth invalidation path.
 - The Extension Control Center inspector no longer crashes when a narrow two-column layout leaves its preview pane fewer than two columns wide.
@@ -23,8 +29,6 @@
 - Dead-owner notification recovery now preserves a machine-readable transition block, marker-age diagnostics, and safe force-recovery guidance without weakening ownership proofs (#3762).
 - Detached SDK session hosts no longer outlive the broker that spawned them. A host whose broker died without teardown (crash, `SIGKILL`, restart without `--close-session-hosts`) previously stayed resident forever, holding its session's memory — hundreds of MB per orphan. Each host now polls the broker discovery publication and, after a bounded grace period with no live broker, disposes itself through the same graceful teardown a `SIGTERM` takes. A replacement broker resets the window, so hosts still survive ordinary broker restarts, and a transient discovery read failure is treated as ambiguity rather than proof of orphanhood.
 - Syntax highlighting now recognizes special filenames such as `CMakeLists.txt`, `Dockerfile.*`, `Makefile`, and `.env.*` before generic filename extensions.
-- Managed session rewrites and authority-absent Darwin appends now use native identity-verified atomic replacement instead of deterministically failing with `managed_replace_exact_unavailable` or risking a torn JSONL tail; uncertain readable outcomes are re-fsynced and carried through ctime-bound strict adoption before recovery reports them durable (#3742).
-- `todo_write` recovery reminders now distinguish rejected payloads from runtime aborts, preserve the available cause, and require durable state reconciliation instead of incorrectly telling the agent to change a valid payload (#3743).
 
 ## [0.12.8] - 2026-08-02
 ### Added
