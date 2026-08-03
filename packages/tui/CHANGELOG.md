@@ -3,8 +3,6 @@
 ## [Unreleased]
 
 ## [0.12.10] - 2026-08-03
-
-## [0.12.9] - 2026-08-03
 ### Fixed
 
 - Corrected the off-screen transcript duplication fix released in 0.12.8, which could still render a Bash tool block twice and could stop appended rows reaching native scrollback. It keyed on whether the last committed row's bytes changed, which is neither necessary nor sufficient: a substituted status line changes that row without anything moving, and repeated or blank rows at the frontier hide a real insertion. The suffix commit now repaints the live viewport instead when two things hold together: the previously visible rows reappear almost intact at some uniform offset below their old index, and the rows that offset pulls into the top of the visible region are exactly the last rows already committed to scrollback — which is the damage itself, since those are the rows about to be emitted twice. Requiring both keeps an ordinary append committing even when repeated or blank rows make it look displaced. Rendered rows carry no identity, so no test on their bytes can prove which logical row moved; this is a policy for which failure to prefer when a frame is ambiguous, chosen to be never worse than the previous behavior and strictly better on every duplication case found.
