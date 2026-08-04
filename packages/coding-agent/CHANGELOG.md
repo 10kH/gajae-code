@@ -18,6 +18,7 @@
 - Managed session rewrites and authority-absent Darwin appends now use native identity-verified atomic replacement instead of deterministically failing with `managed_replace_exact_unavailable` or risking a torn JSONL tail; uncertain readable outcomes are re-fsynced and carried through ctime-bound strict adoption before recovery reports them durable. This unblocks Darwin compaction and session append durability when retained native authority is absent (#3742, #3760).
 - `todo_write` recovery reminders now distinguish rejected payloads from runtime aborts, preserve the available cause, and require durable state reconciliation instead of incorrectly telling the agent to change a valid payload (#3743, #3760).
 - Authority-absent Darwin `appendSync` regression coverage now exercises the replace-based race window (destination mutation during successor staging) instead of the retired in-place `O_APPEND` open path, and documents that ctime-only destination transitions are tolerated by exact replacement.
+- The legacy interactive footer now uses the session manager's cumulative usage index, so completed task and subagent tokens, premium requests, and estimated costs are included exactly once instead of reporting only the parent agent's assistant messages.
 
 ## [0.12.10] - 2026-08-03
 
