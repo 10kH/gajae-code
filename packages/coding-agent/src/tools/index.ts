@@ -296,6 +296,14 @@ export interface ToolSession {
 	getAuthorizedArtifactsDirs?: () => readonly string[];
 	/** Get the ArtifactManager backing this session (shared across parent + subagents). */
 	getArtifactManager?: () => ArtifactManager | null;
+	/** Prove that an ArtifactManager belongs to this concrete session or its explicitly adopted parent tree. */
+	isArtifactManagerAuthorized?: (manager: ArtifactManager) => boolean;
+	/** Adopt a task-created fallback manager into the concrete session owner. */
+	adoptArtifactManager?: (manager: ArtifactManager) => void;
+	/** Linearizably establish the concrete session owner's canonical artifact manager. */
+	ensureArtifactManager?: () => Promise<ArtifactManager | null>;
+	/** Release a task-created fallback manager when its logical session ends. */
+	releaseArtifactManager?: (manager: ArtifactManager) => void;
 	/** Register teardown work owned by the current logical session. */
 	registerSessionCleanup?: (cleanup: () => Promise<void> | void) => () => void;
 	/** Allocate a new artifact path and ID for session-scoped truncated output. */

@@ -485,10 +485,12 @@ interface SessionLifetimeArtifactsState {
 	originalGetArtifactsDir?: ToolSession["getArtifactsDir"];
 	originalGetAuthorizedArtifactsDirs?: ToolSession["getAuthorizedArtifactsDirs"];
 	originalGetArtifactManager?: ToolSession["getArtifactManager"];
+	originalIsArtifactManagerAuthorized?: ToolSession["isArtifactManagerAuthorized"];
 	originalAgentOutputManager?: AgentOutputManager;
 	installedGetArtifactsDir?: ToolSession["getArtifactsDir"];
 	installedGetAuthorizedArtifactsDirs?: ToolSession["getAuthorizedArtifactsDirs"];
 	installedGetArtifactManager?: ToolSession["getArtifactManager"];
+	installedIsArtifactManagerAuthorized?: ToolSession["isArtifactManagerAuthorized"];
 	installedAgentOutputManager?: AgentOutputManager;
 }
 
@@ -569,6 +571,17 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	}
 
 	/**
+	 * The artifact store shared by this whole agent tree, when the session proves
+	 * the exact manager relationship. Path containment is not authority: an
+	 * unrelated manager can choose a lexically nested root or session filename.
+	 */
+	#sharedArtifactStore(): { dir: string; manager: ArtifactManager } | null {
+		const manager = this.session.getArtifactManager?.() ?? null;
+		if (!manager || this.session.isArtifactManagerAuthorized?.(manager) !== true) return null;
+		return { dir: path.resolve(manager.dir), manager };
+	}
+
+	/**
 	 * Ensure a session-lifetime artifact directory when the parent has no session file.
 	 * Returns null only when durable allocation fails (mkdir error) — callers must not
 	 * advertise agent:// URIs without a successful allocation.
@@ -576,15 +589,24 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	async #ensureSessionLifetimeArtifacts(): Promise<{ dir: string; manager: ArtifactManager } | null> {
 		const state = sessionLifetimeArtifactsState(this.session);
 		if (state.authorized && state.dir && state.manager) return { dir: state.dir, manager: state.manager };
+		if (this.session.ensureArtifactManager) {
+			const manager = await this.session.ensureArtifactManager();
+			if (manager && this.session.isArtifactManagerAuthorized?.(manager) === true) {
+				const dir = path.resolve(manager.dir);
+				state.dir = dir;
+				state.manager = manager;
+				if (!(await this.#authorizeSessionLifetimeArtifacts(state, dir, manager, false, false))) return null;
+				return { dir, manager };
+			}
+		}
 
 		const sessionArtifactsDir = this.session.getArtifactsDir?.() ?? null;
 		if (sessionArtifactsDir) {
-			const existingManager = this.session.getArtifactManager?.() ?? null;
-			if (existingManager && path.resolve(existingManager.dir) !== path.resolve(sessionArtifactsDir)) return null;
-			const manager = existingManager ?? new ArtifactManager(sessionArtifactsDir);
+			const manager = new ArtifactManager(sessionArtifactsDir);
 			state.dir = sessionArtifactsDir;
 			state.manager = manager;
-			if (!(await this.#authorizeSessionLifetimeArtifacts(state, sessionArtifactsDir, manager, false))) return null;
+			if (!(await this.#authorizeSessionLifetimeArtifacts(state, sessionArtifactsDir, manager, false, true)))
+				return null;
 			return { dir: sessionArtifactsDir, manager };
 		}
 		if (!this.session.registerSessionCleanup) return null;
@@ -609,7 +631,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 		state.dir = dir;
 		state.manager = new ArtifactManager(dir);
-		if (!(await this.#authorizeSessionLifetimeArtifacts(state, dir, state.manager, true))) return null;
+		if (!(await this.#authorizeSessionLifetimeArtifacts(state, dir, state.manager, true, true))) return null;
 		return dir;
 	}
 
@@ -623,11 +645,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		dir: string,
 		manager: ArtifactManager,
 		owned: boolean,
+		adoptIntoSessionOwner: boolean,
 	): Promise<boolean> {
 		if (state.authorized) return true;
 		state.originalGetArtifactsDir = this.session.getArtifactsDir;
 		state.originalGetAuthorizedArtifactsDirs = this.session.getAuthorizedArtifactsDirs;
 		state.originalGetArtifactManager = this.session.getArtifactManager;
+		state.originalIsArtifactManagerAuthorized = this.session.isArtifactManagerAuthorized;
 		state.originalAgentOutputManager = this.session.agentOutputManager;
 
 		state.installedGetArtifactsDir = () => state.originalGetArtifactsDir?.() ?? dir;
@@ -643,6 +667,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			return dirs;
 		};
 		state.installedGetArtifactManager = () => manager;
+		state.installedIsArtifactManagerAuthorized = candidate =>
+			candidate === manager || state.originalIsArtifactManagerAuthorized?.(candidate) === true;
 		if (owned || !this.session.agentOutputManager) {
 			state.installedAgentOutputManager = new AgentOutputManager(() => this.session.getArtifactsDir?.() ?? null, {
 				parentPrefix: owned ? state.outputPrefix : undefined,
@@ -653,56 +679,74 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		let cleanupRan = false;
 		const cleanup = async () => {
 			cleanupRan = true;
-			try {
-				if (owned) await fs.rm(dir, { recursive: true, force: true });
-			} finally {
-				if (this.session.getArtifactsDir === state.installedGetArtifactsDir)
-					this.session.getArtifactsDir = state.originalGetArtifactsDir;
-				if (this.session.getAuthorizedArtifactsDirs === state.installedGetAuthorizedArtifactsDirs)
-					this.session.getAuthorizedArtifactsDirs = state.originalGetAuthorizedArtifactsDirs;
-				if (this.session.getArtifactManager === state.installedGetArtifactManager)
-					this.session.getArtifactManager = state.originalGetArtifactManager;
-				if (this.session.agentOutputManager === state.installedAgentOutputManager)
-					this.session.agentOutputManager = state.originalAgentOutputManager;
-				sessionLifetimeArtifacts.delete(this.session);
-			}
+			this.session.releaseArtifactManager?.(manager);
+			if (this.session.getArtifactsDir === state.installedGetArtifactsDir)
+				this.session.getArtifactsDir = state.originalGetArtifactsDir;
+			if (this.session.getAuthorizedArtifactsDirs === state.installedGetAuthorizedArtifactsDirs)
+				this.session.getAuthorizedArtifactsDirs = state.originalGetAuthorizedArtifactsDirs;
+			if (this.session.getArtifactManager === state.installedGetArtifactManager)
+				this.session.getArtifactManager = state.originalGetArtifactManager;
+			if (this.session.isArtifactManagerAuthorized === state.installedIsArtifactManagerAuthorized)
+				this.session.isArtifactManagerAuthorized = state.originalIsArtifactManagerAuthorized;
+			if (this.session.agentOutputManager === state.installedAgentOutputManager)
+				this.session.agentOutputManager = state.originalAgentOutputManager;
+			sessionLifetimeArtifacts.delete(this.session);
+			if (owned) await fs.rm(dir, { recursive: true, force: true });
 		};
-		if (owned) {
-			const registerCleanup = this.session.registerSessionCleanup;
-			if (!registerCleanup) {
-				state.dir = undefined;
-				state.manager = undefined;
-				state.ensurePromise = undefined;
-				sessionLifetimeArtifacts.delete(this.session);
-				await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
-				return false;
-			}
+		const registerCleanup = this.session.registerSessionCleanup;
+		if (!registerCleanup) {
+			state.dir = undefined;
+			state.manager = undefined;
+			state.ensurePromise = undefined;
+			sessionLifetimeArtifacts.delete(this.session);
+			if (owned) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+			return false;
+		}
+		try {
+			registerCleanup(cleanup);
+		} catch {
+			state.dir = undefined;
+			state.manager = undefined;
+			state.ensurePromise = undefined;
+			sessionLifetimeArtifacts.delete(this.session);
+			if (owned) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+			return false;
+		}
+		if (cleanupRan) return false;
+		state.cleanupRegistered = true;
+		if (adoptIntoSessionOwner && this.session.adoptArtifactManager) {
 			try {
-				registerCleanup(cleanup);
+				this.session.adoptArtifactManager(manager);
 			} catch {
-				state.dir = undefined;
-				state.manager = undefined;
-				state.ensurePromise = undefined;
-				sessionLifetimeArtifacts.delete(this.session);
-				await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+				await cleanup();
 				return false;
 			}
-			if (cleanupRan) return false;
-			state.cleanupRegistered = true;
+			if (
+				this.session.getArtifactManager?.() !== manager ||
+				this.session.isArtifactManagerAuthorized?.(manager) !== true
+			) {
+				await cleanup();
+				return false;
+			}
 		}
 
 		state.authorized = true;
 		this.session.getArtifactsDir = state.installedGetArtifactsDir;
 		this.session.getAuthorizedArtifactsDirs = state.installedGetAuthorizedArtifactsDirs;
 		this.session.getArtifactManager = state.installedGetArtifactManager;
+		this.session.isArtifactManagerAuthorized = state.installedIsArtifactManagerAuthorized;
 		if (state.installedAgentOutputManager) this.session.agentOutputManager = state.installedAgentOutputManager;
 		return true;
 	}
 
 	/**
 	 * Resolve the effective artifacts directory for this task batch.
-	 * File-backed sessions use the session artifacts path; in-memory parents use
-	 * the session-lifetime durable temp root when allocation succeeds.
+	 *
+	 * The session's ArtifactManager is authoritative when present: a subagent
+	 * adopts its parent's manager, so honouring it keeps the whole agent tree on
+	 * one artifact directory and one ID space instead of giving each nesting
+	 * level a private store. Sessions without a manager fall back to the session
+	 * artifacts path, then to the session-lifetime durable temp root.
 	 */
 	async #resolveEffectiveArtifactsDir(): Promise<{
 		sessionArtifactsDir: string | null;
@@ -710,19 +754,23 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		effectiveArtifactsDir: string | undefined;
 		parentArtifactManager: ArtifactManager | undefined;
 	}> {
+		const shared = this.#sharedArtifactStore();
+		if (shared) {
+			return {
+				sessionArtifactsDir: shared.dir,
+				durableArtifactsDir: null,
+				effectiveArtifactsDir: shared.dir,
+				parentArtifactManager: shared.manager,
+			};
+		}
 		const sessionFile = this.session.getSessionFile();
 		const sessionArtifactsDir = sessionFile ? sessionFile.slice(0, -6) : null;
 		if (sessionArtifactsDir) {
-			const candidateManager = this.session.getArtifactManager?.() ?? undefined;
-			const parentArtifactManager =
-				candidateManager && path.resolve(candidateManager.dir) === path.resolve(sessionArtifactsDir)
-					? candidateManager
-					: undefined;
 			return {
 				sessionArtifactsDir,
 				durableArtifactsDir: null,
 				effectiveArtifactsDir: sessionArtifactsDir,
-				parentArtifactManager,
+				parentArtifactManager: undefined,
 			};
 		}
 		const durable = await this.#ensureSessionLifetimeArtifacts();

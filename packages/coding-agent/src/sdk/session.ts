@@ -1657,7 +1657,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 			},
 			getArtifactManager: () => sessionManager.getArtifactManager(),
-			registerSessionCleanup: cleanup => session?.registerToolSessionCleanup(cleanup) ?? (() => {}),
+			isArtifactManagerAuthorized: manager => sessionManager.isArtifactManagerAuthorized(manager),
+			adoptArtifactManager: manager => sessionManager.adoptArtifactManager(manager),
+			releaseArtifactManager: manager => sessionManager.releaseArtifactManager(manager),
+			ensureArtifactManager: () => sessionManager.ensureArtifactManager(),
+			registerSessionCleanup: cleanup => session?.registerToolSessionTransitionCleanup(cleanup) ?? (() => {}),
 			settings,
 			authStorage,
 			modelRegistry,

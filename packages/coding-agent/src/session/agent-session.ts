@@ -184,7 +184,7 @@ import {
 } from "@gajae-code/utils";
 
 import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append-only-mode";
-import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager } from "../async";
+import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager, type OwnerSubagentShutdownLease } from "../async";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
@@ -1971,6 +1971,8 @@ export class AgentSession {
 	#isDisposed = false;
 	#disposePromise: Promise<void> | undefined;
 	readonly #toolSessionCleanups = new Set<() => Promise<void> | void>();
+	readonly #toolSessionTransitionCleanups = new Set<() => Promise<void> | void>();
+	readonly #deferredOwnerShutdownFinalizations = new Set<Promise<void>>();
 	#newSessionTransition: Promise<boolean> | undefined;
 	// Extension system
 	#extensionRunner: ExtensionRunner | undefined = undefined;
@@ -3408,6 +3410,23 @@ export class AgentSession {
 		return () => this.#toolSessionCleanups.delete(cleanup);
 	}
 
+	registerToolSessionTransitionCleanup(cleanup: () => Promise<void> | void): () => void {
+		if (this.#isDisposed)
+			throw new Error("Cannot register tool transition cleanup after session disposal has started.");
+		this.#toolSessionTransitionCleanups.add(cleanup);
+		return () => this.#toolSessionTransitionCleanups.delete(cleanup);
+	}
+
+	async #runToolSessionTransitionCleanups(): Promise<void> {
+		const cleanups = Array.from(this.#toolSessionTransitionCleanups);
+		this.#toolSessionTransitionCleanups.clear();
+		const results = await Promise.allSettled(cleanups.map(async cleanup => await cleanup()));
+		for (const result of results) {
+			if (result.status === "rejected")
+				logger.warn("Tool session transition cleanup failed", { error: String(result.reason) });
+		}
+	}
+
 	async #runToolSessionCleanups(): Promise<void> {
 		const cleanups = Array.from(this.#toolSessionCleanups);
 		this.#toolSessionCleanups.clear();
@@ -3458,6 +3477,61 @@ export class AgentSession {
 		// existing ones. Cleanup callbacks are error-isolated inside the manager.
 		manager.runOwnerCleanups({ ownerId: this.#agentId });
 		manager.cancelAll({ ownerId: this.#agentId });
+	}
+
+	async #settleOwnAsyncJobsBeforeArtifactRetirement(): Promise<void> {
+		const ownerId = this.#agentId;
+		const manager = AsyncJobManager.instance();
+		if (!ownerId || !manager) return;
+		const lease = manager.beginOwnerSubagentShutdown(ownerId);
+		if (!lease) throw new Error("Owned async cleanup is already in progress before artifact retirement.");
+		let committed = false;
+		try {
+			manager.runOwnerProducerCleanupsStrict({ ownerId });
+			const proof = await manager.cancelAndProveOwnerSubagents(lease);
+			if (!proof.confirmed)
+				throw new Error("Owned subagent cleanup could not be confirmed before artifact retirement.");
+			if (!(await manager.waitForOwnerInFlightDeliveries(ownerId)))
+				throw new Error("Owned async deliveries did not settle before artifact retirement.");
+			if (!(await manager.cancelAndSettleOwnerJobs(ownerId)))
+				throw new Error("Owned async jobs did not settle before artifact retirement.");
+			committed = true;
+		} finally {
+			manager.finishOwnerSubagentShutdown(lease, committed ? "commit" : "release");
+		}
+	}
+
+	#scheduleDeferredOwnerShutdownFinalization(
+		manager: AsyncJobManager,
+		lease: OwnerSubagentShutdownLease,
+		ownerId: string,
+	): void {
+		const finalization = (async () => {
+			while (!this.#isDisposed) {
+				try {
+					manager.runOwnerProducerCleanupsStrict({ ownerId });
+					const proof = await manager.cancelAndProveOwnerSubagents(lease);
+					if (!proof.confirmed) throw new Error(`owner_subagent_${proof.reason}`);
+					if (!(await manager.waitForOwnerInFlightDeliveries(ownerId)))
+						throw new Error("owner_delivery_settlement_timeout");
+					if (!(await manager.cancelAndSettleOwnerJobs(ownerId))) throw new Error("owner_job_settlement_timeout");
+					if (this.#isDisposed) break;
+					this.sessionManager.retireEphemeralArtifactsAfterTransition();
+					await this.#runToolSessionTransitionCleanups();
+					manager.finishOwnerSubagentShutdown(lease, "commit");
+					return;
+				} catch (error) {
+					logger.warn("Deferred owner shutdown finalization retry failed", {
+						ownerId,
+						error: error instanceof Error ? error.message : String(error),
+					});
+					await Bun.sleep(25);
+				}
+			}
+			manager.finishOwnerSubagentShutdown(lease, "release");
+		})();
+		this.#deferredOwnerShutdownFinalizations.add(finalization);
+		void finalization.finally(() => this.#deferredOwnerShutdownFinalizations.delete(finalization));
 	}
 
 	#suppressOwnAsyncJobDeliveries(): void {
@@ -6025,6 +6099,7 @@ export class AgentSession {
 		// the session that owns the manager goes on to dispose it (which itself
 		// nukes any leftover jobs and pending deliveries).
 		this.#cancelOwnAsyncJobs();
+		await Promise.allSettled(this.#deferredOwnerShutdownFinalizations);
 		const ownedAsyncManager = this.#ownedAsyncJobManager;
 		if (ownedAsyncManager) {
 			const drained = await ownedAsyncManager.dispose({ timeoutMs: 3_000 });
@@ -6036,6 +6111,7 @@ export class AgentSession {
 				AsyncJobManager.setInstance(undefined);
 			}
 		}
+		await this.#runToolSessionTransitionCleanups();
 		await this.#runToolSessionCleanups();
 		// Only disconnect the MCP manager THIS session owns (top-level sessions that
 		// connected plugin-bundle MCP servers). Subagents and callers that merely
@@ -10220,6 +10296,7 @@ export class AgentSession {
 				// Last fallible gate while public getters still show the predecessor (#3138).
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				this.sessionManager.commitPreparedNewSession(prepared);
+				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
@@ -10289,6 +10366,7 @@ export class AgentSession {
 				// Last fallible gate while public getters still show the predecessor (#3138).
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				this.sessionManager.commitPreparedNewSession(prepared);
+				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
@@ -10455,7 +10533,9 @@ export class AgentSession {
 			}
 			try {
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
+				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 				this.sessionManager.commitPreparedNewSession(prepared);
+				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
@@ -11572,6 +11652,7 @@ export class AgentSession {
 		const artifactManager = this.sessionManager.getArtifactManager();
 		const prunedArtifacts: Array<{ entryId: string; id: string; toolType: string; originalText: string }> = [];
 		let reservedArtifactId: string | undefined;
+		let artifactAllocationAvailable = artifactManager !== null;
 		if (artifactManager) {
 			try {
 				reservedArtifactId = (await artifactManager.allocatePath("tool-output")).id;
@@ -11579,14 +11660,24 @@ export class AgentSession {
 				logger.warn("Failed to reserve artifact ID for pruned tool output", {
 					error: error instanceof Error ? error.message : String(error),
 				});
+				artifactAllocationAvailable = false;
 			}
 		}
 		const result = pruneToolOutputs(branchEntries, DEFAULT_PRUNE_CONFIG, {
 			relaxedMinimum: overThreshold ? 0 : undefined,
 			artifactRefMaxChars: PRUNED_ARTIFACT_REF_MAX_CHARS,
 			artifactRef: candidate => {
-				if (!artifactManager) return undefined;
-				const id = reservedArtifactId ?? String(artifactManager.allocateId());
+				if (!artifactManager || !artifactAllocationAvailable) return undefined;
+				let id: string;
+				try {
+					id = reservedArtifactId ?? String(artifactManager.allocateId());
+				} catch (error) {
+					artifactAllocationAvailable = false;
+					logger.warn("Failed to allocate artifact ID for pruned tool output", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+					return undefined;
+				}
 				reservedArtifactId = undefined;
 				const toolType = (candidate.toolName ?? "tool-output").replace(/[^a-zA-Z0-9_-]/g, "_") || "tool-output";
 				prunedArtifacts.push({ entryId: candidate.entryId, id, toolType, originalText: candidate.originalText });
@@ -12198,10 +12289,12 @@ export class AgentSession {
 				const successorGateEmitter = this.#constructWorkflowGateEmitter(prepared.sessionId);
 				// Last fallible action: verified local:// readiness from immutable staged options.
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
+				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 
 				// --- Commit boundary: synchronous adoption is the sole identity publication.
 				this.sessionManager.commitPreparedNewSession(prepared);
 				committed = true;
+				await this.#runToolSessionTransitionCleanups();
 				this.agent.reset();
 				this.#syncAgentSessionId();
 				this.#rekeyHindsightMemoryForCurrentSessionId();
@@ -12232,7 +12325,6 @@ export class AgentSession {
 				this.#resetIrcRosterDeliveryState();
 				this.#planReferenceSent = false;
 				this.#planReferencePath = "local://PLAN.md";
-				this.#cancelOwnAsyncJobs();
 				// The predecessor's fenced async-job results (queued while the
 				// transition held the delivery fence) belong to the handed-off session,
 				// not the successor. Suppress and drop ONLY the async-result kind so they
@@ -16337,6 +16429,10 @@ export class AgentSession {
 			onTransitionMutationStarted?: () => void;
 		},
 	): Promise<boolean> {
+		let ownerShutdownManager: AsyncJobManager | undefined;
+		let ownerShutdownLease: OwnerSubagentShutdownLease | undefined;
+		let ownerShutdownTransitionCommitted = false;
+		let ownerShutdownFinalizationDeferred = false;
 		this.#beginSessionTransition("switch-session");
 		try {
 			const previousSessionFile = this.sessionManager.getSessionFile();
@@ -16357,9 +16453,31 @@ export class AgentSession {
 			}
 			options?.onTransitionMutationStarted?.();
 
-			this.#disconnectFromAgent();
+			const asyncManager = AsyncJobManager.instance();
+			const ownerId = this.#agentId;
+			const lease =
+				switchingToDifferentSession && asyncManager && ownerId
+					? asyncManager.beginOwnerSubagentShutdown(ownerId)
+					: undefined;
+			if (switchingToDifferentSession && asyncManager && ownerId && !lease) {
+				this.emitNotice(
+					"error",
+					"Cannot switch sessions while owned subagent cleanup is already in progress.",
+					"switch-session-subagent-cleanup",
+				);
+				return false;
+			}
+			if (lease && asyncManager) {
+				ownerShutdownManager = asyncManager;
+				ownerShutdownLease = lease;
+			}
 			await this.abort();
+			if (this.isCompacting) {
+				this.abortCompaction();
+				while (this.isCompacting) await Bun.sleep(10);
+			}
 
+			this.#disconnectFromAgent();
 			// Flush pending writes before switching so restore snapshots reflect committed state.
 			await this.sessionManager.flush();
 			const previousSessionState = this.sessionManager.captureState();
@@ -16390,9 +16508,13 @@ export class AgentSession {
 				? this.#suspendWorkflowGateEmitter(previousSessionState.sessionId)
 				: undefined;
 			let unavailableDefaultChainMessage: string | undefined;
+			let transitionCleanupCommitted = false;
 
 			try {
-				await this.sessionManager.setSessionFile(sessionPath);
+				await this.sessionManager.setSessionFile(sessionPath, {
+					deferEphemeralArtifactRetirement: switchingToDifferentSession,
+				});
+				if (switchingToDifferentSession) this.sessionManager.stageAdoptedArtifactManagerForTransition();
 				// The successor identity is already rotated in the manager but not yet
 				// published; gate its local:// root before publication so the agent,
 				// workflow-gate emitter, and hooks cannot resolve against an ungated
@@ -16492,6 +16614,38 @@ export class AgentSession {
 					this.#resetIrcRosterDeliveryState();
 				}
 
+				if (switchingToDifferentSession) {
+					let ownerShutdownSettled = true;
+					if (ownerShutdownManager && ownerShutdownLease && ownerId) {
+						try {
+							ownerShutdownManager.runOwnerProducerCleanupsStrict({ ownerId });
+							const proof = await ownerShutdownManager.cancelAndProveOwnerSubagents(ownerShutdownLease);
+							if (!proof.confirmed)
+								throw new Error("Owned subagent cleanup could not be confirmed after successor validation.");
+							if (!(await ownerShutdownManager.waitForOwnerInFlightDeliveries(ownerId)))
+								throw new Error("Owned async deliveries did not settle after successor validation.");
+							if (!(await ownerShutdownManager.cancelAndSettleOwnerJobs(ownerId)))
+								throw new Error("Owned async jobs did not settle after successor validation.");
+						} catch (error) {
+							ownerShutdownSettled = false;
+							ownerShutdownFinalizationDeferred = true;
+							this.#scheduleDeferredOwnerShutdownFinalization(ownerShutdownManager, ownerShutdownLease, ownerId);
+							this.#suppressOwnAsyncJobDeliveries();
+							this.emitNotice(
+								"error",
+								`Successor session is active, but predecessor async cleanup did not settle: ${error instanceof Error ? error.message : String(error)}`,
+								"switch-session-subagent-cleanup",
+							);
+						}
+					}
+					transitionCleanupCommitted = true;
+					// Different files may intentionally carry the same copied session id; pathname transition is the commit signal.
+					ownerShutdownTransitionCommitted = true;
+					if (ownerShutdownSettled) {
+						this.sessionManager.retireEphemeralArtifactsAfterTransition();
+						await this.#runToolSessionTransitionCleanups();
+					}
+				}
 				this.#reconnectToAgent();
 				// Fence predecessor continuations before session_switch starts SDK runtime
 				// teardown. The previous runtime waits for those continuations to settle;
@@ -16500,7 +16654,8 @@ export class AgentSession {
 					this.#bindWorkflowGateEmitter(previousSessionState.sessionId, suspendedWorkflowGateEmitter);
 				// session_switch is the post-commit identity signal. SDK authority and
 				// other identity-bound integrations must not observe the successor until
-				// messages, model state, MCP selections, and the agent subscription are live.
+				// messages, model state, MCP selections, the agent subscription, and
+				// session-scoped tool cleanup are complete.
 				if (this.#extensionRunner) {
 					await this.#extensionRunner.emit({
 						type: "session_switch",
@@ -16511,6 +16666,7 @@ export class AgentSession {
 				}
 				return true;
 			} catch (error) {
+				if (transitionCleanupCommitted) throw error;
 				this.sessionManager.restoreState(previousSessionState);
 				this.#defaultFallbackController = undefined;
 				this.#syncAgentSessionId(previousSessionState.sessionId);
@@ -16569,6 +16725,12 @@ export class AgentSession {
 				throw error;
 			}
 		} finally {
+			if (ownerShutdownManager && ownerShutdownLease && !ownerShutdownFinalizationDeferred) {
+				ownerShutdownManager.finishOwnerSubagentShutdown(
+					ownerShutdownLease,
+					ownerShutdownTransitionCommitted ? "commit" : "release",
+				);
+			}
 			this.#endSessionTransition();
 		}
 	}
@@ -16620,13 +16782,14 @@ export class AgentSession {
 				: await this.sessionManager.prepareNewSession({ parentSession: previousSessionFile });
 			try {
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
+				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 				this.sessionManager.commitPreparedNewSession(prepared);
+				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
 			this.#pendingNextTurnMessages = [];
 			this.#scheduledHiddenNextTurnGeneration = undefined;
-			this.#cancelOwnAsyncJobs();
 
 			this.#syncTodoPhasesFromBranch();
 			this.#syncAgentSessionId();

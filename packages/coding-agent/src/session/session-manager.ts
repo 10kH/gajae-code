@@ -4765,6 +4765,7 @@ interface SessionManagerStateSnapshot {
 	needsFullRewriteOnNextPersist: boolean;
 	fileEntries: FileEntry[];
 	materializedFileEntries: FileEntry[];
+	adoptedArtifactManager: ArtifactManager | null;
 }
 
 /** Benchmark-derived cap for strong materialized session snapshots. */
@@ -4775,6 +4776,7 @@ export const SessionManagerTestHooks: {
 	materializedCacheMaxBytesOverride?: number;
 	beforeResidentTransitionIndexBuild?: () => void;
 	afterForkSnapshot?: () => void | Promise<void>;
+	beforeEphemeralArtifactManagerInstall?: (dir: string) => void | Promise<void>;
 } = {};
 
 function materializedCacheMaxBytes(): number {
@@ -4841,10 +4843,13 @@ export class SessionManager {
 	// Subagents adopt the parent's manager so artifact IDs are unique across the
 	// whole agent tree and all files land in the parent's artifacts dir.
 	#adoptedArtifactManager: ArtifactManager | null = null;
-	// In-memory artifact fallback for non-persistent sessions (persist=false).
-	// Keyed by sequential numeric ID string; mirrors the file-based ArtifactManager ID scheme.
-	#inMemoryArtifacts: Map<string, string> | null = null;
-	#inMemoryArtifactCounter = 0;
+	// Filesystem-backed artifact fallback for non-persistent sessions (persist=false).
+	// The directory is created lazily on first save so artifact content is read back
+	// from disk on demand instead of being retained in memory for the session lifetime.
+	#ephemeralArtifactManager: ArtifactManager | null = null;
+	#ephemeralArtifactDir: string | null = null;
+	#ephemeralArtifactInit: Promise<ArtifactManager | null> | null = null;
+	#ephemeralArtifactCleanups = new Set<Promise<void>>();
 	readonly #blobStore: BlobStore;
 	#residentTextBlobStore: BlobStore = new MemoryBlobStore();
 	#residentImageBlobStore: BlobStore;
@@ -5360,6 +5365,7 @@ export class SessionManager {
 			// Rollback snapshots must own resident data before another session reset disposes
 			// the ephemeral store backing the resident sentinels above.
 			materializedFileEntries,
+			adoptedArtifactManager: this.#adoptedArtifactManager,
 		};
 	}
 
@@ -5397,7 +5403,7 @@ export class SessionManager {
 		this.#persistErrorReported = false;
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
-		this.#adoptedArtifactManager = null;
+		this.#adoptedArtifactManager = snapshot.adoptedArtifactManager;
 		this.#commitResidentTextStoreTransition(prepared);
 		if (this.#sessionFile) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 	}
@@ -5438,8 +5444,7 @@ export class SessionManager {
 		this.#flushed = false;
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#ensuredOnDisk = false;
-		this.#inMemoryArtifacts = null;
-		this.#inMemoryArtifactCounter = 0;
+
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 		this.#adoptedArtifactManager = null;
@@ -5471,6 +5476,7 @@ export class SessionManager {
 			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
 			this.#applyFreshSessionMetadata(fresh);
 			this.#commitResidentTextStoreTransition(prepared);
+			this.#retireEphemeralArtifacts();
 			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			await this.#rewriteFile();
 			this.#flushed = true;
@@ -5544,7 +5550,7 @@ export class SessionManager {
 	}
 
 	/** Switch to a different session file (used for resume and branching). */
-	async setSessionFile(sessionFile: string): Promise<void> {
+	async setSessionFile(sessionFile: string, options?: { deferEphemeralArtifactRetirement?: boolean }): Promise<void> {
 		this.#assertRecoveryHydrationWritable();
 		const resolvedSessionFile = this.storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
 		const strictAdoption = this.#pendingStrictAdoption;
@@ -5641,6 +5647,7 @@ export class SessionManager {
 					prepared.dispose();
 					throw error;
 				}
+				if (!options?.deferEphemeralArtifactRetirement) this.#retireEphemeralArtifacts();
 				managedTransition?.settle();
 				this.#pendingStrictAdoption = undefined;
 				this.#flushed = true;
@@ -5668,8 +5675,6 @@ export class SessionManager {
 				flushed: this.#flushed,
 				needsFullRewriteOnNextPersist: this.#needsFullRewriteOnNextPersist,
 				ensuredOnDisk: this.#ensuredOnDisk,
-				inMemoryArtifacts: this.#inMemoryArtifacts,
-				inMemoryArtifactCounter: this.#inMemoryArtifactCounter,
 				artifactManager: this.#artifactManager,
 				artifactManagerSessionFile: this.#artifactManagerSessionFile,
 				adoptedArtifactManager: this.#adoptedArtifactManager,
@@ -5679,6 +5684,7 @@ export class SessionManager {
 				managedTransition?.adopt();
 				writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 				this.#commitResidentTextStoreTransition(prepared);
+				if (!options?.deferEphemeralArtifactRetirement) this.#retireEphemeralArtifacts();
 			} catch (error) {
 				managedTransition?.rollback();
 				this.#lifecycleIdAdopted = previous.lifecycleIdAdopted;
@@ -5692,8 +5698,6 @@ export class SessionManager {
 				this.#flushed = previous.flushed;
 				this.#needsFullRewriteOnNextPersist = previous.needsFullRewriteOnNextPersist;
 				this.#ensuredOnDisk = previous.ensuredOnDisk;
-				this.#inMemoryArtifacts = previous.inMemoryArtifacts;
-				this.#inMemoryArtifactCounter = previous.inMemoryArtifactCounter;
 				this.#artifactManager = previous.artifactManager;
 				this.#artifactManagerSessionFile = previous.artifactManagerSessionFile;
 				this.#adoptedArtifactManager = previous.adoptedArtifactManager;
@@ -6139,12 +6143,12 @@ export class SessionManager {
 		this.#flushed = stage.flushed;
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#ensuredOnDisk = stage.flushed;
-		this.#inMemoryArtifacts = null;
-		this.#inMemoryArtifactCounter = 0;
+
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 		this.#adoptedArtifactManager = null;
 		this.#commitResidentTextStoreTransition(transition);
+		this.#retireEphemeralArtifacts();
 		stage.committed = true;
 		this.#preparedNewSessions.delete(stage);
 	}
@@ -6955,6 +6959,7 @@ export class SessionManager {
 		const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
 		this.#applyFreshSessionMetadata(fresh);
 		this.#commitResidentTextStoreTransition(prepared);
+		this.#retireEphemeralArtifacts();
 		if (writeBreadcrumb && fresh.sessionFile) writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
 		return fresh.sessionFile;
 	}
@@ -7677,6 +7682,8 @@ export class SessionManager {
 				this.#flushed = true;
 			}
 		});
+		this.#retireEphemeralArtifacts();
+		await this.#drainEphemeralArtifactCleanups();
 		this.#releaseResidentTextStore();
 		this.#releaseOwnedManagedAuthority();
 		if (this.#persistError) throw this.#persistError;
@@ -7736,6 +7743,12 @@ export class SessionManager {
 		// close leaves the session live for a genuine retry.
 		if (!this.#persistWriter) {
 			this.#releaseResidentTextStore();
+			this.#retireEphemeralArtifacts();
+			try {
+				await this.#drainEphemeralArtifactCleanups();
+			} catch (error) {
+				outcome = { kind: "close_unknown", error: toError(error) };
+			}
 		}
 		return outcome;
 	}
@@ -8024,14 +8037,40 @@ export class SessionManager {
 		this.#adoptedArtifactManager = manager;
 	}
 
+	/** Release only the matching externally adopted manager. */
+	releaseArtifactManager(manager: ArtifactManager): void {
+		if (this.#adoptedArtifactManager === manager) this.#adoptedArtifactManager = null;
+	}
+
+	/** Temporarily release adopted authority while an outer transition validates its successor. */
+	stageAdoptedArtifactManagerForTransition(): void {
+		this.#adoptedArtifactManager = null;
+	}
+
+	/** Prove manager authority by exact object identity, never by pathname shape. */
+	isArtifactManagerAuthorized(manager: ArtifactManager): boolean {
+		return (
+			manager === this.#adoptedArtifactManager ||
+			manager === this.#artifactManager ||
+			manager === this.#ephemeralArtifactManager
+		);
+	}
+
 	/**
 	 * Returns the ArtifactManager this session writes through. Lazily creates
 	 * one bound to the current session file unless an external manager was
-	 * adopted via `adoptArtifactManager`. Returns null only for non-persistent
-	 * sessions with no adopted manager.
+	 * adopted via `adoptArtifactManager`. Falls back to the lazily created
+	 * ephemeral filesystem store once a non-persistent session has saved an
+	 * artifact, so `artifact://` stays resolvable. Returns null only when no
+	 * store has been established yet.
 	 */
 	getArtifactManager(): ArtifactManager | null {
-		return this.#getOrCreateArtifactManager();
+		return this.#getOrCreateArtifactManager() ?? this.#ephemeralArtifactManager;
+	}
+
+	/** Linearizably establish this session's persistent or ephemeral artifact manager. */
+	async ensureArtifactManager(): Promise<ArtifactManager | null> {
+		return this.#getOrCreateArtifactManager() ?? (await this.#ensureEphemeralArtifactManager());
 	}
 
 	/**
@@ -8074,26 +8113,87 @@ export class SessionManager {
 
 	/**
 	 * Save artifact content under the current session and return artifact ID.
-	 * Returns an artifact ID for all sessions (file-backed for persistent, in-memory fallback otherwise).
+	 * Persistent sessions write into the session artifact directory; non-persistent
+	 * sessions write into a lazily created temporary directory so the content is
+	 * read back from the filesystem instead of being retained in memory.
 	 */
 	async saveArtifact(content: string, toolType: string): Promise<string | undefined> {
-		const manager = this.#getOrCreateArtifactManager();
-		if (manager) return manager.save(content, toolType);
-		// Non-persistent session: store in memory so spill truncation can proceed.
-		if (!this.#inMemoryArtifacts) this.#inMemoryArtifacts = new Map();
-		const id = String(this.#inMemoryArtifactCounter++);
-		this.#inMemoryArtifacts.set(id, content);
-		return id;
+		const manager = this.#getOrCreateArtifactManager() ?? (await this.#ensureEphemeralArtifactManager());
+		return manager ? manager.save(content, toolType) : undefined;
 	}
 
 	/**
 	 * Resolve an artifact ID to an on-disk path for the current session.
-	 * Returns null when missing or when the session is not persisted.
+	 * Returns null when the artifact is missing.
 	 */
 	async getArtifactPath(id: string): Promise<string | null> {
-		const manager = this.#getOrCreateArtifactManager();
+		const manager = this.getArtifactManager();
 		if (!manager) return null;
 		return manager.getPath(id);
+	}
+
+	/**
+	 * Create the non-persistent session's temporary artifact directory on first use.
+	 * Returns null when the directory cannot be created; callers then report no artifact.
+	 */
+	async #ensureEphemeralArtifactManager(): Promise<ArtifactManager | null> {
+		if (!this.#ephemeralArtifactInit) {
+			let init: Promise<ArtifactManager | null>;
+			init = fs.promises
+				.mkdtemp(path.join(os.tmpdir(), "gjc-session-artifacts-"))
+				.then(async dir => {
+					try {
+						await SessionManagerTestHooks.beforeEphemeralArtifactManagerInstall?.(dir);
+					} catch (error) {
+						await fs.promises.rm(dir, { recursive: true, force: true });
+						throw error;
+					}
+					const manager = new ArtifactManager(dir);
+					if (this.#ephemeralArtifactInit !== init) {
+						await fs.promises.rm(dir, { recursive: true, force: true });
+						return null;
+					}
+					this.#ephemeralArtifactDir = dir;
+					this.#ephemeralArtifactManager = manager;
+					return manager;
+				})
+				.catch(() => null);
+			this.#ephemeralArtifactInit = init;
+		}
+		const init = this.#ephemeralArtifactInit;
+		const manager = await init;
+		if (!manager && this.#ephemeralArtifactInit === init) this.#ephemeralArtifactInit = null;
+		return manager;
+	}
+
+	/** Unbind the active ephemeral root only after a successor transition commits. */
+	#retireEphemeralArtifacts(): void {
+		const dir = this.#ephemeralArtifactDir;
+		const init = this.#ephemeralArtifactInit;
+		if (!dir && !init) return;
+		this.#ephemeralArtifactManager = null;
+		this.#ephemeralArtifactDir = null;
+		this.#ephemeralArtifactInit = null;
+		const cleanup = (async () => {
+			const initialized = await init;
+			const cleanupDir = dir ?? initialized?.dir;
+			if (cleanupDir) await fs.promises.rm(cleanupDir, { recursive: true, force: true });
+		})();
+		void cleanup.catch(() => {});
+		this.#ephemeralArtifactCleanups.add(cleanup);
+	}
+
+	/** Retire predecessor ephemeral artifacts after an outer logical transition commits. */
+	retireEphemeralArtifactsAfterTransition(): void {
+		this.#retireEphemeralArtifacts();
+	}
+
+	async #drainEphemeralArtifactCleanups(): Promise<void> {
+		while (this.#ephemeralArtifactCleanups.size > 0) {
+			const pending = Array.from(this.#ephemeralArtifactCleanups);
+			this.#ephemeralArtifactCleanups.clear();
+			await Promise.all(pending);
+		}
 	}
 
 	/**
@@ -9810,6 +9910,7 @@ export class SessionManager {
 		);
 		manager.#applyFreshSessionMetadata(fresh);
 		manager.#commitResidentTextStoreTransition(transition);
+		manager.#retireEphemeralArtifacts();
 		if (fresh.sessionFile) writeTerminalBreadcrumb(manager.cwd, fresh.sessionFile);
 		manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
 		await manager.#rewriteFile();
@@ -9912,6 +10013,7 @@ export class SessionManager {
 			const transition = manager.#prepareFreshSessionTransition(fresh, "memory-fallback");
 			manager.#applyFreshSessionMetadata(fresh);
 			manager.#commitResidentTextStoreTransition(transition);
+			manager.#retireEphemeralArtifacts();
 			writeTerminalBreadcrumb(manager.cwd, resolved);
 			await manager.#rewriteFile();
 			manager.#flushed = true;
@@ -10103,6 +10205,7 @@ export class SessionManager {
 			);
 			manager.#applyFreshSessionMetadata(fresh);
 			manager.#commitResidentTextStoreTransition(transition);
+			manager.#retireEphemeralArtifacts();
 			manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
 			const beforeWrite = inspectResumeSessionFile(snapshot.sourcePath, snapshot.storage);
 			if ("kind" in beforeWrite) {
