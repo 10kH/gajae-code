@@ -6,6 +6,10 @@
 
 - Interactive turns now announce their state as an OSC 777 sequence (`notify;Terax;gjc;working|attention|finished`), so a hosting terminal can follow the agent without polling. Terminals that do not parse it discard it like any unknown OSC, and print/RPC mode stdout is untouched.
 
+### Added
+
+- Added a verified, copy-installable `ooo` bridge example: `ooo interview` renders Ouroboros MCP questions in GJC, serializes startup and follow-up answers by session ID, cancellation-fences late settlement, disposes state on GJC session changes and `/clear`, drops queued predecessor-generation starts, releases dead transports and controls, honors `OUROBOROS_CLI`, and loads dependency-free in compiled binaries (#3803).
+
 ### Fixed
 
 - Telegram daemon restart now revokes every persisted callback alias before polling. Reconnecting sessions must replay a pending ask to receive fresh, owner-bound aliases; old controls remain stale, and their keyboards are best-effort terminalized when the original Telegram message id is available. Shutdown now fences new session messages and drains every admitted handler before final callback persistence and ownership release, preventing a successful send racing shutdown from publishing alias state after a successor takes ownership (#3727).
