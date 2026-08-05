@@ -143,6 +143,29 @@ describe("release package evidence", () => {
 		expect(record.manifest_sha256).not.toBe(sha256(Buffer.from(`${JSON.stringify(JSON.parse(rawManifest))}\n`)));
 		validateExpectedTarball(record, tarball);
 	});
+	test("accepts exact nightly versions and exact same-version internal dependencies", () => {
+		const definition = PUBLIC_PACKAGE_DEFINITIONS.find(candidate => candidate.name === "@gajae-code/natives")!;
+		const version = "1.2.4-nightly.20260805032109.123456.2.gabcdef012345";
+		const manifest = JSON.stringify({
+			name: definition.name,
+			version,
+			optionalDependencies: { "@gajae-code/natives-linux-x64": version },
+		});
+
+		const record = packageEvidenceFromTarball(definition, fixtureTarball(manifest));
+		expect(record.version).toBe(version);
+		expect(record.internal_dependencies).toEqual({ "@gajae-code/natives-linux-x64": version });
+		const nightlyRecords = expectedFixture().records.map(candidate => ({
+			...candidate,
+			version,
+			internal_dependencies: Object.fromEntries(Object.keys(candidate.internal_dependencies).map(name => [name, version])),
+		}));
+		const expected = createExpectedEvidence({ sourceCommit: "a".repeat(40), releaseVersion: version, packages: nightlyRecords });
+		const digest = expectedEvidenceSha256(expected);
+		const observations = Object.fromEntries(expected.packages.map(candidate => [candidate.name, observation(candidate)]));
+		const final = createFinalEvidence(expected, digest, observations);
+		expect(() => verifyFinalEvidence(expected, final, digest)).not.toThrow();
+	});
 
 	test("rejects workspace, file, ranged, and stale internal dependency forms in every packed field", () => {
 		const definition = PUBLIC_PACKAGE_DEFINITIONS.find(candidate => candidate.name === "@gajae-code/natives")!;
@@ -498,6 +521,7 @@ describe("release package evidence", () => {
 			mode: "publish-from-evidence",
 			evidenceDir: "release-evidence",
 			releaseSerializationKey: "npm-release-global",
+			releaseChannel: "stable",
 		});
 		expect(() => parseReleasePublishCli(["--publish-from-evidence", "--evidence-dir", "release-evidence"])).toThrow("release-serialization-key");
 		expect(assertReleaseSerializationGuard("npm-release-global", "1.2.3")).toBeUndefined();

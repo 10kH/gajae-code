@@ -88,6 +88,18 @@ bun install -g gajae-code
 
 The scoped package is also available as `@gajae-code/coding-agent`.
 
+### Nightly channel
+
+A verified nightly prerelease is published from `main` at 04:23 UTC and can also be started manually with the **nightly-release** CI dispatch. Nightly runs execute the complete main verification graph, build every supported native addon and standalone binary, publish the exact package set under the npm `nightly` dist-tag, and create a matching GitHub prerelease with package evidence. They do not move npm `latest`, rewrite `main`, or consume the `[Unreleased]` changelog sections.
+
+```sh
+bun install -g gajae-code@nightly
+gjc --version
+gjc --smoke-test
+```
+
+Install without `@nightly` to return to the stable channel.
+
 ### Shell completion
 
 GJC can generate a Fig/withfig-compatible spec for [Microsoft inshellisense](https://github.com/microsoft/inshellisense):
