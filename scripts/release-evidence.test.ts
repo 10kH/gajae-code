@@ -39,8 +39,11 @@ import {
 } from "./release-evidence";
 import {
 	downloadNpmRegistryTarball,
+	assertReleaseSourceBinding,
+	createReleaseChannelEvidence,
 	publishRetainedPackage,
 	assertReleaseSerializationGuard,
+	RELEASE_CHANNEL_EVIDENCE_FILE,
 	parseReleasePublishCli,
 	reobserveExpectedEvidencePackages,
 
@@ -145,7 +148,7 @@ describe("release package evidence", () => {
 	});
 	test("accepts exact nightly versions and exact same-version internal dependencies", () => {
 		const definition = PUBLIC_PACKAGE_DEFINITIONS.find(candidate => candidate.name === "@gajae-code/natives")!;
-		const version = "1.2.4-nightly.20260805032109.123456.2.gabcdef012345";
+		const version = "1.2.4-nightly.20260805032109.123456.gabcdef012345";
 		const manifest = JSON.stringify({
 			name: definition.name,
 			version,
@@ -337,7 +340,7 @@ describe("release package evidence", () => {
 	});
 	test("resumes only the exact nightly dist-tag observation", async () => {
 		const definition = PUBLIC_PACKAGE_DEFINITIONS[0]!;
-		const version = "1.2.4-nightly.20260805042300.123456.1.gabcdef012345";
+		const version = "1.2.4-nightly.20260805042300.123456.gabcdef012345";
 		const tarball = canonicalizePackageTarball(fixtureTarball(`{"name":"${definition.name}","version":"${version}","dependencies":{}}\n`));
 		const record = packageEvidenceFromTarball(definition, tarball);
 		const exact = observation(record);
@@ -350,7 +353,7 @@ describe("release package evidence", () => {
 		await expect(publishRetainedPackage(record, "retained.tgz", operations, "nightly")).resolves.toEqual(exact);
 		await expect(publishRetainedPackage(record, "retained.tgz", {
 			...operations,
-			observe: async () => ({ ...exact, registry_latest_version: "1.2.4-nightly.20260806042300.123457.1.gabcdef012345" }),
+			observe: async () => ({ ...exact, registry_latest_version: "1.2.4-nightly.20260806042300.123457.gabcdef012345" }),
 		}, "nightly")).rejects.toThrow("conflicts with immutable expected evidence");
 	});
 	test("recovers only an exact concurrent publication and reports an absent publish failure", async () => {
@@ -544,6 +547,38 @@ describe("release package evidence", () => {
 		expect(() => parseReleasePublishCli(["--publish-from-evidence", "--evidence-dir", "release-evidence"])).toThrow("release-serialization-key");
 		expect(assertReleaseSerializationGuard("npm-release-global", "1.2.3")).toBeUndefined();
 		expect(() => assertReleaseSerializationGuard("npm-release-1.2.3", "1.2.3")).toThrow("must not be scoped");
+	});
+	test("binds evidence to source and records protected latest-tag invariants", () => {
+		const source = "a".repeat(40);
+		const nightlyVersion = "1.2.4-nightly.20260805042300.123456.gaaaaaaaaaaaa";
+		const before = PUBLIC_PACKAGE_DEFINITIONS.map(definition => ({ name: definition.name, version: "1.2.3" }));
+		const unchanged = before.map(record => ({ ...record }));
+		const advanced = before.map(record => ({ ...record, version: "1.2.4" }));
+
+		expect(RELEASE_CHANNEL_EVIDENCE_FILE).toBe("gajae-release-channel-v1.json");
+		expect(() => assertReleaseSourceBinding(nightlyVersion, "nightly", source, source)).not.toThrow();
+		expect(() => assertReleaseSourceBinding(nightlyVersion, "nightly", source, "b".repeat(40))).toThrow("does not match checked-out source");
+		expect(createReleaseChannelEvidence({
+			sourceCommit: source,
+			releaseVersion: nightlyVersion,
+			releaseChannel: "nightly",
+			before,
+			after: unchanged,
+		}).invariant).toBe("unchanged");
+		expect(() => createReleaseChannelEvidence({
+			sourceCommit: source,
+			releaseVersion: nightlyVersion,
+			releaseChannel: "nightly",
+			before,
+			after: advanced,
+		})).toThrow("changed protected npm latest");
+		expect(createReleaseChannelEvidence({
+			sourceCommit: source,
+			releaseVersion: "1.2.4",
+			releaseChannel: "stable",
+			before,
+			after: advanced,
+		}).invariant).toBe("advanced-to-release-version");
 	});
 
 	test("emits deterministic canonical source-native expected and final golden evidence", () => {

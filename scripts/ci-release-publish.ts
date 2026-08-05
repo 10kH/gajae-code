@@ -34,6 +34,7 @@ import {
 	compareStableVersions,
 	nightlyVersionPattern,
 	stableVersionPattern,
+	canonicalJsonBytes,
 	canonicalizePackageTarball,
 	classifyRegistryObservation,
 	createExpectedEvidence,
@@ -81,6 +82,7 @@ let isDryRun = false;
 export const NPM_REGISTRY_URL = "https://registry.npmjs.org/";
 export const NPM_RELEASE_TAG = "latest";
 export const NPM_NIGHTLY_TAG = "nightly";
+export const RELEASE_CHANNEL_EVIDENCE_FILE = "gajae-release-channel-v1.json";
 export type ReleaseChannel = "stable" | "nightly";
 
 interface ReleasePolicy {
@@ -100,7 +102,23 @@ function releasePolicy(channel: ReleaseChannel): ReleasePolicy {
 
 function assertReleaseVersionForChannel(version: string, channel: ReleaseChannel): void {
 	const matches = channel === "nightly" ? nightlyVersionPattern.test(version) : stableVersionPattern.test(version);
-	if (!matches) throw new Error(`${channel} release requires an exact ${channel === "nightly" ? "X.Y.Z-nightly.<utc>.<run>.<attempt>.g<sha>" : "X.Y.Z"} version, received ${version}`);
+	if (!matches) throw new Error(`${channel} release requires an exact ${channel === "nightly" ? "X.Y.Z-nightly.<utc>.<run>.g<sha>" : "X.Y.Z"} version, received ${version}`);
+}
+export function assertReleaseSourceBinding(
+	version: string,
+	channel: ReleaseChannel,
+	evidenceSourceCommit: string,
+	checkedOutSourceCommit: string,
+): void {
+	if (!/^[0-9a-f]{40}$/u.test(evidenceSourceCommit) || !/^[0-9a-f]{40}$/u.test(checkedOutSourceCommit)) {
+		throw new Error("Release source binding requires exact lowercase commit SHAs");
+	}
+	if (evidenceSourceCommit !== checkedOutSourceCommit) {
+		throw new Error(`Release evidence source ${evidenceSourceCommit} does not match checked-out source ${checkedOutSourceCommit}`);
+	}
+	if (channel === "nightly" && !version.endsWith(`.g${checkedOutSourceCommit.slice(0, 12)}`)) {
+		throw new Error(`Nightly release version ${version} is not bound to checked-out source ${checkedOutSourceCommit}`);
+	}
 }
 
 export type ReleasePublishCli =
@@ -572,8 +590,10 @@ async function prepareExpectedEvidence(evidenceDirectory: string, releaseChannel
 	}
 	if (releaseVersion === undefined) throw new Error("No public packages were prepared for release evidence");
 	assertReleaseVersionForChannel(releaseVersion, releaseChannel);
+	const commit = await sourceCommit();
+	assertReleaseSourceBinding(releaseVersion, releaseChannel, commit, commit);
 	const expected = createExpectedEvidence({
-		sourceCommit: await sourceCommit(),
+		sourceCommit: commit,
 		releaseVersion,
 		packages: packageRecords.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0),
 	});
@@ -591,6 +611,94 @@ async function prepareExpectedEvidence(evidenceDirectory: string, releaseChannel
 
 function isMissingRegistryPackage(output: string): boolean {
 	return /\bE404\b|404 Not Found|is not in this registry/iu.test(output);
+}
+export interface RegistryTagSnapshotRecord {
+	name: string;
+	version: string | null;
+}
+
+export interface ReleaseChannelEvidence {
+	schema_version: 1;
+	source_commit: string;
+	release_version: string;
+	release_channel: ReleaseChannel;
+	published_dist_tag: typeof NPM_RELEASE_TAG | typeof NPM_NIGHTLY_TAG;
+	protected_dist_tag: typeof NPM_RELEASE_TAG;
+	protected_before: RegistryTagSnapshotRecord[];
+	protected_after: RegistryTagSnapshotRecord[];
+	invariant: "advanced-to-release-version" | "unchanged";
+}
+
+function validateRegistryTagSnapshot(snapshot: readonly RegistryTagSnapshotRecord[], label: string): RegistryTagSnapshotRecord[] {
+	const expectedNames = PUBLIC_PACKAGE_DEFINITIONS.map(definition => definition.name);
+	if (snapshot.length !== expectedNames.length || snapshot.some((record, index) => record.name !== expectedNames[index])) {
+		throw new Error(`${label} must contain the complete public package set sorted by name`);
+	}
+	for (const record of snapshot) {
+		if (record.version !== null && !stableVersionPattern.test(record.version)) {
+			throw new Error(`${label} ${record.name} must resolve ${NPM_RELEASE_TAG} to stable X.Y.Z or be absent`);
+		}
+	}
+	return snapshot.map(record => ({ ...record }));
+}
+
+export function createReleaseChannelEvidence(input: {
+	sourceCommit: string;
+	releaseVersion: string;
+	releaseChannel: ReleaseChannel;
+	before: readonly RegistryTagSnapshotRecord[];
+	after: readonly RegistryTagSnapshotRecord[];
+}): ReleaseChannelEvidence {
+	assertReleaseSourceBinding(input.releaseVersion, input.releaseChannel, input.sourceCommit, input.sourceCommit);
+	const before = validateRegistryTagSnapshot(input.before, "protected tag snapshot before publication");
+	const after = validateRegistryTagSnapshot(input.after, "protected tag snapshot after publication");
+	if (input.releaseChannel === "nightly") {
+		if (JSON.stringify(before) !== JSON.stringify(after)) {
+			throw new Error(`Nightly publication changed protected npm ${NPM_RELEASE_TAG}`);
+		}
+	} else if (after.some(record => record.version !== input.releaseVersion)) {
+		throw new Error(`Stable publication did not advance every npm ${NPM_RELEASE_TAG} tag to ${input.releaseVersion}`);
+	}
+	return {
+		schema_version: 1,
+		source_commit: input.sourceCommit,
+		release_version: input.releaseVersion,
+		release_channel: input.releaseChannel,
+		published_dist_tag: releasePolicy(input.releaseChannel).npmTag,
+		protected_dist_tag: NPM_RELEASE_TAG,
+		protected_before: before,
+		protected_after: after,
+		invariant: input.releaseChannel === "nightly" ? "unchanged" : "advanced-to-release-version",
+	};
+}
+
+async function observeRegistryTagSnapshot(
+	records: readonly PackageEvidenceRecord[],
+	npmTag: typeof NPM_RELEASE_TAG,
+): Promise<RegistryTagSnapshotRecord[]> {
+	const snapshot: RegistryTagSnapshotRecord[] = [];
+	for (const record of records) {
+		const view = await $`npm view ${`${record.name}@${npmTag}`} version --json --registry=${NPM_REGISTRY_URL} --tag=${npmTag}`.quiet().nothrow();
+		const output = outputOf(view);
+		if (view.exitCode !== 0) {
+			if (isMissingRegistryPackage(output)) {
+				snapshot.push({ name: record.name, version: null });
+				continue;
+			}
+			throw new Error(`npm view failed for protected ${npmTag} ${record.name}: ${output || `exit ${view.exitCode ?? "unknown"}`}`);
+		}
+		let version: unknown;
+		try {
+			version = JSON.parse(view.stdout.toString()) as unknown;
+		} catch {
+			throw new Error(`npm view returned invalid protected ${npmTag} JSON for ${record.name}`);
+		}
+		if (typeof version !== "string" || !stableVersionPattern.test(version)) {
+			throw new Error(`npm view returned non-stable protected ${npmTag} version for ${record.name}`);
+		}
+		snapshot.push({ name: record.name, version });
+	}
+	return snapshot;
 }
 
 function parseRegistryDist(value: unknown, packageName: string): { integrity: string; tarball: string } {
@@ -1008,6 +1116,9 @@ async function publishFromExpectedEvidence(evidenceDirectory: string, releaseSer
 	const expectedPath = path.join(evidenceDirectory, EXPECTED_EVIDENCE_FILE);
 	const expectedAsset = await readExpectedEvidenceFile(expectedPath);
 	assertReleaseVersionForChannel(expectedAsset.value.release_version, releaseChannel);
+	const checkedOutCommit = await sourceCommit();
+	assertReleaseSourceBinding(expectedAsset.value.release_version, releaseChannel, expectedAsset.value.source_commit, checkedOutCommit);
+	const protectedBefore = await observeRegistryTagSnapshot(expectedAsset.value.packages, NPM_RELEASE_TAG);
 	const policy = releasePolicy(releaseChannel);
 	assertReleaseSerializationGuard(releaseSerializationKey, expectedAsset.value.release_version);
 	await publishExpectedEvidencePackages(expectedAsset.value.packages, async (record) => {
@@ -1018,9 +1129,19 @@ async function publishFromExpectedEvidence(evidenceDirectory: string, releaseSer
 		const tarballPath = path.join(evidenceDirectory, "tarballs", `${record.tarball_sha512}.tgz`);
 		return observeRegistryPackage(record, await readRetainedTarball(record, tarballPath), policy);
 	}, releaseChannel);
+	const protectedAfter = await observeRegistryTagSnapshot(expectedAsset.value.packages, NPM_RELEASE_TAG);
+	const channelEvidence = createReleaseChannelEvidence({
+		sourceCommit: checkedOutCommit,
+		releaseVersion: expectedAsset.value.release_version,
+		releaseChannel,
+		before: protectedBefore,
+		after: protectedAfter,
+	});
 	const final = createFinalEvidence(expectedAsset.value, expectedAsset.sha256, observations);
 	const finalPath = path.join(evidenceDirectory, FINAL_EVIDENCE_FILE);
 	const finalDigest = await writeImmutableEvidence(finalPath, final);
+	const channelEvidencePath = path.join(evidenceDirectory, RELEASE_CHANNEL_EVIDENCE_FILE);
+	const channelEvidenceDigest = await writeImmutableBytes(channelEvidencePath, canonicalJsonBytes(channelEvidence));
 	console.log(JSON.stringify({
 		ok: true,
 		phase: "final-evidence",
@@ -1029,6 +1150,8 @@ async function publishFromExpectedEvidence(evidenceDirectory: string, releaseSer
 		final_evidence: finalPath,
 		final_evidence_sha256: finalDigest,
 		verified_packages: final.packages.length,
+		channel_evidence: channelEvidencePath,
+		channel_evidence_sha256: channelEvidenceDigest,
 	}));
 }
 

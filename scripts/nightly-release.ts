@@ -61,12 +61,10 @@ export function deriveNightlyVersion(
 	stableVersions: readonly string[],
 	timestamp: Date,
 	runId: string,
-	runAttempt: string,
 	sourceSha: string,
 ): string {
 	if (stableVersions.length === 0) throw new Error("Cannot derive a nightly version without public package versions");
 	assertPositiveInteger(runId, "Run id");
-	assertPositiveInteger(runAttempt, "Run attempt");
 	assertSourceSha(sourceSha);
 
 	const parsed = stableVersions.map(parseStableVersion);
@@ -78,7 +76,7 @@ export function deriveNightlyVersion(
 		compareNumericIdentifier(candidate, highest) > 0 ? candidate : highest,
 	);
 	const nextPatch = (BigInt(highestPatch) + 1n).toString();
-	return `${major}.${minor}.${nextPatch}-nightly.${utcIdentifier(timestamp)}.${runId}.${runAttempt}.g${sourceSha.slice(0, 12)}`;
+	return `${major}.${minor}.${nextPatch}-nightly.${utcIdentifier(timestamp)}.${runId}.g${sourceSha.slice(0, 12)}`;
 }
 
 function replaceSingle(text: string, pattern: RegExp, replacement: string, label: string): string {
@@ -124,10 +122,9 @@ export async function deriveNightlyVersionFromRepo(
 	repoRoot: string,
 	timestamp: Date,
 	runId: string,
-	runAttempt: string,
 	sourceSha: string,
 ): Promise<string> {
-	return deriveNightlyVersion(await publicPackageVersions(repoRoot), timestamp, runId, runAttempt, sourceSha);
+	return deriveNightlyVersion(await publicPackageVersions(repoRoot), timestamp, runId, sourceSha);
 }
 
 async function workspaceVersionedCrates(repoRoot: string): Promise<string[]> {
@@ -231,13 +228,12 @@ async function main(): Promise<void> {
 	const [mode, ...argv] = process.argv.slice(2);
 	const repoRoot = path.join(import.meta.dir, "..");
 	if (mode === "version") {
-		const values = namedArguments(argv, ["--timestamp", "--run-id", "--run-attempt", "--source-sha"]);
+		const values = namedArguments(argv, ["--timestamp", "--run-id", "--source-sha"]);
 		await assertCheckedOutSourceSha(repoRoot, values["--source-sha"]!);
 		const version = await deriveNightlyVersionFromRepo(
 			repoRoot,
 			new Date(values["--timestamp"]!),
 			values["--run-id"]!,
-			values["--run-attempt"]!,
 			values["--source-sha"]!,
 		);
 		process.stdout.write(`${version}\n`);
@@ -250,7 +246,7 @@ async function main(): Promise<void> {
 		console.log(JSON.stringify({ ok: true, version: values["--version"], changedPaths }));
 		return;
 	}
-	throw new Error("Use version --timestamp <iso> --run-id <id> --run-attempt <attempt> --source-sha <sha>, or stage --version <version> --source-sha <sha>");
+	throw new Error("Use version --timestamp <iso> --run-id <id> --source-sha <sha>, or stage --version <version> --source-sha <sha>");
 }
 
 if (import.meta.main) {

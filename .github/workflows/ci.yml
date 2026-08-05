@@ -23,9 +23,9 @@ permissions:
    contents: read
 
 concurrency:
-   # Stable tags never cancel. Scheduled/manual nightly runs share one cross-run
-   # publication lane so the npm nightly dist-tag cannot move out of order.
-   group: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release')) && 'gajae-nightly-release' || format('ci-{0}-{1}', github.ref, github.event_name == 'workflow_dispatch' && inputs.rehearsal || 'event') }}
+   # Real stable and nightly publication share one non-cancelling cross-channel
+   # lane so npm dist-tags and closed evidence cannot race each other.
+   group: ${{ (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release')) && 'gajae-npm-release' || format('ci-{0}-{1}', github.ref, github.event_name == 'workflow_dispatch' && inputs.rehearsal || 'event') }}
    cancel-in-progress: ${{ !(startsWith(github.ref, 'refs/tags/v') || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release')) }}
 
 jobs:
@@ -50,7 +50,6 @@ jobs:
               IS_NIGHTLY: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release')) && '1' || '0' }}
               SOURCE_SHA: ${{ github.sha }}
               RUN_ID: ${{ github.run_id }}
-              RUN_ATTEMPT: ${{ github.run_attempt }}
            run: |
               set -euo pipefail
               if [ "$IS_NIGHTLY" = 1 ]; then
@@ -58,8 +57,8 @@ jobs:
                     echo "Nightly releases must run from refs/heads/main, not $GITHUB_REF" >&2
                     exit 1
                  fi
-                 timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-                 version="$(bun scripts/nightly-release.ts version --timestamp "$timestamp" --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" --source-sha "$SOURCE_SHA")"
+                 timestamp="$(git show -s --format=%cI "$SOURCE_SHA")"
+                 version="$(bun scripts/nightly-release.ts version --timestamp "$timestamp" --run-id "$RUN_ID" --source-sha "$SOURCE_SHA")"
                  {
                     echo "channel=nightly"
                     echo "version=$version"
@@ -67,9 +66,19 @@ jobs:
                     echo "tag_name=v$version"
                  } >> "$GITHUB_OUTPUT"
               elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+                 version="${GITHUB_REF_NAME#v}"
+                 if ! [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+                    echo "Stable release tag must be exact vX.Y.Z, received $GITHUB_REF_NAME" >&2
+                    exit 1
+                 fi
+                 manifest_version="$(bun -e 'const manifest = await Bun.file("packages/coding-agent/package.json").json(); process.stdout.write(manifest.version)')"
+                 if [ "$manifest_version" != "$version" ]; then
+                    echo "Stable release tag $GITHUB_REF_NAME does not match package version $manifest_version" >&2
+                    exit 1
+                 fi
                  {
                     echo "channel=stable"
-                    echo "version=${GITHUB_REF_NAME#v}"
+                    echo "version=$version"
                     echo "nightly_version="
                     echo "tag_name=$GITHUB_REF_NAME"
                  } >> "$GITHUB_OUTPUT"
@@ -485,6 +494,44 @@ jobs:
               pattern: pi-natives-*
               path: packages/natives/native
               merge-multiple: true
+         - name: Prepare immutable package evidence
+           env:
+              RELEASE_CHANNEL: ${{ needs.release_metadata.outputs.channel }}
+           run: |
+              set -euo pipefail
+              evidence_dir="$RUNNER_TEMP/release-evidence"
+              rm -rf "$evidence_dir"
+              bun scripts/ci-release-publish.ts --prepare-evidence --evidence-dir "$evidence_dir" --release-channel "$RELEASE_CHANNEL"
+         - name: Persist pre-publication package evidence
+           uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+           with:
+              name: release-evidence-${{ needs.release_metadata.outputs.version }}
+              path: ${{ runner.temp }}/release-evidence
+              if-no-files-found: error
+              retention-days: 30
+              overwrite: true
+         - name: Reject pre-existing nightly tag or release
+           if: ${{ needs.release_metadata.outputs.channel == 'nightly' }}
+           env:
+              GH_TOKEN: ${{ github.token }}
+              TAG_NAME: ${{ needs.release_metadata.outputs.tag_name }}
+           shell: bash
+           run: |
+              set -euo pipefail
+              remote_tags="$(git ls-remote --tags origin "refs/tags/$TAG_NAME" "refs/tags/$TAG_NAME^{}")"
+              if [ -n "$remote_tags" ]; then
+                 echo "Nightly tag $TAG_NAME already exists; refusing release upsert" >&2
+                 exit 1
+              fi
+              status="$(curl --silent --show-error --output "$RUNNER_TEMP/nightly-release-preflight.json" --write-out '%{http_code}' \
+                 --header "Authorization: Bearer $GH_TOKEN" \
+                 --header "Accept: application/vnd.github+json" \
+                 "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$TAG_NAME")"
+              case "$status" in
+                 404) ;;
+                 200) echo "Nightly release $TAG_NAME already exists; refusing release upsert" >&2; exit 1 ;;
+                 *) echo "Cannot verify nightly release absence: GitHub API returned HTTP $status" >&2; exit 1 ;;
+              esac
          - name: Publish packages to npm
            env:
               NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -493,8 +540,6 @@ jobs:
            run: |
               set -euo pipefail
               evidence_dir="$RUNNER_TEMP/release-evidence"
-              mkdir -p "$evidence_dir"
-              bun scripts/ci-release-publish.ts --prepare-evidence --evidence-dir "$evidence_dir" --release-channel "$RELEASE_CHANNEL"
               npm_config="$(mktemp "$RUNNER_TEMP/npmrc.XXXXXX")"
               trap 'rm -f "$npm_config"' EXIT
               printf "//registry.npmjs.org/:_authToken=%s\n" "$NPM_TOKEN" > "$npm_config"
@@ -524,7 +569,37 @@ jobs:
               prerelease: ${{ needs.release_metadata.outputs.channel == 'nightly' }}
               make_latest: ${{ needs.release_metadata.outputs.channel != 'nightly' }}
               generate_release_notes: true
+              fail_on_unmatched_files: true
               files: |
                  release-binaries/gjc-*
                  ${{ runner.temp }}/release-evidence/gajae-release-packages-expected-v1.json
                  ${{ runner.temp }}/release-evidence/gajae-release-packages-v1.json
+                 ${{ runner.temp }}/release-evidence/gajae-release-channel-v1.json
+         - name: Verify immutable GitHub Release
+           env:
+              GH_TOKEN: ${{ github.token }}
+              TAG_NAME: ${{ needs.release_metadata.outputs.tag_name }}
+              EXPECTED_PRERELEASE: ${{ needs.release_metadata.outputs.channel == 'nightly' && 'true' || 'false' }}
+              SOURCE_SHA: ${{ github.sha }}
+           shell: bash
+           run: |
+              set -euo pipefail
+              git fetch --force origin "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME"
+              resolved="$(git rev-parse "$TAG_NAME^{commit}")"
+              test "$resolved" = "$SOURCE_SHA" || { echo "Release tag $TAG_NAME resolves to $resolved, expected $SOURCE_SHA" >&2; exit 1; }
+              release_json="$RUNNER_TEMP/release-final.json"
+              gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG_NAME" > "$release_json"
+              RELEASE_JSON="$release_json" bun -e '
+                 const release = await Bun.file(Bun.env.RELEASE_JSON).json();
+                 const expectedPrerelease = Bun.env.EXPECTED_PRERELEASE === "true";
+                 if (release.tag_name !== Bun.env.TAG_NAME || release.draft !== false || release.prerelease !== expectedPrerelease) {
+                    throw new Error("GitHub Release identity/state does not match the requested release");
+                 }
+                 const expectedAssets = [
+                    "gjc-linux-x64", "gjc-linux-arm64", "gjc-darwin-arm64", "gjc-darwin-x64", "gjc-windows-x64.exe",
+                    "gajae-release-packages-expected-v1.json", "gajae-release-packages-v1.json", "gajae-release-channel-v1.json",
+                 ];
+                 const assets = new Set(release.assets.map(asset => asset.name));
+                 const missing = expectedAssets.filter(name => !assets.has(name));
+                 if (missing.length > 0) throw new Error("GitHub Release is missing assets: " + missing.join(", "));
+              '

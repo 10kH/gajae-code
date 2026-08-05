@@ -482,12 +482,16 @@ describe("native release binary coverage", () => {
 		expect(publish).toContain("--publish-from-evidence");
 		expect(publish).toContain("gajae-production-release");
 		expect(publish).toContain("gajae-nightly-release");
+		expect(publish).toContain("Persist pre-publication package evidence");
 		expect(publish).toContain("NPM_TOKEN: ${{ secrets.NPM_TOKEN }}");
 
 		expect(publish).toContain("softprops/action-gh-release");
 		expect(publish).toContain("draft: false");
 		expect(publish).toContain("release-binaries/gjc-*");
 		expect(publish).toContain("gajae-release-packages-v1.json");
+		expect(publish).toContain("gajae-release-channel-v1.json");
+		expect(publish).toContain("fail_on_unmatched_files: true");
+		expect(publish).toContain("Verify immutable GitHub Release");
 
 		// The paranoid multi-job evidence/verify chain is gone.
 		for (const removed of [

@@ -52,7 +52,7 @@ describe("stable release policy", () => {
 		const ci = await workflow();
 		const concurrency = ci.slice(ci.indexOf("concurrency:\n"), ci.indexOf("\njobs:"));
 
-		expect(concurrency).toContain("gajae-nightly-release");
+		expect(concurrency).toContain("gajae-npm-release");
 		expect(concurrency).toContain("startsWith(github.ref, 'refs/tags/v')");
 		expect(concurrency).toContain("inputs.rehearsal == 'nightly-release'");
 		expect(concurrency).not.toContain("cancel-in-progress: true");
@@ -159,7 +159,9 @@ describe("stable release policy", () => {
 		expect(jobSection(ci, "test")).toContain("inputs.rehearsal == 'nightly-release'");
 		expect(metadata).toContain("bun scripts/nightly-release.ts version");
 		expect(metadata).toContain('GITHUB_REF" != refs/heads/main');
-		expect(metadata).toContain("github.run_attempt");
+		expect(metadata).toContain("git show -s --format=%cI");
+		expect(metadata).toContain("Stable release tag must be exact vX.Y.Z");
+		expect(metadata).toContain("does not match package version");
 		expect(gate).toContain("needs: [check, test]");
 		expect(gate).toContain("needs.check.result");
 		expect(gate).toContain("needs.test.result");
@@ -169,11 +171,18 @@ describe("stable release policy", () => {
 		expect(binaries).toContain("Stage nightly release version");
 		expect(publish).toContain("needs.nightly_gate.result == 'success'");
 		expect(publish).toContain("--release-channel \"$RELEASE_CHANNEL\"");
+		expect(publish).toContain("Persist pre-publication package evidence");
+		expect(publish).toContain("release-evidence-${{ needs.release_metadata.outputs.version }}");
+		expect(publish).toContain("Reject pre-existing nightly tag or release");
+		expect(publish).toContain("fail_on_unmatched_files: true");
+		expect(publish).toContain("Verify immutable GitHub Release");
+		expect(publish.indexOf("Reject pre-existing nightly tag or release")).toBeLessThan(publish.indexOf("Publish packages to npm"));
 		expect(publish).toContain("gajae-nightly-release");
 		expect(publish).toContain("prerelease: ${{ needs.release_metadata.outputs.channel == 'nightly' }}");
 		expect(publish).toContain("make_latest: ${{ needs.release_metadata.outputs.channel != 'nightly' }}");
 		expect(publish).toContain("gajae-release-packages-expected-v1.json");
 		expect(publish).toContain("gajae-release-packages-v1.json");
+		expect(publish).toContain("gajae-release-channel-v1.json");
 	});
 	test("rejects reused or moved tags and directs corrections to a newer stable version", async () => {
 		const releaseScript = await Bun.file(releaseScriptPath).text();

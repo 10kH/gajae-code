@@ -7,7 +7,7 @@ import { PUBLIC_PACKAGE_DEFINITIONS } from "./release-evidence";
 
 const temporaryRoots: string[] = [];
 const sourceSha = "abcdef0123456789abcdef0123456789abcdef01";
-const nightlyVersion = "1.2.4-nightly.20260805032109.123456.2.gabcdef012345";
+const nightlyVersion = "1.2.4-nightly.20260805032109.123456.gabcdef012345";
 
 async function fixture(): Promise<string> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-nightly-release-"));
@@ -50,23 +50,22 @@ afterAll(async () => {
 });
 
 describe("nightly release versioning", () => {
-	test("derives the next patch with immutable UTC, run, attempt, and source identity", () => {
+	test("derives the next patch with immutable UTC, run, and source identity", () => {
 		const version = deriveNightlyVersion(
 			["1.2.3", "1.2.8", "1.2.7"],
 			new Date("2026-08-05T03:21:09.999Z"),
 			"123456",
-			"2",
 			sourceSha,
 		);
 
-		expect(version).toBe("1.2.9-nightly.20260805032109.123456.2.gabcdef012345");
+		expect(version).toBe("1.2.9-nightly.20260805032109.123456.gabcdef012345");
 		expect(NIGHTLY_VERSION_PATTERN.test(version)).toBe(true);
 	});
 
 	test("rejects mixed stable lines and malformed run identity", () => {
-		expect(() => deriveNightlyVersion(["1.2.3", "1.3.0"], new Date(), "1", "1", sourceSha)).toThrow("major/minor");
-		expect(() => deriveNightlyVersion(["1.2.3"], new Date(), "01", "1", sourceSha)).toThrow("Run id");
-		expect(() => deriveNightlyVersion(["1.2.3"], new Date(), "1", "1", "A".repeat(40))).toThrow("lowercase hexadecimal");
+		expect(() => deriveNightlyVersion(["1.2.3", "1.3.0"], new Date(), "1", sourceSha)).toThrow("major/minor");
+		expect(() => deriveNightlyVersion(["1.2.3"], new Date(), "01", sourceSha)).toThrow("Run id");
+		expect(() => deriveNightlyVersion(["1.2.3"], new Date(), "1", "A".repeat(40))).toThrow("lowercase hexadecimal");
 	});
 
 	test("stages every public package, catalog edge, Cargo version, lock entry, and native sentinel", async () => {
@@ -87,7 +86,7 @@ describe("nightly release versioning", () => {
 		}
 		expect(await Bun.file(path.join(root, "Cargo.toml")).text()).toContain(`version = "${nightlyVersion}"`);
 		expect((await Bun.file(path.join(root, "Cargo.lock")).text()).match(new RegExp(nightlyVersion.replaceAll(".", "\\."), "gu"))).toHaveLength(5);
-		const sentinel = "__piNativesV1_2_4_nightly_20260805032109_123456_2_gabcdef012345";
+		const sentinel = "__piNativesV1_2_4_nightly_20260805032109_123456_gabcdef012345";
 		for (const relativePath of ["crates/pi-natives/src/lib.rs", "packages/natives/native/index.d.ts", "packages/natives/native/index.js"]) {
 			expect(await Bun.file(path.join(root, relativePath)).text()).toContain(sentinel);
 		}

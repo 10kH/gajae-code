@@ -43,7 +43,7 @@ export const PUBLIC_PACKAGE_DEFINITIONS: readonly PublicPackageDefinition[] = [
 const dependencyFieldNames = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] as const;
 const publicPackageByName = new Map(PUBLIC_PACKAGE_DEFINITIONS.map(definition => [definition.name, definition]));
 export const stableVersionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u;
-export const nightlyVersionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-nightly\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.g[0-9a-f]{12}$/u;
+export const nightlyVersionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-nightly\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.g[0-9a-f]{12}$/u;
 const releaseVersionPattern = new RegExp(`(?:${stableVersionPattern.source})|(?:${nightlyVersionPattern.source})`, "u");
 const sha256Pattern = /^[0-9a-f]{64}$/u;
 const sha512Pattern = /^[0-9a-f]{128}$/u;
