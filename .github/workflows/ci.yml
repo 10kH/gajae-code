@@ -518,13 +518,18 @@ jobs:
            shell: bash
            run: |
               set -euo pipefail
-              remote_tags="$(git ls-remote --tags origin "refs/tags/$TAG_NAME" "refs/tags/$TAG_NAME^{}")"
-              if [ -n "$remote_tags" ]; then
-                 peeled="$(printf '%s' "$remote_tags" | awk '{print $1}')"
-                 # A same-run retry may legitimately encounter the tag this run already pushed.
-                 # Accept it only if it peels to exactly this run's source commit.
+              # Reject any pre-existing tag that does not peel to this run's source.
+              # Lightweight tags report the commit directly; annotated tags require
+              # the peeled ^{} ref. ls-remote --tags emits both lines; we match the
+              # peeled line when present and fall back to the direct ref otherwise.
+              raw_remote="$(git ls-remote --tags origin "refs/tags/$TAG_NAME" "refs/tags/$TAG_NAME^{}")"
+              if [ -n "$raw_remote" ]; then
+                 peeled="$(printf '%s\n' "$raw_remote" | awk -F '\t' '$2 ~ /\^\{\}$/ { print $1; exit }')"
+                 if [ -z "$peeled" ]; then
+                    peeled="$(printf '%s\n' "$raw_remote" | awk -F '\t' '$2 !~ /\^\{\}$/ { print $1; exit }')"
+                 fi
                  if [ "$peeled" != "$SOURCE_SHA" ]; then
-                    echo "Release tag $TAG_NAME already exists and does not peel to $SOURCE_SHA; refusing upsert" >&2
+                    echo "Release tag $TAG_NAME already exists and peels to ${peeled:-<empty>}, not $SOURCE_SHA; refusing upsert" >&2
                     exit 1
                  fi
               fi
@@ -534,17 +539,7 @@ jobs:
                  "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$TAG_NAME")"
               case "$status" in
                  404) ;;
-                 200)
-                    existing_sha="$(RELEASE_JSON="$RUNNER_TEMP/release-preflight.json" bun -e '
-                       const release = await Bun.file(Bun.env.RELEASE_JSON).json();
-                       const sha = release.target_commitish;
-                       process.stdout.write(typeof sha === "string" ? sha : "");
-                    ')"
-                    if [ "$existing_sha" != "$SOURCE_SHA" ]; then
-                       echo "Release $TAG_NAME already exists targeting $existing_sha, expected $SOURCE_SHA; refusing upsert" >&2
-                       exit 1
-                    fi
-                    ;;
+                 200) echo "Release $TAG_NAME already exists; refusing upsert" >&2; exit 1 ;;
                  *) echo "Cannot verify release absence: GitHub API returned HTTP $status" >&2; exit 1 ;;
               esac
          - name: Publish packages to npm

@@ -174,6 +174,9 @@ describe("stable release policy", () => {
 		expect(publish).toContain("Persist pre-publication package evidence");
 		expect(publish).toContain("release-evidence-${{ needs.release_metadata.outputs.version }}");
 		expect(publish).toContain("Reject pre-existing release tag or release");
+		expect(publish).toContain("refusing upsert");
+		expect(publish).toContain("$2 ~ /\\^\\{\\}$/");
+		expect(publish).not.toContain("same-run retry");
 		expect(publish).toContain("fail_on_unmatched_files: true");
 		expect(publish).toContain("Verify immutable GitHub Release");
 		expect(publish.indexOf("Reject pre-existing release tag or release")).toBeLessThan(publish.indexOf("Publish packages to npm"));
