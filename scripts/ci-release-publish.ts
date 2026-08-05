@@ -32,6 +32,8 @@ import {
 	assertExactInternalReleaseDependencies,
 	assertMonotonicLatestVersion,
 	compareStableVersions,
+	nightlyVersionPattern,
+	stableVersionPattern,
 	canonicalizePackageTarball,
 	classifyRegistryObservation,
 	createExpectedEvidence,
@@ -89,8 +91,6 @@ interface ReleasePolicy {
 const npmRegistryOrigin = new URL(NPM_REGISTRY_URL).origin;
 const maxTarballRedirects = 3;
 const releaseSerializationKeyPattern = /^[a-z0-9][a-z0-9._/-]{7,127}$/u;
-const stableVersionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u;
-const nightlyVersionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-nightly\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.g[0-9a-f]{12}$/u;
 
 function releasePolicy(channel: ReleaseChannel): ReleasePolicy {
 	return channel === "nightly"

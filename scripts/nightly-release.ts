@@ -2,10 +2,9 @@
 
 import * as path from "node:path";
 import { $, Glob } from "bun";
-import { PUBLIC_PACKAGE_DEFINITIONS } from "./release-evidence";
+import { PUBLIC_PACKAGE_DEFINITIONS, nightlyVersionPattern, stableVersionPattern } from "./release-evidence";
 
-const stableVersionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u;
-export const NIGHTLY_VERSION_PATTERN = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-nightly\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.g[0-9a-f]{12}$/u;
+export const NIGHTLY_VERSION_PATTERN = nightlyVersionPattern;
 const sourceShaPattern = /^[0-9a-f]{40}$/u;
 const positiveIntegerPattern = /^[1-9]\d*$/u;
 const cargoManifestGlob = new Glob("crates/*/Cargo.toml");

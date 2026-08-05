@@ -335,6 +335,24 @@ describe("release package evidence", () => {
 				: observation(candidate),
 		)).rejects.toThrow("regresses below target");
 	});
+	test("resumes only the exact nightly dist-tag observation", async () => {
+		const definition = PUBLIC_PACKAGE_DEFINITIONS[0]!;
+		const version = "1.2.4-nightly.20260805042300.123456.1.gabcdef012345";
+		const tarball = canonicalizePackageTarball(fixtureTarball(`{"name":"${definition.name}","version":"${version}","dependencies":{}}\n`));
+		const record = packageEvidenceFromTarball(definition, tarball);
+		const exact = observation(record);
+		const operations = {
+			readTarball: async () => tarball,
+			observe: async () => exact,
+			publish: async () => ({ exitCode: 0, output: "" }),
+		};
+
+		await expect(publishRetainedPackage(record, "retained.tgz", operations, "nightly")).resolves.toEqual(exact);
+		await expect(publishRetainedPackage(record, "retained.tgz", {
+			...operations,
+			observe: async () => ({ ...exact, registry_latest_version: "1.2.4-nightly.20260806042300.123457.1.gabcdef012345" }),
+		}, "nightly")).rejects.toThrow("conflicts with immutable expected evidence");
+	});
 	test("recovers only an exact concurrent publication and reports an absent publish failure", async () => {
 		const { expected } = expectedFixture();
 		const record = expected.packages[0]!;
