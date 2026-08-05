@@ -413,6 +413,11 @@ export interface CreateAgentSessionOptions {
 	 * @internal CLI-only startup optimization; SDK callers retain synchronous loading by default.
 	 */
 	deferMcpConfigStartup?: boolean;
+	/**
+	 * Defer memory backend startup until the caller has applied startup model profiles.
+	 * @internal CLI-only ordering guard; SDK callers retain immediate startup by default.
+	 */
+	deferMemoryBackendStartup?: boolean;
 
 	/** Enable LSP integration (tool, formatting, diagnostics, warmup). Default: true */
 	enableLsp?: boolean;
@@ -505,6 +510,8 @@ export interface CreateAgentSessionResult {
 	mcpManager?: MCPManager;
 	/** Starts a deferred exact-config MCP connection. Present only when deferMcpConfigStartup was requested. */
 	startDeferredMcpConfig?: () => Promise<DeferredMcpConfigStartupResult>;
+	/** Starts a deferred memory backend. Present only when deferMemoryBackendStartup was requested. */
+	startDeferredMemoryBackend?: () => void;
 	/** Warning if session was restored with a different model than saved */
 	modelFallbackMessage?: string;
 	/** LSP servers configured for lazy startup in interactive mode */
@@ -2928,18 +2935,24 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				? discoverStartupLspServers(cwd)
 				: undefined;
 
-		logger.time("startMemoryStartupTask", () =>
-			Promise.resolve(
-				resolveMemoryBackend(settings).start({
-					session,
-					settings,
-					modelRegistry,
-					agentDir,
-					taskDepth,
-					parentHindsightSessionState: options.parentHindsightSessionState,
-				}),
-			),
-		);
+		let memoryBackendStarted = false;
+		const startMemoryBackend = () => {
+			if (memoryBackendStarted) return;
+			memoryBackendStarted = true;
+			logger.time("startMemoryStartupTask", () =>
+				Promise.resolve(
+					resolveMemoryBackend(settings).start({
+						session,
+						settings,
+						modelRegistry,
+						agentDir,
+						taskDepth,
+						parentHindsightSessionState: options.parentHindsightSessionState,
+					}),
+				),
+			);
+		};
+		if (!options.deferMemoryBackendStartup) startMemoryBackend();
 
 		// Exact-config managers do not receive reactive callbacks; their tools are
 		// registered once in the session-owned catalog.
@@ -3056,6 +3069,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			setToolUIContext,
 			mcpManager: ownsMcpManager && mcpManager?.isToolsOnly() ? undefined : mcpManager,
 			startDeferredMcpConfig,
+			startDeferredMemoryBackend: options.deferMemoryBackendStartup ? startMemoryBackend : undefined,
 			modelFallbackMessage,
 			lspServers,
 			eventBus,
