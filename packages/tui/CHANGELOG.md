@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.12.12] - 2026-08-05
 ### Fixed
 
 - Restored 60 fps time-dependent loader gradients on direct local terminals while retaining the 80 ms cadence and congestion dropping on SSH and multiplexed terminals.

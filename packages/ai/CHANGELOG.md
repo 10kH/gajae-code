@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.12] - 2026-08-05
+
 ### Fixed
 
 - OpenAI Responses and Azure OpenAI Responses now map the first-event timeout into the SDK request/setup timeout the same way Completions does, so a never-resolving pre-headers fetch on a provider-owned lazy stream cannot wait the SDK's 10-minute default before any transport watchdog exists. Alibaba Responses honors an explicit shorter first-event override before headers; Azure/env-pinned setup timeouts normalize to the typed `stream_first_event_timeout` failure.
