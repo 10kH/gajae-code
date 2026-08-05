@@ -55,6 +55,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * ownership, settlement, and descendant cleanup authority. Generation 38 also
  * adds durable provider-intent admission without changing owner, reclaim,
  * signal, or spawn authority.
+ * Generation 41 applies first-class provider-settings admission to Telegram
+ * lifecycle controls, plus cross-host topic-registry CAS convergence, host-and-epoch
+ * archive fencing, retained topic history, user-topic adoption provenance, and
+ * exact versionless shared-state upgrades with quarantined source snapshots.
  * Generation 42 applies first-class provider-settings admission to Telegram
  * lifecycle controls. Generation 43 applies identity-bound exact replacement
  * cleanup shared by managed-session and daemon filesystem authority. Generation
@@ -69,14 +73,15 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * durable persistence and ownership release. Generation 50 resolves intermediate
  * notifications-directory symlinks before native exact unlink while keeping
  * final-component file symlinks fail-closed under AT_SYMLINK_NOFOLLOW (bounded
- * #3761 multi-account activation repair).
+ * #3761 multi-account activation repair). Generation 51 adds shared durable
+ * topic authority, archive recovery, and requires Telegram's documented error
+ * code for idempotent archive settlement.
  */
-export const DAEMON_GENERATION = 50;
+export const DAEMON_GENERATION = 51;
 
 /**
- * Serving-compatibility boundary for daemon lifecycle requests. Epoch 1 covers
- * all builds published before this field existed; epoch 2 covered generation 29;
- * epoch 3 covered generation 30; bump this to force serving convergence and
- * reload of compatible live predecessors.
+ * Serving-compatibility boundary for daemon lifecycle requests. Epoch 5
+ * requires the complete generation-36 topic authority contract, so older
+ * epoch-4 daemons cannot keep serving across an upgrade.
  */
-export const SERVING_EPOCH = 4;
+export const SERVING_EPOCH = 5;
