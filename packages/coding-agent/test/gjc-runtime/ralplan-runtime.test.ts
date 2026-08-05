@@ -24,6 +24,8 @@ import {
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import { readVisibleSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { YAML } from "bun";
 
 const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
@@ -34,7 +36,7 @@ const ralplanRunDir = (root: string, runId: string) =>
 	path.join(sessionPlansDir(root, TEST_SESSION_ID), "ralplan", runId);
 const ralplanPlanPath = (root: string, runId: string, ...parts: string[]) =>
 	path.join(ralplanRunDir(root, runId), ...parts);
-const CONFIG_ROOT_SETTINGS_PROBE = path.join(import.meta.dir, "..", "fixtures", "config-root-settings-probe.ts");
+const CONFIG_ROOT_CONFIG_PROBE = path.join(import.meta.dir, "..", "fixtures", "config-root-settings-probe.ts");
 
 beforeAll(() => {
 	previousGjcSessionId = process.env.GJC_SESSION_ID;
@@ -53,6 +55,16 @@ async function tempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-ralplan-runtime-"));
 	tempRoots.push(dir);
 	return dir;
+}
+async function seedProjectRalplanMaxIterations(root: string, maxIterations = 5): Promise<void> {
+	// Project config beats any user-layer configuration, making the cap
+	// scenarios hermetic regardless of the developer's ~/.gjc config.
+	await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
+	await fs.writeFile(
+		path.join(root, ".gjc", "config.yml"),
+		YAML.stringify({ gjc: { ralplan: { maxIterations } } }, null, 2),
+		"utf-8",
+	);
 }
 
 afterEach(async () => {
@@ -1712,12 +1724,13 @@ describe("native gjc ralplan runtime — post-clear re-activation (#644)", () =>
 	});
 });
 describe("ralplan automatic handoff admission (#3398)", () => {
-	it("defaults to off when project and user settings are absent", async () => {
+	it("defaults to off when project and user config.yml files are absent", async () => {
 		const root = await tempDir();
 		const userDir = await tempDir();
-		const previousConfigDir = process.env.GJC_CONFIG_DIR;
+		const previousAgentDir = getAgentDir();
+		const previousAgentOverride = process.env.GJC_CODING_AGENT_DIR;
 		try {
-			process.env.GJC_CONFIG_DIR = userDir;
+			setAgentDir(userDir);
 			expect(await resolveRalplanAutoHandoff(root)).toEqual({
 				configuredTarget: "off",
 				effectiveTarget: "off",
@@ -1725,70 +1738,74 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 				source: "default",
 			});
 		} finally {
-			if (previousConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
-			else process.env.GJC_CONFIG_DIR = previousConfigDir;
+			setAgentDir(previousAgentDir);
+			if (previousAgentOverride === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = previousAgentOverride;
 		}
 	});
 
-	it("rejects malformed project settings rather than falling through to user settings", async () => {
+	it("rejects malformed project config.yml rather than falling through to user config.yml", async () => {
 		const root = await tempDir();
 		const userDir = await tempDir();
-		const projectPath = path.join(root, ".gjc", "settings.json");
-		const previousConfigDir = process.env.GJC_CONFIG_DIR;
+		const projectPath = path.join(root, ".gjc", "config.yml");
+		const previousAgentDir = getAgentDir();
+		const previousAgentOverride = process.env.GJC_CODING_AGENT_DIR;
 		try {
-			process.env.GJC_CONFIG_DIR = userDir;
+			setAgentDir(userDir);
 			await fs.writeFile(
-				path.join(userDir, "settings.json"),
-				JSON.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }),
+				path.join(userDir, "config.yml"),
+				YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }, null, 2),
 				"utf-8",
 			);
 			await fs.mkdir(path.dirname(projectPath), { recursive: true });
-			await fs.writeFile(projectPath, "{invalid JSON", "utf-8");
+			await fs.writeFile(projectPath, "{invalid: [yaml", "utf-8");
 
 			await expect(resolveRalplanAutoHandoff(root)).rejects.toThrow(
-				`invalid ralplan settings at ${projectPath}: malformed JSON`,
+				`invalid ralplan settings at ${projectPath}: malformed YAML`,
 			);
 		} finally {
-			if (previousConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
-			else process.env.GJC_CONFIG_DIR = previousConfigDir;
+			setAgentDir(previousAgentDir);
+			if (previousAgentOverride === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = previousAgentOverride;
 		}
 	});
 
-	it("rejects malformed user settings instead of treating automatic handoff as off", async () => {
+	it("rejects malformed agent config.yml instead of treating automatic handoff as off", async () => {
 		const root = await tempDir();
 		const home = await tempDir();
 		const configDir = ".test-gjc";
-		const userPath = path.join(home, configDir, "settings.json");
-		await fs.mkdir(path.dirname(userPath), { recursive: true });
-		await fs.writeFile(userPath, "{invalid JSON", "utf-8");
+		const agentDir = await tempDir();
+		const agentConfigPath = path.join(agentDir, "config.yml");
+		await fs.mkdir(path.dirname(agentConfigPath), { recursive: true });
+		await fs.writeFile(agentConfigPath, "{invalid: [yaml", "utf-8");
 
-		const proc = Bun.spawn([process.execPath, CONFIG_ROOT_SETTINGS_PROBE, "--ralplan-auto-handoff"], {
+		const proc = Bun.spawn([process.execPath, CONFIG_ROOT_CONFIG_PROBE, "--ralplan-auto-handoff"], {
 			cwd: root,
-			env: { ...process.env, HOME: home, GJC_CONFIG_DIR: configDir },
+			env: { ...process.env, HOME: home, GJC_CONFIG_DIR: configDir, GJC_CODING_AGENT_DIR: agentDir },
 			stdout: "pipe",
 			stderr: "pipe",
 		});
 		const [, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
 
 		expect(await proc.exited).not.toBe(0);
-		expect(stderr).toContain(`invalid ralplan settings at ${userPath}: malformed JSON`);
+		expect(stderr).toContain(`invalid ralplan settings at ${agentConfigPath}: malformed YAML`);
 	});
-	it("rejects an invalid configured automatic handoff target", async () => {
+	it("rejects an invalid configured automatic handoff target in project config.yml", async () => {
 		const root = await tempDir();
-		const projectPath = path.join(root, ".gjc", "settings.json");
+		const projectPath = path.join(root, ".gjc", "config.yml");
 		await fs.mkdir(path.dirname(projectPath), { recursive: true });
-		await fs.writeFile(projectPath, JSON.stringify({ gjc: { ralplan: { autoHandoff: "later" } } }), "utf-8");
+		await fs.writeFile(projectPath, YAML.stringify({ gjc: { ralplan: { autoHandoff: "later" } } }, null, 2), "utf-8");
 
 		await expect(resolveRalplanAutoHandoff(root)).rejects.toThrow(
 			`invalid ralplan settings at ${projectPath}: expected gjc.ralplan.autoHandoff to be one of off, ultragoal, team`,
 		);
 	});
-	it("rejects invalid final admission settings before writing final artifacts", async () => {
+	it("rejects invalid final admission config before writing final artifacts", async () => {
 		const root = await tempDir();
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { ralplan: { autoHandoff: "later" } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "later" } } }, null, 2),
 			"utf-8",
 		);
 
@@ -1798,23 +1815,23 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 		expect(existsSync(ralplanPlanPath(root, "invalid-final-admission", "pending-approval.md"))).toBe(false);
 		expect(existsSync(ralplanPlanPath(root, "invalid-final-admission", "index.jsonl"))).toBe(false);
 	});
-	it("resolves ultragoal and a usable team target from project settings", async () => {
+	it("resolves ultragoal and a usable team target from project config.yml", async () => {
 		const root = await tempDir();
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }, null, 2),
 			"utf-8",
 		);
 		expect(await resolveRalplanAutoHandoff(root)).toMatchObject({
 			configuredTarget: "ultragoal",
 			effectiveTarget: "ultragoal",
-			source: path.join(root, ".gjc", "settings.json"),
+			source: path.join(root, ".gjc", "config.yml"),
 		});
 
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { ralplan: { autoHandoff: "team" } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "team" } } }, null, 2),
 			"utf-8",
 		);
 		expect(
@@ -1826,8 +1843,8 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 		const root = await tempDir();
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { ralplan: { autoHandoff: "team" } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "team" } } }, null, 2),
 			"utf-8",
 		);
 		expect(
@@ -1845,8 +1862,8 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 		const root = await tempDir();
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }, null, 2),
 			"utf-8",
 		);
 		const args = ["--write", "--stage", "final", "--stage_n", "1", "--artifact", "# final", "--json"];
@@ -1871,8 +1888,8 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 		const runId = "final-then-stuck";
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal", maxIterations: 1 } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal", maxIterations: 1 } } }, null, 2),
 			"utf-8",
 		);
 
@@ -1890,13 +1907,13 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 			},
 		});
 	});
-	it("uses the final ledger admission after state loss and settings changes", async () => {
+	it("uses the final ledger admission after state loss and config changes", async () => {
 		const root = await tempDir();
 		const runId = "durable-final-admission";
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }, null, 2),
 			"utf-8",
 		);
 		expect((await writeRalplanArtifact(root, runId, "final", 1, "# final")).status).toBe(0);
@@ -1904,8 +1921,8 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 		await fs.rm(ralplanStatePath(root));
 		expect((await writeRalplanArtifact(root, "another-run", "planner", 1, "# other")).status).toBe(0);
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { ralplan: { autoHandoff: "off" } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "off" } } }, null, 2),
 			"utf-8",
 		);
 		const retry = JSON.parse((await writeRalplanArtifact(root, runId, "final", 1, "# final")).stdout ?? "{}");
@@ -1919,8 +1936,8 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 		const root = await tempDir();
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal", maxIterations: 1 } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal", maxIterations: 1 } } }, null, 2),
 			"utf-8",
 		);
 		expect((await writeRalplanArtifact(root, "stuck-ledger", "planner", 1, "# plan")).status).toBe(0);
@@ -1945,8 +1962,8 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 		const indexPath = path.join(ralplanRunDir(root, runId), "index.jsonl");
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }, null, 2),
 			"utf-8",
 		);
 		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
@@ -2035,6 +2052,7 @@ describe("ralplan consensus iteration cap (#3165)", () => {
 
 	it("rejects a 6th revision opener with PLANNING-STUCK and still allows final", async () => {
 		const root = await tempDir();
+		await seedProjectRalplanMaxIterations(root);
 		const runId = "cap-run";
 		const write = async (stage: string, stageN: number, body: string) =>
 			runNativeRalplanCommand(
@@ -2069,12 +2087,12 @@ describe("ralplan consensus iteration cap (#3165)", () => {
 		expect(final.stdout).toContain("pending_approval_path");
 	});
 
-	it("honors project settings maxIterations=2 and resets budget on new run_id", async () => {
+	it("honors project config.yml maxIterations=2 and resets budget on new run_id", async () => {
 		const root = await tempDir();
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { ralplan: { maxIterations: 2 } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxIterations: 2 } } }, null, 2),
 			"utf-8",
 		);
 
@@ -2116,6 +2134,7 @@ describe("ralplan consensus iteration cap (#3165)", () => {
 	});
 	it("fails closed when index.jsonl is emptied after max openers (ledger wipe)", async () => {
 		const root = await tempDir();
+		await seedProjectRalplanMaxIterations(root);
 		const runId = "wipe-cap";
 		const write = async (stage: string, stageN: number, body: string) =>
 			runNativeRalplanCommand(
@@ -2142,6 +2161,7 @@ describe("ralplan consensus iteration cap (#3165)", () => {
 
 	it("fails closed when index.jsonl is truncated under on-disk openers", async () => {
 		const root = await tempDir();
+		await seedProjectRalplanMaxIterations(root);
 		const runId = "trunc-cap";
 		const write = async (stage: string, stageN: number, body: string) =>
 			runNativeRalplanCommand(
@@ -2166,6 +2186,7 @@ describe("ralplan consensus iteration cap (#3165)", () => {
 
 	it("fails closed when index.jsonl is only malformed lines while openers exist on disk", async () => {
 		const root = await tempDir();
+		await seedProjectRalplanMaxIterations(root);
 		const runId = "malformed-cap";
 		const write = async (stage: string, stageN: number, body: string) =>
 			runNativeRalplanCommand(
@@ -2191,6 +2212,7 @@ describe("ralplan consensus iteration cap (#3165)", () => {
 
 	it("fails closed when index is deleted but opener stage files remain", async () => {
 		const root = await tempDir();
+		await seedProjectRalplanMaxIterations(root);
 		const runId = "delete-index-cap";
 		const write = async (stage: string, stageN: number, body: string) =>
 			runNativeRalplanCommand(
@@ -2212,6 +2234,7 @@ describe("ralplan consensus iteration cap (#3165)", () => {
 
 	it("clean new run_id still allows openers after another run is ledger-stuck", async () => {
 		const root = await tempDir();
+		await seedProjectRalplanMaxIterations(root);
 		const write = async (runId: string, stage: string, stageN: number, body: string) =>
 			runNativeRalplanCommand(
 				["--write", "--stage", stage, "--stage_n", String(stageN), "--artifact", body, "--run-id", runId, "--json"],
@@ -2643,8 +2666,8 @@ describe("ralplan crash-gap dedupe repair", () => {
 		const runDir = ralplanRunDir(root, runId);
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 2 } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 2 } } }, null, 2),
 			"utf-8",
 		);
 		await fs.mkdir(runDir, { recursive: true });
@@ -2666,8 +2689,8 @@ describe("ralplan crash-gap dedupe repair", () => {
 		const runDir = ralplanRunDir(root, runId);
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 2 } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 2 } } }, null, 2),
 			"utf-8",
 		);
 		await fs.mkdir(runDir, { recursive: true });
@@ -2709,64 +2732,80 @@ describe("ralplan crash-gap dedupe repair", () => {
 	});
 });
 
-describe("ralplan review lane budget settings", () => {
-	it("resolves nested and flat settings with project-over-user precedence", async () => {
+describe("ralplan review lane budget config.yml", () => {
+	it("resolves nested config.yml with project-over-user precedence", async () => {
 		const root = await tempDir();
 		const userDir = await tempDir();
-		const previousConfigDir = process.env.GJC_CONFIG_DIR;
+		const previousAgentDir = getAgentDir();
+		const previousAgentOverride = process.env.GJC_CODING_AGENT_DIR;
 		try {
-			process.env.GJC_CONFIG_DIR = userDir;
+			setAgentDir(userDir);
 			await fs.writeFile(
-				path.join(userDir, "settings.json"),
-				JSON.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 2 } } }),
+				path.join(userDir, "config.yml"),
+				YAML.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 2 } } }, null, 2),
 				"utf-8",
 			);
 			await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
-			const projectPath = path.join(root, ".gjc", "settings.json");
-			await fs.writeFile(projectPath, JSON.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 3 } } }), "utf-8");
+			const projectPath = path.join(root, ".gjc", "config.yml");
+			await fs.writeFile(
+				projectPath,
+				YAML.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 3 } } }, null, 2),
+				"utf-8",
+			);
 			expect(await resolveRalplanMaxReviewPassesPerLane(root)).toEqual({
 				maxReviewPassesPerLane: 3,
 				source: projectPath,
 			});
 
-			await fs.writeFile(projectPath, JSON.stringify({ "gjc.ralplan.maxReviewPassesPerLane": 4 }), "utf-8");
+			await fs.writeFile(
+				projectPath,
+				YAML.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 4 } } }, null, 2),
+				"utf-8",
+			);
 			expect(await resolveRalplanMaxReviewPassesPerLane(root)).toEqual({
 				maxReviewPassesPerLane: 4,
 				source: projectPath,
 			});
 		} finally {
-			if (previousConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
-			else process.env.GJC_CONFIG_DIR = previousConfigDir;
+			setAgentDir(previousAgentDir);
+			if (previousAgentOverride === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = previousAgentOverride;
 		}
 	});
 
-	it("rejects malformed project settings instead of falling through to a user override", async () => {
+	it("rejects malformed project config.yml instead of falling through to a user override", async () => {
 		const root = await tempDir();
 		const userDir = await tempDir();
-		const previousConfigDir = process.env.GJC_CONFIG_DIR;
+		const previousAgentDir = getAgentDir();
+		const previousAgentOverride = process.env.GJC_CODING_AGENT_DIR;
 		try {
-			process.env.GJC_CONFIG_DIR = userDir;
+			setAgentDir(userDir);
 			await fs.writeFile(
-				path.join(userDir, "settings.json"),
-				JSON.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 2 } } }),
+				path.join(userDir, "config.yml"),
+				YAML.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 2 } } }, null, 2),
 				"utf-8",
 			);
 			await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
-			const projectPath = path.join(root, ".gjc", "settings.json");
-			await fs.writeFile(projectPath, "{invalid JSON", "utf-8");
+			const projectPath = path.join(root, ".gjc", "config.yml");
+			await fs.writeFile(projectPath, "{invalid: [yaml", "utf-8");
 
 			await expect(resolveRalplanMaxReviewPassesPerLane(root)).rejects.toThrow(projectPath);
 		} finally {
-			if (previousConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
-			else process.env.GJC_CONFIG_DIR = previousConfigDir;
+			setAgentDir(previousAgentDir);
+			if (previousAgentOverride === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = previousAgentOverride;
 		}
 	});
 
 	it("rejects an invalid present project value rather than defaulting", async () => {
 		const root = await tempDir();
-		const projectPath = path.join(root, ".gjc", "settings.json");
+		const projectPath = path.join(root, ".gjc", "config.yml");
 		await fs.mkdir(path.dirname(projectPath), { recursive: true });
-		await fs.writeFile(projectPath, JSON.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 99 } } }), "utf-8");
+		await fs.writeFile(
+			projectPath,
+			YAML.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 99 } } }, null, 2),
+			"utf-8",
+		);
 
 		await expect(resolveRalplanMaxReviewPassesPerLane(root)).rejects.toThrow(projectPath);
 	});
@@ -2775,6 +2814,7 @@ describe("ralplan review lane budget settings", () => {
 describe("ralplan review lane budget replays", () => {
 	it("refuses only the pathological same-iteration lane retries and preserves final escalation", async () => {
 		const root = await tempDir();
+		await seedProjectRalplanMaxIterations(root);
 		const runId = "pathological-replay";
 		const sequence = [
 			["planner", "planner"],
@@ -2852,6 +2892,7 @@ describe("ralplan review lane budget replays", () => {
 describe("ralplan review lane budget rigor and receipts", () => {
 	it("does not parse or demote a justified critic blocker, while exhausted openers remain visibly stuck", async () => {
 		const root = await tempDir();
+		await seedProjectRalplanMaxIterations(root);
 		const runId = "rigor-preserved";
 		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# initial plan")).status).toBe(0);
 		const critic = await writeRalplanArtifact(
@@ -2878,8 +2919,8 @@ describe("ralplan review lane budget rigor and receipts", () => {
 		const runId = "warning-json";
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 2 } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 2 } } }, null, 2),
 			"utf-8",
 		);
 		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);
@@ -2906,8 +2947,8 @@ describe("ralplan review lane budget rigor and receipts", () => {
 		const textRunId = "warning-text";
 		await fs.mkdir(path.join(textRoot, ".gjc"), { recursive: true });
 		await fs.writeFile(
-			path.join(textRoot, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 2 } } }),
+			path.join(textRoot, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 2 } } }, null, 2),
 			"utf-8",
 		);
 		expect((await writeRalplanArtifact(textRoot, textRunId, "planner", 1, "# plan")).status).toBe(0);
@@ -3088,8 +3129,8 @@ describe("ralplan HUD lane verdict carriage", () => {
 		const runId = "hud-budget-denominator";
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 3 } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxReviewPassesPerLane: 3 } } }, null, 2),
 			"utf-8",
 		);
 		expect((await writeRalplanArtifact(root, runId, "planner", 1, "# plan")).status).toBe(0);

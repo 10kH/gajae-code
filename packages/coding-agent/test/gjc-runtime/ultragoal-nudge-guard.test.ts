@@ -26,6 +26,7 @@ import {
 	type UltragoalNudgeSurface,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 import { assertUltragoalAskAllowed } from "@gajae-code/coding-agent/tools/ultragoal-ask-guard";
+import { YAML } from "bun";
 
 const TEST_SESSION_ID = "ultragoal-nudge-guard-test-session";
 const ORIGINAL_GJC_SESSION_ID = process.env.GJC_SESSION_ID;
@@ -41,7 +42,10 @@ async function tempDir(): Promise<string> {
 async function setProjectBudget(cwd: string, budget: number): Promise<void> {
 	const gjcDir = path.join(cwd, ".gjc");
 	await fs.mkdir(gjcDir, { recursive: true });
-	await fs.writeFile(path.join(gjcDir, "settings.json"), JSON.stringify({ "gjc.ultragoal.nudgeBudget": budget }));
+	await fs.writeFile(
+		path.join(gjcDir, "config.yml"),
+		YAML.stringify({ gjc: { ultragoal: { nudgeBudget: budget } } }, null, 2),
+	);
 }
 
 const SINGLE_BRIEF = "Implement the story";
@@ -326,8 +330,11 @@ describe("ultragoal nudge guard", () => {
 		expect(defaultResolved.budget).toBe(10);
 
 		const home = await tempDir();
-		await fs.mkdir(path.join(home, ".gjc"), { recursive: true });
-		await fs.writeFile(path.join(home, ".gjc", "settings.json"), JSON.stringify({ "gjc.ultragoal.nudgeBudget": 3 }));
+		await fs.mkdir(path.join(home, ".gjc", "agent"), { recursive: true });
+		await fs.writeFile(
+			path.join(home, ".gjc", "agent", "config.yml"),
+			YAML.stringify({ gjc: { ultragoal: { nudgeBudget: 3 } } }, null, 2),
+		);
 		const probe = path.join(import.meta.dir, "..", "fixtures", "config-root-settings-probe.ts");
 		const userOnly = Bun.spawn([process.execPath, probe], {
 			cwd,

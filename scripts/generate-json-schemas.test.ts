@@ -1,8 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { JSON_SCHEMA_OUTPUTS, stableJson } from "./generate-json-schemas";
-import { SETTINGS_SCHEMA } from "../packages/coding-agent/src/config/settings-schema";
 import { ProfileModelSelectorPattern } from "../packages/coding-agent/src/config/models-config-schema";
+import { SETTINGS_SCHEMA } from "../packages/coding-agent/src/config/settings-schema";
 
 function acceptsJsonSchemaFixture(schema: unknown, value: unknown): boolean {
 	if (schema === true) return true;
@@ -112,7 +112,7 @@ describe("generated JSON Schemas", () => {
 		expect(bindingSelector.anyOf[1].minItems).toBe(1);
 		for (const branch of presetSelector.anyOf) {
 			const selector = branch.type === "array" ? branch.items : branch;
-			expect(selector.pattern).toBe(ProfileModelSelectorPattern.replace("]+/", "]+\\/"));
+			expect(selector.pattern).toBe(new RegExp(ProfileModelSelectorPattern).source);
 		}
 	});
 

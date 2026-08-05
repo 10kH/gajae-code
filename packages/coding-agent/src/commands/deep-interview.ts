@@ -1,4 +1,5 @@
 import { Command, Flags } from "@gajae-code/utils/cli";
+import { ensureWorkflowSettingsMigrated } from "../config/settings";
 import { runNativeDeepInterviewCommand } from "../gjc-runtime/deep-interview-runtime";
 
 export default class DeepInterview extends Command {
@@ -57,6 +58,7 @@ session_id, or GJC_SESSION_ID.`;
 	];
 
 	async run(): Promise<void> {
+		await ensureWorkflowSettingsMigrated(process.cwd());
 		const result = await runNativeDeepInterviewCommand(this.argv, process.cwd());
 		if (result.stdout) process.stdout.write(result.stdout);
 		if (result.stderr) process.stderr.write(result.stderr);

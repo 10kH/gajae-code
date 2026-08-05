@@ -1,4 +1,5 @@
 import { Command } from "@gajae-code/utils/cli";
+import { ensureWorkflowSettingsMigrated } from "../config/settings";
 import {
 	GJC_SESSION_FILE_ENV,
 	GJC_SESSION_ID_ENV,
@@ -16,6 +17,7 @@ export default class Ultragoal extends Command {
 	static delegateHelp = true;
 
 	async run(): Promise<void> {
+		await ensureWorkflowSettingsMigrated(process.cwd());
 		const isReviewStart = this.argv.includes("review") && this.argv.includes("review-start");
 		const shouldActivateGoalMode = isUltragoalCreateGoalsInvocation(this.argv);
 		const result = await runNativeUltragoalCommand(this.argv);
