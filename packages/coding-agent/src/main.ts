@@ -33,6 +33,7 @@ import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import { resolveCliModel, resolveModelRoleValue, resolveModelScope, type ScopedModel } from "./config/model-resolver";
 import { selectorHead } from "./config/model-selector-value";
 import { getDefault, type SettingPath, Settings, settings } from "./config/settings";
+import { distTagForChannel, type UpdateChannel } from "./config/update-channel";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "./defaults/gjc-grok-cli";
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
@@ -81,10 +82,15 @@ const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
 const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
 const TMUX_OWNER_ISOLATION_ARG = "--internal-tmux-owner-isolation";
 
-async function checkForNewVersion(currentVersion: string): Promise<string | undefined> {
+async function checkForNewVersion(
+	currentVersion: string,
+	channel: UpdateChannel = "stable",
+): Promise<string | undefined> {
 	try {
 		// Resolved from npm config so mirrored/firewalled networks are checked too.
-		const { version } = await fetchLatestPackageVersion("@gajae-code/coding-agent");
+		const { version } = await fetchLatestPackageVersion("@gajae-code/coding-agent", {
+			distTag: distTagForChannel(channel),
+		});
 		return Bun.semver.order(version, currentVersion) > 0 ? version : undefined;
 	} catch {
 		return undefined;
@@ -1450,7 +1456,7 @@ export async function runRootCommand(
 	const startupUpdate = new StartupUpdateOrchestrator(
 		startupUpdateRoute,
 		() => settingsInstance.get("startup.checkUpdate"),
-		deps.startupUpdate?.check ?? (() => checkForNewVersion(VERSION)),
+		deps.startupUpdate?.check ?? (() => checkForNewVersion(VERSION, settingsInstance.get("startup.updateChannel"))),
 	);
 	const isInteractive = disposition.isInteractive;
 	const mode = parsedArgs.mode || "text";

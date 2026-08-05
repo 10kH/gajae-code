@@ -101,6 +101,8 @@
 - Added a verified, copy-installable `ooo` bridge example: `ooo interview` renders Ouroboros MCP questions in GJC, serializes startup and follow-up answers by session ID, cancellation-fences late settlement, disposes state on GJC session changes and `/clear`, drops queued predecessor-generation starts, releases dead transports and controls, honors `OUROBOROS_CLI`, and loads dependency-free in compiled binaries (#3803).
 - Added a scheduled and manually dispatchable nightly deployment cycle that verifies the full `main` graph, stages one immutable source-bound prerelease version across npm/Cargo/native surfaces, publishes the complete package set under the npm `nightly` dist-tag without moving `latest`, and creates a matching GitHub prerelease with binaries and closed package evidence.
 
+- `gjc update` now accepts `--channel stable|nightly` to switch release channels in place, and a new **Update Channel** settings entry (`startup.updateChannel`, stable by default) picks the default channel for both `gjc update` and the interactive startup update check. Channel resolution maps to the npm `latest`/`nightly` dist-tags without ever pointing nightly at `latest`, version comparison now orders nightly prereleases with real semver semantics instead of NaN-falling into a forced reinstall, and installed-version verification recognizes prerelease version strings reported by nightly binaries.
+
 ### Fixed
 
 - Fixed deep-interview prompts exposing the literal argument placeholder.

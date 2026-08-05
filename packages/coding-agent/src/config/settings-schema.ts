@@ -1504,6 +1504,21 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"startup.updateChannel": {
+		type: "enum",
+		values: ["stable", "nightly"] as const,
+		default: "stable",
+		ui: {
+			tab: "interaction",
+			label: "Update Channel",
+			description: "Release channel used by `gjc update` and the startup update check",
+			options: [
+				{ value: "stable", label: "Stable", description: "Track stable releases (npm `latest` dist-tag)" },
+				{ value: "nightly", label: "Nightly", description: "Track nightly prereleases (npm `nightly` dist-tag)" },
+			],
+		},
+	},
+
 	"starReminder.enabled": {
 		type: "boolean",
 		default: true,

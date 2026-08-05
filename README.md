@@ -98,7 +98,7 @@ gjc --version
 gjc --smoke-test
 ```
 
-Install without `@nightly` to return to the stable channel.
+Already on GJC? Switch channels without reinstalling: `gjc update --channel nightly` moves to the latest nightly, and `gjc update --channel stable` (or a plain `bun install -g gajae-code@latest`) returns to stable. To make a channel the default for both `gjc update` and the startup update check, set **Settings → Interaction → Update Channel** (the `startup.updateChannel` setting).
 
 ### Shell completion
 
