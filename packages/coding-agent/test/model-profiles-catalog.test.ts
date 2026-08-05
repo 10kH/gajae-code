@@ -376,7 +376,7 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		requiredProviders: ["alibaba-token-plan"],
 		mapping: {
 			default: "alibaba-token-plan/qwen3.8-max-preview:high",
-			executor: "alibaba-token-plan/deepseek-v4-flash-0731:medium",
+			executor: "alibaba-token-plan/deepseek-v4-flash-0731:high",
 			planner: "alibaba-token-plan/deepseek-v4-flash-0731:max",
 			critic: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
 			architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
@@ -735,7 +735,7 @@ describe("built-in model profile catalog", () => {
 		});
 		expect(builtinMapping("alibaba-token-plan-qwen-deepseek")).toEqual({
 			default: "alibaba-token-plan/qwen3.8-max-preview:high",
-			executor: "alibaba-token-plan/deepseek-v4-flash-0731:medium",
+			executor: "alibaba-token-plan/deepseek-v4-flash-0731:high",
 			planner: "alibaba-token-plan/deepseek-v4-flash-0731:max",
 			critic: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
 			architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
