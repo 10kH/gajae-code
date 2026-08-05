@@ -144,9 +144,7 @@ export function injectAlibabaTokenPlanModels(models: Model[]): void {
 		compat: { supportsDeveloperRole: false },
 	};
 	for (const metadata of [deepseek, qwen]) {
-		const existing = models.find(
-			model => model.provider === "alibaba-token-plan" && model.id === metadata.id,
-		);
+		const existing = models.find(model => model.provider === "alibaba-token-plan" && model.id === metadata.id);
 		if (existing) {
 			Object.assign(existing, metadata);
 		} else {
