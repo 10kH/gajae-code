@@ -1387,7 +1387,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						currentJobGeneration: manager.getJob(jobId)?.generation,
 						historicalJobIds: [],
 						status: manager.getJob(jobId)?.status ?? "running",
-						sessionFile: null,
+						sessionFile: subtaskSessionFile,
 						resumable: true,
 						duplicateIdentity: duplicateIdentityKey(admission.identity),
 						duplicateDisposition: admission.disposition?.action,
