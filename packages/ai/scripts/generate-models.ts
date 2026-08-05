@@ -112,11 +112,12 @@ export function injectImageGenerationModels(models: Model[]): void {
 }
 
 /**
- * Keep the Alibaba Token Plan executor model available when authenticated
- * catalog discovery is unavailable during generation.
+ * Keep the Alibaba Token Plan DeepSeek V4 Flash executor and non-preview
+ * Qwen3.8 Max models available when authenticated catalog discovery is
+ * unavailable during generation.
  */
 export function injectAlibabaTokenPlanModels(models: Model[]): void {
-	const metadata: Model<"openai-completions"> = {
+	const deepseek: Model<"openai-completions"> = {
 		id: "deepseek-v4-flash-0731",
 		name: "DeepSeek V4 Flash 0731",
 		api: "openai-completions",
@@ -129,14 +130,29 @@ export function injectAlibabaTokenPlanModels(models: Model[]): void {
 		maxTokens: 384_000,
 		compat: { supportsDeveloperRole: false },
 	};
-	const existing = models.find(
-		model => model.provider === "alibaba-token-plan" && model.id === "deepseek-v4-flash-0731",
-	);
-	if (existing) {
-		Object.assign(existing, metadata);
-		return;
+	const qwen: Model<"openai-responses"> = {
+		id: "qwen-3.8-max",
+		name: "Qwen3.8 Max",
+		api: "openai-responses",
+		provider: "alibaba-token-plan",
+		baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_000_000,
+		maxTokens: 65_536,
+		compat: { supportsDeveloperRole: false },
+	};
+	for (const metadata of [deepseek, qwen]) {
+		const existing = models.find(
+			model => model.provider === "alibaba-token-plan" && model.id === metadata.id,
+		);
+		if (existing) {
+			Object.assign(existing, metadata);
+		} else {
+			models.push(metadata);
+		}
 	}
-	models.push(metadata);
 }
 
 async function resolveProviderApiKey(providerId: string, catalog: CatalogDiscoveryConfig): Promise<string | undefined> {
