@@ -631,6 +631,16 @@ describe("model profile activation", () => {
 				architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
 			},
 		],
+		[
+			"alibaba-token-plan-qwen-deepseek",
+			{
+				default: "alibaba-token-plan/qwen3.8-max-preview:medium",
+				executor: "alibaba-token-plan/deepseek-v4-flash-0731:low",
+				planner: "alibaba-token-plan/deepseek-v4-flash-0731:high",
+				critic: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+				architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+			},
+		],
 	] satisfies Array<
 		[string, Record<string, string>]
 	>)("prepares the reconstructed five-role mapping for %s", async (profileName, expected) => {

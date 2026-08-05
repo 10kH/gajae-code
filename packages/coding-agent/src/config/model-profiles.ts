@@ -305,6 +305,13 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
 		critic: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
 	}),
+	profile("alibaba-token-plan-qwen-deepseek", ["alibaba-token-plan"], {
+		default: "alibaba-token-plan/qwen3.8-max-preview:medium",
+		executor: "alibaba-token-plan/deepseek-v4-flash-0731:low",
+		planner: "alibaba-token-plan/deepseek-v4-flash-0731:high",
+		architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+		critic: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+	}),
 	profile("opus-codex", ["anthropic", "openai-codex"], {
 		default: "anthropic/claude-opus-5:xhigh",
 		executor: "openai-codex/gpt-5.6-terra:low",
@@ -370,6 +377,7 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"alibaba-token-plan-balanced": { displayName: "Balanced", providerGroup: "ALIBABA TOKEN PLAN" },
 	"alibaba-token-plan-pro": { displayName: "Pro", providerGroup: "ALIBABA TOKEN PLAN" },
 	"alibaba-token-plan-qwenmaxxing": { displayName: "QwenMaxxing", providerGroup: "ALIBABA TOKEN PLAN" },
+	"alibaba-token-plan-qwen-deepseek": { displayName: "Qwen + DeepSeek", providerGroup: "ALIBABA TOKEN PLAN" },
 	"opus-codex": { displayName: "Opus + Codex", providerGroup: "COMBOS" },
 	"codex-opencodego": { displayName: "Codex + OpenCodeGo", providerGroup: "COMBOS" },
 	"fable-opus-codex": { displayName: "Fable + Opus + Codex", providerGroup: "COMBOS" },
