@@ -55,6 +55,9 @@ export interface GjcLifecycleContext {
 function fail(code: GjcLifecycleError["code"], message: string, recovery?: string): GjcLifecycleError {
 	return recovery ? { code, message, recovery } : { code, message };
 }
+function isEnoent(error: unknown): boolean {
+	return (error as NodeJS.ErrnoException)?.code === "ENOENT";
+}
 
 const UNSUPPORTED_UPDATE_REASON: Partial<Record<GjcPluginRegistrySource["kind"], string>> = {};
 
@@ -237,30 +240,160 @@ function safeInstalledRoot(scope: GjcPluginScope, cwd: string, pluginRoot: strin
 	if (!relative || relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) return null;
 	return root;
 }
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function isStringArray(value: unknown): value is string[] {
+	return Array.isArray(value) && value.every(item => typeof item === "string");
+}
+
+function isUninstallableEntry(value: unknown, identity: GjcBundleIdentity): value is GjcPluginRegistryEntry {
+	if (!isRecord(value)) return false;
+	if (
+		value.name !== identity.name ||
+		value.scope !== identity.scope ||
+		typeof value.version !== "string" ||
+		typeof value.enabled !== "boolean" ||
+		typeof value.pluginRoot !== "string" ||
+		typeof value.manifestPath !== "string" ||
+		typeof value.manifestHash !== "string" ||
+		typeof value.installedAt !== "string" ||
+		typeof value.updatedAt !== "string" ||
+		!isStringArray(value.disabledSurfaceIds) ||
+		!Array.isArray(value.copiedFiles)
+	) {
+		return false;
+	}
+	const source = value.source;
+	if (
+		!isRecord(source) ||
+		typeof source.kind !== "string" ||
+		typeof source.uri !== "string" ||
+		typeof source.resolvedAt !== "string"
+	) {
+		return false;
+	}
+	const surfaces = value.surfaces;
+	if (!isRecord(surfaces)) return false;
+	for (const key of ["subskills", "tools", "hooks", "mcps", "systemAppendices", "agentAppendices"]) {
+		const list = surfaces[key];
+		if (
+			!Array.isArray(list) ||
+			!list.every(item => isRecord(item) && typeof item.extensionId === "string" && typeof item.name === "string")
+		) {
+			return false;
+		}
+	}
+	if (
+		!value.copiedFiles.every(
+			file =>
+				isRecord(file) &&
+				typeof file.relativePath === "string" &&
+				typeof file.sha256 === "string" &&
+				typeof file.bytes === "number",
+		)
+	) {
+		return false;
+	}
+	if (value.quarantine !== undefined) {
+		if (
+			!Array.isArray(value.quarantine) ||
+			!value.quarantine.every(
+				entry => isRecord(entry) && typeof entry.surfaceId === "string" && typeof entry.code === "string",
+			)
+		) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function isMalformedRegistryError(error: unknown): boolean {
+	return (
+		(error instanceof GjcPluginLoadError && error.code === "invalid_manifest") ||
+		(error instanceof TypeError &&
+			/(?:not iterable|localeCompare|reading ['"](?:scope|name|pluginRoot|plugins|map))/.test(error.message))
+	);
+}
+
+function uninstallFailure(
+	identity: GjcBundleIdentity,
+	kind: "metadata" | "remove" | "write" | "restore",
+): GjcLifecycleError {
+	const detail =
+		kind === "metadata"
+			? "its installed metadata is invalid"
+			: kind === "remove"
+				? "the installed files could not be moved safely"
+				: kind === "write"
+					? "its registry could not be updated"
+					: "the previous state could not be restored";
+	const recovery =
+		kind === "metadata"
+			? `Repair the GJC ${identity.scope} registry, then retry gjc plugin uninstall ${identity.name} --${identity.scope}`
+			: `Check GJC plugin directory permissions, then retry gjc plugin uninstall ${identity.name} --${identity.scope}`;
+	return fail("invalid_target", `Could not uninstall GJC bundle "${identity.name}" because ${detail}`, recovery);
+}
 
 export async function uninstallGjcBundle(
 	ctx: GjcLifecycleContext,
 	identity: GjcBundleIdentity,
 ): Promise<GjcLifecycleResult<{ identity: GjcBundleIdentity; summary: GjcBundleSummary }>> {
 	return withRegistryLock(identity.scope, ctx.cwd, async () => {
-		const registry = await readRegistry(identity.scope, ctx.cwd);
-		const entry = registry.plugins.find(plugin => plugin.name === identity.name);
-		if (!entry) return { ok: false, error: notInstalled(identity) };
-
-		const root = safeInstalledRoot(identity.scope, ctx.cwd, entry.pluginRoot);
-		if (!root) {
-			return {
-				ok: false,
-				error: fail("invalid_target", `GJC bundle "${identity.name}" has an invalid installed target`),
-			};
+		let registry: Awaited<ReturnType<typeof readRegistry>>;
+		try {
+			registry = await readRegistry(identity.scope, ctx.cwd);
+		} catch (error) {
+			if (isMalformedRegistryError(error)) return { ok: false, error: uninstallFailure(identity, "metadata") };
+			throw error;
 		}
 
+		const entry = registry.plugins.find(plugin => plugin && plugin.name === identity.name);
+		if (!entry) return { ok: false, error: notInstalled(identity) };
+		if (!isUninstallableEntry(entry, identity)) return { ok: false, error: uninstallFailure(identity, "metadata") };
+
+		const root = safeInstalledRoot(identity.scope, ctx.cwd, entry.pluginRoot);
+		if (!root) return { ok: false, error: uninstallFailure(identity, "metadata") };
+
 		const summary = toBundleSummary(entry);
-		await fs.rm(root, { recursive: true, force: true });
-		await writeRegistryUnlocked(
-			{ ...registry, plugins: registry.plugins.filter(plugin => plugin !== entry) },
-			ctx.cwd,
-		);
+		const nextRegistry = { ...registry, plugins: registry.plugins.filter(plugin => plugin !== entry) };
+		const backupRoot = `${root}.uninstalling-${process.pid}-${Date.now()}`;
+		let moved = false;
+
+		try {
+			await fs.rename(root, backupRoot);
+			moved = true;
+		} catch (error) {
+			if (!isEnoent(error)) return { ok: false, error: uninstallFailure(identity, "remove") };
+		}
+
+		try {
+			await writeRegistryUnlocked(nextRegistry, ctx.cwd);
+		} catch {
+			if (moved) {
+				try {
+					await fs.rename(backupRoot, root);
+				} catch {
+					return { ok: false, error: uninstallFailure(identity, "restore") };
+				}
+			}
+			return { ok: false, error: uninstallFailure(identity, "write") };
+		}
+
+		if (moved) {
+			try {
+				await fs.rm(backupRoot, { recursive: true, force: true });
+			} catch {
+				try {
+					await writeRegistryUnlocked(registry, ctx.cwd);
+					await fs.rename(backupRoot, root);
+				} catch {
+					return { ok: false, error: uninstallFailure(identity, "restore") };
+				}
+				return { ok: false, error: uninstallFailure(identity, "remove") };
+			}
+		}
 		return { ok: true, value: { identity, summary } };
 	});
 }

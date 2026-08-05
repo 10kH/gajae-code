@@ -481,6 +481,31 @@ function describeInstallFailure(error: unknown): string {
 	return error instanceof GjcPluginLoadError ? error.code : "install_failed";
 }
 
+function isGjcRegistryShapeFailure(error: unknown): boolean {
+	return (
+		(error instanceof GjcPluginLoadError && error.code === "invalid_manifest") ||
+		(error instanceof TypeError &&
+			/(?:not iterable|localeCompare|reading ['"](?:scope|name|pluginRoot|plugins|map))/.test(error.message))
+	);
+}
+
+async function findGjcBundlesForUninstall(
+	cwd: string,
+	name: string,
+	scope: "user" | "project" | undefined,
+): Promise<GjcBundleSummary[]> {
+	const scopes = scope ? [scope] : (["user", "project"] as const);
+	const matches: GjcBundleSummary[] = [];
+	for (const candidateScope of scopes) {
+		try {
+			const result = await getGjcBundle({ cwd }, bundleIdentity(candidateScope, name));
+			if (result.ok) matches.push(result.value);
+		} catch (error) {
+			if (!isGjcRegistryShapeFailure(error)) throw error;
+		}
+	}
+	return matches;
+}
 async function handleInstall(
 	manager: PluginManager,
 	packages: string[],
@@ -637,14 +662,11 @@ async function handleUninstall(
 
 	const scope = flags.scope ?? (flags.user ? "user" : flags.project ? "project" : undefined);
 	const cwd = getProjectDir();
-	const gjcBundles = await listGjcBundles({ cwd });
 	const mktMgr = await makeMarketplaceManager();
 	const installedPlugins = new Set((await mktMgr.listInstalledPlugins()).map(p => p.id));
 
 	for (const name of packages) {
-		const matches = gjcBundles.filter(
-			bundle => bundle.identity.name === name && (scope === undefined || bundle.identity.scope === scope),
-		);
+		const matches = await findGjcBundlesForUninstall(cwd, name, scope);
 		if (matches.length > 0) {
 			if (matches.length > 1) {
 				console.error(chalk.red(`GJC bundle "${name}" is installed in both scopes; specify --user or --project.`));

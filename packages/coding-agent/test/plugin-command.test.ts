@@ -116,6 +116,19 @@ describe("Plugin command scope parsing", () => {
 		expect(listed.exitCode).toBe(0);
 		expect(JSON.parse(listed.stdout)).toMatchObject({ gjc: [] });
 	});
+	it("falls back to non-GJC uninstall when the GJC registry is corrupt", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-command-agent-"));
+		agentDirs.push(agentDir);
+		const cwd = await makeTempProject();
+		const registryRoot = path.join(agentDir, "gjc-plugins");
+		await fs.mkdir(registryRoot, { recursive: true });
+		await fs.writeFile(path.join(registryRoot, "registry.json"), "{");
+
+		const result = await runPluginCommand(["uninstall", "not-a-gjc-bundle"], cwd, agentDir);
+
+		expect(result.exitCode).not.toBe(0);
+		expect(`${result.stdout}${result.stderr}`).not.toContain("Corrupt GJC plugin registry");
+	});
 
 	it("GJC install and upgrade failures never echo the source or its cause", async () => {
 		const cwd = await makeTempProject();

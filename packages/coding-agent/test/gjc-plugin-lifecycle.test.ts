@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -13,6 +13,7 @@ import {
 	previewGjcBundleUpdate,
 	readRegistry,
 	redactSourceLocator,
+	registryPathForScope,
 	setGjcBundleEnabled,
 	setGjcBundleSurfaceEnabled,
 	uninstallGjcBundle,
@@ -118,6 +119,56 @@ describe("GJC bundle lifecycle", () => {
 		expect(result).toMatchObject({ ok: true, value: { identity } });
 		expect((await readRegistry("user", cwd)).plugins).toHaveLength(0);
 		await expect(fs.stat(entry.pluginRoot)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+	test("returns a typed error for a malformed registry entry without removing its root", async () => {
+		const cwd = await mkProjectCwd();
+		const identity = await installFixture(cwd, "user");
+		const registryPath = registryPathForScope("user", cwd);
+		const raw = JSON.parse(await fs.readFile(registryPath, "utf8")) as {
+			plugins: Array<Record<string, unknown>>;
+		};
+		const entry = raw.plugins[0];
+		expect(entry).toBeDefined();
+		if (!entry) throw new Error("missing installed entry");
+		const installedRoot = entry.pluginRoot;
+		expect(typeof installedRoot).toBe("string");
+		if (typeof installedRoot !== "string") throw new Error("missing installed root");
+		const surfaces = entry.surfaces as Record<string, unknown>;
+		surfaces.tools = null;
+		await fs.writeFile(registryPath, JSON.stringify(raw));
+
+		const result = await uninstallGjcBundle({ cwd }, identity);
+
+		expect(result).toMatchObject({
+			ok: false,
+			error: { code: "invalid_target", recovery: expect.stringContaining("retry") },
+		});
+		await expect(fs.stat(installedRoot)).resolves.toBeTruthy();
+	});
+
+	test("restores the root and returns a typed error when registry removal fails", async () => {
+		const cwd = await mkProjectCwd();
+		const identity = await installFixture(cwd, "user");
+		const registryBefore = await readRegistry("user", cwd);
+		const entry = registryBefore.plugins.find(plugin => plugin.name === identity.name);
+		expect(entry).toBeDefined();
+		if (!entry) throw new Error("missing installed entry");
+
+		const realRename = fs.rename;
+		const renameSpy = spyOn(fs, "rename");
+		renameSpy.mockImplementationOnce(realRename);
+		renameSpy.mockRejectedValueOnce(new Error("registry rename failed"));
+		renameSpy.mockImplementation(realRename);
+
+		const result = await uninstallGjcBundle({ cwd }, identity);
+
+		renameSpy.mockRestore();
+		expect(result).toMatchObject({
+			ok: false,
+			error: { code: "invalid_target", recovery: expect.stringContaining("retry") },
+		});
+		expect((await readRegistry("user", cwd)).plugins).toHaveLength(1);
+		await expect(fs.stat(entry.pluginRoot)).resolves.toBeTruthy();
 	});
 
 	test("previews unchanged source with an identity-bound unchanged token", async () => {
