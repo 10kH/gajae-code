@@ -25,8 +25,6 @@ const PACKAGE = "@gajae-code/coding-agent";
 const NPM_WRAPPER_PACKAGE = "gajae-code";
 const NPM_MANAGED_PACKAGES = [NPM_WRAPPER_PACKAGE, PACKAGE] as const;
 
-export { distTagForChannel, isUpdateChannel, UPDATE_CHANNELS, type UpdateChannel } from "../config/update-channel";
-
 export interface UpdateCommandOptions {
 	force: boolean;
 	check: boolean;
@@ -88,6 +86,9 @@ export function parseUpdateArgs(args: string[]): UpdateCommandOptions | undefine
 	let channel: UpdateChannel | undefined;
 	for (let i = 1; i < args.length; i++) {
 		const arg = args[i];
+		if (arg === "--channel" && i + 1 >= args.length) {
+			throw new Error(`Missing value for --channel. Expected one of: ${UPDATE_CHANNELS.join(", ")}.`);
+		}
 		const value =
 			arg === "--channel" ? args[++i] : arg.startsWith("--channel=") ? arg.slice("--channel=".length) : undefined;
 		if (value === undefined) continue;
@@ -234,6 +235,11 @@ async function resolveUpdateTarget(): Promise<UpdateTarget> {
 	throw new Error(formatUnsupportedTargetMessage(`Could not resolve ${APP_NAME} binary path in PATH`));
 }
 
+/** Lookup options for the release check: registry resolution plus the release channel. */
+export interface LatestReleaseLookupOptions extends NpmRegistryLookupOptions {
+	channel?: UpdateChannel;
+}
+
 /**
  * Get the latest release info for a channel from the npm registry.
  * Uses npm instead of GitHub API to avoid unauthenticated rate limiting.
@@ -242,14 +248,8 @@ async function resolveUpdateTarget(): Promise<UpdateTarget> {
  * `BUN_CONFIG_REGISTRY`) so the check reaches the same place the install does.
  * Hardcoding the public registry broke every mirrored or firewalled network.
  */
-/** Lookup options for the release check: registry resolution plus the release channel. */
-export interface LatestReleaseLookupOptions extends NpmRegistryLookupOptions {
-	channel?: UpdateChannel;
-}
-
-async function getLatestRelease(options?: Installer | LatestReleaseLookupOptions): Promise<ReleaseInfo> {
-	const overrides: LatestReleaseLookupOptions = typeof options === "string" ? { installer: options } : (options ?? {});
-	const { channel = "stable", ...lookupOptions } = overrides;
+async function getLatestRelease(options?: LatestReleaseLookupOptions): Promise<ReleaseInfo> {
+	const { channel = "stable", ...lookupOptions } = options ?? {};
 	// The user is deliberately waiting on this command, unlike the startup check.
 	let version: string;
 	let registry: string;
@@ -776,6 +776,38 @@ async function performUpdate(target: UpdateTarget, expectedVersion: string, regi
 	}
 }
 
+/** How the update command should proceed after comparing versions. */
+export interface UpdateDecision {
+	install: boolean;
+	kind: "up-to-date" | "new-version" | "switch-back" | "force";
+}
+
+/**
+ * Decide whether to install after comparing the channel's release with the
+ * installed version.
+ *
+ * A nightly install is semver-newer than every stable release (nightlies
+ * version as stable-max-patch+1), so a plain comparison would pin the user on
+ * nightly forever: switching back to stable must install even though the
+ * target is semver-lower. Only a stable lookup from a nightly build is an
+ * intentional switch-back — the reverse (a same-core nightly behind the
+ * installed stable) still requires --force.
+ */
+export function resolveUpdateDecision(options: {
+	comparison: number;
+	force: boolean;
+	channel: UpdateChannel;
+	currentVersion: string;
+}): UpdateDecision {
+	const isChannelSwitchBack =
+		options.channel === "stable" && options.currentVersion.includes("-nightly.") && options.comparison < 0;
+	if (options.comparison <= 0 && !isChannelSwitchBack && !options.force) {
+		return { install: false, kind: "up-to-date" };
+	}
+	if (isChannelSwitchBack) return { install: true, kind: "switch-back" };
+	return { install: true, kind: options.comparison > 0 ? "new-version" : "force" };
+}
+
 export async function runUpdateCommand(
 	opts: UpdateCommandOptions,
 	deps: UpdateCommandDependencies = {},
@@ -820,14 +852,28 @@ export async function runUpdateCommand(
 	// consumer can satisfy without the field.
 	for (const warning of release.warnings ?? []) console.warn(chalk.yellow(`Warning: ${warning}`));
 
-	const comparison = compareVersions(release.version, VERSION);
+	let comparison: number;
+	try {
+		comparison = compareVersions(release.version, VERSION);
+	} catch (err) {
+		console.error(
+			chalk.red(
+				`Failed to check for updates: the ${distTagForChannel(channel)} channel reported an unparseable version "${release.version}": ${err instanceof Error ? err.message : String(err)}`,
+			),
+		);
+		return exit(1);
+	}
 
-	if (comparison <= 0 && !opts.force) {
+	const decision = resolveUpdateDecision({ comparison, force: opts.force, channel, currentVersion: VERSION });
+
+	if (!decision.install) {
 		console.log(chalk.green(`${theme.status.success} Already up to date`));
 		return;
 	}
 
-	if (comparison > 0) {
+	if (decision.kind === "switch-back") {
+		console.log(chalk.cyan(`Switching to the stable channel: ${release.version}`));
+	} else if (decision.kind === "new-version") {
 		console.log(chalk.cyan(`New version available: ${release.version}`));
 	} else {
 		console.log(chalk.yellow(`Forcing reinstall of ${release.version}`));

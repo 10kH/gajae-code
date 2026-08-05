@@ -32,7 +32,17 @@ export default class Update extends Command {
 			channel = flags.channel;
 		} else {
 			const settings = await Settings.init({ cwd: getProjectDir() });
-			channel = settings.get("startup.updateChannel");
+			const configured = settings.get("startup.updateChannel");
+			if (isUpdateChannel(configured)) {
+				channel = configured;
+			} else {
+				// A hand-edited invalid value degrades to the schema default instead of
+				// leaking into output or the registry lookup.
+				process.stderr.write(
+					`Ignoring invalid startup.updateChannel "${configured}". Expected one of: ${UPDATE_CHANNELS.join(", ")}; using stable.\n`,
+				);
+				channel = "stable";
+			}
 		}
 		await initTheme();
 		await runUpdateCommand({ force: flags.force, check: flags.check, channel });

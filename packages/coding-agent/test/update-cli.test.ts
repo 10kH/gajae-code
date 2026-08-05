@@ -7,22 +7,22 @@ import type { BinaryUpdateFlow } from "../src/cli/update-cli";
 import {
 	buildReleaseBinaryUrlForTest,
 	compareVersionsForTest,
-	distTagForChannel,
 	formatBinaryDownloadFailureMessageForTest,
 	formatManualUpdateInstructionsForTest,
 	formatVerificationFailureForTest,
 	fsyncFileForTest,
 	getLatestReleaseForTest,
-	isUpdateChannel,
 	parseReportedVersionForTest,
 	parseUpdateArgs,
 	replaceBinaryForUpdate,
 	resolveNpmManagedTargetForTest,
+	resolveUpdateDecision,
 	resolveUpdateMethodForTest,
 	runBinaryUpdateFlow,
 	runPackageManagerUpdateForTest,
 	runUpdateCommand,
 } from "../src/cli/update-cli";
+import { distTagForChannel, isUpdateChannel } from "../src/config/update-channel";
 import { initTheme } from "../src/modes/theme/theme";
 import { DEFAULT_NPM_REGISTRY } from "../src/utils/npm-registry";
 
@@ -820,6 +820,142 @@ describe("update-cli release channels", () => {
 		} finally {
 			logSpy.mockRestore();
 		}
+	});
+});
+
+describe("update-cli channel robustness", () => {
+	it("rejects a trailing value-less --channel instead of silently ignoring it", () => {
+		expect(() => parseUpdateArgs(["update", "--channel"])).toThrow("Missing value for --channel");
+	});
+
+	it("requests the nightly dist-tag route for nightly lookups", async () => {
+		const requested: string[] = [];
+		const release = await getLatestReleaseForTest({
+			homeDir: "/nonexistent-home",
+			platform: "darwin",
+			readFile: async () => undefined,
+			lookupEnv: () => undefined,
+			channel: "nightly",
+			fetchImpl: async url => {
+				requested.push(url);
+				return {
+					ok: true,
+					status: 200,
+					statusText: "OK",
+					json: async () => ({ version: "1.2.3-nightly.1.1.gabc" }),
+				};
+			},
+		});
+
+		expect(requested).toEqual(["https://registry.npmjs.org/@gajae-code/coding-agent/nightly"]);
+		expect(release.version).toBe("1.2.3-nightly.1.1.gabc");
+	});
+
+	it("falls back to the packument dist-tags entry for the requested channel", async () => {
+		const requested: string[] = [];
+		const release = await getLatestReleaseForTest({
+			homeDir: "/nonexistent-home",
+			platform: "darwin",
+			readFile: async () => undefined,
+			lookupEnv: () => undefined,
+			channel: "nightly",
+			fetchImpl: async url => {
+				requested.push(url);
+				if (url.endsWith("/nightly")) {
+					return { ok: false, status: 404, statusText: "Not Found", json: async () => ({}) };
+				}
+				return {
+					ok: true,
+					status: 200,
+					statusText: "OK",
+					json: async () => ({
+						"dist-tags": { latest: "1.2.3", nightly: "1.2.4-nightly.1.1.gabc" },
+					}),
+				};
+			},
+		});
+
+		expect(requested).toEqual([
+			"https://registry.npmjs.org/@gajae-code/coding-agent/nightly",
+			"https://registry.npmjs.org/@gajae-code/coding-agent",
+		]);
+		expect(release.version).toBe("1.2.4-nightly.1.1.gabc");
+	});
+
+	it("fails closed with workflow guidance when no nightly has ever been published", async () => {
+		const failing = getLatestReleaseForTest({
+			homeDir: "/nonexistent-home",
+			platform: "darwin",
+			readFile: async () => undefined,
+			lookupEnv: () => undefined,
+			channel: "nightly",
+			fetchImpl: async () => ({ ok: false, status: 404, statusText: "Not Found", json: async () => ({}) }),
+		});
+
+		await expect(failing).rejects.toThrow("nightly channel has no published release yet");
+	});
+
+	it("exits cleanly instead of crashing when the channel reports an unparseable version", async () => {
+		const errors: string[] = [];
+		const exitCodes: number[] = [];
+		const sentinel = new Error("exit");
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(message => {
+			errors.push(String(message));
+		});
+		try {
+			await expect(
+				runUpdateCommand(
+					{ force: false, check: false },
+					{
+						getLatestRelease: async () => ({
+							tag: "vnot-a-semver",
+							version: "not-a-semver",
+							registry: DEFAULT_NPM_REGISTRY,
+							warnings: [],
+						}),
+						exit: code => {
+							exitCodes.push(code);
+							throw sentinel;
+						},
+					},
+				),
+			).rejects.toBe(sentinel);
+			expect(exitCodes).toEqual([1]);
+			expect(errors.join("\n")).toContain('unparseable version "not-a-semver"');
+		} finally {
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("resolves update decisions across the channel matrix", () => {
+		// Nightly build switching back to stable installs the semver-lower target.
+		expect(
+			resolveUpdateDecision({
+				comparison: -1,
+				force: false,
+				channel: "stable",
+				currentVersion: "0.12.12-nightly.20260805044024.123.gabcdef123456",
+			}),
+		).toEqual({ install: true, kind: "switch-back" });
+		// The reverse direction never downgrades silently: a same-core nightly
+		// behind the installed stable still requires --force.
+		expect(
+			resolveUpdateDecision({ comparison: -1, force: false, channel: "nightly", currentVersion: "0.12.12" }),
+		).toEqual({ install: false, kind: "up-to-date" });
+		expect(
+			resolveUpdateDecision({ comparison: -1, force: true, channel: "nightly", currentVersion: "0.12.12" }),
+		).toEqual({ install: true, kind: "force" });
+		// A stable build on the stable channel never treats an older release as a switch-back.
+		expect(
+			resolveUpdateDecision({ comparison: -1, force: false, channel: "stable", currentVersion: "0.12.12" }),
+		).toEqual({ install: false, kind: "up-to-date" });
+		// Ordinary newer-version and equal-version behavior is unchanged.
+		expect(
+			resolveUpdateDecision({ comparison: 1, force: false, channel: "stable", currentVersion: "0.12.11" }),
+		).toEqual({ install: true, kind: "new-version" });
+		expect(
+			resolveUpdateDecision({ comparison: 0, force: false, channel: "stable", currentVersion: "0.12.11" }),
+		).toEqual({ install: false, kind: "up-to-date" });
 	});
 });
 
