@@ -372,6 +372,28 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		},
 	},
 	{
+		name: "alibaba-token-plan-qwen-deepseek",
+		requiredProviders: ["alibaba-token-plan"],
+		mapping: {
+			default: "alibaba-token-plan/qwen-3.8-max:high",
+			executor: "alibaba-token-plan/deepseek-v4-flash-0731:high",
+			planner: "alibaba-token-plan/deepseek-v4-flash-0731:max",
+			critic: "alibaba-token-plan/qwen-3.8-max:xhigh",
+			architect: "alibaba-token-plan/qwen-3.8-max:xhigh",
+		},
+	},
+	{
+		name: "alibaba-token-plan-glm-deepseek",
+		requiredProviders: ["alibaba-token-plan"],
+		mapping: {
+			default: "alibaba-token-plan/glm-5.2:high",
+			executor: "alibaba-token-plan/deepseek-v4-flash-0731:high",
+			planner: "alibaba-token-plan/deepseek-v4-flash-0731:max",
+			critic: "alibaba-token-plan/glm-5.2:xhigh",
+			architect: "alibaba-token-plan/glm-5.2:xhigh",
+		},
+	},
+	{
 		name: "opus-codex",
 		requiredProviders: ["anthropic", "openai-codex"],
 		mapping: {
@@ -461,7 +483,7 @@ const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> 
 };
 
 describe("built-in model profile catalog", () => {
-	test("contains exact 35-profile matrix cell-for-cell", () => {
+	test("contains exact 37-profile matrix cell-for-cell", () => {
 		expect(BUILTIN_MODEL_PROFILES.map(profile => profile.name)).toEqual(
 			expectedProfiles.map(profile => profile.name),
 		);
@@ -648,6 +670,14 @@ describe("built-in model profile catalog", () => {
 			displayName: "QwenMaxxing",
 			providerGroup: "ALIBABA TOKEN PLAN",
 		});
+		expect(getModelProfilePresentation("alibaba-token-plan-qwen-deepseek")).toEqual({
+			displayName: "Qwen + DeepSeek",
+			providerGroup: "ALIBABA TOKEN PLAN",
+		});
+		expect(getModelProfilePresentation("alibaba-token-plan-glm-deepseek")).toEqual({
+			displayName: "GLM + DeepSeek",
+			providerGroup: "ALIBABA TOKEN PLAN",
+		});
 	});
 
 	test("grok-build-pro maps Composer 2.5 Fast and Grok Build roles", () => {
@@ -717,6 +747,20 @@ describe("built-in model profile catalog", () => {
 			planner: "alibaba-token-plan/qwen3.8-max-preview:medium",
 			critic: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
 			architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+		});
+		expect(builtinMapping("alibaba-token-plan-qwen-deepseek")).toEqual({
+			default: "alibaba-token-plan/qwen-3.8-max:high",
+			executor: "alibaba-token-plan/deepseek-v4-flash-0731:high",
+			planner: "alibaba-token-plan/deepseek-v4-flash-0731:max",
+			critic: "alibaba-token-plan/qwen-3.8-max:xhigh",
+			architect: "alibaba-token-plan/qwen-3.8-max:xhigh",
+		});
+		expect(builtinMapping("alibaba-token-plan-glm-deepseek")).toEqual({
+			default: "alibaba-token-plan/glm-5.2:high",
+			executor: "alibaba-token-plan/deepseek-v4-flash-0731:high",
+			planner: "alibaba-token-plan/deepseek-v4-flash-0731:max",
+			critic: "alibaba-token-plan/glm-5.2:xhigh",
+			architect: "alibaba-token-plan/glm-5.2:xhigh",
 		});
 	});
 

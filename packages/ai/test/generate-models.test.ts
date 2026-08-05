@@ -29,12 +29,14 @@ describe("injectImageGenerationModels", () => {
 });
 
 describe("injectAlibabaTokenPlanModels", () => {
-	it("adds the DeepSeek V4 Flash 0731 fallback exactly once", () => {
+	it("adds the DeepSeek V4 Flash 0731 and Qwen 3.8 Max fallbacks exactly once", () => {
 		const models: Model[] = [];
 
 		injectAlibabaTokenPlanModels(models);
 		models[0]!.name = "raw discovery name";
 		models[0]!.reasoning = false;
+		models[1]!.name = "raw discovery name";
+		models[1]!.reasoning = false;
 		injectAlibabaTokenPlanModels(models);
 
 		expect(models).toEqual([
@@ -46,6 +48,15 @@ describe("injectAlibabaTokenPlanModels", () => {
 				reasoning: true,
 				contextWindow: 1_000_000,
 				maxTokens: 384_000,
+			}),
+			expect.objectContaining({
+				id: "qwen-3.8-max",
+				name: "Qwen3.8 Max",
+				api: "openai-responses",
+				provider: "alibaba-token-plan",
+				reasoning: true,
+				contextWindow: 1_000_000,
+				maxTokens: 65_536,
 			}),
 		]);
 	});
