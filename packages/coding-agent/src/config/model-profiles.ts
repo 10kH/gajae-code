@@ -307,8 +307,8 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 	}),
 	profile("alibaba-token-plan-qwen-deepseek", ["alibaba-token-plan"], {
 		default: "alibaba-token-plan/qwen3.8-max-preview:medium",
-		executor: "alibaba-token-plan/deepseek-v4-flash-0731:low",
-		planner: "alibaba-token-plan/deepseek-v4-flash-0731:high",
+		executor: "alibaba-token-plan/deepseek-v4-flash-0731:medium",
+		planner: "alibaba-token-plan/deepseek-v4-flash-0731:xhigh",
 		architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
 		critic: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
 	}),

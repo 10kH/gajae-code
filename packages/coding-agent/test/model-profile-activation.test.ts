@@ -635,8 +635,8 @@ describe("model profile activation", () => {
 			"alibaba-token-plan-qwen-deepseek",
 			{
 				default: "alibaba-token-plan/qwen3.8-max-preview:medium",
-				executor: "alibaba-token-plan/deepseek-v4-flash-0731:low",
-				planner: "alibaba-token-plan/deepseek-v4-flash-0731:high",
+				executor: "alibaba-token-plan/deepseek-v4-flash-0731:medium",
+				planner: "alibaba-token-plan/deepseek-v4-flash-0731:xhigh",
 				critic: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
 				architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
 			},
