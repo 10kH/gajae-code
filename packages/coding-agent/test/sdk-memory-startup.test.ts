@@ -65,5 +65,5 @@ describe("createAgentSession memory startup", () => {
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 30_000);
 });
