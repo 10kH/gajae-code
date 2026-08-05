@@ -19,6 +19,7 @@ import {
 	isGjcPluginSourceShape,
 	listGjcBundles,
 	previewGjcBundleUpdate,
+	uninstallGjcBundle,
 } from "../extensibility/gjc-plugins";
 import { PluginManager, parseSettingValue, validateSetting } from "../extensibility/plugins";
 import {
@@ -627,21 +628,44 @@ async function handleInstall(
 async function handleUninstall(
 	manager: PluginManager,
 	packages: string[],
-	flags: { json?: boolean; scope?: "user" | "project" },
+	flags: { json?: boolean; scope?: "user" | "project"; user?: boolean; project?: boolean },
 ): Promise<void> {
 	if (packages.length === 0) {
 		console.error(chalk.red(`Usage: ${APP_NAME} plugin uninstall <package> ...`));
 		process.exit(1);
 	}
 
-	// For uninstall, check the installed plugins registry directly.
-	// This works even if the marketplace entry was later removed from marketplaces.json.
+	const scope = flags.scope ?? (flags.user ? "user" : flags.project ? "project" : undefined);
+	const cwd = getProjectDir();
+	const gjcBundles = await listGjcBundles({ cwd });
 	const mktMgr = await makeMarketplaceManager();
 	const installedPlugins = new Set((await mktMgr.listInstalledPlugins()).map(p => p.id));
 
 	for (const name of packages) {
+		const matches = gjcBundles.filter(
+			bundle => bundle.identity.name === name && (scope === undefined || bundle.identity.scope === scope),
+		);
+		if (matches.length > 0) {
+			if (matches.length > 1) {
+				console.error(chalk.red(`GJC bundle "${name}" is installed in both scopes; specify --user or --project.`));
+				process.exit(1);
+			}
+			const identity = matches[0].identity;
+			const result = await uninstallGjcBundle({ cwd }, identity);
+			if (!result.ok) {
+				console.error(chalk.red(`${theme.status.error} ${result.error.message}`));
+				if (result.error.recovery) console.error(chalk.dim(`  Try: ${result.error.recovery}`));
+				process.exit(3);
+			}
+			if (flags.json) {
+				console.log(JSON.stringify({ uninstalled: identity }));
+			} else {
+				console.log(chalk.green(`${theme.status.success} Uninstalled ${identity.name} (${identity.scope})`));
+			}
+			continue;
+		}
+
 		if (installedPlugins.has(name)) {
-			// Exact match against installed marketplace plugin IDs (name@marketplace)
 			try {
 				await mktMgr.uninstallPlugin(name, flags.scope);
 				console.log(chalk.green(`${theme.status.success} Uninstalled ${name}`));
@@ -652,7 +676,6 @@ async function handleUninstall(
 			continue;
 		}
 
-		// npm path
 		try {
 			await manager.uninstall(name);
 			if (flags.json) {

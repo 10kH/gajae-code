@@ -18,11 +18,12 @@ const agentDirs: string[] = [];
 async function runPluginCommand(
 	args: string[],
 	cwd: string,
+	agentDirOverride?: string,
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
 	// Isolate the user scope: without this the child process reads the real
 	// ~/.gjc/agent registry and inherits whatever the developer has installed.
-	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-command-agent-"));
-	agentDirs.push(agentDir);
+	const agentDir = agentDirOverride ?? (await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-command-agent-")));
+	if (!agentDirOverride) agentDirs.push(agentDir);
 	const proc = Bun.spawn({
 		cmd: [process.execPath, path.join(import.meta.dir, "../src/cli.ts"), "plugin", ...args],
 		cwd,
@@ -96,6 +97,24 @@ describe("Plugin command scope parsing", () => {
 		expect(gjcJson).not.toContain("manifestPath");
 		expect(gjcJson).not.toContain(os.homedir());
 		expect(gjcJson).not.toMatch(/"uri"\s*:/);
+	});
+	it("uninstalls a user-scoped GJC bundle instead of invoking npm", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-command-agent-"));
+		agentDirs.push(agentDir);
+		const cwd = await makeTempProject();
+		const fixture = path.join(import.meta.dir, "fixtures/gjc-plugins/valid-six-surface-bundle");
+
+		const install = await runPluginCommand(["install", fixture, "--user"], cwd, agentDir);
+		expect(install.exitCode).toBe(0);
+
+		const uninstall = await runPluginCommand(["uninstall", "valid-six-surface-bundle", "--user"], cwd, agentDir);
+		expect(uninstall.exitCode).toBe(0);
+		expect(uninstall.stderr).toBe("");
+		expect(uninstall.stdout).toContain("Uninstalled valid-six-surface-bundle (user)");
+
+		const listed = await runPluginCommand(["list", "--json"], cwd, agentDir);
+		expect(listed.exitCode).toBe(0);
+		expect(JSON.parse(listed.stdout)).toMatchObject({ gjc: [] });
 	});
 
 	it("GJC install and upgrade failures never echo the source or its cause", async () => {

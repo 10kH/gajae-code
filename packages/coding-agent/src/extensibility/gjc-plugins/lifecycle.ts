@@ -14,7 +14,13 @@ import {
 	surfaceIdsOf,
 	targetFingerprint,
 } from "./lifecycle-reconciliation";
-import { readRegistry, sortRegistryEntries, withRegistryLock, writeRegistryUnlocked } from "./registry";
+import {
+	readRegistry,
+	registryRootForScope,
+	sortRegistryEntries,
+	withRegistryLock,
+	writeRegistryUnlocked,
+} from "./registry";
 import type {
 	GjcBundleIdentity,
 	GjcBundleSafeSource,
@@ -222,6 +228,41 @@ export async function getGjcBundle(
 	const entry = registry.plugins.find(p => p.name === identity.name);
 	if (!entry) return { ok: false, error: notInstalled(identity) };
 	return { ok: true, value: toBundleSummary(entry) };
+}
+
+function safeInstalledRoot(scope: GjcPluginScope, cwd: string, pluginRoot: string): string | null {
+	const root = path.resolve(pluginRoot);
+	const scopeRoot = path.resolve(registryRootForScope(scope, cwd));
+	const relative = path.relative(scopeRoot, root);
+	if (!relative || relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) return null;
+	return root;
+}
+
+export async function uninstallGjcBundle(
+	ctx: GjcLifecycleContext,
+	identity: GjcBundleIdentity,
+): Promise<GjcLifecycleResult<{ identity: GjcBundleIdentity; summary: GjcBundleSummary }>> {
+	return withRegistryLock(identity.scope, ctx.cwd, async () => {
+		const registry = await readRegistry(identity.scope, ctx.cwd);
+		const entry = registry.plugins.find(plugin => plugin.name === identity.name);
+		if (!entry) return { ok: false, error: notInstalled(identity) };
+
+		const root = safeInstalledRoot(identity.scope, ctx.cwd, entry.pluginRoot);
+		if (!root) {
+			return {
+				ok: false,
+				error: fail("invalid_target", `GJC bundle "${identity.name}" has an invalid installed target`),
+			};
+		}
+
+		const summary = toBundleSummary(entry);
+		await fs.rm(root, { recursive: true, force: true });
+		await writeRegistryUnlocked(
+			{ ...registry, plugins: registry.plugins.filter(plugin => plugin !== entry) },
+			ctx.cwd,
+		);
+		return { ok: true, value: { identity, summary } };
+	});
 }
 
 function notInstalled(identity: GjcBundleIdentity): GjcLifecycleError {

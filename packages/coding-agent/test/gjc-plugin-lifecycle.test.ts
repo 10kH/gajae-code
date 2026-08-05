@@ -15,6 +15,7 @@ import {
 	redactSourceLocator,
 	setGjcBundleEnabled,
 	setGjcBundleSurfaceEnabled,
+	uninstallGjcBundle,
 } from "../src/extensibility/gjc-plugins";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
@@ -103,6 +104,20 @@ describe("GJC bundle lifecycle", () => {
 		const disabled = await setGjcBundleEnabled({ cwd }, project, false);
 		expect(disabled).toMatchObject({ ok: true, value: { mutated: true, summary: { enabled: false } } });
 		expect(await summary(cwd, user)).toEqual(userBefore);
+	});
+	test("uninstalls a user bundle and removes its installed root", async () => {
+		const cwd = await mkProjectCwd();
+		const identity = await installFixture(cwd, "user");
+		const registryBefore = await readRegistry("user", cwd);
+		const entry = registryBefore.plugins.find(plugin => plugin.name === identity.name);
+		expect(entry).toBeDefined();
+		if (!entry) throw new Error("missing installed entry");
+		expect(await fs.stat(entry.pluginRoot)).toBeTruthy();
+
+		const result = await uninstallGjcBundle({ cwd }, identity);
+		expect(result).toMatchObject({ ok: true, value: { identity } });
+		expect((await readRegistry("user", cwd)).plugins).toHaveLength(0);
+		await expect(fs.stat(entry.pluginRoot)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
 	test("previews unchanged source with an identity-bound unchanged token", async () => {
