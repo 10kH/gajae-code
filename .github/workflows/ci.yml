@@ -510,27 +510,42 @@ jobs:
               if-no-files-found: error
               retention-days: 30
               overwrite: true
-         - name: Reject pre-existing nightly tag or release
-           if: ${{ needs.release_metadata.outputs.channel == 'nightly' }}
+         - name: Reject pre-existing release tag or release
            env:
               GH_TOKEN: ${{ github.token }}
               TAG_NAME: ${{ needs.release_metadata.outputs.tag_name }}
+              SOURCE_SHA: ${{ github.sha }}
            shell: bash
            run: |
               set -euo pipefail
               remote_tags="$(git ls-remote --tags origin "refs/tags/$TAG_NAME" "refs/tags/$TAG_NAME^{}")"
               if [ -n "$remote_tags" ]; then
-                 echo "Nightly tag $TAG_NAME already exists; refusing release upsert" >&2
-                 exit 1
+                 peeled="$(printf '%s' "$remote_tags" | awk '{print $1}')"
+                 # A same-run retry may legitimately encounter the tag this run already pushed.
+                 # Accept it only if it peels to exactly this run's source commit.
+                 if [ "$peeled" != "$SOURCE_SHA" ]; then
+                    echo "Release tag $TAG_NAME already exists and does not peel to $SOURCE_SHA; refusing upsert" >&2
+                    exit 1
+                 fi
               fi
-              status="$(curl --silent --show-error --output "$RUNNER_TEMP/nightly-release-preflight.json" --write-out '%{http_code}' \
+              status="$(curl --silent --show-error --output "$RUNNER_TEMP/release-preflight.json" --write-out '%{http_code}' \
                  --header "Authorization: Bearer $GH_TOKEN" \
                  --header "Accept: application/vnd.github+json" \
                  "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$TAG_NAME")"
               case "$status" in
                  404) ;;
-                 200) echo "Nightly release $TAG_NAME already exists; refusing release upsert" >&2; exit 1 ;;
-                 *) echo "Cannot verify nightly release absence: GitHub API returned HTTP $status" >&2; exit 1 ;;
+                 200)
+                    existing_sha="$(RELEASE_JSON="$RUNNER_TEMP/release-preflight.json" bun -e '
+                       const release = await Bun.file(Bun.env.RELEASE_JSON).json();
+                       const sha = release.target_commitish;
+                       process.stdout.write(typeof sha === "string" ? sha : "");
+                    ')"
+                    if [ "$existing_sha" != "$SOURCE_SHA" ]; then
+                       echo "Release $TAG_NAME already exists targeting $existing_sha, expected $SOURCE_SHA; refusing upsert" >&2
+                       exit 1
+                    fi
+                    ;;
+                 *) echo "Cannot verify release absence: GitHub API returned HTTP $status" >&2; exit 1 ;;
               esac
          - name: Publish packages to npm
            env:

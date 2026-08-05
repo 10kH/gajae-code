@@ -173,10 +173,10 @@ describe("stable release policy", () => {
 		expect(publish).toContain("--release-channel \"$RELEASE_CHANNEL\"");
 		expect(publish).toContain("Persist pre-publication package evidence");
 		expect(publish).toContain("release-evidence-${{ needs.release_metadata.outputs.version }}");
-		expect(publish).toContain("Reject pre-existing nightly tag or release");
+		expect(publish).toContain("Reject pre-existing release tag or release");
 		expect(publish).toContain("fail_on_unmatched_files: true");
 		expect(publish).toContain("Verify immutable GitHub Release");
-		expect(publish.indexOf("Reject pre-existing nightly tag or release")).toBeLessThan(publish.indexOf("Publish packages to npm"));
+		expect(publish.indexOf("Reject pre-existing release tag or release")).toBeLessThan(publish.indexOf("Publish packages to npm"));
 		expect(publish).toContain("gajae-nightly-release");
 		expect(publish).toContain("prerelease: ${{ needs.release_metadata.outputs.channel == 'nightly' }}");
 		expect(publish).toContain("make_latest: ${{ needs.release_metadata.outputs.channel != 'nightly' }}");
