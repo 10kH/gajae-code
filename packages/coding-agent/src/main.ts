@@ -1608,6 +1608,9 @@ export async function runRootCommand(
 		sessionOptions.deferMcpConfigStartup = true;
 	}
 	const hasRootStartupProfile = Boolean(settingsInstance.get("modelProfile.default") || parsedArgs.mpreset);
+	const deferMemoryBackendStartup =
+		hasRootStartupProfile && !(parsedArgs.authBootstrap === true && isInteractive) && mode !== "acp";
+	sessionOptions.deferMemoryBackendStartup = deferMemoryBackendStartup;
 
 	// Research-mode (RLM) preset: augment session options before session creation.
 	deps.rlmPreset?.applyOptions(sessionOptions, settingsInstance);
@@ -1694,6 +1697,7 @@ export async function runRootCommand(
 			lspServers,
 			mcpManager,
 			startDeferredMcpConfig,
+			startDeferredMemoryBackend,
 			eventBus,
 		} = await createSession(sessionOptions, { skipPostCreateModelRefresh: hasRootStartupProfile });
 		applyCliRuntimeApiKeyOverride(authStorage, parsedArgs.apiKey, session.model);
@@ -1733,6 +1737,7 @@ export async function runRootCommand(
 				startDeferredModelProfiles = async () => {
 					try {
 						const result = await applyDeferredStartupModelProfilesForRoot(profileArgs);
+						startDeferredMemoryBackend?.();
 						ready.resolve();
 						return result;
 					} catch (error) {
@@ -1742,6 +1747,7 @@ export async function runRootCommand(
 				};
 			} else {
 				const { recoverableErrors } = await applyStartupModelProfilesForRoot(profileArgs);
+				startDeferredMemoryBackend?.();
 				for (const recoverableError of recoverableErrors) {
 					notifs.push({ kind: "error", message: recoverableError });
 				}
