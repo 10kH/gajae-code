@@ -456,11 +456,17 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 			requiresReasoningContentForToolCalls: true,
 		};
 	}
-	// MiniMax-M3: MiniMax exposes a 1M context tier, but usage beyond 512K is
-	// billed separately. Keep bundled/default metadata at the billing-safe 512K
-	// unless an explicit paid-tier contract is added.
-	if (model.provider !== "opencode-go" && model.id === "minimax-m3") {
-		model.contextWindow = 512_000;
+	// MiniMax-M3's official Token Plan routes expose a 1M context window.
+	// Scope the correction to the four first-class regional MiniMax routes;
+	// unrelated catalog aliases and providers keep their own contracts.
+	if (
+		model.id === "minimax-m3" &&
+		(model.provider === "minimax" ||
+			model.provider === "minimax-cn" ||
+			model.provider === "minimax-code" ||
+			model.provider === "minimax-code-cn")
+	) {
+		model.contextWindow = 1_000_000;
 	}
 }
 
