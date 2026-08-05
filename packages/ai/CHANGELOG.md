@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- OpenAI Responses and Azure OpenAI Responses now map the first-event timeout into the SDK request/setup timeout the same way Completions does, so a never-resolving pre-headers fetch on a provider-owned lazy stream cannot wait the SDK's 10-minute default before any transport watchdog exists. Alibaba Responses honors an explicit shorter first-event override before headers; Azure/env-pinned setup timeouts normalize to the typed `stream_first_event_timeout` failure.
 - OpenAI Codex cost estimates now treat an explicit response `service_tier` as authoritative, so a request for priority processing that the provider serves at the default tier is no longer charged the priority multiplier; the requested tier remains the fallback when the terminal response omits the field.
 - Added shared `isReasoningContentReplayError` classifier and `stripUnusableReasoningItems` repair for the DeepSeek-family reasoning-content replay rejection ("The `reasoning_content` in the thinking mode must be passed back to the API"). The classifier detects the error across message carrier shapes; the repair removes only `reasoning` items whose `encrypted_content` a proxy stripped to empty, preserving all non-reasoning history (text, tool calls, tool outputs). The agent loop consumes both for a bounded repair-and-resend circuit breaker.
 
@@ -34,6 +35,7 @@
 ### Fixed
 
 - Closed the two remaining ingress holes behind bare `Request Blocked` failures on OpenAI codex models. (1) The chatgpt.com/backend-api pre-model gate rejects with an HTTP 400 bare-`detail` body (`{"detail": "Request blocked."}`) carrying no `error.*` envelope and no `code=invalid_prompt`, so `parseCodexError` surfaced an unexplained message, `isInvalidPromptError` and the codex non-retryable classification missed it, and the session-level `invalid_prompt` circuit breaker never attempted a repaired resend. `parseCodexError` now reads top-level `detail` (string or `{message}`) bodies and classifies a leading `Request blocked` message without an explicit provider code as `invalid_prompt`, surfacing `Request blocked (code=invalid_prompt)` so every existing invalid_prompt contract engages. (2) Outgoing tool definitions (descriptions and JSON-schema strings) bypassed every request-boundary sanitizer on both the OpenAI Responses and OpenAI-codex-responses transports, so a `<|channel|>`-quoting MCP/skill tool description poisoned every request on the session in a way no history repair could fix. Both `convertTools` paths now neutralize reserved control tokens across the whole tool payload via the shared idempotent zero-width-space insertion (ref openai/codex#35838).
+- Lazy built-in streams no longer place a normalized-event watchdog in front of providers that already monitor raw transport progress. This prevents active Anthropic, Azure OpenAI, and OpenAI-family streams from being replaced by a blank `Provider stream stalled while waiting for the next event` error when transport-only events refresh the provider watchdog; providers without their own watchdog keep the shared lazy-stream protection.
 
 ### Fixed
 

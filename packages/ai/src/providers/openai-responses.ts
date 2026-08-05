@@ -43,6 +43,7 @@ import {
 	getProviderFirstEventTimeoutFallbackMs,
 	getStreamFirstEventTimeoutMs,
 	iterateWithIdleTimeout,
+	resolveOpenAISdkRequestTimeoutMs,
 } from "../utils/idle-iterator";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { notifyProviderResponse } from "../utils/provider-response";
@@ -85,6 +86,7 @@ import {
 	convertResponsesAssistantMessage,
 	convertResponsesInputContent,
 	createInitialResponsesAssistantMessage,
+	isOpenAIResponsesProgressEvent,
 	normalizeResponsesToolCallIdForTransform,
 	processResponsesStream,
 	repairOrphanResponsesToolOutputs,
@@ -229,32 +231,6 @@ function appendQueryToRequest(input: string | URL | Request, query?: OpenAIRespo
 	return url;
 }
 
-const OPENAI_RESPONSES_PROGRESS_EVENT_TYPES = new Set([
-	"response.created",
-	"response.output_item.added",
-	"response.reasoning_summary_part.added",
-	"response.reasoning_summary_text.delta",
-	"response.reasoning_summary_part.done",
-	"response.reasoning_text.delta",
-	"response.content_part.added",
-	"response.output_text.delta",
-	"response.refusal.delta",
-	"response.function_call_arguments.delta",
-	"response.function_call_arguments.done",
-	"response.custom_tool_call_input.delta",
-	"response.custom_tool_call_input.done",
-	"response.output_item.done",
-	"response.completed",
-	"response.failed",
-	"error",
-]);
-
-function isOpenAIResponsesProgressEvent(event: unknown): boolean {
-	if (!event || typeof event !== "object") return false;
-	const type = (event as { type?: unknown }).type;
-	return typeof type === "string" && OPENAI_RESPONSES_PROGRESS_EVENT_TYPES.has(type);
-}
-
 interface OpenAIResponsesProviderSessionState extends ProviderSessionState {
 	nativeHistoryReplayWarmed: boolean;
 }
@@ -343,6 +319,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				options?.requestMaxRetries,
 				options?.maxRetryDelayMs,
 				options?.attemptScope,
+				options?.streamFirstEventTimeoutMs,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);
@@ -498,6 +475,7 @@ function createClient(
 	requestMaxRetries?: number,
 	maxRetryDelayMs?: number,
 	attemptScope?: import("../types.js").AttemptScopeRef,
+	streamFirstEventTimeoutOverride?: number,
 ): {
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
@@ -568,6 +546,9 @@ function createClient(
 		model.requestTransform,
 		`Gajae-Code/${packageJson.version}`,
 	);
+	// Bound HTTP request timeout to the first-event window so a stalled-before-headers
+	// fetch cannot wait the SDK's 10-minute default before the transport watchdog arms.
+	const sdkTimeoutMs = resolveOpenAISdkRequestTimeoutMs(model.provider, streamFirstEventTimeoutOverride);
 	return {
 		client: new OpenAI({
 			apiKey,
@@ -578,6 +559,7 @@ function createClient(
 			fetch: onSseEvent
 				? wrapFetchForSseDebug(transformedFetch, event => onSseEvent(event, model, attemptScope))
 				: transformedFetch,
+			...(sdkTimeoutMs !== undefined ? { timeout: sdkTimeoutMs } : {}),
 		}),
 		copilotPremiumRequests,
 		baseUrl,
