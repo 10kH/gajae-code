@@ -23,6 +23,8 @@
 
 ### Fixed
 
+- Fixed deep-interview prompts exposing the literal argument placeholder.
+
 - Automatic session retry now refuses to re-issue a request once the failed attempt carries observable assistant text, thinking, or tool-call content — including under explicit legacy `retry.*` settings. Content-free clean failures keep their existing bounded/unbounded policy; managed provisional discard, credential rotation, first-event timeout scope checks, and manual `/retry` are unchanged (#3791).
 - Resuming a session whose transcript file is at or above the ~64 MiB managed-storage per-file bound no longer OOMs, stalls the process, or fails with a bare unhandled rejection. Resume/open now fail closed with a structured `oversized` reason (`SessionTranscriptOversizedError`) and recovery guidance before the full read/decode/parse path, instead of loading the entire file into memory. The bound matches the existing managed-artifact per-file limit and is not raised; sub-limit sessions resume unchanged (#3851).
 
