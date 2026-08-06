@@ -171,6 +171,48 @@ describe("GJC bundle lifecycle", () => {
 		await expect(fs.stat(entry.pluginRoot)).resolves.toBeTruthy();
 	});
 
+	// A registry whose `pluginRoot` points outside the scope root is the shape a
+	// tampered or hand-edited registry takes; uninstall must refuse it instead of
+	// deleting whatever the path names.
+	test("refuses to remove a registry root that escapes the scope directory", async () => {
+		const cwd = await mkProjectCwd();
+		const identity = await installFixture(cwd, "user");
+		const outside = await mkProjectCwd();
+		const sentinel = path.join(outside, "keep-me.txt");
+		await fs.writeFile(sentinel, "not yours to delete");
+
+		const registryPath = registryPathForScope("user", cwd);
+		const raw = JSON.parse(await fs.readFile(registryPath, "utf8")) as {
+			plugins: Array<Record<string, unknown>>;
+		};
+		const entry = raw.plugins[0];
+		expect(entry).toBeDefined();
+		if (!entry) throw new Error("missing installed entry");
+		entry.pluginRoot = outside;
+		await fs.writeFile(registryPath, JSON.stringify(raw));
+
+		const result = await uninstallGjcBundle({ cwd }, identity);
+
+		expect(result).toMatchObject({ ok: false, error: { code: "invalid_target" } });
+		await expect(fs.readFile(sentinel, "utf8")).resolves.toBe("not yours to delete");
+		expect((await readRegistry("user", cwd)).plugins).toHaveLength(1);
+	});
+
+	test("installs the same bundle again after an uninstall", async () => {
+		const cwd = await mkProjectCwd();
+		const identity = await installFixture(cwd, "user");
+		expect(await uninstallGjcBundle({ cwd }, identity)).toMatchObject({ ok: true });
+
+		const reinstalled = await installGjcBundle({ cwd }, "user", sixSurface);
+
+		expect(reinstalled.ok).toBe(true);
+		if (!reinstalled.ok) throw new Error(reinstalled.error.code);
+		expect(reinstalled.value.summary.identity).toEqual(identity);
+		const registry = await readRegistry("user", cwd);
+		expect(registry.plugins).toHaveLength(1);
+		await expect(fs.stat(registry.plugins[0].pluginRoot)).resolves.toBeTruthy();
+	});
+
 	test("previews unchanged source with an identity-bound unchanged token", async () => {
 		const cwd = await mkProjectCwd();
 		const identity = await installFixture(cwd, "project");

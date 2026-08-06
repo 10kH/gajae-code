@@ -116,6 +116,78 @@ describe("Plugin command scope parsing", () => {
 		expect(listed.exitCode).toBe(0);
 		expect(JSON.parse(listed.stdout)).toMatchObject({ gjc: [] });
 	});
+
+	// An unqualified uninstall of a name present in both scopes must refuse
+	// rather than guess, and must not remove either copy.
+	it("refuses an ambiguous uninstall when the bundle is installed in both scopes", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-command-agent-"));
+		agentDirs.push(agentDir);
+		const cwd = await makeTempProject();
+		const fixture = path.join(import.meta.dir, "fixtures/gjc-plugins/valid-six-surface-bundle");
+
+		expect((await runPluginCommand(["install", fixture, "--user"], cwd, agentDir)).exitCode).toBe(0);
+		expect((await runPluginCommand(["install", fixture, "--project"], cwd, agentDir)).exitCode).toBe(0);
+
+		const ambiguous = await runPluginCommand(["uninstall", "valid-six-surface-bundle"], cwd, agentDir);
+		expect(ambiguous.exitCode).toBe(1);
+		expect(ambiguous.stderr).toContain("installed in both scopes");
+
+		const listed = await runPluginCommand(["list", "--json"], cwd, agentDir);
+		const scopes = (JSON.parse(listed.stdout) as { gjc: Array<{ identity: { scope: string } }> }).gjc.map(
+			bundle => bundle.identity.scope,
+		);
+		expect(scopes.toSorted()).toEqual(["project", "user"]);
+	});
+
+	it("scopes an explicit --project uninstall to the project copy", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-command-agent-"));
+		agentDirs.push(agentDir);
+		const cwd = await makeTempProject();
+		const fixture = path.join(import.meta.dir, "fixtures/gjc-plugins/valid-six-surface-bundle");
+
+		expect((await runPluginCommand(["install", fixture, "--user"], cwd, agentDir)).exitCode).toBe(0);
+		expect((await runPluginCommand(["install", fixture, "--project"], cwd, agentDir)).exitCode).toBe(0);
+
+		const uninstall = await runPluginCommand(["uninstall", "valid-six-surface-bundle", "--project"], cwd, agentDir);
+		expect(uninstall.exitCode).toBe(0);
+		expect(uninstall.stdout).toContain("Uninstalled valid-six-surface-bundle (project)");
+
+		const listed = await runPluginCommand(["list", "--json"], cwd, agentDir);
+		expect(
+			(JSON.parse(listed.stdout) as { gjc: Array<{ identity: { scope: string } }> }).gjc.map(
+				bundle => bundle.identity.scope,
+			),
+		).toEqual(["user"]);
+	});
+
+	// The recovery path the whole uninstall command exists for: a user who
+	// uninstalled must be able to install the same bundle again without hitting
+	// `already_installed_use_upgrade` residue.
+	it("reinstalls the same bundle cleanly after an uninstall", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-command-agent-"));
+		agentDirs.push(agentDir);
+		const cwd = await makeTempProject();
+		const fixture = path.join(import.meta.dir, "fixtures/gjc-plugins/valid-six-surface-bundle");
+
+		expect((await runPluginCommand(["install", fixture, "--user"], cwd, agentDir)).exitCode).toBe(0);
+		expect(
+			(await runPluginCommand(["uninstall", "valid-six-surface-bundle", "--user"], cwd, agentDir)).exitCode,
+		).toBe(0);
+
+		const reinstall = await runPluginCommand(["install", fixture, "--user"], cwd, agentDir);
+		expect(reinstall.exitCode).toBe(0);
+		expect(reinstall.stderr).toBe("");
+		expect(`${reinstall.stdout}${reinstall.stderr}`).not.toContain("already_installed");
+
+		const listed = await runPluginCommand(["list", "--json"], cwd, agentDir);
+		expect(JSON.parse(listed.stdout)).toMatchObject({
+			gjc: [
+				expect.objectContaining({
+					identity: { kind: "gjc-bundle", scope: "user", name: "valid-six-surface-bundle" },
+				}),
+			],
+		});
+	});
 	it("falls back to non-GJC uninstall when the GJC registry is corrupt", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-command-agent-"));
 		agentDirs.push(agentDir);
