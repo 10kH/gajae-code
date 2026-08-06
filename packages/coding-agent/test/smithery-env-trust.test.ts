@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -46,6 +46,12 @@ afterEach(() => {
 	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
+// Per-spawn budget for the probe child. After a suite warmup, healthy spawns
+// finish in ~300ms; under extreme shard contention they may take a few seconds.
+// Kill rather than wait for the outer it() timeout so a stalled child cannot
+// pin the suite for the full 60s and leak pipes.
+const PROBE_SPAWN_BUDGET_MS = 45_000;
+
 async function resolveIn(cwd: string, overrides: Record<string, string> = {}): Promise<Resolved> {
 	const env: Record<string, string> = {};
 	for (const [key, value] of Object.entries(process.env)) {
@@ -59,10 +65,32 @@ async function resolveIn(cwd: string, overrides: Record<string, string> = {}): P
 	Object.assign(env, overrides);
 
 	const proc = Bun.spawn([process.execPath, PROBE], { cwd, env, stdout: "pipe", stderr: "pipe" });
-	const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-	const exitCode = await proc.exited;
-	if (exitCode !== 0) throw new Error(`probe failed (${exitCode}): ${stderr}`);
-	return JSON.parse(stdout.trim()) as Resolved;
+	let timedOut = false;
+	const timer = setTimeout(() => {
+		timedOut = true;
+		try {
+			proc.kill();
+		} catch {
+			// already exited
+		}
+	}, PROBE_SPAWN_BUDGET_MS);
+	try {
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		if (timedOut) {
+			throw new Error(
+				`probe timed out after ${PROBE_SPAWN_BUDGET_MS}ms and was killed` +
+					(stderr.trim() ? `: ${stderr.trim()}` : ""),
+			);
+		}
+		if (exitCode !== 0) throw new Error(`probe failed (${exitCode}): ${stderr}`);
+		return JSON.parse(stdout.trim()) as Resolved;
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 const PLANTED = [
@@ -72,6 +100,17 @@ const PLANTED = [
 ].join("\n");
 
 describe("Smithery env trust boundary", () => {
+	// Cold-start the probe module graph outside per-test budgets. Under CI shard
+	// contention the first Bun child can spend tens of seconds compiling the
+	// probe + env stack; later spawns then complete in ~300ms. Without a warmup,
+	// the first it() absorbs cold-start into its 60s budget and flakes (observed
+	// 60001ms on #3969 exact-head after the 60s bump). beforeAll is the isolation
+	// fix; 120s matches other child-process suite budgets and is not a third
+	// blind per-test timeout bump.
+	beforeAll(async () => {
+		await resolveIn(projectDir());
+	}, 120_000);
+
 	it("uses the built-in endpoints and no key by default", async () => {
 		const resolved = await resolveIn(projectDir());
 		expect(resolved.url).toBe("https://smithery.ai");
