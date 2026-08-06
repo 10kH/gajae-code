@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.13] - 2026-08-06
+
 ### Fixed
 
 - `fetchWithRetry` now clamps every scheduled retry delay to the platform timer ceiling so large backoffs and server hints cannot overflow into immediate retries.

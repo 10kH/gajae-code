@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.13] - 2026-08-06
+
 ### Fixed
 
 - An aborted run whose tool ignores its `AbortSignal` now terminates on its own (#3894). `Promise.allSettled` waited on the unresolved call forever, so the turn only ended when the session's force-abort budget expired; the loop now emits a synthetic aborted result for the outstanding calls and `waitForIdle` settles immediately. Session dispose consequently reaches idle through the cooperative path instead of force-invalidating the run.
