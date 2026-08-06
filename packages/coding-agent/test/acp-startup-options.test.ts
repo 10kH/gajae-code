@@ -93,6 +93,33 @@ test("ACP reverse requests use canonical names, session scope, and cancellation"
 	]);
 	expect(typedCalls).toEqual([]);
 });
+test("ACP reverse permission responses normalize the spec-shaped outcome into the SDK decision contract", async () => {
+	const selectedConnection = {
+		request: async () => ({ outcome: { outcome: "selected", optionId: "allow_once" } }),
+	} as unknown as AgentSideConnection;
+	const selectedReverse = createAcpReverseConnection(selectedConnection, "session-1");
+	expect(await selectedReverse.request?.("request", { toolCallId: "call-1" })).toEqual({
+		outcome: "selected",
+		optionId: "allow_once",
+	});
+
+	const cancelledConnection = {
+		request: async () => ({ outcome: { outcome: "cancelled" } }),
+	} as unknown as AgentSideConnection;
+	const cancelledReverse = createAcpReverseConnection(cancelledConnection, "session-1");
+	expect(await cancelledReverse.request?.("request", { toolCallId: "call-2" })).toEqual({
+		outcome: "cancelled",
+	});
+
+	const flatConnection = {
+		request: async () => ({ outcome: "selected", optionId: "allow_always" }),
+	} as unknown as AgentSideConnection;
+	const flatReverse = createAcpReverseConnection(flatConnection, "session-1");
+	expect(await flatReverse.request?.("request", { toolCallId: "call-3" })).toEqual({
+		outcome: "selected",
+		optionId: "allow_always",
+	});
+});
 
 test("ACP maps non-prompt permission handling to the SDK allow policy", async () => {
 	const modes: string[] = [];

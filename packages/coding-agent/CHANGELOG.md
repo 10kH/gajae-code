@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- ACP `session/request_permission` responses are now normalized from the spec-shaped `RequestPermissionResponse` (`{ outcome: { outcome, optionId } }`) into the SDK's flat permission-decision contract before reaching the permission provider. Standards-compliant ACP clients such as Paseo answer with the nested shape, which previously made every permission-gated tool call (bash, edit, write) fail with "permission provider returned an invalid response"; the flat legacy shape keeps passing through unchanged.
 
 ### Added
 

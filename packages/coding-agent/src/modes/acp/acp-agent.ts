@@ -785,13 +785,26 @@ export function createAcpReverseConnection(connection: AgentSideConnection, sess
 			const rawRequest = (connection as unknown as Record<string, unknown>).request;
 			if (typeof rawRequest !== "function")
 				throw new AcpSdkAdapterError("acp_reverse_unavailable", "ACP reverse request surface is unavailable.");
-			return await (
+			const result = await (
 				rawRequest as (
 					method: string,
 					input: JsonObject,
 					options?: { cancellationSignal?: AbortSignal },
 				) => Promise<unknown>
 			).call(connection, name, { ...params, sessionId }, options);
+			// ACP clients answer `session/request_permission` with the spec-shaped
+			// `RequestPermissionResponse` `{ outcome: { outcome, optionId } }`, while the
+			// SDK permission-provider contract is the flat decision `{ outcome, optionId }`.
+			// Normalize the outer wrapper (accepting the flat legacy shape as well) so
+			// permission-gated tool calls resolve instead of failing as an invalid response.
+			const response = object(result);
+			if (name === "session/request_permission" && response) {
+				const decision = object(response.outcome) ?? response;
+				if (decision.outcome === "cancelled") return { outcome: "cancelled" };
+				if (decision.outcome === "selected" && typeof decision.optionId === "string")
+					return { outcome: "selected", optionId: decision.optionId };
+			}
+			return result;
 		},
 	};
 }
