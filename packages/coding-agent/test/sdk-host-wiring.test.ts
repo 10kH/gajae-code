@@ -6243,3 +6243,78 @@ test("canonical subagent lifecycle keeps the parent workflow-gate runtime turn c
 		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 	}
 });
+
+/**
+ * Regression: a continuation (todo reminder, TTSR resume, auto-continue) re-enters
+ * the agent loop inside one prompt and emits a second `agent_start`. That start
+ * used to shift the empty pending queue and overwrite the live correlation with
+ * `undefined`, so the prompt's `agent_end` carried no correlation, was never
+ * terminalized, and every ACP client hung until the 30-minute prompt deadline.
+ */
+test("SDK host keeps the prompt correlation across a mid-prompt continuation agent_start", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-continuation-correlation-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-continuation-correlation-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(sessionContext);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "continuation-prompt",
+			operation: "turn.prompt",
+			input: { text: "read the file and answer" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "continuation-prompt"),
+		"prompt acknowledgement",
+	);
+	const acknowledgement = frames.find(
+		frame => frame.type === "control_response" && frame.id === "continuation-prompt",
+	) as { result?: { commandId?: unknown; turnId?: unknown } };
+	const commandId = acknowledgement.result?.commandId;
+	const turnId = acknowledgement.result?.turnId;
+	expect(acknowledgement).toMatchObject({
+		ok: true,
+		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
+	});
+
+	// First loop entry claims the pending correlation.
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	await waitFor(
+		() => frames.some(frame => frame.type === "agent_start" && frame.commandId === commandId),
+		"correlated agent start",
+	);
+
+	// The continuation re-enters the loop while the same prompt is still in flight.
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+
+	// The terminal must still carry this prompt's exact identity.
+	await handlers.get("agent_end")?.(
+		{ type: "agent_end", stopReason: "completed", messages: [{ role: "assistant", stopReason: "stop" }] } as never,
+		sessionContext,
+	);
+	await waitFor(() => frames.some(frame => frame.type === "agent_end"), "correlated prompt terminal");
+	expect(frames.find(frame => frame.type === "agent_end")).toMatchObject({
+		sessionId,
+		commandId,
+		turnId,
+		outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+	});
+	// The continuation must not publish a duplicate lifecycle start.
+	expect(frames.filter(frame => frame.type === "agent_start").length).toBe(1);
+
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});

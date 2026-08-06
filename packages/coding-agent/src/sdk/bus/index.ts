@@ -6193,9 +6193,16 @@ export function createNotificationsExtension(
 		// Streaming state is SDK-visible session truth (context.get isStreaming);
 		// it is tracked regardless of whether notifications are active.
 		rt.busy = true;
-		const correlation = rt.pendingPromptCorrelations.shift();
+		// A continuation re-enters the agent loop inside the same prompt and emits
+		// another `agent_start`. Shifting again would pop nothing and clobber the
+		// live correlation with `undefined`, so the prompt's `agent_end` could no
+		// longer be terminalized and the caller would hang until the deadline.
+		// Only claim the next pending correlation when this session has no active one.
+		const correlation = rt.activePromptCorrelation ?? rt.pendingPromptCorrelations.shift();
+		const continuation = rt.activePromptCorrelation !== undefined;
 		rt.activePromptCorrelation = correlation;
-		if (correlation) rt.bindPromptExecutionHandle(correlation, ctx.getActivePromptHandle());
+		if (correlation && !continuation) rt.bindPromptExecutionHandle(correlation, ctx.getActivePromptHandle());
+		if (continuation) return;
 		rt.notePromptReconciliation(correlation, { type: "agent_start" });
 		rt.emitPromptLifecycle(correlation, { type: "agent_start", sessionId: id, ...correlation });
 		try {
