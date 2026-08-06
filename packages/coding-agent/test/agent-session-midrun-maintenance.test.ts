@@ -10,7 +10,11 @@ import { loadExtensions } from "@gajae-code/coding-agent/extensibility/extension
 import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
-import { getLatestCompactionEntry, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import {
+	getLatestCompactionEntry,
+	SessionManager,
+	SessionManagerTestHooks,
+} from "@gajae-code/coding-agent/session/session-manager";
 import { getProjectAgentDir, TempDir } from "@gajae-code/utils";
 
 /**
@@ -148,6 +152,57 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 
 	function contextOf(s: AgentSession): AgentContext {
 		return { systemPrompt: s.state.systemPrompt, messages: s.messages, tools: [] };
+	}
+	/**
+	 * Seed an older large bash tool result (prunable) plus a recent protected
+	 * turn fence so mid-run maintenance prefers tool-output eviction.
+	 */
+	async function seedPrunableToolConversation(
+		s: AgentSession,
+		output: string,
+		finalUsageTotal: number,
+	): Promise<string> {
+		const toolCallId = "evict-call";
+		await seed(s, [
+			{ role: "user", content: "first request", timestamp: Date.now() },
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: toolCallId, name: "bash", arguments: { command: "cat" } }],
+				api: s.model!.api,
+				provider: s.model!.provider,
+				model: s.model!.id,
+				usage: usage(1_000),
+				stopReason: "toolUse",
+				timestamp: Date.now(),
+			},
+			{ role: "user", content: "second request", timestamp: Date.now() },
+			assistant(s.model!, usage(1_000), "second response"),
+			{ role: "user", content: "third request", timestamp: Date.now() },
+			assistant(s.model!, usage(finalUsageTotal), "final response"),
+		]);
+		await seed(s, [
+			{
+				role: "toolResult",
+				toolCallId,
+				toolName: "bash",
+				content: [{ type: "text", text: output }],
+				isError: false,
+				timestamp: Date.now(),
+			},
+			{
+				role: "toolResult",
+				toolCallId: "recent-call",
+				toolName: "bash",
+				content: [{ type: "text", text: "recent-protected-".repeat(10_000) }],
+				isError: false,
+				timestamp: Date.now(),
+			},
+		]);
+		await seed(s, [
+			{ role: "user", content: "fence request one", timestamp: Date.now() },
+			{ role: "user", content: "fence request two", timestamp: Date.now() },
+		]);
+		return toolCallId;
 	}
 
 	async function waitFor(predicate: () => boolean): Promise<void> {
@@ -495,6 +550,35 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 			if (operation === "abort") expect(flushCount).toBe(0);
 		}
 	});
+
+	it("fails closed when tool-output eviction artifacts are unavailable", async () => {
+		// Force ephemeral artifact-manager install failure so ensureArtifactManager
+		// returns null. Mid-run maintenance must not report a successful prune that
+		// skipped durable eviction — outcome is failed and original tool text remains.
+		SessionManagerTestHooks.beforeEphemeralArtifactManagerInstall = async () => {
+			throw new Error("injected ephemeral artifact install failure");
+		};
+		try {
+			session = await buildSession({ settings: { "compaction.keepRecentTokens": 10 } });
+			const output = "unavailable-output-".repeat(35_000);
+			const toolCallId = await seedPrunableToolConversation(session, output, 1_000);
+			const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
+			expect(outcome).toBe("failed");
+			const entry = session.sessionManager
+				.getBranch()
+				.find(
+					(candidate): candidate is Extract<typeof candidate, { type: "message" }> =>
+						candidate.type === "message" &&
+						candidate.message.role === "toolResult" &&
+						candidate.message.toolCallId === toolCallId,
+				);
+			expect(entry?.type).toBe("message");
+			if (entry?.type !== "message" || entry.message.role !== "toolResult") return;
+			expect(entry.message.content).toEqual([{ type: "text", text: output }]);
+		} finally {
+			SessionManagerTestHooks.beforeEphemeralArtifactManagerInstall = undefined;
+		}
+	}, 15_000);
 
 	it("T6 attempts identical provider-response anchors at most once", async () => {
 		session = await buildSession({ shortCircuit: false });
