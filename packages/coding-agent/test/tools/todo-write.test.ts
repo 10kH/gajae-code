@@ -371,4 +371,28 @@ describe("TodoWriteTool operation aliases", () => {
 		const tool = new TodoWriteTool(createSession());
 		expect(tool.rawArgumentValidation({ ops: [{ op: "complete" }] })).toMatchObject({ outcome: "reject" });
 	});
+
+	it('accepts "content" as a synonym for "task"', () => {
+		// TodoItem stores and renders the task as `content`, so models emit `content`
+		// and used to be rejected as an unknown key before coercion could repair it.
+		const tool = new TodoWriteTool(createSession());
+		expect(tool.rawArgumentValidation({ ops: [{ op: "done", content: "ship it" }] })).toMatchObject({
+			outcome: "passthrough",
+		});
+		const result = parse([{ op: "done", content: "ship it" }]);
+		expect(result.success).toBe(true);
+		if (result.success) expect(result.data.ops[0]).toMatchObject({ op: "done", task: "ship it" });
+	});
+
+	it("still rejects genuinely unknown operation-entry keys", () => {
+		const tool = new TodoWriteTool(createSession());
+		expect(tool.rawArgumentValidation({ ops: [{ op: "done", title: "ship it" }] })).toMatchObject({
+			outcome: "reject",
+		});
+	});
+
+	it("still requires a target when a content-only completion names nothing", () => {
+		const tool = new TodoWriteTool(createSession());
+		expect(tool.rawArgumentValidation({ ops: [{ op: "done", content: "" }] })).toMatchObject({ outcome: "reject" });
+	});
 });

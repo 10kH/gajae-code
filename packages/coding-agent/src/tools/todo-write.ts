@@ -67,18 +67,36 @@ const InitListEntry = z.object({
 	items: z.array(z.string().describe("task content")).min(1).describe("tasks for this phase"),
 });
 
-const TodoOpEntry = z.object({
-	op: TodoOp,
-	list: z.array(InitListEntry).optional().describe("phased task list (init)"),
-	task: z.string().optional().describe("task content"),
-	phase: z.string().optional().describe("phase name"),
-	items: z.array(z.string().describe("task content")).min(1).optional().describe("tasks to append"),
-	text: z.string().optional().describe("note text"),
-});
+/**
+ * A task is stored and rendered as `content` (see TodoItem) but supplied here as
+ * `task`, and phased lists are supplied as `list` but appended as `items`. Models
+ * follow the shape they can see and emit `content`/`items`, which the strict raw
+ * validator then rejects as an unknown key mid-turn. Normalize the known-safe
+ * synonyms instead of widening the accepted key set.
+ */
+const TodoOpEntry = z.preprocess(
+	entry => {
+		if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return entry;
+		const record = entry as Record<string, unknown>;
+		if (typeof record.content !== "string" || record.task !== undefined) return entry;
+		const { content, ...rest } = record;
+		return { ...rest, task: content };
+	},
+	z.object({
+		op: TodoOp,
+		list: z.array(InitListEntry).optional().describe("phased task list (init)"),
+		task: z.string().optional().describe("task content"),
+		phase: z.string().optional().describe("phase name"),
+		items: z.array(z.string().describe("task content")).min(1).optional().describe("tasks to append"),
+		text: z.string().optional().describe("note text"),
+	}),
+);
 
 const TODO_WRITE_KEYS = new Set(["ops"]);
 const TODO_OP_KEYS = new Set(["op", "list", "task", "phase", "items", "text"]);
 const TODO_INIT_ENTRY_KEYS = new Set(["phase", "items"]);
+/** `content` is accepted only as a synonym the schema rewrites to `task`. */
+const TODO_OP_KEYS_WITH_ALIASES = new Set([...TODO_OP_KEYS, "content"]);
 
 function hasUnknownKeys(value: object, allowed: Set<string>): boolean {
 	return Object.keys(value).some(key => !allowed.has(key));
@@ -89,10 +107,14 @@ function validateRawTodoArguments(arguments_: Record<string, unknown>): RawArgum
 	if (!Array.isArray(arguments_.ops)) return { outcome: "passthrough" };
 	for (const entry of arguments_.ops) {
 		if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
-		if (hasUnknownKeys(entry, TODO_OP_KEYS)) return { outcome: "reject", code: "todo-write-unknown-op-entry-key" };
+		// `content` is normalized to `task` by the schema preprocessor, so it must not be
+		// rejected here as an unknown key first.
+		if (hasUnknownKeys(entry, TODO_OP_KEYS_WITH_ALIASES))
+			return { outcome: "reject", code: "todo-write-unknown-op-entry-key" };
 		const record = entry as Record<string, unknown>;
 		const op = typeof record.op === "string" && isDoneAlias(record.op) ? "done" : record.op;
-		if ((op === "done" || op === "drop") && !record.task && !record.phase) {
+		const target = record.task ?? record.content;
+		if ((op === "done" || op === "drop") && !target && !record.phase) {
 			return { outcome: "reject", code: "todo-write-done-drop-requires-target" };
 		}
 		const list = record.list;
