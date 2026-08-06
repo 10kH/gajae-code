@@ -3466,6 +3466,62 @@ export async function releaseDaemonOwnership(input: {
 	}
 }
 
+/**
+ * Record that this owner's process is gone, without claiming a clean handoff.
+ *
+ * {@link releaseDaemonOwnership} is the orderly path and runs only when the
+ * daemon quiesced and persisted; it also unlinks the ownership lock, which is
+ * correct for a handoff and wrong for a corpse. Every other way a daemon can
+ * end - an uncaught error, a failed final persist, a signal - previously left
+ * `ownershipPhase: "ready"` and a fresh-looking lock behind forever, so later
+ * readers attached to an owner that had not existed for hours.
+ *
+ * This writes `stoppedAt` and nothing else. The lock is left in place for the
+ * existing reclaim path to adjudicate, because a process on its way out is the
+ * least qualified party to decide who owns what next.
+ *
+ * Fenced on full owner identity: if the state no longer names this exact
+ * owner, acquisition, pid and incarnation, a successor already took over and
+ * marking *their* state stopped would be the same lie in the other direction.
+ */
+export async function markDaemonOwnerStopped(input: {
+	settings: Pick<Settings, "getAgentDir">;
+	ownerId: string;
+	acquisitionId?: string;
+	pid?: number;
+	generation?: number;
+	pidIncarnation?: (pid: number) => string | undefined;
+	fs?: TelegramDaemonFs;
+	now?: () => number;
+}): Promise<boolean> {
+	const fsImpl = input.fs ?? nodeFs;
+	const paths = daemonPaths(input.settings.getAgentDir());
+	try {
+		const state = await readJson<DaemonState>(fsImpl, paths.state);
+		if (!hasSafeDaemonStateShape(state)) return false;
+		if (state.stoppedAt !== undefined) return false;
+		const acquisitionId = input.acquisitionId ?? input.ownerId;
+		const pid = input.pid ?? state.pid;
+		const incarnation = (input.pidIncarnation ?? defaultPidIncarnation)(pid);
+		if (
+			state.ownerId !== input.ownerId ||
+			state.acquisitionId !== acquisitionId ||
+			state.pid !== pid ||
+			(input.generation !== undefined && state.generation !== input.generation) ||
+			!isProcessIncarnation(incarnation) ||
+			state.incarnation !== incarnation
+		)
+			return false;
+		const lock = await readOwnershipLock(fsImpl, paths.lock);
+		if (!ownershipLockMatchesState(lock, state)) return false;
+		await writeJsonAtomic(fsImpl, paths.state, { ...state, stoppedAt: (input.now ?? Date.now)() });
+		return true;
+	} catch {
+		// A dying process cannot afford to fail louder than it already is.
+		return false;
+	}
+}
+
 /** Read the persisted daemon ownership state (or undefined when absent). */
 export async function readDaemonState(
 	settings: Pick<Settings, "getAgentDir">,
