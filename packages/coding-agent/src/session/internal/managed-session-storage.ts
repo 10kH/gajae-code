@@ -715,14 +715,33 @@ export class ManagedSessionDescendantStore {
 		this.#authorityBaseDir = retained?.authorityBaseDir ?? this.#baseDir;
 		if (retained) {
 			const relative = path.relative(retained.authorityBaseDir, this.#baseDir).split(path.sep).join("/");
-			const captured = retained.authority.snapshotManagedTree(relative);
-			if (!captured.ok || !captured.snapshot)
-				throw new Error(captured.code ?? "Managed subtree identity unavailable");
-			this.#subtreeRoot = Object.freeze({
-				canonicalPath: this.#baseDir,
-				dev: BigInt(captured.snapshot.rootDev),
-				ino: BigInt(captured.snapshot.rootIno),
-			});
+			// For the root case (authorityBaseDir === baseDir, relative === ""), the
+			// stable identity() result carries the exact root dev/inode without
+			// snapshotting the entire live session tree. snapshotManagedTree("")
+			// walks every mutable descendant, so concurrent writers (other GJC
+			// processes appending jsonl/resident-cache/recovery data) make the
+			// snapshot return identity_mismatch (#3906). Mirrors #assertBound(),
+			// which already uses identity() for this same case. Nested descendants
+			// (relative !== "") still snapshot their subtree as before.
+			if (relative === "") {
+				const rootIdentity = retained.authority.identity();
+				if (!rootIdentity.ok || !rootIdentity.identity)
+					throw new Error(rootIdentity.code ?? "Managed subtree identity unavailable");
+				this.#subtreeRoot = Object.freeze({
+					canonicalPath: this.#baseDir,
+					dev: BigInt(rootIdentity.identity.dev),
+					ino: BigInt(rootIdentity.identity.ino),
+				});
+			} else {
+				const captured = retained.authority.snapshotManagedTree(relative);
+				if (!captured.ok || !captured.snapshot)
+					throw new Error(captured.code ?? "Managed subtree identity unavailable");
+				this.#subtreeRoot = Object.freeze({
+					canonicalPath: this.#baseDir,
+					dev: BigInt(captured.snapshot.rootDev),
+					ino: BigInt(captured.snapshot.rootIno),
+				});
+			}
 			this.#authority = retained.authority;
 			this.#assertBound();
 

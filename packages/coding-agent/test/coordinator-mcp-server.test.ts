@@ -793,7 +793,12 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		expect(lifecycleControls(controls)).toEqual([
 			{
 				operation: "session.create",
-				input: { cwd: root, target: { path: root }, modelPreset: "codex-eco" },
+				input: {
+					cwd: root,
+					target: { path: root },
+					modelPreset: "codex-eco",
+					coordinatorStateDir: path.join(root, ".gjc", "coordinator-state", "local", "repo"),
+				},
 				idempotencyKey: "preset-start",
 			},
 		]);
@@ -858,6 +863,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			input: {
 				cwd: root,
 				target: { path: root, worktree: { enabled: true, name: "hermes" } },
+				coordinatorStateDir: path.join(root, ".gjc", "coordinator-state", "local", "repo"),
 			},
 			idempotencyKey: "worktree-start",
 		});
@@ -1563,7 +1569,15 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		}
 		expect(lifecycleControls(controls)).toEqual(
 			expect.arrayContaining([
-				{ operation: "session.create", input: { cwd: root, target: { path: root } }, idempotencyKey: "plan" },
+				{
+					operation: "session.create",
+					input: {
+						cwd: root,
+						target: { path: root },
+						coordinatorStateDir: path.join(root, ".gjc", "coordinator-state", "local", "repo"),
+					},
+					idempotencyKey: "plan",
+				},
 				{
 					operation: "turn.prompt",
 					input: { text: expect.stringContaining("/skill:ralplan") },
