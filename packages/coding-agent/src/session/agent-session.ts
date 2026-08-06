@@ -11645,10 +11645,21 @@ export class AgentSession {
 		options?: { commitGate?: (actual: { prunedCount: number; tokensSaved: number }) => boolean },
 	): Promise<{ prunedCount: number; tokensSaved: number; committed: boolean } | undefined> {
 		const branchEntries = this.sessionManager.getBranch();
-		const artifactManager = this.sessionManager.getArtifactManager();
+		// Prefer ensureArtifactManager so in-memory / non-persistent sessions get an
+		// ephemeral store (or a visible install failure) instead of silently pruning
+		// without durable eviction. Fail closed when tool-output eviction is planned
+		// but no artifact store can be established.
+		const artifactManager = await this.sessionManager.ensureArtifactManager();
 		const prunedArtifacts: Array<{ entryId: string; id: string; toolType: string; originalText: string }> = [];
 		let reservedArtifactId: string | undefined;
 		let artifactAllocationAvailable = artifactManager !== null;
+		const pruneEstimate = estimateToolOutputPruneSavings(branchEntries, DEFAULT_PRUNE_CONFIG, {
+			relaxedMinimum: overThreshold ? 0 : undefined,
+			artifactRefMaxChars: PRUNED_ARTIFACT_REF_MAX_CHARS,
+		});
+		if (!artifactManager && pruneEstimate.prunableCount > 0) {
+			return undefined;
+		}
 		if (artifactManager) {
 			try {
 				reservedArtifactId = (await artifactManager.allocatePath("tool-output")).id;
