@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Custom OpenAI-compatible models whose wire id is namespaced (for example `cline-pass/deepseek-v4-flash`) now inherit capability metadata from the bundled leaf model when `contextWindow` / `maxTokens` are omitted, instead of silently falling back to the generic 128K / 16K defaults. True unknown leaf ids still default; explicit limits remain authoritative (#3856).
 - `gjc gc` file-lock discovery now budgets the walk **per lock root** and reports a hit entry cap as a **warning**, not a hard error. Truncating one root no longer skips the remaining roots, and a healthy run with only cap warnings exits `0` so scripts/cron/`&&` chains stay usable (#3852).
 
 - `gjc models` is no longer treated as a free-form agent prompt. The mistaken subcommand spelling now routes to the existing `--list-models` listing path so a nested bash-tool invocation cannot recursively spawn unbounded GJC agents (#3857).
