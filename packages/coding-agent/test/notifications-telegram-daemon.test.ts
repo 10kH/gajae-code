@@ -3010,8 +3010,10 @@ describe("telegram daemon", () => {
 		// binds idempotent archive settlement to Telegram error code 400; generation
 		// 52 is claimed by the pre-readiness daemon-child exit diagnostics slice;
 		// generation 53 renders multi-select state for ask-tool asks and renumbers
-		// pre-numbered options exactly once around the selection marker.
-		expect(DAEMON_GENERATION).toBe(53);
+		// pre-numbered options exactly once around the selection marker;
+		// generation 54 records owner stoppedAt on unclean daemon death so a dead
+		// process cannot keep advertising itself as the ready owner (#3965).
+		expect(DAEMON_GENERATION).toBe(54);
 	});
 	test.each([
 		"1",
