@@ -65,7 +65,6 @@ const MODEL_PRESET_CONFIG_KEY = "modelPreset";
 const ACP_CUSTOM_MODEL_PRESET = "__custom__";
 const THINKING_CONFIG_ID = "thinking";
 const SESSION_PAGE_SIZE = 50;
-export const ACP_BOOTSTRAP_RACE_GUARD_MS = 50;
 const MAX_ACP_REPLAY_PAGES = 10_000;
 /** Bounded retention of settled prompt correlations so late duplicates stay closed. */
 const SETTLED_PROMPT_CORRELATION_RETENTION = 16;
@@ -958,8 +957,9 @@ export class AcpAgent implements Agent {
 		try {
 			await this.#attach(id, params.cwd, endpoint(result));
 			await applyAcpStartupOptions(this.#adapter(id), this.#startupOptions);
+			const response = { sessionId: id, ...(await this.#sessionState(id, true)) };
 			this.#scheduleBootstrap(id);
-			return { sessionId: id, ...(await this.#sessionState(id, true)) };
+			return response;
 		} catch (error) {
 			await this.#discardNewSession(id);
 			throw error;
@@ -972,8 +972,9 @@ export class AcpAgent implements Agent {
 		this.#assertNoAdditionalDirectories(params.additionalDirectories);
 		await this.#attachExisting(params.sessionId, params.cwd, mcpServers);
 		await this.#replaySession(params.sessionId);
+		const response = await this.#sessionState(params.sessionId);
 		this.#scheduleBootstrap(params.sessionId);
-		return await this.#sessionState(params.sessionId);
+		return response;
 	}
 
 	async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -981,8 +982,9 @@ export class AcpAgent implements Agent {
 		this.#assertAbsoluteCwd(params.cwd);
 		this.#assertNoAdditionalDirectories(params.additionalDirectories);
 		await this.#attachExisting(params.sessionId, params.cwd, mcpServers);
+		const response = await this.#sessionState(params.sessionId);
 		this.#scheduleBootstrap(params.sessionId);
-		return await this.#sessionState(params.sessionId);
+		return response;
 	}
 
 	async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
@@ -1006,8 +1008,9 @@ export class AcpAgent implements Agent {
 		this.#knownSessionCwds.set(id, params.cwd);
 		try {
 			await this.#attach(id, params.cwd, endpoint(result));
+			const response = { sessionId: id, ...(await this.#sessionState(id)) };
 			this.#scheduleBootstrap(id);
-			return { sessionId: id, ...(await this.#sessionState(id)) };
+			return response;
 		} catch (error) {
 			await this.#discardNewSession(id);
 			throw error;
@@ -2200,7 +2203,19 @@ export class AcpAgent implements Agent {
 		throw new AcpSdkAdapterError("resource_exhausted", "ACP transcript replay exceeded the page limit.");
 	}
 
+	/**
+	 * Bootstrap updates must reach the client only after the request that introduced the
+	 * session has resolved. `session/new` and `session/resume` carry the sessionId in
+	 * their response, so a `session/update` published first names a session the client
+	 * has never seen and is dropped — which is how the skill list went missing in Paseo.
+	 * The ACP session-setup sequence shows updates before the response only for
+	 * `session/load`.
+	 */
 	#scheduleBootstrap(id: string): void {
+		// A macrotask runs after the microtask that resolves this request and writes its
+		// response, so the client always learns the sessionId first. Scheduling therefore
+		// has to happen once the response payload is ready, not before the session-state
+		// queries that produce it.
 		setTimeout(() => {
 			const record = this.#sessions.get(id);
 			if (!record || this.#connection.signal.aborted) return;
@@ -2231,7 +2246,7 @@ export class AcpAgent implements Agent {
 					record.adapter,
 				);
 			})().catch(() => undefined);
-		}, ACP_BOOTSTRAP_RACE_GUARD_MS);
+		});
 	}
 
 	#cursor(cursor: string | null | undefined): number {
