@@ -2,11 +2,13 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
+import type { AgentSideConnection } from "@agentclientprotocol/sdk";
+import { Agent, type AgentTool } from "@gajae-code/agent-core";
 import { closeModelCache, getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { NotificationServer } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
+import * as z from "zod/v4";
 import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { ExtensionRunner } from "../src/extensibility/extensions/runner";
@@ -24,6 +26,7 @@ async function firePreflightAccept(options?: {
 	else options?.onPreflightAccepted?.();
 }
 
+import { createAcpReverseConnection } from "../src/modes/acp/acp-agent";
 import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
 import { buildAskGateAnswerSchema as buildDeepInterviewAskGateAnswerSchema } from "../src/modes/shared/agent-wire/deep-interview-gate";
 import {
@@ -38,6 +41,7 @@ import {
 	validateAskGateStageState,
 } from "../src/modes/shared/agent-wire/workflow-gate-types";
 import type { InteractiveModeContext } from "../src/modes/types";
+import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { createNotificationsExtension, formatPromptSettlementDiagnostic, PresentationArbiter } from "../src/sdk/bus";
@@ -2817,6 +2821,144 @@ test("SDK host routes pure ACP permission prompts through a live reverse provide
 	});
 	socket.close();
 	await waitFor(() => permissionProvider === undefined, "permission provider removal after disconnect");
+});
+
+test("ACP permission attachment normalizes decisions through the registered provider path", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-acp-permission-path-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-acp-permission-path-${Date.now()}`;
+	const acpSessionId = "acp-session-authority";
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!model) throw new Error("Expected bundled test model");
+	const bashTool = {
+		name: "bash",
+		label: "bash",
+		description: "Guarded fixture tool",
+		parameters: z.object({ command: z.string() }),
+		executeCalls: 0,
+		async execute() {
+			bashTool.executeCalls++;
+			return { content: [{ type: "text" as const, text: "executed" }] };
+		},
+	} satisfies AgentTool & { executeCalls: number };
+	const sessionManager = SessionManager.inMemory(cwd);
+	const agentSession = new AgentSession({
+		agent: new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [bashTool], messages: [] },
+			streamFn: createMockModel({ responses: [] }).stream,
+		}),
+		sessionManager,
+		settings: Settings.isolated({ "compaction.enabled": false }),
+		modelRegistry: {} as never,
+		toolRegistry: new Map([[bashTool.name, bashTool]]),
+	});
+	agentSession.setSdkPermissionMode("prompt");
+	let permissionProvider: SdkPermissionProvider;
+	const ctx = {
+		...context(cwd, sessionId),
+		setSdkPermissionProvider: (provider: SdkPermissionProvider | undefined) => {
+			permissionProvider = provider!;
+			agentSession.setSdkPermissionProvider(provider);
+		},
+	};
+	process.env.GJC_NOTIFICATIONS = "1";
+	start(ctx);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+
+	let nextResponse: unknown;
+	let waitForReverseAbort = false;
+	let reverseAbortObserved = false;
+	const reverseCalls: Array<{
+		method: string;
+		input: Record<string, unknown>;
+		signal: AbortSignal | undefined;
+	}> = [];
+	const connection = {
+		async request(
+			method: string,
+			input: Record<string, unknown>,
+			options?: { cancellationSignal?: AbortSignal },
+		): Promise<unknown> {
+			const signal = options?.cancellationSignal;
+			reverseCalls.push({ method, input, signal });
+			if (!waitForReverseAbort) return nextResponse;
+			const { promise, resolve } = Promise.withResolvers<unknown>();
+			const observeAbort = () => {
+				reverseAbortObserved = true;
+				resolve({ outcome: { outcome: "cancelled" } });
+			};
+			if (signal?.aborted) observeAbort();
+			else signal?.addEventListener("abort", observeAbort, { once: true });
+			return await promise;
+		},
+	} as unknown as AgentSideConnection;
+	const adapter = await AcpSdkAdapter.connect({
+		url: endpoint.url,
+		token: endpoint.token,
+		connection: createAcpReverseConnection(connection, acpSessionId),
+		providers: [{ capability: "permission", definitions: [] }],
+		heartbeatMs: 60_000,
+	});
+
+	try {
+		await waitFor(() => permissionProvider !== undefined, "ACP permission provider installation");
+		await agentSession.setActiveToolsByName(["bash"]);
+		const guardedBash = agentSession.agent.state.tools.find(tool => tool.name === "bash");
+		if (!guardedBash) throw new Error("Expected guarded bash tool");
+		let callNumber = 0;
+		const execute = async (response: unknown, signal?: AbortSignal) => {
+			nextResponse = response;
+			return await guardedBash.execute(
+				`call-${++callNumber}`,
+				{ command: "printf guarded" },
+				signal,
+				undefined as never,
+				undefined as never,
+			);
+		};
+
+		for (const response of [
+			{ outcome: { outcome: "selected", optionId: "reject_once" } },
+			{ outcome: { outcome: "cancelled" } },
+			{ outcome: "cancelled" },
+			null,
+			1,
+			[],
+			{},
+			{ outcome: "unknown" },
+			{ outcome: "selected" },
+			{ outcome: "selected", optionId: 1 },
+			{ outcome: "selected", optionId: "" },
+			{ outcome: "selected", optionId: "unknown_option" },
+		]) {
+			await expect(execute(response)).rejects.toThrow();
+			expect(bashTool.executeCalls).toBe(0);
+		}
+
+		waitForReverseAbort = true;
+		const cancellation = new AbortController();
+		const cancelledExecution = execute(undefined, cancellation.signal);
+		await waitFor(() => reverseCalls.length === 13, "reverse permission cancellation request");
+		cancellation.abort();
+		await expect(cancelledExecution).rejects.toThrow("Permission request cancelled");
+		await waitFor(() => reverseAbortObserved, "ACP reverse cancellation signal");
+		expect(bashTool.executeCalls).toBe(0);
+		waitForReverseAbort = false;
+
+		await expect(execute({ outcome: { outcome: "selected", optionId: "allow_once" } })).resolves.toBeDefined();
+		await expect(execute({ outcome: "selected", optionId: "allow_once" })).resolves.toBeDefined();
+		expect(bashTool.executeCalls).toBe(2);
+		expect(reverseCalls).toHaveLength(15);
+		expect(reverseCalls.every(call => call.method === "session/request_permission")).toBe(true);
+		expect(reverseCalls.every(call => call.input.sessionId === acpSessionId)).toBe(true);
+		expect(reverseCalls.every(call => call.signal instanceof AbortSignal)).toBe(true);
+	} finally {
+		await adapter.close();
+		await agentSession.dispose();
+	}
 });
 
 test("SDK host routes AskUserQuestion through a live ACP form elicitation provider", async () => {
