@@ -69,6 +69,18 @@ export const ACP_BOOTSTRAP_RACE_GUARD_MS = 50;
 const MAX_ACP_REPLAY_PAGES = 10_000;
 /** Bounded retention of settled prompt correlations so late duplicates stay closed. */
 const SETTLED_PROMPT_CORRELATION_RETENTION = 16;
+/**
+ * Mirrors `REQUEST_FRAME_BYTES` in `crates/gjc-sdk/src/query.rs`: the SDK WebSocket
+ * server sets `max_message_size`/`max_frame_size` to 256 KiB and closes the socket on
+ * an oversize frame, so an over-limit prompt must be refused before it is sent.
+ */
+const MAX_PROMPT_FRAME_BYTES = 256 * 1024;
+/**
+ * `SdkClient` wraps every control request as `{type,operation,input,id}` with a UUID
+ * `id` before it reaches the socket, so the prompt must be measured inside that
+ * envelope. A canonical-length UUID keeps the measurement equal to the real frame.
+ */
+const PROMPT_FRAME_ID_PLACEHOLDER = "00000000-0000-4000-8000-000000000000";
 
 type JsonObject = Record<string, unknown>;
 interface PromptWaiter {
@@ -111,6 +123,8 @@ type SessionRecord = {
 	settledPromptCorrelations: PromptCorrelation[];
 	authFailure?: string;
 	activePrompt?: PromptWaiter;
+	/** Set by `session/cancel` so an in-flight prompt settles as `cancelled`, never as an error. */
+	cancelRequested?: boolean;
 };
 type Endpoint = { url: string; token: string };
 
@@ -901,7 +915,12 @@ export class AcpAgent implements Agent {
 			agentCapabilities: {
 				loadSession: true,
 				promptCapabilities: { embeddedContext: true, image: true },
-				mcpCapabilities: { http: true, sse: true },
+				// Legacy MCP HTTP+SSE (spec 2024-11-05) is deprecated and not implemented: an
+				// `sse` config is served by the Streamable HTTP transport (runtime-mcp/client.ts),
+				// which never performs the `endpoint`-event handshake. Advertising it would
+				// invite a client to hand us a server we cannot connect to. Locally configured
+				// `sse` entries still resolve through createTransport, so they keep working.
+				mcpCapabilities: { http: true },
 				sessionCapabilities: {
 					list: {},
 					fork: {},
@@ -1143,7 +1162,31 @@ export class AcpAgent implements Agent {
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		if (record.activePrompt) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
 		if (record.authFailure) throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
+		// A new turn starts uncancelled; a stale flag must never settle it as `cancelled`.
+		record.cancelRequested = false;
 		const payload = acpPromptPayload(params.prompt);
+		// The SDK transport hard-caps a single request frame at 256 KiB and answers an
+		// oversize frame by closing the socket (CloseCode::Size, crates/gjc-sdk/src/server.rs),
+		// which surfaces to the client as an opaque `connection_closed` mid-turn. Reject
+		// the prompt up front with a typed, actionable error instead of losing the session.
+		// Measure the frame the server actually receives, not just the payload: SdkClient
+		// wraps it as {type,operation,input,id} with a UUID id, so a prompt sized just
+		// under the cap would still be killed by CloseCode::Size.
+		const promptFrameBytes = Buffer.byteLength(
+			JSON.stringify({
+				type: "control_request",
+				operation: "turn.prompt",
+				input: { text: payload.text, images: payload.images },
+				id: PROMPT_FRAME_ID_PLACEHOLDER,
+			}),
+		);
+		if (promptFrameBytes > MAX_PROMPT_FRAME_BYTES)
+			throw new AcpSdkAdapterError(
+				"invalid_input",
+				`ACP prompt is ${Math.ceil(promptFrameBytes / 1024)} KiB, over the ${Math.floor(
+					MAX_PROMPT_FRAME_BYTES / 1024,
+				)} KiB transport limit. Attach a smaller or more compressed image.`,
+			);
 		let waiter!: PromptWaiter;
 		const response = new Promise<PromptResponse>((resolve, reject) => {
 			waiter = {
@@ -1158,6 +1201,23 @@ export class AcpAgent implements Agent {
 			};
 			record.activePrompt = waiter;
 		});
+		// Echo the user's own message back as `user_message_chunk`. Clients render their
+		// transcript from session/update, so without this a prompt's text and any attached
+		// image never appear in the client UI — only the agent's reply does. Replay
+		// (session/load) already emits these; a live turn must too, and the image blocks
+		// must be published verbatim so attachments are visible, not just fed to the model.
+		for (const block of params.prompt) {
+			if (block.type !== "text" && block.type !== "image") continue;
+			if (block.type === "text" && block.text.length === 0) continue;
+			await this.#publishSessionUpdate(
+				params.sessionId,
+				{
+					sessionId: params.sessionId,
+					update: { sessionUpdate: "user_message_chunk", content: block },
+				},
+				record.adapter,
+			);
+		}
 		try {
 			const acknowledgement = await record.adapter.prompt({
 				text: payload.text,
@@ -1187,6 +1247,15 @@ export class AcpAgent implements Agent {
 			waiter.terminal = undefined;
 			waiter.settled = true;
 			if (record.activePrompt === waiter) record.activePrompt = undefined;
+			// A prompt cancelled before the SDK acknowledged it still ends this turn by
+			// client request, and ACP is explicit: "Agents MUST catch these errors and
+			// return the semantically meaningful `cancelled` stop reason, so that Clients
+			// can reliably confirm the cancellation." Surfacing the transport's `busy`
+			// rejection instead would show the user a spurious error for their own cancel.
+			if (record.cancelRequested) {
+				record.cancelRequested = false;
+				return { stopReason: "cancelled" };
+			}
 			throw error;
 		}
 		return await response;
@@ -1195,6 +1264,9 @@ export class AcpAgent implements Agent {
 	async cancel(params: { sessionId: string }): Promise<void> {
 		const record = this.#sessions.get(params.sessionId);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
+		// Record the client's intent before awaiting the SDK so a prompt that rejects
+		// mid-cancel (e.g. preflight `busy`) can still settle as `cancelled`.
+		record.cancelRequested = true;
 		const acknowledgement = await record.adapter.cancel();
 		const result = object(object(acknowledgement)?.result) ?? object(acknowledgement);
 		if (result?.aborted !== true)
@@ -1532,7 +1604,18 @@ export class AcpAgent implements Agent {
 				record.reconnectUnsubscribe();
 				const waiter = record.activePrompt;
 				record.activePrompt = undefined;
-				waiter?.reject(new AcpSdkAdapterError("connection_closed", `ACP session was ${reason}.`));
+				// `session/close` is the client asking to end its own work, so the pending turn
+				// settles as `cancelled` rather than surfacing a spurious error. ACP: "Agents
+				// MUST catch these errors and return the semantically meaningful `cancelled`
+				// stop reason." Involuntary teardown (transport loss) still rejects.
+				if (waiter && !waiter.settled) {
+					if (reason === "closed" || reason === "discarded") {
+						waiter.settled = true;
+						waiter.resolve({ stopReason: "cancelled" });
+					} else {
+						waiter.reject(new AcpSdkAdapterError("connection_closed", `ACP session was ${reason}.`));
+					}
+				}
 			}
 
 			const failures: unknown[] = [];

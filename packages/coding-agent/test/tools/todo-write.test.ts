@@ -343,3 +343,32 @@ describe("TodoWriteTool renderer", () => {
 		expect(rendered).not.toContain("Rejected task");
 	});
 });
+
+describe("TodoWriteTool operation aliases", () => {
+	const parse = (ops: unknown) => new TodoWriteTool(createSession()).parameters.safeParse({ ops });
+
+	it('accepts "complete" and "completed" as aliases for the "done" operation', () => {
+		// The status this operation sets is spelled `completed`, so models reach for
+		// `complete`/`completed` and used to hit a hard tool failure mid-turn.
+		for (const alias of ["complete", "completed"]) {
+			const result = parse([{ op: alias, task: "ship it" }]);
+			expect(result.success).toBe(true);
+			if (result.success) expect(result.data.ops[0]?.op).toBe("done");
+		}
+	});
+
+	it('still accepts the canonical "done" operation', () => {
+		const result = parse([{ op: "done", task: "ship it" }]);
+		expect(result.success).toBe(true);
+		if (result.success) expect(result.data.ops[0]?.op).toBe("done");
+	});
+
+	it("still rejects operations outside the accepted vocabulary", () => {
+		expect(parse([{ op: "finish", task: "ship it" }]).success).toBe(false);
+	});
+
+	it("still requires a target when an aliased completion names no task or phase", () => {
+		const tool = new TodoWriteTool(createSession());
+		expect(tool.rawArgumentValidation({ ops: [{ op: "complete" }] })).toMatchObject({ outcome: "reject" });
+	});
+});

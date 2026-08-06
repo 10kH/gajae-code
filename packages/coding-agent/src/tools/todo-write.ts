@@ -46,9 +46,21 @@ export interface TodoWriteToolDetails {
 // Schema
 // =============================================================================
 
+// Models reliably reach for `complete`/`completed` because the status this op sets is
+// spelled `completed` (see TodoStatus). Accepting them as exact aliases for `done`
+// removes a repeated hard tool failure without widening the operation vocabulary.
+const TODO_DONE_ALIASES = ["complete", "completed"] as const;
+
+function isDoneAlias(value: string): boolean {
+	return (TODO_DONE_ALIASES as readonly string[]).includes(value);
+}
+
 const TodoOp = z
-	.enum(["init", "start", "done", "rm", "drop", "append", "note"] as const)
-	.describe("operation to apply");
+	.preprocess(
+		value => (typeof value === "string" && isDoneAlias(value) ? "done" : value),
+		z.enum(["init", "start", "done", "rm", "drop", "append", "note"] as const),
+	)
+	.describe('operation to apply; use "done" to complete a task');
 
 const InitListEntry = z.object({
 	phase: z.string().describe("phase name"),
@@ -79,7 +91,8 @@ function validateRawTodoArguments(arguments_: Record<string, unknown>): RawArgum
 		if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
 		if (hasUnknownKeys(entry, TODO_OP_KEYS)) return { outcome: "reject", code: "todo-write-unknown-op-entry-key" };
 		const record = entry as Record<string, unknown>;
-		if ((record.op === "done" || record.op === "drop") && !record.task && !record.phase) {
+		const op = typeof record.op === "string" && isDoneAlias(record.op) ? "done" : record.op;
+		if ((op === "done" || op === "drop") && !record.task && !record.phase) {
 			return { outcome: "reject", code: "todo-write-done-drop-requires-target" };
 		}
 		const list = record.list;

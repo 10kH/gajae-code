@@ -174,8 +174,11 @@ async function createTransport(config: MCPServerConfig): Promise<MCPTransport> {
 		case "stdio":
 			return createStdioTransport(config as MCPStdioServerConfig);
 		case "http":
+			return createHttpTransport(config as MCPHttpServerConfig);
 		case "sse":
-			return createHttpTransport(config as MCPHttpServerConfig | MCPSseServerConfig);
+			// Compatibility: `sse` configs use Streamable HTTP, not the legacy MCP SSE
+			// protocol. The configured URL receives JSON-RPC POST requests directly.
+			return createHttpTransport(config as MCPSseServerConfig);
 		default:
 			throw new Error(`Unknown server type: ${serverType}`);
 	}

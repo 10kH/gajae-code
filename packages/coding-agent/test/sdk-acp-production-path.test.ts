@@ -422,7 +422,8 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		{ agentDir, startupOptions: { modelPreset: "codex-medium" } },
 	);
 	const initialized = await bounded(agent.initialize({ protocolVersion: 1, clientCapabilities: {} }), "initialize");
-	expect(initialized.agentCapabilities?.mcpCapabilities).toEqual({ http: true, sse: true });
+	// Legacy MCP HTTP+SSE is deprecated and unimplemented, so it must not be advertised.
+	expect(initialized.agentCapabilities?.mcpCapabilities).toEqual({ http: true });
 	const created = await bounded(
 		agent.newSession({
 			cwd,
