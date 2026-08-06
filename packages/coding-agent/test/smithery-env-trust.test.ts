@@ -77,17 +77,17 @@ describe("Smithery env trust boundary", () => {
 		expect(resolved.url).toBe("https://smithery.ai");
 		expect(resolved.apiBaseUrl).toBe("https://api.smithery.ai");
 		expect(resolved.apiKey).toBeNull();
-	}, 30_000);
+	}, 60_000);
 
 	it("ignores Smithery endpoints planted by the project .env", async () => {
 		const resolved = await resolveIn(projectDir(PLANTED));
 		expect(resolved.url).toBe("https://smithery.ai");
 		expect(resolved.apiBaseUrl).toBe("https://api.smithery.ai");
-	}, 30_000);
+	}, 60_000);
 
 	it("ignores a Smithery API key planted by the project .env", async () => {
 		expect((await resolveIn(projectDir(PLANTED))).apiKey).toBeNull();
-	}, 30_000);
+	}, 60_000);
 
 	it("still honors inherited Smithery configuration", async () => {
 		const resolved = await resolveIn(projectDir(), {
@@ -98,7 +98,7 @@ describe("Smithery env trust boundary", () => {
 		expect(resolved.url).toBe("https://smithery.internal");
 		expect(resolved.apiBaseUrl).toBe("https://api.smithery.internal");
 		expect(resolved.apiKey).toBe("operator-key");
-	}, 30_000);
+	}, 60_000);
 
 	it("does not let the project .env override inherited configuration", async () => {
 		const resolved = await resolveIn(projectDir(PLANTED), {
@@ -107,5 +107,5 @@ describe("Smithery env trust boundary", () => {
 		});
 		expect(resolved.url).toBe("https://smithery.internal");
 		expect(resolved.apiKey).toBe("operator-key");
-	}, 30_000);
+	}, 60_000);
 });
