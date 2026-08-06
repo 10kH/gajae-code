@@ -1721,6 +1721,23 @@ type SessionAdmissionLease = {
 	release(): void;
 };
 
+/**
+ * Fire-and-forget continuations (auto-compaction retries, queued follow-ups) race a
+ * still-busy agent whose current turn can legitimately hold the run for minutes.
+ * Reschedule with capped exponential backoff instead of a fixed 100ms spin, and give
+ * up after a bounded number of attempts (~4 minutes total) so a stuck busy state
+ * cannot spin forever — observed in production logs as 10,742 reschedules over
+ * 21 minutes inside a single session.
+ */
+const AGENT_CONTINUE_BUSY_RESCHEDULE_BASE_DELAY_MS = 100;
+const AGENT_CONTINUE_BUSY_RESCHEDULE_MAX_DELAY_MS = 5_000;
+const AGENT_CONTINUE_BUSY_MAX_RESCHEDULES = 50;
+
+function agentContinueBusyRescheduleDelayMs(attempt: number): number {
+	const exponential = AGENT_CONTINUE_BUSY_RESCHEDULE_BASE_DELAY_MS * 2 ** Math.max(0, attempt - 1);
+	return Math.min(exponential, AGENT_CONTINUE_BUSY_RESCHEDULE_MAX_DELAY_MS);
+}
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -4713,6 +4730,7 @@ export class AgentSession {
 			options?.onError?.(error);
 		};
 		const scheduledGeneration = options?.generation;
+		let busyReschedules = 0;
 		const scheduleAttempt = (delayMs = options?.delayMs): Promise<void> => {
 			const leaseSettlement = Promise.withResolvers<void>();
 			const settleLease = () => leaseSettlement.resolve();
@@ -4805,12 +4823,25 @@ export class AgentSession {
 								!terminalized &&
 								canContinue()
 							) {
-								this.#retainDeferredAgentEndAfterContinuationBusy(predecessorAgentEndHold, predecessorAgentEnd);
-								logger.debug("agent.continue busy after scheduling; rescheduling", {
+								if (busyReschedules < AGENT_CONTINUE_BUSY_MAX_RESCHEDULES) {
+									busyReschedules += 1;
+									const nextDelayMs = agentContinueBusyRescheduleDelayMs(busyReschedules);
+									this.#retainDeferredAgentEndAfterContinuationBusy(
+										predecessorAgentEndHold,
+										predecessorAgentEnd,
+									);
+									logger.debug("agent.continue busy after scheduling; rescheduling", {
+										error: error.message,
+										attempt: busyReschedules,
+										delayMs: nextDelayMs,
+									});
+									void scheduleAttempt(nextDelayMs);
+									return;
+								}
+								logger.warn("agent.continue busy reschedule budget exhausted; giving up", {
+									attempts: busyReschedules,
 									error: error.message,
 								});
-								void scheduleAttempt(100);
-								return;
 							}
 							if (!predecessorAccepted)
 								this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
@@ -4939,6 +4970,7 @@ export class AgentSession {
 			if (!authorized) this.emitNotice("info", "Auto-continue skipped: no unfinished work detected");
 			return authorized;
 		};
+		let busyReschedules = 0;
 		const scheduleAttempt = (delayMs = 0) => {
 			let rescheduled = false;
 			void this.#schedulePostPromptTask(
@@ -4976,14 +5008,25 @@ export class AgentSession {
 							return;
 						}
 						if (this.#isAgentBusyError(error) && this.#promptGeneration === scheduledGeneration) {
-							logger.debug("Auto-compaction continuation busy; rescheduling", {
+							if (busyReschedules < AGENT_CONTINUE_BUSY_MAX_RESCHEDULES) {
+								busyReschedules += 1;
+								const nextDelayMs = agentContinueBusyRescheduleDelayMs(busyReschedules);
+								logger.debug("Auto-compaction continuation busy; rescheduling", {
+									source: "auto_continue_prompt",
+									reason: "queue_drained",
+									error: error.message,
+									attempt: busyReschedules,
+									delayMs: nextDelayMs,
+								});
+								rescheduled = true;
+								scheduleAttempt(nextDelayMs);
+								return;
+							}
+							logger.warn("Auto-compaction continuation busy reschedule budget exhausted; giving up", {
 								source: "auto_continue_prompt",
-								reason: "queue_drained",
+								attempts: busyReschedules,
 								error: error.message,
 							});
-							rescheduled = true;
-							scheduleAttempt(100);
-							return;
 						}
 						this.#logCompactionContinuationError("auto_continue_prompt", error);
 					} finally {
