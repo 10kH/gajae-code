@@ -6,6 +6,10 @@
 
 - Added first-class `cline-pass` and `commandcode-goat` provider presets with documented API endpoints, environment-variable credentials, non-hardcoded live model discovery from models.dev and the Command Code Provider API, and prefix-based Claude routing.
 
+### Fixed
+
+- `smithery-env-trust.test.ts` now sets a 30s per-test timeout on all five child-process-spawning trust-boundary tests, preventing CI flake when the Bun child-process spawn + env-file-parse chain exceeds the default 5s budget under parallel shard contention (Dev CI run 31102063678).
+
 ## [0.12.15] - 2026-08-06
 
 ## [0.12.14] - 2026-08-06
