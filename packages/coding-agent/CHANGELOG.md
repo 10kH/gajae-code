@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- `smithery-env-trust.test.ts` warms the Bun probe child in `beforeAll` and kills stalled spawns at a 45s budget so the first case no longer absorbs cold-start compile cost into its per-test timeout under shard contention (observed 60001ms timeout after the 60s cap on #3969 exact-head CI). Assertions unchanged.
 - `smithery-env-trust.test.ts` raises the per-test child-process timeout from 30s to 60s so CI contention cannot fail at the previous 30s cap (Dev CI run 31128319216 timed out at 30004ms).
 - `smithery-env-trust.test.ts` now sets a 30s per-test timeout on all five child-process-spawning trust-boundary tests, preventing CI flake when the Bun child-process spawn + env-file-parse chain exceeds the default 5s budget under parallel shard contention (Dev CI run 31102063678).
 
