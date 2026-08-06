@@ -39,7 +39,6 @@ import { deepInterviewStatePath } from "../gjc-runtime/deep-interview-runtime";
 import {
 	assertDeepInterviewInputWithinLimit,
 	assertDeepInterviewStructuredResponseWithinLimit,
-	deepInterviewCharacterCount,
 	MAX_USER_RESPONSE_LENGTH,
 } from "../gjc-runtime/deep-interview-state";
 import {
@@ -63,14 +62,16 @@ import type {
 import { GJC_ASK_TIMEOUT_CODE } from "./ask-answer-registry";
 
 import {
-	selectAskParameters,
-	recoverRoundZeroIntentContract,
-	intentContract,
-	intentReview,
 	type AskParametersSchema,
 	type AskToolInput,
+	intentContract,
+	intentReview,
+	recoverRoundZeroIntentContract,
+	selectAskParameters,
 } from "./ask-contract";
+
 export { askSchema } from "./ask-contract";
+
 import { formatErrorMessage, formatMeta, formatTitle } from "./render-utils";
 import { ToolAbortError } from "./tool-errors";
 import { assertUltragoalAskAllowed } from "./ultragoal-ask-guard";
@@ -78,7 +79,6 @@ import { assertUltragoalAskAllowed } from "./ultragoal-ask-guard";
 // =============================================================================
 // Types
 // =============================================================================
-
 
 /** Result for a single question */
 export interface QuestionResult {

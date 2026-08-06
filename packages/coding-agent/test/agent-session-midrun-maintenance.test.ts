@@ -4,9 +4,9 @@ import * as path from "node:path";
 import { Agent, type AgentContext } from "@gajae-code/agent-core";
 import type { AssistantMessage, Model, ProviderSessionState, Usage } from "@gajae-code/ai";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
+import { createAppendOnlyContextManager } from "@gajae-code/coding-agent/append-only-mode";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { createAppendOnlyContextManager } from "@gajae-code/coding-agent/append-only-mode";
 import { loadExtensions } from "@gajae-code/coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
@@ -157,7 +157,11 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		]);
 	}
 
-	async function seedPrunableToolConversation(s: AgentSession, output: string, finalUsageTotal: number): Promise<string> {
+	async function seedPrunableToolConversation(
+		s: AgentSession,
+		output: string,
+		finalUsageTotal: number,
+	): Promise<string> {
 		const toolCallId = "evict-call";
 		await seed(s, [
 			{ role: "user", content: "first request", timestamp: Date.now() },
@@ -177,8 +181,22 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 			assistant(s.model!, usage(finalUsageTotal), "final response"),
 		]);
 		await seed(s, [
-			{ role: "toolResult", toolCallId, toolName: "bash", content: [{ type: "text", text: output }], isError: false, timestamp: Date.now() },
-			{ role: "toolResult", toolCallId: "recent-call", toolName: "bash", content: [{ type: "text", text: "recent-protected-".repeat(10_000) }], isError: false, timestamp: Date.now() },
+			{
+				role: "toolResult",
+				toolCallId,
+				toolName: "bash",
+				content: [{ type: "text", text: output }],
+				isError: false,
+				timestamp: Date.now(),
+			},
+			{
+				role: "toolResult",
+				toolCallId: "recent-call",
+				toolName: "bash",
+				content: [{ type: "text", text: "recent-protected-".repeat(10_000) }],
+				isError: false,
+				timestamp: Date.now(),
+			},
 		]);
 		await seed(s, [
 			{ role: "user", content: "fence request one", timestamp: Date.now() },
@@ -542,12 +560,16 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		const toolCallId = await seedPrunableToolConversation(session, output, 1_000);
 		const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
 		expect(outcome).toBe("failed");
-		const entry = session.sessionManager.getBranch().find(
-			(candidate): candidate is Extract<typeof candidate, { type: "message" }> =>
-				candidate.type === "message" && candidate.message.role === "toolResult" && candidate.message.toolCallId === toolCallId,
-		);
+		const entry = session.sessionManager
+			.getBranch()
+			.find(
+				(candidate): candidate is Extract<typeof candidate, { type: "message" }> =>
+					candidate.type === "message" &&
+					candidate.message.role === "toolResult" &&
+					candidate.message.toolCallId === toolCallId,
+			);
 		expect(entry?.type).toBe("message");
-		if (!entry || entry.type !== "message" || entry.message.role !== "toolResult") return;
+		if (entry?.type !== "message" || entry.message.role !== "toolResult") return;
 		expect(entry.message.content).toEqual([{ type: "text", text: output }]);
 	}, 15_000);
 
@@ -557,12 +579,16 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		const toolCallId = await seedPrunableToolConversation(session, output, 1_000);
 		const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
 		expect(outcome).toBe("failed");
-		const entry = session.sessionManager.getBranch().find(
-			(candidate): candidate is Extract<typeof candidate, { type: "message" }> =>
-				candidate.type === "message" && candidate.message.role === "toolResult" && candidate.message.toolCallId === toolCallId,
-		);
+		const entry = session.sessionManager
+			.getBranch()
+			.find(
+				(candidate): candidate is Extract<typeof candidate, { type: "message" }> =>
+					candidate.type === "message" &&
+					candidate.message.role === "toolResult" &&
+					candidate.message.toolCallId === toolCallId,
+			);
 		expect(entry?.type).toBe("message");
-		if (!entry || entry.type !== "message" || entry.message.role !== "toolResult") return;
+		if (entry?.type !== "message" || entry.message.role !== "toolResult") return;
 		expect(entry.message.content).toEqual([{ type: "text", text: output }]);
 		expect((await session.sessionManager.getArtifactManager()?.listFiles()) ?? []).toEqual([]);
 	}, 30_000);
@@ -575,19 +601,26 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		expect(artifactManager).not.toBeNull();
 		if (!artifactManager) return;
 		const originalPublishExactText = artifactManager.publishExactText.bind(artifactManager);
-		artifactManager.publishExactText = async () => ({ outcome: "failed", diagnostic: "injected publication failure" });
+		artifactManager.publishExactText = async () => ({
+			outcome: "failed",
+			diagnostic: "injected publication failure",
+		});
 		try {
 			const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
 			expect(outcome).toBe("failed");
 		} finally {
 			artifactManager.publishExactText = originalPublishExactText;
 		}
-		const entry = session.sessionManager.getBranch().find(
-			(candidate): candidate is Extract<typeof candidate, { type: "message" }> =>
-				candidate.type === "message" && candidate.message.role === "toolResult" && candidate.message.toolCallId === toolCallId,
-		);
+		const entry = session.sessionManager
+			.getBranch()
+			.find(
+				(candidate): candidate is Extract<typeof candidate, { type: "message" }> =>
+					candidate.type === "message" &&
+					candidate.message.role === "toolResult" &&
+					candidate.message.toolCallId === toolCallId,
+			);
 		expect(entry?.type).toBe("message");
-		if (!entry || entry.type !== "message" || entry.message.role !== "toolResult") return;
+		if (entry?.type !== "message" || entry.message.role !== "toolResult") return;
 		expect(entry.message.content).toEqual([{ type: "text", text: output }]);
 		expect(await artifactManager.listFiles()).toEqual([]);
 	}, 30_000);
@@ -605,7 +638,9 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		appendOnly?.syncMessages([{ role: "user", content: "provider-retained-marker" }]);
 		expect(appendOnly?.log.length).toBe(1);
 		let closed = 0;
-		session.providerSessionState.set("openai-codex-responses", { close: () => closed++ } satisfies ProviderSessionState);
+		session.providerSessionState.set("openai-codex-responses", {
+			close: () => closed++,
+		} satisfies ProviderSessionState);
 
 		const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
 		expect(outcome).toBe("pruned");
@@ -613,12 +648,16 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		expect(appendOnly?.log.length).toBe(0);
 		expect(session.messages.some(message => JSON.stringify(message).includes(output))).toBe(false);
 
-		const persisted = session.sessionManager.getBranch().find(
-			(entry): entry is Extract<typeof entry, { type: "message" }> =>
-				entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === toolCallId,
-		);
+		const persisted = session.sessionManager
+			.getBranch()
+			.find(
+				(entry): entry is Extract<typeof entry, { type: "message" }> =>
+					entry.type === "message" &&
+					entry.message.role === "toolResult" &&
+					entry.message.toolCallId === toolCallId,
+			);
 		expect(persisted).toBeDefined();
-		if (!persisted || persisted.type !== "message" || persisted.message.role !== "toolResult") return;
+		if (persisted?.type !== "message" || persisted.message.role !== "toolResult") return;
 		const details = persisted.message.details as { meta?: { eviction?: unknown } } | undefined;
 		expect(details?.meta?.eviction).toBeDefined();
 		if (!details?.meta?.eviction) return;
@@ -680,10 +719,12 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		const restoredEntries = await loadEntriesFromFile(sessionFile);
 		const restored = restoredEntries.find(
 			(entry): entry is Extract<typeof entry, { type: "message" }> =>
-				entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === "rollback-old",
+				entry.type === "message" &&
+				entry.message.role === "toolResult" &&
+				entry.message.toolCallId === "rollback-old",
 		);
 		expect(restored).toBeDefined();
-		if (!restored || restored.type !== "message") return;
+		if (restored?.type !== "message") return;
 		const restoredMessage = restored.message as { role: "toolResult"; content: unknown; prunedAt?: unknown };
 		expect(restoredMessage.content).toEqual([{ type: "text", text: oldOutput }]);
 		expect(restoredMessage.prunedAt).toBeUndefined();

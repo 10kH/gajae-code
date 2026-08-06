@@ -40,6 +40,7 @@ async function sdkBusNatives(): Promise<NativeSdkBusBindings> {
 }
 
 type NotificationServer = NativeNotificationServer;
+
 import { $credentialEnv, logger, postmortem, VERSION } from "@gajae-code/utils";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
@@ -80,7 +81,6 @@ import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } fro
 import type { SdkFrame } from "../host/types";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
-import { ActiveProviderResolutionError } from "../providers.js";
 import {
 	lifecycleStartupCapabilityForApi,
 	normalizeSdkStartupFailure,
@@ -439,15 +439,6 @@ async function readGitDiffStat(cwd: string): Promise<string | undefined> {
 		return trimmed ? trimmed.slice(0, 1500) : undefined;
 	} catch {
 		return undefined;
-	}
-}
-
-class DiffQueryError extends Error {
-	constructor(
-		readonly code: "not_git_repository" | "diff_too_large",
-		message: string,
-	) {
-		super(message);
 	}
 }
 
@@ -2234,7 +2225,6 @@ function hasTerminalArbitrationCapability(
 		typeof workflowGate.registerGateTerminalController === "function"
 	);
 }
-
 
 function sdkQuerySurface(
 	ctx: ExtensionContext,
@@ -4828,11 +4818,14 @@ export function createNotificationsExtension(
 				server.sendTo(connectionId, JSON.stringify({ type: responseType, id, ok: false, error }));
 			} catch {}
 		};
-			const sendMalformed = (connectionId: string, message: string): void => {
-				try {
-					server.sendTo(connectionId, JSON.stringify({ type: "protocol_error", ok: false, error: { code: "invalid_frame", message } }));
-				} catch {}
-			};
+		const sendMalformed = (connectionId: string, message: string): void => {
+			try {
+				server.sendTo(
+					connectionId,
+					JSON.stringify({ type: "protocol_error", ok: false, error: { code: "invalid_frame", message } }),
+				);
+			} catch {}
+		};
 		try {
 			server.onSdkFrame((err, inbound) => {
 				if (err) {
@@ -4862,11 +4855,17 @@ export function createNotificationsExtension(
 					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;
 					if (typedFrame.type === "event_replay") {
 						const capabilities = Array.isArray(typedFrame.capabilities) ? typedFrame.capabilities : [];
-						hostCapCache.set(inbound.connectionId, new Set(capabilities.filter((capability): capability is string => typeof capability === "string")));
+						hostCapCache.set(
+							inbound.connectionId,
+							new Set(capabilities.filter((capability): capability is string => typeof capability === "string")),
+						);
 					}
 					inboundSdkFrame?.(inbound.connectionId, typedFrame);
 				} catch (error) {
-					sendMalformed(inbound.connectionId, error instanceof SyntaxError ? "SDK frame is not valid JSON." : String(error));
+					sendMalformed(
+						inbound.connectionId,
+						error instanceof SyntaxError ? "SDK frame is not valid JSON." : String(error),
+					);
 				}
 			});
 			// Required: the negotiated-capability callback is how the TS host learns
