@@ -319,7 +319,12 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 												]
 											: [];
 					socket.send(
-						JSON.stringify({ type: "query_response", id: frame.id, ok: true, result: { page: { items } } }),
+						JSON.stringify({
+							type: "query_response",
+							id: frame.id,
+							ok: true,
+							result: { page: { items, complete: true } },
+						}),
 					);
 					return;
 				}
