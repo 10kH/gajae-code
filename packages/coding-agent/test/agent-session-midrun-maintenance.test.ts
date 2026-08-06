@@ -205,7 +205,6 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		return toolCallId;
 	}
 
-
 	async function waitFor(predicate: () => boolean): Promise<void> {
 		const deadline = Date.now() + 1_000;
 		while (!predicate()) {
