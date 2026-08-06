@@ -395,4 +395,17 @@ describe("TodoWriteTool operation aliases", () => {
 		const tool = new TodoWriteTool(createSession());
 		expect(tool.rawArgumentValidation({ ops: [{ op: "done", content: "" }] })).toMatchObject({ outcome: "reject" });
 	});
+
+	it("tells the model how to address a task when a completion arrives with no target", async () => {
+		// Models send a positional handle (`id: "1"`); it is stripped as an unknown key,
+		// leaving a targetless op. The message has to name what actually works.
+		const tool = new TodoWriteTool(
+			createSession([{ name: "Implementation", tasks: [{ content: "Apply fix", status: "pending" }] }]),
+		);
+		const result = await tool.execute("call-target", { ops: [{ op: "done" }] });
+		expect(result.isError).toBe(true);
+		const text = result.content.map(block => ("text" in block ? block.text : "")).join("\n");
+		expect(text).toContain('Pass "task" with the task\'s exact content');
+		expect(text).toContain("never by number or id");
+	});
 });

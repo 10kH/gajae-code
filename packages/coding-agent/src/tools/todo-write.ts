@@ -591,7 +591,14 @@ export class TodoWriteTool implements AgentTool<typeof todoWriteSchema, TodoWrit
 			entry => (entry.op === "done" || entry.op === "drop") && !entry.task && !entry.phase,
 		);
 		if (missingTarget) {
-			const errors = [`Missing task or phase for ${missingTarget.op} operation`];
+			// Models reach for a positional handle here (`id: "1"`, `index: 2`). Those keys
+			// are stripped before this point, leaving a targetless op, so the message has to
+			// name the one thing that does work: the task's content, verbatim.
+			const errors = [
+				`Missing task or phase for ${missingTarget.op} operation. ` +
+					`Pass "task" with the task's exact content, or "phase" with the phase name; ` +
+					`tasks are addressed by content, never by number or id.`,
+			];
 			return {
 				content: [{ type: "text", text: formatPayloadRejectedSummary(previousPhases, errors) }],
 				details: { phases: previousPhases, storage, failureKind: "payload_rejected" },
