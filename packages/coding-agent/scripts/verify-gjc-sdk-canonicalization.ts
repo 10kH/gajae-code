@@ -1558,6 +1558,19 @@ function exactTeamRuntimeSendKeysRanges(contents: string): ShellRange[] {
 		/args\s*\.\s*(?:push|unshift|splice)\s*\(/.test(continuationBody)
 	)
 		return [];
+	// The frozen continuation argv is only safe while the monitor actually drives it:
+	// `continueStalledGjcTeamWorkers` revives panes that the stale-claim reconciler would
+	// otherwise reap, so the monitor must invoke it, and invoke it before reconciliation.
+	const monitor = /(?:export\s+)?async\s+function\s+monitorGjcTeam\s*\([\s\S]*?\)\s*:\s*Promise<[^>]*>\s*\{/.exec(
+		contents,
+	);
+	if (!monitor) return [];
+	const monitorRange = braceBlockRange(contents, (monitor.index ?? 0) + monitor[0].lastIndexOf("{"));
+	if (!monitorRange) return [];
+	const monitorBody = contents.slice(monitorRange.start, monitorRange.end);
+	const continuationCall = /\bcontinueStalledGjcTeamWorkers\s*\(/.exec(monitorBody);
+	const reconcileCall = /\breconcileGjcTeamStaleClaimsUnlocked\s*\(/.exec(monitorBody);
+	if (!continuationCall || !reconcileCall || (continuationCall.index ?? 0) >= (reconcileCall.index ?? 0)) return [];
 
 	const literalStart = executorRange.start + (literalSend.index ?? 0);
 	const keyStart = executorRange.start + (keySend.index ?? 0);
@@ -3350,8 +3363,8 @@ async function monitorGjcTeam(): Promise<void> {
 	await runSelfTestFixture(
 		{
 			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
-				": (() => {",
-				": Bun.spawnSync([config.tmux_command, ...args])",
+				/: \(\(\) => \{[\s\S]*?\n\t\t\t\}\)\(\);/,
+				": Bun.spawnSync([config.tmux_command, ...args]);",
 			),
 		},
 		1,
