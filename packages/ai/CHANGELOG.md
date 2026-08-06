@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.15] - 2026-08-06
+
 ### Fixed
 
 - Anthropic requests rejected with `A maximum of 4 blocks with cache_control may be provided. Found N.` now retry once with generated caching suppressed, instead of dying on the first attempt (#3934). An Anthropic-compatible gateway may attach its own block-level cache markers before forwarding, and those never appear in the params we serialize, so the total is unpredictable locally and the rejection itself is the only usable signal. The retry keeps generated caching off for the rest of the provider session so later turns do not re-trigger the same 400. Only a genuine breakpoint-overflow `invalid_request_error` is claimed — other `cache_control` complaints, unrelated 400s, non-400 statuses, and our own pre-flight validation failure still surface immediately. The classifier is exported as `isAnthropicCacheBreakpointOverflowError`.
