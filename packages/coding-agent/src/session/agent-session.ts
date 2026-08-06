@@ -11799,6 +11799,11 @@ export class AgentSession {
 		});
 		const artifactManager = await this.sessionManager.ensureArtifactManager();
 		const published = new Map<string, ToolOutputPruneEvictionHandle>();
+		// Fail closed when tool-output eviction is planned but no artifact store can be
+		// established: do not report a successful prune that skipped durable eviction.
+		if (!artifactManager && plan.digests.length > 0) {
+			return undefined;
+		}
 
 		// Publish exact text one candidate at a time. The plan carries only digests and
 		// replacement proposals; original output bytes exist only in this iteration.
