@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Resume listing now reverse-scans for buried but canonically valid `header_patch` titles, so a persisted manual title remains visible in the picker after later transcript growth instead of falling back to an empty/line-1 projection (#3633).
 - Custom OpenAI-compatible models whose wire id is namespaced (for example `cline-pass/deepseek-v4-flash`) now inherit capability metadata from the bundled leaf model when `contextWindow` / `maxTokens` are omitted, instead of silently falling back to the generic 128K / 16K defaults. True unknown leaf ids still default; explicit limits remain authoritative (#3856).
 - `gjc gc` file-lock discovery now budgets the walk **per lock root** and reports a hit entry cap as a **warning**, not a hard error. Truncating one root no longer skips the remaining roots, and a healthy run with only cap warnings exits `0` so scripts/cron/`&&` chains stay usable (#3852).
 
