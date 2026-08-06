@@ -285,6 +285,7 @@ describe("AgentSession resilient retry", () => {
 	}): AgentSession {
 		const model = options.model ?? getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled test model to exist");
+		authStorage.setRuntimeApiKey(model.provider, `${model.provider}-test-key`);
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: { model, systemPrompt: ["Test"], tools: options.tools ?? [], messages: [] },
