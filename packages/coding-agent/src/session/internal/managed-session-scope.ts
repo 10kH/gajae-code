@@ -168,7 +168,8 @@ export type ManagedScopeErrorCode =
 	| "atomic_unavailable"
 	| "invalid_request"
 	| "durability_failed"
-	| "durability_not_provable";
+	| "durability_not_provable"
+	| "capacity_exceeded";
 
 export type ManagedScopeResolution =
 	| { kind: "resolved"; scope: ManagedScope }
@@ -183,18 +184,35 @@ function managedScopeFailureCause(error: unknown): { readonly classification: st
 	return { classification: managedSecurityFailureClassification(error) ?? "binding_invalid" };
 }
 
-const managedScopeFailureCodes = new Set([
+const managedScopeFailureCodes = new Set<ManagedScopeErrorCode>([
 	"atomic_unavailable",
 	"invalid_request",
 	"durability_failed",
 	"durability_not_provable",
 	"migration_busy",
+	"capacity_exceeded",
 ]);
+
+/**
+ * Preserve a recognized native/publication failure as its own error code.
+ *
+ * Collapsing every unrecognized message into `binding_invalid` misreports
+ * unrelated failures — a `content_too_large` tree snapshot, for example — as a
+ * corrupt binding, which sends operators to delete a healthy binding file.
+ */
+function managedScopeErrorCode(message: string): ManagedScopeErrorCode {
+	if (message === "content_too_large") return "capacity_exceeded";
+	return managedScopeFailureCodes.has(message as ManagedScopeErrorCode)
+		? (message as ManagedScopeErrorCode)
+		: "binding_invalid";
+}
 
 function managedScopeFailureMessage(error: unknown, fallback: string): string {
 	const classification = managedSecurityFailureClassification(error);
 	if (classification) return classification;
-	return error instanceof Error && managedScopeFailureCodes.has(error.message) ? error.message : fallback;
+	if (!(error instanceof Error)) return fallback;
+	if (error.message === "content_too_large") return error.message;
+	return managedScopeFailureCodes.has(error.message as ManagedScopeErrorCode) ? error.message : fallback;
 }
 
 export interface ManagedCandidate {
@@ -869,13 +887,7 @@ export async function ensureManagedScope(
 		const message =
 			publication?.classification ??
 			managedScopeFailureMessage(error, "The managed scope could not be initialized.");
-		const code =
-			message === "atomic_unavailable" ||
-			message === "invalid_request" ||
-			message === "durability_failed" ||
-			message === "durability_not_provable"
-				? message
-				: "binding_invalid";
+		const code = managedScopeErrorCode(message);
 		return {
 			kind: "error",
 			code,
@@ -1057,13 +1069,7 @@ export function prepareManagedSessionScopeForWriteSync(
 		const publication = error instanceof ManagedPublishError ? error : undefined;
 		const message =
 			publication?.classification ?? managedScopeFailureMessage(error, "Managed write protocol setup failed.");
-		const code =
-			message === "atomic_unavailable" ||
-			message === "invalid_request" ||
-			message === "durability_failed" ||
-			message === "durability_not_provable"
-				? message
-				: "binding_invalid";
+		const code = managedScopeErrorCode(message);
 
 		return {
 			kind: "error",
@@ -3643,14 +3649,7 @@ export async function prepareManagedSessionScopeForWrite(
 		const publication = error instanceof ManagedPublishError ? error : undefined;
 		const message =
 			publication?.classification ?? managedScopeFailureMessage(error, "Managed write protocol setup failed.");
-		const code =
-			message === "atomic_unavailable" ||
-			message === "invalid_request" ||
-			message === "durability_failed" ||
-			message === "durability_not_provable" ||
-			message === "migration_busy"
-				? message
-				: "binding_invalid";
+		const code = managedScopeErrorCode(message);
 		return {
 			kind: "error",
 			code,
