@@ -2986,7 +2986,7 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 through generation 51 strict archive settlement", () => {
+	test("keeps wire protocol 3 through generation 53 ask-tool multi-select rendering", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
 		// Generations 34 and 35 add media conversion and topic adoption; generation
 		// 36 bound managed-session replacement to exact native filesystem authority,
@@ -3007,8 +3007,11 @@ describe("telegram daemon", () => {
 		// generation 50 resolves intermediate notifications-directory symlinks before
 		// native exact unlink while keeping final-component file symlinks fail-closed;
 		// generation 51 adds shared durable topic authority and archive recovery and
-		// binds idempotent archive settlement to Telegram error code 400.
-		expect(DAEMON_GENERATION).toBe(51);
+		// binds idempotent archive settlement to Telegram error code 400; generation
+		// 52 is claimed by the pre-readiness daemon-child exit diagnostics slice;
+		// generation 53 renders multi-select state for ask-tool asks and renumbers
+		// pre-numbered options exactly once around the selection marker.
+		expect(DAEMON_GENERATION).toBe(53);
 	});
 	test.each([
 		"1",
@@ -6174,6 +6177,35 @@ describe("telegram daemon", () => {
 			answer: 1,
 			token: "ts",
 		});
+	});
+
+	test("multi-select state renumbers pre-numbered options exactly once", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: setPrivateAgentDir(settings(agentDir), agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			rich: { enabled: false },
+			WebSocketImpl: FakeWs as never,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		// Deep-interview options arrive pre-numbered by the ask tool.
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask",
+			question: "Pick all",
+			options: ["1. Alpha", "2. Beta"],
+			selectedOptionIndices: [0],
+		});
+		const sent = bot.calls.find(call => call.method === "sendMessage")!.body;
+		expect(sent.text).toContain("1. ☑ Alpha");
+		expect(sent.text).toContain("2. ☐ Beta");
+		expect(sent.text).not.toContain("1. Alpha");
 	});
 
 	test("callback alias reply is delivered when Telegram callback ack fails", async () => {
@@ -19536,8 +19568,15 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 
 		releaseSend.resolve({ ok: true, result: { message_id: 7 } });
 		await handlerPersistStarted.promise;
+		// `join` counts its deadline in wall-clock from the call, and the statements
+		// between the call and `releaseHandlerPersist` below (the held-state race and
+		// its assertion) run inside that window. A deadline as tight as the released
+		// work itself therefore expires on a loaded runner and reports `false` for a
+		// barrier that did hold. The held half is proven by the race below, not by
+		// the deadline, so bound it generously — the daemon's own shutdown join uses
+		// 1s.
 		const joinedSettled = Promise.withResolvers<boolean>();
-		const joinedEffect = effects.join(100).then(value => {
+		const joinedEffect = effects.join(5_000).then(value => {
 			joinedSettled.resolve(value);
 			return value;
 		});
