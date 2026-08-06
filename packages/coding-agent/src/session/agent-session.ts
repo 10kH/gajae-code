@@ -937,12 +937,6 @@ function isMessageOnlyFirstEventTimeout(message: AssistantMessage): boolean {
 	);
 }
 
-function isBareDefaultWrappedFirstEventTimeout(message: AssistantMessage): boolean {
-	return (
-		message.errorMessage === WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR &&
-		!hasBareDefaultRetryDisqualifyingFacts(message)
-	);
-}
 function isBareDefaultMessageOnlyFirstEventTimeout(message: AssistantMessage): boolean {
 	// Message-only first-event watchdog timeouts in canonical prose — the wrapped
 	// "Error: Provider stream timed out while waiting for the first event" form
@@ -15153,12 +15147,11 @@ export class AgentSession {
 		// requirement above; other transient watchdogs preserve legacy behavior.
 		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential) {
 			const bareDefaultCodexOverload = isBareDefaultCodexOverload(message);
-			const bareDefaultWrappedFirstEventTimeout = isBareDefaultWrappedFirstEventTimeout(message);
 			const canReplayCodexOverload = bareDefaultCodexOverload;
 			if (
 				(!canReplayCodexOverload &&
 					!this.#isTypedFirstEventTimeout(message) &&
-					!bareDefaultWrappedFirstEventTimeout &&
+					!messageOnlyWatchdogTimeout &&
 					(hasBareDefaultRetryDisqualifyingFacts(message) ||
 						(classification !== "transient" && classification !== "first_event_timeout") ||
 						!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))) ||
