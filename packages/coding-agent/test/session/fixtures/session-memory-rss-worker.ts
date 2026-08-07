@@ -66,6 +66,15 @@ for (let cycle = 0; cycle < cycleCount; cycle++) {
 	manager.appendCompaction(`cycle ${cycle}`, undefined, firstKeptEntryId, cycleRecords);
 	cycleSamples.push(collect());
 }
+let selectionSamples: Array<{ rss: number; heapUsed: number; external: number }> = [];
+if (process.env.GJC_SESSION_MEMORY_RSS_SELECTION === "1") {
+	selectionSamples = [collect()];
+	const stage = await manager.stageDefaultModelSelection("provider/model", "high", { appendThinkingLevel: true });
+	selectionSamples.push(collect());
+	const promotion = manager.promoteDefaultModelSelection(stage);
+	if (promotion.kind !== "promoted") throw new Error(`selection_${promotion.kind}`);
+	selectionSamples.push(collect());
+}
 const stats = manager.getSessionMemoryStats();
 await manager.close();
 if (process.env.GJC_SESSION_MEMORY_RSS_KEEP !== "1") fs.rmSync(root, { recursive: true, force: true });
@@ -84,6 +93,7 @@ process.stdout.write(
 		cycleCount,
 		cycleRecords,
 		cycleSamples,
+		selectionSamples,
 		stats,
 	})}\n`,
 );

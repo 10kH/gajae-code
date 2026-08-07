@@ -8,6 +8,7 @@ interface RssWorkerResult {
 	root: string;
 	sessionFile: string;
 	cycleSamples: Array<{ rss: number; heapUsed: number; external: number }>;
+	selectionSamples: Array<{ rss: number; heapUsed: number; external: number }>;
 	eagerRssDeltaBytes: number;
 	stats: {
 		coldRetirementActive: boolean;
@@ -95,5 +96,28 @@ describe.skipIf(!enabled)("session memory RSS plateau", () => {
 		expect(measured.stats.coldRetirementActive).toBe(true);
 		expect(measured.stats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 		expect(measured.eagerRssDeltaBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+	}, 60_000);
+
+	it("stages and promotes a cold 120k-record model selection within the 64 MiB RSS budget", () => {
+		const worker = path.join(import.meta.dir, "fixtures", "session-memory-rss-worker.ts");
+		const result = Bun.spawnSync({
+			cmd: [process.execPath, worker],
+			env: {
+				...process.env,
+				GJC_SESSION_MEMORY_RSS_RECORDS: "120000",
+				GJC_SESSION_MEMORY_RSS_CYCLES: "0",
+				GJC_SESSION_MEMORY_RSS_FIRST_OPEN: "1",
+				GJC_SESSION_MEMORY_RSS_SELECTION: "1",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(result.exitCode, result.stderr.toString()).toBe(0);
+		const measured = JSON.parse(result.stdout.toString()) as RssWorkerResult;
+		expect(measured.selectionSamples).toHaveLength(3);
+		expect(measured.stats.coldRetirementActive).toBe(true);
+		expect(measured.stats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+		const rss = measured.selectionSamples.map(sample => sample.rss);
+		expect(Math.max(...rss) - Math.min(...rss)).toBeLessThanOrEqual(64 * 1024 * 1024);
 	}, 60_000);
 });
