@@ -1341,6 +1341,19 @@ describe("patch-bearing transcript fallback", () => {
 	});
 });
 
+describe("session memory mode scope", () => {
+	it("keeps nonpersistent sessions fully eager when enabled mode is requested", () => {
+		const manager = SessionManager.inMemory("/cwd");
+		manager.setSessionMemoryMode("enabled");
+		const first = manager.appendMessage({ role: "user", content: "one", timestamp: 1 });
+		manager.appendCompaction("summary", undefined, first, 1);
+		expect(manager.getSessionMemoryStats()).toMatchObject({
+			sidecarEnabled: false,
+			coldRetirementActive: false,
+		});
+		expect(manager.getEntries()).toHaveLength(2);
+	});
+});
 describe("whole-session persistence freshness", () => {
 	it("reprepares a rewrite when a direct append lands during async preparation", async () => {
 		class RewriteRaceStorage extends MemorySessionStorage {
