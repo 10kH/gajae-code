@@ -81,9 +81,13 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * gates, and renumbers pre-numbered options exactly once around the selection
  * marker. Generation 54 records owner `stoppedAt` on unclean daemon death
  * (`markDaemonOwnerStopped` + postmortem/finally wiring) so a dead process
- * cannot keep advertising itself as the ready owner (#3965).
+ * cannot keep advertising itself as the ready owner (#3965). Generation 55
+ * contains a shared-topic-authority outage: a failed lease renewal on the
+ * liveness heartbeat and a failed startup registry load are reported instead
+ * of escaping to the process-level fatal handler, authority-failure throws
+ * preserve their underlying cause, and the compensation fence retry is bounded.
  */
-export const DAEMON_GENERATION = 54;
+export const DAEMON_GENERATION = 55;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 5
