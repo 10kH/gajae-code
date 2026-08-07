@@ -8035,11 +8035,20 @@ export class SessionManager {
 		});
 	}
 
-	/** Capture the current managed transcript's descriptor after a rewrite and publish the commit. */
+	/** Capture the current transcript descriptor after a rewrite and publish the commit. */
 	#publishCommitMarkerFromCurrentTranscriptSync(): void {
 		const sessionFile = this.#sessionFile;
-		if (!sessionFile || this.destination.kind !== "managed") return;
-		const descriptor = this.#managedTranscriptStore(sessionFile).descriptorExpected(path.basename(sessionFile));
+		if (!sessionFile) return;
+		const descriptor =
+			this.destination.kind === "managed"
+				? this.#managedTranscriptStore(sessionFile).descriptorExpected(path.basename(sessionFile))
+				: (() => {
+						try {
+							return this.storage.statSync(sessionFile);
+						} catch {
+							return null;
+						}
+					})();
 		if (!descriptor) return;
 		this.#publishSessionCommitMarkerSync(descriptor);
 	}
@@ -8268,11 +8277,9 @@ export class SessionManager {
 		runtime.enabled = true;
 		runtime.base = { baseDigest, baseEndOffset };
 		runtime.tail = tailBuilder.build();
-		if (this.destination.kind === "managed") {
-			runtime.reopenTransition = this.#classifySidecarReopen();
-			this.#publishCommitMarkerFromCurrentTranscriptSync();
-			runtime.terminalTransition = this.#classifySidecarReopen();
-		}
+		runtime.reopenTransition = this.#classifySidecarReopen();
+		this.#publishCommitMarkerFromCurrentTranscriptSync();
+		runtime.terminalTransition = this.#classifySidecarReopen();
 	}
 
 	#validateColdBase(base = this.#sidecarRuntime?.base): boolean {
@@ -8627,10 +8634,8 @@ export class SessionManager {
 			terminalSeq: seq,
 			transcriptSize: byteOffset + byteLength,
 		};
-		if (this.destination.kind === "managed") {
-			this.#publishCommitMarkerFromCurrentTranscriptSync();
-			runtime.terminalTransition = this.#classifySidecarReopen();
-		}
+		this.#publishCommitMarkerFromCurrentTranscriptSync();
+		runtime.terminalTransition = this.#classifySidecarReopen();
 		return true;
 	}
 
@@ -8742,12 +8747,15 @@ export class SessionManager {
 		return classification;
 	}
 
-	/** Current managed transcript descriptor, or null when unavailable. */
+	/** Current transcript descriptor, or null when unavailable. */
 	#managedDescriptorSnapshotOrNull(): DescriptorSnapshot | null {
 		const sessionFile = this.#sessionFile;
-		if (!sessionFile || this.destination.kind !== "managed") return null;
+		if (!sessionFile) return null;
 		try {
-			const descriptor = this.#managedTranscriptStore(sessionFile).descriptorExpected(path.basename(sessionFile));
+			const descriptor =
+				this.destination.kind === "managed"
+					? this.#managedTranscriptStore(sessionFile).descriptorExpected(path.basename(sessionFile))
+					: this.storage.statSync(sessionFile);
 			if (!descriptor) return null;
 			return {
 				dev: descriptor.dev,
