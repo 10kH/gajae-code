@@ -46,51 +46,122 @@ afterEach(() => {
 	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
-// Per-spawn budget for the probe child. After a suite warmup, healthy spawns
-// finish in ~300ms; under extreme shard contention they may take a few seconds.
-// Kill rather than wait for the outer it() timeout so a stalled child cannot
-// pin the suite for the full 60s and leak pipes.
-const PROBE_SPAWN_BUDGET_MS = 45_000;
+/**
+ * Per-attempt budget for one probe child.
+ *
+ * Healthy spawns finish in ~300–500ms after suite warmup. Under CI shard
+ * contention a child can stall during Bun startup; the previous harness awaited
+ * `stdout`/`stderr`/`exited` as a single `Promise.all` and only `kill()`ed on a
+ * timer. When the kill did not close the pipes, `Promise.all` never settled and
+ * the outer `it(..., 60_000)` failed at ~60001ms (Dev CI run 31133356543 —
+ * "still honors inherited Smithery configuration") even though the timer had
+ * fired at 45s. Race the attempt deadline so a stalled child cannot pin the
+ * suite past this budget, and SIGKILL so the process actually dies.
+ */
+const PROBE_SPAWN_BUDGET_MS = 15_000;
+/** Contention recovery: retry only spawn-lifecycle timeouts, never assertion failures. */
+const PROBE_SPAWN_RETRIES = 2;
 
-async function resolveIn(cwd: string, overrides: Record<string, string> = {}): Promise<Resolved> {
-	const env: Record<string, string> = {};
-	for (const [key, value] of Object.entries(process.env)) {
-		if (value !== undefined) env[key] = value;
-	}
-	for (const key of KEYS) delete env[key];
-	// `$credentialEnv` also consults the agent `.env`, the GJC config `.env`,
-	// `~/.env` and the login shell rc files; keep all of them neutral.
-	env.HOME = tempDir();
-	env.GJC_CODING_AGENT_DIR = tempDir();
+function isProbeTimeout(error: unknown): boolean {
+	return error instanceof Error && error.message.startsWith("probe timed out after ");
+}
+
+function buildProbeEnv(overrides: Record<string, string>): Record<string, string> {
+	// Minimal env — copying the full parent process.env under GitHub Actions can
+	// be multi-kilobyte and has been observed to correlate with stalled first-byte
+	// child startup under shard pressure. The probe only needs PATH + neutral
+	// home/config roots + the Smithery keys under test.
+	const env: Record<string, string> = {
+		PATH: process.env.PATH ?? "/usr/bin:/bin",
+		HOME: tempDir(),
+		GJC_CODING_AGENT_DIR: tempDir(),
+		TMPDIR: process.env.TMPDIR ?? os.tmpdir(),
+		LANG: process.env.LANG ?? "C",
+	};
+	// Do not forward BUN_OPTIONS / NODE_OPTIONS — test-runner flags can stall
+	// child startup under contention when combined with a cold module graph.
 	Object.assign(env, overrides);
+	return env;
+}
 
-	const proc = Bun.spawn([process.execPath, PROBE], { cwd, env, stdout: "pipe", stderr: "pipe" });
-	let timedOut = false;
+async function resolveInOnce(cwd: string, overrides: Record<string, string> = {}): Promise<Resolved> {
+	const env = buildProbeEnv(overrides);
+	const proc = Bun.spawn([process.execPath, PROBE], {
+		cwd,
+		env,
+		stdout: "pipe",
+		stderr: "pipe",
+		stdin: "ignore",
+	});
+
+	const { promise, resolve, reject } = Promise.withResolvers<Resolved>();
+	let settled = false;
+	const settle = (fn: () => void): void => {
+		if (settled) return;
+		settled = true;
+		fn();
+	};
+
 	const timer = setTimeout(() => {
-		timedOut = true;
 		try {
-			proc.kill();
+			proc.kill(9);
 		} catch {
 			// already exited
 		}
+		settle(() => {
+			reject(new Error(`probe timed out after ${PROBE_SPAWN_BUDGET_MS}ms and was killed`));
+		});
 	}, PROBE_SPAWN_BUDGET_MS);
-	try {
-		const [stdout, stderr, exitCode] = await Promise.all([
-			new Response(proc.stdout).text(),
-			new Response(proc.stderr).text(),
-			proc.exited,
-		]);
-		if (timedOut) {
-			throw new Error(
-				`probe timed out after ${PROBE_SPAWN_BUDGET_MS}ms and was killed` +
-					(stderr.trim() ? `: ${stderr.trim()}` : ""),
-			);
+
+	void (async () => {
+		try {
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+				proc.exited,
+			]);
+			if (settled) return;
+			if (exitCode !== 0) {
+				settle(() => {
+					reject(new Error(`probe failed (${exitCode}): ${stderr}`));
+				});
+				return;
+			}
+			settle(() => {
+				resolve(JSON.parse(stdout.trim()) as Resolved);
+			});
+		} catch (error) {
+			settle(() => {
+				reject(error instanceof Error ? error : new Error(String(error)));
+			});
 		}
-		if (exitCode !== 0) throw new Error(`probe failed (${exitCode}): ${stderr}`);
-		return JSON.parse(stdout.trim()) as Resolved;
+	})();
+
+	try {
+		return await promise;
 	} finally {
 		clearTimeout(timer);
+		if (!settled) {
+			try {
+				proc.kill(9);
+			} catch {
+				// ignore
+			}
+		}
 	}
+}
+
+async function resolveIn(cwd: string, overrides: Record<string, string> = {}): Promise<Resolved> {
+	let lastTimeout: Error | undefined;
+	for (let attempt = 0; attempt <= PROBE_SPAWN_RETRIES; attempt++) {
+		try {
+			return await resolveInOnce(cwd, overrides);
+		} catch (error) {
+			if (!isProbeTimeout(error) || attempt === PROBE_SPAWN_RETRIES) throw error;
+			lastTimeout = error instanceof Error ? error : new Error(String(error));
+		}
+	}
+	throw lastTimeout ?? new Error("probe failed after retries");
 }
 
 const PLANTED = [
@@ -102,15 +173,13 @@ const PLANTED = [
 describe("Smithery env trust boundary", () => {
 	// Cold-start the probe module graph outside per-test budgets. Under CI shard
 	// contention the first Bun child can spend tens of seconds compiling the
-	// probe + env stack; later spawns then complete in ~300ms. Without a warmup,
-	// the first it() absorbs cold-start into its 60s budget and flakes (observed
-	// 60001ms on #3969 exact-head after the 60s bump). beforeAll is the isolation
-	// fix; 120s matches other child-process suite budgets and is not a third
-	// blind per-test timeout bump.
+	// probe + env stack; later spawns then complete in ~300ms.
 	beforeAll(async () => {
 		await resolveIn(projectDir());
 	}, 120_000);
 
+	// Outer budgets stay generous enough for retries (3 × 15s) but no longer
+	// depend on a single hung Promise.all surviving until 60s.
 	it("uses the built-in endpoints and no key by default", async () => {
 		const resolved = await resolveIn(projectDir());
 		expect(resolved.url).toBe("https://smithery.ai");
