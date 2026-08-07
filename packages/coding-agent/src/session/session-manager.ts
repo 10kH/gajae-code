@@ -725,6 +725,7 @@ export interface SessionMemorySidecarRuntime {
 	hotSuffixBytes: number;
 	accountant: SessionMemoryAccountant;
 	reducer: ReducerState;
+	providerStateEntries: SessionEntry[];
 	blockCache: FixedCacheAccount;
 	entryCache: FixedCacheAccount;
 	tailCache: FixedCacheAccount;
@@ -741,6 +742,7 @@ interface SessionMemoryCommitContents extends CommitMarkerContents {
 	retirementFirstKeptEntryId?: string;
 	leafId?: string;
 	reducer?: ReducerState;
+	providerStateEntries?: SessionEntry[];
 	labels?: Array<[string, string]>;
 	usageStatistics?: UsageStatistics;
 
@@ -757,6 +759,24 @@ function isValidPersistedReducerState(value: ReducerState): boolean {
 			item => typeof item === "number" && Number.isSafeInteger(item),
 		)
 	);
+}
+
+function isProviderStateEntry(entry: SessionEntry): boolean {
+	return [
+		"thinking_level_change",
+		"model_change",
+		"configured_model_chain",
+		"service_tier_change",
+		"mcp_tool_selection",
+		"discovered_builtin_tool_selection",
+		"mode_change",
+		"ttsr_injection",
+	].includes(entry.type);
+}
+
+function providerStateEntryKey(entry: SessionEntry): string | undefined {
+	if (!isProviderStateEntry(entry)) return undefined;
+	return entry.type === "configured_model_chain" ? `${entry.type}:${entry.role}` : entry.type;
 }
 /** Map a session entry to its rolling-tail record kind. */
 function tailRecordKindForEntry(entry: SessionEntry): TailRecordKind {
@@ -6269,6 +6289,7 @@ export class SessionManager {
 				!commit.retirementFirstKeptEntryId ||
 				!commit.leafId ||
 				!commit.reducer ||
+				!Array.isArray(commit.providerStateEntries) ||
 				!commit.usageStatistics ||
 				!Array.isArray(commit.labels) ||
 				!sameDescriptor(commit.descriptor, descriptor) ||
@@ -6297,6 +6318,9 @@ export class SessionManager {
 					entry => Array.isArray(entry) && entry.length === 2 && entry.every(value => typeof value === "string"),
 				) ||
 				!isValidPersistedReducerState(commit.reducer) ||
+				commit.providerStateEntries.length > 256 ||
+				Buffer.byteLength(JSON.stringify(commit.providerStateEntries), "utf8") > 4 * 1024 * 1024 ||
+				!commit.providerStateEntries.every(isProviderStateEntry) ||
 				![
 					commit.usageStatistics.input,
 					commit.usageStatistics.output,
@@ -6390,6 +6414,7 @@ export class SessionManager {
 			};
 			runtime.retirementFirstKeptEntryId = commit.retirementFirstKeptEntryId;
 			runtime.reducer = commit.reducer;
+			runtime.providerStateEntries = commit.providerStateEntries ?? [];
 			runtime.hotSuffixBytes = hotSuffixBytes;
 			runtime.reopenTransition = { kind: "exact", reason: "descriptor_and_proof_match" };
 			runtime.terminalTransition = runtime.reopenTransition;
@@ -8918,6 +8943,7 @@ export class SessionManager {
 				retirementFirstKeptEntryId: runtime.retirementFirstKeptEntryId,
 				leafId: this.#leafId,
 				reducer: runtime.reducer,
+				providerStateEntries: runtime.providerStateEntries,
 				labels: [...runtime.labelsPins.labelsEntries()],
 				usageStatistics: this.#usageStatistics,
 
@@ -9040,6 +9066,7 @@ export class SessionManager {
 				modelChange: { latest: undefined },
 				ttsr: { count: 0, rulesCount: 0, recordsCount: 0, largestOrdinal: -1 },
 			},
+			providerStateEntries: [],
 			blockCache: new FixedCacheAccount(8 * 1024 * 1024),
 			entryCache: new FixedCacheAccount(28 * 1024 * 1024),
 			tailCache: new FixedCacheAccount(4 * 1024 * 1024),
@@ -9136,9 +9163,13 @@ export class SessionManager {
 		let activeCompaction: CompactionEntry | undefined;
 		let active = this.#leafId ? this.#byId.get(this.#leafId) : undefined;
 		let activeSteps = 0;
+		const providerState = new Map<string, { order: number; entry: SessionEntry }>();
 		while (active && activeSteps <= sessionEntries.length) {
 			const ordinal = sessionEntries.length - activeSteps - 1;
 			if (!activeCompaction && active.type === "compaction") activeCompaction = active;
+			const providerKey = providerStateEntryKey(active);
+			if (providerKey && !providerState.has(providerKey))
+				providerState.set(providerKey, { order: activeSteps, entry: cloneSessionEntry(active) });
 			if (active.type === "model_change" && runtime.reducer.modelChange.latest === undefined) {
 				runtime.reducer = applyReducerDelta(runtime.reducer, {
 					kind: "latest_model_change",
@@ -9154,15 +9185,12 @@ export class SessionManager {
 					count: active.ttsrMessageCount ?? 0,
 				});
 			}
-			if (
-				activeCompaction &&
-				runtime.reducer.modelChange.latest !== undefined &&
-				runtime.reducer.ttsr.largestOrdinal >= 0
-			)
-				break;
 			active = active.parentId ? this.#byId.get(active.parentId) : undefined;
 			activeSteps++;
 		}
+		runtime.providerStateEntries = [...providerState.values()]
+			.sort((left, right) => right.order - left.order)
+			.map(item => item.entry);
 		if (!activeCompaction) return;
 		const tailStartOrdinal = sessionEntries.findIndex(entry => entry.id === activeCompaction.firstKeptEntryId);
 		if (tailStartOrdinal < 0) return;
@@ -9644,11 +9672,15 @@ export class SessionManager {
 			modelChange: { latest: undefined },
 			ttsr: { count: 0, rulesCount: 0, recordsCount: 0, largestOrdinal: -1 },
 		};
+		const providerState = new Map<string, { order: number; entry: SessionEntry }>();
 		while (currentId !== null) {
 			const resolved = this.#readColdBranchEntry(currentId);
 			if (!resolved || resolved.index.ordinal >= priorOrdinal) return false;
 			priorOrdinal = resolved.index.ordinal;
 			const { entry, index } = resolved;
+			const providerKey = providerStateEntryKey(entry);
+			if (providerKey && !providerState.has(providerKey))
+				providerState.set(providerKey, { order: index.ordinal, entry: cloneSessionEntry(entry) });
 			if (!boundaryReached) {
 				retainedLeafToBoundary.push(entry);
 				retainedBytes += index.byteLength;
@@ -9716,6 +9748,9 @@ export class SessionManager {
 		this.#usageStatistics = aggregateUsageStatistics;
 		this.#leafId = leafId;
 		runtime.reducer = reducer;
+		runtime.providerStateEntries = [...providerState.values()]
+			.sort((left, right) => left.order - right.order)
+			.map(item => item.entry);
 		runtime.hotSuffixBytes = retainedBytes;
 		runtime.retirementFirstKeptEntryId = boundaryId;
 		runtime.terminalTransition = { kind: "rebuild", reason: "branch_activation_unpublished" };
@@ -9806,6 +9841,13 @@ export class SessionManager {
 	#applySidecarReducerDelta(entry: SessionEntry): void {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled) return;
+		const providerKey = providerStateEntryKey(entry);
+		if (providerKey) {
+			runtime.providerStateEntries = [
+				...runtime.providerStateEntries.filter(candidate => providerStateEntryKey(candidate) !== providerKey),
+				cloneSessionEntry(entry),
+			];
+		}
 		if (entry.type === "model_change") {
 			runtime.reducer = applyReducerDelta(runtime.reducer, {
 				kind: "latest_model_change",
@@ -9956,6 +9998,7 @@ export class SessionManager {
 				retirementFirstKeptEntryId?: unknown;
 				leafId?: unknown;
 				reducer?: unknown;
+				providerStateEntries?: unknown;
 				labels?: unknown;
 				usageStatistics?: unknown;
 				indexDigest?: unknown;
@@ -9998,6 +10041,9 @@ export class SessionManager {
 					: {}),
 				...(typeof value.leafId === "string" ? { leafId: value.leafId } : {}),
 				...(value.reducer && typeof value.reducer === "object" ? { reducer: value.reducer as ReducerState } : {}),
+				...(Array.isArray(value.providerStateEntries)
+					? { providerStateEntries: value.providerStateEntries as SessionEntry[] }
+					: {}),
 				...(Array.isArray(value.labels) ? { labels: value.labels as Array<[string, string]> } : {}),
 				...(value.usageStatistics && typeof value.usageStatistics === "object"
 					? { usageStatistics: value.usageStatistics as UsageStatistics }
@@ -12418,8 +12464,11 @@ export class SessionManager {
 			return cached;
 		}
 		this.#pathOnlyContextBuildCount++;
+		const providerEntries = this.#getActivePathEntriesForProviderContext();
 		const builtContext = buildSessionContext(
-			this.#getActivePathEntriesForProviderContext(),
+			this.#coldSidecarActive() && this.#sidecarRuntime
+				? [...this.#sidecarRuntime.providerStateEntries.map(cloneSessionEntry), ...providerEntries]
+				: providerEntries,
 			this.#leafId,
 			undefined,
 			this.#sessionId,
@@ -12447,7 +12496,7 @@ export class SessionManager {
 			visited.add(current.id);
 			ids.push(current.id);
 			if (!activeCompaction && current.type === "compaction") activeCompaction = current;
-			if (activeCompaction && current.id === activeCompaction.firstKeptEntryId) break;
+			if (this.#coldSidecarActive() && activeCompaction && current.id === activeCompaction.firstKeptEntryId) break;
 			current = current.parentId ? this.#resolveEntry(current.parentId) : undefined;
 		}
 		ids.reverse();

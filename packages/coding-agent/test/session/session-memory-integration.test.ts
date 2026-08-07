@@ -452,6 +452,85 @@ describe("bounded provider context traversal", () => {
 			await manager.close();
 		}
 	});
+	it("preserves pre-compaction provider state across retirement and exact reopen", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/provider-state.jsonl";
+		const records = [
+			{ type: "session", version: 5, id: "provider-state", timestamp: "0", cwd: "/cwd" },
+			{ type: "thinking_level_change", id: "thinking", parentId: null, timestamp: "0", thinkingLevel: "high" },
+			{
+				type: "model_change",
+				id: "model",
+				parentId: "thinking",
+				timestamp: "0",
+				model: "test/default",
+				role: "default",
+			},
+			{
+				type: "configured_model_chain",
+				id: "chain",
+				parentId: "model",
+				timestamp: "0",
+				role: "reviewer",
+				entries: ["test/reviewer"],
+				origin: "session",
+			},
+			{ type: "service_tier_change", id: "tier", parentId: "chain", timestamp: "0", serviceTier: "flex" },
+			{ type: "mcp_tool_selection", id: "mcp", parentId: "tier", timestamp: "0", selectedToolNames: ["mcp__docs"] },
+			{
+				type: "discovered_builtin_tool_selection",
+				id: "builtin",
+				parentId: "mcp",
+				timestamp: "0",
+				selectedToolNames: ["search"],
+			},
+			{
+				type: "mode_change",
+				id: "mode",
+				parentId: "builtin",
+				timestamp: "0",
+				mode: "plan",
+				data: { planFile: "plan.md" },
+			},
+			{
+				type: "message",
+				id: "kept",
+				parentId: "mode",
+				timestamp: "0",
+				message: { role: "user", content: "kept", timestamp: 1 },
+			},
+			{
+				type: "compaction",
+				id: "compact",
+				parentId: "kept",
+				timestamp: "0",
+				summary: "summary",
+				firstKeptEntryId: "kept",
+				tokensBefore: 10,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		const manager = await SessionManager.open(sessionFile, SessionManager.explicitDestination("/sessions"), storage);
+		const eager = manager.buildSessionContext();
+		manager.setSessionMemoryMode("enabled");
+		expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		expect(manager.buildSessionContext()).toEqual(eager);
+		await manager.close();
+
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(reopened.getSessionMemoryStats().lazyReopenSucceeded).toBe(true);
+			expect(reopened.buildSessionContext()).toEqual(eager);
+		} finally {
+			await reopened.close();
+		}
+	});
 });
 
 it("reopens an enabled explicit session from authenticated hot-tail metadata", async () => {
