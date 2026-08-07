@@ -1639,14 +1639,15 @@
 				"mode": {
 					"type": "string",
 					"enum": [
+						"auto",
 						"apply_patch",
 						"hashline",
 						"patch",
 						"replace",
 						"vim"
 					],
-					"description": "Select the edit tool variant (replace, patch, hashline, vim, or apply_patch)",
-					"default": "hashline"
+					"description": "Select the edit tool variant (auto routes by model family; replace, patch, hashline, vim, or apply_patch)",
+					"default": "auto"
 				},
 				"fuzzyMatch": {
 					"type": "boolean",

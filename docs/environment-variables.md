@@ -478,7 +478,7 @@ Extra conditional behavior:
 | `LM_STUDIO_BASE_URL`         | Default implicit LM Studio discovery base URL override (`http://127.0.0.1:1234/v1` if unset)       |
 | `OLLAMA_BASE_URL`            | Default implicit Ollama discovery base URL override (`http://127.0.0.1:11434` if unset)            |
 | `LLAMA_CPP_BASE_URL`         | Default implicit Llama.cpp discovery base URL override (`http://127.0.0.1:8080` if unset)          |
-| `GJC_EDIT_VARIANT`            | Forces edit tool variant when valid (`patch`, `replace`, `hashline`, `atom`, `vim`, `apply_patch`) |
+| `GJC_EDIT_VARIANT`            | Forces edit tool variant (`patch`, `replace`, `hashline`, `vim`, `apply_patch`). The force beats `edit.modelVariants`, `edit.mode`, and automatic model-family routing; invalid values fail fast at startup. `PI_EDIT_VARIANT` is the legacy alias. |
 | `GJC_FORCE_IMAGE_PROTOCOL`    | Forces supported image protocol (`kitty`, `iterm2`/`iterm`, `sixel`, `none`) where used            |
 | `GJC_ALLOW_SIXEL_PASSTHROUGH` | Allows SIXEL passthrough when `GJC_FORCE_IMAGE_PROTOCOL=sixel`                                      |
 | `GJC_NO_PTY`                  | If `1`, disables interactive PTY path for bash tool                                                |

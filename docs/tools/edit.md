@@ -1,6 +1,6 @@
 # edit
 
-> Applies source edits; default mode is the hashline patch language consumed from a single `input` string.
+> Applies source edits; the default `edit.mode: auto` routes the edit protocol by model family, with the hashline patch language (single `input` string) as the fallback mode documented here.
 
 ## Source
 - Entry: `packages/coding-agent/src/edit/index.ts`
@@ -22,7 +22,7 @@
 
 ## Inputs
 
-### Hashline mode (default)
+### Hashline mode
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -42,7 +42,7 @@ Patch language inside `input`:
 
 Anchors come from `read`/`search` output. `read` formats lines as `LINEhh|TEXT` via `formatHashLine` / `formatHashLines` in `packages/coding-agent/src/hashline/hash.ts`; copy only the token left of `|` into op lines.
 
-Other edit modes exist (`replace`, `patch`, `vim`, `apply_patch`) and are selected outside the tool payload by `resolveEditMode()` in `packages/coding-agent/src/utils/edit-mode.ts`. Their schemas are different; this document covers the default hashline mode.
+Other edit modes exist (`replace`, `patch`, `vim`, `apply_patch`) and are selected outside the tool payload by `resolveEditMode()` in `packages/coding-agent/src/utils/edit-mode.ts`. With the default `edit.mode: auto`, the mode is routed by detected model family (GPT/Codex → `apply_patch`; Claude/DeepSeek/Qwen → `replace`; MiniMax/GLM/Kimi and unknown models → `hashline`). Precedence: `GJC_EDIT_VARIANT`/`PI_EDIT_VARIANT` env force, then a matching `edit.modelVariants` rule, then explicit non-`auto` `edit.mode`, then a model-catalog edit recommendation when the session exposes one, then the built-in family mapping, then the `hashline` fallback. Their schemas are different; this document covers hashline mode.
 
 ## Outputs
 - Single-shot tool result; hashline mode does not use a `resolve` preview/apply handshake.
@@ -172,7 +172,7 @@ export const done = true;
   - The tool itself is marked `nonAbortable = true` and `concurrency = "exclusive"` in `packages/coding-agent/src/edit/index.ts`.
 
 ## Limits & Caps
-- Default mode is `hashline` (`DEFAULT_EDIT_MODE`) in `packages/coding-agent/src/utils/edit-mode.ts`.
+- Default `edit.mode` is `auto` (model-family routing); `hashline` (`DEFAULT_EDIT_MODE`) is the fallback for unknown models, in `packages/coding-agent/src/utils/edit-mode.ts`.
 - Anchor hashes are always 2 lowercase letters from a stable 647-entry bigram table (`HL_BIGRAMS_COUNT`) in `packages/coding-agent/src/hashline/hash.ts`.
 - The visible mismatch report shows 2 lines of context on each side (`MISMATCH_CONTEXT`) in `packages/coding-agent/src/hashline/constants.ts`.
 - Stale-anchor recovery uses `fuzzFactor: 3` (`HASHLINE_RECOVERY_FUZZ_FACTOR`) in `packages/coding-agent/src/hashline/recovery.ts`.

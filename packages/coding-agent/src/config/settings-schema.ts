@@ -2,7 +2,7 @@ import type { Effort } from "@gajae-code/ai/model-thinking";
 import { PET_MODE_IDS, PET_SKIN_IDS, PET_SKINS } from "@gajae-code/tui/components/gajae-pet";
 import { TASK_SIMPLE_MODES } from "../task/simple-mode";
 import { getThinkingLevelMetadata } from "../thinking-metadata";
-import { EDIT_MODES } from "../utils/edit-mode";
+import { DEFAULT_EDIT_MODE_SETTING, EDIT_MODE_SETTINGS } from "../utils/edit-mode";
 import { CONFIGURABLE_SEARCH_PROVIDER_IDS } from "../web/search/types";
 import type { ModelSelectorValue } from "./model-selector-value";
 import { UPDATE_CHANNELS } from "./update-channel";
@@ -2141,12 +2141,13 @@ export const SETTINGS_SCHEMA = {
 	// Edit tool
 	"edit.mode": {
 		type: "enum",
-		values: EDIT_MODES,
-		default: "hashline",
+		values: EDIT_MODE_SETTINGS,
+		default: DEFAULT_EDIT_MODE_SETTING,
 		ui: {
 			tab: "editing",
 			label: "Edit Mode",
-			description: "Select the edit tool variant (replace, patch, hashline, vim, or apply_patch)",
+			description:
+				"Select the edit tool variant (auto routes by model family; replace, patch, hashline, vim, or apply_patch)",
 		},
 	},
 

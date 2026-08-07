@@ -37,7 +37,7 @@ import {
 	parseNotificationSettingsSnapshot,
 } from "../sdk/bus/config";
 import { AgentStorage } from "../session/agent-storage";
-import { type EditMode, normalizeEditMode } from "../utils/edit-mode";
+import { type EditMode, type EditVariantMatch, normalizeEditMode } from "../utils/edit-mode";
 import {
 	type AtomicYamlPatch,
 	applyAtomicYamlPatches,
@@ -964,10 +964,12 @@ export class Settings implements NotificationSettingsReader {
 	/**
 	 * Get the edit variant for a specific model.
 	 * Returns "patch", "replace", "hashline", "vim", "apply_patch", or null (use global default).
+	 * Skips invalid values; prefer `matchEditVariantForModel` when invalid
+	 * matches must fail closed instead of falling through.
 	 */
 	getEditVariantForModel(model: string | undefined): EditMode | null {
 		if (!model) return null;
-		const variants = (this.#merged.edit as { modelVariants?: Record<string, string> })?.modelVariants;
+		const variants = this.#editModelVariants();
 		if (!variants) return null;
 		for (const pattern in variants) {
 			if (model.includes(pattern)) {
@@ -978,6 +980,28 @@ export class Settings implements NotificationSettingsReader {
 			}
 		}
 		return null;
+	}
+
+	/**
+	 * First matching `edit.modelVariants` rule for a model, with its raw
+	 * (unvalidated) value. The edit-mode resolver uses this discriminated
+	 * result so a matched-but-invalid value fails closed with a diagnostic
+	 * rather than silently resolving to another mode.
+	 */
+	matchEditVariantForModel(model: string | undefined): EditVariantMatch | null {
+		if (!model) return null;
+		const variants = this.#editModelVariants();
+		if (!variants) return null;
+		for (const pattern in variants) {
+			if (model.includes(pattern)) {
+				return { pattern, value: String(variants[pattern]) };
+			}
+		}
+		return null;
+	}
+
+	#editModelVariants(): Record<string, string> | undefined {
+		return (this.#merged.edit as { modelVariants?: Record<string, string> })?.modelVariants;
 	}
 
 	/**
