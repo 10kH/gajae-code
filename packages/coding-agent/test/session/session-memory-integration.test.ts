@@ -362,6 +362,50 @@ describe("active branch retirement boundary", () => {
 	});
 });
 
+describe("session memory mode across file transitions", () => {
+	it("reapplies enabled retirement and keeps off transitions sidecar-free", async () => {
+		const storage = new MemorySessionStorage();
+		const writeCompacted = (sessionFile: string, sessionId: string): void => {
+			const records = [
+				{ type: "session", version: 5, id: sessionId, timestamp: "0", cwd: "/cwd" },
+				{ type: "custom", id: `${sessionId}-root`, parentId: null, timestamp: "0", customType: "x" },
+				{ type: "custom", id: `${sessionId}-kept`, parentId: `${sessionId}-root`, timestamp: "0", customType: "x" },
+				{
+					type: "compaction",
+					id: `${sessionId}-compaction`,
+					parentId: `${sessionId}-kept`,
+					timestamp: "0",
+					summary: "summary",
+					firstKeptEntryId: `${sessionId}-kept`,
+					tokensBefore: 10,
+				},
+			];
+			storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		};
+		writeCompacted("/sessions/first.jsonl", "first");
+		writeCompacted("/sessions/second.jsonl", "second");
+		writeCompacted("/sessions/third.jsonl", "third");
+		const manager = await SessionManager.open(
+			"/sessions/first.jsonl",
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+		);
+		try {
+			manager.setSessionMemoryMode("enabled");
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			await manager.setSessionFile("/sessions/second.jsonl");
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			expect(manager.getEntry("second-root")).toMatchObject({ id: "second-root" });
+
+			manager.setSessionMemoryMode("off");
+			await manager.setSessionFile("/sessions/third.jsonl");
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
+			expect(storage.listFilesSync("/sessions", "*.spill.*")).toEqual([]);
+		} finally {
+			await manager.close();
+		}
+	});
+});
 describe("patch-bearing transcript fallback", () => {
 	it("keeps patch-bearing transcripts eager so raw offsets cannot drift", async () => {
 		const storage = new MemorySessionStorage();

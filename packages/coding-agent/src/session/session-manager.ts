@@ -5836,7 +5836,10 @@ export class SessionManager {
 		this.#bumpAllRevisions();
 		this.#residentBlobRevision++;
 		prepared.adopt();
-		if (this.persist && this.#sessionFile) this.#buildDisposableSidecars(this.#fileEntries);
+		if (this.persist && this.#sessionFile) {
+			this.#buildDisposableSidecars(this.#fileEntries);
+			if (this.#sessionMemoryMode === "enabled") this.#retireColdEntries();
+		}
 		if (predecessor !== successor) this.#disposeResidentTextStore(predecessor);
 		prepared.releaseReferences();
 	}
@@ -8112,6 +8115,10 @@ export class SessionManager {
 
 	/** Build a fresh disposable `.spill.idx`/`.spill.tail`/`.spill.commit` set from the transcript. */
 	#buildDisposableSidecars(entries: readonly FileEntry[]): void {
+		if (this.#sessionMemoryMode === "off") {
+			this.#sidecarRuntime = undefined;
+			return;
+		}
 		try {
 			this.#buildDisposableSidecarsUnsafe(entries);
 		} catch (error) {
