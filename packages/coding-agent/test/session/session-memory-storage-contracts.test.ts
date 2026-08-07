@@ -358,6 +358,36 @@ describe("commit-marker checked create/replace", () => {
 		if (retained.kind === "present") expect(retained.rawBytesSha256).toBe(current.rawBytesSha256);
 		expect(fs.readdirSync(dir).filter(name => name.endsWith(".tmp"))).toEqual([]);
 	});
+	it("file backend: replacement directory fsync failure leaves the exact new marker recoverable", async () => {
+		if (process.platform === "win32") return;
+		const dir = await makeTempDir("gjc-marker-replace-directory-fsync-");
+		const markerPath = path.join(dir, "session.jsonl.spill.commit");
+		const file = new FileSessionStorage();
+		createSessionCommitMarkerCheckedSync(file, markerPath, markerBytes(0));
+		const current = readSessionCommitMarkerSync(file, markerPath);
+		if (current.kind !== "present") throw new Error("Expected a present marker");
+		const realFsync = fs.fsyncSync;
+		let calls = 0;
+		const fsync = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+			calls++;
+			if (calls === 2) throw new Error("injected_replace_directory_fsync_failure");
+			return realFsync(fd);
+		});
+		try {
+			expect(() =>
+				replaceSessionCommitMarkerCheckedSync(file, markerPath, markerBytes(1), {
+					rawBytesSha256: current.rawBytesSha256,
+					descriptorIdentity: current.stat,
+				}),
+			).toThrow("injected_replace_directory_fsync_failure");
+		} finally {
+			fsync.mockRestore();
+		}
+		const published = readSessionCommitMarkerSync(file, markerPath);
+		expect(published.kind).toBe("present");
+		if (published.kind === "present") expect(published.rawBytesSha256).toBe(markerHash(markerBytes(1)));
+		expect(fs.readdirSync(dir).filter(name => name.endsWith(".tmp"))).toEqual([]);
+	});
 	it("file backend: replace only on exact present raw/hash + descriptor identity match", async () => {
 		const dir = await makeTempDir("gjc-marker-replace-");
 		const markerPath = path.join(dir, "session.jsonl.spill.commit");
