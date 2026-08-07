@@ -295,6 +295,83 @@ describe("SessionManager cold sidecar integration", () => {
 		}
 	});
 });
+
+describe("active branch retirement boundary", () => {
+	it("keeps the active branch eager when only an abandoned branch was compacted", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/abandoned-compaction.jsonl";
+		const entries = [
+			{ type: "session", version: 5, id: "branch-session", timestamp: "0", cwd: "/cwd" },
+			{ type: "custom", id: "root", parentId: null, timestamp: "0", customType: "x" },
+			{ type: "custom", id: "abandoned", parentId: "root", timestamp: "0", customType: "x" },
+			{
+				type: "compaction",
+				id: "abandoned-compaction",
+				parentId: "abandoned",
+				timestamp: "0",
+				summary: "summary",
+				firstKeptEntryId: "abandoned",
+				tokensBefore: 10,
+			},
+			{ type: "custom", id: "active", parentId: "root", timestamp: "0", customType: "x" },
+		];
+		storage.writeTextSync(sessionFile, `${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`);
+		const manager = await SessionManager.open(sessionFile, SessionManager.explicitDestination("/sessions"), storage);
+		try {
+			manager.setSessionMemoryMode("enabled");
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
+			expect(manager.getEntries()).toHaveLength(4);
+			expect(manager.getBranch().map(entry => entry.id)).toEqual(["root", "active"]);
+		} finally {
+			await manager.close();
+		}
+	});
+});
+
+describe("sidecar I/O fallback", () => {
+	it("preserves eager authoritative state when disposable sidecar creation fails", async () => {
+		const sessionFile = "/sessions/sidecar-failure.jsonl";
+		const now = "0";
+		const entries = [
+			{ type: "session", version: 5, id: "failure-session", timestamp: now, cwd: "/cwd" },
+			...Array.from({ length: 4 }, (_, index) => ({
+				type: "message",
+				id: `cold-${index.toString().padStart(4, "0")}`,
+				parentId: index === 0 ? null : `cold-${(index - 1).toString().padStart(4, "0")}`,
+				timestamp: now,
+				message: { role: "user", content: `cold-${index}`, timestamp: index },
+			})),
+			{
+				type: "compaction",
+				id: "failure-compaction",
+				parentId: "cold-0003",
+				timestamp: now,
+				summary: "summary",
+				firstKeptEntryId: "cold-0003",
+				tokensBefore: 10,
+			},
+		];
+		const storage = new (class extends MemorySessionStorage {
+			override openWriter(filePath: string, options?: { flags?: "w" | "a" }) {
+				if (filePath.includes(".spill.")) throw new Error("injected_sidecar_failure");
+				return super.openWriter(filePath, options);
+			}
+		})();
+		storage.writeTextSync(sessionFile, `${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`);
+		const manager = await SessionManager.open(sessionFile, SessionManager.explicitDestination("/sessions"), storage);
+		try {
+			manager.setSessionMemoryMode("enabled");
+			expect(manager.getSessionMemoryStats()).toMatchObject({
+				coldRetirementActive: false,
+				sidecarIneligible: true,
+			});
+			expect(manager.getEntries()).toHaveLength(5);
+			expect(manager.getEntry("cold-0000")).toMatchObject({ id: "cold-0000" });
+		} finally {
+			await manager.close();
+		}
+	});
+});
 describe("descriptor-bound capture and staged fork publication", () => {
 	function writeColdTranscript(
 		storage: FileSessionStorage | MemorySessionStorage,

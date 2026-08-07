@@ -8092,6 +8092,31 @@ export class SessionManager {
 
 	/** Build a fresh disposable `.spill.idx`/`.spill.tail`/`.spill.commit` set from the transcript. */
 	#buildDisposableSidecars(entries: readonly FileEntry[]): void {
+		try {
+			this.#buildDisposableSidecarsUnsafe(entries);
+		} catch (error) {
+			const runtime = this.#sidecarRuntime;
+			if (runtime) {
+				runtime.enabled = false;
+				runtime.sidecarIneligible = true;
+				runtime.hotSuffixBytes = 0;
+				for (const sidecarPath of [runtime.indexPath, runtime.tailPath, runtime.commitPath]) {
+					if (!sidecarPath) continue;
+					try {
+						this.storage.unlinkSync(sidecarPath);
+					} catch {
+						// Disposable cleanup is best-effort; the transcript remains authoritative.
+					}
+				}
+			}
+			logger.warn("Session memory sidecar build failed; preserving eager transcript state", {
+				sessionFile: this.#sessionFile,
+				error: toError(error).message,
+			});
+		}
+	}
+
+	#buildDisposableSidecarsUnsafe(entries: readonly FileEntry[]): void {
 		const runtime = this.#resetSidecarRuntime();
 		if (
 			!this.#sessionFile ||
@@ -8101,16 +8126,12 @@ export class SessionManager {
 		)
 			return;
 		const sessionEntries = entries.filter((entry): entry is SessionEntry => entry.type !== "session");
-		const latestCompaction = [...sessionEntries]
-			.reverse()
-			.find((entry): entry is CompactionEntry => entry.type === "compaction");
-		if (!latestCompaction) return;
-		const tailStartOrdinal = sessionEntries.findIndex(entry => entry.id === latestCompaction.firstKeptEntryId);
-		if (tailStartOrdinal < 0) return;
+		let activeCompaction: CompactionEntry | undefined;
 		let active = this.#leafId ? this.#byId.get(this.#leafId) : undefined;
 		let activeSteps = 0;
 		while (active && activeSteps <= sessionEntries.length) {
 			const ordinal = sessionEntries.length - activeSteps - 1;
+			if (!activeCompaction && active.type === "compaction") activeCompaction = active;
 			if (active.type === "model_change" && runtime.reducer.modelChange.latest === undefined) {
 				runtime.reducer = applyReducerDelta(runtime.reducer, {
 					kind: "latest_model_change",
@@ -8126,10 +8147,18 @@ export class SessionManager {
 					count: active.ttsrMessageCount ?? 0,
 				});
 			}
-			if (runtime.reducer.modelChange.latest !== undefined && runtime.reducer.ttsr.largestOrdinal >= 0) break;
+			if (
+				activeCompaction &&
+				runtime.reducer.modelChange.latest !== undefined &&
+				runtime.reducer.ttsr.largestOrdinal >= 0
+			)
+				break;
 			active = active.parentId ? this.#byId.get(active.parentId) : undefined;
 			activeSteps++;
 		}
+		if (!activeCompaction) return;
+		const tailStartOrdinal = sessionEntries.findIndex(entry => entry.id === activeCompaction.firstKeptEntryId);
+		if (tailStartOrdinal < 0) return;
 		const header = entries.find((entry): entry is SessionHeader => entry.type === "session");
 		const headerBytes = header
 			? Buffer.concat([this.#serializeEntryLine(header), Buffer.from("\n")])
