@@ -170,4 +170,44 @@ describe.skipIf(!enabled)("session memory RSS plateau", () => {
 		const rss = measured.capturedForkSamples.map(sample => sample.rss);
 		expect(Math.max(...rss) - Math.min(...rss)).toBeLessThanOrEqual(64 * 1024 * 1024);
 	}, 60_000);
+
+	it("builds and reopens one million records within the 64 MiB RSS budget", () => {
+		const prepareWorker = path.join(import.meta.dir, "fixtures", "session-memory-rss-worker.ts");
+		const prepared = Bun.spawnSync({
+			cmd: [process.execPath, prepareWorker],
+			env: {
+				...process.env,
+				GJC_SESSION_MEMORY_RSS_RECORDS: "1000000",
+				GJC_SESSION_MEMORY_RSS_CYCLES: "0",
+				GJC_SESSION_MEMORY_RSS_FIRST_OPEN: "1",
+				GJC_SESSION_MEMORY_RSS_KEEP: "1",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(prepared.exitCode, prepared.stderr.toString()).toBe(0);
+		const fixture = JSON.parse(prepared.stdout.toString()) as RssWorkerResult;
+		expect(fixture.eagerRssDeltaBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+		expect(fixture.stats.coldRetirementActive).toBe(true);
+		expect(fixture.stats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+		const lazyWorker = path.join(import.meta.dir, "fixtures", "session-memory-lazy-rss-worker.ts");
+		const lazy = Bun.spawnSync({
+			cmd: [process.execPath, lazyWorker],
+			env: {
+				...process.env,
+				GJC_SESSION_MEMORY_RSS_SESSION: fixture.sessionFile,
+				GJC_SESSION_MEMORY_RSS_REMOVE: "1",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(lazy.exitCode, lazy.stderr.toString()).toBe(0);
+		const reopened = JSON.parse(lazy.stdout.toString()) as {
+			rssDeltaBytes: number;
+			stats: { coldRetirementActive: boolean; totalAccountedBytes: number };
+		};
+		expect(reopened.rssDeltaBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+		expect(reopened.stats.coldRetirementActive).toBe(true);
+		expect(reopened.stats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+	}, 180_000);
 });

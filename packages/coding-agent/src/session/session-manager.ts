@@ -889,6 +889,7 @@ function scanTranscriptLinesBounded(
 		}
 		carry = Buffer.from(combined.subarray(consumed));
 		pos += length;
+		if ((pos & (8 * 1024 * 1024 - 1)) === 0) Bun.gc(true);
 	}
 	return carry.byteLength === 0 ? undefined : "unterminated";
 }
@@ -1229,14 +1230,10 @@ export interface ResumeTailError {
 export type SessionDirectoryMigrationPolicy = ManagedMigrationPolicy;
 export type SessionAppendPersistenceFailurePhase = "current_append" | "prior_failure";
 
-/**
- * Safety bound for resuming a single transcript file. Matches the managed-storage
- * per-file artifact limit (`MANAGED_ARTIFACT_MAX_FILE_BYTES`): transcripts at or above
- * this size are not loaded into memory wholesale because the decode + per-line JSON
- * parse + identity hash would OOM or stall the process (#3851). The bound is a
- * load-time guard only; it does not raise the on-disk managed-storage limit.
- */
+/** Safety bound for eager resume compatibility and managed per-file artifacts. */
 export const RESUME_TRANSCRIPT_MAX_BYTES = MANAGED_ARTIFACT_MAX_FILE_BYTES;
+const BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES = 1024 * 1024 * 1024;
+const EAGER_RESUME_TRANSCRIPT_MAX_BYTES = MANAGED_ARTIFACT_MAX_FILE_BYTES;
 
 export const SESSION_OVERSIZED_RECOVERY_MESSAGE =
 	"The selected session transcript is too large to resume safely. Use `gjc export <session-file>` to export its content into a new session, or remove/archive it after confirming its content is no longer needed.";
@@ -2809,6 +2806,7 @@ interface BoundedTranscriptInspection {
 function inspectTranscriptBounded(
 	filePath: string,
 	storage: SessionStorage,
+	maxBytes = RESUME_TRANSCRIPT_MAX_BYTES,
 ): { ok: true; inspection: BoundedTranscriptInspection } | { ok: false; error: ResumeTailError } {
 	const canonicalPath = resolveEquivalentPath(path.resolve(filePath));
 	let before: SessionStorageStat;
@@ -2820,7 +2818,7 @@ function inspectTranscriptBounded(
 	if (!before.isFile || typeof storage.readRangeSync !== "function") {
 		return { ok: false, error: { kind: "error", reason: "read-failed" } };
 	}
-	if (before.size > RESUME_TRANSCRIPT_MAX_BYTES) {
+	if (before.size > maxBytes) {
 		return { ok: false, error: { kind: "error", reason: "oversized", size: before.size } };
 	}
 
@@ -2848,6 +2846,7 @@ function inspectTranscriptBounded(
 					cwd = typeof parsed.cwd === "string" ? parsed.cwd : undefined;
 				}
 			}
+			if (((offset + length) & (8 * 1024 * 1024 - 1)) === 0) Bun.gc(true);
 		}
 	} catch {
 		return { ok: false, error: { kind: "error", reason: "malformed" } };
@@ -2899,6 +2898,7 @@ function revalidateTranscriptIdentityBounded(
 		for (let offset = 0; offset < before.size; offset += TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
 			const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, before.size - offset);
 			hash.update(storage.readRangeSync(canonicalPath, offset, length).bytes);
+			if (((offset + length) & (8 * 1024 * 1024 - 1)) === 0) Bun.gc(true);
 		}
 	} catch (error) {
 		return resumeReadFailure(error, storage, canonicalPath);
@@ -6394,7 +6394,7 @@ export class SessionManager {
 		let initialized = false;
 		try {
 			const before = this.#managedDescriptorSnapshotOrNull();
-			if (!before || before.size === 0 || before.size > RESUME_TRANSCRIPT_MAX_BYTES) {
+			if (!before || before.size === 0 || before.size > BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES) {
 				this.#lazyReopenFallbackReason = "bounded_first_open_unreadable";
 				return false;
 			}
@@ -6855,6 +6855,8 @@ export class SessionManager {
 			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			return;
 		}
+		const eagerStat = this.storage.statSync(resolvedSessionFile);
+		if (eagerStat.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES) throw new SessionTranscriptOversizedError(eagerStat.size);
 		const entries = await loadEntriesFromFile(resolvedSessionFile, this.storage);
 		if (entries.length === 0) {
 			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
@@ -9164,6 +9166,7 @@ export class SessionManager {
 			for (let offset = 0; offset < base.baseEndOffset; offset += 64 * 1024) {
 				const length = Math.min(64 * 1024, base.baseEndOffset - offset);
 				hash.update(this.storage.readRangeSync(sessionFile, offset, length).bytes);
+				if (((offset + length) & (8 * 1024 * 1024 - 1)) === 0) Bun.gc(true);
 			}
 		} catch {
 			return false;
@@ -12901,7 +12904,7 @@ export class SessionManager {
 		const manager = new SessionManager(cwd, dir, true, storage, destination);
 		manager.#sessionMemoryMode = sessionMemoryMode;
 		if (sessionMemoryMode === "enabled" && destination.kind !== "managed") {
-			const inspected = inspectTranscriptBounded(managedSourcePath, storage);
+			const inspected = inspectTranscriptBounded(managedSourcePath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
 			if (
 				inspected.ok &&
 				(await manager.#tryForkFromBoundedSource(managedSourcePath, inspected.inspection.identity))
@@ -12958,7 +12961,11 @@ export class SessionManager {
 		// owner-only and reparse guards accept.
 		if (storage instanceof FileSessionStorage) filePath = canonicalizeTrustedPath(filePath);
 		if (destination.kind === "explicit" || !(storage instanceof FileSessionStorage)) {
-			const inspected = inspectTranscriptBounded(filePath, storage);
+			const inspected = inspectTranscriptBounded(
+				filePath,
+				storage,
+				sessionMemoryMode === "enabled" ? BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES : RESUME_TRANSCRIPT_MAX_BYTES,
+			);
 			if (!inspected.ok) {
 				if (inspected.error.reason === "missing") {
 					const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
@@ -13162,7 +13169,7 @@ export class SessionManager {
 		filePath: string,
 		storage: SessionStorage = new FileSessionStorage(),
 	): StrictSessionCaptureResult {
-		const inspected = inspectTranscriptBounded(filePath, storage);
+		const inspected = inspectTranscriptBounded(filePath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
 		if (!inspected.ok) return inspected.error;
 		return {
 			kind: "captured",
