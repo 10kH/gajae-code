@@ -1555,7 +1555,18 @@ describe("descriptor-bound capture and staged fork publication", () => {
 	});
 
 	it("forks through memory storage with staged-publication parity and no copied sidecars", async () => {
-		const storage = new MemorySessionStorage();
+		class CapturedForkCountingStorage extends MemorySessionStorage {
+			fullReads = 0;
+			override readTextSync(filePath: string): string {
+				if (!filePath.includes(".spill.")) this.fullReads++;
+				return super.readTextSync(filePath);
+			}
+			override readBytesSync(filePath: string): Uint8Array {
+				if (!filePath.includes(".spill.")) this.fullReads++;
+				return super.readBytesSync(filePath);
+			}
+		}
+		const storage = new CapturedForkCountingStorage();
 		const sessionFile = "/sessions/source.jsonl";
 		writeColdTranscript(storage, sessionFile, "/cwd", 12);
 
@@ -1580,6 +1591,7 @@ describe("descriptor-bound capture and staged fork publication", () => {
 		if (forked.kind !== "forked") throw new Error("Expected strict fork success");
 		try {
 			expect(forked.manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			expect(storage.fullReads).toBe(0);
 			expect(forked.manager.getSessionId()).not.toBe("fork-source");
 			expect(forked.manager.getEntries()).toHaveLength(13);
 			const forkedSessionFile = forked.manager.getSessionFile();

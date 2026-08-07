@@ -12786,6 +12786,100 @@ export class SessionManager {
 		}
 	}
 
+	async #tryForkFromCapturedBounded(
+		snapshot: CapturedSessionTranscriptSnapshot,
+	): Promise<StrictSessionForkResult | undefined> {
+		if (
+			this.#sessionMemoryMode !== "enabled" ||
+			this.destination.kind === "managed" ||
+			typeof snapshot.storage.openStagedWriter !== "function" ||
+			(snapshot.storage instanceof FileSessionStorage && !snapshot.storage.existsSync(this.destination.directory))
+		)
+			return undefined;
+		let sourceHeader: SessionHeader | undefined;
+		let previousId: string | null = null;
+		let ordinal = 0;
+		let sawCompaction = false;
+		let rejected = false;
+		try {
+			snapshot.forEachLine(line => {
+				if (rejected || line.byteLength === 0) return;
+				const record = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(line)) as
+					| FileEntry
+					| SessionPatchRecord;
+				if (ordinal++ === 0) {
+					if (
+						record.type !== "session" ||
+						record.version !== CURRENT_SESSION_VERSION ||
+						record.id !== snapshot.identity.sessionId
+					)
+						rejected = true;
+					else sourceHeader = record;
+					return;
+				}
+				if (
+					record.type === "session" ||
+					record.type === "header_patch" ||
+					record.type === "entry_patch" ||
+					typeof record.id !== "string" ||
+					record.id === previousId ||
+					record.parentId !== previousId ||
+					collectCheckpointBlobRefs(record).size > 0
+				) {
+					rejected = true;
+					return;
+				}
+				previousId = record.id;
+				if (record.type === "compaction") sawCompaction = true;
+			});
+		} catch {
+			return undefined;
+		}
+		if (rejected || !sourceHeader || !sawCompaction) return undefined;
+		const beforeWrite = snapshot.revalidate();
+		if (beforeWrite.kind !== "valid") return beforeWrite;
+		const fresh = this.#freshSessionState({ parentSession: sourceHeader.id });
+		fresh.header.title = sourceHeader.title;
+		fresh.header.titleSource = sourceHeader.titleSource;
+		if (!fresh.sessionFile) return undefined;
+		const staged = snapshot.storage.openStagedWriter(fresh.sessionFile);
+		let published = false;
+		try {
+			let writeOrdinal = 0;
+			snapshot.forEachLine(line => {
+				if (line.byteLength === 0) return;
+				if (writeOrdinal++ === 0) {
+					staged.writeLine(Buffer.from(JSON.stringify(fresh.header), "utf8"));
+					return;
+				}
+				const record = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(line)) as SessionEntry;
+				if (record.type === "message" && record.message.role === "assistant")
+					record.message = sanitizeRehydratedOpenAIResponsesAssistantMessage(record.message);
+				staged.writeLine(Buffer.from(JSON.stringify(record), "utf8"));
+			});
+			staged.fsync();
+			staged.closeSync();
+			staged.publishNoReplace();
+			published = true;
+			const afterWrite = snapshot.revalidate();
+			if (afterWrite.kind !== "valid") {
+				await snapshot.storage.deleteSessionWithArtifacts(fresh.sessionFile);
+				return afterWrite;
+			}
+			await this.#initSessionFile(fresh.sessionFile);
+			writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
+			return { kind: "forked", manager: this };
+		} catch (error) {
+			try {
+				staged.closeSync();
+			} catch {
+				// Preserve the captured-fork failure.
+			}
+			if (published) await snapshot.storage.deleteSessionWithArtifacts(fresh.sessionFile);
+			throw error;
+		}
+	}
+
 	/**
 	 * Fork a session into the current project directory.
 	 * Copies history from another session file while creating a new session file in the current sessionDir.
@@ -13089,6 +13183,13 @@ export class SessionManager {
 		sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow",
 	): Promise<StrictSessionForkResult> {
 		const destination = destinationFor(cwd, destinationInput, snapshot.storage);
+		if (sessionMemoryMode === "enabled" && destination.kind !== "managed") {
+			const boundedManager = new SessionManager(cwd, destination.directory, true, snapshot.storage, destination);
+			boundedManager.#sessionMemoryMode = sessionMemoryMode;
+			const bounded = await boundedManager.#tryForkFromCapturedBounded(snapshot);
+			if (bounded) return bounded;
+			await boundedManager.close();
+		}
 
 		// Bounded parse: iterate the captured transcript line-by-line (no
 		// whole-file string/Buffer) while re-validating the running content hash

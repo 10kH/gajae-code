@@ -124,6 +124,32 @@ if (process.env.GJC_SESSION_MEMORY_RSS_FORK === "1") {
 	forkStats = forked.getSessionMemoryStats();
 	await forked.close();
 }
+let capturedForkSamples: Array<{ rss: number; heapUsed: number; external: number }> = [];
+let capturedForkStats: { coldRetirementActive: boolean; totalAccountedBytes: number } | undefined;
+if (process.env.GJC_SESSION_MEMORY_RSS_CAPTURED_FORK === "1") {
+	if (!managerClosed) {
+		await manager.close();
+		managerClosed = true;
+	}
+	const captured = SessionManager.captureTranscriptStrict(sessionFile);
+	if (captured.kind !== "captured") throw new Error(`capture_${captured.reason}`);
+	const forkDirectory = path.join(root, "captured-forks");
+	fs.mkdirSync(forkDirectory, { recursive: true });
+	capturedForkSamples = [collect()];
+	const forked = await SessionManager.forkFromCaptured(
+		captured.snapshot,
+		root,
+		SessionManager.explicitDestination(forkDirectory),
+		"copy-retain",
+		"enabled",
+	);
+	if (forked.kind !== "forked") throw new Error(`captured_fork_${forked.reason}`);
+	await Bun.sleep(0);
+	capturedForkSamples.push(collect());
+	capturedForkStats = forked.manager.getSessionMemoryStats();
+	await forked.manager.close();
+	captured.snapshot.close();
+}
 if (!managerClosed) await manager.close();
 if (process.env.GJC_SESSION_MEMORY_RSS_KEEP !== "1") fs.rmSync(root, { recursive: true, force: true });
 
@@ -144,6 +170,8 @@ process.stdout.write(
 		selectionSamples,
 		forkSamples,
 		forkStats,
+		capturedForkSamples,
+		capturedForkStats,
 		stats,
 	})}\n`,
 );
