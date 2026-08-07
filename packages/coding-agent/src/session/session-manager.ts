@@ -415,6 +415,9 @@ export interface SessionMemoryStats {
 	totalAccountedBytes: number;
 	lastReopenTransition: ReopenClassification | undefined;
 	currentCommitTransition: ReopenClassification | undefined;
+	lazyReopenAttempted: boolean;
+	lazyReopenSucceeded: boolean;
+	lazyReopenFallbackReason: string | undefined;
 }
 
 export interface SessionMessageEntry extends SessionEntryBase {
@@ -5419,6 +5422,9 @@ export class SessionManager {
 	/** Active cold-sidecar runtime (retirement + lazy resolution). Undefined when disabled. */
 	#sidecarRuntime: SessionMemorySidecarRuntime | undefined = undefined;
 	#sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow";
+	#lazyReopenAttempted = false;
+	#lazyReopenSucceeded = false;
+	#lazyReopenFallbackReason: string | undefined;
 	/** Hot-suffix maintenance budget: 16 MiB steady-state (provider-invisible overrides allowed). */
 	#sidecarHotSuffixBudgetBytes = 16 * 1024 * 1024;
 
@@ -6052,6 +6058,9 @@ export class SessionManager {
 			typeof this.storage.readRangeSync !== "function"
 		)
 			return false;
+		this.#lazyReopenAttempted = true;
+		this.#lazyReopenSucceeded = false;
+		this.#lazyReopenFallbackReason = "proof_invalid";
 		this.#sessionFile = sessionFile;
 		const runtime = this.#resetSidecarRuntime();
 		runtime.enabled = true;
@@ -6173,6 +6182,8 @@ export class SessionManager {
 			this.#usageStatistics = commit.usageStatistics;
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
+			this.#lazyReopenSucceeded = true;
+			this.#lazyReopenFallbackReason = undefined;
 			initialized = true;
 			return true;
 		} catch {
@@ -9410,6 +9421,9 @@ export class SessionManager {
 				totalAccountedBytes: 0,
 				lastReopenTransition: undefined,
 				currentCommitTransition: undefined,
+				lazyReopenAttempted: this.#lazyReopenAttempted,
+				lazyReopenSucceeded: this.#lazyReopenSucceeded,
+				lazyReopenFallbackReason: this.#lazyReopenFallbackReason,
 			};
 		}
 		const reducerBytes = JSON.stringify(runtime.reducer).length * 2 + 48;
@@ -9428,6 +9442,9 @@ export class SessionManager {
 			totalAccountedBytes: runtime.accountant.totalBytes,
 			lastReopenTransition: runtime.reopenTransition,
 			currentCommitTransition: runtime.terminalTransition,
+			lazyReopenAttempted: this.#lazyReopenAttempted,
+			lazyReopenSucceeded: this.#lazyReopenSucceeded,
+			lazyReopenFallbackReason: this.#lazyReopenFallbackReason,
 		};
 	}
 

@@ -506,6 +506,11 @@ it("reopens an enabled explicit session from authenticated hot-tail metadata", a
 	);
 	try {
 		expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		expect(reopened.getSessionMemoryStats()).toMatchObject({
+			lazyReopenAttempted: true,
+			lazyReopenSucceeded: true,
+			lazyReopenFallbackReason: undefined,
+		});
 		storage.rangeReads = 0;
 		expect(reopened.buildSessionContext().messages).toHaveLength(3);
 		expect(storage.rangeReads).toBe(0);
@@ -528,6 +533,11 @@ it("reopens an enabled explicit session from authenticated hot-tail metadata", a
 	);
 	try {
 		expect(storage.textReads).toBeGreaterThan(0);
+		expect(fallback.getSessionMemoryStats()).toMatchObject({
+			lazyReopenAttempted: true,
+			lazyReopenSucceeded: false,
+			lazyReopenFallbackReason: "proof_invalid",
+		});
 		expect(fallback.buildSessionContext().messages).toHaveLength(3);
 	} finally {
 		await fallback.close();
