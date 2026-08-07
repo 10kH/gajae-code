@@ -1705,6 +1705,75 @@ describe("sidecar I/O fallback", () => {
 		}
 	});
 
+	it("recovers from tail fsync followed by append marker publication failure", async () => {
+		class AppendMarkerFailureStorage extends MemorySessionStorage {
+			failMarkers = false;
+			markerFailures = 0;
+			override writeTextSync(filePath: string, content: string): void {
+				if (this.failMarkers && filePath.endsWith(".spill.commit")) {
+					this.markerFailures++;
+					throw new Error("injected_append_marker_failure");
+				}
+				super.writeTextSync(filePath, content);
+			}
+		}
+		const storage = new AppendMarkerFailureStorage();
+		const sessionFile = "/sessions/append-marker-failure.jsonl";
+		const records = [
+			{ type: "session", version: 5, id: "append-marker-failure", timestamp: "0", cwd: "/cwd" },
+			{
+				type: "message",
+				id: "cold",
+				parentId: null,
+				timestamp: "0",
+				message: { role: "user", content: "cold", timestamp: 1 },
+			},
+			{
+				type: "message",
+				id: "kept",
+				parentId: "cold",
+				timestamp: "0",
+				message: { role: "user", content: "kept", timestamp: 2 },
+			},
+			{
+				type: "compaction",
+				id: "compact",
+				parentId: "kept",
+				timestamp: "0",
+				summary: "summary",
+				firstKeptEntryId: "kept",
+				tokensBefore: 10,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		const destination = SessionManager.explicitDestination("/sessions");
+		const manager = await SessionManager.open(sessionFile, destination, storage, "copy-retain", "enabled");
+		storage.failMarkers = true;
+		const appendedId = manager.appendMessage({ role: "user", content: "after-tail-fsync", timestamp: 3 });
+		storage.failMarkers = false;
+		expect(storage.markerFailures).toBeGreaterThan(0);
+		expect(manager.getSessionMemoryStats()).toMatchObject({
+			coldRetirementActive: true,
+			currentCommitTransition: { kind: "rebuild", reason: "commit_marker_publication_failed" },
+		});
+		expect(manager.getEntry(appendedId)).toMatchObject({ id: appendedId });
+		await manager.close();
+		const repaired = await SessionManager.open(sessionFile, destination, storage, "copy-retain", "enabled");
+		expect(repaired.getEntry(appendedId)).toMatchObject({ id: appendedId });
+		expect(repaired.getSessionMemoryStats().currentCommitTransition).toEqual({
+			kind: "exact",
+			reason: "descriptor_and_proof_match",
+		});
+		await repaired.close();
+
+		const verified = await SessionManager.open(sessionFile, destination, storage, "copy-retain", "enabled");
+		try {
+			expect(verified.getSessionMemoryStats().lazyReopenSucceeded).toBe(true);
+			expect(verified.getEntry(appendedId)).toMatchObject({ id: appendedId });
+		} finally {
+			await verified.close();
+		}
+	});
 	it("recovers from transcript publication followed by tail journal failure", async () => {
 		class TailFailureStorage extends MemorySessionStorage {
 			failTail = false;
