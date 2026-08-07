@@ -632,9 +632,9 @@ describe("managed session write protocol", () => {
 		expect((await fs.readdir(opened.path.slice(0, -6))).filter(name => name.endsWith(".bin"))).toHaveLength(count);
 		expect((await fs.readdir(artifacts)).filter(name => name.endsWith(".bin"))).toHaveLength(count);
 		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
-		const committed = (await fs.readdir(receipts)).find(
-			name => JSON.parse(syncFs.readFileSync(path.join(receipts, name), "utf8")).state === "committed",
-		);
+		const committed = (await fs.readdir(receipts))
+			.filter(name => !name.startsWith(".") && name.endsWith(".json"))
+			.find(name => JSON.parse(syncFs.readFileSync(path.join(receipts, name), "utf8")).state === "committed");
 		if (!committed) throw new Error("Missing committed migration receipt");
 		const receipt = JSON.parse(await fs.readFile(path.join(receipts, committed), "utf8")) as {
 			artifactManifest?: unknown[];

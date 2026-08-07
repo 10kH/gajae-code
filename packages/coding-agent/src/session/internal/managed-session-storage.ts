@@ -2295,8 +2295,14 @@ export async function acquireManagedLock(
 			let descriptorClosed = false;
 			const closeDescriptor = (): void => {
 				if (descriptorClosed) return;
-				fs.closeSync(fd);
-				descriptorClosed = true;
+				try {
+					const current = fs.fstatSync(fd, { bigint: true });
+					if (sameFileIdentity(lockIdentity, current)) fs.closeSync(fd);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "EBADF") throw error;
+				} finally {
+					descriptorClosed = true;
+				}
 			};
 			const assertOwned = (): void => {
 				const current = parseLock(lockPath);

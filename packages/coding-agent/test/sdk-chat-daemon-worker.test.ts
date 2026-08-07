@@ -1298,7 +1298,6 @@ describe("chat daemon worker", () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-slack-production-host-"));
 		const agentDir = path.join(root, ".gjc", "agent");
 		const host = await startProductionSdkHost(root);
-		const endpointPath = path.join(root, ".gjc", "state", "sdk", `${host.sessionId}.json`);
 		const index = await new SessionIndex(agentDir).open();
 		let tick: (() => void) | undefined;
 		const config = {
@@ -1351,7 +1350,7 @@ describe("chat daemon worker", () => {
 				locator: { repo: root, stateRoot: path.join(root, ".gjc", "state") },
 				endpointGeneration: 1,
 				pid: process.pid,
-				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+				endpointMtimeMs: host.endpointMtimeMs,
 			});
 			const store = new ConversationStore<SlackConversation>({ agentDir, kind: "slack" });
 			const rootKey = slackConversationKey({ teamId: "team", channelId: "channel", rootTs: "root" });
@@ -1392,7 +1391,7 @@ describe("chat daemon worker", () => {
 				locator: { repo: root, stateRoot: path.join(root, ".gjc", "state") },
 				endpointGeneration: 2,
 				pid: process.pid,
-				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+				endpointMtimeMs: host.endpointMtimeMs,
 			});
 			await store.transact(rootKey, current =>
 				current

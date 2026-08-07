@@ -80,18 +80,25 @@ describe("managed migration lock lease ownership", () => {
 		const decoy = path.join(locks, "decoy");
 		fs.writeFileSync(decoy, "decoy", { mode: 0o600 });
 		let injected = false;
+		let replacementFd: number | undefined;
 		ManagedLockTestHooks.beforeReleaseDescriptorVerification = ({ fd }) => {
 			if (injected) return;
 			injected = true;
 			fs.closeSync(fd);
-			const replacement = fs.openSync(decoy, fs.constants.O_WRONLY);
-			expect(replacement).toBe(fd);
+			replacementFd = fs.openSync(decoy, fs.constants.O_WRONLY);
+			expect(replacementFd).toBe(fd);
 		};
 
-		await first.release();
-		expect(injected).toBe(true);
-		expect(readLock(first.path).released).toBe(true);
-		expect(fs.readFileSync(decoy, "utf8")).toBe("decoy");
+		try {
+			await first.release();
+			expect(injected).toBe(true);
+			expect(readLock(first.path).released).toBe(true);
+			expect(fs.readFileSync(decoy, "utf8")).toBe("decoy");
+			expect(replacementFd).toBeDefined();
+			if (replacementFd !== undefined) expect(fs.fstatSync(replacementFd).isFile()).toBe(true);
+		} finally {
+			if (replacementFd !== undefined) fs.closeSync(replacementFd);
+		}
 	});
 
 	it("preserves a successor installed after a released lock was observed", async () => {
