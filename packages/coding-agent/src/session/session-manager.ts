@@ -1025,6 +1025,37 @@ function collectCheckpointBlobRefs(value: unknown, refs: Set<string> = new Set()
 	return refs;
 }
 
+const FORK_BLOB_VERIFY_MAX_BYTES = 16 * 1024 * 1024;
+
+function verifyForkBlobRefsBounded(value: unknown): boolean {
+	for (const ref of collectCheckpointBlobRefs(value)) {
+		const hash = parseBlobRef(ref);
+		if (!hash) return false;
+		const blobPath = path.join(getBlobsDir(), hash);
+		let fd: number | undefined;
+		try {
+			fd = fs.openSync(blobPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+			const stat = fs.fstatSync(fd);
+			if (!stat.isFile() || stat.size > FORK_BLOB_VERIFY_MAX_BYTES) return false;
+			const digest = crypto.createHash("sha256");
+			const chunk = Buffer.allocUnsafe(64 * 1024);
+			let offset = 0;
+			while (offset < stat.size) {
+				const read = fs.readSync(fd, chunk, 0, Math.min(chunk.byteLength, stat.size - offset), offset);
+				if (read <= 0) return false;
+				digest.update(chunk.subarray(0, read));
+				offset += read;
+			}
+			if (digest.digest("hex") !== hash) return false;
+		} catch {
+			return false;
+		} finally {
+			if (fd !== undefined) fs.closeSync(fd);
+		}
+	}
+	return true;
+}
+
 function decodeCheckpointUtf8(data: Uint8Array): string | null {
 	try {
 		return new TextDecoder("utf-8", { fatal: true }).decode(data);
@@ -13034,7 +13065,7 @@ export class SessionManager {
 						if (record.type === "header_patch" && isHeaderPatchRecord(record))
 							Object.assign(headerPatch, record.patch);
 						else if (record.type === "entry_patch" && isEntryPatchRecord(record)) {
-							if (collectCheckpointBlobRefs(record.patch).size > 0) {
+							if (!verifyForkBlobRefsBounded(record.patch)) {
 								preflightRejected = true;
 								return false;
 							}
@@ -13050,7 +13081,7 @@ export class SessionManager {
 						typeof record.id !== "string" ||
 						record.id === previousId ||
 						record.parentId !== previousId ||
-						collectCheckpointBlobRefs(record).size > 0
+						!verifyForkBlobRefsBounded(record)
 					) {
 						preflightRejected = true;
 						return false;
@@ -13161,7 +13192,7 @@ export class SessionManager {
 					if (record.type === "header_patch" && isHeaderPatchRecord(record))
 						Object.assign(headerPatch, record.patch);
 					else if (record.type === "entry_patch" && isEntryPatchRecord(record)) {
-						if (collectCheckpointBlobRefs(record.patch).size > 0) {
+						if (!verifyForkBlobRefsBounded(record.patch)) {
 							rejected = true;
 							return;
 						}
@@ -13174,7 +13205,7 @@ export class SessionManager {
 					typeof record.id !== "string" ||
 					record.id === previousId ||
 					record.parentId !== previousId ||
-					collectCheckpointBlobRefs(record).size > 0
+					!verifyForkBlobRefsBounded(record)
 				) {
 					rejected = true;
 					return;

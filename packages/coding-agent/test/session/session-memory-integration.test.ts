@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { TempDir } from "@gajae-code/utils";
+import { getBlobsDir, TempDir } from "@gajae-code/utils";
 import { SessionManager } from "../../src/session/session-manager";
 import {
 	FileSessionStorage,
@@ -2354,6 +2354,7 @@ describe("descriptor-bound capture and staged fork publication", () => {
 		sessionFile: string,
 		root: string,
 		entryCount = 60,
+		blobRef?: string,
 	): { ids: string[]; now: string } {
 		const now = new Date().toISOString();
 		const ids = Array.from({ length: entryCount }, (_, index) => `cold-${index.toString().padStart(4, "0")}`);
@@ -2364,7 +2365,14 @@ describe("descriptor-bound capture and staged fork publication", () => {
 				id,
 				parentId: index === 0 ? null : ids[index - 1],
 				timestamp: now,
-				message: { role: "user", content: `cold-${index}-${"x".repeat(256)}`, timestamp: index },
+				message: {
+					role: "user",
+					content:
+						index === 0 && blobRef
+							? [{ type: "image", data: blobRef, mimeType: "image/png" }]
+							: `cold-${index}-${"x".repeat(256)}`,
+					timestamp: index,
+				},
 			})),
 			{
 				type: "compaction",
@@ -2448,7 +2456,11 @@ describe("descriptor-bound capture and staged fork publication", () => {
 		const tempDir = TempDir.createSync("@pi-memory-fork-bounded-");
 		const storage = new FileSessionStorage();
 		const sessionFile = path.join(tempDir.path(), "source.jsonl");
-		writeColdTranscript(storage, sessionFile, tempDir.path(), 8);
+		const blobBytes = Buffer.from("bounded captured fork blob authority", "utf8");
+		const blobHash = createHash("sha256").update(blobBytes).digest("hex");
+		fs.mkdirSync(getBlobsDir(), { recursive: true });
+		fs.writeFileSync(path.join(getBlobsDir(), blobHash), blobBytes);
+		writeColdTranscript(storage, sessionFile, tempDir.path(), 8, `blob:sha256:${blobHash}`);
 
 		const readRangeSync = vi.spyOn(storage, "readRangeSync");
 		const openStagedWriter = vi.spyOn(storage, "openStagedWriter");
@@ -2470,8 +2482,10 @@ describe("descriptor-bound capture and staged fork publication", () => {
 			expect(readRangeSync).toHaveBeenCalled();
 			expect(openStagedWriter).toHaveBeenCalled();
 			expect(readSnapshotSync).not.toHaveBeenCalled();
+			expect(storage.readTextSync(forked.manager.getSessionFile()!)).toContain(blobBytes.toString("base64"));
 		} finally {
 			await forked.manager.close();
+			fs.rmSync(path.join(getBlobsDir(), blobHash), { force: true });
 			tempDir.removeSync();
 		}
 	});
