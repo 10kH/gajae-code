@@ -19,12 +19,6 @@ export const GJC_SKILL_KEYWORD_DEFINITIONS: readonly SkillKeywordDefinition[] = 
 		guidance: "Activate GJC deep-interview requirements workflow",
 	},
 	{
-		keyword: "deep interview",
-		skill: "deep-interview",
-		priority: 8,
-		guidance: "Activate GJC deep-interview requirements workflow",
-	},
-	{
 		keyword: "$ralplan",
 		skill: "ralplan",
 		priority: 9,
@@ -32,12 +26,6 @@ export const GJC_SKILL_KEYWORD_DEFINITIONS: readonly SkillKeywordDefinition[] = 
 	},
 	{
 		keyword: "$ultragoal",
-		skill: "ultragoal",
-		priority: 8,
-		guidance: "Activate GJC ultragoal durable goal workflow",
-	},
-	{
-		keyword: "ultragoal",
 		skill: "ultragoal",
 		priority: 8,
 		guidance: "Activate GJC ultragoal durable goal workflow",

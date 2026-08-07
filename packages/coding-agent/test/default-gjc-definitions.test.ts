@@ -516,8 +516,9 @@ Project executor override body.
 		expect(routing).toContain("Explicit user intent outranks every routing heuristic");
 		expect(routing).toContain("Skills are explicit-invocation surfaces, NEVER autonomous defaults");
 		expect(routing).toContain("Do not overestimate task difficulty");
-		expect(routing).toContain("Vague requirements suggest `/skill:deep-interview`");
-		expect(routing).toContain("requirements-only; must not mutate product code");
+		expect(routing).toContain("offer it through the `ask` tool with a workflow option and a proceed-directly option");
+		expect(routing).toContain("recommend `/skill:deep-interview` via `ask`");
+		expect(routing).toContain("requirements-only and must not mutate product code");
 		expect(routing).toContain("`/skill:ralplan --deliberate`");
 		expect(routing).toContain("`/skill:ultragoal`");
 		expect(routing).toContain("`/skill:team`");
