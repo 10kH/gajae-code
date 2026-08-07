@@ -11498,6 +11498,7 @@ export class SessionManager {
 		destinationInput?: SessionDestinationInput,
 		storage: SessionStorage = new FileSessionStorage(),
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
+		sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow",
 	): Promise<SessionManager> {
 		const destination =
 			destinationInput === undefined
@@ -11513,6 +11514,7 @@ export class SessionManager {
 			if (!inspected.ok) {
 				if (inspected.error.reason === "missing") {
 					const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
+					manager.#sessionMemoryMode = sessionMemoryMode;
 					await manager.#initSessionFile(filePath);
 					return manager;
 				}
@@ -11527,6 +11529,7 @@ export class SessionManager {
 				storage,
 				destination,
 			);
+			manager.#sessionMemoryMode = sessionMemoryMode;
 			await manager.#initSessionFile(filePath);
 			manager.buildSessionContext();
 			return manager;
@@ -11536,6 +11539,7 @@ export class SessionManager {
 		if ("kind" in inspected) {
 			if (inspected.reason === "missing") {
 				const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
+				manager.#sessionMemoryMode = sessionMemoryMode;
 				await manager.#initSessionFile(filePath);
 				return manager;
 			}
@@ -11543,7 +11547,13 @@ export class SessionManager {
 			if (inspected.reason === "context_too_large") throw new SessionContextTooLargeError(inspected.size ?? 0);
 			throw new Error(`Could not open session: ${inspected.reason}`);
 		}
-		const opened = await SessionManager.openExistingStrict(inspected.identity, destination, storage, migrationPolicy);
+		const opened = await SessionManager.openExistingStrict(
+			inspected.identity,
+			destination,
+			storage,
+			migrationPolicy,
+			sessionMemoryMode,
+		);
 		if (opened.kind === "error") {
 			if (opened.reason === "legacy_migration_disabled") throw new SessionMigrationPolicyError();
 			if (opened.reason === "artifact_capacity_exceeded")
@@ -12235,6 +12245,7 @@ export class SessionManager {
 		destinationInput?: SessionDestinationInput,
 		storage: SessionStorage = new FileSessionStorage(),
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
+		sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow",
 	): Promise<StrictSessionOpenResult> {
 		const destination =
 			destinationInput === undefined
@@ -12273,6 +12284,7 @@ export class SessionManager {
 		const header = entries[0] as SessionHeader;
 		const dir = destination.directory;
 		const manager = new SessionManager(header.cwd || getProjectDir(), dir, true, storage, destination);
+		manager.#sessionMemoryMode = sessionMemoryMode;
 		await manager.#hydrateExistingSession(sessionPath, entries, inspected.migrationApplied);
 		const ownershipInspection = revalidateResumeSessionIdentity(sessionPath, storage, inspected.identity);
 		if (ownershipInspection.kind === "error") {
@@ -12299,6 +12311,7 @@ export class SessionManager {
 		destinationInput?: SessionDestinationInput,
 		storage: SessionStorage = new FileSessionStorage(),
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
+		sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow",
 	): Promise<SessionManager> {
 		const destination = destinationFor(cwd, destinationInput, storage);
 		const dir = destination.directory;
@@ -12314,6 +12327,7 @@ export class SessionManager {
 				destination,
 				storage,
 				migrationPolicy,
+				sessionMemoryMode,
 			);
 			if (opened.kind === "error") {
 				if (opened.reason === "legacy_migration_disabled") throw new SessionMigrationPolicyError();
