@@ -1061,7 +1061,7 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 	#stagingPath: string;
 	#destinationPath: string;
 	#securityContext: SessionStorageSecurityContext;
-	#lineOffsets: Array<{ offset: number; length: number }> = [];
+	#lineCount = 0;
 	#pendingPatches = new Map<number, Uint8Array>();
 	#pendingPatchBytes = 0;
 	#closed = false;
@@ -1108,14 +1108,13 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 			throw new RangeError("Staged line exceeds the bounded maximum");
 		const line = Buffer.concat([Buffer.from(bytes), newlineBuffer]);
 		try {
-			const offset = Number(fs.fstatSync(this.#fd, { bigint: true }).size);
 			let written = 0;
 			while (written < line.byteLength) {
 				const count = fs.writeSync(this.#fd, line, written, line.byteLength - written);
 				if (count === 0) throw new Error("Short write");
 				written += count;
 			}
-			this.#lineOffsets.push({ offset, length: line.byteLength });
+			this.#lineCount++;
 		} catch (err) {
 			throw this.#recordError(err);
 		}
@@ -1123,12 +1122,12 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 
 	seekToLine(ordinal: number): void {
 		this.#assertOpen();
-		if (ordinal < 0 || ordinal >= this.#lineOffsets.length) throw new RangeError("Line ordinal is not staged");
+		this.#findLine(ordinal);
 	}
 
 	patchLine(ordinal: number, bytes: Uint8Array): void {
 		this.#assertOpen();
-		const existing = this.#lineOffsets[ordinal];
+		const existing = this.#findLine(ordinal);
 		if (!existing) throw new RangeError("Line ordinal is not staged");
 		const lineLength = bytes.byteLength + 1;
 		if (this.#pendingPatches.has(ordinal)) {
@@ -1151,6 +1150,37 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 		if (this.#pendingPatchBytes > STAGED_WRITER_PATCH_LIMIT_BYTES) {
 			this.#error = new Error("staged_overlay_capacity_exceeded");
 			throw this.#error;
+		}
+	}
+
+	#findLine(ordinal: number): { offset: number; length: number } {
+		if (ordinal < 0 || ordinal >= this.#lineCount) throw new RangeError("Line ordinal is not staged");
+		let fd: number | undefined;
+		try {
+			fd = fs.openSync(this.#stagingPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+			const writerIdentity = fs.fstatSync(this.#fd, { bigint: true });
+			const readerIdentity = fs.fstatSync(fd, { bigint: true });
+			if (writerIdentity.dev !== readerIdentity.dev || writerIdentity.ino !== readerIdentity.ino)
+				throw new Error("staged_source_identity_changed");
+			const chunk = Buffer.alloc(STAGED_WRITER_COPY_CHUNK_BYTES);
+			let offset = 0;
+			let lineStart = 0;
+			let current = 0;
+			for (;;) {
+				const count = fs.readSync(fd, chunk, 0, chunk.byteLength, offset);
+				if (count === 0) break;
+				for (let index = 0; index < count; index++) {
+					if (chunk[index] !== 0x0a) continue;
+					const lineEnd = offset + index + 1;
+					if (current === ordinal) return { offset: lineStart, length: lineEnd - lineStart };
+					current++;
+					lineStart = lineEnd;
+				}
+				offset += count;
+			}
+			throw new RangeError("Line ordinal is not staged");
+		} finally {
+			if (fd !== undefined) fs.closeSync(fd);
 		}
 	}
 

@@ -132,6 +132,20 @@ describe("staged streaming writers (immutable destinations)", () => {
 		expect(file.readTextSync(destination)).toBe("ALPHA\nbeta\ngamma-delta\nepsilon\n");
 	});
 
+	it("file backend: patches high ordinals without retaining per-line offsets", async () => {
+		const dir = await makeTempDir("gjc-staged-many-lines-");
+		const destination = path.join(dir, "fork.jsonl");
+		const file = new FileSessionStorage();
+		const writer = file.openStagedWriter!(destination);
+		for (let ordinal = 0; ordinal < 20_000; ordinal++) writer.writeLine(Buffer.from("value", "utf8"));
+		writer.patchLine(19_999, Buffer.from("VALUE", "utf8"));
+		writer.closeSync();
+		writer.publishNoReplace();
+		const lines = file.readTextSync(destination).trimEnd().split("\n");
+		expect(lines).toHaveLength(20_000);
+		expect(lines.at(-1)).toBe("VALUE");
+	});
+
 	it("file backend: different-length patches are applied by the bounded publish-time overlay pass", async () => {
 		const dir = await makeTempDir("gjc-staged-overlay-");
 		const destination = path.join(dir, "fork.jsonl");
