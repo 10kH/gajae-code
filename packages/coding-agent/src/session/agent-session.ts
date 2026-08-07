@@ -937,10 +937,19 @@ function isMessageOnlyFirstEventTimeout(message: AssistantMessage): boolean {
 	);
 }
 
-function isBareDefaultWrappedFirstEventTimeout(message: AssistantMessage): boolean {
+function isBareDefaultMessageOnlyFirstEventTimeout(message: AssistantMessage): boolean {
+	// Message-only first-event watchdog timeouts in canonical prose — the wrapped
+	// "Error: Provider stream timed out while waiting for the first event" form
+	// or a bare per-provider variant matching BARE_DEFAULT_WATCHDOG_ERROR — are
+	// replay-safe: the watchdog fired before the stream produced any observable
+	// output, so a bare-default retry can re-issue the request without
+	// duplicating side effects. Conflicting structured facts (status/code/
+	// headers) fail closed: a message that also carries transport facts is not
+	// provably a content-free watchdog abort.
 	return (
-		message.errorMessage === WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR &&
-		!hasBareDefaultRetryDisqualifyingFacts(message)
+		!hasBareDefaultRetryDisqualifyingFacts(message) &&
+		(message.errorMessage === WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR ||
+			BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))
 	);
 }
 function isBareDefaultCodexOverload(message: AssistantMessage): boolean {
@@ -15079,15 +15088,21 @@ export class AgentSession {
 		if (!managedFallback && !retrySettings.enabled) return false;
 		const classification = this.#classifyErrorForRetry(message);
 		const firstEventTimeout = classification === "first_event_timeout";
+		// Content-free message-only watchdog prose (wrapped canonical or bare
+		// per-provider variants) is admitted like the typed path: it is
+		// replay-safe, so a bare-default retry may re-issue the request even
+		// after earlier observable activity in the same run.
+		const messageOnlyWatchdogTimeout = isBareDefaultMessageOnlyFirstEventTimeout(message);
 		if (!managedFallback && firstEventTimeout && this.#retryAttempt === 0) {
 			this.#firstEventTimeoutRetryStartedAt = Date.now();
 		}
 		const requiresScopedFirstEventTimeout = managedFallback || !legacyRetryConfigured;
 		if (
-			firstEventTimeout &&
+			(firstEventTimeout || messageOnlyWatchdogTimeout) &&
 			(assistantMessageHasVisibleOrToolContent(message) ||
 				(this.#retryAttempt > 0 && !this.#hasCleanRetryReplaySafety) ||
-				(requiresScopedFirstEventTimeout && (!this.#isTypedFirstEventTimeout(message) || !scope || !scopeWasClean)))
+				(requiresScopedFirstEventTimeout &&
+					((!this.#isTypedFirstEventTimeout(message) && !messageOnlyWatchdogTimeout) || !scope || !scopeWasClean)))
 		) {
 			return managedOutcome
 				? {
@@ -15132,16 +15147,18 @@ export class AgentSession {
 		// requirement above; other transient watchdogs preserve legacy behavior.
 		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential) {
 			const bareDefaultCodexOverload = isBareDefaultCodexOverload(message);
-			const bareDefaultWrappedFirstEventTimeout = isBareDefaultWrappedFirstEventTimeout(message);
 			const canReplayCodexOverload = bareDefaultCodexOverload;
 			if (
 				(!canReplayCodexOverload &&
 					!this.#isTypedFirstEventTimeout(message) &&
-					!bareDefaultWrappedFirstEventTimeout &&
+					!messageOnlyWatchdogTimeout &&
 					(hasBareDefaultRetryDisqualifyingFacts(message) ||
 						(classification !== "transient" && classification !== "first_event_timeout") ||
 						!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))) ||
-				(!canReplayCodexOverload && !firstEventTimeout && !this.#hasCleanRetryReplaySafety)
+				(!canReplayCodexOverload &&
+					!firstEventTimeout &&
+					!messageOnlyWatchdogTimeout &&
+					!this.#hasCleanRetryReplaySafety)
 			) {
 				return false;
 			}
