@@ -6125,6 +6125,7 @@ export class SessionManager {
 	}
 
 	captureState(): SessionManagerStateSnapshot {
+		this.#ensureFullHotView();
 		const materializedFileEntries = materializeResidentEntriesForReadSync(
 			this.#fileEntries,
 			this.#residentBlobStores(),

@@ -2481,6 +2481,32 @@ describe("descriptor-bound capture and staged fork publication", () => {
 		}
 	});
 
+	it("hydrates retired authority before capturing rollback state", async () => {
+		const tempDir = TempDir.createSync("@pi-memory-rollback-cold-");
+		const storage = new FileSessionStorage();
+		const sessionFile = path.join(tempDir.path(), "source.jsonl");
+		const { ids } = writeColdTranscript(storage, sessionFile, tempDir.path());
+		const source = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination(tempDir.path()),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(source.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			const snapshotIds = source
+				.captureState()
+				.fileEntries.filter(entry => entry.type !== "session")
+				.map(entry => entry.id);
+			expect(snapshotIds).toContain(ids[0]!);
+			expect(snapshotIds).toContain(ids.at(-1)!);
+		} finally {
+			await source.close();
+			tempDir.removeSync();
+		}
+	});
+
 	it("publishes through bounded range reads and staged writers without whole-buffer reads", async () => {
 		const tempDir = TempDir.createSync("@pi-memory-fork-bounded-");
 		const storage = new FileSessionStorage();
