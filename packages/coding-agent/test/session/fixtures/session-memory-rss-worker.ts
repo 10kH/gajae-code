@@ -75,8 +75,98 @@ if (process.env.GJC_SESSION_MEMORY_RSS_SELECTION === "1") {
 	if (promotion.kind !== "promoted") throw new Error(`selection_${promotion.kind}`);
 	selectionSamples.push(collect());
 }
-const stats = manager.getSessionMemoryStats();
 let managerClosed = false;
+let branchSamples: Array<{ rss: number; heapUsed: number; external: number }> = [];
+let branchStats: { coldRetirementActive: boolean; totalAccountedBytes: number } | undefined;
+if (process.env.GJC_SESSION_MEMORY_RSS_BRANCH === "1") {
+	await manager.close();
+	managerClosed = true;
+	const branchFile = path.join(root, "branch-rss.jsonl");
+	const branchFd = fs.openSync(branchFile, "w", 0o600);
+	const writeBranch = (value: unknown): void => {
+		fs.writeSync(branchFd, `${JSON.stringify(value)}\n`);
+	};
+	try {
+		writeBranch({ type: "session", version: 5, id: "branch-rss", timestamp: "0", cwd: root });
+		writeBranch({ type: "custom", id: "branch-root", parentId: null, timestamp: "0", customType: "rss", data: {} });
+		writeBranch({
+			type: "custom",
+			id: "branch-target-kept",
+			parentId: "branch-root",
+			timestamp: "0",
+			customType: "rss",
+			data: {},
+		});
+		writeBranch({
+			type: "custom",
+			id: "branch-target-tail",
+			parentId: "branch-target-kept",
+			timestamp: "0",
+			customType: "rss",
+			data: {},
+		});
+		writeBranch({
+			type: "compaction",
+			id: "branch-target-compaction",
+			parentId: "branch-target-tail",
+			timestamp: "0",
+			summary: "target",
+			firstKeptEntryId: "branch-target-kept",
+			tokensBefore: recordCount,
+		});
+		for (let index = 0; index < recordCount; index++) {
+			writeBranch({
+				type: "custom",
+				id: `abandoned-${index}`,
+				parentId: "branch-root",
+				timestamp: "0",
+				customType: "rss",
+				data: { value: index },
+			});
+		}
+		writeBranch({
+			type: "custom",
+			id: "branch-active-kept",
+			parentId: "branch-root",
+			timestamp: "0",
+			customType: "rss",
+			data: {},
+		});
+		writeBranch({
+			type: "custom",
+			id: "branch-active-tail",
+			parentId: "branch-active-kept",
+			timestamp: "0",
+			customType: "rss",
+			data: {},
+		});
+		writeBranch({
+			type: "compaction",
+			id: "branch-active-compaction",
+			parentId: "branch-active-tail",
+			timestamp: "0",
+			summary: "active",
+			firstKeptEntryId: "branch-active-kept",
+			tokensBefore: recordCount,
+		});
+	} finally {
+		fs.closeSync(branchFd);
+	}
+	const branchManager = await SessionManager.open(
+		branchFile,
+		SessionManager.explicitDestination(root),
+		undefined,
+		"copy-retain",
+		"enabled",
+	);
+	branchSamples = [collect()];
+	branchManager.branch("branch-target-compaction");
+	await Bun.sleep(0);
+	branchSamples.push(collect());
+	branchStats = branchManager.getSessionMemoryStats();
+	await branchManager.close();
+}
+const stats = branchStats ?? manager.getSessionMemoryStats();
 let forkSamples: Array<{ rss: number; heapUsed: number; external: number }> = [];
 let forkStats: { coldRetirementActive: boolean; totalAccountedBytes: number } | undefined;
 if (process.env.GJC_SESSION_MEMORY_RSS_FORK === "1") {
@@ -172,6 +262,7 @@ process.stdout.write(
 		forkStats,
 		capturedForkSamples,
 		capturedForkStats,
+		branchSamples,
 		stats,
 	})}\n`,
 );

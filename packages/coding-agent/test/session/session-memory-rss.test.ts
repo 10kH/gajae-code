@@ -14,6 +14,7 @@ interface RssWorkerResult {
 	capturedForkSamples: Array<{ rss: number; heapUsed: number; external: number }>;
 	capturedForkStats?: { coldRetirementActive: boolean; totalAccountedBytes: number };
 	eagerRssDeltaBytes: number;
+	branchSamples: Array<{ rss: number; heapUsed: number; external: number }>;
 	stats: {
 		coldRetirementActive: boolean;
 		totalAccountedBytes: number;
@@ -44,6 +45,28 @@ describe.skipIf(!enabled)("session memory RSS plateau", () => {
 		expect(measured.stats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 		const rssSamples = measured.cycleSamples.map(sample => sample.rss);
 		expect(Math.max(...rssSamples) - Math.min(...rssSamples)).toBeLessThanOrEqual(64 * 1024 * 1024);
+	}, 60_000);
+
+	it("activates a retired compacted branch within the 64 MiB process budget", () => {
+		const worker = path.join(import.meta.dir, "fixtures", "session-memory-rss-worker.ts");
+		const result = Bun.spawnSync({
+			cmd: [process.execPath, worker],
+			env: {
+				...process.env,
+				GJC_SESSION_MEMORY_RSS_RECORDS: "120000",
+				GJC_SESSION_MEMORY_RSS_CYCLES: "1",
+				GJC_SESSION_MEMORY_RSS_CYCLE_RECORDS: "5000",
+				GJC_SESSION_MEMORY_RSS_BRANCH: "1",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(result.exitCode, result.stderr.toString()).toBe(0);
+		const measured = JSON.parse(result.stdout.toString()) as RssWorkerResult;
+		expect(measured.branchSamples).toHaveLength(2);
+		expect(measured.stats.coldRetirementActive).toBe(true);
+		expect(measured.stats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+		expect(measured.branchSamples[1]!.rss - measured.branchSamples[0]!.rss).toBeLessThanOrEqual(64 * 1024 * 1024);
 	}, 60_000);
 
 	it("reopens the authenticated 120k-record sidecar within the 64 MiB RSS budget", () => {
