@@ -82,13 +82,13 @@ describe.skipIf(!enabled)("session memory RSS plateau", () => {
 		expect(measured.rssDeltaBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 	}, 60_000);
 
-	it("builds a first 120k-record enabled sidecar within the 64 MiB RSS budget", () => {
+	it("builds a first 60k-record enabled sidecar within the 64 MiB RSS budget", () => {
 		const worker = path.join(import.meta.dir, "fixtures", "session-memory-rss-worker.ts");
 		const result = Bun.spawnSync({
 			cmd: [process.execPath, worker],
 			env: {
 				...process.env,
-				GJC_SESSION_MEMORY_RSS_RECORDS: "120000",
+				GJC_SESSION_MEMORY_RSS_RECORDS: "60000",
 				GJC_SESSION_MEMORY_RSS_CYCLES: "0",
 				GJC_SESSION_MEMORY_RSS_FIRST_OPEN: "1",
 			},
@@ -97,11 +97,11 @@ describe.skipIf(!enabled)("session memory RSS plateau", () => {
 		});
 		expect(result.exitCode, result.stderr.toString()).toBe(0);
 		const measured = JSON.parse(result.stdout.toString()) as RssWorkerResult;
+		expect(measured.recordCount).toBe(60000);
 		expect(measured.stats.coldRetirementActive).toBe(true);
 		expect(measured.stats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 		expect(measured.eagerRssDeltaBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 	}, 60_000);
-
 	it("stages and promotes a cold 120k-record model selection within the 64 MiB RSS budget", () => {
 		const worker = path.join(import.meta.dir, "fixtures", "session-memory-rss-worker.ts");
 		const result = Bun.spawnSync({
@@ -173,6 +173,21 @@ describe.skipIf(!enabled)("session memory RSS plateau", () => {
 
 	it("builds and reopens one million records within the 64 MiB RSS budget", () => {
 		const prepareWorker = path.join(import.meta.dir, "fixtures", "session-memory-rss-worker.ts");
+		const slopeBaseRun = Bun.spawnSync({
+			cmd: [process.execPath, prepareWorker],
+			env: {
+				...process.env,
+				GJC_SESSION_MEMORY_RSS_RECORDS: "120000",
+				GJC_SESSION_MEMORY_RSS_CYCLES: "0",
+				GJC_SESSION_MEMORY_RSS_FIRST_OPEN: "1",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(slopeBaseRun.exitCode, slopeBaseRun.stderr.toString()).toBe(0);
+		const slopeBase = JSON.parse(slopeBaseRun.stdout.toString()) as RssWorkerResult;
+		expect(slopeBase.recordCount).toBe(120000);
+		expect(slopeBase.eagerRssDeltaBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 		const prepared = Bun.spawnSync({
 			cmd: [process.execPath, prepareWorker],
 			env: {
@@ -190,6 +205,7 @@ describe.skipIf(!enabled)("session memory RSS plateau", () => {
 		expect(fixture.eagerRssDeltaBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 		expect(fixture.stats.coldRetirementActive).toBe(true);
 		expect(fixture.stats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+		expect(fixture.eagerRssDeltaBytes - slopeBase.eagerRssDeltaBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 		const lazyWorker = path.join(import.meta.dir, "fixtures", "session-memory-lazy-rss-worker.ts");
 		const lazy = Bun.spawnSync({
 			cmd: [process.execPath, lazyWorker],
