@@ -1974,6 +1974,7 @@ export class AgentSession {
 	/** Idempotent unregister handle for this session's resource-GC registration. */
 	#unregisterResourceGc?: () => void;
 	#unregisterRuntimeStateFinalizer?: () => void;
+	#unregisterSessionMemorySettings?: () => void;
 	/**
 	 * AsyncJobManager owned by this session (top-level only). Subagents leave
 	 * this undefined and **MUST NOT** dispose the global instance on teardown.
@@ -2609,6 +2610,11 @@ export class AgentSession {
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
 		this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
+		this.#unregisterSessionMemorySettings = this.settings.onChanged(settingPath => {
+			if (settingPath === "sessionMemory.mode") {
+				this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
+			}
+		});
 		this.#workerIntegrationScheduler = new WorkerIntegrationRequestScheduler(
 			config.workerIntegrationRequest ??
 				(async signal => {
@@ -6185,6 +6191,8 @@ export class AgentSession {
 		// No-op when this session opened no tabs. Failure is logged, not thrown.
 		this.#unregisterResourceGc?.();
 		this.#unregisterResourceGc = undefined;
+		this.#unregisterSessionMemorySettings?.();
+		this.#unregisterSessionMemorySettings = undefined;
 		if (ownerTerminalContextFromEnvironment() === null) this.#unregisterRuntimeStateFinalizer?.();
 		this.#unregisterRuntimeStateFinalizer = undefined;
 		await releaseTabsForOwner(this.sessionManager.getSessionId()).catch((error: unknown) =>
@@ -6246,6 +6254,8 @@ export class AgentSession {
 		const kernelOwnerId = this.#evalKernelOwnerId;
 		this.#unregisterResourceGc?.();
 		this.#unregisterResourceGc = undefined;
+		this.#unregisterSessionMemorySettings?.();
+		this.#unregisterSessionMemorySettings = undefined;
 		this.#unregisterTeamWorkerAsyncJobChange?.();
 		this.#unregisterTeamWorkerAsyncJobChange = undefined;
 		this.#teamWorkerHeartbeat?.dispose();
