@@ -332,6 +332,42 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 		).toHaveLength(1);
 		expect(session.getPendingNextTurnMessagesForTests()).toEqual([]);
 	});
+	it("does not replay pending next-turn context after an accepted provider failure", async () => {
+		session.queueDeferredMessageForTests(
+			{
+				role: "custom",
+				customType: "accepted-failure-pending",
+				content: "consume on acceptance",
+				display: false,
+				attribution: "agent",
+				timestamp: Date.now(),
+			},
+			false,
+		);
+		const submitted: AgentMessage[][] = [];
+		const providerFailure = new Error("accepted provider failure");
+		const promptSpy = vi
+			.spyOn(session.agent, "prompt")
+			.mockImplementationOnce(async (messages, options) => {
+				submitted.push(messages as AgentMessage[]);
+				if (!Array.isArray(options)) options?.onRunAccepted?.();
+				throw providerFailure;
+			})
+			.mockImplementationOnce(async (messages, options) => {
+				submitted.push(messages as AgentMessage[]);
+				if (!Array.isArray(options)) options?.onRunAccepted?.();
+			});
+
+		await expect(session.prompt("first")).rejects.toBe(providerFailure);
+		expect(session.getPendingNextTurnMessagesForTests()).toEqual([]);
+		await session.prompt("second");
+		expect(promptSpy).toHaveBeenCalledTimes(2);
+		expect(
+			submitted[1]?.filter(
+				message => message.role === "custom" && message.customType === "accepted-failure-pending",
+			),
+		).toEqual([]);
+	});
 	it("keeps synchronous overflow protection on while the async recovery switch is disabled", async () => {
 		await session.dispose();
 		authStorage.close();
