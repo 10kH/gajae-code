@@ -85,7 +85,7 @@ if (process.env.GJC_SESSION_MEMORY_RSS_FORK === "1") {
 	const warmSource = path.join(root, "fork-warm.jsonl");
 	fs.writeFileSync(
 		warmSource,
-		[
+		`${[
 			{ type: "session", version: 5, id: "fork-warm", timestamp: "0", cwd: root },
 			{ type: "custom", id: "warm", parentId: null, timestamp: "0", customType: "rss", data: {} },
 			{
@@ -99,7 +99,7 @@ if (process.env.GJC_SESSION_MEMORY_RSS_FORK === "1") {
 			},
 		]
 			.map(value => JSON.stringify(value))
-			.join("\n") + "\n",
+			.join("\n")}\n`,
 	);
 	const warmed = await SessionManager.forkFrom(
 		warmSource,
