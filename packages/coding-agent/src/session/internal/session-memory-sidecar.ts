@@ -220,6 +220,7 @@ interface TrackedReducerValue {
 	residentBytes: number;
 	storedBytes: number;
 	sha256: string;
+	metadataBytes: number;
 	offset: number;
 }
 
@@ -278,29 +279,32 @@ export class ReducerBudget {
 		if (!Number.isSafeInteger(storedBytes) || storedBytes < 0) throw new RangeError("invalid_reducer_value_bytes");
 		const previous = this.values.get(key);
 		if (previous !== undefined) {
-			this.total -= previous.residentBytes;
+			this.total -= previous.residentBytes + previous.metadataBytes;
 			this.values.delete(key);
 		}
+		const metadataBytes = residentStringBytes(key) + residentStringBytes(sha256) + RECORD_OBJECT_OVERHEAD_BYTES;
 		if (storedBytes > this.maxInlineBytes) {
 			this.values.set(key, {
 				key,
 				kind: "disk_ref",
 				residentBytes: DESCRIPTOR_BYTES,
+				metadataBytes,
 				storedBytes,
 				sha256,
 				offset: this.nextOffset++,
 			});
-			this.total += DESCRIPTOR_BYTES;
+			this.total += DESCRIPTOR_BYTES + metadataBytes;
 		} else {
 			this.values.set(key, {
 				key,
 				kind: "inline",
 				residentBytes: storedBytes,
+				metadataBytes,
 				storedBytes,
 				sha256,
 				offset: this.nextOffset++,
 			});
-			this.total += storedBytes;
+			this.total += storedBytes + metadataBytes;
 		}
 		return this.enforceBudget();
 	}
