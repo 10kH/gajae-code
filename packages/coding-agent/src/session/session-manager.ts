@@ -11693,13 +11693,28 @@ export class SessionManager {
 		// against the captured identity.
 		let forkEntries: FileEntry[] = [];
 		try {
-			const records: Array<FileEntry | SessionPatchRecord> = [];
+			const directEntries: FileEntry[] = [];
+			let patchRecords: Array<FileEntry | SessionPatchRecord> | undefined;
 			snapshot.forEachLine(line => {
 				const text = new TextDecoder("utf-8", { fatal: true }).decode(line);
 				if (text.length === 0) return;
-				records.push(JSON.parse(text) as FileEntry | SessionPatchRecord);
+				const record = JSON.parse(text) as FileEntry | SessionPatchRecord;
+				if (record.type === "header_patch" || record.type === "entry_patch") {
+					patchRecords ??= [...directEntries];
+					patchRecords.push(record);
+				} else if (patchRecords) {
+					patchRecords.push(record);
+				} else {
+					directEntries.push(record);
+				}
 			});
-			forkEntries = buildFileEntriesFromRecords(records);
+			if (patchRecords) {
+				forkEntries = buildFileEntriesFromRecords(patchRecords);
+				patchRecords.length = 0;
+				directEntries.length = 0;
+			} else {
+				forkEntries = directEntries;
+			}
 			const sourceHeader = forkEntries[0] as SessionHeader | undefined;
 			if (sourceHeader?.type !== "session" || sourceHeader.id !== snapshot.identity.sessionId)
 				return { kind: "error", reason: "identity-mismatch" };
@@ -11731,17 +11746,17 @@ export class SessionManager {
 		try {
 			manager = new SessionManager(cwd, privateStagingDir ?? dir, true, snapshot.storage, forkDestination);
 			await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
-			const sourceHeader = forkEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-			const historyEntries = forkEntries.filter(entry => entry.type !== "session") as SessionEntry[];
+			const sourceHeader = forkEntries[0] as SessionHeader | undefined;
 			const fresh = manager.#freshSessionState({ parentSession: sourceHeader?.id });
 			fresh.header.title = sourceHeader?.title;
 			fresh.header.titleSource = sourceHeader?.titleSource;
+			forkEntries[0] = fresh.header;
 			const transition = manager.#prepareResidentTextStoreTransition(
 				{
 					target: { sessionId: fresh.sessionId, sessionFile: fresh.sessionFile ?? "" },
 					primary: {
 						mode: "materialize",
-						sourceEntries: [fresh.header, ...historyEntries],
+						sourceEntries: forkEntries,
 						sourceStores: { textStore: null, imageStore: manager.#residentImageBlobStore },
 					},
 				},
