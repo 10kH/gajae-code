@@ -919,6 +919,40 @@ describe("SubagentTool", () => {
 		expect(steerText).not.toContain("acted on");
 		await manager.dispose({ timeoutMs: 100 });
 	});
+	it("steer running injects through the live handle even when the record has no session file (regression)", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		let injected: string | undefined;
+		// The task tool registers SubagentRecords with sessionFile: null
+		// (subtask session files are carried by the resume descriptor), so the
+		// steer path must not demand record.sessionFile for a running subagent.
+		manager.registerSubagentRecord({
+			subagentId: "0-SteerNoSession",
+			ownerId: "0-Main",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: true,
+		});
+		manager.registerLiveHandle("0-SteerNoSession", {
+			requestPause() {},
+			async injectMessage(content) {
+				injected = content;
+			},
+		});
+
+		const result = await tool.execute("subagent-steer-no-session", {
+			action: "steer",
+			id: "0-SteerNoSession",
+			message: "course correction",
+		});
+
+		expect(injected).toBe("course correction");
+		expect(result.details?.subagents[0]?.steerMessage).toBe("course correction");
+		expect(result.details?.subagents[0]?.steerState).toBe("queued");
+		await manager.dispose({ timeoutMs: 100 });
+	});
 
 	it("steer attributes the caller (nested parent) id, not main or the child id", async () => {
 		const manager = createManager();
