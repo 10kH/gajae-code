@@ -1079,6 +1079,13 @@ export class BoundedLabelsPinsStore {
 		return this.setIn(this.labels, key, value);
 	}
 
+	deleteLabel(key: string): void {
+		const existing = this.labels.get(key);
+		if (existing === undefined) return;
+		this.total -= residentStringBytes(key) + residentStringBytes(existing) + RECORD_OBJECT_OVERHEAD_BYTES;
+		this.labels.delete(key);
+	}
+
 	setPin(key: string, value: string): boolean {
 		return this.setIn(this.pins, key, value);
 	}
@@ -1097,6 +1104,12 @@ export class BoundedLabelsPinsStore {
 
 	pinsEntries(): ReadonlyMap<string, string> {
 		return this.pins;
+	}
+
+	clear(): void {
+		this.labels.clear();
+		this.pins.clear();
+		this.total = 0;
 	}
 
 	private setIn(map: Map<string, string>, key: string, value: string): boolean {

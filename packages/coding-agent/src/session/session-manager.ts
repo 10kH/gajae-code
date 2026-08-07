@@ -105,6 +105,7 @@ import {
 	type ReopenClassification,
 	RollingTailChainBuilder,
 	residentRecordBytes,
+	residentStringBytes,
 	SessionMemoryAccountant,
 	sameDescriptor,
 	type TailRecord,
@@ -724,6 +725,10 @@ export interface SessionMemorySidecarRuntime {
 	labelsPins: BoundedLabelsPinsStore;
 	terminalTransition: ReopenClassification | undefined;
 	reopenTransition: ReopenClassification | undefined;
+	/** SHA-256 over the exact `.spill.idx` bytes this runtime has written/adopted ("" until proven). */
+	indexDigest: string;
+	/** Live running hash of the index bytes; updated on every index append. */
+	indexHash: crypto.Hash;
 }
 
 interface SessionMemoryCommitContents extends CommitMarkerContents {
@@ -732,6 +737,9 @@ interface SessionMemoryCommitContents extends CommitMarkerContents {
 	reducer?: ReducerState;
 	labels?: Array<[string, string]>;
 	usageStatistics?: UsageStatistics;
+
+	/** SHA-256 over the exact `.spill.idx` bytes the marker's sidecar set was built with. */
+	indexDigest?: string;
 }
 
 function isValidPersistedReducerState(value: ReducerState): boolean {
@@ -760,8 +768,132 @@ function tailRecordKindForEntry(entry: SessionEntry): TailRecordKind {
 	}
 }
 
+/**
+ * Bounded first-open transcript scan limits. The eager authoritative path handles
+ * anything outside these bounds; the bounded path only ever fails closed to it.
+ */
+const BOUNDED_FIRST_OPEN_MAX_LINE_BYTES = 8 * 1024 * 1024;
+/** Maximum records accepted by the bounded first-open hash table. */
+const BOUNDED_FIRST_OPEN_MAX_RECORDS = 1_000_000;
+const BOUNDED_FIRST_OPEN_ID_TABLE_CAPACITY = 1_250_003;
+
+class BoundedFirstOpenIdSet {
+	readonly #high = new Uint32Array(BOUNDED_FIRST_OPEN_ID_TABLE_CAPACITY);
+	readonly #low = new Uint32Array(BOUNDED_FIRST_OPEN_ID_TABLE_CAPACITY);
+	#size = 0;
+
+	#hash(value: string, seed: number): number {
+		let hash = seed >>> 0;
+		for (let index = 0; index < value.length; index++) {
+			hash ^= value.charCodeAt(index);
+			hash = Math.imul(hash, 0x01000193) >>> 0;
+		}
+		return hash;
+	}
+
+	has(value: string): boolean {
+		let high = this.#hash(value, 0x811c9dc5);
+		const low = this.#hash(value, 0x9e3779b9);
+		if (high === 0 && low === 0) high = 1;
+		let slot = low % BOUNDED_FIRST_OPEN_ID_TABLE_CAPACITY;
+		for (let probes = 0; probes < BOUNDED_FIRST_OPEN_ID_TABLE_CAPACITY; probes++) {
+			const existingHigh = this.#high[slot];
+			const existingLow = this.#low[slot];
+			if (existingHigh === 0 && existingLow === 0) return false;
+			if (existingHigh === high && existingLow === low) return true;
+			slot++;
+			if (slot === BOUNDED_FIRST_OPEN_ID_TABLE_CAPACITY) slot = 0;
+		}
+		return true;
+	}
+
+	add(value: string): "added" | "duplicate" | "full" {
+		if (this.#size >= BOUNDED_FIRST_OPEN_MAX_RECORDS) return "full";
+		let high = this.#hash(value, 0x811c9dc5);
+		const low = this.#hash(value, 0x9e3779b9);
+		if (high === 0 && low === 0) high = 1;
+		let slot = low % BOUNDED_FIRST_OPEN_ID_TABLE_CAPACITY;
+		for (let probes = 0; probes < BOUNDED_FIRST_OPEN_ID_TABLE_CAPACITY; probes++) {
+			const existingHigh = this.#high[slot];
+			const existingLow = this.#low[slot];
+			if (existingHigh === high && existingLow === low) return "duplicate";
+			if (existingHigh === 0 && existingLow === 0) {
+				this.#high[slot] = high;
+				this.#low[slot] = low;
+				this.#size++;
+				return "added";
+			}
+			slot++;
+			if (slot === BOUNDED_FIRST_OPEN_ID_TABLE_CAPACITY) slot = 0;
+		}
+		return "full";
+	}
+}
+
+/** State the bounded first-open scan derives without building an entry graph. */
+interface BoundedFirstOpenDiscovery {
+	/** Exactly one current-version header on the first line. */
+	header: SessionHeader;
+	/** Id of the last session entry (leaf of the strictly linear chain). */
+	leafId: string;
+	/** First entry retained by the latest reachable compaction (retirement boundary). */
+	retirementFirstKeptEntryId: string;
+	/** Latest model-change / TTSR reducer state over the linear chain. */
+	reducer: ReducerState;
+	/** Aggregated assistant/task usage totals over the linear chain. */
+	usageStatistics: UsageStatistics;
+	/** Current label state derived from `label` entries in chain order. */
+	labels: Array<[string, string]>;
+}
+
+type BoundedLineScanFailure = "read_failed" | "oversized_line" | "unterminated" | "aborted";
+
+/**
+ * Stream a JSONL transcript in bounded 64 KiB range reads without materializing
+ * the whole file or building an entry graph. `visit(lineStart, lineBytes)` is
+ * invoked for every newline-terminated line with its exact absolute byte offset
+ * and exact bytes including the trailing "\n"; returning `false` aborts with
+ * `"aborted"`. Returns a failure reason when the file is not exactly
+ * newline-terminated, any line exceeds `BOUNDED_FIRST_OPEN_MAX_LINE_BYTES`, or a
+ * range read fails — the caller then fails closed to the eager authoritative
+ * path. Returns `undefined` only after every byte was consumed as a complete
+ * newline-terminated line.
+ */
+function scanTranscriptLinesBounded(
+	storage: SessionStorage,
+	filePath: string,
+	size: number,
+	visit: (lineStart: number, lineBytes: Uint8Array) => boolean | undefined,
+): BoundedLineScanFailure | undefined {
+	let carry = Buffer.alloc(0);
+	let pos = 0;
+	while (pos < size) {
+		if (carry.byteLength > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return "oversized_line";
+		const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, size - pos);
+		let chunk: Uint8Array;
+		try {
+			chunk = storage.readRangeSync!(filePath, pos, length).bytes;
+		} catch {
+			return "read_failed";
+		}
+		const combined = carry.byteLength > 0 ? Buffer.concat([carry, Buffer.from(chunk)]) : Buffer.from(chunk);
+		const base = pos - carry.byteLength;
+		let consumed = 0;
+		while (true) {
+			const newline = combined.indexOf(0x0a, consumed);
+			if (newline < 0) break;
+			if (visit(base + consumed, combined.subarray(consumed, newline + 1)) === false) return "aborted";
+			consumed = newline + 1;
+		}
+		carry = Buffer.from(combined.subarray(consumed));
+		pos += length;
+	}
+	return carry.byteLength === 0 ? undefined : "unterminated";
+}
+
 export type DefaultModelSelectionStage = {
 	readonly entryRevision: number;
+	readonly leafRevision: number;
 	readonly headerExportRevision: number;
 	readonly sessionId: string;
 	readonly sessionFile: string | undefined;
@@ -6112,6 +6244,27 @@ export class SessionManager {
 				].every(isFiniteNonNegativeNumber)
 			)
 				return false;
+
+			// The commit authenticates base + tail but not the index; prove the exact
+			// `.spill.idx` bytes before any cold lookup may trust it. Absent or
+			// mismatched digests fail closed to the eager authoritative path.
+			const indexHash = crypto.createHash("sha256");
+			try {
+				const indexSize = this.storage.statSync(runtime.indexPath).size;
+				for (let offset = 0; offset < indexSize; offset += TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
+					const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, indexSize - offset);
+					indexHash.update(this.storage.readRangeSync(runtime.indexPath, offset, length).bytes);
+					if ((offset & (4 * 1024 * 1024 - 1)) === 0) Bun.gc(true);
+				}
+			} catch {
+				return false;
+			}
+			if (indexHash.copy().digest("hex") !== commit.indexDigest) {
+				this.#lazyReopenFallbackReason = "index_digest_mismatch";
+				return false;
+			}
+			runtime.indexHash = indexHash;
+			runtime.indexDigest = commit.indexDigest;
 			const headerWindow = this.storage.readRangeSync(sessionFile, 0, Math.min(descriptor.size, 64 * 1024)).bytes;
 			const headerEnd = headerWindow.indexOf(10);
 			if (headerEnd < 0) return false;
@@ -6196,10 +6349,499 @@ export class SessionManager {
 		}
 	}
 
+	/**
+	 * Bounded first-open startup for `sessionMemoryMode: "enabled"` when no valid
+	 * reusable commit marker exists. Limited to ordinary current-version linear
+	 * transcript-v5 JSONL with no patch records, duplicate ids, branches,
+	 * migrations, or unsupported storage authority. Scans the transcript in
+	 * bounded 64 KiB ranges (two passes max) without `loadEntriesFromFile`,
+	 * `readText*`, `readBytesSync`, or a full entry graph, builds the disposable
+	 * `.spill.idx`/`.spill.tail`/`.spill.commit` set from exact raw bytes, and
+	 * materializes only header + hot suffix. Any malformed line, duplicate id,
+	 * patch record, unsupported shape, invalid compaction boundary, oversized
+	 * line, descriptor change, budget failure, or schema uncertainty cleans
+	 * partial sidecars/state and returns `false` so the caller falls back to the
+	 * existing eager authoritative path.
+	 */
+	async #tryBoundedFirstOpen(sessionFile: string): Promise<boolean> {
+		if (
+			this.#sessionMemoryMode !== "enabled" ||
+			this.destination.kind === "managed" ||
+			typeof this.storage.readRangeSync !== "function"
+		)
+			return false;
+		this.#lazyReopenAttempted = true;
+		this.#lazyReopenSucceeded = false;
+		this.#sessionFile = sessionFile;
+		const runtime = this.#resetSidecarRuntime();
+		// A pre-existing commit marker means a sidecar set was previously published;
+		// stale/corrupt marker recovery (transcript_ahead, tail_ahead, rebuild)
+		// stays on the eager authoritative path so its classifications are preserved.
+		if (this.storage.existsSync(runtime.commitPath)) {
+			this.#sidecarRuntime = undefined;
+			this.#sessionFile = undefined;
+			return false;
+		}
+		this.#lazyReopenFallbackReason = "bounded_first_open_failed";
+		let initialized = false;
+		try {
+			const before = this.#managedDescriptorSnapshotOrNull();
+			if (!before || before.size === 0 || before.size > RESUME_TRANSCRIPT_MAX_BYTES) {
+				this.#lazyReopenFallbackReason = "bounded_first_open_unreadable";
+				return false;
+			}
+			const discovery = this.#scanBoundedTranscriptForFirstOpen(sessionFile, before);
+			if (!discovery) return false;
+			const built = this.#buildBoundedFirstOpenSidecars(sessionFile, before, discovery);
+			if (!built) return false;
+			runtime.enabled = true;
+			this.#leafId = discovery.leafId;
+			this.#usageStatistics = discovery.usageStatistics;
+			this.#publishCommitMarkerFromCurrentTranscriptSync();
+			if (!this.storage.existsSync(runtime.commitPath)) {
+				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
+				return false;
+			}
+			const terminalDescriptor = this.#managedDescriptorSnapshotOrNull();
+			if (!terminalDescriptor || !sameDescriptor(before, terminalDescriptor)) {
+				this.#lazyReopenFallbackReason = "bounded_first_open_descriptor_changed";
+				return false;
+			}
+			const entries: FileEntry[] = [discovery.header, ...built.hotEntries];
+			await resolveBlobRefsInEntries(entries, this.#blobStore);
+			const prepared = this.#prepareResidentTextStoreTransition(
+				{
+					target: { sessionId: discovery.header.id, sessionFile },
+					primary: {
+						mode: "materialize",
+						sourceEntries: entries,
+						sourceStores: { textStore: null, imageStore: this.#residentImageBlobStore },
+						missingPolicy: "placeholder",
+					},
+				},
+				"memory-fallback",
+			);
+			const finalDescriptor = this.#managedDescriptorSnapshotOrNull();
+			if (!finalDescriptor || !sameDescriptor(before, finalDescriptor)) {
+				prepared.dispose();
+				this.#lazyReopenFallbackReason = "bounded_first_open_descriptor_changed";
+				return false;
+			}
+			this.#sessionId = discovery.header.id;
+			this.#sessionName = discovery.header.title;
+			this.#titleSource = discovery.header.titleSource;
+			this.#needsFullRewriteOnNextPersist = false;
+			this.#commitResidentTextStoreTransition(prepared, false);
+			this.#usageStatistics = discovery.usageStatistics;
+			this.#flushed = true;
+			this.#ensuredOnDisk = true;
+			runtime.reopenTransition = { kind: "rebuild", reason: "bounded_first_open" };
+			runtime.terminalTransition = { kind: "exact", reason: "descriptor_and_proof_match" };
+			this.#lazyReopenSucceeded = true;
+			this.#lazyReopenFallbackReason = undefined;
+			initialized = true;
+			return true;
+		} catch {
+			return false;
+		} finally {
+			if (!initialized) {
+				for (const sidecarPath of [runtime.indexPath, runtime.tailPath, runtime.commitPath]) {
+					if (!sidecarPath) continue;
+					try {
+						this.storage.unlinkSync(sidecarPath);
+					} catch {
+						// Disposable sidecar cleanup is best-effort; the transcript remains authoritative.
+					}
+				}
+				this.#sidecarRuntime = undefined;
+				this.#sessionFile = undefined;
+			}
+		}
+	}
+
+	/**
+	 * Bounded first-open validation pass: verify an ordinary current-version
+	 * linear v5 transcript and derive the sidecar-relevant state (reducer, usage
+	 * totals, labels, retirement boundary) without materializing the file or
+	 * building an entry graph. Every malformed line, duplicate id, patch record,
+	 * unsupported shape, invalid compaction boundary, oversized line, budget
+	 * failure, or schema uncertainty sets the lazy fallback reason and returns
+	 * `undefined`.
+	 */
+	#scanBoundedTranscriptForFirstOpen(
+		sessionFile: string,
+		descriptor: DescriptorSnapshot,
+	): BoundedFirstOpenDiscovery | undefined {
+		const seenIds = new BoundedFirstOpenIdSet();
+		const labelsById = new Map<string, string>();
+		let labelsBytes = 0;
+		const usageStatistics: UsageStatistics = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			premiumRequests: 0,
+			cost: 0,
+		};
+		const addUsage = (totals: ValidatedUsageTotals | null): boolean => {
+			if (!totals) return false;
+			const next = {
+				input: usageStatistics.input + totals.input,
+				output: usageStatistics.output + totals.output,
+				cacheRead: usageStatistics.cacheRead + totals.cacheRead,
+				cacheWrite: usageStatistics.cacheWrite + totals.cacheWrite,
+				premiumRequests: usageStatistics.premiumRequests + totals.premiumRequests,
+				cost: usageStatistics.cost + totals.cost,
+			};
+			if (Object.values(next).some(value => !Number.isFinite(value))) return false;
+			Object.assign(usageStatistics, next);
+			return true;
+		};
+		const fail = (reason: string): false => {
+			this.#lazyReopenFallbackReason = reason;
+			return false;
+		};
+		let header: SessionHeader | undefined;
+		let ordinal = -1;
+		let lastId: string | undefined;
+		let latestModelChange: { ordinal: number; role: string | undefined } | undefined;
+		let latestTtsr: { ordinal: number; rulesCount: number; recordsCount: number; count: number } | undefined;
+		let latestCompactionBoundary: { firstKeptEntryId: string } | undefined;
+		let scannedBytes = 0;
+		const scanFailure = scanTranscriptLinesBounded(
+			this.storage,
+			sessionFile,
+			descriptor.size,
+			(lineStart, lineBytes) => {
+				scannedBytes = lineStart + lineBytes.byteLength;
+				let parsed: unknown;
+				try {
+					parsed = JSON.parse(Buffer.from(lineBytes).toString("utf8"));
+				} catch {
+					return fail("bounded_scan_malformed");
+				}
+				if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
+					return fail("bounded_scan_malformed");
+				const record = parsed as Record<string, unknown>;
+				if (typeof record.type !== "string" || typeof record.id !== "string") return fail("bounded_scan_malformed");
+				if (lineStart === 0) {
+					if (
+						record.type !== "session" ||
+						record.version !== CURRENT_SESSION_VERSION ||
+						typeof record.timestamp !== "string" ||
+						typeof record.cwd !== "string"
+					)
+						return fail("bounded_scan_unsupported");
+					header = record as unknown as SessionHeader;
+					return;
+				}
+				if (record.type === "session") return fail("bounded_scan_unsupported");
+				if (record.type === "header_patch" || record.type === "entry_patch")
+					return fail("bounded_scan_unsupported");
+				if (typeof record.timestamp !== "string") return fail("bounded_scan_malformed");
+				const parentId = record.parentId;
+				if (parentId !== null && typeof parentId !== "string") return fail("bounded_scan_malformed");
+				ordinal++;
+				if (ordinal === 0 ? parentId !== null : parentId !== lastId) return fail("bounded_scan_branch");
+				const idAdd = seenIds.add(record.id);
+				if (idAdd === "duplicate") return fail("bounded_scan_duplicate");
+				if (idAdd === "full") return fail("bounded_scan_budget");
+				if (record.type === "compaction") {
+					if (
+						typeof record.firstKeptEntryId !== "string" ||
+						record.firstKeptEntryId === record.id ||
+						!seenIds.has(record.firstKeptEntryId)
+					)
+						return fail("bounded_scan_invalid_compaction");
+					latestCompactionBoundary = { firstKeptEntryId: record.firstKeptEntryId };
+				} else if (record.type === "model_change") {
+					latestModelChange = { ordinal, role: typeof record.role === "string" ? record.role : undefined };
+				} else if (record.type === "ttsr_injection") {
+					if (!Array.isArray(record.injectedRules)) return fail("bounded_scan_unsupported");
+					const injectedRuleRecords = record.injectedRuleRecords;
+					if (injectedRuleRecords !== undefined && !Array.isArray(injectedRuleRecords))
+						return fail("bounded_scan_unsupported");
+					const ttsrMessageCount = record.ttsrMessageCount;
+					if (ttsrMessageCount !== undefined && typeof ttsrMessageCount !== "number")
+						return fail("bounded_scan_unsupported");
+					latestTtsr = {
+						ordinal,
+						rulesCount: record.injectedRules.length,
+						recordsCount: injectedRuleRecords === undefined ? 0 : injectedRuleRecords.length,
+						count: ttsrMessageCount ?? 0,
+					};
+				} else if (record.type === "label") {
+					if (typeof record.targetId !== "string") return fail("bounded_scan_unsupported");
+					const label = record.label;
+					if (label !== undefined && typeof label !== "string") return fail("bounded_scan_unsupported");
+					if (label) {
+						const existing = labelsById.get(record.targetId);
+						const existingBytes =
+							existing === undefined
+								? 0
+								: residentStringBytes(record.targetId) + residentStringBytes(existing) + 48;
+						const nextBytes = residentStringBytes(record.targetId) + residentStringBytes(label) + 48;
+						if (labelsBytes - existingBytes + nextBytes > LABELS_PINS_BUDGET_BYTES)
+							return fail("bounded_scan_budget");
+						labelsBytes += nextBytes - existingBytes;
+						labelsById.set(record.targetId, label);
+					} else {
+						const existing = labelsById.get(record.targetId);
+						if (existing !== undefined)
+							labelsBytes -= residentStringBytes(record.targetId) + residentStringBytes(existing) + 48;
+						labelsById.delete(record.targetId);
+					}
+				} else if (record.type === "message") {
+					if (record.message === null || typeof record.message !== "object")
+						return fail("bounded_scan_unsupported");
+					const message = record.message as Record<string, unknown>;
+					let usage: unknown;
+					if (message.role === "assistant") {
+						usage = message.usage;
+					} else if (message.role === "toolResult" && message.toolName === "task") {
+						usage = getTaskToolUsage(message.details);
+					}
+					if (usage !== undefined && !addUsage(validatePersistedUsageTotals(usage)))
+						return fail("bounded_scan_unsupported");
+				}
+				lastId = record.id;
+				if ((ordinal & 4095) === 0) Bun.gc(true);
+			},
+		);
+		if (scanFailure) {
+			if (scanFailure === "oversized_line") this.#lazyReopenFallbackReason = "bounded_scan_unsupported";
+			else if (scanFailure === "unterminated") this.#lazyReopenFallbackReason = "bounded_scan_malformed";
+			else if (scanFailure === "read_failed") this.#lazyReopenFallbackReason = "bounded_first_open_unreadable";
+			// "aborted": the callback already recorded a specific reason.
+			return undefined;
+		}
+		if (!header || ordinal < 0) {
+			this.#lazyReopenFallbackReason = "bounded_scan_malformed";
+			return undefined;
+		}
+		if (scannedBytes !== descriptor.size) {
+			this.#lazyReopenFallbackReason = "bounded_scan_malformed";
+			return undefined;
+		}
+		if (!latestCompactionBoundary) {
+			this.#lazyReopenFallbackReason = "bounded_scan_invalid_compaction";
+			return undefined;
+		}
+		const reducer: ReducerState = {
+			modelChange: { latest: latestModelChange },
+			ttsr: {
+				count: latestTtsr?.count ?? 0,
+				rulesCount: latestTtsr?.rulesCount ?? 0,
+				recordsCount: latestTtsr?.recordsCount ?? 0,
+				largestOrdinal: latestTtsr?.ordinal ?? -1,
+			},
+		};
+		if (!isValidPersistedReducerState(reducer)) {
+			this.#lazyReopenFallbackReason = "bounded_scan_unsupported";
+			return undefined;
+		}
+		return {
+			header,
+			leafId: lastId!,
+			retirementFirstKeptEntryId: latestCompactionBoundary.firstKeptEntryId,
+			reducer,
+			usageStatistics,
+			labels: [...labelsById],
+		};
+	}
+
+	/**
+	 * Bounded first-open build pass: write the disposable `.spill.idx`/`.spill.tail`
+	 * set from exact raw transcript bytes and collect the hot suffix entries.
+	 * Digests/offsets cover the exact file bytes (including newlines) so the
+	 * existing authenticated reopen path validates them. Any inconsistency or
+	 * budget failure returns `undefined`; the caller then cleans partial sidecars
+	 * and falls back to the eager authoritative path.
+	 */
+	#buildBoundedFirstOpenSidecars(
+		sessionFile: string,
+		descriptor: DescriptorSnapshot,
+		discovery: BoundedFirstOpenDiscovery,
+	): { hotEntries: SessionEntry[]; hotSuffixBytes: number } | undefined {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.indexPath || !runtime.tailPath) return undefined;
+		let indexWriter: SessionStorageWriter | undefined;
+		let tailWriter: SessionStorageWriter | undefined;
+		const baseHash = crypto.createHash("sha256");
+		let tailBuilder: RollingTailChainBuilder | undefined;
+		let ordinal = -1;
+		let previousId: string | undefined;
+		let tailSeq = 0;
+		let inTail = false;
+		let baseEndOffset = 0;
+		let baseDigest = "";
+		let hotSuffixBytes = 0;
+		let tailResidentBytes = 0;
+		let scannedBytes = 0;
+		const hotEntries: SessionEntry[] = [];
+		let buildFailed = false;
+		try {
+			indexWriter = this.storage.openWriter(runtime.indexPath, { flags: "w" });
+			tailWriter = this.storage.openWriter(runtime.tailPath, { flags: "w" });
+			const scanFailure = scanTranscriptLinesBounded(
+				this.storage,
+				sessionFile,
+				descriptor.size,
+				(lineStart, lineBytes) => {
+					scannedBytes = lineStart + lineBytes.byteLength;
+					let parsed: unknown;
+					try {
+						parsed = JSON.parse(Buffer.from(lineBytes).toString("utf8"));
+					} catch {
+						buildFailed = true;
+						return false;
+					}
+					if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+						buildFailed = true;
+						return false;
+					}
+					const record = parsed as Record<string, unknown>;
+					if (typeof record.id !== "string" || typeof record.type !== "string") {
+						buildFailed = true;
+						return false;
+					}
+					if (ordinal === -1) {
+						if (record.type !== "session") {
+							buildFailed = true;
+							return false;
+						}
+						baseHash.update(lineBytes);
+						ordinal = 0;
+						return;
+					}
+					const parentId = record.parentId;
+					if (parentId !== null && typeof parentId !== "string") {
+						buildFailed = true;
+						return false;
+					}
+					if (ordinal === 0 ? parentId !== null : parentId !== previousId) {
+						buildFailed = true;
+						return false;
+					}
+					const recordDigest = computeLineDigest(lineBytes);
+					const byteLength = lineBytes.byteLength;
+					if (!inTail && record.id === discovery.retirementFirstKeptEntryId) {
+						inTail = true;
+						baseEndOffset = lineStart;
+						baseDigest = baseHash.digest("hex");
+						tailBuilder = new RollingTailChainBuilder({ baseDigest, baseEndOffset });
+					}
+					const indexLine = `${JSON.stringify({
+						id: record.id,
+						ordinal,
+						seq: ordinal,
+						byteOffset: lineStart,
+						byteLength,
+						recordDigest,
+					})}\n`;
+					indexWriter!.writeLineSync(indexLine);
+					runtime.indexHash.update(Buffer.from(indexLine, "utf8"));
+					if (inTail) {
+						const entry = parsed as SessionEntry;
+						hotEntries.push(entry);
+						hotSuffixBytes += byteLength;
+						if (hotSuffixBytes > this.#sidecarHotSuffixBudgetBytes) {
+							buildFailed = true;
+							return false;
+						}
+						const tailRecord = tailBuilder?.append({
+							seq: tailSeq,
+							kind: tailRecordKindForEntry(entry),
+							ordinal,
+							id: record.id,
+							parentId: parentId as string | null,
+							type: record.type,
+							byteOffset: lineStart,
+							byteLength,
+							recordDigest,
+						});
+						if (!tailRecord) {
+							buildFailed = true;
+							return false;
+						}
+						tailWriter!.writeLineSync(`${JSON.stringify(tailRecord)}\n`);
+						tailSeq++;
+						tailResidentBytes += residentRecordBytes(
+							record.id.length + (parentId === null ? 0 : parentId.length) + record.type.length,
+						);
+					} else {
+						baseHash.update(lineBytes);
+					}
+					ordinal++;
+					previousId = record.id;
+					if ((ordinal & 4095) === 0) Bun.gc(true);
+				},
+			);
+			if (scanFailure || buildFailed) {
+				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
+				return undefined;
+			}
+			if (scannedBytes !== descriptor.size || !inTail || !tailBuilder) {
+				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
+				return undefined;
+			}
+			const tail = tailBuilder.build();
+			if (tail.transcriptSize !== descriptor.size || tail.records.length === 0) {
+				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
+				return undefined;
+			}
+			if (!runtime.tailCache.tryAllocate(tailResidentBytes)) {
+				this.#lazyReopenFallbackReason = "bounded_scan_budget";
+				return undefined;
+			}
+			const fixedReservedBytes =
+				runtime.blockCache.budgetBytes +
+				runtime.entryCache.budgetBytes +
+				runtime.tailCache.budgetBytes +
+				REDUCER_BUDGET_BYTES +
+				LABELS_PINS_BUDGET_BYTES +
+				1024 * 1024;
+			if (!runtime.accountant.tryCharge(fixedReservedBytes + hotSuffixBytes)) {
+				this.#lazyReopenFallbackReason = "bounded_scan_budget";
+				return undefined;
+			}
+			runtime.base = { baseDigest, baseEndOffset };
+			runtime.tail = tail;
+			runtime.retirementFirstKeptEntryId = discovery.retirementFirstKeptEntryId;
+			runtime.reducer = discovery.reducer;
+			runtime.hotSuffixBytes = hotSuffixBytes;
+
+			runtime.indexDigest = runtime.indexHash.copy().digest("hex");
+			for (const [id, label] of discovery.labels) {
+				if (!runtime.labelsPins.setLabel(id, label)) {
+					this.#lazyReopenFallbackReason = "bounded_scan_budget";
+					return undefined;
+				}
+			}
+			return { hotEntries, hotSuffixBytes };
+		} finally {
+			try {
+				indexWriter?.closeSync();
+			} catch {
+				// Best-effort writer cleanup; partial sidecars are unlinked by the caller.
+			}
+			try {
+				tailWriter?.closeSync();
+			} catch {
+				// Best-effort writer cleanup; partial sidecars are unlinked by the caller.
+			}
+		}
+	}
+
 	/** Initialize with a specific session file (used by factory methods). */
 	async #initSessionFile(sessionFile: string): Promise<void> {
 		const resolvedSessionFile = this.storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
 		if (await this.#tryInitSessionFileFromSidecar(resolvedSessionFile)) {
+			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+			return;
+		}
+
+		if (await this.#tryBoundedFirstOpen(resolvedSessionFile)) {
 			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			return;
 		}
@@ -8193,10 +8835,27 @@ export class SessionManager {
 				reducer: runtime.reducer,
 				labels: [...runtime.labelsPins.labelsEntries()],
 				usageStatistics: this.#usageStatistics,
+
+				indexDigest: runtime.indexDigest,
 			};
 			const bytes = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
 			try {
-				const current = readSessionCommitMarkerSync(this.storage, markerPath);
+				const current =
+					this.destination.kind === "managed"
+						? readSessionCommitMarkerSync(this.storage, markerPath)
+						: !this.storage.existsSync(markerPath)
+							? ({ kind: "missing" } as const)
+							: (() => {
+									if (!this.storage.readRangeSync) throw new Error("commit_marker_range_read_unavailable");
+									const stat = this.storage.statSync(markerPath);
+									if (stat.size > 8 * 1024 * 1024) throw new Error("commit_marker_oversized");
+									const markerBytes = this.storage.readRangeSync(markerPath, 0, stat.size).bytes;
+									return {
+										kind: "present" as const,
+										rawBytesSha256: crypto.createHash("sha256").update(markerBytes).digest("hex"),
+										stat,
+									};
+								})();
 				if (current.kind === "missing") {
 					createSessionCommitMarkerCheckedSync(this.storage, markerPath, bytes, options);
 				} else {
@@ -8249,6 +8908,9 @@ export class SessionManager {
 				terminalSeq: -1,
 				transcriptSize: 0,
 			},
+
+			indexDigest: "",
+			indexHash: crypto.createHash("sha256"),
 			coldEntries: new Map(),
 			indexPath: this.#sessionFile ? `${this.#sessionFile}.spill.idx` : "",
 			tailPath: this.#sessionFile ? `${this.#sessionFile}.spill.tail` : "",
@@ -8403,16 +9065,16 @@ export class SessionManager {
 				const entry = sessionEntries[ordinal];
 				const persistedLine = Buffer.concat([this.#serializeEntryLine(entry), Buffer.from("\n")]);
 				const recordDigest = computeLineDigest(persistedLine);
-				indexWriter.writeLineSync(
-					`${JSON.stringify({
-						id: entry.id,
-						ordinal,
-						seq: ordinal,
-						byteOffset: runningOffset,
-						byteLength: persistedLine.byteLength,
-						recordDigest,
-					})}\n`,
-				);
+				const indexLine = `${JSON.stringify({
+					id: entry.id,
+					ordinal,
+					seq: ordinal,
+					byteOffset: runningOffset,
+					byteLength: persistedLine.byteLength,
+					recordDigest,
+				})}\n`;
+				indexWriter.writeLineSync(indexLine);
+				runtime.indexHash.update(Buffer.from(indexLine, "utf8"));
 				if (ordinal >= tailStartOrdinal) {
 					const record = tailBuilder.append({
 						seq: tailSeq,
@@ -8457,6 +9119,8 @@ export class SessionManager {
 		runtime.enabled = true;
 		runtime.base = { baseDigest, baseEndOffset };
 		runtime.tail = tailBuilder.build();
+
+		runtime.indexDigest = runtime.indexHash.copy().digest("hex");
 		runtime.reopenTransition = this.#classifySidecarReopen();
 		this.#publishCommitMarkerFromCurrentTranscriptSync();
 		runtime.terminalTransition = this.#classifySidecarReopen();
@@ -8709,8 +9373,21 @@ export class SessionManager {
 		if (header) rebuilt.push(header);
 		rebuilt.push(...coldList.filter(entry => !hotIds.has(entry.id)), ...hotEntries);
 		this.#fileEntries = rebuilt;
-		for (const [id, label] of runtime.labelsPins.labelsEntries()) this.#labelsById.set(id, label);
+		let labelsChanged = false;
+		for (const [id, label] of runtime.labelsPins.labelsEntries()) {
+			if (this.#labelsById.get(id) !== label) labelsChanged = true;
+			this.#labelsById.set(id, label);
+		}
+		runtime.enabled = false;
+		runtime.accountant.release(runtime.accountant.totalBytes);
+		runtime.coldEntries.clear();
+		runtime.tail = { ...runtime.tail, records: [] };
+		runtime.labelsPins.clear();
+		runtime.blockCache.release(runtime.blockCache.allocatedBytes);
+		runtime.entryCache.release(runtime.entryCache.allocatedBytes);
+		runtime.tailCache.release(runtime.tailCache.allocatedBytes);
 		this.#bumpEntryRevision();
+		if (labelsChanged) this.#labelRevision++;
 	}
 
 	/** True when the cold sidecar region is active and usable. */
@@ -8744,7 +9421,7 @@ export class SessionManager {
 	/** Wire reducer deltas for one appended entry (R1 latest-model-change + TTSR latest-wins). */
 	#applySidecarReducerDelta(entry: SessionEntry): void {
 		const runtime = this.#sidecarRuntime;
-		if (!runtime) return;
+		if (!runtime?.enabled) return;
 		if (entry.type === "model_change") {
 			runtime.reducer = applyReducerDelta(runtime.reducer, {
 				kind: "latest_model_change",
@@ -8789,9 +9466,10 @@ export class SessionManager {
 		try {
 			const indexWriter = this.storage.openWriter(runtime.indexPath, { flags: "a" });
 			try {
-				indexWriter.writeLineSync(
-					`${JSON.stringify({ id: entry.id, ordinal: record.ordinal, seq, byteOffset, byteLength, recordDigest })}\n`,
-				);
+				const indexLine = `${JSON.stringify({ id: entry.id, ordinal: record.ordinal, seq, byteOffset, byteLength, recordDigest })}\n`;
+				indexWriter.writeLineSync(indexLine);
+				runtime.indexHash.update(Buffer.from(indexLine, "utf8"));
+				runtime.indexDigest = runtime.indexHash.copy().digest("hex");
 			} finally {
 				indexWriter.closeSync();
 			}
@@ -8843,6 +9521,7 @@ export class SessionManager {
 				reducer?: unknown;
 				labels?: unknown;
 				usageStatistics?: unknown;
+				indexDigest?: unknown;
 			};
 			const descriptor = value.descriptor;
 			const base = value.base;
@@ -8859,7 +9538,8 @@ export class SessionManager {
 				typeof base.baseEndOffset !== "number" ||
 				typeof value.terminalChecksum !== "string" ||
 				typeof value.terminalSeq !== "number" ||
-				typeof value.transcriptSize !== "number"
+				typeof value.transcriptSize !== "number" ||
+				typeof value.indexDigest !== "string"
 			)
 				return undefined;
 			return {
@@ -8885,6 +9565,8 @@ export class SessionManager {
 				...(value.usageStatistics && typeof value.usageStatistics === "object"
 					? { usageStatistics: value.usageStatistics as UsageStatistics }
 					: {}),
+
+				indexDigest: value.indexDigest,
 			};
 		} catch {
 			return undefined;
@@ -9119,6 +9801,7 @@ export class SessionManager {
 	): Promise<DefaultModelSelectionStage> {
 		this.#ensureFullHotView();
 		const entryRevision = this.#entryRevision;
+		const leafRevision = this.#leafRevision;
 		const headerExportRevision = this.#headerExportRevision;
 		const sessionId = this.#sessionId;
 		const sessionFile = this.#sessionFile;
@@ -9163,6 +9846,7 @@ export class SessionManager {
 			: undefined;
 		return {
 			entryRevision,
+			leafRevision,
 			headerExportRevision,
 			sessionId,
 			sessionFile,
@@ -9175,6 +9859,7 @@ export class SessionManager {
 	promoteDefaultModelSelection(stage: DefaultModelSelectionStage): DefaultModelSelectionPromotion {
 		if (
 			stage.entryRevision !== this.#entryRevision ||
+			stage.leafRevision !== this.#leafRevision ||
 			stage.headerExportRevision !== this.#headerExportRevision ||
 			stage.sessionId !== this.#sessionId ||
 			stage.sessionFile !== this.#sessionFile
@@ -10024,8 +10709,9 @@ export class SessionManager {
 	}
 
 	async #persistPatches(records: readonly SessionPatchRecord[]): Promise<void> {
-		if (records.length === 0 || !this.persist || !this.#sessionFile || !this.storage.existsSync(this.#sessionFile))
-			return;
+		if (records.length === 0) return;
+		if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
+		if (!this.persist || !this.#sessionFile || !this.storage.existsSync(this.#sessionFile)) return;
 		await this.#queuePersistTask(async () => {
 			const token = this.#capturePersistenceInputToken();
 			const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
@@ -10164,7 +10850,6 @@ export class SessionManager {
 		this.#fileEntries.push(residentEntry);
 		this.#byId.set(residentEntry.id, residentEntry);
 		this.#leafId = residentEntry.id;
-		this.#applySidecarReducerDelta(residentEntry);
 		this.#bumpEntryRevision();
 		this.#leafRevision++;
 		if (entry.type === "label") this.#labelRevision++;
@@ -10187,6 +10872,23 @@ export class SessionManager {
 				this.#persistError ?? toError(error),
 			);
 		}
+		this.#applySidecarReducerDelta(residentEntry);
+		// Aggregate usage before the sidecar append publishes its commit marker so an
+		// exact reopen observes the same totals as the live manager.
+		if (this.#accumulateEntryUsage(entry)) {
+			logger.warn("Skipped malformed or overflowing usage on appended entry", {
+				sessionFile: this.#sessionFile,
+				entryId: entry.id,
+			});
+		}
+		if (residentEntry.type === "label" && activeRuntime?.enabled) {
+			if (residentEntry.label) {
+				if (!activeRuntime.labelsPins.setLabel(residentEntry.targetId, residentEntry.label))
+					this.#deactivateColdForBranchMutation();
+			} else {
+				activeRuntime.labelsPins.deleteLabel(residentEntry.targetId);
+			}
+		}
 		if (sidecarAppendCharge > 0 && activeRuntime && this.#coldSidecarActive()) {
 			const materialized = materializeResidentEntryForPersistenceSync(
 				residentEntry,
@@ -10208,15 +10910,6 @@ export class SessionManager {
 					activeRuntime.hotSuffixBytes += persistedLine.byteLength;
 				}
 			}
-		}
-		// Same validated, overflow-guarded aggregation as the resume path (#buildIndex): a
-		// malformed task-result or assistant usage shape reaching the append path must not
-		// crash or poison getUsageStatistics() either.
-		if (this.#accumulateEntryUsage(entry)) {
-			logger.warn("Skipped malformed or overflowing usage on appended entry", {
-				sessionFile: this.#sessionFile,
-				entryId: entry.id,
-			});
 		}
 		if (
 			entry.type === "compaction" &&
@@ -10697,6 +11390,7 @@ export class SessionManager {
 
 	evictCompactedContent(firstKeptEntryId: string, compactionEntryId: string): EvictCompactedContentResult {
 		this.#assertRecoveryHydrationWritable();
+		if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
 		const firstKept = this.#byId.get(firstKeptEntryId);
 		const compaction = this.#byId.get(compactionEntryId);
 		if (!firstKept) throw new Error(`Entry ${firstKeptEntryId} not found`);
@@ -12133,7 +12827,10 @@ export class SessionManager {
 				throw new Error("Captured fork source authority changed after destination publication.");
 			}
 			if (manager.#sessionMemoryMode !== "off" && manager.#sessionFile) {
-				manager.#buildDisposableSidecars(manager.#fileEntries);
+				const runtime = manager.#sidecarRuntime;
+				const transcriptSize = manager.storage.statSync(manager.#sessionFile).size;
+				if (!runtime?.enabled || runtime.tail.transcriptSize !== transcriptSize)
+					manager.#buildDisposableSidecars(manager.#fileEntries);
 				if (manager.#sessionMemoryMode === "enabled") manager.#retireColdEntries();
 			}
 			if (manager.#sessionFile) writeTerminalBreadcrumb(manager.cwd, manager.#sessionFile);

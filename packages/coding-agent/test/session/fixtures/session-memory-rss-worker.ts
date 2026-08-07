@@ -44,9 +44,16 @@ const collect = (): { rss: number; heapUsed: number; external: number } => {
 };
 
 const baselineRss = collect();
-const manager = await SessionManager.open(sessionFile, SessionManager.explicitDestination(root));
+const boundedFirstOpen = process.env.GJC_SESSION_MEMORY_RSS_FIRST_OPEN === "1";
+const manager = await SessionManager.open(
+	sessionFile,
+	SessionManager.explicitDestination(root),
+	undefined,
+	"copy-retain",
+	boundedFirstOpen ? "enabled" : "shadow",
+);
 const eagerRss = collect();
-manager.setSessionMemoryMode("enabled");
+if (!boundedFirstOpen) manager.setSessionMemoryMode("enabled");
 const retiredRss = collect();
 const cycleCount = Number.parseInt(process.env.GJC_SESSION_MEMORY_RSS_CYCLES ?? "0", 10);
 const cycleRecords = Number.parseInt(process.env.GJC_SESSION_MEMORY_RSS_CYCLE_RECORDS ?? "5000", 10);

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { TempDir } from "@gajae-code/utils";
@@ -578,6 +579,320 @@ it("applies enabled retirement while constructing a direct fork", async () => {
 	}
 });
 
+it("bounds the first enabled open with zero full-transcript reads and authentic sidecars", async () => {
+	class CountingStorage extends MemorySessionStorage {
+		rangeReads = 0;
+		textReads = 0;
+		textSyncReads = 0;
+		bytesReads = 0;
+		override readRangeSync(filePath: string, offset: number, length: number) {
+			this.rangeReads++;
+			return super.readRangeSync(filePath, offset, length);
+		}
+		override readText(filePath: string) {
+			if (!filePath.includes(".spill.")) this.textReads++;
+			return super.readText(filePath);
+		}
+		override readTextSync(filePath: string) {
+			if (!filePath.includes(".spill.")) this.textSyncReads++;
+			return super.readTextSync(filePath);
+		}
+		override readBytesSync(filePath: string) {
+			if (!filePath.includes(".spill.")) this.bytesReads++;
+			return super.readBytesSync(filePath);
+		}
+	}
+	const storage = new CountingStorage();
+	const sessionFile = "/sessions/bounded-first-open.jsonl";
+	const now = "0";
+	const records = [
+		{ type: "session", version: 5, id: "bounded-first-open", timestamp: now, cwd: "/cwd" },
+		{
+			type: "message",
+			id: "cold-old",
+			parentId: null,
+			timestamp: now,
+			message: { role: "user", content: "cold old", timestamp: 1 },
+		},
+		{
+			type: "message",
+			id: "cold-kept",
+			parentId: "cold-old",
+			timestamp: now,
+			message: { role: "user", content: "cold kept", timestamp: 2 },
+		},
+		{
+			type: "compaction",
+			id: "compaction",
+			parentId: "cold-kept",
+			timestamp: now,
+			summary: "summary",
+			firstKeptEntryId: "cold-kept",
+			tokensBefore: 10,
+		},
+		{
+			type: "message",
+			id: "hot-after",
+			parentId: "compaction",
+			timestamp: now,
+			message: {
+				role: "assistant",
+				content: "hot after",
+				timestamp: 3,
+				usage: { input: 5, output: 7, cacheRead: 1, cacheWrite: 0, premiumRequests: 0, cost: { total: 12 } },
+			},
+		},
+		{ type: "label", id: "label", parentId: "hot-after", timestamp: now, targetId: "cold-old", label: "cold label" },
+	];
+	const transcript = `${records.map(record => JSON.stringify(record)).join("\n")}\n`;
+	storage.writeTextSync(sessionFile, transcript);
+
+	const manager = await SessionManager.open(
+		sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		expect(storage.textReads).toBe(0);
+		expect(storage.textSyncReads).toBe(0);
+		expect(storage.bytesReads).toBe(0);
+		expect(storage.rangeReads).toBeGreaterThan(0);
+		expect(manager.getSessionMemoryStats()).toMatchObject({
+			sidecarEnabled: true,
+			coldRetirementActive: true,
+			lazyReopenAttempted: true,
+			lazyReopenSucceeded: true,
+			lazyReopenFallbackReason: undefined,
+			lastReopenTransition: { kind: "rebuild", reason: "bounded_first_open" },
+		});
+		const cold = manager.getEntry("cold-old");
+		expect(cold).toMatchObject({ id: "cold-old", type: "message" });
+		if (cold?.type !== "message" || !("content" in cold.message)) throw new Error("Expected cold message entry");
+		expect(cold.message.content).toBe("cold old");
+		expect(manager.buildSessionContext().messages).toHaveLength(3);
+		expect(manager.getLabel("cold-old")).toBe("cold label");
+		expect(manager.getUsageStatistics()).toMatchObject({
+			input: 5,
+			output: 7,
+			cacheRead: 1,
+			cacheWrite: 0,
+			premiumRequests: 0,
+			cost: 12,
+		});
+		const marker = JSON.parse(storage.readTextSync(`${sessionFile}.spill.commit`)) as {
+			base: { baseDigest: string; baseEndOffset: number };
+			transcriptSize: number;
+			retirementFirstKeptEntryId: string;
+			leafId: string;
+			indexDigest: string;
+		};
+		expect(marker.base.baseEndOffset).toBe(transcript.indexOf(`${JSON.stringify(records[2])}\n`));
+		expect(marker.base.baseDigest).toMatch(/^[0-9a-f]{64}$/);
+		expect(marker.transcriptSize).toBe(Buffer.byteLength(transcript, "utf8"));
+		expect(marker.retirementFirstKeptEntryId).toBe("cold-kept");
+		expect(marker.leafId).toBe("label");
+
+		// The commit authenticates the exact `.spill.idx` bytes (indexDigest).
+		expect(marker.indexDigest).toBe(
+			createHash("sha256")
+				.update(storage.readBytesSync(`${sessionFile}.spill.idx`))
+				.digest("hex"),
+		);
+	} finally {
+		await manager.close();
+	}
+
+	// The marker published by the bounded first open is accepted by the existing
+	// authenticated explicit lazy reopen path (exact offsets, digests, and the
+	// rolling tail proof all round-trip).
+	storage.textReads = 0;
+	storage.textSyncReads = 0;
+	storage.bytesReads = 0;
+	const reopened = await SessionManager.open(
+		sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		expect(storage.textReads).toBe(0);
+		expect(storage.textSyncReads).toBe(0);
+		expect(storage.bytesReads).toBe(0);
+		expect(reopened.getSessionMemoryStats()).toMatchObject({
+			sidecarEnabled: true,
+			coldRetirementActive: true,
+			lazyReopenAttempted: true,
+			lazyReopenSucceeded: true,
+			lazyReopenFallbackReason: undefined,
+			lastReopenTransition: { kind: "exact", reason: "descriptor_and_proof_match" },
+		});
+		expect(reopened.getEntry("cold-old")).toMatchObject({ id: "cold-old", type: "message" });
+		expect(reopened.buildSessionContext().messages).toHaveLength(3);
+		expect(reopened.getUsageStatistics()).toMatchObject({ cost: 12 });
+	} finally {
+		await reopened.close();
+	}
+
+	// A disposable index that no longer matches the committed indexDigest is
+	// never adopted: the open fails closed to the eager authoritative path.
+	storage.writeTextSync(`${sessionFile}.spill.idx`, `${storage.readTextSync(`${sessionFile}.spill.idx`)}{}\n`);
+	storage.textReads = 0;
+	storage.textSyncReads = 0;
+	storage.bytesReads = 0;
+	const corruptIndex = await SessionManager.open(
+		sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		expect(storage.textReads).toBeGreaterThan(0);
+		expect(corruptIndex.getSessionMemoryStats()).toMatchObject({
+			lazyReopenAttempted: true,
+			lazyReopenSucceeded: false,
+			lazyReopenFallbackReason: "index_digest_mismatch",
+		});
+		expect(corruptIndex.getEntry("cold-old")).toMatchObject({ id: "cold-old", type: "message" });
+	} finally {
+		await corruptIndex.close();
+	}
+});
+
+it("commits cold label clears and appended usage before exact reopen", async () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/metadata-append.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "metadata", timestamp: "0", cwd: "/cwd" },
+		{
+			type: "message",
+			id: "cold",
+			parentId: null,
+			timestamp: "0",
+			message: { role: "user", content: "cold", timestamp: 1 },
+		},
+		{
+			type: "message",
+			id: "kept",
+			parentId: "cold",
+			timestamp: "0",
+			message: { role: "user", content: "kept", timestamp: 2 },
+		},
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "s",
+			firstKeptEntryId: "kept",
+			tokensBefore: 2,
+		},
+		{ type: "label", id: "label", parentId: "compact", timestamp: "0", targetId: "cold", label: "bookmark" },
+	];
+	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	const manager = await SessionManager.open(
+		sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		expect(manager.getLabel("cold")).toBe("bookmark");
+		manager.appendLabelChange("cold", undefined);
+		const assistantId = manager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "done" }],
+			timestamp: 3,
+			usage: {
+				input: 2,
+				output: 3,
+				cacheRead: 0,
+				cacheWrite: 0,
+				premiumRequests: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 5 },
+			},
+		} as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+		manager.appendCompaction("checkpoint", undefined, assistantId, 5);
+		const marker = JSON.parse(storage.readTextSync(`${sessionFile}.spill.commit`)) as {
+			labels: Array<[string, string]>;
+			usageStatistics: { input: number; output: number; cost: number };
+		};
+		expect(marker.labels).not.toContainEqual(["cold", "bookmark"]);
+		expect(marker.usageStatistics).toMatchObject({ input: 2, output: 3, cost: 5 });
+	} finally {
+		await manager.close();
+	}
+
+	const reopened = await SessionManager.open(
+		sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		expect(reopened.getLabel("cold")).toBeUndefined();
+		expect(reopened.getUsageStatistics()).toMatchObject({ input: 2, output: 3, cost: 5 });
+	} finally {
+		await reopened.close();
+	}
+});
+
+it("fails closed to eager on a branched transcript during enabled first open", async () => {
+	class CountingStorage extends MemorySessionStorage {
+		textReads = 0;
+		override readText(filePath: string) {
+			this.textReads++;
+			return super.readText(filePath);
+		}
+	}
+	const storage = new CountingStorage();
+	const sessionFile = "/sessions/branched-first-open.jsonl";
+	const now = "0";
+	const records = [
+		{ type: "session", version: 5, id: "branched", timestamp: now, cwd: "/cwd" },
+		{ type: "custom", id: "root", parentId: null, timestamp: now, customType: "x" },
+		{ type: "custom", id: "kept", parentId: "root", timestamp: now, customType: "x" },
+		{
+			type: "compaction",
+			id: "compaction",
+			parentId: "kept",
+			timestamp: now,
+			summary: "s",
+			firstKeptEntryId: "kept",
+			tokensBefore: 10,
+		},
+		// The branch jumps back to "root" instead of the adjacent "compaction":
+		// the strictly linear parent chain is violated, so the bounded path fails
+		// closed and the eager authoritative path loads everything.
+		{ type: "custom", id: "branch", parentId: "root", timestamp: now, customType: "x" },
+	];
+	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	const manager = await SessionManager.open(
+		sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		expect(storage.textReads).toBeGreaterThan(0);
+		expect(manager.getSessionMemoryStats()).toMatchObject({
+			lazyReopenAttempted: true,
+			lazyReopenSucceeded: false,
+			lazyReopenFallbackReason: "bounded_scan_branch",
+		});
+		expect(manager.getEntry("root")).toMatchObject({ id: "root", type: "custom" });
+		expect(manager.getEntry("branch")).toMatchObject({ id: "branch", type: "custom" });
+		expect(storage.listFilesSync("/sessions", "*.spill.*")).toEqual([]);
+	} finally {
+		await manager.close();
+	}
+});
 it("fails closed for transcript-ahead and tail-ahead reopen states", async () => {
 	class CountingStorage extends MemorySessionStorage {
 		textReads = 0;
