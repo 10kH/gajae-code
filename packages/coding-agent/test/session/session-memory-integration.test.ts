@@ -1103,6 +1103,73 @@ it("stages and promotes default model selection without hydrating retired histor
 	}
 });
 
+it("recovers eagerly when staged selection publication outlives marker publication", async () => {
+	class MarkerFailureStorage extends MemorySessionStorage {
+		failMarkers = false;
+		markerFailures = 0;
+		override replaceExactSync(
+			sourcePath: string,
+			destinationPath: string,
+			expected: Parameters<MemorySessionStorage["replaceExactSync"]>[2],
+		): boolean {
+			const replaced = super.replaceExactSync(sourcePath, destinationPath, expected);
+			if (replaced) this.failMarkers = true;
+			return replaced;
+		}
+		override writeTextSync(filePath: string, content: string): void {
+			if (this.failMarkers && filePath.endsWith(".spill.commit")) {
+				this.markerFailures++;
+				throw new Error("injected_marker_failure");
+			}
+			super.writeTextSync(filePath, content);
+		}
+	}
+	const storage = new MarkerFailureStorage();
+	const sessionFile = "/sessions/selection-marker-failure.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "selection-marker-failure", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "cold", parentId: null, timestamp: "0", customType: "x", data: {} },
+		{ type: "custom", id: "kept", parentId: "cold", timestamp: "0", customType: "x", data: {} },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 10,
+		},
+	];
+	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	const manager = await SessionManager.open(
+		sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	const stage = await manager.stageDefaultModelSelection("provider/model", "high", { appendThinkingLevel: true });
+	const promotion = manager.promoteDefaultModelSelection(stage);
+	storage.failMarkers = false;
+	expect(promotion).toEqual({ kind: "promoted" });
+	expect(manager.getLastModelChangeRole()).toBe("default");
+	expect(storage.markerFailures).toBeGreaterThan(0);
+	await manager.close();
+	const reopened = await SessionManager.open(
+		sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		expect(reopened.getLastModelChangeRole()).toBe("default");
+		expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
+	} finally {
+		await reopened.close();
+	}
+});
+
 describe("malformed transcript sidecar fallback", () => {
 	it("keeps malformed known records eager", async () => {
 		const storage = new MemorySessionStorage();
