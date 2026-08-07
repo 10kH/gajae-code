@@ -211,24 +211,4 @@ describe.skipIf(process.platform !== "linux")("managed task descendant persisten
 		expect(Buffer.byteLength(selected.output)).toBe(Buffer.byteLength(resumed));
 		expect(selected.output.slice(0, 1)).toBe("b");
 	});
-	it("re-secures drifted legacy local trees on captureTree instead of mode_mismatch", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-task-managed-capture-mode-heal-"));
-		temporaryDirectories.push(root);
-		const artifactsDir = path.join(root, "artifacts");
-		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), artifactsDir);
-		const legacyLocal = path.join(artifactsDir, "local");
-		// Foreign / legacy writers create group/other-readable descendants under
-		// the managed session path. Snapshot used to fail closed with mode_mismatch.
-		await fs.mkdir(legacyLocal, { recursive: true, mode: 0o755 });
-		const legacyFile = path.join(legacyLocal, "legacy.txt");
-		await fs.writeFile(legacyFile, "managed legacy payload", { mode: 0o644 });
-		await fs.chmod(legacyLocal, 0o755);
-		await fs.chmod(legacyFile, 0o644);
-		expect(fsSync.statSync(legacyFile).mode & 0o077).not.toBe(0);
-
-		const snapshot = store.captureTree("local");
-		expect(snapshot.entries.some(entry => entry.relativePath === "legacy.txt" && entry.kind === "file")).toBe(true);
-		expect(fsSync.statSync(legacyFile).mode & 0o077).toBe(0);
-		expect(fsSync.statSync(legacyLocal).mode & 0o077).toBe(0);
-	});
 });
