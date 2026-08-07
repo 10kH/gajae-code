@@ -238,6 +238,7 @@ export async function openLifecycleSessionManager(
 			cwd,
 			SessionManager.managedDestination(cwd, agentDir),
 			migrationPolicy,
+			lifecycleSettings.get("sessionMemory.mode"),
 		);
 		if (forked.kind === "error")
 			throw new Error("Lifecycle saved session authority changed while the session host forked it.");
