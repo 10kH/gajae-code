@@ -19,6 +19,7 @@ import {
 	isGjcPluginSourceShape,
 	listGjcBundles,
 	previewGjcBundleUpdate,
+	uninstallGjcBundle,
 } from "../extensibility/gjc-plugins";
 import { PluginManager, parseSettingValue, validateSetting } from "../extensibility/plugins";
 import {
@@ -480,6 +481,31 @@ function describeInstallFailure(error: unknown): string {
 	return error instanceof GjcPluginLoadError ? error.code : "install_failed";
 }
 
+function isGjcRegistryShapeFailure(error: unknown): boolean {
+	return (
+		(error instanceof GjcPluginLoadError && error.code === "invalid_manifest") ||
+		(error instanceof TypeError &&
+			/(?:not iterable|localeCompare|reading ['"](?:scope|name|pluginRoot|plugins|map))/.test(error.message))
+	);
+}
+
+async function findGjcBundlesForUninstall(
+	cwd: string,
+	name: string,
+	scope: "user" | "project" | undefined,
+): Promise<GjcBundleSummary[]> {
+	const scopes = scope ? [scope] : (["user", "project"] as const);
+	const matches: GjcBundleSummary[] = [];
+	for (const candidateScope of scopes) {
+		try {
+			const result = await getGjcBundle({ cwd }, bundleIdentity(candidateScope, name));
+			if (result.ok) matches.push(result.value);
+		} catch (error) {
+			if (!isGjcRegistryShapeFailure(error)) throw error;
+		}
+	}
+	return matches;
+}
 async function handleInstall(
 	manager: PluginManager,
 	packages: string[],
@@ -627,21 +653,41 @@ async function handleInstall(
 async function handleUninstall(
 	manager: PluginManager,
 	packages: string[],
-	flags: { json?: boolean; scope?: "user" | "project" },
+	flags: { json?: boolean; scope?: "user" | "project"; user?: boolean; project?: boolean },
 ): Promise<void> {
 	if (packages.length === 0) {
 		console.error(chalk.red(`Usage: ${APP_NAME} plugin uninstall <package> ...`));
 		process.exit(1);
 	}
 
-	// For uninstall, check the installed plugins registry directly.
-	// This works even if the marketplace entry was later removed from marketplaces.json.
+	const scope = flags.scope ?? (flags.user ? "user" : flags.project ? "project" : undefined);
+	const cwd = getProjectDir();
 	const mktMgr = await makeMarketplaceManager();
 	const installedPlugins = new Set((await mktMgr.listInstalledPlugins()).map(p => p.id));
 
 	for (const name of packages) {
+		const matches = await findGjcBundlesForUninstall(cwd, name, scope);
+		if (matches.length > 0) {
+			if (matches.length > 1) {
+				console.error(chalk.red(`GJC bundle "${name}" is installed in both scopes; specify --user or --project.`));
+				process.exit(1);
+			}
+			const identity = matches[0].identity;
+			const result = await uninstallGjcBundle({ cwd }, identity);
+			if (!result.ok) {
+				console.error(chalk.red(`${theme.status.error} ${result.error.message}`));
+				if (result.error.recovery) console.error(chalk.dim(`  Try: ${result.error.recovery}`));
+				process.exit(3);
+			}
+			if (flags.json) {
+				console.log(JSON.stringify({ uninstalled: identity }));
+			} else {
+				console.log(chalk.green(`${theme.status.success} Uninstalled ${identity.name} (${identity.scope})`));
+			}
+			continue;
+		}
+
 		if (installedPlugins.has(name)) {
-			// Exact match against installed marketplace plugin IDs (name@marketplace)
 			try {
 				await mktMgr.uninstallPlugin(name, flags.scope);
 				console.log(chalk.green(`${theme.status.success} Uninstalled ${name}`));
@@ -652,7 +698,6 @@ async function handleUninstall(
 			continue;
 		}
 
-		// npm path
 		try {
 			await manager.uninstall(name);
 			if (flags.json) {
