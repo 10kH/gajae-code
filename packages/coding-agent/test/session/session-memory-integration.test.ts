@@ -514,6 +514,24 @@ it("reopens an enabled explicit session from authenticated hot-tail metadata", a
 	} finally {
 		await reopened.close();
 	}
+	const markerPath = `${sessionFile}.spill.commit`;
+	const marker = JSON.parse(storage.readTextSync(markerPath)) as { reducer: { ttsr: { count: number } } };
+	marker.reducer.ttsr.count = Number.NaN;
+	storage.writeTextSync(markerPath, `${JSON.stringify(marker)}\n`);
+	storage.textReads = 0;
+	const fallback = await SessionManager.open(
+		sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		expect(storage.textReads).toBeGreaterThan(0);
+		expect(fallback.buildSessionContext().messages).toHaveLength(3);
+	} finally {
+		await fallback.close();
+	}
 });
 describe("session memory mode across file transitions", () => {
 	it("reapplies enabled retirement and keeps off transitions sidecar-free", async () => {

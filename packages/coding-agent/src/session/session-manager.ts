@@ -730,6 +730,17 @@ interface SessionMemoryCommitContents extends CommitMarkerContents {
 	labels?: Array<[string, string]>;
 	usageStatistics?: UsageStatistics;
 }
+
+function isValidPersistedReducerState(value: ReducerState): boolean {
+	const latest = value.modelChange?.latest;
+	return (
+		(latest === undefined ||
+			(Number.isSafeInteger(latest.ordinal) && (latest.role === undefined || typeof latest.role === "string"))) &&
+		[value.ttsr?.count, value.ttsr?.rulesCount, value.ttsr?.recordsCount, value.ttsr?.largestOrdinal].every(
+			item => typeof item === "number" && Number.isSafeInteger(item),
+		)
+	);
+}
 /** Map a session entry to its rolling-tail record kind. */
 function tailRecordKindForEntry(entry: SessionEntry): TailRecordKind {
 	switch (entry.type) {
@@ -6074,6 +6085,24 @@ export class SessionManager {
 				terminalMarkerValid: true,
 			});
 			if (validation.kind !== "valid") return false;
+			if (
+				records.length === 0 ||
+				commit.leafId !== records.at(-1)?.id ||
+				commit.retirementFirstKeptEntryId !== records[0]?.id ||
+				!commit.labels.every(
+					entry => Array.isArray(entry) && entry.length === 2 && entry.every(value => typeof value === "string"),
+				) ||
+				!isValidPersistedReducerState(commit.reducer) ||
+				![
+					commit.usageStatistics.input,
+					commit.usageStatistics.output,
+					commit.usageStatistics.cacheRead,
+					commit.usageStatistics.cacheWrite,
+					commit.usageStatistics.premiumRequests,
+					commit.usageStatistics.cost,
+				].every(isFiniteNonNegativeNumber)
+			)
+				return false;
 			const headerWindow = this.storage.readRangeSync(sessionFile, 0, Math.min(descriptor.size, 64 * 1024)).bytes;
 			const headerEnd = headerWindow.indexOf(10);
 			if (headerEnd < 0) return false;
@@ -6117,6 +6146,11 @@ export class SessionManager {
 				},
 				"memory-fallback",
 			);
+			const terminalDescriptor = this.#managedDescriptorSnapshotOrNull();
+			if (!terminalDescriptor || !sameDescriptor(descriptor, terminalDescriptor)) {
+				prepared.dispose();
+				return false;
+			}
 			this.#sessionId = header.id;
 			this.#sessionName = header.title;
 			this.#titleSource = header.titleSource;
@@ -6135,6 +6169,7 @@ export class SessionManager {
 			runtime.reopenTransition = { kind: "exact", reason: "descriptor_and_proof_match" };
 			runtime.terminalTransition = runtime.reopenTransition;
 			this.#commitResidentTextStoreTransition(prepared, false);
+			this.#commitGen = commit.gen;
 			this.#usageStatistics = commit.usageStatistics;
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
