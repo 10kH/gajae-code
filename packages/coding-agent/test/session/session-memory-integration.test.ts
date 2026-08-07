@@ -543,6 +543,72 @@ describe("managed commit marker classification", () => {
 			tempDir.removeSync();
 		}
 	});
+
+	it("classifies and repairs transcript-ahead crash evidence on reopen", async () => {
+		const tempDir = TempDir.createSync("@pi-managed-transcript-ahead-");
+		const cwd = path.join(tempDir.path(), "workspace");
+		const agentDir = path.join(tempDir.path(), "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const source = SessionManager.create(cwd, destination);
+		let sessionFile: string;
+		try {
+			source.setSessionMemoryMode("enabled");
+			const firstId = source.appendMessage({ role: "user", content: "first", timestamp: 1 });
+			const keptId = source.appendMessage({ role: "user", content: "kept", timestamp: 2 });
+			await source.ensureOnDisk();
+			const compactionId = source.appendCompaction("summary", undefined, keptId, 10);
+			sessionFile = source.getSessionFile()!;
+			await source.close();
+			fs.appendFileSync(
+				sessionFile,
+				`${JSON.stringify({
+					type: "message",
+					id: "crash-window-append",
+					parentId: compactionId,
+					timestamp: new Date().toISOString(),
+					message: { role: "user", content: "transcript ahead", timestamp: 3 },
+				})}\n`,
+			);
+
+			const reopened = await SessionManager.open(sessionFile, destination);
+			try {
+				const stats = reopened.getSessionMemoryStats();
+				expect(stats.lastReopenTransition).toEqual({
+					kind: "transcript_ahead",
+					reason: "object_grew_within_window",
+				});
+				expect(stats.currentCommitTransition).toEqual({
+					kind: "exact",
+					reason: "descriptor_and_proof_match",
+				});
+				expect(reopened.getEntry(firstId)).toMatchObject({ id: firstId });
+				expect(reopened.getEntry("crash-window-append")).toMatchObject({ id: "crash-window-append" });
+			} finally {
+				await reopened.close();
+			}
+			const markerPath = `${sessionFile}.spill.commit`;
+			const corruptMarker = JSON.parse(fs.readFileSync(markerPath, "utf8")) as { terminalChecksum: string };
+			corruptMarker.terminalChecksum = "0".repeat(64);
+			fs.writeFileSync(markerPath, `${JSON.stringify(corruptMarker)}\n`);
+			const repaired = await SessionManager.open(sessionFile, destination);
+			try {
+				expect(repaired.getSessionMemoryStats().lastReopenTransition).toEqual({
+					kind: "rebuild",
+					reason: "terminal_checksum_mismatch",
+				});
+				expect(repaired.getSessionMemoryStats().currentCommitTransition).toEqual({
+					kind: "exact",
+					reason: "descriptor_and_proof_match",
+				});
+			} finally {
+				await repaired.close();
+			}
+		} finally {
+			await source.close().catch(() => {});
+			tempDir.removeSync();
+		}
+	});
 });
 describe("descriptor-bound capture and staged fork publication", () => {
 	function writeColdTranscript(
