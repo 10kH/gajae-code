@@ -236,6 +236,32 @@ describe("staged streaming writers (immutable destinations)", () => {
 	});
 });
 
+describe("exact staged replacement", () => {
+	it("rejects a destination changed after staging", async () => {
+		const dir = await makeTempDir("gjc-staged-exact-");
+		const destination = path.join(dir, "session.jsonl");
+		const source = path.join(dir, "selection.tmp");
+		const file = new FileSessionStorage();
+		file.writeTextSync(destination, "old\n");
+		file.writeTextSync(source, "new\n");
+		const expected = {
+			stat: file.statSync(destination),
+			sha256: createHash("sha256").update("old\n").digest("hex"),
+		};
+		file.writeTextSync(destination, "foreign\n");
+		expect(file.replaceExactSync(source, destination, expected)).toBe(false);
+		expect(file.readTextSync(destination)).toBe("foreign\n");
+		expect(file.readTextSync(source)).toBe("new\n");
+
+		const current = {
+			stat: file.statSync(destination),
+			sha256: createHash("sha256").update("foreign\n").digest("hex"),
+		};
+		expect(file.replaceExactSync(source, destination, current)).toBe(true);
+		expect(file.readTextSync(destination)).toBe("new\n");
+	});
+});
+
 describe("commit-marker checked create/replace", () => {
 	const markerBytes = (gen: number): Uint8Array => Buffer.from(`{"gen":${gen}}\n`, "utf8");
 	const markerHash = (bytes: Uint8Array): string => createHash("sha256").update(bytes).digest("hex");

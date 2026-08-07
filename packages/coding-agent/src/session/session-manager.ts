@@ -904,6 +904,8 @@ export type DefaultModelSelectionStage = {
 	readonly boundedCold: boolean;
 	readonly appendEntries: readonly SessionEntry[];
 	readonly sourceDescriptor: DescriptorSnapshot | undefined;
+	readonly sourceStat: SessionStorageStat | undefined;
+	readonly sourceSha256: string | undefined;
 };
 export interface SessionManagerRevisionSnapshot {
 	entry: number;
@@ -9818,12 +9820,13 @@ export class SessionManager {
 		appendEntries: readonly SessionEntry[],
 		sessionFile: string,
 		sourceDescriptor: DescriptorSnapshot,
-	): Promise<string> {
+	): Promise<{ tempPath: string; sourceSha256: string }> {
 		if (this.destination.kind === "managed" || typeof this.storage.openStagedWriter !== "function")
 			throw new Error("bounded_default_selection_unsupported");
 		const dir = path.resolve(sessionFile, "..");
 		const tempPath = path.join(dir, `.${path.basename(sessionFile)}.${Snowflake.next()}.default-selection.tmp`);
 		const staged = this.storage.openStagedWriter(tempPath);
+		const sourceHash = crypto.createHash("sha256");
 		try {
 			const scanFailure = scanTranscriptLinesBounded(
 				this.storage,
@@ -9831,6 +9834,7 @@ export class SessionManager {
 				sourceDescriptor.size,
 				(_offset, lineBytes) => {
 					staged.writeLine(lineBytes.subarray(0, lineBytes.byteLength - 1));
+					sourceHash.update(lineBytes);
 				},
 			);
 			if (scanFailure) throw new Error(`bounded_default_selection_${scanFailure}`);
@@ -9844,7 +9848,7 @@ export class SessionManager {
 			const after = this.#managedDescriptorSnapshotOrNull();
 			if (!after || !sameDescriptor(sourceDescriptor, after))
 				throw new Error("bounded_default_selection_source_changed");
-			return tempPath;
+			return { tempPath, sourceSha256: sourceHash.digest("hex") };
 		} catch (error) {
 			try {
 				staged.closeSync();
@@ -10026,11 +10030,14 @@ export class SessionManager {
 		if (boundedCold && (!this.#coldIndexDigestValid() || !this.#coldTailMatchesDisk()))
 			throw new Error("bounded_default_selection_sidecar_changed");
 		const appendEntries = entries.slice(this.#fileEntries.length) as SessionEntry[];
-		const tempPath = persistsToExistingFile
-			? boundedCold
-				? await this.#writeBoundedDefaultModelSelection(appendEntries, sessionFile, sourceDescriptor!)
-				: await this.#writeStagedDefaultModelSelection(entries, sessionFile)
+		const sourceStat = boundedCold ? this.storage.statSync(sessionFile) : undefined;
+		const boundedStage = boundedCold
+			? await this.#writeBoundedDefaultModelSelection(appendEntries, sessionFile, sourceDescriptor!)
 			: undefined;
+		const tempPath = persistsToExistingFile
+			? (boundedStage?.tempPath ?? (await this.#writeStagedDefaultModelSelection(entries, sessionFile)))
+			: undefined;
+		const sourceSha256 = boundedStage?.sourceSha256;
 		return {
 			entryRevision,
 			leafRevision,
@@ -10043,6 +10050,8 @@ export class SessionManager {
 			boundedCold,
 			appendEntries,
 			sourceDescriptor,
+			sourceStat,
+			sourceSha256,
 		};
 	}
 
@@ -10106,10 +10115,26 @@ export class SessionManager {
 				}
 				try {
 					this.#closePersistWriterInternalSync();
-					const replacement = this.#replaceSessionFileSync(stage.tempPath, this.#sessionFile);
-					if (replacement.kind === "restored_previous") {
-						transition.dispose();
-						return { kind: "not_promoted", error: replacement.error };
+					if (stage.boundedCold) {
+						if (!this.storage.replaceExactSync || !stage.sourceStat || !stage.sourceSha256) {
+							transition.dispose();
+							return { kind: "unknown", error: new Error("Exact staged replacement is unavailable") };
+						}
+						if (
+							!this.storage.replaceExactSync(stage.tempPath, this.#sessionFile, {
+								stat: stage.sourceStat,
+								sha256: stage.sourceSha256,
+							})
+						) {
+							transition.dispose();
+							return { kind: "not_promoted" };
+						}
+					} else {
+						const replacement = this.#replaceSessionFileSync(stage.tempPath, this.#sessionFile);
+						if (replacement.kind === "restored_previous") {
+							transition.dispose();
+							return { kind: "not_promoted", error: replacement.error };
+						}
 					}
 				} catch (error) {
 					transition.dispose();

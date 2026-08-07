@@ -47,6 +47,11 @@ export interface SessionStorageSnapshot {
 	bytes: Uint8Array;
 	stat: SessionStorageStat;
 }
+
+export interface SessionStorageExactReplacementExpectation {
+	readonly stat: SessionStorageStat;
+	readonly sha256: string;
+}
 /** Upper bound for one descriptor-validated recorded range read. */
 export const SESSION_RANGE_READ_MAX_BYTES = 64 * 1024 * 1024;
 
@@ -267,6 +272,12 @@ export interface SessionStorage {
 	writeText(path: string, content: string): Promise<void>;
 	rename(path: string, nextPath: string): Promise<void>;
 	renameSync(path: string, nextPath: string): void;
+	/** Replace only while the destination still has the expected exact identity and bytes. */
+	replaceExactSync?(
+		sourcePath: string,
+		destinationPath: string,
+		expected: SessionStorageExactReplacementExpectation,
+	): boolean;
 	unlink(path: string): Promise<void>;
 	unlinkSync(path: string): void;
 	deleteSessionWithArtifacts(sessionPath: string): Promise<void>;
@@ -1504,6 +1515,68 @@ export class FileSessionStorage implements SessionStorage {
 		}
 	}
 
+	replaceExactSync(
+		sourcePath: string,
+		destinationPath: string,
+		expected: SessionStorageExactReplacementExpectation,
+	): boolean {
+		const dir = path.dirname(destinationPath);
+		const parent = fs.statSync(dir, { bigint: true });
+		let fd: number | undefined;
+		try {
+			fd = fs.openSync(sourcePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+			const before = fs.fstatSync(fd, { bigint: true });
+			if (!before.isFile()) return false;
+			const hash = createHash("sha256");
+			const chunk = Buffer.alloc(STAGED_WRITER_COPY_CHUNK_BYTES);
+			for (;;) {
+				const count = fs.readSync(fd, chunk, 0, chunk.byteLength, null);
+				if (count === 0) break;
+				hash.update(chunk.subarray(0, count));
+			}
+			const after = fs.fstatSync(fd, { bigint: true });
+			if (
+				before.dev !== after.dev ||
+				before.ino !== after.ino ||
+				before.nlink !== after.nlink ||
+				before.size !== after.size ||
+				before.mtimeNs !== after.mtimeNs
+			)
+				return false;
+			fs.closeSync(fd);
+			fd = undefined;
+			const outcome = native.exactReplacePath(
+				sourcePath,
+				destinationPath,
+				{
+					dev: before.dev,
+					ino: before.ino,
+					nlink: before.nlink,
+					parentDev: parent.dev,
+					parentIno: parent.ino,
+					size: before.size,
+					mtimeNs: before.mtimeNs,
+					sha256: hash.digest("hex"),
+				},
+				{
+					dev: expected.stat.dev,
+					ino: expected.stat.ino,
+					nlink: expected.stat.nlink ?? 1n,
+					parentDev: parent.dev,
+					parentIno: parent.ino,
+					size: BigInt(expected.stat.size),
+					mtimeNs: expected.stat.mtimeNs,
+					sha256: expected.sha256,
+				},
+			);
+			if (!outcome.ok) return false;
+			fsyncDirectorySync(dir);
+			return true;
+		} finally {
+			if (fd !== undefined) fs.closeSync(fd);
+		}
+	}
+
 	unlink(path: string): Promise<void> {
 		return fs.promises.unlink(path);
 	}
@@ -2559,6 +2632,21 @@ export class MemorySessionStorage implements SessionStorage {
 		if (!entry) throw new Error(`File not found: ${path}`);
 		this.#files.set(nextPath, entry);
 		this.#files.delete(path);
+	}
+
+	replaceExactSync(
+		sourcePath: string,
+		destinationPath: string,
+		expected: SessionStorageExactReplacementExpectation,
+	): boolean {
+		const source = this.#files.get(sourcePath);
+		const destination = this.#files.get(destinationPath);
+		if (!source || !destination) return false;
+		if (!sameDescriptorIdentity(this.#statFor(destination), expected.stat)) return false;
+		if (createHash("sha256").update(destination.content).digest("hex") !== expected.sha256) return false;
+		this.#files.set(destinationPath, source);
+		this.#files.delete(sourcePath);
+		return true;
 	}
 
 	unlink(path: string): Promise<void> {
