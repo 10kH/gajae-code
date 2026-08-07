@@ -1090,12 +1090,13 @@ export class BoundedParentChildrenIndex {
 	}
 
 	get(parentId: string): readonly string[] | undefined {
-		return this.childrenByParent.get(parentId);
+		const children = this.childrenByParent.get(parentId);
+		return children ? [...children] : undefined;
 	}
 
 	entries(): ParentChildrenIndexEntry[] {
 		const out: ParentChildrenIndexEntry[] = [];
-		for (const [parentId, children] of this.childrenByParent) out.push({ parentId, children });
+		for (const [parentId, children] of this.childrenByParent) out.push({ parentId, children: [...children] });
 		return out;
 	}
 }

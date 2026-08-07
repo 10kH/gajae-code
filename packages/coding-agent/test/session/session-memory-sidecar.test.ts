@@ -594,6 +594,12 @@ describe("bounded parent→children and labels/pins descriptors", () => {
 		expect(index.add("b", "w")).toBe(false); // parents bound (root, a)
 		expect(index.get("root")).toEqual(["a", "b"]);
 		expect(index.size).toBe(2);
+		const exposed = index.get("root") as string[];
+		exposed.push("escape");
+		expect(index.get("root")).toEqual(["a", "b"]);
+		const entry = index.entries()[0].children as string[];
+		entry.push("escape");
+		expect(index.get("root")).toEqual(["a", "b"]);
 	});
 
 	it("byte-accounts parent and child identifiers", () => {
