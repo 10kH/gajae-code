@@ -3795,8 +3795,12 @@ async function openManagedCandidateForWriteInternal(
 				assertPublicationConsent,
 				scopeRoot(scope),
 			);
+			assertPublicationConsent();
 		} catch (error) {
-			if ((error as Error).message !== "destination_conflict") throw error;
+			if ((error as Error).message !== "destination_conflict") {
+				await removeStagedReceipts(scope, afterLock);
+				throw error;
+			}
 		}
 
 		revalidatePickerConsent(scope, afterLock, expectedIdentity);

@@ -12093,7 +12093,15 @@ export class SessionManager {
 					privateStagingSnapshot = capturedStaging.snapshot;
 					fsyncManagedArtifactTree(privateStagingDir);
 					const outcome = classifyNativePublishOutcome(native.renameNoReplacePath(privateStagingDir, dir));
-					if (!outcome.ok) throw new Error(outcome.code ?? "fork_destination_publish_failed");
+					if (!outcome.ok) {
+						if (outcome.code === "quarantine_collision") {
+							authorityFailure = { kind: "error", reason: "identity-mismatch" };
+							throw new Error("fork_destination_authority_changed");
+						}
+						if (outcome.code === "destination_identity_changed")
+							throw new Error("fork_destination_terminal_identity_changed");
+						throw new Error(outcome.code ?? "fork_destination_publish_failed");
+					}
 					privateStagingPublished = true;
 					const terminal = native.snapshotDirectoryTree(dir);
 					if (
@@ -12118,6 +12126,11 @@ export class SessionManager {
 					finalTransition.dispose();
 					throw error;
 				}
+			}
+			const finalSource = snapshot.revalidate();
+			if (finalSource.kind !== "valid") {
+				authorityFailure = finalSource;
+				throw new Error("Captured fork source authority changed after destination publication.");
 			}
 			if (manager.#sessionMemoryMode !== "off" && manager.#sessionFile) {
 				manager.#buildDisposableSidecars(manager.#fileEntries);
