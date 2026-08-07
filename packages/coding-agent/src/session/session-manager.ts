@@ -60,6 +60,7 @@ import {
 import {
 	canonicalizeTrustedPath,
 	deleteManagedSessionCandidate,
+	isRecoverableOwnerOnlyModeDrift,
 	listManagedCandidates,
 	type ManagedCandidateWriteAuthority,
 	type ManagedMigrationPolicy,
@@ -69,6 +70,7 @@ import {
 	managedRootForScope,
 	openManagedCandidateForWrite,
 	prepareManagedSessionScopeForWriteSync,
+	resecureOwnerOnlyManagedTree,
 	resolveManagedScope,
 	resolveManagedScopeForWrite,
 } from "./internal/managed-session-scope";
@@ -8025,18 +8027,33 @@ export class SessionManager {
 		return {
 			capture: async () => {
 				let snapshot: native.NativeDirectoryTreeSnapshot;
+				const captureLegacyLocal = (): native.NativeDirectoryTreeSnapshot => store.captureTree(legacyLocalRoot);
 				try {
-					snapshot = store.captureTree(legacyLocalRoot);
+					snapshot = captureLegacyLocal();
 				} catch (error) {
 					if (error instanceof Error && error.message === "not_found") return null;
-					if (error instanceof Error && error.message === "reparse_point") {
+					// Prior writers (and some fixtures) can leave group/other-readable
+					// descendants under artifacts/<id>/local. Managed captureTree fails
+					// closed on mode_mismatch; re-secure owner-only modes once — same
+					// class of recovery as prepareManagedSessionScopeForWriteSync.
+					if (isRecoverableOwnerOnlyModeDrift(error)) {
+						resecureOwnerOnlyManagedTree(path.join(sessionFile.slice(0, -6), "local"));
+						try {
+							snapshot = captureLegacyLocal();
+						} catch (retryError) {
+							if (retryError instanceof Error && retryError.message === "not_found") return null;
+							throw retryError;
+						}
+					} else if (error instanceof Error && error.message === "reparse_point") {
 						try {
 							store.captureTree(legacyArtifactsRoot);
 						} catch (artifactsError) {
 							if (artifactsError instanceof Error && artifactsError.message === "not_found") return null;
 						}
+						throw error;
+					} else {
+						throw error;
 					}
-					throw error;
 				}
 				let totalBytes = 0;
 				for (const entry of snapshot.entries) if (entry.kind === "file") totalBytes += Number(entry.size);

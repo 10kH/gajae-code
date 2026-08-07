@@ -910,6 +910,11 @@ export async function ensureManagedScope(
  * uncaught exception. Re-securing the tree in place lets a drifted scope
  * recover on the next launch instead of trapping the user behind a fatal error.
  */
+/** Re-secure owner-only modes under a managed directory (exported for legacy-local migration). */
+export function resecureOwnerOnlyManagedTree(directory: string): void {
+	reapplyOwnerOnlyManagedTree(directory);
+}
+
 function reapplyOwnerOnlyManagedTree(directory: string): void {
 	let entries: fs.Dirent[];
 	try {
@@ -928,23 +933,57 @@ function reapplyOwnerOnlyManagedTree(directory: string): void {
 		if (stat.isSymbolicLink()) continue;
 		if (stat.isDirectory()) {
 			reapplyOwnerOnlyManagedTree(child);
-			try {
-				native.applyOwnerOnlyPathSecurity(child, "directory");
-			} catch {
-				// Best-effort: the managed-tree snapshot re-verifies and reports genuine failures.
-			}
+			assertOwnerOnlyApplied(child, "directory");
 		} else if (stat.isFile()) {
-			try {
-				native.applyOwnerOnlyPathSecurity(child, "file");
-			} catch {
-				// Best-effort, as above.
-			}
+			assertOwnerOnlyApplied(child, "file");
 		}
 	}
+	assertOwnerOnlyApplied(directory, "directory");
+}
+
+/** Apply and verify owner-only mode/ACL; throw mode_mismatch (or native code) on failure. */
+function assertOwnerOnlyApplied(pathname: string, kind: "directory" | "file"): void {
+	const applied = native.applyOwnerOnlyPathSecurity(pathname, kind);
+	if (!applied || typeof applied !== "object" || (applied as { ok?: unknown }).ok !== true) {
+		const code =
+			applied && typeof applied === "object" && typeof (applied as { code?: unknown }).code === "string"
+				? (applied as { code: string }).code
+				: "mode_mismatch";
+		throw new Error(code);
+	}
+	const verified = verifyOwnerOnlyPathSecurity(pathname, kind);
+	if (!verified || typeof verified !== "object" || (verified as { ok?: unknown }).ok !== true) {
+		const code =
+			verified && typeof verified === "object" && typeof (verified as { code?: unknown }).code === "string"
+				? (verified as { code: string }).code
+				: "mode_mismatch";
+		throw new Error(code);
+	}
+}
+
+/**
+ * Mode-only walk for managed-scope prepare self-heal.
+ * Throws `mode_mismatch` when any non-symlink descendant has group/other bits.
+ * Avoids snapshotManagedTree("") which races concurrent session writers (#3906).
+ */
+function assertOwnerOnlyModesRecursive(directory: string): void {
+	let stat: fs.Stats;
 	try {
-		native.applyOwnerOnlyPathSecurity(directory, "directory");
+		stat = fs.lstatSync(directory);
 	} catch {
-		// Best-effort, as above.
+		return;
+	}
+	if (stat.isSymbolicLink()) return;
+	if ((stat.mode & 0o077) !== 0) throw new Error("mode_mismatch");
+	if (!stat.isDirectory()) return;
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(directory, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		assertOwnerOnlyModesRecursive(path.join(directory, entry.name));
 	}
 }
 
@@ -953,7 +992,7 @@ function reapplyOwnerOnlyManagedTree(directory: string): void {
  * (group/other permission bits) rather than an ownership or identity change.
  * Only mode drift can be self-healed by re-applying owner-only permissions.
  */
-function isRecoverableOwnerOnlyModeDrift(error: unknown): boolean {
+export function isRecoverableOwnerOnlyModeDrift(error: unknown): boolean {
 	const message = error instanceof Error ? error.message : "";
 	return message === "mode_mismatch" || message.endsWith(": mode_mismatch");
 }
@@ -1014,8 +1053,20 @@ export function prepareManagedSessionScopeForWriteSync(
 			);
 		stage = "store";
 		let store: ManagedSessionDescendantStore;
+		const openManagedStore = (): ManagedSessionDescendantStore => {
+			const next = buildStore();
+			// #3951 root-store identity binding no longer walks the managed tree on
+			// construct, so mode drift no longer surfaces as mode_mismatch there.
+			// Detect group/other-readable descendants with a mode-only walk — do NOT
+			// call snapshotManagedTree("") here: that reintroduces concurrent-writer
+			// identity_mismatch races (#3906) that break SessionManager.moveTo /move.
+			if (retainedAuthority) {
+				assertOwnerOnlyModesRecursive(scope.directoryPath);
+			}
+			return next;
+		};
 		try {
-			store = buildStore();
+			store = openManagedStore();
 		} catch (error) {
 			if (process.platform === "win32" && policy === "windows-existing-verify-first") throw error;
 			if (!isRecoverableOwnerOnlyModeDrift(error)) throw error;
@@ -1023,7 +1074,7 @@ export function prepareManagedSessionScopeForWriteSync(
 			// (e.g. resident-cache blobs written on the explicit session path).
 			// Re-secure the tree in place and retry once before failing closed.
 			reapplyOwnerOnlyManagedTree(scope.directoryPath);
-			store = buildStore();
+			store = openManagedStore();
 		}
 		const binding = new TextEncoder().encode(`${JSON.stringify(bindingFor(scope))}\n`);
 		stage = "binding_publish";
