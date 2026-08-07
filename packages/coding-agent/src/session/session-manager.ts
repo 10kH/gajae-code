@@ -8503,6 +8503,7 @@ export class SessionManager {
 		if (header) rebuilt.push(header);
 		rebuilt.push(...coldList.filter(entry => !hotIds.has(entry.id)), ...hotEntries);
 		this.#fileEntries = rebuilt;
+		this.#bumpEntryRevision();
 	}
 
 	/** True when the cold sidecar region is active and usable. */
@@ -8517,7 +8518,20 @@ export class SessionManager {
 	#deactivateColdForBranchMutation(): void {
 		if (!this.#coldSidecarActive()) return;
 		this.#ensureFullHotView();
-		if (this.#sidecarRuntime) this.#sidecarRuntime.hotSuffixBytes = 0;
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return;
+		runtime.enabled = false;
+		runtime.sidecarIneligible = true;
+		runtime.hotSuffixBytes = 0;
+		runtime.accountant = new SessionMemoryAccountant();
+		for (const sidecarPath of [runtime.indexPath, runtime.tailPath, runtime.commitPath]) {
+			if (!sidecarPath) continue;
+			try {
+				this.storage.unlinkSync(sidecarPath);
+			} catch {
+				// Derived sidecars are disposable; the fully hydrated transcript is authoritative.
+			}
+		}
 	}
 
 	/** Wire reducer deltas for one appended entry (R1 latest-model-change + TTSR latest-wins). */

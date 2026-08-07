@@ -326,6 +326,40 @@ describe("active branch retirement boundary", () => {
 			await manager.close();
 		}
 	});
+
+	it("invalidates old sidecars before re-enabling on a branch without compaction", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/rebranch.jsonl";
+		const entries = [
+			{ type: "session", version: 5, id: "rebranch", timestamp: "0", cwd: "/cwd" },
+			{ type: "custom", id: "root", parentId: null, timestamp: "0", customType: "x" },
+			{ type: "custom", id: "old", parentId: "root", timestamp: "0", customType: "x" },
+			{
+				type: "compaction",
+				id: "old-compaction",
+				parentId: "old",
+				timestamp: "0",
+				summary: "summary",
+				firstKeptEntryId: "old",
+				tokensBefore: 10,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`);
+		const manager = await SessionManager.open(sessionFile, SessionManager.explicitDestination("/sessions"), storage);
+		try {
+			manager.setSessionMemoryMode("enabled");
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			manager.branch("root");
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
+			expect(storage.listFilesSync("/sessions", "*.spill.*")).toEqual([]);
+			manager.setSessionMemoryMode("enabled");
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
+			expect(manager.getEntries()).toHaveLength(3);
+			expect(manager.getBranch().map(entry => entry.id)).toEqual(["root"]);
+		} finally {
+			await manager.close();
+		}
+	});
 });
 
 describe("patch-bearing transcript fallback", () => {
