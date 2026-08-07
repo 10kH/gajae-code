@@ -88,7 +88,6 @@ import { classifyNativePublishOutcome, formatNativePublishDiagnostic } from "./i
 import {
 	applyReducerDelta,
 	type BaseAnchor,
-	BoundedDictionaryBuilder,
 	BoundedLabelsPinsStore,
 	type CommittedTail,
 	classifyReopen,
@@ -144,6 +143,7 @@ import type {
 	SessionStorageStat,
 	SessionStorageWriter,
 	SessionStorageWriterCloseState,
+	StagedStreamingWriter,
 	VerifiedSessionDeleteResult,
 	VerifiedSessionDeleteTarget,
 } from "./session-storage";
@@ -247,13 +247,42 @@ interface ResidentTransitionInput {
 
 class PreparedResidentStoreTransition {
 	#active = true;
+	#entries: FileEntry[] | undefined;
+	#store: BlobStore | undefined;
+	#index: PreparedSessionIndex | undefined;
 
 	constructor(
-		readonly entries: FileEntry[],
-		readonly store: BlobStore,
-		readonly index: PreparedSessionIndex,
+		entries: FileEntry[],
+		store: BlobStore,
+		index: PreparedSessionIndex,
 		private readonly ownsStore: boolean,
-	) {}
+	) {
+		this.#entries = entries;
+		this.#store = store;
+		this.#index = index;
+	}
+
+	get entries(): FileEntry[] {
+		if (!this.#entries) throw new Error("resident_transition_released");
+		return this.#entries;
+	}
+
+	get store(): BlobStore {
+		if (!this.#store) throw new Error("resident_transition_released");
+		return this.#store;
+	}
+
+	get index(): PreparedSessionIndex {
+		if (!this.#index) throw new Error("resident_transition_released");
+		return this.#index;
+	}
+
+	releaseReferences(): void {
+		if (this.#active) throw new Error("resident_transition_still_active");
+		this.#entries = undefined;
+		this.#store = undefined;
+		this.#index = undefined;
+	}
 
 	dispose(): void {
 		if (!this.#active) return;
@@ -1137,17 +1166,38 @@ export interface StrictSessionOpenFailure {
 	size?: number;
 }
 
-/** Exact transcript bytes and authority captured from one descriptor-bound read. */
-export interface CapturedSessionTranscriptSnapshot {
-	sourcePath: string;
-	identity: ResumeSessionIdentity;
-	content: Uint8Array;
-	storage: SessionStorage;
+/**
+ * Descriptor-bound strict-capture handle. Bounded recorded-length range reads
+ * revalidate the live source against the captured identity on every pass; no
+ * whole-transcript buffer is ever materialized by capture or fork.
+ */
+export interface TranscriptSnapshotHandle {
+	readonly sourcePath: string;
+	readonly identity: ResumeSessionIdentity;
+	readonly storage: SessionStorage;
+	/**
+	 * Iterate every transcript line in bounded recorded-length reads. Each line
+	 * is delivered without its trailing newline; returning `false` aborts the
+	 * pass. A completed pass re-validates the running content hash against the
+	 * captured identity and throws `identity-mismatch` on divergence.
+	 */
+	forEachLine(callback: (line: Uint8Array) => boolean | undefined): boolean;
+	/** Revalidate the live source against the captured identity (bounded). */
+	revalidate(): { kind: "valid" } | StrictSessionOpenFailure;
+	/** Idempotent close; subsequent reads throw. */
+	close(): void;
+	/**
+	 * Rehydrate the full transcript bytes for bounded-full-return consumers.
+	 * This is an explicit compatibility escape hatch, never used by fork/capture
+	 * publication itself.
+	 */
+	materialize(): Uint8Array;
 }
 
-export type StrictSessionCaptureResult =
-	| { kind: "captured"; snapshot: CapturedSessionTranscriptSnapshot }
-	| ResumeTailError;
+/** @deprecated Use {@link TranscriptSnapshotHandle}; retained for call-site compatibility. */
+export type CapturedSessionTranscriptSnapshot = TranscriptSnapshotHandle;
+
+export type StrictSessionCaptureResult = { kind: "captured"; snapshot: TranscriptSnapshotHandle } | ResumeTailError;
 
 export type StrictSessionForkResult = { kind: "forked"; manager: SessionManager } | StrictSessionOpenFailure;
 
@@ -1475,34 +1525,7 @@ function isSupportedSessionVersion(version: unknown): boolean {
 /** Exported for compaction.test.ts */
 export function parseSessionEntries(content: string): FileEntry[] {
 	const records = parseJsonlLenient<FileEntry | SessionPatchRecord>(content);
-	const rawHeader = records.find((record): record is SessionHeader => record.type === "session");
-	if (!isSupportedSessionVersion(rawHeader?.version)) {
-		throw new Error(`Unsupported session version: ${String(rawHeader?.version)}`);
-	}
-	const entries: FileEntry[] = [];
-	const entriesById = new Map<string, SessionEntry>();
-	let header: SessionHeader | undefined;
-
-	for (const record of records) {
-		// Patch records are valid in v4 and v5 only. Ignore patches before a valid
-		// header so malformed prefixes cannot affect later records.
-		if (record.type === "header_patch") {
-			if (header?.version !== undefined && header.version >= 4 && isHeaderPatchRecord(record))
-				applyHeaderPatch(header, record.patch);
-			continue;
-		}
-		if (record.type === "entry_patch") {
-			if (header?.version !== undefined && header.version >= 4 && isEntryPatchRecord(record)) {
-				const entry = entriesById.get(record.entryId);
-				if (entry?.type === "message" && record.patch.message) entry.message = record.patch.message;
-			}
-			continue;
-		}
-		entries.push(record);
-		if (record.type === "session") header ??= record;
-		else entriesById.set(record.id, record);
-	}
-	return entries;
+	return buildFileEntriesFromRecords(records);
 }
 
 function isHeaderPatchRecord(record: SessionPatchRecord): record is HeaderPatchRecord {
@@ -2003,26 +2026,21 @@ type ForkTranscriptPublication =
 			readonly kind: "managed";
 			readonly store: ManagedSessionDescendantStore;
 			readonly relativePath: string;
-			/** Bytes successfully installed by no-replace publication. */
-			readonly publishedBytes: Buffer;
-			/** Absent only while post-publication identity capture is failing. */
-			readonly snapshot?: ManagedFileSnapshot;
+			readonly sessionFile: string;
+			/** SHA-256 of the bytes installed by no-replace publication. */
+			readonly publishedSha256: string;
 	  }
 	| {
 			readonly kind: "explicit-file";
 			readonly sessionFile: string;
-			/** Bytes successfully installed by no-replace publication. */
-			readonly publishedBytes: Buffer;
-			/** Absent only while post-publication identity capture is failing. */
-			readonly snapshot?: ManagedFileSnapshot;
+			/** SHA-256 of the bytes installed by no-replace publication. */
+			readonly publishedSha256: string;
 	  }
 	| {
 			readonly kind: "explicit-storage";
 			readonly sessionFile: string;
-			/** Bytes successfully installed by transcript publication. */
-			readonly publishedBytes: Buffer;
-			/** Absent only while post-publication identity capture is failing. */
-			readonly snapshot?: SessionStorageSnapshot;
+			/** SHA-256 of the bytes installed by transcript publication. */
+			readonly publishedSha256: string;
 	  };
 
 function pruneResidentCacheEntries(snapshot: native.NativeDirectoryTreeSnapshot): native.NativeDirectoryTreeSnapshot {
@@ -2391,10 +2409,6 @@ function sameResumeStat(left: SessionStorageStat, right: SessionStorageStat): bo
 	);
 }
 
-function sameSessionStorageSnapshot(left: SessionStorageSnapshot, right: SessionStorageSnapshot): boolean {
-	return sameResumeStat(left.stat, right.stat) && Buffer.from(left.bytes).equals(Buffer.from(right.bytes));
-}
-
 interface ResumeInspectionSnapshot {
 	identity: ResumeSessionIdentity;
 	content: Uint8Array;
@@ -2605,6 +2619,303 @@ function inspectResumeSessionFile(
 		}
 		return { kind: "error", reason: "malformed" };
 	}
+}
+export const TRANSCRIPT_CAPTURE_CHUNK_BYTES = 64 * 1024;
+const TRANSCRIPT_LINE_TERMINATOR = Buffer.from("\n", "utf8");
+
+interface BoundedTranscriptInspection {
+	identity: ResumeSessionIdentity;
+}
+
+/**
+ * Bounded strict transcript inspection that never materializes the whole file.
+ * Header and identity are derived from descriptor-validated range reads; the
+ * running content hash covers the exact captured bytes.
+ */
+function inspectTranscriptBounded(
+	filePath: string,
+	storage: SessionStorage,
+): { ok: true; inspection: BoundedTranscriptInspection } | { ok: false; error: ResumeTailError } {
+	const canonicalPath = resolveEquivalentPath(path.resolve(filePath));
+	let before: SessionStorageStat;
+	try {
+		before = storage.statSync(canonicalPath);
+	} catch (error) {
+		return { ok: false, error: resumeReadFailure(error, storage, canonicalPath) };
+	}
+	if (!before.isFile || typeof storage.readRangeSync !== "function") {
+		return { ok: false, error: { kind: "error", reason: "read-failed" } };
+	}
+	if (before.size > RESUME_TRANSCRIPT_MAX_BYTES) {
+		return { ok: false, error: { kind: "error", reason: "oversized", size: before.size } };
+	}
+
+	const hash = crypto.createHash("sha256");
+	const decoder = new TextDecoder("utf-8", { fatal: true });
+	let carry = "";
+	let sessionId: string | undefined;
+	try {
+		for (let offset = 0; offset < before.size; offset += TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
+			const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, before.size - offset);
+			const chunk = storage.readRangeSync(canonicalPath, offset, length).bytes;
+			hash.update(chunk);
+			const text = decoder.decode(chunk, { stream: offset + length < before.size });
+			const combined = carry + text;
+			const lines = combined.split("\n");
+			carry = lines.pop() ?? "";
+			for (const line of lines) {
+				if (line.length === 0) continue;
+				const parsed = JSON.parse(line) as SessionHeader;
+				if (sessionId === undefined) {
+					if (parsed.type !== "session" || typeof parsed.id !== "string")
+						return { ok: false, error: { kind: "error", reason: "malformed" } };
+					sessionId = parsed.id;
+				}
+			}
+		}
+	} catch {
+		return { ok: false, error: { kind: "error", reason: "malformed" } };
+	}
+	if (sessionId === undefined) return { ok: false, error: { kind: "error", reason: "malformed" } };
+
+	let after: SessionStorageStat;
+	try {
+		after = storage.statSync(canonicalPath);
+	} catch (error) {
+		return { ok: false, error: resumeReadFailure(error, storage, canonicalPath) };
+	}
+	if (!sameResumeStat(before, after)) return { ok: false, error: { kind: "error", reason: "unstable" } };
+
+	const identity: ResumeSessionIdentity = {
+		canonicalPath,
+		sessionId,
+		dev: before.dev,
+		ino: before.ino,
+		nlink: before.nlink,
+		size: before.size,
+		mtimeMs: before.mtimeMs,
+		mtimeNs: before.mtimeNs,
+		ctimeNs: before.ctimeNs,
+		sha256: hash.digest("hex"),
+	};
+	return { ok: true, inspection: { identity } };
+}
+
+/** Bounded source revalidation comparing the live file to a captured identity. */
+function revalidateTranscriptIdentityBounded(
+	filePath: string,
+	storage: SessionStorage,
+	expected: ResumeSessionIdentity,
+): { kind: "valid" } | StrictSessionOpenFailure {
+	const canonicalPath = resolveEquivalentPath(path.resolve(filePath));
+	let before: SessionStorageStat;
+	try {
+		before = storage.statSync(canonicalPath);
+	} catch (error) {
+		return resumeReadFailure(error, storage, canonicalPath);
+	}
+	if (!before.isFile || typeof storage.readRangeSync !== "function") {
+		return { kind: "error", reason: "read-failed" };
+	}
+	if (before.size !== expected.size) return { kind: "error", reason: "identity-mismatch" };
+	const hash = crypto.createHash("sha256");
+	try {
+		for (let offset = 0; offset < before.size; offset += TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
+			const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, before.size - offset);
+			hash.update(storage.readRangeSync(canonicalPath, offset, length).bytes);
+		}
+	} catch (error) {
+		return resumeReadFailure(error, storage, canonicalPath);
+	}
+	let after: SessionStorageStat;
+	try {
+		after = storage.statSync(canonicalPath);
+	} catch (error) {
+		return resumeReadFailure(error, storage, canonicalPath);
+	}
+	if (!sameResumeStat(before, after)) return { kind: "error", reason: "unstable" };
+	const observed: ResumeSessionIdentity = {
+		canonicalPath,
+		sessionId: expected.sessionId,
+		dev: before.dev,
+		ino: before.ino,
+		nlink: before.nlink,
+		size: before.size,
+		mtimeMs: before.mtimeMs,
+		mtimeNs: before.mtimeNs,
+		ctimeNs: before.ctimeNs,
+		sha256: hash.digest("hex"),
+	};
+	return sameResumeIdentity(expected, observed) ? { kind: "valid" } : { kind: "error", reason: "identity-mismatch" };
+}
+
+function createTranscriptSnapshotHandle(
+	inspection: BoundedTranscriptInspection,
+	filePath: string,
+	storage: SessionStorage,
+): TranscriptSnapshotHandle {
+	const canonicalPath = inspection.identity.canonicalPath;
+	const size = inspection.identity.size;
+	const readRangeSync = storage.readRangeSync?.bind(storage);
+	if (!readRangeSync) throw new Error("bounded_range_read_unavailable");
+	let closed = false;
+
+	const readAllLines = (callback: (line: Uint8Array) => boolean | undefined): boolean => {
+		if (closed) throw new Error("transcript_handle_closed");
+		const hash = crypto.createHash("sha256");
+		const decoder = new TextDecoder("utf-8", { fatal: true });
+		let carry = "";
+		let aborted = false;
+		for (let offset = 0; offset < size; offset += TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
+			const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, size - offset);
+			const chunk = readRangeSync(canonicalPath, offset, length).bytes;
+			hash.update(chunk);
+			const text = decoder.decode(chunk, { stream: offset + length < size });
+			const combined = carry + text;
+			const lines = combined.split("\n");
+			carry = lines.pop() ?? "";
+			for (const line of lines) {
+				if (line.length === 0) continue;
+				const result = callback(Buffer.from(line, "utf8"));
+				if (result === false) {
+					aborted = true;
+					break;
+				}
+			}
+			if (aborted) break;
+		}
+		if (!aborted && carry.length > 0) {
+			const result = callback(Buffer.from(carry, "utf8"));
+			if (result === false) aborted = true;
+		}
+		if (hash.digest("hex") !== inspection.identity.sha256) throw new Error("identity-mismatch");
+		return !aborted;
+	};
+
+	return {
+		sourcePath: path.resolve(filePath),
+		identity: inspection.identity,
+		storage,
+		forEachLine: readAllLines,
+		revalidate(): { kind: "valid" } | StrictSessionOpenFailure {
+			if (closed) throw new Error("transcript_handle_closed");
+			return revalidateTranscriptIdentityBounded(canonicalPath, storage, inspection.identity);
+		},
+		close(): void {
+			closed = true;
+		},
+		materialize(): Uint8Array {
+			if (closed) throw new Error("transcript_handle_closed");
+			if (size > SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES - TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
+				throw new SessionContextTooLargeError(size, SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES);
+			}
+			const output = Buffer.allocUnsafe(size);
+			for (let offset = 0; offset < size; offset += TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
+				const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, size - offset);
+				Buffer.from(readRangeSync(canonicalPath, offset, length).bytes).copy(output, offset);
+			}
+			return output;
+		},
+	};
+}
+
+/**
+ * Apply header/entry patch records to a parsed record array. Mirrors the
+ * record-processing tail of {@link parseSessionEntries} so bounded fork parsing
+ * never needs to reconstruct a whole-transcript string.
+ */
+function buildFileEntriesFromRecords(records: Array<FileEntry | SessionPatchRecord>): FileEntry[] {
+	const rawHeader = records.find((record): record is SessionHeader => record.type === "session");
+	if (!isSupportedSessionVersion(rawHeader?.version)) {
+		throw new Error(`Unsupported session version: ${String(rawHeader?.version)}`);
+	}
+	const entries: FileEntry[] = [];
+	const entriesById = new Map<string, SessionEntry>();
+	let header: SessionHeader | undefined;
+	for (const record of records) {
+		if (record.type === "header_patch") {
+			if (header?.version !== undefined && header.version >= 4 && isHeaderPatchRecord(record))
+				applyHeaderPatch(header, record.patch);
+			continue;
+		}
+		if (record.type === "entry_patch") {
+			if (header?.version !== undefined && header.version >= 4 && isEntryPatchRecord(record)) {
+				const entry = entriesById.get(record.entryId);
+				if (entry?.type === "message" && record.patch.message) entry.message = record.patch.message;
+			}
+			continue;
+		}
+		entries.push(record);
+		if (record.type === "session") header ??= record;
+		else entriesById.set(record.id, record);
+	}
+	return entries;
+}
+
+/**
+ * Publish a fork transcript through the storage staged writer in bounded
+ * passes. Each entry is serialized independently (no whole-transcript
+ * string/Buffer) and installed with no-replace publication. Returns the
+ * SHA-256 of the exact bytes published for post-publication verification.
+ */
+function publishForkTranscriptStreaming(
+	storage: SessionStorage,
+	sessionFile: string,
+	destination: SessionDestination,
+	entries: readonly FileEntry[],
+	persist: (entry: FileEntry) => FileEntry,
+): string {
+	if (typeof storage.openStagedWriter !== "function") throw new Error("fork_publication_storage_unsupported");
+	const staged: StagedStreamingWriter = storage.openStagedWriter(sessionFile, {
+		securityContext: destination.kind === "managed" ? destination.securityContext : undefined,
+	});
+	const hash = crypto.createHash("sha256");
+	try {
+		for (const entry of entries) {
+			const persisted = persist(entry);
+			const line = Buffer.from(JSON.stringify(persisted), "utf8");
+			staged.writeLine(line);
+			hash.update(line);
+			hash.update(TRANSCRIPT_LINE_TERMINATOR);
+		}
+		staged.fsync();
+		staged.closeSync();
+		staged.publishNoReplace();
+	} catch (error) {
+		try {
+			staged.closeSync();
+		} catch {
+			// Preserve the primary publication failure.
+		}
+		throw error;
+	}
+	return hash.digest("hex");
+}
+
+/** Bounded read-back verification that an installed fork transcript matches the intended bytes. */
+function verifyForkTranscriptPublishedBounded(
+	storage: SessionStorage,
+	sessionFile: string,
+	expectedSha256: string,
+): void {
+	const readRangeSync = storage.readRangeSync?.bind(storage);
+	if (!readRangeSync) throw new Error("bounded_range_read_unavailable");
+	let size: number;
+	try {
+		size = storage.statSync(sessionFile).size;
+	} catch {
+		throw new Error("fork_transcript_changed");
+	}
+	const hash = crypto.createHash("sha256");
+	try {
+		for (let offset = 0; offset < size; offset += TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
+			const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, size - offset);
+			hash.update(readRangeSync(sessionFile, offset, length).bytes);
+		}
+	} catch {
+		throw new Error("fork_transcript_changed");
+	}
+	if (hash.digest("hex") !== expectedSha256) throw new Error("fork_transcript_changed");
 }
 
 function fsyncResumeSessionIdentity(expected: ResumeSessionIdentity): void {
@@ -5455,46 +5766,27 @@ export class SessionManager {
 
 	async #cleanupForkTranscriptPublication(publication: ForkTranscriptPublication): Promise<void> {
 		if (publication.kind === "managed") {
-			const snapshot = publication.snapshot ?? publication.store.readExpected(publication.relativePath);
+			const snapshot = publication.store.readExpected(publication.relativePath);
 			if (!snapshot) return;
-			if (!snapshot.bytes.equals(publication.publishedBytes)) throw new Error("fork_transcript_changed");
+			if (snapshot.identity.sha256 !== publication.publishedSha256) throw new Error("fork_transcript_changed");
 			publication.store.removeExpected(publication.relativePath, snapshot);
 			return;
 		}
 		if (publication.kind === "explicit-storage") {
-			if (publication.snapshot) {
-				const current = this.storage.readSnapshotSync?.(publication.sessionFile);
-				if (
-					!current ||
-					!sameSessionStorageSnapshot(current, publication.snapshot) ||
-					!Buffer.from(current.bytes).equals(publication.publishedBytes)
-				) {
-					throw new Error("fork_transcript_changed");
-				}
-			} else {
-				if (!this.storage.existsSync(publication.sessionFile)) return;
-				const current = Buffer.from(this.storage.readTextSync(publication.sessionFile), "utf8");
-				if (!current.equals(publication.publishedBytes)) throw new Error("fork_transcript_changed");
-			}
+			if (!this.storage.existsSync(publication.sessionFile)) return;
+			verifyForkTranscriptPublishedBounded(this.storage, publication.sessionFile, publication.publishedSha256);
 			await this.storage.unlink(publication.sessionFile);
 			return;
 		}
-		let snapshot = publication.snapshot;
-		if (!snapshot) {
-			try {
-				snapshot = captureManagedFileNoFollow(publication.sessionFile);
-			} catch (error) {
-				if (isEnoent(error)) return;
-				throw error;
-			}
-		}
-		if (!snapshot.bytes.equals(publication.publishedBytes)) throw new Error("fork_transcript_changed");
+		if (!this.storage.existsSync(publication.sessionFile)) return;
+		verifyForkTranscriptPublishedBounded(this.storage, publication.sessionFile, publication.publishedSha256);
+		const named = fs.lstatSync(publication.sessionFile, { bigint: true });
 		const removed = native.exactUnlink(publication.sessionFile, {
-			dev: snapshot.identity.dev,
-			ino: snapshot.identity.ino,
-			size: BigInt(snapshot.identity.size),
-			mtimeNs: snapshot.identity.mtimeNs,
-			sha256: snapshot.identity.sha256,
+			dev: named.dev,
+			ino: named.ino,
+			size: BigInt(named.size),
+			mtimeNs: named.mtimeNs,
+			sha256: publication.publishedSha256,
 			quarantineName: `.gjc-fork-${process.pid}-${crypto.randomUUID()}`,
 		});
 		if (
@@ -5533,8 +5825,9 @@ export class SessionManager {
 
 	#commitResidentTextStoreTransition(prepared: PreparedResidentStoreTransition): void {
 		const predecessor = this.#residentTextBlobStore;
+		const successor = prepared.store;
 		this.#fileEntries = prepared.entries;
-		this.#residentTextBlobStore = prepared.store;
+		this.#residentTextBlobStore = successor;
 		this.#byId = prepared.index.byId;
 		this.#labelsById = prepared.index.labelsById;
 		this.#leafId = prepared.index.leafId;
@@ -5543,7 +5836,8 @@ export class SessionManager {
 		this.#residentBlobRevision++;
 		prepared.adopt();
 		if (this.persist && this.#sessionFile) this.#buildDisposableSidecars(this.#fileEntries);
-		if (predecessor !== prepared.store) this.#disposeResidentTextStore(predecessor);
+		if (predecessor !== successor) this.#disposeResidentTextStore(predecessor);
+		prepared.releaseReferences();
 	}
 
 	#releaseResidentTextStore(): void {
@@ -5915,6 +6209,7 @@ export class SessionManager {
 					prepared.dispose();
 					throw error;
 				}
+				entries.length = 0;
 				if (!options?.deferEphemeralArtifactRetirement) this.#retireEphemeralArtifacts();
 				managedTransition?.settle();
 				this.#pendingStrictAdoption = undefined;
@@ -6614,38 +6909,40 @@ export class SessionManager {
 		let transition: PreparedResidentStoreTransition | undefined;
 		try {
 			forkArtifactPublication = await this.copyArtifactsForFork(oldSessionFile, newSessionFile);
-			const content = `${entries.map(entry => JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))).join("\n")}\n`;
-			const contentBytes = Buffer.from(content, "utf8");
+			// Publish each already-materialized entry through the staged writer without
+			// joining the transcript into another whole-file string/Buffer. Retired cold
+			// history was rehydrated above and is therefore not omitted.
+			const publishedSha256 = publishForkTranscriptStreaming(
+				this.storage,
+				newSessionFile,
+				this.destination,
+				entries,
+				entry => prepareEntryForPersistenceSync(entry, this.#blobStore),
+			);
 			if (this.destination.kind === "managed") {
 				const store = this.#managedTranscriptStore(newSessionFile);
 				const relativePath = path.basename(newSessionFile);
-				await store.publishNoReplace(relativePath, contentBytes);
-				const publication = { kind: "managed" as const, store, relativePath, publishedBytes: contentBytes };
-				forkTranscriptPublication = publication;
 				const snapshot = store.readExpected(relativePath);
 				if (!snapshot) throw new Error("managed_fork_transcript_publish_missing");
-				forkTranscriptPublication = { ...publication, snapshot };
+				forkTranscriptPublication = {
+					kind: "managed",
+					store,
+					relativePath,
+					sessionFile: newSessionFile,
+					publishedSha256: snapshot.identity.sha256,
+				};
 			} else if (this.storage instanceof FileSessionStorage) {
-				await writeOwnerOnlyFileNoReplace(newSessionFile, content);
-				const publication = {
-					kind: "explicit-file" as const,
+				forkTranscriptPublication = {
+					kind: "explicit-file",
 					sessionFile: newSessionFile,
-					publishedBytes: contentBytes,
+					publishedSha256,
 				};
-				forkTranscriptPublication = publication;
-				forkTranscriptPublication = { ...publication, snapshot: captureManagedFileNoFollow(newSessionFile) };
 			} else {
-				if (this.storage.existsSync(newSessionFile)) throw new Error("destination_conflict");
-				await this.storage.writeText(newSessionFile, content);
-				const publication = {
-					kind: "explicit-storage" as const,
+				forkTranscriptPublication = {
+					kind: "explicit-storage",
 					sessionFile: newSessionFile,
-					publishedBytes: contentBytes,
+					publishedSha256,
 				};
-				forkTranscriptPublication = publication;
-				const snapshot = this.storage.readSnapshotSync?.(newSessionFile);
-				if (!snapshot) throw new Error("fork_transcript_identity_unavailable");
-				forkTranscriptPublication = { ...publication, snapshot };
 			}
 			if (forkArtifactPublication?.kind === "managed") {
 				forkArtifactPublication.store.verifyRootSecurity();
@@ -6665,13 +6962,12 @@ export class SessionManager {
 			}
 
 			if (forkTranscriptPublication?.kind === "managed") {
-				const snapshot = forkTranscriptPublication.snapshot;
 				const terminalTranscript = forkTranscriptPublication.store.readExpected(
 					forkTranscriptPublication.relativePath,
 				);
 				if (
-					!snapshot?.bytes.equals(forkTranscriptPublication.publishedBytes) ||
-					!managedFileSnapshotEquals(terminalTranscript, snapshot ?? null)
+					!terminalTranscript ||
+					terminalTranscript.identity.sha256 !== forkTranscriptPublication.publishedSha256
 				) {
 					throw new Error("managed_fork_transcript_changed");
 				}
@@ -7811,13 +8107,28 @@ export class SessionManager {
 		if (!latestCompaction) return;
 		const tailStartOrdinal = sessionEntries.findIndex(entry => entry.id === latestCompaction.firstKeptEntryId);
 		if (tailStartOrdinal < 0) return;
-		const activePathIds = new Set<string>();
-		const visited = new Set<string>();
 		let active = this.#leafId ? this.#byId.get(this.#leafId) : undefined;
-		while (active && !visited.has(active.id)) {
-			visited.add(active.id);
-			activePathIds.add(active.id);
+		let activeSteps = 0;
+		while (active && activeSteps <= sessionEntries.length) {
+			const ordinal = sessionEntries.length - activeSteps - 1;
+			if (active.type === "model_change" && runtime.reducer.modelChange.latest === undefined) {
+				runtime.reducer = applyReducerDelta(runtime.reducer, {
+					kind: "latest_model_change",
+					ordinal,
+					role: active.role,
+				});
+			} else if (active.type === "ttsr_injection" && runtime.reducer.ttsr.largestOrdinal < 0) {
+				runtime.reducer = applyReducerDelta(runtime.reducer, {
+					kind: "ttsr_injection",
+					ordinal,
+					rulesCount: active.injectedRules.length,
+					recordsCount: active.injectedRuleRecords?.length ?? 0,
+					count: active.ttsrMessageCount ?? 0,
+				});
+			}
+			if (runtime.reducer.modelChange.latest !== undefined && runtime.reducer.ttsr.largestOrdinal >= 0) break;
 			active = active.parentId ? this.#byId.get(active.parentId) : undefined;
+			activeSteps++;
 		}
 		const header = entries.find((entry): entry is SessionHeader => entry.type === "session");
 		const headerBytes = header
@@ -7832,10 +8143,11 @@ export class SessionManager {
 			baseEndOffset += persistedLine.byteLength;
 		}
 		const baseDigest = baseHash.digest("hex");
-		const dictionary = new BoundedDictionaryBuilder({
-			partitionBufferBytes: 1024 * 1024,
-			bucketJournalBytes: 1024 * 1024,
-		});
+		const hasDuplicateIds = sessionEntries.some(entry => this.#byId.get(entry.id) !== entry);
+		if (hasDuplicateIds) {
+			runtime.sidecarIneligible = true;
+			return;
+		}
 		const tailBuilder = new RollingTailChainBuilder({ baseDigest, baseEndOffset });
 		const indexWriter = this.storage.openWriter(runtime.indexPath, { flags: "w" });
 		const tailWriter = this.storage.openWriter(runtime.tailPath, { flags: "w" });
@@ -7847,27 +8159,6 @@ export class SessionManager {
 				const entry = sessionEntries[ordinal];
 				const persistedLine = Buffer.concat([this.#serializeEntryLine(entry), Buffer.from("\n")]);
 				const recordDigest = computeLineDigest(persistedLine);
-				if (dictionary.add({ ordinal, id: entry.id, bytes: Buffer.from(entry.id, "utf8") }).kind !== "ok") {
-					buildFailed = true;
-					break;
-				}
-				if (activePathIds.has(entry.id)) {
-					if (entry.type === "model_change") {
-						runtime.reducer = applyReducerDelta(runtime.reducer, {
-							kind: "latest_model_change",
-							ordinal,
-							role: entry.role,
-						});
-					} else if (entry.type === "ttsr_injection") {
-						runtime.reducer = applyReducerDelta(runtime.reducer, {
-							kind: "ttsr_injection",
-							ordinal,
-							rulesCount: entry.injectedRules.length,
-							recordsCount: entry.injectedRuleRecords?.length ?? 0,
-							count: entry.ttsrMessageCount ?? 0,
-						});
-					}
-				}
 				indexWriter.writeLineSync(
 					`${JSON.stringify({
 						id: entry.id,
@@ -7903,15 +8194,13 @@ export class SessionManager {
 			indexWriter.closeSync();
 			tailWriter.closeSync();
 		}
-		const dictionaryResult = dictionary.finish();
 		for (const [id, label] of this.#labelsById) {
 			if (!runtime.labelsPins.setLabel(id, label)) {
 				buildFailed = true;
 				break;
 			}
 		}
-		if (buildFailed || dictionaryResult.kind !== "ok" || dictionaryResult.stats.sidecarIneligible) {
-			runtime.sidecarIneligible = dictionaryResult.kind === "ok" && dictionaryResult.stats.sidecarIneligible;
+		if (buildFailed) {
 			for (const sidecarPath of [runtime.indexPath, runtime.tailPath]) {
 				try {
 					this.storage.unlinkSync(sidecarPath);
@@ -7978,18 +8267,19 @@ export class SessionManager {
 			LABELS_PINS_BUDGET_BYTES +
 			1024 * 1024;
 		if (!runtime.accountant.tryCharge(fixedReservedBytes + retainedBytes)) return 0;
-		const coldIds = new Set(this.#readAllColdEntryIndexes().map(record => record.id));
 		let retired = 0;
 		for (let i = 0; i < firstKeptIndex; i++) {
-			const entry = this.#fileEntries[i];
-			if (entry.type === "session") continue;
-			if (!coldIds.has(entry.id)) continue;
-			this.#byId.delete(entry.id);
-			retired++;
+			if (this.#fileEntries[i].type !== "session") retired++;
 		}
 		this.#fileEntries = this.#fileEntries.filter(
 			(entry, index) => entry.type === "session" || index >= firstKeptIndex,
 		);
+		this.#byId = new Map(
+			this.#fileEntries
+				.filter((entry): entry is SessionEntry => entry.type !== "session")
+				.map(entry => [entry.id, entry]),
+		);
+		this.#resetMaterializedCaches();
 		runtime.hotSuffixBytes = retainedBytes;
 		return retired;
 	}
@@ -8787,9 +9077,10 @@ export class SessionManager {
 		if (captured.kind !== "captured") {
 			throw new Error(`memory_guard_checkpoint_capture_failed:${captured.reason}`);
 		}
-		if (captured.snapshot.content.byteLength > MEMORY_GUARD_CHECKPOINT_FILE_MAX_BYTES)
+		const capturedBytes = captured.snapshot.materialize();
+		if (capturedBytes.byteLength > MEMORY_GUARD_CHECKPOINT_FILE_MAX_BYTES)
 			throw new Error("memory_guard_checkpoint_transcript_capacity_exceeded");
-		const transcriptText = decodeCheckpointUtf8(captured.snapshot.content);
+		const transcriptText = decodeCheckpointUtf8(capturedBytes);
 		if (transcriptText === null) throw new Error("memory_guard_checkpoint_transcript_unreadable");
 		const entries = parseSessionEntries(transcriptText);
 		const sessionId = this.getSessionId();
@@ -8844,7 +9135,7 @@ export class SessionManager {
 			}
 		};
 		await ensureOwnerOnlyDirectory(participantRoot);
-		await publishCheckpointFile(path.join(input.checkpointRoot, transcriptRelativePath), captured.snapshot.content);
+		await publishCheckpointFile(path.join(input.checkpointRoot, transcriptRelativePath), capturedBytes);
 		for (const write of blobWrites)
 			await publishCheckpointFile(
 				path.join(input.checkpointRoot, blobRootRelativePath, write.relativePath),
@@ -8869,7 +9160,7 @@ export class SessionManager {
 			session_id: sessionId,
 			session_name: sessionName,
 			transcript: {
-				bytes: String(captured.snapshot.content.byteLength),
+				bytes: String(capturedBytes.byteLength),
 				relative_path: transcriptRelativePath,
 				sha256: captured.snapshot.identity.sha256,
 			},
@@ -10951,6 +11242,7 @@ export class SessionManager {
 				storage,
 				destination,
 			);
+			entries.length = 0;
 			await manager.#initSessionFile(filePath);
 			manager.buildSessionContext();
 			return manager;
@@ -11128,16 +11420,11 @@ export class SessionManager {
 		filePath: string,
 		storage: SessionStorage = new FileSessionStorage(),
 	): StrictSessionCaptureResult {
-		const inspected = inspectResumeSessionFile(filePath, storage);
-		if ("kind" in inspected) return inspected;
+		const inspected = inspectTranscriptBounded(filePath, storage);
+		if (!inspected.ok) return inspected.error;
 		return {
 			kind: "captured",
-			snapshot: {
-				sourcePath: path.resolve(filePath),
-				identity: inspected.identity,
-				content: Uint8Array.from(inspected.content),
-				storage,
-			},
+			snapshot: createTranscriptSnapshotHandle(inspected.inspection, path.resolve(filePath), storage),
 		};
 	}
 
@@ -11153,31 +11440,31 @@ export class SessionManager {
 		_migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 	): Promise<StrictSessionForkResult> {
 		const destination = destinationFor(cwd, destinationInput, snapshot.storage);
-		if (crypto.createHash("sha256").update(snapshot.content).digest("hex") !== snapshot.identity.sha256) {
-			return { kind: "error", reason: "identity-mismatch" };
-		}
 
+		// Bounded parse: iterate the captured transcript line-by-line (no
+		// whole-file string/Buffer) while re-validating the running content hash
+		// against the captured identity.
 		let forkEntries: FileEntry[] = [];
 		try {
-			const content = new TextDecoder("utf-8", { fatal: true }).decode(snapshot.content);
-			for (const line of content.split(/\r?\n/)) {
-				if (line.length > 0) JSON.parse(line);
-			}
-			forkEntries = parseSessionEntries(content);
+			const records: Array<FileEntry | SessionPatchRecord> = [];
+			snapshot.forEachLine(line => {
+				const text = new TextDecoder("utf-8", { fatal: true }).decode(line);
+				if (text.length === 0) return;
+				records.push(JSON.parse(text) as FileEntry | SessionPatchRecord);
+			});
+			forkEntries = buildFileEntriesFromRecords(records);
 			const sourceHeader = forkEntries[0] as SessionHeader | undefined;
 			if (sourceHeader?.type !== "session" || sourceHeader.id !== snapshot.identity.sessionId)
 				return { kind: "error", reason: "identity-mismatch" };
 			migrateToCurrentVersion(forkEntries);
 			if (!hasStrictSessionSchema(forkEntries)) return { kind: "error", reason: "malformed" };
-		} catch {
+		} catch (error) {
+			if (toError(error).message === "identity-mismatch") return { kind: "error", reason: "identity-mismatch" };
 			return { kind: "error", reason: "malformed" };
 		}
 
-		const revalidated = inspectResumeSessionFile(snapshot.sourcePath, snapshot.storage);
-		if ("kind" in revalidated) return revalidated;
-		if (!sameResumeIdentity(snapshot.identity, revalidated.identity)) {
-			return { kind: "error", reason: "identity-mismatch" };
-		}
+		const revalidated = snapshot.revalidate();
+		if (revalidated.kind !== "valid") return revalidated;
 
 		const dir = destination.directory;
 		const privateStagingDir =
@@ -11217,16 +11504,23 @@ export class SessionManager {
 			manager.#commitResidentTextStoreTransition(transition);
 			manager.#retireEphemeralArtifacts();
 			manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
-			const beforeWrite = inspectResumeSessionFile(snapshot.sourcePath, snapshot.storage);
-			if ("kind" in beforeWrite) {
+			const beforeWrite = snapshot.revalidate();
+			if (beforeWrite.kind !== "valid") {
 				authorityFailure = beforeWrite;
 				throw new Error("Captured fork source authority changed before destination write.");
 			}
-			if (!sameResumeIdentity(snapshot.identity, beforeWrite.identity)) {
-				authorityFailure = { kind: "error", reason: "identity-mismatch" };
-				throw new Error("Captured fork source authority changed before destination write.");
-			}
-			await manager.#rewriteFile();
+			const sessionFile = manager.#sessionFile;
+			if (!sessionFile) throw new Error("fork_transcript_session_file_unavailable");
+			const activeManager = manager;
+			// Publish each already-parsed entry through the staged writer without joining
+			// another whole-file string/Buffer. The parse/resident graph is still the
+			// compatibility path; retired cold history is never omitted.
+			publishForkTranscriptStreaming(snapshot.storage, sessionFile, forkDestination, manager.#fileEntries, entry =>
+				prepareEntryForPersistenceSync(
+					materializeResidentEntryForPersistenceSync(entry, activeManager.#residentBlobStores(), new Map()),
+					activeManager.#blobStore,
+				),
+			);
 			if (privateStagingDir) {
 				const capturedStaging = native.snapshotDirectoryTree(privateStagingDir);
 				if (!capturedStaging.ok || !capturedStaging.snapshot)
@@ -11239,13 +11533,9 @@ export class SessionManager {
 				managedForkTranscript = managedForkStore.readExpected(path.basename(manager.#sessionFile));
 				if (!managedForkTranscript) throw new Error("managed_fork_transcript_publish_missing");
 			}
-			const afterWrite = inspectResumeSessionFile(snapshot.sourcePath, snapshot.storage);
-			if ("kind" in afterWrite) {
+			const afterWrite = snapshot.revalidate();
+			if (afterWrite.kind !== "valid") {
 				authorityFailure = afterWrite;
-				throw new Error("Captured fork source authority changed during destination write.");
-			}
-			if (!sameResumeIdentity(snapshot.identity, afterWrite.identity)) {
-				authorityFailure = { kind: "error", reason: "identity-mismatch" };
 				throw new Error("Captured fork source authority changed during destination write.");
 			}
 			if (managedForkStore && managedForkTranscript && manager.#sessionFile) {

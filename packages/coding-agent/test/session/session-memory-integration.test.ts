@@ -1,8 +1,13 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { TempDir } from "@gajae-code/utils";
 import { SessionManager } from "../../src/session/session-manager";
-import { FileSessionStorage } from "../../src/session/session-storage";
+import {
+	FileSessionStorage,
+	MemorySessionStorage,
+	type StagedStreamingWriter,
+} from "../../src/session/session-storage";
 
 describe("SessionManager cold sidecar integration", () => {
 	it("retires a compacted prefix on resume and lazily reloads exact transcript entries", async () => {
@@ -86,7 +91,7 @@ describe("SessionManager cold sidecar integration", () => {
 		}
 	});
 
-	it("keeps the resident hot region flat for a 60k-entry compacted transcript", async () => {
+	it("keeps the resident hot region flat for a 120k-entry compacted transcript", async () => {
 		const tempDir = TempDir.createSync("@pi-session-memory-60k-");
 		const storage = new FileSessionStorage();
 		const sessionFile = path.join(tempDir.path(), "large.jsonl");
@@ -96,16 +101,23 @@ describe("SessionManager cold sidecar integration", () => {
 			`${JSON.stringify({ type: "session", version: 5, id: "large-session", timestamp: now, cwd: tempDir.path() })}\n`,
 		);
 		let priorId: string | null = null;
-		for (let index = 0; index < 60_000; index++) {
-			const id = `entry-${index.toString().padStart(8, "0")}`;
+		const soak = process.env.GJC_SESSION_MEMORY_SOAK === "1";
+		const entryCount = soak ? 1_000_000 : 120_000;
+		const firstId = soak ? "e0" : "entry-00000000";
+		for (let index = 0; index < entryCount; index++) {
+			const id = soak ? `e${index.toString(36)}` : `entry-${index.toString().padStart(8, "0")}`;
 			writer.writeLineSync(
-				`${JSON.stringify({
-					type: "message",
-					id,
-					parentId: priorId,
-					timestamp: now,
-					message: { role: "user", content: `record-${index}`, timestamp: index },
-				})}\n`,
+				`${JSON.stringify(
+					soak
+						? { type: "custom", id, customType: "x" }
+						: {
+								type: "message",
+								id,
+								parentId: priorId,
+								timestamp: now,
+								message: { role: "user", content: `record-${index}`, timestamp: index },
+							},
+				)}\n`,
 			);
 			priorId = id;
 		}
@@ -136,7 +148,7 @@ describe("SessionManager cold sidecar integration", () => {
 			const accountedBeforeAppend = memoryStats.totalAccountedBytes;
 			manager.appendMessage({ role: "user", content: "post-retirement", timestamp: Date.now() });
 			expect(manager.getSessionMemoryStats().totalAccountedBytes).toBeGreaterThan(accountedBeforeAppend);
-			expect(manager.getEntry("entry-00000000")).toMatchObject({ id: "entry-00000000", type: "message" });
+			expect(manager.getEntry(firstId)).toMatchObject({ id: firstId, type: soak ? "custom" : "message" });
 		} finally {
 			await manager.close();
 			tempDir.removeSync();
@@ -281,5 +293,285 @@ describe("SessionManager cold sidecar integration", () => {
 			await manager.close();
 			tempDir.removeSync();
 		}
+	});
+});
+describe("descriptor-bound capture and staged fork publication", () => {
+	function writeColdTranscript(
+		storage: FileSessionStorage | MemorySessionStorage,
+		sessionFile: string,
+		root: string,
+		entryCount = 60,
+	): { ids: string[]; now: string } {
+		const now = new Date().toISOString();
+		const ids = Array.from({ length: entryCount }, (_, index) => `cold-${index.toString().padStart(4, "0")}`);
+		const entries: Array<Record<string, unknown>> = [
+			{ type: "session", version: 5, id: "fork-source", timestamp: now, cwd: root },
+			...ids.map((id, index) => ({
+				type: "message",
+				id,
+				parentId: index === 0 ? null : ids[index - 1],
+				timestamp: now,
+				message: { role: "user", content: `cold-${index}-${"x".repeat(256)}`, timestamp: index },
+			})),
+			{
+				type: "compaction",
+				id: "fork-compaction",
+				parentId: ids.at(-1),
+				timestamp: now,
+				summary: "summary",
+				firstKeptEntryId: ids.at(-1),
+				tokensBefore: 10_000,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`);
+		return { ids, now };
+	}
+
+	it("forks a compacted cold transcript with every entry, fresh identity, and no source-sidecar copying", async () => {
+		const tempDir = TempDir.createSync("@pi-memory-fork-cold-");
+		const storage = new FileSessionStorage();
+		const sessionFile = path.join(tempDir.path(), "source.jsonl");
+		const { ids } = writeColdTranscript(storage, sessionFile, tempDir.path());
+		const source = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination(tempDir.path()),
+			storage,
+		);
+		try {
+			source.setSessionMemoryMode("enabled");
+			expect(storage.existsSync(`${sessionFile}.spill.idx`)).toBe(true);
+			expect(source.hotRetainedMessageCharsForTests()).toBeLessThan(1024);
+
+			const captured = SessionManager.captureTranscriptStrict(sessionFile, storage);
+			expect(captured.kind).toBe("captured");
+			if (captured.kind !== "captured") throw new Error("Expected strict capture");
+			// The descriptor-bound handle must not expose a whole-transcript buffer.
+			expect("content" in captured.snapshot).toBe(false);
+
+			const forked = await SessionManager.forkFromCaptured(
+				captured.snapshot,
+				tempDir.path(),
+				SessionManager.explicitDestination(path.join(tempDir.path(), "forked")),
+			);
+			expect(forked.kind).toBe("forked");
+			if (forked.kind !== "forked") throw new Error("Expected strict fork success");
+			try {
+				expect(forked.manager.getSessionId()).not.toBe("fork-source");
+				expect(forked.manager.getSessionDir()).toBe(path.join(tempDir.path(), "forked"));
+				// 60 messages + 1 compaction, all preserved.
+				expect(forked.manager.getEntries()).toHaveLength(ids.length + 1);
+				expect(forked.manager.getEntry(ids[0])).toMatchObject({ id: ids[0], type: "message" });
+				expect(forked.manager.getEntry(ids.at(-1)!)).toMatchObject({ id: ids.at(-1), type: "message" });
+
+				const forkedSessionFile = forked.manager.getSessionFile();
+				expect(forkedSessionFile).toBeTruthy();
+				if (forkedSessionFile) {
+					// No cold sidecars are copied into the fork destination.
+					const forkSidecars = storage.listFilesSync(path.dirname(forkedSessionFile), "*.spill.*");
+					expect(forkSidecars.every(candidate => candidate.startsWith(`${forkedSessionFile}.spill.`))).toBe(true);
+					const lines = storage
+						.readTextSync(forkedSessionFile)
+						.trimEnd()
+						.split("\n")
+						.map(line => JSON.parse(line) as { id?: string; type?: string });
+					// fresh header + 60 messages + 1 compaction.
+					expect(lines).toHaveLength(ids.length + 2);
+					expect(lines[0]).toMatchObject({ type: "session", id: forked.manager.getSessionId() });
+					expect(lines[0]?.id).not.toBe("fork-source");
+					expect(lines.some(entry => entry.id === ids[0])).toBe(true);
+					expect(lines.some(entry => entry.id === ids.at(-1))).toBe(true);
+					expect(lines.some(entry => entry.id === "fork-compaction")).toBe(true);
+				}
+			} finally {
+				await forked.manager.close();
+			}
+		} finally {
+			await source.close();
+			tempDir.removeSync();
+		}
+	});
+
+	it("publishes through bounded range reads and staged writers without whole-buffer reads", async () => {
+		const tempDir = TempDir.createSync("@pi-memory-fork-bounded-");
+		const storage = new FileSessionStorage();
+		const sessionFile = path.join(tempDir.path(), "source.jsonl");
+		writeColdTranscript(storage, sessionFile, tempDir.path(), 8);
+
+		const readRangeSync = vi.spyOn(storage, "readRangeSync");
+		const openStagedWriter = vi.spyOn(storage, "openStagedWriter");
+		const readSnapshotSync = vi.spyOn(storage, "readSnapshotSync");
+
+		const captured = SessionManager.captureTranscriptStrict(sessionFile, storage);
+		expect(captured.kind).toBe("captured");
+		if (captured.kind !== "captured") throw new Error("Expected strict capture");
+		expect(readSnapshotSync).not.toHaveBeenCalled();
+
+		const forked = await SessionManager.forkFromCaptured(
+			captured.snapshot,
+			tempDir.path(),
+			SessionManager.explicitDestination(path.join(tempDir.path(), "forked-bounded")),
+		);
+		expect(forked.kind).toBe("forked");
+		if (forked.kind !== "forked") throw new Error("Expected strict fork success");
+		try {
+			expect(readRangeSync).toHaveBeenCalled();
+			expect(openStagedWriter).toHaveBeenCalled();
+			expect(readSnapshotSync).not.toHaveBeenCalled();
+		} finally {
+			await forked.manager.close();
+			tempDir.removeSync();
+		}
+	});
+
+	it("rolls back cleanly and removes its private staging directory when source authority changes during publication", async () => {
+		const tempDir = TempDir.createSync("@pi-memory-fork-rollback-");
+		const sourcePath = path.join(tempDir.path(), "source.jsonl");
+		const replacementPath = path.join(tempDir.path(), "replacement.jsonl");
+		const destDir = path.join(tempDir.path(), "dest");
+		const base = new FileSessionStorage();
+		writeColdTranscript(base, sourcePath, tempDir.path(), 4);
+		fs.writeFileSync(
+			replacementPath,
+			`${JSON.stringify({ type: "session", version: 5, id: "replacement", timestamp: new Date().toISOString(), cwd: tempDir.path() })}\n${JSON.stringify({ type: "message", id: "other", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: "other", timestamp: 0 } })}\n`,
+		);
+
+		const storage = new (class extends FileSessionStorage {
+			override openStagedWriter(filePath: string): StagedStreamingWriter {
+				fs.renameSync(replacementPath, sourcePath);
+				return super.openStagedWriter(filePath);
+			}
+		})();
+
+		const captured = SessionManager.captureTranscriptStrict(sourcePath, storage);
+		expect(captured.kind).toBe("captured");
+		if (captured.kind !== "captured") throw new Error("Expected strict capture");
+		expect(
+			await SessionManager.forkFromCaptured(
+				captured.snapshot,
+				tempDir.path(),
+				SessionManager.explicitDestination(destDir),
+			),
+		).toEqual({ kind: "error", reason: "identity-mismatch" });
+		// The private staging directory was removed; the destination was never published.
+		expect(fs.existsSync(destDir)).toBe(false);
+		expect(
+			fs.readdirSync(tempDir.path()).filter(name => name.includes(".fork-staging-") && !name.endsWith(".removing")),
+		).toEqual([]);
+	});
+
+	it("never overwrites existing destination content (no-replace publication)", async () => {
+		const tempDir = TempDir.createSync("@pi-memory-fork-noreplace-");
+		const storage = new FileSessionStorage();
+		const sessionFile = path.join(tempDir.path(), "source.jsonl");
+		writeColdTranscript(storage, sessionFile, tempDir.path(), 4);
+		const destDir = path.join(tempDir.path(), "dest");
+		fs.mkdirSync(destDir);
+		const foreignFile = path.join(destDir, "foreign.jsonl");
+		fs.writeFileSync(foreignFile, `${JSON.stringify({ type: "session", id: "foreign" })}\n`);
+
+		const captured = SessionManager.captureTranscriptStrict(sessionFile, storage);
+		expect(captured.kind).toBe("captured");
+		if (captured.kind !== "captured") throw new Error("Expected strict capture");
+		const forked = await SessionManager.forkFromCaptured(
+			captured.snapshot,
+			tempDir.path(),
+			SessionManager.explicitDestination(destDir),
+		);
+		expect(forked.kind).toBe("forked");
+		if (forked.kind !== "forked") throw new Error("Expected strict fork success");
+		try {
+			// The foreign transcript is preserved byte-for-byte (never overwritten).
+			expect(fs.readFileSync(foreignFile, "utf8")).toBe(`${JSON.stringify({ type: "session", id: "foreign" })}\n`);
+			// The fork added its own fresh session alongside without touching foreign content.
+			const forkedSessionFile = forked.manager.getSessionFile();
+			expect(forkedSessionFile).toBeTruthy();
+			if (forkedSessionFile) {
+				expect(forkedSessionFile).not.toBe(foreignFile);
+				expect(fs.readFileSync(foreignFile, "utf8")).toBe(
+					`${JSON.stringify({ type: "session", id: "foreign" })}\n`,
+				);
+			}
+		} finally {
+			await forked.manager.close();
+			tempDir.removeSync();
+		}
+	});
+
+	it("forks through memory storage with staged-publication parity and no copied sidecars", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/source.jsonl";
+		writeColdTranscript(storage, sessionFile, "/cwd", 12);
+
+		const captured = SessionManager.captureTranscriptStrict(sessionFile, storage);
+		expect(captured.kind).toBe("captured");
+		if (captured.kind !== "captured") throw new Error("Expected strict capture");
+		expect("content" in captured.snapshot).toBe(false);
+		const capturedLines: unknown[] = [];
+		captured.snapshot.forEachLine(line => {
+			capturedLines.push(JSON.parse(Buffer.from(line).toString("utf8")));
+		});
+		expect(capturedLines).toHaveLength(14);
+
+		const forked = await SessionManager.forkFromCaptured(
+			captured.snapshot,
+			"/cwd",
+			SessionManager.explicitDestination("/sessions/forked-memory"),
+		);
+		expect(forked).toMatchObject({ kind: "forked" });
+		if (forked.kind !== "forked") throw new Error("Expected strict fork success");
+		try {
+			expect(forked.manager.getSessionId()).not.toBe("fork-source");
+			expect(forked.manager.getEntries()).toHaveLength(13);
+			const forkedSessionFile = forked.manager.getSessionFile();
+			expect(forkedSessionFile).toContain("/sessions/forked-memory");
+			if (forkedSessionFile) {
+				const lines = storage
+					.readTextSync(forkedSessionFile)
+					.trimEnd()
+					.split("\n")
+					.map(line => JSON.parse(line) as { id?: string });
+				expect(lines).toHaveLength(14);
+				expect(lines.some(entry => entry.id === "cold-0000")).toBe(true);
+			}
+		} finally {
+			await forked.manager.close();
+		}
+	});
+
+	it("preserves a valid final record without a trailing newline and rejects a truncated one", async () => {
+		const storage = new MemorySessionStorage();
+		const sourcePath = "/sessions/no-newline.jsonl";
+		storage.writeTextSync(
+			sourcePath,
+			`${JSON.stringify({ type: "session", version: 5, id: "no-newline", timestamp: "0", cwd: "/cwd" })}\n${JSON.stringify({ type: "custom", id: "final", parentId: null, timestamp: "0", customType: "x" })}`,
+		);
+		const captured = SessionManager.captureTranscriptStrict(sourcePath, storage);
+		expect(captured.kind).toBe("captured");
+		if (captured.kind !== "captured") throw new Error("Expected strict capture");
+		const forked = await SessionManager.forkFromCaptured(
+			captured.snapshot,
+			"/cwd",
+			SessionManager.explicitDestination("/sessions/no-newline-fork"),
+		);
+		expect(forked.kind).toBe("forked");
+		if (forked.kind === "forked") {
+			expect(forked.manager.getEntry("final")).toMatchObject({ id: "final", type: "custom" });
+			await forked.manager.close();
+		}
+
+		storage.writeTextSync(
+			"/sessions/truncated.jsonl",
+			`${JSON.stringify({ type: "session", version: 5, id: "bad", timestamp: "0", cwd: "/cwd" })}\n{"type":`,
+		);
+		const truncated = SessionManager.captureTranscriptStrict("/sessions/truncated.jsonl", storage);
+		expect(truncated.kind).toBe("captured");
+		if (truncated.kind !== "captured") throw new Error("Expected descriptor capture");
+		expect(
+			await SessionManager.forkFromCaptured(
+				truncated.snapshot,
+				"/cwd",
+				SessionManager.explicitDestination("/sessions/truncated-fork"),
+			),
+		).toEqual({ kind: "error", reason: "malformed" });
 	});
 });
