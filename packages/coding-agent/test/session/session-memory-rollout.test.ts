@@ -111,4 +111,25 @@ describe("session memory rollout", () => {
 			await eagerRestart.close();
 		}
 	});
+	it("sweeps orphaned sidecar staging files without deleting active proofs", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/orphan-sweep.jsonl";
+		storage.writeTextSync(sessionFile, transcript("orphan-sweep", "reviewer"));
+		const destination = SessionManager.explicitDestination("/sessions");
+		const built = await SessionManager.open(sessionFile, destination, storage, "copy-retain", "shadow");
+		await built.close();
+		const root = sessionFile.slice(0, -6);
+		const commitPath = `${root}/.session-memory.spill.commit`;
+		const orphans = [
+			`${root}/.session-memory.spill.commit.crash.tmp`,
+			`${root}/.session-memory.spill.capture-crash`,
+			`${root}/.session-memory.spill.fork-crash`,
+			`${root}/.session-memory.spill.overlay-crash`,
+		];
+		for (const orphan of orphans) storage.writeTextSync(orphan, "derived crash debris");
+		const reopened = await SessionManager.open(sessionFile, destination, storage, "copy-retain", "shadow");
+		await reopened.close();
+		expect(orphans.every(orphan => !storage.existsSync(orphan))).toBe(true);
+		expect(storage.existsSync(commitPath)).toBe(true);
+	});
 });

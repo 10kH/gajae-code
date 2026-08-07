@@ -8942,6 +8942,22 @@ export class SessionManager {
 			}
 		}
 		const sidecarRoot = this.#sessionFile?.endsWith(".jsonl") ? this.#sessionFile.slice(0, -6) : this.#sessionFile;
+		if (sidecarRoot) {
+			for (const candidate of this.storage.listFilesSync(sidecarRoot, "*")) {
+				const name = path.basename(candidate);
+				const orphaned =
+					name.endsWith(".tmp") ||
+					name.includes(".spill.capture-") ||
+					name.includes(".spill.fork-") ||
+					name.includes(".spill.overlay-");
+				if (!orphaned || !isDerivedSessionMemoryFile(candidate)) continue;
+				try {
+					this.storage.unlinkSync(candidate);
+				} catch {
+					// Derived crash debris is best-effort cleanup; authoritative startup continues.
+				}
+			}
+		}
 		const runtime: SessionMemorySidecarRuntime = {
 			enabled: false,
 			sidecarIneligible: ineligible,
