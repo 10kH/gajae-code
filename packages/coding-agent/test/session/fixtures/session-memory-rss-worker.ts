@@ -61,11 +61,13 @@ for (let cycle = 0; cycle < cycleCount; cycle++) {
 }
 const stats = manager.getSessionMemoryStats();
 await manager.close();
-fs.rmSync(root, { recursive: true, force: true });
+if (process.env.GJC_SESSION_MEMORY_RSS_KEEP !== "1") fs.rmSync(root, { recursive: true, force: true });
 
 process.stdout.write(
 	`${JSON.stringify({
 		recordCount,
+		root,
+		sessionFile,
 		baseline: baselineRss,
 		eager: eagerRss,
 		retired: retiredRss,

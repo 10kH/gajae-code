@@ -442,6 +442,79 @@ describe("bounded provider context traversal", () => {
 		}
 	});
 });
+
+it("reopens an enabled explicit session from authenticated hot-tail metadata", async () => {
+	class CountingStorage extends MemorySessionStorage {
+		rangeReads = 0;
+		textReads = 0;
+		override readRangeSync(filePath: string, offset: number, length: number) {
+			this.rangeReads++;
+			return super.readRangeSync(filePath, offset, length);
+		}
+		override readText(filePath: string) {
+			this.textReads++;
+			return super.readText(filePath);
+		}
+	}
+	const storage = new CountingStorage();
+	const sessionFile = "/sessions/lazy-reopen.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "lazy-reopen", timestamp: "0", cwd: "/cwd" },
+		{
+			type: "message",
+			id: "old",
+			parentId: null,
+			timestamp: "0",
+			message: { role: "user", content: "old", timestamp: 1 },
+		},
+		{
+			type: "message",
+			id: "kept",
+			parentId: "old",
+			timestamp: "0",
+			message: { role: "user", content: "kept", timestamp: 2 },
+		},
+		{
+			type: "compaction",
+			id: "compaction",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 10,
+		},
+		{
+			type: "message",
+			id: "after",
+			parentId: "compaction",
+			timestamp: "0",
+			message: { role: "user", content: "after", timestamp: 3 },
+		},
+	];
+	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	const initial = await SessionManager.open(sessionFile, SessionManager.explicitDestination("/sessions"), storage);
+	initial.setSessionMemoryMode("enabled");
+	await initial.close();
+	storage.textReads = 0;
+
+	const reopened = await SessionManager.open(
+		sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		storage.rangeReads = 0;
+		expect(reopened.buildSessionContext().messages).toHaveLength(3);
+		expect(storage.rangeReads).toBe(0);
+		expect(storage.textReads).toBe(0);
+		expect(reopened.getEntry("old")).toMatchObject({ id: "old" });
+	} finally {
+		await reopened.close();
+	}
+});
 describe("session memory mode across file transitions", () => {
 	it("reapplies enabled retirement and keeps off transitions sidecar-free", async () => {
 		const storage = new MemorySessionStorage();

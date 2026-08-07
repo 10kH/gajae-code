@@ -722,6 +722,14 @@ export interface SessionMemorySidecarRuntime {
 	terminalTransition: ReopenClassification | undefined;
 	reopenTransition: ReopenClassification | undefined;
 }
+
+interface SessionMemoryCommitContents extends CommitMarkerContents {
+	retirementFirstKeptEntryId?: string;
+	leafId?: string;
+	reducer?: ReducerState;
+	labels?: Array<[string, string]>;
+	usageStatistics?: UsageStatistics;
+}
 /** Map a session entry to its rolling-tail record kind. */
 function tailRecordKindForEntry(entry: SessionEntry): TailRecordKind {
 	switch (entry.type) {
@@ -6026,9 +6034,129 @@ export class SessionManager {
 		);
 	}
 
+	async #tryInitSessionFileFromSidecar(sessionFile: string): Promise<boolean> {
+		if (
+			this.#sessionMemoryMode !== "enabled" ||
+			this.destination.kind === "managed" ||
+			typeof this.storage.readRangeSync !== "function"
+		)
+			return false;
+		this.#sessionFile = sessionFile;
+		const runtime = this.#resetSidecarRuntime();
+		runtime.enabled = true;
+		let initialized = false;
+		try {
+			const commit = this.#readSessionCommitContents();
+			const descriptor = this.#managedDescriptorSnapshotOrNull();
+			if (
+				!commit ||
+				!descriptor ||
+				!commit.retirementFirstKeptEntryId ||
+				!commit.leafId ||
+				!commit.reducer ||
+				!commit.usageStatistics ||
+				!Array.isArray(commit.labels) ||
+				!sameDescriptor(commit.descriptor, descriptor) ||
+				!this.#validateColdBase(commit.base)
+			)
+				return false;
+			const tailSize = this.storage.statSync(runtime.tailPath).size;
+			if (tailSize > runtime.tailCache.budgetBytes) return false;
+			const tailText = Buffer.from(this.storage.readRangeSync(runtime.tailPath, 0, tailSize).bytes).toString("utf8");
+			const records = tailText
+				.split("\n")
+				.filter(Boolean)
+				.map(line => JSON.parse(line) as TailRecord);
+			const validation = validateCommit(commit, records, {
+				descriptor,
+				baseValid: true,
+				tailValid: validateTailChain(commit.base, records).valid,
+				terminalMarkerValid: true,
+			});
+			if (validation.kind !== "valid") return false;
+			const headerWindow = this.storage.readRangeSync(sessionFile, 0, Math.min(descriptor.size, 64 * 1024)).bytes;
+			const headerEnd = headerWindow.indexOf(10);
+			if (headerEnd < 0) return false;
+			const header = JSON.parse(Buffer.from(headerWindow.subarray(0, headerEnd)).toString("utf8")) as SessionHeader;
+			if (header.type !== "session" || header.version !== CURRENT_SESSION_VERSION) return false;
+			const hotEntries: SessionEntry[] = [];
+			for (const record of records) {
+				const line = this.storage.readRangeSync(sessionFile, record.byteOffset, record.byteLength).bytes;
+				if (computeLineDigest(line) !== record.recordDigest) return false;
+				const entry = JSON.parse(Buffer.from(line).toString("utf8")) as SessionEntry;
+				if (entry.id !== record.id || entry.type !== record.type) return false;
+				hotEntries.push(entry);
+			}
+			const entries: FileEntry[] = [header, ...hotEntries];
+			await resolveBlobRefsInEntries(entries, this.#blobStore);
+			const tailResidentBytes = records.reduce(
+				(total, record) =>
+					total + residentRecordBytes(record.id.length + (record.parentId?.length ?? 0) + record.type.length),
+				0,
+			);
+			if (!runtime.tailCache.tryAllocate(tailResidentBytes)) return false;
+			const hotSuffixBytes = records.reduce((total, record) => total + record.byteLength, 0);
+			const fixedReservedBytes =
+				runtime.blockCache.budgetBytes +
+				runtime.entryCache.budgetBytes +
+				runtime.tailCache.budgetBytes +
+				REDUCER_BUDGET_BYTES +
+				LABELS_PINS_BUDGET_BYTES +
+				1024 * 1024;
+			if (!runtime.accountant.tryCharge(fixedReservedBytes + hotSuffixBytes)) return false;
+			for (const [id, label] of commit.labels) if (!runtime.labelsPins.setLabel(id, label)) return false;
+			const prepared = this.#prepareResidentTextStoreTransition(
+				{
+					target: { sessionId: header.id, sessionFile },
+					primary: {
+						mode: "materialize",
+						sourceEntries: entries,
+						sourceStores: { textStore: null, imageStore: this.#residentImageBlobStore },
+						missingPolicy: "placeholder",
+					},
+				},
+				"memory-fallback",
+			);
+			this.#sessionId = header.id;
+			this.#sessionName = header.title;
+			this.#titleSource = header.titleSource;
+			this.#needsFullRewriteOnNextPersist = false;
+			runtime.base = commit.base;
+			runtime.tail = {
+				base: commit.base,
+				records,
+				terminalChecksum: commit.terminalChecksum,
+				terminalSeq: commit.terminalSeq,
+				transcriptSize: commit.transcriptSize,
+			};
+			runtime.retirementFirstKeptEntryId = commit.retirementFirstKeptEntryId;
+			runtime.reducer = commit.reducer;
+			runtime.hotSuffixBytes = hotSuffixBytes;
+			runtime.reopenTransition = { kind: "exact", reason: "descriptor_and_proof_match" };
+			runtime.terminalTransition = runtime.reopenTransition;
+			this.#commitResidentTextStoreTransition(prepared, false);
+			this.#usageStatistics = commit.usageStatistics;
+			this.#flushed = true;
+			this.#ensuredOnDisk = true;
+			initialized = true;
+			return true;
+		} catch {
+			return false;
+		} finally {
+			if (!initialized) {
+				this.#sidecarRuntime = undefined;
+				this.#sessionFile = undefined;
+			}
+		}
+	}
+
 	/** Initialize with a specific session file (used by factory methods). */
 	async #initSessionFile(sessionFile: string): Promise<void> {
 		const resolvedSessionFile = this.storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
+		if (await this.#tryInitSessionFileFromSidecar(resolvedSessionFile)) {
+			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+			return;
+		}
 		const entries = await loadEntriesFromFile(resolvedSessionFile, this.storage);
 		if (entries.length === 0) {
 			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
@@ -7992,10 +8120,11 @@ export class SessionManager {
 	 */
 	#publishSessionCommitMarkerSync(descriptor: SessionStorageStat): void {
 		const sessionFile = this.#sessionFile;
-		if (!sessionFile || this.destination.kind !== "managed") return;
+		if (!sessionFile) return;
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled || runtime.tail.transcriptSize !== descriptor.size) return;
-		const options = { securityContext: this.destination.securityContext };
+		const options =
+			this.destination.kind === "managed" ? { securityContext: this.destination.securityContext } : undefined;
 		this.#withSessionPersistenceFenceSync(() => {
 			const markerPath = `${sessionFile}.spill.commit`;
 			const gen = this.#commitGen + 1;
@@ -8013,6 +8142,11 @@ export class SessionManager {
 				terminalChecksum: runtime.tail.terminalChecksum,
 				terminalSeq: runtime.tail.terminalSeq,
 				transcriptSize: runtime.tail.transcriptSize,
+				retirementFirstKeptEntryId: runtime.retirementFirstKeptEntryId,
+				leafId: this.#leafId,
+				reducer: runtime.reducer,
+				labels: [...runtime.labelsPins.labelsEntries()],
+				usageStatistics: this.#usageStatistics,
 			};
 			const bytes = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
 			try {
@@ -8634,22 +8768,35 @@ export class SessionManager {
 			terminalSeq: seq,
 			transcriptSize: byteOffset + byteLength,
 		};
-		this.#publishCommitMarkerFromCurrentTranscriptSync();
-		runtime.terminalTransition = this.#classifySidecarReopen();
+		if (this.destination.kind === "managed" || entry.type === "compaction") {
+			this.#publishCommitMarkerFromCurrentTranscriptSync();
+			runtime.terminalTransition = this.#classifySidecarReopen();
+		} else {
+			runtime.terminalTransition = { kind: "transcript_ahead", reason: "explicit_append_pending_checkpoint" };
+		}
 		return true;
 	}
 
-	#readSessionCommitContents(): CommitMarkerContents | undefined {
+	#readSessionCommitContents(): SessionMemoryCommitContents | undefined {
 		const markerPath = this.#sidecarRuntime?.commitPath;
-		if (!markerPath || !this.storage.readBytesSync) return undefined;
+		if (!markerPath || !this.storage.readRangeSync) return undefined;
 		try {
-			const value = JSON.parse(Buffer.from(this.storage.readBytesSync(markerPath)).toString("utf8")) as {
+			const markerSize = this.storage.statSync(markerPath).size;
+			if (markerSize > 8 * 1024 * 1024) return undefined;
+			const value = JSON.parse(
+				Buffer.from(this.storage.readRangeSync(markerPath, 0, markerSize).bytes).toString("utf8"),
+			) as {
 				gen?: unknown;
 				descriptor?: Record<string, unknown>;
 				base?: Record<string, unknown>;
 				terminalChecksum?: unknown;
 				terminalSeq?: unknown;
 				transcriptSize?: unknown;
+				retirementFirstKeptEntryId?: unknown;
+				leafId?: unknown;
+				reducer?: unknown;
+				labels?: unknown;
+				usageStatistics?: unknown;
 			};
 			const descriptor = value.descriptor;
 			const base = value.base;
@@ -8683,6 +8830,15 @@ export class SessionManager {
 				terminalChecksum: value.terminalChecksum,
 				terminalSeq: value.terminalSeq,
 				transcriptSize: value.transcriptSize,
+				...(typeof value.retirementFirstKeptEntryId === "string"
+					? { retirementFirstKeptEntryId: value.retirementFirstKeptEntryId }
+					: {}),
+				...(typeof value.leafId === "string" ? { leafId: value.leafId } : {}),
+				...(value.reducer && typeof value.reducer === "object" ? { reducer: value.reducer as ReducerState } : {}),
+				...(Array.isArray(value.labels) ? { labels: value.labels as Array<[string, string]> } : {}),
+				...(value.usageStatistics && typeof value.usageStatistics === "object"
+					? { usageStatistics: value.usageStatistics as UsageStatistics }
+					: {}),
 			};
 		} catch {
 			return undefined;
@@ -8695,7 +8851,7 @@ export class SessionManager {
 		if (!runtime?.enabled || runtime.sidecarIneligible) return { kind: "rebuild", reason: "sidecar_unavailable" };
 		let markerPresent = false;
 		try {
-			markerPresent = readSessionCommitMarkerSync(this.storage, runtime.commitPath).kind === "present";
+			markerPresent = this.storage.existsSync(runtime.commitPath);
 		} catch {
 			return { kind: "rebuild", reason: "commit_marker_read_failed" };
 		}
@@ -10019,6 +10175,8 @@ export class SessionManager {
 			if (this.#coldSidecarActive() && this.#sidecarRuntime) {
 				this.#sidecarRuntime.retirementFirstKeptEntryId = entry.firstKeptEntryId;
 				this.#retireColdEntries();
+				this.#publishCommitMarkerFromCurrentTranscriptSync();
+				this.#sidecarRuntime.terminalTransition = this.#classifySidecarReopen();
 			} else {
 				this.#ensureFullHotView();
 				this.#buildDisposableSidecars(this.#fileEntries);

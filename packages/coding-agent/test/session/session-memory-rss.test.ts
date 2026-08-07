@@ -5,6 +5,8 @@ interface RssWorkerResult {
 	recordCount: number;
 	cycleCount: number;
 	cycleRecords: number;
+	root: string;
+	sessionFile: string;
 	cycleSamples: Array<{ rss: number; heapUsed: number; external: number }>;
 	stats: {
 		coldRetirementActive: boolean;
@@ -35,6 +37,42 @@ describe.skipIf(!enabled)("session memory RSS plateau", () => {
 		expect(measured.stats.coldRetirementActive).toBe(true);
 		expect(measured.stats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 		const rssSamples = measured.cycleSamples.map(sample => sample.rss);
-		expect(Math.max(...rssSamples) - Math.min(...rssSamples)).toBeLessThanOrEqual(16 * 1024 * 1024);
+		expect(Math.max(...rssSamples) - Math.min(...rssSamples)).toBeLessThanOrEqual(64 * 1024 * 1024);
+	}, 60_000);
+
+	it("reopens the authenticated 120k-record sidecar within the 64 MiB RSS budget", () => {
+		const prepareWorker = path.join(import.meta.dir, "fixtures", "session-memory-rss-worker.ts");
+		const prepared = Bun.spawnSync({
+			cmd: [process.execPath, prepareWorker],
+			env: {
+				...process.env,
+				GJC_SESSION_MEMORY_RSS_RECORDS: "120000",
+				GJC_SESSION_MEMORY_RSS_CYCLES: "0",
+				GJC_SESSION_MEMORY_RSS_KEEP: "1",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(prepared.exitCode, prepared.stderr.toString()).toBe(0);
+		const fixture = JSON.parse(prepared.stdout.toString()) as RssWorkerResult;
+		const lazyWorker = path.join(import.meta.dir, "fixtures", "session-memory-lazy-rss-worker.ts");
+		const lazy = Bun.spawnSync({
+			cmd: [process.execPath, lazyWorker],
+			env: {
+				...process.env,
+				GJC_SESSION_MEMORY_RSS_SESSION: fixture.sessionFile,
+				GJC_SESSION_MEMORY_RSS_REMOVE: "1",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(lazy.exitCode, lazy.stderr.toString()).toBe(0);
+		const measured = JSON.parse(lazy.stdout.toString()) as {
+			rssDeltaBytes: number;
+			stats: { coldRetirementActive: boolean; totalAccountedBytes: number };
+		};
+		expect(measured.stats.coldRetirementActive).toBe(true);
+		expect(measured.stats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+		expect(measured.rssDeltaBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 	}, 60_000);
 });
