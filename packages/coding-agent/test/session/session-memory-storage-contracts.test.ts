@@ -4,7 +4,7 @@
  * writers for immutable one-shot destinations, and checked commit-marker
  * create/replace with `missing` vs physically `present` raw/hash expectations.
  */
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
@@ -287,6 +287,77 @@ describe("commit-marker checked create/replace", () => {
 		expect(fs.readdirSync(dir).filter(name => name.endsWith(".tmp"))).toEqual([]);
 	});
 
+	it("file backend: temp fsync failure publishes no marker and leaves no temp debris", async () => {
+		const dir = await makeTempDir("gjc-marker-temp-fsync-");
+		const markerPath = path.join(dir, "session.jsonl.spill.commit");
+		const file = new FileSessionStorage();
+		const fsync = vi.spyOn(fs, "fsyncSync").mockImplementationOnce(() => {
+			throw new Error("injected_temp_fsync_failure");
+		});
+		try {
+			expect(() => createSessionCommitMarkerCheckedSync(file, markerPath, markerBytes(0))).toThrow(
+				"injected_temp_fsync_failure",
+			);
+			expect(readSessionCommitMarkerSync(file, markerPath)).toEqual({ kind: "missing" });
+			expect(fs.readdirSync(dir).filter(name => name.endsWith(".tmp"))).toEqual([]);
+		} finally {
+			fsync.mockRestore();
+		}
+		createSessionCommitMarkerCheckedSync(file, markerPath, markerBytes(1));
+		const recovered = readSessionCommitMarkerSync(file, markerPath);
+		expect(recovered.kind).toBe("present");
+		if (recovered.kind === "present") expect(recovered.rawBytesSha256).toBe(markerHash(markerBytes(1)));
+	});
+
+	it("file backend: directory fsync failure leaves a valid published marker for exact recovery", async () => {
+		if (process.platform === "win32") return;
+		const dir = await makeTempDir("gjc-marker-directory-fsync-");
+		const markerPath = path.join(dir, "session.jsonl.spill.commit");
+		const file = new FileSessionStorage();
+		const realFsync = fs.fsyncSync;
+		let calls = 0;
+		const fsync = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+			calls++;
+			if (calls === 2) throw new Error("injected_directory_fsync_failure");
+			return realFsync(fd);
+		});
+		try {
+			expect(() => createSessionCommitMarkerCheckedSync(file, markerPath, markerBytes(0))).toThrow(
+				"injected_directory_fsync_failure",
+			);
+		} finally {
+			fsync.mockRestore();
+		}
+		const published = readSessionCommitMarkerSync(file, markerPath);
+		expect(published.kind).toBe("present");
+		if (published.kind === "present") expect(published.rawBytesSha256).toBe(markerHash(markerBytes(0)));
+		expect(fs.readdirSync(dir).filter(name => name.endsWith(".tmp"))).toEqual([]);
+	});
+	it("file backend: replacement temp fsync failure preserves the marker and leaves no debris", async () => {
+		const dir = await makeTempDir("gjc-marker-replace-temp-fsync-");
+		const markerPath = path.join(dir, "session.jsonl.spill.commit");
+		const file = new FileSessionStorage();
+		createSessionCommitMarkerCheckedSync(file, markerPath, markerBytes(0));
+		const current = readSessionCommitMarkerSync(file, markerPath);
+		if (current.kind !== "present") throw new Error("Expected a present marker");
+		const fsync = vi.spyOn(fs, "fsyncSync").mockImplementationOnce(() => {
+			throw new Error("injected_replace_temp_fsync_failure");
+		});
+		try {
+			expect(() =>
+				replaceSessionCommitMarkerCheckedSync(file, markerPath, markerBytes(1), {
+					rawBytesSha256: current.rawBytesSha256,
+					descriptorIdentity: current.stat,
+				}),
+			).toThrow("injected_replace_temp_fsync_failure");
+		} finally {
+			fsync.mockRestore();
+		}
+		const retained = readSessionCommitMarkerSync(file, markerPath);
+		expect(retained.kind).toBe("present");
+		if (retained.kind === "present") expect(retained.rawBytesSha256).toBe(current.rawBytesSha256);
+		expect(fs.readdirSync(dir).filter(name => name.endsWith(".tmp"))).toEqual([]);
+	});
 	it("file backend: replace only on exact present raw/hash + descriptor identity match", async () => {
 		const dir = await makeTempDir("gjc-marker-replace-");
 		const markerPath = path.join(dir, "session.jsonl.spill.commit");

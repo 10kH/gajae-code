@@ -771,6 +771,8 @@ function createFileCommitMarkerCheckedSync(
 			0o600,
 		);
 		secureOwnerOnlyFileDescriptor(tempPath, fd, "apply", securityContext);
+		const opened = fs.fstatSync(fd, { bigint: true });
+		stagedIdentity = { dev: opened.dev, ino: opened.ino };
 		let offset = 0;
 		while (offset < bytes.byteLength) offset += fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
 		fs.fsyncSync(fd);
@@ -802,7 +804,7 @@ function createFileCommitMarkerCheckedSync(
 		failure = error;
 	} finally {
 		if (fd !== undefined) fs.closeSync(fd);
-		if (stagedIdentity && (linkPublished || (outcome && mayCleanCurrentStaging(outcome)))) {
+		if (stagedIdentity && (outcome === undefined || linkPublished || mayCleanCurrentStaging(outcome))) {
 			unlinkOwnedStagedSync(tempPath, stagedIdentity);
 		}
 	}
@@ -828,6 +830,7 @@ function replaceFileCommitMarkerCheckedSync(
 	const tempPath = path.join(dir, `.${path.basename(markerPath)}.${randomUUID()}.tmp`);
 	let fd: number | undefined;
 	let staged: fs.BigIntStats | undefined;
+	let stagedIdentity: { dev: bigint; ino: bigint } | undefined;
 	const stagedSha256 = createHash("sha256").update(bytes).digest("hex");
 	let failure: unknown;
 	try {
@@ -837,6 +840,8 @@ function replaceFileCommitMarkerCheckedSync(
 			0o600,
 		);
 		secureOwnerOnlyFileDescriptor(tempPath, fd, "apply", securityContext);
+		const opened = fs.fstatSync(fd, { bigint: true });
+		stagedIdentity = { dev: opened.dev, ino: opened.ino };
 		let offset = 0;
 		while (offset < bytes.byteLength) offset += fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
 		fs.fsyncSync(fd);
@@ -881,6 +886,7 @@ function replaceFileCommitMarkerCheckedSync(
 	} finally {
 		if (fd !== undefined) fs.closeSync(fd);
 		if (staged) unlinkOwnedStagedSync(tempPath, { dev: staged.dev, ino: staged.ino });
+		else if (stagedIdentity) unlinkOwnedStagedSync(tempPath, stagedIdentity);
 	}
 	if (failure !== undefined) throw failure;
 }
