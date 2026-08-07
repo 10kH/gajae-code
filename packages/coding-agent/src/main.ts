@@ -948,6 +948,7 @@ export async function createSessionManager(
 					sessionDestination(),
 					undefined,
 					migrationPolicy,
+					sessionMemoryMode,
 				);
 			}
 		}

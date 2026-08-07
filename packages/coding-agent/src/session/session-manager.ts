@@ -9165,7 +9165,7 @@ export class SessionManager {
 			try {
 				indexWriter?.closeSync();
 			} catch (error) {
-				closeError = error;
+				closeError ??= error;
 			}
 			try {
 				fsyncWriter(tailWriter);
