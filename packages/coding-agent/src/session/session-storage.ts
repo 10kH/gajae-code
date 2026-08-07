@@ -204,6 +204,7 @@ export interface SessionStorageWriter {
 export const STAGED_WRITER_LINE_MAX_BYTES = 64 * 1024 * 1024;
 /** Upper bound for aggregated different-length patches buffered for the publish-time overlay pass. */
 export const STAGED_WRITER_PATCH_LIMIT_BYTES = 8 * 1024 * 1024;
+export const STAGED_WRITER_PATCH_MAX_COUNT = 65_536;
 const STAGED_WRITER_COPY_CHUNK_BYTES = 64 * 1024;
 
 /**
@@ -1144,6 +1145,10 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 				throw this.#recordError(err);
 			}
 			return;
+		}
+		if (this.#pendingPatches.size >= STAGED_WRITER_PATCH_MAX_COUNT) {
+			this.#error = new Error("staged_overlay_capacity_exceeded");
+			throw this.#error;
 		}
 		this.#pendingPatches.set(ordinal, Buffer.from(bytes));
 		this.#pendingPatchBytes += bytes.byteLength;
@@ -2256,6 +2261,10 @@ class MemoryStagedStreamingWriter implements StagedStreamingWriter {
 			this.#pendingPatches.set(ordinal, Buffer.from(bytes));
 			this.#pendingPatchBytes += bytes.byteLength;
 			return;
+		}
+		if (this.#pendingPatches.size >= STAGED_WRITER_PATCH_MAX_COUNT) {
+			this.#error = new Error("staged_overlay_capacity_exceeded");
+			throw this.#error;
 		}
 		this.#pendingPatches.set(ordinal, Buffer.from(bytes));
 		this.#pendingPatchBytes += bytes.byteLength;

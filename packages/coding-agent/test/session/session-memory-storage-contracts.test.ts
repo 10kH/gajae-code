@@ -18,6 +18,7 @@ import {
 	replaceSessionCommitMarkerCheckedSync,
 	SESSION_RANGE_READ_MAX_BYTES,
 	STAGED_WRITER_PATCH_LIMIT_BYTES,
+	STAGED_WRITER_PATCH_MAX_COUNT,
 } from "../../src/session/session-storage";
 
 const temporaryDirectories: string[] = [];
@@ -212,6 +213,18 @@ describe("staged streaming writers (immutable destinations)", () => {
 		writer.writeLine(Buffer.from("seed", "utf8"));
 		const oversized = Buffer.alloc(STAGED_WRITER_PATCH_LIMIT_BYTES + 1, 0x61);
 		expect(() => writer.patchLine(0, oversized)).toThrow("staged_overlay_capacity_exceeded");
+	});
+
+	it("bounded overlay: zero-length patches cannot grow the patch map without limit", () => {
+		const memory = new MemorySessionStorage();
+		const writer = memory.openStagedWriter!("/sessions/patch-count.jsonl");
+		for (let ordinal = 0; ordinal <= STAGED_WRITER_PATCH_MAX_COUNT; ordinal++)
+			writer.writeLine(Buffer.from("x", "utf8"));
+		for (let ordinal = 0; ordinal < STAGED_WRITER_PATCH_MAX_COUNT; ordinal++)
+			writer.patchLine(ordinal, Buffer.alloc(0));
+		expect(() => writer.patchLine(STAGED_WRITER_PATCH_MAX_COUNT, Buffer.alloc(0))).toThrow(
+			"staged_overlay_capacity_exceeded",
+		);
 	});
 });
 
