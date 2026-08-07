@@ -12609,15 +12609,15 @@ export class SessionManager {
 		};
 
 		assertManagedDestinationBound();
-		const inspected = inspectResumeSessionFile(filePath, storage);
-		if ("kind" in inspected) {
-			if (inspected.reason === "missing") return filePath;
-			throw new Error(`Could not inspect managed session: ${inspected.reason}`);
+		const inspectedResult = inspectTranscriptBounded(filePath, storage);
+		if (!inspectedResult.ok) {
+			if (inspectedResult.error.reason === "missing") return filePath;
+			throw new Error(`Could not inspect managed session: ${inspectedResult.error.reason}`);
 		}
+		const inspected = inspectedResult.inspection;
 		if (expectedIdentity && !sameResumeIdentity(expectedIdentity, inspected.identity))
 			throw new Error("Managed session changed before migration authority was adopted.");
-		const header = inspected.entries.find(entry => entry.type === "session") as SessionHeader | undefined;
-		if (!header?.cwd) return filePath;
+		if (!inspected.cwd) return filePath;
 		const sessionsRoot = destination.securityContext.sessionsRoot;
 		const resolvedPath = path.resolve(filePath);
 		const relativeToManagedRoot = path.relative(sessionsRoot, resolvedPath);
@@ -12628,7 +12628,7 @@ export class SessionManager {
 		if (!isManagedPath) return filePath;
 		assertManagedDestinationBound();
 		const resolved = resolveManagedScope({
-			cwd: header.cwd,
+			cwd: inspected.cwd,
 			agentDir: destination.securityContext.agentDir,
 			sessionsRoot,
 		});
@@ -12641,10 +12641,10 @@ export class SessionManager {
 
 		const candidate = listing.owned.find(item => path.resolve(item.path) === resolvedPath);
 		if (!candidate) throw new Error("Session is inside managed storage but is not an authorized managed candidate.");
-		const revalidated = inspectResumeSessionFile(filePath, storage);
+		const revalidated = inspectTranscriptBounded(filePath, storage);
 		if (
-			"kind" in revalidated ||
-			!sameResumeIdentity(inspected.identity, revalidated.identity) ||
+			!revalidated.ok ||
+			!sameResumeIdentity(inspected.identity, revalidated.inspection.identity) ||
 			candidate.identity.dev !== inspected.identity.dev ||
 			candidate.identity.ino !== inspected.identity.ino ||
 			candidate.identity.size !== inspected.identity.size ||
