@@ -13,6 +13,7 @@ import {
 	type NativeExactUnlinkResult,
 	type NativeOwnerOnlySecurityResult,
 	openRecoveryFsRoot,
+	type RecoveryFsIdentity,
 	type RecoveryFsRoot,
 	renameNoReplacePath,
 	repairOwnerOnlyPathSecurityExpected,
@@ -21,6 +22,7 @@ import {
 	verifyOwnerOnlyPathSecurity,
 	verifyOwnerOnlyPathSecurityExpected,
 } from "@gajae-code/natives";
+import type { SessionStorageStat } from "../session-storage";
 import {
 	classifyNativePublishOutcome,
 	formatNativePublishDiagnostic,
@@ -197,6 +199,64 @@ export interface ManagedFileSnapshot {
 		ctimeNs: bigint;
 		sha256: string;
 	};
+}
+/**
+ * Descriptor identity of one managed file object. Deliberately excludes the
+ * content sha256: append receipts must bind the post-operation object without
+ * re-reading the whole payload.
+ */
+export interface ManagedFileIdentity {
+	dev: bigint;
+	ino: bigint;
+	nlink: bigint;
+	size: number;
+	mtimeNs: bigint;
+	ctimeNs: bigint;
+}
+
+/**
+ * Post-operation evidence for one managed append. `descriptor` is the
+ * `SessionStorageStat`-shaped snapshot of the retained/successor object captured
+ * AFTER the append has been synchronized (never a pathname `statSync`); `identity`
+ * carries the same fields as the object identity. The SessionManager feeds
+ * `descriptor` directly into the commit-marker snapshot.
+ */
+export interface ManagedAppendReceipt {
+	descriptor: SessionStorageStat;
+	identity: ManagedFileIdentity;
+}
+
+function managedFileIdentityFromNative(identity: RecoveryFsIdentity): ManagedFileIdentity {
+	return {
+		dev: BigInt(identity.dev),
+		ino: BigInt(identity.ino),
+		nlink: BigInt(identity.nlink),
+		size: Number(identity.size),
+		mtimeNs: BigInt(identity.mtimeNs),
+		ctimeNs: BigInt(identity.ctimeNs),
+	};
+}
+
+function managedAppendReceiptFromIdentity(identity: ManagedFileIdentity): ManagedAppendReceipt {
+	return {
+		identity,
+		descriptor: {
+			dev: identity.dev,
+			ino: identity.ino,
+			nlink: identity.nlink,
+			size: identity.size,
+			mtimeMs: Number(identity.mtimeNs) / 1_000_000,
+			mtimeNs: identity.mtimeNs,
+			ctimeNs: identity.ctimeNs,
+			mtime: new Date(Number(identity.mtimeNs) / 1_000_000),
+			isFile: true,
+		},
+	};
+}
+
+function managedAppendReceiptFromSnapshot(snapshot: ManagedFileSnapshot): ManagedAppendReceipt {
+	const { dev, ino, nlink, size, mtimeNs, ctimeNs } = snapshot.identity;
+	return managedAppendReceiptFromIdentity({ dev, ino, nlink, size, mtimeNs, ctimeNs });
 }
 
 type SerializedReplacementIdentity = {
@@ -1164,15 +1224,16 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 	}
 
-	appendSync(relativePath: string, bytes: Uint8Array): void {
+	appendSync(relativePath: string, bytes: Uint8Array): ManagedAppendReceipt {
 		this.#beforeMutation();
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		const existing = this.readExpected(relativePath);
 		if (!existing) throw new Error("managed_append_missing");
 		if (this.#authority) {
+			const relative = this.#relative(resolved);
 			const appended = this.#authority.appendManaged(
-				this.#relative(resolved),
+				relative,
 				bytes,
 				existing.identity.dev.toString(),
 				existing.identity.ino.toString(),
@@ -1182,8 +1243,13 @@ export class ManagedSessionDescendantStore {
 				existing.identity.sha256,
 			);
 			if (!appended.ok) throw new Error(appended.code ?? "managed_append_failed");
+			// Post-fsync descriptor capture through retained authority: the native append
+			// is synchronous and durable, so the stat reflects the committed object.
+			const stat = this.#authority.stat(relative);
+			if (!stat.ok || !stat.identity) throw new Error(stat.code ?? "managed_append_identity_unavailable");
+			const receipt = managedAppendReceiptFromIdentity(managedFileIdentityFromNative(stat.identity));
 			this.#assertBound();
-			return;
+			return receipt;
 		}
 		// Darwin has no retained native root authority. Do not append in place:
 		// a short write can leave a malformed JSONL tail with no safe recovery
@@ -1197,7 +1263,12 @@ export class ManagedSessionDescendantStore {
 			undefined,
 			existing.identity,
 		);
+		// The successor was secured and revalidated by replaceManagedFileSync; reopen it
+		// no-follow and re-check identity so the receipt binds the committed object.
+		const successor = captureManagedFileNoFollow(resolved);
+		const receipt = managedAppendReceiptFromSnapshot(successor);
 		this.#assertBound();
+		return receipt;
 	}
 
 	#relative(resolved: string): string {

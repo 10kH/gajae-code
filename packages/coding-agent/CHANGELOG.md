@@ -8,6 +8,7 @@
 ### Added
 
 - Added first-class `cline-pass` and `commandcode-goat` provider presets with documented API endpoints, environment-variable credentials, non-hardcoded live model discovery from models.dev and the Command Code Provider API, and prefix-based Claude routing.
+- Bounded-memory cold-session disk offloading is now rollout-ready behind the `sessionMemory` settings namespace. `sessionMemory.mode` (default `"shadow"`) selects `off`/`shadow`/`enabled`: shadow measures and offloads without changing observable session behavior, and canary/default-on are release-channel states, not user-facing enum values. Memory budgets stay fixed implementation constants in the bounded sidecar so the ≤64 MiB steady-state guarantee cannot be invalidated by user-tunable fields; the transcript v5 remains authoritative and derived `.spill.*` sidecars stay disposable. Context materialization is protected by a typed overflow guard (`SessionContextTooLargeError`) with a synchronous measured-bytes preflight. `sessionMemory.contextOverflowRecovery` (default `true`) independently switches the async compact-once overflow recovery path while the synchronous bounded preflight stays always on; sidecar retirement is not default-on in this release.
 
 ### Fixed
 
