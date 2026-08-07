@@ -12901,13 +12901,15 @@ export class AgentSession {
 				}
 			}
 		}
+		const sessionMemory = this.sessionManager.getSessionMemoryStats();
 		return {
 			heapUsedBytes: process.memoryUsage().heapUsed,
 			providerBytes,
 			messageCount: this.state.messages.length,
 			imageBytes,
 			sessionResidentImageBytes: this.sessionManager.getResidentImageBytes(),
-			materializedResidentBytes: this.#streamingEditFileCache.totalBytes,
+			materializedResidentBytes:
+				this.#streamingEditFileCache.totalBytes + sessionMemory.hotRegionBytes + sessionMemory.metaDescriptorBytes,
 			tuiChatChildren: retainedMemory.tuiChatChildren ?? 0,
 			tuiCachedRenderBytes: retainedMemory.tuiCachedRenderBytes ?? 0,
 		};
