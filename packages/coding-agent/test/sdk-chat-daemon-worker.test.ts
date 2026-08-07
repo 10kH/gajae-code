@@ -1294,6 +1294,9 @@ describe("chat daemon worker", () => {
 			server.stop(true);
 		}
 	});
+	// This drives a real broker, production Session SDK host, two endpoint generations,
+	// and a daemon restart. Loaded release shards can spend more than 20s in broker
+	// startup/teardown even though every bounded interaction remains independently asserted.
 	it("routes Slack safe queries through the production Session SDK host across generation and worker restart", async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-slack-production-host-"));
 		const agentDir = path.join(root, ".gjc", "agent");
@@ -1424,5 +1427,5 @@ describe("chat daemon worker", () => {
 		} finally {
 			await host.stop();
 		}
-	}, 20_000);
+	}, 60_000);
 });
