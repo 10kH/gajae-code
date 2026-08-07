@@ -1246,6 +1246,22 @@ it("recovers eagerly when staged selection publication outlives marker publicati
 	} finally {
 		await reopened.close();
 	}
+	const verified = await SessionManager.open(
+		sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		expect(verified.getSessionMemoryStats()).toMatchObject({
+			lazyReopenSucceeded: true,
+			currentCommitTransition: { kind: "exact", reason: "descriptor_and_proof_match" },
+		});
+		expect(verified.getLastModelChangeRole()).toBe("default");
+	} finally {
+		await verified.close();
+	}
 });
 
 describe("malformed transcript sidecar fallback", () => {
@@ -2043,6 +2059,17 @@ describe("managed commit marker classification", () => {
 				});
 			} finally {
 				await repaired.close();
+			}
+			const verified = await SessionManager.open(sessionFile, destination);
+			try {
+				expect(verified.getSessionMemoryStats()).toMatchObject({
+					lazyReopenSucceeded: false,
+					lastReopenTransition: { kind: "exact", reason: "descriptor_and_proof_match" },
+					currentCommitTransition: { kind: "exact", reason: "descriptor_and_proof_match" },
+				});
+				expect(verified.getEntry("crash-window-append")).toMatchObject({ id: "crash-window-append" });
+			} finally {
+				await verified.close();
 			}
 		} finally {
 			await source.close().catch(() => {});
