@@ -69,12 +69,14 @@ if (mode === "recover") {
 
 const manager = await SessionManager.open(sessionFile, destination, storage, "copy-retain", "enabled");
 const killAfterFsync = mode === "crash-after-transcript-fsync" ? 1 : mode === "crash-after-tail-fsync" ? 3 : 0;
-if (killAfterFsync === 0) throw new Error(`Unknown crash mode: ${mode}`);
+const killBeforeFsync = mode === "crash-before-tail-fsync" ? 3 : 0;
+if (killAfterFsync === 0 && killBeforeFsync === 0) throw new Error(`Unknown crash mode: ${mode}`);
 const realFsyncSync = fs.fsyncSync;
 let fsyncCalls = 0;
 vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
-	realFsyncSync(fd);
 	fsyncCalls++;
+	if (fsyncCalls === killBeforeFsync) process.kill(process.pid, "SIGKILL");
+	realFsyncSync(fd);
 	if (fsyncCalls === killAfterFsync) process.kill(process.pid, "SIGKILL");
 });
 manager.appendMessage({ role: "user", content: "durable-before-crash", timestamp: 3 });
