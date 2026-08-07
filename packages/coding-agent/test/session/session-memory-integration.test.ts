@@ -1048,10 +1048,13 @@ describe("descriptor-bound capture and staged fork publication", () => {
 			captured.snapshot,
 			"/cwd",
 			SessionManager.explicitDestination("/sessions/forked-memory"),
+			"copy-retain",
+			"enabled",
 		);
 		expect(forked).toMatchObject({ kind: "forked" });
 		if (forked.kind !== "forked") throw new Error("Expected strict fork success");
 		try {
+			expect(forked.manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
 			expect(forked.manager.getSessionId()).not.toBe("fork-source");
 			expect(forked.manager.getEntries()).toHaveLength(13);
 			const forkedSessionFile = forked.manager.getSessionFile();

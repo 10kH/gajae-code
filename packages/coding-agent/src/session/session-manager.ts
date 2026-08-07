@@ -11944,6 +11944,7 @@ export class SessionManager {
 		cwd: string,
 		destinationInput?: SessionDestinationInput,
 		_migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
+		sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow",
 	): Promise<StrictSessionForkResult> {
 		const destination = destinationFor(cwd, destinationInput, snapshot.storage);
 
@@ -12004,6 +12005,7 @@ export class SessionManager {
 
 		try {
 			manager = new SessionManager(cwd, privateStagingDir ?? dir, true, snapshot.storage, forkDestination);
+			manager.#sessionMemoryMode = sessionMemoryMode;
 			await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
 			const sourceHeader = forkEntries[0] as SessionHeader | undefined;
 			const fresh = manager.#freshSessionState({ parentSession: sourceHeader?.id });
@@ -12116,6 +12118,10 @@ export class SessionManager {
 					finalTransition.dispose();
 					throw error;
 				}
+			}
+			if (manager.#sessionMemoryMode !== "off" && manager.#sessionFile) {
+				manager.#buildDisposableSidecars(manager.#fileEntries);
+				if (manager.#sessionMemoryMode === "enabled") manager.#retireColdEntries();
 			}
 			if (manager.#sessionFile) writeTerminalBreadcrumb(manager.cwd, manager.#sessionFile);
 			return { kind: "forked", manager };
