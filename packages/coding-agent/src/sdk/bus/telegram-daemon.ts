@@ -369,6 +369,10 @@ const BTW_PENDING_TTL_MS = 300_000;
 const PICKER_CALLBACK_PREFIX = "p:";
 const ADOPTION_INTENT_SWEEP_INTERVAL_MS = 60_000;
 const BTW_MAX_PENDING = 256;
+
+/** How long a compensation fence retries a failed topic-registry persist before giving up (40 × 250ms ≈ 10s). */
+const COMPENSATION_FENCE_MAX_ATTEMPTS = 40;
+const COMPENSATION_FENCE_RETRY_DELAY_MS = 250;
 const BTW_SHUTDOWN_JOIN_MS = 1_000;
 const BTW_USAGE_TEXT = "Usage: /btw <question>";
 const BTW_CAPACITY_TEXT = "Too many /btw questions are pending. Wait for one to finish and try again.";
@@ -6323,9 +6327,22 @@ export class TelegramNotificationDaemon {
 			}
 			const logicalSessionId = this.#logicalSessionId(session);
 			if (session.logicalSessionIdTrusted)
-				void this.#renewTopicLease(logicalSessionId).then(renewed => {
-					if (!renewed) this.dropSession(session, "topic_lease_lost");
-				});
+				void this.#renewTopicLease(logicalSessionId).then(
+					renewed => {
+						if (!renewed) this.dropSession(session, "topic_lease_lost");
+					},
+					error => {
+						// A momentarily unavailable shared topic authority must not escape the
+						// heartbeat timer as an unhandled rejection and take the whole daemon
+						// down; report it and let the next heartbeat retry the renewal.
+						logger.warn(
+							`notifications: topic lease renewal failed: ${sanitizeDiagnostic(
+								String(error),
+								this.opts.botToken,
+							)}`,
+						);
+					},
+				);
 			if (session.ws.readyState === WebSocket.OPEN) {
 				const nonce = `${session.sessionId}:${t}:${Math.random().toString(36).slice(2)}`;
 				session.awaitingNonce = nonce;
@@ -8337,8 +8354,8 @@ export class TelegramNotificationDaemon {
 						let accepted = false;
 						try {
 							accepted = await authority.compareAndSet(expectedGeneration, snapshot);
-						} catch {
-							throw new Error("shared topic authority unavailable");
+						} catch (error) {
+							throw new Error("shared topic authority unavailable", { cause: error });
 						}
 						if (accepted) {
 							this.topics.markRegistryPublished(nextGeneration);
@@ -8409,12 +8426,25 @@ export class TelegramNotificationDaemon {
 		if (existing) return await existing;
 		const retry = this.effects.track(
 			(async () => {
-				for (;;) {
+				for (let attempt = 1; ; attempt++) {
 					try {
 						await this.persistTopics();
 						return;
-					} catch {
-						await this.runtime.sleep(250);
+					} catch (error) {
+						if (attempt >= COMPENSATION_FENCE_MAX_ATTEMPTS) {
+							// A shared topic authority that stays unavailable must not keep this
+							// fence spinning every 250ms forever: it churns the registry, and its
+							// pending effect prevents a shutdown from quiescing. Give up and let
+							// the next scan/session pass retry the persist.
+							logger.warn(
+								`notifications: compensation fence gave up after ${attempt} attempts: ${sanitizeDiagnostic(
+									String(error),
+									this.opts.botToken,
+								)}`,
+							);
+							return;
+						}
+						await this.runtime.sleep(COMPENSATION_FENCE_RETRY_DELAY_MS);
 					}
 				}
 			})(),
@@ -8442,15 +8472,15 @@ export class TelegramNotificationDaemon {
 				let accepted = false;
 				try {
 					accepted = await authority.compareAndSet(expectedGeneration, snapshot);
-				} catch {
-					throw new Error("shared topic authority unavailable");
+				} catch (error) {
+					throw new Error("shared topic authority unavailable", { cause: error });
 				}
 				if (!accepted) {
 					let winner: TopicRegistryState | undefined;
 					try {
 						winner = parseTopicRegistryState(await authority.read());
-					} catch {
-						throw new Error("shared topic authority unavailable");
+					} catch (error) {
+						throw new Error("shared topic authority unavailable", { cause: error });
 					}
 					if (!winner) throw new Error("shared topic authority conflict");
 					this.#replaceTopicAuthority(winner);
@@ -8523,8 +8553,8 @@ export class TelegramNotificationDaemon {
 		if (this.opts.topicRegistryAuthority) {
 			try {
 				raw = await this.opts.topicRegistryAuthority.read();
-			} catch {
-				throw new Error("shared topic authority unavailable");
+			} catch (error) {
+				throw new Error("shared topic authority unavailable", { cause: error });
 			}
 			if (!raw) throw new Error("shared topic authority unavailable");
 		}
@@ -12281,7 +12311,21 @@ export class TelegramNotificationDaemon {
 				await this.refreshBotIdentity();
 				await this.registerBotCommands();
 			}
-			await this.loadTopics();
+			try {
+				await this.loadTopics();
+			} catch (error) {
+				// A shared topic authority that is momentarily unavailable at startup must
+				// not kill the daemon before it starts serving: report the failure and
+				// continue with an empty in-memory registry. Connected sessions re-create
+				// their topics through ensureTopic, and later persist passes read the
+				// winner back from the authority (same philosophy as runScan's retry).
+				logger.warn(
+					`notifications: topic registry load failed; continuing with empty registry: ${sanitizeDiagnostic(
+						String(error),
+						this.opts.botToken,
+					)}`,
+				);
+			}
 			if (!this.validationMode()) {
 				await this.loadAdoptionIntents();
 				this.startAdoptionSweepTimer();
