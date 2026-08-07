@@ -14,7 +14,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
+import { Agent, type AgentMessage } from "@gajae-code/agent-core";
 import * as compactionModule from "@gajae-code/agent-core/compaction";
 import { getBundledModel } from "@gajae-code/ai";
 import { TempDir } from "@gajae-code/utils";
@@ -289,7 +289,22 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 		await session.dispose();
 		await makeSession({ "compaction.keepRecentTokens": 1 });
 		appendConversation("seed");
-		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		session.queueDeferredMessageForTests(
+			{
+				role: "custom",
+				customType: "overflow-pending",
+				content: "accepted exactly once",
+				display: false,
+				attribution: "agent",
+				timestamp: Date.now(),
+			},
+			false,
+		);
+		const submitted: AgentMessage[][] = [];
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async (messages, options) => {
+			submitted.push(messages as AgentMessage[]);
+			if (!Array.isArray(options)) options?.onRunAccepted?.();
+		});
 		const realContext = sessionManager.buildSessionContext();
 		const overflow = new SessionContextTooLargeError(70 * 1024 * 1024);
 		const buildSpy = vi
@@ -311,6 +326,11 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 		expect(buildSpy).toHaveBeenCalledTimes(3);
 		expect(compactSpy).toHaveBeenCalledTimes(1);
 		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(submitted).toHaveLength(1);
+		expect(
+			submitted[0]?.filter(message => message.role === "custom" && message.customType === "overflow-pending"),
+		).toHaveLength(1);
+		expect(session.getPendingNextTurnMessagesForTests()).toEqual([]);
 	});
 	it("keeps synchronous overflow protection on while the async recovery switch is disabled", async () => {
 		await session.dispose();
