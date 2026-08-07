@@ -420,6 +420,7 @@ export interface SessionMemoryStats {
 	lazyReopenAttempted: boolean;
 	lazyReopenSucceeded: boolean;
 	lazyReopenFallbackReason: string | undefined;
+	retirementFallbackReason: string | undefined;
 }
 
 export interface SessionMessageEntry extends SessionEntryBase {
@@ -5566,6 +5567,7 @@ export class SessionManager {
 	#lazyReopenAttempted = false;
 	#lazyReopenSucceeded = false;
 	#lazyReopenFallbackReason: string | undefined;
+	#retirementFallbackReason: string | undefined;
 	/** Hot-suffix maintenance budget: 16 MiB steady-state (provider-invisible overrides allowed). */
 	#sidecarHotSuffixBudgetBytes = 16 * 1024 * 1024;
 
@@ -9073,6 +9075,8 @@ export class SessionManager {
 			: Buffer.alloc(0);
 		const baseHash = crypto.createHash("sha256");
 		baseHash.update(headerBytes);
+		const fullHash = crypto.createHash("sha256");
+		fullHash.update(headerBytes);
 		let baseEndOffset = headerBytes.byteLength;
 		for (let ordinal = 0; ordinal < tailStartOrdinal; ordinal++) {
 			const persistedLine = Buffer.concat([this.#serializeEntryLine(sessionEntries[ordinal]), Buffer.from("\n")]);
@@ -9091,6 +9095,7 @@ export class SessionManager {
 		let runningOffset = headerBytes.byteLength;
 		let tailSeq = 0;
 		let buildFailed = false;
+		let tailOverflow = false;
 		let operationError: unknown;
 		let closeError: unknown;
 		try {
@@ -9099,6 +9104,7 @@ export class SessionManager {
 			for (let ordinal = 0; ordinal < sessionEntries.length; ordinal++) {
 				const entry = sessionEntries[ordinal];
 				const persistedLine = Buffer.concat([this.#serializeEntryLine(entry), Buffer.from("\n")]);
+				fullHash.update(persistedLine);
 				const recordDigest = computeLineDigest(persistedLine);
 				const indexLine = `${JSON.stringify({
 					id: entry.id,
@@ -9110,7 +9116,7 @@ export class SessionManager {
 				})}\n`;
 				indexWriter!.writeLineSync(indexLine);
 				runtime.indexHash.update(Buffer.from(indexLine, "utf8"));
-				if (ordinal >= tailStartOrdinal) {
+				if (ordinal >= tailStartOrdinal && !tailOverflow) {
 					const record = tailBuilder.append({
 						seq: tailSeq,
 						kind: tailRecordKindForEntry(entry),
@@ -9123,11 +9129,11 @@ export class SessionManager {
 						recordDigest,
 					});
 					if (!record) {
-						buildFailed = true;
-						break;
+						tailOverflow = true;
+					} else {
+						tailWriter!.writeLineSync(`${JSON.stringify(record)}\n`);
+						tailSeq++;
 					}
-					tailWriter!.writeLineSync(`${JSON.stringify(record)}\n`);
-					tailSeq++;
 				}
 				runningOffset += persistedLine.byteLength;
 			}
@@ -9146,6 +9152,10 @@ export class SessionManager {
 			}
 		}
 		if (operationError ?? closeError) throw operationError ?? closeError;
+		if (tailOverflow) {
+			const truncateTail = this.storage.openWriter(runtime.tailPath, { flags: "w" });
+			truncateTail.closeSync();
+		}
 		for (const [id, label] of this.#labelsById) {
 			if (!runtime.labelsPins.setLabel(id, label)) {
 				buildFailed = true;
@@ -9163,8 +9173,13 @@ export class SessionManager {
 			return;
 		}
 		runtime.enabled = true;
-		runtime.base = { baseDigest, baseEndOffset };
-		runtime.tail = tailBuilder.build();
+		if (tailOverflow) {
+			runtime.base = { baseDigest: fullHash.digest("hex"), baseEndOffset: runningOffset };
+			runtime.tail = new RollingTailChainBuilder(runtime.base).build();
+		} else {
+			runtime.base = { baseDigest, baseEndOffset };
+			runtime.tail = tailBuilder.build();
+		}
 
 		runtime.indexDigest = runtime.indexHash.copy().digest("hex");
 		runtime.reopenTransition = this.#classifySidecarReopen();
@@ -9197,21 +9212,41 @@ export class SessionManager {
 	 */
 	#retireColdEntries(hotSuffixBytes = this.#sidecarHotSuffixBudgetBytes): number {
 		const runtime = this.#sidecarRuntime;
-		if (!runtime?.enabled || runtime.sidecarIneligible || this.#fileEntries.length === 0) return 0;
+		const fail = (reason: string): 0 => {
+			this.#retirementFallbackReason = reason;
+			return 0;
+		};
+		if (!runtime?.enabled || runtime.sidecarIneligible || this.#fileEntries.length === 0)
+			return fail("sidecar_unavailable");
 		const retirementFirstKeptEntryId = runtime.retirementFirstKeptEntryId;
-		if (!retirementFirstKeptEntryId) return 0;
+		if (!retirementFirstKeptEntryId) return fail("boundary_unavailable");
 		const firstKeptIndex = this.#fileEntries.findIndex(
 			entry => entry.type !== "session" && entry.id === retirementFirstKeptEntryId,
 		);
-		if (firstKeptIndex <= 0) return 0;
-		if (!this.#fileEntries.slice(0, firstKeptIndex).some(entry => entry.type !== "session")) return 0;
-		if (!this.#validateColdBase()) return 0;
+		if (firstKeptIndex <= 0) return fail("boundary_not_retirable");
+		if (!this.#fileEntries.slice(0, firstKeptIndex).some(entry => entry.type !== "session"))
+			return fail("no_cold_entries");
+		if (!this.#validateColdBase()) return fail("base_invalid");
+		const activeHotIds = new Set<string>();
+		let active = this.#leafId ? this.#byId.get(this.#leafId) : undefined;
+		let reachedBoundary = false;
+		while (active) {
+			activeHotIds.add(active.id);
+			if (active.id === retirementFirstKeptEntryId) {
+				reachedBoundary = true;
+				break;
+			}
+			active = active.parentId ? this.#byId.get(active.parentId) : undefined;
+		}
+		if (!reachedBoundary) return fail("boundary_not_active");
 		let retainedBytes = 0;
 		let retainedAccountedBytes = 0;
-		for (let i = firstKeptIndex; i < this.#fileEntries.length; i++) {
-			retainedBytes += this.#serializeEntryLine(this.#fileEntries[i]).byteLength;
-			retainedAccountedBytes += residentHotEntryBytes(this.#serializeEntryLine(this.#fileEntries[i]).byteLength);
-			if (retainedBytes > hotSuffixBytes) return 0;
+		for (const entry of this.#fileEntries) {
+			if (entry.type === "session" || !activeHotIds.has(entry.id)) continue;
+			const serializedBytes = this.#serializeEntryLine(entry).byteLength;
+			retainedBytes += serializedBytes;
+			retainedAccountedBytes += residentHotEntryBytes(serializedBytes);
+			if (retainedBytes > hotSuffixBytes) return fail("hot_suffix_budget");
 		}
 		const fixedReservedBytes =
 			runtime.blockCache.budgetBytes +
@@ -9222,15 +9257,13 @@ export class SessionManager {
 			1024 * 1024;
 		const targetAccountedBytes = fixedReservedBytes + retainedAccountedBytes;
 		const accountedDelta = targetAccountedBytes - runtime.accountant.totalBytes;
-		if (accountedDelta > 0 && !runtime.accountant.tryCharge(accountedDelta)) return 0;
+		if (accountedDelta > 0 && !runtime.accountant.tryCharge(accountedDelta)) return fail("accounting_budget");
 		if (accountedDelta < 0) runtime.accountant.release(-accountedDelta);
 		let retired = 0;
-		for (let i = 0; i < firstKeptIndex; i++) {
-			if (this.#fileEntries[i].type !== "session") retired++;
+		for (const entry of this.#fileEntries) {
+			if (entry.type !== "session" && !activeHotIds.has(entry.id)) retired++;
 		}
-		this.#fileEntries = this.#fileEntries.filter(
-			(entry, index) => entry.type === "session" || index >= firstKeptIndex,
-		);
+		this.#fileEntries = this.#fileEntries.filter(entry => entry.type === "session" || activeHotIds.has(entry.id));
 		this.#byId = new Map(
 			this.#fileEntries
 				.filter((entry): entry is SessionEntry => entry.type !== "session")
@@ -9255,6 +9288,7 @@ export class SessionManager {
 		this.#commitResidentTextStoreTransition(transition, false);
 		this.#usageStatistics = aggregateUsageStatistics;
 		runtime.hotSuffixBytes = retainedBytes;
+		this.#retirementFallbackReason = undefined;
 		return retired;
 	}
 
@@ -9447,7 +9481,6 @@ export class SessionManager {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled) return;
 		const records = this.#readAllColdEntryIndexes();
-		const coldOrdinalById = new Map(records.map(record => [record.id, record.ordinal]));
 		for (const record of records) {
 			if (!runtime.coldEntries.has(record.id) && runtime.blockCache.tryAllocate(48)) {
 				runtime.coldEntries.set(record.id, record);
@@ -9459,14 +9492,21 @@ export class SessionManager {
 			}
 		}
 		const header = this.#fileEntries.find((entry): entry is SessionHeader => entry.type === "session");
-		const coldList = [...this.#byId.values()]
-			.filter((entry): entry is SessionEntry => coldOrdinalById.has(entry.id))
-			.sort((left, right) => coldOrdinalById.get(left.id)! - coldOrdinalById.get(right.id)!);
 		const hotEntries = this.#fileEntries.filter((entry): entry is SessionEntry => entry.type !== "session");
-		const hotIds = new Set(hotEntries.map(entry => entry.id));
 		const rebuilt: FileEntry[] = [];
 		if (header) rebuilt.push(header);
-		rebuilt.push(...coldList.filter(entry => !hotIds.has(entry.id)), ...hotEntries);
+		const emittedIds = new Set<string>();
+		for (const record of records) {
+			const entry = this.#byId.get(record.id);
+			if (!entry || emittedIds.has(entry.id)) continue;
+			rebuilt.push(entry);
+			emittedIds.add(entry.id);
+		}
+		for (const entry of hotEntries) {
+			if (emittedIds.has(entry.id)) continue;
+			rebuilt.push(entry);
+			emittedIds.add(entry.id);
+		}
 		this.#fileEntries = rebuilt;
 		let labelsChanged = false;
 		for (const [id, label] of runtime.labelsPins.labelsEntries()) {
@@ -10452,6 +10492,7 @@ export class SessionManager {
 				lazyReopenAttempted: this.#lazyReopenAttempted,
 				lazyReopenSucceeded: this.#lazyReopenSucceeded,
 				lazyReopenFallbackReason: this.#lazyReopenFallbackReason,
+				retirementFallbackReason: this.#retirementFallbackReason,
 			};
 		}
 		const reducerBytes = JSON.stringify(runtime.reducer).length * 2 + 48;
@@ -10473,6 +10514,7 @@ export class SessionManager {
 			lazyReopenAttempted: this.#lazyReopenAttempted,
 			lazyReopenSucceeded: this.#lazyReopenSucceeded,
 			lazyReopenFallbackReason: this.#lazyReopenFallbackReason,
+			retirementFallbackReason: this.#retirementFallbackReason,
 		};
 	}
 

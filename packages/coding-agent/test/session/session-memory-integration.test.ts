@@ -1341,6 +1341,104 @@ describe("patch-bearing transcript fallback", () => {
 	});
 });
 
+describe("branch-heavy retirement", () => {
+	it("retires inactive branches appended after the active compaction boundary", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/branch-heavy.jsonl";
+		const now = "0";
+		const inactive = Array.from({ length: 20_000 }, (_, index) => ({
+			type: "message",
+			id: `inactive-${index.toString().padStart(5, "0")}`,
+			parentId: "root",
+			timestamp: now,
+			message: { role: "user", content: `inactive-${index}-${"x".repeat(1024)}`, timestamp: index + 2 },
+		}));
+		const records = [
+			{ type: "session", version: 5, id: "branch-heavy", timestamp: now, cwd: "/cwd" },
+			{
+				type: "message",
+				id: "root",
+				parentId: null,
+				timestamp: now,
+				message: { role: "user", content: "root", timestamp: 0 },
+			},
+			{
+				type: "message",
+				id: "active-kept",
+				parentId: "root",
+				timestamp: now,
+				message: { role: "user", content: "active-kept", timestamp: 1 },
+			},
+			...inactive,
+			{
+				type: "message",
+				id: "active-tail",
+				parentId: "active-kept",
+				timestamp: now,
+				message: { role: "user", content: "active-tail", timestamp: 30_000 },
+			},
+			{
+				type: "compaction",
+				id: "active-compaction",
+				parentId: "active-tail",
+				timestamp: now,
+				summary: "summary",
+				firstKeptEntryId: "active-kept",
+				tokensBefore: 10_000,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(manager.getSessionMemoryStats()).toMatchObject({
+				coldRetirementActive: true,
+				retirementFallbackReason: undefined,
+				currentCommitTransition: { kind: "exact" },
+			});
+			expect(manager.hotRetainedMessageCharsForTests()).toBeLessThan(1024);
+			expect(manager.getEntry("inactive-19999")).toMatchObject({ id: "inactive-19999" });
+			expect(manager.getBranch().map(entry => entry.id)).toEqual([
+				"root",
+				"active-kept",
+				"active-tail",
+				"active-compaction",
+			]);
+			manager.branch("inactive-19999");
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
+			expect(manager.getBranch().map(entry => entry.id)).toEqual(["root", "inactive-19999"]);
+			manager.appendCompaction("inactive summary", undefined, "inactive-19999", 20_000);
+			expect(manager.getSessionMemoryStats()).toMatchObject({
+				coldRetirementActive: true,
+				retirementFallbackReason: undefined,
+			});
+		} finally {
+			await manager.close();
+		}
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(reopened.getSessionMemoryStats()).toMatchObject({
+				coldRetirementActive: true,
+				lazyReopenSucceeded: true,
+				currentCommitTransition: { kind: "exact" },
+			});
+			expect(reopened.getEntry("inactive-19999")).toMatchObject({ id: "inactive-19999" });
+		} finally {
+			await reopened.close();
+		}
+	}, 20_000);
+});
 describe("session memory mode scope", () => {
 	it("keeps nonpersistent sessions fully eager when enabled mode is requested", () => {
 		const manager = SessionManager.inMemory("/cwd");
