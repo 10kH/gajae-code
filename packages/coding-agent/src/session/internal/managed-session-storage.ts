@@ -1228,19 +1228,25 @@ export class ManagedSessionDescendantStore {
 		this.#beforeMutation();
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
-		const existing = this.readExpected(relativePath);
-		if (!existing) throw new Error("managed_append_missing");
 		if (this.#authority) {
 			const relative = this.#relative(resolved);
+			const observed = this.#authority.stat(relative);
+			if (!observed.ok || !observed.identity) throw new Error(observed.code ?? "managed_append_missing");
+			const nativeSha256 = observed.identity.sha256;
+			const expectedSha256 =
+				typeof nativeSha256 === "string" && /^[0-9a-f]{64}$/i.test(nativeSha256)
+					? nativeSha256.toLowerCase()
+					: this.readExpected(relativePath)?.identity.sha256;
+			if (!expectedSha256) throw new Error("managed_append_missing");
 			const appended = this.#authority.appendManaged(
 				relative,
 				bytes,
-				existing.identity.dev.toString(),
-				existing.identity.ino.toString(),
-				existing.identity.size.toString(),
-				existing.identity.mtimeNs.toString(),
-				existing.identity.ctimeNs.toString(),
-				existing.identity.sha256,
+				observed.identity.dev,
+				observed.identity.ino,
+				observed.identity.size,
+				observed.identity.mtimeNs,
+				observed.identity.ctimeNs,
+				expectedSha256,
 			);
 			if (!appended.ok) throw new Error(appended.code ?? "managed_append_failed");
 			// Post-fsync descriptor capture through retained authority: the native append
@@ -1251,6 +1257,8 @@ export class ManagedSessionDescendantStore {
 			this.#assertBound();
 			return receipt;
 		}
+		const existing = this.readExpected(relativePath);
+		if (!existing) throw new Error("managed_append_missing");
 		// Darwin has no retained native root authority. Do not append in place:
 		// a short write can leave a malformed JSONL tail with no safe recovery
 		// boundary. Replace the exact captured file instead so the old transcript
