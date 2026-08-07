@@ -1,4 +1,5 @@
 # Contributing to Gajae-Code
+Maintainers and their access are listed in [MAINTAINERS.md](./MAINTAINERS.md).
 
 Thanks for contributing. This guide is intentionally short so pull requests land on the right branch with enough context to review.
 
