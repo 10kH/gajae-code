@@ -1039,6 +1039,7 @@ it("fails closed for transcript-ahead and tail-ahead reopen states", async () =>
 	try {
 		expect(transcriptAhead.storage.textReads).toBeGreaterThan(0);
 		expect(transcriptFallback.getEntry("new-tail")).toMatchObject({ id: "new-tail" });
+		expect(transcriptFallback.getSessionMemoryStats().autoDisabledReason).toBe("sidecar_reload_failures");
 	} finally {
 		await transcriptFallback.close();
 	}
@@ -1057,6 +1058,7 @@ it("fails closed for transcript-ahead and tail-ahead reopen states", async () =>
 	try {
 		expect(tailAhead.storage.textReads).toBeGreaterThan(0);
 		expect(tailFallback.buildSessionContext().messages).toHaveLength(1);
+		expect(tailFallback.getSessionMemoryStats().autoDisabledReason).toBe("sidecar_reload_failures");
 	} finally {
 		await tailFallback.close();
 	}

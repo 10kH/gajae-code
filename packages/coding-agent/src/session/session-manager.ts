@@ -6899,12 +6899,22 @@ export class SessionManager {
 	/** Initialize with a specific session file (used by factory methods). */
 	async #initSessionFile(sessionFile: string): Promise<void> {
 		const resolvedSessionFile = this.storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
+		const sidecarRoot = resolvedSessionFile.endsWith(".jsonl")
+			? resolvedSessionFile.slice(0, -6)
+			: resolvedSessionFile;
+		const publishedSidecarWasPresent =
+			this.#sessionMemoryMode === "enabled" &&
+			this.storage.existsSync(`${sidecarRoot}/.session-memory.spill.commit`);
 		if (await this.#tryInitSessionFileFromSidecar(resolvedSessionFile)) {
 			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			return;
 		}
 
 		if (await this.#tryBoundedFirstOpen(resolvedSessionFile)) {
+			if (publishedSidecarWasPresent && this.#lazyReopenAttempted && !this.#lazyReopenSucceeded) {
+				this.#sessionMemoryMode = "shadow";
+				this.#sessionMemoryAutoDisabledReason = "sidecar_reload_failures";
+			}
 			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			return;
 		}
@@ -6949,6 +6959,10 @@ export class SessionManager {
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
 		await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
+		if (publishedSidecarWasPresent && this.#lazyReopenAttempted && !this.#lazyReopenSucceeded) {
+			this.#sessionMemoryMode = "shadow";
+			this.#sessionMemoryAutoDisabledReason = "sidecar_reload_failures";
+		}
 	}
 
 	async #hydrateExistingSession(
