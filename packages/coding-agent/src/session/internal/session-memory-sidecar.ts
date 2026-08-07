@@ -706,6 +706,18 @@ export function computeTailRecordChecksum(
 		: hashChain([previousChecksum, ...fields]);
 }
 
+/** Resident bytes for every retained tail string plus the record object. */
+export function tailRecordResidentBytes(record: TailRecordInput, checksumChars = 64): number {
+	return residentRecordBytes(
+		residentStringBytes(record.id) +
+			(record.parentId === null ? 0 : residentStringBytes(record.parentId)) +
+			residentStringBytes(record.type) +
+			residentStringBytes(record.kind) +
+			residentStringBytes(record.recordDigest) +
+			(2 * checksumChars + 16),
+	);
+}
+
 /** Terminal checksum for a committed tail (empty chain → base only). */
 export function computeTerminalChecksum(base: BaseAnchor, records: readonly TailRecord[]): string {
 	if (records.length === 0) return hashChain([base.baseDigest, base.baseEndOffset]);
@@ -773,7 +785,7 @@ export class RollingTailChainBuilder {
 		if (input.seq !== expectedSeq) throw new Error("tail_seq_discontinuity");
 		if (input.byteOffset !== this.lastEndOffset) throw new Error("tail_offset_discontinuity");
 		const checksum = computeTailRecordChecksum(this.base, this.lastChecksum, input);
-		const residentBytes = residentRecordBytes(input.id.length + (input.parentId?.length ?? 0) + input.type.length);
+		const residentBytes = tailRecordResidentBytes(input, checksum.length);
 		if (residentBytes > this.remainingTailBytes) return undefined;
 		this.remainingTailBytes -= residentBytes;
 		const record: TailRecord = { ...input, gen: input.gen ?? 0, checksum };

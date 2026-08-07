@@ -109,6 +109,7 @@ import {
 	sameDescriptor,
 	type TailRecord,
 	type TailRecordKind,
+	tailRecordResidentBytes,
 	validateCommit,
 	validateTailChain,
 } from "./internal/session-memory-sidecar";
@@ -6280,11 +6281,7 @@ export class SessionManager {
 			}
 			const entries: FileEntry[] = [header, ...hotEntries];
 			await resolveBlobRefsInEntries(entries, this.#blobStore);
-			const tailResidentBytes = records.reduce(
-				(total, record) =>
-					total + residentRecordBytes(record.id.length + (record.parentId?.length ?? 0) + record.type.length),
-				0,
-			);
+			const tailResidentBytes = records.reduce((total, record) => total + tailRecordResidentBytes(record), 0);
 			if (!runtime.tailCache.tryAllocate(tailResidentBytes)) return false;
 			const hotSuffixBytes = records.reduce((total, record) => total + record.byteLength, 0);
 			const hotResidentBytes = records.reduce(
@@ -6774,9 +6771,7 @@ export class SessionManager {
 						}
 						tailWriter!.writeLineSync(`${JSON.stringify(tailRecord)}\n`);
 						tailSeq++;
-						tailResidentBytes += residentRecordBytes(
-							record.id.length + (parentId === null ? 0 : parentId.length) + record.type.length,
-						);
+						tailResidentBytes += tailRecordResidentBytes(tailRecord);
 					} else {
 						baseHash.update(lineBytes);
 					}
@@ -9532,12 +9527,7 @@ export class SessionManager {
 			runtime.tail = tail;
 			runtime.tailCache.release(runtime.tailCache.allocatedBytes);
 			for (const record of tail.records) {
-				if (
-					!runtime.tailCache.tryAllocate(
-						residentRecordBytes(record.id.length + (record.parentId?.length ?? 0) + record.type.length),
-					)
-				)
-					return false;
+				if (!runtime.tailCache.tryAllocate(tailRecordResidentBytes(record))) return false;
 			}
 			return true;
 		} catch {
@@ -10935,9 +10925,17 @@ export class SessionManager {
 		if (activeRuntime && this.#coldSidecarActive()) {
 			const appendedBytes = this.#serializeEntryLine(residentEntry).byteLength + 1;
 			const appendedAccountedBytes = residentHotEntryBytes(appendedBytes);
-			const tailBytes = residentRecordBytes(
-				residentEntry.id.length + (residentEntry.parentId?.length ?? 0) + residentEntry.type.length,
-			);
+			const tailBytes = tailRecordResidentBytes({
+				seq: 0,
+				kind: tailRecordKindForEntry(residentEntry),
+				ordinal: 0,
+				id: residentEntry.id,
+				parentId: residentEntry.parentId,
+				type: residentEntry.type,
+				byteOffset: 0,
+				byteLength: appendedBytes,
+				recordDigest: "0".repeat(64),
+			});
 			if (activeRuntime.hotSuffixBytes + appendedBytes > this.#sidecarHotSuffixBudgetBytes) {
 				this.#deactivateColdForBranchMutation();
 			} else if (!activeRuntime.accountant.tryCharge(appendedAccountedBytes)) {
