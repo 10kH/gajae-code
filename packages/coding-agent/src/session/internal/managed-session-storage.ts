@@ -254,11 +254,6 @@ function managedAppendReceiptFromIdentity(identity: ManagedFileIdentity): Manage
 	};
 }
 
-function managedAppendReceiptFromSnapshot(snapshot: ManagedFileSnapshot): ManagedAppendReceipt {
-	const { dev, ino, nlink, size, mtimeNs, ctimeNs } = snapshot.identity;
-	return managedAppendReceiptFromIdentity({ dev, ino, nlink, size, mtimeNs, ctimeNs });
-}
-
 type SerializedReplacementIdentity = {
 	dev: string;
 	ino: string;
@@ -1257,24 +1252,12 @@ export class ManagedSessionDescendantStore {
 			this.#assertBound();
 			return receipt;
 		}
-		const existing = this.readExpected(relativePath);
-		if (!existing) throw new Error("managed_append_missing");
-		// Darwin has no retained native root authority. Do not append in place:
-		// a short write can leave a malformed JSONL tail with no safe recovery
-		// boundary. Replace the exact captured file instead so the old transcript
-		// or the complete successor remains recoverable after every reported error.
-		replaceManagedFileSync(
-			resolved,
-			Buffer.concat([existing.bytes, Buffer.from(bytes)]),
-			this.#subtreeRoot,
-			this.#policy,
-			undefined,
-			existing.identity,
-		);
-		// The successor was secured and revalidated by replaceManagedFileSync; reopen it
-		// no-follow and re-check identity so the receipt binds the committed object.
-		const successor = captureManagedFileNoFollow(resolved);
-		const receipt = managedAppendReceiptFromSnapshot(successor);
+		// Darwin has no retained native root authority. Copy the predecessor through a
+		// fixed 64 KiB buffer into an exact-replacement staging file, append the new
+		// record bytes, and publish through the existing cleanup-receipt protocol.
+		// The transcript-linear disk pass is unavoidable; resident memory is bounded.
+		const successor = appendManagedFileStreamingSync(resolved, bytes, this.#subtreeRoot, this.#policy);
+		const receipt = managedAppendReceiptFromIdentity(successor);
 		this.#assertBound();
 		return receipt;
 	}
@@ -1890,6 +1873,29 @@ function captureManagedFileNoFollowLimit(pathname: string, maxBytes?: number): M
 	}
 }
 
+function captureManagedFileIdentityStreamingNoFollow(pathname: string): ManagedFileSnapshot["identity"] {
+	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+	try {
+		const before = fs.fstatSync(fd, { bigint: true });
+		if (!before.isFile() || before.nlink > 1) throw new Error("source_changed");
+		const hash = createHash("sha256");
+		const chunk = Buffer.alloc(64 * 1024);
+		for (;;) {
+			const count = fs.readSync(fd, chunk, 0, chunk.byteLength, null);
+			if (count === 0) break;
+			hash.update(chunk.subarray(0, count));
+		}
+		const after = fs.fstatSync(fd, { bigint: true });
+		if (!sameIdentity(identity(before), identity(after))) throw new Error("source_changed");
+		const named = fs.lstatSync(pathname, { bigint: true });
+		if (!named.isFile() || named.isSymbolicLink() || !sameIdentity(identity(before), identity(named)))
+			throw new Error("source_changed");
+		return identity(before, hash.digest("hex"));
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
 /** Atomically publishes bytes without replacing an existing destination. */
 export async function publishManagedFileNoReplace(
 	destination: string,
@@ -2043,9 +2049,9 @@ export function publishManagedFileNoReplaceSync(
 }
 
 /** Replace one managed regular file while retaining the secured staging fd through publication. */
-export function replaceManagedFileSync(
+function replaceManagedFileGeneratedSync(
 	destination: string,
-	bytes: Uint8Array,
+	writeContent: (fd: number) => { size: number; sha256: string },
 	root: ManagedDirectoryRoot,
 	policy: ManagedSessionSecurityPolicy = "default",
 	assertFence?: () => void,
@@ -2074,8 +2080,7 @@ export function replaceManagedFileSync(
 			0o600,
 		);
 		secureFileDescriptor(staging, fd, "apply");
-		let offset = 0;
-		while (offset < bytes.byteLength) offset += fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
+		const generated = writeContent(fd);
 		fs.fsyncSync(fd);
 		secureFileDescriptor(staging, fd, "verify");
 		const staged = fs.fstatSync(fd, { bigint: true });
@@ -2088,7 +2093,8 @@ export function replaceManagedFileSync(
 		assertFence?.();
 		if (expectedDestination) {
 			const parentIdentity = fs.lstatSync(parent, { bigint: true });
-			const successor = identity(staged, createHash("sha256").update(bytes).digest("hex"));
+			if (Number(staged.size) !== generated.size) throw new Error("managed_replace_generated_size_changed");
+			const successor = identity(staged, generated.sha256);
 			const receiptStagingPath = path.join(parent, `.gjc-replace-receipt-pending-${randomUUID()}.json`);
 			preserveStaging = true;
 			const publishedReceiptIdentity = publishManagedFileNoReplaceSync(
@@ -2147,8 +2153,8 @@ export function replaceManagedFileSync(
 				},
 			);
 			if (!replaced.ok) throw new ManagedReplaceError(replaced, receiptCleanup.path);
-			const named = captureManagedFileNoFollow(destination);
-			if (!sameReplacementIdentity(named.identity, successor) || named.identity.sha256 !== successor.sha256)
+			const named = captureManagedFileIdentityStreamingNoFollow(destination);
+			if (!sameReplacementIdentity(named, successor) || named.sha256 !== successor.sha256)
 				throw new Error("destination_identity_changed");
 			fsyncDirectory(parent);
 		} else fs.renameSync(staging, destination);
@@ -2210,6 +2216,92 @@ export function replaceManagedFileSync(
 		}
 	}
 	if (failure !== undefined) throw failure;
+}
+
+export function replaceManagedFileSync(
+	destination: string,
+	bytes: Uint8Array,
+	root: ManagedDirectoryRoot,
+	policy: ManagedSessionSecurityPolicy = "default",
+	assertFence?: () => void,
+	expectedDestination?: ManagedFileSnapshot["identity"],
+): void {
+	replaceManagedFileGeneratedSync(
+		destination,
+		fd => {
+			const hash = createHash("sha256");
+			let offset = 0;
+			while (offset < bytes.byteLength) {
+				const written = fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
+				if (written === 0) throw new Error("managed_replace_short_write");
+				hash.update(bytes.subarray(offset, offset + written));
+				offset += written;
+			}
+			return { size: offset, sha256: hash.digest("hex") };
+		},
+		root,
+		policy,
+		assertFence,
+		expectedDestination,
+	);
+}
+
+function appendManagedFileStreamingSync(
+	destination: string,
+	appendedBytes: Uint8Array,
+	root: ManagedDirectoryRoot,
+	policy: ManagedSessionSecurityPolicy,
+): ManagedFileSnapshot["identity"] {
+	const predecessor = captureManagedFileIdentityStreamingNoFollow(destination);
+	replaceManagedFileGeneratedSync(
+		destination,
+		stagingFd => {
+			const sourceFd = fs.openSync(destination, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+			try {
+				const before = fs.fstatSync(sourceFd, { bigint: true });
+				if (!sameReplacementIdentity(identity(before, predecessor.sha256), predecessor))
+					throw new Error("managed_replace_identity_mismatch");
+				const hash = createHash("sha256");
+				const chunk = Buffer.alloc(64 * 1024);
+				let total = 0;
+				for (;;) {
+					const count = fs.readSync(sourceFd, chunk, 0, chunk.byteLength, null);
+					if (count === 0) break;
+					let written = 0;
+					while (written < count) {
+						const amount = fs.writeSync(stagingFd, chunk, written, count - written);
+						if (amount === 0) throw new Error("managed_replace_short_write");
+						written += amount;
+					}
+					hash.update(chunk.subarray(0, count));
+					total += count;
+				}
+				const after = fs.fstatSync(sourceFd, { bigint: true });
+				const named = fs.lstatSync(destination, { bigint: true });
+				if (
+					!sameReplacementIdentity(identity(after, predecessor.sha256), predecessor) ||
+					!sameReplacementIdentity(identity(named, predecessor.sha256), predecessor)
+				)
+					throw new Error("managed_replace_identity_mismatch");
+				if (hash.copy().digest("hex") !== predecessor.sha256) throw new Error("managed_replace_identity_mismatch");
+				let appended = 0;
+				while (appended < appendedBytes.byteLength) {
+					const amount = fs.writeSync(stagingFd, appendedBytes, appended, appendedBytes.byteLength - appended);
+					if (amount === 0) throw new Error("managed_replace_short_write");
+					hash.update(appendedBytes.subarray(appended, appended + amount));
+					appended += amount;
+				}
+				return { size: total + appended, sha256: hash.digest("hex") };
+			} finally {
+				fs.closeSync(sourceFd);
+			}
+		},
+		root,
+		policy,
+		undefined,
+		predecessor,
+	);
+	return captureManagedFileIdentityStreamingNoFollow(destination);
 }
 
 export async function replaceManagedFile(
