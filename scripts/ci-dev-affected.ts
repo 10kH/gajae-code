@@ -332,6 +332,10 @@ function isNativeBuildKey(key: string): boolean {
 	return NATIVE_BUILD_KEYS.has(key);
 }
 
+function isNativeProducerTask(task: Task): boolean {
+	return task.capabilities?.nativeProducer ?? isNativeBuildKey(task.key);
+}
+
 // Tasks that load the @gajae-code/natives addon at runtime and therefore need a
 // prebuilt `.node` present in `packages/natives/native/`. By construction (see
 // planTasks) every such task only appears in a plan that also includes a native
@@ -375,7 +379,7 @@ export function describeTasks(tasks: readonly Task[]): TaskMatrixEntry[] {
 		native: task.capabilities?.nativeConsumer ?? taskNeedsNative(task.key),
 		rust: task.capabilities?.rust ?? taskNeedsRust(task.key),
 		nextest: task.capabilities?.nextest ?? isRustTestKey(task.key),
-		nativeBuild: task.capabilities?.nativeProducer ?? isNativeBuildKey(task.key),
+		nativeBuild: isNativeProducerTask(task),
 	}));
 }
 
@@ -443,7 +447,7 @@ async function emitFullMatrix(): Promise<void> {
 	const githubOutput = process.env.GITHUB_OUTPUT;
 	if (!githubOutput) return;
 	const shards = tasks
-		.filter(task => task.capabilities?.nativeProducer !== true && task.phase !== "python")
+		.filter(task => !isNativeProducerTask(task) && task.phase !== "python")
 		.map(task => {
 			const entry = describeTasks([task])[0]!;
 			return { key: entry.key, identity: entry.identity, description: entry.description, native: entry.native, rust: entry.rust, nextest: entry.nextest };
@@ -477,7 +481,7 @@ async function emitMatrix(): Promise<void> {
 	const githubOutput = process.env.GITHUB_OUTPUT;
 	if (!githubOutput) return;
 	const shards = tasks
-		.filter(task => task.capabilities?.nativeProducer !== true && task.phase !== "python")
+		.filter(task => !isNativeProducerTask(task) && task.phase !== "python")
 		.map(task => {
 			const entry = describeTasks([task])[0]!;
 			return { key: entry.key, identity: entry.identity, description: entry.description, native: entry.native, rust: entry.rust, nextest: entry.nextest };
