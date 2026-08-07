@@ -281,7 +281,7 @@ export class ManagedTaskPersistence {
 			throw new Error("Managed task persistence authority is unavailable");
 	}
 
-	async openSession(cwd: string): Promise<SessionManager> {
+	async openSession(cwd: string, sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow"): Promise<SessionManager> {
 		const store = this.#artifacts.getManagedStore();
 		if (!store) throw new Error("Managed task persistence authority is unavailable");
 		this.#artifacts.assertManagedBinding();
@@ -292,6 +292,7 @@ export class ManagedTaskPersistence {
 			store,
 			undefined,
 			cwd,
+			sessionMemoryMode,
 		);
 		this.#artifacts.assertManagedBinding();
 		return session;
@@ -1551,7 +1552,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			effectiveThinkingLevelForWarning = effectiveThinkingLevel;
 
 			const sessionManager = options.managedPersistence
-				? await awaitAbortable(options.managedPersistence.openSession(worktree ?? cwd))
+				? await awaitAbortable(
+						options.managedPersistence.openSession(worktree ?? cwd, subagentSettings.get("sessionMemory.mode")),
+					)
 				: sessionFile
 					? await awaitAbortable(
 							SessionManager.open(

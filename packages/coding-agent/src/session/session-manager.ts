@@ -13097,6 +13097,7 @@ export class SessionManager {
 		store: ManagedSessionDescendantStore,
 		storage: SessionStorage = new FileSessionStorage(),
 		cwdOverride?: string,
+		sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow",
 	): Promise<SessionManager> {
 		if (destination.kind !== "managed" || !trustedSessionDestinations.has(destination))
 			throw new Error("Nested managed session authority is unavailable");
@@ -13116,6 +13117,7 @@ export class SessionManager {
 		);
 		if (header && cwdChanged) header.cwd = sessionCwd;
 		const manager = new SessionManager(sessionCwd, destination.directory, true, storage, destination);
+		manager.#sessionMemoryMode = sessionMemoryMode;
 		if (entries.length > 0) {
 			const migrationApplied = migrateToCurrentVersion(entries) || cwdChanged;
 			await manager.#hydrateExistingSession(resolved, entries, migrationApplied, "memory-fallback");
