@@ -444,6 +444,25 @@ describe("commit-marker checked create/replace", () => {
 		expect(file.readTextSync(markerPath)).toBe(`${Buffer.from(markerBytes(5)).toString("utf8")}trailing\n`);
 	});
 
+	it("file backend: a stale concurrent publisher cannot overwrite the winning marker", async () => {
+		const dir = await makeTempDir("gjc-marker-concurrent-");
+		const markerPath = path.join(dir, "session.jsonl.spill.commit");
+		const file = new FileSessionStorage();
+		createSessionCommitMarkerCheckedSync(file, markerPath, markerBytes(0));
+		const sharedExpectation = readSessionCommitMarkerSync(file, markerPath);
+		if (sharedExpectation.kind !== "present") throw new Error("Expected a present marker");
+		const expected = {
+			rawBytesSha256: sharedExpectation.rawBytesSha256,
+			descriptorIdentity: sharedExpectation.stat,
+		};
+		replaceSessionCommitMarkerCheckedSync(file, markerPath, markerBytes(1), expected);
+		expect(() => replaceSessionCommitMarkerCheckedSync(file, markerPath, markerBytes(2), expected)).toThrow(
+			"commit_marker_raw_hash_mismatch",
+		);
+		const winner = readSessionCommitMarkerSync(file, markerPath);
+		expect(winner.kind).toBe("present");
+		if (winner.kind === "present") expect(winner.rawBytesSha256).toBe(markerHash(markerBytes(1)));
+	});
 	it("file backend: corrupt-present is present, never missing, and replaceable by exact raw bytes", async () => {
 		const dir = await makeTempDir("gjc-marker-corrupt-");
 		const markerPath = path.join(dir, "session.jsonl.spill.commit");
