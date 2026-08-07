@@ -69,6 +69,7 @@ test("ACP reverse requests use canonical names, session scope, and cancellation"
 	const reverse = createAcpReverseConnection(connection, "session-1");
 	const requests = [
 		["request", { toolCallId: "call-1", sessionId: "spoofed-session" }],
+		["permission.request", { toolCallId: "call-2", sessionId: "spoofed-session" }],
 		["fs.readTextFile", { path: "/workspace/README.md" }],
 		["fs.writeTextFile", { path: "/workspace/README.md", content: "updated" }],
 		["terminal.create", { command: "printf", args: ["ok"] }],
@@ -78,6 +79,7 @@ test("ACP reverse requests use canonical names, session scope, and cancellation"
 
 	expect(calls).toEqual([
 		["session/request_permission", { toolCallId: "call-1", sessionId: "session-1" }, { cancellationSignal: signal }],
+		["session/request_permission", { toolCallId: "call-2", sessionId: "session-1" }, { cancellationSignal: signal }],
 		["fs/read_text_file", { path: "/workspace/README.md", sessionId: "session-1" }, { cancellationSignal: signal }],
 		[
 			"fs/write_text_file",
@@ -92,6 +94,28 @@ test("ACP reverse requests use canonical names, session scope, and cancellation"
 		],
 	]);
 	expect(typedCalls).toEqual([]);
+});
+test("ACP reverse permission aliases normalize nested and flat outcomes into the SDK decision contract", async () => {
+	for (const method of ["request", "permission.request"] as const) {
+		for (const [response, expected] of [
+			[
+				{ outcome: { outcome: "selected", optionId: "allow_once" } },
+				{ outcome: "selected", optionId: "allow_once" },
+			],
+			[{ outcome: { outcome: "cancelled" } }, { outcome: "cancelled" }],
+			[
+				{ outcome: "selected", optionId: "allow_always" },
+				{ outcome: "selected", optionId: "allow_always" },
+			],
+			[{ outcome: "cancelled" }, { outcome: "cancelled" }],
+		] as const) {
+			const connection = {
+				request: async () => response,
+			} as unknown as AgentSideConnection;
+			const reverse = createAcpReverseConnection(connection, "session-1");
+			expect(await reverse.request?.(method, { toolCallId: "call-1" })).toEqual(expected);
+		}
+	}
 });
 
 test("ACP maps non-prompt permission handling to the SDK allow policy", async () => {
