@@ -517,6 +517,8 @@ describe("managed commit marker classification", () => {
 			const stats = manager.getSessionMemoryStats();
 			expect(stats).toMatchObject({ lastReopenTransition: { kind: "stale_commit", reason: "no_commit_marker" } });
 			expect(stats.currentCommitTransition).toEqual({ kind: "exact", reason: "descriptor_and_proof_match" });
+			manager.appendLabelChange(firstId, "cold label");
+			expect(manager.getLabel(firstId)).toBe("cold label");
 			const appendedId = manager.appendMessage({ role: "user", content: "after", timestamp: 3 });
 			const appendedStats = manager.getSessionMemoryStats();
 			expect(appendedStats.currentCommitTransition).toEqual({

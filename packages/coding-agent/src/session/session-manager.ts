@@ -5814,7 +5814,7 @@ export class SessionManager {
 		}
 	}
 
-	#commitResidentTextStoreTransition(prepared: PreparedResidentStoreTransition): void {
+	#commitResidentTextStoreTransition(prepared: PreparedResidentStoreTransition, rebuildSidecars = true): void {
 		const predecessor = this.#residentTextBlobStore;
 		const successor = prepared.store;
 		this.#fileEntries = prepared.entries;
@@ -5826,7 +5826,7 @@ export class SessionManager {
 		this.#bumpAllRevisions();
 		this.#residentBlobRevision++;
 		prepared.adopt();
-		if (this.persist && this.#sessionFile) {
+		if (rebuildSidecars && this.persist && this.#sessionFile) {
 			this.#buildDisposableSidecars(this.#fileEntries);
 			if (this.#sessionMemoryMode === "enabled") this.#retireColdEntries();
 		}
@@ -8331,6 +8331,23 @@ export class SessionManager {
 				.map(entry => [entry.id, entry]),
 		);
 		this.#resetMaterializedCaches();
+		const aggregateUsageStatistics = this.#usageStatistics;
+		const transition = this.#prepareResidentTextStoreTransition(
+			{
+				target: { sessionId: this.#sessionId, sessionFile: this.#sessionFile ?? "" },
+				primary: {
+					mode: "materialize",
+					sourceEntries: this.#fileEntries,
+					sourceStores: {
+						textStore: this.#residentTextBlobStore,
+						imageStore: this.#residentImageBlobStore,
+					},
+				},
+			},
+			"memory-fallback",
+		);
+		this.#commitResidentTextStoreTransition(transition, false);
+		this.#usageStatistics = aggregateUsageStatistics;
 		runtime.hotSuffixBytes = retainedBytes;
 		return retired;
 	}
@@ -8502,6 +8519,7 @@ export class SessionManager {
 		if (header) rebuilt.push(header);
 		rebuilt.push(...coldList.filter(entry => !hotIds.has(entry.id)), ...hotEntries);
 		this.#fileEntries = rebuilt;
+		for (const [id, label] of runtime.labelsPins.labelsEntries()) this.#labelsById.set(id, label);
 		this.#bumpEntryRevision();
 	}
 
@@ -8597,9 +8615,11 @@ export class SessionManager {
 			this.#deactivateColdForBranchMutation();
 			return false;
 		}
+		const records = runtime.tail.records as TailRecord[];
+		records.push(record);
 		runtime.tail = {
 			base: runtime.base,
-			records: [...runtime.tail.records, record],
+			records,
 			terminalChecksum: checksum,
 			terminalSeq: seq,
 			transcriptSize: byteOffset + byteLength,
@@ -9902,7 +9922,7 @@ export class SessionManager {
 		const residentEntry = this.#prepareEntryForCurrentResidentStore(normalizedEntry) as SessionEntry;
 		let sidecarAppendCharge = 0;
 		let sidecarTailCharge = 0;
-		const activeRuntime = entry.type === "compaction" && this.#sidecarRuntime ? undefined : this.#sidecarRuntime;
+		const activeRuntime = this.#sidecarRuntime;
 		if (activeRuntime && this.#coldSidecarActive()) {
 			const appendedBytes = this.#serializeEntryLine(residentEntry).byteLength + 1;
 			const tailBytes = residentRecordBytes(
@@ -9985,9 +10005,14 @@ export class SessionManager {
 			this.#sessionFile &&
 			this.storage.existsSync(this.#sessionFile)
 		) {
-			this.#ensureFullHotView();
-			this.#buildDisposableSidecars(this.#fileEntries);
-			this.#retireColdEntries();
+			if (this.#coldSidecarActive() && this.#sidecarRuntime) {
+				this.#sidecarRuntime.retirementFirstKeptEntryId = entry.firstKeptEntryId;
+				this.#retireColdEntries();
+			} else {
+				this.#ensureFullHotView();
+				this.#buildDisposableSidecars(this.#fileEntries);
+				this.#retireColdEntries();
+			}
 		}
 	}
 
@@ -10709,7 +10734,7 @@ export class SessionManager {
 	 * Get the label for an entry, if any.
 	 */
 	getLabel(id: string): string | undefined {
-		return this.#labelsById.get(id);
+		return this.#labelsById.get(id) ?? this.#sidecarRuntime?.labelsPins.getLabel(id);
 	}
 
 	/**
