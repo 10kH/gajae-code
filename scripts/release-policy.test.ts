@@ -144,7 +144,7 @@ describe("stable release policy", () => {
 		}
 	});
 
-	test("runs an immutable nightly deployment only after the complete main graph passes", async () => {
+	test("runs an immutable nightly deployment only after the complete source graph passes", async () => {
 		const ci = await workflow();
 		const metadata = jobSection(ci, "release_metadata");
 		const gate = jobSection(ci, "nightly_gate");
@@ -158,7 +158,9 @@ describe("stable release policy", () => {
 		expect(jobSection(ci, "check")).toContain("inputs.rehearsal == 'nightly-release'");
 		expect(jobSection(ci, "test")).toContain("inputs.rehearsal == 'nightly-release'");
 		expect(metadata).toContain("bun scripts/nightly-release.ts version");
-		expect(metadata).toContain('GITHUB_REF" != refs/heads/main');
+		expect(metadata).toContain("expected_ref=refs/heads/dev");
+		expect(metadata).toContain('if [ "$EVENT_NAME" = schedule ]');
+		expect(metadata).toContain("expected_ref=refs/heads/main");
 		expect(metadata).toContain("git show -s --format=%cI");
 		expect(metadata).toContain("Stable release tag must be exact vX.Y.Z");
 		expect(metadata).toContain("does not match package version");

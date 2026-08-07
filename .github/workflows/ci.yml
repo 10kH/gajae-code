@@ -11,7 +11,7 @@ on:
    workflow_dispatch:
       inputs:
          rehearsal:
-            description: "Run the exact tag build/verify graph, the non-tag main graph, or publish an immutable nightly prerelease after the full main graph passes."
+            description: "Run the exact tag build/verify graph, the non-tag main graph, or publish an immutable nightly prerelease after the full source graph passes. Manual nightlies release dev; scheduled nightlies release main."
             required: true
             type: choice
             options: [tag-build-verify, main-nontag, nightly-release]
@@ -48,13 +48,18 @@ jobs:
            shell: bash
            env:
               IS_NIGHTLY: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release')) && '1' || '0' }}
+              EVENT_NAME: ${{ github.event_name }}
               SOURCE_SHA: ${{ github.sha }}
               RUN_ID: ${{ github.run_id }}
            run: |
               set -euo pipefail
               if [ "$IS_NIGHTLY" = 1 ]; then
-                 if [ "$GITHUB_REF" != refs/heads/main ]; then
-                    echo "Nightly releases must run from refs/heads/main, not $GITHUB_REF" >&2
+                 expected_ref=refs/heads/dev
+                 if [ "$EVENT_NAME" = schedule ]; then
+                    expected_ref=refs/heads/main
+                 fi
+                 if [ "$GITHUB_REF" != "$expected_ref" ]; then
+                    echo "Nightly release for $EVENT_NAME must run from $expected_ref, not $GITHUB_REF" >&2
                     exit 1
                  fi
                  timestamp="$(git show -s --format=%cI "$SOURCE_SHA")"
