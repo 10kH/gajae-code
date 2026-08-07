@@ -703,6 +703,8 @@ export interface ColdEntryIndex {
 	byteOffset: number;
 	byteLength: number;
 	recordDigest: string;
+	parentId?: string | null;
+	entryType?: string;
 }
 
 /** Sidecar runtime state attached to a SessionManager with an active cold region. */
@@ -5582,6 +5584,7 @@ export class SessionManager {
 	#lazyReopenSucceeded = false;
 	#lazyReopenFallbackReason: string | undefined;
 	#retirementFallbackReason: string | undefined;
+	#sidecarBranchActivationDirty = false;
 	/** Hot-suffix maintenance budget: 16 MiB steady-state (provider-invisible overrides allowed). */
 	#sidecarHotSuffixBudgetBytes = 16 * 1024 * 1024;
 
@@ -6766,6 +6769,8 @@ export class SessionManager {
 						byteOffset: lineStart,
 						byteLength,
 						recordDigest,
+						parentId,
+						entryType: record.type,
 					})}\n`;
 					indexWriter!.writeLineSync(indexLine);
 					runtime.indexHash.update(Buffer.from(indexLine, "utf8"));
@@ -8836,6 +8841,7 @@ export class SessionManager {
 	 * classification. `gen` is the publication fence counter only.
 	 */
 	#publishSessionCommitMarkerSync(descriptor: SessionStorageStat): boolean {
+		if (this.#sidecarBranchActivationDirty) return false;
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile) return false;
 		const runtime = this.#sidecarRuntime;
@@ -8928,6 +8934,7 @@ export class SessionManager {
 
 	/** Create (or reset) the sidecar runtime for the current lifecycle. */
 	#resetSidecarRuntime(ineligible = false): SessionMemorySidecarRuntime {
+		this.#sidecarBranchActivationDirty = false;
 		if (this.#sessionFile) {
 			for (const legacyPath of [
 				`${this.#sessionFile}.spill.idx`,
@@ -9159,6 +9166,8 @@ export class SessionManager {
 					byteOffset: runningOffset,
 					byteLength: persistedLine.byteLength,
 					recordDigest,
+					parentId: entry.parentId,
+					entryType: entry.type,
 				})}\n`;
 				indexWriter!.writeLineSync(indexLine);
 				runtime.indexHash.update(Buffer.from(indexLine, "utf8"));
@@ -9424,7 +9433,7 @@ export class SessionManager {
 				try {
 					const value = JSON.parse(line) as Partial<ColdEntryIndex> & { id?: unknown };
 					if (
-						value.id === id &&
+						typeof value.id === "string" &&
 						typeof value.ordinal === "number" &&
 						typeof value.seq === "number" &&
 						typeof value.byteOffset === "number" &&
@@ -9437,9 +9446,15 @@ export class SessionManager {
 							byteOffset: value.byteOffset,
 							byteLength: value.byteLength,
 							recordDigest: value.recordDigest,
+							...(value.parentId === null || typeof value.parentId === "string"
+								? { parentId: value.parentId }
+								: {}),
+							...(typeof value.entryType === "string" ? { entryType: value.entryType } : {}),
 						};
-						if (runtime.blockCache.tryAllocate(line.length * 2 + 48)) runtime.coldEntries.set(id, found);
-						return found;
+						if (!runtime.coldEntries.has(value.id) && runtime.blockCache.tryAllocate(line.length * 2 + 48)) {
+							runtime.coldEntries.set(value.id, found);
+						}
+						if (value.id === id) return found;
 					}
 				} catch {
 					// A corrupt disposable index line is ignored; transcript remains authoritative.
@@ -9537,6 +9552,128 @@ export class SessionManager {
 		return entry;
 	}
 
+	#readColdBranchEntry(id: string): { entry: SessionEntry; index: ColdEntryIndex } | undefined {
+		const index = this.#findColdEntryIndex(id);
+		if (!index || !("parentId" in index) || typeof index.entryType !== "string") return undefined;
+		const bytes = this.#readColdEntryRange(index);
+		if (!bytes || computeLineDigest(bytes) !== index.recordDigest) return undefined;
+		try {
+			const parsed = JSON.parse(new TextDecoder("utf-8").decode(bytes)) as SessionEntry;
+			if (
+				!parsed ||
+				typeof parsed !== "object" ||
+				parsed.id !== id ||
+				parsed.type !== index.entryType ||
+				parsed.parentId !== index.parentId
+			)
+				return undefined;
+			return { entry: parsed, index };
+		} catch {
+			return undefined;
+		}
+	}
+
+	#activateColdBranch(leafId: string): boolean {
+		const runtime = this.#sidecarRuntime;
+		if (
+			!this.#coldSidecarActive() ||
+			!runtime ||
+			!this.#coldIndexDigestValid() ||
+			!this.#coldTailMatchesDisk() ||
+			!this.#validateColdBase(runtime.base)
+		)
+			return false;
+		const retainedLeafToBoundary: SessionEntry[] = [];
+		let retainedBytes = 0;
+		let retainedAccountedBytes = 0;
+		let currentId: string | null = leafId;
+		let priorOrdinal = Number.POSITIVE_INFINITY;
+		let boundaryId: string | undefined;
+		let boundaryReached = false;
+		const reducer: ReducerState = {
+			modelChange: { latest: undefined },
+			ttsr: { count: 0, rulesCount: 0, recordsCount: 0, largestOrdinal: -1 },
+		};
+		while (currentId !== null) {
+			const resolved = this.#readColdBranchEntry(currentId);
+			if (!resolved || resolved.index.ordinal >= priorOrdinal) return false;
+			priorOrdinal = resolved.index.ordinal;
+			const { entry, index } = resolved;
+			if (!boundaryReached) {
+				retainedLeafToBoundary.push(entry);
+				retainedBytes += index.byteLength;
+				retainedAccountedBytes += residentHotEntryBytes(index.byteLength);
+				if (retainedBytes > this.#sidecarHotSuffixBudgetBytes) return false;
+			}
+			if (entry.type === "model_change" && reducer.modelChange.latest === undefined) {
+				reducer.modelChange.latest = { ordinal: index.ordinal, role: entry.role };
+			} else if (entry.type === "ttsr_injection" && reducer.ttsr.largestOrdinal < 0) {
+				reducer.ttsr = {
+					count: entry.ttsrMessageCount ?? 0,
+					rulesCount: entry.injectedRules.length,
+					recordsCount: entry.injectedRuleRecords?.length ?? 0,
+					largestOrdinal: index.ordinal,
+				};
+			}
+			if (!boundaryId && entry.type === "compaction") boundaryId = entry.firstKeptEntryId;
+			if (boundaryId && entry.id === boundaryId) boundaryReached = true;
+			currentId = entry.parentId;
+		}
+		if (!boundaryId || !boundaryReached) return false;
+		const header = this.#fileEntries.find((entry): entry is SessionHeader => entry.type === "session");
+		if (!header) return false;
+		const fixedReservedBytes =
+			runtime.blockCache.budgetBytes +
+			runtime.entryCache.budgetBytes +
+			runtime.tailCache.budgetBytes +
+			REDUCER_BUDGET_BYTES +
+			LABELS_PINS_BUDGET_BYTES +
+			1024 * 1024;
+		const targetAccountedBytes = fixedReservedBytes + retainedAccountedBytes;
+		if (targetAccountedBytes > runtime.accountant.snapshot().budgetBytes) return false;
+		const nextEntries: FileEntry[] = [header, ...retainedLeafToBoundary.reverse()];
+		let transition: PreparedResidentStoreTransition;
+		try {
+			transition = this.#prepareResidentTextStoreTransition(
+				{
+					target: { sessionId: this.#sessionId, sessionFile: this.#sessionFile ?? "" },
+					primary: {
+						mode: "materialize",
+						sourceEntries: nextEntries,
+						sourceStores: {
+							textStore: this.#residentTextBlobStore,
+							imageStore: this.#residentImageBlobStore,
+						},
+					},
+				},
+				"memory-fallback",
+			);
+		} catch {
+			return false;
+		}
+		const accountedDelta = targetAccountedBytes - runtime.accountant.totalBytes;
+		if (accountedDelta > 0 && !runtime.accountant.tryCharge(accountedDelta)) {
+			transition.dispose();
+			return false;
+		}
+		if (accountedDelta < 0) runtime.accountant.release(-accountedDelta);
+		const aggregateUsageStatistics = this.#usageStatistics;
+		this.#fileEntries = nextEntries;
+		this.#byId = new Map(
+			nextEntries.filter((entry): entry is SessionEntry => entry.type !== "session").map(entry => [entry.id, entry]),
+		);
+		this.#commitResidentTextStoreTransition(transition, false);
+		this.#usageStatistics = aggregateUsageStatistics;
+		this.#leafId = leafId;
+		runtime.reducer = reducer;
+		runtime.hotSuffixBytes = retainedBytes;
+		runtime.retirementFirstKeptEntryId = boundaryId;
+		runtime.terminalTransition = { kind: "rebuild", reason: "branch_activation_unpublished" };
+		this.#sidecarBranchActivationDirty = true;
+		this.#retirementFallbackReason = undefined;
+		return true;
+	}
+
 	/** Rehydrate the full hot view (for persistence/materialization paths). */
 	#ensureFullHotView(): void {
 		const runtime = this.#sidecarRuntime;
@@ -9583,6 +9720,7 @@ export class SessionManager {
 		runtime.entryCache.release(runtime.entryCache.allocatedBytes);
 		runtime.tailCache.release(runtime.tailCache.allocatedBytes);
 		this.#bumpEntryRevision();
+		this.#sidecarBranchActivationDirty = false;
 		if (labelsChanged) this.#labelRevision++;
 	}
 
@@ -9712,7 +9850,7 @@ export class SessionManager {
 		try {
 			const indexWriter = this.storage.openWriter(runtime.indexPath, { flags: "a" });
 			try {
-				const indexLine = `${JSON.stringify({ id: entry.id, ordinal: record.ordinal, seq, byteOffset, byteLength, recordDigest })}\n`;
+				const indexLine = `${JSON.stringify({ id: entry.id, ordinal: record.ordinal, seq, byteOffset, byteLength, recordDigest, parentId: entry.parentId, entryType: entry.type })}\n`;
 				indexWriter.writeLineSync(indexLine);
 				if (!indexWriter.fsyncSync) throw new Error("Synchronous sidecar fsync is unavailable");
 				indexWriter.fsyncSync();
@@ -10110,6 +10248,7 @@ export class SessionManager {
 		const boundedCold =
 			persistsToExistingFile &&
 			this.#coldSidecarActive() &&
+			!this.#sidecarBranchActivationDirty &&
 			(boundedExplicit || managedAppendExpectation !== undefined);
 		if (!boundedCold) this.#ensureFullHotView();
 		const entryRevision = this.#entryRevision;
@@ -11291,6 +11430,7 @@ export class SessionManager {
 
 	#appendEntry(entry: SessionEntry): void {
 		this.#assertRecoveryHydrationWritable();
+		if (this.#sidecarBranchActivationDirty) this.#deactivateColdForBranchMutation();
 		const normalizedEntry = normalizeSessionEntryForStorage(entry);
 		const residentEntry = this.#prepareEntryForCurrentResidentStore(normalizedEntry) as SessionEntry;
 		let sidecarAppendCharge = 0;
@@ -12463,6 +12603,10 @@ export class SessionManager {
 	 */
 	branch(branchFromId: string): void {
 		this.#assertRecoveryHydrationWritable();
+		if (this.#activateColdBranch(branchFromId)) {
+			this.#leafRevision++;
+			return;
+		}
 		this.#deactivateColdForBranchMutation();
 		if (!this.#resolveEntry(branchFromId)) throw new Error(`Entry ${branchFromId} not found`);
 		this.#leafId = branchFromId;

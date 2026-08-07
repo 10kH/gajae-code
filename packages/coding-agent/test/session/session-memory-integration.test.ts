@@ -1575,7 +1575,209 @@ describe("branch-heavy retirement", () => {
 		} finally {
 			await reopened.close();
 		}
+	}, 30_000);
+
+	it("activates a compacted cold branch without hydrating inactive history", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/bounded-branch-activation.jsonl";
+		const records = [
+			{ type: "session", version: 5, id: "bounded-branch", timestamp: "0", cwd: "/cwd" },
+			{
+				type: "message",
+				id: "root",
+				parentId: null,
+				timestamp: "0",
+				message: { role: "user", content: "root", timestamp: 0 },
+			},
+			{
+				type: "message",
+				id: "a-kept",
+				parentId: "root",
+				timestamp: "0",
+				message: { role: "user", content: "a-kept", timestamp: 1 },
+			},
+			{
+				type: "model_change",
+				id: "a-model",
+				parentId: "a-kept",
+				timestamp: "0",
+				provider: "p",
+				modelId: "m",
+				role: "reviewer",
+			},
+			{
+				type: "message",
+				id: "a-tail",
+				parentId: "a-model",
+				timestamp: "0",
+				message: { role: "user", content: "a-tail", timestamp: 2 },
+			},
+			{
+				type: "compaction",
+				id: "a-compact",
+				parentId: "a-tail",
+				timestamp: "0",
+				summary: "a summary",
+				firstKeptEntryId: "a-kept",
+				tokensBefore: 100,
+			},
+			...Array.from({ length: 5_000 }, (_, index) => ({
+				type: "message",
+				id: `abandoned-${index}`,
+				parentId: "root",
+				timestamp: "0",
+				message: { role: "user", content: `abandoned-${index}-${"x".repeat(512)}`, timestamp: index + 3 },
+			})),
+			{
+				type: "message",
+				id: "b-kept",
+				parentId: "root",
+				timestamp: "0",
+				message: { role: "user", content: "b-kept", timestamp: 9_000 },
+			},
+			{
+				type: "message",
+				id: "b-tail",
+				parentId: "b-kept",
+				timestamp: "0",
+				message: { role: "user", content: "b-tail", timestamp: 9_001 },
+			},
+			{
+				type: "compaction",
+				id: "b-compact",
+				parentId: "b-tail",
+				timestamp: "0",
+				summary: "b summary",
+				firstKeptEntryId: "b-kept",
+				tokensBefore: 200,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			const commitPath = sidecarPath(sessionFile, "commit");
+			const commitBefore = storage.readTextSync(commitPath);
+			expect(manager.hotRetainedMessageCharsForTests()).toBeLessThan(1024);
+			manager.branch("a-compact");
+			expect(manager.getSessionMemoryStats()).toMatchObject({
+				coldRetirementActive: true,
+				currentCommitTransition: { kind: "rebuild", reason: "branch_activation_unpublished" },
+			});
+			expect(manager.hotRetainedMessageCharsForTests()).toBeLessThan(1024);
+			expect(manager.getBranch().map(entry => entry.id)).toEqual([
+				"root",
+				"a-kept",
+				"a-model",
+				"a-tail",
+				"a-compact",
+			]);
+			expect(manager.getLastModelChangeRole()).toBe("reviewer");
+			expect(storage.readTextSync(commitPath)).toBe(commitBefore);
+			manager.appendMessage({ role: "user", content: "persisted after activation", timestamp: 10_000 });
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
+			expect(manager.hotRetainedMessageCharsForTests()).toBeGreaterThan(2_500_000);
+		} finally {
+			await manager.close();
+		}
 	}, 20_000);
+
+	it("falls back eagerly when an authenticated legacy index lacks branch metadata", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/legacy-branch-index.jsonl";
+		const records = [
+			{ type: "session", version: 5, id: "legacy-branch", timestamp: "0", cwd: "/cwd" },
+			{
+				type: "message",
+				id: "root",
+				parentId: null,
+				timestamp: "0",
+				message: { role: "user", content: "root", timestamp: 0 },
+			},
+			{
+				type: "message",
+				id: "a-kept",
+				parentId: "root",
+				timestamp: "0",
+				message: { role: "user", content: "a", timestamp: 1 },
+			},
+			{
+				type: "message",
+				id: "a-tail",
+				parentId: "a-kept",
+				timestamp: "0",
+				message: { role: "user", content: "a-tail", timestamp: 2 },
+			},
+			{
+				type: "compaction",
+				id: "a-compact",
+				parentId: "a-tail",
+				timestamp: "0",
+				summary: "a",
+				firstKeptEntryId: "a-kept",
+				tokensBefore: 10,
+			},
+			{
+				type: "message",
+				id: "b-kept",
+				parentId: "root",
+				timestamp: "0",
+				message: { role: "user", content: "b", timestamp: 3 },
+			},
+			{
+				type: "message",
+				id: "b-tail",
+				parentId: "b-kept",
+				timestamp: "0",
+				message: { role: "user", content: "b-tail", timestamp: 4 },
+			},
+			{
+				type: "compaction",
+				id: "b-compact",
+				parentId: "b-tail",
+				timestamp: "0",
+				summary: "b",
+				firstKeptEntryId: "b-kept",
+				tokensBefore: 20,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		const destination = SessionManager.explicitDestination("/sessions");
+		const built = await SessionManager.open(sessionFile, destination, storage, "copy-retain", "enabled");
+		await built.close();
+		const indexPath = sidecarPath(sessionFile, "idx");
+		const legacyIndex = `${storage
+			.readTextSync(indexPath)
+			.trimEnd()
+			.split("\n")
+			.map(line => {
+				const record = JSON.parse(line) as Record<string, unknown>;
+				delete record.parentId;
+				delete record.entryType;
+				return JSON.stringify(record);
+			})
+			.join("\n")}\n`;
+		storage.writeTextSync(indexPath, legacyIndex);
+		const commitPath = sidecarPath(sessionFile, "commit");
+		const commit = JSON.parse(storage.readTextSync(commitPath)) as Record<string, unknown>;
+		commit.indexDigest = createHash("sha256").update(legacyIndex).digest("hex");
+		storage.writeTextSync(commitPath, `${JSON.stringify(commit)}\n`);
+
+		const reopened = await SessionManager.open(sessionFile, destination, storage, "copy-retain", "enabled");
+		try {
+			expect(reopened.getSessionMemoryStats().lazyReopenSucceeded).toBe(true);
+			reopened.branch("a-compact");
+			expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(false);
+			expect(reopened.getBranch().map(entry => entry.id)).toEqual(["root", "a-kept", "a-tail", "a-compact"]);
+		} finally {
+			await reopened.close();
+		}
+	});
 });
 describe("session memory mode scope", () => {
 	it("keeps nonpersistent sessions fully eager when enabled mode is requested", () => {
