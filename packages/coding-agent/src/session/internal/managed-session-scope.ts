@@ -25,6 +25,7 @@ import {
 	copyManagedFileNoReplace,
 	ensureManagedDirectory,
 	fsyncManagedArtifactTree,
+	inspectManagedFileNoFollow,
 	MANAGED_ARTIFACT_COPY_BATCH_SIZE,
 	MANAGED_ARTIFACT_MAX_FILES,
 	MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
@@ -749,7 +750,7 @@ function matchesPreflightIdentity(candidate: ManagedCandidate, preflight: Candid
 
 function inspectCandidate(filePath: string, provenance: "v2" | "legacy"): ManagedCandidate | { code: string } {
 	try {
-		const snapshot = captureManagedFileNoFollow(filePath);
+		const snapshot = inspectManagedFileNoFollow(filePath, HEADER_MAX_BYTES);
 		const lineEnd = snapshot.bytes.subarray(0, HEADER_MAX_BYTES).indexOf(0x0a);
 		if (lineEnd < 0) return { code: "invalid_header" };
 		const value: unknown = JSON.parse(snapshot.bytes.subarray(0, lineEnd).toString("utf8"));
@@ -781,7 +782,7 @@ function inspectCandidate(filePath: string, provenance: "v2" | "legacy"): Manage
 				...snapshot.identity,
 				nlink: snapshot.identity.nlink,
 				mtimeMs: Number(named.mtimeMs),
-				sha256: createHash("sha256").update(snapshot.bytes).digest("hex"),
+				sha256: snapshot.identity.sha256,
 			},
 		};
 	} catch (error) {

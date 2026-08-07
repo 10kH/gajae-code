@@ -1925,6 +1925,39 @@ function captureManagedFileNoFollowLimit(pathname: string, maxBytes?: number): M
 	}
 }
 
+/** Streams a managed file once while retaining only a bounded header prefix and the full descriptor-bound digest. */
+export function inspectManagedFileNoFollow(pathname: string, prefixLimit: number): ManagedFileSnapshot {
+	if (!Number.isSafeInteger(prefixLimit) || prefixLimit < 0) throw new Error("invalid_capture_limit");
+	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+	try {
+		const before = fs.fstatSync(fd, { bigint: true });
+		if (!before.isFile() || before.nlink > 1) throw new Error("source_changed");
+		const prefix = Buffer.alloc(Math.min(Number(before.size), prefixLimit));
+		const hash = createHash("sha256");
+		const chunk = Buffer.alloc(64 * 1024);
+		let offset = 0;
+		for (;;) {
+			const count = fs.readSync(fd, chunk, 0, chunk.byteLength, null);
+			if (count === 0) break;
+			hash.update(chunk.subarray(0, count));
+			if (offset < prefix.byteLength) {
+				const copied = Math.min(count, prefix.byteLength - offset);
+				chunk.copy(prefix, offset, 0, copied);
+			}
+			offset += count;
+		}
+		if (offset !== Number(before.size)) throw new Error("source_changed");
+		const after = fs.fstatSync(fd, { bigint: true });
+		if (!sameIdentity(identity(before), identity(after))) throw new Error("source_changed");
+		const named = fs.lstatSync(pathname, { bigint: true });
+		if (!named.isFile() || named.isSymbolicLink() || !sameIdentity(identity(before), identity(named)))
+			throw new Error("source_changed");
+		return { bytes: prefix, identity: identity(before, hash.digest("hex")) };
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
 function captureManagedFileIdentityStreamingNoFollow(pathname: string): ManagedFileSnapshot["identity"] {
 	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
 	try {
