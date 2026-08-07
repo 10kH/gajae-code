@@ -304,6 +304,7 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 			missionsSet: new Set(),
 		});
 		hindsight.lastRecallSnippet = "<memories>overflow recall</memories>";
+		const recallReadSpy = vi.spyOn(hindsight, "getRecallSnippetForInjection");
 		const recallMarkSpy = vi.spyOn(hindsight, "markRecallSnippetInjected");
 		session.setHindsightSessionState(hindsight);
 		session.queueDeferredMessageForTests(
@@ -351,6 +352,7 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 			submitted[0]?.filter(message => message.role === "custom" && message.customType === "hindsight-recall"),
 		).toHaveLength(1);
 		expect(recallMarkSpy).toHaveBeenCalledTimes(1);
+		expect(recallReadSpy).toHaveBeenCalledTimes(1);
 		expect(session.getPendingNextTurnMessagesForTests()).toEqual([]);
 	});
 	it("does not replay pending next-turn context after an accepted provider failure", async () => {
