@@ -2636,6 +2636,7 @@ const TRANSCRIPT_LINE_TERMINATOR = Buffer.from("\n", "utf8");
 
 interface BoundedTranscriptInspection {
 	identity: ResumeSessionIdentity;
+	cwd: string | undefined;
 }
 
 /**
@@ -2665,6 +2666,7 @@ function inspectTranscriptBounded(
 	const decoder = new TextDecoder("utf-8", { fatal: true });
 	let carry = "";
 	let sessionId: string | undefined;
+	let cwd: string | undefined;
 	try {
 		for (let offset = 0; offset < before.size; offset += TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
 			const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, before.size - offset);
@@ -2681,6 +2683,7 @@ function inspectTranscriptBounded(
 					if (parsed.type !== "session" || typeof parsed.id !== "string")
 						return { ok: false, error: { kind: "error", reason: "malformed" } };
 					sessionId = parsed.id;
+					cwd = typeof parsed.cwd === "string" ? parsed.cwd : undefined;
 				}
 			}
 		}
@@ -2709,7 +2712,7 @@ function inspectTranscriptBounded(
 		ctimeNs: before.ctimeNs,
 		sha256: hash.digest("hex"),
 	};
-	return { ok: true, inspection: { identity } };
+	return { ok: true, inspection: { identity, cwd } };
 }
 
 /** Bounded source revalidation comparing the live file to a captured identity. */
@@ -11498,26 +11501,24 @@ export class SessionManager {
 		// owner-only and reparse guards accept.
 		if (storage instanceof FileSessionStorage) filePath = canonicalizeTrustedPath(filePath);
 		if (destination.kind === "explicit" || !(storage instanceof FileSessionStorage)) {
-			// Fail closed on oversized transcripts before the full read in the explicit path too (#3851).
-			// A missing file falls through to loadEntriesFromFile, which returns [] and creates
-			// a fresh session — matching the pre-existing behavior.
-			try {
-				const preStat = storage.statSync(filePath);
-				if (preStat.size > RESUME_TRANSCRIPT_MAX_BYTES) throw new SessionTranscriptOversizedError(preStat.size);
-			} catch (error) {
-				if (error instanceof SessionTranscriptOversizedError) throw error;
-				if (!isEnoent(error)) throw error;
+			const inspected = inspectTranscriptBounded(filePath, storage);
+			if (!inspected.ok) {
+				if (inspected.error.reason === "missing") {
+					const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
+					await manager.#initSessionFile(filePath);
+					return manager;
+				}
+				if (inspected.error.reason === "oversized")
+					throw new SessionTranscriptOversizedError(inspected.error.size ?? 0);
+				throw new Error(`Could not open session: ${inspected.error.reason}`);
 			}
-			const entries = await loadEntriesFromFile(filePath, storage);
-			const header = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
 			const manager = new SessionManager(
-				header?.cwd ?? getProjectDir(),
+				inspected.inspection.cwd ?? getProjectDir(),
 				destination.directory,
 				true,
 				storage,
 				destination,
 			);
-			entries.length = 0;
 			await manager.#initSessionFile(filePath);
 			manager.buildSessionContext();
 			return manager;
