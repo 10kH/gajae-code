@@ -577,6 +577,77 @@ it("applies enabled retirement while constructing a direct fork", async () => {
 		await forked.close();
 	}
 });
+
+it("fails closed for transcript-ahead and tail-ahead reopen states", async () => {
+	class CountingStorage extends MemorySessionStorage {
+		textReads = 0;
+		override readText(filePath: string) {
+			this.textReads++;
+			return super.readText(filePath);
+		}
+	}
+	const buildFixture = async (name: string) => {
+		const storage = new CountingStorage();
+		const sessionFile = `/sessions/${name}.jsonl`;
+		const records = [
+			{ type: "session", version: 5, id: name, timestamp: "0", cwd: "/cwd" },
+			{ type: "custom", id: `${name}-old`, parentId: null, timestamp: "0", customType: "x" },
+			{ type: "custom", id: `${name}-kept`, parentId: `${name}-old`, timestamp: "0", customType: "x" },
+			{
+				type: "compaction",
+				id: `${name}-compaction`,
+				parentId: `${name}-kept`,
+				timestamp: "0",
+				summary: "summary",
+				firstKeptEntryId: `${name}-kept`,
+				tokensBefore: 10,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		const initial = await SessionManager.open(sessionFile, SessionManager.explicitDestination("/sessions"), storage);
+		initial.setSessionMemoryMode("enabled");
+		await initial.close();
+		return { storage, sessionFile };
+	};
+
+	const transcriptAhead = await buildFixture("transcript-ahead");
+	transcriptAhead.storage.writeTextSync(
+		transcriptAhead.sessionFile,
+		`${transcriptAhead.storage.readTextSync(transcriptAhead.sessionFile)}${JSON.stringify({ type: "custom", id: "new-tail", parentId: "transcript-ahead-compaction", timestamp: "0", customType: "x" })}\n`,
+	);
+	transcriptAhead.storage.textReads = 0;
+	const transcriptFallback = await SessionManager.open(
+		transcriptAhead.sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		transcriptAhead.storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		expect(transcriptAhead.storage.textReads).toBeGreaterThan(0);
+		expect(transcriptFallback.getEntry("new-tail")).toMatchObject({ id: "new-tail" });
+	} finally {
+		await transcriptFallback.close();
+	}
+
+	const tailAhead = await buildFixture("tail-ahead");
+	const tailPath = `${tailAhead.sessionFile}.spill.tail`;
+	tailAhead.storage.writeTextSync(tailPath, `${tailAhead.storage.readTextSync(tailPath)}{}\n`);
+	tailAhead.storage.textReads = 0;
+	const tailFallback = await SessionManager.open(
+		tailAhead.sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		tailAhead.storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		expect(tailAhead.storage.textReads).toBeGreaterThan(0);
+		expect(tailFallback.buildSessionContext().messages).toHaveLength(1);
+	} finally {
+		await tailFallback.close();
+	}
+});
 describe("session memory mode across file transitions", () => {
 	it("reapplies enabled retirement and keeps off transitions sidecar-free", async () => {
 		const storage = new MemorySessionStorage();
