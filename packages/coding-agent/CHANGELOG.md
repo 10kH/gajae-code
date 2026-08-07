@@ -17,6 +17,7 @@
 
 ### Changed
 
+- Workflow skills are no longer implicitly auto-routed. The UserPromptSubmit keyword autoroute now matches only explicit `$`-prefixed tokens (`$deep-interview`, `$ralplan`, `$ultragoal`, `$team`); natural-language phrases ("don't assume", "consensus plan", "interview me", "coordinated team") and bare skill names no longer activate workflows. The system prompt now ranks explicit user intent above every routing heuristic, forbids workflow self-invocation and plan stacking, bans task-difficulty overestimation, directs the agent to offer heuristic workflow escalation (especially deep-interview for vague requirements) through the `ask` tool with an opt-out, and adds an `<engineering>` principles section.
 - Deferred notification adapters, native bindings, provider construction, tools, skills, eval, session artifacts, and history storage until their feature paths are used, reducing the CLI startup module graph without changing default behavior.
 - Split SDK session hosting into a transport-neutral runtime and lazy notification adapters.
 
