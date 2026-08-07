@@ -2351,9 +2351,10 @@ export async function acquireManagedLock(
 						try {
 							secureFileDescriptor(lockPath, fd, "verify", true);
 						} catch (error) {
+							const descriptorUnavailable = (error as NodeJS.ErrnoException).code === "EBADF";
 							if (
 								process.platform !== "linux" ||
-								managedSecurityFailureClassification(error) !== "identity_mismatch"
+								(!descriptorUnavailable && managedSecurityFailureClassification(error) !== "identity_mismatch")
 							)
 								throw error;
 							replacementFd = openVerifiedLockReleaseDescriptor(lockPath, lockIdentity);

@@ -101,6 +101,22 @@ describe("managed migration lock lease ownership", () => {
 		}
 	});
 
+	it("reacquires exact Linux release authority when the retained descriptor is closed", async () => {
+		if (process.platform !== "linux") return;
+		const locks = createLockRoot("release-closed-descriptor-recovery");
+		const first = await acquireManagedLock(locks, "migration");
+		let injected = false;
+		ManagedLockTestHooks.beforeReleaseDescriptorVerification = ({ fd }) => {
+			if (injected) return;
+			injected = true;
+			fs.closeSync(fd);
+		};
+
+		await first.release();
+		expect(injected).toBe(true);
+		expect(readLock(first.path).released).toBe(true);
+	});
+
 	it("preserves a successor installed after a released lock was observed", async () => {
 		const locks = createLockRoot("retirement-race");
 		const first = await acquireManagedLock(locks, "migration");
