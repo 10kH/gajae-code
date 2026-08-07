@@ -901,6 +901,9 @@ export type DefaultModelSelectionStage = {
 	readonly entries: readonly FileEntry[];
 	readonly tempPath: string | undefined;
 	readonly persistsToExistingFile: boolean;
+	readonly boundedCold: boolean;
+	readonly appendEntries: readonly SessionEntry[];
+	readonly sourceDescriptor: DescriptorSnapshot | undefined;
 };
 export interface SessionManagerRevisionSnapshot {
 	entry: number;
@@ -9250,6 +9253,30 @@ export class SessionManager {
 		}
 	}
 
+	#coldTailMatchesDisk(): boolean {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled || !runtime.tailPath || typeof this.storage.readRangeSync !== "function") return false;
+		let size: number;
+		try {
+			size = this.storage.statSync(runtime.tailPath).size;
+		} catch {
+			return false;
+		}
+		if (size > runtime.tailCache.budgetBytes) return false;
+		let ordinal = 0;
+		const failure = scanTranscriptLinesBounded(this.storage, runtime.tailPath, size, (_offset, lineBytes) => {
+			const expected = runtime.tail.records[ordinal++];
+			if (!expected) return false;
+			try {
+				const actual = JSON.parse(Buffer.from(lineBytes.subarray(0, lineBytes.byteLength - 1)).toString("utf8"));
+				if (JSON.stringify(actual) !== JSON.stringify(expected)) return false;
+			} catch {
+				return false;
+			}
+		});
+		return failure === undefined && ordinal === runtime.tail.records.length;
+	}
+
 	#findColdEntryIndex(id: string): ColdEntryIndex | undefined {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled || !runtime.indexPath || typeof this.storage.readRangeSync !== "function") return undefined;
@@ -9787,6 +9814,52 @@ export class SessionManager {
 		});
 	}
 
+	async #writeBoundedDefaultModelSelection(
+		appendEntries: readonly SessionEntry[],
+		sessionFile: string,
+		sourceDescriptor: DescriptorSnapshot,
+	): Promise<string> {
+		if (this.destination.kind === "managed" || typeof this.storage.openStagedWriter !== "function")
+			throw new Error("bounded_default_selection_unsupported");
+		const dir = path.resolve(sessionFile, "..");
+		const tempPath = path.join(dir, `.${path.basename(sessionFile)}.${Snowflake.next()}.default-selection.tmp`);
+		const staged = this.storage.openStagedWriter(tempPath);
+		try {
+			const scanFailure = scanTranscriptLinesBounded(
+				this.storage,
+				sessionFile,
+				sourceDescriptor.size,
+				(_offset, lineBytes) => {
+					staged.writeLine(lineBytes.subarray(0, lineBytes.byteLength - 1));
+				},
+			);
+			if (scanFailure) throw new Error(`bounded_default_selection_${scanFailure}`);
+			for (const entry of appendEntries) {
+				const persisted = prepareEntryForPersistenceSync(entry, this.#blobStore);
+				staged.writeLine(Buffer.from(JSON.stringify(persisted), "utf8"));
+			}
+			staged.fsync();
+			staged.closeSync();
+			staged.publishNoReplace();
+			const after = this.#managedDescriptorSnapshotOrNull();
+			if (!after || !sameDescriptor(sourceDescriptor, after))
+				throw new Error("bounded_default_selection_source_changed");
+			return tempPath;
+		} catch (error) {
+			try {
+				staged.closeSync();
+			} catch {
+				// Preserve the staging failure.
+			}
+			try {
+				this.storage.unlinkSync(tempPath);
+			} catch {
+				// A successfully published temp may already have been removed by cleanup.
+			}
+			throw toError(error);
+		}
+	}
+
 	async #writeStagedDefaultModelSelection(
 		entries: readonly FileEntry[],
 		sessionFile: string,
@@ -9893,13 +9966,27 @@ export class SessionManager {
 		thinkingLevel: string | undefined,
 		options?: { readonly appendThinkingLevel: boolean },
 	): Promise<DefaultModelSelectionStage> {
-		this.#ensureFullHotView();
+		const sessionFile = this.#sessionFile;
+		const persistsToExistingFile = this.persist && sessionFile !== undefined && this.storage.existsSync(sessionFile);
+		const boundedCold =
+			persistsToExistingFile &&
+			this.#coldSidecarActive() &&
+			this.destination.kind !== "managed" &&
+			typeof this.storage.openStagedWriter === "function" &&
+			typeof this.storage.readRangeSync === "function";
+		if (!boundedCold) this.#ensureFullHotView();
 		const entryRevision = this.#entryRevision;
 		const leafRevision = this.#leafRevision;
 		const headerExportRevision = this.#headerExportRevision;
 		const sessionId = this.#sessionId;
-		const sessionFile = this.#sessionFile;
-		const entryIds = new Map(this.#byId);
+		const generatedIds = new Set<string>();
+		const entryIds = {
+			has: (id: string): boolean =>
+				generatedIds.has(id) || this.#byId.has(id) || (boundedCold && this.#findColdEntryIndex(id) !== undefined),
+			set: (id: string, _entry?: SessionEntry): void => {
+				generatedIds.add(id);
+			},
+		};
 		let parentId = this.#leafId;
 		const entries = [...this.#fileEntries];
 		const temporaryEntry: ModelChangeEntry = {
@@ -9934,9 +10021,15 @@ export class SessionManager {
 			role: "default",
 		};
 		entries.push(modelEntry);
-		const persistsToExistingFile = this.persist && sessionFile !== undefined && this.storage.existsSync(sessionFile);
+		const sourceDescriptor = boundedCold ? (this.#managedDescriptorSnapshotOrNull() ?? undefined) : undefined;
+		if (boundedCold && !sourceDescriptor) throw new Error("bounded_default_selection_source_unavailable");
+		if (boundedCold && (!this.#coldIndexDigestValid() || !this.#coldTailMatchesDisk()))
+			throw new Error("bounded_default_selection_sidecar_changed");
+		const appendEntries = entries.slice(this.#fileEntries.length) as SessionEntry[];
 		const tempPath = persistsToExistingFile
-			? await this.#writeStagedDefaultModelSelection(entries, sessionFile)
+			? boundedCold
+				? await this.#writeBoundedDefaultModelSelection(appendEntries, sessionFile, sourceDescriptor!)
+				: await this.#writeStagedDefaultModelSelection(entries, sessionFile)
 			: undefined;
 		return {
 			entryRevision,
@@ -9947,6 +10040,9 @@ export class SessionManager {
 			entries,
 			tempPath,
 			persistsToExistingFile,
+			boundedCold,
+			appendEntries,
+			sourceDescriptor,
 		};
 	}
 
@@ -9959,6 +10055,17 @@ export class SessionManager {
 			stage.sessionFile !== this.#sessionFile
 		) {
 			return { kind: "not_promoted" };
+		}
+		if (stage.boundedCold) {
+			const currentDescriptor = this.#managedDescriptorSnapshotOrNull();
+			if (
+				!stage.sourceDescriptor ||
+				!currentDescriptor ||
+				!sameDescriptor(stage.sourceDescriptor, currentDescriptor) ||
+				!this.#coldIndexDigestValid() ||
+				!this.#coldTailMatchesDisk()
+			)
+				return { kind: "not_promoted" };
 		}
 		let transition: PreparedResidentStoreTransition;
 		try {
@@ -10016,7 +10123,55 @@ export class SessionManager {
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#flushed = stage.persistsToExistingFile;
 		this.#ensuredOnDisk = stage.persistsToExistingFile;
-		this.#commitResidentTextStoreTransition(transition);
+		if (!stage.boundedCold) {
+			this.#commitResidentTextStoreTransition(transition);
+			return { kind: "promoted" };
+		}
+		const aggregateUsage = this.#usageStatistics;
+		this.#commitResidentTextStoreTransition(transition, false);
+		this.#usageStatistics = aggregateUsage;
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled) return { kind: "promoted" };
+		const persisted = stage.appendEntries.map(entry => ({
+			entry,
+			line: Buffer.from(`${JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))}\n`, "utf8"),
+		}));
+		const appendBytes = persisted.reduce((total, item) => total + item.line.byteLength, 0);
+		const accountedBytes = persisted.reduce((total, item) => total + residentHotEntryBytes(item.line.byteLength), 0);
+		const tailBytes = persisted.reduce(
+			(total, item) =>
+				total +
+				tailRecordResidentBytes({
+					seq: 0,
+					kind: tailRecordKindForEntry(item.entry),
+					ordinal: 0,
+					id: item.entry.id,
+					parentId: item.entry.parentId,
+					type: item.entry.type,
+					byteOffset: 0,
+					byteLength: item.line.byteLength,
+					recordDigest: "0".repeat(64),
+				}),
+			0,
+		);
+		if (
+			runtime.hotSuffixBytes + appendBytes > this.#sidecarHotSuffixBudgetBytes ||
+			!runtime.accountant.tryCharge(accountedBytes) ||
+			!runtime.tailCache.tryAllocate(tailBytes)
+		) {
+			this.#ensureFullHotView();
+			return { kind: "promoted" };
+		}
+		for (const item of persisted) {
+			this.#applySidecarReducerDelta(item.entry);
+			if (!this.#appendColdSidecarRecord(item.entry, item.line)) {
+				this.#ensureFullHotView();
+				return { kind: "promoted" };
+			}
+			runtime.hotSuffixBytes += item.line.byteLength;
+		}
+		this.#publishCommitMarkerFromCurrentTranscriptSync();
+		runtime.terminalTransition = this.#classifySidecarReopen();
 		return { kind: "promoted" };
 	}
 

@@ -1015,6 +1015,82 @@ describe("session memory mode across file transitions", () => {
 		}
 	});
 });
+it("stages and promotes default model selection without hydrating retired history", async () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/bounded-default-selection.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "bounded-selection", timestamp: "0", cwd: "/cwd" },
+		{
+			type: "message",
+			id: "cold-old",
+			parentId: null,
+			timestamp: "0",
+			message: { role: "user", content: "x".repeat(100_000), timestamp: 1 },
+		},
+		{
+			type: "message",
+			id: "kept",
+			parentId: "cold-old",
+			timestamp: "0",
+			message: { role: "user", content: "kept", timestamp: 2 },
+		},
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 10,
+		},
+	];
+	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	const manager = await SessionManager.open(
+		sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		const retainedBefore = manager.hotRetainedMessageCharsForTests();
+		const stage = await manager.stageDefaultModelSelection("provider/model", "high", { appendThinkingLevel: true });
+		expect(stage.boundedCold).toBe(true);
+		expect(manager.hotRetainedMessageCharsForTests()).toBe(retainedBefore);
+		expect(manager.promoteDefaultModelSelection(stage)).toEqual({ kind: "promoted" });
+		expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		expect(manager.getLastModelChangeRole()).toBe("default");
+		expect(manager.getEntry("cold-old")).toMatchObject({ id: "cold-old" });
+		const staleStage = await manager.stageDefaultModelSelection("provider/other", "low", {
+			appendThinkingLevel: true,
+		});
+		const tailPath = `${sessionFile}.spill.tail`;
+		const tailText = storage.readTextSync(tailPath);
+		storage.writeTextSync(tailPath, `${tailText}{}\n`);
+		expect(manager.promoteDefaultModelSelection(staleStage)).toEqual({ kind: "not_promoted" });
+		storage.writeTextSync(tailPath, tailText);
+		await manager.discardDefaultModelSelectionStage(staleStage);
+	} finally {
+		await manager.close();
+	}
+	const reopened = await SessionManager.open(
+		sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		expect(reopened.getSessionMemoryStats()).toMatchObject({
+			coldRetirementActive: true,
+			lazyReopenSucceeded: true,
+		});
+		expect(reopened.getLastModelChangeRole()).toBe("default");
+	} finally {
+		await reopened.close();
+	}
+});
+
 describe("malformed transcript sidecar fallback", () => {
 	it("keeps malformed known records eager", async () => {
 		const storage = new MemorySessionStorage();
