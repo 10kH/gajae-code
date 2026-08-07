@@ -10260,6 +10260,25 @@ export class SessionManager {
 		if (this.#persistError) throw this.#persistError;
 	}
 
+	#releaseClosedSessionState(): void {
+		const runtime = this.#sidecarRuntime;
+		if (runtime) {
+			runtime.enabled = false;
+			runtime.accountant.release(runtime.accountant.totalBytes);
+			runtime.coldEntries.clear();
+			runtime.tail = { ...runtime.tail, records: [] };
+			runtime.labelsPins.clear();
+			runtime.blockCache.release(runtime.blockCache.allocatedBytes);
+			runtime.entryCache.release(runtime.entryCache.allocatedBytes);
+			runtime.tailCache.release(runtime.tailCache.allocatedBytes);
+			this.#sidecarRuntime = undefined;
+		}
+		this.#fileEntries = [];
+		this.#byId.clear();
+		this.#labelsById.clear();
+		this.#resetMaterializedCaches();
+	}
+
 	/** Close the persistent writer after flushing all pending data. */
 	async close(): Promise<void> {
 		// Drain any uncommitted prepared successors before releasing resources so
@@ -10281,6 +10300,7 @@ export class SessionManager {
 		await this.#drainEphemeralArtifactCleanups();
 		this.#releaseResidentTextStore();
 		this.#releaseOwnedManagedAuthority();
+		this.#releaseClosedSessionState();
 		if (this.#persistError) throw this.#persistError;
 	}
 	/** Flush while open, then strictly close; retryable close skips the invalid second flush. */
@@ -10344,6 +10364,8 @@ export class SessionManager {
 			} catch (error) {
 				outcome = { kind: "close_unknown", error: toError(error) };
 			}
+			this.#releaseOwnedManagedAuthority();
+			this.#releaseClosedSessionState();
 		}
 		return outcome;
 	}
@@ -12663,6 +12685,107 @@ export class SessionManager {
 		return opened.path;
 	}
 
+	async #tryForkFromBoundedSource(sourcePath: string, identity: ResumeSessionIdentity): Promise<boolean> {
+		if (
+			this.#sessionMemoryMode !== "enabled" ||
+			this.destination.kind === "managed" ||
+			typeof this.storage.readRangeSync !== "function" ||
+			typeof this.storage.openStagedWriter !== "function"
+		)
+			return false;
+		let sourceHeader: SessionHeader | undefined;
+		let previousId: string | null = null;
+		let ordinal = 0;
+		let sawCompaction = false;
+		let preflightRejected = false;
+		const preflightFailure = scanTranscriptLinesBounded(
+			this.storage,
+			sourcePath,
+			identity.size,
+			(_offset, lineBytes) => {
+				try {
+					const record = JSON.parse(
+						Buffer.from(lineBytes.subarray(0, lineBytes.byteLength - 1)).toString("utf8"),
+					) as FileEntry | SessionPatchRecord;
+					if (ordinal++ === 0) {
+						if (
+							record.type !== "session" ||
+							record.version !== CURRENT_SESSION_VERSION ||
+							record.id !== identity.sessionId
+						)
+							preflightRejected = true;
+						else sourceHeader = record;
+						return !preflightRejected;
+					}
+					if (
+						record.type === "session" ||
+						record.type === "header_patch" ||
+						record.type === "entry_patch" ||
+						typeof record.id !== "string" ||
+						record.id === previousId ||
+						record.parentId !== previousId ||
+						collectCheckpointBlobRefs(record).size > 0
+					) {
+						preflightRejected = true;
+						return false;
+					}
+					previousId = record.id;
+					if (record.type === "compaction") sawCompaction = true;
+				} catch {
+					preflightRejected = true;
+					return false;
+				}
+			},
+		);
+		if (preflightFailure || preflightRejected || !sourceHeader || !sawCompaction) return false;
+		if (revalidateTranscriptIdentityBounded(sourcePath, this.storage, identity).kind !== "valid")
+			throw new Error("fork_source_identity_changed");
+		const fresh = this.#freshSessionState({ parentSession: sourceHeader.id });
+		fresh.header.title = sourceHeader.title;
+		fresh.header.titleSource = sourceHeader.titleSource;
+		if (!fresh.sessionFile) return false;
+		const staged = this.storage.openStagedWriter(fresh.sessionFile);
+		let published = false;
+		try {
+			let ordinal = 0;
+			const copyFailure = scanTranscriptLinesBounded(
+				this.storage,
+				sourcePath,
+				identity.size,
+				(_offset, lineBytes) => {
+					if (ordinal++ === 0) {
+						staged.writeLine(Buffer.from(JSON.stringify(fresh.header), "utf8"));
+						return;
+					}
+					const record = JSON.parse(
+						Buffer.from(lineBytes.subarray(0, lineBytes.byteLength - 1)).toString("utf8"),
+					) as SessionEntry;
+					if (record.type === "message" && record.message.role === "assistant")
+						record.message = sanitizeRehydratedOpenAIResponsesAssistantMessage(record.message);
+					staged.writeLine(Buffer.from(JSON.stringify(record), "utf8"));
+				},
+			);
+			if (copyFailure) throw new Error(`fork_bounded_copy_${copyFailure}`);
+			staged.fsync();
+			staged.closeSync();
+			staged.publishNoReplace();
+			published = true;
+			if (revalidateTranscriptIdentityBounded(sourcePath, this.storage, identity).kind !== "valid")
+				throw new Error("fork_source_identity_changed");
+			await this.#initSessionFile(fresh.sessionFile);
+			writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
+			return true;
+		} catch (error) {
+			try {
+				staged.closeSync();
+			} catch {
+				// Preserve the fork failure.
+			}
+			if (published) await this.storage.deleteSessionWithArtifacts(fresh.sessionFile);
+			throw error;
+		}
+	}
+
 	/**
 	 * Fork a session into the current project directory.
 	 * Copies history from another session file while creating a new session file in the current sessionDir.
@@ -12683,6 +12806,14 @@ export class SessionManager {
 		const dir = destination.directory;
 		const manager = new SessionManager(cwd, dir, true, storage, destination);
 		manager.#sessionMemoryMode = sessionMemoryMode;
+		if (sessionMemoryMode === "enabled" && destination.kind !== "managed") {
+			const inspected = inspectTranscriptBounded(managedSourcePath, storage);
+			if (
+				inspected.ok &&
+				(await manager.#tryForkFromBoundedSource(managedSourcePath, inspected.inspection.identity))
+			)
+				return manager;
+		}
 		const forkEntries = await loadEntriesFromFile(managedSourcePath, storage);
 		migrateToCurrentVersion(forkEntries);
 		await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);

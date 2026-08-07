@@ -76,7 +76,55 @@ if (process.env.GJC_SESSION_MEMORY_RSS_SELECTION === "1") {
 	selectionSamples.push(collect());
 }
 const stats = manager.getSessionMemoryStats();
-await manager.close();
+let managerClosed = false;
+let forkSamples: Array<{ rss: number; heapUsed: number; external: number }> = [];
+let forkStats: { coldRetirementActive: boolean; totalAccountedBytes: number } | undefined;
+if (process.env.GJC_SESSION_MEMORY_RSS_FORK === "1") {
+	await manager.close();
+	managerClosed = true;
+	const warmSource = path.join(root, "fork-warm.jsonl");
+	fs.writeFileSync(
+		warmSource,
+		[
+			{ type: "session", version: 5, id: "fork-warm", timestamp: "0", cwd: root },
+			{ type: "custom", id: "warm", parentId: null, timestamp: "0", customType: "rss", data: {} },
+			{
+				type: "compaction",
+				id: "warm-compaction",
+				parentId: "warm",
+				timestamp: "0",
+				summary: "warm",
+				firstKeptEntryId: "warm",
+				tokensBefore: 1,
+			},
+		]
+			.map(value => JSON.stringify(value))
+			.join("\n") + "\n",
+	);
+	const warmed = await SessionManager.forkFrom(
+		warmSource,
+		root,
+		SessionManager.explicitDestination(path.join(root, "fork-warm-output")),
+		undefined,
+		"copy-retain",
+		"enabled",
+	);
+	await warmed.close();
+	forkSamples = [collect()];
+	const forked = await SessionManager.forkFrom(
+		sessionFile,
+		root,
+		SessionManager.explicitDestination(path.join(root, "forks")),
+		undefined,
+		"copy-retain",
+		"enabled",
+	);
+	await Bun.sleep(0);
+	forkSamples.push(collect());
+	forkStats = forked.getSessionMemoryStats();
+	await forked.close();
+}
+if (!managerClosed) await manager.close();
 if (process.env.GJC_SESSION_MEMORY_RSS_KEEP !== "1") fs.rmSync(root, { recursive: true, force: true });
 
 process.stdout.write(
@@ -94,6 +142,8 @@ process.stdout.write(
 		cycleRecords,
 		cycleSamples,
 		selectionSamples,
+		forkSamples,
+		forkStats,
 		stats,
 	})}\n`,
 );

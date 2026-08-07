@@ -546,7 +546,18 @@ it("reopens an enabled explicit session from authenticated hot-tail metadata", a
 });
 
 it("applies enabled retirement while constructing a direct fork", async () => {
-	const storage = new MemorySessionStorage();
+	class ForkCountingStorage extends MemorySessionStorage {
+		fullReads = 0;
+		override readTextSync(filePath: string): string {
+			if (!filePath.includes(".spill.")) this.fullReads++;
+			return super.readTextSync(filePath);
+		}
+		override readBytesSync(filePath: string): Uint8Array {
+			if (!filePath.includes(".spill.")) this.fullReads++;
+			return super.readBytesSync(filePath);
+		}
+	}
+	const storage = new ForkCountingStorage();
 	const source = "/sessions/fork-source.jsonl";
 	const records = [
 		{ type: "session", version: 5, id: "fork-source", timestamp: "0", cwd: "/cwd" },
@@ -573,6 +584,7 @@ it("applies enabled retirement while constructing a direct fork", async () => {
 	);
 	try {
 		expect(forked.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		expect(storage.fullReads).toBe(0);
 		expect(forked.getEntry("old")).toMatchObject({ id: "old" });
 	} finally {
 		await forked.close();
