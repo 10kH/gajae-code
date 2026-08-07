@@ -348,7 +348,7 @@ export async function uninstallGjcBundle(
 	return withRegistryLock(identity.scope, ctx.cwd, async () => {
 		let registry: Awaited<ReturnType<typeof readRegistry>>;
 		try {
-			registry = await readRegistry(identity.scope, ctx.cwd);
+			registry = await readRegistry(identity.scope, ctx.cwd, { migrate: false });
 		} catch (error) {
 			if (isMalformedRegistryError(error)) return { ok: false, error: uninstallFailure(identity, "metadata") };
 			throw error;

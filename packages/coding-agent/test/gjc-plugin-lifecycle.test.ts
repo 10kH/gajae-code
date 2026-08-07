@@ -199,7 +199,7 @@ describe("GJC bundle lifecycle", () => {
 
 		expect(result).toMatchObject({ ok: false, error: { code: "invalid_target" } });
 		await expect(fs.readFile(sentinel, "utf8")).resolves.toBe("not yours to delete");
-		expect((await readRegistry("user", cwd)).plugins).toHaveLength(1);
+		expect((await readRegistry("user", cwd, { migrate: false })).plugins).toHaveLength(1);
 	});
 
 	test("installs the same bundle again after an uninstall", async () => {

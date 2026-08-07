@@ -93,6 +93,15 @@
 					"type": "boolean",
 					"description": "At interactive startup, notify of newer versions; never install. Use `gjc update` only for recognized Bun global, Windows npm, or bundled-installer binaries; source, linked, and unrecognized installs use their original method.",
 					"default": true
+				},
+				"updateChannel": {
+					"type": "string",
+					"enum": [
+						"stable",
+						"nightly"
+					],
+					"description": "Release channel used by `gjc update` and the startup update check",
+					"default": "stable"
 				}
 			},
 			"additionalProperties": false
@@ -1141,7 +1150,6 @@
 			"description": "Predict your likely next prompt after each turn (smol-model call) and show it as ghost text; Tab accepts",
 			"default": false
 		},
-
 		"starReminder": {
 			"type": "object",
 			"properties": {
