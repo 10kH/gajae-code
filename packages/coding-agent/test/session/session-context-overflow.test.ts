@@ -391,6 +391,23 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 			),
 		).toEqual([]);
 	});
+	it("rethrows the original overflow after one failed forced compaction without continuation", async () => {
+		await session.dispose();
+		await makeSession({ "compaction.keepRecentTokens": 1 });
+		appendConversation("failure");
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		const overflow = new SessionContextTooLargeError(70 * 1024 * 1024);
+		const buildSpy = vi.spyOn(sessionManager, "buildSessionContext").mockImplementationOnce(() => {
+			throw overflow;
+		});
+		compactSpy.mockRejectedValue(new Error("forced compaction failed"));
+
+		await expect(session.prompt("overflow")).rejects.toBe(overflow);
+		expect(buildSpy).toHaveBeenCalledTimes(1);
+		// The single forced workflow tries its configured maintenance-model fallback before stopping.
+		expect(compactSpy).toHaveBeenCalledTimes(2);
+		expect(promptSpy).not.toHaveBeenCalled();
+	});
 	it("keeps synchronous overflow protection on while the async recovery switch is disabled", async () => {
 		await session.dispose();
 		authStorage.close();
