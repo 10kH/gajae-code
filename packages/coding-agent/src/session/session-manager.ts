@@ -9233,11 +9233,29 @@ export class SessionManager {
 		return retired;
 	}
 
+	#coldIndexDigestValid(): boolean {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled || !runtime.indexPath || typeof this.storage.readRangeSync !== "function") return false;
+		let size: number;
+		try {
+			size = this.storage.statSync(runtime.indexPath).size;
+			const hash = crypto.createHash("sha256");
+			for (let offset = 0; offset < size; offset += 64 * 1024) {
+				const length = Math.min(64 * 1024, size - offset);
+				hash.update(this.storage.readRangeSync(runtime.indexPath, offset, length).bytes);
+			}
+			return hash.digest("hex") === runtime.indexDigest;
+		} catch {
+			return false;
+		}
+	}
+
 	#findColdEntryIndex(id: string): ColdEntryIndex | undefined {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled || !runtime.indexPath || typeof this.storage.readRangeSync !== "function") return undefined;
 		const cached = runtime.coldEntries.get(id);
 		if (cached) return cached;
+		if (!this.#coldIndexDigestValid()) return undefined;
 		let size: number;
 		try {
 			size = this.storage.statSync(runtime.indexPath).size;
@@ -9290,6 +9308,7 @@ export class SessionManager {
 	#readAllColdEntryIndexes(): Array<ColdEntryIndex & { id: string }> {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled || !runtime.indexPath || typeof this.storage.readRangeSync !== "function") return [];
+		if (!this.#coldIndexDigestValid()) return [];
 		let size: number;
 		try {
 			size = this.storage.statSync(runtime.indexPath).size;
@@ -9318,7 +9337,7 @@ export class SessionManager {
 					)
 						result.push(value as ColdEntryIndex & { id: string });
 				} catch {
-					// Ignore corrupt disposable index lines; callers fail closed on missing entries.
+					return [];
 				}
 			}
 		}

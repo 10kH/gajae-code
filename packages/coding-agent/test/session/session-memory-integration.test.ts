@@ -707,6 +707,7 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 	// The marker published by the bounded first open is accepted by the existing
 	// authenticated explicit lazy reopen path (exact offsets, digests, and the
 	// rolling tail proof all round-trip).
+	const exactIndexText = storage.readTextSync(`${sessionFile}.spill.idx`);
 	storage.textReads = 0;
 	storage.textSyncReads = 0;
 	storage.bytesReads = 0;
@@ -729,6 +730,9 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 			lazyReopenFallbackReason: undefined,
 			lastReopenTransition: { kind: "exact", reason: "descriptor_and_proof_match" },
 		});
+		storage.writeTextSync(`${sessionFile}.spill.idx`, `${exactIndexText}{}\n`);
+		expect(reopened.getEntry("cold-old")).toBeUndefined();
+		storage.writeTextSync(`${sessionFile}.spill.idx`, exactIndexText);
 		expect(reopened.getEntry("cold-old")).toMatchObject({ id: "cold-old", type: "message" });
 		expect(reopened.buildSessionContext().messages).toHaveLength(3);
 		expect(reopened.getUsageStatistics()).toMatchObject({ cost: 12 });
