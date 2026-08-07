@@ -56,20 +56,14 @@
 		"README.md",
 		"CHANGELOG.md"
 	],
-
 	"exports": {
-		"./core": {
-			"types": "./src/core.ts",
-			"import": "./src/core.ts"
-		},
 		".": {
 			"types": "./src/index.ts",
 			"import": "./src/index.ts"
 		},
 		"./*": {
 			"types": "./src/*.ts",
-			"import": "./src/*.ts",
-			"require": "./src/*.ts"
+			"import": "./src/*.ts"
 		},
 		"./auth-broker": {
 			"types": "./src/auth-broker/index.ts",
@@ -101,8 +95,7 @@
 		},
 		"./providers/*": {
 			"types": "./src/providers/*.ts",
-			"import": "./src/providers/*.ts",
-			"require": "./src/providers/*.ts"
+			"import": "./src/providers/*.ts"
 		},
 		"./providers/cursor/gen/*": {
 			"types": "./src/providers/cursor/gen/*.ts",

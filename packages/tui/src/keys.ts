@@ -19,14 +19,11 @@
  */
 
 import type { KeyEventType } from "@gajae-code/natives";
-
-type NativeKeyBindings = Pick<typeof import("@gajae-code/natives"), "matchesKey" | "parseKey" | "parseKittySequence">;
-let nativeKeyBindings: NativeKeyBindings | undefined;
-
-function nativeKeys(): NativeKeyBindings {
-	if (!nativeKeyBindings) nativeKeyBindings = require("@gajae-code/natives") as NativeKeyBindings;
-	return nativeKeyBindings;
-}
+import {
+	matchesKey as matchesKeyNative,
+	parseKey as parseKeyNative,
+	parseKittySequence as parseKittySequenceNative,
+} from "@gajae-code/natives";
 
 // =============================================================================
 // Platform Detection
@@ -488,7 +485,7 @@ export function isKeyRepeat(data: string): boolean {
 }
 
 export function parseKittySequence(data: string): ParsedKittySequence | null {
-	const result = nativeKeys().parseKittySequence(data);
+	const result = parseKittySequenceNative(data);
 	if (!result) return null;
 	return {
 		codepoint: result.codepoint,
@@ -641,7 +638,7 @@ export function decodePrintableKey(data: string): string | undefined {
  * @param keyId - Key identifier (e.g., "ctrl+c", "escape", Key.ctrl("c"))
  */
 export function matchesKey(data: string, keyId: KeyId): boolean {
-	return nativeKeys().matchesKey(data, keyId, kittyProtocolActive);
+	return matchesKeyNative(data, keyId, kittyProtocolActive);
 }
 
 /**
@@ -653,5 +650,5 @@ export function matchesKey(data: string, keyId: KeyId): boolean {
  * @param data - Raw input data from terminal
  */
 export function parseKey(data: string): string | undefined {
-	return nativeKeys().parseKey(data, kittyProtocolActive) ?? undefined;
+	return parseKeyNative(data, kittyProtocolActive) ?? undefined;
 }

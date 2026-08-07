@@ -17,7 +17,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import type { Model, Usage } from "@gajae-code/ai/core";
+import type { Model, Usage } from "@gajae-code/ai";
 import { $pickenv, prompt, Snowflake } from "@gajae-code/utils";
 import type { ToolSession } from "..";
 import { AsyncJobManager, OwnerSubagentShutdownError, type ResumeRunner, type SubagentRunOutcome } from "../async";
@@ -1387,7 +1387,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						currentJobGeneration: manager.getJob(jobId)?.generation,
 						historicalJobIds: [],
 						status: manager.getJob(jobId)?.status ?? "running",
-						sessionFile: subtaskSessionFile,
+						sessionFile: null,
 						resumable: true,
 						duplicateIdentity: duplicateIdentityKey(admission.identity),
 						duplicateDisposition: admission.disposition?.action,
@@ -2019,7 +2019,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentArtifactManager,
 						parentHindsightSessionState: this.session.getHindsightSessionState?.(),
 						parentTelemetry: this.session.getTelemetry?.(),
-						parentMcpManager: this.session.getMcpManager?.(),
 						forkContextSeed,
 					});
 					return {
@@ -2094,7 +2093,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentArtifactManager,
 						parentHindsightSessionState: this.session.getHindsightSessionState?.(),
 						parentTelemetry: this.session.getTelemetry?.(),
-						parentMcpManager: this.session.getMcpManager?.(),
 						forkContextSeed,
 					});
 					let capturedResult = {

@@ -1,7 +1,4 @@
-// W6b: mcp:// resolution reads the scope-held facade from ResolveContext, never
-// MCPManager.instance(); the manager type stays type-only so the singleton keeps
-// no routing role.
-import type { MCPManager } from "../runtime-mcp/manager";
+import { MCPManager } from "../runtime-mcp/manager";
 import type { MCPResourceReadResult } from "../runtime-mcp/types";
 import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
 
@@ -169,11 +166,12 @@ export class McpProtocolHandler implements ProtocolHandler {
 	readonly scheme = "mcp";
 	readonly immutable = true;
 
-	async resolve(url: InternalUrl, context?: import("./types").ResolveContext): Promise<InternalResource> {
-		const mcpManager = context?.mcpManager;
+	async resolve(url: InternalUrl): Promise<InternalResource> {
+		const mcpManager = MCPManager.instance();
 		if (!mcpManager) {
-			throw new Error("No MCP manager available in the current scope. MCP servers may not be configured.");
+			throw new Error("No MCP manager available. MCP servers may not be configured.");
 		}
+
 		const uri = extractResourceUri(url);
 		const targetServer = resolveTargetServer(mcpManager, uri);
 		if (!targetServer) {

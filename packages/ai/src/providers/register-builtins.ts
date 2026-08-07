@@ -50,21 +50,6 @@ interface LazyProviderModule<TApi extends Api> {
 	stream: (model: Model<TApi>, context: Context, options: OptionsForApi<TApi>) => AsyncIterable<AssistantMessageEvent>;
 }
 
-/**
- * Lazy runtime descriptor for a built-in provider implementation.
- *
- * The registry stores descriptors with an erased module type because each
- * provider's stream options are intentionally different. Callers narrow the
- * loaded module at the single API dispatch boundary instead of forcing
- * distributive variance through the collection type.
- */
-export interface ProviderRuntimeDescriptor<TApi extends Api = Api, TModule = unknown> {
-	readonly api: TApi;
-	readonly load: () => Promise<TModule>;
-}
-
-type ErasedProviderRuntimeDescriptor = ProviderRuntimeDescriptor<Api, any>;
-
 interface AnthropicProviderModule {
 	streamAnthropic: (
 		model: Model<"anthropic-messages">,
@@ -354,80 +339,80 @@ function createLazyStream<TApi extends Api>(
 // ---------------------------------------------------------------------------
 
 function loadAnthropicProviderModule(): Promise<LazyProviderModule<"anthropic-messages">> {
-	anthropicProviderModulePromise ||= Promise.resolve().then(() => {
-		const provider = require("./anthropic") as AnthropicProviderModule;
+	anthropicProviderModulePromise ||= import("./anthropic").then(module => {
+		const provider = module as AnthropicProviderModule;
 		return { stream: provider.streamAnthropic };
 	});
 	return anthropicProviderModulePromise;
 }
 
 function loadAzureOpenAIResponsesProviderModule(): Promise<LazyProviderModule<"azure-openai-responses">> {
-	azureOpenAIResponsesProviderModulePromise ||= Promise.resolve().then(() => {
-		const provider = require("./azure-openai-responses") as AzureOpenAIResponsesProviderModule;
+	azureOpenAIResponsesProviderModulePromise ||= import("./azure-openai-responses").then(module => {
+		const provider = module as AzureOpenAIResponsesProviderModule;
 		return { stream: provider.streamAzureOpenAIResponses };
 	});
 	return azureOpenAIResponsesProviderModulePromise;
 }
 
 function loadGoogleProviderModule(): Promise<LazyProviderModule<"google-generative-ai">> {
-	googleProviderModulePromise ||= Promise.resolve().then(() => {
-		const provider = require("./google") as GoogleProviderModule;
+	googleProviderModulePromise ||= import("./google").then(module => {
+		const provider = module as GoogleProviderModule;
 		return { stream: provider.streamGoogle };
 	});
 	return googleProviderModulePromise;
 }
 
 function loadGoogleGeminiCliProviderModule(): Promise<LazyProviderModule<"google-gemini-cli">> {
-	googleGeminiCliProviderModulePromise ||= Promise.resolve().then(() => {
-		const provider = require("./google-gemini-cli") as GoogleGeminiCliProviderModule;
+	googleGeminiCliProviderModulePromise ||= import("./google-gemini-cli").then(module => {
+		const provider = module as GoogleGeminiCliProviderModule;
 		return { stream: provider.streamGoogleGeminiCli };
 	});
 	return googleGeminiCliProviderModulePromise;
 }
 
 function loadGoogleVertexProviderModule(): Promise<LazyProviderModule<"google-vertex">> {
-	googleVertexProviderModulePromise ||= Promise.resolve().then(() => {
-		const provider = require("./google-vertex") as GoogleVertexProviderModule;
+	googleVertexProviderModulePromise ||= import("./google-vertex").then(module => {
+		const provider = module as GoogleVertexProviderModule;
 		return { stream: provider.streamGoogleVertex };
 	});
 	return googleVertexProviderModulePromise;
 }
 
 function loadOpenAICodexResponsesProviderModule(): Promise<LazyProviderModule<"openai-codex-responses">> {
-	openAICodexResponsesProviderModulePromise ||= Promise.resolve().then(() => {
-		const provider = require("./openai-codex-responses") as OpenAICodexResponsesProviderModule;
+	openAICodexResponsesProviderModulePromise ||= import("./openai-codex-responses").then(module => {
+		const provider = module as OpenAICodexResponsesProviderModule;
 		return { stream: provider.streamOpenAICodexResponses };
 	});
 	return openAICodexResponsesProviderModulePromise;
 }
 
 function loadOpenAICompletionsProviderModule(): Promise<LazyProviderModule<"openai-completions">> {
-	openAICompletionsProviderModulePromise ||= Promise.resolve().then(() => {
-		const provider = require("./openai-completions") as OpenAICompletionsProviderModule;
+	openAICompletionsProviderModulePromise ||= import("./openai-completions").then(module => {
+		const provider = module as OpenAICompletionsProviderModule;
 		return { stream: provider.streamOpenAICompletions };
 	});
 	return openAICompletionsProviderModulePromise;
 }
 
 function loadOpenAIResponsesProviderModule(): Promise<LazyProviderModule<"openai-responses">> {
-	openAIResponsesProviderModulePromise ||= Promise.resolve().then(() => {
-		const provider = require("./openai-responses") as OpenAIResponsesProviderModule;
+	openAIResponsesProviderModulePromise ||= import("./openai-responses").then(module => {
+		const provider = module as OpenAIResponsesProviderModule;
 		return { stream: provider.streamOpenAIResponses };
 	});
 	return openAIResponsesProviderModulePromise;
 }
 
 function loadOllamaProviderModule(): Promise<LazyProviderModule<"ollama-chat">> {
-	ollamaProviderModulePromise ||= Promise.resolve().then(() => {
-		const provider = require("./ollama") as OllamaProviderModule;
+	ollamaProviderModulePromise ||= import("./ollama").then(module => {
+		const provider = module as OllamaProviderModule;
 		return { stream: provider.streamOllama };
 	});
 	return ollamaProviderModulePromise;
 }
 
 function loadCursorProviderModule(): Promise<LazyProviderModule<"cursor-agent">> {
-	cursorProviderModulePromise ||= Promise.resolve().then(() => {
-		const provider = require("./cursor") as CursorProviderModule;
+	cursorProviderModulePromise ||= import("./cursor").then(module => {
+		const provider = module as CursorProviderModule;
 		return { stream: provider.streamCursor };
 	});
 	return cursorProviderModulePromise;
@@ -437,40 +422,11 @@ function loadBedrockProviderModule(): Promise<LazyProviderModule<"bedrock-conver
 	if (bedrockProviderModuleOverride) {
 		return Promise.resolve(bedrockProviderModuleOverride);
 	}
-	bedrockProviderModulePromise ||= Promise.resolve().then(() => {
-		const provider = require("./amazon-bedrock") as BedrockProviderModule;
+	bedrockProviderModulePromise ||= import("./amazon-bedrock").then(module => {
+		const provider = module as BedrockProviderModule;
 		return { stream: provider.streamBedrock };
 	});
 	return bedrockProviderModulePromise;
-}
-
-/**
- * Lazy provider descriptors used by core consumers that need to inspect or
- * prewarm a provider without importing its implementation at startup.
- */
-export const PROVIDER_RUNTIME_DESCRIPTORS: readonly ProviderRuntimeDescriptor<Api, unknown>[] = [
-	{ api: "anthropic-messages", load: loadAnthropicProviderModule },
-	{ api: "azure-openai-responses", load: loadAzureOpenAIResponsesProviderModule },
-	{ api: "google-generative-ai", load: loadGoogleProviderModule },
-	{ api: "google-gemini-cli", load: loadGoogleGeminiCliProviderModule },
-	{ api: "google-vertex", load: loadGoogleVertexProviderModule },
-	{ api: "openai-codex-responses", load: loadOpenAICodexResponsesProviderModule },
-	{ api: "openai-completions", load: loadOpenAICompletionsProviderModule },
-	{ api: "openai-responses", load: loadOpenAIResponsesProviderModule },
-	{ api: "ollama-chat", load: loadOllamaProviderModule },
-	{ api: "cursor-agent", load: loadCursorProviderModule },
-	{ api: "bedrock-converse-stream", load: loadBedrockProviderModule },
-] as readonly ErasedProviderRuntimeDescriptor[];
-
-const providerRuntimeDescriptorMap = new Map<Api, ErasedProviderRuntimeDescriptor>(
-	PROVIDER_RUNTIME_DESCRIPTORS.map(descriptor => [descriptor.api, descriptor]),
-);
-
-/** Return the lazy descriptor for a built-in API, if one is registered. */
-export function getProviderRuntimeDescriptor<TApi extends Api>(
-	api: TApi,
-): ProviderRuntimeDescriptor<TApi, unknown> | undefined {
-	return providerRuntimeDescriptorMap.get(api) as ProviderRuntimeDescriptor<TApi, unknown> | undefined;
 }
 
 // ---------------------------------------------------------------------------

@@ -675,48 +675,6 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		// Native build tasks never appear as shards.
 		expect(matrix.include.every((shard: { key: string }) => shard.key !== "native-linux-x64")).toBe(true);
 	});
-
-	test("--matrix-json excludes the legacy native producer from docs-only shards", async () => {
-		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ci-dev-affected-docs-matrix-"));
-		tempDirs.push(tempDir);
-		const outputFile = path.join(tempDir, "github-output.txt");
-
-		const { stdout, exitCode } = await runScript(["--matrix-json"], "docs/acp-local-development.md", {
-			GITHUB_EVENT_NAME: "pull_request",
-			CI_DEV_PLAN_MODE: "pr",
-			GITHUB_OUTPUT: outputFile,
-		});
-		expect(exitCode).toBe(0);
-		expect((JSON.parse(stdout.trim()) as Array<{ key: string }>).map(entry => entry.key)).toEqual([
-			"test:packages/coding-agent/test/docs-index-lazy.test.ts",
-			"native-linux-x64",
-		]);
-
-		const output = await Bun.file(outputFile).text();
-		expect(output).toContain("has_tasks=true");
-		expect(output).toContain("has_native=true");
-		const planDigest = output.split("\n").find(line => line.startsWith("plan_digest="))?.slice("plan_digest=".length);
-		const planSourceSha = output.split("\n").find(line => line.startsWith("plan_source_sha="))?.slice("plan_source_sha=".length);
-		expect(planDigest).toBeDefined();
-		expect(planSourceSha).toBe(sourceSha);
-		const matrix = JSON.parse((output.split("\n").find(line => line.startsWith("matrix=")) ?? "matrix={}").slice("matrix=".length)) as {
-			include: Array<{ key: string; identity: string }>;
-		};
-		expect(matrix.include.map(entry => entry.key)).toEqual(["test:packages/coding-agent/test/docs-index-lazy.test.ts"]);
-
-		const receiptDir = path.join(tempDir, "receipts");
-		await fs.mkdir(receiptDir);
-		for (const [index, entry] of matrix.include.entries()) {
-			await Bun.write(path.join(receiptDir, `${index}.json`), JSON.stringify({ key: entry.key, identity: entry.identity }));
-		}
-		const validation = await runScript(["--validate-shard-receipts"], "", {
-			CI_DEV_AFFECTED_PLAN: path.join(repoRoot, ".ci-dev-affected-plan.json"),
-			CI_DEV_SHARD_RECEIPTS: receiptDir,
-			CI_DEV_PLAN_DIGEST: planDigest,
-			CI_DEV_PLAN_SOURCE_SHA: planSourceSha,
-		});
-		expect(validation.exitCode).toBe(0);
-	});
 	test("CI_FORCE_FULL emits Python work outside the shard matrix", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ci-dev-affected-python-full-"));
 		tempDirs.push(tempDir);

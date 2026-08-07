@@ -89,8 +89,6 @@ export type FetchLike = (
 export interface NpmRegistryLookupOptions extends NpmRegistryEnvironment {
 	fetchImpl?: FetchLike;
 	timeoutMs?: number;
-	/** npm dist-tag to resolve; defaults to `latest`. Nightly channel lookups pass `nightly`. */
-	distTag?: string;
 }
 
 /** Thrown when a registry is configured but unusable, so it is never silently ignored. */
@@ -587,7 +585,7 @@ function withWarnings(message: string, warnings: string[]): string {
 
 interface VersionResponse {
 	version?: string;
-	"dist-tags"?: Record<string, string | undefined>;
+	"dist-tags"?: { latest?: string };
 }
 
 async function requestJson(
@@ -628,11 +626,11 @@ async function requestJson(
 	}
 }
 
-function readVersion(data: VersionResponse | undefined, distTag: string): string | undefined {
-	return data?.version ?? data?.["dist-tags"]?.[distTag];
+function readVersion(data: VersionResponse | undefined): string | undefined {
+	return data?.version ?? data?.["dist-tags"]?.latest;
 }
 
-/** Fetch the published version of `packageName` at `options.distTag` (default `latest`) from the configured registry. */
+/** Fetch the latest published version of `packageName` from the configured registry. */
 export async function fetchLatestPackageVersion(
 	packageName: string,
 	options: NpmRegistryLookupOptions = {},
@@ -640,24 +638,23 @@ export async function fetchLatestPackageVersion(
 	const resolved = await resolveNpmRegistry(packageName, options);
 	// One deadline for the whole lookup, so the packument retry cannot double it.
 	const signal = AbortSignal.timeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-	const distTag = options.distTag ?? "latest";
 
-	const tagUrl = buildRegistryPackageUrl(resolved.registry, packageName, distTag);
-	const tagged = await requestJson(tagUrl, resolved, options, signal);
-	const version = readVersion(tagged.data, distTag);
+	const latestUrl = buildRegistryPackageUrl(resolved.registry, packageName, "latest");
+	const latest = await requestJson(latestUrl, resolved, options, signal);
+	const version = readVersion(latest.data);
 	if (version) return { version, registry: resolved.registry, warnings: resolved.warnings };
 
-	// `/{pkg}/<dist-tag>` is a registry-API convenience route; a mirror that only
+	// `/{pkg}/latest` is a registry-API convenience route; a mirror that only
 	// serves packuments — which is all the installer itself needs — 404s it.
-	if (tagged.status === 404 || (!tagged.failure && !version)) {
+	if (latest.status === 404 || (!latest.failure && !version)) {
 		const packumentUrl = buildRegistryPackageUrl(resolved.registry, packageName);
 		const packument = await requestJson(packumentUrl, resolved, options, signal);
-		const fallback = readVersion(packument.data, distTag);
+		const fallback = readVersion(packument.data);
 		if (fallback) return { version: fallback, registry: resolved.registry, warnings: resolved.warnings };
 		throw new Error(
-			withWarnings(packument.failure ?? tagged.failure ?? `${packumentUrl} returned no version`, resolved.warnings),
+			withWarnings(packument.failure ?? latest.failure ?? `${packumentUrl} returned no version`, resolved.warnings),
 		);
 	}
 
-	throw new Error(withWarnings(tagged.failure ?? `${tagUrl} returned no version`, resolved.warnings));
+	throw new Error(withWarnings(latest.failure ?? `${latestUrl} returned no version`, resolved.warnings));
 }

@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import type { AstReplaceChange, AstReplaceFileChange, astEdit as astEditFn } from "@gajae-code/natives";
+import { type AstReplaceChange, type AstReplaceFileChange, astEdit } from "@gajae-code/natives";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { $pickenvpos, prompt, untilAborted } from "@gajae-code/utils";
@@ -34,12 +34,6 @@ import { queueResolveHandler } from "./resolve";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
-let astEditLoad: Promise<typeof astEditFn> | undefined;
-
-async function astEditNative(): Promise<typeof astEditFn> {
-	astEditLoad ??= Promise.resolve((require("@gajae-code/natives") as { astEdit: typeof astEditFn }).astEdit);
-	return await astEditLoad;
-}
 const astEditOpSchema = z.object({
 	pat: z.string().describe("ast pattern"),
 	out: z.string().describe("replacement template"),
@@ -85,7 +79,7 @@ async function runAstEditTargets(
 	let limitReached = false;
 	let applied = !options.dryRun;
 	for (const target of targets) {
-		const targetResult = await (await astEditNative())({
+		const targetResult = await astEdit({
 			rewrites: options.rewrites,
 			path: target.basePath,
 			glob: target.glob,
@@ -126,7 +120,7 @@ async function runAstEditTargets(
 	};
 }
 
-async function runAstEditOnce(
+function runAstEditOnce(
 	targets: Array<{ basePath: string; glob?: string }> | undefined,
 	resolvedSearchPath: string,
 	globFilter: string | undefined,
@@ -135,7 +129,7 @@ async function runAstEditOnce(
 	if (targets) {
 		return runAstEditTargets(targets, resolvedSearchPath, options);
 	}
-	return (await astEditNative())({
+	return astEdit({
 		rewrites: options.rewrites,
 		path: resolvedSearchPath,
 		glob: globFilter,
@@ -211,7 +205,6 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				rawPaths: params.paths,
 				cwd: this.session.cwd,
 				getArtifactsDir: this.session.getArtifactsDir,
-				mcpManager: this.session.getMcpManager?.(),
 				getAuthorizedArtifactsDirs: this.session.getAuthorizedArtifactsDirs,
 				internalUrlAction: "rewrite",
 			});

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Closed evidence contracts for stable and nightly npm releases.
+ * Closed evidence contracts for stable npm releases.
  *
  * Expected evidence is written before the first registry mutation. Final evidence
  * is written only after every retained package tarball has been downloaded back
@@ -42,9 +42,7 @@ export const PUBLIC_PACKAGE_DEFINITIONS: readonly PublicPackageDefinition[] = [
 
 const dependencyFieldNames = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] as const;
 const publicPackageByName = new Map(PUBLIC_PACKAGE_DEFINITIONS.map(definition => [definition.name, definition]));
-export const stableVersionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u;
-export const nightlyVersionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-nightly\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.g[0-9a-f]{12}$/u;
-const releaseVersionPattern = new RegExp(`(?:${stableVersionPattern.source})|(?:${nightlyVersionPattern.source})`, "u");
+const stableVersionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u;
 const sha256Pattern = /^[0-9a-f]{64}$/u;
 const sha512Pattern = /^[0-9a-f]{128}$/u;
 const sourceCommitPattern = /^[0-9a-f]{40}$/u;
@@ -77,13 +75,13 @@ function assertTarballLimits(limits: TarballLimits): void {
 	if (limits.maxEntryBytes > limits.maxUnpackedBytes) fail("tarball maxEntryBytes cannot exceed maxUnpackedBytes");
 }
 
-/** Rejects every internal form except the release's exact supported version. */
+/** Rejects every internal form except the release's exact stable version. */
 export function assertExactInternalReleaseDependencies(
 	dependencies: Readonly<Record<string, string>>,
 	releaseVersion: string,
 	label: string,
 ): void {
-	if (!releaseVersionPattern.test(releaseVersion)) fail(`${label} has an unsupported release version ${releaseVersion}`);
+	if (!stableVersionPattern.test(releaseVersion)) fail(`${label} has a non-stable release version ${releaseVersion}`);
 	for (const dependencyName of Object.keys(dependencies).sort()) {
 		if (!publicPackageByName.has(dependencyName)) fail(`${label} names unknown internal dependency ${dependencyName}`);
 		if (dependencies[dependencyName] !== releaseVersion) {
@@ -568,8 +566,8 @@ export function packageEvidenceFromTarball(definition: PublicPackageDefinition, 
 	if (inspection.manifest.name !== definition.name) {
 		fail(`${definition.dir} tarball declares ${inspection.manifest.name}, expected ${definition.name}`);
 	}
-	if (!releaseVersionPattern.test(inspection.manifest.version)) {
-		fail(`${definition.name} tarball has an unsupported release version ${inspection.manifest.version}`);
+	if (!stableVersionPattern.test(inspection.manifest.version)) {
+		fail(`${definition.name} tarball has a non-stable version ${inspection.manifest.version}`);
 	}
 	return {
 		dir: definition.dir,
@@ -606,7 +604,7 @@ function validatePackageRecord(value: unknown, label: string): PackageEvidenceRe
 	const definition = publicPackageByName.get(name);
 	if (definition === undefined || definition.dir !== dir) fail(`${label} is not a known public package`);
 	const version = string(record.version, `${label}.version`);
-	if (!releaseVersionPattern.test(version)) fail(`${label}.version must be a supported release semver`);
+	if (!stableVersionPattern.test(version)) fail(`${label}.version must be stable semver`);
 	const tarballSha512 = string(record.tarball_sha512, `${label}.tarball_sha512`);
 	if (!sha512Pattern.test(tarballSha512)) fail(`${label}.tarball_sha512 must be lowercase SHA-512`);
 	const expectedSri = string(record.expected_sri, `${label}.expected_sri`);
@@ -637,7 +635,7 @@ export function validateExpectedEvidence(value: unknown): ExpectedReleaseEvidenc
 	const sourceCommit = string(evidence.source_commit, "expected evidence.source_commit");
 	if (!sourceCommitPattern.test(sourceCommit)) fail("expected evidence.source_commit must be a lowercase commit SHA");
 	const releaseVersion = string(evidence.release_version, "expected evidence.release_version");
-	if (!releaseVersionPattern.test(releaseVersion)) fail("expected evidence.release_version must be a supported release semver");
+	if (!stableVersionPattern.test(releaseVersion)) fail("expected evidence.release_version must be stable semver");
 	if (!Array.isArray(evidence.packages)) fail("expected evidence.packages must be an array");
 	const packages = evidence.packages.map((record, index) => validatePackageRecord(record, `expected evidence.packages[${index}]`));
 	assertSortedPackageRecords(packages, "expected evidence.packages");
@@ -678,7 +676,7 @@ export function createExpectedEvidence(input: {
 	packages: readonly PackageEvidenceRecord[];
 }): ExpectedReleaseEvidence {
 	if (!sourceCommitPattern.test(input.sourceCommit)) fail("sourceCommit must be a lowercase commit SHA");
-	if (!releaseVersionPattern.test(input.releaseVersion)) fail("releaseVersion must be a supported release semver");
+	if (!stableVersionPattern.test(input.releaseVersion)) fail("releaseVersion must be stable semver");
 	const evidence = validateExpectedEvidence({
 		schema_version: RELEASE_EVIDENCE_SCHEMA_VERSION,
 		source_commit: input.sourceCommit,
@@ -752,7 +750,7 @@ export function validateFinalEvidence(value: unknown): FinalReleaseEvidence {
 	const sourceCommit = string(evidence.source_commit, "final evidence.source_commit");
 	if (!sourceCommitPattern.test(sourceCommit)) fail("final evidence.source_commit must be a lowercase commit SHA");
 	const releaseVersion = string(evidence.release_version, "final evidence.release_version");
-	if (!releaseVersionPattern.test(releaseVersion)) fail("final evidence.release_version must be a supported release semver");
+	if (!stableVersionPattern.test(releaseVersion)) fail("final evidence.release_version must be stable semver");
 	const expectedEvidenceSha = string(evidence.expected_evidence_sha256, "final evidence.expected_evidence_sha256");
 	if (!sha256Pattern.test(expectedEvidenceSha)) fail("final evidence.expected_evidence_sha256 must be lowercase SHA-256");
 	if (!Array.isArray(evidence.packages)) fail("final evidence.packages must be an array");

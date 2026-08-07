@@ -52,10 +52,6 @@ If it is already lost, recover with `git checkout origin/dev -- packages/<pkg>/C
 
 **`packages/coding-agent/src/internal-urls/docs-index.generated.ts` is generated and untracked.** `bun install` rebuilds it through the root `prepare` hook, and `bun run generate-docs-index` rebuilds it on demand. Do not commit it. If you see it in `git status`, something forced it back into the index — `git rm --cached` it. A tracked copy inlines every doc onto a single line, which git cannot three-way merge, so it conflicts on every rebase.
 
-## Nightly release operations
-
-The `CI` workflow publishes a nightly prerelease from `main` at 04:23 UTC. Maintainers can run the same cycle with **Run workflow → nightly-release**. The run must pass the complete main check/test graph before publication, then publishes all public packages under the npm `nightly` dist-tag and creates a matching immutable GitHub prerelease with binaries and package-evidence assets. Do not create or move nightly tags manually, and do not edit package versions or `[Unreleased]` changelog sections for a nightly run; version staging is ephemeral inside CI.
-
 ## PR checklist
 
 - Target branch is `dev`, not `main`.

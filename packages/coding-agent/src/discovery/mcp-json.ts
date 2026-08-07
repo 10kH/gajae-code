@@ -29,7 +29,6 @@ interface MCPConfigFile {
 		{
 			enabled?: boolean;
 			autoload?: boolean;
-			sharing?: "per-session" | "shared";
 			timeout?: number;
 			command?: string;
 			args?: string[];
@@ -103,7 +102,6 @@ function isValidExactServerConfig(value: unknown): boolean {
 	if (!isRecord(value)) return false;
 	return (
 		isOptionalBoolean(value.enabled) &&
-		(value.sharing === undefined || value.sharing === "per-session" || value.sharing === "shared") &&
 		isOptionalBoolean(value.autoload) &&
 		isOptionalBoolean(value.noInheritEnv) &&
 		(value.timeout === undefined ||
@@ -202,7 +200,6 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta, quiet = f
 				name,
 				enabled,
 				autoload,
-				sharing: serverConfig.sharing,
 				timeout,
 				command: serverConfig.command,
 				args: serverConfig.args,

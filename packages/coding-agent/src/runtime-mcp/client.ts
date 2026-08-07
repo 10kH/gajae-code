@@ -174,11 +174,8 @@ async function createTransport(config: MCPServerConfig): Promise<MCPTransport> {
 		case "stdio":
 			return createStdioTransport(config as MCPStdioServerConfig);
 		case "http":
-			return createHttpTransport(config as MCPHttpServerConfig);
 		case "sse":
-			// Compatibility: `sse` configs use Streamable HTTP, not the legacy MCP SSE
-			// protocol. The configured URL receives JSON-RPC POST requests directly.
-			return createHttpTransport(config as MCPSseServerConfig);
+			return createHttpTransport(config as MCPHttpServerConfig | MCPSseServerConfig);
 		default:
 			throw new Error(`Unknown server type: ${serverType}`);
 	}
@@ -199,7 +196,7 @@ async function initializeConnection(
 ): Promise<MCPInitializeResult> {
 	const params: MCPInitializeParams = {
 		protocolVersion: PROTOCOL_VERSION,
-		capabilities: options?.advertiseRoots === false ? {} : { roots: { listChanged: true } },
+		capabilities: options?.advertiseRoots === false ? {} : { roots: { listChanged: false } },
 		clientInfo: CLIENT_INFO,
 	};
 
@@ -432,18 +429,13 @@ export async function readResource(
 	);
 }
 
-type MCPResourceSubscriptionOptions = MCPRequestOptions & { throwOnError?: boolean };
-function resourceSubscriptionRequestOptions(options?: MCPResourceSubscriptionOptions): MCPRequestOptions | undefined {
-	return options?.signal ? { signal: options.signal } : undefined;
-}
-
 /**
  * Subscribe to resource update notifications.
  */
 export async function subscribeToResources(
 	connection: MCPServerConnection,
 	uris: string[],
-	options?: MCPResourceSubscriptionOptions,
+	options?: MCPRequestOptions,
 ): Promise<void> {
 	if (uris.length === 0 || !connection.capabilities.resources?.subscribe) return;
 	const results = await Promise.allSettled(
@@ -452,32 +444,14 @@ export async function subscribeToResources(
 			return connection.transport.request(
 				"resources/subscribe",
 				params as unknown as Record<string, unknown>,
-				resourceSubscriptionRequestOptions(options),
+				options,
 			);
 		}),
 	);
-	const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
-	if (options?.throwOnError && failures.length > 0) {
-		const successfulUris = uris.filter((_uri, index) => results[index]?.status === "fulfilled");
-		const compensation = await Promise.allSettled(
-			successfulUris.map(uri =>
-				connection.transport.request(
-					"resources/unsubscribe",
-					{ uri } as unknown as Record<string, unknown>,
-					resourceSubscriptionRequestOptions(options),
-				),
-			),
-		);
-		const compensationFailures = compensation.filter(
-			(result): result is PromiseRejectedResult => result.status === "rejected",
-		);
-		throw new AggregateError(
-			[...failures.map(result => result.reason), ...compensationFailures.map(result => result.reason)],
-			"MCP resource subscription failed",
-		);
-	}
-	for (const result of failures) {
-		logger.warn("Failed to subscribe to MCP resource", { error: result.reason });
+	for (const result of results) {
+		if (result.status === "rejected") {
+			logger.warn("Failed to subscribe to MCP resource", { error: result.reason });
+		}
 	}
 }
 
@@ -487,7 +461,7 @@ export async function subscribeToResources(
 export async function unsubscribeFromResources(
 	connection: MCPServerConnection,
 	uris: string[],
-	options?: MCPResourceSubscriptionOptions,
+	options?: MCPRequestOptions,
 ): Promise<void> {
 	if (uris.length === 0 || !connection.capabilities.resources?.subscribe) return;
 	const results = await Promise.allSettled(
@@ -496,32 +470,14 @@ export async function unsubscribeFromResources(
 			return connection.transport.request(
 				"resources/unsubscribe",
 				params as unknown as Record<string, unknown>,
-				resourceSubscriptionRequestOptions(options),
+				options,
 			);
 		}),
 	);
-	const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
-	if (options?.throwOnError && failures.length > 0) {
-		const successfulUris = uris.filter((_uri, index) => results[index]?.status === "fulfilled");
-		const compensation = await Promise.allSettled(
-			successfulUris.map(uri =>
-				connection.transport.request(
-					"resources/subscribe",
-					{ uri } as unknown as Record<string, unknown>,
-					resourceSubscriptionRequestOptions(options),
-				),
-			),
-		);
-		const compensationFailures = compensation.filter(
-			(result): result is PromiseRejectedResult => result.status === "rejected",
-		);
-		throw new AggregateError(
-			[...failures.map(result => result.reason), ...compensationFailures.map(result => result.reason)],
-			"MCP resource unsubscription failed",
-		);
-	}
-	for (const result of failures) {
-		logger.warn("Failed to unsubscribe from MCP resource", { error: result.reason });
+	for (const result of results) {
+		if (result.status === "rejected") {
+			logger.warn("Failed to unsubscribe from MCP resource", { error: result.reason });
+		}
 	}
 }
 

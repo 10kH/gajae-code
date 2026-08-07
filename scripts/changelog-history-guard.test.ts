@@ -62,15 +62,9 @@ describe("compareHistory", () => {
 		expect(violation?.removed).toEqual(["0.12.11"]);
 	});
 
-	test("ignores a file absent at the base", () => {
+	test("ignores a file absent on either side", () => {
 		expect(compareHistory("packages/x/CHANGELOG.md", undefined, FULL)).toBeUndefined();
-	});
-
-	test("catches a changelog deleted at the head", () => {
-		const violation = compareHistory("packages/x/CHANGELOG.md", FULL, undefined);
-		expect(violation?.removed).toEqual(["0.12.12", "0.12.11"]);
-		expect(violation?.baseHeadingCount).toBe(2);
-		expect(violation?.headHeadingCount).toBe(0);
+		expect(compareHistory("packages/x/CHANGELOG.md", FULL, undefined)).toBeUndefined();
 	});
 
 	test("does not flag reordering or rewording that keeps every version", () => {

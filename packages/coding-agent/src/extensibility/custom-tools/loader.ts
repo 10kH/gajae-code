@@ -18,7 +18,6 @@ import * as typebox from "../typebox";
 import { createNoOpUIContext, resolvePath } from "../utils";
 import type { CustomToolAPI, CustomToolFactory, LoadedCustomTool, ToolLoadError } from "./types";
 
-export type CustomToolImportGuard = (resolvedPath: string) => Promise<void>;
 /**
  * Load a single tool module using native Bun import.
  */
@@ -27,7 +26,6 @@ async function loadTool(
 	cwd: string,
 	sharedApi: CustomToolAPI,
 	source?: { provider: string; providerName: string; level: "user" | "project" },
-	beforeImport?: CustomToolImportGuard,
 ): Promise<{ tools: LoadedCustomTool[] | null; error: ToolLoadError | null }> {
 	const resolvedPath = resolvePath(toolPath, cwd);
 
@@ -44,7 +42,6 @@ async function loadTool(
 	}
 
 	try {
-		await beforeImport?.(resolvedPath);
 		const module = await import(resolvedPath);
 		const factory = (module.default ?? module) as CustomToolFactory;
 
@@ -124,15 +121,9 @@ export class CustomToolLoader {
 		this.#seenNames = new Set<string>(builtInToolNames);
 	}
 
-	async load(pathsWithSources: ToolPathWithSource[], beforeImport?: CustomToolImportGuard): Promise<void> {
+	async load(pathsWithSources: ToolPathWithSource[]): Promise<void> {
 		for (const { path: toolPath, source } of pathsWithSources) {
-			const { tools: loadedTools, error } = await loadTool(
-				toolPath,
-				this.#sharedApi.cwd,
-				this.#sharedApi,
-				source,
-				beforeImport,
-			);
+			const { tools: loadedTools, error } = await loadTool(toolPath, this.#sharedApi.cwd, this.#sharedApi, source);
 
 			if (error) {
 				this.errors.push(error);
@@ -180,7 +171,6 @@ export async function loadCustomTools(
 		apply(reason: string): Promise<AgentToolResult<unknown>>;
 		reject?(reason: string): Promise<AgentToolResult<unknown> | undefined>;
 	}) => void,
-	beforeImport?: CustomToolImportGuard,
 ) {
 	const loader = new CustomToolLoader(
 		await import("@gajae-code/coding-agent"),
@@ -188,7 +178,7 @@ export async function loadCustomTools(
 		builtInToolNames,
 		pushPendingAction,
 	);
-	await loader.load(pathsWithSources, beforeImport);
+	await loader.load(pathsWithSources);
 	return {
 		tools: loader.tools,
 		errors: loader.errors,

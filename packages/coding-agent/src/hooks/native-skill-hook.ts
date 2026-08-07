@@ -6,11 +6,6 @@ import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
 import { DEFAULT_DISABLED_EXTENSIONS, DEFAULT_SKILL_DISCOVERY_SETTINGS } from "../config/skill-settings-defaults";
 import { sessionLogsDir } from "../gjc-runtime/session-layout";
 import {
-	detectMcpDelegateFlowActivation,
-	type McpDelegateHostContextV1,
-	persistMcpDelegateHostContext,
-} from "./mcp-delegate-host-context";
-import {
 	buildActiveUltragoalPromptContext,
 	buildSkillActivationAdditionalContext,
 	buildSkillStopOutput,
@@ -304,29 +299,16 @@ export async function dispatchGjcNativeSkillHook(
 		});
 		const recoveryContext = buildStateRecoveryDiagnosticsContext(recoveryDiagnostics);
 		const prompt = readPromptText(payload);
-		let delegateHostContext: { path: string; context: McpDelegateHostContextV1 } | null = null;
-		try {
-			delegateHostContext = await persistMcpDelegateHostContext({
-				cwd,
-				sessionId: readSessionId(payload),
-				threadId: readThreadId(payload),
-				turnId: readTurnId(payload),
-				prompt,
-			});
-		} catch (error) {
-			await logHookError(cwd, "mcp_delegate_host_context_persist_error", error);
-		}
-		const skillState =
-			prompt && !detectMcpDelegateFlowActivation(prompt)
-				? await recordSkillActivation({
-						cwd,
-						text: prompt,
-						sessionId: readSessionId(payload),
-						threadId: readThreadId(payload),
-						turnId: readTurnId(payload),
-						stateDir: options.stateDir,
-					})
-				: null;
+		const skillState = prompt
+			? await recordSkillActivation({
+					cwd,
+					text: prompt,
+					sessionId: readSessionId(payload),
+					threadId: readThreadId(payload),
+					turnId: readTurnId(payload),
+					stateDir: options.stateDir,
+				})
+			: null;
 		const effectiveSkillConfig = skillState
 			? await resolveEffectiveSkillConfig(cwd, options.effectiveSkillConfig, options.configPaths, {
 					sessionId: readSessionId(payload),
@@ -359,7 +341,6 @@ export async function dispatchGjcNativeSkillHook(
 		}
 		const additionalContext = [
 			skillState ? buildSkillActivationAdditionalContext(skillState, effectiveSkillConfig) : activeUltragoalContext,
-			delegateHostContext ? `GJC MCP delegate-flow host context persisted at ${delegateHostContext.path}.` : null,
 			recoveryContext,
 			classifyQuestionOnlyPrompt(prompt),
 		]

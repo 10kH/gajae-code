@@ -2,17 +2,7 @@ import { createHash } from "node:crypto";
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-
-import type * as native from "@gajae-code/natives";
-
-let nativeSessionStorageBindings: typeof import("@gajae-code/natives") | undefined;
-
-function nativeSessionStorage(): typeof import("@gajae-code/natives") {
-	if (!nativeSessionStorageBindings) {
-		nativeSessionStorageBindings = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
-	}
-	return nativeSessionStorageBindings;
-}
+import * as native from "@gajae-code/natives";
 
 import { isEnoent, pathIsWithin, peekFile, toError } from "@gajae-code/utils";
 import {
@@ -404,7 +394,7 @@ function nativeExactUnlink(
 		quarantineName?: string;
 	},
 ): NativeExactUnlinkResult {
-	return (nativeSessionStorage().exactUnlink as unknown as NativeExactUnlink)(pathname, identity);
+	return (native.exactUnlink as unknown as NativeExactUnlink)(pathname, identity);
 }
 
 type NativeDirectoryTreeEntry = {
@@ -435,7 +425,7 @@ type NativeDirectoryTreeApi = {
 	): NativeExactUnlinkResult;
 };
 function nativeDirectoryTreeApi(): NativeDirectoryTreeApi {
-	return nativeSessionStorage() as unknown as NativeDirectoryTreeApi;
+	return native as unknown as NativeDirectoryTreeApi;
 }
 
 function snapshotDirectoryTree(pathname: string): NativeDirectoryTreeSnapshot {
@@ -516,14 +506,14 @@ function secureOwnerOnlyFileDescriptor(
 	if (process.platform !== "linux" || !securityContext) {
 		if (operation === "apply") {
 			const applied = validateNativeSecurityResult(
-				nativeSessionStorage().applyOwnerOnlyPathSecurity(pathname, "file"),
+				native.applyOwnerOnlyPathSecurity(pathname, "file"),
 				"apply",
 				"file",
 			);
 			if (!applied.ok) throw new Error(`Owner-only security rejected ${pathname}: ${applied.code}`);
 		}
 		const verified = validateNativeSecurityResult(
-			nativeSessionStorage().verifyOwnerOnlyPathSecurity(pathname, "file"),
+			native.verifyOwnerOnlyPathSecurity(pathname, "file"),
 			"verify",
 			"file",
 		);
@@ -534,8 +524,8 @@ function secureOwnerOnlyFileDescriptor(
 		throw new Error(`Managed writer escaped its session directory: ${pathname}`);
 	const result = validateNativeSecurityResult(
 		operation === "apply"
-			? nativeSessionStorage().applyOwnerOnlyFdSecurity(pathname, "file", fd)
-			: nativeSessionStorage().verifyOwnerOnlyFdSecurity(pathname, "file", fd),
+			? native.applyOwnerOnlyFdSecurity(pathname, "file", fd)
+			: native.verifyOwnerOnlyFdSecurity(pathname, "file", fd),
 		operation,
 		"file",
 	);
@@ -775,11 +765,10 @@ export class FileSessionStorage implements SessionStorage {
 		}
 	}
 	async listFilesByMtime(dir: string, pattern: string): Promise<Array<{ path: string; mtimeMs: number }>> {
-		const nativeBindings = nativeSessionStorage();
-		const result = await nativeBindings.glob({
+		const result = await native.glob({
 			path: dir,
 			pattern,
-			fileType: nativeBindings.FileType.File,
+			fileType: native.FileType.File,
 			recursive: false,
 			hidden: false,
 			gitignore: false,

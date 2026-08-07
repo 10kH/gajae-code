@@ -4,7 +4,6 @@ import {
 	type ManagedCandidate,
 	type ManagedCandidateListing,
 	type ManagedScope,
-	type ManagedScopeErrorCode,
 	type ManagedScopeResolution,
 	resolveManagedScope,
 } from "../session/internal/managed-session-scope";
@@ -32,7 +31,19 @@ export type ResolveManagedSessionScopeResult =
 	| { kind: "resolved"; scope: ManagedSessionScope }
 	| {
 			kind: "error";
-			code: ManagedScopeErrorCode;
+			code:
+				| "cwd_missing"
+				| "cwd_not_directory"
+				| "identity_unavailable"
+				| "network_unsupported"
+				| "sessions_root_unavailable"
+				| "binding_conflict"
+				| "binding_invalid"
+				| "migration_busy"
+				| "atomic_unavailable"
+				| "durability_not_provable"
+				| "durability_failed"
+				| "invalid_request";
 			message: string;
 	  };
 

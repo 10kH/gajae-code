@@ -65,21 +65,10 @@ const MODEL_PRESET_CONFIG_KEY = "modelPreset";
 const ACP_CUSTOM_MODEL_PRESET = "__custom__";
 const THINKING_CONFIG_ID = "thinking";
 const SESSION_PAGE_SIZE = 50;
+export const ACP_BOOTSTRAP_RACE_GUARD_MS = 50;
 const MAX_ACP_REPLAY_PAGES = 10_000;
 /** Bounded retention of settled prompt correlations so late duplicates stay closed. */
 const SETTLED_PROMPT_CORRELATION_RETENTION = 16;
-/**
- * Mirrors `REQUEST_FRAME_BYTES` in `crates/gjc-sdk/src/query.rs`: the SDK WebSocket
- * server sets `max_message_size`/`max_frame_size` to 256 KiB and closes the socket on
- * an oversize frame, so an over-limit prompt must be refused before it is sent.
- */
-const MAX_PROMPT_FRAME_BYTES = 256 * 1024;
-/**
- * `SdkClient` wraps every control request as `{type,operation,input,id}` with a UUID
- * `id` before it reaches the socket, so the prompt must be measured inside that
- * envelope. A canonical-length UUID keeps the measurement equal to the real frame.
- */
-const PROMPT_FRAME_ID_PLACEHOLDER = "00000000-0000-4000-8000-000000000000";
 
 type JsonObject = Record<string, unknown>;
 interface PromptWaiter {
@@ -122,8 +111,6 @@ type SessionRecord = {
 	settledPromptCorrelations: PromptCorrelation[];
 	authFailure?: string;
 	activePrompt?: PromptWaiter;
-	/** Set by `session/cancel` so an in-flight prompt settles as `cancelled`, never as an error. */
-	cancelRequested?: boolean;
 };
 type Endpoint = { url: string; token: string };
 
@@ -750,13 +737,7 @@ export function acpRequestFailure(error: unknown): unknown {
 	}
 }
 
-/**
- * Registers the permission reverse channel whenever a form-less client needs
- * to answer selector asks. The permission mode (prompt vs allow) only gates
- * tool-authorization prompts via `permission_mode.set`; workflow questions
- * still need a channel, so form-less clients always get the permission
- * capability and the bus installs the permission-backed ask source on it.
- */
+/** Registers a permission provider only when the ACP client requires prompts. */
 export function acpProviderRegistrations(
 	capabilities: ClientCapabilities | undefined,
 	env: NodeJS.ProcessEnv = process.env,
@@ -776,7 +757,7 @@ export function acpProviderRegistrations(
 				]
 			: []),
 		...(capabilities?.terminal ? [{ capability: "terminal", definitions: [] }] : []),
-		...(resolveAcpPermissionMode(capabilities, env) === "prompt" || !capabilities?.elicitation?.form
+		...(resolveAcpPermissionMode(capabilities, env) === "prompt"
 			? [{ capability: "permission", definitions: [] }]
 			: []),
 		...(capabilities?.elicitation?.form ? [{ capability: "ui", definitions: [] }] : []),
@@ -804,26 +785,13 @@ export function createAcpReverseConnection(connection: AgentSideConnection, sess
 			const rawRequest = (connection as unknown as Record<string, unknown>).request;
 			if (typeof rawRequest !== "function")
 				throw new AcpSdkAdapterError("acp_reverse_unavailable", "ACP reverse request surface is unavailable.");
-			const result = await (
+			return await (
 				rawRequest as (
 					method: string,
 					input: JsonObject,
 					options?: { cancellationSignal?: AbortSignal },
 				) => Promise<unknown>
 			).call(connection, name, { ...params, sessionId }, options);
-			// ACP clients answer `session/request_permission` with the spec-shaped
-			// `RequestPermissionResponse` `{ outcome: { outcome, optionId } }`, while the
-			// SDK permission-provider contract is the flat decision `{ outcome, optionId }`.
-			// Normalize the outer wrapper (accepting the flat legacy shape as well) so
-			// permission-gated tool calls resolve instead of failing as an invalid response.
-			const response = object(result);
-			if (name === "session/request_permission" && response) {
-				const decision = object(response.outcome) ?? response;
-				if (decision.outcome === "cancelled") return { outcome: "cancelled" };
-				if (decision.outcome === "selected" && typeof decision.optionId === "string")
-					return { outcome: "selected", optionId: decision.optionId };
-			}
-			return result;
 		},
 	};
 }
@@ -914,12 +882,7 @@ export class AcpAgent implements Agent {
 			agentCapabilities: {
 				loadSession: true,
 				promptCapabilities: { embeddedContext: true, image: true },
-				// Legacy MCP HTTP+SSE (spec 2024-11-05) is deprecated and not implemented: an
-				// `sse` config is served by the Streamable HTTP transport (runtime-mcp/client.ts),
-				// which never performs the `endpoint`-event handshake. Advertising it would
-				// invite a client to hand us a server we cannot connect to. Locally configured
-				// `sse` entries still resolve through createTransport, so they keep working.
-				mcpCapabilities: { http: true },
+				mcpCapabilities: { http: true, sse: true },
 				sessionCapabilities: {
 					list: {},
 					fork: {},
@@ -957,9 +920,8 @@ export class AcpAgent implements Agent {
 		try {
 			await this.#attach(id, params.cwd, endpoint(result));
 			await applyAcpStartupOptions(this.#adapter(id), this.#startupOptions);
-			const response = { sessionId: id, ...(await this.#sessionState(id, true)) };
 			this.#scheduleBootstrap(id);
-			return response;
+			return { sessionId: id, ...(await this.#sessionState(id, true)) };
 		} catch (error) {
 			await this.#discardNewSession(id);
 			throw error;
@@ -972,9 +934,8 @@ export class AcpAgent implements Agent {
 		this.#assertNoAdditionalDirectories(params.additionalDirectories);
 		await this.#attachExisting(params.sessionId, params.cwd, mcpServers);
 		await this.#replaySession(params.sessionId);
-		const response = await this.#sessionState(params.sessionId);
 		this.#scheduleBootstrap(params.sessionId);
-		return response;
+		return await this.#sessionState(params.sessionId);
 	}
 
 	async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -982,9 +943,8 @@ export class AcpAgent implements Agent {
 		this.#assertAbsoluteCwd(params.cwd);
 		this.#assertNoAdditionalDirectories(params.additionalDirectories);
 		await this.#attachExisting(params.sessionId, params.cwd, mcpServers);
-		const response = await this.#sessionState(params.sessionId);
 		this.#scheduleBootstrap(params.sessionId);
-		return response;
+		return await this.#sessionState(params.sessionId);
 	}
 
 	async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
@@ -1008,9 +968,8 @@ export class AcpAgent implements Agent {
 		this.#knownSessionCwds.set(id, params.cwd);
 		try {
 			await this.#attach(id, params.cwd, endpoint(result));
-			const response = { sessionId: id, ...(await this.#sessionState(id)) };
 			this.#scheduleBootstrap(id);
-			return response;
+			return { sessionId: id, ...(await this.#sessionState(id)) };
 		} catch (error) {
 			await this.#discardNewSession(id);
 			throw error;
@@ -1117,14 +1076,10 @@ export class AcpAgent implements Agent {
 	async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
 		if (params.modeId !== ACP_DEFAULT_MODE_ID && params.modeId !== ACP_PLAN_MODE_ID)
 			throw new Error(`Unsupported ACP mode: ${params.modeId}`);
-		if (params.modeId === ACP_PLAN_MODE_ID)
-			throw new AcpSdkAdapterError(
-				"unsupported",
-				"ACP plan mode is not available because this ACP session has no host plan-mode lifecycle.",
-			);
+		await this.#adapter(params.sessionId).control("mode.plan.set", { on: params.modeId === ACP_PLAN_MODE_ID });
 		await this.#publishSessionUpdate(params.sessionId, {
 			sessionId: params.sessionId,
-			update: { sessionUpdate: "current_mode_update", currentModeId: ACP_DEFAULT_MODE_ID },
+			update: { sessionUpdate: "current_mode_update", currentModeId: params.modeId },
 		});
 		return {};
 	}
@@ -1165,31 +1120,7 @@ export class AcpAgent implements Agent {
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		if (record.activePrompt) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
 		if (record.authFailure) throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
-		// A new turn starts uncancelled; a stale flag must never settle it as `cancelled`.
-		record.cancelRequested = false;
 		const payload = acpPromptPayload(params.prompt);
-		// The SDK transport hard-caps a single request frame at 256 KiB and answers an
-		// oversize frame by closing the socket (CloseCode::Size, crates/gjc-sdk/src/server.rs),
-		// which surfaces to the client as an opaque `connection_closed` mid-turn. Reject
-		// the prompt up front with a typed, actionable error instead of losing the session.
-		// Measure the frame the server actually receives, not just the payload: SdkClient
-		// wraps it as {type,operation,input,id} with a UUID id, so a prompt sized just
-		// under the cap would still be killed by CloseCode::Size.
-		const promptFrameBytes = Buffer.byteLength(
-			JSON.stringify({
-				type: "control_request",
-				operation: "turn.prompt",
-				input: { text: payload.text, images: payload.images },
-				id: PROMPT_FRAME_ID_PLACEHOLDER,
-			}),
-		);
-		if (promptFrameBytes > MAX_PROMPT_FRAME_BYTES)
-			throw new AcpSdkAdapterError(
-				"invalid_input",
-				`ACP prompt is ${Math.ceil(promptFrameBytes / 1024)} KiB, over the ${Math.floor(
-					MAX_PROMPT_FRAME_BYTES / 1024,
-				)} KiB transport limit. Attach a smaller or more compressed image.`,
-			);
 		let waiter!: PromptWaiter;
 		const response = new Promise<PromptResponse>((resolve, reject) => {
 			waiter = {
@@ -1204,23 +1135,6 @@ export class AcpAgent implements Agent {
 			};
 			record.activePrompt = waiter;
 		});
-		// Echo the user's own message back as `user_message_chunk`. Clients render their
-		// transcript from session/update, so without this a prompt's text and any attached
-		// image never appear in the client UI — only the agent's reply does. Replay
-		// (session/load) already emits these; a live turn must too, and the image blocks
-		// must be published verbatim so attachments are visible, not just fed to the model.
-		for (const block of params.prompt) {
-			if (block.type !== "text" && block.type !== "image") continue;
-			if (block.type === "text" && block.text.length === 0) continue;
-			await this.#publishSessionUpdate(
-				params.sessionId,
-				{
-					sessionId: params.sessionId,
-					update: { sessionUpdate: "user_message_chunk", content: block },
-				},
-				record.adapter,
-			);
-		}
 		try {
 			const acknowledgement = await record.adapter.prompt({
 				text: payload.text,
@@ -1250,15 +1164,6 @@ export class AcpAgent implements Agent {
 			waiter.terminal = undefined;
 			waiter.settled = true;
 			if (record.activePrompt === waiter) record.activePrompt = undefined;
-			// A prompt cancelled before the SDK acknowledged it still ends this turn by
-			// client request, and ACP is explicit: "Agents MUST catch these errors and
-			// return the semantically meaningful `cancelled` stop reason, so that Clients
-			// can reliably confirm the cancellation." Surfacing the transport's `busy`
-			// rejection instead would show the user a spurious error for their own cancel.
-			if (record.cancelRequested) {
-				record.cancelRequested = false;
-				return { stopReason: "cancelled" };
-			}
 			throw error;
 		}
 		return await response;
@@ -1267,9 +1172,6 @@ export class AcpAgent implements Agent {
 	async cancel(params: { sessionId: string }): Promise<void> {
 		const record = this.#sessions.get(params.sessionId);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
-		// Record the client's intent before awaiting the SDK so a prompt that rejects
-		// mid-cancel (e.g. preflight `busy`) can still settle as `cancelled`.
-		record.cancelRequested = true;
 		const acknowledgement = await record.adapter.cancel();
 		const result = object(object(acknowledgement)?.result) ?? object(acknowledgement);
 		if (result?.aborted !== true)
@@ -1607,18 +1509,7 @@ export class AcpAgent implements Agent {
 				record.reconnectUnsubscribe();
 				const waiter = record.activePrompt;
 				record.activePrompt = undefined;
-				// `session/close` is the client asking to end its own work, so the pending turn
-				// settles as `cancelled` rather than surfacing a spurious error. ACP: "Agents
-				// MUST catch these errors and return the semantically meaningful `cancelled`
-				// stop reason." Involuntary teardown (transport loss) still rejects.
-				if (waiter && !waiter.settled) {
-					if (reason === "closed" || reason === "discarded") {
-						waiter.settled = true;
-						waiter.resolve({ stopReason: "cancelled" });
-					} else {
-						waiter.reject(new AcpSdkAdapterError("connection_closed", `ACP session was ${reason}.`));
-					}
-				}
+				waiter?.reject(new AcpSdkAdapterError("connection_closed", `ACP session was ${reason}.`));
 			}
 
 			const failures: unknown[] = [];
@@ -2203,19 +2094,7 @@ export class AcpAgent implements Agent {
 		throw new AcpSdkAdapterError("resource_exhausted", "ACP transcript replay exceeded the page limit.");
 	}
 
-	/**
-	 * Bootstrap updates must reach the client only after the request that introduced the
-	 * session has resolved. `session/new` and `session/resume` carry the sessionId in
-	 * their response, so a `session/update` published first names a session the client
-	 * has never seen and is dropped — which is how the skill list went missing in Paseo.
-	 * The ACP session-setup sequence shows updates before the response only for
-	 * `session/load`.
-	 */
 	#scheduleBootstrap(id: string): void {
-		// A macrotask runs after the microtask that resolves this request and writes its
-		// response, so the client always learns the sessionId first. Scheduling therefore
-		// has to happen once the response payload is ready, not before the session-state
-		// queries that produce it.
 		setTimeout(() => {
 			const record = this.#sessions.get(id);
 			if (!record || this.#connection.signal.aborted) return;
@@ -2246,7 +2125,7 @@ export class AcpAgent implements Agent {
 					record.adapter,
 				);
 			})().catch(() => undefined);
-		});
+		}, ACP_BOOTSTRAP_RACE_GUARD_MS);
 	}
 
 	#cursor(cursor: string | null | undefined): number {

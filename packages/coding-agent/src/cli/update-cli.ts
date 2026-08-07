@@ -10,7 +10,6 @@ import { pipeline } from "node:stream/promises";
 import { $which, APP_NAME, isEnoent, VERSION } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
-import { distTagForChannel, isUpdateChannel, UPDATE_CHANNELS, type UpdateChannel } from "../config/update-channel";
 import { installDefaultGjcDefinitions } from "../defaults/gjc-defaults";
 import { theme } from "../modes/theme/theme";
 import {
@@ -24,12 +23,6 @@ const RELEASE_REPO = "Yeachan-Heo/gajae-code";
 const PACKAGE = "@gajae-code/coding-agent";
 const NPM_WRAPPER_PACKAGE = "gajae-code";
 const NPM_MANAGED_PACKAGES = [NPM_WRAPPER_PACKAGE, PACKAGE] as const;
-
-export interface UpdateCommandOptions {
-	force: boolean;
-	check: boolean;
-	channel?: UpdateChannel;
-}
 
 interface ReleaseInfo {
 	tag: string;
@@ -78,30 +71,14 @@ export interface BinaryReplacementOptions {
  * Parse update subcommand arguments.
  * Returns undefined if not an update command.
  */
-export function parseUpdateArgs(args: string[]): UpdateCommandOptions | undefined {
+export function parseUpdateArgs(args: string[]): { force: boolean; check: boolean } | undefined {
 	if (args.length === 0 || args[0] !== "update") {
 		return undefined;
-	}
-
-	let channel: UpdateChannel | undefined;
-	for (let i = 1; i < args.length; i++) {
-		const arg = args[i];
-		if (arg === "--channel" && i + 1 >= args.length) {
-			throw new Error(`Missing value for --channel. Expected one of: ${UPDATE_CHANNELS.join(", ")}.`);
-		}
-		const value =
-			arg === "--channel" ? args[++i] : arg.startsWith("--channel=") ? arg.slice("--channel=".length) : undefined;
-		if (value === undefined) continue;
-		if (!isUpdateChannel(value)) {
-			throw new Error(`Invalid --channel "${value}". Expected one of: ${UPDATE_CHANNELS.join(", ")}.`);
-		}
-		channel = value;
 	}
 
 	return {
 		force: args.includes("--force") || args.includes("-f"),
 		check: args.includes("--check") || args.includes("-c"),
-		...(channel ? { channel } : {}),
 	};
 }
 
@@ -235,39 +212,21 @@ async function resolveUpdateTarget(): Promise<UpdateTarget> {
 	throw new Error(formatUnsupportedTargetMessage(`Could not resolve ${APP_NAME} binary path in PATH`));
 }
 
-/** Lookup options for the release check: registry resolution plus the release channel. */
-export interface LatestReleaseLookupOptions extends NpmRegistryLookupOptions {
-	channel?: UpdateChannel;
-}
-
 /**
- * Get the latest release info for a channel from the npm registry.
+ * Get the latest release info from the npm registry.
  * Uses npm instead of GitHub API to avoid unauthenticated rate limiting.
  *
  * The registry comes from npm config (`npm_config_registry`, `.npmrc`,
  * `BUN_CONFIG_REGISTRY`) so the check reaches the same place the install does.
  * Hardcoding the public registry broke every mirrored or firewalled network.
  */
-async function getLatestRelease(options?: LatestReleaseLookupOptions): Promise<ReleaseInfo> {
-	const { channel = "stable", ...lookupOptions } = options ?? {};
+async function getLatestRelease(options?: Installer | NpmRegistryLookupOptions): Promise<ReleaseInfo> {
+	const overrides: NpmRegistryLookupOptions = typeof options === "string" ? { installer: options } : (options ?? {});
 	// The user is deliberately waiting on this command, unlike the startup check.
-	let version: string;
-	let registry: string;
-	let warnings: string[];
-	try {
-		({ version, registry, warnings } = await fetchLatestPackageVersion(PACKAGE, {
-			timeoutMs: 20_000,
-			...lookupOptions,
-			distTag: distTagForChannel(channel),
-		}));
-	} catch (err) {
-		if (channel === "nightly") {
-			throw new Error(
-				`${err instanceof Error ? err.message : String(err)} The nightly channel has no published release yet; it is populated by the scheduled nightly workflow.`,
-			);
-		}
-		throw err;
-	}
+	const { version, registry, warnings } = await fetchLatestPackageVersion(PACKAGE, {
+		timeoutMs: 20_000,
+		...overrides,
+	});
 
 	return {
 		tag: `v${version}`,
@@ -277,22 +236,26 @@ async function getLatestRelease(options?: LatestReleaseLookupOptions): Promise<R
 	};
 }
 
-export function getLatestReleaseForTest(options: LatestReleaseLookupOptions): Promise<ReleaseInfo> {
+export function getLatestReleaseForTest(options: NpmRegistryLookupOptions): Promise<ReleaseInfo> {
 	return getLatestRelease(options);
 }
 
 /**
- * Compare semver versions (including nightly prereleases). Returns:
+ * Compare semver versions. Returns:
  * - negative if a < b
  * - 0 if a == b
  * - positive if a > b
  */
 function compareVersions(a: string, b: string): number {
-	return Bun.semver.order(a, b);
-}
+	const pa = a.split(".").map(Number);
+	const pb = b.split(".").map(Number);
 
-export function compareVersionsForTest(a: string, b: string): number {
-	return compareVersions(a, b);
+	for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+		const na = pa[i] || 0;
+		const nb = pb[i] || 0;
+		if (na !== nb) return na - nb;
+	}
+	return 0;
 }
 
 /**
@@ -340,19 +303,6 @@ function resolveGjcPath(): string | undefined {
 }
 
 /**
- * Parse the version reported by `gjc --version` ("gjc/X.Y.Z" or a nightly prerelease variant).
- */
-function parseReportedVersion(output: string): string | undefined {
-	// Output format: "gjc/X.Y.Z" (stable) or "gjc/X.Y.Z-nightly.<ts>.<run>.g<sha>" (nightly prerelease)
-	const match = output.trim().match(/\/(\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)/);
-	return match?.[1];
-}
-
-export function parseReportedVersionForTest(output: string): string | undefined {
-	return parseReportedVersion(output);
-}
-
-/**
  * Run the resolved gjc binary and check if it reports the expected version.
  */
 async function verifyInstalledVersion(expectedVersion: string): Promise<InstalledVersionVerification> {
@@ -361,7 +311,10 @@ async function verifyInstalledVersion(expectedVersion: string): Promise<Installe
 	try {
 		const result = await $`${ompPath} --version`.quiet().nothrow();
 		if (result.exitCode !== 0) return { ok: false, path: ompPath };
-		const actual = parseReportedVersion(result.text());
+		const output = result.text().trim();
+		// Output format: "gjc/X.Y.Z"
+		const match = output.match(/\/(\d+\.\d+\.\d+)/);
+		const actual = match?.[1];
 		return { ok: actual === expectedVersion, actual, path: ompPath };
 	} catch {
 		return { ok: false, path: ompPath };
@@ -759,7 +712,7 @@ async function updateViaBinaryAt(targetPath: string, expectedVersion: string, re
  * Run the update command.
  */
 export interface UpdateCommandDependencies {
-	getLatestRelease?: (options?: LatestReleaseLookupOptions) => Promise<ReleaseInfo>;
+	getLatestRelease?: (installer?: Installer) => Promise<ReleaseInfo>;
 	resolveUpdateTarget?: () => Promise<UpdateTarget>;
 	performUpdate?: (target: UpdateTarget, expectedVersion: string, registry?: string) => Promise<void>;
 	refreshInstalledDefaultSkills?: () => Promise<void>;
@@ -776,43 +729,10 @@ async function performUpdate(target: UpdateTarget, expectedVersion: string, regi
 	}
 }
 
-/** How the update command should proceed after comparing versions. */
-export interface UpdateDecision {
-	install: boolean;
-	kind: "up-to-date" | "new-version" | "switch-back" | "force";
-}
-
-/**
- * Decide whether to install after comparing the channel's release with the
- * installed version.
- *
- * A nightly install is semver-newer than every stable release (nightlies
- * version as stable-max-patch+1), so a plain comparison would pin the user on
- * nightly forever: switching back to stable must install even though the
- * target is semver-lower. Only a stable lookup from a nightly build is an
- * intentional switch-back — the reverse (a same-core nightly behind the
- * installed stable) still requires --force.
- */
-export function resolveUpdateDecision(options: {
-	comparison: number;
-	force: boolean;
-	channel: UpdateChannel;
-	currentVersion: string;
-}): UpdateDecision {
-	const isChannelSwitchBack =
-		options.channel === "stable" && options.currentVersion.includes("-nightly.") && options.comparison < 0;
-	if (options.comparison <= 0 && !isChannelSwitchBack && !options.force) {
-		return { install: false, kind: "up-to-date" };
-	}
-	if (isChannelSwitchBack) return { install: true, kind: "switch-back" };
-	return { install: true, kind: options.comparison > 0 ? "new-version" : "force" };
-}
-
 export async function runUpdateCommand(
-	opts: UpdateCommandOptions,
+	opts: { force: boolean; check: boolean },
 	deps: UpdateCommandDependencies = {},
 ): Promise<void> {
-	const channel = opts.channel ?? "stable";
 	const lookupRelease = deps.getLatestRelease ?? getLatestRelease;
 	const resolveTarget = deps.resolveUpdateTarget ?? resolveUpdateTarget;
 	const update = deps.performUpdate ?? performUpdate;
@@ -820,9 +740,6 @@ export async function runUpdateCommand(
 	const exit = deps.exit ?? process.exit;
 
 	console.log(chalk.dim(`Current version: ${VERSION}`));
-	if (channel !== "stable") {
-		console.log(chalk.dim(`Update channel: ${channel} (npm dist-tag ${distTagForChannel(channel)})`));
-	}
 
 	// Resolve the install target first so the registry lookup can match the
 	// manager that will actually run: the npm-managed path ignores
@@ -840,7 +757,7 @@ export async function runUpdateCommand(
 
 	let release: ReleaseInfo;
 	try {
-		release = await lookupRelease({ ...(installer ? { installer } : {}), channel });
+		release = await lookupRelease(installer);
 	} catch (err) {
 		console.error(chalk.red(`Failed to check for updates: ${err}`));
 		return exit(1);
@@ -852,28 +769,14 @@ export async function runUpdateCommand(
 	// consumer can satisfy without the field.
 	for (const warning of release.warnings ?? []) console.warn(chalk.yellow(`Warning: ${warning}`));
 
-	let comparison: number;
-	try {
-		comparison = compareVersions(release.version, VERSION);
-	} catch (err) {
-		console.error(
-			chalk.red(
-				`Failed to check for updates: the ${distTagForChannel(channel)} channel reported an unparseable version "${release.version}": ${err instanceof Error ? err.message : String(err)}`,
-			),
-		);
-		return exit(1);
-	}
+	const comparison = compareVersions(release.version, VERSION);
 
-	const decision = resolveUpdateDecision({ comparison, force: opts.force, channel, currentVersion: VERSION });
-
-	if (!decision.install) {
+	if (comparison <= 0 && !opts.force) {
 		console.log(chalk.green(`${theme.status.success} Already up to date`));
 		return;
 	}
 
-	if (decision.kind === "switch-back") {
-		console.log(chalk.cyan(`Switching to the stable channel: ${release.version}`));
-	} else if (decision.kind === "new-version") {
+	if (comparison > 0) {
 		console.log(chalk.cyan(`New version available: ${release.version}`));
 	} else {
 		console.log(chalk.yellow(`Forcing reinstall of ${release.version}`));
@@ -923,14 +826,12 @@ ${chalk.bold("Usage:")}
   ${APP_NAME} update [options]
 
 ${chalk.bold("Options:")}
-  -c, --check               Check for updates without installing
-  -f, --force               Force reinstall even if up to date
-  --channel <stable|nightly>  Release channel to update from (default: stable or startup.updateChannel setting)
+  -c, --check   Check for updates without installing
+  -f, --force   Force reinstall even if up to date
 
 ${chalk.bold("Examples:")}
-  ${APP_NAME} update                    Update to latest version
-  ${APP_NAME} update --check            Check if updates are available
-  ${APP_NAME} update --force            Force reinstall
-  ${APP_NAME} update --channel nightly  Update to the latest nightly prerelease
+  ${APP_NAME} update           Update to latest version
+  ${APP_NAME} update --check   Check if updates are available
+  ${APP_NAME} update --force   Force reinstall
 `);
 }

@@ -15,15 +15,7 @@ import type { WriteFileOptions } from "node:fs";
 import * as fsSync from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
-
-let nativeNotificationBindings: typeof import("@gajae-code/natives") | undefined;
-
-function nativeNotification(): typeof import("@gajae-code/natives") {
-	if (!nativeNotificationBindings)
-		nativeNotificationBindings = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
-	return nativeNotificationBindings;
-}
-
+import * as native from "@gajae-code/natives";
 import type { Settings } from "../../config/settings";
 import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
 import {
@@ -222,7 +214,7 @@ export function exactUnlinkNotificationFile(
 	} catch {
 		// Missing/unreadable paths fall through; the native call reports the failure.
 	}
-	const result = nativeNotification().exactUnlink(target, { ...identity, quarantineName });
+	const result = native.exactUnlink(target, { ...identity, quarantineName });
 	return {
 		ok: result.ok,
 		code: result.code,

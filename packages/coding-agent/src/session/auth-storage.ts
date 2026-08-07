@@ -16,11 +16,11 @@ export type {
 	OAuthCredential,
 	SerializedAuthStorage,
 	StoredAuthCredential,
-} from "@gajae-code/ai/core";
+} from "@gajae-code/ai";
 export {
 	AuthBrokerClient,
 	AuthStorage,
 	REMOTE_REFRESH_SENTINEL,
 	RemoteAuthCredentialStore,
 	SqliteAuthCredentialStore,
-} from "@gajae-code/ai/core";
+} from "@gajae-code/ai";

@@ -15,7 +15,6 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { startAuthGateway } from "@gajae-code/ai/auth-gateway/server";
 import {
 	type Api,
 	AuthBrokerClient,
@@ -27,7 +26,8 @@ import {
 	type Model,
 	RemoteAuthCredentialStore,
 	type SnapshotResponse,
-} from "@gajae-code/ai/core";
+	startAuthGateway,
+} from "@gajae-code/ai";
 import { getConfigRootDir, isEnoent, VERSION } from "@gajae-code/utils";
 import chalk from "chalk";
 import { type AuthBrokerClientConfig, resolveAuthBrokerConfig } from "../session/auth-broker-config";

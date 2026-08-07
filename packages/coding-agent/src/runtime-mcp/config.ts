@@ -11,7 +11,6 @@ import type { MCPServer } from "../discovery";
 import { loadCapability } from "../discovery";
 import { loadMCPJsonFile } from "../discovery/mcp-json";
 import { readDisabledServers } from "./config-writer";
-import { canonicalizeMCPEndpoint } from "./pool-key";
 import type { MCPServerConfig } from "./types";
 
 /** Options for loading MCP configs */
@@ -50,7 +49,6 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 		enabled: server.enabled,
 		autoload: server.autoload,
 		timeout: server.timeout,
-		sharing: server.sharing,
 		auth: server.auth,
 		oauth: server.oauth,
 	};
@@ -75,7 +73,6 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 			url: server.url ?? "",
 		};
 		if (server.headers) config.headers = server.headers;
-		canonicalizeMCPEndpoint(config.url);
 		return config;
 	}
 
@@ -86,7 +83,6 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 			url: server.url ?? "",
 		};
 		if (server.headers) config.headers = server.headers;
-		canonicalizeMCPEndpoint(config.url);
 		return config;
 	}
 
@@ -274,9 +270,6 @@ export function filterExaMCPServers(
 export function validateServerConfig(name: string, config: MCPServerConfig): string[] {
 	const errors: string[] = [];
 
-	if (config.sharing !== undefined && config.sharing !== "per-session" && config.sharing !== "shared") {
-		errors.push(`Server "${name}": sharing must be "per-session" or "shared"`);
-	}
 	const serverType = config.type ?? "stdio";
 
 	// Check for conflicting transport fields

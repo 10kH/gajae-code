@@ -26,20 +26,13 @@ function providerNames(capabilities: unknown, env: NodeJS.ProcessEnv = {}): stri
 	return acpProviderRegistrations(capabilities as never, env).map(provider => provider.capability);
 }
 
-test("ACP registers the permission channel for form-less clients regardless of permission mode", () => {
+test("ACP registers a permission provider only for prompt handling", () => {
 	expect(providerNames({ _meta: { gjc: { permissionHandling: "prompt" } } })).toContain("permission");
-	// Form-less clients always get the permission channel so selector asks can
-	// be answered even in auto/always-allow mode (the mode only gates tools).
-	expect(providerNames({ _meta: { gjc: { permissionHandling: "auto" } } })).toContain("permission");
-	expect(providerNames({ _meta: { gjc: { permissionHandling: "always-allow" } } })).toContain("permission");
+	expect(providerNames({ _meta: { gjc: { permissionHandling: "auto" } } })).not.toContain("permission");
+	expect(providerNames({ _meta: { gjc: { permissionHandling: "always-allow" } } })).not.toContain("permission");
 	expect(providerNames(undefined, { GJC_ACP_PERMISSION_MODE: "prompt" })).toContain("permission");
-	expect(providerNames(undefined, { GJC_ACP_PERMISSION_MODE: "auto" })).toContain("permission");
+	expect(providerNames(undefined, { GJC_ACP_PERMISSION_MODE: "auto" })).not.toContain("permission");
 	expect(providerNames({ _meta: { gjc: { permissionHandling: "invalid" } } })).toContain("permission");
-	// A form-eliciting client in allow mode keeps only the ui channel.
-	expect(providerNames({ _meta: { gjc: { permissionHandling: "auto" } }, elicitation: { form: {} } })).not.toContain(
-		"permission",
-	);
-	expect(providerNames({ _meta: { gjc: { permissionHandling: "auto" } }, elicitation: { form: {} } })).toContain("ui");
 });
 
 test("ACP registers the SDK UI provider only for clients with form elicitation", () => {
@@ -76,7 +69,6 @@ test("ACP reverse requests use canonical names, session scope, and cancellation"
 	const reverse = createAcpReverseConnection(connection, "session-1");
 	const requests = [
 		["request", { toolCallId: "call-1", sessionId: "spoofed-session" }],
-		["permission.request", { toolCallId: "call-2", sessionId: "spoofed-session" }],
 		["fs.readTextFile", { path: "/workspace/README.md" }],
 		["fs.writeTextFile", { path: "/workspace/README.md", content: "updated" }],
 		["terminal.create", { command: "printf", args: ["ok"] }],
@@ -86,7 +78,6 @@ test("ACP reverse requests use canonical names, session scope, and cancellation"
 
 	expect(calls).toEqual([
 		["session/request_permission", { toolCallId: "call-1", sessionId: "session-1" }, { cancellationSignal: signal }],
-		["session/request_permission", { toolCallId: "call-2", sessionId: "session-1" }, { cancellationSignal: signal }],
 		["fs/read_text_file", { path: "/workspace/README.md", sessionId: "session-1" }, { cancellationSignal: signal }],
 		[
 			"fs/write_text_file",
@@ -101,28 +92,6 @@ test("ACP reverse requests use canonical names, session scope, and cancellation"
 		],
 	]);
 	expect(typedCalls).toEqual([]);
-});
-test("ACP reverse permission aliases normalize nested and flat outcomes into the SDK decision contract", async () => {
-	for (const method of ["request", "permission.request"] as const) {
-		for (const [response, expected] of [
-			[
-				{ outcome: { outcome: "selected", optionId: "allow_once" } },
-				{ outcome: "selected", optionId: "allow_once" },
-			],
-			[{ outcome: { outcome: "cancelled" } }, { outcome: "cancelled" }],
-			[
-				{ outcome: "selected", optionId: "allow_always" },
-				{ outcome: "selected", optionId: "allow_always" },
-			],
-			[{ outcome: "cancelled" }, { outcome: "cancelled" }],
-		] as const) {
-			const connection = {
-				request: async () => response,
-			} as unknown as AgentSideConnection;
-			const reverse = createAcpReverseConnection(connection, "session-1");
-			expect(await reverse.request?.(method, { toolCallId: "call-1" })).toEqual(expected);
-		}
-	}
 });
 
 test("ACP maps non-prompt permission handling to the SDK allow policy", async () => {

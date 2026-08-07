@@ -1,4 +1,4 @@
-import type { Usage } from "@gajae-code/ai/core";
+import type { Usage } from "@gajae-code/ai";
 
 const TOKENS_PER_MILLION = 1_000_000;
 const MATERIAL_COST_USD = 0.01;

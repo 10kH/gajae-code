@@ -74,18 +74,6 @@ export class SkillProtocolHandler implements ProtocolHandler {
 			targetPath = skill.filePath;
 		}
 
-		if (!hasRelativePath && skill.loadContent) {
-			const content = await skill.loadContent();
-			return {
-				url: url.href,
-				content,
-				contentType: "text/markdown",
-				size: Buffer.byteLength(content, "utf-8"),
-				sourcePath: targetPath,
-				notes: [],
-			};
-		}
-
 		if (typeof skill.content === "string" && !hasRelativePath) {
 			return {
 				url: url.href,

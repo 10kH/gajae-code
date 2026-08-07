@@ -246,20 +246,18 @@ describe("ToolSession adapter fast-mode delegation", () => {
 		tempDir.removeSync();
 	});
 
-	async function toolSession(): Promise<ToolSession> {
+	function toolSession(): ToolSession {
 		const tool = created.session.getToolByName("subagent");
-		const materialize = (tool as { materializeForTests?: () => Promise<unknown> } | undefined)?.materializeForTests;
-		if (!tool || !materialize) throw new Error("subagent lazy tool is not registered");
-		const implementation = await materialize.call(tool);
-		return (implementation as { session: ToolSession }).session;
+		if (!tool) throw new Error("subagent tool is not registered");
+		return (tool as unknown as { session: ToolSession }).session;
 	}
 
-	it("exposes isFastForSubagentProvider on the adapter handed to tools", async () => {
-		expect(typeof (await toolSession()).isFastForSubagentProvider).toBe("function");
+	it("exposes isFastForSubagentProvider on the adapter handed to tools", () => {
+		expect(typeof toolSession().isFastForSubagentProvider).toBe("function");
 	});
 
-	it("delegates the scoped subagent tier through the adapter", async () => {
-		const adapter = await toolSession();
+	it("delegates the scoped subagent tier through the adapter", () => {
+		const adapter = toolSession();
 		expect(adapter.isFastForSubagentProvider?.("openai")).toBe(true);
 		expect(adapter.isFastForSubagentProvider?.("openai-codex")).toBe(true);
 		expect(adapter.isFastForSubagentProvider?.("anthropic")).toBe(false);

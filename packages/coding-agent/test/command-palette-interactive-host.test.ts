@@ -223,7 +223,6 @@ async function createHost(): Promise<InteractivePaletteHost> {
 		const refreshSlashCommandState = vi.spyOn(mode, "refreshSlashCommandState").mockResolvedValue(undefined);
 		try {
 			await mode.init();
-			await mode.ensureHistoryStorage();
 		} finally {
 			if (initializingHost === partialHost) initializingHost = undefined;
 		}

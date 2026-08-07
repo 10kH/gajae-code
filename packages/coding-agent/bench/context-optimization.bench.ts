@@ -17,10 +17,9 @@
 import { estimateMessageTokensHeuristic } from "@gajae-code/agent-core/compaction/compaction";
 import type { SessionEntry } from "@gajae-code/agent-core/compaction/entries";
 import {
-	commitToolOutputPrune,
 	DEFAULT_PRUNE_CONFIG,
-	planToolOutputPrune,
 	type PruneConfig,
+	pruneToolOutputs,
 } from "@gajae-code/agent-core/compaction/pruning";
 import type { AgentMessage } from "@gajae-code/agent-core/types";
 import { buildPhaseRollupReceipt } from "../src/harness-control-plane/phase-rollup";
@@ -156,21 +155,6 @@ function cloneEntries(entries: SessionEntry[]): SessionEntry[] {
 	return structuredClone(entries);
 }
 
-function applyToolOutputPrune(entries: SessionEntry[], config: PruneConfig): {
-	prunedCount: number;
-	tokensSaved: number;
-	prunedEntries: SessionEntry[];
-} {
-	const plan = planToolOutputPrune(entries, config);
-	const byId = new Map(entries.map(entry => [entry.id, entry]));
-	const outcomes = commitToolOutputPrune(entries, plan);
-	const prunedEntries = outcomes
-		.filter(outcome => outcome.outcome === "committed")
-		.map(outcome => byId.get(outcome.entryId))
-		.filter((entry): entry is SessionEntry => entry !== undefined);
-	return { prunedCount: prunedEntries.length, tokensSaved: plan.tokensSaved, prunedEntries };
-}
-
 // ---------------------------------------------------------------------------
 // 1. Staleness-aware pruning gain (vs classic pre-#508 selection)
 // ---------------------------------------------------------------------------
@@ -198,11 +182,10 @@ export function measurePruningGain(entries: SessionEntry[]): PruningGainReport {
 	const classicEntries = cloneEntries(entries);
 	const stalenessEntries = cloneEntries(entries);
 
-	const classic = applyToolOutputPrune(classicEntries, classicConfig);
-	const stalenessAware = applyToolOutputPrune(stalenessEntries, DEFAULT_PRUNE_CONFIG);
+	const classic = pruneToolOutputs(classicEntries, classicConfig);
+	const stalenessAware = pruneToolOutputs(stalenessEntries, DEFAULT_PRUNE_CONFIG);
 
 	const staleReadsPruned = stalenessAware.prunedEntries.filter(entry => {
-		if (entry.type !== "message") return false;
 		const message = entry.message as AgentMessage;
 		return message.role === "toolResult" && message.toolName === "read";
 	}).length;
@@ -268,7 +251,7 @@ export function measureCacheEpochDiscipline(
 		// Old policy: prune every turn (mutates the live array slice in place).
 		const perTurnSlice = perTurn.slice(0, upto);
 		const perTurnContextTokens = totalToolResultTokens(perTurnSlice);
-		const perTurnResult = applyToolOutputPrune(perTurnSlice, DEFAULT_PRUNE_CONFIG);
+		const perTurnResult = pruneToolOutputs(perTurnSlice, DEFAULT_PRUNE_CONFIG);
 		if (perTurnResult.prunedCount > 0) {
 			perTurnRewrites++;
 			perTurnRecacheTokens += perTurnContextTokens;
@@ -278,7 +261,7 @@ export function measureCacheEpochDiscipline(
 		const thresholdContextTokens = totalToolResultTokens(threshold.slice(0, upto));
 		if (thresholdContextTokens > thresholdTokens) {
 			const thresholdSlice = threshold.slice(0, upto);
-			const thresholdResult = applyToolOutputPrune(thresholdSlice, DEFAULT_PRUNE_CONFIG);
+			const thresholdResult = pruneToolOutputs(thresholdSlice, DEFAULT_PRUNE_CONFIG);
 			if (thresholdResult.prunedCount > 0) {
 				thresholdRewrites++;
 				thresholdRecacheTokens += totalToolResultTokens(threshold.slice(0, upto));
@@ -496,7 +479,7 @@ export function measurePerf(): PerfReport {
 	return {
 		pruneLargeSessionEntries: largeSession.length,
 		pruneLargeSessionMsPerOp: timePerOp(10, () => {
-			applyToolOutputPrune(cloneEntries(largeSession), DEFAULT_PRUNE_CONFIG);
+			pruneToolOutputs(cloneEntries(largeSession), DEFAULT_PRUNE_CONFIG);
 		}),
 		ingestBatchSize: ingestBatch.length,
 		ingestBatchMsPerOp: timePerOp(50, () => {

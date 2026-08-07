@@ -31,7 +31,6 @@ import {
 	type AgentState,
 	type AgentTool,
 	assertImagePlaceholdersHavePayload,
-	type ContextMaintenanceResult,
 	canContinuePersistedHistory,
 	getAgentTerminalOwnerContext,
 	type ManagedAttemptContinuationOwnership,
@@ -71,15 +70,11 @@ import {
 	shouldCompact,
 } from "@gajae-code/agent-core/compaction";
 import {
-	commitToolOutputPrune,
-	createPrunedNotice,
 	DEFAULT_PRUNE_CONFIG,
 	estimateToolOutputPruneSavings,
-	extractToolOutputText,
-	planToolOutputPrune,
 	pruneAssistantToolArguments,
+	pruneToolOutputs,
 	shouldRunMaintenancePrune,
-	type ToolOutputPruneEvictionHandle,
 } from "@gajae-code/agent-core/compaction/pruning";
 import type {
 	AssistantMessage,
@@ -102,16 +97,17 @@ import type {
 	TransportFailureFacts,
 	Usage,
 	UsageReport,
-} from "@gajae-code/ai/core";
+} from "@gajae-code/ai";
 import {
 	classifyContextOverflow,
+	clearAnthropicFastModeFallback,
 	getSupportedEfforts,
 	isContextOverflow,
 	isUsageLimitError,
 	modelsAreEqual,
 	resolveServiceTier,
 	streamSimple,
-} from "@gajae-code/ai/core";
+} from "@gajae-code/ai";
 import {
 	type AuthDisposition,
 	beginAttempt,
@@ -173,7 +169,7 @@ export interface ForkContextSeedOptions {
 	signal?: AbortSignal;
 }
 
-import type { MacOSPowerAssertion } from "@gajae-code/natives";
+import { MacOSPowerAssertion } from "@gajae-code/natives";
 import {
 	extractRetryHint,
 	hasFsCode,
@@ -297,9 +293,7 @@ import type { HindsightSessionState } from "../hindsight/state";
 import { buildSkillStopOutput, ensureWorkflowSkillActivationState } from "../hooks/skill-state";
 import { initializeLocalRoot, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { shutdownAll as shutdownAllLspClients } from "../lsp/client";
-import { resolveMemoryBackendId } from "../memory-backend/resolve";
-import { createMemoryBackendService } from "../memory-backend/service";
-import type { MemoryBackend } from "../memory-backend/types";
+import { resolveMemoryBackend } from "../memory-backend";
 import {
 	BrokerWorkflowGateEmitter,
 	FileGateStore,
@@ -320,12 +314,9 @@ import planModeToolDecisionReminderPrompt from "../prompts/system/plan-mode-tool
 import ttsrInterruptTemplate from "../prompts/system/ttsr-interrupt.md" with { type: "text" };
 import ttsrToolReminderTemplate from "../prompts/system/ttsr-tool-reminder.md" with { type: "text" };
 import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
-import type { LazyService } from "../runtime/lazy-service";
-import type { NetworkPrewarmRuntime } from "../runtime/network-prewarm-service";
-import type { WorkspaceTreeRuntime } from "../runtime/workspace-tree-service";
 import { MCPManager } from "../runtime-mcp/manager";
 import type { NotificationSessionController } from "../sdk/bus/session-control";
-import type { SecretObfuscator } from "../secrets/obfuscator";
+import { deobfuscateSessionContext, type SecretObfuscator } from "../secrets/obfuscator";
 import { formatNoCredentialOnboardingError, formatNoModelOnboardingError } from "../setup/model-onboarding-guidance";
 import {
 	isCanonicalGjcWorkflowSkill,
@@ -469,22 +460,6 @@ function appendCompactionStateContext(summary: string, stateContext: string[]): 
 
 const PRUNED_ARTIFACT_REF_MAX_CHARS = 64;
 
-class ToolOutputPruneRollbackError extends Error {
-	readonly code = "tool_output_prune_rollback_failed";
-	readonly stage: "persistence" | "agent";
-
-	constructor(stage: "persistence" | "agent", cause: unknown) {
-		super(
-			stage === "persistence"
-				? "Tool-output prune rollback persistence failed."
-				: "Tool-output prune agent-state rollback failed.",
-			{ cause },
-		);
-		this.name = "ToolOutputPruneRollbackError";
-		this.stage = stage;
-	}
-}
-
 /** Session-specific events that extend the core AgentEvent */
 export type AutoCompactionContinuationSkipReason = "auto_continue_disabled_non_resumable_tail";
 
@@ -558,12 +533,6 @@ export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
 	settings: Settings;
-	/** Lazy memory backend service; omitted callers receive a session-local default. */
-	memoryBackend?: LazyService<MemoryBackend>;
-	/** Lazy workspace-tree service; omitted callers retain the legacy direct-scan path. */
-	workspaceTreeService?: LazyService<WorkspaceTreeRuntime>;
-	/** Lazy model-host prewarm service used for first-request latency diagnostics. */
-	networkPrewarmService?: LazyService<NetworkPrewarmRuntime>;
 	/** Shared Gate-A-eligible notification session controller, when this host supports it. */
 	notificationSessionController?: NotificationSessionController;
 	/** Models to cycle through with Alt+N (from --models flag) */
@@ -597,8 +566,6 @@ export interface AgentSessionConfig {
 	modelRegistry: ModelRegistry;
 	/** Task recursion depth for nested sessions. Top-level sessions use 0. */
 	taskDepth?: number;
-	/** Controls whether workflow gates are published to the process-wide endpoint registry. */
-	workflowGatePublication?: "endpoint" | "local";
 	/** Tool registry for LSP and settings */
 	toolRegistry?: Map<string, AgentTool>;
 	/** Tool-session factory context used to lazily attach workflow-gate-only tools. */
@@ -627,8 +594,6 @@ export interface AgentSessionConfig {
 	) => Promise<{ systemPrompt: string[] }>;
 	/** Initial workspace tree snapshot used for the first volatile per-turn context message. */
 	workspaceTree?: WorkspaceTree;
-	/** Called after a lazy first-turn scan publishes the resolved tree to the stable prompt builder. */
-	onWorkspaceTreeReady?: (tree: WorkspaceTree) => void | Promise<void>;
 	/** Rebuild the SSH tool from current capability discovery results. */
 	reloadSshTool?: () => Promise<AgentTool | null>;
 	requestedToolNames?: ReadonlySet<string>;
@@ -972,19 +937,10 @@ function isMessageOnlyFirstEventTimeout(message: AssistantMessage): boolean {
 	);
 }
 
-function isBareDefaultMessageOnlyFirstEventTimeout(message: AssistantMessage): boolean {
-	// Message-only first-event watchdog timeouts in canonical prose — the wrapped
-	// "Error: Provider stream timed out while waiting for the first event" form
-	// or a bare per-provider variant matching BARE_DEFAULT_WATCHDOG_ERROR — are
-	// replay-safe: the watchdog fired before the stream produced any observable
-	// output, so a bare-default retry can re-issue the request without
-	// duplicating side effects. Conflicting structured facts (status/code/
-	// headers) fail closed: a message that also carries transport facts is not
-	// provably a content-free watchdog abort.
+function isBareDefaultWrappedFirstEventTimeout(message: AssistantMessage): boolean {
 	return (
-		!hasBareDefaultRetryDisqualifyingFacts(message) &&
-		(message.errorMessage === WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR ||
-			BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))
+		message.errorMessage === WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR &&
+		!hasBareDefaultRetryDisqualifyingFacts(message)
 	);
 }
 function isBareDefaultCodexOverload(message: AssistantMessage): boolean {
@@ -1765,39 +1721,12 @@ type SessionAdmissionLease = {
 	release(): void;
 };
 
-/**
- * Fire-and-forget continuations (auto-compaction retries, queued follow-ups) race a
- * still-busy agent whose current turn can legitimately hold the run for minutes.
- * Reschedule with capped exponential backoff instead of a fixed 100ms spin, and give
- * up after a bounded number of attempts (~4 minutes total) so a stuck busy state
- * cannot spin forever — observed in production logs as 10,742 reschedules over
- * 21 minutes inside a single session.
- */
-const AGENT_CONTINUE_BUSY_RESCHEDULE_BASE_DELAY_MS = 100;
-const AGENT_CONTINUE_BUSY_RESCHEDULE_MAX_DELAY_MS = 5_000;
-const AGENT_CONTINUE_BUSY_MAX_RESCHEDULES = 50;
-
-function agentContinueBusyRescheduleDelayMs(attempt: number): number {
-	const exponential = AGENT_CONTINUE_BUSY_RESCHEDULE_BASE_DELAY_MS * 2 ** Math.max(0, attempt - 1);
-	return Math.min(exponential, AGENT_CONTINUE_BUSY_RESCHEDULE_MAX_DELAY_MS);
-}
-
-function deobfuscateSessionContext(context: SessionContext, obfuscator: SecretObfuscator | undefined): SessionContext {
-	if (!obfuscator?.hasSecrets()) return context;
-	const messages = obfuscator.deobfuscateObject(context.messages);
-	if (messages === context.messages) return context;
-	transferSessionMessageIdentity(context.messages, messages);
-	return { ...context, messages };
-}
-
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly settings: Settings;
-	readonly memoryBackend: LazyService<MemoryBackend>;
 	readonly notificationSessionController: NotificationSessionController | undefined;
 	readonly taskDepth: number;
-	#workflowGatePublication: "endpoint" | "local";
 	readonly yieldQueue: YieldQueue;
 	// True from the start of a handoff transition through commit/rollback. While
 	// set, the yield queue treats the session as busy so background async-job
@@ -1806,7 +1735,6 @@ export class AgentSession {
 	#handoffTransitionActive = false;
 
 	#powerAssertion: MacOSPowerAssertion | undefined;
-	#powerAssertionLoad?: Promise<void>;
 
 	readonly configWarnings: string[] = [];
 
@@ -1926,7 +1854,7 @@ export class AgentSession {
 	/** Invocation-scoped EventStream drain barriers owned by active maintenance calls. */
 	#activeMidRunBarrierControllers = new Set<AbortController>();
 	/** Maintenance invocations that must settle before resources are torn down. */
-	#activeMidRunMaintenancePromises = new Set<Promise<ContextMaintenanceResult>>();
+	#activeMidRunMaintenancePromises = new Set<Promise<MidRunMaintenanceOutcome>>();
 	// Anti-loop guard (#1662): signature of the assistant response that last
 	// anchored a mid-run maintenance attempt. A given provider response drives at
 	// most one attempt, so a compaction that cannot shrink further can't wedge the
@@ -2105,9 +2033,6 @@ export class AgentSession {
 	#requestedToolNames: ReadonlySet<string> | undefined;
 	#baseSystemPrompt: string[];
 	#initialWorkspaceTree: WorkspaceTree | undefined;
-	#workspaceTreeService: LazyService<WorkspaceTreeRuntime> | undefined;
-	#onWorkspaceTreeReady: ((tree: WorkspaceTree) => void | Promise<void>) | undefined;
-	#networkPrewarmService: LazyService<NetworkPrewarmRuntime> | undefined;
 	/** Throttle cache for the per-turn volatile workspace-tree scan (see #buildVolatileProjectContextMessage). */
 	#cachedWorkspaceTree: WorkspaceTree | undefined;
 	#cachedWorkspaceTreeAt = 0;
@@ -2264,33 +2189,24 @@ export class AgentSession {
 
 	#acquirePowerAssertion(): void {
 		if (process.platform !== "darwin") return;
-		if (this.#powerAssertion || this.#powerAssertionLoad) return;
+		if (this.#powerAssertion) return;
 		const idle = this.settings.get("power.preventIdleSleep");
 		const system = this.settings.get("power.preventSystemSleep");
 		const user = this.settings.get("power.declareUserActive");
 		const display = this.settings.get("power.preventDisplaySleep");
+		// All four off → user opted out; do nothing.
 		if (!idle && !system && !user && !display) return;
-		this.#powerAssertionLoad = Promise.resolve()
-			.then(() => {
-				const { MacOSPowerAssertion } = require("@gajae-code/natives") as Pick<
-					typeof import("@gajae-code/natives"),
-					"MacOSPowerAssertion"
-				>;
-				if (this.#powerAssertion) return;
-				this.#powerAssertion = MacOSPowerAssertion.start({
-					reason: "Gajae Code agent session",
-					idle,
-					system,
-					user,
-					display,
-				});
-			})
-			.catch(error => {
-				logger.warn("Failed to acquire macOS power assertion", { error: String(error) });
-			})
-			.finally(() => {
-				this.#powerAssertionLoad = undefined;
+		try {
+			this.#powerAssertion = MacOSPowerAssertion.start({
+				reason: "Gajae Code agent session",
+				idle,
+				system,
+				user,
+				display,
 			});
+		} catch (error) {
+			logger.warn("Failed to acquire macOS power assertion", { error: String(error) });
+		}
 	}
 
 	#releasePowerAssertion(): void {
@@ -2661,7 +2577,6 @@ export class AgentSession {
 		this.agent.bindRunCancellationDomainBridge(this.#runCancellationDomains, this.#agentSessionClaimKey);
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
-		this.memoryBackend = config.memoryBackend ?? createMemoryBackendService(this.settings);
 		this.#workerIntegrationScheduler = new WorkerIntegrationRequestScheduler(
 			config.workerIntegrationRequest ??
 				(async signal => {
@@ -2683,7 +2598,6 @@ export class AgentSession {
 				: undefined);
 		this.notificationSessionController = config.notificationSessionController;
 		this.taskDepth = config.taskDepth ?? 0;
-		this.#workflowGatePublication = config.workflowGatePublication ?? "endpoint";
 		// Register this session with the process-wide resource GC (idle/RSS browser-tab eviction
 		// + stale screenshot cleanup). Session-keyed so concurrent sessions share one timer safely.
 		const resourceGcSessionId = this.sessionManager.getSessionId();
@@ -2795,9 +2709,6 @@ export class AgentSession {
 		this.#reloadSshTool = config.reloadSshTool;
 		this.#baseSystemPrompt = this.agent.state.systemPrompt;
 		this.#initialWorkspaceTree = config.workspaceTree;
-		this.#workspaceTreeService = config.workspaceTreeService;
-		this.#networkPrewarmService = config.networkPrewarmService;
-		this.#onWorkspaceTreeReady = config.onWorkspaceTreeReady;
 		this.#mcpDiscoveryEnabled = config.mcpDiscoveryEnabled ?? false;
 		const configuredDiscoveryMode = config.settings.get("tools.discoveryMode");
 		this.#discoveryMode =
@@ -4314,9 +4225,7 @@ export class AgentSession {
 									const ttsrSettings = this.#ttsrManager?.getSettings();
 									if (ttsrSettings?.contextMode === "discard" && targetAssistantIndex !== -1) {
 										// Remove the partial/aborted assistant turn from agent state when it was persisted.
-										this.agent.replaceMessages(this.agent.state.messages.slice(0, targetAssistantIndex), {
-											historyRewrite: { reason: "retry", preserveSeededPrefix: true },
-										});
+										this.agent.replaceMessages(this.agent.state.messages.slice(0, targetAssistantIndex));
 									}
 									// Inject TTSR rules as system reminder before retry
 									const injection = this.#getTtsrInjectionContent();
@@ -4804,7 +4713,6 @@ export class AgentSession {
 			options?.onError?.(error);
 		};
 		const scheduledGeneration = options?.generation;
-		let busyReschedules = 0;
 		const scheduleAttempt = (delayMs = options?.delayMs): Promise<void> => {
 			const leaseSettlement = Promise.withResolvers<void>();
 			const settleLease = () => leaseSettlement.resolve();
@@ -4897,25 +4805,12 @@ export class AgentSession {
 								!terminalized &&
 								canContinue()
 							) {
-								if (busyReschedules < AGENT_CONTINUE_BUSY_MAX_RESCHEDULES) {
-									busyReschedules += 1;
-									const nextDelayMs = agentContinueBusyRescheduleDelayMs(busyReschedules);
-									this.#retainDeferredAgentEndAfterContinuationBusy(
-										predecessorAgentEndHold,
-										predecessorAgentEnd,
-									);
-									logger.debug("agent.continue busy after scheduling; rescheduling", {
-										error: error.message,
-										attempt: busyReschedules,
-										delayMs: nextDelayMs,
-									});
-									void scheduleAttempt(nextDelayMs);
-									return;
-								}
-								logger.warn("agent.continue busy reschedule budget exhausted; giving up", {
-									attempts: busyReschedules,
+								this.#retainDeferredAgentEndAfterContinuationBusy(predecessorAgentEndHold, predecessorAgentEnd);
+								logger.debug("agent.continue busy after scheduling; rescheduling", {
 									error: error.message,
 								});
+								void scheduleAttempt(100);
+								return;
 							}
 							if (!predecessorAccepted)
 								this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
@@ -4971,9 +4866,7 @@ export class AgentSession {
 			lastMsg?.role === "assistant" &&
 			classifyContextOverflow(lastMsg as AssistantMessage, lastMsg.transportFailure, contextWindow)
 		) {
-			this.agent.replaceMessages(messages.slice(0, -1), {
-				historyRewrite: { reason: "retry", preserveSeededPrefix: true },
-			});
+			this.agent.replaceMessages(messages.slice(0, -1));
 		}
 	}
 
@@ -5046,7 +4939,6 @@ export class AgentSession {
 			if (!authorized) this.emitNotice("info", "Auto-continue skipped: no unfinished work detected");
 			return authorized;
 		};
-		let busyReschedules = 0;
 		const scheduleAttempt = (delayMs = 0) => {
 			let rescheduled = false;
 			void this.#schedulePostPromptTask(
@@ -5084,25 +4976,14 @@ export class AgentSession {
 							return;
 						}
 						if (this.#isAgentBusyError(error) && this.#promptGeneration === scheduledGeneration) {
-							if (busyReschedules < AGENT_CONTINUE_BUSY_MAX_RESCHEDULES) {
-								busyReschedules += 1;
-								const nextDelayMs = agentContinueBusyRescheduleDelayMs(busyReschedules);
-								logger.debug("Auto-compaction continuation busy; rescheduling", {
-									source: "auto_continue_prompt",
-									reason: "queue_drained",
-									error: error.message,
-									attempt: busyReschedules,
-									delayMs: nextDelayMs,
-								});
-								rescheduled = true;
-								scheduleAttempt(nextDelayMs);
-								return;
-							}
-							logger.warn("Auto-compaction continuation busy reschedule budget exhausted; giving up", {
+							logger.debug("Auto-compaction continuation busy; rescheduling", {
 								source: "auto_continue_prompt",
-								attempts: busyReschedules,
+								reason: "queue_drained",
 								error: error.message,
 							});
+							rescheduled = true;
+							scheduleAttempt(100);
+							return;
 						}
 						this.#logCompactionContinuationError("auto_continue_prompt", error);
 					} finally {
@@ -6124,8 +6005,7 @@ export class AgentSession {
 	}
 
 	#rekeyHindsightMemoryForCurrentSessionId(): void {
-		if (resolveMemoryBackendId(this.settings) !== "hindsight") return;
-
+		if (resolveMemoryBackend(this.settings).id !== "hindsight") return;
 		const sid = this.agent.sessionId;
 		if (!sid) return;
 		this.getHindsightSessionState()?.setSessionId(sid);
@@ -6133,7 +6013,7 @@ export class AgentSession {
 
 	/** New session file: reset auto-recall / retain-threshold counters for the new transcript. */
 	#resetHindsightConversationTrackingIfHindsight(): void {
-		if (resolveMemoryBackendId(this.settings) !== "hindsight") return;
+		if (resolveMemoryBackend(this.settings).id !== "hindsight") return;
 		const state = this.getHindsightSessionState();
 		if (!state || state.aliasOf) return;
 		state.resetConversationTracking();
@@ -6207,7 +6087,7 @@ export class AgentSession {
 			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
 		}
 		this.#workflowGateEmitter = undefined;
-		this.#notifyWorkflowGateEmitterChanged(this.sessionId, undefined);
+		notifyWorkflowGateEmitterChanged(this.sessionId, undefined);
 		await this.#flushWorkerIntegrationAttempt();
 		await this.#cancelPostPromptTasks();
 		// Cancel jobs this agent registered so a subagent's teardown doesn't
@@ -6235,7 +6115,7 @@ export class AgentSession {
 		// not own. Mirrors the ownedAsyncJobManager rule above.
 		const ownedMcpManager = this.#ownedMcpManager;
 		if (ownedMcpManager) {
-			await ownedMcpManager.releaseLeases();
+			await ownedMcpManager.disconnectAll();
 			if (MCPManager.instance() === ownedMcpManager) {
 				MCPManager.setInstance(undefined);
 			}
@@ -6267,9 +6147,6 @@ export class AgentSession {
 		// Disconnect the agent event listener BEFORE closing session resources so a late
 		// provider/tool message_end cannot append to the closing SessionManager.
 		this.#disconnectFromAgent();
-		await this.memoryBackend.dispose();
-		if (this.#workspaceTreeService) await this.#workspaceTreeService.dispose();
-		if (this.#networkPrewarmService) await this.#networkPrewarmService.dispose();
 		await this.sessionManager.close();
 		this.#closeAllProviderSessions("dispose");
 		const hindsightState = this.getHindsightSessionState();
@@ -7201,7 +7078,7 @@ export class AgentSession {
 	}
 
 	async #buildSystemPromptForAgentStart(promptText: string): Promise<string[]> {
-		const backend = await this.memoryBackend.get("agent-start-prompt");
+		const backend = resolveMemoryBackend(this.settings);
 		if (!backend.beforeAgentStartPrompt) return this.#baseSystemPrompt;
 
 		try {
@@ -7330,7 +7207,7 @@ export class AgentSession {
 		const cwd = this.sessionManager.getCwd();
 		const phase = await resolveCurrentPhaseForParent({ cwd, sessionId, parent });
 		const entries = await readActiveSubskillsForParent({ cwd, sessionId, parent, phase });
-		return entries.some(entry => (entry.toolRefs ?? []).length > 0);
+		return entries.some(entry => (entry.toolPaths ?? []).some(toolPath => toolPath.trim().length > 0));
 	}
 
 	#getCustomToolContext(): CustomToolContext {
@@ -7933,19 +7810,11 @@ export class AgentSession {
 		return getAskAnswerSourceFromRegistry(this.sessionId);
 	}
 
-	#notifyWorkflowGateEmitterChanged(sessionId: string, emitter: WorkflowGateEmitter | undefined): void {
-		if (this.#workflowGatePublication !== "endpoint") return;
-		notifyWorkflowGateEmitterChanged(sessionId, emitter);
-	}
-
 	#constructWorkflowGateEmitter(sessionId = this.sessionManager.getSessionId()): WorkflowGateEmitter {
 		assertNonEmptyGjcSessionId(sessionId, "AgentSession workflow-gate session");
-		const gateStore =
-			this.#workflowGatePublication === "endpoint" && this.sessionManager.isPersisted()
-				? new FileGateStore(
-						path.join(sessionStateDir(this.sessionManager.getCwd(), sessionId), "workflow-gates.json"),
-					)
-				: new MemoryGateStore();
+		const gateStore = this.sessionManager.isPersisted()
+			? new FileGateStore(path.join(sessionStateDir(this.sessionManager.getCwd(), sessionId), "workflow-gates.json"))
+			: new MemoryGateStore();
 		return new BrokerWorkflowGateEmitter(sessionId, gateStore);
 	}
 
@@ -7971,7 +7840,7 @@ export class AgentSession {
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
-		if (previousSessionId) this.#notifyWorkflowGateEmitterChanged(previousSessionId, undefined);
+		if (previousSessionId) notifyWorkflowGateEmitterChanged(previousSessionId, undefined);
 		this.setWorkflowGateEmitter(successorEmitter);
 	}
 
@@ -7989,7 +7858,7 @@ export class AgentSession {
 		this.#workflowGateEmitter = undefined;
 		try {
 			emitter.suspend?.();
-			this.#notifyWorkflowGateEmitterChanged(sessionId, undefined);
+			notifyWorkflowGateEmitterChanged(sessionId, undefined);
 		} catch (error) {
 			logger.warn("Workflow-gate emitter suspension notification failed", {
 				error: error instanceof Error ? error.message : String(error),
@@ -8006,7 +7875,7 @@ export class AgentSession {
 
 	setWorkflowGateEmitter(emitter: WorkflowGateEmitter | undefined): void {
 		this.#workflowGateEmitter = emitter;
-		this.#notifyWorkflowGateEmitterChanged(this.sessionId, emitter);
+		notifyWorkflowGateEmitterChanged(this.sessionId, emitter);
 		if (emitter) {
 			this.#registerWorkflowGateAskTool();
 		}
@@ -8424,30 +8293,19 @@ export class AgentSession {
 		// and the accumulation of stale tree copies in history, while keeping the
 		// content outside the cached system prefix.
 		let includeTree: WorkspaceTree | undefined;
-		let publishStableWorkspaceTree = false;
 		if (this.#initialWorkspaceTree) {
 			this.#cachedWorkspaceTree = this.#initialWorkspaceTree;
 			this.#cachedWorkspaceTreeAt = Date.now();
 			this.#initialWorkspaceTree = undefined;
 			includeTree = this.#cachedWorkspaceTree;
 		} else if (Date.now() - this.#cachedWorkspaceTreeAt >= VOLATILE_TREE_TTL_MS) {
-			if (this.#workspaceTreeService) {
-				const firstWorkspaceTree = this.#cachedWorkspaceTreeAt === 0;
-				const runtime = await this.#workspaceTreeService.get("first-turn-barrier");
-				this.#cachedWorkspaceTree = firstWorkspaceTree ? runtime.snapshot : await runtime.refresh();
-				publishStableWorkspaceTree = firstWorkspaceTree;
-			} else {
-				try {
-					this.#cachedWorkspaceTree = await buildWorkspaceTree(cwd, { timeoutMs: 5000 });
-				} catch {
-					this.#cachedWorkspaceTree = undefined;
-				}
+			try {
+				this.#cachedWorkspaceTree = await buildWorkspaceTree(cwd, { timeoutMs: 5000 });
+			} catch {
+				this.#cachedWorkspaceTree = undefined;
 			}
 			this.#cachedWorkspaceTreeAt = Date.now();
 			includeTree = this.#cachedWorkspaceTree;
-		}
-		if (publishStableWorkspaceTree && includeTree && this.#onWorkspaceTreeReady) {
-			await this.#onWorkspaceTreeReady(includeTree);
 		}
 		return {
 			role: "custom",
@@ -9962,9 +9820,7 @@ export class AgentSession {
 		const eviction = this.sessionManager.evictCompactedContent(firstKeptEntryId, compactionEntryId);
 		if (eviction.evictedEntries > 0) await this.sessionManager.rewriteEntries();
 		const sessionContext = this.buildDisplaySessionContext();
-		this.agent.replaceMessages(sessionContext.messages, {
-			historyRewrite: { reason: "compaction", preserveSeededPrefix: true },
-		});
+		this.agent.replaceMessages(sessionContext.messages);
 		// Compaction can evict a previously injected goal/plan-mode-context copy from
 		// live context; clear the static-once signatures so the next prompt re-injects.
 		this.#resetInjectedContextSignatures();
@@ -10013,9 +9869,7 @@ export class AgentSession {
 			awaitEventDrain: async () => {},
 		},
 	): Promise<MidRunMaintenanceOutcome> {
-		return this.#trackMidRunMaintenance(this.#runMidRunMaintenance(context, lifecycle)).then(
-			result => result.outcome,
-		);
+		return this.#trackMidRunMaintenance(this.#runMidRunMaintenance(context, lifecycle));
 	}
 
 	/** Test seam: estimate mid-run context tokens for a given context view. */
@@ -11681,8 +11535,6 @@ export class AgentSession {
 	 * never by the transient Q1 auto-disable path.
 	 */
 	#rearmFastMode(): void {
-		const { clearAnthropicFastModeFallback } =
-			require("@gajae-code/ai/providers/anthropic") as typeof import("@gajae-code/ai/providers/anthropic");
 		clearAnthropicFastModeFallback(this.#providerSessionState);
 		this.#fastModeAutoDisabledProviderKeys.clear();
 	}
@@ -11793,276 +11645,150 @@ export class AgentSession {
 		options?: { commitGate?: (actual: { prunedCount: number; tokensSaved: number }) => boolean },
 	): Promise<{ prunedCount: number; tokensSaved: number; committed: boolean } | undefined> {
 		const branchEntries = this.sessionManager.getBranch();
-		const plan = planToolOutputPrune(branchEntries, {
-			...DEFAULT_PRUNE_CONFIG,
-			minimumSavings: overThreshold ? 0 : DEFAULT_PRUNE_CONFIG.minimumSavings,
-		});
-		const artifactManager = await this.sessionManager.ensureArtifactManager();
-		const published = new Map<string, ToolOutputPruneEvictionHandle>();
-		// Fail closed when tool-output eviction is planned but no artifact store can be
-		// established: do not report a successful prune that skipped durable eviction.
-		if (!artifactManager && plan.digests.length > 0) {
-			return undefined;
-		}
-
-		// Publish exact text one candidate at a time. The plan carries only digests and
-		// replacement proposals; original output bytes exist only in this iteration.
+		const artifactManager = this.sessionManager.getArtifactManager();
+		const prunedArtifacts: Array<{ entryId: string; id: string; toolType: string; originalText: string }> = [];
+		let reservedArtifactId: string | undefined;
+		let artifactAllocationAvailable = artifactManager !== null;
 		if (artifactManager) {
-			for (const digest of plan.digests) {
-				if (signal?.aborted) break;
-				const proposal = plan.replacements.find(candidate => candidate.entryId === digest.entryId);
-				if (!proposal?.complete) continue;
-				const entry = branchEntries.find(
-					candidate => candidate.type === "message" && candidate.id === digest.entryId,
-				);
-				if (entry?.type !== "message" || entry.message.role !== "toolResult") continue;
-				const captured = extractToolOutputText(entry.message as ToolResultMessage);
-				const outcome = await artifactManager.publishExactText(captured.text, { toolType: "evicted" });
-				if (outcome.outcome === "saved") {
-					published.set(digest.entryId, outcome.handle as ToolOutputPruneEvictionHandle);
-				} else {
-					logger.info("Tool-output eviction artifact unavailable; retaining original output", {
-						entryId: digest.entryId,
-						outcome: outcome.outcome,
-						diagnostic: "diagnostic" in outcome ? outcome.diagnostic : undefined,
-					});
-					if (outcome.outcome === "failed") break;
-				}
+			try {
+				reservedArtifactId = (await artifactManager.allocatePath("tool-output")).id;
+			} catch (error) {
+				logger.warn("Failed to reserve artifact ID for pruned tool output", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+				artifactAllocationAvailable = false;
 			}
 		}
-
-		const removePublishedArtifacts = async (): Promise<void> => {
-			for (const handle of published.values()) {
-				const removed = await artifactManager?.removeNamedBestEffort(`${handle.artifactId}.evicted.log`);
-				if (removed === false) {
-					logger.warn("Failed to remove unpublished tool-output eviction artifact", {
-						artifactId: handle.artifactId,
+		const result = pruneToolOutputs(branchEntries, DEFAULT_PRUNE_CONFIG, {
+			relaxedMinimum: overThreshold ? 0 : undefined,
+			artifactRefMaxChars: PRUNED_ARTIFACT_REF_MAX_CHARS,
+			artifactRef: candidate => {
+				if (!artifactManager || !artifactAllocationAvailable) return undefined;
+				let id: string;
+				try {
+					id = reservedArtifactId ?? String(artifactManager.allocateId());
+				} catch (error) {
+					artifactAllocationAvailable = false;
+					logger.warn("Failed to allocate artifact ID for pruned tool output", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+					return undefined;
+				}
+				reservedArtifactId = undefined;
+				const toolType = (candidate.toolName ?? "tool-output").replace(/[^a-zA-Z0-9_-]/g, "_") || "tool-output";
+				prunedArtifacts.push({ entryId: candidate.entryId, id, toolType, originalText: candidate.originalText });
+				return `artifact://${id}`;
+			},
+		});
+		const failedArtifactEntryIds = new Set<string>();
+		const publishedArtifacts: typeof prunedArtifacts = [];
+		for (const artifact of prunedArtifacts.filter(artifact =>
+			result.originals.some(original => original.entryId === artifact.entryId),
+		)) {
+			try {
+				await artifactManager?.publishNamedNoReplace(
+					`${artifact.id}.${artifact.toolType}.log`,
+					new TextEncoder().encode(artifact.originalText),
+				);
+				publishedArtifacts.push(artifact);
+			} catch (error) {
+				failedArtifactEntryIds.add(artifact.entryId);
+				logger.warn("Failed to persist pruned tool output artifact", {
+					artifactId: artifact.id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		const rollbackPublishedArtifacts = async (reason: "aborted" | "commit_gate_rejected") => {
+			let removedArtifacts = 0;
+			let unremovedArtifacts = 0;
+			for (const artifact of publishedArtifacts) {
+				const filename = `${artifact.id}.${artifact.toolType}.log`;
+				let removed = false;
+				for (let attempt = 0; attempt < 3 && !removed; attempt++) {
+					removed = (await artifactManager?.removeNamedBestEffort(filename)) ?? false;
+					if (!removed && attempt < 2) await Bun.sleep(10);
+				}
+				if (removed) removedArtifacts++;
+				else {
+					unremovedArtifacts++;
+					logger.warn("Failed to roll back staged pruned-output artifact after retries", {
+						artifactId: artifact.id,
+						reason,
 					});
 				}
 			}
+			return { removedArtifacts, unremovedArtifacts };
 		};
-
-		// Evaluate non-tool pruning on a disposable copy so the gate runs before any
-		// live entry is mutated. This avoids retaining originals for rollback.
-		const estimateEntries = structuredClone(branchEntries) as typeof branchEntries;
-		const estimatedArgumentResult = pruneAssistantToolArguments(estimateEntries, DEFAULT_PRUNE_CONFIG);
-		const estimatedFileMentionResult = pruneStaleFileMentions(estimateEntries, p =>
+		let toolTokensSaved = result.tokensSaved;
+		let toolPrunedCount = result.prunedCount;
+		const committedToolEntries = result.prunedEntries.filter(entry => {
+			if (!failedArtifactEntryIds.has(entry.id)) return true;
+			const original = result.originals.find(candidate => candidate.entryId === entry.id);
+			if (!original) return true;
+			const message = entry.message as ToolResultMessage;
+			toolTokensSaved -=
+				original.tokens -
+				estimateTextTokensHeuristic(
+					message.content
+						.filter((part): part is TextContent => part.type === "text")
+						.map(part => part.text)
+						.join(""),
+				);
+			toolPrunedCount--;
+			message.content = [{ type: "text", text: original.originalText }];
+			delete message.prunedAt;
+			return false;
+		});
+		const argumentResult = pruneAssistantToolArguments(branchEntries, DEFAULT_PRUNE_CONFIG);
+		const fileMentionResult = pruneStaleFileMentions(branchEntries, p =>
 			resolveReadPath(p, this.sessionManager.getCwd()),
 		);
-		const estimatedVolatileResult = pruneSupersededVolatileProjectContext(estimateEntries);
-		const estimatedReminderResult = pruneSupersededMaintenanceReminders(estimateEntries);
-		const estimatedToolEntries = [...published.keys()];
-		const estimatedToolSavings = estimatedToolEntries.reduce((total, entryId) => {
-			const proposal = plan.replacements.find(candidate => candidate.entryId === entryId);
-			const handle = published.get(entryId);
-			if (!proposal || !handle) return total;
-			const entry = branchEntries.find(candidate => candidate.type === "message" && candidate.id === entryId);
-			if (entry?.type !== "message" || entry.message.role !== "toolResult") return total;
-			const replacement = createPrunedNotice(
-				proposal.tokens,
-				entry.message as ToolResultMessage,
-				undefined,
-				handle.uri,
-			);
-			return total + Math.max(0, proposal.tokens - estimateTextTokensHeuristic(replacement));
-		}, 0);
-		const estimatedPrunedCount =
-			estimatedToolEntries.length +
-			estimatedArgumentResult.argumentPrunedCount +
-			estimatedFileMentionResult.changed.length +
-			estimatedVolatileResult.changed.length +
-			estimatedReminderResult.changed.length;
-		const estimatedTokensSaved =
-			estimatedToolSavings +
-			estimatedArgumentResult.argumentTokensSaved +
-			Math.round(
-				(estimatedFileMentionResult.bytesSaved +
-					estimatedVolatileResult.bytesSaved +
-					estimatedReminderResult.bytesSaved) /
-					4,
-			);
-
-		if (estimatedPrunedCount === 0 || signal?.aborted) {
-			await removePublishedArtifacts();
+		const volatileContextResult = pruneSupersededVolatileProjectContext(branchEntries);
+		const reminderResult = pruneSupersededMaintenanceReminders(branchEntries);
+		const tokensSaved =
+			toolTokensSaved +
+			argumentResult.argumentTokensSaved +
+			Math.round((fileMentionResult.bytesSaved + volatileContextResult.bytesSaved + reminderResult.bytesSaved) / 4);
+		const prunedCount =
+			toolPrunedCount +
+			argumentResult.argumentPrunedCount +
+			fileMentionResult.changed.length +
+			volatileContextResult.changed.length +
+			reminderResult.changed.length;
+		if (prunedCount === 0 || signal?.aborted) {
+			if (publishedArtifacts.length > 0) await rollbackPublishedArtifacts("aborted");
 			return undefined;
 		}
-		if (
-			options?.commitGate &&
-			!options.commitGate({ prunedCount: estimatedPrunedCount, tokensSaved: estimatedTokensSaved })
-		) {
-			await removePublishedArtifacts();
-			return { prunedCount: estimatedPrunedCount, tokensSaved: estimatedTokensSaved, committed: false };
+		if (options?.commitGate && !options.commitGate({ prunedCount, tokensSaved })) {
+			const rollback = await rollbackPublishedArtifacts("commit_gate_rejected");
+			logger.info("Below-threshold maintenance pruning staged but not committed", {
+				prunedCount,
+				tokensSaved,
+				rolledBackArtifacts: rollback.removedArtifacts,
+				unremovedArtifacts: rollback.unremovedArtifacts,
+			});
+			return { prunedCount, tokensSaved, committed: false };
 		}
 		if (signal?.aborted) {
-			await removePublishedArtifacts();
+			await rollbackPublishedArtifacts("aborted");
 			return undefined;
 		}
-		const rollbackIds = new Set<string>();
-		for (const digest of plan.digests) rollbackIds.add(digest.entryId);
-		for (const entry of estimatedArgumentResult.prunedEntries) rollbackIds.add(entry.id);
-		for (const entry of estimatedFileMentionResult.changed) rollbackIds.add(entry.id);
-		for (const entry of estimatedVolatileResult.changed) rollbackIds.add(entry.id);
-		for (const entry of estimatedReminderResult.changed) rollbackIds.add(entry.id);
-		let rollbackEntries: SessionEntry[];
-		try {
-			rollbackEntries = branchEntries
-				.filter(entry => rollbackIds.has(entry.id) && (entry.type === "message" || entry.type === "custom_message"))
-				.map(entry => structuredClone(entry));
-		} catch (error) {
-			await removePublishedArtifacts();
-			throw error;
-		}
-		const rollbackAgentMessages = this.agent.state.messages.slice();
 
-		const restoreCanonicalEntries = async (): Promise<void> => {
-			const messages = rollbackEntries.filter(
-				(entry): entry is Extract<SessionEntry, { type: "message" }> => entry.type === "message",
-			);
-			const customMessages = rollbackEntries.filter(
-				(entry): entry is Extract<SessionEntry, { type: "custom_message" }> => entry.type === "custom_message",
-			);
-			if (messages.length > 0) this.sessionManager.applyEntryMessageUpdates(messages);
-			if (customMessages.length > 0)
-				this.sessionManager.applyCustomMessageEntryUpdates(customMessages, { preserveEvictedContent: true });
-			await this.sessionManager.rewriteEntries();
-		};
-
-		try {
-			const committedPlan = {
-				...plan,
-				digests: plan.digests.filter(digest => published.has(digest.entryId)),
-				replacements: plan.replacements.filter(replacement => published.has(replacement.entryId)),
-			};
-			const replacementOverrides = new Map<
-				string,
-				{ replacementText: string; eviction: ToolOutputPruneEvictionHandle }
-			>();
-			for (const digest of committedPlan.digests) {
-				const proposal = committedPlan.replacements.find(candidate => candidate.entryId === digest.entryId);
-				const handle = published.get(digest.entryId);
-				const entry = branchEntries.find(
-					candidate => candidate.type === "message" && candidate.id === digest.entryId,
-				);
-				if (!proposal || !handle || !entry || entry.type !== "message" || entry.message.role !== "toolResult")
-					continue;
-				replacementOverrides.set(digest.entryId, {
-					replacementText: createPrunedNotice(
-						proposal.tokens,
-						entry.message as ToolResultMessage,
-						undefined,
-						handle.uri,
-					),
-					eviction: handle,
-				});
-			}
-			const commitOutcomes = commitToolOutputPrune(branchEntries, committedPlan, {
-				replacements: replacementOverrides,
-			});
-			const committedIds = new Set(
-				commitOutcomes.filter(outcome => outcome.outcome === "committed").map(outcome => outcome.entryId),
-			);
-			for (const outcome of commitOutcomes) {
-				if (outcome.outcome !== "committed") {
-					const handle = published.get(outcome.entryId);
-					if (handle) {
-						const removed = await artifactManager?.removeNamedBestEffort(`${handle.artifactId}.evicted.log`);
-						if (removed === false)
-							logger.warn("Failed to remove rejected tool-output eviction artifact", {
-								artifactId: handle.artifactId,
-							});
-					}
-					published.delete(outcome.entryId);
-				}
-			}
-			const argumentResult = pruneAssistantToolArguments(branchEntries, DEFAULT_PRUNE_CONFIG);
-			const fileMentionResult = pruneStaleFileMentions(branchEntries, p =>
-				resolveReadPath(p, this.sessionManager.getCwd()),
-			);
-			const volatileContextResult = pruneSupersededVolatileProjectContext(branchEntries);
-			const reminderResult = pruneSupersededMaintenanceReminders(branchEntries);
-			const toolTokensSaved = [...committedIds].reduce((total, entryId) => {
-				const proposal = plan.replacements.find(candidate => candidate.entryId === entryId);
-				const handle = published.get(entryId);
-				const entry = branchEntries.find(candidate => candidate.type === "message" && candidate.id === entryId);
-				if (!proposal || !handle || !entry || entry.type !== "message" || entry.message.role !== "toolResult")
-					return total;
-				const content = (entry.message as ToolResultMessage).content;
-				const replacement =
-					typeof content === "string" ? content : (content.find(part => part.type === "text")?.text ?? "");
-				return total + Math.max(0, proposal.tokens - estimateTextTokensHeuristic(replacement));
-			}, 0);
-			const prunedCount =
-				committedIds.size +
-				argumentResult.argumentPrunedCount +
-				fileMentionResult.changed.length +
-				volatileContextResult.changed.length +
-				reminderResult.changed.length;
-			const tokensSaved =
-				toolTokensSaved +
-				argumentResult.argumentTokensSaved +
-				Math.round(
-					(fileMentionResult.bytesSaved + volatileContextResult.bytesSaved + reminderResult.bytesSaved) / 4,
-				);
-			if (prunedCount === 0 || signal?.aborted) {
-				await removePublishedArtifacts();
-				return undefined;
-			}
-
-			// getBranch() returns materialized copies for blob-externalized entries, so the
-			// pruning mutations must be written back into the canonical store by id.
-			const committedToolEntries = branchEntries.filter(
-				(entry): entry is Extract<SessionEntry, { type: "message" }> =>
-					entry.type === "message" && committedIds.has(entry.id),
-			);
-			const combined = [...committedToolEntries, ...argumentResult.prunedEntries, ...fileMentionResult.changed];
-			this.sessionManager.applyEntryMessageUpdates(combined);
-			this.sessionManager.applyCustomMessageEntryUpdates([
-				...volatileContextResult.changed,
-				...reminderResult.changed,
-			]);
-			await this.sessionManager.rewriteEntries();
-			const sessionContext = this.buildDisplaySessionContext();
-			this.agent.replaceMessages(sessionContext.messages, {
-				historyRewrite: { reason: "tool-output-prune", preserveSeededPrefix: true },
-			});
-			this.#contextUsageCache = undefined;
-			this.#providerReplaySourceCache = new WeakMap<AgentMessage, ProviderReplaySourceCacheEntry>();
-			// Pruning can evict a previously injected goal/plan-mode-context copy; clear
-			// the static-once signatures so the next prompt re-injects the mode context.
-			this.#resetInjectedContextSignatures();
-			this.#syncTodoPhasesFromBranch();
-			this.#closeCodexProviderSessionsForHistoryRewrite();
-			return { prunedCount, tokensSaved, committed: true };
-		} catch (error) {
-			const rollbackErrors: Error[] = [];
-			try {
-				await restoreCanonicalEntries();
-			} catch (restoreError) {
-				const diagnostic = new ToolOutputPruneRollbackError("persistence", restoreError);
-				rollbackErrors.push(diagnostic);
-				logger.error("Failed to restore tool-output prune state after commit failure", {
-					error: diagnostic.message,
-					cause: restoreError instanceof Error ? restoreError.message : String(restoreError),
-				});
-			}
-			try {
-				this.agent.replaceMessages(rollbackAgentMessages, {
-					historyRewrite: { reason: "tool-output-prune-rollback", preserveSeededPrefix: true },
-				});
-			} catch (restoreError) {
-				const diagnostic = new ToolOutputPruneRollbackError("agent", restoreError);
-				rollbackErrors.push(diagnostic);
-				logger.error("Failed to restore agent messages after tool-output prune commit failure", {
-					error: diagnostic.message,
-					cause: restoreError instanceof Error ? restoreError.message : String(restoreError),
-				});
-			}
-			await removePublishedArtifacts();
-			if (rollbackErrors.length > 0) {
-				throw new AggregateError([error, ...rollbackErrors], "Tool-output prune rollback failed.");
-			}
-			throw error;
-		}
+		// getBranch() returns materialized copies for blob-externalized entries, so
+		// the pruning mutations must be written back into the canonical store.
+		const combined = [...committedToolEntries, ...argumentResult.prunedEntries, ...fileMentionResult.changed];
+		this.sessionManager.applyEntryMessageUpdates(combined);
+		this.sessionManager.applyCustomMessageEntryUpdates([...volatileContextResult.changed, ...reminderResult.changed]);
+		await this.sessionManager.rewriteEntries();
+		const sessionContext = this.buildDisplaySessionContext();
+		this.agent.replaceMessages(sessionContext.messages);
+		// Pruning can evict a previously injected goal/plan-mode-context copy; clear
+		// the static-once signatures so the next prompt re-injects the mode context.
+		this.#resetInjectedContextSignatures();
+		this.#syncTodoPhasesFromBranch();
+		this.#closeCodexProviderSessionsForHistoryRewrite();
+		return { prunedCount, tokensSaved, committed: true };
 	}
 
 	/**
@@ -12326,14 +12052,14 @@ export class AgentSession {
 		messagesToSummarize: AgentMessage[];
 		turnPrefixMessages: AgentMessage[];
 	}): Promise<string | undefined> {
+		const backend = resolveMemoryBackend(this.settings);
+		if (!backend.preCompactionContext) return undefined;
+		const messages = preparation.messagesToSummarize.concat(preparation.turnPrefixMessages);
 		try {
-			const backend = await this.memoryBackend.get("pre-compaction-context");
-			if (!backend.preCompactionContext) return undefined;
-			const messages = preparation.messagesToSummarize.concat(preparation.turnPrefixMessages);
 			return await backend.preCompactionContext(messages, this.settings, this);
 		} catch (err) {
 			logger.debug("Memory backend preCompactionContext failed", {
-				backend: resolveMemoryBackendId(this.settings),
+				backend: backend.id,
 				error: String(err),
 			});
 			return undefined;
@@ -12356,7 +12082,7 @@ export class AgentSession {
 		this.#activeMidRunBarrierControllers.clear();
 	}
 
-	#trackMidRunMaintenance(maintenance: Promise<ContextMaintenanceResult>): Promise<ContextMaintenanceResult> {
+	#trackMidRunMaintenance(maintenance: Promise<MidRunMaintenanceOutcome>): Promise<MidRunMaintenanceOutcome> {
 		this.#activeMidRunMaintenancePromises.add(maintenance);
 		maintenance.then(
 			() => this.#activeMidRunMaintenancePromises.delete(maintenance),
@@ -12573,7 +12299,7 @@ export class AgentSession {
 				this.#pendingNextTurnMessages = [];
 				this.#scheduledHiddenNextTurnGeneration = undefined;
 				this.#todoReminderCount = 0;
-				this.agent.replaceMessages(sessionContext.messages, { historyRewrite: { reason: "handoff" } });
+				this.agent.replaceMessages(sessionContext.messages);
 				this.#syncTodoPhasesFromBranch();
 				if (options?.autoTriggered && this.settings.get("compaction.handoffSaveToDisk")) {
 					try {
@@ -12637,9 +12363,7 @@ export class AgentSession {
 				this.sessionManager.restoreState(rollbackSessionState);
 				this.#syncAgentSessionId(rollbackSessionState.sessionId);
 				this.#rekeyHindsightMemoryForCurrentSessionId();
-				this.agent.replaceMessages(rollbackAgentMessages, {
-					historyRewrite: { reason: "handoff-rollback", preserveSeededPrefix: true },
-				});
+				this.agent.replaceMessages(rollbackAgentMessages);
 				this.agent.clearAllQueues();
 				this.agent.restoreSteering(rollbackAgentSteeringQueue);
 				this.agent.restoreFollowUp(rollbackAgentFollowUpQueue);
@@ -12753,9 +12477,7 @@ export class AgentSession {
 			const messages = this.agent.state.messages;
 			let removedOverflowAssistant = false;
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
-				this.agent.replaceMessages(messages.slice(0, -1), {
-					historyRewrite: { reason: "overflow-retry", preserveSeededPrefix: true },
-				});
+				this.agent.replaceMessages(messages.slice(0, -1));
 				removedOverflowAssistant = true;
 			}
 
@@ -12860,12 +12582,8 @@ export class AgentSession {
 	async #runMidRunMaintenance(
 		context: AgentContext,
 		lifecycle: MidRunMaintenanceLifecycle,
-	): Promise<ContextMaintenanceResult> {
-		const result = (outcome: MidRunMaintenanceOutcome, releaseCurrentContext = false): ContextMaintenanceResult => ({
-			outcome,
-			...(releaseCurrentContext ? { releaseCurrentContext: true } : {}),
-		});
-		if (this.#isDisposed) return { outcome: "aborted" };
+	): Promise<MidRunMaintenanceOutcome> {
+		if (this.#isDisposed) return "aborted";
 		const invocationController = new AbortController();
 		this.#activeMidRunBarrierControllers.add(invocationController);
 		const maintenanceSignal = AbortSignal.any([lifecycle.signal, invocationController.signal]);
@@ -12875,20 +12593,20 @@ export class AgentSession {
 			try {
 				await lifecycle.awaitEventDrain(invocationController.signal);
 			} catch {
-				return isAborted() ? result("aborted") : result("failed");
+				return isAborted() ? "aborted" : "failed";
 			}
-			if (isAborted()) return result("aborted");
+			if (isAborted()) return "aborted";
 
 			// In-place context-full maintenance only. "off" defers entirely; "handoff"
 			// keeps its existing agent_end / pre-prompt boundaries (a mid-tool-loop
 			// session swap would be far more disruptive than the overflow it avoids).
 			const compactionSettings = this.settings.getGroup("compaction");
-			if (!compactionSettings.enabled || compactionSettings.strategy !== "context-full") return result("not-needed");
+			if (!compactionSettings.enabled || compactionSettings.strategy !== "context-full") return "not-needed";
 			const contextWindow = this.model?.contextWindow ?? 0;
-			if (contextWindow <= 0) return result("not-needed");
+			if (contextWindow <= 0) return "not-needed";
 			// A compaction already in flight (overflow recovery, manual, idle) owns the
 			// context; never double-compact underneath it.
-			if (this.isCompacting) return result("not-needed");
+			if (this.isCompacting) return "not-needed";
 
 			// Model maxTokens is a capability ceiling, not a per-turn reservation;
 			// track actual context fullness (mirrors the agent_end / pre-prompt checks).
@@ -12896,7 +12614,7 @@ export class AgentSession {
 			const anchor = this.#findMidRunUsageAnchor(context.messages);
 			let contextTokens = this.#estimateMidRunContextTokens(context.messages);
 			if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
-				return result("not-needed");
+				return "not-needed";
 			}
 			// Anti-loop (#1662): a given provider response anchors at most one
 			// maintenance attempt. Until a NEW response re-anchors usage, repeat checks
@@ -12906,15 +12624,15 @@ export class AgentSession {
 				? `${anchor.message.provider}/${anchor.message.model}#${anchor.message.timestamp}#${calculateContextTokens(anchor.message.usage as Usage)}`
 				: undefined;
 			if (anchorSignature) {
-				if (anchorSignature === this.#lastMidRunMaintenanceAnchorSignature) return result("not-needed");
+				if (anchorSignature === this.#lastMidRunMaintenanceAnchorSignature) return "not-needed";
 				this.#lastMidRunMaintenanceAnchorSignature = anchorSignature;
 			}
 
 			// The FIFO consumer barrier made every prior materialized message canonical.
 			// Flush those synchronous branch appends before any history rewrite.
-			if (isAborted()) return result("aborted");
+			if (isAborted()) return "aborted";
 			await this.sessionManager.flush();
-			if (isAborted()) return result("aborted");
+			if (isAborted()) return "aborted";
 
 			// 1) Prune stale tool outputs first — cheaper than compaction, may avert it,
 			//    and (like all history rewrites) resets the codex provider session /
@@ -12923,7 +12641,7 @@ export class AgentSession {
 				relaxedMinimum: 0,
 				artifactRefMaxChars: PRUNED_ARTIFACT_REF_MAX_CHARS,
 			});
-			let pruneResult: { prunedCount: number; tokensSaved: number; committed: boolean } | undefined;
+			let pruneResult: { prunedCount: number; tokensSaved: number } | undefined;
 			if (
 				pruneEstimate.tokensSaved > 0 &&
 				!shouldCompact(
@@ -12934,20 +12652,20 @@ export class AgentSession {
 				)
 			) {
 				pruneResult = await this.#pruneToolOutputs(maintenanceSignal, true);
-				if (isAborted()) return result("aborted");
+				if (isAborted()) return "aborted";
 				if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 			}
 			if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
-				return pruneResult?.committed ? result("pruned", true) : result("not-needed");
+				return pruneResult?.prunedCount ? "pruned" : "not-needed";
 			}
 
 			// 2) Try context promotion (switch to a larger-window model) before compacting.
 			const lastAssistant = this.#findLastAssistantMessage();
 			if (lastAssistant && lastAssistant.stopReason !== "aborted" && lastAssistant.stopReason !== "error") {
-				if (isAborted()) return result("aborted");
+				if (isAborted()) return "aborted";
 				const promoted = await this.#tryContextPromotion(lastAssistant, maintenanceSignal);
-				if (isAborted()) return result("aborted");
-				if (promoted) return result("promoted");
+				if (isAborted()) return "aborted";
+				if (promoted) return "promoted";
 			}
 
 			// 3) Compact via the existing auto-compaction machinery. continueAfterMaintenance
@@ -12955,18 +12673,18 @@ export class AgentSession {
 			//    agent_end("maintenance") handler owns resumption. The oversized-maintenance
 			//    signature guard and the previous_response_id / prompt-cache-epoch reset
 			//    (#applyCompactionPostAppend) are inherited from #runAutoCompaction.
-			if (isAborted()) return result("aborted");
+			if (isAborted()) return "aborted";
 			const compactionStatus = await this.#runAutoCompaction("threshold", false, false, {
 				continueAfterMaintenance: false,
 				deferHandoffMaintenance: false,
 				signal: maintenanceSignal,
 			});
-			if (isAborted()) return result("aborted");
-			if (compactionStatus.kind === "compacted") return result("compacted", true);
+			if (isAborted()) return "aborted";
+			if (compactionStatus.kind === "compacted") return "compacted";
 			if (compactionStatus.kind === "aborted") {
-				return compactionStatus.source === "hook" ? result("not-needed") : result("aborted");
+				return compactionStatus.source === "hook" ? "not-needed" : "aborted";
 			}
-			return result("failed");
+			return "failed";
 		} finally {
 			this.#activeMidRunBarrierControllers.delete(invocationController);
 		}
@@ -13160,9 +12878,7 @@ export class AgentSession {
 			return;
 		}
 		const safeCount = Math.max(0, Math.min(checkpointState.checkpointMessageCount, this.agent.state.messages.length));
-		this.agent.replaceMessages(this.agent.state.messages.slice(0, safeCount), {
-			historyRewrite: { reason: "rewind", preserveSeededPrefix: true },
-		});
+		this.agent.replaceMessages(this.agent.state.messages.slice(0, safeCount));
 		this.#resetInjectedContextSignatures();
 		try {
 			this.sessionManager.branchWithSummary(checkpointState.checkpointEntryId, report, {
@@ -13492,10 +13208,7 @@ export class AgentSession {
 			attribution: "agent",
 			timestamp: Date.now(),
 		});
-		// The reminder continues the current prompt, so the predecessor `agent_end`
-		// must stay held until the continuation turn produces the real terminal.
-		// Publishing it here would settle the caller's prompt mid-reminder.
-		this.#scheduleAgentContinue({ skipCompactionCheck: true, suppressPredecessorAgentEnd: true });
+		this.#scheduleAgentContinue({ skipCompactionCheck: true });
 	}
 
 	/**
@@ -15312,21 +15025,15 @@ export class AgentSession {
 		if (!managedFallback && !retrySettings.enabled) return false;
 		const classification = this.#classifyErrorForRetry(message);
 		const firstEventTimeout = classification === "first_event_timeout";
-		// Content-free message-only watchdog prose (wrapped canonical or bare
-		// per-provider variants) is admitted like the typed path: it is
-		// replay-safe, so a bare-default retry may re-issue the request even
-		// after earlier observable activity in the same run.
-		const messageOnlyWatchdogTimeout = isBareDefaultMessageOnlyFirstEventTimeout(message);
 		if (!managedFallback && firstEventTimeout && this.#retryAttempt === 0) {
 			this.#firstEventTimeoutRetryStartedAt = Date.now();
 		}
 		const requiresScopedFirstEventTimeout = managedFallback || !legacyRetryConfigured;
 		if (
-			(firstEventTimeout || messageOnlyWatchdogTimeout) &&
+			firstEventTimeout &&
 			(assistantMessageHasVisibleOrToolContent(message) ||
 				(this.#retryAttempt > 0 && !this.#hasCleanRetryReplaySafety) ||
-				(requiresScopedFirstEventTimeout &&
-					((!this.#isTypedFirstEventTimeout(message) && !messageOnlyWatchdogTimeout) || !scope || !scopeWasClean)))
+				(requiresScopedFirstEventTimeout && (!this.#isTypedFirstEventTimeout(message) || !scope || !scopeWasClean)))
 		) {
 			return managedOutcome
 				? {
@@ -15371,18 +15078,16 @@ export class AgentSession {
 		// requirement above; other transient watchdogs preserve legacy behavior.
 		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential) {
 			const bareDefaultCodexOverload = isBareDefaultCodexOverload(message);
+			const bareDefaultWrappedFirstEventTimeout = isBareDefaultWrappedFirstEventTimeout(message);
 			const canReplayCodexOverload = bareDefaultCodexOverload;
 			if (
 				(!canReplayCodexOverload &&
 					!this.#isTypedFirstEventTimeout(message) &&
-					!messageOnlyWatchdogTimeout &&
+					!bareDefaultWrappedFirstEventTimeout &&
 					(hasBareDefaultRetryDisqualifyingFacts(message) ||
 						(classification !== "transient" && classification !== "first_event_timeout") ||
 						!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))) ||
-				(!canReplayCodexOverload &&
-					!firstEventTimeout &&
-					!messageOnlyWatchdogTimeout &&
-					!this.#hasCleanRetryReplaySafety)
+				(!canReplayCodexOverload && !firstEventTimeout && !this.#hasCleanRetryReplaySafety)
 			) {
 				return false;
 			}
@@ -15510,9 +15215,7 @@ export class AgentSession {
 					if (previous.stopReason !== "error" && previous.stopReason !== "aborted") break;
 					end--;
 				}
-				this.agent.replaceMessages(messages.slice(0, end), {
-					historyRewrite: { reason: "retry", preserveSeededPrefix: true },
-				});
+				this.agent.replaceMessages(messages.slice(0, end));
 			}
 			const retrySignal = ownership
 				? AbortSignal.any([retryAbortController.signal, ownership.lease.signal])
@@ -15754,9 +15457,7 @@ export class AgentSession {
 		if (!shouldDropAssistant) return false;
 
 		// Remove the failed/aborted/incomplete assistant message before re-attempting.
-		this.agent.replaceMessages(messages.slice(0, -1), {
-			historyRewrite: { reason: "retry", preserveSeededPrefix: true },
-		});
+		this.agent.replaceMessages(messages.slice(0, -1));
 
 		// Reset retry budget for a fresh attempt
 		this.#retryAttempt = 0;
@@ -16834,24 +16535,13 @@ export class AgentSession {
 				const didReloadConversationChange =
 					!switchingToDifferentSession &&
 					this.#didSessionMessagesChange(previousSessionContext.messages, sessionContext.messages);
-				const historyRewriteReason = switchingToDifferentSession
-					? "session-switch"
-					: didReloadConversationChange
-						? "conversation-reload"
-						: undefined;
 				await this.#restoreMCPSelectionsForSessionContext(sessionContext);
 
 				// The target session is loaded and MCP selections are restored: discard
 				// pre-switch delivery queues before completing the restored agent state.
 				this.agent.clearAllQueues();
 
-				if (historyRewriteReason) {
-					this.agent.replaceMessages(sessionContext.messages, {
-						historyRewrite: { reason: historyRewriteReason },
-					});
-				} else {
-					this.agent.replaceMessages(sessionContext.messages);
-				}
+				this.agent.replaceMessages(sessionContext.messages);
 				this.#resetInjectedContextSignatures();
 				this.#syncTodoPhasesFromBranch();
 				if (switchingToDifferentSession || didReloadConversationChange) {
@@ -17006,12 +16696,7 @@ export class AgentSession {
 				}
 				this.#baseSystemPrompt = previousBaseSystemPrompt;
 				this.agent.setSystemPrompt(previousSystemPrompt);
-				this.agent.replaceMessages(previousAgentMessages, {
-					historyRewrite: {
-						reason: switchingToDifferentSession ? "session-switch-rollback" : "conversation-reload-rollback",
-						preserveSeededPrefix: true,
-					},
-				});
+				this.agent.replaceMessages(previousAgentMessages);
 				this.#steeringMessages = previousSteeringMessages;
 				this.#followUpMessages = previousFollowUpMessages;
 				this.#pendingNextTurnMessages = previousPendingNextTurnMessages;
@@ -17127,9 +16812,7 @@ export class AgentSession {
 			await this.#restoreMCPSelectionsForSessionContext(sessionContext);
 
 			if (!skipConversationRestore) {
-				this.agent.replaceMessages(sessionContext.messages, {
-					historyRewrite: { reason: "session-branch", preserveSeededPrefix: true },
-				});
+				this.agent.replaceMessages(sessionContext.messages);
 				this.#resetInjectedContextSignatures();
 				this.#closeCodexProviderSessionsForHistoryRewrite();
 			}
@@ -17321,9 +17004,7 @@ export class AgentSession {
 			// request-scoped entries cannot re-enter live history after tree navigation.
 			const displayContext = this.buildDisplaySessionContext();
 			await this.#restoreMCPSelectionsForSessionContext(displayContext);
-			this.agent.replaceMessages(displayContext.messages, {
-				historyRewrite: { reason: "tree-navigation", preserveSeededPrefix: true },
-			});
+			this.agent.replaceMessages(displayContext.messages);
 			this.#resetInjectedContextSignatures();
 			this.#syncTodoPhasesFromBranch();
 			this.#closeCodexProviderSessionsForHistoryRewrite();

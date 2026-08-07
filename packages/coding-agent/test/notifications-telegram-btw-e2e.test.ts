@@ -27,8 +27,8 @@ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
  * still asserts its exact post-condition after waiting, so a real regression
  * fails on the assertion rather than on the clock.
  */
-async function waitFor(predicate: () => boolean, label: string, timeoutMs = 12_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
+async function waitFor(predicate: () => boolean, label: string): Promise<void> {
+	const deadline = Date.now() + 12_000;
 	while (Date.now() < deadline) {
 		if (predicate()) return;
 		await sleep(20);
@@ -562,7 +562,7 @@ test("/btw generation replacement terminalizes an old pending request exactly on
 				update_id: 27,
 				message: { message_id: 270, chat: { id: 42 }, message_thread_id: THREAD_ID, text: "/btw crash?" },
 			});
-			await waitFor(() => inbound.length === 1, "crash test provider call", 20_000);
+			await waitFor(() => inbound.length === 1, "crash test provider call");
 			const turn = inbound[0]!;
 			const dispatches = () =>
 				bot.calls.filter(call => call.method === "sendMessage" || call.method === "sendRichMessage").length;
@@ -616,4 +616,4 @@ test("/btw generation replacement terminalizes an old pending request exactly on
 		await fs.promises.rm(agentDir, { recursive: true, force: true });
 		throw err;
 	}
-}, 45_000);
+}, 30_000);

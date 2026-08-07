@@ -5,7 +5,6 @@ import { getThinkingLevelMetadata } from "../thinking-metadata";
 import { EDIT_MODES } from "../utils/edit-mode";
 import { CONFIGURABLE_SEARCH_PROVIDER_IDS } from "../web/search/types";
 import type { ModelSelectorValue } from "./model-selector-value";
-import { UPDATE_CHANNELS } from "./update-channel";
 
 const THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as readonly Effort[];
 const DEFAULT_THINKING_LEVELS = ["off", ...THINKING_EFFORTS] as const;
@@ -275,17 +274,6 @@ export const SETTINGS_SCHEMA = {
 		type: "enum",
 		values: ["copy-retain", "disabled"] as const,
 		default: "copy-retain",
-	},
-	"workspaceTree.mode": {
-		type: "enum",
-		values: ["eager", "lazy"] as const,
-		default: "eager",
-		description: "When to scan the workspace tree used by the first prompt.",
-	},
-	"startup.networkPrewarm": {
-		type: "boolean",
-		default: true,
-		description: "Preconnect the model host during startup before the first request.",
 	},
 	// SDK-owned prompt deadline. Hidden from the UI; ACP has no separate timeout.
 	"sdk.promptDeadlineMs": {
@@ -593,16 +581,6 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	"theme.watchFiles": {
-		type: "boolean",
-		default: true,
-		ui: {
-			tab: "appearance",
-			label: "Watch Theme Files",
-			description: "Reload custom themes when their files change",
-		},
-	},
-
 	symbolPreset: {
 		type: "enum",
 		values: ["unicode", "nerd", "ascii"] as const,
@@ -619,16 +597,6 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	"syntaxHighlighting.enabled": {
-		type: "boolean",
-		default: true,
-		ui: {
-			tab: "appearance",
-			label: "Syntax Highlighting",
-			description: "Highlight code blocks and diffs when rendering",
-		},
-	},
-
 	colorBlindMode: {
 		type: "boolean",
 		default: false,
@@ -640,15 +608,6 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	// Status line
-	"statusLine.watchGitHead": {
-		type: "boolean",
-		default: true,
-		ui: {
-			tab: "appearance",
-			label: "Watch Git HEAD",
-			description: "Refresh status-line git data when HEAD changes",
-		},
-	},
 	"statusLine.preset": {
 		type: "enum",
 		values: ["default", "default-usage", "minimal", "compact", "full", "nerd", "ascii", "custom"] as const,
@@ -1341,15 +1300,6 @@ export const SETTINGS_SCHEMA = {
 	// Interaction
 	// ────────────────────────────────────────────────────────────────────────
 
-	"history.enabled": {
-		type: "boolean",
-		default: true,
-		ui: {
-			tab: "interaction",
-			label: "History",
-			description: "Persist and search submitted prompts in local history",
-		},
-	},
 	"mouse.enabled": {
 		type: "boolean",
 		default: false,
@@ -1502,21 +1452,6 @@ export const SETTINGS_SCHEMA = {
 			label: "Check for Updates",
 			description:
 				"At interactive startup, notify of newer versions; never install. Use `gjc update` only for recognized Bun global, Windows npm, or bundled-installer binaries; source, linked, and unrecognized installs use their original method.",
-		},
-	},
-
-	"startup.updateChannel": {
-		type: "enum",
-		values: UPDATE_CHANNELS,
-		default: "stable",
-		ui: {
-			tab: "interaction",
-			label: "Update Channel",
-			description: "Release channel used by `gjc update` and the startup update check",
-			options: [
-				{ value: "stable", label: "Stable", description: "Track stable releases (npm `latest` dist-tag)" },
-				{ value: "nightly", label: "Nightly", description: "Track nightly prereleases (npm `nightly` dist-tag)" },
-			],
 		},
 	},
 
@@ -3054,11 +2989,6 @@ export const SETTINGS_SCHEMA = {
 	"mcp.notificationDebounceMs": {
 		type: "number",
 		default: 500,
-	},
-
-	"mcp.sharedPoolIdleMs": {
-		type: "number",
-		default: 300_000,
 	},
 
 	// ────────────────────────────────────────────────────────────────────────

@@ -9,20 +9,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-
-import type { verifyOwnerOnlyPathSecurity as verifyOwnerOnlyPathSecurityFn } from "@gajae-code/natives";
-
-let nativeVerifyOwnerOnlyPathSecurity: typeof verifyOwnerOnlyPathSecurityFn | undefined;
-
-function verifyOwnerOnlyPathSecurityNative(
-	...args: Parameters<typeof verifyOwnerOnlyPathSecurityFn>
-): ReturnType<typeof verifyOwnerOnlyPathSecurityFn> {
-	nativeVerifyOwnerOnlyPathSecurity ??= (
-		require("@gajae-code/natives") as { verifyOwnerOnlyPathSecurity: typeof verifyOwnerOnlyPathSecurityFn }
-	).verifyOwnerOnlyPathSecurity;
-	return nativeVerifyOwnerOnlyPathSecurity(...args);
-}
-
+import { verifyOwnerOnlyPathSecurity } from "@gajae-code/natives";
 import { getAgentDir, getSessionsDir } from "@gajae-code/utils";
 import { FileSessionStorage, type SessionStorageSnapshot } from "../../session/session-storage";
 import {
@@ -91,7 +78,7 @@ function readCandidateInitialLines(
 ): string[] {
 	if (readInitialLines) return readInitialLines(candidate.path, 8);
 	if (candidate.provenance !== "legacy") {
-		const security = verifyOwnerOnlyPathSecurityNative(candidate.path, "file");
+		const security = verifyOwnerOnlyPathSecurity(candidate.path, "file");
 		if (!security.ok) throw new ManagedCandidateUnavailableError("Managed session metadata path is unsafe.");
 	}
 	let snapshot: SessionStorageSnapshot;
@@ -173,11 +160,7 @@ async function resolveRecentScopes(
 	}
 	try {
 		const root = await fs.lstat(sessionsRoot);
-		if (
-			!root.isDirectory() ||
-			root.isSymbolicLink() ||
-			!verifyOwnerOnlyPathSecurityNative(sessionsRoot, "directory").ok
-		) {
+		if (!root.isDirectory() || root.isSymbolicLink() || !verifyOwnerOnlyPathSecurity(sessionsRoot, "directory").ok) {
 			return {
 				kind: "error",
 				code: "scope_unavailable",

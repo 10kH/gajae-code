@@ -79,17 +79,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * pre-readiness daemon-child exit diagnostics slice (#3761). Generation 53
  * renders multi-select state for ask-tool asks, not only durable workflow
  * gates, and renumbers pre-numbered options exactly once around the selection
- * marker. Generation 54 records owner `stoppedAt` on unclean daemon death
- * (`markDaemonOwnerStopped` + postmortem/finally wiring) so a dead process
- * cannot keep advertising itself as the ready owner (#3965). Generation 55
- * contains a shared-topic-authority outage: a failed lease renewal on the
- * liveness heartbeat and a failed startup registry load are reported instead
- * of escaping to the process-level fatal handler, authority-failure throws
- * preserve their underlying cause, and the compensation fence retry is bounded.
- * Generation 56 moves exact unlink and process-incarnation authority behind
- * lazy native bindings for the startup-cost cut (#3846).
+ * marker.
  */
-export const DAEMON_GENERATION = 56;
+export const DAEMON_GENERATION = 53;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 5

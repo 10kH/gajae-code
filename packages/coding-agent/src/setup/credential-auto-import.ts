@@ -6,7 +6,7 @@ import type {
 	AuthCredentialIfAbsentReason,
 	AuthCredentialIfAbsentSnapshotResult,
 	AuthStorage,
-} from "@gajae-code/ai/core";
+} from "@gajae-code/ai";
 import { getAgentDir, logger, VERSION } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
 import type { ModelRegistry } from "../config/model-registry";

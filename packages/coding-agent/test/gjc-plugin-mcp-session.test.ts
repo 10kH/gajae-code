@@ -241,9 +241,7 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 		expect(parentManager?.getConnectedServers()).toContain("domain_docs");
 
 		// Subagent (parentTaskPrefix set) must inherit the active MCP tools without
-		// owning the manager. W6b removed MCPManager.instance() from routing, so the
-		// parent's scope-held facade is handed over explicitly — exactly what the
-		// production subagent path forwards as `parentMcpManager`.
+		// owning the manager.
 		const child = await createAgentSession({
 			cwd,
 			agentDir: cwd,
@@ -257,7 +255,6 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 			promptTemplates: [],
 			slashCommands: [],
 			enableMCP: false,
-			inheritedMcpManager: parentManager,
 			enableLsp: false,
 			parentTaskPrefix: "0-Sub",
 		});

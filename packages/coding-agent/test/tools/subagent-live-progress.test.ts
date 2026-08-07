@@ -2,8 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import { AsyncJobManager, type SubagentRecord } from "../../src/async";
 import { Settings } from "../../src/config/settings";
 import type { AgentProgress } from "../../src/task/types";
-import type { ToolSession } from "../../src/tools";
-import { SubagentTool } from "../../src/tools/implementations";
+import { SubagentTool, type ToolSession } from "../../src/tools";
 import {
 	type SubagentSnapshot,
 	type SubagentToolDetails,

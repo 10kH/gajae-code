@@ -1,4 +1,4 @@
-import type { TextContent } from "@gajae-code/ai/core";
+import type { TextContent } from "@gajae-code/ai";
 import type { Component } from "@gajae-code/tui";
 import {
 	Box,

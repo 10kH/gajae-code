@@ -3,7 +3,6 @@ import * as fs from "node:fs";
 
 import * as os from "node:os";
 import * as path from "node:path";
-
 import { type AgentMessage, canContinuePersistedHistory } from "@gajae-code/agent-core";
 import type { ConfiguredModelChainEntry as SharedConfiguredModelChainEntry } from "@gajae-code/agent-core/compaction";
 import type {
@@ -14,13 +13,8 @@ import type {
 	ServiceTier,
 	TextContent,
 	Usage,
-} from "@gajae-code/ai/core";
-import type * as native from "@gajae-code/natives";
-
-function nativeSessionManager(): typeof import("@gajae-code/natives") {
-	return require("@gajae-code/natives") as typeof import("@gajae-code/natives");
-}
-
+} from "@gajae-code/ai";
+import * as native from "@gajae-code/natives";
 import { getTerminalId } from "@gajae-code/tui";
 import {
 	getAgentDir,
@@ -66,7 +60,6 @@ import {
 import {
 	canonicalizeTrustedPath,
 	deleteManagedSessionCandidate,
-	isRecoverableOwnerOnlyModeDrift,
 	listManagedCandidates,
 	type ManagedCandidateWriteAuthority,
 	type ManagedMigrationPolicy,
@@ -76,7 +69,6 @@ import {
 	managedRootForScope,
 	openManagedCandidateForWrite,
 	prepareManagedSessionScopeForWriteSync,
-	resecureOwnerOnlyManagedTree,
 	resolveManagedScope,
 	resolveManagedScopeForWrite,
 } from "./internal/managed-session-scope";
@@ -1946,7 +1938,7 @@ function isAuthorizedPendingCleanup(cleanupError: Error): boolean {
 function removeOwnedForkStaging(stagingDir: string, ownedRoot: native.NativeDirectoryTreeSnapshot): string | undefined {
 	let current: native.NativeDirectoryTreeResult;
 	try {
-		current = nativeSessionManager().snapshotDirectoryTree(stagingDir);
+		current = native.snapshotDirectoryTree(stagingDir);
 	} catch (snapshotError) {
 		return `staging_snapshot_threw:${toError(snapshotError).message}`;
 	}
@@ -1958,7 +1950,7 @@ function removeOwnedForkStaging(stagingDir: string, ownedRoot: native.NativeDire
 	// now because they live inside a root we created; the ROOT must be the one we made.
 	if (current.snapshot.rootDev !== ownedRoot.rootDev || current.snapshot.rootIno !== ownedRoot.rootIno)
 		return "staging_identity_mismatch";
-	const removed = nativeSessionManager().exactRemoveDirectoryTree(stagingDir, current.snapshot);
+	const removed = native.exactRemoveDirectoryTree(stagingDir, current.snapshot);
 	if (removed.ok) return undefined;
 	if (removed.code === "not_found") return undefined;
 	const cleanupPending =
@@ -2926,7 +2918,7 @@ class CrossDeviceMoveUnsupportedError extends Error {
 
 async function movePathAcrossDevicesSafe(source: string, destination: string): Promise<void> {
 	const sourceIdentity = await captureCrossDeviceTreeIdentity(source);
-	const outcome = classifyNativePublishOutcome(nativeSessionManager().renameNoReplacePath(source, destination));
+	const outcome = classifyNativePublishOutcome(native.renameNoReplacePath(source, destination));
 	if (outcome.ok) {
 		if ((await captureCrossDeviceTreeIdentity(destination)) !== sourceIdentity)
 			throw new Error("Atomic session rename did not preserve the captured source identity");
@@ -4845,48 +4837,6 @@ type ManagedDestinationTransition = {
 	dispose(): void;
 };
 
-type EvictedToolOutputHandle = import("../tools/output-meta").EvictedToolOutputHandle;
-
-class EvictedArtifactValidationError extends Error {
-	readonly code: string;
-
-	constructor(code: string, message: string) {
-		super(message);
-		this.name = "EvictedArtifactValidationError";
-		this.code = code;
-	}
-}
-
-function validateEvictedToolOutputHandle(
-	value: unknown,
-): { ok: true; handle: EvictedToolOutputHandle } | { ok: false; diagnostic: string; code: string } {
-	if (!value || typeof value !== "object" || Array.isArray(value))
-		return { ok: false, code: "invalid_shape", diagnostic: "eviction handle must be an object" };
-	const handle = value as Record<string, unknown>;
-	if (handle.v !== 1) {
-		return {
-			ok: false,
-			code: "unsupported_version",
-			diagnostic: `unsupported eviction handle version ${String(handle.v)}; only v1 is readable`,
-		};
-	}
-	if (handle.complete !== true)
-		return { ok: false, code: "incomplete", diagnostic: "eviction artifact is not complete" };
-	if (
-		typeof handle.artifactId !== "string" ||
-		!/^[0-9]+$/.test(handle.artifactId) ||
-		typeof handle.uri !== "string" ||
-		handle.uri !== `artifact://${handle.artifactId}` ||
-		handle.encoding !== "utf-8" ||
-		!Number.isSafeInteger(handle.bytes) ||
-		(handle.bytes as number) < 0 ||
-		typeof handle.sha256 !== "string" ||
-		!/^[0-9a-f]{64}$/.test(handle.sha256)
-	) {
-		return { ok: false, code: "invalid_shape", diagnostic: "eviction handle shape is invalid" };
-	}
-	return { ok: true, handle: value as EvictedToolOutputHandle };
-}
 export class SessionManager {
 	#sessionId: string = "";
 	/** True once a lifecycle pre-allocated id has been adopted (consume-once). */
@@ -5313,7 +5263,7 @@ export class SessionManager {
 			}
 		}
 		if (!snapshot.bytes.equals(publication.publishedBytes)) throw new Error("fork_transcript_changed");
-		const removed = nativeSessionManager().exactUnlink(publication.sessionFile, {
+		const removed = native.exactUnlink(publication.sessionFile, {
 			dev: snapshot.identity.dev,
 			ino: snapshot.identity.ino,
 			size: BigInt(snapshot.identity.size),
@@ -5340,7 +5290,7 @@ export class SessionManager {
 			publication.cleanupStore.removeTreeExpected(publication.cleanupRelativePath, publication.snapshot);
 			return;
 		}
-		const removed = nativeSessionManager().exactRemoveDirectoryTree(publication.artifactsDir, publication.snapshot);
+		const removed = native.exactRemoveDirectoryTree(publication.artifactsDir, publication.snapshot);
 		if (
 			!removed.ok &&
 			!(
@@ -6474,9 +6424,7 @@ export class SessionManager {
 				if (!retainedTreeSnapshotEquals(adoptedSnapshot, forkArtifactPublication.snapshot))
 					throw new Error("artifact_destination_changed_during_transcript_publication");
 			} else if (forkArtifactPublication) {
-				const terminalArtifacts = nativeSessionManager().snapshotDirectoryTree(
-					forkArtifactPublication.artifactsDir,
-				);
+				const terminalArtifacts = native.snapshotDirectoryTree(forkArtifactPublication.artifactsDir);
 				if (
 					!terminalArtifacts.ok ||
 					!terminalArtifacts.snapshot ||
@@ -6561,7 +6509,7 @@ export class SessionManager {
 			try {
 				const sourceStat = fs.lstatSync(sourceDir);
 				if (!sourceStat.isDirectory() || sourceStat.isSymbolicLink()) throw new Error("unsafe_artifacts");
-				const captured = nativeSessionManager().snapshotDirectoryTree(sourceDir);
+				const captured = native.snapshotDirectoryTree(sourceDir);
 				if (!captured.ok || !captured.snapshot) throw new Error(captured.code ?? "unsafe_artifacts");
 				sourceSnapshot = captured.snapshot;
 			} catch (error) {
@@ -6585,7 +6533,7 @@ export class SessionManager {
 			// ourselves under an unguessable name and capture its identity while empty.
 			// Only a root whose identity still matches this capture may ever be removed.
 			fs.mkdirSync(stagingDir, { mode: 0o700 });
-			const ownedStaging = nativeSessionManager().snapshotDirectoryTree(stagingDir);
+			const ownedStaging = native.snapshotDirectoryTree(stagingDir);
 			if (!ownedStaging.ok || !ownedStaging.snapshot) {
 				throw new Error(ownedStaging.code ?? "artifact_staging_snapshot_failed");
 			}
@@ -6599,7 +6547,7 @@ export class SessionManager {
 						return relativePath !== "resident-cache" && !relativePath.startsWith(`resident-cache${path.sep}`);
 					},
 				});
-				const capturedStaging = nativeSessionManager().snapshotDirectoryTree(stagingDir);
+				const capturedStaging = native.snapshotDirectoryTree(stagingDir);
 				if (!capturedStaging.ok || !capturedStaging.snapshot)
 					throw new Error(capturedStaging.code ?? "artifact_destination_snapshot_failed");
 				const stagedSnapshot = capturedStaging.snapshot;
@@ -6608,7 +6556,7 @@ export class SessionManager {
 					stagedSnapshot.rootIno !== ownedStagingRoot.rootIno
 				)
 					throw new Error("artifact_staging_identity_changed");
-				const terminalSource = nativeSessionManager().snapshotDirectoryTree(sourceDir);
+				const terminalSource = native.snapshotDirectoryTree(sourceDir);
 				if (!terminalSource.ok || !terminalSource.snapshot)
 					throw new Error(terminalSource.code ?? "artifact_source_changed");
 				if (JSON.stringify(terminalSource.snapshot) !== JSON.stringify(sourceSnapshot))
@@ -6624,15 +6572,13 @@ export class SessionManager {
 					throw new Error("artifact_destination_terminal_mismatch");
 				// No-replace publication: a directory that appeared at the final name after the
 				// preflight is never replaced and never touched.
-				const outcome = classifyNativePublishOutcome(
-					nativeSessionManager().renameNoReplacePath(stagingDir, finalDestinationDir),
-				);
+				const outcome = classifyNativePublishOutcome(native.renameNoReplacePath(stagingDir, finalDestinationDir));
 				if (!outcome.ok) {
 					if (outcome.reason === "destination_exists") throw new Error("destination_conflict");
 					throw new Error(outcome.code ?? "artifact_destination_publish_failed");
 				}
 				published = true;
-				const terminal = nativeSessionManager().snapshotDirectoryTree(finalDestinationDir);
+				const terminal = native.snapshotDirectoryTree(finalDestinationDir);
 				if (
 					!terminal.ok ||
 					!terminal.snapshot ||
@@ -8079,33 +8025,18 @@ export class SessionManager {
 		return {
 			capture: async () => {
 				let snapshot: native.NativeDirectoryTreeSnapshot;
-				const captureLegacyLocal = (): native.NativeDirectoryTreeSnapshot => store.captureTree(legacyLocalRoot);
 				try {
-					snapshot = captureLegacyLocal();
+					snapshot = store.captureTree(legacyLocalRoot);
 				} catch (error) {
 					if (error instanceof Error && error.message === "not_found") return null;
-					// Prior writers (and some fixtures) can leave group/other-readable
-					// descendants under artifacts/<id>/local. Managed captureTree fails
-					// closed on mode_mismatch; re-secure owner-only modes once — same
-					// class of recovery as prepareManagedSessionScopeForWriteSync.
-					if (isRecoverableOwnerOnlyModeDrift(error)) {
-						resecureOwnerOnlyManagedTree(path.join(sessionFile.slice(0, -6), "local"));
-						try {
-							snapshot = captureLegacyLocal();
-						} catch (retryError) {
-							if (retryError instanceof Error && retryError.message === "not_found") return null;
-							throw retryError;
-						}
-					} else if (error instanceof Error && error.message === "reparse_point") {
+					if (error instanceof Error && error.message === "reparse_point") {
 						try {
 							store.captureTree(legacyArtifactsRoot);
 						} catch (artifactsError) {
 							if (artifactsError instanceof Error && artifactsError.message === "not_found") return null;
 						}
-						throw error;
-					} else {
-						throw error;
 					}
+					throw error;
 				}
 				let totalBytes = 0;
 				for (const entry of snapshot.entries) if (entry.kind === "file") totalBytes += Number(entry.size);
@@ -8228,106 +8159,6 @@ export class SessionManager {
 	async saveArtifact(content: string, toolType: string): Promise<string | undefined> {
 		const manager = this.#getOrCreateArtifactManager() ?? (await this.#ensureEphemeralArtifactManager());
 		return manager ? manager.save(content, toolType) : undefined;
-	}
-
-	async #validatedEvictedToolOutputHandle(
-		handle: unknown,
-	): Promise<{ manager: ArtifactManager; handle: EvictedToolOutputHandle }> {
-		const validation = validateEvictedToolOutputHandle(handle);
-		if (!validation.ok) throw new EvictedArtifactValidationError(validation.code, validation.diagnostic);
-		const manager = this.#getOrCreateArtifactManager();
-		if (!manager) throw new EvictedArtifactValidationError("unavailable", "artifact persistence unavailable");
-		return { manager, handle: validation.handle };
-	}
-
-	async #verifyEvictedToolOutputDigest(manager: ArtifactManager, handle: EvictedToolOutputHandle): Promise<void> {
-		const stream = await manager.openReadStream(handle.artifactId);
-		const reader = stream.getReader();
-		const digest = crypto.createHash("sha256");
-		let bytes = 0;
-		try {
-			for (;;) {
-				const next = await reader.read();
-				if (next.done) break;
-				if (!(next.value instanceof Uint8Array))
-					throw new EvictedArtifactValidationError(
-						"invalid_artifact_stream",
-						"eviction artifact stream is invalid",
-					);
-				bytes += next.value.byteLength;
-				digest.update(next.value);
-			}
-		} finally {
-			reader.releaseLock();
-		}
-		if (bytes !== handle.bytes) {
-			throw new EvictedArtifactValidationError(
-				"byte_length_mismatch",
-				`evicted artifact byte length mismatch: expected ${handle.bytes}, read ${bytes}`,
-			);
-		}
-		if (digest.digest("hex") !== handle.sha256)
-			throw new EvictedArtifactValidationError("sha256_mismatch", "evicted artifact sha256 mismatch");
-	}
-
-	async #readValidatedEvictedToolOutput(
-		handle: unknown,
-	): Promise<{ manager: ArtifactManager; handle: EvictedToolOutputHandle; text: string }> {
-		const validated = await this.#validatedEvictedToolOutputHandle(handle);
-		const text = await validated.manager.readRange(validated.handle.artifactId);
-		const bytes = Buffer.from(text, "utf8");
-		if (bytes.byteLength !== validated.handle.bytes) {
-			throw new EvictedArtifactValidationError(
-				"byte_length_mismatch",
-				`evicted artifact byte length mismatch: expected ${validated.handle.bytes}, read ${bytes.byteLength}`,
-			);
-		}
-		const digest = crypto.createHash("sha256").update(bytes).digest("hex");
-		if (digest !== validated.handle.sha256)
-			throw new EvictedArtifactValidationError("sha256_mismatch", "evicted artifact sha256 mismatch");
-		return { ...validated, text };
-	}
-
-	/** Inspect an evicted artifact using a bounded range read; never rehydrates by default. */
-	async inspectEvictedToolOutput(
-		handle: unknown,
-		range?: { start?: number; endExclusive?: number },
-	): Promise<{ outcome: "saved" | "unavailable" | "failed"; text?: string; diagnostic?: string }> {
-		if (
-			range &&
-			((range.start !== undefined && (!Number.isSafeInteger(range.start) || range.start < 0)) ||
-				(range.endExclusive !== undefined &&
-					(!Number.isSafeInteger(range.endExclusive) || range.endExclusive < 0)) ||
-				(range.start !== undefined && range.endExclusive !== undefined && range.start > range.endExclusive))
-		) {
-			return { outcome: "unavailable", diagnostic: "invalid artifact byte range" };
-		}
-		try {
-			const validated = await this.#validatedEvictedToolOutputHandle(handle);
-			await this.#verifyEvictedToolOutputDigest(validated.manager, validated.handle);
-			const boundedRange = range ?? {
-				start: 0,
-				endExclusive: Math.min(validated.handle.bytes, 16 * 1024 * 1024),
-			};
-			const text = await validated.manager.readRange(validated.handle.artifactId, boundedRange);
-			return { outcome: "saved", text };
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			const diagnostic = error instanceof EvictedArtifactValidationError ? `${error.code}: ${message}` : message;
-			if (
-				error instanceof EvictedArtifactValidationError ||
-				/not found|ENOENT|no such file|unavailable|unsupported eviction|invalid|incomplete/i.test(message)
-			) {
-				return { outcome: "unavailable", diagnostic };
-			}
-			return { outcome: "failed", diagnostic };
-		}
-	}
-
-	/** Explicit full rehydration operation; callers must opt into materialization. */
-	async rehydrateToolResultMessage(handle: unknown): Promise<string> {
-		const validated = await this.#readValidatedEvictedToolOutput(handle);
-		return validated.text;
 	}
 
 	/**
@@ -8904,22 +8735,16 @@ export class SessionManager {
 	}
 
 	/** Write mutated custom-message entries back into the canonical entry store by id. */
-	applyCustomMessageEntryUpdates(
-		entries: readonly CustomMessageEntry[],
-		options: { preserveEvictedContent?: boolean } = {},
-	): void {
+	applyCustomMessageEntryUpdates(entries: readonly CustomMessageEntry[]): void {
 		this.#assertRecoveryHydrationWritable();
 		for (const updated of entries) {
 			const canonical = this.#byId.get(updated.id);
 			if (canonical?.type !== "custom_message") continue;
 			canonical.content = updated.content;
 			canonical.details = updated.details;
-			if (options.preserveEvictedContent) canonical.evictedContent = updated.evictedContent;
-			else {
-				// Pruning replaces content permanently; retaining a cold-spill marker would
-				// rehydrate the superseded payload on the next materialization.
-				canonical.evictedContent = undefined;
-			}
+			// Pruning replaces content permanently; retaining a cold-spill marker would
+			// rehydrate the superseded payload on the next materialization.
+			canonical.evictedContent = undefined;
 		}
 		this.#needsFullRewriteOnNextPersist = true;
 		this.#bumpEntryRevision();
@@ -10302,7 +10127,7 @@ export class SessionManager {
 		const projectGjcDir = path.join(path.resolve(header.cwd), ".gjc");
 		if (isProjectSessionTranscriptPath(projectGjcDir, sessionPath)) {
 			const relativePath = path.relative(projectGjcDir, path.resolve(sessionPath)).split(path.sep).join("/");
-			const authority = nativeSessionManager().openRecoveryFsRoot(projectGjcDir);
+			const authority = native.openRecoveryFsRoot(projectGjcDir);
 			try {
 				const captured = authority.readManaged(relativePath);
 				if (!captured.ok || !captured.identity || !captured.data || !captured.identity.sha256)
@@ -10444,7 +10269,7 @@ export class SessionManager {
 			}
 			await manager.#rewriteFile();
 			if (privateStagingDir) {
-				const capturedStaging = nativeSessionManager().snapshotDirectoryTree(privateStagingDir);
+				const capturedStaging = native.snapshotDirectoryTree(privateStagingDir);
 				if (!capturedStaging.ok || !capturedStaging.snapshot)
 					throw new Error(capturedStaging.code ?? "fork_staging_snapshot_failed");
 				privateStagingSnapshot = capturedStaging.snapshot;
@@ -10490,17 +10315,15 @@ export class SessionManager {
 				// Dispose it before the staging tree becomes published evidence.
 				manager.#disposeResidentTextStore(manager.#residentTextBlobStore);
 				try {
-					const capturedStaging = nativeSessionManager().snapshotDirectoryTree(privateStagingDir);
+					const capturedStaging = native.snapshotDirectoryTree(privateStagingDir);
 					if (!capturedStaging.ok || !capturedStaging.snapshot)
 						throw new Error(capturedStaging.code ?? "fork_staging_snapshot_failed");
 					privateStagingSnapshot = capturedStaging.snapshot;
 					fsyncManagedArtifactTree(privateStagingDir);
-					const outcome = classifyNativePublishOutcome(
-						nativeSessionManager().renameNoReplacePath(privateStagingDir, dir),
-					);
+					const outcome = classifyNativePublishOutcome(native.renameNoReplacePath(privateStagingDir, dir));
 					if (!outcome.ok) throw new Error(outcome.code ?? "fork_destination_publish_failed");
 					privateStagingPublished = true;
-					const terminal = nativeSessionManager().snapshotDirectoryTree(dir);
+					const terminal = native.snapshotDirectoryTree(dir);
 					if (
 						!terminal.ok ||
 						!terminal.snapshot ||
@@ -10508,7 +10331,7 @@ export class SessionManager {
 					)
 						throw new Error("fork_destination_terminal_identity_changed");
 					await syncSessionMoveDirectory(path.dirname(dir));
-					const durableTerminal = nativeSessionManager().snapshotDirectoryTree(dir);
+					const durableTerminal = native.snapshotDirectoryTree(dir);
 					if (
 						!durableTerminal.ok ||
 						!durableTerminal.snapshot ||
@@ -10535,10 +10358,7 @@ export class SessionManager {
 					if (toError(cleanupError).message !== "cleanup_pending") cleanupErrors.push(toError(cleanupError));
 				}
 				if (!privateStagingPublished && privateStagingDir && privateStagingSnapshot) {
-					const removed = nativeSessionManager().exactRemoveDirectoryTree(
-						privateStagingDir,
-						privateStagingSnapshot,
-					);
+					const removed = native.exactRemoveDirectoryTree(privateStagingDir, privateStagingSnapshot);
 					if (!removed.ok && removed.code !== "not_found" && removed.code !== "cleanup_pending")
 						cleanupErrors.push(new Error(removed.code ?? "fork_staging_cleanup_failed"));
 				}

@@ -6,7 +6,7 @@ import {
 	type AuthCredentialStore,
 	SqliteAuthCredentialStore,
 	type StoredAuthCredential,
-} from "@gajae-code/ai/core";
+} from "@gajae-code/ai";
 import { getAgentDbPath, isRecord, logger } from "@gajae-code/utils";
 import type { RawSettings as Settings } from "../config/settings";
 

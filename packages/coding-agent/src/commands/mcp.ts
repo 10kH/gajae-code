@@ -49,11 +49,6 @@ export default class MCP extends Command {
 		}),
 		cwd: Flags.string({ description: "Working directory for stdio server" }),
 		timeout: Flags.integer({ description: "Connection timeout in milliseconds" }),
-		sharing: Flags.string({
-			description: "MCP connection sharing mode",
-			options: ["per-session", "shared"],
-			default: "per-session",
-		}),
 	};
 
 	async run(): Promise<void> {
@@ -80,7 +75,6 @@ export default class MCP extends Command {
 				header: flags.header,
 				cwd: flags.cwd,
 				timeout: flags.timeout,
-				sharing: flags.sharing as MCPCommandArgs["flags"]["sharing"],
 			},
 		};
 		await runMCPCommand(cmd);
@@ -109,7 +103,6 @@ FLAGS
       --header=<value>   HTTP/SSE header as KEY=VALUE (repeatable; redacted in output)
       --cwd=<value>      Working directory for stdio server
       --timeout=<int>    Connection timeout in milliseconds
-      --sharing=<value>  per-session | shared (default: per-session)
 
 EXAMPLES
   $ gjc mcp add context7 npx -y @upstash/context7-mcp

@@ -2,41 +2,31 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
-
-import type {
-	NativeDirectoryTreeSnapshot,
-	NativeExactUnlinkResult,
-	NativeOwnerOnlySecurityResult,
-	RecoveryFsRoot,
+import {
+	applyOwnerOnlyFdSecurity,
+	applyOwnerOnlyPathSecurity,
+	exactRemoveDirectoryTree,
+	exactReplacePath,
+	exactUnlink,
+	linkNoReplacePath,
+	type NativeDirectoryTreeSnapshot,
+	type NativeExactUnlinkResult,
+	type NativeOwnerOnlySecurityResult,
+	openRecoveryFsRoot,
+	type RecoveryFsRoot,
+	renameNoReplacePath,
+	repairOwnerOnlyPathSecurityExpected,
+	snapshotDirectoryTree,
+	verifyOwnerOnlyFdSecurity,
+	verifyOwnerOnlyPathSecurity,
+	verifyOwnerOnlyPathSecurityExpected,
 } from "@gajae-code/natives";
-
 import {
 	classifyNativePublishOutcome,
 	formatNativePublishDiagnostic,
 	mayCleanCurrentStaging,
 	type NativePublishOutcome,
 } from "./native-publish-outcome";
-
-type NativeManagedSessionStorage = Pick<
-	typeof import("@gajae-code/natives"),
-	| "applyOwnerOnlyFdSecurity"
-	| "applyOwnerOnlyPathSecurity"
-	| "exactRemoveDirectoryTree"
-	| "exactReplacePath"
-	| "exactUnlink"
-	| "linkNoReplacePath"
-	| "openRecoveryFsRoot"
-	| "renameNoReplacePath"
-	| "repairOwnerOnlyPathSecurityExpected"
-	| "snapshotDirectoryTree"
-	| "verifyOwnerOnlyFdSecurity"
-	| "verifyOwnerOnlyPathSecurity"
-	| "verifyOwnerOnlyPathSecurityExpected"
->;
-
-function nativeSessionStorage(): NativeManagedSessionStorage {
-	return require("@gajae-code/natives") as NativeManagedSessionStorage;
-}
 
 export const MANAGED_ARTIFACT_MAX_DEPTH = 32;
 export const MANAGED_ARTIFACT_MAX_FILES = 50_000;
@@ -489,15 +479,9 @@ export interface ManagedLockRetirementTestEvent {
 	readonly attemptId: string;
 }
 
-export interface ManagedLockReleaseTestEvent {
-	readonly path: string;
-	readonly fd: number;
-}
-
-/** Test-only seams around managed lock retirement and release verification. */
+/** Test-only seam immediately before exact retirement of one observed lock identity. */
 export const ManagedLockTestHooks: {
 	beforeObservedRetirement?: (event: ManagedLockRetirementTestEvent) => void;
-	beforeReleaseDescriptorVerification?: (event: ManagedLockReleaseTestEvent) => void;
 } = {};
 
 /** Captured configured-root authority for managed paths only. */
@@ -561,7 +545,7 @@ export function retainManagedDirectoryAuthority(
 	if (!named.isDirectory() || named.isSymbolicLink()) throw new Error("Managed directory authority is unavailable");
 	if (expected && (named.dev !== expected.dev || named.ino !== expected.ino))
 		throw new Error("Managed directory identity changed before retention");
-	const rootAuthority = nativeSessionStorage().openRecoveryFsRoot(root.canonicalPath);
+	const rootAuthority = openRecoveryFsRoot(root.canonicalPath);
 	try {
 		const retainedRoot = rootAuthority.identity();
 		if (
@@ -640,17 +624,9 @@ function securityError(pathname: string, result: NativeSecurity): Error {
 }
 
 function secure(pathname: string, kind: "directory" | "file"): void {
-	const applied = validateNativeSecurityResult(
-		nativeSessionStorage().applyOwnerOnlyPathSecurity(pathname, kind),
-		"apply",
-		kind,
-	);
+	const applied = validateNativeSecurityResult(applyOwnerOnlyPathSecurity(pathname, kind), "apply", kind);
 	if (!applied.ok) throw securityError(pathname, applied);
-	const verified = validateNativeSecurityResult(
-		nativeSessionStorage().verifyOwnerOnlyPathSecurity(pathname, kind),
-		"verify",
-		kind,
-	);
+	const verified = validateNativeSecurityResult(verifyOwnerOnlyPathSecurity(pathname, kind), "verify", kind);
 	if (!verified.ok) throw securityError(pathname, verified);
 }
 
@@ -672,7 +648,7 @@ function verifyExistingManagedPathSecurity(
 	expected: fs.BigIntStats,
 ): void {
 	const verified = validateNativeSecurityResult(
-		nativeSessionStorage().verifyOwnerOnlyPathSecurityExpected(pathname, kind, expected.dev, expected.ino),
+		verifyOwnerOnlyPathSecurityExpected(pathname, kind, expected.dev, expected.ino),
 		"verify",
 		kind,
 	);
@@ -685,7 +661,7 @@ function secureExistingManagedDirectory(pathname: string, kind: "directory" | "f
 	const safeKind = kind === "directory" ? named.isDirectory() : named.isFile();
 	if (!safeKind || named.isSymbolicLink()) throw new Error(`Unsafe managed ${kind}: ${pathname}`);
 	const verified = validateNativeSecurityResult(
-		nativeSessionStorage().verifyOwnerOnlyPathSecurityExpected(pathname, kind, named.dev, named.ino),
+		verifyOwnerOnlyPathSecurityExpected(pathname, kind, named.dev, named.ino),
 		"verify",
 		kind,
 	);
@@ -693,7 +669,7 @@ function secureExistingManagedDirectory(pathname: string, kind: "directory" | "f
 	if (verified.ok) return;
 	if (verified.code !== "acl_verify_failed") throw securityError(pathname, verified);
 	const repaired = validateNativeSecurityResult(
-		nativeSessionStorage().repairOwnerOnlyPathSecurityExpected(pathname, kind, named.dev, named.ino),
+		repairOwnerOnlyPathSecurityExpected(pathname, kind, named.dev, named.ino),
 		"verify",
 		kind,
 	);
@@ -739,33 +715,14 @@ export class ManagedSessionDescendantStore {
 		this.#authorityBaseDir = retained?.authorityBaseDir ?? this.#baseDir;
 		if (retained) {
 			const relative = path.relative(retained.authorityBaseDir, this.#baseDir).split(path.sep).join("/");
-			// For the root case (authorityBaseDir === baseDir, relative === ""), the
-			// stable identity() result carries the exact root dev/inode without
-			// snapshotting the entire live session tree. snapshotManagedTree("")
-			// walks every mutable descendant, so concurrent writers (other GJC
-			// processes appending jsonl/resident-cache/recovery data) make the
-			// snapshot return identity_mismatch (#3906). Mirrors #assertBound(),
-			// which already uses identity() for this same case. Nested descendants
-			// (relative !== "") still snapshot their subtree as before.
-			if (relative === "") {
-				const rootIdentity = retained.authority.identity();
-				if (!rootIdentity.ok || !rootIdentity.identity)
-					throw new Error(rootIdentity.code ?? "Managed subtree identity unavailable");
-				this.#subtreeRoot = Object.freeze({
-					canonicalPath: this.#baseDir,
-					dev: BigInt(rootIdentity.identity.dev),
-					ino: BigInt(rootIdentity.identity.ino),
-				});
-			} else {
-				const captured = retained.authority.snapshotManagedTree(relative);
-				if (!captured.ok || !captured.snapshot)
-					throw new Error(captured.code ?? "Managed subtree identity unavailable");
-				this.#subtreeRoot = Object.freeze({
-					canonicalPath: this.#baseDir,
-					dev: BigInt(captured.snapshot.rootDev),
-					ino: BigInt(captured.snapshot.rootIno),
-				});
-			}
+			const captured = retained.authority.snapshotManagedTree(relative);
+			if (!captured.ok || !captured.snapshot)
+				throw new Error(captured.code ?? "Managed subtree identity unavailable");
+			this.#subtreeRoot = Object.freeze({
+				canonicalPath: this.#baseDir,
+				dev: BigInt(captured.snapshot.rootDev),
+				ino: BigInt(captured.snapshot.rootIno),
+			});
 			this.#authority = retained.authority;
 			this.#assertBound();
 
@@ -777,7 +734,7 @@ export class ManagedSessionDescendantStore {
 		this.#subtreeRoot = Object.freeze({ canonicalPath: this.#baseDir, dev: subtreeStat.dev, ino: subtreeStat.ino });
 		if (process.platform === "linux") {
 			const before = fs.lstatSync(this.#baseDir, { bigint: true });
-			const authority = nativeSessionStorage().openRecoveryFsRoot(this.#baseDir);
+			const authority = openRecoveryFsRoot(this.#baseDir);
 			const retained = authority.identity();
 			if (
 				!retained.ok ||
@@ -876,7 +833,7 @@ export class ManagedSessionDescendantStore {
 				verifyExistingManagedPathSecurity(this.#baseDir, "directory", named);
 			else {
 				const verified = validateNativeSecurityResult(
-					nativeSessionStorage().verifyOwnerOnlyPathSecurity(this.#baseDir, "directory"),
+					verifyOwnerOnlyPathSecurity(this.#baseDir, "directory"),
 					"verify",
 					"directory",
 				);
@@ -937,7 +894,7 @@ export class ManagedSessionDescendantStore {
 			binding.predecessor,
 			binding.receipt,
 		);
-		const removed = nativeSessionStorage().exactUnlink(receiptPath, {
+		const removed = exactUnlink(receiptPath, {
 			dev: placeholder.identity.dev,
 			ino: placeholder.identity.ino,
 			nlink: placeholder.identity.nlink,
@@ -974,7 +931,7 @@ export class ManagedSessionDescendantStore {
 		}
 		const predecessor = binding.predecessor;
 		const quarantineName = replacementReceiptRetirementName(receipt.identity, predecessor);
-		const detached = nativeSessionStorage().exactUnlink(receiptPath, {
+		const detached = exactUnlink(receiptPath, {
 			dev: receipt.identity.dev,
 			ino: receipt.identity.ino,
 			nlink: receipt.identity.nlink,
@@ -1027,7 +984,7 @@ export class ManagedSessionDescendantStore {
 		)
 			throw new Error("managed_replace_cleanup_receipt_invalid");
 
-		const retired = nativeSessionStorage().exactUnlink(expectedPredecessor, {
+		const retired = exactUnlink(expectedPredecessor, {
 			dev: parsed.identity.dev,
 			ino: parsed.identity.ino,
 			nlink: parsed.identity.nlink,
@@ -1056,7 +1013,7 @@ export class ManagedSessionDescendantStore {
 			currentReceipt.identity.sha256 !== receipt.identity.sha256
 		)
 			throw new Error("managed_replace_cleanup_receipt_invalid");
-		const removed = nativeSessionStorage().exactUnlink(receiptPath, {
+		const removed = exactUnlink(receiptPath, {
 			dev: currentReceipt.identity.dev,
 			ino: currentReceipt.identity.ino,
 			nlink: currentReceipt.identity.nlink,
@@ -1386,7 +1343,7 @@ export class ManagedSessionDescendantStore {
 		this.#beforeMutation();
 		this.#assertBound();
 		if (!this.#authority) {
-			const removed = nativeSessionStorage().exactUnlink(this.#resolve(relativePath), {
+			const removed = exactUnlink(this.#resolve(relativePath), {
 				dev: expected.identity.dev,
 				ino: expected.identity.ino,
 				size: BigInt(expected.identity.size),
@@ -1475,7 +1432,7 @@ export class ManagedSessionDescendantStore {
 			if (!captured.ok || !captured.snapshot) throw new Error(captured.code ?? "unsafe_artifacts");
 			return captured.snapshot;
 		}
-		const captured = nativeSessionStorage().snapshotDirectoryTree(this.#resolve(relativePath));
+		const captured = snapshotDirectoryTree(this.#resolve(relativePath));
 		if (!captured.ok || !captured.snapshot) throw new Error(captured.code ?? "unsafe_artifacts");
 		return captured.snapshot;
 	}
@@ -1541,16 +1498,13 @@ export class ManagedSessionDescendantStore {
 					this.#relative(this.#resolve(destinationRelativePath)),
 					expected,
 				)
-			: nativeSessionStorage().renameNoReplacePath(
-					this.#resolve(sourceRelativePath),
-					this.#resolve(destinationRelativePath),
-				);
+			: renameNoReplacePath(this.#resolve(sourceRelativePath), this.#resolve(destinationRelativePath));
 		const outcome = classifyNativePublishOutcome(moved, this.#authority ? "retained_tree" : "direct_rename");
 		if (!outcome.ok)
 			throw new ManagedTreeMoveOutcomeError(publishFailure(outcome).message, mayCleanCurrentStaging(outcome));
 		const movedSnapshot = this.#authority
 			? this.#authority.snapshotManagedTree(this.#relative(this.#resolve(destinationRelativePath)))
-			: nativeSessionStorage().snapshotDirectoryTree(this.#resolve(destinationRelativePath));
+			: snapshotDirectoryTree(this.#resolve(destinationRelativePath));
 		if (
 			!movedSnapshot.ok ||
 			!movedSnapshot.snapshot ||
@@ -1567,7 +1521,7 @@ export class ManagedSessionDescendantStore {
 		this.#beforeMutation();
 		this.#assertBound();
 		if (!this.#authority) {
-			const removed = nativeSessionStorage().exactRemoveDirectoryTree(this.#resolve(relativePath), expected);
+			const removed = exactRemoveDirectoryTree(this.#resolve(relativePath), expected);
 			if (!removed.ok) throw new Error(removed.code ?? "managed_remove_failed");
 			this.#assertBound();
 			return;
@@ -1623,55 +1577,23 @@ export class ManagedSessionDescendantStore {
 	}
 }
 
-function secureFileDescriptor(
-	pathname: string,
-	fd: number,
-	operation: "apply" | "verify",
-	allowLinuxIdentityFallback = false,
-): void {
+function secureFileDescriptor(pathname: string, fd: number, operation: "apply" | "verify"): void {
 	if (process.platform !== "linux") {
 		if (operation === "apply") secure(pathname, "file");
 		else {
-			const verified = validateNativeSecurityResult(
-				nativeSessionStorage().verifyOwnerOnlyPathSecurity(pathname, "file"),
-				"verify",
-				"file",
-			);
+			const verified = validateNativeSecurityResult(verifyOwnerOnlyPathSecurity(pathname, "file"), "verify", "file");
 			if (!verified.ok) throw securityError(pathname, verified);
 		}
 		return;
 	}
 	const result = validateNativeSecurityResult(
 		operation === "apply"
-			? nativeSessionStorage().applyOwnerOnlyFdSecurity(pathname, "file", fd)
-			: nativeSessionStorage().verifyOwnerOnlyFdSecurity(pathname, "file", fd),
+			? applyOwnerOnlyFdSecurity(pathname, "file", fd)
+			: verifyOwnerOnlyFdSecurity(pathname, "file", fd),
 		operation,
 		"file",
 	);
-	if (result.ok || operation !== "verify" || !allowLinuxIdentityFallback || result.code !== "identity_mismatch") {
-		if (!result.ok) throw securityError(pathname, result);
-		return;
-	}
-
-	// Some Linux filesystems can report a transient descriptor/path identity mismatch
-	// after a long-lived descriptor has survived repeated metadata updates. Only the
-	// lock-release path opts into this recovery, and only after both the descriptor
-	// and pathname identities agree before and after a native pathname verification.
-	const identityFailure: NativeSecurity = { ok: false, code: "identity_mismatch" };
-	const before = fs.fstatSync(fd, { bigint: true });
-	const named = fs.lstatSync(pathname, { bigint: true });
-	if (!named.isFile() || named.isSymbolicLink() || !sameFileIdentity(before, named))
-		throw securityError(pathname, identityFailure);
-	const verified = validateNativeSecurityResult(
-		nativeSessionStorage().verifyOwnerOnlyPathSecurity(pathname, "file"),
-		"verify",
-		"file",
-	);
-	if (!verified.ok) throw securityError(pathname, verified);
-	const after = fs.fstatSync(fd, { bigint: true });
-	const current = fs.lstatSync(pathname, { bigint: true });
-	if (!current.isFile() || current.isSymbolicLink() || !sameFileIdentity(after, current))
-		throw securityError(pathname, identityFailure);
+	if (!result.ok) throw securityError(pathname, result);
 }
 
 function assertSafeDirectory(pathname: string): void {
@@ -1787,46 +1709,13 @@ function ownerDefinitelyGone(record: LockRecord): boolean {
 
 function writeLockDescriptor(fd: number, record: LockRecord): void {
 	const encoded = Buffer.from(`${JSON.stringify(record)}\n`);
-	let offset = 0;
-	while (offset < encoded.byteLength) {
-		const written = fs.writeSync(fd, encoded, offset, encoded.byteLength - offset, offset);
-		if (written <= 0) throw new Error("durability_failed");
-		offset += written;
-	}
-	fs.ftruncateSync(fd, encoded.byteLength);
+	const written = fs.writeSync(fd, encoded, 0, encoded.byteLength, 0);
+	if (written !== encoded.byteLength) throw new Error("durability_failed");
 	fs.fsyncSync(fd);
 }
 
 function sameFileIdentity(left: fs.BigIntStats, right: fs.BigIntStats): boolean {
 	return left.dev === right.dev && left.ino === right.ino;
-}
-
-function openVerifiedLockReleaseDescriptor(pathname: string, expected: fs.BigIntStats): number {
-	const identityFailure: NativeSecurity = { ok: false, code: "identity_mismatch" };
-	const namedBefore = fs.lstatSync(pathname, { bigint: true });
-	if (!namedBefore.isFile() || namedBefore.isSymbolicLink() || !sameFileIdentity(expected, namedBefore))
-		throw securityError(pathname, identityFailure);
-
-	const replacementFd = fs.openSync(pathname, fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW);
-	try {
-		const openedBefore = fs.fstatSync(replacementFd, { bigint: true });
-		if (!sameFileIdentity(expected, openedBefore) || !sameFileIdentity(namedBefore, openedBefore))
-			throw securityError(pathname, identityFailure);
-		secureFileDescriptor(pathname, replacementFd, "verify");
-		const openedAfter = fs.fstatSync(replacementFd, { bigint: true });
-		const namedAfter = fs.lstatSync(pathname, { bigint: true });
-		if (
-			!namedAfter.isFile() ||
-			namedAfter.isSymbolicLink() ||
-			!sameFileIdentity(expected, openedAfter) ||
-			!sameFileIdentity(openedAfter, namedAfter)
-		)
-			throw securityError(pathname, identityFailure);
-		return replacementFd;
-	} catch (error) {
-		fs.closeSync(replacementFd);
-		throw error;
-	}
 }
 
 /** Create a managed directory and fail closed unless its owner-only mode/ACL verifies. */
@@ -1940,7 +1829,7 @@ export async function publishManagedFileNoReplace(
 		assertOwned?.();
 
 		renameAttempted = true;
-		outcome = classifyNativePublishOutcome(nativeSessionStorage().renameNoReplacePath(staging, destination));
+		outcome = classifyNativePublishOutcome(renameNoReplacePath(staging, destination));
 		if (renameFlagsUnsupported(outcome)) {
 			// linkat publishes the destination without consuming the staging name, so the
 			// secured staging descriptor stays authoritative across publication exactly as
@@ -1948,7 +1837,7 @@ export async function publishManagedFileNoReplace(
 			// below, after that descriptor is closed: unlinking a still-open name on NFS
 			// silly-renames it instead of removing it, which would leave a second link on
 			// the published inode.
-			outcome = classifyNativePublishOutcome(nativeSessionStorage().linkNoReplacePath(staging, destination));
+			outcome = classifyNativePublishOutcome(linkNoReplacePath(staging, destination));
 			linkPublished = outcome.ok;
 		}
 
@@ -2019,11 +1908,11 @@ export function publishManagedFileNoReplaceSync(
 		stagingIdentity = { dev: staged.dev, ino: staged.ino };
 		publishedIdentity = identity(staged, createHash("sha256").update(bytes).digest("hex"));
 
-		outcome = classifyNativePublishOutcome(nativeSessionStorage().renameNoReplacePath(staging, destination));
+		outcome = classifyNativePublishOutcome(renameNoReplacePath(staging, destination));
 		if (renameFlagsUnsupported(outcome)) {
 			// See publishManagedFileNoReplace: the staging link outlives this publication
 			// and is removed only after the secured descriptor is closed.
-			outcome = classifyNativePublishOutcome(nativeSessionStorage().linkNoReplacePath(staging, destination));
+			outcome = classifyNativePublishOutcome(linkNoReplacePath(staging, destination));
 			linkPublished = outcome.ok;
 		}
 		if (!outcome.ok) throw publishFailure(outcome);
@@ -2121,9 +2010,7 @@ export function replaceManagedFileSync(
 				policy,
 			);
 			const receiptPath = replacementReceiptPath(parent, expectedDestination, publishedReceiptIdentity);
-			const receiptPublish = classifyNativePublishOutcome(
-				nativeSessionStorage().renameNoReplacePath(receiptStagingPath, receiptPath),
-			);
+			const receiptPublish = classifyNativePublishOutcome(renameNoReplacePath(receiptStagingPath, receiptPath));
 			if (!receiptPublish.ok) throw publishFailure(receiptPublish);
 			const namedReceipt = captureManagedFileNoFollow(receiptPath);
 			if (
@@ -2139,7 +2026,7 @@ export function replaceManagedFileSync(
 				identity: publishedReceiptIdentity,
 				predecessor: expectedDestination,
 			};
-			const replaced = nativeSessionStorage().exactReplacePath(
+			const replaced = exactReplacePath(
 				staging,
 				destination,
 				{
@@ -2182,7 +2069,7 @@ export function replaceManagedFileSync(
 		fsyncDirectory(parent);
 		if (receiptCleanup) {
 			try {
-				const removed = nativeSessionStorage().exactUnlink(receiptCleanup.path, {
+				const removed = exactUnlink(receiptCleanup.path, {
 					dev: receiptCleanup.identity.dev,
 					ino: receiptCleanup.identity.ino,
 					nlink: receiptCleanup.identity.nlink,
@@ -2284,7 +2171,8 @@ export async function acquireManagedLock(
 			);
 			try {
 				secureFileDescriptor(lockPath, fd, "apply");
-				writeLockDescriptor(fd, record);
+				fs.writeFileSync(fd, `${JSON.stringify(record)}\n`);
+				fs.fsyncSync(fd);
 				fsyncDirectory(locksDirectory);
 			} catch (error) {
 				fs.closeSync(fd);
@@ -2295,14 +2183,8 @@ export async function acquireManagedLock(
 			let descriptorClosed = false;
 			const closeDescriptor = (): void => {
 				if (descriptorClosed) return;
-				try {
-					const current = fs.fstatSync(fd, { bigint: true });
-					if (sameFileIdentity(lockIdentity, current)) fs.closeSync(fd);
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code !== "EBADF") throw error;
-				} finally {
-					descriptorClosed = true;
-				}
+				fs.closeSync(fd);
+				descriptorClosed = true;
 			};
 			const assertOwned = (): void => {
 				const current = parseLock(lockPath);
@@ -2343,40 +2225,20 @@ export async function acquireManagedLock(
 				assertOwned,
 				async release(): Promise<void> {
 					clearInterval(heartbeat);
-					let releaseFd = fd;
-					let replacementFd: number | undefined;
 					try {
 						assertOwned();
-						ManagedLockTestHooks.beforeReleaseDescriptorVerification?.({ path: lockPath, fd });
-						try {
-							secureFileDescriptor(lockPath, fd, "verify", true);
-						} catch (error) {
-							if (
-								process.platform !== "linux" ||
-								managedSecurityFailureClassification(error) !== "identity_mismatch"
-							)
-								throw error;
-							replacementFd = openVerifiedLockReleaseDescriptor(lockPath, lockIdentity);
-							releaseFd = replacementFd;
-						}
+						secureFileDescriptor(lockPath, fd, "verify");
 						const now = Date.now();
 						// A released record is the only live-process reclaim authority. Expiry alone
 						// never authorizes stealing from a holder whose process is still present.
-						writeLockDescriptor(releaseFd, {
+						writeLockDescriptor(fd, {
 							...record,
 							released: true,
 							heartbeatAt: now,
 							leaseExpiresAt: now,
 						});
-						if (replacementFd !== undefined) {
-							const opened = fs.fstatSync(replacementFd, { bigint: true });
-							const named = fs.lstatSync(lockPath, { bigint: true });
-							if (!sameFileIdentity(lockIdentity, opened) || !sameFileIdentity(opened, named))
-								throw securityError(lockPath, { ok: false, code: "identity_mismatch" });
-						}
 						fsyncDirectory(locksDirectory);
 					} finally {
-						if (replacementFd !== undefined) fs.closeSync(replacementFd);
 						released = true;
 						closeDescriptor();
 					}
@@ -2392,7 +2254,7 @@ export async function acquireManagedLock(
 			if (observed && owner && reclaimable) {
 				try {
 					ManagedLockTestHooks.beforeObservedRetirement?.({ path: lockPath, attemptId: owner.attemptId });
-					const removed = nativeSessionStorage().exactUnlink(lockPath, {
+					const removed = exactUnlink(lockPath, {
 						dev: observed.snapshot.identity.dev,
 						ino: observed.snapshot.identity.ino,
 						size: BigInt(observed.snapshot.identity.size),
@@ -2451,7 +2313,7 @@ export function validateManagedArtifactTree(root: string, limits: ManagedArtifac
 
 /** Flush a copied managed artifact tree, including empty directories, before publishing its receipt. */
 export function fsyncManagedArtifactTree(root: string): NativeDirectoryTreeSnapshot {
-	const before = nativeSessionStorage().snapshotDirectoryTree(root);
+	const before = snapshotDirectoryTree(root);
 	if (!before.ok || !before.snapshot) throw new Error(before.code ?? "unsafe_artifacts");
 	const visit = (pathname: string): void => {
 		const stat = fs.lstatSync(pathname);
@@ -2474,7 +2336,7 @@ export function fsyncManagedArtifactTree(root: string): NativeDirectoryTreeSnaps
 	};
 	validateManagedArtifactTree(root);
 	visit(root);
-	const after = nativeSessionStorage().snapshotDirectoryTree(root);
+	const after = snapshotDirectoryTree(root);
 	if (!after.ok || !after.snapshot || JSON.stringify(after.snapshot) !== JSON.stringify(before.snapshot)) {
 		throw new Error("artifact_tree_changed_during_fsync");
 	}

@@ -4,7 +4,6 @@ import * as path from "node:path";
 import * as url from "node:url";
 import { isEnoent } from "@gajae-code/utils/fs-error";
 import { InternalUrlRouter } from "../internal-urls";
-import type { MCPManager } from "../runtime-mcp/manager";
 import { ToolError } from "./tool-errors";
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
@@ -637,7 +636,6 @@ export function resolveReadPath(filePath: string, cwd: string): string {
 export interface ToolScopeOptions {
 	rawPaths: string[];
 	cwd: string;
-	mcpManager?: MCPManager;
 	getArtifactsDir?: () => string | null;
 	getAuthorizedArtifactsDirs?: () => readonly string[];
 	/** Verb used in the "Cannot {action} internal URL without a backing file: …" message. */
@@ -686,12 +684,7 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 		if (hasGlobPathChars(rawPath)) {
 			throw new ToolError(`Glob patterns are not supported for internal URLs: ${rawPath}`);
 		}
-		const resource = await internalRouter.resolve(rawPath, {
-			cwd,
-			getArtifactsDir,
-			getAuthorizedArtifactsDirs,
-			mcpManager: opts.mcpManager,
-		});
+		const resource = await internalRouter.resolve(rawPath, { cwd, getArtifactsDir, getAuthorizedArtifactsDirs });
 		if (!resource.sourcePath) {
 			throw new ToolError(`Cannot ${internalUrlAction} internal URL without a backing file: ${rawPath}`);
 		}

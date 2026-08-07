@@ -2,24 +2,12 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-
-import type { RecoveryFsRoot } from "@gajae-code/natives";
-
-type NativeManagedScope = Pick<
-	typeof import("@gajae-code/natives"),
-	| "applyOwnerOnlyPathSecurity"
-	| "canonicalExistingDirectoryIdentity"
-	| "exactRestore"
-	| "exactUnlink"
-	| "snapshotDirectoryTree"
-	| "verifyOwnerOnlyPathSecurity"
-	| "verifyOwnerOnlyPathSecurityExpected"
->;
-
-function nativeScope(): NativeManagedScope {
-	return require("@gajae-code/natives") as NativeManagedScope;
-}
-
+import * as native from "@gajae-code/natives";
+import {
+	canonicalExistingDirectoryIdentity,
+	verifyOwnerOnlyPathSecurity,
+	verifyOwnerOnlyPathSecurityExpected,
+} from "@gajae-code/natives";
 import { hasFsCode, logger, pathIsWithin } from "@gajae-code/utils";
 import type { ResumeSessionIdentity } from "../session-manager";
 import {
@@ -79,13 +67,13 @@ export interface ManagedScope {
  */
 export interface ManagedCandidateWriteAuthority {
 	readonly rootAuthority: ManagedDirectoryRoot;
-	readonly retainedAuthority?: RecoveryFsRoot;
+	readonly retainedAuthority?: native.RecoveryFsRoot;
 	readonly retainedDirectory?: string;
 }
 
 const managedRoots = new WeakMap<ManagedScope, ReturnType<typeof prepareManagedDirectoryRoot>>();
 const managedDirectoryIdentities = new WeakMap<ManagedScope, { dev: bigint; ino: bigint }>();
-const managedDirectoryAuthorities = new WeakMap<ManagedScope, RecoveryFsRoot | undefined>();
+const managedDirectoryAuthorities = new WeakMap<ManagedScope, native.RecoveryFsRoot | undefined>();
 const boundManagedWriteAuthorities = new WeakMap<ManagedScope, ManagedCandidateWriteAuthority>();
 
 function bindManagedWriteAuthority(scope: ManagedScope, authority: ManagedCandidateWriteAuthority): void {
@@ -119,7 +107,7 @@ function assertRetainedManagedDirectoryIdentity(scope: ManagedScope): void {
 		throw new Error("Managed session directory changed");
 }
 
-export function managedDirectoryAuthorityForScope(scope: ManagedScope): RecoveryFsRoot | undefined {
+export function managedDirectoryAuthorityForScope(scope: ManagedScope): native.RecoveryFsRoot | undefined {
 	if (!managedDirectoryAuthorities.has(scope)) throw new Error("Managed session directory authority was not prepared");
 	return managedDirectoryAuthorities.get(scope);
 }
@@ -180,8 +168,7 @@ export type ManagedScopeErrorCode =
 	| "atomic_unavailable"
 	| "invalid_request"
 	| "durability_failed"
-	| "durability_not_provable"
-	| "capacity_exceeded";
+	| "durability_not_provable";
 
 export type ManagedScopeResolution =
 	| { kind: "resolved"; scope: ManagedScope }
@@ -196,35 +183,18 @@ function managedScopeFailureCause(error: unknown): { readonly classification: st
 	return { classification: managedSecurityFailureClassification(error) ?? "binding_invalid" };
 }
 
-const managedScopeFailureCodes = new Set<ManagedScopeErrorCode>([
+const managedScopeFailureCodes = new Set([
 	"atomic_unavailable",
 	"invalid_request",
 	"durability_failed",
 	"durability_not_provable",
 	"migration_busy",
-	"capacity_exceeded",
 ]);
-
-/**
- * Preserve a recognized native/publication failure as its own error code.
- *
- * Collapsing every unrecognized message into `binding_invalid` misreports
- * unrelated failures — a `content_too_large` tree snapshot, for example — as a
- * corrupt binding, which sends operators to delete a healthy binding file.
- */
-function managedScopeErrorCode(message: string): ManagedScopeErrorCode {
-	if (message === "content_too_large") return "capacity_exceeded";
-	return managedScopeFailureCodes.has(message as ManagedScopeErrorCode)
-		? (message as ManagedScopeErrorCode)
-		: "binding_invalid";
-}
 
 function managedScopeFailureMessage(error: unknown, fallback: string): string {
 	const classification = managedSecurityFailureClassification(error);
 	if (classification) return classification;
-	if (!(error instanceof Error)) return fallback;
-	if (error.message === "content_too_large") return error.message;
-	return managedScopeFailureCodes.has(error.message as ManagedScopeErrorCode) ? error.message : fallback;
+	return error instanceof Error && managedScopeFailureCodes.has(error.message) ? error.message : fallback;
 }
 
 export interface ManagedCandidate {
@@ -353,19 +323,14 @@ function scopeDigest(platform: "posix" | "win32", canonicalPath: string): string
 export const computeManagedScopeDigest = scopeDigest;
 
 function identityFor(cwd: string): NativeIdentity {
-	return nativeScope().canonicalExistingDirectoryIdentity(cwd) as NativeIdentity;
+	return canonicalExistingDirectoryIdentity(cwd) as NativeIdentity;
 }
 
 function verifyExistingManagedScopeDirectory(pathname: string) {
-	if (process.platform !== "win32") return nativeScope().verifyOwnerOnlyPathSecurity(pathname, "directory");
+	if (process.platform !== "win32") return verifyOwnerOnlyPathSecurity(pathname, "directory");
 	const expected = fs.lstatSync(pathname, { bigint: true });
 	if (!expected.isDirectory() || expected.isSymbolicLink()) throw new Error("reparse_point");
-	const verified = nativeScope().verifyOwnerOnlyPathSecurityExpected(
-		pathname,
-		"directory",
-		expected.dev,
-		expected.ino,
-	);
+	const verified = verifyOwnerOnlyPathSecurityExpected(pathname, "directory", expected.dev, expected.ino);
 	const current = fs.lstatSync(pathname, { bigint: true });
 	if (
 		!current.isDirectory() ||
@@ -402,7 +367,7 @@ export function canonicalizeTrustedPath(target: string): string {
 	let base = path.resolve(target);
 	const suffix: string[] = [];
 	for (;;) {
-		const identity = nativeScope().canonicalExistingDirectoryIdentity(base) as NativeIdentity;
+		const identity = canonicalExistingDirectoryIdentity(base) as NativeIdentity;
 		if (identity.ok) {
 			const canonicalBase = canonicalExistingPathForIo(base, identity);
 			return suffix.length === 0 ? canonicalBase : path.join(canonicalBase, ...suffix);
@@ -631,7 +596,7 @@ function legacyDirectoryNames(
 	};
 	const names = new Set<string>([encodeAbsolute(canonicalCwd), encodeAbsolute(lexicalCwd)]);
 	const canonicalRoot = (root: string): string => {
-		const identity = nativeScope().canonicalExistingDirectoryIdentity(root);
+		const identity = canonicalExistingDirectoryIdentity(root);
 		return identity.ok ? identity.canonicalPath : pathApi.resolve(root);
 	};
 	const home = os.homedir();
@@ -904,7 +869,13 @@ export async function ensureManagedScope(
 		const message =
 			publication?.classification ??
 			managedScopeFailureMessage(error, "The managed scope could not be initialized.");
-		const code = managedScopeErrorCode(message);
+		const code =
+			message === "atomic_unavailable" ||
+			message === "invalid_request" ||
+			message === "durability_failed" ||
+			message === "durability_not_provable"
+				? message
+				: "binding_invalid";
 		return {
 			kind: "error",
 			code,
@@ -927,11 +898,6 @@ export async function ensureManagedScope(
  * uncaught exception. Re-securing the tree in place lets a drifted scope
  * recover on the next launch instead of trapping the user behind a fatal error.
  */
-/** Re-secure owner-only modes under a managed directory (exported for legacy-local migration). */
-export function resecureOwnerOnlyManagedTree(directory: string): void {
-	reapplyOwnerOnlyManagedTree(directory);
-}
-
 function reapplyOwnerOnlyManagedTree(directory: string): void {
 	let entries: fs.Dirent[];
 	try {
@@ -950,57 +916,23 @@ function reapplyOwnerOnlyManagedTree(directory: string): void {
 		if (stat.isSymbolicLink()) continue;
 		if (stat.isDirectory()) {
 			reapplyOwnerOnlyManagedTree(child);
-			assertOwnerOnlyApplied(child, "directory");
+			try {
+				native.applyOwnerOnlyPathSecurity(child, "directory");
+			} catch {
+				// Best-effort: the managed-tree snapshot re-verifies and reports genuine failures.
+			}
 		} else if (stat.isFile()) {
-			assertOwnerOnlyApplied(child, "file");
+			try {
+				native.applyOwnerOnlyPathSecurity(child, "file");
+			} catch {
+				// Best-effort, as above.
+			}
 		}
 	}
-	assertOwnerOnlyApplied(directory, "directory");
-}
-
-/** Apply and verify owner-only mode/ACL; throw mode_mismatch (or native code) on failure. */
-function assertOwnerOnlyApplied(pathname: string, kind: "directory" | "file"): void {
-	const applied = nativeScope().applyOwnerOnlyPathSecurity(pathname, kind);
-	if (!applied || typeof applied !== "object" || (applied as { ok?: unknown }).ok !== true) {
-		const code =
-			applied && typeof applied === "object" && typeof (applied as { code?: unknown }).code === "string"
-				? (applied as { code: string }).code
-				: "mode_mismatch";
-		throw new Error(code);
-	}
-	const verified = nativeScope().verifyOwnerOnlyPathSecurity(pathname, kind);
-	if (!verified || typeof verified !== "object" || (verified as { ok?: unknown }).ok !== true) {
-		const code =
-			verified && typeof verified === "object" && typeof (verified as { code?: unknown }).code === "string"
-				? (verified as { code: string }).code
-				: "mode_mismatch";
-		throw new Error(code);
-	}
-}
-
-/**
- * Mode-only walk for managed-scope prepare self-heal.
- * Throws `mode_mismatch` when any non-symlink descendant has group/other bits.
- * Avoids snapshotManagedTree("") which races concurrent session writers (#3906).
- */
-function assertOwnerOnlyModesRecursive(directory: string): void {
-	let stat: fs.Stats;
 	try {
-		stat = fs.lstatSync(directory);
+		native.applyOwnerOnlyPathSecurity(directory, "directory");
 	} catch {
-		return;
-	}
-	if (stat.isSymbolicLink()) return;
-	if ((stat.mode & 0o077) !== 0) throw new Error("mode_mismatch");
-	if (!stat.isDirectory()) return;
-	let entries: fs.Dirent[];
-	try {
-		entries = fs.readdirSync(directory, { withFileTypes: true });
-	} catch {
-		return;
-	}
-	for (const entry of entries) {
-		assertOwnerOnlyModesRecursive(path.join(directory, entry.name));
+		// Best-effort, as above.
 	}
 }
 
@@ -1009,7 +941,7 @@ function assertOwnerOnlyModesRecursive(directory: string): void {
  * (group/other permission bits) rather than an ownership or identity change.
  * Only mode drift can be self-healed by re-applying owner-only permissions.
  */
-export function isRecoverableOwnerOnlyModeDrift(error: unknown): boolean {
+function isRecoverableOwnerOnlyModeDrift(error: unknown): boolean {
 	const message = error instanceof Error ? error.message : "";
 	return message === "mode_mismatch" || message.endsWith(": mode_mismatch");
 }
@@ -1070,20 +1002,8 @@ export function prepareManagedSessionScopeForWriteSync(
 			);
 		stage = "store";
 		let store: ManagedSessionDescendantStore;
-		const openManagedStore = (): ManagedSessionDescendantStore => {
-			const next = buildStore();
-			// #3951 root-store identity binding no longer walks the managed tree on
-			// construct, so mode drift no longer surfaces as mode_mismatch there.
-			// Detect group/other-readable descendants with a mode-only walk — do NOT
-			// call snapshotManagedTree("") here: that reintroduces concurrent-writer
-			// identity_mismatch races (#3906) that break SessionManager.moveTo /move.
-			if (retainedAuthority) {
-				assertOwnerOnlyModesRecursive(scope.directoryPath);
-			}
-			return next;
-		};
 		try {
-			store = openManagedStore();
+			store = buildStore();
 		} catch (error) {
 			if (process.platform === "win32" && policy === "windows-existing-verify-first") throw error;
 			if (!isRecoverableOwnerOnlyModeDrift(error)) throw error;
@@ -1091,7 +1011,7 @@ export function prepareManagedSessionScopeForWriteSync(
 			// (e.g. resident-cache blobs written on the explicit session path).
 			// Re-secure the tree in place and retry once before failing closed.
 			reapplyOwnerOnlyManagedTree(scope.directoryPath);
-			store = openManagedStore();
+			store = buildStore();
 		}
 		const binding = new TextEncoder().encode(`${JSON.stringify(bindingFor(scope))}\n`);
 		stage = "binding_publish";
@@ -1137,7 +1057,13 @@ export function prepareManagedSessionScopeForWriteSync(
 		const publication = error instanceof ManagedPublishError ? error : undefined;
 		const message =
 			publication?.classification ?? managedScopeFailureMessage(error, "Managed write protocol setup failed.");
-		const code = managedScopeErrorCode(message);
+		const code =
+			message === "atomic_unavailable" ||
+			message === "invalid_request" ||
+			message === "durability_failed" ||
+			message === "durability_not_provable"
+				? message
+				: "binding_invalid";
 
 		return {
 			kind: "error",
@@ -2459,9 +2385,14 @@ function artifactIdentityForCleanup(target: RetiredTarget): SessionStorageFileId
 	}
 }
 
+type NativeDirectorySnapshotApi = {
+	snapshotDirectoryTree(
+		pathname: string,
+	): { ok: true; snapshot: NativeDirectoryTreeSnapshot } | { ok: false; code: string; snapshot?: undefined };
+};
 function snapshotArtifactTree(pathname: string): NativeDirectoryTreeSnapshot {
 	validateManagedArtifactTree(pathname);
-	const result = nativeScope().snapshotDirectoryTree(pathname);
+	const result = (native as unknown as NativeDirectorySnapshotApi).snapshotDirectoryTree(pathname);
 	if (!result.ok || !result.snapshot) throw new Error(result.ok ? "unsafe_artifacts" : result.code);
 	return result.snapshot;
 }
@@ -2902,7 +2833,7 @@ export function matchesMigrationArtifactRoot(
 		const stat = fs.lstatSync(pathname, { bigint: true });
 		if (!stat.isDirectory() || stat.isSymbolicLink() || stat.dev !== identity.dev || stat.ino !== identity.ino)
 			return false;
-		const observed = nativeScope().snapshotDirectoryTree(pathname);
+		const observed = native.snapshotDirectoryTree(pathname);
 		const expectedRoot = expectedTree.entries.find(entry => entry.relativePath === "" && entry.kind === "directory");
 		const observedRoot = observed.snapshot?.entries.find(
 			entry => entry.relativePath === "" && entry.kind === "directory",
@@ -2998,7 +2929,7 @@ export function cleanupAuthorityMatches(
 			parentStat.ino !== cleanup.identity.parentIno
 		)
 			return false;
-		const snapshot = nativeScope().snapshotDirectoryTree(cleanup.retainedPath);
+		const snapshot = native.snapshotDirectoryTree(cleanup.retainedPath);
 		const observedRoot = snapshot.snapshot?.entries.find(
 			entry => entry.relativePath === "" && entry.kind === "directory",
 		);
@@ -3031,7 +2962,7 @@ export function detachArtifactRootForMigration(
 ):
 	| { detached: DetachedArtifactRoot; detachOutcome: "clean" }
 	| { detached: DetachedArtifactRoot; detachOutcome: "cleanup_pending"; cleanup: SourceArtifactCleanup } {
-	const result = nativeScope().exactUnlink(plan.originalPath, {
+	const result = native.exactUnlink(plan.originalPath, {
 		...plan.identity,
 		directory: true,
 		detachOnly: true,
@@ -3062,7 +2993,7 @@ export function detachArtifactRootForMigration(
 	const stat = fs.lstatSync(placeholder, { bigint: true });
 	if (!stat.isDirectory() || stat.isSymbolicLink() || path.dirname(placeholder) !== path.dirname(plan.originalPath))
 		throw new Error("durability_failed");
-	const snapshot = nativeScope().snapshotDirectoryTree(placeholder);
+	const snapshot = native.snapshotDirectoryTree(placeholder);
 	if (!snapshot.ok || !snapshot.snapshot) throw new Error("durability_failed");
 	// Windows directory size/mtime authority is the native tree root, never Bun's
 	// zero-valued directory lstat. Capturing Bun values here would guarantee a
@@ -3235,7 +3166,7 @@ export function restorePreparedArtifactRoot(
 		return;
 	}
 	assertPreparedTree(quarantine.detachedPath);
-	const result = nativeScope().exactRestore(quarantine.detachedPath, quarantine.path, {
+	const result = native.exactRestore(quarantine.detachedPath, quarantine.path, {
 		...artifactIdentity,
 		directory: true,
 	});
@@ -3245,7 +3176,7 @@ export function restorePreparedArtifactRoot(
 function restoreDetachedArtifactRoot(detached: DetachedArtifactRoot, cleanup?: SourceArtifactCleanup): void {
 	if (cleanup && !cleanupAuthorityMatches(cleanup, path.dirname(detached.originalPath)))
 		throw new Error("durability_failed");
-	const result = nativeScope().exactRestore(detached.detachedPath, detached.originalPath, {
+	const result = native.exactRestore(detached.detachedPath, detached.originalPath, {
 		...detached.identity,
 		directory: true,
 	});
@@ -3712,7 +3643,14 @@ export async function prepareManagedSessionScopeForWrite(
 		const publication = error instanceof ManagedPublishError ? error : undefined;
 		const message =
 			publication?.classification ?? managedScopeFailureMessage(error, "Managed write protocol setup failed.");
-		const code = managedScopeErrorCode(message);
+		const code =
+			message === "atomic_unavailable" ||
+			message === "invalid_request" ||
+			message === "durability_failed" ||
+			message === "durability_not_provable" ||
+			message === "migration_busy"
+				? message
+				: "binding_invalid";
 		return {
 			kind: "error",
 			code,

@@ -24,7 +24,6 @@ export const ModelCompatSchema = z.object({
 	supportsStore: z.boolean().optional(),
 	supportsDeveloperRole: z.boolean().optional(),
 	sendSessionHeaders: z.boolean().optional(),
-	supportsResponsesSessionAffinity: z.boolean().optional(),
 	supportsMultipleSystemMessages: z.boolean().optional(),
 	supportsReasoningEffort: z.boolean().optional(),
 	reasoningEffortMap: ReasoningEffortMapSchema.optional(),
@@ -190,9 +189,7 @@ export const ModelOverrideSchema = z
 export type ModelOverride = z.infer<typeof ModelOverrideSchema>;
 
 export const ProviderDiscoverySchema = z.object({
-	type: z.enum(["ollama", "llama.cpp", "lm-studio", "openai-models-list", "models-dev"]),
-	apiByModelPrefix: z.record(z.string().min(1), z.enum(["openai-completions", "anthropic-messages"])).optional(),
-	modelsDevProvider: z.string().min(1).optional(),
+	type: z.enum(["ollama", "llama.cpp", "lm-studio", "openai-models-list"]),
 });
 
 const LocalOpenAICompatSchema = z

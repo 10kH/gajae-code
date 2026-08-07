@@ -26,7 +26,7 @@
  */
 
 import * as path from "node:path";
-import type { AuthStorage } from "@gajae-code/ai/core";
+import type { AuthStorage } from "@gajae-code/ai";
 import { $credentialEnv, parseEnvFile } from "@gajae-code/utils";
 
 import { settings } from "../../../config/settings";

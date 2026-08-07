@@ -138,8 +138,7 @@ describe("ACP initialize conformance", () => {
 			expect.objectContaining({
 				loadSession: true,
 				promptCapabilities: expect.objectContaining({ embeddedContext: true, image: true }),
-				// Legacy MCP HTTP+SSE is deprecated and unimplemented, so it stays unadvertised.
-				mcpCapabilities: { http: true },
+				mcpCapabilities: { http: true, sse: true },
 				sessionCapabilities: expect.objectContaining({
 					list: expect.any(Object),
 					fork: expect.any(Object),

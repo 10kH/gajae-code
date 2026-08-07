@@ -1,8 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { ToolResultMessage } from "@gajae-code/ai";
 import type { SessionEntry, SessionMessageEntry } from "../src/compaction/entries";
-import type { PruneConfig } from "../src/compaction/pruning";
-import { applyToolOutputPrune as pruneToolOutputs } from "./pruning-test-utils";
+import { type PruneConfig, pruneToolOutputs } from "../src/compaction/pruning";
 
 let idCounter = 0;
 

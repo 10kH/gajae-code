@@ -20,8 +20,6 @@ The SDK endpoint is loopback-only and is created with the session. It provides t
 
 ACP remains a stdio editor protocol. Its session control uses the SDK adapter internally; it is not a replacement external bot-control protocol.
 
-For the build/run/verify loop when changing ACP code locally, see [ACP local development](./acp-local-development.md).
-
 #### Evidence promotion policy
 
 Ordinary CI runs publish an **ephemeral** report under `$RUNNER_TEMP` and upload it as a

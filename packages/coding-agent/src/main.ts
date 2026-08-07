@@ -9,7 +9,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
-import type { ImageContent } from "@gajae-code/ai/core";
+import type { ImageContent } from "@gajae-code/ai";
 import {
 	$pickenv,
 	getAgentDir,
@@ -33,12 +33,14 @@ import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import { resolveCliModel, resolveModelRoleValue, resolveModelScope, type ScopedModel } from "./config/model-resolver";
 import { selectorHead } from "./config/model-selector-value";
 import { getDefault, type SettingPath, Settings, settings } from "./config/settings";
-import { distTagForChannel, type UpdateChannel } from "./config/update-channel";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "./defaults/gjc-grok-cli";
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
+import { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } from "./gjc-runtime/managed-owner-admission";
+import { isManagedOwnerSupervisorArgv, runManagedOwnerSupervisor } from "./gjc-runtime/managed-owner-supervisor";
 import { persistCoordinatorRuntimeInputReady } from "./gjc-runtime/session-state-sidecar";
+import { isTmuxOwnerIsolationCliArgv, runTmuxOwnerIsolationCliFromStdin } from "./gjc-runtime/tmux-owner-isolation-cli";
 import type { AcpStartupOptions } from "./modes/acp/startup-options";
 import type { SessionSelectionResult } from "./modes/components/session-selector";
 import type { InteractiveMode } from "./modes/interactive-mode";
@@ -78,19 +80,10 @@ import { getDisplayChangelogEntries, getInstalledVersionChangelogEntry, getNewEn
 import type { EventBus } from "./utils/event-bus";
 import { fetchLatestPackageVersion } from "./utils/npm-registry";
 
-const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
-const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
-const TMUX_OWNER_ISOLATION_ARG = "--internal-tmux-owner-isolation";
-
-async function checkForNewVersion(
-	currentVersion: string,
-	channel: UpdateChannel = "stable",
-): Promise<string | undefined> {
+async function checkForNewVersion(currentVersion: string): Promise<string | undefined> {
 	try {
 		// Resolved from npm config so mirrored/firewalled networks are checked too.
-		const { version } = await fetchLatestPackageVersion("@gajae-code/coding-agent", {
-			distTag: distTagForChannel(channel),
-		});
+		const { version } = await fetchLatestPackageVersion("@gajae-code/coding-agent");
 		return Bun.semver.order(version, currentVersion) > 0 ? version : undefined;
 	} catch {
 		return undefined;
@@ -1456,7 +1449,7 @@ export async function runRootCommand(
 	const startupUpdate = new StartupUpdateOrchestrator(
 		startupUpdateRoute,
 		() => settingsInstance.get("startup.checkUpdate"),
-		deps.startupUpdate?.check ?? (() => checkForNewVersion(VERSION, settingsInstance.get("startup.updateChannel"))),
+		deps.startupUpdate?.check ?? (() => checkForNewVersion(VERSION)),
 	);
 	const isInteractive = disposition.isInteractive;
 	const mode = parsedArgs.mode || "text";
@@ -1478,12 +1471,11 @@ export async function runRootCommand(
 	await logger.time(
 		"initTheme:final",
 		deps.initTheme ?? initTheme,
-		isInteractive && settingsInstance.get("theme.watchFiles"),
+		isInteractive,
 		settingsInstance.get("symbolPreset"),
 		settingsInstance.get("colorBlindMode"),
 		settingsInstance.get("theme.dark"),
 		settingsInstance.get("theme.light"),
-		settingsInstance.get("syntaxHighlighting.enabled"),
 	);
 
 	const credentialAutoImportNotice = isInteractive
@@ -1575,10 +1567,7 @@ export async function runRootCommand(
 	let rootTokenTurn = 0;
 	const baseTelemetry = sessionOptions.telemetry;
 	sessionOptions.telemetry = {
-		// C3 telemetry split: the default token-log wrapper is usage-only —
-		// spans stay off unless an SDK embedder supplied its own telemetry
-		// config, which remains authoritative.
-		...(baseTelemetry ?? { spans: false }),
+		...(baseTelemetry ?? {}),
 		onChatUsage: async event => {
 			await baseTelemetry?.onChatUsage?.(event);
 			const currentSessionId = sessionManager?.getSessionId();
@@ -1746,7 +1735,7 @@ export async function runRootCommand(
 				startDeferredModelProfiles = async () => {
 					try {
 						const result = await applyDeferredStartupModelProfilesForRoot(profileArgs);
-						await startDeferredMemoryBackend?.();
+						startDeferredMemoryBackend?.();
 						ready.resolve();
 						return result;
 					} catch (error) {
@@ -1756,7 +1745,7 @@ export async function runRootCommand(
 				};
 			} else {
 				const { recoverableErrors } = await applyStartupModelProfilesForRoot(profileArgs);
-				await startDeferredMemoryBackend?.();
+				startDeferredMemoryBackend?.();
 				for (const recoverableError of recoverableErrors) {
 					notifs.push({ kind: "error", message: recoverableError });
 				}
@@ -1883,26 +1872,19 @@ export async function runRootCommand(
 }
 
 export async function main(args: string[]): Promise<void> {
-	if (args.length === 1 && args[0] === TMUX_OWNER_ISOLATION_ARG) {
-		const { runTmuxOwnerIsolationCliFromStdin } = await import("./gjc-runtime/tmux-owner-isolation-cli");
+	if (isTmuxOwnerIsolationCliArgv(args)) {
 		await runTmuxOwnerIsolationCliFromStdin();
 		return;
 	}
-	if (args.length === 1 && args[0] === MANAGED_OWNER_SUPERVISOR_ARG) {
-		const { runManagedOwnerSupervisor } = await import("./gjc-runtime/managed-owner-supervisor");
+	if (isManagedOwnerSupervisorArgv(args)) {
 		await runManagedOwnerSupervisor();
 		return;
 	}
-	if (process.env[MANAGED_OWNER_CHILD_TOKEN_ENV] !== undefined) {
-		const { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } = await import(
-			"./gjc-runtime/managed-owner-admission"
-		);
-		const admission = await admitManagedOwnerBeforeCli();
-		if (admission.kind === "blocked") return;
-		if (admission.kind === "recovery") {
-			await completeManagedOwnerRecovery(admission.context);
-			return;
-		}
+	const admission = await admitManagedOwnerBeforeCli();
+	if (admission.kind === "blocked") return;
+	if (admission.kind === "recovery") {
+		await completeManagedOwnerRecovery(admission.context);
+		return;
 	}
 	const { runCli } = await import("./cli");
 	await runCli(args.length === 0 ? ["launch"] : args);

@@ -1,7 +1,6 @@
 import { getProjectDir, logger } from "@gajae-code/utils";
 import { Settings } from "../../config/settings";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../../debug/crash-diagnostics";
-import { registerResourceOwner } from "../../runtime/process-lifecycle";
 import { OutputSink } from "../../session/streaming-output";
 import type { ToolSession } from "../../tools";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../../tools/output-meta";
@@ -118,13 +117,6 @@ interface InitializingPythonSession {
 	promise: Promise<PythonSession>;
 }
 
-let pythonResourceCleanupRegistered = false;
-
-function ensurePythonResourceCleanup(): void {
-	if (pythonResourceCleanupRegistered) return;
-	pythonResourceCleanupRegistered = true;
-	registerResourceOwner("python-kernel-sessions", disposeAllKernelSessions);
-}
 const sessions = new Map<string, PythonSession | InitializingPythonSession>();
 
 function isInitializingSession(
@@ -316,7 +308,6 @@ async function acquireSession(sessionId: string, cwd: string, options: PythonExe
 			? await waitForPromiseWithCancellation(existing.promise, options)
 			: existing;
 		attachOwner(session, sessionId, options.kernelOwnerId);
-		ensurePythonResourceCleanup();
 		return session;
 	}
 
@@ -351,7 +342,6 @@ async function acquireSession(sessionId: string, cwd: string, options: PythonExe
 	try {
 		const session = await waitForPromiseWithCancellation(initializing.promise, options);
 		attachOwner(session, sessionId, options.kernelOwnerId);
-		ensurePythonResourceCleanup();
 		return session;
 	} catch (err) {
 		if (sessions.get(sessionId) === initializing) sessions.delete(sessionId);

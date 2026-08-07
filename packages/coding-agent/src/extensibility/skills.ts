@@ -11,12 +11,6 @@ import { expandTilde } from "../tools/path-utils";
 import type { LoadedSubskillActivation } from "./gjc-plugins";
 import { buildSubskillInjection } from "./gjc-plugins/injection";
 import { renderSkillAdvertisement } from "./gjc-plugins/runtime-adapters";
-/** Metadata-only handle returned by bounded skill discovery. */
-export interface SkillDescriptor {
-	readonly metadata: Omit<Skill, "content" | "loadContent">;
-	readonly loadContent: () => Promise<string>;
-}
-
 export interface Skill {
 	name: string;
 	description: string;
@@ -32,8 +26,6 @@ export interface Skill {
 	/** Source metadata for display */
 	_source?: SourceMeta;
 	/** Embedded SKILL.md content for bundled defaults that survive .gjc deletion. */
-	/** Lazily load the full skill body when prompt injection needs it. */
-	loadContent?: () => Promise<string>;
 	content?: string;
 }
 
@@ -94,7 +86,6 @@ export async function loadSkillsFromDir(options: LoadSkillsFromDirOptions): Prom
 			description: typeof capSkill.frontmatter?.description === "string" ? capSkill.frontmatter.description : "",
 			filePath: capSkill.path,
 			baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
-			loadContent: capSkill.loadContent,
 			source: options.source,
 			hide: capSkill.frontmatter?.hide === true,
 			_source: capSkill._source,
@@ -203,7 +194,6 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 				description: typeof capSkill.frontmatter?.description === "string" ? capSkill.frontmatter.description : "",
 				filePath: capSkill.path,
 				baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
-				loadContent: capSkill.loadContent,
 				source: `${capSkill._source.provider}:${capSkill.level}`,
 				hide: capSkill.frontmatter?.hide === true,
 				_source: capSkill._source,
@@ -241,7 +231,6 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 						typeof capSkill.frontmatter?.description === "string" ? capSkill.frontmatter.description : "",
 					filePath: capSkill.path,
 					baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
-					loadContent: capSkill.loadContent,
 					source: "custom:user",
 					hide: capSkill.frontmatter?.hide === true,
 					_source: { ...capSkill._source, providerName: "Custom" },
@@ -418,16 +407,12 @@ export function resolveSkillSlashCommands(
 }
 
 export async function buildSkillPromptMessage(
-	skill: Pick<Skill, "name" | "filePath" | "content" | "loadContent">,
+	skill: Pick<Skill, "name" | "filePath" | "content">,
 	args: string,
 	context?: BuildSkillPromptMessageContext,
 ): Promise<BuiltSkillPromptMessage> {
-	const content = skill.loadContent
-		? await skill.loadContent()
-		: typeof skill.content === "string"
-			? skill.content
-			: await Bun.file(skill.filePath).text();
-	const body = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "").trim();
+	const content = typeof skill.content === "string" ? skill.content : await Bun.file(skill.filePath).text();
+	const body = content.replace(/^---\n[\s\S]*?\n---\n/, "").trim();
 	const metaLines = [`Skill: ${skill.filePath}`];
 	const trimmedArgs = args.trim();
 	if (trimmedArgs) {

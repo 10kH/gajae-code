@@ -214,14 +214,6 @@ export class SessionSdkHost {
 	handleDisconnect(connectionId: string): void {
 		this.reverse.disconnect(connectionId);
 	}
-	/** Route malformed transport bytes through the host's structured protocol-error seam. */
-	handleMalformedFrame(connectionId: string, message: string): void {
-		void this.#sendBestEffort(connectionId, {
-			type: "protocol_error",
-			ok: false,
-			error: { code: "invalid_frame", message },
-		});
-	}
 
 	/** Adds an event to the resumable event ring. Transport delivery is owned by bus wiring. */
 	emitEvent(frame: SdkFrame): EventFrame {
@@ -243,20 +235,13 @@ export class SessionSdkHost {
 		});
 		this.#unsubscribe = typeof disposer === "function" ? disposer : undefined;
 		this.#started = true;
-		try {
-			if (this.#registration)
-				await this.#registration.writer.register({
-					sessionId: this.#options.sessionId,
-					stateRoot: this.#options.stateRoot,
-					endpointGeneration: this.events.generation,
-				});
-			return "started";
-		} catch (error) {
-			this.#unsubscribe?.();
-			this.#unsubscribe = undefined;
-			this.#started = false;
-			throw error;
-		}
+		if (this.#registration)
+			await this.#registration.writer.register({
+				sessionId: this.#options.sessionId,
+				stateRoot: this.#options.stateRoot,
+				endpointGeneration: this.events.generation,
+			});
+		return "started";
 	}
 
 	#publishReadiness(): void {

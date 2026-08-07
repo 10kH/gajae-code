@@ -7,8 +7,7 @@ import type {
 	InteractiveModeContext,
 	SubmittedUserInput,
 } from "@gajae-code/coding-agent/modes/types";
-import type { ToolSession } from "@gajae-code/coding-agent/tools";
-import { SubagentTool } from "@gajae-code/coding-agent/tools/implementations";
+import { SubagentTool, type ToolSession } from "@gajae-code/coding-agent/tools";
 import type { SlashCommand } from "@gajae-code/tui";
 
 beforeAll(async () => {

@@ -1,4 +1,4 @@
-import type { AuthStorage } from "@gajae-code/ai/core";
+import type { AuthStorage } from "@gajae-code/ai";
 import { withHardTimeout } from "./search/providers/utils";
 
 const KAGI_SEARCH_URL = "https://kagi.com/api/v0/search";

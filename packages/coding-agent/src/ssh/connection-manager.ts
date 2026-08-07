@@ -380,13 +380,6 @@ export async function buildRemoteCommand(
 }
 
 let registered = false;
-function ensureSshCleanup(): void {
-	if (registered) return;
-	registered = true;
-	postmortem.register("ssh-cleanup", async () => {
-		await closeAllConnections();
-	});
-}
 
 export async function ensureConnection(host: SSHConnectionTarget): Promise<void> {
 	const key = host.name;
@@ -401,10 +394,16 @@ export async function ensureConnection(host: SSHConnectionTarget): Promise<void>
 		ensureControlDir();
 		await validateKeyPermissions(host.keyPath);
 
+		if (!registered) {
+			registered = true;
+			postmortem.register("ssh-cleanup", async () => {
+				await closeAllConnections();
+			});
+		}
+
 		const target = buildSshTarget(host.username, host.host);
 		if (!supportsSshControlMaster()) {
 			activeHosts.set(key, host);
-			ensureSshCleanup();
 			if (!hostInfoCache.has(key) && !(await loadHostInfoFromDisk(host))) {
 				await probeHostInfo(host);
 			}
@@ -414,7 +413,6 @@ export async function ensureConnection(host: SSHConnectionTarget): Promise<void>
 		const check = await runSshSync(["-O", "check", ...buildCommonArgs(host), target]);
 		if (check.exitCode === 0) {
 			activeHosts.set(key, host);
-			ensureSshCleanup();
 			if (!hostInfoCache.has(key) && !(await loadHostInfoFromDisk(host))) {
 				await probeHostInfo(host);
 			}
@@ -428,7 +426,6 @@ export async function ensureConnection(host: SSHConnectionTarget): Promise<void>
 		}
 
 		activeHosts.set(key, host);
-		ensureSshCleanup();
 		if (!hostInfoCache.has(key) && !(await loadHostInfoFromDisk(host))) {
 			await probeHostInfo(host);
 		}

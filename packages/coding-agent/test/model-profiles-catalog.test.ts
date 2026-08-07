@@ -67,9 +67,9 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		name: "opencodego",
 		requiredProviders: ["opencode-go"],
 		mapping: {
-			default: "opencode-go/kimi-k3",
+			default: "opencode-go/kimi-k2.6",
 			executor: "opencode-go/deepseek-v4-flash",
-			planner: "opencode-go/kimi-k3",
+			planner: "opencode-go/qwen3.7-max",
 			critic: "opencode-go/mimo-v2.5-pro",
 			architect: "opencode-go/deepseek-v4-pro",
 		},
@@ -410,7 +410,7 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		mapping: {
 			default: "openai-codex/gpt-5.6-sol:low",
 			executor: "opencode-go/deepseek-v4-pro",
-			planner: "opencode-go/kimi-k3",
+			planner: "opencode-go/kimi-k2.6",
 			critic: "opencode-go/mimo-v2.5-pro",
 			architect: "openai-codex/gpt-5.6-sol:high",
 		},
@@ -472,7 +472,7 @@ const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> 
 	},
 	"codex-opencodego": {
 		executor: "opencode-go/deepseek-v4-pro",
-		planner: "opencode-go/kimi-k3",
+		planner: "opencode-go/kimi-k2.6",
 		critic: "opencode-go/mimo-v2.5-pro",
 	},
 	"fable-opus-codex": {

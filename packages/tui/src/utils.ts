@@ -1,33 +1,19 @@
-import type { ExtractSegmentsResult, SliceResult } from "@gajae-code/natives";
+import {
+	Ellipsis,
+	type ExtractSegmentsResult,
+	extractSegments as nativeExtractSegments,
+	sliceWithWidth as nativeSliceWithWidth,
+	truncateLinesToWidth as nativeTruncateLinesToWidth,
+	truncateToWidth as nativeTruncateToWidth,
+	visibleWidth as nativeVisibleWidth,
+	visibleWidths as nativeVisibleWidths,
+	wrapTextWithAnsi as nativeWrapTextWithAnsi,
+	type SliceResult,
+} from "@gajae-code/natives";
 import { getDefaultTabWidth, getIndentation, onDefaultTabWidthChange } from "@gajae-code/utils";
 import { renderMetrics } from "./metrics";
 
-type NativeTuiUtils = Pick<
-	typeof import("@gajae-code/natives"),
-	| "extractSegments"
-	| "sliceWithWidth"
-	| "truncateLinesToWidth"
-	| "truncateToWidth"
-	| "visibleWidth"
-	| "visibleWidths"
-	| "wrapTextWithAnsi"
->;
-
-let nativeTuiUtilsBindings: NativeTuiUtils | undefined;
-
-function nativeTuiUtils(): NativeTuiUtils {
-	if (!nativeTuiUtilsBindings) {
-		nativeTuiUtilsBindings = require("@gajae-code/natives") as NativeTuiUtils;
-	}
-	return nativeTuiUtilsBindings;
-}
-
-/** Ellipsis strategy for bounded terminal truncation. Values match the native enum. */
-export enum Ellipsis {
-	Unicode = 0,
-	Ascii = 1,
-	Omit = 2,
-}
+export { Ellipsis } from "@gajae-code/natives";
 
 export { getDefaultTabWidth, getIndentation } from "@gajae-code/utils";
 /** Test-only performance counters for advisory baseline tests. */
@@ -75,7 +61,7 @@ export function isPrintableAscii(text: string): boolean {
 }
 
 export function sliceWithWidth(line: string, startCol: number, length: number, strict?: boolean | null): SliceResult {
-	return nativeTuiUtils().sliceWithWidth(line, startCol, length, strict ?? null, getCachedTabWidth());
+	return nativeSliceWithWidth(line, startCol, length, strict ?? null, getCachedTabWidth());
 }
 
 export function truncateToWidth(
@@ -98,7 +84,7 @@ export function truncateToWidth(
 	if (typeof resolvedEllipsis === "string") {
 		resolvedEllipsis = resolvedEllipsis === "" ? Ellipsis.Omit : Ellipsis.Unicode;
 	}
-	return nativeTuiUtils().truncateToWidth(
+	return nativeTruncateToWidth(
 		safeText,
 		safeWidth,
 		resolvedEllipsis ?? Ellipsis.Unicode,
@@ -119,7 +105,7 @@ export function truncateLinesToWidth(
 	if (typeof resolvedEllipsis === "string") {
 		resolvedEllipsis = resolvedEllipsis === "" ? Ellipsis.Omit : Ellipsis.Unicode;
 	}
-	return nativeTuiUtils().truncateLinesToWidth(
+	return nativeTruncateLinesToWidth(
 		lines.map(line => (typeof line === "string" ? line : String(line ?? ""))),
 		safeWidth,
 		resolvedEllipsis ?? Ellipsis.Unicode,
@@ -130,7 +116,7 @@ export function truncateLinesToWidth(
 
 export function wrapTextWithAnsi(text: string, width: number): string[] {
 	__textHelperPerfCounters.wrapTextWithAnsiCalls += 1;
-	return nativeTuiUtils().wrapTextWithAnsi(text, width, getCachedTabWidth());
+	return nativeWrapTextWithAnsi(text, width, getCachedTabWidth());
 }
 
 export function extractSegments(
@@ -140,7 +126,7 @@ export function extractSegments(
 	afterLen: number,
 	strictAfter: boolean,
 ): ExtractSegmentsResult {
-	return nativeTuiUtils().extractSegments(line, beforeEnd, afterStart, afterLen, strictAfter, getCachedTabWidth());
+	return nativeExtractSegments(line, beforeEnd, afterStart, afterLen, strictAfter, getCachedTabWidth());
 }
 
 // Pre-allocated space buffer for padding
@@ -339,7 +325,7 @@ export function visibleWidthRaw(str: string): number {
 	}
 	const normalized = normalizeForWidth(str);
 	const text = tabCount === 0 ? normalized : normalized.replaceAll("\t", " ".repeat(getCachedTabWidth()));
-	return nativeTuiUtils().visibleWidth(text, getCachedTabWidth());
+	return nativeVisibleWidth(text, getCachedTabWidth());
 }
 
 /**
@@ -353,7 +339,7 @@ export function visibleWidth(str: string): number {
 export function visibleWidthsNative(lines: readonly string[]): number[] {
 	__textHelperPerfCounters.visibleWidthsCalls += 1;
 	const safeLines = lines.map(line => (typeof line === "string" ? line : String(line ?? "")));
-	const widths = nativeTuiUtils().visibleWidths(safeLines, getCachedTabWidth());
+	const widths = nativeVisibleWidths(safeLines, getCachedTabWidth());
 	for (let index = 0; index < safeLines.length; index++) {
 		const line = safeLines[index]!;
 		if (hasUnpairedSurrogate(line)) widths[index] = visibleWidthRaw(line);

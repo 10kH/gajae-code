@@ -7,8 +7,7 @@ import {
 	ensurePyToolBridge,
 	registerPyToolBridge,
 } from "@gajae-code/coding-agent/eval/py/tool-bridge";
-import type { ToolSession } from "@gajae-code/coding-agent/tools";
-import { resolvePythonIntegrationGate } from "@gajae-code/coding-agent/tools/implementations";
+import { resolvePythonIntegrationGate, type ToolSession } from "@gajae-code/coding-agent/tools";
 import { TempDir } from "@gajae-code/utils";
 
 const SHOULD_RUN = resolvePythonIntegrationGate(Bun.env);

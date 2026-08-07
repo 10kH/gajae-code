@@ -40,8 +40,6 @@ export interface MCPToolsLoadOptions {
 	cacheStorage?: AgentStorage | null;
 	/** Auth storage used to resolve OAuth credentials before initial MCP connect */
 	authStorage?: AuthStorage;
-	/** Idle retention for shared MCP pool entries. */
-	sharedPoolIdleMs?: number;
 }
 
 async function resolveToolCache(storage: AgentStorage | null | undefined): Promise<MCPToolCache | null> {
@@ -64,7 +62,7 @@ async function resolveToolCache(storage: AgentStorage | null | undefined): Promi
  */
 export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoadOptions): Promise<MCPToolsLoadResult> {
 	const toolCache = await resolveToolCache(options?.cacheStorage);
-	const manager = new MCPManager(cwd, toolCache, { sharedPoolIdleMs: options?.sharedPoolIdleMs });
+	const manager = new MCPManager(cwd, toolCache);
 	if (options?.authStorage) {
 		manager.setAuthStorage(options.authStorage);
 	}

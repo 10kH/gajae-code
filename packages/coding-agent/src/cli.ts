@@ -5,9 +5,18 @@
  * lightweight CLI runner from pi-utils.
  */
 import "@gajae-code/utils/postmortem";
+import { THINKING_EFFORTS } from "@gajae-code/ai";
 import { Args, type CliConfig, Command, type CommandEntry, Flags, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
+import { loadNative as loadNativeBindings } from "../../natives/native/loader-state.js";
 import { runFixtureReport } from "./cli/fixture-report";
+import { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } from "./gjc-runtime/managed-owner-admission";
+import {
+	isManagedOwnerSupervisorArgv,
+	MANAGED_OWNER_CHILD_TOKEN_ENV,
+	runManagedOwnerSupervisor,
+} from "./gjc-runtime/managed-owner-supervisor";
+import { isTmuxOwnerIsolationCliArgv, runTmuxOwnerIsolationCliFromStdin } from "./gjc-runtime/tmux-owner-isolation-cli";
 import { smokeTestTabWorker } from "./tools/browser/tab-worker-smoke";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
@@ -24,10 +33,6 @@ if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 process.title = APP_NAME;
 const rootHelpFlags = ["--help", "-h", "help"];
 const versionFlags = ["--version", "-v"];
-const THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
-const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
-const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
-const TMUX_OWNER_ISOLATION_ARG = "--internal-tmux-owner-isolation";
 
 export const commands: CommandEntry[] = [
 	{ name: "codex-native-hook", load: () => import("./commands/codex-native-hook").then(m => m.default) },
@@ -200,9 +205,7 @@ function parseWindowsJobMemoryProbeResult(value: unknown): WindowsJobMemoryProbe
 export function runMemoryGuardNativeSmokeFastPath(
 	options: { loadNative?: MemoryGuardNativeSmokeLoad; writeStdout?: (text: string) => void } = {},
 ): void {
-	if (!options.loadNative)
-		throw new Error("memory-guard-native-smoke: native loader is unavailable on the static CLI path");
-	const probe = options.loadNative().probeWindowsJobMemory;
+	const probe = (options.loadNative ?? loadNativeBindings)().probeWindowsJobMemory;
 	if (typeof probe !== "function") {
 		throw new Error("memory-guard-native-smoke: probeWindowsJobMemory export missing from native addon");
 	}
@@ -212,11 +215,6 @@ export function runMemoryGuardNativeSmokeFastPath(
 		result: parseWindowsJobMemoryProbeResult((probe as () => unknown)()),
 	};
 	(options.writeStdout ?? (text => process.stdout.write(text)))(`${JSON.stringify(receipt)}\n`);
-}
-
-async function runMemoryGuardNativeSmokeFastPathFromCli(): Promise<void> {
-	const { runMemoryGuardNativeSmoke } = await import("./cli/native-smoke");
-	runMemoryGuardNativeSmoke();
 }
 
 function rootFixtureArg(argv: string[]): { present: boolean; id: string | undefined } {
@@ -347,8 +345,18 @@ function isSubcommand(first: string | undefined): boolean {
 async function runSmokeTest(): Promise<void> {
 	const { smokeTestSyncWorker } = await import("@gajae-code/stats");
 	await smokeTestSyncWorker();
-	const { runNativeSmokeTest } = await import("./cli/native-smoke");
-	await runNativeSmokeTest();
+	// Prove the embedded native addon extracts and the new perf exports resolve in
+	// the COMPILED single binary (dev runs only load the on-disk .node). Loading the
+	// natives module triggers loadNative()/embedded extraction; calling each new
+	// export confirms the symbols are present in the shipped binary.
+	const { h06FormatHashLines, h02ScoreSequenceFuzzy, h01FindBestFuzzyMatch } = await import("@gajae-code/natives");
+	const hashed = h06FormatHashLines("a\nb", 1);
+	if (hashed.split("\n").length !== 2) {
+		throw new Error(`smoke-test: h06FormatHashLines returned unexpected output: ${JSON.stringify(hashed)}`);
+	}
+	if (typeof h02ScoreSequenceFuzzy !== "function" || typeof h01FindBestFuzzyMatch !== "function") {
+		throw new Error("smoke-test: native fuzzy exports missing from embedded addon");
+	}
 	await smokeTestTabWorker();
 	process.stdout.write("smoke-test: ok\n");
 }
@@ -441,23 +449,18 @@ export async function runCli(argv: string[]): Promise<void> {
 		// Re-exec could not be spawned; fall through and run in this process.
 	}
 	if (isMemoryGuardNativeSmokeFastPath(argv)) {
-		await runMemoryGuardNativeSmokeFastPathFromCli();
+		runMemoryGuardNativeSmokeFastPath();
 		return;
 	}
-	if (argv.length === 1 && argv[0] === TMUX_OWNER_ISOLATION_ARG) {
-		const { runTmuxOwnerIsolationCliFromStdin } = await import("./gjc-runtime/tmux-owner-isolation-cli");
+	if (isTmuxOwnerIsolationCliArgv(argv)) {
 		await runTmuxOwnerIsolationCliFromStdin();
 		return;
 	}
-	if (argv.length === 1 && argv[0] === MANAGED_OWNER_SUPERVISOR_ARG) {
-		const { runManagedOwnerSupervisor } = await import("./gjc-runtime/managed-owner-supervisor");
+	if (isManagedOwnerSupervisorArgv(argv)) {
 		await runManagedOwnerSupervisor();
 		return;
 	}
 	if (process.env[MANAGED_OWNER_CHILD_TOKEN_ENV] !== undefined) {
-		const { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } = await import(
-			"./gjc-runtime/managed-owner-admission"
-		);
 		const admission = await admitManagedOwnerBeforeCli();
 		if (admission.kind === "blocked") return;
 		if (admission.kind === "recovery") {

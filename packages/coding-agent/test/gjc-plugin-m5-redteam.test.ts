@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -62,10 +61,6 @@ async function tempPlugin(name: string): Promise<string> {
 	return dir;
 }
 
-function sha256(value: string): string {
-	return createHash("sha256").update(value).digest("hex");
-}
-
 function count(haystack: string, needle: string): number {
 	return haystack.split(needle).length - 1;
 }
@@ -92,7 +87,7 @@ describe("Milestone 5 red-team appendix rendering", () => {
 							extensionId: "system-appendix:evil",
 							name: 'app"x<name>&',
 							relativePath: "appendix.md",
-							contentHash: sha256(body),
+							contentHash: "c".repeat(64),
 							bytes: Buffer.byteLength(body),
 						},
 					],
@@ -126,7 +121,7 @@ describe("Milestone 5 red-team appendix rendering", () => {
 							extensionId: "system-appendix:big",
 							name: "big",
 							relativePath: "big.md",
-							contentHash: sha256(oversize),
+							contentHash: "d".repeat(64),
 							bytes: Buffer.byteLength(oversize),
 						},
 					],
@@ -151,7 +146,7 @@ describe("Milestone 5 red-team appendix rendering", () => {
 						extensionId: `system-appendix:a${i}`,
 						name: `a${i}`,
 						relativePath: `a${i}.md`,
-						contentHash: sha256(`${i}:${body}`),
+						contentHash: `${i}`.repeat(64),
 						bytes: Buffer.byteLength(`${i}:${body}`),
 					})),
 				}),

@@ -1,4 +1,4 @@
-export { offBackend } from "./off-backend";
-export { localBackend, resolveMemoryBackend, resolveMemoryBackendId } from "./resolve";
-export { createMemoryBackendService } from "./service";
-export type * from "./types";
+export * from "./local-backend";
+export * from "./off-backend";
+export * from "./resolve";
+export * from "./types";

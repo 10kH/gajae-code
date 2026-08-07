@@ -21,11 +21,9 @@ import {
 	getProjectDir,
 	isEnoent,
 	logger,
+	procmgr,
 	setDefaultTabWidth,
 } from "@gajae-code/utils";
-// Subpath import keeps Settings native-free for the W5b S1/idle module-trace
-// gate: the package barrel's procmgr namespace pulls @gajae-code/natives.
-import { getShellConfig as resolveShellConfig } from "@gajae-code/utils/shell-config";
 import { YAML } from "bun";
 import { type Settings as SettingsCapabilityItem, settingsCapability } from "../capability/settings";
 import type { ModelRole } from "../config/model-registry";
@@ -938,7 +936,7 @@ export class Settings implements NotificationSettingsReader {
 	 */
 	getShellConfig() {
 		const shell = this.get("shellPath");
-		return resolveShellConfig(shell);
+		return procmgr.getShellConfig(shell);
 	}
 
 	/**

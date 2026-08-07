@@ -319,18 +319,18 @@ const ANTHROPIC_PROVIDER_SESSION_STATE_KEY = "anthropic-messages";
 type AnthropicProviderSessionState = ProviderSessionState & {
 	strictToolsDisabled: boolean;
 	fastModeDisabled: boolean;
-	generatedCacheBudget: GeneratedCacheBudget;
+	generatedCachingDisabled: boolean;
 };
 
 function createAnthropicProviderSessionState(): AnthropicProviderSessionState {
 	const state: AnthropicProviderSessionState = {
 		strictToolsDisabled: false,
 		fastModeDisabled: false,
-		generatedCacheBudget: 2,
+		generatedCachingDisabled: false,
 		close: () => {
 			state.strictToolsDisabled = false;
 			state.fastModeDisabled = false;
-			state.generatedCacheBudget = 2;
+			state.generatedCachingDisabled = false;
 		},
 	};
 	return state;
@@ -514,22 +514,16 @@ function isClaudeFamilyModel(model: Model<"anthropic-messages">): boolean {
 	return shortId.toLowerCase().startsWith("claude-");
 }
 
-/**
- * How many breakpoints we are still willing to generate after a gateway has
- * rejected a previous attempt. `explicit` mode normally emits two (a reusable
- * prefix anchor on the last assistant turn plus a refresh point on the current
- * user turn), so stepping down to one still caches the prefix, and only the
- * final step gives caching up entirely.
- */
-type GeneratedCacheBudget = 2 | 1 | 0;
-
 function getCacheControl(
 	model: Model<"anthropic-messages">,
 	baseUrl: string,
 	cacheRetention?: CacheRetention,
-	generatedCacheBudget: GeneratedCacheBudget = 2,
+	suppressGeneratedCaching = false,
 ): { mode: AnthropicCacheMode; cacheControl?: AnthropicCacheControl } {
-	if (generatedCacheBudget === 0) return { mode: "none" };
+	// A gateway already at Anthropic's four-breakpoint limit rejected our
+	// generated marker on a previous attempt. The extra markers are invisible
+	// here, so the only safe retry is to add none of our own.
+	if (suppressGeneratedCaching) return { mode: "none" };
 	const retention = resolveCacheRetention(cacheRetention ?? model.cacheRetention, "long");
 	if (retention === "none") return { mode: "none" };
 
@@ -1451,7 +1445,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			let droppedForcedToolChoice = false;
 			let repairLatestAssistantThinking = false;
 			let repairAllAssistantThinking = false;
-			let generatedCacheBudget: GeneratedCacheBudget = providerSessionState?.generatedCacheBudget ?? 2;
+			let suppressGeneratedCaching = providerSessionState?.generatedCachingDisabled ?? false;
 			const prepareParams = async (): Promise<MessageCreateParamsStreaming> => {
 				// Degradation state is cumulative: every fallback rebuild must merge all
 				// repairs activated so far. Rebuilding from only the immediate call lets
@@ -1466,7 +1460,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					options,
 					disableStrictTools,
 					{ repairLatestAssistantThinking, repairAllAssistantThinking },
-					generatedCacheBudget,
+					suppressGeneratedCaching,
 				);
 				if (droppedForcedToolChoice) {
 					delete nextParams.tool_choice;
@@ -1982,27 +1976,22 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					}
 					if (
 						!options?.fallbackManaged &&
-						generatedCacheBudget > 0 &&
+						!suppressGeneratedCaching &&
 						firstTokenTime === undefined &&
 						isAnthropicCacheBreakpointOverflowError(streamFailure)
 					) {
 						// The gateway's own markers already fill Anthropic's four slots, so
-						// one of ours is the fifth. We cannot see the others, which makes the
-						// rejection the only usable signal — and it says "too many", not
-						// "none allowed". So give up one breakpoint at a time instead of all
-						// caching at once: an endpoint that leaves a single slot free keeps
-						// caching the conversation prefix, which is the marker that matters.
-						const nextBudget: GeneratedCacheBudget = generatedCacheBudget === 2 ? 1 : 0;
-						logger.debug("anthropic: cache breakpoint limit exceeded, reducing generated breakpoints", {
+						// our generated breakpoint is the fifth. We cannot see the others,
+						// which makes the rejection itself the only usable signal; retry
+						// once with generated caching off and keep it off for the session.
+						logger.debug("anthropic: cache breakpoint limit exceeded, retrying without generated caching", {
 							model: model.id,
-							from: generatedCacheBudget,
-							to: nextBudget,
 							error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
 						});
 						if (providerSessionState) {
-							providerSessionState.generatedCacheBudget = nextBudget;
+							providerSessionState.generatedCachingDisabled = true;
 						}
-						generatedCacheBudget = nextBudget;
+						suppressGeneratedCaching = true;
 						params = await prepareParams();
 						providerRetryAttempt = 0;
 						resetOutputForRetry();
@@ -2399,12 +2388,7 @@ function isHumanUserMessage(message: MessageCreateParamsStreaming["messages"][nu
 	return message.content.some(block => block.type !== "tool_result");
 }
 
-function applyExplicitPromptCaching(
-	params: AnthropicCacheParams,
-	cacheControl: AnthropicCacheControl,
-	budget: GeneratedCacheBudget,
-): void {
-	if (budget === 0) return;
+function applyExplicitPromptCaching(params: AnthropicCacheParams, cacheControl: AnthropicCacheControl): void {
 	if (countCacheControlBreakpoints(params) >= 4) return;
 
 	const currentUserIndex = params.messages.findLastIndex(isHumanUserMessage);
@@ -2416,13 +2400,6 @@ function applyExplicitPromptCaching(
 	// assistant tool-use turn immediately before them. Anchor the latest completed
 	// assistant turn so the reusable prefix advances during an agent tool loop,
 	// while keeping the newest tool output outside the cache boundary.
-	//
-	// This anchor is the higher-value marker of the two: it covers the whole
-	// conversation prefix, so a reduced budget is spent here first. It only
-	// consumes budget when a marker is actually placed — on a first turn there is
-	// no assistant message yet, and the reduced budget must still reach the
-	// current-turn marker below rather than emitting nothing at all.
-	let remaining: number = budget;
 	for (let index = params.messages.length - 1; index >= 0; index--) {
 		const message = params.messages[index];
 		if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
@@ -2432,12 +2409,10 @@ function applyExplicitPromptCaching(
 				cacheControl,
 			)
 		) {
-			remaining -= 1;
 			break;
 		}
 	}
 
-	if (remaining < 1) return;
 	if (countCacheControlBreakpoints(params) >= 4) return;
 	if (typeof currentUser.content === "string" && currentUser.content.trim()) {
 		currentUser.content = [{ type: "text", text: currentUser.content, cache_control: { ...cacheControl } }];
@@ -2453,17 +2428,14 @@ function applyPromptCaching(
 	params: AnthropicCacheParams,
 	cacheMode: AnthropicCacheMode,
 	cacheControl?: AnthropicCacheControl,
-	budget: GeneratedCacheBudget = 2,
 ): void {
-	if (!cacheControl || cacheMode === "none" || budget === 0) return;
+	if (!cacheControl || cacheMode === "none") return;
 	validateCacheControls(params);
 	if (cacheMode === "automatic") {
-		// Automatic mode only ever emits one marker, so any non-zero budget
-		// covers it; the zero case already returned above.
 		params.cache_control = { ...cacheControl };
 		return;
 	}
-	applyExplicitPromptCaching(params, cacheControl, budget);
+	applyExplicitPromptCaching(params, cacheControl);
 	validateCacheControls(params);
 }
 
@@ -2497,13 +2469,13 @@ function buildParams(
 	options?: AnthropicOptions,
 	disableStrictTools = false,
 	thinkingRepair?: { repairLatestAssistantThinking?: boolean; repairAllAssistantThinking?: boolean },
-	generatedCacheBudget: GeneratedCacheBudget = 2,
+	suppressGeneratedCaching = false,
 ): MessageCreateParamsStreaming {
 	const { mode: cacheMode, cacheControl } = getCacheControl(
 		model,
 		baseUrl,
 		options?.cacheRetention,
-		generatedCacheBudget,
+		suppressGeneratedCaching,
 	);
 
 	const params: AnthropicSamplingParams = {
@@ -2647,7 +2619,7 @@ function buildParams(
 		params.system = systemBlocks;
 	}
 	ensureMaxTokensForThinking(params, model);
-	applyPromptCaching(params as AnthropicCacheParams, cacheMode, cacheControl, generatedCacheBudget);
+	applyPromptCaching(params as AnthropicCacheParams, cacheMode, cacheControl);
 	enforceCacheControlLimit(params, 4);
 	normalizeCacheControlTtlOrdering(params);
 

@@ -1,26 +1,17 @@
-import type { invalidateFsScanCache as invalidateFsScanCacheFn } from "@gajae-code/natives";
-
-let nativeInvalidateFsScanCache: typeof invalidateFsScanCacheFn | undefined;
-
-function invalidateFsScanCacheNative(path: string): void {
-	nativeInvalidateFsScanCache ??= (
-		require("@gajae-code/natives") as { invalidateFsScanCache: typeof invalidateFsScanCacheFn }
-	).invalidateFsScanCache;
-	nativeInvalidateFsScanCache(path);
-}
+import { invalidateFsScanCache } from "@gajae-code/natives";
 
 /**
  * Invalidate shared filesystem scan caches after a content write/update.
  */
 export function invalidateFsScanAfterWrite(path: string): void {
-	invalidateFsScanCacheNative(path);
+	invalidateFsScanCache(path);
 }
 
 /**
  * Invalidate shared filesystem scan caches after deleting a file.
  */
 export function invalidateFsScanAfterDelete(path: string): void {
-	invalidateFsScanCacheNative(path);
+	invalidateFsScanCache(path);
 }
 
 /**
@@ -30,8 +21,8 @@ export function invalidateFsScanAfterDelete(path: string): void {
  * appearance at the new one. Bust both to keep callers honest.
  */
 export function invalidateFsScanAfterRename(oldPath: string, newPath: string): void {
-	invalidateFsScanCacheNative(oldPath);
+	invalidateFsScanCache(oldPath);
 	if (newPath !== oldPath) {
-		invalidateFsScanCacheNative(newPath);
+		invalidateFsScanCache(newPath);
 	}
 }

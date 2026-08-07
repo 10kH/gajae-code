@@ -3,7 +3,7 @@
  *
  * Types for the Exa MCP client and tool implementations.
  */
-import type { TSchema } from "@gajae-code/ai/core";
+import type { TSchema } from "@gajae-code/ai";
 
 /** MCP endpoint URLs */
 export const EXA_MCP_URL = "https://mcp.exa.ai/mcp";

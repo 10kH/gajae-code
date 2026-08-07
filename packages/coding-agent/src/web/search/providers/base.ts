@@ -1,4 +1,4 @@
-import type { AuthStorage } from "@gajae-code/ai/core";
+import type { AuthStorage } from "@gajae-code/ai";
 import type { ActiveSearchModelContext, SearchProviderId, SearchResponse } from "../types";
 
 /**

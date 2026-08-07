@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDbPath, getAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
-import { type ModelsConfig, ModelsConfigSchema, type ProviderDiscovery } from "../config/models-config-schema";
+import { type ModelsConfig, ModelsConfigSchema } from "../config/models-config-schema";
 import { compareRankedProviders, famousProviderIndex } from "../config/provider-ranking";
 import { AuthStorage } from "../session/auth-storage";
 import providerPresets from "./provider-presets.json";
@@ -49,10 +49,9 @@ interface ProviderPreset {
 	providerId: string;
 	baseUrl: string;
 	apiKeyEnv: string;
-	models?: readonly string[];
+	models: readonly string[];
 	modelApi?: Readonly<Record<string, ProviderSetupApi>>;
 	compat?: ProviderCompatConfig;
-	discovery?: ProviderDiscovery;
 }
 
 const PROVIDER_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
@@ -133,7 +132,6 @@ function resolvePresetInput(input: ProviderSetupInput): {
 	modelApi?: Readonly<Record<string, ProviderSetupApi>>;
 	api: ProviderSetupApi;
 	compat?: ProviderCompatConfig;
-	discovery?: ProviderDiscovery;
 } {
 	const preset = input.preset ? findProviderPreset(input.preset) : undefined;
 	if (input.preset && !preset) {
@@ -150,10 +148,8 @@ function resolvePresetInput(input: ProviderSetupInput): {
 		);
 	}
 	if (preset && input.models && input.models.length > 0) {
-		const catalogMode =
-			preset.models && preset.models.length > 0 ? "uses fixed model ids" : "discovers models automatically";
 		throw new Error(
-			`Provider preset '${preset.id}' ${catalogMode}; omit --model or use --compat openai for a custom provider.`,
+			`Provider preset '${preset.id}' uses fixed model ids; omit --model or use --compat openai for a custom provider.`,
 		);
 	}
 	if (preset && input.apiKeyEnv !== undefined && input.apiKeyEnv.trim() !== preset.apiKeyEnv) {
@@ -176,7 +172,6 @@ function resolvePresetInput(input: ProviderSetupInput): {
 		modelApi: preset?.modelApi,
 		api: preset?.api ?? apiForCompatibility(compatibility),
 		compat: preset?.compat,
-		discovery: preset?.discovery,
 	};
 }
 
@@ -210,7 +205,6 @@ function validateSetupInput(input: ProviderSetupInput): {
 	api: ProviderSetupApi;
 	compat?: ProviderCompatConfig;
 	modelApi?: Readonly<Record<string, ProviderSetupApi>>;
-	discovery?: ProviderDiscovery;
 	preset?: ProviderPreset;
 } {
 	const resolved = resolvePresetInput(input);
@@ -245,8 +239,7 @@ function validateSetupInput(input: ProviderSetupInput): {
 	if (!apiKey) throw new Error("API key is required.");
 
 	const models = parseModelList(resolved.models);
-	if (models.length === 0 && !resolved.discovery)
-		throw new Error("At least one model id or model discovery is required.");
+	if (models.length === 0) throw new Error("At least one model id is required.");
 	validateModelApi(resolved.modelApi, models, resolved.preset?.id ?? resolved.providerId);
 
 	return {
@@ -259,7 +252,6 @@ function validateSetupInput(input: ProviderSetupInput): {
 		api: resolved.api,
 		modelApi: resolved.modelApi,
 		compat: resolved.compat,
-		discovery: resolved.discovery,
 		preset: resolved.preset,
 	};
 }
@@ -324,17 +316,12 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 		baseUrl: validated.baseUrl,
 		api: validated.api,
 		auth: "apiKey",
-		...(validated.models.length > 0
-			? {
-					models: validated.models.map(id => {
-						const api = validated.modelApi?.[id];
-						return api ? { id, api } : { id };
-					}),
-				}
-			: {}),
+		models: validated.models.map(id => {
+			const api = validated.modelApi?.[id];
+			return api ? { id, api } : { id };
+		}),
 	};
 	if (validated.compat) provider.compat = validated.compat;
-	if (validated.discovery) provider.discovery = validated.discovery;
 	if (validated.credentialSource === "env") {
 		provider.apiKeyEnv = validated.apiKey;
 	} else {
@@ -382,7 +369,7 @@ export function formatProviderSetupResult(result: ProviderSetupResult): string {
 	return [
 		`Provider '${result.providerId}' configured as ${result.compatibility}-compatible.`,
 		...(result.presetName ? [`Preset: ${result.presetName}`] : []),
-		`Models: ${result.modelIds.length > 0 ? result.modelIds.join(", ") : "discovered automatically"}`,
+		`Models: ${result.modelIds.join(", ")}`,
 		`Base URL: ${result.baseUrl}`,
 		`API key: ${result.credentialSource === "env" ? `${result.redactedApiKey} (environment variable)` : result.redactedApiKey}`,
 		`Config: ${result.modelsPath}`,

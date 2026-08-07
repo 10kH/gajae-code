@@ -58,7 +58,7 @@ export interface MCPAuthConfig {
 }
 
 /** Base server config with shared options */
-export interface MCPServerConfigBase {
+interface MCPServerConfigBase {
 	/** Whether this server is enabled (default: true) */
 	enabled?: boolean;
 	/**
@@ -70,8 +70,6 @@ export interface MCPServerConfigBase {
 	autoload?: boolean;
 	/** Connection timeout in milliseconds (default: 30000) */
 	timeout?: number;
-	/** Pool identity mode. W2 defaults to one physical connection per session. */
-	sharing?: "per-session" | "shared";
 	/** Authentication configuration (optional) */
 	auth?: MCPAuthConfig;
 	/** OAuth configuration for servers requiring explicit client credentials */
@@ -240,8 +238,6 @@ export class MCPExpectedFailure extends Error {
 export interface MCPRequestOptions {
 	/** Abort signal (e.g. Escape-to-interrupt) */
 	signal?: AbortSignal;
-	/** Shared lease policy: never retry the original request after transport/auth failure. */
-	noReplay?: boolean;
 }
 
 /** Transport interface - abstracts stdio/http */

@@ -131,7 +131,7 @@ import {
 	setPreferredSearchProvider,
 	setSearchFallbackProviders,
 	setSearchHardTimeoutMs,
-} from "../../tools/implementations";
+} from "../../tools";
 import { copyToClipboard } from "../../utils/clipboard";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { AgentDashboard } from "../components/agent-dashboard";
@@ -1843,8 +1843,8 @@ export class SelectorController {
 			return { component: selector, focus: selector.getSelectList() };
 		});
 	}
-	async showHistorySearch(): Promise<void> {
-		const historyStorage = await this.ctx.ensureHistoryStorage();
+	showHistorySearch(): void {
+		const historyStorage = this.ctx.historyStorage;
 		if (!historyStorage) return;
 
 		this.showSelector(done => {

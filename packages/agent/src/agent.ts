@@ -980,14 +980,7 @@ export class Agent {
 		this.#contextRevision++;
 	}
 
-	replaceMessages(
-		ms: AgentMessage[],
-		options?: { historyRewrite?: { reason: string; preserveSeededPrefix?: boolean } },
-	) {
-		const rewrite = options?.historyRewrite;
-		if (rewrite && this.#appendOnlyContext) {
-			this.#appendOnlyContext.releaseAfterHistoryRewrite({ preserveSeededPrefix: rewrite.preserveSeededPrefix });
-		}
+	replaceMessages(ms: AgentMessage[]) {
 		this.#state.messages = ms.slice();
 		this.#contextRevision++;
 	}

@@ -25,15 +25,6 @@ export interface SkillFrontmatter {
 }
 
 /**
- * Metadata-only skill handle. Callers must opt in to reading the body through
- * `loadContent`; discovery never loads the body while building this metadata.
- */
-export interface SkillDescriptor {
-	readonly metadata: Omit<Skill, "content" | "loadContent">;
-	readonly loadContent: () => Promise<string>;
-}
-
-/**
  * A skill that provides specialized knowledge or workflows.
  */
 export interface Skill {
@@ -42,9 +33,7 @@ export interface Skill {
 	/** Absolute path to skill file */
 	path: string;
 	/** Skill content (markdown) */
-	/** Lazily load the markdown body when the caller needs prompt content. */
-	loadContent?: () => Promise<string>;
-	content?: string;
+	content: string;
 	/** Parsed frontmatter */
 	frontmatter?: SkillFrontmatter;
 	/** Source level */

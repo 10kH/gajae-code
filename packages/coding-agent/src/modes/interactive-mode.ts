@@ -1,6 +1,6 @@
 import { type Agent, type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import type { CompactionOutcome } from "@gajae-code/agent-core/compaction";
-import type { AssistantMessage, ImageContent, Message, UsageReport } from "@gajae-code/ai/core";
+import type { AssistantMessage, ImageContent, Message, UsageReport } from "@gajae-code/ai";
 import type { Component, EditorTheme, SlashCommand } from "@gajae-code/tui";
 import {
 	Container,
@@ -43,7 +43,7 @@ import {
 } from "../reminders/star-reminder";
 import type { NotificationSessionReconcileResult, NotificationSessionStatus } from "../sdk/bus/session-control";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
-import type { HistoryStorage } from "../session/history-storage";
+import { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
 import { getRecentSessions, getSessionMessageEntryId } from "../session/session-manager";
 import type { LspStartupServerInfo } from "../tools";
@@ -92,7 +92,7 @@ import { ModeGate } from "./controllers/mode-gate";
 import { PlanModeController } from "./controllers/plan-mode-controller";
 import { SelectorController } from "./controllers/selector-controller";
 import { SSHCommandController } from "./controllers/ssh-command-controller";
-import type { SttModeController } from "./controllers/stt-controller";
+import { SttModeController } from "./controllers/stt-controller";
 import { TodoCommandController } from "./controllers/todo-command-controller";
 import { IrcObservationLedger } from "./irc-observation-ledger";
 import { JobsObserver } from "./jobs-observer";
@@ -336,23 +336,6 @@ export function selectShutdownDraft(editorText: string, hasActiveBtw: boolean): 
 	return hasActiveBtw ? "" : editorText;
 }
 
-export async function ensureSttControllerForToggle(
-	current: () => SttModeController | undefined,
-	assign: (controller: SttModeController) => void,
-	load: () => Promise<() => SttModeController> = async () => {
-		const { SttModeController } = await import("./controllers/stt-controller");
-		return () => new SttModeController();
-	},
-): Promise<SttModeController> {
-	const existing = current();
-	if (existing) return existing;
-	const create = await load();
-	const winner = current();
-	if (winner) return winner;
-	const created = create();
-	assign(created);
-	return created;
-}
 export class InteractiveMode implements InteractiveModeContext {
 	session: AgentSession;
 	sessionManager: SessionManager;
@@ -360,7 +343,6 @@ export class InteractiveMode implements InteractiveModeContext {
 	keybindings: KeybindingsManager;
 	agent: Agent;
 	historyStorage?: HistoryStorage;
-	#historyStorageLoad?: Promise<HistoryStorage | undefined>;
 	readonly ircLedger = new IrcObservationLedger();
 
 	ui: TUI;
@@ -645,7 +627,12 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.ui.requestResizeRender();
 		};
 		process.stdout.on("resize", this.#resizeHandler);
-		this.editor.setHistoryStorageLoader(() => this.ensureHistoryStorage());
+		try {
+			this.historyStorage = HistoryStorage.open();
+			this.editor.setHistoryStorage(this.historyStorage);
+		} catch (error) {
+			logger.warn("History storage unavailable", { error: String(error) });
+		}
 		this.hookWidgetContainerAbove = new Container();
 		this.hookWidgetContainerBelow = new Container();
 		this.editorContainer = new Container();
@@ -987,14 +974,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			onTerminalAppearanceChange(mode);
 		});
 
-		// Set up git branch watcher only when enabled. Branch data remains available
-		// through the status line's on-demand resolver when watching is disabled.
-		if (this.settings.get("statusLine.watchGitHead")) {
-			this.statusLine.watchBranch(() => {
-				this.updateEditorChrome();
-				this.ui.requestRender();
-			});
-		}
+		// Set up git branch watcher
+		this.statusLine.watchBranch(() => {
+			this.updateEditorChrome();
+			this.ui.requestRender();
+		});
 
 		// Initial top border update
 		this.updateEditorChrome();
@@ -1002,25 +986,6 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	getSlashCommands(): readonly SlashCommand[] {
 		return this.#resolvedSlashCommands;
-	}
-
-	async ensureHistoryStorage(): Promise<HistoryStorage | undefined> {
-		if (this.historyStorage) return this.historyStorage;
-		if (this.settings.get("history.enabled") === false) return undefined;
-		if (!this.#historyStorageLoad) {
-			this.#historyStorageLoad = import("../session/history-storage")
-				.then(({ HistoryStorage }) => HistoryStorage.openAsync())
-				.then(storage => {
-					this.historyStorage = storage;
-					if (!this.#stopped) this.editor.setHistoryStorage(storage);
-					return storage;
-				})
-				.catch(error => {
-					logger.warn("History storage unavailable", { error: String(error) });
-					return undefined;
-				});
-		}
-		return await this.#historyStorageLoad;
 	}
 
 	/** Reload slash commands and autocomplete for the provided working directory. */
@@ -1632,7 +1597,6 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.ui.requestRender();
 		};
 		nextEditor.setMaxHeight(this.#computeEditorMaxHeight());
-		nextEditor.setHistoryStorageLoader(() => this.ensureHistoryStorage());
 		if (this.historyStorage) {
 			nextEditor.setHistoryStorage(this.historyStorage);
 		}
@@ -2025,13 +1989,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.showWarning("Speech-to-text is disabled. Enable it in settings: stt.enabled");
 			return;
 		}
-		const sttController = await ensureSttControllerForToggle(
-			() => this.#sttController,
-			controller => {
-				this.#sttController = controller;
-			},
-		);
-		await sttController.toggle(this);
+		this.#sttController ??= new SttModeController();
+		await this.#sttController.toggle(this);
 	}
 
 	showDebugSelector(): void {
@@ -2237,8 +2196,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#selectorController.showPetSelector();
 	}
 
-	async showHistorySearch(): Promise<void> {
-		await this.#selectorController.showHistorySearch();
+	showHistorySearch(): void {
+		this.#selectorController.showHistorySearch();
 	}
 
 	showExtensionsDashboard(): void {

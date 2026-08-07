@@ -1,17 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { InternalUrlRouter } from "../../src/internal-urls";
 import { McpProtocolHandler } from "../../src/internal-urls/mcp-protocol";
-import { parseInternalUrl } from "../../src/internal-urls/parse";
 import { MCPManager } from "../../src/runtime-mcp/manager";
 import type { MCPResource, MCPResourceReadResult, MCPResourceTemplate } from "../../src/runtime-mcp/types";
 
-let scopedManager: MCPManager | undefined;
-function scopedRouter(manager: MCPManager | undefined = scopedManager): Pick<InternalUrlRouter, "resolve"> {
-	const router = InternalUrlRouter.instance();
-	return {
-		resolve: (input, context) => router.resolve(input, { ...context, mcpManager: context?.mcpManager ?? manager }),
-	};
-}
 function createMockManager(opts: {
 	servers?: string[];
 	resources?: Map<string, { resources: MCPResource[]; templates: MCPResourceTemplate[] }>;
@@ -28,24 +20,25 @@ function createMockManager(opts: {
 	} as unknown as MCPManager;
 }
 
-function setTemplateManager(templates: string[], text = "matched"): Pick<InternalUrlRouter, "resolve"> {
+function setTemplateManager(templates: string[], text = "matched"): InternalUrlRouter {
 	const resources = new Map<string, { resources: MCPResource[]; templates: MCPResourceTemplate[] }>();
 	resources.set("template-server", {
 		resources: [],
 		templates: templates.map((uriTemplate, index) => ({ uriTemplate, name: `template-${index}` })),
 	});
-	const manager = createMockManager({
-		servers: ["template-server"],
-		resources,
-		readResult: { contents: [{ uri: "test://result", text }] },
-	});
-	return scopedRouter(manager);
+	MCPManager.setInstance(
+		createMockManager({
+			servers: ["template-server"],
+			resources,
+			readResult: { contents: [{ uri: "test://result", text }] },
+		}),
+	);
+	return InternalUrlRouter.instance();
 }
 
 describe("McpProtocolHandler", () => {
 	beforeEach(() => {
 		MCPManager.resetForTests();
-		scopedManager = undefined;
 		InternalUrlRouter.resetForTests();
 		InternalUrlRouter.instance().register(new McpProtocolHandler());
 	});
@@ -53,42 +46,17 @@ describe("McpProtocolHandler", () => {
 	afterEach(() => {
 		MCPManager.resetForTests();
 		InternalUrlRouter.resetForTests();
-		vi.restoreAllMocks();
 	});
 
 	it("returns error when no MCP manager is available", async () => {
-		const router = scopedRouter();
+		const router = InternalUrlRouter.instance();
 		await expect(router.resolve("mcp://test://resource")).rejects.toThrow("No MCP manager");
-	});
-
-	it("uses the scope-held manager without consulting MCPManager.instance()", async () => {
-		const resources = new Map<string, { resources: MCPResource[]; templates: MCPResourceTemplate[] }>();
-		resources.set("scoped", { resources: [{ uri: "test://scoped", name: "scoped" }], templates: [] });
-		const manager = createMockManager({
-			servers: ["scoped"],
-			resources,
-			readResult: { contents: [{ uri: "test://scoped", text: "scope" }] },
-		});
-		const instanceSpy = vi.spyOn(MCPManager, "instance").mockImplementation(() => {
-			throw new Error("process-global MCPManager.instance() must not route mcp://");
-		});
-		try {
-			const resource = await InternalUrlRouter.instance().resolve("mcp://test://scoped", { mcpManager: manager });
-			expect(resource.content).toBe("scope");
-		} finally {
-			instanceSpy.mockRestore();
-		}
-	});
-
-	it("rejects omitted context even when a process-global manager is populated", async () => {
-		MCPManager.setInstance(createMockManager({ servers: ["populated"] }));
-		const handler = new McpProtocolHandler();
-		await expect(handler.resolve(parseInternalUrl("mcp://test://resource"))).rejects.toThrow("No MCP manager");
 	});
 
 	it("requires resource URI in mcp URL", async () => {
 		const manager = createMockManager({ servers: ["server-a"] });
-		const router = scopedRouter(manager);
+		MCPManager.setInstance(manager);
+		const router = InternalUrlRouter.instance();
 		await expect(router.resolve("mcp://")).rejects.toThrow("mcp:// URL requires a resource URI");
 	});
 
@@ -99,7 +67,8 @@ describe("McpProtocolHandler", () => {
 			templates: [],
 		});
 		const manager = createMockManager({ servers: ["server-a"], resources });
-		const router = scopedRouter(manager);
+		MCPManager.setInstance(manager);
+		const router = InternalUrlRouter.instance();
 
 		await expect(router.resolve("mcp://test://missing")).rejects.toThrow("No MCP server has resource");
 		await expect(router.resolve("mcp://test://missing")).rejects.toThrow("file://known");
@@ -117,7 +86,8 @@ describe("McpProtocolHandler", () => {
 			resources,
 			readResult: { contents: [{ uri: "test://doc", text: "hello world" }] },
 		});
-		const router = scopedRouter(manager);
+		MCPManager.setInstance(manager);
+		const router = InternalUrlRouter.instance();
 
 		const resource = await router.resolve("mcp://test://doc");
 		expect(resource.content).toBe("hello world");
@@ -135,7 +105,8 @@ describe("McpProtocolHandler", () => {
 			resources,
 			readResult: { contents: [{ uri: "test://doc?q=1", text: "query resource" }] },
 		});
-		const router = scopedRouter(manager);
+		MCPManager.setInstance(manager);
+		const router = InternalUrlRouter.instance();
 
 		const resource = await router.resolve("mcp://test://doc?q=1");
 		expect(resource.content).toBe("query resource");
@@ -152,7 +123,8 @@ describe("McpProtocolHandler", () => {
 			resources,
 			readResult: { contents: [{ uri: "test://docs/foo/raw", text: "from template" }] },
 		});
-		const router = scopedRouter(manager);
+		MCPManager.setInstance(manager);
+		const router = InternalUrlRouter.instance();
 
 		const resource = await router.resolve("mcp://test://docs/foo/raw");
 		expect(resource.content).toBe("from template");
@@ -169,7 +141,8 @@ describe("McpProtocolHandler", () => {
 			resources,
 			readResult: { contents: [{ uri: "test://docs", text: "empty expansion" }] },
 		});
-		const router = scopedRouter(manager);
+		MCPManager.setInstance(manager);
+		const router = InternalUrlRouter.instance();
 
 		const resource = await router.resolve("mcp://test://docs");
 		expect(resource.content).toBe("empty expansion");
@@ -278,7 +251,8 @@ describe("McpProtocolHandler", () => {
 			resources,
 			readResult: { contents: [{ uri: "test://foo/123", text: "from specific" }] },
 		});
-		const router = scopedRouter(manager);
+		MCPManager.setInstance(manager);
+		const router = InternalUrlRouter.instance();
 
 		const resource = await router.resolve("mcp://test://foo/123");
 		expect(resource.notes).toEqual(["MCP server: specific-server"]);
@@ -299,7 +273,8 @@ describe("McpProtocolHandler", () => {
 			resources,
 			readResult: { contents: [{ uri: "test://foo", text: "from first" }] },
 		});
-		const router = scopedRouter(manager);
+		MCPManager.setInstance(manager);
+		const router = InternalUrlRouter.instance();
 
 		const resource = await router.resolve("mcp://test://foo");
 		expect(resource.notes).toEqual(["MCP server: first"]);
@@ -312,7 +287,8 @@ describe("McpProtocolHandler", () => {
 			templates: [{ uriTemplate: "testing://{id}", name: "testing-template" }],
 		});
 		const manager = createMockManager({ servers: ["tmpl-server"], resources });
-		const router = scopedRouter(manager);
+		MCPManager.setInstance(manager);
+		const router = InternalUrlRouter.instance();
 
 		await expect(router.resolve("mcp://test://foo")).rejects.toThrow("No MCP server has resource");
 	});
@@ -328,7 +304,8 @@ describe("McpProtocolHandler", () => {
 			resources,
 			readResult: undefined,
 		});
-		const router = scopedRouter(manager);
+		MCPManager.setInstance(manager);
+		const router = InternalUrlRouter.instance();
 
 		await expect(router.resolve("mcp://test://empty")).rejects.toThrow("returned no content");
 		await expect(router.resolve("mcp://test://empty")).rejects.toThrow("null-server");
@@ -348,7 +325,8 @@ describe("McpProtocolHandler", () => {
 				contents: [{ uri: "test://image", mimeType: "image/png", blob: blobData }],
 			},
 		});
-		const router = scopedRouter(manager);
+		MCPManager.setInstance(manager);
+		const router = InternalUrlRouter.instance();
 
 		const resource = await router.resolve("mcp://test://image");
 		expect(resource.content).toContain("[Binary content:");
@@ -372,7 +350,8 @@ describe("McpProtocolHandler", () => {
 				],
 			},
 		});
-		const router = scopedRouter(manager);
+		MCPManager.setInstance(manager);
+		const router = InternalUrlRouter.instance();
 
 		const resource = await router.resolve("mcp://test://mixed");
 		expect(resource.content).toContain("part one");
@@ -393,7 +372,8 @@ describe("McpProtocolHandler", () => {
 				contents: [{ uri: "test://blank" }],
 			},
 		});
-		const router = scopedRouter(manager);
+		MCPManager.setInstance(manager);
+		const router = InternalUrlRouter.instance();
 
 		const resource = await router.resolve("mcp://test://blank");
 		expect(resource.content).toBe("(empty resource)");
@@ -410,7 +390,8 @@ describe("McpProtocolHandler", () => {
 			resources,
 			readError: new Error("connection refused"),
 		});
-		const router = scopedRouter(manager);
+		MCPManager.setInstance(manager);
+		const router = InternalUrlRouter.instance();
 
 		await expect(router.resolve("mcp://test://fail")).rejects.toThrow("MCP resource read error:");
 		await expect(router.resolve("mcp://test://fail")).rejects.toThrow("connection refused");
@@ -431,7 +412,8 @@ describe("McpProtocolHandler", () => {
 			resources,
 			readResult: { contents: [{ uri: "test://shared", text: "from first" }] },
 		});
-		const router = scopedRouter(manager);
+		MCPManager.setInstance(manager);
+		const router = InternalUrlRouter.instance();
 
 		const resource = await router.resolve("mcp://test://shared");
 		expect(resource.notes).toEqual(["MCP server: first"]);
@@ -439,7 +421,8 @@ describe("McpProtocolHandler", () => {
 
 	it("shows (none) when no servers have any resources", async () => {
 		const manager = createMockManager({ servers: ["lonely-server"] });
-		const router = scopedRouter(manager);
+		MCPManager.setInstance(manager);
+		const router = InternalUrlRouter.instance();
 
 		await expect(router.resolve("mcp://test://anything")).rejects.toThrow("(none)");
 	});
@@ -457,7 +440,8 @@ describe("McpProtocolHandler", () => {
 				contents: [{ uri: "test://bin", blob: "data" }],
 			},
 		});
-		const router = scopedRouter(manager);
+		MCPManager.setInstance(manager);
+		const router = InternalUrlRouter.instance();
 
 		const resource = await router.resolve("mcp://test://bin");
 		expect(resource.content).toContain("[Binary content: unknown,");

@@ -134,11 +134,10 @@ interface ToolStart {
  * {@link resolveTelemetry}; cost is one allocation per `agentLoop` call.
  *
  * Methods are intentionally non-throwing — telemetry must never turn a
- * successful agent run into a failed one. Span state is kept on live spans for
- * span-enabled runs; spanless pending records use private pending queues. If
- * a finish path is somehow reached without a matching begin (provider crash,
- * tracer swap mid-run), the corresponding record is still emitted with
- * `latencyMs: 0` rather than throwing.
+ * successful agent run into a failed one. WeakMap keys keep span-state
+ * lookups bounded; if a finish path is somehow reached without a matching
+ * begin (provider crash, tracer swap mid-run), the corresponding record is
+ * still emitted with `latencyMs: 0` rather than throwing.
  */
 const kChatStart = Symbol("agent.run-collector.chatStart");
 const kToolStart = Symbol("agent.run-collector.toolStart");
@@ -152,8 +151,6 @@ export class AgentRunCollector {
 	readonly #invokedTools = new Set<string>();
 	readonly #modelsUsed = new Set<string>();
 	readonly #providersUsed = new Set<string>();
-	readonly #spanlessChatStarts: ChatStart[] = [];
-	readonly #spanlessToolStarts = new Map<string, ToolStart[]>();
 	#runEnded = false;
 
 	/** True once `markRunEnded()` has been called for this invocation. */
@@ -191,23 +188,8 @@ export class AgentRunCollector {
 			model: init.model.id,
 			provider,
 		};
-		this.#noteChatModel(init.model.id, provider);
-	}
-
-	/** Begin a chat record without allocating or mutating an OTEL span. */
-	beginChatWithoutSpan(init: {
-		readonly stepNumber: number;
-		readonly model: Model;
-		readonly provider?: string;
-	}): void {
-		const provider = init.provider ?? init.model.provider;
-		this.#spanlessChatStarts.push({
-			stepNumber: init.stepNumber,
-			startedAtMs: performance.now(),
-			model: init.model.id,
-			provider,
-		});
-		this.#noteChatModel(init.model.id, provider);
+		this.#modelsUsed.add(init.model.id);
+		if (provider) this.#providersUsed.add(provider);
 	}
 
 	endChat(
@@ -220,60 +202,6 @@ export class AgentRunCollector {
 	): void {
 		const start = (span as SpanWithChatStart)[kChatStart];
 		(span as SpanWithChatStart)[kChatStart] = undefined;
-		this.#recordChat(start, message, fields);
-	}
-
-	/** Finish a chat record without allocating or mutating an OTEL span. */
-	endChatWithoutSpan(
-		stepNumber: number | undefined,
-		message: AssistantMessage,
-		fields: {
-			readonly costUsd: number | undefined;
-			readonly costUnavailableReason: string | undefined;
-		},
-	): void {
-		this.#recordChat(this.#takeSpanlessChatStart(stepNumber), message, fields);
-	}
-
-	/**
-	 * Stamp the chat span as failed without a finalized AssistantMessage. Used
-	 * by the `catch` arm of `streamAssistantResponse` so error chats still
-	 * appear in the run summary.
-	 */
-	failChat(span: Span, fields: { readonly errorType: string }): void {
-		const start = (span as SpanWithChatStart)[kChatStart];
-		(span as SpanWithChatStart)[kChatStart] = undefined;
-		this.#recordFailedChat(start, fields.errorType);
-	}
-
-	/** Record a failed chat without allocating or mutating an OTEL span. */
-	failChatWithoutSpan(stepNumber: number | undefined, fields: { readonly errorType: string }): void {
-		this.#recordFailedChat(this.#takeSpanlessChatStart(stepNumber), fields.errorType);
-	}
-
-	#noteChatModel(model: string, provider: string | undefined): void {
-		this.#modelsUsed.add(model);
-		if (provider) this.#providersUsed.add(provider);
-	}
-
-	#takeSpanlessChatStart(stepNumber: number | undefined): ChatStart | undefined {
-		for (let index = this.#spanlessChatStarts.length - 1; index >= 0; index -= 1) {
-			const start = this.#spanlessChatStarts[index];
-			if (stepNumber !== undefined && start.stepNumber !== stepNumber) continue;
-			this.#spanlessChatStarts.splice(index, 1);
-			return start;
-		}
-		return undefined;
-	}
-
-	#recordChat(
-		start: ChatStart | undefined,
-		message: AssistantMessage,
-		fields: {
-			readonly costUsd: number | undefined;
-			readonly costUnavailableReason: string | undefined;
-		},
-	): void {
 		const usage = message.usage;
 		// Public surface: `inputTokens` is the total cost-bearing input the
 		// provider charged for, so it must include cache_read + cache_write.
@@ -306,7 +234,14 @@ export class AgentRunCollector {
 		});
 	}
 
-	#recordFailedChat(start: ChatStart | undefined, errorType: string): void {
+	/**
+	 * Stamp the chat span as failed without a finalized AssistantMessage. Used
+	 * by the `catch` arm of `streamAssistantResponse` so error chats still
+	 * appear in the run summary.
+	 */
+	failChat(span: Span, fields: { readonly errorType: string }): void {
+		const start = (span as SpanWithChatStart)[kChatStart];
+		(span as SpanWithChatStart)[kChatStart] = undefined;
 		this.#chats.push({
 			stepNumber: start?.stepNumber ?? -1,
 			model: start?.model ?? "",
@@ -321,7 +256,7 @@ export class AgentRunCollector {
 			totalTokens: 0,
 			costUsd: undefined,
 			costUnavailableReason: undefined,
-			errorType,
+			errorType: fields.errorType,
 		});
 	}
 
@@ -334,41 +269,9 @@ export class AgentRunCollector {
 		this.#invokedTools.add(init.toolName);
 	}
 
-	/** Begin a tool record without allocating or mutating an OTEL span. */
-	beginToolWithoutSpan(init: { readonly toolCallId: string; readonly toolName: string }): void {
-		const starts = this.#spanlessToolStarts.get(init.toolCallId) ?? [];
-		starts.push({
-			toolCallId: init.toolCallId,
-			toolName: init.toolName,
-			startedAtMs: performance.now(),
-		});
-		this.#spanlessToolStarts.set(init.toolCallId, starts);
-		this.#invokedTools.add(init.toolName);
-	}
-
 	endTool(span: Span, fields: { readonly status: ToolStatus; readonly errorType: string | undefined }): void {
 		const start = (span as SpanWithToolStart)[kToolStart];
 		(span as SpanWithToolStart)[kToolStart] = undefined;
-		this.#recordTool(start, fields);
-	}
-
-	/** Finish a tool record without allocating or mutating an OTEL span. */
-	endToolWithoutSpan(record: {
-		readonly toolCallId: string;
-		readonly toolName: string;
-		readonly status: ToolStatus;
-		readonly errorType: string | undefined;
-	}): void {
-		const starts = this.#spanlessToolStarts.get(record.toolCallId);
-		const start = starts?.pop();
-		if (starts && starts.length === 0) this.#spanlessToolStarts.delete(record.toolCallId);
-		this.#recordTool(start ?? { ...record, startedAtMs: performance.now() }, record);
-	}
-
-	#recordTool(
-		start: ToolStart | undefined,
-		fields: { readonly status: ToolStatus; readonly errorType: string | undefined },
-	): void {
 		this.#tools.push({
 			toolCallId: start?.toolCallId ?? "",
 			toolName: start?.toolName ?? "",

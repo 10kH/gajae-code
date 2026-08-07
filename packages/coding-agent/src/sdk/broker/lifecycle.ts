@@ -4,15 +4,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { NativeExactUnlinkResult } from "@gajae-code/natives";
-
-let nativeLifecycleBindings: typeof import("@gajae-code/natives") | undefined;
-
-function nativeLifecycle(): typeof import("@gajae-code/natives") {
-	if (!nativeLifecycleBindings)
-		nativeLifecycleBindings = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
-	return nativeLifecycleBindings;
-}
-
+import * as native from "@gajae-code/natives";
 import { $credentialEnv, resolveEquivalentPath } from "@gajae-code/utils";
 
 import {
@@ -28,11 +20,6 @@ import {
 	type GjcLaunchWorktreePlan,
 	planLaunchWorktree,
 } from "../../gjc-runtime/launch-worktree";
-import {
-	GJC_COORDINATOR_SESSION_BRANCH_ENV,
-	GJC_COORDINATOR_SESSION_ID_ENV,
-	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
-} from "../../gjc-runtime/session-state-sidecar";
 import { validateManagedArtifactTree } from "../../session/internal/managed-session-storage";
 import {
 	FileSessionStorage,
@@ -249,10 +236,6 @@ export interface SessionLifecycleLaunchRequest {
 	semanticReadyDeadlineAt: number;
 	terminationStartDeadlineAt: number;
 	lifecycleCleanupDeadlineAt: number;
-	/** Coordinator namespace dir; broker computes the state file path from launch.id (#2549). */
-	coordinatorStateDir?: string;
-	coordinatorSessionId?: string;
-	coordinatorSessionBranch?: string;
 }
 
 function isSessionLifecycleTranscriptIdentity(value: unknown): value is SessionLifecycleTranscriptIdentity {
@@ -399,14 +382,7 @@ export function readSessionLifecycleLaunchRequest(
 			!hasValidTranscriptAuthority(request.sessionPath, request.sessionIdentity)) ||
 		(request.operation === "session.fork" &&
 			(!hasValidTranscriptAuthority(request.sourceSessionPath, request.sourceSessionIdentity) ||
-				request.sourceSessionId === undefined)) ||
-		(request.coordinatorStateDir !== undefined &&
-			(typeof request.coordinatorStateDir !== "string" || request.coordinatorStateDir.length > 4096)) ||
-		(request.coordinatorSessionId !== undefined &&
-			(typeof request.coordinatorSessionId !== "string" ||
-				!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(request.coordinatorSessionId))) ||
-		(request.coordinatorSessionBranch !== undefined &&
-			(typeof request.coordinatorSessionBranch !== "string" || request.coordinatorSessionBranch.length > 512))
+				request.sourceSessionId === undefined))
 	)
 		throw new Error("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
 	return request as SessionLifecycleLaunchRequest;
@@ -424,10 +400,6 @@ type SessionLaunch = {
 	sessionIdentity?: SessionLifecycleTranscriptIdentity;
 	modelPreset?: string;
 	mcpServers?: SessionLifecycleMcpServer[];
-	/** Coordinator namespace dir; broker computes the state file path from launch.id (#2549). */
-	coordinatorStateDir?: string;
-	coordinatorSessionId?: string;
-	coordinatorSessionBranch?: string;
 	worktree?: SessionLifecycleWorktreeTarget;
 	readiness?: SessionLifecycleReadiness;
 	worktreePlan?: GjcLaunchWorktreePlan;
@@ -1131,7 +1103,7 @@ function exactUnlinkLifecycleFile(
 	plannedPath: string,
 	parentIdentity?: { dev: bigint; ino: bigint },
 ): NativeExactUnlinkResult {
-	return nativeLifecycle().exactUnlink(file, {
+	return native.exactUnlink(file, {
 		...identity,
 		quarantineName: path.basename(plannedPath),
 		...(parentIdentity ? { parentDev: parentIdentity.dev, parentIno: parentIdentity.ino } : {}),
@@ -1882,7 +1854,7 @@ async function reconcileLifecycleCleanup(
 			});
 		}
 		const currentFile = activeCleanup.lifecycleFiles![index];
-		const result = nativeLifecycle().exactUnlink(activePath, {
+		const result = native.exactUnlink(activePath, {
 			...captured.identity,
 			parentDev: BigInt(activeCleanup.lifecycleParentIdentity!.dev),
 			parentIno: BigInt(activeCleanup.lifecycleParentIdentity!.ino),
@@ -2466,14 +2438,6 @@ async function launchInput(
 	} catch {
 		return fail("invalid_input", "Lifecycle worktree does not exist.");
 	}
-	let modelPreset = text(input.modelPreset);
-	if (input.modelPreset !== undefined && (typeof input.modelPreset !== "string" || input.modelPreset.length === 0))
-		return fail("invalid_input", "modelPreset must be a non-empty exact profile ID.");
-	if (modelPreset !== undefined) {
-		const validatedModelPreset = validateBrokerModelPreset(broker.settings.agentDir, modelPreset);
-		if (typeof validatedModelPreset !== "string") return validatedModelPreset;
-		modelPreset = validatedModelPreset;
-	}
 	const worktree = lifecycleWorktreeTarget(input);
 	if (worktree === null || (worktree !== undefined && requestedCwd === undefined))
 		return fail("invalid_input", "Lifecycle worktree target is invalid.");
@@ -2502,6 +2466,9 @@ async function launchInput(
 	const requested = sessionId(input);
 	if (requested !== undefined && !isCanonicalSessionId(requested))
 		return fail("invalid_input", "sessionId must be a canonical safe identifier.");
+	if (input.modelPreset !== undefined && (typeof input.modelPreset !== "string" || input.modelPreset.length === 0))
+		return fail("invalid_input", "modelPreset must be a non-empty exact profile ID.");
+	const modelPreset = text(input.modelPreset);
 	if (input.mcpServers !== undefined && !isSessionLifecycleMcpServers(input.mcpServers))
 		return fail("invalid_input", "mcpServers must contain unique valid stdio, HTTP, or SSE server definitions.");
 	const mcpServers = input.mcpServers as SessionLifecycleMcpServer[] | undefined;
@@ -2517,14 +2484,6 @@ async function launchInput(
 	if (readiness === "deferred" && operation !== "session.create")
 		return fail("invalid_input", "readiness deferred is only supported for session.create.");
 
-	// Coordinator-correlation env scoped to this designated launch only (#2549).
-	// The coordinator passes these so the broker-spawned runtime writes terminal
-	// state to the coordinator-shared file instead of an unread session-local
-	// fallback. They are threaded into the child env, not exported broadly.
-	const coordinatorStateDir = text(input.coordinatorStateDir);
-	const coordinatorSessionId = text(input.coordinatorSessionId);
-	const coordinatorSessionBranch = text(input.coordinatorSessionBranch);
-
 	if (operation === "session.create")
 		return {
 			id: randomUUID(),
@@ -2535,9 +2494,6 @@ async function launchInput(
 			worktree,
 			worktreePlan,
 			...(readiness ? { readiness } : {}),
-			...(coordinatorStateDir ? { coordinatorStateDir } : {}),
-			...(coordinatorSessionId ? { coordinatorSessionId } : {}),
-			...(coordinatorSessionBranch ? { coordinatorSessionBranch } : {}),
 		};
 	if (operation === "session.resume") {
 		if (!requested) return fail("invalid_input", "sessionId is required to resume a saved session.");
@@ -2555,9 +2511,6 @@ async function launchInput(
 			mcpServers,
 			worktree,
 			worktreePlan,
-			...(coordinatorStateDir ? { coordinatorStateDir } : {}),
-			...(coordinatorSessionId ? { coordinatorSessionId } : {}),
-			...(coordinatorSessionBranch ? { coordinatorSessionBranch } : {}),
 		};
 	}
 	const sourceSessionId = text(input.sourceSessionId) ?? text(input.sourceId);
@@ -2580,9 +2533,6 @@ async function launchInput(
 		mcpServers,
 		worktree,
 		worktreePlan,
-		...(coordinatorStateDir ? { coordinatorStateDir } : {}),
-		...(coordinatorSessionId ? { coordinatorSessionId } : {}),
-		...(coordinatorSessionBranch ? { coordinatorSessionBranch } : {}),
 	};
 }
 
@@ -3119,6 +3069,11 @@ async function executeLifecycleResponse(
 
 		const launch = await launchInput(broker, operation, input);
 		if ("ok" in launch) return launch;
+		if (launch.modelPreset) {
+			const validatedModelPreset = validateBrokerModelPreset(broker.settings.agentDir, launch.modelPreset);
+			if (typeof validatedModelPreset !== "string") return validatedModelPreset;
+			launch.modelPreset = validatedModelPreset;
+		}
 		if (!hasProcessIncarnationAuthority())
 			return fail(
 				"incarnation_unavailable",
@@ -3200,9 +3155,6 @@ async function executeLifecycleResponse(
 			...(launch.mcpServers ? { mcpServers: launch.mcpServers } : {}),
 			...(launch.worktree ? { worktree: launch.worktree } : {}),
 			...(launch.readiness ? { readiness: launch.readiness } : {}),
-			...(launch.coordinatorStateDir ? { coordinatorStateDir: launch.coordinatorStateDir } : {}),
-			...(launch.coordinatorSessionId ? { coordinatorSessionId: launch.coordinatorSessionId } : {}),
-			...(launch.coordinatorSessionBranch ? { coordinatorSessionBranch: launch.coordinatorSessionBranch } : {}),
 		};
 		let child: ChildProcess | undefined;
 		let spawnedAuthority: EffectMarker | undefined;
@@ -3220,26 +3172,6 @@ async function executeLifecycleResponse(
 					GJC_STATE_ROOT: launch.root,
 					GJC_LIFECYCLE_REQUEST_ID: effectMarker,
 					GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
-					// Coordinator-correlation env scoped to this designated launch only (#2549).
-					// The runtime sidecar reads these to write terminal state to the
-					// coordinator-shared file instead of an unread session-local fallback.
-					// The broker computes the file path from coordinatorStateDir + launch.id
-					// because the session ID is generated at spawn time.
-					...(launch.coordinatorStateDir
-						? {
-								[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: path.join(
-									launch.coordinatorStateDir,
-									"session-states",
-									`${launch.id}.json`,
-								),
-							}
-						: {}),
-					...(launch.coordinatorSessionId
-						? { [GJC_COORDINATOR_SESSION_ID_ENV]: launch.coordinatorSessionId }
-						: {}),
-					...(launch.coordinatorSessionBranch
-						? { [GJC_COORDINATOR_SESSION_BRANCH_ENV]: launch.coordinatorSessionBranch }
-						: {}),
 				},
 			});
 			child = spawned;
@@ -3535,7 +3467,7 @@ async function executeLifecycleResponse(
 				if (stat.isSymbolicLink() || !stat.isDirectory())
 					return fail("terminal_uncertain", "Artifact cleanup target is not an exact directory.");
 				validateManagedArtifactTree(artifactsPath);
-				const tree = nativeLifecycle().snapshotDirectoryTree(artifactsPath);
+				const tree = native.snapshotDirectoryTree(artifactsPath);
 				if (!tree.ok || !tree.snapshot)
 					return fail(
 						"terminal_uncertain",

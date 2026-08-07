@@ -5,7 +5,7 @@ import {
 	type Model,
 	type ModelRefreshStrategy,
 	readModelCache,
-} from "@gajae-code/ai/core";
+} from "@gajae-code/ai";
 
 export interface DiscoveryProvider {
 	provider: string;

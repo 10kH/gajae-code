@@ -1369,7 +1369,7 @@ setInterval(() => {}, 1000);
 
 			await manager.refreshServerTools("exact");
 			expect(toolListCalls).toBe(1);
-			await expect(manager.reconnectServer("exact")).resolves.toBeDefined();
+			await expect(manager.reconnectServer("exact")).resolves.toBeNull();
 		} finally {
 			await manager.disconnectAll();
 			await normalManager.disconnectAll();

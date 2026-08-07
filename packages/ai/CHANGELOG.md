@@ -1,13 +1,7 @@
 # Changelog
 
 ## [Unreleased]
-### Added
 
-- Added opt-in `compat.supportsResponsesSessionAffinity` for OpenAI Responses custom relays. When enabled, supported `openai-responses` models may send `session_id` and `x-client-request-id` affinity headers to a custom endpoint; canonical OpenAI routing remains automatic and known non-OpenAI provider IDs remain excluded.
-
-### Fixed
-
-- Anthropic requests rejected with `A maximum of 4 blocks with cache_control may be provided. Found N.` now step their generated breakpoints down instead of dying on the first attempt (#3934, supersedes #3943). An Anthropic-compatible gateway may attach its own block-level cache markers before forwarding, and those never appear in the params we serialize, so the total is unpredictable locally and the rejection itself is the only usable signal. Because that rejection says "too many", not "none allowed", recovery gives up one breakpoint at a time: explicit mode normally emits two (a conversation-prefix anchor plus a current-turn refresh point), so the first retry keeps the prefix anchor — the higher-value marker — and only a second rejection disables generated caching entirely. The reduced budget persists for the provider session so later turns neither re-trigger the 400 nor lose more caching than the endpoint requires. Only a genuine breakpoint-overflow `invalid_request_error` is claimed — other `cache_control` complaints, unrelated 400s, non-400 statuses, and our own pre-flight validation failure still surface immediately. The classifier is exported as `isAnthropicCacheBreakpointOverflowError`.
 ## [0.12.15] - 2026-08-06
 
 ### Fixed
@@ -22,12 +16,7 @@
 
 - Anthropic prompt caching now defaults to top-level automatic caching (`cache_control: { type: "ephemeral" }`) on the canonical Anthropic API and explicit block-level caching for Claude-family models on non-canonical Anthropic-compatible gateways (Cloudflare AI Gateway, GitHub Copilot, GitLab Duo, Vercel AI Gateway, zenmux, CLIProxyAPI, etc.). Explicit mode is the safer compatible default because gateways commonly inject, rewrite, or reject the top-level field; verified gateways can opt into it with `compat.promptCacheMode: "automatic"`. Non-Claude models on unknown compatible endpoints keep the no-cache default; `promptCacheMode: "none"` and configured or per-request `cacheRetention: "none"` still opt out. Non-canonical Claude models get the default ~5m lifetime unless the endpoint sets `compat.supportsLongCacheRetention: true`.
 
-### Added
-
-- Added the `@gajae-code/ai/core` entrypoint for shared model and protocol types without loading provider construction code.
-
 ### Fixed
-
 
 - `todo_write` raw argument rejections now carry bounded, authority-controlled correction codes for each rejected shape: unknown root keys, unknown operation-entry keys, done/drop entries missing a task or phase target, and unknown init list-entry keys. Each code maps to a fixed correction message naming the accepted shape (never echoing the offending input), so invalid calls surface specific guidance while valid payloads keep the existing passthrough/coercion path (#3916).
 - Anthropic Sonnet 5 now exposes Anthropic's real `xhigh` and `max` thinking efforts on the Messages API (`minimal`/`low`/`medium`/`high`/`xhigh`/`max`), matching official support. The previous generic `kind === opus` gate excluded it from the full preset range; the capability predicate is now an explicit version-scoped list (Opus 4.7+, Sonnet 5+), so older Sonnet generations and Bedrock Converse routes stay fail-closed at their previously advertised levels (issue #3913).
