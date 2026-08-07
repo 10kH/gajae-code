@@ -10836,10 +10836,13 @@ export class SessionManager {
 		const ids: string[] = [];
 		const visited = new Set<string>();
 		let current = this.#resolveEntry(fromId ?? this.#leafId ?? "");
+		let activeCompaction: CompactionEntry | undefined;
 		while (current) {
 			if (visited.has(current.id)) break;
 			visited.add(current.id);
 			ids.push(current.id);
+			if (!activeCompaction && current.type === "compaction") activeCompaction = current;
+			if (activeCompaction && current.id === activeCompaction.firstKeptEntryId) break;
 			current = current.parentId ? this.#resolveEntry(current.parentId) : undefined;
 		}
 		ids.reverse();

@@ -362,6 +362,86 @@ describe("active branch retirement boundary", () => {
 	});
 });
 
+describe("bounded provider context traversal", () => {
+	it("stops at the active compaction boundary without hydrating older cold entries", async () => {
+		class CountingStorage extends MemorySessionStorage {
+			rangeReads = 0;
+			override readRangeSync(filePath: string, offset: number, length: number) {
+				this.rangeReads++;
+				return super.readRangeSync(filePath, offset, length);
+			}
+		}
+		const storage = new CountingStorage();
+		const sessionFile = "/sessions/context-boundary.jsonl";
+		const entries = [
+			{ type: "session", version: 5, id: "context-boundary", timestamp: "0", cwd: "/cwd" },
+			{
+				type: "message",
+				id: "old-user",
+				parentId: null,
+				timestamp: "0",
+				message: { role: "user", content: "old", timestamp: 1 },
+			},
+			{
+				type: "message",
+				id: "old-assistant",
+				parentId: "old-user",
+				timestamp: "0",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "old answer" }],
+					api: "x",
+					provider: "x",
+					model: "x",
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: 2,
+				},
+			},
+			{
+				type: "message",
+				id: "kept",
+				parentId: "old-assistant",
+				timestamp: "0",
+				message: { role: "user", content: "kept", timestamp: 3 },
+			},
+			{
+				type: "compaction",
+				id: "compaction",
+				parentId: "kept",
+				timestamp: "0",
+				summary: "summary",
+				firstKeptEntryId: "kept",
+				tokensBefore: 10,
+			},
+			{
+				type: "message",
+				id: "after",
+				parentId: "compaction",
+				timestamp: "0",
+				message: { role: "user", content: "after", timestamp: 4 },
+			},
+		];
+		storage.writeTextSync(sessionFile, `${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`);
+		const manager = await SessionManager.open(sessionFile, SessionManager.explicitDestination("/sessions"), storage);
+		try {
+			manager.setSessionMemoryMode("enabled");
+			storage.rangeReads = 0;
+			const context = manager.buildSessionContext();
+			expect(context.messages).toHaveLength(3);
+			expect(storage.rangeReads).toBe(0);
+		} finally {
+			await manager.close();
+		}
+	});
+});
 describe("session memory mode across file transitions", () => {
 	it("reapplies enabled retirement and keeps off transitions sidecar-free", async () => {
 		const storage = new MemorySessionStorage();
