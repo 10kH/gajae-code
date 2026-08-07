@@ -226,6 +226,15 @@ export interface ManagedAppendReceipt {
 	identity: ManagedFileIdentity;
 }
 
+export interface ManagedBoundedAppendExpectation {
+	readonly dev: string;
+	readonly ino: string;
+	readonly size: string;
+	readonly mtimeNs: string;
+	readonly ctimeNs: string;
+	readonly sha256: string;
+}
+
 function managedFileIdentityFromNative(identity: RecoveryFsIdentity): ManagedFileIdentity {
 	return {
 		dev: BigInt(identity.dev),
@@ -1217,6 +1226,49 @@ export class ManagedSessionDescendantStore {
 		}
 		this.#replaceRetained(this.#relative(resolved), bytes);
 		this.#assertBound();
+	}
+
+	captureBoundedAppendExpectation(relativePath: string): ManagedBoundedAppendExpectation | undefined {
+		this.#assertBound();
+		if (!this.#authority) return undefined;
+		const observed = this.#authority.stat(this.#relative(this.#resolve(relativePath)));
+		if (!observed.ok || !observed.identity) return undefined;
+		const sha256 = observed.identity.sha256;
+		if (typeof sha256 !== "string" || !/^[0-9a-f]{64}$/i.test(sha256)) return undefined;
+		return {
+			dev: observed.identity.dev,
+			ino: observed.identity.ino,
+			size: observed.identity.size,
+			mtimeNs: observed.identity.mtimeNs,
+			ctimeNs: observed.identity.ctimeNs,
+			sha256: sha256.toLowerCase(),
+		};
+	}
+
+	appendExpectedSync(
+		relativePath: string,
+		bytes: Uint8Array,
+		expected: ManagedBoundedAppendExpectation,
+	): ManagedAppendReceipt {
+		this.#beforeMutation();
+		this.#assertBound();
+		if (!this.#authority) throw new Error("managed_bounded_append_unavailable");
+		const relative = this.#relative(this.#resolve(relativePath));
+		const appended = this.#authority.appendManaged(
+			relative,
+			bytes,
+			expected.dev,
+			expected.ino,
+			expected.size,
+			expected.mtimeNs,
+			expected.ctimeNs,
+			expected.sha256,
+		);
+		if (!appended.ok) throw new Error(appended.code ?? "managed_append_failed");
+		const stat = this.#authority.stat(relative);
+		if (!stat.ok || !stat.identity) throw new Error(stat.code ?? "managed_append_identity_unavailable");
+		this.#assertBound();
+		return managedAppendReceiptFromIdentity(managedFileIdentityFromNative(stat.identity));
 	}
 
 	appendSync(relativePath: string, bytes: Uint8Array): ManagedAppendReceipt {

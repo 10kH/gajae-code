@@ -77,6 +77,7 @@ import {
 	captureManagedFileNoFollow,
 	fsyncManagedArtifactTree,
 	MANAGED_ARTIFACT_MAX_FILE_BYTES,
+	type ManagedBoundedAppendExpectation,
 	type ManagedDirectoryRoot,
 	type ManagedFileSnapshot,
 	ManagedSessionDescendantStore,
@@ -906,6 +907,7 @@ export type DefaultModelSelectionStage = {
 	readonly sourceDescriptor: DescriptorSnapshot | undefined;
 	readonly sourceStat: SessionStorageStat | undefined;
 	readonly sourceSha256: string | undefined;
+	readonly managedAppendExpectation: ManagedBoundedAppendExpectation | undefined;
 };
 export interface SessionManagerRevisionSnapshot {
 	entry: number;
@@ -9972,12 +9974,18 @@ export class SessionManager {
 	): Promise<DefaultModelSelectionStage> {
 		const sessionFile = this.#sessionFile;
 		const persistsToExistingFile = this.persist && sessionFile !== undefined && this.storage.existsSync(sessionFile);
-		const boundedCold =
-			persistsToExistingFile &&
-			this.#coldSidecarActive() &&
+		const managedAppendExpectation =
+			persistsToExistingFile && this.#coldSidecarActive() && this.destination.kind === "managed"
+				? this.#managedTranscriptStore(sessionFile).captureBoundedAppendExpectation(path.basename(sessionFile))
+				: undefined;
+		const boundedExplicit =
 			this.destination.kind !== "managed" &&
 			typeof this.storage.openStagedWriter === "function" &&
 			typeof this.storage.readRangeSync === "function";
+		const boundedCold =
+			persistsToExistingFile &&
+			this.#coldSidecarActive() &&
+			(boundedExplicit || managedAppendExpectation !== undefined);
 		if (!boundedCold) this.#ensureFullHotView();
 		const entryRevision = this.#entryRevision;
 		const leafRevision = this.#leafRevision;
@@ -10030,13 +10038,16 @@ export class SessionManager {
 		if (boundedCold && (!this.#coldIndexDigestValid() || !this.#coldTailMatchesDisk()))
 			throw new Error("bounded_default_selection_sidecar_changed");
 		const appendEntries = entries.slice(this.#fileEntries.length) as SessionEntry[];
-		const sourceStat = boundedCold ? this.storage.statSync(sessionFile) : undefined;
-		const boundedStage = boundedCold
-			? await this.#writeBoundedDefaultModelSelection(appendEntries, sessionFile, sourceDescriptor!)
-			: undefined;
-		const tempPath = persistsToExistingFile
-			? (boundedStage?.tempPath ?? (await this.#writeStagedDefaultModelSelection(entries, sessionFile)))
-			: undefined;
+		const sourceStat =
+			boundedCold && this.destination.kind !== "managed" ? this.storage.statSync(sessionFile) : undefined;
+		const boundedStage =
+			boundedCold && this.destination.kind !== "managed"
+				? await this.#writeBoundedDefaultModelSelection(appendEntries, sessionFile, sourceDescriptor!)
+				: undefined;
+		const tempPath =
+			persistsToExistingFile && this.destination.kind !== "managed"
+				? (boundedStage?.tempPath ?? (await this.#writeStagedDefaultModelSelection(entries, sessionFile)))
+				: undefined;
 		const sourceSha256 = boundedStage?.sourceSha256;
 		return {
 			entryRevision,
@@ -10052,6 +10063,7 @@ export class SessionManager {
 			sourceDescriptor,
 			sourceStat,
 			sourceSha256,
+			managedAppendExpectation,
 		};
 	}
 
@@ -10099,11 +10111,28 @@ export class SessionManager {
 			}
 			if (this.destination.kind === "managed") {
 				try {
-					const persistedEntries = materializeResidentEntriesForPersistenceSync(
-						[...stage.entries],
-						this.#residentBlobStores(),
-					).map(entry => prepareEntryForPersistenceSync(entry, this.#blobStore));
-					this.#writeEntriesAtomicallySync(persistedEntries);
+					if (stage.boundedCold) {
+						if (!stage.managedAppendExpectation) throw new Error("Managed bounded append expectation is missing");
+						const bytes = Buffer.concat(
+							stage.appendEntries.map(entry =>
+								Buffer.from(
+									`${JSON.stringify(prepareEntryForPersistenceSync(entry, this.#blobStore))}\n`,
+									"utf8",
+								),
+							),
+						);
+						this.#managedTranscriptStore(this.#sessionFile).appendExpectedSync(
+							path.basename(this.#sessionFile),
+							bytes,
+							stage.managedAppendExpectation,
+						);
+					} else {
+						const persistedEntries = materializeResidentEntriesForPersistenceSync(
+							[...stage.entries],
+							this.#residentBlobStores(),
+						).map(entry => prepareEntryForPersistenceSync(entry, this.#blobStore));
+						this.#writeEntriesAtomicallySync(persistedEntries);
+					}
 				} catch (error) {
 					transition.dispose();
 					return { kind: "unknown", error: toError(error) };
