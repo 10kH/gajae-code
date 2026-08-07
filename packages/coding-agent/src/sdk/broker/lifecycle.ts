@@ -20,6 +20,11 @@ import {
 	type GjcLaunchWorktreePlan,
 	planLaunchWorktree,
 } from "../../gjc-runtime/launch-worktree";
+import {
+	GJC_COORDINATOR_SESSION_BRANCH_ENV,
+	GJC_COORDINATOR_SESSION_ID_ENV,
+	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+} from "../../gjc-runtime/session-state-sidecar";
 import { validateManagedArtifactTree } from "../../session/internal/managed-session-storage";
 import {
 	FileSessionStorage,
@@ -236,6 +241,10 @@ export interface SessionLifecycleLaunchRequest {
 	semanticReadyDeadlineAt: number;
 	terminationStartDeadlineAt: number;
 	lifecycleCleanupDeadlineAt: number;
+	/** Coordinator namespace dir; broker computes the state file path from launch.id (#2549). */
+	coordinatorStateDir?: string;
+	coordinatorSessionId?: string;
+	coordinatorSessionBranch?: string;
 }
 
 function isSessionLifecycleTranscriptIdentity(value: unknown): value is SessionLifecycleTranscriptIdentity {
@@ -382,7 +391,14 @@ export function readSessionLifecycleLaunchRequest(
 			!hasValidTranscriptAuthority(request.sessionPath, request.sessionIdentity)) ||
 		(request.operation === "session.fork" &&
 			(!hasValidTranscriptAuthority(request.sourceSessionPath, request.sourceSessionIdentity) ||
-				request.sourceSessionId === undefined))
+				request.sourceSessionId === undefined)) ||
+		(request.coordinatorStateDir !== undefined &&
+			(typeof request.coordinatorStateDir !== "string" || request.coordinatorStateDir.length > 4096)) ||
+		(request.coordinatorSessionId !== undefined &&
+			(typeof request.coordinatorSessionId !== "string" ||
+				!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(request.coordinatorSessionId))) ||
+		(request.coordinatorSessionBranch !== undefined &&
+			(typeof request.coordinatorSessionBranch !== "string" || request.coordinatorSessionBranch.length > 512))
 	)
 		throw new Error("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
 	return request as SessionLifecycleLaunchRequest;
@@ -400,6 +416,10 @@ type SessionLaunch = {
 	sessionIdentity?: SessionLifecycleTranscriptIdentity;
 	modelPreset?: string;
 	mcpServers?: SessionLifecycleMcpServer[];
+	/** Coordinator namespace dir; broker computes the state file path from launch.id (#2549). */
+	coordinatorStateDir?: string;
+	coordinatorSessionId?: string;
+	coordinatorSessionBranch?: string;
 	worktree?: SessionLifecycleWorktreeTarget;
 	readiness?: SessionLifecycleReadiness;
 	worktreePlan?: GjcLaunchWorktreePlan;
@@ -2484,6 +2504,14 @@ async function launchInput(
 	if (readiness === "deferred" && operation !== "session.create")
 		return fail("invalid_input", "readiness deferred is only supported for session.create.");
 
+	// Coordinator-correlation env scoped to this designated launch only (#2549).
+	// The coordinator passes these so the broker-spawned runtime writes terminal
+	// state to the coordinator-shared file instead of an unread session-local
+	// fallback. They are threaded into the child env, not exported broadly.
+	const coordinatorStateDir = text(input.coordinatorStateDir);
+	const coordinatorSessionId = text(input.coordinatorSessionId);
+	const coordinatorSessionBranch = text(input.coordinatorSessionBranch);
+
 	if (operation === "session.create")
 		return {
 			id: randomUUID(),
@@ -2494,6 +2522,9 @@ async function launchInput(
 			worktree,
 			worktreePlan,
 			...(readiness ? { readiness } : {}),
+			...(coordinatorStateDir ? { coordinatorStateDir } : {}),
+			...(coordinatorSessionId ? { coordinatorSessionId } : {}),
+			...(coordinatorSessionBranch ? { coordinatorSessionBranch } : {}),
 		};
 	if (operation === "session.resume") {
 		if (!requested) return fail("invalid_input", "sessionId is required to resume a saved session.");
@@ -2511,6 +2542,9 @@ async function launchInput(
 			mcpServers,
 			worktree,
 			worktreePlan,
+			...(coordinatorStateDir ? { coordinatorStateDir } : {}),
+			...(coordinatorSessionId ? { coordinatorSessionId } : {}),
+			...(coordinatorSessionBranch ? { coordinatorSessionBranch } : {}),
 		};
 	}
 	const sourceSessionId = text(input.sourceSessionId) ?? text(input.sourceId);
@@ -2533,6 +2567,9 @@ async function launchInput(
 		mcpServers,
 		worktree,
 		worktreePlan,
+		...(coordinatorStateDir ? { coordinatorStateDir } : {}),
+		...(coordinatorSessionId ? { coordinatorSessionId } : {}),
+		...(coordinatorSessionBranch ? { coordinatorSessionBranch } : {}),
 	};
 }
 
@@ -3155,6 +3192,9 @@ async function executeLifecycleResponse(
 			...(launch.mcpServers ? { mcpServers: launch.mcpServers } : {}),
 			...(launch.worktree ? { worktree: launch.worktree } : {}),
 			...(launch.readiness ? { readiness: launch.readiness } : {}),
+			...(launch.coordinatorStateDir ? { coordinatorStateDir: launch.coordinatorStateDir } : {}),
+			...(launch.coordinatorSessionId ? { coordinatorSessionId: launch.coordinatorSessionId } : {}),
+			...(launch.coordinatorSessionBranch ? { coordinatorSessionBranch: launch.coordinatorSessionBranch } : {}),
 		};
 		let child: ChildProcess | undefined;
 		let spawnedAuthority: EffectMarker | undefined;
@@ -3172,6 +3212,26 @@ async function executeLifecycleResponse(
 					GJC_STATE_ROOT: launch.root,
 					GJC_LIFECYCLE_REQUEST_ID: effectMarker,
 					GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
+					// Coordinator-correlation env scoped to this designated launch only (#2549).
+					// The runtime sidecar reads these to write terminal state to the
+					// coordinator-shared file instead of an unread session-local fallback.
+					// The broker computes the file path from coordinatorStateDir + launch.id
+					// because the session ID is generated at spawn time.
+					...(launch.coordinatorStateDir
+						? {
+								[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: path.join(
+									launch.coordinatorStateDir,
+									"session-states",
+									`${launch.id}.json`,
+								),
+							}
+						: {}),
+					...(launch.coordinatorSessionId
+						? { [GJC_COORDINATOR_SESSION_ID_ENV]: launch.coordinatorSessionId }
+						: {}),
+					...(launch.coordinatorSessionBranch
+						? { [GJC_COORDINATOR_SESSION_BRANCH_ENV]: launch.coordinatorSessionBranch }
+						: {}),
 				},
 			});
 			child = spawned;

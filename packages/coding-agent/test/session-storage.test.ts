@@ -1420,6 +1420,104 @@ describe.skipIf(process.platform !== "linux")("managed descendant retained bindi
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
+
+	it("root retained-authority store does not snapshot mutable descendants (#3906)", () => {
+		// On Linux, retained-authority store construction must use identity() for the
+		// root case (authorityBaseDir === baseDir) rather than snapshotManagedTree(""),
+		// which walks every mutable descendant and returns identity_mismatch under
+		// concurrent writers. #assertBound() already uses identity() for this case;
+		// the constructor must mirror it. Nested descendants still snapshot.
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-root-snapshot-3906-"));
+		try {
+			const rootAuthority = managedDirectoryRoot(root);
+			// Publish a file so the tree is non-empty (a mutable descendant exists).
+			const warmup = new ManagedSessionDescendantStore(rootAuthority, root);
+			warmup.publishNoReplaceSync("session.jsonl", Buffer.from('{"id":"warm"}\n'));
+			warmup.close();
+
+			const retainedAuthority = retainManagedDirectoryAuthority(rootAuthority, root);
+			if (!retainedAuthority) {
+				// Non-Linux: no retained native root authority. Verify construction still
+				// succeeds without a retained authority and skip the snapshot assertion.
+				const fallback = new ManagedSessionDescendantStore(rootAuthority, root);
+				fallback.close();
+				return;
+			}
+
+			// Spy on snapshotManagedTree: it must NOT be called for root construction.
+			const snapshotSpy = vi.spyOn(native.RecoveryFsRoot.prototype, "snapshotManagedTree");
+
+			const store = new ManagedSessionDescendantStore(rootAuthority, root, {
+				authority: retainedAuthority,
+				authorityBaseDir: root,
+			});
+
+			// Root construction must not have snapshotted the tree at all.
+			expect(snapshotSpy).not.toHaveBeenCalled();
+			store.close();
+
+			snapshotSpy.mockRestore();
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("root retained-authority store survives concurrent descendant writes (#3906)", () => {
+		// Simulate a concurrent writer appending to a descendant file while the
+		// root store is constructed. Before the fix, snapshotManagedTree("") would
+		// observe the mutable descendant mid-write and return identity_mismatch.
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-concurrent-3906-"));
+		try {
+			const rootAuthority = managedDirectoryRoot(root);
+			// Warm up: create a descendant file that will be concurrently written.
+			const warmup = new ManagedSessionDescendantStore(rootAuthority, root);
+			warmup.publishNoReplaceSync("session.jsonl", Buffer.from('{"id":"base"}\n'));
+			warmup.close();
+
+			const retainedAuthority = retainManagedDirectoryAuthority(rootAuthority, root);
+			if (!retainedAuthority) return; // Non-Linux: no retained authority path.
+
+			// Concurrently append to the descendant while constructing the root store.
+			// This would make snapshotManagedTree("") see a changing tree. The fix
+			// uses identity() which only reads the stable root inode/dev.
+			const append = Buffer.from('{"id":"concurrent"}\n');
+			const writer = new ManagedSessionDescendantStore(rootAuthority, root);
+			const interval = setInterval(() => {
+				try {
+					writer.replaceSync("session.jsonl", Buffer.concat([Buffer.from('{"id":"base"}\n'), append]));
+				} catch {
+					// ignore transient races; the point is to create concurrent mutation
+				}
+			}, 1);
+
+			let constructions = 0;
+			let failures = 0;
+			try {
+				for (let i = 0; i < 20; i++) {
+					try {
+						const store = new ManagedSessionDescendantStore(rootAuthority, root, {
+							authority: retainManagedDirectoryAuthority(rootAuthority, root)!,
+							authorityBaseDir: root,
+						});
+						store.assertBound();
+						store.close();
+						constructions++;
+					} catch {
+						failures++;
+					}
+				}
+			} finally {
+				clearInterval(interval);
+				writer.close();
+			}
+
+			// Every root construction must succeed despite concurrent descendant writes.
+			expect(failures).toBe(0);
+			expect(constructions).toBe(20);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("FileSessionStorageWriter path security", () => {

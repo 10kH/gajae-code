@@ -4037,6 +4037,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 												cwd: canonicalCwd,
 												target: coordinatorLifecycleTarget(config.sessionCommand, canonicalCwd),
 												...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
+												// Thread the coordinator state dir so the broker-spawned runtime
+												// writes terminal state to the coordinator-shared file (#2549).
+												coordinatorStateDir: namespaceDir,
 											},
 											idempotencyKey,
 										),
@@ -4249,6 +4252,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										target: coordinatorLifecycleTarget(config.sessionCommand, cwd),
 										...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
 										...(preparesExistingThread ? { readiness: "deferred" } : {}),
+										// Thread the coordinator state dir so the broker-spawned runtime
+										// writes terminal state to the coordinator-shared file (#2549).
+										coordinatorStateDir: namespaceDir,
 									},
 									idempotencyKey,
 								),
