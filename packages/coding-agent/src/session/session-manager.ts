@@ -772,6 +772,7 @@ function tailRecordKindForEntry(entry: SessionEntry): TailRecordKind {
  * anything outside these bounds; the bounded path only ever fails closed to it.
  */
 const BOUNDED_FIRST_OPEN_MAX_LINE_BYTES = 8 * 1024 * 1024;
+const residentHotEntryBytes = (serializedBytes: number): number => residentRecordBytes(serializedBytes * 2 + 256);
 /** Maximum records accepted by the bounded first-open hash table. */
 const BOUNDED_FIRST_OPEN_MAX_RECORDS = 1_000_000;
 const BOUNDED_FIRST_OPEN_ID_TABLE_CAPACITY = 1_250_003;
@@ -6286,6 +6287,10 @@ export class SessionManager {
 			);
 			if (!runtime.tailCache.tryAllocate(tailResidentBytes)) return false;
 			const hotSuffixBytes = records.reduce((total, record) => total + record.byteLength, 0);
+			const hotResidentBytes = records.reduce(
+				(total, record) => total + residentHotEntryBytes(record.byteLength),
+				0,
+			);
 			const fixedReservedBytes =
 				runtime.blockCache.budgetBytes +
 				runtime.entryCache.budgetBytes +
@@ -6293,7 +6298,7 @@ export class SessionManager {
 				REDUCER_BUDGET_BYTES +
 				LABELS_PINS_BUDGET_BYTES +
 				1024 * 1024;
-			if (!runtime.accountant.tryCharge(fixedReservedBytes + hotSuffixBytes)) return false;
+			if (!runtime.accountant.tryCharge(fixedReservedBytes + hotResidentBytes)) return false;
 			for (const [id, label] of commit.labels) if (!runtime.labelsPins.setLabel(id, label)) return false;
 			const prepared = this.#prepareResidentTextStoreTransition(
 				{
@@ -6676,6 +6681,7 @@ export class SessionManager {
 		let baseEndOffset = 0;
 		let baseDigest = "";
 		let hotSuffixBytes = 0;
+		let hotResidentBytes = 0;
 		let tailResidentBytes = 0;
 		let scannedBytes = 0;
 		const hotEntries: SessionEntry[] = [];
@@ -6745,6 +6751,7 @@ export class SessionManager {
 						const entry = parsed as SessionEntry;
 						hotEntries.push(entry);
 						hotSuffixBytes += byteLength;
+						hotResidentBytes += residentHotEntryBytes(byteLength);
 						if (hotSuffixBytes > this.#sidecarHotSuffixBudgetBytes) {
 							buildFailed = true;
 							return false;
@@ -6801,7 +6808,7 @@ export class SessionManager {
 				REDUCER_BUDGET_BYTES +
 				LABELS_PINS_BUDGET_BYTES +
 				1024 * 1024;
-			if (!runtime.accountant.tryCharge(fixedReservedBytes + hotSuffixBytes)) {
+			if (!runtime.accountant.tryCharge(fixedReservedBytes + hotResidentBytes)) {
 				this.#lazyReopenFallbackReason = "bounded_scan_budget";
 				return undefined;
 			}
@@ -9175,8 +9182,10 @@ export class SessionManager {
 		if (!this.#fileEntries.slice(0, firstKeptIndex).some(entry => entry.type !== "session")) return 0;
 		if (!this.#validateColdBase()) return 0;
 		let retainedBytes = 0;
+		let retainedAccountedBytes = 0;
 		for (let i = firstKeptIndex; i < this.#fileEntries.length; i++) {
 			retainedBytes += this.#serializeEntryLine(this.#fileEntries[i]).byteLength;
+			retainedAccountedBytes += residentHotEntryBytes(this.#serializeEntryLine(this.#fileEntries[i]).byteLength);
 			if (retainedBytes > hotSuffixBytes) return 0;
 		}
 		const fixedReservedBytes =
@@ -9186,7 +9195,7 @@ export class SessionManager {
 			REDUCER_BUDGET_BYTES +
 			LABELS_PINS_BUDGET_BYTES +
 			1024 * 1024;
-		const targetAccountedBytes = fixedReservedBytes + retainedBytes;
+		const targetAccountedBytes = fixedReservedBytes + retainedAccountedBytes;
 		const accountedDelta = targetAccountedBytes - runtime.accountant.totalBytes;
 		if (accountedDelta > 0 && !runtime.accountant.tryCharge(accountedDelta)) return 0;
 		if (accountedDelta < 0) runtime.accountant.release(-accountedDelta);
@@ -10901,18 +10910,19 @@ export class SessionManager {
 		const activeRuntime = this.#sidecarRuntime;
 		if (activeRuntime && this.#coldSidecarActive()) {
 			const appendedBytes = this.#serializeEntryLine(residentEntry).byteLength + 1;
+			const appendedAccountedBytes = residentHotEntryBytes(appendedBytes);
 			const tailBytes = residentRecordBytes(
 				residentEntry.id.length + (residentEntry.parentId?.length ?? 0) + residentEntry.type.length,
 			);
 			if (activeRuntime.hotSuffixBytes + appendedBytes > this.#sidecarHotSuffixBudgetBytes) {
 				this.#deactivateColdForBranchMutation();
-			} else if (!activeRuntime.accountant.tryCharge(appendedBytes)) {
+			} else if (!activeRuntime.accountant.tryCharge(appendedAccountedBytes)) {
 				this.#deactivateColdForBranchMutation();
 			} else if (!activeRuntime.tailCache.tryAllocate(tailBytes)) {
-				activeRuntime.accountant.release(appendedBytes);
+				activeRuntime.accountant.release(appendedAccountedBytes);
 				this.#deactivateColdForBranchMutation();
 			} else {
-				sidecarAppendCharge = appendedBytes;
+				sidecarAppendCharge = appendedAccountedBytes;
 				sidecarTailCharge = tailBytes;
 			}
 		}
@@ -10968,7 +10978,8 @@ export class SessionManager {
 			);
 			const persisted = prepareEntryForPersistenceSync(materialized, this.#blobStore);
 			const persistedLine = Buffer.from(`${JSON.stringify(persisted)}\n`, "utf8");
-			const delta = persistedLine.byteLength - sidecarAppendCharge;
+			const persistedAccountedBytes = residentHotEntryBytes(persistedLine.byteLength);
+			const delta = persistedAccountedBytes - sidecarAppendCharge;
 			if (
 				delta > 0 &&
 				(activeRuntime.hotSuffixBytes + persistedLine.byteLength > this.#sidecarHotSuffixBudgetBytes ||
