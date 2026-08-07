@@ -596,6 +596,14 @@ describe("bounded parent→children and labels/pins descriptors", () => {
 		expect(index.size).toBe(2);
 	});
 
+	it("byte-accounts parent and child identifiers", () => {
+		const index = new BoundedParentChildrenIndex({ maxParents: 10, maxChildrenPerParent: 10, budgetBytes: 250 });
+		expect(index.add("root", "a")).toBe(true);
+		expect(index.totalBytes).toBeGreaterThan(0);
+		expect(index.add("root", "b".repeat(100))).toBe(false);
+		expect(index.get("root")).toEqual(["a"]);
+	});
+
 	it("byte-accounts labels/pins and rejects over-budget additions", () => {
 		const store = new BoundedLabelsPinsStore(300);
 		expect(store.setLabel("k1", "v1")).toBe(true);

@@ -78,6 +78,7 @@ export const DICTIONARY_BUCKET_JOURNAL_BYTES = 4 * 1024 * 1024;
 /** Bounded parent→children index bounds. */
 export const PARENT_CHILDREN_MAX_PARENTS = 4096;
 export const PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT = 256;
+export const PARENT_CHILDREN_BUDGET_BYTES = 4 * 1024 * 1024;
 
 // ============================================================================
 // Retained-byte formulas (A.1)
@@ -1049,27 +1050,42 @@ export class BoundedParentChildrenIndex {
 	private readonly childrenByParent = new Map<string, string[]>();
 	private readonly maxParents: number;
 	private readonly maxChildrenPerParent: number;
+	private readonly budgetBytesValue: number;
+	private total = 0;
 
-	constructor(options: { maxParents?: number; maxChildrenPerParent?: number } = {}) {
+	constructor(options: { maxParents?: number; maxChildrenPerParent?: number; budgetBytes?: number } = {}) {
 		this.maxParents = options.maxParents ?? PARENT_CHILDREN_MAX_PARENTS;
 		this.maxChildrenPerParent = options.maxChildrenPerParent ?? PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT;
+		this.budgetBytesValue = options.budgetBytes ?? PARENT_CHILDREN_BUDGET_BYTES;
 	}
 
 	get size(): number {
 		return this.childrenByParent.size;
 	}
 
+	get totalBytes(): number {
+		return this.total;
+	}
+
+	get budgetBytes(): number {
+		return this.budgetBytesValue;
+	}
+
 	add(parentId: string, childId: string): boolean {
 		if (parentId.length === 0 || childId.length === 0) throw new Error("parent_children_empty_id");
 		let children = this.childrenByParent.get(parentId);
+		if (children?.includes(childId)) return true;
+		const parentBytes = children === undefined ? residentStringBytes(parentId) + RECORD_OBJECT_OVERHEAD_BYTES : 0;
+		const childBytes = residentStringBytes(childId) + 8;
+		if (this.total + parentBytes + childBytes > this.budgetBytesValue) return false;
 		if (children === undefined) {
 			if (this.childrenByParent.size >= this.maxParents) return false;
 			children = [];
 			this.childrenByParent.set(parentId, children);
 		}
 		if (children.length >= this.maxChildrenPerParent) return false;
-		if (children.includes(childId)) return true;
 		children.push(childId);
+		this.total += parentBytes + childBytes;
 		return true;
 	}
 
