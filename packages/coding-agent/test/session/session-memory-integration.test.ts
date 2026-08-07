@@ -1988,6 +1988,62 @@ describe("sidecar I/O fallback", () => {
 		}
 	});
 
+	it("publishes append markers from the post-fsync writer descriptor without pathname stat", async () => {
+		const tempDir = TempDir.createSync("@pi-writer-descriptor-");
+		const storage = new FileSessionStorage();
+		const sessionFile = path.join(tempDir.path(), "writer-descriptor.jsonl");
+		const records = [
+			{ type: "session", version: 5, id: "writer-descriptor", timestamp: "0", cwd: "/cwd" },
+			{
+				type: "message",
+				id: "cold",
+				parentId: null,
+				timestamp: "0",
+				message: { role: "user", content: "cold", timestamp: 1 },
+			},
+			{
+				type: "message",
+				id: "kept",
+				parentId: "cold",
+				timestamp: "0",
+				message: { role: "user", content: "kept", timestamp: 2 },
+			},
+			{
+				type: "compaction",
+				id: "compact",
+				parentId: "kept",
+				timestamp: "0",
+				summary: "summary",
+				firstKeptEntryId: "kept",
+				tokensBefore: 10,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination(tempDir.path()),
+			storage,
+		);
+		manager.setSessionMemoryMode("enabled");
+		const realStat = storage.statSync.bind(storage);
+		const statSpy = vi.spyOn(storage, "statSync").mockImplementation(filePath => {
+			if (filePath === sessionFile) throw new Error("pathname transcript stat forbidden");
+			return realStat(filePath);
+		});
+		try {
+			manager.appendMessage({ role: "user", content: "after", timestamp: 3 });
+			expect(manager.getSessionMemoryStats()).toMatchObject({
+				coldRetirementActive: true,
+				currentCommitTransition: { kind: "exact", reason: "descriptor_and_proof_match" },
+			});
+			expect(statSpy.mock.calls.some(([filePath]) => filePath === sessionFile)).toBe(false);
+		} finally {
+			statSpy.mockRestore();
+			await manager.close();
+			tempDir.removeSync();
+		}
+	});
+
 	it("recovers from tail fsync followed by append marker publication failure", async () => {
 		class AppendMarkerFailureStorage extends MemorySessionStorage {
 			failMarkers = false;

@@ -189,6 +189,8 @@ export interface SessionStorageWriter {
 	fsync(): Promise<void>;
 	/** Synchronously fsync all prior writes when the backend supports durable sidecar publication. */
 	fsyncSync?(): void;
+	/** Descriptor-bound identity captured from the still-open writer after fsync. */
+	statSync?(): SessionStorageStat;
 	close(): Promise<void>;
 	/**
 	 * Synchronously close the underlying descriptor. The certainty-aware close
@@ -1012,6 +1014,11 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		} catch (err) {
 			throw this.#recordError(err);
 		}
+	}
+	statSync(): SessionStorageStat {
+		if (this.#closeState !== "open") throw this.#nonOpenWriteError();
+		if (this.#error) throw this.#error;
+		return statFromNode(fs.fstatSync(this.#fd, { bigint: true }));
 	}
 
 	async fsync(): Promise<void> {
@@ -2459,6 +2466,11 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 	fsyncSync(): void {
 		if (this.#closeState !== "open") throw new Error("Writer closed");
 		if (this.#error) throw this.#error;
+	}
+	statSync(): SessionStorageStat {
+		if (this.#closeState !== "open") throw new Error("Writer closed");
+		if (this.#error) throw this.#error;
+		return this.#storage.statSync(this.#path);
 	}
 
 	async fsync(): Promise<void> {

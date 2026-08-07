@@ -893,6 +893,57 @@ function scanTranscriptLinesBounded(
 	size: number,
 	visit: (lineStart: number, lineBytes: Uint8Array) => boolean | undefined,
 ): BoundedLineScanFailure | undefined {
+	if (storage instanceof FileSessionStorage) {
+		const flags = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0);
+		let fd: number | undefined;
+		try {
+			fd = fs.openSync(filePath, flags);
+			const before = fs.fstatSync(fd, { bigint: true });
+			if (!before.isFile() || before.nlink > 1 || Number(before.size) < size) return "read_failed";
+			let carry = Buffer.alloc(0);
+			let pos = 0;
+			while (pos < size) {
+				if (carry.byteLength > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return "oversized_line";
+				const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, size - pos);
+				const chunk = Buffer.allocUnsafe(length);
+				let offset = 0;
+				while (offset < length) {
+					const count = fs.readSync(fd, chunk, offset, length - offset, pos + offset);
+					if (count === 0) return "read_failed";
+					offset += count;
+				}
+				const combined = carry.byteLength > 0 ? Buffer.concat([carry, chunk]) : chunk;
+				const base = pos - carry.byteLength;
+				let consumed = 0;
+				for (;;) {
+					const newline = combined.indexOf(0x0a, consumed);
+					if (newline < 0) break;
+					if (visit(base + consumed, combined.subarray(consumed, newline + 1)) === false) return "aborted";
+					consumed = newline + 1;
+				}
+				carry = Buffer.from(combined.subarray(consumed));
+				pos += length;
+				if ((pos & (8 * 1024 * 1024 - 1)) === 0) Bun.gc(true);
+			}
+			const after = fs.fstatSync(fd, { bigint: true });
+			const named = fs.lstatSync(filePath, { bigint: true });
+			if (
+				after.dev !== before.dev ||
+				after.ino !== before.ino ||
+				after.nlink !== before.nlink ||
+				!named.isFile() ||
+				named.isSymbolicLink() ||
+				named.dev !== before.dev ||
+				named.ino !== before.ino
+			)
+				return "read_failed";
+			return carry.byteLength === 0 ? undefined : "unterminated";
+		} catch {
+			return "read_failed";
+		} finally {
+			if (fd !== undefined) fs.closeSync(fd);
+		}
+	}
 	let carry = Buffer.alloc(0);
 	let pos = 0;
 	while (pos < size) {
@@ -4806,6 +4857,16 @@ class NdjsonFileWriter {
 		if (!this.#writer.fsyncSync) throw new Error("Synchronous session writer fsync is unavailable");
 		try {
 			this.#writer.fsyncSync();
+		} catch (err) {
+			throw this.#recordError(err);
+		}
+	}
+	statSync(): SessionStorageStat {
+		if (this.#closed || this.#closing) throw new Error("Writer closed");
+		if (this.#error) throw this.#error;
+		if (!this.#writer.statSync) throw new Error("Synchronous session writer descriptor capture is unavailable");
+		try {
+			return this.#writer.statSync();
 		} catch (err) {
 			throw this.#recordError(err);
 		}
@@ -9917,7 +9978,11 @@ export class SessionManager {
 		}
 	}
 
-	#appendColdSidecarRecord(entry: SessionEntry, persistedLine: Buffer): boolean {
+	#appendColdSidecarRecord(
+		entry: SessionEntry,
+		persistedLine: Buffer,
+		transcriptDescriptor?: SessionStorageStat,
+	): boolean {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled || runtime.sidecarIneligible) return false;
 		const previous = runtime.tail.records.at(-1);
@@ -9972,7 +10037,11 @@ export class SessionManager {
 			terminalSeq: seq,
 			transcriptSize: byteOffset + byteLength,
 		};
-		if (this.#publishCommitMarkerFromCurrentTranscriptSync()) {
+		if (
+			transcriptDescriptor
+				? this.#publishSessionCommitMarkerSync(transcriptDescriptor)
+				: this.#publishCommitMarkerFromCurrentTranscriptSync()
+		) {
 			runtime.terminalTransition = { kind: "exact", reason: "descriptor_and_proof_match" };
 		} else {
 			runtime.terminalTransition = { kind: "rebuild", reason: "commit_marker_publication_failed" };
@@ -11533,6 +11602,7 @@ export class SessionManager {
 		let sidecarTailCharge = 0;
 		const activeRuntime = this.#sidecarRuntime;
 		let transcriptDurableForSidecar = this.destination.kind === "managed";
+		let transcriptDescriptor: SessionStorageStat | undefined;
 		if (activeRuntime && this.#coldSidecarActive()) {
 			const appendedBytes = this.#serializeEntryLine(residentEntry).byteLength + 1;
 			const appendedAccountedBytes = residentHotEntryBytes(appendedBytes);
@@ -11595,6 +11665,7 @@ export class SessionManager {
 				try {
 					writer.fsyncSync();
 					transcriptDurableForSidecar = true;
+					transcriptDescriptor = writer.statSync();
 				} catch {
 					if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
 				}
@@ -11637,7 +11708,7 @@ export class SessionManager {
 				this.#deactivateColdForBranchMutation();
 			} else {
 				if (delta < 0) activeRuntime.accountant.release(-delta);
-				if (this.#appendColdSidecarRecord(residentEntry, persistedLine)) {
+				if (this.#appendColdSidecarRecord(residentEntry, persistedLine, transcriptDescriptor)) {
 					activeRuntime.hotSuffixBytes += persistedLine.byteLength;
 				}
 			}
