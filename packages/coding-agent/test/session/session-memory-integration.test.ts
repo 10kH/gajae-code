@@ -517,6 +517,26 @@ describe("managed commit marker classification", () => {
 			const stats = manager.getSessionMemoryStats();
 			expect(stats).toMatchObject({ lastReopenTransition: { kind: "stale_commit", reason: "no_commit_marker" } });
 			expect(stats.currentCommitTransition).toEqual({ kind: "exact", reason: "descriptor_and_proof_match" });
+			const appendedId = manager.appendMessage({ role: "user", content: "after", timestamp: 3 });
+			const appendedStats = manager.getSessionMemoryStats();
+			expect(appendedStats.currentCommitTransition).toEqual({
+				kind: "exact",
+				reason: "descriptor_and_proof_match",
+			});
+			const sessionFile = manager.getSessionFile();
+			expect(sessionFile).toBeTruthy();
+			if (sessionFile) {
+				const marker = JSON.parse(fs.readFileSync(`${sessionFile}.spill.commit`, "utf8")) as {
+					transcriptSize: number;
+				};
+				expect(marker.transcriptSize).toBe(fs.statSync(sessionFile).size);
+				const tailRecords = fs
+					.readFileSync(`${sessionFile}.spill.tail`, "utf8")
+					.trimEnd()
+					.split("\n")
+					.map(line => JSON.parse(line) as { id: string });
+				expect(tailRecords.at(-1)?.id).toBe(appendedId);
+			}
 			expect(manager.getEntry(firstId)).toMatchObject({ id: firstId });
 		} finally {
 			await manager.close();

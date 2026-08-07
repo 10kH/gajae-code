@@ -92,18 +92,22 @@ import {
 	type CommitMarkerContents,
 	type CommittedTail,
 	classifyReopen,
+	computeC0,
 	computeLineDigest,
 	type DescriptorSnapshot,
 	FixedCacheAccount,
 	getLastModelChangeRole as getReducerLastModelChangeRole,
+	hashChain,
 	isDerivedSessionMemoryFile,
 	LABELS_PINS_BUDGET_BYTES,
 	REDUCER_BUDGET_BYTES,
 	type ReducerState,
 	type ReopenClassification,
 	RollingTailChainBuilder,
+	residentRecordBytes,
 	SessionMemoryAccountant,
 	sameDescriptor,
+	type TailRecord,
 	type TailRecordKind,
 	validateCommit,
 	validateTailChain,
@@ -8550,6 +8554,63 @@ export class SessionManager {
 		}
 	}
 
+	#appendColdSidecarRecord(entry: SessionEntry, persistedLine: Buffer): boolean {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled || runtime.sidecarIneligible) return false;
+		const previous = runtime.tail.records.at(-1);
+		const seq = previous ? previous.seq + 1 : 0;
+		const byteOffset = runtime.tail.transcriptSize;
+		const byteLength = persistedLine.byteLength;
+		const recordDigest = computeLineDigest(persistedLine);
+		const checksum = previous
+			? hashChain([previous.checksum, seq, byteOffset, byteLength, recordDigest])
+			: computeC0(runtime.base, seq, recordDigest);
+		const record: TailRecord = {
+			gen: this.#commitGen + 1,
+			seq,
+			kind: tailRecordKindForEntry(entry),
+			ordinal: (previous?.ordinal ?? -1) + 1,
+			id: entry.id,
+			parentId: entry.parentId,
+			type: entry.type,
+			byteOffset,
+			byteLength,
+			recordDigest,
+			checksum,
+		};
+		try {
+			const indexWriter = this.storage.openWriter(runtime.indexPath, { flags: "a" });
+			try {
+				indexWriter.writeLineSync(
+					`${JSON.stringify({ id: entry.id, ordinal: record.ordinal, seq, byteOffset, byteLength, recordDigest })}\n`,
+				);
+			} finally {
+				indexWriter.closeSync();
+			}
+			const tailWriter = this.storage.openWriter(runtime.tailPath, { flags: "a" });
+			try {
+				tailWriter.writeLineSync(`${JSON.stringify(record)}\n`);
+			} finally {
+				tailWriter.closeSync();
+			}
+		} catch {
+			this.#deactivateColdForBranchMutation();
+			return false;
+		}
+		runtime.tail = {
+			base: runtime.base,
+			records: [...runtime.tail.records, record],
+			terminalChecksum: checksum,
+			terminalSeq: seq,
+			transcriptSize: byteOffset + byteLength,
+		};
+		if (this.destination.kind === "managed") {
+			this.#publishCommitMarkerFromCurrentTranscriptSync();
+			runtime.terminalTransition = this.#classifySidecarReopen();
+		}
+		return true;
+	}
+
 	#readSessionCommitContents(): CommitMarkerContents | undefined {
 		const markerPath = this.#sidecarRuntime?.commitPath;
 		if (!markerPath || !this.storage.readBytesSync) return undefined;
@@ -9840,16 +9901,23 @@ export class SessionManager {
 		const normalizedEntry = normalizeSessionEntryForStorage(entry);
 		const residentEntry = this.#prepareEntryForCurrentResidentStore(normalizedEntry) as SessionEntry;
 		let sidecarAppendCharge = 0;
+		let sidecarTailCharge = 0;
 		const activeRuntime = entry.type === "compaction" && this.#sidecarRuntime ? undefined : this.#sidecarRuntime;
 		if (activeRuntime && this.#coldSidecarActive()) {
-			const appendedBytes = this.#serializeEntryLine(residentEntry).byteLength;
-			if (
-				activeRuntime.hotSuffixBytes + appendedBytes > this.#sidecarHotSuffixBudgetBytes ||
-				!activeRuntime.accountant.tryCharge(appendedBytes)
-			) {
+			const appendedBytes = this.#serializeEntryLine(residentEntry).byteLength + 1;
+			const tailBytes = residentRecordBytes(
+				residentEntry.id.length + (residentEntry.parentId?.length ?? 0) + residentEntry.type.length,
+			);
+			if (activeRuntime.hotSuffixBytes + appendedBytes > this.#sidecarHotSuffixBudgetBytes) {
+				this.#deactivateColdForBranchMutation();
+			} else if (!activeRuntime.accountant.tryCharge(appendedBytes)) {
+				this.#deactivateColdForBranchMutation();
+			} else if (!activeRuntime.tailCache.tryAllocate(tailBytes)) {
+				activeRuntime.accountant.release(appendedBytes);
 				this.#deactivateColdForBranchMutation();
 			} else {
 				sidecarAppendCharge = appendedBytes;
+				sidecarTailCharge = tailBytes;
 			}
 		}
 		const previousLeafId = this.#leafId;
@@ -9873,6 +9941,7 @@ export class SessionManager {
 			this.#leafRevision++;
 			if (entry.type === "label") this.#labelRevision++;
 			if (sidecarAppendCharge > 0) activeRuntime?.accountant.release(sidecarAppendCharge);
+			if (sidecarTailCharge > 0) activeRuntime?.tailCache.release(sidecarTailCharge);
 			throw new SessionAppendPersistenceError(
 				priorPersistenceError ? "prior_failure" : "current_append",
 				residentEntry.id,
@@ -9880,7 +9949,26 @@ export class SessionManager {
 			);
 		}
 		if (sidecarAppendCharge > 0 && activeRuntime && this.#coldSidecarActive()) {
-			activeRuntime.hotSuffixBytes += sidecarAppendCharge;
+			const materialized = materializeResidentEntryForPersistenceSync(
+				residentEntry,
+				this.#residentBlobStores(),
+				new Map(),
+			);
+			const persisted = prepareEntryForPersistenceSync(materialized, this.#blobStore);
+			const persistedLine = Buffer.from(`${JSON.stringify(persisted)}\n`, "utf8");
+			const delta = persistedLine.byteLength - sidecarAppendCharge;
+			if (
+				delta > 0 &&
+				(activeRuntime.hotSuffixBytes + persistedLine.byteLength > this.#sidecarHotSuffixBudgetBytes ||
+					!activeRuntime.accountant.tryCharge(delta))
+			) {
+				this.#deactivateColdForBranchMutation();
+			} else {
+				if (delta < 0) activeRuntime.accountant.release(-delta);
+				if (this.#appendColdSidecarRecord(residentEntry, persistedLine)) {
+					activeRuntime.hotSuffixBytes += persistedLine.byteLength;
+				}
+			}
 		}
 		// Same validated, overflow-guarded aggregation as the resume path (#buildIndex): a
 		// malformed task-result or assistant usage shape reaching the append path must not
