@@ -477,6 +477,8 @@ export class BoundedDictionaryBuilder {
 	private readonly seenRecordIds = new Map<string, number>();
 	private readonly duplicateIds: string[] = [];
 	private totalTermBytes = 0;
+	private recordIdBytes = 0;
+	private duplicateIdBytes = 0;
 	private peakBytes = 0;
 	private sidecarIneligible = false;
 	private recordCount = 0;
@@ -497,15 +499,23 @@ export class BoundedDictionaryBuilder {
 		const priorOrdinal = this.seenRecordIds.get(record.id);
 		if (priorOrdinal !== undefined) {
 			this.sidecarIneligible = true;
-			if (!this.duplicateIds.includes(record.id)) this.duplicateIds.push(record.id);
+			if (!this.duplicateIds.includes(record.id)) {
+				this.duplicateIdBytes += residentStringBytes(record.id) + RECORD_OBJECT_OVERHEAD_BYTES;
+				this.duplicateIds.push(record.id);
+			}
 		} else {
+			this.recordIdBytes += residentStringBytes(record.id) + RECORD_OBJECT_OVERHEAD_BYTES;
 			this.seenRecordIds.set(record.id, record.ordinal);
+		}
+		this.updatePeak();
+		if (this.peakBytes > this.peakBudget) {
+			return { kind: "budget_exceeded", peakBytes: this.peakBytes, budgetBytes: this.peakBudget };
 		}
 		const term = utf8Decoder.decode(record.bytes);
 		if (!this.idByTerm.has(term)) {
 			this.idByTerm.set(term, this.idByTerm.size);
 			this.terms.push(term);
-			this.totalTermBytes += residentStringBytes(term);
+			this.totalTermBytes += residentStringBytes(term) + RECORD_OBJECT_OVERHEAD_BYTES;
 			this.updatePeak();
 		}
 		if (this.peakBytes > this.peakBudget) {
@@ -537,7 +547,7 @@ export class BoundedDictionaryBuilder {
 	}
 
 	private updatePeak(): void {
-		const current = this.totalTermBytes + this.partitionBase;
+		const current = Math.max(this.partitionBase, this.totalTermBytes + this.recordIdBytes + this.duplicateIdBytes);
 		if (current > this.peakBytes) this.peakBytes = current;
 	}
 }

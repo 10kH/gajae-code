@@ -265,6 +265,16 @@ describe("BoundedDictionaryBuilder", () => {
 			expect(result.peakBytes).toBeGreaterThan(result.budgetBytes);
 		}
 	});
+
+	it("charges retained record IDs and duplicate diagnostics", () => {
+		const builder = new BoundedDictionaryBuilder({
+			peakBudgetBytes: 350,
+			partitionBufferBytes: 1,
+			bucketJournalBytes: 1,
+		});
+		expect(builder.add({ ordinal: 0, id: "a".repeat(80), bytes: enc("x") }).kind).toBe("ok");
+		expect(builder.add({ ordinal: 1, id: "b".repeat(80), bytes: enc("x") }).kind).toBe("budget_exceeded");
+	});
 });
 
 describe("anchored base digest + rolling tail chain tamper detection", () => {
