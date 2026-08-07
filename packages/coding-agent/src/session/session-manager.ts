@@ -10574,12 +10574,16 @@ export class SessionManager {
 	}
 
 	setSessionMemoryMode(mode: "off" | "shadow" | "enabled"): void {
+		const retainedColdRuntime = this.#coldSidecarActive();
 		this.#sessionMemoryMode = mode;
-		if (mode !== "enabled" && this.#coldSidecarActive()) this.#ensureFullHotView();
 		if (mode === "off") {
-			const runtime = this.#sidecarRuntime;
 			this.#consecutiveSidecarBuildFailures = 0;
 			this.#sessionMemoryAutoDisabledReason = undefined;
+			// Rollback is non-materializing: already-retired entries remain lazily readable
+			// from the proven sidecar for this process. A subsequent off-mode process open
+			// ignores derived state and restores the ordinary eager path.
+			if (retainedColdRuntime) return;
+			const runtime = this.#sidecarRuntime;
 			if (runtime) {
 				for (const sidecarPath of [runtime.indexPath, runtime.tailPath, runtime.commitPath]) {
 					if (!sidecarPath) continue;
@@ -10593,6 +10597,7 @@ export class SessionManager {
 			this.#sidecarRuntime = undefined;
 			return;
 		}
+		if (mode === "shadow" && retainedColdRuntime) return;
 		if (
 			(!this.#sidecarRuntime?.enabled || this.#sidecarRuntime.sidecarIneligible) &&
 			this.persist &&
