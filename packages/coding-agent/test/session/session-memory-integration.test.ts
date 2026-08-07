@@ -1674,9 +1674,16 @@ describe("sidecar I/O fallback", () => {
 			expect(manager.getSessionMemoryStats()).toMatchObject({
 				coldRetirementActive: false,
 				sidecarIneligible: true,
+				autoDisabledReason: "sidecar_build_failures",
+				consecutiveBuildFailures: 2,
 			});
 			expect(manager.getEntries()).toHaveLength(5);
 			expect(manager.getEntry("cold-0000")).toMatchObject({ id: "cold-0000" });
+			manager.setSessionMemoryMode("off");
+			expect(manager.getSessionMemoryStats()).toMatchObject({
+				autoDisabledReason: undefined,
+				consecutiveBuildFailures: 0,
+			});
 		} finally {
 			await manager.close();
 		}

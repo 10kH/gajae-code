@@ -493,6 +493,9 @@ export class CommandController {
 			}
 			const fallbackReason = memory.retirementFallbackReason ?? memory.lazyReopenFallbackReason;
 			if (fallbackReason) info += `${theme.fg("dim", "Fallback Reason:")} ${fallbackReason}\n`;
+			if (memory.autoDisabledReason) {
+				info += `${theme.fg("dim", "Auto-Disabled:")} ${theme.fg("warning", memory.autoDisabledReason)}\n`;
+			}
 		}
 		info += `${theme.bold("Tokens")}\n`;
 		info += `${theme.fg("dim", "Input:")} ${stats.tokens.input.toLocaleString()}\n`;

@@ -421,6 +421,8 @@ export interface SessionMemoryStats {
 	lazyReopenSucceeded: boolean;
 	lazyReopenFallbackReason: string | undefined;
 	retirementFallbackReason: string | undefined;
+	autoDisabledReason: string | undefined;
+	consecutiveBuildFailures: number;
 }
 
 export interface SessionMessageEntry extends SessionEntryBase {
@@ -5573,6 +5575,8 @@ export class SessionManager {
 	#preparedNewSessionCleanupInProgress = false;
 	/** Active cold-sidecar runtime (retirement + lazy resolution). Undefined when disabled. */
 	#sidecarRuntime: SessionMemorySidecarRuntime | undefined = undefined;
+	#consecutiveSidecarBuildFailures = 0;
+	#sessionMemoryAutoDisabledReason: string | undefined;
 	#sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow";
 	#lazyReopenAttempted = false;
 	#lazyReopenSucceeded = false;
@@ -9007,7 +9011,14 @@ export class SessionManager {
 		}
 		try {
 			this.#buildDisposableSidecarsUnsafe(entries);
+			const runtime = this.#sidecarRuntime;
+			if (runtime?.enabled && !runtime.sidecarIneligible) this.#consecutiveSidecarBuildFailures = 0;
 		} catch (error) {
+			this.#consecutiveSidecarBuildFailures++;
+			if (this.#consecutiveSidecarBuildFailures >= 2) {
+				this.#sessionMemoryAutoDisabledReason = "sidecar_build_failures";
+				this.#sessionMemoryMode = "shadow";
+			}
 			const runtime = this.#sidecarRuntime;
 			if (runtime) {
 				runtime.enabled = false;
@@ -9025,6 +9036,8 @@ export class SessionManager {
 			logger.warn("Session memory sidecar build failed; preserving eager transcript state", {
 				sessionFile: this.#sessionFile,
 				error: toError(error).message,
+				consecutiveBuildFailures: this.#consecutiveSidecarBuildFailures,
+				autoDisabled: this.#sessionMemoryAutoDisabledReason !== undefined,
 			});
 		}
 	}
@@ -10531,6 +10544,8 @@ export class SessionManager {
 				lazyReopenSucceeded: this.#lazyReopenSucceeded,
 				lazyReopenFallbackReason: this.#lazyReopenFallbackReason,
 				retirementFallbackReason: this.#retirementFallbackReason,
+				autoDisabledReason: this.#sessionMemoryAutoDisabledReason,
+				consecutiveBuildFailures: this.#consecutiveSidecarBuildFailures,
 			};
 		}
 		const reducerBytes = JSON.stringify(runtime.reducer).length * 2 + 48;
@@ -10553,6 +10568,8 @@ export class SessionManager {
 			lazyReopenSucceeded: this.#lazyReopenSucceeded,
 			lazyReopenFallbackReason: this.#lazyReopenFallbackReason,
 			retirementFallbackReason: this.#retirementFallbackReason,
+			autoDisabledReason: this.#sessionMemoryAutoDisabledReason,
+			consecutiveBuildFailures: this.#consecutiveSidecarBuildFailures,
 		};
 	}
 
@@ -10561,6 +10578,8 @@ export class SessionManager {
 		if (mode !== "enabled" && this.#coldSidecarActive()) this.#ensureFullHotView();
 		if (mode === "off") {
 			const runtime = this.#sidecarRuntime;
+			this.#consecutiveSidecarBuildFailures = 0;
+			this.#sessionMemoryAutoDisabledReason = undefined;
 			if (runtime) {
 				for (const sidecarPath of [runtime.indexPath, runtime.tailPath, runtime.commitPath]) {
 					if (!sidecarPath) continue;

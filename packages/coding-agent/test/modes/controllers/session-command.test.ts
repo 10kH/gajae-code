@@ -39,6 +39,8 @@ async function renderSessionInfo(costBreakdown?: Usage["cost"], model?: Model): 
 					lazyReopenSucceeded: true,
 					lazyReopenFallbackReason: undefined,
 					retirementFallbackReason: undefined,
+					autoDisabledReason: undefined,
+					consecutiveBuildFailures: 0,
 				},
 			}),
 			model,
