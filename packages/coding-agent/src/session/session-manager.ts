@@ -8349,6 +8349,10 @@ export class SessionManager {
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
+		if (this.#sessionMemoryMode !== "off") {
+			this.#buildDisposableSidecars(this.#fileEntries);
+			if (this.#sessionMemoryMode === "enabled") this.#retireColdEntries();
+		}
 	}
 
 	async #rewriteFile(): Promise<void> {
@@ -8375,6 +8379,10 @@ export class SessionManager {
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
 		});
+		if (this.#sessionMemoryMode !== "off") {
+			this.#buildDisposableSidecars(this.#fileEntries);
+			if (this.#sessionMemoryMode === "enabled") this.#retireColdEntries();
+		}
 	}
 
 	isPersisted(): boolean {
@@ -8386,6 +8394,7 @@ export class SessionManager {
 		thinkingLevel: string | undefined,
 		options?: { readonly appendThinkingLevel: boolean },
 	): Promise<DefaultModelSelectionStage> {
+		this.#ensureFullHotView();
 		const entryRevision = this.#entryRevision;
 		const headerExportRevision = this.#headerExportRevision;
 		const sessionId = this.#sessionId;
@@ -9647,6 +9656,7 @@ export class SessionManager {
 	 */
 	applyEntryMessageUpdates(entries: readonly SessionMessageEntry[]): void {
 		this.#assertRecoveryHydrationWritable();
+		this.#deactivateColdForBranchMutation();
 		for (const updated of entries) {
 			const canonical = this.#byId.get(updated.id);
 			if (canonical?.type !== "message") continue;
@@ -9664,6 +9674,7 @@ export class SessionManager {
 	/** Write mutated custom-message entries back into the canonical entry store by id. */
 	applyCustomMessageEntryUpdates(entries: readonly CustomMessageEntry[]): void {
 		this.#assertRecoveryHydrationWritable();
+		this.#deactivateColdForBranchMutation();
 		for (const updated of entries) {
 			const canonical = this.#byId.get(updated.id);
 			if (canonical?.type !== "custom_message") continue;
@@ -10941,6 +10952,7 @@ export class SessionManager {
 				destination,
 			);
 			await manager.#initSessionFile(filePath);
+			manager.buildSessionContext();
 			return manager;
 		}
 
@@ -11017,6 +11029,7 @@ export class SessionManager {
 			manager.#ensuredOnDisk = true;
 		}
 		store.assertBound();
+		manager.buildSessionContext();
 		return manager;
 	}
 	/**
