@@ -365,3 +365,27 @@ describe("commit-marker checked create/replace", () => {
 		expect(corruptState.rawBytesSha256).toBe(markerHash(Buffer.from("corrupt{{", "utf8")));
 	});
 });
+
+describe("derived sidecar lifecycle cleanup", () => {
+	it("removes derived siblings for file and memory storage", async () => {
+		const dir = await makeTempDir("gjc-sidecar-delete-");
+		const sessionPath = path.join(dir, "session.jsonl");
+		const file = new FileSessionStorage();
+		file.writeTextSync(sessionPath, "{}\n");
+		file.writeTextSync(`${sessionPath}.spill.idx`, "index\n");
+		file.writeTextSync(`${sessionPath}.spill.tail`, "tail\n");
+		await file.deleteSessionWithArtifacts(sessionPath);
+		expect(file.existsSync(sessionPath)).toBe(false);
+		expect(file.existsSync(`${sessionPath}.spill.idx`)).toBe(false);
+		expect(file.existsSync(`${sessionPath}.spill.tail`)).toBe(false);
+
+		const memory = new MemorySessionStorage();
+		memory.writeTextSync(sessionPath, "{}\n");
+		memory.writeTextSync(`${sessionPath}.spill.idx`, "index\n");
+		memory.writeTextSync(`${sessionPath}.spill.commit`, "commit\n");
+		await memory.deleteSessionWithArtifacts(sessionPath);
+		expect(memory.existsSync(sessionPath)).toBe(false);
+		expect(memory.existsSync(`${sessionPath}.spill.idx`)).toBe(false);
+		expect(memory.existsSync(`${sessionPath}.spill.commit`)).toBe(false);
+	});
+});
