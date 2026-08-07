@@ -20,6 +20,7 @@ import { getBundledModel } from "@gajae-code/ai";
 import { TempDir } from "@gajae-code/utils";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
+import { HindsightSessionState } from "../../src/hindsight/state";
 import { AgentSession } from "../../src/session/agent-session";
 import { AuthStorage } from "../../src/session/auth-storage";
 import {
@@ -289,6 +290,22 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 		await session.dispose();
 		await makeSession({ "compaction.keepRecentTokens": 1 });
 		appendConversation("seed");
+		const hindsight = new HindsightSessionState({
+			sessionId: "overflow-recall",
+			client: {} as never,
+			bankId: "overflow-recall-bank",
+			config: {
+				autoRetain: false,
+				autoRecall: false,
+				mentalModelsEnabled: false,
+				debug: false,
+			} as never,
+			session,
+			missionsSet: new Set(),
+		});
+		hindsight.lastRecallSnippet = "<memories>overflow recall</memories>";
+		const recallMarkSpy = vi.spyOn(hindsight, "markRecallSnippetInjected");
+		session.setHindsightSessionState(hindsight);
 		session.queueDeferredMessageForTests(
 			{
 				role: "custom",
@@ -330,6 +347,10 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 		expect(
 			submitted[0]?.filter(message => message.role === "custom" && message.customType === "overflow-pending"),
 		).toHaveLength(1);
+		expect(
+			submitted[0]?.filter(message => message.role === "custom" && message.customType === "hindsight-recall"),
+		).toHaveLength(1);
+		expect(recallMarkSpy).toHaveBeenCalledTimes(1);
 		expect(session.getPendingNextTurnMessagesForTests()).toEqual([]);
 	});
 	it("does not replay pending next-turn context after an accepted provider failure", async () => {
