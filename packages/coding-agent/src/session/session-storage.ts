@@ -205,6 +205,8 @@ export const STAGED_WRITER_LINE_MAX_BYTES = 64 * 1024 * 1024;
 /** Upper bound for aggregated different-length patches buffered for the publish-time overlay pass. */
 export const STAGED_WRITER_PATCH_LIMIT_BYTES = 8 * 1024 * 1024;
 export const STAGED_WRITER_PATCH_MAX_COUNT = 65_536;
+export const STAGED_MEMORY_WRITER_MAX_BYTES = 20 * 1024 * 1024;
+export const STAGED_MEMORY_WRITER_MAX_LINES = STAGED_WRITER_PATCH_MAX_COUNT + 1;
 const STAGED_WRITER_COPY_CHUNK_BYTES = 64 * 1024;
 
 /**
@@ -2220,6 +2222,7 @@ class MemoryStagedStreamingWriter implements StagedStreamingWriter {
 	#lines: Buffer[] = [];
 	#pendingPatches = new Map<number, Uint8Array>();
 	#pendingPatchBytes = 0;
+	#retainedLineBytes = 0;
 	#closed = false;
 	#published = false;
 	#error: Error | undefined;
@@ -2238,7 +2241,13 @@ class MemoryStagedStreamingWriter implements StagedStreamingWriter {
 		this.#assertOpen();
 		if (bytes.byteLength > STAGED_WRITER_LINE_MAX_BYTES)
 			throw new RangeError("Staged line exceeds the bounded maximum");
+		if (
+			this.#lines.length >= STAGED_MEMORY_WRITER_MAX_LINES ||
+			this.#retainedLineBytes + bytes.byteLength + 1 > STAGED_MEMORY_WRITER_MAX_BYTES
+		)
+			throw new Error("staged_memory_capacity_exceeded");
 		this.#lines.push(Buffer.from(bytes));
+		this.#retainedLineBytes += bytes.byteLength + 1;
 	}
 
 	seekToLine(ordinal: number): void {
@@ -2293,11 +2302,20 @@ class MemoryStagedStreamingWriter implements StagedStreamingWriter {
 		if (!this.#closed) throw new Error("Staged writer must be closed before publication");
 		if (this.#error) throw this.#error;
 		if (this.#storage.existsSync(this.#path)) throw new Error("destination_conflict");
-		const lines = this.#lines.map((line, index) => this.#pendingPatches.get(index) ?? line);
-		const content = Buffer.concat(
-			lines.length === 0 ? [Buffer.alloc(0)] : lines.map(line => Buffer.concat([line, newlineBuffer])),
-		);
-		this.#storage.writeTextSync(this.#path, content.toString("utf8"));
+		const selectedLines = this.#lines.map((line, index) => this.#pendingPatches.get(index) ?? line);
+		const totalBytes = selectedLines.reduce((total, line) => total + line.byteLength + 1, 0);
+		if (totalBytes > STAGED_MEMORY_WRITER_MAX_BYTES + STAGED_WRITER_PATCH_LIMIT_BYTES)
+			throw new Error("staged_memory_capacity_exceeded");
+		const content = Buffer.allocUnsafe(totalBytes);
+		let offset = 0;
+		for (const line of selectedLines) {
+			Buffer.from(line).copy(content, offset);
+			offset += line.byteLength;
+			content[offset++] = 0x0a;
+		}
+		this.#lines.length = 0;
+		this.#pendingPatches.clear();
+		this.#storage.writeBytesOwnedSync(this.#path, content);
 		this.#published = true;
 	}
 }
@@ -2421,6 +2439,15 @@ export class MemorySessionStorage implements SessionStorage {
 
 	existsSync(path: string): boolean {
 		return this.#files.has(path);
+	}
+
+	writeBytesOwnedSync(path: string, content: Buffer): void {
+		const existing = this.#files.get(path);
+		this.#files.set(path, {
+			content,
+			mtimeMs: Date.now(),
+			ino: existing?.ino ?? this.#nextInode++,
+		});
 	}
 
 	writeTextSync(path: string, content: string): void {

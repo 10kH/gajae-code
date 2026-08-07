@@ -17,6 +17,7 @@ import {
 	readSessionCommitMarkerSync,
 	replaceSessionCommitMarkerCheckedSync,
 	SESSION_RANGE_READ_MAX_BYTES,
+	STAGED_MEMORY_WRITER_MAX_BYTES,
 	STAGED_WRITER_PATCH_LIMIT_BYTES,
 	STAGED_WRITER_PATCH_MAX_COUNT,
 } from "../../src/session/session-storage";
@@ -225,6 +226,13 @@ describe("staged streaming writers (immutable destinations)", () => {
 		expect(() => writer.patchLine(STAGED_WRITER_PATCH_MAX_COUNT, Buffer.alloc(0))).toThrow(
 			"staged_overlay_capacity_exceeded",
 		);
+	});
+
+	it("memory staging rejects retained line bytes beyond its fixed bound", () => {
+		const memory = new MemorySessionStorage();
+		const writer = memory.openStagedWriter!("/sessions/memory-cap.jsonl");
+		writer.writeLine(Buffer.alloc(STAGED_MEMORY_WRITER_MAX_BYTES - 1));
+		expect(() => writer.writeLine(Buffer.alloc(0))).toThrow("staged_memory_capacity_exceeded");
 	});
 });
 
