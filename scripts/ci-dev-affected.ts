@@ -966,6 +966,19 @@ function addPackageTestTasks(tasks: Map<string, Task>, workspacePackage: Workspa
 	for (let shard = 1; shard <= total; shard++) {
 		addCodingAgentTestShard(tasks, shard, total);
 	}
+	add(
+		tasks,
+		"test:@gajae-code/coding-agent:sdk-production-host-isolated",
+		"Test @gajae-code/coding-agent production SDK host in isolation",
+		[
+			"bun",
+			"test",
+			"test/sdk-chat-daemon-worker.test.ts",
+			"-t",
+			"routes Slack safe queries through the production Session SDK host",
+		],
+		resolvePackageCwd("packages/coding-agent"),
+	);
 }
 
 function addCodingAgentTestShard(tasks: Map<string, Task>, shard: number, total: number = codingAgentTestShards()): void {

@@ -847,6 +847,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 			"check:@gajae-code/ai", "test:@gajae-code/ai",
 			"check:@gajae-code/coding-agent",
 			...Array.from({ length: 8 }, (_, index) => `test:@gajae-code/coding-agent:shard-${index + 1}-of-8`),
+			"test:@gajae-code/coding-agent:sdk-production-host-isolated",
 			"check:@gajae-code/natives", "test:@gajae-code/natives",
 			"check:@gajae-code/stats", "test:@gajae-code/stats",
 			"check:@gajae-code/tui", "test:@gajae-code/tui",
@@ -1583,6 +1584,7 @@ describe("planFullTasks — Main CI full mode (issue: shard main CI)", () => {
 		// Default coding-agent shard count stays 8 (dev parity).
 		expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-")).length).toBe(8);
 		expect(keys).toContain("test:@gajae-code/coding-agent:shard-1-of-8");
+		expect(keys).toContain("test:@gajae-code/coding-agent:sdk-production-host-isolated");
 		// Default rust-test stays a single unpartitioned task.
 		expect(keys).toContain("rust-test");
 		expect(keys.some(key => key.startsWith("rust-test:partition-"))).toBe(false);
@@ -1598,6 +1600,17 @@ describe("planFullTasks — Main CI full mode (issue: shard main CI)", () => {
 		const runtimeCheck = tasks.find(task => task.key === "runtime-check");
 		expect(runtimeCheck?.command).toEqual(["bun", "run", "check:runtime"]);
 		expect(runtimeCheck?.cwd).toBe(resolvePackageCwd("packages/coding-agent"));
+		const isolatedSdkHost = tasks.find(
+			task => task.key === "test:@gajae-code/coding-agent:sdk-production-host-isolated",
+		);
+		expect(isolatedSdkHost?.command).toEqual([
+			"bun",
+			"test",
+			"test/sdk-chat-daemon-worker.test.ts",
+			"-t",
+			"routes Slack safe queries through the production Session SDK host",
+		]);
+		expect(isolatedSdkHost?.cwd).toBe(resolvePackageCwd("packages/coding-agent"));
 	});
 
 	test("CI_CODING_AGENT_TEST_SHARDS overrides the coding-agent shard count", () => {
