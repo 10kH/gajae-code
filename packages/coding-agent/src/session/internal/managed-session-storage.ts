@@ -629,6 +629,51 @@ function secure(pathname: string, kind: "directory" | "file"): void {
 	const verified = validateNativeSecurityResult(verifyOwnerOnlyPathSecurity(pathname, kind), "verify", kind);
 	if (!verified.ok) throw securityError(pathname, verified);
 }
+/**
+ * Re-apply owner-only security to every descendant under a managed path.
+ *
+ * Foreign writers (and legacy local:// fixtures) can leave group/other-readable
+ * descendants under a managed session tree. Managed-tree snapshots fail closed
+ * with `mode_mismatch` on the first such node; re-securing in place lets a
+ * drifted subtree recover on the next capture instead of aborting resume.
+ */
+function reapplyOwnerOnlyManagedTree(directory: string): void {
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(directory, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		const child = path.join(directory, entry.name);
+		let stat: fs.Stats;
+		try {
+			stat = fs.lstatSync(child);
+		} catch {
+			continue;
+		}
+		if (stat.isSymbolicLink()) continue;
+		if (stat.isDirectory()) {
+			reapplyOwnerOnlyManagedTree(child);
+			try {
+				applyOwnerOnlyPathSecurity(child, "directory");
+			} catch {
+				// Best-effort: the managed-tree snapshot re-verifies and reports genuine failures.
+			}
+		} else if (stat.isFile()) {
+			try {
+				applyOwnerOnlyPathSecurity(child, "file");
+			} catch {
+				// Best-effort, as above.
+			}
+		}
+	}
+	try {
+		applyOwnerOnlyPathSecurity(directory, "directory");
+	} catch {
+		// Best-effort, as above.
+	}
+}
 
 function windowsExistingVerifyFirst(policy: ManagedSessionSecurityPolicy): boolean {
 	return process.platform === "win32" && policy === "windows-existing-verify-first";
@@ -1445,13 +1490,25 @@ export class ManagedSessionDescendantStore {
 	/** Capture a complete descendant tree through this retained root. */
 	captureTree(relativePath: string): NativeDirectoryTreeSnapshot {
 		this.#assertBound();
-		const relative = this.#relative(this.#resolve(relativePath));
+		const absolute = this.#resolve(relativePath);
+		const relative = this.#relative(absolute);
 		if (this.#authority) {
-			const captured = this.#authority.snapshotManagedTree(relative);
+			let captured = this.#authority.snapshotManagedTree(relative);
+			if ((!captured.ok || !captured.snapshot) && captured.code === "mode_mismatch") {
+				// Prior writers left group/other-readable descendants under this
+				// managed path (legacy local:// trees, foreign blob stores). Re-secure
+				// once and retry before failing closed.
+				reapplyOwnerOnlyManagedTree(absolute);
+				captured = this.#authority.snapshotManagedTree(relative);
+			}
 			if (!captured.ok || !captured.snapshot) throw new Error(captured.code ?? "unsafe_artifacts");
 			return captured.snapshot;
 		}
-		const captured = snapshotDirectoryTree(this.#resolve(relativePath));
+		let captured = snapshotDirectoryTree(absolute);
+		if ((!captured.ok || !captured.snapshot) && captured.code === "mode_mismatch") {
+			reapplyOwnerOnlyManagedTree(absolute);
+			captured = snapshotDirectoryTree(absolute);
+		}
 		if (!captured.ok || !captured.snapshot) throw new Error(captured.code ?? "unsafe_artifacts");
 		return captured.snapshot;
 	}
