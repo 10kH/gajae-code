@@ -11594,6 +11594,10 @@ export class SessionManager {
 	}
 
 	#appendEntry(entry: SessionEntry): void {
+		this.#withSessionPersistenceFenceSync(() => this.#appendEntryWithinPersistenceFence(entry));
+	}
+
+	#appendEntryWithinPersistenceFence(entry: SessionEntry): void {
 		this.#assertRecoveryHydrationWritable();
 		if (this.#sidecarBranchActivationDirty) this.#deactivateColdForBranchMutation();
 		const normalizedEntry = normalizeSessionEntryForStorage(entry);
