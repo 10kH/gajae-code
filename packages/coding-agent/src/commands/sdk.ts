@@ -222,6 +222,7 @@ export async function openLifecycleSessionManager(
 			SessionManager.managedDestination(cwd, agentDir),
 			undefined,
 			migrationPolicy,
+			lifecycleSettings.get("sessionMemory.mode"),
 		);
 		if (opened.kind === "error")
 			throw new Error("Lifecycle saved session authority changed while the session host opened it.");
