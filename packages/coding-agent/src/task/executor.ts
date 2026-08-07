@@ -41,6 +41,7 @@ import type { ArtifactManager } from "../session/artifacts";
 import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { SessionManager } from "../session/session-manager";
+import { FileSessionStorage } from "../session/session-storage";
 import { truncateTail } from "../session/streaming-output";
 import type { ContextFileEntry } from "../tools";
 import { jtdToJsonSchema, normalizeSchema } from "../tools/jtd-to-json-schema";
@@ -1553,7 +1554,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				? await awaitAbortable(options.managedPersistence.openSession(worktree ?? cwd))
 				: sessionFile
 					? await awaitAbortable(
-							SessionManager.open(sessionFile, SessionManager.explicitDestination(path.dirname(sessionFile))),
+							SessionManager.open(
+								sessionFile,
+								SessionManager.explicitDestination(path.dirname(sessionFile)),
+								new FileSessionStorage(),
+								subagentSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain",
+								subagentSettings.get("sessionMemory.mode"),
+							),
 						)
 					: SessionManager.inMemory(worktree ?? cwd);
 			if (options.parentArtifactManager) {
