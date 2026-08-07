@@ -2594,7 +2594,7 @@ function resumeReadFailure(error: unknown, storage: SessionStorage, path: string
 	return { kind: "error", reason: missing ? "missing" : "read-failed" };
 }
 
-function hasStrictSessionSchema(entries: FileEntry[]): boolean {
+function hasStrictSessionSchema(entries: readonly FileEntry[]): boolean {
 	for (const entry of entries) {
 		const value = entry as unknown as Record<string, unknown>;
 		if (typeof value.type !== "string") return false;
@@ -6529,6 +6529,7 @@ export class SessionManager {
 					return fail("bounded_scan_malformed");
 				const record = parsed as Record<string, unknown>;
 				if (typeof record.type !== "string" || typeof record.id !== "string") return fail("bounded_scan_malformed");
+				if (!hasStrictSessionSchema([record as unknown as FileEntry])) return fail("bounded_scan_unsupported");
 				if (lineStart === 0) {
 					if (
 						record.type !== "session" ||
@@ -9005,6 +9006,10 @@ export class SessionManager {
 		)
 			return;
 		const sessionEntries = entries.filter((entry): entry is SessionEntry => entry.type !== "session");
+		if (!hasStrictSessionSchema(entries)) {
+			runtime.sidecarIneligible = true;
+			return;
+		}
 		if (this.#transcriptContainsPatchRecords()) {
 			runtime.sidecarIneligible = true;
 			return;

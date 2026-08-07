@@ -1015,6 +1015,49 @@ describe("session memory mode across file transitions", () => {
 		}
 	});
 });
+describe("malformed transcript sidecar fallback", () => {
+	it("keeps malformed known records eager", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/malformed-compaction.jsonl";
+		const records = [
+			{ type: "session", version: 5, id: "malformed", timestamp: "0", cwd: "/cwd" },
+			{
+				type: "message",
+				id: "old",
+				parentId: null,
+				timestamp: "0",
+				message: { role: "user", content: "old", timestamp: 1 },
+			},
+			{
+				type: "compaction",
+				id: "compact",
+				parentId: "old",
+				timestamp: "0",
+				summary: "summary",
+				firstKeptEntryId: "old",
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(manager.getSessionMemoryStats()).toMatchObject({
+				coldRetirementActive: false,
+				sidecarIneligible: true,
+				lazyReopenSucceeded: false,
+			});
+			expect(manager.getEntry("old")).toMatchObject({ id: "old" });
+		} finally {
+			await manager.close();
+		}
+	});
+});
+
 describe("patch-bearing transcript fallback", () => {
 	it("keeps patch-bearing transcripts eager so raw offsets cannot drift", async () => {
 		const storage = new MemorySessionStorage();
