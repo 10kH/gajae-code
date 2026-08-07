@@ -4,12 +4,16 @@ How to run a source change through a real ACP client on your machine. The
 protocol contract lives in [External control readiness](./external-control-readiness.md);
 this page is only the build/run/verify loop.
 
+The commands below assume macOS or Linux with a POSIX shell. The Paseo examples
+were verified with Paseo 0.2.5; confirm command and status names when using a
+newer release.
+
 ## The loop
 
 ```sh
 bun run build:native        # only when crates/ changed
 bun run install:dev:bin     # compile dist/gjc and point `gjc` on PATH at it
-bun run restart:sdk-broker  # REQUIRED — see below
+bun run restart:sdk-broker -- --close-session-hosts  # REQUIRED — see below
 ```
 
 Then drive it from a client, or from a bare stdio handshake:
@@ -42,27 +46,35 @@ the elapsed time predates your build:
 19466  08:25:00  /Users/you/git/gajae-code/packages/coding-agent/dist/gjc sdk broker-internal --agent-dir /Users/you/.gjc/agent
 ```
 
-After `bun run restart:sdk-broker` from your checkout it is replaced by one
-running that checkout's source:
+After `bun run restart:sdk-broker -- --close-session-hosts` from your checkout,
+the broker is replaced by one running that checkout's source:
 
 ```
 79955  00:09  bun --config=.../src/sdk/broker/internal-source.bunfig.toml .../src/cli.ts sdk broker-internal --agent-dir /Users/you/.gjc/agent
 ```
 
 The restart asks the published broker to shut down over its authenticated
-loopback channel and starts a replacement. By default it leaves live session
-hosts alone, so an interactive `gjc` session running in another terminal keeps
-working; pass `--close-session-hosts` to close broker-spawned hosts too.
+loopback channel and starts a replacement. `--close-session-hosts` first closes
+every broker-spawned host in that agent directory, so it can interrupt active
+ACP work; it never closes interactive `gjc` TUI sessions. Without the flag,
+live hosts keep their old entrypoint. A broker-only restart is safe only when
+you will create a fresh ACP session instead of loading or reusing an existing
+one.
 
 Working against a scratch agent directory instead:
 
 ```sh
-bun run restart:sdk-broker -- --agent-dir /tmp/gjc-acp-agent
+bun run restart:sdk-broker -- --agent-dir /tmp/gjc-acp-agent --close-session-hosts
+GJC_CODING_AGENT_DIR=/tmp/gjc-acp-agent gjc acp
 ```
 
-and point the client at it with `GJC_CODING_AGENT_DIR=/tmp/gjc-acp-agent`. A
-fresh agent directory carries no credentials — copy `config.yml`, `models.yml`
-and `models.db` from `~/.gjc/agent` first.
+A fresh agent directory carries no credentials. Stored local credentials live
+in `agent.db`, not `models.db`; do not copy a live SQLite database. Authenticate
+inside the scratch agent directory, use provider environment variables or an
+auth broker, or copy `agent.db` only while no process is using either database.
+For Paseo, put `GJC_CODING_AGENT_DIR` in the provider's `env` entry and restart
+the Paseo daemon, or pass it with `paseo run --env` so the provider process
+receives the override.
 
 ## Confirming what is actually live
 
@@ -87,14 +99,17 @@ paseo daemon restart              # after editing config.json
 paseo provider ls                 # gjc must read `available`, not `error`
 paseo run --provider gjc --cwd /tmp/gjc-acp-test --wait-timeout 3m "your prompt"
 paseo logs <agent-id>             # rendered transcript
-paseo ls                          # status: running / idle / completed / timeout
+paseo ls                          # lifecycle: running / idle / error
 paseo stop <agent-id>             # exercises session/cancel
 paseo delete <agent-id>
 ```
 
 Paseo runs its daemon as a separate long-lived process, so it needs its own
 restart after a config change — but not after a GJC rebuild, since it spawns
-`gjc` per session.
+`gjc` per session. `--wait-timeout 3m` stops the CLI from waiting; it does not
+cancel the agent, which may remain `running`. That timeout is separate from
+GJC's `sdk.promptDeadlineMs`, which defaults to 30 minutes and settles as
+`prompt_deadline_exceeded`.
 
 Errors surface in the daemon log with the JSON-RPC payload intact, which is
 where to look when the CLI prints something opaque like
@@ -106,13 +121,14 @@ grep -i 'failed to create agent' ~/.paseo/daemon.log | tail -1
 
 ## What to smoke-test
 
-Unit tests do not cover the transitions that break in practice. At minimum:
+Unit tests cover the individual terminal and cancellation contracts, but not
+the complete client/daemon/process lifecycle. At minimum:
 
-- **A prompt that makes the agent use a tool and then continue.** Continuations
-  (todo reminders, TTSR resume, auto-continue) re-enter the agent loop and emit
-  a second `agent_start` within one `session/prompt`. Regressions here strand the
-  client until `sdk.promptDeadlineMs` (30 minutes) rather than failing fast, so
-  a run that never leaves `running` is the signal — not an error.
+- **A configured continuation path.** Exercise a deterministic todo reminder,
+  TTSR resume, or auto-continue setup and verify that the same `session/prompt`
+  eventually settles instead of remaining `running`. Different continuation
+  mechanisms may start another agent run or continue within a managed loop, so
+  do not use a fixed `agent_start` count as the invariant.
 - **A follow-up turn on the same session**, including a tool call that touches
   the filesystem.
 - **Cancel mid-turn.** The pending prompt must settle as `cancelled`, and the
