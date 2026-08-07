@@ -1341,6 +1341,69 @@ describe("patch-bearing transcript fallback", () => {
 	});
 });
 
+describe("whole-session persistence freshness", () => {
+	it("reprepares a rewrite when a direct append lands during async preparation", async () => {
+		class RewriteRaceStorage extends MemorySessionStorage {
+			blockNextFlush = false;
+			readonly flushStarted = Promise.withResolvers<void>();
+			readonly releaseFlush = Promise.withResolvers<void>();
+			override openWriter(filePath: string, options?: { flags?: "w" | "a" }): SessionStorageWriter {
+				const writer = super.openWriter(filePath, options);
+				if (filePath.includes(".spill.")) return writer;
+				return {
+					writeLine: writer.writeLine.bind(writer),
+					writeLineSync: writer.writeLineSync.bind(writer),
+					flush: async () => {
+						if (this.blockNextFlush) {
+							this.blockNextFlush = false;
+							this.flushStarted.resolve();
+							await this.releaseFlush.promise;
+						}
+						await writer.flush();
+					},
+					fsync: writer.fsync.bind(writer),
+					close: writer.close.bind(writer),
+					closeSync: writer.closeSync.bind(writer),
+					getError: writer.getError.bind(writer),
+					getCloseState: writer.getCloseState.bind(writer),
+					getCloseError: writer.getCloseError.bind(writer),
+				};
+			}
+		}
+		const storage = new RewriteRaceStorage();
+		const sessionFile = "/sessions/rewrite-race.jsonl";
+		storage.writeTextSync(
+			sessionFile,
+			`${JSON.stringify({ type: "session", version: 5, id: "rewrite-race", timestamp: "0", cwd: "/cwd" })}\n`,
+		);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"off",
+		);
+		try {
+			manager.appendCustomEntry("before", { value: 1 });
+			storage.blockNextFlush = true;
+			const rewrite = manager.rewriteEntries();
+			await storage.flushStarted.promise;
+			const duringId = manager.appendCustomEntry("during", { value: 2 });
+			storage.releaseFlush.resolve();
+			await rewrite;
+			const persisted = storage
+				.readTextSync(sessionFile)
+				.trimEnd()
+				.split("\n")
+				.map(line => JSON.parse(line) as { id?: string });
+			expect(persisted.filter(entry => entry.id === duringId)).toHaveLength(1);
+			expect(manager.getEntry(duringId)).toMatchObject({ id: duringId });
+		} finally {
+			storage.releaseFlush.resolve();
+			await manager.close();
+		}
+	});
+});
 describe("sidecar I/O fallback", () => {
 	it("preserves eager authoritative state when disposable sidecar creation fails", async () => {
 		const sessionFile = "/sessions/sidecar-failure.jsonl";
