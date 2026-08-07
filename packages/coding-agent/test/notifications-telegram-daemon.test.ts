@@ -2986,7 +2986,7 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 through generation 53 ask-tool multi-select rendering", () => {
+	test("keeps wire protocol 3 through generation 55 lazy native authority", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
 		// Generations 34 and 35 add media conversion and topic adoption; generation
 		// 36 bound managed-session replacement to exact native filesystem authority,
@@ -3012,11 +3012,21 @@ describe("telegram daemon", () => {
 		// generation 53 renders multi-select state for ask-tool asks and renumbers
 		// pre-numbered options exactly once around the selection marker;
 		// generation 54 records owner stoppedAt on unclean daemon death so a dead
+<<<<<<< HEAD
 		// process cannot keep advertising itself as the ready owner (#3965).
 		// generation 55 hardens the shared topic authority outage path: a failed
 		// lease renewal on the liveness heartbeat and a failed startup registry
 		// load are reported instead of escaping to the process-level fatal handler.
 		expect(DAEMON_GENERATION).toBe(55);
+||||||| parent of 5d702fb15 (fix(ci): reconcile daemon authority after live-base rebase)
+		// process cannot keep advertising itself as the ready owner (#3965).
+		expect(DAEMON_GENERATION).toBe(54);
+=======
+		// process cannot keep advertising itself as the ready owner (#3965);
+		// generation 55 moves exact unlink and process-incarnation authority behind
+		// lazy native bindings.
+		expect(DAEMON_GENERATION).toBe(55);
+>>>>>>> 5d702fb15 (fix(ci): reconcile daemon authority after live-base rebase)
 	});
 	test.each([
 		"1",

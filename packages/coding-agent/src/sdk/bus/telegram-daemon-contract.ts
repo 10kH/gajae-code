@@ -86,8 +86,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * liveness heartbeat and a failed startup registry load are reported instead
  * of escaping to the process-level fatal handler, authority-failure throws
  * preserve their underlying cause, and the compensation fence retry is bounded.
+ * Generation 56 moves exact unlink and process-incarnation authority behind
+ * lazy native bindings for the startup-cost cut (#3846).
  */
-export const DAEMON_GENERATION = 55;
+export const DAEMON_GENERATION = 56;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 5

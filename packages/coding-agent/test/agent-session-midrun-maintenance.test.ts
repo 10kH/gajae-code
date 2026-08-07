@@ -157,54 +157,6 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		]);
 	}
 
-	async function seedPrunableToolConversation(
-		s: AgentSession,
-		output: string,
-		finalUsageTotal: number,
-	): Promise<string> {
-		const toolCallId = "evict-call";
-		await seed(s, [
-			{ role: "user", content: "first request", timestamp: Date.now() },
-			{
-				role: "assistant",
-				content: [{ type: "toolCall", id: toolCallId, name: "bash", arguments: { command: "cat" } }],
-				api: s.model!.api,
-				provider: s.model!.provider,
-				model: s.model!.id,
-				usage: usage(1_000),
-				stopReason: "toolUse",
-				timestamp: Date.now(),
-			},
-			{ role: "user", content: "second request", timestamp: Date.now() },
-			assistant(s.model!, usage(1_000), "second response"),
-			{ role: "user", content: "third request", timestamp: Date.now() },
-			assistant(s.model!, usage(finalUsageTotal), "final response"),
-		]);
-		await seed(s, [
-			{
-				role: "toolResult",
-				toolCallId,
-				toolName: "bash",
-				content: [{ type: "text", text: output }],
-				isError: false,
-				timestamp: Date.now(),
-			},
-			{
-				role: "toolResult",
-				toolCallId: "recent-call",
-				toolName: "bash",
-				content: [{ type: "text", text: "recent-protected-".repeat(10_000) }],
-				isError: false,
-				timestamp: Date.now(),
-			},
-		]);
-		await seed(s, [
-			{ role: "user", content: "fence request one", timestamp: Date.now() },
-			{ role: "user", content: "fence request two", timestamp: Date.now() },
-		]);
-		return toolCallId;
-	}
-
 	function contextOf(s: AgentSession): AgentContext {
 		return { systemPrompt: s.state.systemPrompt, messages: s.messages, tools: [] };
 	}
