@@ -1341,6 +1341,128 @@ describe("patch-bearing transcript fallback", () => {
 	});
 });
 
+describe("model-change reducer parity", () => {
+	const cases = [
+		{ name: "reviewer-only", roles: ["reviewer"], legacy: false, expected: "reviewer" },
+		{ name: "temporary-only", roles: ["temporary"], legacy: false, expected: "temporary" },
+		{ name: "interleaved-nearest", roles: ["reviewer", "temporary"], legacy: false, expected: "temporary" },
+		{ name: "absent", roles: [], legacy: false, expected: undefined },
+		{ name: "legacy-only", roles: [], legacy: true, expected: undefined },
+		{ name: "explicit-default", roles: [undefined], legacy: true, expected: "default" },
+	] as const;
+
+	for (const parityCase of cases) {
+		it(`matches eager role semantics for ${parityCase.name}`, async () => {
+			const storage = new MemorySessionStorage();
+			const sessionFile = `/sessions/role-${parityCase.name}.jsonl`;
+			const entries: Array<Record<string, unknown>> = [
+				{ type: "session", version: 5, id: `role-${parityCase.name}`, timestamp: "0", cwd: "/cwd" },
+				{
+					type: "message",
+					id: "root",
+					parentId: null,
+					timestamp: "0",
+					message: { role: "user", content: "root", timestamp: 1 },
+				},
+			];
+			let parentId = "root";
+			for (const [index, role] of parityCase.roles.entries()) {
+				const id = `model-${index}`;
+				entries.push({
+					type: "model_change",
+					id,
+					parentId,
+					timestamp: "0",
+					provider: "openai",
+					modelId: `model-${index}`,
+					...(role === undefined ? {} : { role }),
+				});
+				parentId = id;
+			}
+			if (parityCase.legacy) {
+				entries.push({
+					type: "message",
+					id: "legacy-assistant",
+					parentId,
+					timestamp: "0",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "legacy" }],
+						api: "openai-responses",
+						provider: "openai",
+						model: "legacy-model",
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "stop",
+						timestamp: 2,
+					},
+				});
+				parentId = "legacy-assistant";
+			}
+			entries.push(
+				{
+					type: "message",
+					id: "kept",
+					parentId,
+					timestamp: "0",
+					message: { role: "user", content: "kept", timestamp: 3 },
+				},
+				{
+					type: "compaction",
+					id: "compact",
+					parentId: "kept",
+					timestamp: "0",
+					summary: "summary",
+					firstKeptEntryId: "kept",
+					tokensBefore: 3,
+				},
+			);
+			storage.writeTextSync(sessionFile, `${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`);
+			const eager = await SessionManager.open(
+				sessionFile,
+				SessionManager.explicitDestination("/sessions"),
+				storage,
+				"copy-retain",
+				"off",
+			);
+			const eagerRole = eager.getLastModelChangeRole();
+			await eager.close();
+			expect(eagerRole).toBe(parityCase.expected);
+			const retired = await SessionManager.open(
+				sessionFile,
+				SessionManager.explicitDestination("/sessions"),
+				storage,
+				"copy-retain",
+				"enabled",
+			);
+			try {
+				expect(retired.getSessionMemoryStats().coldRetirementActive).toBe(true);
+				expect(retired.getLastModelChangeRole()).toBe(eagerRole);
+			} finally {
+				await retired.close();
+			}
+			const reopened = await SessionManager.open(
+				sessionFile,
+				SessionManager.explicitDestination("/sessions"),
+				storage,
+				"copy-retain",
+				"enabled",
+			);
+			try {
+				expect(reopened.getSessionMemoryStats().lazyReopenSucceeded).toBe(true);
+				expect(reopened.getLastModelChangeRole()).toBe(eagerRole);
+			} finally {
+				await reopened.close();
+			}
+		});
+	}
+});
 describe("branch-heavy retirement", () => {
 	it("retires inactive branches appended after the active compaction boundary", async () => {
 		const storage = new MemorySessionStorage();
