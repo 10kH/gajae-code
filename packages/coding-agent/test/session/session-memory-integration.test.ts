@@ -615,6 +615,24 @@ describe("descriptor-bound capture and staged fork publication", () => {
 		}
 	});
 
+	it("restores eager state before an append would exceed the hot-suffix budget", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/append-budget.jsonl";
+		writeColdTranscript(storage, sessionFile, "/cwd", 12);
+		const manager = await SessionManager.open(sessionFile, SessionManager.explicitDestination("/sessions"), storage);
+		try {
+			manager.setSessionMemoryMode("enabled");
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			manager.setSidecarHotSuffixBudgetForTests(1);
+			manager.appendMessage({ role: "user", content: "budget overflow", timestamp: 1 });
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
+			expect(manager.getEntry("cold-0000")).toMatchObject({ id: "cold-0000" });
+			expect(manager.getEntries()).toHaveLength(14);
+		} finally {
+			await manager.close();
+		}
+	});
+
 	it("preserves a valid final record without a trailing newline and rejects a truncated one", async () => {
 		const storage = new MemorySessionStorage();
 		const sourcePath = "/sessions/no-newline.jsonl";

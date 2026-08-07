@@ -701,6 +701,7 @@ export interface SessionMemorySidecarRuntime {
 	indexPath: string;
 	tailPath: string;
 	commitPath: string;
+	retirementFirstKeptEntryId: string | undefined;
 	/** Hot-suffix byte total (accountant-bounded to ≤ 16 MiB). */
 	hotSuffixBytes: number;
 	accountant: SessionMemoryAccountant;
@@ -8067,6 +8068,7 @@ export class SessionManager {
 			indexPath: this.#sessionFile ? `${this.#sessionFile}.spill.idx` : "",
 			tailPath: this.#sessionFile ? `${this.#sessionFile}.spill.tail` : "",
 			commitPath: this.#sessionFile ? `${this.#sessionFile}.spill.commit` : "",
+			retirementFirstKeptEntryId: undefined,
 			hotSuffixBytes: 0,
 			accountant: new SessionMemoryAccountant(),
 			reducer: {
@@ -8159,6 +8161,7 @@ export class SessionManager {
 		if (!activeCompaction) return;
 		const tailStartOrdinal = sessionEntries.findIndex(entry => entry.id === activeCompaction.firstKeptEntryId);
 		if (tailStartOrdinal < 0) return;
+		runtime.retirementFirstKeptEntryId = activeCompaction.firstKeptEntryId;
 		const header = entries.find((entry): entry is SessionHeader => entry.type === "session");
 		const headerBytes = header
 			? Buffer.concat([this.#serializeEntryLine(header), Buffer.from("\n")])
@@ -8273,12 +8276,10 @@ export class SessionManager {
 	#retireColdEntries(hotSuffixBytes = this.#sidecarHotSuffixBudgetBytes): number {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled || runtime.sidecarIneligible || this.#fileEntries.length === 0) return 0;
-		const latestCompaction = [...this.#fileEntries]
-			.reverse()
-			.find((entry): entry is CompactionEntry => entry.type === "compaction");
-		if (!latestCompaction) return 0;
+		const retirementFirstKeptEntryId = runtime.retirementFirstKeptEntryId;
+		if (!retirementFirstKeptEntryId) return 0;
 		const firstKeptIndex = this.#fileEntries.findIndex(
-			entry => entry.type !== "session" && entry.id === latestCompaction.firstKeptEntryId,
+			entry => entry.type !== "session" && entry.id === retirementFirstKeptEntryId,
 		);
 		if (firstKeptIndex <= 0) return 0;
 		if (!this.#fileEntries.slice(0, firstKeptIndex).some(entry => entry.type !== "session")) return 0;
@@ -9725,6 +9726,19 @@ export class SessionManager {
 		this.#assertRecoveryHydrationWritable();
 		const normalizedEntry = normalizeSessionEntryForStorage(entry);
 		const residentEntry = this.#prepareEntryForCurrentResidentStore(normalizedEntry) as SessionEntry;
+		let sidecarAppendCharge = 0;
+		const activeRuntime = entry.type === "compaction" && this.#sidecarRuntime ? undefined : this.#sidecarRuntime;
+		if (activeRuntime && this.#coldSidecarActive()) {
+			const appendedBytes = this.#serializeEntryLine(residentEntry).byteLength;
+			if (
+				activeRuntime.hotSuffixBytes + appendedBytes > this.#sidecarHotSuffixBudgetBytes ||
+				!activeRuntime.accountant.tryCharge(appendedBytes)
+			) {
+				this.#deactivateColdForBranchMutation();
+			} else {
+				sidecarAppendCharge = appendedBytes;
+			}
+		}
 		const previousLeafId = this.#leafId;
 		const priorPersistenceError = this.#persistError;
 		this.#fileEntries.push(residentEntry);
@@ -9745,16 +9759,15 @@ export class SessionManager {
 			this.#bumpEntryRevision();
 			this.#leafRevision++;
 			if (entry.type === "label") this.#labelRevision++;
+			if (sidecarAppendCharge > 0) activeRuntime?.accountant.release(sidecarAppendCharge);
 			throw new SessionAppendPersistenceError(
 				priorPersistenceError ? "prior_failure" : "current_append",
 				residentEntry.id,
 				this.#persistError ?? toError(error),
 			);
 		}
-		if (entry.type !== "compaction" && this.#coldSidecarActive() && this.#sidecarRuntime) {
-			const appendedBytes = this.#serializeEntryLine(residentEntry).byteLength;
-			this.#sidecarRuntime.hotSuffixBytes += appendedBytes;
-			this.#sidecarRuntime.accountant.charge(appendedBytes);
+		if (sidecarAppendCharge > 0 && activeRuntime && this.#coldSidecarActive()) {
+			activeRuntime.hotSuffixBytes += sidecarAppendCharge;
 		}
 		// Same validated, overflow-guarded aggregation as the resume path (#buildIndex): a
 		// malformed task-result or assistant usage shape reaching the append path must not
@@ -10372,6 +10385,10 @@ export class SessionManager {
 		};
 	}
 
+	setSidecarHotSuffixBudgetForTests(bytes: number): void {
+		if (!Number.isSafeInteger(bytes) || bytes < 0) throw new RangeError("invalid_sidecar_hot_suffix_budget");
+		this.#sidecarHotSuffixBudgetBytes = bytes;
+	}
 	hotRetainedMessageCharsForTests(): number {
 		let total = 0;
 		for (const entry of this.#fileEntries) {
