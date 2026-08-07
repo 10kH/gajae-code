@@ -1131,13 +1131,16 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 	patchLine(ordinal: number, bytes: Uint8Array): void {
 		this.#assertOpen();
 		const existing = this.#findLine(ordinal);
-		if (!existing) throw new RangeError("Line ordinal is not staged");
 		const lineLength = bytes.byteLength + 1;
-		if (this.#pendingPatches.has(ordinal)) {
-			const prior = this.#pendingPatches.get(ordinal)!;
-			this.#pendingPatchBytes -= prior.byteLength;
+		const prior = this.#pendingPatches.get(ordinal);
+		if (prior) {
+			const nextPatchBytes = this.#pendingPatchBytes - prior.byteLength + bytes.byteLength;
+			if (nextPatchBytes > STAGED_WRITER_PATCH_LIMIT_BYTES) {
+				this.#error = new Error("staged_overlay_capacity_exceeded");
+				throw this.#error;
+			}
 			this.#pendingPatches.set(ordinal, Buffer.from(bytes));
-			this.#pendingPatchBytes += bytes.byteLength;
+			this.#pendingPatchBytes = nextPatchBytes;
 			return;
 		}
 		if (lineLength === existing.length) {
@@ -1148,16 +1151,15 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 			}
 			return;
 		}
-		if (this.#pendingPatches.size >= STAGED_WRITER_PATCH_MAX_COUNT) {
+		if (
+			this.#pendingPatches.size >= STAGED_WRITER_PATCH_MAX_COUNT ||
+			this.#pendingPatchBytes + bytes.byteLength > STAGED_WRITER_PATCH_LIMIT_BYTES
+		) {
 			this.#error = new Error("staged_overlay_capacity_exceeded");
 			throw this.#error;
 		}
 		this.#pendingPatches.set(ordinal, Buffer.from(bytes));
 		this.#pendingPatchBytes += bytes.byteLength;
-		if (this.#pendingPatchBytes > STAGED_WRITER_PATCH_LIMIT_BYTES) {
-			this.#error = new Error("staged_overlay_capacity_exceeded");
-			throw this.#error;
-		}
 	}
 
 	#findLine(ordinal: number): { offset: number; length: number } {
@@ -2264,23 +2266,26 @@ class MemoryStagedStreamingWriter implements StagedStreamingWriter {
 			this.#lines[ordinal] = Buffer.from(bytes);
 			return;
 		}
-		if (this.#pendingPatches.has(ordinal)) {
-			const prior = this.#pendingPatches.get(ordinal)!;
-			this.#pendingPatchBytes -= prior.byteLength;
+		const prior = this.#pendingPatches.get(ordinal);
+		if (prior) {
+			const nextPatchBytes = this.#pendingPatchBytes - prior.byteLength + bytes.byteLength;
+			if (nextPatchBytes > STAGED_WRITER_PATCH_LIMIT_BYTES) {
+				this.#error = new Error("staged_overlay_capacity_exceeded");
+				throw this.#error;
+			}
 			this.#pendingPatches.set(ordinal, Buffer.from(bytes));
-			this.#pendingPatchBytes += bytes.byteLength;
+			this.#pendingPatchBytes = nextPatchBytes;
 			return;
 		}
-		if (this.#pendingPatches.size >= STAGED_WRITER_PATCH_MAX_COUNT) {
+		if (
+			this.#pendingPatches.size >= STAGED_WRITER_PATCH_MAX_COUNT ||
+			this.#pendingPatchBytes + bytes.byteLength > STAGED_WRITER_PATCH_LIMIT_BYTES
+		) {
 			this.#error = new Error("staged_overlay_capacity_exceeded");
 			throw this.#error;
 		}
 		this.#pendingPatches.set(ordinal, Buffer.from(bytes));
 		this.#pendingPatchBytes += bytes.byteLength;
-		if (this.#pendingPatchBytes > STAGED_WRITER_PATCH_LIMIT_BYTES) {
-			this.#error = new Error("staged_overlay_capacity_exceeded");
-			throw this.#error;
-		}
 	}
 
 	flush(): void {
