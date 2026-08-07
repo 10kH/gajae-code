@@ -8085,11 +8085,29 @@ export class SessionManager {
 		return runtime;
 	}
 
-	/** Serialize one FileEntry line to bytes (may be a header or a session/cold entry). */
+	/** Serialize side-effect-free candidate bytes for one header/session entry. */
 	#serializeEntryLine(entry: FileEntry): Buffer {
 		const materialized = materializeResidentEntryForPersistenceSync(entry, this.#residentBlobStores(), new Map());
-		const persisted = prepareEntryForPersistenceSync(materialized, this.#blobStore);
-		return Buffer.from(JSON.stringify(persisted), "utf8");
+		return Buffer.from(JSON.stringify(materialized), "utf8");
+	}
+
+	#transcriptContainsPatchRecords(): boolean {
+		if (!this.#sessionFile || typeof this.storage.readRangeSync !== "function") return true;
+		const readRangeSync = this.storage.readRangeSync.bind(this.storage);
+		let size: number;
+		try {
+			size = this.storage.statSync(this.#sessionFile).size;
+		} catch {
+			return true;
+		}
+		let carry = "";
+		for (let offset = 0; offset < size; offset += 64 * 1024) {
+			const length = Math.min(64 * 1024, size - offset);
+			const text = carry + Buffer.from(readRangeSync(this.#sessionFile, offset, length).bytes).toString("utf8");
+			if (/"type"\s*:\s*"(?:header|entry)_patch"/.test(text)) return true;
+			carry = text.slice(-128);
+		}
+		return false;
 	}
 
 	/** Build a fresh disposable `.spill.idx`/`.spill.tail`/`.spill.commit` set from the transcript. */
@@ -8128,6 +8146,10 @@ export class SessionManager {
 		)
 			return;
 		const sessionEntries = entries.filter((entry): entry is SessionEntry => entry.type !== "session");
+		if (this.#transcriptContainsPatchRecords()) {
+			runtime.sidecarIneligible = true;
+			return;
+		}
 		let activeCompaction: CompactionEntry | undefined;
 		let active = this.#leafId ? this.#byId.get(this.#leafId) : undefined;
 		let activeSteps = 0;

@@ -328,6 +328,56 @@ describe("active branch retirement boundary", () => {
 	});
 });
 
+describe("patch-bearing transcript fallback", () => {
+	it("keeps patch-bearing transcripts eager so raw offsets cannot drift", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/patched.jsonl";
+		const records = [
+			{ type: "session", version: 5, id: "patched", timestamp: "0", cwd: "/cwd" },
+			{
+				type: "message",
+				id: "m0",
+				parentId: null,
+				timestamp: "0",
+				message: { role: "user", content: "original", timestamp: 0 },
+			},
+			{
+				type: "entry_patch",
+				entryId: "m0",
+				patch: { message: { role: "user", content: "updated", timestamp: 0 } },
+			},
+			{
+				type: "message",
+				id: "m1",
+				parentId: "m0",
+				timestamp: "0",
+				message: { role: "user", content: "kept", timestamp: 1 },
+			},
+			{
+				type: "compaction",
+				id: "c1",
+				parentId: "m1",
+				timestamp: "0",
+				summary: "summary",
+				firstKeptEntryId: "m1",
+				tokensBefore: 10,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		const manager = await SessionManager.open(sessionFile, SessionManager.explicitDestination("/sessions"), storage);
+		try {
+			manager.setSessionMemoryMode("enabled");
+			expect(manager.getSessionMemoryStats()).toMatchObject({
+				coldRetirementActive: false,
+				sidecarIneligible: true,
+			});
+			expect(manager.getEntry("m0")).toMatchObject({ message: { content: "updated" } });
+		} finally {
+			await manager.close();
+		}
+	});
+});
+
 describe("sidecar I/O fallback", () => {
 	it("preserves eager authoritative state when disposable sidecar creation fails", async () => {
 		const sessionFile = "/sessions/sidecar-failure.jsonl";
