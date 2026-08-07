@@ -3307,32 +3307,37 @@ function receiptPair(scope: ManagedScope, candidate: ManagedCandidate): ManagedC
 	const directory = path.join(managedInternalDirectory(scope), MANAGED_RECEIPTS_DIRECTORY);
 	try {
 		for (const name of fs.readdirSync(directory)) {
-			const pathname = path.join(directory, name);
-			const value: unknown = JSON.parse(captureManagedFileNoFollow(pathname).bytes.toString("utf8"));
-			if (!value || typeof value !== "object") continue;
-			const record = value as { source?: { path?: unknown }; destination?: { path?: unknown } };
-			const otherPath =
-				record.source?.path === candidate.path
-					? record.destination?.path
-					: record.destination?.path === candidate.path
-						? record.source?.path
-						: undefined;
-			if (typeof otherPath !== "string") continue;
-			const other = inspectCandidate(otherPath, candidate.provenance === "v2" ? "legacy" : "v2");
-			if (
-				"code" in other ||
-				!receiptMatches(
-					pathname,
-					candidate.provenance === "legacy" ? candidate : other,
-					candidate.provenance === "v2" ? candidate : other,
-					scope,
+			try {
+				const pathname = path.join(directory, name);
+				const value: unknown = JSON.parse(captureManagedFileNoFollow(pathname).bytes.toString("utf8"));
+				if (!value || typeof value !== "object") continue;
+				const record = value as { source?: { path?: unknown }; destination?: { path?: unknown } };
+				const otherPath =
+					record.source?.path === candidate.path
+						? record.destination?.path
+						: record.destination?.path === candidate.path
+							? record.source?.path
+							: undefined;
+				if (typeof otherPath !== "string") continue;
+				const other = inspectCandidate(otherPath, candidate.provenance === "v2" ? "legacy" : "v2");
+				if (
+					"code" in other ||
+					!receiptMatches(
+						pathname,
+						candidate.provenance === "legacy" ? candidate : other,
+						candidate.provenance === "v2" ? candidate : other,
+						scope,
+					)
 				)
-			)
-				continue;
-			return other;
+					continue;
+				return other;
+			} catch {
+				// Native cleanup residues, symlinks, and malformed files grant no authority;
+				// continue to the deterministic committed receipt instead of aborting the scan.
+			}
 		}
 	} catch {
-		/* no committed pair grants no shadow authority */
+		/* a missing receipts directory grants no shadow authority */
 	}
 	return undefined;
 }
