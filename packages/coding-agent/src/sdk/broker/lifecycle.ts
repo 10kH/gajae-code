@@ -4,7 +4,15 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { NativeExactUnlinkResult } from "@gajae-code/natives";
-import * as native from "@gajae-code/natives";
+
+let nativeLifecycleBindings: typeof import("@gajae-code/natives") | undefined;
+
+function nativeLifecycle(): typeof import("@gajae-code/natives") {
+	if (!nativeLifecycleBindings)
+		nativeLifecycleBindings = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
+	return nativeLifecycleBindings;
+}
+
 import { $credentialEnv, resolveEquivalentPath } from "@gajae-code/utils";
 
 import {
@@ -1123,7 +1131,7 @@ function exactUnlinkLifecycleFile(
 	plannedPath: string,
 	parentIdentity?: { dev: bigint; ino: bigint },
 ): NativeExactUnlinkResult {
-	return native.exactUnlink(file, {
+	return nativeLifecycle().exactUnlink(file, {
 		...identity,
 		quarantineName: path.basename(plannedPath),
 		...(parentIdentity ? { parentDev: parentIdentity.dev, parentIno: parentIdentity.ino } : {}),
@@ -1874,7 +1882,7 @@ async function reconcileLifecycleCleanup(
 			});
 		}
 		const currentFile = activeCleanup.lifecycleFiles![index];
-		const result = native.exactUnlink(activePath, {
+		const result = nativeLifecycle().exactUnlink(activePath, {
 			...captured.identity,
 			parentDev: BigInt(activeCleanup.lifecycleParentIdentity!.dev),
 			parentIno: BigInt(activeCleanup.lifecycleParentIdentity!.ino),
@@ -2458,6 +2466,14 @@ async function launchInput(
 	} catch {
 		return fail("invalid_input", "Lifecycle worktree does not exist.");
 	}
+	let modelPreset = text(input.modelPreset);
+	if (input.modelPreset !== undefined && (typeof input.modelPreset !== "string" || input.modelPreset.length === 0))
+		return fail("invalid_input", "modelPreset must be a non-empty exact profile ID.");
+	if (modelPreset !== undefined) {
+		const validatedModelPreset = validateBrokerModelPreset(broker.settings.agentDir, modelPreset);
+		if (typeof validatedModelPreset !== "string") return validatedModelPreset;
+		modelPreset = validatedModelPreset;
+	}
 	const worktree = lifecycleWorktreeTarget(input);
 	if (worktree === null || (worktree !== undefined && requestedCwd === undefined))
 		return fail("invalid_input", "Lifecycle worktree target is invalid.");
@@ -2486,9 +2502,6 @@ async function launchInput(
 	const requested = sessionId(input);
 	if (requested !== undefined && !isCanonicalSessionId(requested))
 		return fail("invalid_input", "sessionId must be a canonical safe identifier.");
-	if (input.modelPreset !== undefined && (typeof input.modelPreset !== "string" || input.modelPreset.length === 0))
-		return fail("invalid_input", "modelPreset must be a non-empty exact profile ID.");
-	const modelPreset = text(input.modelPreset);
 	if (input.mcpServers !== undefined && !isSessionLifecycleMcpServers(input.mcpServers))
 		return fail("invalid_input", "mcpServers must contain unique valid stdio, HTTP, or SSE server definitions.");
 	const mcpServers = input.mcpServers as SessionLifecycleMcpServer[] | undefined;
@@ -3106,11 +3119,6 @@ async function executeLifecycleResponse(
 
 		const launch = await launchInput(broker, operation, input);
 		if ("ok" in launch) return launch;
-		if (launch.modelPreset) {
-			const validatedModelPreset = validateBrokerModelPreset(broker.settings.agentDir, launch.modelPreset);
-			if (typeof validatedModelPreset !== "string") return validatedModelPreset;
-			launch.modelPreset = validatedModelPreset;
-		}
 		if (!hasProcessIncarnationAuthority())
 			return fail(
 				"incarnation_unavailable",
@@ -3527,7 +3535,7 @@ async function executeLifecycleResponse(
 				if (stat.isSymbolicLink() || !stat.isDirectory())
 					return fail("terminal_uncertain", "Artifact cleanup target is not an exact directory.");
 				validateManagedArtifactTree(artifactsPath);
-				const tree = native.snapshotDirectoryTree(artifactsPath);
+				const tree = nativeLifecycle().snapshotDirectoryTree(artifactsPath);
 				if (!tree.ok || !tree.snapshot)
 					return fail(
 						"terminal_uncertain",

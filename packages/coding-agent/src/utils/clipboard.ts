@@ -1,6 +1,13 @@
 import { execSync } from "node:child_process";
 import type { ClipboardImage } from "@gajae-code/natives";
-import * as native from "@gajae-code/natives";
+
+let nativeClipboardModule: typeof import("@gajae-code/natives") | undefined;
+
+function nativeClipboard(): typeof import("@gajae-code/natives") {
+	nativeClipboardModule ??= require("@gajae-code/natives") as typeof import("@gajae-code/natives");
+	return nativeClipboardModule;
+}
+
 import { logger } from "@gajae-code/utils";
 
 function hasDisplay(): boolean {
@@ -60,7 +67,7 @@ export async function copyToClipboard(text: string): Promise<void> {
 			}
 		}
 
-		await native.copyToClipboard(text);
+		nativeClipboard().copyToClipboard(text);
 	} catch {
 		// Ignore — clipboard copy is best-effort
 	}
@@ -152,5 +159,5 @@ export async function readImageFromClipboard(): Promise<ClipboardImage | null> {
 		return null;
 	}
 
-	return (await native.readImageFromClipboard()) ?? null;
+	return (await nativeClipboard().readImageFromClipboard()) ?? null;
 }
