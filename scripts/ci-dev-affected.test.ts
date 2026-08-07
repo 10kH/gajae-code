@@ -1045,8 +1045,9 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(testTask?.command).toEqual(["bun", "test", "packages/coding-agent/test/edit/foo.test.ts"]);
 	});
 
-	test("SDK host and coordinator prompt-control changes include only coding-agent shard 1", () => {
+	test("SDK host and coordinator prompt-control changes include shard 1 and the isolated production host", () => {
 		const shardOne = "test:@gajae-code/coding-agent:shard-1-of-8";
+		const isolated = "test:@gajae-code/coding-agent:sdk-production-host-isolated";
 		for (const changedPath of [
 			"packages/coding-agent/src/sdk/bus/index.ts",
 			"packages/coding-agent/src/sdk/host/reverse-leases.ts",
@@ -1059,6 +1060,14 @@ describe("planTargetedTasks PR-mode targeting", () => {
 			expect(keys).toContain(shardOne);
 			expect(tasks.find(task => task.key === shardOne)?.command).toEqual(["bun", "test", "--shard=1/8"]);
 			expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toEqual([shardOne]);
+			expect(keys).toContain(isolated);
+			expect(tasks.find(task => task.key === isolated)?.command).toEqual([
+				"bun",
+				"test",
+				"test/sdk-chat-daemon-worker.test.ts",
+				"-t",
+				"routes Slack safe queries through the production Session SDK host",
+			]);
 		}
 	});
 
@@ -1067,6 +1076,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		const keys = tasks.map(task => task.key);
 		expect(keys).toContain("check:@gajae-code/coding-agent");
 		expect(keys).toContain("test:@gajae-code/coding-agent:shard-1-of-8");
+		expect(keys).toContain("test:@gajae-code/coding-agent:sdk-production-host-isolated");
 		expect(keys).not.toContain("test:packages/coding-agent/test/sdk/index.test.ts");
 		expect(keys).not.toContain("test:packages/coding-agent/test/other/index.test.ts");
 		expect(describeTasks(tasks).find(entry => entry.key === "check:@gajae-code/coding-agent")).toMatchObject({

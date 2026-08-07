@@ -895,6 +895,7 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 		}
 		if (isCodingAgentShardOneCoveragePath(changedPath)) {
 			addCodingAgentTestShard(tasks, 1);
+			addCodingAgentSdkProductionHostTask(tasks);
 		}
 
 		if (mappedTests.length > 0) {
@@ -966,6 +967,20 @@ function addPackageTestTasks(tasks: Map<string, Task>, workspacePackage: Workspa
 	for (let shard = 1; shard <= total; shard++) {
 		addCodingAgentTestShard(tasks, shard, total);
 	}
+	addCodingAgentSdkProductionHostTask(tasks);
+}
+
+function addCodingAgentTestShard(tasks: Map<string, Task>, shard: number, total: number = codingAgentTestShards()): void {
+	add(
+		tasks,
+		`test:@gajae-code/coding-agent:shard-${shard}-of-${total}`,
+		`Test @gajae-code/coding-agent shard ${shard}/${total}`,
+		["bun", "test", `--shard=${shard}/${total}`],
+		resolvePackageCwd("packages/coding-agent"),
+	);
+}
+
+function addCodingAgentSdkProductionHostTask(tasks: Map<string, Task>): void {
 	add(
 		tasks,
 		"test:@gajae-code/coding-agent:sdk-production-host-isolated",
@@ -977,16 +992,6 @@ function addPackageTestTasks(tasks: Map<string, Task>, workspacePackage: Workspa
 			"-t",
 			"routes Slack safe queries through the production Session SDK host",
 		],
-		resolvePackageCwd("packages/coding-agent"),
-	);
-}
-
-function addCodingAgentTestShard(tasks: Map<string, Task>, shard: number, total: number = codingAgentTestShards()): void {
-	add(
-		tasks,
-		`test:@gajae-code/coding-agent:shard-${shard}-of-${total}`,
-		`Test @gajae-code/coding-agent shard ${shard}/${total}`,
-		["bun", "test", `--shard=${shard}/${total}`],
 		resolvePackageCwd("packages/coding-agent"),
 	);
 }

@@ -1397,7 +1397,9 @@ describe("chat daemon worker", () => {
 					if (reconciliationCount === 2) generationTwoReconciled.resolve();
 				});
 				await withStageTimeout("first runtime start", firstRuntime.start());
-				const firstCommandResult = firstProvider.waitForPostCount(1, () => true);
+				const firstCommandResult = firstProvider.waitForPostCount(1, post =>
+					post.text.includes('"operation":"todo.list"'),
+				);
 				await firstProvider.handler?.(command("first"));
 				await withStageTimeout("first Slack SDK result", firstCommandResult);
 				expect(firstProvider.posts.filter(post => post.text.includes('"operation":"todo.list"'))).toHaveLength(1);
@@ -1418,7 +1420,9 @@ describe("chat daemon worker", () => {
 				expect(tick).toBeDefined();
 				tick?.();
 				await withStageTimeout("generation-two reconciliation", generationTwoReconciled.promise);
-				const generationTwoCommandResult = firstProvider.waitForPostCount(2, () => true);
+				const generationTwoCommandResult = firstProvider.waitForPostCount(2, post =>
+					post.text.includes('"operation":"todo.list"'),
+				);
 				await firstProvider.handler?.(command("generation-two"));
 				await withStageTimeout("generation-two Slack SDK result", generationTwoCommandResult);
 				expect(firstProvider.posts.filter(post => post.text.includes('"operation":"todo.list"'))).toHaveLength(2);
@@ -1427,7 +1431,9 @@ describe("chat daemon worker", () => {
 
 				const restartedProvider = new FakeSlackProvider();
 				const restartedRuntime = startRuntime(restartedProvider);
-				const restartedCommandResult = restartedProvider.waitForPostCount(1, () => true);
+				const restartedCommandResult = restartedProvider.waitForPostCount(1, post =>
+					post.text.includes('"operation":"todo.list"'),
+				);
 				await withStageTimeout("restarted runtime start", restartedRuntime.start());
 				await restartedProvider.handler?.(command("after-restart"));
 				await withStageTimeout("restarted Slack SDK result", restartedCommandResult);
