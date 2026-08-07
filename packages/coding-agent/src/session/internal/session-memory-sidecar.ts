@@ -614,6 +614,7 @@ export interface TailRecord {
 
 /** Input for appending to a rolling tail chain (checksum is computed). */
 export interface TailRecordInput {
+	gen?: number;
 	seq: number;
 	kind: TailRecordKind;
 	ordinal: number;
@@ -667,6 +668,29 @@ export function computeC0(base: BaseAnchor, seq0: number, lineDigest0: string): 
 	return hashChain([base.baseDigest, base.baseEndOffset, seq0, lineDigest0]);
 }
 
+/** Checksum one complete tail record, including every field used for ordering or lookup. */
+export function computeTailRecordChecksum(
+	base: BaseAnchor,
+	previousChecksum: string | undefined,
+	record: TailRecordInput & { gen?: number },
+): string {
+	const fields: Array<string | number> = [
+		record.gen ?? 0,
+		record.seq,
+		record.kind,
+		record.ordinal,
+		record.id,
+		record.parentId === null ? "<null>" : record.parentId,
+		record.type,
+		record.byteOffset,
+		record.byteLength,
+		record.recordDigest,
+	];
+	return previousChecksum === undefined
+		? hashChain([base.baseDigest, base.baseEndOffset, ...fields])
+		: hashChain([previousChecksum, ...fields]);
+}
+
 /** Terminal checksum for a committed tail (empty chain → base only). */
 export function computeTerminalChecksum(base: BaseAnchor, records: readonly TailRecord[]): string {
 	if (records.length === 0) return hashChain([base.baseDigest, base.baseEndOffset]);
@@ -695,10 +719,7 @@ export function validateTailChain(base: BaseAnchor, records: readonly TailRecord
 		if (record.byteOffset !== expectedOffset) {
 			return { valid: false, firstInvalidSeq: record.seq, reason: "offset_discontinuity" };
 		}
-		const expectedChecksum =
-			previousChecksum === undefined
-				? computeC0(base, record.seq, record.recordDigest)
-				: hashChain([previousChecksum, record.seq, record.byteOffset, record.byteLength, record.recordDigest]);
+		const expectedChecksum = computeTailRecordChecksum(base, previousChecksum, record);
 		if (record.checksum !== expectedChecksum) {
 			return { valid: false, firstInvalidSeq: record.seq, reason: "checksum_mismatch" };
 		}
@@ -736,14 +757,11 @@ export class RollingTailChainBuilder {
 		const expectedSeq = this.lastSeq + 1;
 		if (input.seq !== expectedSeq) throw new Error("tail_seq_discontinuity");
 		if (input.byteOffset !== this.lastEndOffset) throw new Error("tail_offset_discontinuity");
-		const checksum =
-			this.lastChecksum === undefined
-				? computeC0(this.base, input.seq, input.recordDigest)
-				: hashChain([this.lastChecksum, input.seq, input.byteOffset, input.byteLength, input.recordDigest]);
+		const checksum = computeTailRecordChecksum(this.base, this.lastChecksum, input);
 		const residentBytes = residentRecordBytes(input.id.length + (input.parentId?.length ?? 0) + input.type.length);
 		if (residentBytes > this.remainingTailBytes) return undefined;
 		this.remainingTailBytes -= residentBytes;
-		const record: TailRecord = { ...input, gen: 0, checksum };
+		const record: TailRecord = { ...input, gen: input.gen ?? 0, checksum };
 		this.records.push(record);
 		this.lastSeq = input.seq;
 		this.lastEndOffset = input.byteOffset + input.byteLength;

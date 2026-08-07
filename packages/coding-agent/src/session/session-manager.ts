@@ -92,12 +92,11 @@ import {
 	type CommitMarkerContents,
 	type CommittedTail,
 	classifyReopen,
-	computeC0,
 	computeLineDigest,
+	computeTailRecordChecksum,
 	type DescriptorSnapshot,
 	FixedCacheAccount,
 	getLastModelChangeRole as getReducerLastModelChangeRole,
-	hashChain,
 	isDerivedSessionMemoryFile,
 	LABELS_PINS_BUDGET_BYTES,
 	REDUCER_BUDGET_BYTES,
@@ -6398,7 +6397,8 @@ export class SessionManager {
 			this.#leafId = discovery.leafId;
 			this.#usageStatistics = discovery.usageStatistics;
 			this.#publishCommitMarkerFromCurrentTranscriptSync();
-			if (!this.storage.existsSync(runtime.commitPath)) {
+			const publishedTransition = this.#classifySidecarReopen();
+			if (publishedTransition.kind !== "exact") {
 				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
 				return false;
 			}
@@ -9055,12 +9055,16 @@ export class SessionManager {
 			return;
 		}
 		const tailBuilder = new RollingTailChainBuilder({ baseDigest, baseEndOffset });
-		const indexWriter = this.storage.openWriter(runtime.indexPath, { flags: "w" });
-		const tailWriter = this.storage.openWriter(runtime.tailPath, { flags: "w" });
+		let indexWriter: SessionStorageWriter | undefined;
+		let tailWriter: SessionStorageWriter | undefined;
 		let runningOffset = headerBytes.byteLength;
 		let tailSeq = 0;
 		let buildFailed = false;
+		let operationError: unknown;
+		let closeError: unknown;
 		try {
+			indexWriter = this.storage.openWriter(runtime.indexPath, { flags: "w" });
+			tailWriter = this.storage.openWriter(runtime.tailPath, { flags: "w" });
 			for (let ordinal = 0; ordinal < sessionEntries.length; ordinal++) {
 				const entry = sessionEntries[ordinal];
 				const persistedLine = Buffer.concat([this.#serializeEntryLine(entry), Buffer.from("\n")]);
@@ -9073,7 +9077,7 @@ export class SessionManager {
 					byteLength: persistedLine.byteLength,
 					recordDigest,
 				})}\n`;
-				indexWriter.writeLineSync(indexLine);
+				indexWriter!.writeLineSync(indexLine);
 				runtime.indexHash.update(Buffer.from(indexLine, "utf8"));
 				if (ordinal >= tailStartOrdinal) {
 					const record = tailBuilder.append({
@@ -9091,15 +9095,26 @@ export class SessionManager {
 						buildFailed = true;
 						break;
 					}
-					tailWriter.writeLineSync(`${JSON.stringify(record)}\n`);
+					tailWriter!.writeLineSync(`${JSON.stringify(record)}\n`);
 					tailSeq++;
 				}
 				runningOffset += persistedLine.byteLength;
 			}
+		} catch (error) {
+			operationError = error;
 		} finally {
-			indexWriter.closeSync();
-			tailWriter.closeSync();
+			try {
+				indexWriter?.closeSync();
+			} catch (error) {
+				closeError = error;
+			}
+			try {
+				tailWriter?.closeSync();
+			} catch (error) {
+				closeError ??= error;
+			}
 		}
+		if (operationError ?? closeError) throw operationError ?? closeError;
 		for (const [id, label] of this.#labelsById) {
 			if (!runtime.labelsPins.setLabel(id, label)) {
 				buildFailed = true;
@@ -9171,7 +9186,10 @@ export class SessionManager {
 			REDUCER_BUDGET_BYTES +
 			LABELS_PINS_BUDGET_BYTES +
 			1024 * 1024;
-		if (!runtime.accountant.tryCharge(fixedReservedBytes + retainedBytes)) return 0;
+		const targetAccountedBytes = fixedReservedBytes + retainedBytes;
+		const accountedDelta = targetAccountedBytes - runtime.accountant.totalBytes;
+		if (accountedDelta > 0 && !runtime.accountant.tryCharge(accountedDelta)) return 0;
+		if (accountedDelta < 0) runtime.accountant.release(-accountedDelta);
 		let retired = 0;
 		for (let i = 0; i < firstKeptIndex; i++) {
 			if (this.#fileEntries[i].type !== "session") retired++;
@@ -9439,6 +9457,61 @@ export class SessionManager {
 		}
 	}
 
+	#advanceColdTailBoundary(firstKeptEntryId: string): boolean {
+		const runtime = this.#sidecarRuntime;
+		const sessionFile = this.#sessionFile;
+		if (!runtime?.enabled || !sessionFile || !runtime.tailPath || !this.storage.readRangeSync) return false;
+		const firstIndex = runtime.tail.records.findIndex(record => record.id === firstKeptEntryId);
+		if (firstIndex < 0) return false;
+		const firstRecord = runtime.tail.records[firstIndex];
+		const baseHash = crypto.createHash("sha256");
+		try {
+			for (let offset = 0; offset < firstRecord.byteOffset; offset += 64 * 1024) {
+				const length = Math.min(64 * 1024, firstRecord.byteOffset - offset);
+				baseHash.update(this.storage.readRangeSync(sessionFile, offset, length).bytes);
+			}
+			const base: BaseAnchor = { baseDigest: baseHash.digest("hex"), baseEndOffset: firstRecord.byteOffset };
+			const builder = new RollingTailChainBuilder(base);
+			for (let index = firstIndex; index < runtime.tail.records.length; index++) {
+				const prior = runtime.tail.records[index];
+				const appended = builder.append({
+					gen: prior.gen,
+					seq: index - firstIndex,
+					kind: prior.kind,
+					ordinal: prior.ordinal,
+					id: prior.id,
+					parentId: prior.parentId,
+					type: prior.type,
+					byteOffset: prior.byteOffset,
+					byteLength: prior.byteLength,
+					recordDigest: prior.recordDigest,
+				});
+				if (!appended) return false;
+			}
+			const tail = builder.build();
+			const writer = this.storage.openWriter(runtime.tailPath, { flags: "w" });
+			try {
+				for (const record of tail.records) writer.writeLineSync(`${JSON.stringify(record)}\n`);
+			} finally {
+				writer.closeSync();
+			}
+			runtime.base = base;
+			runtime.tail = tail;
+			runtime.tailCache.release(runtime.tailCache.allocatedBytes);
+			for (const record of tail.records) {
+				if (
+					!runtime.tailCache.tryAllocate(
+						residentRecordBytes(record.id.length + (record.parentId?.length ?? 0) + record.type.length),
+					)
+				)
+					return false;
+			}
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
 	#appendColdSidecarRecord(entry: SessionEntry, persistedLine: Buffer): boolean {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled || runtime.sidecarIneligible) return false;
@@ -9447,10 +9520,7 @@ export class SessionManager {
 		const byteOffset = runtime.tail.transcriptSize;
 		const byteLength = persistedLine.byteLength;
 		const recordDigest = computeLineDigest(persistedLine);
-		const checksum = previous
-			? hashChain([previous.checksum, seq, byteOffset, byteLength, recordDigest])
-			: computeC0(runtime.base, seq, recordDigest);
-		const record: TailRecord = {
+		const recordWithoutChecksum = {
 			gen: this.#commitGen + 1,
 			seq,
 			kind: tailRecordKindForEntry(entry),
@@ -9461,8 +9531,9 @@ export class SessionManager {
 			byteOffset,
 			byteLength,
 			recordDigest,
-			checksum,
 		};
+		const checksum = computeTailRecordChecksum(runtime.base, previous?.checksum, recordWithoutChecksum);
+		const record: TailRecord = { ...recordWithoutChecksum, checksum };
 		try {
 			const indexWriter = this.storage.openWriter(runtime.indexPath, { flags: "a" });
 			try {
@@ -10918,10 +10989,14 @@ export class SessionManager {
 			this.storage.existsSync(this.#sessionFile)
 		) {
 			if (this.#coldSidecarActive() && this.#sidecarRuntime) {
-				this.#sidecarRuntime.retirementFirstKeptEntryId = entry.firstKeptEntryId;
-				this.#retireColdEntries();
-				this.#publishCommitMarkerFromCurrentTranscriptSync();
-				this.#sidecarRuntime.terminalTransition = this.#classifySidecarReopen();
+				if (!this.#advanceColdTailBoundary(entry.firstKeptEntryId)) {
+					this.#deactivateColdForBranchMutation();
+				} else {
+					this.#sidecarRuntime.retirementFirstKeptEntryId = entry.firstKeptEntryId;
+					this.#retireColdEntries();
+					this.#publishCommitMarkerFromCurrentTranscriptSync();
+					this.#sidecarRuntime.terminalTransition = this.#classifySidecarReopen();
+				}
 			} else {
 				this.#ensureFullHotView();
 				this.#buildDisposableSidecars(this.#fileEntries);

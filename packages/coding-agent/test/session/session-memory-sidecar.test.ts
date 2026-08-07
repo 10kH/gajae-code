@@ -311,12 +311,12 @@ describe("anchored base digest + rolling tail chain tamper detection", () => {
 		expect(again.terminalChecksum).toBe(tail.terminalChecksum);
 	});
 
-	it("detects tampering in byteLength, recordDigest, and the base anchor", () => {
+	it("detects tampering in payload and ordering metadata", () => {
 		const { records, tail } = couple();
 		// Tamper byteLength on record 0 → record 1's offset becomes discontinuous.
 		const tamperedLength = validateTailChain(base, [{ ...tail.records[0], byteLength: 9 }, tail.records[1]]);
 		expect(tamperedLength.valid).toBe(false);
-		expect(tamperedLength.reason).toBe("offset_discontinuity");
+		expect(tamperedLength.reason).toBe("checksum_mismatch");
 		// Tamper recordDigest on record 0 → C0 mismatch.
 		const tamperedDigest = validateTailChain(base, [
 			{ ...tail.records[0], recordDigest: computeLineDigest(enc("evil")) },
@@ -324,6 +324,19 @@ describe("anchored base digest + rolling tail chain tamper detection", () => {
 		]);
 		expect(tamperedDigest.valid).toBe(false);
 		expect(tamperedDigest.reason).toBe("checksum_mismatch");
+		for (const tampered of [
+			{ ...tail.records[0], id: "other" },
+			{ ...tail.records[0], parentId: "other-parent" },
+			{ ...tail.records[0], ordinal: 99 },
+			{ ...tail.records[0], kind: "tool" as const },
+			{ ...tail.records[0], type: "other" },
+			{ ...tail.records[0], gen: 99 },
+		]) {
+			expect(validateTailChain(base, [tampered, tail.records[1]])).toMatchObject({
+				valid: false,
+				reason: "checksum_mismatch",
+			});
+		}
 		// Tamper the base digest → C0 mismatch.
 		const tamperedBase = validateTailChain({ baseDigest: "deadbeef", baseEndOffset: 100 }, tail.records);
 		expect(tamperedBase.valid).toBe(false);

@@ -835,6 +835,10 @@ it("commits cold label clears and appended usage before exact reopen", async () 
 		"enabled",
 	);
 	try {
+		expect(reopened.getSessionMemoryStats()).toMatchObject({
+			lazyReopenSucceeded: true,
+			lazyReopenFallbackReason: undefined,
+		});
 		expect(reopened.getLabel("cold")).toBeUndefined();
 		expect(reopened.getUsageStatistics()).toMatchObject({ input: 2, output: 3, cost: 5 });
 	} finally {
