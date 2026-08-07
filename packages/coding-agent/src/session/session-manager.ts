@@ -11136,39 +11136,44 @@ export class SessionManager {
 		if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
 		if (!this.persist || !this.#sessionFile || !this.storage.existsSync(this.#sessionFile)) return;
 		await this.#queuePersistTask(async () => {
-			const token = this.#capturePersistenceInputToken();
-			const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-			if (this.#needsFullRewriteOnNextPersist || !this.#flushed || (header?.version ?? 1) < CURRENT_SESSION_VERSION)
-				return this.#rewriteFileContents();
-			const persistedRecords = records.map(record =>
-				record.type === "entry_patch"
-					? (prepareEntryForPersistenceSync(
-							materializeResidentEntryForPersistenceSync(
-								record as unknown as FileEntry,
-								this.#residentBlobStores(),
-								new Map(),
-							),
-							this.#blobStore,
-						) as unknown as SessionPatchRecord)
-					: record,
-			);
-			this.#withSessionPersistenceFenceSync(() => {
-				// Freshness check immediately before the sync transaction; a direct
-				// `_persist` racing between capture and the fence must abort.
-				if (!this.#persistenceInputTokenMatches(token)) throw new Error("session_persistence_input_stale");
-				if (this.destination.kind === "managed") {
-					this.#appendManagedRecordsSync(persistedRecords);
-					return;
-				}
-				const writer = this.#ensurePersistWriter();
-				if (!writer) {
-					this.#rewriteFile().catch(() => {});
-					return;
-				}
-				for (const persistedRecord of persistedRecords) {
-					writer.writeSync(persistedRecord);
-				}
-			});
+			for (let attempt = 0; attempt <= 2; attempt++) {
+				const token = this.#capturePersistenceInputToken();
+				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+				if (
+					this.#needsFullRewriteOnNextPersist ||
+					!this.#flushed ||
+					(header?.version ?? 1) < CURRENT_SESSION_VERSION
+				)
+					return this.#rewriteFileContents();
+				const persistedRecords = records.map(record =>
+					record.type === "entry_patch"
+						? (prepareEntryForPersistenceSync(
+								materializeResidentEntryForPersistenceSync(
+									record as unknown as FileEntry,
+									this.#residentBlobStores(),
+									new Map(),
+								),
+								this.#blobStore,
+							) as unknown as SessionPatchRecord)
+						: record,
+				);
+				const written = this.#withSessionPersistenceFenceSync(() => {
+					if (!this.#persistenceInputTokenMatches(token)) return false;
+					if (this.destination.kind === "managed") {
+						this.#appendManagedRecordsSync(persistedRecords);
+						return true;
+					}
+					const writer = this.#ensurePersistWriter();
+					if (!writer) {
+						this.#rewriteFile().catch(() => {});
+						return true;
+					}
+					for (const persistedRecord of persistedRecords) writer.writeSync(persistedRecord);
+					return true;
+				});
+				if (written) return;
+			}
+			throw new Error("session_persistence_input_stale");
 		});
 	}
 	_persist(entry: SessionEntry): void {
