@@ -388,4 +388,25 @@ describe("derived sidecar lifecycle cleanup", () => {
 		expect(memory.existsSync(`${sessionPath}.spill.idx`)).toBe(false);
 		expect(memory.existsSync(`${sessionPath}.spill.commit`)).toBe(false);
 	});
+
+	it("leaves no spill debris across 100 create-delete cycles", async () => {
+		const dir = await makeTempDir("gjc-sidecar-cycles-");
+		const file = new FileSessionStorage();
+		const memory = new MemorySessionStorage();
+		for (let cycle = 0; cycle < 100; cycle++) {
+			const fileSession = path.join(dir, `session-${cycle}.jsonl`);
+			file.writeTextSync(fileSession, "{}\n");
+			file.writeTextSync(`${fileSession}.spill.idx`, "index\n");
+			file.writeTextSync(`${fileSession}.spill.buckets`, "buckets\n");
+			await file.deleteSessionWithArtifacts(fileSession);
+
+			const memorySession = `/sessions/session-${cycle}.jsonl`;
+			memory.writeTextSync(memorySession, "{}\n");
+			memory.writeTextSync(`${memorySession}.spill.tail`, "tail\n");
+			memory.writeTextSync(`${memorySession}.spill.overlay-${cycle}.tmp`, "overlay\n");
+			await memory.deleteSessionWithArtifacts(memorySession);
+		}
+		expect(file.listFilesSync(dir, "*.spill.*")).toEqual([]);
+		expect(memory.listFilesSync("/sessions", "*.spill.*")).toEqual([]);
+	});
 });
