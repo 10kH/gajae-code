@@ -774,6 +774,7 @@ function tailRecordKindForEntry(entry: SessionEntry): TailRecordKind {
  * anything outside these bounds; the bounded path only ever fails closed to it.
  */
 const BOUNDED_FIRST_OPEN_MAX_LINE_BYTES = 8 * 1024 * 1024;
+const FORK_PATCH_OVERLAY_BUDGET_BYTES = 8 * 1024 * 1024;
 const residentHotEntryBytes = (serializedBytes: number): number => residentRecordBytes(serializedBytes * 2 + 256);
 /** Maximum records accepted by the bounded first-open hash table. */
 const BOUNDED_FIRST_OPEN_MAX_RECORDS = 1_000_000;
@@ -12701,6 +12702,9 @@ export class SessionManager {
 		let ordinal = 0;
 		let sawCompaction = false;
 		let preflightRejected = false;
+		const headerPatch: HeaderPatchRecord["patch"] = {};
+		const entryPatches = new Map<string, EntryPatchRecord["patch"]>();
+		let overlayBytes = 0;
 		const preflightFailure = scanTranscriptLinesBounded(
 			this.storage,
 			sourcePath,
@@ -12720,10 +12724,28 @@ export class SessionManager {
 						else sourceHeader = record;
 						return !preflightRejected;
 					}
+					if (record.type === "header_patch" || record.type === "entry_patch") {
+						overlayBytes += lineBytes.byteLength;
+						if (overlayBytes > FORK_PATCH_OVERLAY_BUDGET_BYTES) {
+							preflightRejected = true;
+							return false;
+						}
+						if (record.type === "header_patch" && isHeaderPatchRecord(record))
+							Object.assign(headerPatch, record.patch);
+						else if (record.type === "entry_patch" && isEntryPatchRecord(record)) {
+							if (collectCheckpointBlobRefs(record.patch).size > 0) {
+								preflightRejected = true;
+								return false;
+							}
+							entryPatches.set(record.entryId, record.patch);
+						} else {
+							preflightRejected = true;
+							return false;
+						}
+						return;
+					}
 					if (
 						record.type === "session" ||
-						record.type === "header_patch" ||
-						record.type === "entry_patch" ||
 						typeof record.id !== "string" ||
 						record.id === previousId ||
 						record.parentId !== previousId ||
@@ -12741,6 +12763,7 @@ export class SessionManager {
 			},
 		);
 		if (preflightFailure || preflightRejected || !sourceHeader || !sawCompaction) return false;
+		applyHeaderPatch(sourceHeader, headerPatch);
 		if (revalidateTranscriptIdentityBounded(sourcePath, this.storage, identity).kind !== "valid")
 			throw new Error("fork_source_identity_changed");
 		const fresh = this.#freshSessionState({ parentSession: sourceHeader.id });
@@ -12762,9 +12785,14 @@ export class SessionManager {
 					}
 					const record = JSON.parse(
 						Buffer.from(lineBytes.subarray(0, lineBytes.byteLength - 1)).toString("utf8"),
-					) as SessionEntry;
-					if (record.type === "message" && record.message.role === "assistant")
-						record.message = sanitizeRehydratedOpenAIResponsesAssistantMessage(record.message);
+					) as SessionEntry | SessionPatchRecord;
+					if (record.type === "header_patch" || record.type === "entry_patch") return;
+					if (record.type === "message") {
+						const patch = entryPatches.get(record.id);
+						if (patch?.message) record.message = patch.message;
+						if (record.message.role === "assistant")
+							record.message = sanitizeRehydratedOpenAIResponsesAssistantMessage(record.message);
+					}
 					staged.writeLine(Buffer.from(JSON.stringify(record), "utf8"));
 				},
 			);
@@ -12804,6 +12832,9 @@ export class SessionManager {
 		let ordinal = 0;
 		let sawCompaction = false;
 		let rejected = false;
+		const headerPatch: HeaderPatchRecord["patch"] = {};
+		const entryPatches = new Map<string, EntryPatchRecord["patch"]>();
+		let overlayBytes = 0;
 		try {
 			snapshot.forEachLine(line => {
 				if (rejected || line.byteLength === 0) return;
@@ -12820,10 +12851,25 @@ export class SessionManager {
 					else sourceHeader = record;
 					return;
 				}
+				if (record.type === "header_patch" || record.type === "entry_patch") {
+					overlayBytes += line.byteLength;
+					if (overlayBytes > FORK_PATCH_OVERLAY_BUDGET_BYTES) {
+						rejected = true;
+						return;
+					}
+					if (record.type === "header_patch" && isHeaderPatchRecord(record))
+						Object.assign(headerPatch, record.patch);
+					else if (record.type === "entry_patch" && isEntryPatchRecord(record)) {
+						if (collectCheckpointBlobRefs(record.patch).size > 0) {
+							rejected = true;
+							return;
+						}
+						entryPatches.set(record.entryId, record.patch);
+					} else rejected = true;
+					return;
+				}
 				if (
 					record.type === "session" ||
-					record.type === "header_patch" ||
-					record.type === "entry_patch" ||
 					typeof record.id !== "string" ||
 					record.id === previousId ||
 					record.parentId !== previousId ||
@@ -12839,6 +12885,7 @@ export class SessionManager {
 			return undefined;
 		}
 		if (rejected || !sourceHeader || !sawCompaction) return undefined;
+		applyHeaderPatch(sourceHeader, headerPatch);
 		const beforeWrite = snapshot.revalidate();
 		if (beforeWrite.kind !== "valid") return beforeWrite;
 		const fresh = this.#freshSessionState({ parentSession: sourceHeader.id });
@@ -12855,9 +12902,16 @@ export class SessionManager {
 					staged.writeLine(Buffer.from(JSON.stringify(fresh.header), "utf8"));
 					return;
 				}
-				const record = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(line)) as SessionEntry;
-				if (record.type === "message" && record.message.role === "assistant")
-					record.message = sanitizeRehydratedOpenAIResponsesAssistantMessage(record.message);
+				const record = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(line)) as
+					| SessionEntry
+					| SessionPatchRecord;
+				if (record.type === "header_patch" || record.type === "entry_patch") return;
+				if (record.type === "message") {
+					const patch = entryPatches.get(record.id);
+					if (patch?.message) record.message = patch.message;
+					if (record.message.role === "assistant")
+						record.message = sanitizeRehydratedOpenAIResponsesAssistantMessage(record.message);
+				}
 				staged.writeLine(Buffer.from(JSON.stringify(record), "utf8"));
 			});
 			staged.fsync();

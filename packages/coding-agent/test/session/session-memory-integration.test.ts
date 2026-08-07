@@ -591,6 +591,71 @@ it("applies enabled retirement while constructing a direct fork", async () => {
 	}
 });
 
+it("folds direct fork header and entry patches without full transcript reads", async () => {
+	class PatchForkStorage extends MemorySessionStorage {
+		fullReads = 0;
+		override readTextSync(filePath: string): string {
+			if (!filePath.includes(".spill.")) this.fullReads++;
+			return super.readTextSync(filePath);
+		}
+		override readBytesSync(filePath: string): Uint8Array {
+			if (!filePath.includes(".spill.")) this.fullReads++;
+			return super.readBytesSync(filePath);
+		}
+	}
+	const storage = new PatchForkStorage();
+	const source = "/sessions/fork-patched-source.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "patched-source", timestamp: "0", cwd: "/cwd" },
+		{
+			type: "message",
+			id: "old",
+			parentId: null,
+			timestamp: "0",
+			message: { role: "user", content: "old", timestamp: 1 },
+		},
+		{
+			type: "message",
+			id: "kept",
+			parentId: "old",
+			timestamp: "0",
+			message: { role: "user", content: "before", timestamp: 2 },
+		},
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 10,
+		},
+		{ type: "header_patch", patch: { title: "patched title", titleSource: "user" } },
+		{
+			type: "entry_patch",
+			entryId: "kept",
+			patch: { message: { role: "user", content: "after", timestamp: 2 } },
+		},
+	];
+	storage.writeTextSync(source, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	const forked = await SessionManager.forkFrom(
+		source,
+		"/cwd",
+		SessionManager.explicitDestination("/patched-forks"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		expect(storage.fullReads).toBe(0);
+		expect(forked.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		expect(forked.getHeader()).toMatchObject({ title: "patched title", titleSource: "user" });
+		expect(forked.getEntry("kept")).toMatchObject({ message: { content: "after" } });
+	} finally {
+		await forked.close();
+	}
+});
+
 it("bounds the first enabled open with zero full-transcript reads and authentic sidecars", async () => {
 	class CountingStorage extends MemorySessionStorage {
 		rangeReads = 0;
@@ -1636,6 +1701,17 @@ describe("descriptor-bound capture and staged fork publication", () => {
 		const storage = new CapturedForkCountingStorage();
 		const sessionFile = "/sessions/source.jsonl";
 		writeColdTranscript(storage, sessionFile, "/cwd", 12);
+		storage.writeTextSync(
+			sessionFile,
+			`${storage.readTextSync(sessionFile)}${JSON.stringify({ type: "header_patch", patch: { title: "captured patch" } })}\n${JSON.stringify(
+				{
+					type: "entry_patch",
+					entryId: "cold-0011",
+					patch: { message: { role: "user", content: "captured patched message", timestamp: 11 } },
+				},
+			)}\n`,
+		);
+		storage.fullReads = 0;
 
 		const captured = SessionManager.captureTranscriptStrict(sessionFile, storage);
 		expect(captured.kind).toBe("captured");
@@ -1645,7 +1721,7 @@ describe("descriptor-bound capture and staged fork publication", () => {
 		captured.snapshot.forEachLine(line => {
 			capturedLines.push(JSON.parse(Buffer.from(line).toString("utf8")));
 		});
-		expect(capturedLines).toHaveLength(14);
+		expect(capturedLines).toHaveLength(16);
 
 		const forked = await SessionManager.forkFromCaptured(
 			captured.snapshot,
@@ -1660,6 +1736,10 @@ describe("descriptor-bound capture and staged fork publication", () => {
 			expect(forked.manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
 			expect(storage.fullReads).toBe(0);
 			expect(forked.manager.getSessionId()).not.toBe("fork-source");
+			expect(forked.manager.getHeader()).toMatchObject({ title: "captured patch" });
+			expect(forked.manager.getEntry("cold-0011")).toMatchObject({
+				message: { content: "captured patched message" },
+			});
 			expect(forked.manager.getEntries()).toHaveLength(13);
 			const forkedSessionFile = forked.manager.getSessionFile();
 			expect(forkedSessionFile).toContain("/sessions/forked-memory");
