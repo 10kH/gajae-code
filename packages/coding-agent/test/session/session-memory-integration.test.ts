@@ -7,6 +7,7 @@ import { SessionManager } from "../../src/session/session-manager";
 import {
 	FileSessionStorage,
 	MemorySessionStorage,
+	type SessionStorageWriter,
 	type StagedStreamingWriter,
 } from "../../src/session/session-storage";
 
@@ -1381,6 +1382,82 @@ describe("sidecar I/O fallback", () => {
 			expect(manager.getEntry("cold-0000")).toMatchObject({ id: "cold-0000" });
 		} finally {
 			await manager.close();
+		}
+	});
+
+	it("recovers from transcript publication followed by tail journal failure", async () => {
+		class TailFailureStorage extends MemorySessionStorage {
+			failTail = false;
+			tailFailures = 0;
+			override openWriter(filePath: string, options?: { flags?: "w" | "a" }): SessionStorageWriter {
+				const writer = super.openWriter(filePath, options);
+				if (!this.failTail || !filePath.endsWith(".spill.tail")) return writer;
+				return {
+					writeLine: writer.writeLine.bind(writer),
+					writeLineSync: () => {
+						this.tailFailures++;
+						throw new Error("injected_tail_failure");
+					},
+					flush: writer.flush.bind(writer),
+					fsync: writer.fsync.bind(writer),
+					close: writer.close.bind(writer),
+					closeSync: writer.closeSync.bind(writer),
+					getError: writer.getError.bind(writer),
+					getCloseState: writer.getCloseState.bind(writer),
+					getCloseError: writer.getCloseError.bind(writer),
+				};
+			}
+		}
+		const storage = new TailFailureStorage();
+		const sessionFile = "/sessions/tail-failure.jsonl";
+		const records = [
+			{ type: "session", version: 5, id: "tail-failure", timestamp: "0", cwd: "/cwd" },
+			{
+				type: "message",
+				id: "cold",
+				parentId: null,
+				timestamp: "0",
+				message: { role: "user", content: "cold", timestamp: 1 },
+			},
+			{
+				type: "compaction",
+				id: "compact",
+				parentId: "cold",
+				timestamp: "0",
+				summary: "summary",
+				firstKeptEntryId: "cold",
+				tokensBefore: 1,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		const appendedId = (() => {
+			storage.failTail = true;
+			return manager.appendCustomEntry("crash-window", { durable: true });
+		})();
+		expect(storage.tailFailures).toBe(1);
+		expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
+		expect(manager.getEntry(appendedId)).toMatchObject({ id: appendedId });
+		await manager.close();
+		storage.failTail = false;
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(reopened.getEntry(appendedId)).toMatchObject({ id: appendedId });
+			expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		} finally {
+			await reopened.close();
 		}
 	});
 });
