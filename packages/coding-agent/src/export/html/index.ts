@@ -144,7 +144,7 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 
 	let sm: SessionManager;
 	try {
-		sm = await SessionManager.open(inputPath);
+		sm = await SessionManager.open(inputPath, undefined, undefined, "copy-retain", "off");
 	} catch (err) {
 		if (isEnoent(err)) throw new Error(`File not found: ${inputPath}`);
 		throw err;

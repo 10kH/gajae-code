@@ -63,9 +63,18 @@ describe("session HTML export fidelity", () => {
 			const sessionFile = session.getSessionFile();
 			expect(sessionFile).toBeString();
 			await session.close();
+			const artifactRoot = sessionFile!.slice(0, -6);
+			const staleSidecars = ["idx", "tail", "commit"].map(kind =>
+				path.join(artifactRoot, `.session-memory.spill.${kind}`),
+			);
+			fs.mkdirSync(artifactRoot, { recursive: true });
+			for (const sidecar of staleSidecars) fs.writeFileSync(sidecar, "stale derived export state");
 
 			const outputPath = path.join(tempDir, "export.html");
 			await exportFromFile(sessionFile!, { outputPath });
+			expect(staleSidecars.map(sidecar => fs.readFileSync(sidecar, "utf8"))).toEqual(
+				staleSidecars.map(() => "stale derived export state"),
+			);
 			const data = decodeExportSessionData(fs.readFileSync(outputPath, "utf8"));
 			const exported = data.entries.find(entry => entry.id === oldUserId);
 			expect(exported?.type).toBe("message");
