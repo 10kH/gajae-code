@@ -187,6 +187,8 @@ export interface SessionStorageWriter {
 	writeLineSync(line: string): void;
 	flush(): Promise<void>;
 	fsync(): Promise<void>;
+	/** Synchronously fsync all prior writes when the backend supports durable sidecar publication. */
+	fsyncSync?(): void;
 	close(): Promise<void>;
 	/**
 	 * Synchronously close the underlying descriptor. The certainty-aware close
@@ -995,7 +997,7 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		// OS buffers are flushed on fsync, nothing to do here
 	}
 
-	async fsync(): Promise<void> {
+	fsyncSync(): void {
 		if (this.#closeState !== "open") throw this.#nonOpenWriteError();
 		if (this.#error) throw this.#error;
 		try {
@@ -1004,6 +1006,10 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		} catch (err) {
 			throw this.#recordError(err);
 		}
+	}
+
+	async fsync(): Promise<void> {
+		this.fsyncSync();
 	}
 
 	closeSync(): void {
@@ -2444,11 +2450,13 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 		if (this.#closeState !== "open") throw new Error("Writer closed");
 		if (this.#error) throw this.#error;
 	}
-
-	async fsync(): Promise<void> {
-		// No-op for in-memory storage
+	fsyncSync(): void {
 		if (this.#closeState !== "open") throw new Error("Writer closed");
 		if (this.#error) throw this.#error;
+	}
+
+	async fsync(): Promise<void> {
+		this.fsyncSync();
 	}
 
 	closeSync(): void {

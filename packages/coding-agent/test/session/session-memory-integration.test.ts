@@ -1473,6 +1473,7 @@ describe("whole-session persistence freshness", () => {
 						await writer.flush();
 					},
 					fsync: writer.fsync.bind(writer),
+					fsyncSync: writer.fsyncSync?.bind(writer),
 					close: writer.close.bind(writer),
 					closeSync: writer.closeSync.bind(writer),
 					getError: writer.getError.bind(writer),
@@ -1574,6 +1575,7 @@ describe("sidecar I/O fallback", () => {
 					},
 					flush: writer.flush.bind(writer),
 					fsync: writer.fsync.bind(writer),
+					fsyncSync: writer.fsyncSync?.bind(writer),
 					close: writer.close.bind(writer),
 					closeSync: writer.closeSync.bind(writer),
 					getError: writer.getError.bind(writer),
@@ -1632,6 +1634,178 @@ describe("sidecar I/O fallback", () => {
 			expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
 		} finally {
 			await reopened.close();
+		}
+	});
+
+	it("recovers when tail fsync fails after the journal write", async () => {
+		class TailFsyncFailureStorage extends MemorySessionStorage {
+			failTailFsync = false;
+			tailFsyncFailures = 0;
+			override openWriter(filePath: string, options?: { flags?: "w" | "a" }): SessionStorageWriter {
+				const writer = super.openWriter(filePath, options);
+				if (!filePath.endsWith(".spill.tail")) return writer;
+				return {
+					writeLine: writer.writeLine.bind(writer),
+					writeLineSync: writer.writeLineSync.bind(writer),
+					flush: writer.flush.bind(writer),
+					fsync: writer.fsync.bind(writer),
+					fsyncSync: () => {
+						if (this.failTailFsync) {
+							this.tailFsyncFailures++;
+							throw new Error("injected_tail_fsync_failure");
+						}
+						writer.fsyncSync?.();
+					},
+					close: writer.close.bind(writer),
+					closeSync: writer.closeSync.bind(writer),
+					getError: writer.getError.bind(writer),
+					getCloseState: writer.getCloseState.bind(writer),
+					getCloseError: writer.getCloseError.bind(writer),
+				};
+			}
+		}
+		const storage = new TailFsyncFailureStorage();
+		const sessionFile = "/sessions/tail-fsync-failure.jsonl";
+		const records = [
+			{ type: "session", version: 5, id: "tail-fsync-failure", timestamp: "0", cwd: "/cwd" },
+			{
+				type: "message",
+				id: "old",
+				parentId: null,
+				timestamp: "0",
+				message: { role: "user", content: "old", timestamp: 1 },
+			},
+			{
+				type: "message",
+				id: "kept",
+				parentId: "old",
+				timestamp: "0",
+				message: { role: "user", content: "kept", timestamp: 2 },
+			},
+			{
+				type: "compaction",
+				id: "compact",
+				parentId: "kept",
+				timestamp: "0",
+				summary: "summary",
+				firstKeptEntryId: "kept",
+				tokensBefore: 2,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		storage.failTailFsync = true;
+		const appendedId = manager.appendCustomEntry("tail-fsync", { durable: true });
+		expect(storage.tailFsyncFailures).toBe(1);
+		expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
+		await manager.close();
+		storage.failTailFsync = false;
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(reopened.getEntry(appendedId)).toMatchObject({ id: appendedId });
+			expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		} finally {
+			await reopened.close();
+		}
+	});
+	it("fsyncs transcript, index, and tail in publication order", async () => {
+		class DurabilityOrderStorage extends MemorySessionStorage {
+			readonly events: string[] = [];
+			override openWriter(filePath: string, options?: { flags?: "w" | "a" }): SessionStorageWriter {
+				const writer = super.openWriter(filePath, options);
+				return {
+					writeLine: async line => {
+						this.events.push(`write:${filePath}`);
+						await writer.writeLine(line);
+					},
+					writeLineSync: line => {
+						this.events.push(`write:${filePath}`);
+						writer.writeLineSync(line);
+					},
+					flush: writer.flush.bind(writer),
+					fsync: async () => {
+						this.events.push(`fsync:${filePath}`);
+						await writer.fsync();
+					},
+					fsyncSync: () => {
+						this.events.push(`fsync:${filePath}`);
+						writer.fsyncSync?.();
+					},
+					close: writer.close.bind(writer),
+					closeSync: writer.closeSync.bind(writer),
+					getError: writer.getError.bind(writer),
+					getCloseState: writer.getCloseState.bind(writer),
+					getCloseError: writer.getCloseError.bind(writer),
+				};
+			}
+		}
+		const storage = new DurabilityOrderStorage();
+		const sessionFile = "/sessions/durability-order.jsonl";
+		const records = [
+			{ type: "session", version: 5, id: "durability-order", timestamp: "0", cwd: "/cwd" },
+			{
+				type: "message",
+				id: "old",
+				parentId: null,
+				timestamp: "0",
+				message: { role: "user", content: "old", timestamp: 1 },
+			},
+			{
+				type: "message",
+				id: "kept",
+				parentId: "old",
+				timestamp: "0",
+				message: { role: "user", content: "kept", timestamp: 2 },
+			},
+			{
+				type: "compaction",
+				id: "compact",
+				parentId: "kept",
+				timestamp: "0",
+				summary: "summary",
+				firstKeptEntryId: "kept",
+				tokensBefore: 2,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			storage.events.length = 0;
+			manager.appendCustomEntry("durable", { value: true });
+			const transcriptFsync = storage.events.indexOf(`fsync:${sessionFile}`);
+			const indexWrite = storage.events.indexOf(`write:${sidecarPath(sessionFile, "idx")}`);
+			const indexFsync = storage.events.indexOf(`fsync:${sidecarPath(sessionFile, "idx")}`);
+			const tailWrite = storage.events.indexOf(`write:${sidecarPath(sessionFile, "tail")}`);
+			const tailFsync = storage.events.indexOf(`fsync:${sidecarPath(sessionFile, "tail")}`);
+			expect(transcriptFsync).toBeGreaterThanOrEqual(0);
+			expect(indexWrite).toBeGreaterThan(transcriptFsync);
+			expect(indexFsync).toBeGreaterThan(indexWrite);
+			expect(tailWrite).toBeGreaterThan(indexFsync);
+			expect(tailFsync).toBeGreaterThan(tailWrite);
+			expect(manager.getSessionMemoryStats().currentCommitTransition).toEqual({
+				kind: "exact",
+				reason: "descriptor_and_proof_match",
+			});
+		} finally {
+			await manager.close();
 		}
 	});
 });

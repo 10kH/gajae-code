@@ -4742,6 +4742,16 @@ class NdjsonFileWriter {
 			throw this.#recordError(err);
 		}
 	}
+	fsyncSync(): void {
+		if (this.#closed || this.#closing) throw new Error("Writer closed");
+		if (this.#error) throw this.#error;
+		if (!this.#writer.fsyncSync) throw new Error("Synchronous session writer fsync is unavailable");
+		try {
+			this.#writer.fsyncSync();
+		} catch (err) {
+			throw this.#recordError(err);
+		}
+	}
 
 	/** Flush all buffered data to disk. Waits for all queued writes. */
 	async flush(): Promise<void> {
@@ -8821,14 +8831,14 @@ export class SessionManager {
 	 * marker (cross-process mutation) aborts and is left untouched for reopen
 	 * classification. `gen` is the publication fence counter only.
 	 */
-	#publishSessionCommitMarkerSync(descriptor: SessionStorageStat): void {
+	#publishSessionCommitMarkerSync(descriptor: SessionStorageStat): boolean {
 		const sessionFile = this.#sessionFile;
-		if (!sessionFile) return;
+		if (!sessionFile) return false;
 		const runtime = this.#sidecarRuntime;
-		if (!runtime?.enabled || runtime.tail.transcriptSize !== descriptor.size) return;
+		if (!runtime?.enabled || runtime.tail.transcriptSize !== descriptor.size) return false;
 		const options =
 			this.destination.kind === "managed" ? { securityContext: this.destination.securityContext } : undefined;
-		this.#withSessionPersistenceFenceSync(() => {
+		return this.#withSessionPersistenceFenceSync(() => {
 			const markerPath = runtime.commitPath;
 			const gen = this.#commitGen + 1;
 			const record = {
@@ -8883,16 +8893,18 @@ export class SessionManager {
 					);
 				}
 				this.#commitGen = gen;
+				return true;
 			} catch {
 				// A diverging sidecar never fails the authoritative transcript write.
+				return false;
 			}
 		});
 	}
 
 	/** Capture the current transcript descriptor after a rewrite and publish the commit. */
-	#publishCommitMarkerFromCurrentTranscriptSync(): void {
+	#publishCommitMarkerFromCurrentTranscriptSync(): boolean {
 		const sessionFile = this.#sessionFile;
-		if (!sessionFile) return;
+		if (!sessionFile) return false;
 		const descriptor =
 			this.destination.kind === "managed"
 				? this.#managedTranscriptStore(sessionFile).descriptorExpected(path.basename(sessionFile))
@@ -8903,8 +8915,8 @@ export class SessionManager {
 							return null;
 						}
 					})();
-		if (!descriptor) return;
-		this.#publishSessionCommitMarkerSync(descriptor);
+		if (!descriptor) return false;
+		return this.#publishSessionCommitMarkerSync(descriptor);
 	}
 	// =========================================================================
 	// Cold-sidecar runtime (P2/P3/P4 primitives integration)
@@ -9090,6 +9102,11 @@ export class SessionManager {
 			return;
 		}
 		const tailBuilder = new RollingTailChainBuilder({ baseDigest, baseEndOffset });
+		const fsyncWriter = (writer: SessionStorageWriter | undefined): void => {
+			if (!writer) return;
+			if (!writer.fsyncSync) throw new Error("Synchronous sidecar fsync is unavailable");
+			writer.fsyncSync();
+		};
 		let indexWriter: SessionStorageWriter | undefined;
 		let tailWriter: SessionStorageWriter | undefined;
 		let runningOffset = headerBytes.byteLength;
@@ -9141,9 +9158,19 @@ export class SessionManager {
 			operationError = error;
 		} finally {
 			try {
+				fsyncWriter(indexWriter);
+			} catch (error) {
+				closeError = error;
+			}
+			try {
 				indexWriter?.closeSync();
 			} catch (error) {
 				closeError = error;
+			}
+			try {
+				fsyncWriter(tailWriter);
+			} catch (error) {
+				closeError ??= error;
 			}
 			try {
 				tailWriter?.closeSync();
@@ -9154,7 +9181,12 @@ export class SessionManager {
 		if (operationError ?? closeError) throw operationError ?? closeError;
 		if (tailOverflow) {
 			const truncateTail = this.storage.openWriter(runtime.tailPath, { flags: "w" });
-			truncateTail.closeSync();
+			try {
+				if (!truncateTail.fsyncSync) throw new Error("Synchronous sidecar fsync is unavailable");
+				truncateTail.fsyncSync();
+			} finally {
+				truncateTail.closeSync();
+			}
 		}
 		for (const [id, label] of this.#labelsById) {
 			if (!runtime.labelsPins.setLabel(id, label)) {
@@ -9609,6 +9641,8 @@ export class SessionManager {
 			const writer = this.storage.openWriter(runtime.tailPath, { flags: "w" });
 			try {
 				for (const record of tail.records) writer.writeLineSync(`${JSON.stringify(record)}\n`);
+				if (!writer.fsyncSync) return false;
+				writer.fsyncSync();
 			} finally {
 				writer.closeSync();
 			}
@@ -9651,6 +9685,8 @@ export class SessionManager {
 			try {
 				const indexLine = `${JSON.stringify({ id: entry.id, ordinal: record.ordinal, seq, byteOffset, byteLength, recordDigest })}\n`;
 				indexWriter.writeLineSync(indexLine);
+				if (!indexWriter.fsyncSync) throw new Error("Synchronous sidecar fsync is unavailable");
+				indexWriter.fsyncSync();
 				runtime.indexHash.update(Buffer.from(indexLine, "utf8"));
 				runtime.indexDigest = runtime.indexHash.copy().digest("hex");
 			} finally {
@@ -9659,6 +9695,8 @@ export class SessionManager {
 			const tailWriter = this.storage.openWriter(runtime.tailPath, { flags: "a" });
 			try {
 				tailWriter.writeLineSync(`${JSON.stringify(record)}\n`);
+				if (!tailWriter.fsyncSync) throw new Error("Synchronous sidecar fsync is unavailable");
+				tailWriter.fsyncSync();
 			} finally {
 				tailWriter.closeSync();
 			}
@@ -9675,11 +9713,10 @@ export class SessionManager {
 			terminalSeq: seq,
 			transcriptSize: byteOffset + byteLength,
 		};
-		if (this.destination.kind === "managed" || entry.type === "compaction") {
-			this.#publishCommitMarkerFromCurrentTranscriptSync();
-			runtime.terminalTransition = this.#classifySidecarReopen();
+		if (this.#publishCommitMarkerFromCurrentTranscriptSync()) {
+			runtime.terminalTransition = { kind: "exact", reason: "descriptor_and_proof_match" };
 		} else {
-			runtime.terminalTransition = { kind: "transcript_ahead", reason: "explicit_append_pending_checkpoint" };
+			runtime.terminalTransition = { kind: "rebuild", reason: "commit_marker_publication_failed" };
 		}
 		return true;
 	}
@@ -9857,6 +9894,7 @@ export class SessionManager {
 				for (const entry of entries) {
 					writer.writeSync(entry);
 				}
+				writer.fsyncSync();
 				writer.closeSync();
 				const replacement = this.#replaceSessionFileSync(tempPath, sessionFile);
 				if (replacement.kind === "restored_previous") throw replacement.error;
@@ -11213,6 +11251,7 @@ export class SessionManager {
 		let sidecarAppendCharge = 0;
 		let sidecarTailCharge = 0;
 		const activeRuntime = this.#sidecarRuntime;
+		let transcriptDurableForSidecar = this.destination.kind === "managed";
 		if (activeRuntime && this.#coldSidecarActive()) {
 			const appendedBytes = this.#serializeEntryLine(residentEntry).byteLength + 1;
 			const appendedAccountedBytes = residentHotEntryBytes(appendedBytes);
@@ -11266,6 +11305,22 @@ export class SessionManager {
 				this.#persistError ?? toError(error),
 			);
 		}
+		if (
+			this.destination.kind !== "managed" &&
+			(sidecarAppendCharge > 0 || (residentEntry.type === "compaction" && this.#sessionMemoryMode === "enabled"))
+		) {
+			const writer = this.#persistWriter;
+			if (writer?.isOpen()) {
+				try {
+					writer.fsyncSync();
+					transcriptDurableForSidecar = true;
+				} catch {
+					if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
+				}
+			} else if (this.#coldSidecarActive()) {
+				this.#deactivateColdForBranchMutation();
+			}
+		}
 		this.#applySidecarReducerDelta(residentEntry);
 		// Aggregate usage before the sidecar append publishes its commit marker so an
 		// exact reopen observes the same totals as the live manager.
@@ -11283,7 +11338,7 @@ export class SessionManager {
 				activeRuntime.labelsPins.deleteLabel(residentEntry.targetId);
 			}
 		}
-		if (sidecarAppendCharge > 0 && activeRuntime && this.#coldSidecarActive()) {
+		if (transcriptDurableForSidecar && sidecarAppendCharge > 0 && activeRuntime && this.#coldSidecarActive()) {
 			const materialized = materializeResidentEntryForPersistenceSync(
 				residentEntry,
 				this.#residentBlobStores(),
@@ -11308,6 +11363,7 @@ export class SessionManager {
 		}
 		if (
 			entry.type === "compaction" &&
+			transcriptDurableForSidecar &&
 			this.#sessionMemoryMode === "enabled" &&
 			this.#sessionFile &&
 			this.storage.existsSync(this.#sessionFile)
