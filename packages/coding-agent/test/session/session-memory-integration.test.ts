@@ -2454,6 +2454,33 @@ describe("descriptor-bound capture and staged fork publication", () => {
 		}
 	});
 
+	it("hydrates retired authority before preparing an internal successor", async () => {
+		const tempDir = TempDir.createSync("@pi-memory-prepared-fork-cold-");
+		const storage = new FileSessionStorage();
+		const sessionFile = path.join(tempDir.path(), "source.jsonl");
+		const { ids } = writeColdTranscript(storage, sessionFile, tempDir.path());
+		const source = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination(tempDir.path()),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(source.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			const prepared = await source.prepareFork();
+			expect(prepared?.sessionFile).toBeTruthy();
+			if (!prepared?.sessionFile) throw new Error("Expected prepared successor");
+			const transcript = storage.readTextSync(prepared.sessionFile);
+			expect(transcript).toContain(ids[0]!);
+			expect(transcript).toContain(ids.at(-1)!);
+			await source.discardPreparedNewSession(prepared);
+		} finally {
+			await source.close();
+			tempDir.removeSync();
+		}
+	});
+
 	it("publishes through bounded range reads and staged writers without whole-buffer reads", async () => {
 		const tempDir = TempDir.createSync("@pi-memory-fork-bounded-");
 		const storage = new FileSessionStorage();

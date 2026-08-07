@@ -2254,7 +2254,10 @@ function pruneResidentCacheEntries(snapshot: native.NativeDirectoryTreeSnapshot)
 	return {
 		...snapshot,
 		entries: snapshot.entries.filter(
-			entry => entry.relativePath !== "resident-cache" && !entry.relativePath.startsWith("resident-cache/"),
+			entry =>
+				entry.relativePath !== "resident-cache" &&
+				!entry.relativePath.startsWith("resident-cache/") &&
+				!isDerivedSessionMemoryFile(entry.relativePath),
 		),
 	};
 }
@@ -7405,6 +7408,7 @@ export class SessionManager {
 		await this.#retryPreparedNewSessionCleanups();
 		if (!this.persist || !this.#sessionFile) return undefined;
 		await this.#closePersistWriter();
+		this.#ensureFullHotView();
 		const sourceFile = this.#sessionFile;
 		const sourceId = this.#sessionId;
 		const timestamp = new Date().toISOString();
@@ -13051,6 +13055,7 @@ export class SessionManager {
 		const headerPatch: HeaderPatchRecord["patch"] = {};
 		const entryPatches = new Map<string, EntryPatchRecord["patch"]>();
 		let overlayBytes = 0;
+		let requiresRecordTransforms = false;
 		const preflightFailure = scanTranscriptLinesBounded(
 			this.storage,
 			sourcePath,
@@ -13071,6 +13076,7 @@ export class SessionManager {
 						return !preflightRejected;
 					}
 					if (record.type === "header_patch" || record.type === "entry_patch") {
+						requiresRecordTransforms = true;
 						overlayBytes += lineBytes.byteLength;
 						if (overlayBytes > FORK_PATCH_OVERLAY_BUDGET_BYTES) {
 							preflightRejected = true;
@@ -13101,6 +13107,7 @@ export class SessionManager {
 						return false;
 					}
 					previousId = record.id;
+					if (record.type === "message" && record.message.role === "assistant") requiresRecordTransforms = true;
 					if (record.type === "compaction") sawCompaction = true;
 				} catch {
 					preflightRejected = true;
@@ -13127,6 +13134,10 @@ export class SessionManager {
 				(_offset, lineBytes) => {
 					if (ordinal++ === 0) {
 						staged.writeLine(Buffer.from(JSON.stringify(fresh.header), "utf8"));
+						return;
+					}
+					if (!requiresRecordTransforms) {
+						staged.writeLine(lineBytes.subarray(0, lineBytes.byteLength - 1));
 						return;
 					}
 					const record = JSON.parse(
@@ -13181,6 +13192,7 @@ export class SessionManager {
 		const headerPatch: HeaderPatchRecord["patch"] = {};
 		const entryPatches = new Map<string, EntryPatchRecord["patch"]>();
 		let overlayBytes = 0;
+		let requiresRecordTransforms = false;
 		try {
 			snapshot.forEachLine(line => {
 				if (rejected || line.byteLength === 0) return;
@@ -13198,6 +13210,7 @@ export class SessionManager {
 					return;
 				}
 				if (record.type === "header_patch" || record.type === "entry_patch") {
+					requiresRecordTransforms = true;
 					overlayBytes += line.byteLength;
 					if (overlayBytes > FORK_PATCH_OVERLAY_BUDGET_BYTES) {
 						rejected = true;
@@ -13225,6 +13238,7 @@ export class SessionManager {
 					return;
 				}
 				previousId = record.id;
+				if (record.type === "message" && record.message.role === "assistant") requiresRecordTransforms = true;
 				if (record.type === "compaction") sawCompaction = true;
 			});
 		} catch {
@@ -13246,6 +13260,10 @@ export class SessionManager {
 				if (line.byteLength === 0) return;
 				if (writeOrdinal++ === 0) {
 					staged.writeLine(Buffer.from(JSON.stringify(fresh.header), "utf8"));
+					return;
+				}
+				if (!requiresRecordTransforms) {
+					staged.writeLine(line);
 					return;
 				}
 				const record = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(line)) as
