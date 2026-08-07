@@ -884,7 +884,14 @@ export async function createSessionManager(
 		}
 		const forkSource = parsed.fork;
 		if (forkSource.includes("/") || forkSource.includes("\\") || forkSource.endsWith(".jsonl")) {
-			return await SessionManager.forkFrom(forkSource, cwd, sessionDestination(), undefined, migrationPolicy);
+			return await SessionManager.forkFrom(
+				forkSource,
+				cwd,
+				sessionDestination(),
+				undefined,
+				migrationPolicy,
+				sessionMemoryMode,
+			);
 		}
 		const match = await resolveResumableSession(
 			forkSource,
@@ -896,7 +903,14 @@ export async function createSessionManager(
 		if (!match) {
 			throw new Error(`Session "${forkSource}" not found.`);
 		}
-		return await SessionManager.forkFrom(match.session.path, cwd, sessionDestination(), undefined, migrationPolicy);
+		return await SessionManager.forkFrom(
+			match.session.path,
+			cwd,
+			sessionDestination(),
+			undefined,
+			migrationPolicy,
+			sessionMemoryMode,
+		);
 	}
 
 	if (parsed.noSession) {

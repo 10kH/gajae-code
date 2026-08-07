@@ -11662,6 +11662,7 @@ export class SessionManager {
 		destinationInput?: SessionDestinationInput,
 		storage: SessionStorage = new FileSessionStorage(),
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
+		sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow",
 	): Promise<SessionManager> {
 		const destination = destinationFor(cwd, destinationInput, storage);
 		const managedSourcePath =
@@ -11670,7 +11671,8 @@ export class SessionManager {
 				: sourcePath;
 		const dir = destination.directory;
 		const manager = new SessionManager(cwd, dir, true, storage, destination);
-		const forkEntries = structuredClone(await loadEntriesFromFile(managedSourcePath, storage)) as FileEntry[];
+		manager.#sessionMemoryMode = sessionMemoryMode;
+		const forkEntries = await loadEntriesFromFile(managedSourcePath, storage);
 		migrateToCurrentVersion(forkEntries);
 		await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
 		const sourceHeader = forkEntries.find(entry => entry.type === "session") as SessionHeader | undefined;

@@ -543,6 +543,40 @@ it("reopens an enabled explicit session from authenticated hot-tail metadata", a
 		await fallback.close();
 	}
 });
+
+it("applies enabled retirement while constructing a direct fork", async () => {
+	const storage = new MemorySessionStorage();
+	const source = "/sessions/fork-source.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "fork-source", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "x", data: { text: "old" } },
+		{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "x", data: { text: "kept" } },
+		{
+			type: "compaction",
+			id: "compaction",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 10,
+		},
+	];
+	storage.writeTextSync(source, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	const forked = await SessionManager.forkFrom(
+		source,
+		"/cwd",
+		SessionManager.explicitDestination("/forks"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		expect(forked.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		expect(forked.getEntry("old")).toMatchObject({ id: "old" });
+	} finally {
+		await forked.close();
+	}
+});
 describe("session memory mode across file transitions", () => {
 	it("reapplies enabled retirement and keeps off transitions sidecar-free", async () => {
 		const storage = new MemorySessionStorage();
