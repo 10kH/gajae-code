@@ -13283,7 +13283,10 @@ export class AgentSession {
 			attribution: "agent",
 			timestamp: Date.now(),
 		});
-		this.#scheduleAgentContinue({ skipCompactionCheck: true });
+		// The reminder continues the current prompt, so the predecessor `agent_end`
+		// must stay held until the continuation turn produces the real terminal.
+		// Publishing it here would settle the caller's prompt mid-reminder.
+		this.#scheduleAgentContinue({ skipCompactionCheck: true, suppressPredecessorAgentEnd: true });
 	}
 
 	/**

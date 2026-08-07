@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { SdkClient, SdkClientError, type SdkFrame } from "../client";
+import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 
 import { OPERATIONS } from "../protocol/operation-registry";
@@ -364,17 +365,21 @@ export class AcpSdkAdapter {
 			const result = await this.#forwardReverse(method, payload, controller.signal);
 			if (!this.#canRespondToReverse(id, active, connectionId, capability, leaseId)) return;
 
-			this.#client.send({ type: "reverse_response", id, connectionId, leaseId, ok: true, result });
+			const response = { type: "reverse_response", id, connectionId, leaseId, ok: true, result };
+			assertReverseResponseFrame(response);
+			this.#client.send(response);
 		} catch (error) {
 			if (!this.#canRespondToReverse(id, active, connectionId, capability, leaseId)) return;
 
 			const typed =
 				error instanceof AcpSdkAdapterError || error instanceof SdkClientError
 					? error
-					: new AcpSdkAdapterError(
-							"acp_reverse_failed",
-							error instanceof Error ? error.message : "ACP reverse request failed.",
-						);
+					: error instanceof ReverseLeaseError
+						? new AcpSdkAdapterError(error.code, error.message)
+						: new AcpSdkAdapterError(
+								"acp_reverse_failed",
+								error instanceof Error ? error.message : "ACP reverse request failed.",
+							);
 			this.#client.send({
 				type: "reverse_response",
 				id,
