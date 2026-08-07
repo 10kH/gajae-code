@@ -10,6 +10,9 @@ import {
 	type StagedStreamingWriter,
 } from "../../src/session/session-storage";
 
+const sidecarPath = (sessionFile: string, kind: "idx" | "tail" | "commit"): string =>
+	`${sessionFile.slice(0, -6)}/.session-memory.spill.${kind}`;
+
 describe("SessionManager cold sidecar integration", () => {
 	it("retires a compacted prefix on resume and lazily reloads exact transcript entries", async () => {
 		const tempDir = TempDir.createSync("@pi-session-memory-sidecar-");
@@ -45,17 +48,23 @@ describe("SessionManager cold sidecar integration", () => {
 			},
 		];
 		storage.writeTextSync(sessionFile, `${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`);
+		storage.writeTextSync(`${sessionFile}.spill.idx`, "legacy-index\n");
+		storage.writeTextSync(`${sessionFile}.spill.tail`, "legacy-tail\n");
+		storage.writeTextSync(`${sessionFile}.spill.commit`, "legacy-commit\n");
 
 		const manager = await SessionManager.open(
 			sessionFile,
 			SessionManager.explicitDestination(tempDir.path()),
 			storage,
 		);
+		expect(storage.existsSync(`${sessionFile}.spill.idx`)).toBe(false);
+		expect(storage.existsSync(`${sessionFile}.spill.tail`)).toBe(false);
+		expect(storage.existsSync(`${sessionFile}.spill.commit`)).toBe(false);
 		try {
 			expect(manager.hotRetainedMessageCharsForTests()).toBeGreaterThan(50_000);
 			manager.setSessionMemoryMode("enabled");
-			expect(storage.existsSync(`${sessionFile}.spill.idx`)).toBe(true);
-			expect(storage.existsSync(`${sessionFile}.spill.tail`)).toBe(true);
+			expect(storage.existsSync(sidecarPath(sessionFile, "idx"))).toBe(true);
+			expect(storage.existsSync(sidecarPath(sessionFile, "tail"))).toBe(true);
 			const memoryStats = manager.getSessionMemoryStats();
 			expect(memoryStats.sidecarEnabled).toBe(true);
 			expect(memoryStats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
@@ -83,8 +92,8 @@ describe("SessionManager cold sidecar integration", () => {
 			expect(manager.getBranch().map(entry => entry.id)).toEqual([ids[0]]);
 			expect(manager.getLastModelChangeRole()).toBeUndefined();
 			manager.setSessionMemoryMode("off");
-			expect(storage.existsSync(`${sessionFile}.spill.idx`)).toBe(false);
-			expect(storage.existsSync(`${sessionFile}.spill.tail`)).toBe(false);
+			expect(storage.existsSync(sidecarPath(sessionFile, "idx"))).toBe(false);
+			expect(storage.existsSync(sidecarPath(sessionFile, "tail"))).toBe(false);
 			expect(manager.hotRetainedMessageCharsForTests()).toBeGreaterThan(50_000);
 		} finally {
 			await manager.close();
@@ -195,8 +204,8 @@ describe("SessionManager cold sidecar integration", () => {
 
 			const sessionFile = manager.getSessionFile();
 			if (!sessionFile) throw new Error("Expected persisted live session");
-			expect(storage.existsSync(`${sessionFile}.spill.idx`)).toBe(true);
-			expect(storage.existsSync(`${sessionFile}.spill.tail`)).toBe(true);
+			expect(storage.existsSync(sidecarPath(sessionFile, "idx"))).toBe(true);
+			expect(storage.existsSync(sidecarPath(sessionFile, "tail"))).toBe(true);
 			expect(manager.hotRetainedMessageCharsForTests()).toBeLessThan(1024);
 			expect(manager.getSessionMemoryStats().sidecarEnabled).toBe(true);
 		} finally {
@@ -287,7 +296,7 @@ describe("SessionManager cold sidecar integration", () => {
 		);
 		try {
 			manager.setSessionMemoryMode("enabled");
-			expect(storage.existsSync(`${sessionFile}.spill.idx`)).toBe(false);
+			expect(storage.existsSync(sidecarPath(sessionFile, "idx"))).toBe(false);
 			expect(manager.getSessionMemoryStats()).toMatchObject({ sidecarEnabled: false, sidecarIneligible: true });
 			expect(manager.getEntriesForExport()).toHaveLength(3);
 		} finally {
@@ -520,7 +529,7 @@ it("reopens an enabled explicit session from authenticated hot-tail metadata", a
 	} finally {
 		await reopened.close();
 	}
-	const markerPath = `${sessionFile}.spill.commit`;
+	const markerPath = sidecarPath(sessionFile, "commit");
 	const marker = JSON.parse(storage.readTextSync(markerPath)) as { reducer: { ttsr: { count: number } } };
 	marker.reducer.ttsr.count = Number.NaN;
 	storage.writeTextSync(markerPath, `${JSON.stringify(marker)}\n`);
@@ -758,7 +767,7 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 			premiumRequests: 0,
 			cost: 12,
 		});
-		const marker = JSON.parse(storage.readTextSync(`${sessionFile}.spill.commit`)) as {
+		const marker = JSON.parse(storage.readTextSync(sidecarPath(sessionFile, "commit"))) as {
 			base: { baseDigest: string; baseEndOffset: number };
 			transcriptSize: number;
 			retirementFirstKeptEntryId: string;
@@ -774,7 +783,7 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 		// The commit authenticates the exact `.spill.idx` bytes (indexDigest).
 		expect(marker.indexDigest).toBe(
 			createHash("sha256")
-				.update(storage.readBytesSync(`${sessionFile}.spill.idx`))
+				.update(storage.readBytesSync(sidecarPath(sessionFile, "idx")))
 				.digest("hex"),
 		);
 	} finally {
@@ -784,7 +793,7 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 	// The marker published by the bounded first open is accepted by the existing
 	// authenticated explicit lazy reopen path (exact offsets, digests, and the
 	// rolling tail proof all round-trip).
-	const exactIndexText = storage.readTextSync(`${sessionFile}.spill.idx`);
+	const exactIndexText = storage.readTextSync(sidecarPath(sessionFile, "idx"));
 	storage.textReads = 0;
 	storage.textSyncReads = 0;
 	storage.bytesReads = 0;
@@ -807,9 +816,9 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 			lazyReopenFallbackReason: undefined,
 			lastReopenTransition: { kind: "exact", reason: "descriptor_and_proof_match" },
 		});
-		storage.writeTextSync(`${sessionFile}.spill.idx`, `${exactIndexText}{}\n`);
+		storage.writeTextSync(sidecarPath(sessionFile, "idx"), `${exactIndexText}{}\n`);
 		expect(reopened.getEntry("cold-old")).toBeUndefined();
-		storage.writeTextSync(`${sessionFile}.spill.idx`, exactIndexText);
+		storage.writeTextSync(sidecarPath(sessionFile, "idx"), exactIndexText);
 		expect(reopened.getEntry("cold-old")).toMatchObject({ id: "cold-old", type: "message" });
 		expect(reopened.buildSessionContext().messages).toHaveLength(3);
 		expect(reopened.getUsageStatistics()).toMatchObject({ cost: 12 });
@@ -819,7 +828,10 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 
 	// A disposable index that no longer matches the committed indexDigest is
 	// never adopted: the open fails closed to the eager authoritative path.
-	storage.writeTextSync(`${sessionFile}.spill.idx`, `${storage.readTextSync(`${sessionFile}.spill.idx`)}{}\n`);
+	storage.writeTextSync(
+		sidecarPath(sessionFile, "idx"),
+		`${storage.readTextSync(sidecarPath(sessionFile, "idx"))}{}\n`,
+	);
 	storage.textReads = 0;
 	storage.textSyncReads = 0;
 	storage.bytesReads = 0;
@@ -898,7 +910,7 @@ it("commits cold label clears and appended usage before exact reopen", async () 
 			},
 		} as unknown as Parameters<SessionManager["appendMessage"]>[0]);
 		manager.appendCompaction("checkpoint", undefined, assistantId, 5);
-		const marker = JSON.parse(storage.readTextSync(`${sessionFile}.spill.commit`)) as {
+		const marker = JSON.parse(storage.readTextSync(sidecarPath(sessionFile, "commit"))) as {
 			labels: Array<[string, string]>;
 			usageStatistics: { input: number; output: number; cost: number };
 		};
@@ -1031,7 +1043,7 @@ it("fails closed for transcript-ahead and tail-ahead reopen states", async () =>
 	}
 
 	const tailAhead = await buildFixture("tail-ahead");
-	const tailPath = `${tailAhead.sessionFile}.spill.tail`;
+	const tailPath = sidecarPath(tailAhead.sessionFile, "tail");
 	tailAhead.storage.writeTextSync(tailPath, `${tailAhead.storage.readTextSync(tailPath)}{}\n`);
 	tailAhead.storage.textReads = 0;
 	const tailFallback = await SessionManager.open(
@@ -1141,7 +1153,7 @@ it("stages and promotes default model selection without hydrating retired histor
 		const staleStage = await manager.stageDefaultModelSelection("provider/other", "low", {
 			appendThinkingLevel: true,
 		});
-		const tailPath = `${sessionFile}.spill.tail`;
+		const tailPath = sidecarPath(sessionFile, "tail");
 		const tailText = storage.readTextSync(tailPath);
 		storage.writeTextSync(tailPath, `${tailText}{}\n`);
 		expect(manager.promoteDefaultModelSelection(staleStage)).toEqual({ kind: "not_promoted" });
@@ -1400,12 +1412,12 @@ describe("managed commit marker classification", () => {
 			const sessionFile = manager.getSessionFile();
 			expect(sessionFile).toBeTruthy();
 			if (sessionFile) {
-				const marker = JSON.parse(fs.readFileSync(`${sessionFile}.spill.commit`, "utf8")) as {
+				const marker = JSON.parse(fs.readFileSync(sidecarPath(sessionFile, "commit"), "utf8")) as {
 					transcriptSize: number;
 				};
 				expect(marker.transcriptSize).toBe(fs.statSync(sessionFile).size);
 				const tailRecords = fs
-					.readFileSync(`${sessionFile}.spill.tail`, "utf8")
+					.readFileSync(sidecarPath(sessionFile, "tail"), "utf8")
 					.trimEnd()
 					.split("\n")
 					.map(line => JSON.parse(line) as { id: string });
@@ -1461,7 +1473,7 @@ describe("managed commit marker classification", () => {
 			} finally {
 				await reopened.close();
 			}
-			const markerPath = `${sessionFile}.spill.commit`;
+			const markerPath = sidecarPath(sessionFile, "commit");
 			const corruptMarker = JSON.parse(fs.readFileSync(markerPath, "utf8")) as { terminalChecksum: string };
 			corruptMarker.terminalChecksum = "0".repeat(64);
 			fs.writeFileSync(markerPath, `${JSON.stringify(corruptMarker)}\n`);
@@ -1528,7 +1540,7 @@ describe("descriptor-bound capture and staged fork publication", () => {
 		);
 		try {
 			source.setSessionMemoryMode("enabled");
-			expect(storage.existsSync(`${sessionFile}.spill.idx`)).toBe(true);
+			expect(storage.existsSync(sidecarPath(sessionFile, "idx"))).toBe(true);
 			expect(source.hotRetainedMessageCharsForTests()).toBeLessThan(1024);
 
 			const captured = SessionManager.captureTranscriptStrict(sessionFile, storage);

@@ -8827,7 +8827,7 @@ export class SessionManager {
 		const options =
 			this.destination.kind === "managed" ? { securityContext: this.destination.securityContext } : undefined;
 		this.#withSessionPersistenceFenceSync(() => {
-			const markerPath = `${sessionFile}.spill.commit`;
+			const markerPath = runtime.commitPath;
 			const gen = this.#commitGen + 1;
 			const record = {
 				gen,
@@ -8910,6 +8910,20 @@ export class SessionManager {
 
 	/** Create (or reset) the sidecar runtime for the current lifecycle. */
 	#resetSidecarRuntime(ineligible = false): SessionMemorySidecarRuntime {
+		if (this.#sessionFile) {
+			for (const legacyPath of [
+				`${this.#sessionFile}.spill.idx`,
+				`${this.#sessionFile}.spill.tail`,
+				`${this.#sessionFile}.spill.commit`,
+			]) {
+				try {
+					this.storage.unlinkSync(legacyPath);
+				} catch {
+					// Legacy sidecars are disposable and may be absent.
+				}
+			}
+		}
+		const sidecarRoot = this.#sessionFile?.endsWith(".jsonl") ? this.#sessionFile.slice(0, -6) : this.#sessionFile;
 		const runtime: SessionMemorySidecarRuntime = {
 			enabled: false,
 			sidecarIneligible: ineligible,
@@ -8925,9 +8939,9 @@ export class SessionManager {
 			indexDigest: "",
 			indexHash: crypto.createHash("sha256"),
 			coldEntries: new Map(),
-			indexPath: this.#sessionFile ? `${this.#sessionFile}.spill.idx` : "",
-			tailPath: this.#sessionFile ? `${this.#sessionFile}.spill.tail` : "",
-			commitPath: this.#sessionFile ? `${this.#sessionFile}.spill.commit` : "",
+			indexPath: sidecarRoot ? `${sidecarRoot}/.session-memory.spill.idx` : "",
+			tailPath: sidecarRoot ? `${sidecarRoot}/.session-memory.spill.tail` : "",
+			commitPath: sidecarRoot ? `${sidecarRoot}/.session-memory.spill.commit` : "",
 			retirementFirstKeptEntryId: undefined,
 			hotSuffixBytes: 0,
 			accountant: new SessionMemoryAccountant(),
