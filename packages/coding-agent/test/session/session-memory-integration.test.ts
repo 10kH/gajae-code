@@ -500,6 +500,30 @@ describe("sidecar I/O fallback", () => {
 		}
 	});
 });
+
+describe("managed commit marker classification", () => {
+	it("records missing-marker recovery before publishing an exact current marker", async () => {
+		const tempDir = TempDir.createSync("@pi-managed-marker-");
+		const cwd = path.join(tempDir.path(), "workspace");
+		const agentDir = path.join(tempDir.path(), "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
+		try {
+			manager.setSessionMemoryMode("enabled");
+			const firstId = manager.appendMessage({ role: "user", content: "first", timestamp: 1 });
+			const keptId = manager.appendMessage({ role: "user", content: "kept", timestamp: 2 });
+			await manager.ensureOnDisk();
+			manager.appendCompaction("summary", undefined, keptId, 10);
+			const stats = manager.getSessionMemoryStats();
+			expect(stats).toMatchObject({ lastReopenTransition: { kind: "stale_commit", reason: "no_commit_marker" } });
+			expect(stats.currentCommitTransition).toEqual({ kind: "exact", reason: "descriptor_and_proof_match" });
+			expect(manager.getEntry(firstId)).toMatchObject({ id: firstId });
+		} finally {
+			await manager.close();
+			tempDir.removeSync();
+		}
+	});
+});
 describe("descriptor-bound capture and staged fork publication", () => {
 	function writeColdTranscript(
 		storage: FileSessionStorage | MemorySessionStorage,

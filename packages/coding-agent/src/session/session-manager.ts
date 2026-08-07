@@ -89,6 +89,7 @@ import {
 	applyReducerDelta,
 	type BaseAnchor,
 	BoundedLabelsPinsStore,
+	type CommitMarkerContents,
 	type CommittedTail,
 	classifyReopen,
 	computeLineDigest,
@@ -102,7 +103,9 @@ import {
 	type ReopenClassification,
 	RollingTailChainBuilder,
 	SessionMemoryAccountant,
+	sameDescriptor,
 	type TailRecordKind,
+	validateCommit,
 	validateTailChain,
 } from "./internal/session-memory-sidecar";
 import { SessionMigrationBusyError } from "./internal/session-open-errors";
@@ -406,6 +409,8 @@ export interface SessionMemoryStats {
 	hotRegionBytes: number;
 	metaDescriptorBytes: number;
 	totalAccountedBytes: number;
+	lastReopenTransition: ReopenClassification | undefined;
+	currentCommitTransition: ReopenClassification | undefined;
 }
 
 export interface SessionMessageEntry extends SessionEntryBase {
@@ -711,6 +716,7 @@ export interface SessionMemorySidecarRuntime {
 	tailCache: FixedCacheAccount;
 	labelsPins: BoundedLabelsPinsStore;
 	terminalTransition: ReopenClassification | undefined;
+	reopenTransition: ReopenClassification | undefined;
 }
 /** Map a session entry to its rolling-tail record kind. */
 function tailRecordKindForEntry(entry: SessionEntry): TailRecordKind {
@@ -8062,6 +8068,7 @@ export class SessionManager {
 			entryCache: new FixedCacheAccount(28 * 1024 * 1024),
 			tailCache: new FixedCacheAccount(4 * 1024 * 1024),
 			labelsPins: new BoundedLabelsPinsStore(),
+			reopenTransition: undefined,
 			terminalTransition: undefined,
 		};
 		this.#sidecarRuntime = runtime;
@@ -8255,25 +8262,26 @@ export class SessionManager {
 		runtime.base = { baseDigest, baseEndOffset };
 		runtime.tail = tailBuilder.build();
 		if (this.destination.kind === "managed") {
+			runtime.reopenTransition = this.#classifySidecarReopen();
 			this.#publishCommitMarkerFromCurrentTranscriptSync();
 			runtime.terminalTransition = this.#classifySidecarReopen();
 		}
 	}
 
-	#validateColdBase(): boolean {
+	#validateColdBase(base = this.#sidecarRuntime?.base): boolean {
 		const runtime = this.#sidecarRuntime;
 		const sessionFile = this.#sessionFile;
-		if (!runtime?.enabled || !sessionFile || typeof this.storage.readRangeSync !== "function") return false;
+		if (!runtime?.enabled || !base || !sessionFile || typeof this.storage.readRangeSync !== "function") return false;
 		const hash = crypto.createHash("sha256");
 		try {
-			for (let offset = 0; offset < runtime.base.baseEndOffset; offset += 64 * 1024) {
-				const length = Math.min(64 * 1024, runtime.base.baseEndOffset - offset);
+			for (let offset = 0; offset < base.baseEndOffset; offset += 64 * 1024) {
+				const length = Math.min(64 * 1024, base.baseEndOffset - offset);
 				hash.update(this.storage.readRangeSync(sessionFile, offset, length).bytes);
 			}
 		} catch {
 			return false;
 		}
-		return hash.digest("hex") === runtime.base.baseDigest;
+		return hash.digest("hex") === base.baseDigest;
 	}
 
 	/**
@@ -8542,32 +8550,110 @@ export class SessionManager {
 		}
 	}
 
+	#readSessionCommitContents(): CommitMarkerContents | undefined {
+		const markerPath = this.#sidecarRuntime?.commitPath;
+		if (!markerPath || !this.storage.readBytesSync) return undefined;
+		try {
+			const value = JSON.parse(Buffer.from(this.storage.readBytesSync(markerPath)).toString("utf8")) as {
+				gen?: unknown;
+				descriptor?: Record<string, unknown>;
+				base?: Record<string, unknown>;
+				terminalChecksum?: unknown;
+				terminalSeq?: unknown;
+				transcriptSize?: unknown;
+			};
+			const descriptor = value.descriptor;
+			const base = value.base;
+			if (
+				typeof value.gen !== "number" ||
+				!descriptor ||
+				typeof descriptor.dev !== "string" ||
+				typeof descriptor.ino !== "string" ||
+				typeof descriptor.size !== "number" ||
+				typeof descriptor.mtimeNs !== "string" ||
+				typeof descriptor.ctimeNs !== "string" ||
+				!base ||
+				typeof base.baseDigest !== "string" ||
+				typeof base.baseEndOffset !== "number" ||
+				typeof value.terminalChecksum !== "string" ||
+				typeof value.terminalSeq !== "number" ||
+				typeof value.transcriptSize !== "number"
+			)
+				return undefined;
+			return {
+				gen: value.gen,
+				descriptor: {
+					dev: BigInt(descriptor.dev),
+					ino: BigInt(descriptor.ino),
+					...(typeof descriptor.nlink === "string" ? { nlink: BigInt(descriptor.nlink) } : {}),
+					size: descriptor.size,
+					mtimeNs: BigInt(descriptor.mtimeNs),
+					ctimeNs: BigInt(descriptor.ctimeNs),
+				},
+				base: { baseDigest: base.baseDigest, baseEndOffset: base.baseEndOffset },
+				terminalChecksum: value.terminalChecksum,
+				terminalSeq: value.terminalSeq,
+				transcriptSize: value.transcriptSize,
+			};
+		} catch {
+			return undefined;
+		}
+	}
+
 	/** Classify the current reopen state against the committed `.spill.commit` marker. */
 	#classifySidecarReopen(): ReopenClassification {
-		if (!this.#coldSidecarActive()) {
-			return { kind: "exact", reason: "no_cold_region" };
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled || runtime.sidecarIneligible) return { kind: "rebuild", reason: "sidecar_unavailable" };
+		let markerPresent = false;
+		try {
+			markerPresent = readSessionCommitMarkerSync(this.storage, runtime.commitPath).kind === "present";
+		} catch {
+			return { kind: "rebuild", reason: "commit_marker_read_failed" };
 		}
-		const runtime = this.#sidecarRuntime!;
-		const observed = {
-			descriptor: this.#managedDescriptorSnapshotOrNull(),
-			baseValid: true,
-			tailValid: validateTailChain(runtime.base, runtime.tail.records).valid,
-			terminalMarkerValid: true,
-		};
+		if (!markerPresent) return { kind: "stale_commit", reason: "no_commit_marker" };
+		const commit = this.#readSessionCommitContents();
+		if (!commit) return { kind: "rebuild", reason: "commit_marker_invalid" };
+		const descriptor = this.#managedDescriptorSnapshotOrNull();
+		if (!descriptor) return { kind: "rebuild", reason: "descriptor_unavailable" };
+		const baseValid = this.#validateColdBase(commit.base);
+		const tailValid = validateTailChain(commit.base, runtime.tail.records).valid;
+		const terminalMarkerValid =
+			commit.terminalChecksum === runtime.tail.terminalChecksum &&
+			commit.terminalSeq === runtime.tail.terminalSeq &&
+			commit.transcriptSize === runtime.tail.transcriptSize;
+		const descriptorExact = sameDescriptor(commit.descriptor, descriptor);
+		const sameObject =
+			commit.descriptor.dev === descriptor.dev &&
+			commit.descriptor.ino === descriptor.ino &&
+			(commit.descriptor.nlink ?? 0n) === (descriptor.nlink ?? 0n);
+		const sameSize = commit.descriptor.size === descriptor.size;
+		const timesChanged =
+			commit.descriptor.mtimeNs !== descriptor.mtimeNs || commit.descriptor.ctimeNs !== descriptor.ctimeNs;
+		const timesAdvanced =
+			descriptor.mtimeNs >= commit.descriptor.mtimeNs && descriptor.ctimeNs >= commit.descriptor.ctimeNs;
 		const classification = classifyReopen({
-			markerPresent: true,
-			descriptorExact: Boolean(observed.descriptor),
-			sameObject: true,
-			sameSize: runtime.tail.transcriptSize === observed.descriptor?.size,
-			sizeGrew: Boolean(observed.descriptor && runtime.tail.transcriptSize < observed.descriptor.size),
-			sizeShrank: Boolean(observed.descriptor && runtime.tail.transcriptSize > observed.descriptor.size),
-			withinScanWindow: true,
-			timesAdvanced: true,
-			timesChanged: false,
-			baseValid: observed.baseValid,
-			tailValid: observed.tailValid,
-			terminalMarkerValid: observed.terminalMarkerValid,
+			markerPresent,
+			descriptorExact,
+			sameObject,
+			sameSize,
+			sizeGrew: sameObject && descriptor.size > commit.descriptor.size,
+			sizeShrank: sameObject && descriptor.size < commit.descriptor.size,
+			withinScanWindow: Math.abs(descriptor.size - commit.descriptor.size) <= 4 * 1024 * 1024,
+			timesAdvanced,
+			timesChanged,
+			baseValid,
+			tailValid,
+			terminalMarkerValid,
 		});
+		if (descriptorExact) {
+			const validation = validateCommit(commit, runtime.tail.records, {
+				descriptor,
+				baseValid,
+				tailValid,
+				terminalMarkerValid,
+			});
+			if (validation.kind === "invalid") return { kind: "rebuild", reason: validation.reason };
+		}
 		runtime.terminalTransition = classification;
 		return classification;
 	}
@@ -9039,6 +9125,8 @@ export class SessionManager {
 				hotRegionBytes: 0,
 				metaDescriptorBytes: 0,
 				totalAccountedBytes: 0,
+				lastReopenTransition: undefined,
+				currentCommitTransition: undefined,
 			};
 		}
 		const reducerBytes = JSON.stringify(runtime.reducer).length * 2 + 48;
@@ -9055,6 +9143,8 @@ export class SessionManager {
 			hotRegionBytes: runtime.hotSuffixBytes,
 			metaDescriptorBytes,
 			totalAccountedBytes: runtime.accountant.totalBytes,
+			lastReopenTransition: runtime.reopenTransition,
+			currentCommitTransition: runtime.terminalTransition,
 		};
 	}
 
