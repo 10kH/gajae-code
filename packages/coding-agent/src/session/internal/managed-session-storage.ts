@@ -1377,6 +1377,23 @@ export class ManagedSessionDescendantStore {
 		if (!replaced.ok) throw new Error(replaced.code ?? "managed_replace_failed");
 	}
 
+	/** Capture descriptor identity without copying file bytes when retained authority is available. */
+	descriptorExpected(relativePath: string): SessionStorageStat | null {
+		this.#assertBound();
+		const resolved = this.#resolve(relativePath);
+		if (!this.#authority) {
+			const snapshot = this.readExpected(relativePath);
+			return snapshot ? managedAppendReceiptFromIdentity(snapshot.identity).descriptor : null;
+		}
+		const stat = this.#authority.stat(this.#relative(resolved));
+		if (!stat.ok) {
+			if (stat.code === "not_found") return null;
+			throw new Error(stat.code ?? "managed_stat_failed");
+		}
+		if (!stat.identity) throw new Error("managed_stat_identity_unavailable");
+		return managedAppendReceiptFromIdentity(managedFileIdentityFromNative(stat.identity)).descriptor;
+	}
+
 	/** Read an exact managed file without exposing its pathname as authority. */
 	readExpected(relativePath: string): ManagedFileSnapshot | null {
 		this.#assertBound();

@@ -5331,26 +5331,6 @@ type ManagedDestinationTransition = {
  * switch); a revision change discards the prepared bytes and re-prepares (bounded),
  * so a stale snapshot is never published.
  */
-/**
- * Converts one managed file snapshot into the `SessionStorageStat`-shaped
- * descriptor the commit-marker helpers expect. The snapshot is captured from an
- * authoritative managed read/append receipt (never a pathname `statSync`), so the
- * descriptor binds the committed managed object.
- */
-function sessionStorageStatFromManagedSnapshot(snapshot: ManagedFileSnapshot): SessionStorageStat {
-	const { dev, ino, nlink, size, mtimeNs, ctimeNs } = snapshot.identity;
-	return {
-		dev,
-		ino,
-		nlink,
-		size,
-		mtimeMs: Number(mtimeNs) / 1_000_000,
-		mtimeNs,
-		ctimeNs,
-		mtime: new Date(Number(mtimeNs) / 1_000_000),
-		isFile: true,
-	};
-}
 export interface PersistenceInputToken {
 	/** Canonical session file path the prepared bytes target. */
 	sessionFile: string;
@@ -8046,9 +8026,9 @@ export class SessionManager {
 	#publishCommitMarkerFromCurrentTranscriptSync(): void {
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile || this.destination.kind !== "managed") return;
-		const snapshot = this.#managedTranscriptStore(sessionFile).readExpected(path.basename(sessionFile));
-		if (!snapshot) return;
-		this.#publishSessionCommitMarkerSync(sessionStorageStatFromManagedSnapshot(snapshot));
+		const descriptor = this.#managedTranscriptStore(sessionFile).descriptorExpected(path.basename(sessionFile));
+		if (!descriptor) return;
+		this.#publishSessionCommitMarkerSync(descriptor);
 	}
 	// =========================================================================
 	// Cold-sidecar runtime (P2/P3/P4 primitives integration)
@@ -8597,15 +8577,15 @@ export class SessionManager {
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile || this.destination.kind !== "managed") return null;
 		try {
-			const snapshot = this.#managedTranscriptStore(sessionFile).readExpected(path.basename(sessionFile));
-			if (!snapshot) return null;
+			const descriptor = this.#managedTranscriptStore(sessionFile).descriptorExpected(path.basename(sessionFile));
+			if (!descriptor) return null;
 			return {
-				dev: snapshot.identity.dev,
-				ino: snapshot.identity.ino,
-				nlink: snapshot.identity.nlink,
-				size: snapshot.identity.size,
-				mtimeNs: snapshot.identity.mtimeNs,
-				ctimeNs: snapshot.identity.ctimeNs,
+				dev: descriptor.dev,
+				ino: descriptor.ino,
+				nlink: descriptor.nlink,
+				size: descriptor.size,
+				mtimeNs: descriptor.mtimeNs,
+				ctimeNs: descriptor.ctimeNs,
 			};
 		} catch {
 			return null;
