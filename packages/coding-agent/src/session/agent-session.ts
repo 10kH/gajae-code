@@ -566,6 +566,8 @@ export interface AgentSessionConfig {
 	modelRegistry: ModelRegistry;
 	/** Task recursion depth for nested sessions. Top-level sessions use 0. */
 	taskDepth?: number;
+	/** Controls whether workflow gates are published to the process-wide endpoint registry. */
+	workflowGatePublication?: "endpoint" | "local";
 	/** Tool registry for LSP and settings */
 	toolRegistry?: Map<string, AgentTool>;
 	/** Tool-session factory context used to lazily attach workflow-gate-only tools. */
@@ -1753,6 +1755,7 @@ export class AgentSession {
 	readonly settings: Settings;
 	readonly notificationSessionController: NotificationSessionController | undefined;
 	readonly taskDepth: number;
+	#workflowGatePublication: "endpoint" | "local";
 	readonly yieldQueue: YieldQueue;
 	// True from the start of a handoff transition through commit/rollback. While
 	// set, the yield queue treats the session as busy so background async-job
@@ -2624,6 +2627,7 @@ export class AgentSession {
 				: undefined);
 		this.notificationSessionController = config.notificationSessionController;
 		this.taskDepth = config.taskDepth ?? 0;
+		this.#workflowGatePublication = config.workflowGatePublication ?? "endpoint";
 		// Register this session with the process-wide resource GC (idle/RSS browser-tab eviction
 		// + stale screenshot cleanup). Session-keyed so concurrent sessions share one timer safely.
 		const resourceGcSessionId = this.sessionManager.getSessionId();
@@ -6139,7 +6143,7 @@ export class AgentSession {
 			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
 		}
 		this.#workflowGateEmitter = undefined;
-		notifyWorkflowGateEmitterChanged(this.sessionId, undefined);
+		this.#notifyWorkflowGateEmitterChanged(this.sessionId, undefined);
 		await this.#flushWorkerIntegrationAttempt();
 		await this.#cancelPostPromptTasks();
 		// Cancel jobs this agent registered so a subagent's teardown doesn't
@@ -7862,11 +7866,19 @@ export class AgentSession {
 		return getAskAnswerSourceFromRegistry(this.sessionId);
 	}
 
+	#notifyWorkflowGateEmitterChanged(sessionId: string, emitter: WorkflowGateEmitter | undefined): void {
+		if (this.#workflowGatePublication !== "endpoint") return;
+		notifyWorkflowGateEmitterChanged(sessionId, emitter);
+	}
+
 	#constructWorkflowGateEmitter(sessionId = this.sessionManager.getSessionId()): WorkflowGateEmitter {
 		assertNonEmptyGjcSessionId(sessionId, "AgentSession workflow-gate session");
-		const gateStore = this.sessionManager.isPersisted()
-			? new FileGateStore(path.join(sessionStateDir(this.sessionManager.getCwd(), sessionId), "workflow-gates.json"))
-			: new MemoryGateStore();
+		const gateStore =
+			this.#workflowGatePublication === "endpoint" && this.sessionManager.isPersisted()
+				? new FileGateStore(
+						path.join(sessionStateDir(this.sessionManager.getCwd(), sessionId), "workflow-gates.json"),
+					)
+				: new MemoryGateStore();
 		return new BrokerWorkflowGateEmitter(sessionId, gateStore);
 	}
 
@@ -7892,7 +7904,7 @@ export class AgentSession {
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
-		if (previousSessionId) notifyWorkflowGateEmitterChanged(previousSessionId, undefined);
+		if (previousSessionId) this.#notifyWorkflowGateEmitterChanged(previousSessionId, undefined);
 		this.setWorkflowGateEmitter(successorEmitter);
 	}
 
@@ -7910,7 +7922,7 @@ export class AgentSession {
 		this.#workflowGateEmitter = undefined;
 		try {
 			emitter.suspend?.();
-			notifyWorkflowGateEmitterChanged(sessionId, undefined);
+			this.#notifyWorkflowGateEmitterChanged(sessionId, undefined);
 		} catch (error) {
 			logger.warn("Workflow-gate emitter suspension notification failed", {
 				error: error instanceof Error ? error.message : String(error),
@@ -7927,7 +7939,7 @@ export class AgentSession {
 
 	setWorkflowGateEmitter(emitter: WorkflowGateEmitter | undefined): void {
 		this.#workflowGateEmitter = emitter;
-		notifyWorkflowGateEmitterChanged(this.sessionId, emitter);
+		this.#notifyWorkflowGateEmitterChanged(this.sessionId, emitter);
 		if (emitter) {
 			this.#registerWorkflowGateAskTool();
 		}
