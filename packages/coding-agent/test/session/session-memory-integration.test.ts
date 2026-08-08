@@ -640,6 +640,13 @@ describe("bounded provider context traversal", () => {
 		const eager = manager.buildSessionContext();
 		manager.setSessionMemoryMode("enabled");
 		expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		const counters = manager.getSessionMemoryStats();
+		expect(counters.coldEntriesRetired).toBeGreaterThan(0);
+		expect(counters.coldEntriesReloaded).toBe(0);
+		expect(counters.sidecarRebuildCount).toBeGreaterThan(0);
+		expect(counters.transcriptGeneration).toBeGreaterThan(0);
+		expect(manager.getEntry("thinking")).toMatchObject({ id: "thinking", type: "thinking_level_change" });
+		expect(manager.getSessionMemoryStats().coldEntriesReloaded).toBeGreaterThan(0);
 		expect(manager.buildSessionContext()).toEqual(eager);
 		await manager.close();
 

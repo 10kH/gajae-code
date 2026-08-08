@@ -458,6 +458,16 @@ export interface SessionMemoryStats {
 	dictionaryArtifactEnabled: boolean;
 	/** Reducer-bucket bytes retained by metadata-delta descriptors (fixed accounting). */
 	metadataDeltaDescriptorBytes: number;
+	/** Live observability counters (P7 contract). */
+	coldEntriesRetired: number;
+	coldEntriesReloaded: number;
+	rangeReadCount: number;
+	rangeReadGenerationMismatchCount: number;
+	sidecarRebuildCount: number;
+	coldMutationPromotions: number;
+	hotOverflowTransitions: number;
+	labelDiskFallbackCount: number;
+	transcriptGeneration: number;
 }
 
 export interface SessionMessageEntry extends SessionEntryBase {
@@ -802,6 +812,16 @@ export interface SessionMemorySidecarRuntime {
 	/** Lazily built 24-bit fingerprints for O(1) fail-closed ID generation when no persistent dictionary exists. */
 	coldIdHashes?: BoundedColdIdHashSet;
 	coldIdHashesDescriptor?: SessionStorageStat;
+	/** Live observability counters (P7 live-only contract). */
+	coldEntriesRetired: number;
+	coldEntriesReloaded: number;
+	rangeReadCount: number;
+	rangeReadGenerationMismatchCount: number;
+	sidecarRebuildCount: number;
+	coldMutationPromotions: number;
+	hotOverflowTransitions: number;
+	labelDiskFallbackCount: number;
+	transcriptGeneration: number;
 }
 
 /** Retained runtime state of the disposable parent→children artifact (block-cache charged). */
@@ -9913,6 +9933,15 @@ export class SessionManager {
 			labelsPins: new BoundedLabelsPinsStore(),
 			reopenTransition: undefined,
 			terminalTransition: undefined,
+			coldEntriesRetired: 0,
+			coldEntriesReloaded: 0,
+			rangeReadCount: 0,
+			rangeReadGenerationMismatchCount: 0,
+			sidecarRebuildCount: 0,
+			coldMutationPromotions: 0,
+			hotOverflowTransitions: 0,
+			labelDiskFallbackCount: 0,
+			transcriptGeneration: 0,
 		};
 		this.#sidecarRuntime = runtime;
 		return runtime;
@@ -11512,6 +11541,9 @@ export class SessionManager {
 		for (const entry of this.#fileEntries) {
 			if (entry.type !== "session" && !activeHotIds.has(entry.id)) retired++;
 		}
+		runtime.coldEntriesRetired += retired;
+		runtime.transcriptGeneration++;
+		runtime.sidecarRebuildCount++;
 		this.#fileEntries = this.#fileEntries.filter(entry => entry.type === "session" || activeHotIds.has(entry.id));
 		this.#byId = new Map(
 			this.#fileEntries
@@ -11841,6 +11873,8 @@ export class SessionManager {
 		if (!sessionFile) return undefined;
 		try {
 			if (typeof this.storage.readRangeSync === "function") {
+				const runtime = this.#sidecarRuntime;
+				if (runtime) runtime.rangeReadCount++;
 				const snapshot = this.storage.readRangeSync(sessionFile, index.byteOffset, index.byteLength);
 				return snapshot.bytes;
 			}
@@ -11891,6 +11925,7 @@ export class SessionManager {
 		// Bound the entry cache; a full cache rejects the rehydration (still correct via rebuild).
 		if (!runtime.entryCache.tryAllocate(bytes.byteLength)) return entry;
 		this.#byId.set(id, entry);
+		runtime.coldEntriesReloaded++;
 		return entry;
 	}
 
@@ -13341,6 +13376,15 @@ export class SessionManager {
 				parentArtifactEnabled: false,
 				dictionaryArtifactEnabled: false,
 				metadataDeltaDescriptorBytes: 0,
+				coldEntriesRetired: 0,
+				coldEntriesReloaded: 0,
+				rangeReadCount: 0,
+				rangeReadGenerationMismatchCount: 0,
+				sidecarRebuildCount: 0,
+				coldMutationPromotions: 0,
+				hotOverflowTransitions: 0,
+				labelDiskFallbackCount: 0,
+				transcriptGeneration: 0,
 			};
 		}
 		const reducerBytes = JSON.stringify(runtime.reducer).length * 2 + 48;
@@ -13369,6 +13413,15 @@ export class SessionManager {
 			parentArtifactEnabled: runtime.parentArtifact !== undefined,
 			dictionaryArtifactEnabled: runtime.dictionary !== undefined,
 			metadataDeltaDescriptorBytes: runtime.metadataDelta?.descriptorBytes ?? 0,
+			coldEntriesRetired: runtime.coldEntriesRetired,
+			coldEntriesReloaded: runtime.coldEntriesReloaded,
+			rangeReadCount: runtime.rangeReadCount,
+			rangeReadGenerationMismatchCount: runtime.rangeReadGenerationMismatchCount,
+			sidecarRebuildCount: runtime.sidecarRebuildCount,
+			coldMutationPromotions: runtime.coldMutationPromotions,
+			hotOverflowTransitions: runtime.hotOverflowTransitions,
+			labelDiskFallbackCount: runtime.labelDiskFallbackCount,
+			transcriptGeneration: runtime.transcriptGeneration,
 		};
 	}
 
