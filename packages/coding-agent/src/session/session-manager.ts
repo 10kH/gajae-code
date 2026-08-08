@@ -100,6 +100,7 @@ import {
 	getLastModelChangeRole as getReducerLastModelChangeRole,
 	isDerivedSessionMemoryFile,
 	LABELS_PINS_BUDGET_BYTES,
+	PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT,
 	REDUCER_BUDGET_BYTES,
 	type ReducerState,
 	type ReopenClassification,
@@ -12559,10 +12560,57 @@ export class SessionManager {
 			: undefined;
 	}
 
+	#readColdChildren(parentId: string): SessionEntry[] | undefined {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled || !runtime.indexPath || typeof this.storage.readRangeSync !== "function") return undefined;
+		if (!this.#coldIndexDigestValid()) return undefined;
+		let size: number;
+		try {
+			size = this.storage.statSync(runtime.indexPath).size;
+		} catch {
+			return undefined;
+		}
+		const childIds: string[] = [];
+		let malformed = false;
+		const failure = scanTranscriptLinesBounded(this.storage, runtime.indexPath, size, (_offset, lineBytes) => {
+			try {
+				const value = JSON.parse(Buffer.from(lineBytes.subarray(0, lineBytes.byteLength - 1)).toString("utf8")) as {
+					id?: unknown;
+					parentId?: unknown;
+				};
+				if (typeof value.id !== "string" || (value.parentId !== null && typeof value.parentId !== "string")) {
+					malformed = true;
+					return false;
+				}
+				if (value.parentId !== parentId) return;
+				if (childIds.length >= PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT) return false;
+				childIds.push(value.id);
+			} catch {
+				malformed = true;
+				return false;
+			}
+		});
+		if (failure || malformed) return undefined;
+		const cache = new Map<string, string>();
+		const children: SessionEntry[] = [];
+		for (const id of childIds) {
+			const entry = this.#resolveEntry(id);
+			if (!entry || entry.parentId !== parentId) return undefined;
+			children.push(
+				cloneSessionEntry(materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), cache)),
+			);
+		}
+		return children;
+	}
+
 	/**
 	 * Get all direct children of an entry.
 	 */
 	getChildren(parentId: string): SessionEntry[] {
+		if (this.#coldSidecarActive()) {
+			const coldChildren = this.#readColdChildren(parentId);
+			if (coldChildren) return coldChildren;
+		}
 		const cache = new Map<string, string>();
 		this.#ensureFullHotView();
 		const children: SessionEntry[] = [];

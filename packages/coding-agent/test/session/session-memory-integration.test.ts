@@ -2229,6 +2229,44 @@ describe("sidecar I/O fallback", () => {
 		}
 	});
 
+	it("reads direct children from the authenticated cold index without hydrating the session", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/cold-children.jsonl";
+		storage.writeTextSync(
+			sessionFile,
+			`${[
+				{ type: "session", version: 5, id: "cold-children", timestamp: "0", cwd: "/cwd" },
+				{ type: "custom", id: "root", parentId: null, timestamp: "0", customType: "node", data: {} },
+				{ type: "custom", id: "abandoned", parentId: "root", timestamp: "0", customType: "node", data: {} },
+				{ type: "custom", id: "active", parentId: "root", timestamp: "0", customType: "node", data: {} },
+				{
+					type: "compaction",
+					id: "active-compaction",
+					parentId: "active",
+					timestamp: "0",
+					summary: "summary",
+					firstKeptEntryId: "active",
+					tokensBefore: 1,
+				},
+			]
+				.map(record => JSON.stringify(record))
+				.join("\n")}\n`,
+		);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			expect(manager.getChildren("root").map(entry => entry.id)).toEqual(["abandoned", "active"]);
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		} finally {
+			await manager.close();
+		}
+	});
 	it("preserves the tail truncation fsync error when close also fails", async () => {
 		class TailTruncationFailureStorage extends MemorySessionStorage {
 			tailWriterCount = 0;
