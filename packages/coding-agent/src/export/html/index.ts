@@ -1,3 +1,4 @@
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentState } from "@gajae-code/agent-core";
 import { APP_NAME, isEnoent } from "@gajae-code/utils";
@@ -119,6 +120,13 @@ async function writeSessionHtml(
 	const marker = "{{SESSION_DATA}}";
 	const markerOffset = themedTemplate.indexOf(marker);
 	if (markerOffset < 0) throw new Error("HTML export template is missing the session-data marker");
+	const sourcePath = sm.getSessionFile();
+	if (sourcePath) {
+		const sourceIdentity = await fs.realpath(sourcePath).catch(() => path.resolve(sourcePath));
+		const outputIdentity = await fs.realpath(outputPath).catch(() => path.resolve(outputPath));
+		if (sourceIdentity === outputIdentity)
+			throw new Error("HTML export output must not overwrite the source transcript");
+	}
 	const sink = Bun.file(outputPath).writer();
 	const encoder = new Base64StreamEncoder();
 	const writeEncoded = (value: string): void => {

@@ -10076,10 +10076,12 @@ export class SessionManager {
 
 	/** True when the cold sidecar region is active and usable. */
 	#coldSidecarActive(): boolean {
+		const runtime = this.#sidecarRuntime;
 		return Boolean(
-			this.#sidecarRuntime?.enabled &&
-				!this.#sidecarRuntime.sidecarIneligible &&
-				this.#sidecarRuntime.hotSuffixBytes > 0,
+			runtime?.enabled &&
+				!runtime.sidecarIneligible &&
+				(runtime.hotSuffixBytes > 0 ||
+					(runtime.tail.records.length === 0 && runtime.base.baseEndOffset === runtime.tail.transcriptSize)),
 		);
 	}
 
@@ -12875,11 +12877,18 @@ export class SessionManager {
 			return cached;
 		}
 		this.#pathOnlyContextBuildCount++;
-		const providerEntries = this.#getActivePathEntriesForProviderContext();
-		const detachedEntries = [
-			...(this.#coldSidecarActive() && this.#sidecarRuntime ? this.#sidecarRuntime.providerStateEntries : []),
-			...providerEntries,
-		].map(cloneSessionEntry);
+		const providerEntries = this.#getActivePathEntriesForProviderContext().map(cloneSessionEntry);
+		const providerStateEntries =
+			this.#coldSidecarActive() && this.#sidecarRuntime
+				? this.#sidecarRuntime.providerStateEntries.map(cloneSessionEntry)
+				: [];
+		let syntheticParentId: string | null = null;
+		for (const entry of providerStateEntries) {
+			entry.parentId = syntheticParentId;
+			syntheticParentId = entry.id;
+		}
+		if (providerEntries[0] && syntheticParentId) providerEntries[0].parentId = syntheticParentId;
+		const detachedEntries = [...providerStateEntries, ...providerEntries];
 		const builtContext = buildSessionContext(detachedEntries, this.#leafId, undefined, this.#sessionId);
 		this.#sessionContextCacheOversized = jsonLikeValueExceedsCacheLimit(builtContext, materializedCacheMaxBytes());
 		if (this.#sessionContextCacheOversized) {
@@ -13661,6 +13670,7 @@ export class SessionManager {
 			} else if (revalidateTranscriptIdentityBounded(sourcePath, this.storage, identity).kind !== "valid") {
 				throw new Error("fork_source_identity_changed");
 			}
+			await this.copyArtifactsForFork(sourcePath, fresh.sessionFile);
 			await this.#initSessionFile(fresh.sessionFile);
 			writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
 			return true;

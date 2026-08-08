@@ -788,9 +788,17 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 			thinkingLevel: "high",
 		},
 		{
+			type: "custom",
+			id: "cold-gap",
+			parentId: "cold-thinking",
+			timestamp: now,
+			customType: "provider-gap",
+			data: { value: true },
+		},
+		{
 			type: "message",
 			id: "cold-kept",
-			parentId: "cold-thinking",
+			parentId: "cold-gap",
 			timestamp: now,
 			message: { role: "user", content: "cold kept", timestamp: 2 },
 		},
@@ -862,7 +870,7 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 			leafId: string;
 			indexDigest: string;
 		};
-		expect(marker.base.baseEndOffset).toBe(transcript.indexOf(`${JSON.stringify(records[3])}\n`));
+		expect(marker.base.baseEndOffset).toBe(transcript.indexOf(`${JSON.stringify(records[4])}\n`));
 		expect(marker.base.baseDigest).toMatch(/^[0-9a-f]{64}$/);
 		expect(marker.transcriptSize).toBe(Buffer.byteLength(transcript, "utf8"));
 		expect(marker.retirementFirstKeptEntryId).toBe("cold-kept");
