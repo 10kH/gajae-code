@@ -2249,8 +2249,10 @@ describe("sidecar I/O fallback", () => {
 	it("reads direct children from the authenticated cold index without hydrating the session", async () => {
 		class CountingStorage extends MemorySessionStorage {
 			rangeReads = 0;
+			indexRangeReads = 0;
 			override readRangeSync(filePath: string, offset: number, length: number) {
 				this.rangeReads++;
+				if (filePath.endsWith(".spill.idx")) this.indexRangeReads++;
 				return super.readRangeSync(filePath, offset, length);
 			}
 		}
@@ -2262,6 +2264,14 @@ describe("sidecar I/O fallback", () => {
 				{ type: "session", version: 5, id: "cold-children", timestamp: "0", cwd: "/cwd" },
 				{ type: "custom", id: "root", parentId: null, timestamp: "0", customType: "node", data: {} },
 				{ type: "custom", id: "abandoned", parentId: "root", timestamp: "0", customType: "node", data: {} },
+				{
+					type: "custom",
+					id: "abandoned-child",
+					parentId: "abandoned",
+					timestamp: "0",
+					customType: "node",
+					data: {},
+				},
 				{ type: "custom", id: "active", parentId: "root", timestamp: "0", customType: "node", data: {} },
 				{
 					type: "compaction",
@@ -2286,9 +2296,12 @@ describe("sidecar I/O fallback", () => {
 		try {
 			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
 			expect(manager.getChildren("root").map(entry => entry.id)).toEqual(["abandoned", "active"]);
-			const readsAfterFirstLookup = storage.rangeReads;
+			expect(manager.parentChildrenCacheKeysForTests()).toContain("abandoned");
+			const indexReadsAfterFirstLookup = storage.indexRangeReads;
 			expect(manager.getChildren("root").map(entry => entry.id)).toEqual(["abandoned", "active"]);
-			expect(storage.rangeReads).toBe(readsAfterFirstLookup);
+			expect(storage.indexRangeReads).toBe(indexReadsAfterFirstLookup);
+			expect(manager.getChildren("abandoned").map(entry => entry.id)).toEqual(["abandoned-child"]);
+			expect(storage.indexRangeReads).toBe(indexReadsAfterFirstLookup);
 			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
 		} finally {
 			await manager.close();

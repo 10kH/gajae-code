@@ -90,6 +90,7 @@ import {
 	applyReducerDelta,
 	type BaseAnchor,
 	BoundedLabelsPinsStore,
+	BoundedParentChildrenIndex,
 	type CommitMarkerContents,
 	type CommittedTail,
 	classifyReopen,
@@ -12555,6 +12556,9 @@ export class SessionManager {
 		if (!Number.isSafeInteger(bytes) || bytes < 0) throw new RangeError("invalid_sidecar_hot_suffix_budget");
 		this.#sidecarHotSuffixBudgetBytes = bytes;
 	}
+	parentChildrenCacheKeysForTests(): string[] {
+		return [...(this.#sidecarRuntime?.parentChildrenCache.keys() ?? [])];
+	}
 	hotRetainedMessageCharsForTests(): number {
 		let total = 0;
 		for (const entry of this.#fileEntries) {
@@ -12724,19 +12728,52 @@ export class SessionManager {
 		if (!this.#coldIndexDigestValid()) return undefined;
 		const childIds: string[] = [];
 		let malformed = false;
+		const neighboringParents = new BoundedParentChildrenIndex();
+		let collectNeighboringParents = false;
+		const neighboringIndexes = new Map<string, { index: ColdEntryIndex; bytes: number }>();
 		const failure = scanTranscriptLinesBounded(this.storage, runtime.indexPath, size, (_offset, lineBytes) => {
 			try {
 				const value = JSON.parse(Buffer.from(lineBytes.subarray(0, lineBytes.byteLength - 1)).toString("utf8")) as {
 					id?: unknown;
 					parentId?: unknown;
+					ordinal?: unknown;
+					seq?: unknown;
+					byteOffset?: unknown;
+					byteLength?: unknown;
+					recordDigest?: unknown;
+					entryType?: unknown;
 				};
 				if (typeof value.id !== "string" || (value.parentId !== null && typeof value.parentId !== "string")) {
 					malformed = true;
 					return false;
 				}
-				if (value.parentId !== parentId) return;
-				if (childIds.length >= PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT) return false;
-				childIds.push(value.id);
+				if (value.parentId === parentId) {
+					collectNeighboringParents = true;
+					if (childIds.length >= PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT) return false;
+					childIds.push(value.id);
+				} else if (collectNeighboringParents && value.parentId !== null) {
+					neighboringParents.add(value.parentId, value.id);
+					if (
+						typeof value.ordinal === "number" &&
+						typeof value.seq === "number" &&
+						typeof value.byteOffset === "number" &&
+						typeof value.byteLength === "number" &&
+						typeof value.recordDigest === "string"
+					) {
+						neighboringIndexes.set(value.id, {
+							index: {
+								ordinal: value.ordinal,
+								seq: value.seq,
+								byteOffset: value.byteOffset,
+								byteLength: value.byteLength,
+								recordDigest: value.recordDigest,
+								parentId: value.parentId,
+								...(typeof value.entryType === "string" ? { entryType: value.entryType } : {}),
+							},
+							bytes: lineBytes.byteLength * 2 + 48,
+						});
+					}
+				}
 			} catch {
 				malformed = true;
 				return false;
@@ -12756,6 +12793,24 @@ export class SessionManager {
 			residentStringBytes(parentId) + 48 + childIds.reduce((total, id) => total + residentStringBytes(id) + 8, 0);
 		if (runtime.blockCache.tryAllocate(cacheBytes)) {
 			runtime.parentChildrenCache.set(parentId, { ids: [...childIds], bytes: cacheBytes, descriptor: indexStat });
+		}
+		for (const neighbor of neighboringParents.entries()) {
+			if (runtime.parentChildrenCache.has(neighbor.parentId)) continue;
+			const neighborBytes =
+				residentStringBytes(neighbor.parentId) +
+				48 +
+				neighbor.children.reduce((total, id) => total + residentStringBytes(id) + 8, 0);
+			for (const childId of neighbor.children) {
+				const childIndex = neighboringIndexes.get(childId);
+				if (childIndex && !runtime.coldEntries.has(childId) && runtime.blockCache.tryAllocate(childIndex.bytes))
+					runtime.coldEntries.set(childId, childIndex.index);
+			}
+			if (!runtime.blockCache.tryAllocate(neighborBytes)) break;
+			runtime.parentChildrenCache.set(neighbor.parentId, {
+				ids: neighbor.children,
+				bytes: neighborBytes,
+				descriptor: indexStat,
+			});
 		}
 		return children;
 	}
