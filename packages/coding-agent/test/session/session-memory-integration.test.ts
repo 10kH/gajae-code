@@ -2671,6 +2671,8 @@ describe("sidecar I/O fallback", () => {
 				reason: "descriptor_and_proof_match",
 			});
 			expect(reopened.parentArtifactEnabledForTests()).toBe(true);
+			expect(reopened.getSessionMemoryStats().coldIndexBytes).toBeGreaterThan(0);
+			expect(reopened.getSessionMemoryStats().coldIndexBlockCacheBytes).toBeGreaterThan(0);
 			const readsAfterReopen = storage.indexRangeReads;
 			const readsBeforeLookups = storage.bucketRangeReads;
 			for (const parent of parents) {
