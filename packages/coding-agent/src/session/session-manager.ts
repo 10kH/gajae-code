@@ -9727,7 +9727,7 @@ export class SessionManager {
 		return failure === undefined && ordinal === runtime.tail.records.length;
 	}
 
-	#findColdEntryIndex(id: string): ColdEntryIndex | undefined {
+	#findColdEntryIndex(id: string, cacheLocality = true): ColdEntryIndex | undefined {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled || !runtime.indexPath || typeof this.storage.readRangeSync !== "function") return undefined;
 		const cached = runtime.coldEntries.get(id);
@@ -9777,21 +9777,24 @@ export class SessionManager {
 								: {}),
 							...(typeof value.entryType === "string" ? { entryType: value.entryType } : {}),
 						};
-						const residentBytes = line.length * 2 + 48;
-						recent.set(value.id, { index: found, bytes: residentBytes });
-						recentBytes += residentBytes;
-						while (recentBytes > runtime.blockCache.budgetBytes && recent.size > 1) {
-							const oldestId = recent.keys().next().value;
-							if (typeof oldestId !== "string") break;
-							const removed = recent.get(oldestId);
-							recent.delete(oldestId);
-							if (removed) recentBytes -= removed.bytes;
+						if (cacheLocality) {
+							const residentBytes = line.length * 2 + 48;
+							recent.set(value.id, { index: found, bytes: residentBytes });
+							recentBytes += residentBytes;
+							while (recentBytes > runtime.blockCache.budgetBytes && recent.size > 1) {
+								const oldestId = recent.keys().next().value;
+								if (typeof oldestId !== "string") break;
+								const removed = recent.get(oldestId);
+								recent.delete(oldestId);
+								if (removed) recentBytes -= removed.bytes;
+							}
 						}
 						if (value.id === id) {
-							for (const [candidateId, candidate] of recent) {
-								if (!runtime.coldEntries.has(candidateId) && runtime.blockCache.tryAllocate(candidate.bytes))
-									runtime.coldEntries.set(candidateId, candidate.index);
-							}
+							if (cacheLocality)
+								for (const [candidateId, candidate] of recent) {
+									if (!runtime.coldEntries.has(candidateId) && runtime.blockCache.tryAllocate(candidate.bytes))
+										runtime.coldEntries.set(candidateId, candidate.index);
+								}
 							return found;
 						}
 					}
@@ -10629,7 +10632,9 @@ export class SessionManager {
 		const generatedIds = new Set<string>();
 		const entryIds = {
 			has: (id: string): boolean =>
-				generatedIds.has(id) || this.#byId.has(id) || (boundedCold && this.#findColdEntryIndex(id) !== undefined),
+				generatedIds.has(id) ||
+				this.#byId.has(id) ||
+				(boundedCold && this.#findColdEntryIndex(id, false) !== undefined),
 			set: (id: string, _entry?: SessionEntry): void => {
 				generatedIds.add(id);
 			},

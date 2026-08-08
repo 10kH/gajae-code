@@ -1,7 +1,6 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { exportSessionToHtml } from "../../../src/export/html";
 import { SessionManager } from "../../../src/session/session-manager";
 
 const collect = (): { rss: number; heapUsed: number; external: number } => {
@@ -75,12 +74,6 @@ const manager = await SessionManager.open(
 const eagerRss = collect();
 if (!boundedFirstOpen) manager.setSessionMemoryMode("enabled");
 const retiredRss = collect();
-const exportSamples: Array<{ rss: number; heapUsed: number; external: number }> = [];
-if (process.env.GJC_SESSION_MEMORY_RSS_EXPORT === "1") {
-	exportSamples.push(collect());
-	await exportSessionToHtml(manager, undefined, { outputPath: path.join(root, "rss-export.html") });
-	exportSamples.push(collect());
-}
 const cycleCount = Number.parseInt(process.env.GJC_SESSION_MEMORY_RSS_CYCLES ?? "0", 10);
 const cycleRecords = Number.parseInt(process.env.GJC_SESSION_MEMORY_RSS_CYCLE_RECORDS ?? "5000", 10);
 const cycleSamples: Array<{ rss: number; heapUsed: number; external: number }> = [];
@@ -284,7 +277,6 @@ process.stdout.write(
 		cycleRecords,
 		cycleSamples,
 		selectionSamples,
-		exportSamples,
 		forkSamples,
 		forkStats,
 		capturedForkSamples,
