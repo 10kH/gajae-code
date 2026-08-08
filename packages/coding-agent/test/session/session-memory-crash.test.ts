@@ -51,6 +51,15 @@ describe("session memory physical crash recovery", () => {
 					kind: "exact",
 					reason: "descriptor_and_proof_match",
 				});
+				const reopened = runWorker(worker, root, "recover");
+				expect(reopened.exitCode, reopened.stderr.toString()).toBe(0);
+				const reopenedResult = JSON.parse(reopened.stdout.toString()) as RecoveryResult;
+				expect(reopenedResult.found).toBe(true);
+				expect(reopenedResult.stats.autoDisabledReason).toBeUndefined();
+				expect(reopenedResult.stats.currentCommitTransition).toEqual({
+					kind: "exact",
+					reason: "descriptor_and_proof_match",
+				});
 			} finally {
 				fs.rmSync(root, { recursive: true, force: true });
 			}
