@@ -15199,7 +15199,17 @@ export class SessionManager {
 	 * Get the label for an entry, if any.
 	 */
 	getLabel(id: string): string | undefined {
-		return this.#labelsById.get(id) ?? this.#sidecarRuntime?.labelsPins.getLabel(id);
+		return this.#resolveLabelForRead(id);
+	}
+
+	/** Resolve a label from the resident map or the cold labels/pins store (live counter). */
+	#resolveLabelForRead(id: string): string | undefined {
+		const hot = this.#labelsById.get(id);
+		if (hot !== undefined) return hot;
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return undefined;
+		runtime.labelDiskFallbackCount++;
+		return runtime.labelsPins.getLabel(id);
 	}
 
 	/**
@@ -15459,8 +15469,7 @@ export class SessionManager {
 
 		// Create nodes with resolved labels
 		for (const entry of entries) {
-			const label = this.#labelsById.get(entry.id);
-			nodeMap.set(entry.id, { entry, children: [], label });
+			nodeMap.set(entry.id, { entry, children: [], label: this.#resolveLabelForRead(entry.id) });
 		}
 
 		const addRoot = (node: SessionTreeNode): void => {
