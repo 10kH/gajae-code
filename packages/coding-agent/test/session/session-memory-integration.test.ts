@@ -1954,6 +1954,82 @@ describe("whole-session persistence freshness", () => {
 			await manager.close();
 		}
 	});
+	it("aborts a prepared rewrite when the manager adopts another lifecycle", async () => {
+		class LifecycleRaceStorage extends MemorySessionStorage {
+			blockNextFlush = false;
+			readonly flushStarted = Promise.withResolvers<void>();
+			readonly releaseFlush = Promise.withResolvers<void>();
+			override openWriter(filePath: string, options?: { flags?: "w" | "a" }): SessionStorageWriter {
+				const writer = super.openWriter(filePath, options);
+				if (filePath.includes(".spill.")) return writer;
+				return {
+					writeLine: writer.writeLine.bind(writer),
+					writeLineSync: writer.writeLineSync.bind(writer),
+					flush: async () => {
+						if (this.blockNextFlush) {
+							this.blockNextFlush = false;
+							this.flushStarted.resolve();
+							await this.releaseFlush.promise;
+						}
+						await writer.flush();
+					},
+					fsync: writer.fsync.bind(writer),
+					fsyncSync: writer.fsyncSync?.bind(writer),
+					statSync: writer.statSync?.bind(writer),
+					close: writer.close.bind(writer),
+					closeSync: writer.closeSync.bind(writer),
+					getError: writer.getError.bind(writer),
+					getCloseState: writer.getCloseState.bind(writer),
+					getCloseError: writer.getCloseError.bind(writer),
+				};
+			}
+		}
+		const storage = new LifecycleRaceStorage();
+		const sourceFile = "/sessions/rewrite-lifecycle-source.jsonl";
+		const destinationFile = "/sessions/rewrite-lifecycle-destination.jsonl";
+		storage.writeTextSync(
+			sourceFile,
+			`${JSON.stringify({ type: "session", version: 5, id: "rewrite-source", timestamp: "0", cwd: "/cwd" })}\n`,
+		);
+		storage.writeTextSync(
+			destinationFile,
+			`${JSON.stringify({ type: "session", version: 5, id: "rewrite-destination", timestamp: "0", cwd: "/cwd" })}\n`,
+		);
+		const destinationManager = await SessionManager.open(
+			destinationFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"off",
+		);
+		const destinationSnapshot = destinationManager.captureState();
+		await destinationManager.close();
+		const manager = await SessionManager.open(
+			sourceFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"off",
+		);
+		try {
+			const sourceEntryId = manager.appendCustomEntry("before-lifecycle-switch", { value: 1 });
+			await manager.flush();
+			const sourceBeforeRewrite = storage.readTextSync(sourceFile);
+			storage.blockNextFlush = true;
+			const rewrite = manager.rewriteEntries();
+			await storage.flushStarted.promise;
+			manager.restoreState(destinationSnapshot);
+			storage.releaseFlush.resolve();
+			await expect(rewrite).rejects.toThrow("session_persistence_lifecycle_changed");
+			expect(storage.readTextSync(sourceFile)).toBe(sourceBeforeRewrite);
+			expect(storage.readTextSync(destinationFile)).not.toContain(sourceEntryId);
+			expect(manager.getSessionId()).toBe("rewrite-destination");
+			expect(manager.getEntry(sourceEntryId)).toBeUndefined();
+		} finally {
+			storage.releaseFlush.resolve();
+			await expect(manager.close()).rejects.toThrow("session_persistence_lifecycle_changed");
+		}
+	});
 	it("reprepares queued patches when a direct append invalidates their persistence token", async () => {
 		const storage = new MemorySessionStorage();
 		const sessionFile = "/sessions/patch-race.jsonl";
