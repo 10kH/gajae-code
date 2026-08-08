@@ -892,6 +892,7 @@ function scanTranscriptLinesBounded(
 	filePath: string,
 	size: number,
 	visit: (lineStart: number, lineBytes: Uint8Array) => boolean | undefined,
+	result?: { stat?: SessionStorageStat },
 ): BoundedLineScanFailure | undefined {
 	if (storage instanceof FileSessionStorage) {
 		const flags = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0);
@@ -937,6 +938,19 @@ function scanTranscriptLinesBounded(
 				named.ino !== before.ino
 			)
 				return "read_failed";
+			if (result) {
+				result.stat = {
+					dev: after.dev,
+					ino: after.ino,
+					nlink: after.nlink,
+					size: Number(after.size),
+					mtimeNs: after.mtimeNs,
+					ctimeNs: after.ctimeNs,
+					mtimeMs: Number(after.mtimeMs),
+					mtime: new Date(Number(after.mtimeMs)),
+					isFile: after.isFile(),
+				};
+			}
 			return carry.byteLength === 0 ? undefined : "unterminated";
 		} catch {
 			return "read_failed";
@@ -13164,7 +13178,7 @@ export class SessionManager {
 		return opened.path;
 	}
 
-	async #tryForkFromBoundedSource(sourcePath: string, identity: ResumeSessionIdentity): Promise<boolean> {
+	async #tryForkFromBoundedSource(sourcePath: string, expectedIdentity?: ResumeSessionIdentity): Promise<boolean> {
 		if (
 			this.#sessionMemoryMode !== "enabled" ||
 			this.destination.kind === "managed" ||
@@ -13181,11 +13195,15 @@ export class SessionManager {
 		const entryPatches = new Map<string, EntryPatchRecord["patch"]>();
 		let overlayBytes = 0;
 		let requiresRecordTransforms = false;
+		const preflightHash = crypto.createHash("sha256");
+		const preflightResult: { stat?: SessionStorageStat } = {};
+		const sourceSize = expectedIdentity?.size ?? this.storage.statSync(sourcePath).size;
 		const preflightFailure = scanTranscriptLinesBounded(
 			this.storage,
 			sourcePath,
-			identity.size,
+			sourceSize,
 			(_offset, lineBytes) => {
+				preflightHash.update(lineBytes);
 				try {
 					const record = JSON.parse(
 						Buffer.from(lineBytes.subarray(0, lineBytes.byteLength - 1)).toString("utf8"),
@@ -13194,7 +13212,7 @@ export class SessionManager {
 						if (
 							record.type !== "session" ||
 							record.version !== CURRENT_SESSION_VERSION ||
-							record.id !== identity.sessionId
+							(expectedIdentity !== undefined && record.id !== expectedIdentity.sessionId)
 						)
 							preflightRejected = true;
 						else sourceHeader = record;
@@ -13239,11 +13257,30 @@ export class SessionManager {
 					return false;
 				}
 			},
+			preflightResult,
 		);
 		if (preflightFailure || preflightRejected || !sourceHeader || !sawCompaction) return false;
-		applyHeaderPatch(sourceHeader, headerPatch);
-		if (revalidateTranscriptIdentityBounded(sourcePath, this.storage, identity).kind !== "valid")
+		const preflightDigest = preflightHash.digest("hex");
+		if (expectedIdentity && preflightDigest !== expectedIdentity.sha256)
 			throw new Error("fork_source_identity_changed");
+		const identity =
+			expectedIdentity ??
+			(preflightResult.stat
+				? {
+						canonicalPath: path.resolve(sourcePath),
+						sessionId: sourceHeader.id,
+						dev: preflightResult.stat.dev,
+						ino: preflightResult.stat.ino,
+						nlink: preflightResult.stat.nlink,
+						size: preflightResult.stat.size,
+						mtimeMs: preflightResult.stat.mtimeMs,
+						mtimeNs: preflightResult.stat.mtimeNs,
+						ctimeNs: preflightResult.stat.ctimeNs,
+						sha256: preflightDigest,
+					}
+				: undefined);
+		if (!identity) return false;
+		applyHeaderPatch(sourceHeader, headerPatch);
 		const fresh = this.#freshSessionState({ parentSession: sourceHeader.id });
 		fresh.header.title = sourceHeader.title;
 		fresh.header.titleSource = sourceHeader.titleSource;
@@ -13252,11 +13289,14 @@ export class SessionManager {
 		let published = false;
 		try {
 			let ordinal = 0;
+			const copyHash = crypto.createHash("sha256");
+			const copyResult: { stat?: SessionStorageStat } = {};
 			const copyFailure = scanTranscriptLinesBounded(
 				this.storage,
 				sourcePath,
 				identity.size,
 				(_offset, lineBytes) => {
+					copyHash.update(lineBytes);
 					if (ordinal++ === 0) {
 						staged.writeLine(Buffer.from(JSON.stringify(fresh.header), "utf8"));
 						return;
@@ -13277,14 +13317,30 @@ export class SessionManager {
 					}
 					staged.writeLine(Buffer.from(JSON.stringify(record), "utf8"));
 				},
+				copyResult,
 			);
 			if (copyFailure) throw new Error(`fork_bounded_copy_${copyFailure}`);
+			if (copyHash.digest("hex") !== identity.sha256) throw new Error("fork_source_identity_changed");
+			if (
+				copyResult.stat &&
+				(copyResult.stat.dev !== identity.dev ||
+					copyResult.stat.ino !== identity.ino ||
+					(identity.nlink !== undefined && copyResult.stat.nlink !== identity.nlink) ||
+					copyResult.stat.size !== identity.size ||
+					copyResult.stat.mtimeNs !== identity.mtimeNs ||
+					(identity.ctimeNs !== undefined && copyResult.stat.ctimeNs !== identity.ctimeNs))
+			)
+				throw new Error("fork_source_identity_changed");
 			staged.fsync();
 			staged.closeSync();
 			staged.publishNoReplace();
 			published = true;
-			if (revalidateTranscriptIdentityBounded(sourcePath, this.storage, identity).kind !== "valid")
+			if (copyResult.stat) {
+				const current = this.storage.statSync(sourcePath);
+				if (!sameDescriptor(copyResult.stat, current)) throw new Error("fork_source_identity_changed");
+			} else if (revalidateTranscriptIdentityBounded(sourcePath, this.storage, identity).kind !== "valid") {
 				throw new Error("fork_source_identity_changed");
+			}
 			await this.#initSessionFile(fresh.sessionFile);
 			writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
 			return true;
@@ -13446,6 +13502,13 @@ export class SessionManager {
 		const dir = destination.directory;
 		const manager = new SessionManager(cwd, dir, true, storage, destination);
 		manager.#sessionMemoryMode = sessionMemoryMode;
+		if (
+			sessionMemoryMode === "enabled" &&
+			destination.kind !== "managed" &&
+			storage instanceof FileSessionStorage &&
+			(await manager.#tryForkFromBoundedSource(managedSourcePath))
+		)
+			return manager;
 		if (sessionMemoryMode === "enabled" && destination.kind !== "managed") {
 			const inspected = inspectTranscriptBounded(managedSourcePath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
 			if (
