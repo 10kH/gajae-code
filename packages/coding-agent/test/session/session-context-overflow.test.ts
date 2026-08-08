@@ -21,6 +21,7 @@ import { TempDir } from "@gajae-code/utils";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
 import { HindsightSessionState } from "../../src/hindsight/state";
+import { AgentRegistry } from "../../src/registry/agent-registry";
 import { AgentSession } from "../../src/session/agent-session";
 import { AuthStorage } from "../../src/session/auth-storage";
 import {
@@ -226,7 +227,10 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 	let modelRegistry: ModelRegistry;
 	let compactSpy: ReturnType<typeof vi.spyOn>;
 
-	async function makeSession(settingsOverrides: Record<string, unknown> = {}): Promise<void> {
+	async function makeSession(
+		settingsOverrides: Record<string, unknown> = {},
+		sessionOverrides: Record<string, unknown> = {},
+	): Promise<void> {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled test model to exist");
 		const agent = new Agent({
@@ -252,6 +256,7 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 				...settingsOverrides,
 			}),
 			modelRegistry,
+			...sessionOverrides,
 		});
 		session.subscribe(() => {});
 	}
@@ -505,6 +510,51 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 		).toEqual([]);
 		expect(recallReadSpy).toHaveBeenCalledTimes(2);
 		expect(recallMarkSpy).toHaveBeenCalledTimes(1);
+	});
+	it("preserves a claimed roster across forced overflow compaction and commits it exactly once", async () => {
+		await session.dispose();
+		const registry = new AgentRegistry();
+		registry.register({
+			id: "1-Worker",
+			displayName: "1-Worker display",
+			rosterLabel: "1-Worker label",
+			kind: "sub",
+			status: "running",
+			session: null,
+		});
+		await makeSession({ "compaction.keepRecentTokens": 1 }, { agentId: "0-Main", agentRegistry: registry });
+		appendConversation("roster-seed");
+		const submitted: AgentMessage[][] = [];
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async (messages, options) => {
+			submitted.push(messages as AgentMessage[]);
+			if (!Array.isArray(options)) options?.onRunAccepted?.();
+		});
+		const realContext = sessionManager.buildSessionContext();
+		const overflow = new SessionContextTooLargeError(70 * 1024 * 1024);
+		const buildSpy = vi
+			.spyOn(sessionManager, "buildSessionContext")
+			.mockImplementationOnce(() => {
+				throw overflow;
+			})
+			.mockImplementationOnce(() => realContext);
+		const firstKeptEntryId = sessionManager.getBranch()[0]?.id ?? "root";
+		compactSpy.mockResolvedValue({
+			summary: "compacted",
+			firstKeptEntryId,
+			tokensBefore: 1,
+		});
+
+		await session.prompt("roster-overflow");
+
+		// Exactly one compaction, one retry, one accepted prompt with the one
+		// claimed roster message committed (never reconstructed nor duplicated).
+		expect(buildSpy).toHaveBeenCalledTimes(3);
+		expect(compactSpy).toHaveBeenCalledTimes(1);
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(submitted).toHaveLength(1);
+		expect(
+			submitted[0]?.filter(message => message.role === "custom" && message.customType === "irc-peer-roster"),
+		).toHaveLength(1);
 	});
 	it("rethrows the original overflow after one failed forced compaction without continuation", async () => {
 		await session.dispose();
