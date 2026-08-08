@@ -9322,6 +9322,10 @@ export class SessionManager {
 
 	#buildDisposableSidecarsUnsafe(entries: readonly FileEntry[]): void {
 		const runtime = this.#resetSidecarRuntime();
+		if (this.destination.kind === "managed") {
+			runtime.sidecarIneligible = true;
+			return;
+		}
 		if (
 			!this.#sessionFile ||
 			!runtime.indexPath ||
