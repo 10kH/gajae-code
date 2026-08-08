@@ -2302,7 +2302,16 @@ describe("sidecar I/O fallback", () => {
 			expect(storage.indexRangeReads).toBe(indexReadsAfterFirstLookup);
 			expect(manager.getChildren("abandoned").map(entry => entry.id)).toEqual(["abandoned-child"]);
 			expect(storage.indexRangeReads).toBe(indexReadsAfterFirstLookup);
-			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			const indexPath = sidecarPath(sessionFile, "idx");
+			const indexText = storage.readTextSync(indexPath);
+			storage.writeTextSync(indexPath, indexText.replace('"abandoned"', '"forged___"'));
+			expect(
+				manager
+					.getChildren("root")
+					.map(entry => entry.id)
+					.sort(),
+			).toEqual(["abandoned", "active"]);
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
 		} finally {
 			await manager.close();
 		}

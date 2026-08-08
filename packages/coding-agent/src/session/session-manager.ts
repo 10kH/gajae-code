@@ -737,6 +737,8 @@ export interface SessionMemorySidecarRuntime {
 	reopenTransition: ReopenClassification | undefined;
 	/** SHA-256 over the exact `.spill.idx` bytes this runtime has written/adopted ("" until proven). */
 	indexDigest: string;
+	/** Descriptor of the exact index bytes whose digest was validated for cache use. */
+	validatedIndexDescriptor?: SessionStorageStat;
 	/** Live running hash of the index bytes; updated on every index append. */
 	indexHash: crypto.Hash;
 }
@@ -6517,8 +6519,10 @@ export class SessionManager {
 			// `.spill.idx` bytes before any cold lookup may trust it. Absent or
 			// mismatched digests fail closed to the eager authoritative path.
 			const indexHash = crypto.createHash("sha256");
+			let indexDescriptor: SessionStorageStat;
 			try {
-				const indexSize = this.storage.statSync(runtime.indexPath).size;
+				indexDescriptor = this.storage.statSync(runtime.indexPath);
+				const indexSize = indexDescriptor.size;
 				for (let offset = 0; offset < indexSize; offset += TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
 					const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, indexSize - offset);
 					indexHash.update(this.storage.readRangeSync(runtime.indexPath, offset, length).bytes);
@@ -6562,6 +6566,7 @@ export class SessionManager {
 			}
 			runtime.indexHash = indexHash;
 			runtime.indexDigest = commit.indexDigest;
+			runtime.validatedIndexDescriptor = indexDescriptor;
 			const headerWindow = this.storage.readRangeSync(sessionFile, 0, Math.min(descriptor.size, 64 * 1024)).bytes;
 			const headerEnd = headerWindow.indexOf(10);
 			if (headerEnd < 0) return false;
@@ -9697,15 +9702,17 @@ export class SessionManager {
 	#coldIndexDigestValid(): boolean {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled || !runtime.indexPath || typeof this.storage.readRangeSync !== "function") return false;
-		let size: number;
+		let descriptor: SessionStorageStat;
 		try {
-			size = this.storage.statSync(runtime.indexPath).size;
+			descriptor = this.storage.statSync(runtime.indexPath);
 			const hash = crypto.createHash("sha256");
-			for (let offset = 0; offset < size; offset += 64 * 1024) {
-				const length = Math.min(64 * 1024, size - offset);
+			for (let offset = 0; offset < descriptor.size; offset += 64 * 1024) {
+				const length = Math.min(64 * 1024, descriptor.size - offset);
 				hash.update(this.storage.readRangeSync(runtime.indexPath, offset, length).bytes);
 			}
-			return hash.digest("hex") === runtime.indexDigest;
+			const valid = hash.digest("hex") === runtime.indexDigest;
+			if (valid) runtime.validatedIndexDescriptor = descriptor;
+			return valid;
 		} catch {
 			return false;
 		}
@@ -9739,7 +9746,19 @@ export class SessionManager {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled || !runtime.indexPath || typeof this.storage.readRangeSync !== "function") return undefined;
 		const cached = runtime.coldEntries.get(id);
-		if (cached) return cached;
+		if (cached) {
+			try {
+				const current = this.storage.statSync(runtime.indexPath);
+				if (runtime.validatedIndexDescriptor && sameDescriptor(runtime.validatedIndexDescriptor, current))
+					return cached;
+			} catch {
+				return undefined;
+			}
+			runtime.coldEntries.clear();
+			runtime.parentChildrenCache.clear();
+			runtime.blockCache.release(runtime.blockCache.allocatedBytes);
+			runtime.validatedIndexDescriptor = undefined;
+		}
 		if (!this.#coldIndexDigestValid()) return undefined;
 		let size: number;
 		try {
@@ -12716,7 +12735,12 @@ export class SessionManager {
 		}
 		const size = indexStat.size;
 		const cached = runtime.parentChildrenCache.get(parentId);
-		if (cached && sameDescriptor(cached.descriptor, indexStat)) {
+		if (
+			cached &&
+			runtime.validatedIndexDescriptor &&
+			sameDescriptor(cached.descriptor, indexStat) &&
+			sameDescriptor(runtime.validatedIndexDescriptor, indexStat)
+		) {
 			const cache = new Map<string, string>();
 			const children: SessionEntry[] = [];
 			for (const id of cached.ids) {
