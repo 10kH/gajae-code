@@ -571,6 +571,7 @@ describe("bounded provider context traversal", () => {
 				});
 			}
 			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
+			expect(manager.getSessionMemoryStats().coldMutationPromotions).toBeGreaterThan(0);
 			expect(manager.getEntriesForExport().filter(entry => entry.type === "configured_model_chain")).toHaveLength(
 				257,
 			);

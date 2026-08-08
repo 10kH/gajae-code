@@ -12208,6 +12208,7 @@ export class SessionManager {
 	#deactivateColdForBranchMutation(): void {
 		if (!this.#coldSidecarActive()) return;
 		this.#ensureFullHotView();
+		this.#sidecarRuntime && this.#sidecarRuntime.coldMutationPromotions++;
 		const runtime = this.#sidecarRuntime;
 		if (!runtime) return;
 		runtime.enabled = false;
@@ -14250,6 +14251,7 @@ export class SessionManager {
 				const ordinal = this.#nextColdOrdinal();
 				if (!this.#applySidecarReducerDelta(residentEntry, ordinal)) {
 					this.#ensureFullHotView();
+					activeRuntime.coldMutationPromotions++;
 				} else if (this.#appendColdSidecarRecord(residentEntry, persistedLine, transcriptDescriptor, ordinal)) {
 					activeRuntime.hotSuffixBytes += persistedLine.byteLength;
 				}
