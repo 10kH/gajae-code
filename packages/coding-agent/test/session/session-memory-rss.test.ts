@@ -21,6 +21,16 @@ interface RssWorkerResult {
 	};
 }
 
+interface GibForkWorkerResult {
+	sourceBytes: number;
+	elapsedMs: number;
+	rssGrowthBytes: number;
+	stats: {
+		coldRetirementActive: boolean;
+		totalAccountedBytes: number;
+	};
+}
+
 const enabled = process.env.GJC_SESSION_MEMORY_RSS === "1";
 
 describe.skipIf(!enabled)("session memory RSS plateau", () => {
@@ -249,4 +259,21 @@ describe.skipIf(!enabled)("session memory RSS plateau", () => {
 		expect(reopened.stats.coldRetirementActive).toBe(true);
 		expect(reopened.stats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 	}, 180_000);
+
+	it("forks a one-GiB compacted transcript within the latency and RSS budgets", () => {
+		const worker = path.join(import.meta.dir, "fixtures", "session-memory-gib-fork-worker.ts");
+		const result = Bun.spawnSync({
+			cmd: [process.execPath, worker],
+			env: process.env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(result.exitCode, result.stderr.toString()).toBe(0);
+		const measured = JSON.parse(result.stdout.toString()) as GibForkWorkerResult;
+		expect(measured.sourceBytes).toBeGreaterThanOrEqual(1_000_000_000);
+		expect(measured.elapsedMs).toBeLessThanOrEqual(4_000);
+		expect(measured.rssGrowthBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+		expect(measured.stats.coldRetirementActive).toBe(true);
+		expect(measured.stats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+	}, 30_000);
 });

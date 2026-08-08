@@ -887,6 +887,50 @@ type BoundedLineScanFailure = "read_failed" | "oversized_line" | "unterminated" 
  * path. Returns `undefined` only after every byte was consumed as a complete
  * newline-terminated line.
  */
+function createBoundedLineChunkConsumer(visit: (lineStart: number, lineBytes: Uint8Array) => boolean | undefined): {
+	consume(chunk: Buffer, chunkStart: number): BoundedLineScanFailure | undefined;
+	hasLargePendingLine(): boolean;
+	finish(): BoundedLineScanFailure | undefined;
+} {
+	let pendingChunks: Buffer[] = [];
+	let pendingBytes = 0;
+	let pendingStart = 0;
+	return {
+		consume(chunk, chunkStart) {
+			let consumed = 0;
+			for (;;) {
+				const newline = chunk.indexOf(0x0a, consumed);
+				if (newline < 0) break;
+				const segment = chunk.subarray(consumed, newline + 1);
+				const lineStart = pendingChunks.length === 0 ? chunkStart + consumed : pendingStart;
+				if (pendingBytes + segment.byteLength > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return "oversized_line";
+				const line =
+					pendingChunks.length === 0
+						? segment
+						: Buffer.concat([...pendingChunks, segment], pendingBytes + segment.byteLength);
+				pendingChunks = [];
+				pendingBytes = 0;
+				if (visit(lineStart, line) === false) return "aborted";
+				consumed = newline + 1;
+			}
+			if (consumed < chunk.byteLength) {
+				if (pendingChunks.length === 0) pendingStart = chunkStart + consumed;
+				const remainder = chunk.subarray(consumed);
+				pendingBytes += remainder.byteLength;
+				if (pendingBytes > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return "oversized_line";
+				pendingChunks.push(remainder);
+			}
+			return undefined;
+		},
+		hasLargePendingLine() {
+			return pendingBytes >= 256 * 1024;
+		},
+		finish() {
+			return pendingBytes === 0 ? undefined : "unterminated";
+		},
+	};
+}
+
 function scanTranscriptLinesBounded(
 	storage: SessionStorage,
 	filePath: string,
@@ -901,10 +945,9 @@ function scanTranscriptLinesBounded(
 			fd = fs.openSync(filePath, flags);
 			const before = fs.fstatSync(fd, { bigint: true });
 			if (!before.isFile() || before.nlink > 1 || Number(before.size) < size) return "read_failed";
-			let carry = Buffer.alloc(0);
+			const consumer = createBoundedLineChunkConsumer(visit);
 			let pos = 0;
 			while (pos < size) {
-				if (carry.byteLength > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return "oversized_line";
 				const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, size - pos);
 				const chunk = Buffer.allocUnsafe(length);
 				let offset = 0;
@@ -913,18 +956,11 @@ function scanTranscriptLinesBounded(
 					if (count === 0) return "read_failed";
 					offset += count;
 				}
-				const combined = carry.byteLength > 0 ? Buffer.concat([carry, chunk]) : chunk;
-				const base = pos - carry.byteLength;
-				let consumed = 0;
-				for (;;) {
-					const newline = combined.indexOf(0x0a, consumed);
-					if (newline < 0) break;
-					if (visit(base + consumed, combined.subarray(consumed, newline + 1)) === false) return "aborted";
-					consumed = newline + 1;
-				}
-				carry = Buffer.from(combined.subarray(consumed));
+				const failure = consumer.consume(chunk, pos);
+				if (failure) return failure;
 				pos += length;
-				if ((pos & (8 * 1024 * 1024 - 1)) === 0) Bun.gc(true);
+				const gcIntervalBytes = consumer.hasLargePendingLine() ? 20 * 1024 * 1024 : 4 * 1024 * 1024;
+				if (pos % gcIntervalBytes === 0) Bun.gc(true);
 			}
 			const after = fs.fstatSync(fd, { bigint: true });
 			const named = fs.lstatSync(filePath, { bigint: true });
@@ -951,17 +987,16 @@ function scanTranscriptLinesBounded(
 					isFile: after.isFile(),
 				};
 			}
-			return carry.byteLength === 0 ? undefined : "unterminated";
+			return consumer.finish();
 		} catch {
 			return "read_failed";
 		} finally {
 			if (fd !== undefined) fs.closeSync(fd);
 		}
 	}
-	let carry = Buffer.alloc(0);
+	const consumer = createBoundedLineChunkConsumer(visit);
 	let pos = 0;
 	while (pos < size) {
-		if (carry.byteLength > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return "oversized_line";
 		const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, size - pos);
 		let chunk: Uint8Array;
 		try {
@@ -969,20 +1004,13 @@ function scanTranscriptLinesBounded(
 		} catch {
 			return "read_failed";
 		}
-		const combined = carry.byteLength > 0 ? Buffer.concat([carry, Buffer.from(chunk)]) : Buffer.from(chunk);
-		const base = pos - carry.byteLength;
-		let consumed = 0;
-		while (true) {
-			const newline = combined.indexOf(0x0a, consumed);
-			if (newline < 0) break;
-			if (visit(base + consumed, combined.subarray(consumed, newline + 1)) === false) return "aborted";
-			consumed = newline + 1;
-		}
-		carry = Buffer.from(combined.subarray(consumed));
+		const failure = consumer.consume(Buffer.from(chunk), pos);
+		if (failure) return failure;
 		pos += length;
-		if ((pos & (8 * 1024 * 1024 - 1)) === 0) Bun.gc(true);
+		const gcIntervalBytes = consumer.hasLargePendingLine() ? 20 * 1024 * 1024 : 4 * 1024 * 1024;
+		if (pos % gcIntervalBytes === 0) Bun.gc(true);
 	}
-	return carry.byteLength === 0 ? undefined : "unterminated";
+	return consumer.finish();
 }
 
 export type DefaultModelSelectionStage = {
