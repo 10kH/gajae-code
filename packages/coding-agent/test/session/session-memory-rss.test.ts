@@ -331,4 +331,26 @@ describe.skipIf(!enabled)("session memory RSS plateau", () => {
 		expect(measured.stats.coldRetirementActive).toBe(true);
 		expect(measured.stats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 	}, 30_000);
+
+	it("keeps RSS flat across many distinct parent lookups served from the persistent artifact", () => {
+		const worker = path.join(import.meta.dir, "fixtures", "session-memory-parent-rss-worker.ts");
+		const result = Bun.spawnSync({
+			cmd: [process.execPath, worker],
+			env: process.env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(result.exitCode, result.stderr.toString()).toBe(0);
+		const measured = JSON.parse(result.stdout.toString()) as {
+			parentCount: number;
+			samples: Array<{ rss: number; heapUsed: number; external: number }>;
+			stats: { coldRetirementActive: boolean; totalAccountedBytes: number };
+		};
+		expect(measured.parentCount).toBe(200);
+		expect(measured.samples.length).toBeGreaterThanOrEqual(5);
+		expect(measured.stats.coldRetirementActive).toBe(true);
+		expect(measured.stats.totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+		const rss = measured.samples.map(sample => sample.rss);
+		expect(Math.max(...rss) - Math.min(...rss)).toBeLessThanOrEqual(64 * 1024 * 1024);
+	}, 60_000);
 });

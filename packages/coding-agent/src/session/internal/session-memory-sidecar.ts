@@ -79,6 +79,8 @@ export const DICTIONARY_BUCKET_JOURNAL_BYTES = 4 * 1024 * 1024;
 export const PARENT_CHILDREN_MAX_PARENTS = 4096;
 export const PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT = 256;
 export const PARENT_CHILDREN_BUDGET_BYTES = 4 * 1024 * 1024;
+/** Deterministic hash-bucket count for the disposable on-disk parent artifact. */
+export const PARENT_CHILDREN_BUCKET_COUNT = 64;
 
 // ============================================================================
 // Retained-byte formulas (A.1)
@@ -359,12 +361,13 @@ export class ReducerBudget {
 
 const SPILL_SEGMENT = ".spill.";
 const DERIVED_SUFFIXES = new Set(["idx", "tail", "commit", "buckets"]);
-const DERIVED_PREFIXES = ["dict-", "capture-", "fork-", "overlay-"];
+const DERIVED_PREFIXES = ["dict-", "capture-", "fork-", "overlay-", "parent-"];
 
 /**
  * Single source of truth for every sidecar artifact and temp: `*.spill.idx`,
  * `*.spill.tail`, `*.spill.commit`, `*.spill.buckets`, `*.spill.dict-*`,
- * `*.spill.capture-*`, `*.spill.fork-*`, `*.spill.overlay-*`, and any
+ * `*.spill.capture-*`, `*.spill.fork-*`, `*.spill.overlay-*`,
+ * `*.spill.parent-*` (persistent parent→children buckets), and any
  * `*.spill.*.tmp`. Used at every fork/delete/sweep/Memory-parity callsite so
  * ad-hoc filters cannot drift.
  */
@@ -1189,4 +1192,234 @@ export class BoundedLabelsPinsStore {
 		map.set(key, value);
 		return true;
 	}
+}
+
+// ============================================================================
+// Persistent bounded parent→children artifact (disposable v2 parent index)
+// ============================================================================
+
+/**
+ * One parent→child edge plus the child's authoritative cold index fields. The
+ * artifact is disposable derived proof; the `.spill.idx` remains authoritative
+ * for entry offsets and the transcript remains authoritative for entry bytes.
+ */
+export interface ParentBucketRecordInput {
+	parentId: string;
+	childId: string;
+	ordinal: number;
+	seq: number;
+	byteOffset: number;
+	byteLength: number;
+	recordDigest: string;
+	entryType?: string;
+}
+
+/** Committed on-disk state of one parent bucket (exact bytes). */
+export interface ParentBucketCommit {
+	size: number;
+	digest: string;
+	complete: boolean;
+}
+
+/**
+ * Commit-marker binding for the disposable parent artifact. The artifact
+ * covers exactly the entry set of the `.spill.idx` whose digest is bound here;
+ * a binding mismatch fails closed to the authoritative cold scan.
+ */
+export interface ParentArtifactCommit {
+	bucketCount: number;
+	indexDigest: string;
+	buckets: ParentBucketCommit[];
+}
+
+/**
+ * Deterministic hash-partition assignment for a parent id. Bucket files are
+ * append-only journals; a lookup reads exactly one bucket (bounded range read)
+ * and verifies each record's `parentId` to filter hash collisions.
+ */
+export function parentBucketForId(parentId: string, bucketCount = PARENT_CHILDREN_BUCKET_COUNT): number {
+	let hash = 0x811c9dc5;
+	for (let index = 0; index < parentId.length; index++) {
+		const code = parentId.charCodeAt(index);
+		hash ^= code & 0xff;
+		hash = Math.imul(hash, 0x01000193);
+		hash ^= code >>> 8;
+		hash = Math.imul(hash, 0x01000193);
+	}
+	return (hash >>> 0) % bucketCount;
+}
+
+/** Serialize one parent→child edge as a compact JSON journal line (trailing newline). */
+export function serializeParentBucketRecord(input: ParentBucketRecordInput): string {
+	return `${JSON.stringify({
+		p: input.parentId,
+		c: input.childId,
+		o: input.ordinal,
+		s: input.seq,
+		b: input.byteOffset,
+		l: input.byteLength,
+		d: input.recordDigest,
+		...(input.entryType !== undefined ? { t: input.entryType } : {}),
+	})}\n`;
+}
+
+/** Strictly parse one parent bucket journal line; `undefined` marks the bucket corrupt. */
+export function parseParentBucketRecord(line: string): ParentBucketRecordInput | undefined {
+	let value: Record<string, unknown>;
+	try {
+		value = JSON.parse(line) as Record<string, unknown>;
+	} catch {
+		return undefined;
+	}
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const { p, c, o, s, b, l, d, t } = value;
+	if (typeof p !== "string" || p.length === 0) return undefined;
+	if (typeof c !== "string" || c.length === 0) return undefined;
+	if (typeof o !== "number" || typeof s !== "number" || typeof b !== "number" || typeof l !== "number")
+		return undefined;
+	if (!Number.isSafeInteger(o) || !Number.isSafeInteger(s) || !Number.isSafeInteger(b) || !Number.isSafeInteger(l))
+		return undefined;
+	if (typeof d !== "string" || d.length !== 64) return undefined;
+	if (t !== undefined && typeof t !== "string") return undefined;
+	return {
+		parentId: p,
+		childId: c,
+		ordinal: o,
+		seq: s,
+		byteOffset: b,
+		byteLength: l,
+		recordDigest: d,
+		...(t !== undefined ? { entryType: t } : {}),
+	};
+}
+
+export interface ParentArtifactBuildResult {
+	metadata: ParentArtifactCommit;
+	/** Per-bucket records in physical (transcript) order. */
+	buckets: string[][];
+	/** Parents excluded because a bound (children/budget/parents) was exceeded. */
+	excludedParents: readonly string[];
+}
+
+/**
+ * Bounded builder for the persistent parent artifact. Parents are indexed
+ * fully or not at all: a parent whose children would exceed
+ * `PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT`, whose first record would exceed
+ * `PARENT_CHILDREN_BUDGET_BYTES`, or that would exceed
+ * `PARENT_CHILDREN_MAX_PARENTS` is excluded (lookups for it fail closed), and
+ * its buffered records are dropped so a truncated "complete" result can never
+ * be published. Per-parent child order is preserved (insertion order).
+ */
+export class BoundedParentArtifactBuilder {
+	private readonly parents = new Map<string, { records: string[]; bytes: number }>();
+	private readonly excluded = new Set<string>();
+	private readonly incompleteBuckets = new Set<number>();
+	private totalBytesValue = 0;
+	private readonly maxParents: number;
+	private readonly maxChildrenPerParent: number;
+	private readonly budgetBytesValue: number;
+	private readonly bucketCount: number;
+	private finished = false;
+	private capacityExhausted = false;
+
+	constructor(
+		options: {
+			maxParents?: number;
+			maxChildrenPerParent?: number;
+			budgetBytes?: number;
+			bucketCount?: number;
+		} = {},
+	) {
+		this.maxParents = options.maxParents ?? PARENT_CHILDREN_MAX_PARENTS;
+		this.maxChildrenPerParent = options.maxChildrenPerParent ?? PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT;
+		this.budgetBytesValue = options.budgetBytes ?? PARENT_CHILDREN_BUDGET_BYTES;
+		this.bucketCount = options.bucketCount ?? PARENT_CHILDREN_BUCKET_COUNT;
+	}
+
+	get distinctParents(): number {
+		return this.parents.size;
+	}
+
+	get totalBytes(): number {
+		return this.totalBytesValue;
+	}
+
+	add(record: ParentBucketRecordInput): void {
+		if (this.finished) throw new Error("parent_artifact_builder_finished");
+		if (record.parentId.length === 0 || record.childId.length === 0) throw new Error("parent_artifact_empty_id");
+		if (this.excluded.has(record.parentId)) return;
+		if (this.capacityExhausted && !this.parents.has(record.parentId)) {
+			this.incompleteBuckets.add(parentBucketForId(record.parentId, this.bucketCount));
+			return;
+		}
+		const line = serializeParentBucketRecord(record);
+		const bytes = Buffer.byteLength(line, "utf8");
+		let parent = this.parents.get(record.parentId);
+		if (parent === undefined) {
+			if (this.parents.size >= this.maxParents || this.totalBytesValue + bytes > this.budgetBytesValue) {
+				this.capacityExhausted = true;
+				this.incompleteBuckets.add(parentBucketForId(record.parentId, this.bucketCount));
+				return;
+			}
+			parent = { records: [], bytes: 0 };
+			this.parents.set(record.parentId, parent);
+		}
+		if (parent.records.length >= this.maxChildrenPerParent || this.totalBytesValue + bytes > this.budgetBytesValue) {
+			this.exclude(record.parentId);
+			return;
+		}
+		parent.records.push(line);
+		parent.bytes += bytes;
+		this.totalBytesValue += bytes;
+	}
+
+	private exclude(parentId: string): void {
+		const parent = this.parents.get(parentId);
+		if (parent) {
+			this.totalBytesValue -= parent.bytes;
+			this.parents.delete(parentId);
+		}
+		this.incompleteBuckets.add(parentBucketForId(parentId, this.bucketCount));
+		this.excluded.add(parentId);
+	}
+
+	finish(indexDigest: string): ParentArtifactBuildResult {
+		if (this.finished) throw new Error("parent_artifact_builder_already_finished");
+		this.finished = true;
+		const byBucket: Array<{ records: string[]; bytes: number }> = Array.from({ length: this.bucketCount }, () => ({
+			records: [],
+			bytes: 0,
+		}));
+		for (const [parentId, parent] of this.parents) {
+			const bucket = parentBucketForId(parentId, this.bucketCount);
+			for (const line of parent.records) {
+				byBucket[bucket].records.push(line);
+				byBucket[bucket].bytes += Buffer.byteLength(line, "utf8");
+			}
+		}
+		const buckets = byBucket.map((bucket, bucketIndex) => {
+			const hash = createHash("sha256");
+			for (const line of bucket.records) hash.update(line, "utf8");
+			return {
+				size: bucket.bytes,
+				digest: hash.digest("hex"),
+				complete: !this.incompleteBuckets.has(bucketIndex),
+			};
+		});
+		const result: ParentArtifactBuildResult = {
+			metadata: { bucketCount: this.bucketCount, indexDigest, buckets },
+			buckets: byBucket.map(bucket => bucket.records),
+			excludedParents: [...this.excluded],
+		};
+		this.parents.clear();
+		this.excluded.clear();
+		this.incompleteBuckets.clear();
+		this.totalBytesValue = 0;
+		return result;
+	}
+}
+
+/** Fixed in-memory cost of the retained parent-artifact runtime state (block-cache charged). */
+export function parentArtifactRuntimeBytes(bucketCount = PARENT_CHILDREN_BUCKET_COUNT): number {
+	return bucketCount * 96 + 128;
 }

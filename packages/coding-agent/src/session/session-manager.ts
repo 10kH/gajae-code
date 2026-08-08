@@ -90,6 +90,7 @@ import {
 	applyReducerDelta,
 	type BaseAnchor,
 	BoundedLabelsPinsStore,
+	BoundedParentArtifactBuilder,
 	BoundedParentChildrenIndex,
 	type CommitMarkerContents,
 	type CommittedTail,
@@ -101,7 +102,14 @@ import {
 	getLastModelChangeRole as getReducerLastModelChangeRole,
 	isDerivedSessionMemoryFile,
 	LABELS_PINS_BUDGET_BYTES,
+	PARENT_CHILDREN_BUCKET_COUNT,
+	PARENT_CHILDREN_BUDGET_BYTES,
 	PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT,
+	type ParentArtifactCommit,
+	type ParentBucketCommit,
+	parentArtifactRuntimeBytes,
+	parentBucketForId,
+	parseParentBucketRecord,
 	REDUCER_BUDGET_BYTES,
 	type ReducerState,
 	type ReopenClassification,
@@ -110,6 +118,7 @@ import {
 	residentStringBytes,
 	SessionMemoryAccountant,
 	sameDescriptor,
+	serializeParentBucketRecord,
 	type TailRecord,
 	type TailRecordKind,
 	tailRecordResidentBytes,
@@ -425,6 +434,8 @@ export interface SessionMemoryStats {
 	retirementFallbackReason: string | undefined;
 	autoDisabledReason: string | undefined;
 	consecutiveBuildFailures: number;
+	/** Persistent bounded parent→children artifact is adopted and usable. */
+	parentArtifactEnabled: boolean;
 }
 
 export interface SessionMessageEntry extends SessionEntryBase {
@@ -722,6 +733,8 @@ export interface SessionMemorySidecarRuntime {
 	indexPath: string;
 	tailPath: string;
 	commitPath: string;
+	/** Directory prefix of the persistent `.spill.parent-<bucket>` bucket files. */
+	parentPathPrefix: string;
 	retirementFirstKeptEntryId: string | undefined;
 	/** Hot-suffix byte total (accountant-bounded to ≤ 16 MiB). */
 	hotSuffixBytes: number;
@@ -729,7 +742,16 @@ export interface SessionMemorySidecarRuntime {
 	reducer: ReducerState;
 	providerStateEntries: SessionEntry[];
 	blockCache: FixedCacheAccount;
-	parentChildrenCache: Map<string, { ids: readonly string[]; bytes: number; descriptor: SessionStorageStat }>;
+	parentChildrenCache: Map<
+		string,
+		{
+			ids: readonly string[];
+			bytes: number;
+			descriptor: SessionStorageStat;
+			bucketDescriptor?: SessionStorageStat;
+			bucketIndex?: number;
+		}
+	>;
 	entryCache: FixedCacheAccount;
 	tailCache: FixedCacheAccount;
 	labelsPins: BoundedLabelsPinsStore;
@@ -741,6 +763,40 @@ export interface SessionMemorySidecarRuntime {
 	validatedIndexDescriptor?: SessionStorageStat;
 	/** Live running hash of the index bytes; updated on every index append. */
 	indexHash: crypto.Hash;
+	/** Persistent bounded parent→children artifact state; absent = parent lookups fail closed. */
+	parentArtifact?: ParentArtifactRuntimeState;
+}
+
+/** Retained runtime state of the disposable parent→children artifact (block-cache charged). */
+interface ParentArtifactRuntimeState {
+	/** Exact `.spill.idx` digest the artifact covers; artifact lookups require `indexDigest === runtime.indexDigest`. */
+	indexDigest: string;
+	/** Committed per-bucket exact-byte size + sha256, updated incrementally on append. */
+	buckets: ParentBucketCommit[];
+	/** Total artifact bytes (sum of bucket sizes). */
+	totalBytes: number;
+	/** Block-cache bytes charged for this retained state; released on invalidation/wholesale release. */
+	chargedBytes: number;
+	/** On-disk byte cap enforced on append; fixed at `PARENT_CHILDREN_BUDGET_BYTES` unless a test shrinks it. */
+	budgetBytes: number;
+}
+
+/** Bucket file paths for the disposable parent artifact derived from an index path. */
+function parentBucketPaths(indexPath: string, bucketCount = PARENT_CHILDREN_BUCKET_COUNT): string[] {
+	const prefix = indexPath.replace(/\.spill\.idx$/, ".spill.parent-");
+	return Array.from({ length: bucketCount }, (_, bucket) => `${prefix}${bucket.toString().padStart(4, "0")}`);
+}
+
+/** Count one parent's records inside a verified bucket byte range. */
+function countParentBucketRecords(bytes: Uint8Array, parentId: string): number {
+	let count = 0;
+	const text = new TextDecoder("utf-8").decode(bytes);
+	for (const line of text.split("\n")) {
+		if (!line) continue;
+		const record = parseParentBucketRecord(line);
+		if (record?.parentId === parentId) count++;
+	}
+	return count;
 }
 
 interface SessionMemoryCommitContents extends CommitMarkerContents {
@@ -753,6 +809,8 @@ interface SessionMemoryCommitContents extends CommitMarkerContents {
 
 	/** SHA-256 over the exact `.spill.idx` bytes the marker's sidecar set was built with. */
 	indexDigest?: string;
+	/** Bounded parent→children artifact binding; absent when no artifact was published for this marker. */
+	parentIndex?: ParentArtifactCommit;
 }
 
 function isValidPersistedReducerState(value: ReducerState): boolean {
@@ -6567,6 +6625,7 @@ export class SessionManager {
 			runtime.indexHash = indexHash;
 			runtime.indexDigest = commit.indexDigest;
 			runtime.validatedIndexDescriptor = indexDescriptor;
+			this.#adoptCommittedParentArtifact(commit.parentIndex);
 			const headerWindow = this.storage.readRangeSync(sessionFile, 0, Math.min(descriptor.size, 64 * 1024)).bytes;
 			const headerEnd = headerWindow.indexOf(10);
 			if (headerEnd < 0) return false;
@@ -6749,7 +6808,7 @@ export class SessionManager {
 			return false;
 		} finally {
 			if (!initialized) {
-				for (const sidecarPath of [runtime.indexPath, runtime.tailPath, runtime.commitPath]) {
+				for (const sidecarPath of this.#disposableSidecarPaths()) {
 					if (!sidecarPath) continue;
 					try {
 						this.storage.unlinkSync(sidecarPath);
@@ -7002,6 +7061,7 @@ export class SessionManager {
 		let scannedBytes = 0;
 		const hotEntries: SessionEntry[] = [];
 		let buildFailed = false;
+		const parentBuilder = new BoundedParentArtifactBuilder();
 		try {
 			indexWriter = this.storage.openWriter(runtime.indexPath, { flags: "w" });
 			tailWriter = this.storage.openWriter(runtime.tailPath, { flags: "w" });
@@ -7065,6 +7125,18 @@ export class SessionManager {
 					})}\n`;
 					indexWriter!.writeLineSync(indexLine);
 					runtime.indexHash.update(Buffer.from(indexLine, "utf8"));
+					if (typeof parentId === "string") {
+						parentBuilder.add({
+							parentId,
+							childId: record.id,
+							ordinal,
+							seq: ordinal,
+							byteOffset: lineStart,
+							byteLength,
+							recordDigest,
+							entryType: record.type,
+						});
+					}
 					if (inTail) {
 						const entry = parsed as SessionEntry;
 						hotEntries.push(entry);
@@ -7140,6 +7212,13 @@ export class SessionManager {
 			runtime.hotSuffixBytes = hotSuffixBytes;
 
 			runtime.indexDigest = runtime.indexHash.copy().digest("hex");
+			this.#publishParentArtifact(parentBuilder, runtime.indexDigest);
+			try {
+				const validated = this.storage.statSync(runtime.indexPath);
+				runtime.validatedIndexDescriptor = validated;
+			} catch {
+				// A missing index falls back to the authoritative digest re-verification path.
+			}
 			for (const [id, label] of discovery.labels) {
 				if (!runtime.labelsPins.setLabel(id, label)) {
 					this.#lazyReopenFallbackReason = "bounded_scan_budget";
@@ -8732,6 +8811,10 @@ export class SessionManager {
 		const malformedUsageSample: string[] = [];
 		for (const entry of fileEntries) {
 			if (entry.type === "session") continue;
+			if (entry.parentId !== null) {
+				const canonicalParent = byId.get(entry.parentId);
+				if (canonicalParent) entry.parentId = canonicalParent.id;
+			}
 			byId.set(entry.id, entry);
 			leafId = entry.id;
 			if (entry.type === "label") {
@@ -9184,6 +9267,19 @@ export class SessionManager {
 				usageStatistics: this.#usageStatistics,
 
 				indexDigest: runtime.indexDigest,
+				...(runtime.parentArtifact
+					? {
+							parentIndex: {
+								bucketCount: runtime.parentArtifact.buckets.length,
+								indexDigest: runtime.parentArtifact.indexDigest,
+								buckets: runtime.parentArtifact.buckets.map(bucket => ({
+									size: bucket.size,
+									digest: bucket.digest,
+									complete: bucket.complete,
+								})),
+							},
+						}
+					: {}),
 			};
 			const bytes = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
 			try {
@@ -9252,6 +9348,7 @@ export class SessionManager {
 				`${this.#sessionFile}.spill.idx`,
 				`${this.#sessionFile}.spill.tail`,
 				`${this.#sessionFile}.spill.commit`,
+				...parentBucketPaths(`${this.#sessionFile}.spill.idx`),
 			]) {
 				try {
 					this.storage.unlinkSync(legacyPath);
@@ -9261,8 +9358,9 @@ export class SessionManager {
 			}
 		}
 		const sidecarRoot = this.#sessionFile?.endsWith(".jsonl") ? this.#sessionFile.slice(0, -6) : this.#sessionFile;
+		const parentPathPrefix = sidecarRoot ? `${sidecarRoot}/.session-memory.spill.parent-` : "";
 		if (sidecarRoot) {
-			for (const candidate of this.storage.listFilesSync(sidecarRoot, "*")) {
+			for (const candidate of this.storage.listFilesSync(sidecarRoot, ".*")) {
 				const name = path.basename(candidate);
 				const orphaned =
 					name.endsWith(".tmp") ||
@@ -9295,6 +9393,7 @@ export class SessionManager {
 			indexPath: sidecarRoot ? `${sidecarRoot}/.session-memory.spill.idx` : "",
 			tailPath: sidecarRoot ? `${sidecarRoot}/.session-memory.spill.tail` : "",
 			commitPath: sidecarRoot ? `${sidecarRoot}/.session-memory.spill.commit` : "",
+			parentPathPrefix,
 			retirementFirstKeptEntryId: undefined,
 			hotSuffixBytes: 0,
 			accountant: new SessionMemoryAccountant(),
@@ -9356,6 +9455,10 @@ export class SessionManager {
 		try {
 			this.#buildDisposableSidecarsUnsafe(entries);
 			const runtime = this.#sidecarRuntime;
+			if (this.#sessionMemoryMode === "shadow" && runtime?.parentArtifact) {
+				runtime.blockCache.release(runtime.parentArtifact.chargedBytes);
+				runtime.parentArtifact = undefined;
+			}
 			if (runtime?.enabled && !runtime.sidecarIneligible) this.#consecutiveSidecarBuildFailures = 0;
 		} catch (error) {
 			this.#consecutiveSidecarBuildFailures++;
@@ -9368,7 +9471,7 @@ export class SessionManager {
 				runtime.enabled = false;
 				runtime.sidecarIneligible = true;
 				runtime.hotSuffixBytes = 0;
-				for (const sidecarPath of [runtime.indexPath, runtime.tailPath, runtime.commitPath]) {
+				for (const sidecarPath of this.#disposableSidecarPaths()) {
 					if (!sidecarPath) continue;
 					try {
 						this.storage.unlinkSync(sidecarPath);
@@ -9481,6 +9584,7 @@ export class SessionManager {
 		let tailOverflow = false;
 		let operationError: unknown;
 		let closeError: unknown;
+		const parentBuilder = new BoundedParentArtifactBuilder();
 		try {
 			indexWriter = this.storage.openWriter(runtime.indexPath, { flags: "w" });
 			tailWriter = this.storage.openWriter(runtime.tailPath, { flags: "w" });
@@ -9501,6 +9605,18 @@ export class SessionManager {
 				})}\n`;
 				indexWriter!.writeLineSync(indexLine);
 				runtime.indexHash.update(Buffer.from(indexLine, "utf8"));
+				if (this.#sessionMemoryMode === "enabled" && typeof entry.parentId === "string") {
+					parentBuilder.add({
+						parentId: entry.parentId,
+						childId: entry.id,
+						ordinal,
+						seq: ordinal,
+						byteOffset: runningOffset,
+						byteLength: persistedLine.byteLength,
+						recordDigest,
+						entryType: entry.type,
+					});
+				}
 				if (ordinal >= tailStartOrdinal && !tailOverflow) {
 					const record = tailBuilder.append({
 						seq: tailSeq,
@@ -9589,9 +9705,398 @@ export class SessionManager {
 		}
 
 		runtime.indexDigest = runtime.indexHash.copy().digest("hex");
+		if (this.#sessionMemoryMode === "enabled") {
+			this.#publishParentArtifact(parentBuilder, runtime.indexDigest);
+		} else {
+			this.#cleanupParentArtifactFiles();
+			runtime.parentArtifact = undefined;
+		}
+		try {
+			const validated = this.storage.statSync(runtime.indexPath);
+			runtime.validatedIndexDescriptor = validated;
+		} catch {
+			// A missing index falls back to the authoritative digest re-verification path.
+		}
 		runtime.reopenTransition = this.#classifySidecarReopen();
 		this.#publishCommitMarkerFromCurrentTranscriptSync();
 		runtime.terminalTransition = this.#classifySidecarReopen();
+	}
+
+	// =========================================================================
+	// Persistent bounded parent→children artifact
+	// =========================================================================
+
+	/** Path of one parent bucket file (`.spill.parent-<bucket>`). */
+	#parentBucketPath(bucket: number): string {
+		const runtime = this.#sidecarRuntime;
+		return runtime ? `${runtime.parentPathPrefix}${bucket.toString().padStart(4, "0")}` : "";
+	}
+
+	/** Best-effort unlink of every derived parent bucket file. */
+	#cleanupParentArtifactFiles(): void {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.parentPathPrefix) return;
+		for (const path of parentBucketPaths(runtime.indexPath)) {
+			try {
+				this.storage.unlinkSync(path);
+			} catch {
+				// Disposable buckets are best-effort cleanup; transcript authority is unaffected.
+			}
+		}
+	}
+
+	/**
+	 * Write the built parent artifact bucket files (fsync before any marker
+	 * publication), then adopt the committed metadata into the runtime. Any
+	 * build/write failure or block-cache rejection disables the artifact (parent
+	 * lookups then fail closed to the authoritative cold scan); the session's
+	 * index/tail sidecars remain fully usable.
+	 */
+	#publishParentArtifact(builder: BoundedParentArtifactBuilder, indexDigest: string): void {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return;
+		const cleanup = (): void => {
+			this.#cleanupParentArtifactFiles();
+			runtime.parentArtifact = undefined;
+		};
+		if (builder.distinctParents === 0) {
+			cleanup();
+			return;
+		}
+		const result = builder.finish(indexDigest);
+		try {
+			for (let bucket = 0; bucket < result.buckets.length; bucket++) {
+				const records = result.buckets[bucket];
+				if (records.length === 0) {
+					try {
+						this.storage.unlinkSync(this.#parentBucketPath(bucket));
+					} catch {
+						// An absent bucket is fine; an unlink failure is best-effort.
+					}
+					continue;
+				}
+				const writer = this.storage.openWriter(this.#parentBucketPath(bucket), { flags: "w" });
+				try {
+					for (const line of records) writer.writeLineSync(line);
+					if (!writer.fsyncSync) throw new Error("Synchronous parent bucket fsync is unavailable");
+					writer.fsyncSync();
+				} finally {
+					writer.closeSync();
+				}
+			}
+		} catch {
+			cleanup();
+			return;
+		}
+		const charged = parentArtifactRuntimeBytes(result.metadata.bucketCount);
+		if (!runtime.blockCache.tryAllocate(charged)) {
+			cleanup();
+			return;
+		}
+		const totalBytes = result.metadata.buckets.reduce((total, bucket) => total + bucket.size, 0);
+		runtime.parentArtifact = {
+			indexDigest: result.metadata.indexDigest,
+			buckets: result.metadata.buckets.map(bucket => ({
+				size: bucket.size,
+				digest: bucket.digest,
+				complete: bucket.complete,
+			})),
+			totalBytes,
+			chargedBytes: charged,
+			budgetBytes: PARENT_CHILDREN_BUDGET_BYTES,
+		};
+	}
+
+	/**
+	 * Fail closed: delete the bucket files and drop the retained artifact state.
+	 * A marker published after this call binds no parent metadata, so lookups
+	 * never trust a stale/partial artifact and fall back to the authoritative
+	 * cold scan.
+	 */
+	#invalidateParentArtifact(): void {
+		const runtime = this.#sidecarRuntime;
+		const artifact = runtime?.parentArtifact;
+		if (!artifact) return;
+		this.#cleanupParentArtifactFiles();
+		runtime.parentArtifact = undefined;
+		if (artifact.chargedBytes > 0) runtime.blockCache.release(artifact.chargedBytes);
+	}
+
+	/**
+	 * Adopt the parent artifact binding from a validated commit marker. Bucket
+	 * bytes are verified lazily (one bounded bucket read per lookup); any
+	 * structural, binding, or budget inconsistency disables the artifact and the
+	 * session still reopens exactly on index/tail proof.
+	 */
+	#adoptCommittedParentArtifact(parentIndex: ParentArtifactCommit | undefined): void {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return;
+		const reject = (): void => {
+			runtime.parentArtifact = undefined;
+		};
+		if (!parentIndex) return reject();
+		if (
+			parentIndex.bucketCount !== PARENT_CHILDREN_BUCKET_COUNT ||
+			parentIndex.indexDigest !== runtime.indexDigest ||
+			parentIndex.buckets.length !== PARENT_CHILDREN_BUCKET_COUNT
+		)
+			return reject();
+		let totalBytes = 0;
+		for (const bucket of parentIndex.buckets) {
+			if (!Number.isSafeInteger(bucket.size) || bucket.size < 0) return reject();
+			if (typeof bucket.digest !== "string" || !/^[0-9a-f]{64}$/.test(bucket.digest)) return reject();
+			if (typeof bucket.complete !== "boolean") return reject();
+			totalBytes += bucket.size;
+		}
+		if (totalBytes > PARENT_CHILDREN_BUDGET_BYTES) return reject();
+		const charged = parentArtifactRuntimeBytes(parentIndex.bucketCount);
+		if (!runtime.blockCache.tryAllocate(charged)) return reject();
+		runtime.parentArtifact = {
+			indexDigest: parentIndex.indexDigest,
+			buckets: parentIndex.buckets.map(bucket => ({
+				size: bucket.size,
+				digest: bucket.digest,
+				complete: bucket.complete,
+			})),
+			totalBytes,
+			chargedBytes: charged,
+			budgetBytes: PARENT_CHILDREN_BUDGET_BYTES,
+		};
+	}
+
+	/** Strictly parse the marker's parent-artifact binding; invalid → absent (fail closed). */
+	#parseParentIndexValue(value: unknown): ParentArtifactCommit | undefined {
+		if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+		const parentIndex = value as Record<string, unknown>;
+		if (typeof parentIndex.bucketCount !== "number" || !Number.isSafeInteger(parentIndex.bucketCount))
+			return undefined;
+		if (typeof parentIndex.indexDigest !== "string" || parentIndex.indexDigest.length !== 64) return undefined;
+		if (!Array.isArray(parentIndex.buckets)) return undefined;
+		const buckets: ParentBucketCommit[] = [];
+		for (const candidate of parentIndex.buckets) {
+			if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return undefined;
+			const bucket = candidate as Record<string, unknown>;
+			if (typeof bucket.size !== "number" || !Number.isSafeInteger(bucket.size) || bucket.size < 0) return undefined;
+			if (typeof bucket.digest !== "string" || !/^[0-9a-f]{64}$/.test(bucket.digest)) return undefined;
+			if (typeof bucket.complete !== "boolean") return undefined;
+			buckets.push({ size: bucket.size, digest: bucket.digest, complete: bucket.complete });
+		}
+		return { bucketCount: parentIndex.bucketCount, indexDigest: parentIndex.indexDigest, buckets };
+	}
+
+	/**
+	 * Incrementally maintain the parent artifact for one appended entry. The
+	 * bucket record is appended and fsynced BEFORE the commit marker is
+	 * published, so a marker never claims parent metadata that lacks the new
+	 * edge. Returns false when the artifact cannot safely cover the append
+	 * (bound exceeded, external bucket mutation, or I/O failure); the caller
+	 * then invalidates the whole artifact and the marker is published without
+	 * parent metadata.
+	 */
+	#appendParentArtifactRecord(
+		parentId: string,
+		index: {
+			childId: string;
+			ordinal: number;
+			seq: number;
+			byteOffset: number;
+			byteLength: number;
+			recordDigest: string;
+			entryType?: string;
+		},
+	): boolean {
+		const runtime = this.#sidecarRuntime;
+		const artifact = runtime?.parentArtifact;
+		if (!artifact) return true;
+		const bucket = parentBucketForId(parentId, artifact.buckets.length);
+		const bucketState = artifact.buckets[bucket];
+		if (!bucketState) return false;
+		const recordLine = serializeParentBucketRecord({
+			parentId,
+			childId: index.childId,
+			ordinal: index.ordinal,
+			seq: index.seq,
+			byteOffset: index.byteOffset,
+			byteLength: index.byteLength,
+			recordDigest: index.recordDigest,
+			entryType: index.entryType,
+		});
+		const recordBytes = Buffer.byteLength(recordLine, "utf8");
+		try {
+			if (typeof this.storage.readRangeSync !== "function") return false;
+			let currentBytes: Uint8Array;
+			try {
+				const current = this.storage.statSync(this.#parentBucketPath(bucket));
+				if (current.size !== bucketState.size || current.size > PARENT_CHILDREN_BUDGET_BYTES) return false;
+				currentBytes = this.storage.readRangeSync(this.#parentBucketPath(bucket), 0, current.size).bytes;
+			} catch {
+				if (bucketState.size !== 0) return false;
+				currentBytes = Buffer.alloc(0);
+			}
+			const digest = crypto.createHash("sha256").update(currentBytes).digest("hex");
+			if (digest !== bucketState.digest || currentBytes.byteLength !== bucketState.size) return false;
+			const childCount = countParentBucketRecords(currentBytes, parentId);
+			if (childCount === 0 && !bucketState.complete) return false;
+			if (childCount >= PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT) return false;
+			if (artifact.totalBytes + recordBytes > artifact.budgetBytes) return false;
+			const writer = this.storage.openWriter(this.#parentBucketPath(bucket), { flags: "a" });
+			try {
+				writer.writeLineSync(recordLine);
+				if (!writer.fsyncSync) throw new Error("Synchronous parent bucket fsync is unavailable");
+				writer.fsyncSync();
+			} finally {
+				writer.closeSync();
+			}
+			const after = this.storage.statSync(this.#parentBucketPath(bucket));
+			const afterBytes = this.storage.readRangeSync(this.#parentBucketPath(bucket), 0, after.size).bytes;
+			bucketState.size = after.size;
+			bucketState.digest = crypto.createHash("sha256").update(afterBytes).digest("hex");
+			artifact.totalBytes = artifact.buckets.reduce((total, bucket) => total + bucket.size, 0);
+			// The artifact now covers the exact index bytes (including the appended
+			// line); rebind so the next marker's parentIndex matches its indexDigest.
+			artifact.indexDigest = runtime.indexDigest;
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Serve one parent's direct children from the persistent artifact: read a
+	 * single bucket (bounded), verify its exact bytes against the committed
+	 * digest, filter hash collisions by parent id, then resolve every child
+	 * from the transcript. Any malformed/corrupt/missing/stale evidence returns
+	 * undefined so the caller falls back to the authoritative cold scan.
+	 */
+	#readParentChildrenFromArtifact(parentId: string, indexStat: SessionStorageStat): SessionEntry[] | undefined {
+		const runtime = this.#sidecarRuntime;
+		const artifact = runtime?.parentArtifact;
+		if (!artifact) return undefined;
+		const fail = (): undefined => {
+			this.#invalidateParentArtifact();
+			return undefined;
+		};
+		if (typeof this.storage.readRangeSync !== "function") return undefined;
+		const bucket = parentBucketForId(parentId, artifact.buckets.length);
+		const committed = artifact.buckets[bucket];
+		if (!committed) return undefined;
+		if (committed.size === 0) return committed.complete ? [] : undefined;
+		let bucketStat: SessionStorageStat;
+		let bytes: Uint8Array;
+		try {
+			bucketStat = this.storage.statSync(this.#parentBucketPath(bucket));
+			if (bucketStat.size !== committed.size || bucketStat.size > PARENT_CHILDREN_BUDGET_BYTES) return fail();
+			bytes = this.storage.readRangeSync(this.#parentBucketPath(bucket), 0, bucketStat.size).bytes;
+		} catch {
+			return fail();
+		}
+		const digest = crypto.createHash("sha256").update(bytes).digest("hex");
+		if (digest !== committed.digest) return fail();
+		const records: Array<{ childId: string; index: ColdEntryIndex; residentBytes: number }> = [];
+		const decoder = new TextDecoder("utf-8");
+		let carry = "";
+		let malformed = false;
+		for (let offset = 0; offset < bytes.byteLength; offset += 64 * 1024) {
+			const length = Math.min(64 * 1024, bytes.byteLength - offset);
+			const text =
+				carry +
+				decoder.decode(bytes.subarray(offset, offset + length), {
+					stream: offset + length < bytes.byteLength,
+				});
+			const lines = text.split("\n");
+			carry = lines.pop() ?? "";
+			for (const line of lines) {
+				if (!line) continue;
+				const record = parseParentBucketRecord(line);
+				if (!record) {
+					malformed = true;
+					break;
+				}
+				if (record.parentId !== parentId) continue;
+				records.push({
+					childId: record.childId,
+					index: {
+						ordinal: record.ordinal,
+						seq: record.seq,
+						byteOffset: record.byteOffset,
+						byteLength: record.byteLength,
+						recordDigest: record.recordDigest,
+						parentId,
+						...(record.entryType !== undefined ? { entryType: record.entryType } : {}),
+					},
+					residentBytes: line.length * 2 + 48,
+				});
+			}
+			if (malformed) break;
+		}
+		if (malformed || records.length > PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT) return fail();
+		if (records.length === 0 && !committed.complete) return undefined;
+		for (const record of records) {
+			if (!runtime.coldEntries.has(record.childId) && runtime.blockCache.tryAllocate(record.residentBytes))
+				runtime.coldEntries.set(record.childId, record.index);
+		}
+		const cache = new Map<string, string>();
+		const children: SessionEntry[] = [];
+		for (const record of records) {
+			const entry = this.#resolveColdChild(record.childId, record.index, parentId);
+			if (!entry) return fail();
+			children.push(
+				cloneSessionEntry(materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), cache)),
+			);
+		}
+		const cacheBytes =
+			residentStringBytes(parentId) +
+			48 +
+			records.reduce((total, record) => total + residentStringBytes(record.childId) + 8, 0);
+		if (runtime.blockCache.tryAllocate(cacheBytes)) {
+			runtime.parentChildrenCache.set(parentId, {
+				ids: records.map(record => record.childId),
+				bytes: cacheBytes,
+				descriptor: indexStat,
+				bucketDescriptor: bucketStat,
+				bucketIndex: bucket,
+			});
+		}
+		return children;
+	}
+
+	/** Resolve one artifact-referenced child from the transcript, verifying parent identity. */
+	#resolveColdChild(id: string, index: ColdEntryIndex, parentId: string): SessionEntry | undefined {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return undefined;
+		const bytes = this.#readColdEntryRange(index);
+		if (!bytes || computeLineDigest(bytes) !== index.recordDigest) return undefined;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(new TextDecoder("utf-8").decode(bytes));
+		} catch {
+			return undefined;
+		}
+		if (parsed === null || typeof parsed !== "object") return undefined;
+		const entry = parsed as SessionEntry;
+		if (entry.id !== id || entry.parentId !== parentId) return undefined;
+		if (!runtime.entryCache.tryAllocate(bytes.byteLength)) return entry;
+		this.#byId.set(id, entry);
+		return entry;
+	}
+
+	/** True when the bucket backing an artifact-seeded cache entry still matches its validated descriptor. */
+	#parentBucketDescriptorMatches(descriptor: SessionStorageStat, bucketIndex: number | undefined): boolean {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.parentPathPrefix || bucketIndex === undefined) return false;
+		try {
+			const current = this.storage.statSync(this.#parentBucketPath(bucketIndex));
+			return sameDescriptor(current, descriptor);
+		} catch {
+			return false;
+		}
+	}
+
+	/** Every disposable sidecar path, including the persistent parent artifact buckets. */
+	#disposableSidecarPaths(): string[] {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return [];
+		return [runtime.indexPath, runtime.tailPath, runtime.commitPath, ...parentBucketPaths(runtime.indexPath)];
 	}
 
 	#validateColdBase(base = this.#sidecarRuntime?.base): boolean {
@@ -9756,6 +10261,7 @@ export class SessionManager {
 			}
 			runtime.coldEntries.clear();
 			runtime.parentChildrenCache.clear();
+			runtime.parentArtifact = undefined;
 			runtime.blockCache.release(runtime.blockCache.allocatedBytes);
 			runtime.validatedIndexDescriptor = undefined;
 		}
@@ -10093,6 +10599,7 @@ export class SessionManager {
 		runtime.tail = { ...runtime.tail, records: [] };
 		runtime.labelsPins.clear();
 		runtime.parentChildrenCache.clear();
+		runtime.parentArtifact = undefined;
 		runtime.blockCache.release(runtime.blockCache.allocatedBytes);
 		runtime.entryCache.release(runtime.entryCache.allocatedBytes);
 		runtime.tailCache.release(runtime.tailCache.allocatedBytes);
@@ -10121,7 +10628,7 @@ export class SessionManager {
 		runtime.sidecarIneligible = true;
 		runtime.hotSuffixBytes = 0;
 		runtime.accountant = new SessionMemoryAccountant();
-		for (const sidecarPath of [runtime.indexPath, runtime.tailPath, runtime.commitPath]) {
+		for (const sidecarPath of this.#disposableSidecarPaths()) {
 			if (!sidecarPath) continue;
 			try {
 				this.storage.unlinkSync(sidecarPath);
@@ -10266,6 +10773,28 @@ export class SessionManager {
 			this.#deactivateColdForBranchMutation();
 			return false;
 		}
+		if (typeof entry.parentId === "string") {
+			if (
+				!this.#appendParentArtifactRecord(entry.parentId, {
+					childId: entry.id,
+					ordinal: record.ordinal,
+					seq,
+					byteOffset,
+					byteLength,
+					recordDigest,
+					entryType: entry.type,
+				})
+			) {
+				this.#invalidateParentArtifact();
+			}
+		}
+		if (entry.parentId === null && runtime.parentArtifact) this.#invalidateParentArtifact();
+		try {
+			const refreshed = this.storage.statSync(runtime.indexPath);
+			runtime.validatedIndexDescriptor = refreshed;
+		} catch {
+			// The next cold lookup re-verifies the index digest before trusting caches.
+		}
 		const records = runtime.tail.records as TailRecord[];
 		records.push(record);
 		runtime.tail = {
@@ -10309,6 +10838,7 @@ export class SessionManager {
 				labels?: unknown;
 				usageStatistics?: unknown;
 				indexDigest?: unknown;
+				parentIndex?: unknown;
 			};
 			const descriptor = value.descriptor;
 			const base = value.base;
@@ -10357,6 +10887,9 @@ export class SessionManager {
 					: {}),
 
 				indexDigest: value.indexDigest,
+				...(this.#parseParentIndexValue(value.parentIndex) !== undefined
+					? { parentIndex: this.#parseParentIndexValue(value.parentIndex) }
+					: {}),
 			};
 		} catch {
 			return undefined;
@@ -11106,6 +11639,7 @@ export class SessionManager {
 				retirementFallbackReason: this.#retirementFallbackReason,
 				autoDisabledReason: this.#sessionMemoryAutoDisabledReason,
 				consecutiveBuildFailures: this.#consecutiveSidecarBuildFailures,
+				parentArtifactEnabled: false,
 			};
 		}
 		const reducerBytes = JSON.stringify(runtime.reducer).length * 2 + 48;
@@ -11130,6 +11664,7 @@ export class SessionManager {
 			retirementFallbackReason: this.#retirementFallbackReason,
 			autoDisabledReason: this.#sessionMemoryAutoDisabledReason,
 			consecutiveBuildFailures: this.#consecutiveSidecarBuildFailures,
+			parentArtifactEnabled: runtime.parentArtifact !== undefined,
 		};
 	}
 
@@ -11145,7 +11680,7 @@ export class SessionManager {
 			if (retainedColdRuntime) return;
 			const runtime = this.#sidecarRuntime;
 			if (runtime) {
-				for (const sidecarPath of [runtime.indexPath, runtime.tailPath, runtime.commitPath]) {
+				for (const sidecarPath of this.#disposableSidecarPaths()) {
 					if (!sidecarPath) continue;
 					try {
 						this.storage.unlinkSync(sidecarPath);
@@ -12585,6 +13120,15 @@ export class SessionManager {
 	parentChildrenCacheKeysForTests(): string[] {
 		return [...(this.#sidecarRuntime?.parentChildrenCache.keys() ?? [])];
 	}
+	parentArtifactEnabledForTests(): boolean {
+		return this.#sidecarRuntime?.parentArtifact !== undefined;
+	}
+	setParentArtifactBudgetForTests(bytes: number): void {
+		const artifact = this.#sidecarRuntime?.parentArtifact;
+		if (!artifact) throw new Error("parent_artifact_unavailable");
+		if (!Number.isSafeInteger(bytes) || bytes < 0) throw new RangeError("invalid_parent_artifact_budget");
+		artifact.budgetBytes = bytes;
+	}
 	hotRetainedMessageCharsForTests(): number {
 		let total = 0;
 		for (const entry of this.#fileEntries) {
@@ -12739,7 +13283,9 @@ export class SessionManager {
 			cached &&
 			runtime.validatedIndexDescriptor &&
 			sameDescriptor(cached.descriptor, indexStat) &&
-			sameDescriptor(runtime.validatedIndexDescriptor, indexStat)
+			sameDescriptor(runtime.validatedIndexDescriptor, indexStat) &&
+			(cached.bucketDescriptor === undefined ||
+				this.#parentBucketDescriptorMatches(cached.bucketDescriptor, cached.bucketIndex))
 		) {
 			const cache = new Map<string, string>();
 			const children: SessionEntry[] = [];
@@ -12755,6 +13301,19 @@ export class SessionManager {
 		if (cached) {
 			runtime.parentChildrenCache.delete(parentId);
 			runtime.blockCache.release(cached.bytes);
+		}
+		// Persistent artifact fast path: one bounded bucket read, never a complete
+		// `.spill.idx` digest+scan. The artifact is disposable derived proof bound
+		// to the exact index digest; any miss falls through to the authoritative
+		// cold scan below.
+		if (
+			runtime.parentArtifact &&
+			runtime.parentArtifact.indexDigest === runtime.indexDigest &&
+			runtime.validatedIndexDescriptor &&
+			sameDescriptor(runtime.validatedIndexDescriptor, indexStat)
+		) {
+			const artifactChildren = this.#readParentChildrenFromArtifact(parentId, indexStat);
+			if (artifactChildren) return artifactChildren;
 		}
 		if (!this.#coldIndexDigestValid()) return undefined;
 		const childIds: string[] = [];

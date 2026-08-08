@@ -3,6 +3,11 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getBlobsDir, logger, TempDir } from "@gajae-code/utils";
+import {
+	PARENT_CHILDREN_BUCKET_COUNT,
+	parentBucketForId,
+	serializeParentBucketRecord,
+} from "../../src/session/internal/session-memory-sidecar";
 import { SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
 import {
 	FileSessionStorage,
@@ -13,6 +18,51 @@ import {
 
 const sidecarPath = (sessionFile: string, kind: "idx" | "tail" | "commit"): string =>
 	`${sessionFile.slice(0, -6)}/.session-memory.spill.${kind}`;
+const parentBucketPath = (sessionFile: string, bucket: number): string =>
+	`${sessionFile.slice(0, -6)}/.session-memory.spill.parent-${bucket.toString().padStart(4, "0")}`;
+
+/** Write a compacted tree transcript: root → `parentCount` parents, each with `childrenPerParent` children. */
+function writeTreeTranscript(
+	storage: MemorySessionStorage,
+	sessionFile: string,
+	options: { parentCount: number; childrenPerParent: number },
+): string[] {
+	const parents = Array.from(
+		{ length: options.parentCount },
+		(_, index) => `parent-${index.toString().padStart(3, "0")}`,
+	);
+	const records: Array<Record<string, unknown>> = [
+		{ type: "session", version: 5, id: "tree-session", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "root", parentId: null, timestamp: "0", customType: "node", data: {} },
+	];
+	for (const parent of parents) {
+		records.push({ type: "custom", id: parent, parentId: "root", timestamp: "0", customType: "node", data: {} });
+	}
+	for (const parent of parents) {
+		for (let index = 0; index < options.childrenPerParent; index++) {
+			records.push({
+				type: "custom",
+				id: `${parent}-child-${index.toString().padStart(2, "0")}`,
+				parentId: parent,
+				timestamp: "0",
+				customType: "node",
+				data: {},
+			});
+		}
+	}
+	records.push({ type: "custom", id: "active", parentId: "root", timestamp: "0", customType: "node", data: {} });
+	records.push({
+		type: "compaction",
+		id: "active-compaction",
+		parentId: "active",
+		timestamp: "0",
+		summary: "summary",
+		firstKeptEntryId: "active",
+		tokensBefore: 1,
+	});
+	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	return parents;
+}
 
 describe("SessionManager cold sidecar integration", () => {
 	it("retires a compacted prefix on resume and lazily reloads exact transcript entries", async () => {
@@ -2372,7 +2422,7 @@ describe("sidecar I/O fallback", () => {
 		try {
 			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
 			expect(manager.getChildren("root").map(entry => entry.id)).toEqual(["abandoned", "active"]);
-			expect(manager.parentChildrenCacheKeysForTests()).toContain("abandoned");
+			expect(manager.parentChildrenCacheKeysForTests()).toContain("root");
 			const indexReadsAfterFirstLookup = storage.indexRangeReads;
 			expect(manager.getChildren("root").map(entry => entry.id)).toEqual(["abandoned", "active"]);
 			expect(storage.indexRangeReads).toBe(indexReadsAfterFirstLookup);
@@ -2380,7 +2430,10 @@ describe("sidecar I/O fallback", () => {
 			expect(storage.indexRangeReads).toBe(indexReadsAfterFirstLookup);
 			const indexPath = sidecarPath(sessionFile, "idx");
 			const indexText = storage.readTextSync(indexPath);
-			storage.writeTextSync(indexPath, indexText.replace('"abandoned"', '"forged___"'));
+			// Different-length replacement so the descriptor (size + mtime) always
+			// changes; a same-length same-millisecond write would be indistinguishable
+			// from the validated descriptor (out-of-scope same-descriptor tampering).
+			storage.writeTextSync(indexPath, indexText.replace('"abandoned"', '"XX"'));
 			expect(
 				manager
 					.getChildren("root")
@@ -2424,6 +2477,280 @@ describe("sidecar I/O fallback", () => {
 				.map(record => JSON.stringify(record))
 				.join("\n")}\n`,
 		);
+		const built = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		await built.close();
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(reopened.parentArtifactEnabledForTests()).toBe(true);
+			expect(reopened.getChildren("root").map(entry => entry.id)).toEqual(["overflow-parent", "active"]);
+			expect(reopened.parentChildrenCacheKeysForTests()).not.toContain("overflow-parent");
+			expect(reopened.getChildren("overflow-parent")).toHaveLength(257);
+			expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(false);
+		} finally {
+			await reopened.close();
+		}
+	});
+
+	it("serves arbitrary disjoint parent lookups after reopen without scanning .spill.idx", async () => {
+		class CountingStorage extends MemorySessionStorage {
+			indexRangeReads = 0;
+			bucketRangeReads = 0;
+			override readRangeSync(filePath: string, offset: number, length: number) {
+				if (filePath.endsWith(".spill.idx")) this.indexRangeReads++;
+				if (filePath.includes(".spill.parent-")) this.bucketRangeReads++;
+				return super.readRangeSync(filePath, offset, length);
+			}
+		}
+		const storage = new CountingStorage();
+		const sessionFile = "/sessions/disjoint-parents.jsonl";
+		const parents = writeTreeTranscript(storage, sessionFile, { parentCount: 24, childrenPerParent: 4 });
+		const first = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		expect(first.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		await first.close();
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(reopened.getSessionMemoryStats().currentCommitTransition).toEqual({
+				kind: "exact",
+				reason: "descriptor_and_proof_match",
+			});
+			expect(reopened.parentArtifactEnabledForTests()).toBe(true);
+			const readsAfterReopen = storage.indexRangeReads;
+			const readsBeforeLookups = storage.bucketRangeReads;
+			for (const parent of parents) {
+				expect(reopened.getChildren(parent).map(entry => entry.id)).toEqual([
+					`${parent}-child-00`,
+					`${parent}-child-01`,
+					`${parent}-child-02`,
+					`${parent}-child-03`,
+				]);
+			}
+			// No `.spill.idx` range read happens for any disjoint parent lookup.
+			expect(storage.indexRangeReads).toBe(readsAfterReopen);
+			// Each disjoint parent costs exactly one bounded bucket read.
+			expect(storage.bucketRangeReads - readsBeforeLookups).toBe(parents.length);
+			expect(reopened.getSessionMemoryStats().totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+		} finally {
+			await reopened.close();
+		}
+	});
+
+	it("preserves transcript physical order for artifact parent lookups across reopen", async () => {
+		class CountingStorage extends MemorySessionStorage {
+			indexRangeReads = 0;
+			override readRangeSync(filePath: string, offset: number, length: number) {
+				if (filePath.endsWith(".spill.idx")) this.indexRangeReads++;
+				return super.readRangeSync(filePath, offset, length);
+			}
+		}
+		const storage = new CountingStorage();
+		const sessionFile = "/sessions/parent-order.jsonl";
+		storage.writeTextSync(
+			sessionFile,
+			`${[
+				{ type: "session", version: 5, id: "parent-order", timestamp: "0", cwd: "/cwd" },
+				{ type: "custom", id: "root", parentId: null, timestamp: "0", customType: "node", data: {} },
+				{ type: "custom", id: "zeta", parentId: "root", timestamp: "0", customType: "node", data: {} },
+				{ type: "custom", id: "alpha", parentId: "root", timestamp: "0", customType: "node", data: {} },
+				{ type: "custom", id: "mid", parentId: "root", timestamp: "0", customType: "node", data: {} },
+				{ type: "custom", id: "active", parentId: "root", timestamp: "0", customType: "node", data: {} },
+				{
+					type: "compaction",
+					id: "active-compaction",
+					parentId: "active",
+					timestamp: "0",
+					summary: "summary",
+					firstKeptEntryId: "active",
+					tokensBefore: 1,
+				},
+			]
+				.map(record => JSON.stringify(record))
+				.join("\n")}\n`,
+		);
+		const built = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		expect(built.getChildren("root").map(entry => entry.id)).toEqual(["zeta", "alpha", "mid", "active"]);
+		await built.close();
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			const readsAfterReopen = storage.indexRangeReads;
+			expect(reopened.getChildren("root").map(entry => entry.id)).toEqual(["zeta", "alpha", "mid", "active"]);
+			expect(storage.indexRangeReads).toBe(readsAfterReopen);
+		} finally {
+			await reopened.close();
+		}
+	});
+
+	it("fails closed to authoritative children when the parent artifact is corrupt, missing, or stale", async () => {
+		class CountingStorage extends MemorySessionStorage {
+			indexRangeReads = 0;
+			override readRangeSync(filePath: string, offset: number, length: number) {
+				if (filePath.endsWith(".spill.idx")) this.indexRangeReads++;
+				return super.readRangeSync(filePath, offset, length);
+			}
+		}
+		const storage = new CountingStorage();
+		const sessionFile = "/sessions/parent-fallback.jsonl";
+		const parents = writeTreeTranscript(storage, sessionFile, { parentCount: 6, childrenPerParent: 3 });
+		const built = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		expect(built.getChildren("root")).toHaveLength(7);
+		await built.close();
+		const rootBucket = parentBucketForId("root", PARENT_CHILDREN_BUCKET_COUNT);
+		const parentBucket = parentBucketForId(parents[0], PARENT_CHILDREN_BUCKET_COUNT);
+
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(reopened.parentArtifactEnabledForTests()).toBe(true);
+			// Corrupt: overwrite the root bucket with garbage → digest mismatch → fallback scan.
+			const rootBucketPath = parentBucketPath(sessionFile, rootBucket);
+			storage.writeTextSync(rootBucketPath, "corrupt-parent-bucket\n");
+			const indexReadsBefore = storage.indexRangeReads;
+			const rootChildren = reopened
+				.getChildren("root")
+				.map(entry => entry.id)
+				.sort();
+			expect(rootChildren).toEqual(["active", ...parents.map(parent => parent).sort()]);
+			expect(storage.indexRangeReads).toBeGreaterThan(indexReadsBefore);
+
+			// Missing: unlink a parent bucket → authoritative children still served.
+			const parentBucketPathForParent = parentBucketPath(sessionFile, parentBucket);
+			storage.unlinkSync(parentBucketPathForParent);
+			expect(reopened.getChildren(parents[0]).map(entry => entry.id)).toEqual([
+				`${parents[0]}-child-00`,
+				`${parents[0]}-child-01`,
+				`${parents[0]}-child-02`,
+			]);
+
+			// Stale: replace the bucket for `parents[1]` with valid-looking but
+			// different bytes → digest mismatch → authoritative fallback.
+			const staleBucket = parentBucketForId(parents[1], PARENT_CHILDREN_BUCKET_COUNT);
+			storage.writeTextSync(
+				parentBucketPath(sessionFile, staleBucket),
+				serializeParentBucketRecord({
+					parentId: "root",
+					childId: "active",
+					ordinal: 0,
+					seq: 0,
+					byteOffset: 0,
+					byteLength: 1,
+					recordDigest: "0".repeat(64),
+				}),
+			);
+			expect(reopened.getChildren(parents[1]).map(entry => entry.id)).toEqual([
+				`${parents[1]}-child-00`,
+				`${parents[1]}-child-01`,
+				`${parents[1]}-child-02`,
+			]);
+			expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		} finally {
+			await reopened.close();
+		}
+	});
+
+	it("binds the parent artifact into the commit marker and reopens exactly", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/parent-marker.jsonl";
+		writeTreeTranscript(storage, sessionFile, { parentCount: 4, childrenPerParent: 2 });
+		const built = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		await built.close();
+		const marker = JSON.parse(storage.readTextSync(sidecarPath(sessionFile, "commit"))) as {
+			indexDigest: string;
+			parentIndex?: { bucketCount: number; indexDigest: string; buckets: Array<{ size: number; digest: string }> };
+		};
+		expect(marker.parentIndex).toBeDefined();
+		expect(marker.parentIndex!.bucketCount).toBe(PARENT_CHILDREN_BUCKET_COUNT);
+		expect(marker.parentIndex!.buckets).toHaveLength(PARENT_CHILDREN_BUCKET_COUNT);
+		// The artifact is bound to the exact index bytes the marker authenticates.
+		expect(marker.parentIndex!.indexDigest).toBe(marker.indexDigest);
+		// Every non-empty bucket's committed digest matches its exact on-disk bytes.
+		for (let bucket = 0; bucket < PARENT_CHILDREN_BUCKET_COUNT; bucket++) {
+			const committed = marker.parentIndex!.buckets[bucket];
+			if (committed.size === 0) continue;
+			const bytes = storage.readBytesSync(parentBucketPath(sessionFile, bucket));
+			expect(bytes.byteLength).toBe(committed.size);
+			expect(createHash("sha256").update(bytes).digest("hex")).toBe(committed.digest);
+		}
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(reopened.getSessionMemoryStats().currentCommitTransition).toEqual({
+				kind: "exact",
+				reason: "descriptor_and_proof_match",
+			});
+			expect(reopened.parentArtifactEnabledForTests()).toBe(true);
+		} finally {
+			await reopened.close();
+		}
+	});
+
+	it("appends parent records before publishing the commit marker and serves them after reopen", async () => {
+		class CountingStorage extends MemorySessionStorage {
+			indexRangeReads = 0;
+			override readRangeSync(filePath: string, offset: number, length: number) {
+				if (filePath.endsWith(".spill.idx")) this.indexRangeReads++;
+				return super.readRangeSync(filePath, offset, length);
+			}
+		}
+		const storage = new CountingStorage();
+		const sessionFile = "/sessions/append-parent.jsonl";
+		writeTreeTranscript(storage, sessionFile, { parentCount: 4, childrenPerParent: 2 });
 		const manager = await SessionManager.open(
 			sessionFile,
 			SessionManager.explicitDestination("/sessions"),
@@ -2432,13 +2759,132 @@ describe("sidecar I/O fallback", () => {
 			"enabled",
 		);
 		try {
-			expect(manager.getChildren("root").map(entry => entry.id)).toEqual(["overflow-parent", "active"]);
-			expect(manager.parentChildrenCacheKeysForTests()).not.toContain("overflow-parent");
-			expect(manager.getChildren("overflow-parent")).toHaveLength(257);
-			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
+			expect(manager.parentArtifactEnabledForTests()).toBe(true);
+			const leafId = manager.getLeafId()!;
+			const appendedId = manager.appendCustomEntry("node", {});
+			// The appended entry's parent is the previous leaf; its bucket record must
+			// be durable before the commit marker claims the new parent metadata.
+			const bucket = parentBucketForId(leafId, PARENT_CHILDREN_BUCKET_COUNT);
+			const bucketPath = parentBucketPath(sessionFile, bucket);
+			expect(storage.readTextSync(bucketPath)).toContain(`"c":"${appendedId}"`);
+			const marker = JSON.parse(storage.readTextSync(sidecarPath(sessionFile, "commit"))) as {
+				parentIndex?: { indexDigest: string; buckets: Array<{ size: number; digest: string }> };
+			};
+			expect(marker.parentIndex).toBeDefined();
+			expect(createHash("sha256").update(storage.readBytesSync(bucketPath)).digest("hex")).toBe(
+				marker.parentIndex!.buckets[bucket].digest,
+			);
+			// Compaction republishes the marker; the artifact stays current (no stale proof).
+			manager.appendCompaction("checkpoint", undefined, appendedId, 1);
+			const markerAfterCompaction = JSON.parse(storage.readTextSync(sidecarPath(sessionFile, "commit"))) as {
+				parentIndex?: { buckets: Array<{ size: number; digest: string }> };
+			};
+			expect(markerAfterCompaction.parentIndex).toBeDefined();
+			expect(createHash("sha256").update(storage.readBytesSync(bucketPath)).digest("hex")).toBe(
+				markerAfterCompaction.parentIndex!.buckets[bucket].digest,
+			);
 		} finally {
 			await manager.close();
 		}
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			const readsAfterReopen = storage.indexRangeReads;
+			expect(reopened.parentArtifactEnabledForTests()).toBe(true);
+			const lastLine = storage.readTextSync(sidecarPath(sessionFile, "idx")).trimEnd().split("\n").at(-1);
+			const parentId = (JSON.parse(lastLine!) as { parentId: string | null }).parentId!;
+			expect(reopened.getChildren(parentId)).toHaveLength(1);
+			expect(storage.indexRangeReads).toBe(readsAfterReopen);
+		} finally {
+			await reopened.close();
+		}
+	});
+
+	it("invalidates the parent artifact when an append cannot be safely recorded", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/append-overflow.jsonl";
+		writeTreeTranscript(storage, sessionFile, { parentCount: 4, childrenPerParent: 2 });
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(manager.parentArtifactEnabledForTests()).toBe(true);
+			// Shrink the append cap below one record: the next append cannot be
+			// covered, so the artifact must fail closed and the marker must be
+			// republished WITHOUT any parent binding.
+			manager.setParentArtifactBudgetForTests(1);
+			manager.appendCustomEntry("node", {});
+			expect(manager.parentArtifactEnabledForTests()).toBe(false);
+			const marker = JSON.parse(storage.readTextSync(sidecarPath(sessionFile, "commit"))) as {
+				parentIndex?: unknown;
+			};
+			expect(marker.parentIndex).toBeUndefined();
+			for (let bucket = 0; bucket < PARENT_CHILDREN_BUCKET_COUNT; bucket++) {
+				expect(storage.existsSync(parentBucketPath(sessionFile, bucket))).toBe(false);
+			}
+		} finally {
+			await manager.close();
+		}
+	});
+
+	it("removes the parent artifact buckets on cold deactivation and verified deletion", async () => {
+		const tempDir = TempDir.createSync("@pi-session-memory-parent-cleanup-");
+		const storage = new FileSessionStorage();
+		const sessionFile = path.join(tempDir.path(), "cleanup.jsonl");
+		const records: Array<Record<string, unknown>> = [
+			{ type: "session", version: 5, id: "cleanup", timestamp: "0", cwd: tempDir.path() },
+			{ type: "custom", id: "root", parentId: null, timestamp: "0", customType: "node", data: {} },
+			{ type: "custom", id: "child", parentId: "root", timestamp: "0", customType: "node", data: {} },
+			{ type: "custom", id: "active", parentId: "root", timestamp: "0", customType: "node", data: {} },
+			{
+				type: "compaction",
+				id: "active-compaction",
+				parentId: "active",
+				timestamp: "0",
+				summary: "summary",
+				firstKeptEntryId: "active",
+				tokensBefore: 1,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination(tempDir.path()),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(manager.parentArtifactEnabledForTests()).toBe(true);
+			expect(
+				fs.existsSync(parentBucketPath(sessionFile, parentBucketForId("root", PARENT_CHILDREN_BUCKET_COUNT))),
+			).toBe(true);
+			// Branching to the pre-compaction root deactivates cold and removes every
+			// disposable sidecar, including the parent artifact buckets.
+			manager.branch("root");
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
+			for (const kind of ["idx", "tail", "commit"] as const) {
+				expect(fs.existsSync(sidecarPath(sessionFile, kind))).toBe(false);
+			}
+			for (let bucket = 0; bucket < PARENT_CHILDREN_BUCKET_COUNT; bucket++) {
+				expect(fs.existsSync(parentBucketPath(sessionFile, bucket))).toBe(false);
+			}
+		} finally {
+			await manager.close();
+		}
+		// Verified deletion removes the whole artifacts directory (buckets included).
+		await storage.deleteSessionWithArtifacts(sessionFile);
+		expect(fs.existsSync(sessionFile.slice(0, -6))).toBe(false);
+		tempDir.removeSync();
 	});
 	it("preserves the tail truncation fsync error when close also fails", async () => {
 		class TailTruncationFailureStorage extends MemorySessionStorage {

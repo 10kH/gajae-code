@@ -7,12 +7,14 @@
  * budget rejection.
  */
 import { describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import {
 	applyReducerDelta,
 	type BaseAnchor,
 	BLOCK_CACHE_BUDGET_BYTES,
 	BoundedDictionaryBuilder,
 	BoundedLabelsPinsStore,
+	BoundedParentArtifactBuilder,
 	BoundedParentChildrenIndex,
 	type CommitMarkerContents,
 	classifyReopen,
@@ -29,6 +31,9 @@ import {
 	isDerivedSessionMemoryFile,
 	LABELS_PINS_BUDGET_BYTES,
 	MAX_REDUCER_INLINE_BYTES,
+	type ParentBucketRecordInput,
+	parentBucketForId,
+	parseParentBucketRecord,
 	ReducerBudget,
 	type ReopenEvidence,
 	RollingTailChainBuilder,
@@ -37,6 +42,7 @@ import {
 	SESSION_MEMORY_ACCEPTANCE_BUDGET_BYTES,
 	SESSION_MEMORY_STEADY_STATE_BUDGET_BYTES,
 	SessionMemoryAccountant,
+	serializeParentBucketRecord,
 	TAIL_BUFFER_BUDGET_BYTES,
 	type TailRecordInput,
 	validateCommit,
@@ -541,6 +547,8 @@ describe("isDerivedSessionMemoryFile", () => {
 			"session.spill.commit",
 			"session.spill.buckets",
 			"session.spill.dict-0",
+			"session.spill.parent-0000",
+			"session.spill.parent-0063",
 			"session.spill.capture-abc.tmp",
 			"session.spill.fork-def.tmp",
 			"session.spill.overlay-ghi.tmp",
@@ -626,7 +634,109 @@ describe("bounded parent→children and labels/pins descriptors", () => {
 		expect(tight.getLabel("kkkkkk")).toBeUndefined();
 		expect(tight.totalBytes).toBe(0);
 	});
+
+	it("deterministically buckets parent ids and round-trips bucket records", () => {
+		expect(parentBucketForId("root", 64)).toBe(parentBucketForId("root", 64));
+		expect(parentBucketForId("a", 64)).toBeGreaterThanOrEqual(0);
+		expect(parentBucketForId("a", 64)).toBeLessThan(64);
+		const record: ParentBucketRecordInput = {
+			parentId: "root",
+			childId: "child-1",
+			ordinal: 2,
+			seq: 2,
+			byteOffset: 4096,
+			byteLength: 123,
+			recordDigest: "0".repeat(64),
+			entryType: "custom",
+		};
+		const line = serializeParentBucketRecord(record);
+		expect(line.endsWith("\n")).toBe(true);
+		const parsed = parseParentBucketRecord(line);
+		expect(parsed).toEqual(record);
+		expect(parseParentBucketRecord("{corrupt\n")).toBeUndefined();
+		expect(parseParentBucketRecord(JSON.stringify({ p: "root", c: "x", o: 1, s: 1, b: 1, l: 1 }))).toBeUndefined();
+	});
+
+	it("indexes parents fully or not at all under every bound", () => {
+		const builder = new BoundedParentArtifactBuilder({
+			maxParents: 3,
+			maxChildrenPerParent: 2,
+			budgetBytes: 10_000,
+			bucketCount: 4,
+		});
+		builder.add(record("root", "a", 0));
+		builder.add(record("root", "b", 1));
+		builder.add(record("root", "c", 2)); // third child → root excluded entirely
+		expect(builder.distinctParents).toBe(0);
+		builder.add(record("p1", "x", 3));
+		builder.add(record("p1", "y", 4));
+		builder.add(record("p2", "z", 5));
+		builder.add(record("p3", "w", 6));
+		builder.add(record("p4", "v", 7)); // global parent capacity exhausted; missing lookup falls back eagerly
+		expect(builder.distinctParents).toBe(3);
+		const result = builder.finish("index-digest");
+		expect(result.metadata.indexDigest).toBe("index-digest");
+		expect(result.excludedParents).toContain("root");
+		expect(result.excludedParents).not.toContain("p4");
+		expect(result.metadata.buckets[parentBucketForId("root", 4)].complete).toBe(false);
+		expect(result.metadata.buckets[parentBucketForId("p4", 4)].complete).toBe(false);
+		// Physical order preserved per parent (bucket grouping may mix parents).
+		const p1 = result.buckets[parentBucketForId("p1", 4)]
+			.map(line => parseParentBucketRecord(line.trimEnd()))
+			.filter(entry => entry?.parentId === "p1");
+		expect(p1.map(entry => entry?.childId)).toEqual(["x", "y"]);
+		const total = result.metadata.buckets.reduce((sum, bucket) => sum + bucket.size, 0);
+		expect(total).toBeGreaterThan(0);
+	});
+
+	it("publishes no record when the first parent exceeds the byte budget", () => {
+		const builder = new BoundedParentArtifactBuilder({
+			maxParents: 10,
+			maxChildrenPerParent: 10,
+			budgetBytes: 1,
+			bucketCount: 4,
+		});
+		builder.add(record("root", "a", 0));
+		expect(builder.distinctParents).toBe(0);
+		expect(builder.totalBytes).toBe(0);
+		const result = builder.finish("d");
+		expect(result.excludedParents).toEqual([]);
+		expect(result.metadata.buckets[parentBucketForId("root", 4)].complete).toBe(false);
+		expect(result.metadata.buckets.every(bucket => bucket.size === 0)).toBe(true);
+	});
+
+	it("digests every non-empty bucket over its exact serialized bytes", () => {
+		const builder = new BoundedParentArtifactBuilder({
+			maxParents: 10,
+			maxChildrenPerParent: 10,
+			budgetBytes: 100_000,
+			bucketCount: 4,
+		});
+		builder.add(record("root", "a", 0));
+		builder.add(record("root", "b", 1));
+		const result = builder.finish("d");
+		const bucket = parentBucketForId("root", 4);
+		const hash = createHash("sha256");
+		for (const line of result.buckets[bucket]) hash.update(line, "utf8");
+		const expectedBytes = result.buckets[bucket].reduce((total, line) => total + Buffer.byteLength(line, "utf8"), 0);
+		expect(result.metadata.buckets[bucket].size).toBe(expectedBytes);
+		expect(result.metadata.buckets[bucket].complete).toBe(true);
+		expect(result.metadata.buckets[bucket].digest).toBe(hash.digest("hex"));
+	});
 });
+
+function record(parentId: string, childId: string, ordinal: number): ParentBucketRecordInput {
+	return {
+		parentId,
+		childId,
+		ordinal,
+		seq: ordinal,
+		byteOffset: ordinal * 100,
+		byteLength: 40,
+		recordDigest: "0".repeat(64),
+		entryType: "custom",
+	};
+}
 
 describe("boundary: accountant enforces the 64 MiB provider peak without retention", () => {
 	it("releases scratch on overflow and leaves later builds possible", () => {

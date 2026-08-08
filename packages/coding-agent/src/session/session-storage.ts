@@ -1469,7 +1469,9 @@ export class FileSessionStorage implements SessionStorage {
 
 	listFilesSync(dir: string, pattern: string): string[] {
 		try {
-			return Array.from(new Bun.Glob(pattern).scanSync(dir)).map(name => path.join(dir, name));
+			return Array.from(new Bun.Glob(pattern).scanSync({ cwd: dir, dot: pattern.startsWith(".") })).map(name =>
+				path.join(dir, name),
+			);
 		} catch {
 			return [];
 		}
@@ -2298,6 +2300,7 @@ function parseFirstJsonlLine(bytes: Uint8Array): Record<string, unknown> | undef
 
 function matchesPattern(name: string, pattern: string): boolean {
 	if (pattern === "*") return true;
+	if (pattern === ".*") return name.startsWith(".");
 	if (pattern.startsWith("*.")) {
 		return name.endsWith(pattern.slice(1));
 	}
