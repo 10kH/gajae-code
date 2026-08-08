@@ -487,6 +487,9 @@ export class CommandController {
 			info += `${theme.fg("dim", "Hot Region:")} ${formatBytes(memory.hotRegionBytes)}\n`;
 			info += `${theme.fg("dim", "Metadata:")} ${formatBytes(memory.metaDescriptorBytes)}\n`;
 			info += `${theme.fg("dim", "Accounted:")} ${formatBytes(memory.totalAccountedBytes)}\n`;
+			if (memory.coldIndexBytes > 0 || memory.coldIndexBlockCacheBytes > 0 || memory.coldEntryCacheBytes > 0) {
+				info += `${theme.fg("dim", "Cold Index/Caches:")} ${formatBytes(memory.coldIndexBytes)} / ${formatBytes(memory.coldIndexBlockCacheBytes)} / ${formatBytes(memory.coldEntryCacheBytes)}\n`;
+			}
 			if (memory.lazyReopenAttempted) {
 				const reopen = memory.lazyReopenSucceeded ? theme.fg("success", "exact") : theme.fg("warning", "fallback");
 				info += `${theme.fg("dim", "Lazy Reopen:")} ${reopen}\n`;

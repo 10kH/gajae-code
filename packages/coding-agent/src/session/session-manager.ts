@@ -458,6 +458,12 @@ export interface SessionMemoryStats {
 	dictionaryArtifactEnabled: boolean;
 	/** Reducer-bucket bytes retained by metadata-delta descriptors (fixed accounting). */
 	metadataDeltaDescriptorBytes: number;
+	/** Live cold index bytes (descriptor size when proven, else 0). */
+	coldIndexBytes: number;
+	/** Live cold block-cache allocated bytes. */
+	coldIndexBlockCacheBytes: number;
+	/** Live cold entry-cache allocated bytes. */
+	coldEntryCacheBytes: number;
 	/** Live observability counters (P7 contract). */
 	coldEntriesRetired: number;
 	coldEntriesReloaded: number;
@@ -13378,6 +13384,9 @@ export class SessionManager {
 				parentArtifactEnabled: false,
 				dictionaryArtifactEnabled: false,
 				metadataDeltaDescriptorBytes: 0,
+				coldIndexBytes: 0,
+				coldIndexBlockCacheBytes: 0,
+				coldEntryCacheBytes: 0,
 				coldEntriesRetired: 0,
 				coldEntriesReloaded: 0,
 				rangeReadCount: 0,
@@ -13415,6 +13424,9 @@ export class SessionManager {
 			parentArtifactEnabled: runtime.parentArtifact !== undefined,
 			dictionaryArtifactEnabled: runtime.dictionary !== undefined,
 			metadataDeltaDescriptorBytes: runtime.metadataDelta?.descriptorBytes ?? 0,
+			coldIndexBytes: runtime.validatedIndexDescriptor?.size ?? 0,
+			coldIndexBlockCacheBytes: runtime.blockCache.allocatedBytes,
+			coldEntryCacheBytes: runtime.entryCache.allocatedBytes,
 			coldEntriesRetired: runtime.coldEntriesRetired,
 			coldEntriesReloaded: runtime.coldEntriesReloaded,
 			rangeReadCount: runtime.rangeReadCount,
