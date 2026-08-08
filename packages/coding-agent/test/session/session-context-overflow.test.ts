@@ -14,7 +14,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as path from "node:path";
-import { Agent, type AgentMessage } from "@gajae-code/agent-core";
+import { Agent, AgentBusyError, type AgentMessage } from "@gajae-code/agent-core";
 import * as compactionModule from "@gajae-code/agent-core/compaction";
 import { getBundledModel } from "@gajae-code/ai";
 import { TempDir } from "@gajae-code/utils";
@@ -360,6 +360,63 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 		expect(recallReadSpy).toHaveBeenCalledTimes(1);
 		expect(session.getPendingNextTurnMessagesForTests()).toEqual([]);
 	});
+	it("preserves pending and recall ownership across AgentBusy before acceptance", async () => {
+		const hindsight = new HindsightSessionState({
+			sessionId: "busy-recall",
+			client: {} as never,
+			bankId: "busy-recall-bank",
+			config: {
+				autoRetain: false,
+				autoRecall: false,
+				mentalModelsEnabled: false,
+				debug: false,
+			} as never,
+			session,
+			missionsSet: new Set(),
+		});
+		hindsight.lastRecallSnippet = "<memories>busy recall</memories>";
+		const recallReadSpy = vi.spyOn(hindsight, "getRecallSnippetForInjection");
+		const recallMarkSpy = vi.spyOn(hindsight, "markRecallSnippetInjected");
+		session.setHindsightSessionState(hindsight);
+		session.queueDeferredMessageForTests(
+			{
+				role: "custom",
+				customType: "busy-pending",
+				content: "preserve until accepted",
+				display: false,
+				attribution: "agent",
+				timestamp: Date.now(),
+			},
+			false,
+		);
+		const submitted: AgentMessage[][] = [];
+		vi.spyOn(session.agent, "waitForIdle").mockResolvedValue(undefined);
+		const promptSpy = vi
+			.spyOn(session.agent, "prompt")
+			.mockImplementationOnce(async messages => {
+				submitted.push(messages as AgentMessage[]);
+				throw new AgentBusyError();
+			})
+			.mockImplementationOnce(async (messages, options) => {
+				submitted.push(messages as AgentMessage[]);
+				if (!Array.isArray(options)) options?.onRunAccepted?.();
+			});
+
+		await session.prompt("busy");
+
+		expect(promptSpy).toHaveBeenCalledTimes(2);
+		for (const messages of submitted) {
+			expect(
+				messages.filter(message => message.role === "custom" && message.customType === "busy-pending"),
+			).toHaveLength(1);
+			expect(
+				messages.filter(message => message.role === "custom" && message.customType === "hindsight-recall"),
+			).toHaveLength(1);
+		}
+		expect(recallReadSpy).toHaveBeenCalledTimes(1);
+		expect(recallMarkSpy).toHaveBeenCalledTimes(1);
+		expect(session.getPendingNextTurnMessagesForTests()).toEqual([]);
+	});
 	it("does not replay pending next-turn context after an accepted provider failure", async () => {
 		session.queueDeferredMessageForTests(
 			{
@@ -372,6 +429,23 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 			},
 			false,
 		);
+		const hindsight = new HindsightSessionState({
+			sessionId: "accepted-failure-recall",
+			client: {} as never,
+			bankId: "accepted-failure-recall-bank",
+			config: {
+				autoRetain: false,
+				autoRecall: false,
+				mentalModelsEnabled: false,
+				debug: false,
+			} as never,
+			session,
+			missionsSet: new Set(),
+		});
+		hindsight.lastRecallSnippet = "<memories>accepted failure recall</memories>";
+		const recallReadSpy = vi.spyOn(hindsight, "getRecallSnippetForInjection");
+		const recallMarkSpy = vi.spyOn(hindsight, "markRecallSnippetInjected");
+		session.setHindsightSessionState(hindsight);
 		const submitted: AgentMessage[][] = [];
 		const providerFailure = new Error("accepted provider failure");
 		const promptSpy = vi
@@ -395,6 +469,11 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 				message => message.role === "custom" && message.customType === "accepted-failure-pending",
 			),
 		).toEqual([]);
+		expect(
+			submitted[1]?.filter(message => message.role === "custom" && message.customType === "hindsight-recall"),
+		).toEqual([]);
+		expect(recallReadSpy).toHaveBeenCalledTimes(2);
+		expect(recallMarkSpy).toHaveBeenCalledTimes(1);
 	});
 	it("rethrows the original overflow after one failed forced compaction without continuation", async () => {
 		await session.dispose();
