@@ -12731,6 +12731,7 @@ export class SessionManager {
 		const neighboringParents = new BoundedParentChildrenIndex();
 		let collectNeighboringParents = false;
 		const neighboringIndexes = new Map<string, { index: ColdEntryIndex; bytes: number }>();
+		let neighboringParentsComplete = true;
 		const failure = scanTranscriptLinesBounded(this.storage, runtime.indexPath, size, (_offset, lineBytes) => {
 			try {
 				const value = JSON.parse(Buffer.from(lineBytes.subarray(0, lineBytes.byteLength - 1)).toString("utf8")) as {
@@ -12752,7 +12753,10 @@ export class SessionManager {
 					if (childIds.length >= PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT) return false;
 					childIds.push(value.id);
 				} else if (collectNeighboringParents && value.parentId !== null) {
-					neighboringParents.add(value.parentId, value.id);
+					if (!neighboringParents.add(value.parentId, value.id)) {
+						neighboringParentsComplete = false;
+						collectNeighboringParents = false;
+					}
 					if (
 						typeof value.ordinal === "number" &&
 						typeof value.seq === "number" &&
@@ -12794,24 +12798,25 @@ export class SessionManager {
 		if (runtime.blockCache.tryAllocate(cacheBytes)) {
 			runtime.parentChildrenCache.set(parentId, { ids: [...childIds], bytes: cacheBytes, descriptor: indexStat });
 		}
-		for (const neighbor of neighboringParents.entries()) {
-			if (runtime.parentChildrenCache.has(neighbor.parentId)) continue;
-			const neighborBytes =
-				residentStringBytes(neighbor.parentId) +
-				48 +
-				neighbor.children.reduce((total, id) => total + residentStringBytes(id) + 8, 0);
-			for (const childId of neighbor.children) {
-				const childIndex = neighboringIndexes.get(childId);
-				if (childIndex && !runtime.coldEntries.has(childId) && runtime.blockCache.tryAllocate(childIndex.bytes))
-					runtime.coldEntries.set(childId, childIndex.index);
+		if (neighboringParentsComplete)
+			for (const neighbor of neighboringParents.entries()) {
+				if (runtime.parentChildrenCache.has(neighbor.parentId)) continue;
+				const neighborBytes =
+					residentStringBytes(neighbor.parentId) +
+					48 +
+					neighbor.children.reduce((total, id) => total + residentStringBytes(id) + 8, 0);
+				for (const childId of neighbor.children) {
+					const childIndex = neighboringIndexes.get(childId);
+					if (childIndex && !runtime.coldEntries.has(childId) && runtime.blockCache.tryAllocate(childIndex.bytes))
+						runtime.coldEntries.set(childId, childIndex.index);
+				}
+				if (!runtime.blockCache.tryAllocate(neighborBytes)) break;
+				runtime.parentChildrenCache.set(neighbor.parentId, {
+					ids: neighbor.children,
+					bytes: neighborBytes,
+					descriptor: indexStat,
+				});
 			}
-			if (!runtime.blockCache.tryAllocate(neighborBytes)) break;
-			runtime.parentChildrenCache.set(neighbor.parentId, {
-				ids: neighbor.children,
-				bytes: neighborBytes,
-				descriptor: indexStat,
-			});
-		}
 		return children;
 	}
 

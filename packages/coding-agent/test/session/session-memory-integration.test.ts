@@ -2307,6 +2307,54 @@ describe("sidecar I/O fallback", () => {
 			await manager.close();
 		}
 	});
+	it("does not cache a truncated neighboring parent block", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/cold-children-overflow.jsonl";
+		const children = Array.from({ length: 257 }, (_, index) => ({
+			type: "custom",
+			id: `overflow-child-${index}`,
+			parentId: "overflow-parent",
+			timestamp: "0",
+			customType: "node",
+			data: {},
+		}));
+		storage.writeTextSync(
+			sessionFile,
+			`${[
+				{ type: "session", version: 5, id: "cold-children-overflow", timestamp: "0", cwd: "/cwd" },
+				{ type: "custom", id: "root", parentId: null, timestamp: "0", customType: "node", data: {} },
+				{ type: "custom", id: "overflow-parent", parentId: "root", timestamp: "0", customType: "node", data: {} },
+				...children,
+				{ type: "custom", id: "active", parentId: "root", timestamp: "0", customType: "node", data: {} },
+				{
+					type: "compaction",
+					id: "active-compaction",
+					parentId: "active",
+					timestamp: "0",
+					summary: "summary",
+					firstKeptEntryId: "active",
+					tokensBefore: 1,
+				},
+			]
+				.map(record => JSON.stringify(record))
+				.join("\n")}\n`,
+		);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(manager.getChildren("root").map(entry => entry.id)).toEqual(["overflow-parent", "active"]);
+			expect(manager.parentChildrenCacheKeysForTests()).not.toContain("overflow-parent");
+			expect(manager.getChildren("overflow-parent")).toHaveLength(257);
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
+		} finally {
+			await manager.close();
+		}
+	});
 	it("preserves the tail truncation fsync error when close also fails", async () => {
 		class TailTruncationFailureStorage extends MemorySessionStorage {
 			tailWriterCount = 0;
