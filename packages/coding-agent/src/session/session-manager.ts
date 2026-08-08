@@ -9741,6 +9741,8 @@ export class SessionManager {
 		}
 		const decoder = new TextDecoder("utf-8");
 		let carry = "";
+		const recent = new Map<string, { index: ColdEntryIndex; bytes: number }>();
+		let recentBytes = 0;
 		for (let offset = 0; offset < size; offset += 64 * 1024) {
 			const length = Math.min(64 * 1024, size - offset);
 			let bytes: Uint8Array;
@@ -9775,10 +9777,23 @@ export class SessionManager {
 								: {}),
 							...(typeof value.entryType === "string" ? { entryType: value.entryType } : {}),
 						};
-						if (!runtime.coldEntries.has(value.id) && runtime.blockCache.tryAllocate(line.length * 2 + 48)) {
-							runtime.coldEntries.set(value.id, found);
+						const residentBytes = line.length * 2 + 48;
+						recent.set(value.id, { index: found, bytes: residentBytes });
+						recentBytes += residentBytes;
+						while (recentBytes > runtime.blockCache.budgetBytes && recent.size > 1) {
+							const oldestId = recent.keys().next().value;
+							if (typeof oldestId !== "string") break;
+							const removed = recent.get(oldestId);
+							recent.delete(oldestId);
+							if (removed) recentBytes -= removed.bytes;
 						}
-						if (value.id === id) return found;
+						if (value.id === id) {
+							for (const [candidateId, candidate] of recent) {
+								if (!runtime.coldEntries.has(candidateId) && runtime.blockCache.tryAllocate(candidate.bytes))
+									runtime.coldEntries.set(candidateId, candidate.index);
+							}
+							return found;
+						}
 					}
 				} catch {
 					// A corrupt disposable index line is ignored; transcript remains authoritative.
