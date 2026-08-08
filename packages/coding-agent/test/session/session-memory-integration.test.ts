@@ -781,9 +781,16 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 			message: { role: "user", content: "cold old", timestamp: 1 },
 		},
 		{
+			type: "thinking_level_change",
+			id: "cold-thinking",
+			parentId: "cold-old",
+			timestamp: now,
+			thinkingLevel: "high",
+		},
+		{
 			type: "message",
 			id: "cold-kept",
-			parentId: "cold-old",
+			parentId: "cold-thinking",
 			timestamp: now,
 			message: { role: "user", content: "cold kept", timestamp: 2 },
 		},
@@ -838,6 +845,7 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 		if (cold?.type !== "message" || !("content" in cold.message)) throw new Error("Expected cold message entry");
 		expect(cold.message.content).toBe("cold old");
 		expect(manager.buildSessionContext().messages).toHaveLength(3);
+		expect(manager.buildSessionContext().thinkingLevel).toBe("high");
 		expect(manager.getLabel("cold-old")).toBe("cold label");
 		expect(manager.getUsageStatistics()).toMatchObject({
 			input: 5,
@@ -854,7 +862,7 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 			leafId: string;
 			indexDigest: string;
 		};
-		expect(marker.base.baseEndOffset).toBe(transcript.indexOf(`${JSON.stringify(records[2])}\n`));
+		expect(marker.base.baseEndOffset).toBe(transcript.indexOf(`${JSON.stringify(records[3])}\n`));
 		expect(marker.base.baseDigest).toMatch(/^[0-9a-f]{64}$/);
 		expect(marker.transcriptSize).toBe(Buffer.byteLength(transcript, "utf8"));
 		expect(marker.retirementFirstKeptEntryId).toBe("cold-kept");
@@ -901,6 +909,7 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 		storage.writeTextSync(sidecarPath(sessionFile, "idx"), exactIndexText);
 		expect(reopened.getEntry("cold-old")).toMatchObject({ id: "cold-old", type: "message" });
 		expect(reopened.buildSessionContext().messages).toHaveLength(3);
+		expect(reopened.buildSessionContext().thinkingLevel).toBe("high");
 		expect(reopened.getUsageStatistics()).toMatchObject({ cost: 12 });
 	} finally {
 		await reopened.close();

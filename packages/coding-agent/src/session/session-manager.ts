@@ -874,6 +874,8 @@ interface BoundedFirstOpenDiscovery {
 	usageStatistics: UsageStatistics;
 	/** Current label state derived from `label` entries in chain order. */
 	labels: Array<[string, string]>;
+	/** Latest provider-affecting entries, bounded by the reducer reservation. */
+	providerStateEntries: SessionEntry[];
 }
 
 type BoundedLineScanFailure = "read_failed" | "oversized_line" | "unterminated" | "aborted";
@@ -6737,6 +6739,8 @@ export class SessionManager {
 		const seenIds = new BoundedFirstOpenIdSet();
 		const labelsById = new Map<string, string>();
 		let labelsBytes = 0;
+		const providerState = new Map<string, { ordinal: number; entry: SessionEntry; bytes: number }>();
+		let providerStateBytes = 0;
 		const usageStatistics: UsageStatistics = {
 			input: 0,
 			output: 0,
@@ -6867,6 +6871,17 @@ export class SessionManager {
 					if (usage !== undefined && !addUsage(validatePersistedUsageTotals(usage)))
 						return fail("bounded_scan_unsupported");
 				}
+				const providerEntry = record as unknown as SessionEntry;
+				const providerKey = providerStateEntryKey(providerEntry);
+				if (providerKey) {
+					const bytes = lineBytes.byteLength + 64;
+					const previous = providerState.get(providerKey);
+					const nextBytes = providerStateBytes - (previous?.bytes ?? 0) + bytes;
+					if (providerState.size >= 256 && !previous) return fail("bounded_scan_budget");
+					if (nextBytes > REDUCER_BUDGET_BYTES) return fail("bounded_scan_budget");
+					providerStateBytes = nextBytes;
+					providerState.set(providerKey, { ordinal, entry: providerEntry, bytes });
+				}
 				lastId = record.id;
 				if ((ordinal & 4095) === 0) Bun.gc(true);
 			},
@@ -6910,6 +6925,9 @@ export class SessionManager {
 			reducer,
 			usageStatistics,
 			labels: [...labelsById],
+			providerStateEntries: [...providerState.values()]
+				.sort((left, right) => left.ordinal - right.ordinal)
+				.map(item => item.entry),
 		};
 	}
 
@@ -7078,6 +7096,7 @@ export class SessionManager {
 			runtime.tail = tail;
 			runtime.retirementFirstKeptEntryId = discovery.retirementFirstKeptEntryId;
 			runtime.reducer = discovery.reducer;
+			runtime.providerStateEntries = discovery.providerStateEntries.map(cloneSessionEntry);
 			runtime.hotSuffixBytes = hotSuffixBytes;
 
 			runtime.indexDigest = runtime.indexHash.copy().digest("hex");
@@ -9322,10 +9341,6 @@ export class SessionManager {
 
 	#buildDisposableSidecarsUnsafe(entries: readonly FileEntry[]): void {
 		const runtime = this.#resetSidecarRuntime();
-		if (this.destination.kind === "managed") {
-			runtime.sidecarIneligible = true;
-			return;
-		}
 		if (
 			!this.#sessionFile ||
 			!runtime.indexPath ||
@@ -9346,12 +9361,20 @@ export class SessionManager {
 		let active = this.#leafId ? this.#byId.get(this.#leafId) : undefined;
 		let activeSteps = 0;
 		const providerState = new Map<string, { order: number; entry: SessionEntry }>();
+		let providerStateBytes = 0;
 		while (active && activeSteps <= sessionEntries.length) {
 			const ordinal = sessionEntries.length - activeSteps - 1;
 			if (!activeCompaction && active.type === "compaction") activeCompaction = active;
 			const providerKey = providerStateEntryKey(active);
-			if (providerKey && !providerState.has(providerKey))
+			if (providerKey && !providerState.has(providerKey)) {
+				const bytes = Buffer.byteLength(JSON.stringify(active), "utf8") + 64;
+				if (providerStateBytes + bytes > REDUCER_BUDGET_BYTES) {
+					runtime.sidecarIneligible = true;
+					return;
+				}
+				providerStateBytes += bytes;
 				providerState.set(providerKey, { order: activeSteps, entry: cloneSessionEntry(active) });
+			}
 			if (active.type === "model_change" && runtime.reducer.modelChange.latest === undefined) {
 				runtime.reducer = applyReducerDelta(runtime.reducer, {
 					kind: "latest_model_change",
