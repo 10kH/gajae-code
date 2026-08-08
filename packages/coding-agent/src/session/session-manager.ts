@@ -969,7 +969,7 @@ function scanTranscriptLinesBounded(
 				const failure = consumer.consume(chunk, pos);
 				if (failure) return failure;
 				pos += length;
-				const gcIntervalBytes = consumer.hasLargePendingLine() ? 20 * 1024 * 1024 : 4 * 1024 * 1024;
+				const gcIntervalBytes = consumer.hasLargePendingLine() ? 23 * 1024 * 1024 : 4 * 1024 * 1024;
 				if (pos % gcIntervalBytes === 0) Bun.gc(true);
 			}
 			const after = fs.fstatSync(fd, { bigint: true });
@@ -1017,7 +1017,7 @@ function scanTranscriptLinesBounded(
 		const failure = consumer.consume(Buffer.from(chunk), pos);
 		if (failure) return failure;
 		pos += length;
-		const gcIntervalBytes = consumer.hasLargePendingLine() ? 20 * 1024 * 1024 : 4 * 1024 * 1024;
+		const gcIntervalBytes = consumer.hasLargePendingLine() ? 23 * 1024 * 1024 : 4 * 1024 * 1024;
 		if (pos % gcIntervalBytes === 0) Bun.gc(true);
 	}
 	return consumer.finish(allowUnterminated);
