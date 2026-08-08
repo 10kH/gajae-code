@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- SDK snapshot spill writes now retry once with a fresh temporary file when Bun reports `EBADF` during write or `fsync` under heavily contended descriptor teardown, and no longer fail when `close()` reports `EBADF` after a successful write and sync. The atomic writer removes the abandoned attempt before retrying, preserves primary I/O failures, accepts only the proven already-closed close case, and keeps every non-`EBADF` error or repeated descriptor failure fatal.
+- ACP now imports the synthetic model-profile provider namespace from a dependency-free SDK constant module, keeping the machine entrypoint out of model-registry, session-host, MCP-manager, and extension-runner closures enforced by `check:runtime`.
+
 ## [0.12.17] - 2026-08-08
 
 ## [0.12.16] - 2026-08-08
@@ -41,6 +46,7 @@
 - `sticky-viewport-showcase.test.ts` runs in ~53s instead of ~192s, cutting the slowest CI test shard from ~369s to ~167s locally. Each of its 17 cases spawned a `bun` subprocess that re-rendered all 20 showcase frames (~9.4s per capture, ~187s of the file's ~192s) purely to obtain a pristine bundle it then corrupted. The bundle is now captured once and handed out as filesystem copies; the one case that must observe mutated `GJC_STICKY_VIEWPORT_ORACLE_COMMIT` state still captures for itself. Isolation is load-bearing and verified: sharing the directory instead of copying it fails 9 cases.
 
 ### Fixed
+- Telegram topic archival no longer corrupts the shared topic registry when an active topic first enters disconnect grace. `beginArchive` changed `authorityState` to `archive_pending` but retained `disconnectGraceExpiresAt`, a field the persisted-state parser permits only for `disconnect_grace`; one closed or stale session therefore made the entire otherwise-valid registry unreadable, after which every daemon scan reported `shared topic authority unavailable` and no new session could create a thread or replay a message. Every transition out of disconnect grace now clears the grace-only deadline before persistence. `DAEMON_GENERATION` bumped to 57.
 
 - `notifications-topic-registry.test.ts` pins `DAEMON_GENERATION` at 54 after #3965 (was stale at 53; Dev CI run 31133356543).
 - `smithery-env-trust.test.ts` no longer awaits hung probe pipes past a hard per-attempt deadline: minimal child env, `stdin: "ignore"`, SIGKILL + settled race, and up to 2 timeout-only retries. Fixes the inherited-config case that hit exactly 60001ms on Dev CI run 31133356543 after kill-at-45s left `Promise.all` on stdout/stderr unresolved. Assertions unchanged.

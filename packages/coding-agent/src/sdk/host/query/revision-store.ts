@@ -1084,16 +1084,38 @@ export class RevisionStore {
 	}
 
 	async #writeAtomic(file: string, data: Buffer): Promise<void> {
-		const temporary = `${file}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+		for (let attempt = 0; attempt < 2; attempt++) {
+			const temporary = `${file}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+			try {
+				await this.#writeAtomicAttempt(temporary, data);
+				await chmod(temporary, 0o600);
+				await rename(temporary, file);
+				return;
+			} catch (error) {
+				await rm(temporary, { force: true }).catch(() => undefined);
+				if ((error as NodeJS.ErrnoException).code !== "EBADF" || attempt === 1) throw error;
+			}
+		}
+	}
+
+	async #writeAtomicAttempt(temporary: string, data: Buffer): Promise<void> {
 		const handle = await open(temporary, "w", 0o600);
+		let failure: { error: unknown } | undefined;
 		try {
 			await handle.writeFile(data);
 			await handle.sync();
-		} finally {
-			await handle.close();
+		} catch (error) {
+			failure = { error };
 		}
-		await chmod(temporary, 0o600);
-		await rename(temporary, file);
+		try {
+			await handle.close();
+		} catch (error) {
+			// Bun can report EBADF when concurrent descriptor teardown has already
+			// closed a fully written and fsynced handle. Preserve every primary write
+			// failure and keep all other close errors fatal.
+			if ((error as NodeJS.ErrnoException).code !== "EBADF" && failure === undefined) failure = { error };
+		}
+		if (failure !== undefined) throw failure.error;
 	}
 
 	#retainSpill(revision: Revision): void {
