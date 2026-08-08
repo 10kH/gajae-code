@@ -6957,6 +6957,10 @@ export class SessionManager {
 				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
 				return undefined;
 			}
+			if (!indexWriter?.fsyncSync || !tailWriter?.fsyncSync)
+				throw new Error("Synchronous sidecar fsync is unavailable");
+			indexWriter.fsyncSync();
+			tailWriter.fsyncSync();
 			if (!runtime.tailCache.tryAllocate(tailResidentBytes)) {
 				this.#lazyReopenFallbackReason = "bounded_scan_budget";
 				return undefined;
