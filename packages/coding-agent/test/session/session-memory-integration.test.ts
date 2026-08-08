@@ -1039,7 +1039,7 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 			lastReopenTransition: { kind: "exact", reason: "descriptor_and_proof_match" },
 		});
 		storage.writeTextSync(sidecarPath(sessionFile, "idx"), `${exactIndexText}{}\n`);
-		expect(reopened.getEntry("cold-old")).toBeUndefined();
+		expect(reopened.getEntry("cold-old")).toMatchObject({ id: "cold-old", type: "message" });
 		storage.writeTextSync(sidecarPath(sessionFile, "idx"), exactIndexText);
 		expect(reopened.getEntry("cold-old")).toMatchObject({ id: "cold-old", type: "message" });
 		expect(reopened.buildSessionContext().messages).toHaveLength(3);
@@ -1066,11 +1066,11 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 		"enabled",
 	);
 	try {
-		expect(storage.textReads).toBeGreaterThan(0);
 		expect(corruptIndex.getSessionMemoryStats()).toMatchObject({
 			lazyReopenAttempted: true,
-			lazyReopenSucceeded: false,
-			lazyReopenFallbackReason: "index_digest_mismatch",
+			lazyReopenSucceeded: true,
+			lazyReopenFallbackReason: undefined,
+			lastReopenTransition: { kind: "rebuild", reason: "bounded_first_open" },
 		});
 		expect(corruptIndex.getEntry("cold-old")).toMatchObject({ id: "cold-old", type: "message" });
 	} finally {

@@ -1355,7 +1355,7 @@ function scanTranscriptLinesBounded(
 	const chunkBytes =
 		size > PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES
 			? reuseLineAssembly
-				? 324 * 1024
+				? 320 * 1024
 				: 256 * 1024
 			: TRANSCRIPT_CAPTURE_CHUNK_BYTES;
 	if (storage instanceof FileSessionStorage) {
@@ -10878,6 +10878,7 @@ export class SessionManager {
 		const hash = crypto.createHash("sha256");
 		const decoder = new TextDecoder("utf-8");
 		let carry = "";
+		let carryBytes: Uint8Array | undefined;
 		let found: ColdEntryIndex | undefined;
 		let residentBytes = 0;
 		for (let offset = 0; offset < committed.size; offset += 64 * 1024) {
@@ -10889,19 +10890,14 @@ export class SessionManager {
 				return undefined;
 			}
 			hash.update(bytes);
-			const text =
-				carry +
-				decoder.decode(bytes, {
-					stream: offset + length < committed.size,
-				});
-			const lines = text.split("\n");
-			carry = lines.pop() ?? "";
-			for (const line of lines) {
-				if (!line) continue;
+			const text = decoder.decode(bytes, { stream: offset + length < committed.size });
+			let lineStart = 0;
+			let newline = text.indexOf("\n");
+			const dispatchLine = (line: string): boolean => {
 				const record = parseDictionaryPartitionRecord(line);
-				if (!record) return undefined;
-				if (record.term !== id) continue;
-				if (record.dictId < 0) return undefined;
+				if (!record) return false;
+				if (record.term !== id) return true;
+				if (record.dictId < 0) return false;
 				found = {
 					ordinal: record.ordinal,
 					seq: record.seq,
@@ -10912,8 +10908,22 @@ export class SessionManager {
 					...(record.entryType.length > 0 ? { entryType: record.entryType } : {}),
 				};
 				residentBytes = line.length * 2 + 48;
+				return true;
+			};
+			while (newline >= 0) {
+				const line =
+					carry === "" && carryBytes === undefined
+						? text.slice(lineStart, newline)
+						: `${carry}${text.slice(lineStart, newline)}`;
+				carry = "";
+				carryBytes = undefined;
+				if (!dispatchLine(line)) return undefined;
+				lineStart = newline + 1;
+				newline = text.indexOf("\n", lineStart);
 			}
+			carry = `${carry}${text.slice(lineStart)}`;
 		}
+		if (carry !== "") return undefined;
 		if (hash.digest("hex") !== committed.digest) return undefined;
 		if (!found) return undefined;
 		if (!runtime.coldEntries.has(id) && runtime.blockCache.tryAllocate(residentBytes))
@@ -11059,6 +11069,12 @@ export class SessionManager {
 			return false;
 		}
 		if (commit === undefined) {
+			const providerKeys = new Set<string>();
+			for (const entry of runtime.providerStateEntries) {
+				const key = providerStateEntryKey(entry);
+				if (!key || providerKeys.has(key)) return false;
+				providerKeys.add(key);
+			}
 			runtime.metadataDelta = undefined;
 			runtime.providerStateOrder = runtime.providerStateEntries
 				.map(providerStateEntryKey)
@@ -11850,7 +11866,7 @@ export class SessionManager {
 			return this.#byId.get(id);
 		};
 		const index = this.#findColdEntryIndex(id);
-		if (!index) return undefined;
+		if (!index) return fail();
 		const bytes = this.#readColdEntryRange(index);
 		if (!bytes) return fail();
 		if (computeLineDigest(bytes) !== index.recordDigest) return fail();
@@ -12056,7 +12072,10 @@ export class SessionManager {
 		if (!this.#sessionFile) throw new Error("cold_transcript_unavailable");
 		const entries = parseSessionEntries(this.storage.readTextSync(this.#sessionFile));
 		const header = entries[0];
-		if (header?.type !== "session") throw new Error("cold_transcript_header_invalid");
+		if (header?.type !== "session" || header.version !== CURRENT_SESSION_VERSION) {
+			throw new Error("cold_transcript_header_invalid");
+		}
+		if (!hasStrictSessionSchema(entries)) throw new Error("cold_transcript_schema_invalid");
 		const migrationApplied = migrateToCurrentVersion(entries);
 		for (const entry of entries) residentizePersistedBlobRefs(entry);
 		const transition = this.#prepareResidentTextStoreTransition(
@@ -12231,7 +12250,7 @@ export class SessionManager {
 	#generateEntryId(): string {
 		const runtime = this.#sidecarRuntime;
 		if (!this.#coldSidecarActive() || !runtime) return generateId(this.#byId);
-		if (runtime.dictionary)
+		if (runtime.dictionary && this.#coldIndexDigestValid())
 			return generateId({ has: id => this.#byId.has(id) || this.#findColdEntryIndex(id, false) !== undefined });
 		const hashes = this.#ensureColdIdHashes();
 		if (!hashes) {
@@ -15878,9 +15897,7 @@ export class SessionManager {
 			(_offset, lineBytes) => {
 				preflightHash.update(lineBytes);
 				try {
-					const record = JSON.parse(
-						Buffer.from(lineBytes.subarray(0, lineBytes.byteLength - 1)).toString("utf8"),
-					) as FileEntry | SessionPatchRecord;
+					const record = JSON.parse(decodeBoundedJsonLine(lineBytes)) as FileEntry | SessionPatchRecord;
 					if (ordinal++ === 0) {
 						if (
 							record.type !== "session" ||
@@ -15980,9 +15997,7 @@ export class SessionManager {
 						staged.writeLine(lineBytes.subarray(0, lineBytes.byteLength - 1));
 						return;
 					}
-					const record = JSON.parse(
-						Buffer.from(lineBytes.subarray(0, lineBytes.byteLength - 1)).toString("utf8"),
-					) as SessionEntry | SessionPatchRecord;
+					const record = JSON.parse(decodeBoundedJsonLine(lineBytes)) as SessionEntry | SessionPatchRecord;
 					if (record.type === "header_patch" || record.type === "entry_patch") return;
 					if (record.type === "message") {
 						const patch = entryPatches.get(record.id);
@@ -16055,9 +16070,7 @@ export class SessionManager {
 		try {
 			snapshot.forEachLine(line => {
 				if (rejected || line.byteLength === 0) return;
-				const record = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(line)) as
-					| FileEntry
-					| SessionPatchRecord;
+				const record = JSON.parse(decodeBoundedJsonLine(line)) as FileEntry | SessionPatchRecord;
 				if (ordinal++ === 0) {
 					if (
 						record.type !== "session" ||
@@ -16123,9 +16136,7 @@ export class SessionManager {
 					staged.writeLine(line);
 					return;
 				}
-				const record = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(line)) as
-					| SessionEntry
-					| SessionPatchRecord;
+				const record = JSON.parse(decodeBoundedJsonLine(line)) as SessionEntry | SessionPatchRecord;
 				if (record.type === "header_patch" || record.type === "entry_patch") return;
 				if (record.type === "message") {
 					const patch = entryPatches.get(record.id);
