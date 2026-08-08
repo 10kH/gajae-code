@@ -138,6 +138,17 @@ describe("R3 synchronous context preflight (D5/D5a)", () => {
 		expect(smallManager.buildSessionContext().messages.length).toBe(1);
 	});
 
+	it("buildPreparedNewSessionContext propagates the typed synchronous overflow", async () => {
+		const manager = SessionManager.inMemory();
+		const prepared = await manager.prepareNewSession();
+		try {
+			manager.appendPreparedCustomMessageEntry(prepared, "oversized", BIG_TEXT, true);
+			expect(() => manager.buildPreparedNewSessionContext(prepared)).toThrow(SessionContextTooLargeError);
+		} finally {
+			await manager.discardPreparedNewSession(prepared);
+			await manager.close();
+		}
+	});
 	it("strict inspection maps a builder overflow to a discriminated context_too_large result, never malformed", async () => {
 		const tempDir = TempDir.createSync("@pi-context-overflow-inspect-");
 		try {
