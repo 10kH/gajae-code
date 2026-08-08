@@ -416,7 +416,6 @@ import type {
 	RecoveryHydrationPromotionFence,
 	SessionContext,
 	SessionEntry,
-	SessionManager,
 	SessionManagerCloseOutcome,
 	SessionMemoryStats,
 } from "./session-manager";
@@ -428,6 +427,7 @@ import {
 	getSessionMessageObservationId,
 	SessionAppendPersistenceError,
 	SessionContextTooLargeError,
+	SessionManager,
 	transferSessionMessageIdentity,
 } from "./session-manager";
 import { getEntriesForInternalRead, getSessionContextForInternalRead } from "./session-manager-internal";
@@ -1754,7 +1754,7 @@ function agentContinueBusyRescheduleDelayMs(attempt: number): number {
 
 export class AgentSession {
 	readonly agent: Agent;
-	readonly sessionManager: SessionManager;
+	sessionManager: SessionManager;
 	readonly settings: Settings;
 	readonly notificationSessionController: NotificationSessionController | undefined;
 	readonly taskDepth: number;
@@ -10635,19 +10635,56 @@ export class AgentSession {
 			// Flush current session to ensure all entries are written
 			await this.sessionManager.flush();
 
-			// Prepare the copied successor and complete local:// readiness while all
-			// public manager getters remain bound to the predecessor.
-			const prepared = await this.sessionManager.prepareFork();
-			if (!prepared) {
-				return false;
-			}
-			try {
-				await initializeLocalRoot(this.#localProtocolOptions(prepared));
-				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
-				this.sessionManager.commitPreparedNewSession(prepared);
+			const boundedColdForkEligible =
+				this.sessionManager.getSessionMemoryStats().coldRetirementActive &&
+				!this.sessionManager.isManagedDestination() &&
+				previousSessionFile !== undefined;
+			if (boundedColdForkEligible) {
+				const previousManager = this.sessionManager;
+				const forkedManager = await SessionManager.forkFrom(
+					previousSessionFile,
+					previousManager.getCwd(),
+					SessionManager.explicitDestination(previousManager.getSessionDir()),
+					undefined,
+					"copy-retain",
+					this.settings.get("sessionMemory.mode"),
+				);
+				try {
+					await initializeLocalRoot({
+						getArtifactsDir: () => forkedManager.getArtifactsDir(),
+						isManagedDestination: () => false,
+						getManagedLegacyLocalMigrationSource: () => null,
+						getSessionId: () => forkedManager.getSessionId(),
+					});
+					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
+				} catch (error) {
+					const forkedFile = forkedManager.getSessionFile();
+					await forkedManager.close();
+					if (forkedFile) await previousManager.discardUncommittedSession(forkedFile);
+					throw error;
+				}
+				this.sessionManager = forkedManager;
+				try {
+					await previousManager.close();
+				} catch (error) {
+					logger.warn("Previous session close failed after bounded fork adoption", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
 				await this.#runToolSessionTransitionCleanups();
-			} catch (error) {
-				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
+			} else {
+				// Prepare the copied successor and complete local:// readiness while all
+				// public manager getters remain bound to the predecessor.
+				const prepared = await this.sessionManager.prepareFork();
+				if (!prepared) return false;
+				try {
+					await initializeLocalRoot(this.#localProtocolOptions(prepared));
+					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
+					this.sessionManager.commitPreparedNewSession(prepared);
+					await this.#runToolSessionTransitionCleanups();
+				} catch (error) {
+					throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
+				}
 			}
 			this.#syncAgentSessionId();
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
