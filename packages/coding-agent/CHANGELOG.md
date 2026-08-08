@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.19] - 2026-08-08
+
 ### Fixed
 
 - Telegram topic-registry archive transitions remain parser-valid across durable-fence load promotion and failed archive-publication rollback. The initial generation-57 fix cleared `disconnectGraceExpiresAt` on direct archive transitions, but loading a `disconnect_grace` record superseded by a newer durable fence could still promote it to `archive_pending` while retaining the grace-only field, and rollback could restore `disconnect_grace` without restoring its required deadline. Both paths now preserve the state/field invariant with parser-roundtrip coverage. This entry also corrects the hotfix attribution omitted from the published 0.12.18 release notes. `DAEMON_GENERATION` bumped to 58.
