@@ -68,12 +68,12 @@ export const TAIL_BUFFER_BUDGET_BYTES = 4 * 1024 * 1024;
 /** Bounded forward-scan window for transcript-ahead recovery (R2.4). */
 export const INDEX_TAIL_SCAN_MAX_BYTES = 4 * 1024 * 1024;
 
-/** Dictionary build peak (4 × 4 MiB partition buffers + 4 MiB bucket flush). */
+/** Dictionary build acceptance cap; default buffers stay well below this 20 MiB maximum. */
 export const DICTIONARY_BUILD_PEAK_BYTES = 20 * 1024 * 1024;
 /** One dictionary partition buffer. */
-export const DICTIONARY_PARTITION_BUFFER_BYTES = 4 * 1024 * 1024;
+export const DICTIONARY_PARTITION_BUFFER_BYTES = 128 * 1024;
 /** Dictionary bucket journal flush buffer. */
-export const DICTIONARY_BUCKET_JOURNAL_BYTES = 4 * 1024 * 1024;
+export const DICTIONARY_BUCKET_JOURNAL_BYTES = 128 * 1024;
 
 /** Bounded parent→children index bounds. */
 export const PARENT_CHILDREN_MAX_PARENTS = 4096;
@@ -361,13 +361,14 @@ export class ReducerBudget {
 
 const SPILL_SEGMENT = ".spill.";
 const DERIVED_SUFFIXES = new Set(["idx", "tail", "commit", "buckets"]);
-const DERIVED_PREFIXES = ["dict-", "capture-", "fork-", "overlay-", "parent-"];
+const DERIVED_PREFIXES = ["dict-", "capture-", "fork-", "overlay-", "parent-", "metadata-"];
 
 /**
  * Single source of truth for every sidecar artifact and temp: `*.spill.idx`,
  * `*.spill.tail`, `*.spill.commit`, `*.spill.buckets`, `*.spill.dict-*`,
  * `*.spill.capture-*`, `*.spill.fork-*`, `*.spill.overlay-*`,
- * `*.spill.parent-*` (persistent parent→children buckets), and any
+ * `*.spill.parent-*` (persistent parent→children buckets),
+ * `*.spill.metadata-*` (persistent metadata-delta section), and any
  * `*.spill.*.tmp`. Used at every fork/delete/sweep/Memory-parity callsite so
  * ad-hoc filters cannot drift.
  */
@@ -1422,4 +1423,704 @@ export class BoundedParentArtifactBuilder {
 /** Fixed in-memory cost of the retained parent-artifact runtime state (block-cache charged). */
 export function parentArtifactRuntimeBytes(bucketCount = PARENT_CHILDREN_BUCKET_COUNT): number {
 	return bucketCount * 96 + 128;
+}
+
+// ============================================================================
+// Persistent bounded dictionary artifact (deterministic hash partitions)
+// ============================================================================
+
+/** Fixed partition count for the on-disk dictionary artifact (4 × 4 MiB buffers). */
+export const DICTIONARY_PARTITION_COUNT = 4;
+/** Maximum unique duplicate record ids retained as diagnostics in the meta. */
+export const DICTIONARY_DUPLICATE_DIAGNOSTIC_MAX = 64;
+/** Fixed capacity of the bounded duplicate-id detector (open addressing). */
+export const DICTIONARY_ID_SET_CAPACITY = 1_125_001;
+/** Maximum records the bounded duplicate-id detector can prove unique. */
+export const DICTIONARY_ID_SET_MAX_RECORDS = 1_000_000;
+
+/**
+ * One partition journal record. `term` is the lossless record id (never
+ * truncated or hash-substituted); the remaining fields are the same exact
+ * index fields the covered `.spill.idx` records, so a partition is a
+ * self-sufficient hash-partitioned flat index for one id.
+ */
+export interface DictionaryPartitionRecord {
+	term: string;
+	dictId: number;
+	ordinal: number;
+	seq: number;
+	byteOffset: number;
+	byteLength: number;
+	recordDigest: string;
+	parentId: string | null;
+	entryType: string;
+}
+
+/** Serialize one dictionary partition record as a compact JSON journal line (trailing newline). */
+export function serializeDictionaryPartitionRecord(input: DictionaryPartitionRecord): string {
+	return `${JSON.stringify({
+		t: input.term,
+		i: input.dictId,
+		o: input.ordinal,
+		s: input.seq,
+		b: input.byteOffset,
+		l: input.byteLength,
+		d: input.recordDigest,
+		p: input.parentId,
+		e: input.entryType,
+	})}\n`;
+}
+
+/** Strictly parse one dictionary partition journal line; `undefined` marks the partition corrupt. */
+export function parseDictionaryPartitionRecord(line: string): DictionaryPartitionRecord | undefined {
+	let value: Record<string, unknown>;
+	try {
+		value = JSON.parse(line) as Record<string, unknown>;
+	} catch {
+		return undefined;
+	}
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const { t, i, o, s, b, l, d, p, e } = value;
+	if (typeof t !== "string" || t.length === 0) return undefined;
+	if (typeof i !== "number" || !Number.isSafeInteger(i) || i < 0) return undefined;
+	if (
+		typeof o !== "number" ||
+		typeof s !== "number" ||
+		typeof b !== "number" ||
+		typeof l !== "number" ||
+		!Number.isSafeInteger(o) ||
+		!Number.isSafeInteger(s) ||
+		!Number.isSafeInteger(b) ||
+		!Number.isSafeInteger(l) ||
+		o < 0 ||
+		s < 0 ||
+		b < 0 ||
+		l <= 0
+	)
+		return undefined;
+	if (typeof d !== "string" || !/^[0-9a-f]{64}$/.test(d)) return undefined;
+	if (p !== null && typeof p !== "string") return undefined;
+	if (typeof e !== "string" || e.length === 0) return undefined;
+	return {
+		term: t,
+		dictId: i,
+		ordinal: o,
+		seq: s,
+		byteOffset: b,
+		byteLength: l,
+		recordDigest: d,
+		parentId: p,
+		entryType: e,
+	};
+}
+
+/**
+ * Deterministic hash-partition assignment for a record id (same FNV-1a family
+ * as `parentBucketForId`). The same id always lands in the same partition, so
+ * every occurrence of a duplicate id is confined to one journal.
+ */
+export function dictionaryPartitionForId(id: string, partitionCount = DICTIONARY_PARTITION_COUNT): number {
+	let hash = 0x811c9dc5;
+	for (let index = 0; index < id.length; index++) {
+		const code = id.charCodeAt(index);
+		hash ^= code & 0xff;
+		hash = Math.imul(hash, 0x01000193);
+		hash ^= code >>> 8;
+		hash = Math.imul(hash, 0x01000193);
+	}
+	return (hash >>> 0) % partitionCount;
+}
+
+/** Committed exact bytes of one on-disk dictionary partition. */
+export interface DictionaryPartitionCommit {
+	size: number;
+	digest: string;
+	records: number;
+	complete: boolean;
+}
+
+/**
+ * Commit-marker binding for the disposable dictionary artifact. Every partition
+ * and the meta file are bound by exact size + SHA-256, and the artifact covers
+ * exactly the entry set of the `.spill.idx` whose digest is bound here; a
+ * binding mismatch fails closed to the authoritative cold scan.
+ */
+export interface DictionaryArtifactCommit {
+	header: SidecarIndexHeaderV2;
+	/** Exact `.spill.idx` digest the artifact covers. */
+	indexDigest: string;
+	/** Per-partition exact-byte commits, one per partition file. */
+	partitions: DictionaryPartitionCommit[];
+	/** Exact bytes of the `.spill.dict-meta` file (self-referential fields omitted from the payload). */
+	metaSize: number;
+	metaDigest: string;
+	recordCount: number;
+	uniqueTerms: number;
+	/** Combined serialized term bytes (lossless ids). */
+	totalBytes: number;
+	/** Bounded duplicate-id diagnostics; non-empty ⇒ the artifact must never be adopted. */
+	duplicateIds: readonly string[];
+	sidecarIneligible: boolean;
+}
+
+/**
+ * Exact serialized bytes of the meta file. `metaSize`/`metaDigest` are omitted
+ * from the payload (they authenticate the bytes that omit them), so
+ * serialization is deterministic and self-referentiality is impossible.
+ */
+export function dictionaryArtifactMetaBytes(commit: Omit<DictionaryArtifactCommit, "metaSize" | "metaDigest">): string {
+	return `${JSON.stringify({
+		header: {
+			version: commit.header.version,
+			sessionId: commit.header.sessionId,
+			sidecarIneligible: commit.header.sidecarIneligible,
+		},
+		indexDigest: commit.indexDigest,
+		partitions: commit.partitions.map(partition => ({
+			size: partition.size,
+			digest: partition.digest,
+			records: partition.records,
+			complete: partition.complete,
+		})),
+		recordCount: commit.recordCount,
+		uniqueTerms: commit.uniqueTerms,
+		totalBytes: commit.totalBytes,
+		duplicateIds: [...commit.duplicateIds],
+		sidecarIneligible: commit.sidecarIneligible,
+	})}\n`;
+}
+
+/** Compute the exact meta bytes and the resulting self-authenticating commit. */
+export function finalizeDictionaryArtifactCommit(commit: Omit<DictionaryArtifactCommit, "metaSize" | "metaDigest">): {
+	bytes: string;
+	commit: DictionaryArtifactCommit;
+} {
+	const bytes = dictionaryArtifactMetaBytes(commit);
+	const metaDigest = computeLineDigest(Buffer.from(bytes, "utf8"));
+	return { bytes, commit: { ...commit, metaSize: bytes.length, metaDigest } };
+}
+
+/**
+ * Strictly parse the exact meta bytes. The digest and size are recomputed over
+ * the supplied exact bytes; any structural, bound, or digest mismatch returns
+ * `undefined` (the artifact is then never trusted).
+ */
+export function parseDictionaryArtifactCommit(bytes: string | Uint8Array): DictionaryArtifactCommit | undefined {
+	const text = typeof bytes === "string" ? bytes : new TextDecoder("utf-8").decode(bytes);
+	const exactLength = typeof bytes === "string" ? Buffer.byteLength(bytes, "utf8") : bytes.byteLength;
+	let value: unknown;
+	try {
+		value = JSON.parse(text);
+	} catch {
+		return undefined;
+	}
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const record = value as Record<string, unknown>;
+	const header = record.header;
+	if (header === null || typeof header !== "object" || Array.isArray(header)) return undefined;
+	const headerRecord = header as Record<string, unknown>;
+	if (headerRecord.version !== 2) return undefined;
+	if (typeof headerRecord.sessionId !== "string") return undefined;
+	if (typeof headerRecord.sidecarIneligible !== "boolean") return undefined;
+	if (typeof record.indexDigest !== "string" || !/^[0-9a-f]{64}$/.test(record.indexDigest)) return undefined;
+	if (!Array.isArray(record.partitions) || record.partitions.length !== DICTIONARY_PARTITION_COUNT) return undefined;
+	const partitions: DictionaryPartitionCommit[] = [];
+	for (const candidate of record.partitions) {
+		if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return undefined;
+		const partition = candidate as Record<string, unknown>;
+		if (!Number.isSafeInteger(partition.size) || (partition.size as number) < 0) return undefined;
+		if (typeof partition.digest !== "string" || !/^[0-9a-f]{64}$/.test(partition.digest)) return undefined;
+		if (!Number.isSafeInteger(partition.records) || (partition.records as number) < 0) return undefined;
+		if (typeof partition.complete !== "boolean") return undefined;
+		partitions.push({
+			size: partition.size as number,
+			digest: partition.digest,
+			records: partition.records as number,
+			complete: partition.complete,
+		});
+	}
+	if (!Number.isSafeInteger(record.recordCount) || (record.recordCount as number) < 0) return undefined;
+	if (!Number.isSafeInteger(record.uniqueTerms) || (record.uniqueTerms as number) < 0) return undefined;
+	if (!Number.isSafeInteger(record.totalBytes) || (record.totalBytes as number) < 0) return undefined;
+	if (!Array.isArray(record.duplicateIds) || record.duplicateIds.some(candidate => typeof candidate !== "string"))
+		return undefined;
+	if (typeof record.sidecarIneligible !== "boolean") return undefined;
+	const expectedDigest = computeLineDigest(
+		typeof bytes === "string" ? Buffer.from(bytes, "utf8") : Buffer.from(bytes),
+	);
+	return {
+		header: {
+			version: 2,
+			sessionId: headerRecord.sessionId,
+			sidecarIneligible: headerRecord.sidecarIneligible,
+		},
+		indexDigest: record.indexDigest,
+		partitions,
+		metaSize: exactLength,
+		metaDigest: expectedDigest,
+		recordCount: record.recordCount as number,
+		uniqueTerms: record.uniqueTerms as number,
+		totalBytes: record.totalBytes as number,
+		duplicateIds: record.duplicateIds as string[],
+		sidecarIneligible: record.sidecarIneligible,
+	};
+}
+
+/** Bounded duplicate-id oracle for the streaming dictionary build. */
+export interface DictionaryIdDetector {
+	add(id: string): "added" | "duplicate" | "full";
+}
+
+/**
+ * Bounded duplicate-id oracle. Small transcripts stay in a tiny exact set;
+ * larger transcripts promote once to the fixed-capacity 48-bit hash table.
+ * A hash collision can only produce a spurious duplicate (fail closed), never
+ * miss a true duplicate.
+ */
+export class BoundedDictionaryIdSet implements DictionaryIdDetector {
+	#small: Set<string> | undefined = new Set();
+	#high: Uint16Array | undefined;
+	#low: Uint32Array | undefined;
+	#size = 0;
+
+	#hash(value: string, seed: number): number {
+		let hash = seed >>> 0;
+		for (let index = 0; index < value.length; index++) {
+			hash ^= value.charCodeAt(index);
+			hash = Math.imul(hash, 0x01000193) >>> 0;
+		}
+		return hash;
+	}
+
+	#hashPair(value: string): [number, number] {
+		let high = this.#hash(value, 0x811c9dc5) & 0xffff;
+		const low = this.#hash(value, 0x9e3779b9);
+		if (high === 0 && low === 0) high = 1;
+		return [high, low];
+	}
+
+	#insertHash(high: number, low: number): "added" | "duplicate" | "full" {
+		const highs = this.#high!;
+		const lows = this.#low!;
+		let slot = low % DICTIONARY_ID_SET_CAPACITY;
+		for (let probes = 0; probes < DICTIONARY_ID_SET_CAPACITY; probes++) {
+			const existingHigh = highs[slot];
+			const existingLow = lows[slot];
+			if (existingHigh === high && existingLow === low) return "duplicate";
+			if (existingHigh === 0 && existingLow === 0) {
+				highs[slot] = high;
+				lows[slot] = low;
+				return "added";
+			}
+			slot++;
+			if (slot === DICTIONARY_ID_SET_CAPACITY) slot = 0;
+		}
+		return "full";
+	}
+
+	#promote(): void {
+		this.#high = new Uint16Array(DICTIONARY_ID_SET_CAPACITY);
+		this.#low = new Uint32Array(DICTIONARY_ID_SET_CAPACITY);
+		for (const value of this.#small!) {
+			const [high, low] = this.#hashPair(value);
+			this.#insertHash(high, low);
+		}
+		this.#small = undefined;
+	}
+
+	has(value: string): boolean {
+		if (this.#small) return this.#small.has(value);
+		const [high, low] = this.#hashPair(value);
+		const highs = this.#high!;
+		const lows = this.#low!;
+		let slot = low % DICTIONARY_ID_SET_CAPACITY;
+		for (let probes = 0; probes < DICTIONARY_ID_SET_CAPACITY; probes++) {
+			const existingHigh = highs[slot];
+			const existingLow = lows[slot];
+			if (existingHigh === 0 && existingLow === 0) return false;
+			if (existingHigh === high && existingLow === low) return true;
+			slot++;
+			if (slot === DICTIONARY_ID_SET_CAPACITY) slot = 0;
+		}
+		return true;
+	}
+
+	add(value: string): "added" | "duplicate" | "full" {
+		if (this.#size >= DICTIONARY_ID_SET_MAX_RECORDS) return "full";
+		if (this.#small) {
+			if (this.#small.has(value)) return "duplicate";
+			if (this.#small.size < 4096) {
+				this.#small.add(value);
+				this.#size++;
+				return "added";
+			}
+			this.#promote();
+		}
+		const [high, low] = this.#hashPair(value);
+		const result = this.#insertHash(high, low);
+		if (result === "added") this.#size++;
+		return result;
+	}
+}
+
+/** One record consumed by the streaming dictionary artifact builder. */
+export interface DictionaryArtifactRecordInput {
+	id: string;
+	ordinal: number;
+	seq: number;
+	byteOffset: number;
+	byteLength: number;
+	recordDigest: string;
+	parentId: string | null;
+	entryType: string;
+}
+
+/**
+ * Persistence target for flushed partition lines. The target owns the exact
+ * bytes on disk and their running digests (it must keep per-partition hashes
+ * for append-time rebinding); the builder never retains flushed lines.
+ */
+export interface DictionaryArtifactFlushTarget {
+	/** Append `lines` to `partition`'s journal, fsyncing before returning false on failure. */
+	writePartitionLines(partition: number, lines: readonly string[]): boolean;
+	/** Exact-byte commit of one partition as currently persisted. */
+	getPartitionCommit(partition: number): DictionaryPartitionCommit;
+}
+
+export type DictionaryArtifactAddResult =
+	| { kind: "ok" }
+	| { kind: "budget_exceeded"; peakBytes: number; budgetBytes: number }
+	| { kind: "flush_failed" };
+
+export type DictionaryArtifactBuildResult =
+	| { kind: "ok"; commit: DictionaryArtifactCommit; stats: DictionaryBuildStats }
+	| { kind: "budget_exceeded"; peakBytes: number; budgetBytes: number }
+	| { kind: "flush_failed" };
+
+export interface DictionaryArtifactBuildOptions {
+	peakBudgetBytes?: number;
+	partitionBufferBytes?: number;
+	journalBytes?: number;
+	partitionCount?: number;
+	detector?: DictionaryIdDetector;
+	/** Persistence target for flushed partition lines; required for `add`/`finish`. */
+	target?: DictionaryArtifactFlushTarget;
+}
+
+/**
+ * Streaming dictionary artifact builder with a deterministic 20 MiB build peak
+ * (4 × `partitionBufferBytes` partition buffers + one `journalBytes` flush
+ * buffer). Consumes records one at a time, flushes full partition buffers
+ * through the journal to the flush target, and never retains the complete
+ * dictionary object/JSON graph. Record ids are stored losslessly as terms.
+ * Duplicate record ids mark the artifact `sidecarIneligible` (never adopted;
+ * the session falls back to eager) while the build still completes
+ * deterministically.
+ */
+export class BoundedDictionaryArtifactBuilder {
+	private readonly buffers: string[][] = [];
+	private readonly bufferBytes: number[] = [];
+	private journal: string[] = [];
+	private journalBytes = 0;
+	private journalPartition: number | undefined;
+	private readonly partitionCountValue: number;
+	private readonly partitionBufferBytesValue: number;
+	private readonly journalBytesValue: number;
+	private readonly peakBudgetValue: number;
+	private readonly detector: DictionaryIdDetector;
+	private readonly target: DictionaryArtifactFlushTarget | undefined;
+	private readonly duplicateIds: string[] = [];
+	private duplicateIdBytes = 0;
+	private uniqueTerms = 0;
+	private totalTermBytes = 0;
+	private recordCount = 0;
+	private peakBytesValue = 0;
+	private sidecarIneligible = false;
+	private flushFailed = false;
+	private finished = false;
+
+	constructor(options: DictionaryArtifactBuildOptions = {}) {
+		this.peakBudgetValue = options.peakBudgetBytes ?? DICTIONARY_BUILD_PEAK_BYTES;
+		this.partitionCountValue = options.partitionCount ?? DICTIONARY_PARTITION_COUNT;
+		this.partitionBufferBytesValue = options.partitionBufferBytes ?? DICTIONARY_PARTITION_BUFFER_BYTES;
+		this.journalBytesValue = options.journalBytes ?? DICTIONARY_BUCKET_JOURNAL_BYTES;
+		this.detector = options.detector ?? new BoundedDictionaryIdSet();
+		this.target = options.target;
+		for (let partition = 0; partition < this.partitionCountValue; partition++) {
+			this.buffers.push([]);
+			this.bufferBytes.push(0);
+		}
+	}
+
+	get peakBytes(): number {
+		return this.peakBytesValue;
+	}
+
+	/** Consumes one record. The build peak stays within the 20 MiB buffer model. */
+	add(record: DictionaryArtifactRecordInput): DictionaryArtifactAddResult {
+		if (this.finished) throw new Error("dictionary_artifact_builder_finished");
+		this.recordCount += 1;
+		const partition = dictionaryPartitionForId(record.id, this.partitionCountValue);
+		const detection = this.detector.add(record.id);
+		if (detection === "duplicate") {
+			this.sidecarIneligible = true;
+			if (this.duplicateIds.length < DICTIONARY_DUPLICATE_DIAGNOSTIC_MAX && !this.duplicateIds.includes(record.id)) {
+				this.duplicateIdBytes += residentStringBytes(record.id) + RECORD_OBJECT_OVERHEAD_BYTES;
+				this.duplicateIds.push(record.id);
+			}
+		} else if (detection === "full") {
+			// Uniqueness can no longer be proven with bounded memory; fail closed.
+			this.sidecarIneligible = true;
+		}
+		if (detection === "added") {
+			this.uniqueTerms += 1;
+			this.totalTermBytes += Buffer.byteLength(record.id, "utf8");
+		}
+		const line = serializeDictionaryPartitionRecord({
+			term: record.id,
+			dictId: detection === "added" ? this.uniqueTerms - 1 : -1,
+			ordinal: record.ordinal,
+			seq: record.seq,
+			byteOffset: record.byteOffset,
+			byteLength: record.byteLength,
+			recordDigest: record.recordDigest,
+			parentId: record.parentId,
+			entryType: record.entryType,
+		});
+		const lineBytes = Buffer.byteLength(line, "utf8");
+		this.buffers[partition]!.push(line);
+		this.bufferBytes[partition]! += lineBytes;
+		this.updatePeak();
+		if (this.peakBytesValue > this.peakBudgetValue) {
+			return { kind: "budget_exceeded", peakBytes: this.peakBytesValue, budgetBytes: this.peakBudgetValue };
+		}
+		if (this.bufferBytes[partition]! > this.partitionBufferBytesValue) {
+			if (!this.flushPartition(partition)) return { kind: "flush_failed" };
+		}
+		return { kind: "ok" };
+	}
+
+	/** Flush every buffer, read the exact partition commits from the target, and finalize. */
+	finish(sessionId: string, indexDigest: string): DictionaryArtifactBuildResult {
+		if (this.finished) throw new Error("dictionary_artifact_builder_already_finished");
+		this.finished = true;
+		for (let partition = 0; partition < this.partitionCountValue; partition++) {
+			if (this.bufferBytes[partition]! > 0) {
+				if (!this.flushPartition(partition)) return { kind: "flush_failed" };
+			}
+		}
+		if (this.flushFailed) return { kind: "flush_failed" };
+		if (this.peakBytesValue > this.peakBudgetValue) {
+			return { kind: "budget_exceeded", peakBytes: this.peakBytesValue, budgetBytes: this.peakBudgetValue };
+		}
+		if (!this.target) return { kind: "flush_failed" };
+		const partitions: DictionaryPartitionCommit[] = [];
+		for (let partition = 0; partition < this.partitionCountValue; partition++) {
+			partitions.push(this.target.getPartitionCommit(partition));
+		}
+		const commit = {
+			header: { version: 2 as const, sessionId, sidecarIneligible: this.sidecarIneligible },
+			indexDigest,
+			partitions,
+			metaSize: 0,
+			metaDigest: "",
+			recordCount: this.recordCount,
+			uniqueTerms: this.uniqueTerms,
+			totalBytes: this.totalTermBytes,
+			duplicateIds: [...this.duplicateIds],
+			sidecarIneligible: this.sidecarIneligible,
+		};
+		const stats: DictionaryBuildStats = {
+			totalRecords: this.recordCount,
+			uniqueTerms: this.uniqueTerms,
+			totalBytes: this.totalTermBytes,
+			peakBytes: this.peakBytesValue,
+			duplicateIds: [...this.duplicateIds],
+			sidecarIneligible: this.sidecarIneligible,
+		};
+		this.journal = [];
+		this.journalBytes = 0;
+		this.journalPartition = undefined;
+		for (let partition = 0; partition < this.partitionCountValue; partition++) {
+			this.buffers[partition] = [];
+			this.bufferBytes[partition] = 0;
+		}
+		return { kind: "ok", commit, stats };
+	}
+
+	/** Moves one partition's buffer into the journal (≤ 4 MiB) and flushes it to the target. */
+	private flushPartition(partition: number): boolean {
+		const buffer = this.buffers[partition]!;
+		if (buffer.length === 0) return true;
+		if (this.journalPartition !== undefined) {
+			// The previous journal flush failed or was never drained; fail closed.
+			this.flushFailed = true;
+			return false;
+		}
+		// Take as many leading lines as fit the journal cap (≤ 4 MiB); the rest
+		// stays buffered so a flush batch never exceeds the fixed journal bound.
+		let take = 0;
+		let takeBytes = 0;
+		while (take < buffer.length) {
+			const lineBytes = Buffer.byteLength(buffer[take]!, "utf8");
+			if (takeBytes + lineBytes > this.journalBytesValue) break;
+			takeBytes += lineBytes;
+			take++;
+		}
+		if (take === 0) {
+			// A single line exceeds the journal cap; fail closed.
+			this.flushFailed = true;
+			return false;
+		}
+		const lines = take === buffer.length ? buffer : buffer.slice(0, take);
+		this.buffers[partition] = take === buffer.length ? [] : buffer.slice(take);
+		this.bufferBytes[partition]! -= takeBytes;
+		this.journal = lines;
+		this.journalBytes = takeBytes;
+		this.journalPartition = partition;
+		this.updatePeak();
+		const ok = this.flushJournal();
+		this.updatePeak();
+		return ok;
+	}
+
+	private flushJournal(): boolean {
+		if (this.journal.length === 0) return true;
+		const partition = this.journalPartition;
+		if (partition === undefined) return true;
+		const lines = this.journal;
+		const bytes = this.journalBytes;
+		this.journal = [];
+		this.journalBytes = 0;
+		this.journalPartition = undefined;
+		const target = this.target;
+		if (!target) {
+			this.flushFailed = true;
+			return false;
+		}
+		const ok = target.writePartitionLines(partition, lines);
+		if (!ok) this.flushFailed = true;
+		if (bytes > this.peakBytesValue) this.peakBytesValue = bytes;
+		return ok;
+	}
+
+	private updatePeak(): void {
+		// Actual buffered content only: at most one partition buffer is being
+		// filled (~4 MiB), the others hold flush remainders, and the journal is
+		// capped at its fixed size — so the peak never exceeds the 20 MiB model
+		// (4 × 4 MiB partition buffers + 4 MiB bucket flush).
+		const current =
+			this.bufferBytes.reduce((total, bytes) => total + bytes, 0) + this.journalBytes + this.duplicateIdBytes;
+		if (current > this.peakBytesValue) this.peakBytesValue = current;
+	}
+}
+
+/** Fixed in-memory cost of the retained dictionary-artifact runtime state (block-cache charged). */
+export function dictionaryArtifactRuntimeBytes(partitionCount = DICTIONARY_PARTITION_COUNT): number {
+	return partitionCount * 96 + 128;
+}
+
+// ============================================================================
+// Persistent metadata-delta artifact (demoted reducer/provider values)
+// ============================================================================
+
+/**
+ * One demoted provider-state value descriptor: exact ordinal, kind, byte
+ * location, and digest inside the `.spill.metadata-delta` section. The value
+ * bytes are persisted before demotion, so a descriptor always points at
+ * durable authenticated bytes.
+ */
+export interface MetadataDeltaValue {
+	/** Provider-state key (`providerStateEntryKey` semantics: type or `type:role`). */
+	key: string;
+	/** Entry type of the demoted value. */
+	kind: string;
+	/** Exact transcript ordinal of the demoted entry. */
+	ordinal: number;
+	/** Position in the build's ordered provider list (reopen merge slot). */
+	position: number;
+	offset: number;
+	length: number;
+	sha256: string;
+}
+
+/** Commit-marker binding for the disposable metadata-delta section. */
+export interface MetadataDeltaArtifactCommit {
+	/** Exact `.spill.idx` digest the sidecar set was built with. */
+	indexDigest: string;
+	/** Exact bytes of the `.spill.metadata-delta` file. */
+	size: number;
+	sha256: string;
+	values: readonly MetadataDeltaValue[];
+}
+
+/** Strict descriptor validation (any ambiguity fails closed). */
+export function isValidMetadataDeltaValue(value: unknown): value is MetadataDeltaValue {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+	const record = value as Record<string, unknown>;
+	return (
+		typeof record.key === "string" &&
+		record.key.length > 0 &&
+		typeof record.kind === "string" &&
+		record.kind.length > 0 &&
+		Number.isSafeInteger(record.ordinal) &&
+		(record.ordinal as number) >= 0 &&
+		Number.isSafeInteger(record.position) &&
+		(record.position as number) >= 0 &&
+		Number.isSafeInteger(record.offset) &&
+		(record.offset as number) >= 0 &&
+		Number.isSafeInteger(record.length) &&
+		(record.length as number) > 0 &&
+		typeof record.sha256 === "string" &&
+		/^[0-9a-f]{64}$/.test(record.sha256)
+	);
+}
+
+/** Strict commit-binding validation: bounded values, unique keys/positions, in-range offsets. */
+export function isValidMetadataDeltaCommit(value: unknown): value is MetadataDeltaArtifactCommit {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+	const record = value as Record<string, unknown>;
+	if (typeof record.indexDigest !== "string" || !/^[0-9a-f]{64}$/.test(record.indexDigest)) return false;
+	if (!Number.isSafeInteger(record.size) || (record.size as number) < 0) return false;
+	if (typeof record.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(record.sha256)) return false;
+	if (!Array.isArray(record.values) || record.values.length > 256) return false;
+	if (!record.values.every(isValidMetadataDeltaValue)) return false;
+	const keys = new Set<string>();
+	const positions = new Set<number>();
+	for (const value of record.values) {
+		// Each value is independently authenticated by its exact byte digest; the
+		// marker may legitimately reorder re-demoted values relative to their
+		// byte offsets, so only uniqueness and range bounds are enforced here.
+		if (keys.has(value.key)) return false;
+		if (positions.has(value.position)) return false;
+		keys.add(value.key);
+		positions.add(value.position);
+		if (value.offset + value.length > (record.size as number)) return false;
+	}
+	return true;
+}
+
+/** Compute the descriptor for one value whose exact line bytes are about to be persisted. */
+export function metadataDeltaValueDescriptor(input: {
+	key: string;
+	kind: string;
+	ordinal: number;
+	position: number;
+	offset: number;
+	lineBytes: Uint8Array;
+}): MetadataDeltaValue {
+	return {
+		key: input.key,
+		kind: input.kind,
+		ordinal: input.ordinal,
+		position: input.position,
+		offset: input.offset,
+		length: input.lineBytes.byteLength,
+		sha256: computeLineDigest(input.lineBytes),
+	};
+}
+
+/** Resident bytes of one retained metadata-delta descriptor (key + 24 B descriptor + object). */
+export function metadataDeltaDescriptorResidentBytes(key: string): number {
+	return residentStringBytes(key) + DESCRIPTOR_BYTES + RECORD_OBJECT_OVERHEAD_BYTES;
 }

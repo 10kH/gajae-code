@@ -1,11 +1,15 @@
 import { describe, expect, it, vi } from "bun:test";
+import * as crypto from "node:crypto";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getBlobsDir, logger, TempDir } from "@gajae-code/utils";
 import {
+	DICTIONARY_PARTITION_COUNT,
+	dictionaryPartitionForId,
 	PARENT_CHILDREN_BUCKET_COUNT,
 	parentBucketForId,
+	parseDictionaryArtifactCommit,
 	serializeParentBucketRecord,
 } from "../../src/session/internal/session-memory-sidecar";
 import { SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
@@ -20,6 +24,12 @@ const sidecarPath = (sessionFile: string, kind: "idx" | "tail" | "commit"): stri
 	`${sessionFile.slice(0, -6)}/.session-memory.spill.${kind}`;
 const parentBucketPath = (sessionFile: string, bucket: number): string =>
 	`${sessionFile.slice(0, -6)}/.session-memory.spill.parent-${bucket.toString().padStart(4, "0")}`;
+const dictionaryPartitionPath = (sessionFile: string, partition: number): string =>
+	`${sessionFile.slice(0, -6)}/.session-memory.spill.dict-part-${partition.toString().padStart(4, "0")}`;
+const dictionaryMetaPathFor = (sessionFile: string): string =>
+	`${sessionFile.slice(0, -6)}/.session-memory.spill.dict-meta`;
+const metadataDeltaPathFor = (sessionFile: string): string =>
+	`${sessionFile.slice(0, -6)}/.session-memory.spill.metadata-delta`;
 
 /** Write a compacted tree transcript: root → `parentCount` parents, each with `childrenPerParent` children. */
 function writeTreeTranscript(
@@ -498,6 +508,72 @@ describe("bounded provider context traversal", () => {
 			const context = manager.buildSessionContext();
 			expect(context.messages).toHaveLength(3);
 			expect(storage.rangeReads).toBe(0);
+		} finally {
+			await manager.close();
+		}
+	});
+	it("rejects generated IDs that collide with retired cold entries", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/cold-generated-id-collision.jsonl";
+		const records = [
+			{ type: "session", version: 5, id: "collision-session", timestamp: "0", cwd: "/cwd" },
+			{ type: "custom", id: "deadbeef", parentId: null, timestamp: "0", customType: "node", data: {} },
+			{ type: "custom", id: "active", parentId: "deadbeef", timestamp: "0", customType: "node", data: {} },
+			{
+				type: "compaction",
+				id: "active-compaction",
+				parentId: "active",
+				timestamp: "0",
+				summary: "summary",
+				firstKeptEntryId: "active",
+				tokensBefore: 1,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		const randomUUID = vi
+			.spyOn(crypto, "randomUUID")
+			.mockReturnValueOnce("00000000-0000-0000-0000-0000deadbeef")
+			.mockReturnValueOnce("00000000-0000-0000-0000-0000cafebabe");
+		try {
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			expect(manager.appendMessage({ role: "user", content: "collision check", timestamp: 1 })).toBe("cafebabe");
+		} finally {
+			randomUUID.mockRestore();
+			await manager.close();
+		}
+	});
+	it("falls back eagerly when appended provider state exceeds the fixed slot budget", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/provider-state-append-budget.jsonl";
+		writeTreeTranscript(storage, sessionFile, { parentCount: 8, childrenPerParent: 2 });
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			for (let index = 0; index < 257; index++) {
+				manager.appendConfiguredModelChain({
+					role: `role-${index}`,
+					entries: [`test/model-${index}`],
+					origin: "session",
+					explicitHead: false,
+				});
+			}
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
+			expect(manager.getEntriesForExport().filter(entry => entry.type === "configured_model_chain")).toHaveLength(
+				257,
+			);
 		} finally {
 			await manager.close();
 		}
@@ -1918,9 +1994,9 @@ describe("branch-heavy retirement", () => {
 
 		const reopened = await SessionManager.open(sessionFile, destination, storage, "copy-retain", "enabled");
 		try {
-			expect(reopened.getSessionMemoryStats().lazyReopenSucceeded).toBe(true);
+			expect(reopened.getSessionMemoryStats().lazyReopenSucceeded).toBe(false);
 			reopened.branch("a-compact");
-			expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(false);
+			expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
 			expect(reopened.getBranch().map(entry => entry.id)).toEqual(["root", "a-kept", "a-tail", "a-compact"]);
 		} finally {
 			await reopened.close();
@@ -2445,6 +2521,55 @@ describe("sidecar I/O fallback", () => {
 			await manager.close();
 		}
 	});
+	it("hydrates the authoritative transcript when an authenticated flat index omits a prefix", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/partial-authenticated-index.jsonl";
+		writeTreeTranscript(storage, sessionFile, { parentCount: 4, childrenPerParent: 2 });
+		const expectedIds = storage
+			.readTextSync(sessionFile)
+			.trimEnd()
+			.split("\n")
+			.slice(1)
+			.map(line => (JSON.parse(line) as { id: string }).id);
+		const built = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		await built.close();
+		const indexPath = sidecarPath(sessionFile, "idx");
+		const partialLines = storage
+			.readTextSync(indexPath)
+			.trimEnd()
+			.split("\n")
+			.slice(1)
+			.map((line, ordinal) => JSON.stringify({ ...JSON.parse(line), ordinal }));
+		const partialIndex = `${partialLines.join("\n")}\n`;
+		storage.writeTextSync(indexPath, partialIndex);
+		const markerPath = sidecarPath(sessionFile, "commit");
+		const marker = JSON.parse(storage.readTextSync(markerPath)) as Record<string, unknown>;
+		marker.indexDigest = createHash("sha256").update(partialIndex).digest("hex");
+		delete marker.parentIndex;
+		delete marker.dictionary;
+		delete marker.metadataDelta;
+		storage.writeTextSync(markerPath, JSON.stringify(marker));
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(reopened.getEntriesForExport().map(entry => entry.id)).toEqual(expectedIds);
+			expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(false);
+			expect(storage.existsSync(indexPath)).toBe(false);
+		} finally {
+			await reopened.close();
+		}
+	});
 	it("does not cache a truncated neighboring parent block", async () => {
 		const storage = new MemorySessionStorage();
 		const sessionFile = "/sessions/cold-children-overflow.jsonl";
@@ -2805,6 +2930,32 @@ describe("sidecar I/O fallback", () => {
 		}
 	});
 
+	it("publishes appended reducer ordinals in the flat-index coordinate space", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/append-reducer-ordinal.jsonl";
+		writeTreeTranscript(storage, sessionFile, { parentCount: 4, childrenPerParent: 2 });
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			manager.appendModelChange("model-next", "reviewer");
+			const indexRecord = JSON.parse(
+				storage.readTextSync(sidecarPath(sessionFile, "idx")).trimEnd().split("\n").at(-1)!,
+			) as {
+				ordinal: number;
+			};
+			const marker = JSON.parse(storage.readTextSync(sidecarPath(sessionFile, "commit"))) as {
+				reducer: { modelChange: { latest?: { ordinal: number; role?: string } } };
+			};
+			expect(marker.reducer.modelChange.latest).toEqual({ ordinal: indexRecord.ordinal, role: "reviewer" });
+		} finally {
+			await manager.close();
+		}
+	});
 	it("invalidates the parent artifact when an append cannot be safely recorded", async () => {
 		const storage = new MemorySessionStorage();
 		const sessionFile = "/sessions/append-overflow.jsonl";
@@ -3178,6 +3329,381 @@ describe("managed session memory authority", () => {
 				await reopened.close();
 			}
 		} finally {
+			tempDir.removeSync();
+		}
+	});
+});
+
+describe("persistent dictionary and metadata-delta artifacts", () => {
+	it("publishes the dictionary artifact bound in the commit marker and reopens exactly", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/dict-marker.jsonl";
+		writeTreeTranscript(storage, sessionFile, { parentCount: 4, childrenPerParent: 2 });
+		const built = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		await built.close();
+		expect(storage.existsSync(dictionaryMetaPathFor(sessionFile))).toBe(true);
+		for (let partition = 0; partition < DICTIONARY_PARTITION_COUNT; partition++)
+			expect(storage.existsSync(dictionaryPartitionPath(sessionFile, partition))).toBe(true);
+		const marker = JSON.parse(storage.readTextSync(sidecarPath(sessionFile, "commit"))) as {
+			indexDigest: string;
+			dictionary?: {
+				indexDigest: string;
+				partitions: Array<{ size: number; digest: string; records: number; complete: boolean }>;
+				metaSize: number;
+				metaDigest: string;
+				recordCount: number;
+				uniqueTerms: number;
+				totalBytes: number;
+				duplicateIds: string[];
+				sidecarIneligible: boolean;
+			};
+		};
+		expect(marker.dictionary).toBeDefined();
+		// The artifact covers exactly the entry set of the bound index digest.
+		expect(marker.dictionary!.indexDigest).toBe(marker.indexDigest);
+		expect(marker.dictionary!.sidecarIneligible).toBe(false);
+		expect(marker.dictionary!.duplicateIds).toEqual([]);
+		// Every partition's committed digest matches its exact on-disk bytes.
+		for (let partition = 0; partition < marker.dictionary!.partitions.length; partition++) {
+			const committed = marker.dictionary!.partitions[partition]!;
+			const bytes = storage.readBytesSync(dictionaryPartitionPath(sessionFile, partition));
+			expect(bytes.byteLength).toBe(committed.size);
+			expect(createHash("sha256").update(bytes).digest("hex")).toBe(committed.digest);
+		}
+		const metaBytes = storage.readBytesSync(dictionaryMetaPathFor(sessionFile));
+		expect(metaBytes.byteLength).toBe(marker.dictionary!.metaSize);
+		expect(createHash("sha256").update(metaBytes).digest("hex")).toBe(marker.dictionary!.metaDigest);
+		const parsedMeta = parseDictionaryArtifactCommit(Buffer.from(metaBytes).toString("utf8"));
+		expect(parsedMeta?.indexDigest).toBe(marker.indexDigest);
+		expect(parsedMeta?.recordCount).toBe(marker.dictionary!.recordCount);
+		expect(parsedMeta?.uniqueTerms).toBe(marker.dictionary!.uniqueTerms);
+		expect(parsedMeta?.uniqueTerms).toBe(parsedMeta?.recordCount);
+
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(reopened.getSessionMemoryStats().lazyReopenSucceeded).toBe(true);
+			expect(reopened.getSessionMemoryStats().dictionaryArtifactEnabled).toBe(true);
+			// Cold lookups resolve through the adopted dictionary-backed partition.
+			expect(reopened.getEntry("root")).toMatchObject({ id: "root", type: "custom" });
+			expect(reopened.getEntry("parent-000")).toMatchObject({ id: "parent-000" });
+		} finally {
+			await reopened.close();
+		}
+	});
+
+	it("fails closed to the authoritative cold scan when dictionary artifacts are corrupt or missing", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/dict-corrupt.jsonl";
+		writeTreeTranscript(storage, sessionFile, { parentCount: 4, childrenPerParent: 2 });
+		const built = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		await built.close();
+		// Corrupt one partition: the session still reopens exactly on index/tail
+		// proof, but the dictionary fast path is disabled (idx scan authoritative).
+		storage.writeTextSync(dictionaryPartitionPath(sessionFile, 0), "junk\n");
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(reopened.getSessionMemoryStats().lazyReopenSucceeded).toBe(true);
+			expect(reopened.getSessionMemoryStats().dictionaryArtifactEnabled).toBe(false);
+			expect(reopened.getEntry("root")).toMatchObject({ id: "root", type: "custom" });
+			expect(reopened.getChildren("root")).toHaveLength(5);
+		} finally {
+			await reopened.close();
+		}
+		// A missing meta file also disables the dictionary while the session reopens exactly.
+		storage.unlinkSync(dictionaryMetaPathFor(sessionFile));
+		const missingMeta = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(missingMeta.getSessionMemoryStats().lazyReopenSucceeded).toBe(true);
+			expect(missingMeta.getSessionMemoryStats().dictionaryArtifactEnabled).toBe(false);
+			expect(missingMeta.getEntry("parent-001")).toMatchObject({ id: "parent-001" });
+		} finally {
+			await missingMeta.close();
+		}
+	});
+
+	it("safely updates the dictionary on append and rebinds the marker", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/dict-append.jsonl";
+		writeTreeTranscript(storage, sessionFile, { parentCount: 4, childrenPerParent: 2 });
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(manager.getSessionMemoryStats().dictionaryArtifactEnabled).toBe(true);
+			const appendedId = manager.appendCustomEntry("node", {});
+			const partition = dictionaryPartitionForId(appendedId, DICTIONARY_PARTITION_COUNT);
+			const partitionFile = dictionaryPartitionPath(sessionFile, partition);
+			// The appended entry's record must be durable and rebound before the
+			// commit marker claims the new dictionary bytes.
+			expect(storage.readTextSync(partitionFile)).toContain(`"t":"${appendedId}"`);
+			const marker = JSON.parse(storage.readTextSync(sidecarPath(sessionFile, "commit"))) as {
+				dictionary?: { partitions: Array<{ size: number; digest: string; records: number }> };
+			};
+			expect(marker.dictionary).toBeDefined();
+			const committed = marker.dictionary!.partitions[partition]!;
+			const bytes = storage.readBytesSync(partitionFile);
+			expect(createHash("sha256").update(bytes).digest("hex")).toBe(committed.digest);
+			// Compaction republishes the marker; the dictionary stays current.
+			manager.appendCompaction("checkpoint", undefined, appendedId, 1);
+			expect(manager.getSessionMemoryStats().dictionaryArtifactEnabled).toBe(true);
+		} finally {
+			await manager.close();
+		}
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(reopened.getSessionMemoryStats().dictionaryArtifactEnabled).toBe(true);
+			expect(reopened.getEntry("root")).toMatchObject({ id: "root" });
+		} finally {
+			await reopened.close();
+		}
+	});
+
+	it("demotes oversized provider values into the metadata-delta and reproduces them on exact reopen", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/provider-delta.jsonl";
+		const records = [
+			{ type: "session", version: 5, id: "provider-delta", timestamp: "0", cwd: "/cwd" },
+			{ type: "thinking_level_change", id: "thinking", parentId: null, timestamp: "0", thinkingLevel: "high" },
+			{
+				type: "model_change",
+				id: "model",
+				parentId: "thinking",
+				timestamp: "0",
+				model: "test/default",
+				role: "default",
+			},
+			{
+				type: "configured_model_chain",
+				id: "chain",
+				parentId: "model",
+				timestamp: "0",
+				role: "reviewer",
+				entries: ["test/reviewer"],
+				origin: "session",
+			},
+			{ type: "service_tier_change", id: "tier", parentId: "chain", timestamp: "0", serviceTier: "flex" },
+			{
+				type: "mode_change",
+				id: "mode",
+				parentId: "tier",
+				timestamp: "0",
+				mode: "plan",
+				data: { planFile: "plan.md" },
+			},
+			{
+				type: "mcp_tool_selection",
+				id: "large-selection",
+				parentId: "mode",
+				timestamp: "0",
+				selectedToolNames: Array.from({ length: 600 }, (_, index) => `mcp__tool_${index}`),
+			},
+			{
+				type: "message",
+				id: "kept",
+				parentId: "large-selection",
+				timestamp: "0",
+				message: { role: "user", content: "kept", timestamp: 1 },
+			},
+			{
+				type: "compaction",
+				id: "compact",
+				parentId: "kept",
+				timestamp: "0",
+				summary: "summary",
+				firstKeptEntryId: "kept",
+				tokensBefore: 10,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		const manager = await SessionManager.open(sessionFile, SessionManager.explicitDestination("/sessions"), storage);
+		const eager = manager.buildSessionContext();
+		manager.setSessionMemoryMode("enabled");
+		expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		expect(manager.getSessionMemoryStats().metadataDeltaDescriptorBytes).toBeGreaterThan(0);
+		expect(manager.buildSessionContext()).toEqual(eager);
+		await manager.close();
+		// The delta file exists and the committed binding authenticates its exact bytes.
+		const deltaPath = metadataDeltaPathFor(sessionFile);
+		expect(storage.existsSync(deltaPath)).toBe(true);
+		const marker = JSON.parse(storage.readTextSync(sidecarPath(sessionFile, "commit"))) as {
+			indexDigest: string;
+			metadataDelta?: {
+				indexDigest: string;
+				size: number;
+				sha256: string;
+				values: Array<{ key: string; kind: string; position: number }>;
+			};
+		};
+		expect(marker.metadataDelta).toBeDefined();
+		expect(marker.metadataDelta!.indexDigest).toBe(marker.indexDigest);
+		const deltaBytes = storage.readBytesSync(deltaPath);
+		expect(deltaBytes.byteLength).toBe(marker.metadataDelta!.size);
+		expect(createHash("sha256").update(deltaBytes).digest("hex")).toBe(marker.metadataDelta!.sha256);
+		expect(marker.metadataDelta!.values.map(value => value.key)).toContain("mcp_tool_selection");
+
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(reopened.getSessionMemoryStats().lazyReopenSucceeded).toBe(true);
+			expect(reopened.getSessionMemoryStats().metadataDeltaDescriptorBytes).toBeGreaterThan(0);
+			expect(reopened.buildSessionContext()).toEqual(eager);
+		} finally {
+			await reopened.close();
+		}
+		const runtimeCorrupt = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			storage.writeTextSync(deltaPath, "{runtime-corrupt\n");
+			runtimeCorrupt.appendLabelChange("kept", "runtime-corruption-check");
+			expect(runtimeCorrupt.buildSessionContext()).toEqual(eager);
+			expect(runtimeCorrupt.getSessionMemoryStats().coldRetirementActive).toBe(false);
+		} finally {
+			await runtimeCorrupt.close();
+		}
+	});
+
+	it("fails closed to eager when the metadata-delta binding is corrupt or missing", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/provider-delta-corrupt.jsonl";
+		const records = [
+			{ type: "session", version: 5, id: "provider-delta-corrupt", timestamp: "0", cwd: "/cwd" },
+			{
+				type: "mcp_tool_selection",
+				id: "selection",
+				parentId: null,
+				timestamp: "0",
+				selectedToolNames: Array.from({ length: 600 }, (_, index) => `mcp__tool_${index}`),
+			},
+			{
+				type: "message",
+				id: "kept",
+				parentId: "selection",
+				timestamp: "0",
+				message: { role: "user", content: "kept", timestamp: 1 },
+			},
+			{
+				type: "compaction",
+				id: "compact",
+				parentId: "kept",
+				timestamp: "0",
+				summary: "summary",
+				firstKeptEntryId: "kept",
+				tokensBefore: 10,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		const manager = await SessionManager.open(sessionFile, SessionManager.explicitDestination("/sessions"), storage);
+		const eager = manager.buildSessionContext();
+		manager.setSessionMemoryMode("enabled");
+		expect(manager.getSessionMemoryStats().metadataDeltaDescriptorBytes).toBeGreaterThan(0);
+		await manager.close();
+		storage.writeTextSync(metadataDeltaPathFor(sessionFile), "{corrupt\n");
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(reopened.getSessionMemoryStats().lazyReopenSucceeded).toBe(false);
+			expect(reopened.getSessionMemoryStats().currentCommitTransition).toEqual({
+				kind: "exact",
+				reason: "descriptor_and_proof_match",
+			});
+			expect(reopened.buildSessionContext()).toEqual(eager);
+		} finally {
+			await reopened.close();
+		}
+		const marker = JSON.parse(storage.readTextSync(sidecarPath(sessionFile, "commit"))) as Record<string, unknown>;
+		marker.metadataDelta = { malformed: true };
+		storage.writeTextSync(sidecarPath(sessionFile, "commit"), JSON.stringify(marker));
+		const malformedBinding = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(malformedBinding.getSessionMemoryStats().lazyReopenSucceeded).toBe(false);
+			expect(malformedBinding.buildSessionContext()).toEqual(eager);
+		} finally {
+			await malformedBinding.close();
+		}
+	});
+
+	it("keeps managed sessions eager and sidecar-free of dictionary/delta artifacts", async () => {
+		const tempDir = TempDir.createSync("@pi-managed-dict-exclusion-");
+		const cwd = path.join(tempDir.path(), "workspace");
+		const agentDir = path.join(tempDir.path(), "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		try {
+			manager.setSessionMemoryMode("enabled");
+			const keptId = manager.appendMessage({ role: "user", content: "kept", timestamp: 1 });
+			await manager.ensureOnDisk();
+			manager.appendCompaction("summary", undefined, keptId, 10);
+			const sessionFile = manager.getSessionFile()!;
+			expect(fs.existsSync(dictionaryMetaPathFor(sessionFile))).toBe(false);
+			expect(fs.existsSync(metadataDeltaPathFor(sessionFile))).toBe(false);
+			for (let partition = 0; partition < DICTIONARY_PARTITION_COUNT; partition++)
+				expect(fs.existsSync(dictionaryPartitionPath(sessionFile, partition))).toBe(false);
+			expect(manager.getSessionMemoryStats().dictionaryArtifactEnabled).toBe(false);
+			expect(manager.getSessionMemoryStats().metadataDeltaDescriptorBytes).toBe(0);
+		} finally {
+			await manager.close();
 			tempDir.removeSync();
 		}
 	});

@@ -12,7 +12,9 @@ import {
 	applyReducerDelta,
 	type BaseAnchor,
 	BLOCK_CACHE_BUDGET_BYTES,
+	BoundedDictionaryArtifactBuilder,
 	BoundedDictionaryBuilder,
+	BoundedDictionaryIdSet,
 	BoundedLabelsPinsStore,
 	BoundedParentArtifactBuilder,
 	BoundedParentChildrenIndex,
@@ -24,15 +26,28 @@ import {
 	DESCRIPTOR_BYTES,
 	type DescriptorSnapshot,
 	DICTIONARY_BUILD_PEAK_BYTES,
+	DICTIONARY_PARTITION_COUNT,
+	type DictionaryArtifactFlushTarget,
+	type DictionaryArtifactRecordInput,
+	type DictionaryIdDetector,
+	type DictionaryPartitionCommit,
+	dictionaryPartitionForId,
 	ENTRY_CACHE_BUDGET_BYTES,
 	FixedCacheAccount,
+	finalizeDictionaryArtifactCommit,
 	foldReducerStates,
 	getLastModelChangeRole,
 	isDerivedSessionMemoryFile,
+	isValidMetadataDeltaCommit,
+	isValidMetadataDeltaValue,
 	LABELS_PINS_BUDGET_BYTES,
 	MAX_REDUCER_INLINE_BYTES,
+	type MetadataDeltaArtifactCommit,
+	metadataDeltaValueDescriptor,
 	type ParentBucketRecordInput,
 	parentBucketForId,
+	parseDictionaryArtifactCommit,
+	parseDictionaryPartitionRecord,
 	parseParentBucketRecord,
 	ReducerBudget,
 	type ReopenEvidence,
@@ -42,6 +57,7 @@ import {
 	SESSION_MEMORY_ACCEPTANCE_BUDGET_BYTES,
 	SESSION_MEMORY_STEADY_STATE_BUDGET_BYTES,
 	SessionMemoryAccountant,
+	serializeDictionaryPartitionRecord,
 	serializeParentBucketRecord,
 	TAIL_BUFFER_BUDGET_BYTES,
 	type TailRecordInput,
@@ -547,6 +563,9 @@ describe("isDerivedSessionMemoryFile", () => {
 			"session.spill.commit",
 			"session.spill.buckets",
 			"session.spill.dict-0",
+			"session.spill.dict-meta",
+			"session.spill.dict-part-0003",
+			"session.spill.metadata-delta",
 			"session.spill.parent-0000",
 			"session.spill.parent-0063",
 			"session.spill.capture-abc.tmp",
@@ -749,5 +768,344 @@ describe("boundary: accountant enforces the 64 MiB provider peak without retenti
 		accountant.release(SESSION_MEMORY_ACCEPTANCE_BUDGET_BYTES - 1);
 		expect(accountant.totalBytes).toBe(0);
 		expect(accountant.tryCharge(1024)).toBe(true);
+	});
+});
+
+describe("dictionary partition record serialization", () => {
+	it("round-trips a partition record deterministically", () => {
+		const input = {
+			term: "entry-0001",
+			dictId: 7,
+			ordinal: 12,
+			seq: 5,
+			byteOffset: 1024,
+			byteLength: 96,
+			recordDigest: "a".repeat(64),
+			parentId: "entry-0000",
+			entryType: "message",
+		};
+		const line = serializeDictionaryPartitionRecord(input);
+		expect(line.endsWith("\n")).toBe(true);
+		const parsed = parseDictionaryPartitionRecord(line);
+		expect(parsed).toEqual(input);
+	});
+
+	it("rejects malformed, empty, or out-of-bounds partition records", () => {
+		const validTail = (): string => `"d":"${"a".repeat(64)}","p":null,"e":"message"}`;
+		expect(parseDictionaryPartitionRecord("not-json\n")).toBeUndefined();
+		expect(parseDictionaryPartitionRecord(`{"t":"","i":0,"o":0,"s":0,"b":0,"l":1,${validTail()}\n`)).toBeUndefined();
+		expect(
+			parseDictionaryPartitionRecord(`{"t":"id","i":0,"o":-1,"s":0,"b":0,"l":1,${validTail()}\n`),
+		).toBeUndefined();
+		expect(
+			parseDictionaryPartitionRecord(`{"t":"id","i":0,"o":0,"s":0,"b":0,"l":0,${validTail()}\n`),
+		).toBeUndefined();
+		expect(
+			parseDictionaryPartitionRecord(
+				`{"t":"id","i":0,"o":0,"s":0,"b":0,"l":1,"d":"short","p":null,"e":"message"}\n`,
+			),
+		).toBeUndefined();
+		expect(
+			parseDictionaryPartitionRecord(`{"t":"id","i":0,"o":0,"s":0,"b":0,"l":1,${validTail()}"p":42}\n`),
+		).toBeUndefined();
+		expect(
+			parseDictionaryPartitionRecord(`{"t":"id","i":-1,"o":0,"s":0,"b":0,"l":1,${validTail()}\n`),
+		).toBeUndefined();
+	});
+
+	it("assigns the same id to the same partition deterministically", () => {
+		const first = dictionaryPartitionForId("entry-0001");
+		expect(dictionaryPartitionForId("entry-0001")).toBe(first);
+		expect(first).toBeGreaterThanOrEqual(0);
+		expect(first).toBeLessThan(DICTIONARY_PARTITION_COUNT);
+		expect(dictionaryPartitionForId("entry-0002")).toBeGreaterThanOrEqual(0);
+	});
+});
+
+describe("dictionary artifact meta binding", () => {
+	const indexDigest = "f".repeat(64);
+	const partition = (size: number, digest: string, records: number): DictionaryPartitionCommit => ({
+		size,
+		digest,
+		records,
+		complete: true,
+	});
+
+	it("finalizes self-authenticating deterministic meta bytes", () => {
+		const commit = {
+			header: { version: 2 as const, sessionId: "sess", sidecarIneligible: false },
+			indexDigest,
+			partitions: [0, 1, 2, 3].map(item => partition(100 + item, `${item}`.repeat(64), 2)),
+			recordCount: 8,
+			uniqueTerms: 8,
+			totalBytes: 400,
+			duplicateIds: [],
+			sidecarIneligible: false,
+		};
+		const first = finalizeDictionaryArtifactCommit(commit);
+		const second = finalizeDictionaryArtifactCommit(commit);
+		expect(first.bytes).toBe(second.bytes);
+		expect(first.commit.metaSize).toBe(first.bytes.length);
+		expect(first.commit.metaDigest).toBe(createHash("sha256").update(first.bytes).digest("hex"));
+		const payload = JSON.parse(first.bytes) as Record<string, unknown>;
+		expect("metaSize" in payload).toBe(false);
+		expect("metaDigest" in payload).toBe(false);
+	});
+
+	it("parses exact meta bytes and recomputes the digest over the exact bytes", () => {
+		const commit = {
+			header: { version: 2 as const, sessionId: "sess", sidecarIneligible: false },
+			indexDigest,
+			partitions: [0, 1, 2, 3].map(item => partition(10 + item, `${item + 10}`.repeat(32), 1)),
+			recordCount: 4,
+			uniqueTerms: 4,
+			totalBytes: 100,
+			duplicateIds: [],
+			sidecarIneligible: false,
+		};
+		const { bytes, commit: finalized } = finalizeDictionaryArtifactCommit(commit);
+		const parsed = parseDictionaryArtifactCommit(bytes);
+		expect(parsed).toEqual(finalized);
+		expect(parsed?.metaSize).toBe(Buffer.byteLength(bytes, "utf8"));
+		expect(parsed?.metaDigest).toBe(createHash("sha256").update(bytes).digest("hex"));
+	});
+
+	it("rejects structurally invalid or tampered meta bytes", () => {
+		expect(parseDictionaryArtifactCommit("garbage")).toBeUndefined();
+		expect(parseDictionaryArtifactCommit("")).toBeUndefined();
+		const commit = {
+			header: { version: 2 as const, sessionId: "sess", sidecarIneligible: false },
+			indexDigest,
+			partitions: [0, 1, 2, 3].map(item => partition(10 + item, `${item + 10}`.repeat(32), 1)),
+			recordCount: 4,
+			uniqueTerms: 4,
+			totalBytes: 100,
+			duplicateIds: [],
+			sidecarIneligible: false,
+		};
+		const { bytes } = finalizeDictionaryArtifactCommit(commit);
+		const flipped = bytes.slice(0, 4) + (bytes[4] === "0" ? "1" : "0") + bytes.slice(5);
+		expect(parseDictionaryArtifactCommit(flipped)).toBeUndefined();
+		expect(parseDictionaryArtifactCommit(`${bytes}extra`)).toBeUndefined();
+	});
+});
+
+describe("BoundedDictionaryArtifactBuilder", () => {
+	class InMemoryFlushTarget implements DictionaryArtifactFlushTarget {
+		readonly partitions: string[][] = Array.from({ length: DICTIONARY_PARTITION_COUNT }, () => []);
+		writePartitionLines(partition: number, lines: readonly string[]): boolean {
+			this.partitions[partition]!.push(...lines);
+			return true;
+		}
+		getPartitionCommit(partition: number): DictionaryPartitionCommit {
+			const lines = this.partitions[partition]!;
+			const hash = createHash("sha256");
+			let size = 0;
+			for (const line of lines) {
+				hash.update(line, "utf8");
+				size += Buffer.byteLength(line, "utf8");
+			}
+			return { size, digest: hash.digest("hex"), records: lines.length, complete: true };
+		}
+	}
+
+	const record = (id: string, ordinal: number): DictionaryArtifactRecordInput => ({
+		id,
+		ordinal,
+		seq: ordinal,
+		byteOffset: ordinal * 100,
+		byteLength: 80,
+		recordDigest: "d".repeat(64),
+		parentId: ordinal === 0 ? null : `p-${ordinal}`,
+		entryType: "message",
+	});
+
+	it("preserves exact duplicate detection after promoting the small-id set", () => {
+		const detector = new BoundedDictionaryIdSet();
+		for (let index = 0; index < 5_000; index++) {
+			if (detector.add(`entry-${index}`) !== "added") throw new Error(`unexpected duplicate at ${index}`);
+		}
+		expect(detector.has("entry-4999")).toBe(true);
+		expect(detector.add("entry-4999")).toBe("duplicate");
+		expect(detector.has("missing")).toBe(false);
+	});
+	it("builds deterministic partitions within the 20 MiB build peak", () => {
+		const target = new InMemoryFlushTarget();
+		const builder = new BoundedDictionaryArtifactBuilder({ target });
+		const count = 20_000;
+		for (let index = 0; index < count; index++) {
+			expect(builder.add(record(`entry-${index}`, index)).kind).toBe("ok");
+		}
+		const built = builder.finish("sess", "a".repeat(64));
+		expect(built.kind).toBe("ok");
+		if (built.kind !== "ok") throw new Error("expected ok build");
+		expect(built.stats.totalRecords).toBe(count);
+		expect(built.stats.uniqueTerms).toBe(count);
+		expect(built.stats.peakBytes).toBeLessThanOrEqual(DICTIONARY_BUILD_PEAK_BYTES);
+		expect(built.stats.sidecarIneligible).toBe(false);
+		expect(built.commit.partitions).toHaveLength(DICTIONARY_PARTITION_COUNT);
+		const totalRecords = built.commit.partitions.reduce((sum, partition) => sum + partition.records, 0);
+		expect(totalRecords).toBe(count);
+		const allTerms = target.partitions.flat().map(line => parseDictionaryPartitionRecord(line)?.term);
+		expect(allTerms).toHaveLength(count);
+		expect(allTerms).toContain("entry-0");
+		expect(allTerms).toContain(`entry-${count - 1}`);
+	});
+
+	it("marks the artifact sidecar-ineligible on duplicate record ids", () => {
+		const target = new InMemoryFlushTarget();
+		const builder = new BoundedDictionaryArtifactBuilder({ target });
+		builder.add(record("dup", 0));
+		builder.add(record("dup", 1));
+		const built = builder.finish("sess", "a".repeat(64));
+		expect(built.kind).toBe("ok");
+		if (built.kind !== "ok") throw new Error("expected ok build");
+		expect(built.stats.sidecarIneligible).toBe(true);
+		expect(built.stats.duplicateIds).toEqual(["dup"]);
+		expect(built.commit.header.sidecarIneligible).toBe(true);
+	});
+
+	it("reports budget_exceeded when a single record overflows the fixed peak", () => {
+		const builder = new BoundedDictionaryArtifactBuilder({
+			peakBudgetBytes: 64,
+			partitionBufferBytes: 128,
+			journalBytes: 256,
+			target: new InMemoryFlushTarget(),
+		});
+		const result = builder.add(record("x".repeat(300), 0));
+		expect(result.kind).toBe("budget_exceeded");
+		if (result.kind === "budget_exceeded") {
+			expect(result.peakBytes).toBeGreaterThan(result.budgetBytes);
+		}
+	});
+
+	it("fails closed when the flush target rejects writes", () => {
+		const failing: DictionaryArtifactFlushTarget = {
+			writePartitionLines: () => false,
+			getPartitionCommit: _partition => ({ size: 0, digest: "0".repeat(64), records: 0, complete: false }),
+		};
+		const builder = new BoundedDictionaryArtifactBuilder({
+			partitionBufferBytes: 64,
+			journalBytes: 256,
+			target: failing,
+		});
+		expect(builder.add(record("id-1", 0)).kind).toBe("flush_failed");
+		expect(builder.finish("sess", "a".repeat(64)).kind).toBe("flush_failed");
+	});
+
+	it("fails closed when the duplicate oracle cannot prove uniqueness", () => {
+		const full: DictionaryIdDetector = { add: () => "full" };
+		const builder = new BoundedDictionaryArtifactBuilder({ target: new InMemoryFlushTarget(), detector: full });
+		builder.add(record("id", 0));
+		const built = builder.finish("sess", "a".repeat(64));
+		expect(built.kind).toBe("ok");
+		if (built.kind !== "ok") throw new Error("expected ok build");
+		expect(built.stats.sidecarIneligible).toBe(true);
+	});
+
+	it("keeps the buffered peak within the fixed partition/journal model", () => {
+		const builder = new BoundedDictionaryArtifactBuilder({
+			partitionBufferBytes: 128,
+			journalBytes: 256,
+			target: new InMemoryFlushTarget(),
+		});
+		for (let index = 0; index < 500; index++) {
+			expect(builder.add(record(`entry-${index}`, index)).kind).toBe("ok");
+		}
+		const built = builder.finish("sess", "a".repeat(64));
+		expect(built.kind).toBe("ok");
+		if (built.kind !== "ok") throw new Error("expected ok build");
+		// The actual buffered content never exceeds the fixed buffer model even
+		// though hundreds of lines streamed through the journal.
+		expect(built.stats.peakBytes).toBeGreaterThan(0);
+		expect(built.stats.peakBytes).toBeLessThanOrEqual(4 * 128 + 256 + 512);
+	});
+});
+
+describe("metadata-delta binding", () => {
+	it("computes exact value descriptors over exact bytes", () => {
+		const lineBytes = new TextEncoder().encode('{"type":"mode_change","id":"m"}\n');
+		const descriptor = metadataDeltaValueDescriptor({
+			key: "mode_change",
+			kind: "mode_change",
+			ordinal: 3,
+			position: 0,
+			offset: 12,
+			lineBytes,
+		});
+		expect(descriptor.length).toBe(lineBytes.byteLength);
+		expect(descriptor.sha256).toBe(createHash("sha256").update(lineBytes).digest("hex"));
+		expect(isValidMetadataDeltaValue(descriptor)).toBe(true);
+	});
+
+	it("accepts a self-consistent commit binding", () => {
+		const commit: MetadataDeltaArtifactCommit = {
+			indexDigest: "0".repeat(64),
+			size: 200,
+			sha256: "1".repeat(64),
+			values: [
+				{ key: "a", kind: "mode_change", ordinal: 1, position: 0, offset: 0, length: 100, sha256: "2".repeat(64) },
+				{
+					key: "b",
+					kind: "model_change",
+					ordinal: 2,
+					position: 1,
+					offset: 100,
+					length: 100,
+					sha256: "3".repeat(64),
+				},
+			],
+		};
+		expect(isValidMetadataDeltaCommit(commit)).toBe(true);
+	});
+
+	it("rejects duplicate keys/positions, out-of-range values, and over-budget counts", () => {
+		const base = {
+			indexDigest: "0".repeat(64),
+			size: 100,
+			sha256: "1".repeat(64),
+			values: [
+				{ key: "a", kind: "mode_change", ordinal: 1, position: 0, offset: 0, length: 100, sha256: "2".repeat(64) },
+			],
+		};
+		expect(isValidMetadataDeltaCommit(base)).toBe(true);
+		expect(
+			isValidMetadataDeltaCommit({
+				...base,
+				values: [base.values[0], { ...base.values[0]!, key: "a" }],
+			}),
+		).toBe(false);
+		expect(
+			isValidMetadataDeltaCommit({
+				...base,
+				values: [base.values[0], { ...base.values[0]!, key: "b", position: 0 }],
+			}),
+		).toBe(false);
+		expect(
+			isValidMetadataDeltaCommit({
+				...base,
+				values: [{ ...base.values[0]!, offset: 50, length: 60 }],
+			}),
+		).toBe(false);
+		expect(
+			isValidMetadataDeltaCommit({
+				...base,
+				values: [{ ...base.values[0]!, sha256: "zz" }],
+			}),
+		).toBe(false);
+		expect(
+			isValidMetadataDeltaCommit({
+				...base,
+				values: Array.from({ length: 257 }, (_, index) => ({
+					key: `k${index}`,
+					kind: "mode_change",
+					ordinal: index,
+					position: index,
+					offset: 0,
+					length: 1,
+					sha256: "2".repeat(64),
+				})),
+			}),
+		).toBe(false);
 	});
 });

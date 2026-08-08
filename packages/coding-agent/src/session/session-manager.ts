@@ -89,6 +89,8 @@ import { classifyNativePublishOutcome, formatNativePublishDiagnostic } from "./i
 import {
 	applyReducerDelta,
 	type BaseAnchor,
+	BoundedDictionaryArtifactBuilder,
+	BoundedDictionaryIdSet,
 	BoundedLabelsPinsStore,
 	BoundedParentArtifactBuilder,
 	BoundedParentChildrenIndex,
@@ -98,10 +100,24 @@ import {
 	computeLineDigest,
 	computeTailRecordChecksum,
 	type DescriptorSnapshot,
+	DICTIONARY_PARTITION_BUFFER_BYTES,
+	DICTIONARY_PARTITION_COUNT,
+	type DictionaryArtifactBuildResult,
+	type DictionaryArtifactCommit,
+	type DictionaryArtifactFlushTarget,
+	type DictionaryPartitionCommit,
+	dictionaryArtifactRuntimeBytes,
+	dictionaryPartitionForId,
 	FixedCacheAccount,
+	finalizeDictionaryArtifactCommit,
 	getLastModelChangeRole as getReducerLastModelChangeRole,
 	isDerivedSessionMemoryFile,
+	isValidMetadataDeltaCommit,
 	LABELS_PINS_BUDGET_BYTES,
+	MAX_REDUCER_INLINE_BYTES,
+	type MetadataDeltaArtifactCommit,
+	type MetadataDeltaValue,
+	metadataDeltaDescriptorResidentBytes,
 	PARENT_CHILDREN_BUCKET_COUNT,
 	PARENT_CHILDREN_BUDGET_BYTES,
 	PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT,
@@ -109,6 +125,7 @@ import {
 	type ParentBucketCommit,
 	parentArtifactRuntimeBytes,
 	parentBucketForId,
+	parseDictionaryPartitionRecord,
 	parseParentBucketRecord,
 	REDUCER_BUDGET_BYTES,
 	type ReducerState,
@@ -118,6 +135,7 @@ import {
 	residentStringBytes,
 	SessionMemoryAccountant,
 	sameDescriptor,
+	serializeDictionaryPartitionRecord,
 	serializeParentBucketRecord,
 	type TailRecord,
 	type TailRecordKind,
@@ -436,6 +454,10 @@ export interface SessionMemoryStats {
 	consecutiveBuildFailures: number;
 	/** Persistent bounded parent→children artifact is adopted and usable. */
 	parentArtifactEnabled: boolean;
+	/** Persistent bounded dictionary artifact is adopted and usable. */
+	dictionaryArtifactEnabled: boolean;
+	/** Reducer-bucket bytes retained by metadata-delta descriptors (fixed accounting). */
+	metadataDeltaDescriptorBytes: number;
 }
 
 export interface SessionMessageEntry extends SessionEntryBase {
@@ -720,7 +742,6 @@ export interface ColdEntryIndex {
 	entryType?: string;
 }
 
-/** Sidecar runtime state attached to a SessionManager with an active cold region. */
 export interface SessionMemorySidecarRuntime {
 	/** Transcript v5 remains authoritative; sidecars are disposable/rebuildable. */
 	enabled: boolean;
@@ -735,12 +756,21 @@ export interface SessionMemorySidecarRuntime {
 	commitPath: string;
 	/** Directory prefix of the persistent `.spill.parent-<bucket>` bucket files. */
 	parentPathPrefix: string;
+	/** Directory prefix of the persistent `.spill.dict-part-<partition>` partition files. */
+	dictionaryPathPrefix: string;
+	/** Path of the persistent `.spill.dict-meta` finalization file. */
+	dictionaryMetaPath: string;
+	/** Path of the persistent `.spill.metadata-delta` section. */
+	metadataDeltaPath: string;
 	retirementFirstKeptEntryId: string | undefined;
 	/** Hot-suffix byte total (accountant-bounded to ≤ 16 MiB). */
 	hotSuffixBytes: number;
 	accountant: SessionMemoryAccountant;
 	reducer: ReducerState;
+	/** Resident inline provider-affecting entries (merged order minus demoted slots). */
 	providerStateEntries: SessionEntry[];
+	/** Merged provider-list order as keys (inline + demoted); reopened/appended slots stay exact. */
+	providerStateOrder: string[];
 	blockCache: FixedCacheAccount;
 	parentChildrenCache: Map<
 		string,
@@ -765,6 +795,13 @@ export interface SessionMemorySidecarRuntime {
 	indexHash: crypto.Hash;
 	/** Persistent bounded parent→children artifact state; absent = parent lookups fail closed. */
 	parentArtifact?: ParentArtifactRuntimeState;
+	/** Persistent bounded dictionary artifact state; absent = dictionary lookups fail closed to the cold scan. */
+	dictionary?: DictionaryArtifactRuntimeState;
+	/** Persistent metadata-delta section state; absent = no demoted provider values. */
+	metadataDelta?: MetadataDeltaArtifactRuntimeState;
+	/** Lazily built 24-bit fingerprints for O(1) fail-closed ID generation when no persistent dictionary exists. */
+	coldIdHashes?: BoundedColdIdHashSet;
+	coldIdHashesDescriptor?: SessionStorageStat;
 }
 
 /** Retained runtime state of the disposable parent→children artifact (block-cache charged). */
@@ -781,10 +818,72 @@ interface ParentArtifactRuntimeState {
 	budgetBytes: number;
 }
 
+/** Retained runtime state of the disposable dictionary artifact (block-cache charged). */
+interface DictionaryArtifactRuntimeState {
+	/** Exact `.spill.idx` digest the artifact covers; lookups require `indexDigest === runtime.indexDigest`. */
+	indexDigest: string;
+	/** Committed per-partition exact-byte size + sha256, updated incrementally on append. */
+	partitions: DictionaryPartitionCommit[];
+	/** Exact `.spill.dict-meta` bytes (size + digest). */
+	metaSize: number;
+	metaDigest: string;
+	recordCount: number;
+	uniqueTerms: number;
+	totalBytes: number;
+	/** Bounded duplicate-id diagnostics; non-empty ⇒ the artifact is never adopted. */
+	duplicateIds: readonly string[];
+	sidecarIneligible: boolean;
+	/** Block-cache bytes charged for this retained state; released on invalidation. */
+	chargedBytes: number;
+	/** On-disk byte cap for a single partition append; fixed unless a test shrinks it. */
+	budgetBytes: number;
+	/** Running per-partition hashes/sizes/records for append-time rebinding. */
+	partitionHashes: crypto.Hash[];
+	partitionSizes: number[];
+	partitionRecords: number[];
+	/** Descriptor of the exact meta bytes whose digest was validated for artifact use. */
+	validatedDescriptor?: SessionStorageStat;
+}
+
+/** Retained runtime state of the disposable metadata-delta section (reducer-bucket accounting). */
+interface MetadataDeltaArtifactRuntimeState {
+	/** Exact `.spill.idx` digest the sidecar set was built with. */
+	indexDigest: string;
+	/** Exact bytes of the `.spill.metadata-delta` file. */
+	size: number;
+	sha256: string;
+	/** Live running hash of the delta bytes; updated on every value append. */
+	hash: crypto.Hash;
+	/** Demoted value descriptors keyed by provider key (positions derived at marker time). */
+	byKey: Map<string, Omit<MetadataDeltaValue, "key" | "position">>;
+	/** Reducer-bucket bytes retained by the descriptors (fixed accounting, reported in stats). */
+	descriptorBytes: number;
+	/** Fixed on-disk byte cap for the section. */
+	budgetBytes: number;
+	/** Descriptor of the exact delta bytes whose digest was validated. */
+	validatedDescriptor?: SessionStorageStat;
+}
+
 /** Bucket file paths for the disposable parent artifact derived from an index path. */
 function parentBucketPaths(indexPath: string, bucketCount = PARENT_CHILDREN_BUCKET_COUNT): string[] {
 	const prefix = indexPath.replace(/\.spill\.idx$/, ".spill.parent-");
 	return Array.from({ length: bucketCount }, (_, bucket) => `${prefix}${bucket.toString().padStart(4, "0")}`);
+}
+
+/** Partition file paths for the disposable dictionary artifact derived from an index path. */
+function dictionaryPartitionPaths(indexPath: string, partitionCount = DICTIONARY_PARTITION_COUNT): string[] {
+	const prefix = indexPath.replace(/\.spill\.idx$/, ".spill.dict-part-");
+	return Array.from({ length: partitionCount }, (_, partition) => `${prefix}${partition.toString().padStart(4, "0")}`);
+}
+
+/** Path of the disposable dictionary meta file derived from an index path. */
+function dictionaryMetaPathFor(indexPath: string): string {
+	return indexPath.replace(/\.spill\.idx$/, ".spill.dict-meta");
+}
+
+/** Path of the disposable metadata-delta section derived from an index path. */
+function metadataDeltaPathFor(indexPath: string): string {
+	return indexPath.replace(/\.spill\.idx$/, ".spill.metadata-delta");
 }
 
 /** Count one parent's records inside a verified bucket byte range. */
@@ -803,6 +902,7 @@ interface SessionMemoryCommitContents extends CommitMarkerContents {
 	retirementFirstKeptEntryId?: string;
 	leafId?: string;
 	reducer?: ReducerState;
+	/** Resident inline provider-affecting entries only; oversized values live in `metadataDelta`. */
 	providerStateEntries?: SessionEntry[];
 	labels?: Array<[string, string]>;
 	usageStatistics?: UsageStatistics;
@@ -811,6 +911,10 @@ interface SessionMemoryCommitContents extends CommitMarkerContents {
 	indexDigest?: string;
 	/** Bounded parent→children artifact binding; absent when no artifact was published for this marker. */
 	parentIndex?: ParentArtifactCommit;
+	/** Bounded dictionary artifact binding; absent when no dictionary was published for this marker. */
+	dictionary?: DictionaryArtifactCommit;
+	/** Metadata-delta section binding; absent when no provider value was demoted. */
+	metadataDelta?: MetadataDeltaArtifactCommit;
 }
 
 function isValidPersistedReducerState(value: ReducerState): boolean {
@@ -863,14 +967,12 @@ function tailRecordKindForEntry(entry: SessionEntry): TailRecordKind {
  */
 const BOUNDED_FIRST_OPEN_MAX_LINE_BYTES = 8 * 1024 * 1024;
 const FORK_PATCH_OVERLAY_BUDGET_BYTES = 8 * 1024 * 1024;
-const residentHotEntryBytes = (serializedBytes: number): number => residentRecordBytes(serializedBytes * 2 + 256);
-/** Maximum records accepted by the bounded first-open hash table. */
-const BOUNDED_FIRST_OPEN_MAX_RECORDS = 1_000_000;
-const BOUNDED_FIRST_OPEN_ID_TABLE_CAPACITY = 1_250_003;
+const COLD_ID_HASH_CAPACITY = 1_250_003;
+const COLD_ID_HASH_BYTES = COLD_ID_HASH_CAPACITY * 3;
 
-class BoundedFirstOpenIdSet {
-	readonly #high = new Uint32Array(BOUNDED_FIRST_OPEN_ID_TABLE_CAPACITY);
-	readonly #low = new Uint32Array(BOUNDED_FIRST_OPEN_ID_TABLE_CAPACITY);
+class BoundedColdIdHashSet {
+	readonly #high = new Uint8Array(COLD_ID_HASH_CAPACITY);
+	readonly #low = new Uint16Array(COLD_ID_HASH_CAPACITY);
 	#size = 0;
 
 	#hash(value: string, seed: number): number {
@@ -882,44 +984,214 @@ class BoundedFirstOpenIdSet {
 		return hash;
 	}
 
+	#fingerprint(value: string): [number, number] {
+		let fingerprint = this.#hash(value, 0x811c9dc5) & 0xffffff;
+		if (fingerprint === 0) fingerprint = 1;
+		return [(fingerprint >>> 16) & 0xff, fingerprint & 0xffff];
+	}
+
 	has(value: string): boolean {
-		let high = this.#hash(value, 0x811c9dc5);
-		const low = this.#hash(value, 0x9e3779b9);
-		if (high === 0 && low === 0) high = 1;
-		let slot = low % BOUNDED_FIRST_OPEN_ID_TABLE_CAPACITY;
-		for (let probes = 0; probes < BOUNDED_FIRST_OPEN_ID_TABLE_CAPACITY; probes++) {
+		const [high, low] = this.#fingerprint(value);
+		let slot = this.#hash(value, 0x9e3779b9) % COLD_ID_HASH_CAPACITY;
+		for (let probes = 0; probes < COLD_ID_HASH_CAPACITY; probes++) {
 			const existingHigh = this.#high[slot];
 			const existingLow = this.#low[slot];
 			if (existingHigh === 0 && existingLow === 0) return false;
 			if (existingHigh === high && existingLow === low) return true;
 			slot++;
-			if (slot === BOUNDED_FIRST_OPEN_ID_TABLE_CAPACITY) slot = 0;
+			if (slot === COLD_ID_HASH_CAPACITY) slot = 0;
 		}
 		return true;
 	}
 
-	add(value: string): "added" | "duplicate" | "full" {
-		if (this.#size >= BOUNDED_FIRST_OPEN_MAX_RECORDS) return "full";
-		let high = this.#hash(value, 0x811c9dc5);
-		const low = this.#hash(value, 0x9e3779b9);
-		if (high === 0 && low === 0) high = 1;
-		let slot = low % BOUNDED_FIRST_OPEN_ID_TABLE_CAPACITY;
-		for (let probes = 0; probes < BOUNDED_FIRST_OPEN_ID_TABLE_CAPACITY; probes++) {
+	add(value: string): boolean {
+		if (this.#size >= 1_000_000) return false;
+		const [high, low] = this.#fingerprint(value);
+		let slot = this.#hash(value, 0x9e3779b9) % COLD_ID_HASH_CAPACITY;
+		for (let probes = 0; probes < COLD_ID_HASH_CAPACITY; probes++) {
 			const existingHigh = this.#high[slot];
 			const existingLow = this.#low[slot];
-			if (existingHigh === high && existingLow === low) return "duplicate";
 			if (existingHigh === 0 && existingLow === 0) {
 				this.#high[slot] = high;
 				this.#low[slot] = low;
 				this.#size++;
-				return "added";
+				return true;
 			}
 			slot++;
-			if (slot === BOUNDED_FIRST_OPEN_ID_TABLE_CAPACITY) slot = 0;
+			if (slot === COLD_ID_HASH_CAPACITY) slot = 0;
 		}
-		return "full";
+		return false;
+	}
+	addUnique(value: string): boolean {
+		if (this.#size >= 1_000_000) return false;
+		const [high, low] = this.#fingerprint(value);
+		let slot = this.#hash(value, 0x9e3779b9) % COLD_ID_HASH_CAPACITY;
+		for (let probes = 0; probes < COLD_ID_HASH_CAPACITY; probes++) {
+			const existingHigh = this.#high[slot];
+			const existingLow = this.#low[slot];
+			if (existingHigh === high && existingLow === low) return false;
+			if (existingHigh === 0 && existingLow === 0) {
+				this.#high[slot] = high;
+				this.#low[slot] = low;
+				this.#size++;
+				return true;
+			}
+			slot++;
+			if (slot === COLD_ID_HASH_CAPACITY) slot = 0;
+		}
+		return false;
 	}
 }
+
+class DiskBackedIdUniquenessCheck {
+	static readonly BUCKETS = 64;
+	static readonly BUFFER_BYTES = 4096;
+	readonly #root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-index-ids-"));
+	readonly #buffers = Array.from({ length: DiskBackedIdUniquenessCheck.BUCKETS }, () =>
+		Buffer.allocUnsafe(DiskBackedIdUniquenessCheck.BUFFER_BYTES),
+	);
+	readonly #positions = new Uint16Array(DiskBackedIdUniquenessCheck.BUCKETS);
+	readonly #fds = new Map<number, number>();
+	#failed = false;
+
+	#hash(value: string, seed: number): number {
+		let hash = seed >>> 0;
+		for (let index = 0; index < value.length; index++) {
+			hash ^= value.charCodeAt(index);
+			hash = Math.imul(hash, 0x01000193) >>> 0;
+		}
+		return hash;
+	}
+
+	#bucketPath(bucket: number): string {
+		return path.join(this.#root, bucket.toString(16).padStart(2, "0"));
+	}
+
+	#flush(bucket: number): void {
+		const length = this.#positions[bucket]!;
+		if (length === 0) return;
+		let fd = this.#fds.get(bucket);
+		if (fd === undefined) {
+			fd = fs.openSync(this.#bucketPath(bucket), "a", 0o600);
+			this.#fds.set(bucket, fd);
+		}
+		fs.writeSync(fd, this.#buffers[bucket]!, 0, length);
+		this.#positions[bucket] = 0;
+	}
+
+	add(value: string): boolean {
+		if (this.#failed) return false;
+		try {
+			const high = this.#hash(value, 0x811c9dc5);
+			const low = this.#hash(value, 0x9e3779b9);
+			const bucket = low & (DiskBackedIdUniquenessCheck.BUCKETS - 1);
+			if (this.#positions[bucket]! + 8 > DiskBackedIdUniquenessCheck.BUFFER_BYTES) this.#flush(bucket);
+			const offset = this.#positions[bucket]!;
+			this.#buffers[bucket]!.writeUInt32LE(high, offset);
+			this.#buffers[bucket]!.writeUInt32LE(low, offset + 4);
+			this.#positions[bucket] = offset + 8;
+			return true;
+		} catch {
+			this.#failed = true;
+			return false;
+		}
+	}
+
+	#hasDuplicate(bytes: Buffer): boolean {
+		const words = new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
+		const count = words.length / 2;
+		const greater = (left: number, right: number): boolean => {
+			const leftHigh = words[left * 2]!;
+			const rightHigh = words[right * 2]!;
+			return leftHigh === rightHigh ? words[left * 2 + 1]! > words[right * 2 + 1]! : leftHigh > rightHigh;
+		};
+		const swap = (left: number, right: number): void => {
+			const leftOffset = left * 2;
+			const rightOffset = right * 2;
+			const high = words[leftOffset]!;
+			const low = words[leftOffset + 1]!;
+			words[leftOffset] = words[rightOffset]!;
+			words[leftOffset + 1] = words[rightOffset + 1]!;
+			words[rightOffset] = high;
+			words[rightOffset + 1] = low;
+		};
+		const siftDown = (start: number, end: number): void => {
+			let root = start;
+			for (;;) {
+				const child = root * 2 + 1;
+				if (child > end) return;
+				let candidate = root;
+				if (greater(child, candidate)) candidate = child;
+				if (child + 1 <= end && greater(child + 1, candidate)) candidate = child + 1;
+				if (candidate === root) return;
+				swap(root, candidate);
+				root = candidate;
+			}
+		};
+		for (let start = Math.floor((count - 2) / 2); start >= 0; start--) siftDown(start, count - 1);
+		for (let end = count - 1; end > 0; end--) {
+			swap(0, end);
+			siftDown(0, end - 1);
+		}
+		for (let index = 1; index < count; index++) {
+			const offset = index * 2;
+			const previous = offset - 2;
+			if (words[offset] === words[previous] && words[offset + 1] === words[previous + 1]) return true;
+		}
+		return false;
+	}
+
+	finish(): boolean {
+		try {
+			for (let bucket = 0; bucket < DiskBackedIdUniquenessCheck.BUCKETS; bucket++) this.#flush(bucket);
+			for (const fd of this.#fds.values()) fs.closeSync(fd);
+			this.#fds.clear();
+			if (this.#failed) return false;
+			for (let bucket = 0; bucket < DiskBackedIdUniquenessCheck.BUCKETS; bucket++) {
+				const bucketPath = this.#bucketPath(bucket);
+				let size: number;
+				try {
+					size = fs.statSync(bucketPath).size;
+				} catch {
+					continue;
+				}
+				if (size % 8 !== 0) return false;
+				const bytes = Buffer.allocUnsafe(size);
+				const fd = fs.openSync(bucketPath, "r");
+				try {
+					let offset = 0;
+					while (offset < size) {
+						const read = fs.readSync(fd, bytes, offset, size - offset, offset);
+						if (read === 0) return false;
+						offset += read;
+					}
+				} finally {
+					fs.closeSync(fd);
+				}
+				if (this.#hasDuplicate(bytes)) return false;
+			}
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	dispose(): void {
+		for (const fd of this.#fds.values()) {
+			try {
+				fs.closeSync(fd);
+			} catch {
+				// Best-effort scratch cleanup.
+			}
+		}
+		this.#fds.clear();
+		fs.rmSync(this.#root, { recursive: true, force: true });
+	}
+}
+/** Persistent secondary artifacts stay optional beyond this fixed build envelope. */
+const PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS = 64 * 1024;
+const PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES = 512 * 1024 * 1024;
+const residentHotEntryBytes = (serializedBytes: number): number => residentRecordBytes(serializedBytes * 2 + 256);
 
 /** State the bounded first-open scan derives without building an entry graph. */
 interface BoundedFirstOpenDiscovery {
@@ -933,10 +1205,12 @@ interface BoundedFirstOpenDiscovery {
 	reducer: ReducerState;
 	/** Aggregated assistant/task usage totals over the linear chain. */
 	usageStatistics: UsageStatistics;
+	/** Number of non-header transcript records proven by the semantic pass. */
+	recordCount: number;
 	/** Current label state derived from `label` entries in chain order. */
 	labels: Array<[string, string]>;
-	/** Latest provider-affecting entries, bounded by the reducer reservation. */
-	providerStateEntries: SessionEntry[];
+	/** Latest provider-affecting entries with exact ordinals, bounded by the reducer reservation. */
+	providerState: Array<{ ordinal: number; entry: SessionEntry }>;
 }
 
 type BoundedLineScanFailure = "read_failed" | "oversized_line" | "unterminated" | "aborted";
@@ -952,6 +1226,11 @@ type BoundedLineScanFailure = "read_failed" | "oversized_line" | "unterminated" 
  * path. Returns `undefined` only after every byte was consumed as a complete
  * newline-terminated line.
  */
+function decodeBoundedJsonLine(lineBytes: Uint8Array): string {
+	const length = lineBytes.at(-1) === 0x0a ? lineBytes.byteLength - 1 : lineBytes.byteLength;
+	return Buffer.from(lineBytes.buffer, lineBytes.byteOffset, length).toString("utf8");
+}
+
 function createBoundedLineChunkConsumer(visit: (lineStart: number, lineBytes: Uint8Array) => boolean | undefined): {
 	consume(chunk: Buffer, chunkStart: number): BoundedLineScanFailure | undefined;
 	hasLargePendingLine(): boolean;
@@ -968,11 +1247,13 @@ function createBoundedLineChunkConsumer(visit: (lineStart: number, lineBytes: Ui
 				if (newline < 0) break;
 				const segment = chunk.subarray(consumed, newline + 1);
 				const lineStart = pendingChunks.length === 0 ? chunkStart + consumed : pendingStart;
-				if (pendingBytes + segment.byteLength > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return "oversized_line";
-				const line =
-					pendingChunks.length === 0
-						? segment
-						: Buffer.concat([...pendingChunks, segment], pendingBytes + segment.byteLength);
+				const lineBytes = pendingBytes + segment.byteLength;
+				if (lineBytes > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return "oversized_line";
+				let line = segment;
+				if (pendingChunks.length > 0) {
+					pendingChunks.push(segment);
+					line = Buffer.concat(pendingChunks, lineBytes);
+				}
 				pendingChunks = [];
 				pendingBytes = 0;
 				if (visit(lineStart, line) === false) return "aborted";
@@ -1001,6 +1282,67 @@ function createBoundedLineChunkConsumer(visit: (lineStart: number, lineBytes: Ui
 	};
 }
 
+function createReusableBoundedLineChunkConsumer(
+	visit: (lineStart: number, lineBytes: Uint8Array) => boolean | undefined,
+): {
+	consume(chunk: Buffer, chunkStart: number): BoundedLineScanFailure | undefined;
+	hasLargePendingLine(): boolean;
+	finish(includeUnterminated?: boolean): BoundedLineScanFailure | undefined;
+} {
+	let pendingBuffer: Buffer | undefined;
+	let pendingBytes = 0;
+	let pendingStart = 0;
+	const ensureCapacity = (required: number): Buffer => {
+		if (pendingBuffer && pendingBuffer.byteLength >= required) return pendingBuffer;
+		let capacity = pendingBuffer?.byteLength ?? 64 * 1024;
+		while (capacity < required) capacity = Math.min(BOUNDED_FIRST_OPEN_MAX_LINE_BYTES, capacity * 2);
+		const grown = Buffer.allocUnsafe(capacity);
+		if (pendingBuffer && pendingBytes > 0) pendingBuffer.copy(grown, 0, 0, pendingBytes);
+		pendingBuffer = grown;
+		return grown;
+	};
+	return {
+		consume(chunk, chunkStart) {
+			let consumed = 0;
+			for (;;) {
+				const newline = chunk.indexOf(0x0a, consumed);
+				if (newline < 0) break;
+				const segment = chunk.subarray(consumed, newline + 1);
+				const lineStart = pendingBytes === 0 ? chunkStart + consumed : pendingStart;
+				const lineBytes = pendingBytes + segment.byteLength;
+				if (lineBytes > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return "oversized_line";
+				let line = segment;
+				if (pendingBytes > 0) {
+					const assembled = ensureCapacity(lineBytes);
+					segment.copy(assembled, pendingBytes);
+					line = assembled.subarray(0, lineBytes);
+				}
+				pendingBytes = 0;
+				if (visit(lineStart, line) === false) return "aborted";
+				consumed = newline + 1;
+			}
+			if (consumed < chunk.byteLength) {
+				if (pendingBytes === 0) pendingStart = chunkStart + consumed;
+				const remainder = chunk.subarray(consumed);
+				const nextBytes = pendingBytes + remainder.byteLength;
+				if (nextBytes > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return "oversized_line";
+				const assembled = ensureCapacity(nextBytes);
+				remainder.copy(assembled, pendingBytes);
+				pendingBytes = nextBytes;
+			}
+			return undefined;
+		},
+		hasLargePendingLine: () => pendingBytes >= 256 * 1024,
+		finish(includeUnterminated = false) {
+			if (pendingBytes === 0) return undefined;
+			if (!includeUnterminated) return "unterminated";
+			const line = pendingBuffer!.subarray(0, pendingBytes);
+			pendingBytes = 0;
+			return visit(pendingStart, line) === false ? "aborted" : undefined;
+		},
+	};
+}
+
 function scanTranscriptLinesBounded(
 	storage: SessionStorage,
 	filePath: string,
@@ -1008,7 +1350,14 @@ function scanTranscriptLinesBounded(
 	visit: (lineStart: number, lineBytes: Uint8Array) => boolean | undefined,
 	result?: { stat?: SessionStorageStat },
 	allowUnterminated = false,
+	reuseLineAssembly = false,
 ): BoundedLineScanFailure | undefined {
+	const chunkBytes =
+		size > PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES
+			? reuseLineAssembly
+				? 324 * 1024
+				: 256 * 1024
+			: TRANSCRIPT_CAPTURE_CHUNK_BYTES;
 	if (storage instanceof FileSessionStorage) {
 		const flags = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0);
 		let fd: number | undefined;
@@ -1016,10 +1365,15 @@ function scanTranscriptLinesBounded(
 			fd = fs.openSync(filePath, flags);
 			const before = fs.fstatSync(fd, { bigint: true });
 			if (!before.isFile() || before.nlink > 1 || Number(before.size) < size) return "read_failed";
-			const consumer = createBoundedLineChunkConsumer(visit);
+			const consumer = reuseLineAssembly
+				? createReusableBoundedLineChunkConsumer(visit)
+				: createBoundedLineChunkConsumer(visit);
 			let pos = 0;
+			let useLargeRecordCadence = false;
+			let bytesSinceGc = 0;
+
 			while (pos < size) {
-				const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, size - pos);
+				const length = Math.min(chunkBytes, size - pos);
 				const chunk = Buffer.allocUnsafe(length);
 				let offset = 0;
 				while (offset < length) {
@@ -1030,8 +1384,19 @@ function scanTranscriptLinesBounded(
 				const failure = consumer.consume(chunk, pos);
 				if (failure) return failure;
 				pos += length;
-				const gcIntervalBytes = consumer.hasLargePendingLine() ? 23 * 1024 * 1024 : 4 * 1024 * 1024;
-				if (pos % gcIntervalBytes === 0) Bun.gc(true);
+				useLargeRecordCadence ||= consumer.hasLargePendingLine();
+				const gcIntervalBytes = useLargeRecordCadence
+					? size > PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES
+						? reuseLineAssembly
+							? 60 * 1024 * 1024
+							: 32 * 1024 * 1024
+						: 23 * 1024 * 1024
+					: 4 * 1024 * 1024;
+				bytesSinceGc += length;
+				if (bytesSinceGc >= gcIntervalBytes) {
+					Bun.gc(true);
+					bytesSinceGc = 0;
+				}
 			}
 			const after = fs.fstatSync(fd, { bigint: true });
 			const named = fs.lstatSync(filePath, { bigint: true });
@@ -1065,10 +1430,14 @@ function scanTranscriptLinesBounded(
 			if (fd !== undefined) fs.closeSync(fd);
 		}
 	}
-	const consumer = createBoundedLineChunkConsumer(visit);
+	const consumer = reuseLineAssembly
+		? createReusableBoundedLineChunkConsumer(visit)
+		: createBoundedLineChunkConsumer(visit);
 	let pos = 0;
+	let useLargeRecordCadence = false;
+	let bytesSinceGc = 0;
 	while (pos < size) {
-		const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, size - pos);
+		const length = Math.min(chunkBytes, size - pos);
 		let chunk: Uint8Array;
 		try {
 			chunk = storage.readRangeSync!(filePath, pos, length).bytes;
@@ -1078,8 +1447,17 @@ function scanTranscriptLinesBounded(
 		const failure = consumer.consume(Buffer.from(chunk), pos);
 		if (failure) return failure;
 		pos += length;
-		const gcIntervalBytes = consumer.hasLargePendingLine() ? 23 * 1024 * 1024 : 4 * 1024 * 1024;
-		if (pos % gcIntervalBytes === 0) Bun.gc(true);
+		useLargeRecordCadence ||= consumer.hasLargePendingLine();
+		const gcIntervalBytes = useLargeRecordCadence
+			? size > PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES
+				? 32 * 1024 * 1024
+				: 23 * 1024 * 1024
+			: 4 * 1024 * 1024;
+		bytesSinceGc += length;
+		if (bytesSinceGc >= gcIntervalBytes) {
+			Bun.gc(true);
+			bytesSinceGc = 0;
+		}
 	}
 	return consumer.finish(allowUnterminated);
 }
@@ -1806,7 +2184,11 @@ function generateId(byId: { has(id: string): boolean }): string {
 		const id = crypto.randomUUID().slice(-8);
 		if (!byId.has(id)) return id;
 	}
-	return Snowflake.next(); // fallback to full snowflake id
+	for (let i = 0; i < 100; i++) {
+		const id = Snowflake.next();
+		if (!byId.has(id)) return id;
+	}
+	throw new Error("Unable to generate a unique session entry id");
 }
 
 /** Migrate v1 → v2: add id/parentId tree structure. Mutates in place. */
@@ -3231,6 +3613,7 @@ function createTranscriptSnapshotHandle(
 				}
 			},
 			scanResult,
+			true,
 			true,
 		);
 		if (failure && !(failure === "aborted" && aborted)) throw new Error(`transcript_scan_${failure}`);
@@ -6528,6 +6911,7 @@ export class SessionManager {
 				!Array.isArray(commit.providerStateEntries) ||
 				!commit.usageStatistics ||
 				!Array.isArray(commit.labels) ||
+				typeof commit.indexDigest !== "string" ||
 				!sameDescriptor(commit.descriptor, descriptor) ||
 				!this.#validateColdBase(commit.base)
 			)
@@ -6576,23 +6960,18 @@ export class SessionManager {
 			// The commit authenticates base + tail but not the index; prove the exact
 			// `.spill.idx` bytes before any cold lookup may trust it. Absent or
 			// mismatched digests fail closed to the eager authoritative path.
-			const indexHash = crypto.createHash("sha256");
 			let indexDescriptor: SessionStorageStat;
 			try {
 				indexDescriptor = this.storage.statSync(runtime.indexPath);
-				const indexSize = indexDescriptor.size;
-				for (let offset = 0; offset < indexSize; offset += TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
-					const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, indexSize - offset);
-					indexHash.update(this.storage.readRangeSync(runtime.indexPath, offset, length).bytes);
-					if ((offset & (4 * 1024 * 1024 - 1)) === 0) Bun.gc(true);
-				}
 			} catch {
 				return false;
 			}
-			if (indexHash.copy().digest("hex") !== commit.indexDigest) {
-				this.#lazyReopenFallbackReason = "index_digest_mismatch";
+			if (!this.#validateColdIndexCoverage(sessionFile, descriptor.size, commit.indexDigest)) {
+				if (this.#lazyReopenFallbackReason !== "index_digest_mismatch")
+					this.#lazyReopenFallbackReason = "index_coverage_invalid";
 				return false;
 			}
+			Bun.gc(true);
 			if (fullBaseEmptyTail) {
 				let leafOrdinal: number | undefined;
 				let boundaryOrdinal: number | undefined;
@@ -6603,9 +6982,7 @@ export class SessionManager {
 					indexSize,
 					(_offset, lineBytes) => {
 						try {
-							const record = JSON.parse(
-								Buffer.from(lineBytes.subarray(0, lineBytes.byteLength - 1)).toString("utf8"),
-							) as { id?: unknown; ordinal?: unknown };
+							const record = JSON.parse(decodeBoundedJsonLine(lineBytes)) as { id?: unknown; ordinal?: unknown };
 							if (typeof record.id !== "string" || !Number.isSafeInteger(record.ordinal)) return false;
 							if (record.id === commit.leafId) leafOrdinal = record.ordinal as number;
 							if (record.id === commit.retirementFirstKeptEntryId) boundaryOrdinal = record.ordinal as number;
@@ -6622,9 +6999,11 @@ export class SessionManager {
 				)
 					return false;
 			}
-			runtime.indexHash = indexHash;
 			runtime.indexDigest = commit.indexDigest;
 			runtime.validatedIndexDescriptor = indexDescriptor;
+			// The dictionary artifact is disposable acceleration: adoption failure
+			// only disables the fast path; the idx remains authoritative.
+			this.#adoptCommittedDictionary(commit.dictionary);
 			this.#adoptCommittedParentArtifact(commit.parentIndex);
 			const headerWindow = this.storage.readRangeSync(sessionFile, 0, Math.min(descriptor.size, 64 * 1024)).bytes;
 			const headerEnd = headerWindow.indexOf(10);
@@ -6637,6 +7016,7 @@ export class SessionManager {
 				if (computeLineDigest(line) !== record.recordDigest) return false;
 				const entry = JSON.parse(Buffer.from(line).toString("utf8")) as SessionEntry;
 				if (entry.id !== record.id || entry.type !== record.type) return false;
+				if (entry.parentId !== record.parentId) return false;
 				hotEntries.push(entry);
 			}
 			const entries: FileEntry[] = [header, ...hotEntries];
@@ -6689,6 +7069,9 @@ export class SessionManager {
 			runtime.retirementFirstKeptEntryId = commit.retirementFirstKeptEntryId;
 			runtime.reducer = commit.reducer;
 			runtime.providerStateEntries = commit.providerStateEntries ?? [];
+			// Metadata-delta adoption is authoritative for provider state: any
+			// ambiguity in the binding or rehydration fails closed to the eager path.
+			if (!this.#adoptCommittedMetadataDelta(commit.metadataDelta)) return false;
 			runtime.hotSuffixBytes = hotSuffixBytes;
 			runtime.reopenTransition = { kind: "exact", reason: "descriptor_and_proof_match" };
 			runtime.terminalTransition = runtime.reopenTransition;
@@ -6754,6 +7137,10 @@ export class SessionManager {
 			}
 			const discovery = this.#scanBoundedTranscriptForFirstOpen(sessionFile, before);
 			if (!discovery) return false;
+			// The semantic pass's fixed duplicate table is no longer needed. Collect it
+			// before allocating publication buffers for ordinary-size transcripts; the
+			// one-GiB fork lane skips this pause to preserve its latency gate.
+			if (before.size < 512 * 1024 * 1024) Bun.gc(true);
 			const built = this.#buildBoundedFirstOpenSidecars(sessionFile, before, discovery);
 			if (!built) return false;
 			runtime.enabled = true;
@@ -6835,7 +7222,7 @@ export class SessionManager {
 		sessionFile: string,
 		descriptor: DescriptorSnapshot,
 	): BoundedFirstOpenDiscovery | undefined {
-		const seenIds = new BoundedFirstOpenIdSet();
+		const seenIds = new BoundedDictionaryIdSet();
 		const labelsById = new Map<string, string>();
 		let labelsBytes = 0;
 		const providerState = new Map<string, { ordinal: number; entry: SessionEntry; bytes: number }>();
@@ -6881,7 +7268,7 @@ export class SessionManager {
 				scannedBytes = lineStart + lineBytes.byteLength;
 				let parsed: unknown;
 				try {
-					parsed = JSON.parse(Buffer.from(lineBytes).toString("utf8"));
+					parsed = JSON.parse(decodeBoundedJsonLine(lineBytes));
 				} catch {
 					return fail("bounded_scan_malformed");
 				}
@@ -7020,13 +7407,14 @@ export class SessionManager {
 		return {
 			header,
 			leafId: lastId!,
+			recordCount: ordinal + 1,
 			retirementFirstKeptEntryId: latestCompactionBoundary.firstKeptEntryId,
 			reducer,
 			usageStatistics,
 			labels: [...labelsById],
-			providerStateEntries: [...providerState.values()]
+			providerState: [...providerState.values()]
 				.sort((left, right) => left.ordinal - right.ordinal)
-				.map(item => item.entry),
+				.map(item => ({ ordinal: item.ordinal, entry: item.entry })),
 		};
 	}
 
@@ -7061,10 +7449,26 @@ export class SessionManager {
 		let scannedBytes = 0;
 		const hotEntries: SessionEntry[] = [];
 		let buildFailed = false;
+		let secondaryArtifactsEligible =
+			descriptor.size <= PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES &&
+			discovery.recordCount <= PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS;
 		const parentBuilder = new BoundedParentArtifactBuilder();
+		// Persistent dictionary scratch stays below the 20 MiB acceptance cap.
+		// Oversized inputs retain the authenticated flat-index fallback instead.
+		const partitionHashes = Array.from({ length: DICTIONARY_PARTITION_COUNT }, () => crypto.createHash("sha256"));
+		const partitionSizes = new Array<number>(DICTIONARY_PARTITION_COUNT).fill(0);
+		const partitionRecords = new Array<number>(DICTIONARY_PARTITION_COUNT).fill(0);
+		const dictionaryBuilder = new BoundedDictionaryArtifactBuilder({
+			detector: new BoundedDictionaryIdSet(),
+			target: this.#createDictionaryFlushTarget(partitionHashes, partitionSizes, partitionRecords),
+		});
+		// Metadata-delta section state (fixed 4 MiB reducer budget).
+		const metadataDeltaState = this.#createMetadataDeltaRuntimeState();
+		runtime.metadataDelta = metadataDeltaState;
 		try {
 			indexWriter = this.storage.openWriter(runtime.indexPath, { flags: "w" });
 			tailWriter = this.storage.openWriter(runtime.tailPath, { flags: "w" });
+			this.#truncateDerivedArtifactFiles(secondaryArtifactsEligible);
 			const scanFailure = scanTranscriptLinesBounded(
 				this.storage,
 				sessionFile,
@@ -7125,17 +7529,34 @@ export class SessionManager {
 					})}\n`;
 					indexWriter!.writeLineSync(indexLine);
 					runtime.indexHash.update(Buffer.from(indexLine, "utf8"));
-					if (typeof parentId === "string") {
-						parentBuilder.add({
-							parentId,
-							childId: record.id,
+					if (ordinal >= PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS) secondaryArtifactsEligible = false;
+					if (secondaryArtifactsEligible) {
+						const dictionaryAdd = dictionaryBuilder.add({
+							id: record.id,
 							ordinal,
 							seq: ordinal,
 							byteOffset: lineStart,
 							byteLength,
 							recordDigest,
+							parentId,
 							entryType: record.type,
 						});
+						if (dictionaryAdd.kind !== "ok") {
+							buildFailed = true;
+							return false;
+						}
+						if (typeof parentId === "string") {
+							parentBuilder.add({
+								parentId,
+								childId: record.id,
+								ordinal,
+								seq: ordinal,
+								byteOffset: lineStart,
+								byteLength,
+								recordDigest,
+								entryType: record.type,
+							});
+						}
 					}
 					if (inTail) {
 						const entry = parsed as SessionEntry;
@@ -7208,11 +7629,57 @@ export class SessionManager {
 			runtime.tail = tail;
 			runtime.retirementFirstKeptEntryId = discovery.retirementFirstKeptEntryId;
 			runtime.reducer = discovery.reducer;
-			runtime.providerStateEntries = discovery.providerStateEntries.map(cloneSessionEntry);
 			runtime.hotSuffixBytes = hotSuffixBytes;
 
 			runtime.indexDigest = runtime.indexHash.copy().digest("hex");
-			this.#publishParentArtifact(parentBuilder, runtime.indexDigest);
+			metadataDeltaState.indexDigest = runtime.indexDigest;
+			if (secondaryArtifactsEligible) {
+				const dictionaryResult = dictionaryBuilder.finish(discovery.header.id, runtime.indexDigest);
+				if (dictionaryResult.kind !== "ok" || dictionaryResult.commit.sidecarIneligible) {
+					this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
+					return undefined;
+				}
+				if (
+					!this.#adoptBuiltDictionaryArtifact(dictionaryResult, partitionHashes, partitionSizes, partitionRecords)
+				) {
+					this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
+					return undefined;
+				}
+			} else {
+				runtime.dictionary = undefined;
+			}
+			// Provider state with oversized-value demotion: values over
+			// MAX_REDUCER_INLINE_BYTES are persisted to the metadata-delta section
+			// (before the marker binds their descriptors) with exact location+digest
+			// and are NOT retained resident — only a 24 B descriptor is kept. The
+			// merged provider order is tracked explicitly so reopen reproduces the
+			// exact slot sequence.
+			runtime.providerStateEntries = [];
+			runtime.providerStateOrder = [];
+			for (const provider of discovery.providerState) {
+				const providerKey = providerStateEntryKey(provider.entry);
+				if (!providerKey) continue;
+				runtime.providerStateOrder.push(providerKey);
+				const persistedLine = Buffer.from(`${JSON.stringify(provider.entry)}\n`, "utf8");
+				if (persistedLine.byteLength > MAX_REDUCER_INLINE_BYTES) {
+					const stored = this.#appendMetadataDeltaValue(persistedLine);
+					if (stored) {
+						metadataDeltaState.byKey.set(providerKey, {
+							kind: provider.entry.type,
+							ordinal: provider.ordinal,
+							...stored,
+						});
+					} else {
+						metadataDeltaState.byKey.delete(providerKey);
+						runtime.providerStateEntries.push(cloneSessionEntry(provider.entry));
+					}
+				} else {
+					runtime.providerStateEntries.push(cloneSessionEntry(provider.entry));
+				}
+			}
+			this.#syncMetadataDeltaDescriptorBytes();
+			if (secondaryArtifactsEligible) this.#publishParentArtifact(parentBuilder, runtime.indexDigest);
+			else runtime.parentArtifact = undefined;
 			try {
 				const validated = this.storage.statSync(runtime.indexPath);
 				runtime.validatedIndexDescriptor = validated;
@@ -9245,6 +9712,7 @@ export class SessionManager {
 		return this.#withSessionPersistenceFenceSync(() => {
 			const markerPath = runtime.commitPath;
 			const gen = this.#commitGen + 1;
+			const metadataDeltaCommit = this.#buildMetadataDeltaCommit();
 			const record = {
 				gen,
 				descriptor: {
@@ -9262,7 +9730,7 @@ export class SessionManager {
 				retirementFirstKeptEntryId: runtime.retirementFirstKeptEntryId,
 				leafId: this.#leafId,
 				reducer: runtime.reducer,
-				providerStateEntries: runtime.providerStateEntries,
+				providerStateEntries: this.#markerProviderStateEntries(),
 				labels: [...runtime.labelsPins.labelsEntries()],
 				usageStatistics: this.#usageStatistics,
 
@@ -9280,6 +9748,32 @@ export class SessionManager {
 							},
 						}
 					: {}),
+				...(runtime.dictionary
+					? {
+							dictionary: {
+								header: {
+									version: 2,
+									sessionId: this.#sessionId ?? "",
+									sidecarIneligible: runtime.dictionary.sidecarIneligible,
+								},
+								indexDigest: runtime.dictionary.indexDigest,
+								partitions: runtime.dictionary.partitions.map(partition => ({
+									size: partition.size,
+									digest: partition.digest,
+									records: partition.records,
+									complete: partition.complete,
+								})),
+								metaSize: runtime.dictionary.metaSize,
+								metaDigest: runtime.dictionary.metaDigest,
+								recordCount: runtime.dictionary.recordCount,
+								uniqueTerms: runtime.dictionary.uniqueTerms,
+								totalBytes: runtime.dictionary.totalBytes,
+								duplicateIds: [...runtime.dictionary.duplicateIds],
+								sidecarIneligible: runtime.dictionary.sidecarIneligible,
+							},
+						}
+					: {}),
+				...(metadataDeltaCommit ? { metadataDelta: metadataDeltaCommit } : {}),
 			};
 			const bytes = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
 			try {
@@ -9349,6 +9843,9 @@ export class SessionManager {
 				`${this.#sessionFile}.spill.tail`,
 				`${this.#sessionFile}.spill.commit`,
 				...parentBucketPaths(`${this.#sessionFile}.spill.idx`),
+				...dictionaryPartitionPaths(`${this.#sessionFile}.spill.idx`),
+				dictionaryMetaPathFor(`${this.#sessionFile}.spill.idx`),
+				metadataDeltaPathFor(`${this.#sessionFile}.spill.idx`),
 			]) {
 				try {
 					this.storage.unlinkSync(legacyPath);
@@ -9359,6 +9856,9 @@ export class SessionManager {
 		}
 		const sidecarRoot = this.#sessionFile?.endsWith(".jsonl") ? this.#sessionFile.slice(0, -6) : this.#sessionFile;
 		const parentPathPrefix = sidecarRoot ? `${sidecarRoot}/.session-memory.spill.parent-` : "";
+		const dictionaryPathPrefix = sidecarRoot ? `${sidecarRoot}/.session-memory.spill.dict-part-` : "";
+		const dictionaryMetaPath = sidecarRoot ? `${sidecarRoot}/.session-memory.spill.dict-meta` : "";
+		const metadataDeltaPath = sidecarRoot ? `${sidecarRoot}/.session-memory.spill.metadata-delta` : "";
 		if (sidecarRoot) {
 			for (const candidate of this.storage.listFilesSync(sidecarRoot, ".*")) {
 				const name = path.basename(candidate);
@@ -9394,6 +9894,9 @@ export class SessionManager {
 			tailPath: sidecarRoot ? `${sidecarRoot}/.session-memory.spill.tail` : "",
 			commitPath: sidecarRoot ? `${sidecarRoot}/.session-memory.spill.commit` : "",
 			parentPathPrefix,
+			dictionaryPathPrefix,
+			dictionaryMetaPath,
+			metadataDeltaPath,
 			retirementFirstKeptEntryId: undefined,
 			hotSuffixBytes: 0,
 			accountant: new SessionMemoryAccountant(),
@@ -9402,6 +9905,7 @@ export class SessionManager {
 				ttsr: { count: 0, rulesCount: 0, recordsCount: 0, largestOrdinal: -1 },
 			},
 			providerStateEntries: [],
+			providerStateOrder: [],
 			blockCache: new FixedCacheAccount(8 * 1024 * 1024),
 			parentChildrenCache: new Map(),
 			entryCache: new FixedCacheAccount(28 * 1024 * 1024),
@@ -9510,7 +10014,7 @@ export class SessionManager {
 		let activeCompaction: CompactionEntry | undefined;
 		let active = this.#leafId ? this.#byId.get(this.#leafId) : undefined;
 		let activeSteps = 0;
-		const providerState = new Map<string, { order: number; entry: SessionEntry }>();
+		const providerState = new Map<string, { order: number; ordinal: number; entry: SessionEntry }>();
 		let providerStateBytes = 0;
 		while (active && activeSteps <= sessionEntries.length) {
 			const ordinal = sessionEntries.length - activeSteps - 1;
@@ -9523,7 +10027,7 @@ export class SessionManager {
 					return;
 				}
 				providerStateBytes += bytes;
-				providerState.set(providerKey, { order: activeSteps, entry: cloneSessionEntry(active) });
+				providerState.set(providerKey, { order: activeSteps, ordinal, entry: cloneSessionEntry(active) });
 			}
 			if (active.type === "model_change" && runtime.reducer.modelChange.latest === undefined) {
 				runtime.reducer = applyReducerDelta(runtime.reducer, {
@@ -9543,9 +10047,11 @@ export class SessionManager {
 			active = active.parentId ? this.#byId.get(active.parentId) : undefined;
 			activeSteps++;
 		}
-		runtime.providerStateEntries = [...providerState.values()]
-			.sort((left, right) => right.order - left.order)
-			.map(item => item.entry);
+		const sortedProviderState = [...providerState.values()].sort((left, right) => right.order - left.order);
+		runtime.providerStateOrder = sortedProviderState.map(item => providerStateEntryKey(item.entry)!);
+		runtime.providerStateEntries = [];
+		// Inline entries are added after the delta decision below (demoted
+		// values stay resident only as descriptors).
 		if (!activeCompaction) return;
 		const tailStartOrdinal = sessionEntries.findIndex(entry => entry.id === activeCompaction.firstKeptEntryId);
 		if (tailStartOrdinal < 0) return;
@@ -9585,9 +10091,47 @@ export class SessionManager {
 		let operationError: unknown;
 		let closeError: unknown;
 		const parentBuilder = new BoundedParentArtifactBuilder();
+		const enabledBuild = this.#sessionMemoryMode === "enabled";
+		const secondaryArtifactsEligible =
+			enabledBuild &&
+			sessionEntries.length <= PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS &&
+			this.storage.statSync(this.#sessionFile).size <= PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES;
+		const partitionHashes = Array.from({ length: DICTIONARY_PARTITION_COUNT }, () => crypto.createHash("sha256"));
+		const partitionSizes = new Array<number>(DICTIONARY_PARTITION_COUNT).fill(0);
+		const partitionRecords = new Array<number>(DICTIONARY_PARTITION_COUNT).fill(0);
+		const dictionaryBuilder = new BoundedDictionaryArtifactBuilder({
+			detector: new BoundedDictionaryIdSet(),
+			target: this.#createDictionaryFlushTarget(partitionHashes, partitionSizes, partitionRecords),
+		});
 		try {
 			indexWriter = this.storage.openWriter(runtime.indexPath, { flags: "w" });
 			tailWriter = this.storage.openWriter(runtime.tailPath, { flags: "w" });
+			this.#truncateDerivedArtifactFiles(secondaryArtifactsEligible);
+			if (enabledBuild) {
+				runtime.metadataDelta = this.#createMetadataDeltaRuntimeState();
+				for (const item of sortedProviderState) {
+					const key = providerStateEntryKey(item.entry)!;
+					const persistedLine = Buffer.from(`${JSON.stringify(item.entry)}\n`, "utf8");
+					if (persistedLine.byteLength > MAX_REDUCER_INLINE_BYTES) {
+						const stored = this.#appendMetadataDeltaValue(persistedLine);
+						if (stored) {
+							runtime.metadataDelta.byKey.set(key, {
+								kind: item.entry.type,
+								ordinal: item.ordinal,
+								...stored,
+							});
+						} else {
+							runtime.metadataDelta.byKey.delete(key);
+							runtime.providerStateEntries.push(cloneSessionEntry(item.entry));
+						}
+					} else {
+						runtime.providerStateEntries.push(cloneSessionEntry(item.entry));
+					}
+				}
+				this.#syncMetadataDeltaDescriptorBytes();
+			} else {
+				runtime.providerStateEntries = sortedProviderState.map(item => cloneSessionEntry(item.entry));
+			}
 			for (let ordinal = 0; ordinal < sessionEntries.length; ordinal++) {
 				const entry = sessionEntries[ordinal];
 				const persistedLine = Buffer.concat([this.#serializeEntryLine(entry), Buffer.from("\n")]);
@@ -9605,7 +10149,23 @@ export class SessionManager {
 				})}\n`;
 				indexWriter!.writeLineSync(indexLine);
 				runtime.indexHash.update(Buffer.from(indexLine, "utf8"));
-				if (this.#sessionMemoryMode === "enabled" && typeof entry.parentId === "string") {
+				if (secondaryArtifactsEligible) {
+					const dictionaryAdd = dictionaryBuilder.add({
+						id: entry.id,
+						ordinal,
+						seq: ordinal,
+						byteOffset: runningOffset,
+						byteLength: persistedLine.byteLength,
+						recordDigest,
+						parentId: entry.parentId,
+						entryType: entry.type,
+					});
+					if (dictionaryAdd.kind !== "ok") {
+						buildFailed = true;
+						throw new Error("dictionary_artifact_build_failed");
+					}
+				}
+				if (secondaryArtifactsEligible && typeof entry.parentId === "string") {
 					parentBuilder.add({
 						parentId: entry.parentId,
 						childId: entry.id,
@@ -9686,13 +10246,21 @@ export class SessionManager {
 			}
 		}
 		if (buildFailed) {
-			for (const sidecarPath of [runtime.indexPath, runtime.tailPath]) {
+			for (const sidecarPath of [
+				runtime.indexPath,
+				runtime.tailPath,
+				runtime.dictionaryMetaPath,
+				runtime.metadataDeltaPath,
+				...dictionaryPartitionPaths(runtime.indexPath),
+			]) {
 				try {
 					this.storage.unlinkSync(sidecarPath);
 				} catch {
 					// Disposable sidecar cleanup is best-effort; eager transcript state remains authoritative.
 				}
 			}
+			runtime.dictionary = undefined;
+			runtime.metadataDelta = undefined;
 			return;
 		}
 		runtime.enabled = true;
@@ -9705,11 +10273,25 @@ export class SessionManager {
 		}
 
 		runtime.indexDigest = runtime.indexHash.copy().digest("hex");
-		if (this.#sessionMemoryMode === "enabled") {
-			this.#publishParentArtifact(parentBuilder, runtime.indexDigest);
+		if (runtime.metadataDelta) runtime.metadataDelta.indexDigest = runtime.indexDigest;
+		if (enabledBuild) {
+			if (secondaryArtifactsEligible) {
+				const dictionaryResult = dictionaryBuilder.finish(this.#sessionId ?? "", runtime.indexDigest);
+				if (dictionaryResult.kind === "ok" && !dictionaryResult.commit.sidecarIneligible) {
+					this.#adoptBuiltDictionaryArtifact(dictionaryResult, partitionHashes, partitionSizes, partitionRecords);
+				}
+				this.#publishParentArtifact(parentBuilder, runtime.indexDigest);
+			} else {
+				runtime.parentArtifact = undefined;
+				runtime.dictionary = undefined;
+			}
+			this.#syncMetadataDeltaDescriptorBytes();
 		} else {
 			this.#cleanupParentArtifactFiles();
+			this.#cleanupDictionaryArtifactFiles();
 			runtime.parentArtifact = undefined;
+			runtime.dictionary = undefined;
+			runtime.metadataDelta = undefined;
 		}
 		try {
 			const validated = this.storage.statSync(runtime.indexPath);
@@ -9884,6 +10466,727 @@ export class SessionManager {
 		return { bucketCount: parentIndex.bucketCount, indexDigest: parentIndex.indexDigest, buckets };
 	}
 
+	// =========================================================================
+	// Persistent bounded dictionary artifact (hash-partitioned flat index)
+	// =========================================================================
+
+	/** Path of one dictionary partition file (`.spill.dict-part-<partition>`). */
+	#dictionaryPartitionPath(partition: number): string {
+		const runtime = this.#sidecarRuntime;
+		return runtime ? `${runtime.dictionaryPathPrefix}${partition.toString().padStart(4, "0")}` : "";
+	}
+
+	/** Best-effort unlink of every dictionary partition + meta file. */
+	#cleanupDictionaryArtifactFiles(): void {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return;
+		for (const path of [runtime.dictionaryMetaPath, ...dictionaryPartitionPaths(runtime.indexPath)]) {
+			try {
+				this.storage.unlinkSync(path);
+			} catch {
+				// Disposable dictionary files are best-effort cleanup; transcript authority is unaffected.
+			}
+		}
+	}
+
+	/** Truncate dictionary files for an eligible fresh secondary-artifact build. */
+	#truncateDerivedArtifactFiles(includeDictionary: boolean): void {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime || !includeDictionary) return;
+		const paths = [runtime.dictionaryMetaPath, ...dictionaryPartitionPaths(runtime.indexPath)];
+		for (const path of paths) {
+			try {
+				const writer = this.storage.openWriter(path, { flags: "w" });
+				try {
+					if (!writer.fsyncSync) throw new Error("Synchronous sidecar fsync is unavailable");
+					writer.fsyncSync();
+				} finally {
+					writer.closeSync();
+				}
+			} catch {
+				// Truncation failures surface at the first write; disposable artifacts remain best-effort.
+			}
+		}
+	}
+
+	/** Persist one flushed batch of dictionary partition lines (append + fsync). */
+	#writeDictionaryPartitionLines(partition: number, lines: readonly string[]): boolean {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return false;
+		try {
+			const writer = this.storage.openWriter(this.#dictionaryPartitionPath(partition), { flags: "a" });
+			try {
+				for (const line of lines) writer.writeLineSync(line);
+				if (!writer.fsyncSync) throw new Error("Synchronous dictionary partition fsync is unavailable");
+				writer.fsyncSync();
+			} finally {
+				writer.closeSync();
+			}
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/** Flush target for the streaming dictionary build (owns exact bytes + running digests). */
+	#createDictionaryFlushTarget(
+		hashes: crypto.Hash[],
+		sizes: number[],
+		records: number[],
+	): DictionaryArtifactFlushTarget {
+		return {
+			writePartitionLines: (partition, lines) => {
+				if (!this.#writeDictionaryPartitionLines(partition, lines)) return false;
+				for (const line of lines) {
+					const bytes = Buffer.from(line, "utf8");
+					hashes[partition]!.update(bytes);
+					sizes[partition]! += bytes.byteLength;
+					records[partition]! += 1;
+				}
+				return true;
+			},
+			getPartitionCommit: partition => ({
+				size: sizes[partition]!,
+				digest: hashes[partition]!.copy().digest("hex"),
+				records: records[partition]!,
+				complete: true,
+			}),
+		};
+	}
+
+	/**
+	 * Persist the finalized dictionary meta file (fsynced before any marker
+	 * publication) and adopt the artifact into the runtime. Any write or
+	 * block-cache rejection disables the artifact (lookups fail closed to the
+	 * authoritative cold scan); the session's index/tail sidecars remain fully
+	 * usable.
+	 */
+	#adoptBuiltDictionaryArtifact(
+		result: Extract<DictionaryArtifactBuildResult, { kind: "ok" }>,
+		partitionHashes: crypto.Hash[],
+		partitionSizes: number[],
+		partitionRecords: number[],
+	): boolean {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return false;
+		const meta = finalizeDictionaryArtifactCommit(result.commit);
+		try {
+			const writer = this.storage.openWriter(runtime.dictionaryMetaPath, { flags: "w" });
+			try {
+				writer.writeLineSync(meta.bytes);
+				if (!writer.fsyncSync) throw new Error("Synchronous dictionary meta fsync is unavailable");
+				writer.fsyncSync();
+			} finally {
+				writer.closeSync();
+			}
+		} catch {
+			return false;
+		}
+		const charged = dictionaryArtifactRuntimeBytes(result.commit.partitions.length);
+		if (!runtime.blockCache.tryAllocate(charged)) return false;
+		runtime.dictionary = {
+			indexDigest: result.commit.indexDigest,
+			partitions: result.commit.partitions.map(partition => ({ ...partition })),
+			metaSize: meta.commit.metaSize,
+			metaDigest: meta.commit.metaDigest,
+			recordCount: result.commit.recordCount,
+			uniqueTerms: result.commit.uniqueTerms,
+			totalBytes: result.commit.totalBytes,
+			duplicateIds: [...result.commit.duplicateIds],
+			sidecarIneligible: result.commit.sidecarIneligible,
+			chargedBytes: charged,
+			budgetBytes: DICTIONARY_PARTITION_BUFFER_BYTES,
+			partitionHashes,
+			partitionSizes,
+			partitionRecords,
+		};
+		try {
+			runtime.dictionary.validatedDescriptor = this.storage.statSync(runtime.dictionaryMetaPath);
+		} catch {
+			// A missing meta falls back to the authoritative digest re-verification path.
+		}
+		return true;
+	}
+
+	/** Strictly parse the marker's dictionary-artifact binding; invalid → absent (fail closed). */
+	#parseDictionaryCommitValue(value: unknown): DictionaryArtifactCommit | undefined {
+		if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+		const record = value as Record<string, unknown>;
+		const header = record.header;
+		if (header === null || typeof header !== "object" || Array.isArray(header)) return undefined;
+		const headerRecord = header as Record<string, unknown>;
+		if (headerRecord.version !== 2) return undefined;
+		if (typeof headerRecord.sessionId !== "string") return undefined;
+		if (typeof headerRecord.sidecarIneligible !== "boolean") return undefined;
+		if (typeof record.indexDigest !== "string" || !/^[0-9a-f]{64}$/.test(record.indexDigest)) return undefined;
+		if (!Array.isArray(record.partitions) || record.partitions.length !== DICTIONARY_PARTITION_COUNT)
+			return undefined;
+		const partitions: DictionaryPartitionCommit[] = [];
+		for (const candidate of record.partitions) {
+			if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return undefined;
+			const partition = candidate as Record<string, unknown>;
+			if (!Number.isSafeInteger(partition.size) || (partition.size as number) < 0) return undefined;
+			if (typeof partition.digest !== "string" || !/^[0-9a-f]{64}$/.test(partition.digest)) return undefined;
+			if (!Number.isSafeInteger(partition.records) || (partition.records as number) < 0) return undefined;
+			if (typeof partition.complete !== "boolean") return undefined;
+			partitions.push({
+				size: partition.size as number,
+				digest: partition.digest,
+				records: partition.records as number,
+				complete: partition.complete,
+			});
+		}
+		if (!Number.isSafeInteger(record.recordCount) || (record.recordCount as number) < 0) return undefined;
+		if (!Number.isSafeInteger(record.uniqueTerms) || (record.uniqueTerms as number) < 0) return undefined;
+		if (!Number.isSafeInteger(record.totalBytes) || (record.totalBytes as number) < 0) return undefined;
+		if (!Array.isArray(record.duplicateIds) || record.duplicateIds.some(candidate => typeof candidate !== "string"))
+			return undefined;
+		if (typeof record.sidecarIneligible !== "boolean") return undefined;
+		const candidate: Omit<DictionaryArtifactCommit, "metaSize" | "metaDigest"> = {
+			header: {
+				version: 2,
+				sessionId: headerRecord.sessionId,
+				sidecarIneligible: headerRecord.sidecarIneligible,
+			},
+			indexDigest: record.indexDigest,
+			partitions,
+			recordCount: record.recordCount as number,
+			uniqueTerms: record.uniqueTerms as number,
+			totalBytes: record.totalBytes as number,
+			duplicateIds: record.duplicateIds as string[],
+			sidecarIneligible: record.sidecarIneligible,
+		};
+		return finalizeDictionaryArtifactCommit(candidate).commit;
+	}
+
+	/**
+	 * Adopt the dictionary artifact binding from a validated commit marker. The
+	 * exact meta bytes and every partition byte range are re-hashed once (bounded
+	 * 64 KiB chunk reads); any structural, binding, digest, or budget
+	 * inconsistency disables the dictionary and the session still reopens
+	 * exactly on index/tail proof.
+	 */
+	#adoptCommittedDictionary(dictionary: DictionaryArtifactCommit | undefined): void {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return;
+		const reject = (): void => {
+			runtime.dictionary = undefined;
+		};
+		const parsed = this.#parseDictionaryCommitValue(dictionary);
+		if (!parsed) return reject();
+		if (parsed.indexDigest !== runtime.indexDigest) return reject();
+		if (parsed.sidecarIneligible || parsed.duplicateIds.length > 0) return reject();
+		if (parsed.partitions.some(partition => !partition.complete)) return reject();
+		if (typeof this.storage.readRangeSync !== "function") return reject();
+		try {
+			const metaStat = this.storage.statSync(runtime.dictionaryMetaPath);
+			if (metaStat.size !== parsed.metaSize) return reject();
+			const metaHash = crypto.createHash("sha256");
+			for (let offset = 0; offset < parsed.metaSize; offset += 64 * 1024) {
+				const length = Math.min(64 * 1024, parsed.metaSize - offset);
+				metaHash.update(this.storage.readRangeSync(runtime.dictionaryMetaPath, offset, length).bytes);
+			}
+			if (metaHash.digest("hex") !== parsed.metaDigest) return reject();
+		} catch {
+			return reject();
+		}
+		const adoptedHashes: crypto.Hash[] = [];
+		const adoptedSizes: number[] = [];
+		const adoptedRecords: number[] = [];
+		for (let partition = 0; partition < parsed.partitions.length; partition++) {
+			const committed = parsed.partitions[partition]!;
+			try {
+				const stat = this.storage.statSync(this.#dictionaryPartitionPath(partition));
+				if (stat.size !== committed.size) return reject();
+				// The verification hash keeps the full partition byte state so it
+				// doubles as the append-time running hash (seeded with exact bytes).
+				const hash = crypto.createHash("sha256");
+				for (let offset = 0; offset < committed.size; offset += 64 * 1024) {
+					const length = Math.min(64 * 1024, committed.size - offset);
+					hash.update(this.storage.readRangeSync(this.#dictionaryPartitionPath(partition), offset, length).bytes);
+					if ((offset & (4 * 1024 * 1024 - 1)) === 0) Bun.gc(true);
+				}
+				if (hash.copy().digest("hex") !== committed.digest) return reject();
+				adoptedHashes.push(hash);
+				adoptedSizes.push(committed.size);
+				adoptedRecords.push(committed.records);
+			} catch {
+				return reject();
+			}
+		}
+		const charged = dictionaryArtifactRuntimeBytes(parsed.partitions.length);
+		if (!runtime.blockCache.tryAllocate(charged)) return reject();
+		runtime.dictionary = {
+			indexDigest: parsed.indexDigest,
+			partitions: parsed.partitions.map(partition => ({ ...partition })),
+			metaSize: parsed.metaSize,
+			metaDigest: parsed.metaDigest,
+			recordCount: parsed.recordCount,
+			uniqueTerms: parsed.uniqueTerms,
+			totalBytes: parsed.totalBytes,
+			duplicateIds: [...parsed.duplicateIds],
+			sidecarIneligible: parsed.sidecarIneligible,
+			chargedBytes: charged,
+			budgetBytes: DICTIONARY_PARTITION_BUFFER_BYTES,
+			partitionHashes: adoptedHashes,
+			partitionSizes: adoptedSizes,
+			partitionRecords: adoptedRecords,
+		};
+		try {
+			runtime.dictionary.validatedDescriptor = this.storage.statSync(runtime.dictionaryMetaPath);
+		} catch {
+			// Re-verification happens on first use.
+		}
+	}
+
+	/**
+	 * Incrementally maintain the dictionary artifact for one appended entry:
+	 * append the partition line (fsync), rewrite the meta (fsync), and rebind
+	 * the running digests before the commit marker is published. Any failure
+	 * invalidates the whole artifact; the marker is then published without
+	 * dictionary metadata and lookups fall back to the authoritative cold scan.
+	 */
+	#appendDictionaryRecord(index: {
+		id: string;
+		ordinal: number;
+		seq: number;
+		byteOffset: number;
+		byteLength: number;
+		recordDigest: string;
+		parentId: string | null;
+		entryType: string;
+	}): boolean {
+		const runtime = this.#sidecarRuntime;
+		const dictionary = runtime?.dictionary;
+		if (!dictionary) return true;
+		const partition = dictionaryPartitionForId(index.id, dictionary.partitions.length);
+		const partitionState = dictionary.partitions[partition];
+		if (!partitionState) return false;
+		const recordLine = serializeDictionaryPartitionRecord({
+			term: index.id,
+			dictId: dictionary.uniqueTerms,
+			ordinal: index.ordinal,
+			seq: index.seq,
+			byteOffset: index.byteOffset,
+			byteLength: index.byteLength,
+			recordDigest: index.recordDigest,
+			parentId: index.parentId,
+			entryType: index.entryType,
+		});
+		const recordBytes = Buffer.byteLength(recordLine, "utf8");
+		if (recordBytes > dictionary.budgetBytes) return false;
+		try {
+			const writer = this.storage.openWriter(this.#dictionaryPartitionPath(partition), { flags: "a" });
+			try {
+				writer.writeLineSync(recordLine);
+				if (!writer.fsyncSync) throw new Error("Synchronous dictionary partition fsync is unavailable");
+				writer.fsyncSync();
+			} finally {
+				writer.closeSync();
+			}
+		} catch {
+			return false;
+		}
+		dictionary.partitionHashes[partition]!.update(Buffer.from(recordLine, "utf8"));
+		dictionary.partitionSizes[partition]! += recordBytes;
+		dictionary.partitionRecords[partition]! += 1;
+		partitionState.size = dictionary.partitionSizes[partition]!;
+		partitionState.digest = dictionary.partitionHashes[partition]!.copy().digest("hex");
+		partitionState.records = dictionary.partitionRecords[partition]!;
+		dictionary.recordCount += 1;
+		dictionary.uniqueTerms += 1;
+		dictionary.totalBytes += Buffer.byteLength(index.id, "utf8");
+		dictionary.indexDigest = runtime.indexDigest;
+		const commit: Omit<DictionaryArtifactCommit, "metaSize" | "metaDigest"> = {
+			header: {
+				version: 2,
+				sessionId: this.#sessionId ?? "",
+				sidecarIneligible: dictionary.sidecarIneligible,
+			},
+			indexDigest: runtime.indexDigest,
+			partitions: dictionary.partitions.map(partition => ({
+				size: partition.size,
+				digest: partition.digest,
+				records: partition.records,
+				complete: partition.complete,
+			})),
+			recordCount: dictionary.recordCount,
+			uniqueTerms: dictionary.uniqueTerms,
+			totalBytes: dictionary.totalBytes,
+			duplicateIds: [...dictionary.duplicateIds],
+			sidecarIneligible: dictionary.sidecarIneligible,
+		};
+		const meta = finalizeDictionaryArtifactCommit(commit);
+		try {
+			const metaWriter = this.storage.openWriter(runtime.dictionaryMetaPath, { flags: "w" });
+			try {
+				metaWriter.writeLineSync(meta.bytes);
+				if (!metaWriter.fsyncSync) throw new Error("Synchronous dictionary meta fsync is unavailable");
+				metaWriter.fsyncSync();
+			} finally {
+				metaWriter.closeSync();
+			}
+		} catch {
+			return false;
+		}
+		dictionary.metaSize = meta.commit.metaSize;
+		dictionary.metaDigest = meta.commit.metaDigest;
+		try {
+			dictionary.validatedDescriptor = this.storage.statSync(runtime.dictionaryMetaPath);
+		} catch {
+			// Re-verification happens on first use.
+		}
+		return true;
+	}
+
+	/** Fail closed: drop the retained dictionary state (files stay disposable; lookups use the idx scan). */
+	#invalidateDictionaryArtifact(): void {
+		const runtime = this.#sidecarRuntime;
+		const dictionary = runtime?.dictionary;
+		if (!dictionary) return;
+		runtime.dictionary = undefined;
+		if (dictionary.chargedBytes > 0) runtime.blockCache.release(dictionary.chargedBytes);
+	}
+
+	/** Serve one cold entry index from the persistent dictionary artifact (bounded partition read). */
+	#findColdEntryIndexFromDictionary(id: string): ColdEntryIndex | undefined {
+		const runtime = this.#sidecarRuntime;
+		const dictionary = runtime?.dictionary;
+		if (!dictionary || typeof this.storage.readRangeSync !== "function") return undefined;
+		if (dictionary.indexDigest !== runtime.indexDigest) return undefined;
+		let indexStat: SessionStorageStat;
+		try {
+			indexStat = this.storage.statSync(runtime.indexPath);
+		} catch {
+			return undefined;
+		}
+		if (!runtime.validatedIndexDescriptor || !sameDescriptor(runtime.validatedIndexDescriptor, indexStat))
+			return undefined;
+		const partition = dictionaryPartitionForId(id, dictionary.partitions.length);
+		const committed = dictionary.partitions[partition];
+		if (!committed?.complete || committed.size === 0) return undefined;
+		let partitionStat: SessionStorageStat;
+		try {
+			partitionStat = this.storage.statSync(this.#dictionaryPartitionPath(partition));
+		} catch {
+			return undefined;
+		}
+		if (partitionStat.size !== committed.size) return undefined;
+		// One bounded chunked pass: incrementally hash the exact bytes while
+		// locating the lossless term; the record is trusted only after the whole
+		// partition verifies against the committed digest.
+		const hash = crypto.createHash("sha256");
+		const decoder = new TextDecoder("utf-8");
+		let carry = "";
+		let found: ColdEntryIndex | undefined;
+		let residentBytes = 0;
+		for (let offset = 0; offset < committed.size; offset += 64 * 1024) {
+			const length = Math.min(64 * 1024, committed.size - offset);
+			let bytes: Uint8Array;
+			try {
+				bytes = this.storage.readRangeSync(this.#dictionaryPartitionPath(partition), offset, length).bytes;
+			} catch {
+				return undefined;
+			}
+			hash.update(bytes);
+			const text =
+				carry +
+				decoder.decode(bytes, {
+					stream: offset + length < committed.size,
+				});
+			const lines = text.split("\n");
+			carry = lines.pop() ?? "";
+			for (const line of lines) {
+				if (!line) continue;
+				const record = parseDictionaryPartitionRecord(line);
+				if (!record) return undefined;
+				if (record.term !== id) continue;
+				if (record.dictId < 0) return undefined;
+				found = {
+					ordinal: record.ordinal,
+					seq: record.seq,
+					byteOffset: record.byteOffset,
+					byteLength: record.byteLength,
+					recordDigest: record.recordDigest,
+					parentId: record.parentId,
+					...(record.entryType.length > 0 ? { entryType: record.entryType } : {}),
+				};
+				residentBytes = line.length * 2 + 48;
+			}
+		}
+		if (hash.digest("hex") !== committed.digest) return undefined;
+		if (!found) return undefined;
+		if (!runtime.coldEntries.has(id) && runtime.blockCache.tryAllocate(residentBytes))
+			runtime.coldEntries.set(id, found);
+		return found;
+	}
+
+	// =========================================================================
+	// Persistent metadata-delta section (demoted reducer/provider values)
+	// =========================================================================
+
+	/** Fresh metadata-delta runtime state for a build or adoption. */
+	#createMetadataDeltaRuntimeState(): MetadataDeltaArtifactRuntimeState {
+		return {
+			indexDigest: "",
+			size: 0,
+			sha256: "",
+			hash: crypto.createHash("sha256"),
+			byKey: new Map(),
+			descriptorBytes: 0,
+			budgetBytes: REDUCER_BUDGET_BYTES,
+		};
+	}
+
+	/** Resident bytes of one retained delta descriptor (key + kind + sha256 + object + descriptor). */
+	#metadataDeltaDescriptorCharge(key: string, kind: string): number {
+		return metadataDeltaDescriptorResidentBytes(key) + residentStringBytes(kind) + 2 * 64 + 16 + 8;
+	}
+
+	/** Reconcile the reducer-bucket descriptor accounting with the current byKey set. */
+	#syncMetadataDeltaDescriptorBytes(): void {
+		const delta = this.#sidecarRuntime?.metadataDelta;
+		if (!delta) return;
+		let total = 0;
+		for (const [key, value] of delta.byKey) total += this.#metadataDeltaDescriptorCharge(key, value.kind);
+		delta.descriptorBytes = total;
+	}
+
+	/**
+	 * Append one provider value's exact line bytes to the metadata-delta section
+	 * (fsync before returning). Returns the exact value location + digest, or
+	 * `undefined` when the fixed 4 MiB reducer budget would be exceeded or the
+	 * write fails — the caller then keeps the value inline (fail closed to the
+	 * pre-demotion eager marker semantics).
+	 */
+	#appendMetadataDeltaValue(lineBytes: Uint8Array): { offset: number; length: number; sha256: string } | undefined {
+		const runtime = this.#sidecarRuntime;
+		const delta = runtime?.metadataDelta;
+		if (!delta) return undefined;
+		if (delta.size + lineBytes.byteLength > delta.budgetBytes) return undefined;
+		try {
+			const writer = this.storage.openWriter(runtime.metadataDeltaPath, { flags: delta.size === 0 ? "w" : "a" });
+			try {
+				writer.writeLineSync(Buffer.from(lineBytes).toString("utf8"));
+				if (!writer.fsyncSync) throw new Error("Synchronous metadata-delta fsync is unavailable");
+				writer.fsyncSync();
+			} finally {
+				writer.closeSync();
+			}
+		} catch {
+			return undefined;
+		}
+		const offset = delta.size;
+		delta.hash.update(Buffer.from(lineBytes));
+		delta.size += lineBytes.byteLength;
+		delta.sha256 = delta.hash.copy().digest("hex");
+		return { offset, length: lineBytes.byteLength, sha256: computeLineDigest(Buffer.from(lineBytes)) };
+	}
+
+	/**
+	 * Derive the marker's metadata-delta binding from the current runtime state.
+	 * Positions are the merged provider-list indices, so reopen reproduces the
+	 * exact ordered provider list. Absent when no value is demoted.
+	 */
+	#buildMetadataDeltaCommit(): MetadataDeltaArtifactCommit | undefined {
+		const runtime = this.#sidecarRuntime;
+		const delta = runtime?.metadataDelta;
+		if (!delta || delta.byKey.size === 0) return undefined;
+		const values: MetadataDeltaValue[] = [];
+		runtime.providerStateOrder.forEach((key, position) => {
+			const stored = delta.byKey.get(key);
+			if (!stored) return;
+			values.push({ key, ...stored, position });
+		});
+		if (values.length === 0) return undefined;
+		return { indexDigest: delta.indexDigest, size: delta.size, sha256: delta.sha256, values };
+	}
+
+	/**
+	 * The marker's inline provider list: the merged provider order minus the
+	 * demoted entries (those are carried as metadata-delta descriptors with
+	 * their exact merged positions, so reopen reproduces the merged order).
+	 */
+	#markerProviderStateEntries(): SessionEntry[] {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return [];
+		const delta = runtime.metadataDelta;
+		if (!delta || delta.byKey.size === 0) return runtime.providerStateEntries.map(cloneSessionEntry);
+		const inlineByKey = new Map<string, SessionEntry>();
+		for (const entry of runtime.providerStateEntries) {
+			const key = providerStateEntryKey(entry);
+			if (key) inlineByKey.set(key, entry);
+		}
+		const inline: SessionEntry[] = [];
+		for (const key of runtime.providerStateOrder) {
+			const entry = inlineByKey.get(key);
+			if (entry) inline.push(cloneSessionEntry(entry));
+		}
+		return inline;
+	}
+
+	/** Read one demoted value's exact bytes, verify its digest, and parse it strictly. */
+	#rehydrateMetadataDeltaValue(fileBytes: Uint8Array, value: MetadataDeltaValue): SessionEntry | undefined {
+		if (value.offset + value.length > fileBytes.byteLength) return undefined;
+		const bytes = fileBytes.subarray(value.offset, value.offset + value.length);
+		if (computeLineDigest(bytes) !== value.sha256) return undefined;
+		let entry: unknown;
+		try {
+			entry = JSON.parse(Buffer.from(bytes).toString("utf8"));
+		} catch {
+			return undefined;
+		}
+		if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+		const candidate = entry as SessionEntry;
+		if (candidate.type !== value.kind) return undefined;
+		if (!isProviderStateEntry(candidate)) return undefined;
+		if (providerStateEntryKey(candidate) !== value.key) return undefined;
+		return candidate;
+	}
+
+	/**
+	 * Verify the committed metadata-delta binding (exact size + SHA-256 over the
+	 * file bytes + covered index digest), validate every demoted value's bytes
+	 * (transient rehydration), and rebuild the exact merged provider order as
+	 * keys. Demoted values are NOT retained resident — only their descriptors
+	 * are kept, and the provider context rehydrates them on demand. Any
+	 * ambiguity fails closed (returns false → the caller falls back to the
+	 * eager authoritative path).
+	 */
+	#adoptCommittedMetadataDelta(commit: MetadataDeltaArtifactCommit | undefined): boolean {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) {
+			return false;
+		}
+		if (commit === undefined) {
+			runtime.metadataDelta = undefined;
+			runtime.providerStateOrder = runtime.providerStateEntries
+				.map(providerStateEntryKey)
+				.filter((key): key is string => key !== undefined);
+			return true;
+		}
+		if (!isValidMetadataDeltaCommit(commit)) return false;
+		if (commit.indexDigest !== runtime.indexDigest) return false;
+		if (commit.size > REDUCER_BUDGET_BYTES) return false;
+		if (commit.values.length + runtime.providerStateEntries.length > 256) return false;
+		if (Buffer.byteLength(JSON.stringify(runtime.providerStateEntries), "utf8") + commit.size > REDUCER_BUDGET_BYTES)
+			return false;
+		const providerKeys = new Set<string>();
+		for (const entry of runtime.providerStateEntries) {
+			const key = providerStateEntryKey(entry);
+			if (!key || providerKeys.has(key)) return false;
+			providerKeys.add(key);
+		}
+		for (const value of commit.values) {
+			if (providerKeys.has(value.key)) return false;
+			providerKeys.add(value.key);
+		}
+		if (typeof this.storage.readRangeSync !== "function") return false;
+		let fileBytes: Uint8Array;
+		try {
+			const stat = this.storage.statSync(runtime.metadataDeltaPath);
+			if (stat.size !== commit.size) return false;
+			fileBytes = this.storage.readRangeSync(runtime.metadataDeltaPath, 0, commit.size).bytes;
+		} catch {
+			return false;
+		}
+		if (computeLineDigest(fileBytes) !== commit.sha256) return false;
+		// Transient validation: every demoted value's exact bytes must parse to a
+		// matching provider entry. The parsed entries are not retained.
+		for (const value of commit.values) {
+			if (!this.#rehydrateMetadataDeltaValue(fileBytes, value)) return false;
+		}
+		// Merge the exact slot sequence: demoted keys occupy their positions;
+		// inline keys (marker order) fill the remaining slots in order.
+		const slots: Array<string | undefined> = new Array(
+			runtime.providerStateEntries.length + commit.values.length,
+		).fill(undefined);
+		for (const value of commit.values) {
+			if (value.position < 0 || value.position >= slots.length || slots[value.position] !== undefined) return false;
+			slots[value.position] = value.key;
+		}
+		let inlineIndex = 0;
+		for (let slot = 0; slot < slots.length; slot++) {
+			if (slots[slot] !== undefined) continue;
+			if (inlineIndex >= runtime.providerStateEntries.length) return false;
+			const key = providerStateEntryKey(runtime.providerStateEntries[inlineIndex++]!);
+			if (!key) return false;
+			slots[slot] = key;
+		}
+		if (inlineIndex !== runtime.providerStateEntries.length) return false;
+		const delta = this.#createMetadataDeltaRuntimeState();
+		delta.indexDigest = commit.indexDigest;
+		delta.size = commit.size;
+		delta.sha256 = commit.sha256;
+		delta.hash = crypto.createHash("sha256").update(fileBytes);
+		for (const value of commit.values) {
+			delta.byKey.set(value.key, {
+				kind: value.kind,
+				ordinal: value.ordinal,
+				offset: value.offset,
+				length: value.length,
+				sha256: value.sha256,
+			});
+		}
+		runtime.metadataDelta = delta;
+		this.#syncMetadataDeltaDescriptorBytes();
+		try {
+			delta.validatedDescriptor = this.storage.statSync(runtime.metadataDeltaPath);
+		} catch {
+			// Re-verification happens on first use.
+		}
+		runtime.providerStateOrder = slots as string[];
+		return true;
+	}
+
+	/**
+	 * The merged provider list for the provider-context builder: inline entries
+	 * in merged order plus on-demand bounded rehydration of demoted values from
+	 * the authenticated metadata-delta section. Returns `undefined` on any
+	 * inconsistency (callers fall back to the authoritative eager path).
+	 */
+	#resolvedProviderStateEntries(): SessionEntry[] | undefined {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime) return undefined;
+		const delta = runtime.metadataDelta;
+		const inlineByKey = new Map<string, SessionEntry>();
+		for (const entry of runtime.providerStateEntries) {
+			const key = providerStateEntryKey(entry);
+			if (key) inlineByKey.set(key, entry);
+		}
+		if (!delta || delta.byKey.size === 0) {
+			// No demoted values: the merged order equals the inline list.
+			return runtime.providerStateOrder
+				.map(key => inlineByKey.get(key))
+				.filter((entry): entry is SessionEntry => entry !== undefined);
+		}
+		if (typeof this.storage.readRangeSync !== "function") return undefined;
+		let fileBytes: Uint8Array;
+		try {
+			const stat = this.storage.statSync(runtime.metadataDeltaPath);
+			if (stat.size !== delta.size) return undefined;
+			fileBytes = this.storage.readRangeSync(runtime.metadataDeltaPath, 0, delta.size).bytes;
+		} catch {
+			return undefined;
+		}
+		if (computeLineDigest(fileBytes) !== delta.sha256) return undefined;
+		const resolved: SessionEntry[] = [];
+		for (const key of runtime.providerStateOrder) {
+			const inline = inlineByKey.get(key);
+			if (inline) {
+				resolved.push(inline);
+				continue;
+			}
+			const stored = delta.byKey.get(key);
+			if (!stored) return undefined;
+			const value: MetadataDeltaValue = { key, ...stored, position: -1 };
+			const entry = this.#rehydrateMetadataDeltaValue(fileBytes, value);
+			if (!entry) return undefined;
+			resolved.push(entry);
+		}
+		return resolved;
+	}
+
 	/**
 	 * Incrementally maintain the parent artifact for one appended entry. The
 	 * bucket record is appended and fsynced BEFORE the commit marker is
@@ -9911,6 +11214,7 @@ export class SessionManager {
 		const bucket = parentBucketForId(parentId, artifact.buckets.length);
 		const bucketState = artifact.buckets[bucket];
 		if (!bucketState) return false;
+		if (!bucketState.complete) return false;
 		const recordLine = serializeParentBucketRecord({
 			parentId,
 			childId: index.childId,
@@ -9936,7 +11240,6 @@ export class SessionManager {
 			const digest = crypto.createHash("sha256").update(currentBytes).digest("hex");
 			if (digest !== bucketState.digest || currentBytes.byteLength !== bucketState.size) return false;
 			const childCount = countParentBucketRecords(currentBytes, parentId);
-			if (childCount === 0 && !bucketState.complete) return false;
 			if (childCount >= PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT) return false;
 			if (artifact.totalBytes + recordBytes > artifact.budgetBytes) return false;
 			const writer = this.storage.openWriter(this.#parentBucketPath(bucket), { flags: "a" });
@@ -9980,7 +11283,8 @@ export class SessionManager {
 		const bucket = parentBucketForId(parentId, artifact.buckets.length);
 		const committed = artifact.buckets[bucket];
 		if (!committed) return undefined;
-		if (committed.size === 0) return committed.complete ? [] : undefined;
+		if (!committed.complete) return fail();
+
 		let bucketStat: SessionStorageStat;
 		let bytes: Uint8Array;
 		try {
@@ -10006,7 +11310,10 @@ export class SessionManager {
 			const lines = text.split("\n");
 			carry = lines.pop() ?? "";
 			for (const line of lines) {
-				if (!line) continue;
+				if (!line) {
+					malformed = true;
+					break;
+				}
 				const record = parseParentBucketRecord(line);
 				if (!record) {
 					malformed = true;
@@ -10029,8 +11336,8 @@ export class SessionManager {
 			}
 			if (malformed) break;
 		}
+		if (carry.length > 0) malformed = true;
 		if (malformed || records.length > PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT) return fail();
-		if (records.length === 0 && !committed.complete) return undefined;
 		for (const record of records) {
 			if (!runtime.coldEntries.has(record.childId) && runtime.blockCache.tryAllocate(record.residentBytes))
 				runtime.coldEntries.set(record.childId, record.index);
@@ -10074,7 +11381,13 @@ export class SessionManager {
 		}
 		if (parsed === null || typeof parsed !== "object") return undefined;
 		const entry = parsed as SessionEntry;
-		if (entry.id !== id || entry.parentId !== parentId) return undefined;
+		if (
+			entry.id !== id ||
+			entry.parentId !== parentId ||
+			(typeof index.entryType === "string" && entry.type !== index.entryType)
+		)
+			return undefined;
+		residentizePersistedBlobRefs(entry);
 		if (!runtime.entryCache.tryAllocate(bytes.byteLength)) return entry;
 		this.#byId.set(id, entry);
 		return entry;
@@ -10092,11 +11405,19 @@ export class SessionManager {
 		}
 	}
 
-	/** Every disposable sidecar path, including the persistent parent artifact buckets. */
+	/** Every disposable sidecar path, including persistent dictionary/metadata artifacts. */
 	#disposableSidecarPaths(): string[] {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime) return [];
-		return [runtime.indexPath, runtime.tailPath, runtime.commitPath, ...parentBucketPaths(runtime.indexPath)];
+		return [
+			runtime.indexPath,
+			runtime.tailPath,
+			runtime.commitPath,
+			runtime.dictionaryMetaPath,
+			runtime.metadataDeltaPath,
+			...dictionaryPartitionPaths(runtime.indexPath),
+			...parentBucketPaths(runtime.indexPath),
+		];
 	}
 
 	#validateColdBase(base = this.#sidecarRuntime?.base): boolean {
@@ -10238,7 +11559,7 @@ export class SessionManager {
 			const expected = runtime.tail.records[ordinal++];
 			if (!expected) return false;
 			try {
-				const actual = JSON.parse(Buffer.from(lineBytes.subarray(0, lineBytes.byteLength - 1)).toString("utf8"));
+				const actual = JSON.parse(decodeBoundedJsonLine(lineBytes));
 				if (JSON.stringify(actual) !== JSON.stringify(expected)) return false;
 			} catch {
 				return false;
@@ -10265,6 +11586,8 @@ export class SessionManager {
 			runtime.blockCache.release(runtime.blockCache.allocatedBytes);
 			runtime.validatedIndexDescriptor = undefined;
 		}
+		const dictionaryIndex = this.#findColdEntryIndexFromDictionary(id);
+		if (dictionaryIndex) return dictionaryIndex;
 		if (!this.#coldIndexDigestValid()) return undefined;
 		let size: number;
 		try {
@@ -10339,17 +11662,103 @@ export class SessionManager {
 		return undefined;
 	}
 
-	#readAllColdEntryIndexes(): Array<ColdEntryIndex & { id: string }> {
+	#validateColdIndexCoverage(sessionFile: string, transcriptSize: number, expectedDigest: string): boolean {
 		const runtime = this.#sidecarRuntime;
-		if (!runtime?.enabled || !runtime.indexPath || typeof this.storage.readRangeSync !== "function") return [];
-		if (!this.#coldIndexDigestValid()) return [];
+		if (!runtime?.indexPath || typeof this.storage.readRangeSync !== "function") return false;
+		const memoryIds = this.storage instanceof FileSessionStorage ? undefined : new BoundedColdIdHashSet();
+		let diskIds: DiskBackedIdUniquenessCheck | undefined;
+		try {
+			if (this.storage instanceof FileSessionStorage) diskIds = new DiskBackedIdUniquenessCheck();
+		} catch {
+			return false;
+		}
+		let ordinal = 0;
+		let expectedOffset: number | undefined;
+		let firstOffset: number | undefined;
+		let valid = true;
+		const indexHash = crypto.createHash("sha256");
 		let size: number;
 		try {
 			size = this.storage.statSync(runtime.indexPath).size;
 		} catch {
-			return [];
+			diskIds?.dispose();
+			return false;
+		}
+		const failure = scanTranscriptLinesBounded(this.storage, runtime.indexPath, size, (_offset, lineBytes) => {
+			indexHash.update(lineBytes);
+			try {
+				const value = JSON.parse(decodeBoundedJsonLine(lineBytes)) as Partial<ColdEntryIndex> & { id?: unknown };
+				if (
+					typeof value.id !== "string" ||
+					typeof value.ordinal !== "number" ||
+					!Number.isSafeInteger(value.ordinal) ||
+					typeof value.seq !== "number" ||
+					!Number.isSafeInteger(value.seq) ||
+					typeof value.byteOffset !== "number" ||
+					!Number.isSafeInteger(value.byteOffset) ||
+					typeof value.byteLength !== "number" ||
+					!Number.isSafeInteger(value.byteLength) ||
+					typeof value.recordDigest !== "string" ||
+					!/^[0-9a-f]{64}$/.test(value.recordDigest) ||
+					(value.parentId !== null && typeof value.parentId !== "string") ||
+					typeof value.entryType !== "string" ||
+					value.ordinal !== ordinal ||
+					value.byteLength <= 0 ||
+					(expectedOffset === undefined ? value.byteOffset <= 0 : value.byteOffset !== expectedOffset) ||
+					!(diskIds ? diskIds.add(value.id) : memoryIds!.addUnique(value.id))
+				) {
+					valid = false;
+					return false;
+				}
+				firstOffset ??= value.byteOffset;
+				expectedOffset = value.byteOffset + value.byteLength;
+				ordinal++;
+			} catch {
+				valid = false;
+				return false;
+			}
+		});
+		const idsUnique = diskIds ? diskIds.finish() : true;
+		const digestValid = indexHash.copy().digest("hex") === expectedDigest;
+		if (!digestValid) this.#lazyReopenFallbackReason = "index_digest_mismatch";
+		diskIds?.dispose();
+		if (
+			failure ||
+			!valid ||
+			!idsUnique ||
+			!digestValid ||
+			ordinal === 0 ||
+			expectedOffset !== transcriptSize ||
+			firstOffset === undefined
+		)
+			return false;
+		if (firstOffset > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return false;
+		try {
+			const headerBytes = this.storage.readRangeSync(sessionFile, 0, firstOffset).bytes;
+			const headerValid =
+				headerBytes.byteLength === firstOffset &&
+				headerBytes.at(-1) === 0x0a &&
+				Buffer.from(headerBytes).indexOf(0x0a) === headerBytes.byteLength - 1;
+			if (headerValid) runtime.indexHash = indexHash;
+			return headerValid;
+		} catch {
+			return false;
+		}
+	}
+
+	#readAllColdEntryIndexes(): Array<ColdEntryIndex & { id: string }> {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled || !runtime.indexPath || typeof this.storage.readRangeSync !== "function")
+			throw new Error("cold_index_unavailable");
+		if (!this.#coldIndexDigestValid()) throw new Error("cold_index_invalid");
+		let size: number;
+		try {
+			size = this.storage.statSync(runtime.indexPath).size;
+		} catch {
+			throw new Error("cold_index_unavailable");
 		}
 		const result: Array<ColdEntryIndex & { id: string }> = [];
+		const ids = new Set<string>();
 		const decoder = new TextDecoder("utf-8");
 		let carry = "";
 		for (let offset = 0; offset < size; offset += 64 * 1024) {
@@ -10358,23 +11767,55 @@ export class SessionManager {
 			const lines = (carry + decoder.decode(bytes, { stream: offset + length < size })).split("\n");
 			carry = lines.pop() ?? "";
 			for (const line of lines) {
-				if (!line) continue;
+				if (!line) throw new Error("cold_index_malformed");
 				try {
 					const value = JSON.parse(line) as Partial<ColdEntryIndex> & { id?: unknown };
 					if (
-						typeof value.id === "string" &&
-						typeof value.ordinal === "number" &&
-						typeof value.seq === "number" &&
-						typeof value.byteOffset === "number" &&
-						typeof value.byteLength === "number" &&
-						typeof value.recordDigest === "string"
+						typeof value.id !== "string" ||
+						typeof value.ordinal !== "number" ||
+						!Number.isSafeInteger(value.ordinal) ||
+						typeof value.seq !== "number" ||
+						!Number.isSafeInteger(value.seq) ||
+						typeof value.byteOffset !== "number" ||
+						!Number.isSafeInteger(value.byteOffset) ||
+						typeof value.byteLength !== "number" ||
+						!Number.isSafeInteger(value.byteLength) ||
+						typeof value.recordDigest !== "string" ||
+						!/^[0-9a-f]{64}$/.test(value.recordDigest) ||
+						(value.parentId !== null && typeof value.parentId !== "string") ||
+						typeof value.entryType !== "string"
 					)
-						result.push(value as ColdEntryIndex & { id: string });
+						throw new Error("cold_index_malformed");
+					const previous = result.at(-1);
+					if (
+						value.ordinal !== result.length ||
+						value.byteOffset < 0 ||
+						value.byteLength <= 0 ||
+						(previous ? previous.byteOffset + previous.byteLength !== value.byteOffset : value.byteOffset <= 0) ||
+						ids.has(value.id)
+					)
+						throw new Error("cold_index_incomplete");
+					ids.add(value.id);
+					result.push(value as ColdEntryIndex & { id: string });
 				} catch {
-					return [];
+					throw new Error("cold_index_malformed");
 				}
 			}
 		}
+		if (carry.length > 0) throw new Error("cold_index_unterminated");
+		const first = result[0];
+		if (!first || first.byteOffset > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES || !this.#sessionFile)
+			throw new Error("cold_index_incomplete");
+		const headerBytes = this.storage.readRangeSync(this.#sessionFile, 0, first.byteOffset).bytes;
+		if (
+			headerBytes.byteLength !== first.byteOffset ||
+			headerBytes.at(-1) !== 0x0a ||
+			Buffer.from(headerBytes).indexOf(0x0a) !== headerBytes.byteLength - 1
+		)
+			throw new Error("cold_index_incomplete");
+		const last = result.at(-1);
+		if (!last || last.byteOffset + last.byteLength !== runtime.tail.transcriptSize)
+			throw new Error("cold_index_incomplete");
 		return result;
 	}
 
@@ -10404,23 +11845,33 @@ export class SessionManager {
 		if (hot) return hot;
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled) return undefined;
+		const fail = (): SessionEntry | undefined => {
+			this.#hydrateAuthoritativeTranscriptSync(runtime);
+			return this.#byId.get(id);
+		};
 		const index = this.#findColdEntryIndex(id);
 		if (!index) return undefined;
 		const bytes = this.#readColdEntryRange(index);
-		if (!bytes) return undefined;
-		if (computeLineDigest(bytes) !== index.recordDigest) return undefined;
+		if (!bytes) return fail();
+		if (computeLineDigest(bytes) !== index.recordDigest) return fail();
 		let parsed: unknown;
 		try {
 			const text = new TextDecoder("utf-8").decode(bytes);
 			parsed = JSON.parse(text);
 		} catch {
-			return undefined;
+			return fail();
 		}
 		if (parsed === null || typeof parsed !== "object" || typeof (parsed as { id?: unknown }).id !== "string") {
-			return undefined;
+			return fail();
 		}
-		if ((parsed as { id?: unknown }).id !== id) return undefined;
+		if (
+			(parsed as { id?: unknown }).id !== id ||
+			(typeof index.entryType === "string" && (parsed as SessionEntry).type !== index.entryType) ||
+			("parentId" in index && (parsed as SessionEntry).parentId !== index.parentId)
+		)
+			return fail();
 		const entry = parsed as SessionEntry;
+		residentizePersistedBlobRefs(entry);
 		// Bound the entry cache; a full cache rejects the rehydration (still correct via rebuild).
 		if (!runtime.entryCache.tryAllocate(bytes.byteLength)) return entry;
 		this.#byId.set(id, entry);
@@ -10442,6 +11893,7 @@ export class SessionManager {
 				parsed.parentId !== index.parentId
 			)
 				return undefined;
+			residentizePersistedBlobRefs(parsed);
 			return { entry: parsed, index };
 		} catch {
 			return undefined;
@@ -10470,14 +11922,20 @@ export class SessionManager {
 			ttsr: { count: 0, rulesCount: 0, recordsCount: 0, largestOrdinal: -1 },
 		};
 		const providerState = new Map<string, { order: number; entry: SessionEntry }>();
+		let providerStateBytes = 0;
 		while (currentId !== null) {
 			const resolved = this.#readColdBranchEntry(currentId);
 			if (!resolved || resolved.index.ordinal >= priorOrdinal) return false;
 			priorOrdinal = resolved.index.ordinal;
 			const { entry, index } = resolved;
 			const providerKey = providerStateEntryKey(entry);
-			if (providerKey && !providerState.has(providerKey))
+			if (providerKey && !providerState.has(providerKey)) {
+				if (providerState.size >= 256) return false;
+				const entryBytes = Buffer.byteLength(JSON.stringify(entry), "utf8") + 64;
+				if (providerStateBytes + entryBytes > REDUCER_BUDGET_BYTES) return false;
+				providerStateBytes += entryBytes;
 				providerState.set(providerKey, { order: index.ordinal, entry: cloneSessionEntry(entry) });
+			}
 			if (!boundaryReached) {
 				retainedLeafToBoundary.push(entry);
 				retainedBytes += index.byteLength;
@@ -10545,9 +12003,14 @@ export class SessionManager {
 		this.#usageStatistics = aggregateUsageStatistics;
 		this.#leafId = leafId;
 		runtime.reducer = reducer;
-		runtime.providerStateEntries = [...providerState.values()]
-			.sort((left, right) => left.order - right.order)
-			.map(item => item.entry);
+		const sortedBranchProvider = [...providerState.values()].sort((left, right) => left.order - right.order);
+		runtime.providerStateOrder = sortedBranchProvider.map(item => providerStateEntryKey(item.entry)!);
+		runtime.providerStateEntries = sortedBranchProvider.map(item => cloneSessionEntry(item.entry));
+		// Branch provider state is not republished (marker publication is fenced
+		// while the branch is dirty), so the metadata-delta binding must stay
+		// exactly as published: drop the in-memory delta state and keep every
+		// branch provider value resident inline.
+		runtime.metadataDelta = undefined;
 		runtime.hotSuffixBytes = retainedBytes;
 		runtime.retirementFirstKeptEntryId = boundaryId;
 		runtime.terminalTransition = { kind: "rebuild", reason: "branch_activation_unpublished" };
@@ -10556,43 +12019,7 @@ export class SessionManager {
 		return true;
 	}
 
-	/** Rehydrate the full hot view (for persistence/materialization paths). */
-	#ensureFullHotView(): void {
-		const runtime = this.#sidecarRuntime;
-		if (!runtime?.enabled) return;
-		const records = this.#readAllColdEntryIndexes();
-		for (const record of records) {
-			if (!runtime.coldEntries.has(record.id) && runtime.blockCache.tryAllocate(48)) {
-				runtime.coldEntries.set(record.id, record);
-			}
-			if (!this.#byId.has(record.id)) {
-				const entry = this.#resolveEntry(record.id);
-				if (!entry) throw new Error(`Cold session entry ${record.id} could not be rehydrated.`);
-				this.#byId.set(record.id, entry);
-			}
-		}
-		const header = this.#fileEntries.find((entry): entry is SessionHeader => entry.type === "session");
-		const hotEntries = this.#fileEntries.filter((entry): entry is SessionEntry => entry.type !== "session");
-		const rebuilt: FileEntry[] = [];
-		if (header) rebuilt.push(header);
-		const emittedIds = new Set<string>();
-		for (const record of records) {
-			const entry = this.#byId.get(record.id);
-			if (!entry || emittedIds.has(entry.id)) continue;
-			rebuilt.push(entry);
-			emittedIds.add(entry.id);
-		}
-		for (const entry of hotEntries) {
-			if (emittedIds.has(entry.id)) continue;
-			rebuilt.push(entry);
-			emittedIds.add(entry.id);
-		}
-		this.#fileEntries = rebuilt;
-		let labelsChanged = false;
-		for (const [id, label] of runtime.labelsPins.labelsEntries()) {
-			if (this.#labelsById.get(id) !== label) labelsChanged = true;
-			this.#labelsById.set(id, label);
-		}
+	#clearColdRuntimeAfterHydration(runtime: SessionMemorySidecarRuntime): void {
 		runtime.enabled = false;
 		runtime.accountant.release(runtime.accountant.totalBytes);
 		runtime.coldEntries.clear();
@@ -10600,12 +12027,117 @@ export class SessionManager {
 		runtime.labelsPins.clear();
 		runtime.parentChildrenCache.clear();
 		runtime.parentArtifact = undefined;
+		runtime.dictionary = undefined;
+		runtime.metadataDelta = undefined;
+		runtime.coldIdHashes = undefined;
+		runtime.coldIdHashesDescriptor = undefined;
+		runtime.providerStateEntries = [];
+		runtime.providerStateOrder = [];
+		runtime.reducer = {
+			modelChange: { latest: undefined },
+			ttsr: { count: 0, rulesCount: 0, recordsCount: 0, largestOrdinal: -1 },
+		};
+		runtime.hotSuffixBytes = 0;
 		runtime.blockCache.release(runtime.blockCache.allocatedBytes);
 		runtime.entryCache.release(runtime.entryCache.allocatedBytes);
 		runtime.tailCache.release(runtime.tailCache.allocatedBytes);
-		this.#bumpEntryRevision();
+		for (const sidecarPath of this.#disposableSidecarPaths()) {
+			if (!sidecarPath) continue;
+			try {
+				this.storage.unlinkSync(sidecarPath);
+			} catch {
+				// Derived sidecars are disposable after authoritative hydration.
+			}
+		}
 		this.#sidecarBranchActivationDirty = false;
-		if (labelsChanged) this.#labelRevision++;
+	}
+
+	#hydrateAuthoritativeTranscriptSync(runtime: SessionMemorySidecarRuntime): void {
+		if (!this.#sessionFile) throw new Error("cold_transcript_unavailable");
+		const entries = parseSessionEntries(this.storage.readTextSync(this.#sessionFile));
+		const header = entries[0];
+		if (header?.type !== "session") throw new Error("cold_transcript_header_invalid");
+		const migrationApplied = migrateToCurrentVersion(entries);
+		for (const entry of entries) residentizePersistedBlobRefs(entry);
+		const transition = this.#prepareResidentTextStoreTransition(
+			{
+				target: { sessionId: header.id, sessionFile: this.#sessionFile },
+				primary: {
+					mode: "materialize",
+					sourceEntries: entries,
+					sourceStores: { textStore: null, imageStore: this.#residentImageBlobStore },
+					missingPolicy: "placeholder",
+				},
+			},
+			"memory-fallback",
+		);
+		this.#commitResidentTextStoreTransition(transition, false);
+		this.#sessionId = header.id;
+		this.#sessionName = header.title;
+		this.#titleSource = header.titleSource;
+		if (migrationApplied) this.#needsFullRewriteOnNextPersist = true;
+		this.#clearColdRuntimeAfterHydration(runtime);
+	}
+
+	/** Rehydrate the full hot view (for persistence/materialization paths). */
+	#ensureFullHotView(): void {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled) return;
+		if (!this.#validateColdBase(runtime.base) || !this.#coldTailMatchesDisk()) {
+			this.#hydrateAuthoritativeTranscriptSync(runtime);
+			return;
+		}
+		if (this.#sessionFile && this.storage.statSync(this.#sessionFile).size !== runtime.tail.transcriptSize) {
+			this.#hydrateAuthoritativeTranscriptSync(runtime);
+			return;
+		}
+		let records: Array<ColdEntryIndex & { id: string }>;
+		try {
+			records = this.#readAllColdEntryIndexes();
+		} catch {
+			this.#hydrateAuthoritativeTranscriptSync(runtime);
+			return;
+		}
+		const header = this.#fileEntries.find((entry): entry is SessionHeader => entry.type === "session");
+		if (!header) {
+			this.#hydrateAuthoritativeTranscriptSync(runtime);
+			return;
+		}
+		try {
+			const rebuilt: FileEntry[] = [header];
+			for (const record of records) {
+				const bytes = this.#readColdEntryRange(record);
+				if (!bytes || computeLineDigest(bytes) !== record.recordDigest)
+					throw new Error("cold_index_digest_mismatch");
+				const entry = JSON.parse(Buffer.from(bytes).toString("utf8")) as SessionEntry;
+				if (
+					!entry ||
+					typeof entry !== "object" ||
+					entry.id !== record.id ||
+					(typeof record.entryType === "string" && entry.type !== record.entryType) ||
+					("parentId" in record && entry.parentId !== record.parentId)
+				)
+					throw new Error("cold_index_identity_mismatch");
+				residentizePersistedBlobRefs(entry);
+				rebuilt.push(entry);
+			}
+			const transition = this.#prepareResidentTextStoreTransition(
+				{
+					target: { sessionId: this.#sessionId, sessionFile: this.#sessionFile ?? "" },
+					primary: {
+						mode: "materialize",
+						sourceEntries: rebuilt,
+						sourceStores: { textStore: null, imageStore: this.#residentImageBlobStore },
+						missingPolicy: "placeholder",
+					},
+				},
+				"memory-fallback",
+			);
+			this.#commitResidentTextStoreTransition(transition, false);
+			this.#clearColdRuntimeAfterHydration(runtime);
+		} catch {
+			this.#hydrateAuthoritativeTranscriptSync(runtime);
+		}
 	}
 
 	/** True when the cold sidecar region is active and usable. */
@@ -10628,6 +12160,10 @@ export class SessionManager {
 		runtime.sidecarIneligible = true;
 		runtime.hotSuffixBytes = 0;
 		runtime.accountant = new SessionMemoryAccountant();
+		runtime.dictionary = undefined;
+		runtime.metadataDelta = undefined;
+		runtime.coldIdHashes = undefined;
+		runtime.coldIdHashesDescriptor = undefined;
 		for (const sidecarPath of this.#disposableSidecarPaths()) {
 			if (!sidecarPath) continue;
 			try {
@@ -10638,32 +12174,140 @@ export class SessionManager {
 		}
 	}
 
-	/** Wire reducer deltas for one appended entry (R1 latest-model-change + TTSR latest-wins). */
-	#applySidecarReducerDelta(entry: SessionEntry): void {
+	#nextColdOrdinal(): number {
 		const runtime = this.#sidecarRuntime;
-		if (!runtime?.enabled) return;
+		if (!runtime?.enabled) throw new Error("cold_sidecar_unavailable");
+		const previous = runtime.tail.records.at(-1);
+		if (previous) return previous.ordinal + 1;
+		if (runtime.dictionary) return runtime.dictionary.recordCount;
+		return this.#readAllColdEntryIndexes().length;
+	}
+
+	#ensureColdIdHashes(): BoundedColdIdHashSet | undefined {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled || !runtime.indexPath) return undefined;
+		if (runtime.coldIdHashes) {
+			try {
+				if (
+					runtime.coldIdHashesDescriptor &&
+					sameDescriptor(this.storage.statSync(runtime.indexPath), runtime.coldIdHashesDescriptor)
+				)
+					return runtime.coldIdHashes;
+			} catch {
+				// Fall through to authoritative hydration.
+			}
+			runtime.coldIdHashes = undefined;
+			runtime.coldIdHashesDescriptor = undefined;
+			runtime.accountant.release(COLD_ID_HASH_BYTES);
+			return undefined;
+		}
+		if (!this.#coldIndexDigestValid()) return undefined;
+		if (!runtime.accountant.tryCharge(COLD_ID_HASH_BYTES)) return undefined;
+		const hashes = new BoundedColdIdHashSet();
+		let complete = true;
+		try {
+			const size = this.storage.statSync(runtime.indexPath).size;
+			const failure = scanTranscriptLinesBounded(this.storage, runtime.indexPath, size, (_offset, lineBytes) => {
+				try {
+					const value = JSON.parse(decodeBoundedJsonLine(lineBytes)) as { id?: unknown };
+					if (typeof value.id !== "string" || !hashes.add(value.id)) {
+						complete = false;
+						return false;
+					}
+				} catch {
+					complete = false;
+					return false;
+				}
+			});
+			if (failure || !complete) return undefined;
+			runtime.coldIdHashes = hashes;
+			runtime.coldIdHashesDescriptor = this.storage.statSync(runtime.indexPath);
+			return hashes;
+		} finally {
+			if (!runtime.coldIdHashes) runtime.accountant.release(COLD_ID_HASH_BYTES);
+		}
+	}
+
+	#generateEntryId(): string {
+		const runtime = this.#sidecarRuntime;
+		if (!this.#coldSidecarActive() || !runtime) return generateId(this.#byId);
+		if (runtime.dictionary)
+			return generateId({ has: id => this.#byId.has(id) || this.#findColdEntryIndex(id, false) !== undefined });
+		const hashes = this.#ensureColdIdHashes();
+		if (!hashes) {
+			this.#ensureFullHotView();
+			return generateId(this.#byId);
+		}
+		return generateId({ has: id => this.#byId.has(id) || hashes.has(id) });
+	}
+
+	/** Wire reducer deltas for one appended entry (R1 latest-model-change + TTSR latest-wins). */
+	#applySidecarReducerDelta(entry: SessionEntry, ordinal: number): boolean {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled) return false;
 		const providerKey = providerStateEntryKey(entry);
 		if (providerKey) {
-			runtime.providerStateEntries = [
+			const existed = runtime.providerStateOrder.includes(providerKey);
+			if (!existed && runtime.providerStateOrder.length >= 256) return false;
+			const demoted = this.#persistProviderStateValue(entry, ordinal);
+			const nextProviderEntries = [
 				...runtime.providerStateEntries.filter(candidate => providerStateEntryKey(candidate) !== providerKey),
-				cloneSessionEntry(entry),
+				...(demoted ? [] : [cloneSessionEntry(entry)]),
 			];
+			const providerBytes =
+				Buffer.byteLength(JSON.stringify(nextProviderEntries), "utf8") + (runtime.metadataDelta?.size ?? 0);
+			if (providerBytes > REDUCER_BUDGET_BYTES) return false;
+			runtime.providerStateOrder = [...runtime.providerStateOrder.filter(key => key !== providerKey), providerKey];
+			runtime.providerStateEntries = nextProviderEntries;
 		}
 		if (entry.type === "model_change") {
 			runtime.reducer = applyReducerDelta(runtime.reducer, {
 				kind: "latest_model_change",
-				ordinal: this.#fileEntries.length - 1,
+				ordinal,
 				role: entry.role,
 			});
 		} else if (entry.type === "ttsr_injection") {
 			runtime.reducer = applyReducerDelta(runtime.reducer, {
 				kind: "ttsr_injection",
-				ordinal: this.#fileEntries.length - 1,
+				ordinal,
 				rulesCount: entry.injectedRules.length,
 				recordsCount: entry.injectedRuleRecords?.length ?? 0,
 				count: entry.ttsrMessageCount ?? 0,
 			});
 		}
+		return true;
+	}
+
+	/**
+	 * Persist one provider-state entry's value into the metadata-delta section
+	 * when it exceeds `MAX_REDUCER_INLINE_BYTES`; otherwise keep it inline. The
+	 * value bytes are fsynced before the descriptor is retained, so the marker
+	 * only ever binds descriptors pointing at durable authenticated bytes. When
+	 * the fixed 4 MiB reducer budget or the write fails, the value stays inline
+	 * (fail closed to the pre-demotion eager marker semantics). Returns whether
+	 * the value was demoted (the caller then keeps only the 24 B descriptor
+	 * resident instead of the full entry).
+	 */
+	#persistProviderStateValue(entry: SessionEntry, ordinal: number): boolean {
+		const runtime = this.#sidecarRuntime;
+		const delta = runtime?.metadataDelta;
+		if (!delta) return false;
+		const key = providerStateEntryKey(entry);
+		if (!key) return false;
+		const persistedLine = Buffer.from(`${JSON.stringify(entry)}\n`, "utf8");
+		if (persistedLine.byteLength > MAX_REDUCER_INLINE_BYTES) {
+			const stored = this.#appendMetadataDeltaValue(persistedLine);
+			if (stored) {
+				delta.byKey.set(key, { kind: entry.type, ordinal, ...stored });
+				this.#syncMetadataDeltaDescriptorBytes();
+				return true;
+			}
+			delta.byKey.delete(key);
+		} else {
+			delta.byKey.delete(key);
+		}
+		this.#syncMetadataDeltaDescriptorBytes();
+		return false;
 	}
 
 	#advanceColdTailBoundary(firstKeptEntryId: string): boolean {
@@ -10722,6 +12366,7 @@ export class SessionManager {
 		entry: SessionEntry,
 		persistedLine: Buffer,
 		transcriptDescriptor?: SessionStorageStat,
+		ordinal = this.#nextColdOrdinal(),
 	): boolean {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled || runtime.sidecarIneligible) return false;
@@ -10739,7 +12384,7 @@ export class SessionManager {
 			gen: this.#commitGen + 1,
 			seq,
 			kind: tailRecordKindForEntry(entry),
-			ordinal: (previous?.ordinal ?? -1) + 1,
+			ordinal,
 			id: entry.id,
 			parentId: entry.parentId,
 			type: entry.type,
@@ -10757,7 +12402,9 @@ export class SessionManager {
 				if (!indexWriter.fsyncSync) throw new Error("Synchronous sidecar fsync is unavailable");
 				indexWriter.fsyncSync();
 				runtime.indexHash.update(Buffer.from(indexLine, "utf8"));
+				if (runtime.coldIdHashes && !runtime.coldIdHashes.add(entry.id)) return false;
 				runtime.indexDigest = runtime.indexHash.copy().digest("hex");
+				if (runtime.metadataDelta) runtime.metadataDelta.indexDigest = runtime.indexDigest;
 			} finally {
 				indexWriter.closeSync();
 			}
@@ -10773,25 +12420,46 @@ export class SessionManager {
 			this.#deactivateColdForBranchMutation();
 			return false;
 		}
-		if (typeof entry.parentId === "string") {
+		const secondaryArtifactsEligible =
+			record.ordinal < PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS &&
+			byteOffset + byteLength <= PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES;
+		if (!secondaryArtifactsEligible) {
+			this.#invalidateParentArtifact();
+			this.#invalidateDictionaryArtifact();
+		} else {
+			if (typeof entry.parentId === "string") {
+				if (
+					!this.#appendParentArtifactRecord(entry.parentId, {
+						childId: entry.id,
+						ordinal: record.ordinal,
+						seq,
+						byteOffset,
+						byteLength,
+						recordDigest,
+						entryType: entry.type,
+					})
+				)
+					this.#invalidateParentArtifact();
+			}
+			if (entry.parentId === null && runtime.parentArtifact) this.#invalidateParentArtifact();
 			if (
-				!this.#appendParentArtifactRecord(entry.parentId, {
-					childId: entry.id,
+				!this.#appendDictionaryRecord({
+					id: entry.id,
 					ordinal: record.ordinal,
 					seq,
 					byteOffset,
 					byteLength,
 					recordDigest,
+					parentId: entry.parentId,
 					entryType: entry.type,
 				})
-			) {
-				this.#invalidateParentArtifact();
-			}
+			)
+				this.#invalidateDictionaryArtifact();
 		}
-		if (entry.parentId === null && runtime.parentArtifact) this.#invalidateParentArtifact();
 		try {
 			const refreshed = this.storage.statSync(runtime.indexPath);
 			runtime.validatedIndexDescriptor = refreshed;
+			runtime.coldIdHashesDescriptor = runtime.coldIdHashes ? refreshed : undefined;
 		} catch {
 			// The next cold lookup re-verifies the index digest before trusting caches.
 		}
@@ -10839,6 +12507,8 @@ export class SessionManager {
 				usageStatistics?: unknown;
 				indexDigest?: unknown;
 				parentIndex?: unknown;
+				dictionary?: unknown;
+				metadataDelta?: unknown;
 			};
 			const descriptor = value.descriptor;
 			const base = value.base;
@@ -10858,6 +12528,8 @@ export class SessionManager {
 				typeof value.transcriptSize !== "number" ||
 				typeof value.indexDigest !== "string"
 			)
+				return undefined;
+			if (Object.hasOwn(value, "metadataDelta") && !isValidMetadataDeltaCommit(value.metadataDelta))
 				return undefined;
 			return {
 				gen: value.gen,
@@ -10890,6 +12562,10 @@ export class SessionManager {
 				...(this.#parseParentIndexValue(value.parentIndex) !== undefined
 					? { parentIndex: this.#parseParentIndexValue(value.parentIndex) }
 					: {}),
+				...(this.#parseDictionaryCommitValue(value.dictionary) !== undefined
+					? { dictionary: this.#parseDictionaryCommitValue(value.dictionary) }
+					: {}),
+				...(isValidMetadataDeltaCommit(value.metadataDelta) ? { metadataDelta: value.metadataDelta } : {}),
 			};
 		} catch {
 			return undefined;
@@ -11419,8 +13095,12 @@ export class SessionManager {
 			return { kind: "promoted" };
 		}
 		for (const item of persisted) {
-			this.#applySidecarReducerDelta(item.entry);
-			if (!this.#appendColdSidecarRecord(item.entry, item.line)) {
+			const ordinal = this.#nextColdOrdinal();
+			if (!this.#applySidecarReducerDelta(item.entry, ordinal)) {
+				this.#ensureFullHotView();
+				return { kind: "promoted" };
+			}
+			if (!this.#appendColdSidecarRecord(item.entry, item.line, undefined, ordinal)) {
 				this.#ensureFullHotView();
 				return { kind: "promoted" };
 			}
@@ -11640,6 +13320,8 @@ export class SessionManager {
 				autoDisabledReason: this.#sessionMemoryAutoDisabledReason,
 				consecutiveBuildFailures: this.#consecutiveSidecarBuildFailures,
 				parentArtifactEnabled: false,
+				dictionaryArtifactEnabled: false,
+				metadataDeltaDescriptorBytes: 0,
 			};
 		}
 		const reducerBytes = JSON.stringify(runtime.reducer).length * 2 + 48;
@@ -11648,7 +13330,8 @@ export class SessionManager {
 			runtime.entryCache.allocatedBytes +
 			runtime.tailCache.allocatedBytes +
 			runtime.labelsPins.totalBytes +
-			reducerBytes;
+			reducerBytes +
+			(runtime.metadataDelta?.descriptorBytes ?? 0);
 		return {
 			sidecarEnabled: runtime.enabled,
 			coldRetirementActive: this.#coldSidecarActive(),
@@ -11665,6 +13348,8 @@ export class SessionManager {
 			autoDisabledReason: this.#sessionMemoryAutoDisabledReason,
 			consecutiveBuildFailures: this.#consecutiveSidecarBuildFailures,
 			parentArtifactEnabled: runtime.parentArtifact !== undefined,
+			dictionaryArtifactEnabled: runtime.dictionary !== undefined,
+			metadataDeltaDescriptorBytes: runtime.metadataDelta?.descriptorBytes ?? 0,
 		};
 	}
 
@@ -11694,7 +13379,9 @@ export class SessionManager {
 		}
 		if (mode === "shadow" && retainedColdRuntime) return;
 		if (
-			(!this.#sidecarRuntime?.enabled || this.#sidecarRuntime.sidecarIneligible) &&
+			(!this.#sidecarRuntime?.enabled ||
+				this.#sidecarRuntime.sidecarIneligible ||
+				(mode === "enabled" && !this.#sidecarRuntime.dictionary)) &&
 			this.persist &&
 			this.#sessionFile
 		) {
@@ -12453,7 +14140,7 @@ export class SessionManager {
 				this.#deactivateColdForBranchMutation();
 			}
 		}
-		this.#applySidecarReducerDelta(residentEntry);
+
 		// Aggregate usage before the sidecar append publishes its commit marker so an
 		// exact reopen observes the same totals as the live manager.
 		if (this.#accumulateEntryUsage(entry)) {
@@ -12488,7 +14175,10 @@ export class SessionManager {
 				this.#deactivateColdForBranchMutation();
 			} else {
 				if (delta < 0) activeRuntime.accountant.release(-delta);
-				if (this.#appendColdSidecarRecord(residentEntry, persistedLine, transcriptDescriptor)) {
+				const ordinal = this.#nextColdOrdinal();
+				if (!this.#applySidecarReducerDelta(residentEntry, ordinal)) {
+					this.#ensureFullHotView();
+				} else if (this.#appendColdSidecarRecord(residentEntry, persistedLine, transcriptDescriptor, ordinal)) {
 					activeRuntime.hotSuffixBytes += persistedLine.byteLength;
 				}
 			}
@@ -12521,7 +14211,7 @@ export class SessionManager {
 	appendConfiguredModelChain(chain: ConfiguredModelChain): string {
 		const entry: ConfiguredModelChainEntry = {
 			type: "configured_model_chain",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			role: chain.role,
@@ -12552,7 +14242,7 @@ export class SessionManager {
 	): string {
 		const entry: SessionMessageEntry = {
 			type: "message",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			message,
@@ -12568,7 +14258,7 @@ export class SessionManager {
 	appendThinkingLevelChange(thinkingLevel?: string): string {
 		const entry: ThinkingLevelChangeEntry = {
 			type: "thinking_level_change",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			thinkingLevel: thinkingLevel ?? null,
@@ -12580,7 +14270,7 @@ export class SessionManager {
 	appendServiceTierChange(serviceTier: ServiceTier | null): string {
 		const entry: ServiceTierChangeEntry = {
 			type: "service_tier_change",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			serviceTier,
@@ -12593,7 +14283,7 @@ export class SessionManager {
 	appendModeChange(mode: string, data?: Record<string, unknown>): string {
 		const entry: ModeChangeEntry = {
 			type: "mode_change",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			mode,
@@ -12615,7 +14305,7 @@ export class SessionManager {
 	): string {
 		const entry: ModelChangeEntry = {
 			type: "model_change",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			model,
@@ -12638,7 +14328,7 @@ export class SessionManager {
 	}): string {
 		const entry: SessionInitEntry = {
 			type: "session_init",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			...init,
@@ -12659,7 +14349,7 @@ export class SessionManager {
 	): string {
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			summary,
@@ -12680,7 +14370,7 @@ export class SessionManager {
 			type: "custom",
 			customType,
 			data,
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 		};
@@ -12699,7 +14389,7 @@ export class SessionManager {
 			type: "custom",
 			customType: "context_clear",
 			data,
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: null,
 			timestamp: new Date().toISOString(),
 		};
@@ -12820,7 +14510,7 @@ export class SessionManager {
 		attribution: MessageAttribution = "agent",
 		observationId?: string,
 	): string {
-		const entryId = generateId(this.#byId);
+		const entryId = this.#generateEntryId();
 		const stableObservationId =
 			observationId ?? (customType.startsWith("irc:") ? `session:${this.#sessionId}:entry:${entryId}` : undefined);
 		const persistedDetails =
@@ -12853,7 +14543,7 @@ export class SessionManager {
 	appendMCPToolSelection(selectedToolNames: string[], mutationCorrelationId?: string): string {
 		const entry: MCPToolSelectionEntry = {
 			type: "mcp_tool_selection",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			selectedToolNames: [...selectedToolNames],
@@ -12867,7 +14557,7 @@ export class SessionManager {
 	appendDiscoveredBuiltinToolSelection(selectedToolNames: string[], mutationCorrelationId?: string): string {
 		const entry: DiscoveredBuiltinToolSelectionEntry = {
 			type: "discovered_builtin_tool_selection",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			selectedToolNames: [...selectedToolNames],
@@ -12885,7 +14575,7 @@ export class SessionManager {
 	appendTtsrInjection(ruleNames: string[], records?: TtsrInjectionRecord[], ttsrMessageCount?: number): string {
 		const entry: TtsrInjectionEntry = {
 			type: "ttsr_injection",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			injectedRules: ruleNames,
@@ -13207,9 +14897,7 @@ export class SessionManager {
 			const size = this.storage.statSync(this.#sessionFile).size;
 			const failure = scanTranscriptLinesBounded(this.storage, this.#sessionFile, size, (_offset, lineBytes) => {
 				try {
-					const record = JSON.parse(
-						Buffer.from(lineBytes.subarray(0, lineBytes.byteLength - 1)).toString("utf8"),
-					) as FileEntry | SessionPatchRecord;
+					const record = JSON.parse(decodeBoundedJsonLine(lineBytes)) as FileEntry | SessionPatchRecord;
 					if (record.type === "session") return;
 					if (record.type === "header_patch" || record.type === "entry_patch") return false;
 					if (typeof record.id !== "string") return false;
@@ -13324,7 +15012,7 @@ export class SessionManager {
 		let neighboringParentsComplete = true;
 		const failure = scanTranscriptLinesBounded(this.storage, runtime.indexPath, size, (_offset, lineBytes) => {
 			try {
-				const value = JSON.parse(Buffer.from(lineBytes.subarray(0, lineBytes.byteLength - 1)).toString("utf8")) as {
+				const value = JSON.parse(decodeBoundedJsonLine(lineBytes)) as {
 					id?: unknown;
 					parentId?: unknown;
 					ordinal?: unknown;
@@ -13449,7 +15137,7 @@ export class SessionManager {
 		}
 		const entry: LabelEntry = {
 			type: "label",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			targetId,
@@ -13527,11 +15215,17 @@ export class SessionManager {
 			return cached;
 		}
 		this.#pathOnlyContextBuildCount++;
+		let resolvedProviderState: SessionEntry[] = [];
+		if (this.#coldSidecarActive() && this.#sidecarRuntime) {
+			const resolved = this.#resolvedProviderStateEntries();
+			if (!resolved) {
+				this.#ensureFullHotView();
+				return this.#getSessionContextForRead();
+			}
+			resolvedProviderState = resolved;
+		}
 		const providerEntries = this.#getActivePathEntriesForProviderContext().map(cloneSessionEntry);
-		const providerStateEntries =
-			this.#coldSidecarActive() && this.#sidecarRuntime
-				? this.#sidecarRuntime.providerStateEntries.map(cloneSessionEntry)
-				: [];
+		const providerStateEntries = resolvedProviderState.map(cloneSessionEntry);
 		let syntheticParentId: string | null = null;
 		for (const entry of providerStateEntries) {
 			entry.parentId = syntheticParentId;
@@ -13806,7 +15500,7 @@ export class SessionManager {
 		this.#leafId = branchFromId;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: branchFromId,
 			timestamp: new Date().toISOString(),
 			fromId: branchFromId ?? "root",
@@ -14237,6 +15931,8 @@ export class SessionManager {
 				}
 			},
 			preflightResult,
+			false,
+			true,
 		);
 		if (preflightFailure || preflightRejected || !sourceHeader || !sawCompaction) return false;
 		const preflightDigest = preflightHash.digest("hex");
@@ -14297,6 +15993,8 @@ export class SessionManager {
 					staged.writeLine(Buffer.from(JSON.stringify(record), "utf8"));
 				},
 				copyResult,
+				false,
+				true,
 			);
 			if (copyFailure) throw new Error(`fork_bounded_copy_${copyFailure}`);
 			if (copyHash.digest("hex") !== identity.sha256) throw new Error("fork_source_identity_changed");
