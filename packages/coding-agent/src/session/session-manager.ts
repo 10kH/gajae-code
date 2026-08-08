@@ -890,7 +890,7 @@ type BoundedLineScanFailure = "read_failed" | "oversized_line" | "unterminated" 
 function createBoundedLineChunkConsumer(visit: (lineStart: number, lineBytes: Uint8Array) => boolean | undefined): {
 	consume(chunk: Buffer, chunkStart: number): BoundedLineScanFailure | undefined;
 	hasLargePendingLine(): boolean;
-	finish(): BoundedLineScanFailure | undefined;
+	finish(includeUnterminated?: boolean): BoundedLineScanFailure | undefined;
 } {
 	let pendingChunks: Buffer[] = [];
 	let pendingBytes = 0;
@@ -925,8 +925,13 @@ function createBoundedLineChunkConsumer(visit: (lineStart: number, lineBytes: Ui
 		hasLargePendingLine() {
 			return pendingBytes >= 256 * 1024;
 		},
-		finish() {
-			return pendingBytes === 0 ? undefined : "unterminated";
+		finish(includeUnterminated = false) {
+			if (pendingBytes === 0) return undefined;
+			if (!includeUnterminated) return "unterminated";
+			const line = Buffer.concat(pendingChunks, pendingBytes);
+			pendingChunks = [];
+			pendingBytes = 0;
+			return visit(pendingStart, line) === false ? "aborted" : undefined;
 		},
 	};
 }
@@ -937,6 +942,7 @@ function scanTranscriptLinesBounded(
 	size: number,
 	visit: (lineStart: number, lineBytes: Uint8Array) => boolean | undefined,
 	result?: { stat?: SessionStorageStat },
+	allowUnterminated = false,
 ): BoundedLineScanFailure | undefined {
 	if (storage instanceof FileSessionStorage) {
 		const flags = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0);
@@ -987,7 +993,7 @@ function scanTranscriptLinesBounded(
 					isFile: after.isFile(),
 				};
 			}
-			return consumer.finish();
+			return consumer.finish(allowUnterminated);
 		} catch {
 			return "read_failed";
 		} finally {
@@ -1010,7 +1016,7 @@ function scanTranscriptLinesBounded(
 		const gcIntervalBytes = consumer.hasLargePendingLine() ? 20 * 1024 * 1024 : 4 * 1024 * 1024;
 		if (pos % gcIntervalBytes === 0) Bun.gc(true);
 	}
-	return consumer.finish();
+	return consumer.finish(allowUnterminated);
 }
 
 export type DefaultModelSelectionStage = {
@@ -1502,6 +1508,8 @@ export interface TranscriptSnapshotHandle {
 	 * captured identity and throws `identity-mismatch` on divergence.
 	 */
 	forEachLine(callback: (line: Uint8Array) => boolean | undefined): boolean;
+	/** Descriptor captured after the most recent complete line pass, when supported. */
+	getLastReadStat(): SessionStorageStat | undefined;
 	/** Revalidate the live source against the captured identity (bounded). */
 	revalidate(): { kind: "valid" } | StrictSessionOpenFailure;
 	/** Idempotent close; subsequent reads throw. */
@@ -3036,6 +3044,55 @@ function revalidateTranscriptIdentityBounded(
 	expected: ResumeSessionIdentity,
 ): { kind: "valid" } | StrictSessionOpenFailure {
 	const canonicalPath = resolveEquivalentPath(path.resolve(filePath));
+	if (storage instanceof FileSessionStorage) {
+		const flags = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0);
+		let fd: number | undefined;
+		try {
+			fd = fs.openSync(canonicalPath, flags);
+			const before = fs.fstatSync(fd, { bigint: true });
+			if (
+				!before.isFile() ||
+				before.dev !== expected.dev ||
+				before.ino !== expected.ino ||
+				(expected.nlink !== undefined && before.nlink !== expected.nlink) ||
+				Number(before.size) !== expected.size ||
+				before.mtimeNs !== expected.mtimeNs ||
+				(expected.ctimeNs !== undefined && before.ctimeNs !== expected.ctimeNs)
+			)
+				return { kind: "error", reason: "identity-mismatch" };
+			const hash = crypto.createHash("sha256");
+			const chunk = Buffer.allocUnsafe(1024 * 1024);
+			let offset = 0;
+			while (offset < expected.size) {
+				const length = Math.min(chunk.byteLength, expected.size - offset);
+				const count = fs.readSync(fd, chunk, 0, length, offset);
+				if (count !== length) return { kind: "error", reason: "read-failed" };
+				hash.update(chunk.subarray(0, count));
+				offset += count;
+			}
+			const after = fs.fstatSync(fd, { bigint: true });
+			const named = fs.lstatSync(canonicalPath, { bigint: true });
+			if (
+				after.dev !== before.dev ||
+				after.ino !== before.ino ||
+				after.nlink !== before.nlink ||
+				after.size !== before.size ||
+				after.mtimeNs !== before.mtimeNs ||
+				after.ctimeNs !== before.ctimeNs ||
+				!named.isFile() ||
+				named.isSymbolicLink() ||
+				named.dev !== before.dev ||
+				named.ino !== before.ino ||
+				hash.digest("hex") !== expected.sha256
+			)
+				return { kind: "error", reason: "identity-mismatch" };
+			return { kind: "valid" };
+		} catch (error) {
+			return resumeReadFailure(error, storage, canonicalPath);
+		} finally {
+			if (fd !== undefined) fs.closeSync(fd);
+		}
+	}
 	let before: SessionStorageStat;
 	try {
 		before = storage.statSync(canonicalPath);
@@ -3088,37 +3145,44 @@ function createTranscriptSnapshotHandle(
 	const readRangeSync = storage.readRangeSync?.bind(storage);
 	if (!readRangeSync) throw new Error("bounded_range_read_unavailable");
 	let closed = false;
+	let lastReadStat: SessionStorageStat | undefined;
 
 	const readAllLines = (callback: (line: Uint8Array) => boolean | undefined): boolean => {
 		if (closed) throw new Error("transcript_handle_closed");
 		const hash = crypto.createHash("sha256");
-		const decoder = new TextDecoder("utf-8", { fatal: true });
-		let carry = "";
 		let aborted = false;
-		for (let offset = 0; offset < size; offset += TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
-			const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, size - offset);
-			const chunk = readRangeSync(canonicalPath, offset, length).bytes;
-			hash.update(chunk);
-			const text = decoder.decode(chunk, { stream: offset + length < size });
-			const combined = carry + text;
-			const lines = combined.split("\n");
-			carry = lines.pop() ?? "";
-			for (const line of lines) {
-				if (line.length === 0) continue;
-				const result = callback(Buffer.from(line, "utf8"));
-				if (result === false) {
+		const scanResult: { stat?: SessionStorageStat } = {};
+		const failure = scanTranscriptLinesBounded(
+			storage,
+			canonicalPath,
+			size,
+			(_offset, line) => {
+				hash.update(line);
+				const body = line[line.byteLength - 1] === 0x0a ? line.subarray(0, line.byteLength - 1) : line;
+				if (body.byteLength === 0) return;
+				if (callback(body) === false) {
 					aborted = true;
-					break;
+					return false;
 				}
-			}
-			if (aborted) break;
-		}
-		if (!aborted && carry.length > 0) {
-			const result = callback(Buffer.from(carry, "utf8"));
-			if (result === false) aborted = true;
-		}
+			},
+			scanResult,
+			true,
+		);
+		if (failure && !(failure === "aborted" && aborted)) throw new Error(`transcript_scan_${failure}`);
+		if (aborted) return false;
+		if (
+			scanResult.stat &&
+			(scanResult.stat.dev !== inspection.identity.dev ||
+				scanResult.stat.ino !== inspection.identity.ino ||
+				(inspection.identity.nlink !== undefined && scanResult.stat.nlink !== inspection.identity.nlink) ||
+				scanResult.stat.size !== inspection.identity.size ||
+				scanResult.stat.mtimeNs !== inspection.identity.mtimeNs ||
+				(inspection.identity.ctimeNs !== undefined && scanResult.stat.ctimeNs !== inspection.identity.ctimeNs))
+		)
+			throw new Error("identity-mismatch");
+		lastReadStat = scanResult.stat;
 		if (hash.digest("hex") !== inspection.identity.sha256) throw new Error("identity-mismatch");
-		return !aborted;
+		return true;
 	};
 
 	return {
@@ -3126,6 +3190,7 @@ function createTranscriptSnapshotHandle(
 		identity: inspection.identity,
 		storage,
 		forEachLine: readAllLines,
+		getLastReadStat: () => lastReadStat,
 		revalidate(): { kind: "valid" } | StrictSessionOpenFailure {
 			if (closed) throw new Error("transcript_handle_closed");
 			return revalidateTranscriptIdentityBounded(canonicalPath, storage, inspection.identity);
@@ -13468,8 +13533,6 @@ export class SessionManager {
 		}
 		if (rejected || !sourceHeader || !sawCompaction) return undefined;
 		applyHeaderPatch(sourceHeader, headerPatch);
-		const beforeWrite = snapshot.revalidate();
-		if (beforeWrite.kind !== "valid") return beforeWrite;
 		const fresh = this.#freshSessionState({ parentSession: sourceHeader.id });
 		fresh.header.title = sourceHeader.title;
 		fresh.header.titleSource = sourceHeader.titleSource;
@@ -13504,10 +13567,19 @@ export class SessionManager {
 			staged.closeSync();
 			staged.publishNoReplace();
 			published = true;
-			const afterWrite = snapshot.revalidate();
-			if (afterWrite.kind !== "valid") {
-				await snapshot.storage.deleteSessionWithArtifacts(fresh.sessionFile);
-				return afterWrite;
+			const copyDescriptor = snapshot.getLastReadStat();
+			if (snapshot.storage instanceof FileSessionStorage && copyDescriptor) {
+				const current = snapshot.storage.statSync(snapshot.sourcePath);
+				if (!sameDescriptor(copyDescriptor, current)) {
+					await snapshot.storage.deleteSessionWithArtifacts(fresh.sessionFile);
+					return { kind: "error", reason: "identity-mismatch" };
+				}
+			} else {
+				const afterWrite = snapshot.revalidate();
+				if (afterWrite.kind !== "valid") {
+					await snapshot.storage.deleteSessionWithArtifacts(fresh.sessionFile);
+					return afterWrite;
+				}
 			}
 			await this.#initSessionFile(fresh.sessionFile);
 			writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);

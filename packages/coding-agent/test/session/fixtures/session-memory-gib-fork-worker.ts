@@ -37,25 +37,42 @@ try {
 } finally {
 	fs.closeSync(fd);
 }
+const capturedMode = process.env.GJC_SESSION_MEMORY_GIB_CAPTURED === "1";
+const captured = capturedMode ? SessionManager.captureTranscriptStrict(sourceFile) : undefined;
+if (captured?.kind === "error") throw new Error(`capture_${captured.reason}`);
 
 Bun.gc(true);
 const sourceBytes = fs.statSync(sourceFile).size;
 const baselineRss = process.memoryUsage().rss;
 const startedAt = performance.now();
-const manager = await SessionManager.forkFrom(
-	sourceFile,
-	root,
-	SessionManager.explicitDestination(destinationDirectory),
-	undefined,
-	"copy-retain",
-	"enabled",
-);
+let manager: SessionManager;
+if (captured?.kind === "captured") {
+	const forked = await SessionManager.forkFromCaptured(
+		captured.snapshot,
+		root,
+		SessionManager.explicitDestination(destinationDirectory),
+		"copy-retain",
+		"enabled",
+	);
+	if (forked.kind !== "forked") throw new Error(`captured_fork_${forked.reason}`);
+	manager = forked.manager;
+} else {
+	manager = await SessionManager.forkFrom(
+		sourceFile,
+		root,
+		SessionManager.explicitDestination(destinationDirectory),
+		undefined,
+		"copy-retain",
+		"enabled",
+	);
+}
 await Bun.sleep(0);
 const elapsedMs = performance.now() - startedAt;
 Bun.gc(true);
 const rssGrowthBytes = process.memoryUsage().rss - baselineRss;
 const stats = manager.getSessionMemoryStats();
 await manager.close();
+if (captured?.kind === "captured") captured.snapshot.close();
 fs.rmSync(root, { recursive: true, force: true });
 
-process.stdout.write(`${JSON.stringify({ sourceBytes, elapsedMs, rssGrowthBytes, stats })}\n`);
+process.stdout.write(`${JSON.stringify({ capturedMode, sourceBytes, elapsedMs, rssGrowthBytes, stats })}\n`);
