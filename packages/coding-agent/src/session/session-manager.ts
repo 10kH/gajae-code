@@ -1046,13 +1046,36 @@ class BoundedColdIdHashSet {
 class DiskBackedIdUniquenessCheck {
 	static readonly BUCKETS = 64;
 	static readonly BUFFER_BYTES = 4096;
-	readonly #root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-index-ids-"));
 	readonly #buffers = Array.from({ length: DiskBackedIdUniquenessCheck.BUCKETS }, () =>
 		Buffer.allocUnsafe(DiskBackedIdUniquenessCheck.BUFFER_BYTES),
 	);
 	readonly #positions = new Uint16Array(DiskBackedIdUniquenessCheck.BUCKETS);
 	readonly #fds = new Map<number, number>();
 	#failed = false;
+
+	constructor() {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-index-ids-"));
+		try {
+			for (let bucket = 0; bucket < DiskBackedIdUniquenessCheck.BUCKETS; bucket++) {
+				const bucketPath = path.join(root, bucket.toString(16).padStart(2, "0"));
+				const fd = fs.openSync(bucketPath, "w+", 0o600);
+				fs.unlinkSync(bucketPath);
+				this.#fds.set(bucket, fd);
+			}
+			fs.rmdirSync(root);
+		} catch (error) {
+			for (const fd of this.#fds.values()) {
+				try {
+					fs.closeSync(fd);
+				} catch {
+					// Preserve the constructor failure.
+				}
+			}
+			this.#fds.clear();
+			fs.rmSync(root, { recursive: true, force: true });
+			throw error;
+		}
+	}
 
 	#hash(value: string, seed: number): number {
 		let hash = seed >>> 0;
@@ -1063,19 +1086,10 @@ class DiskBackedIdUniquenessCheck {
 		return hash;
 	}
 
-	#bucketPath(bucket: number): string {
-		return path.join(this.#root, bucket.toString(16).padStart(2, "0"));
-	}
-
 	#flush(bucket: number): void {
 		const length = this.#positions[bucket]!;
 		if (length === 0) return;
-		let fd = this.#fds.get(bucket);
-		if (fd === undefined) {
-			fd = fs.openSync(this.#bucketPath(bucket), "a", 0o600);
-			this.#fds.set(bucket, fd);
-		}
-		fs.writeSync(fd, this.#buffers[bucket]!, 0, length);
+		fs.writeSync(this.#fds.get(bucket)!, this.#buffers[bucket]!, 0, length);
 		this.#positions[bucket] = 0;
 	}
 
@@ -1144,29 +1158,16 @@ class DiskBackedIdUniquenessCheck {
 	finish(): boolean {
 		try {
 			for (let bucket = 0; bucket < DiskBackedIdUniquenessCheck.BUCKETS; bucket++) this.#flush(bucket);
-			for (const fd of this.#fds.values()) fs.closeSync(fd);
-			this.#fds.clear();
 			if (this.#failed) return false;
-			for (let bucket = 0; bucket < DiskBackedIdUniquenessCheck.BUCKETS; bucket++) {
-				const bucketPath = this.#bucketPath(bucket);
-				let size: number;
-				try {
-					size = fs.statSync(bucketPath).size;
-				} catch {
-					continue;
-				}
+			for (const fd of this.#fds.values()) {
+				const size = fs.fstatSync(fd).size;
 				if (size % 8 !== 0) return false;
 				const bytes = Buffer.allocUnsafe(size);
-				const fd = fs.openSync(bucketPath, "r");
-				try {
-					let offset = 0;
-					while (offset < size) {
-						const read = fs.readSync(fd, bytes, offset, size - offset, offset);
-						if (read === 0) return false;
-						offset += read;
-					}
-				} finally {
-					fs.closeSync(fd);
+				let offset = 0;
+				while (offset < size) {
+					const read = fs.readSync(fd, bytes, offset, size - offset, offset);
+					if (read === 0) return false;
+					offset += read;
 				}
 				if (this.#hasDuplicate(bytes)) return false;
 			}
@@ -1185,7 +1186,6 @@ class DiskBackedIdUniquenessCheck {
 			}
 		}
 		this.#fds.clear();
-		fs.rmSync(this.#root, { recursive: true, force: true });
 	}
 }
 /** Persistent secondary artifacts stay optional beyond this fixed build envelope. */
