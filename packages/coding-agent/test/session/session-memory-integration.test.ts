@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getBlobsDir, TempDir } from "@gajae-code/utils";
+import { getBlobsDir, logger, TempDir } from "@gajae-code/utils";
 import { SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
 import {
 	FileSessionStorage,
@@ -2229,6 +2229,79 @@ describe("sidecar I/O fallback", () => {
 		}
 	});
 
+	it("preserves the tail truncation fsync error when close also fails", async () => {
+		class TailTruncationFailureStorage extends MemorySessionStorage {
+			tailWriterCount = 0;
+			override openWriter(filePath: string, options?: { flags?: "w" | "a" }): SessionStorageWriter {
+				const writer = super.openWriter(filePath, options);
+				if (!filePath.endsWith(".spill.tail") || ++this.tailWriterCount !== 2) return writer;
+				return {
+					writeLine: writer.writeLine.bind(writer),
+					writeLineSync: writer.writeLineSync.bind(writer),
+					flush: writer.flush.bind(writer),
+					fsync: writer.fsync.bind(writer),
+					fsyncSync: () => {
+						throw new Error("injected_tail_truncation_fsync_failure");
+					},
+					statSync: writer.statSync?.bind(writer),
+					close: writer.close.bind(writer),
+					closeSync: () => {
+						throw new Error("injected_tail_truncation_close_failure");
+					},
+					getError: writer.getError.bind(writer),
+					getCloseState: writer.getCloseState.bind(writer),
+					getCloseError: writer.getCloseError.bind(writer),
+				};
+			}
+		}
+		const storage = new TailTruncationFailureStorage();
+		const sessionFile = "/sessions/tail-truncation-finalizer.jsonl";
+		const entries = Array.from({ length: 16_000 }, (_, index) => ({
+			type: "custom",
+			id: `entry-${index}`,
+			parentId: index === 0 ? null : `entry-${index - 1}`,
+			timestamp: "0",
+			customType: "tail-overflow",
+			data: { index },
+		}));
+		storage.writeTextSync(
+			sessionFile,
+			`${[
+				{ type: "session", version: 5, id: "tail-truncation-finalizer", timestamp: "0", cwd: "/cwd" },
+				...entries,
+				{
+					type: "compaction",
+					id: "tail-truncation-compaction",
+					parentId: "entry-15999",
+					timestamp: "0",
+					summary: "summary",
+					firstKeptEntryId: "entry-0",
+					tokensBefore: 16_000,
+				},
+			]
+				.map(record => JSON.stringify(record))
+				.join("\n")}\n`,
+		);
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"shadow",
+		);
+		try {
+			expect(storage.tailWriterCount).toBe(2);
+			expect(warning).toHaveBeenCalledWith(
+				"Session memory sidecar build failed; preserving eager transcript state",
+				expect.objectContaining({ error: "injected_tail_truncation_fsync_failure" }),
+			);
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
+		} finally {
+			warning.mockRestore();
+			await manager.close();
+		}
+	}, 30_000);
 	it("recovers when tail fsync fails after the journal write", async () => {
 		class TailFsyncFailureStorage extends MemorySessionStorage {
 			failTailFsync = false;
