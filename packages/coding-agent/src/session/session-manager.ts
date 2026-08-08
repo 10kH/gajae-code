@@ -5624,6 +5624,7 @@ export const SessionManagerTestHooks: {
 	beforeResidentTransitionIndexBuild?: () => void;
 	afterForkSnapshot?: () => void | Promise<void>;
 	beforeEphemeralArtifactManagerInstall?: (dir: string) => void | Promise<void>;
+	beforePersistPatchFence?: (attempt: number) => void;
 } = {};
 
 function materializedCacheMaxBytes(): number {
@@ -11526,6 +11527,7 @@ export class SessionManager {
 							) as unknown as SessionPatchRecord)
 						: record,
 				);
+				SessionManagerTestHooks.beforePersistPatchFence?.(attempt);
 				const written = this.#withSessionPersistenceFenceSync(() => {
 					if (!this.#persistenceInputTokenMatches(token)) return false;
 					if (this.destination.kind === "managed") {

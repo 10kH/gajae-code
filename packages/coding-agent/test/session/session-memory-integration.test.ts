@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getBlobsDir, TempDir } from "@gajae-code/utils";
-import { SessionManager } from "../../src/session/session-manager";
+import { SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
 import {
 	FileSessionStorage,
 	MemorySessionStorage,
@@ -1934,6 +1934,43 @@ describe("whole-session persistence freshness", () => {
 			expect(manager.getEntry(duringId)).toMatchObject({ id: duringId });
 		} finally {
 			storage.releaseFlush.resolve();
+			await manager.close();
+		}
+	});
+	it("reprepares queued patches when a direct append invalidates their persistence token", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/patch-race.jsonl";
+		storage.writeTextSync(
+			sessionFile,
+			`${JSON.stringify({ type: "session", version: 5, id: "patch-race", timestamp: "0", cwd: "/cwd" })}\n`,
+		);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"off",
+		);
+		let hookCalls = 0;
+		let appendedId: string | undefined;
+		try {
+			SessionManagerTestHooks.beforePersistPatchFence = attempt => {
+				hookCalls++;
+				if (attempt === 0) appendedId = manager.appendCustomEntry("during-patch-prepare", { value: 1 });
+			};
+			expect(await manager.setSessionName("race-safe", "user")).toBe(true);
+			const persisted = storage
+				.readTextSync(sessionFile)
+				.trimEnd()
+				.split("\n")
+				.map(line => JSON.parse(line) as { type: string; id?: string; patch?: { title?: string } });
+			expect(hookCalls).toBe(2);
+			expect(persisted.filter(entry => entry.id === appendedId)).toHaveLength(1);
+			expect(
+				persisted.filter(entry => entry.type === "header_patch" && entry.patch?.title === "race-safe"),
+			).toHaveLength(1);
+		} finally {
+			SessionManagerTestHooks.beforePersistPatchFence = undefined;
 			await manager.close();
 		}
 	});
