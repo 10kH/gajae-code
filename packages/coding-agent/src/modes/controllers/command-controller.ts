@@ -493,6 +493,15 @@ export class CommandController {
 			}
 			const fallbackReason = memory.retirementFallbackReason ?? memory.lazyReopenFallbackReason;
 			if (fallbackReason) info += `${theme.fg("dim", "Fallback Reason:")} ${fallbackReason}\n`;
+			if (memory.coldEntriesRetired > 0 || memory.coldEntriesReloaded > 0) {
+				info += `${theme.fg("dim", "Cold Retired/Reloaded:")} ${memory.coldEntriesRetired}/${memory.coldEntriesReloaded}\n`;
+			}
+			if (memory.rangeReadCount > 0 || memory.rangeReadGenerationMismatchCount > 0) {
+				info += `${theme.fg("dim", "Cold Range Reads:")} ${memory.rangeReadCount} (${memory.rangeReadGenerationMismatchCount} mismatched)\n`;
+			}
+			if (memory.sidecarRebuildCount > 0 || memory.transcriptGeneration > 0) {
+				info += `${theme.fg("dim", "Sidecar Rebuilds:")} ${memory.sidecarRebuildCount} (gen ${memory.transcriptGeneration})\n`;
+			}
 			if (memory.autoDisabledReason) {
 				info += `${theme.fg("dim", "Auto-Disabled:")} ${theme.fg("warning", memory.autoDisabledReason)}\n`;
 			}
