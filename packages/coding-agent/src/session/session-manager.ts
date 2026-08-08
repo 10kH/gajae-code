@@ -728,6 +728,7 @@ export interface SessionMemorySidecarRuntime {
 	reducer: ReducerState;
 	providerStateEntries: SessionEntry[];
 	blockCache: FixedCacheAccount;
+	parentChildrenCache: Map<string, { ids: readonly string[]; bytes: number; descriptor: SessionStorageStat }>;
 	entryCache: FixedCacheAccount;
 	tailCache: FixedCacheAccount;
 	labelsPins: BoundedLabelsPinsStore;
@@ -9244,6 +9245,7 @@ export class SessionManager {
 			},
 			providerStateEntries: [],
 			blockCache: new FixedCacheAccount(8 * 1024 * 1024),
+			parentChildrenCache: new Map(),
 			entryCache: new FixedCacheAccount(28 * 1024 * 1024),
 			tailCache: new FixedCacheAccount(4 * 1024 * 1024),
 			labelsPins: new BoundedLabelsPinsStore(),
@@ -9984,6 +9986,7 @@ export class SessionManager {
 		runtime.coldEntries.clear();
 		runtime.tail = { ...runtime.tail, records: [] };
 		runtime.labelsPins.clear();
+		runtime.parentChildrenCache.clear();
 		runtime.blockCache.release(runtime.blockCache.allocatedBytes);
 		runtime.entryCache.release(runtime.entryCache.allocatedBytes);
 		runtime.tailCache.release(runtime.tailCache.allocatedBytes);
@@ -10107,6 +10110,11 @@ export class SessionManager {
 	): boolean {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled || runtime.sidecarIneligible) return false;
+		const cachedChildren = entry.parentId ? runtime.parentChildrenCache.get(entry.parentId) : undefined;
+		if (entry.parentId && cachedChildren) {
+			runtime.parentChildrenCache.delete(entry.parentId);
+			runtime.blockCache.release(cachedChildren.bytes);
+		}
 		const previous = runtime.tail.records.at(-1);
 		const seq = previous ? previous.seq + 1 : 0;
 		const byteOffset = runtime.tail.transcriptSize;
@@ -12565,13 +12573,31 @@ export class SessionManager {
 	#readColdChildren(parentId: string): SessionEntry[] | undefined {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled || !runtime.indexPath || typeof this.storage.readRangeSync !== "function") return undefined;
-		if (!this.#coldIndexDigestValid()) return undefined;
-		let size: number;
+		let indexStat: SessionStorageStat;
 		try {
-			size = this.storage.statSync(runtime.indexPath).size;
+			indexStat = this.storage.statSync(runtime.indexPath);
 		} catch {
 			return undefined;
 		}
+		const size = indexStat.size;
+		const cached = runtime.parentChildrenCache.get(parentId);
+		if (cached && sameDescriptor(cached.descriptor, indexStat)) {
+			const cache = new Map<string, string>();
+			const children: SessionEntry[] = [];
+			for (const id of cached.ids) {
+				const entry = this.#resolveEntry(id);
+				if (!entry || entry.parentId !== parentId) return undefined;
+				children.push(
+					cloneSessionEntry(materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), cache)),
+				);
+			}
+			return children;
+		}
+		if (cached) {
+			runtime.parentChildrenCache.delete(parentId);
+			runtime.blockCache.release(cached.bytes);
+		}
+		if (!this.#coldIndexDigestValid()) return undefined;
 		const childIds: string[] = [];
 		let malformed = false;
 		const failure = scanTranscriptLinesBounded(this.storage, runtime.indexPath, size, (_offset, lineBytes) => {
@@ -12601,6 +12627,11 @@ export class SessionManager {
 			children.push(
 				cloneSessionEntry(materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), cache)),
 			);
+		}
+		const cacheBytes =
+			residentStringBytes(parentId) + 48 + childIds.reduce((total, id) => total + residentStringBytes(id) + 8, 0);
+		if (runtime.blockCache.tryAllocate(cacheBytes)) {
+			runtime.parentChildrenCache.set(parentId, { ids: [...childIds], bytes: cacheBytes, descriptor: indexStat });
 		}
 		return children;
 	}

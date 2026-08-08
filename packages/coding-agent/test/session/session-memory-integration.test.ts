@@ -2230,7 +2230,14 @@ describe("sidecar I/O fallback", () => {
 	});
 
 	it("reads direct children from the authenticated cold index without hydrating the session", async () => {
-		const storage = new MemorySessionStorage();
+		class CountingStorage extends MemorySessionStorage {
+			rangeReads = 0;
+			override readRangeSync(filePath: string, offset: number, length: number) {
+				this.rangeReads++;
+				return super.readRangeSync(filePath, offset, length);
+			}
+		}
+		const storage = new CountingStorage();
 		const sessionFile = "/sessions/cold-children.jsonl";
 		storage.writeTextSync(
 			sessionFile,
@@ -2262,6 +2269,9 @@ describe("sidecar I/O fallback", () => {
 		try {
 			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
 			expect(manager.getChildren("root").map(entry => entry.id)).toEqual(["abandoned", "active"]);
+			const readsAfterFirstLookup = storage.rangeReads;
+			expect(manager.getChildren("root").map(entry => entry.id)).toEqual(["abandoned", "active"]);
+			expect(storage.rangeReads).toBe(readsAfterFirstLookup);
 			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
 		} finally {
 			await manager.close();
