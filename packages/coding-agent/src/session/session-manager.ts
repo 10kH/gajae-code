@@ -6485,10 +6485,15 @@ export class SessionManager {
 				terminalMarkerValid: true,
 			});
 			if (validation.kind !== "valid") return false;
+			const fullBaseEmptyTail =
+				records.length === 0 &&
+				commit.base.baseEndOffset === descriptor.size &&
+				commit.transcriptSize === descriptor.size;
 			if (
-				records.length === 0 ||
-				commit.leafId !== records.at(-1)?.id ||
-				commit.retirementFirstKeptEntryId !== records[0]?.id ||
+				(!fullBaseEmptyTail &&
+					(records.length === 0 ||
+						commit.leafId !== records.at(-1)?.id ||
+						commit.retirementFirstKeptEntryId !== records[0]?.id)) ||
 				!commit.labels.every(
 					entry => Array.isArray(entry) && entry.length === 2 && entry.every(value => typeof value === "string"),
 				) ||
@@ -6524,6 +6529,35 @@ export class SessionManager {
 			if (indexHash.copy().digest("hex") !== commit.indexDigest) {
 				this.#lazyReopenFallbackReason = "index_digest_mismatch";
 				return false;
+			}
+			if (fullBaseEmptyTail) {
+				let leafOrdinal: number | undefined;
+				let boundaryOrdinal: number | undefined;
+				const indexSize = this.storage.statSync(runtime.indexPath).size;
+				const scanFailure = scanTranscriptLinesBounded(
+					this.storage,
+					runtime.indexPath,
+					indexSize,
+					(_offset, lineBytes) => {
+						try {
+							const record = JSON.parse(
+								Buffer.from(lineBytes.subarray(0, lineBytes.byteLength - 1)).toString("utf8"),
+							) as { id?: unknown; ordinal?: unknown };
+							if (typeof record.id !== "string" || !Number.isSafeInteger(record.ordinal)) return false;
+							if (record.id === commit.leafId) leafOrdinal = record.ordinal as number;
+							if (record.id === commit.retirementFirstKeptEntryId) boundaryOrdinal = record.ordinal as number;
+						} catch {
+							return false;
+						}
+					},
+				);
+				if (
+					scanFailure ||
+					leafOrdinal === undefined ||
+					boundaryOrdinal === undefined ||
+					boundaryOrdinal > leafOrdinal
+				)
+					return false;
 			}
 			runtime.indexHash = indexHash;
 			runtime.indexDigest = commit.indexDigest;
