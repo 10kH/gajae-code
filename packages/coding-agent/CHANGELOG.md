@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.16] - 2026-08-08
+
 ### Added
 
 - `gjc gc` now reports managed session scope capacity when a scope is at or past 75% of the managed byte budget. A scope is snapshotted in full on every session start and fails closed once it exceeds the budget, but it is filled by GJC's own session records, so a working directory in sustained use can cross the limit with no prior signal — the first symptom is a launch that aborts. The probe is read-only and never fails a gc run: an absent, unreadable, or non-directory scope is reported as `unavailable`, an unreadable subtree is skipped so a partial walk still answers "am I near the budget?", and scopes below the threshold are omitted entirely so existing output is unchanged. `gc` still reclaims nothing here; the report names the scope path so stale session directories can be moved out by hand.
