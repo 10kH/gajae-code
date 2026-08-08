@@ -502,6 +502,12 @@ export class CommandController {
 			if (memory.sidecarRebuildCount > 0 || memory.transcriptGeneration > 0) {
 				info += `${theme.fg("dim", "Sidecar Rebuilds:")} ${memory.sidecarRebuildCount} (gen ${memory.transcriptGeneration})\n`;
 			}
+			if (memory.coldMutationPromotions > 0 || memory.hotOverflowTransitions > 0) {
+				info += `${theme.fg("dim", "Cold Promotions/Overflows:")} ${memory.coldMutationPromotions}/${memory.hotOverflowTransitions}\n`;
+			}
+			if (memory.labelDiskFallbackCount > 0) {
+				info += `${theme.fg("dim", "Label Disk Reads:")} ${memory.labelDiskFallbackCount}\n`;
+			}
 			if (memory.autoDisabledReason) {
 				info += `${theme.fg("dim", "Auto-Disabled:")} ${theme.fg("warning", memory.autoDisabledReason)}\n`;
 			}
