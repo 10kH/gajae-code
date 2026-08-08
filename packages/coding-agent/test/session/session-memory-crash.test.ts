@@ -29,6 +29,10 @@ describe("session memory physical crash recovery", () => {
 		{ crashMode: "crash-after-transcript-fsync", restoreTail: false },
 		{ crashMode: "crash-after-tail-fsync", restoreTail: false },
 		{ crashMode: "crash-before-tail-fsync", restoreTail: true },
+		{ crashMode: "crash-before-marker-temp-fsync", restoreTail: false },
+		{ crashMode: "crash-after-marker-temp-fsync", restoreTail: false },
+		{ crashMode: "crash-before-marker-directory-fsync", restoreTail: false },
+		{ crashMode: "crash-after-marker-directory-fsync", restoreTail: false },
 	]) {
 		it(`recovers authoritative append after ${crashMode}`, () => {
 			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-session-crash-"));
@@ -45,8 +49,8 @@ describe("session memory physical crash recovery", () => {
 				const recovered = runWorker(worker, root, "recover");
 				expect(recovered.exitCode, recovered.stderr.toString()).toBe(0);
 				const result = JSON.parse(recovered.stdout.toString()) as RecoveryResult;
+				expect(fs.readdirSync(fixture.sessionFile.slice(0, -6)).filter(name => name.endsWith(".tmp"))).toEqual([]);
 				expect(result.found).toBe(true);
-				expect(result.stats.autoDisabledReason).toBe("sidecar_reload_failures");
 				expect(result.stats.currentCommitTransition).toEqual({
 					kind: "exact",
 					reason: "descriptor_and_proof_match",

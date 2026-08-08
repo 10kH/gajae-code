@@ -68,16 +68,30 @@ if (mode === "recover") {
 }
 
 const manager = await SessionManager.open(sessionFile, destination, storage, "copy-retain", "enabled");
-const killAfterFsync = mode === "crash-after-transcript-fsync" ? 1 : mode === "crash-after-tail-fsync" ? 3 : 0;
-const killBeforeFsync = mode === "crash-before-tail-fsync" ? 3 : 0;
-if (killAfterFsync === 0 && killBeforeFsync === 0) throw new Error(`Unknown crash mode: ${mode}`);
 const realFsyncSync = fs.fsyncSync;
-let fsyncCalls = 0;
+const artifactRoot = sessionFile.slice(0, -6);
+const transcriptRealPath = fs.realpathSync(sessionFile);
+const artifactRealPath = fs.realpathSync(artifactRoot);
+let markerTempFsynced = false;
 vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
-	fsyncCalls++;
-	if (fsyncCalls === killBeforeFsync) process.kill(process.pid, "SIGKILL");
+	let target = "";
+	try {
+		target = fs.readlinkSync(`/dev/fd/${fd}`);
+	} catch {}
+	const point =
+		target === transcriptRealPath
+			? "transcript-fsync"
+			: target.endsWith("/.session-memory.spill.tail")
+				? "tail-fsync"
+				: target.includes("/.session-memory.spill.commit.") && target.endsWith(".tmp")
+					? "marker-temp-fsync"
+					: markerTempFsynced && target === artifactRealPath
+						? "marker-directory-fsync"
+						: "other";
+	if (mode === `crash-before-${point}`) process.kill(process.pid, "SIGKILL");
 	realFsyncSync(fd);
-	if (fsyncCalls === killAfterFsync) process.kill(process.pid, "SIGKILL");
+	if (point === "marker-temp-fsync") markerTempFsynced = true;
+	if (mode === `crash-after-${point}`) process.kill(process.pid, "SIGKILL");
 });
 manager.appendMessage({ role: "user", content: "durable-before-crash", timestamp: 3 });
 process.exit(2);
