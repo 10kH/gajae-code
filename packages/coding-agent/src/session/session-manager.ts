@@ -13146,6 +13146,7 @@ export class SessionManager {
 			!runtime.accountant.tryCharge(accountedBytes) ||
 			!runtime.tailCache.tryAllocate(tailBytes)
 		) {
+			runtime.hotOverflowTransitions++;
 			this.#ensureFullHotView();
 			return { kind: "promoted" };
 		}
@@ -14158,6 +14159,7 @@ export class SessionManager {
 				recordDigest: "0".repeat(64),
 			});
 			if (activeRuntime.hotSuffixBytes + appendedBytes > this.#sidecarHotSuffixBudgetBytes) {
+				activeRuntime.hotOverflowTransitions++;
 				this.#deactivateColdForBranchMutation();
 			} else if (!activeRuntime.accountant.tryCharge(appendedAccountedBytes)) {
 				this.#deactivateColdForBranchMutation();

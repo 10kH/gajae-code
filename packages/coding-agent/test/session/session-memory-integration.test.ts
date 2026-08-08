@@ -4067,6 +4067,7 @@ describe("descriptor-bound capture and staged fork publication", () => {
 			manager.setSidecarHotSuffixBudgetForTests(1);
 			manager.appendMessage({ role: "user", content: "budget overflow", timestamp: 1 });
 			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
+			expect(manager.getSessionMemoryStats().hotOverflowTransitions).toBeGreaterThan(0);
 			expect(manager.getEntry("cold-0000")).toMatchObject({ id: "cold-0000" });
 			expect(manager.getEntries()).toHaveLength(14);
 		} finally {
