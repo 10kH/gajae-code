@@ -269,6 +269,11 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 		tempDir.removeSync();
 	});
 
+	it("buildDisplaySessionContext preserves the synchronous typed overflow without compaction", () => {
+		sessionManager.appendMessage(assistantMsg(BIG_TEXT));
+		expect(() => session.buildDisplaySessionContext()).toThrow(SessionContextTooLargeError);
+		expect(compactSpy).not.toHaveBeenCalled();
+	});
 	it("rethrows the original typed error with zero retries when forced compaction cannot make progress", async () => {
 		appendConversation("seed");
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
