@@ -12549,6 +12549,47 @@ export class SessionManager {
 		return this.#getCanonicalBranchClones(fromId);
 	}
 
+	visitEntriesForExport(visitor: (entry: SessionEntry) => void): void {
+		if (this.#coldSidecarActive() && this.#sessionFile) {
+			const size = this.storage.statSync(this.#sessionFile).size;
+			const failure = scanTranscriptLinesBounded(this.storage, this.#sessionFile, size, (_offset, lineBytes) => {
+				try {
+					const record = JSON.parse(
+						Buffer.from(lineBytes.subarray(0, lineBytes.byteLength - 1)).toString("utf8"),
+					) as FileEntry | SessionPatchRecord;
+					if (record.type === "session") return;
+					if (record.type === "header_patch" || record.type === "entry_patch") return false;
+					if (typeof record.id !== "string") return false;
+					visitor(
+						cloneSessionEntry(
+							rehydrateColdSpillEntry(
+								materializeResidentEntryForReadSync(record, this.#residentBlobStores(), new Map()),
+								this.#coldSpillReadStore(),
+								this.#residentBlobStoresForColdRehydrate(),
+							),
+						),
+					);
+				} catch {
+					return false;
+				}
+			});
+			if (failure) throw new Error(`export_transcript_scan_failed:${failure}`);
+			return;
+		}
+		const cache = new Map<string, string>();
+		for (const entry of this.#fileEntries) {
+			if (entry.type === "session") continue;
+			visitor(
+				cloneSessionEntry(
+					rehydrateColdSpillEntry(
+						materializeResidentEntryForReadSync(entry, this.#residentBlobStores(), cache),
+						this.#coldSpillReadStore(),
+						this.#residentBlobStoresForColdRehydrate(),
+					),
+				),
+			);
+		}
+	}
 	getEntriesForExport(): SessionEntry[] {
 		this.#ensureFullHotView();
 		const cache = new Map<string, string>();

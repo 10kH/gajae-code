@@ -66,8 +66,8 @@ if (captured?.kind === "captured") {
 		"enabled",
 	);
 }
-await Bun.sleep(0);
 const elapsedMs = performance.now() - startedAt;
+await Bun.sleep(0);
 Bun.gc(true);
 const rssGrowthBytes = process.memoryUsage().rss - baselineRss;
 const stats = manager.getSessionMemoryStats();
