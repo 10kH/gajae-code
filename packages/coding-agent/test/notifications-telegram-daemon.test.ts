@@ -2986,7 +2986,7 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 through generation 53 ask-tool multi-select rendering", () => {
+	test("keeps wire protocol 3 through generation 55 lazy native authority", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
 		// Generations 34 and 35 add media conversion and topic adoption; generation
 		// 36 bound managed-session replacement to exact native filesystem authority,
@@ -3010,8 +3010,13 @@ describe("telegram daemon", () => {
 		// binds idempotent archive settlement to Telegram error code 400; generation
 		// 52 is claimed by the pre-readiness daemon-child exit diagnostics slice;
 		// generation 53 renders multi-select state for ask-tool asks and renumbers
-		// pre-numbered options exactly once around the selection marker.
-		expect(DAEMON_GENERATION).toBe(53);
+		// pre-numbered options exactly once around the selection marker;
+		// generation 54 records owner stoppedAt on unclean daemon death so a dead
+		// process cannot keep advertising itself as the ready owner (#3965).
+		// generation 55 hardens the shared topic authority outage path (#3974).
+		// generation 56 moves exact unlink and process-incarnation authority behind
+		// lazy native bindings (#3846).
+		expect(DAEMON_GENERATION).toBe(56);
 	});
 	test.each([
 		"1",
@@ -22598,6 +22603,88 @@ test("a failed root scan is retried on the next tick instead of exiting the daem
 		expect(scan.mock.calls).toHaveLength(2);
 		expect(escaped).toEqual([]);
 		scan.mockRestore();
+	} finally {
+		process.off("unhandledRejection", onEscape);
+		warn.mockRestore();
+	}
+});
+
+test("a topic lease renewal failure on the liveness heartbeat is reported instead of escaping as an unhandled rejection", async () => {
+	const warn = spyOn(logger, "warn").mockImplementation(() => {});
+	const escaped: unknown[] = [];
+	const onEscape = (reason: any): void => void escaped.push(reason?.stack ?? String(reason));
+	process.on("unhandledRejection", onEscape);
+	FakeWs.instances = [];
+	const liveness: Array<() => void> = [];
+	let armed = false;
+	let state = {
+		version: 2 as const,
+		registryGeneration: 1,
+		topics: {
+			S: {
+				topicId: "700",
+				topicOrigin: "daemon_created" as const,
+				sessionUuid: "s",
+				identitySent: true,
+				createdAt: 1,
+				authorityEpoch: 0,
+				authorityState: "active" as const,
+				chatId: "42",
+				endpointKey: "ws://session|token",
+				endpointDigest: "digest",
+				endpointGeneration: 1,
+			},
+		},
+	};
+	const authority = {
+		read: async () => state,
+		compareAndSet: async (_expectedGeneration: number, next: any) => {
+			if (!armed) {
+				state = next;
+				return true;
+			}
+			throw new Error("shared topic authority unavailable");
+		},
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(tempAgentDir()),
+		ownerId: "owner",
+		botToken: "token",
+		chatId: "42",
+		botApi: new FakeBotApi(),
+		WebSocketImpl: FakeWs as any,
+		installationHostId: "local-host",
+		topicRegistryAuthority: authority as never,
+		setIntervalImpl: ((cb: () => void) => {
+			liveness.push(cb);
+			return 0;
+		}) as any,
+		clearIntervalImpl: (() => {}) as any,
+	});
+	try {
+		await (daemon as any).loadTopics();
+		const session = daemon.connectSession("S", "ws://session", "token");
+		FakeWs.instances[0]!.dispatchEvent(new Event("open"));
+		FakeWs.instances[0]!.emit({ type: "hello", protocolVersion: 2, capabilities: ["client_ping_pong"] });
+		FakeWs.instances[0]!.emit({
+			type: "event_replay_result",
+			ok: true,
+			id: "telegram-startup-replay:S",
+			generation: 1,
+			lastSeq: 0,
+			events: [],
+		});
+		for (let attempts = 0; attempts < 20 && liveness.length === 0; attempts++) await Bun.sleep(1);
+		expect(liveness).toHaveLength(1);
+		armed = true;
+		liveness[0]!();
+		await new Promise(resolve => setTimeout(resolve, 50));
+		// The heartbeat's lease renewal hits the dead authority. Before the fix the
+		// single-arg .then() let the rejection escape to the process-level fatal
+		// handler; now it is reported and the next heartbeat retries.
+		expect(escaped).toEqual([]);
+		expect(warn.mock.calls.some(call => String(call[0]).includes("topic lease renewal failed"))).toBe(true);
+		expect(session.logicalSessionIdTrusted).toBe(true);
 	} finally {
 		process.off("unhandledRejection", onEscape);
 		warn.mockRestore();

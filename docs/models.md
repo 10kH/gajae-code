@@ -162,15 +162,17 @@ providers:
       - id: anthropic.claude-3-5-sonnet-20241022-v2:0
 ```
 
-### MiniMax and GLM custom provider examples
+### Coding-plan provider presets
 
-For common MiniMax and GLM/zAI setup, prefer the provider presets so the OpenAI-compatible API, base URL, env var, model id, and compatibility flags are written together:
+For supported coding-plan providers, prefer presets so the API type, base URL, environment variable, model catalog, discovery behavior, and compatibility flags are written together:
 
 ```sh
 gjc setup provider --preset minimax
 gjc setup provider --preset minimax-cn
 gjc setup provider --preset glm
 gjc setup provider --preset alibaba-token-plan
+gjc setup provider --preset cline-pass
+gjc setup provider --preset commandcode-goat
 ```
 
 The same presets are available inside the TUI:
@@ -180,9 +182,11 @@ The same presets are available inside the TUI:
 /provider add --preset glm
 /provider add zai
 /provider add --preset alibaba-token-plan
+/provider add --preset cline-pass
+/provider add --preset commandcode-goat
 ```
 
-Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, `ZAI_API_KEY`, or `ALIBABA_TOKEN_PLAN_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider. The Alibaba Token Plan preset (aliases: alibaba, token-plan) writes an OpenAI-compatible custom provider named alibaba-token-plan with per-model API routing (qwen3.8-max-preview uses openai-responses; glm-5.2, deepseek-v4-pro, and deepseek-v4-flash-0731 use openai-completions).
+Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, `ZAI_API_KEY`, `ALIBABA_TOKEN_PLAN_API_KEY`, `CLINE_API_KEY`, or `CMD_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider. The Alibaba Token Plan preset (aliases: `alibaba`, `token-plan`) writes an OpenAI-compatible custom provider named `alibaba-token-plan` with per-model API routing. The ClinePass preset (aliases: `clinepass`, `cline`) does not hardcode models: Cline's inference API has no working `/models` route, so GJC follows Cline's own catalog-generation source and fetches the live `cline-pass` provider catalog from `https://models.dev/api.json`. The Command Code GOAT preset (aliases: `commandcode`, `command-code`, `goat`) fetches its live `/provider/v1/models` catalog, routes every current or future `claude-*` model through Anthropic Messages, and routes other models through Chat Completions. Create the corresponding API key in the provider dashboard before inference; plan entitlement is enforced by the provider.
 
 ## Model profiles (`--mpreset`)
 
@@ -230,7 +234,7 @@ Cancellation discards provisional output and emits exactly one cancelled `agent_
 Built-in profiles are grouped by provider mix and tier:
 
 - `codex-{eco,medium,pro}` — GPT-5.6 Sol/Terra/Luna role mixes tuned by tier and reasoning effort; `lunamaxxing` — OpenAI Codex Luna-only profile with maximum reasoning on delegated roles
-- `opencodego` — single OpenCode Go preset (Kimi default, DeepSeek executor/architect, Qwen planner, MiMo critic)
+- `opencodego` — single OpenCode Go preset (Kimi K3 default and planner, DeepSeek executor/architect, MiMo critic)
 - `claude-opus` — Anthropic OAuth preset centered on `claude-opus-5`
 - Single-provider tiers: `glm-{eco,medium,pro}`, `kimi-coding-plan-{eco,medium,pro}`, `mimo-{eco,medium,pro}`, `grok-{eco,medium,pro}`, `cursor-{eco,medium,pro}`, `minimax-{eco,medium,pro}`
 - Alibaba Token Plan: `alibaba-token-plan-balanced` preserves the established Qwen/DeepSeek V4 Pro/GLM mix; `alibaba-token-plan-pro` raises execution and independent criticism with DeepSeek V4 Flash 0731 max and GLM xhigh; `alibaba-token-plan-qwenmaxxing` stays Qwen-only; `alibaba-token-plan-qwen-deepseek` keeps Qwen 3.8 Max (`qwen3.8-max`) on the expensive default (high)/architect (xhigh)/critic (xhigh) roles and spends DeepSeek V4 Flash 0731 on the cheap planner (max) and executor (high) roles; `alibaba-token-plan-glm-deepseek` does the same with GLM 5.2 (`glm-5.2`) as the expensive model
@@ -247,6 +251,12 @@ gjc --mpreset opencodego --default
 ```
 
 The `/model` command opens to a preset landing view: presets are grouped by provider with live auth marks (✓/✗), highlighting a group expands its tiers, and selecting a tier shows the full role→model preview before applying for the session or as default. Typing jumps straight to model search, and `Browse all models` opens the classic tabbed model selector. In `/login`, `Add custom provider` is the first option for configuring credentials needed by custom or profile-required providers; after a successful provider login, the matching preset is recommended automatically.
+External SDK/ACP clients (e.g. the Paseo TUI) can select profiles like ordinary
+models: the SDK `models.list/current` (Q10) catalog exposes every usable profile
+as a synthetic `gajae-code/<profile>` entry (e.g. `gajae-code/codex-eco`), and
+selecting one through `model.set` (or the ACP Model picker) activates the
+profile for the live session only. Persisting a profile remains an explicit TUI
+choice, mirroring `gjc --mpreset <name> --default`. See [SDK model profiles](./sdk.md#model-profiles-as-synthetic-models-gajae-codeprofile).
 
 MiniMax's OpenAI-compatible endpoint rejects multiple system messages and emits thinking in `reasoning_content`, so pin the public-safe compatibility fields when hand-authoring a custom provider:
 
@@ -279,6 +289,35 @@ providers:
     models:
       - id: glm-4.6
 ```
+
+### JetBrains AI (Junie)
+
+`jetbrains-junie` is a first-class provider serving JetBrains-hosted models through the documented
+Ingrazzio gateway (`https://ingrazzio-cloud-prod.labs.jb.gg`).
+
+Authenticate with an access token generated at [junie.jetbrains.com/cli](https://junie.jetbrains.com/cli):
+
+```sh
+export JUNIE_API_KEY=...
+```
+
+The token is sent as `Authorization: Bearer` — JetBrains AI rejects requests that also carry `x-api-key`, so
+this provider never lets the Anthropic SDK attach one. Usage is billed against your JetBrains AI
+subscription, so bundled per-token costs are zero. There is no OAuth login flow; the environment variable is
+the only supported credential source.
+
+The gateway multiplexes transports by model family:
+
+| Family | Models | Transport | Prompt limit |
+| --- | --- | --- | --- |
+| Claude | `claude-sonnet-4-6` (default), `claude-sonnet-5`, `claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`, `claude-opus-5`, `claude-fable-5` | `anthropic-messages` | 1M |
+| GPT | `gpt-5-2025-08-07`, `gpt-5.2-2025-12-11`, `gpt-5.4`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra` | `openai-completions` | 922K |
+| GPT (Responses-only) | `gpt-5.3-codex` | `openai-responses` | 272K |
+
+All models cap output at 128K. Junie also exposes Gemini and Grok, but those ride a proprietary Grazie
+translation protocol that GJC does not implement, so they are deliberately not bundled. The bare
+`opus`/`sonnet`/`gpt`/`grok` aliases are Junie CLI shorthands the gateway itself rejects.
+
 ### Allowed auth/discovery values
 
 - `auth`: `apiKey` (default), `none`, or `oauth`; for `models.yml` custom models, `oauth` is accepted by schema but does not waive the `apiKey` requirement
@@ -770,6 +809,7 @@ Request shaping:
 - `supportsStore` — emit `store: false` on requests. Default: auto (off for non-standard endpoints).
 - `supportsDeveloperRole` — use the `developer` system role for reasoning models instead of `system`. Default: auto.
 - `sendSessionHeaders` — forward the agent session id as `session_id` and `x-session-id` request headers so OpenAI-compatible relays/proxies can do session-affinity routing and reuse a server-side prompt cache. Default: `false`. Caller-set `headers`/`requestTransform` values are never overwritten.
+- `supportsResponsesSessionAffinity` — for `openai-responses`, opt in to forwarding `session_id` and `x-client-request-id` affinity headers to a custom OpenAI-compatible relay. Canonical OpenAI routing remains automatic; known non-OpenAI provider IDs are rejected. Default: `false`.
 - `supportsUsageInStreaming` — send `stream_options: { include_usage: true }` to receive token usage on streaming responses. Default: `true`.
 - `maxTokensField` — `"max_completion_tokens"` or `"max_tokens"`. Default: auto.
 - `supportsToolChoice` — emit the `tool_choice` parameter when the caller forces a specific tool. Default: `true`. Set `false` for endpoints that 400 on `tool_choice` (e.g. DeepSeek when reasoning is on).
@@ -813,7 +853,7 @@ Prompt-cache modes:
 
 Without an explicit mode, canonical Anthropic endpoints default to `automatic`, Claude-family model ids on non-canonical compatible endpoints default to `explicit`, and unknown non-Claude compatible endpoints default to `none`. Non-canonical endpoints get the default ~5m lifetime unless they opt into `supportsLongCacheRetention: true`. Set `promptCacheMode: automatic` only when a gateway is known to pass through Anthropic's top-level cache control without adding conflicting block markers.
 
-If a gateway attaches enough cache markers of its own that our generated breakpoint becomes the fifth, Anthropic rejects the request with `A maximum of 4 blocks with cache_control may be provided.` Those extra markers are not visible in the request GJC builds, so the rejection is handled at runtime rather than predicted: the turn retries once with generated caching suppressed and keeps it suppressed for the rest of the provider session. Set `promptCacheMode: none` on such a gateway to skip the wasted first attempt.
+If a gateway attaches enough cache markers of its own that ours push the request past Anthropic's four-breakpoint limit, Anthropic rejects it with `A maximum of 4 blocks with cache_control may be provided.` Those extra markers are not visible in the request GJC builds, so the limit is handled at runtime rather than predicted. Because the rejection means "too many" rather than "none allowed", recovery reduces the generated breakpoints one step at a time: `explicit` mode normally emits two markers (a conversation-prefix anchor and a current-turn refresh point), so the first retry keeps only the prefix anchor, and generated caching is disabled entirely only if that is rejected too. The reduced setting persists for the rest of the provider session, so an endpoint with one free slot keeps caching its conversation prefix instead of losing caching altogether. Set `promptCacheMode: none` on a gateway that never has a free slot to skip the wasted attempts.
 
 ```yaml
 providers:
