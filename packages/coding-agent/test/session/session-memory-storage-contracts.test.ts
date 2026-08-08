@@ -463,6 +463,57 @@ describe("commit-marker checked create/replace", () => {
 		expect(winner.kind).toBe("present");
 		if (winner.kind === "present") expect(winner.rawBytesSha256).toBe(markerHash(markerBytes(1)));
 	});
+	it("file backend: simultaneous publishers admit exactly one checked replacement", async () => {
+		const dir = await makeTempDir("gjc-marker-concurrent-process-");
+		const markerPath = path.join(dir, "session.spill.commit");
+		const file = new FileSessionStorage();
+		createSessionCommitMarkerCheckedSync(file, markerPath, markerBytes(0));
+		const worker = path.join(import.meta.dir, "fixtures", "session-memory-marker-race-worker.ts");
+		const spawnPublisher = (publisher: string, generation: number) =>
+			Bun.spawn({
+				cmd: [process.execPath, worker],
+				env: {
+					...process.env,
+					GJC_MARKER_RACE_ROOT: dir,
+					GJC_MARKER_RACE_PUBLISHER: publisher,
+					GJC_MARKER_RACE_GENERATION: String(generation),
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+		const left = spawnPublisher("left", 1);
+		const right = spawnPublisher("right", 2);
+		for (let attempt = 0; attempt < 5_000; attempt++) {
+			if (fs.existsSync(path.join(dir, "ready-left")) && fs.existsSync(path.join(dir, "ready-right"))) break;
+			await Bun.sleep(1);
+		}
+		expect(fs.existsSync(path.join(dir, "ready-left"))).toBe(true);
+		expect(fs.existsSync(path.join(dir, "ready-right"))).toBe(true);
+		fs.writeFileSync(path.join(dir, "go"), "go\n");
+		const [leftExit, rightExit] = await Promise.all([left.exited, right.exited]);
+		const [leftOutput, rightOutput, leftError, rightError] = await Promise.all([
+			new Response(left.stdout).text(),
+			new Response(right.stdout).text(),
+			new Response(left.stderr).text(),
+			new Response(right.stderr).text(),
+		]);
+		expect(leftExit, leftError).toBe(0);
+		expect(rightExit, rightError).toBe(0);
+		const results = [leftOutput, rightOutput].map(
+			text => JSON.parse(text) as { outcome: "published" | "rejected"; generation: number; error?: string },
+		);
+		expect(
+			results.filter(result => result.outcome === "published"),
+			JSON.stringify(results),
+		).toHaveLength(1);
+		expect(results.filter(result => result.outcome === "rejected")).toHaveLength(1);
+		expect(results.find(result => result.outcome === "rejected")?.error).toMatch(/commit_marker_/);
+		const winner = results.find(result => result.outcome === "published")!;
+		const state = readSessionCommitMarkerSync(file, markerPath);
+		expect(state.kind).toBe("present");
+		if (state.kind === "present") expect(state.rawBytesSha256).toBe(markerHash(markerBytes(winner.generation)));
+		expect(fs.readdirSync(dir).filter(name => name.endsWith(".tmp"))).toEqual([]);
+	});
 	it("file backend: corrupt-present is present, never missing, and replaceable by exact raw bytes", async () => {
 		const dir = await makeTempDir("gjc-marker-corrupt-");
 		const markerPath = path.join(dir, "session.jsonl.spill.commit");
