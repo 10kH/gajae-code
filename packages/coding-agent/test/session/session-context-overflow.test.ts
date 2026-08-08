@@ -401,7 +401,21 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 			false,
 		);
 		const submitted: AgentMessage[][] = [];
-		vi.spyOn(session.agent, "waitForIdle").mockResolvedValue(undefined);
+		vi.spyOn(session.agent, "waitForIdle").mockImplementation(async () => {
+			session.setGoalModeState({
+				enabled: true,
+				mode: "active",
+				goal: {
+					id: "busy-goal",
+					objective: "Reflect live idle-wait state",
+					status: "active",
+					tokensUsed: 0,
+					timeUsedSeconds: 0,
+					createdAt: 0,
+					updatedAt: 0,
+				},
+			});
+		});
 		const promptSpy = vi
 			.spyOn(session.agent, "prompt")
 			.mockImplementationOnce(async messages => {
@@ -424,6 +438,12 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 				messages.filter(message => message.role === "custom" && message.customType === "hindsight-recall"),
 			).toHaveLength(1);
 		}
+		expect(
+			submitted[0]?.filter(message => message.role === "custom" && message.customType === "goal-mode-context"),
+		).toEqual([]);
+		expect(
+			submitted[1]?.filter(message => message.role === "custom" && message.customType === "goal-mode-context"),
+		).toHaveLength(1);
 		expect(recallReadSpy).toHaveBeenCalledTimes(1);
 		expect(recallMarkSpy).toHaveBeenCalledTimes(1);
 		expect(session.getPendingNextTurnMessagesForTests()).toEqual([]);

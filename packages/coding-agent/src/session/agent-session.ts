@@ -8757,11 +8757,10 @@ export class AgentSession {
 			let beforeAgentStartResultMessages: BeforeAgentStartInternalMessage[] = [];
 			const contributedMessages: BeforeAgentStartInternalMessage[] = [];
 			let recallMarked = false;
-			// Phase B attempt cache: the first assembled attempt messages are reused
-			// across AgentBusy/idle waits exactly like the pre-seam single messages
-			// array, while the overflow preflight stays live on every attempt. The
-			// seam resets this cache after a forced compaction so Phase B rebuilds
-			// overlays (matching post-compaction rebuild semantics).
+			let planReferenceMessage: CustomMessage | null = null;
+			// Phase B attempt cache. AgentBusy/idle and forced-compaction retries clear
+			// this cache so live plan/goal/volatile/MCP overlays are rebuilt. One-shot
+			// Phase A products (including the plan reference) remain stable.
 			let attemptMessages: AgentMessage[] | undefined;
 
 			const buildPreSubmit = async (): Promise<AgentMessage[]> => {
@@ -8799,6 +8798,7 @@ export class AgentSession {
 					}
 					const beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(expandedText);
 					hindsightRecall = this.getHindsightSessionState()?.getRecallSnippetForInjection();
+					planReferenceMessage = await this.#buildPlanReferenceMessage();
 					// Emit before_agent_start extension event. Race hook completion with
 					// prompt cancellation so a wedged hook cannot retain SDK prompt authority.
 					if (this.#extensionRunner?.hasHandlers("before_agent_start")) this.#markRetryReplayUnsafe();
@@ -8861,9 +8861,9 @@ export class AgentSession {
 					return attemptMessages;
 				}
 				const messages: AgentMessage[] = [];
-				const planReferenceMessage = await this.#buildPlanReferenceMessage?.();
-				if (planReferenceMessage) {
-					messages.push(planReferenceMessage);
+				const currentPlanReferenceMessage = planReferenceMessage;
+				if (currentPlanReferenceMessage) {
+					messages.push(currentPlanReferenceMessage);
 				}
 				const planModeMessage = await this.#buildAutomaticPlanModeMessage();
 				if (planModeMessage) {
@@ -15550,6 +15550,7 @@ export class AgentSession {
 					throw new Error("Timed out waiting for prior agent run to finish before prompting.");
 				}
 				await this.agent.waitForIdle();
+				preSubmit.reset();
 			}
 		}
 	}
