@@ -70,3 +70,44 @@ describe("session memory physical crash recovery", () => {
 		}, 30_000);
 	}
 });
+
+describe("session memory first-marker physical crash recovery", () => {
+	for (const crashMode of [
+		"create-crash-before-marker-temp-fsync",
+		"create-crash-after-marker-temp-fsync",
+		"create-crash-before-marker-directory-fsync",
+		"create-crash-after-marker-directory-fsync",
+	]) {
+		it(`recovers first checked marker publication after ${crashMode}`, () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-session-create-crash-"));
+			const worker = path.join(import.meta.dir, "fixtures", "session-memory-crash-worker.ts");
+			try {
+				const setup = runWorker(worker, root, "setup-raw");
+				expect(setup.exitCode, setup.stderr.toString()).toBe(0);
+				const fixture = JSON.parse(setup.stdout.toString()) as { sessionFile: string };
+				const crashed = runWorker(worker, root, crashMode);
+				expect(crashed.exitCode).not.toBe(0);
+				const recovered = runWorker(worker, root, "recover");
+				expect(recovered.exitCode, recovered.stderr.toString()).toBe(0);
+				const result = JSON.parse(recovered.stdout.toString()) as RecoveryResult;
+				expect(result.found).toBe(false);
+				expect(result.stats.currentCommitTransition).toEqual({
+					kind: "exact",
+					reason: "descriptor_and_proof_match",
+				});
+				expect(fs.readdirSync(fixture.sessionFile.slice(0, -6)).filter(name => name.endsWith(".tmp"))).toEqual([]);
+				const reopened = runWorker(worker, root, "recover");
+				expect(reopened.exitCode, reopened.stderr.toString()).toBe(0);
+				const reopenedResult = JSON.parse(reopened.stdout.toString()) as RecoveryResult;
+				expect(reopenedResult.found).toBe(false);
+				expect(reopenedResult.stats.autoDisabledReason).toBeUndefined();
+				expect(reopenedResult.stats.currentCommitTransition).toEqual({
+					kind: "exact",
+					reason: "descriptor_and_proof_match",
+				});
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		}, 30_000);
+	}
+});
