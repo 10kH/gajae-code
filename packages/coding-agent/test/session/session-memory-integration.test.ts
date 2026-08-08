@@ -2603,124 +2603,50 @@ describe("sidecar I/O fallback", () => {
 	});
 });
 
-describe("managed commit marker classification", () => {
-	it("records missing-marker recovery before publishing an exact current marker", async () => {
-		const tempDir = TempDir.createSync("@pi-managed-marker-");
+describe("managed session memory authority", () => {
+	it("keeps enabled managed sessions eager and sidecar-free", async () => {
+		const tempDir = TempDir.createSync("@pi-managed-memory-eager-");
 		const cwd = path.join(tempDir.path(), "workspace");
 		const agentDir = path.join(tempDir.path(), "agent");
 		fs.mkdirSync(cwd, { recursive: true });
-		const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		let sessionFile: string;
 		try {
 			manager.setSessionMemoryMode("enabled");
 			const firstId = manager.appendMessage({ role: "user", content: "first", timestamp: 1 });
 			const keptId = manager.appendMessage({ role: "user", content: "kept", timestamp: 2 });
 			await manager.ensureOnDisk();
 			manager.appendCompaction("summary", undefined, keptId, 10);
-			const stats = manager.getSessionMemoryStats();
-			expect(stats).toMatchObject({ lastReopenTransition: { kind: "stale_commit", reason: "no_commit_marker" } });
-			expect(stats.currentCommitTransition).toEqual({ kind: "exact", reason: "descriptor_and_proof_match" });
-			manager.appendLabelChange(firstId, "cold label");
-			expect(manager.getLabel(firstId)).toBe("cold label");
+			manager.appendLabelChange(firstId, "managed label");
 			const appendedId = manager.appendMessage({ role: "user", content: "after", timestamp: 3 });
-			const appendedStats = manager.getSessionMemoryStats();
-			expect(appendedStats.currentCommitTransition).toEqual({
-				kind: "exact",
-				reason: "descriptor_and_proof_match",
+			sessionFile = manager.getSessionFile()!;
+			expect(manager.getSessionMemoryStats()).toMatchObject({
+				sidecarEnabled: false,
+				coldRetirementActive: false,
+				lazyReopenSucceeded: false,
 			});
-			const sessionFile = manager.getSessionFile();
-			expect(sessionFile).toBeTruthy();
-			if (sessionFile) {
-				const marker = JSON.parse(fs.readFileSync(sidecarPath(sessionFile, "commit"), "utf8")) as {
-					transcriptSize: number;
-				};
-				expect(marker.transcriptSize).toBe(fs.statSync(sessionFile).size);
-				const tailRecords = fs
-					.readFileSync(sidecarPath(sessionFile, "tail"), "utf8")
-					.trimEnd()
-					.split("\n")
-					.map(line => JSON.parse(line) as { id: string });
-				expect(tailRecords.at(-1)?.id).toBe(appendedId);
-			}
+			for (const kind of ["idx", "tail", "commit"] as const)
+				expect(fs.existsSync(sidecarPath(sessionFile, kind))).toBe(false);
 			expect(manager.getEntry(firstId)).toMatchObject({ id: firstId });
+			expect(manager.getEntry(appendedId)).toMatchObject({ id: appendedId });
 		} finally {
 			await manager.close();
-			tempDir.removeSync();
 		}
-	});
-
-	it("classifies and repairs transcript-ahead crash evidence on reopen", async () => {
-		const tempDir = TempDir.createSync("@pi-managed-transcript-ahead-");
-		const cwd = path.join(tempDir.path(), "workspace");
-		const agentDir = path.join(tempDir.path(), "agent");
-		fs.mkdirSync(cwd, { recursive: true });
-		const destination = SessionManager.managedDestination(cwd, agentDir);
-		const source = SessionManager.create(cwd, destination);
-		let sessionFile: string;
 		try {
-			source.setSessionMemoryMode("enabled");
-			const firstId = source.appendMessage({ role: "user", content: "first", timestamp: 1 });
-			const keptId = source.appendMessage({ role: "user", content: "kept", timestamp: 2 });
-			await source.ensureOnDisk();
-			const compactionId = source.appendCompaction("summary", undefined, keptId, 10);
-			sessionFile = source.getSessionFile()!;
-			await source.close();
-			fs.appendFileSync(
-				sessionFile,
-				`${JSON.stringify({
-					type: "message",
-					id: "crash-window-append",
-					parentId: compactionId,
-					timestamp: new Date().toISOString(),
-					message: { role: "user", content: "transcript ahead", timestamp: 3 },
-				})}\n`,
-			);
-
-			const reopened = await SessionManager.open(sessionFile, destination);
+			const reopened = await SessionManager.open(sessionFile, destination, undefined, "copy-retain", "enabled");
 			try {
-				const stats = reopened.getSessionMemoryStats();
-				expect(stats.lastReopenTransition).toEqual({
-					kind: "transcript_ahead",
-					reason: "object_grew_within_window",
+				expect(reopened.getSessionMemoryStats()).toMatchObject({
+					sidecarEnabled: false,
+					coldRetirementActive: false,
+					lazyReopenSucceeded: false,
 				});
-				expect(stats.currentCommitTransition).toEqual({
-					kind: "exact",
-					reason: "descriptor_and_proof_match",
-				});
-				expect(reopened.getEntry(firstId)).toMatchObject({ id: firstId });
-				expect(reopened.getEntry("crash-window-append")).toMatchObject({ id: "crash-window-append" });
+				expect(reopened.getLabel(reopened.getEntries()[0]!.id)).toBe("managed label");
+				expect(reopened.buildSessionContext().messages).toHaveLength(3);
 			} finally {
 				await reopened.close();
 			}
-			const markerPath = sidecarPath(sessionFile, "commit");
-			const corruptMarker = JSON.parse(fs.readFileSync(markerPath, "utf8")) as { terminalChecksum: string };
-			corruptMarker.terminalChecksum = "0".repeat(64);
-			fs.writeFileSync(markerPath, `${JSON.stringify(corruptMarker)}\n`);
-			const repaired = await SessionManager.open(sessionFile, destination);
-			try {
-				expect(repaired.getSessionMemoryStats().lastReopenTransition).toEqual({
-					kind: "rebuild",
-					reason: "terminal_checksum_mismatch",
-				});
-				expect(repaired.getSessionMemoryStats().currentCommitTransition).toEqual({
-					kind: "exact",
-					reason: "descriptor_and_proof_match",
-				});
-			} finally {
-				await repaired.close();
-			}
-			const verified = await SessionManager.open(sessionFile, destination);
-			try {
-				expect(verified.getSessionMemoryStats()).toMatchObject({
-					lazyReopenSucceeded: false,
-					lastReopenTransition: { kind: "exact", reason: "descriptor_and_proof_match" },
-					currentCommitTransition: { kind: "exact", reason: "descriptor_and_proof_match" },
-				});
-				expect(verified.getEntry("crash-window-append")).toMatchObject({ id: "crash-window-append" });
-			} finally {
-				await verified.close();
-			}
 		} finally {
-			await source.close().catch(() => {});
 			tempDir.removeSync();
 		}
 	});

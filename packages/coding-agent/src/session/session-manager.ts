@@ -9337,6 +9337,13 @@ export class SessionManager {
 
 	/** Build a fresh disposable `.spill.idx`/`.spill.tail`/`.spill.commit` set from the transcript. */
 	#buildDisposableSidecars(entries: readonly FileEntry[]): void {
+		if (this.destination.kind === "managed") {
+			// Retained managed authority does not expose bounded range or staged sidecar APIs.
+			// Keep managed sessions on the eager transcript path rather than publishing
+			// disposable proof through generic pathname-based storage operations.
+			this.#sidecarRuntime = undefined;
+			return;
+		}
 		if (this.#sessionMemoryMode === "off") {
 			this.#sidecarRuntime = undefined;
 			return;
