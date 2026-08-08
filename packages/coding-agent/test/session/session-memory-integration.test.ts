@@ -1895,6 +1895,7 @@ describe("whole-session persistence freshness", () => {
 					},
 					fsync: writer.fsync.bind(writer),
 					fsyncSync: writer.fsyncSync?.bind(writer),
+					statSync: writer.statSync?.bind(writer),
 					close: writer.close.bind(writer),
 					closeSync: writer.closeSync.bind(writer),
 					getError: writer.getError.bind(writer),
@@ -2129,6 +2130,7 @@ describe("sidecar I/O fallback", () => {
 					flush: writer.flush.bind(writer),
 					fsync: writer.fsync.bind(writer),
 					fsyncSync: writer.fsyncSync?.bind(writer),
+					statSync: writer.statSync?.bind(writer),
 					close: writer.close.bind(writer),
 					closeSync: writer.closeSync.bind(writer),
 					getError: writer.getError.bind(writer),
@@ -2209,6 +2211,7 @@ describe("sidecar I/O fallback", () => {
 						}
 						writer.fsyncSync?.();
 					},
+					statSync: writer.statSync?.bind(writer),
 					close: writer.close.bind(writer),
 					closeSync: writer.closeSync.bind(writer),
 					getError: writer.getError.bind(writer),
@@ -2296,6 +2299,7 @@ describe("sidecar I/O fallback", () => {
 						this.events.push(`fsync:${filePath}`);
 						writer.fsyncSync?.();
 					},
+					statSync: writer.statSync?.bind(writer),
 					close: writer.close.bind(writer),
 					closeSync: writer.closeSync.bind(writer),
 					getError: writer.getError.bind(writer),

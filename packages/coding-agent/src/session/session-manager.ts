@@ -9376,12 +9376,19 @@ export class SessionManager {
 		if (operationError ?? closeError) throw operationError ?? closeError;
 		if (tailOverflow) {
 			const truncateTail = this.storage.openWriter(runtime.tailPath, { flags: "w" });
+			let durabilityError: unknown;
 			try {
 				if (!truncateTail.fsyncSync) throw new Error("Synchronous sidecar fsync is unavailable");
 				truncateTail.fsyncSync();
-			} finally {
-				truncateTail.closeSync();
+			} catch (error) {
+				durabilityError = error;
 			}
+			try {
+				truncateTail.closeSync();
+			} catch (error) {
+				durabilityError ??= error;
+			}
+			if (durabilityError) throw durabilityError;
 		}
 		for (const [id, label] of this.#labelsById) {
 			if (!runtime.labelsPins.setLabel(id, label)) {
