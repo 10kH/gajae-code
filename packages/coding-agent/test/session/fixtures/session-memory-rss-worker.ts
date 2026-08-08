@@ -3,6 +3,31 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { SessionManager } from "../../../src/session/session-manager";
 
+const collect = (): { rss: number; heapUsed: number; external: number } => {
+	Bun.gc(true);
+	const usage = process.memoryUsage();
+	return { rss: usage.rss, heapUsed: usage.heapUsed, external: usage.external };
+};
+
+if (process.env.GJC_SESSION_MEMORY_RSS_CONTEXT === "1") {
+	const manager = SessionManager.inMemory();
+	const payload = `context-rss-${"x".repeat(24 * 1024 * 1024)}`;
+	manager.appendMessage({ role: "user", content: payload, timestamp: 0 });
+	const baseline = collect();
+	const context = manager.buildSessionContext();
+	const retained = collect();
+	process.stdout.write(
+		`${JSON.stringify({
+			baseline,
+			retained,
+			rssGrowthBytes: retained.rss - baseline.rss,
+			messageBytes: Buffer.byteLength((context.messages[0] as { content: string }).content),
+		})}\n`,
+	);
+	await manager.close();
+	process.exit(0);
+}
+
 const recordCount = Number.parseInt(process.env.GJC_SESSION_MEMORY_RSS_RECORDS ?? "120000", 10);
 if (!Number.isSafeInteger(recordCount) || recordCount < 10) throw new Error("invalid_record_count");
 
@@ -36,12 +61,6 @@ try {
 } finally {
 	fs.closeSync(fd);
 }
-
-const collect = (): { rss: number; heapUsed: number; external: number } => {
-	Bun.gc(true);
-	const usage = process.memoryUsage();
-	return { rss: usage.rss, heapUsed: usage.heapUsed, external: usage.external };
-};
 
 const baselineRss = collect();
 const boundedFirstOpen = process.env.GJC_SESSION_MEMORY_RSS_FIRST_OPEN === "1";

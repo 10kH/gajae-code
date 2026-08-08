@@ -35,6 +35,22 @@ interface GibForkWorkerResult {
 const enabled = process.env.GJC_SESSION_MEMORY_RSS === "1";
 
 describe.skipIf(!enabled)("session memory RSS plateau", () => {
+	it("materializes a 24 MiB public provider context within the 64 MiB RSS budget", () => {
+		const worker = path.join(import.meta.dir, "fixtures", "session-memory-rss-worker.ts");
+		const result = Bun.spawnSync({
+			cmd: [process.execPath, worker],
+			env: { ...process.env, GJC_SESSION_MEMORY_RSS_CONTEXT: "1" },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(result.exitCode, result.stderr.toString()).toBe(0);
+		const measured = JSON.parse(result.stdout.toString()) as {
+			rssGrowthBytes: number;
+			messageBytes: number;
+		};
+		expect(measured.messageBytes).toBeGreaterThanOrEqual(24 * 1024 * 1024);
+		expect(measured.rssGrowthBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+	}, 60_000);
 	it("keeps post-compaction RSS growth bounded across a 120k-record session", () => {
 		const worker = path.join(import.meta.dir, "fixtures", "session-memory-rss-worker.ts");
 		const result = Bun.spawnSync({

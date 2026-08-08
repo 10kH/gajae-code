@@ -5843,6 +5843,7 @@ export class SessionManager {
 	#materializedEntriesRevision = -1;
 	#materializedEntriesCache: MaterializedCacheReference<SessionEntry[]> | undefined;
 	#sessionContextCache: MaterializedCacheReference<SessionContext> | undefined;
+	#sessionContextCacheOversized = false;
 	#materializedCachesWeaklyHeld = false;
 	#sessionContextEntryRevision = -1;
 	#sessionContextLeafRevision = -1;
@@ -6112,6 +6113,7 @@ export class SessionManager {
 		this.#materializedEntriesCache = undefined;
 		this.#materializedCachesWeaklyHeld = false;
 		this.#sessionContextCache = undefined;
+		this.#sessionContextCacheOversized = false;
 		this.#sessionContextEntryRevision = -1;
 		this.#sessionContextLeafRevision = -1;
 		this.#sessionContextReplayMetadataRevision = -1;
@@ -12688,7 +12690,20 @@ export class SessionManager {
 	 * Return a defensive context snapshot for public consumers.
 	 */
 	buildSessionContext(): SessionContext {
-		return cloneSessionContext(this.#getSessionContextForRead());
+		const context = this.#getSessionContextForRead();
+		if (!this.#sessionContextCacheOversized) return cloneSessionContext(context);
+		// Large contexts are built from detached entry clones below. Transfer the
+		// one-shot snapshot to the caller instead of retaining and deep-cloning a
+		// second full graph; invalidate the cache so caller mutation cannot affect
+		// a later read.
+		this.#sessionContextCache = undefined;
+		this.#sessionContextCacheOversized = false;
+		this.#sessionContextEntryRevision = -1;
+		this.#sessionContextLeafRevision = -1;
+		this.#sessionContextReplayMetadataRevision = -1;
+		return process.env.NODE_ENV === "test" || process.env.NODE_ENV === "development"
+			? cloneSessionContext(context)
+			: (context as SessionContext);
 	}
 
 	/**
@@ -12708,15 +12723,13 @@ export class SessionManager {
 		}
 		this.#pathOnlyContextBuildCount++;
 		const providerEntries = this.#getActivePathEntriesForProviderContext();
-		const builtContext = buildSessionContext(
-			this.#coldSidecarActive() && this.#sidecarRuntime
-				? [...this.#sidecarRuntime.providerStateEntries.map(cloneSessionEntry), ...providerEntries]
-				: providerEntries,
-			this.#leafId,
-			undefined,
-			this.#sessionId,
-		);
-		if (jsonLikeValueExceedsCacheLimit(builtContext, materializedCacheMaxBytes())) {
+		const detachedEntries = [
+			...(this.#coldSidecarActive() && this.#sidecarRuntime ? this.#sidecarRuntime.providerStateEntries : []),
+			...providerEntries,
+		].map(cloneSessionEntry);
+		const builtContext = buildSessionContext(detachedEntries, this.#leafId, undefined, this.#sessionId);
+		this.#sessionContextCacheOversized = jsonLikeValueExceedsCacheLimit(builtContext, materializedCacheMaxBytes());
+		if (this.#sessionContextCacheOversized) {
 			this.#holdMaterializedCachesWeakly();
 		}
 		const context = freezeInternalReadSnapshot(builtContext);
