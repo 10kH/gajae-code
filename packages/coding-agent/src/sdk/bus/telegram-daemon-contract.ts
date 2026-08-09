@@ -126,8 +126,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * same-process reconnect retains the unadvanced replay cursor.
  * Generation 74 serializes each Router frame until its durable publication state
  * becomes attempted or delivered, preserving sequence order without cursor gaps.
+ * Generation 75 routes every direct effect through the suppression-aware adapter
+ * and gives each publication queue item a non-coalescing identity.
  */
-export const DAEMON_GENERATION = 74;
+export const DAEMON_GENERATION = 75;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -147,5 +149,6 @@ export const DAEMON_GENERATION = 74;
  * Epoch 19 requires direct invalid/rejected outcomes to retain exact receipt state.
  * Epoch 20 requires Router cursor advancement to follow settled publication state.
  * Epoch 21 requires ordered Router settlement waiters for queued publications.
+ * Epoch 22 requires unified dispatch guards and non-coalescing publication work.
  */
-export const SERVING_EPOCH = 21;
+export const SERVING_EPOCH = 22;

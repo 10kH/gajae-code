@@ -4228,6 +4228,7 @@ export class TelegramNotificationDaemon {
 	/** Exact settlement of each admitted legacy-v1 start; retained only while visible. */
 	private readonly legacyToolStarts = new Map<string, LegacyToolStartSettlement>();
 	private nextLegacyToolStartId = 1;
+	private nextPublicationQueueItemId = 1;
 	private readonly unresolvedToolTerminalizations = new Map<string, { messageId: number; owner: ToolActivityOwner }>();
 	private toolTerminalizationChain: Promise<void> = Promise.resolve();
 	private toolActivityPolicyEpoch = 0;
@@ -4761,6 +4762,12 @@ export class TelegramNotificationDaemon {
 				outcomes.push(collectedOutcome);
 				return result.response;
 			},
+		};
+	}
+	private botApiForPublication(publicationId: string | undefined): BotApi {
+		return {
+			call: async (method, body, callOpts) =>
+				(await this.callPublicationBotApiClassified(publicationId, method, body, callOpts)).response,
 		};
 	}
 
@@ -5438,20 +5445,7 @@ export class TelegramNotificationDaemon {
 	}
 
 	private async failPublicationPreSend(publicationId: string | undefined, reason: string): Promise<never> {
-		if (publicationId && this.publicationsClaimedThisRun.has(publicationId)) {
-			const claimedAt = this.claimedPublications.get(publicationId);
-			this.claimedPublications.delete(publicationId);
-			this.publicationsClaimedThisRun.delete(publicationId);
-			this.deferredPublications.delete(publicationId);
-			try {
-				await this.persistPublicationReceipts();
-			} catch (error) {
-				if (claimedAt !== undefined) this.claimedPublications.set(publicationId, claimedAt);
-				this.publicationsClaimedThisRun.add(publicationId);
-				throw new Error(`Telegram publication pre-send rollback failed: ${reason}`, { cause: error });
-			}
-		}
-		if (publicationId) this.publicationSettlements.delete(publicationId);
+		this.resetPublicationSettlement(publicationId);
 		throw new Error(`Telegram publication rejected before send: ${reason}`);
 	}
 
@@ -5939,6 +5933,7 @@ export class TelegramNotificationDaemon {
 		allowWhileStopping?: boolean;
 		signal?: AbortSignal;
 		isAuthoritative?: () => boolean;
+		botApi?: BotApi;
 	}): Promise<unknown> {
 		if (
 			(!input.allowWhileStopping && this.#stoppingBtw) ||
@@ -5948,7 +5943,7 @@ export class TelegramNotificationDaemon {
 			return undefined;
 		const signals = [this.#btwDeliveryAbort.signal, AbortSignal.timeout(30_000)];
 		if (input.signal) signals.unshift(input.signal);
-		return this.botApi.call(
+		return (input.botApi ?? this.botApi).call(
 			"sendMessage",
 			{
 				chat_id: this.opts.chatId,
@@ -5973,6 +5968,7 @@ export class TelegramNotificationDaemon {
 		body: Record<string, unknown>;
 		signal: AbortSignal;
 		isAuthoritative: () => boolean;
+		publicationId?: string;
 	}): Promise<BtwQueuedDeliveryOutcome> {
 		if (input.signal.aborted) return "uncertain";
 		const result = Promise.withResolvers<BtwQueuedDeliveryOutcome>();
@@ -6003,6 +5999,7 @@ export class TelegramNotificationDaemon {
 				payload: {
 					send: { method: "sendMessage", lane: "finalized", text: String(input.body.text ?? "") },
 					btwDelivery: delivery,
+					...(input.publicationId ? { publicationId: input.publicationId } : {}),
 				},
 			});
 			if (input.signal.aborted) abort();
@@ -6971,12 +6968,19 @@ export class TelegramNotificationDaemon {
 					? `legacy-tool-terminal:${this.nextLegacyToolStartId++}`
 					: legacyStart.itemId
 				: undefined;
+		const publicationQueueItemId = publicationId
+			? `publication:${publicationId}:${this.nextPublicationQueueItemId++}`
+			: undefined;
 		if (publicationId) this.deferredPublications.add(publicationId);
 		const submitted = this.submitPool({
 			sessionId,
 			lane: send.lane,
 			coalesceKey: send.coalesceKey,
-			...(poolItemId !== undefined ? { itemId: poolItemId } : {}),
+			...(poolItemId !== undefined
+				? { itemId: poolItemId }
+				: publicationQueueItemId !== undefined
+					? { itemId: publicationQueueItemId }
+					: {}),
 			payload: {
 				send,
 				...(publicationId ? { publicationId } : {}),
@@ -8794,11 +8798,18 @@ export class TelegramNotificationDaemon {
 					? `legacy-tool-terminal:${this.nextLegacyToolStartId++}`
 					: legacyToolStart.itemId
 				: undefined;
+		const publicationQueueItemId = publicationId
+			? `publication:${publicationId}:${this.nextPublicationQueueItemId++}`
+			: undefined;
 		const submitted = this.submitPool({
 			sessionId,
 			lane: send.lane,
 			coalesceKey: send.coalesceKey,
-			...(poolItemId !== undefined ? { itemId: poolItemId } : {}),
+			...(poolItemId !== undefined
+				? { itemId: poolItemId }
+				: publicationQueueItemId !== undefined
+					? { itemId: publicationQueueItemId }
+					: {}),
 			payload: {
 				send,
 				...(publicationId ? { publicationId } : {}),
@@ -9072,8 +9083,7 @@ export class TelegramNotificationDaemon {
 		if (!this.#leaseTokenAllows(socketLease) || !this.topicLeaseIsCurrent(topicLease))
 			throw new Error("Telegram model selection publication authority became stale.");
 		try {
-			await this.beginPublicationAttempt(publicationId);
-			const response = await this.botApi.call(
+			const response = await this.botApiForPublication(publicationId).call(
 				"sendMessage",
 				{
 					chat_id: this.opts.chatId,
@@ -9394,15 +9404,16 @@ export class TelegramNotificationDaemon {
 									: "This /btw question failed. Send it again to retry.";
 					try {
 						if (!isAuthoritative()) return;
-						await this.beginPublicationAttempt(publicationId);
-						terminalDelivery.attempted = true;
 						const response = await this.#sendBtwMessage({
 							threadId: pending.threadId,
 							messageId: pending.messageId,
 							text,
 							signal: terminalDelivery.controller.signal,
 							isAuthoritative,
+							botApi: this.botApiForPublication(publicationId),
 						});
+						terminalDelivery.attempted =
+							publicationId !== undefined && this.ambiguousPublications.has(publicationId);
 						deliveryOutcome =
 							telegramMessageId(response) !== undefined
 								? "accepted"
@@ -9427,9 +9438,12 @@ export class TelegramNotificationDaemon {
 				): Promise<"accepted" | "rejected" | "uncertain" | "stale"> => {
 					if (!isAuthoritative()) return "stale";
 					try {
-						await this.beginPublicationAttempt(publicationId);
-						terminalDelivery.attempted = true;
-						const response = await this.botApi.call(method, body, { noRetry: true, signal });
+						const response = await this.botApiForPublication(publicationId).call(method, body, {
+							noRetry: true,
+							signal,
+						});
+						terminalDelivery.attempted =
+							publicationId !== undefined && this.ambiguousPublications.has(publicationId);
 						if (telegramMessageId(response) !== undefined) return "accepted";
 						if (response && typeof response === "object" && (response as { ok?: unknown }).ok === false)
 							return "rejected";
@@ -9448,6 +9462,7 @@ export class TelegramNotificationDaemon {
 							pending,
 							signal,
 							isAuthoritative,
+							publicationId,
 							body: {
 								chat_id: this.opts.chatId,
 								message_thread_id: Number(pending.threadId),
@@ -9863,7 +9878,7 @@ export class TelegramNotificationDaemon {
 					if (!callbackDispatchAuthorityIsCurrent()) return undefined;
 					let result: { ok?: unknown; result?: { message_id?: unknown } } | undefined;
 					try {
-						result = (await this.botApi.call(
+						result = (await this.botApiForPublication(publicationId).call(
 							"sendMessage",
 							{
 								chat_id: this.opts.chatId,
@@ -9900,9 +9915,8 @@ export class TelegramNotificationDaemon {
 				// Rich (default on): promote to sendRichMessage with a top-level
 				// reply_markup (probe-confirmed). Any miss falls back to the HTML loop.
 				if (callbackDispatchAuthorityIsCurrent()) {
-					await this.beginPublicationAttempt(publicationId);
 					const outcome = await deliverRichActionWithFallback(
-						this.botApi,
+						this.botApiForPublication(publicationId),
 						{
 							chat_id: this.opts.chatId,
 							...threadField,
@@ -9930,7 +9944,6 @@ export class TelegramNotificationDaemon {
 				}
 			} else {
 				// Rich disabled: deliver through the HTML chunk path.
-				await this.beginPublicationAttempt(publicationId);
 				messageId = await sendHtmlChunks();
 			}
 			const pendingActionIsCurrent = pendingAction !== undefined && session.pending.get(msg.id) === pendingAction;
