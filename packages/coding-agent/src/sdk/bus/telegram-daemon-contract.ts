@@ -172,8 +172,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 108 interrupts replay requests immediately when Router stop begins.
  * Generation 109 isolates stale attachment client and provider cleanup failures.
  * Generation 110 installs replay stop handling before starting the request.
+ * Generation 111 isolates replacement client and provider cleanup failures.
+ * Generation 112 preserves provider handoff while isolating replacement close failure.
  */
-export const DAEMON_GENERATION = 110;
+export const DAEMON_GENERATION = 112;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -229,5 +231,7 @@ export const DAEMON_GENERATION = 110;
  * Epoch 55 closes pending reconnect replay without hanging Router shutdown.
  * Epoch 56 guarantees provider authority cleanup despite transport close failure.
  * Epoch 57 prevents orphaned replay request rejection during stop.
+ * Epoch 58 guarantees old authority cleanup before replacement attachment.
+ * Epoch 59 drops old provider authority only when replacement creation fails.
  */
-export const SERVING_EPOCH = 57;
+export const SERVING_EPOCH = 59;

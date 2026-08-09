@@ -477,13 +477,30 @@ export class SessionRouter {
 		if (existing) {
 			this.#sessions.delete(indexed.sessionId);
 			existing.dispose();
-			await existing.client.close();
+			try {
+				await existing.client.close();
+			} catch (error) {
+				logger.warn(
+					`SDK session replacement transport cleanup failed for ${indexed.sessionId}; authority remains revoked (${String(error)}).`,
+				);
+			}
 			if (!resumable) {
 				this.#undelivered.delete(indexed.sessionId);
 				this.#recoveredFrames.delete(indexed.sessionId);
 			}
 		}
-		const client = await (this.#deps.createClient ?? connectAttachedSession)(endpoint);
+		let client: SessionRouterClient;
+		try {
+			client = await (this.#deps.createClient ?? connectAttachedSession)(endpoint);
+		} catch (error) {
+			if (existing)
+				try {
+					await this.#deps.onSessionRemoved?.(existing.capability);
+				} catch {
+					// Replacement failure already revoked Router authority; provider cleanup remains best effort.
+				}
+			throw error;
+		}
 		if (!this.#started) {
 			await client.close().catch(() => undefined);
 			return false;
