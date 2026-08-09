@@ -323,6 +323,18 @@ function canonicalJson(value: unknown): string {
 		.join(",")}}`;
 }
 
+function credentialFreeLifecycleResponse(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(credentialFreeLifecycleResponse);
+	if (value === null || typeof value !== "object") return value;
+	const output: Record<string, unknown> = {};
+	for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+		if (key === "token" || key === "url" || (key === "endpoint" && nested !== null && typeof nested === "object"))
+			continue;
+		output[key] = credentialFreeLifecycleResponse(nested);
+	}
+	return output;
+}
+
 type EndpointAuthority = { endpointGeneration?: number; endpointIncarnation?: string };
 function endpointIncarnation(
 	record: Pick<IndexedSession, "endpointGeneration" | "endpointMtimeMs" | "pid">,
@@ -1385,9 +1397,10 @@ export class Broker {
 				if (!cleanup) return replay;
 				const outcome = await executeLifecycle(this, operation, input, identity, cleanup);
 				const response = outcome.response;
+				const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
 				await this.ledger.transition(identity, lifecycleResponseState(response), {
-					response,
-					responseDigest: createHash("sha256").update(canonicalJson(response)).digest("hex"),
+					response: storedResponse,
+					responseDigest: createHash("sha256").update(canonicalJson(storedResponse)).digest("hex"),
 					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
 					...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
 				});
@@ -1402,10 +1415,11 @@ export class Broker {
 					return replay ?? error("terminal_uncertain", "prior lifecycle operation outcome is uncertain");
 				const outcome = await executeLifecycle(this, operation, input, identity, cleanup);
 				const response = outcome.response;
+				const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
 				await this.ledger.transition(identity, lifecycleResponseState(response), {
 					...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
-					response,
-					responseDigest: createHash("sha256").update(canonicalJson(response)).digest("hex"),
+					response: storedResponse,
+					responseDigest: createHash("sha256").update(canonicalJson(storedResponse)).digest("hex"),
 					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
 					...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
 				});
@@ -1414,14 +1428,15 @@ export class Broker {
 			if (begun.kind === "in_progress") return error("broker_restarting", "lifecycle operation is in progress");
 			const outcome = await executeLifecycle(this, operation, input, identity);
 			const response = outcome.response;
+			const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
 			await this.ledger.transition(identity, lifecycleResponseState(response), {
 				...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
 				resultSessionId:
 					response.ok && typeof (response.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
 						? (response.result as { sessionId: string }).sessionId
 						: undefined,
-				response,
-				responseDigest: createHash("sha256").update(canonicalJson(response)).digest("hex"),
+				response: storedResponse,
+				responseDigest: createHash("sha256").update(canonicalJson(storedResponse)).digest("hex"),
 				...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
 				...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
 			});
@@ -1429,7 +1444,7 @@ export class Broker {
 			const persisted = await this.ledger.readTerminal(identity, requestHash);
 			const persistenceVerified =
 				persisted !== undefined &&
-				canonicalJson(persisted.response) === canonicalJson(response) &&
+				canonicalJson(persisted.response) === canonicalJson(storedResponse) &&
 				canonicalJson(persisted.durableEffects) === canonicalJson(outcome.durableEffects) &&
 				canonicalJson(persisted.startupFailure) === canonicalJson(outcome.startupFailure);
 			if (!persistenceVerified) {

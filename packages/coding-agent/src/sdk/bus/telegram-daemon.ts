@@ -4433,6 +4433,12 @@ export class TelegramNotificationDaemon {
 			} else item.controller?.abort();
 			this.finishSelectedAck(item, { status: "unknown", reason: "shutdown" });
 		}
+		for (const item of this.pool.removeWhere(() => true)) {
+			if (item.payload.selectedAck)
+				this.finishSelectedAck(item.payload.selectedAck, { status: "unknown", reason: "shutdown" });
+			item.payload.btwDelivery?.finish("uncertain");
+			this.rejectRemovedPublication(item);
+		}
 		this.#stoppingBtw = true;
 		for (const delivery of this.#btwTerminalDeliveries.values()) {
 			delivery.invalidated = true;
@@ -4949,6 +4955,8 @@ export class TelegramNotificationDaemon {
 		await this.claimPublication(frame.publicationId);
 		const replayPending = session.replayPending;
 		await this.effects.admit(() => this.handleSessionMessage(session, frame.body, frame.publicationId));
+		if (frame.publicationId && this.publicationHasPendingWork(frame.publicationId))
+			await this.publicationSettlement(frame.publicationId).promise;
 		if (
 			!replayPending &&
 			!this.deferredPublications.has(frame.publicationId ?? "") &&
@@ -5528,7 +5536,7 @@ export class TelegramNotificationDaemon {
 			}
 			if (this.publicationTerminal(publicationId))
 				throw new Error("Telegram publication became terminal during provider dispatch admission.");
-			const result = await this.callBotApiClassified(method, body, callOpts);
+			const result = await this.callBotApiClassified(method, body, { ...callOpts, noRetry: true });
 			if (publicationId) this.publicationLastOutcomes.set(publicationId, result.outcome.kind);
 			return result;
 		}
@@ -11964,6 +11972,7 @@ export class TelegramNotificationDaemon {
 							await this.opts.control?.clear?.(this.opts.ownerId);
 						}
 						await this.persistTopics();
+						await this.presentationPersistenceQueue;
 						persisted = true;
 					});
 					const deadline = Promise.withResolvers<boolean>();

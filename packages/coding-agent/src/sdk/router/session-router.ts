@@ -110,7 +110,7 @@ function readSequence(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 ? value : undefined;
 }
 
-function fallbackCorrelation(frame: Record<string, unknown>): SessionRouterFrame {
+function fallbackCorrelation(frame: Record<string, unknown>): SessionRouterFrame | undefined {
 	const payload =
 		frame.type === "event" && frame.payload && typeof frame.payload === "object" && !Array.isArray(frame.payload)
 			? (frame.payload as Record<string, unknown>)
@@ -118,14 +118,19 @@ function fallbackCorrelation(frame: Record<string, unknown>): SessionRouterFrame
 	const readSession = (value: unknown): string | undefined =>
 		typeof value === "string" && value.length > 0 ? value : undefined;
 	const readName = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
-	const readIdentity = (key: "sessionId" | "generation"): string | number | undefined => {
-		const outer = frame[key] as string | number | undefined;
-		const inner = payload?.[key] as string | number | undefined;
-		if (outer !== undefined && inner !== undefined && outer !== inner) return undefined;
-		return outer !== undefined ? outer : inner;
-	};
-	const sessionId = readSession(readIdentity("sessionId"));
-	const generation = readGeneration(readIdentity("generation"));
+	const outerSession = frame.sessionId;
+	const innerSession = payload?.sessionId;
+	const outerGeneration = frame.generation;
+	const innerGeneration = payload?.generation;
+	if (outerSession !== undefined && innerSession !== undefined && outerSession !== innerSession) return undefined;
+	if (outerGeneration !== undefined && innerGeneration !== undefined && outerGeneration !== innerGeneration)
+		return undefined;
+	const sessionClaim = outerSession !== undefined ? outerSession : innerSession;
+	const generationClaim = outerGeneration !== undefined ? outerGeneration : innerGeneration;
+	const sessionId = readSession(sessionClaim);
+	const generation = readGeneration(generationClaim);
+	if (sessionClaim !== undefined && sessionId === undefined) return undefined;
+	if (generationClaim !== undefined && generation === undefined) return undefined;
 	const body = payload ?? frame;
 	return {
 		body,
@@ -584,6 +589,9 @@ export class SessionRouter {
 				const correlated = this.#correlateFrame(frame);
 				if (!correlated) return;
 				const seq = typeof frame.seq === "number" && Number.isSafeInteger(frame.seq) ? frame.seq : undefined;
+				if (correlated.sessionId !== undefined && correlated.sessionId !== attached.sessionId) return;
+				if (correlated.generation !== undefined && correlated.generation !== attached.generation) return;
+				if (seq !== undefined && correlated.generation === undefined) return;
 				const ownsSequence =
 					correlated.generation === attached.generation &&
 					(correlated.sessionId === undefined || correlated.sessionId === attached.sessionId);

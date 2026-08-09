@@ -147,8 +147,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 85 removes the obsolete pending-frame admission path entirely.
  * Generation 86 terminalizes queued selected acknowledgements during shutdown.
  * Generation 87 routes every run-loop exit through the publication stop boundary.
+ * Generation 88 rejects all queued publications before Router shutdown, disables
+ * implicit provider retries, and durably joins receipt persistence.
  */
-export const DAEMON_GENERATION = 87;
+export const DAEMON_GENERATION = 88;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -181,5 +183,6 @@ export const DAEMON_GENERATION = 87;
  * Epoch 32 removes identity-gated pending publication admission.
  * Epoch 33 requires selected-ack shutdown removal to settle publication state.
  * Epoch 34 requires control-file exits to terminalize queued publications first.
+ * Epoch 35 requires complete publication teardown and single-attempt dispatch.
  */
-export const SERVING_EPOCH = 34;
+export const SERVING_EPOCH = 35;

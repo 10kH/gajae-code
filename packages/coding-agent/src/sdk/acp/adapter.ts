@@ -41,6 +41,17 @@ export class AcpSdkAdapterError extends Error {
 	}
 }
 
+function credentialFreeLifecycleResult(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(credentialFreeLifecycleResult);
+	if (value === null || typeof value !== "object") return value;
+	const output: Record<string, unknown> = {};
+	for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+		if (key === "endpoint" || key === "token" || key === "url") continue;
+		output[key] = credentialFreeLifecycleResult(nested);
+	}
+	return output;
+}
+
 /**
  * Lifecycle failures the ACP MCP launch wrapper must report verbatim. Everything else
  * is re-attributed to the configured MCP servers, which is the useful answer for a
@@ -229,10 +240,11 @@ export class AcpSdkAdapter {
 		// request that named no readiness budget is queued for the default one, so it
 		// needs the same extension rather than the client's generic request deadline.
 		const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
-		return await this.#client.global(operation, input, {
+		const result = await this.#client.global(operation, input, {
 			idempotencyKey,
 			...(timeoutMs === undefined ? {} : { timeoutMs }),
 		});
+		return isLifecycleOperation(operation) ? credentialFreeLifecycleResult(result) : result;
 	}
 
 	async sdkControl(params: { operation: string; input?: JsonObject }): Promise<unknown> {
