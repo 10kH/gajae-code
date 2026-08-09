@@ -4752,8 +4752,7 @@ export class TelegramNotificationDaemon {
 	private botApiWithOutcomeCollector(outcomes: BotApiCallOutcome[], publicationId?: string): BotApi {
 		return {
 			call: async (method, body, callOpts) => {
-				await this.markPublicationAttempted(publicationId);
-				const result = await this.callBotApiClassified(method, body, callOpts);
+				const result = await this.callPublicationBotApiClassified(publicationId, method, body, callOpts);
 				const collectedOutcome =
 					result.outcome.kind === "accepted" && !hasAcceptedTelegramReceipt(method, result.response)
 						? ({ kind: "unknown" } as const)
@@ -5361,6 +5360,48 @@ export class TelegramNotificationDaemon {
 			this.publicationsClaimedThisRun.add(publicationId);
 			throw new Error("Telegram publication attempt persistence failed.", { cause: error });
 		}
+	}
+
+	private async restorePublicationQueued(publicationId: string | undefined): Promise<void> {
+		if (!publicationId) return;
+		const attemptedAt = this.ambiguousPublications.get(publicationId);
+		if (attemptedAt === undefined) return;
+		this.ambiguousPublications.delete(publicationId);
+		this.claimedPublications.set(publicationId, attemptedAt);
+		try {
+			await this.persistPublicationReceipts();
+		} catch (error) {
+			this.claimedPublications.delete(publicationId);
+			this.ambiguousPublications.set(publicationId, attemptedAt);
+			throw new Error("Telegram publication queued-state persistence failed.", { cause: error });
+		}
+	}
+
+	private async beginPublicationAttempt(publicationId: string | undefined): Promise<void> {
+		if (this.effects.stopping)
+			return await this.failPublicationPreSend(publicationId, "provider effects are stopping");
+		await this.markPublicationAttempted(publicationId);
+		if (this.effects.stopping) {
+			await this.restorePublicationQueued(publicationId);
+			return await this.failPublicationPreSend(publicationId, "provider effects stopped before dispatch");
+		}
+	}
+
+	private async callPublicationBotApiClassified(
+		publicationId: string | undefined,
+		method: string,
+		body: unknown,
+		callOpts?: { signal?: AbortSignal; noRetry?: boolean },
+	): Promise<BotApiCallResult> {
+		const cooldownActive = (): boolean =>
+			method !== "getUpdates" && (this.opts.now?.() ?? Date.now()) < this.botCooldownUntil;
+		if (cooldownActive()) return this.callBotApiClassified(method, body, callOpts);
+		await this.beginPublicationAttempt(publicationId);
+		if (cooldownActive()) {
+			await this.restorePublicationQueued(publicationId);
+			return this.callBotApiClassified(method, body, callOpts);
+		}
+		return this.callBotApiClassified(method, body, callOpts);
 	}
 
 	private async failPublicationPreSend(publicationId: string | undefined, reason: string): Promise<never> {
@@ -8109,11 +8150,12 @@ export class TelegramNotificationDaemon {
 					continue;
 				}
 				try {
-					await this.markPublicationAttempted(item.payload.publicationId);
-					const { response, outcome } = await this.callBotApiClassified("sendMessage", btwDelivery.body, {
-						noRetry: true,
-						signal: btwDelivery.signal,
-					});
+					const { response, outcome } = await this.callPublicationBotApiClassified(
+						item.payload.publicationId,
+						"sendMessage",
+						btwDelivery.body,
+						{ noRetry: true, signal: btwDelivery.signal },
+					);
 					if (outcome.kind === "retryable") {
 						const requeued = this.submitPool({
 							sessionId: item.sessionId,
@@ -8181,8 +8223,8 @@ export class TelegramNotificationDaemon {
 						this.pool.settle(item.itemId!, "rejected");
 						continue;
 					}
-					await this.markPublicationAttempted(item.payload.publicationId);
-					const { response, outcome } = await this.callBotApiClassified(
+					const { response, outcome } = await this.callPublicationBotApiClassified(
+						item.payload.publicationId,
 						"sendMessage",
 						{
 							chat_id: this.opts.chatId,
@@ -8992,7 +9034,7 @@ export class TelegramNotificationDaemon {
 		if (!this.#leaseTokenAllows(socketLease) || !this.topicLeaseIsCurrent(topicLease))
 			throw new Error("Telegram model selection publication authority became stale.");
 		try {
-			await this.markPublicationAttempted(publicationId);
+			await this.beginPublicationAttempt(publicationId);
 			const response = await this.botApi.call(
 				"sendMessage",
 				{
@@ -9152,6 +9194,8 @@ export class TelegramNotificationDaemon {
 			const replayState = [...(latestIdentity ? [latestIdentity] : []), ...latestActions.values()];
 			const replayCounts = new Map<string, number>();
 			for (const frame of replayState) {
+				const replayPublicationId = replayPublicationIds.get(frame);
+				if (this.publicationShouldSuppress(replayPublicationId)) continue;
 				const fingerprint = JSON.stringify(frame);
 				replayCounts.set(fingerprint, (replayCounts.get(fingerprint) ?? 0) + 1);
 				try {
@@ -9164,12 +9208,12 @@ export class TelegramNotificationDaemon {
 					this.dropSession(session, "replay_admission_failed");
 					return;
 				}
-				const replayPublicationId = replayPublicationIds.get(frame);
 				if (!this.deferredPublications.has(replayPublicationId ?? ""))
 					await this.markPublicationDelivered(replayPublicationId);
 			}
 			const queued = session.replayQueue.splice(0);
 			for (const queuedItem of queued) {
+				if (this.publicationShouldSuppress(queuedItem.publicationId)) continue;
 				const frame = queuedItem.frame;
 				if (
 					frame.type === "tool_activity" &&
@@ -9308,6 +9352,8 @@ export class TelegramNotificationDaemon {
 									? "This /btw question stopped because the GJC session closed or changed. Reopen it and try again."
 									: "This /btw question failed. Send it again to retry.";
 					try {
+						if (!isAuthoritative()) return;
+						await this.beginPublicationAttempt(publicationId);
 						const response = await this.#sendBtwMessage({
 							threadId: pending.threadId,
 							messageId: pending.messageId,
@@ -9339,7 +9385,7 @@ export class TelegramNotificationDaemon {
 				): Promise<"accepted" | "rejected" | "uncertain" | "stale"> => {
 					if (!isAuthoritative()) return "stale";
 					try {
-						await this.markPublicationAttempted(publicationId);
+						await this.beginPublicationAttempt(publicationId);
 						const response = await this.botApi.call(method, body, { noRetry: true, signal });
 						if (telegramMessageId(response) !== undefined) return "accepted";
 						if (response && typeof response === "object" && (response as { ok?: unknown }).ok === false)
@@ -9811,7 +9857,7 @@ export class TelegramNotificationDaemon {
 				// Rich (default on): promote to sendRichMessage with a top-level
 				// reply_markup (probe-confirmed). Any miss falls back to the HTML loop.
 				if (callbackDispatchAuthorityIsCurrent()) {
-					await this.markPublicationAttempted(publicationId);
+					await this.beginPublicationAttempt(publicationId);
 					const outcome = await deliverRichActionWithFallback(
 						this.botApi,
 						{
@@ -9841,7 +9887,7 @@ export class TelegramNotificationDaemon {
 				}
 			} else {
 				// Rich disabled: deliver through the HTML chunk path.
-				await this.markPublicationAttempted(publicationId);
+				await this.beginPublicationAttempt(publicationId);
 				messageId = await sendHtmlChunks();
 			}
 			const pendingActionIsCurrent = pendingAction !== undefined && session.pending.get(msg.id) === pendingAction;

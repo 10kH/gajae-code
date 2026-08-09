@@ -118,8 +118,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * only from positive Telegram message receipts.
  * Generation 70 separates queued claims from provider-attempt ambiguity so
  * pre-send work remains replayable after daemon restart.
+ * Generation 71 preserves queued state through cooldown/shutdown suppression and
+ * never converts replay-suppressed ambiguity into delivered confirmation.
  */
-export const DAEMON_GENERATION = 70;
+export const DAEMON_GENERATION = 71;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -135,5 +137,6 @@ export const DAEMON_GENERATION = 70;
  * Epoch 15 requires BTW shutdown to preserve Router replay authority.
  * Epoch 16 requires accepted-only settlement for special provider queues.
  * Epoch 17 requires durable queued/attempted/confirmed publication states.
+ * Epoch 18 requires suppression-aware attempt transitions and replay confirmation.
  */
-export const SERVING_EPOCH = 17;
+export const SERVING_EPOCH = 18;
