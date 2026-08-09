@@ -527,7 +527,41 @@ test("ACP fails closed for local-only startup flags while translating model and 
 test("ACP rejects unknown flags instead of silently ignoring them", () => {
 	const parsed = parseArgs(["--mpreset", "codex-medium", "--mpresett"]);
 	expect(parsed.unknownFlags).toEqual(new Map([["--mpresett", true]]));
-	expect(() => resolveAcpStartupOptions(parsed, {})).toThrow("Unsupported under SDK-backed ACP: extension flags");
+	expect(() => resolveAcpStartupOptions(parsed, {})).toThrow(
+		"Unsupported under SDK-backed ACP: unknown flags: --mpresett",
+	);
+});
+
+test("ACP accepts --no-extensions and still names every unsupported discovery flag", () => {
+	const accepted = parseArgs(["--no-extensions"]);
+	expect(accepted.unknownFlags.size).toBe(0);
+	expect(accepted.noExtensions).toBe(true);
+	expect(() => resolveAcpStartupOptions(accepted, {})).not.toThrow();
+
+	for (const [args, expectedFlag] of [
+		[["--no-skills"], "--no-skills"],
+		[["--skills", "git-*,docker"], "--skills"],
+		[["--skills", ",,"], "--skills"],
+		[["--skills", "git-*", "--skills", ",,"], "--skills"],
+	] as const) {
+		const parsed = parseArgs([...args]);
+		expect(parsed.unknownFlags.size).toBe(0);
+		expect(() => resolveAcpStartupOptions(parsed, {})).toThrow(`Unsupported under SDK-backed ACP: ${expectedFlag}`);
+	}
+});
+
+test("ACP rejects registered extension-loading flags by name", () => {
+	for (const args of [
+		["--extension", "/tmp/a.ts"],
+		["-e", "/tmp/a.ts"],
+	] as const) {
+		expect(() => resolveAcpStartupOptions(parseArgs([...args]), {})).toThrow(
+			"Unsupported under SDK-backed ACP: --extension",
+		);
+	}
+	expect(() => resolveAcpStartupOptions(parseArgs(["--hook", "/tmp/a.ts"]), {})).toThrow(
+		"Unsupported under SDK-backed ACP: --hook. Use ACP session configuration",
+	);
 });
 
 test("--default without --mpreset is a typed CLI parse error", () => {

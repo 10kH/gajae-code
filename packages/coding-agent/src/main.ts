@@ -258,7 +258,7 @@ export function resolveAcpStartupOptions(
 		...(parsed.providerSessionId ? ["--provider-session-id"] : []),
 		...(parsed.resume ? ["--resume"] : []),
 		...(parsed.sessionDir ? ["--session-dir"] : []),
-		...(parsed.skills?.length ? ["--skills"] : []),
+		...(parsed.skills !== undefined ? ["--skills"] : []),
 		...(parsed.slow ? ["--slow"] : []),
 		...(parsed.smol ? ["--smol"] : []),
 		...(parsed.plan ? ["--plan"] : []),
@@ -266,7 +266,7 @@ export function resolveAcpStartupOptions(
 		...(parsed.tmux ? ["--tmux"] : []),
 		...(parsed.tools?.length ? ["--tools"] : []),
 		...(parsed.extensions?.length ? ["--extension"] : []),
-		...(parsed.unknownFlags.size > 0 ? ["extension flags"] : []),
+		...(parsed.unknownFlags.size > 0 ? [`unknown flags: ${[...parsed.unknownFlags.keys()].join(" ")}`] : []),
 	];
 	if (unsupported.length > 0) {
 		throw new Error(
