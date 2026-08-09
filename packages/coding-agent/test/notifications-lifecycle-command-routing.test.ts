@@ -136,6 +136,26 @@ describe("Telegram lifecycle command routing", () => {
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
 
+	test("limits distinct session creates per Telegram actor without blocking idempotent retries", async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-rate-limit-"));
+		const { calls, service } = lifecycleHarness();
+		const telegram = bot();
+		const daemonInstance = daemon(agentDir, telegram.api, service, { count: 0 });
+		try {
+			await daemonInstance.handleTelegramUpdate(message("/session_create path /repo", 201));
+			await daemonInstance.handleTelegramUpdate(message("/session_create path /repo", 202));
+			await daemonInstance.handleTelegramUpdate(message("/session_create path /repo", 203));
+			await daemonInstance.handleTelegramUpdate(message("/session_create path /repo", 204));
+			expect(calls.filter(call => call.operation === "session.create").map(call => call.requestKey)).toEqual([
+				"telegram:42:201",
+				"telegram:42:202",
+				"telegram:42:203",
+			]);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	test("session_recent is provided by lifecycleService.listRecent and rendered without credentials", async () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-recent-"));
 		const { service, setRecent } = lifecycleHarness();

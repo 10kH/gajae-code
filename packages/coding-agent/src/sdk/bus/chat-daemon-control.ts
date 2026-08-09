@@ -73,8 +73,8 @@ export type ChatDaemonAction = "stop" | "reload";
  * generation 29 / slack generation 28 advance the replay cursor only after a frame is
  * published, so an owner at an earlier generation acknowledges an event before delivering
  * it and loses that event for good the first time a surface refuses it. Discord generation 30 /
- * slack generation 29 move lifecycle and attachment authority into SDK core, so an earlier
- * provider daemon cannot retain obsolete direct endpoint ownership.
+ * slack generation 29 move lifecycle and attachment authority into SDK core; generation 30 also
+ * isolates per-session Router attachment failures so one stale endpoint cannot block healthy sessions.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
 	discord: 30,

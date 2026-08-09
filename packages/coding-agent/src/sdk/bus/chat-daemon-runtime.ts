@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { SdkClientError } from "../client/client";
 import { SESSION_PREPARED_EVENT } from "../host/host";
 
+import type { SessionRouterDeps } from "../router";
+
 import { type SessionAttachment, SessionRouter, SessionRouterError, type SessionRouterFrame } from "../router";
 
 import { createDiscordAdapter, createSlackAdapter } from "./chat-adapters";
@@ -55,7 +57,7 @@ export interface ChatDaemonRuntimeDeps {
 	createSlackProvider?: (
 		config: NonNullable<ChatDaemonRuntimeConfig["notifications"]["slack"]>,
 	) => SlackProviderClient;
-	routerDeps?: import("../router").SessionRouterDeps;
+	routerDeps?: SessionRouterDeps;
 }
 
 /** The lifecycle signals that decide whether a chat root exists at all. */

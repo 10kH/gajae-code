@@ -1,7 +1,9 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
+
 import type { SessionIndex } from "../src/sdk/broker/session-index";
 import { type SessionAttachment, SessionRouter, type SessionRouterClient, SessionRouterError } from "../src/sdk/router";
 
@@ -81,6 +83,86 @@ async function routerFixture() {
 }
 
 describe("SessionRouter dispatch authority", () => {
+	test("contains an unreachable indexed endpoint while attaching healthy sessions", async () => {
+		const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-reconcile-"));
+		tempDirs.push(repo);
+		const agentDir = path.join(repo, ".gjc", "agent");
+		const stateRoot = path.join(repo, ".gjc", "state");
+		const endpointDir = path.join(stateRoot, "sdk");
+		fs.mkdirSync(endpointDir, { recursive: true });
+		const indexed = [
+			{
+				sessionId: "router-unreachable",
+				url: "ws://unreachable.test",
+				token: "unreachable-secret",
+			},
+			{
+				sessionId: "router-healthy",
+				url: "ws://healthy.test",
+				token: "healthy-secret",
+			},
+		] as const;
+		const endpointMtimeMs = new Map<string, number>();
+		for (const session of indexed) {
+			const endpointFile = path.join(endpointDir, `${session.sessionId}.json`);
+			fs.writeFileSync(endpointFile, `${JSON.stringify({ ...session, pid: 42 })}\n`);
+			endpointMtimeMs.set(session.sessionId, fs.statSync(endpointFile).mtimeMs);
+		}
+		const index = {
+			open: async () => {},
+			refresh: async () => {},
+			listSessions: () => ({
+				indexSeq: 1,
+				sessions: indexed.map(session => ({
+					sessionId: session.sessionId,
+					locator: { repo, stateRoot },
+					endpointGeneration: 1,
+					pid: 42,
+					endpointMtimeMs: endpointMtimeMs.get(session.sessionId),
+					live: true,
+					indexSeq: 1,
+				})),
+				warnings: [],
+			}),
+		} as unknown as SessionIndex;
+		const attachments: SessionAttachment[] = [];
+		const warnings: string[] = [];
+		const warnSpy = spyOn(logger, "warn").mockImplementation((message: string) => {
+			warnings.push(message);
+		});
+		const router = new SessionRouter({
+			agentDir,
+			deps: {
+				createIndex: () => index,
+				createClient: async endpoint => {
+					if (endpoint.url.includes("unreachable")) throw new Error(`connect failed with ${endpoint.token}`);
+					return {
+						onFrame: () => () => {},
+						request: async () => ({ events: [] }),
+						close: async () => {},
+						send: () => {},
+					};
+				},
+				onAttachment: attachment => {
+					attachments.push(attachment);
+				},
+				setInterval: (() => 0) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as unknown as typeof clearInterval,
+			},
+		});
+		try {
+			await router.start();
+			expect(router.isReady()).toBe(true);
+			expect(attachments.map(attachment => attachment.sessionId)).toEqual(["router-healthy"]);
+			expect(router.attachment("router-unreachable")).toBeNull();
+			expect(router.attachment("router-healthy")).not.toBeNull();
+			expect(warnings.some(message => message.includes("router-unreachable"))).toBe(true);
+			expect(warnings.every(message => !message.includes("unreachable-secret"))).toBe(true);
+		} finally {
+			await router.stop();
+			warnSpy.mockRestore();
+		}
+	});
 	test("revokes an old attachment at send time before the periodic reconciliation tick", async () => {
 		const fixture = await routerFixture();
 		const firstAttachment = fixture.attachments[0]!;

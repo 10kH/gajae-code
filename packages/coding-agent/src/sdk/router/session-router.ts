@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
-import path from "node:path";
+import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import type { IndexedSession, SessionIndex } from "../broker/session-index";
 import { SessionIndex as DefaultSessionIndex } from "../broker/session-index";
@@ -378,7 +378,26 @@ export class SessionRouter {
 				: [];
 		const liveIds = new Set(live.map(session => session.sessionId));
 		const attachedIds = new Set<string>();
-		for (const session of live) if (await this.#attach(session)) attachedIds.add(session.sessionId);
+		for (const session of live) {
+			try {
+				if (await this.#attach(session)) attachedIds.add(session.sessionId);
+			} catch {
+				const failed = this.#sessions.get(session.sessionId);
+				if (failed) {
+					this.#sessions.delete(session.sessionId);
+					failed.dispose();
+					await failed.client.close().catch(() => undefined);
+					try {
+						await this.#deps.onSessionRemoved?.(failed.capability);
+					} catch {
+						// A failed attachment is already revoked; provider cleanup is best effort.
+					}
+				}
+				logger.warn(
+					`SDK session attachment failed for indexed session ${session.sessionId} at generation ${session.endpointGeneration}; the endpoint remains unauthorized.`,
+				);
+			}
+		}
 		for (const [sessionId, attached] of this.#sessions) {
 			if (attachedIds.has(sessionId)) continue;
 			if (!liveIds.has(sessionId)) {

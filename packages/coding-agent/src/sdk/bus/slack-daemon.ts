@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { SdkClientError } from "../client/client";
-import type { SessionAttachment } from "../router";
+import { type SessionAttachment, SessionRouterError } from "../router";
 
 import type { ChatDeliveryError } from "./chat-daemon-runtime";
 import { ConversationStore } from "./conversation-store";
@@ -1104,7 +1104,7 @@ export class SlackNotificationDaemon {
 			}
 			await this.#withEffectLease(effect.id, lease, async () => {
 				if (!(await this.#inboundEffectCurrent(claim, effect.id))) throw new SlackStaleEffectError();
-				claim.endpoint.send(effect.payload);
+				await claim.endpoint.send(effect.payload);
 			});
 			if (!(await this.#inboundEffectCurrent(claim, effect.id))) {
 				await this.#terminalizeStaleInboundDispatch(claim.key, claim.receipt, "stale_binding");
@@ -2289,6 +2289,7 @@ export class SlackNotificationDaemon {
 	}
 	#isDefiniteSdkPreSendFailure(error: unknown): boolean {
 		if (error instanceof SlackEndpointBindingError) return true;
+		if (error instanceof SessionRouterError) return error.phase === "pre_send";
 		if (error instanceof SdkClientError) return error.code === "connection_closed";
 		return (
 			error instanceof Error &&

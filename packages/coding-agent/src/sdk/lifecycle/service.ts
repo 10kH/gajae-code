@@ -251,6 +251,21 @@ export type SessionLifecycleResult =
 	| SessionDeleteOutcome
 	| SessionListOutcome;
 
+/** Shared, side-effect-free validation for lifecycle mutation requests. */
+export type SessionLifecycleMutationValidation =
+	| {
+			readonly ok: true;
+			readonly operation: Exclude<SessionLifecycleOperation, "session.list">;
+			readonly actor: SessionLifecycleActor;
+			readonly requestKey: string;
+			readonly target: Readonly<Record<string, unknown>>;
+	  }
+	| SessionCreateFailure
+	| SessionForkFailure
+	| SessionResumeFailure
+	| SessionCloseFailure
+	| SessionDeleteFailure;
+
 const RETRYABLE_BROKER_ERRORS = new Set([
 	"unavailable",
 	"broker_restarting",
@@ -344,6 +359,29 @@ function validTarget(target: unknown): target is Readonly<Record<string, unknown
 	return isRecord(target);
 }
 
+/** Validates lifecycle authority and shape without contacting the Broker. */
+export function validateSessionLifecycleMutationRequest(request: unknown): SessionLifecycleMutationValidation {
+	const record = isRecord(request) ? request : {};
+	const operation = operationOf(record.operation);
+	if (operation === "session.list")
+		return failure("session.create", "terminal", "invalid_request", "lifecycle mutation operation is required");
+	if (!validActor(record.actor))
+		return failure(operation, "terminal", "unauthorized", "authenticated actor is required");
+	if (!validRequestKey(record.requestKey))
+		return failure(operation, "terminal", "invalid_request", "requestKey is required");
+	if (record.capability !== operation)
+		return failure(operation, "terminal", "capability_denied", `capability does not authorize ${operation}`);
+	if (!validTarget(record.target))
+		return failure(operation, "terminal", "invalid_request", "target must be an object");
+	return {
+		ok: true,
+		operation,
+		actor: record.actor,
+		requestKey: record.requestKey,
+		target: record.target,
+	};
+}
+
 function certaintyForBrokerCode(code: string): SessionLifecycleCertainty {
 	if (code === "terminal_uncertain") return "uncertain";
 	if (code === "cleanup_pending") return "cleanup_pending";
@@ -418,7 +456,7 @@ function brokerError(value: unknown): { code: string; message: string } | undefi
 	return { code: value.error.code, message: value.error.message };
 }
 
-function brokerErrorFromThrown(value: unknown): { code: string; message: string } | undefined {
+function brokerErrorFromThrown(value: unknown): { code: string; message: string; requestSent?: boolean } | undefined {
 	if (!isRecord(value)) return undefined;
 	const details = isRecord(value.details) ? value.details : undefined;
 	const code =
@@ -430,7 +468,25 @@ function brokerErrorFromThrown(value: unknown): { code: string; message: string 
 			: typeof value.message === "string"
 				? value.message
 				: "lifecycle broker request failed";
-	return { code, message };
+	const requestSent =
+		typeof details?.requestSent === "boolean"
+			? details.requestSent
+			: typeof value.requestSent === "boolean"
+				? value.requestSent
+				: undefined;
+	return { code, message, ...(requestSent === undefined ? {} : { requestSent }) };
+}
+
+const TRANSPORT_ERROR_CODES = new Set(["timeout", "connection_closed", "reconnect_exhausted", "unavailable"]);
+
+function certaintyForThrownError(error: {
+	readonly code: string;
+	readonly requestSent?: boolean;
+}): SessionLifecycleCertainty {
+	if (!TRANSPORT_ERROR_CODES.has(error.code)) return certaintyForBrokerCode(error.code);
+	if (error.requestSent === false) return "retryable";
+	if (error.requestSent === true || error.code === "connection_closed") return "uncertain";
+	return "retryable";
 }
 
 function brokerSuccess(value: unknown): unknown | undefined {
@@ -450,25 +506,10 @@ export class SessionLifecycleService {
 	): Promise<
 		SessionCreateOutcome | SessionForkOutcome | SessionResumeOutcome | SessionCloseOutcome | SessionDeleteOutcome
 	> {
-		const operation = operationOf((request as { operation?: unknown }).operation);
-		if (operation === "session.list")
-			return failure("session.create", "terminal", "invalid_request", "lifecycle mutation operation is required");
-		if (!validActor((request as { actor?: unknown }).actor))
-			return failure(operation, "terminal", "unauthorized", "authenticated actor is required");
-		if (!validRequestKey((request as { requestKey?: unknown }).requestKey))
-			return failure(operation, "terminal", "invalid_request", "requestKey is required");
-		if ((request as { capability?: unknown }).capability !== operation)
-			return failure(operation, "terminal", "capability_denied", `capability does not authorize ${operation}`);
-		const target = (request as { target?: unknown }).target;
-		if (!validTarget(target)) return failure(operation, "terminal", "invalid_request", "target must be an object");
-
-		const typedRequest = request as SessionLifecycleMutationRequest & { target: Readonly<Record<string, unknown>> };
-		const idempotencyKey = deriveSessionLifecycleIdempotencyKey(
-			typedRequest.actor,
-			typedRequest.requestKey,
-			operation,
-			target,
-		);
+		const validation = validateSessionLifecycleMutationRequest(request);
+		if (!validation.ok) return validation;
+		const { operation, actor, requestKey, target } = validation;
+		const idempotencyKey = deriveSessionLifecycleIdempotencyKey(actor, requestKey, operation, target);
 		let response: unknown;
 		try {
 			response = await this.#client.global(
@@ -476,13 +517,13 @@ export class SessionLifecycleService {
 				{ ...target },
 				{
 					idempotencyKey,
-					...(typedRequest.timeoutMs === undefined ? {} : { timeoutMs: typedRequest.timeoutMs }),
+					...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
 				},
 			);
 		} catch (thrown) {
 			const error = brokerError(thrown) ?? brokerErrorFromThrown(thrown);
 			return error
-				? failure(operation, certaintyForBrokerCode(error.code), error.code, error.message)
+				? failure(operation, certaintyForThrownError(error), error.code, error.message)
 				: failure(operation, "retryable", "unavailable", "lifecycle broker request was unavailable");
 		}
 
@@ -552,7 +593,7 @@ export class SessionLifecycleService {
 		} catch (thrown) {
 			const error = brokerError(thrown) ?? brokerErrorFromThrown(thrown);
 			return error
-				? failure("session.list", certaintyForBrokerCode(error.code), error.code, error.message)
+				? failure("session.list", certaintyForThrownError(error), error.code, error.message)
 				: failure("session.list", "retryable", "unavailable", "lifecycle broker request was unavailable");
 		}
 		const error = brokerError(response);

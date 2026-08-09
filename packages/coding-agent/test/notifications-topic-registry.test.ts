@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes SDK-owned generation 59 at serving epoch 6", () => {
+test("publishes delivery-safe generation 60 at serving epoch 7", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 59 / serving epoch 6: SDK-owned lifecycle and Router attachment authority.
-	expect(DAEMON_GENERATION).toBe(59);
-	expect(SERVING_EPOCH).toBe(6);
+	// Generation 60 / serving epoch 7: durable Router delivery receipts and acknowledged attachment dispatch.
+	expect(DAEMON_GENERATION).toBe(60);
+	expect(SERVING_EPOCH).toBe(7);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();

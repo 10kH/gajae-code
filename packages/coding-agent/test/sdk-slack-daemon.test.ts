@@ -10,7 +10,7 @@ import { SlackEndpointBindingError, SlackNotificationDaemon } from "../src/sdk/b
 import { SlackProviderError } from "../src/sdk/bus/slack-live-provider";
 import { SlackProvider, type SlackSocketEnvelope } from "../src/sdk/bus/slack-provider";
 import { SdkClientError } from "../src/sdk/client/client";
-import type { SessionAttachment } from "../src/sdk/router";
+import { type SessionAttachment, SessionRouterError } from "../src/sdk/router";
 
 class FakeSlack {
 	handler: ((envelope: SlackSocketEnvelope) => void | Promise<void>) | undefined;
@@ -158,7 +158,7 @@ async function withDaemon(
 	) => Promise<void>,
 	options: {
 		onCommand?: (sessionId: string, content: string) => Promise<boolean>;
-		attachmentSend?: (injected: Array<Record<string, unknown>>) => { send(frame: Record<string, unknown>): void };
+		attachmentSend?: (injected: Array<Record<string, unknown>>) => { send(frame: Record<string, unknown>): unknown };
 		authorizeActor?: ((actorId: string) => boolean | Promise<boolean>) | false;
 	} = {},
 ): Promise<void> {
@@ -180,8 +180,8 @@ async function withDaemon(
 			resolveAttachment: async sessionId => ({
 				...endpoint(sessionId, endpointGeneration),
 				send: (frame: Record<string, unknown>) => {
-					if (attachment) attachment.send(frame);
-					else injected.push(frame);
+					if (attachment) return attachment.send(frame);
+					injected.push(frame);
 				},
 			}),
 			onCommand: options.onCommand,
@@ -1478,6 +1478,47 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 						if (fail) {
 							fail = false;
 							throw new SdkClientError("connection_closed", "SDK unavailable before send");
+						}
+						injected.push(frame);
+					},
+				}),
+			},
+		);
+	});
+
+	it("awaits an async stale attachment rejection before journaling inbound success", async () => {
+		let sendAttempts = 0;
+		await withDaemon(
+			async (daemon, _fake, injected, _setEndpointGeneration, agentDir) => {
+				const root = await daemon.postRoot("session", "root");
+				await daemon.notify("session", "question", "action-1");
+				const inbound = messageEnvelope("first", "event-1", root.rootTs!, { clientMsgId: "interaction-1" });
+				const idempotencyKey = "slack:T1:C1:1.1:U1:event-1:interaction-1";
+				const effectId = "inbound:T1:C1:1.1:U1:event-1:interaction-1";
+				const journal = new ChatEffectJournal({ agentDir, transport: "slack" });
+
+				expect(await daemon.handleEnvelope(inbound)).toBe(false);
+				expect(await journal.read(effectId)).toMatchObject({
+					state: "accepted",
+					receipt: { status: "accepted" },
+				});
+				expect(injected).toEqual([]);
+
+				expect(await daemon.handleEnvelope({ ...inbound, envelope_id: "redelivery" })).toBe(true);
+				expect(sendAttempts).toBe(2);
+				expect(injected).toEqual([expect.objectContaining({ idempotencyKey })]);
+				expect(await journal.read(effectId)).toMatchObject({
+					state: "terminal",
+					receipt: { status: "sent" },
+				});
+			},
+			{
+				attachmentSend: injected => ({
+					async send(frame) {
+						sendAttempts++;
+						if (sendAttempts === 1) {
+							await Promise.resolve();
+							throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 						}
 						injected.push(frame);
 					},

@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
 import { SdkClient } from "../client/client";
 import { readSdkBrokerDiscovery } from "../client/discovery";
@@ -12,6 +13,7 @@ import {
 	type SessionLifecycleOperation,
 	SessionLifecycleService,
 	type SessionResumeOutcome,
+	validateSessionLifecycleMutationRequest,
 } from "./service";
 
 /** SDK-core broker client that keeps broker credentials inside the lifecycle boundary. */
@@ -33,14 +35,23 @@ export class AgentDirSessionLifecycleClient implements SessionLifecycleClient {
 		const client = await SdkClient.connect(discovery.url, discovery.token, {
 			...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
 		});
+		let result: unknown;
 		try {
-			return await client.global(operation, input, {
+			result = await client.global(operation, input, {
 				...(options.idempotencyKey === undefined ? {} : { idempotencyKey: options.idempotencyKey }),
 				...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
 			});
 		} finally {
-			await client.close();
+			try {
+				await client.close();
+			} catch (error) {
+				logger.warn("SDK lifecycle client cleanup failed", {
+					operation,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
 		}
+		return result;
 	}
 }
 
@@ -48,6 +59,32 @@ export type ExternalSessionCreateTarget =
 	| { readonly kind: "existing_path"; readonly path: string }
 	| { readonly kind: "worktree"; readonly repo: string; readonly branch: string }
 	| { readonly kind: "plain_dir"; readonly path: string };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validExternalSessionCreateTarget(value: unknown): value is ExternalSessionCreateTarget {
+	if (!isRecord(value) || typeof value.kind !== "string") return false;
+	if (value.kind === "plain_dir" || value.kind === "existing_path")
+		return typeof value.path === "string" && value.path.length > 0;
+	return (
+		value.kind === "worktree" &&
+		typeof value.repo === "string" &&
+		value.repo.length > 0 &&
+		typeof value.branch === "string" &&
+		value.branch.length > 0
+	);
+}
+
+function invalidExternalCreate(message: string): SessionCreateOutcome {
+	return {
+		ok: false,
+		operation: "session.create",
+		certainty: "terminal",
+		error: { code: "invalid_request", message },
+	};
+}
 
 export interface ExternalSessionResumeTarget {
 	readonly sessionIdOrPrefix: string;
@@ -79,22 +116,43 @@ export class AgentDirSessionLifecycleService extends SessionLifecycleService {
 		readonly modelPreset?: string;
 		readonly readinessTimeoutMs?: number;
 	}): Promise<SessionCreateOutcome> {
-		if (request.target.kind === "plain_dir") await fs.mkdir(request.target.path, { recursive: true });
-		const cwd = request.target.kind === "worktree" ? request.target.repo : request.target.path;
+		const rawRequest: Record<string, unknown> = isRecord(request) ? request : {};
+		const targetInput = rawRequest.target;
+		if (!validExternalSessionCreateTarget(targetInput))
+			return invalidExternalCreate("target must be a valid external create target");
+		const modelPreset = rawRequest.modelPreset;
+		if (modelPreset !== undefined && typeof modelPreset !== "string")
+			return invalidExternalCreate("modelPreset must be a string");
+		const readinessTimeoutMs = rawRequest.readinessTimeoutMs;
+		if (
+			readinessTimeoutMs !== undefined &&
+			(typeof readinessTimeoutMs !== "number" || !Number.isFinite(readinessTimeoutMs))
+		)
+			return invalidExternalCreate("readinessTimeoutMs must be a finite number");
+
+		const cwd = targetInput.kind === "worktree" ? targetInput.repo : targetInput.path;
+		const target = {
+			cwd,
+			stateRoot: path.join(path.resolve(cwd), ".gjc", "state"),
+			...(targetInput.kind === "worktree" ? { worktree: { enabled: true as const, name: targetInput.branch } } : {}),
+			...(modelPreset === undefined ? {} : { modelPreset }),
+			...(readinessTimeoutMs === undefined ? {} : { readinessTimeoutMs }),
+		};
+		const validation = validateSessionLifecycleMutationRequest({
+			operation: "session.create",
+			actor: rawRequest.actor,
+			capability: rawRequest.capability,
+			requestKey: rawRequest.requestKey,
+			target,
+		});
+		if (!validation.ok) return validation as SessionCreateOutcome;
+		if (targetInput.kind === "plain_dir") await fs.mkdir(targetInput.path, { recursive: true });
 		return await this.create({
-			actor: request.actor,
-			capability: request.capability,
-			requestKey: request.requestKey,
-			target: {
-				cwd,
-				stateRoot: path.join(path.resolve(cwd), ".gjc", "state"),
-				...(request.target.kind === "worktree"
-					? { worktree: { enabled: true as const, name: request.target.branch } }
-					: {}),
-				...(request.modelPreset === undefined ? {} : { modelPreset: request.modelPreset }),
-				...(request.readinessTimeoutMs === undefined ? {} : { readinessTimeoutMs: request.readinessTimeoutMs }),
-			},
-			...(request.readinessTimeoutMs === undefined ? {} : { timeoutMs: request.readinessTimeoutMs + 1_000 }),
+			actor: validation.actor,
+			capability: "session.create",
+			requestKey: validation.requestKey,
+			target,
+			...(readinessTimeoutMs === undefined ? {} : { timeoutMs: readinessTimeoutMs + 1_000 }),
 		});
 	}
 

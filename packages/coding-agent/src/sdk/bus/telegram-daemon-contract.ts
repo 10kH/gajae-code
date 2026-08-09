@@ -95,13 +95,15 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * the exact grace deadline when a failed archive publication rolls back.
  * Generation 59 moves lifecycle and attachment authority into SDK core,
  * removes provider root scanning and direct endpoint credentials, and rebuilds
- * Telegram presentation bindings from SessionRouter attachments.
+ * Telegram presentation bindings from SessionRouter attachments. Generation 60
+ * persists Router publication receipts, awaits inbound attachment dispatch,
+ * restores actor-scoped create throttling, and exact-unlinks ownership locks.
  */
-export const DAEMON_GENERATION = 59;
+export const DAEMON_GENERATION = 60;
 
 /**
- * Serving-compatibility boundary for daemon lifecycle requests. Epoch 6
- * requires the SDK-owned lifecycle and SessionRouter attachment contract, so
- * root-scanning epoch-5 daemons cannot keep serving across the cutover.
+ * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
+ * requires durable publication receipts and acknowledged attachment dispatch,
+ * so epoch-6 daemons cannot serve across the delivery-safety cutover.
  */
-export const SERVING_EPOCH = 6;
+export const SERVING_EPOCH = 7;

@@ -1,5 +1,13 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import * as brokerEnsure from "../src/sdk/broker/ensure";
+import { SdkClient } from "../src/sdk/client/client";
+import * as sdkDiscovery from "../src/sdk/client/discovery";
 import {
+	AgentDirSessionLifecycleClient,
+	AgentDirSessionLifecycleService,
 	deriveSessionLifecycleIdempotencyKey,
 	type SessionLifecycleClient,
 	type SessionLifecycleClientRequestOptions,
@@ -187,8 +195,80 @@ describe("SessionLifecycleService", () => {
 		});
 		expect(thrownResult).toMatchObject({ ok: false, certainty: "uncertain", error: { code: "terminal_uncertain" } });
 
+		for (const [details, certainty] of [
+			[{ requestSent: true, requestId: "sent-timeout" }, "uncertain"],
+			[{ requestSent: false, requestId: "pre-send-timeout" }, "retryable"],
+		] as const) {
+			const transport = serviceWith();
+			transport.client.failure = Object.assign(new Error("SDK request timed out"), {
+				code: "timeout",
+				details,
+			});
+			const outcome = await transport.service.create({
+				actor,
+				capability: "session.create",
+				requestKey: details.requestId,
+				target,
+			});
+			expect(outcome).toMatchObject({ ok: false, certainty, error: { code: "timeout" } });
+		}
+
+		const closed = serviceWith();
+		closed.client.failure = Object.assign(new Error("SDK connection closed"), { code: "connection_closed" });
+		const closedOutcome = await closed.service.create({
+			actor,
+			capability: "session.create",
+			requestKey: "ambiguous-connection",
+			target,
+		});
+		expect(closedOutcome).toMatchObject({ ok: false, certainty: "uncertain", error: { code: "connection_closed" } });
+
 		const malformed = serviceWith("not-a-broker-response");
 		const result = await malformed.service.list({ actor, capability: "session.list" });
 		expect(result).toMatchObject({ ok: false, certainty: "uncertain", error: { code: "malformed_response" } });
+	});
+
+	it("preserves a successful lifecycle result when SDK cleanup fails", async () => {
+		const ensureSpy = spyOn(brokerEnsure, "ensureBroker").mockResolvedValue({} as never);
+		const discoverySpy = spyOn(sdkDiscovery, "readSdkBrokerDiscovery").mockResolvedValue({
+			url: "ws://127.0.0.1:1",
+			token: "broker-token",
+		} as never);
+		const closeError = new Error("cleanup timed out");
+		const response = { ok: true, result: { sessionId: "session-1" } };
+		const fakeClient = {
+			global: async () => response,
+			close: async () => {
+				throw closeError;
+			},
+		} as unknown as SdkClient;
+		const connectSpy = spyOn(SdkClient, "connect").mockResolvedValue(fakeClient);
+		try {
+			const client = new AgentDirSessionLifecycleClient("/agent");
+			await expect(client.global("session.create", target, { idempotencyKey: "request-1" })).resolves.toEqual(
+				response,
+			);
+		} finally {
+			connectSpy.mockRestore();
+			discoverySpy.mockRestore();
+			ensureSpy.mockRestore();
+		}
+	});
+	it("does not create a plain_dir before lifecycle authority validation", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-lifecycle-"));
+		const requested = path.join(root, "unauthorized");
+		try {
+			const service = new AgentDirSessionLifecycleService(root);
+			const outcome = await service.createExternal({
+				actor: { id: "", namespace: actor.namespace },
+				capability: "session.create",
+				requestKey: "unauthorized-request",
+				target: { kind: "plain_dir", path: requested },
+			});
+			expect(outcome).toMatchObject({ ok: false, certainty: "terminal", error: { code: "unauthorized" } });
+			await expect(fs.stat(requested)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 });

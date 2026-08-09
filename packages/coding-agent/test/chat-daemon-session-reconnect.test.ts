@@ -537,13 +537,90 @@ async function awaitReplayRequests(host: FakeSessionHost, count: number): Promis
 	expect(host.replayRequests).toHaveLength(count);
 }
 
-test("an attached chat session reconnects on a budget that outlives the host heartbeat TTL", async () => {
+test("chat daemon startup isolates an unreachable indexed endpoint from a healthy attachment", async () => {
+	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-chat-reconcile-"));
+	let runtime: ChatDaemonRuntime | undefined;
+	const warnings: string[] = [];
+	const warnSpy = spyOn(logger, "warn").mockImplementation((message: string) => {
+		warnings.push(message);
+	});
+	try {
+		const stateRoot = path.join(agentDir, ".gjc", "state");
+		const endpointDir = path.join(stateRoot, "sdk");
+		await fs.mkdir(endpointDir, { recursive: true });
+		const sessions = [
+			{ sessionId: "chat-unreachable", url: "ws://unreachable.test/", token: "chat-unreachable-secret" },
+			{ sessionId: "chat-healthy", url: "ws://healthy.test/", token: "chat-healthy-secret" },
+		] as const;
+		const index = await new SessionIndex(agentDir).open();
+		for (const session of sessions) {
+			const endpointFile = path.join(endpointDir, `${session.sessionId}.json`);
+			await fs.writeFile(endpointFile, `${JSON.stringify({ ...session, pid: process.pid })}\n`);
+			const endpointMtimeMs = (await fs.stat(endpointFile)).mtimeMs;
+			await index.append({
+				type: "host_registered",
+				sessionId: session.sessionId,
+				locator: { repo: agentDir, stateRoot },
+				endpointGeneration: 1,
+				pid: process.pid,
+				endpointMtimeMs,
+			});
+		}
+		const provider = new FakeSlackProvider();
+		const attachedSessions: string[] = [];
+		runtime = new ChatDaemonRuntime(
+			{
+				kind: "slack",
+				agentDir,
+				config: {
+					identity: "test-identity",
+					notifications: {
+						slack: {
+							botToken: "xoxb-not-persisted",
+							appToken: "xapp-not-persisted",
+							workspaceId: "T1",
+							channelId: "C1",
+						},
+					},
+				},
+			},
+			{
+				createSlackProvider: () => provider,
+				routerDeps: {
+					createClient: async endpoint => {
+						if (endpoint.sessionId === "chat-unreachable")
+							throw new Error(`connect failed with ${endpoint.token}`);
+						attachedSessions.push(endpoint.sessionId);
+						return {
+							onFrame: () => () => {},
+							request: async () => ({ events: [] }),
+							close: async () => {},
+							send: () => {},
+						};
+					},
+					setInterval: (() => 0) as unknown as typeof setInterval,
+					clearInterval: (() => {}) as unknown as typeof clearInterval,
+				},
+			},
+		);
+		await runtime.start();
+		expect(runtime.transportHealthy()).toBe(true);
+		expect(attachedSessions).toEqual(["chat-healthy"]);
+		expect(warnings.some(message => message.includes("chat-unreachable"))).toBe(true);
+		expect(warnings.every(message => !message.includes("chat-unreachable-secret"))).toBe(true);
+	} finally {
+		await runtime?.stop();
+		warnSpy.mockRestore();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+test("an unreachable attached chat session exhausts its long-lived reconnect budget without blocking startup", async () => {
 	await withAttachedSessionRuntime(async ({ runtime }) => {
 		await withFakeTransport(async clock => {
 			const starting = runtime.start();
 			await awaitSocket(1);
 			const observed = await drainReconnects(clock);
-			await expect(starting).rejects.toMatchObject({ code: "reconnect_exhausted" });
+			await expect(starting).resolves.toBeUndefined();
 
 			// The attached-session client must follow the shared long-lived schedule,
 			// not the transport's one-shot defaults (3 attempts, 25/50/100ms = 175ms).

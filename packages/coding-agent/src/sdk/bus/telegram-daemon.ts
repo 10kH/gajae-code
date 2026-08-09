@@ -55,7 +55,13 @@ import type {
 	SessionLifecycleActor,
 	SessionResumeOutcome,
 } from "../lifecycle/service";
-import { type SessionAttachment, SessionRouter, type SessionRouterDeps } from "../router/session-router";
+import {
+	type SessionAttachment,
+	SessionRouter,
+	type SessionRouterDeps,
+	type SessionRouterFrame,
+} from "../router/session-router";
+
 import {
 	buildButtonGrid,
 	buildCompactChoiceGrid,
@@ -349,6 +355,24 @@ export const BTW_QUESTION_MAX_UTF8_BYTES = 16_384;
 const TELEGRAM_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024;
 const TELEGRAM_SESSION_ATTACHMENT_MAX_COUNT = 20;
 const TELEGRAM_SESSION_ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024;
+
+const TELEGRAM_PRESENTATION_STATE_VERSION = 1;
+const TELEGRAM_PRESENTATION_STATE_LIMIT = 4_096;
+const TELEGRAM_CREATE_RATE_LIMIT_MAX = 3;
+const TELEGRAM_CREATE_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1_000;
+
+type TelegramPresentationState = {
+	version: typeof TELEGRAM_PRESENTATION_STATE_VERSION;
+	delivered: Record<string, number>;
+};
+function publicationIdForEvent(sessionId: string, generation: unknown, event: unknown): string | undefined {
+	if (!Number.isSafeInteger(generation) || Number(generation) < 1) return undefined;
+	if (!event || typeof event !== "object" || Array.isArray(event)) return undefined;
+	const seq = (event as { seq?: unknown }).seq;
+	return Number.isSafeInteger(seq) && Number(seq) >= 1
+		? `${sessionId}:${Number(generation)}:${Number(seq)}`
+		: undefined;
+}
 const TELEGRAM_ATTACHMENT_DOWNLOAD_TIMEOUT_MS = 60_000;
 const TELEGRAM_PHOTO_MAX_BYTES = 10 * 1024 * 1024;
 const TELEGRAM_PHOTO_MAX_DIMENSION = 10_000;
@@ -1353,19 +1377,32 @@ function ownershipLockMatchesMetadata(lock: OwnershipLockRead, metadata: Ownersh
 	return lock.kind === "valid" && JSON.stringify(lock.metadata) === JSON.stringify(metadata);
 }
 
+/** Accept only an exact lock unlink or a typed retained cleanup with the canonical path gone. */
+async function exactUnlinkAcceptedWithRetainedEvidence(
+	fsImpl: TelegramDaemonFs,
+	file: string,
+	identity: NotificationEndpointFileIdentity,
+): Promise<boolean> {
+	if (!fsImpl.exactUnlink || !fsImpl.readEndpointFile) return false;
+	const removed = await fsImpl.exactUnlink(file, identity);
+	if (removed.ok) return true;
+	return (
+		removed.code === "cleanup_pending" &&
+		typeof removed.detachedPath === "string" &&
+		removed.detachedPath.length > 0 &&
+		(await fsImpl.readEndpointFile(file).catch(() => undefined)) === undefined
+	);
+}
+
 async function unlinkOwnershipLockExactly(
 	fsImpl: TelegramDaemonFs,
 	file: string,
 	expected: OwnershipLockRead,
 ): Promise<boolean> {
-	if (expected.kind === "missing" || !ownershipLockMatches(expected, await readOwnershipLock(fsImpl, file)))
-		return false;
-	try {
-		await fsImpl.unlink(file);
-	} catch {
-		return false;
-	}
-	return (await readOwnershipLock(fsImpl, file)).kind === "missing";
+	if (expected.kind === "missing" || !fsImpl.readEndpointFile || !fsImpl.exactUnlink) return false;
+	const endpoint = await fsImpl.readEndpointFile(file).catch(() => undefined);
+	if (!endpoint || !ownershipLockMatches(expected, await readOwnershipLock(fsImpl, file))) return false;
+	return await exactUnlinkAcceptedWithRetainedEvidence(fsImpl, file, endpoint.identity);
 }
 
 /**
@@ -3845,7 +3882,9 @@ interface AttachmentSession {
 	logicalSessionIdTrusted: boolean;
 	readonly attachment: SessionAttachment;
 	/** Opaque local identity used only to fence presentation state. */
-	readonly transport: { readyState: number; send(data: string): void; close(): void };
+
+	readonly transport: { readyState: number; send(data: string): Promise<void>; close(): void };
+
 	attachmentKey: string;
 	hostGeneration: number;
 	pending: Map<string, { sessionId: string; actionId: string }>;
@@ -3857,7 +3896,8 @@ interface AttachmentSession {
 	pingTimer: ReturnType<typeof setInterval> | undefined;
 	replayId: string;
 	replayPending: boolean;
-	replayQueue: Record<string, unknown>[];
+	replayQueue: Array<{ frame: Record<string, unknown>; publicationId?: string }>;
+
 	recoveryLease?: {
 		state: "pending" | "authorized" | "rejected";
 		logicalSessionId: string;
@@ -3936,6 +3976,7 @@ interface PendingThreadedFrame {
 	session: AttachmentSession;
 	socketLease?: { session: AttachmentSession; token: number; logicalSessionId: string };
 	toolActivity?: ToolActivityOwner;
+	publicationId?: string;
 }
 
 type SelectedAckOutcome =
@@ -4031,6 +4072,7 @@ interface TelegramQueuePayload {
 	topicLease?: TopicAuthorityLease;
 	/** Immutable owner lease captured when the work was admitted. */
 	socketLease?: { session: AttachmentSession; token: number; logicalSessionId: string };
+	publicationId?: string;
 	selectedAck?: SelectedAckQueueItem;
 	btwDelivery?: BtwQueuedDelivery;
 	toolActivity?: ToolActivityOwner;
@@ -4213,6 +4255,11 @@ export class TelegramNotificationDaemon {
 	private readonly droppedSessions = new WeakSet<AttachmentSession>();
 	private topicsPersistQueue: Promise<void> = Promise.resolve();
 	/** Serializes recovery compare/write/publish claims so competing endpoint migrations cannot durably diverge. */
+	/** Durable provider presentation identities; credentials and lifecycle state never enter this journal. */
+	private readonly deliveredPublications = new Map<string, number>();
+	private presentationPersistenceQueue: Promise<void> = Promise.resolve();
+	/** Provider-owned create admission window, keyed by the authorized Telegram actor. */
+	private readonly createRateLimitHits = new Map<string, Array<{ requestKey: string; at: number }>>();
 	private recoveryBindingClaimQueue: Promise<void> = Promise.resolve();
 	/** Durable compensation fences retry under supervision until persistence succeeds. */
 	private readonly compensationFenceRetries = new Map<string, Promise<void>>();
@@ -4353,6 +4400,26 @@ export class TelegramNotificationDaemon {
 		return `telegram:${this.opts.chatId}:${identity}`;
 	}
 
+	private admitSessionCreate(requestKey: string): boolean {
+		const actor = this.lifecycleActor();
+		const key = `${actor.namespace}:${actor.id}`;
+		const now = this.runtime.now();
+		const recent = (this.createRateLimitHits.get(key) ?? []).filter(
+			entry => now - entry.at < TELEGRAM_CREATE_RATE_LIMIT_WINDOW_MS,
+		);
+		if (recent.some(entry => entry.requestKey === requestKey)) {
+			this.createRateLimitHits.set(key, recent);
+			return true;
+		}
+		if (recent.length >= TELEGRAM_CREATE_RATE_LIMIT_MAX) {
+			this.createRateLimitHits.set(key, recent);
+			return false;
+		}
+		recent.push({ requestKey, at: now });
+		this.createRateLimitHits.set(key, recent);
+		return true;
+	}
+
 	private async runLifecycleCommand(
 		parsed:
 			| { kind: "create"; target: SessionCreateTarget; modelPreset?: string }
@@ -4361,7 +4428,18 @@ export class TelegramNotificationDaemon {
 		requestKey: string,
 	): Promise<SessionCreateOutcome | SessionCloseOutcome | SessionResumeOutcome | ExternalSessionResumeResult> {
 		const actor = this.lifecycleActor();
-		if (parsed.kind === "create")
+		if (parsed.kind === "create") {
+			if (!this.admitSessionCreate(requestKey)) {
+				return {
+					ok: false,
+					operation: "session.create",
+					certainty: "retryable",
+					error: {
+						code: "rate_limited",
+						message: "Telegram session creation is limited to 3 requests per 10 minutes.",
+					},
+				};
+			}
 			return this.lifecycleService.createExternal({
 				actor,
 				capability: "session.create",
@@ -4369,6 +4447,7 @@ export class TelegramNotificationDaemon {
 				target: parsed.target as ExternalSessionCreateTarget,
 				...(parsed.modelPreset === undefined ? {} : { modelPreset: parsed.modelPreset }),
 			});
+		}
 		if (parsed.kind === "close")
 			return this.lifecycleService.close({
 				actor,
@@ -4694,7 +4773,7 @@ export class TelegramNotificationDaemon {
 			deps: {
 				...opts.routerDeps,
 				onAttachment: attachment => this.#onAttachment(attachment),
-				onFrame: (attachment, frame) => this.#onRouterFrame(attachment, frame.body),
+				onFrame: (attachment, frame) => this.#onRouterFrame(attachment, frame),
 				onSessionRemoved: attachment => this.#onSessionRemoved(attachment),
 			},
 		});
@@ -4710,14 +4789,9 @@ export class TelegramNotificationDaemon {
 		return this.sessions.get(session.sessionId) === session && session.attachment.isCurrent();
 	}
 
-	#sendAttachment(session: AttachmentSession, frame: Record<string, unknown>): boolean {
-		if (!this.#attachmentIsCurrent(session)) return false;
-		try {
-			void Promise.resolve(session.attachment.send(frame)).catch(() => undefined);
-			return true;
-		} catch {
-			return false;
-		}
+	async #sendAttachment(session: AttachmentSession, frame: Record<string, unknown>): Promise<void> {
+		if (!this.#attachmentIsCurrent(session)) throw new Error("SDK session attachment is stale.");
+		await Promise.resolve(session.attachment.send(frame));
 	}
 
 	#onAttachment(attachment: SessionAttachment): void {
@@ -4725,8 +4799,9 @@ export class TelegramNotificationDaemon {
 			get readyState(): number {
 				return attachment.isCurrent() ? 1 : 3;
 			},
-			send: (data: string): void => {
-				void Promise.resolve(attachment.send(JSON.parse(data) as Record<string, unknown>)).catch(() => undefined);
+			send: async (data: string): Promise<void> => {
+				if (!attachment.isCurrent()) throw new Error("SDK session attachment is stale.");
+				await Promise.resolve(attachment.send(JSON.parse(data) as Record<string, unknown>));
 			},
 			close: (): void => {},
 		};
@@ -4739,13 +4814,14 @@ export class TelegramNotificationDaemon {
 			attachmentKey: crypto.randomUUID(),
 			hostGeneration: attachment.generation,
 			pending: new Map(),
-			capable: false,
-			ephemeralCapable: false,
+			capable: true,
+			ephemeralCapable: true,
+			toolActivityCapability: "v2",
 			lastPongAt: this.runtime.now(),
 			awaitingNonce: undefined,
 			pingTimer: undefined,
 			replayId: `telegram-router-replay:${attachment.sessionId}:${attachment.generation}`,
-			replayPending: false,
+			replayPending: true,
 			replayQueue: [],
 		};
 		const previous = this.sessions.get(session.sessionId);
@@ -4754,19 +4830,42 @@ export class TelegramNotificationDaemon {
 		this.#clearModelChoiceAliases(session.sessionId);
 		if (this.topics.get(session.sessionId)?.authorityState === "active")
 			this.preservedInitiatorTopics.add(session.sessionId);
-		this.#sendAttachment(session, {
-			type: "hello",
-			protocolVersion: NOTIFICATION_PROTOCOL_VERSION,
-			capabilities: [
-				CLIENT_PING_PONG_CAPABILITY,
-				ASK_CONTROLS_CAPABILITY,
-				ASK_SELECTED_ACK_CAPABILITY,
-				TOOL_ACTIVITY_CAPABILITY,
-				LEGACY_TOOL_ACTIVITY_CAPABILITY,
-				"ephemeral_turn_v1",
-			],
-		});
-		void this.#onRouterAttachmentReady(session);
+		void this.#initializeAttachment(session);
+	}
+
+	/**
+	 * Router reconciliation invokes onAttachment before its own replay request. The
+	 * attachment send itself waits for that reconciliation, so this handshake must
+	 * be scheduled rather than awaited here. The capability-bearing replay request
+	 * then asks the host for the gated frames that the Router's first request could
+	 * not see.
+	 */
+	async #initializeAttachment(session: AttachmentSession): Promise<void> {
+		try {
+			await this.#sendAttachment(session, {
+				type: "hello",
+				protocolVersion: NOTIFICATION_PROTOCOL_VERSION,
+				capabilities: [
+					CLIENT_PING_PONG_CAPABILITY,
+					ASK_CONTROLS_CAPABILITY,
+					ASK_SELECTED_ACK_CAPABILITY,
+					TOOL_ACTIVITY_CAPABILITY,
+					LEGACY_TOOL_ACTIVITY_CAPABILITY,
+					"ephemeral_turn_v1",
+				],
+			});
+			const cursor = this.topics.replayCursor(session.sessionId);
+			await this.#sendAttachment(session, {
+				type: "event_replay",
+				id: session.replayId,
+				sinceGeneration: cursor?.generation ?? session.hostGeneration,
+				sinceSeq: cursor?.seq ?? 0,
+				capabilities: [TOOL_ACTIVITY_CAPABILITY],
+			});
+		} catch (error) {
+			if (this.sessions.get(session.sessionId) === session)
+				logger.warn(`notifications: Telegram attachment handshake failed: ${sanitizeDiagnostic(String(error))}`);
+		}
 	}
 
 	async #onRouterAttachmentReady(session: AttachmentSession): Promise<void> {
@@ -4776,10 +4875,12 @@ export class TelegramNotificationDaemon {
 		if (lease?.topicId === topic.topicId) await this.flushPendingThreadedFrames(session.sessionId, lease);
 	}
 
-	async #onRouterFrame(attachment: SessionAttachment, msg: Record<string, unknown>): Promise<void> {
+	async #onRouterFrame(attachment: SessionAttachment, frame: SessionRouterFrame): Promise<void> {
 		const session = this.sessions.get(attachment.sessionId);
 		if (!session || session.attachment !== attachment || !attachment.isCurrent()) return;
-		await this.effects.admit(() => this.handleSessionMessage(session, msg));
+		const replayPending = session.replayPending;
+		await this.effects.admit(() => this.handleSessionMessage(session, frame.body, frame.publicationId));
+		if (!replayPending) await this.markPublicationDelivered(frame.publicationId);
 	}
 
 	async #onSessionRemoved(attachment: SessionAttachment): Promise<void> {
@@ -5075,6 +5176,67 @@ export class TelegramNotificationDaemon {
 					});
 				},
 			});
+	}
+
+	private presentationStatePath(): string {
+		return path.join(daemonPaths(this.opts.settings.getAgentDir()).dir, "telegram-presentation-state.json");
+	}
+
+	private publicationDelivered(publicationId: string | undefined): boolean {
+		return publicationId !== undefined && this.deliveredPublications.has(publicationId);
+	}
+
+	private async loadPresentationState(): Promise<void> {
+		if (this.validationMode()) return;
+		const raw = await readJson<unknown>(this.fsImpl, this.presentationStatePath());
+		if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+		const state = raw as Partial<TelegramPresentationState>;
+		if (
+			state.version !== TELEGRAM_PRESENTATION_STATE_VERSION ||
+			!state.delivered ||
+			typeof state.delivered !== "object"
+		)
+			return;
+		for (const [publicationId, timestamp] of Object.entries(state.delivered))
+			if (publicationId && typeof timestamp === "number" && Number.isFinite(timestamp))
+				this.deliveredPublications.set(publicationId, timestamp);
+		this.pruneDeliveredPublications();
+	}
+
+	private pruneDeliveredPublications(): void {
+		while (this.deliveredPublications.size > TELEGRAM_PRESENTATION_STATE_LIMIT) {
+			const oldest = [...this.deliveredPublications.entries()].sort((left, right) => left[1] - right[1])[0]?.[0];
+			if (oldest === undefined) return;
+			this.deliveredPublications.delete(oldest);
+		}
+	}
+
+	private async persistPresentationState(): Promise<void> {
+		if (this.validationMode()) return;
+		await ensureDir(this.fsImpl, daemonPaths(this.opts.settings.getAgentDir()).dir);
+		await writeJsonAtomic(
+			this.fsImpl,
+			this.presentationStatePath(),
+			{ version: TELEGRAM_PRESENTATION_STATE_VERSION, delivered: Object.fromEntries(this.deliveredPublications) },
+			{ durable: true },
+		);
+	}
+
+	private async markPublicationDelivered(publicationId: string | undefined): Promise<void> {
+		if (!publicationId || this.publicationDelivered(publicationId)) return;
+		this.deliveredPublications.set(publicationId, this.runtime.now());
+		this.pruneDeliveredPublications();
+		const pending = this.presentationPersistenceQueue.then(() => this.persistPresentationState());
+		this.presentationPersistenceQueue = pending.catch(() => undefined);
+		try {
+			await pending;
+		} catch (error) {
+			this.deliveredPublications.delete(publicationId);
+			logger.warn(
+				`notifications: Telegram presentation state persistence failed: ${sanitizeDiagnostic(String(error))}`,
+			);
+			throw error;
+		}
 	}
 
 	async loadAliases(): Promise<void> {
@@ -5457,15 +5619,15 @@ export class TelegramNotificationDaemon {
 				pending.generation !== session.hostGeneration
 			)
 				continue;
-			this.#sendPendingBtwTurn(session, requestId, pending);
+			void this.#sendPendingBtwTurn(session, requestId, pending);
 		}
 	}
-	#sendPendingBtwTurn(session: AttachmentSession, requestId: string, pending: PendingBtwTurn): boolean {
+	async #sendPendingBtwTurn(session: AttachmentSession, requestId: string, pending: PendingBtwTurn): Promise<boolean> {
 		if (!this.#leaseTokenAllows(pending.socketLease) || this.sessions.get(session.sessionId) !== session)
 			return false;
 		if (pending.dispatchedSocketLeaseToken === pending.socketLease.token) return true;
 		try {
-			session.transport.send(
+			await session.transport.send(
 				JSON.stringify({
 					type: "ephemeral_turn",
 					sessionId: pending.logicalSessionId,
@@ -6545,6 +6707,7 @@ export class TelegramNotificationDaemon {
 		topicLease: TopicAuthorityLease,
 		toolActivity?: ToolActivityOwner,
 		socketLease?: { session: AttachmentSession; token: number; logicalSessionId: string },
+		publicationId?: string,
 	): Promise<void> {
 		const legacyStart =
 			toolActivity?.phase === "started"
@@ -6573,6 +6736,7 @@ export class TelegramNotificationDaemon {
 			...(poolItemId !== undefined ? { itemId: poolItemId } : {}),
 			payload: {
 				send,
+				...(publicationId ? { publicationId } : {}),
 				topicLease,
 				...(socketLease ? { socketLease } : {}),
 				...(toolActivity ? { toolActivity } : {}),
@@ -8560,7 +8724,11 @@ export class TelegramNotificationDaemon {
 	}
 
 	/** Render successful `/model` lists as session-bound, one-shot inline choices. */
-	async #renderModelChoices(session: AttachmentSession, msg: Record<string, unknown>): Promise<boolean> {
+	async #renderModelChoices(
+		session: AttachmentSession,
+		msg: Record<string, unknown>,
+		publicationId?: string,
+	): Promise<boolean> {
 		const logicalSessionId =
 			!session.logicalSessionIdTrusted && typeof msg.sessionId === "string" && msg.sessionId.trim()
 				? msg.sessionId
@@ -8633,10 +8801,12 @@ export class TelegramNotificationDaemon {
 			logger.warn("notifications: failed to send model selection keyboard");
 			return false;
 		}
+		if (publicationId) await this.markPublicationDelivered(publicationId);
 		return true;
 	}
 
-	async handleSessionMessage(session: AttachmentSession, msg: any): Promise<void> {
+	async handleSessionMessage(session: AttachmentSession, msg: any, publicationId?: string): Promise<void> {
+		if (this.publicationDelivered(publicationId) && msg?.type !== "event_replay_result") return;
 		if (msg?.type === "hello") {
 			const capabilities = Array.isArray(msg.capabilities) ? msg.capabilities : [];
 			const previousToolActivityCapability = session.toolActivityCapability;
@@ -8653,13 +8823,11 @@ export class TelegramNotificationDaemon {
 			return;
 		}
 		if (session.replayPending) {
-			if (msg?.type === "tool_activity" && (this.opts.toolActivity?.enabled !== true || this.toolActivityStopping))
-				return;
 			const matchingReplay = msg?.type === "event_replay_result" && msg.id === session.replayId;
 			if (!matchingReplay) {
 				const frame = msg as Record<string, unknown>;
 				if (frame.type === "tool_activity") this.replayToolActivityEpochs.set(frame, this.toolActivityPolicyEpoch);
-				session.replayQueue.push(frame);
+				session.replayQueue.push({ frame, publicationId });
 				return;
 			}
 			const replayValid =
@@ -8680,6 +8848,14 @@ export class TelegramNotificationDaemon {
 					})
 				: [];
 			const identityFrames = replayed.filter(frame => frame.type === "identity_header");
+			const replayPublicationIds = new WeakMap<Record<string, unknown>, string>();
+			if (replayValid) {
+				for (const [index, event] of (msg.events as Record<string, unknown>[]).entries()) {
+					const frame = replayed[index];
+					const publicationId = publicationIdForEvent(session.sessionId, msg.generation, event);
+					if (frame && publicationId) replayPublicationIds.set(frame, publicationId);
+				}
+			}
 			const identities = identityFrames.flatMap(frame =>
 				typeof frame.sessionId === "string" && frame.sessionId.trim() ? [frame.sessionId] : [],
 			);
@@ -8756,7 +8932,7 @@ export class TelegramNotificationDaemon {
 				const fingerprint = JSON.stringify(frame);
 				replayCounts.set(fingerprint, (replayCounts.get(fingerprint) ?? 0) + 1);
 				try {
-					await this.handleSessionMessage(session, frame);
+					await this.handleSessionMessage(session, frame, replayPublicationIds.get(frame));
 				} catch (error) {
 					logger.warn(
 						`notifications: Telegram replay admission failed: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`,
@@ -8764,9 +8940,11 @@ export class TelegramNotificationDaemon {
 					this.dropSession(session, "replay_admission_failed");
 					return;
 				}
+				await this.markPublicationDelivered(replayPublicationIds.get(frame));
 			}
 			const queued = session.replayQueue.splice(0);
-			for (const frame of queued) {
+			for (const queuedItem of queued) {
+				const frame = queuedItem.frame;
 				if (
 					frame.type === "tool_activity" &&
 					this.replayToolActivityEpochs.get(frame) !== this.toolActivityPolicyEpoch
@@ -8777,10 +8955,13 @@ export class TelegramNotificationDaemon {
 				if (remaining > 0) {
 					if (remaining === 1) replayCounts.delete(fingerprint);
 					else replayCounts.set(fingerprint, remaining - 1);
+					await this.markPublicationDelivered(queuedItem.publicationId);
 					continue;
 				}
-				await this.handleSessionMessage(session, frame);
+				await this.handleSessionMessage(session, frame, queuedItem.publicationId);
+				await this.markPublicationDelivered(queuedItem.publicationId);
 			}
+			await this.#onRouterAttachmentReady(session);
 			this.#terminalizeBtwTurnsForGenerationChange(session);
 			this.#resumeBtwTurnsForSession(session);
 			const recoveredSessionId = this.#logicalSessionId(session);
@@ -8795,7 +8976,7 @@ export class TelegramNotificationDaemon {
 		if (msg && typeof msg === "object") await this.#updateLogicalSessionForThreadedFrame(session, msg);
 		if (session.logicalSessionIdTrusted && !this.#leaseAllows(session)) return;
 		if (await this.frameRouter.dispatch(session, msg as Record<string, unknown>)) return;
-		if (await this.#renderModelChoices(session, msg as Record<string, unknown>)) return;
+		if (await this.#renderModelChoices(session, msg as Record<string, unknown>, publicationId)) return;
 
 		if (msg?.type === "ephemeral_turn_result") {
 			const requestId = typeof msg.requestId === "string" ? msg.requestId : undefined;
@@ -9597,7 +9778,7 @@ export class TelegramNotificationDaemon {
 			return true;
 		}
 		try {
-			session.transport.send(
+			await session.transport.send(
 				JSON.stringify({
 					type: "control_command",
 					sessionId: route.sessionId,
@@ -10450,7 +10631,7 @@ export class TelegramNotificationDaemon {
 							else this.pendingThreadedFrames.set(sessionId, retained);
 						}
 						for (const session of this.sessions.values()) {
-							session.replayQueue = session.replayQueue.filter(frame => frame.type !== "tool_activity");
+							session.replayQueue = session.replayQueue.filter(item => item.frame.type !== "tool_activity");
 						}
 					}
 					// The policy flips before joining the serialized dispatch chain:
@@ -10788,7 +10969,7 @@ export class TelegramNotificationDaemon {
 							expiresAt: (this.opts.now?.() ?? Date.now()) + BTW_PENDING_TTL_MS,
 						};
 						this.#pendingBtwTurns.set(requestId, pending);
-						if (!this.#sendPendingBtwTurn(session, requestId, pending)) {
+						if (!(await this.#sendPendingBtwTurn(session, requestId, pending))) {
 							this.#pendingBtwTurns.delete(requestId);
 							await this.#sendBtwMessage({
 								threadId: inbound.threadId,
@@ -10828,7 +11009,7 @@ export class TelegramNotificationDaemon {
 							return;
 						}
 						if (!routeAllows()) return;
-						session.transport.send(
+						await session.transport.send(
 							JSON.stringify({
 								type: "control_command",
 								sessionId: this.#logicalSessionId(session),
@@ -10848,7 +11029,7 @@ export class TelegramNotificationDaemon {
 					const pendingAsk = cfg || hasMedia ? undefined : [...session.pending.values()].at(-1);
 					if (!routeAllows()) return;
 					if (pendingAsk) {
-						session.transport.send(
+						await session.transport.send(
 							JSON.stringify({
 								type: "reply",
 								id: pendingAsk.actionId,
@@ -10861,7 +11042,7 @@ export class TelegramNotificationDaemon {
 						return;
 					}
 					if (!routeAllows()) return;
-					session.transport.send(
+					await session.transport.send(
 						JSON.stringify(
 							cfg
 								? { type: "config_command", sessionId: inbound.sessionId, ...cfg }
@@ -10994,7 +11175,9 @@ export class TelegramNotificationDaemon {
 				await this.sendStaleGuidance(callbackId);
 				return;
 			}
-			session.transport.send(JSON.stringify({ type: "reply", id: decision.actionId, answer: decision.answer }));
+			await session.transport.send(
+				JSON.stringify({ type: "reply", id: decision.actionId, answer: decision.answer }),
+			);
 			await this.answerCallbackQueryBestEffort(callbackId);
 		} else if (decision.kind === "stale") {
 			await this.sendStaleGuidance(callbackId);
@@ -11097,6 +11280,7 @@ export class TelegramNotificationDaemon {
 			if (!this.validationMode()) {
 				await this.loadSeenUpdateIds();
 				await this.replyStore.load();
+				await this.loadPresentationState();
 			}
 			await this.attachmentRouter.start();
 			let idleSince = this.runtime.now();
