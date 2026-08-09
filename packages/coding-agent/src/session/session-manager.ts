@@ -6312,6 +6312,7 @@ export class SessionManager {
 	#flushed: boolean = false;
 	#needsFullRewriteOnNextPersist: boolean = false;
 	#readOnlyResume = false;
+	#resumedDraftConsumed = false;
 	#ensuredOnDisk: boolean = false;
 	#recoveryHydrationContext: RecoveryHydrationContext | undefined;
 	#recoveryPromotionTranscriptPath: string | undefined;
@@ -8518,6 +8519,8 @@ export class SessionManager {
 		this.#flushed = stage.flushed;
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#ensuredOnDisk = stage.flushed;
+		this.#readOnlyResume = false;
+		this.#resumedDraftConsumed = false;
 
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
@@ -13360,6 +13363,10 @@ export class SessionManager {
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#flushed = stage.persistsToExistingFile;
 		this.#ensuredOnDisk = stage.persistsToExistingFile;
+		if (stage.persistsToExistingFile && this.#readOnlyResume && this.#sessionFile) {
+			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			this.#readOnlyResume = false;
+		}
 		if (!stage.boundedCold) {
 			this.#commitResidentTextStoreTransition(transition);
 			return { kind: "promoted" };
@@ -14262,7 +14269,14 @@ export class SessionManager {
 	async saveDraft(text: string): Promise<void> {
 		if (this.destination.kind === "managed") {
 			if (text.length === 0) {
-				await this.#getManagedDraftStore()?.remove("draft.txt");
+				const store = this.#getManagedDraftStore();
+				if (!store) return;
+				const removedDraft = await store.consume("draft.txt");
+				if (this.#readOnlyResume && this.#sessionFile && (removedDraft !== null || this.#resumedDraftConsumed)) {
+					writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+					this.#readOnlyResume = false;
+					this.#resumedDraftConsumed = false;
+				}
 				return;
 			}
 			// Force the session header onto disk so resume can find the file we are
@@ -14273,15 +14287,26 @@ export class SessionManager {
 			const store = this.#getManagedDraftStore();
 			if (!store) return;
 			await store.replace("draft.txt", Buffer.from(text, "utf8"));
+			if (this.#readOnlyResume && this.#sessionFile) {
+				writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+				this.#readOnlyResume = false;
+			}
 			return;
 		}
 		const draftPath = this.#getDraftPath();
 		if (!draftPath || !this.persist) return;
 		if (text.length === 0) {
+			let removedDraft = false;
 			try {
 				await this.storage.unlink(draftPath);
+				removedDraft = true;
 			} catch (err) {
 				if (!isEnoent(err)) throw err;
+			}
+			if (this.#readOnlyResume && this.#sessionFile && (removedDraft || this.#resumedDraftConsumed)) {
+				writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+				this.#readOnlyResume = false;
+				this.#resumedDraftConsumed = false;
 			}
 			return;
 		}
@@ -14293,6 +14318,10 @@ export class SessionManager {
 		const artifactManager = this.#getOrCreateArtifactManager();
 		if (!artifactManager) return;
 		await artifactManager.replaceNamed("draft.txt", text);
+		if (this.#readOnlyResume && this.#sessionFile) {
+			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			this.#readOnlyResume = false;
+		}
 	}
 
 	/**
@@ -14303,6 +14332,7 @@ export class SessionManager {
 	async consumeDraft(): Promise<string | null> {
 		if (this.destination.kind === "managed") {
 			const draft = await this.#getManagedDraftStore()?.consume("draft.txt");
+			if (draft && this.#readOnlyResume) this.#resumedDraftConsumed = true;
 			return draft ? Buffer.from(draft).toString("utf8") : null;
 		}
 		const draftPath = this.#getDraftPath();
@@ -14319,6 +14349,7 @@ export class SessionManager {
 		} catch (err) {
 			if (!isEnoent(err)) throw err;
 		}
+		if (this.#readOnlyResume) this.#resumedDraftConsumed = true;
 		return text;
 	}
 
@@ -14976,6 +15007,10 @@ export class SessionManager {
 		this.#assertRecoveryHydrationWritable();
 		if (!this.persist || !this.#sessionFile) return;
 		await this.#rewriteFile();
+		if (this.#readOnlyResume) {
+			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			this.#readOnlyResume = false;
+		}
 	}
 
 	/**
