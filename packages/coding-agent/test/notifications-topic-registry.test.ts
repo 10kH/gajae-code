@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes fail-closed generation 88 at serving epoch 35", () => {
+test("publishes stop-race generation 89 at serving epoch 36", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 88 / serving epoch 35: queued publication teardown is durable and single-attempt.
-	expect(DAEMON_GENERATION).toBe(88);
-	expect(SERVING_EPOCH).toBe(35);
+	// Generation 89 / serving epoch 36: pool submission is rejected immediately after stop.
+	expect(DAEMON_GENERATION).toBe(89);
+	expect(SERVING_EPOCH).toBe(36);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();

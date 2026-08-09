@@ -8240,7 +8240,7 @@ export class TelegramNotificationDaemon {
 		this.markPublicationRejected(publicationId).catch(() => undefined);
 	}
 	private submitPool(item: Parameters<RateLimitPool<TelegramQueuePayload>["submit"]>[0]): boolean {
-		if (this.effects.stopping) return false;
+		if (this.stopRequested || this.effects.stopping) return false;
 		this.pool.submit(item);
 		return true;
 	}
