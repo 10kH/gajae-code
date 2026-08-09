@@ -8056,32 +8056,32 @@ export class TelegramNotificationDaemon {
 					continue;
 				}
 				try {
-					const { outcome } = await this.callBotApiClassified("sendMessage", btwDelivery.body, {
+					const { response, outcome } = await this.callBotApiClassified("sendMessage", btwDelivery.body, {
 						noRetry: true,
 						signal: btwDelivery.signal,
 					});
 					if (outcome.kind === "retryable") {
-						this.submitPool({
+						const requeued = this.submitPool({
 							sessionId: item.sessionId,
 							lane: item.lane,
 							coalesceKey: item.coalesceKey,
 							deadlineAt: item.deadlineAt,
 							payload: item.payload,
 						});
+						if (!requeued) btwDelivery.finish("uncertain");
 						this.pool.settle(item.itemId!, "ambiguous");
 						continue;
 					}
-					btwDelivery.finish(
-						outcome.kind === "accepted"
-							? "accepted"
-							: outcome.kind === "rejected"
-								? "not_delivered"
-								: "uncertain",
-					);
+					const delivered = outcome.kind === "accepted" && telegramMessageId(response) !== undefined;
+					btwDelivery.finish(delivered ? "accepted" : outcome.kind === "rejected" ? "not_delivered" : "uncertain");
 					this.pool.settle(
 						item.itemId!,
-						outcome.kind === "accepted" ? "accepted" : outcome.kind === "rejected" ? "rejected" : "ambiguous",
+						delivered ? "accepted" : outcome.kind === "rejected" ? "rejected" : "ambiguous",
 					);
+					if (delivered && item.payload.publicationId) {
+						await this.markPublicationDelivered(item.payload.publicationId);
+						this.deferredPublications.delete(item.payload.publicationId);
+					}
 				} catch {
 					btwDelivery.finish("uncertain");
 					this.pool.settle(item.itemId!, "ambiguous");
@@ -8157,14 +8157,17 @@ export class TelegramNotificationDaemon {
 						}
 						continue;
 					}
-					const typedResponse = response as { ok?: unknown; result?: { message_id?: unknown } } | undefined;
-					const messageId = typedResponse?.result?.message_id;
-					const delivered = typedResponse?.ok === true && typeof messageId === "number";
+					const messageId = telegramMessageId(response);
+					const delivered = messageId !== undefined;
 					this.finishSelectedAck(
 						selectedAck,
 						delivered ? { status: "delivered", messageId } : { status: "failed", reason: "telegram_rejected" },
 					);
 					this.pool.settle(item.itemId!, delivered ? "accepted" : "rejected");
+					if (delivered && item.payload.publicationId) {
+						await this.markPublicationDelivered(item.payload.publicationId);
+						this.deferredPublications.delete(item.payload.publicationId);
+					}
 				} catch {
 					this.finishSelectedAck(selectedAck, { status: "unknown", reason: "transport_ambiguous" });
 					this.pool.settle(item.itemId!, "ambiguous");
