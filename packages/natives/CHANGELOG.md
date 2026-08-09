@@ -2,10 +2,13 @@
 
 ## [Unreleased]
 
+### Removed
+
+- Removed the obsolete `NotificationControlServer` N-API surface. Session lifecycle mutations now enter the coding-agent SDK Broker path instead of a provider-owned native control endpoint.
+
 ## [0.12.21] - 2026-08-09
 
 ## [0.12.20] - 2026-08-09
-
 ## [0.12.19] - 2026-08-08
 
 ## [0.12.18] - 2026-08-08

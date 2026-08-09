@@ -631,7 +631,7 @@ setup fails closed without saving or exposing the raw token.
 
 Configuration completeness, provider-local quarantine, durable desired intent, effective enablement, runtime readiness, and delivery outcomes are separate contracts. The global `notifications.enabled` master never erases provider credentials or desired flags. `/settings` edits secrets through explicit `keep`, `replace`, or `remove` actions, commits only the selected provider in one CAS batch, and reports post-commit observer or activation failures without pretending the durable save rolled back. Malformed provider-local values are quarantined for explicit repair while safe sibling providers remain usable; malformed global notification structure remains fail-closed.
 
-`GJC_NOTIFICATIONS=0` suppresses only automatic generic current-session admission. Explicit `/notify on` can opt the current session back in without mutating durable provider state, and direct provider APIs remain governed by provider effectiveness and their own runtime readiness. If Telegram ownership is proven foreign while Discord or Slack is effective, GJC publishes the chat daemon endpoint under the isolated `.gjc/state/chat/sdk/` discovery path; the blocked Telegram scanner never receives the shared endpoint token.
+`GJC_NOTIFICATIONS=0` suppresses only automatic generic current-session admission. Explicit `/notify on` can opt the current session back in without mutating durable provider state, and direct provider APIs remain governed by provider effectiveness and their own runtime readiness. Telegram, Discord, and Slack attachments are reconstructed through `SessionRouter`; no provider receives the shared endpoint token.
 
 - [Telegram notification onboarding](./telegram-onboarding.md) documents
   `gjc notify setup` and private-chat pairing.
@@ -644,35 +644,29 @@ Configuration completeness, provider-local quarantine, durable desired intent, e
 
 `gjc notify status` reports provider completeness, repair/quarantine state, desired intent, effective enablement, and masked tokens. Destination identifiers remain visible and may be sensitive. The Discord and Slack setup commands are non-interactive and require their documented identifier and token flags; supply secrets through an approved local mechanism, not examples, committed files, shell history, logs, or chat. `gjc notify health --provider <provider> --probe` performs a provider-owned REST diagnostic even when complete credentials are intentionally inactive, while `gjc notify test --provider <provider>` additionally requires effective enablement and runtime readiness.
 
-The daemon/session engine is shared. Session discovery, WebSocket protocol,
-redaction decisions, rate-limit pooling, reply routing, singleton ownership, and
-lifecycle control are not reimplemented by each chat surface. Telegram, Discord,
-and Slack adapters are thin presentation layers: they render internal notification
-events into transport payloads and map transport interactions back to `{sessionId,
-actionId,answer}` replies.
+Session lifecycle and attachment routing are SDK-core services shared by every
+chat provider. `SessionLifecycleService` authorizes typed create, fork, resume,
+close, delete, and list requests, derives the Broker idempotency identity, and
+projects credential-free outcomes. The Broker remains the only lifecycle
+executor and durable terminal authority.
 
-Discord maps a session to an archiveable thread; resume unarchives it or creates
-a replacement, and stale/superseded thread input fails closed. Slack maps a
-session to an immutable root thread; resume creates a new root, acknowledges all
-Socket Mode envelopes immediately, and does not persist a Socket Mode cursor.
+`SessionRouter` consumes the Broker `SessionIndex`, resolves exact endpoint
+authority, retains endpoint credentials and SDK clients, and owns replay,
+reconnect, rotation, and stale-attachment revocation. Telegram, Discord, and
+Slack receive only opaque current-generation attachments. Provider daemons own
+transport leases, cursors, rate limits, threads/topics/messages, presentation
+journals, and delivery receipts; they cannot read endpoint files or tokens,
+allocate SessionIds, or perform session process lifecycle effects.
 
-The Discord and Slack acceptance suites use fake providers only. They exercise
-provider failure, reconciliation, restart, dedupe, lifecycle, and reconnect paths
-without live credentials or live-provider end-to-end tests.
 
 ## Managed Telegram daemon (bundled reference client)
 
-GJC also ships a managed Telegram reference client for the common phone-notify
-workflow. It remains a client of the generic SDK: it scans session discovery
-files, opens each session WebSocket, and routes Telegram replies back to the
-matching endpoint. Run `gjc notify setup` once to complete Telegram's interactive
-private-chat pairing flow.
+The managed Telegram client is a provider supervisor and presentation adapter.
+It owns the single `getUpdates` poller and Telegram topic state, while
+`SessionRouter` reconstructs SDK attachments from Broker state. A provider
+restart never creates, resumes, closes, or mutates a GJC session by itself.
 
-For Telegram forum topics, the daemon deletes the per-session topic when the local
-notification endpoint shuts down, so it disappears from the topic list. A resumed
-session creates a fresh topic before sending again. The bot must be allowed to
-delete messages in that chat; without that permission, deletion is best-effort and
-delivery continues.
+For Telegram forum topics, the daemon archives or deletes the presentation topic when `SessionRouter` retires the current attachment. A resumed session creates or rebinds a fresh current-generation topic before sending again. Topic cleanup is best-effort and cannot change the Broker lifecycle result.
 
 ### Singleton poller and trust model
 
@@ -803,98 +797,60 @@ By default it refuses to start when a fresh managed daemon already owns the same
 bot token for the same paired chat, because a second poller will cause Telegram
 409 conflicts. Use `--force` only for deliberate debugging when you have stopped
 or intentionally want to override the daemon guard.
-## Two client surfaces: per-session vs daemon-owned lifecycle control
+## Session lifecycle and attachment surfaces
 
-The SDK now exposes **two distinct surfaces**. Do not confuse them:
+SDK core exposes two related provider-neutral capabilities:
 
-1. **Per-session notification clients (the normal, documented contract above).**
-   A client discovers `<repo>/.gjc/state/sdk/<sessionId>.json`, connects
-   to that session's loopback WebSocket, and handles `action_needed`,
-   `action_resolved`, `reply_rejected`, and the optional threaded frames. This is
-   all an ordinary integration (Telegram, Discord, Slack, mobile, local tools)
-   needs. It requires **zero** upstream changes.
+1. **`SessionLifecycleService`** accepts an authenticated actor, an explicit
+   operation capability, a stable caller request key, and a typed target. It
+   derives one Broker idempotency key and invokes the canonical Broker lifecycle
+   operation. Results never expose endpoint URLs, tokens, process identities,
+   cleanup paths, or raw Broker receipts.
+2. **`SessionRouter`** owns live attachment discovery and transport. It validates
+   the exact indexed endpoint generation, keeps credentials and `SdkClient`
+   instances private, replays from the attachment cursor, reconnects after
+   rotation, and revokes stale capabilities. Provider-facing attachments expose
+   only `sessionId`, `generation`, `isCurrent()`, and `send()`.
 
-2. **The daemon-owned session *lifecycle* control endpoint (privileged).**
-   A separate, **session-independent**, loopback-only, authenticated control
-   endpoint that accepts `session_create` / `session_close` / `session_resume`
-   frames. It exists because creating a session cannot use a per-session socket
-   (none exists before the session does). It is **not** part of the normal
-   integration contract: ordinary clients never implement it. Only the bundled,
-   trusted daemon (e.g. the managed Telegram daemon) speaks it.
+There is no daemon-owned lifecycle control endpoint, provider lifecycle ledger,
+notification-root scanner, or provider-created SessionId. Telegram `/session_*`
+commands call the SDK lifecycle service directly. A Telegram update or topic
+reservation supplies the stable provider request identity; the Broker allocates
+the SessionId, and Telegram CAS-binds the returned opaque ID to its presentation
+mapping.
 
-### Lifecycle control endpoint
+### Lifecycle trust and recovery
 
-- **Discovery:** `<agentDir>/notifications/control.json` (daemon-owned, mode
-  `0600`), distinct from per-session endpoint files. It carries only non-secret
-  endpoint metadata (url/host/port/pid/owner). The control token is held **in
-  memory** by the daemon (the sole client) and is **never** written to disk.
-- **Auth and routing:** the loopback SDK broker requires
-  `?token=<control-token>` (HTTP `401` otherwise) and re-checks every
-  lifecycle frame's `token` (`unauthorized` on mismatch). It routes accepted
-  requests through the canonical SDK lifecycle operation.
-- **Frames:** `session_create` (target `existing_path` | `worktree` |
-  `plain_dir`), `session_close` (hard-kill, history preserved, recoverable),
-  `session_resume` (reattach if alive, else cold-restart from history); responses
-  `session_create_response` / `session_close_response` / `session_resume_response`
-  / `session_lifecycle_error`. The protocol also defines a replayable
-  `session_ready` per-session frame for readiness-gated creates; the current MVP
-  daemon replies once the tmux launch is requested (see the phone guide) rather
-  than waiting on it. Inline prompt text (`-- <prompt>`) is rejected in the MVP.
+- paired provider identity and operation capability are checked before the
+  Broker call;
+- retries reuse the same provider request key, so one request produces one
+  Broker ledger identity and at most one lifecycle effect;
+- `terminal_uncertain` remains uncertain and is reconciled from Broker ledger,
+  effect marker, process incarnation, endpoint/index, readiness, and exact
+  cleanup evidence only;
+- provider transport restart reloads cursor and presentation state, while the
+  Router reconstructs attachments from Broker state;
+- stale endpoint generations and attachments fail closed;
+- provider topic/thread/message cleanup cannot rewrite a confirmed lifecycle
+  outcome.
 
-### Trust model and hardening (daemon side)
-
-The control endpoint trusts the configured paired chat for any path (an accepted
-risk). It is hardened around that boundary:
-
-- **Strict paired-chat gating** — non-paired chats are rejected *before* any path
-  parsing, filesystem, or process action.
-- **Durable idempotency** — a locked, atomic, fsynced ledger keyed by
-  `chatId:updateId` + request hash (`telegram-lifecycle-idempotency.json`).
-  Duplicate updates never repeat side effects, including across daemon restart; a
-  duplicate while in-progress reports pending (never a second spawn); a same id
-  with a different body is `duplicate_conflict`; an effect failure is recorded
-  `terminal_uncertain` (never auto-respawned).
-- **Per-chat create rate limit.**
-- **Audit log** — append-only `telegram-lifecycle-audit.jsonl` (`0600`) recording
-  every accept/reject/duplicate/rate-limit/spawn/success/failure. Raw control
-  tokens and raw prompts are never logged (prompt hash + byte length only).
-- **Inline prompts rejected (MVP)** — `session_create` with `-- <prompt>` text is
-  rejected with usage; no prompt is ever placed in argv, audit, or responses. (A
-  redacted prompt-ref flow is reserved for a future revision.)
-- **GJC-managed-only close** — force-close re-reads the exact `@gjc-profile`
-  immediately before kill and requires the `@gjc-session-id` (and optional
-  `@gjc-session-state-file`) tag to match; it never touches non-GJC tmux.
-- **Recent-activity picker** — sessions are ranked by history-file mtime and
-  enriched with terminal breadcrumbs so the operator picks a recent repo/session
-  instead of typing raw paths. Ambiguous resumes fail closed with candidates.
 ### Phone test guide (create / close / resume from Telegram)
 
 End-to-end manual check once `gjc notify setup` has paired your private chat:
 
-1. **Pair + start.** Run `gjc notify setup` (BotFather token, DM the bot to pair).
-   Start any GJC session with notifications enabled so the daemon owner is
-   running (`gjc launch` in a repo, or `GJC_NOTIFICATIONS=1`). The owner starts
-   the loopback control endpoint and accepts `/session_*` while running; with zero
-   active sessions it still idle-exits after the inactivity timeout.
-2. **Create.** From your paired chat, pick `/session_create` from the Telegram
-   command menu or send `/session_create path <repo-dir>` (or
-   `/session_create worktree <repo> <branch>`, or `/session_create dir <newdir>`).
-   `<repo-dir>`, `<repo>`, and `<newdir>` may use `~`/`~/...` for your own home
-   directory; named-user forms such as `~alice/repo` are rejected. The bot replies
-   once the tmux launch is requested; the session shows up in `/session_recent`
-   once it is ready. (Inline prompts via `-- <text>` are rejected for now with
-   usage text.)
-3. **List.** `/session_recent` shows recent sessions (most-recent first) to copy
-   an id from.
-4. **Close.** `/session_close <sessionId>` hard-kills the GJC-managed session
-   (history is preserved); the bot confirms.
-5. **Resume.** `/session_resume <sessionId|prefix>` reattaches if it is still
-   alive, otherwise cold-restarts it from saved history. An ambiguous prefix
-   replies with the matching candidates instead of guessing.
+1. Run `gjc notify setup` and start or reload the Telegram provider supervisor.
+   The supervisor owns only the Telegram poller and presentation state.
+2. Send `/session_create path <repo-dir>`, `/session_create worktree <repo>
+   <branch>`, or `/session_create dir <newdir>`. The SDK lifecycle service submits
+   one canonical Broker create request; the bot reports the credential-free
+   outcome.
+3. `/session_recent` lists verified recent managed sessions.
+4. `/session_close <sessionId>` asks Broker lifecycle to close the exact managed
+   session and preserves history.
+5. `/session_resume <sessionId|prefix>` resolves verified managed history,
+   reattaches a live session or performs canonical Broker resume, and refuses
+   ambiguous prefixes.
 
-Commands are accepted **only** from the paired chat; **create** is rate-limited,
-and all lifecycle commands are idempotent per Telegram update id and audited (no
-tokens or prompts are logged).
-For an automated proof of the wire path without a real bot, see
-`packages/coding-agent/scripts/g011-daemon-path-smoke.ts` (real native control
-endpoint + loopback WebSocket).
+Commands are accepted only from the paired chat. Duplicate Telegram updates and
+replayed topic reservations reuse their original request identity; they never
+allocate or spawn a second session.

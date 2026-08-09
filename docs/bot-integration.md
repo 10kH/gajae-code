@@ -153,7 +153,7 @@ A stock session publishes readiness immediately, so a running chat daemon surfac
 
 A prepared session is live and endpoint-addressable but withholds its readiness signal, so no root is claimed. The response carries `session_id` and `state: "prepared"`, and `session_state.ready_for_input` is `false`. `prepare_existing_thread` refuses an initial `prompt`, and `gjc_coordinator_send_prompt` refuses the session with `session_not_activated` until it is activated.
 
-Preparation requires a configured, session-enabled Slack target in the selected workdir: that target plus the agent directory is what supplies the daemon-owned bind/activation authority. Without it the start fails closed with a lifecycle startup failure instead of returning a prepared session that could be activated before any thread is bound.
+Preparation requires a configured, session-enabled Slack target in the selected workdir. Slack owns the existing-thread presentation mapping, while `SessionRouter` supplies exact endpoint-generation proof and performs activation without exposing endpoint credentials. Without that combined authority the start fails closed with a lifecycle startup failure instead of returning a prepared session that could activate before any thread is bound.
 
 Bind the existing thread through the daemon-owned command path, which is the only writer of chat mappings:
 

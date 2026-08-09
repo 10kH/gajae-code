@@ -43,6 +43,13 @@
 - Bounded-memory cold-session disk offloading is rollout-ready behind the `sessionMemory` settings namespace. `sessionMemory.mode` (default `"shadow"`) selects `off`/`shadow`/`enabled`: shadow measures without changing observable session behavior, and canary/default-on remain release-channel decisions rather than user-facing enum values. Fixed implementation budgets preserve the ≤64 MiB steady-state guarantee; transcript v5 stays authoritative and derived `.spill.*` sidecars remain disposable. Context materialization uses the typed `SessionContextTooLargeError` preflight, while `sessionMemory.contextOverflowRecovery` independently controls the async compact-once recovery path.
 - Enabled explicit-path resumes validate descriptor-bound commit metadata, base/tail hashes, terminal proof, and hot-record digests before loading only the authenticated post-compaction tail. Fresh-process gates cover 120k compaction cycles, direct/captured forks, and one-million-record first build plus exact lazy reopen. Managed retained-authority startup remains on the eager compatibility path pending retained-authority range support.
 - Enabled canary sessions fail closed to shadow/eager behavior after repeated sidecar build failures or failed adoption, expose the live auto-disable reason through `/session`, and clear the session-local latch through the existing `off` rollback mode. Live `enabled` → `shadow`/`off` rollback keeps existing cold entries lazily readable for the current process; the next `off`-mode start ignores derived state and restores eager compatibility.
+### Changed
+
+- Session lifecycle and external attachments are now SDK-core authorities: `SessionLifecycleService` routes typed, capability-checked mutations through the canonical Broker ledger, and `SessionRouter` exclusively owns endpoint discovery, credentials, SDK clients, replay, reconnect, rotation, and stale-attachment revocation. Telegram, Discord, and Slack retain only provider transport and presentation state.
+
+### Removed
+
+- Removed Telegram's daemon-owned lifecycle control server, lifecycle ledger/orchestrator, SessionId preallocation, tmux/process lifecycle executor, and native lifecycle-control fallback. Provider retries now reuse one Broker idempotency identity, and topic reservations bind only the Broker-returned opaque SessionId.
 
 ## [0.12.19] - 2026-08-08
 

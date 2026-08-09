@@ -8,16 +8,19 @@ product.
 
 ## What you are setting up
 
-Gajae-Code notifications are a loopback WebSocket SDK plus a managed Telegram
-reference daemon:
+Gajae-Code notifications use the SDK session runtime, the global Broker index,
+and a managed Telegram provider supervisor:
 
-- each GJC session publishes a local notification endpoint under
-  `.gjc/state/sdk/<sessionId>.json`;
-- the managed Telegram daemon scans those endpoints, connects to them, and sends
-  action-needed events to the configured Telegram chat;
-- replies and inline button taps route back to the exact session/action through
-  the same notification protocol. When the configured chat supports Telegram
-  forum topics, each session is routed through its own topic.
+- each eligible GJC session registers its exact endpoint generation with the
+  Broker;
+- SDK-core `SessionRouter` resolves endpoint authority, keeps URL/token
+  credentials private, and presents only opaque current-generation attachments
+  to Telegram;
+- the Telegram supervisor owns `getUpdates`, rate limits, retries, topics,
+  messages, callbacks, and delivery receipts;
+- replies and inline button taps route through the Router attachment to the
+  exact session/action. In forum chats, each session is represented by its own
+  Telegram topic.
 
 The setup command stores global notification settings in your GJC agent config
 and later sessions auto-connect when notifications are enabled.
@@ -191,17 +194,19 @@ layer:
 Provider completeness, malformed-state quarantine, desired intent, effective enablement, runtime readiness, and delivery outcome are separate status dimensions. Telegram is complete when its bot token and private-chat id are valid; it is effective only when it is complete, not quarantined, desired on, and the global master is on. Provider-local malformed values are quarantined without erasing safe sibling values or secrets. Removing Telegram is adapter-local: it removes only Telegram credentials and sets Telegram desired intent off without changing `notifications.enabled` or any Discord/Slack state.
 
 
-Three lifecycle gates keep SDK hosting, setup, and managed delivery separate:
+Three gates keep SDK hosting, provider setup, and managed delivery separate:
 
 1. An eligible host receives the dormant notification control surface. `GJC_NOTIFY=off`,
    `0`, or `false` is a hard process opt-out; unsupported hosts and
    helper/subagent sessions are also ineligible.
-2. Every eligible top-level session hosts its local SDK endpoint by default,
-   independently of notification configuration. `GJC_SDK_DISABLE=1` opts out of
-   SDK hosting for that session.
-3. A managed Telegram daemon is ensured only for a complete global Telegram
-   configuration with managed delivery enabled. Discord-only, Slack-only, and
-   environment-only sessions do not start a Telegram daemon.
+2. Every eligible top-level session hosts its local SDK endpoint and registers
+   exact authority with the Broker by default, independently of notification
+   configuration. `GJC_SDK_DISABLE=1` opts out for that session. `SessionRouter`
+   alone reads the endpoint credential and manages replay/reconnect.
+3. A managed Telegram supervisor is ensured only for a complete global Telegram
+   configuration with managed delivery enabled. It reconstructs opaque
+   attachments from Broker state; Discord-only, Slack-only, and environment-only
+   sessions do not start a Telegram supervisor.
 
 Environment/session precedence for managed delivery is implemented in
 `packages/coding-agent/src/sdk/bus/config.ts`:
@@ -453,11 +458,12 @@ recovery removes only dead-owner artifacts and never touches a live owner.
 
 Check, in order:
 
-1. `gjc notify status` and confirm the selected provider is complete, not quarantined, desired on, and effective
+1. `gjc notify status` and confirm Telegram is complete, not quarantined, desired on, and effective
 2. the session has not run `/notify off`; when `GJC_NOTIFICATIONS=0` suppresses automatic admission, run `/notify on` explicitly
-3. the repo has `.gjc/state/sdk/<sessionId>.json`, or `.gjc/state/chat/sdk/<sessionId>.json` when a proven foreign Telegram owner is isolated while Discord/Slack remains effective
-4. the selected provider runtime is ready or attached
-5. the managed daemon state is fresh under the GJC agent notifications directory
+3. the Broker reports the session as live with a current endpoint generation
+4. the Telegram supervisor is ready and `SessionRouter` has reconstructed the attachment
+5. the provider owner state is fresh under the GJC agent notifications directory
 
-Do not paste endpoint discovery files into public issues; they contain the
-per-session WebSocket token needed by clients.
+Endpoint discovery records contain per-session credentials. They are SDK-core
+implementation details and must not be copied into provider state or public
+issues.
