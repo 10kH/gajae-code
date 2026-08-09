@@ -473,6 +473,10 @@ export interface SessionMemoryStats {
 	coldMutationPromotions: number;
 	hotOverflowTransitions: number;
 	labelDiskFallbackCount: number;
+	/** Shadow-mode eager-vs-sidecar parity mismatches observed at build time (AC10 telemetry). */
+	shadowParityMismatchCount: number;
+	/** Shadow-mode parity comparisons performed at build time (AC10 telemetry). */
+	shadowParityCheckCount: number;
 	transcriptGeneration: number;
 }
 
@@ -827,6 +831,10 @@ export interface SessionMemorySidecarRuntime {
 	coldMutationPromotions: number;
 	hotOverflowTransitions: number;
 	labelDiskFallbackCount: number;
+	/** Shadow-mode eager-vs-sidecar parity mismatches observed at build time (AC10 telemetry). */
+	shadowParityMismatchCount: number;
+	/** Shadow-mode parity comparisons performed at build time (AC10 telemetry). */
+	shadowParityCheckCount: number;
 	transcriptGeneration: number;
 }
 
@@ -9947,6 +9955,8 @@ export class SessionManager {
 			coldMutationPromotions: 0,
 			hotOverflowTransitions: 0,
 			labelDiskFallbackCount: 0,
+			shadowParityMismatchCount: 0,
+			shadowParityCheckCount: 0,
 			transcriptGeneration: 0,
 		};
 		this.#sidecarRuntime = runtime;
@@ -9998,6 +10008,9 @@ export class SessionManager {
 				runtime.blockCache.release(runtime.parentArtifact.chargedBytes);
 				runtime.parentArtifact = undefined;
 			}
+			if (this.#sessionMemoryMode === "shadow" && runtime?.enabled && !runtime.sidecarIneligible) {
+				this.#compareShadowParity(runtime);
+			}
 			if (runtime?.enabled && !runtime.sidecarIneligible) this.#consecutiveSidecarBuildFailures = 0;
 		} catch (error) {
 			this.#consecutiveSidecarBuildFailures++;
@@ -10024,6 +10037,36 @@ export class SessionManager {
 				error: toError(error).message,
 				consecutiveBuildFailures: this.#consecutiveSidecarBuildFailures,
 				autoDisabled: this.#sessionMemoryAutoDisabledReason !== undefined,
+			});
+		}
+	}
+
+	/**
+	 * Shadow-mode parity telemetry (AC10). After a successful shadow sidecar build,
+	 * compare the bounded reducer-derived surface against the authoritative eager
+	 * walk: the nearest model-change role (R1) and the provider message count. Any
+	 * mismatch increments the live mismatch counter and logs a rate-limited warning;
+	 * the sidecar is disposable, so the eager transcript remains authoritative.
+	 */
+	#compareShadowParity(runtime: SessionMemorySidecarRuntime): void {
+		const reducerRole = getReducerLastModelChangeRole(runtime.reducer);
+		const eagerRole = this.getLastModelChangeRole();
+		const providerCount = runtime.providerStateEntries.length;
+		const eagerContext = this.buildSessionContext();
+		const eagerMessageCount = eagerContext.messages.length;
+		runtime.shadowParityCheckCount++;
+		const mismatched =
+			reducerRole !== eagerRole ||
+			(eagerMessageCount > 0 && providerCount > eagerMessageCount) ||
+			(eagerMessageCount > 0 && providerCount === 0 && eagerMessageCount > 1);
+		if (mismatched) {
+			runtime.shadowParityMismatchCount++;
+			logger.warn("Session memory shadow parity mismatch", {
+				sessionFile: this.#sessionFile,
+				reducerRole,
+				eagerRole,
+				providerCount,
+				eagerMessageCount,
 			});
 		}
 	}
@@ -13395,6 +13438,8 @@ export class SessionManager {
 				coldMutationPromotions: 0,
 				hotOverflowTransitions: 0,
 				labelDiskFallbackCount: 0,
+				shadowParityMismatchCount: 0,
+				shadowParityCheckCount: 0,
 				transcriptGeneration: 0,
 			};
 		}
@@ -13435,6 +13480,8 @@ export class SessionManager {
 			coldMutationPromotions: runtime.coldMutationPromotions,
 			hotOverflowTransitions: runtime.hotOverflowTransitions,
 			labelDiskFallbackCount: runtime.labelDiskFallbackCount,
+			shadowParityMismatchCount: runtime.shadowParityMismatchCount,
+			shadowParityCheckCount: runtime.shadowParityCheckCount,
 			transcriptGeneration: runtime.transcriptGeneration,
 		};
 	}

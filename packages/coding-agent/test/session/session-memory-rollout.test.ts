@@ -58,6 +58,8 @@ describe("session memory rollout", () => {
 				role: shadow.getLastModelChangeRole(),
 			};
 			if (JSON.stringify(shadowEvidence) !== JSON.stringify(eagerEvidence)) mismatches++;
+			expect(shadow.getSessionMemoryStats().shadowParityMismatchCount).toBe(0);
+			expect(shadow.getSessionMemoryStats().shadowParityCheckCount).toBeGreaterThan(0);
 			expect(shadow.getSessionMemoryStats()).toMatchObject({
 				sidecarEnabled: true,
 				coldRetirementActive: false,

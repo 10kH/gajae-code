@@ -511,6 +511,9 @@ export class CommandController {
 			if (memory.labelDiskFallbackCount > 0) {
 				info += `${theme.fg("dim", "Label Disk Reads:")} ${memory.labelDiskFallbackCount}\n`;
 			}
+			if (memory.shadowParityCheckCount > 0) {
+				info += `${theme.fg("dim", "Shadow Parity:")} ${memory.shadowParityMismatchCount}/${memory.shadowParityCheckCount} mismatches\n`;
+			}
 			if (memory.autoDisabledReason) {
 				info += `${theme.fg("dim", "Auto-Disabled:")} ${theme.fg("warning", memory.autoDisabledReason)}\n`;
 			}
