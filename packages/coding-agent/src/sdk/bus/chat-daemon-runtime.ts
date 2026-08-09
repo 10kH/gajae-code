@@ -250,10 +250,7 @@ export class ChatDaemonRuntime {
 			correlateFrame,
 			deps: {
 				...deps.routerDeps,
-				onFrame: async (attachment, frame) => {
-					await this.#handleFrame(attachment, frame);
-					return "settled" as const;
-				},
+				onFrame: async (attachment, frame) => await this.#handleFrame(attachment, frame),
 				onAttachment: async attachment => this.#onAttachment(attachment),
 				onSessionRemoved: async attachment => await this.#close(attachment.sessionId),
 			},

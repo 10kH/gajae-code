@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes unified-dispatch generation 75 at serving epoch 22", () => {
+test("publishes terminal-state generation 76 at serving epoch 23", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 75 / serving epoch 22: direct effects share dispatch guards and queue identity.
-	expect(DAEMON_GENERATION).toBe(75);
-	expect(SERVING_EPOCH).toBe(22);
+	// Generation 76 / serving epoch 23: invalid direct frames settle as rejected.
+	expect(DAEMON_GENERATION).toBe(76);
+	expect(SERVING_EPOCH).toBe(23);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();

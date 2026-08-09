@@ -128,8 +128,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * becomes attempted or delivered, preserving sequence order without cursor gaps.
  * Generation 75 routes every direct effect through the suppression-aware adapter
  * and gives each publication queue item a non-coalescing identity.
+ * Generation 76 adds durable terminal rejection for invalid direct frames and
+ * confirms accepted non-OK BTW status publications before returning.
  */
-export const DAEMON_GENERATION = 75;
+export const DAEMON_GENERATION = 76;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -150,5 +152,6 @@ export const DAEMON_GENERATION = 75;
  * Epoch 20 requires Router cursor advancement to follow settled publication state.
  * Epoch 21 requires ordered Router settlement waiters for queued publications.
  * Epoch 22 requires unified dispatch guards and non-coalescing publication work.
+ * Epoch 23 requires explicit rejected state and terminal direct settlement.
  */
-export const SERVING_EPOCH = 22;
+export const SERVING_EPOCH = 23;

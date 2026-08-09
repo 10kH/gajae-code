@@ -92,6 +92,7 @@ describe("Telegram provider supervisor ownership", () => {
 			claimPublication(publicationId: string): Promise<void>;
 			markPublicationAttempted(publicationId: string): Promise<void>;
 			markPublicationDelivered(publicationId: string): Promise<void>;
+			markPublicationRejected(publicationId: string): Promise<void>;
 			loadPresentationState(): Promise<void>;
 			publicationShouldSuppress(publicationId: string): boolean;
 			publicationSettlement(publicationId: string): { promise: Promise<void> };
@@ -124,6 +125,12 @@ describe("Telegram provider supervisor ownership", () => {
 			await restartedDelivered.loadPresentationState();
 			expect(restartedDelivered.publicationShouldSuppress("session:60:1")).toBe(true);
 
+			await first.claimPublication("session:60:2");
+			await first.markPublicationRejected("session:60:2");
+			const restartedRejected = makeHarness();
+			await restartedRejected.loadPresentationState();
+			expect(restartedRejected.publicationShouldSuppress("session:60:2")).toBe(true);
+
 			fs.writeFileSync(
 				path.join(daemonPaths(agentDir).dir, "telegram-presentation-state.json"),
 				`${JSON.stringify({ version: 1, delivered: { "legacy:60:1": Date.now() } })}\n`,
@@ -137,7 +144,7 @@ describe("Telegram provider supervisor ownership", () => {
 			);
 			fs.writeFileSync(
 				path.join(daemonPaths(agentDir).dir, "telegram-presentation-state.json"),
-				`${JSON.stringify({ version: 3, delivered: {}, claimed: oversizedClaims, ambiguous: {} })}\n`,
+				`${JSON.stringify({ version: 4, delivered: {}, claimed: oversizedClaims, ambiguous: {}, rejected: {} })}\n`,
 			);
 			const restartedOversized = makeHarness();
 			await restartedOversized.loadPresentationState();

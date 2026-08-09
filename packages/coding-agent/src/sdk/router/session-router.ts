@@ -43,17 +43,13 @@ export interface SessionRouterFrame {
 }
 
 export type SessionRouterFrameCorrelator = (frame: Record<string, unknown>) => SessionRouterFrame | undefined;
-export type SessionRouterFrameDisposition = "settled" | "deferred";
 
 export interface SessionRouterDeps {
 	createClient?: (endpoint: SdkSessionEndpoint) => Promise<SessionRouterClient>;
 	createIndex?: (agentDir: string) => SessionIndex;
 	createBrokerClient?: (endpoint: { url: string; token: string }) => Promise<SessionRouterClient>;
 	/** Receives only an opaque capability and correlated provider-neutral frames. */
-	onFrame?: (
-		attachment: SessionAttachment,
-		frame: SessionRouterFrame,
-	) => Promise<SessionRouterFrameDisposition> | SessionRouterFrameDisposition;
+	onFrame?: (attachment: SessionAttachment, frame: SessionRouterFrame) => Promise<void> | void;
 	onAttachment?: (attachment: SessionAttachment) => Promise<void> | void;
 	/** Called when the Broker index no longer reports an attached session as live. */
 	onSessionRemoved?: (attachment: SessionAttachment) => Promise<void> | void;
@@ -608,9 +604,8 @@ export class SessionRouter {
 				}
 				const publicationId =
 					seq !== undefined && ownsSequence ? `${attached.sessionId}:${attached.generation}:${seq}` : undefined;
-				let disposition: SessionRouterFrameDisposition | undefined;
 				try {
-					disposition = await this.#deps.onFrame?.(
+					await this.#deps.onFrame?.(
 						attached.capability,
 						publicationId === undefined ? correlated : { ...correlated, publicationId },
 					);
@@ -619,7 +614,6 @@ export class SessionRouter {
 					this.#failDelivery(attached, seq, error);
 					return;
 				}
-				if (disposition === "deferred") return;
 				if (seq !== undefined && ownsSequence) {
 					this.#undelivered.delete(attached.sessionId);
 					this.#removeRecoveredFrame(attached.sessionId, attached.generation, seq);
