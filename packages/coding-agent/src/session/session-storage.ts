@@ -2,7 +2,17 @@ import { createHash, randomUUID } from "node:crypto";
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import * as native from "@gajae-code/natives";
+
+import type * as native from "@gajae-code/natives";
+
+let nativeSessionStorageBindings: typeof import("@gajae-code/natives") | undefined;
+
+function nativeSessionStorage(): typeof import("@gajae-code/natives") {
+	if (!nativeSessionStorageBindings) {
+		nativeSessionStorageBindings = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
+	}
+	return nativeSessionStorageBindings;
+}
 
 import { isEnoent, pathIsWithin, peekFile, toError } from "@gajae-code/utils";
 import {
@@ -489,7 +499,7 @@ function nativeExactUnlink(
 		quarantineName?: string;
 	},
 ): NativeExactUnlinkResult {
-	return (native.exactUnlink as unknown as NativeExactUnlink)(pathname, identity);
+	return (nativeSessionStorage().exactUnlink as unknown as NativeExactUnlink)(pathname, identity);
 }
 
 type NativeDirectoryTreeEntry = {
@@ -520,7 +530,7 @@ type NativeDirectoryTreeApi = {
 	): NativeExactUnlinkResult;
 };
 function nativeDirectoryTreeApi(): NativeDirectoryTreeApi {
-	return native as unknown as NativeDirectoryTreeApi;
+	return nativeSessionStorage() as unknown as NativeDirectoryTreeApi;
 }
 
 function snapshotDirectoryTree(pathname: string): NativeDirectoryTreeSnapshot {
@@ -601,14 +611,14 @@ function secureOwnerOnlyFileDescriptor(
 	if (process.platform !== "linux" || !securityContext) {
 		if (operation === "apply") {
 			const applied = validateNativeSecurityResult(
-				native.applyOwnerOnlyPathSecurity(pathname, "file"),
+				nativeSessionStorage().applyOwnerOnlyPathSecurity(pathname, "file"),
 				"apply",
 				"file",
 			);
 			if (!applied.ok) throw new Error(`Owner-only security rejected ${pathname}: ${applied.code}`);
 		}
 		const verified = validateNativeSecurityResult(
-			native.verifyOwnerOnlyPathSecurity(pathname, "file"),
+			nativeSessionStorage().verifyOwnerOnlyPathSecurity(pathname, "file"),
 			"verify",
 			"file",
 		);
@@ -619,8 +629,8 @@ function secureOwnerOnlyFileDescriptor(
 		throw new Error(`Managed writer escaped its session directory: ${pathname}`);
 	const result = validateNativeSecurityResult(
 		operation === "apply"
-			? native.applyOwnerOnlyFdSecurity(pathname, "file", fd)
-			: native.verifyOwnerOnlyFdSecurity(pathname, "file", fd),
+			? nativeSessionStorage().applyOwnerOnlyFdSecurity(pathname, "file", fd)
+			: nativeSessionStorage().verifyOwnerOnlyFdSecurity(pathname, "file", fd),
 		operation,
 		"file",
 	);
@@ -784,9 +794,9 @@ function createFileCommitMarkerCheckedSync(
 		fs.closeSync(fd);
 		fd = undefined;
 
-		outcome = classifyNativePublishOutcome(native.renameNoReplacePath(tempPath, markerPath));
+		outcome = classifyNativePublishOutcome(nativeSessionStorage().renameNoReplacePath(tempPath, markerPath));
 		if (renameFlagsUnsupported(outcome)) {
-			outcome = classifyNativePublishOutcome(native.linkNoReplacePath(tempPath, markerPath));
+			outcome = classifyNativePublishOutcome(nativeSessionStorage().linkNoReplacePath(tempPath, markerPath));
 			linkPublished = outcome.ok;
 		}
 		if (!outcome.ok) {
@@ -854,7 +864,7 @@ function replaceFileCommitMarkerCheckedSync(
 
 		// Checked atomic rename: replaces the destination only while it is still the
 		// expected marker object (exact dev/ino/nlink/size/mtimeNs + raw sha256).
-		const replaced = native.exactReplacePath(
+		const replaced = nativeSessionStorage().exactReplacePath(
 			tempPath,
 			markerPath,
 			{
@@ -1271,9 +1281,13 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 			}
 			const staged = fs.lstatSync(publishSource, { bigint: true });
 			stagedIdentity = { dev: staged.dev, ino: staged.ino };
-			outcome = classifyNativePublishOutcome(native.renameNoReplacePath(publishSource, this.#destinationPath));
+			outcome = classifyNativePublishOutcome(
+				nativeSessionStorage().renameNoReplacePath(publishSource, this.#destinationPath),
+			);
 			if (renameFlagsUnsupported(outcome)) {
-				outcome = classifyNativePublishOutcome(native.linkNoReplacePath(publishSource, this.#destinationPath));
+				outcome = classifyNativePublishOutcome(
+					nativeSessionStorage().linkNoReplacePath(publishSource, this.#destinationPath),
+				);
 				linkPublished = outcome.ok;
 			}
 			if (!outcome.ok) throw new Error(`staged_publish_rejected:${outcome.reason}`);
@@ -1477,10 +1491,11 @@ export class FileSessionStorage implements SessionStorage {
 		}
 	}
 	async listFilesByMtime(dir: string, pattern: string): Promise<Array<{ path: string; mtimeMs: number }>> {
-		const result = await native.glob({
+		const nativeBindings = nativeSessionStorage();
+		const result = await nativeBindings.glob({
 			path: dir,
 			pattern,
-			fileType: native.FileType.File,
+			fileType: nativeBindings.FileType.File,
 			recursive: false,
 			hidden: false,
 			gitignore: false,
@@ -1566,7 +1581,7 @@ export class FileSessionStorage implements SessionStorage {
 				return false;
 			fs.closeSync(fd);
 			fd = undefined;
-			const outcome = native.exactReplacePath(
+			const outcome = nativeSessionStorage().exactReplacePath(
 				sourcePath,
 				destinationPath,
 				{
@@ -2765,5 +2780,149 @@ export class MemorySessionStorage implements SessionStorage {
 
 	openStagedWriter(path: string): StagedStreamingWriter {
 		return new MemoryStagedStreamingWriter(this, path);
+	}
+}
+
+/**
+ * Outcome of a disk-retention retirement attempt.
+ *
+ * `kept` means the transcript survived and nothing of the session was
+ * destroyed, with the exact reason so `gjc gc --disk` can report it.
+ * `cleanup_pending` means the delete authority already detached or removed the
+ * session's artifact tree (or quarantined the transcript) before it stopped:
+ * the record survives, the session does not, and a caller must NOT report that
+ * as an ordinary keep.
+ */
+export type SessionRetirementOutcome =
+	| { kind: "retired" }
+	| { kind: "kept"; reason: string }
+	| { kind: "cleanup_pending"; reason: string };
+
+/** A retirement that cleared every precondition the retention pass itself owns. */
+type SessionRetirementPlan =
+	| { kind: "retirable"; target: VerifiedSessionDeleteTarget; artifactsPresent: boolean }
+	| { kind: "kept"; reason: string };
+
+/**
+ * Evaluate the preconditions retirement owns — the transcript must be readable
+ * and carry a usable session header — and bind the delete target to the exact
+ * bytes just read. Nothing here mutates the store.
+ */
+function planSessionRetirement(
+	storage: FileSessionStorage,
+	sessionsRoot: string,
+	transcriptPath: string,
+): SessionRetirementPlan {
+	let snapshot: SessionStorageSnapshot;
+	try {
+		snapshot = storage.readSnapshotSync(transcriptPath);
+	} catch (err) {
+		return { kind: "kept", reason: `transcript_unreadable: ${toError(err).message}` };
+	}
+
+	const header = parseFirstJsonlLine(snapshot.bytes);
+	if (header?.type !== "session" || typeof header.id !== "string" || typeof header.cwd !== "string") {
+		return { kind: "kept", reason: "transcript_header_unusable" };
+	}
+
+	// The verified delete authority only unlinks a single-link transcript, so a
+	// hard-linked one can never be retired. Refusing here keeps the dry run from
+	// promising bytes prune cannot release, and — because this runs before the
+	// artifact phase — keeps a doomed retirement from destroying the artifact
+	// tree of a session whose transcript will survive anyway.
+	if (snapshot.stat.nlink === undefined || snapshot.stat.nlink !== 1n) {
+		return { kind: "kept", reason: "transcript_not_single_link" };
+	}
+
+	const directory = path.dirname(transcriptPath);
+	return {
+		kind: "retirable",
+		artifactsPresent: storage.existsSync(transcriptPath.slice(0, -".jsonl".length)),
+		target: {
+			sessionsRoot,
+			transcriptPath,
+			sessionId: header.id,
+			cwd: header.cwd,
+			transcriptIdentity: {
+				dev: snapshot.stat.dev,
+				ino: snapshot.stat.ino,
+				nlink: snapshot.stat.nlink,
+				size: snapshot.stat.size,
+				mtimeNs: snapshot.stat.mtimeNs,
+				sha256: createHash("sha256").update(snapshot.bytes).digest("hex"),
+			},
+			plannedArtifactsPath: path.join(directory, `.gjc-delete-gc-${randomUUID()}-artifacts`),
+			plannedTranscriptPath: path.join(directory, `.gjc-delete-gc-${randomUUID()}-transcript`),
+		},
+	};
+}
+
+/**
+ * Non-mutating projection of {@link retireSessionTranscript}: would the
+ * retention pass's own preconditions let this transcript be retired at all?
+ *
+ * `gjc gc --disk` runs it so a dry run reports the verdict a prune would reach
+ * instead of promising bytes the delete authority will refuse to release. The
+ * authority's verdict (containment, identity, artifact tree) is deliberately
+ * not predicted here — it is re-derived against live state at delete time.
+ */
+export function probeSessionRetirement(
+	storage: FileSessionStorage,
+	sessionsRoot: string,
+	transcriptPath: string,
+): { kind: "retirable" } | { kind: "kept"; reason: string } {
+	const plan = planSessionRetirement(storage, sessionsRoot, transcriptPath);
+	return plan.kind === "retirable" ? { kind: "retirable" } : plan;
+}
+
+/**
+ * A transcript that survives after its artifacts are already gone is not a
+ * benign keep: the session is half-destroyed and the caller has to surface it.
+ */
+function retirementIncomplete(artifactsRemoved: boolean, reason: string): SessionRetirementOutcome {
+	return artifactsRemoved ? { kind: "cleanup_pending", reason } : { kind: "kept", reason };
+}
+
+/**
+ * Retire one managed session transcript through the verified hard-delete
+ * authority.
+ *
+ * This is the only supported way for a retention pass to remove a transcript:
+ * identity, containment, header id/cwd, artifact tree and parent directory are
+ * all re-verified inside {@link FileSessionStorage.deleteSessionVerified}, and
+ * anything ambiguous fails closed as `kept` rather than deleting bytes. The
+ * caller owns the retention policy; this function owns nothing but the delete
+ * authority.
+ */
+export async function retireSessionTranscript(
+	storage: FileSessionStorage,
+	sessionsRoot: string,
+	transcriptPath: string,
+): Promise<SessionRetirementOutcome> {
+	const plan = planSessionRetirement(storage, sessionsRoot, transcriptPath);
+	if (plan.kind === "kept") return plan;
+
+	let artifactsRemoved = false;
+	try {
+		// Phase 1 removes the sibling artifact directory (or proves it absent);
+		// phase 2 unlinks the transcript only against the same bound identity.
+		const artifacts = await storage.deleteSessionVerified(plan.target);
+		if (artifacts.kind === "deleted") return { kind: "retired" };
+		if (artifacts.kind === "cleanup_pending") {
+			return { kind: "cleanup_pending", reason: `cleanup_pending_${artifacts.phase}: ${artifacts.error.message}` };
+		}
+		// Phase 1 is durable: whatever artifact tree the session had is gone, so
+		// every later refusal leaves a record without its artifacts.
+		artifactsRemoved = plan.artifactsPresent;
+		const deletion = await storage.deleteSessionVerified({ ...plan.target, artifactsRemoved: true });
+		if (deletion.kind === "deleted") return { kind: "retired" };
+		if (deletion.kind === "cleanup_pending") {
+			return { kind: "cleanup_pending", reason: `cleanup_pending_${deletion.phase}: ${deletion.error.message}` };
+		}
+		return retirementIncomplete(artifactsRemoved, "transcript_not_deleted");
+	} catch (err) {
+		const error = toError(err);
+		const kind = err instanceof SessionDeleteVerificationError ? err.kind : "error";
+		return retirementIncomplete(artifactsRemoved, `verified_delete_rejected(${kind}): ${error.message}`);
 	}
 }

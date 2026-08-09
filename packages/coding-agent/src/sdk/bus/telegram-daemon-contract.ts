@@ -81,9 +81,20 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * gates, and renumbers pre-numbered options exactly once around the selection
  * marker. Generation 54 records owner `stoppedAt` on unclean daemon death
  * (`markDaemonOwnerStopped` + postmortem/finally wiring) so a dead process
- * cannot keep advertising itself as the ready owner (#3965).
+ * cannot keep advertising itself as the ready owner (#3965). Generation 55
+ * contains a shared-topic-authority outage: a failed lease renewal on the
+ * liveness heartbeat and a failed startup registry load are reported instead
+ * of escaping to the process-level fatal handler, authority-failure throws
+ * preserve their underlying cause, and the compensation fence retry is bounded.
+ * Generation 56 moves exact unlink and process-incarnation authority behind
+ * lazy native bindings for the startup-cost cut (#3846). Generation 57 clears
+ * disconnect-grace-only fields whenever a topic enters an archive state, so
+ * one stale session cannot make the shared registry unreadable and block every
+ * later session from creating a topic or replaying notifications. Generation
+ * 58 preserves that invariant during durable-fence load promotion and restores
+ * the exact grace deadline when a failed archive publication rolls back.
  */
-export const DAEMON_GENERATION = 54;
+export const DAEMON_GENERATION = 58;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 5

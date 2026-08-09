@@ -113,64 +113,74 @@ export interface ThinkingConfig {
 	mode: ThinkingControlMode;
 }
 
-export type KnownProvider =
-	| "alibaba-token-plan"
-	| "amazon-bedrock"
-	| "azure-openai"
-	| "anthropic"
-	| "google"
-	| "google-gemini-cli"
-	| "google-antigravity"
-	| "google-vertex"
-	| "openai"
-	| "openai-codex"
-	| "opencodex"
-	| "kimi-code"
-	| "minimax-code"
-	| "minimax-code-cn"
-	| "github-copilot"
-	| "fireworks"
-	| "firepass"
-	| "fugu"
-	| "gitlab-duo"
-	| "cursor"
-	| "deepseek"
-	| "deepinfra"
-	| "xai"
-	| "groq"
-	| "cerebras"
-	| "openrouter"
-	| "kilo"
-	| "vercel-ai-gateway"
-	| "zai"
-	| "glm-zcode"
-	| "mistral"
-	| "minimax"
-	| "opencode-go"
-	| "opencode-zen"
-	| "opengateway"
-	| "bizrouter"
-	| "mara"
-	| "synthetic"
-	| "cloudflare-ai-gateway"
-	| "huggingface"
-	| "litellm"
-	| "moonshot"
-	| "nvidia"
-	| "nanogpt"
-	| "ollama"
-	| "ollama-cloud"
-	| "qianfan"
-	| "qwen-portal"
-	| "together"
-	| "venice"
-	| "vllm"
-	| "xiaomi"
-	| "xiaomi-token-plan-sgp"
-	| "xiaomi-token-plan-ams"
-	| "xiaomi-token-plan-cn"
-	| "zenmux"
-	| "lm-studio";
+export const KNOWN_PROVIDERS = [
+	"alibaba-token-plan",
+	"amazon-bedrock",
+	"azure-openai",
+	"anthropic",
+	"google",
+	"google-gemini-cli",
+	"google-antigravity",
+	"google-vertex",
+	"openai",
+	"openai-codex",
+	"opencodex",
+	"kimi-code",
+	"minimax-code",
+	"minimax-code-cn",
+	"github-copilot",
+	"fireworks",
+	"firepass",
+	"fugu",
+	"gitlab-duo",
+	"cursor",
+	"jetbrains-junie",
+	"deepseek",
+	"deepinfra",
+	"xai",
+	"groq",
+	"cerebras",
+	"openrouter",
+	"kilo",
+	"vercel-ai-gateway",
+	"zai",
+	"glm-zcode",
+	"mistral",
+	"minimax",
+	"opencode-go",
+	"opencode-zen",
+	"opengateway",
+	"bizrouter",
+	"mara",
+	"synthetic",
+	"cloudflare-ai-gateway",
+	"huggingface",
+	"litellm",
+	"moonshot",
+	"nvidia",
+	"nanogpt",
+	"ollama",
+	"ollama-cloud",
+	"qianfan",
+	"qwen-portal",
+	"together",
+	"venice",
+	"vllm",
+	"xiaomi",
+	"xiaomi-token-plan-sgp",
+	"xiaomi-token-plan-ams",
+	"xiaomi-token-plan-cn",
+	"zenmux",
+	"lm-studio",
+] as const;
+
+export type KnownProvider = (typeof KNOWN_PROVIDERS)[number];
+
+const KNOWN_PROVIDER_SET = new Set<string>(KNOWN_PROVIDERS);
+
+export function isKnownProvider(provider: string): provider is KnownProvider {
+	return KNOWN_PROVIDER_SET.has(provider);
+}
 export type Provider = KnownProvider | string;
 
 import type { Effort } from "./model-thinking";
@@ -749,10 +759,27 @@ export type RawArgumentRejectionCode =
 	| "todo-write-done-drop-requires-target"
 	| "todo-write-unknown-init-entry-key";
 
+/**
+ * Optional structured detail attached to a raw-argument rejection. The fixed
+ * per-code guidance in `RAW_ARGUMENT_REJECTION_MESSAGES` explains the shape;
+ * this names what the caller actually sent that was wrong, so a retry can
+ * differ from the failed call.
+ */
+export interface RawArgumentRejectionDetail {
+	/** Offending keys, in payload order. */
+	readonly rejectedKeys?: readonly string[];
+	/**
+	 * Correction for a rejected key whose replacement is exact and
+	 * unambiguous. Never populate this from fuzzy or edit-distance matching:
+	 * a wrong suggestion costs more turns than no suggestion.
+	 */
+	readonly hint?: string;
+}
+
 export type RawArgumentValidationResult =
 	| { outcome: "passthrough" }
 	| { outcome: "accept"; arguments: ToolCall["arguments"] }
-	| { outcome: "reject"; code?: RawArgumentRejectionCode };
+	| { outcome: "reject"; code?: RawArgumentRejectionCode; detail?: RawArgumentRejectionDetail };
 
 export interface Tool<TParameters extends TSchema = TSchema> {
 	name: string;
@@ -852,6 +879,13 @@ export interface OpenAICompat extends ToolChoiceCompat {
 	 * caller already set via `headers`/`requestTransform`.
 	 */
 	sendSessionHeaders?: boolean;
+	/**
+	 * Whether an OpenAI Responses transport may forward the agent session id
+	 * as `session_id` and `x-client-request-id` affinity headers for an
+	 * explicitly configured custom relay. First-party OpenAI uses its canonical
+	 * HTTPS origin automatically; known non-OpenAI providers remain excluded.
+	 */
+	supportsResponsesSessionAffinity?: boolean;
 	/**
 	 * Whether the provider's chat-completions endpoint accepts multiple
 	 * leading `system`/`developer` messages. When false, ordered system

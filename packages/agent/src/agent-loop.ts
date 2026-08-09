@@ -1521,11 +1521,18 @@ async function runLoopBody(
 					awaitEventDrain: (invocationSignal: AbortSignal) =>
 						stream.waitForConsumerDrain(AbortSignal.any([loopSignal, invocationSignal])),
 				};
-				const maintenanceOutcome = await config.maintainContext(currentContext, lifecycle);
+				const maintenanceResult = await config.maintainContext(currentContext, lifecycle);
+				const maintenance =
+					typeof maintenanceResult === "string" ? { outcome: maintenanceResult } : maintenanceResult;
 				// A callback can settle after its loop has been cancelled. Never let a
 				// stale "not-needed" fall through to streamAssistantResponse, which
 				// invokes the provider before it observes the aborted signal.
-				const outcome = loopSignal.aborted ? "aborted" : maintenanceOutcome;
+				const outcome = loopSignal.aborted ? "aborted" : maintenance.outcome;
+				if (maintenance.releaseCurrentContext) {
+					currentContext.messages.length = 0;
+					newMessages.length = 0;
+					convertedContextCache.delete(config);
+				}
 
 				if (outcome !== "not-needed") {
 					publishAgentEnd(
@@ -2440,6 +2447,7 @@ async function streamAssistantResponse(
 		});
 	} catch (err) {
 		failChatSpan(telemetry, chatSpan, {
+			stepNumber: chatStepNumber,
 			errorObject: err,
 			responseHeaders: capturedHeaders,
 			baseUrl: config.model.baseUrl,
@@ -2486,14 +2494,48 @@ function emitAbortedAssistantMessage(
 }
 
 /**
- * Match a tool against the model-visible call name. Tools emitted via OpenAI's
- * custom-tool path (e.g. `apply_patch` on GPT-5) arrive under their wire-level
- * name, which may differ from the harness-internal `name`, so dispatch and any
- * "is this tool callable" check must consider both. Internal `name` takes
- * precedence when a caller needs a single match.
+ * Model-visible call names of a tool. Tools emitted via OpenAI's custom-tool
+ * path (e.g. `apply_patch` on GPT-5) arrive under their wire-level name, which
+ * may differ from the harness-internal `name`, so dispatch and any "is this
+ * tool callable" check must consider both.
  */
-function toolMatchesCallName(tool: { name: string; customWireName?: string }, callName: string): boolean {
-	return tool.name === callName || (tool.customWireName !== undefined && tool.customWireName === callName);
+function toolCallNames(tool: { name: string; customWireName?: string }): string[] {
+	return tool.customWireName === undefined || tool.customWireName === tool.name
+		? [tool.name]
+		: [tool.name, tool.customWireName];
+}
+
+/**
+ * Wire name of the tool-discovery tool. Sessions that hide discoverable
+ * built-ins expose it under exactly that name.
+ */
+const TOOL_DISCOVERY_NAME = "search_tool_bm25";
+
+/**
+ * Active tool a call name dispatches to. Tools emitted via OpenAI's custom-tool
+ * path (e.g. `apply_patch` on GPT-5) come back under their wire-level name,
+ * which may differ from the harness-internal `name`. Match on either, preferring
+ * `name` for determinism if both somehow collide.
+ */
+function findActiveTool<T extends { name: string; customWireName?: string }>(
+	tools: ReadonlyArray<T> | undefined,
+	callName: string,
+): T | undefined {
+	return (
+		tools?.find(tool => tool.name === callName) ??
+		tools?.find(tool => tool.customWireName !== undefined && tool.customWireName === callName)
+	);
+}
+
+/**
+ * Whether tool discovery is callable in this session. A namespaced lookalike
+ * proves nothing: `mcp__srv__x_search_tool_bm25` reads equally well as a bridged
+ * discovery tool and as that server's own `x_search_tool_bm25`, and the registry
+ * cannot tell the two apart. Naming the wrong one sends the model at a tool it
+ * never asked for, so only the literal call name counts.
+ */
+function isToolDiscoveryCallable(tools: ReadonlyArray<{ name: string; customWireName?: string }> | undefined): boolean {
+	return (tools ?? []).some(tool => toolCallNames(tool).includes(TOOL_DISCOVERY_NAME));
 }
 
 /**
@@ -2542,13 +2584,7 @@ async function executeToolCalls(
 
 	const records = toolCalls.map(toolCall => ({
 		toolCall,
-		// Tools emitted via OpenAI's custom-tool path (e.g. `apply_patch` on GPT-5)
-		// come back under their wire-level name, which may differ from the
-		// harness-internal `name`. Match on either, preferring `name` for
-		// determinism if both somehow collide.
-		tool:
-			tools?.find(t => t.name === toolCall.name) ??
-			tools?.find(t => t.customWireName !== undefined && t.customWireName === toolCall.name),
+		tool: findActiveTool(tools, toolCall.name),
 		args: toolCall.arguments as Record<string, unknown>,
 		started: false,
 		result: undefined as AgentToolResult<any> | undefined,
@@ -2696,11 +2732,17 @@ async function executeToolCalls(
 					// the tool and retry instead of giving up on the capability. The
 					// base wording stays byte-for-byte stable for downstream consumers;
 					// the period and hint are appended only when discovery is callable.
+					// The call name is echoed verbatim and no other tool is named or
+					// dispatched to: `mcp__<server>__<x>_<base>` reads equally well as a
+					// stale bridge instance segment in front of `base` and as that
+					// server's own two-segment `<x>_<base>`, and the registry only ever
+					// proves the live name, never the one the model sent. Running or
+					// naming that guess hits a tool the model never asked for, which is
+					// worse than the dead end it would replace.
 					const base = `Tool ${toolCall.name} not found`;
-					const hasToolDiscovery = tools?.some(t => toolMatchesCallName(t, "search_tool_bm25")) ?? false;
 					throw new Error(
-						hasToolDiscovery
-							? `${base}. If you are unsure whether this tool exists or how to use it, call \`search_tool_bm25\` to discover and activate the matching tool, then retry.`
+						isToolDiscoveryCallable(tools)
+							? `${base}. If you are unsure whether this tool exists or how to use it, call \`${TOOL_DISCOVERY_NAME}\` to discover and activate the matching tool, then retry.`
 							: base,
 					);
 				}

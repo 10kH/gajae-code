@@ -3,7 +3,7 @@ import { validateToolArguments } from "@gajae-code/ai";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import * as themeModule from "@gajae-code/coding-agent/modes/theme/theme";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
-import { applyOpsToPhases, type TodoPhase, TodoWriteTool } from "@gajae-code/coding-agent/tools";
+import { applyOpsToPhases, type TodoPhase, TodoWriteTool } from "@gajae-code/coding-agent/tools/implementations";
 import { todoWriteToolRenderer } from "../../src/tools/todo-write";
 
 function captureValidationError(run: () => void): string {
@@ -265,18 +265,51 @@ describe("TodoWriteTool raw argument rejection codes", () => {
 		arguments: arguments_,
 	});
 
-	it("rejects an unknown root key with the root-shape correction", () => {
-		expect(() => validateToolArguments(tool, call({ ops: [{ op: "done", task: "x" }], extraRootKey: true }))).toThrow(
-			"todo_write root accepts only an ops array of operation entries",
+	const REJECTED = 'Validation failed for tool "todo_write": raw arguments rejected before coercion';
+
+	it("names the unknown root key alongside the root-shape correction", () => {
+		const message = captureValidationError(() =>
+			validateToolArguments(tool, call({ ops: [{ op: "done", task: "x" }], extraRootKey: true })),
+		);
+		expect(message).toBe(
+			`${REJECTED}; todo_write root accepts only an ops array of operation entries; rejected key: "extraRootKey"`,
 		);
 	});
 
-	it("rejects an unknown operation-entry key with the entry-shape correction", () => {
+	it("names a note key without emitting an incomplete replacement", () => {
+		const message = captureValidationError(() =>
+			validateToolArguments(tool, call({ ops: [{ op: "note", note: "why this plan" }] })),
+		);
+		expect(message).toBe(
+			`${REJECTED}; todo_write operation entries accept only op, list, task, phase, items, and text keys; rejected key: "note" (note is an op, not a key; note operations require both "task" and "text")`,
+		);
+		expect(message).not.toContain('use { op: "note", text: "..." }');
+	});
+
+	it("rejects the incomplete note shape for missing task content", async () => {
+		const result = await tool.execute("call-note", { ops: [{ op: "note", text: "why this plan" }] });
+		const first = result.content?.[0];
+		const text = first?.type === "text" ? first.text : "";
+		expect(text).toContain("Missing task content");
+		expect(text).toContain("Todo update was not applied");
+	});
+
+	it("names an unknown operation-entry key without inventing a replacement for it", () => {
 		const message = captureValidationError(() =>
 			validateToolArguments(tool, call({ ops: [{ op: "done", task: "x", bogusOpKey: "y" }] })),
 		);
-		expect(message).toContain("todo_write operation entries accept only op, list, task, phase, items, and text keys");
-		expect(message).not.toContain("bogusOpKey");
+		expect(message).toBe(
+			`${REJECTED}; todo_write operation entries accept only op, list, task, phase, items, and text keys; rejected key: "bogusOpKey"`,
+		);
+	});
+
+	it("names every unknown key when an operation entry carries several", () => {
+		const message = captureValidationError(() =>
+			validateToolArguments(tool, call({ ops: [{ op: "done", task: "x", alpha: 1, beta: 2 }] })),
+		);
+		expect(message).toBe(
+			`${REJECTED}; todo_write operation entries accept only op, list, task, phase, items, and text keys; rejected keys: "alpha", "beta"`,
+		);
 	});
 
 	it("rejects a done entry without a task or phase target", () => {
@@ -291,15 +324,23 @@ describe("TodoWriteTool raw argument rejection codes", () => {
 		);
 	});
 
-	it("rejects an unknown init list-entry key with the init-shape correction", () => {
+	it("names the unknown init list-entry key alongside the init-shape correction", () => {
 		const message = captureValidationError(() =>
 			validateToolArguments(
 				tool,
 				call({ ops: [{ op: "init", list: [{ phase: "Execution", items: ["status"], bogusInitKey: 1 }] }] }),
 			),
 		);
-		expect(message).toContain("todo_write init list entries accept only phase and items keys");
-		expect(message).not.toContain("bogusInitKey");
+		expect(message).toBe(
+			`${REJECTED}; todo_write init list entries accept only phase and items keys; rejected key: "bogusInitKey"`,
+		);
+	});
+
+	it("still accepts content as the task alias instead of naming it as rejected", () => {
+		const parsed = validateToolArguments(tool, call({ ops: [{ op: "done", content: "ship it" }] })) as {
+			ops: Array<{ op: string; task?: string }>;
+		};
+		expect(parsed.ops[0]).toEqual({ op: "done", task: "ship it" });
 	});
 
 	it("keeps valid payloads accepted at the validation boundary", () => {
@@ -318,6 +359,20 @@ describe("TodoWriteTool raw argument rejection codes", () => {
 		const message = captureValidationError(() => validateToolArguments(tool, call({ ops: "not-an-array" })));
 		expect(message).toContain('Validation failed for tool "todo_write"');
 		expect(message).not.toContain("raw arguments rejected before coercion");
+	});
+
+	it("accepts the injected intent field alongside ops", () => {
+		const parsed = validateToolArguments(
+			tool,
+			call({ _i: "Tracking progress", ops: [{ op: "done", task: "status" }] }),
+		) as { ops: Array<{ op: string; task?: string }> };
+		expect(parsed.ops[0]).toEqual({ op: "done", task: "status" });
+	});
+
+	it("still rejects an unknown root key when the intent field is present", () => {
+		expect(() =>
+			validateToolArguments(tool, call({ _i: "Tracking progress", ops: [{ op: "done", task: "x" }], stray: 1 })),
+		).toThrow("todo_write root accepts only an ops array of operation entries");
 	});
 });
 
@@ -341,5 +396,71 @@ describe("TodoWriteTool renderer", () => {
 		const rendered = Bun.stripANSI(component.render(160).join("\n"));
 		expect(rendered).toContain("Todo state persistence failed: disk failed");
 		expect(rendered).not.toContain("Rejected task");
+	});
+});
+
+describe("TodoWriteTool operation aliases", () => {
+	const parse = (ops: unknown) => new TodoWriteTool(createSession()).parameters.safeParse({ ops });
+
+	it('accepts "complete" and "completed" as aliases for the "done" operation', () => {
+		// The status this operation sets is spelled `completed`, so models reach for
+		// `complete`/`completed` and used to hit a hard tool failure mid-turn.
+		for (const alias of ["complete", "completed"]) {
+			const result = parse([{ op: alias, task: "ship it" }]);
+			expect(result.success).toBe(true);
+			if (result.success) expect(result.data.ops[0]?.op).toBe("done");
+		}
+	});
+
+	it('still accepts the canonical "done" operation', () => {
+		const result = parse([{ op: "done", task: "ship it" }]);
+		expect(result.success).toBe(true);
+		if (result.success) expect(result.data.ops[0]?.op).toBe("done");
+	});
+
+	it("still rejects operations outside the accepted vocabulary", () => {
+		expect(parse([{ op: "finish", task: "ship it" }]).success).toBe(false);
+	});
+
+	it("still requires a target when an aliased completion names no task or phase", () => {
+		const tool = new TodoWriteTool(createSession());
+		expect(tool.rawArgumentValidation({ ops: [{ op: "complete" }] })).toMatchObject({ outcome: "reject" });
+	});
+
+	it('accepts "content" as a synonym for "task"', () => {
+		// TodoItem stores and renders the task as `content`, so models emit `content`
+		// and used to be rejected as an unknown key before coercion could repair it.
+		const tool = new TodoWriteTool(createSession());
+		expect(tool.rawArgumentValidation({ ops: [{ op: "done", content: "ship it" }] })).toMatchObject({
+			outcome: "passthrough",
+		});
+		const result = parse([{ op: "done", content: "ship it" }]);
+		expect(result.success).toBe(true);
+		if (result.success) expect(result.data.ops[0]).toMatchObject({ op: "done", task: "ship it" });
+	});
+
+	it("still rejects genuinely unknown operation-entry keys", () => {
+		const tool = new TodoWriteTool(createSession());
+		expect(tool.rawArgumentValidation({ ops: [{ op: "done", title: "ship it" }] })).toMatchObject({
+			outcome: "reject",
+		});
+	});
+
+	it("still requires a target when a content-only completion names nothing", () => {
+		const tool = new TodoWriteTool(createSession());
+		expect(tool.rawArgumentValidation({ ops: [{ op: "done", content: "" }] })).toMatchObject({ outcome: "reject" });
+	});
+
+	it("tells the model how to address a task when a completion arrives with no target", async () => {
+		// Models send a positional handle (`id: "1"`); it is stripped as an unknown key,
+		// leaving a targetless op. The message has to name what actually works.
+		const tool = new TodoWriteTool(
+			createSession([{ name: "Implementation", tasks: [{ content: "Apply fix", status: "pending" }] }]),
+		);
+		const result = await tool.execute("call-target", { ops: [{ op: "done" }] });
+		expect(result.isError).toBe(true);
+		const text = result.content.map(block => ("text" in block ? block.text : "")).join("\n");
+		expect(text).toContain('Pass "task" with the task\'s exact content');
+		expect(text).toContain("never by number or id");
 	});
 });

@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { SdkClient, SdkClientError, type SdkFrame } from "../client";
+import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
-
 import { OPERATIONS } from "../protocol/operation-registry";
+import { ACP_SESSION_RECONNECT } from "../session-reconnect";
 
 type JsonObject = Record<string, unknown>;
 
@@ -45,6 +46,8 @@ type ReverseRequest = {
 	controller?: AbortController;
 	cancelTimer?: NodeJS.Timeout;
 };
+
+export { ACP_SESSION_RECONNECT };
 
 const SESSION_GLOBALS: Record<string, string> = {
 	newSession: "session.create",
@@ -89,7 +92,7 @@ export class AcpSdkAdapter {
 	#closed = false;
 
 	constructor(options: AcpSdkAdapterOptions) {
-		this.#client = options.client ?? new SdkClient(options.url, options.token);
+		this.#client = options.client ?? new SdkClient(options.url, options.token, { ...ACP_SESSION_RECONNECT });
 		this.#connection = options.connection;
 		this.#providers = options.providers ?? [];
 		for (const [capability, leaseId] of Object.entries(options.expectedLeaseIds ?? {}))
@@ -99,7 +102,8 @@ export class AcpSdkAdapter {
 	}
 
 	static async connect(options: AcpSdkAdapterOptions): Promise<AcpSdkAdapter> {
-		const client = options.client ?? (await SdkClient.connect(options.url, options.token));
+		const client =
+			options.client ?? (await SdkClient.connect(options.url, options.token, { ...ACP_SESSION_RECONNECT }));
 		const adapter = new AcpSdkAdapter({ ...options, client });
 		await adapter.start();
 		return adapter;
@@ -364,17 +368,21 @@ export class AcpSdkAdapter {
 			const result = await this.#forwardReverse(method, payload, controller.signal);
 			if (!this.#canRespondToReverse(id, active, connectionId, capability, leaseId)) return;
 
-			this.#client.send({ type: "reverse_response", id, connectionId, leaseId, ok: true, result });
+			const response = { type: "reverse_response", id, connectionId, leaseId, ok: true, result };
+			assertReverseResponseFrame(response);
+			this.#client.send(response);
 		} catch (error) {
 			if (!this.#canRespondToReverse(id, active, connectionId, capability, leaseId)) return;
 
 			const typed =
 				error instanceof AcpSdkAdapterError || error instanceof SdkClientError
 					? error
-					: new AcpSdkAdapterError(
-							"acp_reverse_failed",
-							error instanceof Error ? error.message : "ACP reverse request failed.",
-						);
+					: error instanceof ReverseLeaseError
+						? new AcpSdkAdapterError(error.code, error.message)
+						: new AcpSdkAdapterError(
+								"acp_reverse_failed",
+								error instanceof Error ? error.message : "ACP reverse request failed.",
+							);
 			this.#client.send({
 				type: "reverse_response",
 				id,

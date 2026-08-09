@@ -13,6 +13,7 @@ import {
 	getBundledProviders,
 	googleAntigravityModelManagerOptions,
 	googleGeminiCliModelManagerOptions,
+	isKnownProvider,
 	type Model,
 	type ModelManagerOptions,
 	type ModelRefreshStrategy,
@@ -26,7 +27,7 @@ import {
 	UNK_CONTEXT_WINDOW,
 	UNK_MAX_TOKENS,
 	unregisterCustomApis,
-} from "@gajae-code/ai";
+} from "@gajae-code/ai/core";
 
 // Sentinel for local-only OAuth token (LM Studio, vLLM) — declared inline to avoid loading
 // any provider module at startup. Must match `DEFAULT_LOCAL_TOKEN` in oauth/lm-studio.ts.
@@ -46,7 +47,7 @@ import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
 import type { ActiveSearchModelContext, WebSearchMode } from "../web/search/types";
 import { type ConfigError, ConfigFile } from "./config-file";
 import { isAuthenticated, kNoAuth } from "./model-auth";
-import { ModelBindingsApplier } from "./model-bindings-applier";
+import { type ConfiguredModelBindings, ModelBindingsApplier } from "./model-bindings-applier";
 import { ModelDiscoveryManager, type ProviderDiscoveryState } from "./model-discovery-manager";
 
 export type { ProviderDiscoveryState, ProviderDiscoveryStatus } from "./model-discovery-manager";
@@ -256,11 +257,51 @@ function getKnownProviderModelApi(providerName: string, modelId: string): Api | 
 		?.api as Api | undefined;
 }
 
+function isCanonicalOpenAIAffinityBaseUrl(baseUrl: string | undefined): boolean {
+	if (!baseUrl) return false;
+	try {
+		const url = new URL(baseUrl);
+		return (
+			url.origin === "https://api.openai.com" &&
+			url.username === "" &&
+			url.password === "" &&
+			(url.pathname === "/" || url.pathname === "/v1") &&
+			url.search === "" &&
+			url.hash === ""
+		);
+	} catch {
+		return false;
+	}
+}
+
+function assertResponsesSessionAffinitySupported(
+	providerName: string,
+	api: Api | undefined,
+	baseUrl: string | undefined,
+	source: string,
+): void {
+	if (isKnownProvider(providerName) && providerName !== "openai") {
+		throw new Error(
+			`Provider ${providerName}: ${source} is only supported for the openai provider or unknown user-defined provider IDs.`,
+		);
+	}
+	if (api !== "openai-responses") {
+		throw new Error(`Provider ${providerName}: ${source} is only supported with the openai-responses API.`);
+	}
+	if (!isKnownProvider(providerName) && (!baseUrl?.trim() || isCanonicalOpenAIAffinityBaseUrl(baseUrl))) {
+		throw new Error(
+			`Provider ${providerName}: ${source} requires a genuinely custom base URL for unknown provider IDs.`,
+		);
+	}
+}
+
 interface ProviderValidationModel {
 	id: string;
+	baseUrl?: string;
 	api?: Api;
 	contextWindow?: number;
 	maxTokens?: number;
+	compat?: Model<Api>["compat"];
 	requestTransform?: ModelRequestTransform;
 }
 
@@ -342,13 +383,49 @@ function validateProviderConfiguration(
 	if (mode === "models-config" && config.discovery && !config.api) {
 		throw new Error(`Provider ${providerName}: "api" is required when discovery is enabled at provider level.`);
 	}
+	const configCompat = config.compat;
+	if (
+		configCompat &&
+		"supportsResponsesSessionAffinity" in configCompat &&
+		configCompat.supportsResponsesSessionAffinity !== undefined
+	) {
+		const source = '"compat.supportsResponsesSessionAffinity"';
+		if (models.length > 0) {
+			for (const model of models) {
+				assertResponsesSessionAffinitySupported(
+					providerName,
+					model.api ?? config.api ?? getKnownProviderModelApi(providerName, model.id),
+					model.baseUrl ?? config.baseUrl,
+					source,
+				);
+			}
+		} else if (config.api) {
+			assertResponsesSessionAffinitySupported(providerName, config.api, config.baseUrl, source);
+		} else {
+			const knownApis = getKnownProviderApis(providerName);
+			if (knownApis.size === 0) {
+				assertResponsesSessionAffinitySupported(providerName, undefined, config.baseUrl, source);
+			}
+			for (const api of knownApis) {
+				assertResponsesSessionAffinitySupported(providerName, api, config.baseUrl, source);
+			}
+		}
+	}
 	for (const [modelId, rawOverride] of Object.entries(config.modelOverrides ?? {})) {
 		const override = rawOverride as ModelOverride;
-		if (!override.requestTransform) continue;
 		const effectiveApi =
 			models.find(model => model.id === modelId)?.api ??
 			config.api ??
 			getKnownProviderModelApi(providerName, modelId);
+		if (override.compat?.supportsResponsesSessionAffinity !== undefined) {
+			assertResponsesSessionAffinitySupported(
+				providerName,
+				effectiveApi,
+				config.baseUrl,
+				`modelOverrides ${modelId} "compat.supportsResponsesSessionAffinity"`,
+			);
+		}
+		if (!override.requestTransform) continue;
 		if (effectiveApi) {
 			assertRequestTransformSupportedForModelApi(
 				providerName,
@@ -383,6 +460,15 @@ function validateProviderConfiguration(
 			throw new Error(`Provider ${providerName}: model missing "id"`);
 		}
 		const effectiveApi = modelDef.api ?? config.api;
+		const modelCompat = modelDef.compat;
+		if (modelCompat && "supportsResponsesSessionAffinity" in modelCompat) {
+			assertResponsesSessionAffinitySupported(
+				providerName,
+				effectiveApi,
+				modelDef.baseUrl ?? config.baseUrl,
+				`model ${modelDef.id} "compat.supportsResponsesSessionAffinity"`,
+			);
+		}
 		if (config.requestTransform && effectiveApi) {
 			assertRequestTransformSupportedForModelApi(
 				providerName,
@@ -717,6 +803,26 @@ function mergeCompat<TBase extends object, TOverride extends object>(
 			isRecord(baseValue) && isRecord(overrideValue) ? mergeCompat(baseValue, overrideValue) : overrideValue;
 	}
 	return merged as TBase & TOverride;
+}
+
+function mergeProviderCompat(
+	baseCompat: Model<Api>["compat"],
+	overrideCompat: Model<Api>["compat"],
+): Model<Api>["compat"] {
+	const merged = mergeCompat(baseCompat, overrideCompat);
+	// An explicit model-level opt-out must win over a provider-level opt-in.
+	const baseAffinity =
+		baseCompat && "supportsResponsesSessionAffinity" in baseCompat
+			? baseCompat.supportsResponsesSessionAffinity
+			: undefined;
+	const overrideAffinity =
+		overrideCompat && "supportsResponsesSessionAffinity" in overrideCompat
+			? overrideCompat.supportsResponsesSessionAffinity
+			: undefined;
+	if (baseAffinity === false && overrideAffinity !== undefined) {
+		return { ...merged, supportsResponsesSessionAffinity: false };
+	}
+	return merged;
 }
 
 function mergeRequestTransform(
@@ -1362,7 +1468,6 @@ export class ModelRegistry {
 				const withTransportOverride = this.#applyProviderTransportOverride(m, providerOverride);
 				return {
 					...withTransportOverride,
-					compat: mergeCompat(m.compat, providerOverride.compat),
 					cacheRetention: m.cacheRetention ?? providerOverride.cacheRetention,
 				};
 			});
@@ -1462,10 +1567,7 @@ export class ModelRegistry {
 			const withTransport = providerOverride
 				? models.map(model => this.#applyProviderTransportOverride(model, providerOverride))
 				: models;
-			const withCompat = providerOverride?.compat
-				? withTransport.map(model => ({ ...model, compat: mergeCompat(model.compat, providerOverride.compat) }))
-				: withTransport;
-			cachedModels.push(...this.#applyProviderModelOverrides(descriptor.providerId, withCompat));
+			cachedModels.push(...this.#applyProviderModelOverrides(descriptor.providerId, withTransport));
 		}
 		return cachedModels;
 	}
@@ -1875,6 +1977,20 @@ export class ModelRegistry {
 	}
 	applyConfiguredModelBindings(targetSettings: Settings): void {
 		this.#modelBindingsApplier.applyTo(targetSettings);
+	}
+
+	/**
+	 * Re-assert configured modelBindings into the target override slots after a
+	 * session-scoped profile reset removed profile-installed keys. Bypasses the
+	 * user-edit heuristic so the startup role/agent routing is restored.
+	 */
+	reapplyConfiguredModelBindings(targetSettings: Settings): void {
+		this.#modelBindingsApplier.forceApplyTo(targetSettings);
+	}
+
+	/** The currently configured modelBindings, for pre-profile baseline lookup. */
+	getConfiguredModelBindings(): ConfiguredModelBindings | undefined {
+		return this.#modelBindingsApplier.getBindings();
 	}
 
 	async #refreshRuntimeDiscoveries(
@@ -2940,12 +3056,24 @@ export class ModelRegistry {
 		};
 	}
 	#applyProviderTransportOverride<
-		T extends { baseUrl?: string; headers?: Record<string, string>; cacheRetention?: CacheRetention },
+		T extends {
+			baseUrl?: string;
+			headers?: Record<string, string>;
+			compat?: Model<Api>["compat"];
+			cacheRetention?: CacheRetention;
+		},
 	>(
 		entry: T,
 		override: Pick<
 			ProviderOverride,
-			"baseUrl" | "headers" | "authHeader" | "apiKey" | "transport" | "requestTransform" | "cacheRetention"
+			| "baseUrl"
+			| "headers"
+			| "authHeader"
+			| "apiKey"
+			| "compat"
+			| "transport"
+			| "requestTransform"
+			| "cacheRetention"
 		>,
 	): T {
 		const headers = mergeAuthHeader(
@@ -2955,6 +3083,7 @@ export class ModelRegistry {
 		);
 		return {
 			...entry,
+			compat: mergeProviderCompat(entry.compat, override.compat),
 			baseUrl: override.baseUrl ?? entry.baseUrl,
 			headers,
 			// Preserve the model's existing transport when the override omits one;
@@ -2967,12 +3096,19 @@ export class ModelRegistry {
 			cacheRetention: entry.cacheRetention ?? override.cacheRetention,
 		};
 	}
+	#applyRuntimeProviderOverride(model: Model<Api>, override: ProviderOverride): Model<Api> {
+		const withTransportOverride = this.#applyProviderTransportOverride(model, override);
+		const modelCompat = this.#modelOverrides.get(model.provider)?.get(model.id)?.compat;
+		return modelCompat
+			? { ...withTransportOverride, compat: mergeCompat(withTransportOverride.compat, modelCompat) }
+			: withTransportOverride;
+	}
 	#applyRuntimeProviderOverrides(models: Model<Api>[]): Model<Api>[] {
 		if (this.#runtimeProviderOverrides.size === 0) return models;
 		return models.map(model => {
 			const override = this.#runtimeProviderOverrides.get(model.provider);
 			if (!override) return model;
-			return this.#applyProviderTransportOverride(model, override);
+			return this.#applyRuntimeProviderOverride(model, override);
 		});
 	}
 	#applyModelOverrides(models: Model<Api>[], overrides: Map<string, Map<string, ModelOverride>>): Model<Api>[] {
@@ -2987,7 +3123,10 @@ export class ModelRegistry {
 	}
 	#applyHardcodedModelPolicies(models: Model<Api>[]): Model<Api>[] {
 		return models.map(model => {
-			if (model.id !== "gpt-5.4" || model.provider === "github-copilot") {
+			// `github-copilot` and `jetbrains-junie` both serve GPT-5.4 through their own
+			// gateway, which enforces a smaller prompt budget than the first-party 1M
+			// figure (Junie's is a probed 922K). Their bundled values are measured.
+			if (model.id !== "gpt-5.4" || model.provider === "github-copilot" || model.provider === "jetbrains-junie") {
 				return model;
 			}
 			const overrides = this.#modelOverrides.get(model.provider)?.get(model.id);
@@ -3077,6 +3216,11 @@ export class ModelRegistry {
 	 */
 	getAll(): Model<Api>[] {
 		return this.#models;
+	}
+
+	/** Provider ids declared in models.yml, including override-only providers. */
+	getConfiguredProviderIds(): readonly string[] {
+		return [...this.#configuredProviderIds];
 	}
 
 	#isModelAvailable(model: Model<Api>, disabledProviders = getDisabledProviderIdsFromSettings()): boolean {
@@ -3558,6 +3702,7 @@ export class ModelRegistry {
 				apiKey: config.apiKey,
 				api: config.api,
 				oauthConfigured: Boolean(config.oauth),
+				compat: config.compat,
 				requestTransform: config.requestTransform,
 				models: (config.models ?? []) as ProviderValidationModel[],
 			},
@@ -3648,7 +3793,7 @@ export class ModelRegistry {
 			const withRuntimeTransportOverride = runtimeTransportOverride
 				? nextModels.map(model => {
 						if (model.provider !== providerName) return model;
-						return this.#applyProviderTransportOverride(model, runtimeTransportOverride);
+						return this.#applyRuntimeProviderOverride(model, runtimeTransportOverride);
 					})
 				: nextModels;
 
@@ -3675,6 +3820,7 @@ export class ModelRegistry {
 			config.headers ||
 			config.apiKey ||
 			config.authHeader !== undefined ||
+			config.compat !== undefined ||
 			config.requestTransform !== undefined ||
 			config.transport !== undefined
 		) {
@@ -3683,6 +3829,7 @@ export class ModelRegistry {
 				headers: config.headers,
 				apiKey: config.apiKey,
 				authHeader: config.authHeader,
+				compat: config.compat,
 				requestTransform: config.requestTransform,
 				transport: config.transport,
 			};
@@ -3693,7 +3840,7 @@ export class ModelRegistry {
 			this.#runtimeProviderOverrides.set(providerName, nextRuntimeOverride);
 			this.#models = this.#models.map(m => {
 				if (m.provider !== providerName) return m;
-				return this.#applyProviderTransportOverride(m, transportOverride);
+				return this.#applyRuntimeProviderOverride(m, transportOverride);
 			});
 			this.#rebuildCanonicalIndex();
 			this.#rebuildProviderActivity();

@@ -2,14 +2,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { CompactionCancelledError, type CompactionOutcome } from "@gajae-code/agent-core/compaction";
-import {
-	getEnvApiKey,
-	getProviderDetails,
-	type ProviderDetails,
-	type ToolCall,
-	type UsageLimit,
-	type UsageReport,
-} from "@gajae-code/ai";
+import { getEnvApiKey, type ToolCall, type UsageLimit, type UsageReport } from "@gajae-code/ai/core";
+import type { ProviderDetails } from "@gajae-code/ai/provider-details";
 import { type Keybinding, Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@gajae-code/tui";
 import { formatBytes, formatDuration, Snowflake, setProjectDir } from "@gajae-code/utils";
 import { resolveAppendOnlyMode } from "../../append-only-mode";
@@ -19,16 +13,7 @@ import type { KeybindingsManager } from "../../config/keybindings";
 import { clearClaudePluginRootsCache } from "../../discovery/helpers";
 import { loadCustomShare } from "../../export/custom-share";
 import type { CompactOptions } from "../../extensibility/extensions/types";
-import {
-	diffMentalModelContent,
-	type HindsightApi,
-	type HindsightSessionState,
-	loadHindsightConfig,
-	reloadMentalModelsForSession,
-	resolveSeedsForScope,
-	summarizeMentalModel,
-} from "../../hindsight";
-import { resolveMemoryBackend } from "../../memory-backend";
+import type { HindsightApi, HindsightSessionState } from "../../hindsight";
 import { BashExecutionComponent } from "../../modes/components/bash-execution";
 import { BorderedLoader } from "../../modes/components/bordered-loader";
 import { DynamicBorder } from "../../modes/components/dynamic-border";
@@ -54,7 +39,16 @@ import { getDisplayChangelogEntries } from "../../utils/changelog";
 import { copyToClipboard } from "../../utils/clipboard";
 import { openPath } from "../../utils/open";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
-import { prepareTranscriptRebuild } from "../utils/ui-helpers";
+import { addChatChild, prepareTranscriptRebuild, syncPendingExecutionComponents } from "../utils/ui-helpers";
+
+type HindsightModule = typeof import("../../hindsight");
+let hindsightModulePromise: Promise<HindsightModule> | undefined;
+
+function loadHindsightModule(): Promise<HindsightModule> {
+	if (hindsightModulePromise) return hindsightModulePromise;
+	hindsightModulePromise = import("../../hindsight");
+	return hindsightModulePromise;
+}
 
 function showMarkdownPanel(ctx: InteractiveModeContext, title: string, markdown: string): void {
 	ctx.chatContainer.addChild(new Spacer(1));
@@ -129,17 +123,17 @@ export class CommandController {
 	}
 
 	handleDumpCommand() {
-		try {
-			const formatted = this.ctx.session.formatSessionAsText();
-			if (!formatted) {
-				this.ctx.showError("No messages to dump yet.");
-				return;
-			}
-			copyToClipboard(formatted);
-			this.ctx.showStatus("Session copied to clipboard");
-		} catch (error: unknown) {
-			this.ctx.showError(`Failed to copy session: ${error instanceof Error ? error.message : "Unknown error"}`);
+		const formatted = this.ctx.session.formatSessionAsText();
+		if (!formatted) {
+			this.ctx.showError("No messages to dump yet.");
+			return;
 		}
+		copyToClipboard(formatted).then(
+			() => this.ctx.showStatus("Session copied to clipboard"),
+			(error: unknown) => {
+				this.ctx.showError(`Failed to copy session: ${error instanceof Error ? error.message : "Unknown error"}`);
+			},
+		);
 	}
 
 	async handleDebugTranscriptCommand(): Promise<void> {
@@ -421,12 +415,10 @@ export class CommandController {
 	}
 
 	#doCopy(content: string, label: string) {
-		try {
-			copyToClipboard(content);
-			this.ctx.showStatus(label);
-		} catch (error) {
-			this.ctx.showError(error instanceof Error ? error.message : String(error));
-		}
+		copyToClipboard(content).then(
+			() => this.ctx.showStatus(label),
+			(error: unknown) => this.ctx.showError(error instanceof Error ? error.message : String(error)),
+		);
 	}
 
 	async handleSessionCommand(): Promise<void> {
@@ -453,6 +445,8 @@ export class CommandController {
 				model.provider,
 				stats.sessionId,
 			);
+			const { getProviderDetails } =
+				require("@gajae-code/ai/provider-details") as typeof import("@gajae-code/ai/provider-details");
 			const providerDetails = getProviderDetails({
 				model,
 				sessionId: stats.sessionId,
@@ -715,7 +709,7 @@ export class CommandController {
 		const argumentText = text.slice(7).trim();
 		const action = argumentText.split(/\s+/, 1)[0]?.toLowerCase() || "view";
 		const agentDir = this.ctx.settings.getAgentDir();
-		const backend = resolveMemoryBackend(this.ctx.settings);
+		const backend = await this.ctx.session.memoryBackend.get("memory-command");
 
 		if (action === "view") {
 			const payload = await backend.buildDeveloperInstructions(agentDir, this.ctx.settings, this.ctx.session);
@@ -813,6 +807,7 @@ export class CommandController {
 	async #mmList(state: HindsightSessionState): Promise<void> {
 		const client: HindsightApi = state.client;
 		try {
+			const { summarizeMentalModel } = await loadHindsightModule();
 			const response = await client.listMentalModels(state.bankId, { detail: "metadata" });
 			const items = response.items ?? [];
 			if (items.length === 0) {
@@ -852,6 +847,7 @@ export class CommandController {
 
 	async #mmRefresh(state: HindsightSessionState, id: string | undefined): Promise<void> {
 		try {
+			const { reloadMentalModelsForSession } = await loadHindsightModule();
 			if (id) {
 				// Single-model refresh is explicit operator intent: bypass the
 				// auto-refresh filter so curated/manual models can still be
@@ -906,6 +902,7 @@ export class CommandController {
 
 	async #mmHistory(state: HindsightSessionState, id: string): Promise<void> {
 		try {
+			const { diffMentalModelContent } = await loadHindsightModule();
 			const [model, history] = await Promise.all([
 				state.client.getMentalModel(state.bankId, id, { detail: "content" }),
 				state.client.getMentalModelHistory(state.bankId, id),
@@ -939,6 +936,7 @@ export class CommandController {
 
 	async #mmSeed(state: HindsightSessionState): Promise<void> {
 		try {
+			const { loadHindsightConfig, resolveSeedsForScope } = await loadHindsightModule();
 			const config = loadHindsightConfig(this.ctx.settings);
 			const seeds = resolveSeedsForScope(
 				{
@@ -983,16 +981,22 @@ export class CommandController {
 	}
 
 	async #mmReload(state: HindsightSessionState): Promise<void> {
-		const ok = await reloadMentalModelsForSession(state.session);
-		if (ok) {
-			this.ctx.showStatus("Mental-model cache reloaded.");
-		} else {
-			this.ctx.showError("Reload failed (Hindsight backend not active or mental models disabled).");
+		try {
+			const { reloadMentalModelsForSession } = await loadHindsightModule();
+			const ok = await reloadMentalModelsForSession(state.session);
+			if (ok) {
+				this.ctx.showStatus("Mental-model cache reloaded.");
+			} else {
+				this.ctx.showError("Reload failed (Hindsight backend not active or mental models disabled).");
+			}
+		} catch (error) {
+			this.ctx.showError(`mm reload failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 
 	async #mmDelete(state: HindsightSessionState, id: string): Promise<void> {
 		try {
+			const { reloadMentalModelsForSession } = await loadHindsightModule();
 			const removed = await state.client.deleteMentalModel(state.bankId, id);
 			if (!removed) {
 				this.ctx.showError(`Mental model not found: ${id}`);
@@ -1182,7 +1186,8 @@ export class CommandController {
 
 	async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
 		const isDeferred = this.ctx.session.isStreaming;
-		this.ctx.bashComponent = new BashExecutionComponent(command, this.ctx.ui, excludeFromContext);
+		const component = new BashExecutionComponent(command, this.ctx.ui, excludeFromContext);
+		this.ctx.bashComponent = component;
 
 		if (isDeferred) {
 			this.ctx.pendingMessagesContainer.addChild(this.ctx.bashComponent);
@@ -1200,7 +1205,9 @@ export class CommandController {
 						this.ctx.bashComponent.appendOutput(chunk);
 					}
 				},
-				{ excludeFromContext },
+				// A transcript rebuild racing this call must drop the parked block once the
+				// session owns its message, otherwise the rebuilt row is rendered twice.
+				{ excludeFromContext, onPersisted: () => component.markResultPersisted() },
 			);
 
 			if (this.ctx.bashComponent) {
@@ -1217,8 +1224,18 @@ export class CommandController {
 			this.ctx.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`);
 		}
 		const bashComponent = this.ctx.bashComponent;
-		if (isDeferred && bashComponent && this.ctx.pendingBashComponents.includes(bashComponent)) {
-			this.ctx.pendingMessagesContainer.detachChild(bashComponent);
+		if (isDeferred && bashComponent) {
+			// Parentage is the container's answer, never this bookkeeping's: `/clear`,
+			// `/context-clear`, extension redraws and the selector all call
+			// `pendingMessagesContainer.clear()`, which disposes and evicts the parked
+			// component while leaving it listed in `pendingBashComponents`. Ask the
+			// container whether it still holds a live child before moving anything;
+			// a disposed block is terminal and must never reach a fresh transcript.
+			if (this.ctx.pendingMessagesContainer.hasLiveChild(bashComponent)) {
+				this.ctx.pendingMessagesContainer.detachChild(bashComponent);
+				addChatChild(this.ctx, bashComponent);
+			}
+			syncPendingExecutionComponents(this.ctx);
 		}
 
 		this.ctx.bashComponent = undefined;
@@ -1227,7 +1244,8 @@ export class CommandController {
 
 	async handlePythonCommand(code: string, excludeFromContext = false): Promise<void> {
 		const isDeferred = this.ctx.session.isStreaming;
-		this.ctx.pythonComponent = new EvalExecutionComponent(code, this.ctx.ui, excludeFromContext);
+		const component = new EvalExecutionComponent(code, this.ctx.ui, excludeFromContext);
+		this.ctx.pythonComponent = component;
 
 		if (isDeferred) {
 			this.ctx.pendingMessagesContainer.addChild(this.ctx.pythonComponent);
@@ -1245,7 +1263,9 @@ export class CommandController {
 						this.ctx.pythonComponent.appendOutput(chunk);
 					}
 				},
-				{ excludeFromContext },
+				// A transcript rebuild racing this call must drop the parked block once the
+				// session owns its message, otherwise the rebuilt row is rendered twice.
+				{ excludeFromContext, onPersisted: () => component.markResultPersisted() },
 			);
 
 			if (this.ctx.pythonComponent) {
