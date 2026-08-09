@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes bounded-receipt generation 67 at serving epoch 14", () => {
+test("publishes BTW-retry generation 68 at serving epoch 15", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 67 / serving epoch 14: bounded receipt loading and fail-closed pending eviction.
-	expect(DAEMON_GENERATION).toBe(67);
-	expect(SERVING_EPOCH).toBe(14);
+	// Generation 68 / serving epoch 15: BTW shutdown preserves Router replay authority.
+	expect(DAEMON_GENERATION).toBe(68);
+	expect(SERVING_EPOCH).toBe(15);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();

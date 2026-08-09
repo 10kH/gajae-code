@@ -9194,7 +9194,8 @@ export class TelegramNotificationDaemon {
 			)
 				return;
 			if (msg.status === "ok" && typeof msg.text !== "string") return;
-			if (this.#stoppingBtw || this.#btwTerminalDeliveries.has(requestId)) return;
+			if (this.#stoppingBtw) return await this.failPublicationPreSend(publicationId, "BTW delivery is stopping");
+			if (this.#btwTerminalDeliveries.has(requestId)) return;
 			if (publicationId) this.deferredPublications.add(publicationId);
 			const isAuthoritative = (): boolean =>
 				!this.#stoppingBtw &&

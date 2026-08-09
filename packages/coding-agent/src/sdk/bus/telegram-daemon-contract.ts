@@ -113,8 +113,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * worst continuation disposition before confirmation.
  * Generation 67 quarantines oversized persisted receipt maps and retains claims
  * for pending-topic frames evicted before provider delivery.
+ * Generation 68 releases claimed BTW publications when shutdown prevents dispatch.
  */
-export const DAEMON_GENERATION = 67;
+export const DAEMON_GENERATION = 68;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -127,5 +128,6 @@ export const DAEMON_GENERATION = 67;
  * requires malformed provider responses to remain unconfirmed claims.
  * Epoch 13 requires complete direct-effect identity and pre-send retry semantics.
  * Epoch 14 requires bounded receipt loading and fail-closed pending eviction.
+ * Epoch 15 requires BTW shutdown to preserve Router replay authority.
  */
-export const SERVING_EPOCH = 14;
+export const SERVING_EPOCH = 15;
