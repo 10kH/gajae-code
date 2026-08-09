@@ -5451,15 +5451,24 @@ export class TelegramNotificationDaemon {
 		body: unknown,
 		callOpts?: { signal?: AbortSignal; noRetry?: boolean },
 	): Promise<BotApiCallResult> {
-		const cooldownActive = (): boolean =>
-			method !== "getUpdates" && (this.opts.now?.() ?? Date.now()) < this.botCooldownUntil;
-		if (cooldownActive()) return this.callBotApiClassified(method, body, callOpts);
-		await this.beginPublicationAttempt(publicationId);
-		if (cooldownActive()) {
-			await this.restorePublicationQueued(publicationId);
+		const cooldownRemaining = (): number =>
+			method === "getUpdates" ? 0 : Math.max(0, this.botCooldownUntil - (this.opts.now?.() ?? Date.now()));
+		for (;;) {
+			let remaining = cooldownRemaining();
+			while (remaining > 0) {
+				if (callOpts?.signal?.aborted) throw callOpts.signal.reason;
+				if (this.effects.stopping)
+					return await this.failPublicationPreSend(publicationId, "provider effects are stopping during cooldown");
+				await this.runtime.sleep(Math.min(remaining, 1_000));
+				remaining = cooldownRemaining();
+			}
+			await this.beginPublicationAttempt(publicationId);
+			if (cooldownRemaining() > 0) {
+				await this.restorePublicationQueued(publicationId);
+				continue;
+			}
 			return this.callBotApiClassified(method, body, callOpts);
 		}
-		return this.callBotApiClassified(method, body, callOpts);
 	}
 
 	private async failPublicationPreSend(publicationId: string | undefined, reason: string): Promise<never> {
@@ -8192,12 +8201,17 @@ export class TelegramNotificationDaemon {
 		// message whose finalized frame is in this batch, so a stale live edit can
 		// never be delivered on a later drain after the authoritative final.
 		if (finalizedKeys.size > 0) {
-			this.pool.removeWhere(
+			const removedLiveItems = this.pool.removeWhere(
 				it =>
 					it.lane === "live" &&
 					it.coalesceKey !== undefined &&
 					finalizedKeys.has(`${it.sessionId}:${it.coalesceKey}`),
 			);
+			for (const removed of removedLiveItems)
+				if (removed.payload.publicationId) {
+					await this.markPublicationRejected(removed.payload.publicationId);
+					this.deferredPublications.delete(removed.payload.publicationId);
+				}
 		}
 		for (const item of batch) {
 			const toolActivity = item.payload.toolActivity;
@@ -9444,7 +9458,11 @@ export class TelegramNotificationDaemon {
 									? "This /btw question stopped because the GJC session closed or changed. Reopen it and try again."
 									: "This /btw question failed. Send it again to retry.";
 					try {
-						if (!isAuthoritative()) return;
+						if (!isAuthoritative())
+							return await this.failPublicationPreSend(
+								publicationId,
+								"BTW authority is stale before status dispatch",
+							);
 						const response = await this.#sendBtwMessage({
 							threadId: pending.threadId,
 							messageId: pending.messageId,
@@ -9481,7 +9499,8 @@ export class TelegramNotificationDaemon {
 					method: "sendMessage" | "sendRichMessage",
 					body: unknown,
 				): Promise<"accepted" | "rejected" | "uncertain" | "stale"> => {
-					if (!isAuthoritative()) return "stale";
+					if (!isAuthoritative())
+						return await this.failPublicationPreSend(publicationId, "BTW authority is stale before delivery");
 					try {
 						const response = await this.botApiForPublication(publicationId).call(method, body, {
 							noRetry: true,
@@ -9598,6 +9617,11 @@ export class TelegramNotificationDaemon {
 				await this.markPublicationDelivered(publicationId);
 				this.deferredPublications.delete(publicationId);
 			}
+			if (publicationId && this.claimedPublications.has(publicationId))
+				return await this.failPublicationPreSend(
+					publicationId,
+					"BTW publication completed without provider dispatch",
+				);
 			return;
 		}
 		if (typeof msg?.type === "string" && TelegramNotificationDaemon.THREADED_FRAMES.has(msg.type)) {
@@ -9920,7 +9944,14 @@ export class TelegramNotificationDaemon {
 				let acceptedMessageId: number | undefined;
 				for (let i = 0; i < chunks.length; i++) {
 					const exposesCallbacks = i === chunks.length - 1 && inline_keyboard.length > 0;
-					if (!callbackDispatchAuthorityIsCurrent()) return undefined;
+					if (!callbackDispatchAuthorityIsCurrent()) {
+						if (publicationId && this.claimedPublications.has(publicationId))
+							return await this.failPublicationPreSend(
+								publicationId,
+								"action authority is stale before HTML dispatch",
+							);
+						return undefined;
+					}
 					let result: { ok?: unknown; result?: { message_id?: unknown } } | undefined;
 					try {
 						result = (await this.botApiForPublication(publicationId).call(
@@ -10117,6 +10148,11 @@ export class TelegramNotificationDaemon {
 				for (const [alias] of createdAliases) this.aliasTable.delete(alias);
 			}
 			await this.persistAliases();
+			if (publicationId && messageId === undefined && this.claimedPublications.has(publicationId))
+				return await this.failPublicationPreSend(
+					publicationId,
+					"action publication completed without provider dispatch",
+				);
 			if (publicationId) {
 				if (messageId !== undefined) await this.markPublicationDelivered(publicationId);
 				else this.deferredPublications.add(publicationId);
