@@ -360,6 +360,7 @@ export class ChatDaemonRuntime {
 	}
 
 	async #handleFrame(attachment: SessionAttachment, correlated: CorrelatedFrame): Promise<void> {
+		const publicationId = correlated.publicationId;
 		const normalizedFrame = correlated.body;
 		const bodyType = typeof normalizedFrame.type === "string" ? normalizedFrame.type : undefined;
 		if (isControlPlaneFrameType(correlated.name) || isControlPlaneFrameType(bodyType)) return;
@@ -374,7 +375,7 @@ export class ChatDaemonRuntime {
 		if (name === SESSION_PREPARED_EVENT || bodyType === SESSION_PREPARED_EVENT) return;
 		if (name === "session_ready") {
 			if (correlated.generation !== attachment.generation) return;
-			await this.#resume(sessionId, attachment.generation, "GJC session ready.");
+			await this.#resume(sessionId, attachment.generation, "GJC session ready.", publicationId);
 			return;
 		}
 		const notification = this.#notificationEvent(sessionId, normalizedFrame);
@@ -411,6 +412,7 @@ export class ChatDaemonRuntime {
 				content,
 				notification.type === "action_needed" ? notification.id : undefined,
 				attachment.generation,
+				publicationId,
 			);
 	}
 
@@ -419,7 +421,7 @@ export class ChatDaemonRuntime {
 		await this.#slack?.close(sessionId);
 	}
 
-	async #resume(sessionId: string, generation: number, content: string): Promise<void> {
+	async #resume(sessionId: string, generation: number, content: string, publicationId?: string): Promise<void> {
 		if (this.#discord) {
 			await this.#discord.resume(sessionId, generation);
 			await this.#discord.notify({

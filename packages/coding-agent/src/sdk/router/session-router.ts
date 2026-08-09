@@ -39,6 +39,7 @@ export interface SessionRouterFrame {
 	readonly name: string | undefined;
 	readonly sessionId: string | undefined;
 	readonly generation: number | undefined;
+	readonly publicationId?: string;
 }
 
 export type SessionRouterFrameCorrelator = (frame: Record<string, unknown>) => SessionRouterFrame | undefined;
@@ -99,6 +100,7 @@ type AttachedSession = {
 const REPLAY_BARRIER_LIMIT = 1_024;
 const REPLAY_RETRY_ATTEMPTS = 3;
 const REPLAY_RETRY_BACKOFF_MS = 100;
+const DELIVERY_ATTEMPT_LIMIT = 3;
 
 function readGeneration(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
@@ -164,6 +166,7 @@ export class SessionRouter {
 	readonly #sessions = new Map<string, AttachedSession>();
 	readonly #pending = new Set<Promise<void>>();
 	readonly #frameTails = new Map<string, Promise<void>>();
+	readonly #undelivered = new Map<string, { generation: number; seq: number; attempts: number }>();
 	readonly #reviving = new Set<string>();
 	#stopTimer: (() => void) | undefined;
 	#reconcileTail: Promise<void> = Promise.resolve();
@@ -373,6 +376,7 @@ export class SessionRouter {
 		for (const session of live) if (await this.#attach(session)) ids.add(session.sessionId);
 		for (const [sessionId, attached] of this.#sessions) {
 			if (ids.has(sessionId)) continue;
+			this.#undelivered.delete(sessionId);
 			this.#sessions.delete(sessionId);
 			attached.dispose();
 			await attached.client.close();
@@ -416,6 +420,7 @@ export class SessionRouter {
 			this.#sessions.delete(indexed.sessionId);
 			existing.dispose();
 			await existing.client.close();
+			if (!resumable) this.#undelivered.delete(indexed.sessionId);
 		}
 		const client = await (this.#deps.createClient ?? connectAttachedSession)(endpoint);
 		let attached: AttachedSession | undefined;
@@ -482,6 +487,21 @@ export class SessionRouter {
 			`chat daemon replay barrier failed (${reason}); rebuilding session ${attached.sessionId} at generation ${attached.generation} from seq ${attached.cursor.seq}.`,
 		);
 	}
+	#failDelivery(attached: AttachedSession, seq: number, error: unknown): void {
+		const previous = this.#undelivered.get(attached.sessionId);
+		const attempts = previous?.generation === attached.generation && previous.seq === seq ? previous.attempts + 1 : 1;
+		const reason = error instanceof Error ? error.message : String(error);
+		if (attempts >= DELIVERY_ATTEMPT_LIMIT) {
+			this.#undelivered.delete(attached.sessionId);
+			attached.cursor.seq = seq;
+			logger.warn(
+				`chat daemon conceded seq ${seq} of session ${attached.sessionId} at generation ${attached.generation} after ${attempts} refused publications (${reason}); delivery resumes above it.`,
+			);
+			return;
+		}
+		this.#undelivered.set(attached.sessionId, { generation: attached.generation, seq, attempts });
+		this.#failBarrier(attached, `publication failed at seq ${seq} (${reason})`);
+	}
 
 	#schedule(task: Promise<void>): void {
 		this.#pending.add(task);
@@ -514,9 +534,23 @@ export class SessionRouter {
 						held.push({ seq, frame });
 						return;
 					}
-					attached.cursor.seq = seq;
 				}
-				await this.#deps.onFrame?.(attached.capability, correlated);
+				const publicationId =
+					seq !== undefined && ownsSequence ? `${attached.sessionId}:${attached.generation}:${seq}` : undefined;
+				try {
+					await this.#deps.onFrame?.(
+						attached.capability,
+						publicationId === undefined ? correlated : { ...correlated, publicationId },
+					);
+				} catch (error) {
+					if (seq === undefined || !ownsSequence) throw error;
+					this.#failDelivery(attached, seq, error);
+					return;
+				}
+				if (seq !== undefined && ownsSequence) {
+					this.#undelivered.delete(attached.sessionId);
+					if (seq > attached.cursor.seq) attached.cursor.seq = seq;
+				}
 			});
 		this.#frameTails.set(attached.sessionId, current);
 		void current.then(
