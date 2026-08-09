@@ -2,13 +2,13 @@
   "schemaVersion": 1,
   "kind": "package-test-report",
   "subject": "Option+Q queue lifecycle",
-  "head": "f9adf911c2435bca0c32988a7b88b9026e8b2913",
+  "head": "84b0a836d11d5f29f982300082ca459dd03a9a18",
   "commands": [
     "bun --cwd=packages/coding-agent run check:types",
     "bun test packages/coding-agent/test/agent-session-queued-prompts.test.ts packages/coding-agent/test/input-controller-keybindings.test.ts packages/coding-agent/test/input-controller-skill-queue.test.ts packages/coding-agent/test/issue-825-repro.test.ts",
     "bunx biome check packages/agent/src/agent.ts packages/coding-agent/src/session/agent-session.ts packages/coding-agent/src/modes/controllers/input-controller.ts packages/coding-agent/src/modes/utils/ui-helpers.ts"
   ],
   "result": {"testsPassed": 93, "testsFailed": 0, "typecheck": "passed", "formatCheck": "passed"},
-  "ci": {"devRun": 31336356010, "publicSyncRun": 31336356009, "status": "success"},
+  "ci": {"devRun": 31337721925, "publicSyncRun": 31337721948, "status": "success"},
   "approval": {"pullRequest": 4120, "reviewId": "PRR_kwDOSoXRbc8AAAABI56Pwg", "reviewer": "Yeachan-Heo", "decision": "APPROVED"}
 }
