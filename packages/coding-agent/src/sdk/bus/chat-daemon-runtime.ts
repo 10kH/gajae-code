@@ -28,7 +28,6 @@ export interface ChatDaemonRuntimeConfig {
 	presentation?: { redact: boolean; verbosity: "lean" | "verbose" };
 }
 
-
 export type ChatDeliveryPhase = "pre_send" | "ambiguous";
 
 /** An authorized SDK command could not be conclusively delivered. */
