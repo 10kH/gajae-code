@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes stop-provider-cleanup generation 115 at serving epoch 62", () => {
+test("publishes claim-admission generation 116 at serving epoch 63", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 115 / serving epoch 62: Router stop removes every disposed provider attachment.
-	expect(DAEMON_GENERATION).toBe(115);
-	expect(SERVING_EPOCH).toBe(62);
+	// Generation 116 / serving epoch 63: failed claim admission creates no publication waiter.
+	expect(DAEMON_GENERATION).toBe(116);
+	expect(SERVING_EPOCH).toBe(63);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();

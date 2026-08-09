@@ -177,8 +177,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 113 removes old provider authority when replacement races stop.
  * Generation 114 removes successor provider authority when handoff races stop.
  * Generation 115 removes provider authority for every attachment disposed by stop.
+ * Generation 116 creates publication waiters only after claim admission succeeds.
  */
-export const DAEMON_GENERATION = 115;
+export const DAEMON_GENERATION = 116;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -239,5 +240,6 @@ export const DAEMON_GENERATION = 115;
  * Epoch 60 closes provider cleanup for replacement creation interrupted by stop.
  * Epoch 61 closes provider cleanup after published replacement handoff.
  * Epoch 62 covers stop during recovered-frame and replay awaits.
+ * Epoch 63 prevents capacity and claim-persistence waiter leaks.
  */
-export const SERVING_EPOCH = 62;
+export const SERVING_EPOCH = 63;

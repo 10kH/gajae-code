@@ -5476,10 +5476,12 @@ export class TelegramNotificationDaemon {
 	}
 
 	private async claimPublication(publicationId: string | undefined): Promise<void> {
-		if (publicationId && !this.publicationDelivered(publicationId) && !this.ambiguousPublications.has(publicationId))
-			this.publicationSettlement(publicationId);
-		if (!publicationId || this.publicationDelivered(publicationId) || this.claimedPublications.has(publicationId))
+		if (!publicationId || this.publicationDelivered(publicationId) || this.ambiguousPublications.has(publicationId))
 			return;
+		if (this.claimedPublications.has(publicationId)) {
+			this.publicationSettlement(publicationId);
+			return;
+		}
 		if (this.claimedPublications.size + this.ambiguousPublications.size >= TELEGRAM_PUBLICATION_CLAIM_LIMIT)
 			throw new Error("Telegram publication claim capacity is exhausted; refusing provider dispatch.");
 		this.claimedPublications.set(publicationId, this.runtime.now());
@@ -5493,6 +5495,7 @@ export class TelegramNotificationDaemon {
 			logger.warn(`notifications: Telegram publication claim failed: ${sanitizeDiagnostic(String(error))}`);
 			throw error;
 		}
+		this.publicationSettlement(publicationId);
 	}
 
 	private async markPublicationAttempted(publicationId: string | undefined): Promise<void> {
