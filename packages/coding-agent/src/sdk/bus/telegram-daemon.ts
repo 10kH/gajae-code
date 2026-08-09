@@ -8412,17 +8412,20 @@ export class TelegramNotificationDaemon {
 					);
 					if (outcome.kind === "retryable") {
 						this.pool.settle(item.itemId!, "ambiguous");
-						if (this.effects.stopping) {
-							this.finishSelectedAck(selectedAck, { status: "unknown", reason: "shutdown" });
+						const requeued = this.submitPool({
+							sessionId: item.sessionId,
+							lane: item.lane,
+							coalesceKey: item.coalesceKey,
+							deadlineAt: item.deadlineAt,
+							itemId: selectedAck.itemId,
+							payload: item.payload,
+						});
+						if (!requeued) {
+							const shutdownOutcome = { status: "unknown", reason: "shutdown" } as const;
+							this.finishSelectedAck(selectedAck, shutdownOutcome);
+							await this.settleSelectedPublication(item.payload.publicationId, shutdownOutcome);
+							if (item.payload.publicationId) this.deferredPublications.delete(item.payload.publicationId);
 						} else {
-							const retry = this.pool.submit({
-								sessionId: item.sessionId,
-								lane: item.lane,
-								coalesceKey: item.coalesceKey,
-								deadlineAt: item.deadlineAt,
-								payload: item.payload,
-							});
-							selectedAck.itemId = retry.itemId;
 							selectedAck.state = "queued";
 							selectedAck.controller = undefined;
 						}
