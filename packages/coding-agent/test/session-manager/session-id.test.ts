@@ -235,7 +235,7 @@ describe("SessionManager session ids", () => {
 			destination.endsWith(".jsonl") ? publishFailure("io_error", "io_failure") : "passthrough",
 		);
 		try {
-			await expect(session.fork()).rejects.toThrow("io_error");
+			await expect(session.fork()).rejects.toThrow("staged_publish_rejected:io_failure");
 			injection.assertHit();
 			expect(session.getSessionFile()).toBe(oldSessionFile);
 			expect(session.getSessionId()).toBe(oldSessionId);
@@ -277,7 +277,7 @@ describe("SessionManager session ids", () => {
 			publish.assertHit();
 			cleanup.assertHit();
 			// The PRIMARY error survives verbatim.
-			expect(String(error?.message)).toContain("io_error");
+			expect(String(error?.message)).toContain("staged_publish_rejected:io_failure");
 			// The cleanup outcome must NOT have superseded it.
 			expect(String(error?.message)).not.toContain("Failed to clean up fork publication");
 			expect(error?.cause).toBeUndefined();
@@ -315,7 +315,7 @@ describe("SessionManager session ids", () => {
 			expect(String(error?.message)).toContain("identity_mismatch");
 			// The primary failure is preserved rather than discarded.
 			expect(error?.cause).toBeInstanceOf(Error);
-			expect(String((error?.cause as Error).message)).toContain("io_error");
+			expect(String((error?.cause as Error).message)).toContain("staged_publish_rejected:io_failure");
 		} finally {
 			cleanup.restore();
 			publish.restore();
