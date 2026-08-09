@@ -8554,7 +8554,7 @@ export class TelegramNotificationDaemon {
 						const draftId = this.draftStream.tryClaim(item.sessionId, this.opts.now?.() ?? Date.now());
 						if (draftId !== undefined) {
 							await deliverDraft(
-								this.botApi,
+								itemBotApi,
 								{
 									chat_id: this.opts.chatId,
 									...threadField,

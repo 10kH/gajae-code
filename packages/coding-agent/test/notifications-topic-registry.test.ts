@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes selected-persistence generation 95 at serving epoch 42", () => {
+test("publishes rich-draft-abort generation 96 at serving epoch 43", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 95 / serving epoch 42: selected receipt persistence failures reject Router waiters.
-	expect(DAEMON_GENERATION).toBe(95);
-	expect(SERVING_EPOCH).toBe(42);
+	// Generation 96 / serving epoch 43: rich drafts share publication abort authority.
+	expect(DAEMON_GENERATION).toBe(96);
+	expect(SERVING_EPOCH).toBe(43);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
