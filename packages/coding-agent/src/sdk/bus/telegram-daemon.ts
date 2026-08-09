@@ -24,6 +24,11 @@ import {
 	acquireDaemonTransitionLock,
 	type DaemonTransitionLock,
 	daemonTransitionLockIsHeld,
+	exactUnlinkNotificationFile,
+	type NotificationEndpointFile,
+	type NotificationEndpointFileIdentity,
+	type NotificationExactUnlinkResult,
+	readNotificationEndpointFile,
 	releaseDaemonTransitionLock,
 	sanitizeDiagnostic,
 } from "./notification-service";
@@ -177,6 +182,8 @@ export interface TelegramDaemonFs {
 		isDirectory?(): boolean;
 	}>;
 	lstat?(path: string, opts: { bigint: true }): Promise<ExactFileStat>;
+	readEndpointFile?(file: string): Promise<NotificationEndpointFile>;
+	exactUnlink?(file: string, identity: NotificationEndpointFileIdentity): Promise<NotificationExactUnlinkResult>;
 }
 
 export interface SpawnResult {
@@ -239,6 +246,7 @@ function negotiateToolActivityCapability(
 
 const nodeFs: TelegramDaemonFs = {
 	...(fs.promises as unknown as TelegramDaemonFs),
+	lstat: async (file, options) => (await fs.promises.lstat(file, options)) as ExactFileStat,
 	fsyncFile: async file => {
 		const handle = await fs.promises.open(file, "r+");
 		try {
@@ -247,6 +255,9 @@ const nodeFs: TelegramDaemonFs = {
 			await handle.close();
 		}
 	},
+	readEndpointFile: readNotificationEndpointFile,
+	exactUnlink: async (file, identity) =>
+		exactUnlinkNotificationFile(file, identity, `transition-${crypto.randomUUID()}`),
 	fsyncDirectory: async directory => {
 		const handle = await fs.promises.open(directory, "r");
 		try {
