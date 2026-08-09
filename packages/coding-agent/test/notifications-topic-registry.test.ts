@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes strict-receipt generation 64 at serving epoch 11", () => {
+test("publishes malformed-safe generation 65 at serving epoch 12", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 64 / serving epoch 11: strict direct receipts and continuation admission.
-	expect(DAEMON_GENERATION).toBe(64);
-	expect(SERVING_EPOCH).toBe(11);
+	// Generation 65 / serving epoch 12: malformed provider responses remain unconfirmed claims.
+	expect(DAEMON_GENERATION).toBe(65);
+	expect(SERVING_EPOCH).toBe(12);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();

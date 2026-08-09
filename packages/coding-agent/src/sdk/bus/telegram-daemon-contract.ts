@@ -106,8 +106,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * replay-state and live-held frames during attachment recovery.
  * Generation 64 additionally defers stale-lease frames, requires authoritative
  * model message IDs, and retains claims when continuation admission fails.
+ * Generation 65 treats malformed or unknown Bot API responses as ambiguous
+ * rather than accepting them without a provider receipt.
  */
-export const DAEMON_GENERATION = 64;
+export const DAEMON_GENERATION = 65;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -116,6 +118,7 @@ export const DAEMON_GENERATION = 64;
  * requires the durable claimed/confirmed publication receipt format. Epoch 9
  * requires accepted-only confirmation and legacy receipt quarantine. Epoch 10
  * requires replay admission to retain deferred publication claims. Epoch 11
- * requires strict direct receipts and fail-closed continuation admission.
+ * requires strict direct receipts and fail-closed continuation admission. Epoch 12
+ * requires malformed provider responses to remain unconfirmed claims.
  */
-export const SERVING_EPOCH = 11;
+export const SERVING_EPOCH = 12;

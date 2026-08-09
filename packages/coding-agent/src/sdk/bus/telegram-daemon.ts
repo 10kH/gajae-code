@@ -8477,8 +8477,8 @@ export class TelegramNotificationDaemon {
 						}
 					}
 					disposition = "ambiguous";
-				} else if (disposition === "accepted" && !accepted && rejected) {
-					disposition = "rejected";
+				} else if (disposition === "accepted" && !accepted) {
+					disposition = rejected ? "rejected" : "ambiguous";
 				}
 				if (item.payload.publicationId) publicationDispositions.set(item.payload.publicationId, disposition);
 				this.pool.settle(item.itemId!, disposition);
