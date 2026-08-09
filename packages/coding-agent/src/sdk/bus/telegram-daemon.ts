@@ -4288,6 +4288,7 @@ export class TelegramNotificationDaemon {
 	private readonly deferredPublications = new Set<string>();
 	private readonly publicationLastOutcomes = new Map<string, BotApiCallOutcome["kind"]>();
 	private readonly publicationSettlements = new Map<string, PromiseWithResolvers<void>>();
+	private readonly failedPublicationSettlements = new Set<string>();
 	private presentationPersistenceQueue: Promise<void> = Promise.resolve();
 	/** Provider-owned create admission window, keyed by the authorized Telegram actor. */
 	private readonly createRateLimitHits = new Map<string, Array<{ requestKey: string; at: number }>>();
@@ -4418,6 +4419,7 @@ export class TelegramNotificationDaemon {
 	requestStop(_reason?: "reload" | "stop" | "signal"): void {
 		this.stopRequested = true;
 		this.effects.closeAdmission();
+		this.#deliveryAbort.abort();
 
 		const toolShutdown = this.beginToolActivityShutdown();
 		void toolShutdown
@@ -4960,6 +4962,8 @@ export class TelegramNotificationDaemon {
 	}
 
 	async #onRouterFrame(attachment: SessionAttachment, frame: SessionRouterFrame): Promise<void> {
+		if (frame.publicationId && this.failedPublicationSettlements.delete(frame.publicationId))
+			this.publicationSettlements.delete(frame.publicationId);
 		const session = this.sessions.get(attachment.sessionId);
 		if (!session || session.attachment !== attachment || !attachment.isCurrent()) return;
 		if (this.publicationShouldSuppress(frame.publicationId)) return;
@@ -5448,6 +5452,7 @@ export class TelegramNotificationDaemon {
 	private rejectPublicationSettlement(publicationId: string, error: unknown): void {
 		const settlement = this.publicationSettlements.get(publicationId);
 		if (!settlement) return;
+		this.failedPublicationSettlements.add(publicationId);
 		settlement.reject(error);
 		void settlement.promise.catch(() => undefined);
 	}

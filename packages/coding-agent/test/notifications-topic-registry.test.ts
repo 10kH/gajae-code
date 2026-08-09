@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes persistence-failure generation 92 at serving epoch 39", () => {
+test("publishes abort-and-replay generation 93 at serving epoch 40", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 92 / serving epoch 39: receipt persistence failures reject Router waiters.
-	expect(DAEMON_GENERATION).toBe(92);
-	expect(SERVING_EPOCH).toBe(39);
+	// Generation 93 / serving epoch 40: hanging delivery aborts and failed settlements reset on replay.
+	expect(DAEMON_GENERATION).toBe(93);
+	expect(SERVING_EPOCH).toBe(40);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
