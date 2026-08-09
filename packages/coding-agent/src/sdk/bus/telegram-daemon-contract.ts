@@ -108,8 +108,11 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * model message IDs, and retains claims when continuation admission fails.
  * Generation 65 treats malformed or unknown Bot API responses as ambiguous
  * rather than accepting them without a provider receipt.
+ * Generation 66 propagates publication identity through selected and ephemeral
+ * direct effects, retries definite pre-send route failures, and aggregates the
+ * worst continuation disposition before confirmation.
  */
-export const DAEMON_GENERATION = 65;
+export const DAEMON_GENERATION = 66;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -120,5 +123,6 @@ export const DAEMON_GENERATION = 65;
  * requires replay admission to retain deferred publication claims. Epoch 11
  * requires strict direct receipts and fail-closed continuation admission. Epoch 12
  * requires malformed provider responses to remain unconfirmed claims.
+ * Epoch 13 requires complete direct-effect identity and pre-send retry semantics.
  */
-export const SERVING_EPOCH = 12;
+export const SERVING_EPOCH = 13;
