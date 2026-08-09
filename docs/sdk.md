@@ -7,19 +7,9 @@ For a beginner-friendly application development guide (recipes, customization, a
   <img src="../assets/telegram-mobile-hero.png" alt="Gajae Code mobile answers for coding agents hero illustration" width="100%" />
 </p>
 
-A small, transport-agnostic SDK for receiving **action-needed** signals from a
-GJC session and sending **replies** back without scraping the terminal.
+The SDK exposes a generic action/reply protocol without requiring integrations to scrape the terminal. SDK core owns managed attachment discovery and credential-bearing clients through `SessionRouter`; Telegram, Discord, and Slack receive opaque session attachments and own only provider transport and presentation. The lower-level loopback WebSocket contract remains available for explicitly standalone clients, but it is not the bundled-provider topology.
 
-The stable contract is deliberately generic: every top-level running session
-hosts one loopback WebSocket endpoint by default, and integrations are
-user-written clients that connect to that endpoint. Telegram, Discord, Slack,
-mobile apps, and local tools all use the same JSON protocol. No upstream Rust,
-N-API, or wire-protocol change is required for a new integration.
-
-> Status: the Rust core (`crates/gjc-sdk`) provides the wire protocol, action
-> lifecycle, loopback WebSocket server, and endpoint discovery file. The bundled
-> Telegram daemon is a reference client layered on top of this SDK; it is not the
-> upstream topology.
+> Status: the Rust core (`crates/gjc-sdk`) provides the wire protocol, action lifecycle, loopback WebSocket server, and session-owned endpoint record. TypeScript SDK core provides Broker lifecycle authority and `SessionRouter` attachment authority. The bundled provider daemons do not discover endpoint files or retain endpoint credentials.
 
 ## TypeScript transport client
 
@@ -90,20 +80,11 @@ GJC session (upstream)                          your client (anywhere)
 └───────────────────────────────┘               └──────────────────────────┘
 ```
 
-- **One endpoint per top-level session.** Each top-level session runs its own
-  loopback WebSocket server. Subagents do not host endpoints. Upstream does not
-  maintain a shared daemon, singleton, or chat-to-session registry;
-  multiplexing many sessions into one integration is a client-side concern.
-- **Hosted by default.** SDK hosting is independent of notification
-  configuration. Set `GJC_SDK_DISABLE=1` to opt out of hosting for a top-level
-  session.
-- **Notification delivery is optional.** Configure and enable a managed
-  notification adapter only when remote delivery is needed; the SDK endpoint
-  remains available without one.
-- **Integrations are clients.** A client discovers endpoint files, connects to
-  one or more WebSockets, renders `action_needed`, and sends `reply` messages.
-- **Zero upstream change.** New transports do not require changes to
-  `crates/gjc-sdk` or the JSON protocol.
+- **One endpoint per top-level session.** Each top-level session runs its own loopback WebSocket server. Subagents do not host endpoints. The Broker index is the authoritative live-session catalog, and `SessionRouter` multiplexes managed provider attachments across indexed sessions.
+- **Hosted by default.** SDK hosting is independent of notification configuration. Set `GJC_SDK_DISABLE=1` to opt out of hosting for a top-level session.
+- **Notification delivery is optional.** Configure and enable a managed notification adapter only when remote delivery is needed; the SDK endpoint remains available without one.
+- **Managed integrations use opaque attachments.** Telegram, Discord, Slack, and in-product adapters compose `SessionRouter`; they do not discover endpoint files or receive URL/token credentials. An explicitly standalone low-level client may implement the documented WebSocket contract directly under its own trust boundary.
+- **Zero wire-protocol change.** New transports do not require changes to `crates/gjc-sdk` or the JSON protocol.
 - **tmux-agnostic.** The endpoint behaves identically with or without tmux.
 
 ## Endpoint discovery
@@ -608,9 +589,7 @@ This is a readonly resolver/listing contract. Do not import `@gajae-code/coding-
 The resolver uses canonical native identity: supported POSIX and Windows local aliases can designate one scope, while UNC/network workspaces are unsupported. Scope digests are collision-resistant identifiers, not injective aliases, credentials, or authentication. The owner-only checks protect managed local storage paths but do not authenticate an adapter or make hostile concurrent filesystem races safe. Adapters that need mutations must use the higher-level lifecycle/session APIs rather than the readonly directory API.
 ## Managed notification adapters
 
-GJC ships managed SDK-client adapters for Telegram, Discord, and Slack. They use
-one local SDK endpoint per session; the adapters do not change the wire protocol,
-keep endpoint credentials in provider state, or expose a remote shell.
+GJC ships managed SDK adapters for Telegram, Discord, and Slack. `SessionRouter` resolves one session-owned endpoint per attachment and keeps every endpoint credential inside SDK core. Provider daemons receive only opaque attachment capabilities; they neither change the wire protocol nor expose a remote shell.
 
 The recommended interactive path is `/settings` → **Notifications**. It owns
 setup, health, test, recovery, reconnect, local enablement, and Telegram

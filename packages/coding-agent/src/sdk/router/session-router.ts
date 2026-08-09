@@ -364,7 +364,11 @@ export class SessionRouter {
 	async #reconcile(): Promise<void> {
 		await this.#index.open();
 		await this.#index.refresh();
-		const live = this.#index.listSessions().sessions.filter(session => session.live);
+		const indexed = this.#index.listSessions();
+		const live =
+			indexed.warnings.length === 0
+				? indexed.sessions.filter(session => session.live && !session.terminalUncertain)
+				: [];
 		const ids = new Set(live.map(session => session.sessionId));
 		for (const session of live) await this.#attach(session);
 		for (const [sessionId, attached] of this.#sessions) {
