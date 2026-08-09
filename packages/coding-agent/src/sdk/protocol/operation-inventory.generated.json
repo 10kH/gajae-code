@@ -996,9 +996,9 @@
 		"decision": "include",
 		"sdkId": "session.create",
 		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
 			"mcp": "generic_safe",
 			"acp": "generic_safe",
 			"daemonCli": "generic_safe"
@@ -1014,9 +1014,9 @@
 		"decision": "include",
 		"sdkId": "session.fork",
 		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
 			"mcp": "generic_safe",
 			"acp": "generic_safe",
 			"daemonCli": "generic_safe"
@@ -1032,9 +1032,9 @@
 		"decision": "include",
 		"sdkId": "session.resume",
 		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
 			"mcp": "generic_safe",
 			"acp": "generic_safe",
 			"daemonCli": "generic_safe"
@@ -1050,9 +1050,9 @@
 		"decision": "include",
 		"sdkId": "session.close",
 		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
 			"mcp": "generic_safe",
 			"acp": "generic_safe",
 			"daemonCli": "generic_safe"
@@ -1068,9 +1068,9 @@
 		"decision": "include",
 		"sdkId": "session.delete",
 		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
 			"mcp": "generic_safe",
 			"acp": "generic_safe",
 			"daemonCli": "generic_safe"
