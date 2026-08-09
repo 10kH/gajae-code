@@ -2629,6 +2629,7 @@ export class AgentSession {
 	}
 	async #settleEndedInFlight(promptWait?: "publication" | "full"): Promise<void> {
 		const flushError = this.#endInFlight();
+		const predecessorPromptStillInFlight = this.#promptInFlightCount > 0;
 		if (promptWait === "publication") {
 			await this.#agentEndPublicationPromise;
 		} else if (promptWait === "full") {
@@ -2636,7 +2637,10 @@ export class AgentSession {
 			await this.#waitForPostPromptRecovery();
 			await this.#agentEndPublicationPromise;
 		}
-		await this.#waitForSessionSettlement();
+		// A post-prompt continuation runs before its predecessor prompt returns. Its
+		// publication must settle, but session-wide settlement can still be owned by
+		// that predecessor; waiting here would make each prompt wait on the other.
+		if (!predecessorPromptStillInFlight) await this.#waitForSessionSettlement();
 		if (flushError) throw flushError;
 	}
 

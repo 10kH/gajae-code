@@ -455,7 +455,7 @@ describe("resident-store transition seam", () => {
 		const b = await createManagedPersistedSession(`cross-workspace fork B ${"b".repeat(4096)}`);
 		try {
 			await expect(b.sm.setSessionFile(a.sessionFile)).resolves.toBeUndefined();
-			await expect(b.sm.fork()).rejects.toThrow("Managed writer escaped its session directory");
+			await expect(b.sm.fork()).rejects.toThrow("Managed transcript escaped its session directory");
 			expect(b.sm.getSessionFile()).toBe(a.sessionFile);
 			expect(fs.readFileSync(a.sessionFile, "utf8")).toContain(aText);
 			expect(fs.readdirSync(path.dirname(a.sessionFile)).filter(name => name.includes("fork-staging"))).toEqual([]);

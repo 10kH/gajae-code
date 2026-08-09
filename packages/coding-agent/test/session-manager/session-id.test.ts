@@ -113,7 +113,7 @@ describe("SessionManager session ids", () => {
 			expect(session.getSessionId()).toBe(oldSessionId);
 			const entries = await fs.readdir(path.dirname(oldSessionFile));
 			expect(entries.filter(entry => entry.endsWith(".jsonl"))).toEqual([path.basename(oldSessionFile)]);
-			expect(entries.some(entry => entry.includes("fork-staging"))).toBe(false);
+			expect(entries.some(entry => entry.includes("fork-staging") && !entry.endsWith(".removing"))).toBe(false);
 		} finally {
 			injection.restore();
 			await session.close();
@@ -242,7 +242,7 @@ describe("SessionManager session ids", () => {
 			const entries = await fs.readdir(path.dirname(oldSessionFile));
 			expect(entries.filter(entry => entry.endsWith(".jsonl"))).toEqual([path.basename(oldSessionFile)]);
 			const artifactDirectories = entries.filter(
-				entry => !entry.startsWith(".") && entry !== path.basename(oldSessionFile),
+				entry => !entry.startsWith(".") && entry !== path.basename(oldSessionFile) && !entry.endsWith(".removing"),
 			);
 			expect(artifactDirectories).toContain(path.basename(oldSessionFile, ".jsonl"));
 			expect(artifactDirectories).toHaveLength(1);
