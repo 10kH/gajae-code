@@ -104,8 +104,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * retains queued/fallback claims, and quarantines legacy v1 confirmations.
  * Generation 63 applies the same deferred confirmation boundary while draining
  * replay-state and live-held frames during attachment recovery.
+ * Generation 64 additionally defers stale-lease frames, requires authoritative
+ * model message IDs, and retains claims when continuation admission fails.
  */
-export const DAEMON_GENERATION = 63;
+export const DAEMON_GENERATION = 64;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -113,6 +115,7 @@ export const DAEMON_GENERATION = 63;
  * so epoch-6 daemons cannot serve across the delivery-safety cutover. Epoch 8
  * requires the durable claimed/confirmed publication receipt format. Epoch 9
  * requires accepted-only confirmation and legacy receipt quarantine. Epoch 10
- * requires replay admission to retain deferred publication claims.
+ * requires replay admission to retain deferred publication claims. Epoch 11
+ * requires strict direct receipts and fail-closed continuation admission.
  */
-export const SERVING_EPOCH = 10;
+export const SERVING_EPOCH = 11;

@@ -7951,6 +7951,7 @@ export class TelegramNotificationDaemon {
 			batch.flatMap(item => (item.payload.publicationId ? [item.payload.publicationId] : [])),
 		);
 		const publicationDispositions = new Map<string, RateLimitDisposition>();
+		const failedPublications = new Set<string>();
 		for (const expiredItem of expired) {
 			if (expiredItem.payload.selectedAck) {
 				this.finishSelectedAck(expiredItem.payload.selectedAck, { status: "failed", reason: "expired" });
@@ -8264,27 +8265,31 @@ export class TelegramNotificationDaemon {
 								...(disableNotification === true ? { disable_notification: true } : {}),
 							});
 							for (let i = 1; i < chunks.length; i++) {
-								this.submitPool({
-									sessionId: item.sessionId,
-									lane: item.lane,
-									payload: {
-										send: {
-											...send,
-											method: "sendMessage",
-											text: chunks[i]!,
-											editable: false,
-											coalesceKey: undefined,
-											photoBase64: undefined,
-											documentBase64: undefined,
-											richMarkdown: undefined,
-											richDraftMarkdown: undefined,
-											richClass: undefined,
+								if (
+									!this.submitPool({
+										sessionId: item.sessionId,
+										lane: item.lane,
+										payload: {
+											send: {
+												...send,
+												method: "sendMessage",
+												text: chunks[i]!,
+												editable: false,
+												coalesceKey: undefined,
+												photoBase64: undefined,
+												documentBase64: undefined,
+												richMarkdown: undefined,
+												richDraftMarkdown: undefined,
+												richClass: undefined,
+											},
+											topicLease,
+											socketLease,
+											publicationId: item.payload.publicationId,
 										},
-										topicLease,
-										socketLease,
-										publicationId: item.payload.publicationId,
-									},
-								});
+									}) &&
+									item.payload.publicationId
+								)
+									failedPublications.add(item.payload.publicationId);
 							}
 						};
 						const richMessageId = await deliverRichWithFallback(
@@ -8376,27 +8381,31 @@ export class TelegramNotificationDaemon {
 						// can never be re-promoted to a duplicate sendRichMessage.
 						if (item.lane !== "live") {
 							for (let i = 1; i < chunks.length; i++) {
-								this.submitPool({
-									sessionId: item.sessionId,
-									lane: item.lane,
-									payload: {
-										send: {
-											...send,
-											method: "sendMessage",
-											text: chunks[i]!,
-											editable: false,
-											coalesceKey: undefined,
-											photoBase64: undefined,
-											documentBase64: undefined,
-											richMarkdown: undefined,
-											richDraftMarkdown: undefined,
-											richClass: undefined,
+								if (
+									!this.submitPool({
+										sessionId: item.sessionId,
+										lane: item.lane,
+										payload: {
+											send: {
+												...send,
+												method: "sendMessage",
+												text: chunks[i]!,
+												editable: false,
+												coalesceKey: undefined,
+												photoBase64: undefined,
+												documentBase64: undefined,
+												richMarkdown: undefined,
+												richDraftMarkdown: undefined,
+												richClass: undefined,
+											},
+											topicLease,
+											socketLease,
+											publicationId: item.payload.publicationId,
 										},
-										topicLease,
-										socketLease,
-										publicationId: item.payload.publicationId,
-									},
-								});
+									}) &&
+									item.payload.publicationId
+								)
+									failedPublications.add(item.payload.publicationId);
 							}
 						}
 						if (editKey && ckey !== undefined && firstMessageId !== undefined && !send.terminal) {
@@ -8492,6 +8501,7 @@ export class TelegramNotificationDaemon {
 		}
 		for (const publicationId of publicationIds) {
 			if (this.pool.someQueued(item => item.payload.publicationId === publicationId)) continue;
+			if (failedPublications.has(publicationId)) continue;
 			if (publicationDispositions.get(publicationId) !== "accepted") continue;
 			await this.markPublicationDelivered(publicationId);
 			this.deferredPublications.delete(publicationId);
@@ -8886,7 +8896,18 @@ export class TelegramNotificationDaemon {
 				},
 				{ noRetry: true },
 			);
-			if (!response || typeof response !== "object" || (response as { ok?: unknown }).ok !== true) {
+			const messageId =
+				response && typeof response === "object"
+					? (response as { ok?: unknown; result?: { message_id?: unknown } }).result?.message_id
+					: undefined;
+			if (
+				!response ||
+				typeof response !== "object" ||
+				(response as { ok?: unknown }).ok !== true ||
+				typeof messageId !== "number" ||
+				!Number.isSafeInteger(messageId) ||
+				messageId <= 0
+			) {
 				for (const alias of aliases) this.#modelChoiceAliases.delete(alias);
 				throw new Error("Telegram model selection publication was rejected.");
 			}
@@ -9070,7 +9091,10 @@ export class TelegramNotificationDaemon {
 		}
 		if (msg?.type === "event_replay_result") return;
 		if (msg && typeof msg === "object") await this.#updateLogicalSessionForThreadedFrame(session, msg);
-		if (session.logicalSessionIdTrusted && !this.#leaseAllows(session)) return;
+		if (session.logicalSessionIdTrusted && !this.#leaseAllows(session)) {
+			if (publicationId) this.deferredPublications.add(publicationId);
+			return;
+		}
 		if (await this.frameRouter.dispatch(session, msg as Record<string, unknown>)) return;
 		if (await this.#renderModelChoices(session, msg as Record<string, unknown>, publicationId)) return;
 
