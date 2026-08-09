@@ -552,6 +552,11 @@ export class SessionRouter {
 			this.#sessions.delete(indexed.sessionId);
 			attached.dispose();
 			await attached.client.close().catch(() => undefined);
+			try {
+				await this.#deps.onSessionRemoved?.(capability);
+			} catch {
+				// Router authority is already revoked; provider cleanup remains best effort.
+			}
 			return false;
 		}
 		if (!(await this.#deliverRecoveredFrames(attached))) return false;

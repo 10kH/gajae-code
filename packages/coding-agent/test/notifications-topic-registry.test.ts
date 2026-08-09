@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes stopped-replacement generation 113 at serving epoch 60", () => {
+test("publishes successor-cleanup generation 114 at serving epoch 61", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 113 / serving epoch 60: replacement stopped during creation removes old provider authority.
-	expect(DAEMON_GENERATION).toBe(113);
-	expect(SERVING_EPOCH).toBe(60);
+	// Generation 114 / serving epoch 61: published successor authority is removed when stop wins.
+	expect(DAEMON_GENERATION).toBe(114);
+	expect(SERVING_EPOCH).toBe(61);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();

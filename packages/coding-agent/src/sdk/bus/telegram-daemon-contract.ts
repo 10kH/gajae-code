@@ -175,8 +175,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 111 isolates replacement client and provider cleanup failures.
  * Generation 112 preserves provider handoff while isolating replacement close failure.
  * Generation 113 removes old provider authority when replacement races stop.
+ * Generation 114 removes successor provider authority when handoff races stop.
  */
-export const DAEMON_GENERATION = 113;
+export const DAEMON_GENERATION = 114;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -235,5 +236,6 @@ export const DAEMON_GENERATION = 113;
  * Epoch 58 guarantees old authority cleanup before replacement attachment.
  * Epoch 59 drops old provider authority only when replacement creation fails.
  * Epoch 60 closes provider cleanup for replacement creation interrupted by stop.
+ * Epoch 61 closes provider cleanup after published replacement handoff.
  */
-export const SERVING_EPOCH = 60;
+export const SERVING_EPOCH = 61;
