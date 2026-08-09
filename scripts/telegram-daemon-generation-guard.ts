@@ -8,7 +8,7 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 43;
+export const GUARD_CONTRACT_VERSION = 44;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
@@ -18,8 +18,8 @@ const sdkHost = "packages/coding-agent/src/sdk/host/host.ts";
 
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
 const chatCli = "packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts";
-const chatRuntime = "packages/coding-agent/src/sdk/bus/chat-daemon-runtime.ts";
 const sdkDiscovery = "packages/coding-agent/src/sdk/client/discovery.ts";
+const sessionRouter = "packages/coding-agent/src/sdk/router/session-router.ts";
 const config = "packages/coding-agent/src/sdk/bus/config.ts";
 const guardScript = "scripts/telegram-daemon-generation-guard.ts";
 const manifestScript = "scripts/telegram-daemon-generation-manifest.json";
@@ -69,7 +69,7 @@ type GuardManifest = {
  * protected because old owners must be replaced when that admission path changes.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "bef21d66aa1784d3dc93df813f98074773c116eac8cd4c4ec2adbed1aec6432c";
+const PROTECTED_INVENTORY_SHA256 = "1cbf6a7874dbd1379a0532028d7ae499e2b92fe785baab614b150c6da9490825";
 
 /** Transition-marker generations fence every daemon lifecycle mutation. */
 export const TRANSITION_TOKEN_PROTECTED_DECLARATIONS = [
@@ -109,8 +109,14 @@ export const TELEGRAM_OWNER_LOCK_PROTECTED_DECLARATIONS = [
 export const TELEGRAM_PROCESS_AUTHORITY_PROTECTED_DECLARATIONS = ["DaemonProcessReference", "defaultProcessReference", "signalCapturedOwner"] as const;
 
 
-/** Telegram authentication and lifecycle control must remain generation-fenced. */
-export const TELEGRAM_LIFECYCLE_PROTECTED_DECLARATIONS = ["validBotToken", "requestStop", "startLifecycleControl", "run"] as const;
+/** Telegram provider authentication, supervisor lifecycle, and Router attachment entry stay generation-fenced. */
+export const TELEGRAM_LIFECYCLE_PROTECTED_DECLARATIONS = [
+	"validBotToken",
+	"requestStop",
+	"ensureTelegramDaemonRunningDetailed",
+	"TelegramNotificationDaemon.#socketLease",
+	"run",
+] as const;
 /** Callback receipt activation and revocation define durable reply authority. */
 export const TELEGRAM_CALLBACK_RECEIPT_PROTECTED_DECLARATIONS = [
 	"dropSession",
@@ -162,7 +168,7 @@ export const CHAT_CONFIG_PROTECTED_DECLARATIONS = {
 
 /** Chat-only endpoint isolation must replace daemon owners that cannot discover it. */
 export const CHAT_ENDPOINT_DISCOVERY_PROTECTED_DECLARATIONS = {
-	[chatRuntime]: ["attach"],
+	[sessionRouter]: ["SessionRouter.#attach"],
 	[sdkDiscovery]: ["readSdkSessionEndpoint"],
 } as const;
 
@@ -179,7 +185,6 @@ export const TELEGRAM_TOOL_ACTIVITY_PROTECTED_DECLARATIONS = {
 		"toolActivityDeliveryIsCurrent",
 		"handleSessionMessage",
 		"processTelegramUpdate",
-		"createSessionRouter",
 	],
 } as const;
 /** Callback recovery receipt and routing primitives must remain generation-fenced. */

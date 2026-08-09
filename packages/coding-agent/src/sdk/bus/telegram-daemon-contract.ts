@@ -93,15 +93,15 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * later session from creating a topic or replaying notifications. Generation
  * 58 preserves that invariant during durable-fence load promotion and restores
  * the exact grace deadline when a failed archive publication rolls back.
- * Generation 59 publishes the owner's attached OPEN-socket count in the
- * heartbeat sidecar so `gjc notify health` can report a live daemon that is
- * attached to no registered endpoint (#4128).
+ * Generation 59 moves lifecycle and attachment authority into SDK core,
+ * removes provider root scanning and direct endpoint credentials, and rebuilds
+ * Telegram presentation bindings from SessionRouter attachments.
  */
 export const DAEMON_GENERATION = 59;
 
 /**
- * Serving-compatibility boundary for daemon lifecycle requests. Epoch 5
- * requires the complete generation-36 topic authority contract, so older
- * epoch-4 daemons cannot keep serving across an upgrade.
+ * Serving-compatibility boundary for daemon lifecycle requests. Epoch 6
+ * requires the SDK-owned lifecycle and SessionRouter attachment contract, so
+ * root-scanning epoch-5 daemons cannot keep serving across the cutover.
  */
-export const SERVING_EPOCH = 5;
+export const SERVING_EPOCH = 6;
