@@ -141,8 +141,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * and removes the raw Router Broker mutation tunnel.
  * Generation 82 terminalizes expired and out-of-band queue removals, defers BTW
  * completion across all chunks, and classifies definitive direct rejections.
+ * Generation 83 terminalizes pending frames discarded during topic flush.
  */
-export const DAEMON_GENERATION = 82;
+export const DAEMON_GENERATION = 83;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -170,5 +171,6 @@ export const DAEMON_GENERATION = 82;
  * Epoch 27 requires no-dispatch terminalization and post-wait revalidation.
  * Epoch 28 requires terminal flat/pending admission and list-only Broker routing.
  * Epoch 29 requires complete removal terminalization and direct rejection state.
+ * Epoch 30 requires terminal settlement for pending-frame flush discards.
  */
-export const SERVING_EPOCH = 29;
+export const SERVING_EPOCH = 30;

@@ -7224,6 +7224,10 @@ export class TelegramNotificationDaemon {
 				(frame.msg.type === "tool_activity" && this.opts.toolActivity?.enabled !== true)
 			) {
 				this.failLegacyToolStart(frame.toolActivity);
+				if (frame.publicationId) {
+					await this.markPublicationRejected(frame.publicationId);
+					this.deferredPublications.delete(frame.publicationId);
+				}
 				continue;
 			}
 			await this.submitThreadedFrame(
