@@ -492,8 +492,9 @@ export class ChatDaemonRuntime {
 		input: Record<string, unknown>,
 		idempotencyKey: string,
 	): Promise<Record<string, unknown>> {
+		if (operation !== "session.list") throw new ChatDeliveryError("pre_send");
 		try {
-			return await this.#router.requestBroker(operation, input, idempotencyKey);
+			return await this.#router.listBrokerSessions(input, idempotencyKey);
 		} catch (error) {
 			if (error instanceof SessionRouterError) throw new ChatDeliveryError(error.phase);
 			throw error;

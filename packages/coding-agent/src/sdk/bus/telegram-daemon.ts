@@ -7076,6 +7076,8 @@ export class TelegramNotificationDaemon {
 		});
 		if (!submitted) {
 			this.settleRejectedLegacyToolSubmission(toolActivity, legacyStart);
+			await this.markPublicationRejected(publicationId);
+			if (publicationId) this.deferredPublications.delete(publicationId);
 			return;
 		}
 		await this.flushPool();
@@ -7147,17 +7149,19 @@ export class TelegramNotificationDaemon {
 		}
 	}
 
-	private rememberPendingThreadedFrame(
+	private async rememberPendingThreadedFrame(
 		session: AttachmentSession,
 		send: ThreadedSend,
 		msg: Record<string, unknown>,
 		toolActivity?: ToolActivityOwner,
 		publicationId?: string,
-	): void {
+	): Promise<void> {
 		const logicalSessionId = this.#logicalSessionId(session);
 		const socketLease = this.#socketLease(session, logicalSessionId);
 		if (!socketLease && !session.logicalSessionIdTrusted) {
 			this.failLegacyToolStart(toolActivity);
+			await this.markPublicationRejected(publicationId);
+			if (publicationId) this.deferredPublications.delete(publicationId);
 			return;
 		}
 		const frames = this.pendingThreadedFrames.get(logicalSessionId) ?? [];
@@ -7179,6 +7183,10 @@ export class TelegramNotificationDaemon {
 		if (frames.length > PENDING_TOPIC_FRAME_LIMIT) {
 			const evicted = frames.shift();
 			this.failLegacyToolStart(evicted?.toolActivity);
+			if (evicted?.publicationId) {
+				await this.markPublicationRejected(evicted.publicationId);
+				this.deferredPublications.delete(evicted.publicationId);
+			}
 		}
 		this.pendingThreadedFrames.set(logicalSessionId, frames);
 	}
@@ -8876,15 +8884,20 @@ export class TelegramNotificationDaemon {
 		publicationId?: string,
 	): Promise<void> {
 		if (publicationId) this.deferredPublications.add(publicationId);
-		if ((socketLease && !this.#leaseTokenAllows(socketLease)) || !(await this.pairedChatIsPrivate())) return;
-		if (toolActivity && !this.toolActivityDeliveryIsCurrent(toolActivity)) return;
-		if (socketLease && !this.#leaseTokenAllows(socketLease)) return;
+		const rejectPublication = async (): Promise<void> => {
+			await this.markPublicationRejected(publicationId);
+			if (publicationId) this.deferredPublications.delete(publicationId);
+		};
+		if ((socketLease && !this.#leaseTokenAllows(socketLease)) || !(await this.pairedChatIsPrivate()))
+			return await rejectPublication();
+		if (toolActivity && !this.toolActivityDeliveryIsCurrent(toolActivity)) return await rejectPublication();
+		if (socketLease && !this.#leaseTokenAllows(socketLease)) return await rejectPublication();
 		await this.notifyThreadedFallback(socketLease);
-		if (toolActivity && !this.toolActivityDeliveryIsCurrent(toolActivity)) return;
-		if (socketLease && !this.#leaseTokenAllows(socketLease)) return;
-		if (toolActivity && !this.toolActivityDeliveryIsCurrent(toolActivity)) return;
-		if (send.identity && this.flatIdentitySent.has(sessionId)) return;
-		if (toolActivity && !this.toolActivityDeliveryIsCurrent(toolActivity)) return;
+		if (toolActivity && !this.toolActivityDeliveryIsCurrent(toolActivity)) return await rejectPublication();
+		if (socketLease && !this.#leaseTokenAllows(socketLease)) return await rejectPublication();
+		if (toolActivity && !this.toolActivityDeliveryIsCurrent(toolActivity)) return await rejectPublication();
+		if (send.identity && this.flatIdentitySent.has(sessionId)) return await rejectPublication();
+		if (toolActivity && !this.toolActivityDeliveryIsCurrent(toolActivity)) return await rejectPublication();
 		const legacyToolStart =
 			toolActivity?.phase === "started"
 				? this.legacyToolStarts.get(`${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`)
@@ -8927,6 +8940,8 @@ export class TelegramNotificationDaemon {
 		});
 		if (!submitted) {
 			this.settleRejectedLegacyToolSubmission(toolActivity, legacyToolStart);
+			await this.markPublicationRejected(publicationId);
+			if (publicationId) this.deferredPublications.delete(publicationId);
 			return;
 		}
 		await this.flushPool();
@@ -9816,7 +9831,7 @@ export class TelegramNotificationDaemon {
 				await this.failPublicationPreSend(publicationId, "topic authority is inactive or malformed");
 			}
 			if (!send.identity && !existingTopic && !this.flatIdentitySent.has(logicalSessionId)) {
-				this.rememberPendingThreadedFrame(session, send, threadedFrame, toolActivity, publicationId);
+				await this.rememberPendingThreadedFrame(session, send, threadedFrame, toolActivity, publicationId);
 				return;
 			}
 			const topicId =

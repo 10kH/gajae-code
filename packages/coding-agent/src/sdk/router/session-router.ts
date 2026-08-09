@@ -324,12 +324,9 @@ export class SessionRouter {
 		}
 	}
 
-	/** Executes one Broker request using Router-owned broker discovery and client custody. */
-	async requestBroker(
-		operation: string,
-		input: Record<string, unknown>,
-		idempotencyKey: string,
-	): Promise<Record<string, unknown>> {
+	/** Lists saved sessions through Router-owned Broker discovery without exposing credentials or mutation authority. */
+	async listBrokerSessions(input: Record<string, unknown>, idempotencyKey: string): Promise<Record<string, unknown>> {
+		const operation = "session.list";
 		const discovery = await readSdkBrokerDiscovery(this.#agentDir);
 		if (!discovery) throw new SessionRouterError("pre_send");
 		let client: SessionRouterClient;
