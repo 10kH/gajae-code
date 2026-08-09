@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes generic-persistence generation 99 at serving epoch 46", () => {
+test("publishes centralized-persistence generation 100 at serving epoch 47", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 99 / serving epoch 46: generic terminal receipt failures reject Router waiters.
-	expect(DAEMON_GENERATION).toBe(99);
-	expect(SERVING_EPOCH).toBe(46);
+	// Generation 100 / serving epoch 47: every terminal persistence rollback rejects Router waiters.
+	expect(DAEMON_GENERATION).toBe(100);
+	expect(SERVING_EPOCH).toBe(47);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();

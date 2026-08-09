@@ -5611,6 +5611,7 @@ export class TelegramNotificationDaemon {
 			logger.warn(
 				`notifications: Telegram presentation state persistence failed: ${sanitizeDiagnostic(String(error))}`,
 			);
+			this.rejectPublicationSettlement(publicationId, error);
 			throw error;
 		}
 		this.settlePublication(publicationId);
@@ -5632,6 +5633,7 @@ export class TelegramNotificationDaemon {
 			this.rejectedPublications.delete(publicationId);
 			if (claimedAt !== undefined) this.claimedPublications.set(publicationId, claimedAt);
 			if (ambiguousAt !== undefined) this.ambiguousPublications.set(publicationId, ambiguousAt);
+			this.rejectPublicationSettlement(publicationId, error);
 			throw error;
 		}
 		this.settlePublication(publicationId);

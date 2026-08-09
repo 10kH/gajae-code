@@ -161,8 +161,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 97 bounds strict tool terminalization with shutdown abort authority.
  * Generation 98 applies delivery abort authority to every supervised Bot API call.
  * Generation 99 propagates generic terminal receipt persistence failure to Router.
+ * Generation 100 centralizes terminal receipt failure propagation in state transitions.
  */
-export const DAEMON_GENERATION = 99;
+export const DAEMON_GENERATION = 100;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -207,5 +208,6 @@ export const DAEMON_GENERATION = 99;
  * Epoch 44 closes terminal tool transport hangs during shutdown.
  * Epoch 45 closes raw topic and callback transport hangs during shutdown.
  * Epoch 46 closes timer-finalized publication persistence settlement.
+ * Epoch 47 covers every delivered/rejected persistence rollback path.
  */
-export const SERVING_EPOCH = 46;
+export const SERVING_EPOCH = 47;
