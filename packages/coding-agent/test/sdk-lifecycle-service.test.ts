@@ -290,6 +290,13 @@ describe("SessionLifecycleService", () => {
 				target: { sessionIdOrPrefix: "" },
 			});
 			expect(emptyPrefix).toMatchObject({ kind: "unavailable" });
+			const unsafePrefix = await service.resumeExternal({
+				actor,
+				capability: "session.resume",
+				requestKey: "resume-unsafe-prefix",
+				target: { sessionIdOrPrefix: "../session" },
+			});
+			expect(unsafePrefix).toMatchObject({ kind: "unavailable" });
 			expect(listSpy).not.toHaveBeenCalled();
 		} finally {
 			listSpy.mockRestore();

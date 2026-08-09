@@ -64,6 +64,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+const EXTERNAL_SESSION_PREFIX_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+
 function validExternalSessionCreateTarget(value: unknown): value is ExternalSessionCreateTarget {
 	if (!isRecord(value) || typeof value.kind !== "string") return false;
 	if (value.kind === "plain_dir" || value.kind === "existing_path")
@@ -95,7 +97,7 @@ function validExternalSessionResumeTarget(value: unknown): value is ExternalSess
 	return (
 		isRecord(value) &&
 		typeof value.sessionIdOrPrefix === "string" &&
-		value.sessionIdOrPrefix.length > 0 &&
+		EXTERNAL_SESSION_PREFIX_PATTERN.test(value.sessionIdOrPrefix) &&
 		(value.path === undefined || (typeof value.path === "string" && value.path.length > 0))
 	);
 }
@@ -189,7 +191,7 @@ export class AgentDirSessionLifecycleService extends SessionLifecycleService {
 		const rawRequest: Record<string, unknown> = isRecord(request) ? request : {};
 		const targetInput = rawRequest.target;
 		if (!validExternalSessionResumeTarget(targetInput))
-			return invalidExternalResume("resume target requires a non-empty sessionIdOrPrefix");
+			return invalidExternalResume("resume target requires a safe session id or prefix");
 		const validation = validateSessionLifecycleMutationRequest({
 			operation: "session.resume",
 			actor: rawRequest.actor,
