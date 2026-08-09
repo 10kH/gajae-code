@@ -117,7 +117,7 @@
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/notifications-lifecycle-control-runtime.test.ts"
+				"packages/coding-agent/test/notifications-sdk-lifecycle-service.test.ts"
 			]
 		},
 		{
@@ -125,27 +125,6 @@
 				"bun",
 				"test",
 				"packages/coding-agent/test/notifications-lifecycle-create-autoresume.test.ts"
-			]
-		},
-		{
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/notifications-lifecycle-daemon-ownership.test.ts"
-			]
-		},
-		{
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/notifications-lifecycle-native-control.test.ts"
-			]
-		},
-		{
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/notifications-lifecycle-orchestrator.test.ts"
 			]
 		},
 		{
