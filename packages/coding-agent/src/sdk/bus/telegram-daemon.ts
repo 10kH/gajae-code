@@ -628,7 +628,7 @@ async function syncTelegramFile(fsImpl: TelegramDaemonFs, file: string): Promise
 }
 
 async function syncTelegramDirectory(fsImpl: TelegramDaemonFs, directory: string): Promise<void> {
-	let handle: Awaited<ReturnType<TelegramDaemonFs["open"]>>;
+	let handle: { sync?: () => Promise<void>; close(): Promise<void> };
 	try {
 		handle = await fsImpl.open(directory, "r");
 	} catch (error) {
@@ -3894,7 +3894,7 @@ interface AttachmentSession {
 	toolActivityCapability?: "v1" | "v2";
 	lastPongAt: number;
 	awaitingNonce: string | undefined;
-	pingTimer: ReturnType<typeof setInterval> | undefined;
+	pingTimer: NodeJS.Timeout | undefined;
 	replayId: string;
 	replayPending: boolean;
 	replayQueue: Array<{ frame: Record<string, unknown>; publicationId?: string }>;
