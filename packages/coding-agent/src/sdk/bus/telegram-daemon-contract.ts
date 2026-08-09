@@ -167,8 +167,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 103 fences and joins Router reconciliation during stop.
  * Generation 104 prevents Router timer installation after concurrent stop.
  * Generation 105 revokes attachment capabilities immediately when Router stop begins.
+ * Generation 106 isolates every Router client close attempt during shutdown.
  */
-export const DAEMON_GENERATION = 105;
+export const DAEMON_GENERATION = 106;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -219,5 +220,6 @@ export const DAEMON_GENERATION = 105;
  * Epoch 50 prevents attachment resurrection after provider shutdown.
  * Epoch 51 fully fences Router startup and reconciliation after stop.
  * Epoch 52 prevents provider dispatch throughout the Router stop window.
+ * Epoch 53 prevents one transport close timeout from skipping later cleanup.
  */
-export const SERVING_EPOCH = 52;
+export const SERVING_EPOCH = 53;

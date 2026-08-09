@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes immediate-revocation generation 105 at serving epoch 52", () => {
+test("publishes close-isolation generation 106 at serving epoch 53", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 105 / serving epoch 52: Router stop immediately revokes attachment dispatch.
-	expect(DAEMON_GENERATION).toBe(105);
-	expect(SERVING_EPOCH).toBe(52);
+	// Generation 106 / serving epoch 53: Router close failures cannot skip later clients.
+	expect(DAEMON_GENERATION).toBe(106);
+	expect(SERVING_EPOCH).toBe(53);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();

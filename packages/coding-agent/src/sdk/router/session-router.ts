@@ -220,11 +220,17 @@ export class SessionRouter {
 		this.#ready = false;
 		await this.#reconcileTail.catch(() => undefined);
 		await Promise.allSettled([...this.#pending]);
+		const closeErrors: unknown[] = [];
 		for (const [sessionId, attached] of this.#sessions) {
 			this.#sessions.delete(sessionId);
 			attached.dispose();
-			await attached.client.close();
+			try {
+				await attached.client.close();
+			} catch (error) {
+				closeErrors.push(error);
+			}
 		}
+		if (closeErrors.length > 0) throw new AggregateError(closeErrors, "SessionRouter client shutdown failed.");
 	}
 
 	/** Returns an opaque lease only while the exact attachment generation is live. */
