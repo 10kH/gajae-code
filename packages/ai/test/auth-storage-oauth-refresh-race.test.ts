@@ -749,6 +749,24 @@ describe("AuthStorage OAuth refresh race", () => {
 				expect(plainRefreshSpy).not.toHaveBeenCalled();
 				expect(tokenRequests).toHaveLength(1);
 				expect(tokenRequests[0]).toContain("refresh_token=mcp-refresh");
+
+				// The adopted binding must SURVIVE persistence: stripping it would
+				// send the next (rotated) refresh token to the plain provider
+				// endpoint instead of the bound one.
+				const stored = store!.listAuthCredentials("anthropic");
+				expect(stored).toHaveLength(1);
+				if (stored[0]?.credential.type === "oauth") {
+					expect(stored[0].credential.refresh).toBe("mcp-refresh-2");
+					expect(stored[0].credential.mcpBinding?.tokenEndpoint).toBe(`${origin}/token`);
+				}
+
+				// Second, forced refresh: must dial the bound endpoint again with
+				// the rotated token — proving both binding persistence and that a
+				// local forced refresh of a bound row goes through the guard.
+				await authStorage!.refreshCredentialById(credentialId);
+				expect(plainRefreshSpy).not.toHaveBeenCalled();
+				expect(tokenRequests).toHaveLength(2);
+				expect(tokenRequests[1]).toContain("refresh_token=mcp-refresh-2");
 			});
 		} finally {
 			server.stop(true);
@@ -792,5 +810,115 @@ describe("AuthStorage OAuth refresh race", () => {
 		expect(apiKey).toBe("fresh-access-from-peer");
 		expect(refreshSpy).not.toHaveBeenCalled();
 		expect(events).toHaveLength(0);
+	});
+	test("a forced refresh of a stale MCP-bound snapshot adopts the persisted rotation", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		// The in-memory target is MCP-bound but STALE: a peer already rotated
+		// the persisted row. A local forced refresh must go through the guard
+		// and spend the peer's newest refresh token at the bound endpoint —
+		// never replay the stale one.
+		const tokenRequests: string[] = [];
+		const server = Bun.serve({
+			port: 0,
+			fetch: async request => {
+				const body = await request.text();
+				tokenRequests.push(body);
+				if (body.includes("stale-mcp-refresh")) {
+					return new Response("invalid_grant", { status: 400 });
+				}
+				return Response.json({
+					access_token: "mcp-force-access",
+					refresh_token: "mcp-force-refresh",
+					expires_in: 3600,
+				});
+			},
+		});
+		try {
+			const origin = `http://localhost:${server.port}`;
+			const binding = { resourceOrigin: origin, tokenEndpoint: `${origin}/token` };
+
+			await authStorage.set("anthropic", [
+				{
+					type: "oauth",
+					access: "stale-mcp-access",
+					refresh: "stale-mcp-refresh",
+					expires: Date.now() + 60 * 60_000,
+					mcpBinding: binding,
+				},
+			]);
+			const credentialId = store.listAuthCredentials("anthropic")[0]!.id;
+			store.updateAuthCredential(credentialId, {
+				type: "oauth",
+				access: "peer-mcp-access",
+				refresh: "peer-mcp-refresh",
+				expires: Date.now() + 60 * 60_000,
+				mcpBinding: binding,
+			});
+
+			await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+				const entry = await authStorage!.refreshCredentialById(credentialId);
+
+				expect(tokenRequests).toHaveLength(1);
+				expect(tokenRequests[0]).toContain("refresh_token=peer-mcp-refresh");
+				if (entry.credential.type === "oauth") {
+					expect(entry.credential.access).toBe("mcp-force-access");
+				}
+				const stored = store!.listAuthCredentials("anthropic");
+				if (stored[0]?.credential.type === "oauth") {
+					expect(stored[0].credential.refresh).toBe("mcp-force-refresh");
+					expect(stored[0].credential.mcpBinding?.tokenEndpoint).toBe(`${origin}/token`);
+				}
+			});
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	test("an adopted token's definitive failure disables the row instead of looping, even for frozen errors", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		// Direct P1-b regression: snapshot token A is stale, the guard adopts
+		// persisted token B, and B fails definitively. Recovery must compare the
+		// row against B (the token actually sent) — comparing against A would
+		// misread the adoption as a peer rotation and reload-retry forever. The
+		// provider throws a FROZEN error: attempt provenance must not be
+		// recorded by mutating the thrown object.
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "stale-access",
+				refresh: "token-a",
+				expires: Date.now() - 60_000,
+			},
+		]);
+		const credentialId = store.listAuthCredentials("anthropic")[0]!.id;
+		store.updateAuthCredential(credentialId, {
+			type: "oauth",
+			access: "expired-access-b",
+			refresh: "token-b",
+			expires: Date.now() - 1_000,
+		});
+
+		const refreshedWith: string[] = [];
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async (_provider, credentials) => {
+			refreshedWith.push(credentials.refresh);
+			throw Object.freeze(new Error('invalid_grant {"error":"invalid_grant","error_description":"revoked"}'));
+		});
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async () => {
+			throw Object.freeze(new Error('invalid_grant {"error":"invalid_grant","error_description":"revoked"}'));
+		});
+
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			const apiKey = await authStorage!.getApiKey("anthropic", "session-adopted-definitive");
+
+			expect(apiKey).toBeUndefined();
+			// Only token B was ever dialed, exactly once.
+			expect(refreshedWith).toEqual(["token-b"]);
+			// Disabled with the definitive cause — not spun through reload-retry.
+			expect(events).toHaveLength(1);
+			expect(events[0]?.disabledCause).toContain("invalid_grant");
+			expect(store!.listAuthCredentials("anthropic")).toHaveLength(0);
+		});
 	});
 });

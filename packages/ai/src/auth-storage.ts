@@ -765,26 +765,35 @@ const MAX_OAUTH_RESOLUTION_RELOADS = 3;
 const OAUTH_REFRESH_FAILURE_REPLAY_GUARD_MS = 30_000;
 
 /**
- * Tag a refresh failure with the refresh token that was actually sent
- * upstream, so failure recovery can distinguish "a peer rotated the row"
- * from "the guard adopted the persisted token and that token failed".
- * Without the tag, recovery compares the row against the caller's stale
- * snapshot and misreads its own adoption as a peer rotation.
+ * A refresh result that carries the full authority of the credential that was
+ * actually refreshed: rotated tokens plus the identity metadata and MCP
+ * binding of the effective (possibly guard-adopted) credential. Callers
+ * persist from this shape so an adopted binding or identity is never
+ * reconstructed from a stale snapshot.
  */
-const ATTEMPTED_REFRESH_TOKEN = Symbol("gjc.oauth.attemptedRefreshToken");
+type RefreshedOAuthCredentials = OAuthCredentials & { mcpBinding?: MCPOAuthBinding };
 
-type RefreshAttemptTagged = { [ATTEMPTED_REFRESH_TOKEN]?: string };
+/**
+ * Side-table mapping a refresh failure to the refresh token that was actually
+ * sent upstream, so failure recovery can distinguish "a peer rotated the row"
+ * from "the guard adopted the persisted token and that token failed". Without
+ * it, recovery compares the row against the caller's stale snapshot and
+ * misreads its own adoption as a peer rotation. A WeakMap is used instead of
+ * mutating the thrown object: providers may throw frozen/sealed errors, and
+ * writing a property to those would replace the real failure with a TypeError.
+ */
+const attemptedRefreshTokens = new WeakMap<object, string>();
 
 function tagRefreshAttempt(error: unknown, refreshToken: string): unknown {
 	if (error !== null && typeof error === "object") {
-		(error as RefreshAttemptTagged)[ATTEMPTED_REFRESH_TOKEN] = refreshToken;
+		attemptedRefreshTokens.set(error, refreshToken);
 	}
 	return error;
 }
 
 function getAttemptedRefreshToken(error: unknown): string | undefined {
 	if (error !== null && typeof error === "object") {
-		return (error as RefreshAttemptTagged)[ATTEMPTED_REFRESH_TOKEN];
+		return attemptedRefreshTokens.get(error);
 	}
 	return undefined;
 }
@@ -1061,7 +1070,7 @@ export class AuthStorage {
 	#providerOAuthRefreshGenerations = new Map<string, number>();
 	#generationListeners: Set<(generation: number) => void> = new Set();
 	#oauthRefreshInFlight: Map<number, Promise<AuthCredentialSnapshotEntry>> = new Map();
-	#oauthCredentialRefreshInFlight: Map<number, Promise<OAuthCredentials>> = new Map();
+	#oauthCredentialRefreshInFlight: Map<number, Promise<RefreshedOAuthCredentials>> = new Map();
 	/**
 	 * Locally failed refresh attempts keyed by `${credentialId}:${refreshToken}`.
 	 * See {@link OAUTH_REFRESH_FAILURE_REPLAY_GUARD_MS}.
@@ -3570,14 +3579,15 @@ export class AuthStorage {
 		credentialId: number | undefined,
 		signal?: AbortSignal,
 		force = false,
-	): Promise<OAuthCredentials> {
+		mcpClient: MCPOAuthRefreshClient = {},
+	): Promise<RefreshedOAuthCredentials> {
 		if (credentialId !== undefined) {
 			const existing = this.#oauthCredentialRefreshInFlight.get(credentialId);
 			if (existing) return raceCredentialRefreshWithSignal(existing, signal);
 		}
 		if (!force && Date.now() + OAUTH_REFRESH_SKEW_MS < credential.expires) return credential;
 		if (credentialId === undefined) {
-			return this.#refreshOAuthCredentialUnshared(provider, credential, undefined, signal, force);
+			return this.#refreshOAuthCredentialUnshared(provider, credential, undefined, signal, force, mcpClient);
 		}
 		const promise = this.#refreshOAuthCredentialUnshared(
 			provider,
@@ -3585,6 +3595,7 @@ export class AuthStorage {
 			credentialId,
 			undefined,
 			force,
+			mcpClient,
 		).finally(() => {
 			this.#oauthCredentialRefreshInFlight.delete(credentialId);
 		});
@@ -3598,7 +3609,8 @@ export class AuthStorage {
 		credentialId: number | undefined,
 		signal?: AbortSignal,
 		force = false,
-	): Promise<OAuthCredentials> {
+		mcpClient: MCPOAuthRefreshClient = {},
+	): Promise<RefreshedOAuthCredentials> {
 		let refreshPromise: Promise<OAuthCredentials>;
 		let localDial = false;
 		// Caller override > store-level hook > local per-provider refresh.
@@ -3649,8 +3661,10 @@ export class AuthStorage {
 			// though we saw a failure (timeout, lost response), so replaying it
 			// risks reuse-detection revocation. Surface the memoized failure
 			// instead of dialing again; a peer's successful rotation changes the
-			// token and therefore never hits this memo.
-			if (credentialId !== undefined) {
+			// token and therefore never hits this memo. Explicit force refreshes
+			// bypass the check (a deliberate operator/broker retry must reach the
+			// endpoint) but their failures are still recorded below.
+			if (!force && credentialId !== undefined) {
 				const memoKey = `${credentialId}:${credential.refresh}`;
 				const memo = this.#recentOAuthRefreshFailures.get(memoKey);
 				if (memo && memo.expiresAt > Date.now()) {
@@ -3663,7 +3677,7 @@ export class AuthStorage {
 			// and its refresh token must only ever be sent to the bound token
 			// endpoint.
 			if (credential.mcpBinding) {
-				refreshPromise = refreshBoundMCPOAuthCredential(credential, {}, signal);
+				refreshPromise = refreshBoundMCPOAuthCredential(credential, mcpClient, signal);
 			} else {
 				const customProvider = getOAuthProvider(provider);
 				if (customProvider) {
@@ -3695,7 +3709,22 @@ export class AuthStorage {
 			}
 		}
 		try {
-			return await Promise.race([refreshPromise, cancellation.promise]);
+			const refreshed = await Promise.race([refreshPromise, cancellation.promise]);
+			// Return the FULL authority of the effective credential: rotated
+			// tokens from upstream plus the identity metadata and MCP binding of
+			// the (possibly guard-adopted) credential that was actually
+			// refreshed. Callers persist from this shape; rebuilding it from
+			// their stale snapshots would strip an adopted binding — sending the
+			// next refresh token to the wrong endpoint — or relabel rotated
+			// tokens with stale identity.
+			return {
+				...refreshed,
+				accountId: refreshed.accountId ?? credential.accountId,
+				email: refreshed.email ?? credential.email,
+				projectId: refreshed.projectId ?? credential.projectId,
+				enterpriseUrl: refreshed.enterpriseUrl ?? credential.enterpriseUrl,
+				mcpBinding: (refreshed as RefreshedOAuthCredentials).mcpBinding ?? credential.mcpBinding,
+			};
 		} catch (error) {
 			if (localDial && credentialId !== undefined) {
 				for (const [key, entry] of this.#recentOAuthRefreshFailures) {
@@ -3803,6 +3832,10 @@ export class AuthStorage {
 
 		try {
 			let result: { newCredentials: OAuthCredentials; apiKey: string } | null;
+			// The refresh result carries the effective (possibly guard-adopted)
+			// credential's binding; `updated` must persist it or the next refresh
+			// of an MCP-bound row would dial the plain provider endpoint.
+			let refreshedAuthority: RefreshedOAuthCredentials;
 			const customProvider = getOAuthProvider(provider);
 			if (customProvider) {
 				const refreshedCredentials = await this.#refreshOAuthCredential(
@@ -3811,6 +3844,7 @@ export class AuthStorage {
 					this.#getStoredCredentials(provider)[selection.index]?.id,
 					options?.signal,
 				);
+				refreshedAuthority = refreshedCredentials;
 				const apiKey = customProvider.getApiKey
 					? customProvider.getApiKey(refreshedCredentials)
 					: refreshedCredentials.access;
@@ -3827,6 +3861,7 @@ export class AuthStorage {
 					this.#getStoredCredentials(provider)[selection.index]?.id,
 					options?.signal,
 				);
+				refreshedAuthority = refreshedCredentials;
 				const oauthCreds: Record<string, OAuthCredentials> = {
 					[provider]: refreshedCredentials,
 				};
@@ -3842,6 +3877,7 @@ export class AuthStorage {
 				email: result.newCredentials.email ?? selection.credential.email,
 				projectId: result.newCredentials.projectId ?? selection.credential.projectId,
 				enterpriseUrl: result.newCredentials.enterpriseUrl ?? selection.credential.enterpriseUrl,
+				mcpBinding: refreshedAuthority.mcpBinding,
 			};
 			this.#replaceCredentialAt(provider, selection.index, updated);
 			if ((checkUsage && !allowBlocked) || requiresProModel) {
@@ -4373,17 +4409,13 @@ export class AuthStorage {
 			// requested refresh. The guard still substitutes the newest persisted
 			// refresh token when a peer rotated the row.
 			const stale: OAuthCredential = { ...target.credential, expires: 0 };
-			let refreshed: OAuthCredentials;
-			if (target.credential.mcpBinding) {
+			let refreshed: RefreshedOAuthCredentials;
+			const remoteRefresh = this.#store.refreshMCPOAuthCredential?.bind(this.#store);
+			if (target.credential.mcpBinding && remoteRefresh) {
+				// Remote (broker) stores refresh MCP-bound rows server-side; the
+				// server runs the guarded local path against its own row.
 				assertCanonicalMCPOAuthBinding(target.credential.mcpBinding);
-				const remoteRefresh = this.#store.refreshMCPOAuthCredential?.bind(this.#store);
-				const refreshedCredential = remoteRefresh
-					? await remoteRefresh(id, stale, mcpClient, signal)
-					: {
-							type: "oauth" as const,
-							...(await refreshBoundMCPOAuthCredential(stale, mcpClient, signal)),
-							mcpBinding: target.credential.mcpBinding,
-						};
+				const refreshedCredential = await remoteRefresh(id, stale, mcpClient, signal);
 				if (
 					refreshedCredential.mcpBinding?.resourceOrigin !== target.credential.mcpBinding.resourceOrigin ||
 					refreshedCredential.mcpBinding.tokenEndpoint !== target.credential.mcpBinding.tokenEndpoint
@@ -4391,8 +4423,29 @@ export class AuthStorage {
 					throw new Error("Refreshed MCP OAuth credential binding mismatch");
 				}
 				refreshed = refreshedCredential;
+			} else if (target.credential.mcpBinding) {
+				// Local forced refresh of a bound row dials the unshared path
+				// DIRECTLY so the caller's cancellation signal reaches the bound
+				// token fetch (documented contract) — while still running the
+				// stale-snapshot guard, memo recording, and failure provenance.
+				// The outer #oauthRefreshInFlight map already single-flights
+				// concurrent public force callers per row.
+				assertCanonicalMCPOAuthBinding(target.credential.mcpBinding);
+				refreshed = await this.#refreshOAuthCredentialUnshared(
+					provider as Provider,
+					stale,
+					id,
+					signal,
+					true,
+					mcpClient,
+				);
 			} else {
-				refreshed = await this.#refreshOAuthCredential(provider as Provider, stale, id, signal, true);
+				// Plain local force refresh routes through the guarded, memoized,
+				// single-flighted path: the stale-snapshot guard adopts a
+				// peer-rotated row (tokens AND binding) before dispatch, so a
+				// forced refresh never replays a rotated token or dials a stale
+				// endpoint. The returned authority carries the effective binding.
+				refreshed = await this.#refreshOAuthCredential(provider as Provider, stale, id, signal, true, mcpClient);
 			}
 			const updated: OAuthCredential = {
 				type: "oauth",
@@ -4403,7 +4456,7 @@ export class AuthStorage {
 				email: refreshed.email ?? target.credential.email,
 				projectId: refreshed.projectId ?? target.credential.projectId,
 				enterpriseUrl: refreshed.enterpriseUrl ?? target.credential.enterpriseUrl,
-				mcpBinding: target.credential.mcpBinding,
+				mcpBinding: refreshed.mcpBinding,
 			};
 			this.#replaceCredentialAt(provider, index, updated);
 			return {
