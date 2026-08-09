@@ -14435,7 +14435,7 @@ export class SessionManager {
 	}
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.#sessionFile) return;
-		this.#readOnlyResume = false;
+		const publishResumeBreadcrumb = this.#readOnlyResume;
 		if (this.#persistError) throw this.#persistError;
 
 		// Normally we wait for the first assistant message before persisting to avoid
@@ -14460,6 +14460,8 @@ export class SessionManager {
 			// test-level tempDir cleanup.
 			try {
 				this.#rewriteFileSync();
+				if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+				this.#readOnlyResume = false;
 			} catch (err) {
 				this.#recordPersistError(err);
 				throw this.#persistError ?? toError(err);
@@ -14472,6 +14474,7 @@ export class SessionManager {
 		// landing immediately after this call. Image externalization (rare) runs via
 		// the synchronous blob-store path so blob bytes are durable before the JSONL
 		// line referencing them is written.
+		let persisted = false;
 		try {
 			this.#withSessionPersistenceFenceSync(() => {
 				if (this.destination.kind === "managed") {
@@ -14482,6 +14485,7 @@ export class SessionManager {
 					);
 					const persistedEntry = prepareEntryForPersistenceSync(materializedEntry, this.#blobStore);
 					this.#appendManagedRecordsSync([persistedEntry]);
+					persisted = true;
 					return;
 				}
 				const writer = this.#ensurePersistWriter();
@@ -14500,7 +14504,10 @@ export class SessionManager {
 				);
 				const persistedEntry = prepareEntryForPersistenceSync(materializedEntry, this.#blobStore);
 				writer.writeSync(persistedEntry);
+				persisted = true;
 			});
+			if (publishResumeBreadcrumb && persisted) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			if (persisted) this.#readOnlyResume = false;
 		} catch (err) {
 			this.#recordPersistError(err);
 			throw this.#persistError ?? toError(err);
@@ -17539,6 +17546,7 @@ export class SessionManager {
 			await manager.close();
 			return ownershipInspection;
 		}
+		manager.#sanitizeLoadedOpenAIResponsesReplayMetadata();
 		return { kind: "opened", manager };
 	}
 

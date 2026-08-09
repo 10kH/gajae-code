@@ -8934,6 +8934,10 @@ export class AgentSession {
 
 			const buildPreSubmit = async (): Promise<AgentMessage[] | null> => {
 				this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
+				if (options?.onFinalPreflight && !(await options.onFinalPreflight({ hasPendingNextTurnMessages }))) {
+					this.#resetInjectedContextSignatures();
+					return null;
+				}
 				if (!phaseACompleted) {
 					phaseACompleted = true;
 					// Phase A (one-time side-effectful products; runs once).
