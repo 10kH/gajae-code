@@ -9034,7 +9034,9 @@ export class TelegramNotificationDaemon {
 					this.dropSession(session, "replay_admission_failed");
 					return;
 				}
-				await this.markPublicationDelivered(replayPublicationIds.get(frame));
+				const replayPublicationId = replayPublicationIds.get(frame);
+				if (!this.deferredPublications.has(replayPublicationId ?? ""))
+					await this.markPublicationDelivered(replayPublicationId);
 			}
 			const queued = session.replayQueue.splice(0);
 			for (const queuedItem of queued) {
@@ -9049,11 +9051,11 @@ export class TelegramNotificationDaemon {
 				if (remaining > 0) {
 					if (remaining === 1) replayCounts.delete(fingerprint);
 					else replayCounts.set(fingerprint, remaining - 1);
-					await this.markPublicationDelivered(queuedItem.publicationId);
 					continue;
 				}
 				await this.handleSessionMessage(session, frame, queuedItem.publicationId);
-				await this.markPublicationDelivered(queuedItem.publicationId);
+				if (!this.deferredPublications.has(queuedItem.publicationId ?? ""))
+					await this.markPublicationDelivered(queuedItem.publicationId);
 			}
 			await this.#onRouterAttachmentReady(session);
 			this.#terminalizeBtwTurnsForGenerationChange(session);

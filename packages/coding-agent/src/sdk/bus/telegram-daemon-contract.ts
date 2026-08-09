@@ -102,14 +102,17 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * and retains ambiguous claims across restart to prevent duplicate effects.
  * Generation 62 confirms receipts only from accepted provider outcomes,
  * retains queued/fallback claims, and quarantines legacy v1 confirmations.
+ * Generation 63 applies the same deferred confirmation boundary while draining
+ * replay-state and live-held frames during attachment recovery.
  */
-export const DAEMON_GENERATION = 62;
+export const DAEMON_GENERATION = 63;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
  * requires durable publication receipts and acknowledged attachment dispatch,
  * so epoch-6 daemons cannot serve across the delivery-safety cutover. Epoch 8
  * requires the durable claimed/confirmed publication receipt format. Epoch 9
- * requires accepted-only confirmation and legacy receipt quarantine.
+ * requires accepted-only confirmation and legacy receipt quarantine. Epoch 10
+ * requires replay admission to retain deferred publication claims.
  */
-export const SERVING_EPOCH = 9;
+export const SERVING_EPOCH = 10;
