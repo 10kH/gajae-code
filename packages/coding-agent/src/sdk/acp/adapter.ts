@@ -231,6 +231,16 @@ export class AcpSdkAdapter {
 		return await this.#client.query(query, input, cursor);
 	}
 	async global(operation: string, input: JsonObject = {}, idempotencyKey?: string): Promise<unknown> {
+		const result = await this.#lifecycleRequest(operation, input, idempotencyKey);
+		return isLifecycleOperation(operation) ? credentialFreeLifecycleResult(result) : result;
+	}
+	/** Uses lifecycle endpoint credentials only inside the ACP session owner. */
+	async lifecycle(operation: string, input: JsonObject = {}, idempotencyKey?: string): Promise<unknown> {
+		if (!isLifecycleOperation(operation))
+			throw new AcpSdkAdapterError("invalid_input", "ACP lifecycle requests must use a lifecycle operation.");
+		return await this.#lifecycleRequest(operation, input, idempotencyKey);
+	}
+	async #lifecycleRequest(operation: string, input: JsonObject, idempotencyKey?: string): Promise<unknown> {
 		this.#assertGenericDisposition("global", operation);
 		if (isLifecycleOperation(operation) && !idempotencyKey)
 			throw new AcpSdkAdapterError("invalid_input", "idempotencyKey is required for lifecycle operations.");
@@ -240,11 +250,10 @@ export class AcpSdkAdapter {
 		// request that named no readiness budget is queued for the default one, so it
 		// needs the same extension rather than the client's generic request deadline.
 		const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
-		const result = await this.#client.global(operation, input, {
+		return await this.#client.global(operation, input, {
 			idempotencyKey,
 			...(timeoutMs === undefined ? {} : { timeoutMs }),
 		});
-		return isLifecycleOperation(operation) ? credentialFreeLifecycleResult(result) : result;
 	}
 
 	async sdkControl(params: { operation: string; input?: JsonObject }): Promise<unknown> {

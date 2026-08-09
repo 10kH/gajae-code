@@ -3049,7 +3049,7 @@ export class AcpAgent implements Agent {
 		mcpServers: SessionLifecycleMcpServer[],
 	): Promise<unknown> {
 		try {
-			return await (await this.#brokerAdapter()).global(operation, input, idempotencyKey);
+			return await (await this.#brokerAdapter()).lifecycle(operation, input, idempotencyKey);
 		} catch (error) {
 			throw acpMcpLaunchFailure(error, mcpServers);
 		}
