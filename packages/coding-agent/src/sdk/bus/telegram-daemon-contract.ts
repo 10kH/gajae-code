@@ -130,8 +130,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * and gives each publication queue item a non-coalescing identity.
  * Generation 76 adds durable terminal rejection for invalid direct frames and
  * confirms accepted non-OK BTW status publications before returning.
+ * Generation 77 bounds terminal rejection receipts alongside delivered receipts.
  */
-export const DAEMON_GENERATION = 76;
+export const DAEMON_GENERATION = 77;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -153,5 +154,6 @@ export const DAEMON_GENERATION = 76;
  * Epoch 21 requires ordered Router settlement waiters for queued publications.
  * Epoch 22 requires unified dispatch guards and non-coalescing publication work.
  * Epoch 23 requires explicit rejected state and terminal direct settlement.
+ * Epoch 24 requires bounded terminal rejection retention.
  */
-export const SERVING_EPOCH = 23;
+export const SERVING_EPOCH = 24;

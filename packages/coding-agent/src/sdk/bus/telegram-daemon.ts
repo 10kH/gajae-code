@@ -5327,6 +5327,12 @@ export class TelegramNotificationDaemon {
 			this.deliveredPublications.delete(oldest);
 			this.deferredPublications.delete(oldest);
 		}
+		while (this.rejectedPublications.size > TELEGRAM_PRESENTATION_STATE_LIMIT) {
+			const oldest = [...this.rejectedPublications.entries()].sort((left, right) => left[1] - right[1])[0]?.[0];
+			if (oldest === undefined) return;
+			this.rejectedPublications.delete(oldest);
+			this.deferredPublications.delete(oldest);
+		}
 	}
 
 	private async persistPresentationState(): Promise<void> {
