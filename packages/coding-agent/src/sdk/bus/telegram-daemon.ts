@@ -4127,6 +4127,7 @@ interface PendingBtwDelivery {
 	finished: Promise<void>;
 	finish: () => void;
 	outcome?: "accepted" | "not_delivered" | "uncertain" | "partial_accepted";
+	attempted: boolean;
 }
 
 class TelegramEffectSupervisor {
@@ -4376,8 +4377,6 @@ export class TelegramNotificationDaemon {
 			await this.markPublicationAttempted(publicationId);
 			return;
 		}
-		await this.markPublicationDelivered(publicationId);
-		this.deferredPublications.delete(publicationId);
 	}
 	private finishSelectedAck(item: SelectedAckQueueItem, outcome: SelectedAckOutcome): void {
 		if (this.selectedAckPending.get(item.pendingKey) !== item) return;
@@ -4961,13 +4960,13 @@ export class TelegramNotificationDaemon {
 				name: "ask-selected-ack",
 				matches: msg => msg.type === "ask_selected_ack_request",
 				handle: async (session, msg) => {
+					const publicationId = session.activePublicationId;
+					if (publicationId) this.deferredPublications.add(publicationId);
 					const requestId = typeof msg.requestId === "string" ? msg.requestId : undefined;
 					const commitKey = typeof msg.commitKey === "string" ? msg.commitKey : undefined;
 					const mode = msg.mode === "live" || msg.mode === "recovery" ? msg.mode : undefined;
 					const deadlineAt = typeof msg.deadlineAt === "number" ? msg.deadlineAt : undefined;
 					if (!requestId || !commitKey || !mode || !deadlineAt) return;
-					const publicationId = session.activePublicationId;
-					if (publicationId) this.deferredPublications.add(publicationId);
 					const cacheKey = `${session.sessionId}\0${commitKey}`;
 					const cached = this.getCachedSelectedAck(cacheKey);
 					if (cached) {
@@ -9255,6 +9254,7 @@ export class TelegramNotificationDaemon {
 		if (await this.#renderModelChoices(session, msg as Record<string, unknown>, publicationId)) return;
 
 		if (msg?.type === "ephemeral_turn_result") {
+			if (publicationId) this.deferredPublications.add(publicationId);
 			const requestId = typeof msg.requestId === "string" ? msg.requestId : undefined;
 			if (!requestId) return;
 			this.#purgeBtwTombstones();
@@ -9307,13 +9307,14 @@ export class TelegramNotificationDaemon {
 					this.deferredPublications.delete(publicationId);
 				} else if (
 					publicationId &&
-					(existingDelivery.outcome === "uncertain" || existingDelivery.outcome === "partial_accepted")
+					(existingDelivery.outcome === "uncertain" ||
+						existingDelivery.outcome === "partial_accepted" ||
+						(existingDelivery.outcome === "not_delivered" && existingDelivery.attempted))
 				) {
 					await this.markPublicationAttempted(publicationId);
 				}
 				return;
 			}
-			if (publicationId) this.deferredPublications.add(publicationId);
 			const isAuthoritative = (): boolean =>
 				!this.#stoppingBtw &&
 				this.#leaseTokenAllows(pending.socketLease) &&
@@ -9334,6 +9335,7 @@ export class TelegramNotificationDaemon {
 				pending,
 				invalidated: false,
 				terminalizeOnInvalidation: false,
+				attempted: false,
 				controller: new AbortController(),
 				finished: finished.promise,
 				finish: finished.resolve,
@@ -9354,6 +9356,7 @@ export class TelegramNotificationDaemon {
 					try {
 						if (!isAuthoritative()) return;
 						await this.beginPublicationAttempt(publicationId);
+						terminalDelivery.attempted = true;
 						const response = await this.#sendBtwMessage({
 							threadId: pending.threadId,
 							messageId: pending.messageId,
@@ -9386,6 +9389,7 @@ export class TelegramNotificationDaemon {
 					if (!isAuthoritative()) return "stale";
 					try {
 						await this.beginPublicationAttempt(publicationId);
+						terminalDelivery.attempted = true;
 						const response = await this.botApi.call(method, body, { noRetry: true, signal });
 						if (telegramMessageId(response) !== undefined) return "accepted";
 						if (response && typeof response === "object" && (response as { ok?: unknown }).ok === false)

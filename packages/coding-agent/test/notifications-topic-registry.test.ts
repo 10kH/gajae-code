@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes suppression-aware generation 71 at serving epoch 18", () => {
+test("publishes exact-rejection generation 72 at serving epoch 19", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 71 / serving epoch 18: pre-send suppression stays queued and ambiguous replay stays unconfirmed.
-	expect(DAEMON_GENERATION).toBe(71);
-	expect(SERVING_EPOCH).toBe(18);
+	// Generation 72 / serving epoch 19: direct invalid and rejected outcomes retain exact state.
+	expect(DAEMON_GENERATION).toBe(72);
+	expect(SERVING_EPOCH).toBe(19);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();

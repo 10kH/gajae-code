@@ -120,8 +120,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * pre-send work remains replayable after daemon restart.
  * Generation 71 preserves queued state through cooldown/shutdown suppression and
  * never converts replay-suppressed ambiguity into delivered confirmation.
+ * Generation 72 keeps invalid selected publications queued and mirrors attempted
+ * BTW rejection outcomes across duplicate publication identities.
  */
-export const DAEMON_GENERATION = 71;
+export const DAEMON_GENERATION = 72;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -138,5 +140,6 @@ export const DAEMON_GENERATION = 71;
  * Epoch 16 requires accepted-only settlement for special provider queues.
  * Epoch 17 requires durable queued/attempted/confirmed publication states.
  * Epoch 18 requires suppression-aware attempt transitions and replay confirmation.
+ * Epoch 19 requires direct invalid/rejected outcomes to retain exact receipt state.
  */
-export const SERVING_EPOCH = 18;
+export const SERVING_EPOCH = 19;
