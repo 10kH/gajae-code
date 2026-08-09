@@ -7,7 +7,12 @@ import type { SessionRouterDeps } from "../router";
 import { type SessionAttachment, SessionRouter, SessionRouterError, type SessionRouterFrame } from "../router";
 
 import { createDiscordAdapter, createSlackAdapter } from "./chat-adapters";
-import { type ChatTransport, projectChatCommandOutcome, sendAuthorizedChatOperation } from "./chat-command-policy";
+import {
+	type ChatOperationRequest,
+	type ChatTransport,
+	projectChatCommandOutcome,
+	sendAuthorizedChatOperation,
+} from "./chat-command-policy";
 import type { ChatDaemonCommandBindInput, ChatDaemonCommandOutcome } from "./chat-daemon-command-channel";
 import type { ChatDaemonKind } from "./chat-daemon-control";
 import { isControlPlaneFrameType } from "./control-plane-frames";
@@ -498,7 +503,7 @@ export class ChatDaemonRuntime {
 	async #postCommandOutcome(
 		transport: ChatTransport,
 		sessionId: string,
-		request: Pick<import("./chat-command-policy").ChatOperationRequest, "kind" | "operation">,
+		request: Pick<ChatOperationRequest, "kind" | "operation">,
 		outcome: { ok: true; result: unknown } | { ok: false; error: { code: string; message: string } },
 	): Promise<void> {
 		const content = JSON.stringify(projectChatCommandOutcome(request, outcome));
