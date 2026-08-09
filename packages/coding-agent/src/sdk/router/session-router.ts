@@ -699,15 +699,15 @@ export class SessionRouter {
 			let replay: Record<string, unknown>;
 			for (let attempt = 0; ; attempt++) {
 				try {
+					const stopped = Promise.withResolvers<void>();
+					const onStop = (): void => stopped.resolve();
+					if (this.#stopController.signal.aborted) stopped.resolve();
+					else this.#stopController.signal.addEventListener("abort", onStop, { once: true });
 					const replayRequest = attached.client.request({
 						type: "event_replay",
 						sinceGeneration: attached.generation,
 						sinceSeq,
 					});
-					if (this.#stopController.signal.aborted) return;
-					const stopped = Promise.withResolvers<void>();
-					const onStop = (): void => stopped.resolve();
-					this.#stopController.signal.addEventListener("abort", onStop, { once: true });
 					let outcome: { kind: "response"; value: Record<string, unknown> } | { kind: "stopped" };
 					try {
 						outcome = await Promise.race([
