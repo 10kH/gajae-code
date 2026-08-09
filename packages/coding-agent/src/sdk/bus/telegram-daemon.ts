@@ -4137,6 +4137,11 @@ class TelegramEffectSupervisor {
 	readonly #abort = new AbortController();
 	readonly #terminalContext = new AsyncLocalStorage<boolean>();
 	readonly #pending = new Set<Promise<unknown>>();
+	readonly #deliveryAbort: AbortSignal;
+
+	constructor(deliveryAbort: AbortSignal) {
+		this.#deliveryAbort = deliveryAbort;
+	}
 
 	call(
 		api: BotApi,
@@ -4147,11 +4152,12 @@ class TelegramEffectSupervisor {
 		const terminal = this.#terminalContext.getStore() === true;
 		if (this.#stopping && !terminal)
 			return Promise.reject(Object.assign(new Error("Daemon is stopping"), { name: "AbortError" }));
-		const signal = terminal
-			? opts?.signal
-			: opts?.signal
-				? AbortSignal.any([this.#abort.signal, opts.signal])
-				: this.#abort.signal;
+		const signals = [
+			this.#deliveryAbort,
+			...(terminal ? [] : [this.#abort.signal]),
+			...(opts?.signal ? [opts.signal] : []),
+		];
+		const signal = AbortSignal.any(signals);
 		return this.track(api.call(method, body, { ...opts, signal }));
 	}
 
@@ -4263,8 +4269,9 @@ export class TelegramNotificationDaemon {
 	private stopRequested = false;
 
 	private readonly fsImpl: TelegramDaemonFs;
+	readonly #deliveryAbort = new AbortController();
 	private readonly botApi: BotApi;
-	private readonly effects = new TelegramEffectSupervisor();
+	private readonly effects = new TelegramEffectSupervisor(this.#deliveryAbort.signal);
 	private readonly topics = new TopicRegistry();
 	/** Stable host-local identity; never persisted in shared topic authority. */
 	private installationHostId: string;
@@ -4312,7 +4319,6 @@ export class TelegramNotificationDaemon {
 	>();
 	#stoppingBtw = false;
 	readonly #btwDeliveryAbort = new AbortController();
-	readonly #deliveryAbort = new AbortController();
 	private readonly pool: RateLimitPool<TelegramQueuePayload>;
 	private readonly poller: TelegramUpdatePoller;
 	private readonly dispatchState = new TelegramEventDispatchState();
