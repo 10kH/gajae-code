@@ -7823,6 +7823,18 @@ export class SessionManager {
 			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			return;
 		}
+		if (!this.storage.existsSync(resolvedSessionFile)) {
+			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
+			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
+			this.#applyFreshSessionMetadata(fresh);
+			this.#commitResidentTextStoreTransition(prepared);
+			this.#retireEphemeralArtifacts();
+			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+			await this.#rewriteFile();
+			this.#flushed = true;
+			this.#ensuredOnDisk = true;
+			return;
+		}
 		const eagerStat = this.storage.statSync(resolvedSessionFile);
 		if (eagerStat.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES) throw new SessionTranscriptOversizedError(eagerStat.size);
 		const entries = await loadEntriesFromFile(resolvedSessionFile, this.storage);
@@ -9040,6 +9052,7 @@ export class SessionManager {
 		let managedDestinationStore: ManagedSessionDescendantStore | undefined;
 		let rollbackManagedMove: (() => Promise<void>) | undefined;
 		let residentTransition: PreparedResidentStoreTransition | undefined;
+		const hadPersistedSession = this.#ensuredOnDisk;
 
 		if (this.persist && this.#sessionFile) {
 			// Close the persist writer before moving files
@@ -9275,7 +9288,7 @@ export class SessionManager {
 			if (this.persist && this.#sessionFile && hadSessionFile) {
 				await this.#appendHeaderPatch({ cwd: resolvedCwd });
 				await this.#rewriteFile();
-			} else if (this.persist && this.#sessionFile && hasAssistant) {
+			} else if (this.persist && this.#sessionFile && (hasAssistant || (!hadSessionFile && hadPersistedSession))) {
 				await this.#appendHeaderPatch({ cwd: resolvedCwd });
 				await this.#rewriteFile();
 			} else {
@@ -15656,8 +15669,10 @@ export class SessionManager {
 	 * cap are weakly held so a GC cycle can reclaim them between reads.
 	 */
 	#getSessionContextForRead(): Readonly<SessionContext> {
+		const hasResidentSentinel = this.#fileEntries.some(entry => containsResidentSentinel(entry));
 		const cached = dereferenceMaterializedCache(this.#sessionContextCache);
 		if (
+			!hasResidentSentinel &&
 			cached &&
 			this.#sessionContextEntryRevision === this.#entryRevision &&
 			this.#sessionContextLeafRevision === this.#leafRevision &&
@@ -15690,7 +15705,11 @@ export class SessionManager {
 			this.#holdMaterializedCachesWeakly();
 		}
 		const context = freezeInternalReadSnapshot(builtContext);
-		this.#sessionContextCache = this.#materializedCachesWeaklyHeld ? new WeakRef(context) : context;
+		this.#sessionContextCache = hasResidentSentinel
+			? undefined
+			: this.#materializedCachesWeaklyHeld
+				? new WeakRef(context)
+				: context;
 		transferSessionMessageIdentity(builtContext.messages, context.messages);
 		this.#sessionContextEntryRevision = this.#entryRevision;
 		this.#sessionContextLeafRevision = this.#leafRevision;
