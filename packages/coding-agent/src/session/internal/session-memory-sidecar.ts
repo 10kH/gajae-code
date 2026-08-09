@@ -67,6 +67,40 @@ export const ENTRY_CACHE_BUDGET_BYTES = 28 * 1024 * 1024;
 export const TAIL_BUFFER_BUDGET_BYTES = 4 * 1024 * 1024;
 /** Bounded forward-scan window for transcript-ahead recovery (R2.4). */
 export const INDEX_TAIL_SCAN_MAX_BYTES = 4 * 1024 * 1024;
+/** Maximum ordinal-index records retained transiently for one cold branch activation. */
+export const COLD_BRANCH_PREFETCH_MAX_INDEX_ENTRIES = 16 * 1024;
+
+/**
+ * Decide the cold-branch ordinal-run fast path before allocating its Map or
+ * transcript window. Large sparse/interleaved intervals fail closed to bounded
+ * dictionary/index fallback; the transcript remains authoritative.
+ */
+export function coldBranchOrdinalRunWithinPrefetchBounds(input: {
+	boundaryOrdinal: number;
+	leafOrdinal: number;
+	transcriptStart: number;
+	transcriptEnd: number;
+	maxTranscriptBytes: number;
+}): boolean {
+	const values = [
+		input.boundaryOrdinal,
+		input.leafOrdinal,
+		input.transcriptStart,
+		input.transcriptEnd,
+		input.maxTranscriptBytes,
+	];
+	if (!values.every(value => Number.isSafeInteger(value))) return false;
+	const intervalEntries = input.leafOrdinal - input.boundaryOrdinal + 1;
+	const transcriptLength = input.transcriptEnd - input.transcriptStart;
+	return (
+		input.boundaryOrdinal >= 0 &&
+		intervalEntries > 0 &&
+		intervalEntries <= COLD_BRANCH_PREFETCH_MAX_INDEX_ENTRIES &&
+		input.transcriptStart >= 0 &&
+		transcriptLength > 0 &&
+		transcriptLength <= input.maxTranscriptBytes
+	);
+}
 
 /** Dictionary build acceptance cap; default buffers stay well below this 20 MiB maximum. */
 export const DICTIONARY_BUILD_PEAK_BYTES = 20 * 1024 * 1024;

@@ -1919,6 +1919,69 @@ describe("branch-heavy retirement", () => {
 		}
 	}, 20_000);
 
+	it("aborts ordinal prefetch before allocating a sparse interval beyond the fixed cap", async () => {
+		class IndexReadCountingStorage extends MemorySessionStorage {
+			indexReads = 0;
+			override readRangeSync(filePath: string, offset: number, length: number) {
+				if (filePath.endsWith(".spill.idx")) this.indexReads++;
+				return super.readRangeSync(filePath, offset, length);
+			}
+		}
+		const storage = new IndexReadCountingStorage();
+		const sessionFile = "/sessions/sparse-branch-prefetch-cap.jsonl";
+		const records = [
+			{ type: "session", version: 5, id: "sparse-branch", timestamp: "0", cwd: "/cwd" },
+			{ type: "custom", id: "root", parentId: null, timestamp: "0", customType: "node", data: {} },
+			{ type: "custom", id: "branch-kept", parentId: "root", timestamp: "0", customType: "node", data: {} },
+			...Array.from({ length: 20_000 }, (_, index) => ({
+				type: "custom",
+				id: `interleaved-${index}`,
+				parentId: "root",
+				timestamp: "0",
+				customType: "node",
+				data: {},
+			})),
+			{
+				type: "compaction",
+				id: "branch-compact",
+				parentId: "branch-kept",
+				timestamp: "0",
+				summary: "branch summary",
+				firstKeptEntryId: "branch-kept",
+				tokensBefore: 1,
+			},
+			{ type: "custom", id: "active", parentId: "root", timestamp: "0", customType: "node", data: {} },
+			{
+				type: "compaction",
+				id: "active-compact",
+				parentId: "active",
+				timestamp: "0",
+				summary: "active summary",
+				firstKeptEntryId: "active",
+				tokensBefore: 1,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		const manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			const indexReadsBefore = storage.indexReads;
+			manager.branch("branch-compact");
+			// One digest-validation scan is allowed; a second ordinal-prefetch scan would
+			// exceed this bound, proving the interval cap returns before Map allocation.
+			expect(storage.indexReads - indexReadsBefore).toBeLessThanOrEqual(70);
+			expect(manager.getBranch().map(entry => entry.id)).toEqual(["root", "branch-kept", "branch-compact"]);
+			expect(manager.getSessionMemoryStats().totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+		} finally {
+			await manager.close();
+		}
+	}, 30_000);
+
 	it("falls back eagerly when an authenticated legacy index lacks branch metadata", async () => {
 		const storage = new MemorySessionStorage();
 		const sessionFile = "/sessions/legacy-branch-index.jsonl";

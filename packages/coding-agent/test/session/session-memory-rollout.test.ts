@@ -68,6 +68,71 @@ describe("session memory rollout", () => {
 		}
 		expect(mismatches).toBe(0);
 	});
+	it("compares demoted provider metadata and counts an instrumented corrupt sidecar read", async () => {
+		class CorruptMetadataReadStorage extends MemorySessionStorage {
+			metadataReads = 0;
+			override readRangeSync(filePath: string, offset: number, length: number) {
+				const result = super.readRangeSync(filePath, offset, length);
+				if (!filePath.endsWith(".spill.metadata-delta") || offset !== 0 || result.bytes.length === 0) return result;
+				this.metadataReads++;
+				const bytes = result.bytes.slice();
+				bytes[0] = "!".charCodeAt(0);
+				return { ...result, bytes };
+			}
+		}
+		const records = [
+			{ type: "session", version: 5, id: "shadow-positive-control", timestamp: "0", cwd: "/cwd" },
+			{
+				type: "mcp_tool_selection",
+				id: "large-provider-state",
+				parentId: null,
+				timestamp: "0",
+				selectedToolNames: Array.from({ length: 600 }, (_, index) => `mcp__tool_${index}`),
+			},
+			{
+				type: "message",
+				id: "kept",
+				parentId: "large-provider-state",
+				timestamp: "0",
+				message: { role: "user", content: "kept", timestamp: 1 },
+			},
+			{
+				type: "compaction",
+				id: "compact",
+				parentId: "kept",
+				timestamp: "0",
+				summary: "summary",
+				firstKeptEntryId: "kept",
+				tokensBefore: 10,
+			},
+		];
+		const transcriptText = `${records.map(record => JSON.stringify(record)).join("\n")}\n`;
+		const destination = SessionManager.explicitDestination("/sessions");
+
+		const exactStorage = new MemorySessionStorage();
+		const exactFile = "/sessions/shadow-metadata-exact.jsonl";
+		exactStorage.writeTextSync(exactFile, transcriptText);
+		const exact = await SessionManager.open(exactFile, destination, exactStorage, "copy-retain", "shadow");
+		expect(exact.getSessionMemoryStats()).toMatchObject({
+			shadowParityCheckCount: 1,
+			shadowParityMismatchCount: 0,
+		});
+		expect(exact.getSessionMemoryStats().metadataDeltaDescriptorBytes).toBeGreaterThan(0);
+		await exact.close();
+
+		const corruptStorage = new CorruptMetadataReadStorage();
+		const corruptFile = "/sessions/shadow-metadata-corrupt.jsonl";
+		corruptStorage.writeTextSync(corruptFile, transcriptText);
+		const corrupt = await SessionManager.open(corruptFile, destination, corruptStorage, "copy-retain", "shadow");
+		expect(corruptStorage.metadataReads).toBeGreaterThan(0);
+		expect(corrupt.getSessionMemoryStats()).toMatchObject({
+			shadowParityCheckCount: 1,
+			shadowParityMismatchCount: 1,
+		});
+		// Shadow telemetry never weakens authority: callers still receive the eager context.
+		expect(corrupt.buildSessionContext().messages).toHaveLength(2);
+		await corrupt.close();
+	});
 	it("downgrades a live cold session without eager reload and restores eager behavior on restart", async () => {
 		const storage = new MemorySessionStorage();
 		const sessionFile = "/sessions/downgrade.jsonl";

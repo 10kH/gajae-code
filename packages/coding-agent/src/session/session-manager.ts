@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 
 import * as os from "node:os";
 import * as path from "node:path";
+import * as util from "node:util";
 import { type AgentMessage, canContinuePersistedHistory } from "@gajae-code/agent-core";
 import type { ConfiguredModelChainEntry as SharedConfiguredModelChainEntry } from "@gajae-code/agent-core/compaction";
 import type {
@@ -97,6 +98,7 @@ import {
 	type CommitMarkerContents,
 	type CommittedTail,
 	classifyReopen,
+	coldBranchOrdinalRunWithinPrefetchBounds,
 	computeLineDigest,
 	computeTailRecordChecksum,
 	type DescriptorSnapshot,
@@ -192,6 +194,7 @@ import {
 	MemorySessionStorage,
 	readSessionCommitMarkerSync,
 	replaceSessionCommitMarkerCheckedSync,
+	SESSION_RANGE_READ_MAX_BYTES,
 } from "./session-storage";
 
 export const CURRENT_SESSION_VERSION = 5;
@@ -10009,7 +10012,7 @@ export class SessionManager {
 				runtime.parentArtifact = undefined;
 			}
 			if (this.#sessionMemoryMode === "shadow" && runtime?.enabled && !runtime.sidecarIneligible) {
-				this.#compareShadowParity(runtime);
+				this.#compareShadowParity(runtime, entries);
 			}
 			if (runtime?.enabled && !runtime.sidecarIneligible) this.#consecutiveSidecarBuildFailures = 0;
 		} catch (error) {
@@ -10043,30 +10046,47 @@ export class SessionManager {
 
 	/**
 	 * Shadow-mode parity telemetry (AC10). After a successful shadow sidecar build,
-	 * compare the bounded reducer-derived surface against the authoritative eager
-	 * walk: the nearest model-change role (R1) and the provider message count. Any
-	 * mismatch increments the live mismatch counter and logs a rate-limited warning;
-	 * the sidecar is disposable, so the eager transcript remains authoritative.
+	 * materialize the provider context through both authoritative eager traversal and
+	 * the exact sidecar reducer/provider-state + hot-suffix path used after retirement.
+	 * Any mismatch increments the live counter and warns; the eager transcript remains
+	 * authoritative and no sidecar result is returned to the caller.
 	 */
-	#compareShadowParity(runtime: SessionMemorySidecarRuntime): void {
-		const reducerRole = getReducerLastModelChangeRole(runtime.reducer);
-		const eagerRole = this.getLastModelChangeRole();
-		const providerCount = runtime.providerStateEntries.length;
-		const eagerContext = this.buildSessionContext();
-		const eagerMessageCount = eagerContext.messages.length;
+	#compareShadowParity(runtime: SessionMemorySidecarRuntime, entries: readonly FileEntry[]): void {
+		const eagerEntries = entries.filter((entry): entry is SessionEntry => entry.type !== "session");
+		const eagerContext = buildSessionContext(
+			eagerEntries.map(cloneSessionEntry),
+			this.#leafId,
+			undefined,
+			this.#sessionId,
+		);
+		const resolvedProviderState = this.#resolvedProviderStateEntries();
+		let sidecarContext: SessionContext | undefined;
+		if (resolvedProviderState) {
+			const providerEntries = this.#getActivePathEntriesForProviderContext(undefined, true).map(cloneSessionEntry);
+			const providerStateEntries = resolvedProviderState.map(cloneSessionEntry);
+			let syntheticParentId: string | null = null;
+			for (const entry of providerStateEntries) {
+				entry.parentId = syntheticParentId;
+				syntheticParentId = entry.id;
+			}
+			if (providerEntries[0] && syntheticParentId) providerEntries[0].parentId = syntheticParentId;
+			sidecarContext = buildSessionContext(
+				[...providerStateEntries, ...providerEntries],
+				this.#leafId,
+				undefined,
+				this.#sessionId,
+			);
+		}
 		runtime.shadowParityCheckCount++;
-		const mismatched =
-			reducerRole !== eagerRole ||
-			(eagerMessageCount > 0 && providerCount > eagerMessageCount) ||
-			(eagerMessageCount > 0 && providerCount === 0 && eagerMessageCount > 1);
-		if (mismatched) {
+		const eagerRole = this.getLastModelChangeRole();
+		const reducerRole = getReducerLastModelChangeRole(runtime.reducer);
+		if (!sidecarContext || reducerRole !== eagerRole || !util.isDeepStrictEqual(sidecarContext, eagerContext)) {
 			runtime.shadowParityMismatchCount++;
 			logger.warn("Session memory shadow parity mismatch", {
 				sessionFile: this.#sessionFile,
 				reducerRole,
 				eagerRole,
-				providerCount,
-				eagerMessageCount,
+				sidecarContextAvailable: sidecarContext !== undefined,
 			});
 		}
 	}
@@ -10185,31 +10205,27 @@ export class SessionManager {
 			indexWriter = this.storage.openWriter(runtime.indexPath, { flags: "w" });
 			tailWriter = this.storage.openWriter(runtime.tailPath, { flags: "w" });
 			this.#truncateDerivedArtifactFiles(secondaryArtifactsEligible);
-			if (enabledBuild) {
-				runtime.metadataDelta = this.#createMetadataDeltaRuntimeState();
-				for (const item of sortedProviderState) {
-					const key = providerStateEntryKey(item.entry)!;
-					const persistedLine = Buffer.from(`${JSON.stringify(item.entry)}\n`, "utf8");
-					if (persistedLine.byteLength > MAX_REDUCER_INLINE_BYTES) {
-						const stored = this.#appendMetadataDeltaValue(persistedLine);
-						if (stored) {
-							runtime.metadataDelta.byKey.set(key, {
-								kind: item.entry.type,
-								ordinal: item.ordinal,
-								...stored,
-							});
-						} else {
-							runtime.metadataDelta.byKey.delete(key);
-							runtime.providerStateEntries.push(cloneSessionEntry(item.entry));
-						}
+			runtime.metadataDelta = this.#createMetadataDeltaRuntimeState();
+			for (const item of sortedProviderState) {
+				const key = providerStateEntryKey(item.entry)!;
+				const persistedLine = Buffer.from(`${JSON.stringify(item.entry)}\n`, "utf8");
+				if (persistedLine.byteLength > MAX_REDUCER_INLINE_BYTES) {
+					const stored = this.#appendMetadataDeltaValue(persistedLine);
+					if (stored) {
+						runtime.metadataDelta.byKey.set(key, {
+							kind: item.entry.type,
+							ordinal: item.ordinal,
+							...stored,
+						});
 					} else {
+						runtime.metadataDelta.byKey.delete(key);
 						runtime.providerStateEntries.push(cloneSessionEntry(item.entry));
 					}
+				} else {
+					runtime.providerStateEntries.push(cloneSessionEntry(item.entry));
 				}
-				this.#syncMetadataDeltaDescriptorBytes();
-			} else {
-				runtime.providerStateEntries = sortedProviderState.map(item => cloneSessionEntry(item.entry));
 			}
+			this.#syncMetadataDeltaDescriptorBytes();
 			for (let ordinal = 0; ordinal < sessionEntries.length; ordinal++) {
 				const entry = sessionEntries[ordinal];
 				const persistedLine = Buffer.concat([this.#serializeEntryLine(entry), Buffer.from("\n")]);
@@ -10369,7 +10385,8 @@ export class SessionManager {
 			this.#cleanupDictionaryArtifactFiles();
 			runtime.parentArtifact = undefined;
 			runtime.dictionary = undefined;
-			runtime.metadataDelta = undefined;
+			// Keep the bounded metadata delta live through the shadow parity comparison;
+			// parent/dictionary artifacts remain disabled because shadow never retires.
 		}
 		try {
 			const validated = this.storage.statSync(runtime.indexPath);
@@ -10958,6 +10975,7 @@ export class SessionManager {
 		let carry = "";
 		let carryBytes: Uint8Array | undefined;
 		let found: ColdEntryIndex | undefined;
+		const targetPrefix = `{"t":${JSON.stringify(id)},`;
 		let residentBytes = 0;
 		for (let offset = 0; offset < committed.size; offset += 64 * 1024) {
 			const length = Math.min(64 * 1024, committed.size - offset);
@@ -10972,9 +10990,12 @@ export class SessionManager {
 			let lineStart = 0;
 			let newline = text.indexOf("\n");
 			const dispatchLine = (line: string): boolean => {
+				// The committed digest authenticates every byte in this immutable partition;
+				// parse only the exact target term instead of JSON-decoding every unrelated
+				// record in the partition's bounded verification pass.
+				if (!line.startsWith(targetPrefix)) return true;
 				const record = parseDictionaryPartitionRecord(line);
-				if (!record) return false;
-				if (record.term !== id) return true;
+				if (!record || record.term !== id) return false;
 				if (record.dictId < 0) return false;
 				found = {
 					ordinal: record.ordinal,
@@ -11978,10 +11999,13 @@ export class SessionManager {
 		return entry;
 	}
 
-	#readColdBranchEntry(id: string): { entry: SessionEntry; index: ColdEntryIndex } | undefined {
-		const index = this.#findColdEntryIndex(id);
-		if (!index || !("parentId" in index) || typeof index.entryType !== "string") return undefined;
-		const bytes = this.#readColdEntryRange(index);
+	#parseColdBranchEntry(
+		id: string,
+		index: ColdEntryIndex,
+		recordBytes?: Uint8Array,
+	): { entry: SessionEntry; index: ColdEntryIndex } | undefined {
+		if (!("parentId" in index) || typeof index.entryType !== "string") return undefined;
+		const bytes = recordBytes ?? this.#readColdEntryRange(index);
 		if (!bytes || computeLineDigest(bytes) !== index.recordDigest) return undefined;
 		try {
 			const parsed = JSON.parse(new TextDecoder("utf-8").decode(bytes)) as SessionEntry;
@@ -12000,6 +12024,102 @@ export class SessionManager {
 		}
 	}
 
+	#readColdBranchEntry(id: string): { entry: SessionEntry; index: ColdEntryIndex } | undefined {
+		const index = this.#findColdEntryIndex(id);
+		return index ? this.#parseColdBranchEntry(id, index) : undefined;
+	}
+
+	/**
+	 * Prefetch one compacted cold branch by ordinal run. The index is ordered one
+	 * line per transcript ordinal, so the scan skips JSON parsing outside the
+	 * boundary..leaf interval and retains only that bounded interval. This avoids
+	 * one persistent-dictionary partition scan per ancestor on 10k-entry switches.
+	 */
+	#prefetchColdBranchOrdinalRun(
+		leafId: string,
+	): Map<string, { entry: SessionEntry; index: ColdEntryIndex }> | undefined {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.indexPath || typeof this.storage.readRangeSync !== "function") return undefined;
+		const leaf = this.#readColdBranchEntry(leafId);
+		if (leaf?.entry.type !== "compaction") return undefined;
+		const boundaryIndex = this.#findColdEntryIndex(leaf.entry.firstKeptEntryId);
+		if (!boundaryIndex || boundaryIndex.ordinal > leaf.index.ordinal) return undefined;
+		const transcriptStart = boundaryIndex.byteOffset;
+		const transcriptEnd = leaf.index.byteOffset + leaf.index.byteLength;
+		const transcriptLength = transcriptEnd - transcriptStart;
+		if (
+			!coldBranchOrdinalRunWithinPrefetchBounds({
+				boundaryOrdinal: boundaryIndex.ordinal,
+				leafOrdinal: leaf.index.ordinal,
+				transcriptStart,
+				transcriptEnd,
+				maxTranscriptBytes: SESSION_RANGE_READ_MAX_BYTES,
+			})
+		)
+			return undefined;
+		let indexSize: number;
+		try {
+			indexSize = this.storage.statSync(runtime.indexPath).size;
+		} catch {
+			return undefined;
+		}
+		const indexes = new Map<string, ColdEntryIndex>();
+		let ordinal = 0;
+		let valid = true;
+		const failure = scanTranscriptLinesBounded(this.storage, runtime.indexPath, indexSize, (_offset, lineBytes) => {
+			const currentOrdinal = ordinal++;
+			if (currentOrdinal < boundaryIndex.ordinal || currentOrdinal > leaf.index.ordinal) return;
+			try {
+				const value = JSON.parse(decodeBoundedJsonLine(lineBytes)) as Partial<ColdEntryIndex> & { id?: unknown };
+				if (
+					typeof value.id !== "string" ||
+					value.ordinal !== currentOrdinal ||
+					typeof value.seq !== "number" ||
+					typeof value.byteOffset !== "number" ||
+					typeof value.byteLength !== "number" ||
+					typeof value.recordDigest !== "string" ||
+					(value.parentId !== null && typeof value.parentId !== "string") ||
+					typeof value.entryType !== "string"
+				) {
+					valid = false;
+					return false;
+				}
+				indexes.set(value.id, value as ColdEntryIndex);
+			} catch {
+				valid = false;
+				return false;
+			}
+		});
+		if (failure || !valid) return undefined;
+		if (!this.#sessionFile) return undefined;
+		let transcriptBytes: Uint8Array;
+		try {
+			runtime.rangeReadCount++;
+			transcriptBytes = this.storage.readRangeSync(this.#sessionFile, transcriptStart, transcriptLength).bytes;
+			if (transcriptBytes.byteLength !== transcriptLength) return undefined;
+		} catch {
+			return undefined;
+		}
+		const prefetched = new Map<string, { entry: SessionEntry; index: ColdEntryIndex }>();
+		let currentId: string | null = leafId;
+		let priorOrdinal = Number.POSITIVE_INFINITY;
+		while (currentId !== null) {
+			const index = indexes.get(currentId);
+			if (!index || index.ordinal >= priorOrdinal) return undefined;
+			priorOrdinal = index.ordinal;
+			const recordBytes = transcriptBytes?.subarray(
+				index.byteOffset - transcriptStart,
+				index.byteOffset - transcriptStart + index.byteLength,
+			);
+			const resolved = this.#parseColdBranchEntry(currentId, index, recordBytes);
+			if (!resolved) return undefined;
+			prefetched.set(currentId, resolved);
+			if (currentId === leaf.entry.firstKeptEntryId) return prefetched;
+			currentId = resolved.entry.parentId;
+		}
+		return undefined;
+	}
+
 	#activateColdBranch(leafId: string): boolean {
 		const runtime = this.#sidecarRuntime;
 		if (
@@ -12013,6 +12133,7 @@ export class SessionManager {
 		const retainedLeafToBoundary: SessionEntry[] = [];
 		let retainedBytes = 0;
 		let retainedAccountedBytes = 0;
+		const prefetched = this.#prefetchColdBranchOrdinalRun(leafId);
 		let currentId: string | null = leafId;
 		let priorOrdinal = Number.POSITIVE_INFINITY;
 		let boundaryId: string | undefined;
@@ -12024,10 +12145,12 @@ export class SessionManager {
 		const providerState = new Map<string, { order: number; entry: SessionEntry }>();
 		let providerStateBytes = 0;
 		while (currentId !== null) {
-			const resolved = this.#readColdBranchEntry(currentId);
+			const resolved: { entry: SessionEntry; index: ColdEntryIndex } | undefined =
+				prefetched?.get(currentId) ?? this.#readColdBranchEntry(currentId);
 			if (!resolved || resolved.index.ordinal >= priorOrdinal) return false;
 			priorOrdinal = resolved.index.ordinal;
-			const { entry, index } = resolved;
+			const entry: SessionEntry = resolved.entry;
+			const index: ColdEntryIndex = resolved.index;
 			const providerKey = providerStateEntryKey(entry);
 			if (providerKey && !providerState.has(providerKey)) {
 				if (providerState.size >= 256) return false;
@@ -15392,7 +15515,7 @@ export class SessionManager {
 		return context;
 	}
 
-	#getActivePathEntriesForProviderContext(fromId?: string | null): SessionEntry[] {
+	#getActivePathEntriesForProviderContext(fromId?: string | null, forceColdSidecar = false): SessionEntry[] {
 		if (fromId === null || (fromId === undefined && this.#leafId === null)) return [];
 		const ids: string[] = [];
 		const visited = new Set<string>();
@@ -15403,7 +15526,12 @@ export class SessionManager {
 			visited.add(current.id);
 			ids.push(current.id);
 			if (!activeCompaction && current.type === "compaction") activeCompaction = current;
-			if (this.#coldSidecarActive() && activeCompaction && current.id === activeCompaction.firstKeptEntryId) break;
+			if (
+				(forceColdSidecar || this.#coldSidecarActive()) &&
+				activeCompaction &&
+				current.id === activeCompaction.firstKeptEntryId
+			)
+				break;
 			current = current.parentId ? this.#resolveEntry(current.parentId) : undefined;
 		}
 		ids.reverse();

@@ -4,6 +4,7 @@
 ### Fixed
 
 - ACP `session/request_permission` responses are now normalized from the spec-shaped `RequestPermissionResponse` (`{ outcome: { outcome, optionId } }`) into the SDK's flat permission-decision contract before reaching the permission provider. Standards-compliant ACP clients such as Paseo can now authorize permission-gated shell/eval and destructive file operations (`bash`, `monitor`, `eval`, `delete`, `move`, and `edit` only for delete/move operations) without an invalid-response failure; `write` and ordinary edits remain ungated. Nested and flat selected/cancelled responses are accepted by reconstructing the canonical SDK decision fields, while malformed or unknown decisions fail closed.
+- Shadow-mode cold-session builds now compare the actual sidecar-derived provider context against the authoritative eager context and expose check/mismatch counters in `/session`; corrupt provider metadata produces a counted mismatch without weakening transcript authority. Cold branch activation now resolves compacted 10k-entry branches through one bounded ordinal-index scan and one bounded transcript range read instead of scanning a dictionary partition for every ancestor, and cold dictionary lookup skips unrelated JSON decoding while retaining full partition-digest verification.
 
 ### Added
 

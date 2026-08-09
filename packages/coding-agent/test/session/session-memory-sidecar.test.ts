@@ -20,6 +20,7 @@ import {
 	BoundedParentChildrenIndex,
 	type CommitMarkerContents,
 	classifyReopen,
+	coldBranchOrdinalRunWithinPrefetchBounds,
 	computeLineDigest,
 	computeTerminalChecksum,
 	createReducerState,
@@ -66,6 +67,38 @@ import {
 } from "../../src/session/internal/session-memory-sidecar";
 
 const enc = (value: string): Uint8Array => new TextEncoder().encode(value);
+
+describe("cold branch ordinal prefetch bounds", () => {
+	it("admits the 10k latency run and rejects million-entry or oversized sparse intervals before allocation", () => {
+		expect(
+			coldBranchOrdinalRunWithinPrefetchBounds({
+				boundaryOrdinal: 10,
+				leafOrdinal: 10_010,
+				transcriptStart: 1_000,
+				transcriptEnd: 2 * 1024 * 1024,
+				maxTranscriptBytes: 64 * 1024 * 1024,
+			}),
+		).toBe(true);
+		expect(
+			coldBranchOrdinalRunWithinPrefetchBounds({
+				boundaryOrdinal: 10,
+				leafOrdinal: 1_000_010,
+				transcriptStart: 1_000,
+				transcriptEnd: 2 * 1024 * 1024,
+				maxTranscriptBytes: 64 * 1024 * 1024,
+			}),
+		).toBe(false);
+		expect(
+			coldBranchOrdinalRunWithinPrefetchBounds({
+				boundaryOrdinal: 10,
+				leafOrdinal: 20,
+				transcriptStart: 1_000,
+				transcriptEnd: 64 * 1024 * 1024 + 1_001,
+				maxTranscriptBytes: 64 * 1024 * 1024,
+			}),
+		).toBe(false);
+	});
+});
 
 describe("SessionMemoryAccountant arithmetic", () => {
 	it("charges the resident formulas exactly", () => {

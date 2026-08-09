@@ -46,24 +46,43 @@ try {
 			});
 		}
 	}
-	for (let index = 0; index < recordCount - 2; index++) {
+	const branchEntryCount = 10_000;
+	const fixedEntryCount = 1 + 12 + 12 * 6 + branchEntryCount + 1 + 1 + 1;
+	const fillEntryCount = recordCount - fixedEntryCount;
+	for (let index = 0; index < fillEntryCount; index++) {
 		write({
 			type: "custom",
 			id: `entry-${index}`,
-			parentId: index === 0 ? null : `entry-${index - 1}`,
+			parentId: index === 0 ? "root" : `entry-${index - 1}`,
 			timestamp: "0",
 			customType: "lat",
 			data: { value: index },
 		});
 	}
+	let branchParent = "root";
+	for (let index = 0; index < branchEntryCount; index++) {
+		const id = `branch-${index}`;
+		write({ type: "custom", id, parentId: branchParent, timestamp: "0", customType: "lat", data: { value: index } });
+		branchParent = id;
+	}
 	write({
 		type: "compaction",
-		id: "latency-compaction",
-		parentId: `entry-${recordCount - 3}`,
+		id: "branch-compaction",
+		parentId: branchParent,
 		timestamp: "0",
-		summary: "summary",
-		firstKeptEntryId: `entry-${recordCount - 3}`,
-		tokensBefore: recordCount,
+		summary: "branch summary",
+		firstKeptEntryId: "branch-0",
+		tokensBefore: branchEntryCount,
+	});
+	write({ type: "custom", id: "active", parentId: "root", timestamp: "0", customType: "lat", data: {} });
+	write({
+		type: "compaction",
+		id: "active-compaction",
+		parentId: "active",
+		timestamp: "0",
+		summary: "active summary",
+		firstKeptEntryId: "active",
+		tokensBefore: 1,
 	});
 } finally {
 	fs.closeSync(fd);
@@ -81,7 +100,8 @@ if (!stats.coldRetirementActive) throw new Error("cold_retirement_inactive");
 if (!stats.dictionaryArtifactEnabled) throw new Error("dictionary_artifact_missing");
 
 // Cold random entry lookups: uniformly distributed across the retired prefix.
-const coldIds = Array.from({ length: 50 }, (_, i) => `entry-${Math.floor((i * (recordCount * 0.5)) / 50)}`);
+const fillEntryCount = recordCount - (1 + 12 + 12 * 6 + 10_000 + 1 + 1 + 1);
+const coldIds = Array.from({ length: 50 }, (_, i) => `entry-${Math.floor((i * (fillEntryCount * 0.8)) / 50)}`);
 const coldSamples: number[] = [];
 const rangeReadsBefore = stats.rangeReadCount;
 for (const id of coldIds) {
@@ -103,24 +123,39 @@ for (const id of coldIds) {
 }
 const warmRangeReads = manager.getSessionMemoryStats().rangeReadCount - rangeReadsBeforeWarm;
 
-// Persistent parent→children lookups: each disjoint parent costs one bounded
-// bucket read and no .spill.idx range read.
+// Persistent parent→children lookups: verified bounded bucket reads, never a
+// complete `.spill.idx` scan. Use a fresh baseline after the root lookup.
 const rootChildren = manager.getChildren("root");
-const parentIds = rootChildren.map(entry => entry.id);
-if (parentIds.length === 0) throw new Error("no_parents");
+const parentIds = rootChildren.map(entry => entry.id).filter(id => id.startsWith("parent-"));
+if (parentIds.length !== 12) throw new Error(`parent_count_mismatch:${parentIds.length}`);
 const childrenSamples: number[] = [];
-const bucketReadsBefore = stats.rangeReadCount;
-for (const parent of parentIds.slice(0, 20)) {
+const bucketReadsBefore = manager.getSessionMemoryStats().rangeReadCount;
+for (const parent of parentIds) {
 	const start = performance.now();
 	const children = manager.getChildren(parent);
-	if (children.length === 0) throw new Error(`parent_children_empty:${parent}`);
+	if (children.length !== 6) throw new Error(`parent_children_mismatch:${parent}`);
 	childrenSamples.push(performance.now() - start);
 }
 const childrenRangeReads = manager.getSessionMemoryStats().rangeReadCount - bucketReadsBefore;
 
+// Switch into a 10k-entry cold branch repeatedly. Each switch uses one bounded
+// ordinal-index scan and one bounded transcript range read rather than 10k
+// persistent-dictionary scans; switch back to the tiny active branch between samples.
+const branchSwitchSamples: number[] = [];
+const branchReadsBefore = manager.getSessionMemoryStats().rangeReadCount;
+for (let sample = 0; sample < 5; sample++) {
+	const start = performance.now();
+	manager.branch("branch-compaction");
+	branchSwitchSamples.push(performance.now() - start);
+	if (manager.getLeafEntry()?.id !== "branch-compaction") throw new Error("branch_switch_mismatch");
+	manager.branch("active-compaction");
+}
+const branchRangeReads = manager.getSessionMemoryStats().rangeReadCount - branchReadsBefore;
+
 const sortedCold = [...coldSamples].sort((a, b) => a - b);
 const sortedWarm = [...warmSamples].sort((a, b) => a - b);
 const sortedChildren = [...childrenSamples].sort((a, b) => a - b);
+const sortedBranchSwitch = [...branchSwitchSamples].sort((a, b) => a - b);
 
 const result = {
 	recordCount,
@@ -128,9 +163,15 @@ const result = {
 	coldRangeReads,
 	warmRangeReads,
 	childrenRangeReads,
+	branchRangeReads,
 	coldMs: { p50: percentile(sortedCold, 0.5), p95: percentile(sortedCold, 0.95), p99: percentile(sortedCold, 0.99) },
 	warmMs: { p50: percentile(sortedWarm, 0.5), p95: percentile(sortedWarm, 0.95) },
 	childrenMs: { p50: percentile(sortedChildren, 0.5), p95: percentile(sortedChildren, 0.95) },
+	branchSwitchMs: {
+		p50: percentile(sortedBranchSwitch, 0.5),
+		p95: percentile(sortedBranchSwitch, 0.95),
+		p99: percentile(sortedBranchSwitch, 0.99),
+	},
 	stats: {
 		coldRetirementActive: manager.getSessionMemoryStats().coldRetirementActive,
 		totalAccountedBytes: manager.getSessionMemoryStats().totalAccountedBytes,

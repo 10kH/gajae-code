@@ -7,16 +7,18 @@ interface LatencyWorkerResult {
 	coldRangeReads: number;
 	warmRangeReads: number;
 	childrenRangeReads: number;
+	branchRangeReads: number;
 	coldMs: { p50: number; p95: number; p99: number };
 	warmMs: { p50: number; p95: number };
 	childrenMs: { p50: number; p95: number };
+	branchSwitchMs: { p50: number; p95: number; p99: number };
 	stats: { coldRetirementActive: boolean; totalAccountedBytes: number };
 }
 
 const enabled = process.env.GJC_SESSION_MEMORY_LATENCY === "1";
 
 describe.skipIf(!enabled)("session memory latency / I-O (AC11)", () => {
-	it("serves cold random, warm cached, and parent-children lookups within the approved p95 budgets and I-O counts", () => {
+	it("serves cold random, warm cached, parent-children, and 10k branch-switch operations within approved p95 budgets", () => {
 		const worker = path.join(import.meta.dir, "fixtures", "session-memory-latency-worker.ts");
 		const result = Bun.spawnSync({
 			cmd: [process.execPath, worker],
@@ -38,12 +40,17 @@ describe.skipIf(!enabled)("session memory latency / I-O (AC11)", () => {
 		// Each cold random lookup is exactly one bounded dictionary partition read
 		// (1 block + ≤1 patch seek), never a full index scan.
 		expect(measured.coldRangeReads).toBeLessThanOrEqual(50);
+		expect(measured.childrenRangeReads).toBeGreaterThan(0);
+		expect(measured.childrenRangeReads).toBeLessThanOrEqual(256);
+		expect(measured.branchRangeReads).toBeGreaterThan(0);
+		expect(measured.branchRangeReads).toBeLessThanOrEqual(30);
 
-		// Approved AC11 p95 budgets (stage-02-revision:167): cold random read ≤ 5 ms
-		// and warm reads are microseconds. On a quiet NVMe host the cold p95 budget is
-		// met; the gate is opt-in (GJC_SESSION_MEMORY_LATENCY=1) like the RSS suite so
-		// it is not flaky under unrelated machine load.
-		expect(measured.coldMs.p95).toBeLessThanOrEqual(250);
+		// Approved AC11 local-NVMe p95 budgets (stage-02-revision:167):
+		// cold random read ≤ 5 ms and a 10k-cold-entry branch switch ≤ 200 ms.
+		// The gate is opt-in (GJC_SESSION_MEMORY_LATENCY=1) like the RSS suite so
+		// unrelated shared-host load cannot make normal CI flaky.
+		expect(measured.coldMs.p95).toBeLessThanOrEqual(5);
+		expect(measured.branchSwitchMs.p95).toBeLessThanOrEqual(200);
 		expect(measured.warmMs.p95).toBeLessThanOrEqual(5);
 		expect(measured.childrenMs.p95).toBeLessThanOrEqual(1_000);
 	}, 120_000);
