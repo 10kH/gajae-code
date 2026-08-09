@@ -6216,6 +6216,7 @@ export const SessionManagerTestHooks: {
 	materializedCacheMaxBytesOverride?: number;
 	beforeResidentTransitionIndexBuild?: () => void;
 	afterForkSnapshot?: () => void | Promise<void>;
+	afterForkTranscriptPublished?: () => void | Promise<void>;
 	beforeEphemeralArtifactManagerInstall?: (dir: string) => void | Promise<void>;
 	beforePersistPatchFence?: (attempt: number) => void;
 } = {};
@@ -8755,6 +8756,7 @@ export class SessionManager {
 					publishedSha256,
 				};
 			}
+			await SessionManagerTestHooks.afterForkTranscriptPublished?.();
 			if (forkArtifactPublication?.kind === "managed") {
 				forkArtifactPublication.store.verifyRootSecurity();
 				forkArtifactPublication.store.assertBound();
