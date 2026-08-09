@@ -91,6 +91,19 @@ export interface ExternalSessionResumeTarget {
 	readonly path?: string;
 }
 
+function validExternalSessionResumeTarget(value: unknown): value is ExternalSessionResumeTarget {
+	return (
+		isRecord(value) &&
+		typeof value.sessionIdOrPrefix === "string" &&
+		value.sessionIdOrPrefix.length > 0 &&
+		(value.path === undefined || (typeof value.path === "string" && value.path.length > 0))
+	);
+}
+
+function invalidExternalResume(message: string): ExternalSessionResumeResult {
+	return { kind: "unavailable", message };
+}
+
 export type ExternalSessionResumeResult =
 	| { readonly kind: "result"; readonly outcome: SessionResumeOutcome }
 	| { readonly kind: "not_found" }
@@ -173,19 +186,31 @@ export class AgentDirSessionLifecycleService extends SessionLifecycleService {
 		readonly modelPreset?: string;
 		readonly readinessTimeoutMs?: number;
 	}): Promise<ExternalSessionResumeResult> {
+		const rawRequest: Record<string, unknown> = isRecord(request) ? request : {};
+		const targetInput = rawRequest.target;
+		if (!validExternalSessionResumeTarget(targetInput))
+			return invalidExternalResume("resume target requires a non-empty sessionIdOrPrefix");
+		const validation = validateSessionLifecycleMutationRequest({
+			operation: "session.resume",
+			actor: rawRequest.actor,
+			capability: rawRequest.capability,
+			requestKey: rawRequest.requestKey,
+			target: { sessionId: targetInput.sessionIdOrPrefix, ...(targetInput.path ? { cwd: targetInput.path } : {}) },
+		});
+		if (!validation.ok) return invalidExternalResume(validation.error.message);
 		const recent = await this.listRecent({
-			cwd: request.target.path ?? this.#agentDir,
-			allWorkspaces: request.target.path === undefined,
+			cwd: targetInput.path ?? this.#agentDir,
+			allWorkspaces: targetInput.path === undefined,
 			limit: 1_000,
 			includeInternal: false,
 		});
 		if (recent.kind === "error") return { kind: "unavailable", message: recent.message };
 		const prefixed = recent.entries.filter(
 			entry =>
-				entry.sessionId === request.target.sessionIdOrPrefix ||
-				entry.sessionId.startsWith(request.target.sessionIdOrPrefix),
+				entry.sessionId === targetInput.sessionIdOrPrefix ||
+				entry.sessionId.startsWith(targetInput.sessionIdOrPrefix),
 		);
-		const exact = prefixed.filter(entry => entry.sessionId === request.target.sessionIdOrPrefix);
+		const exact = prefixed.filter(entry => entry.sessionId === targetInput.sessionIdOrPrefix);
 		const resolved: RecentSessionEntry[] = exact.length > 0 ? exact : prefixed;
 		if (resolved.length === 0) return { kind: "not_found" };
 		if (resolved.length > 1)
@@ -199,9 +224,9 @@ export class AgentDirSessionLifecycleService extends SessionLifecycleService {
 		const selected = resolved[0]!;
 		if (!selected.path) return { kind: "unavailable", message: "Saved session workspace is unavailable." };
 		const outcome = await this.resume({
-			actor: request.actor,
-			capability: request.capability,
-			requestKey: request.requestKey,
+			actor: validation.actor,
+			capability: "session.resume",
+			requestKey: validation.requestKey,
 			target: {
 				sessionId: selected.sessionId,
 				cwd: selected.path,

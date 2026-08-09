@@ -49,6 +49,7 @@ import {
 	type ExternalSessionResumeResult,
 	type ExternalSessionResumeTarget,
 } from "../lifecycle/client";
+import type { ListRecentSessionsResult } from "../lifecycle/recent-sessions";
 import type {
 	SessionCloseOutcome,
 	SessionCreateOutcome,
@@ -9949,7 +9950,7 @@ export class TelegramNotificationDaemon {
 
 	/** Render verified recent work folders as one-shot picker buttons. */
 	async #renderRecentFolderChoices(threadId: number, providerRequestKey: string): Promise<boolean> {
-		let recent: Awaited<ReturnType<AgentDirSessionLifecycleService["listRecent"]>>;
+		let recent: ListRecentSessionsResult;
 		try {
 			recent = await this.lifecycleService.listRecent({
 				cwd: process.cwd(),

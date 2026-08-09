@@ -271,4 +271,28 @@ describe("SessionLifecycleService", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
+
+	it("rejects invalid resume authority before enumerating saved histories", async () => {
+		const service = new AgentDirSessionLifecycleService("/agent");
+		const listSpy = spyOn(service, "listRecent").mockResolvedValue({ kind: "complete", entries: [], warnings: [] });
+		try {
+			const unauthorized = await service.resumeExternal({
+				actor: { id: "", namespace: actor.namespace },
+				capability: "session.resume",
+				requestKey: "resume-unauthorized",
+				target: { sessionIdOrPrefix: "session" },
+			});
+			expect(unauthorized).toMatchObject({ kind: "unavailable", message: "authenticated actor is required" });
+			const emptyPrefix = await service.resumeExternal({
+				actor,
+				capability: "session.resume",
+				requestKey: "resume-empty-prefix",
+				target: { sessionIdOrPrefix: "" },
+			});
+			expect(emptyPrefix).toMatchObject({ kind: "unavailable" });
+			expect(listSpy).not.toHaveBeenCalled();
+		} finally {
+			listSpy.mockRestore();
+		}
+	});
 });
