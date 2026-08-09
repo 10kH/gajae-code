@@ -142,8 +142,11 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 82 terminalizes expired and out-of-band queue removals, defers BTW
  * completion across all chunks, and classifies definitive direct rejections.
  * Generation 83 terminalizes pending frames discarded during topic flush.
+ * Generation 84 closes policy/archive/selected direct waiter cleanup and routes
+ * pre-identity threaded output through flat delivery instead of a blocked queue.
+ * Generation 85 removes the obsolete pending-frame admission path entirely.
  */
-export const DAEMON_GENERATION = 83;
+export const DAEMON_GENERATION = 85;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -172,5 +175,7 @@ export const DAEMON_GENERATION = 83;
  * Epoch 28 requires terminal flat/pending admission and list-only Broker routing.
  * Epoch 29 requires complete removal terminalization and direct rejection state.
  * Epoch 30 requires terminal settlement for pending-frame flush discards.
+ * Epoch 31 requires complete direct waiter closure and pre-identity delivery.
+ * Epoch 32 removes identity-gated pending publication admission.
  */
-export const SERVING_EPOCH = 30;
+export const SERVING_EPOCH = 32;

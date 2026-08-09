@@ -334,7 +334,6 @@ const TYPING_REFRESH_INTERVAL_MS = 4_000;
 // Native reactions used as a two-stage delivery double-check on inbound thread
 // messages: queued on receipt, consumed once a turn picks the message up.
 const QUEUED_REACTION = "👀";
-const PENDING_TOPIC_FRAME_LIMIT = 20;
 const SEEN_UPDATE_ID_LIMIT = 1_000;
 const ORPHAN_TOPIC_GRACE_MS = 60_000;
 const CONSUMED_REACTION = "✅";
@@ -4084,6 +4083,7 @@ interface SelectedAckQueueItem {
 	state: "queued" | "dispatching" | "sending";
 	controller?: AbortController;
 	followers: Array<{ pendingKey: string; requestId: string; commitKey: string }>;
+	publicationId?: string;
 	settled: Promise<SelectedAckOutcome>;
 	resolveSettled: (outcome: SelectedAckOutcome) => void;
 }
@@ -5029,7 +5029,11 @@ export class TelegramNotificationDaemon {
 					}
 					const logicalSessionId = this.#logicalSessionId(session);
 					const socketLease = this.#socketLease(session, logicalSessionId);
-					if (!socketLease) return;
+					if (!socketLease) {
+						await this.markPublicationRejected(publicationId);
+						if (publicationId) this.deferredPublications.delete(publicationId);
+						return;
+					}
 					const topicLease = this.topicAuthorityLeaseFromRegistry(logicalSessionId);
 					if (
 						this.topics.get(logicalSessionId)?.bindingMalformed ||
@@ -5043,8 +5047,11 @@ export class TelegramNotificationDaemon {
 						if (
 							existing.requestId === requestId ||
 							existing.followers.some(follower => follower.requestId === requestId)
-						)
+						) {
+							const outcome = await existing.settled;
+							await this.settleSelectedPublication(publicationId, outcome);
 							return;
+						}
 						const pendingKey = `${session.attachmentKey}\0${requestId}`;
 						existing.followers.push({ pendingKey, requestId, commitKey });
 						this.selectedAckPending.set(pendingKey, existing);
@@ -5053,7 +5060,11 @@ export class TelegramNotificationDaemon {
 						return;
 					}
 					const pendingKey = `${session.attachmentKey}\0${requestId}`;
-					if (this.selectedAckPending.has(pendingKey)) return;
+					if (this.selectedAckPending.has(pendingKey)) {
+						const outcome = await this.selectedAckPending.get(pendingKey)!.settled;
+						await this.settleSelectedPublication(publicationId, outcome);
+						return;
+					}
 					const settlement = Promise.withResolvers<SelectedAckOutcome>();
 					const item: SelectedAckQueueItem = {
 						pendingKey,
@@ -5064,6 +5075,7 @@ export class TelegramNotificationDaemon {
 						session,
 						socketLease,
 						state: "queued",
+						publicationId,
 						followers: [],
 						settled: settlement.promise,
 						resolveSettled: settlement.resolve,
@@ -5089,7 +5101,7 @@ export class TelegramNotificationDaemon {
 			.add({
 				name: "ask-selected-ack-cancel",
 				matches: msg => msg.type === "ask_selected_ack_cancel",
-				handle: (session, msg) => {
+				handle: async (session, msg) => {
 					const requestId = typeof msg.requestId === "string" ? msg.requestId : undefined;
 					const commitKey = typeof msg.commitKey === "string" ? msg.commitKey : undefined;
 					if (!requestId || !commitKey) return;
@@ -5131,10 +5143,15 @@ export class TelegramNotificationDaemon {
 					if (item.state !== "sending") {
 						this.pool.removeById(item.itemId);
 						this.finishSelectedAck(item, { status: "failed", reason: "cancelled" });
+						await this.settleSelectedPublication(item.publicationId, { status: "failed", reason: "cancelled" });
 						return;
 					}
 					item.controller?.abort();
 					this.finishSelectedAck(item, { status: "unknown", reason: "transport_ambiguous" });
+					await this.settleSelectedPublication(item.publicationId, {
+						status: "unknown",
+						reason: "transport_ambiguous",
+					});
 				},
 			})
 			.add({
@@ -6876,9 +6893,18 @@ export class TelegramNotificationDaemon {
 
 	private cancelUnsentLegacyToolStart(state: LegacyToolStartSettlement): boolean {
 		if (state.phase !== "admitted" && state.phase !== "pending_identity" && state.phase !== "queued") return false;
-		if (state.itemId) this.pool.removeById(state.itemId);
+		if (state.itemId) {
+			const removed = this.pool.removeById(state.itemId);
+			if (removed) this.rejectRemovedPublication(removed);
+		}
 		for (const [sessionId, frames] of this.pendingThreadedFrames) {
+			const removed = frames.filter(frame => frame.toolActivity === state.owner);
 			const retained = frames.filter(frame => frame.toolActivity !== state.owner);
+			for (const frame of removed)
+				if (frame.publicationId) {
+					this.deferredPublications.delete(frame.publicationId);
+					this.markPublicationRejected(frame.publicationId).catch(() => undefined);
+				}
 			if (retained.length === 0) this.pendingThreadedFrames.delete(sessionId);
 			else if (retained.length !== frames.length) this.pendingThreadedFrames.set(sessionId, retained);
 		}
@@ -7167,48 +7193,6 @@ export class TelegramNotificationDaemon {
 				return;
 			}
 		}
-	}
-
-	private async rememberPendingThreadedFrame(
-		session: AttachmentSession,
-		send: ThreadedSend,
-		msg: Record<string, unknown>,
-		toolActivity?: ToolActivityOwner,
-		publicationId?: string,
-	): Promise<void> {
-		const logicalSessionId = this.#logicalSessionId(session);
-		const socketLease = this.#socketLease(session, logicalSessionId);
-		if (!socketLease && !session.logicalSessionIdTrusted) {
-			this.failLegacyToolStart(toolActivity);
-			await this.markPublicationRejected(publicationId);
-			if (publicationId) this.deferredPublications.delete(publicationId);
-			return;
-		}
-		const frames = this.pendingThreadedFrames.get(logicalSessionId) ?? [];
-		const legacyStart =
-			toolActivity?.phase === "started"
-				? this.legacyToolStarts.get(`${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`)
-				: undefined;
-		if (legacyStart !== undefined && legacyStart.owner === toolActivity) legacyStart.phase = "pending_identity";
-		frames.push({
-			send,
-			msg,
-			logicalSessionId,
-			session,
-			socketLease,
-			...(toolActivity ? { toolActivity } : {}),
-			...(publicationId ? { publicationId } : {}),
-		});
-		if (publicationId) this.deferredPublications.add(publicationId);
-		if (frames.length > PENDING_TOPIC_FRAME_LIMIT) {
-			const evicted = frames.shift();
-			this.failLegacyToolStart(evicted?.toolActivity);
-			if (evicted?.publicationId) {
-				await this.markPublicationRejected(evicted.publicationId);
-				this.deferredPublications.delete(evicted.publicationId);
-			}
-		}
-		this.pendingThreadedFrames.set(logicalSessionId, frames);
 	}
 
 	private async flushPendingThreadedFrames(sessionId: string, topicLease: TopicAuthorityLease): Promise<void> {
@@ -7660,7 +7644,10 @@ export class TelegramNotificationDaemon {
 				if (ownerSessionId === sessionId) this.topicOwnerByIdentity.delete(identityKey);
 			});
 			for (const frame of this.pendingThreadedFrames.get(sessionId) ?? [])
-				if (frame.publicationId) this.deferredPublications.delete(frame.publicationId);
+				if (frame.publicationId) {
+					await this.markPublicationRejected(frame.publicationId);
+					this.deferredPublications.delete(frame.publicationId);
+				}
 			this.pendingThreadedFrames.delete(sessionId);
 			try {
 				await this.persistTopics();
@@ -9602,6 +9589,14 @@ export class TelegramNotificationDaemon {
 						await this.markPublicationDelivered(publicationId);
 						this.deferredPublications.delete(publicationId);
 					}
+					if (
+						publicationId &&
+						deliveryOutcome !== "accepted" &&
+						this.publicationLastOutcomes.get(publicationId) === "rejected"
+					) {
+						await this.markPublicationRejected(publicationId);
+						this.deferredPublications.delete(publicationId);
+					}
 					return;
 				}
 				const markdown = msg.text;
@@ -9877,7 +9872,7 @@ export class TelegramNotificationDaemon {
 				await this.failPublicationPreSend(publicationId, "topic authority is inactive or malformed");
 			}
 			if (!send.identity && !existingTopic && !this.flatIdentitySent.has(logicalSessionId)) {
-				await this.rememberPendingThreadedFrame(session, send, threadedFrame, toolActivity, publicationId);
+				await this.deliverFlatFallback(logicalSessionId, send, toolActivity, socketLease, publicationId);
 				return;
 			}
 			const topicId =
@@ -11212,11 +11207,21 @@ export class TelegramNotificationDaemon {
 								if (!this.liveMessages.has(key) && owner?.session === toolActivity.session)
 									this.toolActivityOwners.delete(key);
 							}
+							for (const frame of frames)
+								if (frame.msg.type === "tool_activity" && frame.publicationId) {
+									await this.markPublicationRejected(frame.publicationId);
+									this.deferredPublications.delete(frame.publicationId);
+								}
 							const retained = frames.filter(frame => frame.msg.type !== "tool_activity");
 							if (retained.length === 0) this.pendingThreadedFrames.delete(sessionId);
 							else this.pendingThreadedFrames.set(sessionId, retained);
 						}
 						for (const session of this.sessions.values()) {
+							for (const item of session.replayQueue)
+								if (item.frame.type === "tool_activity" && item.publicationId) {
+									await this.markPublicationRejected(item.publicationId);
+									this.deferredPublications.delete(item.publicationId);
+								}
 							session.replayQueue = session.replayQueue.filter(item => item.frame.type !== "tool_activity");
 						}
 					}
