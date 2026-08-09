@@ -181,6 +181,7 @@ export class SessionRouter {
 	#reconcileTail: Promise<void> = Promise.resolve();
 	#ready = false;
 	#started = false;
+	#stopController = new AbortController();
 
 	constructor(options: SessionRouterOptions) {
 		this.#agentDir = options.agentDir;
@@ -197,6 +198,7 @@ export class SessionRouter {
 	async start(): Promise<void> {
 		if (this.#started) return;
 		this.#started = true;
+		if (this.#stopController.signal.aborted) this.#stopController = new AbortController();
 		try {
 			await this.#serialReconcile();
 			if (!this.#started) return;
@@ -217,6 +219,7 @@ export class SessionRouter {
 		if (this.#stopTimer) this.#stopTimer();
 		this.#stopTimer = undefined;
 		this.#started = false;
+		this.#stopController.abort();
 		this.#ready = false;
 		await this.#reconcileTail.catch(() => undefined);
 		await Promise.allSettled([...this.#pending]);
@@ -492,7 +495,7 @@ export class SessionRouter {
 			if (attached) this.#schedule(this.#enqueueFrame(attached, frame, "live"));
 		});
 		const disposeReconnect = client.onReconnect?.(() => {
-			if (attached) void this.#replayAttachment(attached, attached.cursor.seq).catch(() => undefined);
+			if (attached) this.#schedule(this.#replayAttachment(attached, attached.cursor.seq));
 		});
 		attached = {
 			id: randomUUID(),
@@ -686,11 +689,26 @@ export class SessionRouter {
 			let replay: Record<string, unknown>;
 			for (let attempt = 0; ; attempt++) {
 				try {
-					replay = await attached.client.request({
+					const replayRequest = attached.client.request({
 						type: "event_replay",
 						sinceGeneration: attached.generation,
 						sinceSeq,
 					});
+					if (this.#stopController.signal.aborted) return;
+					const stopped = Promise.withResolvers<void>();
+					const onStop = (): void => stopped.resolve();
+					this.#stopController.signal.addEventListener("abort", onStop, { once: true });
+					let outcome: { kind: "response"; value: Record<string, unknown> } | { kind: "stopped" };
+					try {
+						outcome = await Promise.race([
+							replayRequest.then(value => ({ kind: "response" as const, value })),
+							stopped.promise.then(() => ({ kind: "stopped" as const })),
+						]);
+					} finally {
+						this.#stopController.signal.removeEventListener("abort", onStop);
+					}
+					if (outcome.kind === "stopped") return;
+					replay = outcome.value;
 					break;
 				} catch {
 					if (attempt >= REPLAY_RETRY_ATTEMPTS) {

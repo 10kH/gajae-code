@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes close-isolation generation 106 at serving epoch 53", () => {
+test("publishes replay-interrupt generation 108 at serving epoch 55", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 106 / serving epoch 53: Router close failures cannot skip later clients.
-	expect(DAEMON_GENERATION).toBe(106);
-	expect(SERVING_EPOCH).toBe(53);
+	// Generation 108 / serving epoch 55: Router stop interrupts pending reconnect replay.
+	expect(DAEMON_GENERATION).toBe(108);
+	expect(SERVING_EPOCH).toBe(55);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
