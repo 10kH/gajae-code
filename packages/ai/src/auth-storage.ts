@@ -3560,6 +3560,38 @@ export class AuthStorage {
 		} else if (credential.mcpBinding) {
 			refreshPromise = refreshBoundMCPOAuthCredential(credential, {}, signal);
 		} else {
+			// Stale-snapshot guard: before replaying our in-memory refresh token
+			// upstream, re-read the persisted row. With several gjc processes
+			// sharing one store, a peer may have already rotated the token; the
+			// post-failure recovery below (catch in #tryOAuthCredential) reloads
+			// AFTER the replay, but by then the damage is upstream — providers
+			// with refresh-token rotation + reuse detection (Anthropic) treat a
+			// replayed rotated token as theft and can revoke the whole grant
+			// family, killing the peer's freshly rotated, still-valid tokens
+			// mid-request (observed as live-session 401 "OAuth access token has
+			// been revoked" plus all-day `invalid_grant` refresh floods). Adopt
+			// the persisted credential instead: skip the upstream call entirely
+			// when it is still fresh, otherwise refresh with the newest refresh
+			// token. Force-refresh semantics are preserved — a force caller
+			// passes a clone whose refresh token still matches the row, so the
+			// guard is a no-op there (same for broker snapshots, where both
+			// sides carry the redacted refresh sentinel).
+			if (credentialId !== undefined) {
+				const persisted = this.#store
+					.listAuthCredentials(provider)
+					.find(row => row.id === credentialId)?.credential;
+				if (persisted?.type === "oauth" && persisted.refresh !== credential.refresh) {
+					logger.debug("OAuth refresh skipped stale snapshot; adopting persisted rotation", {
+						provider,
+						credentialId,
+						persistedFresh: Date.now() + OAUTH_REFRESH_SKEW_MS < persisted.expires,
+					});
+					if (Date.now() + OAUTH_REFRESH_SKEW_MS < persisted.expires) {
+						return persisted;
+					}
+					credential = persisted;
+				}
+			}
 			const customProvider = getOAuthProvider(provider);
 			if (customProvider) {
 				if (!customProvider.refreshToken) {

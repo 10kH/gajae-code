@@ -501,4 +501,110 @@ describe("AuthStorage OAuth refresh race", () => {
 			expect(events[0]?.disabledCause).toContain("authorization grant is invalid");
 		});
 	});
+	test("never replays a stale refresh token upstream when a peer already rotated the row", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		// The post-failure recovery paths above only reload AFTER the stale
+		// token was already replayed at the provider's token endpoint. For
+		// providers with refresh-token rotation + reuse detection (Anthropic),
+		// that replay revokes the whole grant family and kills the peer's
+		// still-valid tokens mid-request. The pre-refresh guard must therefore
+		// adopt the persisted rotation WITHOUT any upstream refresh call.
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "stale-access",
+				refresh: "stale-refresh",
+				expires: Date.now() - 60_000,
+			},
+		]);
+		const credentialId = store.listAuthCredentials("anthropic")[0]!.id;
+
+		// Peer rotated the row and its access token is still fresh.
+		store.updateAuthCredential(credentialId, {
+			type: "oauth",
+			access: "fresh-access-from-peer",
+			refresh: "fresh-refresh-from-peer",
+			expires: Date.now() + 60 * 60_000,
+		});
+
+		const refreshSpy = vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async () => {
+			throw new Error("upstream token endpoint must not be hit with a stale refresh token");
+		});
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, creds) => {
+			const credential = creds[provider];
+			if (!credential) return null;
+			return { newCredentials: credential, apiKey: credential.access };
+		});
+
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			const apiKey = await authStorage!.getApiKey("anthropic", "session-no-replay");
+
+			expect(apiKey).toBe("fresh-access-from-peer");
+			// Zero upstream refresh calls: the guard adopted the persisted row.
+			expect(refreshSpy).not.toHaveBeenCalled();
+			expect(events).toHaveLength(0);
+		});
+	});
+
+	test("refreshes with the persisted refresh token when both snapshot and row are expired", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "stale-access",
+				refresh: "stale-refresh",
+				expires: Date.now() - 60_000,
+			},
+		]);
+		const credentialId = store.listAuthCredentials("anthropic")[0]!.id;
+
+		// Peer rotated the row, but the rotated access token has ALSO expired
+		// (e.g. this process slept past the peer token's lifetime). A refresh is
+		// genuinely needed — it must spend the NEWEST refresh token, never the
+		// stale snapshot one.
+		store.updateAuthCredential(credentialId, {
+			type: "oauth",
+			access: "expired-access-from-peer",
+			refresh: "fresh-refresh-from-peer",
+			expires: Date.now() - 1_000,
+		});
+
+		const refreshedWith: string[] = [];
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async (_provider, credentials) => {
+			refreshedWith.push(credentials.refresh);
+			if (credentials.refresh !== "fresh-refresh-from-peer") {
+				throw new Error(
+					'invalid_grant {"error":"invalid_grant","error_description":"Refresh token not found or invalid"}',
+				);
+			}
+			return {
+				...credentials,
+				access: "rotated-access",
+				refresh: "rotated-refresh",
+				expires: Date.now() + 60 * 60_000,
+			};
+		});
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, creds) => {
+			const credential = creds[provider];
+			if (!credential) return null;
+			return { newCredentials: credential, apiKey: credential.access };
+		});
+
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			const apiKey = await authStorage!.getApiKey("anthropic", "session-adopt-refresh");
+
+			expect(apiKey).toBe("rotated-access");
+			expect(refreshedWith).toEqual(["fresh-refresh-from-peer"]);
+			expect(events).toHaveLength(0);
+
+			// Rotation result persisted to the shared row.
+			const stored = store!.listAuthCredentials("anthropic");
+			expect(stored).toHaveLength(1);
+			if (stored[0]?.credential.type === "oauth") {
+				expect(stored[0].credential.refresh).toBe("rotated-refresh");
+			}
+		});
+	});
 });
