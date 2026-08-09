@@ -116,8 +116,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 68 releases claimed BTW publications when shutdown prevents dispatch.
  * Generation 69 settles selected acknowledgements and queued BTW publications
  * only from positive Telegram message receipts.
+ * Generation 70 separates queued claims from provider-attempt ambiguity so
+ * pre-send work remains replayable after daemon restart.
  */
-export const DAEMON_GENERATION = 69;
+export const DAEMON_GENERATION = 70;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -132,5 +134,6 @@ export const DAEMON_GENERATION = 69;
  * Epoch 14 requires bounded receipt loading and fail-closed pending eviction.
  * Epoch 15 requires BTW shutdown to preserve Router replay authority.
  * Epoch 16 requires accepted-only settlement for special provider queues.
+ * Epoch 17 requires durable queued/attempted/confirmed publication states.
  */
-export const SERVING_EPOCH = 16;
+export const SERVING_EPOCH = 17;

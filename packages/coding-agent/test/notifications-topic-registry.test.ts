@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes special-queue generation 69 at serving epoch 16", () => {
+test("publishes attempt-aware generation 70 at serving epoch 17", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 69 / serving epoch 16: selected and BTW queues require positive message receipts.
-	expect(DAEMON_GENERATION).toBe(69);
-	expect(SERVING_EPOCH).toBe(16);
+	// Generation 70 / serving epoch 17: queued work stays replayable until provider attempt.
+	expect(DAEMON_GENERATION).toBe(70);
+	expect(SERVING_EPOCH).toBe(17);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
