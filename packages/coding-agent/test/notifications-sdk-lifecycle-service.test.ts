@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	deriveSessionLifecycleIdempotencyKey,
 	type SessionLifecycleClient,
+	type SessionLifecycleClientRequestOptions,
 	SessionLifecycleService,
 } from "../src/sdk/lifecycle/service";
 
@@ -14,7 +15,11 @@ function lifecycleClient(
 		result: { sessionId: "broker-session-1", endpoint: { url: "ws://private", token: "secret" } },
 	},
 ) {
-	const calls: Array<{ operation: string; input: Record<string, unknown>; options: Record<string, unknown> }> = [];
+	const calls: Array<{
+		operation: string;
+		input: Record<string, unknown>;
+		options: SessionLifecycleClientRequestOptions;
+	}> = [];
 	const client: SessionLifecycleClient = {
 		global: async (operation, input, options) => {
 			calls.push({ operation, input, options });

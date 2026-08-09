@@ -43,11 +43,7 @@ interface SetupResult {
 
 interface SetupOptions {
 	settingsOverrides?: Record<string, unknown>;
-	ensureTelegramDaemon?: (input: {
-		settings: Settings;
-		cwd: string;
-		sessionId: string;
-	}) => Promise<EnsureDaemonResult>;
+	ensureTelegramDaemon?: (input: { settings: Settings }) => Promise<EnsureDaemonResult>;
 }
 
 async function setup(

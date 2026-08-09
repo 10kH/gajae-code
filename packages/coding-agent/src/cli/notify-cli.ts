@@ -548,12 +548,7 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 				reconnect: async () =>
 					deps.ensureTelegramDaemon
 						? await deps.ensureTelegramDaemon(settings)
-						: await ensureTelegramDaemonRunningDetailed({
-								settings,
-								cwd: process.cwd(),
-								sessionId: `notify-cli-${process.pid}`,
-								registerRoot: false,
-							}),
+						: await ensureTelegramDaemonRunningDetailed({ settings }),
 				persistInactive: async marker => await persistTelegramActivationMarker(settings, marker),
 				clearInactive: async marker => await clearTelegramActivationMarker(settings, marker),
 				marker: activationMarker,

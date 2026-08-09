@@ -1308,7 +1308,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 		const release = Promise.withResolvers<void>();
 		await withDaemon(
 			async (_daemon, provider, agentDir) => {
-				const attachment = async (sessionId): Promise<SessionAttachment> => ({
+				const attachment = async (sessionId: string): Promise<SessionAttachment> => ({
 					sessionId,
 					generation: 1,
 					isCurrent: () => true,
@@ -1388,7 +1388,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				const uncertainCustomId = `gjc:1:ask-uncertain:${uncertain.pendingActionNonce!}`;
 				provider.deferInteraction = async () => {};
 				const originalSend = (await attachment("session")).send;
-				const throwingAttachment = async (sessionId): Promise<SessionAttachment> => ({
+				const throwingAttachment = async (sessionId: string): Promise<SessionAttachment> => ({
 					sessionId,
 					generation: 1,
 					isCurrent: () => true,
@@ -2112,7 +2112,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			let failScheduledDrain = false;
 			let failedScheduledDrains = 0;
 			const provider = new FakeDiscordProvider();
-			const attachment = async (sessionId): Promise<SessionAttachment> => {
+			const attachment = async (sessionId: string): Promise<SessionAttachment> => {
 				if (failScheduledDrain) {
 					failedScheduledDrains++;
 					throw new Error("transient attachment lookup failure");

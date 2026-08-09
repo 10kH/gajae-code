@@ -24,6 +24,12 @@ const forbiddenProviderAuthorities = [
 	"createLifecycleControlServer",
 	"createLifecycleOrchestratorDeps",
 	"intendedSessionId",
+	"scanRoots",
+	"registerNotificationRoot",
+	"unregisterNotificationRoot",
+	"notificationRootRegistration",
+	"notificationRootForCwd",
+	"WebSocketImpl",
 ] as const;
 
 describe("SDK-owned session lifecycle authority", () => {
@@ -34,6 +40,9 @@ describe("SDK-owned session lifecycle authority", () => {
 				expect(contents, `${relativePath} retains forbidden authority ${forbidden}`).not.toContain(forbidden);
 			}
 		}
+		const telegram = await source("src/sdk/bus/telegram-daemon.ts");
+		for (const forbidden of ["connectSession(", "readEndpoint("] as const)
+			expect(telegram, `telegram-daemon.ts retains forbidden authority ${forbidden}`).not.toContain(forbidden);
 	});
 
 	test("only SDK core modules read Broker and session endpoint discovery", async () => {

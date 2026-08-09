@@ -148,11 +148,7 @@ test("abandons a premature endpoint generation before handing out its replacemen
 async function bootSession(
 	settingsOverrides: Record<string, unknown> = {},
 	options: {
-		ensureTelegramDaemon?: (input: {
-			settings: Settings;
-			cwd: string;
-			sessionId: string;
-		}) => Promise<EnsureDaemonResult>;
+		ensureTelegramDaemon?: (input: { settings: Settings }) => Promise<EnsureDaemonResult>;
 	} = {},
 	replacePrematureEndpoint = true,
 ): Promise<{
@@ -190,7 +186,11 @@ async function bootSession(
 		eligible: true,
 		getConfig: () => getNotificationConfig(settings),
 	});
-	createNotificationsExtension(api, { settings, controller, ensureTelegramDaemon: options.ensureTelegramDaemon });
+	createNotificationsExtension(api, {
+		settings,
+		controller,
+		ensureTelegramDaemon: options.ensureTelegramDaemon ?? (async () => "attached"),
+	});
 	const sid = `stream-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
 		cwd,

@@ -1323,7 +1323,7 @@ describe("chat daemon worker", () => {
 	const skipProductionSessionHost =
 		process.env.AFFECTED_TASK_KEY?.startsWith("test:@gajae-code/coding-agent:shard-") ?? false;
 	const productionSessionHostTestName =
-		"routes Slack safe queries through the production Session SDK host across generation and worker restart";
+		"routes Slack safe queries through the production Session SDK host across worker restart";
 	it.skipIf(skipProductionSessionHost)(
 		productionSessionHostTestName,
 		async () => {
@@ -1331,7 +1331,6 @@ describe("chat daemon worker", () => {
 			const agentDir = path.join(root, ".gjc", "agent");
 			const host = await startProductionSdkHost(root);
 			const index = await new SessionIndex(agentDir).open();
-			let tick: (() => void) | undefined;
 			const config = {
 				identity: "fingerprint-only",
 				notifications: {
@@ -1369,10 +1368,7 @@ describe("chat daemon worker", () => {
 						routerDeps: {
 							createIndex: () => index,
 							onReconciled,
-							setInterval: ((callback: () => void) => {
-								tick = callback;
-								return 0;
-							}) as unknown as typeof setInterval,
+							setInterval: (() => 0) as unknown as typeof setInterval,
 							clearInterval: (() => {}) as typeof clearInterval,
 						},
 					},
@@ -1405,12 +1401,7 @@ describe("chat daemon worker", () => {
 				});
 
 				const firstProvider = new FakeSlackProvider();
-				const generationTwoReconciled = Promise.withResolvers<void>();
-				let reconciliationCount = 0;
-				const firstRuntime = startRuntime(firstProvider, () => {
-					reconciliationCount++;
-					if (reconciliationCount === 2) generationTwoReconciled.resolve();
-				});
+				const firstRuntime = startRuntime(firstProvider);
 				await withStageTimeout("first runtime start", firstRuntime.start());
 				const firstCommandResult = firstProvider.waitForPostCount(1, post =>
 					post.text.includes('"operation":"todo.list"'),
@@ -1419,28 +1410,6 @@ describe("chat daemon worker", () => {
 				await withStageTimeout("first Slack SDK result", firstCommandResult);
 				expect(firstProvider.posts.filter(post => post.text.includes('"operation":"todo.list"'))).toHaveLength(1);
 
-				await index.append({
-					type: "host_registered",
-					sessionId: host.sessionId,
-					locator: { repo: root, stateRoot: path.join(root, ".gjc", "state") },
-					endpointGeneration: 2,
-					pid: process.pid,
-					endpointMtimeMs: host.endpointMtimeMs,
-				});
-				await store.transact(rootKey, current =>
-					current
-						? { ...current, generation: current.generation + 1, endpointGeneration: 2, updatedAt: Date.now() }
-						: current,
-				);
-				expect(tick).toBeDefined();
-				tick?.();
-				await withStageTimeout("generation-two reconciliation", generationTwoReconciled.promise);
-				const generationTwoCommandResult = firstProvider.waitForPostCount(2, post =>
-					post.text.includes('"operation":"todo.list"'),
-				);
-				await firstProvider.handler?.(command("generation-two"));
-				await withStageTimeout("generation-two Slack SDK result", generationTwoCommandResult);
-				expect(firstProvider.posts.filter(post => post.text.includes('"operation":"todo.list"'))).toHaveLength(2);
 				await withStageTimeout("first runtime stop", firstRuntime.stop());
 				expect(firstProvider.stopped).toBe(true);
 

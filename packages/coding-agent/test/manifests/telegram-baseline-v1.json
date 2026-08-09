@@ -117,13 +117,6 @@
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/notifications-sdk-lifecycle-service.test.ts"
-			]
-		},
-		{
-			"argv": [
-				"bun",
-				"test",
 				"packages/coding-agent/test/notifications-lifecycle-create-autoresume.test.ts"
 			]
 		},
@@ -208,13 +201,6 @@
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/notifications-rich-e2e.test.ts"
-			]
-		},
-		{
-			"argv": [
-				"bun",
-				"test",
 				"packages/coding-agent/test/notifications-rich-redteam.test.ts"
 			]
 		},
@@ -223,6 +209,13 @@
 				"bun",
 				"test",
 				"packages/coding-agent/test/notifications-rich-render.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/notifications-sdk-lifecycle-service.test.ts"
 			]
 		},
 		{
@@ -257,41 +250,6 @@
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/notifications-telegram-btw-e2e.test.ts"
-			]
-		},
-		{
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/notifications-telegram-daemon-2956-redteam.test.ts"
-			]
-		},
-		{
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/notifications-telegram-daemon-2956.test.ts"
-			]
-		},
-		{
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/notifications-telegram-daemon-2960-redteam.test.ts"
-			]
-		},
-		{
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/notifications-telegram-daemon-2960.test.ts"
-			]
-		},
-		{
-			"argv": [
-				"bun",
-				"test",
 				"packages/coding-agent/test/notifications-telegram-daemon-cas.test.ts"
 			]
 		},
@@ -300,20 +258,6 @@
 				"bun",
 				"test",
 				"packages/coding-agent/test/notifications-telegram-daemon-owner-postmortem.test.ts"
-			]
-		},
-		{
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/notifications-telegram-daemon-self-heal.test.ts"
-			]
-		},
-		{
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/notifications-telegram-daemon-staging-temp-leak.test.ts"
 			]
 		},
 		{
