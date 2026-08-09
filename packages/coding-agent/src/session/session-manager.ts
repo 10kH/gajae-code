@@ -4793,6 +4793,14 @@ function cloneSessionEntry(entry: SessionEntry): SessionEntry {
 	return cloned;
 }
 
+/** Match eager-resume replay sanitation whenever an entry is loaded from a bounded sidecar path. */
+function sanitizeLoadedSessionEntryReplayMetadata(entry: SessionEntry): SessionEntry {
+	if (entry.type === "message" && entry.message.role === "assistant") {
+		entry.message = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
+	}
+	return entry;
+}
+
 function materializeProviderVisibleEntrySync(entry: SessionEntry, stores: ResidentBlobStores): SessionEntry {
 	if (entry.type === "compaction") {
 		const cache = new Map<string, string>();
@@ -7054,7 +7062,7 @@ export class SessionManager {
 				const entry = JSON.parse(Buffer.from(line).toString("utf8")) as SessionEntry;
 				if (entry.id !== record.id || entry.type !== record.type) return false;
 				if (entry.parentId !== record.parentId) return false;
-				hotEntries.push(entry);
+				hotEntries.push(sanitizeLoadedSessionEntryReplayMetadata(entry));
 			}
 			const entries: FileEntry[] = [header, ...hotEntries];
 			await resolveBlobRefsInEntries(entries, this.#blobStore);
@@ -7597,7 +7605,7 @@ export class SessionManager {
 					}
 					if (inTail) {
 						const entry = parsed as SessionEntry;
-						hotEntries.push(entry);
+						hotEntries.push(sanitizeLoadedSessionEntryReplayMetadata(entry));
 						hotSuffixBytes += byteLength;
 						hotResidentBytes += residentHotEntryBytes(byteLength);
 						if (hotSuffixBytes > this.#sidecarHotSuffixBudgetBytes) {
@@ -11990,7 +11998,7 @@ export class SessionManager {
 			("parentId" in index && (parsed as SessionEntry).parentId !== index.parentId)
 		)
 			return fail();
-		const entry = parsed as SessionEntry;
+		const entry = sanitizeLoadedSessionEntryReplayMetadata(parsed as SessionEntry);
 		residentizePersistedBlobRefs(entry);
 		// Bound the entry cache; a full cache rejects the rehydration (still correct via rebuild).
 		if (!runtime.entryCache.tryAllocate(bytes.byteLength)) return entry;
@@ -12017,8 +12025,9 @@ export class SessionManager {
 				parsed.parentId !== index.parentId
 			)
 				return undefined;
-			residentizePersistedBlobRefs(parsed);
-			return { entry: parsed, index };
+			const entry = sanitizeLoadedSessionEntryReplayMetadata(parsed);
+			residentizePersistedBlobRefs(entry);
+			return { entry, index };
 		} catch {
 			return undefined;
 		}

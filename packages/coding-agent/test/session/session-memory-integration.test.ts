@@ -1086,6 +1086,81 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 	}
 });
 
+it("matches eager replay-metadata sanitation on bounded first open and exact reopen", async () => {
+	const records = [
+		{ type: "session", version: 5, id: "replay-sanitize", timestamp: "0", cwd: "/cwd" },
+		{
+			type: "message",
+			id: "assistant",
+			parentId: null,
+			timestamp: "0",
+			message: {
+				role: "assistant",
+				content: [{ type: "thinking", thinking: "reasoning", thinkingSignature: "stale-signature" }],
+				provider: "openai",
+				model: "test",
+				timestamp: 0,
+				providerPayload: { type: "openaiResponsesHistory", provider: "openai", items: [] },
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+			},
+		},
+		{
+			type: "message",
+			id: "user",
+			parentId: "assistant",
+			timestamp: "0",
+			message: { role: "user", content: "continue", timestamp: 1 },
+		},
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "user",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "assistant",
+			tokensBefore: 10,
+		},
+	];
+	const transcript = `${records.map(record => JSON.stringify(record)).join("\n")}\n`;
+	const eagerStorage = new MemorySessionStorage();
+	const enabledStorage = new MemorySessionStorage();
+	eagerStorage.writeTextSync("/eager/session.jsonl", transcript);
+	enabledStorage.writeTextSync("/enabled/session.jsonl", transcript);
+	const eager = await SessionManager.open(
+		"/eager/session.jsonl",
+		SessionManager.explicitDestination("/eager"),
+		eagerStorage,
+		"copy-retain",
+		"off",
+	);
+	const expected = eager.buildSessionContext();
+	await eager.close();
+
+	const enabled = await SessionManager.open(
+		"/enabled/session.jsonl",
+		SessionManager.explicitDestination("/enabled"),
+		enabledStorage,
+		"copy-retain",
+		"enabled",
+	);
+	expect(enabled.getSessionMemoryStats().coldRetirementActive).toBe(true);
+	expect(enabled.buildSessionContext()).toEqual(expected);
+	expect(JSON.stringify(enabled.buildSessionContext())).not.toContain("stale-signature");
+	expect(JSON.stringify(enabled.buildSessionContext())).not.toContain("openaiResponsesHistory");
+	await enabled.close();
+
+	const reopened = await SessionManager.open(
+		"/enabled/session.jsonl",
+		SessionManager.explicitDestination("/enabled"),
+		enabledStorage,
+		"copy-retain",
+		"enabled",
+	);
+	expect(reopened.getSessionMemoryStats().lazyReopenSucceeded).toBe(true);
+	expect(reopened.buildSessionContext()).toEqual(expected);
+	await reopened.close();
+});
+
 it("commits cold label clears and appended usage before exact reopen", async () => {
 	const storage = new MemorySessionStorage();
 	const sessionFile = "/sessions/metadata-append.jsonl";
