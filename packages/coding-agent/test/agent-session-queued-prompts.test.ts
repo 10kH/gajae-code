@@ -166,6 +166,26 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		expect(session.queuedMessageCount).toBe(0);
 	});
 
+	it("resumes a follow-up queued during foreground eval once the execution settles", async () => {
+		session = buildSession([{ content: ["turn 1"] }, { content: ["turn 2"] }]);
+		await session.prompt("p1");
+
+		const gate = Promise.withResolvers<void>();
+		const evalExecution = session.trackEvalExecution(gate.promise, new AbortController());
+		await session.followUp("p2", undefined, { followUpQueuePolicy: "sequential" });
+
+		expect(session.getQueuedMessages().followUp).toEqual(["p2"]);
+		expect(userTexts(session)).toEqual(["p1"]);
+
+		gate.resolve();
+		await evalExecution;
+		await session.waitForIdle();
+
+		expect(userTexts(session)).toEqual(["p1", "p2"]);
+		expect(assistantCount(session)).toBe(2);
+		expect(session.queuedMessageCount).toBe(0);
+	});
+
 	it("keeps explicit composer queue prompts sequential even when follow-up mode batches", async () => {
 		const gate = Promise.withResolvers<void>();
 		session = buildSession([

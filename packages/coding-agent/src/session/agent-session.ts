@@ -9475,11 +9475,7 @@ export class AgentSession {
 		// agent.continue() only dequeues follow-ups from an assistant-ended state;
 		// resuming from user/toolResult state runs an extra model call on the
 		// stale prompt before draining the queue.
-		if (!this.#cancelAndSubmitInProgress && this.#canAutoContinueForFollowUp()) {
-			this.#scheduleAgentContinue({
-				shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
-			});
-		}
+		this.#scheduleQueuedFollowUpContinuation();
 	}
 
 	/**
@@ -9494,6 +9490,13 @@ export class AgentSession {
 		const messages = this.agent.state.messages;
 		const last = messages[messages.length - 1];
 		return last?.role === "assistant";
+	}
+	#scheduleQueuedFollowUpContinuation(): void {
+		if (!this.#cancelAndSubmitInProgress && this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages()) {
+			this.#scheduleAgentContinue({
+				shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
+			});
+		}
 	}
 
 	/**
@@ -16375,6 +16378,7 @@ export class AgentSession {
 			return result;
 		} finally {
 			this.#bashAbortControllers.delete(abortController);
+			this.#scheduleQueuedFollowUpContinuation();
 		}
 	}
 
@@ -16517,10 +16521,12 @@ export class AgentSession {
 			() => {
 				this.#evalAbortControllers.delete(abortController);
 				this.#activeEvalExecutions.delete(execution);
+				this.#scheduleQueuedFollowUpContinuation();
 			},
 			() => {
 				this.#evalAbortControllers.delete(abortController);
 				this.#activeEvalExecutions.delete(execution);
+				this.#scheduleQueuedFollowUpContinuation();
 			},
 		);
 		return execution;
