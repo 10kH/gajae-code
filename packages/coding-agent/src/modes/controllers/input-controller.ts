@@ -25,7 +25,11 @@ import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { ensureSupportedImageInput, ImageInputTooLargeError } from "../../utils/image-loading";
 import { resizeImage } from "../../utils/image-resize";
 import { loadPastedImageBatch, PastedImageBatchError } from "../../utils/pasted-image-loading";
-import { formatPastedImageReference, parsePastedImagePaths } from "../../utils/pasted-image-path";
+import {
+	formatPastedImageReference,
+	locatePastedImageReferenceAroundCursor,
+	parsePastedImagePaths,
+} from "../../utils/pasted-image-path";
 import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 import { ActionRegistry, APP_ACTION_METADATA } from "../action-registry";
 import { CommandPalette, type CommandPaletteAction, type CommandPaletteEntry } from "../components/command-palette";
@@ -64,6 +68,11 @@ function isExpandable(obj: unknown): obj is Expandable {
 export class InputController {
 	readonly actionRegistry: ActionRegistry<void>;
 	readonly #loadPastedImageBatch: typeof loadPastedImageBatch;
+	#imagePlaceholderDeletionUndo?: {
+		beforeText: string;
+		afterText: string;
+		pendingImages: InteractiveModeContext["pendingImages"];
+	};
 
 	constructor(
 		private ctx: InteractiveModeContext,
@@ -645,6 +654,12 @@ export class InputController {
 		};
 
 		this.ctx.editor.clearCustomKeyHandlers();
+		for (const key of new Set([
+			...this.ctx.keybindings.getKeys("tui.editor.deleteCharBackward"),
+			"shift+backspace" as const,
+		])) {
+			this.ctx.editor.setCustomKeyHandler(key, () => this.#deleteImagePlaceholderBeforeCursor());
+		}
 		// Wire up extension shortcuts
 		this.registerExtensionShortcuts();
 
@@ -751,6 +766,7 @@ export class InputController {
 		// Tab on an empty composer accepts the pending ghost-text prompt suggestion.
 		this.ctx.editor.onTab = (text: string) => this.ctx.promptSuggestion?.tryAcceptOnTab(text) === true;
 
+		this.ctx.editor.onUndo = text => this.#restorePendingImagesAfterPlaceholderUndo(text);
 		this.ctx.editor.onChange = (text: string) => {
 			this.#resetEscapeGestures();
 			this.ctx.promptSuggestion?.notifyEditorChanged(text);
@@ -777,6 +793,7 @@ export class InputController {
 	}
 
 	async submitText(text: string, composer: ComposerSubmissionOptions): Promise<void> {
+		this.#imagePlaceholderDeletionUndo = undefined;
 		text = text.trim();
 		const submittedBashMode = this.ctx.isBashMode;
 		const submittedBashNoContext = this.ctx.isBashNoContext;
@@ -1733,6 +1750,45 @@ export class InputController {
 				imagePaths.length === 1 ? "Failed to attach pasted image" : "Failed to attach pasted images",
 			);
 			return false;
+		}
+	}
+
+	#deleteImagePlaceholderBeforeCursor(): boolean {
+		if (this.ctx.pendingImages.length === 0) return false;
+
+		const { line, col } = this.ctx.editor.getCursor();
+		const currentLine = this.ctx.editor.getLines()[line] ?? "";
+		const range = locatePastedImageReferenceAroundCursor(currentLine, col);
+		if (!range) return false;
+		const placeholderNumberText = String(range.imageIndex);
+
+		const imageIndex = Number.parseInt(placeholderNumberText, 10) - 1;
+		if (imageIndex < 0 || imageIndex >= this.ctx.pendingImages.length) return false;
+
+		const beforeText = this.ctx.editor.getText();
+		const pendingImages = this.ctx.pendingImages;
+		const deleted = this.ctx.editor.deleteTextRangeAroundCursor(range.startCol, range.endCol);
+		if (deleted) {
+			this.#imagePlaceholderDeletionUndo = {
+				beforeText,
+				afterText: this.ctx.editor.getText(),
+				pendingImages,
+			};
+		}
+		return deleted;
+	}
+
+	#restorePendingImagesAfterPlaceholderUndo(text: string): void {
+		const deletion = this.#imagePlaceholderDeletionUndo;
+		if (!deletion) return;
+
+		if (text === deletion.beforeText) {
+			if (this.ctx.pendingImages.length === 0) {
+				this.ctx.pendingImages = deletion.pendingImages;
+			}
+			this.#imagePlaceholderDeletionUndo = undefined;
+		} else if (text !== deletion.afterText) {
+			this.#imagePlaceholderDeletionUndo = undefined;
 		}
 	}
 
