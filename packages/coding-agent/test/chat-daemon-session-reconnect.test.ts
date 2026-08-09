@@ -1242,7 +1242,14 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 			// of what live delivery carried rather than against a partially drained queue.
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none"]);
 
+			provider.failPosts = 1;
 			provider.releasePosts();
+			await awaitRefusals(provider, 1);
+			await Bun.sleep(50);
+			host.stallReplay = false;
+			reconcile();
+			host.accept(await awaitSocket(3));
+			await awaitReplayRequests(host, 3);
 			await awaitPosts(provider, 3);
 			await Bun.sleep(20);
 
@@ -1271,7 +1278,9 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 			expect(host.replayRequests).toEqual([
 				{ sinceGeneration: GENERATION, sinceSeq: 0 },
 				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 2 },
 			]);
+			expect(warnings.filter(line => line.includes("publication failed at seq 2"))).toHaveLength(1);
 		});
 	});
 }, 20_000);

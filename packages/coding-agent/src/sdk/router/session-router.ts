@@ -167,6 +167,10 @@ export class SessionRouter {
 	readonly #pending = new Set<Promise<void>>();
 	readonly #frameTails = new Map<string, Promise<void>>();
 	readonly #undelivered = new Map<string, { generation: number; seq: number; attempts: number }>();
+	readonly #recoveredFrames = new Map<
+		string,
+		{ generation: number; frames: Array<{ seq: number; frame: Record<string, unknown> }> }
+	>();
 	readonly #reviving = new Set<string>();
 	#stopTimer: (() => void) | undefined;
 	#reconcileTail: Promise<void> = Promise.resolve();
@@ -372,11 +376,15 @@ export class SessionRouter {
 			indexed.warnings.length === 0
 				? indexed.sessions.filter(session => session.live && !session.terminalUncertain)
 				: [];
-		const ids = new Set<string>();
-		for (const session of live) if (await this.#attach(session)) ids.add(session.sessionId);
+		const liveIds = new Set(live.map(session => session.sessionId));
+		const attachedIds = new Set<string>();
+		for (const session of live) if (await this.#attach(session)) attachedIds.add(session.sessionId);
 		for (const [sessionId, attached] of this.#sessions) {
-			if (ids.has(sessionId)) continue;
-			this.#undelivered.delete(sessionId);
+			if (attachedIds.has(sessionId)) continue;
+			if (!liveIds.has(sessionId)) {
+				this.#undelivered.delete(sessionId);
+				this.#recoveredFrames.delete(sessionId);
+			}
 			this.#sessions.delete(sessionId);
 			attached.dispose();
 			await attached.client.close();
@@ -420,7 +428,10 @@ export class SessionRouter {
 			this.#sessions.delete(indexed.sessionId);
 			existing.dispose();
 			await existing.client.close();
-			if (!resumable) this.#undelivered.delete(indexed.sessionId);
+			if (!resumable) {
+				this.#undelivered.delete(indexed.sessionId);
+				this.#recoveredFrames.delete(indexed.sessionId);
+			}
 		}
 		const client = await (this.#deps.createClient ?? connectAttachedSession)(endpoint);
 		let attached: AttachedSession | undefined;
@@ -460,7 +471,8 @@ export class SessionRouter {
 		};
 		this.#sessions.set(indexed.sessionId, attached);
 		await this.#deps.onAttachment?.(capability);
-		await this.#replayAttachment(attached, resumeSeq);
+		if (!(await this.#deliverRecoveredFrames(attached))) return false;
+		await this.#replayAttachment(attached, attached.cursor.seq);
 		return true;
 	}
 
@@ -493,6 +505,7 @@ export class SessionRouter {
 		const reason = error instanceof Error ? error.message : String(error);
 		if (attempts >= DELIVERY_ATTEMPT_LIMIT) {
 			this.#undelivered.delete(attached.sessionId);
+			this.#removeRecoveredFrame(attached.sessionId, attached.generation, seq);
 			attached.cursor.seq = seq;
 			logger.warn(
 				`chat daemon conceded seq ${seq} of session ${attached.sessionId} at generation ${attached.generation} after ${attempts} refused publications (${reason}); delivery resumes above it.`,
@@ -501,6 +514,41 @@ export class SessionRouter {
 		}
 		this.#undelivered.set(attached.sessionId, { generation: attached.generation, seq, attempts });
 		this.#failBarrier(attached, `publication failed at seq ${seq} (${reason})`);
+	}
+
+	#rememberRecoveredFrame(attached: AttachedSession, seq: number, frame: Record<string, unknown>): void {
+		let pending = this.#recoveredFrames.get(attached.sessionId);
+		if (!pending || pending.generation !== attached.generation) {
+			pending = { generation: attached.generation, frames: [] };
+			this.#recoveredFrames.set(attached.sessionId, pending);
+		}
+		const existing = pending.frames.find(item => item.seq === seq);
+		if (existing) existing.frame = frame;
+		else {
+			pending.frames.push({ seq, frame });
+			pending.frames.sort((left, right) => left.seq - right.seq);
+		}
+	}
+
+	#removeRecoveredFrame(sessionId: string, generation: number, seq: number): void {
+		const pending = this.#recoveredFrames.get(sessionId);
+		if (!pending || pending.generation !== generation) return;
+		pending.frames = pending.frames.filter(item => item.seq !== seq);
+		if (pending.frames.length === 0) this.#recoveredFrames.delete(sessionId);
+	}
+
+	async #deliverRecoveredFrames(attached: AttachedSession): Promise<boolean> {
+		const pending = this.#recoveredFrames.get(attached.sessionId);
+		if (!pending || pending.generation !== attached.generation) return true;
+		for (const item of [...pending.frames]) {
+			if (item.seq <= attached.cursor.seq) {
+				this.#removeRecoveredFrame(attached.sessionId, attached.generation, item.seq);
+				continue;
+			}
+			await this.#enqueueFrame(attached, item.frame, "ordered");
+			if (attached.barrier.detached || attached.barrier.failed) return false;
+		}
+		return true;
 	}
 
 	#schedule(task: Promise<void>): void {
@@ -549,6 +597,7 @@ export class SessionRouter {
 				}
 				if (seq !== undefined && ownsSequence) {
 					this.#undelivered.delete(attached.sessionId);
+					this.#removeRecoveredFrame(attached.sessionId, attached.generation, seq);
 					if (seq > attached.cursor.seq) attached.cursor.seq = seq;
 				}
 			});
@@ -643,7 +692,8 @@ export class SessionRouter {
 				logger.warn(
 					`chat daemon replay conceded a retention gap (sequences ${gap.fromSeq}-${gap.toSeq} are gone from the host${recoveredNote}); session ${attached.sessionId} generation ${attached.generation} resumes at seq ${gap.toSeq + 1}.`,
 				);
-				for (const entry of recovered) await this.#enqueueFrame(attached, entry.frame, "ordered");
+				for (const entry of recovered) this.#rememberRecoveredFrame(attached, entry.seq, entry.frame);
+				if (!(await this.#deliverRecoveredFrames(attached))) return;
 				if (gap.toSeq > attached.cursor.seq) attached.cursor.seq = gap.toSeq;
 			}
 			for (const event of events) await this.#enqueueFrame(attached, event, "ordered");
