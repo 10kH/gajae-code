@@ -226,7 +226,7 @@ function correlateFrame(frame: Record<string, unknown>): CorrelatedFrame | undef
 
 /**
  * Worker-owned session discovery and event fanout. It connects only through the
- * public SDK transport and retains endpoint tokens solely in live client objects.
+ * public SDK transport and retains SDK credentials solely in live client objects.
  */
 export class ChatDaemonRuntime {
 	readonly #router: SessionRouter;
@@ -270,14 +270,13 @@ export class ChatDaemonRuntime {
 			);
 			this.#discord = new DiscordNotificationDaemon({
 				agentDir: this.input.agentDir,
-				repo: "",
 				guildId: config.guildId,
 				parentChannelId: config.parentChannelId,
 				provider,
-				resolveEndpoint: async (sessionId, expectedGeneration) =>
+				resolveAttachment: (sessionId, expectedGeneration) =>
 					this.#router.attachment(sessionId, expectedGeneration),
-				onCommand: async (sessionId, content, endpoint, idempotencyKey) =>
-					await this.#runChatCommand("discord", sessionId, content, endpoint.generation, idempotencyKey),
+				onCommand: async (sessionId, content, attachment, idempotencyKey) =>
+					await this.#runChatCommand("discord", sessionId, content, attachment.generation, idempotencyKey),
 			});
 		} else {
 			const config = this.input.config.notifications.slack;
@@ -303,8 +302,8 @@ export class ChatDaemonRuntime {
 				authorizeActor: async actorId => config.authorizedUserId === actorId,
 				resolveAttachment: async sessionId => this.#router.attachment(sessionId),
 				resolveBindingAuthority: async sessionId => await this.#router.bindingAuthority(sessionId),
-				onCommand: async (sessionId, content, endpoint, idempotencyKey) =>
-					await this.#runChatCommand("slack", sessionId, content, endpoint.generation, idempotencyKey),
+				onCommand: async (sessionId, content, attachment, idempotencyKey) =>
+					await this.#runChatCommand("slack", sessionId, content, attachment.generation, idempotencyKey),
 			});
 		}
 		try {
