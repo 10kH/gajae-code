@@ -292,7 +292,9 @@ export const OPERATIONS: readonly Operation[] = [
 							acp: "machine_only",
 							daemonCli: "machine_only",
 						})
-					: dispositions(),
+					: ["G03", "G04", "G05", "G06", "G07"].includes(id)
+						? dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" })
+						: dispositions(),
 			testIds: ["packages/coding-agent/test/sdk-operation-inventory.test.ts"],
 		};
 	}),

@@ -134,6 +134,11 @@ describe("SDK operation matrix", () => {
 		for (const transport of ["discord", "slack"] as const) {
 			for (const request of [
 				{ kind: "global" as const, operation: "session.get_endpoint" },
+				{ kind: "global" as const, operation: "session.create" },
+				{ kind: "global" as const, operation: "session.fork" },
+				{ kind: "global" as const, operation: "session.resume" },
+				{ kind: "global" as const, operation: "session.close" },
+				{ kind: "global" as const, operation: "session.delete" },
 				{ kind: "control" as const, operation: "bash.execute" },
 				{ kind: "control" as const, operation: "bash.abort" },
 				{ kind: "control" as const, operation: "bash.background" },
