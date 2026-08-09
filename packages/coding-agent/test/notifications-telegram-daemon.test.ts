@@ -96,6 +96,7 @@ describe("Telegram provider supervisor ownership", () => {
 			loadPresentationState(): Promise<void>;
 			publicationShouldSuppress(publicationId: string): boolean;
 			publicationSettlement(publicationId: string): { promise: Promise<void> };
+			settlePublication(publicationId: string): void;
 		};
 		const makeHarness = (): PublicationReceiptHarness =>
 			new TelegramNotificationDaemon({
@@ -113,8 +114,14 @@ describe("Telegram provider supervisor ownership", () => {
 			await restartedWithClaim.loadPresentationState();
 			expect(restartedWithClaim.publicationShouldSuppress("session:60:1")).toBe(false);
 
-			const attemptedSettlement = first.publicationSettlement("session:60:1").promise;
+			let attemptedSettlementResolved = false;
+			const attemptedSettlement = first.publicationSettlement("session:60:1").promise.then(() => {
+				attemptedSettlementResolved = true;
+			});
 			await first.markPublicationAttempted("session:60:1");
+			await Bun.sleep(0);
+			expect(attemptedSettlementResolved).toBe(false);
+			first.settlePublication("session:60:1");
 			await attemptedSettlement;
 			const restartedAmbiguous = makeHarness();
 			await restartedAmbiguous.loadPresentationState();
@@ -138,6 +145,15 @@ describe("Telegram provider supervisor ownership", () => {
 			const restartedLegacy = makeHarness();
 			await restartedLegacy.loadPresentationState();
 			expect(restartedLegacy.publicationShouldSuppress("legacy:60:1")).toBe(false);
+
+			fs.writeFileSync(
+				path.join(daemonPaths(agentDir).dir, "telegram-presentation-state.json"),
+				`${JSON.stringify({ version: 3, delivered: { "legacy-v3:delivered": Date.now() }, claimed: {}, ambiguous: { "legacy-v3:ambiguous": Date.now() } })}\n`,
+			);
+			const restartedV3 = makeHarness();
+			await restartedV3.loadPresentationState();
+			expect(restartedV3.publicationShouldSuppress("legacy-v3:delivered")).toBe(true);
+			expect(restartedV3.publicationShouldSuppress("legacy-v3:ambiguous")).toBe(true);
 
 			const oversizedClaims = Object.fromEntries(
 				Array.from({ length: 4_097 }, (_, index) => [`oversized:67:${index}`, Date.now() + index]),

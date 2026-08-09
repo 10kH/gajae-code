@@ -4377,8 +4377,13 @@ export class TelegramNotificationDaemon {
 			this.deferredPublications.delete(publicationId);
 			return;
 		}
-		if (outcome.status === "unknown" || outcome.reason === "telegram_rejected") {
+		if (outcome.status === "unknown") {
 			await this.markPublicationAttempted(publicationId);
+			return;
+		}
+		if (outcome.reason === "telegram_rejected") {
+			await this.markPublicationRejected(publicationId);
+			this.deferredPublications.delete(publicationId);
 			return;
 		}
 		await this.markPublicationRejected(publicationId);
@@ -4941,8 +4946,18 @@ export class TelegramNotificationDaemon {
 		await this.claimPublication(frame.publicationId);
 		const replayPending = session.replayPending;
 		await this.effects.admit(() => this.handleSessionMessage(session, frame.body, frame.publicationId));
-		if (!replayPending && !this.deferredPublications.has(frame.publicationId ?? ""))
+		if (
+			!replayPending &&
+			!this.deferredPublications.has(frame.publicationId ?? "") &&
+			!this.publicationShouldSuppress(frame.publicationId)
+		)
 			await this.markPublicationDelivered(frame.publicationId);
+		if (
+			frame.publicationId &&
+			this.ambiguousPublications.has(frame.publicationId) &&
+			!this.publicationHasPendingWork(frame.publicationId)
+		)
+			this.settlePublication(frame.publicationId);
 		if (frame.publicationId && this.claimedPublications.has(frame.publicationId))
 			await this.publicationSettlement(frame.publicationId).promise;
 	}
@@ -5281,7 +5296,7 @@ export class TelegramNotificationDaemon {
 		if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
 		const state = raw as Partial<TelegramPresentationState>;
 		if (
-			state.version !== TELEGRAM_PRESENTATION_STATE_VERSION ||
+			(state.version !== 3 && state.version !== TELEGRAM_PRESENTATION_STATE_VERSION) ||
 			!state.delivered ||
 			typeof state.delivered !== "object"
 		)
@@ -5380,6 +5395,13 @@ export class TelegramNotificationDaemon {
 		this.publicationSettlements.set(publicationId, Promise.withResolvers<void>());
 	}
 
+	private publicationHasPendingWork(publicationId: string): boolean {
+		if (this.pool.someQueued(item => item.payload.publicationId === publicationId)) return true;
+		for (const frames of this.pendingThreadedFrames.values())
+			if (frames.some(frame => frame.publicationId === publicationId)) return true;
+		return false;
+	}
+
 	private async claimPublication(publicationId: string | undefined): Promise<void> {
 		if (publicationId && !this.publicationDelivered(publicationId) && !this.ambiguousPublications.has(publicationId))
 			this.publicationSettlement(publicationId);
@@ -5416,7 +5438,6 @@ export class TelegramNotificationDaemon {
 			this.publicationsClaimedThisRun.add(publicationId);
 			throw new Error("Telegram publication attempt persistence failed.", { cause: error });
 		}
-		this.settlePublication(publicationId);
 	}
 
 	private async restorePublicationQueued(publicationId: string | undefined): Promise<void> {
@@ -5472,7 +5493,7 @@ export class TelegramNotificationDaemon {
 	}
 
 	private async failPublicationPreSend(publicationId: string | undefined, reason: string): Promise<never> {
-		this.resetPublicationSettlement(publicationId);
+		await this.markPublicationRejected(publicationId);
 		throw new Error(`Telegram publication rejected before send: ${reason}`);
 	}
 
@@ -5480,8 +5501,10 @@ export class TelegramNotificationDaemon {
 		if (!publicationId || this.publicationDelivered(publicationId)) return;
 		const claimedAt = this.claimedPublications.get(publicationId);
 		const ambiguousAt = this.ambiguousPublications.get(publicationId);
+		const rejectedAt = this.rejectedPublications.get(publicationId);
 		this.claimedPublications.delete(publicationId);
 		this.ambiguousPublications.delete(publicationId);
+		this.rejectedPublications.delete(publicationId);
 		this.publicationsClaimedThisRun.delete(publicationId);
 		this.deliveredPublications.set(publicationId, this.runtime.now());
 		this.prunePublicationReceipts();
@@ -5491,6 +5514,7 @@ export class TelegramNotificationDaemon {
 			this.deliveredPublications.delete(publicationId);
 			if (claimedAt !== undefined) this.claimedPublications.set(publicationId, claimedAt);
 			if (ambiguousAt !== undefined) this.ambiguousPublications.set(publicationId, ambiguousAt);
+			if (rejectedAt !== undefined) this.rejectedPublications.set(publicationId, rejectedAt);
 			logger.warn(
 				`notifications: Telegram presentation state persistence failed: ${sanitizeDiagnostic(String(error))}`,
 			);
@@ -5792,7 +5816,8 @@ export class TelegramNotificationDaemon {
 		}
 		if (isCurrentSession)
 			for (const publicationId of this.publicationSettlements.keys())
-				if (publicationId.startsWith(`${session.sessionId}:`)) this.settlePublication(publicationId);
+				if (publicationId.startsWith(`${session.sessionId}:`))
+					this.markPublicationRejected(publicationId).catch(() => undefined);
 		if (isCurrentSession) this.cancelLegacyToolStartsForSession(session);
 		if (isCurrentSession) this.scheduleVisibleToolTerminalization(session.attachmentKey).catch(() => undefined);
 		const clearIntervalImpl = this.opts.clearIntervalImpl ?? clearInterval;
@@ -8358,6 +8383,10 @@ export class TelegramNotificationDaemon {
 						await this.markPublicationDelivered(item.payload.publicationId);
 						this.deferredPublications.delete(item.payload.publicationId);
 					}
+					if (!delivered && item.payload.publicationId) {
+						await this.markPublicationRejected(item.payload.publicationId);
+						this.deferredPublications.delete(item.payload.publicationId);
+					}
 				} catch {
 					this.finishSelectedAck(selectedAck, { status: "unknown", reason: "transport_ambiguous" });
 					this.pool.settle(item.itemId!, "ambiguous");
@@ -8695,8 +8724,11 @@ export class TelegramNotificationDaemon {
 						} else if (toolActivity?.phase === "terminal" && item.payload.legacyToolStart !== undefined) {
 							retryItemId = `legacy-tool-terminal:${this.nextLegacyToolStartId++}`;
 						}
+						if (item.payload.publicationId && retryItemId === undefined)
+							retryItemId = `publication:${item.payload.publicationId}:${this.nextPublicationQueueItemId++}`;
 						const newerCoalescedItem =
 							toolActivity === undefined &&
+							item.payload.publicationId === undefined &&
 							item.coalesceKey !== undefined &&
 							this.pool.someQueued(
 								queued =>
@@ -8744,10 +8776,20 @@ export class TelegramNotificationDaemon {
 		}
 		for (const publicationId of publicationIds) {
 			if (this.pool.someQueued(item => item.payload.publicationId === publicationId)) continue;
-			if (failedPublications.has(publicationId)) continue;
-			if (publicationDispositions.get(publicationId) !== "accepted") continue;
-			await this.markPublicationDelivered(publicationId);
-			this.deferredPublications.delete(publicationId);
+			if (failedPublications.has(publicationId)) {
+				this.settlePublication(publicationId);
+				continue;
+			}
+			const disposition = publicationDispositions.get(publicationId);
+			if (disposition === "accepted") {
+				await this.markPublicationDelivered(publicationId);
+				this.deferredPublications.delete(publicationId);
+			} else if (disposition === "rejected" || disposition === "removed" || disposition === "expired") {
+				await this.markPublicationRejected(publicationId);
+				this.deferredPublications.delete(publicationId);
+			} else if (disposition === "ambiguous") {
+				this.settlePublication(publicationId);
+			}
 		}
 	}
 
@@ -9307,7 +9349,10 @@ export class TelegramNotificationDaemon {
 					this.dropSession(session, "replay_admission_failed");
 					return;
 				}
-				if (!this.deferredPublications.has(replayPublicationId ?? ""))
+				if (
+					!this.deferredPublications.has(replayPublicationId ?? "") &&
+					!this.publicationShouldSuppress(replayPublicationId)
+				)
 					await this.markPublicationDelivered(replayPublicationId);
 			}
 			const queued = session.replayQueue.splice(0);
@@ -9327,7 +9372,10 @@ export class TelegramNotificationDaemon {
 					continue;
 				}
 				await this.handleSessionMessage(session, frame, queuedItem.publicationId);
-				if (!this.deferredPublications.has(queuedItem.publicationId ?? ""))
+				if (
+					!this.deferredPublications.has(queuedItem.publicationId ?? "") &&
+					!this.publicationShouldSuppress(queuedItem.publicationId)
+				)
 					await this.markPublicationDelivered(queuedItem.publicationId);
 			}
 			await this.#onRouterAttachmentReady(session);

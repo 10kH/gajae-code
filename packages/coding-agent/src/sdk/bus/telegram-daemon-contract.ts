@@ -133,8 +133,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 77 bounds terminal rejection receipts alongside delivered receipts.
  * Generation 78 retries stale direct authority before dispatch and terminalizes
  * intentionally superseded queued live publications.
+ * Generation 79 preserves rejected state through outer/replay confirmation and
+ * settles publication-level continuation and retry barriers.
  */
-export const DAEMON_GENERATION = 78;
+export const DAEMON_GENERATION = 79;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -158,5 +160,6 @@ export const DAEMON_GENERATION = 78;
  * Epoch 23 requires explicit rejected state and terminal direct settlement.
  * Epoch 24 requires bounded terminal rejection retention.
  * Epoch 25 requires stale-dispatch retry and superseded publication settlement.
+ * Epoch 26 requires terminal-state exclusivity and complete publication barriers.
  */
-export const SERVING_EPOCH = 25;
+export const SERVING_EPOCH = 26;

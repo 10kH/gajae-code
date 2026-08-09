@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes stale-dispatch generation 78 at serving epoch 25", () => {
+test("publishes terminal-order generation 79 at serving epoch 26", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 78 / serving epoch 25: stale and superseded work reaches durable settlement.
-	expect(DAEMON_GENERATION).toBe(78);
-	expect(SERVING_EPOCH).toBe(25);
+	// Generation 79 / serving epoch 26: terminal state remains exclusive across full publication barriers.
+	expect(DAEMON_GENERATION).toBe(79);
+	expect(SERVING_EPOCH).toBe(26);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
