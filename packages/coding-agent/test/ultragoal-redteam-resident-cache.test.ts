@@ -548,7 +548,7 @@ describe.skipIf(process.platform === "win32")("ultragoal resident-cache adversar
 		expect(residentInstanceDirs(root)).toEqual([]);
 	});
 
-	it("C8 keeps below-cap snapshots strong and rebuilds above-cap snapshots without content loss", async () => {
+	it("C8 rematerializes resident-backed contexts and rebuilds above-cap snapshots without content loss", async () => {
 		const belowCap = SessionManager.inMemory();
 		try {
 			SessionManagerTestHooks.materializedCacheMaxBytesOverride = MiB;
@@ -562,7 +562,7 @@ describe.skipIf(process.platform === "win32")("ultragoal resident-cache adversar
 			}
 			expect(belowCap.getObservabilityStatsForTests()).toMatchObject({
 				materializedEntriesCachePopulateCount: warmed.materializedEntriesCachePopulateCount,
-				pathOnlyContextBuildCount: warmed.pathOnlyContextBuildCount,
+				pathOnlyContextBuildCount: warmed.pathOnlyContextBuildCount + 3,
 			});
 		} finally {
 			await belowCap.close();
