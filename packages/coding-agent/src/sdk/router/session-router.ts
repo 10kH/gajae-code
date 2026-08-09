@@ -232,6 +232,11 @@ export class SessionRouter {
 			} catch (error) {
 				closeErrors.push(error);
 			}
+			try {
+				await this.#deps.onSessionRemoved?.(attached.capability);
+			} catch (error) {
+				closeErrors.push(error);
+			}
 		}
 		if (closeErrors.length > 0) throw new AggregateError(closeErrors, "SessionRouter client shutdown failed.");
 	}
