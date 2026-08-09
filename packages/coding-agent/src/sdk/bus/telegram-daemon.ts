@@ -5539,12 +5539,16 @@ export class TelegramNotificationDaemon {
 		body: unknown,
 		callOpts?: { signal?: AbortSignal; noRetry?: boolean },
 	): Promise<BotApiCallResult> {
+		const signal = callOpts?.signal
+			? AbortSignal.any([this.#deliveryAbort.signal, callOpts.signal])
+			: this.#deliveryAbort.signal;
 		const cooldownRemaining = (): number =>
 			method === "getUpdates" ? 0 : Math.max(0, this.botCooldownUntil - (this.opts.now?.() ?? Date.now()));
 		for (;;) {
 			let remaining = cooldownRemaining();
 			while (remaining > 0) {
-				if (callOpts?.signal?.aborted) throw callOpts.signal.reason;
+				if (signal.aborted)
+					return await this.failPublicationPreSend(publicationId, "provider delivery aborted during cooldown");
 				if (this.effects.stopping)
 					return await this.failPublicationPreSend(publicationId, "provider effects are stopping during cooldown");
 				await this.runtime.sleep(Math.min(remaining, 1_000));
@@ -5552,6 +5556,8 @@ export class TelegramNotificationDaemon {
 			}
 			if (this.publicationTerminal(publicationId))
 				throw new Error("Telegram publication became terminal before provider dispatch.");
+			if (signal.aborted)
+				return await this.failPublicationPreSend(publicationId, "provider delivery aborted before dispatch");
 			await this.beginPublicationAttempt(publicationId);
 			if (cooldownRemaining() > 0) {
 				await this.restorePublicationQueued(publicationId);
@@ -5559,7 +5565,14 @@ export class TelegramNotificationDaemon {
 			}
 			if (this.publicationTerminal(publicationId))
 				throw new Error("Telegram publication became terminal during provider dispatch admission.");
-			const result = await this.callBotApiClassified(method, body, { ...callOpts, noRetry: true });
+			if (signal.aborted) {
+				await this.restorePublicationQueued(publicationId);
+				return await this.failPublicationPreSend(
+					publicationId,
+					"provider delivery aborted during dispatch admission",
+				);
+			}
+			const result = await this.callBotApiClassified(method, body, { ...callOpts, signal, noRetry: true });
 			if (publicationId) this.publicationLastOutcomes.set(publicationId, result.outcome.kind);
 			return result;
 		}
