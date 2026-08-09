@@ -13432,6 +13432,7 @@ export class SessionManager {
 	 */
 	async ensureOnDisk(): Promise<void> {
 		if (!this.persist || !this.#sessionFile) return;
+		if (this.#readOnlyResume) return;
 		if (this.#flushed && !this.#needsFullRewriteOnNextPersist) return;
 		await this.#rewriteFile();
 		this.#ensuredOnDisk = true;
@@ -14401,8 +14402,12 @@ export class SessionManager {
 					this.#needsFullRewriteOnNextPersist ||
 					!this.#flushed ||
 					(header?.version ?? 1) < CURRENT_SESSION_VERSION
-				)
-					return this.#rewriteFileContents();
+				) {
+					await this.#rewriteFileContents();
+					if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, sessionFile);
+					this.#readOnlyResume = false;
+					return;
+				}
 				const persistedRecords = records.map(record =>
 					record.type === "entry_patch"
 						? (prepareEntryForPersistenceSync(
@@ -14426,7 +14431,12 @@ export class SessionManager {
 					}
 					const writer = this.#ensurePersistWriter();
 					if (!writer) {
-						this.#rewriteFile().catch(() => {});
+						void this.#rewriteFile()
+							.then(() => {
+								if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, sessionFile);
+								this.#readOnlyResume = false;
+							})
+							.catch(() => {});
 						return true;
 					}
 					for (const persistedRecord of persistedRecords) writer.writeSync(persistedRecord);
