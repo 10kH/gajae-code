@@ -215,13 +215,6 @@
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/notifications-sdk-lifecycle-service.test.ts"
-			]
-		},
-		{
-			"argv": [
-				"bun",
-				"test",
 				"packages/coding-agent/test/notifications-service.test.ts"
 			]
 		},
@@ -314,6 +307,13 @@
 				"bun",
 				"test",
 				"packages/coding-agent/test/notifications-turn-ordering.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-lifecycle-telegram-integration.test.ts"
 			]
 		},
 		{
