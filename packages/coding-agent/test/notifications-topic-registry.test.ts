@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes prebatch-isolation generation 102 at serving epoch 49", () => {
+test("publishes Router-timer-fence generation 104 at serving epoch 51", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 102 / serving epoch 49: removed inventories isolate terminal persistence failures.
-	expect(DAEMON_GENERATION).toBe(102);
-	expect(SERVING_EPOCH).toBe(49);
+	// Generation 104 / serving epoch 51: stopped Router startup cannot install a reconcile timer.
+	expect(DAEMON_GENERATION).toBe(104);
+	expect(SERVING_EPOCH).toBe(51);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();

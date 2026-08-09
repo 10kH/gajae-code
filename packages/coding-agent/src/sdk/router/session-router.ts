@@ -199,6 +199,7 @@ export class SessionRouter {
 		this.#started = true;
 		try {
 			await this.#serialReconcile();
+			if (!this.#started) return;
 			const timer = (this.#deps.setInterval ?? setInterval)(() => this.#schedule(this.#serialReconcile()), 2_000);
 			this.#stopTimer = () => (this.#deps.clearInterval ?? clearInterval)(timer);
 		} catch (error) {
@@ -217,6 +218,7 @@ export class SessionRouter {
 		this.#stopTimer = undefined;
 		this.#started = false;
 		this.#ready = false;
+		await this.#reconcileTail.catch(() => undefined);
 		await Promise.allSettled([...this.#pending]);
 		for (const [sessionId, attached] of this.#sessions) {
 			this.#sessions.delete(sessionId);
@@ -359,6 +361,7 @@ export class SessionRouter {
 			.then(async () => {
 				try {
 					await this.#reconcile();
+					if (!this.#started) return;
 					this.#ready = true;
 					this.#deps.onReconciled?.();
 				} catch (error) {
@@ -371,8 +374,11 @@ export class SessionRouter {
 	}
 
 	async #reconcile(): Promise<void> {
+		if (!this.#started) return;
 		await this.#index.open();
+		if (!this.#started) return;
 		await this.#index.refresh();
+		if (!this.#started) return;
 		const indexed = this.#index.listSessions();
 		const live =
 			indexed.warnings.length === 0
@@ -381,6 +387,7 @@ export class SessionRouter {
 		const liveIds = new Set(live.map(session => session.sessionId));
 		const attachedIds = new Set<string>();
 		for (const session of live) {
+			if (!this.#started) break;
 			try {
 				if (await this.#attach(session)) attachedIds.add(session.sessionId);
 			} catch {
@@ -400,6 +407,7 @@ export class SessionRouter {
 				);
 			}
 		}
+		if (!this.#started) return;
 		for (const [sessionId, attached] of this.#sessions) {
 			if (attachedIds.has(sessionId)) continue;
 			if (!liveIds.has(sessionId)) {
@@ -432,7 +440,9 @@ export class SessionRouter {
 	}
 
 	async #attach(indexed: IndexedSession): Promise<boolean> {
+		if (!this.#started) return false;
 		const endpoint = await this.#readEndpoint(indexed);
+		if (!this.#started) return false;
 		if (!endpoint) return false;
 		const existing = this.#sessions.get(indexed.sessionId);
 		const resumable =
@@ -455,6 +465,10 @@ export class SessionRouter {
 			}
 		}
 		const client = await (this.#deps.createClient ?? connectAttachedSession)(endpoint);
+		if (!this.#started) {
+			await client.close().catch(() => undefined);
+			return false;
+		}
 		let attached: AttachedSession | undefined;
 		const barrier: ReplayBarrier = { held: undefined, detached: false, failed: false };
 		const capability: SessionAttachment = Object.freeze({
@@ -492,6 +506,12 @@ export class SessionRouter {
 		};
 		this.#sessions.set(indexed.sessionId, attached);
 		await this.#deps.onAttachment?.(capability);
+		if (!this.#started) {
+			this.#sessions.delete(indexed.sessionId);
+			attached.dispose();
+			await attached.client.close().catch(() => undefined);
+			return false;
+		}
 		if (!(await this.#deliverRecoveredFrames(attached))) return false;
 		await this.#replayAttachment(attached, attached.cursor.seq);
 		return true;

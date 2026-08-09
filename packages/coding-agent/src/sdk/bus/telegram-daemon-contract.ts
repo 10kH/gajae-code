@@ -164,8 +164,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 100 centralizes terminal receipt failure propagation in state transitions.
  * Generation 101 isolates batch terminal failures and replays rejected rollback.
  * Generation 102 isolates expired and superseded pre-batch receipt failures.
+ * Generation 103 fences and joins Router reconciliation during stop.
+ * Generation 104 prevents Router timer installation after concurrent stop.
  */
-export const DAEMON_GENERATION = 102;
+export const DAEMON_GENERATION = 104;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -213,5 +215,7 @@ export const DAEMON_GENERATION = 102;
  * Epoch 47 covers every delivered/rejected persistence rollback path.
  * Epoch 48 preserves unrelated batch settlement and rejected replayability.
  * Epoch 49 preserves every removed inventory settlement after individual failure.
+ * Epoch 50 prevents attachment resurrection after provider shutdown.
+ * Epoch 51 fully fences Router startup and reconciliation after stop.
  */
-export const SERVING_EPOCH = 49;
+export const SERVING_EPOCH = 51;
