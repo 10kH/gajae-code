@@ -8306,6 +8306,7 @@ export class TelegramNotificationDaemon {
 		);
 		const publicationDispositions = new Map<string, RateLimitDisposition>();
 		const failedPublications = new Set<string>();
+		let terminalizationError: unknown;
 		for (const expiredItem of expired) {
 			if (expiredItem.payload.selectedAck) {
 				this.finishSelectedAck(expiredItem.payload.selectedAck, { status: "failed", reason: "expired" });
@@ -8313,8 +8314,12 @@ export class TelegramNotificationDaemon {
 			expiredItem.payload.btwDelivery?.finish("not_delivered");
 			this.failLegacyToolStart(expiredItem.payload.toolActivity);
 			if (expiredItem.payload.publicationId) {
-				await this.markPublicationRejected(expiredItem.payload.publicationId);
-				this.deferredPublications.delete(expiredItem.payload.publicationId);
+				try {
+					await this.markPublicationRejected(expiredItem.payload.publicationId);
+					this.deferredPublications.delete(expiredItem.payload.publicationId);
+				} catch (error) {
+					terminalizationError ??= error;
+				}
 			}
 		}
 		// Within a batch a finalized frame supersedes any still-queued live frame for
@@ -8339,8 +8344,12 @@ export class TelegramNotificationDaemon {
 			);
 			for (const removed of removedLiveItems)
 				if (removed.payload.publicationId) {
-					await this.markPublicationRejected(removed.payload.publicationId);
-					this.deferredPublications.delete(removed.payload.publicationId);
+					try {
+						await this.markPublicationRejected(removed.payload.publicationId);
+						this.deferredPublications.delete(removed.payload.publicationId);
+					} catch (error) {
+						terminalizationError ??= error;
+					}
 				}
 		}
 		for (const item of batch) {
@@ -8883,7 +8892,6 @@ export class TelegramNotificationDaemon {
 				}
 			}
 		}
-		let terminalizationError: unknown;
 		for (const publicationId of publicationIds) {
 			if (this.pool.someQueued(item => item.payload.publicationId === publicationId)) continue;
 			if (failedPublications.has(publicationId)) {
