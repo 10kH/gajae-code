@@ -1295,8 +1295,9 @@ export class AuthStorage {
 	 * Used for CLI --api-key flag.
 	 */
 	setRuntimeApiKey(provider: string, apiKey: string): void {
-		this.#runtimeOverrides.set(provider, apiKey);
-		this.#bumpGeneration("set-runtime-api-key", provider);
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		this.#runtimeOverrides.set(storageProvider, apiKey);
+		this.#bumpGeneration("set-runtime-api-key", storageProvider);
 	}
 
 	/**
@@ -1324,12 +1325,19 @@ export class AuthStorage {
 	 * Remove a runtime API key override.
 	 */
 	removeRuntimeApiKey(provider: string): void {
-		if (this.#runtimeOverrides.delete(provider)) this.#bumpGeneration("remove-runtime-api-key", provider);
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.#runtimeOverrides.delete(storageProvider))
+			this.#bumpGeneration("remove-runtime-api-key", storageProvider);
 	}
 
 	/** Whether a provider is currently authenticated by a runtime API-key override. */
 	hasRuntimeApiKey(provider: string): boolean {
-		return Boolean(this.#runtimeOverrides.get(provider));
+		return Boolean(this.#runtimeOverrides.get(resolveOAuthStorageProvider(provider)));
+	}
+
+	/** Whether a provider is currently authenticated by a config API-key override. */
+	hasConfigApiKey(provider: string): boolean {
+		return Boolean(this.#configOverrides.get(resolveOAuthStorageProvider(provider)));
 	}
 
 	/**
@@ -1358,9 +1366,10 @@ export class AuthStorage {
 	 * resolver rather than a stored row.
 	 */
 	getSessionCredentialRowId(provider: string, sessionId?: string): number | undefined {
-		const session = this.#getSessionCredential(provider, sessionId);
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const session = this.#getSessionCredential(storageProvider, sessionId);
 		if (!session) return undefined;
-		return this.#getStoredCredentials(provider)[session.index]?.id;
+		return this.#getStoredCredentials(storageProvider)[session.index]?.id;
 	}
 
 	/**
@@ -1374,15 +1383,17 @@ export class AuthStorage {
 	 * still wins for the duration of a single invocation.
 	 */
 	setConfigApiKey(provider: string, apiKey: string): void {
-		this.#configOverrides.set(provider, apiKey);
-		this.#bumpGeneration("set-config-api-key", provider);
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		this.#configOverrides.set(storageProvider, apiKey);
+		this.#bumpGeneration("set-config-api-key", storageProvider);
 	}
 
 	/**
 	 * Remove a single config-sourced API key override.
 	 */
 	removeConfigApiKey(provider: string): void {
-		if (this.#configOverrides.delete(provider)) this.#bumpGeneration("remove-config-api-key", provider);
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.#configOverrides.delete(storageProvider)) this.#bumpGeneration("remove-config-api-key", storageProvider);
 	}
 
 	/**
@@ -1624,7 +1635,7 @@ export class AuthStorage {
 
 	/** Returns the credential type selected for a provider/session, if one has been recorded. */
 	getSessionCredentialType(provider: string, sessionId?: string): AuthCredential["type"] | undefined {
-		return this.#getSessionCredential(provider, sessionId)?.type;
+		return this.#getSessionCredential(resolveOAuthStorageProvider(provider), sessionId)?.type;
 	}
 
 	/** Clears the last credential used by a session for a provider. */
@@ -1713,7 +1724,7 @@ export class AuthStorage {
 		provider: string,
 		type: T,
 		sessionId?: string,
-		isUsable?: (credential: Extract<AuthCredential, { type: T }>, index: number) => boolean,
+		isUsable?: (credential: Extract<AuthCredential, { type: T }>, index: number) => boolean | undefined,
 	): { credential: Extract<AuthCredential, { type: T }>; index: number } | undefined {
 		const credentials = this.#getCredentialsForProvider(provider)
 			.map((credential, index) => ({ credential, index }))
@@ -1723,23 +1734,52 @@ export class AuthStorage {
 			);
 
 		if (credentials.length === 0) return undefined;
-		if (credentials.length === 1) return credentials[0];
 
 		const providerKey = this.#getProviderTypeKey(provider, type);
 		const order = this.#getCredentialOrder(providerKey, sessionId, credentials.length);
-		const fallback = credentials[order[0]];
-
 		for (const idx of order) {
 			const candidate = credentials[idx];
 			if (
 				!this.#isCredentialBlocked(providerKey, candidate.index) &&
-				(isUsable === undefined || isUsable(candidate.credential, candidate.index))
+				(isUsable === undefined || isUsable(candidate.credential, candidate.index) !== false)
 			) {
 				return candidate;
 			}
 		}
 
-		return fallback;
+		return order
+			.map(idx => credentials[idx])
+			.find(candidate => isUsable === undefined || isUsable(candidate.credential, candidate.index) !== false);
+	}
+
+	#selectApiKeyCredential(
+		provider: string,
+		sessionId?: string,
+		excludedIndices: ReadonlySet<number> = new Set(),
+		includeKnownUnusable = false,
+	): { credential: ApiKeyCredential; index: number } | undefined {
+		const credentials = this.#getCredentialsForProvider(provider)
+			.map((credential, index) => ({ credential, index }))
+			.filter(
+				(entry): entry is { credential: ApiKeyCredential; index: number } => entry.credential.type === "api_key",
+			);
+		if (credentials.length === 0) return undefined;
+
+		const providerKey = this.#getProviderTypeKey(provider, "api_key");
+		const order = this.#getCredentialOrder(providerKey, sessionId, credentials.length);
+		const ordered = order
+			.map(index => credentials[index])
+			.filter(entry => !excludedIndices.has(entry.index))
+			.filter(
+				entry => includeKnownUnusable || this.#storedApiKeyUsability(provider, entry.credential.key) !== false,
+			);
+		const unblocked = ordered.filter(entry => !this.#isCredentialBlocked(providerKey, entry.index));
+		const candidates = unblocked.length > 0 ? unblocked : ordered;
+		return candidates.sort((left, right) => {
+			const usabilityRank = (credential: ApiKeyCredential): number =>
+				this.#storedApiKeyUsability(provider, credential.key) === true ? 0 : 1;
+			return usabilityRank(left.credential) - usabilityRank(right.credential);
+		})[0];
 	}
 
 	/**
@@ -2022,6 +2062,36 @@ export class AuthStorage {
 	}
 
 	/**
+	 * Credential type that a provider/session will dispatch first without performing I/O.
+	 * Mirrors getApiKey selector validation, overrides, session OAuth stickiness,
+	 * cached command-key usability, OAuth retry, and environment fallback order.
+	 */
+	getEffectiveCredentialType(provider: string, sessionId?: string): AuthCredential["type"] | undefined {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		let selected: ({ index: number } & StoredCredential) | undefined;
+		try {
+			selected = this.#resolveSelectedStoredCredential(storageProvider);
+		} catch {
+			return undefined;
+		}
+		if (this.hasRuntimeApiKey(storageProvider) || this.#configOverrides.has(storageProvider)) return "api_key";
+		if (selected) return selected.credential.type;
+
+		const credentials = this.#getCredentialsForProvider(storageProvider);
+		const sessionCredential = this.#getSessionCredential(storageProvider, sessionId);
+		if (sessionCredential?.type === "oauth" && credentials[sessionCredential.index]?.type === "oauth") return "oauth";
+
+		const apiKeys = credentials.filter((credential): credential is ApiKeyCredential => credential.type === "api_key");
+		if (apiKeys.some(credential => this.#storedApiKeyUsability(storageProvider, credential.key) !== false)) {
+			return "api_key";
+		}
+		if (credentials.some(credential => credential.type === "oauth")) return "oauth";
+		if (apiKeys.length > 0) return "api_key";
+		if (getEnvApiKey(storageProvider) || this.#fallbackResolver?.(storageProvider)) return "api_key";
+		return undefined;
+	}
+
+	/**
 	 * Check whether configured auth is currently usable without resolving credentials.
 	 */
 	hasUsableAuth(provider: string): boolean {
@@ -2047,16 +2117,17 @@ export class AuthStorage {
 
 			const credentials = this.#getCredentialsForProvider(storageProvider);
 			let hasStoredApiKey = false;
-			let hasSelectableApiKey = false;
+			let hasUnblockedApiKey = false;
 			let hasUsableApiKey = false;
 			for (const [index, credential] of credentials.entries()) {
 				if (credential.type !== "api_key") continue;
 				hasStoredApiKey = true;
 				if (this.#isCredentialBlocked(this.#getProviderTypeKey(storageProvider, credential.type), index)) continue;
-				hasSelectableApiKey = true;
+				hasUnblockedApiKey = true;
 				hasUsableApiKey ||= this.#hasUsableResolvedStoredApiKey(storageProvider, credential.key);
 			}
-			if (hasStoredApiKey) return hasSelectableApiKey && hasUsableApiKey;
+			if (hasUsableApiKey) return true;
+			if (hasStoredApiKey && !hasUnblockedApiKey) return false;
 			if (
 				this.#getCredentialsForProvider(storageProvider).some(
 					(credential, index) =>
@@ -2096,6 +2167,7 @@ export class AuthStorage {
 	 * Returns `undefined` when no OAuth credential carries an `accountId`.
 	 */
 	getOAuthAccountId(provider: string, sessionId?: string): string | undefined {
+		provider = resolveOAuthStorageProvider(provider);
 		const allCredentials = this.#getCredentialsForProvider(provider);
 		const oauthCredentials = allCredentials.filter((c): c is OAuthCredential => c.type === "oauth");
 		if (oauthCredentials.length === 0) return undefined;
@@ -3250,6 +3322,7 @@ export class AuthStorage {
 		sessionId: string | undefined,
 		options?: { retryAfterMs?: number; baseUrl?: string; signal?: AbortSignal },
 	): Promise<boolean> {
+		provider = resolveOAuthStorageProvider(provider);
 		const sessionCredential = this.#getSessionCredential(provider, sessionId);
 		if (!sessionCredential) return false;
 
@@ -4155,9 +4228,13 @@ export class AuthStorage {
 		})();
 		return promise;
 	}
+	#storedApiKeyUsability(provider: string, key: string): boolean | undefined {
+		if (!key.startsWith("!")) return true;
+		return this.#resolvedStoredApiKeyValues.get(resolveOAuthStorageProvider(provider))?.get(key)?.usable;
+	}
+
 	#hasUsableResolvedStoredApiKey(provider: string, key: string): boolean {
-		const resolved = this.#resolvedStoredApiKeyValues.get(resolveOAuthStorageProvider(provider))?.get(key);
-		return key.startsWith("!") ? resolved?.usable === true : true;
+		return this.#storedApiKeyUsability(provider, key) === true;
 	}
 
 	/**
@@ -4167,6 +4244,7 @@ export class AuthStorage {
 	 * routing metadata so discovery can hit the correct host.
 	 */
 	async peekApiKey(provider: string): Promise<string | undefined> {
+		provider = resolveOAuthStorageProvider(provider);
 		const runtimeKey = this.#runtimeOverrides.get(provider);
 		if (runtimeKey) return runtimeKey;
 
@@ -4193,11 +4271,13 @@ export class AuthStorage {
 			return undefined;
 		}
 
-		const apiKeySelection = this.#selectCredentialByType(provider, "api_key", undefined, credential =>
-			this.#hasUsableResolvedStoredApiKey(provider, credential.key),
-		);
-		if (apiKeySelection) {
-			return this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
+		const attemptedApiKeyIndices = new Set<number>();
+		for (;;) {
+			const apiKeySelection = this.#selectApiKeyCredential(provider, undefined, attemptedApiKeyIndices);
+			if (!apiKeySelection) break;
+			attemptedApiKeyIndices.add(apiKeySelection.index);
+			const resolved = await this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
+			if (resolved) return resolved;
 		}
 
 		const oauthSelection = this.#selectCredentialByType(provider, "oauth");
@@ -4222,19 +4302,20 @@ export class AuthStorage {
 	 * Priority:
 	 * 1. Runtime override (CLI --api-key)
 	 * 2. Config override (models.yml `providers.<name>.apiKey`)
-	 * 3. API key from storage
-	 * 4. OAuth token from storage (auto-refreshed)
-	 * 5. Environment variable
-	 * 6. Fallback resolver (models.yml custom providers, last-resort)
+	 * 3. Session-selected OAuth credential, when present
+	 * 4. Usable or unresolved API key from storage
+	 * 5. OAuth token from storage (auto-refreshed)
+	 * 6. Previously unusable command-backed API key retry
+	 * 7. Environment variable
+	 * 8. Fallback resolver (models.yml custom providers, last-resort)
 	 */
 	async getApiKey(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<string | undefined> {
+		provider = resolveOAuthStorageProvider(provider);
 		const selectedCredential = this.#resolveSelectedStoredCredential(provider, options);
 
-		// Runtime override takes highest priority
+		// Runtime override takes highest priority after selector validation.
 		const runtimeKey = this.#runtimeOverrides.get(provider);
-		if (runtimeKey) {
-			return runtimeKey;
-		}
+		if (runtimeKey) return runtimeKey;
 
 		// Config override: explicit apiKey pinned in models.yml beats the broker's
 		// OAuth credentials. The user redirected a provider at a custom baseUrl
@@ -4242,28 +4323,50 @@ export class AuthStorage {
 		// honor it instead of forwarding an upstream OAuth token that the proxy
 		// won't accept.
 		const configKey = this.#configOverrides.get(provider);
-		if (configKey) {
-			return configKey;
-		}
+		if (configKey) return configKey;
 
 		if (selectedCredential?.credential.type === "api_key") {
 			this.#recordSessionCredential(provider, sessionId, "api_key", selectedCredential.index);
 			return this.#resolveStoredApiKey(provider, selectedCredential.credential.key);
 		}
 
+		let oauthAttempted = false;
+		if (!selectedCredential && this.#getSessionCredential(provider, sessionId)?.type === "oauth") {
+			const oauthResolved = await this.#resolveOAuthSelection(provider, sessionId, options);
+			oauthAttempted = true;
+			if (oauthResolved) return oauthResolved.apiKey;
+		}
+
+		const attemptedApiKeyIndices = new Set<number>();
 		if (!selectedCredential) {
-			const apiKeySelection = this.#selectCredentialByType(provider, "api_key", sessionId, credential =>
-				this.#hasUsableResolvedStoredApiKey(provider, credential.key),
-			);
-			if (apiKeySelection) {
-				this.#recordSessionCredential(provider, sessionId, "api_key", apiKeySelection.index);
-				return this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
+			for (;;) {
+				const apiKeySelection = this.#selectApiKeyCredential(provider, sessionId, attemptedApiKeyIndices);
+				if (!apiKeySelection) break;
+				attemptedApiKeyIndices.add(apiKeySelection.index);
+				const resolved = await this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
+				if (resolved) {
+					this.#recordSessionCredential(provider, sessionId, "api_key", apiKeySelection.index);
+					return resolved;
+				}
 			}
 		}
 
-		const oauthResolved = await this.#resolveOAuthSelection(provider, sessionId, options);
-		if (oauthResolved) {
-			return oauthResolved.apiKey;
+		if (!oauthAttempted) {
+			const oauthResolved = await this.#resolveOAuthSelection(provider, sessionId, options);
+			if (oauthResolved) return oauthResolved.apiKey;
+		}
+
+		if (!selectedCredential) {
+			for (;;) {
+				const apiKeySelection = this.#selectApiKeyCredential(provider, sessionId, attemptedApiKeyIndices, true);
+				if (!apiKeySelection) break;
+				attemptedApiKeyIndices.add(apiKeySelection.index);
+				const resolved = await this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
+				if (resolved) {
+					this.#recordSessionCredential(provider, sessionId, "api_key", apiKeySelection.index);
+					return resolved;
+				}
+			}
 		}
 
 		// Fall back to environment variable or custom resolver. If we reach here after
@@ -4273,8 +4376,6 @@ export class AuthStorage {
 		if (sessionId) this.#sessionLastCredential.get(provider)?.delete(sessionId);
 		const envKey = getEnvApiKey(provider);
 		if (envKey) return envKey;
-
-		// Fall back to custom resolver (e.g., models.json custom providers)
 		return this.#fallbackResolver?.(provider) ?? undefined;
 	}
 
@@ -4298,6 +4399,7 @@ export class AuthStorage {
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
 	): Promise<OAuthAccess | undefined> {
+		provider = resolveOAuthStorageProvider(provider);
 		// Runtime / config overrides intentionally short-circuit OAuth: when the
 		// user has pinned an API key, they expect the OAuth identity to be
 		// suppressed (same contract as `getOAuthAccountId`).
@@ -4352,11 +4454,12 @@ export class AuthStorage {
 	): Promise<boolean> {
 		const signal = isAbortSignalOption(optionsOrSignal) ? optionsOrSignal : optionsOrSignal?.signal;
 		const sessionId = isAbortSignalOption(optionsOrSignal) ? undefined : optionsOrSignal?.sessionId;
-		const stored = this.#getStoredCredentials(provider);
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const stored = this.#getStoredCredentials(storageProvider);
 		let matched: { id: number; type: AuthCredential["type"]; index: number } | undefined;
 		for (let index = 0; index < stored.length; index++) {
 			const entry = stored[index];
-			if (entry && (await this.#credentialMatchesApiKey(provider, entry.credential, apiKey))) {
+			if (entry && (await this.#credentialMatchesApiKey(storageProvider, entry.credential, apiKey))) {
 				matched = { id: entry.id, type: entry.credential.type, index };
 				break;
 			}
@@ -4367,9 +4470,9 @@ export class AuthStorage {
 			return false;
 		}
 
-		this.#clearSessionCredential(provider, sessionId);
+		this.#clearSessionCredential(storageProvider, sessionId);
 		this.#markCredentialBlocked(
-			this.#getProviderTypeKey(provider, matched.type),
+			this.#getProviderTypeKey(storageProvider, matched.type),
 			matched.index,
 			Date.now() + AuthStorage.#defaultBackoffMs,
 		);
@@ -4381,9 +4484,9 @@ export class AuthStorage {
 			await this.reload();
 		}
 
-		const latestRows = this.#store.listAuthCredentials(provider);
+		const latestRows = this.#store.listAuthCredentials(storageProvider);
 		this.#setStoredCredentials(
-			provider,
+			storageProvider,
 			latestRows.map(row => ({ id: row.id, credential: row.credential })),
 		);
 		return true;
