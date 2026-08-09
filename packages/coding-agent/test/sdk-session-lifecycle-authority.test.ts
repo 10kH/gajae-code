@@ -9,6 +9,7 @@ const providerAuthorityFiles = [
 	"src/sdk/bus/discord-daemon.ts",
 	"src/sdk/bus/slack-daemon.ts",
 	"src/sdk/bus/telegram-daemon.ts",
+	"src/sdk/bus/telegram-reference.ts",
 	"src/sdk/bus/existing-thread-readiness.ts",
 	"src/sdk/bus/slack-thread-binding.ts",
 ] as const;
@@ -43,6 +44,17 @@ describe("SDK-owned session lifecycle authority", () => {
 		const telegram = await source("src/sdk/bus/telegram-daemon.ts");
 		for (const forbidden of ["connectSession(", "readEndpoint("] as const)
 			expect(telegram, `telegram-daemon.ts retains forbidden authority ${forbidden}`).not.toContain(forbidden);
+		const telegramReference = await source("src/sdk/bus/telegram-reference.ts");
+		for (const forbidden of [
+			"new WebSocket",
+			"readFileSync(",
+			"runTelegramReferenceClient",
+			"readEndpoint(",
+		] as const)
+			expect(telegramReference, `telegram-reference.ts retains forbidden authority ${forbidden}`).not.toContain(
+				forbidden,
+			);
+		expect(await Bun.file(path.join(packageRoot, "src/sdk/bus/telegram-cli.ts")).exists()).toBe(false);
 	});
 
 	test("only SDK core modules read Broker and session endpoint discovery", async () => {

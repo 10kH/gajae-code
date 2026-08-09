@@ -4713,7 +4713,7 @@ export class TelegramNotificationDaemon {
 	#sendAttachment(session: AttachmentSession, frame: Record<string, unknown>): boolean {
 		if (!this.#attachmentIsCurrent(session)) return false;
 		try {
-			session.attachment.send(frame);
+			void Promise.resolve(session.attachment.send(frame)).catch(() => undefined);
 			return true;
 		} catch {
 			return false;
@@ -4725,7 +4725,9 @@ export class TelegramNotificationDaemon {
 			get readyState(): number {
 				return attachment.isCurrent() ? 1 : 3;
 			},
-			send: (data: string): void => attachment.send(JSON.parse(data) as Record<string, unknown>),
+			send: (data: string): void => {
+				void Promise.resolve(attachment.send(JSON.parse(data) as Record<string, unknown>)).catch(() => undefined);
+			},
 			close: (): void => {},
 		};
 		const session: AttachmentSession = {

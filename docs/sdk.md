@@ -553,33 +553,29 @@ state remain private: these APIs do not create a public authority value.
 
 The `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions. The native loader requires the matching version sentinel; mixed native/runtime versions are unsupported and must not claim SDK compatibility.
 
-## Minimal client example
+## Minimal provider adapter example
+
+Provider integrations compose SDK core's `SessionRouter`; they never read endpoint files or retain URL/token credentials:
 
 ```js
-import { readFileSync } from "node:fs";
-import WebSocket from "ws";
+import { SessionRouter } from "@gajae-code/coding-agent/sdk/router";
 
-const { url, token } = JSON.parse(
-  readFileSync(`.gjc/state/sdk/${sessionId}.json`, "utf8"),
-);
-
-const ws = new WebSocket(`${url}/?token=${encodeURIComponent(token)}`);
-
-ws.on("message", (data) => {
-  const msg = JSON.parse(data.toString());
-  if (msg.type === "action_needed" && msg.kind === "ask") {
-    // present msg.question / msg.options to the human, then:
-    ws.send(JSON.stringify({ type: "reply", id: msg.id, answer: 0, token }));
-  } else if (msg.type === "action_resolved") {
-    // mark this action as no longer answerable in your UI
-  } else if (msg.type === "reply_rejected") {
-    // e.g. reason === "already_answered" → the ask was answered elsewhere
-  }
+const router = new SessionRouter({
+  agentDir,
+  deps: {
+    onAttachment: (attachment) => provider.bind(attachment.sessionId, attachment),
+    onFrame: (attachment, frame) => provider.render(attachment.sessionId, frame.body),
+    onSessionRemoved: (attachment) => provider.unbind(attachment.sessionId),
+  },
 });
+
+await router.start();
+const attachment = router.attachment(sessionId);
+if (!attachment) throw new Error("session attachment unavailable");
+await attachment.send({ type: "reply", id: actionId, answer });
 ```
 
-Swap `ws` for a Telegram bot's long-poll loop, a Discord gateway client, or a
-Slack socket-mode app — the contract above is all you implement.
+Telegram, Discord, Slack, and third-party adapters own only their provider transport and presentation state. `SessionRouter` performs exact endpoint resolution, credential custody, replay, reconnect, rotation, and dispatch-time stale-lease rejection.
 
 ## Fallback chains
 
@@ -783,20 +779,6 @@ Inside a GJC session, `/notify` controls the current session only:
 - `/notify on` re-enables the current session when global setup is complete and
   `GJC_NOTIFICATIONS=0` is not forcing opt-out.
 
-### Manual Telegram CLI is for debugging
-
-`packages/coding-agent/src/sdk/bus/telegram-cli.ts` remains as a manual
-reference/debug client and template for other integrations. It is not the primary
-Telegram UX.
-
-```sh
-bun run packages/coding-agent/src/sdk/bus/telegram-cli.ts --bot-token "$BOT_TOKEN"
-```
-
-By default it refuses to start when a fresh managed daemon already owns the same
-bot token for the same paired chat, because a second poller will cause Telegram
-409 conflicts. Use `--force` only for deliberate debugging when you have stopped
-or intentionally want to override the daemon guard.
 ## Session lifecycle and attachment surfaces
 
 SDK core exposes two related provider-neutral capabilities:

@@ -49,7 +49,7 @@
 
 ### Removed
 
-- Removed Telegram's daemon-owned lifecycle control server, lifecycle ledger/orchestrator, SessionId preallocation, tmux/process lifecycle executor, and native lifecycle-control fallback. Provider retries now reuse one Broker idempotency identity, and topic reservations bind only the Broker-returned opaque SessionId.
+- Removed Telegram's daemon-owned lifecycle control server, lifecycle ledger/orchestrator, SessionId preallocation, tmux/process lifecycle executor, native lifecycle-control fallback, and manual endpoint-file/WebSocket bridge. Provider retries now reuse one Broker idempotency identity, and topic reservations bind only the Broker-returned opaque SessionId.
 
 ## [0.12.19] - 2026-08-08
 

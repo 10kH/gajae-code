@@ -398,18 +398,6 @@ does not edit global config or credentials:
 
 `GJC_NOTIFICATIONS=0` suppresses automatic generic current-session admission only. An explicit `/notify on` may override that one automatic-admission suppression for the current session; it does not alter durable provider intent or enable a direct provider API. `GJC_NOTIFY=off`, `0`, or `false` remains the hard process-level opt-out and exposes no notification control surface to override.
 
-## 9. Debug-only manual bridge
-
-The manual Telegram CLI remains a reference/debug tool:
-
-```sh
-bun run packages/coding-agent/src/sdk/bus/telegram-cli.ts --bot-token "$BOT_TOKEN"
-```
-
-If a fresh managed daemon already owns the same bot token and paired chat, the
-manual CLI refuses to start by default because a second poller would cause
-Telegram `409 Conflict`. Use `--force` only for deliberate debugging after you
-understand which daemon owns polling.
 
 ## Troubleshooting
 

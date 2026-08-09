@@ -20,7 +20,7 @@ export interface SessionAttachment {
 	readonly sessionId: string;
 	readonly generation: number;
 	isCurrent(): boolean;
-	send(frame: Record<string, unknown>): void;
+	send(frame: Record<string, unknown>): unknown;
 }
 
 /** The transport surface Router keeps private behind its attachment capabilities. */
@@ -227,6 +227,7 @@ export class SessionRouter {
 		frame: Record<string, unknown>,
 		expectedGeneration?: number,
 	): Promise<Record<string, unknown>> {
+		await this.#serialReconcile();
 		const attached = this.#sessions.get(sessionId);
 		if (!attached || !this.#attachmentLive(attached)) throw new SessionRouterError("pre_send");
 		if (expectedGeneration !== undefined && expectedGeneration !== attached.generation)
@@ -419,7 +420,8 @@ export class SessionRouter {
 			sessionId: indexed.sessionId,
 			generation: indexed.endpointGeneration,
 			isCurrent: () => attached !== undefined && this.#attachmentLive(attached),
-			send: (frame: Record<string, unknown>) => {
+			send: async (frame: Record<string, unknown>) => {
+				await this.#serialReconcile();
 				if (!attached || !this.#attachmentLive(attached))
 					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 				attached.client.send(frame);
