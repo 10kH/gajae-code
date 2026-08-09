@@ -15092,6 +15092,9 @@ export class AgentSession {
 			)
 		);
 	}
+	#isIdleStreamStallErrorMessage(errorMessage: string): boolean {
+		return /stream stalled while waiting for the next event/i.test(errorMessage);
+	}
 
 	#isFirstEventTimeoutErrorMessage(errorMessage: string): boolean {
 		// First-event timeout: the stream watchdog aborted because no event
@@ -15148,8 +15151,8 @@ export class AgentSession {
 	/**
 	 * Ordered retry classification: typed safety stop (surface) -> legacy safety stop
 	 * (surface) -> overflow (compaction) -> terminal (surface) -> usage_limit
-	 * (rotation) -> first_event_timeout (bounded retry) -> transient (unbounded retry) ->
-	 * unknown (bounded retry).
+	 * (rotation) -> first_event_timeout (bounded retry) -> transient (unbounded retry,
+	 * except canonical idle-stream stalls bounded downstream) -> unknown (bounded retry).
 	 */
 	#classifyErrorForRetry(message: AssistantMessage): RetryErrorClassification {
 		if (message.stopReason !== "error") return "none";
@@ -15707,7 +15710,10 @@ export class AgentSession {
 				return false;
 			}
 		}
-		const legacyUnbounded = !managedFallback && classification === "transient";
+		const legacyUnbounded =
+			!managedFallback &&
+			classification === "transient" &&
+			!this.#isIdleStreamStallErrorMessage(message.errorMessage ?? "");
 		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome = managedFallback
