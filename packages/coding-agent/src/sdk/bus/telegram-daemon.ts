@@ -5788,12 +5788,16 @@ export class TelegramNotificationDaemon {
 					let delivered = false;
 					for (let attempt = 0; attempt < (strict ? 5 : 1); attempt++) {
 						try {
-							const response = (await this.botApi.call("editMessageText", {
-								chat_id: this.opts.chatId,
-								message_id: messageId,
-								text: send.text,
-								parse_mode: TELEGRAM_PARSE_MODE,
-							})) as { ok?: boolean; description?: string } | undefined;
+							const response = (await this.botApi.call(
+								"editMessageText",
+								{
+									chat_id: this.opts.chatId,
+									message_id: messageId,
+									text: send.text,
+									parse_mode: TELEGRAM_PARSE_MODE,
+								},
+								{ signal: AbortSignal.any([this.#deliveryAbort.signal, AbortSignal.timeout(30_000)]) },
+							)) as { ok?: boolean; description?: string } | undefined;
 							delivered = response?.ok === true || /not modified/i.test(String(response?.description ?? ""));
 							if (delivered) break;
 							failure = new Error(String(response?.description ?? "Telegram rejected tool terminalization."));

@@ -158,8 +158,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 94 wires the immediate delivery abort into every publication call.
  * Generation 95 propagates selected-ack receipt persistence failure to Router.
  * Generation 96 routes rich-draft delivery through the publication abort boundary.
+ * Generation 97 bounds strict tool terminalization with shutdown abort authority.
  */
-export const DAEMON_GENERATION = 96;
+export const DAEMON_GENERATION = 97;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -201,5 +202,6 @@ export const DAEMON_GENERATION = 96;
  * Epoch 41 closes ordinary publication hangs during shutdown.
  * Epoch 42 closes selected terminal receipt persistence settlement.
  * Epoch 43 closes rich-draft transport hangs during shutdown.
+ * Epoch 44 closes terminal tool transport hangs during shutdown.
  */
-export const SERVING_EPOCH = 43;
+export const SERVING_EPOCH = 44;

@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes rich-draft-abort generation 96 at serving epoch 43", () => {
+test("publishes terminal-tool-abort generation 97 at serving epoch 44", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 96 / serving epoch 43: rich drafts share publication abort authority.
-	expect(DAEMON_GENERATION).toBe(96);
-	expect(SERVING_EPOCH).toBe(43);
+	// Generation 97 / serving epoch 44: strict tool terminalization observes shutdown abort.
+	expect(DAEMON_GENERATION).toBe(97);
+	expect(SERVING_EPOCH).toBe(44);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
