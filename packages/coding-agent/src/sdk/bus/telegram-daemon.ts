@@ -4427,8 +4427,10 @@ export class TelegramNotificationDaemon {
 			})
 			.catch(() => undefined);
 		for (const item of new Set(this.selectedAckPending.values())) {
-			if (item.state === "queued") this.pool.removeById(item.itemId);
-			else item.controller?.abort();
+			if (item.state === "queued") {
+				const removed = this.pool.removeById(item.itemId);
+				if (removed) this.rejectRemovedPublication(removed);
+			} else item.controller?.abort();
 			this.finishSelectedAck(item, { status: "unknown", reason: "shutdown" });
 		}
 		this.#stoppingBtw = true;

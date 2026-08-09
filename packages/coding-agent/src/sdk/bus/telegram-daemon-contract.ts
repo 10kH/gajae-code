@@ -145,8 +145,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 84 closes policy/archive/selected direct waiter cleanup and routes
  * pre-identity threaded output through flat delivery instead of a blocked queue.
  * Generation 85 removes the obsolete pending-frame admission path entirely.
+ * Generation 86 terminalizes queued selected acknowledgements during shutdown.
  */
-export const DAEMON_GENERATION = 85;
+export const DAEMON_GENERATION = 86;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -177,5 +178,6 @@ export const DAEMON_GENERATION = 85;
  * Epoch 30 requires terminal settlement for pending-frame flush discards.
  * Epoch 31 requires complete direct waiter closure and pre-identity delivery.
  * Epoch 32 removes identity-gated pending publication admission.
+ * Epoch 33 requires selected-ack shutdown removal to settle publication state.
  */
-export const SERVING_EPOCH = 32;
+export const SERVING_EPOCH = 33;

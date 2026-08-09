@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes direct-cleanup generation 85 at serving epoch 32", () => {
+test("publishes shutdown-settlement generation 86 at serving epoch 33", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 85 / serving epoch 32: identity-gated pending publication admission is removed.
-	expect(DAEMON_GENERATION).toBe(85);
-	expect(SERVING_EPOCH).toBe(32);
+	// Generation 86 / serving epoch 33: queued selected acknowledgements settle during shutdown.
+	expect(DAEMON_GENERATION).toBe(86);
+	expect(SERVING_EPOCH).toBe(33);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
