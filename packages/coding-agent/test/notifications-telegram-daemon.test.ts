@@ -94,6 +94,7 @@ describe("Telegram provider supervisor ownership", () => {
 			markPublicationDelivered(publicationId: string): Promise<void>;
 			loadPresentationState(): Promise<void>;
 			publicationShouldSuppress(publicationId: string): boolean;
+			publicationSettlement(publicationId: string): { promise: Promise<void> };
 		};
 		const makeHarness = (): PublicationReceiptHarness =>
 			new TelegramNotificationDaemon({
@@ -111,7 +112,9 @@ describe("Telegram provider supervisor ownership", () => {
 			await restartedWithClaim.loadPresentationState();
 			expect(restartedWithClaim.publicationShouldSuppress("session:60:1")).toBe(false);
 
+			const attemptedSettlement = first.publicationSettlement("session:60:1").promise;
 			await first.markPublicationAttempted("session:60:1");
+			await attemptedSettlement;
 			const restartedAmbiguous = makeHarness();
 			await restartedAmbiguous.loadPresentationState();
 			expect(restartedAmbiguous.publicationShouldSuppress("session:60:1")).toBe(true);

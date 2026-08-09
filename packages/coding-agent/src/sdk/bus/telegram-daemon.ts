@@ -4284,6 +4284,7 @@ export class TelegramNotificationDaemon {
 	private readonly ambiguousPublications = new Map<string, number>();
 	private readonly publicationsClaimedThisRun = new Set<string>();
 	private readonly deferredPublications = new Set<string>();
+	private readonly publicationSettlements = new Map<string, PromiseWithResolvers<void>>();
 	private presentationPersistenceQueue: Promise<void> = Promise.resolve();
 	/** Provider-owned create admission window, keyed by the authorized Telegram actor. */
 	private readonly createRateLimitHits = new Map<string, Array<{ requestKey: string; at: number }>>();
@@ -4935,7 +4936,9 @@ export class TelegramNotificationDaemon {
 		await this.effects.admit(() => this.handleSessionMessage(session, frame.body, frame.publicationId));
 		if (!replayPending && !this.deferredPublications.has(frame.publicationId ?? ""))
 			await this.markPublicationDelivered(frame.publicationId);
-		return frame.publicationId && this.claimedPublications.has(frame.publicationId) ? "deferred" : "settled";
+		if (frame.publicationId && this.claimedPublications.has(frame.publicationId))
+			await this.publicationSettlement(frame.publicationId).promise;
+		return "settled";
 	}
 
 	async #onSessionRemoved(attachment: SessionAttachment): Promise<void> {
@@ -5330,7 +5333,31 @@ export class TelegramNotificationDaemon {
 		await pending;
 	}
 
+	private publicationSettlement(publicationId: string): PromiseWithResolvers<void> {
+		let settlement = this.publicationSettlements.get(publicationId);
+		if (!settlement) {
+			settlement = Promise.withResolvers<void>();
+			this.publicationSettlements.set(publicationId, settlement);
+		}
+		return settlement;
+	}
+
+	private settlePublication(publicationId: string | undefined): void {
+		if (!publicationId) return;
+		const settlement = this.publicationSettlements.get(publicationId);
+		if (!settlement) return;
+		this.publicationSettlements.delete(publicationId);
+		settlement.resolve();
+	}
+
+	private resetPublicationSettlement(publicationId: string | undefined): void {
+		if (!publicationId || this.publicationSettlements.has(publicationId)) return;
+		this.publicationSettlements.set(publicationId, Promise.withResolvers<void>());
+	}
+
 	private async claimPublication(publicationId: string | undefined): Promise<void> {
+		if (publicationId && !this.publicationDelivered(publicationId) && !this.ambiguousPublications.has(publicationId))
+			this.publicationSettlement(publicationId);
 		if (!publicationId || this.publicationDelivered(publicationId) || this.claimedPublications.has(publicationId))
 			return;
 		if (this.claimedPublications.size + this.ambiguousPublications.size >= TELEGRAM_PUBLICATION_CLAIM_LIMIT)
@@ -5364,6 +5391,7 @@ export class TelegramNotificationDaemon {
 			this.publicationsClaimedThisRun.add(publicationId);
 			throw new Error("Telegram publication attempt persistence failed.", { cause: error });
 		}
+		this.settlePublication(publicationId);
 	}
 
 	private async restorePublicationQueued(publicationId: string | undefined): Promise<void> {
@@ -5379,6 +5407,7 @@ export class TelegramNotificationDaemon {
 			this.ambiguousPublications.set(publicationId, attemptedAt);
 			throw new Error("Telegram publication queued-state persistence failed.", { cause: error });
 		}
+		this.resetPublicationSettlement(publicationId);
 	}
 
 	private async beginPublicationAttempt(publicationId: string | undefined): Promise<void> {
@@ -5422,6 +5451,7 @@ export class TelegramNotificationDaemon {
 				throw new Error(`Telegram publication pre-send rollback failed: ${reason}`, { cause: error });
 			}
 		}
+		if (publicationId) this.publicationSettlements.delete(publicationId);
 		throw new Error(`Telegram publication rejected before send: ${reason}`);
 	}
 
@@ -5445,6 +5475,7 @@ export class TelegramNotificationDaemon {
 			);
 			throw error;
 		}
+		this.settlePublication(publicationId);
 	}
 
 	async loadAliases(): Promise<void> {
@@ -5719,6 +5750,9 @@ export class TelegramNotificationDaemon {
 			this.revokeCallbackAliases(callbackLease);
 			this.droppedSessions.add(session);
 		}
+		if (isCurrentSession)
+			for (const publicationId of this.publicationSettlements.keys())
+				if (publicationId.startsWith(`${session.sessionId}:`)) this.settlePublication(publicationId);
 		if (isCurrentSession) this.cancelLegacyToolStartsForSession(session);
 		if (isCurrentSession) this.scheduleVisibleToolTerminalization(session.attachmentKey).catch(() => undefined);
 		const clearIntervalImpl = this.opts.clearIntervalImpl ?? clearInterval;
