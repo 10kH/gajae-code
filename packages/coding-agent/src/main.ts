@@ -877,6 +877,7 @@ export async function createSessionManager(
 	activeSettings: Settings = settings,
 ): Promise<SessionManager | undefined> {
 	const migrationPolicy = activeSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
+	const sessionMemoryMode = activeSettings.get("sessionMemory.mode");
 	const sessionDestination = () =>
 		parsed.sessionDir
 			? SessionManager.explicitDestination(parsed.sessionDir)
@@ -890,7 +891,14 @@ export async function createSessionManager(
 		}
 		const forkSource = parsed.fork;
 		if (forkSource.includes("/") || forkSource.includes("\\") || forkSource.endsWith(".jsonl")) {
-			return await SessionManager.forkFrom(forkSource, cwd, sessionDestination(), undefined, migrationPolicy);
+			return await SessionManager.forkFrom(
+				forkSource,
+				cwd,
+				sessionDestination(),
+				undefined,
+				migrationPolicy,
+				sessionMemoryMode,
+			);
 		}
 		const match = await resolveResumableSession(
 			forkSource,
@@ -902,7 +910,14 @@ export async function createSessionManager(
 		if (!match) {
 			throw new Error(`Session "${forkSource}" not found.`);
 		}
-		return await SessionManager.forkFrom(match.session.path, cwd, sessionDestination(), undefined, migrationPolicy);
+		return await SessionManager.forkFrom(
+			match.session.path,
+			cwd,
+			sessionDestination(),
+			undefined,
+			migrationPolicy,
+			sessionMemoryMode,
+		);
 	}
 
 	if (parsed.noSession) {
@@ -914,7 +929,7 @@ export async function createSessionManager(
 			const destination = parsed.sessionDir
 				? SessionManager.explicitDestination(parsed.sessionDir)
 				: SessionManager.explicitDestination(path.dirname(sessionArg));
-			return await SessionManager.open(sessionArg, destination, undefined, migrationPolicy);
+			return await SessionManager.open(sessionArg, destination, undefined, migrationPolicy, sessionMemoryMode);
 		}
 		const match = await resolveResumableSession(
 			sessionArg,
@@ -940,13 +955,26 @@ export async function createSessionManager(
 					sessionDestination(),
 					undefined,
 					migrationPolicy,
+					sessionMemoryMode,
 				);
 			}
 		}
-		return await SessionManager.open(match.session.path, sessionDestination(), undefined, migrationPolicy);
+		return await SessionManager.open(
+			match.session.path,
+			sessionDestination(),
+			undefined,
+			migrationPolicy,
+			sessionMemoryMode,
+		);
 	}
 	if (parsed.continue) {
-		return await SessionManager.continueRecent(cwd, sessionDestination(), undefined, migrationPolicy);
+		return await SessionManager.continueRecent(
+			cwd,
+			sessionDestination(),
+			undefined,
+			migrationPolicy,
+			sessionMemoryMode,
+		);
 	}
 	// --resume without value is handled separately (needs picker UI)
 	// If --session-dir provided without --continue/--resume, create new session there
