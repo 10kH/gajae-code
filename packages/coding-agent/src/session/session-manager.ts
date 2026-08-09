@@ -6310,6 +6310,7 @@ export class SessionManager {
 	#sessionFile: string | undefined;
 	#flushed: boolean = false;
 	#needsFullRewriteOnNextPersist: boolean = false;
+	#readOnlyResume = false;
 	#ensuredOnDisk: boolean = false;
 	#recoveryHydrationContext: RecoveryHydrationContext | undefined;
 	#recoveryPromotionTranscriptPath: string | undefined;
@@ -13480,7 +13481,7 @@ export class SessionManager {
 				await this.#closePersistWriterInternal();
 				this.#flushed = true;
 			}
-			if (this.#needsFullRewriteOnNextPersist) await this.#rewriteFileContents();
+			if (this.#needsFullRewriteOnNextPersist && !this.#readOnlyResume) await this.#rewriteFileContents();
 		});
 		this.#retireEphemeralArtifacts();
 		await this.#drainEphemeralArtifactCleanups();
@@ -14432,6 +14433,7 @@ export class SessionManager {
 	}
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.#sessionFile) return;
+		this.#readOnlyResume = false;
 		if (this.#persistError) throw this.#persistError;
 
 		// Normally we wait for the first assistant message before persisting to avoid
@@ -15670,10 +15672,8 @@ export class SessionManager {
 	 * cap are weakly held so a GC cycle can reclaim them between reads.
 	 */
 	#getSessionContextForRead(): Readonly<SessionContext> {
-		const hasResidentSentinel = this.#fileEntries.some(entry => containsResidentSentinel(entry));
 		const cached = dereferenceMaterializedCache(this.#sessionContextCache);
 		if (
-			!hasResidentSentinel &&
 			cached &&
 			this.#sessionContextEntryRevision === this.#entryRevision &&
 			this.#sessionContextLeafRevision === this.#leafRevision &&
@@ -15706,11 +15706,7 @@ export class SessionManager {
 			this.#holdMaterializedCachesWeakly();
 		}
 		const context = freezeInternalReadSnapshot(builtContext);
-		this.#sessionContextCache = hasResidentSentinel
-			? undefined
-			: this.#materializedCachesWeaklyHeld
-				? new WeakRef(context)
-				: context;
+		this.#sessionContextCache = this.#materializedCachesWeaklyHeld ? new WeakRef(context) : context;
 		transferSessionMessageIdentity(builtContext.messages, context.messages);
 		this.#sessionContextEntryRevision = this.#entryRevision;
 		this.#sessionContextLeafRevision = this.#leafRevision;
@@ -17535,17 +17531,11 @@ export class SessionManager {
 		const manager = new SessionManager(header.cwd || getProjectDir(), dir, true, storage, destination);
 		manager.#sessionMemoryMode = sessionMemoryMode;
 		await manager.#hydrateExistingSession(sessionPath, entries, inspected.migrationApplied);
+		manager.#readOnlyResume = true;
 		const ownershipInspection = revalidateResumeSessionIdentity(sessionPath, storage, inspected.identity);
 		if (ownershipInspection.kind === "error") {
 			await manager.close();
 			return ownershipInspection;
-		}
-		try {
-			await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
-			writeTerminalBreadcrumb(manager.cwd, sessionPath);
-		} catch (error) {
-			await manager.close();
-			throw error;
 		}
 		return { kind: "opened", manager };
 	}

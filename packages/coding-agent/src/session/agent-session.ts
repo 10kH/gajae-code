@@ -753,7 +753,7 @@ type AutoCompactionTerminalStatus =
  * forced compaction retry).
  */
 type PreSubmitBuilder = {
-	build: () => Promise<AgentMessage[]>;
+	build: () => Promise<AgentMessage[] | null>;
 	reset: () => void;
 };
 
@@ -2014,6 +2014,7 @@ export class AgentSession {
 	#fallbackInvocationId = 0;
 	// Todo completion reminder state
 	#todoReminderCount = 0;
+	#todoReminderSentForPrompt = false;
 	#deepInterviewUserIntentEpoch = 0;
 	#deepInterviewTurnOwnerEpoch = 0;
 	#deepInterviewGenuineUserMessageEpochs = new WeakMap<object, number>();
@@ -8880,6 +8881,7 @@ export class AgentSession {
 
 			// Reset todo reminder count on new user prompt
 			this.#todoReminderCount = 0;
+			this.#todoReminderSentForPrompt = false;
 
 			// Validate model
 			if (!this.model) {
@@ -8932,7 +8934,7 @@ export class AgentSession {
 			// Phase A products (including the plan reference) remain stable.
 			let attemptMessages: AgentMessage[] | undefined;
 
-			const buildPreSubmit = async (): Promise<AgentMessage[]> => {
+			const buildPreSubmit = async (): Promise<AgentMessage[] | null> => {
 				this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 				if (!phaseACompleted) {
 					phaseACompleted = true;
@@ -9094,6 +9096,10 @@ export class AgentSession {
 						message.role,
 					);
 				}
+				if (options?.onFinalPreflight && !(await options.onFinalPreflight({ hasPendingNextTurnMessages }))) {
+					this.#resetInjectedContextSignatures();
+					return null;
+				}
 				attemptMessages = messages;
 				return messages;
 			};
@@ -9123,10 +9129,6 @@ export class AgentSession {
 					if (this.#cancelAndSubmitInProgress) this.#cancelAndSubmitPendingNextTurnDrained = true;
 				},
 			};
-			if (options?.onFinalPreflight && !(await options.onFinalPreflight({ hasPendingNextTurnMessages }))) {
-				this.#resetInjectedContextSignatures();
-				return;
-			}
 			await this.#promptAgentWithIdleRetry(preSubmit, agentPromptOptions, predecessorAgentEndHold, {
 				signal: preflightSignal,
 				resourceRunId: this.#runResourceLeaseContext.getStore()?.resourceRunId,
@@ -13890,6 +13892,7 @@ export class AgentSession {
 			return;
 		}
 
+		if (this.#todoReminderSentForPrompt) return;
 		const remindersMax = this.settings.get("todo.reminders.max");
 		if (this.#todoReminderCount >= remindersMax) {
 			logger.debug("Todo completion: max reminders reached", { count: this.#todoReminderCount });
@@ -13921,6 +13924,7 @@ export class AgentSession {
 
 		// Build reminder message
 		this.#todoReminderCount++;
+		this.#todoReminderSentForPrompt = true;
 		const todoList = incompleteByPhase
 			.map(phase => `- ${phase.name}\n${phase.tasks.map(task => `  - ${task.content}`).join("\n")}`)
 			.join("\n");
@@ -16160,6 +16164,10 @@ export class AgentSession {
 				continuationHold = undefined;
 				try {
 					const messages = await preSubmit.build();
+					if (messages === null) {
+						this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
+						return;
+					}
 					if (!preflightAccepted) {
 						await seam?.onPreflightAccepted?.();
 						preflightAccepted = true;
