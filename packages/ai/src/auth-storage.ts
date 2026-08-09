@@ -3649,7 +3649,22 @@ export class AuthStorage {
 						persistedFresh: Date.now() + OAUTH_REFRESH_SKEW_MS < persisted.expires,
 					});
 					if (!force && Date.now() + OAUTH_REFRESH_SKEW_MS < persisted.expires) {
-						return persisted;
+						// Normalize into a full-authority shape with EXPLICIT
+						// optional keys: JSON-deserialized rows omit absent
+						// fields, and callers merge this result over their stale
+						// snapshot with a spread — removed authority (e.g. a
+						// dropped MCP binding) must clobber the stale value, not
+						// be inherited from it.
+						return {
+							access: persisted.access,
+							refresh: persisted.refresh,
+							expires: persisted.expires,
+							accountId: persisted.accountId,
+							email: persisted.email,
+							projectId: persisted.projectId,
+							enterpriseUrl: persisted.enterpriseUrl,
+							mcpBinding: persisted.mcpBinding,
+						};
 					}
 					// Force refreshes still dial upstream, but spend the newest
 					// persisted refresh token instead of the stale snapshot one.

@@ -921,4 +921,123 @@ describe("AuthStorage OAuth refresh race", () => {
 			expect(store!.listAuthCredentials("anthropic")).toHaveLength(0);
 		});
 	});
+	test("adopting a fresh unbound row REMOVES a stale snapshot's MCP binding", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		// Inverse of the binding-adoption case: the stale snapshot is bound but
+		// the authoritative row dropped the binding (e.g. re-login through the
+		// plain provider flow). The adopted authority must clobber the stale
+		// binding — inheriting it would send the NEXT refresh token to the old
+		// MCP endpoint.
+		let mcpDials = 0;
+		const server = Bun.serve({
+			port: 0,
+			fetch: async () => {
+				mcpDials += 1;
+				return new Response("gone", { status: 400 });
+			},
+		});
+		try {
+			const origin = `http://localhost:${server.port}`;
+			await authStorage.set("anthropic", [
+				{
+					type: "oauth",
+					access: "stale-bound-access",
+					refresh: "stale-bound-refresh",
+					expires: Date.now() - 60_000,
+					mcpBinding: { resourceOrigin: origin, tokenEndpoint: `${origin}/token` },
+				},
+			]);
+			const credentialId = store.listAuthCredentials("anthropic")[0]!.id;
+			store.updateAuthCredential(credentialId, {
+				type: "oauth",
+				access: "fresh-unbound-access",
+				refresh: "fresh-unbound-refresh",
+				expires: Date.now() + 60 * 60_000,
+			});
+
+			const refreshedWith: string[] = [];
+			vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async (_provider, credentials) => {
+				refreshedWith.push(credentials.refresh);
+				return {
+					...credentials,
+					access: "plain-rotated-access",
+					refresh: "plain-rotated-refresh",
+					expires: Date.now() + 60 * 60_000,
+				};
+			});
+			vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, creds) => {
+				const credential = creds[provider];
+				if (!credential) return null;
+				return { newCredentials: credential, apiKey: credential.access };
+			});
+
+			await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+				const apiKey = await authStorage!.getApiKey("anthropic", "session-unbind");
+				expect(apiKey).toBe("fresh-unbound-access");
+
+				// The persisted row must have LOST the binding.
+				const stored = store!.listAuthCredentials("anthropic");
+				expect(stored).toHaveLength(1);
+				if (stored[0]?.credential.type === "oauth") {
+					expect(stored[0].credential.mcpBinding).toBeUndefined();
+				}
+
+				// A forced refresh now dials the plain provider path with the
+				// adopted token — the old MCP endpoint is never contacted.
+				await authStorage!.refreshCredentialById(credentialId);
+				expect(refreshedWith).toEqual(["fresh-unbound-refresh"]);
+				expect(mcpDials).toBe(0);
+			});
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	test("an explicit force refresh bypasses the failure memo and dials again", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "stale-access",
+				refresh: "memo-token",
+				expires: Date.now() - 60_000,
+			},
+		]);
+		const credentialId = store.listAuthCredentials("anthropic")[0]!.id;
+
+		let refreshCalls = 0;
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async (_provider, credentials) => {
+			refreshCalls += 1;
+			if (refreshCalls === 1) {
+				throw new Error("fetch failed: network timeout while contacting token endpoint");
+			}
+			return {
+				...credentials,
+				access: "recovered-access",
+				refresh: "recovered-refresh",
+				expires: Date.now() + 60 * 60_000,
+			};
+		});
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, creds) => {
+			const credential = creds[provider];
+			if (!credential) return null;
+			return { newCredentials: credential, apiKey: credential.access };
+		});
+
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			// Transient failure: memoized, temp-blocked, not disabled.
+			const apiKey = await authStorage!.getApiKey("anthropic", "session-memo-force");
+			expect(apiKey).toBeUndefined();
+			expect(refreshCalls).toBe(1);
+
+			// A deliberate force retry must reach the endpoint despite the memo.
+			const entry = await authStorage!.refreshCredentialById(credentialId);
+			expect(refreshCalls).toBe(2);
+			if (entry.credential.type === "oauth") {
+				expect(entry.credential.access).toBe("recovered-access");
+			}
+		});
+	});
 });
