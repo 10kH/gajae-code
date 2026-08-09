@@ -4286,6 +4286,7 @@ export class TelegramNotificationDaemon {
 	private readonly rejectedPublications = new Map<string, number>();
 	private readonly publicationsClaimedThisRun = new Set<string>();
 	private readonly deferredPublications = new Set<string>();
+	private readonly publicationLastOutcomes = new Map<string, BotApiCallOutcome["kind"]>();
 	private readonly publicationSettlements = new Map<string, PromiseWithResolvers<void>>();
 	private presentationPersistenceQueue: Promise<void> = Promise.resolve();
 	/** Provider-owned create admission window, keyed by the authorized Telegram actor. */
@@ -4951,7 +4952,7 @@ export class TelegramNotificationDaemon {
 			!this.deferredPublications.has(frame.publicationId ?? "") &&
 			!this.publicationShouldSuppress(frame.publicationId)
 		)
-			await this.markPublicationDelivered(frame.publicationId);
+			await this.markPublicationRejected(frame.publicationId);
 		if (
 			frame.publicationId &&
 			this.ambiguousPublications.has(frame.publicationId) &&
@@ -5334,6 +5335,15 @@ export class TelegramNotificationDaemon {
 		for (const [publicationId, timestamp] of rejectedEntries)
 			if (publicationId && typeof timestamp === "number" && Number.isFinite(timestamp))
 				this.rejectedPublications.set(publicationId, timestamp);
+		for (const publicationId of this.deliveredPublications.keys()) {
+			this.claimedPublications.delete(publicationId);
+			this.ambiguousPublications.delete(publicationId);
+			this.rejectedPublications.delete(publicationId);
+		}
+		for (const publicationId of this.rejectedPublications.keys()) {
+			this.claimedPublications.delete(publicationId);
+			this.ambiguousPublications.delete(publicationId);
+		}
 		this.prunePublicationReceipts();
 		const uncertainCount = this.claimedPublications.size + this.ambiguousPublications.size;
 		if (uncertainCount > 0)
@@ -5499,7 +5509,9 @@ export class TelegramNotificationDaemon {
 			}
 			if (this.publicationTerminal(publicationId))
 				throw new Error("Telegram publication became terminal during provider dispatch admission.");
-			return this.callBotApiClassified(method, body, callOpts);
+			const result = await this.callBotApiClassified(method, body, callOpts);
+			if (publicationId) this.publicationLastOutcomes.set(publicationId, result.outcome.kind);
+			return result;
 		}
 	}
 
@@ -5517,6 +5529,7 @@ export class TelegramNotificationDaemon {
 		this.ambiguousPublications.delete(publicationId);
 		this.rejectedPublications.delete(publicationId);
 		this.publicationsClaimedThisRun.delete(publicationId);
+		this.publicationLastOutcomes.delete(publicationId);
 		this.deliveredPublications.set(publicationId, this.runtime.now());
 		this.prunePublicationReceipts();
 		try {
@@ -5535,12 +5548,14 @@ export class TelegramNotificationDaemon {
 	}
 
 	private async markPublicationRejected(publicationId: string | undefined): Promise<void> {
-		if (!publicationId || this.rejectedPublications.has(publicationId)) return;
+		if (!publicationId || this.rejectedPublications.has(publicationId) || this.publicationDelivered(publicationId))
+			return;
 		const claimedAt = this.claimedPublications.get(publicationId);
 		const ambiguousAt = this.ambiguousPublications.get(publicationId);
 		this.claimedPublications.delete(publicationId);
 		this.ambiguousPublications.delete(publicationId);
 		this.publicationsClaimedThisRun.delete(publicationId);
+		this.publicationLastOutcomes.delete(publicationId);
 		this.rejectedPublications.set(publicationId, this.runtime.now());
 		try {
 			await this.persistPublicationReceipts();
@@ -5771,11 +5786,12 @@ export class TelegramNotificationDaemon {
 			}
 			return [...claimedByKey.values()];
 		};
-		this.pool.removeWhere(
+		const removedToolItems = this.pool.removeWhere(
 			item =>
 				item.payload.toolActivity !== undefined &&
 				(attachmentKey === undefined || item.payload.toolActivity.attachmentKey === attachmentKey),
 		);
+		for (const item of removedToolItems) this.rejectRemovedPublication(item);
 		const next = this.enqueueToolTerminalization(claimVisible, false, strict);
 		if (attachmentKey !== undefined) {
 			void next.then(() => this.revokedToolEndpoints.delete(attachmentKey));
@@ -5877,6 +5893,7 @@ export class TelegramNotificationDaemon {
 	#finishQueuedBtwDeliveries(pending: PendingBtwTurn, outcome: BtwQueuedDeliveryOutcome): void {
 		for (const item of this.pool.removeWhere(item => item.payload.btwDelivery?.pending === pending)) {
 			item.payload.btwDelivery?.finish(outcome);
+			this.rejectRemovedPublication(item);
 		}
 	}
 	#takeBtwTurn(requestId: string, pending: PendingBtwTurn): boolean {
@@ -6144,7 +6161,10 @@ export class TelegramNotificationDaemon {
 		shutdownController.abort("daemon_shutdown");
 		this.#btwDeliveryAbort.abort();
 		this.#btwTerminalTombstones.clear();
-		for (const item of this.pool.removeWhere(() => true)) item.payload.btwDelivery?.finish("uncertain");
+		for (const item of this.pool.removeWhere(() => true)) {
+			item.payload.btwDelivery?.finish("uncertain");
+			this.rejectRemovedPublication(item);
+		}
 	}
 
 	private deleteMessageRoutes(sessionId: string, actionId?: string): void {
@@ -7602,6 +7622,7 @@ export class TelegramNotificationDaemon {
 			if (item.payload.selectedAck)
 				this.finishSelectedAck(item.payload.selectedAck, { status: "failed", reason: "cancelled" });
 			item.payload.btwDelivery?.finish("stale");
+			this.rejectRemovedPublication(item);
 		}
 		try {
 			await this.flushPool();
@@ -8211,6 +8232,12 @@ export class TelegramNotificationDaemon {
 	}
 
 	/** Drain the shared rate-limit pool and deliver each granted send to its topic. */
+	private rejectRemovedPublication(item: { payload: TelegramQueuePayload }): void {
+		const publicationId = item.payload.publicationId;
+		if (!publicationId) return;
+		this.deferredPublications.delete(publicationId);
+		this.markPublicationRejected(publicationId).catch(() => undefined);
+	}
 	private submitPool(item: Parameters<RateLimitPool<TelegramQueuePayload>["submit"]>[0]): boolean {
 		if (this.effects.stopping) return false;
 		this.pool.submit(item);
@@ -8230,6 +8257,10 @@ export class TelegramNotificationDaemon {
 			}
 			expiredItem.payload.btwDelivery?.finish("not_delivered");
 			this.failLegacyToolStart(expiredItem.payload.toolActivity);
+			if (expiredItem.payload.publicationId) {
+				await this.markPublicationRejected(expiredItem.payload.publicationId);
+				this.deferredPublications.delete(expiredItem.payload.publicationId);
+			}
 		}
 		// Within a batch a finalized frame supersedes any still-queued live frame for
 		// the same streamed message (finalized outranks live), so drop the stale live
@@ -8311,10 +8342,6 @@ export class TelegramNotificationDaemon {
 						item.itemId!,
 						delivered ? "accepted" : outcome.kind === "rejected" ? "rejected" : "ambiguous",
 					);
-					if (delivered && item.payload.publicationId) {
-						await this.markPublicationDelivered(item.payload.publicationId);
-						this.deferredPublications.delete(item.payload.publicationId);
-					}
 				} catch {
 					btwDelivery.finish("uncertain");
 					this.pool.settle(item.itemId!, "ambiguous");
@@ -8702,7 +8729,10 @@ export class TelegramNotificationDaemon {
 				}
 			} catch {
 				// Best-effort: a failed send/edit must never stop the daemon.
-				disposition = "ambiguous";
+				disposition =
+					item.payload.publicationId && this.claimedPublications.has(item.payload.publicationId)
+						? "rejected"
+						: "ambiguous";
 				if (item.payload.toolActivity?.phase === "started") this.toolActivityAmbiguous = true;
 			} finally {
 				const retryable = itemOutcomes.some(outcome => outcome.kind === "retryable");
@@ -9229,6 +9259,10 @@ export class TelegramNotificationDaemon {
 				!Number.isSafeInteger(messageId) ||
 				messageId <= 0
 			) {
+				if (publicationId && this.publicationLastOutcomes.get(publicationId) === "rejected") {
+					await this.markPublicationRejected(publicationId);
+					this.deferredPublications.delete(publicationId);
+				}
 				for (const alias of aliases) this.#modelChoiceAliases.delete(alias);
 				throw new Error("Telegram model selection publication was rejected.");
 			}
@@ -9382,7 +9416,7 @@ export class TelegramNotificationDaemon {
 					!this.deferredPublications.has(replayPublicationId ?? "") &&
 					!this.publicationShouldSuppress(replayPublicationId)
 				)
-					await this.markPublicationDelivered(replayPublicationId);
+					await this.markPublicationRejected(replayPublicationId);
 			}
 			const queued = session.replayQueue.splice(0);
 			for (const queuedItem of queued) {
@@ -9405,7 +9439,7 @@ export class TelegramNotificationDaemon {
 					!this.deferredPublications.has(queuedItem.publicationId ?? "") &&
 					!this.publicationShouldSuppress(queuedItem.publicationId)
 				)
-					await this.markPublicationDelivered(queuedItem.publicationId);
+					await this.markPublicationRejected(queuedItem.publicationId);
 			}
 			await this.#onRouterAttachmentReady(session);
 			this.#terminalizeBtwTurnsForGenerationChange(session);
@@ -9692,6 +9726,14 @@ export class TelegramNotificationDaemon {
 			}
 			if (publicationId && deliveryOutcome === "accepted") {
 				await this.markPublicationDelivered(publicationId);
+				this.deferredPublications.delete(publicationId);
+			}
+			if (
+				publicationId &&
+				deliveryOutcome !== "accepted" &&
+				this.publicationLastOutcomes.get(publicationId) === "rejected"
+			) {
+				await this.markPublicationRejected(publicationId);
 				this.deferredPublications.delete(publicationId);
 			}
 			if (publicationId && this.claimedPublications.has(publicationId))
@@ -10225,6 +10267,14 @@ export class TelegramNotificationDaemon {
 				for (const [alias] of createdAliases) this.aliasTable.delete(alias);
 			}
 			await this.persistAliases();
+			if (
+				publicationId &&
+				messageId === undefined &&
+				this.publicationLastOutcomes.get(publicationId) === "rejected"
+			) {
+				await this.markPublicationRejected(publicationId);
+				this.deferredPublications.delete(publicationId);
+			}
 			if (publicationId && messageId === undefined && this.claimedPublications.has(publicationId))
 				return await this.failPublicationPreSend(
 					publicationId,
@@ -11141,6 +11191,7 @@ export class TelegramNotificationDaemon {
 							return !this.liveMessages.has(key) || owner?.session !== toolActivity.session;
 						});
 						for (const item of removedTools) {
+							this.rejectRemovedPublication(item);
 							const toolActivity = item.payload.toolActivity;
 							if (!toolActivity) continue;
 							const key = `${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`;

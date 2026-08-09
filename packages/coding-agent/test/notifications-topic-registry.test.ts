@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes authority-bound generation 81 at serving epoch 28", () => {
+test("publishes complete-terminal generation 82 at serving epoch 29", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 81 / serving epoch 28: terminal flat admission and list-only Broker routing.
-	expect(DAEMON_GENERATION).toBe(81);
-	expect(SERVING_EPOCH).toBe(28);
+	// Generation 82 / serving epoch 29: all removals and direct rejections reach terminal state.
+	expect(DAEMON_GENERATION).toBe(82);
+	expect(SERVING_EPOCH).toBe(29);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
