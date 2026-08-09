@@ -503,6 +503,12 @@ export class SessionRouter {
 		}
 		if (!this.#started) {
 			await client.close().catch(() => undefined);
+			if (existing)
+				try {
+					await this.#deps.onSessionRemoved?.(existing.capability);
+				} catch {
+					// Router authority is already revoked; provider cleanup remains best effort.
+				}
 			return false;
 		}
 		let attached: AttachedSession | undefined;
