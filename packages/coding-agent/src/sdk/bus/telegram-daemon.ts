@@ -4974,6 +4974,8 @@ export class TelegramNotificationDaemon {
 			this.publicationSettlements.delete(frame.publicationId);
 		const session = this.sessions.get(attachment.sessionId);
 		if (!session || session.attachment !== attachment || !attachment.isCurrent()) return;
+		if (frame.publicationId && this.publicationsBeingRejected.has(frame.publicationId))
+			await this.publicationSettlement(frame.publicationId).promise;
 		if (this.publicationShouldSuppress(frame.publicationId)) return;
 		await this.claimPublication(frame.publicationId);
 		const replayPending = session.replayPending;
@@ -5496,7 +5498,7 @@ export class TelegramNotificationDaemon {
 		} catch (error) {
 			this.claimedPublications.delete(publicationId);
 			this.publicationsClaimedThisRun.delete(publicationId);
-			this.tentativePublications.delete(publicationId);
+			if (!this.publicationsBeingRejected.has(publicationId)) this.tentativePublications.delete(publicationId);
 			logger.warn(`notifications: Telegram publication claim failed: ${sanitizeDiagnostic(String(error))}`);
 			this.rejectPublicationSettlement(publicationId, error);
 			this.publicationSettlements.delete(publicationId);
@@ -5652,6 +5654,7 @@ export class TelegramNotificationDaemon {
 			throw error;
 		} finally {
 			this.publicationsBeingRejected.delete(publicationId);
+			if (!this.rejectedPublications.has(publicationId)) this.tentativePublications.delete(publicationId);
 		}
 		this.tentativePublications.delete(publicationId);
 		this.settlePublication(publicationId);

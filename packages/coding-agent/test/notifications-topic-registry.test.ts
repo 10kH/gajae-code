@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes bounded-stop generation 119 at serving epoch 66", () => {
+test("publishes provisional-rejection generation 120 at serving epoch 67", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 119 / serving epoch 66: stop is bounded and rejected failed continuations stay rejected.
-	expect(DAEMON_GENERATION).toBe(119);
-	expect(SERVING_EPOCH).toBe(66);
+	// Generation 120 / serving epoch 67: replay awaits rejection durability before suppression.
+	expect(DAEMON_GENERATION).toBe(120);
+	expect(SERVING_EPOCH).toBe(67);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
