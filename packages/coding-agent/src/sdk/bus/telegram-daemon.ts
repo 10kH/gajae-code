@@ -8888,17 +8888,22 @@ export class TelegramNotificationDaemon {
 				continue;
 			}
 			const disposition = publicationDispositions.get(publicationId);
-			if (disposition === "accepted") {
-				await this.markPublicationDelivered(publicationId);
-				this.deferredPublications.delete(publicationId);
-			} else if (disposition === "rejected" || disposition === "removed" || disposition === "expired") {
-				await this.markPublicationRejected(publicationId);
-				this.deferredPublications.delete(publicationId);
-			} else if (disposition === "ambiguous") {
-				this.settlePublication(publicationId);
-			} else if (disposition === undefined && this.claimedPublications.has(publicationId)) {
-				await this.markPublicationRejected(publicationId);
-				this.deferredPublications.delete(publicationId);
+			try {
+				if (disposition === "accepted") {
+					await this.markPublicationDelivered(publicationId);
+					this.deferredPublications.delete(publicationId);
+				} else if (disposition === "rejected" || disposition === "removed" || disposition === "expired") {
+					await this.markPublicationRejected(publicationId);
+					this.deferredPublications.delete(publicationId);
+				} else if (disposition === "ambiguous") {
+					this.settlePublication(publicationId);
+				} else if (disposition === undefined && this.claimedPublications.has(publicationId)) {
+					await this.markPublicationRejected(publicationId);
+					this.deferredPublications.delete(publicationId);
+				}
+			} catch (error) {
+				this.rejectPublicationSettlement(publicationId, error);
+				throw error;
 			}
 		}
 	}

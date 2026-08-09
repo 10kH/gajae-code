@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes global-abort generation 98 at serving epoch 45", () => {
+test("publishes generic-persistence generation 99 at serving epoch 46", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 98 / serving epoch 45: every supervised Bot API call observes shutdown abort.
-	expect(DAEMON_GENERATION).toBe(98);
-	expect(SERVING_EPOCH).toBe(45);
+	// Generation 99 / serving epoch 46: generic terminal receipt failures reject Router waiters.
+	expect(DAEMON_GENERATION).toBe(99);
+	expect(SERVING_EPOCH).toBe(46);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
