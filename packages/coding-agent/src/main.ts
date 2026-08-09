@@ -266,7 +266,7 @@ export function resolveAcpStartupOptions(
 		...(parsed.plan ? ["--plan"] : []),
 		...(parsed.systemPrompt ? ["--system-prompt"] : []),
 		...(parsed.tmux ? ["--tmux"] : []),
-		...(parsed.tools?.length ? ["--tools"] : []),
+		...(parsed.tools !== undefined ? ["--tools"] : []),
 		...(parsed.extensions?.length ? ["--extension"] : []),
 		...(parsed.unknownFlags.size > 0 ? [`unknown flags: ${[...parsed.unknownFlags.keys()].join(" ")}`] : []),
 	];

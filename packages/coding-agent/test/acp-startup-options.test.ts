@@ -550,6 +550,23 @@ test("ACP accepts --no-extensions and still names every unsupported discovery fl
 	}
 });
 
+test("ACP rejects --tools by presence so an emptied filter cannot disable every tool", () => {
+	for (const args of [
+		["--tools", "read,bash"],
+		["--tools", ",,"],
+		["--tools", ","],
+		["--tools", "read", "--tools", ",,"],
+	] as const) {
+		const parsed = parseArgs([...args]);
+		expect(parsed.unknownFlags.size).toBe(0);
+		expect(() => resolveAcpStartupOptions(parsed, {})).toThrow("Unsupported under SDK-backed ACP: --tools");
+	}
+
+	// A comma-only filter normalizes to [], which is truthy, so a bypass here would
+	// reach `options.toolNames = parsed.tools` and start ACP with no tools at all.
+	expect(parseArgs(["--tools", ",,"]).tools).toEqual([]);
+});
+
 test("ACP rejects registered extension-loading flags by name", () => {
 	for (const args of [
 		["--extension", "/tmp/a.ts"],
