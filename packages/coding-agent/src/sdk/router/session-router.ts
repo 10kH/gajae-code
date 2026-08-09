@@ -7,6 +7,12 @@ import { SessionIndex as DefaultSessionIndex } from "../broker/session-index";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { SdkClient } from "../client/client";
 import { readSdkBrokerDiscovery, readSdkSessionEndpoint, type SdkSessionEndpoint } from "../client/discovery";
+import {
+	type ActivatedPreparedSession,
+	type PreparedSessionActivationClient,
+	requestPreparedSessionActivation,
+	SessionActivationError,
+} from "../session-activation";
 import { ACP_SESSION_RECONNECT } from "../session-reconnect";
 
 /** The only capability a provider may retain for an attached SDK session. */
@@ -232,17 +238,82 @@ export class SessionRouter {
 	async bindingAuthority(sessionId: string): Promise<{ sessionId: string; endpointGeneration: number } | undefined> {
 		const attached = this.#sessions.get(sessionId);
 		if (!attached || !this.#attachmentLive(attached)) return undefined;
-		await this.#index.refresh();
-		const listing = this.#index.listSessions();
-		if (listing.warnings.length > 0) return undefined;
-		const indexed = listing.sessions.find(candidate => candidate.sessionId === sessionId);
+		let indexed: IndexedSession | undefined;
+		try {
+			await this.#index.refresh();
+			const listing = this.#index.listSessions();
+			if (listing.warnings.length > 0) return undefined;
+			indexed = listing.sessions.find(candidate => candidate.sessionId === sessionId);
+		} catch {
+			return undefined;
+		}
 		if (!indexed?.live || indexed.terminalUncertain) return undefined;
-		if (indexed.endpointGeneration !== attached.generation || indexed.endpointMtimeMs === undefined) return undefined;
+		if (
+			!Number.isSafeInteger(indexed.endpointGeneration) ||
+			indexed.endpointGeneration <= 0 ||
+			indexed.endpointGeneration !== attached.generation ||
+			indexed.endpointMtimeMs === undefined
+		)
+			return undefined;
 		if (!Number.isSafeInteger(indexed.pid) || indexed.pid <= 0) return undefined;
-		const endpoint = await this.#readEndpoint(indexed);
+		const endpoint = await this.#readEndpoint(indexed).catch(() => null);
 		if (!endpoint || endpoint.stale === true || endpoint.pid !== indexed.pid || !endpoint.token) return undefined;
 		if (this.#sessions.get(sessionId) !== attached || !this.#attachmentLive(attached)) return undefined;
 		return { sessionId, endpointGeneration: attached.generation };
+	}
+
+	/** Activates a prepared session through one Router-owned, one-shot SDK client. */
+	async activatePreparedSession(sessionId: string): Promise<ActivatedPreparedSession> {
+		let indexed: IndexedSession | undefined;
+		try {
+			await this.#index.open();
+			await this.#index.refresh();
+			const listing = this.#index.listSessions();
+			if (listing.warnings.length > 0)
+				throw new SessionActivationError(
+					"session_not_live",
+					"Session activation requires an intact session index.",
+				);
+			indexed = listing.sessions.find(candidate => candidate.sessionId === sessionId);
+		} catch (error) {
+			if (error instanceof SessionActivationError) throw error;
+			throw new SessionActivationError(
+				"session_not_live",
+				"Session activation requires an exact live session endpoint.",
+			);
+		}
+		if (
+			!indexed?.live ||
+			indexed.terminalUncertain ||
+			!Number.isSafeInteger(indexed.endpointGeneration) ||
+			indexed.endpointGeneration <= 0 ||
+			!Number.isSafeInteger(indexed.pid) ||
+			indexed.pid <= 0
+		)
+			throw new SessionActivationError(
+				"session_not_live",
+				"Session activation requires an exact live session endpoint.",
+			);
+		const endpoint = await this.#readEndpoint(indexed).catch(() => null);
+		if (!endpoint || endpoint.stale === true || !endpoint.url || !endpoint.token || endpoint.pid !== indexed.pid)
+			throw new SessionActivationError(
+				"session_not_live",
+				"Session activation requires a readable session discovery endpoint.",
+			);
+
+		let client: PreparedSessionActivationClient;
+		try {
+			client = await (this.#deps.createClient
+				? this.#deps.createClient(endpoint)
+				: connectPreparedSession(endpoint));
+		} catch {
+			throw new SessionActivationError("activation_unavailable", "The session endpoint could not be reached.");
+		}
+		try {
+			return await requestPreparedSessionActivation(client, sessionId, indexed.endpointGeneration);
+		} finally {
+			await client.close().catch(() => undefined);
+		}
 	}
 
 	/** Executes one Broker request using Router-owned broker discovery and client custody. */
@@ -544,4 +615,15 @@ export class SessionRouter {
 
 async function connectAttachedSession(endpoint: SdkSessionEndpoint): Promise<SessionRouterClient> {
 	return await SdkClient.connect(endpoint.url, endpoint.token, { ...ACP_SESSION_RECONNECT });
+}
+
+async function connectPreparedSession(endpoint: {
+	url: string;
+	token: string;
+}): Promise<PreparedSessionActivationClient> {
+	const client = await SdkClient.connect(endpoint.url, endpoint.token, { reconnectAttempts: 0 });
+	return {
+		request: async frame => (await client.request(frame)) as Record<string, unknown>,
+		close: async () => await client.close(),
+	};
 }

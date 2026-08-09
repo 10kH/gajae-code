@@ -109,6 +109,7 @@ async function withDaemon(
 		store: ConversationStore<SlackConversation>;
 		agentDir: string;
 		setGeneration: (generation: number) => void;
+		setAuthorityAvailable: (available: boolean) => void;
 	}) => Promise<void>,
 	createStore?: (agentDir: string) => ConversationStore<SlackConversation>,
 ): Promise<void> {
@@ -117,6 +118,7 @@ async function withDaemon(
 	try {
 		const fake = new FakeSlack();
 		let generation = 3;
+		let authorityAvailable = true;
 		let id = 0;
 		daemon = new SlackNotificationDaemon({
 			agentDir,
@@ -126,6 +128,8 @@ async function withDaemon(
 			provider: new SlackProvider(fake),
 			randomId: () => `client-id-${++id}`,
 			resolveAttachment: async sessionId => endpoint(sessionId, generation),
+			resolveBindingAuthority: async sessionId =>
+				authorityAvailable ? { sessionId, endpointGeneration: generation } : undefined,
 			...(createStore ? { store: createStore(agentDir) } : {}),
 		});
 		await run({
@@ -137,6 +141,9 @@ async function withDaemon(
 			agentDir,
 			setGeneration: value => {
 				generation = value;
+			},
+			setAuthorityAvailable: available => {
+				authorityAvailable = available;
 			},
 		});
 	} finally {
@@ -175,6 +182,15 @@ describe("slack existing-root adoption", () => {
 			expect(fake.posts).toEqual([]);
 			const document = await store.load();
 			expect(Object.keys(document.conversations)).toEqual([intentKey("s1")]);
+		});
+	});
+
+	test("missing Router binding authority is refused before provider lookup or CAS", async () => {
+		await withDaemon(async ({ daemon, fake, store, setAuthorityAvailable }) => {
+			setAuthorityAvailable(false);
+			await expect(daemon.bindExistingRoot("s1", EXISTING_ROOT)).rejects.toMatchObject({ code: "session_not_live" });
+			expect(fake.timestampLookups).toEqual([]);
+			expect(Object.keys((await store.load()).conversations)).toEqual([]);
 		});
 	});
 
