@@ -15690,8 +15690,10 @@ export class SessionManager {
 	 * cap are weakly held so a GC cycle can reclaim them between reads.
 	 */
 	#getSessionContextForRead(): Readonly<SessionContext> {
+		const hasResidentSentinel = this.#fileEntries.some(entry => containsResidentSentinel(entry));
 		const cached = dereferenceMaterializedCache(this.#sessionContextCache);
 		if (
+			!hasResidentSentinel &&
 			cached &&
 			this.#sessionContextEntryRevision === this.#entryRevision &&
 			this.#sessionContextLeafRevision === this.#leafRevision &&
@@ -15724,7 +15726,11 @@ export class SessionManager {
 			this.#holdMaterializedCachesWeakly();
 		}
 		const context = freezeInternalReadSnapshot(builtContext);
-		this.#sessionContextCache = this.#materializedCachesWeaklyHeld ? new WeakRef(context) : context;
+		this.#sessionContextCache = hasResidentSentinel
+			? undefined
+			: this.#materializedCachesWeaklyHeld
+				? new WeakRef(context)
+				: context;
 		transferSessionMessageIdentity(builtContext.messages, context.messages);
 		this.#sessionContextEntryRevision = this.#entryRevision;
 		this.#sessionContextLeafRevision = this.#leafRevision;
