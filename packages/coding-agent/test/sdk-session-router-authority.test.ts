@@ -5,7 +5,14 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 
 import type { SessionIndex } from "../src/sdk/broker/session-index";
-import { type SessionAttachment, SessionRouter, type SessionRouterClient, SessionRouterError } from "../src/sdk/router";
+import {
+	type SessionAttachment,
+	SessionRouter,
+	type SessionRouterClient,
+	SessionRouterError,
+	type SessionRouterFrame,
+	type SessionRouterFrameDisposition,
+} from "../src/sdk/router";
 
 const tempDirs: string[] = [];
 
@@ -46,10 +53,13 @@ async function routerFixture() {
 			warnings: authority.warnings,
 		}),
 	} as unknown as SessionIndex;
+	const routedFrames: SessionRouterFrame[] = [];
+	let frameDisposition: SessionRouterFrameDisposition = "settled";
 	const clients: Array<{
 		sent: Record<string, unknown>[];
 		requests: Record<string, unknown>[];
 		client: SessionRouterClient;
+		emit: (frame: Record<string, unknown>) => void;
 	}> = [];
 	const attachments: SessionAttachment[] = [];
 	const router = new SessionRouter({
@@ -59,8 +69,14 @@ async function routerFixture() {
 			createClient: async () => {
 				const sent: Record<string, unknown>[] = [];
 				const requests: Record<string, unknown>[] = [];
+				let listener: ((frame: Record<string, unknown>) => void) | undefined;
 				const client: SessionRouterClient = {
-					onFrame: () => () => {},
+					onFrame: value => {
+						listener = value;
+						return () => {
+							listener = undefined;
+						};
+					},
 					request: async operation => {
 						requests.push(operation);
 						return { events: [] };
@@ -68,21 +84,55 @@ async function routerFixture() {
 					close: async () => {},
 					send: frame => sent.push(frame),
 				};
-				clients.push({ sent, requests, client });
+				clients.push({ sent, requests, client, emit: frame => listener?.(frame) });
 				return client;
 			},
 			onAttachment: attachment => {
 				attachments.push(attachment);
+			},
+			onFrame: (_attachment, frame) => {
+				routedFrames.push(frame);
+				return frameDisposition;
 			},
 			setInterval: (() => 0) as unknown as typeof setInterval,
 			clearInterval: (() => {}) as unknown as typeof clearInterval,
 		},
 	});
 	await router.start();
-	return { authority, attachments, clients, endpointFile, router, sessionId };
+	return {
+		authority,
+		attachments,
+		clients,
+		endpointFile,
+		routedFrames,
+		router,
+		sessionId,
+		setFrameDisposition: (value: SessionRouterFrameDisposition) => {
+			frameDisposition = value;
+		},
+	};
 }
 
 describe("SessionRouter dispatch authority", () => {
+	test("retains the sequence cursor while provider delivery is deferred", async () => {
+		const fixture = await routerFixture();
+		fixture.setFrameDisposition("deferred");
+		const frame = {
+			type: "event",
+			seq: 1,
+			sessionId: fixture.sessionId,
+			generation: 1,
+			payload: { type: "assistant", text: "queued" },
+		};
+		fixture.clients[0]!.emit(frame);
+		await Bun.sleep(0);
+		expect(fixture.routedFrames).toHaveLength(1);
+		fixture.setFrameDisposition("settled");
+		fixture.clients[0]!.emit(frame);
+		await Bun.sleep(0);
+		expect(fixture.routedFrames).toHaveLength(2);
+		await fixture.router.stop();
+	});
 	test("contains an unreachable indexed endpoint while attaching healthy sessions", async () => {
 		const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-reconcile-"));
 		tempDirs.push(repo);

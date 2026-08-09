@@ -122,8 +122,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * never converts replay-suppressed ambiguity into delivered confirmation.
  * Generation 72 keeps invalid selected publications queued and mirrors attempted
  * BTW rejection outcomes across duplicate publication identities.
+ * Generation 73 reports queued publication disposition to SessionRouter so
+ * same-process reconnect retains the unadvanced replay cursor.
  */
-export const DAEMON_GENERATION = 72;
+export const DAEMON_GENERATION = 73;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -141,5 +143,6 @@ export const DAEMON_GENERATION = 72;
  * Epoch 17 requires durable queued/attempted/confirmed publication states.
  * Epoch 18 requires suppression-aware attempt transitions and replay confirmation.
  * Epoch 19 requires direct invalid/rejected outcomes to retain exact receipt state.
+ * Epoch 20 requires Router cursor advancement to follow settled publication state.
  */
-export const SERVING_EPOCH = 19;
+export const SERVING_EPOCH = 20;

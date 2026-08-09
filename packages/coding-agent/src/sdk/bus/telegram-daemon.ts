@@ -61,6 +61,7 @@ import {
 	SessionRouter,
 	type SessionRouterDeps,
 	type SessionRouterFrame,
+	type SessionRouterFrameDisposition,
 } from "../router/session-router";
 
 import {
@@ -4922,15 +4923,19 @@ export class TelegramNotificationDaemon {
 		if (lease?.topicId === topic.topicId) await this.flushPendingThreadedFrames(session.sessionId, lease);
 	}
 
-	async #onRouterFrame(attachment: SessionAttachment, frame: SessionRouterFrame): Promise<void> {
+	async #onRouterFrame(
+		attachment: SessionAttachment,
+		frame: SessionRouterFrame,
+	): Promise<SessionRouterFrameDisposition> {
 		const session = this.sessions.get(attachment.sessionId);
-		if (!session || session.attachment !== attachment || !attachment.isCurrent()) return;
-		if (this.publicationShouldSuppress(frame.publicationId)) return;
+		if (!session || session.attachment !== attachment || !attachment.isCurrent()) return "settled";
+		if (this.publicationShouldSuppress(frame.publicationId)) return "settled";
 		await this.claimPublication(frame.publicationId);
 		const replayPending = session.replayPending;
 		await this.effects.admit(() => this.handleSessionMessage(session, frame.body, frame.publicationId));
 		if (!replayPending && !this.deferredPublications.has(frame.publicationId ?? ""))
 			await this.markPublicationDelivered(frame.publicationId);
+		return frame.publicationId && this.claimedPublications.has(frame.publicationId) ? "deferred" : "settled";
 	}
 
 	async #onSessionRemoved(attachment: SessionAttachment): Promise<void> {

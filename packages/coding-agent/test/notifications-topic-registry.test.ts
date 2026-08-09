@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes exact-rejection generation 72 at serving epoch 19", () => {
+test("publishes cursor-bound generation 73 at serving epoch 20", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 72 / serving epoch 19: direct invalid and rejected outcomes retain exact state.
-	expect(DAEMON_GENERATION).toBe(72);
-	expect(SERVING_EPOCH).toBe(19);
+	// Generation 73 / serving epoch 20: Router cursor advances only for settled publications.
+	expect(DAEMON_GENERATION).toBe(73);
+	expect(SERVING_EPOCH).toBe(20);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
