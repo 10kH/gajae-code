@@ -528,7 +528,10 @@ export class SessionRouter {
 
 	#attachmentLive(attached: AttachedSession): boolean {
 		return (
-			!attached.barrier.detached && !attached.barrier.failed && this.#sessions.get(attached.sessionId) === attached
+			this.#started &&
+			!attached.barrier.detached &&
+			!attached.barrier.failed &&
+			this.#sessions.get(attached.sessionId) === attached
 		);
 	}
 
