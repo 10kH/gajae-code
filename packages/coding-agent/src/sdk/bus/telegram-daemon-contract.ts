@@ -135,8 +135,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * intentionally superseded queued live publications.
  * Generation 79 preserves rejected state through outer/replay confirmation and
  * settles publication-level continuation and retry barriers.
+ * Generation 80 terminalizes every no-dispatch queue branch and revalidates
+ * terminal publication state after cooldown waits.
  */
-export const DAEMON_GENERATION = 79;
+export const DAEMON_GENERATION = 80;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -161,5 +163,6 @@ export const DAEMON_GENERATION = 79;
  * Epoch 24 requires bounded terminal rejection retention.
  * Epoch 25 requires stale-dispatch retry and superseded publication settlement.
  * Epoch 26 requires terminal-state exclusivity and complete publication barriers.
+ * Epoch 27 requires no-dispatch terminalization and post-wait revalidation.
  */
-export const SERVING_EPOCH = 26;
+export const SERVING_EPOCH = 27;

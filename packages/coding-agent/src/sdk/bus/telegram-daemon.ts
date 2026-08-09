@@ -5290,6 +5290,13 @@ export class TelegramNotificationDaemon {
 		);
 	}
 
+	private publicationTerminal(publicationId: string | undefined): boolean {
+		return (
+			publicationId !== undefined &&
+			(this.deliveredPublications.has(publicationId) || this.rejectedPublications.has(publicationId))
+		);
+	}
+
 	private async loadPresentationState(): Promise<void> {
 		if (this.validationMode()) return;
 		const raw = await readJson<unknown>(this.fsImpl, this.presentationStatePath());
@@ -5483,11 +5490,15 @@ export class TelegramNotificationDaemon {
 				await this.runtime.sleep(Math.min(remaining, 1_000));
 				remaining = cooldownRemaining();
 			}
+			if (this.publicationTerminal(publicationId))
+				throw new Error("Telegram publication became terminal before provider dispatch.");
 			await this.beginPublicationAttempt(publicationId);
 			if (cooldownRemaining() > 0) {
 				await this.restorePublicationQueued(publicationId);
 				continue;
 			}
+			if (this.publicationTerminal(publicationId))
+				throw new Error("Telegram publication became terminal during provider dispatch admission.");
 			return this.callBotApiClassified(method, body, callOpts);
 		}
 	}
@@ -8789,6 +8800,9 @@ export class TelegramNotificationDaemon {
 				this.deferredPublications.delete(publicationId);
 			} else if (disposition === "ambiguous") {
 				this.settlePublication(publicationId);
+			} else if (disposition === undefined && this.claimedPublications.has(publicationId)) {
+				await this.markPublicationRejected(publicationId);
+				this.deferredPublications.delete(publicationId);
 			}
 		}
 	}
