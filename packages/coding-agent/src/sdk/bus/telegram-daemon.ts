@@ -5632,7 +5632,7 @@ export class TelegramNotificationDaemon {
 		} catch (error) {
 			this.rejectedPublications.delete(publicationId);
 			if (claimedAt !== undefined) this.claimedPublications.set(publicationId, claimedAt);
-			if (ambiguousAt !== undefined) this.ambiguousPublications.set(publicationId, ambiguousAt);
+			else if (ambiguousAt !== undefined) this.claimedPublications.set(publicationId, ambiguousAt);
 			this.rejectPublicationSettlement(publicationId, error);
 			throw error;
 		}
@@ -8883,6 +8883,7 @@ export class TelegramNotificationDaemon {
 				}
 			}
 		}
+		let terminalizationError: unknown;
 		for (const publicationId of publicationIds) {
 			if (this.pool.someQueued(item => item.payload.publicationId === publicationId)) continue;
 			if (failedPublications.has(publicationId)) {
@@ -8905,9 +8906,10 @@ export class TelegramNotificationDaemon {
 				}
 			} catch (error) {
 				this.rejectPublicationSettlement(publicationId, error);
-				throw error;
+				terminalizationError ??= error;
 			}
 		}
+		if (terminalizationError !== undefined) throw terminalizationError;
 	}
 
 	/**

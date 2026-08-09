@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes centralized-persistence generation 100 at serving epoch 47", () => {
+test("publishes batch-isolation generation 101 at serving epoch 48", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 100 / serving epoch 47: every terminal persistence rollback rejects Router waiters.
-	expect(DAEMON_GENERATION).toBe(100);
-	expect(SERVING_EPOCH).toBe(47);
+	// Generation 101 / serving epoch 48: batch failure isolation preserves rejected replayability.
+	expect(DAEMON_GENERATION).toBe(101);
+	expect(SERVING_EPOCH).toBe(48);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();

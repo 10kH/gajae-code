@@ -162,8 +162,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 98 applies delivery abort authority to every supervised Bot API call.
  * Generation 99 propagates generic terminal receipt persistence failure to Router.
  * Generation 100 centralizes terminal receipt failure propagation in state transitions.
+ * Generation 101 isolates batch terminal failures and replays rejected rollback.
  */
-export const DAEMON_GENERATION = 100;
+export const DAEMON_GENERATION = 101;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -209,5 +210,6 @@ export const DAEMON_GENERATION = 100;
  * Epoch 45 closes raw topic and callback transport hangs during shutdown.
  * Epoch 46 closes timer-finalized publication persistence settlement.
  * Epoch 47 covers every delivered/rejected persistence rollback path.
+ * Epoch 48 preserves unrelated batch settlement and rejected replayability.
  */
-export const SERVING_EPOCH = 47;
+export const SERVING_EPOCH = 48;
