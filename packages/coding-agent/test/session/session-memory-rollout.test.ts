@@ -128,6 +128,8 @@ describe("session memory rollout", () => {
 		];
 		for (const orphan of orphans) storage.writeTextSync(orphan, "derived crash debris");
 		const reopened = await SessionManager.open(sessionFile, destination, storage, "copy-retain", "shadow");
+		expect(reopened.getSessionMemoryStats().coldIndexBytes).toBeGreaterThan(0);
+		expect(reopened.getSessionMemoryStats().coldIndexBlockCacheBytes).toBeGreaterThanOrEqual(0);
 		await reopened.close();
 		expect(orphans.every(orphan => !storage.existsSync(orphan))).toBe(true);
 		expect(storage.existsSync(commitPath)).toBe(true);
