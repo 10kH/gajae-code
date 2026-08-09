@@ -221,24 +221,30 @@ export class SessionRouter {
 		this.#started = false;
 		this.#stopController.abort();
 		this.#ready = false;
-		await this.#reconcileTail.catch(() => undefined);
-		await Promise.allSettled([...this.#pending]);
-		const closeErrors: unknown[] = [];
+		const shutdownTasks: Promise<void>[] = [];
 		for (const [sessionId, attached] of this.#sessions) {
 			this.#sessions.delete(sessionId);
 			attached.dispose();
-			try {
-				await attached.client.close();
-			} catch (error) {
-				closeErrors.push(error);
-			}
-			try {
-				await this.#deps.onSessionRemoved?.(attached.capability);
-			} catch (error) {
-				closeErrors.push(error);
-			}
+			shutdownTasks.push(
+				(async () => await attached.client.close())(),
+				(async () => await this.#deps.onSessionRemoved?.(attached.capability))(),
+			);
 		}
-		if (closeErrors.length > 0) throw new AggregateError(closeErrors, "SessionRouter client shutdown failed.");
+		const pending = Promise.allSettled([this.#reconcileTail, ...this.#pending, ...shutdownTasks]);
+		const outcome = await Promise.race([
+			pending.then(results => ({ kind: "settled" as const, results })),
+			Bun.sleep(5_000).then(() => ({ kind: "timeout" as const })),
+		]);
+		if (outcome.kind === "timeout") {
+			logger.warn(
+				"SessionRouter shutdown exceeded 5000ms; authority is revoked and cleanup continues in background.",
+			);
+			return;
+		}
+		const errors = outcome.results
+			.filter((result): result is PromiseRejectedResult => result.status === "rejected")
+			.map(result => result.reason);
+		if (errors.length > 0) throw new AggregateError(errors, "SessionRouter shutdown failed.");
 	}
 
 	/** Returns an opaque lease only while the exact attachment generation is live. */

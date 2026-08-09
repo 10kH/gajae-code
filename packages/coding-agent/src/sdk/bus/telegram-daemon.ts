@@ -8912,12 +8912,17 @@ export class TelegramNotificationDaemon {
 		}
 		for (const publicationId of publicationIds) {
 			if (this.pool.someQueued(item => item.payload.publicationId === publicationId)) continue;
-			if (failedPublications.has(publicationId)) {
-				this.settlePublication(publicationId);
-				continue;
-			}
 			const disposition = publicationDispositions.get(publicationId);
 			try {
+				if (failedPublications.has(publicationId)) {
+					if (disposition === "rejected") {
+						await this.markPublicationRejected(publicationId);
+						this.deferredPublications.delete(publicationId);
+					} else {
+						this.settlePublication(publicationId);
+					}
+					continue;
+				}
 				if (disposition === "accepted") {
 					await this.markPublicationDelivered(publicationId);
 					this.deferredPublications.delete(publicationId);
