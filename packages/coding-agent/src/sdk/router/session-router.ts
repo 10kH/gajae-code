@@ -369,8 +369,8 @@ export class SessionRouter {
 			indexed.warnings.length === 0
 				? indexed.sessions.filter(session => session.live && !session.terminalUncertain)
 				: [];
-		const ids = new Set(live.map(session => session.sessionId));
-		for (const session of live) await this.#attach(session);
+		const ids = new Set<string>();
+		for (const session of live) if (await this.#attach(session)) ids.add(session.sessionId);
 		for (const [sessionId, attached] of this.#sessions) {
 			if (ids.has(sessionId)) continue;
 			this.#sessions.delete(sessionId);
@@ -398,9 +398,9 @@ export class SessionRouter {
 		return endpoint;
 	}
 
-	async #attach(indexed: IndexedSession): Promise<void> {
+	async #attach(indexed: IndexedSession): Promise<boolean> {
 		const endpoint = await this.#readEndpoint(indexed);
-		if (!endpoint) return;
+		if (!endpoint) return false;
 		const existing = this.#sessions.get(indexed.sessionId);
 		const resumable =
 			existing !== undefined &&
@@ -409,7 +409,7 @@ export class SessionRouter {
 			existing.generation === indexed.endpointGeneration;
 		if (existing && resumable && !existing.barrier.failed) {
 			this.#reviveTransport(existing);
-			return;
+			return true;
 		}
 		const resumeSeq = existing && resumable ? existing.cursor.seq : 0;
 		if (existing) {
@@ -456,6 +456,7 @@ export class SessionRouter {
 		this.#sessions.set(indexed.sessionId, attached);
 		await this.#deps.onAttachment?.(capability);
 		await this.#replayAttachment(attached, resumeSeq);
+		return true;
 	}
 
 	#reviveTransport(attached: AttachedSession): void {

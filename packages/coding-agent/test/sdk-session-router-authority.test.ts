@@ -77,7 +77,7 @@ async function routerFixture() {
 		},
 	});
 	await router.start();
-	return { authority, attachments, clients, router, sessionId };
+	return { authority, attachments, clients, endpointFile, router, sessionId };
 }
 
 describe("SessionRouter dispatch authority", () => {
@@ -109,6 +109,18 @@ describe("SessionRouter dispatch authority", () => {
 		await fixture.router.stop();
 	});
 
+	test("revokes an attachment when exact endpoint revalidation fails for a still-live index row", async () => {
+		const fixture = await routerFixture();
+		const attachment = fixture.attachments[0]!;
+		fs.rmSync(fixture.endpointFile);
+
+		await expect(attachment.send({ type: "reply", id: "ask", answer: "yes" })).rejects.toBeInstanceOf(
+			SessionRouterError,
+		);
+		expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+		expect(fixture.clients[0]?.sent).toEqual([]);
+		await fixture.router.stop();
+	});
 	test("detaches and rejects requests while the Broker index has corruption warnings", async () => {
 		const fixture = await routerFixture();
 		fixture.authority.warnings = ["corrupt index suffix"];
