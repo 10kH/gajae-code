@@ -5487,15 +5487,19 @@ export class TelegramNotificationDaemon {
 		this.claimedPublications.set(publicationId, this.runtime.now());
 		this.publicationsClaimedThisRun.add(publicationId);
 		this.prunePublicationReceipts();
+		this.publicationSettlement(publicationId);
 		try {
 			await this.persistPublicationReceipts();
 		} catch (error) {
 			this.claimedPublications.delete(publicationId);
 			this.publicationsClaimedThisRun.delete(publicationId);
 			logger.warn(`notifications: Telegram publication claim failed: ${sanitizeDiagnostic(String(error))}`);
+			this.rejectPublicationSettlement(publicationId, error);
+			this.publicationSettlements.delete(publicationId);
 			throw error;
 		}
-		this.publicationSettlement(publicationId);
+		if (!this.claimedPublications.has(publicationId) || this.publicationShouldSuppress(publicationId))
+			throw new Error("Telegram publication claim authority changed during persistence.");
 	}
 
 	private async markPublicationAttempted(publicationId: string | undefined): Promise<void> {

@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes claim-admission generation 116 at serving epoch 63", () => {
+test("publishes concurrent-claim generation 117 at serving epoch 64", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 116 / serving epoch 63: failed claim admission creates no publication waiter.
-	expect(DAEMON_GENERATION).toBe(116);
-	expect(SERVING_EPOCH).toBe(63);
+	// Generation 117 / serving epoch 64: concurrent teardown observes and revokes tentative claims.
+	expect(DAEMON_GENERATION).toBe(117);
+	expect(SERVING_EPOCH).toBe(64);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
