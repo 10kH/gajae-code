@@ -4288,12 +4288,22 @@ export function createNotificationsExtension(
 		const kindReconciliation = createKindAwareReconciliation({ store: durableStore });
 		// Restart recovery must commit before any prompt is admitted; otherwise a new
 		// admission can race the hydrated full-state replacement.
-		const reconciliationReady: Promise<void> = durableStore
-			? kindReconciliation.hydrateFromStore()
-			: Promise.resolve();
+		let reconciliationReady: Promise<void> = durableStore ? kindReconciliation.hydrateFromStore() : Promise.resolve();
 		// Never let a hydration rejection become an unhandled rejection; tracked prompts
 		// re-await the same promise and fail closed below.
 		void reconciliationReady.catch(() => {});
+		const awaitReconciliationReady = async () => {
+			const observed = reconciliationReady;
+			try {
+				await observed;
+			} catch {
+				if (reconciliationReady === observed) {
+					reconciliationReady = durableStore ? kindReconciliation.hydrateFromStore() : Promise.resolve();
+					void reconciliationReady.catch(() => {});
+				}
+				await reconciliationReady;
+			}
+		};
 		// Backward-compatible process-local prompt reconciler kept for unit-test isolation;
 		// production path uses kindReconciliation for prompt+skill.
 		const reconciliation = createPromptReconciliation();
@@ -4774,7 +4784,7 @@ export function createNotificationsExtension(
 			trackGateResolution,
 			admitPromptSubmission,
 			releasePromptAdmission,
-			() => reconciliationReady,
+			awaitReconciliationReady,
 			settings,
 			configOverrides,
 			configRevision,
