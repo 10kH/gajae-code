@@ -2444,15 +2444,22 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 	#onError: ((err: Error) => void) | undefined;
 
 	#closeAdapter: SessionStorageWriterCloseAdapter | undefined;
+	#bytes: Buffer;
+	#length = 0;
 
 	constructor(storage: MemorySessionStorage, path: string, options?: SessionStorageWriterOpenOptions) {
 		this.#storage = storage;
 		this.#path = path;
 		this.#onError = options?.onError;
 		this.#closeAdapter = options?.closeAdapter;
-		if ((options?.flags ?? "a") === "w") {
-			this.#storage.writeTextSync(path, "");
-		}
+		const existing =
+			options?.flags === "w" || !storage.existsSync(path)
+				? Buffer.alloc(0)
+				: Buffer.from(storage.readBytesSync(path));
+		this.#length = existing.byteLength;
+		this.#bytes = Buffer.allocUnsafe(Math.max(existing.byteLength, 4096));
+		existing.copy(this.#bytes);
+		if (options?.flags === "w") this.#storage.writeBytesOwnedSync(path, this.#bytes.subarray(0, 0));
 	}
 
 	#recordError(err: unknown): Error {
@@ -2466,8 +2473,16 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 		if (this.#closeState !== "open") throw new Error("Writer closed");
 		if (this.#error) throw this.#error;
 		try {
-			const existing = this.#storage.existsSync(this.#path) ? this.#storage.readTextSync(this.#path) : "";
-			this.#storage.writeTextSync(this.#path, `${existing}${line}`);
+			const bytes = Buffer.from(line, "utf8");
+			const nextLength = this.#length + bytes.byteLength;
+			if (nextLength > this.#bytes.byteLength) {
+				const expanded = Buffer.allocUnsafe(Math.max(nextLength, this.#bytes.byteLength * 2));
+				this.#bytes.copy(expanded, 0, 0, this.#length);
+				this.#bytes = expanded;
+			}
+			bytes.copy(this.#bytes, this.#length);
+			this.#length = nextLength;
+			this.#storage.writeBytesOwnedSync(this.#path, this.#bytes.subarray(0, this.#length));
 		} catch (err) {
 			throw this.#recordError(err);
 		}
