@@ -72,11 +72,13 @@ export type ChatDaemonAction = "stop" | "reload";
  * before the host heartbeat TTL expires and permanently loses its attachment. Discord
  * generation 29 / slack generation 28 advance the replay cursor only after a frame is
  * published, so an owner at an earlier generation acknowledges an event before delivering
- * it and loses that event for good the first time a surface refuses it.
+ * it and loses that event for good the first time a surface refuses it. Discord generation 30 /
+ * slack generation 29 move lifecycle and attachment authority into SDK core, so an earlier
+ * provider daemon cannot retain obsolete direct endpoint ownership.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 29,
-	slack: 28,
+	discord: 30,
+	slack: 29,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

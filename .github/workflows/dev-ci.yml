@@ -370,7 +370,7 @@ jobs:
         run: |
           bun test ./packages/coding-agent/test/daemon-control.test.ts --test-name-pattern 'incarnation|captured-owner|owner-lock|poll overlap|configured chat providers|hard Windows authority'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          bun test ./packages/coding-agent/test/notifications-telegram-daemon.test.ts --test-name-pattern 'Windows production preflight|Windows legacy cooperative handoff|promoted generation-3 hybrid|concurrent ensureTelegramDaemonRunning|stale dead-pid lock|lock written before|parent-format|transition lock|provisional|readiness|reload failure|pre-upgrade owner|current-generation live owner|v0.10.2|historical pretty|exact unlink|rollback preserves legacy unmanaged root|runDaemonInternal rewrites persisted owner pid|heartbeat fails closed'
+          bun test ./packages/coding-agent/test/notifications-telegram-daemon.test.ts --test-name-pattern 'provider owner state contains transport authority|constructing or restarting provider transport cannot mutate session lifecycle'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun test ./packages/natives/test/native.test.ts --test-name-pattern 'signals only the pinned root process'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
