@@ -14391,6 +14391,8 @@ export class SessionManager {
 		if (records.length === 0) return;
 		if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
 		if (!this.persist || !this.#sessionFile || !this.storage.existsSync(this.#sessionFile)) return;
+		const sessionFile = this.#sessionFile;
+		const publishResumeBreadcrumb = this.#readOnlyResume;
 		await this.#queuePersistTask(async () => {
 			for (let attempt = 0; attempt <= 2; attempt++) {
 				const token = this.#capturePersistenceInputToken();
@@ -14414,10 +14416,12 @@ export class SessionManager {
 						: record,
 				);
 				SessionManagerTestHooks.beforePersistPatchFence?.(attempt);
+				let persisted = false;
 				const written = this.#withSessionPersistenceFenceSync(() => {
 					if (!this.#persistenceInputTokenMatches(token)) return false;
 					if (this.destination.kind === "managed") {
 						this.#appendManagedRecordsSync(persistedRecords);
+						persisted = true;
 						return true;
 					}
 					const writer = this.#ensurePersistWriter();
@@ -14426,9 +14430,14 @@ export class SessionManager {
 						return true;
 					}
 					for (const persistedRecord of persistedRecords) writer.writeSync(persistedRecord);
+					persisted = true;
 					return true;
 				});
-				if (written) return;
+				if (written) {
+					if (publishResumeBreadcrumb && persisted) writeTerminalBreadcrumb(this.cwd, sessionFile);
+					if (persisted) this.#readOnlyResume = false;
+					return;
+				}
 			}
 			throw new Error("session_persistence_input_stale");
 		});
