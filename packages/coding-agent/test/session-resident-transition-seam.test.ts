@@ -1051,7 +1051,7 @@ describe("resident-store transition seam", () => {
 			).toBe(true);
 		}
 
-		expect(source.slice(setSessionFileStart, setSessionFileEnd)).not.toMatch(/this\.\#fileEntries\s*=(?!=)/);
+		expect(source.slice(setSessionFileStart, setSessionFileEnd)).not.toMatch(/this\.#fileEntries\s*=(?!=)/);
 	});
 
 	it("T6 aborts recovery promotion before staging removal when candidate preparation cannot trust the cache root", async () => {
