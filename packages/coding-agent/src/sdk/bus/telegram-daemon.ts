@@ -11925,6 +11925,7 @@ export class TelegramNotificationDaemon {
 				await this.runtime.sleep(10);
 			}
 		} finally {
+			this.requestStop("stop");
 			this.running = false;
 			await this.attachmentRouter
 				.stop()
