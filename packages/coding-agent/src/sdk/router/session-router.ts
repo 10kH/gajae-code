@@ -417,6 +417,7 @@ export class SessionRouter {
 			}
 		}
 		if (!this.#started) return;
+		const cleanupErrors: unknown[] = [];
 		for (const [sessionId, attached] of this.#sessions) {
 			if (attachedIds.has(sessionId)) continue;
 			if (!liveIds.has(sessionId)) {
@@ -425,9 +426,18 @@ export class SessionRouter {
 			}
 			this.#sessions.delete(sessionId);
 			attached.dispose();
-			await attached.client.close();
-			await this.#deps.onSessionRemoved?.(attached.capability);
+			try {
+				await attached.client.close();
+			} catch (error) {
+				cleanupErrors.push(error);
+			}
+			try {
+				await this.#deps.onSessionRemoved?.(attached.capability);
+			} catch (error) {
+				cleanupErrors.push(error);
+			}
 		}
+		if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, "SessionRouter stale cleanup failed.");
 	}
 
 	async #readEndpoint(indexed: IndexedSession): Promise<SdkSessionEndpoint | null> {
