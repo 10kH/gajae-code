@@ -8471,13 +8471,15 @@ export class TelegramNotificationDaemon {
 						delivered ? { status: "delivered", messageId } : { status: "failed", reason: "telegram_rejected" },
 					);
 					this.pool.settle(item.itemId!, delivered ? "accepted" : "rejected");
-					if (delivered && item.payload.publicationId) {
-						await this.markPublicationDelivered(item.payload.publicationId);
-						this.deferredPublications.delete(item.payload.publicationId);
-					}
-					if (!delivered && item.payload.publicationId) {
-						await this.markPublicationRejected(item.payload.publicationId);
-						this.deferredPublications.delete(item.payload.publicationId);
+					if (item.payload.publicationId) {
+						try {
+							if (delivered) await this.markPublicationDelivered(item.payload.publicationId);
+							else await this.markPublicationRejected(item.payload.publicationId);
+							this.deferredPublications.delete(item.payload.publicationId);
+						} catch (error) {
+							this.rejectPublicationSettlement(item.payload.publicationId, error);
+							throw error;
+						}
 					}
 				} catch {
 					this.finishSelectedAck(selectedAck, { status: "unknown", reason: "transport_ambiguous" });

@@ -156,8 +156,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 93 aborts provider delivery immediately and resets failed settlement
  * resolvers before same-daemon replay.
  * Generation 94 wires the immediate delivery abort into every publication call.
+ * Generation 95 propagates selected-ack receipt persistence failure to Router.
  */
-export const DAEMON_GENERATION = 94;
+export const DAEMON_GENERATION = 95;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -197,5 +198,6 @@ export const DAEMON_GENERATION = 94;
  * Epoch 39 propagates terminal receipt persistence failure to Router shutdown.
  * Epoch 40 closes hanging-delivery shutdown and transient persistence replay.
  * Epoch 41 closes ordinary publication hangs during shutdown.
+ * Epoch 42 closes selected terminal receipt persistence settlement.
  */
-export const SERVING_EPOCH = 41;
+export const SERVING_EPOCH = 42;
