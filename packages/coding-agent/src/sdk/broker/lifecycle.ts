@@ -72,6 +72,13 @@ import {
 	processIncarnation,
 } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
+import {
+	cancellableSleep,
+	DEFAULT_READINESS_TIMEOUT_MS,
+	isValidReadinessTimeoutMs,
+	READINESS_TIMEOUT_INVALID_MESSAGE,
+	startupQueueWaitMs,
+} from "./startup-budget";
 
 export {
 	type ProcessIncarnationCommandRunner,
@@ -80,9 +87,6 @@ export {
 	processIncarnation,
 };
 
-const READY_TIMEOUT_MS = 10_000;
-const MIN_READY_TIMEOUT_MS = 4_000;
-const MAX_READY_TIMEOUT_MS = 60_000;
 const POLL_MS = 50;
 const CLOSE_TIMEOUT_MS = 2_000;
 const MAX_RECEIVED_AT_SKEW_MS = 5_000;
@@ -99,12 +103,7 @@ export interface LifecycleDeadlines {
 }
 
 export function deriveLifecycleDeadlines(receivedAt: number, requestedReadinessTimeoutMs: number): LifecycleDeadlines {
-	if (
-		!Number.isSafeInteger(receivedAt) ||
-		!Number.isSafeInteger(requestedReadinessTimeoutMs) ||
-		requestedReadinessTimeoutMs < MIN_READY_TIMEOUT_MS ||
-		requestedReadinessTimeoutMs > MAX_READY_TIMEOUT_MS
-	)
+	if (!Number.isSafeInteger(receivedAt) || !isValidReadinessTimeoutMs(requestedReadinessTimeoutMs))
 		throw new Error("Lifecycle timing values must be safe integers in the approved readiness range.");
 	const phaseWindowMs = Math.min(1_000, Math.max(500, Math.floor(requestedReadinessTimeoutMs / 4)));
 	const lifecycleCleanupDeadlineAt = receivedAt + requestedReadinessTimeoutMs;
@@ -128,13 +127,10 @@ export function deriveLifecycleDeadlines(receivedAt: number, requestedReadinessT
 
 export interface LifecycleTiming {
 	now(): number;
-	sleep(ms: number): Promise<void>;
+	sleep(ms: number, signal?: AbortSignal): Promise<void>;
 }
 
-const defaultLifecycleTiming: LifecycleTiming = {
-	now: Date.now,
-	sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
-};
+const defaultLifecycleTiming: LifecycleTiming = { now: Date.now, sleep: cancellableSleep };
 const lifecycleTimingsForTest = new WeakMap<Broker, LifecycleTiming>();
 type LifecycleCommand = SdkInternalSpawnCommand | { file: string; args: string[] };
 type LifecycleCommandResolver = () => LifecycleCommand;
@@ -492,17 +488,8 @@ export function validateBrokerModelPresetForTest(agentDir: string, requestedProf
 
 function readinessTimeout(input: Input): number | BrokerResponse {
 	const value = input.readinessTimeoutMs;
-	if (value === undefined) return READY_TIMEOUT_MS;
-	if (
-		typeof value !== "number" ||
-		!Number.isSafeInteger(value) ||
-		value < MIN_READY_TIMEOUT_MS ||
-		value > MAX_READY_TIMEOUT_MS
-	)
-		return fail(
-			"invalid_input",
-			`readinessTimeoutMs must be an integer between ${MIN_READY_TIMEOUT_MS} and ${MAX_READY_TIMEOUT_MS}.`,
-		);
+	if (value === undefined) return DEFAULT_READINESS_TIMEOUT_MS;
+	if (!isValidReadinessTimeoutMs(value)) return fail("invalid_input", READINESS_TIMEOUT_INVALID_MESSAGE);
 	return value;
 }
 
@@ -3125,20 +3112,21 @@ async function executeLifecycleResponse(
 				input.terminationStartDeadlineAt,
 				input.lifecycleCleanupDeadlineAt,
 			];
-			let queueWaitMs: number;
+			let requestedReadinessTimeoutMs: number;
 			if (suppliedDeadlineFields.some(value => value !== undefined)) {
 				const supplied = lifecycleDeadlines(input, timing.now());
 				if ("ok" in supplied) return supplied;
-				queueWaitMs = supplied.requestedReadinessTimeoutMs;
+				requestedReadinessTimeoutMs = supplied.requestedReadinessTimeoutMs;
 			} else {
 				const timeout = readinessTimeout(input);
 				if (typeof timeout !== "number") return timeout;
-				queueWaitMs = timeout;
+				requestedReadinessTimeoutMs = timeout;
 			}
+			const queueWaitMs = startupQueueWaitMs(requestedReadinessTimeoutMs);
 			const launch = await launchInput(broker, operation, input);
 			if ("ok" in launch) return launch;
 			const admitted = await broker.runStartup(queueWaitMs, timing, async admittedAt => {
-				const admittedInput = { ...input, ...deriveLifecycleDeadlines(admittedAt, queueWaitMs) };
+				const admittedInput = { ...input, ...deriveLifecycleDeadlines(admittedAt, requestedReadinessTimeoutMs) };
 				startupAdmittedInputs.add(admittedInput);
 				startupLaunchInputs.set(admittedInput, launch);
 				try {
@@ -3149,6 +3137,11 @@ async function executeLifecycleResponse(
 				}
 			});
 			if (admitted.status === "completed") return admitted.value;
+			if (admitted.status === "admission_refused")
+				return fail(
+					"startup_admission_refused",
+					"SDK host startup was refused because the broker no longer owns the session root.",
+				);
 			const failure = normalizeSdkStartupFailure("startup", admitted.reason);
 			return fail("startup_admission_timeout", failure.message);
 		}
@@ -3250,41 +3243,49 @@ async function executeLifecycleResponse(
 		let child: ChildProcess | undefined;
 		let spawnedAuthority: EffectMarker | undefined;
 		try {
-			const cmd = command(broker);
-			const spawned = spawn(cmd.file, cmd.args, {
-				cwd: launch.cwd,
-				detached: true,
-				stdio: "ignore",
-				env: {
-					...("kind" in cmd ? cmd.env : process.env),
-					GJC_AGENT_DIR: broker.settings.agentDir,
-					GJC_CODING_AGENT_DIR: broker.settings.agentDir,
-					GJC_SESSION_ID: launch.id,
-					GJC_STATE_ROOT: launch.root,
-					GJC_LIFECYCLE_REQUEST_ID: effectMarker,
-					GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
-					// Coordinator-correlation env scoped to this designated launch only (#2549).
-					// The runtime sidecar reads these to write terminal state to the
-					// coordinator-shared file instead of an unread session-local fallback.
-					// The broker computes the file path from coordinatorStateDir + launch.id
-					// because the session ID is generated at spawn time.
-					...(launch.coordinatorStateDir
-						? {
-								[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: path.join(
-									launch.coordinatorStateDir,
-									"session-states",
-									`${launch.id}.json`,
-								),
-							}
-						: {}),
-					...(launch.coordinatorSessionId
-						? { [GJC_COORDINATOR_SESSION_ID_ENV]: launch.coordinatorSessionId }
-						: {}),
-					...(launch.coordinatorSessionBranch
-						? { [GJC_COORDINATOR_SESSION_BRANCH_ENV]: launch.coordinatorSessionBranch }
-						: {}),
-				},
+			const authorizedSpawn = broker.runSynchronousEffectWithFreshPublicationAuthority(() => {
+				const cmd = command(broker);
+				return spawn(cmd.file, cmd.args, {
+					cwd: launch.cwd,
+					detached: true,
+					stdio: "ignore",
+					env: {
+						...("kind" in cmd ? cmd.env : process.env),
+						GJC_AGENT_DIR: broker.settings.agentDir,
+						GJC_CODING_AGENT_DIR: broker.settings.agentDir,
+						GJC_SESSION_ID: launch.id,
+						GJC_STATE_ROOT: launch.root,
+						GJC_LIFECYCLE_REQUEST_ID: effectMarker,
+						GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
+						// Coordinator-correlation env scoped to this designated launch only (#2549).
+						// The runtime sidecar reads these to write terminal state to the
+						// coordinator-shared file instead of an unread session-local fallback.
+						// The broker computes the file path from coordinatorStateDir + launch.id
+						// because the session ID is generated at spawn time.
+						...(launch.coordinatorStateDir
+							? {
+									[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: path.join(
+										launch.coordinatorStateDir,
+										"session-states",
+										`${launch.id}.json`,
+									),
+								}
+							: {}),
+						...(launch.coordinatorSessionId
+							? { [GJC_COORDINATOR_SESSION_ID_ENV]: launch.coordinatorSessionId }
+							: {}),
+						...(launch.coordinatorSessionBranch
+							? { [GJC_COORDINATOR_SESSION_BRANCH_ENV]: launch.coordinatorSessionBranch }
+							: {}),
+					},
+				});
 			});
+			if (!authorizedSpawn.authorized)
+				return fail(
+					"startup_admission_refused",
+					"SDK host startup was refused because the broker no longer owns the session root.",
+				);
+			const spawned = authorizedSpawn.value;
 			child = spawned;
 			const pid = spawned.pid;
 			if (!pid) throw new Error("spawned session has no pid");

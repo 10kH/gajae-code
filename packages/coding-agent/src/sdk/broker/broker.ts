@@ -65,6 +65,7 @@ export type BrokerErrorCode =
 	| "invalid_input"
 	| "spawn_failed"
 	| "startup_admission_timeout"
+	| "startup_admission_refused"
 	| "readiness_timeout"
 	| "close_refused"
 	| "not_found"
@@ -554,15 +555,17 @@ const BROKER_SETTLEMENT_MS = 2_000;
 
 export interface StartupAdmissionTiming {
 	now(): number;
-	sleep(ms: number): Promise<void>;
+	sleep(ms: number, signal?: AbortSignal): Promise<void>;
 }
 
 export type StartupAdmissionResult<T> =
 	| { status: "completed"; admittedAt: number; value: T }
-	| { status: "admission_timeout"; reason: "admission_timeout" };
+	| { status: "admission_timeout"; reason: "admission_timeout" }
+	| { status: "admission_refused"; reason: "admission_refused" };
 
 interface StartupAdmissionWaiter {
-	state: "waiting" | "admitted" | "timed_out";
+	state: "waiting" | "admitted" | "timed_out" | "refused";
+	admissionEpoch?: number;
 	ready: PromiseWithResolvers<void>;
 }
 
@@ -575,6 +578,8 @@ export function sdkHostStartupConcurrency(availableParallelism = os.availablePar
 
 export class StartupAdmissionQueue {
 	#inFlight = 0;
+	#closed = false;
+	#epoch = 0;
 	#waiters: StartupAdmissionWaiter[] = [];
 
 	constructor(readonly limit: number) {
@@ -589,40 +594,53 @@ export class StartupAdmissionQueue {
 	): Promise<StartupAdmissionResult<T>> {
 		if (!Number.isSafeInteger(queueWaitMs) || queueWaitMs < 1)
 			throw new Error("SDK host startup queue wait must be a positive safe integer.");
+		if (this.#closed) return { status: "admission_refused", reason: "admission_refused" };
 		if (this.#inFlight < this.limit) return this.#runAdmitted(timing, task);
 
 		const ready = Promise.withResolvers<void>();
 		const waiter: StartupAdmissionWaiter = { state: "waiting", ready };
 		this.#waiters.push(waiter);
-		const outcome = await Promise.race([
-			ready.promise.then(() => "admitted" as const),
-			timing.sleep(queueWaitMs).then(() => {
-				if (waiter.state === "admitted") return "admitted" as const;
-				if (waiter.state === "timed_out") return "timed_out" as const;
-				waiter.state = "timed_out";
-				const index = this.#waiters.indexOf(waiter);
-				if (index >= 0) this.#waiters.splice(index, 1);
-				return "timed_out" as const;
-			}),
-		]);
+		const cutoff = new AbortController();
+		let outcome: "admitted" | "timed_out" | "refused";
+		try {
+			outcome = await Promise.race([
+				ready.promise.then(() => (waiter.state === "refused" ? ("refused" as const) : ("admitted" as const))),
+				timing.sleep(queueWaitMs, cutoff.signal).then(() => {
+					if (waiter.state === "admitted") return "admitted" as const;
+					if (waiter.state === "refused") return "refused" as const;
+					if (waiter.state === "timed_out") return "timed_out" as const;
+					waiter.state = "timed_out";
+					const index = this.#waiters.indexOf(waiter);
+					if (index >= 0) this.#waiters.splice(index, 1);
+					return "timed_out" as const;
+				}),
+			]);
+		} finally {
+			cutoff.abort();
+		}
 		if (outcome === "timed_out") return { status: "admission_timeout", reason: "admission_timeout" };
-		return this.#runGranted(timing, task);
+		if (outcome === "refused") return { status: "admission_refused", reason: "admission_refused" };
+		return this.#runGranted(waiter.admissionEpoch!, timing, task);
 	}
 
 	async #runAdmitted<T>(
 		timing: StartupAdmissionTiming,
 		task: (admittedAt: number) => Promise<T>,
 	): Promise<StartupAdmissionResult<T>> {
+		const admissionEpoch = this.#epoch;
 		this.#inFlight += 1;
-		return this.#runGranted(timing, task);
+		return this.#runGranted(admissionEpoch, timing, task);
 	}
 
 	async #runGranted<T>(
+		admissionEpoch: number,
 		timing: StartupAdmissionTiming,
 		task: (admittedAt: number) => Promise<T>,
 	): Promise<StartupAdmissionResult<T>> {
-		const admittedAt = timing.now();
 		try {
+			const admittedAt = timing.now();
+			if (this.#closed || admissionEpoch !== this.#epoch)
+				return { status: "admission_refused", reason: "admission_refused" };
 			return { status: "completed", admittedAt, value: await task(admittedAt) };
 		} finally {
 			this.#inFlight -= 1;
@@ -631,14 +649,39 @@ export class StartupAdmissionQueue {
 	}
 
 	#grantNext(): void {
+		if (this.#closed) return;
 		while (this.#inFlight < this.limit) {
 			const waiter = this.#waiters.shift();
 			if (!waiter) return;
 			if (waiter.state !== "waiting") continue;
 			waiter.state = "admitted";
+			waiter.admissionEpoch = this.#epoch;
 			this.#inFlight += 1;
 			waiter.ready.resolve();
 		}
+	}
+
+	/**
+	 * Refuse every queued startup and every later one. A broker that can no longer
+	 * prove it owns the published root must not spawn children through slots that
+	 * free up while it is fenced. The epoch also invalidates a waiter that was
+	 * granted but has not crossed the task execution boundary yet.
+	 */
+	close(): void {
+		if (this.#closed) return;
+		this.#closed = true;
+		this.#epoch += 1;
+		for (const waiter of this.#waiters.splice(0)) {
+			if (waiter.state !== "waiting") continue;
+			waiter.state = "refused";
+			waiter.ready.resolve();
+		}
+	}
+
+	/** Accept later startups after fresh publication ownership has been proven. */
+	reopen(): void {
+		this.#closed = false;
+		this.#grantNext();
 	}
 }
 type BrokerPublicationState =
@@ -833,6 +876,9 @@ export class Broker {
 			this.#resolveCompletion = completion.resolve;
 			this.#rejectCompletion = completion.reject;
 			this.#completionTask = null;
+			// A drained queue refuses every later startup by design, so a restarted broker
+			// needs a new one or it would admit nothing for the rest of the process.
+			this.#startupAdmissions = new StartupAdmissionQueue(sdkHostStartupConcurrency());
 		}
 		this.#stopping = false;
 		this.#publicationState = "healthy-owned";
@@ -935,6 +981,7 @@ export class Broker {
 	#fence(kind: "suspect-unpublished" | "observation-ambiguous" | "heartbeat-ambiguous"): void {
 		if (this.#publicationState === "stopping") return;
 		this.#publicationState = kind;
+		this.#startupAdmissions.close();
 		if (kind === "suspect-unpublished") {
 			this.#lossAt ??= process.hrtime.bigint();
 			this.#ambiguousAt = null;
@@ -967,11 +1014,13 @@ export class Broker {
 			return;
 		}
 		if (observation === "owned") {
-			if (this.#publicationState === "heartbeat-ambiguous") {
-				if (writeHeartbeat) await this.#writeHeartbeat();
-				return;
-			}
+			// Recover the cached publication state synchronously with the observation
+			// so request admission does not lag behind the awaited heartbeat IO.
+			// The heartbeat write that follows re-checks fresh publication authority
+			// and fences (downgrading this optimistic recovery) if ownership changed
+			// between the observation and the write.
 			this.#publicationState = "healthy-owned";
+			this.#startupAdmissions.reopen();
 			this.#lossAt = null;
 			this.#ambiguousAt = null;
 			if (writeHeartbeat) await this.#writeHeartbeat();
@@ -992,10 +1041,10 @@ export class Broker {
 			this.#fence("heartbeat-ambiguous");
 			return;
 		}
-		this.#publicationState = "healthy-owned";
-		this.#lossAt = null;
-		this.#ambiguousAt = null;
-		this.discovery = { ...this.discovery, heartbeatAt };
+		const recovery = this.runSynchronousEffectWithFreshPublicationAuthority(() => {
+			this.discovery = { ...this.discovery!, heartbeatAt };
+		});
+		if (!recovery.authorized) return;
 	}
 	async heartbeat(): Promise<void> {
 		if (this.#publicationState !== "healthy-owned") return;
@@ -1005,6 +1054,13 @@ export class Broker {
 		if (this.#completionTask) return this.#completionTask;
 		this.#stopping = true;
 		this.#publicationState = "stopping";
+		// A lost-root broker has been fenced: it no longer owns the published root, and
+		// its settlement is bounded, so any startup still queued behind it would be
+		// granted after completion and spawn a child the broker has no authority over.
+		// An owned-root stop keeps the queue open on purpose: the broker still owns
+		// everything it admitted, and completion waits unbounded for those startups, so
+		// draining would abandon work that is about to finish correctly.
+		if (mode === "lost-root") this.#startupAdmissions.close();
 		if (this.#heartbeatTimer) clearInterval(this.#heartbeatTimer);
 		this.#heartbeatTimer = null;
 		this.#completionTask = (async () => {
@@ -1031,8 +1087,53 @@ export class Broker {
 		void this.#completionTask.then(this.#resolveCompletion, this.#rejectCompletion);
 		return this.#completionTask;
 	}
+	/**
+	 * Fresh, uncached proof that this broker still publishes the discovery root.
+	 * The cached state is not proof: the watchdog observes on a cadence, so a
+	 * replacement can already be on disk without having been seen yet.
+	 */
+	#provenOwnedRoot(): boolean {
+		if (!this.#publication || this.#publicationState !== "healthy-owned") return false;
+		try {
+			return (publicationObservationOverridesForTest.get(this) ?? this.#publication.observe()) === "owned";
+		} catch {
+			return false;
+		}
+	}
+	/**
+	 * Revalidate retained publication ownership and begin one synchronous effect in
+	 * the same stack. The callback is the authority boundary: callers must perform
+	 * the authorized effect inside it, so no awaited work can separate proof from
+	 * the effect it authorizes.
+	 */
+	runSynchronousEffectWithFreshPublicationAuthority<T>(
+		effect: () => T,
+		..._synchronousOnly: T extends PromiseLike<unknown> ? [never] : []
+	): { authorized: true; value: T } | { authorized: false } {
+		if (!this.#publication || this.#publicationState === "stopping") return { authorized: false };
+		let observation: BrokerPublicationObservation;
+		try {
+			observation = publicationObservationOverridesForTest.get(this) ?? this.#publication.observe();
+		} catch {
+			this.#fence("observation-ambiguous");
+			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
+			return { authorized: false };
+		}
+		if (observation !== "owned") {
+			this.#fence(observation === "ambiguous" ? "observation-ambiguous" : "suspect-unpublished");
+			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
+			return { authorized: false };
+		}
+		return { authorized: true, value: effect() };
+	}
+	/**
+	 * A stop may take the owning path only while it can prove it still owns the root.
+	 * Claiming ownership it cannot prove keeps the admission queue open, so a startup
+	 * queued behind this broker is granted a slot that frees after completion and
+	 * spawns a child the broker has no authority over.
+	 */
 	async stop(): Promise<void> {
-		await this.#complete("owned-root");
+		await this.#complete(this.#provenOwnedRoot() ? "owned-root" : "lost-root");
 	}
 	async #endpoint(input: Record<string, unknown>): Promise<BrokerResponse> {
 		const sessionId = input.sessionId;
