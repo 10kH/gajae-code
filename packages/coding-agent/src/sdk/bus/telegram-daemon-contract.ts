@@ -150,8 +150,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 88 rejects all queued publications before Router shutdown, disables
  * implicit provider retries, and durably joins receipt persistence.
  * Generation 89 rejects all pool submissions once a stop is requested.
+ * Generation 90 terminalizes replay-queued publications before Router shutdown.
  */
-export const DAEMON_GENERATION = 89;
+export const DAEMON_GENERATION = 90;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -186,5 +187,6 @@ export const DAEMON_GENERATION = 89;
  * Epoch 34 requires control-file exits to terminalize queued publications first.
  * Epoch 35 requires complete publication teardown and single-attempt dispatch.
  * Epoch 36 closes the retry-after-stop queue race.
+ * Epoch 37 closes replay-queue settlement during stop.
  */
-export const SERVING_EPOCH = 36;
+export const SERVING_EPOCH = 37;

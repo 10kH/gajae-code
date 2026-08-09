@@ -4439,6 +4439,15 @@ export class TelegramNotificationDaemon {
 			item.payload.btwDelivery?.finish("uncertain");
 			this.rejectRemovedPublication(item);
 		}
+		for (const session of this.sessions.values()) {
+			for (const item of session.replayQueue) {
+				if (!item.publicationId) continue;
+				this.deferredPublications.delete(item.publicationId);
+				this.markPublicationRejected(item.publicationId).catch(() => undefined);
+			}
+			session.replayQueue = [];
+			session.replayPending = false;
+		}
 		this.#stoppingBtw = true;
 		for (const delivery of this.#btwTerminalDeliveries.values()) {
 			delivery.invalidated = true;
