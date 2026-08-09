@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "../src/config/settings";
+import { daemonPaths } from "../src/sdk/bus/daemon-paths";
 import { DAEMON_GENERATION, hasSafeDaemonStateShape, TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
 import type { AgentDirSessionLifecycleService } from "../src/sdk/lifecycle/client";
 
@@ -113,6 +114,14 @@ describe("Telegram provider supervisor ownership", () => {
 			const restartedDelivered = makeHarness();
 			await restartedDelivered.loadPresentationState();
 			expect(restartedDelivered.publicationShouldSuppress("session:60:1")).toBe(true);
+
+			fs.writeFileSync(
+				path.join(daemonPaths(agentDir).dir, "telegram-presentation-state.json"),
+				`${JSON.stringify({ version: 1, delivered: { "legacy:60:1": Date.now() } })}\n`,
+			);
+			const restartedLegacy = makeHarness();
+			await restartedLegacy.loadPresentationState();
+			expect(restartedLegacy.publicationShouldSuppress("legacy:60:1")).toBe(false);
 		} finally {
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}

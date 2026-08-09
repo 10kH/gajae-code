@@ -100,13 +100,16 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * restores actor-scoped create throttling, and exact-unlinks ownership locks.
  * Generation 61 durably claims provider publication identities before dispatch
  * and retains ambiguous claims across restart to prevent duplicate effects.
+ * Generation 62 confirms receipts only from accepted provider outcomes,
+ * retains queued/fallback claims, and quarantines legacy v1 confirmations.
  */
-export const DAEMON_GENERATION = 61;
+export const DAEMON_GENERATION = 62;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
  * requires durable publication receipts and acknowledged attachment dispatch,
  * so epoch-6 daemons cannot serve across the delivery-safety cutover. Epoch 8
- * requires the durable claimed/confirmed publication receipt format.
+ * requires the durable claimed/confirmed publication receipt format. Epoch 9
+ * requires accepted-only confirmation and legacy receipt quarantine.
  */
-export const SERVING_EPOCH = 8;
+export const SERVING_EPOCH = 9;
