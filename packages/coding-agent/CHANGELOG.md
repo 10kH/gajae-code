@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.21] - 2026-08-09
+
 ### Fixed
 - Strict session resume now sanitizes stale replay metadata in memory without mutating the selected transcript, then publishes the terminal resume breadcrumb only after the first durable user-visible write. Declined auto-continuations restore their deferred predecessor terminal instead of dropping client settlement evidence.
 - Todo completion reminders now honor `todo.reminders.max` across an interactive turn rather than stopping after the first reminder.
