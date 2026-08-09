@@ -152,8 +152,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 89 rejects all pool submissions once a stop is requested.
  * Generation 90 terminalizes replay-queued publications before Router shutdown.
  * Generation 91 routes selected-ack retries through the stop admission fence.
+ * Generation 92 rejects Router waiters when terminal receipt persistence fails.
  */
-export const DAEMON_GENERATION = 91;
+export const DAEMON_GENERATION = 92;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -190,5 +191,6 @@ export const DAEMON_GENERATION = 91;
  * Epoch 36 closes the retry-after-stop queue race.
  * Epoch 37 closes replay-queue settlement during stop.
  * Epoch 38 closes selected-ack retry-after-stop settlement.
+ * Epoch 39 propagates terminal receipt persistence failure to Router shutdown.
  */
-export const SERVING_EPOCH = 38;
+export const SERVING_EPOCH = 39;

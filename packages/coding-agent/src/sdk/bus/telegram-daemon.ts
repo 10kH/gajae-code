@@ -4443,7 +4443,9 @@ export class TelegramNotificationDaemon {
 			for (const item of session.replayQueue) {
 				if (!item.publicationId) continue;
 				this.deferredPublications.delete(item.publicationId);
-				this.markPublicationRejected(item.publicationId).catch(() => undefined);
+				this.markPublicationRejected(item.publicationId).catch(error =>
+					this.rejectPublicationSettlement(item.publicationId!, error),
+				);
 			}
 			session.replayQueue = [];
 			session.replayPending = false;
@@ -5443,6 +5445,13 @@ export class TelegramNotificationDaemon {
 		settlement.resolve();
 	}
 
+	private rejectPublicationSettlement(publicationId: string, error: unknown): void {
+		const settlement = this.publicationSettlements.get(publicationId);
+		if (!settlement) return;
+		settlement.reject(error);
+		void settlement.promise.catch(() => undefined);
+	}
+
 	private resetPublicationSettlement(publicationId: string | undefined): void {
 		if (!publicationId || this.publicationSettlements.has(publicationId)) return;
 		this.publicationSettlements.set(publicationId, Promise.withResolvers<void>());
@@ -5880,7 +5889,9 @@ export class TelegramNotificationDaemon {
 		if (isCurrentSession)
 			for (const publicationId of this.publicationSettlements.keys())
 				if (publicationId.startsWith(`${session.sessionId}:`))
-					this.markPublicationRejected(publicationId).catch(() => undefined);
+					this.markPublicationRejected(publicationId).catch(error =>
+						this.rejectPublicationSettlement(publicationId, error),
+					);
 		if (isCurrentSession) this.cancelLegacyToolStartsForSession(session);
 		if (isCurrentSession) this.scheduleVisibleToolTerminalization(session.attachmentKey).catch(() => undefined);
 		const clearIntervalImpl = this.opts.clearIntervalImpl ?? clearInterval;
@@ -6922,7 +6933,9 @@ export class TelegramNotificationDaemon {
 			for (const frame of removed)
 				if (frame.publicationId) {
 					this.deferredPublications.delete(frame.publicationId);
-					this.markPublicationRejected(frame.publicationId).catch(() => undefined);
+					this.markPublicationRejected(frame.publicationId).catch(error =>
+						this.rejectPublicationSettlement(frame.publicationId!, error),
+					);
 				}
 			if (retained.length === 0) this.pendingThreadedFrames.delete(sessionId);
 			else if (retained.length !== frames.length) this.pendingThreadedFrames.set(sessionId, retained);
@@ -8246,7 +8259,9 @@ export class TelegramNotificationDaemon {
 		const publicationId = item.payload.publicationId;
 		if (!publicationId) return;
 		this.deferredPublications.delete(publicationId);
-		this.markPublicationRejected(publicationId).catch(() => undefined);
+		this.markPublicationRejected(publicationId).catch(error =>
+			this.rejectPublicationSettlement(publicationId, error),
+		);
 	}
 	private submitPool(item: Parameters<RateLimitPool<TelegramQueuePayload>["submit"]>[0]): boolean {
 		if (this.stopRequested || this.effects.stopping) return false;
