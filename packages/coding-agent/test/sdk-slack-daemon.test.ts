@@ -6,10 +6,11 @@ import { ChatDeliveryError } from "../src/sdk/bus/chat-daemon-runtime";
 import { ChatEffectJournal } from "../src/sdk/bus/chat-effect-journal";
 import { ConversationStore } from "../src/sdk/bus/conversation-store";
 import type { SlackConversation } from "../src/sdk/bus/slack-conversation";
-import { type SlackEndpoint, SlackEndpointBindingError, SlackNotificationDaemon } from "../src/sdk/bus/slack-daemon";
+import { SlackEndpointBindingError, SlackNotificationDaemon } from "../src/sdk/bus/slack-daemon";
 import { SlackProviderError } from "../src/sdk/bus/slack-live-provider";
 import { SlackProvider, type SlackSocketEnvelope } from "../src/sdk/bus/slack-provider";
 import { SdkClientError } from "../src/sdk/client/client";
+import type { SessionAttachment } from "../src/sdk/router";
 
 class FakeSlack {
 	handler: ((envelope: SlackSocketEnvelope) => void | Promise<void>) | undefined;
@@ -118,8 +119,8 @@ class FakeSlack {
 	}
 }
 
-function endpoint(sessionId: string, generation = 1): SlackEndpoint {
-	return { sessionId, url: "ws://localhost", token: "not-persisted", path: "", generation };
+function endpoint(sessionId: string, generation = 1): SessionAttachment {
+	return { sessionId, generation, isCurrent: () => true, send: () => undefined };
 }
 
 type LoadBarrier = {
@@ -157,7 +158,7 @@ async function withDaemon(
 	) => Promise<void>,
 	options: {
 		onCommand?: (sessionId: string, content: string) => Promise<boolean>;
-		createClient?: (injected: Array<Record<string, unknown>>) => { send(frame: Record<string, unknown>): void };
+		attachmentSend?: (injected: Array<Record<string, unknown>>) => { send(frame: Record<string, unknown>): void };
 		authorizeActor?: ((actorId: string) => boolean | Promise<boolean>) | false;
 	} = {},
 ): Promise<void> {
@@ -167,6 +168,7 @@ async function withDaemon(
 		const fake = new FakeSlack();
 		const injected: Array<Record<string, unknown>> = [];
 		let endpointGeneration = 1;
+		const attachment = options.attachmentSend?.(injected);
 		let id = 0;
 		daemon = new SlackNotificationDaemon({
 			agentDir,
@@ -175,13 +177,13 @@ async function withDaemon(
 			channelId: "C1",
 			provider: new SlackProvider(fake),
 			randomId: () => `client-id-${++id}`,
-			createClient: () =>
-				options.createClient?.(injected) ?? {
-					send(frame: Record<string, unknown>) {
-						injected.push(frame);
-					},
+			resolveAttachment: async sessionId => ({
+				...endpoint(sessionId, endpointGeneration),
+				send: (frame: Record<string, unknown>) => {
+					if (attachment) attachment.send(frame);
+					else injected.push(frame);
 				},
-			resolveEndpoint: async sessionId => endpoint(sessionId, endpointGeneration),
+			}),
 			onCommand: options.onCommand,
 			...(options.authorizeActor === false
 				? {}
@@ -320,8 +322,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(fake),
 				randomId: () => "root-client-id",
-				createClient: () => ({ send(_frame: Record<string, unknown>) {} }),
-				resolveEndpoint: async (sessionId: string) => endpoint(sessionId),
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
 			};
 			const [first, second] = await Promise.all([
 				new SlackNotificationDaemon(options).postRoot("session", "root"),
@@ -345,8 +346,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(fake),
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async (sessionId: string) => endpoint(sessionId),
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
 				now: () => now,
 				publicationLeaseMs: 10,
 			};
@@ -397,8 +397,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(fake),
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async (sessionId: string) => endpoint(sessionId),
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
 				publicationLeaseMs: 15,
 			};
 			const first = new SlackNotificationDaemon({
@@ -461,8 +460,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(fake),
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async (sessionId: string) => endpoint(sessionId),
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
 				publicationLeaseMs: 15,
 			};
 			const root = new SlackNotificationDaemon({ ...base, randomId: () => "root", publicationOwnerId: "root" });
@@ -554,8 +552,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(fake),
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async (sessionId: string) => endpoint(sessionId),
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
 				publicationLeaseMs: 1_000,
 			};
 			const root = new SlackNotificationDaemon({
@@ -760,8 +757,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(fake),
 				store,
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async sessionId => endpoint(sessionId, generation),
+				resolveAttachment: async sessionId => endpoint(sessionId, generation),
 			});
 			await daemon.postRoot("session", "generation one", 1);
 			generation = 2;
@@ -820,8 +816,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				store,
 				publicationOwnerId,
 				randomId: () => `client-${++id}`,
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async (sessionId: string) => endpoint(sessionId, generation),
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId, generation),
 			});
 			const initial = new SlackNotificationDaemon(options(new BlockingSlackStore(agentDir, barrier), "initial"));
 			await initial.postRoot("session", "generation one", 1);
@@ -892,8 +887,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(fake),
 				randomId: () => "root-client",
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async (sessionId: string) => endpoint(sessionId),
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
 			};
 			const first = new SlackNotificationDaemon(options);
 			const posted = await first.postRoot("session", "root");
@@ -935,8 +929,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(fake),
 				randomId: () => `client-${++id}`,
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async (sessionId: string) => endpoint(sessionId),
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
 			};
 			const first = new SlackNotificationDaemon(options);
 			const root = await first.postRoot("session", "root");
@@ -983,8 +976,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(fake),
 				randomId: () => `client-${++id}`,
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async (sessionId: string) => endpoint(sessionId),
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
 				authorizeActor: (actorId: string) => actorId === "U1",
 			};
 			const first = new SlackNotificationDaemon(options);
@@ -1024,7 +1016,10 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			};
 			restarted = new SlackNotificationDaemon({
 				...options,
-				createClient: () => ({ send: frame => injected.push(frame) }),
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					send: (frame: Record<string, unknown>) => injected.push(frame),
+				}),
 			});
 			await restarted.start();
 			expect(fake.acks).toContain("early");
@@ -1217,8 +1212,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(fake),
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async sessionId => endpoint(sessionId, generation),
+				resolveAttachment: async sessionId => endpoint(sessionId, generation),
 			});
 			const original = await daemon.postRoot("session", "root", 1);
 			await new ChatEffectJournal({ agentDir, transport: "slack" }).enqueue({
@@ -1300,8 +1294,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(firstProvider),
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
+				resolveAttachment: async sessionId => endpoint(sessionId),
 				authorizeActor: actorId => actorId === "U1",
 				onCommand: async () => {
 					throw new Error("command must not run before ACK");
@@ -1327,8 +1320,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(new FakeSlack()),
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
+				resolveAttachment: async sessionId => endpoint(sessionId),
 				authorizeActor: actorId => actorId === "U1",
 				onCommand: async (_sessionId, _content, _endpoint, idempotencyKey) => {
 					keys.push(idempotencyKey);
@@ -1401,8 +1393,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(firstFake),
 				randomId: () => "client-id",
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
+				resolveAttachment: async sessionId => endpoint(sessionId),
 			});
 			const root = await first.postRoot("session", "root");
 			await first.notify("session", "question", "restored-action");
@@ -1414,12 +1405,10 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(new FakeSlack()),
 				randomId: () => "client-id",
-				createClient: () => ({
-					send(frame) {
-						injected.push(frame);
-					},
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					send: (frame: Record<string, unknown>) => injected.push(frame),
 				}),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
 				authorizeActor: actorId => actorId === "U1",
 			});
 			expect(
@@ -1484,7 +1473,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				expect(injected).toHaveLength(1);
 			},
 			{
-				createClient: injected => ({
+				attachmentSend: injected => ({
 					send(frame) {
 						if (fail) {
 							fail = false;
@@ -1506,12 +1495,12 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(new FakeSlack()),
-				createClient: () => ({
-					send() {
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					send: () => {
 						throw new SdkClientError("connection_closed", "before send");
 					},
 				}),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
 				authorizeActor: actorId => actorId === "U1",
 			});
 			const root = await first.postRoot("session", "root");
@@ -1528,8 +1517,10 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(new FakeSlack()),
-				createClient: () => ({ send: frame => replayed.push(frame) }),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					send: (frame: Record<string, unknown>) => replayed.push(frame),
+				}),
 				authorizeActor: actorId => actorId === "U1",
 			});
 			await restarted.start();
@@ -1566,8 +1557,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(firstFake),
 				randomId: () => "client-id",
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
+				resolveAttachment: async sessionId => endpoint(sessionId),
 				authorizeActor: actorId => actorId === "U1",
 			});
 			const root = await first.postRoot("session", "root");
@@ -1587,8 +1577,10 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(new FakeSlack()),
 				randomId: () => "client-id",
-				createClient: () => ({ send: frame => replayed.push(frame) }),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					send: (frame: Record<string, unknown>) => replayed.push(frame),
+				}),
 				authorizeActor: actorId => actorId === "U1",
 			});
 			await restarted.start();
@@ -1620,7 +1612,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				expect(sent).toBe(true);
 			},
 			{
-				createClient: injected => ({
+				attachmentSend: injected => ({
 					send(frame) {
 						if (swapped) throw new SlackEndpointBindingError();
 						sent = true;
@@ -1738,7 +1730,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				);
 			},
 			{
-				createClient: injected => ({
+				attachmentSend: injected => ({
 					send(frame) {
 						injected.push(frame);
 						throw new SdkClientError("unavailable", "accepted then disconnected");
@@ -1757,12 +1749,13 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(new FakeSlack()),
-				createClient: () => ({
-					send() {
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					send: () => {
 						throw new SdkClientError("unavailable", "accepted then disconnected");
 					},
 				}),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
+
 				authorizeActor: actorId => actorId === "U1",
 			});
 			const root = await first.postRoot("session", "root");
@@ -1786,8 +1779,10 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(new FakeSlack()),
-				createClient: () => ({ send: frame => replayed.push(frame) }),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					send: (frame: Record<string, unknown>) => replayed.push(frame),
+				}),
 				authorizeActor: actorId => actorId === "U1",
 			});
 			await restarted.start();
@@ -1807,8 +1802,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(new FakeSlack()),
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
+				resolveAttachment: async sessionId => endpoint(sessionId),
 			});
 			const original = await first.postRoot("session", "original root");
 			const effectId = `inbound:T1:C1:${original.rootTs}:U1:event-1:interaction-1`;
@@ -1845,8 +1839,10 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(new FakeSlack()),
-				createClient: () => ({ send: frame => injected.push(frame) }),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					send: (frame: Record<string, unknown>) => injected.push(frame),
+				}),
 			});
 			const replacement = await restarted.resume("session", "replacement root");
 			expect(replacement.rootTs).not.toBe(original.rootTs);
@@ -1874,8 +1870,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(fake),
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async sessionId => endpoint(sessionId, generation),
+				resolveAttachment: async sessionId => endpoint(sessionId, generation),
 			});
 			await daemon.postRoot("session", "root");
 			fake.onFind = async () => {
@@ -1907,13 +1902,12 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(fake),
 				now: () => now,
-				createClient: () => ({ send: frame => injected.push(frame) }),
-				resolveEndpoint: async sessionId => {
+				resolveAttachment: async sessionId => {
 					if (failScheduledDrain) {
 						scheduledDrainFailed.resolve();
 						throw new Error("transient endpoint lookup failure");
 					}
-					return endpoint(sessionId);
+					return { ...endpoint(sessionId), send: (frame: Record<string, unknown>) => injected.push(frame) };
 				},
 				authorizeActor: actorId => actorId === "U1",
 			});

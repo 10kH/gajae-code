@@ -402,11 +402,13 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 			},
 			{
 				createSlackProvider: () => provider,
-				setInterval: ((callback: () => void) => {
-					reconcileTick = callback;
-					return 0;
-				}) as unknown as typeof setInterval,
-				clearInterval: (() => undefined) as unknown as typeof clearInterval,
+				routerDeps: {
+					setInterval: ((callback: () => void) => {
+						reconcileTick = callback;
+						return 0;
+					}) as unknown as typeof setInterval,
+					clearInterval: (() => undefined) as unknown as typeof clearInterval,
+				},
 			},
 		);
 		await run({

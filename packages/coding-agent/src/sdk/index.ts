@@ -24,5 +24,6 @@ export type {
 } from "./models";
 export * from "./prompt-status";
 export type { ActiveProviderConnectionKind, ActiveProviderDescriptor } from "./providers";
+export * as router from "./router";
 export * from "./session";
 export * from "./session-directory";

@@ -13,7 +13,7 @@ import {
 import { chatDaemonGeneration, chatDaemonIdentity, chatDaemonPaths } from "../src/sdk/bus/chat-daemon-control";
 import { ConversationStore, type ConversationStoreFs, conversationStorePath } from "../src/sdk/bus/conversation-store";
 import { type SlackConversation, slackConversationKey } from "../src/sdk/bus/slack-conversation";
-import { type SlackEndpoint, SlackNotificationDaemon } from "../src/sdk/bus/slack-daemon";
+import { SlackNotificationDaemon } from "../src/sdk/bus/slack-daemon";
 import { SlackProviderError } from "../src/sdk/bus/slack-live-provider";
 import { SlackProvider } from "../src/sdk/bus/slack-provider";
 import {
@@ -21,6 +21,7 @@ import {
 	isBoundedSlackRootTs,
 	SlackThreadBindingError,
 } from "../src/sdk/bus/slack-thread-binding";
+import type { SessionAttachment } from "../src/sdk/router";
 
 const TEAM = "T1";
 const CHANNEL = "C1";
@@ -61,8 +62,8 @@ class FakeSlack {
 	}
 }
 
-function endpoint(sessionId: string, generation: number): SlackEndpoint {
-	return { sessionId, url: "ws://localhost", token: "not-persisted", path: "", generation };
+function endpoint(sessionId: string, generation: number): SessionAttachment {
+	return { sessionId, generation, isCurrent: () => true, send: () => undefined };
 }
 
 function intentKey(sessionId: string): string {
@@ -124,8 +125,7 @@ async function withDaemon(
 			channelId: CHANNEL,
 			provider: new SlackProvider(fake),
 			randomId: () => `client-id-${++id}`,
-			createClient: () => ({ send: () => undefined }),
-			resolveEndpoint: async sessionId => endpoint(sessionId, generation),
+			resolveAttachment: async sessionId => endpoint(sessionId, generation),
 			...(createStore ? { store: createStore(agentDir) } : {}),
 		});
 		await run({

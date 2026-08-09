@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SessionIndex } from "../src/sdk/broker/session-index";
-import { ChatDaemonRuntime, type ChatDaemonSdkClient } from "../src/sdk/bus/chat-daemon-runtime";
+import { ChatDaemonRuntime } from "../src/sdk/bus/chat-daemon-runtime";
 import { ChatEffectJournal } from "../src/sdk/bus/chat-effect-journal";
 import { ConversationStore } from "../src/sdk/bus/conversation-store";
 import type {
@@ -15,6 +15,7 @@ import type {
 import { type SlackConversation, slackConversationKey } from "../src/sdk/bus/slack-conversation";
 import type { SlackProviderClient, SlackSocketEnvelope } from "../src/sdk/bus/slack-provider";
 import { SdkClientError } from "../src/sdk/client/client";
+import type { SessionRouterClient } from "../src/sdk/router";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 
 type SlackPost = { channel: string; text: string; threadTs?: string; clientMsgId: string };
@@ -184,7 +185,7 @@ class FakeDiscordProvider implements DiscordProvider {
 	}
 }
 
-class FakeSdkClient implements ChatDaemonSdkClient {
+class FakeSdkClient implements SessionRouterClient {
 	closed = false;
 	sent: Record<string, unknown>[] = [];
 	requests: Record<string, unknown>[] = [];
@@ -322,11 +323,13 @@ describe("chat daemon worker", () => {
 			},
 			{
 				createDiscordProvider: () => provider,
-				createClient: async () => client,
-				createBrokerClient: async () => brokerClient,
-				createIndex: () => index,
-				setInterval: (() => 0) as unknown as typeof setInterval,
-				clearInterval: (() => {}) as typeof clearInterval,
+				routerDeps: {
+					createClient: async () => client,
+					createBrokerClient: async () => brokerClient,
+					createIndex: () => index,
+					setInterval: (() => 0) as unknown as typeof setInterval,
+					clearInterval: (() => {}) as typeof clearInterval,
+				},
 			},
 		);
 
@@ -561,13 +564,15 @@ describe("chat daemon worker", () => {
 			},
 			{
 				createDiscordProvider: () => provider,
-				createClient: async endpoint => {
-					attachedToken = endpoint.token;
-					return client;
+				routerDeps: {
+					createClient: async endpoint => {
+						attachedToken = endpoint.token;
+						return client;
+					},
+					createIndex: () => index,
+					setInterval: (() => 0) as unknown as typeof setInterval,
+					clearInterval: (() => {}) as typeof clearInterval,
 				},
-				createIndex: () => index,
-				setInterval: (() => 0) as unknown as typeof setInterval,
-				clearInterval: (() => {}) as typeof clearInterval,
 			},
 		);
 		await runtime.start();
@@ -620,13 +625,15 @@ describe("chat daemon worker", () => {
 			},
 			{
 				createDiscordProvider: () => new FakeDiscordProvider(),
-				createClient: async () => {
-					connected = true;
-					return new FakeSdkClient();
+				routerDeps: {
+					createClient: async () => {
+						connected = true;
+						return new FakeSdkClient();
+					},
+					createIndex: () => index,
+					setInterval: (() => 0) as unknown as typeof setInterval,
+					clearInterval: (() => {}) as typeof clearInterval,
 				},
-				createIndex: () => index,
-				setInterval: (() => 0) as unknown as typeof setInterval,
-				clearInterval: (() => {}) as typeof clearInterval,
 			},
 		);
 		await runtime.start();
@@ -669,16 +676,18 @@ describe("chat daemon worker", () => {
 			},
 			{
 				createDiscordProvider: () => provider,
-				createClient: async endpoint => {
-					if (endpoint.token === "new-token") throw new Error("replacement unavailable");
-					return oldClient;
+				routerDeps: {
+					createClient: async endpoint => {
+						if (endpoint.token === "new-token") throw new Error("replacement unavailable");
+						return oldClient;
+					},
+					createIndex: () => index,
+					setInterval: ((callback: () => void) => {
+						tick = callback;
+						return 0;
+					}) as unknown as typeof setInterval,
+					clearInterval: (() => {}) as typeof clearInterval,
 				},
-				createIndex: () => index,
-				setInterval: ((callback: () => void) => {
-					tick = callback;
-					return 0;
-				}) as unknown as typeof setInterval,
-				clearInterval: (() => {}) as typeof clearInterval,
 			},
 		);
 		await runtime.start();
@@ -749,13 +758,15 @@ describe("chat daemon worker", () => {
 			},
 			{
 				createDiscordProvider: () => provider,
-				createClient: async endpoint => (endpoint.token === "old-token" ? oldClient : newClient),
-				createIndex: () => index,
-				setInterval: ((callback: () => void) => {
-					tick = callback;
-					return 0;
-				}) as unknown as typeof setInterval,
-				clearInterval: (() => {}) as typeof clearInterval,
+				routerDeps: {
+					createClient: async endpoint => (endpoint.token === "old-token" ? oldClient : newClient),
+					createIndex: () => index,
+					setInterval: ((callback: () => void) => {
+						tick = callback;
+						return 0;
+					}) as unknown as typeof setInterval,
+					clearInterval: (() => {}) as typeof clearInterval,
+				},
 			},
 		);
 		await runtime.start();
@@ -836,7 +847,7 @@ describe("chat daemon worker", () => {
 				},
 			},
 		};
-		const timerDeps = {
+		const routerDeps = {
 			createIndex: () => index,
 			setInterval: (() => 0) as unknown as typeof setInterval,
 			clearInterval: (() => {}) as typeof clearInterval,
@@ -844,10 +855,10 @@ describe("chat daemon worker", () => {
 		const firstProvider = new FakeSlackProvider();
 		const firstClient = new FakeSdkClient();
 		const firstRuntime = new ChatDaemonRuntime(runtimeInput, {
-			...timerDeps,
+			routerDeps: { ...routerDeps, createClient: async () => firstClient },
 			createSlackProvider: () => firstProvider,
-			createClient: async () => firstClient,
 		});
+
 		await firstRuntime.start();
 		firstClient.handler?.({
 			type: "action_needed",
@@ -864,9 +875,8 @@ describe("chat daemon worker", () => {
 		const restartedProvider = new FakeSlackProvider();
 		const restartedClient = new FakeSdkClient();
 		const restartedRuntime = new ChatDaemonRuntime(runtimeInput, {
-			...timerDeps,
+			routerDeps: { ...routerDeps, createClient: async () => restartedClient },
 			createSlackProvider: () => restartedProvider,
-			createClient: async () => restartedClient,
 		});
 		await restartedRuntime.start();
 		const persisted = await readConversation();
@@ -977,11 +987,13 @@ describe("chat daemon worker", () => {
 			},
 			{
 				createSlackProvider: () => provider,
-				createClient: async () => client,
-				createBrokerClient: async () => broker,
-				createIndex: () => index,
-				setInterval: (() => 0) as unknown as typeof setInterval,
-				clearInterval: (() => {}) as typeof clearInterval,
+				routerDeps: {
+					createClient: async () => client,
+					createBrokerClient: async () => broker,
+					createIndex: () => index,
+					setInterval: (() => 0) as unknown as typeof setInterval,
+					clearInterval: (() => {}) as typeof clearInterval,
+				},
 			},
 		);
 		await runtime.start();
@@ -1101,7 +1113,7 @@ describe("chat daemon worker", () => {
 				},
 			},
 		};
-		const timerDeps = {
+		const routerDeps = {
 			createIndex: () => index,
 			setInterval: (() => 0) as unknown as typeof setInterval,
 			clearInterval: (() => {}) as typeof clearInterval,
@@ -1115,10 +1127,10 @@ describe("chat daemon worker", () => {
 			throw new SdkClientError("connection_closed", "SDK connection closed after accepting the control request");
 		};
 		const firstRuntime = new ChatDaemonRuntime(runtimeInput, {
-			...timerDeps,
+			routerDeps: { ...routerDeps, createClient: async () => firstClient },
 			createSlackProvider: () => firstProvider,
-			createClient: async () => firstClient,
 		});
+
 		await firstRuntime.start();
 		const rootTs = "1.1";
 		expect(firstProvider.posts).toHaveLength(1);
@@ -1157,9 +1169,8 @@ describe("chat daemon worker", () => {
 		const restartedProvider = new FakeSlackProvider();
 		const restartedClient = new FakeSdkClient();
 		const restartedRuntime = new ChatDaemonRuntime(runtimeInput, {
-			...timerDeps,
+			routerDeps: { ...routerDeps, createClient: async () => restartedClient },
 			createSlackProvider: () => restartedProvider,
-			createClient: async () => restartedClient,
 		});
 		await restartedRuntime.start();
 		expect(restartedClient.requests).toEqual([expect.objectContaining({ type: "event_replay" })]);
@@ -1256,9 +1267,11 @@ describe("chat daemon worker", () => {
 				},
 				{
 					createDiscordProvider: () => provider,
-					createIndex: () => index,
-					setInterval: (() => 0) as unknown as typeof setInterval,
-					clearInterval: (() => {}) as typeof clearInterval,
+					routerDeps: {
+						createIndex: () => index,
+						setInterval: (() => 0) as unknown as typeof setInterval,
+						clearInterval: (() => {}) as typeof clearInterval,
+					},
 				},
 			);
 			const replayedThread = provider.waitForThreadCount(1);
@@ -1353,13 +1366,15 @@ describe("chat daemon worker", () => {
 					{ kind: "slack", agentDir, config },
 					{
 						createSlackProvider: () => provider,
-						createIndex: () => index,
-						onReconciled,
-						setInterval: ((callback: () => void) => {
-							tick = callback;
-							return 0;
-						}) as unknown as typeof setInterval,
-						clearInterval: (() => {}) as typeof clearInterval,
+						routerDeps: {
+							createIndex: () => index,
+							onReconciled,
+							setInterval: ((callback: () => void) => {
+								tick = callback;
+								return 0;
+							}) as unknown as typeof setInterval,
+							clearInterval: (() => {}) as typeof clearInterval,
+						},
 					},
 				);
 			try {
