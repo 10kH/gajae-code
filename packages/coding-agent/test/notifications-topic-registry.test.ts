@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes delivery-safe generation 60 at serving epoch 7", () => {
+test("publishes durable-claim generation 61 at serving epoch 8", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 60 / serving epoch 7: durable Router delivery receipts and acknowledged attachment dispatch.
-	expect(DAEMON_GENERATION).toBe(60);
-	expect(SERVING_EPOCH).toBe(7);
+	// Generation 61 / serving epoch 8: durable claimed/confirmed provider publication receipts.
+	expect(DAEMON_GENERATION).toBe(61);
+	expect(SERVING_EPOCH).toBe(8);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();

@@ -98,12 +98,15 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Telegram presentation bindings from SessionRouter attachments. Generation 60
  * persists Router publication receipts, awaits inbound attachment dispatch,
  * restores actor-scoped create throttling, and exact-unlinks ownership locks.
+ * Generation 61 durably claims provider publication identities before dispatch
+ * and retains ambiguous claims across restart to prevent duplicate effects.
  */
-export const DAEMON_GENERATION = 60;
+export const DAEMON_GENERATION = 61;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
  * requires durable publication receipts and acknowledged attachment dispatch,
- * so epoch-6 daemons cannot serve across the delivery-safety cutover.
+ * so epoch-6 daemons cannot serve across the delivery-safety cutover. Epoch 8
+ * requires the durable claimed/confirmed publication receipt format.
  */
-export const SERVING_EPOCH = 7;
+export const SERVING_EPOCH = 8;

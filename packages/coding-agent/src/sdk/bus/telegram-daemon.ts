@@ -357,14 +357,15 @@ const TELEGRAM_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024;
 const TELEGRAM_SESSION_ATTACHMENT_MAX_COUNT = 20;
 const TELEGRAM_SESSION_ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024;
 
-const TELEGRAM_PRESENTATION_STATE_VERSION = 1;
+const TELEGRAM_PRESENTATION_STATE_VERSION = 2;
 const TELEGRAM_PRESENTATION_STATE_LIMIT = 4_096;
 const TELEGRAM_CREATE_RATE_LIMIT_MAX = 3;
 const TELEGRAM_CREATE_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1_000;
 
 type TelegramPresentationState = {
-	version: typeof TELEGRAM_PRESENTATION_STATE_VERSION;
+	version: 1 | typeof TELEGRAM_PRESENTATION_STATE_VERSION;
 	delivered: Record<string, number>;
+	claimed?: Record<string, number>;
 };
 function publicationIdForEvent(sessionId: string, generation: unknown, event: unknown): string | undefined {
 	if (!Number.isSafeInteger(generation) || Number(generation) < 1) return undefined;
@@ -4258,6 +4259,9 @@ export class TelegramNotificationDaemon {
 	/** Serializes recovery compare/write/publish claims so competing endpoint migrations cannot durably diverge. */
 	/** Durable provider presentation identities; credentials and lifecycle state never enter this journal. */
 	private readonly deliveredPublications = new Map<string, number>();
+	private readonly claimedPublications = new Map<string, number>();
+	private readonly publicationsClaimedThisRun = new Set<string>();
+	private readonly deferredPublications = new Set<string>();
 	private presentationPersistenceQueue: Promise<void> = Promise.resolve();
 	/** Provider-owned create admission window, keyed by the authorized Telegram actor. */
 	private readonly createRateLimitHits = new Map<string, Array<{ requestKey: string; at: number }>>();
@@ -4879,9 +4883,12 @@ export class TelegramNotificationDaemon {
 	async #onRouterFrame(attachment: SessionAttachment, frame: SessionRouterFrame): Promise<void> {
 		const session = this.sessions.get(attachment.sessionId);
 		if (!session || session.attachment !== attachment || !attachment.isCurrent()) return;
+		if (this.publicationShouldSuppress(frame.publicationId)) return;
+		await this.claimPublication(frame.publicationId);
 		const replayPending = session.replayPending;
 		await this.effects.admit(() => this.handleSessionMessage(session, frame.body, frame.publicationId));
-		if (!replayPending) await this.markPublicationDelivered(frame.publicationId);
+		if (!replayPending && !this.deferredPublications.has(frame.publicationId ?? ""))
+			await this.markPublicationDelivered(frame.publicationId);
 	}
 
 	async #onSessionRemoved(attachment: SessionAttachment): Promise<void> {
@@ -5187,13 +5194,21 @@ export class TelegramNotificationDaemon {
 		return publicationId !== undefined && this.deliveredPublications.has(publicationId);
 	}
 
+	private publicationShouldSuppress(publicationId: string | undefined): boolean {
+		return (
+			publicationId !== undefined &&
+			(this.deliveredPublications.has(publicationId) ||
+				(this.claimedPublications.has(publicationId) && !this.publicationsClaimedThisRun.has(publicationId)))
+		);
+	}
+
 	private async loadPresentationState(): Promise<void> {
 		if (this.validationMode()) return;
 		const raw = await readJson<unknown>(this.fsImpl, this.presentationStatePath());
 		if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
 		const state = raw as Partial<TelegramPresentationState>;
 		if (
-			state.version !== TELEGRAM_PRESENTATION_STATE_VERSION ||
+			(state.version !== 1 && state.version !== TELEGRAM_PRESENTATION_STATE_VERSION) ||
 			!state.delivered ||
 			typeof state.delivered !== "object"
 		)
@@ -5201,14 +5216,29 @@ export class TelegramNotificationDaemon {
 		for (const [publicationId, timestamp] of Object.entries(state.delivered))
 			if (publicationId && typeof timestamp === "number" && Number.isFinite(timestamp))
 				this.deliveredPublications.set(publicationId, timestamp);
-		this.pruneDeliveredPublications();
+		if (state.version === TELEGRAM_PRESENTATION_STATE_VERSION && state.claimed && typeof state.claimed === "object") {
+			for (const [publicationId, timestamp] of Object.entries(state.claimed))
+				if (publicationId && typeof timestamp === "number" && Number.isFinite(timestamp))
+					this.claimedPublications.set(publicationId, timestamp);
+		}
+		this.prunePublicationReceipts();
+		if (this.claimedPublications.size > 0)
+			logger.warn(
+				`notifications: ${this.claimedPublications.size} Telegram publication claim(s) remain provider-uncertain and will not be duplicated after restart.`,
+			);
 	}
 
-	private pruneDeliveredPublications(): void {
-		while (this.deliveredPublications.size > TELEGRAM_PRESENTATION_STATE_LIMIT) {
-			const oldest = [...this.deliveredPublications.entries()].sort((left, right) => left[1] - right[1])[0]?.[0];
-			if (oldest === undefined) return;
-			this.deliveredPublications.delete(oldest);
+	private prunePublicationReceipts(): void {
+		while (this.deliveredPublications.size + this.claimedPublications.size > TELEGRAM_PRESENTATION_STATE_LIMIT) {
+			const oldest = [
+				...[...this.deliveredPublications].map(([id, at]) => ({ id, at, delivered: true })),
+				...[...this.claimedPublications].map(([id, at]) => ({ id, at, delivered: false })),
+			].sort((left, right) => left.at - right.at)[0];
+			if (!oldest) return;
+			if (oldest.delivered) this.deliveredPublications.delete(oldest.id);
+			else this.claimedPublications.delete(oldest.id);
+			this.publicationsClaimedThisRun.delete(oldest.id);
+			this.deferredPublications.delete(oldest.id);
 		}
 	}
 
@@ -5218,21 +5248,49 @@ export class TelegramNotificationDaemon {
 		await writeJsonAtomic(
 			this.fsImpl,
 			this.presentationStatePath(),
-			{ version: TELEGRAM_PRESENTATION_STATE_VERSION, delivered: Object.fromEntries(this.deliveredPublications) },
+			{
+				version: TELEGRAM_PRESENTATION_STATE_VERSION,
+				delivered: Object.fromEntries(this.deliveredPublications),
+				claimed: Object.fromEntries(this.claimedPublications),
+			},
 			{ durable: true },
 		);
 	}
 
-	private async markPublicationDelivered(publicationId: string | undefined): Promise<void> {
-		if (!publicationId || this.publicationDelivered(publicationId)) return;
-		this.deliveredPublications.set(publicationId, this.runtime.now());
-		this.pruneDeliveredPublications();
+	private async persistPublicationReceipts(): Promise<void> {
 		const pending = this.presentationPersistenceQueue.then(() => this.persistPresentationState());
 		this.presentationPersistenceQueue = pending.catch(() => undefined);
+		await pending;
+	}
+
+	private async claimPublication(publicationId: string | undefined): Promise<void> {
+		if (!publicationId || this.publicationDelivered(publicationId) || this.claimedPublications.has(publicationId))
+			return;
+		this.claimedPublications.set(publicationId, this.runtime.now());
+		this.publicationsClaimedThisRun.add(publicationId);
+		this.prunePublicationReceipts();
 		try {
-			await pending;
+			await this.persistPublicationReceipts();
+		} catch (error) {
+			this.claimedPublications.delete(publicationId);
+			this.publicationsClaimedThisRun.delete(publicationId);
+			logger.warn(`notifications: Telegram publication claim failed: ${sanitizeDiagnostic(String(error))}`);
+			throw error;
+		}
+	}
+
+	private async markPublicationDelivered(publicationId: string | undefined): Promise<void> {
+		if (!publicationId || this.publicationDelivered(publicationId)) return;
+		const claimedAt = this.claimedPublications.get(publicationId);
+		this.claimedPublications.delete(publicationId);
+		this.publicationsClaimedThisRun.delete(publicationId);
+		this.deliveredPublications.set(publicationId, this.runtime.now());
+		this.prunePublicationReceipts();
+		try {
+			await this.persistPublicationReceipts();
 		} catch (error) {
 			this.deliveredPublications.delete(publicationId);
+			if (claimedAt !== undefined) this.claimedPublications.set(publicationId, claimedAt);
 			logger.warn(
 				`notifications: Telegram presentation state persistence failed: ${sanitizeDiagnostic(String(error))}`,
 			);
@@ -6824,6 +6882,7 @@ export class TelegramNotificationDaemon {
 		send: ThreadedSend,
 		msg: Record<string, unknown>,
 		toolActivity?: ToolActivityOwner,
+		publicationId?: string,
 	): void {
 		const logicalSessionId = this.#logicalSessionId(session);
 		const socketLease = this.#socketLease(session, logicalSessionId);
@@ -6844,10 +6903,13 @@ export class TelegramNotificationDaemon {
 			session,
 			socketLease,
 			...(toolActivity ? { toolActivity } : {}),
+			...(publicationId ? { publicationId } : {}),
 		});
+		if (publicationId) this.deferredPublications.add(publicationId);
 		if (frames.length > PENDING_TOPIC_FRAME_LIMIT) {
 			const evicted = frames.shift();
 			this.failLegacyToolStart(evicted?.toolActivity);
+			if (evicted?.publicationId) this.deferredPublications.delete(evicted.publicationId);
 		}
 		this.pendingThreadedFrames.set(logicalSessionId, frames);
 	}
@@ -6867,7 +6929,14 @@ export class TelegramNotificationDaemon {
 				this.failLegacyToolStart(frame.toolActivity);
 				continue;
 			}
-			await this.submitThreadedFrame(sessionId, frame.send, topicLease, frame.toolActivity, socketLease);
+			await this.submitThreadedFrame(
+				sessionId,
+				frame.send,
+				topicLease,
+				frame.toolActivity,
+				socketLease,
+				frame.publicationId,
+			);
 		}
 	}
 
@@ -7871,6 +7940,9 @@ export class TelegramNotificationDaemon {
 
 	private async flushPoolInner(): Promise<void> {
 		const { granted: batch, expired } = this.pool.drainWithExpired();
+		const publicationIds = new Set(
+			batch.flatMap(item => (item.payload.publicationId ? [item.payload.publicationId] : [])),
+		);
 		for (const expiredItem of expired) {
 			if (expiredItem.payload.selectedAck) {
 				this.finishSelectedAck(expiredItem.payload.selectedAck, { status: "failed", reason: "expired" });
@@ -8202,6 +8274,7 @@ export class TelegramNotificationDaemon {
 										},
 										topicLease,
 										socketLease,
+										publicationId: item.payload.publicationId,
 									},
 								});
 							}
@@ -8313,6 +8386,7 @@ export class TelegramNotificationDaemon {
 										},
 										topicLease,
 										socketLease,
+										publicationId: item.payload.publicationId,
 									},
 								});
 							}
@@ -8406,6 +8480,11 @@ export class TelegramNotificationDaemon {
 						this.toolActivityOwners.delete(editKey);
 				}
 			}
+		}
+		for (const publicationId of publicationIds) {
+			if (this.pool.someQueued(item => item.payload.publicationId === publicationId)) continue;
+			await this.markPublicationDelivered(publicationId);
+			this.deferredPublications.delete(publicationId);
 		}
 	}
 
@@ -8807,7 +8886,7 @@ export class TelegramNotificationDaemon {
 	}
 
 	async handleSessionMessage(session: AttachmentSession, msg: any, publicationId?: string): Promise<void> {
-		if (this.publicationDelivered(publicationId) && msg?.type !== "event_replay_result") return;
+		if (this.publicationShouldSuppress(publicationId) && msg?.type !== "event_replay_result") return;
 		if (msg?.type === "hello") {
 			const capabilities = Array.isArray(msg.capabilities) ? msg.capabilities : [];
 			const previousToolActivityCapability = session.toolActivityCapability;
@@ -8933,6 +9012,7 @@ export class TelegramNotificationDaemon {
 				const fingerprint = JSON.stringify(frame);
 				replayCounts.set(fingerprint, (replayCounts.get(fingerprint) ?? 0) + 1);
 				try {
+					await this.claimPublication(replayPublicationIds.get(frame));
 					await this.handleSessionMessage(session, frame, replayPublicationIds.get(frame));
 				} catch (error) {
 					logger.warn(
@@ -9328,7 +9408,7 @@ export class TelegramNotificationDaemon {
 				return;
 			}
 			if (!send.identity && !existingTopic && !this.flatIdentitySent.has(logicalSessionId)) {
-				this.rememberPendingThreadedFrame(session, send, threadedFrame, toolActivity);
+				this.rememberPendingThreadedFrame(session, send, threadedFrame, toolActivity, publicationId);
 				return;
 			}
 			const topicId =
@@ -9378,7 +9458,14 @@ export class TelegramNotificationDaemon {
 					}
 				}
 				if (this.topics.needsIdentity(logicalSessionId)) {
-					await this.submitThreadedFrame(logicalSessionId, send, topicLease, undefined, socketLease);
+					await this.submitThreadedFrame(
+						logicalSessionId,
+						send,
+						topicLease,
+						undefined,
+						socketLease,
+						publicationId,
+					);
 					this.topics.markIdentitySent(logicalSessionId);
 				}
 				await this.persistTopics();
@@ -9390,7 +9477,7 @@ export class TelegramNotificationDaemon {
 				abandonStaleToolStart();
 				return;
 			}
-			await this.submitThreadedFrame(logicalSessionId, send, topicLease, toolActivity, socketLease);
+			await this.submitThreadedFrame(logicalSessionId, send, topicLease, toolActivity, socketLease, publicationId);
 			return;
 		}
 		if (msg.type === "action_needed" && msg.id) {

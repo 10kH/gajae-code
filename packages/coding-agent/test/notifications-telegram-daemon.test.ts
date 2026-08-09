@@ -84,4 +84,37 @@ describe("Telegram provider supervisor ownership", () => {
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
 	});
+
+	test("durably suppresses ambiguous publication claims after provider restart", async () => {
+		const agentDir = tempAgentDir();
+		type PublicationReceiptHarness = {
+			claimPublication(publicationId: string): Promise<void>;
+			markPublicationDelivered(publicationId: string): Promise<void>;
+			loadPresentationState(): Promise<void>;
+			publicationShouldSuppress(publicationId: string): boolean;
+		};
+		const makeHarness = (): PublicationReceiptHarness =>
+			new TelegramNotificationDaemon({
+				settings: settings(agentDir),
+				ownerId: "provider-owner",
+				botToken: BOT_TOKEN,
+				chatId: "42",
+			}) as unknown as PublicationReceiptHarness;
+		try {
+			const first = makeHarness();
+			await first.claimPublication("session:60:1");
+			expect(first.publicationShouldSuppress("session:60:1")).toBe(false);
+
+			const restartedWithClaim = makeHarness();
+			await restartedWithClaim.loadPresentationState();
+			expect(restartedWithClaim.publicationShouldSuppress("session:60:1")).toBe(true);
+
+			await first.markPublicationDelivered("session:60:1");
+			const restartedDelivered = makeHarness();
+			await restartedDelivered.loadPresentationState();
+			expect(restartedDelivered.publicationShouldSuppress("session:60:1")).toBe(true);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
 });
