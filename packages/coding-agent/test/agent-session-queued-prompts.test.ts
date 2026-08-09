@@ -179,6 +179,18 @@ describe("AgentSession queued prompts (issue #434)", () => {
 
 		gate.resolve();
 		await evalExecution;
+		session.recordPythonResult("print('done')", {
+			output: "",
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+			totalLines: 0,
+			totalBytes: 0,
+			outputLines: 0,
+			outputBytes: 0,
+			displayOutputs: [],
+			stdinRequested: false,
+		});
 		await session.waitForIdle();
 
 		expect(userTexts(session)).toEqual(["p1", "p2"]);

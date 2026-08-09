@@ -4957,8 +4957,12 @@ export class AgentSession {
 						};
 						const startsQueuedSuccessor =
 							this.agent.state.messages.at(-1)?.role === "assistant" && this.agent.hasQueuedMessages();
+						const continueQueued =
+							this.agent.state.messages.at(-1)?.role === "assistant"
+								? this.agent.continue.bind(this.agent)
+								: this.agent.continueQueuedMessages.bind(this.agent);
 						try {
-							await this.agent.continue({
+							await continueQueued({
 								...this.#managedFallbackPromptOptions(),
 								maintenanceContinuation: options?.maintenanceContinuation,
 								// Reset only after continue() has claimed the queued turn. Skipped or stale
@@ -9489,7 +9493,7 @@ export class AgentSession {
 		if (this.isRetrying) return false;
 		const messages = this.agent.state.messages;
 		const last = messages[messages.length - 1];
-		return last?.role === "assistant";
+		return last?.role === "assistant" || last?.role === "bashExecution" || last?.role === "pythonExecution";
 	}
 	#scheduleQueuedFollowUpContinuation(): void {
 		if (!this.#cancelAndSubmitInProgress && this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages()) {
@@ -16563,6 +16567,12 @@ export class AgentSession {
 		} else {
 			this.agent.appendMessage(pythonMessage);
 			this.sessionManager.appendMessage(pythonMessage);
+			if (!this.#cancelAndSubmitInProgress && this.agent.hasQueuedMessages()) {
+				this.#scheduleAgentContinue({
+					shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
+					rescheduleOnBusy: true,
+				});
+			}
 			options?.onPersisted?.();
 		}
 	}
