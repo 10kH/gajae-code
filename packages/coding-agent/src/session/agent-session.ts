@@ -4957,8 +4957,12 @@ export class AgentSession {
 						};
 						const startsQueuedSuccessor =
 							this.agent.state.messages.at(-1)?.role === "assistant" && this.agent.hasQueuedMessages();
+						const continueQueued =
+							this.agent.state.messages.at(-1)?.role === "assistant"
+								? this.agent.continue.bind(this.agent)
+								: this.agent.continueQueuedMessages.bind(this.agent);
 						try {
-							await this.agent.continue({
+							await continueQueued({
 								...this.#managedFallbackPromptOptions(),
 								maintenanceContinuation: options?.maintenanceContinuation,
 								// Reset only after continue() has claimed the queued turn. Skipped or stale
@@ -9475,11 +9479,7 @@ export class AgentSession {
 		// agent.continue() only dequeues follow-ups from an assistant-ended state;
 		// resuming from user/toolResult state runs an extra model call on the
 		// stale prompt before draining the queue.
-		if (!this.#cancelAndSubmitInProgress && this.#canAutoContinueForFollowUp()) {
-			this.#scheduleAgentContinue({
-				shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
-			});
-		}
+		this.#scheduleQueuedFollowUpContinuation();
 	}
 
 	/**
@@ -9487,10 +9487,20 @@ export class AgentSession {
 	 */
 	#canAutoContinueForFollowUp(): boolean {
 		if (this.isStreaming) return false;
+		if (this.isCompacting) return false;
+		if (this.isBashRunning) return false;
+		if (this.isEvalRunning) return false;
 		if (this.isRetrying) return false;
 		const messages = this.agent.state.messages;
 		const last = messages[messages.length - 1];
-		return last?.role === "assistant";
+		return last?.role === "assistant" || last?.role === "bashExecution" || last?.role === "pythonExecution";
+	}
+	#scheduleQueuedFollowUpContinuation(): void {
+		if (!this.#cancelAndSubmitInProgress && this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages()) {
+			this.#scheduleAgentContinue({
+				shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
+			});
+		}
 	}
 
 	/**
@@ -16372,6 +16382,7 @@ export class AgentSession {
 			return result;
 		} finally {
 			this.#bashAbortControllers.delete(abortController);
+			this.#scheduleQueuedFollowUpContinuation();
 		}
 	}
 
@@ -16514,10 +16525,12 @@ export class AgentSession {
 			() => {
 				this.#evalAbortControllers.delete(abortController);
 				this.#activeEvalExecutions.delete(execution);
+				this.#scheduleQueuedFollowUpContinuation();
 			},
 			() => {
 				this.#evalAbortControllers.delete(abortController);
 				this.#activeEvalExecutions.delete(execution);
+				this.#scheduleQueuedFollowUpContinuation();
 			},
 		);
 		return execution;
@@ -16554,6 +16567,12 @@ export class AgentSession {
 		} else {
 			this.agent.appendMessage(pythonMessage);
 			this.sessionManager.appendMessage(pythonMessage);
+			if (!this.#cancelAndSubmitInProgress && this.agent.hasQueuedMessages()) {
+				this.#scheduleAgentContinue({
+					shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
+					rescheduleOnBusy: true,
+				});
+			}
 			options?.onPersisted?.();
 		}
 	}
