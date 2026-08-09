@@ -422,11 +422,7 @@ function brokerErrorFromThrown(value: unknown): { code: string; message: string 
 	if (!isRecord(value)) return undefined;
 	const details = isRecord(value.details) ? value.details : undefined;
 	const code =
-		typeof details?.code === "string"
-			? details.code
-			: typeof value.code === "string"
-				? value.code
-				: undefined;
+		typeof details?.code === "string" ? details.code : typeof value.code === "string" ? value.code : undefined;
 	if (!code) return undefined;
 	const message =
 		typeof details?.message === "string"
@@ -451,7 +447,9 @@ export class SessionLifecycleService {
 
 	async execute(
 		request: SessionLifecycleMutationRequest,
-	): Promise<SessionCreateOutcome | SessionForkOutcome | SessionResumeOutcome | SessionCloseOutcome | SessionDeleteOutcome> {
+	): Promise<
+		SessionCreateOutcome | SessionForkOutcome | SessionResumeOutcome | SessionCloseOutcome | SessionDeleteOutcome
+	> {
 		const operation = operationOf((request as { operation?: unknown }).operation);
 		if (operation === "session.list")
 			return failure("session.create", "terminal", "invalid_request", "lifecycle mutation operation is required");
@@ -473,10 +471,14 @@ export class SessionLifecycleService {
 		);
 		let response: unknown;
 		try {
-			response = await this.#client.global(operation, { ...target }, {
-				idempotencyKey,
-				...(typedRequest.timeoutMs === undefined ? {} : { timeoutMs: typedRequest.timeoutMs }),
-			});
+			response = await this.#client.global(
+				operation,
+				{ ...target },
+				{
+					idempotencyKey,
+					...(typedRequest.timeoutMs === undefined ? {} : { timeoutMs: typedRequest.timeoutMs }),
+				},
+			);
 		} catch (thrown) {
 			const error = brokerError(thrown) ?? brokerErrorFromThrown(thrown);
 			return error
@@ -496,7 +498,12 @@ export class SessionLifecycleService {
 				: undefined;
 		const parsed = sessionResult(brokerSuccess(response), fallbackSessionId);
 		if (!parsed)
-			return failure(operation, "uncertain", "malformed_response", "lifecycle broker returned a malformed session result");
+			return failure(
+				operation,
+				"uncertain",
+				"malformed_response",
+				"lifecycle broker returned a malformed session result",
+			);
 		return { ok: true, operation, result: parsed } as
 			| SessionCreateOutcome
 			| SessionForkOutcome
@@ -535,9 +542,13 @@ export class SessionLifecycleService {
 			return failure("session.list", "terminal", "invalid_request", "target must be an object");
 		let response: unknown;
 		try {
-			response = await this.#client.global("session.list", { ...target }, {
-				...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
-			});
+			response = await this.#client.global(
+				"session.list",
+				{ ...target },
+				{
+					...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
+				},
+			);
 		} catch (thrown) {
 			const error = brokerError(thrown) ?? brokerErrorFromThrown(thrown);
 			return error
@@ -549,6 +560,11 @@ export class SessionLifecycleService {
 		const parsed = isRecord(response) && response.ok === true ? listResult(brokerSuccess(response)) : undefined;
 		return parsed
 			? { ok: true, operation: "session.list", result: parsed }
-			: failure("session.list", "uncertain", "malformed_response", "lifecycle broker returned a malformed list result");
+			: failure(
+					"session.list",
+					"uncertain",
+					"malformed_response",
+					"lifecycle broker returned a malformed list result",
+				);
 	}
 }

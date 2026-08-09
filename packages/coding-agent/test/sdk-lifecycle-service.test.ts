@@ -1,10 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import {
 	deriveSessionLifecycleIdempotencyKey,
-	SessionLifecycleService,
 	type SessionLifecycleClient,
 	type SessionLifecycleClientRequestOptions,
 	type SessionLifecycleOperation,
+	SessionLifecycleService,
 } from "../src/sdk/lifecycle";
 
 type Call = {
@@ -62,8 +62,8 @@ describe("SessionLifecycleService", () => {
 		await second.service.create({ actor, capability: "session.create", requestKey: "request-1", target });
 		expect(first.client.calls[0]?.options.idempotencyKey).toBe(second.client.calls[0]?.options.idempotencyKey);
 		expect(first.client.calls[0]?.options.idempotencyKey).toBe(
-		deriveSessionLifecycleIdempotencyKey(actor, "request-1", "session.create", target),
-	);
+			deriveSessionLifecycleIdempotencyKey(actor, "request-1", "session.create", target),
+		);
 
 		const actorKey = deriveSessionLifecycleIdempotencyKey(
 			{ ...actor, id: "operator-2" },
@@ -135,7 +135,11 @@ describe("SessionLifecycleService", () => {
 			},
 		});
 		const created = await service.create({ actor, capability: "session.create", requestKey: "create", target });
-		expect(created).toEqual({ ok: true, operation: "session.create", result: { sessionId: "created", cwd: "/repo" } });
+		expect(created).toEqual({
+			ok: true,
+			operation: "session.create",
+			result: { sessionId: "created", cwd: "/repo" },
+		});
 
 		const resumed = await service.resume({
 			actor,
@@ -143,7 +147,11 @@ describe("SessionLifecycleService", () => {
 			requestKey: "resume",
 			target: { sessionId: "resumed" },
 		});
-		expect(resumed).toEqual({ ok: true, operation: "session.resume", result: { sessionId: "created", cwd: "/repo" } });
+		expect(resumed).toEqual({
+			ok: true,
+			operation: "session.resume",
+			result: { sessionId: "created", cwd: "/repo" },
+		});
 	});
 
 	it("maps Broker certainty codes and treats malformed responses as uncertain", async () => {

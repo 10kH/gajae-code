@@ -3,15 +3,15 @@ import * as path from "node:path";
 import { ensureBroker } from "../broker/ensure";
 import { SdkClient } from "../client/client";
 import { readSdkBrokerDiscovery } from "../client/discovery";
-import { listRecentSessions, type ListRecentSessionsResult, type RecentSessionEntry } from "./recent-sessions";
+import { type ListRecentSessionsResult, listRecentSessions, type RecentSessionEntry } from "./recent-sessions";
 import {
 	type SessionCreateOutcome,
 	type SessionLifecycleActor,
 	type SessionLifecycleClient,
 	type SessionLifecycleClientRequestOptions,
 	type SessionLifecycleOperation,
-	type SessionResumeOutcome,
 	SessionLifecycleService,
+	type SessionResumeOutcome,
 } from "./service";
 
 /** SDK-core broker client that keeps broker credentials inside the lifecycle boundary. */
