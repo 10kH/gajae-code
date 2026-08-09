@@ -81,6 +81,7 @@ async function createContext(options?: {
 	const setActionKeys = vi.fn();
 	const showModelSelector = vi.fn();
 	const prompt = vi.fn(async () => {});
+	const followUp = vi.fn(async () => {});
 	const updatePendingMessagesDisplay = vi.fn();
 	const handleBashCommand = vi.fn(async () => {});
 	const showStatus = vi.fn();
@@ -225,6 +226,7 @@ async function createContext(options?: {
 			abortBash: vi.fn(),
 			extensionRunner: undefined,
 			prompt,
+			followUp,
 			popLastQueuedMessage,
 			clearQueue,
 			getQueuedMessages: () => ({ steering: [], followUp: [...sessionQueuedMessages] }),
@@ -326,6 +328,7 @@ async function createContext(options?: {
 			setActionKeys,
 			showModelSelector,
 			prompt,
+			followUp,
 			onInputCallback,
 			startPendingSubmission,
 			updatePendingMessagesDisplay,
@@ -607,6 +610,23 @@ describe("InputController keybinding setup", () => {
 
 		expect(spies.queueCompactionMessage).toHaveBeenCalledWith("queue while compacting via shortcut", "followUp");
 		expect(spies.prompt).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("");
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+	it("queues skill text behind foreground bash instead of invoking the skill immediately", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const session = ctx.session as unknown as { isBashRunning: boolean };
+		session.isBashRunning = true;
+		editor.setText("/skill:team");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		await editor.onQueue?.();
+		await Bun.sleep(0);
+
+		expect(spies.followUp).toHaveBeenCalledWith("/skill:team", undefined, {
+			followUpQueuePolicy: "sequential",
+		});
 		expect(editor.getText()).toBe("");
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});

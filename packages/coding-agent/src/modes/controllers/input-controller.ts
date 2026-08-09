@@ -1497,6 +1497,21 @@ export class InputController {
 			return;
 		}
 
+		// Foreground bash/eval owns the process fence. Queue all prompt text,
+		// including slash skill input, until the process settles instead of
+		// expanding a skill and starting a competing model turn.
+		if (this.ctx.session.isBashRunning || this.ctx.session.isEvalRunning) {
+			this.ctx.editor.addToHistory(text);
+			this.ctx.editor.setText("");
+			await this.ctx.withLocalSubmission(text, () =>
+				this.ctx.session.followUp(text, undefined, {
+					followUpQueuePolicy: "sequential",
+				}),
+			);
+			this.ctx.updatePendingMessagesDisplay();
+			this.ctx.ui.requestRender();
+			return;
+		}
 		// Skill commands invoke through the custom-message path regardless of
 		// which keybinding submitted them. Enter routes them as `steer`;
 		// explicit queue shortcuts route them as `followUp`.

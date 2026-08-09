@@ -9487,6 +9487,9 @@ export class AgentSession {
 	 */
 	#canAutoContinueForFollowUp(): boolean {
 		if (this.isStreaming) return false;
+		if (this.isCompacting) return false;
+		if (this.isBashRunning) return false;
+		if (this.isEvalRunning) return false;
 		if (this.isRetrying) return false;
 		const messages = this.agent.state.messages;
 		const last = messages[messages.length - 1];
