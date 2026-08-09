@@ -1,4 +1,4 @@
-import { Flags } from "@gajae-code/utils/cli";
+import { type FlagDescriptor, Flags } from "@gajae-code/utils/cli";
 
 const ROOT_THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
@@ -66,3 +66,35 @@ export const ROOT_LAUNCH_FLAGS = {
 	}),
 	"no-title": Flags.boolean({ description: "Disable title auto-generation" }),
 };
+
+export type ConsumerLaunchFlagName = "hook" | "extension" | "no-extensions" | "no-skills" | "skills";
+
+export type LaunchFlagConsumer = "acp" | "local";
+
+/**
+ * Flags accepted only so their owning startup consumer can classify them. They
+ * deliberately stay out of root help and completion.
+ */
+export const CONSUMER_LAUNCH_FLAGS: Record<ConsumerLaunchFlagName, FlagDescriptor> = {
+	hook: Flags.string({ multiple: true }),
+	extension: Flags.string({ char: "e", multiple: true }),
+	"no-extensions": Flags.boolean(),
+	"no-skills": Flags.boolean(),
+	skills: Flags.string(),
+};
+
+/** Every flag understood by the launch argument parser, including hidden consumer-owned flags. */
+export const LAUNCH_PARSE_FLAGS = { ...ROOT_LAUNCH_FLAGS, ...CONSUMER_LAUNCH_FLAGS };
+
+/** Startup consumers that may receive a hidden launch flag. */
+export const LAUNCH_FLAG_CONSUMERS: Record<ConsumerLaunchFlagName, readonly LaunchFlagConsumer[]> = {
+	hook: ["acp"],
+	extension: ["acp"],
+	"no-extensions": ["acp"],
+	"no-skills": ["acp", "local"],
+	skills: ["acp"],
+};
+
+export function launchFlagIsOwnedBy(name: ConsumerLaunchFlagName, consumer: LaunchFlagConsumer): boolean {
+	return LAUNCH_FLAG_CONSUMERS[name].includes(consumer);
+}

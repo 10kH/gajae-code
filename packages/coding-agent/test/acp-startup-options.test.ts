@@ -525,7 +525,7 @@ test("ACP fails closed for local-only startup flags while translating model and 
 });
 
 test("ACP rejects unknown flags instead of silently ignoring them", () => {
-	const parsed = parseArgs(["--mpreset", "codex-medium", "--mpresett"]);
+	const parsed = parseArgs(["--mpreset", "codex-medium", "--mpresett"], "acp");
 	expect(parsed.unknownFlags).toEqual(new Map([["--mpresett", true]]));
 	expect(() => resolveAcpStartupOptions(parsed, {})).toThrow(
 		"Unsupported under SDK-backed ACP: unknown flags: --mpresett",
@@ -533,7 +533,7 @@ test("ACP rejects unknown flags instead of silently ignoring them", () => {
 });
 
 test("ACP accepts --no-extensions and still names every unsupported discovery flag", () => {
-	const accepted = parseArgs(["--no-extensions"]);
+	const accepted = parseArgs(["--no-extensions"], "acp");
 	expect(accepted.unknownFlags.size).toBe(0);
 	expect(accepted.noExtensions).toBe(true);
 	expect(() => resolveAcpStartupOptions(accepted, {})).not.toThrow();
@@ -544,7 +544,7 @@ test("ACP accepts --no-extensions and still names every unsupported discovery fl
 		[["--skills", ",,"], "--skills"],
 		[["--skills", "git-*", "--skills", ",,"], "--skills"],
 	] as const) {
-		const parsed = parseArgs([...args]);
+		const parsed = parseArgs([...args], "acp");
 		expect(parsed.unknownFlags.size).toBe(0);
 		expect(() => resolveAcpStartupOptions(parsed, {})).toThrow(`Unsupported under SDK-backed ACP: ${expectedFlag}`);
 	}
@@ -555,11 +555,11 @@ test("ACP rejects registered extension-loading flags by name", () => {
 		["--extension", "/tmp/a.ts"],
 		["-e", "/tmp/a.ts"],
 	] as const) {
-		expect(() => resolveAcpStartupOptions(parseArgs([...args]), {})).toThrow(
+		expect(() => resolveAcpStartupOptions(parseArgs([...args], "acp"), {})).toThrow(
 			"Unsupported under SDK-backed ACP: --extension",
 		);
 	}
-	expect(() => resolveAcpStartupOptions(parseArgs(["--hook", "/tmp/a.ts"]), {})).toThrow(
+	expect(() => resolveAcpStartupOptions(parseArgs(["--hook", "/tmp/a.ts"], "acp"), {})).toThrow(
 		"Unsupported under SDK-backed ACP: --hook. Use ACP session configuration",
 	);
 });
@@ -582,6 +582,9 @@ test("ACP command maps invalid argv to typed CLI usage errors", async () => {
 			"--acp-terminal-auth only supports --mode acp",
 		);
 	}
+	await expect(new Acp(["--acp-terminal-auth", "--no-extensions"], TEST_CONFIG).run()).rejects.toThrow(
+		"Unknown option: --no-extensions",
+	);
 });
 
 test("ACP command renders usage and exits nonzero for invalid argv", async () => {

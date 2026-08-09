@@ -6,7 +6,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { APP_NAME, setProjectDir } from "@gajae-code/utils";
 import { Args, Command } from "@gajae-code/utils/cli";
-import { parseArgs } from "../cli/args";
+import { assertLocalLaunchArgs, parseArgs } from "../cli/args";
 import { ROOT_LAUNCH_FLAGS } from "../cli/root-flags";
 import { launchDefaultTmuxIfNeeded } from "../gjc-runtime/launch-tmux";
 import { type PreparedLaunchWorktree, prepareLaunchWorktree } from "../gjc-runtime/launch-worktree";
@@ -92,7 +92,8 @@ export default class Index extends Command {
 
 	async run(): Promise<void> {
 		const { args } = prepareAcpTerminalAuthArgs(this.argv);
-		const parsed = parseArgs([...args]);
+		const parsed = parseArgs([...args], "deferred");
+		if (parsed.mode !== "acp") assertLocalLaunchArgs(parsed);
 		if (parsed.help || parsed.version) {
 			await runRootCommand(parsed, args);
 			return;
@@ -109,7 +110,8 @@ export default class Index extends Command {
 			process.chdir(launch.cwd);
 			setProjectDir(launch.cwd);
 		}
-		const launchParsed = parseArgs(launch.args);
+		const launchParsed = parseArgs(launch.args, "deferred");
+		if (launchParsed.mode !== "acp") assertLocalLaunchArgs(launchParsed);
 		if (
 			launchDefaultTmuxIfNeeded({
 				parsed: launchParsed,
