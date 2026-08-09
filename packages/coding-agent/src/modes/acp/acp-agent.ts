@@ -57,6 +57,7 @@ import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } f
 import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
 import { resolveAcpAbortScope } from "./abort-scope";
+import { type AcpBuiltinCommandRuntime, executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import {
 	buildToolCallStartUpdate,
 	mapAgentSessionEventToAcpSessionUpdates,
@@ -1494,6 +1495,25 @@ export class AcpAgent implements Agent {
 		record.cancelRequested = false;
 		const payload = acpPromptPayload(params.prompt);
 		const skillInvocation = acpSkillInvocation(params.prompt);
+		const builtinResult = await executeAcpBuiltinSlashCommand(
+			payload.text,
+			{
+				output: async (text: string) =>
+					await this.#publishSessionUpdate(
+						params.sessionId,
+						{
+							sessionId: params.sessionId,
+							update: {
+								sessionUpdate: "agent_message_chunk",
+								content: { type: "text", text },
+							},
+						},
+						record.adapter,
+					),
+			} as unknown as AcpBuiltinCommandRuntime,
+			{ disabledOnly: true },
+		);
+		if (builtinResult !== false) return { stopReason: "end_turn" };
 		// The SDK transport hard-caps a single request frame at 256 KiB and answers an
 		// oversize frame by closing the socket (CloseCode::Size, crates/gjc-sdk/src/server.rs),
 		// which surfaces to the client as an opaque `connection_closed` mid-turn. Reject
