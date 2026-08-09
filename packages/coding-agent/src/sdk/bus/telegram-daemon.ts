@@ -5243,14 +5243,21 @@ export class TelegramNotificationDaemon {
 			);
 			return;
 		}
-		for (const [publicationId, timestamp] of Object.entries(state.delivered))
+		const deliveredEntries = Object.entries(state.delivered);
+		const claimedEntries = state.claimed && typeof state.claimed === "object" ? Object.entries(state.claimed) : [];
+		if (
+			deliveredEntries.length > TELEGRAM_PRESENTATION_STATE_LIMIT * 2 ||
+			claimedEntries.length > TELEGRAM_PUBLICATION_CLAIM_LIMIT
+		) {
+			logger.warn("notifications: oversized Telegram publication receipt state was quarantined.");
+			return;
+		}
+		for (const [publicationId, timestamp] of deliveredEntries)
 			if (publicationId && typeof timestamp === "number" && Number.isFinite(timestamp))
 				this.deliveredPublications.set(publicationId, timestamp);
-		if (state.version === TELEGRAM_PRESENTATION_STATE_VERSION && state.claimed && typeof state.claimed === "object") {
-			for (const [publicationId, timestamp] of Object.entries(state.claimed))
-				if (publicationId && typeof timestamp === "number" && Number.isFinite(timestamp))
-					this.claimedPublications.set(publicationId, timestamp);
-		}
+		for (const [publicationId, timestamp] of claimedEntries)
+			if (publicationId && typeof timestamp === "number" && Number.isFinite(timestamp))
+				this.claimedPublications.set(publicationId, timestamp);
 		this.prunePublicationReceipts();
 		if (this.claimedPublications.size > 0)
 			logger.warn(
@@ -6954,7 +6961,6 @@ export class TelegramNotificationDaemon {
 		if (frames.length > PENDING_TOPIC_FRAME_LIMIT) {
 			const evicted = frames.shift();
 			this.failLegacyToolStart(evicted?.toolActivity);
-			if (evicted?.publicationId) this.deferredPublications.delete(evicted.publicationId);
 		}
 		this.pendingThreadedFrames.set(logicalSessionId, frames);
 	}

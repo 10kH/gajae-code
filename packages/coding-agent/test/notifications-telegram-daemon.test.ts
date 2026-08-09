@@ -122,6 +122,17 @@ describe("Telegram provider supervisor ownership", () => {
 			const restartedLegacy = makeHarness();
 			await restartedLegacy.loadPresentationState();
 			expect(restartedLegacy.publicationShouldSuppress("legacy:60:1")).toBe(false);
+
+			const oversizedClaims = Object.fromEntries(
+				Array.from({ length: 4_097 }, (_, index) => [`oversized:67:${index}`, Date.now() + index]),
+			);
+			fs.writeFileSync(
+				path.join(daemonPaths(agentDir).dir, "telegram-presentation-state.json"),
+				`${JSON.stringify({ version: 2, delivered: {}, claimed: oversizedClaims })}\n`,
+			);
+			const restartedOversized = makeHarness();
+			await restartedOversized.loadPresentationState();
+			expect(restartedOversized.publicationShouldSuppress("oversized:67:0")).toBe(false);
 		} finally {
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}

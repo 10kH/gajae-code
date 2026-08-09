@@ -111,8 +111,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 66 propagates publication identity through selected and ephemeral
  * direct effects, retries definite pre-send route failures, and aggregates the
  * worst continuation disposition before confirmation.
+ * Generation 67 quarantines oversized persisted receipt maps and retains claims
+ * for pending-topic frames evicted before provider delivery.
  */
-export const DAEMON_GENERATION = 66;
+export const DAEMON_GENERATION = 67;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -124,5 +126,6 @@ export const DAEMON_GENERATION = 66;
  * requires strict direct receipts and fail-closed continuation admission. Epoch 12
  * requires malformed provider responses to remain unconfirmed claims.
  * Epoch 13 requires complete direct-effect identity and pre-send retry semantics.
+ * Epoch 14 requires bounded receipt loading and fail-closed pending eviction.
  */
-export const SERVING_EPOCH = 13;
+export const SERVING_EPOCH = 14;
