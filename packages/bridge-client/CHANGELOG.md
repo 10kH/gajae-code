@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.12.20] - 2026-08-09
 ### Fixed
 
 - `SdkClient` request-timeout errors now expose `SdkRequestTimeoutDetails`, including whether `WebSocket.send()` returned. A sent request remains execution-uncertain; ordered prompt and skill callers must reconcile through their existing `clientRef` rather than retry.
