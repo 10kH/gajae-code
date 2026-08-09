@@ -607,4 +607,190 @@ describe("AuthStorage OAuth refresh race", () => {
 			}
 		});
 	});
+	test("force refresh still dials upstream when a peer rotated the row fresh, spending the newest token", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		// Explicit force intent (broker POST /v1/credential/:id/refresh) must
+		// never be satisfied by the guard's fresh-row adoption: the caller asked
+		// for a NEW token. But the dial must spend the peer's rotated refresh
+		// token, not the stale snapshot one.
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "stale-access",
+				refresh: "stale-refresh",
+				expires: Date.now() + 60 * 60_000,
+			},
+		]);
+		const credentialId = store.listAuthCredentials("anthropic")[0]!.id;
+
+		store.updateAuthCredential(credentialId, {
+			type: "oauth",
+			access: "fresh-access-from-peer",
+			refresh: "fresh-refresh-from-peer",
+			expires: Date.now() + 60 * 60_000,
+		});
+
+		const refreshedWith: string[] = [];
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async (_provider, credentials) => {
+			refreshedWith.push(credentials.refresh);
+			return {
+				...credentials,
+				access: "force-rotated-access",
+				refresh: "force-rotated-refresh",
+				expires: Date.now() + 60 * 60_000,
+			};
+		});
+
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			const entry = await authStorage!.refreshCredentialById(credentialId);
+
+			expect(refreshedWith).toEqual(["fresh-refresh-from-peer"]);
+			expect(entry.credential.type).toBe("oauth");
+			if (entry.credential.type === "oauth") {
+				expect(entry.credential.access).toBe("force-rotated-access");
+			}
+			const stored = store!.listAuthCredentials("anthropic");
+			if (stored[0]?.credential.type === "oauth") {
+				expect(stored[0].credential.refresh).toBe("force-rotated-refresh");
+			}
+		});
+	});
+
+	test("an ambiguous local refresh failure is not replayed within the same resolution", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		// After a timeout/lost-response failure the provider may have already
+		// consumed the rotating refresh token; dialing it again risks
+		// reuse-detection revocation. The candidate preflight and the main
+		// attempt both want a refresh — only ONE upstream dial may happen.
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "stale-access",
+				refresh: "ambiguous-refresh",
+				expires: Date.now() - 60_000,
+			},
+		]);
+
+		let refreshCalls = 0;
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async () => {
+			refreshCalls += 1;
+			throw new Error("fetch failed: network timeout while contacting token endpoint");
+		});
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async () => {
+			throw new Error("fetch failed: network timeout while contacting token endpoint");
+		});
+
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			const apiKey = await authStorage!.getApiKey("anthropic", "session-ambiguous");
+
+			expect(apiKey).toBeUndefined();
+			// Exactly one dial: the memoized failure covers every later attempt
+			// with the same (credential, token) pair inside the guard window.
+			expect(refreshCalls).toBe(1);
+			// Transient failure: temp-blocked, never disabled.
+			expect(events).toHaveLength(0);
+			expect(store!.listAuthCredentials("anthropic")).toHaveLength(1);
+		});
+	});
+
+	test("adopts a persisted MCP binding and refreshes only against its bound token endpoint", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		const tokenRequests: string[] = [];
+		const server = Bun.serve({
+			port: 0,
+			fetch: async request => {
+				tokenRequests.push(await request.text());
+				return Response.json({
+					access_token: "mcp-access",
+					refresh_token: "mcp-refresh-2",
+					expires_in: 3600,
+				});
+			},
+		});
+		try {
+			const origin = `http://localhost:${server.port}`;
+
+			// Stale snapshot without a binding; the persisted row acquired one.
+			// The adopted refresh token must go to the bound endpoint, never to
+			// the plain per-provider refresher.
+			await authStorage.set("anthropic", [
+				{
+					type: "oauth",
+					access: "stale-access",
+					refresh: "stale-refresh",
+					expires: Date.now() - 60_000,
+				},
+			]);
+			const credentialId = store.listAuthCredentials("anthropic")[0]!.id;
+			store.updateAuthCredential(credentialId, {
+				type: "oauth",
+				access: "expired-mcp-access",
+				refresh: "mcp-refresh",
+				expires: Date.now() - 1_000,
+				mcpBinding: { resourceOrigin: origin, tokenEndpoint: `${origin}/token` },
+			});
+
+			const plainRefreshSpy = vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async () => {
+				throw new Error("plain provider refresh must not be used for an MCP-bound credential");
+			});
+			vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, creds) => {
+				const credential = creds[provider];
+				if (!credential) return null;
+				return { newCredentials: credential, apiKey: credential.access };
+			});
+
+			await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+				const apiKey = await authStorage!.getApiKey("anthropic", "session-mcp-adopt");
+
+				expect(apiKey).toBe("mcp-access");
+				expect(plainRefreshSpy).not.toHaveBeenCalled();
+				expect(tokenRequests).toHaveLength(1);
+				expect(tokenRequests[0]).toContain("refresh_token=mcp-refresh");
+			});
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	test("guard resolves the storage alias so openai-codex-device adopts a peer rotation", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		// `openai-codex-device` reads canonical `openai-codex` rows in memory;
+		// the pre-dial row read must canonicalize the same way or the guard
+		// silently no-ops on the alias path.
+		await authStorage.set("openai-codex", [
+			{
+				type: "oauth",
+				access: "stale-access",
+				refresh: "stale-refresh",
+				expires: Date.now() - 60_000,
+			},
+		]);
+		const credentialId = store.listAuthCredentials("openai-codex")[0]!.id;
+
+		store.updateAuthCredential(credentialId, {
+			type: "oauth",
+			access: "fresh-access-from-peer",
+			refresh: "fresh-refresh-from-peer",
+			expires: Date.now() + 60 * 60_000,
+		});
+
+		const refreshSpy = vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async () => {
+			throw new Error("upstream token endpoint must not be hit with a stale refresh token");
+		});
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, creds) => {
+			const credential = creds[oauthUtils.resolveOAuthStorageProvider(provider)] ?? creds[provider];
+			if (!credential) return null;
+			return { newCredentials: credential, apiKey: credential.access };
+		});
+
+		const apiKey = await authStorage.getApiKey("openai-codex-device", "session-alias");
+
+		expect(apiKey).toBe("fresh-access-from-peer");
+		expect(refreshSpy).not.toHaveBeenCalled();
+		expect(events).toHaveLength(0);
+	});
 });

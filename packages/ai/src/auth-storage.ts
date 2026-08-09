@@ -752,6 +752,43 @@ const MAX_PENDING_DISABLED_EVENTS = 32;
  */
 const MAX_OAUTH_RESOLUTION_RELOADS = 3;
 
+/**
+ * How long a locally failed refresh attempt pins its exact (credential id,
+ * refresh token) pair as non-replayable. Within this window the memoized
+ * failure is rethrown instead of dialing the token endpoint again: after an
+ * ambiguous failure (timeout, lost response) the provider may have already
+ * consumed the rotating refresh token, and replaying it trips refresh-token
+ * reuse detection, which can revoke the whole grant family. A successful
+ * rotation changes the token and therefore the key, so recovery after a
+ * peer's successful refresh is never blocked by this memo.
+ */
+const OAUTH_REFRESH_FAILURE_REPLAY_GUARD_MS = 30_000;
+
+/**
+ * Tag a refresh failure with the refresh token that was actually sent
+ * upstream, so failure recovery can distinguish "a peer rotated the row"
+ * from "the guard adopted the persisted token and that token failed".
+ * Without the tag, recovery compares the row against the caller's stale
+ * snapshot and misreads its own adoption as a peer rotation.
+ */
+const ATTEMPTED_REFRESH_TOKEN = Symbol("gjc.oauth.attemptedRefreshToken");
+
+type RefreshAttemptTagged = { [ATTEMPTED_REFRESH_TOKEN]?: string };
+
+function tagRefreshAttempt(error: unknown, refreshToken: string): unknown {
+	if (error !== null && typeof error === "object") {
+		(error as RefreshAttemptTagged)[ATTEMPTED_REFRESH_TOKEN] = refreshToken;
+	}
+	return error;
+}
+
+function getAttemptedRefreshToken(error: unknown): string | undefined {
+	if (error !== null && typeof error === "object") {
+		return (error as RefreshAttemptTagged)[ATTEMPTED_REFRESH_TOKEN];
+	}
+	return undefined;
+}
+
 type UsageCacheEntry<T> = {
 	value: T;
 	expiresAt: number;
@@ -1025,6 +1062,11 @@ export class AuthStorage {
 	#generationListeners: Set<(generation: number) => void> = new Set();
 	#oauthRefreshInFlight: Map<number, Promise<AuthCredentialSnapshotEntry>> = new Map();
 	#oauthCredentialRefreshInFlight: Map<number, Promise<OAuthCredentials>> = new Map();
+	/**
+	 * Locally failed refresh attempts keyed by `${credentialId}:${refreshToken}`.
+	 * See {@link OAUTH_REFRESH_FAILURE_REPLAY_GUARD_MS}.
+	 */
+	#recentOAuthRefreshFailures = new Map<string, { expiresAt: number; error: unknown }>();
 	#closed = false;
 
 	constructor(store: AuthCredentialStore, options: AuthStorageOptions = {}) {
@@ -3527,16 +3569,23 @@ export class AuthStorage {
 		credential: OAuthCredential,
 		credentialId: number | undefined,
 		signal?: AbortSignal,
+		force = false,
 	): Promise<OAuthCredentials> {
 		if (credentialId !== undefined) {
 			const existing = this.#oauthCredentialRefreshInFlight.get(credentialId);
 			if (existing) return raceCredentialRefreshWithSignal(existing, signal);
 		}
-		if (Date.now() + OAUTH_REFRESH_SKEW_MS < credential.expires) return credential;
+		if (!force && Date.now() + OAUTH_REFRESH_SKEW_MS < credential.expires) return credential;
 		if (credentialId === undefined) {
-			return this.#refreshOAuthCredentialUnshared(provider, credential, undefined, signal);
+			return this.#refreshOAuthCredentialUnshared(provider, credential, undefined, signal, force);
 		}
-		const promise = this.#refreshOAuthCredentialUnshared(provider, credential, credentialId).finally(() => {
+		const promise = this.#refreshOAuthCredentialUnshared(
+			provider,
+			credential,
+			credentialId,
+			undefined,
+			force,
+		).finally(() => {
 			this.#oauthCredentialRefreshInFlight.delete(credentialId);
 		});
 		this.#oauthCredentialRefreshInFlight.set(credentialId, promise);
@@ -3548,8 +3597,10 @@ export class AuthStorage {
 		credential: OAuthCredential,
 		credentialId: number | undefined,
 		signal?: AbortSignal,
+		force = false,
 	): Promise<OAuthCredentials> {
 		let refreshPromise: Promise<OAuthCredentials>;
+		let localDial = false;
 		// Caller override > store-level hook > local per-provider refresh.
 		// `RemoteAuthCredentialStore` exposes the hook so a broker-backed gateway
 		// routes refresh through the broker without explicit wiring.
@@ -3557,49 +3608,72 @@ export class AuthStorage {
 		const overrideRefresh = this.#refreshOAuthCredentialOverride ?? storeRefresh;
 		if (overrideRefresh && credentialId !== undefined) {
 			refreshPromise = overrideRefresh(provider, credentialId, credential, signal);
-		} else if (credential.mcpBinding) {
-			refreshPromise = refreshBoundMCPOAuthCredential(credential, {}, signal);
 		} else {
 			// Stale-snapshot guard: before replaying our in-memory refresh token
 			// upstream, re-read the persisted row. With several gjc processes
 			// sharing one store, a peer may have already rotated the token; the
-			// post-failure recovery below (catch in #tryOAuthCredential) reloads
-			// AFTER the replay, but by then the damage is upstream — providers
-			// with refresh-token rotation + reuse detection (Anthropic) treat a
+			// post-failure recovery (catch in #tryOAuthCredential) reloads AFTER
+			// the replay, but by then the damage is upstream — providers with
+			// refresh-token rotation + reuse detection (Anthropic) treat a
 			// replayed rotated token as theft and can revoke the whole grant
 			// family, killing the peer's freshly rotated, still-valid tokens
 			// mid-request (observed as live-session 401 "OAuth access token has
 			// been revoked" plus all-day `invalid_grant` refresh floods). Adopt
 			// the persisted credential instead: skip the upstream call entirely
-			// when it is still fresh, otherwise refresh with the newest refresh
-			// token. Force-refresh semantics are preserved — a force caller
-			// passes a clone whose refresh token still matches the row, so the
-			// guard is a no-op there (same for broker snapshots, where both
-			// sides carry the redacted refresh sentinel).
+			// when it is still fresh (unless the caller demanded a force
+			// refresh), otherwise refresh with the newest refresh token. Broker
+			// snapshots never take this branch (their store exposes the refresh
+			// hook above), so the redacted refresh sentinel cannot confuse the
+			// comparison.
 			if (credentialId !== undefined) {
 				const persisted = this.#store
-					.listAuthCredentials(provider)
+					.listAuthCredentials(resolveOAuthStorageProvider(provider))
 					.find(row => row.id === credentialId)?.credential;
 				if (persisted?.type === "oauth" && persisted.refresh !== credential.refresh) {
-					logger.debug("OAuth refresh skipped stale snapshot; adopting persisted rotation", {
+					logger.debug("OAuth refresh adopting persisted peer rotation over stale snapshot", {
 						provider,
 						credentialId,
+						force,
 						persistedFresh: Date.now() + OAUTH_REFRESH_SKEW_MS < persisted.expires,
 					});
-					if (Date.now() + OAUTH_REFRESH_SKEW_MS < persisted.expires) {
+					if (!force && Date.now() + OAUTH_REFRESH_SKEW_MS < persisted.expires) {
 						return persisted;
 					}
+					// Force refreshes still dial upstream, but spend the newest
+					// persisted refresh token instead of the stale snapshot one.
 					credential = persisted;
 				}
 			}
-			const customProvider = getOAuthProvider(provider);
-			if (customProvider) {
-				if (!customProvider.refreshToken) {
-					throw new Error(`OAuth provider "${provider}" does not support token refresh`);
+			// Replay guard: an attempt with this exact (id, token) pair failed
+			// moments ago. The provider may have consumed the rotating token even
+			// though we saw a failure (timeout, lost response), so replaying it
+			// risks reuse-detection revocation. Surface the memoized failure
+			// instead of dialing again; a peer's successful rotation changes the
+			// token and therefore never hits this memo.
+			if (credentialId !== undefined) {
+				const memoKey = `${credentialId}:${credential.refresh}`;
+				const memo = this.#recentOAuthRefreshFailures.get(memoKey);
+				if (memo && memo.expiresAt > Date.now()) {
+					throw memo.error;
 				}
-				refreshPromise = customProvider.refreshToken(credential);
+			}
+			localDial = true;
+			// Re-check the binding AFTER adoption: a persisted row may have
+			// acquired (or always had) an MCP binding the stale snapshot lacked,
+			// and its refresh token must only ever be sent to the bound token
+			// endpoint.
+			if (credential.mcpBinding) {
+				refreshPromise = refreshBoundMCPOAuthCredential(credential, {}, signal);
 			} else {
-				refreshPromise = refreshOAuthToken(provider as OAuthProvider, credential);
+				const customProvider = getOAuthProvider(provider);
+				if (customProvider) {
+					if (!customProvider.refreshToken) {
+						throw new Error(`OAuth provider "${provider}" does not support token refresh`);
+					}
+					refreshPromise = customProvider.refreshToken(credential);
+				} else {
+					refreshPromise = refreshOAuthToken(provider as OAuthProvider, credential);
+				}
 			}
 		}
 		// Bound the refresh so a slow/hanging token endpoint cannot stall credential selection.
@@ -3622,6 +3696,17 @@ export class AuthStorage {
 		}
 		try {
 			return await Promise.race([refreshPromise, cancellation.promise]);
+		} catch (error) {
+			if (localDial && credentialId !== undefined) {
+				for (const [key, entry] of this.#recentOAuthRefreshFailures) {
+					if (entry.expiresAt <= Date.now()) this.#recentOAuthRefreshFailures.delete(key);
+				}
+				this.#recentOAuthRefreshFailures.set(`${credentialId}:${credential.refresh}`, {
+					expiresAt: Date.now() + OAUTH_REFRESH_FAILURE_REPLAY_GUARD_MS,
+					error,
+				});
+			}
+			throw tagRefreshAttempt(error, credential.refresh);
 		} finally {
 			if (timeout) clearTimeout(timeout);
 			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
@@ -3797,11 +3882,17 @@ export class AuthStorage {
 			// multiple gjc processes sharing the store, the stale-snapshot failure
 			// would otherwise be misclassified as transient and the credential
 			// temp-blocked on every rotation race.
+			// Compare against the refresh token that was ACTUALLY sent upstream.
+			// The refresh helper may have adopted the persisted row's newer token
+			// (stale-snapshot guard); comparing the row against our even-staler
+			// selection snapshot would misread that adoption as a fresh peer
+			// rotation and loop reload-retry instead of classifying the failure.
+			const attemptedRefreshToken = getAttemptedRefreshToken(error) ?? selection.credential.refresh;
 			const attemptedCredentialId = this.#getStoredCredentials(provider)[selection.index]?.id;
 			if (attemptedCredentialId !== undefined) {
 				const latestRow = this.#store.listAuthCredentials(provider).find(row => row.id === attemptedCredentialId);
 				const latestCredential = latestRow?.credential;
-				if (latestCredential?.type === "oauth" && latestCredential.refresh !== selection.credential.refresh) {
+				if (latestCredential?.type === "oauth" && latestCredential.refresh !== attemptedRefreshToken) {
 					logger.debug("OAuth refresh race detected; another process rotated token first", {
 						provider,
 						index: selection.index,
@@ -3849,7 +3940,7 @@ export class AuthStorage {
 					// peer rotation to clobber — so apply it directly instead of looping.
 					const stillHoldsAttemptedToken =
 						attemptedCredentialId !== undefined &&
-						this.#credentialRowHoldsRefreshToken(provider, attemptedCredentialId, selection.credential.refresh);
+						this.#credentialRowHoldsRefreshToken(provider, attemptedCredentialId, attemptedRefreshToken);
 					if (stillHoldsAttemptedToken && attemptedCredentialId !== undefined) {
 						logger.warn("OAuth refresh disable CAS mismatched an unrotated row; disabling by id", {
 							provider,
@@ -4276,8 +4367,11 @@ export class AuthStorage {
 			if (target.credential.type !== "oauth") {
 				throw new Error(`Credential ${id} is not OAuth (provider=${provider}, type=${target.credential.type})`);
 			}
-			// Pass a clone with expires=0 so the cached not-yet-expired short-circuit
-			// in #refreshOAuthCredential doesn't suppress the requested refresh.
+			// Pass a clone with expires=0 plus explicit force intent so neither
+			// the cached not-yet-expired short-circuit in #refreshOAuthCredential
+			// nor the stale-snapshot guard's fresh-row adoption suppresses the
+			// requested refresh. The guard still substitutes the newest persisted
+			// refresh token when a peer rotated the row.
 			const stale: OAuthCredential = { ...target.credential, expires: 0 };
 			let refreshed: OAuthCredentials;
 			if (target.credential.mcpBinding) {
@@ -4298,7 +4392,7 @@ export class AuthStorage {
 				}
 				refreshed = refreshedCredential;
 			} else {
-				refreshed = await this.#refreshOAuthCredential(provider as Provider, stale, id, signal);
+				refreshed = await this.#refreshOAuthCredential(provider as Provider, stale, id, signal, true);
 			}
 			const updated: OAuthCredential = {
 				type: "oauth",
