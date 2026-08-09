@@ -7,10 +7,10 @@ import { logger } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
 import { parseEffort } from "../thinking";
 import { BUILTIN_TOOLS } from "../tools";
-import { ROOT_LAUNCH_FLAGS } from "./root-flags";
+import { type ConsumerLaunchFlagName, LAUNCH_PARSE_FLAGS, launchFlagIsOwnedBy } from "./root-flags";
 
 const ROOT_FLAG_TOKENS = new Set<string>();
-for (const [name, descriptor] of Object.entries(ROOT_LAUNCH_FLAGS)) {
+for (const [name, descriptor] of Object.entries(LAUNCH_PARSE_FLAGS)) {
 	ROOT_FLAG_TOKENS.add(`--${name}`);
 	if (descriptor.char) ROOT_FLAG_TOKENS.add(`-${descriptor.char}`);
 }
@@ -81,11 +81,13 @@ export interface Args {
 	noTitle?: boolean;
 	messages: string[];
 	fileArgs: string[];
-	/** Retained for test/runtime compatibility; extension-defined flags are no longer parsed. */
+	/** Flags unknown to every launch parser; their consumer supplies the diagnostic. */
 	unknownFlags: Map<string, boolean | string>;
 	/** Exact interactive startup login intent, recognized before model-profile activation. */
 	authBootstrap?: true;
 }
+
+const CONSUMER_FLAGS_BY_ARGS = new WeakMap<Args, Map<ConsumerLaunchFlagName, string>>();
 
 function isStartupSlashCommandArg(arg: string | undefined): boolean {
 	return (
@@ -128,6 +130,7 @@ export function parseArgs(args: string[]): Args {
 		fileArgs: [],
 		unknownFlags: new Map(),
 	};
+	const consumerFlags = new Map<ConsumerLaunchFlagName, string>();
 
 	for (let i = 0; i < args.length; i++) {
 		let arg = args[i];
@@ -161,7 +164,9 @@ export function parseArgs(args: string[]): Args {
 			args.splice(i + 1, 0, value);
 		}
 		if (arg.startsWith("-") && !isKnownRootFlagToken(arg)) {
-			throw new CliParseError(`Unknown option: ${arg}`);
+			result.unknownFlags.set(arg, true);
+			if (hasInlineValue) i++;
+			continue;
 		}
 
 		if (arg === "--help" || arg === "-h") {
@@ -272,18 +277,23 @@ export function parseArgs(args: string[]): Args {
 		} else if (arg === "--extension" || arg === "-e") {
 			const extension = takeFlagValue(args, i++, "--extension");
 			result.extensions = [...(result.extensions ?? []), extension];
+			consumerFlags.set("extension", "--extension");
 		} else if (arg === "--hook") {
 			const hook = takeFlagValue(args, i++, "--hook");
 			result.hooks = [...(result.hooks ?? []), hook];
+			consumerFlags.set("hook", "--hook");
 		} else if (arg === "--no-extensions") {
 			result.noExtensions = true;
+			consumerFlags.set("no-extensions", "--no-extensions");
 		} else if (arg === "--no-skills") {
 			result.noSkills = true;
+			consumerFlags.set("no-skills", "--no-skills");
 		} else if (arg === "--skills") {
 			result.skills = takeFlagValue(args, i++, "--skills")
 				.split(",")
 				.map(s => s.trim())
 				.filter(Boolean);
+			consumerFlags.set("skills", "--skills");
 		} else if (arg === "--tools") {
 			const toolNames = takeFlagValue(args, i++, "--tools")
 				.split(",")
@@ -345,14 +355,21 @@ export function parseArgs(args: string[]): Args {
 	if (result.default && !result.mpreset) {
 		throw new CliParseError("--default requires --mpreset <name>");
 	}
-	if (
-		result.mcpConfig !== undefined &&
-		(result.mode === "acp" || result.listModels !== undefined || result.export !== undefined)
-	) {
+	if (result.mcpConfig !== undefined && (result.listModels !== undefined || result.export !== undefined)) {
 		throw new CliParseError(
 			"--mcp-config is only supported in standalone interactive, tmux, print, text, or json modes.",
 		);
 	}
 
+	CONSUMER_FLAGS_BY_ARGS.set(result, consumerFlags);
 	return result;
+}
+
+/** Reject flags whose only owners are non-local startup consumers. */
+export function assertLocalLaunchArgs(parsed: Args): void {
+	const unknown = parsed.unknownFlags.keys().next().value;
+	if (unknown) throw new CliParseError(`Unknown option: ${unknown}`);
+	for (const [name, token] of CONSUMER_FLAGS_BY_ARGS.get(parsed) ?? []) {
+		if (!launchFlagIsOwnedBy(name, "local")) throw new CliParseError(`Unknown option: ${token}`);
+	}
 }
