@@ -15,7 +15,7 @@ export default class Acp extends Command {
 
 	async run(): Promise<void> {
 		const { args, terminalAuth } = prepareAcpTerminalAuthArgs(this.argv);
-		const parsed = parseArgs(args);
+		const parsed = parseArgs(args, terminalAuth ? "local" : "acp");
 		if (parsed.unknownFlags.size > 0) {
 			throw new CliParseError(`Unknown ACP option: ${[...parsed.unknownFlags.keys()].join(", ")}`);
 		}

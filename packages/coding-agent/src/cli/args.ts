@@ -33,6 +33,8 @@ function isKnownRootFlagToken(arg: string): boolean {
 
 export type Mode = "text" | "json" | "acp";
 
+export type ParseArgsAuthority = "local" | "acp" | "deferred";
+
 export interface Args {
 	cwd?: string;
 	allowHome?: boolean;
@@ -124,7 +126,7 @@ function takePromptValue(
 	return takeFlagValue(args, index, flag, allowInlineDashPrefixed || allowSeparatedDashPrefixed);
 }
 
-export function parseArgs(args: string[]): Args {
+export function parseArgs(args: string[], authority: ParseArgsAuthority = "local"): Args {
 	const result: Args = {
 		messages: [],
 		fileArgs: [],
@@ -362,6 +364,7 @@ export function parseArgs(args: string[]): Args {
 	}
 
 	CONSUMER_FLAGS_BY_ARGS.set(result, consumerFlags);
+	if (authority === "local") assertLocalLaunchArgs(result);
 	return result;
 }
 

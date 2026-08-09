@@ -92,7 +92,7 @@ export default class Index extends Command {
 
 	async run(): Promise<void> {
 		const { args } = prepareAcpTerminalAuthArgs(this.argv);
-		const parsed = parseArgs([...args]);
+		const parsed = parseArgs([...args], "deferred");
 		if (parsed.mode !== "acp") assertLocalLaunchArgs(parsed);
 		if (parsed.help || parsed.version) {
 			await runRootCommand(parsed, args);
@@ -110,7 +110,7 @@ export default class Index extends Command {
 			process.chdir(launch.cwd);
 			setProjectDir(launch.cwd);
 		}
-		const launchParsed = parseArgs(launch.args);
+		const launchParsed = parseArgs(launch.args, "deferred");
 		if (launchParsed.mode !== "acp") assertLocalLaunchArgs(launchParsed);
 		if (
 			launchDefaultTmuxIfNeeded({

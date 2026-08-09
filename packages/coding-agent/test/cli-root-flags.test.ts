@@ -55,10 +55,8 @@ describe("CLI root flag parity", () => {
 		expect(() => assertLocalLaunchArgs(parseArgs(["--no-skills"]))).not.toThrow();
 	});
 
-	it("defers unknown options to the owning startup path while preserving dash-prefixed prompt text after --", () => {
-		const unknown = parseArgs(["--modle", "opus"]);
-		expect(unknown.unknownFlags).toEqual(new Map([["--modle", true]]));
-		expect(() => assertLocalLaunchArgs(unknown)).toThrow("Unknown option: --modle");
+	it("rejects unknown options by default while preserving dash-prefixed prompt text after --", () => {
+		expect(() => parseArgs(["--modle", "opus"])).toThrow("Unknown option: --modle");
 		expect(parseArgs(["--", "--modle", "@prompt.md"])).toMatchObject({
 			messages: ["--modle"],
 			fileArgs: ["prompt.md"],

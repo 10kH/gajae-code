@@ -4,7 +4,7 @@
 
 ### Fixed
 - Streamed edit preview coalescing now keys on the complete partial-JSON payload rather than its length, so same-size in-place argument replacements recompute and render while repeated payloads remain cached.
-- Root flag validation now defers ACP- and local-startup-owned options to their owning consumers, preserving ACP-specific diagnostics, SDK startup forwarding, and real ACP subprocess framing without exposing retired flags in root help or completion.
+- CLI parsing now fails closed by default, while launch and ACP explicitly defer only their owned startup options; this preserves ACP-specific diagnostics, SDK startup forwarding, real ACP subprocess framing, and RLM typo rejection without exposing retired flags in root help or completion.
 
 ## [0.12.21] - 2026-08-09
 
