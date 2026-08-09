@@ -43,6 +43,8 @@ import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { SessionManager } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
 import { truncateTail } from "../session/streaming-output";
+// Ensure mandatory subagent result extraction is available even when a session is mocked.
+import "../tools/yield";
 import type { ContextFileEntry } from "../tools";
 import { jtdToJsonSchema, normalizeSchema } from "../tools/jtd-to-json-schema";
 import type { ReportFindingDetails } from "../tools/review";
@@ -1511,7 +1513,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					options.parentActiveModelPattern,
 					modelRegistry,
 					settings,
-					options.parentSessionId,
+					canonicalChildScope,
 					{ managedFallback: true },
 					canonicalChildScope,
 				),
@@ -1659,6 +1661,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					authStorage,
 					modelRegistry,
 					settings: subagentSettings,
+					providerSessionId: canonicalChildScope,
 					model,
 					thinkingLevel: effectiveThinkingLevel,
 					modelSubstitution:

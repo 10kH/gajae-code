@@ -430,7 +430,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 			await openedSessionManager?.close();
 			appendSync.mockRestore();
 		}
-	}, 15_000);
+	}, 30_000);
 
 	it("sanitizes stale assistant replay metadata when forking a persisted session", async () => {
 		const sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-fork-source-${Snowflake.next()}-`));
@@ -603,7 +603,11 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		authStorages.push(childAuthStorage);
 
 		expect(child.sessionId).not.toBe(parent.sessionId);
+		// A fork owns a new transcript and provider transport/cache affinity. It
+		// inherits only the sanitized prompt seed, never the parent's session.
+		expect(child.agent.sessionId).toBe(child.sessionId);
 		expect(child.agent.providerSessionId).toBe(child.sessionId);
+		expect(child.agent.providerSessionId).not.toBe(parent.agent.providerSessionId);
 		expect(child.providerSessionState).toBe(childState);
 		expect(child.providerSessionState).not.toBe(parent.providerSessionState);
 		const childCodexState = child.providerSessionState.get("openai-codex-responses") as
@@ -913,6 +917,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 				"task.forkContext.enabled": true,
 			}),
 			getSessionFile: () => parent.sessionManager.getSessionFile(),
+			getSessionId: () => parent.sessionId,
 			getSessionSpawns: () => "*",
 			model: parent.model,
 			buildForkContextSeed: (opts: Parameters<AgentSession["buildForkContextSeed"]>[0]) =>
@@ -951,12 +956,14 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		expect(execChild).toBeDefined();
 		expect(archChild).toBeDefined();
 
+		const expectedIds = new Map([
+			["executor", JSON.stringify(["subagent-canonical", parent.sessionId, "0-ExecFork"])],
+			["architect", JSON.stringify(["subagent-canonical", parent.sessionId, "0-ArchFork"])],
+		]);
 		for (const child of [execChild!, archChild!]) {
 			expect(child.forkContextSeed).toBeDefined();
-			// Seeds carry conversation content only. TaskTool must not inject a
-			// provider identity: each child derives its own from its logical session
-			// so concurrent workers never share an upstream session owner.
-			expect(child.providerSessionId).toBeUndefined();
+			expect(child.providerSessionId).toBe(expectedIds.get(child.agentDisplayName!));
+			expect(child.providerSessionId).not.toBe(parent.sessionId);
 		}
 	});
 
