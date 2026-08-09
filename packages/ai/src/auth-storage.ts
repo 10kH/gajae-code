@@ -301,6 +301,18 @@ export interface AuthCredentialSnapshot {
  *   a remote broker; mutating methods (`replace*`, `upsert*`, `delete*ForProvider`)
  *   throw because login flows route through the broker, not the client.
  */
+export type OAuthRefreshLease = {
+	credentialId: number;
+	owner: string;
+	tokenFingerprint: string;
+};
+
+export type OAuthRefreshLeaseClaim =
+	| { kind: "claimed"; credential: OAuthCredential; lease: OAuthRefreshLease }
+	| { kind: "adopted"; credential: OAuthCredential }
+	| { kind: "busy"; expiresAt: number }
+	| { kind: "missing" };
+
 export interface AuthCredentialStore {
 	close(): void;
 	listAuthCredentials(provider?: string): StoredAuthCredential[];
@@ -339,6 +351,25 @@ export interface AuthCredentialStore {
 		client: MCPOAuthRefreshClient,
 		signal?: AbortSignal,
 	): Promise<OAuthCredential>;
+	/**
+	 * Atomically adopts a fresh row or claims the current refresh token for one
+	 * local provider dial. SQLite-backed stores use this to prevent another
+	 * process from replaying a rotating refresh token between a pre-read and
+	 * the provider request.
+	 */
+	claimOAuthRefreshLease?(
+		credentialId: number,
+		expectedRefresh: string,
+		force: boolean,
+		owner: string,
+		nowMs: number,
+		leaseMs: number,
+	): OAuthRefreshLeaseClaim;
+	/** Atomically persists a successful claimed refresh and releases its lease. */
+	completeOAuthRefreshLease?(lease: OAuthRefreshLease, credential: OAuthCredential): boolean;
+	/** Releases an uncompleted refresh lease owned by this process. */
+	releaseOAuthRefreshLease?(lease: OAuthRefreshLease): void;
+
 	/**
 	 * Optional async pre-read hook invoked after AuthStorage selects a stored
 	 * credential but before it returns that credential for an outbound request.
@@ -722,6 +753,9 @@ const USAGE_FAILURE_BACKOFF_MS = 10_000;
 // (~3.5s total worst case); a tight per-request budget aborts retries mid-cycle.
 const DEFAULT_USAGE_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_OAUTH_REFRESH_TIMEOUT_MS = 10_000;
+/** Maximum provider ownership window; expiry recovers a crashed process without indefinite blocking. */
+const OAUTH_REFRESH_LEASE_MS = DEFAULT_OAUTH_REFRESH_TIMEOUT_MS + 5_000;
+
 /**
  * Refresh OAuth access tokens this many ms before their stated expiry. The
  * skew exists so callers downstream of {@link AuthStorage} (stream providers,
@@ -771,7 +805,7 @@ const OAUTH_REFRESH_FAILURE_REPLAY_GUARD_MS = 30_000;
  * persist from this shape so an adopted binding or identity is never
  * reconstructed from a stale snapshot.
  */
-type RefreshedOAuthCredentials = OAuthCredentials & { mcpBinding?: MCPOAuthBinding };
+type RefreshedOAuthCredentials = OAuthCredentials & { mcpBinding?: MCPOAuthBinding; persistedByLease?: boolean };
 
 /**
  * Side-table mapping a refresh failure to the refresh token that was actually
@@ -1076,6 +1110,8 @@ export class AuthStorage {
 	 * See {@link OAUTH_REFRESH_FAILURE_REPLAY_GUARD_MS}.
 	 */
 	#recentOAuthRefreshFailures = new Map<string, { expiresAt: number; error: unknown }>();
+	#oauthRefreshLeaseOwner = crypto.randomUUID();
+
 	#closed = false;
 
 	constructor(store: AuthCredentialStore, options: AuthStorageOptions = {}) {
@@ -1724,12 +1760,12 @@ export class AuthStorage {
 		}
 	}
 
-	/** Updates credential at index in-place (used for OAuth token refresh) */
-	#replaceCredentialAt(provider: string, index: number, credential: AuthCredential): void {
+	/** Updates a credential at index after OAuth token refresh. */
+	#replaceCredentialAt(provider: string, index: number, credential: AuthCredential, persist = true): void {
 		const entries = this.#getStoredCredentials(provider);
 		if (index < 0 || index >= entries.length) return;
 		const target = entries[index];
-		this.#store.updateAuthCredential(target.id, credential);
+		if (persist) this.#store.updateAuthCredential(target.id, credential);
 		const updated = [...entries];
 		updated[index] = { id: target.id, credential };
 		this.#setStoredCredentials(provider, updated);
@@ -3521,7 +3557,12 @@ export class AuthStorage {
 						type: "oauth",
 					};
 					candidate.selection.credential = updated;
-					this.#replaceCredentialAt(provider, candidate.selection.index, updated);
+					this.#replaceCredentialAt(
+						provider,
+						candidate.selection.index,
+						updated,
+						!refreshedCredentials.persistedByLease,
+					);
 				} catch {}
 			}),
 		);
@@ -3613,6 +3654,8 @@ export class AuthStorage {
 	): Promise<RefreshedOAuthCredentials> {
 		let refreshPromise: Promise<OAuthCredentials>;
 		let localDial = false;
+		let refreshLease: OAuthRefreshLease | undefined;
+
 		// Caller override > store-level hook > local per-provider refresh.
 		// `RemoteAuthCredentialStore` exposes the hook so a broker-backed gateway
 		// routes refresh through the broker without explicit wiring.
@@ -3638,37 +3681,56 @@ export class AuthStorage {
 			// hook above), so the redacted refresh sentinel cannot confuse the
 			// comparison.
 			if (credentialId !== undefined) {
-				const persisted = this.#store
-					.listAuthCredentials(resolveOAuthStorageProvider(provider))
-					.find(row => row.id === credentialId)?.credential;
-				if (persisted?.type === "oauth" && persisted.refresh !== credential.refresh) {
-					logger.debug("OAuth refresh adopting persisted peer rotation over stale snapshot", {
-						provider,
-						credentialId,
-						force,
-						persistedFresh: Date.now() + OAUTH_REFRESH_SKEW_MS < persisted.expires,
-					});
-					if (!force && Date.now() + OAUTH_REFRESH_SKEW_MS < persisted.expires) {
-						// Normalize into a full-authority shape with EXPLICIT
-						// optional keys: JSON-deserialized rows omit absent
-						// fields, and callers merge this result over their stale
-						// snapshot with a spread — removed authority (e.g. a
-						// dropped MCP binding) must clobber the stale value, not
-						// be inherited from it.
-						return {
-							access: persisted.access,
-							refresh: persisted.refresh,
-							expires: persisted.expires,
-							accountId: persisted.accountId,
-							email: persisted.email,
-							projectId: persisted.projectId,
-							enterpriseUrl: persisted.enterpriseUrl,
-							mcpBinding: persisted.mcpBinding,
-						};
+				const claimLease = this.#store.claimOAuthRefreshLease?.bind(this.#store);
+				if (claimLease) {
+					const owner = this.#oauthRefreshLeaseOwner;
+
+					const deadline = Date.now() + OAUTH_REFRESH_LEASE_MS;
+					for (;;) {
+						if (signal?.aborted) throw new Error("OAuth token refresh aborted by caller");
+						const claim = claimLease(
+							credentialId,
+							credential.refresh,
+							force,
+							owner,
+							Date.now(),
+							OAUTH_REFRESH_LEASE_MS,
+						);
+						if (claim.kind === "missing") throw new Error("OAuth refresh credential disappeared");
+
+						if (claim.kind === "claimed") {
+							credential = claim.credential;
+							refreshLease = claim.lease;
+							break;
+						}
+						if (claim.kind === "adopted") {
+							return {
+								access: claim.credential.access,
+								refresh: claim.credential.refresh,
+								expires: claim.credential.expires,
+								accountId: claim.credential.accountId,
+								email: claim.credential.email,
+								projectId: claim.credential.projectId,
+								enterpriseUrl: claim.credential.enterpriseUrl,
+								mcpBinding: claim.credential.mcpBinding,
+								persistedByLease: true,
+							};
+						}
+						if (Date.now() >= deadline) {
+							throw new Error("OAuth token refresh ownership remained ambiguous");
+						}
+						await Bun.sleep(Math.min(50, Math.max(1, claim.expiresAt - Date.now())));
 					}
-					// Force refreshes still dial upstream, but spend the newest
-					// persisted refresh token instead of the stale snapshot one.
-					credential = persisted;
+				} else {
+					const persisted = this.#store
+						.listAuthCredentials(resolveOAuthStorageProvider(provider))
+						.find(row => row.id === credentialId)?.credential;
+					if (persisted?.type === "oauth" && persisted.refresh !== credential.refresh) {
+						if (!force && Date.now() + OAUTH_REFRESH_SKEW_MS < persisted.expires) {
+							return { ...persisted, persistedByLease: true };
+						}
+						credential = persisted;
+					}
 				}
 			}
 			// Replay guard: an attempt with this exact (id, token) pair failed
@@ -3732,7 +3794,7 @@ export class AuthStorage {
 			// their stale snapshots would strip an adopted binding — sending the
 			// next refresh token to the wrong endpoint — or relabel rotated
 			// tokens with stale identity.
-			return {
+			const authority: RefreshedOAuthCredentials = {
 				...refreshed,
 				accountId: refreshed.accountId ?? credential.accountId,
 				email: refreshed.email ?? credential.email,
@@ -3740,6 +3802,16 @@ export class AuthStorage {
 				enterpriseUrl: refreshed.enterpriseUrl ?? credential.enterpriseUrl,
 				mcpBinding: (refreshed as RefreshedOAuthCredentials).mcpBinding ?? credential.mcpBinding,
 			};
+			if (refreshLease) {
+				const completeLease = this.#store.completeOAuthRefreshLease?.bind(this.#store);
+				const { persistedByLease: _persistedByLease, ...persistedCredentials } = authority;
+				const persisted: OAuthCredential = { type: "oauth", ...persistedCredentials };
+				if (!completeLease?.(refreshLease, persisted)) {
+					throw new Error("OAuth token refresh ownership was lost before persistence");
+				}
+				authority.persistedByLease = true;
+			}
+			return authority;
 		} catch (error) {
 			if (localDial && credentialId !== undefined) {
 				for (const [key, entry] of this.#recentOAuthRefreshFailures) {
@@ -3894,7 +3966,8 @@ export class AuthStorage {
 				enterpriseUrl: result.newCredentials.enterpriseUrl ?? selection.credential.enterpriseUrl,
 				mcpBinding: refreshedAuthority.mcpBinding,
 			};
-			this.#replaceCredentialAt(provider, selection.index, updated);
+			this.#replaceCredentialAt(provider, selection.index, updated, !refreshedAuthority.persistedByLease);
+
 			if ((checkUsage && !allowBlocked) || requiresProModel) {
 				const sameAccount = selection.credential.accountId === updated.accountId;
 				if (!usageChecked || !sameAccount) {
@@ -4473,7 +4546,7 @@ export class AuthStorage {
 				enterpriseUrl: refreshed.enterpriseUrl ?? target.credential.enterpriseUrl,
 				mcpBinding: refreshed.mcpBinding,
 			};
-			this.#replaceCredentialAt(provider, index, updated);
+			this.#replaceCredentialAt(provider, index, updated, !refreshed.persistedByLease);
 			return {
 				id,
 				provider,
@@ -4858,6 +4931,13 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				expires_at INTEGER NOT NULL
 			);
 			CREATE INDEX IF NOT EXISTS idx_cache_expires ON cache(expires_at);
+			CREATE TABLE IF NOT EXISTS oauth_refresh_leases (
+				credential_id INTEGER PRIMARY KEY,
+				owner TEXT NOT NULL,
+				token_fingerprint TEXT NOT NULL,
+				expires_at INTEGER NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS idx_oauth_refresh_leases_expires ON oauth_refresh_leases(expires_at);
 		`);
 
 		if (!this.#authCredentialsTableExists()) {
@@ -5057,6 +5137,98 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			results.push(toStoredAuthCredential(row, credential));
 		}
 		return results;
+	}
+	claimOAuthRefreshLease(
+		credentialId: number,
+		expectedRefresh: string,
+		force: boolean,
+		owner: string,
+		nowMs: number,
+		leaseMs: number,
+	): OAuthRefreshLeaseClaim {
+		const claim = this.#db.transaction((): OAuthRefreshLeaseClaim => {
+			const row = this.#db
+				.prepare(
+					"SELECT id, provider, credential_type, data, disabled_cause, identity_key FROM auth_credentials WHERE id = ? AND disabled_cause IS NULL",
+				)
+				.get(credentialId) as AuthRow | undefined;
+			const credential = row ? deserializeCredential(row) : null;
+			if (credential?.type !== "oauth") return { kind: "missing" };
+			if (!force && credential.refresh !== expectedRefresh && nowMs + OAUTH_REFRESH_SKEW_MS < credential.expires) {
+				return { kind: "adopted", credential };
+			}
+			const active = this.#db
+				.prepare("SELECT owner, expires_at FROM oauth_refresh_leases WHERE credential_id = ?")
+				.get(credentialId) as { owner?: string; expires_at?: number } | undefined;
+			if (typeof active?.expires_at === "number" && active.expires_at > nowMs) {
+				if (active.owner === owner) {
+					this.#db
+						.prepare("UPDATE oauth_refresh_leases SET expires_at = ? WHERE credential_id = ? AND owner = ?")
+						.run(nowMs + leaseMs, credentialId, owner);
+					return {
+						kind: "claimed",
+						credential,
+						lease: {
+							credentialId,
+							owner,
+							tokenFingerprint: crypto.createHash("sha256").update(credential.refresh).digest("hex"),
+						},
+					};
+				}
+				return { kind: "busy", expiresAt: active.expires_at };
+			}
+
+			this.#db.prepare("DELETE FROM oauth_refresh_leases WHERE credential_id = ?").run(credentialId);
+			const tokenFingerprint = crypto.createHash("sha256").update(credential.refresh).digest("hex");
+			this.#db
+				.prepare(
+					"INSERT INTO oauth_refresh_leases (credential_id, owner, token_fingerprint, expires_at) VALUES (?, ?, ?, ?)",
+				)
+				.run(credentialId, owner, tokenFingerprint, nowMs + leaseMs);
+			return { kind: "claimed", credential, lease: { credentialId, owner, tokenFingerprint } };
+		});
+		return claim();
+	}
+
+	completeOAuthRefreshLease(lease: OAuthRefreshLease, credential: OAuthCredential): boolean {
+		const serialized = serializeCredential(
+			(
+				this.#db.prepare("SELECT provider FROM auth_credentials WHERE id = ?").get(lease.credentialId) as
+					| { provider?: string }
+					| undefined
+			)?.provider ?? "",
+			credential,
+		);
+		if (!serialized) return false;
+		const complete = this.#db.transaction(() => {
+			const leaseRow = this.#db
+				.prepare("SELECT owner, token_fingerprint FROM oauth_refresh_leases WHERE credential_id = ?")
+				.get(lease.credentialId) as { owner?: string; token_fingerprint?: string } | undefined;
+			if (leaseRow?.owner !== lease.owner || leaseRow.token_fingerprint !== lease.tokenFingerprint) return false;
+			const row = this.#db
+				.prepare("SELECT data FROM auth_credentials WHERE id = ? AND disabled_cause IS NULL")
+				.get(lease.credentialId) as { data?: string } | undefined;
+			if (
+				!row ||
+				crypto
+					.createHash("sha256")
+					.update((JSON.parse(row.data ?? "{}") as { refresh?: string }).refresh ?? "")
+					.digest("hex") !== lease.tokenFingerprint
+			)
+				return false;
+			this.#updateStmt.run(serialized.credentialType, serialized.data, serialized.identityKey, lease.credentialId);
+			this.#db
+				.prepare("DELETE FROM oauth_refresh_leases WHERE credential_id = ? AND owner = ?")
+				.run(lease.credentialId, lease.owner);
+			return true;
+		});
+		return complete();
+	}
+
+	releaseOAuthRefreshLease(lease: OAuthRefreshLease): void {
+		this.#db
+			.prepare("DELETE FROM oauth_refresh_leases WHERE credential_id = ? AND owner = ?")
+			.run(lease.credentialId, lease.owner);
 	}
 
 	replaceAuthCredentialsForProvider(provider: string, credentials: AuthCredential[]): StoredAuthCredential[] {

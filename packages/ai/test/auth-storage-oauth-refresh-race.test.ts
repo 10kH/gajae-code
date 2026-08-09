@@ -1040,4 +1040,67 @@ describe("AuthStorage OAuth refresh race", () => {
 			}
 		});
 	});
+
+	test("leases one rotating token across SQLite connections and adopts the winner", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const peerStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		const peer = new AuthStorage(peerStore);
+		try {
+			await authStorage.set("anthropic", [
+				{ type: "oauth", access: "expired-access", refresh: "shared-refresh", expires: Date.now() - 60_000 },
+			]);
+			await peer.reload();
+			const firstDial = Promise.withResolvers<void>();
+			const releaseFirstDial = Promise.withResolvers<void>();
+			let dials = 0;
+			vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async (_provider, credential) => {
+				dials += 1;
+				expect(credential.refresh).toBe("shared-refresh");
+				firstDial.resolve();
+				await releaseFirstDial.promise;
+				return {
+					...credential,
+					access: "winner-access",
+					refresh: "winner-refresh",
+					expires: Date.now() + 60 * 60_000,
+				};
+			});
+			vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+				const credential = credentials[provider]!;
+				return { newCredentials: credential, apiKey: credential.access };
+			});
+			await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+				const winner = authStorage!.getApiKey("anthropic", "lease-winner");
+				await firstDial.promise;
+				const waiter = peer.getApiKey("anthropic", "lease-waiter");
+				await Bun.sleep(100);
+				expect(dials).toBe(1);
+				releaseFirstDial.resolve();
+				await expect(winner).resolves.toBe("winner-access");
+				await expect(waiter).resolves.toBe("winner-access");
+				expect(dials).toBe(1);
+			});
+		} finally {
+			peerStore.close();
+		}
+	});
+	test("expires abandoned leases, isolates credentials, and never lets force steal an active lease", async () => {
+		if (!authStorage || !(store instanceof SqliteAuthCredentialStore)) throw new Error("test setup failed");
+		await authStorage.set("anthropic", [
+			{ type: "oauth", access: "a", refresh: "first-secret", expires: Date.now() - 60_000 },
+			{ type: "oauth", access: "b", refresh: "second-secret", expires: Date.now() - 60_000 },
+		]);
+		const [first, second] = store.listAuthCredentials("anthropic");
+		if (!first || !second) throw new Error("credentials missing");
+		const now = Date.now();
+		const firstClaim = store.claimOAuthRefreshLease(first.id, "first-secret", false, "owner-a", now, 50);
+		expect(firstClaim.kind).toBe("claimed");
+		const forcedPeerClaim = store.claimOAuthRefreshLease(first.id, "first-secret", true, "owner-b", now + 1, 50);
+		expect(forcedPeerClaim.kind).toBe("busy");
+		const secondClaim = store.claimOAuthRefreshLease(second.id, "second-secret", false, "owner-b", now + 1, 50);
+		expect(secondClaim.kind).toBe("claimed");
+		const recovered = store.claimOAuthRefreshLease(first.id, "first-secret", false, "owner-b", now + 51, 50);
+		expect(recovered.kind).toBe("claimed");
+		if (recovered.kind === "claimed") expect(recovered.lease.tokenFingerprint).not.toContain("first-secret");
+	});
 });
