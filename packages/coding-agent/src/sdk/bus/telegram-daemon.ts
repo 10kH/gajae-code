@@ -4289,6 +4289,8 @@ export class TelegramNotificationDaemon {
 	/** Durable provider presentation identities; credentials and lifecycle state never enter this journal. */
 	private readonly deliveredPublications = new Map<string, number>();
 	private readonly claimedPublications = new Map<string, number>();
+	private readonly tentativePublications = new Set<string>();
+	private readonly publicationsBeingRejected = new Set<string>();
 	private readonly ambiguousPublications = new Map<string, number>();
 	private readonly rejectedPublications = new Map<string, number>();
 	private readonly publicationsClaimedThisRun = new Set<string>();
@@ -5484,6 +5486,7 @@ export class TelegramNotificationDaemon {
 		}
 		if (this.claimedPublications.size + this.ambiguousPublications.size >= TELEGRAM_PUBLICATION_CLAIM_LIMIT)
 			throw new Error("Telegram publication claim capacity is exhausted; refusing provider dispatch.");
+		this.tentativePublications.add(publicationId);
 		this.claimedPublications.set(publicationId, this.runtime.now());
 		this.publicationsClaimedThisRun.add(publicationId);
 		this.prunePublicationReceipts();
@@ -5493,11 +5496,13 @@ export class TelegramNotificationDaemon {
 		} catch (error) {
 			this.claimedPublications.delete(publicationId);
 			this.publicationsClaimedThisRun.delete(publicationId);
+			this.tentativePublications.delete(publicationId);
 			logger.warn(`notifications: Telegram publication claim failed: ${sanitizeDiagnostic(String(error))}`);
 			this.rejectPublicationSettlement(publicationId, error);
 			this.publicationSettlements.delete(publicationId);
 			throw error;
 		}
+		if (!this.publicationsBeingRejected.has(publicationId)) this.tentativePublications.delete(publicationId);
 		if (!this.claimedPublications.has(publicationId) || this.publicationShouldSuppress(publicationId))
 			throw new Error("Telegram publication claim authority changed during persistence.");
 	}
@@ -5627,6 +5632,7 @@ export class TelegramNotificationDaemon {
 	private async markPublicationRejected(publicationId: string | undefined): Promise<void> {
 		if (!publicationId || this.rejectedPublications.has(publicationId) || this.publicationDelivered(publicationId))
 			return;
+		this.publicationsBeingRejected.add(publicationId);
 		const claimedAt = this.claimedPublications.get(publicationId);
 		const ambiguousAt = this.ambiguousPublications.get(publicationId);
 		this.claimedPublications.delete(publicationId);
@@ -5638,11 +5644,16 @@ export class TelegramNotificationDaemon {
 			await this.persistPublicationReceipts();
 		} catch (error) {
 			this.rejectedPublications.delete(publicationId);
-			if (claimedAt !== undefined) this.claimedPublications.set(publicationId, claimedAt);
-			else if (ambiguousAt !== undefined) this.claimedPublications.set(publicationId, ambiguousAt);
+			if (!this.tentativePublications.has(publicationId)) {
+				if (claimedAt !== undefined) this.claimedPublications.set(publicationId, claimedAt);
+				else if (ambiguousAt !== undefined) this.ambiguousPublications.set(publicationId, ambiguousAt);
+			}
 			this.rejectPublicationSettlement(publicationId, error);
 			throw error;
+		} finally {
+			this.publicationsBeingRejected.delete(publicationId);
 		}
+		this.tentativePublications.delete(publicationId);
 		this.settlePublication(publicationId);
 	}
 

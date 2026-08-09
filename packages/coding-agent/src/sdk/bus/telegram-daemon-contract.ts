@@ -179,8 +179,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 115 removes provider authority for every attachment disposed by stop.
  * Generation 116 creates publication waiters only after claim admission succeeds.
  * Generation 117 exposes tentative claims to concurrent teardown and aborts revoked admission.
+ * Generation 118 prevents failed concurrent rejection from reviving tentative claims.
  */
-export const DAEMON_GENERATION = 117;
+export const DAEMON_GENERATION = 118;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -243,5 +244,6 @@ export const DAEMON_GENERATION = 117;
  * Epoch 62 covers stop during recovered-frame and replay awaits.
  * Epoch 63 prevents capacity and claim-persistence waiter leaks.
  * Epoch 64 closes attachment replacement during claim persistence.
+ * Epoch 65 closes dual persistence failure during tentative claim teardown.
  */
-export const SERVING_EPOCH = 64;
+export const SERVING_EPOCH = 65;
