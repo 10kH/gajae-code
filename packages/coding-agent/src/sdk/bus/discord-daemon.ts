@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { logger } from "@gajae-code/utils";
 import { SdkClientError } from "../client/client";
 import { type SessionAttachment, SessionRouterError } from "../router";
 import type { ChatDeliveryError } from "./chat-daemon-runtime";
@@ -291,11 +292,24 @@ export class DiscordNotificationDaemon {
 			this.#started = false;
 			await this.options.provider.stop();
 		}
-		// Drain until quiescent: a tracked task can schedule further tracked work while
-		// we await, and any that outlives stop() would bleed timing pressure into the
-		// next daemon/test. #started is false, so no new recovery timers arm and the
-		// loop terminates.
-		while (this.#activeWork.size > 0) await Promise.all([...this.#activeWork]);
+		// Drain until quiescent, but never let a hung provider REST request prevent
+		// SessionRouter authority revocation and daemon ownership release.
+		const drainDeadline = this.#now() + 5_000;
+		while (this.#activeWork.size > 0) {
+			const remaining = drainDeadline - this.#now();
+			if (remaining <= 0) {
+				logger.warn("Discord provider work exceeded the 5000ms shutdown drain; continuing with Router revocation.");
+				return;
+			}
+			const settled = await Promise.race([
+				Promise.allSettled([...this.#activeWork]).then(() => true),
+				Bun.sleep(remaining).then(() => false),
+			]);
+			if (!settled) {
+				logger.warn("Discord provider work exceeded the 5000ms shutdown drain; continuing with Router revocation.");
+				return;
+			}
+		}
 	}
 
 	/**

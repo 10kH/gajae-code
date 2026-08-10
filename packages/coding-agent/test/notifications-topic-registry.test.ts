@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes selected-ambiguity generation 127 at serving epoch 74", () => {
+test("publishes Discord bounded-drain generation 128 at serving epoch 75", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 127 / serving epoch 74: accepted responses without message identity remain ambiguous.
-	expect(DAEMON_GENERATION).toBe(127);
-	expect(SERVING_EPOCH).toBe(74);
+	// Generation 128 / serving epoch 75: hung Discord work cannot block Router shutdown.
+	expect(DAEMON_GENERATION).toBe(128);
+	expect(SERVING_EPOCH).toBe(75);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
