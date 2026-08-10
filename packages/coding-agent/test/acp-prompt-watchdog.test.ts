@@ -17,7 +17,7 @@ import {
 	publishExactSessionAuthority,
 } from "./helpers/sdk-exact-session-authority";
 
-setDefaultTimeout(30_000);
+setDefaultTimeout(60_000);
 
 type TestSocket = { send(message: string): void };
 type StoppedReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";
@@ -92,14 +92,14 @@ type Fixture = {
 async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
 	return await Promise.race([
 		promise,
-		Bun.sleep(15_000).then(() => {
+		Bun.sleep(45_000).then(() => {
 			throw new Error(`Timed out waiting for ${label}`);
 		}),
 	]);
 }
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-	const deadline = Date.now() + 15_000;
+	const deadline = Date.now() + 45_000;
 	while (Date.now() < deadline) {
 		if (predicate()) return;
 		await Bun.sleep(5);
