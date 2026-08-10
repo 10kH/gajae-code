@@ -2379,7 +2379,7 @@ function sdkControlSurface(
 		requesterConnectionId?: string,
 		clientRef?: string,
 		trackReconciliation?: boolean,
-		preflightAbort?: () => void,
+		preflightAbort?: () => void | Promise<void>,
 		reconciliationKind?: ReconciliationKind,
 	) => void | Promise<void> = () => {},
 	onPromptFailed: (
@@ -2951,10 +2951,8 @@ function sdkControlSurface(
 				reject(error);
 			};
 			const executionSettled = Promise.withResolvers<void>();
-			let cancellationWaiterAttached = false;
 			const key = preflightKey(requesterConnectionId, correlation);
 			const cancelPreflight = async () => {
-				cancellationWaiterAttached = true;
 				preflightController.abort();
 				if (phase === "pending") {
 					releaseAdmission();
@@ -2995,7 +2993,7 @@ function sdkControlSurface(
 									requesterConnectionId,
 									undefined,
 									false,
-									() => preflightController.abort(),
+									cancelPreflight,
 									"skill",
 								);
 								promptOwned = requesterConnectionId !== undefined;
@@ -3073,14 +3071,7 @@ function sdkControlSurface(
 					}
 					if (!promptOwned && durableSkillAccepted && skillRecon)
 						void skillRecon.noteTransition(correlation, { type: "agent_failed", error });
-					if (
-						cancellationWaiterAttached &&
-						preflightController.signal.aborted &&
-						phase === "accepted" &&
-						error !== cancellationError
-					)
-						executionSettled.reject(error);
-					else executionSettled.resolve();
+					executionSettled.resolve();
 				},
 			);
 			try {
@@ -4264,7 +4255,7 @@ export function createNotificationsExtension(
 			/** Agent-owned resource run captured at acceptance; cleanup targets only this handle. */
 			executionHandle?: string;
 			/** Cancels accepted skill preparation before an execution handle exists. */
-			preflightAbort?: () => void;
+			preflightAbort?: () => void | Promise<void>;
 			reconciliationKind: ReconciliationKind;
 			bufferedFrames: Array<PromptLifecycleFrame | Record<string, unknown>>;
 		};
@@ -4436,7 +4427,7 @@ export function createNotificationsExtension(
 			requesterConnectionId?: string,
 			clientRef?: string,
 			trackReconciliation = false,
-			preflightAbort?: () => void,
+			preflightAbort?: () => void | Promise<void>,
 			reconciliationKind: ReconciliationKind = "prompt",
 		) => {
 			if (!requesterConnectionId) {
@@ -4798,15 +4789,44 @@ export function createNotificationsExtension(
 				const [commandId, turnId] = key.split(":", 2);
 				if (commandId && turnId) {
 					const hasExecutionHandle = Boolean(submission.executionHandle);
-					if (!hasExecutionHandle) {
-						submission.preflightAbort?.();
-						removePendingPromptCorrelation({ commandId, turnId });
+					const cancellationOutcome: SdkPromptTerminalOutcome = {
+						kind: "stopped",
+						reason: "cancelled",
+						provenance: "client_cancel",
+					};
+					if (!hasExecutionHandle && submission.preflightAbort) {
+						try {
+							await kindReconciliation.claimPendingOutcome(
+								submission.reconciliationKind,
+								{ commandId, turnId },
+								cancellationOutcome,
+							);
+						} catch (error) {
+							logger.warn(`sdk: accepted preflight cancellation claim failed: ${String(error)}`);
+							failPromptClosed(
+								{ commandId, turnId },
+								submission,
+								"terminal_uncertain",
+								"Accepted prompt cancellation could not be persisted.",
+							);
+							return { aborted: true, disposition: "cancelled" as const };
+						}
+						try {
+							await submission.preflightAbort();
+						} catch (error) {
+							logger.warn(`sdk: accepted preflight cancellation failed: ${String(error)}`);
+							failPromptClosed(
+								{ commandId, turnId },
+								submission,
+								"terminal_uncertain",
+								"Accepted prompt preparation could not be settled before cancellation.",
+							);
+							return { aborted: true, disposition: "cancelled" as const };
+						}
 					}
-					await terminalizePrompt(
-						{ commandId, turnId },
-						{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
-						{ fence: hasExecutionHandle },
-					);
+					await terminalizePrompt({ commandId, turnId }, cancellationOutcome, {
+						fence: hasExecutionHandle || !submission.preflightAbort,
+					});
 				}
 				return { aborted: true, disposition: "cancelled" as const };
 			},
@@ -5344,7 +5364,9 @@ export function createNotificationsExtension(
 				// terminal authority stays with the eventual normalized SDK outcome.
 				for (const submission of promptSubmissions.values())
 					if (submission.connectionId === connectionId) {
-						submission.preflightAbort?.();
+						void Promise.resolve(submission.preflightAbort?.()).catch(error =>
+							logger.warn(`sdk: disconnected accepted preflight cancellation failed: ${String(error)}`),
+						);
 						abandonPrompt(submission);
 					}
 			});
