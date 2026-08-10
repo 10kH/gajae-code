@@ -1,10 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { SessionIndex } from "../src/sdk/broker/session-index";
 
 type TestServer = {
 	port: number | undefined;
@@ -248,7 +249,15 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 								ok: true,
 								result: {
 									sessionId: "owned-session",
-									endpoint: { url: `ws://127.0.0.1:${server.port}`, token },
+									endpointGeneration: 1,
+									pid: process.pid,
+									endpointMtimeMs,
+									endpoint: {
+										sessionId: "owned-session",
+										pid: process.pid,
+										url: `ws://127.0.0.1:${server.port}`,
+										token,
+									},
 								},
 							}),
 						);
@@ -324,6 +333,10 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 						return;
 					}
 					socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: {} }));
+					return;
+				}
+				if (frame.type === "event_replay") {
+					socket.send(JSON.stringify({ type: "event_replay_result", id: frame.id, events: [] }));
 					return;
 				}
 				if (frame.type === "query_request") {
@@ -488,6 +501,33 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	});
 	servers.push(server);
 	await mkdir(cwd, { recursive: true });
+	const endpointPath = path.join(cwd, ".gjc", "state", "sdk", "owned-session.json");
+	await mkdir(path.dirname(endpointPath), { recursive: true });
+	await Bun.write(
+		endpointPath,
+		JSON.stringify({
+			sessionId: "owned-session",
+			pid: process.pid,
+			url: `ws://127.0.0.1:${server.port}`,
+			token,
+		}),
+	);
+	await utimes(endpointPath, 0.001, 0.001);
+	const endpointMtimeMs = (await stat(endpointPath)).mtimeMs;
+	brokerSessions[0] = {
+		...brokerSessions[0],
+		pid: process.pid,
+		endpointMtimeMs,
+	};
+	const index = await new SessionIndex(agentDir).open();
+	await index.append({
+		type: "host_registered",
+		sessionId: "owned-session",
+		locator: { repo: cwd, stateRoot: path.join(cwd, ".gjc", "state") },
+		endpointGeneration: 1,
+		pid: process.pid,
+		endpointMtimeMs,
+	});
 	await writeBrokerDiscovery(agentDir, {
 		version: 1,
 		protocolVersion: 3,
