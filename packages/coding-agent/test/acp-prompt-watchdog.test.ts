@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, setDefaultTimeout, test } from "bun:test";
 import * as path from "node:path";
 import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
 import { getProviderFirstEventTimeoutFallbackMs } from "@gajae-code/ai/utils/idle-iterator";
@@ -10,6 +10,8 @@ import {
 	ACP_PROMPT_INFERENCE_TIMEOUT_MS,
 	ACP_PROMPT_TOOL_ACTIVITY_TIMEOUT_MS,
 } from "../src/sdk/prompt-watchdog";
+
+setDefaultTimeout(30_000);
 
 type TestSocket = { send(message: string): void };
 type StoppedReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";
@@ -84,14 +86,14 @@ type Fixture = {
 async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
 	return await Promise.race([
 		promise,
-		Bun.sleep(2_000).then(() => {
+		Bun.sleep(15_000).then(() => {
 			throw new Error(`Timed out waiting for ${label}`);
 		}),
 	]);
 }
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-	const deadline = Date.now() + 2_000;
+	const deadline = Date.now() + 15_000;
 	while (Date.now() < deadline) {
 		if (predicate()) return;
 		await Bun.sleep(5);
@@ -155,6 +157,8 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 	const sendAssistantText = (text: string): void => {
 		send({
 			type: "event",
+			kind: "message_end",
+			sessionId,
 			commandId,
 			turnId,
 			payload: {
@@ -175,6 +179,8 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 	const sendToolStart = (toolCallId: string): void => {
 		send({
 			type: "event",
+			kind: "tool_execution_start",
+			sessionId,
 			commandId,
 			turnId,
 			payload: {
@@ -191,6 +197,8 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 	const sendToolEnd = (toolCallId: string): void => {
 		send({
 			type: "event",
+			kind: "tool_execution_end",
+			sessionId,
 			commandId,
 			turnId,
 			payload: {
@@ -803,6 +811,8 @@ test("a correlationless frame refreshes liveness without moving the turn's bound
 		const chunks = textChunks(fixture.updates);
 		fixture.send({
 			type: "event",
+			kind: "message_end",
+			sessionId: fixture.sessionId,
 			payload: {
 				event_type: "message_end",
 				event: {

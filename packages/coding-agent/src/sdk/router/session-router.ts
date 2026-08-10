@@ -44,6 +44,8 @@ export interface SessionRouterFrame {
 	readonly name: string | undefined;
 	readonly sessionId: string | undefined;
 	readonly generation: number | undefined;
+	readonly commandId?: string;
+	readonly turnId?: string;
 	readonly publicationId?: string;
 }
 
@@ -128,6 +130,8 @@ function fallbackCorrelation(frame: Record<string, unknown>): SessionRouterFrame
 	const readSession = (value: unknown): string | undefined =>
 		typeof value === "string" && value.length > 0 ? value : undefined;
 	const readName = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
+	const readCorrelation = (value: unknown): string | undefined =>
+		typeof value === "string" && value.length > 0 ? value : undefined;
 	const outerSession = frame.sessionId;
 	const innerSession = payload?.sessionId;
 	const outerGeneration = frame.generation;
@@ -142,11 +146,24 @@ function fallbackCorrelation(frame: Record<string, unknown>): SessionRouterFrame
 	if (sessionClaim !== undefined && sessionId === undefined) return undefined;
 	if (generationClaim !== undefined && generation === undefined) return undefined;
 	const body = payload ?? frame;
+	const nestedEvent = payload
+		? payload.event && typeof payload.event === "object" && !Array.isArray(payload.event)
+			? (payload.event as Record<string, unknown>)
+			: undefined
+		: undefined;
+	const commandId =
+		readCorrelation(frame.commandId) ??
+		readCorrelation(payload?.commandId) ??
+		readCorrelation(nestedEvent?.commandId);
+	const turnId =
+		readCorrelation(frame.turnId) ?? readCorrelation(payload?.turnId) ?? readCorrelation(nestedEvent?.turnId);
 	return {
 		body,
 		name: readName(frame.name) ?? readName(frame.kind) ?? readName(body.type),
 		sessionId,
 		generation,
+		commandId,
+		turnId,
 	};
 }
 

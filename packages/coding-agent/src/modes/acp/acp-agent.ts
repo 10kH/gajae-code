@@ -52,7 +52,7 @@ import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/cli
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-namespace";
 import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
-import { SessionRouter } from "../../sdk/router";
+import { SessionRouter, type SessionRouterFrame } from "../../sdk/router";
 import {
 	buildToolCallStartUpdate,
 	mapAgentSessionEventToAcpSessionUpdates,
@@ -568,6 +568,24 @@ function receivedSdkEvent(frame: JsonObject): ReceivedSdkEvent | undefined {
 	return {
 		event,
 		...(object(payload.event) ? { wirePayload: payload } : {}),
+	};
+}
+
+function acpFrameFromRouted(frame: SessionRouterFrame): JsonObject {
+	if (
+		frame.body.type === "activity" ||
+		frame.body.type === "agent_start" ||
+		frame.body.type === "agent_end" ||
+		frame.body.type === "agent_failed"
+	)
+		return frame.body;
+	return {
+		type: "event",
+		...(frame.name === undefined ? {} : { kind: frame.name }),
+		...(frame.sessionId === undefined ? {} : { sessionId: frame.sessionId }),
+		...(frame.commandId === undefined ? {} : { commandId: frame.commandId }),
+		...(frame.turnId === undefined ? {} : { turnId: frame.turnId }),
+		payload: frame.body,
 	};
 }
 
@@ -1741,8 +1759,9 @@ export class AcpAgent implements Agent {
 					},
 					onFrame: (attachment, frame) => {
 						if (attachment.sessionId !== id) return;
-						if (adapter) adapter.acceptFrame(frame.body);
-						else bufferedFrames.push(frame.body);
+						const acpFrame = acpFrameFromRouted(frame);
+						if (adapter) adapter.acceptFrame(acpFrame);
+						else bufferedFrames.push(acpFrame);
 					},
 				},
 			});
