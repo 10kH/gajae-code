@@ -9900,12 +9900,11 @@ export class SessionManager {
 		return this.#boundedReadStorageProxy;
 	}
 	/**
-	 * Mutable commit-marker publication for managed destinations, executed inside the
-	 * persistence fence. The transcript is authoritative; the marker is disposable.
-	 * Checked create-while-missing / replace-only-on-exact-present (raw hash +
-	 * descriptor identity) guarantee stale bytes are never published; a diverging
-	 * marker (cross-process mutation) aborts and is left untouched for reopen
-	 * classification. `gen` is the publication fence counter only.
+	 * Publish the mutable disposable commit marker inside the persistence fence.
+	 * Managed sessions use a private verified per-process cache, so an fsynced
+	 * overwrite cannot race another process. Explicit destinations retain checked
+	 * create/replace publication with raw-hash and descriptor identity validation.
+	 * The transcript remains authoritative in both cases.
 	 */
 	#publishSessionCommitMarkerSync(descriptor: SessionStorageStat): boolean {
 		if (this.#sidecarBranchActivationDirty) return false;
@@ -9913,7 +9912,6 @@ export class SessionManager {
 		if (!sessionFile) return false;
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled || runtime.tail.transcriptSize !== descriptor.size) return false;
-		const options = undefined;
 		return this.#withSessionPersistenceFenceSync(() => {
 			const markerPath = runtime.commitPath;
 			const gen = this.#commitGen + 1;
@@ -10008,15 +10006,12 @@ export class SessionManager {
 							};
 						})();
 				if (current.kind === "missing") {
-					createSessionCommitMarkerCheckedSync(this.storage, markerPath, bytes, options);
+					createSessionCommitMarkerCheckedSync(this.storage, markerPath, bytes);
 				} else {
-					replaceSessionCommitMarkerCheckedSync(
-						this.storage,
-						markerPath,
-						bytes,
-						{ rawBytesSha256: current.rawBytesSha256, descriptorIdentity: current.stat },
-						options,
-					);
+					replaceSessionCommitMarkerCheckedSync(this.storage, markerPath, bytes, {
+						rawBytesSha256: current.rawBytesSha256,
+						descriptorIdentity: current.stat,
+					});
 				}
 				this.#commitGen = gen;
 				return true;
