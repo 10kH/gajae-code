@@ -1727,6 +1727,32 @@ export class ManagedSessionDescendantStore {
 			throw new Error(removed.code ?? "managed_remove_failed");
 		this.#assertBound();
 	}
+
+	/** Remove one exact file without allocating its contents. */
+	removeIfExistsDescriptor(relativePath: string): boolean {
+		this.#beforeMutation();
+		this.#assertBound();
+		const resolved = this.#resolve(relativePath);
+		let identity: ManagedFileSnapshot["identity"];
+		if (this.#authority) {
+			const observed = this.#authority.stat(this.#relative(resolved));
+			if (!observed.ok) {
+				if (observed.code === "not_found") return false;
+				throw new Error(observed.code ?? "managed_stat_failed");
+			}
+			if (!observed.identity?.sha256) throw new Error("managed_stat_identity_unavailable");
+			identity = { ...managedFileIdentityFromNative(observed.identity), sha256: observed.identity.sha256 };
+		} else {
+			try {
+				identity = captureManagedFileIdentityStreamingNoFollow(resolved);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+				throw error;
+			}
+		}
+		this.removeExpected(relativePath, { bytes: Buffer.alloc(0), identity });
+		return true;
+	}
 	/** Read and remove one managed descendant through retained authority. */
 	async consume(relativePath: string): Promise<Uint8Array | null> {
 		this.#beforeMutation();

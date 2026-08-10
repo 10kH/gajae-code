@@ -6496,14 +6496,14 @@ export class SessionManager {
 								? authority.replace(relative, bytes)
 								: authority.publishNoReplace(relative, bytes);
 						}
-						case "unlinkSync": {
-							const snapshot = authority.readExpected(relative);
-							if (!snapshot) throw Object.assign(new Error("Managed sidecar not found"), { code: "ENOENT" });
-							authority.removeExpected(relative, snapshot);
+						case "unlinkSync":
+							if (!authority.removeIfExistsDescriptor(relative))
+								throw Object.assign(new Error("Managed sidecar not found"), { code: "ENOENT" });
 							return;
-						}
 						case "unlink":
-							return authority.remove(relative);
+							return authority.removeIfExistsDescriptor(relative)
+								? Promise.resolve()
+								: Promise.reject(Object.assign(new Error("Managed sidecar not found"), { code: "ENOENT" }));
 						case "openWriter":
 						case "openStagedWriter":
 							args[1] = {
@@ -17167,6 +17167,12 @@ export class SessionManager {
 				if (!(error instanceof Error) || error.message !== "nested_managed_bounded_rewrite_required") throw error;
 			}
 		}
+		if (
+			sessionMemoryMode === "enabled" &&
+			capturedDescriptor &&
+			capturedDescriptor.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES
+		)
+			throw new SessionTranscriptOversizedError(capturedDescriptor.size);
 		const captured = store.readExpected(path.basename(resolved));
 		if (
 			Boolean(captured) !== Boolean(capturedDescriptor) ||
