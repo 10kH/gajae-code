@@ -2476,6 +2476,8 @@ function replaceManagedFileGeneratedSync(
 			0o600,
 		);
 		secureFileDescriptor(staging, fd, "apply");
+		const initiallyStaged = fs.fstatSync(fd, { bigint: true });
+		stagedIdentity = { dev: initiallyStaged.dev, ino: initiallyStaged.ino };
 		const generated = writeContent(fd);
 		fs.fsyncSync(fd);
 		secureFileDescriptor(staging, fd, "verify");
@@ -2692,6 +2694,8 @@ function appendManagedFileStreamingSync(
 	policy: ManagedSessionSecurityPolicy,
 ): ManagedFileSnapshot["identity"] {
 	const predecessor = captureManagedFileIdentityStreamingNoFollow(destination);
+	if (predecessor.size > MANAGED_ARTIFACT_MAX_FILE_BYTES - appendedBytes.byteLength)
+		throw new Error("content_too_large");
 	return replaceManagedFileGeneratedSync(
 		destination,
 		stagingFd => {

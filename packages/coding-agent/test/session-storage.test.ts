@@ -641,6 +641,21 @@ describe.skipIf(process.platform !== "darwin")("authority-absent managed replace
 			}),
 		).toThrow("content_too_large");
 	});
+	it("rejects repeated over-ceiling appends without replacement staging leaks", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-append-limit-")));
+		try {
+			const sessionDir = path.join(root, "session");
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), sessionDir);
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("x"));
+			fs.truncateSync(path.join(sessionDir, "session.jsonl"), MANAGED_ARTIFACT_MAX_FILE_BYTES);
+			for (let attempt = 0; attempt < 2; attempt++)
+				expect(() => store.appendSync("session.jsonl", Buffer.from("x"))).toThrow("content_too_large");
+			expect(fs.readdirSync(sessionDir).filter(name => name.endsWith(".replacement"))).toEqual([]);
+			expect(fs.statSync(path.join(sessionDir, "session.jsonl")).size).toBe(MANAGED_ARTIFACT_MAX_FILE_BYTES);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
 	it("atomically replaces an existing file through the Darwin path", () => {
 		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-replace-")));
 		try {
