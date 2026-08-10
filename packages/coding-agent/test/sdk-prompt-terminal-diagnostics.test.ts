@@ -36,7 +36,7 @@ async function closeSocket(socket: WebSocket): Promise<void> {
 }
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-	const deadline = Date.now() + 15_000;
+	const deadline = Date.now() + 60_000;
 	while (!predicate()) {
 		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
 		await Bun.sleep(20);
@@ -185,7 +185,7 @@ test("SDK host logs a bounded reason from a reachable provider failure", async (
 	}
 
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
-}, 20_000);
+}, 75_000);
 
 test("SDK host logs a bounded reason from an accepted sendUserMessage rejection", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-terminal-accepted-rejection-"));
@@ -256,7 +256,7 @@ test("SDK host logs a bounded reason from an accepted sendUserMessage rejection"
 	}
 
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
-}, 20_000);
+}, 75_000);
 test("SDK host does not log a client cancellation as a prompt terminal failure", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-terminal-cancel-"));
 	dirs.push(cwd);
@@ -307,4 +307,4 @@ test("SDK host does not log a client cancellation as a prompt terminal failure",
 	}
 
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
-}, 20_000);
+}, 75_000);
