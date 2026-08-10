@@ -608,7 +608,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:retireProvisionalDaemonOwnership": "d5f45044ea524f0694691bda67f47f9d74eaa5506926b718f40f2613a892d82f",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:revokeCallbackAliases": "aeaedab55ce2109ca07d91436b45bcc0bed81cddd8249cd03c5dad6e53a0f3ae",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:rollbackOwnershipLockRebind": "7e9bc148e69268c393051e0b87417c20ce44824e777d4be050b9e91607c410a1",
-    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:run": "a168a12909c32803e2f1db9bd004e5c04c977e59449da00f469b4dced4d05467",
+    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:run": "30f054c73f8d63cd4adc8441974c5ae97f0283bb49f6187dc62f475f4cdb0fe5",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:spawnTelegramDaemonOwner": "321b140a26bc2056d98cfcd48b63fa6f9a69ebd7cef66286614da11adf7c0c79",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:syncTelegramDirectory": "ba812f68629802f7ae9a974d1b5b30d13a0cc510c10350ac1ec1f7cc17c6493a",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:syncTelegramFile": "ab8fff161531fedd4e706428de6e1f780d9f30fb2045da818e8d50a3d410fb74",
