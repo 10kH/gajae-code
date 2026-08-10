@@ -909,18 +909,18 @@ The required optimization work is now implemented. This section supersedes the e
 
 ### 14.3 Profiler evidence
 
-Source-bound artifacts for commit `7dc128f45`:
+Source-bound artifacts for commit `b7896b0eb`:
 
 - `artifacts/profiles/session-first-open-1024-source-bound.cpuprofile`
 - `artifacts/profiles/session-first-open-1024-source-bound.md.md`
 - `artifacts/profiles/session-first-open-1024-source-bound-metadata.json`
 - `artifacts/session-first-open-1024-source-bound-run-md.json`
 
-Earlier exploratory profiles are not acceptance evidence. The final 1024 MiB profile is explicitly bound to source tree `193b4fdc320daca96f2a85d79cb05e7cd9f5cfaf` and cumulative diff SHA-256 `bc90efe0f7ba2e844d21fcb4253828a0607e95e972e2acac48ca27d472bc9278`. It measured 984.97 ms first-open, five pressure-GC requests totaling 21.67 ms, and zero warm range reads. Self time is now led by hash update (44.4%), write (8.3%), JSON stringify (5.8%), GC (4.8%), byte counting (4.6%), read (4.4%), and parse (3.4%). GC and repeated file opening are no longer the dominant costs; hashing and index serialization/write are the remaining optimization surface.
+Earlier exploratory profiles are not acceptance evidence. The final 1024 MiB profile is explicitly bound to source tree `6a41821627e1b88ac80098a35a3a4f985e7a995a` and cumulative diff SHA-256 `eaeff00651a287cff0e46acaea1f71d86388d2a6b41a396ed2efc111789c997a`. It measured 963.63 ms first-open, five pressure-GC requests totaling 21.33 ms, and zero warm range reads. Self time is led by hash update (43.7%), write (8.7%), JSON stringify (6.1%), byte counting (4.9%), GC (4.8%), read (3.8%), and parse (3.2%). GC and repeated file opening are no longer the dominant costs; hashing and index serialization/write are the remaining optimization surface.
 
 ### 14.4 Same-host A/B evidence
 
-Every artifact in this subsection records `gitSha: 7dc128f45bdc7d84883c4381ee5edbc22a01f306`.
+Every artifact in this subsection records `gitSha: b7896b0eb00bf219e1168afabe20147680229869`.
 
 #### GC strategy
 
@@ -928,54 +928,54 @@ Every artifact in this subsection records `gitSha: 7dc128f45bdc7d84883c4381ee5ed
 
 | Size | Strategy | First-open p50 | Operation RSS p50 |
 |---:|---|---:|---:|
-|128 MiB|current|276.5 ms|89.6 MiB|
-|128 MiB|none|167.9 ms|88.3 MiB|
-|128 MiB|async|180.2 ms|95.8 MiB|
-|128 MiB|pressure|186.9 ms|86.6 MiB|
-|512 MiB|current|664.4 ms|92.3 MiB|
-|512 MiB|none|494.5 ms|95.9 MiB|
-|512 MiB|async|518.7 ms|88.0 MiB|
-|512 MiB|pressure|515.0 ms|96.5 MiB|
+|128 MiB|current|281.2 ms|97.3 MiB|
+|128 MiB|none|171.5 ms|93.5 MiB|
+|128 MiB|async|183.9 ms|85.9 MiB|
+|128 MiB|pressure|190.8 ms|88.2 MiB|
+|512 MiB|current|683.4 ms|99.5 MiB|
+|512 MiB|none|505.9 ms|96.0 MiB|
+|512 MiB|async|529.7 ms|96.4 MiB|
+|512 MiB|pressure|531.1 ms|96.3 MiB|
 
-`none` is fastest in the isolated matrix, but it failed four opt-in RSS cases under the full product lifecycle; the one-GiB direct fork exceeded the 128 MiB allocator envelope at 138.5 MiB. Pressure mode passed all 13 RSS cases and remains the product default. The benchmark-only `none`, `async`, and `current` controls remain available for causal experiments.
+`none` is fastest in the isolated matrix, but it failed two opt-in RSS cases under the full product lifecycle: the 60k first-build fixture exceeded its 64 MiB RSS ceiling at 124,190,720 bytes, and the million-record fixture exceeded the 128 MiB allocator ceiling at 135,790,592 bytes. Pressure mode passed all 13 RSS cases and remains the product default. The benchmark-only `none`, `async`, and `current` controls remain available for causal experiments.
 
 #### Secondary artifacts
 
 `artifacts/session-secondary-{current,off,lazy}-source-bound-2026-08-10.{json,csv,svg}`:
 
-Disabling synchronous dictionary/parent construction saved about 62–66 ms at 384/512 MiB and about 10 ms at 768 MiB. Median cold lookup remained between 0.7 and 1.3 ms. This supports keeping the flat index authoritative and secondary artifacts disabled by default across both first-open and later rebuilds; it does not justify background publication complexity as a product default.
+Disabling synchronous dictionary/parent construction saved about 68–79 ms at 384/512 MiB and was effectively neutral at 768 MiB. Median cold lookup remained between 0.8 and 1.3 ms. This supports keeping the flat index authoritative and secondary artifacts disabled by default across both first-open and later rebuilds; it does not justify background publication complexity as a product default.
 
 #### Multi-session opening
 
 `artifacts/session-subagent-{sequential,concurrency2}-source-bound-2026-08-10.{json,csv,svg}` measured three isolated 512 MiB aggregate subagent-tree samples:
 
-- sequential p50: 629.6 ms, 72.6 MiB operation RSS;
-- concurrency two p50: 629.6 ms, 80.1 MiB operation RSS.
+- sequential p50: 672.4 ms, 71.8 MiB operation RSS;
+- concurrency two p50: 653.9 ms, 80.1 MiB operation RSS.
 
-Concurrency produced no latency improvement and increased RSS by 7.5 MiB. Product opening remains sequential; the matrix retains `--open-concurrency` as an evidence control only.
+Concurrency improved latency by only 18.5 ms (2.8%) while increasing RSS by 8.3 MiB. Product opening remains sequential; the matrix retains `--open-concurrency` as an evidence control only.
 
 #### Automatic routing
 
-`artifacts/session-small-auto-source-bound-2026-08-10.{json,csv,svg}` covered 1/4/16/32/64 MiB with three isolated samples per mode. Auto p50 remained below off-mode p50 at every size because auto avoids the redundant full strict-inspection pass even when it selects eager state. At 64 MiB, auto p50 was 96.50 ms versus 204.41 ms off. `artifacts/session-auto-threshold-source-bound-2026-08-10.{json,csv,svg}` confirms bounded routing at 128 MiB.
+`artifacts/session-small-auto-source-bound-2026-08-10.{json,csv,svg}` covered 1/4/16/32/64 MiB with three isolated samples per mode. Auto p50 remained below off-mode p50 at every size because auto avoids the redundant full strict-inspection pass even when it selects eager state. At 64 MiB, auto p50 was 106.48 ms versus 195.89 ms off. `artifacts/session-auto-threshold-source-bound-2026-08-10.{json,csv,svg}` confirms bounded routing at 128 MiB.
 
 ### 14.5 Full-size result
 
 `artifacts/session-2gib-first-open-source-bound-2026-08-10.{json,csv,svg}` contains three fresh, uncontended 2048 MiB raw cold-first-open samples with auto routing, pressure GC, and default-disabled secondary artifacts:
 
-- p50: 1,883.9 ms;
-- p95/max: 1,886.6 ms;
-- p50 throughput: 1,087.1 MiB/s;
-- operation RSS p50/max: 95.1/96.4 MiB;
+- p50: 1,897.6 ms;
+- p95/max: 1,901.3 ms;
+- p50 throughput: 1,079.3 MiB/s;
+- operation RSS p50/max: 96.0/96.1 MiB;
 - cold lookup required one bounded range read;
 - warm lookup required zero range reads.
 
-The full direct/captured fork corpus in `artifacts/session-gib-stress-source-bound-2026-08-10.json` is bound to the same source. Direct fork p50/p95 was 2,221.9/2,237.7 ms at 89.2/89.3 MiB RSS; captured fork p50/p95 was 2,266.6/2,851.2 ms at 86.2/86.3 MiB RSS. These results are below the accepted four-second fork and 8.2-second first-open budgets.
+The full direct/captured fork corpus in `artifacts/session-gib-stress-source-bound-2026-08-10.json` is bound to the same source. Direct fork p50/p95 was 2,298.9/2,315.8 ms at 88.9/89.3 MiB RSS; captured fork p50/p95 was 2,241.8/2,320.6 ms at 86.3/86.4 MiB RSS. These results are below the accepted four-second fork and 8.2-second first-open budgets.
 
 ### 14.6 Memory and verification acceptance
 
 Live bounded session state remains under the 64 MiB accountant budget. Bun/macOS allocator high-water RSS is separately bounded by a 128 MiB process envelope for large first-open/fork operations. Split metrics are recomputed from live cache, tail, provider-state, and reducer state rather than stale transition snapshots.
 
-`artifacts/session-source-bound-verification-receipt.json` binds the final verification to commit `7dc128f45`: 223 focused tests passed with one intentional skip, all 13 opt-in RSS tests passed, all seven mandatory computer-enforcement adversarial cases passed, package typecheck passed, schema synchronization passed, and the partial source-bound report rendered successfully.
+`artifacts/session-source-bound-verification-receipt.json` binds the final verification to commit `b7896b0eb`: 226 focused tests passed with one intentional default-off latency skip, the explicit opt-in latency/I-O gate passed all 14 assertions, all 13 opt-in RSS tests passed, all seven mandatory computer-enforcement adversarial cases passed, package typecheck passed, schema synchronization passed, and the partial source-bound report rendered successfully.
 
 ### 14.7 Review-closed safety behavior and rejected follow-ups
 
@@ -983,6 +983,9 @@ Live bounded session state remains under the 64 MiB accountant budget. Bun/macOS
 - Physical scanner rejection (unterminated input, oversized line, missing parent, or descriptor mutation) suppresses later eager sidecar reconstruction for that lifecycle.
 - Post-admission sidecar tamper on a transcript above the eager ceiling fails closed with a rebuild-required error rather than hydrating the entire transcript.
 - Secondary artifacts stay disabled across later sidecar rebuilds unless explicitly enabled.
+- Dictionary adoption requires exact equality between the committed dictionary header and the authoritative transcript session ID.
+- Disabled secondary rebuilds delete prior dictionary partitions/meta and parent buckets before recomputing sidecar disk accounting.
+- Full-hot-view operations apply the eager-size ceiling before allocating or scanning the complete private index, including a structurally valid commit-rebound tamper case.
 - Missing report dimensions, failed runs, and unrun fork modes remain unavailable/N/A rather than becoming zero-valued or cross-operation evidence.
 - No product-default multi-session parallel opening: measured latency gain was zero and RSS increased.
 - No background dictionary/parent publication: measured savings do not justify new marker replacement complexity.

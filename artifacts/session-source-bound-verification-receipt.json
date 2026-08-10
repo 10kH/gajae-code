@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "kind": "session-boundary-test-report",
-  "sourceCommit": "7dc128f45",
-  "sourceTree": "193b4fdc320daca96f2a85d79cb05e7cd9f5cfaf",
-  "cumulativeDiffSha256": "bc90efe0f7ba2e844d21fcb4253828a0607e95e972e2acac48ca27d472bc9278",
+  "sourceCommit": "b7896b0eb",
+  "sourceTree": "6a41821627e1b88ac80098a35a3a4f985e7a995a",
+  "cumulativeDiffSha256": "eaeff00651a287cff0e46acaea1f71d86388d2a6b41a396ed2efc111789c997a",
   "results": [
     {
       "id": "package-typecheck",
@@ -15,11 +15,20 @@
       "id": "focused-session-boundary",
       "command": "bun test packages/coding-agent/test/session-manager-resume-oversized.test.ts packages/coding-agent/test/settings-session-memory.test.ts packages/coding-agent/test/modes/controllers/session-command.test.ts packages/coding-agent/test/session/session-memory-storage-contracts.test.ts packages/coding-agent/test/session/session-memory-integration.test.ts packages/coding-agent/test/session/session-memory-latency.test.ts packages/coding-agent/test/session/session-memory-sidecar.test.ts packages/coding-agent/test/session/session-memory-crash.test.ts packages/coding-agent/test/session/session-memory-rollout.test.ts",
       "status": "passed",
-      "testsPassed": 223,
+      "testsPassed": 226,
       "testsSkipped": 1,
       "testsFailed": 0,
-      "assertions": 22068,
+      "assertions": 22148,
       "artifact": "artifacts/session-source-bound-focused-tests.xml"
+    },
+    {
+      "id": "opt-in-latency",
+      "command": "GJC_SESSION_MEMORY_LATENCY=1 bun test packages/coding-agent/test/session/session-memory-latency.test.ts",
+      "status": "passed",
+      "testsPassed": 1,
+      "testsFailed": 0,
+      "assertions": 14,
+      "artifact": "artifacts/session-source-bound-latency-tests.xml"
     },
     {
       "id": "opt-in-rss",
@@ -34,10 +43,10 @@
       "id": "no-gc-rss-negative-control",
       "command": "GJC_SESSION_MEMORY_GC_STRATEGY=none GJC_SESSION_MEMORY_RSS=1 bun test packages/coding-agent/test/session/session-memory-rss.test.ts",
       "status": "expected_failure",
-      "testsPassed": 9,
-      "testsFailed": 4,
+      "testsPassed": 11,
+      "testsFailed": 2,
       "artifact": "artifacts/session-source-bound-rss-none-tests.xml",
-      "evidence": "No-GC failed the product RSS envelope, including a 138477568-byte direct-fork RSS delta above the 134217728-byte ceiling."
+      "evidence": "No-GC failed the 60k first-build 64 MiB RSS ceiling at 124190720 bytes and the million-record 128 MiB allocator ceiling at 135790592 bytes."
     },
     {
       "id": "mandatory-computer-redteam",
