@@ -550,7 +550,7 @@ describe("chat daemon worker", () => {
 		});
 		const provider = new FakeDiscordProvider();
 		const client = new FakeSdkClient();
-		let attachedToken: string | undefined;
+		let attachedAuthority: Record<string, unknown> | undefined;
 		const runtime = new ChatDaemonRuntime(
 			{
 				kind: "discord",
@@ -565,8 +565,8 @@ describe("chat daemon worker", () => {
 			{
 				createDiscordProvider: () => provider,
 				routerDeps: {
-					createClient: async endpoint => {
-						attachedToken = endpoint.token;
+					createClient: async authority => {
+						attachedAuthority = authority;
 						return client;
 					},
 					createIndex: () => index,
@@ -576,7 +576,8 @@ describe("chat daemon worker", () => {
 			},
 		);
 		await runtime.start();
-		expect(attachedToken).toBe("chat-only-token");
+		expect(attachedAuthority).toMatchObject({ sessionId: "chat-only", generation: 1 });
+		expect(attachedAuthority).not.toHaveProperty("token");
 		await runtime.stop();
 	});
 
@@ -668,6 +669,7 @@ describe("chat daemon worker", () => {
 		const provider = new FakeDiscordProvider();
 		const oldClient = new FakeSdkClient();
 		let tick: (() => void) | undefined;
+		let createClientCalls = 0;
 		const runtime = new ChatDaemonRuntime(
 			{
 				kind: "discord",
@@ -682,8 +684,8 @@ describe("chat daemon worker", () => {
 			{
 				createDiscordProvider: () => provider,
 				routerDeps: {
-					createClient: async endpoint => {
-						if (endpoint.token === "new-token") throw new Error("replacement unavailable");
+					createClient: async () => {
+						if (++createClientCalls === 2) throw new Error("replacement unavailable");
 						return oldClient;
 					},
 					createIndex: () => index,
@@ -750,6 +752,7 @@ describe("chat daemon worker", () => {
 		const oldClient = new FakeSdkClient();
 		const newClient = new FakeSdkClient();
 		let tick: (() => void) | undefined;
+		let createClientCalls = 0;
 		const runtime = new ChatDaemonRuntime(
 			{
 				kind: "discord",
@@ -764,7 +767,7 @@ describe("chat daemon worker", () => {
 			{
 				createDiscordProvider: () => provider,
 				routerDeps: {
-					createClient: async endpoint => (endpoint.token === "old-token" ? oldClient : newClient),
+					createClient: async () => (++createClientCalls === 1 ? oldClient : newClient),
 					createIndex: () => index,
 					setInterval: ((callback: () => void) => {
 						tick = callback;
@@ -793,10 +796,12 @@ describe("chat daemon worker", () => {
 		});
 		const replacementReplay = newClient.waitForRequest(frame => frame.type === "event_replay");
 		tick?.();
-		await replacementReplay;
+		await Bun.sleep(25);
 		expect(oldClient.closed).toBe(true);
-		expect(newClient.handler).toBeDefined();
+		expect(newClient.handler).toBeUndefined();
 		release.resolve();
+		await replacementReplay;
+		expect(newClient.handler).toBeDefined();
 		const freshDelivered = provider.waitForMessage(message => message.content.includes("fresh replacement"));
 		newClient.handler?.({ type: "turn_stream", sessionId: "session", text: "fresh replacement" });
 		await freshDelivered;

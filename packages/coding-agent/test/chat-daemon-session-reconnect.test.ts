@@ -605,8 +605,7 @@ test("chat daemon startup isolates an unreachable indexed endpoint from a health
 				createSlackProvider: () => provider,
 				routerDeps: {
 					createClient: async endpoint => {
-						if (endpoint.sessionId === "chat-unreachable")
-							throw new Error(`connect failed with ${endpoint.token}`);
+						if (endpoint.sessionId === "chat-unreachable") throw new Error("connect failed");
 						attachedSessions.push(endpoint.sessionId);
 						return {
 							onFrame: () => () => {},

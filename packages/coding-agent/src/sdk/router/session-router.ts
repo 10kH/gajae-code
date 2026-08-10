@@ -52,9 +52,14 @@ export interface SessionRouterFrame {
 export type SessionRouterFrameCorrelator = (frame: Record<string, unknown>) => SessionRouterFrame | undefined;
 
 export interface SessionRouterDeps {
-	createClient?: (endpoint: SdkSessionEndpoint) => Promise<SessionRouterClient>;
+	createClient?: (authority: {
+		readonly sessionId: string;
+		readonly generation: number;
+		readonly pid: number;
+		readonly endpointMtimeMs: number;
+	}) => Promise<SessionRouterClient>;
 	createIndex?: (agentDir: string) => SessionIndex;
-	createBrokerClient?: (endpoint: { url: string; token: string }) => Promise<SessionRouterClient>;
+	createBrokerClient?: () => Promise<SessionRouterClient>;
 	/** Receives only an opaque capability and correlated provider-neutral frames. */
 	onFrame?: (attachment: SessionAttachment, frame: SessionRouterFrame) => Promise<void> | void;
 	onAttachment?: (attachment: SessionAttachment) => Promise<void> | void;
@@ -474,7 +479,10 @@ export class SessionRouter {
 			!Number.isSafeInteger(indexed.endpointGeneration) ||
 			indexed.endpointGeneration <= 0 ||
 			!Number.isSafeInteger(indexed.pid) ||
-			indexed.pid <= 0
+			indexed.pid <= 0 ||
+			typeof indexed.endpointMtimeMs !== "number" ||
+			!Number.isFinite(indexed.endpointMtimeMs) ||
+			indexed.endpointMtimeMs <= 0
 		)
 			throw new SessionActivationError(
 				"session_not_live",
@@ -490,7 +498,12 @@ export class SessionRouter {
 		let client: PreparedSessionActivationClient;
 		try {
 			client = await (this.#deps.createClient
-				? this.#deps.createClient(endpoint)
+				? this.#deps.createClient({
+						sessionId: indexed.sessionId,
+						generation: indexed.endpointGeneration,
+						pid: indexed.pid,
+						endpointMtimeMs: indexed.endpointMtimeMs,
+					})
 				: connectPreparedSession(endpoint));
 		} catch {
 			throw new SessionActivationError("activation_unavailable", "The session endpoint could not be reached.");
@@ -509,9 +522,9 @@ export class SessionRouter {
 		if (!discovery) throw new SessionRouterError("pre_send");
 		let client: SessionRouterClient;
 		try {
-			client = await (
-				this.#deps.createBrokerClient ?? (async endpoint => await SdkClient.connect(endpoint.url, endpoint.token))
-			)({ url: discovery.url, token: discovery.token });
+			client = this.#deps.createBrokerClient
+				? await this.#deps.createBrokerClient()
+				: await SdkClient.connect(discovery.url, discovery.token);
 		} catch {
 			throw new SessionRouterError("pre_send");
 		}
@@ -712,31 +725,22 @@ export class SessionRouter {
 					`SDK session replacement transport cleanup failed for ${indexed.sessionId}; authority remains revoked (${String(error)}).`,
 				);
 			}
+			await this.#deps.onSessionRemoved?.(existing.capability);
 			if (!resumable) {
 				this.#undelivered.delete(indexed.sessionId);
 				this.#recoveredFrames.delete(indexed.sessionId);
 			}
 		}
-		let client: SessionRouterClient;
-		try {
-			client = await (this.#deps.createClient ?? connectAttachedSession)(endpoint);
-		} catch (error) {
-			if (existing && !this.#sessions.has(indexed.sessionId))
-				try {
-					await this.#deps.onSessionRemoved?.(existing.capability);
-				} catch {
-					// Replacement failure already revoked Router authority; provider cleanup remains best effort.
-				}
-			throw error;
-		}
+		const client: SessionRouterClient = this.#deps.createClient
+			? await this.#deps.createClient({
+					sessionId: indexed.sessionId,
+					generation: indexed.endpointGeneration,
+					pid: indexed.pid,
+					endpointMtimeMs: indexed.endpointMtimeMs,
+				})
+			: await connectAttachedSession(endpoint);
 		if (!this.#running(runEpoch)) {
 			await client.close().catch(() => undefined);
-			if (existing && !this.#sessions.has(indexed.sessionId))
-				try {
-					await this.#deps.onSessionRemoved?.(existing.capability);
-				} catch {
-					// Router authority is already revoked; provider cleanup remains best effort.
-				}
 			return false;
 		}
 		let attached: AttachedSession | undefined;
