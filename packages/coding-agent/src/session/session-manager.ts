@@ -7342,6 +7342,10 @@ export class SessionManager {
 				this.#lazyReopenFallbackReason = "bounded_first_open_unreadable";
 				return false;
 			}
+			if (this.destination.kind === "managed" && before.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES) {
+				this.#lazyReopenFallbackReason = "bounded_first_open_unreadable";
+				return false;
+			}
 			const discovery = this.#scanBoundedTranscriptForFirstOpen(sessionFile, before);
 			if (!discovery) return false;
 			// The semantic pass's fixed duplicate table is no longer needed. Collect it
@@ -17082,6 +17086,18 @@ export class SessionManager {
 			return manager;
 		}
 
+		if (
+			sessionMemoryMode === "enabled" &&
+			path.dirname(path.resolve(filePath)) === path.resolve(destination.directory)
+		) {
+			const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
+			manager.#sessionMemoryMode = sessionMemoryMode;
+			await manager.#initSessionFile(filePath, true);
+			const header = manager.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+			if (header?.cwd) manager.cwd = header.cwd;
+			manager.buildSessionContext();
+			return manager;
+		}
 		const inspected = inspectResumeSessionFile(filePath, storage);
 		if ("kind" in inspected) {
 			if (inspected.reason === "missing") {
@@ -17167,12 +17183,7 @@ export class SessionManager {
 				if (!(error instanceof Error) || error.message !== "nested_managed_bounded_rewrite_required") throw error;
 			}
 		}
-		if (
-			sessionMemoryMode === "enabled" &&
-			capturedDescriptor &&
-			capturedDescriptor.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES
-		)
-			throw new SessionTranscriptOversizedError(capturedDescriptor.size);
+		if (sessionMemoryMode === "enabled" && capturedDescriptor) throw new Error("nested_managed_bounded_open_failed");
 		const captured = store.readExpected(path.basename(resolved));
 		if (
 			Boolean(captured) !== Boolean(capturedDescriptor) ||

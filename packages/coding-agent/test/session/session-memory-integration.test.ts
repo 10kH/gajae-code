@@ -360,7 +360,8 @@ describe("SessionManager cold sidecar integration", () => {
 			try {
 				expect(reopened.getSessionMemoryStats()).toMatchObject({
 					coldRetirementActive: true,
-					sidecarRebuildCount: 1,
+					lazyReopenSucceeded: true,
+					lastReopenTransition: { kind: "rebuild", reason: "bounded_first_open" },
 				});
 				expect(reopened.getSessionMemoryStats().totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 				expect(reopened.hotRetainedMessageCharsForTests()).toBeLessThan(1024);
@@ -3801,7 +3802,8 @@ describePosix("managed session memory authority", () => {
 				expect(reopened.getSessionMemoryStats()).toMatchObject({
 					sidecarEnabled: true,
 					coldRetirementActive: true,
-					sidecarRebuildCount: 1,
+					lazyReopenSucceeded: true,
+					lastReopenTransition: { kind: "rebuild", reason: "bounded_first_open" },
 				});
 				expect(reopened.getLabel(reopened.getEntries()[0]!.id)).toBe("managed label");
 				expect(reopened.buildSessionContext().messages).toHaveLength(3);
