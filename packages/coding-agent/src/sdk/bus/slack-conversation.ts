@@ -26,6 +26,8 @@ export interface SlackConversation extends ConversationRecord {
 	sessionId?: string;
 	endpointGeneration?: number;
 	clientMsgId?: string;
+	/** Exact pending Router-removal cleanup; cleared only after the mapping close CAS commits. */
+	cleanupEffectId?: string;
 	/** Exclusive, expiring authority for provider reconciliation/publication of the root intent. */
 	rootPublicationOwner?: string;
 	rootPublicationLeaseExpiresAt?: number;

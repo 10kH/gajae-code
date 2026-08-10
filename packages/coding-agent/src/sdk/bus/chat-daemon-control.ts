@@ -90,10 +90,12 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 36 / Slack generation 41 drain prior cleanup before provider restart.
  * Discord generation 37 / Slack generation 42 serialize successor attachment visibility after cleanup.
  * Discord generation 38 / Slack generation 43 hold successor frames behind cleanup settlement.
+ * Discord generation 39 / Slack generation 44 recover durable cleanup before attachment publication.
+ * Slack generation 45 persists exact pending cleanup intent through recovery.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 38,
-	slack: 43,
+	discord: 39,
+	slack: 45,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

@@ -378,6 +378,12 @@ export class DiscordNotificationDaemon {
 		if (closing) await this.#driveClose(closing);
 	}
 
+	async recoverCleanup(sessionId: string, endpointGeneration: number): Promise<void> {
+		const record = await this.#bySession(sessionId);
+		if (record?.endpointGeneration !== endpointGeneration || !closingIntent(record)) return;
+		await this.#driveClose(record);
+	}
+
 	async archive(sessionId: string): Promise<void> {
 		const running = this.#archives.get(sessionId);
 		if (running) return await running;

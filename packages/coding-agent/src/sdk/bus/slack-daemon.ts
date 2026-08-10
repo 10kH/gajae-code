@@ -847,6 +847,28 @@ export class SlackNotificationDaemon {
 		return await this.#track(this.#close(sessionId, marker, true, endpointGeneration));
 	}
 
+	async recoverCleanup(sessionId: string, endpointGeneration: number): Promise<void> {
+		const found = await this.findSession(sessionId, true);
+		if (
+			!found?.record.rootTs ||
+			found.record.state !== "active" ||
+			found.record.endpointGeneration !== endpointGeneration
+		)
+			return;
+		const effectId = `close-marker-cleanup:${sessionId}:${found.record.clientMsgId ?? found.record.rootTs}`;
+		if (found.record.cleanupEffectId !== effectId) return;
+		const effect = await this.#journal.read(effectId);
+		if (!effect || (effect.state === "terminal" && !effect.receipt?.messageId && !effect.receipt?.timestamp)) {
+			await this.store.transact(found.key, current =>
+				current?.cleanupEffectId === effectId
+					? nextRecord(current, { cleanupEffectId: undefined, updatedAt: this.#now() })
+					: current,
+			);
+			return;
+		}
+		await this.close(sessionId, "Session closed.", endpointGeneration);
+	}
+
 	async #close(
 		sessionId: string,
 		marker: string,
@@ -858,6 +880,25 @@ export class SlackNotificationDaemon {
 		if (expectedEndpointGeneration !== undefined && found.record.endpointGeneration !== expectedEndpointGeneration)
 			return false;
 		const effectId = `${allowRemovedAttachment ? "close-marker-cleanup" : "close-marker"}:${sessionId}:${found.record.clientMsgId ?? found.record.rootTs}`;
+		if (allowRemovedAttachment) {
+			let admitted = false;
+			await this.store.transact(found.key, current => {
+				if (
+					current?.state !== "active" ||
+					current.sessionId !== found.record.sessionId ||
+					current.rootTs !== found.record.rootTs ||
+					current.endpointGeneration !== found.record.endpointGeneration ||
+					current.clientMsgId !== found.record.clientMsgId ||
+					(current.cleanupEffectId !== undefined && current.cleanupEffectId !== effectId)
+				)
+					return current;
+				admitted = true;
+				return current.cleanupEffectId === effectId
+					? current
+					: nextRecord(current, { cleanupEffectId: effectId, updatedAt: this.#now() });
+			});
+			if (!admitted) return false;
+		}
 		const existing = await this.#journal.read<{
 			channel: string;
 			text: string;
@@ -883,12 +924,14 @@ export class SlackNotificationDaemon {
 				current.sessionId !== found.record.sessionId ||
 				current.rootTs !== found.record.rootTs ||
 				current.endpointGeneration !== found.record.endpointGeneration ||
-				current.clientMsgId !== found.record.clientMsgId
+				current.clientMsgId !== found.record.clientMsgId ||
+				(allowRemovedAttachment && current.cleanupEffectId !== effectId)
 			)
 				return current;
 			closed = true;
 			return nextRecord(current, {
 				state: "closed_marker",
+				cleanupEffectId: undefined,
 				pendingActionId: undefined,
 				updatedAt: this.#now(),
 			});

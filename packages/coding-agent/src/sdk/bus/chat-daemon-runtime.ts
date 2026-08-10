@@ -238,6 +238,7 @@ export class ChatDaemonRuntime {
 	readonly #router: SessionRouter;
 	readonly #attachments = new Map<string, SessionAttachment>();
 	readonly #cleanupWork = new Map<string, Promise<void>>();
+	readonly #attachmentBarriers = new Map<string, Promise<void>>();
 	#discord: DiscordNotificationDaemon | undefined;
 	#slack: SlackNotificationDaemon | undefined;
 	#presentation: NotificationPresentationEngine | undefined;
@@ -371,11 +372,24 @@ export class ChatDaemonRuntime {
 
 	async #onAttachment(attachment: SessionAttachment): Promise<void> {
 		this.#attachments.set(attachment.sessionId, attachment);
-		await this.#cleanupWork.get(attachment.sessionId)?.catch(() => undefined);
-		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
-		this.#presentation?.connectSession(attachment.sessionId, {
-			sendReply: route => attachment.send({ type: "reply", id: route.actionId, answer: route.answer }),
-		});
+		const discord = this.#discord;
+		const slack = this.#slack;
+		const barrier = (async () => {
+			await this.#cleanupWork.get(attachment.sessionId)?.catch(() => undefined);
+			await discord?.recoverCleanup(attachment.sessionId, attachment.generation);
+			await slack?.recoverCleanup(attachment.sessionId, attachment.generation);
+		})();
+		this.#attachmentBarriers.set(attachment.sessionId, barrier);
+		try {
+			await barrier;
+			if (this.#attachments.get(attachment.sessionId) !== attachment) return;
+			this.#presentation?.connectSession(attachment.sessionId, {
+				sendReply: route => attachment.send({ type: "reply", id: route.actionId, answer: route.answer }),
+			});
+		} finally {
+			if (this.#attachmentBarriers.get(attachment.sessionId) === barrier)
+				this.#attachmentBarriers.delete(attachment.sessionId);
+		}
 	}
 
 	async #onSessionRemoved(attachment: SessionAttachment): Promise<void> {
@@ -386,7 +400,7 @@ export class ChatDaemonRuntime {
 
 	async #handleFrame(attachment: SessionAttachment, correlated: CorrelatedFrame): Promise<void> {
 		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
-		await this.#cleanupWork.get(attachment.sessionId)?.catch(() => undefined);
+		await this.#attachmentBarriers.get(attachment.sessionId);
 		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
 		const publicationId = correlated.publicationId;
 		const normalizedFrame = correlated.body;

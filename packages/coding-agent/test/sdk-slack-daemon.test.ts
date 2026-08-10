@@ -613,6 +613,22 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		});
 	});
 
+	it("clears an exact terminally rejected cleanup before successor attachment", async () => {
+		await withDaemon(async (daemon, fake) => {
+			await daemon.postRoot("session", "root");
+			fake.failPost = true;
+			await expect(daemon.close("session", undefined, 1)).rejects.toThrow("Slack rate limited");
+			expect((await daemon.findSession("session", true))?.record.cleanupEffectId).toContain(
+				"close-marker-cleanup:session:",
+			);
+			fake.failPost = false;
+			await daemon.recoverCleanup("session", 1);
+			const recovered = (await daemon.findSession("session", true))?.record;
+			expect(recovered?.state).toBe("active");
+			expect(recovered?.cleanupEffectId).toBeUndefined();
+		});
+	});
+
 	it("rejects a delayed cleanup callback for a successor generation", async () => {
 		await withDaemon(async (daemon, fake, _injected, setEndpointGeneration) => {
 			await daemon.postRoot("session", "root");
