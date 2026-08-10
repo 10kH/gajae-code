@@ -710,6 +710,19 @@ function staleEventFrame(
 	};
 }
 
+function correlationlessAssistantFrame(text: string): Record<string, unknown> {
+	return {
+		type: "event",
+		payload: {
+			event_type: "message_end",
+			event: {
+				type: "message_end",
+				message: { role: "assistant", content: [{ type: "text", text }] },
+			},
+		},
+	};
+}
+
 test("a settled turn's stale message frame does not narrow the live turn off the inference bound", async () => {
 	const fixture = await createFixture();
 	try {
@@ -725,16 +738,19 @@ test("a settled turn's stale message frame does not narrow the live turn off the
 		);
 
 		const armedBefore = fixture.clock.armed;
+		const chunks = textChunks(fixture.updates);
 		fixture.send(
 			staleEventFrame(stale, "message_update", {
 				type: "message_update",
 				message: { role: "assistant", content: [{ type: "text", text: "flushed from the abandoned turn" }] },
 			}),
 		);
-		await waitFor(() => fixture.clock.armed?.id !== armedBefore?.id, "stale frame ingress");
+		fixture.send(correlationlessAssistantFrame("stale message ingress marker"));
+		await waitFor(() => textChunks(fixture.updates) > chunks, "stale message frame ingress");
 
 		// The live turn has emitted only `agent_start`: its own model call is still unanswered, so
 		// the inference bound owns it. A frame belonging to a settled turn cannot clear that.
+		expect(fixture.clock.armed).toEqual(armedBefore);
 		expect(fixture.clock.armed?.at).toBe(fixture.clock.now() + ACP_PROMPT_INFERENCE_TIMEOUT_MS);
 		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
 		await Bun.sleep(10);
@@ -753,6 +769,7 @@ test("a settled turn's stale tool start does not pin the live turn to the tool b
 		const { stale, pending } = await abandonTurnThenStartAnother(fixture);
 
 		const armedBefore = fixture.clock.armed;
+		const chunks = textChunks(fixture.updates);
 		fixture.send(
 			staleEventFrame(stale, "tool_execution_start", {
 				type: "tool_execution_start",
@@ -761,10 +778,12 @@ test("a settled turn's stale tool start does not pin the live turn to the tool b
 				args: { command: "sleep 100000" },
 			}),
 		);
-		await waitFor(() => fixture.clock.armed?.id !== armedBefore?.id, "stale frame ingress");
+		fixture.send(correlationlessAssistantFrame("stale tool ingress marker"));
+		await waitFor(() => textChunks(fixture.updates) > chunks, "stale tool frame ingress");
 
 		// Nothing is executing on the live turn, so the hour-wide tool bound must stay retired:
 		// borrowing it from a settled turn would blind the safety net to a dead producer.
+		expect(fixture.clock.armed).toEqual(armedBefore);
 		expect(fixture.clock.armed?.at).toBe(fixture.clock.now() + ACP_PROMPT_INFERENCE_TIMEOUT_MS);
 		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS + 1);
 		const error = await bounded(
@@ -783,43 +802,22 @@ test("a settled turn's stale tool start does not pin the live turn to the tool b
 	}
 });
 
-test("a correlationless frame refreshes liveness without moving the turn's bound", async () => {
+test("correlationless frames do not refresh the active prompt watchdog", async () => {
 	const fixture = await createFixture();
 	try {
 		const { pending } = await startTurn(fixture);
-		let settled = false;
-		void pending.then(
-			() => {
-				settled = true;
-			},
-			() => {
-				settled = true;
-			},
-		);
+		const armedBefore = fixture.clock.armed;
+		if (!armedBefore) throw new Error("Expected an armed prompt watchdog");
 
-		// Heartbeats and session-scoped events carry no command/turn identity. They prove the
-		// producer lives, so they refresh the baseline, but they own no activity transition —
-		// an assistant message that belongs to nobody must not retire this turn's inference bound.
+		// Heartbeats and session-scoped events carry no command/turn identity. They can be
+		// published as session activity, but must not be attributed to this prompt's watchdog.
 		const chunks = textChunks(fixture.updates);
-		fixture.send({
-			type: "event",
-			payload: {
-				event_type: "message_end",
-				event: {
-					type: "message_end",
-					message: { role: "assistant", content: [{ type: "text", text: "unowned" }] },
-				},
-			},
-		});
+		fixture.send({ type: "activity", sessionId: fixture.sessionId, state: "idle" });
+		fixture.send(correlationlessAssistantFrame("unowned"));
 		await waitFor(() => textChunks(fixture.updates) > chunks, "correlationless frame ingress");
 
-		expect(fixture.clock.armed?.at).toBe(fixture.clock.now() + ACP_PROMPT_INFERENCE_TIMEOUT_MS);
-		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
-		await Bun.sleep(10);
-		expect(settled).toBe(false);
-
-		// The baseline did move with that frame: the expiry is measured from it, and reports it.
-		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS - ACP_PROMPT_INACTIVITY_TIMEOUT_MS);
+		expect(fixture.clock.armed).toEqual(armedBefore);
+		fixture.clock.advance(armedBefore.at - fixture.clock.now() + 1);
 		const error = await bounded(
 			pending.then(
 				() => undefined,
@@ -830,7 +828,48 @@ test("a correlationless frame refreshes liveness without moving the turn's bound
 		expect(error).toBeInstanceOf(Error);
 		const message = (error as Error).message;
 		expect(message).toContain(`${Math.round(ACP_PROMPT_INFERENCE_TIMEOUT_MS / 1_000)}s of silence`);
-		expect(message).toContain('"message_end"');
+		expect(message).toContain('"agent_start"');
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("conflicting frame and event identities do not refresh the active prompt watchdog", async () => {
+	const fixture = await createFixture();
+	try {
+		const { pending } = await startTurn(fixture);
+		const armedBefore = fixture.clock.armed;
+		if (!armedBefore) throw new Error("Expected an armed prompt watchdog");
+		const { commandId, turnId } = fixture.correlation();
+		const chunks = textChunks(fixture.updates);
+
+		fixture.send({
+			type: "event",
+			commandId,
+			turnId,
+			payload: {
+				event_type: "message_end",
+				event: {
+					type: "message_end",
+					commandId: "foreign-command",
+					turnId: "foreign-turn",
+					message: { role: "assistant", content: [{ type: "text", text: "conflicting identity" }] },
+				},
+			},
+		});
+		await waitFor(() => textChunks(fixture.updates) > chunks, "conflicting identity frame ingress");
+
+		expect(fixture.clock.armed).toEqual(armedBefore);
+		fixture.clock.advance(armedBefore.at - fixture.clock.now() + 1);
+		const error = await bounded(
+			pending.then(
+				() => undefined,
+				(reason: unknown) => reason,
+			),
+			"watchdog rejection",
+		);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain('"agent_start"');
 	} finally {
 		fixture.dispose();
 	}
