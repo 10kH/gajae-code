@@ -84,10 +84,11 @@ export type ChatDaemonAction = "stop" | "reload";
  * Slack generation 35 identity-fences detached startup cleanup from restarted daemon state.
  * Slack generation 36 retains stop ownership for every detached lifecycle generation.
  * Discord generation 32 / Slack generation 37 bind cleanup to the removed attachment generation.
+ * Discord generation 33 / Slack generation 38 identity-fence cleanup callbacks on exact attachments.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 32,
-	slack: 37,
+	discord: 33,
+	slack: 38,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

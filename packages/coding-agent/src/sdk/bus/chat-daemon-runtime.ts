@@ -236,6 +236,7 @@ function correlateFrame(frame: Record<string, unknown>): CorrelatedFrame | undef
  */
 export class ChatDaemonRuntime {
 	readonly #router: SessionRouter;
+	readonly #attachments = new Map<string, SessionAttachment>();
 	#discord: DiscordNotificationDaemon | undefined;
 	#slack: SlackNotificationDaemon | undefined;
 	#presentation: NotificationPresentationEngine | undefined;
@@ -252,7 +253,7 @@ export class ChatDaemonRuntime {
 				...deps.routerDeps,
 				onFrame: async (attachment, frame) => await this.#handleFrame(attachment, frame),
 				onAttachment: async attachment => this.#onAttachment(attachment),
-				onSessionRemoved: async attachment => await this.#close(attachment),
+				onSessionRemoved: async attachment => await this.#onSessionRemoved(attachment),
 			},
 		});
 	}
@@ -360,12 +361,20 @@ export class ChatDaemonRuntime {
 	}
 
 	async #onAttachment(attachment: SessionAttachment): Promise<void> {
+		this.#attachments.set(attachment.sessionId, attachment);
 		this.#presentation?.connectSession(attachment.sessionId, {
 			sendReply: route => attachment.send({ type: "reply", id: route.actionId, answer: route.answer }),
 		});
 	}
 
+	async #onSessionRemoved(attachment: SessionAttachment): Promise<void> {
+		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
+		this.#attachments.delete(attachment.sessionId);
+		await this.#closeProviders(attachment);
+	}
+
 	async #handleFrame(attachment: SessionAttachment, correlated: CorrelatedFrame): Promise<void> {
+		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
 		const publicationId = correlated.publicationId;
 		const normalizedFrame = correlated.body;
 		const bodyType = typeof normalizedFrame.type === "string" ? normalizedFrame.type : undefined;
@@ -375,7 +384,7 @@ export class ChatDaemonRuntime {
 		const sessionId = attachment.sessionId;
 		const name = correlated.name;
 		if (name === "session_closed" || name === "session_terminated") {
-			await this.#close(attachment);
+			await this.#closeProviders(attachment);
 			return;
 		}
 		if (name === SESSION_PREPARED_EVENT || bodyType === SESSION_PREPARED_EVENT) return;
@@ -422,7 +431,7 @@ export class ChatDaemonRuntime {
 			);
 	}
 
-	async #close(attachment: SessionAttachment): Promise<void> {
+	async #closeProviders(attachment: SessionAttachment): Promise<void> {
 		await this.#discord?.close(attachment.sessionId, attachment.generation);
 		await this.#slack?.close(attachment.sessionId, undefined, attachment.generation);
 	}
