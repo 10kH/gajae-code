@@ -108,10 +108,11 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 52 / Slack generation 58 classify reconnect-time endpoint changes before provider retirement.
  * Discord generation 53 / Slack generation 59 serialize successor attach behind predecessor provider retirement.
  * Discord generation 54 / Slack generation 60 version-fence attaches already in flight when retirement begins.
+ * Discord generation 55 / Slack generation 61 fence durable inbound work by exact attachment identity.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 54,
-	slack: 60,
+	discord: 55,
+	slack: 61,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

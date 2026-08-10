@@ -633,18 +633,8 @@ export class SessionRouter {
 				if (await this.#attach(session, runEpoch)) attachedIds.add(session.sessionId);
 			} catch {
 				const failed = this.#sessions.get(session.sessionId);
-				if (failed?.runEpoch === runEpoch) {
-					this.#adopted.delete(session.sessionId);
-
-					this.#sessions.delete(session.sessionId);
-					failed.dispose();
-					await failed.client.close().catch(() => undefined);
-					try {
-						await this.#deps.onSessionRemoved?.(failed.capability);
-					} catch {
-						// A failed attachment is already revoked; provider cleanup is best effort.
-					}
-				}
+				if (failed?.runEpoch === runEpoch)
+					await this.#retireAttachment(failed, liveIds.has(session.sessionId) ? "replaced" : "removed");
 				logger.warn(
 					`SDK session attachment failed for indexed session ${session.sessionId} at generation ${session.endpointGeneration}; the endpoint remains unauthorized.`,
 				);
@@ -659,16 +649,8 @@ export class SessionRouter {
 				this.#undelivered.delete(sessionId);
 				this.#recoveredFrames.delete(sessionId);
 			}
-			this.#adopted.delete(sessionId);
-			this.#sessions.delete(sessionId);
-			attached.dispose();
 			try {
-				await attached.client.close();
-			} catch (error) {
-				cleanupErrors.push(error);
-			}
-			try {
-				await this.#deps.onSessionRemoved?.(attached.capability);
+				await this.#retireAttachment(attached, liveIds.has(sessionId) ? "replaced" : "removed");
 			} catch (error) {
 				cleanupErrors.push(error);
 			}

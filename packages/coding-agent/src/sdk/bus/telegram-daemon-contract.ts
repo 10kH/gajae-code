@@ -212,8 +212,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 148 classifies reconnect-time endpoint successors before attachment retirement.
  * Generation 149 serializes successor attachment behind predecessor provider retirement.
  * Generation 150 version-fences attaches already in flight when retirement begins.
+ * Generation 151 preserves provider continuity for endpoint-before-index replacement cleanup.
  */
-export const DAEMON_GENERATION = 150;
+export const DAEMON_GENERATION = 151;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
