@@ -683,7 +683,7 @@ describe("chat daemon worker", () => {
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
 		});
 		tick?.();
-		await Bun.sleep(10);
+		for (let attempt = 0; attempt < 2_000 && !oldClient.closed; attempt++) await Bun.sleep(1);
 		expect(oldClient.closed).toBe(true);
 		lateOldFrame({ type: "turn_stream", sessionId: "session", text: "stale" });
 		await Bun.sleep(10);

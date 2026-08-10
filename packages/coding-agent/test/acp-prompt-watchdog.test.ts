@@ -155,8 +155,6 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 	let turnId = "";
 	let promptSocket: TestSocket | undefined;
 	let server!: ReturnType<typeof Bun.serve>;
-	let authority: ExactSessionAuthorityFixture;
-	let authorityOptions: ExactSessionAuthorityOptions;
 
 	const send = (frame: Record<string, unknown>): void => {
 		if (!promptSocket) throw new Error("Expected a prompt socket");
@@ -247,8 +245,8 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 						socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: {} }));
 						return;
 					}
-					void publishExactSessionAuthority(authorityOptions, authority);
 					socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: authority }));
+					setTimeout(() => void publishExactSessionAuthority(authorityOptions, authority), 10);
 					return;
 				}
 				if (frame.type === "query_request") {
@@ -301,14 +299,14 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 	});
 	const port = server.port;
 	if (port === undefined) throw new Error("Expected an ACP fixture server port");
-	authorityOptions = {
+	const authorityOptions: ExactSessionAuthorityOptions = {
 		agentDir,
 		cwd,
 		sessionId,
 		url: `ws://127.0.0.1:${port}`,
 		token,
 	};
-	authority = await prepareExactSessionAuthority(authorityOptions);
+	const authority: ExactSessionAuthorityFixture = await prepareExactSessionAuthority(authorityOptions);
 	await writeBrokerDiscovery(agentDir, {
 		version: 1,
 		protocolVersion: 3,
