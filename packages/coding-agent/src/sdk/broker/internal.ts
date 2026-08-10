@@ -1,5 +1,5 @@
 import * as fs from "node:fs/promises";
-import path from "node:path";
+import * as path from "node:path";
 import type { Broker } from "./broker";
 
 /** Wait for broker-local completion, then terminate only the current broker process. */
@@ -50,13 +50,9 @@ export async function writeBrokerStartupFailureMarker(
 ): Promise<void> {
 	try {
 		await fs.mkdir(path.dirname(brokerStartupFailurePath(agentDir)), { recursive: true, mode: 0o700 });
-		await fs.writeFile(
+		await Bun.write(
 			brokerStartupFailurePath(agentDir),
 			JSON.stringify(boundedMarker(failure.reason, failure.exitCode, failure.signal)),
-			{
-				flag: "w",
-				mode: 0o600,
-			},
 		);
 	} catch {
 		// Best-effort only.
@@ -68,7 +64,9 @@ export async function readBrokerStartupFailureMarker(
 	agentDir: string,
 ): Promise<BrokerStartupFailureMarker | undefined> {
 	try {
-		const raw = await fs.readFile(brokerStartupFailurePath(agentDir), "utf8");
+		const file = Bun.file(brokerStartupFailurePath(agentDir));
+		if (!(await file.exists())) return undefined;
+		const raw = await file.text();
 		const value: unknown = JSON.parse(raw);
 		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 		const marker = value as Partial<BrokerStartupFailureMarker>;
@@ -90,7 +88,8 @@ export async function readBrokerStartupFailureMarker(
 /** Best-effort marker removal; used at spawn so a stale marker never misattributes an older failure. */
 export async function clearBrokerStartupFailureMarker(agentDir: string): Promise<void> {
 	try {
-		await fs.unlink(brokerStartupFailurePath(agentDir));
+		const file = Bun.file(brokerStartupFailurePath(agentDir));
+		if (await file.exists()) await file.unlink();
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
 			// Best-effort only.
@@ -113,7 +112,9 @@ export class BrokerStartupError extends Error {
 
 	constructor(fields: { exitCode: number | null; signal: string | null; reason: string; stderrExcerpt?: string }) {
 		super(
-			`Detached SDK broker exited before discovery (code=${fields.exitCode}, signal=${fields.signal}): ${fields.reason}`,
+			`Detached SDK broker exited before discovery (code=${fields.exitCode}, signal=${fields.signal}): ${fields.reason}${
+				fields.stderrExcerpt ? ` Broker stderr: ${fields.stderrExcerpt}` : ""
+			}`,
 		);
 		this.name = "BrokerStartupError";
 		this.exitCode = fields.exitCode;
