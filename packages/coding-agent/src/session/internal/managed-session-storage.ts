@@ -2064,7 +2064,8 @@ function sameReplacementIdentity(
 		left.ino === right.ino &&
 		left.nlink === right.nlink &&
 		left.size === right.size &&
-		left.mtimeNs === right.mtimeNs
+		left.mtimeNs === right.mtimeNs &&
+		left.sha256 === right.sha256
 	);
 }
 
@@ -2614,7 +2615,24 @@ function replaceManagedFileGeneratedSync(
 		failure =
 			publicationCommitted && !publishedIdentity ? new ManagedCommittedMutationError(operation, error) : error;
 	} finally {
-		if (fd !== undefined) fs.closeSync(fd);
+		if (fd !== undefined) {
+			try {
+				fs.closeSync(fd);
+			} catch (error) {
+				if (publicationCommitted && !publishedIdentity) {
+					const cause =
+						failure === undefined
+							? error
+							: new AggregateError([failure, error], "Managed replacement and descriptor close both failed.");
+					failure = new ManagedCommittedMutationError(operation, cause);
+				} else {
+					failure =
+						failure === undefined
+							? error
+							: new AggregateError([failure, error], "Managed replacement and descriptor close both failed.");
+				}
+			}
+		}
 		if (stagedIdentity && !preserveStaging) {
 			try {
 				const named = fs.lstatSync(staging, { bigint: true });

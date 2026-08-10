@@ -4163,7 +4163,7 @@ describe("persistent dictionary and metadata-delta artifacts", () => {
 		}
 	});
 
-	it("keeps managed dictionary and delta acceleration outside the managed tree", async () => {
+	itPosix("keeps managed dictionary and delta acceleration outside the managed tree", async () => {
 		const tempDir = TempDir.createSync("@pi-managed-dict-exclusion-");
 		const cwd = path.join(tempDir.path(), "workspace");
 		const agentDir = path.join(tempDir.path(), "agent");

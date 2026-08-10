@@ -47,6 +47,7 @@ import { ArtifactManager } from "./artifacts";
 import {
 	type BlobPutResult,
 	BlobStore,
+	disposeVerifiedResidentCacheInstanceDir,
 	EphemeralBlobStore,
 	externalizeImageData,
 	externalizeImageDataSync,
@@ -59,7 +60,6 @@ import {
 	parseBlobRef,
 	ResidentBlobMissingError,
 	ResidentCacheTrustError,
-	removeEmptyResidentCacheInstanceDir,
 	resolveResidentImageDataSync,
 	resolveResidentImageDataUrlSync,
 	resolveTextBlobSync,
@@ -9977,7 +9977,7 @@ export class SessionManager {
 			retainedAuthority?.close();
 			this.#managedSidecarAuthorityStore = undefined;
 			this.#managedSidecarSecurityContext = undefined;
-			removeEmptyResidentCacheInstanceDir(instanceDir);
+			disposeVerifiedResidentCacheInstanceDir(instanceDir);
 			throw error;
 		}
 		return instanceDir;
