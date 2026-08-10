@@ -1735,7 +1735,7 @@ export class DiscordNotificationDaemon {
 		let revalidationFailed = false;
 		let providerEffectStarted = false;
 		let renewal: Promise<boolean> | undefined;
-		const renew = async (): Promise<boolean> => {
+		const renewLease = async (): Promise<boolean> => {
 			if (renewalLost) return false;
 			if (renewal) return await renewal;
 			const currentRenewal = (async (): Promise<boolean> => {
@@ -1743,10 +1743,6 @@ export class DiscordNotificationDaemon {
 					this.#effects.renew(id, lease, this.#providerLeaseMs),
 				);
 				if (!renewed) renewalLost = true;
-				else if (!(await revalidate())) {
-					revalidationFailed = true;
-					renewalLost = true;
-				}
 				return !renewalLost;
 			})();
 			renewal = currentRenewal;
@@ -1758,19 +1754,24 @@ export class DiscordNotificationDaemon {
 		};
 		const timer = setInterval(
 			() => {
-				void renew().catch(() => {});
+				void renewLease().catch(() => {});
 			},
 			Math.max(1, Math.floor(this.#providerLeaseMs / 3)),
 		);
 		const ensure = async (): Promise<void> => {
-			if (!(await renew())) throw new Error(`Discord effect ${id} lost its fence`);
+			if (!(await renewLease())) throw new Error(`Discord effect ${id} lost its fence`);
+			if (!(await revalidate())) {
+				revalidationFailed = true;
+				renewalLost = true;
+				throw new Error(`Discord effect ${id} lost its fence`);
+			}
 		};
 		try {
 			await ensure();
 			const receipt = await operation(ensure, () => {
 				providerEffectStarted = true;
 			});
-			await ensure();
+			if (!(await renewLease())) throw new Error(`Discord effect ${id} lost its fence`);
 			const committed = await this.#effects.record(id, lease, "terminal", receipt);
 			if (!committed) throw new Error(`Discord effect ${id} lost its fence before commit`);
 			return receipt;
