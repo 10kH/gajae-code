@@ -1611,8 +1611,17 @@ export class DiscordNotificationDaemon {
 		let lost = false;
 		let renewal: Promise<boolean> | undefined;
 		let expectedGeneration = intent.generation;
+		const workGeneration = this.#workGeneration;
+		const invalidate = async (): Promise<void> => {
+			lost = true;
+			await this.#abandonCreator(this.#intentKey(intent.sessionId!), intent);
+		};
+		this.#workInvalidators.add(invalidate);
 		const renew = async (): Promise<boolean> => {
-			if (lost) return false;
+			if (lost || workGeneration !== this.#workGeneration) {
+				await invalidate();
+				return false;
+			}
 			if (renewal) return await renewal;
 			const currentRenewal = (async (): Promise<boolean> => {
 				const now = this.#now();
@@ -1631,6 +1640,14 @@ export class DiscordNotificationDaemon {
 						updatedAt: now,
 					};
 				});
+				if (workGeneration !== this.#workGeneration) {
+					if (current?.state === "creating" && current.createOwner === intent.createOwner) {
+						intent.generation = current.generation;
+						intent.createLeaseExpiresAt = current.createLeaseExpiresAt;
+					}
+					await invalidate();
+					return false;
+				}
 				if (
 					current?.state !== "creating" ||
 					current.createOwner !== intent.createOwner ||
@@ -1665,6 +1682,7 @@ export class DiscordNotificationDaemon {
 			return result;
 		} finally {
 			clearInterval(timer);
+			this.#workInvalidators.delete(invalidate);
 		}
 	}
 	async #clearPending(record: DiscordConversation, actionId: string, actionNonce: string): Promise<void> {

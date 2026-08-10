@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes journal-boundary generation 131 at serving epoch 78", () => {
+test("publishes create-intent-fence generation 132 at serving epoch 79", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 131 / serving epoch 78: timed-out Discord work becomes uncertain before Router revocation.
-	expect(DAEMON_GENERATION).toBe(131);
-	expect(SERVING_EPOCH).toBe(78);
+	// Generation 132 / serving epoch 79: timed-out Discord creator ownership is released.
+	expect(DAEMON_GENERATION).toBe(132);
+	expect(SERVING_EPOCH).toBe(79);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
