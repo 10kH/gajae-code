@@ -2470,6 +2470,27 @@ async function removeExactDeadSessionEndpoint(
 	}
 }
 
+async function hasOwnedEndpointPayload(root: string, id: string, effectMarker: string): Promise<boolean> {
+	const directory = path.join(root, "sdk");
+	const endpointName = `${id}.json`;
+	let names: string[];
+	try {
+		names = await fs.readdir(directory);
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code !== "ENOENT";
+	}
+	for (const name of names) {
+		if (!name.startsWith(".gjc-delete-endpoint-") || !name.includes(effectMarker) || !name.endsWith(endpointName))
+			continue;
+		try {
+			const metadata = await fs.lstat(path.join(directory, name));
+			if (!metadata.isFile() || metadata.size > 0) return true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return true;
+		}
+	}
+	return false;
+}
 async function waitForClose(broker: Broker, id: string, record: CloseRecord, timeoutMs: number): Promise<boolean> {
 	const timing = lifecycleTiming(broker);
 	const deadline = timing.now() + timeoutMs;
@@ -2505,6 +2526,8 @@ async function waitForClose(broker: Broker, id: string, record: CloseRecord, tim
 					: undefined;
 			if (expected) await removeOwnedLifecycleArtifacts(record.locator.stateRoot, id, expected);
 			if (!(await removeExactDeadSessionEndpoint(broker, id, record))) return false;
+			if (expected && (await hasOwnedEndpointPayload(record.locator.stateRoot, id, expected.effectMarker)))
+				return false;
 			await broker.index.unregisterIfCurrent(registration);
 			return await endpointRemoved(record.locator.stateRoot, id);
 		}
