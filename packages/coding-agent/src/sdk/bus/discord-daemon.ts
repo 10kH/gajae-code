@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { SdkClientError } from "../client/client";
-import { SessionRouterError, type SessionAttachment } from "../router";
+import { type SessionAttachment, SessionRouterError } from "../router";
 import type { ChatDeliveryError } from "./chat-daemon-runtime";
 
 import {

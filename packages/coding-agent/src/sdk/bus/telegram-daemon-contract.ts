@@ -185,8 +185,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 121 fences bounded-stop continuations from later Router runs.
  * Generation 122 fences every nested replay suppression on rejection durability.
  * Generation 123 scopes stale Router errors to their originating run epoch.
+ * Generation 124 detaches restart tails and restores rejected rollback as replayable.
  */
-export const DAEMON_GENERATION = 123;
+export const DAEMON_GENERATION = 124;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -255,5 +256,6 @@ export const DAEMON_GENERATION = 123;
  * Epoch 68 prevents pre-stop reconciliation authority after same-instance restart.
  * Epoch 69 prevents provisional nested replay cursor concession.
  * Epoch 70 prevents stale run failures from stopping a restarted Router.
+ * Epoch 71 restores bounded Router restart and rejected publication replay.
  */
-export const SERVING_EPOCH = 70;
+export const SERVING_EPOCH = 71;

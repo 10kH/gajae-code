@@ -477,7 +477,13 @@ function brokerErrorFromThrown(value: unknown): { code: string; message: string;
 	return { code, message, ...(requestSent === undefined ? {} : { requestSent }) };
 }
 
-const TRANSPORT_ERROR_CODES = new Set(["timeout", "connection_closed", "reconnect_exhausted", "unavailable", "protocol_error"]);
+const TRANSPORT_ERROR_CODES = new Set([
+	"timeout",
+	"connection_closed",
+	"reconnect_exhausted",
+	"unavailable",
+	"protocol_error",
+]);
 
 function certaintyForThrownError(error: {
 	readonly code: string;

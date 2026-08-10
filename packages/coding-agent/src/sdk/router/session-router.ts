@@ -201,7 +201,11 @@ export class SessionRouter {
 		if (this.#started) return;
 		this.#started = true;
 		const runEpoch = ++this.#runEpoch;
-		if (this.#stopController.signal.aborted) this.#stopController = new AbortController();
+		if (this.#stopController.signal.aborted) {
+			this.#stopController = new AbortController();
+			this.#reconcileTail = Promise.resolve();
+			this.#frameTails.clear();
+		}
 		try {
 			await this.#serialReconcile(runEpoch);
 			if (!this.#running(runEpoch)) return;

@@ -5652,7 +5652,7 @@ export class TelegramNotificationDaemon {
 			this.rejectedPublications.delete(publicationId);
 			if (!this.tentativePublications.has(publicationId)) {
 				if (claimedAt !== undefined) this.claimedPublications.set(publicationId, claimedAt);
-				else if (ambiguousAt !== undefined) this.ambiguousPublications.set(publicationId, ambiguousAt);
+				else if (ambiguousAt !== undefined) this.claimedPublications.set(publicationId, ambiguousAt);
 			}
 			this.rejectPublicationSettlement(publicationId, error);
 			throw error;
