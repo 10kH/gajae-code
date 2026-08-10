@@ -87,10 +87,11 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 33 / Slack generation 38 identity-fence cleanup callbacks on exact attachments.
  * Discord generation 34 / Slack generation 39 clear stale attachment identity before provider reassignment.
  * Discord generation 35 / Slack generation 40 capture provider ownership before cleanup awaits.
+ * Discord generation 36 / Slack generation 41 drain prior cleanup before provider restart.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 35,
-	slack: 40,
+	discord: 36,
+	slack: 41,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

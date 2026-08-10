@@ -237,6 +237,7 @@ function correlateFrame(frame: Record<string, unknown>): CorrelatedFrame | undef
 export class ChatDaemonRuntime {
 	readonly #router: SessionRouter;
 	readonly #attachments = new Map<string, SessionAttachment>();
+	readonly #cleanupWork = new Set<Promise<void>>();
 	#discord: DiscordNotificationDaemon | undefined;
 	#slack: SlackNotificationDaemon | undefined;
 	#presentation: NotificationPresentationEngine | undefined;
@@ -259,6 +260,13 @@ export class ChatDaemonRuntime {
 	}
 
 	async start(): Promise<void> {
+		if (this.#cleanupWork.size > 0) {
+			const settled = await Promise.race([
+				Promise.allSettled([...this.#cleanupWork]).then(() => true),
+				Bun.sleep(5_000).then(() => false),
+			]);
+			if (!settled) throw new Error("Prior provider cleanup did not settle before chat daemon restart.");
+		}
 		this.#attachments.clear();
 		if (this.input.kind === "discord") {
 			const config = this.input.config.notifications.discord;
@@ -371,7 +379,7 @@ export class ChatDaemonRuntime {
 	async #onSessionRemoved(attachment: SessionAttachment): Promise<void> {
 		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
 		this.#attachments.delete(attachment.sessionId);
-		await this.#closeProviders(attachment);
+		await this.#trackCleanup(attachment);
 	}
 
 	async #handleFrame(attachment: SessionAttachment, correlated: CorrelatedFrame): Promise<void> {
@@ -385,7 +393,7 @@ export class ChatDaemonRuntime {
 		const sessionId = attachment.sessionId;
 		const name = correlated.name;
 		if (name === "session_closed" || name === "session_terminated") {
-			await this.#closeProviders(attachment);
+			await this.#trackCleanup(attachment);
 			return;
 		}
 		if (name === SESSION_PREPARED_EVENT || bodyType === SESSION_PREPARED_EVENT) return;
@@ -432,6 +440,11 @@ export class ChatDaemonRuntime {
 			);
 	}
 
+	#trackCleanup(attachment: SessionAttachment): Promise<void> {
+		const work = this.#closeProviders(attachment);
+		this.#cleanupWork.add(work);
+		return work.finally(() => this.#cleanupWork.delete(work));
+	}
 	async #closeProviders(attachment: SessionAttachment): Promise<void> {
 		const discord = this.#discord;
 		const slack = this.#slack;
