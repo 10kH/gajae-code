@@ -9475,6 +9475,7 @@ export class AgentSession {
 		if (!this.#cancelAndSubmitInProgress && this.#canAutoContinueForSteer()) {
 			this.#scheduleAgentContinue({
 				shouldContinue: () => this.#canAutoContinueForSteer() && this.agent.hasQueuedSteering(),
+				continueQueuedOnly: true,
 			});
 		}
 	}
