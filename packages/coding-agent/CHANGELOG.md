@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- Browser `act` and `run` responses can now surface an opt-in (`open(..., { diagnostics: true })`), bounded mailbox of page exceptions and `console.error` metadata. Entries carry only kind, timestamp, origin-only URL, line/column, and an allowlisted built-in error class; path segments, query strings, messages, arguments, values, and stacks are never retained. Serialization is byte-bounded with an explicit truncation marker.
+
 ### Fixed
 - Option+Q verification now supports normal macOS Terminal.app profiles and fails with an actionable Settings > Profiles > Keyboard > Use Option as Meta key diagnostic when the profile cannot forward Option as Meta/Esc.
 - Queued-message selection now accepts the actual macOS Terminal.app Option+Up/Down byte sequence from either physical Option key, enabling multi-message restore, delete, and reorder flows.
