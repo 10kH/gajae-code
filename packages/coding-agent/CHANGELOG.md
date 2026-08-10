@@ -56,6 +56,10 @@
 
 - Removed Telegram's daemon-owned lifecycle control server, lifecycle ledger/orchestrator, SessionId preallocation, tmux/process lifecycle executor, native lifecycle-control fallback, and manual endpoint-file/WebSocket bridge. Provider retries now reuse one Broker idempotency identity, and topic reservations bind only the Broker-returned opaque SessionId.
 
+### Fixed
+
+- `gjc team` no longer rejects every successful native tmux startup with `tmux_layout_postproof_failed` and then, after passing layout verification, `tmux_window_option_postproof_failed`. tmux reports `#{window_layout}` as an encoded layout string rather than the requested preset name, so Team now verifies the encoded readback and the non-mutating `main-vertical` pane geometry without replaying the readback. Window-option readback now also uses `show-window-options -v`; unlike `show-options`, native tmux does not support the quiet `-q` flag on that command.
+
 ## [0.12.19] - 2026-08-08
 
 ### Fixed
