@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "kind": "cpu-profile-source-receipt",
-  "sourceCommit": "94de8e2eb",
-  "sourceTree": "968bc4ea9de2dc56d8e5a3d20ceebb4d1b26fdc8",
-  "cumulativeDiffSha256": "d0d984f137d00871c881b4c05405944ba8e169782eb8675338371dab19600f47",
+  "sourceCommit": "6a57ccf59",
+  "sourceTree": "27c7d0a9a7530e149a321f38eb894aeecee89634",
+  "cumulativeDiffSha256": "7f293b552cd45add2a61f99d5c1fc95470b22b748ccb628c64b02b8c5dafb08d",
   "command": [
     "bun",
     "--cpu-prof",
@@ -33,19 +33,19 @@
     "markdownRun": "artifacts/session-first-open-1024-source-bound-run-md.json"
   },
   "observed": {
-    "firstOpenMs": 964.511833,
-    "operationRssGrowthBytes": 122126336,
+    "firstOpenMs": 939.428959,
+    "operationRssGrowthBytes": 110002176,
     "gcRequests": 5,
-    "gcElapsedMs": 19.976666,
+    "gcElapsedMs": 18.824834,
     "warmRangeReads": 0,
     "topSelfTime": [
-      { "function": "update", "percent": 44.8 },
-      { "function": "write", "percent": 11.3 },
-      { "function": "byteLength", "percent": 5.1 },
-      { "function": "stringify", "percent": 4.9 },
-      { "function": "gc", "percent": 4.2 },
-      { "function": "parse", "percent": 3.5 },
-      { "function": "readSync", "percent": 3.1 }
+      { "function": "update", "percent": 45.1 },
+      { "function": "write", "percent": 8.9 },
+      { "function": "stringify", "percent": 6.3 },
+      { "function": "byteLength", "percent": 4.8 },
+      { "function": "gc", "percent": 4.1 },
+      { "function": "readSync", "percent": 4.0 },
+      { "function": "parse", "percent": 3.4 }
     ]
   }
 }

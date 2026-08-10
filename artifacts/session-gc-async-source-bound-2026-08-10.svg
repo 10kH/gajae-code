@@ -8,17 +8,17 @@
 <line x1="76" y1="424" x2="644" y2="424" stroke="#e2e8f0"/>
 <text x="69" y="428" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">0</text>
 <line x1="76" y1="340" x2="644" y2="340" stroke="#e2e8f0"/>
-<text x="69" y="344" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">145</text>
+<text x="69" y="344" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">138</text>
 <line x1="76" y1="256" x2="644" y2="256" stroke="#e2e8f0"/>
-<text x="69" y="260" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">289</text>
+<text x="69" y="260" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">277</text>
 <line x1="76" y1="172" x2="644" y2="172" stroke="#e2e8f0"/>
-<text x="69" y="176" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">434</text>
+<text x="69" y="176" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">415</text>
 <line x1="76" y1="88" x2="644" y2="88" stroke="#e2e8f0"/>
-<text x="69" y="92" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">579</text>
+<text x="69" y="92" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">553</text>
 <text x="76" y="441" text-anchor="middle" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">128</text>
 <text x="644" y="441" text-anchor="middle" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">512</text>
-<polyline fill="none" stroke="#2563eb" stroke-width="2" points="76,314.7468622803834 644,112.88888888888891"/>
-<circle cx="76" cy="314.7468622803834" r="3.5" fill="#2563eb"/>
+<polyline fill="none" stroke="#2563eb" stroke-width="2" points="76,315.02306756074734 644,112.88888888888891"/>
+<circle cx="76" cy="315.02306756074734" r="3.5" fill="#2563eb"/>
 <circle cx="644" cy="112.88888888888891" r="3.5" fill="#2563eb"/>
 <text x="684" y="77" font-family="system-ui,sans-serif" font-size="15" font-weight="650">Operation RSS growth (MiB)</text>
 <line x1="684" y1="424" x2="1252" y2="424" stroke="#94a3b8"/>
@@ -26,35 +26,35 @@
 <line x1="684" y1="424" x2="1252" y2="424" stroke="#e2e8f0"/>
 <text x="677" y="428" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">0</text>
 <line x1="684" y1="340" x2="1252" y2="340" stroke="#e2e8f0"/>
-<text x="677" y="344" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">26</text>
+<text x="677" y="344" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">25</text>
 <line x1="684" y1="256" x2="1252" y2="256" stroke="#e2e8f0"/>
-<text x="677" y="260" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">52</text>
+<text x="677" y="260" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">51</text>
 <line x1="684" y1="172" x2="1252" y2="172" stroke="#e2e8f0"/>
-<text x="677" y="176" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">78</text>
+<text x="677" y="176" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">76</text>
 <line x1="684" y1="88" x2="1252" y2="88" stroke="#e2e8f0"/>
-<text x="677" y="92" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">104</text>
+<text x="677" y="92" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">101</text>
 <text x="684" y="441" text-anchor="middle" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">128</text>
 <text x="1252" y="441" text-anchor="middle" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">512</text>
-<polyline fill="none" stroke="#2563eb" stroke-width="2" points="684,120.07577318655893 1252,112.88888888888891"/>
-<circle cx="684" cy="120.07577318655893" r="3.5" fill="#2563eb"/>
-<circle cx="1252" cy="112.88888888888891" r="3.5" fill="#2563eb"/>
+<polyline fill="none" stroke="#2563eb" stroke-width="2" points="684,112.88888888888891 1252,131.53166787217867"/>
+<circle cx="684" cy="112.88888888888891" r="3.5" fill="#2563eb"/>
+<circle cx="1252" cy="131.53166787217867" r="3.5" fill="#2563eb"/>
 <text x="76" y="523" font-family="system-ui,sans-serif" font-size="15" font-weight="650">Operation throughput (MiB/s)</text>
 <line x1="76" y1="870" x2="644" y2="870" stroke="#94a3b8"/>
 <line x1="76" y1="534" x2="76" y2="870" stroke="#94a3b8"/>
 <line x1="76" y1="870" x2="644" y2="870" stroke="#e2e8f0"/>
 <text x="69" y="874" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">0</text>
 <line x1="76" y1="786" x2="644" y2="786" stroke="#e2e8f0"/>
-<text x="69" y="790" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">258</text>
+<text x="69" y="790" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">270</text>
 <line x1="76" y1="702" x2="644" y2="702" stroke="#e2e8f0"/>
-<text x="69" y="706" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">516</text>
+<text x="69" y="706" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">540</text>
 <line x1="76" y1="618" x2="644" y2="618" stroke="#e2e8f0"/>
-<text x="69" y="622" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">774</text>
+<text x="69" y="622" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">810</text>
 <line x1="76" y1="534" x2="644" y2="534" stroke="#e2e8f0"/>
-<text x="69" y="538" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">1032</text>
+<text x="69" y="538" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">1079</text>
 <text x="76" y="887" text-anchor="middle" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">128</text>
 <text x="644" y="887" text-anchor="middle" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">512</text>
-<polyline fill="none" stroke="#2563eb" stroke-width="2" points="76,648.5186643673592 644,558.8888888888889"/>
-<circle cx="76" cy="648.5186643673592" r="3.5" fill="#2563eb"/>
+<polyline fill="none" stroke="#2563eb" stroke-width="2" points="76,647.9573133269646 644,558.8888888888889"/>
+<circle cx="76" cy="647.9573133269646" r="3.5" fill="#2563eb"/>
 <circle cx="644" cy="558.8888888888889" r="3.5" fill="#2563eb"/>
 <text x="684" y="523" font-family="system-ui,sans-serif" font-size="15" font-weight="650">Cold lookup p95 (ms)</text>
 <line x1="684" y1="870" x2="1252" y2="870" stroke="#94a3b8"/>
@@ -71,9 +71,9 @@
 <text x="677" y="538" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">1.1</text>
 <text x="684" y="887" text-anchor="middle" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">128</text>
 <text x="1252" y="887" text-anchor="middle" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">512</text>
-<polyline fill="none" stroke="#2563eb" stroke-width="2" points="684,599.6702666666635 1252,582.105555555546"/>
-<circle cx="684" cy="599.6702666666635" r="3.5" fill="#2563eb"/>
-<circle cx="1252" cy="582.105555555546" r="3.5" fill="#2563eb"/>
+<polyline fill="none" stroke="#2563eb" stroke-width="2" points="684,639.9849777777824 1252,578.8519555555549"/>
+<circle cx="684" cy="639.9849777777824" r="3.5" fill="#2563eb"/>
+<circle cx="1252" cy="578.8519555555549" r="3.5" fill="#2563eb"/>
 <line x1="76" y1="938" x2="98" y2="938" stroke="#2563eb" stroke-width="3"/>
 <text x="104" y="942" font-family="system-ui,sans-serif" font-size="10" fill="#334155">linear-resume · raw cold first-open · enabled</text>
 </svg>
