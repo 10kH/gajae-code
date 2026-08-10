@@ -2294,20 +2294,49 @@ async function removeExactDeadSessionEndpoint(broker: Broker, id: string, record
 	)
 		return false;
 	const endpointPath = path.join(record.locator.stateRoot, "sdk", `${id}.json`);
+	let handle: fs.FileHandle | undefined;
 	try {
-		const [source, metadata] = await Promise.all([fs.readFile(endpointPath, "utf8"), fs.stat(endpointPath)]);
-		const endpoint = JSON.parse(source) as { sessionId?: unknown; pid?: unknown; stale?: unknown };
+		handle = await fs.open(endpointPath, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+		const metadata = await handle.stat({ bigint: true });
+		if (!metadata.isFile() || metadata.nlink !== 1n || metadata.size > 4096n) return false;
+		const bytes = Buffer.alloc(Number(metadata.size) + 1);
+		const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+		if (bytesRead !== Number(metadata.size)) return false;
+		const source = bytes.subarray(0, bytesRead);
+		const endpoint = JSON.parse(source.toString("utf8")) as { sessionId?: unknown; pid?: unknown; stale?: unknown };
 		if (
 			endpoint.sessionId !== id ||
 			endpoint.pid !== record.pid ||
 			endpoint.stale === true ||
-			metadata.mtimeMs !== record.endpointMtimeMs
+			Number(metadata.mtimeNs) / 1_000_000 !== record.endpointMtimeMs
 		)
 			return false;
-		await fs.unlink(endpointPath);
-		return true;
+		await handle.close();
+		handle = undefined;
+		const removed = exactUnlinkLifecycleFile(
+			endpointPath,
+			{
+				dev: metadata.dev,
+				ino: metadata.ino,
+				nlink: metadata.nlink,
+				size: metadata.size,
+				mtimeNs: metadata.mtimeNs,
+				sha256: createHash("sha256").update(source).digest("hex"),
+			},
+			path.join(path.dirname(endpointPath), `.gjc-dead-endpoint-${randomUUID()}.json`),
+		);
+		return (
+			removed.ok ||
+			removed.code === "not_found" ||
+			(removed.code === "cleanup_pending" &&
+				removed.detachedPath !== undefined &&
+				removed.retainedSuccessorPath === undefined &&
+				(await endpointRemoved(record.locator.stateRoot, id)))
+		);
 	} catch (error) {
 		return (error as NodeJS.ErrnoException).code === "ENOENT";
+	} finally {
+		await handle?.close();
 	}
 }
 

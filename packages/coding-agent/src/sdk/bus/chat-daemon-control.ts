@@ -105,10 +105,11 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 50 / Slack generation 55 terminalize predecessor routes only for a changed same-generation endpoint incarnation.
  * Slack generation 56 clears predecessor inbound receipts before same-generation successor publication.
  * Discord generation 51 / Slack generation 57 persist restart-stable Router endpoint-incarnation authority in provider mappings.
+ * Discord generation 52 / Slack generation 58 classify reconnect-time endpoint changes before provider retirement.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 51,
-	slack: 57,
+	discord: 52,
+	slack: 58,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

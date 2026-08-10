@@ -1002,14 +1002,36 @@ export class SessionRouter {
 		return attached.published && this.#attachmentLive(attached);
 	}
 
-	async #retireAttachment(attached: AttachedSession): Promise<void> {
+	async #retireAttachment(
+		attached: AttachedSession,
+		explicitReason?: "removed" | "replaced" | "replaced_same_generation",
+	): Promise<void> {
 		this.#adopted.delete(attached.sessionId);
 		if (this.#sessions.get(attached.sessionId) !== attached) return;
 		this.#sessions.delete(attached.sessionId);
 		attached.dispose();
 		await attached.client.close().catch(() => undefined);
+		let reason = explicitReason;
+		if (reason === undefined) {
+			try {
+				await this.#index.refresh();
+				const current = this.#index
+					.listSessions()
+					.sessions.find(session => session.sessionId === attached.sessionId);
+				if (
+					current?.live &&
+					(current.endpointGeneration !== attached.generation ||
+						current.pid !== attached.pid ||
+						current.endpointMtimeMs !== attached.endpointMtimeMs)
+				)
+					reason = current.endpointGeneration === attached.generation ? "replaced_same_generation" : "replaced";
+			} catch {
+				// Revocation remains terminal when current Broker authority cannot be proven.
+			}
+		}
+		reason ??= "removed";
 		try {
-			await this.#deps.onSessionRemoved?.(attached.capability);
+			await this.#deps.onSessionRemoved?.(attached.capability, reason);
 		} catch {
 			// Exact authority is already revoked; provider cleanup remains best effort.
 		}

@@ -620,10 +620,10 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes durable attachment incarnation generation 147 at serving epoch 87", () => {
+test("publishes reconnect successor classification generation 148 at serving epoch 87", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 147 / serving epoch 87: Router attachment identity is stable for one exact endpoint incarnation.
-	expect(DAEMON_GENERATION).toBe(147);
+	// Generation 148 / serving epoch 87: reconnect retirement distinguishes endpoint successors from terminal removal.
+	expect(DAEMON_GENERATION).toBe(148);
 	expect(SERVING_EPOCH).toBe(87);
 });
 test("archives pending topics into retained inactive records", async () => {
