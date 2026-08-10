@@ -1245,12 +1245,12 @@ export class ManagedSessionDescendantStore {
 			try {
 				let examined = 0;
 				for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
-					const name = entry.name;
-					if (!name.startsWith(".gjc-replace-receipt-pending-") && !name.startsWith(".gjc-replace-cleanup-"))
-						continue;
 					examined++;
 					if (examined > REPLACEMENT_CLEANUP_RECEIPT_SCAN_LIMIT)
 						throw new Error("managed_replace_cleanup_receipt_limit_exceeded");
+					const name = entry.name;
+					if (!name.startsWith(".gjc-replace-receipt-pending-") && !name.startsWith(".gjc-replace-cleanup-"))
+						continue;
 					if (name.startsWith(".gjc-replace-receipt-pending-")) {
 						this.#reconcilePendingReplacementReceipt(path.join(this.#baseDir, name));
 						continue;
@@ -1938,7 +1938,12 @@ export class ManagedSessionDescendantStore {
 	/** Capture a complete descendant tree through this retained root. */
 	captureTree(relativePath: string): NativeDirectoryTreeSnapshot {
 		this.#assertBound();
-		validateManagedArtifactTree(this.#resolve(relativePath));
+		try {
+			validateManagedArtifactTree(this.#resolve(relativePath));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error("not_found");
+			throw error;
+		}
 		const relative = this.#relative(this.#resolve(relativePath));
 		if (this.#authority) {
 			const captured = this.#authority.snapshotManagedTree(relative);
@@ -3098,23 +3103,31 @@ export function validateManagedArtifactTree(root: string, limits: ManagedArtifac
 	};
 	const maxFiles = clampLimit(limits.maxFiles, MANAGED_ARTIFACT_MAX_FILES);
 	const maxTotalBytes = clampLimit(limits.maxTotalBytes, MANAGED_ARTIFACT_MAX_TOTAL_BYTES);
+	let entries = 0;
 	let files = 0;
 	let bytes = 0;
 	const visit = (directory: string, depth: number): void => {
 		if (depth > MANAGED_ARTIFACT_MAX_DEPTH) throw new Error("unsafe_artifacts");
-		for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-			const entryPath = path.join(directory, entry.name);
-			const stat = fs.lstatSync(entryPath);
-			if (stat.isSymbolicLink()) throw new Error("unsafe_artifacts");
-			if (stat.isDirectory()) {
-				visit(entryPath, depth + 1);
-				continue;
+		const handle = fs.opendirSync(directory);
+		try {
+			for (let entry = handle.readSync(); entry; entry = handle.readSync()) {
+				entries++;
+				if (entries > maxFiles) throw new Error("artifact_capacity_exceeded");
+				const entryPath = path.join(directory, entry.name);
+				const stat = fs.lstatSync(entryPath);
+				if (stat.isSymbolicLink()) throw new Error("unsafe_artifacts");
+				if (stat.isDirectory()) {
+					visit(entryPath, depth + 1);
+					continue;
+				}
+				if (stat.nlink > 1) throw new Error("unsafe_artifacts");
+				if (!stat.isFile() || stat.size > MANAGED_ARTIFACT_MAX_FILE_BYTES) throw new Error("unsafe_artifacts");
+				files++;
+				bytes += stat.size;
+				if (files > maxFiles || bytes > maxTotalBytes) throw new Error("artifact_capacity_exceeded");
 			}
-			if (stat.nlink > 1) throw new Error("unsafe_artifacts");
-			if (!stat.isFile() || stat.size > MANAGED_ARTIFACT_MAX_FILE_BYTES) throw new Error("unsafe_artifacts");
-			files++;
-			bytes += stat.size;
-			if (files > maxFiles || bytes > maxTotalBytes) throw new Error("artifact_capacity_exceeded");
+		} finally {
+			handle.closeSync();
 		}
 	};
 	const rootStat = fs.lstatSync(root);
