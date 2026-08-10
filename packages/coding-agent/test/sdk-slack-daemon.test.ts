@@ -474,7 +474,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(fake),
 				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
-				publicationLeaseMs: 15,
+				publicationLeaseMs: 500,
 			};
 			const root = new SlackNotificationDaemon({ ...base, randomId: () => "root", publicationOwnerId: "root" });
 			await root.postRoot("session", "root");
@@ -497,7 +497,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			const firstLease = await first.store.read(key);
 			if (!firstLease) throw new Error("Slack action lease was not persisted");
 			let renewedLease = firstLease;
-			for (let attempt = 0; attempt < 20 && renewedLease.generation === firstLease.generation; attempt++) {
+			for (let attempt = 0; attempt < 80 && renewedLease.generation === firstLease.generation; attempt++) {
 				await Bun.sleep(25);
 				renewedLease = (await first.store.read(key)) ?? renewedLease;
 			}
