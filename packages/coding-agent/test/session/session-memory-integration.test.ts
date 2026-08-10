@@ -78,6 +78,9 @@ function writeTreeTranscript(
 	return parents;
 }
 
+const itPosix = it.skipIf(process.platform === "win32");
+const describePosix = describe.skipIf(process.platform === "win32");
+
 describe("SessionManager cold sidecar integration", () => {
 	it("retires a compacted prefix on resume and lazily reloads exact transcript entries", async () => {
 		const tempDir = TempDir.createSync("@pi-session-memory-sidecar-");
@@ -279,310 +282,331 @@ describe("SessionManager cold sidecar integration", () => {
 		}
 	});
 
-	it("retires and lazily reloads managed TUI/review-session history through retained range authority", async () => {
-		const tempDir = TempDir.createSync("@pi-session-memory-managed-");
-		const cwd = path.join(tempDir.path(), "project");
-		const agentDir = path.join(tempDir.path(), "agent");
-		fs.mkdirSync(cwd, { recursive: true });
-		const storage = new FileSessionStorage();
-		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
-		const initial = SessionManager.create(cwd, destination, storage);
-		let coldId = "";
-		let firstKeptEntryId = "";
-		let sessionFile = "";
-		try {
-			initial.setSessionMemoryMode("enabled");
-			initial.appendMessage({
-				role: "assistant",
-				content: [{ type: "text", text: "published" }],
-				api: "anthropic-messages",
-				provider: "anthropic",
-				model: "claude-sonnet-4-5",
-				usage: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-				stopReason: "stop",
-				timestamp: Date.now(),
-			});
-			for (let index = 0; index < 400; index++) {
-				const id = initial.appendMessage({
-					role: "user",
-					content: `managed-${index}-${"x".repeat(256)}`,
+	itPosix(
+		"retires and lazily reloads managed TUI/review-session history through retained range authority",
+		async () => {
+			const tempDir = TempDir.createSync("@pi-session-memory-managed-");
+			const cwd = path.join(tempDir.path(), "project");
+			const agentDir = path.join(tempDir.path(), "agent");
+			fs.mkdirSync(cwd, { recursive: true });
+			const storage = new FileSessionStorage();
+			const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+			const initial = SessionManager.create(cwd, destination, storage);
+			let coldId = "";
+			let firstKeptEntryId = "";
+			let sessionFile = "";
+			try {
+				initial.setSessionMemoryMode("enabled");
+				initial.appendMessage({
+					role: "assistant",
+					content: [{ type: "text", text: "published" }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-sonnet-4-5",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
 					timestamp: Date.now(),
 				});
-				coldId ||= id;
-				firstKeptEntryId = id;
+				for (let index = 0; index < 400; index++) {
+					const id = initial.appendMessage({
+						role: "user",
+						content: `managed-${index}-${"x".repeat(256)}`,
+						timestamp: Date.now(),
+					});
+					coldId ||= id;
+					firstKeptEntryId = id;
+				}
+				initial.appendCompaction("summary", undefined, firstKeptEntryId, 20_000);
+				sessionFile = initial.getSessionFile() ?? "";
+				expect(sessionFile).not.toBe("");
+				expect(initial.getSessionMemoryStats()).toMatchObject({
+					coldRetirementActive: true,
+					sidecarIneligible: false,
+				});
+				expect(initial.hotRetainedMessageCharsForTests()).toBeLessThan(1024);
+				expect(initial.getEntry(coldId)?.id).toBe(coldId);
+				initial.setSessionMemoryMode("shadow");
+				expect(initial.getSessionMemoryStats().coldRetirementActive).toBe(true);
+				expect(initial.getEntry(coldId)?.id).toBe(coldId);
+				initial.setSessionMemoryMode("off");
+				expect(initial.getSessionMemoryStats().coldRetirementActive).toBe(true);
+				expect(initial.getEntry(coldId)?.id).toBe(coldId);
+				const artifactsDir = initial.getArtifactsDir();
+				if (!artifactsDir) throw new Error("Expected managed artifacts directory");
+				const managedSidecars = fs.existsSync(artifactsDir)
+					? fs
+							.readdirSync(artifactsDir, { recursive: true })
+							.some(entry => String(entry).includes(".session-memory.spill"))
+					: false;
+				expect(managedSidecars).toBe(false);
+			} finally {
+				await initial.close();
 			}
-			initial.appendCompaction("summary", undefined, firstKeptEntryId, 20_000);
-			sessionFile = initial.getSessionFile() ?? "";
-			expect(sessionFile).not.toBe("");
-			expect(initial.getSessionMemoryStats()).toMatchObject({
-				coldRetirementActive: true,
-				sidecarIneligible: false,
-			});
-			expect(initial.hotRetainedMessageCharsForTests()).toBeLessThan(1024);
-			expect(initial.getEntry(coldId)?.id).toBe(coldId);
-			initial.setSessionMemoryMode("shadow");
-			expect(initial.getSessionMemoryStats().coldRetirementActive).toBe(true);
-			expect(initial.getEntry(coldId)?.id).toBe(coldId);
-			initial.setSessionMemoryMode("off");
-			expect(initial.getSessionMemoryStats().coldRetirementActive).toBe(true);
-			expect(initial.getEntry(coldId)?.id).toBe(coldId);
-			const artifactsDir = initial.getArtifactsDir();
-			if (!artifactsDir) throw new Error("Expected managed artifacts directory");
-			const managedSidecars = fs.existsSync(artifactsDir)
-				? fs
-						.readdirSync(artifactsDir, { recursive: true })
-						.some(entry => String(entry).includes(".session-memory.spill"))
-				: false;
-			expect(managedSidecars).toBe(false);
-		} finally {
-			await initial.close();
-		}
 
-		const reopened = await SessionManager.open(
-			sessionFile,
-			SessionManager.managedDestination(cwd, agentDir, storage),
-			storage,
-			"copy-retain",
-			"enabled",
-		);
-		try {
-			expect(reopened.getSessionMemoryStats()).toMatchObject({
-				coldRetirementActive: true,
-				sidecarRebuildCount: 1,
-			});
-			expect(reopened.getSessionMemoryStats().totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
-			expect(reopened.hotRetainedMessageCharsForTests()).toBeLessThan(1024);
-			const reopenedStat = fs.statSync(sessionFile);
-			fs.utimesSync(sessionFile, reopenedStat.atime, new Date(reopenedStat.mtimeMs + 2_000));
-			expect(reopened.getEntry(coldId)?.id).toBe(coldId);
-			expect(reopened.getSessionMemoryStats().rangeReadGenerationMismatchCount).toBeGreaterThan(0);
-			reopened.setSessionMemoryMode("enabled");
-			expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
-		} finally {
-			await reopened.close();
-			tempDir.removeSync();
-		}
-	}, 60_000);
+			const reopened = await SessionManager.open(
+				sessionFile,
+				SessionManager.managedDestination(cwd, agentDir, storage),
+				storage,
+				"copy-retain",
+				"enabled",
+			);
+			try {
+				expect(reopened.getSessionMemoryStats()).toMatchObject({
+					coldRetirementActive: true,
+					sidecarRebuildCount: 1,
+				});
+				expect(reopened.getSessionMemoryStats().totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+				expect(reopened.hotRetainedMessageCharsForTests()).toBeLessThan(1024);
+				const reopenedStat = fs.statSync(sessionFile);
+				fs.utimesSync(sessionFile, reopenedStat.atime, new Date(reopenedStat.mtimeMs + 2_000));
+				expect(reopened.getEntry(coldId)?.id).toBe(coldId);
+				expect(reopened.getSessionMemoryStats().rangeReadGenerationMismatchCount).toBeGreaterThan(0);
+				reopened.setSessionMemoryMode("enabled");
+				expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			} finally {
+				await reopened.close();
+				tempDir.removeSync();
+			}
+		},
+		60_000,
+	);
 
-	it("retires nested managed review-subagent history without sidecars in the managed tree", async () => {
-		const tempDir = TempDir.createSync("@pi-session-memory-nested-managed-");
-		const cwd = path.join(tempDir.path(), "project");
-		const managedRoot = path.join(tempDir.path(), "managed");
-		const profileAgentDir = path.join(tempDir.path(), "agent-profile");
-		fs.mkdirSync(cwd, { recursive: true });
-		fs.mkdirSync(managedRoot, { recursive: true, mode: 0o700 });
-		const rootStore = new ManagedSessionDescendantStore(
-			managedDirectoryRoot(managedRoot),
-			managedRoot,
-			undefined,
-			undefined,
-			profileAgentDir,
-		);
-		rootStore.ensureDirectory("review");
-		const nestedStore = rootStore.deriveSubtree("review");
-		const manager = SessionManager.create(
-			cwd,
-			SessionManager.nestedManagedDestination(nestedStore, nestedStore.dir),
-			new FileSessionStorage(),
-		);
-		let coldId = "";
-		let firstKeptEntryId = "";
-		try {
-			manager.setSessionMemoryMode("enabled");
-			manager.appendMessage({
-				role: "assistant",
-				content: [{ type: "text", text: "published" }],
-				api: "anthropic-messages",
-				provider: "anthropic",
-				model: "claude-sonnet-4-5",
-				usage: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-				stopReason: "stop",
-				timestamp: Date.now(),
-			});
-			for (let index = 0; index < 200; index++) {
-				const id = manager.appendMessage({
-					role: "user",
-					content: `review-${index}-${"x".repeat(256)}`,
+	itPosix(
+		"retires nested managed review-subagent history without sidecars in the managed tree",
+		async () => {
+			const tempDir = TempDir.createSync("@pi-session-memory-nested-managed-");
+			const cwd = path.join(tempDir.path(), "project");
+			const managedRoot = path.join(tempDir.path(), "managed");
+			const profileAgentDir = path.join(tempDir.path(), "agent-profile");
+			fs.mkdirSync(cwd, { recursive: true });
+			fs.mkdirSync(managedRoot, { recursive: true, mode: 0o700 });
+			const rootStore = new ManagedSessionDescendantStore(
+				managedDirectoryRoot(managedRoot),
+				managedRoot,
+				undefined,
+				undefined,
+				profileAgentDir,
+			);
+			rootStore.ensureDirectory("review");
+			const nestedStore = rootStore.deriveSubtree("review");
+			const manager = SessionManager.create(
+				cwd,
+				SessionManager.nestedManagedDestination(nestedStore, nestedStore.dir),
+				new FileSessionStorage(),
+			);
+			let coldId = "";
+			let firstKeptEntryId = "";
+			try {
+				manager.setSessionMemoryMode("enabled");
+				manager.appendMessage({
+					role: "assistant",
+					content: [{ type: "text", text: "published" }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-sonnet-4-5",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
 					timestamp: Date.now(),
 				});
-				coldId ||= id;
-				firstKeptEntryId = id;
+				for (let index = 0; index < 200; index++) {
+					const id = manager.appendMessage({
+						role: "user",
+						content: `review-${index}-${"x".repeat(256)}`,
+						timestamp: Date.now(),
+					});
+					coldId ||= id;
+					firstKeptEntryId = id;
+				}
+				manager.appendCompaction("summary", undefined, firstKeptEntryId, 10_000);
+				expect(manager.getSessionMemoryStats()).toMatchObject({
+					coldRetirementActive: true,
+					sidecarIneligible: false,
+				});
+				expect(manager.hotRetainedMessageCharsForTests()).toBeLessThan(1024);
+				expect(manager.getEntry(coldId)?.id).toBe(coldId);
+				expect(
+					fs
+						.readdirSync(managedRoot, { recursive: true })
+						.some(entry => String(entry).includes(".session-memory.spill")),
+				).toBe(false);
+			} finally {
+				await manager.close();
+				rootStore.close();
+				tempDir.removeSync();
 			}
-			manager.appendCompaction("summary", undefined, firstKeptEntryId, 10_000);
-			expect(manager.getSessionMemoryStats()).toMatchObject({
-				coldRetirementActive: true,
-				sidecarIneligible: false,
-			});
-			expect(manager.hotRetainedMessageCharsForTests()).toBeLessThan(1024);
-			expect(manager.getEntry(coldId)?.id).toBe(coldId);
+		},
+		60_000,
+	);
+	itPosix(
+		"rejects nested managed transcript replacement after capture",
+		async () => {
+			const tempDir = TempDir.createSync("@pi-session-memory-nested-swap-");
+			const cwd = path.join(tempDir.path(), "project");
+			const managedRoot = path.join(tempDir.path(), "managed");
+			const profileAgentDir = path.join(tempDir.path(), "agent-profile");
+			fs.mkdirSync(cwd, { recursive: true });
+			fs.mkdirSync(managedRoot, { recursive: true, mode: 0o700 });
+			const rootStore = new ManagedSessionDescendantStore(
+				managedDirectoryRoot(managedRoot),
+				managedRoot,
+				undefined,
+				undefined,
+				profileAgentDir,
+			);
+			rootStore.ensureDirectory("review");
+			const nestedStore = rootStore.deriveSubtree("review");
+			const sessionFile = path.join(nestedStore.dir, "review.jsonl");
+			const originalDescriptor = nestedStore.descriptorExpected.bind(nestedStore);
+			const cacheRoot = getResidentCacheRootDir(profileAgentDir);
+			const cacheEntriesBefore = fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0;
+			try {
+				nestedStore.publishNoReplaceSync(
+					"review.jsonl",
+					Buffer.from(
+						`${JSON.stringify({ type: "session", version: 5, id: "nested-swap", timestamp: "0", cwd })}\n`,
+					),
+				);
+				let replaced = false;
+				vi.spyOn(nestedStore, "descriptorExpected").mockImplementation(relativePath => {
+					if (
+						!replaced &&
+						relativePath === "review.jsonl" &&
+						fs.existsSync(cacheRoot) &&
+						fs.readdirSync(cacheRoot).length > cacheEntriesBefore
+					) {
+						replaced = true;
+						nestedStore.replaceSync(
+							"review.jsonl",
+							Buffer.from(
+								`${JSON.stringify({ type: "session", version: 5, id: "attacker", timestamp: "0", cwd })}\n`,
+							),
+						);
+					}
+					return originalDescriptor(relativePath);
+				});
+				await expect(
+					SessionManager.openNestedManaged(
+						sessionFile,
+						SessionManager.nestedManagedDestination(nestedStore, nestedStore.dir),
+						nestedStore,
+						new FileSessionStorage(),
+						cwd,
+						"enabled",
+					),
+				).rejects.toThrow("source_changed");
+				expect(replaced).toBe(true);
+				expect(fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0).toBe(cacheEntriesBefore);
+			} finally {
+				rootStore.close();
+				tempDir.removeSync();
+			}
+		},
+		60_000,
+	);
+	itPosix(
+		"reopens nested managed cold history and disposes its private sidecar cache",
+		async () => {
+			const tempDir = TempDir.createSync("@pi-session-memory-nested-reopen-");
+			const cwd = path.join(tempDir.path(), "project");
+			const managedRoot = path.join(tempDir.path(), "managed");
+			const profileAgentDir = path.join(tempDir.path(), "agent-profile");
+			fs.mkdirSync(cwd, { recursive: true });
+			fs.mkdirSync(managedRoot, { recursive: true, mode: 0o700 });
+			const rootStore = new ManagedSessionDescendantStore(
+				managedDirectoryRoot(managedRoot),
+				managedRoot,
+				undefined,
+				undefined,
+				profileAgentDir,
+			);
+			rootStore.ensureDirectory("review");
+			const nestedStore = rootStore.deriveSubtree("review");
+			const destination = SessionManager.nestedManagedDestination(nestedStore, nestedStore.dir);
+			const manager = SessionManager.create(cwd, destination, new FileSessionStorage());
+			let coldId = "";
+			let firstKeptEntryId = "";
+			let sessionFile = "";
+			try {
+				manager.setSessionMemoryMode("enabled");
+				manager.appendMessage({ role: "user", content: "root", timestamp: Date.now() });
+				manager.appendMessage({
+					role: "assistant",
+					content: [{ type: "text", text: "published" }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-sonnet-4-5",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: Date.now(),
+				});
+				for (let index = 0; index < 200; index++) {
+					const id = manager.appendMessage({
+						role: "user",
+						content: `nested-reopen-${index}-${"x".repeat(256)}`,
+						timestamp: Date.now(),
+					});
+					coldId ||= id;
+					firstKeptEntryId = id;
+				}
+				manager.appendCompaction("summary", undefined, firstKeptEntryId, 10_000);
+				sessionFile = manager.getSessionFile() ?? "";
+				expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			} finally {
+				await manager.close();
+			}
+			const cacheRoot = getResidentCacheRootDir(profileAgentDir);
+			const beforeReopen = fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0;
+			const transcriptRead = vi.spyOn(nestedStore, "readExpected");
+			const reopened = await SessionManager.openNestedManaged(
+				sessionFile,
+				destination,
+				nestedStore,
+				new FileSessionStorage(),
+				cwd,
+				"enabled",
+			);
+			expect(transcriptRead).not.toHaveBeenCalled();
+			try {
+				expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
+				expect(reopened.getSessionMemoryStats().totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+				expect(reopened.getEntry(coldId)?.id).toBe(coldId);
+				expect(fs.readdirSync(cacheRoot).length).toBeGreaterThan(beforeReopen);
+			} finally {
+				await reopened.close();
+			}
+			expect(fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0).toBe(beforeReopen);
 			expect(
 				fs
 					.readdirSync(managedRoot, { recursive: true })
 					.some(entry => String(entry).includes(".session-memory.spill")),
 			).toBe(false);
-		} finally {
-			await manager.close();
 			rootStore.close();
+			transcriptRead.mockRestore();
 			tempDir.removeSync();
-		}
-	}, 60_000);
-	it("rejects nested managed transcript replacement after capture", async () => {
-		const tempDir = TempDir.createSync("@pi-session-memory-nested-swap-");
-		const cwd = path.join(tempDir.path(), "project");
-		const managedRoot = path.join(tempDir.path(), "managed");
-		const profileAgentDir = path.join(tempDir.path(), "agent-profile");
-		fs.mkdirSync(cwd, { recursive: true });
-		fs.mkdirSync(managedRoot, { recursive: true, mode: 0o700 });
-		const rootStore = new ManagedSessionDescendantStore(
-			managedDirectoryRoot(managedRoot),
-			managedRoot,
-			undefined,
-			undefined,
-			profileAgentDir,
-		);
-		rootStore.ensureDirectory("review");
-		const nestedStore = rootStore.deriveSubtree("review");
-		const sessionFile = path.join(nestedStore.dir, "review.jsonl");
-		const originalDescriptor = nestedStore.descriptorExpected.bind(nestedStore);
-		const cacheRoot = getResidentCacheRootDir(profileAgentDir);
-		const cacheEntriesBefore = fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0;
-		try {
-			nestedStore.publishNoReplaceSync(
-				"review.jsonl",
-				Buffer.from(`${JSON.stringify({ type: "session", version: 5, id: "nested-swap", timestamp: "0", cwd })}\n`),
-			);
-			let replaced = false;
-			vi.spyOn(nestedStore, "descriptorExpected").mockImplementation(relativePath => {
-				if (
-					!replaced &&
-					relativePath === "review.jsonl" &&
-					fs.existsSync(cacheRoot) &&
-					fs.readdirSync(cacheRoot).length > cacheEntriesBefore
-				) {
-					replaced = true;
-					nestedStore.replaceSync(
-						"review.jsonl",
-						Buffer.from(
-							`${JSON.stringify({ type: "session", version: 5, id: "attacker", timestamp: "0", cwd })}\n`,
-						),
-					);
-				}
-				return originalDescriptor(relativePath);
-			});
-			await expect(
-				SessionManager.openNestedManaged(
-					sessionFile,
-					SessionManager.nestedManagedDestination(nestedStore, nestedStore.dir),
-					nestedStore,
-					new FileSessionStorage(),
-					cwd,
-					"enabled",
-				),
-			).rejects.toThrow("source_changed");
-			expect(replaced).toBe(true);
-			expect(fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0).toBe(cacheEntriesBefore);
-		} finally {
-			rootStore.close();
-			tempDir.removeSync();
-		}
-	}, 60_000);
-	it("reopens nested managed cold history and disposes its private sidecar cache", async () => {
-		const tempDir = TempDir.createSync("@pi-session-memory-nested-reopen-");
-		const cwd = path.join(tempDir.path(), "project");
-		const managedRoot = path.join(tempDir.path(), "managed");
-		const profileAgentDir = path.join(tempDir.path(), "agent-profile");
-		fs.mkdirSync(cwd, { recursive: true });
-		fs.mkdirSync(managedRoot, { recursive: true, mode: 0o700 });
-		const rootStore = new ManagedSessionDescendantStore(
-			managedDirectoryRoot(managedRoot),
-			managedRoot,
-			undefined,
-			undefined,
-			profileAgentDir,
-		);
-		rootStore.ensureDirectory("review");
-		const nestedStore = rootStore.deriveSubtree("review");
-		const destination = SessionManager.nestedManagedDestination(nestedStore, nestedStore.dir);
-		const manager = SessionManager.create(cwd, destination, new FileSessionStorage());
-		let coldId = "";
-		let firstKeptEntryId = "";
-		let sessionFile = "";
-		try {
-			manager.setSessionMemoryMode("enabled");
-			manager.appendMessage({ role: "user", content: "root", timestamp: Date.now() });
-			manager.appendMessage({
-				role: "assistant",
-				content: [{ type: "text", text: "published" }],
-				api: "anthropic-messages",
-				provider: "anthropic",
-				model: "claude-sonnet-4-5",
-				usage: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-				stopReason: "stop",
-				timestamp: Date.now(),
-			});
-			for (let index = 0; index < 200; index++) {
-				const id = manager.appendMessage({
-					role: "user",
-					content: `nested-reopen-${index}-${"x".repeat(256)}`,
-					timestamp: Date.now(),
-				});
-				coldId ||= id;
-				firstKeptEntryId = id;
-			}
-			manager.appendCompaction("summary", undefined, firstKeptEntryId, 10_000);
-			sessionFile = manager.getSessionFile() ?? "";
-			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
-		} finally {
-			await manager.close();
-		}
-		const cacheRoot = getResidentCacheRootDir(profileAgentDir);
-		const beforeReopen = fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0;
-		const reopened = await SessionManager.openNestedManaged(
-			sessionFile,
-			destination,
-			nestedStore,
-			new FileSessionStorage(),
-			cwd,
-			"enabled",
-		);
-		try {
-			expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
-			expect(reopened.getSessionMemoryStats().totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
-			expect(reopened.getEntry(coldId)?.id).toBe(coldId);
-			expect(fs.readdirSync(cacheRoot).length).toBeGreaterThan(beforeReopen);
-		} finally {
-			await reopened.close();
-		}
-		expect(fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0).toBe(beforeReopen);
-		expect(
-			fs
-				.readdirSync(managedRoot, { recursive: true })
-				.some(entry => String(entry).includes(".session-memory.spill")),
-		).toBe(false);
-		rootStore.close();
-		tempDir.removeSync();
-	}, 60_000);
+		},
+		60_000,
+	);
 	it("fails closed when the authoritative cold prefix changes after shadow indexing", async () => {
 		const tempDir = TempDir.createSync("@pi-session-memory-mismatch-");
 		const storage = new FileSessionStorage();
@@ -3741,7 +3765,7 @@ describe("sidecar I/O fallback", () => {
 	});
 });
 
-describe("managed session memory authority", () => {
+describePosix("managed session memory authority", () => {
 	it("retires managed history while keeping disposable sidecars outside managed authority", async () => {
 		const tempDir = TempDir.createSync("@pi-managed-memory-eager-");
 		const cwd = path.join(tempDir.path(), "workspace");

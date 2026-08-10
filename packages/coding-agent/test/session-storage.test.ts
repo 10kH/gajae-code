@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
@@ -668,7 +668,7 @@ describe.skipIf(process.platform !== "darwin")("authority-absent managed replace
 	});
 	it("keeps memory-authoritative append success when cleanup receipt retirement is pending", () => {
 		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-append-receipt-")));
-		let exactUnlink: ReturnType<typeof vi.spyOn> | undefined;
+		let exactUnlink: Mock<typeof native.exactUnlink> | undefined;
 		try {
 			const sessionDir = path.join(root, "session");
 			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), sessionDir);
@@ -693,7 +693,7 @@ describe.skipIf(process.platform !== "darwin")("authority-absent managed replace
 			fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-receipt-publish-")),
 		);
 		const realRenameNoReplacePath = native.renameNoReplacePath;
-		let renameNoReplace: ReturnType<typeof vi.spyOn> | undefined;
+		let renameNoReplace: Mock<typeof native.renameNoReplacePath> | undefined;
 		try {
 			const sessionDir = path.join(root, "session");
 			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), sessionDir);
@@ -729,7 +729,7 @@ describe.skipIf(process.platform !== "darwin")("authority-absent managed replace
 	it("rejects a destination substitution at the native exchange boundary", () => {
 		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-replace-race-")));
 		const realExactReplacePath = native.exactReplacePath;
-		let exactReplace: ReturnType<typeof vi.spyOn> | undefined;
+		let exactReplace: Mock<typeof native.exactReplacePath> | undefined;
 		try {
 			const sessionDir = path.join(root, "session");
 			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), sessionDir);
@@ -760,8 +760,8 @@ describe.skipIf(process.platform !== "darwin")("authority-absent managed replace
 		const root = fs.realpathSync.native(
 			fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-replace-failure-")),
 		);
-		let exactReplace: ReturnType<typeof vi.spyOn> | undefined;
-		let exactUnlink: ReturnType<typeof vi.spyOn> | undefined;
+		let exactReplace: Mock<typeof native.exactReplacePath> | undefined;
+		let exactUnlink: Mock<typeof native.exactUnlink> | undefined;
 		try {
 			const sessionDir = path.join(root, "session");
 			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), sessionDir);
@@ -816,7 +816,7 @@ describe.skipIf(process.platform !== "darwin")("authority-absent managed replace
 		const root = fs.realpathSync.native(
 			fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-receipt-retirement-")),
 		);
-		let exactUnlink: ReturnType<typeof vi.spyOn> | undefined;
+		let exactUnlink: Mock<typeof native.exactUnlink> | undefined;
 		try {
 			const sessionDir = path.join(root, "session");
 			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), sessionDir);
@@ -866,7 +866,7 @@ describe.skipIf(process.platform !== "darwin")("authority-absent managed replace
 		const root = fs.realpathSync.native(
 			fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-replace-postcommit-")),
 		);
-		let exactReplace: ReturnType<typeof vi.spyOn> | undefined;
+		let exactReplace: Mock<typeof native.exactReplacePath> | undefined;
 		let committedSource: string | undefined;
 		try {
 			const sessionDir = path.join(root, "session");
@@ -884,7 +884,7 @@ describe.skipIf(process.platform !== "darwin")("authority-absent managed replace
 			});
 
 			expect(() => store.replaceSync("session.jsonl", Buffer.from("successor\n"))).toThrow(
-				"destination_identity_changed",
+				"managed_replace_committed_outcome_uncertain",
 			);
 			if (!committedSource) throw new Error("Expected native replacement source");
 			expect(fs.readFileSync(committedSource, "utf8")).toBe("successor\n");
@@ -901,8 +901,8 @@ describe.skipIf(process.platform !== "darwin")("authority-absent managed replace
 		);
 		const realExactReplacePath = native.exactReplacePath;
 		const realExactUnlink = native.exactUnlink;
-		let exactReplace: ReturnType<typeof vi.spyOn> | undefined;
-		let exactUnlink: ReturnType<typeof vi.spyOn> | undefined;
+		let exactReplace: Mock<typeof native.exactReplacePath> | undefined;
+		let exactUnlink: Mock<typeof native.exactUnlink> | undefined;
 		let committedSource: string | undefined;
 		let moved = false;
 		let retainedReceipt: string | undefined;

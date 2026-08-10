@@ -361,7 +361,7 @@ function writeResidentCacheOwnerToken(instanceDir: string, uid: number): void {
 	}
 }
 
-function removeEmptyResidentCacheInstanceDir(instanceDir: string): void {
+export function removeEmptyResidentCacheInstanceDir(instanceDir: string): void {
 	try {
 		const stat = fs.lstatSync(instanceDir);
 		if (stat.isSymbolicLink()) {
@@ -373,6 +373,7 @@ function removeEmptyResidentCacheInstanceDir(instanceDir: string): void {
 		// The candidate is already absent, was replaced, or is no longer empty.
 		// Never recursively delete an unverified path while handling a trust failure.
 	}
+	if (!fs.existsSync(instanceDir)) liveResidentCacheDirs.delete(path.resolve(instanceDir));
 }
 
 function removeResidentCacheTreeNoFollow(pathname: string): void {

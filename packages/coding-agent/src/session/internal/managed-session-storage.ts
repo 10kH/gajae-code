@@ -88,6 +88,16 @@ export class ManagedReplaceError extends Error {
 	}
 }
 
+export class ManagedCommittedMutationError extends Error {
+	constructor(
+		readonly operation: "replace" | "append",
+		cause: unknown,
+	) {
+		super(`managed_${operation}_committed_outcome_uncertain`, { cause });
+		this.name = "ManagedCommittedMutationError";
+	}
+}
+
 function publishFailure(outcome: NativePublishOutcome): ManagedPublishError {
 	const classification =
 		outcome.reason === "destination_exists"
@@ -2418,6 +2428,7 @@ function replaceManagedFileGeneratedSync(
 	assertFence?: () => void,
 	expectedDestination?: ManagedFileSnapshot["identity"],
 	acceptCommittedCleanupFailure = false,
+	operation: "replace" | "append" = "replace",
 ): ManagedFileSnapshot["identity"] {
 	const parent = path.dirname(destination);
 	ensureManagedDirectory(parent, root, policy);
@@ -2437,6 +2448,8 @@ function replaceManagedFileGeneratedSync(
 	let failure: unknown;
 	let publishedIdentity: ManagedFileSnapshot["identity"] | undefined;
 	let publicationDurable = false;
+	let publicationCommitted = false;
+	let expectedSuccessor: ManagedFileSnapshot["identity"] | undefined;
 	try {
 		fd = fs.openSync(
 			staging,
@@ -2449,6 +2462,7 @@ function replaceManagedFileGeneratedSync(
 		secureFileDescriptor(staging, fd, "verify");
 		const staged = fs.fstatSync(fd, { bigint: true });
 		stagedIdentity = { dev: staged.dev, ino: staged.ino };
+		expectedSuccessor = identity(staged, generated.sha256);
 		if (process.platform === "win32" && expectedDestination) {
 			fs.closeSync(fd);
 			fd = undefined;
@@ -2458,7 +2472,7 @@ function replaceManagedFileGeneratedSync(
 		if (expectedDestination) {
 			const parentIdentity = fs.lstatSync(parent, { bigint: true });
 			if (Number(staged.size) !== generated.size) throw new Error("managed_replace_generated_size_changed");
-			const successor = identity(staged, generated.sha256);
+			const successor = expectedSuccessor;
 			const receiptStagingPath = path.join(parent, `.gjc-replace-receipt-pending-${randomUUID()}.json`);
 			preserveStaging = true;
 			const publishedReceiptIdentity = publishManagedFileNoReplaceSync(
@@ -2519,20 +2533,28 @@ function replaceManagedFileGeneratedSync(
 				},
 			);
 			if (!replaced.ok) throw new ManagedReplaceError(replaced, receiptCleanup.path);
+			publicationCommitted = true;
 			fsyncDirectory(parent);
-		} else fs.renameSync(staging, destination);
+		} else {
+			fs.renameSync(staging, destination);
+			publicationCommitted = true;
+		}
 		assertManagedDirectoryRoot(root);
 		const named = fs.lstatSync(destination, { bigint: true });
 		if (!named.isFile() || named.isSymbolicLink() || named.dev !== staged.dev || named.ino !== staged.ino) {
 			throw new Error("destination_identity_changed");
 		}
-		publishedIdentity = identity(named, generated.sha256);
+		if (!expectedSuccessor) throw new Error("managed_replace_identity_unavailable");
 		if (fd !== undefined) {
 			secureFileDescriptor(destination, fd, "verify");
 			fs.closeSync(fd);
 			fd = undefined;
 		}
 		fsyncDirectory(parent);
+		const verifiedIdentity = captureManagedFileIdentityStreamingNoFollow(destination);
+		if (!sameReplacementIdentity(verifiedIdentity, expectedSuccessor))
+			throw new Error("destination_identity_changed");
+		publishedIdentity = verifiedIdentity;
 		publicationDurable = true;
 		if (receiptCleanup) {
 			try {
@@ -2563,7 +2585,8 @@ function replaceManagedFileGeneratedSync(
 			}
 		}
 	} catch (error) {
-		failure = error;
+		failure =
+			publicationCommitted && !publishedIdentity ? new ManagedCommittedMutationError(operation, error) : error;
 	} finally {
 		if (fd !== undefined) fs.closeSync(fd);
 		if (stagedIdentity && !preserveStaging) {
@@ -2672,6 +2695,7 @@ function appendManagedFileStreamingSync(
 		undefined,
 		predecessor,
 		true,
+		"append",
 	);
 }
 
