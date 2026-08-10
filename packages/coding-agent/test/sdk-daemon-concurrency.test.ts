@@ -137,6 +137,87 @@ describe("ConversationStore", () => {
 		);
 	});
 
+	test("heals a leaked lock this process wrote instead of timing out", async () => {
+		const fs = new MemoryConversationStoreFs();
+		const store = new ConversationStore<TestConversation>({
+			agentDir: "/agent",
+			kind: "discord",
+			fs,
+			pid: process.pid,
+			pidAlive: () => true,
+		});
+		// Simulate a release that failed between close() and unlink(): a
+		// well-formed lock whose recorded pid is still this (live) process. The
+		// recorded owner being alive makes it unstale, so only the evidence-based
+		// same-process leak heal can recover it without raising the timeout.
+		const leaked = JSON.stringify({ pid: process.pid, incarnation: processIncarnation(process.pid), timestamp: 1 });
+		fs.files.set(`${store.filePath}.lock`, leaked);
+		const started = performance.now();
+		await expect(store.write("mapping", undefined, record(1))).resolves.toBe(true);
+		expect(performance.now() - started).toBeLessThan(900);
+		expect(fs.files.has(`${store.filePath}.lock`)).toBe(false);
+	});
+
+	test("does not heal a lock a same-process instance currently holds", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let paused = false;
+		class PausingFs extends MemoryConversationStoreFs {
+			override async rename(from: string, to: string) {
+				if (!paused) {
+					paused = true;
+					entered.resolve();
+					await release.promise;
+				}
+				await super.rename(from, to);
+			}
+		}
+		const fs = new PausingFs();
+		const first = new ConversationStore<TestConversation>({
+			agentDir: "/agent",
+			kind: "discord",
+			fs,
+			pid: process.pid,
+			pidAlive: () => true,
+		});
+		const second = new ConversationStore<TestConversation>({
+			agentDir: "/agent",
+			kind: "discord",
+			fs,
+			pid: process.pid,
+			pidAlive: () => true,
+		});
+		const firstWrite = first.write("one", undefined, record(1));
+		await entered.promise;
+		let secondSettled = false;
+		const secondWrite = second.write("two", undefined, record(1)).finally(() => {
+			secondSettled = true;
+		});
+		await Bun.sleep(25);
+		// The live holder is registered, so the waiter must wait rather than heal.
+		expect(secondSettled).toBe(false);
+		release.resolve();
+		await expect(Promise.all([firstWrite, secondWrite])).resolves.toEqual([true, true]);
+		expect((await first.load()).conversations).toEqual({ one: record(1), two: record(1) });
+	});
+
+	test("does not heal a well-formed lock held by another live process", async () => {
+		const fs = new MemoryConversationStoreFs();
+		const store = new ConversationStore<TestConversation>({
+			agentDir: "/agent",
+			kind: "discord",
+			fs,
+			pid: 202,
+			pidAlive: () => true,
+			pidIncarnation: pid => (pid === 303 ? "linux:102" : "linux:101"),
+			lockTimeoutMs: 0,
+		});
+		const foreign = JSON.stringify({ pid: 303, incarnation: "linux:102", timestamp: 1 });
+		fs.files.set(`${store.filePath}.lock`, foreign);
+		await expect(store.write("mapping", undefined, record(1))).rejects.toBeInstanceOf(ConversationLockTimeoutError);
+		expect(fs.files.get(`${store.filePath}.lock`)).toBe(foreign);
+	});
+
 	test("default-path lock uses canonical processIncarnation format", async () => {
 		let capturedLock: string | undefined;
 		class CapturingFs extends MemoryConversationStoreFs {

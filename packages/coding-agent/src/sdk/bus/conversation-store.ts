@@ -47,10 +47,20 @@ interface ConversationStoreLock {
 	pid: number;
 	incarnation: string;
 	timestamp: number;
+	/** Uniquely identifies one acquire; lets a release prove it owns the lock file. */
+	nonce?: string;
 }
 
 const nodeFs: ConversationStoreFs = fs;
 const UNPUBLISHED_LOCK_STALE_MS = 30_000;
+
+/**
+ * Lock files this process currently holds or is acquiring, across every store
+ * instance. A waiter that finds a well-formed lock whose recorded pid is this
+ * process but whose path is absent here can prove the lock was leaked by this
+ * process and may safely remove it instead of timing out.
+ */
+const heldLockFiles = new Set<string>();
 
 export function conversationStorePath(agentDir: string, kind: string, fileName = "conversations.json"): string {
 	return path.join(agentDir, "sdk", "daemons", kind, fileName);
@@ -214,41 +224,73 @@ export class ConversationStore<T extends ConversationRecord> {
 		const tail = previous.then(() => gate.promise);
 		this.#locks.set(this.#file, tail);
 		await previous;
+		const lockFile = `${this.#file}.lock`;
 		let fileLock: ConversationStoreFileHandle | undefined;
+		let lockToken: ConversationStoreLock | undefined;
 		try {
-			fileLock = await this.#acquireFileLock();
+			const acquired = await this.#acquireFileLock();
+			fileLock = acquired.handle;
+			lockToken = acquired.lock;
 			return await operation();
 		} finally {
 			try {
-				await fileLock?.close();
-				if (fileLock)
-					await this.#fs.unlink(`${this.#file}.lock`).catch(error => {
-						if (!isMissing(error)) throw error;
-					});
+				// A failed close must never skip the unlink: that would leak a
+				// well-formed lock whose pid is still alive and block every later
+				// waiter for the full timeout. The unlink is ownership-checked so
+				// it can only ever remove the lock this holder wrote.
+				if (fileLock) await fileLock.close().catch(() => undefined);
+				if (fileLock && lockToken) await this.#unlinkOwnedLock(lockFile, lockToken);
 			} finally {
+				heldLockFiles.delete(lockFile);
 				gate.resolve();
 				if (this.#locks.get(this.#file) === tail) this.#locks.delete(this.#file);
 			}
 		}
 	}
 
-	async #acquireFileLock(): Promise<ConversationStoreFileHandle> {
+	async #unlinkOwnedLock(lockFile: string, expected: ConversationStoreLock): Promise<void> {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(await this.#fs.readFile(lockFile, "utf8"));
+		} catch (error) {
+			if (isMissing(error)) return;
+			return; // unreadable: never remove a lock we cannot identify
+		}
+		if (
+			!isConversationStoreLock(parsed) ||
+			parsed.pid !== expected.pid ||
+			parsed.incarnation !== expected.incarnation ||
+			parsed.timestamp !== expected.timestamp ||
+			parsed.nonce !== expected.nonce
+		)
+			return; // a successor holds the path now; leave it
+		await this.#fs.unlink(lockFile).catch(error => {
+			if (!isMissing(error)) throw error;
+		});
+	}
+
+	async #acquireFileLock(): Promise<{ handle: ConversationStoreFileHandle; lock: ConversationStoreLock }> {
 		const lockFile = `${this.#file}.lock`;
 		const deadline = Date.now() + this.#lockTimeoutMs;
 		await this.#fs.mkdir(this.#directory, { recursive: true, mode: 0o700 });
 		for (;;) {
 			try {
 				const handle = await this.#fs.open(lockFile, "wx");
+				// Register before publishing lock content so a same-process waiter
+				// can never mistake this creation for a leak and delete it.
+				heldLockFiles.add(lockFile);
 				try {
 					const lock: ConversationStoreLock = {
 						pid: this.#pid,
 						incarnation: this.#pidIncarnation(this.#pid) ?? "unavailable",
 						timestamp: this.#clock(),
+						nonce: randomUUID(),
 					};
 					await handle.writeFile(`${JSON.stringify(lock)}\n`, "utf8");
 					await handle.sync();
-					return handle;
+					return { handle, lock };
 				} catch (error) {
+					heldLockFiles.delete(lockFile);
 					await handle.close().catch(() => undefined);
 					await this.#fs.unlink(lockFile).catch(() => undefined);
 					throw error;
@@ -256,10 +298,31 @@ export class ConversationStore<T extends ConversationRecord> {
 			} catch (error) {
 				if (!isAlreadyExists(error)) throw error;
 				if (await this.#reclaimStaleLock(lockFile)) continue;
+				if (await this.#reclaimSameProcessLeak(lockFile)) continue;
 				if (Date.now() >= deadline) throw new ConversationLockTimeoutError(lockFile, this.#lockTimeoutMs);
 				await this.#sleep(Math.min(10, Math.max(1, deadline - Date.now())));
 			}
 		}
+	}
+
+	/**
+	 * Removes a well-formed lock this process wrote but no longer holds. The
+	 * pid is this process and the path is absent from the held set, so the lock
+	 * is provably leaked rather than live: a live holder would be registered.
+	 * Cross-process locks are never touched (pid differs) and unpublished empty
+	 * locks are left to the existing 30s unpublished-lock rule.
+	 */
+	async #reclaimSameProcessLeak(lockFile: string): Promise<boolean> {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(await this.#fs.readFile(lockFile, "utf8"));
+		} catch {
+			return false;
+		}
+		if (!isConversationStoreLock(parsed) || parsed.pid !== this.#pid) return false;
+		if (heldLockFiles.has(lockFile)) return false;
+		await this.#fs.unlink(lockFile).catch(() => undefined);
+		return true;
 	}
 
 	async #reclaimStaleLock(lockFile: string): Promise<boolean> {
@@ -280,14 +343,28 @@ export class ConversationStore<T extends ConversationRecord> {
 		try {
 			return await this.#createLockFile(reclaimFile);
 		} catch (error) {
-			if (!isAlreadyExists(error) || !(await this.#isStaleLock(reclaimFile))) return undefined;
-			await this.#fs.unlink(reclaimFile).catch(() => undefined);
-			try {
-				return await this.#createLockFile(reclaimFile);
-			} catch (retryError) {
-				if (isAlreadyExists(retryError)) return undefined;
-				throw retryError;
+			if (!isAlreadyExists(error)) return undefined;
+			if (await this.#isStaleLock(reclaimFile)) {
+				await this.#fs.unlink(reclaimFile).catch(() => undefined);
+				try {
+					return await this.#createLockFile(reclaimFile);
+				} catch (retryError) {
+					if (isAlreadyExists(retryError)) return undefined;
+					throw retryError;
+				}
 			}
+			// A leaked reclaim lock from this process must not block reclaim of a
+			// provably stale main lock. The double-reclaim window this opens is
+			// benign: both reclaimers unlink the same stale main lock idempotently.
+			if (await this.#reclaimSameProcessLeak(reclaimFile)) {
+				try {
+					return await this.#createLockFile(reclaimFile);
+				} catch (retryError) {
+					if (isAlreadyExists(retryError)) return undefined;
+					throw retryError;
+				}
+			}
+			return undefined;
 		}
 	}
 	async #createLockFile(lockFile: string): Promise<ConversationStoreFileHandle> {
@@ -297,6 +374,7 @@ export class ConversationStore<T extends ConversationRecord> {
 				pid: this.#pid,
 				incarnation: this.#pidIncarnation(this.#pid) ?? "unavailable",
 				timestamp: this.#clock(),
+				nonce: randomUUID(),
 			};
 			await handle.writeFile(`${JSON.stringify(lock)}\n`, "utf8");
 			await handle.sync();
