@@ -1138,6 +1138,35 @@ function exactUnlinkLifecycleFile(
 	});
 }
 
+function removeRetainedExactPlaceholder(file: string, parentDirectory: string, quarantinePrefix: string): boolean {
+	let current = path.resolve(file);
+	const parent = path.resolve(parentDirectory);
+	for (let attempt = 0; attempt < 4; attempt++) {
+		if (path.dirname(current) !== parent) return false;
+		if (!fsSync.existsSync(current)) return true;
+		const captured = captureLifecycleFile(current, true, false);
+		const parentIdentity = lifecycleParentIdentity(parent);
+		if (!captured || !parentIdentity) return false;
+		let result: NativeExactUnlinkResult;
+		try {
+			result = exactUnlinkLifecycleFile(
+				current,
+				captured.identity,
+				path.join(parent, `${quarantinePrefix}-${attempt}`),
+				{ dev: BigInt(parentIdentity.dev), ino: BigInt(parentIdentity.ino) },
+			);
+		} catch {
+			return false;
+		}
+		if (result.ok || result.code === "not_found") return true;
+		if (result.code !== "cleanup_pending" || result.retainedUnknownPath) return false;
+		const next = result.retainedPlaceholderPath ?? result.detachedPath;
+		if (!next) return false;
+		current = path.resolve(next);
+	}
+	return false;
+}
+
 type LifecycleCleanupFile = NonNullable<BrokerCleanupEvidence["lifecycleFiles"]>[number];
 
 function sameLifecycleCleanupIdentity(
@@ -2113,7 +2142,36 @@ async function removeOwnedLifecycleArtifacts(root: string, id: string, expected:
 					: finalEndpointPath,
 			{ dev: BigInt(endpointParent.dev), ino: BigInt(endpointParent.ino) },
 		);
-		if (!endpointRemoval.ok) return false;
+		if (!endpointRemoval.ok) {
+			if (endpointRemoval.code !== "cleanup_pending" || endpointRemoval.retainedUnknownPath) return false;
+			if (endpointRemoval.retainedPlaceholderPath) {
+				if (endpointRemoval.payloadDurable !== true) return false;
+				removeRetainedExactPlaceholder(
+					endpointRemoval.retainedPlaceholderPath,
+					path.dirname(endpointPath),
+					`.gjc-delete-endpoint-placeholder-${expected.effectMarker}-${path.basename(endpointPath)}`,
+				);
+			}
+			if (endpointRemoval.detachedPath && fsSync.existsSync(endpointRemoval.detachedPath)) {
+				const detachedPath = path.resolve(endpointRemoval.detachedPath);
+				if (path.dirname(detachedPath) !== path.dirname(path.resolve(endpointPath))) return false;
+				let detachedRemoval: NativeExactUnlinkResult;
+				try {
+					detachedRemoval = exactUnlinkLifecycleFile(
+						detachedPath,
+						endpoint.identity,
+						path.join(
+							path.dirname(detachedPath),
+							`.gjc-delete-endpoint-detached-${expected.effectMarker}-${path.basename(endpointPath)}`,
+						),
+						{ dev: BigInt(endpointParent.dev), ino: BigInt(endpointParent.ino) },
+					);
+				} catch {
+					return false;
+				}
+				if (!detachedRemoval.ok && detachedRemoval.code !== "not_found") return false;
+			}
+		}
 	}
 	const currentMarker = await readEffectMarker(lifecycleMarkerPath(root, id));
 	if (!currentMarker || !sameEffectMarker(currentMarker, expected)) return false;
@@ -2304,7 +2362,38 @@ async function removeExactDeadSessionEndpoint(
 	const plannedEndpointPath = path.join(path.dirname(endpointPath), `.gjc-dead-endpoint-${suffix}`);
 	const retryEndpointPath = path.join(path.dirname(endpointPath), `.gjc-dead-endpoint-retry-${suffix}`);
 	const finalEndpointPath = path.join(path.dirname(endpointPath), `.gjc-dead-endpoint-final-${suffix}`);
-	const candidates = [finalEndpointPath, retryEndpointPath, plannedEndpointPath, endpointPath];
+	const ownedEndpointPaths = record.lifecycleRequestId
+		? [
+				`.gjc-delete-endpoint-detached-${record.lifecycleRequestId}-${path.basename(endpointPath)}`,
+				`.gjc-delete-endpoint-final-${record.lifecycleRequestId}-${path.basename(endpointPath)}`,
+				`.gjc-delete-endpoint-retry-${record.lifecycleRequestId}-${path.basename(endpointPath)}`,
+				`.gjc-delete-endpoint-${record.lifecycleRequestId}-${path.basename(endpointPath)}`,
+			].map(name => path.join(path.dirname(endpointPath), name))
+		: [];
+	const ownedPayloadPaths: string[] = [];
+	for (const ownedPath of ownedEndpointPaths) {
+		let size: number;
+		try {
+			size = fsSync.lstatSync(ownedPath).size;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			return false;
+		}
+		if (size > 0) ownedPayloadPaths.push(ownedPath);
+	}
+	const ownedPlaceholderPath = record.lifecycleRequestId
+		? path.join(
+				path.dirname(endpointPath),
+				`.gjc-delete-endpoint-placeholder-${record.lifecycleRequestId}-${path.basename(endpointPath)}`,
+			)
+		: undefined;
+	if (ownedPlaceholderPath && fsSync.existsSync(ownedPlaceholderPath))
+		removeRetainedExactPlaceholder(
+			ownedPlaceholderPath,
+			path.dirname(endpointPath),
+			`.gjc-delete-endpoint-placeholder-retry-${record.lifecycleRequestId}`,
+		);
+	const candidates = [...ownedPayloadPaths, finalEndpointPath, retryEndpointPath, plannedEndpointPath, endpointPath];
 	const authorizedDetachedSource =
 		authorizedSource && path.dirname(path.resolve(authorizedSource)) === path.dirname(path.resolve(endpointPath))
 			? authorizedSource
@@ -2364,18 +2453,12 @@ async function removeExactDeadSessionEndpoint(
 		if (removed.ok || removed.code === "not_found") return true;
 		if (removed.code === "cleanup_pending" && removed.retainedUnknownPath) return false;
 		if (removed.code === "cleanup_pending" && removed.retainedPlaceholderPath) {
-			const placeholderPath = path.resolve(removed.retainedPlaceholderPath);
-			if (path.dirname(placeholderPath) !== path.dirname(path.resolve(endpointPath))) return false;
-			const placeholder = captureLifecycleFile(placeholderPath, true, true);
-			const placeholderParent = lifecycleParentIdentity(path.dirname(placeholderPath));
-			if (!placeholder || !placeholderParent) return false;
-			const placeholderRemoval = exactUnlinkLifecycleFile(
-				placeholderPath,
-				placeholder.identity,
-				path.join(path.dirname(placeholderPath), `.gjc-dead-endpoint-placeholder-${suffix}`),
-				{ dev: BigInt(placeholderParent.dev), ino: BigInt(placeholderParent.ino) },
+			if (removed.payloadDurable !== true) return false;
+			removeRetainedExactPlaceholder(
+				removed.retainedPlaceholderPath,
+				path.dirname(endpointPath),
+				`.gjc-dead-endpoint-placeholder-${suffix}`,
 			);
-			if (!placeholderRemoval.ok && placeholderRemoval.code !== "not_found") return false;
 		}
 		if (removed.code === "cleanup_pending" && attempt < 4)
 			return await removeExactDeadSessionEndpoint(broker, id, record, attempt + 1, removed.detachedPath);
@@ -2387,6 +2470,27 @@ async function removeExactDeadSessionEndpoint(
 	}
 }
 
+async function hasOwnedEndpointPayload(root: string, id: string, effectMarker: string): Promise<boolean> {
+	const directory = path.join(root, "sdk");
+	const endpointName = `${id}.json`;
+	let names: string[];
+	try {
+		names = await fs.readdir(directory);
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code !== "ENOENT";
+	}
+	for (const name of names) {
+		if (!name.startsWith(".gjc-delete-endpoint-") || !name.includes(effectMarker) || !name.endsWith(endpointName))
+			continue;
+		try {
+			const metadata = await fs.lstat(path.join(directory, name));
+			if (!metadata.isFile() || metadata.size > 0) return true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return true;
+		}
+	}
+	return false;
+}
 async function waitForClose(broker: Broker, id: string, record: CloseRecord, timeoutMs: number): Promise<boolean> {
 	const timing = lifecycleTiming(broker);
 	const deadline = timing.now() + timeoutMs;
@@ -2420,12 +2524,10 @@ async function waitForClose(broker: Broker, id: string, record: CloseRecord, tim
 							incarnation: record.processIncarnation,
 						}
 					: undefined;
-			if (expected) {
-				const marker = await readEffectMarker(lifecycleMarkerPath(record.locator.stateRoot, id));
-				if (marker && sameEffectMarker(marker, expected))
-					await removeOwnedLifecycleArtifacts(record.locator.stateRoot, id, expected);
-			}
+			if (expected) await removeOwnedLifecycleArtifacts(record.locator.stateRoot, id, expected);
 			if (!(await removeExactDeadSessionEndpoint(broker, id, record))) return false;
+			if (expected && (await hasOwnedEndpointPayload(record.locator.stateRoot, id, expected.effectMarker)))
+				return false;
 			await broker.index.unregisterIfCurrent(registration);
 			return await endpointRemoved(record.locator.stateRoot, id);
 		}
