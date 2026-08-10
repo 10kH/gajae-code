@@ -333,6 +333,49 @@ describe("SessionRouter dispatch authority", () => {
 		}
 	});
 
+	test("delivers an unsequenced replay response ahead of a blocked sequenced event", async () => {
+		const eventEntered = Promise.withResolvers<void>();
+		const replayDelivered = Promise.withResolvers<void>();
+		const releaseEvent = Promise.withResolvers<void>();
+		const order: string[] = [];
+		const fixture = await routerFixture({
+			onFrame: async (_attachment, frame) => {
+				if (frame.name === "event") {
+					order.push("event-entered");
+					eventEntered.resolve();
+					await releaseEvent.promise;
+					order.push("event-settled");
+					return;
+				}
+				if (frame.name === "event_replay_result") {
+					order.push("replay-response");
+					replayDelivered.resolve();
+					releaseEvent.resolve();
+				}
+			},
+		});
+		try {
+			fixture.clients[0]?.emit({
+				type: "event",
+				sessionId: fixture.sessionId,
+				generation: 1,
+				seq: 1,
+			});
+			await eventEntered.promise;
+			fixture.clients[0]?.emit({ type: "event_replay_result", id: "provider-replay", events: [] });
+			const delivered = await Promise.race([
+				replayDelivered.promise.then(() => true),
+				Bun.sleep(250).then(() => false),
+			]);
+			expect(delivered).toBe(true);
+			await Bun.sleep(10);
+			expect(order).toEqual(["event-entered", "replay-response", "event-settled"]);
+		} finally {
+			releaseEvent.resolve();
+			await fixture.router.stop();
+		}
+	});
+
 	test("keeps lifecycle adoption provisional until a delayed index proves the exact authority", async () => {
 		const fixture = await routerFixture({ initiallyIndexed: false });
 		const endpoint = JSON.parse(fs.readFileSync(fixture.endpointFile, "utf8")) as Record<string, unknown>;
