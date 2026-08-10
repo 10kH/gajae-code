@@ -4392,7 +4392,7 @@ export class TelegramNotificationDaemon {
 			return;
 		}
 		if (outcome.reason === "telegram_rejected") {
-			await this.markPublicationRejected(publicationId);
+			await this.markPublicationRejected(publicationId, true);
 			this.deferredPublications.delete(publicationId);
 			return;
 		}
@@ -5635,7 +5635,10 @@ export class TelegramNotificationDaemon {
 		this.settlePublication(publicationId);
 	}
 
-	private async markPublicationRejected(publicationId: string | undefined): Promise<void> {
+	private async markPublicationRejected(
+		publicationId: string | undefined,
+		definitiveProviderRejection = false,
+	): Promise<void> {
 		if (!publicationId || this.rejectedPublications.has(publicationId) || this.publicationDelivered(publicationId))
 			return;
 		this.publicationsBeingRejected.add(publicationId);
@@ -5652,7 +5655,10 @@ export class TelegramNotificationDaemon {
 			this.rejectedPublications.delete(publicationId);
 			if (!this.tentativePublications.has(publicationId)) {
 				if (claimedAt !== undefined) this.claimedPublications.set(publicationId, claimedAt);
-				else if (ambiguousAt !== undefined) this.claimedPublications.set(publicationId, ambiguousAt);
+				else if (ambiguousAt !== undefined) {
+					if (definitiveProviderRejection) this.claimedPublications.set(publicationId, ambiguousAt);
+					else this.ambiguousPublications.set(publicationId, ambiguousAt);
+				}
 			}
 			this.rejectPublicationSettlement(publicationId, error);
 			throw error;
@@ -8520,7 +8526,7 @@ export class TelegramNotificationDaemon {
 					if (item.payload.publicationId) {
 						try {
 							if (delivered) await this.markPublicationDelivered(item.payload.publicationId);
-							else await this.markPublicationRejected(item.payload.publicationId);
+							else await this.markPublicationRejected(item.payload.publicationId, true);
 							this.deferredPublications.delete(item.payload.publicationId);
 						} catch (error) {
 							this.rejectPublicationSettlement(item.payload.publicationId, error);
@@ -8923,7 +8929,7 @@ export class TelegramNotificationDaemon {
 			try {
 				if (failedPublications.has(publicationId)) {
 					if (disposition === "rejected") {
-						await this.markPublicationRejected(publicationId);
+						await this.markPublicationRejected(publicationId, true);
 						this.deferredPublications.delete(publicationId);
 					} else {
 						this.settlePublication(publicationId);
@@ -8933,7 +8939,10 @@ export class TelegramNotificationDaemon {
 				if (disposition === "accepted") {
 					await this.markPublicationDelivered(publicationId);
 					this.deferredPublications.delete(publicationId);
-				} else if (disposition === "rejected" || disposition === "removed" || disposition === "expired") {
+				} else if (disposition === "rejected") {
+					await this.markPublicationRejected(publicationId, true);
+					this.deferredPublications.delete(publicationId);
+				} else if (disposition === "removed" || disposition === "expired") {
 					await this.markPublicationRejected(publicationId);
 					this.deferredPublications.delete(publicationId);
 				} else if (disposition === "ambiguous") {
@@ -9365,7 +9374,7 @@ export class TelegramNotificationDaemon {
 				messageId <= 0
 			) {
 				if (publicationId && this.publicationLastOutcomes.get(publicationId) === "rejected") {
-					await this.markPublicationRejected(publicationId);
+					await this.markPublicationRejected(publicationId, true);
 					this.deferredPublications.delete(publicationId);
 				}
 				for (const alias of aliases) this.#modelChoiceAliases.delete(alias);
@@ -9708,7 +9717,7 @@ export class TelegramNotificationDaemon {
 						deliveryOutcome !== "accepted" &&
 						this.publicationLastOutcomes.get(publicationId) === "rejected"
 					) {
-						await this.markPublicationRejected(publicationId);
+						await this.markPublicationRejected(publicationId, true);
 						this.deferredPublications.delete(publicationId);
 					}
 					return;
@@ -9846,7 +9855,7 @@ export class TelegramNotificationDaemon {
 				deliveryOutcome !== "accepted" &&
 				this.publicationLastOutcomes.get(publicationId) === "rejected"
 			) {
-				await this.markPublicationRejected(publicationId);
+				await this.markPublicationRejected(publicationId, true);
 				this.deferredPublications.delete(publicationId);
 			}
 			if (publicationId && this.claimedPublications.has(publicationId))
@@ -10385,7 +10394,7 @@ export class TelegramNotificationDaemon {
 				messageId === undefined &&
 				this.publicationLastOutcomes.get(publicationId) === "rejected"
 			) {
-				await this.markPublicationRejected(publicationId);
+				await this.markPublicationRejected(publicationId, true);
 				this.deferredPublications.delete(publicationId);
 			}
 			if (publicationId && messageId === undefined && this.claimedPublications.has(publicationId))

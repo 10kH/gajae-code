@@ -714,10 +714,12 @@ export class SessionRouter {
 						publicationId === undefined ? correlated : { ...correlated, publicationId },
 					);
 				} catch (error) {
+					if (!this.#attachmentLive(attached)) return;
 					if (seq === undefined || !ownsSequence) throw error;
 					this.#failDelivery(attached, seq, error);
 					return;
 				}
+				if (!this.#attachmentLive(attached)) return;
 				if (seq !== undefined && ownsSequence) {
 					this.#undelivered.delete(attached.sessionId);
 					this.#removeRecoveredFrame(attached.sessionId, attached.generation, seq);
