@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes Router-ready generation 138 at serving epoch 85", () => {
+test("publishes private-client generation 139 at serving epoch 86", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 138 / serving epoch 85: provider handshakes start after publication and direct relays are removed.
-	expect(DAEMON_GENERATION).toBe(138);
-	expect(SERVING_EPOCH).toBe(85);
+	// Generation 139 / serving epoch 86: raw SDK clients are private to core authority paths.
+	expect(DAEMON_GENERATION).toBe(139);
+	expect(SERVING_EPOCH).toBe(86);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();

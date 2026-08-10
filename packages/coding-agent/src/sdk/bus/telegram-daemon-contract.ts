@@ -200,8 +200,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 136 keeps provider attachment publication provisional until recovery succeeds.
  * Generation 137 fences stale reconciliation, frame tails, and identity-less replay rejection.
  * Generation 138 starts provider handshakes only after Router publication.
+ * Generation 139 privatizes raw SDK clients and removes the Python transport package.
  */
-export const DAEMON_GENERATION = 138;
+export const DAEMON_GENERATION = 139;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -285,5 +286,6 @@ export const DAEMON_GENERATION = 138;
  * Epoch 83 binds provider commands to the exact opaque attachment identity.
  * Epoch 84 prohibits provider lifecycle-equivalent controls and detaches replacement work.
  * Epoch 85 removes direct relay attachment and prohibits lifecycle controls on every adapter.
+ * Epoch 86 removes public discovery/client exports and retires cross-process raw transports.
  */
-export const SERVING_EPOCH = 85;
+export const SERVING_EPOCH = 86;

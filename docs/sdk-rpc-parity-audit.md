@@ -104,8 +104,7 @@ implements the control path (`dispatch.ts:138-253`). That does **not** erase the
 user-perceived reduction. It is **REAL** across five dimensions:
 
 1. **stdio JSONL and Unix-socket transports.** The interim `gjc sdk serve` relay was retired; external attachment now requires Router-owned opaque capabilities and never forwards endpoint credentials.
-2. **Typed Python client.** Phase 1 closes the absence of a supported typed
-   Python client through `gjc_sdk`.
+2. **Typed Python client.** The interim public Python transport client was retired with the direct relay; cross-process integrations require Router-owned capabilities.
 3. **`negotiate_unattended`.** No fail-closed unattended negotiation with the
    retired declaration, budget, scope, and allowlist exists: this remains Phase 2.
 4. **Cross-process session registry/reattach.** Discovery files locate a live

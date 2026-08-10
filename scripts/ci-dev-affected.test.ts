@@ -722,18 +722,6 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		});
 		expect(validation.exitCode).toBe(0);
 	});
-	test("CI_FORCE_FULL emits Python work outside the shard matrix", async () => {
-		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ci-dev-affected-python-full-"));
-		tempDirs.push(tempDir);
-		const outputFile = path.join(tempDir, "github-output.txt");
-		const { stdout, exitCode } = await runScript(["--matrix-json"], "", { CI_FORCE_FULL: "1", GITHUB_OUTPUT: outputFile });
-		expect(exitCode).toBe(0);
-		expect((JSON.parse(stdout.trim()) as Array<{ key: string }>).filter(entry => entry.key.startsWith("python-"))).toHaveLength(3);
-		const output = await Bun.file(outputFile).text();
-		expect(output).toContain("has_python=true");
-		const matrix = JSON.parse((output.split("\n").find(line => line.startsWith("matrix=")) ?? "matrix={}").slice("matrix=".length));
-		expect(matrix.include.some((entry: { key: string }) => entry.key.startsWith("python-"))).toBe(false);
-	});
 
 	test("changed-path ranges use the canonical source head instead of ambient PR merge SHA", async () => {
 		const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repoRoot }).stdout.toString().trim();
@@ -1382,15 +1370,6 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		}
 	});
 
-test("Python SDK changes plan dedicated Python validation and one native build", () => {
-	const changed = ["python/gjc-sdk/gjc_sdk/client.py"];
-	for (const tasks of [planTasks(changed, packages), planTargetedTasks(changed, packages, [])]) {
-		expect(tasks.map(task => task.key)).toEqual(["python-check", "python-test", "python-build-smoke", "native-linux-x64"]);
-		expect(tasks.filter(task => task.phase === "python").map(task => task.key)).toEqual(["python-check", "python-test", "python-build-smoke"]);
-	}
-	const full = planFullTasks(packages);
-	expect(full.filter(task => task.phase === "python").map(task => task.key)).toEqual(["python-check", "python-test", "python-build-smoke"]);
-});
 
 
 	test("native-consuming test files pull in a single native build task", () => {

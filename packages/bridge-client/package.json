@@ -1,8 +1,9 @@
 {
 	"type": "module",
+	"private": true,
 	"name": "@gajae-code/bridge-client",
 	"version": "0.12.21",
-	"description": "Transport-only v3 SDK WebSocket client",
+	"description": "Internal SDK WebSocket client used only by SDK core",
 	"homepage": "https://gajae-code.com",
 	"author": "Yeachan-Heo and Gajae Code Contributors",
 	"license": "MIT",

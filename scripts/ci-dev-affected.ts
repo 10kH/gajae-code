@@ -242,7 +242,6 @@ export function planFullTasks(packages: readonly WorkspacePackage[]): Task[] {
 	add(tasks, "rust-check", "Rust check", ["bun", "run", "check:rs"]);
 	addRustTestTasks(tasks);
 	add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
-	addPythonTasks(tasks);
 	add(tasks, "runtime-check", "Runtime checks (needs native addon)", ["bun", "run", "check:runtime"], resolvePackageCwd("packages/coding-agent"));
 	// root-check (ci:check:full) is intentionally omitted: Main CI runs it in the
 	// dedicated native-free `check` job, so emitting it here would double-run it.
@@ -269,11 +268,6 @@ function addRustTestTasks(tasks: Map<string, Task>): void {
 }
 
 
-function addPythonTasks(tasks: Map<string, Task>): void {
-	add(tasks, "python-check", "Python SDK type check", ["bun", "run", "check:py-sdk"], undefined, { rust: false, nextest: false, nativeConsumer: false, nativeProducer: false }, "python");
-	add(tasks, "python-test", "Python SDK tests", ["bun", "run", "test:py-sdk"], undefined, { rust: false, nextest: false, nativeConsumer: true, nativeProducer: false }, "python");
-	add(tasks, "python-build-smoke", "Python SDK build smoke", ["bun", "run", "ci:test:py-sdk-build"], undefined, { rust: false, nextest: false, nativeConsumer: false, nativeProducer: false }, "python");
-}
 async function resolvePlannedTasks(paths: readonly string[]): Promise<Task[]> {
 	if (isForceFullMode()) return planFullTasks(await getWorkspacePackages());
 	const fromArtifact = await loadCanonicalPlan();
@@ -778,10 +772,6 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 		add(tasks, "bridge-client-sdk-package-smoke", "Bridge-client SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
 	}
 
-	if (paths.some(isPythonPath)) {
-		addPythonTasks(tasks);
-		addNativeBuild(tasks);
-	}
 	if (rustChanged) {
 		add(tasks, "rust-check", "Rust check", ["bun", "run", "check:rs"]);
 		add(tasks, "rust-test", "Rust tests", ["bun", "run", "test:rs"]);
@@ -865,10 +855,6 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 			for (const testFile of behavioralTestsFor(changedPath)) {
 				addTestFileTask(tasks, testFile);
 			}
-			continue;
-		}
-		if (isPythonPath(changedPath)) {
-			addPythonTasks(tasks);
 			continue;
 		}
 		if (isInstallPath(changedPath)) {
@@ -1197,9 +1183,6 @@ function addReleasePublishTasks(tasks: Map<string, Task>): void {
 }
 
 
-function isPythonPath(changedPath: string): boolean {
-	return changedPath.startsWith("python/gjc-sdk/");
-}
 
 function isRustPath(changedPath: string): boolean {
 	const fileName = path.basename(changedPath);
