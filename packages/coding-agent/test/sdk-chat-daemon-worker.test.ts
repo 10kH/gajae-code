@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
@@ -1371,6 +1372,17 @@ describe("chat daemon worker", () => {
 					rootTs: "root",
 					sessionId: host.sessionId,
 					endpointGeneration: 1,
+					attachmentAuthorityId: crypto
+						.createHash("sha256")
+						.update(
+							JSON.stringify({
+								sessionId: host.sessionId,
+								generation: 1,
+								pid: process.pid,
+								endpointMtimeMs: host.endpointMtimeMs,
+							}),
+						)
+						.digest("hex"),
 					updatedAt: Date.now(),
 					seenEventIds: [],
 					seenContextIds: [],

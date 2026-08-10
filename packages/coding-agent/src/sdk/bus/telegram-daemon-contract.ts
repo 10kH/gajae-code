@@ -208,8 +208,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 144 revalidates endpoint authority before exact publication-time requests.
  * Generation 145 distinguishes transport reconnect from a changed same-generation endpoint successor.
  * Generation 146 revokes token-zero and callback leases before endpoint replacement while retaining topic presentation.
+ * Generation 147 uses a restart-stable opaque Router endpoint-incarnation identity.
  */
-export const DAEMON_GENERATION = 146;
+export const DAEMON_GENERATION = 147;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

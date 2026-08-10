@@ -100,6 +100,7 @@ export interface DiscordNotificationDaemonOptions {
 export interface DiscordNotificationInput {
 	sessionId: string;
 	endpointGeneration: number;
+	attachmentAuthorityId?: string;
 	content: string;
 	threadName?: string;
 	actionId?: string;
@@ -517,13 +518,21 @@ export class DiscordNotificationDaemon {
 		await this.#completeArchive(archiving, occurrenceId);
 	}
 
-	async resume(sessionId: string, endpointGeneration: number): Promise<DiscordConversation | undefined> {
-		return await this.#track(this.#resumeAdmission(sessionId, endpointGeneration));
+	async resume(
+		sessionId: string,
+		endpointGeneration: number,
+		attachmentAuthorityId?: string,
+	): Promise<DiscordConversation | undefined> {
+		return await this.#track(this.#resumeAdmission(sessionId, endpointGeneration, attachmentAuthorityId));
 	}
-	async #resumeAdmission(sessionId: string, endpointGeneration: number): Promise<DiscordConversation | undefined> {
+	async #resumeAdmission(
+		sessionId: string,
+		endpointGeneration: number,
+		attachmentAuthorityId?: string,
+	): Promise<DiscordConversation | undefined> {
 		const running = this.#resumes.get(sessionId);
 		if (running) return await running;
-		const task = this.#resume(sessionId, endpointGeneration);
+		const task = this.#resume(sessionId, endpointGeneration, attachmentAuthorityId);
 		this.#resumes.set(sessionId, task);
 		try {
 			return await task;
@@ -532,9 +541,17 @@ export class DiscordNotificationDaemon {
 		}
 	}
 
-	async #resume(sessionId: string, endpointGeneration: number): Promise<DiscordConversation | undefined> {
+	async #resume(
+		sessionId: string,
+		endpointGeneration: number,
+		attachmentAuthorityId?: string,
+	): Promise<DiscordConversation | undefined> {
 		const record = await this.#bySession(sessionId);
 		if (!record?.threadId || record.state === "closed") return undefined;
+		if (attachmentAuthorityId !== undefined && record.attachmentAuthorityId !== attachmentAuthorityId) {
+			await this.retireAttachment(sessionId, record.endpointGeneration ?? endpointGeneration);
+			return undefined;
+		}
 		if (closingIntent(record)) {
 			await this.#driveClose(record);
 			return undefined;
@@ -546,6 +563,7 @@ export class DiscordNotificationDaemon {
 			...record,
 			state: "resuming",
 			endpointGeneration,
+			attachmentAuthorityId,
 			effectIncarnationId,
 			resumeOccurrenceId,
 			resumeEffectId: `unarchive:${record.threadId}:${effectIncarnationId}:${resumeOccurrenceId}`,
@@ -1367,9 +1385,26 @@ export class DiscordNotificationDaemon {
 			throw new Error("Discord thread is closing");
 		}
 		if (existing?.state === "active" && existing.threadId) {
-			if (existing.endpointGeneration === input.endpointGeneration) return existing;
+			if (
+				existing.endpointGeneration === input.endpointGeneration &&
+				(input.attachmentAuthorityId === undefined ||
+					existing.attachmentAuthorityId === input.attachmentAuthorityId)
+			)
+				return existing;
+			if (
+				existing.endpointGeneration === input.endpointGeneration &&
+				input.attachmentAuthorityId !== undefined &&
+				existing.attachmentAuthorityId !== input.attachmentAuthorityId
+			) {
+				await this.retireAttachment(input.sessionId, input.endpointGeneration);
+				return await this.#ensureConversation(input);
+			}
 			await this.#requireLiveBinding(input.sessionId, input.endpointGeneration);
-			return await this.#replace(existing, { ...existing, endpointGeneration: input.endpointGeneration });
+			return await this.#replace(existing, {
+				...existing,
+				endpointGeneration: input.endpointGeneration,
+				attachmentAuthorityId: input.attachmentAuthorityId,
+			});
 		}
 		const inFlight = this.#creates.get(input.sessionId);
 		if (inFlight) {
@@ -1380,11 +1415,25 @@ export class DiscordNotificationDaemon {
 				await this.#requireLiveBinding(input.sessionId, input.endpointGeneration);
 				return await this.#ensureConversation(input);
 			}
-			if (created.endpointGeneration === input.endpointGeneration) return created;
+			if (
+				created.endpointGeneration === input.endpointGeneration &&
+				(input.attachmentAuthorityId === undefined || created.attachmentAuthorityId === input.attachmentAuthorityId)
+			)
+				return created;
 			await this.#requireLiveBinding(input.sessionId, input.endpointGeneration);
-			return await this.#replace(created, { ...created, endpointGeneration: input.endpointGeneration });
+			return await this.#replace(created, {
+				...created,
+				endpointGeneration: input.endpointGeneration,
+				attachmentAuthorityId: input.attachmentAuthorityId,
+			});
 		}
-		const pending = this.#create(input.sessionId, input.endpointGeneration, randomUUID(), input.threadName);
+		const pending = this.#create(
+			input.sessionId,
+			input.endpointGeneration,
+			randomUUID(),
+			input.threadName,
+			input.attachmentAuthorityId,
+		);
 		this.#creates.set(input.sessionId, pending);
 		try {
 			return await pending;
@@ -1398,6 +1447,7 @@ export class DiscordNotificationDaemon {
 		endpointGeneration: number,
 		nonce: string,
 		name = "GJC session",
+		attachmentAuthorityId?: string,
 	): Promise<DiscordConversation> {
 		const intentKey = this.#intentKey(sessionId);
 		const owner = randomUUID();
@@ -1409,9 +1459,21 @@ export class DiscordNotificationDaemon {
 				throw new Error("Discord thread is closing");
 			}
 			if (active?.state === "active" && active.threadId) {
-				if (active.endpointGeneration === endpointGeneration) return active;
+				if (
+					active.endpointGeneration === endpointGeneration &&
+					(attachmentAuthorityId === undefined || active.attachmentAuthorityId === attachmentAuthorityId)
+				)
+					return active;
+				if (
+					active.endpointGeneration === endpointGeneration &&
+					attachmentAuthorityId !== undefined &&
+					active.attachmentAuthorityId !== attachmentAuthorityId
+				) {
+					await this.retireAttachment(sessionId, endpointGeneration);
+					continue;
+				}
 				await this.#requireLiveBinding(sessionId, endpointGeneration);
-				return await this.#replace(active, { ...active, endpointGeneration });
+				return await this.#replace(active, { ...active, endpointGeneration, attachmentAuthorityId });
 			}
 			const now = this.#now();
 			await this.#requireLiveBinding(sessionId, endpointGeneration);
@@ -1425,6 +1487,7 @@ export class DiscordNotificationDaemon {
 					parentChannelId: this.options.parentChannelId,
 					sessionId,
 					endpointGeneration,
+					attachmentAuthorityId,
 					createNonce: old?.createNonce ?? nonce,
 					createOwner: owner,
 					createLeaseExpiresAt: now + 60_000,
@@ -1477,12 +1540,15 @@ export class DiscordNotificationDaemon {
 				threadId: thread.id,
 				sessionId,
 				endpointGeneration,
+				attachmentAuthorityId: intent.attachmentAuthorityId,
 				createNonce: intent.createNonce,
 				effectIncarnationId: old?.effectIncarnationId ?? intent.effectIncarnationId ?? randomUUID(),
 				updatedAt: this.#now(),
-				seenEventIds: old?.seenEventIds ?? [],
-				seenInteractionIds: old?.seenInteractionIds ?? [],
-				inboundDispatches: old?.inboundDispatches,
+				seenEventIds: old?.attachmentAuthorityId === intent.attachmentAuthorityId ? (old?.seenEventIds ?? []) : [],
+				seenInteractionIds:
+					old?.attachmentAuthorityId === intent.attachmentAuthorityId ? (old?.seenInteractionIds ?? []) : [],
+				inboundDispatches:
+					old?.attachmentAuthorityId === intent.attachmentAuthorityId ? old?.inboundDispatches : undefined,
 			}),
 		);
 		if (!record) throw new Error("Unable to persist Discord thread mapping");
@@ -2187,7 +2253,13 @@ export class DiscordNotificationDaemon {
 			return;
 		}
 		if (effect.state !== "terminal") {
-			await this.#create(effect.sessionId, effect.endpointGeneration, intent.createNonce!, payload.name);
+			await this.#create(
+				effect.sessionId,
+				effect.endpointGeneration,
+				intent.createNonce!,
+				payload.name,
+				intent.attachmentAuthorityId,
+			);
 			return;
 		}
 		const threadId = effect.receipt?.threadId;
@@ -2220,6 +2292,7 @@ export class DiscordNotificationDaemon {
 					threadId,
 					sessionId: intent.sessionId,
 					endpointGeneration: intent.endpointGeneration,
+					attachmentAuthorityId: intent.attachmentAuthorityId,
 					createNonce: intent.createNonce,
 					effectIncarnationId: intent.createNonce,
 					updatedAt: this.#now(),

@@ -578,7 +578,7 @@ export class SlackNotificationDaemon {
 		const pendingKey = this.#intentKey(sessionId);
 		let claimed = false;
 		const pending = await this.store.transact(pendingKey, current => {
-			if (current?.state === "active") return current;
+			if (current?.state === "active" && current.attachmentAuthorityId === endpoint.authorityId) return current;
 			const now = this.#now();
 			if (
 				current?.rootPublicationOwner !== undefined &&
@@ -608,12 +608,17 @@ export class SlackNotificationDaemon {
 				rootPublicationLeaseExpiresAt: now + this.#publicationLeaseMs,
 				rootPublicationFence: (current?.rootPublicationFence ?? 0) + 1,
 				endpointGeneration: generation,
+				attachmentAuthorityId: endpoint.authorityId,
 				updatedAt: now,
-				seenEventIds: current?.seenEventIds ?? [],
-				seenContextIds: current?.seenContextIds ?? [],
-				seenRetryKeys: current?.seenRetryKeys ?? [],
-				seenInteractionIds: current?.seenInteractionIds ?? [],
-				inboundDispatches: current?.inboundDispatches ?? [],
+				seenEventIds: current?.attachmentAuthorityId === endpoint.authorityId ? (current?.seenEventIds ?? []) : [],
+				seenContextIds:
+					current?.attachmentAuthorityId === endpoint.authorityId ? (current?.seenContextIds ?? []) : [],
+				seenRetryKeys:
+					current?.attachmentAuthorityId === endpoint.authorityId ? (current?.seenRetryKeys ?? []) : [],
+				seenInteractionIds:
+					current?.attachmentAuthorityId === endpoint.authorityId ? (current?.seenInteractionIds ?? []) : [],
+				inboundDispatches:
+					current?.attachmentAuthorityId === endpoint.authorityId ? (current?.inboundDispatches ?? []) : [],
 			};
 		});
 		// An already-active session root is authoritative whether this daemon
@@ -682,6 +687,7 @@ export class SlackNotificationDaemon {
 				state: "active",
 				rootTs: confirmedPosted.ts,
 				endpointGeneration: generation,
+				attachmentAuthorityId: endpoint.authorityId,
 				updatedAt: this.#now(),
 				lastError: undefined,
 				rootPublicationOwner: undefined,
@@ -727,7 +733,8 @@ export class SlackNotificationDaemon {
 		const usedExistingRoot =
 			existing?.record.state === "active" &&
 			!!existing.record.rootTs &&
-			existing.record.endpointGeneration === generation;
+			existing.record.endpointGeneration === generation &&
+			existing.record.attachmentAuthorityId === endpoint.authorityId;
 		let conversation: SlackConversation;
 		let bodyWasUsedAsRoot =
 			usedExistingRoot &&
@@ -1092,7 +1099,11 @@ export class SlackNotificationDaemon {
 			const previousGeneration = this.#requireEndpointGeneration(previous.record);
 			if (previousGeneration > generation)
 				throw new SlackEndpointBindingError("Slack root belongs to a newer endpoint generation.");
-			if (previousGeneration === generation && (!forced || waitedForRollover))
+			if (
+				previousGeneration === generation &&
+				previous.record.attachmentAuthorityId === endpoint.authorityId &&
+				(!forced || waitedForRollover)
+			)
 				return { conversation: previous.record, created: false };
 
 			let claimed = false;

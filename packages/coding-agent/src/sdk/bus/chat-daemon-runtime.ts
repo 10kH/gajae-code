@@ -454,7 +454,13 @@ export class ChatDaemonRuntime {
 		if (name === SESSION_PREPARED_EVENT || bodyType === SESSION_PREPARED_EVENT) return;
 		if (name === "session_ready") {
 			if (correlated.generation !== attachment.generation) return;
-			await this.#resume(sessionId, attachment.generation, "GJC session ready.", publicationId);
+			await this.#resume(
+				sessionId,
+				attachment.generation,
+				attachment.authorityId,
+				"GJC session ready.",
+				publicationId,
+			);
 			return;
 		}
 		const notification = this.#notificationEvent(sessionId, normalizedFrame);
@@ -479,6 +485,7 @@ export class ChatDaemonRuntime {
 			await this.#discord.notify({
 				sessionId,
 				endpointGeneration: attachment.generation,
+				attachmentAuthorityId: attachment.authorityId,
 				content,
 				...(publicationId === undefined ? {} : { publicationId }),
 				...(notification.type === "action_needed"
@@ -513,12 +520,19 @@ export class ChatDaemonRuntime {
 		await slack?.close(attachment.sessionId, undefined, attachment.generation);
 	}
 
-	async #resume(sessionId: string, generation: number, content: string, publicationId?: string): Promise<void> {
+	async #resume(
+		sessionId: string,
+		generation: number,
+		attachmentAuthorityId: string | undefined,
+		content: string,
+		publicationId?: string,
+	): Promise<void> {
 		if (this.#discord) {
-			await this.#discord.resume(sessionId, generation);
+			await this.#discord.resume(sessionId, generation, attachmentAuthorityId);
 			await this.#discord.notify({
 				sessionId,
 				endpointGeneration: generation,
+				attachmentAuthorityId,
 				content,
 				...(publicationId === undefined ? {} : { publicationId }),
 			});

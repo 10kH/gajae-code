@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
@@ -772,7 +772,17 @@ export class SessionRouter {
 		const publication = Promise.withResolvers<void>();
 		void publication.promise.catch(() => undefined);
 		const capability: SessionAttachment = Object.freeze({
-			authorityId: randomUUID(),
+			authorityId: crypto
+				.createHash("sha256")
+				.update(
+					JSON.stringify({
+						sessionId: indexed.sessionId,
+						generation: indexed.endpointGeneration,
+						pid: indexed.pid,
+						endpointMtimeMs: indexed.endpointMtimeMs,
+					}),
+				)
+				.digest("hex"),
 			sessionId: indexed.sessionId,
 			generation: indexed.endpointGeneration,
 			isCurrent: () => attached !== undefined && this.#attachmentPublished(attached),
@@ -815,7 +825,7 @@ export class SessionRouter {
 		});
 		attached = {
 			initializingPublication: false,
-			id: randomUUID(),
+			id: crypto.randomUUID(),
 			sessionId: indexed.sessionId,
 			endpoint,
 			pid: indexed.pid,

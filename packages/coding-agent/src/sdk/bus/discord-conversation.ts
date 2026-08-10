@@ -28,6 +28,7 @@ export interface DiscordConversation extends ConversationRecord {
 	createOwner?: string;
 	createLeaseExpiresAt?: number;
 	endpointGeneration?: number;
+	attachmentAuthorityId?: string;
 	/** Immutable lineage for archive and resume provider effects. */
 	effectIncarnationId?: string;
 	/** Current archive operation authority. */
