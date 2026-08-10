@@ -13286,6 +13286,11 @@ export class SessionManager {
 	): boolean {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled || runtime.sidecarIneligible) return false;
+		if (runtime.coldIdHashes && !runtime.coldIdHashes.add(entry.id)) {
+			runtime.coldIdHashes = undefined;
+			runtime.coldIdHashesDescriptor = undefined;
+			runtime.accountant.release(COLD_ID_HASH_BYTES);
+		}
 		const cachedChildren = entry.parentId ? runtime.parentChildrenCache.get(entry.parentId) : undefined;
 		if (entry.parentId && cachedChildren) {
 			runtime.parentChildrenCache.delete(entry.parentId);
@@ -13318,7 +13323,6 @@ export class SessionManager {
 				if (!indexWriter.fsyncSync) throw new Error("Synchronous sidecar fsync is unavailable");
 				indexWriter.fsyncSync();
 				runtime.indexHash.update(Buffer.from(indexLine, "utf8"));
-				if (runtime.coldIdHashes && !runtime.coldIdHashes.add(entry.id)) return false;
 				runtime.indexDigest = runtime.indexHash.copy().digest("hex");
 				if (runtime.metadataDelta) runtime.metadataDelta.indexDigest = runtime.indexDigest;
 			} finally {
@@ -15501,7 +15505,7 @@ export class SessionManager {
 	clearModelRole(role: string): string {
 		const entry: ModelChangeEntry = {
 			type: "model_change",
-			id: generateId(this.#byId),
+			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			model: "",

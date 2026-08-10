@@ -1522,7 +1522,7 @@ it("appends after tail overflow without materializing the complete cold index", 
 	SessionManagerTestHooks.sidecarTailBufferBytesOverride = 1;
 	SessionManagerTestHooks.secondaryArtifactMode = "disabled";
 	SessionManagerTestHooks.readAllColdEntryIndexesCalls = 0;
-	SessionManagerTestHooks.coldIdHashMaxEntriesOverride = 2;
+	SessionManagerTestHooks.coldIdHashMaxEntriesOverride = 4;
 	let manager: SessionManager | undefined;
 	try {
 		const built = await SessionManager.open(
@@ -1549,13 +1549,28 @@ it("appends after tail overflow without materializing the complete cold index", 
 		expect(storage.readTextSync(sidecarPath(sessionFile, "tail"))).toBe("");
 		SessionManagerTestHooks.readAllColdEntryIndexesCalls = 0;
 		const appendedId = manager.appendCustomEntry("after-overflow", {});
+		const clearedId = manager.clearModelRole("reviewer");
+		const finalId = manager.appendCustomEntry("after-clear", {});
 		expect(SessionManagerTestHooks.readAllColdEntryIndexesCalls).toBe(0);
-		const finalIndex = storage.readTextSync(sidecarPath(sessionFile, "idx")).trimEnd().split("\n").at(-1);
-		expect(finalIndex).toBeDefined();
-		expect(JSON.parse(finalIndex!)).toMatchObject({ id: appendedId, ordinal: 3 });
-		const finalTail = storage.readTextSync(sidecarPath(sessionFile, "tail")).trimEnd().split("\n").at(-1);
-		expect(finalTail).toBeDefined();
-		expect(JSON.parse(finalTail!)).toMatchObject({ id: appendedId, ordinal: 3 });
+		const expected = [
+			{ id: appendedId, ordinal: 3 },
+			{ id: clearedId, ordinal: 4 },
+			{ id: finalId, ordinal: 5 },
+		];
+		const finalIndex = storage
+			.readTextSync(sidecarPath(sessionFile, "idx"))
+			.trimEnd()
+			.split("\n")
+			.slice(-3)
+			.map(line => JSON.parse(line));
+		const finalTail = storage
+			.readTextSync(sidecarPath(sessionFile, "tail"))
+			.trimEnd()
+			.split("\n")
+			.slice(-3)
+			.map(line => JSON.parse(line));
+		expect(finalIndex).toMatchObject(expected);
+		expect(finalTail).toMatchObject(expected);
 	} finally {
 		SessionManagerTestHooks.sidecarTailBufferBytesOverride = undefined;
 		SessionManagerTestHooks.secondaryArtifactMode = undefined;
