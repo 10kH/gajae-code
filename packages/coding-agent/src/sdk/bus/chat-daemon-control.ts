@@ -100,10 +100,11 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 45 / Slack generation 50 clean predecessor presentation authority before exact Router replacement and reject post-stop Discord callbacks.
  * Discord generation 46 / Slack generation 51 establish replay barriers before reconnect awaits, distinguish replacement from terminal cleanup, and await lifecycle-fenced Discord inbound work.
  * Discord generation 47 / Slack generation 52 preserve presentation continuity across replacement while exact opaque authority fences stale work.
+ * Discord generation 48 / Slack generation 53 allow exact publication-time requests without reconciliation deadlock.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 47,
-	slack: 52,
+	discord: 48,
+	slack: 53,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

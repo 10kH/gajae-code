@@ -409,7 +409,9 @@ export class SessionRouter {
 		expectedAttachment?: SessionAttachment,
 		options?: { timeoutMs?: number },
 	): Promise<Record<string, unknown>> {
-		await this.#serialReconcile(this.#runEpoch);
+		const publishing = this.#sessions.get(sessionId);
+		if (!expectedAttachment || publishing?.capability !== expectedAttachment || !publishing.initializingPublication)
+			await this.#serialReconcile(this.#runEpoch);
 		const attached = this.#sessions.get(sessionId);
 		if (!attached || !this.#attachmentPublished(attached)) throw new SessionRouterError("pre_send");
 		if (expectedGeneration !== undefined && expectedGeneration !== attached.generation)

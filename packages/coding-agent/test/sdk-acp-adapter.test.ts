@@ -438,7 +438,7 @@ test("ACP reverse cancellation remains terminal after its tombstone TTL while th
 	}
 });
 
-test("ACP provider reclaim aborts reverse requests owned by the previous Router connection", async () => {
+test("ACP same-attachment reconnect readiness aborts reverse requests owned by the previous transport", async () => {
 	const harness = createRouterHarness();
 	let cancellationSignal: AbortSignal | undefined;
 	const adapter = new AcpSdkAdapter({
@@ -464,14 +464,7 @@ test("ACP provider reclaim aborts reverse requests owned by the previous Router 
 			payload: { method: "ui.elicit", payload: {} },
 		});
 		await waitFor(() => cancellationSignal !== undefined, "reverse cancellation signal");
-		adapter.acceptFrame({
-			type: "reverse_request",
-			id: "connection-rotation",
-			connectionId: "router-connection-2",
-			capability: "ui",
-			leaseId: "lease-1",
-			payload: { method: "ui.elicit", payload: {} },
-		});
+		await adapter.attachmentReady(harness.attachment);
 		await waitFor(() => cancellationSignal?.aborted === true, "reconnect reverse abort");
 		expect(harness.sent.some(frame => frame.type === "reverse_response" && frame.id === "reconnect-abort")).toBe(
 			false,

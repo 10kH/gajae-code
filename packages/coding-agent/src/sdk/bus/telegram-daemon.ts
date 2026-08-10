@@ -4871,7 +4871,7 @@ export class TelegramNotificationDaemon {
 				onAttachment: attachment => this.#onAttachment(attachment),
 				onAttachmentReady: attachment => this.#onAttachmentReady(attachment),
 				onFrame: (attachment, frame) => this.#onRouterFrame(attachment, frame),
-				onSessionRemoved: attachment => this.#onSessionRemoved(attachment),
+				onSessionRemoved: (attachment, reason) => this.#onSessionRemoved(attachment, reason),
 			},
 		});
 		this.pool = new RateLimitPool<TelegramQueuePayload>({ now: opts.now });
@@ -5021,9 +5021,13 @@ export class TelegramNotificationDaemon {
 			await this.#publicationSettlement(frame.publicationId).promise;
 	}
 
-	async #onSessionRemoved(attachment: SessionAttachment): Promise<void> {
+	async #onSessionRemoved(attachment: SessionAttachment, reason: "removed" | "replaced" = "removed"): Promise<void> {
 		const session = this.sessions.get(attachment.sessionId);
 		if (!session || session.attachment !== attachment) return;
+		if (reason === "replaced") {
+			this.sessions.delete(attachment.sessionId);
+			return;
+		}
 		this.#dropSession(session, "router_session_removed");
 	}
 

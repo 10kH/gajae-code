@@ -193,6 +193,7 @@ export class AcpSdkAdapter {
 	async attachmentReady(attachment: SessionAttachment): Promise<void> {
 		if (this.#attachment !== attachment) this.acceptAttachment(attachment);
 		else {
+			this.#abortActiveReverseRequests();
 			this.#connectionId = undefined;
 			this.#routerConnectionReady = false;
 			this.#providersActivated = false;
