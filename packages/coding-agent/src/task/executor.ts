@@ -214,7 +214,15 @@ export interface ExecutorOptions {
 	 * if the resolved subagent model has no working credentials. See #985.
 	 */
 	parentActiveModelPattern?: string;
+	/**
+	 * Whether the live parent session has an active model profile. When set,
+	 * persisted `task.agentModelOverrides` may resolve through preset-equivalent
+	 * aliases (bare profile aliases re-resolve to an equivalent provider variant).
+	 * Manual/direct parents (no active profile) keep exact resolution.
+	 */
+	parentActiveModelProfile?: string;
 	parentSessionId?: string;
+	parentCredentialSessionId?: string;
 	thinkingLevel?: ThinkingLevel;
 	outputSchema?: unknown;
 	/** Parent task recursion depth (0 = top-level, 1 = first child, etc.) */
@@ -1513,8 +1521,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					options.parentActiveModelPattern,
 					modelRegistry,
 					settings,
-					canonicalChildScope,
-					{ managedFallback: true },
+					options.parentCredentialSessionId ?? options.parentSessionId,
+					{
+						managedFallback: true,
+						...(options.parentActiveModelProfile ? { aliasIntent: "preset-equivalent" } : {}),
+					},
 					canonicalChildScope,
 				),
 			);
@@ -1664,6 +1675,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					providerSessionId: canonicalChildScope,
 					model,
 					thinkingLevel: effectiveThinkingLevel,
+					activeModelProfile: options.parentActiveModelProfile,
+					credentialSessionId: options.parentCredentialSessionId ?? options.parentSessionId,
 					modelSubstitution:
 						modelSubstitutionWarning?.reason === "auth_unavailable" && requestedModel
 							? { requestedModel, reason: modelSubstitutionWarning.reason }
@@ -1733,20 +1746,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			);
 
 			activeSession = session;
-			// Each subagent invocation owns a fresh controller; its configured chain
-			// is scoped to this child session and never shares parent sticky state.
-			// Auth-aware resolution can substitute the parent model only after every
-			// override entry was unavailable. Rebase the controller to that concrete
-			// parent selector so its request is never charged to override index zero.
-			session.setConfiguredModelChain(
-				"default",
-				parentFallbackSelector ? [parentFallbackSelector] : modelPatterns,
-				"subagent",
-				agent.name,
-				true,
-			);
-			if (activeIndex !== undefined && !parentFallbackSelector) {
-				session.seedDefaultFallbackResolution(activeIndex, skips);
+			const configuredChildChain = parentFallbackSelector ? [parentFallbackSelector] : modelPatterns;
+			session.setConfiguredModelChain("default", configuredChildChain, "subagent", agent.name, true);
+			if (!parentFallbackSelector) {
+				session.seedDefaultFallbackResolution(activeIndex ?? 0, skips);
 			}
 			const liveSubagentId = options.subagentId ?? id;
 			const manager = AsyncJobManager.instance();
@@ -1871,6 +1874,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					},
 					{
 						getModel: () => session.model,
+						getCredentialSessionId: () => session.credentialSessionId,
 						isIdle: () => !session.isStreaming,
 						getActivePromptHandle: () => session.activePromptHandle,
 						abort: () => session.abort(),

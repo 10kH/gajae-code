@@ -608,6 +608,29 @@ function secureOwnerOnlyFileDescriptor(
 ): void {
 	if (securityContext && !isValidManagedSecurityContext(securityContext))
 		throw new Error("Invalid managed session security context");
+	if (securityContext) {
+		const root = fs.lstatSync(securityContext.rootAuthority.canonicalPath, { bigint: true });
+		if (
+			!root.isDirectory() ||
+			root.isSymbolicLink() ||
+			root.dev !== securityContext.rootAuthority.dev ||
+			root.ino !== securityContext.rootAuthority.ino
+		)
+			throw new Error("Managed writer root authority changed");
+		if (securityContext.retainedAuthority) {
+			const relative = path.relative(securityContext.sessionDir, pathname).split(path.sep).join("/");
+			const retained = securityContext.retainedAuthority.stat(relative);
+			const opened = fs.fstatSync(fd, { bigint: true });
+			if (
+				!retained.ok ||
+				!retained.identity ||
+				retained.identity.dev !== opened.dev.toString() ||
+				retained.identity.ino !== opened.ino.toString() ||
+				retained.identity.nlink !== opened.nlink.toString()
+			)
+				throw new Error("Managed writer descriptor escaped retained authority");
+		}
+	}
 	if (process.platform !== "linux" || !securityContext) {
 		if (operation === "apply") {
 			const applied = validateNativeSecurityResult(

@@ -8,8 +8,8 @@ import type { Api, Model } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../../config/model-profile-contract";
 import { type ModelProfileDefinition, resolveProfileBindings } from "../../config/model-profiles";
-import { resolveModelChainWithAuth } from "../../config/model-resolver";
-import { normalizeModelSelectorValue } from "../../config/model-selector-value";
+import { resolveModelChainWithAuth, splitSelectorThinkingSuffix } from "../../config/model-resolver";
+import { type ModelSelectorValue, normalizeModelSelectorValue } from "../../config/model-selector-value";
 import { type Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { parseThinkingLevel } from "../../thinking";
@@ -411,7 +411,24 @@ export function createInvocationReconciliation(
 		async noteTransition(kind, correlation, frame) {
 			if (!correlation) return;
 			const record = records.get(key(kind, correlation));
-			if (!record || record.terminalAt !== undefined) return;
+			if (!record) return;
+			if (record.terminalAt !== undefined) {
+				// Same late agent_failed enrichment as the kind-aware bus reconciler: a
+				// failure reason may arrive on a different delivery path than the one that
+				// claimed the terminal. Enrich the settled record instead of dropping it;
+				// never resurrect (status/terminalAt untouched), and first reason wins.
+				if (frame.type === "agent_failed" && record.error === undefined) {
+					logger.error("SDK invocation failed (late)", {
+						kind,
+						commandId: correlation.commandId,
+						turnId: correlation.turnId,
+						error: formatPromptFailureForLocalLog(frame.error),
+					});
+					record.error = sanitizePromptFailure(frame.error);
+					await persist();
+				}
+				return;
+			}
 			if (frame.type === "agent_start") {
 				record.status = "in_flight";
 				record.startedAt = Date.now();
@@ -528,6 +545,63 @@ function createQuerySurface(
 		}
 		return undefined;
 	};
+	const getProfileCredentialSessionId = () => ctx.credentialSessionId ?? id;
+	const resolveProfileAvailability = async (
+		profile: ModelProfileDefinition,
+		authenticatedProviders: ReadonlySet<string>,
+	): Promise<{ available: boolean; defaultModel?: Model<Api> }> => {
+		const rewriteSelectorProvider = (selector: string): string => {
+			const slash = selector.indexOf("/");
+			if (slash < 0) return selector;
+			const provider = selector.slice(0, slash);
+			if (authenticatedProviders.has(provider)) return selector;
+			const group = (profile.alternativeProviderGroups ?? []).find(candidates => candidates.includes(provider));
+			if (!group) return selector;
+			const replacement = group.find(candidate => authenticatedProviders.has(candidate));
+			return replacement ? replacement + selector.slice(slash) : selector;
+		};
+		try {
+			const bindings = resolveProfileBindings(profile);
+			const assignments: Array<{ value: ModelSelectorValue; isDefault: boolean }> = [];
+			if (bindings.defaultSelector !== undefined) {
+				assignments.push({ value: bindings.defaultSelector, isDefault: true });
+			}
+			for (const value of Object.values(bindings.modelRoles)) assignments.push({ value, isDefault: false });
+			for (const value of Object.values(bindings.agentModelOverrides)) assignments.push({ value, isDefault: false });
+			let defaultModel: Model<Api> | undefined;
+			for (const assignment of assignments) {
+				const selectors = normalizeModelSelectorValue(assignment.value).map(rewriteSelectorProvider);
+				const hasBareSelector = selectors.some(selector => {
+					const suffix = splitSelectorThinkingSuffix(selector);
+					const identity = suffix.thinkingLevel ? suffix.selector : selector;
+					return !identity.includes("/");
+				});
+				if (!assignment.isDefault && !hasBareSelector) continue;
+				const resolution = await resolveModelChainWithAuth(
+					selectors,
+					{
+						...ctx.modelRegistry,
+						getAvailable: () => ctx.modelRegistry.getAvailable(),
+						getApiKey: (model: Model<Api>, sessionId?: string) =>
+							ctx.modelRegistry.getApiKeyForProvider(model.provider, sessionId, model.baseUrl),
+					},
+					options.settings,
+					getProfileCredentialSessionId(),
+					{
+						managedFallback: true,
+						aliasIntent: "preset-equivalent",
+						canonicalSessionId: null,
+						credentialSessionId: getProfileCredentialSessionId(),
+					},
+				);
+				if (!resolution.model) return { available: false };
+				if (assignment.isDefault) defaultModel = resolution.model;
+			}
+			return { available: true, defaultModel };
+		} catch {
+			return { available: false };
+		}
+	};
 	const getDiff = async () => {
 		try {
 			const { stdout } = await execFileAsync("git", ["diff", "--no-ext-diff"], {
@@ -620,61 +694,27 @@ function createQuerySurface(
 			let authenticatedProviders: ReadonlySet<string>;
 			try {
 				authenticatedProviders = await collectAuthenticatedProfileProviders(profiles, provider =>
-					ctx.modelRegistry.getApiKeyForProvider(provider, id),
+					ctx.modelRegistry.getApiKeyForProvider(provider, getProfileCredentialSessionId()),
 				);
 			} catch {
 				// Availability join failed: degrade only the synthetic facade,
 				// retain concrete rows and the active marker readback.
 				return degraded();
 			}
-			// Resolve each profile's default model exactly like profile activation:
-			// walk the default mapping chain, rewrite alternative-group providers
-			// to their authenticated member, and use the same pattern-aware,
-			// managed-fallback-eligible resolver so Q10 reports the limits of the
-			// model the profile will actually activate (glob defaults such as
-			// `provider/gpt-*` and Cursor-managed-fallback skips included).
 			const resolvedDefaultModels = new Map<string, Model<Api>>();
-			const rewriteSelectorProvider = (selector: string, profile: ModelProfileDefinition): string => {
-				const slash = selector.indexOf("/");
-				if (slash < 0) return selector;
-				const provider = selector.slice(0, slash);
-				if (authenticatedProviders.has(provider)) return selector;
-				const group = (profile.alternativeProviderGroups ?? []).find(candidates => candidates.includes(provider));
-				if (!group) return selector;
-				const replacement = group.find(candidate => authenticatedProviders.has(candidate));
-				return replacement ? replacement + selector.slice(slash) : selector;
-			};
+			const fullyResolvedProfiles = new Set<string>();
 			await Promise.all(
 				[...profiles.entries()].map(async ([name, profile]) => {
-					try {
-						const defaultSelector = resolveProfileBindings(profile).defaultSelector;
-						if (defaultSelector === undefined) return; // role-only profile
-						const selectors = normalizeModelSelectorValue(defaultSelector).map(selector =>
-							rewriteSelectorProvider(selector, profile),
-						);
-						const resolution = await resolveModelChainWithAuth(
-							selectors,
-							{
-								...ctx.modelRegistry,
-								getAvailable: () => ctx.modelRegistry.getAll(),
-								getApiKey: (model: Model<Api>, sessionId?: string) =>
-									ctx.modelRegistry.getApiKeyForProvider(model.provider, sessionId, model.baseUrl),
-							},
-							options.settings,
-							id,
-							{ managedFallback: true },
-						);
-						if (resolution.model) resolvedDefaultModels.set(name, resolution.model);
-					} catch {
-						// A provider whose credential state cannot be read must not
-						// fail the whole Q10 query: skip this profile's metadata
-						// resolution and degrade only its synthetic row.
-					}
+					const result = await resolveProfileAvailability(profile, authenticatedProviders);
+					if (!result.available) return;
+					fullyResolvedProfiles.add(name);
+					if (result.defaultModel) resolvedDefaultModels.set(name, result.defaultModel);
 				}),
 			);
 			const availableProfileIds = new Set<string>();
 			for (const [name, profile] of profiles) {
 				if (!isModelProfileProviderAvailable(profile, authenticatedProviders)) continue;
+				if (!fullyResolvedProfiles.has(name)) continue;
 				// A profile with a default mapping is selectable only when its
 				// default chain actually resolves to an authenticated model:
 				// activation rejects unresolvable defaults even when the
@@ -737,12 +777,18 @@ function createQuerySurface(
 		getModelProfiles: async () => {
 			const profiles = ctx.modelRegistry.getModelProfiles();
 			const authenticatedProviders = await collectAuthenticatedProfileProviders(profiles, provider =>
-				ctx.modelRegistry.getApiKeyForProvider(provider, id),
+				ctx.modelRegistry.getApiKeyForProvider(provider, getProfileCredentialSessionId()),
 			);
-			return projectModelProfileCatalog(profiles, ctx.modelRegistry.getError()).map(item => ({
-				...item,
-				available: isModelProfileProviderAvailable(profiles.get(item.id)!, authenticatedProviders),
-			})) as unknown[];
+			return (await Promise.all(
+				projectModelProfileCatalog(profiles, ctx.modelRegistry.getError()).map(async item => ({
+					...item,
+					available:
+						isModelProfileProviderAvailable(profiles.get(item.id)!, authenticatedProviders) &&
+						(
+							await resolveProfileAvailability(profiles.get(item.id)!, authenticatedProviders)
+						).available,
+				})),
+			)) as unknown[];
 		},
 		installedQueries: policy.installedQueries,
 	};
@@ -965,8 +1011,11 @@ function createControlSurface(
 				},
 				error => {
 					if (settled) {
-						if (kind === "skill")
-							void reconciliation.noteTransition(kind, correlation, { type: "agent_failed", error });
+						// The submission promise rejects after preflight acceptance only when the
+						// work itself is over (provider stream interrupt, abort, queue failure).
+						// Every kind must terminalize here or the record stays non-terminal
+						// forever; `noteTransition` ignores an already-terminal record.
+						void reconciliation.noteTransition(kind, correlation, { type: "agent_failed", error });
 						return;
 					}
 					settled = true;
