@@ -2292,6 +2292,7 @@ export async function publishManagedFileNoReplace(
 	root?: ManagedDirectoryRoot,
 	policy: ManagedSessionSecurityPolicy = "default",
 ): Promise<void> {
+	if (bytes.byteLength > MANAGED_ARTIFACT_MAX_FILE_BYTES) throw new Error("content_too_large");
 	const parent = path.dirname(destination);
 	ensureManagedDirectory(parent, root, policy);
 	const staging = path.join(parent, `.${path.basename(destination)}.${randomUUID()}.staging`);
@@ -2373,6 +2374,7 @@ export function publishManagedFileNoReplaceSync(
 	root?: ManagedDirectoryRoot,
 	policy: ManagedSessionSecurityPolicy = "default",
 ): ManagedFileSnapshot["identity"] {
+	if (bytes.byteLength > MANAGED_ARTIFACT_MAX_FILE_BYTES) throw new Error("content_too_large");
 	const parent = path.dirname(destination);
 	ensureManagedDirectory(parent, root, policy);
 	const staging = path.join(parent, `.${path.basename(destination)}.${randomUUID()}.staging`);
@@ -2662,6 +2664,7 @@ export function replaceManagedFileSync(
 	assertFence?: () => void,
 	expectedDestination?: ManagedFileSnapshot["identity"],
 ): void {
+	if (bytes.byteLength > MANAGED_ARTIFACT_MAX_FILE_BYTES) throw new Error("content_too_large");
 	replaceManagedFileGeneratedSync(
 		destination,
 		fd => {
@@ -2723,6 +2726,8 @@ function appendManagedFileStreamingSync(
 				)
 					throw new Error("managed_replace_identity_mismatch");
 				if (hash.copy().digest("hex") !== predecessor.sha256) throw new Error("managed_replace_identity_mismatch");
+				if (total > MANAGED_ARTIFACT_MAX_FILE_BYTES - appendedBytes.byteLength)
+					throw new Error("content_too_large");
 				let appended = 0;
 				while (appended < appendedBytes.byteLength) {
 					const amount = fs.writeSync(stagingFd, appendedBytes, appended, appendedBytes.byteLength - appended);

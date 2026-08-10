@@ -7,12 +7,15 @@ import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import {
 	captureManagedFileNoFollow,
+	MANAGED_ARTIFACT_MAX_FILE_BYTES,
 	ManagedCommittedMutationError,
 	ManagedReplaceError,
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
 	publishManagedFileNoReplace,
+	publishManagedFileNoReplaceSync,
 	renameFlagsUnsupported,
+	replaceManagedFileSync,
 	retainManagedDirectoryAuthority,
 	validateNativeSecurityResult,
 } from "../src/session/internal/managed-session-storage";
@@ -627,6 +630,17 @@ describe("managed descriptor reads", () => {
 });
 
 describe.skipIf(process.platform !== "darwin")("authority-absent managed replacement", () => {
+	it("rejects path-based managed writes above the reopenable ceiling before allocation", () => {
+		const oversized = { byteLength: MANAGED_ARTIFACT_MAX_FILE_BYTES + 1 } as unknown as Uint8Array;
+		expect(() => publishManagedFileNoReplaceSync("/unused", oversized)).toThrow("content_too_large");
+		expect(() =>
+			replaceManagedFileSync("/unused", oversized, {
+				canonicalPath: "/unused",
+				dev: 0n,
+				ino: 0n,
+			}),
+		).toThrow("content_too_large");
+	});
 	it("atomically replaces an existing file through the Darwin path", () => {
 		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-replace-")));
 		try {
