@@ -94,10 +94,11 @@ export type ChatDaemonAction = "stop" | "reload";
  * Slack generation 45 persists exact pending cleanup intent through recovery.
  * Discord generation 40 bounds provider lifecycle joins before Router revocation.
  * Discord generation 41 / Slack generation 46 revoke Router authority despite provider shutdown failure.
+ * Discord generation 42 / Slack generation 47 retain daemon objects across restart to preserve detached lifecycle fences.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 41,
-	slack: 46,
+	discord: 42,
+	slack: 47,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

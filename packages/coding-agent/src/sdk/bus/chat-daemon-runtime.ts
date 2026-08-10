@@ -269,6 +269,12 @@ export class ChatDaemonRuntime {
 			if (!settled) throw new Error("Prior provider cleanup did not settle before chat daemon restart.");
 		}
 		this.#attachments.clear();
+		const retainedProvider = this.#discord?.restartBlocked() ? this.#discord : undefined;
+		if (retainedProvider) {
+			await this.#router.start();
+			await retainedProvider.start();
+			return;
+		}
 		if (this.input.kind === "discord") {
 			const config = this.input.config.notifications.discord;
 			if (!config) throw new Error("Discord chat daemon provider configuration is unavailable.");
@@ -339,10 +345,13 @@ export class ChatDaemonRuntime {
 
 	async stop(): Promise<void> {
 		const providerResults = await Promise.allSettled([this.#discord?.stop(), this.#slack?.stop()]);
-		this.#discord = undefined;
+		const discordRestartBlocked = this.#discord?.restartBlocked() ?? false;
+		if (!discordRestartBlocked) this.#discord = undefined;
 		this.#slack = undefined;
-		this.#presentation = undefined;
-		this.#transportHealthy = undefined;
+		if (!discordRestartBlocked) {
+			this.#presentation = undefined;
+			this.#transportHealthy = undefined;
+		}
 		await this.#router.stop();
 		const failures = providerResults.filter(
 			(result): result is PromiseRejectedResult => result.status === "rejected",

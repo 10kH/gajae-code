@@ -194,6 +194,9 @@ export class DiscordNotificationDaemon {
 		};
 		this.#resolveAttachment = options.resolveAttachment;
 	}
+	restartBlocked(): boolean {
+		return this.#providerLifecycleTail !== undefined || this.#providerLifecycleError !== undefined;
+	}
 
 	async start(): Promise<void> {
 		if (this.#started && !this.#stopTask) return;
