@@ -43,6 +43,7 @@ export const MANAGED_ARTIFACT_MAX_FILES = 50_000;
 export const MANAGED_ARTIFACT_MAX_FILE_BYTES = 64 * 1024 * 1024;
 export const MANAGED_ARTIFACT_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
 const REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES = 64 * 1024;
+const REPLACEMENT_CLEANUP_RECEIPT_SCAN_LIMIT = 1024;
 export const MANAGED_ARTIFACT_COPY_BATCH_SIZE = 256;
 const LOCK_LEASE_MS = 60_000;
 const LOCK_HEARTBEAT_MS = 10_000;
@@ -1240,27 +1241,36 @@ export class ManagedSessionDescendantStore {
 		if (this.#reconcilingReplacementCleanup) return;
 		this.#reconcilingReplacementCleanup = true;
 		try {
-			for (const name of fs.readdirSync(this.#baseDir)) {
-				if (name.startsWith(".gjc-replace-receipt-pending-")) {
-					this.#reconcilePendingReplacementReceipt(path.join(this.#baseDir, name));
-					continue;
-				}
-				if (!name.startsWith(".gjc-replace-cleanup-")) continue;
-				if (replacementCleanupReceiptBinding(name)) {
-					try {
-						this.#detachReplacementCleanupReceipt(path.join(this.#baseDir, name));
-					} catch (error) {
-						// A transient Windows handle/AV failure leaves the receipt intact for a
-						// later reconciliation; it must not abort the session mutation.
-						if (!isRetryableReplacementReceiptCleanupError(error)) throw error;
+			const directory = fs.opendirSync(this.#baseDir);
+			try {
+				let examined = 0;
+				for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
+					const name = entry.name;
+					if (!name.startsWith(".gjc-replace-receipt-pending-") && !name.startsWith(".gjc-replace-cleanup-"))
+						continue;
+					examined++;
+					if (examined > REPLACEMENT_CLEANUP_RECEIPT_SCAN_LIMIT)
+						throw new Error("managed_replace_cleanup_receipt_limit_exceeded");
+					if (name.startsWith(".gjc-replace-receipt-pending-")) {
+						this.#reconcilePendingReplacementReceipt(path.join(this.#baseDir, name));
+						continue;
 					}
-					continue;
+					if (replacementCleanupReceiptBinding(name)) {
+						try {
+							this.#detachReplacementCleanupReceipt(path.join(this.#baseDir, name));
+						} catch (error) {
+							if (!isRetryableReplacementReceiptCleanupError(error)) throw error;
+						}
+						continue;
+					}
+					if (legacyReplacementCleanupReceiptBinding(name)) {
+						this.#reconcileLegacyReplacementCleanupReceipt(path.join(this.#baseDir, name), name);
+						continue;
+					}
+					throw new Error("managed_replace_cleanup_receipt_invalid");
 				}
-				if (legacyReplacementCleanupReceiptBinding(name)) {
-					this.#reconcileLegacyReplacementCleanupReceipt(path.join(this.#baseDir, name), name);
-					continue;
-				}
-				throw new Error("managed_replace_cleanup_receipt_invalid");
+			} finally {
+				directory.closeSync();
 			}
 		} finally {
 			this.#reconcilingReplacementCleanup = false;
@@ -1486,6 +1496,11 @@ export class ManagedSessionDescendantStore {
 		return receipt;
 	}
 
+	#assertPathBackedReadRelative(relativePath: string): void {
+		if (!this.#authority && relativePath.split(/[\\/]/).length > 1)
+			throw new Error("managed_nested_path_unsupported");
+	}
+
 	#relative(resolved: string): string {
 		return path.relative(this.#authorityBaseDir, resolved).split(path.sep).join("/");
 	}
@@ -1594,6 +1609,7 @@ export class ManagedSessionDescendantStore {
 
 	/** Capture descriptor identity without copying file bytes when retained authority is available. */
 	descriptorExpected(relativePath: string): SessionStorageStat | null {
+		this.#assertPathBackedReadRelative(relativePath);
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
@@ -1672,6 +1688,7 @@ export class ManagedSessionDescendantStore {
 			throw new RangeError("Invalid managed range read");
 		if (start > Number.MAX_SAFE_INTEGER - length) throw new RangeError("Managed range read start overflows");
 		if (length > 64 * 1024 * 1024) throw new RangeError("Managed range read exceeds the bounded maximum");
+		this.#assertPathBackedReadRelative(relativePath);
 		this.#assertBound();
 		const rootBefore = fs.lstatSync(this.#baseDir, { bigint: true });
 		if (
@@ -1772,6 +1789,7 @@ export class ManagedSessionDescendantStore {
 	}
 	/** Read an exact managed file without exposing its pathname as authority. */
 	readExpected(relativePath: string): ManagedFileSnapshot | null {
+		this.#assertPathBackedReadRelative(relativePath);
 		this.#assertBound();
 		const relative = this.#relative(this.#resolve(relativePath));
 		if (!this.#authority) {
@@ -1920,6 +1938,7 @@ export class ManagedSessionDescendantStore {
 	/** Capture a complete descendant tree through this retained root. */
 	captureTree(relativePath: string): NativeDirectoryTreeSnapshot {
 		this.#assertBound();
+		validateManagedArtifactTree(this.#resolve(relativePath));
 		const relative = this.#relative(this.#resolve(relativePath));
 		if (this.#authority) {
 			const captured = this.#authority.snapshotManagedTree(relative);
