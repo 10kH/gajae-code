@@ -2,7 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+- Browser `act` and `run` responses can now surface an opt-in (`open(..., { diagnostics: true })`), bounded mailbox of page exceptions and `console.error` metadata. Entries carry only kind, timestamp, origin-only URL, line/column, and an allowlisted built-in error class; path segments, query strings, messages, arguments, values, and stacks are never retained. Serialization is byte-bounded with an explicit truncation marker.
+
 ### Fixed
+- Option+Q verification now supports normal macOS Terminal.app profiles and fails with an actionable Settings > Profiles > Keyboard > Use Option as Meta key diagnostic when the profile cannot forward Option as Meta/Esc.
+- Queued-message selection now accepts the actual macOS Terminal.app Option+Up/Down byte sequence from either physical Option key, enabling multi-message restore, delete, and reorder flows.
 - `bun run restart:sdk-broker --close-session-hosts` no longer fails against session hosts whose workspace was deleted while they kept running. The teardown fence proved a pid's identity only from the spawn-time marker inside the session's own workspace state root, so deleting that workspace (a removed worktree, a cleaned scratch directory) destroyed the only evidence the broker would accept: `session.close` answered `close_refused` forever, the host stayed resident serving the source it started with, and every restart exited non-zero naming the same unkillable orphans. Hosts now publish their OS start incarnation into the broker-owned session index at registration — and reconciliation preserves it — so the pid stays provable after its workspace is gone, while a marker naming a different process still refuses the signal and an incarnation that no longer matches the live pid still fails closed. A host that dies before withdrawing its own registration is now retired by the broker on the same evidence its dead-registration sweep already uses, so a completed teardown is reported as one instead of surfacing as `endpoint_stale` or `terminal_uncertain`.
 - Memory-pressure sweeps now request asynchronous garbage collection instead of forcing a stop-the-world collection on the main event loop, preventing periodic input and rendering stalls under the opt-in memory guard.
 - Follow-up queue auto-continuation now waits for compaction and foreground bash/eval work to settle, preventing queued prompts from starting a model turn concurrently with those operations.
@@ -12,6 +17,7 @@
 - Streamed edit preview coalescing now keys on the complete partial-JSON payload rather than its length, so same-size in-place argument replacements recompute and render while repeated payloads remain cached.
 - CLI parsing now fails closed by default, while launch and ACP explicitly defer only their owned startup options; this preserves ACP-specific diagnostics, SDK startup forwarding, real ACP subprocess framing, and RLM typo rejection without exposing retired flags in root help or completion.
 - Read-tool code summarization and ZIP extraction now run asynchronously instead of blocking the TUI event loop during structural parsing or decompression.
+- `secrets.yml` entries with `mode: "replace"` and no explicit `replacement` now derive their substitute from a keyed, domain-separated HMAC-SHA256 construction over the process key instead of an unkeyed public `Bun.hash`. Derived replacements are no longer confirmable offline without the key (issue #4166); same-process determinism, same-length output, and alphanumeric character behavior are preserved, and explicit `replacement` values are unchanged. Note: derived replacements differ across processes/key rotations — set an explicit `replacement` when a stable value is required.
 
 ## [0.12.21] - 2026-08-09
 
@@ -334,6 +340,7 @@
 
 ### Fixed
 
+- Managed session forks no longer fail with `managed_nested_path_unsupported` on platforms without retained root authority. Nested reads verify each intermediate directory component as a real same-device directory instead of being rejected outright, restoring artifact copying during `fork()` and `moveTo()`.
 - Terminal input now normalizes Option/Meta navigation and psmux modified-Enter encodings through the native key parser, keeping legacy, Kitty CSI-u, and modifyOtherKeys behavior consistent.
 - Ultragoal CLI replay no longer executes model-authored test source or trusts `replaySafe: true` as arbitrary command authority. Runtime replay is limited to the pinned Bun runtime for `--version` and literal `-e "console.log(...)"`; shells, interpreter code strings, path-qualified executables, tests, install/publish/network/git mutation commands, and arbitrary argv are rejected. Replay cwd/artifact files are realpath-confined, ambiguous rows fail closed, stdout and stderr are checked, and POSIX timeout cleanup signals the process group. Structured test-report fallback remains deliberately unsupported pending a separate trusted-provenance design (#3533).
 - Ultragoal CLI replay evidence now reads the replay file referenced by an `executorQa.artifactRefs` entry whose `kind` is `cli-replay`. Inline, nested, and file-backed replay forms are disambiguated explicitly; mixed or malformed rows fail closed (#3533).

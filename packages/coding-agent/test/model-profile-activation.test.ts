@@ -1355,6 +1355,33 @@ describe("model profile activation", () => {
 		});
 		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
+	test("colon-tagged concrete model selector materializes whole with optional effort", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({ "task.agentModelOverrides": { executor: "provider-a/old-executor" } });
+		const registry = fakeRegistry({
+			profiles: [
+				{
+					name: "colon-tag",
+					requiredProviders: ["ollama-cloud"],
+					modelMapping: {
+						default: "ollama-cloud/deepseek-v4-flash:0731",
+						executor: "ollama-cloud/deepseek-v4-flash:0731:xhigh",
+					},
+					source: "user",
+				},
+			],
+		});
+		registry.getAll = () => [model("ollama-cloud", "deepseek-v4-flash:0731"), ...fakeRegistry().getAll()];
+
+		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: "colon-tag" });
+
+		expect(session.getConfiguredModelChain("default")).toEqual(["ollama-cloud/deepseek-v4-flash:0731"]);
+		expect(session.model?.provider).toBe("ollama-cloud");
+		expect(session.model?.id).toBe("deepseek-v4-flash:0731");
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "ollama-cloud/deepseek-v4-flash:0731:xhigh",
+		});
+	});
 
 	test("batch materialization is inactive without an active profile", () => {
 		const session = fakeSession();

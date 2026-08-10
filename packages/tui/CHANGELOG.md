@@ -5,6 +5,9 @@
 ### Added
 
 - Added atomic same-line deletion APIs and an `Editor` undo callback for keeping application state synchronized with editor history.
+### Fixed
+
+- macOS Terminal.app Option+Arrow input is now buffered and decoded as a single Meta-wrapped escape sequence, so Option+Up/Down can open and navigate queued-message selectors.
 
 ## [0.12.21] - 2026-08-09
 
