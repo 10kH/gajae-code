@@ -266,6 +266,7 @@ describe("AgentSession deep-interview continuation", () => {
 	it("resets the attempt budget on a genuine user prompt", async () => {
 		await activateWorkflow("deep-interview");
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const continueQueuedSpy = vi.spyOn(session.agent, "continueQueuedMessages").mockResolvedValue();
 
 		await emitAssistantStop(100);
 		await emitAssistantStop(200);
@@ -280,8 +281,10 @@ describe("AgentSession deep-interview continuation", () => {
 		await session.waitForIdle();
 
 		await emitAssistantStop(400);
-		// The queued user message owns one continuation; the later deep-interview stop owns the other.
-		expect(continueSpy).toHaveBeenCalledTimes(4);
+		// The queued user message uses the queued-message continuation path; the later
+		// deep-interview stop uses the ordinary continuation path.
+		expect(continueSpy).toHaveBeenCalledTimes(3);
+		expect(continueQueuedSpy).toHaveBeenCalledTimes(1);
 		expect(developerReminders()).toHaveLength(3);
 	});
 
@@ -591,6 +594,7 @@ describe("AgentSession deep-interview continuation", () => {
 	it("claims genuine ingress exactly once while synthetic and agent-attributed streaming inputs cannot supersede", async () => {
 		await activateWorkflow("deep-interview");
 		vi.spyOn(session.agent, "continue").mockResolvedValue();
+		vi.spyOn(session.agent, "continueQueuedMessages").mockResolvedValue();
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
 		let isStreaming = false;
 		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => isStreaming });

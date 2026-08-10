@@ -272,7 +272,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 			display: false,
 			timestamp: Date.now(),
 		});
-		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const continueQueuedSpy = vi.spyOn(session.agent, "continueQueuedMessages").mockResolvedValue();
 		const { promise: firstCompactionDone, resolve: onFirstCompactionDone } = Promise.withResolvers<void>();
 		const { promise: secondCompactionDone, resolve: onSecondCompactionDone } = Promise.withResolvers<void>();
 		let compactionEndCount = 0;
@@ -317,7 +317,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		await withTimeout(secondCompactionDone, 1000, "Pre-continue compaction timed out");
 		await session.waitForIdle();
 
-		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(continueQueuedSpy).toHaveBeenCalledTimes(1);
 		expect(getRuntimeSignals().filter(signal => signal === "compaction:start:threshold")).toHaveLength(2);
 	});
 

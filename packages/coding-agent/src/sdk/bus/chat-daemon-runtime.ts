@@ -370,8 +370,9 @@ export class ChatDaemonRuntime {
 	}
 
 	async #onAttachment(attachment: SessionAttachment): Promise<void> {
-		await this.#cleanupWork.get(attachment.sessionId)?.catch(() => undefined);
 		this.#attachments.set(attachment.sessionId, attachment);
+		await this.#cleanupWork.get(attachment.sessionId)?.catch(() => undefined);
+		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
 		this.#presentation?.connectSession(attachment.sessionId, {
 			sendReply: route => attachment.send({ type: "reply", id: route.actionId, answer: route.answer }),
 		});
@@ -384,6 +385,8 @@ export class ChatDaemonRuntime {
 	}
 
 	async #handleFrame(attachment: SessionAttachment, correlated: CorrelatedFrame): Promise<void> {
+		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
+		await this.#cleanupWork.get(attachment.sessionId)?.catch(() => undefined);
 		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
 		const publicationId = correlated.publicationId;
 		const normalizedFrame = correlated.body;
