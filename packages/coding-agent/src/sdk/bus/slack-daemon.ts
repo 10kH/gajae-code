@@ -789,6 +789,10 @@ export class SlackNotificationDaemon {
 	}
 
 	async close(sessionId: string, marker = "Session closed."): Promise<boolean> {
+		return await this.#track(this.#close(sessionId, marker));
+	}
+
+	async #close(sessionId: string, marker: string): Promise<boolean> {
 		const found = await this.findSession(sessionId, true);
 		if (!found?.record.rootTs || found.record.state !== "active") return false;
 		const effectId = `close-marker:${sessionId}:${found.record.clientMsgId ?? found.record.rootTs}`;
@@ -1202,8 +1206,12 @@ export class SlackNotificationDaemon {
 		);
 	}
 
-	async #withEffectLease<T>(id: string, lease: ChatEffectLease, operation: () => Promise<T>): Promise<T> {
-		const workGeneration = this.#workGeneration;
+	async #withEffectLease<T>(
+		id: string,
+		lease: ChatEffectLease,
+		operation: () => Promise<T>,
+		workGeneration = this.#workGeneration,
+	): Promise<T> {
 		let invalidation: Promise<void> | undefined;
 		let invalidated = false;
 		const invalidate = async (): Promise<void> => {
@@ -2045,21 +2053,28 @@ export class SlackNotificationDaemon {
 		const requiresReconciliation =
 			initial.state === "accepted" || initial.state === "uncertain" || initial.state === "leased";
 		try {
-			const posted = await this.#withEffectLease(id, lease, async () => {
-				const found = await this.options.provider.findMessageByClientMsgId({
-					channel: effect!.payload.channel,
-					threadTs: effect!.payload.threadTs,
-					clientMsgId: effect!.payload.clientMsgId,
-				});
-				if (found) return found;
-				if (workGeneration !== this.#workGeneration) throw new Error(`Slack effect ${id} lost its shutdown fence`);
-				if (!(await this.#providerEffectCurrent(effect!))) {
-					if (requiresReconciliation) throw new SlackReconciledAbsentEffectError();
-					throw new SlackStaleEffectError();
-				}
-				if (workGeneration !== this.#workGeneration) throw new Error(`Slack effect ${id} lost its shutdown fence`);
-				return await this.options.provider.postMessage(effect!.payload);
-			});
+			const posted = await this.#withEffectLease(
+				id,
+				lease,
+				async () => {
+					const found = await this.options.provider.findMessageByClientMsgId({
+						channel: effect!.payload.channel,
+						threadTs: effect!.payload.threadTs,
+						clientMsgId: effect!.payload.clientMsgId,
+					});
+					if (found) return found;
+					if (workGeneration !== this.#workGeneration)
+						throw new Error(`Slack effect ${id} lost its shutdown fence`);
+					if (!(await this.#providerEffectCurrent(effect!))) {
+						if (requiresReconciliation) throw new SlackReconciledAbsentEffectError();
+						throw new SlackStaleEffectError();
+					}
+					if (workGeneration !== this.#workGeneration)
+						throw new Error(`Slack effect ${id} lost its shutdown fence`);
+					return await this.options.provider.postMessage(effect!.payload);
+				},
+				workGeneration,
+			);
 
 			if (
 				!(await this.#journal.record(id, lease, "terminal", {
@@ -2092,6 +2107,7 @@ export class SlackNotificationDaemon {
 								threadTs: effect!.payload.threadTs,
 								clientMsgId: effect!.payload.clientMsgId,
 							}),
+						workGeneration,
 					);
 					if (reconciled) {
 						if (
