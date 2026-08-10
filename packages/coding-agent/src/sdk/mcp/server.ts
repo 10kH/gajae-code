@@ -143,7 +143,7 @@ function mcpOperationError(
 }
 
 const MCP_LIFECYCLE_ACTOR = { id: "gjc-sdk-mcp", namespace: "sdk:mcp" } as const;
-const ROUTER_START_TIMEOUT_MS = 10_000;
+const ROUTER_START_TIMEOUT_MS = 3_000;
 const ROUTER_STOP_TIMEOUT_MS = 5_000;
 type LifecycleMutationOperation = Exclude<SessionLifecycleOperation, "session.list">;
 
@@ -355,15 +355,14 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 
 /**
  * Runs the SDK MCP server over stdio (newline-delimited JSON-RPC), the shipped
- * `gjc mcp-serve sdk` entrypoint. SessionRouter owns live endpoint authority for
- * the command lifetime and is stopped after stdin and in-flight requests drain.
+ * `gjc mcp-serve sdk` entrypoint. SessionRouter owns live endpoint authority and starts lazily
+ * on the first live-session tool, then stops after stdin and in-flight requests drain.
  */
 export async function runSdkMcpStdio(options: SdkMcpServerOptions = {}): Promise<void> {
 	const server = createSdkMcpServer(options);
 	let buffer = "";
 	const inflight = new Set<Promise<void>>();
 	try {
-		await server.start();
 		process.stdin.setEncoding("utf8");
 
 		const track = (work: Promise<void>): void => {
