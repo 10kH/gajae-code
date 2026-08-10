@@ -691,7 +691,7 @@ describe("chat daemon worker", () => {
 		await runtime.stop();
 	});
 
-	it("discards queued frames emitted by a replaced attachment", async () => {
+	it("discards queued frames emitted by a same-generation successor attachment", async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-frame-"));
 		const agentDir = path.join(root, "agent");
 		const stateRoot = path.join(root, ".gjc", "state");
@@ -761,7 +761,7 @@ describe("chat daemon worker", () => {
 			type: "host_registered",
 			sessionId: "session",
 			locator: { repo: root, stateRoot },
-			endpointGeneration: 2,
+			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
 		});
