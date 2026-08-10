@@ -1095,6 +1095,15 @@ class BoundedColdIdHashSet {
 	readonly #high = new Uint8Array(COLD_ID_HASH_CAPACITY);
 	readonly #low = new Uint16Array(COLD_ID_HASH_CAPACITY);
 	#size = 0;
+	readonly #maxEntries: number;
+
+	constructor(maxEntries = coldIdHashMaxEntries()) {
+		this.#maxEntries = maxEntries;
+	}
+
+	get atCapacity(): boolean {
+		return this.#size >= this.#maxEntries;
+	}
 
 	#hash(value: string, seed: number): number {
 		let hash = seed >>> 0;
@@ -1126,7 +1135,7 @@ class BoundedColdIdHashSet {
 	}
 
 	add(value: string): boolean {
-		if (this.#size >= 1_000_000) return false;
+		if (this.atCapacity) return false;
 		const [high, low] = this.#fingerprint(value);
 		let slot = this.#hash(value, 0x9e3779b9) % COLD_ID_HASH_CAPACITY;
 		for (let probes = 0; probes < COLD_ID_HASH_CAPACITY; probes++) {
@@ -6397,6 +6406,8 @@ export const SessionManagerTestHooks: {
 	readAllColdEntryIndexesCalls?: number;
 	/** Test-only exact-reopen exception diagnostic. */
 	lastSidecarInitError?: string;
+	/** Test-only generated-ID cache capacity override. */
+	coldIdHashMaxEntriesOverride?: number;
 } = {};
 
 function materializedCacheMaxBytes(): number {
@@ -6428,6 +6439,14 @@ function sidecarTailBufferBytes(): number {
 	if (override === undefined) return 4 * 1024 * 1024;
 	if (!Number.isSafeInteger(override) || override < 1)
 		throw new RangeError("sidecarTailBufferBytesOverride must be a positive safe integer.");
+	return override;
+}
+
+function coldIdHashMaxEntries(): number {
+	const override = SessionManagerTestHooks.coldIdHashMaxEntriesOverride;
+	if (override === undefined) return 1_000_000;
+	if (!Number.isSafeInteger(override) || override < 1 || override > COLD_ID_HASH_CAPACITY)
+		throw new RangeError(`coldIdHashMaxEntriesOverride must be between 1 and ${COLD_ID_HASH_CAPACITY}.`);
 	return override;
 }
 
@@ -13083,8 +13102,13 @@ export class SessionManager {
 				if (
 					runtime.coldIdHashesDescriptor &&
 					sameDescriptor(this.storage.statSync(runtime.indexPath), runtime.coldIdHashesDescriptor)
-				)
-					return runtime.coldIdHashes;
+				) {
+					if (!runtime.coldIdHashes.atCapacity) return runtime.coldIdHashes;
+					runtime.coldIdHashes = undefined;
+					runtime.coldIdHashesDescriptor = undefined;
+					runtime.accountant.release(COLD_ID_HASH_BYTES);
+					return undefined;
+				}
 			} catch {
 				// Fall through to a bounded rebuild.
 			}
@@ -13110,7 +13134,7 @@ export class SessionManager {
 					return false;
 				}
 			});
-			if (failure || !complete) return undefined;
+			if (failure || !complete || hashes.atCapacity) return undefined;
 			runtime.coldIdHashes = hashes;
 			runtime.coldIdHashesDescriptor = this.storage.statSync(runtime.indexPath);
 			return hashes;

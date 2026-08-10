@@ -1522,6 +1522,7 @@ it("appends after tail overflow without materializing the complete cold index", 
 	SessionManagerTestHooks.sidecarTailBufferBytesOverride = 1;
 	SessionManagerTestHooks.secondaryArtifactMode = "disabled";
 	SessionManagerTestHooks.readAllColdEntryIndexesCalls = 0;
+	SessionManagerTestHooks.coldIdHashMaxEntriesOverride = 2;
 	let manager: SessionManager | undefined;
 	try {
 		const built = await SessionManager.open(
@@ -1552,10 +1553,14 @@ it("appends after tail overflow without materializing the complete cold index", 
 		const finalIndex = storage.readTextSync(sidecarPath(sessionFile, "idx")).trimEnd().split("\n").at(-1);
 		expect(finalIndex).toBeDefined();
 		expect(JSON.parse(finalIndex!)).toMatchObject({ id: appendedId, ordinal: 3 });
+		const finalTail = storage.readTextSync(sidecarPath(sessionFile, "tail")).trimEnd().split("\n").at(-1);
+		expect(finalTail).toBeDefined();
+		expect(JSON.parse(finalTail!)).toMatchObject({ id: appendedId, ordinal: 3 });
 	} finally {
 		SessionManagerTestHooks.sidecarTailBufferBytesOverride = undefined;
 		SessionManagerTestHooks.secondaryArtifactMode = undefined;
 		SessionManagerTestHooks.readAllColdEntryIndexesCalls = undefined;
+		SessionManagerTestHooks.coldIdHashMaxEntriesOverride = undefined;
 		await manager?.close();
 	}
 });
