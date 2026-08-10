@@ -2422,12 +2422,8 @@ async function waitForClose(broker: Broker, id: string, record: CloseRecord, tim
 					: undefined;
 			if (expected) {
 				const marker = await readEffectMarker(lifecycleMarkerPath(record.locator.stateRoot, id));
-				if (
-					marker &&
-					sameEffectMarker(marker, expected) &&
-					!(await removeOwnedLifecycleArtifacts(record.locator.stateRoot, id, expected))
-				)
-					return false;
+				if (marker && sameEffectMarker(marker, expected))
+					await removeOwnedLifecycleArtifacts(record.locator.stateRoot, id, expected);
 			}
 			if (!(await removeExactDeadSessionEndpoint(broker, id, record))) return false;
 			await broker.index.unregisterIfCurrent(registration);
@@ -3142,9 +3138,8 @@ function sameCloseAuthority(authority: CloseAuthority, record: CloseRecord, sess
 	);
 }
 
-function sameCloseProcessIdentity(expected: CloseRecord, current: CloseRecord & { live: boolean }): boolean {
+function sameCloseStoredProcessIdentity(expected: CloseRecord, current: CloseRecord): boolean {
 	return (
-		current.live &&
 		current.pid === expected.pid &&
 		typeof expected.processIncarnation === "string" &&
 		expected.processIncarnation.length > 0 &&
@@ -3155,6 +3150,10 @@ function sameCloseProcessIdentity(expected: CloseRecord, current: CloseRecord & 
 		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
 		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
 	);
+}
+
+function sameCloseProcessIdentity(expected: CloseRecord, current: CloseRecord & { live: boolean }): boolean {
+	return current.live && sameCloseStoredProcessIdentity(expected, current);
 }
 
 function sameCloseGeneration(expected: CloseRecord, current: CloseRecord & { live: boolean }): boolean {
@@ -3178,9 +3177,16 @@ async function revalidateCloseGeneration(
 ): Promise<BrokerResponse | undefined> {
 	await broker.index.refresh();
 	const current = broker.index.listSessions().sessions.find(session => session.sessionId === id);
-	return current &&
-		sameCloseGeneration(expected, current) &&
-		(!authority || sameCloseAuthority(authority, current, id))
+	if (
+		!authority &&
+		current &&
+		current.endpointGeneration === expected.endpointGeneration &&
+		sameCloseStoredProcessIdentity(expected, current)
+	) {
+		expected.endpointMtimeMs = current.endpointMtimeMs;
+		return undefined;
+	}
+	return authority && current && sameCloseGeneration(expected, current) && sameCloseAuthority(authority, current, id)
 		? undefined
 		: fail("endpoint_stale", "session endpoint is stale");
 }
@@ -3613,11 +3619,39 @@ async function executeLifecycleResponse(
 					timeoutMs: 2_000,
 					reconnectAttempts: 0,
 				});
-				const refreshedEndpointResult = await broker.handleRequest("session.get_endpoint", {
+				let refreshedEndpointResult = await broker.handleRequest("session.get_endpoint", {
 					sessionId: id,
 					endpointGeneration: record.endpointGeneration,
 				});
+				if (
+					!refreshedEndpointResult.ok &&
+					refreshedEndpointResult.error.code === "endpoint_stale" &&
+					!requestedAuthority.authority
+				) {
+					await broker.index.refresh();
+					const heartbeatRecord = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+					if (
+						heartbeatRecord &&
+						heartbeatRecord.endpointGeneration === record.endpointGeneration &&
+						sameCloseProcessIdentity(record, heartbeatRecord)
+					) {
+						record = heartbeatRecord;
+						refreshedEndpointResult = await broker.handleRequest("session.get_endpoint", {
+							sessionId: id,
+							endpointGeneration: record.endpointGeneration,
+						});
+					}
+				}
 				if (!refreshedEndpointResult.ok) return refreshedEndpointResult;
+				await broker.index.refresh();
+				const refreshedRecord = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+				if (
+					!refreshedRecord ||
+					refreshedRecord.endpointGeneration !== record.endpointGeneration ||
+					!sameCloseProcessIdentity(record, refreshedRecord)
+				)
+					return fail("endpoint_stale", "session endpoint is stale");
+				record = refreshedRecord;
 				const refreshedEndpoint = closeEndpoint(refreshedEndpointResult.result);
 				if (
 					!refreshedEndpoint ||
@@ -3657,12 +3691,19 @@ async function executeLifecycleResponse(
 		if (usedSignalFallback) {
 			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
 			if (stale) return stale;
-			if (!(await signalVerifiedSession(record, id, "SIGTERM", signalAuthority)))
-				return fail(
-					"close_refused",
-					"Session endpoint is unavailable and its durable process identity could not be verified.",
-				);
-			note = "Endpoint close was unreachable; sent SIGTERM to the durably identified session process.";
+			const exited =
+				typeof record.processIncarnation === "string" &&
+				observeProcess(record.pid, record.processIncarnation, value =>
+					processIncarnationForBroker(broker, value),
+				) === "exited";
+			if (!exited) {
+				if (!(await signalVerifiedSession(record, id, "SIGTERM", signalAuthority)))
+					return fail(
+						"close_refused",
+						"Session endpoint is unavailable and its durable process identity could not be verified.",
+					);
+				note = "Endpoint close was unreachable; sent SIGTERM to the durably identified session process.";
+			}
 		}
 
 		let closed = await waitForClose(broker, id, record, CLOSE_TIMEOUT_MS);
