@@ -264,6 +264,7 @@ function counterFromStats(stats: SessionMemoryStats): CounterEvidence {
 		indexWriteCalls: read(["indexWriteCalls", "indexWriteCount"]),
 		fsyncCount: read(["fsyncCount", "fsyncCalls"]),
 	};
+}
 
 function phaseEvidenceFromStats(stats: SessionMemoryStats[], wholeFork: PhaseMetric): ForkPhaseEvidence {
 	const evidence = emptyForkPhaseEvidence(wholeFork);
