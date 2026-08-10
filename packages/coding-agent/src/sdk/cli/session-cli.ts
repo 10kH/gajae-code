@@ -1,18 +1,16 @@
 import * as fs from "node:fs/promises";
-import { createInterface } from "node:readline/promises";
 import { getAgentDir } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
+import { SdkClientError } from "../client";
 import {
-	listSdkSessionEndpoints,
-	readSdkBrokerDiscovery,
-	readSdkSessionEndpoint,
-	SdkClient,
-	SdkClientError,
-	SdkDiscoveryError,
-} from "../client";
-import { validateAdapterControl } from "../protocol/adapter-validation";
+	createSessionLifecycleService,
+	type SessionLifecycleMutationRequest,
+	type SessionLifecycleOperation,
+} from "../lifecycle";
+import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { adapterDispositionError, findOperation, type OperationKind } from "../protocol/operation-registry";
+import { type SessionAttachment, SessionRouter, SessionRouterError } from "../router";
 
 export type SdkSessionCliAction = "list" | "control" | "query" | "global";
 
@@ -27,9 +25,6 @@ export interface SdkSessionCliArgs {
 	jsonInputStdin?: boolean;
 	confirm?: boolean;
 	cursor?: string;
-	showEndpointCredential?: boolean;
-	yes?: boolean;
-	repo?: string;
 	agentDir?: string;
 }
 
@@ -136,7 +131,12 @@ function cliOperationError(kind: OperationKind, operation: string): { code: stri
 	return error;
 }
 
-function isLifecycleOperation(operation: string): boolean {
+const DAEMON_CLI_LIFECYCLE_ACTOR = { id: "gjc-daemon-session-cli", namespace: "sdk:daemon-cli" } as const;
+const ROUTER_START_TIMEOUT_MS = 10_000;
+const ROUTER_STOP_TIMEOUT_MS = 5_000;
+type LifecycleMutationOperation = Exclude<SessionLifecycleOperation, "session.list">;
+
+function isLifecycleOperation(operation: string): operation is LifecycleMutationOperation {
 	return (
 		operation === "session.create" ||
 		operation === "session.fork" ||
@@ -146,48 +146,40 @@ function isLifecycleOperation(operation: string): boolean {
 	);
 }
 
-async function confirmEndpointCredentialOutput(): Promise<boolean> {
-	const prompt = createInterface({ input: process.stdin, output: process.stderr });
+async function bounded<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new SdkClientError("timeout", message)), timeoutMs);
+	});
 	try {
-		return (await prompt.question("Print the endpoint credential to stdout? [y/N] ")).trim().toLowerCase() === "y";
+		return await Promise.race([promise, timeout]);
 	} finally {
-		prompt.close();
+		if (timer) clearTimeout(timer);
 	}
 }
 
-async function connectBroker(agentDir: string): Promise<SdkClient> {
-	await ensureBroker({ agentDir });
-	const discovery = await readSdkBrokerDiscovery(agentDir);
-	if (!discovery) throw new SdkSessionCliError("broker_unavailable", "SDK broker discovery is unavailable.", 1);
-	return await SdkClient.connect(discovery.url, discovery.token);
+async function withRouter<T>(agentDir: string, action: (router: SessionRouter) => Promise<T>): Promise<T> {
+	const router = new SessionRouter({ agentDir });
+	try {
+		await bounded(router.start(), ROUTER_START_TIMEOUT_MS, "SDK session Router startup timed out.");
+		return await action(router);
+	} finally {
+		await bounded(router.stop(), ROUTER_STOP_TIMEOUT_MS, "SDK session Router shutdown timed out.");
+	}
 }
 
-async function connectSession(repo: string, sessionId: string): Promise<SdkClient> {
-	const endpoint = await readSdkSessionEndpoint(repo, sessionId);
-	if (!endpoint)
-		throw new SdkSessionCliError("session_unavailable", `SDK endpoint for session ${sessionId} is unavailable.`, 1);
-	return await SdkClient.connect(endpoint.url, endpoint.token);
-}
-
-function brokerAbsent(error: unknown): boolean {
-	if (error instanceof SdkSessionCliError) return error.code === "broker_unavailable";
-	const details = error instanceof SdkClientError ? error.details : error;
-	const code = (details as { code?: unknown } | undefined)?.code;
-	return (
-		code === "ENOENT" ||
-		code === "ECONNREFUSED" ||
-		/(?:ENOENT|ECONNREFUSED|connection refused)/i.test(error instanceof Error ? error.message : "")
-	);
-}
-
-async function paginatedSessionList(client: SdkClient, input: JsonRecord = {}): Promise<unknown> {
+async function paginatedSessionList(
+	router: SessionRouter,
+	input: JsonRecord = {},
+	requestKey = `${DAEMON_CLI_LIFECYCLE_ACTOR.namespace}:session.list`,
+): Promise<unknown> {
 	const aggregate: JsonRecord = {};
 	const sessions: unknown[] = [];
 	let firstResponse: JsonRecord | undefined;
 	let cursor: string | undefined;
 	for (let pageCount = 0; pageCount < MAX_SESSION_LIST_PAGES; pageCount++) {
 		const response = object(
-			await client.global("session.list", { ...input, ...(cursor === undefined ? {} : { cursor }) }),
+			await router.listBrokerSessions({ ...input, ...(cursor === undefined ? {} : { cursor }) }, requestKey),
 		);
 		firstResponse ??= response;
 		if (response?.ok === false) {
@@ -218,25 +210,9 @@ async function paginatedSessionList(client: SdkClient, input: JsonRecord = {}): 
 	throw new SdkClientError("protocol_error", "session.list exceeded the page budget.");
 }
 
-async function runList(repo: string, agentDir: string): Promise<unknown> {
-	try {
-		const client = await connectBroker(agentDir);
-		try {
-			return await paginatedSessionList(client);
-		} finally {
-			await client.close();
-		}
-	} catch (error) {
-		if (!brokerAbsent(error)) throw error;
-		const { endpoints, warnings } = await listSdkSessionEndpoints(repo);
-		return {
-			sessions: endpoints.map(({ sessionId, path }) => ({ sessionId, path })),
-			warnings: [
-				{ code: "broker_unavailable", message: "Listed endpoint files because the broker is unavailable." },
-				...warnings,
-			],
-		};
-	}
+async function runList(agentDir: string): Promise<unknown> {
+	await ensureBroker({ agentDir });
+	return await withRouter(agentDir, async router => await paginatedSessionList(router));
 }
 
 /** Runs the pure-SDK `gjc daemon session` command family. */
@@ -251,31 +227,24 @@ export async function runSdkSessionCli(
 		const action = args.action;
 		if (action !== "list" && action !== "control" && action !== "query" && action !== "global")
 			throw new SdkSessionCliError("usage", "Expected one of: list, control, query, global.", 2);
-		const repo = args.repo ?? process.cwd();
 		const agentDir = args.agentDir ?? getAgentDir();
 		if (action === "list") {
-			writeOutput(await runList(repo, agentDir));
+			writeOutput(await runList(agentDir));
 			return;
 		}
 		const operation = action === "query" ? requireValue(args.query, "--query") : requireValue(args.operation, "--op");
 		const kind: OperationKind = action === "query" ? "query" : action === "global" ? "global" : "control";
 		const dispositionError = cliOperationError(kind, operation);
 		if (dispositionError) throw new SdkSessionCliError(dispositionError.code, dispositionError.message, 1);
-		if (isEndpointOperation(operation)) {
-			if (!args.showEndpointCredential)
-				throw new SdkSessionCliError(
-					"endpoint_credential_forbidden",
-					"session.get_endpoint requires --show-endpoint-credential.",
-					1,
-				);
-			if (process.stdout.isTTY && !args.yes && !(await confirmEndpointCredentialOutput()))
-				throw new SdkSessionCliError(
-					"endpoint_credential_confirmation_required",
-					"Endpoint credential output was not confirmed.",
-					1,
-				);
-		}
+		if (isEndpointOperation(operation))
+			throw new SdkSessionCliError(
+				"endpoint_credential_forbidden",
+				"session.get_endpoint is not available through the ordinary CLI.",
+				1,
+			);
 		const input = await inputFromArgs(args);
+		const secretError = validateAdapterSecretFields(operation, input);
+		if (secretError) throw new SdkSessionCliError(secretError.code, secretError.message, 2);
 		if (kind === "control") {
 			const invalid = validateAdapterControl(operation, input);
 			if (invalid) throw new SdkSessionCliError(invalid.code, invalid.message, 2);
@@ -284,42 +253,69 @@ export async function runSdkSessionCli(
 			const idempotencyKey = args.idempotencyKey;
 			if (isLifecycleOperation(operation) && !idempotencyKey)
 				throw new SdkSessionCliError("invalid_input", "--idempotency-key is required for lifecycle operations.", 2);
-			const client = await connectBroker(agentDir);
-			try {
+			if (operation === "session.list") {
+				await ensureBroker({ agentDir });
+				writeOutput(
+					await withRouter(
+						agentDir,
+						async router =>
+							await paginatedSessionList(router, input, `${DAEMON_CLI_LIFECYCLE_ACTOR.namespace}:session.list`),
+					),
+				);
+			} else if (isLifecycleOperation(operation)) {
+				const lifecycleService = createSessionLifecycleService(agentDir);
 				const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
 				writeOutput(
-					await client.global(operation, input, {
-						idempotencyKey,
+					await lifecycleService.execute({
+						operation,
+						actor: DAEMON_CLI_LIFECYCLE_ACTOR,
+						capability: operation,
+						requestKey: idempotencyKey!,
+						target: input,
 						...(timeoutMs === undefined ? {} : { timeoutMs }),
-					}),
+					} as unknown as SessionLifecycleMutationRequest),
 				);
-			} finally {
-				await client.close();
 			}
 			return;
 		}
 		const sessionId = requireValue(args.sessionId, "<sessionId>");
-		const client = await connectSession(repo, sessionId);
-		try {
-			if (action === "control")
-				writeOutput(await client.control(operation, input, { confirm: args.confirm === true }));
-			else writeOutput(await client.query(operation, input, args.cursor));
-		} finally {
-			await client.close();
-		}
+		writeOutput(
+			await withRouter(agentDir, async router => {
+				const attachment: SessionAttachment | null = router.attachment(sessionId);
+				if (!attachment)
+					throw new SdkSessionCliError(
+						"session_unavailable",
+						`SDK session ${sessionId} is unavailable through the session Router.`,
+						1,
+					);
+				return await router.request(
+					sessionId,
+					action === "control"
+						? { type: "control_request", operation, input, confirm: args.confirm === true }
+						: {
+								type: "query_request",
+								query: operation,
+								input,
+								...(args.cursor === undefined ? {} : { cursor: args.cursor }),
+							},
+					attachment.generation,
+					attachment,
+				);
+			}),
+		);
 	} catch (error) {
 		const cliError =
 			error instanceof SdkSessionCliError
 				? error
-				: error instanceof SdkClientError
-					? new SdkSessionCliError(
-							error.code,
-							error.message,
-							1,
-							(error.details as { details?: unknown } | undefined)?.details,
-						)
-					: error instanceof SdkDiscoveryError
-						? new SdkSessionCliError(error.code, error.message, 1)
+				: error instanceof SessionRouterError
+					? new SdkSessionCliError(error.phase, error.message, 1)
+					: error instanceof SdkClientError
+						? new SdkSessionCliError(
+								error.code,
+								error.message,
+								1,
+								(error.details as { details?: unknown } | undefined)?.details,
+							)
 						: new SdkSessionCliError(
 								"operation_failed",
 								error instanceof Error ? error.message : "SDK operation failed.",

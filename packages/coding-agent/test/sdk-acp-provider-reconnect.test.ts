@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { AcpSdkAdapter } from "../src/sdk/acp";
+import { ACP_SESSION_RECONNECT, AcpSdkAdapter } from "../src/sdk/acp";
 import { SdkClient } from "../src/sdk/client";
 
 const waitFor = async <T>(read: () => T | undefined, label: string): Promise<T> => {
@@ -50,8 +50,7 @@ test("ACP provider reconnects after a server-side heartbeat disconnect, awaits h
 	};
 	start();
 	const adapter = new AcpSdkAdapter({
-		url: `ws://127.0.0.1:${port}`,
-		token: "token",
+		client: new SdkClient(`ws://127.0.0.1:${port}`, "token", { ...ACP_SESSION_RECONNECT }),
 		providers: [{ capability: "ui", definitions: [{ name: "select" }] }],
 		heartbeatMs: 10,
 	});
@@ -85,8 +84,6 @@ test("ACP reconnect exhaustion is observable as a typed rejection", async () => 
 	// adapter's typed-rejection propagation is still asserted without a 40s
 	// real-time wait in CI.
 	const adapter = new AcpSdkAdapter({
-		url: "ws://127.0.0.1:1",
-		token: "token",
 		providers: [{ capability: "ui", definitions: [] }],
 		client: new SdkClient("ws://127.0.0.1:1", "token", {
 			reconnectAttempts: 1,

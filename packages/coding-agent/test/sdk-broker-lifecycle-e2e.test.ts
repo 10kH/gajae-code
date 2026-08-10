@@ -13,6 +13,7 @@ import { Broker, type BrokerCleanupEvidence, type BrokerResponse } from "../src/
 import { brokerOwnerForTest, startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
 import {
+	canonicalDeleteLocatorPath,
 	deriveLifecycleDeadlines,
 	executeLifecycle,
 	hasValidLifecycleDeadlines,
@@ -126,6 +127,13 @@ function canonicalJson(value: unknown): string {
 		.sort()
 		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
 		.join(",")}}`;
+}
+function deleteRequestHash(request: Record<string, unknown>): string {
+	const cwd = canonicalDeleteLocatorPath(String(request.cwd));
+	const input = { ...request, cwd, stateRoot: path.join(cwd, ".gjc", "state") };
+	return createHash("sha256")
+		.update(canonicalJson({ operation: "session.delete", input }))
+		.digest("hex");
 }
 
 async function snapshotDeleteSurface(
@@ -1606,9 +1614,7 @@ test("broker replays an unmarked base metadata cleanup receipt and rejects a rep
 		const [stat, bytes] = await Promise.all([fs.stat(markerPath, { bigint: true }), fs.readFile(markerPath)]);
 		const target = createHash("sha256").update(canonicalJson({ sessionId })).digest("hex");
 		const identity = await deriveIdempotencyIdentity(agentDir, "session.delete", key, target);
-		const requestHash = createHash("sha256")
-			.update(canonicalJson({ operation: "session.delete", input: request }))
-			.digest("hex");
+		const requestHash = deleteRequestHash(request);
 		const ledger = await new LifecycleLedger(agentDir).open();
 		await ledger.begin(identity, requestHash);
 		await ledger.transition(identity, "effect_started", {
@@ -1789,9 +1795,7 @@ test("broker rejects a corrupt completed lifecycle cleanup receipt when its read
 		]);
 		const target = createHash("sha256").update(canonicalJson({ sessionId })).digest("hex");
 		const identity = await deriveIdempotencyIdentity(agentDir, "session.delete", key, target);
-		const requestHash = createHash("sha256")
-			.update(canonicalJson({ operation: "session.delete", input: request }))
-			.digest("hex");
+		const requestHash = deleteRequestHash(request);
 		const ledger = await new LifecycleLedger(agentDir).open();
 		await ledger.begin(identity, requestHash);
 		await ledger.transition(identity, "effect_started", {
@@ -2004,12 +2008,7 @@ test("broker rejects duplicate lifecycle marker replay authorities without unlin
 			createHash("sha256").update(canonicalJson({ sessionId })).digest("hex"),
 		);
 		const ledger = await new LifecycleLedger(agentDir).open();
-		await ledger.begin(
-			identity,
-			createHash("sha256")
-				.update(canonicalJson({ operation: "session.delete", input: request }))
-				.digest("hex"),
-		);
+		await ledger.begin(identity, deleteRequestHash(request));
 		const cleanupFile = (plannedPath: string) => ({
 			path: markerPath,
 			identity: {
@@ -2076,12 +2075,7 @@ test("broker rejects a ready-only lifecycle replay entry without marker authorit
 			createHash("sha256").update(canonicalJson({ sessionId })).digest("hex"),
 		);
 		const ledger = await new LifecycleLedger(agentDir).open();
-		await ledger.begin(
-			identity,
-			createHash("sha256")
-				.update(canonicalJson({ operation: "session.delete", input: request }))
-				.digest("hex"),
-		);
+		await ledger.begin(identity, deleteRequestHash(request));
 		await ledger.transition(identity, "effect_started", {
 			intendedSessionId: sessionId,
 			response: {
@@ -2156,12 +2150,7 @@ test("broker fails closed when a lifecycle ready sibling is swapped after marker
 			createHash("sha256").update(canonicalJson({ sessionId })).digest("hex"),
 		);
 		const ledger = await new LifecycleLedger(agentDir).open();
-		await ledger.begin(
-			identity,
-			createHash("sha256")
-				.update(canonicalJson({ operation: "session.delete", input: request }))
-				.digest("hex"),
-		);
+		await ledger.begin(identity, deleteRequestHash(request));
 		await ledger.transition(identity, "effect_started", {
 			intendedSessionId: sessionId,
 			response: {
@@ -3503,17 +3492,17 @@ test("ACP, MCP, and daemon global requests bootstrap a broker with zero sessions
 		expect(await acp.listSessions({})).toEqual({ sessions: [] });
 		expect(await readSdkBrokerDiscovery(agentDirs[0])).not.toBeNull();
 
-		const mcp = createSdkMcpServer({ repo: path.join(root, "mcp"), agentDir: agentDirs[1] });
+		const mcp = createSdkMcpServer({ agentDir: agentDirs[1] });
 		expect(await mcp.callTool("gjc_session_global", { operation: "session.list" })).toMatchObject({
 			ok: true,
 			result: { sessions: [] },
 		});
 		expect(await readSdkBrokerDiscovery(agentDirs[1])).not.toBeNull();
+		await mcp.close();
 
 		const output: unknown[] = [];
-		await runSdkSessionCli(
-			{ action: "global", operation: "session.list", agentDir: agentDirs[2], repo: path.join(root, "daemon") },
-			value => output.push(value),
+		await runSdkSessionCli({ action: "global", operation: "session.list", agentDir: agentDirs[2] }, value =>
+			output.push(value),
 		);
 		expect(output).toMatchObject([{ ok: true, result: { sessions: [] } }]);
 		expect(await readSdkBrokerDiscovery(agentDirs[2])).not.toBeNull();

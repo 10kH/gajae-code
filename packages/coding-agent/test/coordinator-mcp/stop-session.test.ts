@@ -88,7 +88,7 @@ async function createServer(
 		},
 		services: {
 			getAgentDir: () => agentDir,
-			connectSdk: async () =>
+			connectBroker: async () =>
 				({
 					global: async (
 						operation: string,

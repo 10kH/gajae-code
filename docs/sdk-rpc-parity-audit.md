@@ -122,11 +122,7 @@ user-perceived reduction. It is **REAL** across five dimensions:
    `workflow.gates.list` plus the Coordinator MCP pull loop can enumerate and
    answer durable workflow gates; they are not unattended negotiation
    (`docs/sdk.md §Coordinator MCP question pull loop`).
-2. **Reattach/registry — NOT implemented.** Define cross-process registry and
-   reattachment semantics. Partial equivalent only: discovery files at
-   `.gjc/state/sdk/<sessionId>.json` provide endpoint location and token for a
-   live session (`docs/sdk.md §Endpoint discovery`); architecture explicitly says there is no
-   shared upstream registry (`docs/sdk.md §Architecture`).
+2. **Reattachment semantics — implemented in SDK core.** `SessionRouter` exclusively resolves private endpoint publication, retains credentials, reconnects, replays, rotates transports, and issues exact opaque attachment capabilities. External adapters do not consume discovery files or raw endpoint credentials.
 3. **Full event stream — NOT implemented.** Define a renderer-grade session
    event contract only if consumers require it. Partial equivalent only:
    `action_needed`, `action_resolved`, `reply_rejected`, and optional threaded

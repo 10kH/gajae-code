@@ -67,8 +67,6 @@ export default class Daemon extends Command {
 		confirm: Flags.boolean({ description: "Confirm a destructive SDK control operation" }),
 		query: Flags.string({ description: "SDK query name" }),
 		cursor: Flags.string({ description: "SDK query continuation cursor" }),
-		"show-endpoint-credential": Flags.boolean({ description: "Allow session.get_endpoint secret output" }),
-		yes: Flags.boolean({ description: "Confirm endpoint credential output on a TTY" }),
 	};
 
 	async run(): Promise<void> {
@@ -93,8 +91,6 @@ export default class Daemon extends Command {
 				confirm: Boolean(flagRec.confirm),
 				idempotencyKey: flagRec["idempotency-key"] as string | undefined,
 				cursor: flagRec.cursor as string | undefined,
-				showEndpointCredential: Boolean(flagRec["show-endpoint-credential"]),
-				yes: Boolean(flagRec.yes),
 				agentDir: flagRec["agent-dir"] as string | undefined,
 			});
 			return;

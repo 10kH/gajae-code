@@ -31,6 +31,9 @@ export interface SessionRouterClient {
 	onReconnect?(handler: () => void): () => void;
 	connect?(): Promise<void>;
 	request(frame: Record<string, unknown>, options?: { timeoutMs?: number }): Promise<Record<string, unknown>>;
+	/** Current private transport connection identity; never exposed through SessionAttachment. */
+	readonly connectionId?: string;
+
 	close(): Promise<void>;
 	send(frame: Record<string, unknown>): void;
 }
@@ -176,6 +179,7 @@ export class SessionRouter {
 	readonly #correlateFrame: SessionRouterFrameCorrelator;
 	readonly #index: SessionIndex;
 	readonly #sessions = new Map<string, AttachedSession>();
+	readonly #adopted = new Map<string, { generation: number; attachment: SessionAttachment }>();
 	readonly #pending = new Set<Promise<void>>();
 	readonly #frameTails = new Map<string, Promise<void>>();
 	readonly #undelivered = new Map<string, { generation: number; seq: number; attempts: number }>();
@@ -230,6 +234,55 @@ export class SessionRouter {
 	reconcile(): Promise<void> {
 		return this.#serialReconcile(this.#runEpoch);
 	}
+	/** Ingests a credential-bearing Broker lifecycle result directly into Router custody. */
+	async adoptLifecycleResult(
+		value: unknown,
+		fallback: { sessionId: string; cwd: string; endpointGeneration?: number },
+	): Promise<SessionAttachment> {
+		const outer =
+			value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+		const result =
+			outer.result !== null && typeof outer.result === "object" && !Array.isArray(outer.result)
+				? (outer.result as Record<string, unknown>)
+				: outer;
+		const endpointValue = result.endpoint;
+		const endpointRecord =
+			endpointValue !== null && typeof endpointValue === "object" && !Array.isArray(endpointValue)
+				? (endpointValue as Record<string, unknown>)
+				: result;
+		const sessionId = typeof result.sessionId === "string" ? result.sessionId : fallback.sessionId;
+		if (
+			sessionId !== fallback.sessionId ||
+			typeof endpointRecord.url !== "string" ||
+			typeof endpointRecord.token !== "string"
+		)
+			throw new SessionRouterError("pre_send", "Broker lifecycle result omitted an exact session endpoint.");
+		const endpointGeneration = readGeneration(result.endpointGeneration) ?? fallback.endpointGeneration ?? 1;
+		const pid = readGeneration(endpointRecord.pid) ?? process.pid;
+		const indexed: IndexedSession = {
+			sessionId,
+			locator: {
+				repo: path.resolve(fallback.cwd),
+				stateRoot: path.join(path.resolve(fallback.cwd), ".gjc", "state"),
+			},
+			endpointGeneration,
+			pid,
+			endpointMtimeMs: Date.now(),
+			live: true,
+			indexSeq: Number.MAX_SAFE_INTEGER,
+		};
+		const attached = await this.#attach(
+			indexed,
+			this.#runEpoch,
+			{ sessionId, url: endpointRecord.url, token: endpointRecord.token, pid, path: "<broker-lifecycle>" },
+			true,
+		);
+		const capability = this.attachment(sessionId, endpointGeneration);
+		if (!attached || !capability)
+			throw new SessionRouterError("pre_send", "Broker session endpoint could not be attached.");
+		this.#adopted.set(sessionId, { generation: endpointGeneration, attachment: capability });
+		return capability;
+	}
 
 	async stop(): Promise<void> {
 		if (this.#stopTimer) this.#stopTimer();
@@ -247,6 +300,7 @@ export class SessionRouter {
 				(async () => await this.#deps.onSessionRemoved?.(attached.capability))(),
 			);
 		}
+		this.#adopted.clear();
 		const pending = Promise.allSettled([this.#reconcileTail, ...this.#pending, ...shutdownTasks]);
 		const outcome = await Promise.race([
 			pending.then(results => ({ kind: "settled" as const, results })),
@@ -271,6 +325,13 @@ export class SessionRouter {
 		if (expectedGeneration !== undefined && expectedGeneration !== attached.generation) return null;
 		return attached.capability;
 	}
+	#prepareFrame(attached: AttachedSession, frame: Record<string, unknown>): Record<string, unknown> {
+		const connectionId = attached.client.connectionId;
+		if (connectionId === undefined) return frame;
+		if (frame.connectionId !== undefined && frame.connectionId !== connectionId)
+			throw new SessionRouterError("pre_send", "SDK session transport identity changed before command dispatch.");
+		return { ...frame, connectionId };
+	}
 
 	/** Sends an SDK command through the current attachment without exposing its client. */
 	async request(
@@ -286,7 +347,14 @@ export class SessionRouter {
 			throw new SessionRouterError("pre_send", "SDK session endpoint changed before command dispatch.");
 		if (expectedAttachment !== undefined && attached.capability !== expectedAttachment)
 			throw new SessionRouterError("pre_send", "SDK session attachment changed before command dispatch.");
-		return await attached.client.request(frame);
+		const response = await attached.client.request(this.#prepareFrame(attached, frame));
+		if (
+			!this.#attachmentPublished(attached) ||
+			(expectedGeneration !== undefined && attached.generation !== expectedGeneration) ||
+			(expectedAttachment !== undefined && attached.capability !== expectedAttachment)
+		)
+			throw new SessionRouterError("ambiguous", "SDK session attachment changed while awaiting command response.");
+		return response;
 	}
 
 	/** Resolves the exact provider-neutral binding authority for operator adoption. */
@@ -426,6 +494,19 @@ export class SessionRouter {
 				: [];
 		const liveIds = new Set(live.map(session => session.sessionId));
 		const attachedIds = new Set<string>();
+		if (indexed.warnings.length === 0) {
+			for (const [sessionId, adopted] of this.#adopted) {
+				const indexedSession = live.find(session => session.sessionId === sessionId);
+				if (indexedSession?.endpointGeneration === adopted.generation) {
+					this.#adopted.delete(sessionId);
+					continue;
+				}
+				const attached = this.#sessions.get(sessionId);
+				if (attached?.capability !== adopted.attachment || !this.#attachmentPublished(attached)) continue;
+				liveIds.add(sessionId);
+				attachedIds.add(sessionId);
+			}
+		}
 		for (const session of live) {
 			if (!this.#running(runEpoch)) break;
 			try {
@@ -490,9 +571,14 @@ export class SessionRouter {
 		return endpoint;
 	}
 
-	async #attach(indexed: IndexedSession, runEpoch: number): Promise<boolean> {
+	async #attach(
+		indexed: IndexedSession,
+		runEpoch: number,
+		resolvedEndpoint?: SdkSessionEndpoint,
+		skipReplay = false,
+	): Promise<boolean> {
 		if (!this.#running(runEpoch)) return false;
-		const endpoint = await this.#readEndpoint(indexed);
+		const endpoint = resolvedEndpoint ?? (await this.#readEndpoint(indexed));
 		if (!this.#running(runEpoch)) return false;
 		if (!endpoint) return false;
 		const existing = this.#sessions.get(indexed.sessionId);
@@ -555,7 +641,7 @@ export class SessionRouter {
 				await this.#serialReconcile(runEpoch);
 				if (!attached || !this.#attachmentPublished(attached))
 					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
-				attached.client.send(frame);
+				attached.client.send(this.#prepareFrame(attached, frame));
 			},
 			retire: async () => {
 				if (attached) await this.#retireAttachment(attached);
@@ -634,6 +720,7 @@ export class SessionRouter {
 				}
 			throw error;
 		}
+		if (skipReplay) return true;
 		if (!(await this.#deliverRecoveredFrames(attached))) return false;
 		await this.#replayAttachment(attached, attached.cursor.seq);
 		return true;
@@ -666,6 +753,7 @@ export class SessionRouter {
 	}
 
 	async #retireAttachment(attached: AttachedSession): Promise<void> {
+		this.#adopted.delete(attached.sessionId);
 		if (this.#sessions.get(attached.sessionId) !== attached) return;
 		this.#sessions.delete(attached.sessionId);
 		attached.dispose();

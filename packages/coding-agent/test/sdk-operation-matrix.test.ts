@@ -1,5 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { CHAT_OPERATION_POLICY, sendAuthorizedChatOperation } from "../src/sdk/bus/chat-command-policy.js";
+import { dispatchControl } from "../src/sdk/host/control/dispatch.js";
+import type { ControlSurface } from "../src/sdk/host/control/operations.js";
+import { createSdkSurfacePolicy } from "../src/sdk/host/surface-policy.js";
 import { ADAPTERS, type AdapterDisposition, OPERATIONS } from "../src/sdk/protocol/operation-registry.js";
 
 type InventoryRow = {
@@ -204,5 +207,45 @@ describe("SDK operation matrix", () => {
 			expect(secretSends).toBe(0);
 			expect(JSON.stringify(secretResult)).not.toContain(secret);
 		}
+	});
+	it("removes Broker lifecycle controls from host surfaces before mutation", async () => {
+		const lifecycleOperations = [
+			"session.new",
+			"session.fork",
+			"session.resume",
+			"session.switch",
+			"session.branch",
+			"session.handoff",
+			"session.delete",
+		];
+		const policy = createSdkSurfacePolicy({ bindings: ["sdkControl"], workflowGateAvailable: false });
+		for (const operation of lifecycleOperations) expect(policy.installedControls.has(operation)).toBe(false);
+		expect(policy.installedControls.has("session.rename")).toBe(true);
+		expect(policy.installedControls.has("session.cwd.move")).toBe(true);
+		expect(policy.installedControls.has("session.close")).toBe(true);
+
+		let mutations = 0;
+		const surface = new Proxy(
+			{},
+			{
+				get: () => () => {
+					mutations++;
+				},
+			},
+		) as unknown as ControlSurface;
+		for (const operation of lifecycleOperations) {
+			const row = OPERATIONS.find(candidate => candidate.kind === "control" && candidate.sdkId === operation);
+			const response = await dispatchControl(surface, row, {
+				id: operation,
+				operation,
+				input: { id: "session-id", entryId: "entry-id", target: "target" },
+				confirm: true,
+			});
+			expect(response).toMatchObject({
+				ok: false,
+				error: { code: "operation_prohibited" },
+			});
+		}
+		expect(mutations).toBe(0);
 	});
 });

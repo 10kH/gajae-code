@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { NotificationServer } from "../../natives/native/index.js";
-import { AcpSdkAdapter } from "../src/sdk/acp";
+import { ACP_SESSION_RECONNECT, AcpSdkAdapter } from "../src/sdk/acp";
+import { SdkClient } from "../src/sdk/client";
 import { SessionSdkHost } from "../src/sdk/host";
 
 const waitFor = async <T>(read: () => T | undefined): Promise<T> => {
@@ -41,8 +42,14 @@ test("SDK-RPC-provider-conflict: real ACP clients race atomically for one provid
 	const endpoint = await server.start();
 	const winnerProvider = { capability: "ui", definitions: [{ name: "winner-select" }] };
 	const loserProvider = { capability: "ui", definitions: [{ name: "loser-select" }] };
-	const winner = new AcpSdkAdapter({ url: endpoint.url, token: "token", providers: [winnerProvider] });
-	const loser = new AcpSdkAdapter({ url: endpoint.url, token: "token", providers: [loserProvider] });
+	const winner = new AcpSdkAdapter({
+		client: new SdkClient(endpoint.url, "token", { ...ACP_SESSION_RECONNECT }),
+		providers: [winnerProvider],
+	});
+	const loser = new AcpSdkAdapter({
+		client: new SdkClient(endpoint.url, "token", { ...ACP_SESSION_RECONNECT }),
+		providers: [loserProvider],
+	});
 
 	try {
 		const settled = await Promise.allSettled([winner.start(), loser.start()]);

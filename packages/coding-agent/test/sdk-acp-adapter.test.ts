@@ -6,7 +6,7 @@ import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter, type AcpSdkAdapterError, acpMcpLaunchFailure } from "../src/sdk/acp";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
-import { SdkClientError } from "../src/sdk/client";
+import { SdkClient, SdkClientError } from "../src/sdk/client";
 import { MAX_REVERSE_PAYLOAD_BYTES } from "../src/sdk/host";
 
 class FakeSdkClient {
@@ -70,7 +70,7 @@ const waitFor = async (predicate: () => boolean, label: string): Promise<void> =
 
 test("ACP SDK adapter maps native and extension methods and keeps endpoint credentials machine-only", async () => {
 	const sdk = new FakeSdkClient();
-	const adapter = new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: sdk as never });
+	const adapter = new AcpSdkAdapter({ client: sdk as never });
 	await adapter.start();
 	await adapter.prompt({ prompt: "hello" });
 	await adapter.cancel();
@@ -94,7 +94,7 @@ test("ACP SDK adapter maps native and extension methods and keeps endpoint crede
 
 test("ACP generic routes honor provider, machine, and secret field dispositions", async () => {
 	const sdk = new FakeSdkClient();
-	const adapter = new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: sdk as never });
+	const adapter = new AcpSdkAdapter({ client: sdk as never });
 	await adapter.start();
 	await expect(adapter.handle("_gjc/sdk/control", { operation: "host_tools.register" })).rejects.toMatchObject({
 		code: "provider_required",
@@ -119,7 +119,7 @@ test("ACP generic routes honor provider, machine, and secret field dispositions"
 
 test("ACP SDK adapter exposes SDK event frames while rejecting raw lifecycle globals", async () => {
 	const sdk = new FakeSdkClient();
-	const adapter = new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: sdk as never });
+	const adapter = new AcpSdkAdapter({ client: sdk as never });
 	const received: Record<string, unknown>[] = [];
 	const unsubscribe = adapter.onFrame(frame => received.push(frame));
 	await adapter.start();
@@ -146,7 +146,7 @@ test("ACP SDK adapter exposes SDK event frames while rejecting raw lifecycle glo
 
 test("ACP SDK adapter forwards terminal reconnect failures to its session owner", async () => {
 	const sdk = new FakeSdkClient();
-	const adapter = new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: sdk as never });
+	const adapter = new AcpSdkAdapter({ client: sdk as never });
 	const failures: AcpSdkAdapterError[] = [];
 	adapter.onReconnectFailed(error => failures.push(error as AcpSdkAdapterError));
 	await adapter.start();
@@ -157,7 +157,7 @@ test("ACP SDK adapter forwards terminal reconnect failures to its session owner"
 });
 test("ACP lifecycle aliases forward caller idempotency keys outside operation input", async () => {
 	const sdk = new FakeSdkClient();
-	const adapter = new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: sdk as never });
+	const adapter = new AcpSdkAdapter({ client: sdk as never });
 	const aliases: Array<{ method: string; operation: string; input: Record<string, unknown> }> = [
 		{ method: "newSession", operation: "session.create", input: { cwd: "/workspace/new" } },
 		{ method: "loadSession", operation: "session.resume", input: { cwd: "/workspace/load", sessionId: "load" } },
@@ -193,8 +193,6 @@ test("ACP reverse dispatch requires exact current lease ownership and rejects in
 	const callbacks: Array<{ method: string; params: Record<string, unknown> }> = [];
 	const response = Promise.withResolvers<unknown>();
 	const adapter = new AcpSdkAdapter({
-		url: "ws://unused",
-		token: "secret",
 		client: sdk as never,
 		providers: [{ capability: "ui", definitions: [{ name: "select" }] }],
 		connection: {
@@ -261,8 +259,6 @@ test("ACP reverse responses reject an inner result below the cap when its frame 
 		),
 	).toBeGreaterThan(MAX_REVERSE_PAYLOAD_BYTES);
 	const adapter = new AcpSdkAdapter({
-		url: "ws://unused",
-		token: "secret",
 		client: sdk as never,
 		providers: [{ capability: "terminal", definitions: [] }],
 		connection: { request: async () => result },
@@ -299,8 +295,6 @@ test("ACP reverse cancellation remains terminal after its tombstone TTL while th
 	const callback = Promise.withResolvers<unknown>();
 	let cancellationSignal: AbortSignal | undefined;
 	const adapter = new AcpSdkAdapter({
-		url: "ws://unused",
-		token: "secret",
 		client: sdk as never,
 		providers: [{ capability: "ui", definitions: [{ name: "select" }] }],
 		reverseCancelTtlMs: 5,
@@ -336,8 +330,6 @@ test("ACP provider reclaim aborts reverse requests owned by the previous SDK con
 	const sdk = new FakeSdkClient();
 	let cancellationSignal: AbortSignal | undefined;
 	const adapter = new AcpSdkAdapter({
-		url: "ws://unused",
-		token: "secret",
 		client: sdk as never,
 		providers: [{ capability: "ui", definitions: [] }],
 		connection: {
@@ -393,8 +385,7 @@ test("ACP reverse cancellation and stale failures suppress responses over the re
 		},
 	});
 	const adapter = new AcpSdkAdapter({
-		url: `ws://127.0.0.1:${server.port}`,
-		token: "token",
+		client: new SdkClient(`ws://127.0.0.1:${server.port}`, "token"),
 		providers: [{ capability: "ui", definitions: [{ name: "select" }] }],
 		connection: { request: () => new Promise((resolve, reject) => pending.push({ resolve, reject })) },
 	});

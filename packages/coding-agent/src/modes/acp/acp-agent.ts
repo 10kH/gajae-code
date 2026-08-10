@@ -52,6 +52,7 @@ import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/cli
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-namespace";
 import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
+import { SessionRouter } from "../../sdk/router";
 import {
 	buildToolCallStartUpdate,
 	mapAgentSessionEventToAcpSessionUpdates,
@@ -129,6 +130,7 @@ type PendingAttachment = { epoch: number; task: Promise<void> };
 type SessionRecord = {
 	cwd: string;
 	adapter: AcpSdkAdapter;
+	router: SessionRouter;
 	closeIdempotencyKey: string;
 	unsubscribe: () => void;
 	reconnectUnsubscribe: () => void;
@@ -149,7 +151,6 @@ type SessionRecord = {
 	/** Set by `session/cancel` so an in-flight prompt settles as `cancelled`, never as an error. */
 	cancelRequested?: boolean;
 };
-type Endpoint = { url: string; token: string };
 
 type BrokerSession = {
 	sessionId: string;
@@ -272,15 +273,6 @@ export function paginateAcpSessions(
 		sessions,
 		nextCursor: offset + sessions.length < filtered.length ? String(offset + sessions.length) : undefined,
 	};
-}
-
-function endpoint(value: unknown): Endpoint {
-	const candidate = object(value);
-	const result = object(candidate?.result) ?? candidate;
-	const nested = object(result?.endpoint) ?? result;
-	if (typeof nested?.url !== "string" || typeof nested.token !== "string")
-		throw new AcpSdkAdapterError("unavailable", "SDK lifecycle response omitted a session endpoint.");
-	return { url: nested.url, token: nested.token };
 }
 
 function sessionId(value: unknown): string {
@@ -1152,7 +1144,7 @@ export class AcpAgent implements Agent {
 		const id = sessionId(result);
 		this.#knownSessionCwds.set(id, params.cwd);
 		try {
-			await this.#attach(id, params.cwd, endpoint(result));
+			await this.#attach(id, params.cwd, undefined, result);
 			await applyAcpStartupOptions(this.#adapter(id), this.#startupOptions);
 			const response = { sessionId: id, ...(await this.#sessionState(id, true)) };
 			this.#scheduleBootstrap(id);
@@ -1204,7 +1196,7 @@ export class AcpAgent implements Agent {
 		const id = sessionId(result);
 		this.#knownSessionCwds.set(id, params.cwd);
 		try {
-			await this.#attach(id, params.cwd, endpoint(result));
+			await this.#attach(id, params.cwd, undefined, result);
 			const response = { sessionId: id, ...(await this.#sessionState(id)) };
 			this.#scheduleBootstrap(id);
 			return response;
@@ -1668,9 +1660,7 @@ export class AcpAgent implements Agent {
 		if (indexed?.live) {
 			// A reconnect may repeat the client's MCP declaration. Attaching to the
 			// existing endpoint preserves the live host's immutable configuration.
-			const result = await this.#brokerEndpoint(id, indexed.endpointGeneration);
-			this.#assertSessionEpoch(id, epoch);
-			await this.#attach(id, cwd, endpoint(result), epoch);
+			await this.#attach(id, cwd, epoch);
 			return;
 		}
 
@@ -1689,7 +1679,7 @@ export class AcpAgent implements Agent {
 			mcpServers,
 		);
 		this.#assertSessionEpoch(id, epoch);
-		await this.#attach(id, cwd, endpoint(result), epoch);
+		await this.#attach(id, cwd, epoch, result);
 	}
 
 	async #scopedBrokerSession(id: string, cwd: string): Promise<BrokerSession | undefined> {
@@ -1708,7 +1698,7 @@ export class AcpAgent implements Agent {
 		return matches[0];
 	}
 
-	async #attach(id: string, cwd: string, discovered: Endpoint, epoch = this.#sessionEpoch(id)): Promise<void> {
+	async #attach(id: string, cwd: string, epoch = this.#sessionEpoch(id), lifecycleResult?: unknown): Promise<void> {
 		this.#assertSessionEpoch(id, epoch);
 		const existing = this.#sessions.get(id);
 		if (existing) {
@@ -1727,7 +1717,7 @@ export class AcpAgent implements Agent {
 			return;
 		}
 
-		const task = this.#attachEndpoint(id, cwd, discovered, epoch);
+		const task = this.#attachEndpoint(id, cwd, epoch, lifecycleResult);
 		const pending = { epoch, task };
 		this.#attaching.set(id, pending);
 		try {
@@ -1738,15 +1728,38 @@ export class AcpAgent implements Agent {
 		}
 	}
 
-	async #attachEndpoint(id: string, cwd: string, discovered: Endpoint, epoch: number): Promise<void> {
+	async #attachEndpoint(id: string, cwd: string, epoch: number, lifecycleResult?: unknown): Promise<void> {
 		let adapter: AcpSdkAdapter | undefined;
+		let router: SessionRouter | undefined;
 		try {
+			const bufferedFrames: Record<string, unknown>[] = [];
+			router = new SessionRouter({
+				agentDir: this.#agentDir,
+				deps: {
+					onAttachment: attachment => {
+						if (attachment.sessionId === id && adapter) adapter.acceptAttachment(attachment);
+					},
+					onFrame: (attachment, frame) => {
+						if (attachment.sessionId !== id) return;
+						if (adapter) adapter.acceptFrame(frame.body);
+						else bufferedFrames.push(frame.body);
+					},
+				},
+			});
+			await router.start();
+			const attachment = lifecycleResult
+				? await router.adoptLifecycleResult(lifecycleResult, { sessionId: id, cwd })
+				: router.attachment(id);
+			if (!attachment)
+				throw new AcpSdkAdapterError("unavailable", `ACP session ${id} has no current Router attachment.`);
 			adapter = await AcpSdkAdapter.connect({
-				url: discovered.url,
-				token: discovered.token,
+				router,
+				attachment,
+				sessionId: id,
 				connection: this.#reverseConnection(id),
 				providers: this.#providers(),
 			});
+			for (const frame of bufferedFrames) adapter.acceptFrame(frame);
 			let capabilities: JsonObject | undefined;
 			try {
 				const response = object(await adapter.query("runtime.capabilities"));
@@ -1764,6 +1777,7 @@ export class AcpAgent implements Agent {
 			const record: SessionRecord = {
 				cwd,
 				adapter,
+				router,
 				closeIdempotencyKey: randomUUID(),
 				unsubscribe: () => {},
 				reconnectUnsubscribe: () => {},
@@ -1795,6 +1809,9 @@ export class AcpAgent implements Agent {
 					await adapter.close();
 				} catch {}
 			}
+			try {
+				await router?.stop();
+			} catch {}
 			throw error;
 		}
 	}
@@ -1882,6 +1899,11 @@ export class AcpAgent implements Agent {
 			} catch (error) {
 				failures.push(error);
 			}
+			try {
+				await record?.router.stop();
+			} catch (error) {
+				failures.push(error);
+			}
 			if (closeRemote) {
 				const closeIdempotencyKey =
 					record?.closeIdempotencyKey ?? this.#pendingCloseIdempotencyKeys.get(id) ?? randomUUID();
@@ -1919,16 +1941,13 @@ export class AcpAgent implements Agent {
 		try {
 			await adapter.close();
 		} catch {}
+		try {
+			await record.router.stop();
+		} catch {}
 	}
 
 	async #brokerAdapter(): Promise<AcpSdkAdapter> {
 		return (await this.#brokerConnection()).adapter;
-	}
-
-	/** Machine-local endpoint lookup; never routed through ACP extension methods. */
-	async #brokerEndpoint(sessionId: string, endpointGeneration: number | undefined): Promise<unknown> {
-		const input = { sessionId, ...(endpointGeneration === undefined ? {} : { endpointGeneration }) };
-		return await (await this.#brokerConnection()).client.global("session.get_endpoint", input);
 	}
 
 	async #brokerConnection(): Promise<BrokerConnection> {
@@ -1939,7 +1958,7 @@ export class AcpAgent implements Agent {
 				const discovery = await readSdkBrokerDiscovery(this.#agentDir);
 				if (!discovery) throw new AcpSdkAdapterError("unavailable", "SDK broker discovery is unavailable.");
 				const client = await SdkClient.connect(discovery.url, discovery.token, { ...ACP_SESSION_RECONNECT });
-				const adapter = new AcpSdkAdapter({ url: discovery.url, token: discovery.token, client });
+				const adapter = new AcpSdkAdapter({ client });
 				adapter.onReconnectFailed(() => {
 					if (this.#broker === pending) this.#broker = undefined;
 					void adapter.close().catch(() => undefined);

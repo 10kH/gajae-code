@@ -20,6 +20,7 @@ import { lifecycleRequestTimeoutMs } from "../sdk/broker/startup-budget";
 import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
 import { SdkClient, SdkClientError } from "../sdk/client/client";
 import { readSdkBrokerDiscovery } from "../sdk/client/discovery";
+import { type SessionAttachment, SessionRouter, type SessionRouterDeps, SessionRouterError } from "../sdk/router";
 import {
 	type ActivatedPreparedSession,
 	requestPreparedSessionActivation,
@@ -176,7 +177,8 @@ interface RuntimeSessionStatePayload extends CoordinatorSessionState {
 }
 
 interface CoordinatorServices {
-	connectSdk?: (url: string, token: string) => Promise<SdkClient>;
+	connectBroker?: (url: string, token: string) => Promise<SdkClient>;
+	routerDeps?: SessionRouterDeps;
 	ensureBroker?: (settings: EnsureBrokerSettings) => Promise<BrokerDiscovery>;
 	readSdkBrokerDiscovery?: (agentDir: string) => Promise<BrokerDiscovery | null>;
 	getAgentDir?: () => string;
@@ -2393,6 +2395,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	const config = buildCoordinatorMcpConfig(env);
 	const promptAckTimeoutMs = boundedRuntimePromptAckTimeoutMs(env.GJC_COORDINATOR_MCP_PROMPT_ACK_TIMEOUT_MS);
 	const services = options.services ?? {};
+	const routerAgentDir = services.getAgentDir?.() ?? getAgentDir();
+	const router = new SessionRouter({ agentDir: routerAgentDir, deps: services.routerDeps });
+	let routerReady: Promise<void> | null = null;
+	async function ensureRouterReady(): Promise<void> {
+		routerReady ??= router.start().catch(error => {
+			routerReady = null;
+			throw error;
+		});
+		await routerReady;
+	}
 	const platform = options.platform ?? process.platform;
 	const loadModelProfiles = services.resolveModelProfiles ?? loadCoordinatorModelProfiles;
 	const namespaceDir = path.join(
@@ -2862,27 +2874,74 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		}
 	}
 
+	type CoordinatorSessionAttachment = {
+		sessionId: string;
+		generation: number;
+		attachment: SessionAttachment;
+	};
+
+	async function resolveSessionAttachment(session: Record<string, unknown>): Promise<CoordinatorSessionAttachment> {
+		const sessionId = optionalString(session.session_id) ?? optionalString(session.sessionId);
+		const generation =
+			typeof session.endpoint_generation === "number" &&
+			Number.isSafeInteger(session.endpoint_generation) &&
+			session.endpoint_generation > 0
+				? session.endpoint_generation
+				: null;
+		if (!sessionId || generation === null)
+			throw new SdkClientError("not_found", "Coordinator session has no usable endpoint generation.");
+		await ensureRouterReady();
+		await router.reconcile();
+		const attachment = router.attachment(sessionId, generation);
+		if (!attachment?.isCurrent())
+			throw new SdkClientError("endpoint_stale", "Coordinator session attachment is unavailable or stale.");
+		return { sessionId, generation, attachment };
+	}
+
+	function sdkResponse(response: Record<string, unknown>, operation: string): Record<string, unknown> {
+		if (response.ok !== true) {
+			const error = asRecord(response.error);
+			throw new SdkClientError(
+				typeof error?.code === "string" ? error.code : "unavailable",
+				typeof error?.message === "string" ? error.message : `SDK ${operation} request failed.`,
+			);
+		}
+		return response;
+	}
+
+	async function requestSessionFrame(
+		target: CoordinatorSessionAttachment,
+		frame: Record<string, unknown>,
+	): Promise<Record<string, unknown>> {
+		try {
+			return await router.request(target.sessionId, frame, target.generation, target.attachment);
+		} catch (error) {
+			if (error instanceof SessionRouterError)
+				throw new SdkClientError(
+					"endpoint_stale",
+					"Coordinator session attachment changed before request completion.",
+				);
+			throw error;
+		}
+	}
+
 	async function controlSession(
 		session: Record<string, unknown>,
 		operation: string,
 		input: Record<string, unknown>,
 		idempotencyKey: string,
 	): Promise<unknown> {
-		const endpoint = await resolveSessionEndpoint(session, idempotencyKey);
-		const client = await (services.connectSdk ?? ((url, token) => SdkClient.connect(url, token)))(
-			endpoint.url,
-			endpoint.token,
-		);
-		const isPromptOperation =
-			operation === "turn.prompt" || operation === "turn.follow_up" || operation === "turn.abort_and_prompt";
-		try {
-			return await client.control(operation, input, {
+		const target = await resolveSessionAttachment(session);
+		const response = asRecord(
+			await requestSessionFrame(target, {
+				type: "control_request",
+				operation,
+				input,
 				idempotencyKey,
-				...(isPromptOperation ? { timeoutMs: promptAckTimeoutMs } : {}),
-			});
-		} finally {
-			await client.close();
-		}
+			}),
+		);
+		if (response?.ok === false) sdkResponse(response, operation);
+		return response;
 	}
 
 	async function querySession(
@@ -2891,24 +2950,17 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		input: Record<string, unknown> = {},
 		cursor?: string,
 	): Promise<Record<string, unknown>> {
-		const endpoint = await resolveSessionEndpoint(session);
-		const client = await (services.connectSdk ?? ((url, token) => SdkClient.connect(url, token)))(
-			endpoint.url,
-			endpoint.token,
+		const target = await resolveSessionAttachment(session);
+		const response = asRecord(
+			await requestSessionFrame(target, {
+				type: "query_request",
+				query,
+				input,
+				...(cursor === undefined ? {} : { cursor }),
+			}),
 		);
-		try {
-			const response = asRecord(await client.query(query, input, cursor));
-			if (response?.ok !== true) {
-				const error = asRecord(response?.error);
-				throw new SdkClientError(
-					typeof error?.code === "string" ? error.code : "unavailable",
-					typeof error?.message === "string" ? error.message : `SDK ${query} query failed.`,
-				);
-			}
-			return response;
-		} finally {
-			await client.close();
-		}
+		if (!response) throw new SdkClientError("unavailable", `SDK ${query} query returned an invalid response.`);
+		return sdkResponse(response, query);
 	}
 
 	async function readCompleteQ12Snapshot(session: Record<string, unknown>): Promise<{
@@ -2923,19 +2975,22 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		let cursor: string | undefined;
 		let revision: string | null = null;
 		let bytes = 0;
-		let client: SdkClient;
+		let target: CoordinatorSessionAttachment;
 		try {
-			const endpoint = await resolveSessionEndpoint(session);
-			client = await (services.connectSdk ?? ((url, token) => SdkClient.connect(url, token)))(
-				endpoint.url,
-				endpoint.token,
-			);
+			target = await resolveSessionAttachment(session);
 		} catch {
 			return { items: [], revision, complete: false, reason: "query_unavailable" };
 		}
 		try {
 			for (let pageCount = 0; pageCount < 8 && Date.now() <= deadline; pageCount++) {
-				const response = asRecord(await client.query("Q12", {}, cursor));
+				const response = asRecord(
+					await requestSessionFrame(target, {
+						type: "query_request",
+						query: "Q12",
+						input: {},
+						...(cursor === undefined ? {} : { cursor }),
+					}),
+				);
 				if (response?.ok !== true) return { items: [], revision, complete: false, reason: "query_unavailable" };
 				const page = asRecord(response.page);
 				const pageItems = page?.items;
@@ -2976,8 +3031,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			return { items: [], revision, complete: false, reason: "pagination_malformed" };
 		} catch {
 			return { items: [], revision, complete: false, reason: "query_unavailable" };
-		} finally {
-			await client.close().catch(() => undefined);
 		}
 	}
 
@@ -3174,7 +3227,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 
 		let client: SdkClient;
 		try {
-			client = await (services.connectSdk ?? ((url, token) => SdkClient.connect(url, token)))(
+			client = await (services.connectBroker ?? ((url, token) => SdkClient.connect(url, token)))(
 				discovery.url,
 				discovery.token,
 			);
@@ -3317,123 +3370,29 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return { workspace: match.workspace, endpointGeneration, endpointIncarnation };
 	}
 
-	async function exactBrokerSessionBinding(
-		sessionId: string,
-		workspace: string,
-		idempotencyKey?: string,
-	): Promise<BrokerSessionAuthority & { endpoint: { url: string; token: string } }> {
-		const authority = await exactBrokerSessionAuthority(sessionId, workspace);
-		const endpointRecord = brokerResult(
-			await brokerSession(
-				workspace,
-				"session.get_endpoint",
-				{
-					sessionId,
-					endpointGeneration: authority.endpointGeneration,
-					endpointIncarnation: authority.endpointIncarnation,
-				},
-				idempotencyKey,
-			),
-		);
-		const url = optionalString(endpointRecord.url);
-		const token = optionalString(endpointRecord.token);
-		if (!url || !token)
-			throw new SdkClientError("endpoint_stale", "Broker returned an invalid incarnation-bound endpoint.");
-		return { ...authority, endpoint: { url, token } };
-	}
-
-	async function resolveSessionEndpoint(
-		session: Record<string, unknown>,
-		idempotencyKey?: string,
-	): Promise<{ url: string; token: string }> {
-		const sessionId = optionalString(session.session_id) ?? optionalString(session.sessionId);
-		const cwd = optionalString(session.cwd);
-		const persistedWorkspace = optionalString(session.broker_workspace);
-		const persistedGeneration =
-			typeof session.endpoint_generation === "number" &&
-			Number.isSafeInteger(session.endpoint_generation) &&
-			session.endpoint_generation > 0
-				? session.endpoint_generation
-				: null;
-		const persistedIncarnation = optionalString(session.endpoint_incarnation);
-		if (!sessionId || !cwd || !persistedWorkspace || persistedGeneration === null || !persistedIncarnation)
-			throw new SdkClientError("not_found", "Coordinator session has no incarnation-bound broker identity.");
-		const workspace = await canonicalBrokerWorkspace(cwd);
-		if (!sameCanonicalPath(workspace, persistedWorkspace, platform))
-			throw new SdkClientError("endpoint_stale", "Coordinator session workspace binding is stale.");
-		const binding = await exactBrokerSessionBinding(sessionId, workspace, idempotencyKey);
-		if (binding.endpointGeneration !== persistedGeneration || binding.endpointIncarnation !== persistedIncarnation)
-			throw new SdkClientError("endpoint_stale", "Coordinator session endpoint incarnation is stale.");
-		return binding.endpoint;
+	async function exactBrokerSessionBinding(sessionId: string, workspace: string): Promise<BrokerSessionAuthority> {
+		return await exactBrokerSessionAuthority(sessionId, workspace);
 	}
 
 	/**
-	 * The same incarnation-bound authority `resolveSessionEndpoint` requires,
-	 * plus the exact endpoint generation the activation frame has to name. A
-	 * session whose endpoint rolled or whose workspace binding drifted is refused
-	 * here, before any activation is attempted.
-	 */
-	async function resolveSessionActivationTarget(
-		session: Record<string, unknown>,
-		idempotencyKey?: string,
-	): Promise<{ endpoint: { url: string; token: string }; endpointGeneration: number }> {
-		const sessionId = optionalString(session.session_id) ?? optionalString(session.sessionId);
-		const cwd = optionalString(session.cwd);
-		const persistedWorkspace = optionalString(session.broker_workspace);
-		const persistedGeneration =
-			typeof session.endpoint_generation === "number" &&
-			Number.isSafeInteger(session.endpoint_generation) &&
-			session.endpoint_generation > 0
-				? session.endpoint_generation
-				: null;
-		const persistedIncarnation = optionalString(session.endpoint_incarnation);
-		if (!sessionId || !cwd || !persistedWorkspace || persistedGeneration === null || !persistedIncarnation)
-			throw new SdkClientError("not_found", "Coordinator session has no incarnation-bound broker identity.");
-		const workspace = await canonicalBrokerWorkspace(cwd);
-		if (!sameCanonicalPath(workspace, persistedWorkspace, platform))
-			throw new SdkClientError("endpoint_stale", "Coordinator session workspace binding is stale.");
-		const binding = await exactBrokerSessionBinding(sessionId, workspace, idempotencyKey);
-		if (binding.endpointGeneration !== persistedGeneration || binding.endpointIncarnation !== persistedIncarnation)
-			throw new SdkClientError("endpoint_stale", "Coordinator session endpoint incarnation is stale.");
-		return { endpoint: binding.endpoint, endpointGeneration: binding.endpointGeneration };
-	}
-
-	/**
-	 * Ask a prepared session to publish its withheld readiness.
-	 *
-	 * The Coordinator never writes a chat mapping and never fakes a readiness
-	 * signal: it proves exact endpoint authority, then delegates to the same
-	 * activation exchange the `gjc notify activate-thread` CLI uses. The session's
-	 * own activation gate remains the authority on whether a binding exists.
+	 * Ask a prepared session to publish its withheld readiness through the
+	 * Router-owned attachment. Endpoint credentials and SDK clients never leave
+	 * SessionRouter.
 	 */
 	async function activatePreparedCoordinatorSession(
 		session: Record<string, unknown>,
 		sessionId: string,
-		idempotencyKey: string,
+		_idempotencyKey: string,
 	): Promise<ActivatedPreparedSession> {
-		const target = await resolveSessionActivationTarget(session, idempotencyKey);
-		let client: SdkClient;
-		try {
-			client = await (services.connectSdk ?? ((url, token) => SdkClient.connect(url, token)))(
-				target.endpoint.url,
-				target.endpoint.token,
-			);
-		} catch {
-			// Nothing was sent, so no activation can have been applied.
-			throw new SessionActivationError("activation_unavailable", "The session endpoint could not be reached.");
-		}
-		try {
-			return await requestPreparedSessionActivation(
-				{
-					request: async frame => (await client.request(frame)) as Record<string, unknown>,
-					close: async () => await client.close(),
-				},
-				sessionId,
-				target.endpointGeneration,
-			);
-		} finally {
-			await client.close().catch(() => undefined);
-		}
+		const target = await resolveSessionAttachment(session);
+		return await requestPreparedSessionActivation(
+			{
+				request: async frame => await requestSessionFrame(target, frame),
+				close: async () => {},
+			},
+			sessionId,
+			target.generation,
+		);
 	}
 
 	async function listSessions(cwd?: string): Promise<Array<Record<string, unknown>>> {
@@ -4192,7 +4151,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						const creation = await claimProductionCreation(name, idempotencyKey, canonicalArgs);
 						if (creation.request.phase === "completed" && creation.request.safe_response)
 							return creation.request.safe_response;
-						const binding = await exactBrokerSessionBinding(sessionId, cwd, idempotencyKey);
+						const binding = await exactBrokerSessionBinding(sessionId, cwd);
 						const session = normalizeSession({
 							session_id: sessionId,
 							cwd,
@@ -4577,7 +4536,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 											message: "Coordinator session is bound to another workspace.",
 										},
 									};
-								const binding = await exactBrokerSessionBinding(sessionId, canonicalCwd, idempotencyKey);
+								const binding = await exactBrokerSessionBinding(sessionId, canonicalCwd);
 								if (
 									!sameCanonicalPath(
 										optionalString(existing.broker_workspace) ?? "",
@@ -4641,7 +4600,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									const createdCwd = await canonicalBrokerWorkspace(
 										optionalString(created.cwd) ?? canonicalCwd,
 									);
-									const binding = await exactBrokerSessionBinding(sessionId, createdCwd, idempotencyKey);
+									const binding = await exactBrokerSessionBinding(sessionId, createdCwd);
 									session = normalizeSession({
 										session_id: sessionId,
 										cwd: createdCwd,
@@ -4897,7 +4856,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							}
 							sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
 							const sessionCwd = await canonicalBrokerWorkspace(optionalString(created.cwd) ?? cwd);
-							const binding = await exactBrokerSessionBinding(sessionId, sessionCwd, idempotencyKey);
+							const binding = await exactBrokerSessionBinding(sessionId, sessionCwd);
 							session = normalizeSession({
 								session_id: sessionId,
 								cwd: sessionCwd,
@@ -5732,7 +5691,19 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return { jsonrpc: "2.0", id, error: { code: -32601, message: `unknown_method:${request.method}` } };
 	}
 
-	return { config, callTool, handleJsonRpc, handle: handleJsonRpc, reapSession, sessionReaper };
+	return {
+		config,
+		callTool,
+		handleJsonRpc,
+		handle: handleJsonRpc,
+		reapSession,
+		sessionReaper,
+		router,
+		close: async () => {
+			sessionReaper.stop();
+			await router.stop();
+		},
+	};
 }
 
 function legacyToolResult(payload: unknown): { content: Array<{ type: "text"; text: string }>; isError: boolean } {
@@ -5773,11 +5744,15 @@ export async function handleCoordinatorMcpRequest(
 	const params = (request.params ?? {}) as { name?: string; arguments?: Record<string, unknown> };
 	const args = params.arguments ?? {};
 	const server = createCoordinatorMcpServer({ env: options.env ?? process.env });
-	return {
-		jsonrpc: "2.0",
-		id: request.id ?? null,
-		result: legacyToolResult(await server.callTool(params.name ?? "", args)),
-	};
+	try {
+		return {
+			jsonrpc: "2.0",
+			id: request.id ?? null,
+			result: legacyToolResult(await server.callTool(params.name ?? "", args)),
+		};
+	} finally {
+		await server.close();
+	}
 }
 
 export interface PumpCoordinatorOptions {
@@ -6001,6 +5976,6 @@ export async function runCoordinatorMcpStdio(options: CoordinatorMcpServerOption
 			},
 		);
 	} finally {
-		server.sessionReaper.stop();
+		await server.close();
 	}
 }
