@@ -145,6 +145,8 @@
 			"types": "./src/sdk/bus/*.ts",
 			"import": "./src/sdk/bus/*.ts"
 		},
+		"./sdk/client": null,
+		"./sdk/client/*": null,
 		"./session/internal/*": null,
 		"./config/model-auth": null,
 		"./config/model-auth.js": null,
