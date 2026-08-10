@@ -4683,15 +4683,7 @@ export async function reapDeadSessionRegistrations(
 	const dead = broker.index.listSessions().sessions.filter(session => !session.live && !session.terminalUncertain);
 	const reaped: ReapedSessionRegistration[] = [];
 	for (const session of dead) {
-		await broker.index.append({
-			type: "host_unregistered",
-			sessionId: session.sessionId,
-			locator: session.locator,
-			endpointGeneration: session.endpointGeneration,
-			pid: session.pid,
-			...(session.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: session.endpointMtimeMs }),
-			...(session.lifecycleRequestId ? { lifecycleRequestId: session.lifecycleRequestId } : {}),
-		});
+		if (!(await broker.index.unregisterIfCurrent(session))) continue;
 		const record = {
 			sessionId: session.sessionId,
 			pid: session.pid,
