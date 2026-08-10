@@ -518,6 +518,35 @@ describe("managed descriptor reads", () => {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
+
+	it("reads bounded ranges and rejects a pathname swap before returning bytes", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-range-")));
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+		const transcript = path.join(root, "session.jsonl");
+		try {
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("0123456789\n"));
+			expect(Buffer.from(store.readRangeExpectedSync("session.jsonl", 2, 4).bytes).toString("utf8")).toBe("2345");
+
+			const readSync = fs.readSync;
+			const spy = vi.spyOn(fs, "readSync").mockImplementationOnce(((
+				fd: number,
+				buffer: NodeJS.ArrayBufferView,
+				offset: number,
+				length: number,
+				position: number | null,
+			) => {
+				const count = readSync(fd, buffer, offset, length, position);
+				fs.renameSync(transcript, `${transcript}.detached`);
+				fs.writeFileSync(transcript, "attacker\n", { mode: 0o600 });
+				return count;
+			}) as never);
+			expect(() => store.readRangeExpectedSync("session.jsonl", 0, 4)).toThrow("source_changed");
+			spy.mockRestore();
+		} finally {
+			store.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
 });
 
 describe.skipIf(process.platform !== "darwin")("authority-absent managed replacement", () => {

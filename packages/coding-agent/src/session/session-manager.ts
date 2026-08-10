@@ -186,6 +186,7 @@ import { type SessionManagerReadAccess, sessionManagerReadCapability } from "./s
 import type {
 	ManagedSessionSecurityContext,
 	SessionStorage,
+	SessionStorageRangeSnapshot,
 	SessionStorageSnapshot,
 	SessionStorageStat,
 	SessionStorageWriter,
@@ -199,7 +200,6 @@ import {
 	createSessionCommitMarkerCheckedSync,
 	FileSessionStorage,
 	MemorySessionStorage,
-	readSessionCommitMarkerSync,
 	replaceSessionCommitMarkerCheckedSync,
 	SESSION_RANGE_READ_MAX_BYTES,
 } from "./session-storage";
@@ -6357,6 +6357,9 @@ export class SessionManager {
 	#artifactManagerSessionFile: string | null = null;
 	#managedTranscriptStoreCache: { directory: string; store: ManagedSessionDescendantStore } | null = null;
 	#ownedManagedAuthority: ManagedSessionDescendantStore | undefined;
+	#managedSidecarCacheStore: EphemeralBlobStore | undefined;
+	#managedSidecarCacheSessionFile: string | undefined;
+	#boundedReadStorageProxy: SessionStorage | undefined;
 	// When set, take precedence over the lazily-derived per-session manager.
 	// Subagents adopt the parent's manager so artifact IDs are unique across the
 	// whole agent tree and all files land in the parent's artifacts dir.
@@ -6409,13 +6412,31 @@ export class SessionManager {
 		getTree: () => this.#getTree(freezeInternalReadSnapshot(this.#getMaterializedEntriesInternal())),
 	};
 
+	private readonly storage: SessionStorage;
+	readonly #managedSidecarFileStorage = new FileSessionStorage();
 	private constructor(
 		private cwd: string,
 		private sessionDir: string,
 		private readonly persist: boolean,
-		private readonly storage: SessionStorage,
+		storage: SessionStorage,
 		private destination: SessionDestination = explicitDestination(sessionDir),
 	) {
+		this.storage = new Proxy(storage, {
+			get: (target, property, receiver) => {
+				const value = Reflect.get(target, property, receiver);
+				if (typeof value !== "function") return value;
+				return (...args: unknown[]) => {
+					const first = args[0];
+					const operationTarget =
+						typeof first === "string" && this.#isManagedSidecarPath(first)
+							? this.#managedSidecarFileStorage
+							: target;
+					const operation = Reflect.get(operationTarget, property, operationTarget);
+					if (typeof operation !== "function") return operation;
+					return Reflect.apply(operation, operationTarget, args);
+				};
+			},
+		});
 		this.#blobStore = persist ? new BlobStore(getBlobsDir()) : this.#residentTextBlobStore;
 		this.#residentImageBlobStore = this.#blobStore;
 		if (persist && sessionDir) {
@@ -6982,7 +7003,7 @@ export class SessionManager {
 	async #tryInitSessionFileFromSidecar(sessionFile: string): Promise<boolean> {
 		if (
 			this.#sessionMemoryMode !== "enabled" ||
-			this.destination.kind === "managed" ||
+			(this.destination.kind === "managed" && process.platform === "win32") ||
 			typeof this.storage.readRangeSync !== "function"
 		)
 			return false;
@@ -7099,14 +7120,14 @@ export class SessionManager {
 			// only disables the fast path; the idx remains authoritative.
 			this.#adoptCommittedDictionary(commit.dictionary);
 			this.#adoptCommittedParentArtifact(commit.parentIndex);
-			const headerWindow = this.storage.readRangeSync(sessionFile, 0, Math.min(descriptor.size, 64 * 1024)).bytes;
+			const headerWindow = this.#readRangeSync(sessionFile, 0, Math.min(descriptor.size, 64 * 1024)).bytes;
 			const headerEnd = headerWindow.indexOf(10);
 			if (headerEnd < 0) return false;
 			const header = JSON.parse(Buffer.from(headerWindow.subarray(0, headerEnd)).toString("utf8")) as SessionHeader;
 			if (header.type !== "session" || header.version !== CURRENT_SESSION_VERSION) return false;
 			const hotEntries: SessionEntry[] = [];
 			for (const record of records) {
-				const line = this.storage.readRangeSync(sessionFile, record.byteOffset, record.byteLength).bytes;
+				const line = this.#readRangeSync(sessionFile, record.byteOffset, record.byteLength).bytes;
 				if (computeLineDigest(line) !== record.recordDigest) return false;
 				const entry = JSON.parse(Buffer.from(line).toString("utf8")) as SessionEntry;
 				if (entry.id !== record.id || entry.type !== record.type) return false;
@@ -7205,7 +7226,7 @@ export class SessionManager {
 	async #tryBoundedFirstOpen(sessionFile: string): Promise<boolean> {
 		if (
 			this.#sessionMemoryMode !== "enabled" ||
-			this.destination.kind === "managed" ||
+			(this.destination.kind === "managed" && process.platform === "win32") ||
 			typeof this.storage.readRangeSync !== "function"
 		)
 			return false;
@@ -7355,7 +7376,7 @@ export class SessionManager {
 		let latestCompactionBoundary: { firstKeptEntryId: string } | undefined;
 		let scannedBytes = 0;
 		const scanFailure = scanTranscriptLinesBounded(
-			this.storage,
+			this.#boundedReadStorage(),
 			sessionFile,
 			descriptor.size,
 			(lineStart, lineBytes) => {
@@ -7564,7 +7585,7 @@ export class SessionManager {
 			tailWriter = this.storage.openWriter(runtime.tailPath, { flags: "w" });
 			this.#truncateDerivedArtifactFiles(secondaryArtifactsEligible);
 			const scanFailure = scanTranscriptLinesBounded(
-				this.storage,
+				this.#boundedReadStorage(),
 				sessionFile,
 				descriptor.size,
 				(lineStart, lineBytes) => {
@@ -7823,7 +7844,7 @@ export class SessionManager {
 			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			return;
 		}
-		const eagerStat = this.storage.statSync(resolvedSessionFile);
+		const eagerStat = this.#statSync(resolvedSessionFile);
 		if (eagerStat.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES) throw new SessionTranscriptOversizedError(eagerStat.size);
 		const entries = await loadEntriesFromFile(resolvedSessionFile, this.storage);
 		if (entries.length === 0) {
@@ -9791,6 +9812,73 @@ export class SessionManager {
 		this.#managedTranscriptStoreCache = { directory: sessionDir, store };
 		return store;
 	}
+
+	#releaseManagedSidecarCache(): void {
+		this.#managedSidecarCacheStore?.dispose();
+		this.#managedSidecarCacheStore = undefined;
+		this.#managedSidecarCacheSessionFile = undefined;
+	}
+
+	#isManagedSidecarPath(candidate: string): boolean {
+		const root = this.#managedSidecarCacheStore?.dir;
+		if (!root) return false;
+		const resolvedRoot = path.resolve(root);
+		const resolvedCandidate = path.resolve(candidate);
+		return resolvedCandidate === resolvedRoot || resolvedCandidate.startsWith(`${resolvedRoot}${path.sep}`);
+	}
+	#managedSidecarRoot(sessionFile = this.#sessionFile): string | undefined {
+		if (this.destination.kind !== "managed" || !sessionFile || process.platform === "win32") return undefined;
+		if (this.#managedSidecarCacheStore && this.#managedSidecarCacheSessionFile === sessionFile)
+			return this.#managedSidecarCacheStore.dir;
+		this.#releaseManagedSidecarCache();
+		const instanceDir = openVerifiedResidentCacheInstanceDir(
+			getResidentCacheRootDir(this.#residentCacheProfileAgentDir()),
+		);
+		this.#managedSidecarCacheStore = EphemeralBlobStore.adoptVerifiedDir(instanceDir);
+		this.#managedSidecarCacheSessionFile = sessionFile;
+		return instanceDir;
+	}
+
+	#readRangeSync(filePath: string, start: number, length: number): SessionStorageRangeSnapshot {
+		if (
+			this.destination.kind === "managed" &&
+			this.#sessionFile &&
+			path.resolve(filePath) === path.resolve(this.#sessionFile)
+		) {
+			return this.#managedTranscriptStore(filePath).readRangeExpectedSync(path.basename(filePath), start, length);
+		}
+		if (!this.storage.readRangeSync) throw new Error("Session range reads are unavailable");
+		return this.storage.readRangeSync(filePath, start, length);
+	}
+
+	#statSync(filePath: string): SessionStorageStat {
+		if (
+			this.destination.kind === "managed" &&
+			this.#sessionFile &&
+			path.resolve(filePath) === path.resolve(this.#sessionFile)
+		) {
+			const descriptor = this.#managedTranscriptStore(filePath).descriptorExpected(path.basename(filePath));
+			if (!descriptor) throw Object.assign(new Error("Managed file not found"), { code: "ENOENT" });
+			return descriptor;
+		}
+		return this.storage.statSync(filePath);
+	}
+
+	#boundedReadStorage(): SessionStorage {
+		if (this.destination.kind !== "managed") return this.storage;
+		this.#boundedReadStorageProxy ??= new Proxy(this.storage, {
+			get: (target, property, receiver) => {
+				if (property === "readRangeSync") return this.#readRangeSync.bind(this);
+				if (property === "readRange")
+					return async (filePath: string, start: number, length: number) =>
+						this.#readRangeSync(filePath, start, length);
+				if (property === "statSync") return this.#statSync.bind(this);
+				const value = Reflect.get(target, property, receiver);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		return this.#boundedReadStorageProxy;
+	}
 	/**
 	 * Mutable commit-marker publication for managed destinations, executed inside the
 	 * persistence fence. The transcript is authoritative; the marker is disposable.
@@ -9805,8 +9893,7 @@ export class SessionManager {
 		if (!sessionFile) return false;
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled || runtime.tail.transcriptSize !== descriptor.size) return false;
-		const options =
-			this.destination.kind === "managed" ? { securityContext: this.destination.securityContext } : undefined;
+		const options = undefined;
 		return this.#withSessionPersistenceFenceSync(() => {
 			const markerPath = runtime.commitPath;
 			const gen = this.#commitGen + 1;
@@ -9875,22 +9962,31 @@ export class SessionManager {
 			};
 			const bytes = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
 			try {
-				const current =
-					this.destination.kind === "managed"
-						? readSessionCommitMarkerSync(this.storage, markerPath)
-						: !this.storage.existsSync(markerPath)
-							? ({ kind: "missing" } as const)
-							: (() => {
-									if (!this.storage.readRangeSync) throw new Error("commit_marker_range_read_unavailable");
-									const stat = this.storage.statSync(markerPath);
-									if (stat.size > 8 * 1024 * 1024) throw new Error("commit_marker_oversized");
-									const markerBytes = this.storage.readRangeSync(markerPath, 0, stat.size).bytes;
-									return {
-										kind: "present" as const,
-										rawBytesSha256: crypto.createHash("sha256").update(markerBytes).digest("hex"),
-										stat,
-									};
-								})();
+				if (this.destination.kind === "managed") {
+					const writer = this.storage.openWriter(markerPath, { flags: "w" });
+					try {
+						writer.writeLineSync(bytes.toString("utf8"));
+						if (!writer.fsyncSync) throw new Error("Synchronous commit marker fsync is unavailable");
+						writer.fsyncSync();
+					} finally {
+						writer.closeSync();
+					}
+					this.#commitGen = gen;
+					return true;
+				}
+				const current = !this.storage.existsSync(markerPath)
+					? ({ kind: "missing" } as const)
+					: (() => {
+							if (!this.storage.readRangeSync) throw new Error("commit_marker_range_read_unavailable");
+							const stat = this.storage.statSync(markerPath);
+							if (stat.size > 8 * 1024 * 1024) throw new Error("commit_marker_oversized");
+							const markerBytes = this.storage.readRangeSync(markerPath, 0, stat.size).bytes;
+							return {
+								kind: "present" as const,
+								rawBytesSha256: crypto.createHash("sha256").update(markerBytes).digest("hex"),
+								stat,
+							};
+						})();
 				if (current.kind === "missing") {
 					createSessionCommitMarkerCheckedSync(this.storage, markerPath, bytes, options);
 				} else {
@@ -9935,7 +10031,7 @@ export class SessionManager {
 	/** Create (or reset) the sidecar runtime for the current lifecycle. */
 	#resetSidecarRuntime(ineligible = false): SessionMemorySidecarRuntime {
 		this.#sidecarBranchActivationDirty = false;
-		if (this.#sessionFile) {
+		if (this.#sessionFile && this.destination.kind !== "managed") {
 			for (const legacyPath of [
 				`${this.#sessionFile}.spill.idx`,
 				`${this.#sessionFile}.spill.tail`,
@@ -9952,7 +10048,12 @@ export class SessionManager {
 				}
 			}
 		}
-		const sidecarRoot = this.#sessionFile?.endsWith(".jsonl") ? this.#sessionFile.slice(0, -6) : this.#sessionFile;
+		const sidecarRoot =
+			this.destination.kind === "managed"
+				? this.#managedSidecarRoot()
+				: this.#sessionFile?.endsWith(".jsonl")
+					? this.#sessionFile.slice(0, -6)
+					: this.#sessionFile;
 		const parentPathPrefix = sidecarRoot ? `${sidecarRoot}/.session-memory.spill.parent-` : "";
 		const dictionaryPathPrefix = sidecarRoot ? `${sidecarRoot}/.session-memory.spill.dict-part-` : "";
 		const dictionaryMetaPath = sidecarRoot ? `${sidecarRoot}/.session-memory.spill.dict-meta` : "";
@@ -10035,10 +10136,10 @@ export class SessionManager {
 
 	#transcriptContainsPatchRecords(): boolean {
 		if (!this.#sessionFile || typeof this.storage.readRangeSync !== "function") return true;
-		const readRangeSync = this.storage.readRangeSync.bind(this.storage);
+		const readRangeSync = this.#readRangeSync.bind(this);
 		let size: number;
 		try {
-			size = this.storage.statSync(this.#sessionFile).size;
+			size = this.#statSync(this.#sessionFile).size;
 		} catch {
 			return true;
 		}
@@ -10054,10 +10155,7 @@ export class SessionManager {
 
 	/** Build a fresh disposable `.spill.idx`/`.spill.tail`/`.spill.commit` set from the transcript. */
 	#buildDisposableSidecars(entries: readonly FileEntry[]): void {
-		if (this.destination.kind === "managed") {
-			// Retained managed authority does not expose bounded range or staged sidecar APIs.
-			// Keep managed sessions on the eager transcript path rather than publishing
-			// disposable proof through generic pathname-based storage operations.
+		if (this.destination.kind === "managed" && process.platform === "win32") {
 			this.#sidecarRuntime = undefined;
 			return;
 		}
@@ -10254,7 +10352,7 @@ export class SessionManager {
 		const secondaryArtifactsEligible =
 			enabledBuild &&
 			sessionEntries.length <= PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS &&
-			this.storage.statSync(this.#sessionFile).size <= PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES;
+			this.#statSync(this.#sessionFile).size <= PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES;
 		const partitionHashes = Array.from({ length: DICTIONARY_PARTITION_COUNT }, () => crypto.createHash("sha256"));
 		const partitionSizes = new Array<number>(DICTIONARY_PARTITION_COUNT).fill(0);
 		const partitionRecords = new Array<number>(DICTIONARY_PARTITION_COUNT).fill(0);
@@ -11604,7 +11702,7 @@ export class SessionManager {
 		try {
 			for (let offset = 0; offset < base.baseEndOffset; offset += 64 * 1024) {
 				const length = Math.min(64 * 1024, base.baseEndOffset - offset);
-				hash.update(this.storage.readRangeSync(sessionFile, offset, length).bytes);
+				hash.update(this.#readRangeSync(sessionFile, offset, length).bytes);
 				if (((offset + length) & (8 * 1024 * 1024 - 1)) === 0) Bun.gc(true);
 			}
 		} catch {
@@ -11913,7 +12011,7 @@ export class SessionManager {
 			return false;
 		if (firstOffset > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return false;
 		try {
-			const headerBytes = this.storage.readRangeSync(sessionFile, 0, firstOffset).bytes;
+			const headerBytes = this.#readRangeSync(sessionFile, 0, firstOffset).bytes;
 			const headerValid =
 				headerBytes.byteLength === firstOffset &&
 				headerBytes.at(-1) === 0x0a &&
@@ -11985,7 +12083,7 @@ export class SessionManager {
 		const first = result[0];
 		if (!first || first.byteOffset > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES || !this.#sessionFile)
 			throw new Error("cold_index_incomplete");
-		const headerBytes = this.storage.readRangeSync(this.#sessionFile, 0, first.byteOffset).bytes;
+		const headerBytes = this.#readRangeSync(this.#sessionFile, 0, first.byteOffset).bytes;
 		if (
 			headerBytes.byteLength !== first.byteOffset ||
 			headerBytes.at(-1) !== 0x0a ||
@@ -12003,21 +12101,12 @@ export class SessionManager {
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile) return undefined;
 		try {
-			if (typeof this.storage.readRangeSync === "function") {
-				const runtime = this.#sidecarRuntime;
-				if (runtime) runtime.rangeReadCount++;
-				const snapshot = this.storage.readRangeSync(sessionFile, index.byteOffset, index.byteLength);
-				return snapshot.bytes;
-			}
-			if (this.destination.kind === "managed") {
-				const snapshot = this.#managedTranscriptStore(sessionFile).readExpected(path.basename(sessionFile));
-				if (!snapshot) return undefined;
-				return snapshot.bytes.subarray(index.byteOffset, index.byteOffset + index.byteLength);
-			}
+			const runtime = this.#sidecarRuntime;
+			if (runtime) runtime.rangeReadCount++;
+			return this.#readRangeSync(sessionFile, index.byteOffset, index.byteLength).bytes;
 		} catch {
 			return undefined;
 		}
-		return undefined;
 	}
 
 	/** Rehydrate one cold entry back into the hot map (bounded by the entry cache). */
@@ -12157,7 +12246,7 @@ export class SessionManager {
 		let transcriptBytes: Uint8Array;
 		try {
 			runtime.rangeReadCount++;
-			transcriptBytes = this.storage.readRangeSync(this.#sessionFile, transcriptStart, transcriptLength).bytes;
+			transcriptBytes = this.#readRangeSync(this.#sessionFile, transcriptStart, transcriptLength).bytes;
 			if (transcriptBytes.byteLength !== transcriptLength) return undefined;
 		} catch {
 			return undefined;
@@ -12339,7 +12428,15 @@ export class SessionManager {
 
 	#hydrateAuthoritativeTranscriptSync(runtime: SessionMemorySidecarRuntime): void {
 		if (!this.#sessionFile) throw new Error("cold_transcript_unavailable");
-		const entries = parseSessionEntries(this.storage.readTextSync(this.#sessionFile));
+		const transcriptText =
+			this.destination.kind === "managed"
+				? (() => {
+						const snapshot = this.#managedTranscriptStore().readExpected(path.basename(this.#sessionFile!));
+						if (!snapshot) throw new Error("cold_transcript_unavailable");
+						return Buffer.from(snapshot.bytes).toString("utf8");
+					})()
+				: this.storage.readTextSync(this.#sessionFile);
+		const entries = parseSessionEntries(transcriptText);
 		const header = entries[0];
 		if (header?.type !== "session" || header.version !== CURRENT_SESSION_VERSION) {
 			throw new Error("cold_transcript_header_invalid");
@@ -12375,7 +12472,7 @@ export class SessionManager {
 			this.#hydrateAuthoritativeTranscriptSync(runtime);
 			return;
 		}
-		if (this.#sessionFile && this.storage.statSync(this.#sessionFile).size !== runtime.tail.transcriptSize) {
+		if (this.#sessionFile && this.#statSync(this.#sessionFile).size !== runtime.tail.transcriptSize) {
 			this.#hydrateAuthoritativeTranscriptSync(runtime);
 			return;
 		}
@@ -12610,7 +12707,7 @@ export class SessionManager {
 		try {
 			for (let offset = 0; offset < firstRecord.byteOffset; offset += 64 * 1024) {
 				const length = Math.min(64 * 1024, firstRecord.byteOffset - offset);
-				baseHash.update(this.storage.readRangeSync(sessionFile, offset, length).bytes);
+				baseHash.update(this.#readRangeSync(sessionFile, offset, length).bytes);
 			}
 			const base: BaseAnchor = { baseDigest: baseHash.digest("hex"), baseEndOffset: firstRecord.byteOffset };
 			const builder = new RollingTailChainBuilder(base);
@@ -13449,6 +13546,7 @@ export class SessionManager {
 		this.#byId.clear();
 		this.#labelsById.clear();
 		this.#resetMaterializedCaches();
+		this.#releaseManagedSidecarCache();
 	}
 
 	/** Close the persistent writer after flushing all pending data. */
@@ -13693,6 +13791,7 @@ export class SessionManager {
 				}
 			}
 			this.#sidecarRuntime = undefined;
+			this.#releaseManagedSidecarCache();
 			return;
 		}
 		if (mode === "shadow" && retainedColdRuntime) return;
@@ -15335,26 +15434,31 @@ export class SessionManager {
 
 	visitEntriesForExport(visitor: (entry: SessionEntry) => void): void {
 		if (this.#coldSidecarActive() && this.#sessionFile) {
-			const size = this.storage.statSync(this.#sessionFile).size;
-			const failure = scanTranscriptLinesBounded(this.storage, this.#sessionFile, size, (_offset, lineBytes) => {
-				try {
-					const record = JSON.parse(decodeBoundedJsonLine(lineBytes)) as FileEntry | SessionPatchRecord;
-					if (record.type === "session") return;
-					if (record.type === "header_patch" || record.type === "entry_patch") return false;
-					if (typeof record.id !== "string") return false;
-					visitor(
-						cloneSessionEntry(
-							rehydrateColdSpillEntry(
-								materializeResidentEntryForReadSync(record, this.#residentBlobStores(), new Map()),
-								this.#coldSpillReadStore(),
-								this.#residentBlobStoresForColdRehydrate(),
+			const size = this.#statSync(this.#sessionFile).size;
+			const failure = scanTranscriptLinesBounded(
+				this.#boundedReadStorage(),
+				this.#sessionFile,
+				size,
+				(_offset, lineBytes) => {
+					try {
+						const record = JSON.parse(decodeBoundedJsonLine(lineBytes)) as FileEntry | SessionPatchRecord;
+						if (record.type === "session") return;
+						if (record.type === "header_patch" || record.type === "entry_patch") return false;
+						if (typeof record.id !== "string") return false;
+						visitor(
+							cloneSessionEntry(
+								rehydrateColdSpillEntry(
+									materializeResidentEntryForReadSync(record, this.#residentBlobStores(), new Map()),
+									this.#coldSpillReadStore(),
+									this.#residentBlobStoresForColdRehydrate(),
+								),
 							),
-						),
-					);
-				} catch {
-					return false;
-				}
-			});
+						);
+					} catch {
+						return false;
+					}
+				},
+			);
 			if (failure) throw new Error(`export_transcript_scan_failed:${failure}`);
 			return;
 		}

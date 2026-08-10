@@ -5,6 +5,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getBlobsDir, logger, TempDir } from "@gajae-code/utils";
 import {
+	ManagedSessionDescendantStore,
+	managedDirectoryRoot,
+} from "../../src/session/internal/managed-session-storage";
+import {
 	DICTIONARY_PARTITION_COUNT,
 	dictionaryPartitionForId,
 	PARENT_CHILDREN_BUCKET_COUNT,
@@ -274,6 +278,157 @@ describe("SessionManager cold sidecar integration", () => {
 			tempDir.removeSync();
 		}
 	});
+
+	it("retires and lazily reloads managed TUI/review-session history through retained range authority", async () => {
+		const tempDir = TempDir.createSync("@pi-session-memory-managed-");
+		const cwd = path.join(tempDir.path(), "project");
+		const agentDir = path.join(tempDir.path(), "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const initial = SessionManager.create(cwd, destination, storage);
+		let coldId = "";
+		let firstKeptEntryId = "";
+		let sessionFile = "";
+		try {
+			initial.setSessionMemoryMode("enabled");
+			initial.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "published" }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+			});
+			for (let index = 0; index < 400; index++) {
+				const id = initial.appendMessage({
+					role: "user",
+					content: `managed-${index}-${"x".repeat(256)}`,
+					timestamp: Date.now(),
+				});
+				coldId ||= id;
+				firstKeptEntryId = id;
+			}
+			initial.appendCompaction("summary", undefined, firstKeptEntryId, 20_000);
+			sessionFile = initial.getSessionFile() ?? "";
+			expect(sessionFile).not.toBe("");
+			expect(initial.getSessionMemoryStats()).toMatchObject({
+				coldRetirementActive: true,
+				sidecarIneligible: false,
+			});
+			expect(initial.hotRetainedMessageCharsForTests()).toBeLessThan(1024);
+			expect(initial.getEntry(coldId)?.id).toBe(coldId);
+			const artifactsDir = initial.getArtifactsDir();
+			if (!artifactsDir) throw new Error("Expected managed artifacts directory");
+			const managedSidecars = fs.existsSync(artifactsDir)
+				? fs
+						.readdirSync(artifactsDir, { recursive: true })
+						.some(entry => String(entry).includes(".session-memory.spill"))
+				: false;
+			expect(managedSidecars).toBe(false);
+		} finally {
+			await initial.close();
+		}
+
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.managedDestination(cwd, agentDir, storage),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(reopened.getSessionMemoryStats()).toMatchObject({
+				coldRetirementActive: true,
+				sidecarRebuildCount: 1,
+			});
+			expect(reopened.getSessionMemoryStats().totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+			expect(reopened.hotRetainedMessageCharsForTests()).toBeLessThan(1024);
+			expect(reopened.getEntry(coldId)?.id).toBe(coldId);
+		} finally {
+			await reopened.close();
+			tempDir.removeSync();
+		}
+	}, 60_000);
+
+	it("retires nested managed review-subagent history without sidecars in the managed tree", async () => {
+		const tempDir = TempDir.createSync("@pi-session-memory-nested-managed-");
+		const cwd = path.join(tempDir.path(), "project");
+		const managedRoot = path.join(tempDir.path(), "managed");
+		const profileAgentDir = path.join(tempDir.path(), "agent-profile");
+		fs.mkdirSync(cwd, { recursive: true });
+		fs.mkdirSync(managedRoot, { recursive: true, mode: 0o700 });
+		const rootStore = new ManagedSessionDescendantStore(
+			managedDirectoryRoot(managedRoot),
+			managedRoot,
+			undefined,
+			undefined,
+			profileAgentDir,
+		);
+		rootStore.ensureDirectory("review");
+		const nestedStore = rootStore.deriveSubtree("review");
+		const manager = SessionManager.create(
+			cwd,
+			SessionManager.nestedManagedDestination(nestedStore, nestedStore.dir),
+			new FileSessionStorage(),
+		);
+		let coldId = "";
+		let firstKeptEntryId = "";
+		try {
+			manager.setSessionMemoryMode("enabled");
+			manager.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "published" }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+			});
+			for (let index = 0; index < 200; index++) {
+				const id = manager.appendMessage({
+					role: "user",
+					content: `review-${index}-${"x".repeat(256)}`,
+					timestamp: Date.now(),
+				});
+				coldId ||= id;
+				firstKeptEntryId = id;
+			}
+			manager.appendCompaction("summary", undefined, firstKeptEntryId, 10_000);
+			expect(manager.getSessionMemoryStats()).toMatchObject({
+				coldRetirementActive: true,
+				sidecarIneligible: false,
+			});
+			expect(manager.hotRetainedMessageCharsForTests()).toBeLessThan(1024);
+			expect(manager.getEntry(coldId)?.id).toBe(coldId);
+			expect(
+				fs
+					.readdirSync(managedRoot, { recursive: true })
+					.some(entry => String(entry).includes(".session-memory.spill")),
+			).toBe(false);
+		} finally {
+			await manager.close();
+			rootStore.close();
+			tempDir.removeSync();
+		}
+	}, 60_000);
 
 	it("fails closed when the authoritative cold prefix changes after shadow indexing", async () => {
 		const tempDir = TempDir.createSync("@pi-session-memory-mismatch-");
@@ -3434,7 +3589,7 @@ describe("sidecar I/O fallback", () => {
 });
 
 describe("managed session memory authority", () => {
-	it("keeps enabled managed sessions eager and sidecar-free", async () => {
+	it("retires managed history while keeping disposable sidecars outside managed authority", async () => {
 		const tempDir = TempDir.createSync("@pi-managed-memory-eager-");
 		const cwd = path.join(tempDir.path(), "workspace");
 		const agentDir = path.join(tempDir.path(), "agent");
@@ -3452,9 +3607,9 @@ describe("managed session memory authority", () => {
 			const appendedId = manager.appendMessage({ role: "user", content: "after", timestamp: 3 });
 			sessionFile = manager.getSessionFile()!;
 			expect(manager.getSessionMemoryStats()).toMatchObject({
-				sidecarEnabled: false,
-				coldRetirementActive: false,
-				lazyReopenSucceeded: false,
+				sidecarEnabled: true,
+				coldRetirementActive: true,
+				sidecarIneligible: false,
 			});
 			for (const kind of ["idx", "tail", "commit"] as const)
 				expect(fs.existsSync(sidecarPath(sessionFile, kind))).toBe(false);
@@ -3467,9 +3622,9 @@ describe("managed session memory authority", () => {
 			const reopened = await SessionManager.open(sessionFile, destination, undefined, "copy-retain", "enabled");
 			try {
 				expect(reopened.getSessionMemoryStats()).toMatchObject({
-					sidecarEnabled: false,
-					coldRetirementActive: false,
-					lazyReopenSucceeded: false,
+					sidecarEnabled: true,
+					coldRetirementActive: true,
+					sidecarRebuildCount: 1,
 				});
 				expect(reopened.getLabel(reopened.getEntries()[0]!.id)).toBe("managed label");
 				expect(reopened.buildSessionContext().messages).toHaveLength(3);
@@ -3831,7 +3986,7 @@ describe("persistent dictionary and metadata-delta artifacts", () => {
 		}
 	});
 
-	it("keeps managed sessions eager and sidecar-free of dictionary/delta artifacts", async () => {
+	it("keeps managed dictionary and delta acceleration outside the managed tree", async () => {
 		const tempDir = TempDir.createSync("@pi-managed-dict-exclusion-");
 		const cwd = path.join(tempDir.path(), "workspace");
 		const agentDir = path.join(tempDir.path(), "agent");
@@ -3848,7 +4003,7 @@ describe("persistent dictionary and metadata-delta artifacts", () => {
 			expect(fs.existsSync(metadataDeltaPathFor(sessionFile))).toBe(false);
 			for (let partition = 0; partition < DICTIONARY_PARTITION_COUNT; partition++)
 				expect(fs.existsSync(dictionaryPartitionPath(sessionFile, partition))).toBe(false);
-			expect(manager.getSessionMemoryStats().dictionaryArtifactEnabled).toBe(false);
+			expect(manager.getSessionMemoryStats().dictionaryArtifactEnabled).toBe(true);
 			expect(manager.getSessionMemoryStats().metadataDeltaDescriptorBytes).toBe(0);
 		} finally {
 			await manager.close();

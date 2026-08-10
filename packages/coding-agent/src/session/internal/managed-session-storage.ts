@@ -9,7 +9,7 @@ import type {
 	RecoveryFsIdentity,
 	RecoveryFsRoot,
 } from "@gajae-code/natives";
-import type { SessionStorageStat } from "../session-storage";
+import type { SessionStorageRangeSnapshot, SessionStorageStat } from "../session-storage";
 import {
 	classifyNativePublishOutcome,
 	formatNativePublishDiagnostic,
@@ -1476,6 +1476,102 @@ export class ManagedSessionDescendantStore {
 		}
 		if (!stat.identity) throw new Error("managed_stat_identity_unavailable");
 		return managedAppendReceiptFromIdentity(managedFileIdentityFromNative(stat.identity)).descriptor;
+	}
+
+	/**
+	 * Read one bounded range through a no-follow descriptor while binding the
+	 * opened file to retained authority (when available) and the managed root
+	 * before and after the read. This avoids whole-transcript capture for cold
+	 * managed-session indexing without weakening pathname authority.
+	 */
+	readRangeExpectedSync(relativePath: string, start: number, length: number): SessionStorageRangeSnapshot {
+		if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(length) || length < 0)
+			throw new RangeError("Invalid managed range read");
+		if (length > 64 * 1024 * 1024) throw new RangeError("Managed range read exceeds the bounded maximum");
+		this.#assertBound();
+		const rootBefore = fs.lstatSync(this.#baseDir, { bigint: true });
+		if (
+			!rootBefore.isDirectory() ||
+			rootBefore.isSymbolicLink() ||
+			rootBefore.dev !== this.#subtreeRoot.dev ||
+			rootBefore.ino !== this.#subtreeRoot.ino
+		)
+			throw new Error("Managed descendant root binding changed");
+		const resolved = this.#resolve(relativePath);
+		const relative = this.#relative(resolved);
+		const retained = this.#authority?.stat(relative);
+		if (retained && !retained.ok) {
+			if (retained.code === "not_found")
+				throw Object.assign(new Error("Managed file not found"), { code: "ENOENT" });
+			throw new Error(retained.code ?? "managed_stat_failed");
+		}
+		if (retained && !retained.identity) throw new Error("managed_stat_identity_unavailable");
+		const fd = fs.openSync(resolved, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+		try {
+			const before = fs.fstatSync(fd, { bigint: true });
+			if (!before.isFile() || before.nlink > 1n) throw new Error("source_changed");
+			if (retained?.identity) {
+				const expected = retained.identity;
+				if (
+					before.dev.toString() !== expected.dev ||
+					before.ino.toString() !== expected.ino ||
+					before.nlink.toString() !== expected.nlink ||
+					before.size.toString() !== expected.size ||
+					before.mtimeNs.toString() !== expected.mtimeNs ||
+					before.ctimeNs.toString() !== expected.ctimeNs
+				)
+					throw new Error("source_changed");
+			}
+			if (Number(before.size) < start + length) throw new Error("range_not_present");
+			const bytes = Buffer.alloc(length);
+			let offset = 0;
+			while (offset < length) {
+				const count = fs.readSync(fd, bytes, offset, length - offset, start + offset);
+				if (count === 0) throw new Error("range_not_present");
+				offset += count;
+			}
+			const after = fs.fstatSync(fd, { bigint: true });
+			const named = fs.lstatSync(resolved, { bigint: true });
+			if (
+				after.dev !== before.dev ||
+				after.ino !== before.ino ||
+				after.nlink !== before.nlink ||
+				after.size !== before.size ||
+				after.mtimeNs !== before.mtimeNs ||
+				after.ctimeNs !== before.ctimeNs ||
+				!named.isFile() ||
+				named.isSymbolicLink() ||
+				named.dev !== before.dev ||
+				named.ino !== before.ino ||
+				named.nlink !== before.nlink
+			)
+				throw new Error("source_changed");
+			const rootAfter = fs.lstatSync(this.#baseDir, { bigint: true });
+			if (
+				!rootAfter.isDirectory() ||
+				rootAfter.isSymbolicLink() ||
+				rootAfter.dev !== rootBefore.dev ||
+				rootAfter.ino !== rootBefore.ino
+			)
+				throw new Error("Managed descendant root binding changed");
+			this.#assertBound();
+			return {
+				bytes,
+				stat: {
+					dev: after.dev,
+					ino: after.ino,
+					nlink: after.nlink,
+					size: Number(after.size),
+					mtimeNs: after.mtimeNs,
+					ctimeNs: after.ctimeNs,
+					mtimeMs: Number(after.mtimeNs) / 1_000_000,
+					mtime: new Date(Number(after.mtimeNs) / 1_000_000),
+					isFile: true,
+				},
+			};
+		} finally {
+			fs.closeSync(fd);
+		}
 	}
 
 	/** Read an exact managed file without exposing its pathname as authority. */
