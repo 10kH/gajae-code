@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes callback-fence generation 126 at serving epoch 73", () => {
+test("publishes selected-ambiguity generation 127 at serving epoch 74", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 126 / serving epoch 73: stale callbacks cannot mutate successor retry state.
-	expect(DAEMON_GENERATION).toBe(126);
-	expect(SERVING_EPOCH).toBe(73);
+	// Generation 127 / serving epoch 74: accepted responses without message identity remain ambiguous.
+	expect(DAEMON_GENERATION).toBe(127);
+	expect(SERVING_EPOCH).toBe(74);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();

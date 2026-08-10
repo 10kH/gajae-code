@@ -188,8 +188,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 124 detaches restart tails and restores rejected rollback as replayable.
  * Generation 125 prevents stale run cleanup from deleting restarted attachments.
  * Generation 126 fences stale callback bookkeeping and distinguishes definitive rejection.
+ * Generation 127 keeps malformed accepted selected sends transport-ambiguous.
  */
-export const DAEMON_GENERATION = 126;
+export const DAEMON_GENERATION = 127;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -261,5 +262,6 @@ export const DAEMON_GENERATION = 126;
  * Epoch 71 restores bounded Router restart and rejected publication replay.
  * Epoch 72 identity-fences provider cleanup after bounded restart.
  * Epoch 73 preserves successor retry state and ambiguous dispatched cleanup.
+ * Epoch 74 prevents replay after accepted responses lacking message identity.
  */
-export const SERVING_EPOCH = 73;
+export const SERVING_EPOCH = 74;

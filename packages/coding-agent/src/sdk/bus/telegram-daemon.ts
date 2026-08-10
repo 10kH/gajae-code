@@ -8518,15 +8518,20 @@ export class TelegramNotificationDaemon {
 					}
 					const messageId = telegramMessageId(response);
 					const delivered = messageId !== undefined;
+					const definitiveRejected = outcome.kind === "rejected";
 					this.finishSelectedAck(
 						selectedAck,
-						delivered ? { status: "delivered", messageId } : { status: "failed", reason: "telegram_rejected" },
+						delivered
+							? { status: "delivered", messageId }
+							: definitiveRejected
+								? { status: "failed", reason: "telegram_rejected" }
+								: { status: "unknown", reason: "transport_ambiguous" },
 					);
-					this.pool.settle(item.itemId!, delivered ? "accepted" : "rejected");
+					this.pool.settle(item.itemId!, delivered ? "accepted" : definitiveRejected ? "rejected" : "ambiguous");
 					if (item.payload.publicationId) {
 						try {
 							if (delivered) await this.markPublicationDelivered(item.payload.publicationId);
-							else await this.markPublicationRejected(item.payload.publicationId, true);
+							else if (definitiveRejected) await this.markPublicationRejected(item.payload.publicationId, true);
 							this.deferredPublications.delete(item.payload.publicationId);
 						} catch (error) {
 							this.rejectPublicationSettlement(item.payload.publicationId, error);
