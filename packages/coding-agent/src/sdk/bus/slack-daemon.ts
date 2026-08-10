@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { logger } from "@gajae-code/utils";
 import { SdkClientError } from "../client/client";
 import { type SessionAttachment, SessionRouterError } from "../router";
 
@@ -183,7 +184,9 @@ export class SlackNotificationDaemon {
 
 	readonly #inflightInbound = new Set<string>();
 	readonly #activeWork = new Set<Promise<unknown>>();
+	readonly #workInvalidators = new Set<() => Promise<void>>();
 	readonly #rollovers = new Map<string, Promise<SlackRootPublication>>();
+	#workGeneration = 0;
 	#lifecycleTail: Promise<void> = Promise.resolve();
 	#lifecycleGeneration = 0;
 	#startedGeneration: number | undefined;
@@ -292,11 +295,30 @@ export class SlackNotificationDaemon {
 			// Calling provider.stop() before joining the lifecycle queue lets a provider
 			// cancel an open that resolves only after its socket is stopped.
 			if (providerStop) await providerStop;
-			// Drain until quiescent: a tracked task can schedule further tracked work
-			// (recovery/reconciliation) while we await, and any that outlives stop() would
-			// bleed timing pressure into the next daemon/test. #started is already false,
-			// so no new lease-recovery timers can be armed and the loop terminates.
-			while (this.#activeWork.size > 0) await Promise.all([...this.#activeWork]);
+			// Drain until quiescent, but never let a hung provider request prevent
+			// SessionRouter authority revocation and daemon ownership release.
+			const drainDeadline = this.#now() + 5_000;
+			while (this.#activeWork.size > 0) {
+				const remaining = drainDeadline - this.#now();
+				if (remaining <= 0) {
+					await this.#invalidateActiveWork();
+					logger.warn(
+						"Slack provider work exceeded the 5000ms shutdown drain; continuing with Router revocation.",
+					);
+					return;
+				}
+				const settled = await Promise.race([
+					Promise.allSettled([...this.#activeWork]).then(() => true),
+					Bun.sleep(remaining).then(() => false),
+				]);
+				if (!settled) {
+					await this.#invalidateActiveWork();
+					logger.warn(
+						"Slack provider work exceeded the 5000ms shutdown drain; continuing with Router revocation.",
+					);
+					return;
+				}
+			}
 		});
 		this.#stopOperation = operation;
 		try {
@@ -348,6 +370,11 @@ export class SlackNotificationDaemon {
 	#track<T>(work: Promise<T>): Promise<T> {
 		this.#activeWork.add(work);
 		return work.finally(() => this.#activeWork.delete(work));
+	}
+
+	async #invalidateActiveWork(): Promise<void> {
+		this.#workGeneration += 1;
+		await Promise.allSettled([...this.#workInvalidators].map(invalidate => invalidate()));
 	}
 
 	#enqueueLifecycle<T>(operation: () => Promise<T>): Promise<T> {
@@ -570,6 +597,16 @@ export class SlackNotificationDaemon {
 		endpointGeneration?: number,
 		publicationId?: string,
 	): Promise<SlackConversation> {
+		return await this.#track(this.#notify(sessionId, body, actionId, endpointGeneration, publicationId));
+	}
+
+	async #notify(
+		sessionId: string,
+		body: string,
+		actionId?: string,
+		endpointGeneration?: number,
+		publicationId?: string,
+	): Promise<SlackConversation> {
 		const endpoint = await this.#resolveAttachment(sessionId);
 		if (!endpoint || (endpointGeneration !== undefined && endpoint.generation !== endpointGeneration))
 			throw new SlackEndpointBindingError("Slack notification requires the current session endpoint.");
@@ -725,6 +762,10 @@ export class SlackNotificationDaemon {
 
 	/** Posts a safe command outcome to the active mapped root thread. */
 	async postCommandResult(sessionId: string, content: string): Promise<boolean> {
+		return await this.#track(this.#postCommandResult(sessionId, content));
+	}
+
+	async #postCommandResult(sessionId: string, content: string): Promise<boolean> {
 		const found = await this.findSession(sessionId, false);
 		if (found?.record.state !== "active" || !found.record.rootTs) return false;
 		const generation = this.#requireEndpointGeneration(found.record);
@@ -779,6 +820,15 @@ export class SlackNotificationDaemon {
 	}
 
 	async resume(
+		sessionId: string,
+		body: string,
+		endpointGeneration?: number,
+		publicationId?: string,
+	): Promise<SlackConversation> {
+		return await this.#track(this.#resume(sessionId, body, endpointGeneration, publicationId));
+	}
+
+	async #resume(
 		sessionId: string,
 		body: string,
 		endpointGeneration?: number,
@@ -1153,20 +1203,48 @@ export class SlackNotificationDaemon {
 	}
 
 	async #withEffectLease<T>(id: string, lease: ChatEffectLease, operation: () => Promise<T>): Promise<T> {
-		// The effect was just claimed, so its lease is current. The periodic renewal
-		// still protects the external operation without another durable write first.
-		return await this.#withRenewal(
-			operation,
-			async () => {
-				if (
-					!(await this.#rescheduleAfterEffectTransition(
-						this.#journal.renew(id, lease, Math.max(this.#publicationLeaseMs, 100)),
-					))
-				)
-					throw new Error("Slack effect lease renewal failed");
-			},
-			false,
-		);
+		const workGeneration = this.#workGeneration;
+		let invalidation: Promise<void> | undefined;
+		let invalidated = false;
+		const invalidate = async (): Promise<void> => {
+			invalidated = true;
+			invalidation ??= this.#rescheduleAfterEffectTransition(
+				this.#journal.record(id, lease, "uncertain", { status: "shutdown_timeout" }),
+			).then(() => undefined);
+			await invalidation;
+		};
+		this.#workInvalidators.add(invalidate);
+		const ensureLive = async (): Promise<void> => {
+			if (invalidated || workGeneration !== this.#workGeneration) {
+				await invalidate();
+				throw new Error(`Slack effect ${id} was admitted after shutdown drain expiry`);
+			}
+			if (
+				!(await this.#rescheduleAfterEffectTransition(
+					this.#journal.renew(id, lease, Math.max(this.#publicationLeaseMs, 100)),
+				))
+			)
+				throw new Error("Slack effect lease renewal failed");
+			if (workGeneration !== this.#workGeneration) {
+				await invalidate();
+				throw new Error(`Slack effect ${id} lost its shutdown fence`);
+			}
+		};
+		try {
+			await ensureLive();
+			const result = await this.#withRenewal(
+				async () => {
+					await ensureLive();
+					return await operation();
+				},
+				ensureLive,
+				false,
+			);
+			await ensureLive();
+			return result;
+		} finally {
+			this.#workInvalidators.delete(invalidate);
+		}
 	}
 
 	async #drainPendingDispatches(): Promise<void> {
@@ -1915,6 +1993,7 @@ export class SlackNotificationDaemon {
 	): Promise<SlackPostedMessage> {
 		if (!Number.isSafeInteger(endpointGeneration) || endpointGeneration <= 0)
 			throw new SlackEndpointBindingError("Slack provider effects require a positive endpoint generation.");
+		const workGeneration = this.#workGeneration;
 		const initial = await this.#rescheduleAfterEffectTransition(
 			this.#journal.enqueue({
 				id,
@@ -1973,10 +2052,12 @@ export class SlackNotificationDaemon {
 					clientMsgId: effect!.payload.clientMsgId,
 				});
 				if (found) return found;
+				if (workGeneration !== this.#workGeneration) throw new Error(`Slack effect ${id} lost its shutdown fence`);
 				if (!(await this.#providerEffectCurrent(effect!))) {
 					if (requiresReconciliation) throw new SlackReconciledAbsentEffectError();
 					throw new SlackStaleEffectError();
 				}
+				if (workGeneration !== this.#workGeneration) throw new Error(`Slack effect ${id} lost its shutdown fence`);
 				return await this.options.provider.postMessage(effect!.payload);
 			});
 
@@ -2083,7 +2164,18 @@ export class SlackNotificationDaemon {
 	}
 
 	async #withPublicationLease<T>(operation: () => Promise<T>, renew: () => Promise<void>): Promise<T> {
-		return await this.#withRenewal(operation, renew);
+		const workGeneration = this.#workGeneration;
+		const fencedRenew = async (): Promise<void> => {
+			if (workGeneration !== this.#workGeneration) throw new Error("Slack publication lost its shutdown fence");
+			await renew();
+			if (workGeneration !== this.#workGeneration) throw new Error("Slack publication lost its shutdown fence");
+		};
+		const result = await this.#withRenewal(async () => {
+			if (workGeneration !== this.#workGeneration) throw new Error("Slack publication lost its shutdown fence");
+			return await operation();
+		}, fencedRenew);
+		if (workGeneration !== this.#workGeneration) throw new Error("Slack publication lost its shutdown fence");
+		return result;
 	}
 
 	async #withRenewal<T>(

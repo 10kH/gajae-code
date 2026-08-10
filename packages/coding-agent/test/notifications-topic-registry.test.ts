@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes serialized-invalidation generation 133 at serving epoch 80", () => {
+test("publishes definitive-rejection generation 134 at serving epoch 81", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 133 / serving epoch 80: late Discord admissions are terminalized after drain expiry.
-	expect(DAEMON_GENERATION).toBe(133);
-	expect(SERVING_EPOCH).toBe(80);
+	// Generation 134 / serving epoch 81: definitive provider rejection remains replayable after persistence failure.
+	expect(DAEMON_GENERATION).toBe(134);
+	expect(SERVING_EPOCH).toBe(81);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();

@@ -4,7 +4,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "../src/config/settings";
 import { daemonPaths } from "../src/sdk/bus/daemon-paths";
-import { DAEMON_GENERATION, hasSafeDaemonStateShape, TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
+import {
+	DAEMON_GENERATION,
+	hasSafeDaemonStateShape,
+	type TelegramDaemonFs,
+	TelegramNotificationDaemon,
+} from "../src/sdk/bus/telegram-daemon";
 import type { AgentDirSessionLifecycleService } from "../src/sdk/lifecycle/client";
 
 const BOT_TOKEN = "1234567890:ABCDEFghijkLmnOpQrsTuvWxYz012345678";
@@ -165,6 +170,73 @@ describe("Telegram provider supervisor ownership", () => {
 			const restartedOversized = makeHarness();
 			await restartedOversized.loadPresentationState();
 			expect(restartedOversized.publicationShouldSuppress("oversized:67:0")).toBe(false);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test("replays an explicitly rejected publication after rejection persistence failure", async () => {
+		const agentDir = tempAgentDir();
+		let persistenceFailures = 0;
+		const durableFs = {
+			...fs.promises,
+			writeFile: async (file: string, data: string, options?: fs.WriteFileOptions): Promise<void> => {
+				if (persistenceFailures > 0 && file.includes("telegram-presentation-state.json.")) {
+					persistenceFailures -= 1;
+					throw new Error("injected presentation persistence failure");
+				}
+				await fs.promises.writeFile(file, data, options);
+			},
+		} as unknown as TelegramDaemonFs;
+		type PublicationReceiptHarness = {
+			claimPublication(publicationId: string): Promise<void>;
+			markPublicationAttempted(publicationId: string): Promise<void>;
+			markPublicationRejected(publicationId: string, definitiveProviderRejection?: boolean): Promise<void>;
+			loadPresentationState(): Promise<void>;
+			publicationShouldSuppress(publicationId: string): boolean;
+		};
+		const makeHarness = (): PublicationReceiptHarness =>
+			new TelegramNotificationDaemon({
+				settings: settings(agentDir),
+				ownerId: "provider-owner",
+				botToken: BOT_TOKEN,
+				chatId: "42",
+				fs: durableFs,
+			}) as unknown as PublicationReceiptHarness;
+		const publicationId = "session:61:1";
+		let providerAttempts = 0;
+		const attempt = async (daemon: PublicationReceiptHarness): Promise<void> => {
+			providerAttempts += 1;
+			await daemon.markPublicationAttempted(publicationId);
+		};
+		try {
+			const first = makeHarness();
+			await first.claimPublication(publicationId);
+			await attempt(first);
+			persistenceFailures = 1;
+			await expect(first.markPublicationRejected(publicationId, true)).rejects.toThrow(
+				"injected presentation persistence failure",
+			);
+
+			const persisted = JSON.parse(
+				fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-presentation-state.json"), "utf8"),
+			) as {
+				claimed?: Record<string, number>;
+				ambiguous?: Record<string, number>;
+				rejected?: Record<string, number>;
+			};
+			expect(persisted.claimed?.[publicationId]).toBeDefined();
+			expect(persisted.ambiguous?.[publicationId]).toBeUndefined();
+			expect(persisted.rejected?.[publicationId]).toBeUndefined();
+			expect(providerAttempts).toBe(1);
+
+			const restarted = makeHarness();
+			await restarted.loadPresentationState();
+			expect(restarted.publicationShouldSuppress(publicationId)).toBe(false);
+			await restarted.claimPublication(publicationId);
+			expect(providerAttempts).toBe(1);
+			await attempt(restarted);
+			expect(providerAttempts).toBe(2);
 		} finally {
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}

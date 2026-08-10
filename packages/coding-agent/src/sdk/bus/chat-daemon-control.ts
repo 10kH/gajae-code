@@ -75,10 +75,12 @@ export type ChatDaemonAction = "stop" | "reload";
  * it and loses that event for good the first time a surface refuses it. Discord generation 30 /
  * slack generation 29 move lifecycle and attachment authority into SDK core; generation 30 also
  * isolates per-session Router attachment failures so one stale endpoint cannot block healthy sessions.
+ * Discord generation 31 bounds one REST operation across response parsing and multi-request flows.
+ * Slack generation 30 bounds shutdown, tracks outbound work, and fences late effect commits.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 30,
-	slack: 29,
+	discord: 31,
+	slack: 30,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

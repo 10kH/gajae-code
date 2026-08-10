@@ -5653,13 +5653,29 @@ export class TelegramNotificationDaemon {
 			await this.persistPublicationReceipts();
 		} catch (error) {
 			this.rejectedPublications.delete(publicationId);
+			let compensationError: unknown;
 			if (!this.tentativePublications.has(publicationId)) {
 				if (claimedAt !== undefined) this.claimedPublications.set(publicationId, claimedAt);
 				else if (ambiguousAt !== undefined) {
-					if (definitiveProviderRejection) this.claimedPublications.set(publicationId, ambiguousAt);
-					else this.ambiguousPublications.set(publicationId, ambiguousAt);
+					if (definitiveProviderRejection) {
+						// An explicit provider rejection proves that the attempt was not delivered.
+						// Persist the replayable claim synchronously; otherwise a restart would keep
+						// the old ambiguous receipt and suppress the retry.
+						this.claimedPublications.set(publicationId, ambiguousAt);
+						try {
+							await this.persistPublicationReceipts();
+						} catch (candidate) {
+							compensationError = candidate;
+							this.claimedPublications.delete(publicationId);
+							this.ambiguousPublications.set(publicationId, ambiguousAt);
+						}
+					} else this.ambiguousPublications.set(publicationId, ambiguousAt);
 				}
 			}
+			if (compensationError !== undefined)
+				logger.warn(
+					`notifications: Telegram definitive-rejection rollback remained ambiguous: ${sanitizeDiagnostic(String(compensationError))}`,
+				);
 			this.rejectPublicationSettlement(publicationId, error);
 			throw error;
 		} finally {

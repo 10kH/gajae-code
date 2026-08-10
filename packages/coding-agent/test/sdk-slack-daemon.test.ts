@@ -160,6 +160,7 @@ async function withDaemon(
 		onCommand?: (sessionId: string, content: string) => Promise<boolean>;
 		attachmentSend?: (injected: Array<Record<string, unknown>>) => { send(frame: Record<string, unknown>): unknown };
 		authorizeActor?: ((actorId: string) => boolean | Promise<boolean>) | false;
+		now?: () => number;
 	} = {},
 ): Promise<void> {
 	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-daemon-"));
@@ -184,6 +185,7 @@ async function withDaemon(
 					injected.push(frame);
 				},
 			}),
+			now: options.now,
 			onCommand: options.onCommand,
 			...(options.authorizeActor === false
 				? {}
@@ -1199,6 +1201,66 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			await Promise.all([starting, stopping]);
 			expect(fake.stops).toBe(1);
 		});
+	});
+
+	it("bounds stop when a tracked /sdk command never settles", async () => {
+		let stopping = false;
+		let nowCalls = 0;
+		const commandStarted = Promise.withResolvers<void>();
+		await withDaemon(
+			async (daemon, fake) => {
+				await daemon.postRoot("session", "root");
+				await daemon.start();
+				const handler = fake.handler;
+				if (!handler) throw new Error("Slack Socket Mode handler was not installed");
+				void handler(
+					messageEnvelope("never-settles", "never-settles-event", "1.1", {
+						text: "/sdk hi",
+					}),
+				);
+				await commandStarted.promise;
+				stopping = true;
+				await daemon.stop();
+				expect(fake.stops).toBe(1);
+				nowCalls = 0;
+			},
+			{
+				now: () => (stopping ? (nowCalls++ === 0 ? 0 : 5_001) : 0),
+				onCommand: async () => {
+					commandStarted.resolve();
+					return await new Promise<boolean>(() => {});
+				},
+			},
+		);
+	});
+
+	it("fences tracked outbound notification work that races stop", async () => {
+		let stopping = false;
+		let nowCalls = 0;
+		const findStarted = Promise.withResolvers<void>();
+		const releaseFind = Promise.withResolvers<void>();
+		await withDaemon(
+			async (daemon, fake, _injected, _setEndpointGeneration, agentDir) => {
+				await daemon.postRoot("session", "root");
+				fake.onFind = async () => {
+					findStarted.resolve();
+					await releaseFind.promise;
+				};
+				const posting = daemon.notify("session", "late notification");
+				await findStarted.promise;
+				stopping = true;
+				await daemon.stop();
+				releaseFind.resolve();
+				await expect(posting).rejects.toThrow("shutdown");
+				expect(fake.posts.map(post => post.text)).toEqual(["root"]);
+				const effect = (await new ChatEffectJournal({ agentDir, transport: "slack" }).list()).find(candidate =>
+					candidate.id.startsWith("notification:"),
+				);
+				expect(effect).toMatchObject({ state: "uncertain", receipt: { status: "shutdown_timeout" } });
+				nowCalls = 0;
+			},
+			{ now: () => (stopping ? (nowCalls++ === 0 ? 0 : 5_001) : 0) },
+		);
 	});
 
 	it("suppresses a generation-N provider effect after close and generation-N+1 resume", async () => {
