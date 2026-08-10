@@ -24,9 +24,10 @@ import type { Api, Model } from "./types";
  *    The model registry merges it into `model.contextWindow` before this cap and
  *    passes it here; it is honored when a positive finite number, with
  *    diagnostics emitted at the registry. Never silently discarded.
- * 2. Live OAuth discovery metadata (`context_window`), capped at `ceiling`.
- * 3. Bundled conservative `fallback`, used when discovery metadata is
- *    absent or invalid.
+ * 2. Live OAuth discovery metadata (`context_window`), forced to the enforced
+ *    product window for the GPT-5.6 tier.
+ * 3. Bundled conservative generic window (`CODEX_GENERIC_CONTEXT_WINDOW`),
+ *    used when discovery metadata is absent or invalid.
  */
 export interface CodexGpt56ContextCapPolicy {
 	/**

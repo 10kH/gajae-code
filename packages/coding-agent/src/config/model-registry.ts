@@ -864,7 +864,17 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	if (override.output !== undefined) result.output = override.output as ("text" | "image")[];
 	if (override.cacheRetention !== undefined) result.cacheRetention = override.cacheRetention;
 	const contextWindowOverride = toPositiveNumberOrUndefined(override.contextWindow);
-	if (contextWindowOverride !== undefined) result.contextWindow = contextWindowOverride;
+	if (contextWindowOverride !== undefined) {
+		result.contextWindow = contextWindowOverride;
+	} else if (override.contextWindow !== undefined && !isCodexGpt56Tier({ id: model.id })) {
+		// Codex-tier invalid overrides are diagnosed in #collectCodexContextWindowOverrides;
+		// every other provider is diagnosed here so an ignored override is never silent.
+		logger.warn("model context-window override ignored: value must be a positive finite number", {
+			model: model.id,
+			provider: model.provider,
+			override: override.contextWindow,
+		});
+	}
 	if (override.maxTokens !== undefined) result.maxTokens = override.maxTokens;
 	if (override.contextPromotionTarget !== undefined) result.contextPromotionTarget = override.contextPromotionTarget;
 	if (override.wireModelId !== undefined) result.wireModelId = override.wireModelId;
@@ -883,6 +893,26 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	}
 	result.compat = mergeCompat(model.compat, override.compat);
 	return enrichModelThinking(result);
+}
+/**
+ * Normalizes `modelOverrides` keys to lowercase so override matching is
+ * case-insensitive everywhere (the Codex cap exemption is keyed by
+ * `codexContextOverrideKey`, which lowercases both sides). Without this,
+ * a mixed-case config key is exempted from the cap without its value ever
+ * being merged into the model.
+ */
+function normalizeModelOverrideKeys(
+	modelOverrides: Map<string, Map<string, ModelOverride>>,
+): Map<string, Map<string, ModelOverride>> {
+	const normalized = new Map<string, Map<string, ModelOverride>>();
+	for (const [provider, perModel] of modelOverrides) {
+		const perProvider = new Map<string, ModelOverride>();
+		for (const [modelId, override] of perModel) {
+			perProvider.set(modelId.toLowerCase(), override);
+		}
+		normalized.set(provider.toLowerCase(), perProvider);
+	}
+	return normalized;
 }
 
 interface CustomModelDefinitionLike {
@@ -1410,7 +1440,7 @@ export class ModelRegistry {
 		this.#configuredDiscoveryProviderIds = new Set(discoverableProviders.map(provider => provider.provider));
 		this.#customModelOverlays = customModels;
 		this.#providerOverrides = overrides;
-		this.#modelOverrides = modelOverrides;
+		this.#modelOverrides = normalizeModelOverrideKeys(modelOverrides);
 		this.#codexContextWindowOverrides = this.#collectCodexContextWindowOverrides();
 		this.#equivalenceConfig = equivalence;
 		this.#modelBindingsApplier.setBindings(modelBindings);
@@ -3039,10 +3069,10 @@ export class ModelRegistry {
 	}
 
 	#applyProviderModelOverrides(provider: string, models: Model<Api>[]): Model<Api>[] {
-		const overrides = this.#modelOverrides.get(provider);
+		const overrides = this.#modelOverrides.get(provider.toLowerCase());
 		if (!overrides || overrides.size === 0) return models;
 		return models.map(model => {
-			const override = overrides.get(model.id);
+			const override = overrides.get(model.id.toLowerCase());
 			if (!override) return model;
 			return applyModelOverride(model, override);
 		});
@@ -3130,7 +3160,7 @@ export class ModelRegistry {
 	}
 	#applyRuntimeProviderOverride(model: Model<Api>, override: ProviderOverride): Model<Api> {
 		const withTransportOverride = this.#applyProviderTransportOverride(model, override);
-		const modelCompat = this.#modelOverrides.get(model.provider)?.get(model.id)?.compat;
+		const modelCompat = this.#modelOverrides.get(model.provider.toLowerCase())?.get(model.id.toLowerCase())?.compat;
 		return modelCompat
 			? { ...withTransportOverride, compat: mergeCompat(withTransportOverride.compat, modelCompat) }
 			: withTransportOverride;
@@ -3186,9 +3216,9 @@ export class ModelRegistry {
 	#applyModelOverrides(models: Model<Api>[], overrides: Map<string, Map<string, ModelOverride>>): Model<Api>[] {
 		if (overrides.size === 0) return models;
 		return models.map(model => {
-			const providerOverrides = overrides.get(model.provider);
+			const providerOverrides = overrides.get(model.provider.toLowerCase());
 			if (!providerOverrides) return model;
-			const override = providerOverrides.get(model.id);
+			const override = providerOverrides.get(model.id.toLowerCase());
 			if (!override) return model;
 			return applyModelOverride(model, override);
 		});
@@ -3201,7 +3231,7 @@ export class ModelRegistry {
 			if (model.id !== "gpt-5.4" || model.provider === "github-copilot" || model.provider === "jetbrains-junie") {
 				return model;
 			}
-			const overrides = this.#modelOverrides.get(model.provider)?.get(model.id);
+			const overrides = this.#modelOverrides.get(model.provider.toLowerCase())?.get(model.id.toLowerCase());
 			if (!overrides) {
 				return applyModelOverride(model, { contextWindow: 1_000_000 });
 			}

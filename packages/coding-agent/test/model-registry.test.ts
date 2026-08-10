@@ -340,6 +340,43 @@ describe("ModelRegistry", () => {
 			expect(openaiCodexSol?.contextWindow).toBe(373_000);
 			expect(extensionSol?.contextWindow).toBe(372_000);
 		});
+		test("non-Codex contextWindow overrides that are not positive finite numbers are ignored without corrupting the bundled model", () => {
+			writeRawModelsJson({
+				openai: {
+					modelOverrides: {
+						"gpt-4o": { contextWindow: -5 },
+						"gpt-4.1": { contextWindow: Number.NaN },
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const models = getModelsForProvider(registry, "openai");
+			for (const id of ["gpt-4o", "gpt-4.1"]) {
+				const model = models.find(candidate => candidate.id === id);
+				expect(model?.contextWindow).toBeTypeOf("number");
+				expect(Number.isFinite(model!.contextWindow!)).toBe(true);
+				expect(model!.contextWindow!).toBeGreaterThan(0);
+			}
+		});
+
+		test("mixed-case modelOverrides keys match the bundled lowercase models and the Codex cap exemption", () => {
+			writeRawModelsJson({
+				"openai-codex": {
+					modelOverrides: {
+						"GPT-5.6-SOL": { contextWindow: 380_000 },
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const codexModels = getModelsForProvider(registry, "openai-codex");
+			const sol = codexModels.find(model => model.id === "gpt-5.6-sol");
+
+			// The mixed-case key is normalized to gpt-5.6-sol, so the value is
+			// merged AND the cap exemption matches the same normalized key.
+			expect(sol?.contextWindow).toBe(380_000);
+		});
 		test("keeps models config baseUrl ahead of provider base URL env vars", () => {
 			const restore = setEnvForTest("OPENAI_BASE_URL", "https://openai-env.example.com/v1");
 			try {
