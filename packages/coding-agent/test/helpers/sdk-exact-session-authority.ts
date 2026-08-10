@@ -30,6 +30,7 @@ export async function prepareExactSessionAuthority(
 ): Promise<ExactSessionAuthorityFixture> {
 	const endpointGeneration = options.endpointGeneration ?? 1;
 	const endpointFile = path.join(options.cwd, ".gjc", "state", "sdk", `${options.sessionId}.json`);
+	await fs.mkdir(path.dirname(endpointFile), { recursive: true });
 	const endpoint = {
 		sessionId: options.sessionId,
 		pid: process.pid,

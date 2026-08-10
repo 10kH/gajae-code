@@ -260,7 +260,10 @@ export class DiscordNotificationDaemon {
 			this.#providerStarting = true;
 			try {
 				await this.options.provider.start(
-					event => this.#track(this.handleInbound(event)),
+					async event => {
+						if (lifecycleGeneration !== this.#lifecycleGeneration || !this.#started) return;
+						this.#track(this.handleInbound(event));
+					},
 					() => {},
 				);
 			} finally {

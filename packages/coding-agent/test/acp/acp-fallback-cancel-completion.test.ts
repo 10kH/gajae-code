@@ -15,9 +15,9 @@ import {
 } from "@agentclientprotocol/sdk";
 import { AcpAgent, acpRequestFailure } from "@gajae-code/coding-agent/modes/acp/acp-agent";
 import { createAcpConnection } from "@gajae-code/coding-agent/modes/acp/acp-mode";
-import { writeBrokerDiscovery } from "@gajae-code/coding-agent/sdk/broker/discovery";
 import { TempDir } from "@gajae-code/utils";
 import { AcpSdkAdapterError } from "../../src/sdk/acp";
+import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 
 type TestSocket = { send(message: string): void };
 class TestClient implements Client {

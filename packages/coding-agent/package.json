@@ -151,6 +151,8 @@
 		"./sdk/lifecycle/broker-client.js": null,
 		"./sdk/lifecycle/broker-client": null,
 		"./sdk/lifecycle/broker-client/*": null,
+		"./sdk/broker": null,
+		"./sdk/broker/*": null,
 		"./sdk/client": null,
 		"./sdk/client/*": null,
 		"./session/internal/*": null,

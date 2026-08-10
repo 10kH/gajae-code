@@ -156,7 +156,6 @@ function normalizePersistedIntent(value: unknown): { intent: TelegramAdoptionInt
 			target: value.intent.target,
 			createdAt: value.intent.createdAt,
 			expiresAt: value.intent.expiresAt,
-			sessionId: value.intent.intendedSessionId,
 		},
 	};
 }

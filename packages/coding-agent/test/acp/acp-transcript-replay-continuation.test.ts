@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, setDefaultTimeout } from "
 import * as path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import { AcpAgent } from "@gajae-code/coding-agent/modes/acp/acp-agent";
-import { writeBrokerDiscovery } from "@gajae-code/coding-agent/sdk/broker/discovery";
 import { TempDir } from "@gajae-code/utils";
+import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 import {
 	type ExactSessionAuthorityFixture,
 	type ExactSessionAuthorityOptions,

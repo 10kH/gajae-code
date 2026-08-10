@@ -746,6 +746,7 @@ async function reconcileReadyScope(broker: Broker, id: string, scope: string | u
 		// published about its own process has to survive it: dropping the incarnation
 		// here would silently disarm the teardown fence for every lifecycle session.
 		...(record.processIncarnation === undefined ? {} : { processIncarnation: record.processIncarnation }),
+		...(record.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: record.lifecycleRequestId }),
 		endpointMtimeMs: record.endpointMtimeMs,
 	});
 }
@@ -2978,6 +2979,7 @@ type CloseRecord = {
 	pid: number;
 	endpointMtimeMs?: number;
 	lifecycleRequestId?: string;
+	processIncarnation?: string;
 };
 
 function endpointIncarnation(record: CloseRecord, sessionId: string): string | undefined {
@@ -3045,6 +3047,8 @@ function sameCloseGeneration(expected: CloseRecord, current: CloseRecord & { liv
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
+		current.lifecycleRequestId === expected.lifecycleRequestId &&
+		current.processIncarnation === expected.processIncarnation &&
 		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
 		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
 	);
@@ -3458,6 +3462,10 @@ async function executeLifecycleResponse(
 		if (requestedAuthority.authority && !sameCloseAuthority(requestedAuthority.authority, record, id))
 			return fail("endpoint_stale", "session endpoint is stale");
 		await broker.ledger.transition(identity, "effect_started", { intendedSessionId: id, effectMarker: randomUUID() });
+		const signalAuthority: EffectMarker | undefined =
+			typeof record.lifecycleRequestId === "string" && typeof record.processIncarnation === "string"
+				? { pid: record.pid, effectMarker: record.lifecycleRequestId, incarnation: record.processIncarnation }
+				: undefined;
 
 		let usedSignalFallback = false;
 		let note: string | undefined;
@@ -3533,7 +3541,7 @@ async function executeLifecycleResponse(
 		if (usedSignalFallback) {
 			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
 			if (stale) return stale;
-			if (!(await signalVerifiedSession(record, id, "SIGTERM")))
+			if (!(await signalVerifiedSession(record, id, "SIGTERM", signalAuthority)))
 				return fail(
 					"close_refused",
 					"Session endpoint is unavailable and its durable process identity could not be verified.",
@@ -3545,7 +3553,7 @@ async function executeLifecycleResponse(
 		if (!closed && !usedSignalFallback) {
 			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
 			if (stale) return stale;
-			if (!(await signalVerifiedSession(record, id, "SIGTERM"))) {
+			if (!(await signalVerifiedSession(record, id, "SIGTERM", signalAuthority))) {
 				await recordTerminalUncertain(broker, id, record.locator.stateRoot, record.pid);
 				return fail(
 					"terminal_uncertain",
@@ -3559,7 +3567,7 @@ async function executeLifecycleResponse(
 		if (!closed) {
 			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
 			if (stale) return stale;
-			if (!(await signalVerifiedSession(record, id, "SIGKILL"))) {
+			if (!(await signalVerifiedSession(record, id, "SIGKILL", signalAuthority))) {
 				await recordTerminalUncertain(broker, id, record.locator.stateRoot, record.pid);
 				return fail(
 					"terminal_uncertain",

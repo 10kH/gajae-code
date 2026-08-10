@@ -194,8 +194,8 @@ describe("SessionRouter dispatch authority", () => {
 			agentDir,
 			deps: {
 				createIndex: () => index,
-				createClient: async endpoint => {
-					if (endpoint.url.includes("unreachable")) throw new Error(`connect failed with ${endpoint.token}`);
+				createClient: async authority => {
+					if (authority.sessionId.includes("unreachable")) throw new Error("connect failed");
 					return {
 						onFrame: () => () => {},
 						request: async () => ({ events: [] }),

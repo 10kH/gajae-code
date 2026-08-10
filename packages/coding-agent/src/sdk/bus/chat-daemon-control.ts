@@ -97,10 +97,11 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 42 / Slack generation 47 retain daemon objects across restart to preserve detached lifecycle fences.
  * Discord generation 43 / Slack generation 48 fence Router attachment publication and Broker-adopted endpoint authority.
  * Discord generation 44 / Slack generation 49 retain provider shutdown tails and rejected lifecycle errors so no successor transport starts before ownership settles.
+ * Discord generation 45 / Slack generation 50 clean predecessor presentation authority before exact Router replacement and reject post-stop Discord callbacks.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 44,
-	slack: 49,
+	discord: 45,
+	slack: 50,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
