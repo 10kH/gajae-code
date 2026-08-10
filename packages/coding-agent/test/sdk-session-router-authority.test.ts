@@ -16,6 +16,7 @@ afterEach(() => {
 async function routerFixture(
 	options: {
 		onAttachment?: (attachment: SessionAttachment) => void | Promise<void>;
+		onAttachmentReady?: (attachment: SessionAttachment) => void | Promise<void>;
 		onSessionRemoved?: (attachment: SessionAttachment) => void | Promise<void>;
 		start?: boolean;
 	} = {},
@@ -81,6 +82,7 @@ async function routerFixture(
 				if (options.onAttachment) return options.onAttachment(attachment);
 				attachments.push(attachment);
 			},
+			onAttachmentReady: options.onAttachmentReady,
 			onSessionRemoved: options.onSessionRemoved,
 			setInterval: (() => 0) as unknown as typeof setInterval,
 			clearInterval: (() => {}) as unknown as typeof clearInterval,
@@ -235,6 +237,23 @@ describe("SessionRouter dispatch authority", () => {
 				fixture.router.request(fixture.sessionId, { type: "query_request" }, 1, impostor),
 			).rejects.toBeInstanceOf(SessionRouterError);
 			expect(fixture.clients[0]?.requests.filter(frame => frame.type === "query_request")).toEqual([]);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("publishes readiness only after capability authority becomes current", async () => {
+		const phases: string[] = [];
+		const fixture = await routerFixture({
+			onAttachment: attachment => {
+				phases.push(`attachment:${attachment.isCurrent()}`);
+			},
+			onAttachmentReady: attachment => {
+				phases.push(`ready:${attachment.isCurrent()}`);
+			},
+		});
+		try {
+			expect(phases).toEqual(["attachment:false", "ready:true"]);
 		} finally {
 			await fixture.router.stop();
 		}

@@ -7,89 +7,40 @@ For a beginner-friendly application development guide (recipes, customization, a
   <img src="../assets/telegram-mobile-hero.png" alt="Gajae Code mobile answers for coding agents hero illustration" width="100%" />
 </p>
 
-The SDK exposes a generic action/reply protocol without requiring integrations to scrape the terminal. SDK core owns managed attachment discovery and credential-bearing clients through `SessionRouter`; Telegram, Discord, and Slack receive opaque session attachments and own only provider transport and presentation. The lower-level loopback WebSocket contract remains available for explicitly standalone clients, but it is not the bundled-provider topology.
+The SDK exposes a generic action/reply protocol without requiring integrations to scrape the terminal. SDK core owns all managed attachment discovery and credential-bearing clients through `SessionRouter`; Telegram, Discord, Slack, ACP, MCP, and CLI adapters receive only capability-scoped operations and never endpoint credentials.
 
-> Status: the Rust core (`crates/gjc-sdk`) provides the wire protocol, action lifecycle, loopback WebSocket server, and session-owned endpoint record. TypeScript SDK core provides Broker lifecycle authority and `SessionRouter` attachment authority. The bundled provider daemons do not discover endpoint files or retain endpoint credentials.
+> Status: the Rust core (`crates/gjc-sdk`) provides the session-local wire protocol and endpoint record. TypeScript SDK core provides Broker lifecycle authority and `SessionRouter` attachment authority. Endpoint records and tokens are internal implementation details, not an external attachment surface.
 
-## TypeScript transport client
+## External attachment policy
 
-Install the standalone transport-only client when connecting to the v3 SDK WebSocket endpoint from TypeScript:
+External and managed integrations attach through SDK-core surfaces only:
 
-```bash
-bun add @gajae-code/bridge-client
-```
+- lifecycle mutations use `SessionLifecycleService` and the Broker lifecycle ledger;
+- live session controls use opaque `SessionAttachment` capabilities issued by `SessionRouter`;
+- endpoint URL/token discovery, raw WebSocket relays, and `gjc sdk serve` are not public attachment mechanisms;
+- lifecycle-equivalent per-session controls are prohibited on Telegram, Discord, Slack, ACP, MCP, and daemon CLI adapters.
 
-```ts
-import { SdkClient } from "@gajae-code/bridge-client";
-```
-
-`@gajae-code/coding-agent/sdk` remains a compatibility re-export of this same `SdkClient` class and associated types, so both entry points preserve class identity. The package is a client for the documented v3 transport only: it does not restore the historical BridgeClient backend protocol, handshake/commands/SSE endpoints, or any direct host-control path.
-
-## Migration from the removed RPC mode
-
-The retired `--mode rpc`, `rpc-ui`, and `bridge` modes are removed. The SDK v3
-WebSocket endpoint is now the canonical external control/query bus.
-
-| Retired RPC commands | SDK v3 control/query operations |
-| --- | --- |
-| `prompt`, `steer`, `follow_up`, `abort` | `turn.prompt`, `turn.steer`, `turn.follow_up`, `turn.abort` |
-| Model, thinking, queue, retry, and compaction controls | `model.*`, `thinking.*`, `queue.*`, `retry.*`, and `compaction.*` |
-| Session and transcript queries | `session.*`, `transcript.*`, `context.get`, and `session.stats` |
-| Workflow-gate response | `workflow.gate_answer` |
-
-See the [RPC-to-SDK v3 parity audit](./sdk-rpc-parity-audit.md) for the full
-matrix, partial equivalents, and evidence.
-
-For a local non-WebSocket transport, run one of these commands:
-
-```sh
-gjc sdk serve --stdio
-```
-
-```sh
-gjc sdk serve --socket <path>
-```
-
-It relays the identical SDK v3 frames over stdio or a Unix socket. Socket
-clients send an authentication preface and the socket is mode `0600`; stdio is
-one parent-owned connection.
-
-Python clients install the `gjc_sdk` package from `python/gjc-sdk`:
-
-```sh
-python -m pip install ./python/gjc-sdk
-```
-
-Import `SdkClient` with `from gjc_sdk import SdkClient`, then use
-`SdkClient.connect_ws`, `SdkClient.connect_socket`, or `SdkClient.connect_stdio`.
-The client supplies `reply.token` for replies.
-
-Phase 2 still does **not** provide unattended negotiation, a cross-process
-reattach/registry, or a renderer-grade full event stream. No event-plane parity
-is claimed; see the audit's [ranked Phase-2 register](./sdk-rpc-parity-audit.md#ranked-phase-2-follow-up-register--not-implemented).
+For embedding GJC in-process, use the [embedding SDK guide](./sdk-embedding.md). Managed providers use the notification adapters documented below.
 
 ## Architecture
 
 ```
-GJC session (upstream)                          your client (anywhere)
-┌───────────────────────────────┐               ┌──────────────────────────┐
-│ ask-tool fires / agent idle    │  action_needed │ Telegram / Discord / ... │
-│   → notifications core         │ ─────────────▶ │  render + collect reply  │
-│ ws://127.0.0.1:<port> (+token) │ ◀───────────── │                          │
-│   reply → resolve ask gate     │     reply       │                          │
-└───────────────────────────────┘               └──────────────────────────┘
+Broker lifecycle → Session runtime endpoint → SessionRouter → opaque adapter capability
 ```
+
+The Broker is the sole lifecycle executor and durable terminal authority. `SessionRouter` is the sole credential-bearing external attachment manager. Provider supervisors own only provider transport and presentation state.
 
 - **One endpoint per top-level session.** Each top-level session runs its own loopback WebSocket server. Subagents do not host endpoints. The Broker index is the authoritative live-session catalog, and `SessionRouter` multiplexes managed provider attachments across indexed sessions.
 - **Hosted by default.** SDK hosting is independent of notification configuration. Set `GJC_SDK_DISABLE=1` to opt out of hosting for a top-level session.
 - **Notification delivery is optional.** Configure and enable a managed notification adapter only when remote delivery is needed; the SDK endpoint remains available without one.
-- **Managed integrations use opaque attachments.** Telegram, Discord, Slack, and in-product adapters compose `SessionRouter`; they do not discover endpoint files or receive URL/token credentials. An explicitly standalone low-level client may implement the documented WebSocket contract directly under its own trust boundary.
+- **Managed integrations use opaque attachments.** Telegram, Discord, Slack, ACP, MCP, and CLI adapters compose SDK-core services; they do not discover endpoint files or receive URL/token credentials.
 - **Zero wire-protocol change.** New transports do not require changes to `crates/gjc-sdk` or the JSON protocol.
 - **tmux-agnostic.** The endpoint behaves identically with or without tmux.
 
-## Endpoint discovery
+## Internal endpoint publication
 
 A running session writes a discovery file at:
+This file is consumed only by Broker resolution and `SessionRouter`; external adapters must not read it.
 
 ```
 <repo>/.gjc/state/sdk/<sessionId>.json

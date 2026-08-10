@@ -177,8 +177,16 @@ const reverse = [
 ] as const;
 
 function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (["C25", "C26", "C27", "C28", "C29", "C30", "C31", "C32", "C34", "C48", "C52"].includes(id))
-		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });
+	if (["C25", "C26", "C27", "C28", "C29", "C30", "C31", "C32", "C34", "C48"].includes(id))
+		return dispositions({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+			mcp: "prohibited",
+			acp: "prohibited",
+			daemonCli: "prohibited",
+		});
+	if (id === "C52") return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });
 	if (id === "C38")
 		return dispositions({
 			telegram: "prohibited",

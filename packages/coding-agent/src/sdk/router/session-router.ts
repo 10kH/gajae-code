@@ -51,6 +51,8 @@ export interface SessionRouterDeps {
 	/** Receives only an opaque capability and correlated provider-neutral frames. */
 	onFrame?: (attachment: SessionAttachment, frame: SessionRouterFrame) => Promise<void> | void;
 	onAttachment?: (attachment: SessionAttachment) => Promise<void> | void;
+	/** Called only after the opaque capability becomes externally current. */
+	onAttachmentReady?: (attachment: SessionAttachment) => Promise<void> | void;
 	/** Called when the Broker index no longer reports an attached session as live. */
 	onSessionRemoved?: (attachment: SessionAttachment) => Promise<void> | void;
 	onReconciled?: () => void;
@@ -605,6 +607,22 @@ export class SessionRouter {
 			return false;
 		}
 		attached.published = true;
+		try {
+			await this.#deps.onAttachmentReady?.(capability);
+		} catch (error) {
+			const readyStillCurrent = this.#sessions.get(indexed.sessionId) === attached;
+			attached.published = false;
+			if (readyStillCurrent) this.#sessions.delete(indexed.sessionId);
+			attached.dispose();
+			await attached.client.close().catch(() => undefined);
+			if (readyStillCurrent)
+				try {
+					await this.#deps.onSessionRemoved?.(capability);
+				} catch {
+					// Ready publication failed closed; provider cleanup remains best effort.
+				}
+			throw error;
+		}
 		if (!(await this.#deliverRecoveredFrames(attached))) return false;
 		await this.#replayAttachment(attached, attached.cursor.seq);
 		return true;

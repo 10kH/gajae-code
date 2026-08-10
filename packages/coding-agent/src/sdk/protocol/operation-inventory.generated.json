@@ -441,9 +441,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -459,9 +459,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -477,9 +477,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -495,9 +495,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -513,9 +513,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -531,9 +531,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -549,9 +549,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -567,9 +567,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -603,9 +603,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -855,9 +855,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -2118,9 +2118,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -2165,9 +2165,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -2194,9 +2194,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -3739,9 +3739,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -3793,9 +3793,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -4481,9 +4481,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -4622,9 +4622,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -4651,9 +4651,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -4808,9 +4808,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -4826,9 +4826,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"

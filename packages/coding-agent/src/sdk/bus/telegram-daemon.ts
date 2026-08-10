@@ -4867,6 +4867,7 @@ export class TelegramNotificationDaemon {
 			deps: {
 				...opts.routerDeps,
 				onAttachment: attachment => this.#onAttachment(attachment),
+				onAttachmentReady: attachment => this.#onAttachmentReady(attachment),
 				onFrame: (attachment, frame) => this.#onRouterFrame(attachment, frame),
 				onSessionRemoved: attachment => this.#onSessionRemoved(attachment),
 			},
@@ -4924,6 +4925,11 @@ export class TelegramNotificationDaemon {
 		this.#clearModelChoiceAliases(session.sessionId);
 		if (this.topics.get(session.sessionId)?.authorityState === "active")
 			this.preservedInitiatorTopics.add(session.sessionId);
+	}
+
+	#onAttachmentReady(attachment: SessionAttachment): void {
+		const session = this.sessions.get(attachment.sessionId);
+		if (!session || session.attachment !== attachment) return;
 		void this.#initializeAttachment(session);
 	}
 

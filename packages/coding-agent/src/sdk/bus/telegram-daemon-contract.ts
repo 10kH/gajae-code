@@ -199,8 +199,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 135 revokes attachments whose provider publication hook rejects.
  * Generation 136 keeps provider attachment publication provisional until recovery succeeds.
  * Generation 137 fences stale reconciliation, frame tails, and identity-less replay rejection.
+ * Generation 138 starts provider handshakes only after Router publication.
  */
-export const DAEMON_GENERATION = 137;
+export const DAEMON_GENERATION = 138;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -283,5 +284,6 @@ export const DAEMON_GENERATION = 137;
  * Epoch 82 fails closed before exposing provider attachments after cleanup recovery failure.
  * Epoch 83 binds provider commands to the exact opaque attachment identity.
  * Epoch 84 prohibits provider lifecycle-equivalent controls and detaches replacement work.
+ * Epoch 85 removes direct relay attachment and prohibits lifecycle controls on every adapter.
  */
-export const SERVING_EPOCH = 84;
+export const SERVING_EPOCH = 85;
