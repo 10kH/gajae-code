@@ -293,7 +293,7 @@ export class ChatDaemonRuntime {
 				resolveAttachment: (sessionId, expectedGeneration) =>
 					this.#router.attachment(sessionId, expectedGeneration),
 				onCommand: async (sessionId, content, attachment, idempotencyKey) =>
-					await this.#runChatCommand("discord", sessionId, content, attachment.generation, idempotencyKey),
+					await this.#runChatCommand("discord", sessionId, content, attachment, idempotencyKey),
 			});
 		} else {
 			const config = this.input.config.notifications.slack;
@@ -320,7 +320,7 @@ export class ChatDaemonRuntime {
 				resolveAttachment: async sessionId => this.#router.attachment(sessionId),
 				resolveBindingAuthority: async sessionId => await this.#router.bindingAuthority(sessionId),
 				onCommand: async (sessionId, content, attachment, idempotencyKey) =>
-					await this.#runChatCommand("slack", sessionId, content, attachment.generation, idempotencyKey),
+					await this.#runChatCommand("slack", sessionId, content, attachment, idempotencyKey),
 			});
 		}
 		try {
@@ -493,7 +493,7 @@ export class ChatDaemonRuntime {
 		transport: ChatTransport,
 		sessionId: string,
 		content: string,
-		expectedGeneration?: number,
+		expectedAttachment: SessionAttachment,
 		idempotencyKey: string = randomUUID(),
 	): Promise<boolean> {
 		const match = /^\/sdk\s+(control|query|global)\s+([^\s]+)(?:\s+(.+))?\s*$/.exec(content);
@@ -514,13 +514,14 @@ export class ChatDaemonRuntime {
 			outcome = await sendAuthorizedChatOperation(transport, { kind, operation, input }, async () => {
 				if (kind === "global")
 					return await this.#runGlobalCommand(operation, input as Record<string, unknown>, idempotencyKey);
-				if (!this.#router.attachment(sessionId, expectedGeneration)) throw new ChatDeliveryError("pre_send");
+				if (!expectedAttachment.isCurrent()) throw new ChatDeliveryError("pre_send");
 				return await this.#router.request(
 					sessionId,
 					kind === "control"
 						? { type: "control_request", operation, input, confirm: true, idempotencyKey }
 						: { type: "query_request", query: operation, input, idempotencyKey },
-					expectedGeneration,
+					expectedAttachment.generation,
+					expectedAttachment,
 				);
 			});
 		} catch (error) {

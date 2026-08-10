@@ -17,6 +17,7 @@ async function routerFixture(
 	options: {
 		onAttachment?: (attachment: SessionAttachment) => void | Promise<void>;
 		onSessionRemoved?: (attachment: SessionAttachment) => void | Promise<void>;
+		start?: boolean;
 	} = {},
 ) {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-authority-"));
@@ -85,7 +86,7 @@ async function routerFixture(
 			clearInterval: (() => {}) as unknown as typeof clearInterval,
 		},
 	});
-	await router.start();
+	if (options.start !== false) await router.start();
 	return {
 		authority,
 		attachments,
@@ -192,6 +193,48 @@ describe("SessionRouter dispatch authority", () => {
 			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
 			expect(removed?.sessionId).toBe(fixture.sessionId);
 			expect(removed?.isCurrent()).toBe(false);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("keeps a rejecting provider publication provisional", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const fixture = await routerFixture({
+			start: false,
+			onAttachment: async () => {
+				entered.resolve();
+				await release.promise;
+				throw new Error("provider publication rejected");
+			},
+		});
+		const starting = fixture.router.start();
+		await entered.promise;
+		expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+		const request = fixture.router.request(fixture.sessionId, { type: "query_request" });
+		await Bun.sleep(10);
+		expect(fixture.clients[0]?.requests.filter(frame => frame.type === "query_request")).toEqual([]);
+		release.resolve();
+		await expect(request).rejects.toBeInstanceOf(SessionRouterError);
+		await starting;
+		expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+		await fixture.router.stop();
+	});
+
+	test("rejects a command carrying a different same-generation attachment", async () => {
+		const fixture = await routerFixture();
+		const impostor: SessionAttachment = Object.freeze({
+			sessionId: fixture.sessionId,
+			generation: 1,
+			isCurrent: () => true,
+			send: async () => {},
+		});
+		try {
+			await expect(
+				fixture.router.request(fixture.sessionId, { type: "query_request" }, 1, impostor),
+			).rejects.toBeInstanceOf(SessionRouterError);
+			expect(fixture.clients[0]?.requests.filter(frame => frame.type === "query_request")).toEqual([]);
 		} finally {
 			await fixture.router.stop();
 		}
