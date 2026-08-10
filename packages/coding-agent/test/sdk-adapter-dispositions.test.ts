@@ -62,6 +62,8 @@ const adapterPrefix: Record<MachineAdapter, string> = { mcp: "M", acp: "A", daem
 
 function expectedOutcome(adapter: MachineAdapter, operation: Operation, secret = false): Expected {
 	if (secret) return "rejected_before_send";
+	if (operation.sdkId === "session.get_endpoint" && (adapter === "mcp" || adapter === "daemonCli"))
+		return "rejected_before_send";
 	if (operation.kind === "reverse") return "internal_only";
 	const disposition = operation.adapterDispositions[adapter];
 	if (disposition === "prohibited" || disposition === "provider_only") return "rejected_before_send";
@@ -280,7 +282,7 @@ async function assertAcpRow(operation: Operation, secret: boolean): Promise<void
 	const before = host.observed.length;
 	const input = inputFor(operation, secret);
 	const endpoint = operation.kind === "global" ? host.brokerEndpoint : host.endpoint;
-	const adapter = await AcpSdkAdapter.connect(endpoint);
+	const adapter = await AcpSdkAdapter.connect({ client: await SdkClient.connect(endpoint.url, endpoint.token) });
 	try {
 		if (operation.kind === "control") {
 			if (expected === "forwarded") {
@@ -313,17 +315,12 @@ async function assertAcpRow(operation: Operation, secret: boolean): Promise<void
 
 async function assertMcpRow(operation: Operation, secret: boolean): Promise<void> {
 	const host = await fixture();
+	let mcp: ReturnType<typeof createSdkMcpServer> | undefined;
 	try {
 		const expected = expectedOutcome("mcp", operation, secret);
 		const before = host.observed.length;
 		const input = inputFor(operation, secret);
-		const mcp = createSdkMcpServer({
-			repo: host.repo,
-			agentDir: host.agentDir,
-			...(operation.kind === "global"
-				? {}
-				: { connect: () => SdkClient.connect(host.endpoint.url, host.endpoint.token) }),
-		});
+		mcp = createSdkMcpServer({ agentDir: host.agentDir });
 		const tool =
 			operation.kind === "global"
 				? "gjc_session_global"
@@ -343,6 +340,7 @@ async function assertMcpRow(operation: Operation, secret: boolean): Promise<void
 		} else expect(result).toMatchObject({ ok: false, error: expect.any(Object) });
 		expectObservation(host, before, operation, expected);
 	} finally {
+		await mcp?.close();
 		await stopFixture(host, operation);
 	}
 }
@@ -374,14 +372,12 @@ async function assertDaemonCliRow(operation: Operation, secret: boolean): Promis
 		const action = operation.kind === "global" ? "global" : operation.kind === "query" ? "query" : "control";
 		const args = {
 			action,
-			repo: host.repo,
 			agentDir: host.agentDir,
 			idempotencyKey: operation.kind === "global" ? `parity-${operation.id}` : undefined,
 			...(action === "query"
 				? { sessionId: host.sessionId, query: operation.sdkId }
 				: { operation: operation.sdkId }),
 			...(action === "control" ? { sessionId: host.sessionId, confirm: true } : {}),
-			...(operation.sdkId === "session.get_endpoint" ? { showEndpointCredential: true, yes: true } : {}),
 			jsonInput: JSON.stringify(input),
 		};
 		const result = await runDaemonCli(args);

@@ -4,6 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createCoordinatorMcpServer } from "../../src/coordinator-mcp/server";
 import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
+import type { SessionIndex } from "../../src/sdk/broker/session-index";
+import type { SessionRouterClient } from "../../src/sdk/router";
 
 async function withTempRoot(run: (root: string) => Promise<void>): Promise<void> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coord-race-"));
@@ -46,6 +48,7 @@ describe("send_prompt same-session concurrency", () => {
 				path.join(root, ".gjc", "state", "sdk", `${sessionId}.json`),
 				JSON.stringify({ version: 1, url: sessionUrl, token: "session-token" }),
 			);
+			await fs.utimes(path.join(root, ".gjc", "state", "sdk", `${sessionId}.json`), 0.001, 0.001);
 
 			const server = await createCoordinatorMcpServer({
 				env: {
@@ -57,37 +60,61 @@ describe("send_prompt same-session concurrency", () => {
 				},
 				services: {
 					getAgentDir: () => agentDir,
-					connectSdk: async url =>
-						url === brokerUrl
-							? ({
-									global: async (operation: string, input: Record<string, unknown>) => {
-										if (operation === "session.create") {
-											brokerSessions.push({
-												sessionId,
-												locator: { repo: root },
-												live: true,
-												endpointGeneration: 1,
-												pid: 100,
-												endpointMtimeMs: 1,
-											});
-											return { ok: true, result: { sessionId } };
-										}
-										if (operation === "session.list")
-											return { ok: true, result: { sessions: brokerSessions } };
-										if (operation === "session.get_endpoint") {
-											return { ok: true, result: { url: sessionUrl, token: "session-token" } };
-										}
-										throw new Error(`unexpected broker operation: ${operation} ${JSON.stringify(input)}`);
-									},
-									close: async () => {},
-								} as never)
-							: ({
-									control: async (operation: string) => {
-										expect(operation).toBe("turn.prompt");
-										return { accepted: true, commandId: "runtime-command", turnId: "runtime-turn" };
-									},
-									close: async () => {},
-								} as never),
+					connectBroker: async () =>
+						({
+							global: async (operation: string, input: Record<string, unknown>) => {
+								if (operation === "session.create") {
+									brokerSessions.push({
+										sessionId,
+										locator: { repo: root },
+										live: true,
+										endpointGeneration: 1,
+										pid: 100,
+										endpointMtimeMs: 1,
+									});
+									return { ok: true, result: { sessionId } };
+								}
+								if (operation === "session.list") return { ok: true, result: { sessions: brokerSessions } };
+								throw new Error(`unexpected broker operation: ${operation} ${JSON.stringify(input)}`);
+							},
+							close: async () => {},
+						}) as never,
+					routerDeps: {
+						createIndex: () =>
+							({
+								open: async () => {},
+								refresh: async () => {},
+								listSessions: () => ({
+									indexSeq: 1,
+									sessions: brokerSessions.map(session => ({
+										sessionId: session.sessionId,
+										locator: { repo: root, stateRoot: path.join(root, ".gjc", "state") },
+										live: session.live,
+										endpointGeneration: session.endpointGeneration,
+										pid: session.pid,
+										endpointMtimeMs: session.endpointMtimeMs,
+										indexSeq: 1,
+									})),
+									warnings: [],
+								}),
+							}) as unknown as SessionIndex,
+						createClient: async () => {
+							const client: SessionRouterClient = {
+								onFrame: () => () => {},
+								request: async frame => {
+									if (frame.type === "event_replay") return {};
+									expect(frame.type).toBe("control_request");
+									expect(frame.operation).toBe("turn.prompt");
+									return { accepted: true, command_id: "runtime-command", turn_id: "runtime-turn" };
+								},
+								close: async () => {},
+								send: () => {},
+							};
+							return client;
+						},
+						setInterval: (() => 0) as unknown as typeof setInterval,
+						clearInterval: (() => {}) as unknown as typeof clearInterval,
+					},
 				},
 			});
 

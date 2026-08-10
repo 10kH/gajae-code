@@ -39,42 +39,9 @@ The Broker is the sole lifecycle executor and durable terminal authority. `Sessi
 
 ## Internal endpoint publication
 
-A running session writes a discovery file at:
-This file is consumed only by Broker resolution and `SessionRouter`; external adapters must not read it.
+A running session publishes an implementation-private credential record for Broker resolution. `SessionRouter` is the sole consumer of the resolved URL/token pair and the sole owner of per-session SDK clients, replay, reconnect, rotation, prepared activation, and opaque attachment capabilities.
 
-```
-<repo>/.gjc/state/sdk/<sessionId>.json
-```
-
-(`.gjc/state/` is git-ignored.) Shape:
-
-```json
-{
-  "version": 1,
-  "sessionId": "019edd41-...",
-  "pid": 12345,
-  "host": "127.0.0.1",
-  "port": 53124,
-  "url": "ws://127.0.0.1:53124",
-  "token": "<per-session token>",
-  "startedAt": 1718760000000,
-  "updatedAt": 1718760000000,
-  "stale": false
-}
-```
-
-- The file is created `0700`/`0600` (unix) and written atomically.
-- The **token is in the file** for Broker and `SessionRouter`; external adapters must never read or log it.
-  Stale files (dead PID, past TTL, or explicitly marked) are cleaned up on the next start.
-
-SDK core connects internally with the token as a query parameter:
-
-```
-ws://127.0.0.1:<port>/?token=<token>
-```
-This URL/token form is not a public client contract.
-
-A wrong/missing token is rejected at the handshake with HTTP `401`.
+The record path, schema, credential transport, and handshake are not public client contracts. ACP, MCP, Coordinator, CLI, provider daemons, extensions, and integrations must use Router-issued attachments or Broker lifecycle services; they must not scan state roots, parse discovery files, retain endpoint credentials, or open raw per-session WebSockets. Broker and Router validate process identity, endpoint generation, incarnation, and file integrity before attachment, and fail closed on stale or uncertain state.
 
 ### Internal broker launch isolation
 

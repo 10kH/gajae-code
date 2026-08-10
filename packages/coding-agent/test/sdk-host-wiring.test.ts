@@ -47,6 +47,7 @@ import { SessionIndex } from "../src/sdk/broker/session-index";
 import { createNotificationsExtension, formatPromptSettlementDiagnostic, PresentationArbiter } from "../src/sdk/bus";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import type { NotificationSessionController } from "../src/sdk/bus/session-control";
+import { SdkClient } from "../src/sdk/client";
 import { SessionSdkHost } from "../src/sdk/host";
 import { createAgentSession } from "../src/sdk/session";
 import {
@@ -929,9 +930,8 @@ test("interactive SDK control routes synthetic gajae-code selections to session-
 		contextActions?.sdkControl?.("model.set", { id: "gajae-code/codex-eco", thinkingLevel: "high" }),
 	).rejects.toMatchObject({ code: "invalid_input" });
 });
-test("interactive session.handoff SDK control threads focus instructions to session.handoff", async () => {
+test("interactive SDK controls reject Broker-owned session handoff", async () => {
 	let contextActions: ExtensionContextActions | undefined;
-	const handoffCalls: (string | undefined)[] = [];
 	const runner = {
 		initialize(
 			_actions: ExtensionActions,
@@ -943,26 +943,12 @@ test("interactive session.handoff SDK control threads focus instructions to sess
 		},
 	};
 	const controller = new ExtensionUiController({
-		session: {
-			extensionRunner: runner,
-			handoff: async (instructions?: string) => {
-				handoffCalls.push(instructions);
-				return { document: "## Goal\nContinue", savedPath: undefined };
-			},
-		},
+		session: { extensionRunner: runner },
 	} as unknown as InteractiveModeContext);
 	controller.initializeHookRunner({} as ExtensionUIContext, false);
-
-	// The wire carries the focus under `target` (see sdk-control-dispatch);
-	// the SDK control seam must forward it to session.handoff.
-	expect(await contextActions?.sdkControl?.("session.handoff", { target: "preserve failing test" })).toEqual({
-		handoff: { document: "## Goal\nContinue", savedPath: undefined },
-	});
-	expect(handoffCalls).toEqual(["preserve failing test"]);
-
-	// A bare handoff (no focus) forwards undefined.
-	await contextActions?.sdkControl?.("session.handoff", {});
-	expect(handoffCalls).toEqual(["preserve failing test", undefined]);
+	await expect(
+		contextActions?.sdkControl?.("session.handoff", { target: "preserve failing test" }),
+	).rejects.toMatchObject({ code: "operation_prohibited" });
 });
 
 test("startup records identity before an early lifecycle event and publishes it only after NotificationServer starts", async () => {
@@ -2781,8 +2767,7 @@ test("ACP permission attachment normalizes decisions through the registered prov
 		},
 	} as unknown as AgentSideConnection;
 	const adapter = await AcpSdkAdapter.connect({
-		url: endpoint.url,
-		token: endpoint.token,
+		client: new SdkClient(endpoint.url, endpoint.token),
 		connection: createAcpReverseConnection(connection, acpSessionId),
 		providers: [{ capability: "permission", definitions: [] }],
 		heartbeatMs: 60_000,
