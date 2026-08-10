@@ -1051,10 +1051,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 			expect(keys).toContain(isolated);
 			expect(tasks.find(task => task.key === isolated)?.command).toEqual([
 				"bun",
-				"test",
-				"test/sdk-chat-daemon-worker.test.ts",
-				"-t",
-				"routes Slack safe queries through the production Session SDK host",
+				"../../scripts/run-sdk-production-host-isolated.ts",
 			]);
 		}
 	});
@@ -1585,13 +1582,7 @@ describe("planFullTasks — Main CI full mode (issue: shard main CI)", () => {
 		const isolatedSdkHost = tasks.find(
 			task => task.key === "test:@gajae-code/coding-agent:sdk-production-host-isolated",
 		);
-		expect(isolatedSdkHost?.command).toEqual([
-			"bun",
-			"test",
-			"test/sdk-chat-daemon-worker.test.ts",
-			"-t",
-			"routes Slack safe queries through the production Session SDK host",
-		]);
+		expect(isolatedSdkHost?.command).toEqual(["bun", "../../scripts/run-sdk-production-host-isolated.ts"]);
 		expect(isolatedSdkHost?.cwd).toBe(resolvePackageCwd("packages/coding-agent"));
 	});
 

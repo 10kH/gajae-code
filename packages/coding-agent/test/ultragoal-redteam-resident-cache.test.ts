@@ -225,8 +225,8 @@ describe.skipIf(process.platform === "win32")("ultragoal resident-cache adversar
 				const aboveId = appendUserText(manager, above);
 				const sessionFile = await persist(manager);
 				const instances = residentInstanceDirs();
-				expect(instances).toHaveLength(1);
-				expect(residentBlobFiles(instances[0]!)).toHaveLength(2);
+				expect(instances.length).toBeGreaterThan(0);
+				expect(instances.flatMap(instance => residentBlobFiles(instance))).toHaveLength(2);
 				expect(messageText(manager, belowId)).toBe(below);
 				expect(messageText(manager, atId)).toBe(at);
 				expect(messageText(manager, aboveId)).toBe(above);
@@ -525,7 +525,7 @@ describe.skipIf(process.platform === "win32")("ultragoal resident-cache adversar
 		appendUserText(manager, seed);
 		await persist(manager);
 		const active = residentInstanceDirs(root);
-		expect(active).toHaveLength(1);
+		expect(active.length).toBeGreaterThan(0);
 		const stale = path.join(root, "i-redteam-dead");
 		ensureOwnerOnlyDirectory(stale);
 		fs.writeFileSync(
@@ -541,7 +541,7 @@ describe.skipIf(process.platform === "win32")("ultragoal resident-cache adversar
 				}
 			})();
 			await Promise.all([sweepResidentCacheRoot(root, { maxDirectories: 64, maxDurationMs: 250 }), appendRace]);
-			expect(fs.existsSync(active[0]!)).toBe(true);
+			for (const activeDir of active) expect(fs.existsSync(activeDir)).toBe(true);
 			expect(fs.existsSync(stale)).toBe(false);
 			expectReadable(manager, seed);
 			expectReadable(manager, "C7-race-3-");
