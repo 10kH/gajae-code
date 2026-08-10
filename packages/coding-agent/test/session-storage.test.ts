@@ -528,6 +528,9 @@ describe("managed descriptor reads", () => {
 		try {
 			store.publishNoReplaceSync("session.jsonl", Buffer.from("0123456789\n"));
 			expect(Buffer.from(store.readRangeExpectedSync("session.jsonl", 2, 4).bytes).toString("utf8")).toBe("2345");
+			expect(() => store.readRangeExpectedSync("session.jsonl", Number.MAX_SAFE_INTEGER, 1)).toThrow(
+				"Managed range read start overflows",
+			);
 
 			const readSync = fs.readSync;
 			const spy = vi.spyOn(fs, "readSync").mockImplementationOnce(((

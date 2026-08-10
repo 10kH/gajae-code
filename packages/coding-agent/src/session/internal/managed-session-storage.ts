@@ -1549,6 +1549,7 @@ export class ManagedSessionDescendantStore {
 	): SessionStorageRangeSnapshot {
 		if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(length) || length < 0)
 			throw new RangeError("Invalid managed range read");
+		if (start > Number.MAX_SAFE_INTEGER - length) throw new RangeError("Managed range read start overflows");
 		if (length > 64 * 1024 * 1024) throw new RangeError("Managed range read exceeds the bounded maximum");
 		this.#assertBound();
 		const rootBefore = fs.lstatSync(this.#baseDir, { bigint: true });
