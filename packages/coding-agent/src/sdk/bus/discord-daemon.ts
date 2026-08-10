@@ -2116,13 +2116,17 @@ export class DiscordNotificationDaemon {
 			content: string;
 			nonce: string;
 			components?: DiscordMessageComponent[];
+			attachmentAuthorityId?: string;
 		}>(id);
 		const payload = existingEffect?.payload ?? {
 			threadId: record.threadId!,
 			content,
 			nonce,
+			...(record.attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId: record.attachmentAuthorityId }),
 			...(components ? { components } : {}),
 		};
+		if (payload.attachmentAuthorityId !== record.attachmentAuthorityId)
+			throw new DiscordAttachmentBindingError("Discord provider effect belongs to another attachment.");
 		await this.#runEffect(
 			id,
 			"post-message",
@@ -2163,10 +2167,17 @@ export class DiscordNotificationDaemon {
 						(allowInactive || current.state === "active") &&
 						current.generation === record.generation &&
 						current.endpointGeneration === record.endpointGeneration &&
+						current.attachmentAuthorityId === payload.attachmentAuthorityId &&
 						(!actionPublication || current.pendingActionEffectId === id);
 				return (
 					mappingCurrent &&
-					(closing || allowInactive || (await this.#bindingCurrent(record.sessionId!, record.endpointGeneration!)))
+					(closing ||
+						allowInactive ||
+						(await this.#bindingCurrent(
+							record.sessionId!,
+							record.endpointGeneration!,
+							record.attachmentAuthorityId,
+						)))
 				);
 			},
 		);
@@ -2179,12 +2190,22 @@ export class DiscordNotificationDaemon {
 		closing = false,
 		occurrenceId?: string,
 	): Promise<void> {
+		const existingEffect = await this.#effects.read<{ attachmentAuthorityId?: string }>(id);
+		if (existingEffect && existingEffect.payload.attachmentAuthorityId !== record.attachmentAuthorityId)
+			throw new DiscordAttachmentBindingError("Discord thread effect belongs to another attachment.");
 		await this.#runEffect(
 			id,
 			operation,
 			record.sessionId,
 			record.endpointGeneration!,
-			{ threadId: record.threadId!, locked, ...(occurrenceId === undefined ? {} : { occurrenceId }) },
+			{
+				threadId: record.threadId!,
+				locked,
+				...(record.attachmentAuthorityId === undefined
+					? {}
+					: { attachmentAuthorityId: record.attachmentAuthorityId }),
+				...(occurrenceId === undefined ? {} : { occurrenceId }),
+			},
 
 			async (ensure, beforeProvider) => {
 				await ensure();
@@ -2209,6 +2230,7 @@ export class DiscordNotificationDaemon {
 						current.state === (operation === "archive" ? "active" : "resuming") &&
 						current.generation === record.generation &&
 						current.endpointGeneration === record.endpointGeneration &&
+						current.attachmentAuthorityId === record.attachmentAuthorityId &&
 						(occurrenceId === undefined ||
 							(operation === "archive"
 								? current.archiveEffectId === id && current.archiveOccurrenceId === occurrenceId
@@ -2216,7 +2238,12 @@ export class DiscordNotificationDaemon {
 				return (
 					mappingCurrent &&
 					(closing ||
-						(!!record.sessionId && (await this.#bindingCurrent(record.sessionId, record.endpointGeneration!))))
+						(!!record.sessionId &&
+							(await this.#bindingCurrent(
+								record.sessionId,
+								record.endpointGeneration!,
+								record.attachmentAuthorityId,
+							))))
 				);
 			},
 			!closing,
@@ -2230,7 +2257,15 @@ export class DiscordNotificationDaemon {
 			"create-thread",
 			intent.sessionId,
 			intent.endpointGeneration!,
-			{ guildId: intent.guildId, parentId: intent.parentChannelId, name, nonce },
+			{
+				guildId: intent.guildId,
+				parentId: intent.parentChannelId,
+				name,
+				nonce,
+				...(intent.attachmentAuthorityId === undefined
+					? {}
+					: { attachmentAuthorityId: intent.attachmentAuthorityId }),
+			},
 			async ensure => {
 				await ensure();
 				const existing = await this.options.provider.findThreadByNonce({
@@ -2261,7 +2296,8 @@ export class DiscordNotificationDaemon {
 					current.createOwner === intent.createOwner &&
 					current.generation === intent.generation &&
 					(current.createLeaseExpiresAt ?? 0) > this.#now() &&
-					(await this.#bindingCurrent(intent.sessionId!, intent.endpointGeneration!))
+					current.attachmentAuthorityId === intent.attachmentAuthorityId &&
+					(await this.#bindingCurrent(intent.sessionId!, intent.endpointGeneration!, intent.attachmentAuthorityId))
 				);
 			},
 		);
@@ -2270,7 +2306,13 @@ export class DiscordNotificationDaemon {
 	}
 	async #recoverCreateThread(
 		effect: ChatEffect,
-		payload: { guildId?: string; parentId?: string; name?: string; nonce?: string },
+		payload: {
+			guildId?: string;
+			parentId?: string;
+			name?: string;
+			nonce?: string;
+			attachmentAuthorityId?: string;
+		},
 	): Promise<void> {
 		if (!effect.sessionId || !payload.nonce) return;
 		const intentKey = this.#intentKey(effect.sessionId);
@@ -2280,13 +2322,14 @@ export class DiscordNotificationDaemon {
 			intent.sessionId === effect.sessionId &&
 			intent.guildId === payload.guildId &&
 			intent.parentChannelId === payload.parentId &&
+			intent.attachmentAuthorityId === payload.attachmentAuthorityId &&
 			discordEffectNonce(`create:${intent.sessionId}:${intent.createNonce}`) === payload.nonce;
 		if (!matchesIntent || !intent) {
 			if (effect.state !== "terminal") await this.#terminalizeEffect(effect.id, "rejected");
 
 			return;
 		}
-		if (!(await this.#bindingCurrent(effect.sessionId, effect.endpointGeneration))) {
+		if (!(await this.#bindingCurrent(effect.sessionId, effect.endpointGeneration, payload.attachmentAuthorityId))) {
 			await this.#store.delete(intentKey, intent.generation);
 			return;
 		}
@@ -2310,7 +2353,7 @@ export class DiscordNotificationDaemon {
 			await this.#store.delete(intentKey, intent.generation);
 			return;
 		}
-		await this.#requireLiveBinding(effect.sessionId, effect.endpointGeneration);
+		await this.#requireLiveBinding(effect.sessionId, effect.endpointGeneration, payload.attachmentAuthorityId);
 		const key = discordConversationKey({
 			appId: intent.appId,
 			guildId: intent.guildId,

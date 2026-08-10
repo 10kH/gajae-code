@@ -645,6 +645,7 @@ export class SlackNotificationDaemon {
 					channel: this.options.channelId,
 					text: body,
 					clientMsgId,
+					...(endpoint.authorityId === undefined ? {} : { attachmentAuthorityId: endpoint.authorityId }),
 				});
 				createdRootEffect = !durable.existed;
 				posted = await this.#postDurable(effectId, sessionId, generation, durable.payload);
@@ -781,6 +782,9 @@ export class SlackNotificationDaemon {
 				threadTs: conversation.rootTs,
 				text: body,
 				clientMsgId: publication.clientMsgId,
+				...(conversation.attachmentAuthorityId === undefined
+					? {}
+					: { attachmentAuthorityId: conversation.attachmentAuthorityId }),
 			});
 			return conversation;
 		}
@@ -829,6 +833,9 @@ export class SlackNotificationDaemon {
 					threadTs: conversation.rootTs,
 					text: body,
 					clientMsgId,
+					...(conversation.attachmentAuthorityId === undefined
+						? {}
+						: { attachmentAuthorityId: conversation.attachmentAuthorityId }),
 				});
 				published = await this.#postDurable(effectId, sessionId, conversationGeneration, durable.payload);
 			});
@@ -887,6 +894,9 @@ export class SlackNotificationDaemon {
 			threadTs: found.record.rootTs,
 			text: content,
 			clientMsgId: this.#randomId(),
+			...(found.record.attachmentAuthorityId === undefined
+				? {}
+				: { attachmentAuthorityId: found.record.attachmentAuthorityId }),
 		});
 		return true;
 	}
@@ -988,6 +998,9 @@ export class SlackNotificationDaemon {
 				threadTs: found.record.rootTs,
 				text: marker,
 				clientMsgId: existing?.payload.clientMsgId ?? this.#randomId(),
+				...(found.record.attachmentAuthorityId === undefined
+					? {}
+					: { attachmentAuthorityId: found.record.attachmentAuthorityId }),
 			},
 		);
 		await this.#postDurable(effectId, sessionId, this.#requireEndpointGeneration(found.record), durable.payload);
@@ -2036,6 +2049,7 @@ export class SlackNotificationDaemon {
 					text?: unknown;
 					threadTs?: unknown;
 					clientMsgId?: unknown;
+					attachmentAuthorityId?: unknown;
 				};
 				if (
 					typeof payload.channel !== "string" ||
@@ -2049,6 +2063,9 @@ export class SlackNotificationDaemon {
 					text: payload.text,
 					...(typeof payload.threadTs === "string" ? { threadTs: payload.threadTs } : {}),
 					clientMsgId: payload.clientMsgId,
+					...(typeof payload.attachmentAuthorityId === "string"
+						? { attachmentAuthorityId: payload.attachmentAuthorityId }
+						: {}),
 				});
 			} catch {
 				failed = true;
@@ -2159,22 +2176,30 @@ export class SlackNotificationDaemon {
 			return false;
 		if (!effect.id.startsWith("close-marker-cleanup:")) {
 			const endpoint = await this.#resolveAttachment(effect.sessionId);
-			if (!endpoint || endpoint.generation !== effect.endpointGeneration) return false;
+			const payload = effect.payload as { attachmentAuthorityId?: unknown; threadTs?: unknown };
+			if (
+				!endpoint ||
+				endpoint.generation !== effect.endpointGeneration ||
+				payload.attachmentAuthorityId !== endpoint.authorityId
+			)
+				return false;
 		}
-		const payload = effect.payload as { threadTs?: unknown };
+		const payload = effect.payload as { attachmentAuthorityId?: unknown; threadTs?: unknown };
 		const threadTs = payload.threadTs;
 		const records = Object.values((await this.store.load()).conversations);
 		if (typeof threadTs === "string") {
 			return records.some(
 				record =>
 					record.sessionId === effect.sessionId &&
-					acceptsSlackInbound(record, threadTs, effect.endpointGeneration),
+					acceptsSlackInbound(record, threadTs, effect.endpointGeneration) &&
+					record.attachmentAuthorityId === payload.attachmentAuthorityId,
 			);
 		}
 		return records.some(
 			record =>
 				record.sessionId === effect.sessionId &&
 				record.endpointGeneration === effect.endpointGeneration &&
+				record.attachmentAuthorityId === payload.attachmentAuthorityId &&
 				record.state === "posting_root",
 		);
 	}
@@ -2201,23 +2226,34 @@ export class SlackNotificationDaemon {
 		id: string,
 		sessionId: string,
 		endpointGeneration: number,
-		expected: { channel: string; text: string; threadTs?: string; clientMsgId: string },
-	): Promise<{ payload: typeof expected; existed: boolean }> {
-		const existing = await this.#journal.read<typeof expected>(id);
-		if (!existing) return { payload: expected, existed: false };
+		expected: {
+			channel: string;
+			text: string;
+			threadTs?: string;
+			clientMsgId: string;
+			attachmentAuthorityId?: string;
+		},
+	): Promise<{
+		payload: typeof expected & { attachmentAuthorityId?: string };
+		existed: boolean;
+	}> {
+		const durableExpected = { ...expected };
+		const existing = await this.#journal.read<typeof durableExpected>(id);
+		if (!existing) return { payload: durableExpected, existed: false };
 		const payload = existing.payload;
 		if (
 			existing.kind !== "provider-post" ||
 			existing.transport !== "slack" ||
 			existing.sessionId !== sessionId ||
 			existing.endpointGeneration !== endpointGeneration ||
+			payload.attachmentAuthorityId !== durableExpected.attachmentAuthorityId ||
 			typeof payload.channel !== "string" ||
 			typeof payload.text !== "string" ||
 			typeof payload.clientMsgId !== "string" ||
 			(payload.threadTs !== undefined && typeof payload.threadTs !== "string") ||
-			payload.channel !== expected.channel ||
-			payload.threadTs !== expected.threadTs ||
-			payload.clientMsgId !== expected.clientMsgId
+			payload.channel !== durableExpected.channel ||
+			payload.threadTs !== durableExpected.threadTs ||
+			payload.clientMsgId !== durableExpected.clientMsgId
 		) {
 			throw new SlackEndpointBindingError("Slack provider effect identity does not match the durable occurrence.");
 		}
@@ -2228,7 +2264,13 @@ export class SlackNotificationDaemon {
 		id: string,
 		sessionId: string,
 		endpointGeneration: number,
-		payload: { channel: string; text: string; threadTs?: string; clientMsgId: string },
+		payload: {
+			channel: string;
+			text: string;
+			threadTs?: string;
+			clientMsgId: string;
+			attachmentAuthorityId?: string;
+		},
 	): Promise<SlackPostedMessage> {
 		if (!Number.isSafeInteger(endpointGeneration) || endpointGeneration <= 0)
 			throw new SlackEndpointBindingError("Slack provider effects require a positive endpoint generation.");
@@ -2517,6 +2559,9 @@ export class SlackNotificationDaemon {
 						channel: payload.channel,
 						text: payload.text,
 						clientMsgId,
+						...(current.attachmentAuthorityId === undefined
+							? {}
+							: { attachmentAuthorityId: current.attachmentAuthorityId }),
 					});
 				} catch (error) {
 					if (!(error instanceof SlackStaleEffectError)) throw error;

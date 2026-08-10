@@ -1196,6 +1196,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 					threadTs: root.rootTs,
 					text: "recovery before start",
 					clientMsgId: "recovery-before-start",
+					attachmentAuthorityId: "session:1",
 				},
 			});
 			const starting = daemon.start();
