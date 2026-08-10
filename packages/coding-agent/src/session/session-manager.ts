@@ -9956,9 +9956,10 @@ export class SessionManager {
 			getResidentCacheRootDir(this.#residentCacheProfileAgentDir()),
 		);
 		const cacheParent = path.dirname(instanceDir);
-		const cacheRoot = managedDirectoryRoot(instanceDir);
-		const retainedAuthority = retainManagedDirectoryAuthority(cacheRoot, instanceDir);
+		let retainedAuthority: native.RecoveryFsRoot | undefined;
 		try {
+			const cacheRoot = managedDirectoryRoot(instanceDir);
+			retainedAuthority = retainManagedDirectoryAuthority(cacheRoot, instanceDir);
 			this.#managedSidecarAuthorityStore = new ManagedSessionDescendantStore(
 				cacheRoot,
 				instanceDir,

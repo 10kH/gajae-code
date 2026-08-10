@@ -2549,7 +2549,18 @@ function replaceManagedFileGeneratedSync(
 					sha256: expectedDestination.sha256,
 				},
 			);
-			if (!replaced.ok) throw new ManagedReplaceError(replaced, receiptCleanup.path);
+			if (!replaced.ok) {
+				publicationCommitted =
+					replaced.code === "cleanup_pending" ||
+					replaced.code === "durability_failed" ||
+					Boolean(
+						replaced.detachedPath ??
+							replaced.retainedSuccessorPath ??
+							replaced.retainedPlaceholderPath ??
+							replaced.retainedUnknownPath,
+					);
+				throw new ManagedReplaceError(replaced, receiptCleanup.path);
+			}
 			publicationCommitted = true;
 			fsyncDirectory(parent);
 		} else {

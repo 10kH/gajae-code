@@ -7,6 +7,7 @@ import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import {
 	captureManagedFileNoFollow,
+	ManagedCommittedMutationError,
 	ManagedReplaceError,
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
@@ -756,7 +757,7 @@ describe.skipIf(process.platform !== "darwin")("authority-absent managed replace
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
-	it("retains native post-exchange paths in ManagedReplaceError", () => {
+	it("retains native post-exchange paths inside committed-outcome evidence", () => {
 		const root = fs.realpathSync.native(
 			fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-replace-failure-")),
 		);
@@ -791,8 +792,11 @@ describe.skipIf(process.platform !== "darwin")("authority-absent managed replace
 				error = caught;
 			}
 
-			expect(error).toBeInstanceOf(ManagedReplaceError);
-			const replaceError = error as ManagedReplaceError;
+			expect(error).toBeInstanceOf(ManagedCommittedMutationError);
+			const committedError = error as ManagedCommittedMutationError;
+			expect(committedError.operation).toBe("replace");
+			expect(committedError.cause).toBeInstanceOf(ManagedReplaceError);
+			const replaceError = committedError.cause as ManagedReplaceError;
 			expect(replaceError.message).toBe("managed_replace_failed:durability_failed");
 			expect(replaceError.code).toBe("durability_failed");
 			expect(replaceError.detachedPath).toBe(predecessor);
