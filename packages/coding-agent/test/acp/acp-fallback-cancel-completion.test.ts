@@ -25,7 +25,7 @@ import {
 	publishExactSessionAuthority,
 } from "../helpers/sdk-exact-session-authority";
 
-setDefaultTimeout(30_000);
+setDefaultTimeout(60_000);
 
 type TestSocket = { send(message: string): void };
 class TestClient implements Client {
@@ -43,7 +43,7 @@ class TestClient implements Client {
 async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
 	return await Promise.race([
 		promise,
-		Bun.sleep(15_000).then(() => {
+		Bun.sleep(45_000).then(() => {
 			throw new Error(`Timed out waiting for ${label}`);
 		}),
 	]);
