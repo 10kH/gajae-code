@@ -1384,7 +1384,7 @@ export class DiscordNotificationDaemon {
 				!!attachment &&
 				attachment.isCurrent() &&
 				attachment.generation === endpointGeneration &&
-				(attachmentAuthorityId === undefined || attachment.authorityId === attachmentAuthorityId)
+				attachment.authorityId === attachmentAuthorityId
 			);
 		} catch {
 			return false;
@@ -1437,7 +1437,7 @@ export class DiscordNotificationDaemon {
 				await this.retireAttachment(input.sessionId, input.endpointGeneration);
 				return await this.#ensureConversation(input);
 			}
-			await this.#requireLiveBinding(input.sessionId, input.endpointGeneration);
+			await this.#requireLiveBinding(input.sessionId, input.endpointGeneration, input.attachmentAuthorityId);
 			return await this.#replace(existing, {
 				...existing,
 				endpointGeneration: input.endpointGeneration,
@@ -1450,7 +1450,7 @@ export class DiscordNotificationDaemon {
 			try {
 				created = await inFlight;
 			} catch {
-				await this.#requireLiveBinding(input.sessionId, input.endpointGeneration);
+				await this.#requireLiveBinding(input.sessionId, input.endpointGeneration, input.attachmentAuthorityId);
 				return await this.#ensureConversation(input);
 			}
 			if (
@@ -1458,7 +1458,7 @@ export class DiscordNotificationDaemon {
 				(input.attachmentAuthorityId === undefined || created.attachmentAuthorityId === input.attachmentAuthorityId)
 			)
 				return created;
-			await this.#requireLiveBinding(input.sessionId, input.endpointGeneration);
+			await this.#requireLiveBinding(input.sessionId, input.endpointGeneration, input.attachmentAuthorityId);
 			return await this.#replace(created, {
 				...created,
 				endpointGeneration: input.endpointGeneration,
@@ -1510,11 +1510,11 @@ export class DiscordNotificationDaemon {
 					await this.retireAttachment(sessionId, endpointGeneration);
 					continue;
 				}
-				await this.#requireLiveBinding(sessionId, endpointGeneration);
+				await this.#requireLiveBinding(sessionId, endpointGeneration, attachmentAuthorityId);
 				return await this.#replace(active, { ...active, endpointGeneration, attachmentAuthorityId });
 			}
 			const now = this.#now();
-			await this.#requireLiveBinding(sessionId, endpointGeneration);
+			await this.#requireLiveBinding(sessionId, endpointGeneration, attachmentAuthorityId);
 			intent = await this.#store.transact(intentKey, old => {
 				if (old?.state === "creating" && old.createOwner && (old.createLeaseExpiresAt ?? 0) > now) return old;
 				return {
@@ -1541,13 +1541,13 @@ export class DiscordNotificationDaemon {
 		const active = await this.#bySession(sessionId);
 		if (active?.state === "active" && active.threadId) {
 			if (active.endpointGeneration === endpointGeneration) return active;
-			await this.#requireLiveBinding(sessionId, endpointGeneration);
+			await this.#requireLiveBinding(sessionId, endpointGeneration, active.attachmentAuthorityId);
 			return await this.#replace(active, { ...active, endpointGeneration });
 		}
 		let thread: DiscordThread | null;
 		try {
 			thread = await this.#withCreateIntentLease(intent, () => this.#createThreadEffect(intent, name));
-			await this.#requireLiveBinding(sessionId, endpointGeneration);
+			await this.#requireLiveBinding(sessionId, endpointGeneration, intent.attachmentAuthorityId);
 		} catch (error) {
 			await this.#abandonCreator(intentKey, intent);
 			throw error;
@@ -1561,7 +1561,7 @@ export class DiscordNotificationDaemon {
 		) {
 			throw new Error("Discord create intent lost its fence before mapping commit");
 		}
-		await this.#requireLiveBinding(sessionId, endpointGeneration);
+		await this.#requireLiveBinding(sessionId, endpointGeneration, intent.attachmentAuthorityId);
 		const key = discordConversationKey({
 			appId: intent.appId,
 			guildId: intent.guildId,
@@ -1945,7 +1945,7 @@ export class DiscordNotificationDaemon {
 			parentChannelId: record.parentChannelId,
 			threadId: record.threadId!,
 		});
-		await this.#requireLiveBinding(record.sessionId!, record.endpointGeneration!);
+		await this.#requireLiveBinding(record.sessionId!, record.endpointGeneration!, record.attachmentAuthorityId);
 		const result = await this.#store.transact(key, current => {
 			if (
 				current?.state !== "active" ||

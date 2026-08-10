@@ -110,9 +110,10 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 54 / Slack generation 60 version-fence attaches already in flight when retirement begins.
  * Discord generation 55 / Slack generation 61 fence durable inbound work by exact attachment identity.
  * Discord generation 56 / Slack generation 62 fence durable provider-post and thread-effect recovery by attachment identity.
+ * Discord generation 57 removes missing-authority wildcard behavior from durable binding checks.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 56,
+	discord: 57,
 	slack: 62,
 };
 
