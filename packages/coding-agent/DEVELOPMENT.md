@@ -18,7 +18,7 @@ CLI / daemon session commands / ACP / MCP
 ```
 
 - **Interactive and print CLI**: `src/cli.ts` routes ordinary CLI work to `src/main.ts`, which owns local session setup and interactive or one-shot execution.
-- **Internal SDK transport client**: private workspace package `@gajae-code/bridge-client` supplies `SdkClient` only to Broker, `SessionRouter`, and trusted in-process adapters. It is not exported from `@gajae-code/coding-agent/sdk` and is not a public attachment surface.
+- **Internal SDK transport client**: `src/sdk/client/client.ts` supplies `SdkClient` only to Broker, `SessionRouter`, and trusted in-process adapters. It is not exported from `@gajae-code/coding-agent/sdk` and is not a public attachment surface.
 
 - **Daemon session CLI**: `gjc daemon session ...` is implemented by `src/commands/daemon.ts` and `src/sdk/cli/session-cli.ts`. It discovers the SDK broker/session endpoint and invokes typed SDK `list`, `control`, `query`, or `global` operations; it does not launch a private transport.
 - **ACP**: `src/modes/acp/acp-mode.ts` creates the ACP connection and `src/modes/acp/acp-agent.ts` adapts ACP requests to `AcpSdkAdapter` and `SdkClient`. ACP must keep session authority in the SDK.
@@ -90,7 +90,7 @@ Choose the public surface deliberately:
 Do not restore or document as active:
 
 - `--mode rpc`, RPC mode source, JSONL RPC clients, or RPC compatibility fixtures.
-- Historical BridgeClient backend protocol and every public raw endpoint client/relay surface. The private internal client is limited to SDK-core authority paths.
+- Historical BridgeClient backend protocol and every public raw endpoint client/relay surface. The internal client module is limited to SDK-core authority paths.
 - Unattended transport imports or protocol clients.
 
 
@@ -98,7 +98,7 @@ Historical changelog entries, removal documentation, and negative scanner self-t
 
 ## Verification
 
-The closure gate is `bun run verify:sdk-canonicalization` from this package. It is part of `bun run check`, so workspace checks and root release/prepublish checks enforce it automatically. The scanner permits the private internal SDK client only in SDK-core authority paths and rejects historical BridgeClient protocol surfaces, retired source trees and exports, bridge/unattended imports, executable RPC compatibility fixtures, direct authority bypasses, and unsupported machine-entrypoint import graphs.
+The closure gate is `bun run verify:sdk-canonicalization` from this package. It is part of `bun run check`, so workspace checks and root release/prepublish checks enforce it automatically. The scanner permits the internal SDK client only in SDK-core authority paths and rejects historical BridgeClient protocol surfaces, retired source trees and exports, bridge/unattended imports, executable RPC compatibility fixtures, direct authority bypasses, and unsupported machine-entrypoint import graphs.
 
 Run focused checks while working on this boundary:
 

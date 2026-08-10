@@ -348,7 +348,7 @@ function taskNeedsNative(key: string): boolean {
 		key === "wrapper-version" ||
 		key === "deep-interview-definitions" ||
 		key === "deep-interview-runtime" ||
-		key === "bridge-client-sdk-package-smoke" ||
+		key === "sdk-package-smoke" ||
 		key.startsWith("test:")
 	);
 }
@@ -768,8 +768,8 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 	if (publishChanged) {
 		addReleasePublishTasks(tasks);
 	}
-	if (paths.some(isBridgeClientSdkPackageSmokePath)) {
-		add(tasks, "bridge-client-sdk-package-smoke", "Bridge-client SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
+	if (paths.some(isSdkPackageSmokePath)) {
+		add(tasks, "sdk-package-smoke", "SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
 	}
 
 	if (rustChanged) {
@@ -867,16 +867,16 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 				add(tasks, "wrapper-version", "Unscoped wrapper CLI version smoke", ["bun", "packages/gajae-code/bin/gjc.js", "--version"]);
 			}
 		}
-		if (isBridgeClientSdkPackageSmokePath(changedPath)) {
-			add(tasks, "bridge-client-sdk-package-smoke", "Bridge-client SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
-			const bridgeClientOwner = owningPackage(changedPath, packages);
-			if (bridgeClientOwner?.manifest.scripts?.check) {
+		if (isSdkPackageSmokePath(changedPath)) {
+			add(tasks, "sdk-package-smoke", "SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
+			const sdkClientOwner = owningPackage(changedPath, packages);
+			if (sdkClientOwner?.manifest.scripts?.check) {
 				add(
 					tasks,
-					`check:${bridgeClientOwner.name}`,
-					`Check ${bridgeClientOwner.name}`,
+					`check:${sdkClientOwner.name}`,
+					`Check ${sdkClientOwner.name}`,
 					packageScriptCommand("check"),
-					resolvePackageCwd(bridgeClientOwner.dir),
+					resolvePackageCwd(sdkClientOwner.dir),
 				);
 			}
 		}
@@ -1201,11 +1201,8 @@ function isCodingAgentRuntimePath(changedPath: string): boolean {
 	return changedPath.startsWith("packages/coding-agent/") || changedPath.startsWith("packages/agent/") || changedPath.startsWith("packages/ai/");
 }
 
-function isBridgeClientSdkPackageSmokePath(changedPath: string): boolean {
-	return (
-		changedPath.startsWith("packages/bridge-client/") ||
-		changedPath.startsWith("packages/coding-agent/src/sdk/client/")
-	);
+function isSdkPackageSmokePath(changedPath: string): boolean {
+	return changedPath.startsWith("packages/coding-agent/src/sdk/client/");
 }
 
 function isDeepInterviewOnly(paths: readonly string[]): boolean {
@@ -1480,7 +1477,6 @@ function isReleasePublishPath(changedPath: string): boolean {
 	return (
 		changedPath === "scripts/ci-release-publish.ts" ||
 		changedPath === "scripts/release-evidence.ts" ||
-		changedPath.startsWith("packages/bridge-client/") ||
 		changedPath.startsWith("packages/gajae-code/") ||
 		changedPath.startsWith("packages/natives-") ||
 		changedPath === "packages/natives/package.json"

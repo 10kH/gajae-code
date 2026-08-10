@@ -64,15 +64,15 @@ This file is consumed only by Broker resolution and `SessionRouter`; external ad
 ```
 
 - The file is created `0700`/`0600` (unix) and written atomically.
-- The **token is in the file** because clients need it; never log it raw.
-  Stale files (dead PID, past TTL, or explicitly marked) are cleaned up on the
-  next start.
+- The **token is in the file** for Broker and `SessionRouter`; external adapters must never read or log it.
+  Stale files (dead PID, past TTL, or explicitly marked) are cleaned up on the next start.
 
-Connect with the token as a query parameter:
+SDK core connects internally with the token as a query parameter:
 
 ```
 ws://127.0.0.1:<port>/?token=<token>
 ```
+This URL/token form is not a public client contract.
 
 A wrong/missing token is rejected at the handshake with HTTP `401`.
 
@@ -82,7 +82,7 @@ When the SDK starts its default internal broker or session host from the publish
 
 This boundary prevents a child from newly loading caller-cwd or user-global Bun preload/dotenv policy. It cannot determine how a value already present in the parent environment was originally loaded, so ordinary provider/GJC environment values remain inherited. Default internal children, including compiled self-spawns, remove inherited `BUN_OPTIONS` so parent eval/test/inspect/debug/runtime options cannot be replayed into a detached child. Compiled binaries otherwise retain their existing self-spawn command contract, corroborated by a dedicated embedded marker and exact anchored Bun virtual-filesystem identity. The explicit `GJC_SDK_SESSION_COMMAND` session-host override remains a trusted legacy operator boundary and is not parsed as a shell-safe general command API. There is no broker-command override.
 
-Broker and per-session discovery tokens remain in their authoritative private discovery files because clients need them. Launch errors, logs, and diagnostics redact those tokens and never include the child environment or isolation configuration contents.
+Broker and per-session discovery tokens remain in their authoritative private discovery files for SDK-core resolution. Launch errors, logs, and diagnostics redact those tokens and never include the child environment or isolation configuration contents.
 
 ## Protocol
 
@@ -132,17 +132,7 @@ JSON text frames. Field names are `camelCase`; the `type` discriminator is
 Reasons: `already_answered`, `unknown_action`, `invalid_answer`,
 `resolver_unavailable`, `idempotency_conflict`, `unauthorized`.
 
-The frames above are the minimal contract every client implements. Threaded
-clients (like the managed Telegram daemon) may also receive optional
-server → client frames they can render or ignore: `identity_header` (one-time
-per-session repo/branch/machine header), `context_update` (last message, task,
-goal, token usage, model, diff), `turn_stream` (live/finalized turn output),
-`image_attachment` (agent-produced images), `activity` (busy/idle, drives the
-typing indicator), `inbound_ack` (delivery state of an injected user message),
-`session_closed` (endpoint teardown; threaded clients may delete/archive the
-remote conversation), `config_update` (current verbosity/redact), `hello`
-(server capability/version), and `pong`. A minimal client only needs
-`action_needed`, `action_resolved`, and `reply_rejected`.
+The frames above are the internal transport contract implemented by SDK-core attachments. Managed adapters may receive optional server → client frames they can render or ignore: `identity_header` (one-time per-session repo/branch/machine header), `context_update` (last message, task, goal, token usage, model, diff), `turn_stream` (live/finalized turn output), `image_attachment` (agent-produced images), `activity` (busy/idle, drives the typing indicator), `inbound_ack` (delivery state of an injected user message), `session_closed` (endpoint teardown; threaded adapters may delete/archive the remote conversation), `config_update` (current verbosity/redact), `hello` (server capability/version), and `pong`.
 
 ### Client → server
 
@@ -161,10 +151,7 @@ remote conversation), `config_update` (current verbosity/redact), `hello`
 Optional `idempotencyKey` makes retries safe: the same key + same body re-acks;
 the same key + different body is rejected with `idempotency_conflict`.
 
-Threaded clients may also send optional client → server frames: `user_message`
-(inject/steer a turn with free text), `config_command` (toggle verbosity/redact
-in-thread), `hello` (capability/version), and `ping`. A minimal client only
-needs `reply`.
+Managed threaded adapters may also send optional client → server frames through their opaque attachment: `user_message` (inject/steer a turn with free text), `config_command` (toggle verbosity/redact in-thread), `hello` (capability/version), and `ping`.
 
 ## Model catalog query (Q10)
 
@@ -513,7 +500,7 @@ Telegram, Discord, Slack, and third-party adapters own only their provider trans
 
 Model-role selectors may be ordered fallback chains; see [Fallback chains](./models.md#fallback-chains) for configuration and retry-budget details. Resolution-time skips do not consume attempts. When a request-time retry advances to another eligible entry, the selected default fallback remains sticky for later prompts in that session until an explicit model selection or a chain reset changes it.
 
-`model_fallback_switched { eventId, from, to, reason, role, scope, activeIndex, chainLength, attemptsUsed }` is the canonical session lifecycle event for every real fallback-model switch. It replaces the legacy `retry_fallback_applied` / `retry_fallback_succeeded` event names. Embedding clients can subscribe to this session event; generic WebSocket clients should use only the protocol frames documented above and any adapter-specific status updates they support.
+`model_fallback_switched { eventId, from, to, reason, role, scope, activeIndex, chainLength, attemptsUsed }` is the canonical session lifecycle event for every real fallback-model switch. It replaces the legacy `retry_fallback_applied` / `retry_fallback_succeeded` event names. Embedding clients can subscribe to this in-process session event; managed adapters receive only the status projections their SDK-core integration supports.
 
 
 ## Managed session-directory adapter guidance

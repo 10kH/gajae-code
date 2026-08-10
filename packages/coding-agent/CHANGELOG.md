@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- SDK core now exclusively owns managed session lifecycle and external attachments through Broker lifecycle services and `SessionRouter`; provider daemons receive opaque capabilities only, lifecycle-equivalent adapter controls fail closed, and the former public stdio/socket, standalone TypeScript, and Python raw endpoint clients are removed.
+
 ### Fixed
 - Memory-pressure sweeps now request asynchronous garbage collection instead of forcing a stop-the-world collection on the main event loop, preventing periodic input and rendering stalls under the opt-in memory guard.
 - Follow-up queue auto-continuation now waits for compaction and foreground bash/eval work to settle, preventing queued prompts from starting a model turn concurrently with those operations.

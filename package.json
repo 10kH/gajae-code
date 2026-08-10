@@ -22,7 +22,6 @@
       "@gajae-code/stats": "0.12.21",
       "@gajae-code/agent-core": "0.12.21",
       "@gajae-code/ai": "0.12.21",
-      "@gajae-code/bridge-client": "0.12.21",
       "@gajae-code/coding-agent": "0.12.21",
       "@gajae-code/natives": "0.12.21",
       "@gajae-code/natives-darwin-arm64": "0.12.21",

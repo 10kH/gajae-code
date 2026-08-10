@@ -12,7 +12,7 @@ Dependency direction (roughly bottom-up):
 utils ─┬─▶ ai ─────┬─▶ agent ─▶ coding-agent (gjc CLI, primary product surface)
        ├─▶ tui ────┘               │
        └─▶ natives (napi-rs ◀── crates/pi-natives)
-                                   └─▶ stats (dashboard), bridge-client, sdk surfaces
+                                   └─▶ stats (dashboard), sdk surfaces
 ```
 
 | Workspace | Role |
@@ -24,7 +24,6 @@ utils ─┬─▶ ai ─────┬─▶ agent ─▶ coding-agent (gjc CL
 | `packages/natives` + `packages/natives-<platform>` | napi-rs bindings over `crates/pi-natives` (text/image/grep/shell/pty). See `docs/natives-*.md`. |
 | `packages/stats` | Local observability dashboard (`gjc stats`). |
 | `packages/utils` | Shared utilities (`@gajae-code/pi-utils`): logger, `isCompiledBinary`, path/string helpers. |
-| `packages/bridge-client` | OOO bridge client (`docs/ooo-bridge-extension-contract.md`). |
 | `packages/*-benchmark` | Edit / orchestration-token benchmarks; not shipped. |
 | `crates/` | Rust: `pi-natives`, `pi-shell`/`brush-*` (vendored shell), `pi-ast`, `pi-iso`, `git-daemon`, `gjc-sdk`. Driven via `bun scripts/run-rs-task.ts`. |
 

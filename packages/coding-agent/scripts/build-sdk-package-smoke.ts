@@ -8,7 +8,6 @@ const packageDir = path.resolve(import.meta.dir, "..");
 const packageName = "@gajae-code/coding-agent";
 const agentPackageDir = path.resolve(packageDir, "../agent");
 const aiPackageDir = path.resolve(packageDir, "../ai");
-const bridgeClientPackageDir = path.resolve(packageDir, "../bridge-client");
 const tuiPackageDir = path.resolve(packageDir, "../tui");
 const nativesPackageDir = path.resolve(packageDir, "../natives");
 const linuxX64PackageDir = path.resolve(packageDir, "../natives-linux-x64");
@@ -47,10 +46,6 @@ async function runSmoke(): Promise<Surface> {
 		}
 		const agentTarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], agentPackageDir);
 		const aiTarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], aiPackageDir);
-		const bridgeClientTarball = run(
-			["bun", "pm", "pack", "--destination", tempDir, "--quiet"],
-			bridgeClientPackageDir,
-		);
 		const tuiTarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], tuiPackageDir);
 		const nativesTarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], nativesPackageDir);
 		const linuxX64Tarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], stagedLinuxX64Dir);
@@ -58,9 +53,6 @@ async function runSmoke(): Promise<Surface> {
 		const codingAgentTarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], packageDir);
 		const agentTarballPath = path.isAbsolute(agentTarball) ? agentTarball : path.join(agentPackageDir, agentTarball);
 		const aiTarballPath = path.isAbsolute(aiTarball) ? aiTarball : path.join(aiPackageDir, aiTarball);
-		const bridgeClientTarballPath = path.isAbsolute(bridgeClientTarball)
-			? bridgeClientTarball
-			: path.join(bridgeClientPackageDir, bridgeClientTarball);
 		const tuiTarballPath = path.isAbsolute(tuiTarball) ? tuiTarball : path.join(tuiPackageDir, tuiTarball);
 		const nativesTarballPath = path.isAbsolute(nativesTarball)
 			? nativesTarball
@@ -81,7 +73,6 @@ async function runSmoke(): Promise<Surface> {
 					dependencies: {
 						"@gajae-code/agent-core": `file:${agentTarballPath}`,
 						"@gajae-code/ai": `file:${aiTarballPath}`,
-						"@gajae-code/bridge-client": `file:${bridgeClientTarballPath}`,
 						[packageName]: `file:${codingAgentTarballPath}`,
 						"@gajae-code/tui": `file:${tuiTarballPath}`,
 						"@gajae-code/natives": `file:${nativesTarballPath}`,
@@ -91,7 +82,6 @@ async function runSmoke(): Promise<Surface> {
 					overrides: {
 						"@gajae-code/agent-core": `file:${agentTarballPath}`,
 						"@gajae-code/ai": `file:${aiTarballPath}`,
-						"@gajae-code/bridge-client": `file:${bridgeClientTarballPath}`,
 						"@gajae-code/tui": `file:${tuiTarballPath}`,
 						"@gajae-code/natives": `file:${nativesTarballPath}`,
 						"@gajae-code/natives-linux-x64": `file:${linuxX64TarballPath}`,

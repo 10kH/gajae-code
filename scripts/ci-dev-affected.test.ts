@@ -1005,12 +1005,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		dir: "packages/coding-agent",
 		manifest: { name: "@gajae-code/coding-agent", scripts: { check: "biome check .", test: "bun test" } },
 	};
-	const bridgeClient: WorkspacePackage = {
-		name: "@gajae-code/bridge-client",
-		dir: "packages/bridge-client",
-		manifest: { name: "@gajae-code/bridge-client", scripts: { check: "biome check .", test: "bun test" } },
-	};
-	const targetingPackages: WorkspacePackage[] = [codingAgent, bridgeClient];
+	const targetingPackages: WorkspacePackage[] = [codingAgent];
 	const testFiles = [
 		"packages/coding-agent/test/edit/foo.test.ts",
 		"packages/coding-agent/test/edit/bar.test.ts",
@@ -1020,7 +1015,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		"packages/coding-agent/test/sdk-host-wiring.test.ts",
 		"packages/coding-agent/test/sdk/index.test.ts",
 		"packages/coding-agent/test/other/index.test.ts",
-		"packages/bridge-client/test/client.test.ts",
+		"packages/coding-agent/test/sdk-client.test.ts",
 	];
 
 	function targeted(paths: readonly string[]) {
@@ -1265,20 +1260,16 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(keys).toContain("release-publish-dry-run");
 	});
 
-	test("bridge-client changes retain package validation alongside release publish coverage", () => {
-		const tasks = targeted(["packages/bridge-client/src/client.ts"]);
+	test("internal SDK client changes retain package validation and packed-surface coverage", () => {
+		const tasks = targeted(["packages/coding-agent/src/sdk/client/client.ts"]);
 		const keys = tasks.map(task => task.key);
-		expect(keys.filter(key => key === "check:@gajae-code/bridge-client")).toHaveLength(1);
-		expect(keys.filter(key => key === "release-publish-contract")).toHaveLength(1);
-		expect(keys.filter(key => key === "release-publish-dry-run")).toHaveLength(1);
-		expect(keys.filter(key => key === "test:scripts/release-evidence.test.ts")).toHaveLength(1);
-		expect(keys.filter(key => key === "bridge-client-sdk-package-smoke")).toHaveLength(1);
-		expect(keys.filter(key => key === "test:packages/bridge-client/test/client.test.ts")).toHaveLength(1);
-		expect(tasks.find(task => task.key === "bridge-client-sdk-package-smoke")?.command).toEqual([
+		expect(keys.filter(key => key === "check:@gajae-code/coding-agent")).toHaveLength(1);
+		expect(keys.filter(key => key === "sdk-package-smoke")).toHaveLength(1);
+		expect(tasks.find(task => task.key === "sdk-package-smoke")?.command).toEqual([
 			"bun",
 			"packages/coding-agent/scripts/build-sdk-package-smoke.ts",
 		]);
-		expect(describeTasks(tasks).find(task => task.key === "bridge-client-sdk-package-smoke")?.native).toBe(true);
+		expect(describeTasks(tasks).find(task => task.key === "sdk-package-smoke")?.native).toBe(true);
 		expect(keys.filter(key => key === "native-linux-x64")).toHaveLength(1);
 	});
 
@@ -1392,11 +1383,6 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		manifest: { name: "@gajae-code/coding-agent", scripts: { check: "biome check .", test: "bun test" } },
 	};
 
-	const bridgeClient: WorkspacePackage = {
-		name: "@gajae-code/bridge-client",
-		dir: "packages/bridge-client",
-		manifest: { name: "@gajae-code/bridge-client", scripts: { check: "biome check .", test: "bun test" } },
-	};
 	test("push mode splits the package-wide coding-agent test across bounded shards", () => {
 		const tasks = planTasks(["packages/coding-agent/src/edit/foo.ts"], [codingAgent]);
 		const keys = tasks.map(task => task.key);
@@ -1440,21 +1426,16 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: true, nativeBuild: false });
 	});
 
-	test("push mode selects the bridge-client SDK package smoke exactly once for package and SDK client changes", () => {
-		const tasks = planTasks(
-			["packages/bridge-client/package.json", "packages/coding-agent/src/sdk/client/client.ts"],
-			[codingAgent, bridgeClient],
-		);
+	test("push mode selects the SDK package smoke for internal client changes", () => {
+		const tasks = planTasks(["packages/coding-agent/src/sdk/client/client.ts"], [codingAgent]);
 		const keys = tasks.map(task => task.key);
-		expect(keys.filter(key => key === "bridge-client-sdk-package-smoke")).toHaveLength(1);
-		expect(tasks.find(task => task.key === "bridge-client-sdk-package-smoke")?.command).toEqual([
+		expect(keys.filter(key => key === "sdk-package-smoke")).toHaveLength(1);
+		expect(tasks.find(task => task.key === "sdk-package-smoke")?.command).toEqual([
 			"bun",
 			"packages/coding-agent/scripts/build-sdk-package-smoke.ts",
 		]);
-		expect(describeTasks(tasks).find(task => task.key === "bridge-client-sdk-package-smoke")?.native).toBe(true);
+		expect(describeTasks(tasks).find(task => task.key === "sdk-package-smoke")?.native).toBe(true);
 		expect(keys.filter(key => key === "native-linux-x64")).toHaveLength(1);
-		expect(keys.filter(key => key === "release-publish-contract")).toHaveLength(1);
-		expect(keys.filter(key => key === "release-publish-dry-run")).toHaveLength(1);
 	});
 
 	test("full-workspace changes partition root tests into matrix shards", () => {

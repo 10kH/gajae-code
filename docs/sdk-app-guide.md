@@ -146,41 +146,11 @@ orchestrator patterns where a session must return machine-readable results.
 Pass `telemetry: {}` to enable OpenTelemetry GenAI-semantic-convention spans
 (no-op unless an OTEL SDK is registered in your host).
 
-## Quick start: attach from outside
+## Attach from another process
 
-Any running top-level session (including one your embedded app created) writes a
-discovery file:
+Process-isolated integrations use an SDK-core adapter backed by `SessionRouter`. Endpoint discovery records and bearer tokens are internal implementation details; applications must not read them or open raw session WebSockets.
 
-```
-<repo>/.gjc/state/sdk/<sessionId>.json   →  { url, port, token, ... }
-```
-
-Connect with any WebSocket client (`ws://127.0.0.1:<port>/?token=<token>`), or
-use the TypeScript transport package:
-
-```bash
-bun add @gajae-code/bridge-client
-```
-
-```ts
-import { SdkClient } from "@gajae-code/bridge-client";
-```
-
-A minimal client only handles three frames:
-
-- `action_needed` — a question needs an answer (`kind: "ask"`) or the agent is idle
-- `action_resolved` — that action is no longer answerable
-- `reply_rejected` — your reply failed (e.g. `already_answered`)
-
-and sends one: `reply`. See [sdk.md](./sdk.md#minimal-client-example) for the
-complete example and the optional threaded frames (`turn_stream`,
-`context_update`, `activity`, `image_attachment`, …).
-
-Beyond frames, the WS surface exposes typed **control operations**
-(`turn.prompt`, `turn.steer`, `ask.answer`, `model.set`, `session.fork`,
-`bash.execute`, …) and **queries** (`transcript.list/body`, `diff.*`,
-`usage.get`, `models.list/current`, `workflow.gates.list`, …). See the
-[SDK wire protocol & machine interfaces](./sdk.md) for the complete catalog.
+Managed adapters receive opaque `SessionAttachment` capabilities for live controls and submit lifecycle mutations through `SessionLifecycleService`. See [sdk.md](./sdk.md) for the ownership and adapter contract.
 
 The `models.list/current` (Q10) catalog also lists model profiles as synthetic
 `gajae-code/<profile>` entries (e.g. `gajae-code/codex-eco`). Treat them as
