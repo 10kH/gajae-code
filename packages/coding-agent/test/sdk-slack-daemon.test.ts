@@ -1281,6 +1281,31 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		);
 	});
 
+	it("does not let a detached startup clear a restarted daemon", async () => {
+		let boundedStop = false;
+		let nowCalls = 0;
+		const oldStartGate = Promise.withResolvers<void>();
+		await withDaemon(
+			async (daemon, fake) => {
+				fake.startGate = oldStartGate.promise;
+				const oldStart = daemon.start();
+				await fake.waitForStartCount(1);
+				boundedStop = true;
+				await daemon.stop();
+				boundedStop = false;
+				fake.startGate = undefined;
+				await daemon.start();
+				expect(fake.startCalls).toBe(2);
+				oldStartGate.resolve();
+				await oldStart;
+				await daemon.stop();
+				expect(fake.stops).toBe(2);
+				nowCalls = 0;
+			},
+			{ now: () => (boundedStop ? (nowCalls++ === 0 ? 0 : 5_001) : 0) },
+		);
+	});
+
 	it("fences tracked outbound notification work that races stop", async () => {
 		let stopping = false;
 		let nowCalls = 0;

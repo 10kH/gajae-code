@@ -194,8 +194,8 @@ export class SlackNotificationDaemon {
 	#startOperationGeneration: number | undefined;
 	#stopOperation: Promise<void> | undefined;
 	#started = false;
-	#providerStarting = false;
-	#providerRunning = false;
+	#providerStartingGeneration: number | undefined;
+	#providerRunningGeneration: number | undefined;
 	#providerStopRequestedGeneration: number | undefined;
 	#leaseRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
 	#leaseRecoveryAt: number | undefined;
@@ -239,12 +239,14 @@ export class SlackNotificationDaemon {
 					!this.#started ||
 					this.#startedGeneration !== lifecycleGeneration
 				) {
-					this.#started = false;
-					this.#startedGeneration = undefined;
-					this.#clearLeaseRecoveryTimer();
+					if (this.#startedGeneration === lifecycleGeneration) {
+						this.#started = false;
+						this.#startedGeneration = undefined;
+						this.#clearLeaseRecoveryTimer();
+					}
 					return;
 				}
-				this.#providerStarting = true;
+				this.#providerStartingGeneration = lifecycleGeneration;
 				try {
 					await this.options.provider.start(async envelope => {
 						if (
@@ -255,15 +257,19 @@ export class SlackNotificationDaemon {
 							return;
 						await this.#track(this.handleEnvelope(envelope));
 					});
-					this.#providerRunning = true;
+					if (this.#startedGeneration === lifecycleGeneration && this.#lifecycleGeneration === lifecycleGeneration)
+						this.#providerRunningGeneration = lifecycleGeneration;
 				} finally {
-					this.#providerStarting = false;
+					if (this.#providerStartingGeneration === lifecycleGeneration)
+						this.#providerStartingGeneration = undefined;
 				}
 				if (lifecycleGeneration !== this.#lifecycleGeneration || this.#startedGeneration !== lifecycleGeneration) {
-					this.#started = false;
-					this.#startedGeneration = undefined;
-					this.#providerRunning = false;
-					this.#clearLeaseRecoveryTimer();
+					if (this.#startedGeneration === lifecycleGeneration) {
+						this.#started = false;
+						this.#startedGeneration = undefined;
+						this.#clearLeaseRecoveryTimer();
+					}
+					if (this.#providerRunningGeneration === lifecycleGeneration) this.#providerRunningGeneration = undefined;
 					if (this.#providerStopRequestedGeneration !== lifecycleGeneration) await this.options.provider.stop();
 				}
 			} catch (error) {
@@ -290,10 +296,12 @@ export class SlackNotificationDaemon {
 	async stop(): Promise<void> {
 		if (this.#stopOperation) return await this.#stopOperation;
 		const lifecycleGeneration = this.#lifecycleGeneration++;
-		const stopProvider = this.#providerStarting || this.#providerRunning;
+		const stopProvider =
+			this.#providerStartingGeneration === lifecycleGeneration ||
+			this.#providerRunningGeneration === lifecycleGeneration;
 		this.#started = false;
 		this.#startedGeneration = undefined;
-		this.#providerRunning = false;
+		if (this.#providerRunningGeneration === lifecycleGeneration) this.#providerRunningGeneration = undefined;
 		this.#clearLeaseRecoveryTimer();
 		if (stopProvider) this.#providerStopRequestedGeneration = lifecycleGeneration;
 		const providerStop = stopProvider ? this.options.provider.stop() : undefined;
