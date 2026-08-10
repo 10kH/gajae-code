@@ -1,6 +1,6 @@
 {
   "kind": "computer-redteam-test-report",
-  "generatedAt": "2026-08-10T10:01:16.098Z",
+  "generatedAt": "2026-08-10T12:00:09.245Z",
   "commands": [
     "bun --cwd=packages/coding-agent test src/tools/computer.enforcement.test.ts",
     "cd packages/coding-agent && bun x tsc --noEmit -p ."

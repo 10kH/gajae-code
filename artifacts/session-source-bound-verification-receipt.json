@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "kind": "session-boundary-test-report",
+  "sourceCommit": "7dc128f45",
+  "sourceTree": "193b4fdc320daca96f2a85d79cb05e7cd9f5cfaf",
+  "cumulativeDiffSha256": "bc90efe0f7ba2e844d21fcb4253828a0607e95e972e2acac48ca27d472bc9278",
+  "results": [
+    {
+      "id": "package-typecheck",
+      "command": "bun --cwd=packages/coding-agent run check:types",
+      "status": "passed",
+      "artifact": "artifacts/session-source-bound-typecheck.txt"
+    },
+    {
+      "id": "focused-session-boundary",
+      "command": "bun test packages/coding-agent/test/session-manager-resume-oversized.test.ts packages/coding-agent/test/settings-session-memory.test.ts packages/coding-agent/test/modes/controllers/session-command.test.ts packages/coding-agent/test/session/session-memory-storage-contracts.test.ts packages/coding-agent/test/session/session-memory-integration.test.ts packages/coding-agent/test/session/session-memory-latency.test.ts packages/coding-agent/test/session/session-memory-sidecar.test.ts packages/coding-agent/test/session/session-memory-crash.test.ts packages/coding-agent/test/session/session-memory-rollout.test.ts",
+      "status": "passed",
+      "testsPassed": 223,
+      "testsSkipped": 1,
+      "testsFailed": 0,
+      "assertions": 22068,
+      "artifact": "artifacts/session-source-bound-focused-tests.xml"
+    },
+    {
+      "id": "opt-in-rss",
+      "command": "GJC_SESSION_MEMORY_RSS=1 bun test packages/coding-agent/test/session/session-memory-rss.test.ts",
+      "status": "passed",
+      "testsPassed": 13,
+      "testsFailed": 0,
+      "assertions": 76,
+      "artifact": "artifacts/session-source-bound-rss-tests.xml"
+    },
+    {
+      "id": "no-gc-rss-negative-control",
+      "command": "GJC_SESSION_MEMORY_GC_STRATEGY=none GJC_SESSION_MEMORY_RSS=1 bun test packages/coding-agent/test/session/session-memory-rss.test.ts",
+      "status": "expected_failure",
+      "testsPassed": 9,
+      "testsFailed": 4,
+      "artifact": "artifacts/session-source-bound-rss-none-tests.xml",
+      "evidence": "No-GC failed the product RSS envelope, including a 138477568-byte direct-fork RSS delta above the 134217728-byte ceiling."
+    },
+    {
+      "id": "mandatory-computer-redteam",
+      "command": "bun --cwd=packages/coding-agent test src/tools/computer.enforcement.test.ts",
+      "status": "passed",
+      "testsPassed": 1,
+      "testsFailed": 0,
+      "assertions": 10,
+      "artifact": "artifacts/session-source-bound-computer-tests.xml",
+      "caseReport": "artifacts/vb001-gen5/computer-redteam-test-report.json"
+    },
+    {
+      "id": "schema-sync",
+      "command": "bun run check:schemas",
+      "status": "passed",
+      "artifact": "artifacts/session-source-bound-schema-check.txt"
+    },
+    {
+      "id": "partial-report-render",
+      "command": "bun packages/coding-agent/bench/session-stress-report.ts --matrix artifacts/session-2gib-first-open-source-bound-2026-08-10.json --svg artifacts/session-2gib-first-open-source-bound-2026-08-10.svg --gib artifacts/session-gib-stress-source-bound-2026-08-10.json --out artifacts/session-stress-report-source-bound-2026-08-10.html",
+      "status": "passed",
+      "artifact": "artifacts/session-source-bound-report-render.txt"
+    }
+  ]
+}

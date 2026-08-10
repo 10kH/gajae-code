@@ -840,7 +840,7 @@ Do not weaken fail-closed behavior to improve benchmarks.
 
 ---
 
-## 12. Decision log
+## 12. Baseline decision log (superseded by §14)
 
 ### Supported conclusion
 
@@ -848,11 +848,11 @@ The system can support 2048 MiB explicit cold sessions with bounded process-memo
 
 ### Supported bottleneck classification
 
-Cold first-open construction is the dominant user-visible cost. The implementation performs two complete JSON parse passes and frequent synchronous GC, with additional per-record hashing/serialization/writes.
+At the baseline revision, cold first-open construction was the dominant user-visible cost. That implementation performed two complete JSON parse passes and frequent synchronous GC, with additional per-record hashing/serialization/writes.
 
-### Not yet supported
+### Not yet supported at the baseline revision
 
-- No symbol has profiler-confirmed CPU self-time.
+- No symbol had profiler-confirmed CPU self-time at the baseline revision; §14.3 records the later profiler evidence.
 - The 18.96-second linear 2048 MiB point is not established as a deterministic cliff.
 - The isolated small multi-transcript lookup spikes are not established algorithmic regressions.
 - High post-close RSS is not established as a leak.
@@ -870,11 +870,11 @@ These are bounded, independently testable changes with the strongest code eviden
 
 ---
 
-## 13. Final handoff summary
+## 13. Original handoff summary (superseded by §14)
 
-The memory-bound cold-session architecture is fundamentally successful. The next engineer should not redesign lookup or reintroduce eager transcript materialization. Optimize the raw-transcript-to-sidecar conversion path.
+At the baseline revision, the memory-bound cold-session architecture was fundamentally successful. The follow-up work therefore targeted the raw-transcript-to-sidecar conversion path rather than redesigning lookup or reintroducing eager transcript materialization.
 
-The most likely near-term win is eliminating excessive synchronous GC and enabling the existing reusable line assembler. The largest longer-term win is reducing cold first-open from two complete JSON parse passes to one full semantic/index pass plus a bounded hot-suffix pass. Preserve transcript authority, descriptor validation, authenticated sidecars, crash safety, and byte parity throughout.
+The original recommended direction was to eliminate excessive synchronous GC, enable reusable line assembly, and reduce cold first-open from two complete JSON parse passes to one full semantic/index pass plus a bounded hot-suffix pass. Section 14 records the implemented result and measured evidence.
 
 ---
 
@@ -909,73 +909,81 @@ The required optimization work is now implemented. This section supersedes the e
 
 ### 14.3 Profiler evidence
 
-Artifacts:
+Source-bound artifacts for commit `7dc128f45`:
 
-- `artifacts/profiles/session-first-open-1024.cpuprofile`
-- `artifacts/profiles/session-first-open-1024.md.md`
-- `artifacts/profiles/session-first-open-1024-final.cpuprofile`
-- `artifacts/profiles/session-first-open-1024-final.md.md`
+- `artifacts/profiles/session-first-open-1024-source-bound.cpuprofile`
+- `artifacts/profiles/session-first-open-1024-source-bound.md.md`
+- `artifacts/profiles/session-first-open-1024-source-bound-metadata.json`
+- `artifacts/session-first-open-1024-source-bound-run-md.json`
 
-The initial 1024 MiB profile attributed 27.5% self time to GC and 9.6% to synchronous open calls; immediate authenticated reclassification consumed about 1.22 seconds in phase telemetry. After pressure GC, bounded publication proof reuse, header-only preflight, targeted flat-index boundary lookup, and buffered/reused output, the final profile attributed 5.3% to GC and 0.2% to open calls. Hash update, writes, byte counting, JSON serialization, reads, and JSON parse are now the leading costs. The final profile identifies serialization/write/hash work—not GC or repeated file opening—as the remaining optimization surface.
+Earlier exploratory profiles are not acceptance evidence. The final 1024 MiB profile is explicitly bound to source tree `193b4fdc320daca96f2a85d79cb05e7cd9f5cfaf` and cumulative diff SHA-256 `bc90efe0f7ba2e844d21fcb4253828a0607e95e972e2acac48ca27d472bc9278`. It measured 984.97 ms first-open, five pressure-GC requests totaling 21.67 ms, and zero warm range reads. Self time is now led by hash update (44.4%), write (8.3%), JSON stringify (5.8%), GC (4.8%), byte counting (4.6%), read (4.4%), and parse (3.4%). GC and repeated file opening are no longer the dominant costs; hashing and index serialization/write are the remaining optimization surface.
 
 ### 14.4 Same-host A/B evidence
 
+Every artifact in this subsection records `gitSha: 7dc128f45bdc7d84883c4381ee5edbc22a01f306`.
+
 #### GC strategy
 
-`artifacts/session-gc-{current,none,async,pressure}-2026-08-10.{json,csv,svg}`:
+`artifacts/session-gc-{current,none,async,pressure}-source-bound-2026-08-10.{json,csv,svg}`:
 
 | Size | Strategy | First-open p50 | Operation RSS p50 |
 |---:|---|---:|---:|
-|128 MiB|current|638.4 ms|114.4 MiB|
-|128 MiB|none|635.3 ms|143.7 MiB|
-|128 MiB|async|612.8 ms|149.1 MiB|
-|128 MiB|pressure|530.8 ms|116.9 MiB|
-|512 MiB|current|2,378.3 ms|116.0 MiB|
-|512 MiB|none|2,266.4 ms|146.6 MiB|
-|512 MiB|async|2,124.4 ms|155.7 MiB|
-|512 MiB|pressure|2,009.2 ms|118.9 MiB|
+|128 MiB|current|276.5 ms|89.6 MiB|
+|128 MiB|none|167.9 ms|88.3 MiB|
+|128 MiB|async|180.2 ms|95.8 MiB|
+|128 MiB|pressure|186.9 ms|86.6 MiB|
+|512 MiB|current|664.4 ms|92.3 MiB|
+|512 MiB|none|494.5 ms|95.9 MiB|
+|512 MiB|async|518.7 ms|88.0 MiB|
+|512 MiB|pressure|515.0 ms|96.5 MiB|
 
-Pressure mode was the only tested strategy that materially reduced first-open time without accepting the unbounded-retention RSS increase of `none` or `async`.
+`none` is fastest in the isolated matrix, but it failed four opt-in RSS cases under the full product lifecycle; the one-GiB direct fork exceeded the 128 MiB allocator envelope at 138.5 MiB. Pressure mode passed all 13 RSS cases and remains the product default. The benchmark-only `none`, `async`, and `current` controls remain available for causal experiments.
 
 #### Secondary artifacts
 
-`artifacts/session-secondary-{current,off,lazy}-2026-08-10.{json,csv,svg}`:
+`artifacts/session-secondary-{current,off,lazy}-source-bound-2026-08-10.{json,csv,svg}`:
 
-Disabling synchronous dictionary/parent construction saved roughly 25–80 ms over 384–768 MiB and about 5 MiB RSS at 384/512 MiB. Median cold lookup remained below 1.6 ms in all tested modes. This evidence supports leaving the flat index authoritative and secondary artifacts disabled by default; it does not justify background publication complexity as a product default.
+Disabling synchronous dictionary/parent construction saved about 62–66 ms at 384/512 MiB and about 10 ms at 768 MiB. Median cold lookup remained between 0.7 and 1.3 ms. This supports keeping the flat index authoritative and secondary artifacts disabled by default across both first-open and later rebuilds; it does not justify background publication complexity as a product default.
 
 #### Multi-session opening
 
-`artifacts/session-subagent-open-{sequential,concurrency2}-2026-08-10.{json,csv,svg}` measured three isolated 512 MiB aggregate subagent-tree samples:
+`artifacts/session-subagent-{sequential,concurrency2}-source-bound-2026-08-10.{json,csv,svg}` measured three isolated 512 MiB aggregate subagent-tree samples:
 
-- sequential p50: 2,771.2 ms, 91.4 MiB operation RSS;
-- concurrency two p50: 2,738.9 ms, 99.8 MiB operation RSS.
+- sequential p50: 629.6 ms, 72.6 MiB operation RSS;
+- concurrency two p50: 629.6 ms, 80.1 MiB operation RSS.
 
-The 1.2% latency improvement did not justify the additional RSS and publication-concurrency surface. Product opening remains sequential; the matrix now exposes `--open-concurrency` for bounded evidence collection.
+Concurrency produced no latency improvement and increased RSS by 7.5 MiB. Product opening remains sequential; the matrix retains `--open-concurrency` as an evidence control only.
 
 #### Automatic routing
 
-`artifacts/session-small-auto-comparison-2026-08-10.{json,csv,svg}` covered 1/4/16/32/64 MiB. At 64 MiB, auto p50 was 213.86 ms versus off p50 210.68 ms, a 3.18 ms delta. `artifacts/session-auto-threshold-128mib-2026-08-10.{json,csv,svg}` confirmed the threshold transition. Ordinary sessions therefore remain eager without meaningful regression while large sessions gain bounded admission automatically.
+`artifacts/session-small-auto-source-bound-2026-08-10.{json,csv,svg}` covered 1/4/16/32/64 MiB with three isolated samples per mode. Auto p50 remained below off-mode p50 at every size because auto avoids the redundant full strict-inspection pass even when it selects eager state. At 64 MiB, auto p50 was 96.50 ms versus 204.41 ms off. `artifacts/session-auto-threshold-source-bound-2026-08-10.{json,csv,svg}` confirms bounded routing at 128 MiB.
 
 ### 14.5 Full-size result
 
-`artifacts/session-2gib-first-open-solo-2026-08-10.{json,csv,svg}` contains three fresh, uncontended 2048 MiB raw cold-first-open samples with auto routing, pressure GC, and default-disabled secondary artifacts:
+`artifacts/session-2gib-first-open-source-bound-2026-08-10.{json,csv,svg}` contains three fresh, uncontended 2048 MiB raw cold-first-open samples with auto routing, pressure GC, and default-disabled secondary artifacts:
 
-- p50: 4,798.6 ms;
-- p95/max: 5,131.5 ms;
-- p50 throughput: 426.8 MiB/s;
-- operation RSS p50/max: 94.9/95.0 MiB;
+- p50: 1,883.9 ms;
+- p95/max: 1,886.6 ms;
+- p50 throughput: 1,087.1 MiB/s;
+- operation RSS p50/max: 95.1/96.4 MiB;
 - cold lookup required one bounded range read;
 - warm lookup required zero range reads.
 
-This is below the prior accepted 8.2-second 2048 MiB first-open budget and removes the earlier 18.96-second outlier from the supported steady-state envelope.
+The full direct/captured fork corpus in `artifacts/session-gib-stress-source-bound-2026-08-10.json` is bound to the same source. Direct fork p50/p95 was 2,221.9/2,237.7 ms at 89.2/89.3 MiB RSS; captured fork p50/p95 was 2,266.6/2,851.2 ms at 86.2/86.3 MiB RSS. These results are below the accepted four-second fork and 8.2-second first-open budgets.
 
-### 14.6 Memory acceptance clarification
+### 14.6 Memory and verification acceptance
 
-Live bounded session state remains under the 64 MiB accountant budget. Current Bun/macOS allocator high-water RSS is separately bounded by a 128 MiB process envelope for large first-open/fork operations. The opt-in RSS suite continues to assert the 64 MiB live-accounting invariant and uses the larger envelope only for allocator-retained RSS pages. Report and `/session` output expose both classes instead of conflating reservation, live residency, disk bytes, and process RSS.
+Live bounded session state remains under the 64 MiB accountant budget. Bun/macOS allocator high-water RSS is separately bounded by a 128 MiB process envelope for large first-open/fork operations. Split metrics are recomputed from live cache, tail, provider-state, and reducer state rather than stale transition snapshots.
 
-### 14.7 Rejected follow-ups
+`artifacts/session-source-bound-verification-receipt.json` binds the final verification to commit `7dc128f45`: 223 focused tests passed with one intentional skip, all 13 opt-in RSS tests passed, all seven mandatory computer-enforcement adversarial cases passed, package typecheck passed, schema synchronization passed, and the partial source-bound report rendered successfully.
 
-- No product-default multi-session parallel opening: measured latency gain was negligible and RSS increased.
-- No background dictionary/parent publication: measured savings do not justify new marker replacement and concurrent-winner complexity.
+### 14.7 Review-closed safety behavior and rejected follow-ups
+
+- Bounded first-open publishers use an owner-bound exclusive build lock; a second opener waits for and adopts the authenticated winner rather than writing shared final paths concurrently.
+- Physical scanner rejection (unterminated input, oversized line, missing parent, or descriptor mutation) suppresses later eager sidecar reconstruction for that lifecycle.
+- Post-admission sidecar tamper on a transcript above the eager ceiling fails closed with a rebuild-required error rather than hydrating the entire transcript.
+- Secondary artifacts stay disabled across later sidecar rebuilds unless explicitly enabled.
+- Missing report dimensions, failed runs, and unrun fork modes remain unavailable/N/A rather than becoming zero-valued or cross-operation evidence.
+- No product-default multi-session parallel opening: measured latency gain was zero and RSS increased.
+- No background dictionary/parent publication: measured savings do not justify new marker replacement complexity.
 - No unbounded ID map or transcript-sized entry graph: exact compaction authority remains the private flat index plus a bounded target lookup and suffix read.
-- No eager fallback after bounded construction failure for oversized admitted transcripts: failures continue to fail closed.
