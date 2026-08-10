@@ -1612,9 +1612,14 @@ export class DiscordNotificationDaemon {
 		let renewal: Promise<boolean> | undefined;
 		let expectedGeneration = intent.generation;
 		const workGeneration = this.#workGeneration;
+		const abandonCurrent = async (): Promise<void> => {
+			await this.#abandonCreator(this.#intentKey(intent.sessionId!), intent);
+		};
 		const invalidate = async (): Promise<void> => {
 			lost = true;
-			await this.#abandonCreator(this.#intentKey(intent.sessionId!), intent);
+			const activeRenewal = renewal;
+			if (activeRenewal) await activeRenewal.catch(() => false);
+			await abandonCurrent();
 		};
 		this.#workInvalidators.add(invalidate);
 		const renew = async (): Promise<boolean> => {
@@ -1645,7 +1650,8 @@ export class DiscordNotificationDaemon {
 						intent.generation = current.generation;
 						intent.createLeaseExpiresAt = current.createLeaseExpiresAt;
 					}
-					await invalidate();
+					lost = true;
+					await abandonCurrent();
 					return false;
 				}
 				if (
@@ -1789,6 +1795,12 @@ export class DiscordNotificationDaemon {
 			effect = reclaimed;
 		}
 		const lease: ChatEffectLease = { owner: this.#providerOwner, epoch: effect.epoch };
+		if (workGeneration !== this.#workGeneration) {
+			await this.#rescheduleAfterEffectTransition(
+				this.#effects.record(id, lease, "uncertain", { status: "shutdown_timeout" }),
+			);
+			throw new Error(`Discord effect ${id} was admitted after shutdown drain expiry`);
+		}
 		let renewalLost = false;
 		let revalidationFailed = false;
 		let providerEffectStarted = false;

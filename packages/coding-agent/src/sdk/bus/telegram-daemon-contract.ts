@@ -194,8 +194,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 130 invalidates Discord effect lease renewal when shutdown drain expires.
  * Generation 131 invalidates Discord effect leases at the journal mutation boundary.
  * Generation 132 invalidates Discord create-intent leases at drain expiry.
+ * Generation 133 serializes Discord creator invalidation with in-flight admission.
  */
-export const DAEMON_GENERATION = 132;
+export const DAEMON_GENERATION = 133;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -273,5 +274,6 @@ export const DAEMON_GENERATION = 132;
  * Epoch 77 fences late Discord effect commits after Router revocation.
  * Epoch 78 atomically marks timed-out Discord work uncertain before Router revocation.
  * Epoch 79 releases timed-out Discord creator ownership for successor recovery.
+ * Epoch 80 terminalizes leases admitted after shutdown invalidator snapshot.
  */
-export const SERVING_EPOCH = 79;
+export const SERVING_EPOCH = 80;

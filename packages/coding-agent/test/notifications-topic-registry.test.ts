@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes create-intent-fence generation 132 at serving epoch 79", () => {
+test("publishes serialized-invalidation generation 133 at serving epoch 80", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 132 / serving epoch 79: timed-out Discord creator ownership is released.
-	expect(DAEMON_GENERATION).toBe(132);
-	expect(SERVING_EPOCH).toBe(79);
+	// Generation 133 / serving epoch 80: late Discord admissions are terminalized after drain expiry.
+	expect(DAEMON_GENERATION).toBe(133);
+	expect(SERVING_EPOCH).toBe(80);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
