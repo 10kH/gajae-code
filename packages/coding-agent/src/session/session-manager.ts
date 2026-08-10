@@ -6364,6 +6364,7 @@ export class SessionManager {
 	#ownedManagedAuthority: ManagedSessionDescendantStore | undefined;
 	#managedSidecarCacheStore: EphemeralBlobStore | undefined;
 	#managedSidecarCacheSessionFile: string | undefined;
+	#managedRangeExpectedDescriptor: DescriptorSnapshot | undefined;
 	#boundedReadStorageProxy: SessionStorage | undefined;
 	// When set, take precedence over the lazily-derived per-session manager.
 	// Subagents adopt the parent's manager so artifact IDs are unique across the
@@ -7022,6 +7023,7 @@ export class SessionManager {
 		try {
 			const commit = this.#readSessionCommitContents();
 			const descriptor = this.#managedDescriptorSnapshotOrNull();
+			if (this.destination.kind === "managed") this.#managedRangeExpectedDescriptor = descriptor ?? undefined;
 			if (
 				!commit ||
 				!descriptor ||
@@ -7251,6 +7253,7 @@ export class SessionManager {
 		let initialized = false;
 		try {
 			const before = this.#managedDescriptorSnapshotOrNull();
+			if (this.destination.kind === "managed") this.#managedRangeExpectedDescriptor = before ?? undefined;
 			if (!before || before.size === 0 || before.size > BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES) {
 				this.#lazyReopenFallbackReason = "bounded_first_open_unreadable";
 				return false;
@@ -9837,6 +9840,7 @@ export class SessionManager {
 		this.#managedSidecarCacheStore?.dispose();
 		this.#managedSidecarCacheStore = undefined;
 		this.#managedSidecarCacheSessionFile = undefined;
+		this.#managedRangeExpectedDescriptor = undefined;
 	}
 
 	#isManagedSidecarPath(candidate: string): boolean {
@@ -9865,7 +9869,22 @@ export class SessionManager {
 			this.#sessionFile &&
 			path.resolve(filePath) === path.resolve(this.#sessionFile)
 		) {
-			return this.#managedTranscriptStore(filePath).readRangeExpectedSync(path.basename(filePath), start, length);
+			try {
+				return this.#managedTranscriptStore(filePath).readRangeExpectedSync(
+					path.basename(filePath),
+					start,
+					length,
+					this.#managedRangeExpectedDescriptor,
+				);
+			} catch (error) {
+				if (
+					error instanceof Error &&
+					(error.message === "managed_range_generation_mismatch" || error.message === "source_changed") &&
+					this.#sidecarRuntime
+				)
+					this.#sidecarRuntime.rangeReadGenerationMismatchCount++;
+				throw error;
+			}
 		}
 		if (!this.storage.readRangeSync) throw new Error("Session range reads are unavailable");
 		return this.storage.readRangeSync(filePath, start, length);
@@ -9989,6 +10008,7 @@ export class SessionManager {
 					} finally {
 						writer.closeSync();
 					}
+					this.#managedRangeExpectedDescriptor = descriptor;
 					this.#commitGen = gen;
 					return true;
 				}
@@ -16979,6 +16999,19 @@ export class SessionManager {
 			throw new Error("Nested managed session escaped retained authority");
 		store.assertBound();
 		const captured = store.readExpected(path.basename(resolved));
+		const capturedDescriptor = store.descriptorExpected(path.basename(resolved));
+		if (
+			Boolean(captured) !== Boolean(capturedDescriptor) ||
+			(captured &&
+				capturedDescriptor &&
+				(captured.identity.dev !== capturedDescriptor.dev ||
+					captured.identity.ino !== capturedDescriptor.ino ||
+					captured.identity.nlink !== capturedDescriptor.nlink ||
+					captured.identity.size !== capturedDescriptor.size ||
+					captured.identity.mtimeNs !== capturedDescriptor.mtimeNs ||
+					captured.identity.ctimeNs !== capturedDescriptor.ctimeNs))
+		)
+			throw new Error("source_changed");
 		const entries = captured ? parseSessionEntries(captured.bytes.toString("utf8")) : [];
 		const header = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		const sessionCwd = cwdOverride ? path.resolve(cwdOverride) : (header?.cwd ?? getProjectDir());
@@ -16988,16 +17021,19 @@ export class SessionManager {
 		if (header && cwdChanged) header.cwd = sessionCwd;
 		const manager = new SessionManager(sessionCwd, destination.directory, true, storage, destination);
 		manager.#sessionMemoryMode = sessionMemoryMode;
+		let transcriptChanged = false;
 		if (entries.length > 0) {
 			const migrationApplied = migrateToCurrentVersion(entries) || cwdChanged;
+			transcriptChanged = migrationApplied;
 			await manager.#hydrateExistingSession(resolved, entries, migrationApplied, "memory-fallback");
 			if (cwdChanged) {
 				await manager.#rewriteFile();
 				manager.#flushed = true;
 				manager.#ensuredOnDisk = true;
 			}
+			if (cwdChanged) transcriptChanged = true;
 			writeTerminalBreadcrumb(manager.cwd, resolved);
-			await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
+			if (await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist()) transcriptChanged = true;
 		} else {
 			const fresh = manager.#freshSessionState(undefined, resolved);
 			const transition = manager.#prepareFreshSessionTransition(fresh, "memory-fallback");
@@ -17008,8 +17044,14 @@ export class SessionManager {
 			await manager.#rewriteFile();
 			manager.#flushed = true;
 			manager.#ensuredOnDisk = true;
+			transcriptChanged = true;
 		}
 		store.assertBound();
+		if (!transcriptChanged) {
+			const finalDescriptor = store.descriptorExpected(path.basename(resolved));
+			if (!capturedDescriptor || !finalDescriptor || !sameDescriptor(capturedDescriptor, finalDescriptor))
+				throw new Error("source_changed");
+		}
 		manager.buildSessionContext();
 		return manager;
 	}

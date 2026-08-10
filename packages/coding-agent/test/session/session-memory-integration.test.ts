@@ -3,7 +3,7 @@ import * as crypto from "node:crypto";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getBlobsDir, logger, TempDir } from "@gajae-code/utils";
+import { getBlobsDir, getResidentCacheRootDir, logger, TempDir } from "@gajae-code/utils";
 import {
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
@@ -353,7 +353,10 @@ describe("SessionManager cold sidecar integration", () => {
 			});
 			expect(reopened.getSessionMemoryStats().totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 			expect(reopened.hotRetainedMessageCharsForTests()).toBeLessThan(1024);
+			const reopenedStat = fs.statSync(sessionFile);
+			fs.utimesSync(sessionFile, reopenedStat.atime, new Date(reopenedStat.mtimeMs + 2_000));
 			expect(reopened.getEntry(coldId)?.id).toBe(coldId);
+			expect(reopened.getSessionMemoryStats().rangeReadGenerationMismatchCount).toBeGreaterThan(0);
 		} finally {
 			await reopened.close();
 			tempDir.removeSync();
@@ -428,6 +431,141 @@ describe("SessionManager cold sidecar integration", () => {
 			rootStore.close();
 			tempDir.removeSync();
 		}
+	}, 60_000);
+	it("rejects nested managed transcript replacement after capture", async () => {
+		const tempDir = TempDir.createSync("@pi-session-memory-nested-swap-");
+		const cwd = path.join(tempDir.path(), "project");
+		const managedRoot = path.join(tempDir.path(), "managed");
+		const profileAgentDir = path.join(tempDir.path(), "agent-profile");
+		fs.mkdirSync(cwd, { recursive: true });
+		fs.mkdirSync(managedRoot, { recursive: true, mode: 0o700 });
+		const rootStore = new ManagedSessionDescendantStore(
+			managedDirectoryRoot(managedRoot),
+			managedRoot,
+			undefined,
+			undefined,
+			profileAgentDir,
+		);
+		rootStore.ensureDirectory("review");
+		const nestedStore = rootStore.deriveSubtree("review");
+		const sessionFile = path.join(nestedStore.dir, "review.jsonl");
+		const originalRead = nestedStore.readExpected.bind(nestedStore);
+		try {
+			nestedStore.publishNoReplaceSync(
+				"review.jsonl",
+				Buffer.from(`${JSON.stringify({ type: "session", version: 5, id: "nested-swap", timestamp: "0", cwd })}\n`),
+			);
+			let replaced = false;
+			vi.spyOn(nestedStore, "readExpected").mockImplementation(relativePath => {
+				const snapshot = originalRead(relativePath);
+				if (!replaced && relativePath === "review.jsonl") {
+					replaced = true;
+					nestedStore.replaceSync(
+						"review.jsonl",
+						Buffer.from(
+							`${JSON.stringify({ type: "session", version: 5, id: "attacker", timestamp: "0", cwd })}\n`,
+						),
+					);
+				}
+				return snapshot;
+			});
+			await expect(
+				SessionManager.openNestedManaged(
+					sessionFile,
+					SessionManager.nestedManagedDestination(nestedStore, nestedStore.dir),
+					nestedStore,
+					new FileSessionStorage(),
+					cwd,
+					"enabled",
+				),
+			).rejects.toThrow("source_changed");
+		} finally {
+			rootStore.close();
+			tempDir.removeSync();
+		}
+	}, 60_000);
+	it("reopens nested managed cold history and disposes its private sidecar cache", async () => {
+		const tempDir = TempDir.createSync("@pi-session-memory-nested-reopen-");
+		const cwd = path.join(tempDir.path(), "project");
+		const managedRoot = path.join(tempDir.path(), "managed");
+		const profileAgentDir = path.join(tempDir.path(), "agent-profile");
+		fs.mkdirSync(cwd, { recursive: true });
+		fs.mkdirSync(managedRoot, { recursive: true, mode: 0o700 });
+		const rootStore = new ManagedSessionDescendantStore(
+			managedDirectoryRoot(managedRoot),
+			managedRoot,
+			undefined,
+			undefined,
+			profileAgentDir,
+		);
+		rootStore.ensureDirectory("review");
+		const nestedStore = rootStore.deriveSubtree("review");
+		const destination = SessionManager.nestedManagedDestination(nestedStore, nestedStore.dir);
+		const manager = SessionManager.create(cwd, destination, new FileSessionStorage());
+		let coldId = "";
+		let firstKeptEntryId = "";
+		let sessionFile = "";
+		try {
+			manager.setSessionMemoryMode("enabled");
+			manager.appendMessage({ role: "user", content: "root", timestamp: Date.now() });
+			manager.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "published" }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+			});
+			for (let index = 0; index < 200; index++) {
+				const id = manager.appendMessage({
+					role: "user",
+					content: `nested-reopen-${index}-${"x".repeat(256)}`,
+					timestamp: Date.now(),
+				});
+				coldId ||= id;
+				firstKeptEntryId = id;
+			}
+			manager.appendCompaction("summary", undefined, firstKeptEntryId, 10_000);
+			sessionFile = manager.getSessionFile() ?? "";
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		} finally {
+			await manager.close();
+		}
+		const cacheRoot = getResidentCacheRootDir(profileAgentDir);
+		const beforeReopen = fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0;
+		const reopened = await SessionManager.openNestedManaged(
+			sessionFile,
+			destination,
+			nestedStore,
+			new FileSessionStorage(),
+			cwd,
+			"enabled",
+		);
+		try {
+			expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			expect(reopened.getSessionMemoryStats().totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+			expect(reopened.getEntry(coldId)?.id).toBe(coldId);
+			expect(fs.readdirSync(cacheRoot).length).toBeGreaterThan(beforeReopen);
+		} finally {
+			await reopened.close();
+		}
+		expect(fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0).toBe(beforeReopen);
+		expect(
+			fs
+				.readdirSync(managedRoot, { recursive: true })
+				.some(entry => String(entry).includes(".session-memory.spill")),
+		).toBe(false);
+		rootStore.close();
+		tempDir.removeSync();
 	}, 60_000);
 	it("fails closed when the authoritative cold prefix changes after shadow indexing", async () => {
 		const tempDir = TempDir.createSync("@pi-session-memory-mismatch-");

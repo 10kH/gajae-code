@@ -509,11 +509,13 @@ describe("managed descriptor reads", () => {
 			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
 			const bytes = Buffer.from("descriptor payload\n");
 			store.publishNoReplaceSync("session.jsonl", bytes);
+			const readSpy = vi.spyOn(fs, "readSync");
 			const descriptor = store.descriptorExpected("session.jsonl");
 			expect(descriptor).toMatchObject({ size: bytes.byteLength, isFile: true });
 			expect(descriptor?.dev).toBeTypeOf("bigint");
 			expect(descriptor?.ino).toBeTypeOf("bigint");
 			expect(store.descriptorExpected("missing.jsonl")).toBeNull();
+			expect(readSpy).not.toHaveBeenCalled();
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -541,6 +543,53 @@ describe("managed descriptor reads", () => {
 				return count;
 			}) as never);
 			expect(() => store.readRangeExpectedSync("session.jsonl", 0, 4)).toThrow("source_changed");
+			spy.mockRestore();
+		} finally {
+			store.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+	it("binds ranges to the caller's committed descriptor generation", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-generation-")));
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+		try {
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("generation-one\n"));
+			const expected = store.descriptorExpected("session.jsonl");
+			if (!expected) throw new Error("Expected managed transcript descriptor");
+			store.replaceSync("session.jsonl", Buffer.from("generation-two\n"));
+			expect(() => store.readRangeExpectedSync("session.jsonl", 0, 4, expected)).toThrow(
+				"managed_range_generation_mismatch",
+			);
+		} finally {
+			store.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.platform === "win32")("rejects a FIFO pathname substitution without blocking", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-fifo-")));
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+		const transcript = path.join(root, "session.jsonl");
+		const detached = `${transcript}.detached`;
+		try {
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("fifo-safe\n"));
+			const expected = store.descriptorExpected("session.jsonl");
+			if (!expected) throw new Error("Expected managed transcript descriptor");
+			const openSync = fs.openSync;
+			let observedFlags = 0;
+			const spy = vi.spyOn(fs, "openSync").mockImplementationOnce(((
+				file: fs.PathLike,
+				flags: fs.OpenMode,
+				mode?: fs.Mode,
+			) => {
+				observedFlags = Number(flags);
+				fs.renameSync(transcript, detached);
+				const created = Bun.spawnSync(["mkfifo", transcript]);
+				if (created.exitCode !== 0) throw new Error("Could not create FIFO fixture");
+				return openSync(file, flags, mode);
+			}) as typeof fs.openSync);
+			expect(() => store.readRangeExpectedSync("session.jsonl", 0, 4, expected)).toThrow("source_changed");
+			expect(observedFlags & fs.constants.O_NONBLOCK).toBe(fs.constants.O_NONBLOCK);
 			spy.mockRestore();
 		} finally {
 			store.close();

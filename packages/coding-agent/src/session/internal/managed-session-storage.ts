@@ -1476,8 +1476,55 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
-			const snapshot = this.readExpected(relativePath);
-			return snapshot ? managedAppendReceiptFromIdentity(snapshot.identity).descriptor : null;
+			const rootBefore = fs.lstatSync(this.#baseDir, { bigint: true });
+			if (
+				!rootBefore.isDirectory() ||
+				rootBefore.isSymbolicLink() ||
+				rootBefore.dev !== this.#subtreeRoot.dev ||
+				rootBefore.ino !== this.#subtreeRoot.ino
+			)
+				throw new Error("Managed descendant root binding changed");
+			let fd: number | undefined;
+			try {
+				fd = fs.openSync(
+					resolved,
+					fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0),
+				);
+				const opened = fs.fstatSync(fd, { bigint: true });
+				const named = fs.lstatSync(resolved, { bigint: true });
+				if (
+					!opened.isFile() ||
+					opened.nlink > 1n ||
+					!named.isFile() ||
+					named.isSymbolicLink() ||
+					named.dev !== opened.dev ||
+					named.ino !== opened.ino ||
+					named.nlink !== opened.nlink
+				)
+					throw new Error("source_changed");
+				const rootAfter = fs.lstatSync(this.#baseDir, { bigint: true });
+				if (
+					!rootAfter.isDirectory() ||
+					rootAfter.isSymbolicLink() ||
+					rootAfter.dev !== rootBefore.dev ||
+					rootAfter.ino !== rootBefore.ino
+				)
+					throw new Error("Managed descendant root binding changed");
+				this.#assertBound();
+				return managedAppendReceiptFromIdentity({
+					dev: opened.dev,
+					ino: opened.ino,
+					nlink: opened.nlink,
+					size: Number(opened.size),
+					mtimeNs: opened.mtimeNs,
+					ctimeNs: opened.ctimeNs,
+				}).descriptor;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+				throw error;
+			} finally {
+				if (fd !== undefined) fs.closeSync(fd);
+			}
 		}
 		const stat = this.#authority.stat(this.#relative(resolved));
 		if (!stat.ok) {
@@ -1494,7 +1541,12 @@ export class ManagedSessionDescendantStore {
 	 * before and after the read. This avoids whole-transcript capture for cold
 	 * managed-session indexing without weakening pathname authority.
 	 */
-	readRangeExpectedSync(relativePath: string, start: number, length: number): SessionStorageRangeSnapshot {
+	readRangeExpectedSync(
+		relativePath: string,
+		start: number,
+		length: number,
+		expectedDescriptor?: Pick<SessionStorageStat, "dev" | "ino" | "nlink" | "size" | "mtimeNs" | "ctimeNs">,
+	): SessionStorageRangeSnapshot {
 		if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(length) || length < 0)
 			throw new RangeError("Invalid managed range read");
 		if (length > 64 * 1024 * 1024) throw new RangeError("Managed range read exceeds the bounded maximum");
@@ -1516,7 +1568,10 @@ export class ManagedSessionDescendantStore {
 			throw new Error(retained.code ?? "managed_stat_failed");
 		}
 		if (retained && !retained.identity) throw new Error("managed_stat_identity_unavailable");
-		const fd = fs.openSync(resolved, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+		const fd = fs.openSync(
+			resolved,
+			fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0),
+		);
 		try {
 			const before = fs.fstatSync(fd, { bigint: true });
 			if (!before.isFile() || before.nlink > 1n) throw new Error("source_changed");
@@ -1532,6 +1587,16 @@ export class ManagedSessionDescendantStore {
 				)
 					throw new Error("source_changed");
 			}
+			if (
+				expectedDescriptor &&
+				(before.dev !== expectedDescriptor.dev ||
+					before.ino !== expectedDescriptor.ino ||
+					before.nlink !== (expectedDescriptor.nlink ?? before.nlink) ||
+					Number(before.size) !== expectedDescriptor.size ||
+					before.mtimeNs !== expectedDescriptor.mtimeNs ||
+					before.ctimeNs !== expectedDescriptor.ctimeNs)
+			)
+				throw new Error("managed_range_generation_mismatch");
 			if (Number(before.size) < start + length) throw new Error("range_not_present");
 			const bytes = Buffer.alloc(length);
 			let offset = 0;
