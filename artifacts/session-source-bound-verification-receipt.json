@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "kind": "session-boundary-test-report",
-  "sourceCommit": "b7896b0eb",
-  "sourceTree": "6a41821627e1b88ac80098a35a3a4f985e7a995a",
-  "cumulativeDiffSha256": "eaeff00651a287cff0e46acaea1f71d86388d2a6b41a396ed2efc111789c997a",
+  "sourceCommit": "94de8e2eb",
+  "sourceTree": "968bc4ea9de2dc56d8e5a3d20ceebb4d1b26fdc8",
+  "cumulativeDiffSha256": "d0d984f137d00871c881b4c05405944ba8e169782eb8675338371dab19600f47",
   "results": [
     {
       "id": "package-typecheck",
@@ -15,10 +15,10 @@
       "id": "focused-session-boundary",
       "command": "bun test packages/coding-agent/test/session-manager-resume-oversized.test.ts packages/coding-agent/test/settings-session-memory.test.ts packages/coding-agent/test/modes/controllers/session-command.test.ts packages/coding-agent/test/session/session-memory-storage-contracts.test.ts packages/coding-agent/test/session/session-memory-integration.test.ts packages/coding-agent/test/session/session-memory-latency.test.ts packages/coding-agent/test/session/session-memory-sidecar.test.ts packages/coding-agent/test/session/session-memory-crash.test.ts packages/coding-agent/test/session/session-memory-rollout.test.ts",
       "status": "passed",
-      "testsPassed": 226,
+      "testsPassed": 227,
       "testsSkipped": 1,
       "testsFailed": 0,
-      "assertions": 22148,
+      "assertions": 22154,
       "artifact": "artifacts/session-source-bound-focused-tests.xml"
     },
     {
@@ -46,7 +46,7 @@
       "testsPassed": 11,
       "testsFailed": 2,
       "artifact": "artifacts/session-source-bound-rss-none-tests.xml",
-      "evidence": "No-GC failed the 60k first-build 64 MiB RSS ceiling at 124190720 bytes and the million-record 128 MiB allocator ceiling at 135790592 bytes."
+      "evidence": "No-GC failed the 60k first-build 64 MiB RSS ceiling at 124092416 bytes and the million-record 128 MiB allocator ceiling at 134856704 bytes."
     },
     {
       "id": "mandatory-computer-redteam",
