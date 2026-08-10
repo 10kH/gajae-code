@@ -4,6 +4,7 @@
 
 ### Fixed
 - Memory-pressure sweeps now request asynchronous garbage collection instead of forcing a stop-the-world collection on the main event loop, preventing periodic input and rendering stalls under the opt-in memory guard.
+- `gjc gc --disk --prune` now fences the blob mark/sweep so a session transcript that keeps changing under the mark can never cause unsafe reclamation: each transcript's references are bound to a stat snapshot taken before and after its read, the store must be observed completely quiet across a quiescence window before the sweep may act, and the fence is re-verified immediately before every removal. A store that still moves withholds the sweep with `keep:withheld_evidence_incomplete: sessions_changed_during_mark` instead of reclaiming on evidence it could not prove stable (#4158).
 - Follow-up queue auto-continuation now waits for compaction and foreground bash/eval work to settle, preventing queued prompts from starting a model turn concurrently with those operations.
 - Follow-up queue submissions now defer slash/skill text during foreground bash/eval work instead of invoking a competing custom-message turn.
 - Follow-up queues now resume through a dedicated queued-message continuation after Python/Bash execution tails, avoiding an extra stale-turn replay.
