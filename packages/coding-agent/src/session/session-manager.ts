@@ -1306,6 +1306,25 @@ const PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS = 64 * 1024;
 const PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES = 512 * 1024 * 1024;
 const residentHotEntryBytes = (serializedBytes: number): number => residentRecordBytes(serializedBytes * 2 + 256);
 
+/** A bounded parsed entry retained from the semantic/index pass. */
+interface BoundedFirstOpenRingEntry {
+	id: string;
+	ordinal: number;
+	entry: SessionEntry;
+	byteOffset: number;
+	byteLength: number;
+	recordDigest: string;
+	parentId: string | null;
+	entryType: string;
+}
+
+interface BoundedFirstOpenHashCheckpoint {
+	offset: number;
+	hash: crypto.Hash;
+}
+
+const BOUNDED_FIRST_OPEN_HASH_CHECKPOINT_INTERVAL_BYTES = 64 * 1024 * 1024;
+
 /** State the bounded first-open scan derives without building an entry graph. */
 interface BoundedFirstOpenDiscovery {
 	/** Exactly one current-version header on the first line. */
@@ -1314,6 +1333,8 @@ interface BoundedFirstOpenDiscovery {
 	leafId: string;
 	/** First entry retained by the latest reachable compaction (retirement boundary). */
 	retirementFirstKeptEntryId: string;
+	/** Ordinal of the compaction entry that selected the retained boundary. */
+	retirementCompactionOrdinal: number;
 	/** Latest model-change / TTSR reducer state over the linear chain. */
 	reducer: ReducerState;
 	/** Aggregated assistant/task usage totals over the linear chain. */
@@ -1324,6 +1345,12 @@ interface BoundedFirstOpenDiscovery {
 	labels: Array<[string, string]>;
 	/** Latest provider-affecting entries with exact ordinals, bounded by the reducer reservation. */
 	providerState: Array<{ ordinal: number; entry: SessionEntry }>;
+	/** Recent parsed entries retained within the existing hot suffix budget. */
+	ring: BoundedFirstOpenRingEntry[];
+	/** SHA-256 prefix states at bounded transcript offsets. */
+	hashCheckpoints: BoundedFirstOpenHashCheckpoint[];
+	/** Exact digest of the private flat index written by the semantic pass. */
+	indexDigest: string;
 }
 
 type BoundedLineScanFailure = "read_failed" | "oversized_line" | "unterminated" | "aborted";
@@ -1342,6 +1369,38 @@ type BoundedLineScanFailure = "read_failed" | "oversized_line" | "unterminated" 
 function decodeBoundedJsonLine(lineBytes: Uint8Array): string {
 	const length = lineBytes.at(-1) === 0x0a ? lineBytes.byteLength - 1 : lineBytes.byteLength;
 	return Buffer.from(lineBytes.buffer, lineBytes.byteOffset, length).toString("utf8");
+}
+
+function updateBoundedTranscriptHash(
+	hash: crypto.Hash,
+	lineStart: number,
+	lineBytes: Uint8Array,
+	state: { nextCheckpointOffset: number; hashedOffset: number },
+	checkpoints: BoundedFirstOpenHashCheckpoint[],
+): boolean {
+	if (lineStart !== state.hashedOffset) return false;
+	let offset = 0;
+	while (offset < lineBytes.byteLength) {
+		const absolute = lineStart + offset;
+		if (absolute >= state.nextCheckpointOffset) {
+			checkpoints.push({ offset: state.nextCheckpointOffset, hash: hash.copy() });
+			state.nextCheckpointOffset += BOUNDED_FIRST_OPEN_HASH_CHECKPOINT_INTERVAL_BYTES;
+			continue;
+		}
+		const end = Math.min(
+			lineBytes.byteLength,
+			offset + Math.max(1, state.nextCheckpointOffset - absolute),
+		);
+		hash.update(lineBytes.subarray(offset, end));
+		offset = end;
+		state.hashedOffset = lineStart + offset;
+		if (state.hashedOffset === state.nextCheckpointOffset) {
+			checkpoints.push({ offset: state.nextCheckpointOffset, hash: hash.copy() });
+			state.nextCheckpointOffset += BOUNDED_FIRST_OPEN_HASH_CHECKPOINT_INTERVAL_BYTES;
+		}
+	}
+	state.hashedOffset = lineStart + lineBytes.byteLength;
+	return true;
 }
 
 function createBoundedLineChunkConsumer(visit: (lineStart: number, lineBytes: Uint8Array) => boolean | undefined): {
@@ -1469,6 +1528,7 @@ function scanTranscriptLinesBounded(
 	allowUnterminated = false,
 	reuseLineAssembly = false,
 	firstOpenTelemetry?: SessionMemoryFirstOpenTelemetry,
+	countAsTranscriptBytes = true,
 ): BoundedLineScanFailure | undefined {
 	const chunkBytes =
 		size > PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES
@@ -1504,7 +1564,7 @@ function scanTranscriptLinesBounded(
 				pos += length;
 				if (firstOpenTelemetry) {
 					firstOpenTelemetry.bytesRead += length;
-					firstOpenTelemetry.transcriptBytesRead += length;
+					if (countAsTranscriptBytes) firstOpenTelemetry.transcriptBytesRead += length;
 				}
 				useLargeRecordCadence ||= consumer.hasLargePendingLine();
 				const gcIntervalBytes = useLargeRecordCadence
@@ -1572,7 +1632,7 @@ function scanTranscriptLinesBounded(
 		pos += length;
 		if (firstOpenTelemetry) {
 			firstOpenTelemetry.bytesRead += length;
-			firstOpenTelemetry.transcriptBytesRead += length;
+			if (countAsTranscriptBytes) firstOpenTelemetry.transcriptBytesRead += length;
 		}
 		useLargeRecordCadence ||= consumer.hasLargePendingLine();
 		const gcIntervalBytes = useLargeRecordCadence
@@ -7430,10 +7490,10 @@ export class SessionManager {
 	 * reusable commit marker exists. Limited to ordinary current-version linear
 	 * transcript-v5 JSONL with no patch records, duplicate ids, branches,
 	 * migrations, or unsupported storage authority. Scans the transcript in
-	 * bounded 64 KiB ranges (two passes max) without `loadEntriesFromFile`,
-	 * `readText*`, `readBytesSync`, or a full entry graph, builds the disposable
-	 * `.spill.idx`/`.spill.tail`/`.spill.commit` set from exact raw bytes, and
-	 * materializes only header + hot suffix. Any malformed line, duplicate id,
+	 * bounded 64 KiB ranges with one full semantic/index pass plus bounded private
+	 * index and hash-proof reads, without `loadEntriesFromFile`, `readText*`,
+	 * `readBytesSync`, or a full entry graph, builds the disposable sidecar set from
+	 * exact raw bytes, and materializes only header + hot suffix. Any malformed line,
 	 * patch record, unsupported shape, invalid compaction boundary, oversized
 	 * line, descriptor change, budget failure, or schema uncertainty cleans
 	 * partial sidecars/state and returns `false` so the caller falls back to the
@@ -7611,14 +7671,30 @@ export class SessionManager {
 		let lastId: string | undefined;
 		let latestModelChange: { ordinal: number; role: string | undefined } | undefined;
 		let latestTtsr: { ordinal: number; rulesCount: number; recordsCount: number; count: number } | undefined;
-		let latestCompactionBoundary: { firstKeptEntryId: string } | undefined;
+		let latestCompactionBoundary: { firstKeptEntryId: string; ordinal: number } | undefined;
 		let scannedBytes = 0;
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.indexPath) return undefined;
+		let indexWriter: SessionStorageWriter | undefined;
+		const transcriptHash = crypto.createHash("sha256");
+		const hashCheckpoints: BoundedFirstOpenHashCheckpoint[] = [{ offset: 0, hash: transcriptHash.copy() }];
+		const hashState = {
+			nextCheckpointOffset: BOUNDED_FIRST_OPEN_HASH_CHECKPOINT_INTERVAL_BYTES,
+			hashedOffset: 0,
+		};
+		const ring: BoundedFirstOpenRingEntry[] = [];
+		let ringBytes = 0;
+		const ringBudget = this.#sidecarHotSuffixBudgetBytes;
+		try {
+			indexWriter = openFirstOpenSidecarWriter(this.storage, runtime.indexPath);
 		const scanFailure = scanTranscriptLinesBounded(
 			this.storage,
 			sessionFile,
 			descriptor.size,
 			(lineStart, lineBytes) => {
 				scannedBytes = lineStart + lineBytes.byteLength;
+				if (!updateBoundedTranscriptHash(transcriptHash, lineStart, lineBytes, hashState, hashCheckpoints))
+					return fail("bounded_scan_malformed");
 				let parsed: unknown;
 				try {
 					parsed = JSON.parse(decodeBoundedJsonLine(lineBytes));
@@ -7653,6 +7729,21 @@ export class SessionManager {
 				const idAdd = seenIds.add(record.id);
 				if (idAdd === "duplicate") return fail("bounded_scan_duplicate");
 				if (idAdd === "full") return fail("bounded_scan_budget");
+				const recordDigest = computeLineDigest(lineBytes);
+				const byteLength = lineBytes.byteLength;
+				const indexLine = `${JSON.stringify({
+					id: record.id,
+					ordinal,
+					seq: ordinal,
+					byteOffset: lineStart,
+					byteLength,
+					recordDigest,
+					parentId,
+					entryType: record.type,
+				})}\n`;
+				const indexBytes = Buffer.from(indexLine, "utf8");
+				writeFirstOpenSidecarBytes(indexWriter!, indexBytes, telemetry, "index");
+				runtime.indexHash.update(indexBytes);
 				if (record.type === "compaction") {
 					if (
 						typeof record.firstKeptEntryId !== "string" ||
@@ -7660,7 +7751,7 @@ export class SessionManager {
 						!seenIds.has(record.firstKeptEntryId)
 					)
 						return fail("bounded_scan_invalid_compaction");
-					latestCompactionBoundary = { firstKeptEntryId: record.firstKeptEntryId };
+					latestCompactionBoundary = { firstKeptEntryId: record.firstKeptEntryId, ordinal };
 				} else if (record.type === "model_change") {
 					latestModelChange = { ordinal, role: typeof record.role === "string" ? record.role : undefined };
 				} else if (record.type === "ttsr_injection") {
@@ -7722,6 +7813,19 @@ export class SessionManager {
 					providerStateBytes = nextBytes;
 					providerState.set(providerKey, { ordinal, entry: providerEntry, bytes });
 				}
+				const ringEntry: BoundedFirstOpenRingEntry = {
+					id: record.id,
+					ordinal,
+					entry: sanitizeLoadedSessionEntryReplayMetadata(record as unknown as SessionEntry),
+					byteOffset: lineStart,
+					byteLength,
+					recordDigest,
+					parentId,
+					entryType: record.type,
+				};
+				ring.push(ringEntry);
+				ringBytes += byteLength;
+				while (ringBytes > ringBudget && ring.length > 0) ringBytes -= ring.shift()!.byteLength;
 				lastId = record.id;
 			},
 			undefined,
@@ -7761,27 +7865,53 @@ export class SessionManager {
 			this.#lazyReopenFallbackReason = "bounded_scan_unsupported";
 			return undefined;
 		}
+		fsyncFirstOpenSidecarWriter(indexWriter!, telemetry);
+		const bufferedIndexWriter = asBufferedSidecarWriter(indexWriter!);
+		if (bufferedIndexWriter) {
+			const instrumentation = bufferedIndexWriter.getInstrumentation();
+			telemetry.indexWriteCalls = instrumentation.writeCalls;
+			telemetry.bytesWritten = Math.max(telemetry.bytesWritten, instrumentation.bytesWritten);
+		}
+		runtime.indexDigest = runtime.indexHash.copy().digest("hex");
+		try {
+			runtime.validatedIndexDescriptor = this.storage.statSync(runtime.indexPath);
+		} catch {
+			return undefined;
+		}
 		return {
 			header,
 			leafId: lastId!,
 			recordCount: ordinal + 1,
 			retirementFirstKeptEntryId: latestCompactionBoundary.firstKeptEntryId,
+			retirementCompactionOrdinal: latestCompactionBoundary.ordinal,
 			reducer,
 			usageStatistics,
 			labels: [...labelsById],
 			providerState: [...providerState.values()]
 				.sort((left, right) => left.ordinal - right.ordinal)
 				.map(item => ({ ordinal: item.ordinal, entry: item.entry })),
+			ring,
+			hashCheckpoints,
+			indexDigest: runtime.indexDigest,
 		};
+		} catch {
+			this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
+			return undefined;
+		} finally {
+			try {
+				indexWriter?.closeSync();
+			} catch {
+				// A private index close failure leaves the published set unpublished.
+				throw new Error("bounded_index_close_failed");
+			}
+		}
 	}
 
 	/**
-	 * Bounded first-open build pass: write the disposable `.spill.idx`/`.spill.tail`
-	 * set from exact raw transcript bytes and collect the hot suffix entries.
-	 * Digests/offsets cover the exact file bytes (including newlines) so the
-	 * existing authenticated reopen path validates them. Any inconsistency or
-	 * budget failure returns `undefined`; the caller then cleans partial sidecars
-	 * and falls back to the eager authoritative path.
+	 * Bounded first-open materialization from the semantic/index pass. The transcript
+	 * is parsed exactly once; this stage resolves the private flat-index boundary,
+	 * proves the base digest from a bounded hash checkpoint read, and builds tail and
+	 * secondary artifacts only from the bounded retained suffix ring.
 	 */
 	#buildBoundedFirstOpenSidecars(
 		sessionFile: string,
@@ -7792,30 +7922,14 @@ export class SessionManager {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.indexPath || !runtime.tailPath) return undefined;
 		const telemetry = this.#firstOpenTelemetry;
-		let indexWriter: SessionStorageWriter | undefined;
 		let tailWriter: SessionStorageWriter | undefined;
-		const baseHash = crypto.createHash("sha256");
-		let tailBuilder: RollingTailChainBuilder | undefined;
-		let ordinal = -1;
-		let previousId: string | undefined;
-		let tailSeq = 0;
-		let inTail = false;
-		let baseEndOffset = 0;
-		let baseDigest = "";
-		let hotSuffixBytes = 0;
-		let hotResidentBytes = 0;
-		let tailResidentBytes = 0;
-		let scannedBytes = 0;
-		const hotEntries: SessionEntry[] = [];
 		let buildFailed = false;
-		let secondaryArtifactsEligible =
+		const secondaryArtifactsEligible =
 			secondaryArtifactMode !== "disabled" &&
+			discovery.recordCount <= PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS &&
 			(secondaryArtifactMode === "enabled" ||
-				(descriptor.size <= PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES &&
-					discovery.recordCount <= PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS));
+				descriptor.size <= PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES);
 		const parentBuilder = new BoundedParentArtifactBuilder();
-		// Persistent dictionary scratch stays below the 20 MiB acceptance cap.
-		// Oversized inputs retain the authenticated flat-index fallback instead.
 		const partitionHashes = Array.from({ length: DICTIONARY_PARTITION_COUNT }, () => crypto.createHash("sha256"));
 		const partitionSizes = new Array<number>(DICTIONARY_PARTITION_COUNT).fill(0);
 		const partitionRecords = new Array<number>(DICTIONARY_PARTITION_COUNT).fill(0);
@@ -7823,149 +7937,158 @@ export class SessionManager {
 			detector: new BoundedDictionaryIdSet(),
 			target: this.#createDictionaryFlushTarget(partitionHashes, partitionSizes, partitionRecords),
 		});
-		// Metadata-delta section state (fixed 4 MiB reducer budget).
 		const metadataDeltaState = this.#createMetadataDeltaRuntimeState();
 		runtime.metadataDelta = metadataDeltaState;
 		try {
-			indexWriter = openFirstOpenSidecarWriter(this.storage, runtime.indexPath);
-			tailWriter = openFirstOpenSidecarWriter(this.storage, runtime.tailPath);
 			this.#truncateDerivedArtifactFiles(secondaryArtifactsEligible);
-			const scanFailure = scanTranscriptLinesBounded(
+			const indexSize = this.storage.statSync(runtime.indexPath).size;
+			let boundaryIndex: ({ id: string } & ColdEntryIndex) | undefined;
+			let indexBuildFailed = false;
+			const indexFailure = scanTranscriptLinesBounded(
 				this.storage,
-				sessionFile,
-				descriptor.size,
-				(lineStart, lineBytes) => {
-					scannedBytes = lineStart + lineBytes.byteLength;
+				runtime.indexPath,
+				indexSize,
+				(_offset, lineBytes) => {
 					let parsed: unknown;
 					try {
-						parsed = JSON.parse(Buffer.from(lineBytes).toString("utf8"));
+						parsed = JSON.parse(decodeBoundedJsonLine(lineBytes));
 					} catch {
-						buildFailed = true;
 						return false;
 					}
-					if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-						buildFailed = true;
+					if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+					const value = parsed as Partial<ColdEntryIndex> & { id?: unknown };
+					if (
+						typeof value.id !== "string" ||
+						!Number.isSafeInteger(value.ordinal) ||
+						!Number.isSafeInteger(value.seq) ||
+						!Number.isSafeInteger(value.byteOffset) ||
+						!Number.isSafeInteger(value.byteLength) ||
+						typeof value.recordDigest !== "string" ||
+						(value.parentId !== null && typeof value.parentId !== "string") ||
+						typeof value.entryType !== "string"
+					) {
+						indexBuildFailed = true;
 						return false;
 					}
-					telemetry.recordsParsed += 1;
-					const record = parsed as Record<string, unknown>;
-					if (typeof record.id !== "string" || typeof record.type !== "string") {
-						buildFailed = true;
-						return false;
-					}
-					if (ordinal === -1) {
-						if (record.type !== "session") {
-							buildFailed = true;
-							return false;
-						}
-						baseHash.update(lineBytes);
-						ordinal = 0;
-						return;
-					}
-					const parentId = record.parentId;
-					if (parentId !== null && typeof parentId !== "string") {
-						buildFailed = true;
-						return false;
-					}
-					if (ordinal === 0 ? parentId !== null : parentId !== previousId) {
-						buildFailed = true;
-						return false;
-					}
-					const recordDigest = computeLineDigest(lineBytes);
-					const byteLength = lineBytes.byteLength;
-					if (!inTail && record.id === discovery.retirementFirstKeptEntryId) {
-						inTail = true;
-						baseEndOffset = lineStart;
-						baseDigest = baseHash.digest("hex");
-						tailBuilder = new RollingTailChainBuilder({ baseDigest, baseEndOffset });
-					}
-					const indexLine = `${JSON.stringify({
-						id: record.id,
-						ordinal,
-						seq: ordinal,
-						byteOffset: lineStart,
-						byteLength,
-						recordDigest,
-						parentId,
-						entryType: record.type,
-					})}\n`;
-					const indexBytes = Buffer.from(indexLine, "utf8");
-					writeFirstOpenSidecarBytes(indexWriter!, indexBytes, telemetry, "index");
-					runtime.indexHash.update(indexBytes);
-					if (secondaryArtifactMode === "auto" && ordinal >= PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS)
-						secondaryArtifactsEligible = false;
+					const indexEntry = value as { id: string } & ColdEntryIndex;
 					if (secondaryArtifactsEligible) {
 						const dictionaryAdd = dictionaryBuilder.add({
-							id: record.id,
-							ordinal,
-							seq: ordinal,
-							byteOffset: lineStart,
-							byteLength,
-							recordDigest,
-							parentId,
-							entryType: record.type,
+							id: indexEntry.id,
+							ordinal: indexEntry.ordinal,
+							seq: indexEntry.seq,
+							byteOffset: indexEntry.byteOffset,
+							byteLength: indexEntry.byteLength,
+							recordDigest: indexEntry.recordDigest,
+							parentId: indexEntry.parentId ?? null,
+							entryType: indexEntry.entryType!,
 						});
 						if (dictionaryAdd.kind !== "ok") {
-							buildFailed = true;
+							indexBuildFailed = true;
 							return false;
 						}
-						if (typeof parentId === "string") {
+						if (typeof indexEntry.parentId === "string") {
 							parentBuilder.add({
-								parentId,
-								childId: record.id,
-								ordinal,
-								seq: ordinal,
-								byteOffset: lineStart,
-								byteLength,
-								recordDigest,
-								entryType: record.type,
+								parentId: indexEntry.parentId,
+								childId: indexEntry.id,
+								ordinal: indexEntry.ordinal,
+								seq: indexEntry.seq,
+								byteOffset: indexEntry.byteOffset,
+								byteLength: indexEntry.byteLength,
+								recordDigest: indexEntry.recordDigest,
+								entryType: indexEntry.entryType!,
 							});
 						}
 					}
-					if (inTail) {
-						const entry = parsed as SessionEntry;
-						hotEntries.push(sanitizeLoadedSessionEntryReplayMetadata(entry));
-						hotSuffixBytes += byteLength;
-						hotResidentBytes += residentHotEntryBytes(byteLength);
-						if (hotSuffixBytes > this.#sidecarHotSuffixBudgetBytes) {
-							buildFailed = true;
-							return false;
-						}
-						const tailRecord = tailBuilder?.append({
-							seq: tailSeq,
-							kind: tailRecordKindForEntry(entry),
-							ordinal,
-							id: record.id,
-							parentId: parentId as string | null,
-							type: record.type,
-							byteOffset: lineStart,
-							byteLength,
-							recordDigest,
-						});
-						if (!tailRecord) {
-							buildFailed = true;
-							return false;
-						}
-						const tailBytes = Buffer.from(`${JSON.stringify(tailRecord)}\n`, "utf8");
-						writeFirstOpenSidecarBytes(tailWriter!, tailBytes, telemetry, "tail");
-						tailSeq++;
-						tailResidentBytes += tailRecordResidentBytes(tailRecord);
-					} else {
-						baseHash.update(lineBytes);
-					}
-					ordinal++;
-					previousId = record.id;
+					if (indexEntry.id === discovery.retirementFirstKeptEntryId) boundaryIndex = indexEntry;
+					return true;
 				},
 				undefined,
 				false,
 				true,
 				telemetry,
+				false,
 			);
-			if (scanFailure || buildFailed) {
+			if (
+				indexFailure ||
+				indexBuildFailed ||
+				!boundaryIndex ||
+				boundaryIndex.ordinal >= discovery.retirementCompactionOrdinal
+			) {
 				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
 				return undefined;
 			}
-			if (scannedBytes !== descriptor.size || !inTail || !tailBuilder) {
+			const baseEndOffset = boundaryIndex.byteOffset;
+			const checkpoint = [...discovery.hashCheckpoints]
+				.reverse()
+				.find(candidate => candidate.offset <= baseEndOffset);
+			if (!checkpoint || baseEndOffset < checkpoint.offset || baseEndOffset - checkpoint.offset > SESSION_RANGE_READ_MAX_BYTES) {
+				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
+				return undefined;
+			}
+			const baseHash = checkpoint.hash.copy();
+			let hashOffset = checkpoint.offset;
+			while (hashOffset < baseEndOffset) {
+				const length = Math.min(SESSION_RANGE_READ_MAX_BYTES, baseEndOffset - hashOffset);
+				const bytes = this.storage.readRangeSync!(sessionFile, hashOffset, length).bytes;
+				if (bytes.byteLength !== length) {
+					this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
+					return undefined;
+				}
+				baseHash.update(bytes);
+				telemetry.bytesRead += length;
+				telemetry.transcriptBytesRead += length;
+				hashOffset += length;
+			}
+			const baseDigest = baseHash.digest("hex");
+			const boundaryRingIndex = discovery.ring.findIndex(
+				entry => entry.id === boundaryIndex!.id && entry.byteOffset === baseEndOffset,
+			);
+			if (boundaryRingIndex < 0) {
+				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
+				return undefined;
+			}
+			const suffix = discovery.ring.slice(boundaryRingIndex);
+			if (
+				suffix.length === 0 ||
+				suffix[0]!.byteOffset !== baseEndOffset ||
+				suffix[suffix.length - 1]!.byteOffset + suffix[suffix.length - 1]!.byteLength !== descriptor.size
+			) {
+				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
+				return undefined;
+			}
+			tailWriter = openFirstOpenSidecarWriter(this.storage, runtime.tailPath);
+			const tailBuilder = new RollingTailChainBuilder({ baseDigest, baseEndOffset });
+			let tailSeq = 0;
+			let hotSuffixBytes = 0;
+			let hotResidentBytes = 0;
+			let tailResidentBytes = 0;
+			const hotEntries: SessionEntry[] = [];
+			for (const item of suffix) {
+				const entry = item.entry;
+				const tailRecord = tailBuilder.append({
+					seq: tailSeq,
+					kind: tailRecordKindForEntry(entry),
+					ordinal: item.ordinal,
+					id: item.id,
+					parentId: item.parentId,
+					type: item.entryType,
+					byteOffset: item.byteOffset,
+					byteLength: item.byteLength,
+					recordDigest: item.recordDigest,
+				});
+				if (!tailRecord) {
+					buildFailed = true;
+					break;
+				}
+				const tailBytes = Buffer.from(`${JSON.stringify(tailRecord)}\n`, "utf8");
+				writeFirstOpenSidecarBytes(tailWriter, tailBytes, telemetry, "tail");
+				tailSeq++;
+				tailResidentBytes += tailRecordResidentBytes(tailRecord);
+				hotSuffixBytes += item.byteLength;
+				hotResidentBytes += residentHotEntryBytes(item.byteLength);
+				hotEntries.push(entry);
+			}
+			if (buildFailed) {
 				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
 				return undefined;
 			}
@@ -7974,14 +8097,7 @@ export class SessionManager {
 				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
 				return undefined;
 			}
-			fsyncFirstOpenSidecarWriter(indexWriter!, telemetry);
-			fsyncFirstOpenSidecarWriter(tailWriter!, telemetry);
-			const bufferedIndexWriter = asBufferedSidecarWriter(indexWriter!);
-			if (bufferedIndexWriter) {
-				const instrumentation = bufferedIndexWriter.getInstrumentation();
-				telemetry.indexWriteCalls = instrumentation.writeCalls;
-				telemetry.bytesWritten = Math.max(telemetry.bytesWritten, instrumentation.bytesWritten);
-			}
+			fsyncFirstOpenSidecarWriter(tailWriter, telemetry);
 			if (!runtime.tailCache.tryAllocate(tailResidentBytes)) {
 				this.#lazyReopenFallbackReason = "bounded_scan_budget";
 				return undefined;
@@ -8004,8 +8120,7 @@ export class SessionManager {
 			runtime.retirementFirstKeptEntryId = discovery.retirementFirstKeptEntryId;
 			runtime.reducer = discovery.reducer;
 			runtime.hotSuffixBytes = hotSuffixBytes;
-
-			runtime.indexDigest = runtime.indexHash.copy().digest("hex");
+			runtime.indexDigest = discovery.indexDigest;
 			metadataDeltaState.indexDigest = runtime.indexDigest;
 			const dictionaryStarted = startFirstOpenPhase();
 			if (secondaryArtifactsEligible) {
@@ -8014,9 +8129,7 @@ export class SessionManager {
 					this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
 					return undefined;
 				}
-				if (
-					!this.#adoptBuiltDictionaryArtifact(dictionaryResult, partitionHashes, partitionSizes, partitionRecords)
-				) {
+				if (!this.#adoptBuiltDictionaryArtifact(dictionaryResult, partitionHashes, partitionSizes, partitionRecords)) {
 					this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
 					return undefined;
 				}
@@ -8026,12 +8139,6 @@ export class SessionManager {
 			recordFirstOpenPhase(telemetry, "dictionary", dictionaryStarted);
 			telemetry.dictionaryBuildElapsedMs = telemetry.phaseTelemetry.dictionary?.wallMs ?? 0;
 			telemetry.dictionaryArtifactEnabled = runtime.dictionary !== undefined;
-			// Provider state with oversized-value demotion: values over
-			// MAX_REDUCER_INLINE_BYTES are persisted to the metadata-delta section
-			// (before the marker binds their descriptors) with exact location+digest
-			// and are NOT retained resident — only a 24 B descriptor is kept. The
-			// merged provider order is tracked explicitly so reopen reproduces the
-			// exact slot sequence.
 			const metadataStarted = startFirstOpenPhase();
 			runtime.providerStateEntries = [];
 			runtime.providerStateOrder = [];
@@ -8043,11 +8150,7 @@ export class SessionManager {
 				if (persistedLine.byteLength > MAX_REDUCER_INLINE_BYTES) {
 					const stored = this.#appendMetadataDeltaValue(persistedLine);
 					if (stored) {
-						metadataDeltaState.byKey.set(providerKey, {
-							kind: provider.entry.type,
-							ordinal: provider.ordinal,
-							...stored,
-						});
+						metadataDeltaState.byKey.set(providerKey, { kind: provider.entry.type, ordinal: provider.ordinal, ...stored });
 					} else {
 						metadataDeltaState.byKey.delete(providerKey);
 						runtime.providerStateEntries.push(cloneSessionEntry(provider.entry));
@@ -8064,12 +8167,6 @@ export class SessionManager {
 			recordFirstOpenPhase(telemetry, "parent", parentStarted);
 			telemetry.parentBuildElapsedMs = telemetry.phaseTelemetry.parent?.wallMs ?? 0;
 			telemetry.parentArtifactEnabled = runtime.parentArtifact !== undefined;
-			try {
-				const validated = this.storage.statSync(runtime.indexPath);
-				runtime.validatedIndexDescriptor = validated;
-			} catch {
-				// A missing index falls back to the authoritative digest re-verification path.
-			}
 			for (const [id, label] of discovery.labels) {
 				if (!runtime.labelsPins.setLabel(id, label)) {
 					this.#lazyReopenFallbackReason = "bounded_scan_budget";
@@ -8077,16 +8174,14 @@ export class SessionManager {
 				}
 			}
 			return { hotEntries, hotSuffixBytes };
+		} catch {
+			this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
+			return undefined;
 		} finally {
-			try {
-				indexWriter?.closeSync();
-			} catch {
-				// Best-effort writer cleanup; partial sidecars are unlinked by the caller.
-			}
 			try {
 				tailWriter?.closeSync();
 			} catch {
-				// Best-effort writer cleanup; partial sidecars are unlinked by the caller.
+				throw new Error("bounded_tail_close_failed");
 			}
 		}
 	}

@@ -1001,7 +1001,7 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 			strategy: "current",
 			secondaryArtifactMode: "auto",
 		});
-		expect(stats.firstOpen.recordsParsed).toBeGreaterThanOrEqual(records.length);
+		expect(stats.firstOpen.recordsParsed).toBe(records.length);
 		expect(stats.firstOpen.transcriptBytesRead).toBeGreaterThanOrEqual(transcript.length);
 		expect(stats.firstOpen.indexWriteBytes).toBeGreaterThan(0);
 		expect(stats.firstOpen.indexWriteCalls).toBeGreaterThan(0);
@@ -1155,6 +1155,61 @@ it("applies benchmark-only GC and secondary-artifact controls to bounded first-o
 		SessionManagerTestHooks.firstOpenGcStrategy = undefined;
 		SessionManagerTestHooks.secondaryArtifactMode = undefined;
 		await manager?.close();
+	}
+});
+
+it("selects the latest exact compaction boundary in one semantic parse pass", async () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/bounded-first-open-latest-compaction.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "latest-compaction", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "a", parentId: null, timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "b", parentId: "a", timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "c", parentId: "b", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact-1",
+			parentId: "c",
+			timestamp: "0",
+			summary: "first",
+			firstKeptEntryId: "b",
+			tokensBefore: 1,
+		},
+		{ type: "custom", id: "d", parentId: "compact-1", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact-2",
+			parentId: "d",
+			timestamp: "0",
+			summary: "second",
+			firstKeptEntryId: "c",
+			tokensBefore: 2,
+		},
+		{ type: "custom", id: "e", parentId: "compact-2", timestamp: "0", customType: "node", data: {} },
+	];
+	const transcript = `${records.map(record => JSON.stringify(record)).join("\n")}\n`;
+	storage.writeTextSync(sessionFile, transcript);
+	const manager = await SessionManager.open(
+		sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		const stats = manager.getSessionMemoryStats();
+		expect(stats.lazyReopenSucceeded).toBe(true);
+		expect(stats.firstOpen.recordsParsed).toBe(records.length);
+		const marker = JSON.parse(storage.readTextSync(sidecarPath(sessionFile, "commit"))) as {
+			base: { baseEndOffset: number };
+			retirementFirstKeptEntryId: string;
+		};
+		expect(marker.retirementFirstKeptEntryId).toBe("c");
+		expect(marker.base.baseEndOffset).toBe(transcript.indexOf(`${JSON.stringify(records[3])}\n`));
+		expect(manager.getEntry("a")).toMatchObject({ id: "a" });
+		expect(manager.getEntry("e")).toMatchObject({ id: "e" });
+	} finally {
+		await manager.close();
 	}
 });
 
