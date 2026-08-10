@@ -3033,6 +3033,9 @@ function sameCloseProcessIdentity(expected: CloseRecord, current: CloseRecord & 
 	return (
 		current.live &&
 		current.pid === expected.pid &&
+		typeof expected.processIncarnation === "string" &&
+		expected.processIncarnation.length > 0 &&
+		current.processIncarnation === expected.processIncarnation &&
 		typeof expected.lifecycleRequestId === "string" &&
 		expected.lifecycleRequestId.length > 0 &&
 		current.lifecycleRequestId === expected.lifecycleRequestId &&

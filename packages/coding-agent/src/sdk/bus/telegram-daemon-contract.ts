@@ -204,8 +204,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 140 retires failed handshakes and holds provisional frames until publication.
  * Generation 141 awaits the provider handshake before Router replay to prevent retained-event deadlock.
  * Generation 142 migrates live adoption reservations and applies create throttling to topic adoption.
+ * Generation 143 preserves topic presentation continuity across exact Router endpoint replacement.
  */
-export const DAEMON_GENERATION = 142;
+export const DAEMON_GENERATION = 143;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

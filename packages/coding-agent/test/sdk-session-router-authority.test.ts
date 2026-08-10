@@ -347,6 +347,32 @@ describe("SessionRouter dispatch authority", () => {
 		}
 	});
 
+	test("allows exact publication-time requests before Router replay", async () => {
+		let router: SessionRouter | undefined;
+		const phases: string[] = [];
+		const fixture = await routerFixture({
+			start: false,
+			onAttachmentReady: async attachment => {
+				phases.push("ready");
+				await router?.request(
+					attachment.sessionId,
+					{ type: "register_provider", capability: "ui" },
+					attachment.generation,
+					attachment,
+				);
+				phases.push("registered");
+			},
+		});
+		router = fixture.router;
+		try {
+			await router.start();
+			expect(phases).toEqual(["ready", "registered"]);
+			expect(fixture.clients[0]?.requests.map(frame => frame.type)).toEqual(["register_provider", "event_replay"]);
+		} finally {
+			await router.stop();
+		}
+	});
+
 	test("revalidates exact endpoint authority before publication handshake sends", async () => {
 		let authority: { pid: number; endpointMtimeMs: number } | undefined;
 		let endpointFile = "";
