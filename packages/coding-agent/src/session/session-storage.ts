@@ -997,7 +997,8 @@ class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 		this.#onError = options?.onError;
 		this.#closeAdapter = options?.closeAdapter ?? defaultCloseAdapter;
 		this.#securityContext = options?.securityContext;
-		this.#bufferSize = options?.bufferSize === undefined ? undefined : normalizeBufferedWriterCapacity(options.bufferSize);
+		this.#bufferSize =
+			options?.bufferSize === undefined ? undefined : normalizeBufferedWriterCapacity(options.bufferSize);
 		this.#buffer = this.#bufferSize === undefined ? undefined : Buffer.allocUnsafe(this.#bufferSize);
 		const flags = options?.flags ?? "a";
 		const dir = path.dirname(fpath);
@@ -1278,13 +1279,14 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 		this.#assertOpen();
 		if (bytes.byteLength > STAGED_WRITER_LINE_MAX_BYTES)
 			throw new RangeError("Staged line exceeds the bounded maximum");
-		const line = Buffer.concat([Buffer.from(bytes), newlineBuffer]);
 		try {
-			let written = 0;
-			while (written < line.byteLength) {
-				const count = fs.writeSync(this.#fd, line, written, line.byteLength - written);
-				if (count === 0) throw new Error("Short write");
-				written += count;
+			for (const chunk of [bytes, newlineBuffer]) {
+				let written = 0;
+				while (written < chunk.byteLength) {
+					const count = fs.writeSync(this.#fd, chunk, written, chunk.byteLength - written);
+					if (count === 0) throw new Error("Short write");
+					written += count;
+				}
 			}
 			this.#lineCount++;
 		} catch (err) {
@@ -2594,7 +2596,8 @@ class MemorySessionStorageWriter implements SessionStorageBufferedWriter {
 		this.#path = path;
 		this.#onError = options?.onError;
 		this.#closeAdapter = options?.closeAdapter;
-		this.#bufferSize = options?.bufferSize === undefined ? undefined : normalizeBufferedWriterCapacity(options.bufferSize);
+		this.#bufferSize =
+			options?.bufferSize === undefined ? undefined : normalizeBufferedWriterCapacity(options.bufferSize);
 		this.#buffer = this.#bufferSize === undefined ? undefined : Buffer.allocUnsafe(this.#bufferSize);
 		const existing =
 			options?.flags === "w" || !storage.existsSync(path)

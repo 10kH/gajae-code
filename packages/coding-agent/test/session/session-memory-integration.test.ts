@@ -998,10 +998,14 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 		expect(stats.firstOpen).toMatchObject({
 			attempted: true,
 			succeeded: true,
-			strategy: "current",
-			secondaryArtifactMode: "auto",
+			strategy: "pressure",
+			secondaryArtifactMode: "disabled",
 		});
-		expect(stats.firstOpen.recordsParsed).toBe(records.length);
+		expect(stats.firstOpen.semanticRecordsParsed).toBe(records.length);
+		expect(stats.firstOpen.suffixRecordsParsed).toBeGreaterThan(0);
+		expect(stats.firstOpen.recordsParsed).toBe(
+			stats.firstOpen.semanticRecordsParsed + stats.firstOpen.suffixRecordsParsed,
+		);
 		expect(stats.firstOpen.transcriptBytesRead).toBeGreaterThanOrEqual(transcript.length);
 		expect(stats.firstOpen.indexWriteBytes).toBeGreaterThan(0);
 		expect(stats.firstOpen.indexWriteCalls).toBeGreaterThan(0);
@@ -1259,7 +1263,8 @@ it("selects the latest exact compaction boundary in one semantic parse pass", as
 	try {
 		const stats = manager.getSessionMemoryStats();
 		expect(stats.lazyReopenSucceeded).toBe(true);
-		expect(stats.firstOpen.recordsParsed).toBe(records.length);
+		expect(stats.firstOpen.semanticRecordsParsed).toBe(records.length);
+		expect(stats.firstOpen.suffixRecordsParsed).toBeGreaterThan(0);
 		const marker = JSON.parse(storage.readTextSync(sidecarPath(sessionFile, "commit"))) as {
 			base: { baseEndOffset: number };
 			retirementFirstKeptEntryId: string;

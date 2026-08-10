@@ -455,7 +455,7 @@ export type SessionMemorySecondaryArtifactMode = "auto" | "enabled" | "disabled"
 
 export interface SessionMemoryPhaseTelemetry {
 	wallMs: number;
-	cpuMs: number;
+	cpuMs: number | null;
 }
 
 export interface SessionMemoryFirstOpenTelemetry {
@@ -476,6 +476,8 @@ export interface SessionMemoryFirstOpenTelemetry {
 	sidecarBytesWritten: number;
 	sidecarFileBytes: number;
 	recordsParsed: number;
+	semanticRecordsParsed: number;
+	suffixRecordsParsed: number;
 	lineAssemblyCopyCount: number;
 	lineCopyCount: number;
 	lineAssemblyCopyBytes: number;
@@ -1308,18 +1310,6 @@ const PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS = 64 * 1024;
 const PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES = 512 * 1024 * 1024;
 const residentHotEntryBytes = (serializedBytes: number): number => residentRecordBytes(serializedBytes * 2 + 256);
 
-/** A bounded parsed entry retained from the semantic/index pass. */
-interface BoundedFirstOpenRingEntry {
-	id: string;
-	ordinal: number;
-	entry: SessionEntry;
-	byteOffset: number;
-	byteLength: number;
-	recordDigest: string;
-	parentId: string | null;
-	entryType: string;
-}
-
 interface BoundedFirstOpenHashCheckpoint {
 	offset: number;
 	hash: crypto.Hash;
@@ -1347,8 +1337,6 @@ interface BoundedFirstOpenDiscovery {
 	labels: Array<[string, string]>;
 	/** Latest provider-affecting entries with exact ordinals, bounded by the reducer reservation. */
 	providerState: Array<{ ordinal: number; entry: SessionEntry }>;
-	/** Recent parsed entries retained within the existing hot suffix budget. */
-	ring: BoundedFirstOpenRingEntry[];
 	/** SHA-256 prefix states at bounded transcript offsets. */
 	hashCheckpoints: BoundedFirstOpenHashCheckpoint[];
 	/** Exact digest of the private flat index written by the semantic pass. */
@@ -1373,6 +1361,12 @@ function decodeBoundedJsonLine(lineBytes: Uint8Array): string {
 	return Buffer.from(lineBytes.buffer, lineBytes.byteOffset, length).toString("utf8");
 }
 
+function bytesStartWith(bytes: Uint8Array, prefix: Uint8Array): boolean {
+	if (bytes.byteLength < prefix.byteLength) return false;
+	for (let index = 0; index < prefix.byteLength; index++) if (bytes[index] !== prefix[index]) return false;
+	return true;
+}
+
 function updateBoundedTranscriptHash(
 	hash: crypto.Hash,
 	lineStart: number,
@@ -1389,10 +1383,7 @@ function updateBoundedTranscriptHash(
 			state.nextCheckpointOffset += BOUNDED_FIRST_OPEN_HASH_CHECKPOINT_INTERVAL_BYTES;
 			continue;
 		}
-		const end = Math.min(
-			lineBytes.byteLength,
-			offset + Math.max(1, state.nextCheckpointOffset - absolute),
-		);
+		const end = Math.min(lineBytes.byteLength, offset + Math.max(1, state.nextCheckpointOffset - absolute));
 		hash.update(lineBytes.subarray(offset, end));
 		offset = end;
 		state.hashedOffset = lineStart + offset;
@@ -1551,10 +1542,11 @@ function scanTranscriptLinesBounded(
 			let pos = 0;
 			let useLargeRecordCadence = false;
 			let bytesSinceGc = 0;
+			const reusableReadBuffer = reuseLineAssembly ? Buffer.allocUnsafe(chunkBytes) : undefined;
 
 			while (pos < size) {
 				const length = Math.min(chunkBytes, size - pos);
-				const chunk = Buffer.allocUnsafe(length);
+				const chunk = reusableReadBuffer?.subarray(0, length) ?? Buffer.allocUnsafe(length);
 				let offset = 0;
 				while (offset < length) {
 					const count = fs.readSync(fd, chunk, offset, length - offset, pos + offset);
@@ -3599,6 +3591,41 @@ const TRANSCRIPT_LINE_TERMINATOR = Buffer.from("\n", "utf8");
 interface BoundedTranscriptInspection {
 	identity: ResumeSessionIdentity;
 	cwd: string | undefined;
+}
+
+function inspectTranscriptHeaderBounded(
+	filePath: string,
+	storage: SessionStorage,
+	maxBytes: number,
+): { ok: true; inspection: { cwd: string | undefined } } | { ok: false; error: ResumeTailError } {
+	const canonicalPath = resolveEquivalentPath(path.resolve(filePath));
+	let before: SessionStorageStat;
+	try {
+		before = storage.statSync(canonicalPath);
+	} catch (error) {
+		return { ok: false, error: resumeReadFailure(error, storage, canonicalPath) };
+	}
+	if (!before.isFile || typeof storage.readRangeSync !== "function")
+		return { ok: false, error: { kind: "error", reason: "read-failed" } };
+	if (before.size > maxBytes) return { ok: false, error: { kind: "error", reason: "oversized", size: before.size } };
+	if (before.size === 0) return { ok: false, error: { kind: "error", reason: "malformed" } };
+	try {
+		const length = Math.min(before.size, BOUNDED_FIRST_OPEN_MAX_LINE_BYTES + 1);
+		const range = storage.readRangeSync(canonicalPath, 0, length);
+		if (!sameResumeStat(before, range.stat)) return { ok: false, error: { kind: "error", reason: "unstable" } };
+		const newline = range.bytes.indexOf(0x0a);
+		if (newline < 0 || newline > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES)
+			return { ok: false, error: { kind: "error", reason: "malformed" } };
+		const text = new TextDecoder("utf-8", { fatal: true }).decode(range.bytes.subarray(0, newline));
+		const header = JSON.parse(text) as Partial<SessionHeader>;
+		if (header.type !== "session" || typeof header.id !== "string")
+			return { ok: false, error: { kind: "error", reason: "malformed" } };
+		const after = storage.statSync(canonicalPath);
+		if (!sameResumeStat(before, after)) return { ok: false, error: { kind: "error", reason: "unstable" } };
+		return { ok: true, inspection: { cwd: typeof header.cwd === "string" ? header.cwd : undefined } };
+	} catch {
+		return { ok: false, error: { kind: "error", reason: "malformed" } };
+	}
 }
 
 /**
@@ -6395,8 +6422,8 @@ function autoModeMinTranscriptBytes(): number {
 }
 
 function emptyFirstOpenTelemetry(
-	strategy: SessionMemoryGcStrategy = "current",
-	secondaryArtifactMode: SessionMemorySecondaryArtifactMode = "auto",
+	strategy: SessionMemoryGcStrategy = "pressure",
+	secondaryArtifactMode: SessionMemorySecondaryArtifactMode = "disabled",
 ): SessionMemoryFirstOpenTelemetry {
 	const phases: Record<string, SessionMemoryPhaseTelemetry> = {};
 	return {
@@ -6415,6 +6442,8 @@ function emptyFirstOpenTelemetry(
 		sidecarBytesWritten: 0,
 		sidecarFileBytes: 0,
 		recordsParsed: 0,
+		semanticRecordsParsed: 0,
+		suffixRecordsParsed: 0,
 		lineAssemblyCopyCount: 0,
 		lineCopyCount: 0,
 		lineAssemblyCopyBytes: 0,
@@ -6438,14 +6467,14 @@ function firstOpenGcStrategy(): SessionMemoryGcStrategy {
 		SessionManagerTestHooks.firstOpenGcStrategy ?? process.env.GJC_SESSION_MEMORY_GC_STRATEGY?.trim().toLowerCase();
 	return candidate === "none" || candidate === "async" || candidate === "pressure" || candidate === "current"
 		? candidate
-		: "current";
+		: "pressure";
 }
 
 function firstOpenSecondaryArtifactMode(): SessionMemorySecondaryArtifactMode {
 	const candidate =
 		SessionManagerTestHooks.secondaryArtifactMode ??
 		process.env.GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE?.trim().toLowerCase();
-	return candidate === "enabled" || candidate === "disabled" || candidate === "auto" ? candidate : "auto";
+	return candidate === "enabled" || candidate === "disabled" || candidate === "auto" ? candidate : "disabled";
 }
 
 function residentProcessBytes(): number {
@@ -6472,12 +6501,12 @@ function startFirstOpenPhase(): { wall: bigint; cpu: NodeJS.CpuUsage } {
 	return { wall: process.hrtime.bigint(), cpu: process.cpuUsage() };
 }
 
-function recordFirstOpenGcRequest(telemetry: SessionMemoryFirstOpenTelemetry): boolean {
+function recordFirstOpenGcRequest(telemetry: SessionMemoryFirstOpenTelemetry, force = false): boolean {
 	if (telemetry.strategy === "none") return false;
-	if (telemetry.strategy === "pressure") {
+	if (telemetry.strategy === "pressure" && !force) {
 		const current = residentProcessBytes();
 		const baseline = telemetry.pressureBaselineBytes ?? current;
-		if (current - baseline < 32 * 1024 * 1024) return false;
+		if (current - baseline < 4 * 1024 * 1024) return false;
 		telemetry.pressureBaselineBytes = current;
 	}
 	const started = process.hrtime.bigint();
@@ -6526,10 +6555,11 @@ function writeFirstOpenSidecarBytes(
 
 function fsyncFirstOpenSidecarWriter(writer: SessionStorageWriter, telemetry: SessionMemoryFirstOpenTelemetry): void {
 	if (!writer.fsyncSync) throw new Error("Synchronous sidecar fsync is unavailable");
-	const started = process.hrtime.bigint();
+	const started = startFirstOpenPhase();
 	writer.fsyncSync();
 	telemetry.fsyncCount += 1;
-	telemetry.fsyncElapsedMs += Number(process.hrtime.bigint() - started) / 1_000_000;
+	telemetry.fsyncElapsedMs += Number(process.hrtime.bigint() - started.wall) / 1_000_000;
+	recordFirstOpenPhase(telemetry, "fsync", started);
 }
 
 type ManagedDestinationTransition = {
@@ -7568,7 +7598,7 @@ export class SessionManager {
 			// The semantic pass's fixed duplicate table is no longer needed. Collect it
 			// before allocating publication buffers for ordinary-size transcripts; the
 			// one-GiB fork lane skips this pause to preserve its latency gate.
-			if (before.size < 512 * 1024 * 1024) recordFirstOpenGcRequest(telemetry);
+			if (before.size < 512 * 1024 * 1024) recordFirstOpenGcRequest(telemetry, true);
 			const buildStarted = startFirstOpenPhase();
 			const built = this.#buildBoundedFirstOpenSidecars(sessionFile, before, discovery, secondaryArtifactMode);
 			recordFirstOpenPhase(telemetry, "indexTailWork", buildStarted);
@@ -7577,18 +7607,21 @@ export class SessionManager {
 			this.#leafId = discovery.leafId;
 			this.#usageStatistics = discovery.usageStatistics;
 			const commitStarted = startFirstOpenPhase();
-			this.#publishCommitMarkerFromCurrentTranscriptSync();
-			const publishedTransition = this.#classifySidecarReopen();
+			const published = this.#publishCommitMarkerFromCurrentTranscriptSync();
+			const terminalDescriptor = this.#managedDescriptorSnapshotOrNull();
 			recordFirstOpenPhase(telemetry, "commitClassification", commitStarted);
-			if (publishedTransition.kind !== "exact") {
+			if (!published) {
 				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
 				return false;
 			}
-			const terminalDescriptor = this.#managedDescriptorSnapshotOrNull();
 			if (!terminalDescriptor || !sameDescriptor(before, terminalDescriptor)) {
 				this.#lazyReopenFallbackReason = "bounded_first_open_descriptor_changed";
 				return false;
 			}
+			const publishedTransition: ReopenClassification = {
+				kind: "exact",
+				reason: "descriptor_and_proof_match",
+			};
 			const hotContextStarted = startFirstOpenPhase();
 			const entries: FileEntry[] = [discovery.header, ...built.hotEntries];
 			await resolveBlobRefsInEntries(entries, this.#blobStore);
@@ -7699,6 +7732,8 @@ export class SessionManager {
 		let latestTtsr: { ordinal: number; rulesCount: number; recordsCount: number; count: number } | undefined;
 		let latestCompactionBoundary: { firstKeptEntryId: string; ordinal: number } | undefined;
 		let scannedBytes = 0;
+		let indexSerializationWriteNs = 0n;
+		let indexSerializationBuffer = Buffer.allocUnsafe(64 * 1024);
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.indexPath) return undefined;
 		let indexWriter: SessionStorageWriter | undefined;
@@ -7708,218 +7743,220 @@ export class SessionManager {
 			nextCheckpointOffset: BOUNDED_FIRST_OPEN_HASH_CHECKPOINT_INTERVAL_BYTES,
 			hashedOffset: 0,
 		};
-		const ring: BoundedFirstOpenRingEntry[] = [];
-		let ringBytes = 0;
-		const ringBudget = this.#sidecarHotSuffixBudgetBytes;
 		try {
 			indexWriter = openFirstOpenSidecarWriter(this.storage, runtime.indexPath);
-		const scanFailure = scanTranscriptLinesBounded(
-			this.storage,
-			sessionFile,
-			descriptor.size,
-			(lineStart, lineBytes) => {
-				scannedBytes = lineStart + lineBytes.byteLength;
-				if (!updateBoundedTranscriptHash(transcriptHash, lineStart, lineBytes, hashState, hashCheckpoints))
-					return fail("bounded_scan_malformed");
-				let parsed: unknown;
-				try {
-					parsed = JSON.parse(decodeBoundedJsonLine(lineBytes));
-				} catch {
-					return fail("bounded_scan_malformed");
-				}
-				if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
-					return fail("bounded_scan_malformed");
-				const record = parsed as Record<string, unknown>;
-				if (typeof record.type !== "string" || typeof record.id !== "string") return fail("bounded_scan_malformed");
-				if (!hasStrictSessionSchema([record as unknown as FileEntry])) return fail("bounded_scan_unsupported");
-				telemetry.recordsParsed += 1;
-				if (lineStart === 0) {
-					if (
-						record.type !== "session" ||
-						record.version !== CURRENT_SESSION_VERSION ||
-						typeof record.timestamp !== "string" ||
-						typeof record.cwd !== "string"
-					)
+			const scanFailure = scanTranscriptLinesBounded(
+				this.storage,
+				sessionFile,
+				descriptor.size,
+				(lineStart, lineBytes) => {
+					scannedBytes = lineStart + lineBytes.byteLength;
+					if (!updateBoundedTranscriptHash(transcriptHash, lineStart, lineBytes, hashState, hashCheckpoints))
+						return fail("bounded_scan_malformed");
+					let parsed: unknown;
+					try {
+						parsed = JSON.parse(decodeBoundedJsonLine(lineBytes));
+					} catch {
+						return fail("bounded_scan_malformed");
+					}
+					if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
+						return fail("bounded_scan_malformed");
+					const record = parsed as Record<string, unknown>;
+					if (typeof record.type !== "string" || typeof record.id !== "string")
+						return fail("bounded_scan_malformed");
+					if (!hasStrictSessionSchema([record as unknown as FileEntry])) return fail("bounded_scan_unsupported");
+					telemetry.recordsParsed += 1;
+					telemetry.semanticRecordsParsed += 1;
+					if (lineStart === 0) {
+						if (
+							record.type !== "session" ||
+							record.version !== CURRENT_SESSION_VERSION ||
+							typeof record.timestamp !== "string" ||
+							typeof record.cwd !== "string"
+						)
+							return fail("bounded_scan_unsupported");
+						header = record as unknown as SessionHeader;
+						return;
+					}
+					if (record.type === "session") return fail("bounded_scan_unsupported");
+					if (record.type === "header_patch" || record.type === "entry_patch")
 						return fail("bounded_scan_unsupported");
-					header = record as unknown as SessionHeader;
-					return;
-				}
-				if (record.type === "session") return fail("bounded_scan_unsupported");
-				if (record.type === "header_patch" || record.type === "entry_patch")
-					return fail("bounded_scan_unsupported");
-				if (typeof record.timestamp !== "string") return fail("bounded_scan_malformed");
-				const parentId = record.parentId;
-				if (parentId !== null && typeof parentId !== "string") return fail("bounded_scan_malformed");
-				ordinal++;
-				if (ordinal === 0 ? parentId !== null : parentId !== lastId) return fail("bounded_scan_branch");
-				const idAdd = seenIds.add(record.id);
-				if (idAdd === "duplicate") return fail("bounded_scan_duplicate");
-				if (idAdd === "full") return fail("bounded_scan_budget");
-				const recordDigest = computeLineDigest(lineBytes);
-				const byteLength = lineBytes.byteLength;
-				const indexLine = `${JSON.stringify({
-					id: record.id,
-					ordinal,
-					seq: ordinal,
-					byteOffset: lineStart,
-					byteLength,
-					recordDigest,
-					parentId,
-					entryType: record.type,
-				})}\n`;
-				const indexBytes = Buffer.from(indexLine, "utf8");
-				writeFirstOpenSidecarBytes(indexWriter!, indexBytes, telemetry, "index");
-				runtime.indexHash.update(indexBytes);
-				if (record.type === "compaction") {
-					if (
-						typeof record.firstKeptEntryId !== "string" ||
-						record.firstKeptEntryId === record.id ||
-						!seenIds.has(record.firstKeptEntryId)
-					)
-						return fail("bounded_scan_invalid_compaction");
-					latestCompactionBoundary = { firstKeptEntryId: record.firstKeptEntryId, ordinal };
-				} else if (record.type === "model_change") {
-					latestModelChange = { ordinal, role: typeof record.role === "string" ? record.role : undefined };
-				} else if (record.type === "ttsr_injection") {
-					if (!Array.isArray(record.injectedRules)) return fail("bounded_scan_unsupported");
-					const injectedRuleRecords = record.injectedRuleRecords;
-					if (injectedRuleRecords !== undefined && !Array.isArray(injectedRuleRecords))
-						return fail("bounded_scan_unsupported");
-					const ttsrMessageCount = record.ttsrMessageCount;
-					if (ttsrMessageCount !== undefined && typeof ttsrMessageCount !== "number")
-						return fail("bounded_scan_unsupported");
-					latestTtsr = {
+					if (typeof record.timestamp !== "string") return fail("bounded_scan_malformed");
+					const parentId = record.parentId;
+					if (parentId !== null && typeof parentId !== "string") return fail("bounded_scan_malformed");
+					ordinal++;
+					if (ordinal === 0 ? parentId !== null : parentId !== lastId) return fail("bounded_scan_branch");
+					const idAdd = seenIds.add(record.id);
+					if (idAdd === "duplicate") return fail("bounded_scan_duplicate");
+					if (idAdd === "full") return fail("bounded_scan_budget");
+					const recordDigest = computeLineDigest(lineBytes);
+					const byteLength = lineBytes.byteLength;
+					const indexStarted = process.hrtime.bigint();
+					const indexLine = `${JSON.stringify({
+						id: record.id,
 						ordinal,
-						rulesCount: record.injectedRules.length,
-						recordsCount: injectedRuleRecords === undefined ? 0 : injectedRuleRecords.length,
-						count: ttsrMessageCount ?? 0,
-					};
-				} else if (record.type === "label") {
-					if (typeof record.targetId !== "string") return fail("bounded_scan_unsupported");
-					const label = record.label;
-					if (label !== undefined && typeof label !== "string") return fail("bounded_scan_unsupported");
-					if (label) {
-						const existing = labelsById.get(record.targetId);
-						const existingBytes =
-							existing === undefined
-								? 0
-								: residentStringBytes(record.targetId) + residentStringBytes(existing) + 48;
-						const nextBytes = residentStringBytes(record.targetId) + residentStringBytes(label) + 48;
-						if (labelsBytes - existingBytes + nextBytes > LABELS_PINS_BUDGET_BYTES)
-							return fail("bounded_scan_budget");
-						labelsBytes += nextBytes - existingBytes;
-						labelsById.set(record.targetId, label);
-					} else {
-						const existing = labelsById.get(record.targetId);
-						if (existing !== undefined)
-							labelsBytes -= residentStringBytes(record.targetId) + residentStringBytes(existing) + 48;
-						labelsById.delete(record.targetId);
+						seq: ordinal,
+						byteOffset: lineStart,
+						byteLength,
+						recordDigest,
+						parentId,
+						entryType: record.type,
+					})}\n`;
+					const indexByteLength = Buffer.byteLength(indexLine, "utf8");
+					if (indexByteLength > indexSerializationBuffer.byteLength) {
+						let capacity = indexSerializationBuffer.byteLength;
+						while (capacity < indexByteLength) capacity *= 2;
+						indexSerializationBuffer = Buffer.allocUnsafe(capacity);
 					}
-				} else if (record.type === "message") {
-					if (record.message === null || typeof record.message !== "object")
-						return fail("bounded_scan_unsupported");
-					const message = record.message as Record<string, unknown>;
-					let usage: unknown;
-					if (message.role === "assistant") {
-						usage = message.usage;
-					} else if (message.role === "toolResult" && message.toolName === "task") {
-						usage = getTaskToolUsage(message.details);
+					const written = indexSerializationBuffer.write(indexLine, 0, indexByteLength, "utf8");
+					if (written !== indexByteLength) return fail("bounded_scan_build_failed");
+					const indexBytes = indexSerializationBuffer.subarray(0, written);
+					writeFirstOpenSidecarBytes(indexWriter!, indexBytes, telemetry, "index");
+					runtime.indexHash.update(indexBytes);
+					indexSerializationWriteNs += process.hrtime.bigint() - indexStarted;
+					if (record.type === "compaction") {
+						if (
+							typeof record.firstKeptEntryId !== "string" ||
+							record.firstKeptEntryId === record.id ||
+							!seenIds.has(record.firstKeptEntryId)
+						)
+							return fail("bounded_scan_invalid_compaction");
+						latestCompactionBoundary = { firstKeptEntryId: record.firstKeptEntryId, ordinal };
+					} else if (record.type === "model_change") {
+						latestModelChange = { ordinal, role: typeof record.role === "string" ? record.role : undefined };
+					} else if (record.type === "ttsr_injection") {
+						if (!Array.isArray(record.injectedRules)) return fail("bounded_scan_unsupported");
+						const injectedRuleRecords = record.injectedRuleRecords;
+						if (injectedRuleRecords !== undefined && !Array.isArray(injectedRuleRecords))
+							return fail("bounded_scan_unsupported");
+						const ttsrMessageCount = record.ttsrMessageCount;
+						if (ttsrMessageCount !== undefined && typeof ttsrMessageCount !== "number")
+							return fail("bounded_scan_unsupported");
+						latestTtsr = {
+							ordinal,
+							rulesCount: record.injectedRules.length,
+							recordsCount: injectedRuleRecords === undefined ? 0 : injectedRuleRecords.length,
+							count: ttsrMessageCount ?? 0,
+						};
+					} else if (record.type === "label") {
+						if (typeof record.targetId !== "string") return fail("bounded_scan_unsupported");
+						const label = record.label;
+						if (label !== undefined && typeof label !== "string") return fail("bounded_scan_unsupported");
+						if (label) {
+							const existing = labelsById.get(record.targetId);
+							const existingBytes =
+								existing === undefined
+									? 0
+									: residentStringBytes(record.targetId) + residentStringBytes(existing) + 48;
+							const nextBytes = residentStringBytes(record.targetId) + residentStringBytes(label) + 48;
+							if (labelsBytes - existingBytes + nextBytes > LABELS_PINS_BUDGET_BYTES)
+								return fail("bounded_scan_budget");
+							labelsBytes += nextBytes - existingBytes;
+							labelsById.set(record.targetId, label);
+						} else {
+							const existing = labelsById.get(record.targetId);
+							if (existing !== undefined)
+								labelsBytes -= residentStringBytes(record.targetId) + residentStringBytes(existing) + 48;
+							labelsById.delete(record.targetId);
+						}
+					} else if (record.type === "message") {
+						if (record.message === null || typeof record.message !== "object")
+							return fail("bounded_scan_unsupported");
+						const message = record.message as Record<string, unknown>;
+						let usage: unknown;
+						if (message.role === "assistant") {
+							usage = message.usage;
+						} else if (message.role === "toolResult" && message.toolName === "task") {
+							usage = getTaskToolUsage(message.details);
+						}
+						if (usage !== undefined && !addUsage(validatePersistedUsageTotals(usage)))
+							return fail("bounded_scan_unsupported");
 					}
-					if (usage !== undefined && !addUsage(validatePersistedUsageTotals(usage)))
-						return fail("bounded_scan_unsupported");
-				}
-				const providerEntry = record as unknown as SessionEntry;
-				const providerKey = providerStateEntryKey(providerEntry);
-				if (providerKey) {
-					const bytes = lineBytes.byteLength + 64;
-					const previous = providerState.get(providerKey);
-					const nextBytes = providerStateBytes - (previous?.bytes ?? 0) + bytes;
-					if (providerState.size >= 256 && !previous) return fail("bounded_scan_budget");
-					if (nextBytes > REDUCER_BUDGET_BYTES) return fail("bounded_scan_budget");
-					providerStateBytes = nextBytes;
-					providerState.set(providerKey, { ordinal, entry: providerEntry, bytes });
-				}
-				const ringEntry: BoundedFirstOpenRingEntry = {
-					id: record.id,
-					ordinal,
-					entry: sanitizeLoadedSessionEntryReplayMetadata(record as unknown as SessionEntry),
-					byteOffset: lineStart,
-					byteLength,
-					recordDigest,
-					parentId,
-					entryType: record.type,
-				};
-				ring.push(ringEntry);
-				ringBytes += byteLength;
-				while (ringBytes > ringBudget && ring.length > 0) ringBytes -= ring.shift()!.byteLength;
-				lastId = record.id;
-			},
-			undefined,
-			false,
-			true,
-			telemetry,
-		);
-		if (scanFailure) {
-			if (scanFailure === "oversized_line") this.#lazyReopenFallbackReason = "bounded_scan_unsupported";
-			else if (scanFailure === "unterminated") this.#lazyReopenFallbackReason = "bounded_scan_malformed";
-			else if (scanFailure === "read_failed") this.#lazyReopenFallbackReason = "bounded_first_open_unreadable";
-			// "aborted": the callback already recorded a specific reason.
-			return undefined;
-		}
-		if (!header || ordinal < 0) {
-			this.#lazyReopenFallbackReason = "bounded_scan_malformed";
-			return undefined;
-		}
-		if (scannedBytes !== descriptor.size) {
-			this.#lazyReopenFallbackReason = "bounded_scan_malformed";
-			return undefined;
-		}
-		if (!latestCompactionBoundary) {
-			this.#lazyReopenFallbackReason = "bounded_scan_invalid_compaction";
-			return undefined;
-		}
-		const reducer: ReducerState = {
-			modelChange: { latest: latestModelChange },
-			ttsr: {
-				count: latestTtsr?.count ?? 0,
-				rulesCount: latestTtsr?.rulesCount ?? 0,
-				recordsCount: latestTtsr?.recordsCount ?? 0,
-				largestOrdinal: latestTtsr?.ordinal ?? -1,
-			},
-		};
-		if (!isValidPersistedReducerState(reducer)) {
-			this.#lazyReopenFallbackReason = "bounded_scan_unsupported";
-			return undefined;
-		}
-		fsyncFirstOpenSidecarWriter(indexWriter!, telemetry);
-		const bufferedIndexWriter = asBufferedSidecarWriter(indexWriter!);
-		if (bufferedIndexWriter) {
-			const instrumentation = bufferedIndexWriter.getInstrumentation();
-			telemetry.indexWriteCalls = instrumentation.writeCalls;
-			telemetry.bytesWritten = Math.max(telemetry.bytesWritten, instrumentation.bytesWritten);
-		}
-		runtime.indexDigest = runtime.indexHash.copy().digest("hex");
-		try {
-			runtime.validatedIndexDescriptor = this.storage.statSync(runtime.indexPath);
-		} catch {
-			return undefined;
-		}
-		return {
-			header,
-			leafId: lastId!,
-			recordCount: ordinal + 1,
-			retirementFirstKeptEntryId: latestCompactionBoundary.firstKeptEntryId,
-			retirementCompactionOrdinal: latestCompactionBoundary.ordinal,
-			reducer,
-			usageStatistics,
-			labels: [...labelsById],
-			providerState: [...providerState.values()]
-				.sort((left, right) => left.ordinal - right.ordinal)
-				.map(item => ({ ordinal: item.ordinal, entry: item.entry })),
-			ring,
-			hashCheckpoints,
-			indexDigest: runtime.indexDigest,
-		};
+					const providerEntry = record as unknown as SessionEntry;
+					const providerKey = providerStateEntryKey(providerEntry);
+					if (providerKey) {
+						const bytes = lineBytes.byteLength + 64;
+						const previous = providerState.get(providerKey);
+						const nextBytes = providerStateBytes - (previous?.bytes ?? 0) + bytes;
+						if (providerState.size >= 256 && !previous) return fail("bounded_scan_budget");
+						if (nextBytes > REDUCER_BUDGET_BYTES) return fail("bounded_scan_budget");
+						providerStateBytes = nextBytes;
+						providerState.set(providerKey, { ordinal, entry: providerEntry, bytes });
+					}
+					if ((ordinal & 1023) === 0) recordFirstOpenGcRequest(telemetry, true);
+					lastId = record.id;
+				},
+				undefined,
+				false,
+				true,
+				telemetry,
+			);
+			if (scanFailure) {
+				if (scanFailure === "oversized_line") this.#lazyReopenFallbackReason = "bounded_scan_unsupported";
+				else if (scanFailure === "unterminated") this.#lazyReopenFallbackReason = "bounded_scan_malformed";
+				else if (scanFailure === "read_failed") this.#lazyReopenFallbackReason = "bounded_first_open_unreadable";
+				// "aborted": the callback already recorded a specific reason.
+				return undefined;
+			}
+			if (!header || ordinal < 0) {
+				this.#lazyReopenFallbackReason = "bounded_scan_malformed";
+				return undefined;
+			}
+			if (scannedBytes !== descriptor.size) {
+				this.#lazyReopenFallbackReason = "bounded_scan_malformed";
+				return undefined;
+			}
+			if (!latestCompactionBoundary) {
+				this.#lazyReopenFallbackReason = "bounded_scan_invalid_compaction";
+				return undefined;
+			}
+			const reducer: ReducerState = {
+				modelChange: { latest: latestModelChange },
+				ttsr: {
+					count: latestTtsr?.count ?? 0,
+					rulesCount: latestTtsr?.rulesCount ?? 0,
+					recordsCount: latestTtsr?.recordsCount ?? 0,
+					largestOrdinal: latestTtsr?.ordinal ?? -1,
+				},
+			};
+			if (!isValidPersistedReducerState(reducer)) {
+				this.#lazyReopenFallbackReason = "bounded_scan_unsupported";
+				return undefined;
+			}
+			fsyncFirstOpenSidecarWriter(indexWriter!, telemetry);
+			const bufferedIndexWriter = asBufferedSidecarWriter(indexWriter!);
+			if (bufferedIndexWriter) {
+				const instrumentation = bufferedIndexWriter.getInstrumentation();
+				telemetry.indexWriteCalls = instrumentation.writeCalls;
+				telemetry.bytesWritten = Math.max(telemetry.bytesWritten, instrumentation.bytesWritten);
+			}
+			const indexSerializationWriteMs = Number(indexSerializationWriteNs) / 1_000_000;
+			telemetry.phaseTelemetry.indexSerializationWrite = {
+				wallMs: indexSerializationWriteMs,
+				cpuMs: null,
+			};
+			runtime.indexDigest = runtime.indexHash.copy().digest("hex");
+			telemetry.flatIndexElapsedMs = indexSerializationWriteMs;
+			try {
+				runtime.validatedIndexDescriptor = this.storage.statSync(runtime.indexPath);
+			} catch {
+				return undefined;
+			}
+			return {
+				header,
+				leafId: lastId!,
+				recordCount: ordinal + 1,
+				retirementFirstKeptEntryId: latestCompactionBoundary.firstKeptEntryId,
+				retirementCompactionOrdinal: latestCompactionBoundary.ordinal,
+				reducer,
+				usageStatistics,
+				labels: [...labelsById],
+				providerState: [...providerState.values()]
+					.sort((left, right) => left.ordinal - right.ordinal)
+					.map(item => ({ ordinal: item.ordinal, entry: item.entry })),
+				hashCheckpoints,
+				indexDigest: runtime.indexDigest,
+			};
 		} catch {
 			this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
 			return undefined;
@@ -7935,15 +7972,15 @@ export class SessionManager {
 
 	/**
 	 * Bounded first-open materialization from the semantic/index pass. The transcript
-	 * is parsed exactly once; this stage resolves the private flat-index boundary,
-	 * proves the base digest from a bounded hash checkpoint read, and builds tail and
-	 * secondary artifacts only from the bounded retained suffix ring.
+	 * receives one full semantic parse; this stage resolves the private flat-index boundary,
+	 * proves the base digest from a bounded hash checkpoint read, then parses the authenticated
+	 * hot suffix through one bounded transcript range read.
 	 */
 	#buildBoundedFirstOpenSidecars(
 		sessionFile: string,
 		descriptor: DescriptorSnapshot,
 		discovery: BoundedFirstOpenDiscovery,
-		secondaryArtifactMode: SessionMemorySecondaryArtifactMode = "auto",
+		secondaryArtifactMode: SessionMemorySecondaryArtifactMode = "disabled",
 	): { hotEntries: SessionEntry[]; hotSuffixBytes: number } | undefined {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.indexPath || !runtime.tailPath) return undefined;
@@ -7953,8 +7990,7 @@ export class SessionManager {
 		const secondaryArtifactsEligible =
 			secondaryArtifactMode !== "disabled" &&
 			discovery.recordCount <= PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS &&
-			(secondaryArtifactMode === "enabled" ||
-				descriptor.size <= PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES);
+			(secondaryArtifactMode === "enabled" || descriptor.size <= PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES);
 		const parentBuilder = new BoundedParentArtifactBuilder();
 		const partitionHashes = Array.from({ length: DICTIONARY_PARTITION_COUNT }, () => crypto.createHash("sha256"));
 		const partitionSizes = new Array<number>(DICTIONARY_PARTITION_COUNT).fill(0);
@@ -7968,6 +8004,7 @@ export class SessionManager {
 		try {
 			this.#truncateDerivedArtifactFiles(secondaryArtifactsEligible);
 			const indexSize = this.storage.statSync(runtime.indexPath).size;
+			const boundaryPrefix = Buffer.from(`{"id":${JSON.stringify(discovery.retirementFirstKeptEntryId)},`, "utf8");
 			let boundaryIndex: ({ id: string } & ColdEntryIndex) | undefined;
 			let indexBuildFailed = false;
 			const indexFailure = scanTranscriptLinesBounded(
@@ -7975,6 +8012,7 @@ export class SessionManager {
 				runtime.indexPath,
 				indexSize,
 				(_offset, lineBytes) => {
+					if (!secondaryArtifactsEligible && !bytesStartWith(lineBytes, boundaryPrefix)) return true;
 					let parsed: unknown;
 					try {
 						parsed = JSON.parse(decodeBoundedJsonLine(lineBytes));
@@ -8047,7 +8085,11 @@ export class SessionManager {
 			const checkpoint = [...discovery.hashCheckpoints]
 				.reverse()
 				.find(candidate => candidate.offset <= baseEndOffset);
-			if (!checkpoint || baseEndOffset < checkpoint.offset || baseEndOffset - checkpoint.offset > SESSION_RANGE_READ_MAX_BYTES) {
+			if (
+				!checkpoint ||
+				baseEndOffset < checkpoint.offset ||
+				baseEndOffset - checkpoint.offset > SESSION_RANGE_READ_MAX_BYTES
+			) {
 				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
 				return undefined;
 			}
@@ -8066,41 +8108,79 @@ export class SessionManager {
 				hashOffset += length;
 			}
 			const baseDigest = baseHash.digest("hex");
-			const boundaryRingIndex = discovery.ring.findIndex(
-				entry => entry.id === boundaryIndex!.id && entry.byteOffset === baseEndOffset,
+			const suffixLength = descriptor.size - baseEndOffset;
+			if (suffixLength <= 0 || suffixLength > this.#sidecarHotSuffixBudgetBytes) {
+				this.#lazyReopenFallbackReason = "bounded_scan_budget";
+				return undefined;
+			}
+			const suffixSnapshot = this.storage.readRangeSync!(sessionFile, baseEndOffset, suffixLength);
+			if (!sameDescriptor(descriptor, suffixSnapshot.stat) || suffixSnapshot.bytes.byteLength !== suffixLength) {
+				this.#lazyReopenFallbackReason = "bounded_first_open_descriptor_changed";
+				return undefined;
+			}
+			telemetry.bytesRead += suffixLength;
+			telemetry.transcriptBytesRead += suffixLength;
+			const suffixBytes = Buffer.from(
+				suffixSnapshot.bytes.buffer,
+				suffixSnapshot.bytes.byteOffset,
+				suffixSnapshot.bytes.byteLength,
 			);
-			if (boundaryRingIndex < 0) {
-				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
-				return undefined;
-			}
-			const suffix = discovery.ring.slice(boundaryRingIndex);
-			if (
-				suffix.length === 0 ||
-				suffix[0]!.byteOffset !== baseEndOffset ||
-				suffix[suffix.length - 1]!.byteOffset + suffix[suffix.length - 1]!.byteLength !== descriptor.size
-			) {
-				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
-				return undefined;
-			}
 			tailWriter = openFirstOpenSidecarWriter(this.storage, runtime.tailPath);
 			const tailBuilder = new RollingTailChainBuilder({ baseDigest, baseEndOffset });
 			let tailSeq = 0;
 			let hotSuffixBytes = 0;
 			let hotResidentBytes = 0;
 			let tailResidentBytes = 0;
+			let previousId: string | undefined;
 			const hotEntries: SessionEntry[] = [];
-			for (const item of suffix) {
-				const entry = item.entry;
+			for (let cursor = 0; cursor < suffixBytes.byteLength; ) {
+				const newline = suffixBytes.indexOf(0x0a, cursor);
+				if (newline < 0) {
+					buildFailed = true;
+					break;
+				}
+				const byteLength = newline - cursor + 1;
+				if (byteLength > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) {
+					buildFailed = true;
+					break;
+				}
+				const lineBytes = suffixBytes.subarray(cursor, newline + 1);
+				let parsed: unknown;
+				try {
+					parsed = JSON.parse(decodeBoundedJsonLine(lineBytes));
+				} catch {
+					buildFailed = true;
+					break;
+				}
+				if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+					buildFailed = true;
+					break;
+				}
+				const record = parsed as Record<string, unknown>;
+				const parentId = record.parentId;
+				if (
+					typeof record.id !== "string" ||
+					typeof record.type !== "string" ||
+					(parentId !== null && typeof parentId !== "string") ||
+					(tailSeq === 0 ? record.id !== boundaryIndex.id : parentId !== previousId)
+				) {
+					buildFailed = true;
+					break;
+				}
+				const recordDigest = computeLineDigest(lineBytes);
+				telemetry.recordsParsed += 1;
+				telemetry.suffixRecordsParsed += 1;
+				const entry = sanitizeLoadedSessionEntryReplayMetadata(record as unknown as SessionEntry);
 				const tailRecord = tailBuilder.append({
 					seq: tailSeq,
 					kind: tailRecordKindForEntry(entry),
-					ordinal: item.ordinal,
-					id: item.id,
-					parentId: item.parentId,
-					type: item.entryType,
-					byteOffset: item.byteOffset,
-					byteLength: item.byteLength,
-					recordDigest: item.recordDigest,
+					ordinal: boundaryIndex.ordinal + tailSeq,
+					id: record.id,
+					parentId,
+					type: record.type,
+					byteOffset: baseEndOffset + cursor,
+					byteLength,
+					recordDigest,
 				});
 				if (!tailRecord) {
 					buildFailed = true;
@@ -8109,10 +8189,12 @@ export class SessionManager {
 				const tailBytes = Buffer.from(`${JSON.stringify(tailRecord)}\n`, "utf8");
 				writeFirstOpenSidecarBytes(tailWriter, tailBytes, telemetry, "tail");
 				tailSeq++;
+				previousId = record.id;
 				tailResidentBytes += tailRecordResidentBytes(tailRecord);
-				hotSuffixBytes += item.byteLength;
-				hotResidentBytes += residentHotEntryBytes(item.byteLength);
+				hotSuffixBytes += byteLength;
+				hotResidentBytes += residentHotEntryBytes(byteLength);
 				hotEntries.push(entry);
+				cursor = newline + 1;
 			}
 			if (buildFailed) {
 				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
@@ -8155,7 +8237,9 @@ export class SessionManager {
 					this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
 					return undefined;
 				}
-				if (!this.#adoptBuiltDictionaryArtifact(dictionaryResult, partitionHashes, partitionSizes, partitionRecords)) {
+				if (
+					!this.#adoptBuiltDictionaryArtifact(dictionaryResult, partitionHashes, partitionSizes, partitionRecords)
+				) {
 					this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
 					return undefined;
 				}
@@ -8176,7 +8260,11 @@ export class SessionManager {
 				if (persistedLine.byteLength > MAX_REDUCER_INLINE_BYTES) {
 					const stored = this.#appendMetadataDeltaValue(persistedLine);
 					if (stored) {
-						metadataDeltaState.byKey.set(providerKey, { kind: provider.entry.type, ordinal: provider.ordinal, ...stored });
+						metadataDeltaState.byKey.set(providerKey, {
+							kind: provider.entry.type,
+							ordinal: provider.ordinal,
+							...stored,
+						});
 					} else {
 						metadataDeltaState.byKey.delete(providerKey);
 						runtime.providerStateEntries.push(cloneSessionEntry(provider.entry));
@@ -12024,7 +12112,7 @@ export class SessionManager {
 			...dictionaryPartitionPaths(runtime.indexPath),
 			...parentBucketPaths(runtime.indexPath),
 		];
-}
+	}
 	#sidecarFileByteTotal(): number {
 		let total = 0;
 		for (const sidecarPath of this.#disposableSidecarPaths()) {
@@ -17204,7 +17292,10 @@ export class SessionManager {
 			(await manager.#tryForkFromBoundedSource(managedSourcePath))
 		)
 			return manager;
-		if (manager.#effectiveSessionMemoryMode(storage.statSync(managedSourcePath).size) === "enabled" && destination.kind !== "managed") {
+		if (
+			manager.#effectiveSessionMemoryMode(storage.statSync(managedSourcePath).size) === "enabled" &&
+			destination.kind !== "managed"
+		) {
 			const inspected = inspectTranscriptBounded(managedSourcePath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
 			if (
 				inspected.ok &&
@@ -17262,13 +17353,11 @@ export class SessionManager {
 		// owner-only and reparse guards accept.
 		if (storage instanceof FileSessionStorage) filePath = canonicalizeTrustedPath(filePath);
 		if (destination.kind === "explicit" || !(storage instanceof FileSessionStorage)) {
-			const inspected = inspectTranscriptBounded(
-				filePath,
-				storage,
-				sessionMemoryMode === "enabled" || sessionMemoryMode === "auto"
-					? BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES
-					: RESUME_TRANSCRIPT_MAX_BYTES,
-			);
+			const boundedAdmission = sessionMemoryMode === "enabled" || sessionMemoryMode === "auto";
+			const maxBytes = boundedAdmission ? BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES : RESUME_TRANSCRIPT_MAX_BYTES;
+			const inspected = boundedAdmission
+				? inspectTranscriptHeaderBounded(filePath, storage, maxBytes)
+				: inspectTranscriptBounded(filePath, storage, maxBytes);
 			if (!inspected.ok) {
 				if (inspected.error.reason === "missing") {
 					const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
