@@ -49,7 +49,7 @@ import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import type { NotificationSessionController } from "../src/sdk/bus/session-control";
 import { SdkClient } from "../src/sdk/client";
 import { SessionSdkHost } from "../src/sdk/host";
-import type { SessionRouter } from "../src/sdk/router";
+import type { SessionAttachment } from "../src/sdk/router/session-router";
 import { createAgentSession } from "../src/sdk/session";
 import {
 	attachLifecycleStartupCapability,
@@ -2744,23 +2744,6 @@ test("ACP permission attachment normalizes decisions through the registered prov
 		url: string;
 		token: string;
 	};
-	const client = new SdkClient(endpoint.url, endpoint.token);
-	await client.connect();
-	const attachment = {
-		sessionId,
-		generation: 1,
-		isCurrent: () => true,
-		send: (frame: Record<string, unknown>) => client.send(frame),
-	};
-	const router = {
-		request: async (
-			_requestedSessionId: string,
-			frame: Record<string, unknown>,
-			_expectedGeneration?: number,
-			_expectedAttachment?: unknown,
-			options?: { timeoutMs?: number },
-		) => await client.request({ ...frame, connectionId: client.connectionId }, options),
-	} as unknown as SessionRouter;
 
 	let nextResponse: unknown;
 	let waitForReverseAbort = false;
@@ -2789,16 +2772,32 @@ test("ACP permission attachment normalizes decisions through the registered prov
 			return await promise;
 		},
 	} as unknown as AgentSideConnection;
-	let adapter: AcpSdkAdapter | undefined;
-	const disposeFrames = client.onFrame(frame => adapter?.acceptFrame(frame));
-	adapter = await AcpSdkAdapter.connect({
-		router,
+	const client = new SdkClient(endpoint.url, endpoint.token);
+	const routedFrame = (frame: Record<string, unknown>): Record<string, unknown> => ({
+		...frame,
+		connectionId: client.connectionId,
+	});
+	const attachment: SessionAttachment = {
+		sessionId: acpSessionId,
+		generation: 1,
+		isCurrent: () => true,
+		send: async frame => client.send(routedFrame(frame)),
+		retire: async () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async (_sessionId: string, frame: Record<string, unknown>) =>
+				await client.request(routedFrame(frame)),
+		} as never,
 		attachment,
-		sessionId,
+		sessionId: acpSessionId,
 		connection: createAcpReverseConnection(connection, acpSessionId),
 		providers: [{ capability: "permission", definitions: [] }],
 		heartbeatMs: 60_000,
 	});
+	const unsubscribe = client.onFrame(frame => adapter.acceptFrame(frame));
+	await client.connect();
+	await adapter.start();
 
 	try {
 		await waitFor(() => permissionProvider !== undefined, "ACP permission provider installation");
@@ -2853,8 +2852,8 @@ test("ACP permission attachment normalizes decisions through the registered prov
 		expect(reverseCalls.every(call => call.input.sessionId === acpSessionId)).toBe(true);
 		expect(reverseCalls.every(call => call.signal instanceof AbortSignal)).toBe(true);
 	} finally {
-		disposeFrames();
-		await Promise.race([adapter?.close(), Bun.sleep(2_000)]);
+		unsubscribe();
+		await adapter.close();
 		await client.close();
 		await agentSession.dispose();
 	}
