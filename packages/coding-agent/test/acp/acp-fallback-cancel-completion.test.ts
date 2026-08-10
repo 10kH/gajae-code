@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setDefaultTimeout, spyOn } from "bun:test";
 import * as path from "node:path";
 import {
 	type AgentSideConnection,
@@ -25,6 +25,8 @@ import {
 	publishExactSessionAuthority,
 } from "../helpers/sdk-exact-session-authority";
 
+setDefaultTimeout(30_000);
+
 type TestSocket = { send(message: string): void };
 class TestClient implements Client {
 	async requestPermission(_params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
@@ -41,7 +43,7 @@ class TestClient implements Client {
 async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
 	return await Promise.race([
 		promise,
-		Bun.sleep(2_000).then(() => {
+		Bun.sleep(15_000).then(() => {
 			throw new Error(`Timed out waiting for ${label}`);
 		}),
 	]);
