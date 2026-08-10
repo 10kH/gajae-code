@@ -5,12 +5,12 @@ application** — mobile apps, desktop apps, custom web frontends, chat bots, an
 vertical AI products.
 
 > Proof that this works in production: the bundled **Telegram, Discord, and Slack
-> integrations are themselves ordinary SDK clients**. They use the exact same
-> public contract described here — no private hooks, no upstream changes.
+> integrations are SDK-core managed adapters**. They use opaque Router attachments
+> and provider-neutral presentation contracts rather than private endpoint credentials.
 
 Related references:
 
-- [SDK wire protocol & machine interfaces](./sdk.md) — the full WebSocket contract
+- [SDK wire protocol & machine interfaces](./sdk.md) — internal wire semantics and supported managed adapters
 - [Embedding SDK](./sdk-embedding.md) — the in-process TypeScript API
 - [External control readiness](./external-control-readiness.md) — supported surfaces
 
@@ -26,31 +26,31 @@ Gajae-Code packages the runtime as a reusable component:
 - **Drop the agentic loop from your codebase.** `createAgentSession()` gives you
   a production agent loop (tools, retries, compaction, session files, model
   fallback chains) in one call.
-- **A local machine interface is available by default.** Top-level sessions host
-  a loopback WebSocket endpoint, so a client you build can observe actions and
-  send replies without scraping a terminal. Remote transport, identity, and
-  delivery remain your client's responsibility.
-- **Many subscribers, one session.** The event stream supports multiple
-  subscribers: your app UI, a configured remote client, and an audit logger can
-  all watch the same session simultaneously.
+- **A managed machine interface is available.** Top-level sessions host an internal
+  loopback endpoint, while SDK-core `SessionRouter` retains its discovery record,
+  credentials, replay cursor, and exact attachment authority. Applications use
+  Coordinator MCP, the daemon-session CLI, or a configured managed adapter rather
+  than opening that endpoint directly.
+- **Many subscribers, one session.** In-process subscribers and configured managed
+  adapters can observe the same session without sharing endpoint credentials.
 - **Not just for coding.** Tools, skills, rules, and the system prompt are all
   injectable, so the same runtime powers legal assistants, research agents,
   data-analysis products — any vertical.
 
 
-## The two surfaces (pick one, or combine)
+## The two supported integration surfaces
 
-| | Embedding SDK (in-process) | WebSocket SDK (out-of-process) |
+| | Embedding SDK (in-process) | Managed external control |
 | --- | --- | --- |
-| What it is | Import `@gajae-code/coding-agent` as a library | Connect to a running session's loopback WS endpoint |
-| Language | TypeScript / Bun (Node-compatible) | Any language (JSON frames) |
-| Telemetry | Full: token deltas, tool events, session events | Curated: action/ask frames, summarized turn stream, queries |
-| Trust model | You are the host — full access | Token-authenticated client — secrets are never exposed |
-| Typical consumer | Your app's own UI and business logic | Bots, mobile clients, dashboards, orchestrators |
+| What it is | Import `@gajae-code/coding-agent` as a library | Use Coordinator MCP, daemon-session CLI, or a configured Telegram/Discord/Slack adapter |
+| Language | TypeScript / Bun (Node-compatible) | Any client capable of the selected MCP/CLI/provider interface |
+| Telemetry | Full token deltas, tool events, and session events | Curated provider-neutral frames and queries |
+| Trust model | Your process hosts the runtime | SDK core retains endpoint credentials and issues exact opaque attachments |
+| Typical consumer | Your app UI and business logic | Bots, dashboards, and orchestrators |
 
-A common production shape uses **both**: your app UI is the in-process
-subscriber (full-fidelity streaming), while a configured remote client attaches
-over WebSocket for notifications and approvals.
+A common production shape combines an in-process UI with one or more configured
+managed adapters. Applications never discover endpoint records or open raw session
+WebSockets.
 
 
 ## Quick start: embed the runtime
@@ -181,34 +181,24 @@ for the supported controller surfaces and lifecycle constraints.
 
 ## Application recipes
 
-- **Vertical AI app (delete your agentic loop).** Embed with `toolNames` +
-  `customTools` + `skills` + a domain `systemPrompt`. Your product UI subscribes
-  in-process for token-level streaming. Add remote notifications or approvals
-  only after configuring, enabling, and completing the required credentials or
-  pairing for a managed adapter, or after deploying your own WS client; see
-  [managed notification adapters](./sdk.md#managed-notification-adapters).
-- **Custom web app / dashboard.** Run sessions under the broker; your web
-  backend attaches as a WS client, renders `turn_stream` snapshots, answers asks
-  with `reply`, and reads history with `transcript.*` queries.
-- **Mobile / desktop companion.** Build a client for the WS contract: discover
-  endpoints, render `action_needed`, and send `reply`. Threaded frames give you
-  live activity and context updates.
-- **Fleet orchestrator.** Use Coordinator MCP or the documented daemon-session
-  lifecycle operations to create and supervise many worktree-scoped sessions.
+- **Vertical AI app.** Embed with `toolNames`, `customTools`, `skills`, and a domain
+  `systemPrompt`. Subscribe in-process for full-fidelity streaming.
+- **Custom web app or dashboard.** Keep the agent runtime in your backend process;
+  expose your own authenticated product API, or use Coordinator MCP for supported
+  external orchestration. Do not relay the internal session endpoint.
+- **Mobile or desktop companion.** Pair through a configured managed notification
+  adapter for actions and approvals, or call an application backend that embeds GJC.
+- **Fleet orchestrator.** Use Coordinator MCP or daemon-session lifecycle operations
+  to create and supervise worktree-scoped sessions.
 
-## What the WS surface deliberately does not do
+## External interface constraints
 
-So you design around it rather than fight it:
-
-- **Loopback only.** Remote transport (like the Telegram daemon) is a
-  client-side concern.
-- **No secrets on the wire.** `config.patch` rejects secret fields;
-  `session.get_endpoint` is prohibited through chat adapters and MCP.
-- **Summarized streaming.** `turn_stream` is a throttled snapshot stream (no
-  thinking tokens, redaction-gated). Full-fidelity token deltas are an
-  in-process embedding capability.
-- **Fail-closed action identity.** One active answerable presentation at a
-  time; stale IDs never regain authority. Do not retry by matching text.
+- Endpoint records, bearer tokens, and raw session WebSockets are private SDK-core
+  implementation details.
+- `config.patch` rejects secret fields, and `session.get_endpoint` is prohibited on
+  public adapters.
+- Full-fidelity token deltas remain an in-process embedding capability.
+- Action identity is fail-closed: stale IDs never regain authority.
 
 Destructive operations (`session.delete`, `context.clear`) require
 `confirm: true`.
@@ -216,15 +206,16 @@ Destructive operations (`session.delete`, `context.clear`) require
 ## FAQ
 
 **Is embedding a subprocess?** No — it is a library import; the agent loop runs
-in your process. Process isolation is what the broker/WS path is for.
+in your process. Process-isolated control uses Coordinator MCP, daemon-session CLI,
+or a configured managed adapter.
 
-**Can multiple clients watch one session?** Yes. Subscribers are additive on
-both surfaces; replies to asks are arbitrated first-valid-wins.
+**Can multiple consumers watch one session?** Yes. In-process subscribers and
+managed adapters are additive; replies to asks remain first-valid-wins.
 
-**Can the TUI and my code share a session?** Concurrently: run the TUI and
-attach your code as a WS client. Sequentially: sessions are `.jsonl` files —
-resume/fork/handoff between your embedded app and `gjc`.
+**Can the TUI and my code share a session?** Use in-process embedding for code that
+hosts the runtime, or Coordinator MCP/managed adapters for process-isolated control.
+Session files remain resumable through canonical lifecycle operations.
 
-**I need full streaming in another language.** Today: spawn a session and use
-the WS contract, or wrap the embedding SDK in a small TS host you own.
-Dedicated embedding-like Rust/Python SDKs are tracked as roadmap issues.
+**I need another language.** Use Coordinator MCP or your own authenticated backend
+around the TypeScript embedding SDK. Dedicated embedding-like Rust/Python SDKs are
+roadmap work, not raw endpoint contracts.
