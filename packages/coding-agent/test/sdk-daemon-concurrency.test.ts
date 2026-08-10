@@ -157,6 +157,26 @@ describe("ConversationStore", () => {
 		expect(performance.now() - started).toBeLessThan(900);
 		expect(fs.files.has(`${store.filePath}.lock`)).toBe(false);
 	});
+	test("removes its lock when closing the lock handle fails", async () => {
+		class CloseFailingLockFs extends MemoryConversationStoreFs {
+			override async open(file: string, flags: string) {
+				const handle = await super.open(file, flags);
+				if (flags !== "wx" || !file.endsWith(".lock")) return handle;
+				return {
+					...handle,
+					close: async () => {
+						await handle.close();
+						throw new Error("lock close failed");
+					},
+				};
+			}
+		}
+		const fs = new CloseFailingLockFs();
+		const store = new ConversationStore<TestConversation>({ agentDir: "/agent", kind: "discord", fs });
+		await expect(store.write("mapping", undefined, record(1))).resolves.toBe(true);
+		expect(fs.files.has(`${store.filePath}.lock`)).toBe(false);
+		await expect(store.write("mapping", 1, record(2))).resolves.toBe(true);
+	});
 
 	test("does not heal a lock a same-process instance currently holds", async () => {
 		const entered = Promise.withResolvers<void>();
