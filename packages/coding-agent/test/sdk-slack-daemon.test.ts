@@ -25,6 +25,7 @@ class FakeSlack {
 	onAck?: (envelopeId: string) => Promise<void>;
 	postGate?: Promise<void>;
 	startGate?: Promise<void>;
+	stopGate?: Promise<void>;
 	startUntilStopped = false;
 	postStarts = 0;
 	#postStartWaiters: Array<{ count: number; resolve: () => void }> = [];
@@ -48,6 +49,7 @@ class FakeSlack {
 	async stop(): Promise<void> {
 		this.stops++;
 		this.#startStopGate.resolve();
+		await this.stopGate;
 	}
 
 	async ack(envelopeId: string): Promise<void> {
@@ -153,7 +155,7 @@ async function withDaemon(
 		daemon: SlackNotificationDaemon,
 		fake: FakeSlack,
 		injected: Array<Record<string, unknown>>,
-		setEndpointGeneration: (generation: number) => void,
+		setEndpointGeneration: (generation: number | undefined) => void,
 		agentDir: string,
 	) => Promise<void>,
 	options: {
@@ -168,7 +170,7 @@ async function withDaemon(
 	try {
 		const fake = new FakeSlack();
 		const injected: Array<Record<string, unknown>> = [];
-		let endpointGeneration = 1;
+		let endpointGeneration: number | undefined = 1;
 		const attachment = options.attachmentSend?.(injected);
 		let id = 0;
 		daemon = new SlackNotificationDaemon({
@@ -178,13 +180,16 @@ async function withDaemon(
 			channelId: "C1",
 			provider: new SlackProvider(fake),
 			randomId: () => `client-id-${++id}`,
-			resolveAttachment: async sessionId => ({
-				...endpoint(sessionId, endpointGeneration),
-				send: (frame: Record<string, unknown>) => {
-					if (attachment) return attachment.send(frame);
-					injected.push(frame);
-				},
-			}),
+			resolveAttachment: async sessionId => {
+				if (endpointGeneration === undefined) return null;
+				return {
+					...endpoint(sessionId, endpointGeneration),
+					send: (frame: Record<string, unknown>) => {
+						if (attachment) return attachment.send(frame);
+						injected.push(frame);
+					},
+				};
+			},
 			now: options.now,
 			onCommand: options.onCommand,
 			...(options.authorizeActor === false
@@ -596,6 +601,15 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			const replacements = fake.posts.filter(post => post.text === "replacement root");
 			expect(replacements).toHaveLength(1);
 			expect(replacements[0]?.threadTs).toBeUndefined();
+		});
+	});
+
+	it("posts the close marker after Router attachment revocation", async () => {
+		await withDaemon(async (daemon, fake, _injected, setEndpointGeneration) => {
+			await daemon.postRoot("session", "root");
+			setEndpointGeneration(undefined);
+			expect(await daemon.close("session")).toBe(true);
+			expect(fake.posts.map(post => post.text)).toEqual(["root", "Session closed."]);
 		});
 	});
 
@@ -1234,6 +1248,22 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		);
 	});
 
+	it("bounds a provider stop that never settles", async () => {
+		let stopping = false;
+		let nowCalls = 0;
+		await withDaemon(
+			async (daemon, fake) => {
+				fake.stopGate = new Promise<void>(() => {});
+				await daemon.start();
+				stopping = true;
+				await daemon.stop();
+				expect(fake.stops).toBe(1);
+				nowCalls = 0;
+			},
+			{ now: () => (stopping ? (nowCalls++ === 0 ? 0 : 5_001) : 0) },
+		);
+	});
+
 	it("fences tracked outbound notification work that races stop", async () => {
 		let stopping = false;
 		let nowCalls = 0;
@@ -1283,7 +1313,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				await expect(closing).rejects.toThrow("shutdown");
 				expect(fake.posts.map(post => post.text)).toEqual(["root"]);
 				const effect = (await new ChatEffectJournal({ agentDir, transport: "slack" }).list()).find(candidate =>
-					candidate.id.startsWith("close-marker:"),
+					candidate.id.startsWith("close-marker"),
 				);
 				expect(effect).toMatchObject({ state: "uncertain", receipt: { status: "shutdown_timeout" } });
 				nowCalls = 0;

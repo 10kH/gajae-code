@@ -247,6 +247,12 @@ export class SlackNotificationDaemon {
 				this.#providerStarting = true;
 				try {
 					await this.options.provider.start(async envelope => {
+						if (
+							!this.#started ||
+							this.#startedGeneration !== lifecycleGeneration ||
+							lifecycleGeneration !== this.#lifecycleGeneration
+						)
+							return;
 						await this.#track(this.handleEnvelope(envelope));
 					});
 					this.#providerRunning = true;
@@ -291,13 +297,33 @@ export class SlackNotificationDaemon {
 		this.#clearLeaseRecoveryTimer();
 		if (stopProvider) this.#providerStopRequestedGeneration = lifecycleGeneration;
 		const providerStop = stopProvider ? this.options.provider.stop() : undefined;
+		const shutdownDeadline = this.#now() + 5_000;
 		const operation = this.#enqueueLifecycle(async () => {
 			// Calling provider.stop() before joining the lifecycle queue lets a provider
-			// cancel an open that resolves only after its socket is stopped.
-			if (providerStop) await providerStop;
-			// Drain until quiescent, but never let a hung provider request prevent
+			// cancel an open that resolves only after its socket is stopped. The same
+			// operation deadline covers provider teardown and admitted work draining.
+			if (providerStop) {
+				const remaining = shutdownDeadline - this.#now();
+				const stopped =
+					remaining > 0 &&
+					(await Promise.race([
+						providerStop.then(
+							() => true,
+							error => {
+								logger.warn(`Slack provider stop failed; continuing with Router revocation: ${String(error)}`);
+								return false;
+							},
+						),
+						Bun.sleep(remaining).then(() => false),
+					]));
+				if (!stopped) {
+					await this.#invalidateActiveWork();
+					logger.warn("Slack provider stop exceeded the shutdown deadline; continuing with Router revocation.");
+				}
+			}
+			// Drain until quiescent, but never let hung provider work prevent
 			// SessionRouter authority revocation and daemon ownership release.
-			const drainDeadline = this.#now() + 5_000;
+			const drainDeadline = shutdownDeadline;
 			while (this.#activeWork.size > 0) {
 				const remaining = drainDeadline - this.#now();
 				if (remaining <= 0) {
@@ -789,13 +815,13 @@ export class SlackNotificationDaemon {
 	}
 
 	async close(sessionId: string, marker = "Session closed."): Promise<boolean> {
-		return await this.#track(this.#close(sessionId, marker));
+		return await this.#track(this.#close(sessionId, marker, true));
 	}
 
-	async #close(sessionId: string, marker: string): Promise<boolean> {
+	async #close(sessionId: string, marker: string, allowRemovedAttachment: boolean): Promise<boolean> {
 		const found = await this.findSession(sessionId, true);
 		if (!found?.record.rootTs || found.record.state !== "active") return false;
-		const effectId = `close-marker:${sessionId}:${found.record.clientMsgId ?? found.record.rootTs}`;
+		const effectId = `${allowRemovedAttachment ? "close-marker-cleanup" : "close-marker"}:${sessionId}:${found.record.clientMsgId ?? found.record.rootTs}`;
 		const existing = await this.#journal.read<{
 			channel: string;
 			text: string;
@@ -944,7 +970,7 @@ export class SlackNotificationDaemon {
 			}
 			let closed = false;
 			try {
-				closed = await this.close(sessionId);
+				closed = await this.#track(this.#close(sessionId, "Session closed.", false));
 			} catch (error) {
 				if (!(error instanceof SlackStaleEffectError)) throw error;
 				// The old-generation close marker was deliberately suppressed after
@@ -1928,8 +1954,10 @@ export class SlackNotificationDaemon {
 	async #providerEffectCurrent(effect: ChatEffect): Promise<boolean> {
 		if (!effect.sessionId || !Number.isSafeInteger(effect.endpointGeneration) || effect.endpointGeneration <= 0)
 			return false;
-		const endpoint = await this.#resolveAttachment(effect.sessionId);
-		if (!endpoint || endpoint.generation !== effect.endpointGeneration) return false;
+		if (!effect.id.startsWith("close-marker-cleanup:")) {
+			const endpoint = await this.#resolveAttachment(effect.sessionId);
+			if (!endpoint || endpoint.generation !== effect.endpointGeneration) return false;
+		}
 		const payload = effect.payload as { threadTs?: unknown };
 		const threadTs = payload.threadTs;
 		const records = Object.values((await this.store.load()).conversations);
