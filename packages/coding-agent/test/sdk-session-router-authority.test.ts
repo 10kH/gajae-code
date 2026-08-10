@@ -373,6 +373,39 @@ describe("SessionRouter dispatch authority", () => {
 		}
 	});
 
+	test("rejects an exact publication-time request after endpoint replacement", async () => {
+		let router: SessionRouter | undefined;
+		let endpointFile = "";
+		let sessionId = "";
+		const fixture = await routerFixture({
+			start: false,
+			onAttachmentReady: async attachment => {
+				fs.writeFileSync(
+					endpointFile,
+					JSON.stringify({ sessionId, url: "ws://router.test", token: "replacement", pid: 42 }),
+				);
+				if (!router) throw new Error("Router fixture unavailable");
+				await expect(
+					router.request(
+						attachment.sessionId,
+						{ type: "register_provider", capability: "ui" },
+						attachment.generation,
+						attachment,
+					),
+				).rejects.toMatchObject({ phase: "pre_send" });
+			},
+		});
+		router = fixture.router;
+		endpointFile = fixture.endpointFile;
+		sessionId = fixture.sessionId;
+		try {
+			await router.start();
+			expect(fixture.clients[0]?.requests.map(frame => frame.type)).toEqual([]);
+		} finally {
+			await router.stop();
+		}
+	});
+
 	test("revalidates exact endpoint authority before publication handshake sends", async () => {
 		let authority: { pid: number; endpointMtimeMs: number } | undefined;
 		let endpointFile = "";

@@ -418,6 +418,18 @@ export class SessionRouter {
 			throw new SessionRouterError("pre_send", "SDK session endpoint changed before command dispatch.");
 		if (expectedAttachment !== undefined && attached.capability !== expectedAttachment)
 			throw new SessionRouterError("pre_send", "SDK session attachment changed before command dispatch.");
+		if (attached.initializingPublication) {
+			const endpoint = await this.#readEndpoint(attached.indexed);
+			if (
+				!endpoint ||
+				endpoint.url !== attached.endpoint.url ||
+				endpoint.token !== attached.endpoint.token ||
+				endpoint.pid !== attached.pid
+			) {
+				await this.#retireAttachment(attached);
+				throw new SessionRouterError("pre_send", "SDK session attachment changed during publication.");
+			}
+		}
 		const response = await attached.client.request(this.#prepareFrame(attached, frame), options);
 		if (
 			!this.#attachmentPublished(attached) ||
