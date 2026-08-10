@@ -4974,9 +4974,7 @@ export class TelegramNotificationDaemon {
 			this.publicationSettlements.delete(frame.publicationId);
 		const session = this.sessions.get(attachment.sessionId);
 		if (!session || session.attachment !== attachment || !attachment.isCurrent()) return;
-		if (frame.publicationId && this.publicationsBeingRejected.has(frame.publicationId))
-			await this.publicationSettlement(frame.publicationId).promise;
-		if (this.publicationShouldSuppress(frame.publicationId)) return;
+		if (await this.publicationSuppressed(frame.publicationId)) return;
 		await this.claimPublication(frame.publicationId);
 		const replayPending = session.replayPending;
 		await this.effects.admit(() => this.handleSessionMessage(session, frame.body, frame.publicationId));
@@ -4985,7 +4983,7 @@ export class TelegramNotificationDaemon {
 		if (
 			!replayPending &&
 			!this.deferredPublications.has(frame.publicationId ?? "") &&
-			!this.publicationShouldSuppress(frame.publicationId)
+			!(await this.publicationSuppressed(frame.publicationId))
 		)
 			await this.markPublicationRejected(frame.publicationId);
 		if (
@@ -5341,6 +5339,12 @@ export class TelegramNotificationDaemon {
 				this.ambiguousPublications.has(publicationId) ||
 				this.rejectedPublications.has(publicationId))
 		);
+	}
+
+	private async publicationSuppressed(publicationId: string | undefined): Promise<boolean> {
+		if (publicationId && this.publicationsBeingRejected.has(publicationId))
+			await this.publicationSettlement(publicationId).promise;
+		return this.publicationShouldSuppress(publicationId);
 	}
 
 	private publicationTerminal(publicationId: string | undefined): boolean {
@@ -9376,7 +9380,7 @@ export class TelegramNotificationDaemon {
 	}
 
 	async handleSessionMessage(session: AttachmentSession, msg: any, publicationId?: string): Promise<void> {
-		if (this.publicationShouldSuppress(publicationId) && msg?.type !== "event_replay_result") return;
+		if ((await this.publicationSuppressed(publicationId)) && msg?.type !== "event_replay_result") return;
 		if (msg?.type === "hello") {
 			const capabilities = Array.isArray(msg.capabilities) ? msg.capabilities : [];
 			const previousToolActivityCapability = session.toolActivityCapability;
@@ -9500,7 +9504,7 @@ export class TelegramNotificationDaemon {
 			const replayCounts = new Map<string, number>();
 			for (const frame of replayState) {
 				const replayPublicationId = replayPublicationIds.get(frame);
-				if (this.publicationShouldSuppress(replayPublicationId)) continue;
+				if (await this.publicationSuppressed(replayPublicationId)) continue;
 				const fingerprint = JSON.stringify(frame);
 				replayCounts.set(fingerprint, (replayCounts.get(fingerprint) ?? 0) + 1);
 				try {
@@ -9515,13 +9519,13 @@ export class TelegramNotificationDaemon {
 				}
 				if (
 					!this.deferredPublications.has(replayPublicationId ?? "") &&
-					!this.publicationShouldSuppress(replayPublicationId)
+					!(await this.publicationSuppressed(replayPublicationId))
 				)
 					await this.markPublicationRejected(replayPublicationId);
 			}
 			const queued = session.replayQueue.splice(0);
 			for (const queuedItem of queued) {
-				if (this.publicationShouldSuppress(queuedItem.publicationId)) continue;
+				if (await this.publicationSuppressed(queuedItem.publicationId)) continue;
 				const frame = queuedItem.frame;
 				if (
 					frame.type === "tool_activity" &&
@@ -9538,7 +9542,7 @@ export class TelegramNotificationDaemon {
 				await this.handleSessionMessage(session, frame, queuedItem.publicationId);
 				if (
 					!this.deferredPublications.has(queuedItem.publicationId ?? "") &&
-					!this.publicationShouldSuppress(queuedItem.publicationId)
+					!(await this.publicationSuppressed(queuedItem.publicationId))
 				)
 					await this.markPublicationRejected(queuedItem.publicationId);
 			}
