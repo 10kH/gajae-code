@@ -39,7 +39,10 @@ describe("SDK WebSocket transport lifecycle", () => {
 		const endpoints = await Promise.all([transport.start(), transport.start(), transport.start()]);
 		expect(new Set(endpoints.map(endpoint => endpoint.url)).size).toBe(1);
 		const endpointPath = path.join(stateRoot, "sdk", "concurrent-start.json");
-		expect(JSON.parse(await fs.readFile(endpointPath, "utf8")).url).toBe(endpoints[0]?.url);
+		expect(JSON.parse(await fs.readFile(endpointPath, "utf8"))).toMatchObject({
+			sessionId: "concurrent-start",
+			url: endpoints[0]?.url,
+		});
 		await transport.stop();
 		await expect(fs.stat(endpointPath)).rejects.toMatchObject({ code: "ENOENT" });
 		await fs.rm(stateRoot, { recursive: true, force: true });

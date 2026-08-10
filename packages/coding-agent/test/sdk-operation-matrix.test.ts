@@ -222,7 +222,6 @@ describe("SDK operation matrix", () => {
 		for (const operation of lifecycleOperations) expect(policy.installedControls.has(operation)).toBe(false);
 		expect(policy.installedControls.has("session.rename")).toBe(true);
 		expect(policy.installedControls.has("session.cwd.move")).toBe(true);
-		expect(policy.installedControls.has("session.close")).toBe(true);
 
 		let mutations = 0;
 		const surface = new Proxy(

@@ -1752,9 +1752,17 @@ export class AcpAgent implements Agent {
 				: router.attachment(id);
 			if (!attachment)
 				throw new AcpSdkAdapterError("unavailable", `ACP session ${id} has no current Router attachment.`);
+			let currentAttachment = router.attachment(id);
+			for (let attempt = 0; !currentAttachment && attempt < 40; attempt++) {
+				await Bun.sleep(50);
+				await router.reconcile();
+				currentAttachment = router.attachment(id);
+			}
+			if (!currentAttachment)
+				throw new AcpSdkAdapterError("unavailable", `ACP session ${id} lost exact Router authority.`);
 			adapter = await AcpSdkAdapter.connect({
 				router,
-				attachment,
+				attachment: currentAttachment,
 				sessionId: id,
 				connection: this.#reverseConnection(id),
 				providers: this.#providers(),
@@ -1894,16 +1902,6 @@ export class AcpAgent implements Agent {
 			}
 
 			const failures: unknown[] = [];
-			try {
-				await record?.adapter.close();
-			} catch (error) {
-				failures.push(error);
-			}
-			try {
-				await record?.router.stop();
-			} catch (error) {
-				failures.push(error);
-			}
 			if (closeRemote) {
 				const closeIdempotencyKey =
 					record?.closeIdempotencyKey ?? this.#pendingCloseIdempotencyKeys.get(id) ?? randomUUID();
@@ -1914,6 +1912,16 @@ export class AcpAgent implements Agent {
 					if (this.#isDefinitiveBrokerResponse(error)) this.#pendingCloseIdempotencyKeys.delete(id);
 					if (!(ownershipBound && this.#isAlreadyGone(error))) failures.push(error);
 				}
+			}
+			try {
+				await record?.adapter.close();
+			} catch (error) {
+				failures.push(error);
+			}
+			try {
+				await record?.router.stop();
+			} catch (error) {
+				failures.push(error);
 			}
 			if (failures.length > 0) {
 				const detail = failures

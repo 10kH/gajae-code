@@ -269,11 +269,23 @@ export class ChatDaemonRuntime {
 			if (!settled) throw new Error("Prior provider cleanup did not settle before chat daemon restart.");
 		}
 		this.#attachments.clear();
-		const retainedProvider = this.#discord?.restartBlocked() ? this.#discord : undefined;
+		const retainedProvider =
+			this.input.kind === "discord"
+				? this.#discord?.restartBlocked()
+					? this.#discord
+					: undefined
+				: this.#slack?.restartBlocked()
+					? this.#slack
+					: undefined;
 		if (retainedProvider) {
-			await this.#router.start();
-			await retainedProvider.start();
-			return;
+			try {
+				await this.#router.start();
+				await retainedProvider.start();
+				return;
+			} catch (error) {
+				await this.#router.stop().catch(() => undefined);
+				throw error;
+			}
 		}
 		if (this.input.kind === "discord") {
 			const config = this.input.config.notifications.discord;
@@ -346,9 +358,10 @@ export class ChatDaemonRuntime {
 	async stop(): Promise<void> {
 		const providerResults = await Promise.allSettled([this.#discord?.stop(), this.#slack?.stop()]);
 		const discordRestartBlocked = this.#discord?.restartBlocked() ?? false;
+		const slackRestartBlocked = this.#slack?.restartBlocked() ?? false;
 		if (!discordRestartBlocked) this.#discord = undefined;
-		this.#slack = undefined;
-		if (!discordRestartBlocked) {
+		if (!slackRestartBlocked) this.#slack = undefined;
+		if (!discordRestartBlocked && !slackRestartBlocked) {
 			this.#presentation = undefined;
 			this.#transportHealthy = undefined;
 		}

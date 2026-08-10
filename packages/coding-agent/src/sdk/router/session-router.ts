@@ -97,6 +97,8 @@ type AttachedSession = {
 	readonly sessionId: string;
 	readonly endpoint: SdkSessionEndpoint;
 	readonly generation: number;
+	readonly pid: number;
+	readonly endpointMtimeMs: number;
 	readonly runEpoch: number;
 	readonly client: SessionRouterClient;
 	readonly cursor: { seq: number };
@@ -114,6 +116,14 @@ const DELIVERY_ATTEMPT_LIMIT = 3;
 
 function readGeneration(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function readPositiveInteger(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function readEndpointMtime(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
 function readSequence(value: unknown): number | undefined {
@@ -169,6 +179,24 @@ function readReplayGap(
 	return { kind: "sequence_gap", fromSeq, toSeq };
 }
 
+function sameIndexedAuthority(expected: IndexedSession, current: IndexedSession): boolean {
+	return (
+		current.sessionId === expected.sessionId &&
+		current.live &&
+		!current.terminalUncertain &&
+		current.endpointGeneration === expected.endpointGeneration &&
+		current.pid === expected.pid &&
+		current.endpointMtimeMs === expected.endpointMtimeMs
+	);
+}
+
+type AdoptedSession = {
+	readonly generation: number;
+	readonly pid: number;
+	readonly endpointMtimeMs: number;
+	readonly attachment: SessionAttachment;
+};
+
 /**
  * Broker-index-backed SDK attachment authority. Providers receive only opaque
  * attachment capabilities; endpoint records and SDK clients remain here.
@@ -179,7 +207,7 @@ export class SessionRouter {
 	readonly #correlateFrame: SessionRouterFrameCorrelator;
 	readonly #index: SessionIndex;
 	readonly #sessions = new Map<string, AttachedSession>();
-	readonly #adopted = new Map<string, { generation: number; attachment: SessionAttachment }>();
+	readonly #adopted = new Map<string, AdoptedSession>();
 	readonly #pending = new Set<Promise<void>>();
 	readonly #frameTails = new Map<string, Promise<void>>();
 	readonly #undelivered = new Map<string, { generation: number; seq: number; attempts: number }>();
@@ -237,7 +265,7 @@ export class SessionRouter {
 	/** Ingests a credential-bearing Broker lifecycle result directly into Router custody. */
 	async adoptLifecycleResult(
 		value: unknown,
-		fallback: { sessionId: string; cwd: string; endpointGeneration?: number },
+		fallback: { sessionId: string; cwd: string },
 	): Promise<SessionAttachment> {
 		const outer =
 			value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
@@ -250,37 +278,51 @@ export class SessionRouter {
 			endpointValue !== null && typeof endpointValue === "object" && !Array.isArray(endpointValue)
 				? (endpointValue as Record<string, unknown>)
 				: result;
-		const sessionId = typeof result.sessionId === "string" ? result.sessionId : fallback.sessionId;
+		const sessionId = typeof result.sessionId === "string" ? result.sessionId : undefined;
+		const endpointGeneration = readPositiveInteger(result.endpointGeneration);
+		const pid = readPositiveInteger(result.pid);
+		const endpointMtimeMs = readEndpointMtime(result.endpointMtimeMs);
 		if (
 			sessionId !== fallback.sessionId ||
+			endpointGeneration === undefined ||
+			pid === undefined ||
+			endpointMtimeMs === undefined ||
+			endpointRecord.sessionId !== sessionId ||
+			endpointRecord.pid !== pid ||
 			typeof endpointRecord.url !== "string" ||
 			typeof endpointRecord.token !== "string"
 		)
-			throw new SessionRouterError("pre_send", "Broker lifecycle result omitted an exact session endpoint.");
-		const endpointGeneration = readGeneration(result.endpointGeneration) ?? fallback.endpointGeneration ?? 1;
-		const pid = readGeneration(endpointRecord.pid) ?? process.pid;
+			throw new SessionRouterError(
+				"pre_send",
+				"Broker lifecycle result omitted an exact session endpoint authority.",
+			);
+		const repo = path.resolve(fallback.cwd);
+		const stateRoot = path.join(repo, ".gjc", "state");
 		const indexed: IndexedSession = {
 			sessionId,
-			locator: {
-				repo: path.resolve(fallback.cwd),
-				stateRoot: path.join(path.resolve(fallback.cwd), ".gjc", "state"),
-			},
+			locator: { repo, stateRoot },
 			endpointGeneration,
 			pid,
-			endpointMtimeMs: Date.now(),
+			endpointMtimeMs,
 			live: true,
-			indexSeq: Number.MAX_SAFE_INTEGER,
+			indexSeq: 0,
 		};
-		const attached = await this.#attach(
-			indexed,
-			this.#runEpoch,
-			{ sessionId, url: endpointRecord.url, token: endpointRecord.token, pid, path: "<broker-lifecycle>" },
-			true,
-		);
-		const capability = this.attachment(sessionId, endpointGeneration);
-		if (!attached || !capability)
+		const endpoint: SdkSessionEndpoint = {
+			sessionId,
+			url: endpointRecord.url,
+			token: endpointRecord.token,
+			pid,
+			path: path.join(stateRoot, "sdk", `${sessionId}.json`),
+		};
+		const attached = await this.#attach(indexed, this.#runEpoch, endpoint, true, true);
+		const current = this.#sessions.get(sessionId);
+		const capability = current?.capability;
+		if (!attached || !current || !capability)
 			throw new SessionRouterError("pre_send", "Broker session endpoint could not be attached.");
-		this.#adopted.set(sessionId, { generation: endpointGeneration, attachment: capability });
+		const listing = this.#index.listSessions();
+		const indexedCurrent =
+			listing.warnings.length === 0 ? listing.sessions.find(item => item.sessionId === sessionId) : undefined;
+		if (indexedCurrent && sameIndexedAuthority(indexed, indexedCurrent)) await this.#serialReconcile(this.#runEpoch);
 		return capability;
 	}
 
@@ -495,16 +537,40 @@ export class SessionRouter {
 		const liveIds = new Set(live.map(session => session.sessionId));
 		const attachedIds = new Set<string>();
 		if (indexed.warnings.length === 0) {
-			for (const [sessionId, adopted] of this.#adopted) {
-				const indexedSession = live.find(session => session.sessionId === sessionId);
-				if (indexedSession?.endpointGeneration === adopted.generation) {
+			for (const [sessionId, adopted] of [...this.#adopted]) {
+				const attached = this.#sessions.get(sessionId);
+				const indexedSession = indexed.sessions.find(session => session.sessionId === sessionId);
+				if (!attached || attached.capability !== adopted.attachment) {
 					this.#adopted.delete(sessionId);
 					continue;
 				}
-				const attached = this.#sessions.get(sessionId);
-				if (attached?.capability !== adopted.attachment || !this.#attachmentPublished(attached)) continue;
-				liveIds.add(sessionId);
-				attachedIds.add(sessionId);
+				const exactIndex =
+					indexedSession?.live === true &&
+					!indexedSession.terminalUncertain &&
+					indexedSession.endpointGeneration === adopted.generation &&
+					indexedSession.pid === adopted.pid &&
+					indexedSession.endpointMtimeMs === adopted.endpointMtimeMs;
+				const endpoint = exactIndex ? await this.#readEndpoint(indexedSession).catch(() => null) : null;
+				if (
+					!exactIndex ||
+					!endpoint ||
+					endpoint.pid !== adopted.pid ||
+					endpoint.url !== attached.endpoint.url ||
+					endpoint.token !== attached.endpoint.token
+				) {
+					this.#adopted.delete(sessionId);
+					await this.#retireAttachment(attached);
+					continue;
+				}
+				try {
+					if (await this.#publishAttachment(attached, true)) {
+						this.#adopted.delete(sessionId);
+						attachedIds.add(sessionId);
+					}
+				} catch {
+					this.#adopted.delete(sessionId);
+					await this.#retireAttachment(attached);
+				}
 			}
 		}
 		for (const session of live) {
@@ -514,6 +580,8 @@ export class SessionRouter {
 			} catch {
 				const failed = this.#sessions.get(session.sessionId);
 				if (failed?.runEpoch === runEpoch) {
+					this.#adopted.delete(session.sessionId);
+
 					this.#sessions.delete(session.sessionId);
 					failed.dispose();
 					await failed.client.close().catch(() => undefined);
@@ -537,6 +605,7 @@ export class SessionRouter {
 				this.#undelivered.delete(sessionId);
 				this.#recoveredFrames.delete(sessionId);
 			}
+			this.#adopted.delete(sessionId);
 			this.#sessions.delete(sessionId);
 			attached.dispose();
 			try {
@@ -563,11 +632,25 @@ export class SessionRouter {
 				: indexedStateRoot === path.join(defaultStateRoot, "chat")
 					? "chat"
 					: undefined;
-		if (!scope || indexed.endpointMtimeMs === undefined) return null;
+		if (!scope || indexed.endpointMtimeMs === undefined || !Number.isFinite(indexed.endpointMtimeMs)) return null;
 		const endpoint = await readSdkSessionEndpoint(repo, indexed.sessionId, scope);
-		if (!endpoint || endpoint.stale) return null;
+		if (!endpoint || endpoint.stale || endpoint.pid !== indexed.pid) return null;
 		const endpointStat = await fs.stat(endpoint.path).catch(() => undefined);
 		if (!endpointStat || endpointStat.mtimeMs !== indexed.endpointMtimeMs) return null;
+		let raw: Record<string, unknown>;
+		try {
+			const parsed = JSON.parse(await fs.readFile(endpoint.path, "utf8"));
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+			raw = parsed as Record<string, unknown>;
+		} catch {
+			return null;
+		}
+		if (raw.sessionId !== indexed.sessionId || raw.pid !== indexed.pid || raw.stale === true) return null;
+		await this.#index.refresh();
+		const listing = this.#index.listSessions();
+		if (listing.warnings.length > 0) return null;
+		const current = listing.sessions.find(session => session.sessionId === indexed.sessionId);
+		if (!current || !sameIndexedAuthority(indexed, current)) return null;
 		return endpoint;
 	}
 
@@ -576,8 +659,10 @@ export class SessionRouter {
 		runEpoch: number,
 		resolvedEndpoint?: SdkSessionEndpoint,
 		skipReplay = false,
+		deferPublication = false,
 	): Promise<boolean> {
 		if (!this.#running(runEpoch)) return false;
+		if (indexed.endpointMtimeMs === undefined) return false;
 		const endpoint = resolvedEndpoint ?? (await this.#readEndpoint(indexed));
 		if (!this.#running(runEpoch)) return false;
 		if (!endpoint) return false;
@@ -586,13 +671,17 @@ export class SessionRouter {
 			existing !== undefined &&
 			existing.endpoint.url === endpoint.url &&
 			existing.endpoint.token === endpoint.token &&
-			existing.generation === indexed.endpointGeneration;
+			existing.generation === indexed.endpointGeneration &&
+			existing.pid === indexed.pid &&
+			existing.endpointMtimeMs === indexed.endpointMtimeMs;
 		if (existing && resumable && !existing.barrier.failed) {
 			this.#reviveTransport(existing);
 			return true;
 		}
 		const resumeSeq = existing && resumable ? existing.cursor.seq : 0;
 		if (existing) {
+			this.#adopted.delete(indexed.sessionId);
+
 			this.#sessions.delete(indexed.sessionId);
 			existing.dispose();
 			try {
@@ -657,6 +746,8 @@ export class SessionRouter {
 			id: randomUUID(),
 			sessionId: indexed.sessionId,
 			endpoint,
+			pid: indexed.pid,
+			endpointMtimeMs: indexed.endpointMtimeMs,
 			generation: indexed.endpointGeneration,
 			runEpoch,
 			client,
@@ -674,10 +765,18 @@ export class SessionRouter {
 			},
 		};
 		this.#sessions.set(indexed.sessionId, attached);
+		if (deferPublication)
+			this.#adopted.set(indexed.sessionId, {
+				generation: indexed.endpointGeneration,
+				pid: indexed.pid,
+				endpointMtimeMs: indexed.endpointMtimeMs,
+				attachment: capability,
+			});
 		try {
 			await this.#deps.onAttachment?.(capability);
 		} catch (error) {
 			const failedStillCurrent = this.#sessions.get(indexed.sessionId) === attached;
+			this.#adopted.delete(indexed.sessionId);
 			if (failedStillCurrent) this.#sessions.delete(indexed.sessionId);
 			attached.dispose();
 			await attached.client.close().catch(() => undefined);
@@ -689,6 +788,7 @@ export class SessionRouter {
 				}
 			throw error;
 		}
+		if (deferPublication) return true;
 		const publicationStillCurrent = this.#sessions.get(indexed.sessionId) === attached;
 		if (!this.#running(runEpoch) || !publicationStillCurrent) {
 			if (publicationStillCurrent) this.#sessions.delete(indexed.sessionId);
@@ -715,6 +815,34 @@ export class SessionRouter {
 			if (readyStillCurrent)
 				try {
 					await this.#deps.onSessionRemoved?.(capability);
+				} catch {
+					// Ready publication failed closed; provider cleanup remains best effort.
+				}
+			throw error;
+		}
+		if (skipReplay) return true;
+		if (!(await this.#deliverRecoveredFrames(attached))) return false;
+		await this.#replayAttachment(attached, attached.cursor.seq);
+		return true;
+	}
+
+	async #publishAttachment(attached: AttachedSession, skipReplay: boolean): Promise<boolean> {
+		if (attached.published) return this.#attachmentPublished(attached);
+		if (!this.#attachmentLive(attached)) return false;
+		attached.published = true;
+		attached.publication.resolve();
+		try {
+			await this.#deps.onAttachmentReady?.(attached.capability);
+		} catch (error) {
+			const stillCurrent = this.#sessions.get(attached.sessionId) === attached;
+			attached.published = false;
+			this.#adopted.delete(attached.sessionId);
+			if (stillCurrent) this.#sessions.delete(attached.sessionId);
+			attached.dispose();
+			await attached.client.close().catch(() => undefined);
+			if (stillCurrent)
+				try {
+					await this.#deps.onSessionRemoved?.(attached.capability);
 				} catch {
 					// Ready publication failed closed; provider cleanup remains best effort.
 				}

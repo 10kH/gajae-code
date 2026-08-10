@@ -24,6 +24,7 @@ const BROKER_LIFECYCLE_CONTROL_OPERATIONS = new Set([
 	"session.switch",
 	"session.branch",
 	"session.handoff",
+	"session.close",
 	"session.delete",
 ]);
 

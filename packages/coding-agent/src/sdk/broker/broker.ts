@@ -1248,7 +1248,10 @@ export class Broker {
 			offset: 0,
 			expiresAt: Date.now() + SESSION_LIST_CURSOR_TTL_MS,
 		};
-		const sessions = snapshot.sessions.slice(snapshot.offset, snapshot.offset + snapshot.limit);
+		const sessions = snapshot.sessions.slice(snapshot.offset, snapshot.offset + snapshot.limit).map(session => {
+			const { lifecycleRequestId: _lifecycleRequestId, ...publicSession } = session;
+			return publicSession;
+		});
 		const offset = snapshot.offset + sessions.length;
 		if (offset >= snapshot.sessions.length && typeof cursor === "string") this.#sessionListCursors.delete(cursor);
 		const continuationCursor =

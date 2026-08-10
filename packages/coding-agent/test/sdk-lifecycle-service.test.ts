@@ -6,7 +6,6 @@ import * as brokerEnsure from "../src/sdk/broker/ensure";
 import { SdkClient } from "../src/sdk/client/client";
 import * as sdkDiscovery from "../src/sdk/client/discovery";
 import {
-	AgentDirSessionLifecycleClient,
 	AgentDirSessionLifecycleService,
 	deriveSessionLifecycleIdempotencyKey,
 	type SessionLifecycleClient,
@@ -14,6 +13,7 @@ import {
 	type SessionLifecycleOperation,
 	SessionLifecycleService,
 } from "../src/sdk/lifecycle";
+import { AgentDirSessionLifecycleClient } from "../src/sdk/lifecycle/broker-client";
 
 type Call = {
 	operation: SessionLifecycleOperation;

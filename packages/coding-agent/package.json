@@ -145,6 +145,12 @@
 			"types": "./src/sdk/bus/*.ts",
 			"import": "./src/sdk/bus/*.ts"
 		},
+		"./sdk/host/control/runtime-gate.js": null,
+		"./sdk/host/control/runtime-gate": null,
+		"./sdk/host/control/runtime-gate/*": null,
+		"./sdk/lifecycle/broker-client.js": null,
+		"./sdk/lifecycle/broker-client": null,
+		"./sdk/lifecycle/broker-client/*": null,
 		"./sdk/client": null,
 		"./sdk/client/*": null,
 		"./session/internal/*": null,

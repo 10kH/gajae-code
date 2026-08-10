@@ -6,8 +6,9 @@ import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter, type AcpSdkAdapterError, acpMcpLaunchFailure } from "../src/sdk/acp";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
-import { SdkClient, SdkClientError } from "../src/sdk/client";
+import { SdkClientError } from "../src/sdk/client";
 import { MAX_REVERSE_PAYLOAD_BYTES } from "../src/sdk/host";
+import type { SessionAttachment } from "../src/sdk/router";
 
 class FakeSdkClient {
 	connectionId = "acp-connection";
@@ -59,6 +60,44 @@ class FakeSdkClient {
 	async close() {}
 }
 
+type RouterHarness = {
+	router: unknown;
+	attachment: SessionAttachment;
+	requests: Record<string, unknown>[];
+	sent: Record<string, unknown>[];
+	setCurrent: (current: boolean) => void;
+};
+
+function createRouterHarness(options: { send?: (frame: Record<string, unknown>) => unknown } = {}): RouterHarness {
+	let current = true;
+	let nextLease = 0;
+	const requests: Record<string, unknown>[] = [];
+	const sent: Record<string, unknown>[] = [];
+	const attachment: SessionAttachment = {
+		sessionId: "session-1",
+		generation: 1,
+		isCurrent: () => current,
+		send: async frame => {
+			sent.push(frame);
+			return await options.send?.(frame);
+		},
+	};
+	const router = {
+		request: async (_sessionId: string, frame: Record<string, unknown>) => {
+			requests.push(frame);
+			if (frame.type === "register_provider")
+				return {
+					ok: true,
+					result: {
+						leaseId: typeof frame.expectedLeaseId === "string" ? frame.expectedLeaseId : `lease-${++nextLease}`,
+					},
+				};
+			return { ok: true, result: { accepted: true } };
+		},
+	};
+	return { router, attachment, requests, sent, setCurrent: value => (current = value) };
+}
+
 const waitFor = async (predicate: () => boolean, label: string): Promise<void> => {
 	const deadline = Date.now() + 2_000;
 	while (Date.now() < deadline) {
@@ -69,32 +108,85 @@ const waitFor = async (predicate: () => boolean, label: string): Promise<void> =
 };
 
 test("ACP SDK adapter maps native and extension methods and keeps endpoint credentials machine-only", async () => {
-	const sdk = new FakeSdkClient();
-	const adapter = new AcpSdkAdapter({ client: sdk as never });
+	const harness = createRouterHarness();
+	const adapter = new AcpSdkAdapter({
+		router: harness.router as never,
+		attachment: harness.attachment,
+		sessionId: harness.attachment.sessionId,
+	});
 	await adapter.start();
 	await adapter.prompt({ prompt: "hello" });
 	await adapter.cancel();
 	await adapter.setModel({ modelId: "provider/model" });
 	await adapter.handle("_gjc/sdk/control", { operation: "runtime.reload", input: { components: ["tools"] } });
-	await adapter.handle("listSessions");
-	expect(sdk.frames).toEqual(
+	await expect(adapter.handle("listSessions")).rejects.toMatchObject({ code: "operation_prohibited" });
+	expect(harness.requests).toEqual(
 		expect.arrayContaining([
 			expect.objectContaining({ operation: "turn.prompt", input: expect.objectContaining({ text: "hello" }) }),
 			expect.objectContaining({ operation: "turn.abort" }),
 			expect.objectContaining({ operation: "model.set", input: { id: "provider/model" } }),
 			expect.objectContaining({ operation: "runtime.reload" }),
-			expect.objectContaining({ operation: "session.list" }),
 		]),
 	);
-	await expect(adapter.sdkGlobal({ operation: "session.get_endpoint" })).rejects.toMatchObject({
+	const broker = new AcpSdkAdapter({ client: new FakeSdkClient() as never });
+	await broker.start();
+	await expect(broker.sdkGlobal({ operation: "session.get_endpoint" })).rejects.toMatchObject({
 		code: "endpoint_credential_forbidden",
 	} satisfies Partial<AcpSdkAdapterError>);
 	await adapter.close();
+	await broker.close();
+});
+
+test("Broker client injection cannot service live session controls or queries", async () => {
+	const sdk = new FakeSdkClient();
+	const adapter = new AcpSdkAdapter({ client: sdk as never });
+	await adapter.start();
+	await expect(adapter.prompt({ prompt: "hello" })).rejects.toMatchObject({ code: "operation_prohibited" });
+	await expect(adapter.query("runtime.capabilities")).rejects.toMatchObject({ code: "operation_prohibited" });
+	expect(sdk.frames).toEqual([]);
+	await adapter.close();
+});
+
+test("Router reverse send rejection settles the request and reports transport failure", async () => {
+	const failures: AcpSdkAdapterError[] = [];
+	const harness = createRouterHarness({
+		send: async () => {
+			throw new Error("send rejected");
+		},
+	});
+	const callback = Promise.resolve({ selected: "yes" });
+	const adapter = new AcpSdkAdapter({
+		router: harness.router as never,
+		attachment: harness.attachment,
+		sessionId: harness.attachment.sessionId,
+		providers: [{ capability: "ui", definitions: [] }],
+		connection: { request: async () => await callback },
+	});
+	adapter.onReconnectFailed(error => failures.push(error as AcpSdkAdapterError));
+	await adapter.start();
+	try {
+		adapter.acceptFrame({
+			type: "reverse_request",
+			id: "send-rejected",
+			connectionId: "router-connection-1",
+			capability: "ui",
+			leaseId: "lease-1",
+			payload: { method: "ui.select", payload: {} },
+		});
+		await waitFor(() => failures.length > 0, "reverse send rejection");
+		expect(failures[0]?.code).toBe("reconnect_exhausted");
+	} finally {
+		await adapter.close();
+	}
 });
 
 test("ACP generic routes honor provider, machine, and secret field dispositions", async () => {
-	const sdk = new FakeSdkClient();
-	const adapter = new AcpSdkAdapter({ client: sdk as never });
+	const harness = createRouterHarness();
+	const adapter = new AcpSdkAdapter({
+		router: harness.router as never,
+		attachment: harness.attachment,
+		sessionId: harness.attachment.sessionId,
+	});
 	await adapter.start();
 	await expect(adapter.handle("_gjc/sdk/control", { operation: "host_tools.register" })).rejects.toMatchObject({
 		code: "provider_required",
@@ -109,11 +201,13 @@ test("ACP generic routes honor provider, machine, and secret field dispositions"
 		adapter.handle("_gjc/sdk/control", { operation: "config.patch", input: { apiToken: "secret" } }),
 	).rejects.toMatchObject({ code: "secret_field_forbidden" });
 	await adapter.handle("_gjc/sdk/control", { operation: "config.patch", input: { killSwitchHotkey: true } });
-	expect(sdk.frames).toContainEqual({
-		type: "control_request",
-		operation: "config.patch",
-		input: { killSwitchHotkey: true },
-	});
+	expect(harness.requests).toContainEqual(
+		expect.objectContaining({
+			type: "control_request",
+			operation: "config.patch",
+			input: { killSwitchHotkey: true },
+		}),
+	);
 	await adapter.close();
 });
 
@@ -188,12 +282,15 @@ test("ACP lifecycle aliases forward caller idempotency keys outside operation in
 	);
 	await adapter.close();
 });
-test("ACP reverse dispatch requires exact current lease ownership and rejects in-flight duplicates", async () => {
-	const sdk = new FakeSdkClient();
+
+test("ACP reverse dispatch derives Router identity from exact frames and rejects duplicates", async () => {
+	const harness = createRouterHarness();
 	const callbacks: Array<{ method: string; params: Record<string, unknown> }> = [];
 	const response = Promise.withResolvers<unknown>();
 	const adapter = new AcpSdkAdapter({
-		client: sdk as never,
+		router: harness.router as never,
+		attachment: harness.attachment,
+		sessionId: harness.attachment.sessionId,
 		providers: [{ capability: "ui", definitions: [{ name: "select" }] }],
 		connection: {
 			request: async (method, params) => {
@@ -202,47 +299,54 @@ test("ACP reverse dispatch requires exact current lease ownership and rejects in
 			},
 		},
 	});
-	const reverse = (id: string, connectionId: string, capability: string, leaseId: string) =>
-		sdk.emit({
+	const connectionId = "router-connection-1";
+	const reverse = (id: string, frameConnectionId = connectionId, capability = "ui", leaseId = "lease-1") =>
+		adapter.acceptFrame({
 			type: "reverse_request",
 			id,
-			connectionId,
+			connectionId: frameConnectionId,
 			capability,
 			leaseId,
 			payload: { method: "ui.select", payload: { options: ["yes"] } },
 		});
 	await adapter.start();
 	try {
-		reverse("stale-connection", "stale-connection", "ui", "lease-1");
-		reverse("stale-lease", sdk.connectionId, "ui", "stale-lease");
-		reverse("wrong-capability", sdk.connectionId, "terminal", "lease-1");
+		reverse("stale-lease", connectionId, "ui", "stale-lease");
+		reverse("wrong-capability", connectionId, "terminal", "lease-1");
 		expect(callbacks).toEqual([]);
 
-		reverse("in-flight", sdk.connectionId, "ui", "lease-1");
-		reverse("in-flight", sdk.connectionId, "ui", "lease-1");
+		reverse("in-flight");
+		reverse("in-flight");
+		await waitFor(() => callbacks.length === 1, "valid reverse request");
 		expect(callbacks).toEqual([{ method: "ui.select", params: { options: ["yes"] } }]);
 
 		response.resolve({ selected: "yes" });
 		await waitFor(
-			() => sdk.frames.some(frame => frame.type === "reverse_response" && frame.id === "in-flight"),
+			() => harness.sent.some(frame => frame.type === "reverse_response" && frame.id === "in-flight"),
 			"valid reverse response",
 		);
-		expect(sdk.frames.filter(frame => frame.type === "reverse_response")).toEqual([
+		expect(harness.sent.filter(frame => frame.type === "reverse_response")).toEqual([
 			{
 				type: "reverse_response",
 				id: "in-flight",
-				connectionId: sdk.connectionId,
+				connectionId,
 				leaseId: "lease-1",
 				ok: true,
 				result: { selected: "yes" },
 			},
 		]);
+
+		// A different exact transport identity is not accepted until provider leases reclaim.
+		reverse("rotated-connection", "router-connection-2");
+		expect(callbacks).toHaveLength(1);
 	} finally {
 		await adapter.close();
 	}
 });
+
 test("ACP reverse responses reject an inner result below the cap when its frame exceeds the transport limit", async () => {
-	const sdk = new FakeSdkClient();
+	const harness = createRouterHarness();
+	const connectionId = "router-connection-1";
 	const emptyResultBytes = Buffer.byteLength(JSON.stringify({ value: "" }));
 	const result = { value: "x".repeat(MAX_REVERSE_PAYLOAD_BYTES - emptyResultBytes - 1) };
 	expect(Buffer.byteLength(JSON.stringify(result))).toBe(MAX_REVERSE_PAYLOAD_BYTES - 1);
@@ -251,7 +355,7 @@ test("ACP reverse responses reject an inner result below the cap when its frame 
 			JSON.stringify({
 				type: "reverse_response",
 				id: "near-frame-limit",
-				connectionId: sdk.connectionId,
+				connectionId,
 				leaseId: "lease-1",
 				ok: true,
 				result,
@@ -259,28 +363,30 @@ test("ACP reverse responses reject an inner result below the cap when its frame 
 		),
 	).toBeGreaterThan(MAX_REVERSE_PAYLOAD_BYTES);
 	const adapter = new AcpSdkAdapter({
-		client: sdk as never,
+		router: harness.router as never,
+		attachment: harness.attachment,
+		sessionId: harness.attachment.sessionId,
 		providers: [{ capability: "terminal", definitions: [] }],
 		connection: { request: async () => result },
 	});
 	await adapter.start();
 	try {
-		sdk.emit({
+		adapter.acceptFrame({
 			type: "reverse_request",
 			id: "near-frame-limit",
-			connectionId: sdk.connectionId,
+			connectionId,
 			capability: "terminal",
 			leaseId: "lease-1",
 			payload: { method: "terminal.output", payload: {} },
 		});
 		await waitFor(
-			() => sdk.frames.some(frame => frame.type === "reverse_response" && frame.id === "near-frame-limit"),
+			() => harness.sent.some(frame => frame.type === "reverse_response" && frame.id === "near-frame-limit"),
 			"oversized reverse response rejection",
 		);
-		expect(sdk.frames.find(frame => frame.type === "reverse_response" && frame.id === "near-frame-limit")).toEqual({
+		expect(harness.sent.find(frame => frame.type === "reverse_response" && frame.id === "near-frame-limit")).toEqual({
 			type: "reverse_response",
 			id: "near-frame-limit",
-			connectionId: sdk.connectionId,
+			connectionId,
 			leaseId: "lease-1",
 			ok: false,
 			error: { code: "payload_too_large", message: "payload_too_large" },
@@ -291,11 +397,13 @@ test("ACP reverse responses reject an inner result below the cap when its frame 
 });
 
 test("ACP reverse cancellation remains terminal after its tombstone TTL while the callback is still running", async () => {
-	const sdk = new FakeSdkClient();
+	const harness = createRouterHarness();
 	const callback = Promise.withResolvers<unknown>();
 	let cancellationSignal: AbortSignal | undefined;
 	const adapter = new AcpSdkAdapter({
-		client: sdk as never,
+		router: harness.router as never,
+		attachment: harness.attachment,
+		sessionId: harness.attachment.sessionId,
 		providers: [{ capability: "ui", definitions: [{ name: "select" }] }],
 		reverseCancelTtlMs: 5,
 		connection: {
@@ -305,32 +413,38 @@ test("ACP reverse cancellation remains terminal after its tombstone TTL while th
 			},
 		},
 	});
+	const connectionId = "router-connection-1";
 	await adapter.start();
 	try {
-		sdk.emit({
+		adapter.acceptFrame({
 			type: "reverse_request",
 			id: "slow-cancelled",
-			connectionId: sdk.connectionId,
+			connectionId,
 			capability: "ui",
 			leaseId: "lease-1",
 			payload: { method: "ui.select", payload: {} },
 		});
-		sdk.emit({ type: "reverse_cancel", id: "slow-cancelled" });
+		await waitFor(() => cancellationSignal !== undefined, "reverse cancellation signal");
+		adapter.acceptFrame({ type: "reverse_cancel", id: "slow-cancelled" });
 		expect(cancellationSignal?.aborted).toBe(true);
 		await Bun.sleep(10);
 		callback.resolve({ selected: "yes" });
 		await Bun.sleep(0);
-		expect(sdk.frames.some(frame => frame.type === "reverse_response" && frame.id === "slow-cancelled")).toBe(false);
+		expect(harness.sent.some(frame => frame.type === "reverse_response" && frame.id === "slow-cancelled")).toBe(
+			false,
+		);
 	} finally {
 		await adapter.close();
 	}
 });
 
-test("ACP provider reclaim aborts reverse requests owned by the previous SDK connection", async () => {
-	const sdk = new FakeSdkClient();
+test("ACP provider reclaim aborts reverse requests owned by the previous Router connection", async () => {
+	const harness = createRouterHarness();
 	let cancellationSignal: AbortSignal | undefined;
 	const adapter = new AcpSdkAdapter({
-		client: sdk as never,
+		router: harness.router as never,
+		attachment: harness.attachment,
+		sessionId: harness.attachment.sessionId,
 		providers: [{ capability: "ui", definitions: [] }],
 		connection: {
 			request: async (_method, _params, options) => {
@@ -341,93 +455,71 @@ test("ACP provider reclaim aborts reverse requests owned by the previous SDK con
 	});
 	await adapter.start();
 	try {
-		sdk.emit({
+		adapter.acceptFrame({
 			type: "reverse_request",
 			id: "reconnect-abort",
-			connectionId: sdk.connectionId,
+			connectionId: "router-connection-1",
 			capability: "ui",
 			leaseId: "lease-1",
 			payload: { method: "ui.elicit", payload: {} },
 		});
 		await waitFor(() => cancellationSignal !== undefined, "reverse cancellation signal");
-		sdk.connectionId = "acp-reconnected";
-		sdk.emitReconnect();
+		adapter.acceptFrame({
+			type: "reverse_request",
+			id: "connection-rotation",
+			connectionId: "router-connection-2",
+			capability: "ui",
+			leaseId: "lease-1",
+			payload: { method: "ui.elicit", payload: {} },
+		});
 		await waitFor(() => cancellationSignal?.aborted === true, "reconnect reverse abort");
-		expect(sdk.frames.some(frame => frame.type === "reverse_response" && frame.id === "reconnect-abort")).toBe(false);
+		expect(harness.sent.some(frame => frame.type === "reverse_response" && frame.id === "reconnect-abort")).toBe(
+			false,
+		);
 	} finally {
 		await adapter.close();
 	}
 });
-test("ACP reverse cancellation and stale failures suppress responses over the real WebSocket transport", async () => {
-	let server!: ReturnType<typeof Bun.serve>;
 
-	let socket: any;
-	let connectionId = "connection-1";
-	const clientFrames: Record<string, unknown>[] = [];
+test("ACP reverse cancellation and stale failures suppress responses after Router identity rotation", async () => {
+	const harness = createRouterHarness();
 	const pending: Array<{ resolve: (value: unknown) => void; reject: (error: Error) => void }> = [];
-	server = Bun.serve({
-		hostname: "127.0.0.1",
-		port: 0,
-		fetch(request) {
-			if (!server.upgrade(request, { data: undefined })) return new Response("Upgrade failed", { status: 400 });
-		},
-		websocket: {
-			open(client) {
-				socket = client;
-				client.send(JSON.stringify({ type: "hello", connectionId }));
-			},
-			message(client, raw) {
-				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
-				clientFrames.push(frame);
-				if (frame.type === "register_provider")
-					client.send(JSON.stringify({ type: "register_provider_result", id: frame.id, leaseId: "lease-1" }));
-			},
-		},
-	});
 	const adapter = new AcpSdkAdapter({
-		client: new SdkClient(`ws://127.0.0.1:${server.port}`, "token"),
+		router: harness.router as never,
+		attachment: harness.attachment,
+		sessionId: harness.attachment.sessionId,
 		providers: [{ capability: "ui", definitions: [{ name: "select" }] }],
-		connection: { request: () => new Promise((resolve, reject) => pending.push({ resolve, reject })) },
+		connection: {
+			request: () => new Promise((resolve, reject) => pending.push({ resolve, reject })),
+		},
 	});
+	const reverse = (id: string, connectionId: string) =>
+		adapter.acceptFrame({
+			type: "reverse_request",
+			id,
+			connectionId,
+			capability: "ui",
+			leaseId: "lease-1",
+			payload: { method: "ui.select", payload: {} },
+		});
+	await adapter.start();
 	try {
-		await adapter.start();
-		socket.send(
-			JSON.stringify({
-				type: "reverse_request",
-				id: "cancelled",
-				connectionId,
-				capability: "ui",
-				leaseId: "lease-1",
-				payload: { method: "ui.select", payload: {} },
-			}),
-		);
+		reverse("cancelled", "router-connection-1");
 		await waitFor(() => pending.length === 1, "cancelled reverse request");
-		socket.send(JSON.stringify({ type: "reverse_cancel", id: "cancelled" }));
+		adapter.acceptFrame({ type: "reverse_cancel", id: "cancelled" });
 		await Bun.sleep(10);
 		pending.shift()!.resolve({ selected: "ignored" });
 		await Bun.sleep(20);
-		expect(clientFrames.some(frame => frame.type === "reverse_response" && frame.id === "cancelled")).toBe(false);
+		expect(harness.sent.some(frame => frame.type === "reverse_response" && frame.id === "cancelled")).toBe(false);
 
-		socket.send(
-			JSON.stringify({
-				type: "reverse_request",
-				id: "stale-error",
-				connectionId,
-				capability: "ui",
-				leaseId: "lease-1",
-				payload: { method: "ui.select", payload: {} },
-			}),
-		);
+		reverse("stale-error", "router-connection-1");
 		await waitFor(() => pending.length === 1, "stale reverse request");
-		connectionId = "connection-2";
-		socket.send(JSON.stringify({ type: "hello", connectionId }));
-		await Bun.sleep(10);
+		reverse("rotation", "router-connection-2");
 		pending.shift()!.reject(new Error("stale failure"));
 		await Bun.sleep(20);
-		expect(clientFrames.some(frame => frame.type === "reverse_response" && frame.id === "stale-error")).toBe(false);
+		expect(harness.sent.some(frame => frame.type === "reverse_response" && frame.id === "stale-error")).toBe(false);
 	} finally {
 		await adapter.close();
-		server.stop(true);
 	}
 });
 

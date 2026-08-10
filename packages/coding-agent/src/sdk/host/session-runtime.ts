@@ -25,6 +25,7 @@ import { projectQ10Models } from "../models.js";
 import { formatPromptFailureForLocalLog, sanitizePromptFailure } from "../prompt-failure";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { type ControlSurface, dispatchControl } from "./control";
+import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "./control/runtime-gate";
 import { SessionSdkHost, type SessionSdkHostOptions } from "./host";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "./query";
 import {
@@ -1133,7 +1134,11 @@ function createControlSurface(
 		newSession: () => typed("session.new"),
 		forkSession: () => typed("session.fork"),
 		resumeSession: id => typed("session.resume", { id }),
-		closeSession: () => typed("session.close"),
+		closeSession: capability =>
+			typed(
+				"session.close",
+				capability === undefined ? {} : { [BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: capability },
+			),
 		switchSession: id => typed("session.switch", { id }),
 		branchSession: entryId => typed("session.branch", { entryId }),
 		renameSession: name => typed("session.rename", { name }),

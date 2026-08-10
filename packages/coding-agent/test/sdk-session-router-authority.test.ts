@@ -26,6 +26,8 @@ async function routerFixture(
 		onSessionRemoved?: (attachment: SessionAttachment) => void | Promise<void>;
 		onFrame?: (attachment: SessionAttachment, frame: SessionRouterFrame) => void | Promise<void>;
 		start?: boolean;
+		initiallyIndexed?: boolean;
+		onIndexRefresh?: () => void | Promise<void>;
 	} = {},
 ) {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-authority-"));
@@ -36,27 +38,38 @@ async function routerFixture(
 	const endpointDir = path.join(stateRoot, "sdk");
 	const endpointFile = path.join(endpointDir, `${sessionId}.json`);
 	fs.mkdirSync(endpointDir, { recursive: true });
-	fs.writeFileSync(endpointFile, JSON.stringify({ url: "ws://router.test", token: "secret", pid: 42 }));
+	fs.writeFileSync(endpointFile, JSON.stringify({ sessionId, url: "ws://router.test", token: "secret", pid: 42 }));
 	const endpointMtimeMs = fs.statSync(endpointFile).mtimeMs;
 
-	const authority = { generation: 1, terminalUncertain: false, warnings: [] as string[] };
+	const authority = {
+		generation: 1,
+		pid: 42,
+		endpointMtimeMs,
+		indexed: options.initiallyIndexed !== false,
+		terminalUncertain: false,
+		warnings: [] as string[],
+	};
 	const index = {
 		open: async () => {},
-		refresh: async () => {},
+		refresh: async () => {
+			await options.onIndexRefresh?.();
+		},
 		listSessions: () => ({
 			indexSeq: authority.generation,
-			sessions: [
-				{
-					sessionId,
-					locator: { repo, stateRoot },
-					endpointGeneration: authority.generation,
-					pid: 42,
-					endpointMtimeMs,
-					live: true,
-					indexSeq: authority.generation,
-					terminalUncertain: authority.terminalUncertain || undefined,
-				},
-			],
+			sessions: authority.indexed
+				? [
+						{
+							sessionId,
+							locator: { repo, stateRoot },
+							endpointGeneration: authority.generation,
+							pid: authority.pid,
+							endpointMtimeMs: authority.endpointMtimeMs,
+							live: true,
+							indexSeq: authority.generation,
+							terminalUncertain: authority.terminalUncertain || undefined,
+						},
+					]
+				: [],
 			warnings: authority.warnings,
 		}),
 	} as unknown as SessionIndex;
@@ -105,6 +118,7 @@ async function routerFixture(
 	});
 	if (options.start !== false) await router.start();
 	return {
+		repo,
 		authority,
 		attachments,
 		clients,
@@ -299,6 +313,83 @@ describe("SessionRouter dispatch authority", () => {
 			await fixture.router.stop();
 		}
 	});
+
+	test("keeps lifecycle adoption provisional until a delayed index proves the exact authority", async () => {
+		const fixture = await routerFixture({ initiallyIndexed: false });
+		const endpoint = JSON.parse(fs.readFileSync(fixture.endpointFile, "utf8")) as Record<string, unknown>;
+		const adopted = await fixture.router.adoptLifecycleResult(
+			{
+				ok: true,
+				result: {
+					sessionId: fixture.sessionId,
+					endpointGeneration: fixture.authority.generation,
+					pid: fixture.authority.pid,
+					endpointMtimeMs: fixture.authority.endpointMtimeMs,
+					endpoint,
+				},
+			},
+			{ sessionId: fixture.sessionId, cwd: fixture.repo },
+		);
+		try {
+			expect(adopted.isCurrent()).toBe(false);
+			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+			fixture.authority.indexed = true;
+			await fixture.router.reconcile();
+			expect(adopted.isCurrent()).toBe(true);
+			expect(fixture.router.attachment(fixture.sessionId)).toBe(adopted);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("revokes lifecycle adoption when the index remains missing or terminal", async () => {
+		const fixture = await routerFixture({ initiallyIndexed: false });
+		const endpoint = JSON.parse(fs.readFileSync(fixture.endpointFile, "utf8")) as Record<string, unknown>;
+		const adopted = await fixture.router.adoptLifecycleResult(
+			{
+				ok: true,
+				result: {
+					sessionId: fixture.sessionId,
+					endpointGeneration: fixture.authority.generation,
+					pid: fixture.authority.pid,
+					endpointMtimeMs: fixture.authority.endpointMtimeMs,
+					endpoint,
+				},
+			},
+			{ sessionId: fixture.sessionId, cwd: fixture.repo },
+		);
+		try {
+			await fixture.router.reconcile();
+			expect(adopted.isCurrent()).toBe(false);
+			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+		} finally {
+			await fixture.router.stop();
+		}
+
+		const terminal = await routerFixture();
+		const terminalEndpoint = JSON.parse(fs.readFileSync(terminal.endpointFile, "utf8")) as Record<string, unknown>;
+		const terminalAdopted = await terminal.router.adoptLifecycleResult(
+			{
+				ok: true,
+				result: {
+					sessionId: terminal.sessionId,
+					endpointGeneration: terminal.authority.generation,
+					pid: terminal.authority.pid,
+					endpointMtimeMs: terminal.authority.endpointMtimeMs,
+					endpoint: terminalEndpoint,
+				},
+			},
+			{ sessionId: terminal.sessionId, cwd: terminal.repo },
+		);
+		try {
+			terminal.authority.terminalUncertain = true;
+			await terminal.router.reconcile();
+			expect(terminalAdopted.isCurrent()).toBe(false);
+			expect(terminal.router.attachment(terminal.sessionId)).toBeNull();
+		} finally {
+			await terminal.router.stop();
+		}
+	});
 	test("revokes an old attachment at send time before the periodic reconciliation tick", async () => {
 		const fixture = await routerFixture();
 		const firstAttachment = fixture.attachments[0]!;
@@ -312,6 +403,63 @@ describe("SessionRouter dispatch authority", () => {
 		expect(fixture.clients[0]?.sent).toEqual([]);
 		expect(fixture.router.attachment(fixture.sessionId)?.generation).toBe(2);
 		await fixture.router.stop();
+	});
+	test("revokes a same-generation predecessor when successor pid and mtime replace the endpoint", async () => {
+		const fixture = await routerFixture();
+		const predecessor = fixture.attachments[0]!;
+		fs.writeFileSync(
+			fixture.endpointFile,
+			JSON.stringify({ sessionId: fixture.sessionId, url: "ws://router-successor", token: "successor", pid: 43 }),
+		);
+		fixture.authority.pid = 43;
+		fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
+
+		await expect(predecessor.send({ type: "reply", id: "ask", answer: "yes" })).rejects.toBeInstanceOf(
+			SessionRouterError,
+		);
+		expect(predecessor.isCurrent()).toBe(false);
+		expect(fixture.router.attachment(fixture.sessionId)?.generation).toBe(1);
+		expect(fixture.clients[0]?.sent).toEqual([]);
+		await fixture.router.stop();
+	});
+	test("revokes an attachment when the endpoint pid disagrees with the indexed process", async () => {
+		const fixture = await routerFixture();
+		const attachment = fixture.attachments[0]!;
+		fs.writeFileSync(
+			fixture.endpointFile,
+			JSON.stringify({ sessionId: fixture.sessionId, url: "ws://router.test", token: "secret", pid: 43 }),
+		);
+
+		await expect(attachment.send({ type: "reply", id: "ask", answer: "yes" })).rejects.toBeInstanceOf(
+			SessionRouterError,
+		);
+		expect(attachment.isCurrent()).toBe(false);
+		expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+		await fixture.router.stop();
+	});
+	test("rejects an endpoint when the Broker index rotates during endpoint validation", async () => {
+		let refreshCount = 0;
+		let fixture!: Awaited<ReturnType<typeof routerFixture>>;
+		fixture = await routerFixture({
+			start: false,
+			onIndexRefresh: () => {
+				refreshCount += 1;
+				if (refreshCount !== 2) return;
+				fs.writeFileSync(
+					fixture.endpointFile,
+					JSON.stringify({ sessionId: fixture.sessionId, url: "ws://router-race", token: "race", pid: 43 }),
+				);
+				fixture.authority.pid = 43;
+				fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
+			},
+		});
+		await fixture.router.start();
+		try {
+			expect(refreshCount).toBeGreaterThanOrEqual(2);
+			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+		} finally {
+			await fixture.router.stop();
+		}
 	});
 
 	test("revokes attachments when Broker terminal authority is uncertain", async () => {

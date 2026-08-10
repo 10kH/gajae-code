@@ -175,6 +175,7 @@ export class DiscordNotificationDaemon {
 	#providerStarting = false;
 	#providerLifecycleTail: Promise<void> | undefined;
 	#providerLifecycleError: unknown;
+	#providerLifecycleErrorSet = false;
 
 	#leaseRecoveryTimer: unknown;
 	#leaseRecoveryAt: number | undefined;
@@ -195,12 +196,12 @@ export class DiscordNotificationDaemon {
 		this.#resolveAttachment = options.resolveAttachment;
 	}
 	restartBlocked(): boolean {
-		return this.#providerLifecycleTail !== undefined || this.#providerLifecycleError !== undefined;
+		return this.#providerLifecycleTail !== undefined || this.#providerLifecycleErrorSet;
 	}
 
 	async start(): Promise<void> {
 		if (this.#started && !this.#stopTask) return;
-		if (this.#providerLifecycleError !== undefined) throw this.#providerLifecycleError;
+		if (this.#providerLifecycleErrorSet) throw this.#providerLifecycleError;
 		if (this.#providerLifecycleTail) {
 			const tail = this.#providerLifecycleTail;
 			const settled = await Promise.race([
@@ -208,7 +209,12 @@ export class DiscordNotificationDaemon {
 				Bun.sleep(5_000).then(() => false),
 			]);
 			if (!settled) throw new Error("Prior Discord provider shutdown did not settle before restart.");
-			await tail;
+			try {
+				await tail;
+			} catch (error) {
+				this.#recordProviderLifecycleError(error);
+				throw error;
+			}
 			if (this.#providerLifecycleTail === tail) this.#providerLifecycleTail = undefined;
 		}
 		if (this.#stopTask) {
@@ -262,7 +268,12 @@ export class DiscordNotificationDaemon {
 			}
 			if (lifecycleGeneration !== this.#lifecycleGeneration) {
 				this.#started = false;
-				await this.options.provider.stop();
+				try {
+					await this.options.provider.stop();
+				} catch (error) {
+					this.#recordProviderLifecycleError(error);
+					throw error;
+				}
 			}
 		} catch (error) {
 			if (lifecycleGeneration === this.#lifecycleGeneration) {
@@ -298,11 +309,20 @@ export class DiscordNotificationDaemon {
 
 	async #stop(starting: Promise<void> | undefined, stopProvider: boolean): Promise<void> {
 		const drainDeadline = this.#now() + 5_000;
+		let providerStopError: unknown;
+		let providerStopRejected = false;
 		const providerLifecycle = (async () => {
 			// Calling provider.stop() before awaiting start lets a provider cancel a
 			// Gateway open that is already in flight. #start rechecks the generation
 			// after it resolves and closes any late open.
-			if (stopProvider) await this.options.provider.stop();
+			if (stopProvider) {
+				try {
+					await this.options.provider.stop();
+				} catch (error) {
+					providerStopRejected = true;
+					providerStopError = error;
+				}
+			}
 			try {
 				await starting;
 			} catch {
@@ -310,8 +330,14 @@ export class DiscordNotificationDaemon {
 			}
 			if (this.#providerStarting || this.#started) {
 				this.#started = false;
-				await this.options.provider.stop();
+				try {
+					await this.options.provider.stop();
+				} catch (error) {
+					providerStopRejected = true;
+					providerStopError ??= error;
+				}
 			}
+			if (providerStopRejected) throw providerStopError;
 		})();
 		const providerOutcome = await Promise.race([
 			providerLifecycle.then(
@@ -320,19 +346,16 @@ export class DiscordNotificationDaemon {
 			),
 			Bun.sleep(Math.max(0, drainDeadline - this.#now())).then(() => ({ kind: "timeout" as const })),
 		]);
-		if (providerOutcome.kind === "rejected") throw providerOutcome.error;
-		if (providerOutcome.kind === "timeout") {
-			this.#providerLifecycleTail = providerLifecycle;
-			void providerLifecycle.then(
-				() => {
-					if (this.#providerLifecycleTail === providerLifecycle) this.#providerLifecycleTail = undefined;
-				},
-				error => {
-					this.#providerLifecycleError = error;
-					if (this.#providerLifecycleTail === providerLifecycle) this.#providerLifecycleTail = undefined;
-				},
-			);
+		if (providerOutcome.kind === "rejected") {
+			this.#recordProviderLifecycleError(providerOutcome.error);
 			await this.#invalidateActiveWork();
+			await this.#drainActiveWork(drainDeadline);
+			throw providerOutcome.error;
+		}
+		if (providerOutcome.kind === "timeout") {
+			this.#retainProviderLifecycle(providerLifecycle);
+			await this.#invalidateActiveWork();
+			await this.#drainActiveWork(drainDeadline);
 			logger.warn(
 				"Discord provider lifecycle exceeded the 5000ms shutdown drain; continuing with Router revocation.",
 			);
@@ -340,8 +363,17 @@ export class DiscordNotificationDaemon {
 		}
 		// Drain until quiescent, but never let a hung provider REST request prevent
 		// SessionRouter authority revocation and daemon ownership release.
+		await this.#drainActiveWork(drainDeadline);
+	}
+
+	async #invalidateActiveWork(): Promise<void> {
+		this.#workGeneration += 1;
+		await Promise.allSettled([...this.#workInvalidators].map(invalidate => invalidate()));
+	}
+
+	async #drainActiveWork(deadline: number): Promise<void> {
 		while (this.#activeWork.size > 0) {
-			const remaining = drainDeadline - this.#now();
+			const remaining = deadline - this.#now();
 			if (remaining <= 0) {
 				await this.#invalidateActiveWork();
 				logger.warn("Discord provider work exceeded the 5000ms shutdown drain; continuing with Router revocation.");
@@ -359,9 +391,22 @@ export class DiscordNotificationDaemon {
 		}
 	}
 
-	async #invalidateActiveWork(): Promise<void> {
-		this.#workGeneration += 1;
-		await Promise.allSettled([...this.#workInvalidators].map(invalidate => invalidate()));
+	#recordProviderLifecycleError(error: unknown): void {
+		this.#providerLifecycleError = error;
+		this.#providerLifecycleErrorSet = true;
+	}
+
+	#retainProviderLifecycle(tail: Promise<void>): void {
+		this.#providerLifecycleTail = tail;
+		void tail.then(
+			() => {
+				if (this.#providerLifecycleTail === tail) this.#providerLifecycleTail = undefined;
+			},
+			error => {
+				this.#recordProviderLifecycleError(error);
+				if (this.#providerLifecycleTail === tail) this.#providerLifecycleTail = undefined;
+			},
+		);
 	}
 
 	/**

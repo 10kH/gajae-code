@@ -1,3 +1,4 @@
+import { redactBrokerRuntimeCloseCapability } from "./control/runtime-gate";
 import { type EventFrame, SessionEventStream } from "./events";
 import { type ProviderLease, ReverseLeaseError, ReverseLeaseRuntime } from "./reverse-leases";
 import type { BrokerIndexWriter, HostEndpointAdapters, SdkFrame } from "./types";
@@ -542,7 +543,7 @@ export class SessionSdkHost {
 	}
 	#observeRequest(kind: "control" | "query", connectionId: string, frame: SdkFrame): void {
 		try {
-			this.#options.onRequest?.(kind, connectionId, frame);
+			this.#options.onRequest?.(kind, connectionId, redactBrokerRuntimeCloseCapability(frame));
 		} catch {
 			// Diagnostic observers must not change request handling.
 		}

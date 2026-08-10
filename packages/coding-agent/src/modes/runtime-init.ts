@@ -18,7 +18,6 @@ import {
 	syntheticNamespaceCollision,
 } from "../sdk/model-profile-model";
 import type { AgentSession } from "../session/agent-session";
-
 import { parseThinkingLevel } from "../thinking";
 import type { TodoPhase } from "../tools/todo-write";
 

@@ -5,6 +5,7 @@ import {
 } from "../../../session/default-model-selection";
 import { OPERATIONS, type Operation } from "../../protocol/operation-registry";
 import type { ControlInput, ControlSurface, ControlValue } from "./operations";
+import { brokerRuntimeCloseCapability, hasBrokerRuntimeCloseCapability } from "./runtime-gate";
 
 export interface ControlRequest {
 	id: string;
@@ -78,6 +79,7 @@ const BROKER_LIFECYCLE_CONTROL_OPERATIONS = new Set([
 	"session.switch",
 	"session.branch",
 	"session.handoff",
+	"session.close",
 	"session.delete",
 ]);
 const IDEMPOTENCY_TTL_MS = 15 * 60 * 1_000;
@@ -212,7 +214,7 @@ function invoke(
 		case "bash.abort":
 			return surface.abortBash();
 		case "session.close":
-			return surface.closeSession();
+			return surface.closeSession(brokerRuntimeCloseCapability(input));
 		case "session.rename":
 			return surface.renameSession(text(input, "name"));
 		case "session.export_html":
@@ -371,7 +373,8 @@ export function dispatchControl(
 		return Promise.resolve(
 			failure(request.id, "unknown_operation", `Unknown control operation: ${request.operation}.`),
 		);
-	if (BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(row.sdkId))
+	const brokerCloseAuthorized = row.sdkId === "session.close" && hasBrokerRuntimeCloseCapability(request.input);
+	if (BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(row.sdkId) && !brokerCloseAuthorized)
 		return Promise.resolve(
 			failure(
 				request.id,
@@ -379,7 +382,11 @@ export function dispatchControl(
 				`${request.operation} is available only through the Broker lifecycle service.`,
 			),
 		);
-	if (surface.installedOperations instanceof Set && !surface.installedOperations.has(row.sdkId))
+	if (
+		!brokerCloseAuthorized &&
+		surface.installedOperations instanceof Set &&
+		!surface.installedOperations.has(row.sdkId)
+	)
 		return Promise.resolve(
 			failure(request.id, "operation_not_session_owned", `${request.operation} is not installed for this session.`),
 		);

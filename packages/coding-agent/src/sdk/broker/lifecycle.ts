@@ -44,6 +44,7 @@ import {
 } from "../../session/session-storage";
 import type { SessionLifecycleMcpServer } from "../acp/mcp";
 import { SdkClient, SdkClientError } from "../client/client";
+import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
 import { SESSION_PREPARED_EVENT } from "../host/host";
 import {
 	type LogicalSessionCandidate,
@@ -3132,12 +3133,16 @@ async function executeLifecycleResponse(
 				if ("ok" in finalScope) return finalScope;
 				if (!sameResumeSessionIdentity(initialScope, finalScope))
 					return fail("endpoint_stale", "Saved session changed while its resume authority was being verified.");
+				if (current.endpointMtimeMs === undefined)
+					return fail("endpoint_stale", "Live session endpoint authority is incomplete.");
 				return {
 					ok: true,
 					result: {
 						sessionId: requestedSessionId,
 						cwd: finalScope.cwd,
 						endpointGeneration: current.endpointGeneration,
+						pid: current.pid,
+						endpointMtimeMs: current.endpointMtimeMs,
 						endpoint: endpoint.result,
 						reused: true,
 					},
@@ -3429,6 +3434,9 @@ async function executeLifecycleResponse(
 			result: {
 				sessionId: launch.id,
 				cwd: launch.cwd,
+				endpointGeneration: verified.endpointGeneration,
+				pid: verified.endpoint.pid,
+				endpointMtimeMs: verified.endpointMtimeMs,
 				endpoint: verified.endpoint,
 				...(launch.readiness === "deferred" ? { readiness: "prepared" as const } : {}),
 				...(worktreeReceipt ? { worktree: worktreeReceipt } : {}),
@@ -3495,11 +3503,22 @@ async function executeLifecycleResponse(
 					return fail("endpoint_stale", "session endpoint is stale");
 				const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
 				if (stale) return stale;
-				const response = await client.control("session.close");
-				if ((response as { ok?: unknown }).ok !== true)
-					return fail("close_refused", "Session endpoint rejected session.close.");
+				if (record.lifecycleRequestId === undefined) {
+					usedSignalFallback = true;
+				} else {
+					const response = await client.control("session.close", {
+						[BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: record.lifecycleRequestId,
+					});
+					if ((response as { ok?: unknown }).ok !== true) {
+						const closeError = (response as { error?: { code?: unknown } }).error;
+						if (closeError?.code === "operation_prohibited") usedSignalFallback = true;
+						else return fail("close_refused", "Session endpoint rejected session.close.");
+					}
+				}
 			} catch (error) {
 				if (isTransportFailure(error)) usedSignalFallback = true;
+				else if (error instanceof SdkClientError && error.code === "operation_prohibited")
+					usedSignalFallback = true;
 				else if (error instanceof SdkClientError) return fail(error.code, error.message);
 				else
 					return fail(

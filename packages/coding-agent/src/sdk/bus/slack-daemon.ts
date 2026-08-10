@@ -197,6 +197,9 @@ export class SlackNotificationDaemon {
 	#providerStartingGeneration: number | undefined;
 	#providerRunningGeneration: number | undefined;
 	readonly #providerStopRequestedGenerations = new Set<number>();
+	#providerLifecycleTail: Promise<void> | undefined;
+	#providerLifecycleError: unknown;
+	#providerLifecycleErrorSet = false;
 	#leaseRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
 	#leaseRecoveryAt: number | undefined;
 	#leaseRecoveryFailures = 0;
@@ -215,7 +218,27 @@ export class SlackNotificationDaemon {
 		this.#resolveAttachment = options.resolveAttachment;
 	}
 
+	restartBlocked(): boolean {
+		return this.#providerLifecycleTail !== undefined || this.#providerLifecycleErrorSet;
+	}
+
 	async start(): Promise<void> {
+		if (this.#providerLifecycleErrorSet) throw this.#providerLifecycleError;
+		if (this.#providerLifecycleTail) {
+			const tail = this.#providerLifecycleTail;
+			const settled = await Promise.race([
+				Promise.allSettled([tail]).then(() => true),
+				Bun.sleep(5_000).then(() => false),
+			]);
+			if (!settled) throw new Error("Prior Slack provider shutdown did not settle before restart.");
+			try {
+				await tail;
+			} catch (error) {
+				this.#recordProviderLifecycleError(error);
+				throw error;
+			}
+			if (this.#providerLifecycleTail === tail) this.#providerLifecycleTail = undefined;
+		}
 		const lifecycleGeneration = this.#lifecycleGeneration;
 		if (this.#started && this.#startedGeneration === lifecycleGeneration) return;
 		if (this.#startOperation && this.#startOperationGeneration === lifecycleGeneration)
@@ -304,7 +327,10 @@ export class SlackNotificationDaemon {
 		if (this.#providerRunningGeneration === lifecycleGeneration) this.#providerRunningGeneration = undefined;
 		this.#clearLeaseRecoveryTimer();
 		if (stopProvider) this.#providerStopRequestedGenerations.add(lifecycleGeneration);
-		const providerStop = stopProvider ? this.options.provider.stop() : undefined;
+		const providerStop = stopProvider ? Promise.resolve().then(() => this.options.provider.stop()) : undefined;
+		if (providerStop) void providerStop.catch(() => undefined);
+		let providerStopError: unknown;
+		let providerStopRejected = false;
 		const shutdownDeadline = this.#now() + 5_000;
 		const predecessor = this.#lifecycleTail;
 		const operation = (async () => {
@@ -335,6 +361,8 @@ export class SlackNotificationDaemon {
 						providerStop.then(
 							() => true,
 							error => {
+								providerStopRejected = true;
+								providerStopError = error;
 								logger.warn(`Slack provider stop failed; continuing with Router revocation: ${String(error)}`);
 								return false;
 							},
@@ -342,21 +370,21 @@ export class SlackNotificationDaemon {
 						Bun.sleep(remaining).then(() => false),
 					]));
 				if (!stopped) {
+					this.#retainProviderLifecycle(providerStop);
 					await this.#invalidateActiveWork();
 					logger.warn("Slack provider stop exceeded the shutdown deadline; continuing with Router revocation.");
 				}
 			}
 			// Drain until quiescent, but never let hung provider work prevent
 			// SessionRouter authority revocation and daemon ownership release.
-			const drainDeadline = shutdownDeadline;
 			while (this.#activeWork.size > 0) {
-				const remaining = drainDeadline - this.#now();
+				const remaining = shutdownDeadline - this.#now();
 				if (remaining <= 0) {
 					await this.#invalidateActiveWork();
 					logger.warn(
 						"Slack provider work exceeded the 5000ms shutdown drain; continuing with Router revocation.",
 					);
-					return;
+					break;
 				}
 				const settled = await Promise.race([
 					Promise.allSettled([...this.#activeWork]).then(() => true),
@@ -367,8 +395,12 @@ export class SlackNotificationDaemon {
 					logger.warn(
 						"Slack provider work exceeded the 5000ms shutdown drain; continuing with Router revocation.",
 					);
-					return;
+					break;
 				}
+			}
+			if (providerStopRejected) {
+				this.#recordProviderLifecycleError(providerStopError);
+				throw providerStopError;
 			}
 		})();
 		this.#lifecycleTail = operation.then(
@@ -430,6 +462,24 @@ export class SlackNotificationDaemon {
 	async #invalidateActiveWork(): Promise<void> {
 		this.#workGeneration += 1;
 		await Promise.allSettled([...this.#workInvalidators].map(invalidate => invalidate()));
+	}
+
+	#recordProviderLifecycleError(error: unknown): void {
+		this.#providerLifecycleError = error;
+		this.#providerLifecycleErrorSet = true;
+	}
+
+	#retainProviderLifecycle(tail: Promise<void>): void {
+		this.#providerLifecycleTail = tail;
+		void tail.then(
+			() => {
+				if (this.#providerLifecycleTail === tail) this.#providerLifecycleTail = undefined;
+			},
+			error => {
+				this.#recordProviderLifecycleError(error);
+				if (this.#providerLifecycleTail === tail) this.#providerLifecycleTail = undefined;
+			},
+		);
 	}
 
 	#enqueueLifecycle<T>(operation: () => Promise<T>): Promise<T> {
