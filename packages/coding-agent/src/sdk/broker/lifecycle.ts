@@ -1138,35 +1138,6 @@ function exactUnlinkLifecycleFile(
 	});
 }
 
-function removeRetainedExactPlaceholder(file: string, parentDirectory: string, quarantinePrefix: string): boolean {
-	let current = path.resolve(file);
-	const parent = path.resolve(parentDirectory);
-	for (let attempt = 0; attempt < 4; attempt++) {
-		if (path.dirname(current) !== parent) return false;
-		if (!fsSync.existsSync(current)) return true;
-		const captured = captureLifecycleFile(current, true, false);
-		const parentIdentity = lifecycleParentIdentity(parent);
-		if (!captured || !parentIdentity) return false;
-		let result: NativeExactUnlinkResult;
-		try {
-			result = exactUnlinkLifecycleFile(
-				current,
-				captured.identity,
-				path.join(parent, `${quarantinePrefix}-${attempt}`),
-				{ dev: BigInt(parentIdentity.dev), ino: BigInt(parentIdentity.ino) },
-			);
-		} catch {
-			return false;
-		}
-		if (result.ok || result.code === "not_found") return true;
-		if (result.code !== "cleanup_pending" || result.retainedUnknownPath) return false;
-		const next = result.retainedPlaceholderPath ?? result.detachedPath;
-		if (!next) return false;
-		current = path.resolve(next);
-	}
-	return false;
-}
-
 type LifecycleCleanupFile = NonNullable<BrokerCleanupEvidence["lifecycleFiles"]>[number];
 
 function sameLifecycleCleanupIdentity(
@@ -2103,6 +2074,7 @@ async function removeOwnedLifecycleArtifacts(
 	id: string,
 	expected: EffectMarker,
 	onRetainedUnknown?: () => void,
+	onDurablePlaceholder?: (file: string) => void,
 ): Promise<boolean> {
 	const marker = await readEffectMarker(lifecycleMarkerPath(root, id));
 	if (!marker || !sameEffectMarker(marker, expected)) return false;
@@ -2148,18 +2120,21 @@ async function removeOwnedLifecycleArtifacts(
 			{ dev: BigInt(endpointParent.dev), ino: BigInt(endpointParent.ino) },
 		);
 		if (!endpointRemoval.ok) {
-			if (endpointRemoval.code !== "cleanup_pending") return false;
 			if (endpointRemoval.retainedUnknownPath) {
 				onRetainedUnknown?.();
 				return false;
 			}
+			if (endpointRemoval.code !== "cleanup_pending") return false;
 			if (endpointRemoval.retainedPlaceholderPath) {
 				if (endpointRemoval.payloadDurable !== true) return false;
-				removeRetainedExactPlaceholder(
-					endpointRemoval.retainedPlaceholderPath,
-					path.dirname(endpointPath),
-					`.gjc-delete-endpoint-placeholder-${expected.effectMarker}-${path.basename(endpointPath)}`,
-				);
+				onDurablePlaceholder?.(path.resolve(endpointRemoval.retainedPlaceholderPath));
+				for (const candidate of [endpointSource, plannedEndpointPath, retryEndpointPath, finalEndpointPath]) {
+					try {
+						if (fsSync.lstatSync(candidate).size === 0) onDurablePlaceholder?.(path.resolve(candidate));
+					} catch {
+						// Absent aliases carry no retained authority.
+					}
+				}
 			}
 			if (endpointRemoval.detachedPath && fsSync.existsSync(endpointRemoval.detachedPath)) {
 				const detachedPath = path.resolve(endpointRemoval.detachedPath);
@@ -2352,6 +2327,7 @@ async function removeExactDeadSessionEndpoint(
 	record: CloseRecord,
 	attempt = 0,
 	authorizedSource?: string,
+	durablePlaceholders?: Set<string>,
 ): Promise<boolean> {
 	if (record.endpointMtimeMs === undefined) return await endpointRemoved(record.locator.stateRoot, id);
 	await broker.index.refresh();
@@ -2390,18 +2366,6 @@ async function removeExactDeadSessionEndpoint(
 		}
 		if (size > 0) ownedPayloadPaths.push(ownedPath);
 	}
-	const ownedPlaceholderPath = record.lifecycleRequestId
-		? path.join(
-				path.dirname(endpointPath),
-				`.gjc-delete-endpoint-placeholder-${record.lifecycleRequestId}-${path.basename(endpointPath)}`,
-			)
-		: undefined;
-	if (ownedPlaceholderPath && fsSync.existsSync(ownedPlaceholderPath))
-		removeRetainedExactPlaceholder(
-			ownedPlaceholderPath,
-			path.dirname(endpointPath),
-			`.gjc-delete-endpoint-placeholder-retry-${record.lifecycleRequestId}`,
-		);
 	const candidates = [...ownedPayloadPaths, finalEndpointPath, retryEndpointPath, plannedEndpointPath, endpointPath];
 	let authorizedDetachedSource: string | undefined;
 	if (authorizedSource && path.dirname(path.resolve(authorizedSource)) === path.dirname(path.resolve(endpointPath))) {
@@ -2467,14 +2431,24 @@ async function removeExactDeadSessionEndpoint(
 		if (removed.code === "cleanup_pending" && removed.retainedUnknownPath) return false;
 		if (removed.code === "cleanup_pending" && removed.retainedPlaceholderPath) {
 			if (removed.payloadDurable !== true) return false;
-			removeRetainedExactPlaceholder(
-				removed.retainedPlaceholderPath,
-				path.dirname(endpointPath),
-				`.gjc-dead-endpoint-placeholder-${suffix}`,
-			);
+			durablePlaceholders?.add(path.resolve(removed.retainedPlaceholderPath));
+			for (const candidate of [endpointSource, plannedEndpointPath, retryEndpointPath, finalEndpointPath]) {
+				try {
+					if (fsSync.lstatSync(candidate).size === 0) durablePlaceholders?.add(path.resolve(candidate));
+				} catch {
+					// Absent aliases carry no retained authority.
+				}
+			}
 		}
 		if (removed.code === "cleanup_pending" && attempt < 4)
-			return await removeExactDeadSessionEndpoint(broker, id, record, attempt + 1, removed.detachedPath);
+			return await removeExactDeadSessionEndpoint(
+				broker,
+				id,
+				record,
+				attempt + 1,
+				removed.detachedPath,
+				durablePlaceholders,
+			);
 		return false;
 	} catch {
 		return false;
@@ -2483,7 +2457,12 @@ async function removeExactDeadSessionEndpoint(
 	}
 }
 
-async function hasOwnedEndpointPayload(root: string, id: string, effectMarker: string): Promise<boolean> {
+async function hasOwnedEndpointPayload(
+	root: string,
+	id: string,
+	effectMarker: string,
+	durablePlaceholders: ReadonlySet<string>,
+): Promise<boolean> {
 	const directory = path.join(root, "sdk");
 	const endpointName = `${id}.json`;
 	let names: string[];
@@ -2493,11 +2472,17 @@ async function hasOwnedEndpointPayload(root: string, id: string, effectMarker: s
 		return (error as NodeJS.ErrnoException).code !== "ENOENT";
 	}
 	for (const name of names) {
-		if (!name.startsWith(".gjc-delete-endpoint-") || !name.includes(effectMarker) || !name.endsWith(endpointName))
+		if (!name.startsWith(".gjc-delete-endpoint-") || !name.includes(effectMarker) || !name.includes(endpointName))
 			continue;
 		try {
-			const metadata = await fs.lstat(path.join(directory, name));
-			if (!metadata.isFile() || metadata.size > 0) return true;
+			const candidate = path.join(directory, name);
+			const metadata = await fs.lstat(candidate);
+			if (
+				!metadata.isFile() ||
+				metadata.size > 0 ||
+				(metadata.size === 0 && !durablePlaceholders.has(path.resolve(candidate)))
+			)
+				return true;
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return true;
 		}
@@ -2507,6 +2492,7 @@ async function hasOwnedEndpointPayload(root: string, id: string, effectMarker: s
 async function waitForClose(broker: Broker, id: string, record: CloseRecord, timeoutMs: number): Promise<boolean> {
 	const timing = lifecycleTiming(broker);
 	const deadline = timing.now() + timeoutMs;
+	const durablePlaceholders = new Set<string>();
 	while (timing.now() < deadline) {
 		await broker.index.refresh();
 		const registration = broker.index.findHostRegistration(
@@ -2519,7 +2505,14 @@ async function waitForClose(broker: Broker, id: string, record: CloseRecord, tim
 			registration &&
 			broker.index.hostUnregisteredAfter(registration) &&
 			(await endpointRemoved(record.locator.stateRoot, id)) &&
-			hasObservedProcessExit(record.pid)
+			hasObservedProcessExit(record.pid) &&
+			(!record.lifecycleRequestId ||
+				!(await hasOwnedEndpointPayload(
+					record.locator.stateRoot,
+					id,
+					record.lifecycleRequestId,
+					durablePlaceholders,
+				)))
 		)
 			return true;
 		// A host that dies before it can withdraw its own registration — killed
@@ -2539,12 +2532,22 @@ async function waitForClose(broker: Broker, id: string, record: CloseRecord, tim
 					: undefined;
 			let retainedUnknown = false;
 			if (expected)
-				await removeOwnedLifecycleArtifacts(record.locator.stateRoot, id, expected, () => {
-					retainedUnknown = true;
-				});
+				await removeOwnedLifecycleArtifacts(
+					record.locator.stateRoot,
+					id,
+					expected,
+					() => {
+						retainedUnknown = true;
+					},
+					file => durablePlaceholders.add(path.resolve(file)),
+				);
 			if (retainedUnknown) return false;
-			if (!(await removeExactDeadSessionEndpoint(broker, id, record))) return false;
-			if (expected && (await hasOwnedEndpointPayload(record.locator.stateRoot, id, expected.effectMarker)))
+			if (!(await removeExactDeadSessionEndpoint(broker, id, record, 0, undefined, durablePlaceholders)))
+				return false;
+			if (
+				expected &&
+				(await hasOwnedEndpointPayload(record.locator.stateRoot, id, expected.effectMarker, durablePlaceholders))
+			)
 				return false;
 			await broker.index.unregisterIfCurrent(registration);
 			return await endpointRemoved(record.locator.stateRoot, id);
