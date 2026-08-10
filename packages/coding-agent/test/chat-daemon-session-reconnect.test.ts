@@ -39,6 +39,7 @@ class FakeSlackProvider implements SlackProviderClient {
 	failReconciliations = 0;
 	/** Every post this provider refused, so a test can settle on the refusal itself. */
 	readonly refused: string[] = [];
+	readonly completedClientMsgIds = new Set<string>();
 	readonly transportHealthy = true;
 
 	async start(): Promise<void> {}
@@ -82,7 +83,10 @@ class FakeSlackProvider implements SlackProviderClient {
 		}
 		this.postAttempts.push(input);
 		const duplicate = this.posts.findIndex(post => post.clientMsgId === input.clientMsgId);
-		if (duplicate >= 0) return { channel: input.channel, ts: `7.${duplicate + 1}`, client_msg_id: input.clientMsgId };
+		if (duplicate >= 0) {
+			this.completedClientMsgIds.add(input.clientMsgId);
+			return { channel: input.channel, ts: `7.${duplicate + 1}`, client_msg_id: input.clientMsgId };
+		}
 		const position = this.posts.push(input);
 		if (this.acceptThenThrowPosts > 0) {
 			this.acceptThenThrowPosts -= 1;
@@ -90,6 +94,7 @@ class FakeSlackProvider implements SlackProviderClient {
 			throw new SlackProviderError("connection", "chat.postMessage", undefined, undefined, true);
 		}
 		if (this.#publishGate) await this.#publishGate;
+		this.completedClientMsgIds.add(input.clientMsgId);
 		return { channel: input.channel, ts: `7.${position}`, client_msg_id: input.clientMsgId };
 	}
 
@@ -515,6 +520,18 @@ async function awaitPosts(provider: FakeSlackProvider, count: number): Promise<v
 	await Bun.sleep(25);
 }
 
+async function awaitCompletedPosts(provider: FakeSlackProvider, count: number): Promise<void> {
+	for (
+		let attempt = 0;
+		attempt < 2_000 && (provider.posts.length < count || provider.completedClientMsgIds.size < count);
+		attempt++
+	)
+		await Bun.sleep(1);
+	expect(provider.posts).toHaveLength(count);
+	expect(provider.completedClientMsgIds.size).toBeGreaterThanOrEqual(count);
+	await Bun.sleep(100);
+}
+
 async function awaitDiscordPosts(provider: FakeDiscordProvider, count: number): Promise<void> {
 	for (let attempt = 0; attempt < 2_000 && provider.posts.length < count; attempt++) await Bun.sleep(1);
 	expect(provider.posts).toHaveLength(count);
@@ -566,7 +583,7 @@ test("an established chat attachment that loses its open socket resumes from its
 			await starting;
 
 			host.emit("before the drop");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			// Drop the already-attached, already-active socket, then keep the session
 			// producing: these events exist only in the host's log until delivery resumes.
@@ -638,7 +655,7 @@ test("a live frame delivered before the resume replay answers is published in se
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			host.drop();
 			host.emit("two");
@@ -734,7 +751,7 @@ test("a supersession while a replay is pending discards it instead of replaying 
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			host.drop();
 			host.emit("two");
@@ -775,7 +792,7 @@ test("a replay refused on a live socket loses no event and leaves the cursor bel
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			host.drop();
 			host.emit("two");
@@ -869,7 +886,7 @@ test("a real 256-frame host ring loses only the sequences the host says it evict
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			host.drop();
 			host.emit("two");
@@ -1027,7 +1044,7 @@ test("a replay whose gap never states its range fails the barrier instead of pub
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			host.drop();
 			host.emit("two");
