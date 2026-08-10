@@ -2302,6 +2302,19 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 		);
 	});
 
+	test("bounds a provider stop that never settles", async () => {
+		await withDaemon(async (daemon, provider) => {
+			await daemon.start();
+			const never = Promise.withResolvers<void>();
+			provider.stop = async () => await never.promise;
+			const outcome = await Promise.race([
+				daemon.stop().then(() => "stopped" as const),
+				Bun.sleep(6_000).then(() => "timeout" as const),
+			]);
+			expect(outcome).toBe("stopped");
+		});
+	}, 7_000);
+
 	test("fences a stopped Gateway start and keeps repeated starts idempotent", async () => {
 		await withDaemon(async (daemon, provider) => {
 			const startEntered = Promise.withResolvers<void>();

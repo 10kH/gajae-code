@@ -9499,7 +9499,10 @@ export class TelegramNotificationDaemon {
 				!this.preservedInitiatorTopics.has(session.sessionId);
 			const replayCandidateSessionId =
 				replayIdentitySessionId ?? (canResumeTransport || canBootstrapTransport ? session.sessionId : undefined);
-			if (!replayCandidateSessionId) return;
+			if (!replayCandidateSessionId) {
+				this.dropSession(session, "recovery_rejected");
+				return;
+			}
 			const recovered = await this.#recoverTopicBinding(
 				session,
 				replayCandidateSessionId ?? session.sessionId,

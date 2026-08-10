@@ -444,8 +444,9 @@ export class SessionRouter {
 		}
 		if (!this.#running(runEpoch)) return;
 		const cleanupErrors: unknown[] = [];
-		for (const [sessionId, attached] of this.#sessions) {
+		for (const [sessionId, attached] of [...this.#sessions]) {
 			if (attachedIds.has(sessionId)) continue;
+			if (!this.#running(runEpoch) || this.#sessions.get(sessionId) !== attached) continue;
 			if (!liveIds.has(sessionId)) {
 				this.#undelivered.delete(sessionId);
 				this.#recoveredFrames.delete(sessionId);
@@ -704,7 +705,7 @@ export class SessionRouter {
 	}
 
 	#enqueueFrame(attached: AttachedSession, frame: Record<string, unknown>, origin: FrameOrigin): Promise<void> {
-		const previous = this.#frameTails.get(attached.sessionId) ?? Promise.resolve();
+		const previous = this.#frameTails.get(attached.id) ?? Promise.resolve();
 		const current = previous
 			.catch(() => undefined)
 			.then(async () => {
@@ -750,13 +751,13 @@ export class SessionRouter {
 					if (seq > attached.cursor.seq) attached.cursor.seq = seq;
 				}
 			});
-		this.#frameTails.set(attached.sessionId, current);
+		this.#frameTails.set(attached.id, current);
 		void current.then(
 			() => {
-				if (this.#frameTails.get(attached.sessionId) === current) this.#frameTails.delete(attached.sessionId);
+				if (this.#frameTails.get(attached.id) === current) this.#frameTails.delete(attached.id);
 			},
 			() => {
-				if (this.#frameTails.get(attached.sessionId) === current) this.#frameTails.delete(attached.sessionId);
+				if (this.#frameTails.get(attached.id) === current) this.#frameTails.delete(attached.id);
 			},
 		);
 		return current;
@@ -813,7 +814,7 @@ export class SessionRouter {
 				}
 			}
 			if (attached.barrier.held !== held || !this.#attachmentLive(attached)) return;
-			await this.#frameTails.get(attached.sessionId)?.catch(() => undefined);
+			await this.#frameTails.get(attached.id)?.catch(() => undefined);
 			if (attached.barrier.held !== held || !this.#attachmentLive(attached)) return;
 			const events = Array.isArray(replay.events)
 				? replay.events.filter(

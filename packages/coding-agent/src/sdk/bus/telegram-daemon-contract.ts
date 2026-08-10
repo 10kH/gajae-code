@@ -198,8 +198,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 134 durably restores replay after definitive provider rejection.
  * Generation 135 revokes attachments whose provider publication hook rejects.
  * Generation 136 keeps provider attachment publication provisional until recovery succeeds.
+ * Generation 137 fences stale reconciliation, frame tails, and identity-less replay rejection.
  */
-export const DAEMON_GENERATION = 136;
+export const DAEMON_GENERATION = 137;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -281,5 +282,6 @@ export const DAEMON_GENERATION = 136;
  * Epoch 81 preserves definitive provider rejection across persistence failure and restart.
  * Epoch 82 fails closed before exposing provider attachments after cleanup recovery failure.
  * Epoch 83 binds provider commands to the exact opaque attachment identity.
+ * Epoch 84 prohibits provider lifecycle-equivalent controls and detaches replacement work.
  */
-export const SERVING_EPOCH = 83;
+export const SERVING_EPOCH = 84;

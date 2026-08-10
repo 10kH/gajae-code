@@ -173,6 +173,8 @@ export class DiscordNotificationDaemon {
 	#startTask: Promise<void> | undefined;
 	#stopTask: Promise<void> | undefined;
 	#providerStarting = false;
+	#providerLifecycleTail: Promise<void> | undefined;
+	#providerLifecycleError: unknown;
 
 	#leaseRecoveryTimer: unknown;
 	#leaseRecoveryAt: number | undefined;
@@ -195,6 +197,17 @@ export class DiscordNotificationDaemon {
 
 	async start(): Promise<void> {
 		if (this.#started && !this.#stopTask) return;
+		if (this.#providerLifecycleError !== undefined) throw this.#providerLifecycleError;
+		if (this.#providerLifecycleTail) {
+			const tail = this.#providerLifecycleTail;
+			const settled = await Promise.race([
+				Promise.allSettled([tail]).then(() => true),
+				Bun.sleep(5_000).then(() => false),
+			]);
+			if (!settled) throw new Error("Prior Discord provider shutdown did not settle before restart.");
+			await tail;
+			if (this.#providerLifecycleTail === tail) this.#providerLifecycleTail = undefined;
+		}
 		if (this.#stopTask) {
 			await this.#stopTask;
 			return await this.start();
@@ -281,22 +294,49 @@ export class DiscordNotificationDaemon {
 	}
 
 	async #stop(starting: Promise<void> | undefined, stopProvider: boolean): Promise<void> {
-		// Calling provider.stop() before awaiting start lets a provider cancel a
-		// Gateway open that is already in flight. #start rechecks the generation
-		// after it resolves and closes any late open.
-		if (stopProvider) await this.options.provider.stop();
-		try {
-			await starting;
-		} catch {
-			// The caller of start() owns its recovery/start error; stop still drains it.
-		}
-		if (this.#providerStarting || this.#started) {
-			this.#started = false;
-			await this.options.provider.stop();
+		const drainDeadline = this.#now() + 5_000;
+		const providerLifecycle = (async () => {
+			// Calling provider.stop() before awaiting start lets a provider cancel a
+			// Gateway open that is already in flight. #start rechecks the generation
+			// after it resolves and closes any late open.
+			if (stopProvider) await this.options.provider.stop();
+			try {
+				await starting;
+			} catch {
+				// The caller of start() owns its recovery/start error; stop still drains it.
+			}
+			if (this.#providerStarting || this.#started) {
+				this.#started = false;
+				await this.options.provider.stop();
+			}
+		})();
+		const providerOutcome = await Promise.race([
+			providerLifecycle.then(
+				() => ({ kind: "settled" as const }),
+				error => ({ kind: "rejected" as const, error }),
+			),
+			Bun.sleep(Math.max(0, drainDeadline - this.#now())).then(() => ({ kind: "timeout" as const })),
+		]);
+		if (providerOutcome.kind === "rejected") throw providerOutcome.error;
+		if (providerOutcome.kind === "timeout") {
+			this.#providerLifecycleTail = providerLifecycle;
+			void providerLifecycle.then(
+				() => {
+					if (this.#providerLifecycleTail === providerLifecycle) this.#providerLifecycleTail = undefined;
+				},
+				error => {
+					this.#providerLifecycleError = error;
+					if (this.#providerLifecycleTail === providerLifecycle) this.#providerLifecycleTail = undefined;
+				},
+			);
+			await this.#invalidateActiveWork();
+			logger.warn(
+				"Discord provider lifecycle exceeded the 5000ms shutdown drain; continuing with Router revocation.",
+			);
+			return;
 		}
 		// Drain until quiescent, but never let a hung provider REST request prevent
 		// SessionRouter authority revocation and daemon ownership release.
-		const drainDeadline = this.#now() + 5_000;
 		while (this.#activeWork.size > 0) {
 			const remaining = drainDeadline - this.#now();
 			if (remaining <= 0) {

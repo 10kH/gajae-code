@@ -92,9 +92,10 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 38 / Slack generation 43 hold successor frames behind cleanup settlement.
  * Discord generation 39 / Slack generation 44 recover durable cleanup before attachment publication.
  * Slack generation 45 persists exact pending cleanup intent through recovery.
+ * Discord generation 40 bounds provider lifecycle joins before Router revocation.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 39,
+	discord: 40,
 	slack: 45,
 };
 

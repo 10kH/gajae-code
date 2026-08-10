@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes provisional-attachment generation 136 at serving epoch 83", () => {
+test("publishes detached-replacement generation 137 at serving epoch 84", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 136 / serving epoch 83: tentative attachments stay opaque and commands bind exact identity.
-	expect(DAEMON_GENERATION).toBe(136);
-	expect(SERVING_EPOCH).toBe(83);
+	// Generation 137 / serving epoch 84: stale replacement work and lifecycle-equivalent provider controls fail closed.
+	expect(DAEMON_GENERATION).toBe(137);
+	expect(SERVING_EPOCH).toBe(84);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
