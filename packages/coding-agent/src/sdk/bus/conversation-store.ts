@@ -220,7 +220,7 @@ export class ConversationStore<T extends ConversationRecord> {
 			return await operation();
 		} finally {
 			try {
-				await fileLock?.close();
+				await closeConversationStoreFileLock(fileLock);
 				if (fileLock)
 					await this.#fs.unlink(`${this.#file}.lock`).catch(error => {
 						if (!isMissing(error)) throw error;
@@ -366,6 +366,15 @@ export class ConversationStore<T extends ConversationRecord> {
 
 function isMissing(error: unknown): error is NodeJS.ErrnoException {
 	return isRecord(error) && error.code === "ENOENT";
+}
+
+async function closeConversationStoreFileLock(handle: ConversationStoreFileHandle | undefined): Promise<void> {
+	if (!handle) return;
+	try {
+		await handle.close();
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EBADF") throw error;
+	}
 }
 
 async function syncParentDirectory(
