@@ -2389,7 +2389,15 @@ async function waitForClose(broker: Broker, id: string, record: CloseRecord, tim
 							incarnation: record.processIncarnation,
 						}
 					: undefined;
-			if (expected) await removeOwnedLifecycleArtifacts(record.locator.stateRoot, id, expected);
+			if (expected) {
+				const marker = await readEffectMarker(lifecycleMarkerPath(record.locator.stateRoot, id));
+				if (
+					marker &&
+					sameEffectMarker(marker, expected) &&
+					!(await removeOwnedLifecycleArtifacts(record.locator.stateRoot, id, expected))
+				)
+					return false;
+			}
 			if (!(await removeExactDeadSessionEndpoint(broker, id, record))) return false;
 			await broker.index.unregisterIfCurrent(registration);
 			return await endpointRemoved(record.locator.stateRoot, id);
