@@ -88,10 +88,11 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 34 / Slack generation 39 clear stale attachment identity before provider reassignment.
  * Discord generation 35 / Slack generation 40 capture provider ownership before cleanup awaits.
  * Discord generation 36 / Slack generation 41 drain prior cleanup before provider restart.
+ * Discord generation 37 / Slack generation 42 serialize successor attachment visibility after cleanup.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 36,
-	slack: 41,
+	discord: 37,
+	slack: 42,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
