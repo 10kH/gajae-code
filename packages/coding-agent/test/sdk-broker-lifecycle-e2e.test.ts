@@ -2899,10 +2899,12 @@ test("broker rebinds implicit close only for a matching non-empty lifecycle requ
 	const originalHandleRequest = broker.handleRequest.bind(broker);
 	try {
 		await broker.start();
-		for (const [label, initialRequestId, replacementRequestId, expectedCode] of [
-			["same", "request-a", "request-a", "close_refused"],
-			["absent", undefined, undefined, "endpoint_stale"],
-			["different", "request-a", "request-b", "endpoint_stale"],
+		const processIdentity = await incarnation(process.pid);
+		for (const [label, initialRequestId, replacementRequestId, replacementIncarnation, expectedCode] of [
+			["same", "request-a", "request-a", processIdentity, "close_refused"],
+			["absent", undefined, undefined, processIdentity, "endpoint_stale"],
+			["different", "request-a", "request-b", processIdentity, "endpoint_stale"],
+			["successor", "request-a", "request-a", `${processIdentity}:successor`, "endpoint_stale"],
 		] as const) {
 			const sessionId = `close-rebind-${label}`;
 			const locator = { repo: "fixture", stateRoot };
@@ -2913,6 +2915,7 @@ test("broker rebinds implicit close only for a matching non-empty lifecycle requ
 				endpointGeneration: 1,
 				pid: process.pid,
 				endpointMtimeMs: 1,
+				processIncarnation: processIdentity,
 				...(initialRequestId ? { lifecycleRequestId: initialRequestId } : {}),
 			});
 			await broker.index.append({
@@ -2934,6 +2937,7 @@ test("broker rebinds implicit close only for a matching non-empty lifecycle requ
 							endpointGeneration: 2,
 							pid: process.pid,
 							endpointMtimeMs: 2,
+							processIncarnation: replacementIncarnation,
 							...(replacementRequestId ? { lifecycleRequestId: replacementRequestId } : {}),
 						});
 						return { ok: false, error: { code: "endpoint_stale", message: "session endpoint is stale" } };
