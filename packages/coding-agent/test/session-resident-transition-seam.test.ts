@@ -93,9 +93,13 @@ function residentCacheDirs(): string[] {
 		.sort();
 }
 
+function residentDataCacheDirs(): string[] {
+	return residentCacheDirs().filter(dir => fs.readdirSync(dir).some(name => /^[0-9a-f]{64}$/.test(name)));
+}
+
 function activeResidentCacheDir(): string {
-	const dirs = residentCacheDirs();
-	if (dirs.length !== 1) throw new Error(`Expected one active resident cache directory, got ${dirs.length}`);
+	const dirs = residentDataCacheDirs();
+	if (dirs.length !== 1) throw new Error(`Expected one active resident data cache directory, got ${dirs.length}`);
 	return dirs[0]!;
 }
 
@@ -382,7 +386,7 @@ describe("resident-store transition seam", () => {
 			b.sm.appendMessage(assistantMessage(appended));
 			await b.sm.flush();
 			expect(fs.readFileSync(a.sessionFile, "utf8")).toContain(appended);
-			expect(residentCacheDirs()).toHaveLength(1);
+			expect(residentDataCacheDirs()).toHaveLength(1);
 			await b.sm.close();
 			const reopened = await SessionManager.open(a.sessionFile);
 			try {
@@ -802,7 +806,7 @@ describe("resident-store transition seam", () => {
 							.filter(name => name.endsWith(".jsonl"))
 							.sort(),
 					).toEqual(transcriptInventory);
-					expect(residentCacheDirs()).toEqual([predecessor.cacheDir]);
+					expect(residentDataCacheDirs()).toEqual([predecessor.cacheDir]);
 				} finally {
 					await predecessor.sm.close();
 				}
@@ -832,7 +836,7 @@ describe("resident-store transition seam", () => {
 						.filter(name => name.endsWith(".jsonl"))
 						.sort(),
 				).toEqual(transcriptInventory);
-				expect(residentCacheDirs()).toEqual([predecessor.cacheDir]);
+				expect(residentDataCacheDirs()).toEqual([predecessor.cacheDir]);
 			} finally {
 				installed.restore();
 				await predecessor.sm.close();
@@ -1020,7 +1024,7 @@ describe("resident-store transition seam", () => {
 						.filter(name => name.endsWith(".jsonl"))
 						.sort(),
 				).toEqual(transcriptsBefore);
-				expect(residentCacheDirs()).toEqual([predecessor.cacheDir]);
+				expect(residentDataCacheDirs()).toEqual([predecessor.cacheDir]);
 			} finally {
 				restoreMutation();
 				await predecessor.sm.close();
@@ -1114,7 +1118,7 @@ describe("resident-store transition seam", () => {
 			).rejects.toThrow("destination_conflict");
 			expect(publishNoReplace).toHaveBeenCalledTimes(1);
 			expect(adopted).toHaveBeenCalledTimes(1);
-			expect(disposed).toHaveBeenCalledTimes(1);
+			expect(disposed).toHaveBeenCalledTimes(2);
 			expect(collisionPath).toBeDefined();
 			expect(fs.existsSync(collisionPath!)).toBe(true);
 			expect(staged.manager.getSessionFile()).toBe(stagingFile);

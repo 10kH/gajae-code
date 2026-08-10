@@ -9,7 +9,7 @@ fd = sys.stdin.fileno()
 old = termios.tcgetattr(fd)
 try:
     tty.setraw(fd)
-    print("Press Option+Q or Option+I; press Ctrl-C to stop", flush=True)
+    print("Press left/right Option+Q or left/right Option+I; press Ctrl-C to stop", flush=True)
     while True:
         value = sys.stdin.buffer.read(1)
         if not value:
