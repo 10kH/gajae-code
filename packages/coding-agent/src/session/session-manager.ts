@@ -47,6 +47,7 @@ import { ArtifactManager } from "./artifacts";
 import {
 	type BlobPutResult,
 	BlobStore,
+	disposeVerifiedResidentCacheInstanceDir,
 	EphemeralBlobStore,
 	externalizeImageData,
 	externalizeImageDataSync,
@@ -86,10 +87,12 @@ import {
 	fsyncManagedArtifactTree,
 	MANAGED_ARTIFACT_MAX_FILE_BYTES,
 	type ManagedBoundedAppendExpectation,
+	ManagedCommittedMutationError,
 	type ManagedDirectoryRoot,
 	type ManagedFileSnapshot,
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
+	managedDirectoryRoot,
 	mayCleanManagedTreeStaging,
 	retainManagedDirectoryAuthority,
 } from "./internal/managed-session-storage";
@@ -186,10 +189,12 @@ import { type SessionManagerReadAccess, sessionManagerReadCapability } from "./s
 import type {
 	ManagedSessionSecurityContext,
 	SessionStorage,
+	SessionStorageRangeSnapshot,
 	SessionStorageSnapshot,
 	SessionStorageStat,
 	SessionStorageWriter,
 	SessionStorageWriterCloseState,
+	SessionStorageWriterOpenOptions,
 	StagedStreamingWriter,
 	VerifiedSessionDeleteResult,
 	VerifiedSessionDeleteTarget,
@@ -199,7 +204,6 @@ import {
 	createSessionCommitMarkerCheckedSync,
 	FileSessionStorage,
 	MemorySessionStorage,
-	readSessionCommitMarkerSync,
 	replaceSessionCommitMarkerCheckedSync,
 	SESSION_RANGE_READ_MAX_BYTES,
 } from "./session-storage";
@@ -6362,6 +6366,12 @@ export class SessionManager {
 	#artifactManagerSessionFile: string | null = null;
 	#managedTranscriptStoreCache: { directory: string; store: ManagedSessionDescendantStore } | null = null;
 	#ownedManagedAuthority: ManagedSessionDescendantStore | undefined;
+	#managedSidecarCacheStore: EphemeralBlobStore | undefined;
+	#managedSidecarAuthorityStore: ManagedSessionDescendantStore | undefined;
+	#managedSidecarSecurityContext: ManagedSessionSecurityContext | undefined;
+	#managedSidecarCacheSessionFile: string | undefined;
+	#managedRangeExpectedDescriptor: DescriptorSnapshot | undefined;
+	#boundedReadStorageProxy: SessionStorage | undefined;
 	// When set, take precedence over the lazily-derived per-session manager.
 	// Subagents adopt the parent's manager so artifact IDs are unique across the
 	// whole agent tree and all files land in the parent's artifacts dir.
@@ -6414,22 +6424,115 @@ export class SessionManager {
 		getTree: () => this.#getTree(freezeInternalReadSnapshot(this.#getMaterializedEntriesInternal())),
 	};
 
+	readonly #storage: SessionStorage;
+	readonly #managedSidecarFileStorage = new FileSessionStorage();
 	private constructor(
 		private cwd: string,
 		private sessionDir: string,
 		private readonly persist: boolean,
-		private readonly storage: SessionStorage,
+		storage: SessionStorage,
 		private destination: SessionDestination = explicitDestination(sessionDir),
 	) {
+		this.#storage = new Proxy(storage, {
+			get: (target, property, receiver) => {
+				const value = Reflect.get(target, property, receiver);
+				if (typeof value !== "function") return value;
+				return (...args: unknown[]) => {
+					const first = args[0];
+					if (typeof first !== "string" || !this.#isManagedSidecarPath(first))
+						return Reflect.apply(value, target, args);
+					const authority = this.#managedSidecarAuthorityStore;
+					if (!authority) throw new Error("Managed sidecar authority is unavailable");
+					authority.assertBound();
+					const relative = path.relative(authority.dir, first);
+					switch (property) {
+						case "existsSync":
+							return authority.descriptorExpected(relative) !== null;
+						case "exists":
+							return Promise.resolve(authority.descriptorExpected(relative) !== null);
+						case "statSync": {
+							const descriptor = authority.descriptorExpected(relative);
+							if (!descriptor) throw Object.assign(new Error("Managed sidecar not found"), { code: "ENOENT" });
+							return descriptor;
+						}
+						case "readSnapshotSync": {
+							const snapshot = authority.readExpected(relative);
+							if (!snapshot) throw Object.assign(new Error("Managed sidecar not found"), { code: "ENOENT" });
+							return { bytes: snapshot.bytes, stat: authority.descriptorExpected(relative)! };
+						}
+						case "readBytesSync": {
+							const snapshot = authority.readExpected(relative);
+							if (!snapshot) throw Object.assign(new Error("Managed sidecar not found"), { code: "ENOENT" });
+							return snapshot.bytes;
+						}
+						case "readTextSync": {
+							const snapshot = authority.readExpected(relative);
+							if (!snapshot) throw Object.assign(new Error("Managed sidecar not found"), { code: "ENOENT" });
+							return snapshot.bytes.toString("utf8");
+						}
+						case "readText": {
+							const snapshot = authority.readExpected(relative);
+							if (!snapshot)
+								return Promise.reject(
+									Object.assign(new Error("Managed sidecar not found"), { code: "ENOENT" }),
+								);
+							return Promise.resolve(snapshot.bytes.toString("utf8"));
+						}
+						case "readRangeSync":
+							return authority.readRangeExpectedSync(relative, args[1] as number, args[2] as number);
+						case "readRange":
+							return Promise.resolve(
+								authority.readRangeExpectedSync(relative, args[1] as number, args[2] as number),
+							);
+						case "writeTextSync": {
+							const bytes = Buffer.from(args[1] as string, "utf8");
+							if (authority.descriptorExpected(relative)) authority.replaceSync(relative, bytes);
+							else authority.publishNoReplaceSync(relative, bytes);
+							return;
+						}
+						case "writeText": {
+							const bytes = Buffer.from(args[1] as string, "utf8");
+							return authority.descriptorExpected(relative)
+								? authority.replace(relative, bytes)
+								: authority.publishNoReplace(relative, bytes);
+						}
+						case "unlinkSync":
+							if (!authority.removeIfExistsDescriptor(relative))
+								throw Object.assign(new Error("Managed sidecar not found"), { code: "ENOENT" });
+							return;
+						case "unlink":
+							return authority.removeIfExistsDescriptor(relative)
+								? Promise.resolve()
+								: Promise.reject(Object.assign(new Error("Managed sidecar not found"), { code: "ENOENT" }));
+						case "openWriter":
+						case "openStagedWriter":
+							args[1] = {
+								...(args[1] as SessionStorageWriterOpenOptions | undefined),
+								securityContext: this.#managedSidecarSecurityContext,
+							};
+							break;
+					}
+					const operation = Reflect.get(
+						this.#managedSidecarFileStorage,
+						property,
+						this.#managedSidecarFileStorage,
+					);
+					if (typeof operation !== "function") return operation;
+					const result = Reflect.apply(operation, this.#managedSidecarFileStorage, args);
+					authority.assertBound();
+					return result;
+				};
+			},
+		});
 		this.#blobStore = persist ? new BlobStore(getBlobsDir()) : this.#residentTextBlobStore;
 		this.#residentImageBlobStore = this.#blobStore;
 		if (persist && sessionDir) {
-			this.storage.ensureDirSync(sessionDir);
+			this.#storage.ensureDirSync(sessionDir);
 			// Canonicalize the trusted session directory (single choke point for every
 			// creation path: create/open/moveTo/fork/SDK) so benign ancestor symlinks
 			// (e.g. macOS `/var -> /private/var`, a symlinked `$HOME`) are resolved to a
 			// symlink-free root before the strict owner-only and reparse guards run.
-			if (this.storage instanceof FileSessionStorage) {
+			if (this.#storage instanceof FileSessionStorage) {
 				this.sessionDir = canonicalizeTrustedPath(sessionDir);
 			}
 		}
@@ -6451,7 +6554,7 @@ export class SessionManager {
 	 * hash matches a currently referenced resident text blob.
 	 */
 	#createPersistedResidentTextFallback(): ((hash: string) => Buffer | null) | undefined {
-		if (!this.#sessionFile || !(this.storage instanceof FileSessionStorage)) return undefined;
+		if (!this.#sessionFile || !(this.#storage instanceof FileSessionStorage)) return undefined;
 		const requested = new Set<string>();
 		for (const entry of this.#fileEntries) collectResidentTextBlobHashes(entry, requested);
 		if (requested.size === 0) return undefined;
@@ -6507,7 +6610,7 @@ export class SessionManager {
 	}
 
 	#newResidentTextStoreCandidate(target: ResidentTransitionInput["target"]): { store: BlobStore; ownsStore: boolean } {
-		if (!this.persist || !target.sessionFile || !(this.storage instanceof FileSessionStorage)) {
+		if (!this.persist || !target.sessionFile || !(this.#storage instanceof FileSessionStorage)) {
 			return { store: this.#newCanonicalResidentTextStore(), ownsStore: false };
 		}
 		if (process.platform === "win32") {
@@ -6724,13 +6827,13 @@ export class SessionManager {
 			return;
 		}
 		if (publication.kind === "explicit-storage") {
-			if (!this.storage.existsSync(publication.sessionFile)) return;
-			verifyForkTranscriptPublishedBounded(this.storage, publication.sessionFile, publication.publishedSha256);
-			await this.storage.unlink(publication.sessionFile);
+			if (!this.#storage.existsSync(publication.sessionFile)) return;
+			verifyForkTranscriptPublishedBounded(this.#storage, publication.sessionFile, publication.publishedSha256);
+			await this.#storage.unlink(publication.sessionFile);
 			return;
 		}
-		if (!this.storage.existsSync(publication.sessionFile)) return;
-		verifyForkTranscriptPublishedBounded(this.storage, publication.sessionFile, publication.publishedSha256);
+		if (!this.#storage.existsSync(publication.sessionFile)) return;
+		verifyForkTranscriptPublishedBounded(this.#storage, publication.sessionFile, publication.publishedSha256);
 		const named = fs.lstatSync(publication.sessionFile, { bigint: true });
 		const removed = nativeSessionManager().exactUnlink(publication.sessionFile, {
 			dev: named.dev,
@@ -6958,6 +7061,7 @@ export class SessionManager {
 		this.#sessionName = state.header.title;
 		this.#titleSource = state.header.titleSource;
 		this.#sessionFile = state.sessionFile;
+		this.#managedRangeExpectedDescriptor = undefined;
 		this.#flushed = false;
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#ensuredOnDisk = false;
@@ -6987,8 +7091,8 @@ export class SessionManager {
 	async #tryInitSessionFileFromSidecar(sessionFile: string): Promise<boolean> {
 		if (
 			this.#sessionMemoryMode !== "enabled" ||
-			this.destination.kind === "managed" ||
-			typeof this.storage.readRangeSync !== "function"
+			(this.destination.kind === "managed" && process.platform === "win32") ||
+			typeof this.#storage.readRangeSync !== "function"
 		)
 			return false;
 		this.#lazyReopenAttempted = true;
@@ -7001,6 +7105,7 @@ export class SessionManager {
 		try {
 			const commit = this.#readSessionCommitContents();
 			const descriptor = this.#managedDescriptorSnapshotOrNull();
+			if (this.destination.kind === "managed") this.#managedRangeExpectedDescriptor = descriptor ?? undefined;
 			if (
 				!commit ||
 				!descriptor ||
@@ -7015,9 +7120,11 @@ export class SessionManager {
 				!this.#validateColdBase(commit.base)
 			)
 				return false;
-			const tailSize = this.storage.statSync(runtime.tailPath).size;
+			const tailSize = this.#storage.statSync(runtime.tailPath).size;
 			if (tailSize > runtime.tailCache.budgetBytes) return false;
-			const tailText = Buffer.from(this.storage.readRangeSync(runtime.tailPath, 0, tailSize).bytes).toString("utf8");
+			const tailText = Buffer.from(this.#storage.readRangeSync(runtime.tailPath, 0, tailSize).bytes).toString(
+				"utf8",
+			);
 			const records = tailText
 				.split("\n")
 				.filter(Boolean)
@@ -7061,7 +7168,7 @@ export class SessionManager {
 			// mismatched digests fail closed to the eager authoritative path.
 			let indexDescriptor: SessionStorageStat;
 			try {
-				indexDescriptor = this.storage.statSync(runtime.indexPath);
+				indexDescriptor = this.#storage.statSync(runtime.indexPath);
 			} catch {
 				return false;
 			}
@@ -7074,9 +7181,9 @@ export class SessionManager {
 			if (fullBaseEmptyTail) {
 				let leafOrdinal: number | undefined;
 				let boundaryOrdinal: number | undefined;
-				const indexSize = this.storage.statSync(runtime.indexPath).size;
+				const indexSize = this.#storage.statSync(runtime.indexPath).size;
 				const scanFailure = scanTranscriptLinesBounded(
-					this.storage,
+					this.#storage,
 					runtime.indexPath,
 					indexSize,
 					(_offset, lineBytes) => {
@@ -7104,14 +7211,14 @@ export class SessionManager {
 			// only disables the fast path; the idx remains authoritative.
 			this.#adoptCommittedDictionary(commit.dictionary);
 			this.#adoptCommittedParentArtifact(commit.parentIndex);
-			const headerWindow = this.storage.readRangeSync(sessionFile, 0, Math.min(descriptor.size, 64 * 1024)).bytes;
+			const headerWindow = this.#readRangeSync(sessionFile, 0, Math.min(descriptor.size, 64 * 1024)).bytes;
 			const headerEnd = headerWindow.indexOf(10);
 			if (headerEnd < 0) return false;
 			const header = JSON.parse(Buffer.from(headerWindow.subarray(0, headerEnd)).toString("utf8")) as SessionHeader;
 			if (header.type !== "session" || header.version !== CURRENT_SESSION_VERSION) return false;
 			const hotEntries: SessionEntry[] = [];
 			for (const record of records) {
-				const line = this.storage.readRangeSync(sessionFile, record.byteOffset, record.byteLength).bytes;
+				const line = this.#readRangeSync(sessionFile, record.byteOffset, record.byteLength).bytes;
 				if (computeLineDigest(line) !== record.recordDigest) return false;
 				const entry = JSON.parse(Buffer.from(line).toString("utf8")) as SessionEntry;
 				if (entry.id !== record.id || entry.type !== record.type) return false;
@@ -7210,8 +7317,8 @@ export class SessionManager {
 	async #tryBoundedFirstOpen(sessionFile: string): Promise<boolean> {
 		if (
 			this.#sessionMemoryMode !== "enabled" ||
-			this.destination.kind === "managed" ||
-			typeof this.storage.readRangeSync !== "function"
+			(this.destination.kind === "managed" && process.platform === "win32") ||
+			typeof this.#storage.readRangeSync !== "function"
 		)
 			return false;
 		this.#lazyReopenAttempted = true;
@@ -7221,7 +7328,7 @@ export class SessionManager {
 		// A pre-existing commit marker means a sidecar set was previously published;
 		// stale/corrupt marker recovery (transcript_ahead, tail_ahead, rebuild)
 		// stays on the eager authoritative path so its classifications are preserved.
-		if (this.storage.existsSync(runtime.commitPath)) {
+		if (this.#storage.existsSync(runtime.commitPath)) {
 			this.#sidecarRuntime = undefined;
 			this.#sessionFile = undefined;
 			return false;
@@ -7230,7 +7337,12 @@ export class SessionManager {
 		let initialized = false;
 		try {
 			const before = this.#managedDescriptorSnapshotOrNull();
+			if (this.destination.kind === "managed") this.#managedRangeExpectedDescriptor = before ?? undefined;
 			if (!before || before.size === 0 || before.size > BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES) {
+				this.#lazyReopenFallbackReason = "bounded_first_open_unreadable";
+				return false;
+			}
+			if (this.destination.kind === "managed" && before.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES) {
 				this.#lazyReopenFallbackReason = "bounded_first_open_unreadable";
 				return false;
 			}
@@ -7297,7 +7409,7 @@ export class SessionManager {
 				for (const sidecarPath of this.#disposableSidecarPaths()) {
 					if (!sidecarPath) continue;
 					try {
-						this.storage.unlinkSync(sidecarPath);
+						this.#storage.unlinkSync(sidecarPath);
 					} catch {
 						// Disposable sidecar cleanup is best-effort; the transcript remains authoritative.
 					}
@@ -7360,7 +7472,7 @@ export class SessionManager {
 		let latestCompactionBoundary: { firstKeptEntryId: string } | undefined;
 		let scannedBytes = 0;
 		const scanFailure = scanTranscriptLinesBounded(
-			this.storage,
+			this.#boundedReadStorage(),
 			sessionFile,
 			descriptor.size,
 			(lineStart, lineBytes) => {
@@ -7565,11 +7677,11 @@ export class SessionManager {
 		const metadataDeltaState = this.#createMetadataDeltaRuntimeState();
 		runtime.metadataDelta = metadataDeltaState;
 		try {
-			indexWriter = this.storage.openWriter(runtime.indexPath, { flags: "w" });
-			tailWriter = this.storage.openWriter(runtime.tailPath, { flags: "w" });
+			indexWriter = this.#storage.openWriter(runtime.indexPath, { flags: "w" });
+			tailWriter = this.#storage.openWriter(runtime.tailPath, { flags: "w" });
 			this.#truncateDerivedArtifactFiles(secondaryArtifactsEligible);
 			const scanFailure = scanTranscriptLinesBounded(
-				this.storage,
+				this.#boundedReadStorage(),
 				sessionFile,
 				descriptor.size,
 				(lineStart, lineBytes) => {
@@ -7780,7 +7892,7 @@ export class SessionManager {
 			if (secondaryArtifactsEligible) this.#publishParentArtifact(parentBuilder, runtime.indexDigest);
 			else runtime.parentArtifact = undefined;
 			try {
-				const validated = this.storage.statSync(runtime.indexPath);
+				const validated = this.#storage.statSync(runtime.indexPath);
 				runtime.validatedIndexDescriptor = validated;
 			} catch {
 				// A missing index falls back to the authoritative digest re-verification path.
@@ -7808,13 +7920,14 @@ export class SessionManager {
 
 	/** Initialize with a specific session file (used by factory methods). */
 	async #initSessionFile(sessionFile: string, initializeMissing = false): Promise<void> {
-		const resolvedSessionFile = this.storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
+		let strictManagedFallbackEntries: FileEntry[] | undefined;
+		const resolvedSessionFile = this.#storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
 		const sidecarRoot = resolvedSessionFile.endsWith(".jsonl")
 			? resolvedSessionFile.slice(0, -6)
 			: resolvedSessionFile;
 		const publishedSidecarWasPresent =
 			this.#sessionMemoryMode === "enabled" &&
-			this.storage.existsSync(`${sidecarRoot}/.session-memory.spill.commit`);
+			this.#storage.existsSync(`${sidecarRoot}/.session-memory.spill.commit`);
 		if (await this.#tryInitSessionFileFromSidecar(resolvedSessionFile)) {
 			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			return;
@@ -7828,7 +7941,7 @@ export class SessionManager {
 			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			return;
 		}
-		if (initializeMissing && !this.storage.existsSync(resolvedSessionFile)) {
+		if (initializeMissing && !this.#storage.existsSync(resolvedSessionFile)) {
 			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
 			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
 			this.#applyFreshSessionMetadata(fresh);
@@ -7840,9 +7953,18 @@ export class SessionManager {
 			this.#ensuredOnDisk = true;
 			return;
 		}
-		const eagerStat = this.storage.statSync(resolvedSessionFile);
+		if (
+			this.destination.kind === "managed" &&
+			this.#sessionMemoryMode === "enabled" &&
+			process.platform !== "win32"
+		) {
+			const inspected = inspectResumeSessionFile(resolvedSessionFile, this.#storage);
+			if ("kind" in inspected) throw new Error(`Could not open session: ${inspected.reason}`);
+			strictManagedFallbackEntries = inspected.entries;
+		}
+		const eagerStat = this.#statSync(resolvedSessionFile);
 		if (eagerStat.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES) throw new SessionTranscriptOversizedError(eagerStat.size);
-		const entries = await loadEntriesFromFile(resolvedSessionFile, this.storage);
+		const entries = strictManagedFallbackEntries ?? (await loadEntriesFromFile(resolvedSessionFile, this.#storage));
 		if (entries.length === 0) {
 			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
 			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
@@ -7896,7 +8018,7 @@ export class SessionManager {
 		// Strict inspection creates these entries solely for this hydration path. Adopt that
 		// final, validated representation instead of cloning the complete transcript again.
 		const header = entries[0] as SessionHeader;
-		const resolvedSessionFile = this.storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
+		const resolvedSessionFile = this.#storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
 		await resolveBlobRefsInEntries(entries, this.#blobStore);
 		const prepared = this.#prepareResidentTextStoreTransition(
 			{
@@ -7928,7 +8050,7 @@ export class SessionManager {
 	/** Switch to a different session file (used for resume and branching). */
 	async setSessionFile(sessionFile: string, options?: { deferEphemeralArtifactRetirement?: boolean }): Promise<void> {
 		this.#assertRecoveryHydrationWritable();
-		const resolvedSessionFile = this.storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
+		const resolvedSessionFile = this.#storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
 		const strictAdoption = this.#pendingStrictAdoption;
 		let managedTransition: ManagedDestinationTransition | undefined;
 		if (this.destination.kind === "managed") {
@@ -7943,7 +8065,7 @@ export class SessionManager {
 		}
 		try {
 			if (strictAdoption && resolvedSessionFile === strictAdoption.canonicalPath) {
-				const inspected = inspectResumeSessionFile(resolvedSessionFile, this.storage);
+				const inspected = inspectResumeSessionFile(resolvedSessionFile, this.#storage);
 				if ("kind" in inspected || !sameResumeIdentity(strictAdoption.identity, inspected.identity))
 					throw new Error("Prepared session changed before strict adoption.");
 			}
@@ -7952,16 +8074,16 @@ export class SessionManager {
 			if (strictAdoption?.inspection && resolvedSessionFile === strictAdoption.canonicalPath) {
 				entries = strictAdoption.inspection.entries;
 				candidateMigrationApplied = strictAdoption.inspection.migrationApplied;
-			} else if (this.storage.existsSync(resolvedSessionFile)) {
-				const inspected = inspectResumeSessionFile(resolvedSessionFile, this.storage);
+			} else if (this.#storage.existsSync(resolvedSessionFile)) {
+				const inspected = inspectResumeSessionFile(resolvedSessionFile, this.#storage);
 				if ("kind" in inspected) throw new Error(`Could not switch session: ${inspected.reason}`);
 				entries = inspected.entries;
 				candidateMigrationApplied = inspected.migrationApplied;
 			} else {
-				entries = await loadEntriesFromFile(resolvedSessionFile, this.storage);
+				entries = await loadEntriesFromFile(resolvedSessionFile, this.#storage);
 			}
 			if (strictAdoption) {
-				const inspected = inspectResumeSessionFile(resolvedSessionFile, this.storage);
+				const inspected = inspectResumeSessionFile(resolvedSessionFile, this.#storage);
 				if ("kind" in inspected || !sameResumeIdentity(strictAdoption.identity, inspected.identity))
 					throw new Error("Prepared session changed during strict adoption.");
 			}
@@ -7989,7 +8111,7 @@ export class SessionManager {
 					throw error;
 				}
 				if (strictAdoption) {
-					const inspected = inspectResumeSessionFile(resolvedSessionFile, this.storage);
+					const inspected = inspectResumeSessionFile(resolvedSessionFile, this.#storage);
 					if ("kind" in inspected || !sameResumeIdentity(strictAdoption.identity, inspected.identity)) {
 						prepared.dispose();
 						throw new Error("Prepared session changed before strict adoption commit.");
@@ -8236,7 +8358,7 @@ export class SessionManager {
 			if (staleCleanupError) throw staleCleanupError;
 			const dir = path.resolve(stage.sessionFile, "..");
 			const tempPath = path.join(dir, `.${path.basename(stage.sessionFile)}.${Snowflake.next()}.tmp`);
-			const writer = new NdjsonFileWriter(this.storage, tempPath, { flags: "w" });
+			const writer = new NdjsonFileWriter(this.#storage, tempPath, { flags: "w" });
 			stage.persistenceTempPath = tempPath;
 			stage.persistenceWriter = writer;
 			try {
@@ -8373,7 +8495,7 @@ export class SessionManager {
 					Buffer.from(content, "utf8"),
 				);
 			} else {
-				this.storage.writeTextSync(sessionFile, content);
+				this.#storage.writeTextSync(sessionFile, content);
 			}
 		} catch (error) {
 			try {
@@ -8456,7 +8578,7 @@ export class SessionManager {
 						Buffer.from(content, "utf8"),
 					);
 				} else {
-					this.storage.writeTextSync(sessionFile, content);
+					this.#storage.writeTextSync(sessionFile, content);
 				}
 			}
 			return stage;
@@ -8509,6 +8631,11 @@ export class SessionManager {
 			transition.dispose();
 			throw error;
 		}
+		const predecessorRuntime = this.#sidecarRuntime;
+		if (predecessorRuntime) this.#clearColdRuntimeAfterHydration(predecessorRuntime);
+		this.#sidecarRuntime = undefined;
+		this.#releaseManagedSidecarCache();
+		this.#boundedReadStorageProxy = undefined;
 		if (!this.#lifecycleIdAdopted && stage.sessionId === lifecyclePreallocatedSessionId())
 			this.#lifecycleIdAdopted = true;
 		this.#persistChain = Promise.resolve();
@@ -8590,7 +8717,7 @@ export class SessionManager {
 		}
 		if (stage.persistenceTempPath && !stage.persistenceWriter) {
 			try {
-				await this.storage.unlink(stage.persistenceTempPath);
+				await this.#storage.unlink(stage.persistenceTempPath);
 				stage.persistenceTempPath = undefined;
 			} catch (error) {
 				if (!isEnoent(error)) errors.push(toError(error));
@@ -8633,7 +8760,7 @@ export class SessionManager {
 				if (deleted.kind !== "deleted" && deleted.kind !== "already_deleted")
 					throw new Error(`Could not delete managed session: ${deleted.message}`);
 			} else {
-				await this.storage.deleteSessionWithArtifacts(sessionPath);
+				await this.#storage.deleteSessionWithArtifacts(sessionPath);
 			}
 		} catch (err) {
 			if (isEnoent(err)) return;
@@ -8674,7 +8801,7 @@ export class SessionManager {
 			throw new Error("Uncommitted session discard is limited to this manager's configured session directory.");
 		}
 		try {
-			await this.storage.deleteSessionWithArtifacts(canonicalCandidate);
+			await this.#storage.deleteSessionWithArtifacts(canonicalCandidate);
 		} catch (err) {
 			if (isEnoent(err)) return;
 			throw err;
@@ -8730,7 +8857,7 @@ export class SessionManager {
 			// joining the transcript into another whole-file string/Buffer. Retired cold
 			// history was rehydrated above and is therefore not omitted.
 			const publishedSha256 = publishForkTranscriptStreaming(
-				this.storage,
+				this.#storage,
 				newSessionFile,
 				this.destination,
 				entries,
@@ -8748,7 +8875,7 @@ export class SessionManager {
 					sessionFile: newSessionFile,
 					publishedSha256: snapshot.identity.sha256,
 				};
-			} else if (this.storage instanceof FileSessionStorage) {
+			} else if (this.#storage instanceof FileSessionStorage) {
 				forkTranscriptPublication = {
 					kind: "explicit-file",
 					sessionFile: newSessionFile,
@@ -9046,10 +9173,10 @@ export class SessionManager {
 		const previousDestination = this.destination;
 
 		const nextDestination =
-			this.storage instanceof FileSessionStorage
+			this.#storage instanceof FileSessionStorage
 				? managedDestination(
 						resolvedCwd,
-						this.storage,
+						this.#storage,
 						this.destination.kind === "managed" ? this.destination.securityContext.profileAgentDir : undefined,
 					)
 				: this.destination;
@@ -9077,7 +9204,7 @@ export class SessionManager {
 			let managedArtifacts: native.NativeDirectoryTreeSnapshot | undefined;
 			let managedPublishedTranscript!: ReturnType<ManagedSessionDescendantStore["readExpected"]>;
 			let managedPublishedArtifacts: native.NativeDirectoryTreeSnapshot | undefined;
-			hadSessionFile = managedMove ? false : this.storage.existsSync(oldSessionFile);
+			hadSessionFile = managedMove ? false : this.#storage.existsSync(oldSessionFile);
 			let movedSessionFile = false;
 			let movedArtifactDir = false;
 			const materializedEntries = materializeResidentEntriesForReadSync(
@@ -9566,7 +9693,7 @@ export class SessionManager {
 			return undefined;
 		}
 		// Note: caller must await _closePersistWriter() before calling this if switching files
-		this.#persistWriter = new NdjsonFileWriter(this.storage, this.#sessionFile, {
+		this.#persistWriter = new NdjsonFileWriter(this.#storage, this.#sessionFile, {
 			onError: err => {
 				this.#recordPersistError(err);
 			},
@@ -9614,22 +9741,22 @@ export class SessionManager {
 		const dir = path.resolve(targetPath, "..");
 		const backupPath = path.join(dir, `${path.basename(targetPath)}.${Snowflake.next()}.bak`);
 		try {
-			this.storage.renameSync(targetPath, backupPath);
+			this.#storage.renameSync(targetPath, backupPath);
 		} catch (err) {
 			if (isEnoent(err)) {
-				this.storage.renameSync(tempPath, targetPath);
+				this.#storage.renameSync(tempPath, targetPath);
 				return { kind: "replaced" };
 			}
 			throw toError(renameError);
 		}
 
 		try {
-			this.storage.renameSync(tempPath, targetPath);
+			this.#storage.renameSync(tempPath, targetPath);
 		} catch (err) {
 			const replaceError = toError(err);
 			const originalError = toError(renameError);
 			try {
-				this.storage.renameSync(backupPath, targetPath);
+				this.#storage.renameSync(backupPath, targetPath);
 			} catch (rollbackErr) {
 				const rollbackError = toError(rollbackErr);
 				throw new Error(
@@ -9641,7 +9768,7 @@ export class SessionManager {
 		}
 
 		try {
-			this.storage.unlinkSync(backupPath);
+			this.#storage.unlinkSync(backupPath);
 		} catch (err) {
 			if (!isEnoent(err)) {
 				logger.warn("Failed to remove session rewrite backup", {
@@ -9658,22 +9785,22 @@ export class SessionManager {
 		const dir = path.resolve(targetPath, "..");
 		const backupPath = path.join(dir, `${path.basename(targetPath)}.${Snowflake.next()}.bak`);
 		try {
-			await this.storage.rename(targetPath, backupPath);
+			await this.#storage.rename(targetPath, backupPath);
 		} catch (err) {
 			if (isEnoent(err)) {
-				await this.storage.rename(tempPath, targetPath);
+				await this.#storage.rename(tempPath, targetPath);
 				return;
 			}
 			throw toError(renameError);
 		}
 
 		try {
-			await this.storage.rename(tempPath, targetPath);
+			await this.#storage.rename(tempPath, targetPath);
 		} catch (err) {
 			const replaceError = toError(err);
 			const originalError = toError(renameError);
 			try {
-				await this.storage.rename(backupPath, targetPath);
+				await this.#storage.rename(backupPath, targetPath);
 			} catch (rollbackErr) {
 				const rollbackError = toError(rollbackErr);
 				throw new Error(
@@ -9685,7 +9812,7 @@ export class SessionManager {
 		}
 
 		try {
-			await this.storage.unlink(backupPath);
+			await this.#storage.unlink(backupPath);
 		} catch (err) {
 			if (!isEnoent(err)) {
 				logger.warn("Failed to remove session rewrite backup", {
@@ -9699,7 +9826,7 @@ export class SessionManager {
 
 	async #replaceSessionFile(tempPath: string, targetPath: string): Promise<void> {
 		try {
-			await this.storage.rename(tempPath, targetPath);
+			await this.#storage.rename(tempPath, targetPath);
 		} catch (err) {
 			if (!hasFsCode(err, "EPERM")) throw toError(err);
 			await this.#replaceSessionFileAfterEperm(tempPath, targetPath, err);
@@ -9708,7 +9835,7 @@ export class SessionManager {
 
 	#replaceSessionFileSync(tempPath: string, targetPath: string): SessionFileReplacementSyncOutcome {
 		try {
-			this.storage.renameSync(tempPath, targetPath);
+			this.#storage.renameSync(tempPath, targetPath);
 			return { kind: "replaced" };
 		} catch (err) {
 			if (hasFsCode(err, "EPERM")) {
@@ -9812,13 +9939,126 @@ export class SessionManager {
 		this.#managedTranscriptStoreCache = { directory: sessionDir, store };
 		return store;
 	}
+	#releaseManagedSidecarCache(): void {
+		this.#managedSidecarAuthorityStore?.close();
+		this.#managedSidecarSecurityContext?.retainedAuthority?.close();
+		this.#managedSidecarAuthorityStore = undefined;
+		this.#managedSidecarSecurityContext = undefined;
+		this.#managedSidecarCacheStore?.dispose();
+		this.#managedSidecarCacheStore = undefined;
+		this.#managedSidecarCacheSessionFile = undefined;
+		this.#managedRangeExpectedDescriptor = undefined;
+	}
+
+	#isManagedSidecarPath(candidate: string): boolean {
+		const root = this.#managedSidecarCacheStore?.dir;
+		if (!root) return false;
+		const resolvedRoot = path.resolve(root);
+		const resolvedCandidate = path.resolve(candidate);
+		return resolvedCandidate === resolvedRoot || resolvedCandidate.startsWith(`${resolvedRoot}${path.sep}`);
+	}
+	#managedSidecarRoot(sessionFile = this.#sessionFile): string | undefined {
+		if (this.destination.kind !== "managed" || !sessionFile || process.platform === "win32") return undefined;
+		if (this.#managedSidecarCacheStore && this.#managedSidecarCacheSessionFile === sessionFile)
+			return this.#managedSidecarCacheStore.dir;
+		this.#releaseManagedSidecarCache();
+		const instanceDir = openVerifiedResidentCacheInstanceDir(
+			getResidentCacheRootDir(this.#residentCacheProfileAgentDir()),
+		);
+		const cacheParent = path.dirname(instanceDir);
+		let retainedAuthority: native.RecoveryFsRoot | undefined;
+		try {
+			const cacheRoot = managedDirectoryRoot(instanceDir);
+			retainedAuthority = retainManagedDirectoryAuthority(cacheRoot, instanceDir);
+			this.#managedSidecarAuthorityStore = new ManagedSessionDescendantStore(
+				cacheRoot,
+				instanceDir,
+				retainedAuthority ? { authority: retainedAuthority, authorityBaseDir: instanceDir } : undefined,
+				undefined,
+				cacheParent,
+			);
+			this.#managedSidecarSecurityContext = createManagedSessionSecurityContext({
+				agentDir: instanceDir,
+				profileAgentDir: cacheParent,
+				sessionsRoot: instanceDir,
+				sessionDir: instanceDir,
+				rootAuthority: cacheRoot,
+				retainedAuthority,
+			});
+			this.#managedSidecarCacheStore = EphemeralBlobStore.adoptVerifiedDir(instanceDir);
+			this.#managedSidecarCacheSessionFile = sessionFile;
+		} catch (error) {
+			this.#managedSidecarAuthorityStore?.close();
+			retainedAuthority?.close();
+			this.#managedSidecarAuthorityStore = undefined;
+			this.#managedSidecarSecurityContext = undefined;
+			disposeVerifiedResidentCacheInstanceDir(instanceDir);
+			throw error;
+		}
+		return instanceDir;
+	}
+
+	#readRangeSync(filePath: string, start: number, length: number): SessionStorageRangeSnapshot {
+		if (
+			this.destination.kind === "managed" &&
+			this.#sessionFile &&
+			path.resolve(filePath) === path.resolve(this.#sessionFile)
+		) {
+			try {
+				return this.#managedTranscriptStore(filePath).readRangeExpectedSync(
+					path.basename(filePath),
+					start,
+					length,
+					this.#managedRangeExpectedDescriptor,
+				);
+			} catch (error) {
+				if (
+					error instanceof Error &&
+					(error.message === "managed_range_generation_mismatch" || error.message === "source_changed") &&
+					this.#sidecarRuntime
+				)
+					this.#sidecarRuntime.rangeReadGenerationMismatchCount++;
+				throw error;
+			}
+		}
+		if (!this.#storage.readRangeSync) throw new Error("Session range reads are unavailable");
+		return this.#storage.readRangeSync(filePath, start, length);
+	}
+
+	#statSync(filePath: string): SessionStorageStat {
+		if (
+			this.destination.kind === "managed" &&
+			this.#sessionFile &&
+			path.resolve(filePath) === path.resolve(this.#sessionFile)
+		) {
+			const descriptor = this.#managedTranscriptStore(filePath).descriptorExpected(path.basename(filePath));
+			if (!descriptor) throw Object.assign(new Error("Managed file not found"), { code: "ENOENT" });
+			return descriptor;
+		}
+		return this.#storage.statSync(filePath);
+	}
+
+	#boundedReadStorage(): SessionStorage {
+		if (this.destination.kind !== "managed") return this.#storage;
+		this.#boundedReadStorageProxy ??= new Proxy({} as SessionStorage, {
+			get: (_target, property) => {
+				if (property === "readRangeSync") return this.#readRangeSync.bind(this);
+				if (property === "readRange")
+					return async (filePath: string, start: number, length: number) =>
+						this.#readRangeSync(filePath, start, length);
+				if (property === "statSync") return this.#statSync.bind(this);
+				const value = Reflect.get(this.#storage, property, this.#storage);
+				return typeof value === "function" ? value.bind(this.#storage) : value;
+			},
+		});
+		return this.#boundedReadStorageProxy;
+	}
 	/**
-	 * Mutable commit-marker publication for managed destinations, executed inside the
-	 * persistence fence. The transcript is authoritative; the marker is disposable.
-	 * Checked create-while-missing / replace-only-on-exact-present (raw hash +
-	 * descriptor identity) guarantee stale bytes are never published; a diverging
-	 * marker (cross-process mutation) aborts and is left untouched for reopen
-	 * classification. `gen` is the publication fence counter only.
+	 * Publish the mutable disposable commit marker inside the persistence fence.
+	 * Managed sessions use a private verified per-process cache, so an fsynced
+	 * overwrite cannot race another process. Explicit destinations retain checked
+	 * create/replace publication with raw-hash and descriptor identity validation.
+	 * The transcript remains authoritative in both cases.
 	 */
 	#publishSessionCommitMarkerSync(descriptor: SessionStorageStat): boolean {
 		if (this.#sidecarBranchActivationDirty) return false;
@@ -9826,8 +10066,6 @@ export class SessionManager {
 		if (!sessionFile) return false;
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled || runtime.tail.transcriptSize !== descriptor.size) return false;
-		const options =
-			this.destination.kind === "managed" ? { securityContext: this.destination.securityContext } : undefined;
 		return this.#withSessionPersistenceFenceSync(() => {
 			const markerPath = runtime.commitPath;
 			const gen = this.#commitGen + 1;
@@ -9896,32 +10134,39 @@ export class SessionManager {
 			};
 			const bytes = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
 			try {
-				const current =
-					this.destination.kind === "managed"
-						? readSessionCommitMarkerSync(this.storage, markerPath)
-						: !this.storage.existsSync(markerPath)
-							? ({ kind: "missing" } as const)
-							: (() => {
-									if (!this.storage.readRangeSync) throw new Error("commit_marker_range_read_unavailable");
-									const stat = this.storage.statSync(markerPath);
-									if (stat.size > 8 * 1024 * 1024) throw new Error("commit_marker_oversized");
-									const markerBytes = this.storage.readRangeSync(markerPath, 0, stat.size).bytes;
-									return {
-										kind: "present" as const,
-										rawBytesSha256: crypto.createHash("sha256").update(markerBytes).digest("hex"),
-										stat,
-									};
-								})();
+				if (this.destination.kind === "managed") {
+					const writer = this.#storage.openWriter(markerPath, { flags: "w" });
+					try {
+						writer.writeLineSync(bytes.toString("utf8"));
+						if (!writer.fsyncSync) throw new Error("Synchronous commit marker fsync is unavailable");
+						writer.fsyncSync();
+					} finally {
+						writer.closeSync();
+					}
+					this.#managedRangeExpectedDescriptor = descriptor;
+					this.#commitGen = gen;
+					return true;
+				}
+				const current = !this.#storage.existsSync(markerPath)
+					? ({ kind: "missing" } as const)
+					: (() => {
+							if (!this.#storage.readRangeSync) throw new Error("commit_marker_range_read_unavailable");
+							const stat = this.#storage.statSync(markerPath);
+							if (stat.size > 8 * 1024 * 1024) throw new Error("commit_marker_oversized");
+							const markerBytes = this.#storage.readRangeSync(markerPath, 0, stat.size).bytes;
+							return {
+								kind: "present" as const,
+								rawBytesSha256: crypto.createHash("sha256").update(markerBytes).digest("hex"),
+								stat,
+							};
+						})();
 				if (current.kind === "missing") {
-					createSessionCommitMarkerCheckedSync(this.storage, markerPath, bytes, options);
+					createSessionCommitMarkerCheckedSync(this.#storage, markerPath, bytes);
 				} else {
-					replaceSessionCommitMarkerCheckedSync(
-						this.storage,
-						markerPath,
-						bytes,
-						{ rawBytesSha256: current.rawBytesSha256, descriptorIdentity: current.stat },
-						options,
-					);
+					replaceSessionCommitMarkerCheckedSync(this.#storage, markerPath, bytes, {
+						rawBytesSha256: current.rawBytesSha256,
+						descriptorIdentity: current.stat,
+					});
 				}
 				this.#commitGen = gen;
 				return true;
@@ -9941,7 +10186,7 @@ export class SessionManager {
 				? this.#managedTranscriptStore(sessionFile).descriptorExpected(path.basename(sessionFile))
 				: (() => {
 						try {
-							return this.storage.statSync(sessionFile);
+							return this.#storage.statSync(sessionFile);
 						} catch {
 							return null;
 						}
@@ -9956,7 +10201,7 @@ export class SessionManager {
 	/** Create (or reset) the sidecar runtime for the current lifecycle. */
 	#resetSidecarRuntime(ineligible = false): SessionMemorySidecarRuntime {
 		this.#sidecarBranchActivationDirty = false;
-		if (this.#sessionFile) {
+		if (this.#sessionFile && this.destination.kind !== "managed") {
 			for (const legacyPath of [
 				`${this.#sessionFile}.spill.idx`,
 				`${this.#sessionFile}.spill.tail`,
@@ -9967,19 +10212,28 @@ export class SessionManager {
 				metadataDeltaPathFor(`${this.#sessionFile}.spill.idx`),
 			]) {
 				try {
-					this.storage.unlinkSync(legacyPath);
+					this.#storage.unlinkSync(legacyPath);
 				} catch {
 					// Legacy sidecars are disposable and may be absent.
 				}
 			}
 		}
-		const sidecarRoot = this.#sessionFile?.endsWith(".jsonl") ? this.#sessionFile.slice(0, -6) : this.#sessionFile;
+		const sidecarRoot =
+			this.destination.kind === "managed"
+				? this.#managedSidecarRoot()
+				: this.#sessionFile?.endsWith(".jsonl")
+					? this.#sessionFile.slice(0, -6)
+					: this.#sessionFile;
+		this.#managedRangeExpectedDescriptor =
+			this.destination.kind === "managed" && this.#sessionFile
+				? (this.#managedDescriptorSnapshotOrNull() ?? undefined)
+				: undefined;
 		const parentPathPrefix = sidecarRoot ? `${sidecarRoot}/.session-memory.spill.parent-` : "";
 		const dictionaryPathPrefix = sidecarRoot ? `${sidecarRoot}/.session-memory.spill.dict-part-` : "";
 		const dictionaryMetaPath = sidecarRoot ? `${sidecarRoot}/.session-memory.spill.dict-meta` : "";
 		const metadataDeltaPath = sidecarRoot ? `${sidecarRoot}/.session-memory.spill.metadata-delta` : "";
 		if (sidecarRoot) {
-			for (const candidate of this.storage.listFilesSync(sidecarRoot, ".*")) {
+			for (const candidate of this.#storage.listFilesSync(sidecarRoot, ".*")) {
 				const name = path.basename(candidate);
 				const orphaned =
 					name.endsWith(".tmp") ||
@@ -9988,7 +10242,7 @@ export class SessionManager {
 					name.includes(".spill.overlay-");
 				if (!orphaned || !isDerivedSessionMemoryFile(candidate)) continue;
 				try {
-					this.storage.unlinkSync(candidate);
+					this.#storage.unlinkSync(candidate);
 				} catch {
 					// Derived crash debris is best-effort cleanup; authoritative startup continues.
 				}
@@ -10055,11 +10309,11 @@ export class SessionManager {
 	}
 
 	#transcriptContainsPatchRecords(): boolean {
-		if (!this.#sessionFile || typeof this.storage.readRangeSync !== "function") return true;
-		const readRangeSync = this.storage.readRangeSync.bind(this.storage);
+		if (!this.#sessionFile || typeof this.#storage.readRangeSync !== "function") return true;
+		const readRangeSync = this.#readRangeSync.bind(this);
 		let size: number;
 		try {
-			size = this.storage.statSync(this.#sessionFile).size;
+			size = this.#statSync(this.#sessionFile).size;
 		} catch {
 			return true;
 		}
@@ -10075,10 +10329,7 @@ export class SessionManager {
 
 	/** Build a fresh disposable `.spill.idx`/`.spill.tail`/`.spill.commit` set from the transcript. */
 	#buildDisposableSidecars(entries: readonly FileEntry[]): void {
-		if (this.destination.kind === "managed") {
-			// Retained managed authority does not expose bounded range or staged sidecar APIs.
-			// Keep managed sessions on the eager transcript path rather than publishing
-			// disposable proof through generic pathname-based storage operations.
+		if (this.destination.kind === "managed" && process.platform === "win32") {
 			this.#sidecarRuntime = undefined;
 			return;
 		}
@@ -10111,7 +10362,7 @@ export class SessionManager {
 				for (const sidecarPath of this.#disposableSidecarPaths()) {
 					if (!sidecarPath) continue;
 					try {
-						this.storage.unlinkSync(sidecarPath);
+						this.#storage.unlinkSync(sidecarPath);
 					} catch {
 						// Disposable cleanup is best-effort; the transcript remains authoritative.
 					}
@@ -10179,7 +10430,7 @@ export class SessionManager {
 			!this.#sessionFile ||
 			!runtime.indexPath ||
 			!runtime.tailPath ||
-			typeof this.storage.readRangeSync !== "function"
+			typeof this.#storage.readRangeSync !== "function"
 		)
 			return;
 		const sessionEntries = entries.filter((entry): entry is SessionEntry => entry.type !== "session");
@@ -10275,7 +10526,7 @@ export class SessionManager {
 		const secondaryArtifactsEligible =
 			enabledBuild &&
 			sessionEntries.length <= PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS &&
-			this.storage.statSync(this.#sessionFile).size <= PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES;
+			this.#statSync(this.#sessionFile).size <= PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES;
 		const partitionHashes = Array.from({ length: DICTIONARY_PARTITION_COUNT }, () => crypto.createHash("sha256"));
 		const partitionSizes = new Array<number>(DICTIONARY_PARTITION_COUNT).fill(0);
 		const partitionRecords = new Array<number>(DICTIONARY_PARTITION_COUNT).fill(0);
@@ -10284,8 +10535,8 @@ export class SessionManager {
 			target: this.#createDictionaryFlushTarget(partitionHashes, partitionSizes, partitionRecords),
 		});
 		try {
-			indexWriter = this.storage.openWriter(runtime.indexPath, { flags: "w" });
-			tailWriter = this.storage.openWriter(runtime.tailPath, { flags: "w" });
+			indexWriter = this.#storage.openWriter(runtime.indexPath, { flags: "w" });
+			tailWriter = this.#storage.openWriter(runtime.tailPath, { flags: "w" });
 			this.#truncateDerivedArtifactFiles(secondaryArtifactsEligible);
 			runtime.metadataDelta = this.#createMetadataDeltaRuntimeState();
 			for (const item of sortedProviderState) {
@@ -10400,7 +10651,7 @@ export class SessionManager {
 		}
 		if (operationError ?? closeError) throw operationError ?? closeError;
 		if (tailOverflow) {
-			const truncateTail = this.storage.openWriter(runtime.tailPath, { flags: "w" });
+			const truncateTail = this.#storage.openWriter(runtime.tailPath, { flags: "w" });
 			let durabilityError: unknown;
 			try {
 				if (!truncateTail.fsyncSync) throw new Error("Synchronous sidecar fsync is unavailable");
@@ -10430,7 +10681,7 @@ export class SessionManager {
 				...dictionaryPartitionPaths(runtime.indexPath),
 			]) {
 				try {
-					this.storage.unlinkSync(sidecarPath);
+					this.#storage.unlinkSync(sidecarPath);
 				} catch {
 					// Disposable sidecar cleanup is best-effort; eager transcript state remains authoritative.
 				}
@@ -10471,7 +10722,7 @@ export class SessionManager {
 			// parent/dictionary artifacts remain disabled because shadow never retires.
 		}
 		try {
-			const validated = this.storage.statSync(runtime.indexPath);
+			const validated = this.#storage.statSync(runtime.indexPath);
 			runtime.validatedIndexDescriptor = validated;
 		} catch {
 			// A missing index falls back to the authoritative digest re-verification path.
@@ -10497,7 +10748,7 @@ export class SessionManager {
 		if (!runtime?.parentPathPrefix) return;
 		for (const path of parentBucketPaths(runtime.indexPath)) {
 			try {
-				this.storage.unlinkSync(path);
+				this.#storage.unlinkSync(path);
 			} catch {
 				// Disposable buckets are best-effort cleanup; transcript authority is unaffected.
 			}
@@ -10528,13 +10779,13 @@ export class SessionManager {
 				const records = result.buckets[bucket];
 				if (records.length === 0) {
 					try {
-						this.storage.unlinkSync(this.#parentBucketPath(bucket));
+						this.#storage.unlinkSync(this.#parentBucketPath(bucket));
 					} catch {
 						// An absent bucket is fine; an unlink failure is best-effort.
 					}
 					continue;
 				}
-				const writer = this.storage.openWriter(this.#parentBucketPath(bucket), { flags: "w" });
+				const writer = this.#storage.openWriter(this.#parentBucketPath(bucket), { flags: "w" });
 				try {
 					for (const line of records) writer.writeLineSync(line);
 					if (!writer.fsyncSync) throw new Error("Synchronous parent bucket fsync is unavailable");
@@ -10659,7 +10910,7 @@ export class SessionManager {
 		if (!runtime) return;
 		for (const path of [runtime.dictionaryMetaPath, ...dictionaryPartitionPaths(runtime.indexPath)]) {
 			try {
-				this.storage.unlinkSync(path);
+				this.#storage.unlinkSync(path);
 			} catch {
 				// Disposable dictionary files are best-effort cleanup; transcript authority is unaffected.
 			}
@@ -10673,7 +10924,7 @@ export class SessionManager {
 		const paths = [runtime.dictionaryMetaPath, ...dictionaryPartitionPaths(runtime.indexPath)];
 		for (const path of paths) {
 			try {
-				const writer = this.storage.openWriter(path, { flags: "w" });
+				const writer = this.#storage.openWriter(path, { flags: "w" });
 				try {
 					if (!writer.fsyncSync) throw new Error("Synchronous sidecar fsync is unavailable");
 					writer.fsyncSync();
@@ -10691,7 +10942,7 @@ export class SessionManager {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime) return false;
 		try {
-			const writer = this.storage.openWriter(this.#dictionaryPartitionPath(partition), { flags: "a" });
+			const writer = this.#storage.openWriter(this.#dictionaryPartitionPath(partition), { flags: "a" });
 			try {
 				for (const line of lines) writer.writeLineSync(line);
 				if (!writer.fsyncSync) throw new Error("Synchronous dictionary partition fsync is unavailable");
@@ -10748,7 +10999,7 @@ export class SessionManager {
 		if (!runtime) return false;
 		const meta = finalizeDictionaryArtifactCommit(result.commit);
 		try {
-			const writer = this.storage.openWriter(runtime.dictionaryMetaPath, { flags: "w" });
+			const writer = this.#storage.openWriter(runtime.dictionaryMetaPath, { flags: "w" });
 			try {
 				writer.writeLineSync(meta.bytes);
 				if (!writer.fsyncSync) throw new Error("Synchronous dictionary meta fsync is unavailable");
@@ -10778,7 +11029,7 @@ export class SessionManager {
 			partitionRecords,
 		};
 		try {
-			runtime.dictionary.validatedDescriptor = this.storage.statSync(runtime.dictionaryMetaPath);
+			runtime.dictionary.validatedDescriptor = this.#storage.statSync(runtime.dictionaryMetaPath);
 		} catch {
 			// A missing meta falls back to the authoritative digest re-verification path.
 		}
@@ -10854,14 +11105,14 @@ export class SessionManager {
 		if (parsed.indexDigest !== runtime.indexDigest) return reject();
 		if (parsed.sidecarIneligible || parsed.duplicateIds.length > 0) return reject();
 		if (parsed.partitions.some(partition => !partition.complete)) return reject();
-		if (typeof this.storage.readRangeSync !== "function") return reject();
+		if (typeof this.#storage.readRangeSync !== "function") return reject();
 		try {
-			const metaStat = this.storage.statSync(runtime.dictionaryMetaPath);
+			const metaStat = this.#storage.statSync(runtime.dictionaryMetaPath);
 			if (metaStat.size !== parsed.metaSize) return reject();
 			const metaHash = crypto.createHash("sha256");
 			for (let offset = 0; offset < parsed.metaSize; offset += 64 * 1024) {
 				const length = Math.min(64 * 1024, parsed.metaSize - offset);
-				metaHash.update(this.storage.readRangeSync(runtime.dictionaryMetaPath, offset, length).bytes);
+				metaHash.update(this.#storage.readRangeSync(runtime.dictionaryMetaPath, offset, length).bytes);
 			}
 			if (metaHash.digest("hex") !== parsed.metaDigest) return reject();
 		} catch {
@@ -10873,14 +11124,14 @@ export class SessionManager {
 		for (let partition = 0; partition < parsed.partitions.length; partition++) {
 			const committed = parsed.partitions[partition]!;
 			try {
-				const stat = this.storage.statSync(this.#dictionaryPartitionPath(partition));
+				const stat = this.#storage.statSync(this.#dictionaryPartitionPath(partition));
 				if (stat.size !== committed.size) return reject();
 				// The verification hash keeps the full partition byte state so it
 				// doubles as the append-time running hash (seeded with exact bytes).
 				const hash = crypto.createHash("sha256");
 				for (let offset = 0; offset < committed.size; offset += 64 * 1024) {
 					const length = Math.min(64 * 1024, committed.size - offset);
-					hash.update(this.storage.readRangeSync(this.#dictionaryPartitionPath(partition), offset, length).bytes);
+					hash.update(this.#storage.readRangeSync(this.#dictionaryPartitionPath(partition), offset, length).bytes);
 					if ((offset & (4 * 1024 * 1024 - 1)) === 0) Bun.gc(true);
 				}
 				if (hash.copy().digest("hex") !== committed.digest) return reject();
@@ -10910,7 +11161,7 @@ export class SessionManager {
 			partitionRecords: adoptedRecords,
 		};
 		try {
-			runtime.dictionary.validatedDescriptor = this.storage.statSync(runtime.dictionaryMetaPath);
+			runtime.dictionary.validatedDescriptor = this.#storage.statSync(runtime.dictionaryMetaPath);
 		} catch {
 			// Re-verification happens on first use.
 		}
@@ -10953,7 +11204,7 @@ export class SessionManager {
 		const recordBytes = Buffer.byteLength(recordLine, "utf8");
 		if (recordBytes > dictionary.budgetBytes) return false;
 		try {
-			const writer = this.storage.openWriter(this.#dictionaryPartitionPath(partition), { flags: "a" });
+			const writer = this.#storage.openWriter(this.#dictionaryPartitionPath(partition), { flags: "a" });
 			try {
 				writer.writeLineSync(recordLine);
 				if (!writer.fsyncSync) throw new Error("Synchronous dictionary partition fsync is unavailable");
@@ -10995,7 +11246,7 @@ export class SessionManager {
 		};
 		const meta = finalizeDictionaryArtifactCommit(commit);
 		try {
-			const metaWriter = this.storage.openWriter(runtime.dictionaryMetaPath, { flags: "w" });
+			const metaWriter = this.#storage.openWriter(runtime.dictionaryMetaPath, { flags: "w" });
 			try {
 				metaWriter.writeLineSync(meta.bytes);
 				if (!metaWriter.fsyncSync) throw new Error("Synchronous dictionary meta fsync is unavailable");
@@ -11009,7 +11260,7 @@ export class SessionManager {
 		dictionary.metaSize = meta.commit.metaSize;
 		dictionary.metaDigest = meta.commit.metaDigest;
 		try {
-			dictionary.validatedDescriptor = this.storage.statSync(runtime.dictionaryMetaPath);
+			dictionary.validatedDescriptor = this.#storage.statSync(runtime.dictionaryMetaPath);
 		} catch {
 			// Re-verification happens on first use.
 		}
@@ -11029,11 +11280,11 @@ export class SessionManager {
 	#findColdEntryIndexFromDictionary(id: string): ColdEntryIndex | undefined {
 		const runtime = this.#sidecarRuntime;
 		const dictionary = runtime?.dictionary;
-		if (!dictionary || typeof this.storage.readRangeSync !== "function") return undefined;
+		if (!dictionary || typeof this.#storage.readRangeSync !== "function") return undefined;
 		if (dictionary.indexDigest !== runtime.indexDigest) return undefined;
 		let indexStat: SessionStorageStat;
 		try {
-			indexStat = this.storage.statSync(runtime.indexPath);
+			indexStat = this.#storage.statSync(runtime.indexPath);
 		} catch {
 			return undefined;
 		}
@@ -11044,7 +11295,7 @@ export class SessionManager {
 		if (!committed?.complete || committed.size === 0) return undefined;
 		let partitionStat: SessionStorageStat;
 		try {
-			partitionStat = this.storage.statSync(this.#dictionaryPartitionPath(partition));
+			partitionStat = this.#storage.statSync(this.#dictionaryPartitionPath(partition));
 		} catch {
 			return undefined;
 		}
@@ -11063,7 +11314,7 @@ export class SessionManager {
 			const length = Math.min(64 * 1024, committed.size - offset);
 			let bytes: Uint8Array;
 			try {
-				bytes = this.storage.readRangeSync(this.#dictionaryPartitionPath(partition), offset, length).bytes;
+				bytes = this.#storage.readRangeSync(this.#dictionaryPartitionPath(partition), offset, length).bytes;
 			} catch {
 				return undefined;
 			}
@@ -11156,7 +11407,7 @@ export class SessionManager {
 		if (!delta) return undefined;
 		if (delta.size + lineBytes.byteLength > delta.budgetBytes) return undefined;
 		try {
-			const writer = this.storage.openWriter(runtime.metadataDeltaPath, { flags: delta.size === 0 ? "w" : "a" });
+			const writer = this.#storage.openWriter(runtime.metadataDeltaPath, { flags: delta.size === 0 ? "w" : "a" });
 			try {
 				writer.writeLineSync(Buffer.from(lineBytes).toString("utf8"));
 				if (!writer.fsyncSync) throw new Error("Synchronous metadata-delta fsync is unavailable");
@@ -11278,12 +11529,12 @@ export class SessionManager {
 			if (providerKeys.has(value.key)) return false;
 			providerKeys.add(value.key);
 		}
-		if (typeof this.storage.readRangeSync !== "function") return false;
+		if (typeof this.#storage.readRangeSync !== "function") return false;
 		let fileBytes: Uint8Array;
 		try {
-			const stat = this.storage.statSync(runtime.metadataDeltaPath);
+			const stat = this.#storage.statSync(runtime.metadataDeltaPath);
 			if (stat.size !== commit.size) return false;
-			fileBytes = this.storage.readRangeSync(runtime.metadataDeltaPath, 0, commit.size).bytes;
+			fileBytes = this.#storage.readRangeSync(runtime.metadataDeltaPath, 0, commit.size).bytes;
 		} catch {
 			return false;
 		}
@@ -11328,7 +11579,7 @@ export class SessionManager {
 		runtime.metadataDelta = delta;
 		this.#syncMetadataDeltaDescriptorBytes();
 		try {
-			delta.validatedDescriptor = this.storage.statSync(runtime.metadataDeltaPath);
+			delta.validatedDescriptor = this.#storage.statSync(runtime.metadataDeltaPath);
 		} catch {
 			// Re-verification happens on first use.
 		}
@@ -11357,12 +11608,12 @@ export class SessionManager {
 				.map(key => inlineByKey.get(key))
 				.filter((entry): entry is SessionEntry => entry !== undefined);
 		}
-		if (typeof this.storage.readRangeSync !== "function") return undefined;
+		if (typeof this.#storage.readRangeSync !== "function") return undefined;
 		let fileBytes: Uint8Array;
 		try {
-			const stat = this.storage.statSync(runtime.metadataDeltaPath);
+			const stat = this.#storage.statSync(runtime.metadataDeltaPath);
 			if (stat.size !== delta.size) return undefined;
-			fileBytes = this.storage.readRangeSync(runtime.metadataDeltaPath, 0, delta.size).bytes;
+			fileBytes = this.#storage.readRangeSync(runtime.metadataDeltaPath, 0, delta.size).bytes;
 		} catch {
 			return undefined;
 		}
@@ -11424,12 +11675,12 @@ export class SessionManager {
 		});
 		const recordBytes = Buffer.byteLength(recordLine, "utf8");
 		try {
-			if (typeof this.storage.readRangeSync !== "function") return false;
+			if (typeof this.#storage.readRangeSync !== "function") return false;
 			let currentBytes: Uint8Array;
 			try {
-				const current = this.storage.statSync(this.#parentBucketPath(bucket));
+				const current = this.#storage.statSync(this.#parentBucketPath(bucket));
 				if (current.size !== bucketState.size || current.size > PARENT_CHILDREN_BUDGET_BYTES) return false;
-				currentBytes = this.storage.readRangeSync(this.#parentBucketPath(bucket), 0, current.size).bytes;
+				currentBytes = this.#storage.readRangeSync(this.#parentBucketPath(bucket), 0, current.size).bytes;
 			} catch {
 				if (bucketState.size !== 0) return false;
 				currentBytes = Buffer.alloc(0);
@@ -11439,7 +11690,7 @@ export class SessionManager {
 			const childCount = countParentBucketRecords(currentBytes, parentId);
 			if (childCount >= PARENT_CHILDREN_MAX_CHILDREN_PER_PARENT) return false;
 			if (artifact.totalBytes + recordBytes > artifact.budgetBytes) return false;
-			const writer = this.storage.openWriter(this.#parentBucketPath(bucket), { flags: "a" });
+			const writer = this.#storage.openWriter(this.#parentBucketPath(bucket), { flags: "a" });
 			try {
 				writer.writeLineSync(recordLine);
 				if (!writer.fsyncSync) throw new Error("Synchronous parent bucket fsync is unavailable");
@@ -11447,8 +11698,8 @@ export class SessionManager {
 			} finally {
 				writer.closeSync();
 			}
-			const after = this.storage.statSync(this.#parentBucketPath(bucket));
-			const afterBytes = this.storage.readRangeSync(this.#parentBucketPath(bucket), 0, after.size).bytes;
+			const after = this.#storage.statSync(this.#parentBucketPath(bucket));
+			const afterBytes = this.#storage.readRangeSync(this.#parentBucketPath(bucket), 0, after.size).bytes;
 			bucketState.size = after.size;
 			bucketState.digest = crypto.createHash("sha256").update(afterBytes).digest("hex");
 			artifact.totalBytes = artifact.buckets.reduce((total, bucket) => total + bucket.size, 0);
@@ -11476,7 +11727,7 @@ export class SessionManager {
 			this.#invalidateParentArtifact();
 			return undefined;
 		};
-		if (typeof this.storage.readRangeSync !== "function") return undefined;
+		if (typeof this.#storage.readRangeSync !== "function") return undefined;
 		const bucket = parentBucketForId(parentId, artifact.buckets.length);
 		const committed = artifact.buckets[bucket];
 		if (!committed) return undefined;
@@ -11485,9 +11736,9 @@ export class SessionManager {
 		let bucketStat: SessionStorageStat;
 		let bytes: Uint8Array;
 		try {
-			bucketStat = this.storage.statSync(this.#parentBucketPath(bucket));
+			bucketStat = this.#storage.statSync(this.#parentBucketPath(bucket));
 			if (bucketStat.size !== committed.size || bucketStat.size > PARENT_CHILDREN_BUDGET_BYTES) return fail();
-			bytes = this.storage.readRangeSync(this.#parentBucketPath(bucket), 0, bucketStat.size).bytes;
+			bytes = this.#storage.readRangeSync(this.#parentBucketPath(bucket), 0, bucketStat.size).bytes;
 		} catch {
 			return fail();
 		}
@@ -11595,7 +11846,7 @@ export class SessionManager {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.parentPathPrefix || bucketIndex === undefined) return false;
 		try {
-			const current = this.storage.statSync(this.#parentBucketPath(bucketIndex));
+			const current = this.#storage.statSync(this.#parentBucketPath(bucketIndex));
 			return sameDescriptor(current, descriptor);
 		} catch {
 			return false;
@@ -11620,12 +11871,12 @@ export class SessionManager {
 	#validateColdBase(base = this.#sidecarRuntime?.base): boolean {
 		const runtime = this.#sidecarRuntime;
 		const sessionFile = this.#sessionFile;
-		if (!runtime?.enabled || !base || !sessionFile || typeof this.storage.readRangeSync !== "function") return false;
+		if (!runtime?.enabled || !base || !sessionFile || typeof this.#storage.readRangeSync !== "function") return false;
 		const hash = crypto.createHash("sha256");
 		try {
 			for (let offset = 0; offset < base.baseEndOffset; offset += 64 * 1024) {
 				const length = Math.min(64 * 1024, base.baseEndOffset - offset);
-				hash.update(this.storage.readRangeSync(sessionFile, offset, length).bytes);
+				hash.update(this.#readRangeSync(sessionFile, offset, length).bytes);
 				if (((offset + length) & (8 * 1024 * 1024 - 1)) === 0) Bun.gc(true);
 			}
 		} catch {
@@ -11727,14 +11978,14 @@ export class SessionManager {
 
 	#coldIndexDigestValid(): boolean {
 		const runtime = this.#sidecarRuntime;
-		if (!runtime?.enabled || !runtime.indexPath || typeof this.storage.readRangeSync !== "function") return false;
+		if (!runtime?.enabled || !runtime.indexPath || typeof this.#storage.readRangeSync !== "function") return false;
 		let descriptor: SessionStorageStat;
 		try {
-			descriptor = this.storage.statSync(runtime.indexPath);
+			descriptor = this.#storage.statSync(runtime.indexPath);
 			const hash = crypto.createHash("sha256");
 			for (let offset = 0; offset < descriptor.size; offset += 64 * 1024) {
 				const length = Math.min(64 * 1024, descriptor.size - offset);
-				hash.update(this.storage.readRangeSync(runtime.indexPath, offset, length).bytes);
+				hash.update(this.#storage.readRangeSync(runtime.indexPath, offset, length).bytes);
 			}
 			const valid = hash.digest("hex") === runtime.indexDigest;
 			if (valid) runtime.validatedIndexDescriptor = descriptor;
@@ -11746,16 +11997,16 @@ export class SessionManager {
 
 	#coldTailMatchesDisk(): boolean {
 		const runtime = this.#sidecarRuntime;
-		if (!runtime?.enabled || !runtime.tailPath || typeof this.storage.readRangeSync !== "function") return false;
+		if (!runtime?.enabled || !runtime.tailPath || typeof this.#storage.readRangeSync !== "function") return false;
 		let size: number;
 		try {
-			size = this.storage.statSync(runtime.tailPath).size;
+			size = this.#storage.statSync(runtime.tailPath).size;
 		} catch {
 			return false;
 		}
 		if (size > runtime.tailCache.budgetBytes) return false;
 		let ordinal = 0;
-		const failure = scanTranscriptLinesBounded(this.storage, runtime.tailPath, size, (_offset, lineBytes) => {
+		const failure = scanTranscriptLinesBounded(this.#storage, runtime.tailPath, size, (_offset, lineBytes) => {
 			const expected = runtime.tail.records[ordinal++];
 			if (!expected) return false;
 			try {
@@ -11770,11 +12021,12 @@ export class SessionManager {
 
 	#findColdEntryIndex(id: string, cacheLocality = true): ColdEntryIndex | undefined {
 		const runtime = this.#sidecarRuntime;
-		if (!runtime?.enabled || !runtime.indexPath || typeof this.storage.readRangeSync !== "function") return undefined;
+		if (!runtime?.enabled || !runtime.indexPath || typeof this.#storage.readRangeSync !== "function")
+			return undefined;
 		const cached = runtime.coldEntries.get(id);
 		if (cached) {
 			try {
-				const current = this.storage.statSync(runtime.indexPath);
+				const current = this.#storage.statSync(runtime.indexPath);
 				if (runtime.validatedIndexDescriptor && sameDescriptor(runtime.validatedIndexDescriptor, current))
 					return cached;
 			} catch {
@@ -11791,7 +12043,7 @@ export class SessionManager {
 		if (!this.#coldIndexDigestValid()) return undefined;
 		let size: number;
 		try {
-			size = this.storage.statSync(runtime.indexPath).size;
+			size = this.#storage.statSync(runtime.indexPath).size;
 		} catch {
 			return undefined;
 		}
@@ -11803,7 +12055,7 @@ export class SessionManager {
 			const length = Math.min(64 * 1024, size - offset);
 			let bytes: Uint8Array;
 			try {
-				bytes = this.storage.readRangeSync(runtime.indexPath, offset, length).bytes;
+				bytes = this.#storage.readRangeSync(runtime.indexPath, offset, length).bytes;
 			} catch {
 				return undefined;
 			}
@@ -11864,11 +12116,11 @@ export class SessionManager {
 
 	#validateColdIndexCoverage(sessionFile: string, transcriptSize: number, expectedDigest: string): boolean {
 		const runtime = this.#sidecarRuntime;
-		if (!runtime?.indexPath || typeof this.storage.readRangeSync !== "function") return false;
-		const memoryIds = this.storage instanceof FileSessionStorage ? undefined : new BoundedColdIdHashSet();
+		if (!runtime?.indexPath || typeof this.#storage.readRangeSync !== "function") return false;
+		const memoryIds = this.#storage instanceof FileSessionStorage ? undefined : new BoundedColdIdHashSet();
 		let diskIds: DiskBackedIdUniquenessCheck | undefined;
 		try {
-			if (this.storage instanceof FileSessionStorage) diskIds = new DiskBackedIdUniquenessCheck();
+			if (this.#storage instanceof FileSessionStorage) diskIds = new DiskBackedIdUniquenessCheck();
 		} catch {
 			return false;
 		}
@@ -11879,12 +12131,12 @@ export class SessionManager {
 		const indexHash = crypto.createHash("sha256");
 		let size: number;
 		try {
-			size = this.storage.statSync(runtime.indexPath).size;
+			size = this.#storage.statSync(runtime.indexPath).size;
 		} catch {
 			diskIds?.dispose();
 			return false;
 		}
-		const failure = scanTranscriptLinesBounded(this.storage, runtime.indexPath, size, (_offset, lineBytes) => {
+		const failure = scanTranscriptLinesBounded(this.#storage, runtime.indexPath, size, (_offset, lineBytes) => {
 			indexHash.update(lineBytes);
 			try {
 				const value = JSON.parse(decodeBoundedJsonLine(lineBytes)) as Partial<ColdEntryIndex> & { id?: unknown };
@@ -11934,7 +12186,7 @@ export class SessionManager {
 			return false;
 		if (firstOffset > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return false;
 		try {
-			const headerBytes = this.storage.readRangeSync(sessionFile, 0, firstOffset).bytes;
+			const headerBytes = this.#readRangeSync(sessionFile, 0, firstOffset).bytes;
 			const headerValid =
 				headerBytes.byteLength === firstOffset &&
 				headerBytes.at(-1) === 0x0a &&
@@ -11948,12 +12200,12 @@ export class SessionManager {
 
 	#readAllColdEntryIndexes(): Array<ColdEntryIndex & { id: string }> {
 		const runtime = this.#sidecarRuntime;
-		if (!runtime?.enabled || !runtime.indexPath || typeof this.storage.readRangeSync !== "function")
+		if (!runtime?.enabled || !runtime.indexPath || typeof this.#storage.readRangeSync !== "function")
 			throw new Error("cold_index_unavailable");
 		if (!this.#coldIndexDigestValid()) throw new Error("cold_index_invalid");
 		let size: number;
 		try {
-			size = this.storage.statSync(runtime.indexPath).size;
+			size = this.#storage.statSync(runtime.indexPath).size;
 		} catch {
 			throw new Error("cold_index_unavailable");
 		}
@@ -11963,7 +12215,7 @@ export class SessionManager {
 		let carry = "";
 		for (let offset = 0; offset < size; offset += 64 * 1024) {
 			const length = Math.min(64 * 1024, size - offset);
-			const bytes = this.storage.readRangeSync(runtime.indexPath, offset, length).bytes;
+			const bytes = this.#storage.readRangeSync(runtime.indexPath, offset, length).bytes;
 			const lines = (carry + decoder.decode(bytes, { stream: offset + length < size })).split("\n");
 			carry = lines.pop() ?? "";
 			for (const line of lines) {
@@ -12006,7 +12258,7 @@ export class SessionManager {
 		const first = result[0];
 		if (!first || first.byteOffset > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES || !this.#sessionFile)
 			throw new Error("cold_index_incomplete");
-		const headerBytes = this.storage.readRangeSync(this.#sessionFile, 0, first.byteOffset).bytes;
+		const headerBytes = this.#readRangeSync(this.#sessionFile, 0, first.byteOffset).bytes;
 		if (
 			headerBytes.byteLength !== first.byteOffset ||
 			headerBytes.at(-1) !== 0x0a ||
@@ -12024,21 +12276,12 @@ export class SessionManager {
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile) return undefined;
 		try {
-			if (typeof this.storage.readRangeSync === "function") {
-				const runtime = this.#sidecarRuntime;
-				if (runtime) runtime.rangeReadCount++;
-				const snapshot = this.storage.readRangeSync(sessionFile, index.byteOffset, index.byteLength);
-				return snapshot.bytes;
-			}
-			if (this.destination.kind === "managed") {
-				const snapshot = this.#managedTranscriptStore(sessionFile).readExpected(path.basename(sessionFile));
-				if (!snapshot) return undefined;
-				return snapshot.bytes.subarray(index.byteOffset, index.byteOffset + index.byteLength);
-			}
+			const runtime = this.#sidecarRuntime;
+			if (runtime) runtime.rangeReadCount++;
+			return this.#readRangeSync(sessionFile, index.byteOffset, index.byteLength).bytes;
 		} catch {
 			return undefined;
 		}
-		return undefined;
 	}
 
 	/** Rehydrate one cold entry back into the hot map (bounded by the entry cache). */
@@ -12122,7 +12365,7 @@ export class SessionManager {
 		leafId: string,
 	): Map<string, { entry: SessionEntry; index: ColdEntryIndex }> | undefined {
 		const runtime = this.#sidecarRuntime;
-		if (!runtime?.indexPath || typeof this.storage.readRangeSync !== "function") return undefined;
+		if (!runtime?.indexPath || typeof this.#storage.readRangeSync !== "function") return undefined;
 		const leaf = this.#readColdBranchEntry(leafId);
 		if (leaf?.entry.type !== "compaction") return undefined;
 		const boundaryIndex = this.#findColdEntryIndex(leaf.entry.firstKeptEntryId);
@@ -12142,14 +12385,14 @@ export class SessionManager {
 			return undefined;
 		let indexSize: number;
 		try {
-			indexSize = this.storage.statSync(runtime.indexPath).size;
+			indexSize = this.#storage.statSync(runtime.indexPath).size;
 		} catch {
 			return undefined;
 		}
 		const indexes = new Map<string, ColdEntryIndex>();
 		let ordinal = 0;
 		let valid = true;
-		const failure = scanTranscriptLinesBounded(this.storage, runtime.indexPath, indexSize, (_offset, lineBytes) => {
+		const failure = scanTranscriptLinesBounded(this.#storage, runtime.indexPath, indexSize, (_offset, lineBytes) => {
 			const currentOrdinal = ordinal++;
 			if (currentOrdinal < boundaryIndex.ordinal || currentOrdinal > leaf.index.ordinal) return;
 			try {
@@ -12178,7 +12421,7 @@ export class SessionManager {
 		let transcriptBytes: Uint8Array;
 		try {
 			runtime.rangeReadCount++;
-			transcriptBytes = this.storage.readRangeSync(this.#sessionFile, transcriptStart, transcriptLength).bytes;
+			transcriptBytes = this.#readRangeSync(this.#sessionFile, transcriptStart, transcriptLength).bytes;
 			if (transcriptBytes.byteLength !== transcriptLength) return undefined;
 		} catch {
 			return undefined;
@@ -12350,17 +12593,27 @@ export class SessionManager {
 		for (const sidecarPath of this.#disposableSidecarPaths()) {
 			if (!sidecarPath) continue;
 			try {
-				this.storage.unlinkSync(sidecarPath);
+				this.#storage.unlinkSync(sidecarPath);
 			} catch {
 				// Derived sidecars are disposable after authoritative hydration.
 			}
 		}
 		this.#sidecarBranchActivationDirty = false;
+		this.#managedRangeExpectedDescriptor =
+			this.destination.kind === "managed" ? (this.#managedDescriptorSnapshotOrNull() ?? undefined) : undefined;
 	}
 
 	#hydrateAuthoritativeTranscriptSync(runtime: SessionMemorySidecarRuntime): void {
 		if (!this.#sessionFile) throw new Error("cold_transcript_unavailable");
-		const entries = parseSessionEntries(this.storage.readTextSync(this.#sessionFile));
+		const transcriptText =
+			this.destination.kind === "managed"
+				? (() => {
+						const snapshot = this.#managedTranscriptStore().readExpected(path.basename(this.#sessionFile!));
+						if (!snapshot) throw new Error("cold_transcript_unavailable");
+						return Buffer.from(snapshot.bytes).toString("utf8");
+					})()
+				: this.#storage.readTextSync(this.#sessionFile);
+		const entries = parseSessionEntries(transcriptText);
 		const header = entries[0];
 		if (header?.type !== "session" || header.version !== CURRENT_SESSION_VERSION) {
 			throw new Error("cold_transcript_header_invalid");
@@ -12396,7 +12649,7 @@ export class SessionManager {
 			this.#hydrateAuthoritativeTranscriptSync(runtime);
 			return;
 		}
-		if (this.#sessionFile && this.storage.statSync(this.#sessionFile).size !== runtime.tail.transcriptSize) {
+		if (this.#sessionFile && this.#statSync(this.#sessionFile).size !== runtime.tail.transcriptSize) {
 			this.#hydrateAuthoritativeTranscriptSync(runtime);
 			return;
 		}
@@ -12477,7 +12730,7 @@ export class SessionManager {
 		for (const sidecarPath of this.#disposableSidecarPaths()) {
 			if (!sidecarPath) continue;
 			try {
-				this.storage.unlinkSync(sidecarPath);
+				this.#storage.unlinkSync(sidecarPath);
 			} catch {
 				// Derived sidecars are disposable; the fully hydrated transcript is authoritative.
 			}
@@ -12500,7 +12753,7 @@ export class SessionManager {
 			try {
 				if (
 					runtime.coldIdHashesDescriptor &&
-					sameDescriptor(this.storage.statSync(runtime.indexPath), runtime.coldIdHashesDescriptor)
+					sameDescriptor(this.#storage.statSync(runtime.indexPath), runtime.coldIdHashesDescriptor)
 				)
 					return runtime.coldIdHashes;
 			} catch {
@@ -12516,8 +12769,8 @@ export class SessionManager {
 		const hashes = new BoundedColdIdHashSet();
 		let complete = true;
 		try {
-			const size = this.storage.statSync(runtime.indexPath).size;
-			const failure = scanTranscriptLinesBounded(this.storage, runtime.indexPath, size, (_offset, lineBytes) => {
+			const size = this.#storage.statSync(runtime.indexPath).size;
+			const failure = scanTranscriptLinesBounded(this.#storage, runtime.indexPath, size, (_offset, lineBytes) => {
 				try {
 					const value = JSON.parse(decodeBoundedJsonLine(lineBytes)) as { id?: unknown };
 					if (typeof value.id !== "string" || !hashes.add(value.id)) {
@@ -12531,7 +12784,7 @@ export class SessionManager {
 			});
 			if (failure || !complete) return undefined;
 			runtime.coldIdHashes = hashes;
-			runtime.coldIdHashesDescriptor = this.storage.statSync(runtime.indexPath);
+			runtime.coldIdHashesDescriptor = this.#storage.statSync(runtime.indexPath);
 			return hashes;
 		} finally {
 			if (!runtime.coldIdHashes) runtime.accountant.release(COLD_ID_HASH_BYTES);
@@ -12623,7 +12876,7 @@ export class SessionManager {
 	#advanceColdTailBoundary(firstKeptEntryId: string): boolean {
 		const runtime = this.#sidecarRuntime;
 		const sessionFile = this.#sessionFile;
-		if (!runtime?.enabled || !sessionFile || !runtime.tailPath || !this.storage.readRangeSync) return false;
+		if (!runtime?.enabled || !sessionFile || !runtime.tailPath || !this.#storage.readRangeSync) return false;
 		const firstIndex = runtime.tail.records.findIndex(record => record.id === firstKeptEntryId);
 		if (firstIndex < 0) return false;
 		const firstRecord = runtime.tail.records[firstIndex];
@@ -12631,7 +12884,7 @@ export class SessionManager {
 		try {
 			for (let offset = 0; offset < firstRecord.byteOffset; offset += 64 * 1024) {
 				const length = Math.min(64 * 1024, firstRecord.byteOffset - offset);
-				baseHash.update(this.storage.readRangeSync(sessionFile, offset, length).bytes);
+				baseHash.update(this.#readRangeSync(sessionFile, offset, length).bytes);
 			}
 			const base: BaseAnchor = { baseDigest: baseHash.digest("hex"), baseEndOffset: firstRecord.byteOffset };
 			const builder = new RollingTailChainBuilder(base);
@@ -12652,7 +12905,7 @@ export class SessionManager {
 				if (!appended) return false;
 			}
 			const tail = builder.build();
-			const writer = this.storage.openWriter(runtime.tailPath, { flags: "w" });
+			const writer = this.#storage.openWriter(runtime.tailPath, { flags: "w" });
 			try {
 				for (const record of tail.records) writer.writeLineSync(`${JSON.stringify(record)}\n`);
 				if (!writer.fsyncSync) return false;
@@ -12705,7 +12958,7 @@ export class SessionManager {
 		const checksum = computeTailRecordChecksum(runtime.base, previous?.checksum, recordWithoutChecksum);
 		const record: TailRecord = { ...recordWithoutChecksum, checksum };
 		try {
-			const indexWriter = this.storage.openWriter(runtime.indexPath, { flags: "a" });
+			const indexWriter = this.#storage.openWriter(runtime.indexPath, { flags: "a" });
 			try {
 				const indexLine = `${JSON.stringify({ id: entry.id, ordinal: record.ordinal, seq, byteOffset, byteLength, recordDigest, parentId: entry.parentId, entryType: entry.type })}\n`;
 				indexWriter.writeLineSync(indexLine);
@@ -12718,7 +12971,7 @@ export class SessionManager {
 			} finally {
 				indexWriter.closeSync();
 			}
-			const tailWriter = this.storage.openWriter(runtime.tailPath, { flags: "a" });
+			const tailWriter = this.#storage.openWriter(runtime.tailPath, { flags: "a" });
 			try {
 				tailWriter.writeLineSync(`${JSON.stringify(record)}\n`);
 				if (!tailWriter.fsyncSync) throw new Error("Synchronous sidecar fsync is unavailable");
@@ -12767,7 +13020,7 @@ export class SessionManager {
 				this.#invalidateDictionaryArtifact();
 		}
 		try {
-			const refreshed = this.storage.statSync(runtime.indexPath);
+			const refreshed = this.#storage.statSync(runtime.indexPath);
 			runtime.validatedIndexDescriptor = refreshed;
 			runtime.coldIdHashesDescriptor = runtime.coldIdHashes ? refreshed : undefined;
 		} catch {
@@ -12796,12 +13049,12 @@ export class SessionManager {
 
 	#readSessionCommitContents(): SessionMemoryCommitContents | undefined {
 		const markerPath = this.#sidecarRuntime?.commitPath;
-		if (!markerPath || !this.storage.readRangeSync) return undefined;
+		if (!markerPath || !this.#storage.readRangeSync) return undefined;
 		try {
-			const markerSize = this.storage.statSync(markerPath).size;
+			const markerSize = this.#storage.statSync(markerPath).size;
 			if (markerSize > 8 * 1024 * 1024) return undefined;
 			const value = JSON.parse(
-				Buffer.from(this.storage.readRangeSync(markerPath, 0, markerSize).bytes).toString("utf8"),
+				Buffer.from(this.#storage.readRangeSync(markerPath, 0, markerSize).bytes).toString("utf8"),
 			) as {
 				gen?: unknown;
 				descriptor?: Record<string, unknown>;
@@ -12888,7 +13141,7 @@ export class SessionManager {
 		if (!runtime?.enabled || runtime.sidecarIneligible) return { kind: "rebuild", reason: "sidecar_unavailable" };
 		let markerPresent = false;
 		try {
-			markerPresent = this.storage.existsSync(runtime.commitPath);
+			markerPresent = this.#storage.existsSync(runtime.commitPath);
 		} catch {
 			return { kind: "rebuild", reason: "commit_marker_read_failed" };
 		}
@@ -12948,7 +13201,7 @@ export class SessionManager {
 			const descriptor =
 				this.destination.kind === "managed"
 					? this.#managedTranscriptStore(sessionFile).descriptorExpected(path.basename(sessionFile))
-					: this.storage.statSync(sessionFile);
+					: this.#storage.statSync(sessionFile);
 			if (!descriptor) return null;
 			return {
 				dev: descriptor.dev,
@@ -12978,7 +13231,7 @@ export class SessionManager {
 			}
 			const dir = path.resolve(sessionFile, "..");
 			const tempPath = path.join(dir, `.${path.basename(sessionFile)}.${Snowflake.next()}.tmp`);
-			const writer = new NdjsonFileWriter(this.storage, tempPath, { flags: "w" });
+			const writer = new NdjsonFileWriter(this.#storage, tempPath, { flags: "w" });
 			try {
 				for (const entry of entries) {
 					writer.writeSync(entry);
@@ -12997,7 +13250,7 @@ export class SessionManager {
 				} catch {
 					// Best-effort cleanup of the temp writer's descriptor.
 				}
-				void this.storage.unlink(tempPath).catch(() => {});
+				void this.#storage.unlink(tempPath).catch(() => {});
 				throw toError(err);
 			}
 		});
@@ -13008,15 +13261,15 @@ export class SessionManager {
 		sessionFile: string,
 		sourceDescriptor: DescriptorSnapshot,
 	): Promise<{ tempPath: string; sourceSha256: string }> {
-		if (this.destination.kind === "managed" || typeof this.storage.openStagedWriter !== "function")
+		if (this.destination.kind === "managed" || typeof this.#storage.openStagedWriter !== "function")
 			throw new Error("bounded_default_selection_unsupported");
 		const dir = path.resolve(sessionFile, "..");
 		const tempPath = path.join(dir, `.${path.basename(sessionFile)}.${Snowflake.next()}.default-selection.tmp`);
-		const staged = this.storage.openStagedWriter(tempPath);
+		const staged = this.#storage.openStagedWriter(tempPath);
 		const sourceHash = crypto.createHash("sha256");
 		try {
 			const scanFailure = scanTranscriptLinesBounded(
-				this.storage,
+				this.#storage,
 				sessionFile,
 				sourceDescriptor.size,
 				(_offset, lineBytes) => {
@@ -13043,7 +13296,7 @@ export class SessionManager {
 				// Preserve the staging failure.
 			}
 			try {
-				this.storage.unlinkSync(tempPath);
+				this.#storage.unlinkSync(tempPath);
 			} catch {
 				// A successfully published temp may already have been removed by cleanup.
 			}
@@ -13056,10 +13309,10 @@ export class SessionManager {
 		sessionFile: string,
 	): Promise<string | undefined> {
 		if (this.destination.kind === "managed") return undefined;
-		if (!this.storage.existsSync(sessionFile)) return undefined;
+		if (!this.#storage.existsSync(sessionFile)) return undefined;
 		const dir = path.resolve(sessionFile, "..");
 		const tempPath = path.join(dir, `.${path.basename(sessionFile)}.${Snowflake.next()}.default-selection.tmp`);
-		const writer = new NdjsonFileWriter(this.storage, tempPath, {
+		const writer = new NdjsonFileWriter(this.#storage, tempPath, {
 			flags: "w",
 		});
 		try {
@@ -13080,7 +13333,7 @@ export class SessionManager {
 				await writer.close();
 			} catch {}
 			try {
-				await this.storage.unlink(tempPath);
+				await this.#storage.unlink(tempPath);
 			} catch {}
 			throw toError(error);
 		}
@@ -13158,15 +13411,15 @@ export class SessionManager {
 		options?: { readonly appendThinkingLevel: boolean },
 	): Promise<DefaultModelSelectionStage> {
 		const sessionFile = this.#sessionFile;
-		const persistsToExistingFile = this.persist && sessionFile !== undefined && this.storage.existsSync(sessionFile);
+		const persistsToExistingFile = this.persist && sessionFile !== undefined && this.#storage.existsSync(sessionFile);
 		const managedAppendExpectation =
 			persistsToExistingFile && this.#coldSidecarActive() && this.destination.kind === "managed"
 				? this.#managedTranscriptStore(sessionFile).captureBoundedAppendExpectation(path.basename(sessionFile))
 				: undefined;
 		const boundedExplicit =
 			this.destination.kind !== "managed" &&
-			typeof this.storage.openStagedWriter === "function" &&
-			typeof this.storage.readRangeSync === "function";
+			typeof this.#storage.openStagedWriter === "function" &&
+			typeof this.#storage.readRangeSync === "function";
 		const boundedCold =
 			persistsToExistingFile &&
 			this.#coldSidecarActive() &&
@@ -13227,7 +13480,7 @@ export class SessionManager {
 			throw new Error("bounded_default_selection_sidecar_changed");
 		const appendEntries = entries.slice(this.#fileEntries.length) as SessionEntry[];
 		const sourceStat =
-			boundedCold && this.destination.kind !== "managed" ? this.storage.statSync(sessionFile) : undefined;
+			boundedCold && this.destination.kind !== "managed" ? this.#storage.statSync(sessionFile) : undefined;
 		const boundedStage =
 			boundedCold && this.destination.kind !== "managed"
 				? await this.#writeBoundedDefaultModelSelection(appendEntries, sessionFile, sourceDescriptor!)
@@ -13333,12 +13586,12 @@ export class SessionManager {
 				try {
 					this.#closePersistWriterInternalSync();
 					if (stage.boundedCold) {
-						if (!this.storage.replaceExactSync || !stage.sourceStat || !stage.sourceSha256) {
+						if (!this.#storage.replaceExactSync || !stage.sourceStat || !stage.sourceSha256) {
 							transition.dispose();
 							return { kind: "unknown", error: new Error("Exact staged replacement is unavailable") };
 						}
 						if (
-							!this.storage.replaceExactSync(stage.tempPath, this.#sessionFile, {
+							!this.#storage.replaceExactSync(stage.tempPath, this.#sessionFile, {
 								stat: stage.sourceStat,
 								sha256: stage.sourceSha256,
 							})
@@ -13429,7 +13682,7 @@ export class SessionManager {
 	async discardDefaultModelSelectionStage(stage: DefaultModelSelectionStage): Promise<void> {
 		if (!stage.tempPath) return;
 		try {
-			await this.storage.unlink(stage.tempPath);
+			await this.#storage.unlink(stage.tempPath);
 		} catch (error) {
 			if (!isEnoent(error)) throw toError(error);
 		}
@@ -13475,6 +13728,7 @@ export class SessionManager {
 		this.#byId.clear();
 		this.#labelsById.clear();
 		this.#resetMaterializedCaches();
+		this.#releaseManagedSidecarCache();
 	}
 
 	/** Close the persistent writer after flushing all pending data. */
@@ -13605,9 +13859,9 @@ export class SessionManager {
 			? await SessionManager.listManagedForResumePickerReadOnly(
 					this.cwd,
 					this.destination.securityContext.agentDir,
-					this.storage,
+					this.#storage,
 				)
-			: await SessionManager.listForResumePickerReadOnly(this.cwd, this.destination.directory, this.storage);
+			: await SessionManager.listForResumePickerReadOnly(this.cwd, this.destination.directory, this.#storage);
 	}
 
 	getSessionId(): string {
@@ -13713,13 +13967,14 @@ export class SessionManager {
 				for (const sidecarPath of this.#disposableSidecarPaths()) {
 					if (!sidecarPath) continue;
 					try {
-						this.storage.unlinkSync(sidecarPath);
+						this.#storage.unlinkSync(sidecarPath);
 					} catch {
 						// Sidecars are disposable; off mode remains eager even if best-effort cleanup fails.
 					}
 				}
 			}
 			this.#sidecarRuntime = undefined;
+			this.#releaseManagedSidecarCache();
 			return;
 		}
 		if (mode === "shadow" && retainedColdRuntime) return;
@@ -13775,7 +14030,7 @@ export class SessionManager {
 		this.#assertMemoryGuardParticipantIngressLease(input.ingressLease);
 		if (!this.#sessionFile) throw new Error("memory_guard_checkpoint_session_file_unavailable");
 		await this.flush();
-		const captured = SessionManager.captureTranscriptStrict(this.#sessionFile, this.storage);
+		const captured = SessionManager.captureTranscriptStrict(this.#sessionFile, this.#storage);
 		if (captured.kind !== "captured") {
 			throw new Error(`memory_guard_checkpoint_capture_failed:${captured.reason}`);
 		}
@@ -13873,7 +14128,7 @@ export class SessionManager {
 		);
 		await publishCheckpointFile(checkpointPath, memoryGuardCanonicalJson(checkpoint));
 		const currentRevisions = this.revisionSnapshot();
-		const recaptured = SessionManager.captureTranscriptStrict(this.#sessionFile, this.storage);
+		const recaptured = SessionManager.captureTranscriptStrict(this.#sessionFile, this.#storage);
 		if (
 			this.getSessionId() !== sessionId ||
 			(this.getSessionName() ?? null) !== sessionName ||
@@ -14300,7 +14555,7 @@ export class SessionManager {
 		if (text.length === 0) {
 			let removedDraft = false;
 			try {
-				await this.storage.unlink(draftPath);
+				await this.#storage.unlink(draftPath);
 				removedDraft = true;
 			} catch (err) {
 				if (!isEnoent(err)) throw err;
@@ -14341,13 +14596,13 @@ export class SessionManager {
 		if (!draftPath) return null;
 		let text: string;
 		try {
-			text = await this.storage.readText(draftPath);
+			text = await this.#storage.readText(draftPath);
 		} catch (err) {
 			if (isEnoent(err)) return null;
 			throw err;
 		}
 		try {
-			await this.storage.unlink(draftPath);
+			await this.#storage.unlink(draftPath);
 		} catch (err) {
 			if (!isEnoent(err)) throw err;
 		}
@@ -14424,7 +14679,7 @@ export class SessionManager {
 	async #persistPatches(records: readonly SessionPatchRecord[]): Promise<void> {
 		if (records.length === 0) return;
 		if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
-		if (!this.persist || !this.#sessionFile || !this.storage.existsSync(this.#sessionFile)) return;
+		if (!this.persist || !this.#sessionFile || !this.#storage.existsSync(this.#sessionFile)) return;
 		const sessionFile = this.#sessionFile;
 		const publishResumeBreadcrumb = this.#readOnlyResume;
 		await this.#queuePersistTask(async () => {
@@ -14618,6 +14873,12 @@ export class SessionManager {
 		try {
 			this._persist(residentEntry);
 		} catch (error) {
+			if (error instanceof ManagedCommittedMutationError) {
+				if (sidecarAppendCharge > 0) activeRuntime?.accountant.release(sidecarAppendCharge);
+				if (sidecarTailCharge > 0) activeRuntime?.tailCache.release(sidecarTailCharge);
+				this.#needsFullRewriteOnNextPersist = true;
+				throw new SessionAppendPersistenceError("current_append", residentEntry.id, this.#persistError ?? error);
+			}
 			const removed = this.#fileEntries.pop();
 			if (removed !== residentEntry)
 				throw new Error("Session append rollback lost resident ordering.", { cause: error });
@@ -14700,7 +14961,7 @@ export class SessionManager {
 			transcriptDurableForSidecar &&
 			this.#sessionMemoryMode === "enabled" &&
 			this.#sessionFile &&
-			this.storage.existsSync(this.#sessionFile)
+			this.#storage.existsSync(this.#sessionFile)
 		) {
 			if (this.#coldSidecarActive() && this.#sidecarRuntime) {
 				if (!this.#advanceColdTailBoundary(entry.firstKeptEntryId)) {
@@ -14993,14 +15254,14 @@ export class SessionManager {
 			// genuinely re-dispatched and still fail if the descriptor cannot settle.
 		}
 		await this.#closePersistWriter();
-		const inspected = inspectResumeSessionFile(sessionFile, this.storage);
+		const inspected = inspectResumeSessionFile(sessionFile, this.#storage);
 		if ("kind" in inspected) throw persistenceError;
 		try {
 			fsyncResumeSessionIdentity(inspected.identity);
 		} catch {
 			throw persistenceError;
 		}
-		const durable = inspectResumeSessionFile(sessionFile, this.storage);
+		const durable = inspectResumeSessionFile(sessionFile, this.#storage);
 		if ("kind" in durable || !sameResumeIdentity(inspected.identity, durable.identity)) {
 			throw persistenceError;
 		}
@@ -15431,26 +15692,31 @@ export class SessionManager {
 
 	visitEntriesForExport(visitor: (entry: SessionEntry) => void): void {
 		if (this.#coldSidecarActive() && this.#sessionFile) {
-			const size = this.storage.statSync(this.#sessionFile).size;
-			const failure = scanTranscriptLinesBounded(this.storage, this.#sessionFile, size, (_offset, lineBytes) => {
-				try {
-					const record = JSON.parse(decodeBoundedJsonLine(lineBytes)) as FileEntry | SessionPatchRecord;
-					if (record.type === "session") return;
-					if (record.type === "header_patch" || record.type === "entry_patch") return false;
-					if (typeof record.id !== "string") return false;
-					visitor(
-						cloneSessionEntry(
-							rehydrateColdSpillEntry(
-								materializeResidentEntryForReadSync(record, this.#residentBlobStores(), new Map()),
-								this.#coldSpillReadStore(),
-								this.#residentBlobStoresForColdRehydrate(),
+			const size = this.#statSync(this.#sessionFile).size;
+			const failure = scanTranscriptLinesBounded(
+				this.#boundedReadStorage(),
+				this.#sessionFile,
+				size,
+				(_offset, lineBytes) => {
+					try {
+						const record = JSON.parse(decodeBoundedJsonLine(lineBytes)) as FileEntry | SessionPatchRecord;
+						if (record.type === "session") return;
+						if (record.type === "header_patch" || record.type === "entry_patch") return false;
+						if (typeof record.id !== "string") return false;
+						visitor(
+							cloneSessionEntry(
+								rehydrateColdSpillEntry(
+									materializeResidentEntryForReadSync(record, this.#residentBlobStores(), new Map()),
+									this.#coldSpillReadStore(),
+									this.#residentBlobStoresForColdRehydrate(),
+								),
 							),
-						),
-					);
-				} catch {
-					return false;
-				}
-			});
+						);
+					} catch {
+						return false;
+					}
+				},
+			);
 			if (failure) throw new Error(`export_transcript_scan_failed:${failure}`);
 			return;
 		}
@@ -15495,10 +15761,11 @@ export class SessionManager {
 
 	#readColdChildren(parentId: string): SessionEntry[] | undefined {
 		const runtime = this.#sidecarRuntime;
-		if (!runtime?.enabled || !runtime.indexPath || typeof this.storage.readRangeSync !== "function") return undefined;
+		if (!runtime?.enabled || !runtime.indexPath || typeof this.#storage.readRangeSync !== "function")
+			return undefined;
 		let indexStat: SessionStorageStat;
 		try {
-			indexStat = this.storage.statSync(runtime.indexPath);
+			indexStat = this.#storage.statSync(runtime.indexPath);
 		} catch {
 			return undefined;
 		}
@@ -15547,7 +15814,7 @@ export class SessionManager {
 		let collectNeighboringParents = false;
 		const neighboringIndexes = new Map<string, { index: ColdEntryIndex; bytes: number }>();
 		let neighboringParentsComplete = true;
-		const failure = scanTranscriptLinesBounded(this.storage, runtime.indexPath, size, (_offset, lineBytes) => {
+		const failure = scanTranscriptLinesBounded(this.#storage, runtime.indexPath, size, (_offset, lineBytes) => {
 			try {
 				const value = JSON.parse(decodeBoundedJsonLine(lineBytes)) as {
 					id?: unknown;
@@ -16155,7 +16422,7 @@ export class SessionManager {
 						Buffer.from(`${lines.join("\n")}\n`, "utf8"),
 					);
 				} else {
-					this.storage.writeTextSync(newSessionFile, `${lines.join("\n")}\n`);
+					this.#storage.writeTextSync(newSessionFile, `${lines.join("\n")}\n`);
 				}
 			} catch (error) {
 				transition.dispose();
@@ -16304,7 +16571,7 @@ export class SessionManager {
 		expectedIdentity: ResumeSessionIdentity,
 	): Promise<string> {
 		const preparedPath = await this.prepareManagedCandidateForWrite(filePath, migrationPolicy, expectedIdentity);
-		const inspected = inspectResumeSessionFile(preparedPath, this.storage);
+		const inspected = inspectResumeSessionFile(preparedPath, this.#storage);
 		if ("kind" in inspected) throw new Error(`Could not inspect prepared managed session: ${inspected.reason}`);
 		this.#pendingStrictAdoption = { canonicalPath: inspected.identity.canonicalPath, identity: inspected.identity };
 		return preparedPath;
@@ -16412,8 +16679,8 @@ export class SessionManager {
 		if (
 			this.#sessionMemoryMode !== "enabled" ||
 			this.destination.kind === "managed" ||
-			typeof this.storage.readRangeSync !== "function" ||
-			typeof this.storage.openStagedWriter !== "function"
+			typeof this.#storage.readRangeSync !== "function" ||
+			typeof this.#storage.openStagedWriter !== "function"
 		)
 			return false;
 		let sourceHeader: SessionHeader | undefined;
@@ -16427,9 +16694,9 @@ export class SessionManager {
 		let requiresRecordTransforms = false;
 		const preflightHash = crypto.createHash("sha256");
 		const preflightResult: { stat?: SessionStorageStat } = {};
-		const sourceSize = expectedIdentity?.size ?? this.storage.statSync(sourcePath).size;
+		const sourceSize = expectedIdentity?.size ?? this.#storage.statSync(sourcePath).size;
 		const preflightFailure = scanTranscriptLinesBounded(
-			this.storage,
+			this.#storage,
 			sourcePath,
 			sourceSize,
 			(_offset, lineBytes) => {
@@ -16515,14 +16782,14 @@ export class SessionManager {
 		fresh.header.title = sourceHeader.title;
 		fresh.header.titleSource = sourceHeader.titleSource;
 		if (!fresh.sessionFile) return false;
-		const staged = this.storage.openStagedWriter(fresh.sessionFile);
+		const staged = this.#storage.openStagedWriter(fresh.sessionFile);
 		let published = false;
 		try {
 			let ordinal = 0;
 			const copyHash = crypto.createHash("sha256");
 			const copyResult: { stat?: SessionStorageStat } = {};
 			const copyFailure = scanTranscriptLinesBounded(
-				this.storage,
+				this.#storage,
 				sourcePath,
 				identity.size,
 				(_offset, lineBytes) => {
@@ -16566,9 +16833,9 @@ export class SessionManager {
 			staged.publishNoReplace();
 			published = true;
 			if (copyResult.stat) {
-				const current = this.storage.statSync(sourcePath);
+				const current = this.#storage.statSync(sourcePath);
 				if (!sameDescriptor(copyResult.stat, current)) throw new Error("fork_source_identity_changed");
-			} else if (revalidateTranscriptIdentityBounded(sourcePath, this.storage, identity).kind !== "valid") {
+			} else if (revalidateTranscriptIdentityBounded(sourcePath, this.#storage, identity).kind !== "valid") {
 				throw new Error("fork_source_identity_changed");
 			}
 			await this.copyArtifactsForFork(sourcePath, fresh.sessionFile);
@@ -16581,7 +16848,7 @@ export class SessionManager {
 			} catch {
 				// Preserve the fork failure.
 			}
-			if (published) await this.storage.deleteSessionWithArtifacts(fresh.sessionFile);
+			if (published) await this.#storage.deleteSessionWithArtifacts(fresh.sessionFile);
 			throw error;
 		}
 	}
@@ -16830,6 +17097,23 @@ export class SessionManager {
 			return manager;
 		}
 
+		if (
+			sessionMemoryMode === "enabled" &&
+			path.dirname(path.resolve(filePath)) === path.resolve(destination.directory)
+		) {
+			const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
+			manager.#sessionMemoryMode = sessionMemoryMode;
+			try {
+				await manager.#initSessionFile(filePath, true);
+				const header = manager.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+				if (header?.cwd) manager.cwd = header.cwd;
+				manager.buildSessionContext();
+				return manager;
+			} catch (error) {
+				await manager.close().catch(() => {});
+				throw error;
+			}
+		}
 		const inspected = inspectResumeSessionFile(filePath, storage);
 		if ("kind" in inspected) {
 			if (inspected.reason === "missing") {
@@ -16880,7 +17164,61 @@ export class SessionManager {
 		)
 			throw new Error("Nested managed session escaped retained authority");
 		store.assertBound();
+		const capturedDescriptor = store.descriptorExpected(path.basename(resolved));
+		if (sessionMemoryMode === "enabled" && capturedDescriptor && capturedDescriptor.size > 0) {
+			const boundedManager = new SessionManager(
+				cwdOverride ? path.resolve(cwdOverride) : getProjectDir(),
+				destination.directory,
+				true,
+				storage,
+				destination,
+			);
+			boundedManager.#sessionMemoryMode = sessionMemoryMode;
+			try {
+				const openedFromSidecar = await boundedManager.#tryInitSessionFileFromSidecar(resolved);
+				const openedBounded = openedFromSidecar || (await boundedManager.#tryBoundedFirstOpen(resolved));
+				if (openedBounded) {
+					const header = boundedManager.#fileEntries.find(entry => entry.type === "session") as
+						| SessionHeader
+						| undefined;
+					if (!header) throw new Error("source_changed");
+					const sessionCwd = cwdOverride ? path.resolve(cwdOverride) : header.cwd || getProjectDir();
+					if (cwdOverride && resolveEquivalentPath(header.cwd) !== resolveEquivalentPath(sessionCwd))
+						throw new Error("nested_managed_bounded_rewrite_required");
+					boundedManager.cwd = sessionCwd;
+					store.assertBound();
+					const finalDescriptor = store.descriptorExpected(path.basename(resolved));
+					if (!finalDescriptor || !sameDescriptor(capturedDescriptor, finalDescriptor))
+						throw new Error("source_changed");
+					boundedManager.buildSessionContext();
+					return boundedManager;
+				}
+				if (boundedManager.#lazyReopenFallbackReason === "bounded_first_open_descriptor_changed")
+					throw new Error("source_changed");
+				await boundedManager.close().catch(() => {});
+			} catch (error) {
+				await boundedManager.close().catch(() => {});
+				if (!(error instanceof Error) || error.message !== "nested_managed_bounded_rewrite_required") throw error;
+			}
+		}
+		if (sessionMemoryMode === "enabled" && capturedDescriptor) {
+			const failedDescriptor = store.descriptorExpected(path.basename(resolved));
+			if (!failedDescriptor || !sameDescriptor(capturedDescriptor, failedDescriptor))
+				throw new Error("source_changed");
+		}
 		const captured = store.readExpected(path.basename(resolved));
+		if (
+			Boolean(captured) !== Boolean(capturedDescriptor) ||
+			(captured &&
+				capturedDescriptor &&
+				(captured.identity.dev !== capturedDescriptor.dev ||
+					captured.identity.ino !== capturedDescriptor.ino ||
+					captured.identity.nlink !== capturedDescriptor.nlink ||
+					captured.identity.size !== capturedDescriptor.size ||
+					captured.identity.mtimeNs !== capturedDescriptor.mtimeNs ||
+					captured.identity.ctimeNs !== capturedDescriptor.ctimeNs))
+		)
+			throw new Error("source_changed");
 		const entries = captured ? parseSessionEntries(captured.bytes.toString("utf8")) : [];
 		const header = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		const sessionCwd = cwdOverride ? path.resolve(cwdOverride) : (header?.cwd ?? getProjectDir());
@@ -16890,30 +17228,44 @@ export class SessionManager {
 		if (header && cwdChanged) header.cwd = sessionCwd;
 		const manager = new SessionManager(sessionCwd, destination.directory, true, storage, destination);
 		manager.#sessionMemoryMode = sessionMemoryMode;
-		if (entries.length > 0) {
-			const migrationApplied = migrateToCurrentVersion(entries) || cwdChanged;
-			await manager.#hydrateExistingSession(resolved, entries, migrationApplied, "memory-fallback");
-			if (cwdChanged) {
+		try {
+			let transcriptChanged = false;
+			if (entries.length > 0) {
+				const migrationApplied = migrateToCurrentVersion(entries) || cwdChanged;
+				transcriptChanged = migrationApplied;
+				await manager.#hydrateExistingSession(resolved, entries, migrationApplied, "memory-fallback");
+				if (cwdChanged) {
+					await manager.#rewriteFile();
+					manager.#flushed = true;
+					manager.#ensuredOnDisk = true;
+				}
+				if (cwdChanged) transcriptChanged = true;
+				writeTerminalBreadcrumb(manager.cwd, resolved);
+				if (await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist()) transcriptChanged = true;
+			} else {
+				const fresh = manager.#freshSessionState(undefined, resolved);
+				const transition = manager.#prepareFreshSessionTransition(fresh, "memory-fallback");
+				manager.#applyFreshSessionMetadata(fresh);
+				manager.#commitResidentTextStoreTransition(transition);
+				manager.#retireEphemeralArtifacts();
+				writeTerminalBreadcrumb(manager.cwd, resolved);
 				await manager.#rewriteFile();
 				manager.#flushed = true;
 				manager.#ensuredOnDisk = true;
+				transcriptChanged = true;
 			}
-			writeTerminalBreadcrumb(manager.cwd, resolved);
-			await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
-		} else {
-			const fresh = manager.#freshSessionState(undefined, resolved);
-			const transition = manager.#prepareFreshSessionTransition(fresh, "memory-fallback");
-			manager.#applyFreshSessionMetadata(fresh);
-			manager.#commitResidentTextStoreTransition(transition);
-			manager.#retireEphemeralArtifacts();
-			writeTerminalBreadcrumb(manager.cwd, resolved);
-			await manager.#rewriteFile();
-			manager.#flushed = true;
-			manager.#ensuredOnDisk = true;
+			store.assertBound();
+			if (!transcriptChanged) {
+				const finalDescriptor = store.descriptorExpected(path.basename(resolved));
+				if (!capturedDescriptor || !finalDescriptor || !sameDescriptor(capturedDescriptor, finalDescriptor))
+					throw new Error("source_changed");
+			}
+			manager.buildSessionContext();
+			return manager;
+		} catch (error) {
+			await manager.close().catch(() => {});
+			throw error;
 		}
-		store.assertBound();
-		manager.buildSessionContext();
-		return manager;
 	}
 	/**
 	 * List default-managed sessions for the resume picker without recovery or other
@@ -17228,7 +17580,7 @@ export class SessionManager {
 			}
 			if (manager.#sessionMemoryMode !== "off" && manager.#sessionFile) {
 				const runtime = manager.#sidecarRuntime;
-				const transcriptSize = manager.storage.statSync(manager.#sessionFile).size;
+				const transcriptSize = manager.#storage.statSync(manager.#sessionFile).size;
 				if (!runtime?.enabled || runtime.tail.transcriptSize !== transcriptSize)
 					manager.#buildDisposableSidecars(manager.#fileEntries);
 				if (manager.#sessionMemoryMode === "enabled") manager.#retireColdEntries();
@@ -17514,7 +17866,7 @@ export class SessionManager {
 		if (fence.ownershipReady !== true || this.#recoveryHydrationContext !== context) {
 			throw new Error("Recovery hydration promotion requires the original ownership-ready context.");
 		}
-		const inspected = inspectResumeSessionFile(context.identity.canonicalPath, this.storage);
+		const inspected = inspectResumeSessionFile(context.identity.canonicalPath, this.#storage);
 		if ("kind" in inspected || !sameResumeIdentity(context.identity, inspected.identity)) {
 			throw new Error("Recovery transcript authority changed before promotion.");
 		}
@@ -17526,7 +17878,7 @@ export class SessionManager {
 		await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 		const promotionPath = this.#recoveryPromotionTranscriptPath;
 		if (!promotionPath) throw new Error("Recovery transcript promotion path is unavailable.");
-		const promotedSource = inspectResumeSessionFile(context.identity.canonicalPath, this.storage);
+		const promotedSource = inspectResumeSessionFile(context.identity.canonicalPath, this.#storage);
 		if ("kind" in promotedSource) throw new Error("Recovery transcript became unavailable before publication.");
 		const transition = this.#prepareResidentTextStoreTransition(
 			{
@@ -17557,6 +17909,9 @@ export class SessionManager {
 			}
 		} catch (error) {
 			transition.dispose();
+			this.#sidecarRuntime = undefined;
+			this.#releaseManagedSidecarCache();
+			this.#boundedReadStorageProxy = undefined;
 			throw error;
 		}
 		this.#sessionFile = promotionPath;
@@ -17785,7 +18140,7 @@ export class SessionManager {
 	inventorySessionsStrict(): StrictInventoryResult {
 		return SessionManager.inventorySessionsStrict(this.cwd, {
 			sessionDir: this.destination.kind === "explicit" ? this.destination.directory : undefined,
-			storage: this.storage,
+			storage: this.#storage,
 			destination: this.destination,
 		});
 	}
@@ -17911,10 +18266,10 @@ export class SessionManager {
 	 * authorization target captured from a complete strict inventory.
 	 */
 	async deleteSessionVerified(target: VerifiedSessionDeleteTarget): Promise<VerifiedSessionDeleteResult> {
-		if (!this.storage.deleteSessionVerified) {
+		if (!this.#storage.deleteSessionVerified) {
 			throw new Error("Storage backend does not support verified session deletion");
 		}
-		return this.storage.deleteSessionVerified(target);
+		return this.#storage.deleteSessionVerified(target);
 	}
 }
 const strictInventoryDecoder = new TextDecoder("utf-8", { fatal: false });
