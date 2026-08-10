@@ -1400,7 +1400,9 @@ export class Broker {
 						(operation === "session.create" || operation === "session.fork" || operation === "session.resume") &&
 						typeof (replay.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
 					) {
-						const endpoint = await this.#endpoint({ sessionId: (replay.result as { sessionId: string }).sessionId });
+						const endpoint = await this.#endpoint({
+							sessionId: (replay.result as { sessionId: string }).sessionId,
+						});
 						if (endpoint.ok)
 							return {
 								ok: true,

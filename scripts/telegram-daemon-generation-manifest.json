@@ -412,7 +412,7 @@
     "discord:packages/coding-agent/src/sdk/bus/config.ts:notificationConfigFromFile": "ed9446063305a13e9c6e8a9ffcac46985b44d79b778e0c96dbc1612b01f1f7d2",
     "discord:packages/coding-agent/src/sdk/bus/config.ts:resolveNotificationProvider": "09402fa9db279332fc392ef13a059b90f82c8721f4ed33cbc060222663558efd",
     "discord:packages/coding-agent/src/sdk/bus/config.ts:tokenFingerprint": "dd57445254e5ca152c4a2030f8959367a6800759f3f82fc5da09cc7b9a5aa758",
-    "discord:packages/coding-agent/src/sdk/bus/discord-daemon.ts:DiscordNotificationDaemon": "c8bdfce1cf64f1887767c2c6775693dc7c0f31f97b8d80543a72844e2575ce3b",
+    "discord:packages/coding-agent/src/sdk/bus/discord-daemon.ts:DiscordNotificationDaemon": "fedeb6420d5a846151211d852544f0beaac7ed9413ed013220081f1c0a18c59d",
     "discord:packages/coding-agent/src/sdk/bus/discord-daemon.ts:close": "7d57be9b99c4e88ff6872ab82586de703b448dd06fc53a83096ed64b3209d05b",
     "discord:packages/coding-agent/src/sdk/bus/discord-daemon.ts:handleInbound": "1573d03ae11233beffe1516d5457b20f3d0069ae64e325f9b3accbd7deffce5b",
     "discord:packages/coding-agent/src/sdk/bus/discord-daemon.ts:notify": "b0ddddf966a4bf239a54c09d5da823720d48f33bf58b8c6d9d8c5c6f41078d3e",
