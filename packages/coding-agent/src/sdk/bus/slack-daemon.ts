@@ -196,7 +196,7 @@ export class SlackNotificationDaemon {
 	#started = false;
 	#providerStartingGeneration: number | undefined;
 	#providerRunningGeneration: number | undefined;
-	#providerStopRequestedGeneration: number | undefined;
+	readonly #providerStopRequestedGenerations = new Set<number>();
 	#leaseRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
 	#leaseRecoveryAt: number | undefined;
 	#leaseRecoveryFailures = 0;
@@ -270,7 +270,7 @@ export class SlackNotificationDaemon {
 						this.#clearLeaseRecoveryTimer();
 					}
 					if (this.#providerRunningGeneration === lifecycleGeneration) this.#providerRunningGeneration = undefined;
-					if (this.#providerStopRequestedGeneration !== lifecycleGeneration) await this.options.provider.stop();
+					if (!this.#providerStopRequestedGenerations.has(lifecycleGeneration)) await this.options.provider.stop();
 				}
 			} catch (error) {
 				if (this.#startedGeneration === lifecycleGeneration) {
@@ -303,7 +303,7 @@ export class SlackNotificationDaemon {
 		this.#startedGeneration = undefined;
 		if (this.#providerRunningGeneration === lifecycleGeneration) this.#providerRunningGeneration = undefined;
 		this.#clearLeaseRecoveryTimer();
-		if (stopProvider) this.#providerStopRequestedGeneration = lifecycleGeneration;
+		if (stopProvider) this.#providerStopRequestedGenerations.add(lifecycleGeneration);
 		const providerStop = stopProvider ? this.options.provider.stop() : undefined;
 		const shutdownDeadline = this.#now() + 5_000;
 		const predecessor = this.#lifecycleTail;

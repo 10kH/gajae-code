@@ -82,10 +82,11 @@ export type ChatDaemonAction = "stop" | "reload";
  * Slack generation 33 bounds lifecycle predecessors under the shutdown deadline.
  * Slack generation 34 CAS-fences cleanup mapping commits against successors.
  * Slack generation 35 identity-fences detached startup cleanup from restarted daemon state.
+ * Slack generation 36 retains stop ownership for every detached lifecycle generation.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
 	discord: 31,
-	slack: 35,
+	slack: 36,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

@@ -1296,10 +1296,15 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				fake.startGate = undefined;
 				await daemon.start();
 				expect(fake.startCalls).toBe(2);
-				oldStartGate.resolve();
-				await oldStart;
 				await daemon.stop();
 				expect(fake.stops).toBe(2);
+				await daemon.start();
+				expect(fake.startCalls).toBe(3);
+				oldStartGate.resolve();
+				await oldStart;
+				expect(fake.stops).toBe(2);
+				await daemon.stop();
+				expect(fake.stops).toBe(3);
 				nowCalls = 0;
 			},
 			{ now: () => (boundedStop ? (nowCalls++ === 0 ? 0 : 5_001) : 0) },
