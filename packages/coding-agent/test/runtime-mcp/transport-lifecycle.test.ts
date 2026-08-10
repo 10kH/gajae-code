@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, test, vi } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, test, vi } from "bun:test";
 import { logger } from "@gajae-code/utils";
 import { disposeAllOwnedProcesses, liveOwnedProcessCount } from "../../src/runtime/process-lifecycle";
 import { HttpTransport } from "../../src/runtime-mcp/transports/http";
 import { StdioTransport } from "../../src/runtime-mcp/transports/stdio";
 
+setDefaultTimeout(30_000);
 async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 10_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
