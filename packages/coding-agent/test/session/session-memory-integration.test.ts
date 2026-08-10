@@ -1501,6 +1501,65 @@ it("refreshes split residency metrics after append and retained off-mode rollbac
 	}
 });
 
+it("appends after tail overflow without materializing the complete cold index", async () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/tail-overflow-next-ordinal.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "tail-overflow", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	SessionManagerTestHooks.sidecarTailBufferBytesOverride = 1;
+	SessionManagerTestHooks.secondaryArtifactMode = "disabled";
+	SessionManagerTestHooks.readAllColdEntryIndexesCalls = 0;
+	let manager: SessionManager | undefined;
+	try {
+		const built = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		await built.close();
+		manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		expect(SessionManagerTestHooks.lastSidecarInitError).toBeUndefined();
+		expect(manager.getSessionMemoryStats()).toMatchObject({
+			coldRetirementActive: true,
+			dictionaryArtifactEnabled: false,
+			lazyReopenSucceeded: true,
+		});
+		expect(storage.readTextSync(sidecarPath(sessionFile, "tail"))).toBe("");
+		SessionManagerTestHooks.readAllColdEntryIndexesCalls = 0;
+		const appendedId = manager.appendCustomEntry("after-overflow", {});
+		expect(SessionManagerTestHooks.readAllColdEntryIndexesCalls).toBe(0);
+		const finalIndex = storage.readTextSync(sidecarPath(sessionFile, "idx")).trimEnd().split("\n").at(-1);
+		expect(finalIndex).toBeDefined();
+		expect(JSON.parse(finalIndex!)).toMatchObject({ id: appendedId, ordinal: 3 });
+	} finally {
+		SessionManagerTestHooks.sidecarTailBufferBytesOverride = undefined;
+		SessionManagerTestHooks.secondaryArtifactMode = undefined;
+		SessionManagerTestHooks.readAllColdEntryIndexesCalls = undefined;
+		await manager?.close();
+	}
+});
+
 it("applies benchmark-only GC and secondary-artifact controls to bounded first-open", async () => {
 	const storage = new MemorySessionStorage();
 	const sessionFile = "/sessions/bounded-first-open-controls.jsonl";
