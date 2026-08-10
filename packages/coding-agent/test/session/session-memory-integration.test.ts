@@ -327,6 +327,12 @@ describe("SessionManager cold sidecar integration", () => {
 			});
 			expect(initial.hotRetainedMessageCharsForTests()).toBeLessThan(1024);
 			expect(initial.getEntry(coldId)?.id).toBe(coldId);
+			initial.setSessionMemoryMode("shadow");
+			expect(initial.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			expect(initial.getEntry(coldId)?.id).toBe(coldId);
+			initial.setSessionMemoryMode("off");
+			expect(initial.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			expect(initial.getEntry(coldId)?.id).toBe(coldId);
 			const artifactsDir = initial.getArtifactsDir();
 			if (!artifactsDir) throw new Error("Expected managed artifacts directory");
 			const managedSidecars = fs.existsSync(artifactsDir)
