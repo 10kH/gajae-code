@@ -1394,7 +1394,21 @@ export class Broker {
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;
 				const cleanup = cleanupFromResponse(replay) ?? reconstructedDeleteCleanup;
-				if (!cleanup) return replay;
+				if (!cleanup) {
+					if (
+						replay.ok &&
+						(operation === "session.create" || operation === "session.fork" || operation === "session.resume") &&
+						typeof (replay.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
+					) {
+						const endpoint = await this.#endpoint({ sessionId: (replay.result as { sessionId: string }).sessionId });
+						if (endpoint.ok)
+							return {
+								ok: true,
+								result: { ...(replay.result as Record<string, unknown>), endpoint: endpoint.result },
+							};
+					}
+					return replay;
+				}
 				const outcome = await executeLifecycle(this, operation, input, identity, cleanup);
 				const response = outcome.response;
 				const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
