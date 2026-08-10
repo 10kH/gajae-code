@@ -3751,6 +3751,7 @@ export class TelegramUpdatePoller {
 		}
 		this.#opts.backoff.reset();
 		let malformedSeen = false;
+		const startingOffset = this.#offset;
 		for (const update of body.result) {
 			// A single malformed update_id must not wedge the poller. Skip the
 			// bad entry (surfaced below as an api_failure health signal) while
@@ -3774,6 +3775,7 @@ export class TelegramUpdatePoller {
 				this.#offset = update.update_id + 1;
 			}
 		}
+		if (malformedSeen && this.#offset === startingOffset) this.#offset += 1;
 		if (malformedSeen) {
 			await this.#opts.runtime.sleep(POLL_BACKOFF_MS, signal);
 			return { kind: "api_failure", description: "Malformed getUpdates response" };
@@ -4898,7 +4900,9 @@ export class TelegramNotificationDaemon {
 				if (!attachment.isCurrent()) throw new Error("SDK session attachment is stale.");
 				await Promise.resolve(attachment.send(JSON.parse(data) as Record<string, unknown>));
 			},
-			close: (): void => {},
+			close: (): void => {
+				void attachment.retire?.();
+			},
 		};
 		const session: AttachmentSession = {
 			sessionId: attachment.sessionId,
@@ -4963,8 +4967,10 @@ export class TelegramNotificationDaemon {
 				capabilities: [TOOL_ACTIVITY_CAPABILITY],
 			});
 		} catch (error) {
-			if (this.sessions.get(session.sessionId) === session)
+			if (this.sessions.get(session.sessionId) === session) {
 				logger.warn(`notifications: Telegram attachment handshake failed: ${sanitizeDiagnostic(String(error))}`);
+				this.dropSession(session, "handshake_failed");
+			}
 		}
 	}
 
@@ -5615,9 +5621,7 @@ export class TelegramNotificationDaemon {
 
 	private async markPublicationDelivered(publicationId: string | undefined): Promise<void> {
 		if (!publicationId || this.publicationDelivered(publicationId)) return;
-		const claimedAt = this.claimedPublications.get(publicationId);
 		const ambiguousAt = this.ambiguousPublications.get(publicationId);
-		const rejectedAt = this.rejectedPublications.get(publicationId);
 		this.claimedPublications.delete(publicationId);
 		this.ambiguousPublications.delete(publicationId);
 		this.rejectedPublications.delete(publicationId);
@@ -5629,9 +5633,16 @@ export class TelegramNotificationDaemon {
 			await this.persistPublicationReceipts();
 		} catch (error) {
 			this.deliveredPublications.delete(publicationId);
-			if (claimedAt !== undefined) this.claimedPublications.set(publicationId, claimedAt);
-			if (ambiguousAt !== undefined) this.ambiguousPublications.set(publicationId, ambiguousAt);
-			if (rejectedAt !== undefined) this.rejectedPublications.set(publicationId, rejectedAt);
+			this.claimedPublications.delete(publicationId);
+			this.rejectedPublications.delete(publicationId);
+			this.ambiguousPublications.set(publicationId, ambiguousAt ?? this.runtime.now());
+			try {
+				await this.persistPublicationReceipts();
+			} catch (compensationError) {
+				logger.warn(
+					`notifications: Telegram ambiguous delivery compensation failed: ${sanitizeDiagnostic(String(compensationError))}`,
+				);
+			}
 			logger.warn(
 				`notifications: Telegram presentation state persistence failed: ${sanitizeDiagnostic(String(error))}`,
 			);

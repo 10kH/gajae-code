@@ -4,11 +4,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "../src/config/settings";
 import { daemonPaths } from "../src/sdk/bus/daemon-paths";
+import type { NotificationOperatorRuntime } from "../src/sdk/bus/operator-runtime";
 import {
+	type BotApi,
 	DAEMON_GENERATION,
 	hasSafeDaemonStateShape,
 	type TelegramDaemonFs,
 	TelegramNotificationDaemon,
+	TelegramUpdatePoller,
 } from "../src/sdk/bus/telegram-daemon";
 import type { AgentDirSessionLifecycleService } from "../src/sdk/lifecycle/client";
 
@@ -241,4 +244,25 @@ describe("Telegram provider supervisor ownership", () => {
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
 	});
+});
+
+test("advances past a malformed-only getUpdates batch", async () => {
+	const offsets: number[] = [];
+	let calls = 0;
+	const botApi: BotApi = {
+		call: async (_method, body) => {
+			offsets.push((body as { offset: number }).offset);
+			calls++;
+			return calls === 1 ? { ok: true, result: [{}] } : { ok: true, result: [{ update_id: 1 }] };
+		},
+	};
+	const poller = new TelegramUpdatePoller({
+		botApi,
+		runtime: { sleep: async () => {} } as unknown as NotificationOperatorRuntime,
+		backoff: { next: () => 1, reset: () => {} },
+		processUpdate: async () => "consumed",
+	});
+	expect((await poller.pollOnceResult()).kind).toBe("api_failure");
+	expect((await poller.pollOnceResult()).kind).toBe("success");
+	expect(offsets).toEqual([0, 1]);
 });

@@ -21,6 +21,8 @@ export interface SessionAttachment {
 	readonly generation: number;
 	isCurrent(): boolean;
 	send(frame: Record<string, unknown>): unknown;
+	/** Revoke this exact capability after provider admission or replay fails closed. */
+	retire?(): Promise<void>;
 }
 
 /** The transport surface Router keeps private behind its attachment capabilities. */
@@ -98,6 +100,7 @@ type AttachedSession = {
 	readonly barrier: ReplayBarrier;
 	readonly capability: SessionAttachment;
 	published: boolean;
+	readonly publication: { promise: Promise<void>; resolve: () => void; reject: (reason?: unknown) => void };
 	dispose: () => void;
 };
 
@@ -542,6 +545,8 @@ export class SessionRouter {
 		}
 		let attached: AttachedSession | undefined;
 		const barrier: ReplayBarrier = { held: undefined, detached: false, failed: false };
+		const publication = Promise.withResolvers<void>();
+		void publication.promise.catch(() => undefined);
 		const capability: SessionAttachment = Object.freeze({
 			sessionId: indexed.sessionId,
 			generation: indexed.endpointGeneration,
@@ -551,6 +556,9 @@ export class SessionRouter {
 				if (!attached || !this.#attachmentPublished(attached))
 					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 				attached.client.send(frame);
+			},
+			retire: async () => {
+				if (attached) await this.#retireAttachment(attached);
 			},
 		});
 		const disposeFrames = client.onFrame(frame => {
@@ -570,10 +578,12 @@ export class SessionRouter {
 			barrier,
 			capability,
 			published: false,
+			publication,
 			dispose: () => {
 				disposeFrames();
 				disposeReconnect?.();
 				barrier.detached = true;
+				if (!attached?.published) publication.reject(new SessionRouterError("pre_send"));
 				barrier.held = undefined;
 			},
 		};
@@ -607,6 +617,7 @@ export class SessionRouter {
 			return false;
 		}
 		attached.published = true;
+		attached.publication.resolve();
 		try {
 			await this.#deps.onAttachmentReady?.(capability);
 		} catch (error) {
@@ -652,6 +663,18 @@ export class SessionRouter {
 
 	#attachmentPublished(attached: AttachedSession): boolean {
 		return attached.published && this.#attachmentLive(attached);
+	}
+
+	async #retireAttachment(attached: AttachedSession): Promise<void> {
+		if (this.#sessions.get(attached.sessionId) !== attached) return;
+		this.#sessions.delete(attached.sessionId);
+		attached.dispose();
+		await attached.client.close().catch(() => undefined);
+		try {
+			await this.#deps.onSessionRemoved?.(attached.capability);
+		} catch {
+			// Exact authority is already revoked; provider cleanup remains best effort.
+		}
 	}
 
 	#failBarrier(attached: AttachedSession, reason: string): void {
@@ -728,6 +751,10 @@ export class SessionRouter {
 			.catch(() => undefined)
 			.then(async () => {
 				if (!this.#attachmentLive(attached)) return;
+				if (!attached.published) {
+					await attached.publication.promise.catch(() => undefined);
+					if (!this.#attachmentPublished(attached)) return;
+				}
 				const correlated = this.#correlateFrame(frame);
 				if (!correlated) return;
 				const seq = typeof frame.seq === "number" && Number.isSafeInteger(frame.seq) ? frame.seq : undefined;

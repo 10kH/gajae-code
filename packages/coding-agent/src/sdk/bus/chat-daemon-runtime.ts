@@ -338,12 +338,20 @@ export class ChatDaemonRuntime {
 	}
 
 	async stop(): Promise<void> {
-		await Promise.all([this.#discord?.stop(), this.#slack?.stop()]);
+		const providerResults = await Promise.allSettled([this.#discord?.stop(), this.#slack?.stop()]);
 		this.#discord = undefined;
 		this.#slack = undefined;
 		this.#presentation = undefined;
 		this.#transportHealthy = undefined;
 		await this.#router.stop();
+		const failures = providerResults.filter(
+			(result): result is PromiseRejectedResult => result.status === "rejected",
+		);
+		if (failures.length > 0)
+			throw new AggregateError(
+				failures.map(result => result.reason),
+				"Provider shutdown failed after Router authority revocation.",
+			);
 	}
 
 	/** Adopt an operator-supplied Slack root through the provider's presentation store. */

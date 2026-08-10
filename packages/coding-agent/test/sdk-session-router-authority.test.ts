@@ -5,7 +5,13 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 
 import type { SessionIndex } from "../src/sdk/broker/session-index";
-import { type SessionAttachment, SessionRouter, type SessionRouterClient, SessionRouterError } from "../src/sdk/router";
+import {
+	type SessionAttachment,
+	SessionRouter,
+	type SessionRouterClient,
+	SessionRouterError,
+	type SessionRouterFrame,
+} from "../src/sdk/router";
 
 const tempDirs: string[] = [];
 
@@ -18,6 +24,7 @@ async function routerFixture(
 		onAttachment?: (attachment: SessionAttachment) => void | Promise<void>;
 		onAttachmentReady?: (attachment: SessionAttachment) => void | Promise<void>;
 		onSessionRemoved?: (attachment: SessionAttachment) => void | Promise<void>;
+		onFrame?: (attachment: SessionAttachment, frame: SessionRouterFrame) => void | Promise<void>;
 		start?: boolean;
 	} = {},
 ) {
@@ -57,6 +64,7 @@ async function routerFixture(
 		sent: Record<string, unknown>[];
 		requests: Record<string, unknown>[];
 		client: SessionRouterClient;
+		emit: (frame: Record<string, unknown>) => void;
 	}> = [];
 	const attachments: SessionAttachment[] = [];
 	const router = new SessionRouter({
@@ -66,8 +74,14 @@ async function routerFixture(
 			createClient: async () => {
 				const sent: Record<string, unknown>[] = [];
 				const requests: Record<string, unknown>[] = [];
+				let handler: ((frame: Record<string, unknown>) => void) | undefined;
 				const client: SessionRouterClient = {
-					onFrame: () => () => {},
+					onFrame: next => {
+						handler = next;
+						return () => {
+							if (handler === next) handler = undefined;
+						};
+					},
 					request: async operation => {
 						requests.push(operation);
 						return { events: [] };
@@ -75,7 +89,7 @@ async function routerFixture(
 					close: async () => {},
 					send: frame => sent.push(frame),
 				};
-				clients.push({ sent, requests, client });
+				clients.push({ sent, requests, client, emit: frame => handler?.(frame) });
 				return client;
 			},
 			onAttachment: attachment => {
@@ -83,6 +97,7 @@ async function routerFixture(
 				attachments.push(attachment);
 			},
 			onAttachmentReady: options.onAttachmentReady,
+			onFrame: options.onFrame,
 			onSessionRemoved: options.onSessionRemoved,
 			setInterval: (() => 0) as unknown as typeof setInterval,
 			clearInterval: (() => {}) as unknown as typeof clearInterval,
@@ -221,6 +236,32 @@ describe("SessionRouter dispatch authority", () => {
 		await expect(request).rejects.toBeInstanceOf(SessionRouterError);
 		await starting;
 		expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+		await fixture.router.stop();
+	});
+
+	test("holds live frames until provider publication succeeds", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const frames: SessionRouterFrame[] = [];
+		const fixture = await routerFixture({
+			start: false,
+			onAttachment: async () => {
+				entered.resolve();
+				await release.promise;
+			},
+			onFrame: (_attachment, frame) => {
+				frames.push(frame);
+			},
+		});
+		const starting = fixture.router.start();
+		await entered.promise;
+		fixture.clients[0]?.emit({ type: "notification", sessionId: fixture.sessionId });
+		await Bun.sleep(10);
+		expect(frames).toEqual([]);
+		release.resolve();
+		await starting;
+		await Bun.sleep(10);
+		expect(frames).toHaveLength(1);
 		await fixture.router.stop();
 	});
 
