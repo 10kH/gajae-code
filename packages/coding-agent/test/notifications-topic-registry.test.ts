@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes Discord REST-timeout generation 129 at serving epoch 76", () => {
+test("publishes Discord lease-fence generation 130 at serving epoch 77", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 129 / serving epoch 76: every Discord REST operation has a total deadline.
-	expect(DAEMON_GENERATION).toBe(129);
-	expect(SERVING_EPOCH).toBe(76);
+	// Generation 130 / serving epoch 77: daemon stop invalidates Discord effect renewal and late commit.
+	expect(DAEMON_GENERATION).toBe(130);
+	expect(SERVING_EPOCH).toBe(77);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
