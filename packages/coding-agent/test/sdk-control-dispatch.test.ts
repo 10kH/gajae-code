@@ -58,6 +58,17 @@ const methodByOperation: Record<string, string> = {
 	"bash.background": "backgroundBash",
 };
 
+const BROKER_LIFECYCLE_OPERATIONS = new Set([
+	"session.new",
+	"session.fork",
+	"session.resume",
+	"session.close",
+	"session.switch",
+	"session.branch",
+	"session.handoff",
+	"session.delete",
+]);
+
 function request(row: (typeof OPERATIONS)[number]): ControlRequest {
 	return {
 		id: row.id,
@@ -107,7 +118,7 @@ test("dispatches every control registry operation to its ControlSurface method",
 				},
 		},
 	) as ControlSurface;
-	const rows = OPERATIONS.filter(row => row.kind === "control");
+	const rows = OPERATIONS.filter(row => row.kind === "control" && !BROKER_LIFECYCLE_OPERATIONS.has(row.sdkId));
 	for (const row of rows) {
 		const response = await dispatchControl(surface, row, request(row));
 		expect(response).toEqual({ id: row.id, ok: true, result: methodByOperation[row.sdkId] });
@@ -167,14 +178,12 @@ test("forwards an optional thinking level with model.set without changing legacy
 	]);
 });
 
-test("session.handoff surfaces the retained handoff document in the error details", async () => {
+test("session.handoff remains available only through the Broker lifecycle service", async () => {
 	const row = OPERATIONS.find(operation => operation.sdkId === "session.handoff")!;
+	let called = false;
 	const surface = {
 		handoffSession: () => {
-			throw Object.assign(new Error("Handoff is unavailable for the current state."), {
-				code: "invalid_request",
-				handoffDocument: "## Goal\nRetained across the SDK wire",
-			});
+			called = true;
 		},
 	} as unknown as ControlSurface;
 
@@ -184,8 +193,9 @@ test("session.handoff surfaces the retained handoff document in the error detail
 	});
 
 	expect(response.ok).toBe(false);
-	expect(response.error?.code).toBe("invalid_request");
-	expect(response.error?.details).toEqual({ handoffDocument: "## Goal\nRetained across the SDK wire" });
+	expect(response.error?.code).toBe("operation_prohibited");
+	expect(response.error?.details).toBeUndefined();
+	expect(called).toBe(false);
 });
 
 test("non-handoff control failures do not attach handoff details", async () => {
