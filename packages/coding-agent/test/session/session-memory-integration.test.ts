@@ -365,6 +365,11 @@ describe("SessionManager cold sidecar integration", () => {
 				});
 				expect(reopened.getSessionMemoryStats().totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 				expect(reopened.hotRetainedMessageCharsForTests()).toBeLessThan(1024);
+				const selection = await reopened.stageDefaultModelSelection("provider/model", "high", {
+					appendThinkingLevel: true,
+				});
+				expect(selection.boundedCold).toBe(true);
+				expect(reopened.promoteDefaultModelSelection(selection)).toEqual({ kind: "promoted" });
 				const reopenedStat = fs.statSync(sessionFile);
 				fs.utimesSync(sessionFile, reopenedStat.atime, new Date(reopenedStat.mtimeMs + 2_000));
 				expect(reopened.getEntry(coldId)?.id).toBe(coldId);

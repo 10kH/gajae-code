@@ -1291,18 +1291,20 @@ export class ManagedSessionDescendantStore {
 
 	captureBoundedAppendExpectation(relativePath: string): ManagedBoundedAppendExpectation | undefined {
 		this.#assertBound();
-		if (!this.#authority) return undefined;
-		const observed = this.#authority.stat(this.#relative(this.#resolve(relativePath)));
-		if (!observed.ok || !observed.identity) return undefined;
-		const sha256 = observed.identity.sha256;
-		if (typeof sha256 !== "string" || !/^[0-9a-f]{64}$/i.test(sha256)) return undefined;
+		let identity: ManagedFileSnapshot["identity"];
+		try {
+			identity = captureManagedFileIdentityStreamingNoFollow(this.#resolve(relativePath));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		}
 		return {
-			dev: observed.identity.dev,
-			ino: observed.identity.ino,
-			size: observed.identity.size,
-			mtimeNs: observed.identity.mtimeNs,
-			ctimeNs: observed.identity.ctimeNs,
-			sha256: sha256.toLowerCase(),
+			dev: identity.dev.toString(),
+			ino: identity.ino.toString(),
+			size: identity.size.toString(),
+			mtimeNs: identity.mtimeNs.toString(),
+			ctimeNs: identity.ctimeNs.toString(),
+			sha256: identity.sha256,
 		};
 	}
 
@@ -1313,7 +1315,26 @@ export class ManagedSessionDescendantStore {
 	): ManagedAppendReceipt {
 		this.#beforeMutation();
 		this.#assertBound();
-		if (!this.#authority) throw new Error("managed_bounded_append_unavailable");
+		if (!this.#authority) {
+			const current = captureManagedFileIdentityStreamingNoFollow(this.#resolve(relativePath));
+			if (
+				current.dev.toString() !== expected.dev ||
+				current.ino.toString() !== expected.ino ||
+				current.size.toString() !== expected.size ||
+				current.mtimeNs.toString() !== expected.mtimeNs ||
+				current.ctimeNs.toString() !== expected.ctimeNs ||
+				current.sha256 !== expected.sha256
+			)
+				throw new Error("managed_append_identity_mismatch");
+			const appended = appendManagedFileStreamingSync(
+				this.#resolve(relativePath),
+				bytes,
+				this.#subtreeRoot,
+				this.#policy,
+			);
+			this.#assertBound();
+			return managedAppendReceiptFromIdentity(appended);
+		}
 		const relative = this.#relative(this.#resolve(relativePath));
 		const appended = this.#authority.appendManaged(
 			relative,

@@ -7952,6 +7952,8 @@ export class SessionManager {
 			this.#ensuredOnDisk = true;
 			return;
 		}
+		if (this.destination.kind === "managed" && this.#sessionMemoryMode === "enabled")
+			throw new Error("managed_bounded_open_failed");
 		const eagerStat = this.#statSync(resolvedSessionFile);
 		if (eagerStat.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES) throw new SessionTranscriptOversizedError(eagerStat.size);
 		const entries = await loadEntriesFromFile(resolvedSessionFile, this.#storage);
