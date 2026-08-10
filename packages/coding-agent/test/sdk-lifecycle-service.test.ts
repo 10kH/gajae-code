@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as brokerEnsure from "../src/sdk/broker/ensure";
+import { lifecycleRequestTimeoutMs } from "../src/sdk/broker/startup-budget";
 import { SdkClient } from "../src/sdk/client/client";
 import * as sdkDiscovery from "../src/sdk/client/discovery";
 import {
@@ -365,6 +366,10 @@ describe("SessionLifecycleService", () => {
 			expect(createSpy.mock.calls[0]?.[0]).toMatchObject({
 				target: { cwd: requested, stateRoot: path.join(requested, ".gjc", "state") },
 			});
+			const createRequest = createSpy.mock.calls[0]?.[0];
+			expect(createRequest?.timeoutMs).toBe(
+				lifecycleRequestTimeoutMs("session.create", { ...(createRequest?.target ?? {}) }),
+			);
 
 			const parentFile = path.join(root, "not-a-directory");
 			await fs.writeFile(parentFile, "file");

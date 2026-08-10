@@ -1106,6 +1106,13 @@ export class AcpAgent implements Agent {
 					if (record) record.attachment = attachment;
 					adapter.acceptAttachment(attachment);
 				},
+				onAttachmentReady: async attachment => {
+					const record = this.#sessions.get(attachment.sessionId);
+					const adapter = record?.adapter ?? this.#pendingRouterAdapters.get(attachment.sessionId);
+					if (!adapter) return;
+					if (record) record.attachment = attachment;
+					await adapter.attachmentReady(attachment);
+				},
 				onFrame: (attachment, frame) => {
 					const acpFrame = acpFrameFromRouted(frame);
 					const adapter =
@@ -1797,6 +1804,8 @@ export class AcpAgent implements Agent {
 	async #attachEndpoint(id: string, cwd: string, epoch: number, lifecycleResult?: unknown): Promise<void> {
 		let adapter: AcpSdkAdapter | undefined;
 		const bufferedFrames: Record<string, unknown>[] = [];
+		const pendingAdapterFrames: Record<string, unknown>[] = [];
+		let unsubscribePendingFrames = () => {};
 		this.#pendingRouterFrames.set(id, bufferedFrames);
 		try {
 			await this.#ensureRouterReady();
@@ -1820,9 +1829,9 @@ export class AcpAgent implements Agent {
 				connection: this.#reverseConnection(id),
 				providers: this.#providers(),
 			});
+			unsubscribePendingFrames = adapter.onFrame(frame => pendingAdapterFrames.push(frame));
 			this.#pendingRouterAdapters.set(id, adapter);
 			await adapter.start();
-			for (const frame of bufferedFrames) adapter.acceptFrame(frame);
 			let capabilities: JsonObject | undefined;
 			try {
 				const response = object(await adapter.query("runtime.capabilities"));
@@ -1859,6 +1868,9 @@ export class AcpAgent implements Agent {
 				this.#recoverSessionAfterTransportFailure(id, adapter!, error),
 			);
 			this.#sessions.set(id, record);
+			unsubscribePendingFrames();
+			for (const frame of bufferedFrames) adapter.acceptFrame(frame);
+			for (const frame of pendingAdapterFrames) this.#enqueueSdkFrame(id, adapter, frame);
 			this.#pendingRouterAdapters.delete(id);
 			this.#pendingRouterFrames.delete(id);
 			this.#knownSessionCwds.set(id, cwd);
@@ -1866,6 +1878,7 @@ export class AcpAgent implements Agent {
 			this.#assertSessionEpoch(id, epoch);
 			this.#pendingCloseIdempotencyKeys.delete(id);
 		} catch (error) {
+			unsubscribePendingFrames();
 			this.#pendingRouterAdapters.delete(id);
 			this.#pendingRouterFrames.delete(id);
 			if (adapter && this.#sessions.get(id)?.adapter === adapter) {

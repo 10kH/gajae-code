@@ -1,6 +1,10 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isValidReadinessTimeoutMs, READINESS_TIMEOUT_INVALID_MESSAGE } from "../broker/startup-budget";
+import {
+	isValidReadinessTimeoutMs,
+	lifecycleRequestTimeoutMs,
+	READINESS_TIMEOUT_INVALID_MESSAGE,
+} from "../broker/startup-budget";
 import { AgentDirSessionLifecycleClient } from "./broker-client";
 import { type ListRecentSessionsResult, listRecentSessions, type RecentSessionEntry } from "./recent-sessions";
 import {
@@ -139,7 +143,7 @@ export class AgentDirSessionLifecycleService extends SessionLifecycleService {
 			capability: "session.create",
 			requestKey: validation.requestKey,
 			target,
-			...(readinessTimeoutMs === undefined ? {} : { timeoutMs: readinessTimeoutMs + 1_000 }),
+			timeoutMs: lifecycleRequestTimeoutMs("session.create", target),
 		});
 	}
 
@@ -205,19 +209,20 @@ export class AgentDirSessionLifecycleService extends SessionLifecycleService {
 		const selected = resolved[0]!;
 		if (!selected.path) return { kind: "unavailable", message: "Saved session workspace is unavailable." };
 		const selectedCwd = path.resolve(selected.path);
+		const target = {
+			sessionId: selected.sessionId,
+			cwd: selectedCwd,
+			stateRoot: path.join(selectedCwd, ".gjc", "state"),
+			sessionPath: selected.sessionStateFile,
+			...(request.modelPreset === undefined ? {} : { modelPreset: request.modelPreset }),
+			...(readinessTimeoutMs === undefined ? {} : { readinessTimeoutMs }),
+		};
 		const outcome = await this.resume({
 			actor: validation.actor,
 			capability: "session.resume",
 			requestKey: validation.requestKey,
-			target: {
-				sessionId: selected.sessionId,
-				cwd: selectedCwd,
-				stateRoot: path.join(selectedCwd, ".gjc", "state"),
-				sessionPath: selected.sessionStateFile,
-				...(request.modelPreset === undefined ? {} : { modelPreset: request.modelPreset }),
-				...(readinessTimeoutMs === undefined ? {} : { readinessTimeoutMs }),
-			},
-			...(readinessTimeoutMs === undefined ? {} : { timeoutMs: readinessTimeoutMs + 1_000 }),
+			target,
+			timeoutMs: lifecycleRequestTimeoutMs("session.resume", target),
 		});
 		return { kind: "result", outcome };
 	}
