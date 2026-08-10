@@ -757,7 +757,12 @@ export class SessionRouter {
 			},
 		});
 		const disposeFrames = client.onFrame(frame => {
-			if (attached) this.#schedule(this.#enqueueFrame(attached, frame, "live"));
+			if (!attached) return;
+			const task =
+				frame.type === "event_replay_result" && frame.seq === undefined
+					? this.#deliverOutOfBandFrame(attached, frame)
+					: this.#enqueueFrame(attached, frame, "live");
+			this.#schedule(task);
 		});
 		const disposeReconnect = client.onReconnect?.(() => {
 			if (attached) this.#schedule(this.#replayAttachment(attached, attached.cursor.seq));
@@ -988,6 +993,18 @@ export class SessionRouter {
 		);
 	}
 
+	async #deliverOutOfBandFrame(attached: AttachedSession, frame: Record<string, unknown>): Promise<void> {
+		if (!this.#attachmentLive(attached)) return;
+		if (!attached.published) {
+			await attached.publication.promise.catch(() => undefined);
+			if (!this.#attachmentPublished(attached)) return;
+		}
+		const correlated = this.#correlateFrame(frame);
+		if (!correlated) return;
+		if (correlated.sessionId !== undefined && correlated.sessionId !== attached.sessionId) return;
+		if (correlated.generation !== undefined && correlated.generation !== attached.generation) return;
+		await this.#deps.onFrame?.(attached.capability, correlated);
+	}
 	#enqueueFrame(attached: AttachedSession, frame: Record<string, unknown>, origin: FrameOrigin): Promise<void> {
 		const previous = this.#frameTails.get(attached.id) ?? Promise.resolve();
 		const current = previous
