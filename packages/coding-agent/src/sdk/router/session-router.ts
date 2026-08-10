@@ -95,6 +95,7 @@ type AttachedSession = {
 	readonly cursor: { seq: number };
 	readonly barrier: ReplayBarrier;
 	readonly capability: SessionAttachment;
+	published: boolean;
 	dispose: () => void;
 };
 
@@ -261,7 +262,7 @@ export class SessionRouter {
 	/** Returns an opaque lease only while the exact attachment generation is live. */
 	attachment(sessionId: string, expectedGeneration?: number): SessionAttachment | null {
 		const attached = this.#sessions.get(sessionId);
-		if (!attached || !this.#attachmentLive(attached)) return null;
+		if (!attached || !this.#attachmentPublished(attached)) return null;
 		if (expectedGeneration !== undefined && expectedGeneration !== attached.generation) return null;
 		return attached.capability;
 	}
@@ -271,19 +272,22 @@ export class SessionRouter {
 		sessionId: string,
 		frame: Record<string, unknown>,
 		expectedGeneration?: number,
+		expectedAttachment?: SessionAttachment,
 	): Promise<Record<string, unknown>> {
 		await this.#serialReconcile(this.#runEpoch);
 		const attached = this.#sessions.get(sessionId);
-		if (!attached || !this.#attachmentLive(attached)) throw new SessionRouterError("pre_send");
+		if (!attached || !this.#attachmentPublished(attached)) throw new SessionRouterError("pre_send");
 		if (expectedGeneration !== undefined && expectedGeneration !== attached.generation)
 			throw new SessionRouterError("pre_send", "SDK session endpoint changed before command dispatch.");
+		if (expectedAttachment !== undefined && attached.capability !== expectedAttachment)
+			throw new SessionRouterError("pre_send", "SDK session attachment changed before command dispatch.");
 		return await attached.client.request(frame);
 	}
 
 	/** Resolves the exact provider-neutral binding authority for operator adoption. */
 	async bindingAuthority(sessionId: string): Promise<{ sessionId: string; endpointGeneration: number } | undefined> {
 		const attached = this.#sessions.get(sessionId);
-		if (!attached || !this.#attachmentLive(attached)) return undefined;
+		if (!attached || !this.#attachmentPublished(attached)) return undefined;
 		let indexed: IndexedSession | undefined;
 		try {
 			await this.#index.refresh();
@@ -304,7 +308,7 @@ export class SessionRouter {
 		if (!Number.isSafeInteger(indexed.pid) || indexed.pid <= 0) return undefined;
 		const endpoint = await this.#readEndpoint(indexed).catch(() => null);
 		if (!endpoint || endpoint.stale === true || endpoint.pid !== indexed.pid || !endpoint.token) return undefined;
-		if (this.#sessions.get(sessionId) !== attached || !this.#attachmentLive(attached)) return undefined;
+		if (this.#sessions.get(sessionId) !== attached || !this.#attachmentPublished(attached)) return undefined;
 		return { sessionId, endpointGeneration: attached.generation };
 	}
 
@@ -538,10 +542,10 @@ export class SessionRouter {
 		const capability: SessionAttachment = Object.freeze({
 			sessionId: indexed.sessionId,
 			generation: indexed.endpointGeneration,
-			isCurrent: () => attached !== undefined && this.#attachmentLive(attached),
+			isCurrent: () => attached !== undefined && this.#attachmentPublished(attached),
 			send: async (frame: Record<string, unknown>) => {
 				await this.#serialReconcile(runEpoch);
-				if (!attached || !this.#attachmentLive(attached))
+				if (!attached || !this.#attachmentPublished(attached))
 					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 				attached.client.send(frame);
 			},
@@ -562,6 +566,7 @@ export class SessionRouter {
 			cursor: { seq: resumeSeq },
 			barrier,
 			capability,
+			published: false,
 			dispose: () => {
 				disposeFrames();
 				disposeReconnect?.();
@@ -585,12 +590,12 @@ export class SessionRouter {
 				}
 			throw error;
 		}
-		if (!this.#running(runEpoch)) {
-			const staleStillCurrent = this.#sessions.get(indexed.sessionId) === attached;
-			if (staleStillCurrent) this.#sessions.delete(indexed.sessionId);
+		const publicationStillCurrent = this.#sessions.get(indexed.sessionId) === attached;
+		if (!this.#running(runEpoch) || !publicationStillCurrent) {
+			if (publicationStillCurrent) this.#sessions.delete(indexed.sessionId);
 			attached.dispose();
 			await attached.client.close().catch(() => undefined);
-			if (staleStillCurrent)
+			if (publicationStillCurrent)
 				try {
 					await this.#deps.onSessionRemoved?.(capability);
 				} catch {
@@ -598,6 +603,7 @@ export class SessionRouter {
 				}
 			return false;
 		}
+		attached.published = true;
 		if (!(await this.#deliverRecoveredFrames(attached))) return false;
 		await this.#replayAttachment(attached, attached.cursor.seq);
 		return true;
@@ -623,6 +629,10 @@ export class SessionRouter {
 			!attached.barrier.failed &&
 			this.#sessions.get(attached.sessionId) === attached
 		);
+	}
+
+	#attachmentPublished(attached: AttachedSession): boolean {
+		return attached.published && this.#attachmentLive(attached);
 	}
 
 	#failBarrier(attached: AttachedSession, reason: string): void {
