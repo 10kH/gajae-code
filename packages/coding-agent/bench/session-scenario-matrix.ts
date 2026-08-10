@@ -108,6 +108,7 @@ type WorkerResult = {
 	gcStrategy: GcStrategy;
 	secondaryArtifacts: SecondaryArtifacts;
 	repetitions: number;
+	repetitionIndex?: number;
 	status: Status;
 	fileCount: number;
 	totalBytes: number;
@@ -186,6 +187,7 @@ type MatrixReport = {
 	gcStrategy: GcStrategy;
 	secondaryArtifacts: SecondaryArtifacts;
 	repetitions: number;
+	samples: number;
 	smallComparisonSizesMiB?: number[];
 	runs: WorkerResult[];
 };
@@ -198,6 +200,7 @@ type ParentArgs = {
 	gcStrategy: GcStrategy;
 	secondaryArtifacts: SecondaryArtifacts;
 	repetitions: number;
+	samples: number;
 	outPrefix: string;
 	smallComparison: boolean;
 };
@@ -1035,6 +1038,7 @@ function parseParentArgs(argv: string[]): ParentArgs {
 	let gcStrategy: GcStrategy = "current";
 	let secondaryArtifacts: SecondaryArtifacts = "current";
 	let repetitions = DEFAULT_REPETITIONS;
+	let samples = 1;
 	let outPrefix = "artifacts/session-scenario-matrix-2026-08-10";
 	let smallComparison = false;
 	let explicitModes = false;
@@ -1066,6 +1070,10 @@ function parseParentArgs(argv: string[]): ParentArgs {
 			const value = Number.parseInt(argv[++index] ?? "", 10);
 			if (!Number.isSafeInteger(value) || value < 1 || value > 100) throw new Error("--repetitions must be between 1 and 100");
 			repetitions = value;
+		} else if (argument === "--samples") {
+			const value = Number.parseInt(argv[++index] ?? "", 10);
+			if (!Number.isSafeInteger(value) || value < 1 || value > 20) throw new Error("--samples must be between 1 and 20");
+			samples = value;
 		} else if (argument === "--small-session-comparison" || argument === "--compare-small-modes") {
 			smallComparison = true;
 		} else if (argument === "--out-prefix") {
@@ -1079,7 +1087,7 @@ function parseParentArgs(argv: string[]): ParentArgs {
 		if (!explicitSizes) sizesMiB = [...SMALL_COMPARISON_SIZES_MIB];
 		if (!explicitModes) sessionMemoryModes = ["enabled", "shadow", "off"];
 	}
-	return { sizesMiB, scenarios, operations, sessionMemoryModes, gcStrategy, secondaryArtifacts, repetitions, outPrefix, smallComparison };
+	return { sizesMiB, scenarios, operations, sessionMemoryModes, gcStrategy, secondaryArtifacts, repetitions, samples, outPrefix, smallComparison };
 }
 
 function gitSha(): string | null {
@@ -1094,7 +1102,7 @@ function csvCell(value: unknown): string {
 
 function reportCsv(report: MatrixReport): string {
 	const headers = [
-		"scenario", "operationClass", "sessionMemoryMode", "gcStrategy", "secondaryArtifacts", "repetitions", "targetMiB", "status", "fileCount", "entryCount", "generationMs", "firstOpenMs", "exactAuthenticatedReopenMs", "transcriptAheadReopenMs", "repeatedLifecycleMs", "firstOpenP95Ms",
+		"scenario", "operationClass", "sessionMemoryMode", "gcStrategy", "secondaryArtifacts", "repetitions", "repetitionIndex", "targetMiB", "status", "fileCount", "entryCount", "generationMs", "firstOpenMs", "exactAuthenticatedReopenMs", "transcriptAheadReopenMs", "repeatedLifecycleMs", "firstOpenP95Ms",
 		"throughputMiBPerSecond", "operationRssGrowthMiB", "firstOpenRssGrowthMiB", "lookupRssGrowthMiB", "teardownRssGrowthMiB", "maxRssMiB", "phaseEvidenceJson", "counterEvidenceJson",
 		"coldLookupP95Ms", "warmLookupP95Ms", "coldRangeReads", "warmRangeReads", "accountedMiB", "sidecarEnabled", "coldRetirementActive", "dictionaryArtifactEnabled", "parentArtifactEnabled", "gcRequests", "bytesRead", "bytesWritten", "recordsParsed", "indexWriteCalls", "fsyncCount", "failureCode",
 	];
@@ -1105,6 +1113,7 @@ function reportCsv(report: MatrixReport): string {
 		run.gcStrategy,
 		run.secondaryArtifacts,
 		run.repetitions,
+		run.repetitionIndex ?? 0,
 		run.targetMiB,
 		run.status,
 		run.fileCount,
@@ -1243,14 +1252,18 @@ async function runParent(): Promise<void> {
 		for (const sessionMemoryMode of args.sessionMemoryModes) {
 			for (const scenario of args.scenarios) {
 				for (const sizeMiB of args.sizesMiB) {
-					const child = Bun.spawnSync({
-						cmd: [process.execPath, "--smol", "--expose-gc", import.meta.path, "--worker", scenario, String(sizeMiB), operation, sessionMemoryMode, args.gcStrategy, args.secondaryArtifacts, String(args.repetitions)],
-						stdout: "pipe",
-						stderr: "pipe",
-						env: benchmarkEnv(args.gcStrategy, args.secondaryArtifacts),
-					});
-					if (child.exitCode !== 0) throw new Error(child.stderr.toString() || `worker exited ${child.exitCode}`);
-					runs.push(JSON.parse(child.stdout.toString()) as WorkerResult);
+					for (let repetitionIndex = 0; repetitionIndex < args.samples; repetitionIndex++) {
+						const child = Bun.spawnSync({
+							cmd: [process.execPath, "--smol", "--expose-gc", import.meta.path, "--worker", scenario, String(sizeMiB), operation, sessionMemoryMode, args.gcStrategy, args.secondaryArtifacts, String(args.repetitions)],
+							stdout: "pipe",
+							stderr: "pipe",
+							env: benchmarkEnv(args.gcStrategy, args.secondaryArtifacts),
+						});
+						if (child.exitCode !== 0) throw new Error(child.stderr.toString() || `worker exited ${child.exitCode}`);
+						const run = JSON.parse(child.stdout.toString()) as WorkerResult;
+						run.repetitionIndex = repetitionIndex;
+						runs.push(run);
+					}
 				}
 			}
 		}
@@ -1271,6 +1284,7 @@ async function runParent(): Promise<void> {
 		gcStrategy: args.gcStrategy,
 		secondaryArtifacts: args.secondaryArtifacts,
 		repetitions: args.repetitions,
+		samples: args.samples,
 		smallComparisonSizesMiB: args.smallComparison ? [...SMALL_COMPARISON_SIZES_MIB] : undefined,
 		runs,
 	};
