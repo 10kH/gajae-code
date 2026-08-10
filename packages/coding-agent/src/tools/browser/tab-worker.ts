@@ -28,7 +28,11 @@ import {
 	loadPuppeteerInWorker,
 } from "./launch";
 import { extractReadableFromHtml, type ReadableFormat, type ReadableResult } from "./readable";
-import { BrowserRuntimeDiagnosticsMailbox, instrumentBrowserRuntimeDiagnostics } from "./runtime-diagnostics";
+import {
+	BrowserRuntimeDiagnosticsMailbox,
+	instrumentBrowserRuntimeDiagnostics,
+	serializeRuntimeDiagnostics,
+} from "./runtime-diagnostics";
 import { formatScreenshot } from "./screenshot-format";
 import type {
 	Observation,
@@ -76,6 +80,16 @@ const INTERACTIVE_AX_ROLES = new Set([
 ]);
 
 const LEGACY_SELECTOR_PREFIXES = ["p-aria/", "p-text/", "p-xpath/", "p-pierce/"] as const;
+
+/**
+ * Test seam: override the worker's puppeteer loader so WorkerCore-level tests can
+ * inject a fake browser/page without a live Chromium. Mirrors the supervisor's
+ * `__setAcquireTabWorkerDepsForTest` pattern.
+ */
+let loadPuppeteerInWorkerForTest: typeof loadPuppeteerInWorker | undefined;
+export function __setLoadPuppeteerInWorkerForTest(loader: typeof loadPuppeteerInWorker | undefined): void {
+	loadPuppeteerInWorkerForTest = loader;
+}
 
 type DialogPolicy = "accept" | "dismiss";
 type DragTarget = string | { readonly x: number; readonly y: number };
@@ -451,7 +465,7 @@ export class WorkerCore {
 	async #init(payload: WorkerInitPayload): Promise<void> {
 		try {
 			this.#mode = payload.mode;
-			const puppeteer = await loadPuppeteerInWorker(payload.safeDir);
+			const puppeteer = await (loadPuppeteerInWorkerForTest ?? loadPuppeteerInWorker)(payload.safeDir);
 			this.#browser = await puppeteer.connect({
 				browserWSEndpoint: payload.browserWSEndpoint,
 				defaultViewport: null,
@@ -461,7 +475,7 @@ export class WorkerCore {
 				this.#page = await this.#browser.newPage();
 				await applyStealthPatches(this.#browser, this.#page, { browserSession: null, override: null }, payload.geo);
 				await applyViewport(this.#page, payload.viewport);
-				await this.#instrumentRuntimeDiagnostics(this.#page);
+				if (payload.runtimeDiagnostics) await this.#instrumentRuntimeDiagnostics(this.#page);
 				if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
 				if (payload.url) {
 					await this.#page.goto(payload.url, {
@@ -472,7 +486,7 @@ export class WorkerCore {
 				}
 			} else {
 				this.#page = await this.#findAttachedPage(payload.targetId);
-				await this.#instrumentRuntimeDiagnostics(this.#page);
+				if (payload.runtimeDiagnostics) await this.#instrumentRuntimeDiagnostics(this.#page);
 				if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
 			}
 			this.#targetId = await targetIdForPage(this.#page);
@@ -597,12 +611,9 @@ export class WorkerCore {
 					cancelRejection,
 				]);
 				await this.#postReadyInfo();
-				const { runtimeDiagnostics, runtimeDiagnosticsDropped } = this.#runtimeDiagnostics.drain();
-				if (runtimeDiagnostics.length || runtimeDiagnosticsDropped) {
-					displays.push({
-						type: "text",
-						text: safeJsonStringify({ runtimeDiagnostics, runtimeDiagnosticsDropped }),
-					});
+				const drained = this.#runtimeDiagnostics.drain();
+				if (drained.runtimeDiagnostics.length || drained.runtimeDiagnosticsDropped) {
+					displays.push({ type: "text", text: serializeRuntimeDiagnostics(drained) });
 				}
 				this.#transport.send({
 					type: "result",
