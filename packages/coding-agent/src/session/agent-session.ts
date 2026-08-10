@@ -4975,7 +4975,8 @@ export class AgentSession {
 						};
 						const hasQueuedMessages = this.agent.hasQueuedMessages();
 						const startsQueuedSuccessor =
-							hasQueuedMessages && (options?.continueQueuedOnly === true || this.agent.state.messages.at(-1)?.role === "assistant");
+							hasQueuedMessages &&
+							(options?.continueQueuedOnly === true || this.agent.state.messages.at(-1)?.role === "assistant");
 						const continueQueued = options?.continueQueuedOnly
 							? this.agent.continueQueuedMessages.bind(this.agent)
 							: this.agent.continue.bind(this.agent);
