@@ -63,25 +63,24 @@ describe("SessionLifecycleService", () => {
 		expect(client.calls).toHaveLength(0);
 	});
 
-	it("derives deterministic keys while separating actor, request, and target identity", async () => {
+	it("derives deterministic keys while separating actor, request, and operation identity", async () => {
 		const first = serviceWith();
 		const second = serviceWith();
 		await first.service.create({ actor, capability: "session.create", requestKey: "request-1", target });
 		await second.service.create({ actor, capability: "session.create", requestKey: "request-1", target });
 		expect(first.client.calls[0]?.options.idempotencyKey).toBe(second.client.calls[0]?.options.idempotencyKey);
 		expect(first.client.calls[0]?.options.idempotencyKey).toBe(
-			deriveSessionLifecycleIdempotencyKey(actor, "request-1", "session.create", target),
+			deriveSessionLifecycleIdempotencyKey(actor, "request-1", "session.create"),
 		);
 
 		const actorKey = deriveSessionLifecycleIdempotencyKey(
 			{ ...actor, id: "operator-2" },
 			"request-1",
 			"session.create",
-			target,
 		);
-		const requestKey = deriveSessionLifecycleIdempotencyKey(actor, "request-2", "session.create", target);
-		const targetKey = deriveSessionLifecycleIdempotencyKey(actor, "request-1", "session.create", { cwd: "/other" });
-		expect(new Set([first.client.calls[0]?.options.idempotencyKey, actorKey, requestKey, targetKey]).size).toBe(4);
+		const requestKey = deriveSessionLifecycleIdempotencyKey(actor, "request-2", "session.create");
+		const operationKey = deriveSessionLifecycleIdempotencyKey(actor, "request-1", "session.fork");
+		expect(new Set([first.client.calls[0]?.options.idempotencyKey, actorKey, requestKey, operationKey]).size).toBe(4);
 	});
 
 	it("maps every lifecycle operation to its Broker operation and input", async () => {

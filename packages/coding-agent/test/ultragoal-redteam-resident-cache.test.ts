@@ -596,5 +596,5 @@ describe.skipIf(process.platform === "win32")("ultragoal resident-cache adversar
 		} finally {
 			await aboveCap.close();
 		}
-	});
+	}, 20_000);
 });

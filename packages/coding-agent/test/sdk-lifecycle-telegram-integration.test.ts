@@ -43,7 +43,7 @@ describe("SDK-owned Telegram lifecycle integration", () => {
 		expect(calls).toHaveLength(2);
 		expect(calls[0]?.options.idempotencyKey).toBe(calls[1]?.options.idempotencyKey);
 		expect(calls[0]?.options.idempotencyKey).toBe(
-			deriveSessionLifecycleIdempotencyKey(actor, "telegram:42:17", "session.create", target),
+			deriveSessionLifecycleIdempotencyKey(actor, "telegram:42:17", "session.create"),
 		);
 		expect(first).toEqual({ ok: true, operation: "session.create", result: { sessionId: "broker-session-1" } });
 		expect(second).toEqual(first);

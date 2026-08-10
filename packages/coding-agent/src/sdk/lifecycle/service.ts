@@ -292,24 +292,17 @@ function canonicalJson(value: unknown): string {
 	return JSON.stringify(String(value));
 }
 
-/** Returns the canonical target identity used for the service idempotency namespace. */
-export function canonicalSessionLifecycleTarget(target: Readonly<Record<string, unknown>>): string {
-	return canonicalJson(target);
-}
-
 /** Derives a stable Broker idempotency key without exposing caller identity to Broker inputs. */
 export function deriveSessionLifecycleIdempotencyKey(
 	actor: SessionLifecycleActor,
 	requestKey: string,
 	operation: SessionLifecycleOperation,
-	target: Readonly<Record<string, unknown>>,
 ): string {
 	const identity = {
 		actorNamespace: actor.namespace,
 		actorId: actor.id,
 		requestKey,
 		operation,
-		target: canonicalSessionLifecycleTarget(target),
 	};
 	return createHash("sha256").update(canonicalJson(identity), "utf8").digest("hex");
 }
@@ -516,7 +509,7 @@ export class SessionLifecycleService {
 		const validation = validateSessionLifecycleMutationRequest(request);
 		if (!validation.ok) return validation;
 		const { operation, actor, requestKey, target } = validation;
-		const idempotencyKey = deriveSessionLifecycleIdempotencyKey(actor, requestKey, operation, target);
+		const idempotencyKey = deriveSessionLifecycleIdempotencyKey(actor, requestKey, operation);
 		let response: unknown;
 		try {
 			response = await this.#client.global(
