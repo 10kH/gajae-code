@@ -17205,7 +17205,6 @@ export class SessionManager {
 			const failedDescriptor = store.descriptorExpected(path.basename(resolved));
 			if (!failedDescriptor || !sameDescriptor(capturedDescriptor, failedDescriptor))
 				throw new Error("source_changed");
-			throw new Error("source_changed");
 		}
 		const captured = store.readExpected(path.basename(resolved));
 		if (

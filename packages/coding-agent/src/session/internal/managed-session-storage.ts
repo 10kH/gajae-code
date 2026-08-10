@@ -1861,7 +1861,6 @@ export class ManagedSessionDescendantStore {
 			throw error;
 		}
 		if (!named.isFile() || named.isSymbolicLink()) throw new Error("managed_remove_failed");
-		if (named.size > BigInt(MANAGED_ARTIFACT_MAX_FILE_BYTES)) throw new Error("content_too_large");
 		let identity: ManagedFileSnapshot["identity"];
 		try {
 			identity = captureManagedFileIdentityStreamingNoFollow(resolved);
