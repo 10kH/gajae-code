@@ -1504,7 +1504,11 @@ test("a frame queued behind a failed publication cannot advance the cursor past 
 			// refuse: the failure warning is the synchronous completion signal from
 			// `#failDelivery` → `#failBarrier`, and reconciling before it arrives races a
 			// replay the delayed retirement would still discard.
-			for (let attempt = 0; attempt < 2_000 && !warnings.some(line => line.includes("publication failed at seq 2")); attempt++)
+			for (
+				let attempt = 0;
+				attempt < 2_000 && !warnings.some(line => line.includes("publication failed at seq 2"));
+				attempt++
+			)
 				await Bun.sleep(1);
 			expect(warnings.some(line => line.includes("publication failed at seq 2"))).toBe(true);
 
