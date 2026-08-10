@@ -298,7 +298,17 @@ export class DiscordNotificationDaemon {
 		while (this.#activeWork.size > 0) await Promise.all([...this.#activeWork]);
 	}
 
+	/**
+	 * Frame-driven publication work is tracked like inbound events so that stop()
+	 * drains it while the Router still holds attachment authority. A session
+	 * replayed during teardown otherwise reaches its post-provider binding
+	 * revalidation only after Router.stop() has revoked the attachment, turning a
+	 * legitimate create into a spurious teardown rejection.
+	 */
 	async notify(input: DiscordNotificationInput): Promise<DiscordConversation> {
+		return await this.#track(this.#notify(input));
+	}
+	async #notify(input: DiscordNotificationInput): Promise<DiscordConversation> {
 		await this.#requireLiveBinding(input.sessionId, input.endpointGeneration);
 		const conversation = await this.#ensureConversation(input);
 		await this.#requireLiveBinding(input.sessionId, input.endpointGeneration);
@@ -331,6 +341,9 @@ export class DiscordNotificationDaemon {
 
 	/** Posts a safe command outcome to the active mapped conversation. */
 	async postCommandResult(sessionId: string, content: string): Promise<boolean> {
+		return await this.#track(this.#postCommandResult(sessionId, content));
+	}
+	async #postCommandResult(sessionId: string, content: string): Promise<boolean> {
 		const record = await this.#bySession(sessionId);
 		if (record?.state !== "active" || !record.threadId) return false;
 		await this.#postEffect(`command-result:${record.threadId}:${randomUUID()}`, record, content);
@@ -367,6 +380,9 @@ export class DiscordNotificationDaemon {
 	}
 
 	async resume(sessionId: string, endpointGeneration: number): Promise<DiscordConversation | undefined> {
+		return await this.#track(this.#resumeAdmission(sessionId, endpointGeneration));
+	}
+	async #resumeAdmission(sessionId: string, endpointGeneration: number): Promise<DiscordConversation | undefined> {
 		const running = this.#resumes.get(sessionId);
 		if (running) return await running;
 		const task = this.#resume(sessionId, endpointGeneration);
