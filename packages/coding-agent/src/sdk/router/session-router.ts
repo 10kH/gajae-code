@@ -238,6 +238,7 @@ export class SessionRouter {
 	readonly #sessions = new Map<string, AttachedSession>();
 	readonly #adopted = new Map<string, AdoptedSession>();
 	readonly #retirements = new Map<string, Promise<void>>();
+	readonly #retirementVersions = new Map<string, number>();
 	readonly #pending = new Set<Promise<void>>();
 	readonly #frameTails = new Map<string, Promise<void>>();
 	readonly #undelivered = new Map<string, { generation: number; seq: number; attempts: number }>();
@@ -714,11 +715,16 @@ export class SessionRouter {
 		skipReplay = false,
 		deferPublication = false,
 	): Promise<boolean> {
+		const retirementVersion = this.#retirementVersions.get(indexed.sessionId) ?? 0;
 		const retirement = this.#retirements.get(indexed.sessionId);
 		if (retirement) await retirement;
 		if (!this.#running(runEpoch)) return false;
 		if (indexed.endpointMtimeMs === undefined) return false;
 		const endpoint = resolvedEndpoint ?? (await this.#readEndpoint(indexed));
+		const retirementAfterValidation = this.#retirements.get(indexed.sessionId);
+		if (retirementAfterValidation) await retirementAfterValidation;
+		if ((this.#retirementVersions.get(indexed.sessionId) ?? 0) !== retirementVersion)
+			return await this.#attach(indexed, runEpoch, undefined, skipReplay, deferPublication);
 		if (!this.#running(runEpoch)) return false;
 		if (!endpoint) return false;
 		const existing = this.#sessions.get(indexed.sessionId);
@@ -769,6 +775,12 @@ export class SessionRouter {
 		if (!this.#running(runEpoch)) {
 			await client.close().catch(() => undefined);
 			return false;
+		}
+		if ((this.#retirementVersions.get(indexed.sessionId) ?? 0) !== retirementVersion) {
+			await client.close().catch(() => undefined);
+			const currentRetirement = this.#retirements.get(indexed.sessionId);
+			if (currentRetirement) await currentRetirement;
+			return await this.#attach(indexed, runEpoch, undefined, skipReplay, deferPublication);
 		}
 		let attached: AttachedSession | undefined;
 		const barrier: ReplayBarrier = { held: undefined, detached: false, failed: false };
@@ -1011,6 +1023,7 @@ export class SessionRouter {
 	): Promise<void> {
 		this.#adopted.delete(attached.sessionId);
 		if (this.#sessions.get(attached.sessionId) !== attached) return;
+		this.#retirementVersions.set(attached.sessionId, (this.#retirementVersions.get(attached.sessionId) ?? 0) + 1);
 		this.#sessions.delete(attached.sessionId);
 		attached.dispose();
 		const gate = Promise.withResolvers<void>();

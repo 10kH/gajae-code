@@ -211,8 +211,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 147 uses a restart-stable opaque Router endpoint-incarnation identity.
  * Generation 148 classifies reconnect-time endpoint successors before attachment retirement.
  * Generation 149 serializes successor attachment behind predecessor provider retirement.
+ * Generation 150 version-fences attaches already in flight when retirement begins.
  */
-export const DAEMON_GENERATION = 149;
+export const DAEMON_GENERATION = 150;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

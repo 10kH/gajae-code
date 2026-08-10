@@ -620,10 +620,10 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes retirement serialization generation 149 at serving epoch 87", () => {
+test("publishes retirement version fencing generation 150 at serving epoch 87", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 149 / serving epoch 87: successor attach waits for predecessor provider retirement.
-	expect(DAEMON_GENERATION).toBe(149);
+	// Generation 150 / serving epoch 87: in-flight successor attaches restart after retirement begins.
+	expect(DAEMON_GENERATION).toBe(150);
 	expect(SERVING_EPOCH).toBe(87);
 });
 test("archives pending topics into retained inactive records", async () => {
