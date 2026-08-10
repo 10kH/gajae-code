@@ -182,8 +182,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 118 prevents failed concurrent rejection from reviving tentative claims.
  * Generation 119 bounds Router stop and preserves rejected failed continuations.
  * Generation 120 awaits provisional rejection durability before replay suppression.
+ * Generation 121 fences bounded-stop continuations from later Router runs.
  */
-export const DAEMON_GENERATION = 120;
+export const DAEMON_GENERATION = 121;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -249,5 +250,6 @@ export const DAEMON_GENERATION = 120;
  * Epoch 65 closes dual persistence failure during tentative claim teardown.
  * Epoch 66 prevents callback shutdown deadlock and false ambiguous rejection.
  * Epoch 67 closes concurrent claim/rejection persistence cursor concession.
+ * Epoch 68 prevents pre-stop reconciliation authority after same-instance restart.
  */
-export const SERVING_EPOCH = 67;
+export const SERVING_EPOCH = 68;

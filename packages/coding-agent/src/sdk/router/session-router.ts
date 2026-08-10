@@ -90,6 +90,7 @@ type AttachedSession = {
 	readonly sessionId: string;
 	readonly endpoint: SdkSessionEndpoint;
 	readonly generation: number;
+	readonly runEpoch: number;
 	readonly client: SessionRouterClient;
 	readonly cursor: { seq: number };
 	readonly barrier: ReplayBarrier;
@@ -182,6 +183,7 @@ export class SessionRouter {
 	#ready = false;
 	#started = false;
 	#stopController = new AbortController();
+	#runEpoch = 0;
 
 	constructor(options: SessionRouterOptions) {
 		this.#agentDir = options.agentDir;
@@ -198,11 +200,15 @@ export class SessionRouter {
 	async start(): Promise<void> {
 		if (this.#started) return;
 		this.#started = true;
+		const runEpoch = ++this.#runEpoch;
 		if (this.#stopController.signal.aborted) this.#stopController = new AbortController();
 		try {
-			await this.#serialReconcile();
-			if (!this.#started) return;
-			const timer = (this.#deps.setInterval ?? setInterval)(() => this.#schedule(this.#serialReconcile()), 2_000);
+			await this.#serialReconcile(runEpoch);
+			if (!this.#running(runEpoch)) return;
+			const timer = (this.#deps.setInterval ?? setInterval)(
+				() => this.#schedule(this.#serialReconcile(runEpoch)),
+				2_000,
+			);
 			this.#stopTimer = () => (this.#deps.clearInterval ?? clearInterval)(timer);
 		} catch (error) {
 			await this.stop();
@@ -212,13 +218,14 @@ export class SessionRouter {
 
 	/** Exposed for deterministic callers and reconciliation tests. */
 	reconcile(): Promise<void> {
-		return this.#serialReconcile();
+		return this.#serialReconcile(this.#runEpoch);
 	}
 
 	async stop(): Promise<void> {
 		if (this.#stopTimer) this.#stopTimer();
 		this.#stopTimer = undefined;
 		this.#started = false;
+		this.#runEpoch += 1;
 		this.#stopController.abort();
 		this.#ready = false;
 		const shutdownTasks: Promise<void>[] = [];
@@ -261,7 +268,7 @@ export class SessionRouter {
 		frame: Record<string, unknown>,
 		expectedGeneration?: number,
 	): Promise<Record<string, unknown>> {
-		await this.#serialReconcile();
+		await this.#serialReconcile(this.#runEpoch);
 		const attached = this.#sessions.get(sessionId);
 		if (!attached || !this.#attachmentLive(attached)) throw new SessionRouterError("pre_send");
 		if (expectedGeneration !== undefined && expectedGeneration !== attached.generation)
@@ -375,13 +382,13 @@ export class SessionRouter {
 		}
 	}
 
-	async #serialReconcile(): Promise<void> {
+	async #serialReconcile(runEpoch: number): Promise<void> {
 		const task = this.#reconcileTail
 			.catch(() => undefined)
 			.then(async () => {
 				try {
-					await this.#reconcile();
-					if (!this.#started) return;
+					await this.#reconcile(runEpoch);
+					if (!this.#running(runEpoch)) return;
 					this.#ready = true;
 					this.#deps.onReconciled?.();
 				} catch (error) {
@@ -393,12 +400,12 @@ export class SessionRouter {
 		return await task;
 	}
 
-	async #reconcile(): Promise<void> {
-		if (!this.#started) return;
+	async #reconcile(runEpoch: number): Promise<void> {
+		if (!this.#running(runEpoch)) return;
 		await this.#index.open();
-		if (!this.#started) return;
+		if (!this.#running(runEpoch)) return;
 		await this.#index.refresh();
-		if (!this.#started) return;
+		if (!this.#running(runEpoch)) return;
 		const indexed = this.#index.listSessions();
 		const live =
 			indexed.warnings.length === 0
@@ -407,12 +414,12 @@ export class SessionRouter {
 		const liveIds = new Set(live.map(session => session.sessionId));
 		const attachedIds = new Set<string>();
 		for (const session of live) {
-			if (!this.#started) break;
+			if (!this.#running(runEpoch)) break;
 			try {
-				if (await this.#attach(session)) attachedIds.add(session.sessionId);
+				if (await this.#attach(session, runEpoch)) attachedIds.add(session.sessionId);
 			} catch {
 				const failed = this.#sessions.get(session.sessionId);
-				if (failed) {
+				if (failed?.runEpoch === runEpoch) {
 					this.#sessions.delete(session.sessionId);
 					failed.dispose();
 					await failed.client.close().catch(() => undefined);
@@ -427,7 +434,7 @@ export class SessionRouter {
 				);
 			}
 		}
-		if (!this.#started) return;
+		if (!this.#running(runEpoch)) return;
 		const cleanupErrors: unknown[] = [];
 		for (const [sessionId, attached] of this.#sessions) {
 			if (attachedIds.has(sessionId)) continue;
@@ -469,10 +476,10 @@ export class SessionRouter {
 		return endpoint;
 	}
 
-	async #attach(indexed: IndexedSession): Promise<boolean> {
-		if (!this.#started) return false;
+	async #attach(indexed: IndexedSession, runEpoch: number): Promise<boolean> {
+		if (!this.#running(runEpoch)) return false;
 		const endpoint = await this.#readEndpoint(indexed);
-		if (!this.#started) return false;
+		if (!this.#running(runEpoch)) return false;
 		if (!endpoint) return false;
 		const existing = this.#sessions.get(indexed.sessionId);
 		const resumable =
@@ -512,7 +519,7 @@ export class SessionRouter {
 				}
 			throw error;
 		}
-		if (!this.#started) {
+		if (!this.#running(runEpoch)) {
 			await client.close().catch(() => undefined);
 			if (existing)
 				try {
@@ -529,7 +536,7 @@ export class SessionRouter {
 			generation: indexed.endpointGeneration,
 			isCurrent: () => attached !== undefined && this.#attachmentLive(attached),
 			send: async (frame: Record<string, unknown>) => {
-				await this.#serialReconcile();
+				await this.#serialReconcile(runEpoch);
 				if (!attached || !this.#attachmentLive(attached))
 					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 				attached.client.send(frame);
@@ -546,6 +553,7 @@ export class SessionRouter {
 			sessionId: indexed.sessionId,
 			endpoint,
 			generation: indexed.endpointGeneration,
+			runEpoch,
 			client,
 			cursor: { seq: resumeSeq },
 			barrier,
@@ -559,7 +567,7 @@ export class SessionRouter {
 		};
 		this.#sessions.set(indexed.sessionId, attached);
 		await this.#deps.onAttachment?.(capability);
-		if (!this.#started) {
+		if (!this.#running(runEpoch)) {
 			this.#sessions.delete(indexed.sessionId);
 			attached.dispose();
 			await attached.client.close().catch(() => undefined);
@@ -584,9 +592,13 @@ export class SessionRouter {
 			.finally(() => this.#reviving.delete(attached.id));
 	}
 
+	#running(runEpoch: number): boolean {
+		return this.#started && runEpoch === this.#runEpoch;
+	}
+
 	#attachmentLive(attached: AttachedSession): boolean {
 		return (
-			this.#started &&
+			this.#running(attached.runEpoch) &&
 			!attached.barrier.detached &&
 			!attached.barrier.failed &&
 			this.#sessions.get(attached.sessionId) === attached
