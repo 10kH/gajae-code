@@ -17,6 +17,7 @@
 - Streamed edit preview coalescing now keys on the complete partial-JSON payload rather than its length, so same-size in-place argument replacements recompute and render while repeated payloads remain cached.
 - CLI parsing now fails closed by default, while launch and ACP explicitly defer only their owned startup options; this preserves ACP-specific diagnostics, SDK startup forwarding, real ACP subprocess framing, and RLM typo rejection without exposing retired flags in root help or completion.
 - Read-tool code summarization and ZIP extraction now run asynchronously instead of blocking the TUI event loop during structural parsing or decompression.
+- `secrets.yml` entries with `mode: "replace"` and no explicit `replacement` now derive their substitute from a keyed, domain-separated HMAC-SHA256 construction over the process key instead of an unkeyed public `Bun.hash`. Derived replacements are no longer confirmable offline without the key (issue #4166); same-process determinism, same-length output, and alphanumeric character behavior are preserved, and explicit `replacement` values are unchanged. Note: derived replacements differ across processes/key rotations — set an explicit `replacement` when a stable value is required.
 
 ## [0.12.21] - 2026-08-09
 
