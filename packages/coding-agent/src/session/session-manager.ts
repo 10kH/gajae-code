@@ -17178,13 +17178,20 @@ export class SessionManager {
 					boundedManager.buildSessionContext();
 					return boundedManager;
 				}
+				if (boundedManager.#lazyReopenFallbackReason === "bounded_first_open_descriptor_changed")
+					throw new Error("source_changed");
 				await boundedManager.close().catch(() => {});
 			} catch (error) {
 				await boundedManager.close().catch(() => {});
 				if (!(error instanceof Error) || error.message !== "nested_managed_bounded_rewrite_required") throw error;
 			}
 		}
-		if (sessionMemoryMode === "enabled" && capturedDescriptor) throw new Error("nested_managed_bounded_open_failed");
+		if (sessionMemoryMode === "enabled" && capturedDescriptor) {
+			const failedDescriptor = store.descriptorExpected(path.basename(resolved));
+			if (!failedDescriptor || !sameDescriptor(capturedDescriptor, failedDescriptor))
+				throw new Error("source_changed");
+			throw new Error("source_changed");
+		}
 		const captured = store.readExpected(path.basename(resolved));
 		if (
 			Boolean(captured) !== Boolean(capturedDescriptor) ||

@@ -481,14 +481,11 @@ describe("SessionManager cold sidecar integration", () => {
 						`${JSON.stringify({ type: "session", version: 5, id: "nested-swap", timestamp: "0", cwd })}\n`,
 					),
 				);
+				let descriptorReads = 0;
 				let replaced = false;
 				vi.spyOn(nestedStore, "descriptorExpected").mockImplementation(relativePath => {
-					if (
-						!replaced &&
-						relativePath === "review.jsonl" &&
-						fs.existsSync(cacheRoot) &&
-						fs.readdirSync(cacheRoot).length > cacheEntriesBefore
-					) {
+					descriptorReads++;
+					if (!replaced && relativePath === "review.jsonl" && descriptorReads > 1) {
 						replaced = true;
 						nestedStore.replaceSync(
 							"review.jsonl",
