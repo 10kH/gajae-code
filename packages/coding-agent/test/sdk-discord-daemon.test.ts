@@ -272,19 +272,35 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 	});
 
 	test("archives then unarchives a resumable thread and replaces it when permission prevents unarchive", async () => {
-		await withDaemon(async (daemon, provider) => {
-			const original = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
-			await daemon.archive("session");
-			const resumed = await daemon.resume("session", 2);
-			expect(resumed?.threadId).toBe(original.threadId);
-			expect(provider.unarchived).toEqual([original.threadId!]);
+		await withDaemon(
+			async (daemon, provider) => {
+				const original = await daemon.notify({
+					sessionId: "session",
+					endpointGeneration: 1,
+					attachmentAuthorityId: "authority",
+					content: "open",
+				});
+				await daemon.archive("session");
+				const resumed = await daemon.resume("session", 2, "authority");
+				expect(resumed?.threadId).toBe(original.threadId);
+				expect(provider.unarchived).toEqual([original.threadId!]);
 
-			await daemon.archive("session");
-			provider.failUnarchive = true;
-			const replacement = await daemon.resume("session", 3);
-			expect(replacement?.threadId).toBe("thread-2");
-			expect(provider.creates).toBe(2);
-		});
+				await daemon.archive("session");
+				provider.failUnarchive = true;
+				const replacement = await daemon.resume("session", 3, "authority");
+				expect(replacement?.threadId).toBe("thread-2");
+				expect(provider.creates).toBe(2);
+			},
+			{
+				resolveAttachment: async (sessionId, expectedGeneration = 1) => ({
+					authorityId: "authority",
+					sessionId,
+					generation: expectedGeneration,
+					isCurrent: () => true,
+					send: () => {},
+				}),
+			},
+		);
 	});
 
 	test("fails closed for stale, superseded, and unavailable inbound routes", async () => {

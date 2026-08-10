@@ -594,7 +594,13 @@ export class DiscordNotificationDaemon {
 				pendingActionEffectId: undefined,
 			});
 
-			const replacement = await this.#create(sessionId, endpointGeneration, `resume-${randomUUID()}`);
+			const replacement = await this.#create(
+				sessionId,
+				endpointGeneration,
+				`resume-${randomUUID()}`,
+				undefined,
+				attachmentAuthorityId,
+			);
 			await this.#requireLiveBinding(sessionId, endpointGeneration, attachmentAuthorityId);
 			await this.#replace(superseded, { ...superseded, supersededByThreadId: replacement.threadId });
 			return replacement;
