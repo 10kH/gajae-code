@@ -13647,7 +13647,10 @@ export class AgentSession {
 			imageBytes,
 			sessionResidentImageBytes: this.sessionManager.getResidentImageBytes(),
 			materializedResidentBytes:
-				this.#streamingEditFileCache.totalBytes + sessionMemory.hotRegionBytes + sessionMemory.metaDescriptorBytes,
+				this.#streamingEditFileCache.totalBytes +
+				sessionMemory.allocatedCacheBytes +
+				sessionMemory.hotResidentBytes +
+				sessionMemory.metadataResidentBytes,
 			tuiChatChildren: retainedMemory.tuiChatChildren ?? 0,
 			tuiCachedRenderBytes: retainedMemory.tuiCachedRenderBytes ?? 0,
 		};

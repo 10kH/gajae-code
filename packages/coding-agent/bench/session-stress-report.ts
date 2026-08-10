@@ -48,6 +48,9 @@ type MatrixRun = {
 		totalAccountedBytes: number;
 		maxAccountedBytes: number;
 		coldRetirementActiveCount: number;
+		reservedBudgetBytes?: number;
+		residentBytes?: number;
+		sidecarFileBytes?: number;
 		contextMessageCount: number;
 		telemetry?: Record<string, unknown>;
 	};
@@ -194,6 +197,32 @@ function telemetryText(run: MatrixRun, key: string): string {
 	return value === undefined || value === null ? "n/a" : String(value);
 }
 
+function memoryMetric(run: MatrixRun, key: "reservedBudgetBytes" | "residentBytes" | "sidecarFileBytes"): number {
+	const direct = run.sessionMemory[key];
+	if (typeof direct === "number" && Number.isFinite(direct)) return direct;
+	const telemetry = run.sessionMemory.telemetry ?? {};
+	const value = telemetry[key];
+	if (typeof value === "number" && Number.isFinite(value)) return value;
+	if (key === "reservedBudgetBytes") return run.sessionMemory.totalAccountedBytes;
+	if (key === "residentBytes") {
+		const allocated = typeof telemetry.allocatedCacheBytes === "number" ? telemetry.allocatedCacheBytes : 0;
+		const hot =
+			typeof telemetry.hotResidentBytes === "number"
+				? telemetry.hotResidentBytes
+				: typeof telemetry.hotRegionBytes === "number"
+					? telemetry.hotRegionBytes
+					: 0;
+		const metadata =
+			typeof telemetry.metadataResidentBytes === "number"
+				? telemetry.metadataResidentBytes
+				: typeof telemetry.metaDescriptorBytes === "number"
+					? telemetry.metaDescriptorBytes
+					: 0;
+		return allocated + hot + metadata;
+	}
+	return 0;
+}
+
 function phaseEvidenceText(run: MatrixRun): string {
 	const phases = Object.entries(run.phaseEvidence ?? {}).filter(([, value]) => value !== null && value !== undefined).map(([key]) => key);
 	const counters = Object.entries(run.counters ?? {}).filter(([, value]) => value !== null && value !== undefined).map(([key]) => key);
@@ -244,7 +273,7 @@ function renderEndpointTable(matrix: MatrixReport): string {
 						<td class="num">${formatMs(operationElapsed(run))}</td>
 						<td class="num">${formatNumber(run.throughputMiBPerSecond)} MiB/s</td>
 						<td class="num">${formatMiB(operationRss(run))}</td>
-						<td class="num">${formatMs(run.lookup.coldMs.p95)}</td>
+						<td class="num">${run.lookup.coldMs ? formatMs(run.lookup.coldMs.p95) : "n/a"}</td>
 						<td class="num">${run.entryCount.toLocaleString()}</td>
 					</tr>`;
 				})
@@ -275,10 +304,12 @@ function renderAppendixRows(matrix: MatrixReport): string {
 			<td class="num">${operationP95(run).toFixed(2)}</td>
 			<td class="num">${run.throughputMiBPerSecond.toFixed(2)}</td>
 			<td class="num">${(operationRss(run) / MIB).toFixed(2)}</td>
-			<td class="num">${run.lookup.coldMs.p95.toFixed(3)}</td>
-			<td class="num">${run.lookup.warmMs.p95.toFixed(3)}</td>
-			<td class="num">${run.lookup.warmRangeReads}</td>
-			<td class="num">${(run.sessionMemory.totalAccountedBytes / MIB).toFixed(2)}</td>
+			<td class="num">${run.lookup.coldMs ? run.lookup.coldMs.p95.toFixed(3) : "n/a"}</td>
+			<td class="num">${run.lookup.warmMs ? run.lookup.warmMs.p95.toFixed(3) : "n/a"}</td>
+			<td class="num">${run.lookup.warmRangeReads ?? "n/a"}</td>
+			<td class="num">${(memoryMetric(run, "reservedBudgetBytes") / MIB).toFixed(2)}</td>
+			<td class="num">${(memoryMetric(run, "residentBytes") / MIB).toFixed(2)}</td>
+			<td class="num">${(memoryMetric(run, "sidecarFileBytes") / MIB).toFixed(2)}</td>
 			<td>${escapeHtml(telemetryText(run, "dictionaryArtifactEnabled"))}</td>
 			<td>${escapeHtml(telemetryText(run, "parentArtifactEnabled"))}</td>
 			<td class="mono">${escapeHtml(phaseEvidenceText(run))}</td>
@@ -298,15 +329,13 @@ async function main(): Promise<void> {
 	const successful = matrix.runs.filter(run => run.status === "ok");
 	const rejected = matrix.runs.filter(run => run.status === "rejected");
 	const maxOperationRss = Math.max(0, ...successful.map(operationRss));
-	const maxColdP95 = Math.max(0, ...successful.map(run => run.lookup.coldMs.p95));
-	const maxWarmP95 = Math.max(0, ...successful.map(run => run.lookup.warmMs.p95));
+	const maxColdP95 = Math.max(0, ...successful.map(run => run.lookup.coldMs?.p95 ?? 0));
+	const maxWarmP95 = Math.max(0, ...successful.map(run => run.lookup.warmMs?.p95 ?? 0));
 	const maxProcessRss = Math.max(0, ...successful.map(run => run.memory.maxRssBytes));
 	const maxTeardownRss = Math.max(0, ...successful.map(run => run.memory.teardownRssGrowthBytes));
-	const totalWarmReads = successful.reduce((total, run) => total + run.lookup.warmRangeReads, 0);
-	const linear2GiB = runAt(matrix, "linear-resume", 2048);
-	const multi2GiB = runAt(matrix, "multi-transcript", 2048);
-	const subagent2GiB = runAt(matrix, "subagent-tree", 2048);
-	const goal2GiB = runAt(matrix, "goal-history", 2048);
+	const totalWarmReads = successful.reduce((total, run) => total + (run.lookup.warmRangeReads ?? 0), 0);
+	const largestSizeMiB = Math.max(...matrix.sizesMiB);
+	const largestRuns = successful.filter(run => run.targetMiB === largestSizeMiB);
 	const generatedAt = new Date().toISOString();
 	const html = `<!doctype html>
 <html lang="en">
@@ -334,13 +363,13 @@ table{width:100%;border-collapse:collapse;font-size:12px;margin:12px 0 22px}th{b
 <header class="cover">
 <div class="eyebrow">Gajae Code Performance Engineering</div>
 <h1>Synthetic Long-Running Session Stress Report</h1>
-		<div class="subtitle">Dense ${escapeHtml((matrix.operations ?? ["raw-cold-first-open"]).map(operationLabel).join(", "))} scaling across linear transcripts, concurrent transcript sets, parent/subagent trees, and goal-lifecycle histories.</div>
+		<div class="subtitle">${escapeHtml((matrix.operations ?? ["raw-cold-first-open"]).map(operationLabel).join(", "))} evidence across ${matrix.scenarios.map(scenarioName).join(", ")}.</div>
 		<div class="meta"><span>Evidence SHA: ${escapeHtml(matrix.gitSha ?? "unknown")}</span><span>${escapeHtml(matrix.cpu ?? "unknown CPU")}</span><span>${escapeHtml(matrix.platform)} ${escapeHtml(matrix.arch)}</span><span>Bun ${escapeHtml(matrix.bunVersion)}</span><span>GC ${escapeHtml(matrix.gcStrategy ?? gib.gcStrategy ?? "n/a")}</span><span>Secondary artifacts ${escapeHtml(matrix.secondaryArtifacts ?? gib.secondaryArtifacts ?? "n/a")}</span><span>Report ${escapeHtml(generatedAt)}</span></div>
 </header>
 <div class="body">
 <section>
 <h2>Executive summary</h2>
-<p class="lead">The former one-GiB bounded-session admission ceiling was the reason single-file 2048 MiB sessions were rejected. It was a fixed safety threshold, not a measured parser or sidecar limitation. The ceiling is now 2 GiB plus 1 MiB of bounded fork-header headroom, and bounded session memory is enabled by default.</p>
+<p class="lead">The former one-GiB bounded-session admission ceiling was a fixed safety threshold, not a measured parser or sidecar limitation. The ceiling is now 2 GiB plus 1 MiB of bounded fork-header headroom, and automatic routing keeps ordinary transcripts eager while admitting large transcripts through bounded session memory.</p>
 <div class="kpis">
 <div class="kpi good"><strong>${successful.length}/${matrix.runs.length}</strong><span>successful benchmark runs</span></div>
 <div class="kpi good"><strong>${matrix.operations?.length ?? 1}</strong><span>operation classes represented</span></div>
@@ -353,14 +382,14 @@ table{width:100%;border-collapse:collapse;font-size:12px;margin:12px 0 22px}th{b
 <section>
 <h2>Dense scaling chart</h2>
 <div class="chart">${chart}</div>
-<p class="caption">Figure 1. Seventeen size points per scenario: ${matrix.sizesMiB.map(value => `${value} MiB`).join(", ")}. The corpus uses 256 KiB payload chunks, producing up to roughly 8,200 records in single-file 2048 MiB sessions. Every plotted point is a completed run from the attached JSON evidence.</p>
+<p class="caption">Figure 1. ${matrix.sizesMiB.length} size point${matrix.sizesMiB.length === 1 ? "" : "s"} per configured scenario: ${matrix.sizesMiB.map(value => `${value} MiB`).join(", ")}. Every plotted point is a completed run from the attached JSON evidence.</p>
 </section>
 <section>
-<h2>2048 MiB outcomes</h2>
+<h2>${largestSizeMiB.toLocaleString()} MiB outcomes</h2>
 <table>
-<thead><tr><th>Scenario</th><th>Operation</th><th>Mode</th><th>Files</th><th>Entries</th><th>Latency</th><th>Throughput</th><th>RSS growth</th><th>Cold p95</th><th>Accounted state</th></tr></thead>
+<thead><tr><th>Scenario</th><th>Operation</th><th>Mode</th><th>Files</th><th>Entries</th><th>Latency</th><th>Throughput</th><th>RSS growth</th><th>Cold p95</th><th>Reserved</th><th>Resident</th><th>Sidecars</th></tr></thead>
 <tbody>
-${[linear2GiB,multi2GiB,subagent2GiB,goal2GiB].map(run => `<tr><td>${escapeHtml(scenarioName(run.scenario))}</td><td>${escapeHtml(operationLabel(run.operationClass))}</td><td>${escapeHtml(run.sessionMemoryMode ?? "n/a")}</td><td class="num">${run.fileCount}</td><td class="num">${run.entryCount.toLocaleString()}</td><td class="num">${formatMs(operationElapsed(run))}</td><td class="num">${formatNumber(run.throughputMiBPerSecond)} MiB/s</td><td class="num">${formatMiB(operationRss(run))}</td><td class="num">${formatMs(run.lookup.coldMs.p95)}</td><td class="num">${formatMiB(run.sessionMemory.totalAccountedBytes)}</td></tr>`).join("\n")}
+${largestRuns.map(run => `<tr><td>${escapeHtml(scenarioName(run.scenario))}</td><td>${escapeHtml(operationLabel(run.operationClass))}</td><td>${escapeHtml(run.sessionMemoryMode ?? "n/a")}</td><td class="num">${run.fileCount}</td><td class="num">${run.entryCount.toLocaleString()}</td><td class="num">${formatMs(operationElapsed(run))}</td><td class="num">${formatNumber(run.throughputMiBPerSecond)} MiB/s</td><td class="num">${formatMiB(operationRss(run))}</td><td class="num">${run.lookup.coldMs ? formatMs(run.lookup.coldMs.p95) : "n/a"}</td><td class="num">${formatMiB(memoryMetric(run, "reservedBudgetBytes"))}</td><td class="num">${formatMiB(memoryMetric(run, "residentBytes"))}</td><td class="num">${formatMiB(memoryMetric(run, "sidecarFileBytes"))}</td></tr>`).join("\n")}
 </tbody></table>
 </section>
 <section>
@@ -373,7 +402,7 @@ ${renderEndpointTable(matrix)}
 <div class="finding"><b>Raw first-open cost</b><p>The raw cold first-open operation performs security/semantic validation and sidecar construction when no authenticated artifact exists. It is not an exact authenticated reopen, a transcript-ahead recovery, or a fork copy.</p></div>
 <div class="finding"><b>Exact reopen and transcript-ahead evidence</b><p>Fresh-process authenticated reopen and transcript-ahead recovery are represented as separate operation classes. Their setup first-open evidence is retained under <span class="mono">preparation</span> rather than folded into reopen latency.</p></div>
 <div class="finding"><b>Memory behavior</b><p>Maximum operation RSS growth was ${formatMiB(maxOperationRss)}. Maximum post-close growth was ${formatMiB(maxTeardownRss)}. Maximum whole-process RSS was ${formatMiB(maxProcessRss)}, which includes fixture generation and allocator high-water residency and is not equivalent to reachable session state.</p></div>
-<div class="finding"><b>Lookup behavior</b><p>Maximum cold p95 was ${formatMs(maxColdP95)} and maximum warm p95 was ${formatMs(maxWarmP95)}. Warm lookups added no range reads anywhere in the dense matrix.</p></div>
+<div class="finding"><b>Lookup behavior</b><p>Maximum cold p95 was ${formatMs(maxColdP95)} and maximum warm p95 was ${formatMs(maxWarmP95)}. Warm lookups added ${totalWarmReads} range reads across the represented runs.</p></div>
 </div>
 <div class="callout warning"><b>Unavailable phase telemetry:</b> phase/counter fields remain null or absent when the runtime does not expose them; the report does not infer semantic, write, GC, or fsync measurements from aggregate open time.</div>
 </section>
@@ -411,7 +440,7 @@ ${(["direct","captured"] as const).map(mode => { const value=gib.summary[mode]; 
 <section class="page-break">
 <h2>Appendix A — Complete dense matrix</h2>
 <table class="appendix">
-<thead><tr><th>Scenario</th><th>Operation</th><th>Mode</th><th>MiB</th><th>Files</th><th>Entries</th><th>Status</th><th>Latency ms</th><th>Per-file p95</th><th>MiB/s</th><th>RSS MiB</th><th>Cold p95</th><th>Warm p95</th><th>Warm reads</th><th>Accounted MiB</th><th>Dictionary</th><th>Parent</th><th>Phase/counter evidence</th></tr></thead>
+<thead><tr><th>Scenario</th><th>Operation</th><th>Mode</th><th>MiB</th><th>Files</th><th>Entries</th><th>Status</th><th>Latency ms</th><th>Per-file p95</th><th>MiB/s</th><th>RSS MiB</th><th>Cold p95</th><th>Warm p95</th><th>Warm reads</th><th>Reserved MiB</th><th>Resident MiB</th><th>Sidecar MiB</th><th>Dictionary</th><th>Parent</th><th>Phase/counter evidence</th></tr></thead>
 <tbody>${renderAppendixRows(matrix)}</tbody>
 </table>
 </section>

@@ -109,6 +109,7 @@ type WorkerResult = {
 	secondaryArtifacts: SecondaryArtifacts;
 	repetitions: number;
 	repetitionIndex?: number;
+	openConcurrency?: number;
 	status: Status;
 	fileCount: number;
 	totalBytes: number;
@@ -157,6 +158,9 @@ type WorkerResult = {
 		totalAccountedBytes: number;
 		maxAccountedBytes: number;
 		coldRetirementActiveCount: number;
+		reservedBudgetBytes: number;
+		residentBytes: number;
+		sidecarFileBytes: number;
 		contextMessageCount: number;
 		telemetry: Record<string, TelemetryValue>;
 	};
@@ -188,6 +192,7 @@ type MatrixReport = {
 	secondaryArtifacts: SecondaryArtifacts;
 	repetitions: number;
 	samples: number;
+	openConcurrency: number;
 	smallComparisonSizesMiB?: number[];
 	runs: WorkerResult[];
 };
@@ -201,6 +206,7 @@ type ParentArgs = {
 	secondaryArtifacts: SecondaryArtifacts;
 	repetitions: number;
 	samples: number;
+	openConcurrency: number;
 	outPrefix: string;
 	smallComparison: boolean;
 };
@@ -441,6 +447,12 @@ function aggregateStats(stats: SessionMemoryStats[], contextMessageCount: number
 		totalAccountedBytes: stats.reduce((total, value) => total + value.totalAccountedBytes, 0),
 		maxAccountedBytes: Math.max(0, ...stats.map(value => value.totalAccountedBytes)),
 		coldRetirementActiveCount: stats.filter(value => value.coldRetirementActive).length,
+		reservedBudgetBytes: stats.reduce((total, value) => total + value.reservedBudgetBytes, 0),
+		residentBytes: stats.reduce(
+			(total, value) => total + value.allocatedCacheBytes + value.hotResidentBytes + value.metadataResidentBytes,
+			0,
+		),
+		sidecarFileBytes: stats.reduce((total, value) => total + value.sidecarFileBytes, 0),
 		contextMessageCount,
 		telemetry,
 	};
@@ -617,7 +629,8 @@ function benchmarkEnv(gcStrategy: GcStrategy, secondaryArtifacts: SecondaryArtif
 	return {
 		...process.env,
 		GJC_SESSION_MEMORY_GC_STRATEGY: gcStrategy,
-		GJC_SESSION_MEMORY_SECONDARY_ARTIFACTS: secondaryArtifacts,
+		GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE:
+			secondaryArtifacts === "current" ? "auto" : "disabled",
 	};
 }
 
@@ -723,7 +736,7 @@ async function runFreshReopenWorker(
 			afterStats = afterWarm;
 		}
 		const closeMeasured = await measurePhase(async () => {
-			for (const manager of managers) await manager.close();
+			for (const manager of managers) if (manager) await manager.close();
 			managers.length = 0;
 		});
 		closeMs = closeMeasured.metric.elapsedMs;
@@ -773,7 +786,7 @@ async function runFreshReopenWorker(
 			failure,
 		};
 	} finally {
-		for (const manager of managers) await manager.close();
+		for (const manager of managers) if (manager) await manager.close();
 	}
 }
 
@@ -785,6 +798,7 @@ async function runWorker(
 	gcStrategy: GcStrategy = "current",
 	secondaryArtifacts: SecondaryArtifacts = "current",
 	repetitions = DEFAULT_REPETITIONS,
+	openConcurrency = 1,
 ): Promise<WorkerResult> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), `gjc-session-matrix-${scenario}-${targetMiB}-`));
 	const fileCount = scenarioFileCount(scenario);
@@ -834,18 +848,25 @@ async function runWorker(
 		const firstOpenCpuStart = process.cpuUsage();
 		const firstOpenStartedAt = performance.now();
 		try {
-			for (const transcript of generated) {
-				const startedAt = performance.now();
-				const manager = await SessionManager.open(
-					transcript.file,
-					SessionManager.explicitDestination(root),
-					undefined,
-					"copy-retain",
-					sessionMemoryMode,
-				);
-				firstOpenSamples.push(performance.now() - startedAt);
-				managers.push(manager);
-			}
+			let nextIndex = 0;
+			const openNext = async (): Promise<void> => {
+				for (;;) {
+					const index = nextIndex++;
+					const transcript = generated[index];
+					if (!transcript) return;
+					const startedAt = performance.now();
+					const manager = await SessionManager.open(
+						transcript.file,
+						SessionManager.explicitDestination(root),
+						undefined,
+						"copy-retain",
+						sessionMemoryMode,
+					);
+					firstOpenSamples[index] = performance.now() - startedAt;
+					managers[index] = manager;
+				}
+			};
+			await Promise.all(Array.from({ length: Math.min(openConcurrency, generated.length) }, () => openNext()));
 		} catch (error) {
 			status = "code" in Object(error) && Object(error).code === "oversized" ? "rejected" : "error";
 			failure = failureFrom(error);
@@ -888,7 +909,7 @@ async function runWorker(
 			afterStats = afterWarm;
 		}
 		const setupClose = await measurePhase(async () => {
-			for (const manager of managers) await manager.close();
+			for (const manager of managers) if (manager) await manager.close();
 			managers.length = 0;
 		});
 		closeMs = setupClose.metric.elapsedMs;
@@ -1017,7 +1038,7 @@ async function runWorker(
 			failure,
 		};
 	} finally {
-		for (const manager of managers) await manager.close();
+		for (const manager of managers) if (manager) await manager.close();
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }
@@ -1039,6 +1060,7 @@ function parseParentArgs(argv: string[]): ParentArgs {
 	let secondaryArtifacts: SecondaryArtifacts = "current";
 	let repetitions = DEFAULT_REPETITIONS;
 	let samples = 1;
+	let openConcurrency = 1;
 	let outPrefix = "artifacts/session-scenario-matrix-2026-08-10";
 	let smallComparison = false;
 	let explicitModes = false;
@@ -1074,6 +1096,11 @@ function parseParentArgs(argv: string[]): ParentArgs {
 			const value = Number.parseInt(argv[++index] ?? "", 10);
 			if (!Number.isSafeInteger(value) || value < 1 || value > 20) throw new Error("--samples must be between 1 and 20");
 			samples = value;
+		} else if (argument === "--open-concurrency") {
+			const value = Number.parseInt(argv[++index] ?? "", 10);
+			if (!Number.isSafeInteger(value) || value < 1 || value > 4)
+				throw new Error("--open-concurrency must be between 1 and 4");
+			openConcurrency = value;
 		} else if (argument === "--small-session-comparison" || argument === "--compare-small-modes") {
 			smallComparison = true;
 		} else if (argument === "--out-prefix") {
@@ -1087,7 +1114,7 @@ function parseParentArgs(argv: string[]): ParentArgs {
 		if (!explicitSizes) sizesMiB = [...SMALL_COMPARISON_SIZES_MIB];
 		if (!explicitModes) sessionMemoryModes = ["auto", "enabled", "shadow", "off"];
 	}
-	return { sizesMiB, scenarios, operations, sessionMemoryModes, gcStrategy, secondaryArtifacts, repetitions, samples, outPrefix, smallComparison };
+	return { sizesMiB, scenarios, operations, sessionMemoryModes, gcStrategy, secondaryArtifacts, repetitions, samples, openConcurrency, outPrefix, smallComparison };
 }
 
 function gitSha(): string | null {
@@ -1102,9 +1129,9 @@ function csvCell(value: unknown): string {
 
 function reportCsv(report: MatrixReport): string {
 	const headers = [
-		"scenario", "operationClass", "sessionMemoryMode", "gcStrategy", "secondaryArtifacts", "repetitions", "repetitionIndex", "targetMiB", "status", "fileCount", "entryCount", "generationMs", "firstOpenMs", "exactAuthenticatedReopenMs", "transcriptAheadReopenMs", "repeatedLifecycleMs", "firstOpenP95Ms",
+		"scenario", "operationClass", "sessionMemoryMode", "gcStrategy", "secondaryArtifacts", "repetitions", "repetitionIndex", "openConcurrency", "targetMiB", "status", "fileCount", "entryCount", "generationMs", "firstOpenMs", "exactAuthenticatedReopenMs", "transcriptAheadReopenMs", "repeatedLifecycleMs", "firstOpenP95Ms",
 		"throughputMiBPerSecond", "operationRssGrowthMiB", "firstOpenRssGrowthMiB", "lookupRssGrowthMiB", "teardownRssGrowthMiB", "maxRssMiB", "phaseEvidenceJson", "counterEvidenceJson",
-		"coldLookupP95Ms", "warmLookupP95Ms", "coldRangeReads", "warmRangeReads", "accountedMiB", "sidecarEnabled", "coldRetirementActive", "dictionaryArtifactEnabled", "parentArtifactEnabled", "gcRequests", "bytesRead", "bytesWritten", "recordsParsed", "indexWriteCalls", "fsyncCount", "failureCode",
+		"coldLookupP95Ms", "warmLookupP95Ms", "coldRangeReads", "warmRangeReads", "accountedMiB", "reservedMiB", "residentMiB", "sidecarFileMiB", "sidecarEnabled", "coldRetirementActive", "dictionaryArtifactEnabled", "parentArtifactEnabled", "gcRequests", "bytesRead", "bytesWritten", "recordsParsed", "indexWriteCalls", "fsyncCount", "failureCode",
 	];
 	const rows = report.runs.map(run => [
 		run.scenario,
@@ -1114,6 +1141,7 @@ function reportCsv(report: MatrixReport): string {
 		run.secondaryArtifacts,
 		run.repetitions,
 		run.repetitionIndex ?? 0,
+		run.openConcurrency ?? report.openConcurrency,
 		run.targetMiB,
 		run.status,
 		run.fileCount,
@@ -1137,6 +1165,9 @@ function reportCsv(report: MatrixReport): string {
 		run.lookup.coldRangeReads ?? "",
 		run.lookup.warmRangeReads ?? "",
 		run.sessionMemory.totalAccountedBytes / MIB,
+		run.sessionMemory.reservedBudgetBytes / MIB,
+		run.sessionMemory.residentBytes / MIB,
+		run.sessionMemory.sidecarFileBytes / MIB,
 		run.sessionMemory.telemetry.sidecarEnabled ?? "",
 		run.sessionMemory.telemetry.coldRetirementActive ?? "",
 		run.sessionMemory.telemetry.dictionaryArtifactEnabled ?? "",
@@ -1254,7 +1285,7 @@ async function runParent(): Promise<void> {
 				for (const sizeMiB of args.sizesMiB) {
 					for (let repetitionIndex = 0; repetitionIndex < args.samples; repetitionIndex++) {
 						const child = Bun.spawnSync({
-							cmd: [process.execPath, "--smol", "--expose-gc", import.meta.path, "--worker", scenario, String(sizeMiB), operation, sessionMemoryMode, args.gcStrategy, args.secondaryArtifacts, String(args.repetitions)],
+							cmd: [process.execPath, "--smol", "--expose-gc", import.meta.path, "--worker", scenario, String(sizeMiB), operation, sessionMemoryMode, args.gcStrategy, args.secondaryArtifacts, String(args.repetitions), String(args.openConcurrency)],
 							stdout: "pipe",
 							stderr: "pipe",
 							env: benchmarkEnv(args.gcStrategy, args.secondaryArtifacts),
@@ -1262,6 +1293,7 @@ async function runParent(): Promise<void> {
 						if (child.exitCode !== 0) throw new Error(child.stderr.toString() || `worker exited ${child.exitCode}`);
 						const run = JSON.parse(child.stdout.toString()) as WorkerResult;
 						run.repetitionIndex = repetitionIndex;
+						run.openConcurrency = args.openConcurrency;
 						runs.push(run);
 					}
 				}
@@ -1285,6 +1317,7 @@ async function runParent(): Promise<void> {
 		secondaryArtifacts: args.secondaryArtifacts,
 		repetitions: args.repetitions,
 		samples: args.samples,
+		openConcurrency: args.openConcurrency,
 		smallComparisonSizesMiB: args.smallComparison ? [...SMALL_COMPARISON_SIZES_MIB] : undefined,
 		runs,
 	};
@@ -1315,8 +1348,9 @@ if (Bun.argv[2] === "--fresh-reopen") {
 	const gcStrategy = gcStrategyFromArg(Bun.argv[7] ?? "current");
 	const secondaryArtifacts = secondaryArtifactsFromArg(Bun.argv[8] ?? "current");
 	const repetitions = Number.parseInt(Bun.argv[9] ?? String(DEFAULT_REPETITIONS), 10);
-	if (!isScenario(scenario) || !Number.isSafeInteger(targetMiB) || targetMiB < 1 || !Number.isSafeInteger(repetitions) || repetitions < 1) throw new Error("invalid worker arguments");
-	process.stdout.write(`${JSON.stringify(await runWorker(scenario, targetMiB, operation, sessionMemoryMode, gcStrategy, secondaryArtifacts, repetitions))}\n`);
+	const openConcurrency = Number.parseInt(Bun.argv[10] ?? "1", 10);
+	if (!isScenario(scenario) || !Number.isSafeInteger(targetMiB) || targetMiB < 1 || !Number.isSafeInteger(repetitions) || repetitions < 1 || !Number.isSafeInteger(openConcurrency) || openConcurrency < 1 || openConcurrency > 4) throw new Error("invalid worker arguments");
+	process.stdout.write(`${JSON.stringify(await runWorker(scenario, targetMiB, operation, sessionMemoryMode, gcStrategy, secondaryArtifacts, repetitions, openConcurrency))}\n`);
 } else {
 	await runParent();
 }

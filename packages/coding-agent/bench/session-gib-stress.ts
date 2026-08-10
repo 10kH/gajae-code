@@ -219,7 +219,8 @@ function benchmarkEnv(gcStrategy: GcStrategy, secondaryArtifacts: SecondaryArtif
 	return {
 		...process.env,
 		GJC_SESSION_MEMORY_GC_STRATEGY: gcStrategy,
-		GJC_SESSION_MEMORY_SECONDARY_ARTIFACTS: secondaryArtifacts,
+		GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE:
+			secondaryArtifacts === "current" ? "auto" : "disabled",
 	};
 }
 
