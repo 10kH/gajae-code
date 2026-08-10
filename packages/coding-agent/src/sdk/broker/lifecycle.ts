@@ -2279,12 +2279,39 @@ async function endpointRemoved(root: string, id: string): Promise<boolean> {
 	}
 }
 
-async function waitForClose(
-	broker: Broker,
-	id: string,
-	record: { locator: { stateRoot: string }; endpointGeneration: number; pid: number; lifecycleRequestId?: string },
-	timeoutMs: number,
-): Promise<boolean> {
+async function removeExactDeadSessionEndpoint(broker: Broker, id: string, record: CloseRecord): Promise<boolean> {
+	if (record.endpointMtimeMs === undefined) return false;
+	await broker.index.refresh();
+	const current = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+	if (
+		!current ||
+		current.endpointGeneration !== record.endpointGeneration ||
+		current.pid !== record.pid ||
+		current.endpointMtimeMs !== record.endpointMtimeMs ||
+		current.lifecycleRequestId !== record.lifecycleRequestId ||
+		current.processIncarnation !== record.processIncarnation ||
+		path.resolve(current.locator.stateRoot) !== path.resolve(record.locator.stateRoot)
+	)
+		return false;
+	const endpointPath = path.join(record.locator.stateRoot, "sdk", `${id}.json`);
+	try {
+		const [source, metadata] = await Promise.all([fs.readFile(endpointPath, "utf8"), fs.stat(endpointPath)]);
+		const endpoint = JSON.parse(source) as { sessionId?: unknown; pid?: unknown; stale?: unknown };
+		if (
+			endpoint.sessionId !== id ||
+			endpoint.pid !== record.pid ||
+			endpoint.stale === true ||
+			metadata.mtimeMs !== record.endpointMtimeMs
+		)
+			return false;
+		await fs.unlink(endpointPath);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ENOENT";
+	}
+}
+
+async function waitForClose(broker: Broker, id: string, record: CloseRecord, timeoutMs: number): Promise<boolean> {
 	const timing = lifecycleTiming(broker);
 	const deadline = timing.now() + timeoutMs;
 	while (timing.now() < deadline) {
@@ -2309,6 +2336,20 @@ async function waitForClose(
 		// on, so retire it here too instead of escalating signals at a pid that no
 		// longer exists and then reporting the teardown as unfinished.
 		if (registration && hasObservedProcessExit(record.pid)) {
+			const expected =
+				typeof record.lifecycleRequestId === "string" && typeof record.processIncarnation === "string"
+					? {
+							pid: record.pid,
+							effectMarker: record.lifecycleRequestId,
+							incarnation: record.processIncarnation,
+						}
+					: undefined;
+			if (expected) await removeOwnedLifecycleArtifacts(record.locator.stateRoot, id, expected);
+			if (
+				!(await endpointRemoved(record.locator.stateRoot, id)) &&
+				!(await removeExactDeadSessionEndpoint(broker, id, record))
+			)
+				return false;
 			await broker.index.append({
 				type: "host_unregistered",
 				sessionId: id,
@@ -2318,7 +2359,7 @@ async function waitForClose(
 				...(registration.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: registration.endpointMtimeMs }),
 				...(registration.lifecycleRequestId ? { lifecycleRequestId: registration.lifecycleRequestId } : {}),
 			});
-			return true;
+			return await endpointRemoved(record.locator.stateRoot, id);
 		}
 		await timing.sleep(POLL_MS);
 	}
