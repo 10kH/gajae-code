@@ -395,8 +395,8 @@ function credentialFreeRecord(value: Record<string, unknown>): Record<string, un
 }
 
 function sessionResult(value: unknown, fallbackSessionId?: string): SessionLifecycleSessionResult | undefined {
-	if (!isRecord(value) && fallbackSessionId === undefined) return undefined;
-	const record: Record<string, unknown> = isRecord(value) ? credentialFreeRecord(value) : {};
+	if (!isRecord(value)) return undefined;
+	const record = credentialFreeRecord(value);
 	const sessionId = typeof record.sessionId === "string" ? record.sessionId : fallbackSessionId;
 	if (!sessionId) return undefined;
 	const result: {

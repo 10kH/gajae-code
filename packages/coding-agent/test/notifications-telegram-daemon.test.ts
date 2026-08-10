@@ -96,23 +96,13 @@ describe("Telegram provider supervisor ownership", () => {
 
 	test("durably suppresses ambiguous publication claims after provider restart", async () => {
 		const agentDir = tempAgentDir();
-		type PublicationReceiptHarness = {
-			claimPublication(publicationId: string): Promise<void>;
-			markPublicationAttempted(publicationId: string): Promise<void>;
-			markPublicationDelivered(publicationId: string): Promise<void>;
-			markPublicationRejected(publicationId: string): Promise<void>;
-			loadPresentationState(): Promise<void>;
-			publicationShouldSuppress(publicationId: string): boolean;
-			publicationSettlement(publicationId: string): { promise: Promise<void> };
-			settlePublication(publicationId: string): void;
-		};
-		const makeHarness = (): PublicationReceiptHarness =>
+		const makeHarness = () =>
 			new TelegramNotificationDaemon({
 				settings: settings(agentDir),
 				ownerId: "provider-owner",
 				botToken: BOT_TOKEN,
 				chatId: "42",
-			}) as unknown as PublicationReceiptHarness;
+			}).publicationReceiptHarnessForTest();
 		try {
 			const first = makeHarness();
 			await first.claimPublication("session:60:1");
@@ -205,7 +195,7 @@ describe("Telegram provider supervisor ownership", () => {
 				botToken: BOT_TOKEN,
 				chatId: "42",
 				fs: durableFs,
-			}) as unknown as PublicationReceiptHarness;
+			}).publicationReceiptHarnessForTest();
 		const publicationId = "session:61:1";
 		let providerAttempts = 0;
 		const attempt = async (daemon: PublicationReceiptHarness): Promise<void> => {

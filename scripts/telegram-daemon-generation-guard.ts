@@ -8,7 +8,7 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 44;
+export const GUARD_CONTRACT_VERSION = 45;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
@@ -69,7 +69,7 @@ type GuardManifest = {
  * protected because old owners must be replaced when that admission path changes.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "1cbf6a7874dbd1379a0532028d7ae499e2b92fe785baab614b150c6da9490825";
+const PROTECTED_INVENTORY_SHA256 = "f4caf659746092f5f4c6b90abd50546f893866a0c222495db586d1f6f26b2217";
 
 /** Transition-marker generations fence every daemon lifecycle mutation. */
 export const TRANSITION_TOKEN_PROTECTED_DECLARATIONS = [
@@ -119,7 +119,7 @@ export const TELEGRAM_LIFECYCLE_PROTECTED_DECLARATIONS = [
 ] as const;
 /** Callback receipt activation and revocation define durable reply authority. */
 export const TELEGRAM_CALLBACK_RECEIPT_PROTECTED_DECLARATIONS = [
-	"dropSession",
+	"TelegramNotificationDaemon.#dropSession",
 	"TelegramUpdatePoller",
 	"TelegramBotTransport",
 	"fetchWithRetry",

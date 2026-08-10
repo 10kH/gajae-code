@@ -14,6 +14,7 @@ import { daemonPaths } from "./daemon-paths";
 import type { SessionCreateTarget } from "./index";
 
 export const TELEGRAM_ADOPTION_INTENT_VERSION = 2;
+const LEGACY_TELEGRAM_ADOPTION_INTENT_VERSION = 1 as const;
 export type TelegramAdoptionTarget = Extract<SessionCreateTarget, { kind: "existing_path" }>;
 export const DEFAULT_ADOPTION_INTENT_TTL_MS = 10 * 60 * 1000;
 const INTENT_FILE_SUFFIX = ".adoption-intent.json";
@@ -62,6 +63,22 @@ interface PersistedIntent {
 	intent: TelegramAdoptionIntent;
 }
 
+interface LegacyTelegramAdoptionIntent {
+	readonly intendedSessionId: string;
+	readonly topicId: number;
+	readonly chatId: string;
+	readonly target: TelegramAdoptionTarget;
+	readonly createdAt: number;
+	readonly expiresAt: number;
+}
+
+interface LegacyPersistedIntent {
+	version: typeof LEGACY_TELEGRAM_ADOPTION_INTENT_VERSION;
+	intent: LegacyTelegramAdoptionIntent;
+}
+
+type PersistedIntentRecord = PersistedIntent | LegacyPersistedIntent;
+
 export interface TelegramPendingTopic {
 	readonly topicId: number;
 	readonly chatId: string;
@@ -74,6 +91,13 @@ interface PersistedPendingTopic {
 	pendingTopic: TelegramPendingTopic;
 }
 
+interface LegacyPersistedPendingTopic {
+	version: typeof LEGACY_TELEGRAM_ADOPTION_INTENT_VERSION;
+	pendingTopic: TelegramPendingTopic;
+}
+
+type PersistedPendingTopicRecord = PersistedPendingTopic | LegacyPersistedPendingTopic;
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -82,12 +106,31 @@ function isSessionCreateTarget(value: unknown): value is TelegramAdoptionTarget 
 	return isRecord(value) && value.kind === "existing_path" && typeof value.path === "string";
 }
 
-function isPersistedIntent(value: unknown): value is PersistedIntent {
-	if (!isRecord(value) || value.version !== TELEGRAM_ADOPTION_INTENT_VERSION || !isRecord(value.intent)) return false;
+function isPersistedIntent(value: unknown): value is PersistedIntentRecord {
+	if (!isRecord(value) || !isRecord(value.intent)) return false;
+	if (value.version === TELEGRAM_ADOPTION_INTENT_VERSION) {
+		const intent = value.intent;
+		return (
+			typeof intent.providerRequestKey === "string" &&
+			intent.providerRequestKey.length > 0 &&
+			typeof intent.topicId === "number" &&
+			Number.isSafeInteger(intent.topicId) &&
+			intent.topicId > 0 &&
+			typeof intent.chatId === "string" &&
+			typeof intent.createdAt === "number" &&
+			Number.isFinite(intent.createdAt) &&
+			typeof intent.expiresAt === "number" &&
+			Number.isFinite(intent.expiresAt) &&
+			intent.expiresAt > intent.createdAt &&
+			(intent.sessionId === undefined || (typeof intent.sessionId === "string" && intent.sessionId.length > 0)) &&
+			isSessionCreateTarget(intent.target)
+		);
+	}
+	if (value.version !== LEGACY_TELEGRAM_ADOPTION_INTENT_VERSION) return false;
 	const intent = value.intent;
 	return (
-		typeof intent.providerRequestKey === "string" &&
-		intent.providerRequestKey.length > 0 &&
+		typeof intent.intendedSessionId === "string" &&
+		intent.intendedSessionId.length > 0 &&
 		typeof intent.topicId === "number" &&
 		Number.isSafeInteger(intent.topicId) &&
 		intent.topicId > 0 &&
@@ -97,13 +140,30 @@ function isPersistedIntent(value: unknown): value is PersistedIntent {
 		typeof intent.expiresAt === "number" &&
 		Number.isFinite(intent.expiresAt) &&
 		intent.expiresAt > intent.createdAt &&
-		(intent.sessionId === undefined || (typeof intent.sessionId === "string" && intent.sessionId.length > 0)) &&
 		isSessionCreateTarget(intent.target)
 	);
 }
 
-function isPersistedPendingTopic(value: unknown): value is PersistedPendingTopic {
-	if (!isRecord(value) || value.version !== TELEGRAM_ADOPTION_INTENT_VERSION || !isRecord(value.pendingTopic))
+function normalizePersistedIntent(value: unknown): { intent: TelegramAdoptionIntent; legacy: boolean } | undefined {
+	if (!isPersistedIntent(value)) return undefined;
+	if (value.version === TELEGRAM_ADOPTION_INTENT_VERSION) return { intent: value.intent, legacy: false };
+	return {
+		legacy: true,
+		intent: {
+			providerRequestKey: `legacy:v1:${value.intent.intendedSessionId}`,
+			topicId: value.intent.topicId,
+			chatId: value.intent.chatId,
+			target: value.intent.target,
+			createdAt: value.intent.createdAt,
+			expiresAt: value.intent.expiresAt,
+			sessionId: value.intent.intendedSessionId,
+		},
+	};
+}
+
+function isPersistedPendingTopic(value: unknown): value is PersistedPendingTopicRecord {
+	if (!isRecord(value) || !isRecord(value.pendingTopic)) return false;
+	if (value.version !== TELEGRAM_ADOPTION_INTENT_VERSION && value.version !== LEGACY_TELEGRAM_ADOPTION_INTENT_VERSION)
 		return false;
 	const pending = value.pendingTopic;
 	return (
@@ -321,17 +381,22 @@ export class TelegramAdoptionIntentStore {
 
 	async readIntent(providerRequestKey: string): Promise<TelegramAdoptionIntent | undefined> {
 		const file = adoptionIntentFilePath(this.#agentDir, providerRequestKey);
-		const parsed = await this.#readSidecar(file);
-		if (!parsed || parsed.providerRequestKey !== providerRequestKey || this.#now() >= parsed.expiresAt)
+		const record = await this.#readSidecarRecord(file);
+		const parsed = record?.intent;
+		if (!record || !parsed || parsed.providerRequestKey !== providerRequestKey || this.#now() >= parsed.expiresAt)
 			return undefined;
 		this.#intents.set(providerRequestKey, parsed);
+		if (record.legacy) await this.#migrateIntentSidecar(file, parsed);
 		return parsed;
 	}
 
 	async readPendingTopic(topicId: number): Promise<TelegramPendingTopic | undefined> {
-		const pending = await this.#readPendingSidecar(pendingTopicFilePath(this.#agentDir, topicId));
-		if (!pending || pending.topicId !== topicId || this.#now() >= pending.expiresAt) return undefined;
+		const file = pendingTopicFilePath(this.#agentDir, topicId);
+		const record = await this.#readPendingSidecarRecord(file);
+		const pending = record?.pendingTopic;
+		if (!record || !pending || pending.topicId !== topicId || this.#now() >= pending.expiresAt) return undefined;
 		this.#pendingTopics.set(topicId, pending);
+		if (record.legacy) await this.#migratePendingTopicSidecar(file, pending);
 		return pending;
 	}
 
@@ -345,16 +410,28 @@ export class TelegramAdoptionIntentStore {
 		}
 		let loaded = 0;
 		for (const name of names) {
+			const file = path.join(this.#dir, name);
 			if (name.endsWith(INTENT_FILE_SUFFIX)) {
 				const encoded = name.slice(0, -INTENT_FILE_SUFFIX.length);
 				const key = decodeProviderRequestKey(encoded);
-				if (!key) continue;
-				if (await this.readIntent(key)) loaded++;
+				const record = await this.#readSidecarRecord(file);
+				const intent = record?.intent;
+				if (!intent || this.#now() >= intent.expiresAt) continue;
+				if (!record.legacy && (!key || intent.providerRequestKey !== key)) continue;
+				this.#intents.set(intent.providerRequestKey, intent);
+				if (record.legacy) await this.#migrateIntentSidecar(file, intent);
+				loaded++;
 				continue;
 			}
 			if (!name.endsWith(PENDING_TOPIC_FILE_SUFFIX)) continue;
 			const topicId = Number(name.slice(0, -PENDING_TOPIC_FILE_SUFFIX.length));
-			if (Number.isSafeInteger(topicId) && topicId > 0 && (await this.readPendingTopic(topicId))) loaded++;
+			if (!Number.isSafeInteger(topicId) || topicId <= 0) continue;
+			const record = await this.#readPendingSidecarRecord(file);
+			const pending = record?.pendingTopic;
+			if (!pending || pending.topicId !== topicId || this.#now() >= pending.expiresAt) continue;
+			this.#pendingTopics.set(topicId, pending);
+			if (record.legacy) await this.#migratePendingTopicSidecar(file, pending);
+			loaded++;
 		}
 		return loaded;
 	}
@@ -392,9 +469,8 @@ export class TelegramAdoptionIntentStore {
 		for (const name of names) {
 			const file = path.join(this.#dir, name);
 			if (name.endsWith(INTENT_FILE_SUFFIX)) {
-				const encoded = name.slice(0, -INTENT_FILE_SUFFIX.length);
-				const key = decodeProviderRequestKey(encoded);
-				const intent = key ? await this.#readSidecar(file) : undefined;
+				const record = await this.#readSidecarRecord(file);
+				const intent = record?.intent;
 				if (intent && now < intent.expiresAt) continue;
 				try {
 					await this.#fsImpl.unlink(file);
@@ -402,15 +478,15 @@ export class TelegramAdoptionIntentStore {
 				} catch (error) {
 					if (!isMissing(error)) throw error;
 				}
-				if (key) {
-					this.#intents.delete(key);
-					if (intent) this.releaseClaim(intent.topicId, key);
+				if (intent) {
+					this.#intents.delete(intent.providerRequestKey);
+					this.releaseClaim(intent.topicId, intent.providerRequestKey);
 				}
 				continue;
 			}
 			if (!name.endsWith(PENDING_TOPIC_FILE_SUFFIX)) continue;
 			const topicId = Number(name.slice(0, -PENDING_TOPIC_FILE_SUFFIX.length));
-			const pending = await this.#readPendingSidecar(file);
+			const pending = (await this.#readPendingSidecarRecord(file))?.pendingTopic;
 			if (Number.isSafeInteger(topicId) && topicId > 0 && pending?.topicId === topicId && now < pending.expiresAt)
 				continue;
 			try {
@@ -424,7 +500,7 @@ export class TelegramAdoptionIntentStore {
 		return removed;
 	}
 
-	async #readSidecar(file: string): Promise<TelegramAdoptionIntent | undefined> {
+	async #readSidecarRecord(file: string): Promise<{ intent: TelegramAdoptionIntent; legacy: boolean } | undefined> {
 		let raw: string;
 		try {
 			raw = await this.#fsImpl.readFile(file, "utf8");
@@ -433,14 +509,15 @@ export class TelegramAdoptionIntentStore {
 			throw error;
 		}
 		try {
-			const parsed: unknown = JSON.parse(raw);
-			return isPersistedIntent(parsed) ? parsed.intent : undefined;
+			return normalizePersistedIntent(JSON.parse(raw) as unknown);
 		} catch {
 			return undefined;
 		}
 	}
 
-	async #readPendingSidecar(file: string): Promise<TelegramPendingTopic | undefined> {
+	async #readPendingSidecarRecord(
+		file: string,
+	): Promise<{ pendingTopic: TelegramPendingTopic; legacy: boolean } | undefined> {
 		let raw: string;
 		try {
 			raw = await this.#fsImpl.readFile(file, "utf8");
@@ -450,9 +527,36 @@ export class TelegramAdoptionIntentStore {
 		}
 		try {
 			const parsed: unknown = JSON.parse(raw);
-			return isPersistedPendingTopic(parsed) ? parsed.pendingTopic : undefined;
+			if (!isPersistedPendingTopic(parsed)) return undefined;
+			return {
+				pendingTopic: parsed.pendingTopic,
+				legacy: parsed.version === LEGACY_TELEGRAM_ADOPTION_INTENT_VERSION,
+			};
 		} catch {
 			return undefined;
+		}
+	}
+
+	async #migrateIntentSidecar(file: string, intent: TelegramAdoptionIntent): Promise<void> {
+		try {
+			const destination = adoptionIntentFilePath(this.#agentDir, intent.providerRequestKey);
+			await this.#writeSidecar(destination, { version: TELEGRAM_ADOPTION_INTENT_VERSION, intent });
+			if (destination !== file) await this.#fsImpl.unlink(file).catch(() => undefined);
+		} catch {
+			// Keep a live v1 sidecar in place when migration is temporarily unavailable.
+		}
+	}
+
+	async #migratePendingTopicSidecar(file: string, pendingTopic: TelegramPendingTopic): Promise<void> {
+		try {
+			const destination = pendingTopicFilePath(this.#agentDir, pendingTopic.topicId);
+			await this.#writeSidecar(destination, {
+				version: TELEGRAM_ADOPTION_INTENT_VERSION,
+				pendingTopic,
+			});
+			if (destination !== file) await this.#fsImpl.unlink(file).catch(() => undefined);
+		} catch {
+			// Keep a live v1 sidecar in place when migration is temporarily unavailable.
 		}
 	}
 

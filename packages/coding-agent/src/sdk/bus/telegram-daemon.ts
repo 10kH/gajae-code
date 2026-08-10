@@ -4236,7 +4236,7 @@ export class TelegramNotificationDaemon {
 	/** Exact settlement of each admitted legacy-v1 start; retained only while visible. */
 	private readonly legacyToolStarts = new Map<string, LegacyToolStartSettlement>();
 	private nextLegacyToolStartId = 1;
-	private nextPublicationQueueItemId = 1;
+	#nextPublicationQueueItemId = 1;
 	private readonly unresolvedToolTerminalizations = new Map<string, { messageId: number; owner: ToolActivityOwner }>();
 	private toolTerminalizationChain: Promise<void> = Promise.resolve();
 	private toolActivityPolicyEpoch = 0;
@@ -4262,8 +4262,8 @@ export class TelegramNotificationDaemon {
 
 	private readonly runtime: NotificationOperatorRuntime;
 	/** Provider-facing frame dispatcher; endpoint authority remains in SessionRouter. */
-	private readonly frameRouter: OperatorEventRouter<AttachmentSession>;
-	private readonly attachmentRouter: SessionRouter;
+	readonly #frameRouter: OperatorEventRouter<AttachmentSession>;
+	readonly #attachmentRouter: SessionRouter;
 	private readonly pollConflictBackoff = new JitteredPollConflictBackoff();
 	private readonly loopBackoff = new OperatorBackoffPolicy({ initialMs: 250, maxMs: 4_000 });
 	private running = false;
@@ -4285,24 +4285,24 @@ export class TelegramNotificationDaemon {
 	readonly #malformedTopicCreateEndpoints = new Map<string, string>();
 	/** Serializes registry snapshots so an older atomic write cannot overwrite newer rename state. */
 	/** Legacy sockets have no durable token, so explicit teardown is their revocation fence. */
-	private readonly droppedSessions = new WeakSet<AttachmentSession>();
+	readonly #droppedSessions = new WeakSet<AttachmentSession>();
 	private topicsPersistQueue: Promise<void> = Promise.resolve();
 	/** Serializes recovery compare/write/publish claims so competing endpoint migrations cannot durably diverge. */
 	/** Durable provider presentation identities; credentials and lifecycle state never enter this journal. */
-	private readonly deliveredPublications = new Map<string, number>();
-	private readonly claimedPublications = new Map<string, number>();
-	private readonly tentativePublications = new Set<string>();
-	private readonly publicationsBeingRejected = new Set<string>();
-	private readonly ambiguousPublications = new Map<string, number>();
-	private readonly rejectedPublications = new Map<string, number>();
-	private readonly publicationsClaimedThisRun = new Set<string>();
-	private readonly deferredPublications = new Set<string>();
-	private readonly publicationLastOutcomes = new Map<string, BotApiCallOutcome["kind"]>();
-	private readonly publicationSettlements = new Map<string, PromiseWithResolvers<void>>();
-	private readonly failedPublicationSettlements = new Set<string>();
-	private presentationPersistenceQueue: Promise<void> = Promise.resolve();
+	readonly #deliveredPublications = new Map<string, number>();
+	readonly #claimedPublications = new Map<string, number>();
+	readonly #tentativePublications = new Set<string>();
+	readonly #publicationsBeingRejected = new Set<string>();
+	readonly #ambiguousPublications = new Map<string, number>();
+	readonly #rejectedPublications = new Map<string, number>();
+	readonly #publicationsClaimedThisRun = new Set<string>();
+	readonly #deferredPublications = new Set<string>();
+	readonly #publicationLastOutcomes = new Map<string, BotApiCallOutcome["kind"]>();
+	readonly #publicationSettlements = new Map<string, PromiseWithResolvers<void>>();
+	readonly #failedPublicationSettlements = new Set<string>();
+	#presentationPersistenceQueue: Promise<void> = Promise.resolve();
 	/** Provider-owned create admission window, keyed by the authorized Telegram actor. */
-	private readonly createRateLimitHits = new Map<string, Array<{ requestKey: string; at: number }>>();
+	readonly #createRateLimitHits = new Map<string, Array<{ requestKey: string; at: number }>>();
 	private recoveryBindingClaimQueue: Promise<void> = Promise.resolve();
 	/** Durable compensation fences retry under supervision until persistence succeeds. */
 	private readonly compensationFenceRetries = new Map<string, Promise<void>>();
@@ -4336,7 +4336,7 @@ export class TelegramNotificationDaemon {
 	/** Identity-bearing sessions by repo/branch surface, used to avoid transient duplicate topics. */
 	private readonly topicOwnerByIdentity = new Map<string, string>();
 	/** Ephemeral legacy topic owners retained across a same-socket config rekey. */
-	private readonly legacyTopicOwners = new Map<string, AttachmentSession>();
+	readonly #legacyTopicOwners = new Map<string, AttachmentSession>();
 	/** Preserved initiator topics must not route through a rekeyed transport. */
 	private readonly preservedInitiatorTopics = new Set<string>();
 	/** Non-identity frames held until identity creates the correct thread. */
@@ -4344,7 +4344,7 @@ export class TelegramNotificationDaemon {
 	/** Durable endpoint leases for sessions that already sent an authorized session_closed. */
 	private readonly closedEndpointKeys = new Map<string, TopicEndpointBinding>();
 	/** Exactly one authorized transport may route each recovered logical session. */
-	private readonly logicalSessionOwners = new Map<string, AttachmentSession>();
+	readonly #logicalSessionOwners = new Map<string, AttachmentSession>();
 	private nextSocketLeaseToken = 1;
 	/** True once the daemon has nudged the user to enable Threaded Mode. */
 	private threadedFallbackNoticeSent = false;
@@ -4368,7 +4368,7 @@ export class TelegramNotificationDaemon {
 		return this.dispatchState.inboundReactions;
 	}
 	/** SDK-owned service is the sole lifecycle executor and terminal authority. */
-	private readonly lifecycleService: AgentDirSessionLifecycleService;
+	readonly #lifecycleService: AgentDirSessionLifecycleService;
 	/** Attempt tombstones live for the daemon lifetime so a commit key can never send twice. */
 	private readonly selectedAckCache = new Map<string, SelectedAckOutcome>();
 	private cacheSelectedAck(cacheKey: string, outcome: SelectedAckOutcome): void {
@@ -4385,21 +4385,21 @@ export class TelegramNotificationDaemon {
 	): Promise<void> {
 		if (!publicationId) return;
 		if (outcome.status === "delivered") {
-			await this.markPublicationDelivered(publicationId);
-			this.deferredPublications.delete(publicationId);
+			await this.#markPublicationDelivered(publicationId);
+			this.#deferredPublications.delete(publicationId);
 			return;
 		}
 		if (outcome.status === "unknown") {
-			await this.markPublicationAttempted(publicationId);
+			await this.#markPublicationAttempted(publicationId);
 			return;
 		}
 		if (outcome.reason === "telegram_rejected") {
-			await this.markPublicationRejected(publicationId, true);
-			this.deferredPublications.delete(publicationId);
+			await this.#markPublicationRejected(publicationId, true);
+			this.#deferredPublications.delete(publicationId);
 			return;
 		}
-		await this.markPublicationRejected(publicationId);
-		this.deferredPublications.delete(publicationId);
+		await this.#markPublicationRejected(publicationId);
+		this.#deferredPublications.delete(publicationId);
 	}
 	private finishSelectedAck(item: SelectedAckQueueItem, outcome: SelectedAckOutcome): void {
 		if (this.selectedAckPending.get(item.pendingKey) !== item) return;
@@ -4454,9 +4454,9 @@ export class TelegramNotificationDaemon {
 		for (const session of this.sessions.values()) {
 			for (const item of session.replayQueue) {
 				if (!item.publicationId) continue;
-				this.deferredPublications.delete(item.publicationId);
-				this.markPublicationRejected(item.publicationId).catch(error =>
-					this.rejectPublicationSettlement(item.publicationId!, error),
+				this.#deferredPublications.delete(item.publicationId);
+				this.#markPublicationRejected(item.publicationId).catch(error =>
+					this.#rejectPublicationSettlement(item.publicationId!, error),
 				);
 			}
 			session.replayQueue = [];
@@ -4471,11 +4471,11 @@ export class TelegramNotificationDaemon {
 		this.running = false;
 	}
 
-	private lifecycleActor(): SessionLifecycleActor {
+	#lifecycleActor(): SessionLifecycleActor {
 		return { id: String(this.opts.chatId), namespace: `telegram:${tokenFingerprint(this.opts.botToken)}` };
 	}
 
-	private providerRequestKey(updateId: number | undefined, text?: string): string {
+	#providerRequestKey(updateId: number | undefined, text?: string): string {
 		const identity =
 			updateId === undefined
 				? crypto
@@ -4486,36 +4486,36 @@ export class TelegramNotificationDaemon {
 		return `telegram:${this.opts.chatId}:${identity}`;
 	}
 
-	private admitSessionCreate(requestKey: string): boolean {
-		const actor = this.lifecycleActor();
+	#admitSessionCreate(requestKey: string): boolean {
+		const actor = this.#lifecycleActor();
 		const key = `${actor.namespace}:${actor.id}`;
 		const now = this.runtime.now();
-		const recent = (this.createRateLimitHits.get(key) ?? []).filter(
+		const recent = (this.#createRateLimitHits.get(key) ?? []).filter(
 			entry => now - entry.at < TELEGRAM_CREATE_RATE_LIMIT_WINDOW_MS,
 		);
 		if (recent.some(entry => entry.requestKey === requestKey)) {
-			this.createRateLimitHits.set(key, recent);
+			this.#createRateLimitHits.set(key, recent);
 			return true;
 		}
 		if (recent.length >= TELEGRAM_CREATE_RATE_LIMIT_MAX) {
-			this.createRateLimitHits.set(key, recent);
+			this.#createRateLimitHits.set(key, recent);
 			return false;
 		}
 		recent.push({ requestKey, at: now });
-		this.createRateLimitHits.set(key, recent);
+		this.#createRateLimitHits.set(key, recent);
 		return true;
 	}
 
-	private async runLifecycleCommand(
+	async #runLifecycleCommand(
 		parsed:
 			| { kind: "create"; target: SessionCreateTarget; modelPreset?: string }
 			| { kind: "close"; target: SessionCloseTarget }
 			| { kind: "resume"; target: SessionResumeTarget },
 		requestKey: string,
 	): Promise<SessionCreateOutcome | SessionCloseOutcome | SessionResumeOutcome | ExternalSessionResumeResult> {
-		const actor = this.lifecycleActor();
+		const actor = this.#lifecycleActor();
 		if (parsed.kind === "create") {
-			if (!this.admitSessionCreate(requestKey)) {
+			if (!this.#admitSessionCreate(requestKey)) {
 				return {
 					ok: false,
 					operation: "session.create",
@@ -4526,7 +4526,7 @@ export class TelegramNotificationDaemon {
 					},
 				};
 			}
-			return this.lifecycleService.createExternal({
+			return this.#lifecycleService.createExternal({
 				actor,
 				capability: "session.create",
 				requestKey,
@@ -4535,13 +4535,13 @@ export class TelegramNotificationDaemon {
 			});
 		}
 		if (parsed.kind === "close")
-			return this.lifecycleService.close({
+			return this.#lifecycleService.close({
 				actor,
 				capability: "session.close",
 				requestKey,
 				target: { sessionId: parsed.target.sessionId },
 			});
-		return this.lifecycleService.resumeExternal({
+		return this.#lifecycleService.resumeExternal({
 			actor,
 			capability: "session.resume",
 			requestKey,
@@ -4596,7 +4596,7 @@ export class TelegramNotificationDaemon {
 			return true;
 		}
 		if (parsed.kind === "recent") {
-			const recent = await this.lifecycleService.listRecent({
+			const recent = await this.#lifecycleService.listRecent({
 				cwd: process.cwd(),
 				limit: 10,
 				includeInternal: false,
@@ -4622,10 +4622,10 @@ export class TelegramNotificationDaemon {
 			await reply(`${valid.message}\n\n${lifecycleUsage()}`);
 			return true;
 		}
-		const requestKey = this.providerRequestKey(updateId, text);
+		const requestKey = this.#providerRequestKey(updateId, text);
 		let outcome: SessionCreateOutcome | SessionCloseOutcome | SessionResumeOutcome | ExternalSessionResumeResult;
 		try {
-			outcome = await this.runLifecycleCommand(parsed, requestKey);
+			outcome = await this.#runLifecycleCommand(parsed, requestKey);
 		} catch {
 			outcome = {
 				ok: false,
@@ -4639,11 +4639,11 @@ export class TelegramNotificationDaemon {
 				error: { code: "terminal_uncertain", message: "lifecycle outcome is uncertain" },
 			} as SessionCreateOutcome;
 		}
-		await reply(this.formatLifecycleResponse(outcome, verb, requestKey, parsed));
+		await reply(this.#formatLifecycleResponse(outcome, verb, requestKey, parsed));
 		return true;
 	}
 
-	private formatLifecycleResponse(
+	#formatLifecycleResponse(
 		outcome: SessionCreateOutcome | SessionCloseOutcome | SessionResumeOutcome | ExternalSessionResumeResult,
 		verb: LifecycleCommandVerb,
 		requestKey: string,
@@ -4653,7 +4653,7 @@ export class TelegramNotificationDaemon {
 			| { kind: "resume"; target: SessionResumeTarget },
 	): string {
 		if ("kind" in outcome) {
-			if (outcome.kind === "result") return this.formatLifecycleResponse(outcome.outcome, verb, requestKey, parsed);
+			if (outcome.kind === "result") return this.#formatLifecycleResponse(outcome.outcome, verb, requestKey, parsed);
 			if (outcome.kind === "ambiguous")
 				return formatLifecycleOutcome(
 					{
@@ -4791,10 +4791,10 @@ export class TelegramNotificationDaemon {
 		callOpts?: { signal?: AbortSignal; noRetry?: boolean },
 	) => Promise<BotApiCallResult>;
 
-	private botApiWithOutcomeCollector(outcomes: BotApiCallOutcome[], publicationId?: string): BotApi {
+	#botApiWithOutcomeCollector(outcomes: BotApiCallOutcome[], publicationId?: string): BotApi {
 		return {
 			call: async (method, body, callOpts) => {
-				const result = await this.callPublicationBotApiClassified(publicationId, method, body, callOpts);
+				const result = await this.#callPublicationBotApiClassified(publicationId, method, body, callOpts);
 				const collectedOutcome =
 					result.outcome.kind === "accepted" && !hasAcceptedTelegramReceipt(method, result.response)
 						? ({ kind: "unknown" } as const)
@@ -4804,15 +4804,15 @@ export class TelegramNotificationDaemon {
 			},
 		};
 	}
-	private botApiForPublication(publicationId: string | undefined): BotApi {
+	#botApiForPublication(publicationId: string | undefined): BotApi {
 		return {
 			call: async (method, body, callOpts) =>
-				(await this.callPublicationBotApiClassified(publicationId, method, body, callOpts)).response,
+				(await this.#callPublicationBotApiClassified(publicationId, method, body, callOpts)).response,
 		};
 	}
 
 	constructor(private readonly opts: TelegramDaemonOptions) {
-		this.lifecycleService = (opts.createLifecycleService ?? createSessionLifecycleService)(
+		this.#lifecycleService = (opts.createLifecycleService ?? createSessionLifecycleService)(
 			opts.settings.getAgentDir(),
 		);
 		this.fsImpl = opts.fs ?? nodeFs;
@@ -4863,8 +4863,8 @@ export class TelegramNotificationDaemon {
 			setIntervalImpl: opts.setIntervalImpl,
 			clearIntervalImpl: opts.clearIntervalImpl,
 		});
-		this.frameRouter = this.createFrameRouter();
-		this.attachmentRouter = new SessionRouter({
+		this.#frameRouter = this.#createFrameRouter();
+		this.#attachmentRouter = new SessionRouter({
 			agentDir: opts.settings.getAgentDir(),
 			deps: {
 				...opts.routerDeps,
@@ -4881,6 +4881,20 @@ export class TelegramNotificationDaemon {
 			backoff: this.pollConflictBackoff,
 			processUpdate: update => this.processTelegramUpdate(update),
 		});
+	}
+	/** @internal Test-only access to durable publication receipt transitions. */
+	publicationReceiptHarnessForTest() {
+		return {
+			claimPublication: (publicationId: string) => this.#claimPublication(publicationId),
+			markPublicationAttempted: (publicationId: string) => this.#markPublicationAttempted(publicationId),
+			markPublicationDelivered: (publicationId: string) => this.#markPublicationDelivered(publicationId),
+			markPublicationRejected: (publicationId: string, definitiveProviderRejection = false) =>
+				this.#markPublicationRejected(publicationId, definitiveProviderRejection),
+			loadPresentationState: () => this.#loadPresentationState(),
+			publicationShouldSuppress: (publicationId: string) => this.#publicationShouldSuppress(publicationId),
+			publicationSettlement: (publicationId: string) => this.#publicationSettlement(publicationId),
+			settlePublication: (publicationId: string) => this.#settlePublication(publicationId),
+		};
 	}
 	#attachmentIsCurrent(session: AttachmentSession): boolean {
 		return this.sessions.get(session.sessionId) === session && session.attachment.isCurrent();
@@ -4924,7 +4938,7 @@ export class TelegramNotificationDaemon {
 			replayQueue: [],
 		};
 		const previous = this.sessions.get(session.sessionId);
-		if (previous) this.dropSession(previous, "attachment_replaced");
+		if (previous) this.#dropSession(previous, "attachment_replaced");
 		this.sessions.set(session.sessionId, session);
 		this.#clearModelChoiceAliases(session.sessionId);
 		if (this.topics.get(session.sessionId)?.authorityState === "active")
@@ -4968,7 +4982,7 @@ export class TelegramNotificationDaemon {
 		} catch (error) {
 			if (this.sessions.get(session.sessionId) === session) {
 				logger.warn(`notifications: Telegram attachment handshake failed: ${sanitizeDiagnostic(String(error))}`);
-				this.dropSession(session, "handshake_failed");
+				this.#dropSession(session, "handshake_failed");
 			}
 		}
 	}
@@ -4981,39 +4995,39 @@ export class TelegramNotificationDaemon {
 	}
 
 	async #onRouterFrame(attachment: SessionAttachment, frame: SessionRouterFrame): Promise<void> {
-		if (frame.publicationId && this.failedPublicationSettlements.delete(frame.publicationId))
-			this.publicationSettlements.delete(frame.publicationId);
+		if (frame.publicationId && this.#failedPublicationSettlements.delete(frame.publicationId))
+			this.#publicationSettlements.delete(frame.publicationId);
 		const session = this.sessions.get(attachment.sessionId);
 		if (!session || session.attachment !== attachment || !attachment.isCurrent()) return;
-		if (await this.publicationSuppressed(frame.publicationId)) return;
-		await this.claimPublication(frame.publicationId);
+		if (await this.#publicationSuppressed(frame.publicationId)) return;
+		await this.#claimPublication(frame.publicationId);
 		const replayPending = session.replayPending;
 		await this.effects.admit(() => this.handleSessionMessage(session, frame.body, frame.publicationId));
-		if (frame.publicationId && this.publicationHasPendingWork(frame.publicationId))
-			await this.publicationSettlement(frame.publicationId).promise;
+		if (frame.publicationId && this.#publicationHasPendingWork(frame.publicationId))
+			await this.#publicationSettlement(frame.publicationId).promise;
 		if (
 			!replayPending &&
-			!this.deferredPublications.has(frame.publicationId ?? "") &&
-			!(await this.publicationSuppressed(frame.publicationId))
+			!this.#deferredPublications.has(frame.publicationId ?? "") &&
+			!(await this.#publicationSuppressed(frame.publicationId))
 		)
-			await this.markPublicationRejected(frame.publicationId);
+			await this.#markPublicationRejected(frame.publicationId);
 		if (
 			frame.publicationId &&
-			this.ambiguousPublications.has(frame.publicationId) &&
-			!this.publicationHasPendingWork(frame.publicationId)
+			this.#ambiguousPublications.has(frame.publicationId) &&
+			!this.#publicationHasPendingWork(frame.publicationId)
 		)
-			this.settlePublication(frame.publicationId);
-		if (frame.publicationId && this.claimedPublications.has(frame.publicationId))
-			await this.publicationSettlement(frame.publicationId).promise;
+			this.#settlePublication(frame.publicationId);
+		if (frame.publicationId && this.#claimedPublications.has(frame.publicationId))
+			await this.#publicationSettlement(frame.publicationId).promise;
 	}
 
 	async #onSessionRemoved(attachment: SessionAttachment): Promise<void> {
 		const session = this.sessions.get(attachment.sessionId);
 		if (!session || session.attachment !== attachment) return;
-		this.dropSession(session, "router_session_removed");
+		this.#dropSession(session, "router_session_removed");
 	}
 
-	private createFrameRouter(): OperatorEventRouter<AttachmentSession> {
+	#createFrameRouter(): OperatorEventRouter<AttachmentSession> {
 		return new OperatorEventRouter<AttachmentSession>()
 			.add({
 				name: "hello",
@@ -5035,14 +5049,14 @@ export class TelegramNotificationDaemon {
 				matches: msg => msg.type === "ask_selected_ack_request",
 				handle: async (session, msg) => {
 					const publicationId = session.activePublicationId;
-					if (publicationId) this.deferredPublications.add(publicationId);
+					if (publicationId) this.#deferredPublications.add(publicationId);
 					const requestId = typeof msg.requestId === "string" ? msg.requestId : undefined;
 					const commitKey = typeof msg.commitKey === "string" ? msg.commitKey : undefined;
 					const mode = msg.mode === "live" || msg.mode === "recovery" ? msg.mode : undefined;
 					const deadlineAt = typeof msg.deadlineAt === "number" ? msg.deadlineAt : undefined;
 					if (!requestId || !commitKey || !mode || !deadlineAt) {
-						await this.markPublicationRejected(publicationId);
-						if (publicationId) this.deferredPublications.delete(publicationId);
+						await this.#markPublicationRejected(publicationId);
+						if (publicationId) this.#deferredPublications.delete(publicationId);
 						return;
 					}
 					const cacheKey = `${session.sessionId}\0${commitKey}`;
@@ -5074,8 +5088,8 @@ export class TelegramNotificationDaemon {
 					const logicalSessionId = this.#logicalSessionId(session);
 					const socketLease = this.#socketLease(session, logicalSessionId);
 					if (!socketLease) {
-						await this.markPublicationRejected(publicationId);
-						if (publicationId) this.deferredPublications.delete(publicationId);
+						await this.#markPublicationRejected(publicationId);
+						if (publicationId) this.#deferredPublications.delete(publicationId);
 						return;
 					}
 					const topicLease = this.topicAuthorityLeaseFromRegistry(logicalSessionId);
@@ -5138,7 +5152,7 @@ export class TelegramNotificationDaemon {
 						},
 					});
 					if (!submitted)
-						await this.failPublicationPreSend(publicationId, "selected acknowledgement queue stopped");
+						await this.#failPublicationPreSend(publicationId, "selected acknowledgement queue stopped");
 					await this.flushPool();
 				},
 			})
@@ -5286,7 +5300,7 @@ export class TelegramNotificationDaemon {
 							(socketLease &&
 								(session.recoveryLease?.token !== socketLease.token ||
 									session.recoveryLease.state !== "authorized" ||
-									this.logicalSessionOwners.get(logicalSessionId) !== session))
+									this.#logicalSessionOwners.get(logicalSessionId) !== session))
 						) {
 							// A replacement won after the close fence committed. Restore the exact
 							// pre-close authority and remove the predecessor tombstone together.
@@ -5329,45 +5343,45 @@ export class TelegramNotificationDaemon {
 							);
 							return;
 						}
-						this.dropSession(session, "session_closed");
+						this.#dropSession(session, "session_closed");
 					});
 				},
 			});
 	}
 
-	private presentationStatePath(): string {
+	#presentationStatePath(): string {
 		return path.join(daemonPaths(this.opts.settings.getAgentDir()).dir, "telegram-presentation-state.json");
 	}
 
-	private publicationDelivered(publicationId: string | undefined): boolean {
-		return publicationId !== undefined && this.deliveredPublications.has(publicationId);
+	#publicationDelivered(publicationId: string | undefined): boolean {
+		return publicationId !== undefined && this.#deliveredPublications.has(publicationId);
 	}
 
-	private publicationShouldSuppress(publicationId: string | undefined): boolean {
+	#publicationShouldSuppress(publicationId: string | undefined): boolean {
 		return (
 			publicationId !== undefined &&
-			(this.deliveredPublications.has(publicationId) ||
-				this.ambiguousPublications.has(publicationId) ||
-				this.rejectedPublications.has(publicationId))
+			(this.#deliveredPublications.has(publicationId) ||
+				this.#ambiguousPublications.has(publicationId) ||
+				this.#rejectedPublications.has(publicationId))
 		);
 	}
 
-	private async publicationSuppressed(publicationId: string | undefined): Promise<boolean> {
-		if (publicationId && this.publicationsBeingRejected.has(publicationId))
-			await this.publicationSettlement(publicationId).promise;
-		return this.publicationShouldSuppress(publicationId);
+	async #publicationSuppressed(publicationId: string | undefined): Promise<boolean> {
+		if (publicationId && this.#publicationsBeingRejected.has(publicationId))
+			await this.#publicationSettlement(publicationId).promise;
+		return this.#publicationShouldSuppress(publicationId);
 	}
 
-	private publicationTerminal(publicationId: string | undefined): boolean {
+	#publicationTerminal(publicationId: string | undefined): boolean {
 		return (
 			publicationId !== undefined &&
-			(this.deliveredPublications.has(publicationId) || this.rejectedPublications.has(publicationId))
+			(this.#deliveredPublications.has(publicationId) || this.#rejectedPublications.has(publicationId))
 		);
 	}
 
-	private async loadPresentationState(): Promise<void> {
+	async #loadPresentationState(): Promise<void> {
 		if (this.validationMode()) return;
-		const raw = await readJson<unknown>(this.fsImpl, this.presentationStatePath());
+		const raw = await readJson<unknown>(this.fsImpl, this.#presentationStatePath());
 		if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
 		const state = raw as Partial<TelegramPresentationState>;
 		if (
@@ -5392,183 +5406,183 @@ export class TelegramNotificationDaemon {
 		}
 		for (const [publicationId, timestamp] of deliveredEntries)
 			if (publicationId && typeof timestamp === "number" && Number.isFinite(timestamp))
-				this.deliveredPublications.set(publicationId, timestamp);
+				this.#deliveredPublications.set(publicationId, timestamp);
 		for (const [publicationId, timestamp] of claimedEntries)
 			if (publicationId && typeof timestamp === "number" && Number.isFinite(timestamp))
-				this.claimedPublications.set(publicationId, timestamp);
+				this.#claimedPublications.set(publicationId, timestamp);
 		for (const [publicationId, timestamp] of ambiguousEntries)
 			if (publicationId && typeof timestamp === "number" && Number.isFinite(timestamp))
-				this.ambiguousPublications.set(publicationId, timestamp);
+				this.#ambiguousPublications.set(publicationId, timestamp);
 		for (const [publicationId, timestamp] of rejectedEntries)
 			if (publicationId && typeof timestamp === "number" && Number.isFinite(timestamp))
-				this.rejectedPublications.set(publicationId, timestamp);
-		for (const publicationId of this.deliveredPublications.keys()) {
-			this.claimedPublications.delete(publicationId);
-			this.ambiguousPublications.delete(publicationId);
-			this.rejectedPublications.delete(publicationId);
+				this.#rejectedPublications.set(publicationId, timestamp);
+		for (const publicationId of this.#deliveredPublications.keys()) {
+			this.#claimedPublications.delete(publicationId);
+			this.#ambiguousPublications.delete(publicationId);
+			this.#rejectedPublications.delete(publicationId);
 		}
-		for (const publicationId of this.rejectedPublications.keys()) {
-			this.claimedPublications.delete(publicationId);
-			this.ambiguousPublications.delete(publicationId);
+		for (const publicationId of this.#rejectedPublications.keys()) {
+			this.#claimedPublications.delete(publicationId);
+			this.#ambiguousPublications.delete(publicationId);
 		}
-		this.prunePublicationReceipts();
-		const uncertainCount = this.claimedPublications.size + this.ambiguousPublications.size;
+		this.#prunePublicationReceipts();
+		const uncertainCount = this.#claimedPublications.size + this.#ambiguousPublications.size;
 		if (uncertainCount > 0)
 			logger.warn(
 				`notifications: ${uncertainCount} Telegram publication(s) remain queued or provider-ambiguous after restart.`,
 			);
 	}
 
-	private prunePublicationReceipts(): void {
-		while (this.deliveredPublications.size > TELEGRAM_PRESENTATION_STATE_LIMIT) {
-			const oldest = [...this.deliveredPublications.entries()].sort((left, right) => left[1] - right[1])[0]?.[0];
+	#prunePublicationReceipts(): void {
+		while (this.#deliveredPublications.size > TELEGRAM_PRESENTATION_STATE_LIMIT) {
+			const oldest = [...this.#deliveredPublications.entries()].sort((left, right) => left[1] - right[1])[0]?.[0];
 			if (oldest === undefined) return;
-			this.deliveredPublications.delete(oldest);
-			this.deferredPublications.delete(oldest);
+			this.#deliveredPublications.delete(oldest);
+			this.#deferredPublications.delete(oldest);
 		}
-		while (this.rejectedPublications.size > TELEGRAM_PRESENTATION_STATE_LIMIT) {
-			const oldest = [...this.rejectedPublications.entries()].sort((left, right) => left[1] - right[1])[0]?.[0];
+		while (this.#rejectedPublications.size > TELEGRAM_PRESENTATION_STATE_LIMIT) {
+			const oldest = [...this.#rejectedPublications.entries()].sort((left, right) => left[1] - right[1])[0]?.[0];
 			if (oldest === undefined) return;
-			this.rejectedPublications.delete(oldest);
-			this.deferredPublications.delete(oldest);
+			this.#rejectedPublications.delete(oldest);
+			this.#deferredPublications.delete(oldest);
 		}
 	}
 
-	private async persistPresentationState(): Promise<void> {
+	async #persistPresentationState(): Promise<void> {
 		if (this.validationMode()) return;
 		await ensureDir(this.fsImpl, daemonPaths(this.opts.settings.getAgentDir()).dir);
 		await writeJsonAtomic(
 			this.fsImpl,
-			this.presentationStatePath(),
+			this.#presentationStatePath(),
 			{
 				version: TELEGRAM_PRESENTATION_STATE_VERSION,
-				delivered: Object.fromEntries(this.deliveredPublications),
-				claimed: Object.fromEntries(this.claimedPublications),
-				ambiguous: Object.fromEntries(this.ambiguousPublications),
-				rejected: Object.fromEntries(this.rejectedPublications),
+				delivered: Object.fromEntries(this.#deliveredPublications),
+				claimed: Object.fromEntries(this.#claimedPublications),
+				ambiguous: Object.fromEntries(this.#ambiguousPublications),
+				rejected: Object.fromEntries(this.#rejectedPublications),
 			},
 			{ durable: true },
 		);
 	}
 
-	private async persistPublicationReceipts(): Promise<void> {
-		const pending = this.presentationPersistenceQueue.then(() => this.persistPresentationState());
-		this.presentationPersistenceQueue = pending.catch(() => undefined);
+	async #persistPublicationReceipts(): Promise<void> {
+		const pending = this.#presentationPersistenceQueue.then(() => this.#persistPresentationState());
+		this.#presentationPersistenceQueue = pending.catch(() => undefined);
 		await pending;
 	}
 
-	private publicationSettlement(publicationId: string): PromiseWithResolvers<void> {
-		let settlement = this.publicationSettlements.get(publicationId);
+	#publicationSettlement(publicationId: string): PromiseWithResolvers<void> {
+		let settlement = this.#publicationSettlements.get(publicationId);
 		if (!settlement) {
 			settlement = Promise.withResolvers<void>();
-			this.publicationSettlements.set(publicationId, settlement);
+			this.#publicationSettlements.set(publicationId, settlement);
 		}
 		return settlement;
 	}
 
-	private settlePublication(publicationId: string | undefined): void {
+	#settlePublication(publicationId: string | undefined): void {
 		if (!publicationId) return;
-		const settlement = this.publicationSettlements.get(publicationId);
+		const settlement = this.#publicationSettlements.get(publicationId);
 		if (!settlement) return;
-		this.publicationSettlements.delete(publicationId);
+		this.#publicationSettlements.delete(publicationId);
 		settlement.resolve();
 	}
 
-	private rejectPublicationSettlement(publicationId: string, error: unknown): void {
-		const settlement = this.publicationSettlements.get(publicationId);
+	#rejectPublicationSettlement(publicationId: string, error: unknown): void {
+		const settlement = this.#publicationSettlements.get(publicationId);
 		if (!settlement) return;
-		this.failedPublicationSettlements.add(publicationId);
+		this.#failedPublicationSettlements.add(publicationId);
 		settlement.reject(error);
 		void settlement.promise.catch(() => undefined);
 	}
 
-	private resetPublicationSettlement(publicationId: string | undefined): void {
-		if (!publicationId || this.publicationSettlements.has(publicationId)) return;
-		this.publicationSettlements.set(publicationId, Promise.withResolvers<void>());
+	#resetPublicationSettlement(publicationId: string | undefined): void {
+		if (!publicationId || this.#publicationSettlements.has(publicationId)) return;
+		this.#publicationSettlements.set(publicationId, Promise.withResolvers<void>());
 	}
 
-	private publicationHasPendingWork(publicationId: string): boolean {
+	#publicationHasPendingWork(publicationId: string): boolean {
 		if (this.pool.someQueued(item => item.payload.publicationId === publicationId)) return true;
 		for (const frames of this.pendingThreadedFrames.values())
 			if (frames.some(frame => frame.publicationId === publicationId)) return true;
 		return false;
 	}
 
-	private async claimPublication(publicationId: string | undefined): Promise<void> {
-		if (!publicationId || this.publicationDelivered(publicationId) || this.ambiguousPublications.has(publicationId))
+	async #claimPublication(publicationId: string | undefined): Promise<void> {
+		if (!publicationId || this.#publicationDelivered(publicationId) || this.#ambiguousPublications.has(publicationId))
 			return;
-		if (this.claimedPublications.has(publicationId)) {
-			this.publicationSettlement(publicationId);
+		if (this.#claimedPublications.has(publicationId)) {
+			this.#publicationSettlement(publicationId);
 			return;
 		}
-		if (this.claimedPublications.size + this.ambiguousPublications.size >= TELEGRAM_PUBLICATION_CLAIM_LIMIT)
+		if (this.#claimedPublications.size + this.#ambiguousPublications.size >= TELEGRAM_PUBLICATION_CLAIM_LIMIT)
 			throw new Error("Telegram publication claim capacity is exhausted; refusing provider dispatch.");
-		this.tentativePublications.add(publicationId);
-		this.claimedPublications.set(publicationId, this.runtime.now());
-		this.publicationsClaimedThisRun.add(publicationId);
-		this.prunePublicationReceipts();
-		this.publicationSettlement(publicationId);
+		this.#tentativePublications.add(publicationId);
+		this.#claimedPublications.set(publicationId, this.runtime.now());
+		this.#publicationsClaimedThisRun.add(publicationId);
+		this.#prunePublicationReceipts();
+		this.#publicationSettlement(publicationId);
 		try {
-			await this.persistPublicationReceipts();
+			await this.#persistPublicationReceipts();
 		} catch (error) {
-			this.claimedPublications.delete(publicationId);
-			this.publicationsClaimedThisRun.delete(publicationId);
-			if (!this.publicationsBeingRejected.has(publicationId)) this.tentativePublications.delete(publicationId);
+			this.#claimedPublications.delete(publicationId);
+			this.#publicationsClaimedThisRun.delete(publicationId);
+			if (!this.#publicationsBeingRejected.has(publicationId)) this.#tentativePublications.delete(publicationId);
 			logger.warn(`notifications: Telegram publication claim failed: ${sanitizeDiagnostic(String(error))}`);
-			this.rejectPublicationSettlement(publicationId, error);
-			this.publicationSettlements.delete(publicationId);
+			this.#rejectPublicationSettlement(publicationId, error);
+			this.#publicationSettlements.delete(publicationId);
 			throw error;
 		}
-		if (!this.publicationsBeingRejected.has(publicationId)) this.tentativePublications.delete(publicationId);
-		if (!this.claimedPublications.has(publicationId) || this.publicationShouldSuppress(publicationId))
+		if (!this.#publicationsBeingRejected.has(publicationId)) this.#tentativePublications.delete(publicationId);
+		if (!this.#claimedPublications.has(publicationId) || this.#publicationShouldSuppress(publicationId))
 			throw new Error("Telegram publication claim authority changed during persistence.");
 	}
 
-	private async markPublicationAttempted(publicationId: string | undefined): Promise<void> {
-		if (!publicationId || this.publicationDelivered(publicationId) || this.ambiguousPublications.has(publicationId))
+	async #markPublicationAttempted(publicationId: string | undefined): Promise<void> {
+		if (!publicationId || this.#publicationDelivered(publicationId) || this.#ambiguousPublications.has(publicationId))
 			return;
-		const claimedAt = this.claimedPublications.get(publicationId);
+		const claimedAt = this.#claimedPublications.get(publicationId);
 		if (claimedAt === undefined) return;
-		this.claimedPublications.delete(publicationId);
-		this.publicationsClaimedThisRun.delete(publicationId);
-		this.ambiguousPublications.set(publicationId, this.runtime.now());
+		this.#claimedPublications.delete(publicationId);
+		this.#publicationsClaimedThisRun.delete(publicationId);
+		this.#ambiguousPublications.set(publicationId, this.runtime.now());
 		try {
-			await this.persistPublicationReceipts();
+			await this.#persistPublicationReceipts();
 		} catch (error) {
-			this.ambiguousPublications.delete(publicationId);
-			this.claimedPublications.set(publicationId, claimedAt);
-			this.publicationsClaimedThisRun.add(publicationId);
+			this.#ambiguousPublications.delete(publicationId);
+			this.#claimedPublications.set(publicationId, claimedAt);
+			this.#publicationsClaimedThisRun.add(publicationId);
 			throw new Error("Telegram publication attempt persistence failed.", { cause: error });
 		}
 	}
 
-	private async restorePublicationQueued(publicationId: string | undefined): Promise<void> {
+	async #restorePublicationQueued(publicationId: string | undefined): Promise<void> {
 		if (!publicationId) return;
-		const attemptedAt = this.ambiguousPublications.get(publicationId);
+		const attemptedAt = this.#ambiguousPublications.get(publicationId);
 		if (attemptedAt === undefined) return;
-		this.ambiguousPublications.delete(publicationId);
-		this.claimedPublications.set(publicationId, attemptedAt);
+		this.#ambiguousPublications.delete(publicationId);
+		this.#claimedPublications.set(publicationId, attemptedAt);
 		try {
-			await this.persistPublicationReceipts();
+			await this.#persistPublicationReceipts();
 		} catch (error) {
-			this.claimedPublications.delete(publicationId);
-			this.ambiguousPublications.set(publicationId, attemptedAt);
+			this.#claimedPublications.delete(publicationId);
+			this.#ambiguousPublications.set(publicationId, attemptedAt);
 			throw new Error("Telegram publication queued-state persistence failed.", { cause: error });
 		}
-		this.resetPublicationSettlement(publicationId);
+		this.#resetPublicationSettlement(publicationId);
 	}
 
-	private async beginPublicationAttempt(publicationId: string | undefined): Promise<void> {
+	async #beginPublicationAttempt(publicationId: string | undefined): Promise<void> {
 		if (this.effects.stopping)
-			return await this.failPublicationPreSend(publicationId, "provider effects are stopping");
-		await this.markPublicationAttempted(publicationId);
+			return await this.#failPublicationPreSend(publicationId, "provider effects are stopping");
+		await this.#markPublicationAttempted(publicationId);
 		if (this.effects.stopping) {
-			await this.restorePublicationQueued(publicationId);
-			return await this.failPublicationPreSend(publicationId, "provider effects stopped before dispatch");
+			await this.#restorePublicationQueued(publicationId);
+			return await this.#failPublicationPreSend(publicationId, "provider effects stopped before dispatch");
 		}
 	}
 
-	private async callPublicationBotApiClassified(
+	async #callPublicationBotApiClassified(
 		publicationId: string | undefined,
 		method: string,
 		body: unknown,
@@ -5583,60 +5597,63 @@ export class TelegramNotificationDaemon {
 			let remaining = cooldownRemaining();
 			while (remaining > 0) {
 				if (signal.aborted)
-					return await this.failPublicationPreSend(publicationId, "provider delivery aborted during cooldown");
+					return await this.#failPublicationPreSend(publicationId, "provider delivery aborted during cooldown");
 				if (this.effects.stopping)
-					return await this.failPublicationPreSend(publicationId, "provider effects are stopping during cooldown");
+					return await this.#failPublicationPreSend(
+						publicationId,
+						"provider effects are stopping during cooldown",
+					);
 				await this.runtime.sleep(Math.min(remaining, 1_000));
 				remaining = cooldownRemaining();
 			}
-			if (this.publicationTerminal(publicationId))
+			if (this.#publicationTerminal(publicationId))
 				throw new Error("Telegram publication became terminal before provider dispatch.");
 			if (signal.aborted)
-				return await this.failPublicationPreSend(publicationId, "provider delivery aborted before dispatch");
-			await this.beginPublicationAttempt(publicationId);
+				return await this.#failPublicationPreSend(publicationId, "provider delivery aborted before dispatch");
+			await this.#beginPublicationAttempt(publicationId);
 			if (cooldownRemaining() > 0) {
-				await this.restorePublicationQueued(publicationId);
+				await this.#restorePublicationQueued(publicationId);
 				continue;
 			}
-			if (this.publicationTerminal(publicationId))
+			if (this.#publicationTerminal(publicationId))
 				throw new Error("Telegram publication became terminal during provider dispatch admission.");
 			if (signal.aborted) {
-				await this.restorePublicationQueued(publicationId);
-				return await this.failPublicationPreSend(
+				await this.#restorePublicationQueued(publicationId);
+				return await this.#failPublicationPreSend(
 					publicationId,
 					"provider delivery aborted during dispatch admission",
 				);
 			}
 			const result = await this.callBotApiClassified(method, body, { ...callOpts, signal, noRetry: true });
-			if (publicationId) this.publicationLastOutcomes.set(publicationId, result.outcome.kind);
+			if (publicationId) this.#publicationLastOutcomes.set(publicationId, result.outcome.kind);
 			return result;
 		}
 	}
 
-	private async failPublicationPreSend(publicationId: string | undefined, reason: string): Promise<never> {
-		await this.markPublicationRejected(publicationId);
+	async #failPublicationPreSend(publicationId: string | undefined, reason: string): Promise<never> {
+		await this.#markPublicationRejected(publicationId);
 		throw new Error(`Telegram publication rejected before send: ${reason}`);
 	}
 
-	private async markPublicationDelivered(publicationId: string | undefined): Promise<void> {
-		if (!publicationId || this.publicationDelivered(publicationId)) return;
-		const ambiguousAt = this.ambiguousPublications.get(publicationId);
-		this.claimedPublications.delete(publicationId);
-		this.ambiguousPublications.delete(publicationId);
-		this.rejectedPublications.delete(publicationId);
-		this.publicationsClaimedThisRun.delete(publicationId);
-		this.publicationLastOutcomes.delete(publicationId);
-		this.deliveredPublications.set(publicationId, this.runtime.now());
-		this.prunePublicationReceipts();
+	async #markPublicationDelivered(publicationId: string | undefined): Promise<void> {
+		if (!publicationId || this.#publicationDelivered(publicationId)) return;
+		const ambiguousAt = this.#ambiguousPublications.get(publicationId);
+		this.#claimedPublications.delete(publicationId);
+		this.#ambiguousPublications.delete(publicationId);
+		this.#rejectedPublications.delete(publicationId);
+		this.#publicationsClaimedThisRun.delete(publicationId);
+		this.#publicationLastOutcomes.delete(publicationId);
+		this.#deliveredPublications.set(publicationId, this.runtime.now());
+		this.#prunePublicationReceipts();
 		try {
-			await this.persistPublicationReceipts();
+			await this.#persistPublicationReceipts();
 		} catch (error) {
-			this.deliveredPublications.delete(publicationId);
-			this.claimedPublications.delete(publicationId);
-			this.rejectedPublications.delete(publicationId);
-			this.ambiguousPublications.set(publicationId, ambiguousAt ?? this.runtime.now());
+			this.#deliveredPublications.delete(publicationId);
+			this.#claimedPublications.delete(publicationId);
+			this.#rejectedPublications.delete(publicationId);
+			this.#ambiguousPublications.set(publicationId, ambiguousAt ?? this.runtime.now());
 			try {
-				await this.persistPublicationReceipts();
+				await this.#persistPublicationReceipts();
 			} catch (compensationError) {
 				logger.warn(
 					`notifications: Telegram ambiguous delivery compensation failed: ${sanitizeDiagnostic(String(compensationError))}`,
@@ -5645,61 +5662,61 @@ export class TelegramNotificationDaemon {
 			logger.warn(
 				`notifications: Telegram presentation state persistence failed: ${sanitizeDiagnostic(String(error))}`,
 			);
-			this.rejectPublicationSettlement(publicationId, error);
+			this.#rejectPublicationSettlement(publicationId, error);
 			throw error;
 		}
-		this.settlePublication(publicationId);
+		this.#settlePublication(publicationId);
 	}
 
-	private async markPublicationRejected(
+	async #markPublicationRejected(
 		publicationId: string | undefined,
 		definitiveProviderRejection = false,
 	): Promise<void> {
-		if (!publicationId || this.rejectedPublications.has(publicationId) || this.publicationDelivered(publicationId))
+		if (!publicationId || this.#rejectedPublications.has(publicationId) || this.#publicationDelivered(publicationId))
 			return;
-		this.publicationsBeingRejected.add(publicationId);
-		const claimedAt = this.claimedPublications.get(publicationId);
-		const ambiguousAt = this.ambiguousPublications.get(publicationId);
-		this.claimedPublications.delete(publicationId);
-		this.ambiguousPublications.delete(publicationId);
-		this.publicationsClaimedThisRun.delete(publicationId);
-		this.publicationLastOutcomes.delete(publicationId);
-		this.rejectedPublications.set(publicationId, this.runtime.now());
+		this.#publicationsBeingRejected.add(publicationId);
+		const claimedAt = this.#claimedPublications.get(publicationId);
+		const ambiguousAt = this.#ambiguousPublications.get(publicationId);
+		this.#claimedPublications.delete(publicationId);
+		this.#ambiguousPublications.delete(publicationId);
+		this.#publicationsClaimedThisRun.delete(publicationId);
+		this.#publicationLastOutcomes.delete(publicationId);
+		this.#rejectedPublications.set(publicationId, this.runtime.now());
 		try {
-			await this.persistPublicationReceipts();
+			await this.#persistPublicationReceipts();
 		} catch (error) {
-			this.rejectedPublications.delete(publicationId);
+			this.#rejectedPublications.delete(publicationId);
 			let compensationError: unknown;
-			if (!this.tentativePublications.has(publicationId)) {
-				if (claimedAt !== undefined) this.claimedPublications.set(publicationId, claimedAt);
+			if (!this.#tentativePublications.has(publicationId)) {
+				if (claimedAt !== undefined) this.#claimedPublications.set(publicationId, claimedAt);
 				else if (ambiguousAt !== undefined) {
 					if (definitiveProviderRejection) {
 						// An explicit provider rejection proves that the attempt was not delivered.
 						// Persist the replayable claim synchronously; otherwise a restart would keep
 						// the old ambiguous receipt and suppress the retry.
-						this.claimedPublications.set(publicationId, ambiguousAt);
+						this.#claimedPublications.set(publicationId, ambiguousAt);
 						try {
-							await this.persistPublicationReceipts();
+							await this.#persistPublicationReceipts();
 						} catch (candidate) {
 							compensationError = candidate;
-							this.claimedPublications.delete(publicationId);
-							this.ambiguousPublications.set(publicationId, ambiguousAt);
+							this.#claimedPublications.delete(publicationId);
+							this.#ambiguousPublications.set(publicationId, ambiguousAt);
 						}
-					} else this.ambiguousPublications.set(publicationId, ambiguousAt);
+					} else this.#ambiguousPublications.set(publicationId, ambiguousAt);
 				}
 			}
 			if (compensationError !== undefined)
 				logger.warn(
 					`notifications: Telegram definitive-rejection rollback remained ambiguous: ${sanitizeDiagnostic(String(compensationError))}`,
 				);
-			this.rejectPublicationSettlement(publicationId, error);
+			this.#rejectPublicationSettlement(publicationId, error);
 			throw error;
 		} finally {
-			this.publicationsBeingRejected.delete(publicationId);
-			if (!this.rejectedPublications.has(publicationId)) this.tentativePublications.delete(publicationId);
+			this.#publicationsBeingRejected.delete(publicationId);
+			if (!this.#rejectedPublications.has(publicationId)) this.#tentativePublications.delete(publicationId);
 		}
-		this.tentativePublications.delete(publicationId);
-		this.settlePublication(publicationId);
+		this.#tentativePublications.delete(publicationId);
+		this.#settlePublication(publicationId);
 	}
 
 	async loadAliases(): Promise<void> {
@@ -5900,7 +5917,7 @@ export class TelegramNotificationDaemon {
 		return next;
 	}
 
-	private scheduleVisibleToolTerminalization(attachmentKey?: string, strict = false): Promise<void> {
+	#scheduleVisibleToolTerminalization(attachmentKey?: string, strict = false): Promise<void> {
 		if (attachmentKey !== undefined) this.revokedToolEndpoints.add(attachmentKey);
 		const claimVisible = (): Array<{ messageId: number; owner: ToolActivityOwner }> => {
 			const claimedByKey = new Map<string, { messageId: number; owner: ToolActivityOwner }>();
@@ -5949,7 +5966,7 @@ export class TelegramNotificationDaemon {
 				failures.push(new Error("Tool activity delivery became ambiguous during daemon shutdown."));
 			}
 			try {
-				await this.scheduleVisibleToolTerminalization(undefined, true);
+				await this.#scheduleVisibleToolTerminalization(undefined, true);
 			} catch (error) {
 				failures.push(error instanceof Error ? error : new Error(String(error)));
 			}
@@ -5960,7 +5977,7 @@ export class TelegramNotificationDaemon {
 		return this.toolShutdownBarrier;
 	}
 
-	private dropSession(session: AttachmentSession, reason: string): void {
+	#dropSession(session: AttachmentSession, reason: string): void {
 		// Capture the exact callback lease before revoking recovery authority. A
 		// predecessor transport can remain keyed by its own session id after a
 		// successor becomes the logical owner, so logical-session revocation
@@ -5977,16 +5994,16 @@ export class TelegramNotificationDaemon {
 		const isCurrentSession = this.sessions.get(session.sessionId) === session;
 		if (isCurrentSession) {
 			this.revokeCallbackAliases(callbackLease);
-			this.droppedSessions.add(session);
+			this.#droppedSessions.add(session);
 		}
 		if (isCurrentSession)
-			for (const publicationId of this.publicationSettlements.keys())
+			for (const publicationId of this.#publicationSettlements.keys())
 				if (publicationId.startsWith(`${session.sessionId}:`))
-					this.markPublicationRejected(publicationId).catch(error =>
-						this.rejectPublicationSettlement(publicationId, error),
+					this.#markPublicationRejected(publicationId).catch(error =>
+						this.#rejectPublicationSettlement(publicationId, error),
 					);
 		if (isCurrentSession) this.cancelLegacyToolStartsForSession(session);
-		if (isCurrentSession) this.scheduleVisibleToolTerminalization(session.attachmentKey).catch(() => undefined);
+		if (isCurrentSession) this.#scheduleVisibleToolTerminalization(session.attachmentKey).catch(() => undefined);
 		const clearIntervalImpl = this.opts.clearIntervalImpl ?? clearInterval;
 		if (session.pingTimer) {
 			clearIntervalImpl(session.pingTimer);
@@ -6004,11 +6021,11 @@ export class TelegramNotificationDaemon {
 		if (isCurrentSession) {
 			this.#clearModelChoiceAliasesForSocket(session);
 			this.sessions.delete(session.sessionId);
-			for (const [topicSessionId, owner] of this.legacyTopicOwners) {
-				if (owner === session) this.legacyTopicOwners.delete(topicSessionId);
+			for (const [topicSessionId, owner] of this.#legacyTopicOwners) {
+				if (owner === session) this.#legacyTopicOwners.delete(topicSessionId);
 			}
-			for (const [logicalSessionId, owner] of this.logicalSessionOwners) {
-				if (owner === session) this.logicalSessionOwners.delete(logicalSessionId);
+			for (const [logicalSessionId, owner] of this.#logicalSessionOwners) {
+				if (owner === session) this.#logicalSessionOwners.delete(logicalSessionId);
 			}
 		}
 
@@ -6396,7 +6413,7 @@ export class TelegramNotificationDaemon {
 	}
 
 	#leaseAllows(session: AttachmentSession, logicalSessionId = this.#logicalSessionId(session)): boolean {
-		if (this.droppedSessions.has(session)) return false;
+		if (this.#droppedSessions.has(session)) return false;
 		const closedBinding = this.closedEndpointKeys.get(session.sessionId);
 		if (
 			closedBinding &&
@@ -6410,7 +6427,7 @@ export class TelegramNotificationDaemon {
 		if (this.sessions.get(session.sessionId) !== session) return false;
 		const lease = session.recoveryLease;
 		if (lease?.state !== "authorized" || lease.logicalSessionId !== logicalSessionId) return false;
-		if (this.logicalSessionOwners.get(logicalSessionId) !== session) return false;
+		if (this.#logicalSessionOwners.get(logicalSessionId) !== session) return false;
 		const record = this.topics.get(logicalSessionId);
 		return (
 			lease.binding.endpointKey === session.attachmentKey &&
@@ -6428,7 +6445,7 @@ export class TelegramNotificationDaemon {
 
 	#leaseTokenAllows(socketLease: { session: AttachmentSession; token: number; logicalSessionId: string }): boolean {
 		return socketLease.token === 0
-			? !socketLease.session.logicalSessionIdTrusted && !this.droppedSessions.has(socketLease.session)
+			? !socketLease.session.logicalSessionIdTrusted && !this.#droppedSessions.has(socketLease.session)
 			: this.sessions.get(socketLease.session.sessionId) === socketLease.session &&
 					socketLease.session.recoveryLease?.token === socketLease.token &&
 					this.#leaseAllows(socketLease.session, socketLease.logicalSessionId);
@@ -6438,14 +6455,14 @@ export class TelegramNotificationDaemon {
 		if (socketLease.token === 0)
 			return (
 				this.sessions.get(socketLease.session.sessionId) === socketLease.session &&
-				!this.droppedSessions.has(socketLease.session)
+				!this.#droppedSessions.has(socketLease.session)
 			);
 		return (
 			this.sessions.get(socketLease.session.sessionId) === socketLease.session &&
 			socketLease.session.recoveryLease?.token === socketLease.token &&
 			socketLease.session.recoveryLease.state === "authorized" &&
 			socketLease.session.recoveryLease.logicalSessionId === socketLease.logicalSessionId &&
-			this.logicalSessionOwners.get(socketLease.logicalSessionId) === socketLease.session
+			this.#logicalSessionOwners.get(socketLease.logicalSessionId) === socketLease.session
 		);
 	}
 
@@ -6468,7 +6485,7 @@ export class TelegramNotificationDaemon {
 			this.sessions.get(session.sessionId) === session &&
 			lease?.state === "authorized" &&
 			lease.logicalSessionId === logicalSessionId &&
-			this.logicalSessionOwners.get(logicalSessionId) === session &&
+			this.#logicalSessionOwners.get(logicalSessionId) === session &&
 			lease.binding.chatId === String(this.opts.chatId) &&
 			lease.binding.endpointKey === session.attachmentKey &&
 			lease.binding.endpointGeneration === session.hostGeneration
@@ -6549,7 +6566,7 @@ export class TelegramNotificationDaemon {
 		};
 		void this.#persistTopicMutation(
 			() => {
-				const owner = this.logicalSessionOwners.get(sessionId);
+				const owner = this.#logicalSessionOwners.get(sessionId);
 				return owner === undefined
 					? this.topics.releaseLeaseToGrace(
 							sessionId,
@@ -6573,9 +6590,9 @@ export class TelegramNotificationDaemon {
 
 	#authorizeLease(session: AttachmentSession, logicalSessionId: string, binding: TopicEndpointBinding): void {
 		const previousSessionId = this.#logicalSessionId(session);
-		if (previousSessionId !== logicalSessionId && this.logicalSessionOwners.get(previousSessionId) === session)
-			this.logicalSessionOwners.delete(previousSessionId);
-		const previousOwner = this.logicalSessionOwners.get(logicalSessionId);
+		if (previousSessionId !== logicalSessionId && this.#logicalSessionOwners.get(previousSessionId) === session)
+			this.#logicalSessionOwners.delete(previousSessionId);
+		const previousOwner = this.#logicalSessionOwners.get(logicalSessionId);
 		if (previousOwner && previousOwner !== session && previousOwner.recoveryLease) {
 			const predecessorLease = {
 				session: previousOwner,
@@ -6585,7 +6602,7 @@ export class TelegramNotificationDaemon {
 			previousOwner.recoveryLease = { ...previousOwner.recoveryLease, state: "rejected" };
 			this.revokeCallbackAliases(predecessorLease);
 		}
-		this.logicalSessionOwners.set(logicalSessionId, session);
+		this.#logicalSessionOwners.set(logicalSessionId, session);
 		this.preservedInitiatorTopics.delete(logicalSessionId);
 		session.logicalSessionId = logicalSessionId;
 		session.recoveryLease = { state: "authorized", logicalSessionId, binding, token: this.nextSocketLeaseToken++ };
@@ -6871,7 +6888,7 @@ export class TelegramNotificationDaemon {
 		}
 		const { previousSessionId } = claim;
 		if (preserveTransportTopic && previousSessionId !== candidateSessionId) {
-			this.legacyTopicOwners.set(previousSessionId, session);
+			this.#legacyTopicOwners.set(previousSessionId, session);
 			this.preservedInitiatorTopics.add(previousSessionId);
 		}
 		if (candidateSessionId === session.sessionId)
@@ -7025,9 +7042,9 @@ export class TelegramNotificationDaemon {
 			const retained = frames.filter(frame => frame.toolActivity !== state.owner);
 			for (const frame of removed)
 				if (frame.publicationId) {
-					this.deferredPublications.delete(frame.publicationId);
-					this.markPublicationRejected(frame.publicationId).catch(error =>
-						this.rejectPublicationSettlement(frame.publicationId!, error),
+					this.#deferredPublications.delete(frame.publicationId);
+					this.#markPublicationRejected(frame.publicationId).catch(error =>
+						this.#rejectPublicationSettlement(frame.publicationId!, error),
 					);
 				}
 			if (retained.length === 0) this.pendingThreadedFrames.delete(sessionId);
@@ -7161,7 +7178,7 @@ export class TelegramNotificationDaemon {
 	private toolActivityAuthorityIsCurrent(toolActivity: ToolActivityOwner): boolean {
 		if (this.revokedToolEndpoints.has(toolActivity.attachmentKey)) return false;
 		const session =
-			this.logicalSessionOwners.get(toolActivity.sessionId) ?? this.sessions.get(toolActivity.sessionId);
+			this.#logicalSessionOwners.get(toolActivity.sessionId) ?? this.sessions.get(toolActivity.sessionId);
 		if (toolActivity.attachmentKey === undefined) return session === undefined;
 		return session === toolActivity.session && session.attachmentKey === toolActivity.attachmentKey;
 	}
@@ -7222,9 +7239,9 @@ export class TelegramNotificationDaemon {
 					: legacyStart.itemId
 				: undefined;
 		const publicationQueueItemId = publicationId
-			? `publication:${publicationId}:${this.nextPublicationQueueItemId++}`
+			? `publication:${publicationId}:${this.#nextPublicationQueueItemId++}`
 			: undefined;
-		if (publicationId) this.deferredPublications.add(publicationId);
+		if (publicationId) this.#deferredPublications.add(publicationId);
 		const submitted = this.submitPool({
 			sessionId,
 			lane: send.lane,
@@ -7247,8 +7264,8 @@ export class TelegramNotificationDaemon {
 		});
 		if (!submitted) {
 			this.settleRejectedLegacyToolSubmission(toolActivity, legacyStart);
-			await this.markPublicationRejected(publicationId);
-			if (publicationId) this.deferredPublications.delete(publicationId);
+			await this.#markPublicationRejected(publicationId);
+			if (publicationId) this.#deferredPublications.delete(publicationId);
 			return;
 		}
 		await this.flushPool();
@@ -7334,8 +7351,8 @@ export class TelegramNotificationDaemon {
 			) {
 				this.failLegacyToolStart(frame.toolActivity);
 				if (frame.publicationId) {
-					await this.markPublicationRejected(frame.publicationId);
-					this.deferredPublications.delete(frame.publicationId);
+					await this.#markPublicationRejected(frame.publicationId);
+					this.#deferredPublications.delete(frame.publicationId);
 				}
 				continue;
 			}
@@ -7770,8 +7787,8 @@ export class TelegramNotificationDaemon {
 			});
 			for (const frame of this.pendingThreadedFrames.get(sessionId) ?? [])
 				if (frame.publicationId) {
-					await this.markPublicationRejected(frame.publicationId);
-					this.deferredPublications.delete(frame.publicationId);
+					await this.#markPublicationRejected(frame.publicationId);
+					this.#deferredPublications.delete(frame.publicationId);
 				}
 			this.pendingThreadedFrames.delete(sessionId);
 			try {
@@ -8351,9 +8368,9 @@ export class TelegramNotificationDaemon {
 	private rejectRemovedPublication(item: { payload: TelegramQueuePayload }): void {
 		const publicationId = item.payload.publicationId;
 		if (!publicationId) return;
-		this.deferredPublications.delete(publicationId);
-		this.markPublicationRejected(publicationId).catch(error =>
-			this.rejectPublicationSettlement(publicationId, error),
+		this.#deferredPublications.delete(publicationId);
+		this.#markPublicationRejected(publicationId).catch(error =>
+			this.#rejectPublicationSettlement(publicationId, error),
 		);
 	}
 	private submitPool(item: Parameters<RateLimitPool<TelegramQueuePayload>["submit"]>[0]): boolean {
@@ -8378,8 +8395,8 @@ export class TelegramNotificationDaemon {
 			this.failLegacyToolStart(expiredItem.payload.toolActivity);
 			if (expiredItem.payload.publicationId) {
 				try {
-					await this.markPublicationRejected(expiredItem.payload.publicationId);
-					this.deferredPublications.delete(expiredItem.payload.publicationId);
+					await this.#markPublicationRejected(expiredItem.payload.publicationId);
+					this.#deferredPublications.delete(expiredItem.payload.publicationId);
 				} catch (error) {
 					terminalizationError ??= error;
 				}
@@ -8408,8 +8425,8 @@ export class TelegramNotificationDaemon {
 			for (const removed of removedLiveItems)
 				if (removed.payload.publicationId) {
 					try {
-						await this.markPublicationRejected(removed.payload.publicationId);
-						this.deferredPublications.delete(removed.payload.publicationId);
+						await this.#markPublicationRejected(removed.payload.publicationId);
+						this.#deferredPublications.delete(removed.payload.publicationId);
 					} catch (error) {
 						terminalizationError ??= error;
 					}
@@ -8445,7 +8462,7 @@ export class TelegramNotificationDaemon {
 					continue;
 				}
 				try {
-					const { response, outcome } = await this.callPublicationBotApiClassified(
+					const { response, outcome } = await this.#callPublicationBotApiClassified(
 						item.payload.publicationId,
 						"sendMessage",
 						btwDelivery.body,
@@ -8514,7 +8531,7 @@ export class TelegramNotificationDaemon {
 						this.pool.settle(item.itemId!, "rejected");
 						continue;
 					}
-					const { response, outcome } = await this.callPublicationBotApiClassified(
+					const { response, outcome } = await this.#callPublicationBotApiClassified(
 						item.payload.publicationId,
 						"sendMessage",
 						{
@@ -8541,7 +8558,7 @@ export class TelegramNotificationDaemon {
 							const shutdownOutcome = { status: "unknown", reason: "shutdown" } as const;
 							this.finishSelectedAck(selectedAck, shutdownOutcome);
 							await this.settleSelectedPublication(item.payload.publicationId, shutdownOutcome);
-							if (item.payload.publicationId) this.deferredPublications.delete(item.payload.publicationId);
+							if (item.payload.publicationId) this.#deferredPublications.delete(item.payload.publicationId);
 						} else {
 							selectedAck.state = "queued";
 							selectedAck.controller = undefined;
@@ -8562,11 +8579,11 @@ export class TelegramNotificationDaemon {
 					this.pool.settle(item.itemId!, delivered ? "accepted" : definitiveRejected ? "rejected" : "ambiguous");
 					if (item.payload.publicationId) {
 						try {
-							if (delivered) await this.markPublicationDelivered(item.payload.publicationId);
-							else if (definitiveRejected) await this.markPublicationRejected(item.payload.publicationId, true);
-							this.deferredPublications.delete(item.payload.publicationId);
+							if (delivered) await this.#markPublicationDelivered(item.payload.publicationId);
+							else if (definitiveRejected) await this.#markPublicationRejected(item.payload.publicationId, true);
+							this.#deferredPublications.delete(item.payload.publicationId);
 						} catch (error) {
-							this.rejectPublicationSettlement(item.payload.publicationId, error);
+							this.#rejectPublicationSettlement(item.payload.publicationId, error);
 							throw error;
 						}
 					}
@@ -8622,7 +8639,7 @@ export class TelegramNotificationDaemon {
 				continue;
 			}
 			const itemOutcomes: BotApiCallOutcome[] = [];
-			const itemBotApi = this.botApiWithOutcomeCollector(itemOutcomes, item.payload.publicationId);
+			const itemBotApi = this.#botApiWithOutcomeCollector(itemOutcomes, item.payload.publicationId);
 			let disposition: "accepted" | "ambiguous" | "rejected" = "accepted";
 			try {
 				// Draft streaming (opt-in, off by default): stream a live turn frame as a
@@ -8867,7 +8884,7 @@ export class TelegramNotificationDaemon {
 			} catch {
 				// Best-effort: a failed send/edit must never stop the daemon.
 				disposition =
-					item.payload.publicationId && this.claimedPublications.has(item.payload.publicationId)
+					item.payload.publicationId && this.#claimedPublications.has(item.payload.publicationId)
 						? "rejected"
 						: "ambiguous";
 				if (item.payload.toolActivity?.phase === "started") this.toolActivityAmbiguous = true;
@@ -8911,7 +8928,7 @@ export class TelegramNotificationDaemon {
 							retryItemId = `legacy-tool-terminal:${this.nextLegacyToolStartId++}`;
 						}
 						if (item.payload.publicationId && retryItemId === undefined)
-							retryItemId = `publication:${item.payload.publicationId}:${this.nextPublicationQueueItemId++}`;
+							retryItemId = `publication:${item.payload.publicationId}:${this.#nextPublicationQueueItemId++}`;
 						const newerCoalescedItem =
 							toolActivity === undefined &&
 							item.payload.publicationId === undefined &&
@@ -8966,30 +8983,30 @@ export class TelegramNotificationDaemon {
 			try {
 				if (failedPublications.has(publicationId)) {
 					if (disposition === "rejected") {
-						await this.markPublicationRejected(publicationId, true);
-						this.deferredPublications.delete(publicationId);
+						await this.#markPublicationRejected(publicationId, true);
+						this.#deferredPublications.delete(publicationId);
 					} else {
-						this.settlePublication(publicationId);
+						this.#settlePublication(publicationId);
 					}
 					continue;
 				}
 				if (disposition === "accepted") {
-					await this.markPublicationDelivered(publicationId);
-					this.deferredPublications.delete(publicationId);
+					await this.#markPublicationDelivered(publicationId);
+					this.#deferredPublications.delete(publicationId);
 				} else if (disposition === "rejected") {
-					await this.markPublicationRejected(publicationId, true);
-					this.deferredPublications.delete(publicationId);
+					await this.#markPublicationRejected(publicationId, true);
+					this.#deferredPublications.delete(publicationId);
 				} else if (disposition === "removed" || disposition === "expired") {
-					await this.markPublicationRejected(publicationId);
-					this.deferredPublications.delete(publicationId);
+					await this.#markPublicationRejected(publicationId);
+					this.#deferredPublications.delete(publicationId);
 				} else if (disposition === "ambiguous") {
-					this.settlePublication(publicationId);
-				} else if (disposition === undefined && this.claimedPublications.has(publicationId)) {
-					await this.markPublicationRejected(publicationId);
-					this.deferredPublications.delete(publicationId);
+					this.#settlePublication(publicationId);
+				} else if (disposition === undefined && this.#claimedPublications.has(publicationId)) {
+					await this.#markPublicationRejected(publicationId);
+					this.#deferredPublications.delete(publicationId);
 				}
 			} catch (error) {
-				this.rejectPublicationSettlement(publicationId, error);
+				this.#rejectPublicationSettlement(publicationId, error);
 				terminalizationError ??= error;
 			}
 		}
@@ -9064,10 +9081,10 @@ export class TelegramNotificationDaemon {
 		socketLease?: { session: AttachmentSession; token: number; logicalSessionId: string },
 		publicationId?: string,
 	): Promise<void> {
-		if (publicationId) this.deferredPublications.add(publicationId);
+		if (publicationId) this.#deferredPublications.add(publicationId);
 		const rejectPublication = async (): Promise<void> => {
-			await this.markPublicationRejected(publicationId);
-			if (publicationId) this.deferredPublications.delete(publicationId);
+			await this.#markPublicationRejected(publicationId);
+			if (publicationId) this.#deferredPublications.delete(publicationId);
 		};
 		if ((socketLease && !this.#leaseTokenAllows(socketLease)) || !(await this.pairedChatIsPrivate()))
 			return await rejectPublication();
@@ -9100,7 +9117,7 @@ export class TelegramNotificationDaemon {
 					: legacyToolStart.itemId
 				: undefined;
 		const publicationQueueItemId = publicationId
-			? `publication:${publicationId}:${this.nextPublicationQueueItemId++}`
+			? `publication:${publicationId}:${this.#nextPublicationQueueItemId++}`
 			: undefined;
 		const submitted = this.submitPool({
 			sessionId,
@@ -9121,8 +9138,8 @@ export class TelegramNotificationDaemon {
 		});
 		if (!submitted) {
 			this.settleRejectedLegacyToolSubmission(toolActivity, legacyToolStart);
-			await this.markPublicationRejected(publicationId);
-			if (publicationId) this.deferredPublications.delete(publicationId);
+			await this.#markPublicationRejected(publicationId);
+			if (publicationId) this.#deferredPublications.delete(publicationId);
 			return;
 		}
 		await this.flushPool();
@@ -9281,7 +9298,7 @@ export class TelegramNotificationDaemon {
 		sessionId: string,
 		capturedLease?: { session: AttachmentSession; token: number; logicalSessionId: string },
 	): Promise<void> {
-		const session = this.logicalSessionOwners.get(sessionId) ?? this.sessions.get(sessionId);
+		const session = this.#logicalSessionOwners.get(sessionId) ?? this.sessions.get(sessionId);
 		const socketLease = capturedLease ?? (session ? this.#socketLease(session, sessionId) : undefined);
 		if (!socketLease) return;
 		const topicLease = await this.topicAuthorityLease(sessionId);
@@ -9372,7 +9389,7 @@ export class TelegramNotificationDaemon {
 		const topicLease = await this.topicAuthorityLease(logicalSessionId);
 		if (!topicId || !topicLease || topicLease.topicId !== topicId)
 			throw new Error("Telegram model selection publication has no current topic authority.");
-		if (!session.logicalSessionIdTrusted) this.legacyTopicOwners.set(logicalSessionId, session);
+		if (!session.logicalSessionIdTrusted) this.#legacyTopicOwners.set(logicalSessionId, session);
 
 		// Each logical session owns only its most recently rendered menu.
 		this.#clearModelChoiceAliases(logicalSessionId);
@@ -9386,7 +9403,7 @@ export class TelegramNotificationDaemon {
 		if (!this.#leaseTokenAllows(socketLease) || !this.topicLeaseIsCurrent(topicLease))
 			throw new Error("Telegram model selection publication authority became stale.");
 		try {
-			const response = await this.botApiForPublication(publicationId).call(
+			const response = await this.#botApiForPublication(publicationId).call(
 				"sendMessage",
 				{
 					chat_id: this.opts.chatId,
@@ -9410,9 +9427,9 @@ export class TelegramNotificationDaemon {
 				!Number.isSafeInteger(messageId) ||
 				messageId <= 0
 			) {
-				if (publicationId && this.publicationLastOutcomes.get(publicationId) === "rejected") {
-					await this.markPublicationRejected(publicationId, true);
-					this.deferredPublications.delete(publicationId);
+				if (publicationId && this.#publicationLastOutcomes.get(publicationId) === "rejected") {
+					await this.#markPublicationRejected(publicationId, true);
+					this.#deferredPublications.delete(publicationId);
 				}
 				for (const alias of aliases) this.#modelChoiceAliases.delete(alias);
 				throw new Error("Telegram model selection publication was rejected.");
@@ -9421,12 +9438,12 @@ export class TelegramNotificationDaemon {
 			for (const alias of aliases) this.#modelChoiceAliases.delete(alias);
 			throw new Error("Telegram model selection publication outcome is ambiguous.", { cause: error });
 		}
-		if (publicationId) await this.markPublicationDelivered(publicationId);
+		if (publicationId) await this.#markPublicationDelivered(publicationId);
 		return true;
 	}
 
 	async handleSessionMessage(session: AttachmentSession, msg: any, publicationId?: string): Promise<void> {
-		if ((await this.publicationSuppressed(publicationId)) && msg?.type !== "event_replay_result") return;
+		if ((await this.#publicationSuppressed(publicationId)) && msg?.type !== "event_replay_result") return;
 		if (msg?.type === "hello") {
 			const capabilities = Array.isArray(msg.capabilities) ? msg.capabilities : [];
 			const previousToolActivityCapability = session.toolActivityCapability;
@@ -9487,7 +9504,7 @@ export class TelegramNotificationDaemon {
 				// A replay result is the admission proof. Never clear its barrier or drain
 				// queued frames after malformed/conflicting proof; the socket cannot fall
 				// back to transport-local config rekeying.
-				this.dropSession(session, "invalid_replay");
+				this.#dropSession(session, "invalid_replay");
 				return;
 			}
 			session.hostGeneration = msg.generation;
@@ -9516,7 +9533,7 @@ export class TelegramNotificationDaemon {
 			const replayCandidateSessionId =
 				replayIdentitySessionId ?? (canResumeTransport || canBootstrapTransport ? session.sessionId : undefined);
 			if (!replayCandidateSessionId) {
-				this.dropSession(session, "recovery_rejected");
+				this.#dropSession(session, "recovery_rejected");
 				return;
 			}
 			const recovered = await this.#recoverTopicBinding(
@@ -9529,14 +9546,14 @@ export class TelegramNotificationDaemon {
 			if (this.sessions.get(session.sessionId) !== session) return;
 			if (!recovered) {
 				if (session.hostGeneration === msg.generation && session.recoveryLease?.state !== "pending")
-					this.dropSession(session, "recovery_rejected");
+					this.#dropSession(session, "recovery_rejected");
 				return;
 			}
 			if (
 				!this.#ownsLiveOpenEndpoint(session, endpointBinding) ||
 				!this.#leaseAllows(session, this.#logicalSessionId(session))
 			) {
-				this.dropSession(session, "recovery_rejected");
+				this.#dropSession(session, "recovery_rejected");
 				return;
 			}
 			session.replayPending = false;
@@ -9553,28 +9570,28 @@ export class TelegramNotificationDaemon {
 			const replayCounts = new Map<string, number>();
 			for (const frame of replayState) {
 				const replayPublicationId = replayPublicationIds.get(frame);
-				if (await this.publicationSuppressed(replayPublicationId)) continue;
+				if (await this.#publicationSuppressed(replayPublicationId)) continue;
 				const fingerprint = JSON.stringify(frame);
 				replayCounts.set(fingerprint, (replayCounts.get(fingerprint) ?? 0) + 1);
 				try {
-					await this.claimPublication(replayPublicationIds.get(frame));
+					await this.#claimPublication(replayPublicationIds.get(frame));
 					await this.handleSessionMessage(session, frame, replayPublicationIds.get(frame));
 				} catch (error) {
 					logger.warn(
 						`notifications: Telegram replay admission failed: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`,
 					);
-					this.dropSession(session, "replay_admission_failed");
+					this.#dropSession(session, "replay_admission_failed");
 					return;
 				}
 				if (
-					!this.deferredPublications.has(replayPublicationId ?? "") &&
-					!(await this.publicationSuppressed(replayPublicationId))
+					!this.#deferredPublications.has(replayPublicationId ?? "") &&
+					!(await this.#publicationSuppressed(replayPublicationId))
 				)
-					await this.markPublicationRejected(replayPublicationId);
+					await this.#markPublicationRejected(replayPublicationId);
 			}
 			const queued = session.replayQueue.splice(0);
 			for (const queuedItem of queued) {
-				if (await this.publicationSuppressed(queuedItem.publicationId)) continue;
+				if (await this.#publicationSuppressed(queuedItem.publicationId)) continue;
 				const frame = queuedItem.frame;
 				if (
 					frame.type === "tool_activity" &&
@@ -9590,10 +9607,10 @@ export class TelegramNotificationDaemon {
 				}
 				await this.handleSessionMessage(session, frame, queuedItem.publicationId);
 				if (
-					!this.deferredPublications.has(queuedItem.publicationId ?? "") &&
-					!(await this.publicationSuppressed(queuedItem.publicationId))
+					!this.#deferredPublications.has(queuedItem.publicationId ?? "") &&
+					!(await this.#publicationSuppressed(queuedItem.publicationId))
 				)
-					await this.markPublicationRejected(queuedItem.publicationId);
+					await this.#markPublicationRejected(queuedItem.publicationId);
 			}
 			await this.#onRouterAttachmentReady(session);
 			this.#terminalizeBtwTurnsForGenerationChange(session);
@@ -9609,20 +9626,20 @@ export class TelegramNotificationDaemon {
 		if (msg?.type === "event_replay_result") return;
 		if (msg && typeof msg === "object") await this.#updateLogicalSessionForThreadedFrame(session, msg);
 		if (session.logicalSessionIdTrusted && !this.#leaseAllows(session))
-			await this.failPublicationPreSend(publicationId, "trusted attachment lease is stale");
+			await this.#failPublicationPreSend(publicationId, "trusted attachment lease is stale");
 		session.activePublicationId = publicationId;
 		try {
-			if (await this.frameRouter.dispatch(session, msg as Record<string, unknown>)) return;
+			if (await this.#frameRouter.dispatch(session, msg as Record<string, unknown>)) return;
 		} finally {
 			session.activePublicationId = undefined;
 		}
 		if (await this.#renderModelChoices(session, msg as Record<string, unknown>, publicationId)) return;
 
 		if (msg?.type === "ephemeral_turn_result") {
-			if (publicationId) this.deferredPublications.add(publicationId);
+			if (publicationId) this.#deferredPublications.add(publicationId);
 			const rejectPublication = async (): Promise<void> => {
-				await this.markPublicationRejected(publicationId);
-				if (publicationId) this.deferredPublications.delete(publicationId);
+				await this.#markPublicationRejected(publicationId);
+				if (publicationId) this.#deferredPublications.delete(publicationId);
 			};
 			const requestId = typeof msg.requestId === "string" ? msg.requestId : undefined;
 			if (!requestId) return await rejectPublication();
@@ -9666,21 +9683,21 @@ export class TelegramNotificationDaemon {
 			)
 				return await rejectPublication();
 			if (msg.status === "ok" && typeof msg.text !== "string") return await rejectPublication();
-			if (this.#stoppingBtw) return await this.failPublicationPreSend(publicationId, "BTW delivery is stopping");
+			if (this.#stoppingBtw) return await this.#failPublicationPreSend(publicationId, "BTW delivery is stopping");
 			const existingDelivery = this.#btwTerminalDeliveries.get(requestId);
 			if (existingDelivery) {
-				if (publicationId) this.deferredPublications.add(publicationId);
+				if (publicationId) this.#deferredPublications.add(publicationId);
 				await existingDelivery.finished;
 				if (publicationId && existingDelivery.outcome === "accepted") {
-					await this.markPublicationDelivered(publicationId);
-					this.deferredPublications.delete(publicationId);
+					await this.#markPublicationDelivered(publicationId);
+					this.#deferredPublications.delete(publicationId);
 				} else if (
 					publicationId &&
 					(existingDelivery.outcome === "uncertain" ||
 						existingDelivery.outcome === "partial_accepted" ||
 						(existingDelivery.outcome === "not_delivered" && existingDelivery.attempted))
 				) {
-					await this.markPublicationAttempted(publicationId);
+					await this.#markPublicationAttempted(publicationId);
 				}
 				return;
 			}
@@ -9724,7 +9741,7 @@ export class TelegramNotificationDaemon {
 									: "This /btw question failed. Send it again to retry.";
 					try {
 						if (!isAuthoritative())
-							return await this.failPublicationPreSend(
+							return await this.#failPublicationPreSend(
 								publicationId,
 								"BTW authority is stale before status dispatch",
 							);
@@ -9734,10 +9751,10 @@ export class TelegramNotificationDaemon {
 							text,
 							signal: terminalDelivery.controller.signal,
 							isAuthoritative,
-							botApi: this.botApiForPublication(publicationId),
+							botApi: this.#botApiForPublication(publicationId),
 						});
 						terminalDelivery.attempted =
-							publicationId !== undefined && this.ambiguousPublications.has(publicationId);
+							publicationId !== undefined && this.#ambiguousPublications.has(publicationId);
 						deliveryOutcome =
 							telegramMessageId(response) !== undefined
 								? "accepted"
@@ -9749,16 +9766,16 @@ export class TelegramNotificationDaemon {
 						logger.warn("notifications: /btw status delivery failed");
 					}
 					if (publicationId && deliveryOutcome === "accepted") {
-						await this.markPublicationDelivered(publicationId);
-						this.deferredPublications.delete(publicationId);
+						await this.#markPublicationDelivered(publicationId);
+						this.#deferredPublications.delete(publicationId);
 					}
 					if (
 						publicationId &&
 						deliveryOutcome !== "accepted" &&
-						this.publicationLastOutcomes.get(publicationId) === "rejected"
+						this.#publicationLastOutcomes.get(publicationId) === "rejected"
 					) {
-						await this.markPublicationRejected(publicationId, true);
-						this.deferredPublications.delete(publicationId);
+						await this.#markPublicationRejected(publicationId, true);
+						this.#deferredPublications.delete(publicationId);
 					}
 					return;
 				}
@@ -9773,14 +9790,14 @@ export class TelegramNotificationDaemon {
 					body: unknown,
 				): Promise<"accepted" | "rejected" | "uncertain" | "stale"> => {
 					if (!isAuthoritative())
-						return await this.failPublicationPreSend(publicationId, "BTW authority is stale before delivery");
+						return await this.#failPublicationPreSend(publicationId, "BTW authority is stale before delivery");
 					try {
-						const response = await this.botApiForPublication(publicationId).call(method, body, {
+						const response = await this.#botApiForPublication(publicationId).call(method, body, {
 							noRetry: true,
 							signal,
 						});
 						terminalDelivery.attempted =
-							publicationId !== undefined && this.ambiguousPublications.has(publicationId);
+							publicationId !== undefined && this.#ambiguousPublications.has(publicationId);
 						if (telegramMessageId(response) !== undefined) return "accepted";
 						if (response && typeof response === "object" && (response as { ok?: unknown }).ok === false)
 							return "rejected";
@@ -9887,19 +9904,19 @@ export class TelegramNotificationDaemon {
 				}
 			}
 			if (publicationId && deliveryOutcome === "accepted") {
-				await this.markPublicationDelivered(publicationId);
-				this.deferredPublications.delete(publicationId);
+				await this.#markPublicationDelivered(publicationId);
+				this.#deferredPublications.delete(publicationId);
 			}
 			if (
 				publicationId &&
 				deliveryOutcome !== "accepted" &&
-				this.publicationLastOutcomes.get(publicationId) === "rejected"
+				this.#publicationLastOutcomes.get(publicationId) === "rejected"
 			) {
-				await this.markPublicationRejected(publicationId, true);
-				this.deferredPublications.delete(publicationId);
+				await this.#markPublicationRejected(publicationId, true);
+				this.#deferredPublications.delete(publicationId);
 			}
-			if (publicationId && this.claimedPublications.has(publicationId))
-				return await this.failPublicationPreSend(
+			if (publicationId && this.#claimedPublications.has(publicationId))
+				return await this.#failPublicationPreSend(
 					publicationId,
 					"BTW publication completed without provider dispatch",
 				);
@@ -10017,12 +10034,12 @@ export class TelegramNotificationDaemon {
 					: transportLogicalSessionId;
 			if (!this.#leaseAllows(session, logicalSessionId)) {
 				this.failLegacyToolStart(toolActivity);
-				await this.failPublicationPreSend(publicationId, "thread route lease is stale");
+				await this.#failPublicationPreSend(publicationId, "thread route lease is stale");
 			}
 			const socketLease = this.#socketLease(session, logicalSessionId);
 			if (!socketLease) {
 				this.failLegacyToolStart(toolActivity);
-				return await this.failPublicationPreSend(publicationId, "thread socket lease is unavailable");
+				return await this.#failPublicationPreSend(publicationId, "thread socket lease is unavailable");
 			}
 			const existingTopic = await this.existingTopicForPrivateChat(logicalSessionId);
 			if (!toolFrameIsCurrent()) {
@@ -10032,7 +10049,7 @@ export class TelegramNotificationDaemon {
 			const topicRecord = this.topics.get(logicalSessionId);
 			if (topicRecord && (topicRecord.authorityState !== "active" || topicRecord.bindingMalformed)) {
 				this.failLegacyToolStart(toolActivity);
-				await this.failPublicationPreSend(publicationId, "topic authority is inactive or malformed");
+				await this.#failPublicationPreSend(publicationId, "topic authority is inactive or malformed");
 			}
 			if (!send.identity && !existingTopic && !this.flatIdentitySent.has(logicalSessionId)) {
 				await this.deliverFlatFallback(logicalSessionId, send, toolActivity, socketLease, publicationId);
@@ -10046,7 +10063,7 @@ export class TelegramNotificationDaemon {
 				const topicRecord = this.topics.get(logicalSessionId);
 				if (topicRecord && (topicRecord.authorityState !== "active" || topicRecord.bindingMalformed)) {
 					this.failLegacyToolStart(toolActivity);
-					await this.failPublicationPreSend(publicationId, "topic creation lost authority");
+					await this.#failPublicationPreSend(publicationId, "topic creation lost authority");
 				}
 				if (!toolFrameIsCurrent()) {
 					abandonStaleToolStart();
@@ -10065,7 +10082,7 @@ export class TelegramNotificationDaemon {
 				const name = this.topicNameFor(logicalSessionId, msg);
 				if (this.topics.needsRename(logicalSessionId, name)) {
 					if (!this.#leaseTokenAllows(socketLease) || !this.topicLeaseIsCurrent(topicLease))
-						await this.failPublicationPreSend(publicationId, "identity rename authority is stale");
+						await this.#failPublicationPreSend(publicationId, "identity rename authority is stale");
 					try {
 						this.daemonRenameAttempts.set(
 							logicalSessionId,
@@ -10111,7 +10128,7 @@ export class TelegramNotificationDaemon {
 		if (msg.type === "action_needed" && msg.id) {
 			const logicalSessionId = this.#logicalSessionId(session);
 			const socketLease = this.#socketLease(session, logicalSessionId);
-			if (!socketLease) return await this.failPublicationPreSend(publicationId, "action route has no socket lease");
+			if (!socketLease) return await this.#failPublicationPreSend(publicationId, "action route has no socket lease");
 			const pendingAction = msg.kind === "ask" ? { sessionId: logicalSessionId, actionId: msg.id } : undefined;
 			if (pendingAction) {
 				session.pending.set(msg.id, pendingAction);
@@ -10119,15 +10136,15 @@ export class TelegramNotificationDaemon {
 			}
 			const topicRecord = this.topics.get(logicalSessionId);
 			if (topicRecord && (topicRecord.authorityState !== "active" || topicRecord.bindingMalformed))
-				await this.failPublicationPreSend(publicationId, "action topic authority is inactive or malformed");
+				await this.#failPublicationPreSend(publicationId, "action topic authority is inactive or malformed");
 			const topicId = await this.ensureTopic(logicalSessionId, this.topicNameFor(logicalSessionId, msg), session);
 			const topicLease = topicId ? this.topicAuthorityLeaseFromRegistry(logicalSessionId) : undefined;
 			if (topicId && (!topicLease || topicLease.topicId !== topicId))
-				await this.failPublicationPreSend(publicationId, "action topic lease does not match");
+				await this.#failPublicationPreSend(publicationId, "action topic lease does not match");
 			if (!topicId) {
 				// Fail closed for non-private chats; only nudge + flat-deliver in a private DM.
 				if (!(await this.pairedChatIsPrivate()))
-					await this.failPublicationPreSend(publicationId, "action fallback requires a private chat");
+					await this.#failPublicationPreSend(publicationId, "action fallback requires a private chat");
 				await this.notifyThreadedFallback(socketLease);
 			}
 			const threadField = topicLease ? { message_thread_id: Number(topicLease.topicId) } : {};
@@ -10226,8 +10243,8 @@ export class TelegramNotificationDaemon {
 				for (let i = 0; i < chunks.length; i++) {
 					const exposesCallbacks = i === chunks.length - 1 && inline_keyboard.length > 0;
 					if (!callbackDispatchAuthorityIsCurrent()) {
-						if (publicationId && this.claimedPublications.has(publicationId))
-							return await this.failPublicationPreSend(
+						if (publicationId && this.#claimedPublications.has(publicationId))
+							return await this.#failPublicationPreSend(
 								publicationId,
 								"action authority is stale before HTML dispatch",
 							);
@@ -10235,7 +10252,7 @@ export class TelegramNotificationDaemon {
 					}
 					let result: { ok?: unknown; result?: { message_id?: unknown } } | undefined;
 					try {
-						result = (await this.botApiForPublication(publicationId).call(
+						result = (await this.#botApiForPublication(publicationId).call(
 							"sendMessage",
 							{
 								chat_id: this.opts.chatId,
@@ -10273,7 +10290,7 @@ export class TelegramNotificationDaemon {
 				// reply_markup (probe-confirmed). Any miss falls back to the HTML loop.
 				if (callbackDispatchAuthorityIsCurrent()) {
 					const outcome = await deliverRichActionWithFallback(
-						this.botApiForPublication(publicationId),
+						this.#botApiForPublication(publicationId),
 						{
 							chat_id: this.opts.chatId,
 							...threadField,
@@ -10432,19 +10449,19 @@ export class TelegramNotificationDaemon {
 			if (
 				publicationId &&
 				messageId === undefined &&
-				this.publicationLastOutcomes.get(publicationId) === "rejected"
+				this.#publicationLastOutcomes.get(publicationId) === "rejected"
 			) {
-				await this.markPublicationRejected(publicationId, true);
-				this.deferredPublications.delete(publicationId);
+				await this.#markPublicationRejected(publicationId, true);
+				this.#deferredPublications.delete(publicationId);
 			}
-			if (publicationId && messageId === undefined && this.claimedPublications.has(publicationId))
-				return await this.failPublicationPreSend(
+			if (publicationId && messageId === undefined && this.#claimedPublications.has(publicationId))
+				return await this.#failPublicationPreSend(
 					publicationId,
 					"action publication completed without provider dispatch",
 				);
 			if (publicationId) {
-				if (messageId !== undefined) await this.markPublicationDelivered(publicationId);
-				else this.deferredPublications.add(publicationId);
+				if (messageId !== undefined) await this.#markPublicationDelivered(publicationId);
+				else this.#deferredPublications.add(publicationId);
 			}
 		} else if (msg.type === "action_resolved" && msg.id) {
 			session.pending.delete(msg.id);
@@ -10649,7 +10666,7 @@ export class TelegramNotificationDaemon {
 
 	/** Render the top-level folder source choices for a user-created topic. */
 	async #renderAdoptionPicker(threadId: number, updateId: number): Promise<boolean> {
-		const providerRequestKey = this.providerRequestKey(updateId, `topic:${threadId}`);
+		const providerRequestKey = this.#providerRequestKey(updateId, `topic:${threadId}`);
 		const chatId = String(this.opts.chatId);
 		const choices: Array<{ label: string; action: TopicPickerAction }> = [
 			{ label: "1. Home (~)", action: { kind: "select", target: { kind: "existing_path", path: os.homedir() } } },
@@ -10694,7 +10711,7 @@ export class TelegramNotificationDaemon {
 	async #renderRecentFolderChoices(threadId: number, providerRequestKey: string): Promise<boolean> {
 		let recent: ListRecentSessionsResult;
 		try {
-			recent = await this.lifecycleService.listRecent({
+			recent = await this.#lifecycleService.listRecent({
 				cwd: process.cwd(),
 				limit: 8,
 				includeInternal: false,
@@ -11031,7 +11048,7 @@ export class TelegramNotificationDaemon {
 			parsed.target,
 			String(this.opts.chatId),
 			updateId,
-			this.providerRequestKey(updateId, text),
+			this.#providerRequestKey(updateId, text),
 		);
 		return true;
 	}
@@ -11105,12 +11122,10 @@ export class TelegramNotificationDaemon {
 			}
 			let outcome: SessionCreateOutcome;
 			try {
-				outcome = await this.lifecycleService.createExternal({
-					actor: this.lifecycleActor(),
-					capability: "session.create",
-					requestKey: providerRequestKey,
-					target,
-				});
+				outcome = (await this.#runLifecycleCommand(
+					{ kind: "create", target },
+					providerRequestKey,
+				)) as SessionCreateOutcome;
 			} catch {
 				outcome = {
 					ok: false,
@@ -11139,7 +11154,7 @@ export class TelegramNotificationDaemon {
 				.call("sendMessage", {
 					chat_id: this.opts.chatId,
 					message_thread_id: topicId,
-					text: this.formatLifecycleResponse(outcome, "session_create", providerRequestKey, {
+					text: this.#formatLifecycleResponse(outcome, "session_create", providerRequestKey, {
 						kind: "create",
 						target,
 					}),
@@ -11372,8 +11387,8 @@ export class TelegramNotificationDaemon {
 							}
 							for (const frame of frames)
 								if (frame.msg.type === "tool_activity" && frame.publicationId) {
-									await this.markPublicationRejected(frame.publicationId);
-									this.deferredPublications.delete(frame.publicationId);
+									await this.#markPublicationRejected(frame.publicationId);
+									this.#deferredPublications.delete(frame.publicationId);
 								}
 							const retained = frames.filter(frame => frame.msg.type !== "tool_activity");
 							if (retained.length === 0) this.pendingThreadedFrames.delete(sessionId);
@@ -11382,8 +11397,8 @@ export class TelegramNotificationDaemon {
 						for (const session of this.sessions.values()) {
 							for (const item of session.replayQueue)
 								if (item.frame.type === "tool_activity" && item.publicationId) {
-									await this.markPublicationRejected(item.publicationId);
-									this.deferredPublications.delete(item.publicationId);
+									await this.#markPublicationRejected(item.publicationId);
+									this.#deferredPublications.delete(item.publicationId);
 								}
 							session.replayQueue = session.replayQueue.filter(item => item.frame.type !== "tool_activity");
 						}
@@ -11451,10 +11466,10 @@ export class TelegramNotificationDaemon {
 				topicToSession: t => {
 					const topicSessionId = this.topics.sessionForTopic(t);
 					if (!topicSessionId) return undefined;
-					const legacyOwner = this.legacyTopicOwners.get(topicSessionId);
+					const legacyOwner = this.#legacyTopicOwners.get(topicSessionId);
 					if (this.preservedInitiatorTopics.has(topicSessionId)) return undefined;
 					const owner =
-						this.logicalSessionOwners.get(topicSessionId) ??
+						this.#logicalSessionOwners.get(topicSessionId) ??
 						legacyOwner ??
 						[...this.sessions.values()].find(
 							session =>
@@ -11499,7 +11514,7 @@ export class TelegramNotificationDaemon {
 				const reservedBtw = parseBtwCommand(inbound.text, this.botUsername);
 				if (preliminaryControl.kind === "ignored") return;
 				const session =
-					this.logicalSessionOwners.get(inbound.sessionId) ??
+					this.#logicalSessionOwners.get(inbound.sessionId) ??
 					this.sessions.get(inbound.sessionId) ??
 					[...this.sessions.values()].find(
 						candidate =>
@@ -11848,7 +11863,7 @@ export class TelegramNotificationDaemon {
 				typeof callbackAlias === "string" ? this.#callbackAliasPending.get(callbackAlias) : undefined;
 			const callbackTopic =
 				typeof callbackAlias === "string" ? this.#callbackAliasTopics.get(callbackAlias) : undefined;
-			const session = this.logicalSessionOwners.get(decision.sessionId) ?? this.sessions.get(decision.sessionId);
+			const session = this.#logicalSessionOwners.get(decision.sessionId) ?? this.sessions.get(decision.sessionId);
 			const pendingAction = session?.pending.get(decision.actionId);
 			if (
 				(typeof callbackAlias === "string" &&
@@ -12034,9 +12049,9 @@ export class TelegramNotificationDaemon {
 			if (!this.validationMode()) {
 				await this.loadSeenUpdateIds();
 				await this.replyStore.load();
-				await this.loadPresentationState();
+				await this.#loadPresentationState();
 			}
-			await this.attachmentRouter.start();
+			await this.#attachmentRouter.start();
 			let idleSince = this.runtime.now();
 			while (this.running) {
 				if (await this.controlStopRequested()) break;
@@ -12088,7 +12103,7 @@ export class TelegramNotificationDaemon {
 		} finally {
 			this.requestStop("stop");
 			this.running = false;
-			await this.attachmentRouter
+			await this.#attachmentRouter
 				.stop()
 				.catch(error =>
 					logger.warn(`notifications: attachment router stop failed: ${sanitizeDiagnostic(String(error))}`),
@@ -12125,7 +12140,7 @@ export class TelegramNotificationDaemon {
 							await this.opts.control?.clear?.(this.opts.ownerId);
 						}
 						await this.persistTopics();
-						await this.presentationPersistenceQueue;
+						await this.#presentationPersistenceQueue;
 						persisted = true;
 					});
 					const deadline = Promise.withResolvers<boolean>();

@@ -6,6 +6,7 @@ import { createCoordinatorMcpServer } from "../../src/coordinator-mcp/server";
 import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 import type { SessionIndex } from "../../src/sdk/broker/session-index";
 import type { SessionRouterClient } from "../../src/sdk/router";
+import { prepareExactSessionAuthority } from "../helpers/sdk-exact-session-authority";
 
 async function withTempRoot(run: (root: string) => Promise<void>): Promise<void> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coord-race-"));
@@ -43,12 +44,13 @@ describe("send_prompt same-session concurrency", () => {
 				startedAt: Date.now(),
 				heartbeatAt: Date.now(),
 			});
-			await fs.mkdir(path.join(root, ".gjc", "state", "sdk"), { recursive: true });
-			await Bun.write(
-				path.join(root, ".gjc", "state", "sdk", `${sessionId}.json`),
-				JSON.stringify({ version: 1, url: sessionUrl, token: "session-token" }),
-			);
-			await fs.utimes(path.join(root, ".gjc", "state", "sdk", `${sessionId}.json`), 0.001, 0.001);
+			const authority = await prepareExactSessionAuthority({
+				agentDir,
+				cwd: root,
+				sessionId,
+				url: sessionUrl,
+				token: "session-token",
+			});
 
 			const server = await createCoordinatorMcpServer({
 				env: {
@@ -69,8 +71,8 @@ describe("send_prompt same-session concurrency", () => {
 										locator: { repo: root },
 										live: true,
 										endpointGeneration: 1,
-										pid: 100,
-										endpointMtimeMs: 1,
+										pid: authority.pid,
+										endpointMtimeMs: authority.endpointMtimeMs,
 									});
 									return { ok: true, result: { sessionId } };
 								}

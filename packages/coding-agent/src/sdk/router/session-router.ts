@@ -401,6 +401,7 @@ export class SessionRouter {
 		frame: Record<string, unknown>,
 		expectedGeneration?: number,
 		expectedAttachment?: SessionAttachment,
+		options?: { timeoutMs?: number },
 	): Promise<Record<string, unknown>> {
 		await this.#serialReconcile(this.#runEpoch);
 		const attached = this.#sessions.get(sessionId);
@@ -409,7 +410,7 @@ export class SessionRouter {
 			throw new SessionRouterError("pre_send", "SDK session endpoint changed before command dispatch.");
 		if (expectedAttachment !== undefined && attached.capability !== expectedAttachment)
 			throw new SessionRouterError("pre_send", "SDK session attachment changed before command dispatch.");
-		const response = await attached.client.request(this.#prepareFrame(attached, frame));
+		const response = await attached.client.request(this.#prepareFrame(attached, frame), options);
 		if (
 			!this.#attachmentPublished(attached) ||
 			(expectedGeneration !== undefined && attached.generation !== expectedGeneration) ||

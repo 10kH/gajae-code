@@ -48,7 +48,7 @@ type DiscordRequestContext = {
 	controller: AbortController;
 	signal: AbortSignal;
 	timeoutError: Error;
-	timeout: ReturnType<typeof setTimeout>;
+	timeout: NodeJS.Timeout;
 };
 
 function discordRequestTimeoutError(): Error {

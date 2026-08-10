@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { isValidReadinessTimeoutMs, READINESS_TIMEOUT_INVALID_MESSAGE } from "../broker/startup-budget";
 import { AgentDirSessionLifecycleClient } from "./broker-client";
 import { type ListRecentSessionsResult, listRecentSessions, type RecentSessionEntry } from "./recent-sessions";
 import {
@@ -40,6 +41,18 @@ function invalidExternalCreate(message: string): SessionCreateOutcome {
 		operation: "session.create",
 		certainty: "terminal",
 		error: { code: "invalid_request", message },
+	};
+}
+const RETRYABLE_PLAIN_DIR_ERRORS = new Set(["EAGAIN", "EINTR", "EMFILE", "ENFILE", "ENOSPC", "EDQUOT"]);
+
+function plainDirCreateFailure(error: unknown): SessionCreateOutcome {
+	const code = isRecord(error) && typeof error.code === "string" ? error.code : "filesystem_error";
+	const message = error instanceof Error ? error.message : "Unable to prepare the requested directory.";
+	return {
+		ok: false,
+		operation: "session.create",
+		certainty: RETRYABLE_PLAIN_DIR_ERRORS.has(code) ? "retryable" : "terminal",
+		error: { code, message },
 	};
 }
 
@@ -94,16 +107,14 @@ export class AgentDirSessionLifecycleService extends SessionLifecycleService {
 		if (modelPreset !== undefined && typeof modelPreset !== "string")
 			return invalidExternalCreate("modelPreset must be a string");
 		const readinessTimeoutMs = rawRequest.readinessTimeoutMs;
-		if (
-			readinessTimeoutMs !== undefined &&
-			(typeof readinessTimeoutMs !== "number" || !Number.isFinite(readinessTimeoutMs))
-		)
-			return invalidExternalCreate("readinessTimeoutMs must be a finite number");
+		if (readinessTimeoutMs !== undefined && !isValidReadinessTimeoutMs(readinessTimeoutMs))
+			return invalidExternalCreate(READINESS_TIMEOUT_INVALID_MESSAGE);
 
-		const cwd = targetInput.kind === "worktree" ? targetInput.repo : targetInput.path;
+		const requestedCwd = targetInput.kind === "worktree" ? targetInput.repo : targetInput.path;
+		const cwd = path.resolve(requestedCwd);
 		const target = {
 			cwd,
-			stateRoot: path.join(path.resolve(cwd), ".gjc", "state"),
+			stateRoot: path.join(cwd, ".gjc", "state"),
 			...(targetInput.kind === "worktree" ? { worktree: { enabled: true as const, name: targetInput.branch } } : {}),
 			...(modelPreset === undefined ? {} : { modelPreset }),
 			...(readinessTimeoutMs === undefined ? {} : { readinessTimeoutMs }),
@@ -116,7 +127,13 @@ export class AgentDirSessionLifecycleService extends SessionLifecycleService {
 			target,
 		});
 		if (!validation.ok) return validation as SessionCreateOutcome;
-		if (targetInput.kind === "plain_dir") await fs.mkdir(targetInput.path, { recursive: true });
+		if (targetInput.kind === "plain_dir") {
+			try {
+				await fs.mkdir(cwd, { recursive: true });
+			} catch (error) {
+				return plainDirCreateFailure(error);
+			}
+		}
 		return await this.create({
 			actor: validation.actor,
 			capability: "session.create",
@@ -147,17 +164,24 @@ export class AgentDirSessionLifecycleService extends SessionLifecycleService {
 		const targetInput = rawRequest.target;
 		if (!validExternalSessionResumeTarget(targetInput))
 			return invalidExternalResume("resume target requires a safe session id or prefix");
+		const readinessTimeoutMs = rawRequest.readinessTimeoutMs;
+		if (readinessTimeoutMs !== undefined && !isValidReadinessTimeoutMs(readinessTimeoutMs))
+			return invalidExternalResume(READINESS_TIMEOUT_INVALID_MESSAGE);
+		const requestedCwd = targetInput.path === undefined ? undefined : path.resolve(targetInput.path);
 		const validation = validateSessionLifecycleMutationRequest({
 			operation: "session.resume",
 			actor: rawRequest.actor,
 			capability: rawRequest.capability,
 			requestKey: rawRequest.requestKey,
-			target: { sessionId: targetInput.sessionIdOrPrefix, ...(targetInput.path ? { cwd: targetInput.path } : {}) },
+			target: {
+				sessionId: targetInput.sessionIdOrPrefix,
+				...(requestedCwd === undefined ? {} : { cwd: requestedCwd }),
+			},
 		});
 		if (!validation.ok) return invalidExternalResume(validation.error.message);
 		const recent = await this.listRecent({
-			cwd: targetInput.path ?? this.#agentDir,
-			allWorkspaces: targetInput.path === undefined,
+			cwd: requestedCwd ?? this.#agentDir,
+			allWorkspaces: requestedCwd === undefined,
 			limit: 1_000,
 			includeInternal: false,
 		});
@@ -180,19 +204,20 @@ export class AgentDirSessionLifecycleService extends SessionLifecycleService {
 			};
 		const selected = resolved[0]!;
 		if (!selected.path) return { kind: "unavailable", message: "Saved session workspace is unavailable." };
+		const selectedCwd = path.resolve(selected.path);
 		const outcome = await this.resume({
 			actor: validation.actor,
 			capability: "session.resume",
 			requestKey: validation.requestKey,
 			target: {
 				sessionId: selected.sessionId,
-				cwd: selected.path,
-				stateRoot: path.join(path.resolve(selected.path), ".gjc", "state"),
+				cwd: selectedCwd,
+				stateRoot: path.join(selectedCwd, ".gjc", "state"),
 				sessionPath: selected.sessionStateFile,
 				...(request.modelPreset === undefined ? {} : { modelPreset: request.modelPreset }),
-				...(request.readinessTimeoutMs === undefined ? {} : { readinessTimeoutMs: request.readinessTimeoutMs }),
+				...(readinessTimeoutMs === undefined ? {} : { readinessTimeoutMs }),
 			},
-			...(request.readinessTimeoutMs === undefined ? {} : { timeoutMs: request.readinessTimeoutMs + 1_000 }),
+			...(readinessTimeoutMs === undefined ? {} : { timeoutMs: readinessTimeoutMs + 1_000 }),
 		});
 		return { kind: "result", outcome };
 	}

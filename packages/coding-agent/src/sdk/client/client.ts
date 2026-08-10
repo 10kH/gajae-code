@@ -53,7 +53,7 @@ type Cycle = {
 	phase: "opening" | "backoff" | "complete" | "aborted";
 	candidate: Incarnation | null;
 	promise?: Promise<Incarnation>;
-	backoffTimer?: ReturnType<typeof setTimeout>;
+	backoffTimer?: NodeJS.Timeout;
 	rejectBackoff?: (error: Error) => void;
 };
 type Incarnation = {
@@ -62,9 +62,9 @@ type Incarnation = {
 	readonly socket: WebSocket;
 	phase: "opening" | "hello" | "active" | "retired";
 	tornDown: boolean;
-	openTimer?: ReturnType<typeof setTimeout>;
+	openTimer?: NodeJS.Timeout;
 	failure?: Error;
-	helloTimer?: ReturnType<typeof setTimeout>;
+	helloTimer?: NodeJS.Timeout;
 	/** Hello frames that arrived before the open handler advanced phase to "hello". */
 	earlyHello?: Frame;
 	resolveOpen?: () => void;
@@ -77,7 +77,7 @@ type Pending = {
 	readonly incarnation: Incarnation;
 	resolve: (value: unknown) => void;
 	reject: (error: Error) => void;
-	timer: ReturnType<typeof setTimeout>;
+	timer: NodeJS.Timeout;
 	sent: boolean;
 };
 
@@ -277,49 +277,49 @@ export class SdkClient {
 		const timeoutMs = this.#remainingTimeout(options.timeoutMs ?? this.#timeoutMs);
 		if (timeoutMs <= 0) throw this.#deadlineError();
 		const id = randomUUID();
-		return await new Promise<unknown>((resolve, reject) => {
-			const pending: Pending = {
-				incarnation,
-				resolve,
-				reject,
-				sent: false,
-				timer: setTimeout(
-					() =>
-						this.#settlePending(
-							id,
-							pending,
-							new SdkClientError("timeout", `SDK request timed out after ${timeoutMs}ms`, {
-								requestId: id,
-								requestSent: pending.sent,
-							} satisfies SdkRequestTimeoutDetails),
-						),
-					timeoutMs,
-				),
-			};
-			this.#pending.set(id, pending);
-			if (!this.#isActive(incarnation) || incarnation.socket.readyState !== WebSocket.OPEN) {
-				this.#settlePending(id, pending, new SdkClientError("unavailable", "SDK WebSocket is not connected"));
-				return;
-			}
-			try {
-				incarnation.socket.send(
-					JSON.stringify({
-						...frame,
+		const deferred = Promise.withResolvers<unknown>();
+		const pending: Pending = {
+			incarnation,
+			resolve: deferred.resolve,
+			reject: deferred.reject,
+			sent: false,
+			timer: setTimeout(
+				() =>
+					this.#settlePending(
 						id,
-						...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-					}),
-				);
-				pending.sent = true;
-			} catch (error) {
-				this.#settlePending(
+						pending,
+						new SdkClientError("timeout", `SDK request timed out after ${timeoutMs}ms`, {
+							requestId: id,
+							requestSent: pending.sent,
+						} satisfies SdkRequestTimeoutDetails),
+					),
+				timeoutMs,
+			),
+		};
+		this.#pending.set(id, pending);
+		if (!this.#isActive(incarnation) || incarnation.socket.readyState !== WebSocket.OPEN) {
+			this.#settlePending(id, pending, new SdkClientError("unavailable", "SDK WebSocket is not connected"));
+			return await deferred.promise;
+		}
+		try {
+			incarnation.socket.send(
+				JSON.stringify({
+					...frame,
 					id,
-					pending,
-					error instanceof SdkClientError
-						? error
-						: new SdkClientError("unavailable", "SDK WebSocket send failed", error),
-				);
-			}
-		});
+					...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+				}),
+			);
+			pending.sent = true;
+		} catch (error) {
+			this.#settlePending(
+				id,
+				pending,
+				error instanceof SdkClientError
+					? error
+					: new SdkClientError("unavailable", "SDK WebSocket send failed", error),
+			);
+		}
+		return await deferred.promise;
 	}
 
 	#deadlineError(): SdkClientError {
@@ -384,10 +384,10 @@ export class SdkClient {
 					);
 					if (backoffMs <= 0) break;
 					cycle.phase = "backoff";
-					await new Promise<void>((resolve, reject) => {
-						cycle.rejectBackoff = reject;
-						cycle.backoffTimer = setTimeout(resolve, backoffMs);
-					});
+					const deferred = Promise.withResolvers<void>();
+					cycle.rejectBackoff = deferred.reject;
+					cycle.backoffTimer = setTimeout(() => deferred.resolve(), backoffMs);
+					await deferred.promise;
 					cycle.rejectBackoff = undefined;
 					cycle.backoffTimer = undefined;
 					if (!this.#isOpening(cycle)) throw new SdkClientError("connection_closed", "SDK client closed");
@@ -423,7 +423,8 @@ export class SdkClient {
 	#open(cycle: Cycle): Promise<Incarnation> {
 		const timeoutMs = this.#remainingTimeout();
 		if (timeoutMs <= 0) return Promise.reject(this.#deadlineError());
-		return new Promise((resolve, reject) => {
+		const deferred = Promise.withResolvers<Incarnation>();
+		try {
 			const url = new URL(this.#url);
 			url.searchParams.set("token", this.#token);
 			const socket = new WebSocket(url);
@@ -434,8 +435,8 @@ export class SdkClient {
 				phase: "opening",
 				tornDown: false,
 				listeners: [],
-				resolveOpen: () => resolve(incarnation),
-				rejectOpen: reject,
+				resolveOpen: () => deferred.resolve(incarnation),
+				rejectOpen: deferred.reject,
 			};
 			cycle.candidate = incarnation;
 			const add = (type: "open" | "error" | "close" | "message", listener: EventListener, once = false) => {
@@ -466,7 +467,10 @@ export class SdkClient {
 			add("message", ((event: MessageEvent) => this.#onMessage(event.data, incarnation)) as EventListener);
 			incarnation.openTimer = setTimeout(() => this.#onOpenTimeout(incarnation, timeoutMs), timeoutMs);
 			incarnation.openTimer.unref?.();
-		});
+		} catch (error) {
+			deferred.reject(error);
+		}
+		return deferred.promise;
 	}
 
 	#beginHello(incarnation: Incarnation): void {
@@ -492,10 +496,10 @@ export class SdkClient {
 		if (this.#isActive(incarnation)) return Promise.resolve();
 		if (!this.#isCandidate(incarnation.cycle, incarnation) || incarnation.phase !== "hello")
 			return Promise.reject(new SdkClientError("connection_closed", "SDK WebSocket is not connected"));
-		return new Promise((resolve, reject) => {
-			incarnation.resolveHello = resolve;
-			incarnation.rejectHello = reject;
-		});
+		const deferred = Promise.withResolvers<void>();
+		incarnation.resolveHello = deferred.resolve;
+		incarnation.rejectHello = deferred.reject;
+		return deferred.promise;
 	}
 
 	#onOpenTimeout(incarnation: Incarnation, timeoutMs: number): void {
