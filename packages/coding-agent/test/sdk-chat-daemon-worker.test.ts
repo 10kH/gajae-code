@@ -256,7 +256,7 @@ describe("chat daemon worker", () => {
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "endpoint-token" }),
+			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "endpoint-token" }),
 		);
 		const index = await new SessionIndex(agentDir).open();
 		await index.append({
@@ -532,12 +532,12 @@ describe("chat daemon worker", () => {
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "chat-only-token" }),
+			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "chat-only-token" }),
 		);
 		await fs.mkdir(path.dirname(defaultEndpointPath), { recursive: true });
 		await fs.writeFile(
 			defaultEndpointPath,
-			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:2", token: "shared-token" }),
+			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:2", token: "shared-token" }),
 		);
 		const index = await new SessionIndex(agentDir).open();
 		await index.append({
@@ -588,7 +588,7 @@ describe("chat daemon worker", () => {
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "authorized-token" }),
+			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "authorized-token" }),
 		);
 		const authorizedMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
 		const index = await new SessionIndex(agentDir).open();
@@ -602,7 +602,12 @@ describe("chat daemon worker", () => {
 		});
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:2", token: "substituted-token" }),
+			JSON.stringify({
+				sessionId: "session",
+				pid: process.pid,
+				url: "ws://127.0.0.1:2",
+				token: "substituted-token",
+			}),
 		);
 		const later = new Date(authorizedMtimeMs + 2_000);
 		await fs.utimes(endpointPath, later, later);
@@ -649,7 +654,7 @@ describe("chat daemon worker", () => {
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "old-token" }),
+			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "old-token" }),
 		);
 		const index = await new SessionIndex(agentDir).open();
 		await index.append({
@@ -694,7 +699,7 @@ describe("chat daemon worker", () => {
 		const lateOldFrame = oldClient.handler!;
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "new-token" }),
+			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "new-token" }),
 		);
 		await index.append({
 			type: "host_registered",
@@ -721,7 +726,7 @@ describe("chat daemon worker", () => {
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "old-token" }),
+			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "old-token" }),
 		);
 		const index = await new SessionIndex(agentDir).open();
 		await index.append({
@@ -776,7 +781,7 @@ describe("chat daemon worker", () => {
 		oldClient.handler?.({ type: "turn_stream", sessionId: "session", text: "stale queued" });
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "new-token" }),
+			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "new-token" }),
 		);
 		await index.append({
 			type: "host_registered",
@@ -808,7 +813,7 @@ describe("chat daemon worker", () => {
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "endpoint-token" }),
+			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "endpoint-token" }),
 		);
 		const index = await new SessionIndex(agentDir).open();
 		await index.append({
@@ -935,7 +940,7 @@ describe("chat daemon worker", () => {
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "endpoint-token" }),
+			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "endpoint-token" }),
 		);
 		const index = await new SessionIndex(agentDir).open();
 		await index.append({
@@ -1086,7 +1091,7 @@ describe("chat daemon worker", () => {
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "endpoint-token" }),
+			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "endpoint-token" }),
 		);
 		const index = await new SessionIndex(agentDir).open();
 		await index.append({
@@ -1237,7 +1242,7 @@ describe("chat daemon worker", () => {
 			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 			await fs.writeFile(
 				endpointPath,
-				JSON.stringify({ sessionId: "session", url: `ws://127.0.0.1:${server.port}`, token }),
+				JSON.stringify({ sessionId: "session", pid: process.pid, url: `ws://127.0.0.1:${server.port}`, token }),
 			);
 			const index = await new SessionIndex(agentDir).open();
 			await index.append({

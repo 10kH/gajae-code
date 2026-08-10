@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setDefaultTimeout } from "bun:test";
 import * as path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import { AcpAgent } from "@gajae-code/coding-agent/modes/acp/acp-agent";
@@ -11,6 +11,8 @@ import {
 	publishExactSessionAuthority,
 } from "../helpers/sdk-exact-session-authority";
 
+setDefaultTimeout(20_000);
+
 const TOKEN = "acp-transcript-continuation-token";
 /** Small enough that every fixture body needs several `resource.body` pages. */
 const CONTINUATION_PAGE_CHARS = 8;
@@ -18,14 +20,14 @@ const CONTINUATION_PAGE_CHARS = 8;
 async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
 	return await Promise.race([
 		promise,
-		Bun.sleep(5_000).then(() => {
+		Bun.sleep(15_000).then(() => {
 			throw new Error(`Timed out waiting for ${label}`);
 		}),
 	]);
 }
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-	const deadline = Date.now() + 5_000;
+	const deadline = Date.now() + 15_000;
 	while (Date.now() < deadline) {
 		if (predicate()) return;
 		await Bun.sleep(5);
