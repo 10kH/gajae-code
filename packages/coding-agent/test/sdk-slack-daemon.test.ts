@@ -1264,6 +1264,23 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		);
 	});
 
+	it("bounds a start predecessor that never settles", async () => {
+		let stopping = false;
+		let nowCalls = 0;
+		await withDaemon(
+			async (daemon, fake) => {
+				fake.startGate = new Promise<void>(() => {});
+				void daemon.start();
+				await fake.waitForStartCount(1);
+				stopping = true;
+				await daemon.stop();
+				expect(fake.stops).toBe(1);
+				nowCalls = 0;
+			},
+			{ now: () => (stopping ? (nowCalls++ === 0 ? 0 : 5_001) : 0) },
+		);
+	});
+
 	it("fences tracked outbound notification work that races stop", async () => {
 		let stopping = false;
 		let nowCalls = 0;
@@ -1320,6 +1337,40 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			},
 			{ now: () => (stopping ? (nowCalls++ === 0 ? 0 : 5_001) : 0) },
 		);
+	});
+
+	it("does not let a cleanup close overwrite a successor mapping", async () => {
+		const postGate = Promise.withResolvers<void>();
+		await withDaemon(async (daemon, fake, _injected, setEndpointGeneration) => {
+			const root = await daemon.postRoot("session", "root");
+			setEndpointGeneration(undefined);
+			fake.postGate = postGate.promise;
+			const closing = daemon.close("session");
+			await fake.waitForPostStartCount(2);
+			const key = "T1:C1:intent:session";
+			await daemon.store.transact(key, current =>
+				current
+					? {
+							...current,
+							state: "active",
+							rootTs: "successor-root",
+							clientMsgId: "successor-client",
+							endpointGeneration: 2,
+							updatedAt: current.updatedAt + 1,
+							generation: current.generation + 1,
+						}
+					: current,
+			);
+			postGate.resolve();
+			expect(await closing).toBe(false);
+			expect(await daemon.store.read(key)).toMatchObject({
+				state: "active",
+				rootTs: "successor-root",
+				clientMsgId: "successor-client",
+				endpointGeneration: 2,
+			});
+			expect(fake.posts).toContainEqual(expect.objectContaining({ threadTs: root.rootTs, text: "Session closed." }));
+		});
 	});
 
 	it("suppresses a generation-N provider effect after close and generation-N+1 resume", async () => {

@@ -298,7 +298,24 @@ export class SlackNotificationDaemon {
 		if (stopProvider) this.#providerStopRequestedGeneration = lifecycleGeneration;
 		const providerStop = stopProvider ? this.options.provider.stop() : undefined;
 		const shutdownDeadline = this.#now() + 5_000;
-		const operation = this.#enqueueLifecycle(async () => {
+		const predecessor = this.#lifecycleTail;
+		const operation = (async () => {
+			const predecessorRemaining = shutdownDeadline - this.#now();
+			const predecessorSettled =
+				predecessorRemaining > 0 &&
+				(await Promise.race([
+					predecessor.then(
+						() => true,
+						() => true,
+					),
+					Bun.sleep(predecessorRemaining).then(() => false),
+				]));
+			if (!predecessorSettled) {
+				await this.#invalidateActiveWork();
+				logger.warn(
+					"Slack lifecycle predecessor exceeded the shutdown deadline; continuing with Router revocation.",
+				);
+			}
 			// Calling provider.stop() before joining the lifecycle queue lets a provider
 			// cancel an open that resolves only after its socket is stopped. The same
 			// operation deadline covers provider teardown and admitted work draining.
@@ -345,7 +362,11 @@ export class SlackNotificationDaemon {
 					return;
 				}
 			}
-		});
+		})();
+		this.#lifecycleTail = operation.then(
+			() => undefined,
+			() => undefined,
+		);
 		this.#stopOperation = operation;
 		try {
 			await operation;
@@ -840,13 +861,25 @@ export class SlackNotificationDaemon {
 			},
 		);
 		await this.#postDurable(effectId, sessionId, this.#requireEndpointGeneration(found.record), durable.payload);
-		await this.store.transact(found.key, current =>
-			current
-				? nextRecord(current, { state: "closed_marker", pendingActionId: undefined, updatedAt: this.#now() })
-				: current,
-		);
+		let closed = false;
+		await this.store.transact(found.key, current => {
+			if (
+				current?.state !== "active" ||
+				current.sessionId !== found.record.sessionId ||
+				current.rootTs !== found.record.rootTs ||
+				current.endpointGeneration !== found.record.endpointGeneration ||
+				current.clientMsgId !== found.record.clientMsgId
+			)
+				return current;
+			closed = true;
+			return nextRecord(current, {
+				state: "closed_marker",
+				pendingActionId: undefined,
+				updatedAt: this.#now(),
+			});
+		});
 
-		return true;
+		return closed;
 	}
 
 	async resume(

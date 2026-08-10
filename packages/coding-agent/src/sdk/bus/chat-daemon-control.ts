@@ -79,10 +79,12 @@ export type ChatDaemonAction = "stop" | "reload";
  * Slack generation 30 bounds shutdown, tracks outbound work, and fences late effect commits.
  * Slack generation 31 fences late post admission and tracks close-marker shutdown work.
  * Slack generation 32 bounds provider teardown and preserves close markers after Router revocation.
+ * Slack generation 33 bounds lifecycle predecessors under the shutdown deadline.
+ * Slack generation 34 CAS-fences cleanup mapping commits against successors.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
 	discord: 31,
-	slack: 32,
+	slack: 34,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
