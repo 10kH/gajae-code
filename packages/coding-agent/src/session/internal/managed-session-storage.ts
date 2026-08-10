@@ -102,7 +102,7 @@ export class ManagedCommittedMutationError extends Error {
 
 function managedAppendFailure(code: string | undefined): Error {
 	const error = new Error(code ?? "managed_append_failed");
-	return code === "identity_mismatch" || code === "not_found" || code === "content_too_large"
+	return code === "content_too_large" || code === "too_large"
 		? error
 		: new ManagedCommittedMutationError("append", error);
 }
