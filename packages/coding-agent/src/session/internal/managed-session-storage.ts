@@ -43,7 +43,7 @@ export const MANAGED_ARTIFACT_MAX_FILES = 50_000;
 export const MANAGED_ARTIFACT_MAX_FILE_BYTES = 64 * 1024 * 1024;
 export const MANAGED_ARTIFACT_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
 const REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES = 64 * 1024;
-const REPLACEMENT_CLEANUP_RECEIPT_SCAN_LIMIT = 1024;
+const REPLACEMENT_CLEANUP_RECEIPT_SCAN_LIMIT = MANAGED_ARTIFACT_MAX_FILES;
 export const MANAGED_ARTIFACT_COPY_BATCH_SIZE = 256;
 const LOCK_LEASE_MS = 60_000;
 const LOCK_HEARTBEAT_MS = 10_000;
@@ -1938,12 +1938,14 @@ export class ManagedSessionDescendantStore {
 	/** Capture a complete descendant tree through this retained root. */
 	captureTree(relativePath: string): NativeDirectoryTreeSnapshot {
 		this.#assertBound();
+		const resolved = this.#resolve(relativePath);
 		try {
-			validateManagedArtifactTree(this.#resolve(relativePath));
+			fs.lstatSync(resolved);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error("not_found");
 			throw error;
 		}
+		validateManagedArtifactTree(resolved);
 		const relative = this.#relative(this.#resolve(relativePath));
 		if (this.#authority) {
 			const captured = this.#authority.snapshotManagedTree(relative);
