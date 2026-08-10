@@ -620,10 +620,10 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes publication-request revalidation generation 144 at serving epoch 87", () => {
+test("publishes same-generation successor fencing generation 145 at serving epoch 87", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 144 / serving epoch 87: publication-time requests revalidate exact endpoint authority.
-	expect(DAEMON_GENERATION).toBe(144);
+	// Generation 145 / serving epoch 87: reconnect and same-generation successor authority are distinct.
+	expect(DAEMON_GENERATION).toBe(145);
 	expect(SERVING_EPOCH).toBe(87);
 });
 test("archives pending topics into retained inactive records", async () => {

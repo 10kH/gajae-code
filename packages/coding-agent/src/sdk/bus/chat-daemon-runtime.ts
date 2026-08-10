@@ -422,8 +422,15 @@ export class ChatDaemonRuntime {
 		}
 	}
 
-	async #onSessionRemoved(attachment: SessionAttachment, reason: "removed" | "replaced" = "removed"): Promise<void> {
+	async #onSessionRemoved(
+		attachment: SessionAttachment,
+		reason: "removed" | "replaced" | "replaced_same_generation" = "removed",
+	): Promise<void> {
 		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
+		if (reason === "replaced_same_generation") {
+			await this.#discord?.retireAttachment(attachment.sessionId, attachment.generation);
+			await this.#slack?.retireAttachment(attachment.sessionId, attachment.generation);
+		}
 		this.#attachments.delete(attachment.sessionId);
 		if (reason === "removed") await this.#trackCleanup(attachment);
 	}

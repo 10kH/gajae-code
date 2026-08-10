@@ -919,6 +919,21 @@ export class SlackNotificationDaemon {
 		await this.close(sessionId, "Session closed.", endpointGeneration);
 	}
 
+	async retireAttachment(sessionId: string, endpointGeneration: number): Promise<void> {
+		const found = await this.findSession(sessionId, true);
+		if (found?.record.endpointGeneration !== endpointGeneration) return;
+		await this.store.transact(found.key, current =>
+			current?.sessionId === sessionId && current.endpointGeneration === endpointGeneration
+				? nextRecord(current, {
+						state: "closed_marker",
+						pendingActionId: undefined,
+						cleanupEffectId: undefined,
+						updatedAt: this.#now(),
+					})
+				: current,
+		);
+	}
+
 	async #close(
 		sessionId: string,
 		marker: string,

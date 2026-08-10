@@ -67,7 +67,10 @@ export interface SessionRouterDeps {
 	/** Called only after the opaque capability becomes externally current. */
 	onAttachmentReady?: (attachment: SessionAttachment) => Promise<void> | void;
 	/** Called when the Broker index no longer reports an attached session as live. */
-	onSessionRemoved?: (attachment: SessionAttachment, reason?: "removed" | "replaced") => Promise<void> | void;
+	onSessionRemoved?: (
+		attachment: SessionAttachment,
+		reason?: "removed" | "replaced" | "replaced_same_generation",
+	) => Promise<void> | void;
 	onReconciled?: () => void;
 	setInterval?: typeof setInterval;
 	clearInterval?: typeof clearInterval;
@@ -740,7 +743,13 @@ export class SessionRouter {
 					`SDK session replacement transport cleanup failed for ${indexed.sessionId}; authority remains revoked (${String(error)}).`,
 				);
 			}
-			await this.#deps.onSessionRemoved?.(existing.capability, "replaced");
+			await this.#deps.onSessionRemoved?.(
+				existing.capability,
+				existing.generation === indexed.endpointGeneration &&
+					(existing.pid !== indexed.pid || existing.endpointMtimeMs !== indexed.endpointMtimeMs)
+					? "replaced_same_generation"
+					: "replaced",
+			);
 			if (!resumable) {
 				this.#undelivered.delete(indexed.sessionId);
 				this.#recoveredFrames.delete(indexed.sessionId);
