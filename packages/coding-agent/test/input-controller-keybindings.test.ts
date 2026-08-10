@@ -701,7 +701,7 @@ describe("InputController keybinding setup", () => {
 		expect(rendered).toContain("⌦ remove");
 		expect(rendered).toContain("⌃↑/⌃↓ move");
 		expect(rendered).toContain("⎋ cancel");
-		selector.handleInput("\x1b[1;3A");
+		selector.handleInput("\x1b\x1b[A");
 		selector.handleInput("\n");
 
 		expect(editor.getText()).toBe("older session queue");

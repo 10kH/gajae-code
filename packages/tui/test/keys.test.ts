@@ -99,6 +99,8 @@ describe("matchesKey", () => {
 });
 describe.each([
 	{ data: "\x1bq", kitty: false, key: "alt+q", expected: "alt+q" },
+	{ data: "\x1b\x1b[A", kitty: false, key: "alt+up", expected: "alt+up" },
+	{ data: "\x1b\x1b[B", kitty: false, key: "alt+down", expected: "alt+down" },
 	{ data: "\x1bC", kitty: true, key: "alt+shift+c", expected: "alt+shift+c" },
 	{ data: "\x1b[113;3u", kitty: true, key: "alt+q", expected: "alt+q" },
 	{ data: "\x1b[99;4u", kitty: true, key: "alt+shift+c", expected: "alt+shift+c" },

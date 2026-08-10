@@ -486,6 +486,17 @@ fn parse_key_id(key_id: &str) -> Option<ParsedKeyId<'_>> {
 
 	Some(ParsedKeyId { key, modifier })
 }
+/// Resolve a macOS Terminal.app Meta prefix wrapped around another escape
+/// sequence, such as Option+Up (`ESC ESC [ A`). The outer ESC is the Meta
+/// marker; the inner sequence is the ordinary arrow/function-key sequence.
+fn parse_meta_wrapped_key(bytes: &[u8], kitty_protocol_active: bool) -> Option<Cow<'static, str>> {
+	if bytes.len() < 2 || !bytes.starts_with(b"\x1b\x1b") {
+		return None;
+	}
+	let inner = parse_key_inner(&bytes[1..], kitty_protocol_active)?;
+	let ParsedKeyId { key, modifier } = parse_key_id(inner.as_ref())?;
+	Some(Cow::Owned(format_with_mods(modifier | MOD_ALT, key)))
+}
 
 #[inline]
 const fn raw_ctrl_char(letter: u8) -> u8 {
@@ -562,6 +573,12 @@ fn matches_key_inner(bytes: &[u8], key_id: &str, kitty_protocol_active: bool) ->
 	let Some(ParsedKeyId { key, modifier }) = parse_key_id(key_id) else {
 		return false;
 	};
+	if modifier & MOD_ALT != 0 && bytes.starts_with(b"\x1b\x1b") {
+		let inner_key = format_with_mods(modifier & !MOD_ALT, key);
+		if matches_key_inner(&bytes[1..], &inner_key, kitty_protocol_active) {
+			return true;
+		}
+	}
 
 	// Parse Kitty once (avoid repeated parsing in branches).
 	let kitty_parsed = parse_kitty_sequence_bytes(bytes);
@@ -1014,6 +1031,9 @@ fn parse_key_inner(bytes: &[u8], kitty_protocol_active: bool) -> Option<Cow<'sta
 	// Fast path: single byte (most common for typing)
 	if bytes.len() == 1 {
 		return parse_single_byte(bytes[0]);
+	}
+	if let Some(meta_key) = parse_meta_wrapped_key(bytes, kitty_protocol_active) {
+		return Some(meta_key);
 	}
 
 	// All escape sequences start with ESC
@@ -1576,6 +1596,24 @@ mod tests {
 		}
 	}
 
+	#[test]
+	fn macos_terminal_meta_wrapped_navigation_matches_option_arrows() {
+		let cases = [
+			(b"\x1b\x1b[A".as_slice(), "alt+up"),
+			(b"\x1b\x1b[B".as_slice(), "alt+down"),
+			(b"\x1b\x1b[C".as_slice(), "alt+right"),
+			(b"\x1b\x1b[D".as_slice(), "alt+left"),
+			(b"\x1b\x1b[3~".as_slice(), "alt+delete"),
+		];
+
+		for kitty_active in [false, true] {
+			for (bytes, key_id) in cases {
+				assert_eq!(parse_key_inner(bytes, kitty_active).as_deref(), Some(key_id));
+				assert!(matches_key_inner(bytes, key_id, kitty_active));
+				assert!(!matches_key_inner(bytes, key_id.strip_prefix("alt+").unwrap(), kitty_active));
+			}
+		}
+	}
 	#[test]
 	fn parse_key_ignores_kitty_release_events() {
 		assert_eq!(parse_key_inner(b"\x1b[127u", true).as_deref(), Some("backspace"));
