@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
@@ -6,11 +6,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import {
+	captureManagedFileNoFollow,
+	MANAGED_ARTIFACT_MAX_FILE_BYTES,
+	ManagedCommittedMutationError,
 	ManagedReplaceError,
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
 	publishManagedFileNoReplace,
+	publishManagedFileNoReplaceSync,
 	renameFlagsUnsupported,
+	replaceManagedFileSync,
 	retainManagedDirectoryAuthority,
 	validateNativeSecurityResult,
 } from "../src/session/internal/managed-session-storage";
@@ -509,11 +514,115 @@ describe("managed descriptor reads", () => {
 			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
 			const bytes = Buffer.from("descriptor payload\n");
 			store.publishNoReplaceSync("session.jsonl", bytes);
+			const readSpy = vi.spyOn(fs, "readSync");
 			const descriptor = store.descriptorExpected("session.jsonl");
 			expect(descriptor).toMatchObject({ size: bytes.byteLength, isFile: true });
 			expect(descriptor?.dev).toBeTypeOf("bigint");
 			expect(descriptor?.ino).toBeTypeOf("bigint");
 			expect(store.descriptorExpected("missing.jsonl")).toBeNull();
+			expect(readSpy).not.toHaveBeenCalled();
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("reads bounded ranges and rejects a pathname swap before returning bytes", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-range-")));
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+		const transcript = path.join(root, "session.jsonl");
+		try {
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("0123456789\n"));
+			expect(Buffer.from(store.readRangeExpectedSync("session.jsonl", 2, 4).bytes).toString("utf8")).toBe("2345");
+			expect(() => store.readRangeExpectedSync("session.jsonl", Number.MAX_SAFE_INTEGER, 1)).toThrow(
+				"Managed range read start overflows",
+			);
+
+			const readSync = fs.readSync;
+			const spy = vi.spyOn(fs, "readSync").mockImplementationOnce(((
+				fd: number,
+				buffer: NodeJS.ArrayBufferView,
+				offset: number,
+				length: number,
+				position: number | null,
+			) => {
+				const count = readSync(fd, buffer, offset, length, position);
+				fs.renameSync(transcript, `${transcript}.detached`);
+				fs.writeFileSync(transcript, "attacker\n", { mode: 0o600 });
+				return count;
+			}) as never);
+			expect(() => store.readRangeExpectedSync("session.jsonl", 0, 4)).toThrow("source_changed");
+			spy.mockRestore();
+		} finally {
+			store.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+	it("binds ranges to the caller's committed descriptor generation", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-generation-")));
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+		try {
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("generation-one\n"));
+			const expected = store.descriptorExpected("session.jsonl");
+			if (!expected) throw new Error("Expected managed transcript descriptor");
+			store.replaceSync("session.jsonl", Buffer.from("generation-two\n"));
+			expect(() => store.readRangeExpectedSync("session.jsonl", 0, 4, expected)).toThrow(
+				"managed_range_generation_mismatch",
+			);
+		} finally {
+			store.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.platform === "win32")("rejects a FIFO pathname substitution without blocking", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-fifo-")));
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+		const transcript = path.join(root, "session.jsonl");
+		const detached = `${transcript}.detached`;
+		try {
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("fifo-safe\n"));
+			const expected = store.descriptorExpected("session.jsonl");
+			if (!expected) throw new Error("Expected managed transcript descriptor");
+			const openSync = fs.openSync;
+			let observedFlags = 0;
+			const spy = vi.spyOn(fs, "openSync").mockImplementationOnce(((
+				file: fs.PathLike,
+				flags: fs.OpenMode,
+				mode?: fs.Mode,
+			) => {
+				observedFlags = Number(flags);
+				fs.renameSync(transcript, detached);
+				const created = Bun.spawnSync(["mkfifo", transcript]);
+				if (created.exitCode !== 0) throw new Error("Could not create FIFO fixture");
+				return openSync(file, flags, mode);
+			}) as typeof fs.openSync);
+			expect(() => store.readRangeExpectedSync("session.jsonl", 0, 4, expected)).toThrow("source_changed");
+			expect(observedFlags & fs.constants.O_NONBLOCK).toBe(fs.constants.O_NONBLOCK);
+			spy.mockRestore();
+		} finally {
+			store.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+	it.skipIf(process.platform === "win32")("rejects a FIFO cold-fallback capture without blocking", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-fallback-fifo-")));
+		const fifo = path.join(root, "session.jsonl");
+		try {
+			const created = Bun.spawnSync(["mkfifo", fifo]);
+			if (created.exitCode !== 0) throw new Error("Could not create FIFO fixture");
+			const openSync = fs.openSync;
+			let observedFlags = 0;
+			const spy = vi.spyOn(fs, "openSync").mockImplementationOnce(((
+				file: fs.PathLike,
+				flags: fs.OpenMode,
+				mode?: fs.Mode,
+			) => {
+				observedFlags = Number(flags);
+				return openSync(file, flags, mode);
+			}) as typeof fs.openSync);
+			expect(() => captureManagedFileNoFollow(fifo)).toThrow("source_changed");
+			expect(observedFlags & fs.constants.O_NONBLOCK).toBe(fs.constants.O_NONBLOCK);
+			spy.mockRestore();
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -521,6 +630,51 @@ describe("managed descriptor reads", () => {
 });
 
 describe.skipIf(process.platform !== "darwin")("authority-absent managed replacement", () => {
+	it("rejects authority-absent subtree replacement before read or delete", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-subtree-swap-")));
+		try {
+			const sessionDir = path.join(root, "session");
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), sessionDir);
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("authority\n"));
+			const original = `${sessionDir}.original`;
+			const attacker = `${sessionDir}.attacker`;
+			fs.renameSync(sessionDir, original);
+			fs.mkdirSync(attacker, { mode: 0o700 });
+			fs.writeFileSync(path.join(attacker, "session.jsonl"), "attacker\n", { mode: 0o600 });
+			fs.symlinkSync(attacker, sessionDir, "dir");
+			expect(() => store.readExpected("session.jsonl")).toThrow("root binding changed");
+			expect(() => store.removeIfExistsDescriptor("session.jsonl")).toThrow("root binding changed");
+			expect(fs.readFileSync(path.join(attacker, "session.jsonl"), "utf8")).toBe("attacker\n");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+	it("rejects path-based managed writes above the reopenable ceiling before allocation", () => {
+		const oversized = { byteLength: MANAGED_ARTIFACT_MAX_FILE_BYTES + 1 } as unknown as Uint8Array;
+		expect(() => publishManagedFileNoReplaceSync("/unused", oversized)).toThrow("content_too_large");
+		expect(() =>
+			replaceManagedFileSync("/unused", oversized, {
+				canonicalPath: "/unused",
+				dev: 0n,
+				ino: 0n,
+			}),
+		).toThrow("content_too_large");
+	});
+	it("rejects repeated over-ceiling appends without replacement staging leaks", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-append-limit-")));
+		try {
+			const sessionDir = path.join(root, "session");
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), sessionDir);
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("x"));
+			fs.truncateSync(path.join(sessionDir, "session.jsonl"), MANAGED_ARTIFACT_MAX_FILE_BYTES);
+			for (let attempt = 0; attempt < 2; attempt++)
+				expect(() => store.appendSync("session.jsonl", Buffer.from("x"))).toThrow("content_too_large");
+			expect(fs.readdirSync(sessionDir).filter(name => name.endsWith(".replacement"))).toEqual([]);
+			expect(fs.statSync(path.join(sessionDir, "session.jsonl")).size).toBe(MANAGED_ARTIFACT_MAX_FILE_BYTES);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
 	it("atomically replaces an existing file through the Darwin path", () => {
 		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-replace-")));
 		try {
@@ -561,13 +715,34 @@ describe.skipIf(process.platform !== "darwin")("authority-absent managed replace
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
+	it("keeps memory-authoritative append success when cleanup receipt retirement is pending", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-append-receipt-")));
+		let exactUnlink: Mock<typeof native.exactUnlink> | undefined;
+		try {
+			const sessionDir = path.join(root, "session");
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), sessionDir);
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("before\n"));
+			exactUnlink = vi.spyOn(native, "exactUnlink").mockImplementation(pathname => ({
+				ok: false,
+				code: "cleanup_pending",
+				retainedPlaceholderPath: pathname,
+			}));
+			const receipt = store.appendSync("session.jsonl", Buffer.from("after\n"));
+			expect(receipt.descriptor.size).toBe(Buffer.byteLength("before\nafter\n"));
+			expect(fs.readFileSync(path.join(sessionDir, "session.jsonl"), "utf8")).toBe("before\nafter\n");
+			expect(fs.readdirSync(sessionDir).some(entry => entry.startsWith(".gjc-replace-cleanup-"))).toBe(true);
+		} finally {
+			exactUnlink?.mockRestore();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
 
 	it("preserves the staged successor when receipt publication commits but reports failure", () => {
 		const root = fs.realpathSync.native(
 			fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-receipt-publish-")),
 		);
 		const realRenameNoReplacePath = native.renameNoReplacePath;
-		let renameNoReplace: ReturnType<typeof vi.spyOn> | undefined;
+		let renameNoReplace: Mock<typeof native.renameNoReplacePath> | undefined;
 		try {
 			const sessionDir = path.join(root, "session");
 			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), sessionDir);
@@ -603,7 +778,7 @@ describe.skipIf(process.platform !== "darwin")("authority-absent managed replace
 	it("rejects a destination substitution at the native exchange boundary", () => {
 		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-replace-race-")));
 		const realExactReplacePath = native.exactReplacePath;
-		let exactReplace: ReturnType<typeof vi.spyOn> | undefined;
+		let exactReplace: Mock<typeof native.exactReplacePath> | undefined;
 		try {
 			const sessionDir = path.join(root, "session");
 			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), sessionDir);
@@ -630,12 +805,12 @@ describe.skipIf(process.platform !== "darwin")("authority-absent managed replace
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
-	it("retains native post-exchange paths in ManagedReplaceError", () => {
+	it("retains native post-exchange paths inside committed-outcome evidence", () => {
 		const root = fs.realpathSync.native(
 			fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-replace-failure-")),
 		);
-		let exactReplace: ReturnType<typeof vi.spyOn> | undefined;
-		let exactUnlink: ReturnType<typeof vi.spyOn> | undefined;
+		let exactReplace: Mock<typeof native.exactReplacePath> | undefined;
+		let exactUnlink: Mock<typeof native.exactUnlink> | undefined;
 		try {
 			const sessionDir = path.join(root, "session");
 			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), sessionDir);
@@ -665,8 +840,11 @@ describe.skipIf(process.platform !== "darwin")("authority-absent managed replace
 				error = caught;
 			}
 
-			expect(error).toBeInstanceOf(ManagedReplaceError);
-			const replaceError = error as ManagedReplaceError;
+			expect(error).toBeInstanceOf(ManagedCommittedMutationError);
+			const committedError = error as ManagedCommittedMutationError;
+			expect(committedError.operation).toBe("replace");
+			expect(committedError.cause).toBeInstanceOf(ManagedReplaceError);
+			const replaceError = committedError.cause as ManagedReplaceError;
 			expect(replaceError.message).toBe("managed_replace_failed:durability_failed");
 			expect(replaceError.code).toBe("durability_failed");
 			expect(replaceError.detachedPath).toBe(predecessor);
@@ -690,7 +868,7 @@ describe.skipIf(process.platform !== "darwin")("authority-absent managed replace
 		const root = fs.realpathSync.native(
 			fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-receipt-retirement-")),
 		);
-		let exactUnlink: ReturnType<typeof vi.spyOn> | undefined;
+		let exactUnlink: Mock<typeof native.exactUnlink> | undefined;
 		try {
 			const sessionDir = path.join(root, "session");
 			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), sessionDir);
@@ -740,7 +918,7 @@ describe.skipIf(process.platform !== "darwin")("authority-absent managed replace
 		const root = fs.realpathSync.native(
 			fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-replace-postcommit-")),
 		);
-		let exactReplace: ReturnType<typeof vi.spyOn> | undefined;
+		let exactReplace: Mock<typeof native.exactReplacePath> | undefined;
 		let committedSource: string | undefined;
 		try {
 			const sessionDir = path.join(root, "session");
@@ -758,7 +936,7 @@ describe.skipIf(process.platform !== "darwin")("authority-absent managed replace
 			});
 
 			expect(() => store.replaceSync("session.jsonl", Buffer.from("successor\n"))).toThrow(
-				"destination_identity_changed",
+				"managed_replace_committed_outcome_uncertain",
 			);
 			if (!committedSource) throw new Error("Expected native replacement source");
 			expect(fs.readFileSync(committedSource, "utf8")).toBe("successor\n");
@@ -775,8 +953,8 @@ describe.skipIf(process.platform !== "darwin")("authority-absent managed replace
 		);
 		const realExactReplacePath = native.exactReplacePath;
 		const realExactUnlink = native.exactUnlink;
-		let exactReplace: ReturnType<typeof vi.spyOn> | undefined;
-		let exactUnlink: ReturnType<typeof vi.spyOn> | undefined;
+		let exactReplace: Mock<typeof native.exactReplacePath> | undefined;
+		let exactUnlink: Mock<typeof native.exactUnlink> | undefined;
 		let committedSource: string | undefined;
 		let moved = false;
 		let retainedReceipt: string | undefined;
