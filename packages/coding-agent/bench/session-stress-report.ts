@@ -114,7 +114,7 @@ type GibReport = {
 	runs?: GibRun[];
 	summary?: Partial<Record<"direct" | "captured", {
 		forkElapsedMs: { median: number; p95: number };
-		forkCpuMicros: { median: number };
+		forkCpuMicros: { median: number } | null;
 		forkRssGrowthBytes: { median: number; p95: number };
 		reopenElapsedMs: { median: number; p95: number };
 		coldLookupP95Ms: { median: number; p95: number };
@@ -189,12 +189,13 @@ function operationLabel(operation: OperationClass | undefined): string {
 		"repeated-lifecycle": "Repeated open/lookup/close",
 		"direct-fork": "Direct fork",
 		"captured-fork": "Captured fork",
+		unknown: "Operation unavailable",
 	};
 	return labels[operation ?? ""] ?? operation ?? "Unknown operation";
 }
 
 function normalizedOperation(run: MatrixRun): OperationClass {
-	return run.operationClass ?? "raw-cold-first-open";
+	return run.operationClass ?? "unknown";
 }
 
 function operationElapsed(run: MatrixRun): number | null {
@@ -255,7 +256,7 @@ function memoryMetric(run: MatrixRun, key: "reservedBudgetBytes" | "residentByte
 	const telemetry = run.sessionMemory?.telemetry ?? {};
 	const telemetryNumber = finiteNumber(telemetry[key]);
 	if (telemetryNumber !== null) return telemetryNumber;
-	if (key === "reservedBudgetBytes") return finiteNumber(run.sessionMemory?.totalAccountedBytes);
+	if (key === "reservedBudgetBytes") return null;
 	if (key === "residentBytes") {
 		const components = [telemetry.allocatedCacheBytes, telemetry.hotResidentBytes ?? telemetry.hotRegionBytes, telemetry.metadataResidentBytes ?? telemetry.metaDescriptorBytes]
 			.map(finiteNumber)
@@ -311,6 +312,10 @@ function failureText(run: MatrixRun): string {
 	return code && message ? `${code}: ${message}` : message ?? code ?? "No failure reason recorded";
 }
 
+function sampleLabel(run: MatrixRun): string {
+	return run.repetitionIndex === undefined ? "N/A" : String(run.repetitionIndex + 1);
+}
+
 function renderEndpointTable(matrix: MatrixReport): string {
 	const scenarios = availableScenarios(matrix);
 	if (scenarios.length === 0) return "<p>N/A — no matrix runs are available.</p>";
@@ -321,6 +326,7 @@ function renderEndpointTable(matrix: MatrixReport): string {
 				<td>${run.targetMiB.toLocaleString()} MiB</td>
 				<td>${escapeHtml(operationLabel(run.operationClass))}</td>
 				<td>${escapeHtml(run.sessionMemoryMode ?? "N/A")}</td>
+				<td>${escapeHtml(sampleLabel(run))}</td>
 				<td><span class="status ${escapeHtml(run.status)}">${escapeHtml(run.status)}</span>${run.status === "ok" ? "" : `<div class="small">${escapeHtml(failureText(run))}</div>`}</td>
 				<td class="num">${run.status === "ok" ? formatMs(operationElapsed(run)) : "N/A"}</td>
 				<td class="num">${run.status === "ok" ? formatThroughput(run.throughputMiBPerSecond) : "N/A"}</td>
@@ -332,7 +338,7 @@ function renderEndpointTable(matrix: MatrixReport): string {
 				<h3>${escapeHtml(scenarioName(scenario))}</h3>
 				<p>${escapeHtml(scenarioDescription(scenario))}</p>
 				<table>
-					<thead><tr><th>Corpus size</th><th>Operation</th><th>Memory mode</th><th>Outcome</th><th>Latency</th><th>Throughput</th><th>RSS growth</th><th>Cold p95</th><th>Entries</th></tr></thead>
+					<thead><tr><th>Corpus size</th><th>Operation</th><th>Memory mode</th><th>Sample</th><th>Outcome</th><th>Latency</th><th>Throughput</th><th>RSS growth</th><th>Cold p95</th><th>Entries</th></tr></thead>
 					<tbody>${rows}</tbody>
 				</table>
 			</section>`;
@@ -346,6 +352,7 @@ function renderAppendixRows(matrix: MatrixReport): string {
 			<td>${escapeHtml(scenarioName(run.scenario))}</td>
 			<td>${escapeHtml(operationLabel(run.operationClass))}</td>
 			<td>${escapeHtml(run.sessionMemoryMode ?? "N/A")}</td>
+			<td>${escapeHtml(sampleLabel(run))}</td>
 			<td class="num">${run.targetMiB}</td>
 			<td class="num">${run.fileCount}</td>
 			<td class="num">${finiteNumber(run.entryCount) === null ? "N/A" : run.entryCount.toLocaleString()}</td>
@@ -480,9 +487,9 @@ table{width:100%;border-collapse:collapse;font-size:12px;margin:12px 0 22px}th{b
 <section>
 <h2>${largestSizeMiB === null ? "Largest available outcomes" : `${largestSizeMiB.toLocaleString()} MiB outcomes`}</h2>
 ${largestSizeMiB === null ? "<p>N/A — no matrix size is available.</p>" : `<table>
-<thead><tr><th>Scenario</th><th>Operation</th><th>Mode</th><th>Outcome</th><th>Failure reason</th><th>Files</th><th>Entries</th><th>Latency</th><th>Throughput</th><th>RSS growth</th><th>Cold p95</th><th>Reserved</th><th>Resident</th><th>Sidecars</th></tr></thead>
+<thead><tr><th>Scenario</th><th>Operation</th><th>Mode</th><th>Sample</th><th>Outcome</th><th>Failure reason</th><th>Files</th><th>Entries</th><th>Latency</th><th>Throughput</th><th>RSS growth</th><th>Cold p95</th><th>Reserved</th><th>Resident</th><th>Sidecars</th></tr></thead>
 <tbody>
-${largestRuns.map(run => `<tr><td>${escapeHtml(scenarioName(run.scenario))}</td><td>${escapeHtml(operationLabel(run.operationClass))}</td><td>${escapeHtml(run.sessionMemoryMode ?? "N/A")}</td><td>${escapeHtml(run.status)}</td><td>${escapeHtml(failureText(run) || "N/A")}</td><td class="num">${run.status === "ok" ? run.fileCount : "N/A"}</td><td class="num">${run.status === "ok" && finiteNumber(run.entryCount) !== null ? run.entryCount.toLocaleString() : "N/A"}</td><td class="num">${formatMs(operationElapsed(run))}</td><td class="num">${run.status === "ok" ? formatThroughput(run.throughputMiBPerSecond) : "N/A"}</td><td class="num">${formatMiB(operationRss(run))}</td><td class="num">${run.status === "ok" && run.lookup?.coldMs ? formatMs(run.lookup.coldMs.p95) : "N/A"}</td><td class="num">${formatMiB(memoryMetric(run, "reservedBudgetBytes"))}</td><td class="num">${formatMiB(memoryMetric(run, "residentBytes"))}</td><td class="num">${formatMiB(memoryMetric(run, "sidecarFileBytes"))}</td></tr>`).join("\n")}
+${largestRuns.map(run => `<tr><td>${escapeHtml(scenarioName(run.scenario))}</td><td>${escapeHtml(operationLabel(run.operationClass))}</td><td>${escapeHtml(run.sessionMemoryMode ?? "N/A")}</td><td>${escapeHtml(sampleLabel(run))}</td><td>${escapeHtml(run.status)}</td><td>${escapeHtml(failureText(run) || "N/A")}</td><td class="num">${run.status === "ok" ? run.fileCount : "N/A"}</td><td class="num">${run.status === "ok" && finiteNumber(run.entryCount) !== null ? run.entryCount.toLocaleString() : "N/A"}</td><td class="num">${formatMs(operationElapsed(run))}</td><td class="num">${run.status === "ok" ? formatThroughput(run.throughputMiBPerSecond) : "N/A"}</td><td class="num">${formatMiB(operationRss(run))}</td><td class="num">${run.status === "ok" && run.lookup?.coldMs ? formatMs(run.lookup.coldMs.p95) : "N/A"}</td><td class="num">${formatMiB(memoryMetric(run, "reservedBudgetBytes"))}</td><td class="num">${formatMiB(memoryMetric(run, "residentBytes"))}</td><td class="num">${formatMiB(memoryMetric(run, "sidecarFileBytes"))}</td></tr>`).join("\n")}
 </tbody></table>`}
 </section>
 <section>
@@ -534,7 +541,7 @@ ${renderGibRows(gib, gibModes)}
 <section class="page-break">
 <h2>Appendix A — Complete dense matrix</h2>
 <table class="appendix">
-<thead><tr><th>Scenario</th><th>Operation</th><th>Mode</th><th>MiB</th><th>Files</th><th>Entries</th><th>Status</th><th>Failure reason</th><th>Latency ms</th><th>Per-file p95</th><th>MiB/s</th><th>RSS MiB</th><th>Cold p95</th><th>Warm p95</th><th>Warm reads</th><th>Reserved MiB</th><th>Resident MiB</th><th>Sidecar MiB</th><th>Dictionary</th><th>Parent</th><th>Phase/counter evidence</th></tr></thead>
+<thead><tr><th>Scenario</th><th>Operation</th><th>Mode</th><th>Sample</th><th>MiB</th><th>Files</th><th>Entries</th><th>Status</th><th>Failure reason</th><th>Latency ms</th><th>Per-file p95</th><th>MiB/s</th><th>RSS MiB</th><th>Cold p95</th><th>Warm p95</th><th>Warm reads</th><th>Reserved MiB</th><th>Resident MiB</th><th>Sidecar MiB</th><th>Dictionary</th><th>Parent</th><th>Phase/counter evidence</th></tr></thead>
 <tbody>${renderAppendixRows(matrix)}</tbody>
 </table>
 </section>

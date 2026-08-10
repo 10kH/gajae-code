@@ -147,7 +147,7 @@ type BenchmarkReport = {
 	runs: WorkerResult[];
 	summary: Partial<Record<Mode, {
 		forkElapsedMs: Summary;
-		forkCpuMicros: Summary;
+		forkCpuMicros: Summary | null;
 		forkRssGrowthBytes: Summary;
 		reopenElapsedMs: Summary;
 		coldLookupP95Ms: Summary;
@@ -571,7 +571,9 @@ function summarizeMode(runs: WorkerResult[], mode: Mode): NonNullable<BenchmarkR
 	if (selected.length === 0) return undefined;
 	return {
 		forkElapsedMs: summarize(selected.map(run => run.phases.fork.elapsedMs)),
-		forkCpuMicros: summarize(selected.flatMap(run => run.phases.fork.cpu ? [run.phases.fork.cpu.userMicros + run.phases.fork.cpu.systemMicros] : [])),
+		forkCpuMicros: selected.some(run => run.phases.fork.cpu)
+			? summarize(selected.flatMap(run => run.phases.fork.cpu ? [run.phases.fork.cpu.userMicros + run.phases.fork.cpu.systemMicros] : []))
+			: null,
 		forkRssGrowthBytes: summarize(selected.map(run => run.memory.forkRssGrowthBytes)),
 		reopenElapsedMs: summarize(selected.map(run => run.phases.reopen.elapsedMs)),
 		coldLookupP95Ms: summarize(selected.map(run => run.latency.coldLookupMs.p95)),

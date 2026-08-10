@@ -4452,6 +4452,167 @@ describe("persistent dictionary and metadata-delta artifacts", () => {
 			tempDir.removeSync();
 		}
 	});
+
+	it("rejects a dictionary artifact rebound to a different session id", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/dict-session-mismatch.jsonl";
+		writeTreeTranscript(storage, sessionFile, { parentCount: 4, childrenPerParent: 2 });
+		const built = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		await built.close();
+
+		const meta = JSON.parse(storage.readTextSync(dictionaryMetaPathFor(sessionFile))) as {
+			header: { sessionId: string };
+		};
+		meta.header.sessionId = "different-session";
+		const metaBytes = Buffer.from(`${JSON.stringify(meta)}\n`, "utf8");
+		storage.writeTextSync(dictionaryMetaPathFor(sessionFile), metaBytes.toString("utf8"));
+		const marker = JSON.parse(storage.readTextSync(sidecarPath(sessionFile, "commit"))) as {
+			dictionary?: { header: { sessionId: string }; metaSize: number; metaDigest: string };
+		};
+		expect(marker.dictionary).toBeDefined();
+		marker.dictionary!.header.sessionId = "different-session";
+		marker.dictionary!.metaSize = metaBytes.byteLength;
+		marker.dictionary!.metaDigest = createHash("sha256").update(metaBytes).digest("hex");
+		storage.writeTextSync(sidecarPath(sessionFile, "commit"), JSON.stringify(marker));
+
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(reopened.getSessionMemoryStats()).toMatchObject({
+				lazyReopenSucceeded: true,
+				dictionaryArtifactEnabled: false,
+			});
+			expect(reopened.getEntry("root")).toMatchObject({ id: "root" });
+		} finally {
+			await reopened.close();
+		}
+	});
+
+	it("removes stale secondary files when a rebuild uses disabled artifacts", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/secondary-rebuild-disabled.jsonl";
+		writeTreeTranscript(storage, sessionFile, { parentCount: 4, childrenPerParent: 2 });
+		const built = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		await built.close();
+		expect(storage.existsSync(dictionaryMetaPathFor(sessionFile))).toBe(true);
+		expect(
+			Array.from({ length: PARENT_CHILDREN_BUCKET_COUNT }, (_, bucket) =>
+				parentBucketPath(sessionFile, bucket),
+			).some(path => storage.existsSync(path)),
+		).toBe(true);
+
+		SessionManagerTestHooks.secondaryArtifactMode = "disabled";
+		storage.writeTextSync(
+			sidecarPath(sessionFile, "idx"),
+			`${storage.readTextSync(sidecarPath(sessionFile, "idx"))}{}\n`,
+		);
+		const rebuilt = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(rebuilt.getSessionMemoryStats()).toMatchObject({
+				coldRetirementActive: true,
+				dictionaryArtifactEnabled: false,
+				parentArtifactEnabled: false,
+			});
+			expect(storage.existsSync(dictionaryMetaPathFor(sessionFile))).toBe(false);
+			for (let partition = 0; partition < DICTIONARY_PARTITION_COUNT; partition++)
+				expect(storage.existsSync(dictionaryPartitionPath(sessionFile, partition))).toBe(false);
+			for (let bucket = 0; bucket < PARENT_CHILDREN_BUCKET_COUNT; bucket++)
+				expect(storage.existsSync(parentBucketPath(sessionFile, bucket))).toBe(false);
+			const primarySidecarBytes = (["idx", "tail", "commit"] as const)
+				.map(kind => storage.statSync(sidecarPath(sessionFile, kind)).size)
+				.reduce((total, size) => total + size, 0);
+			const metadataDeltaBytes = storage.existsSync(metadataDeltaPathFor(sessionFile))
+				? storage.statSync(metadataDeltaPathFor(sessionFile)).size
+				: 0;
+			expect(rebuilt.getSessionMemoryStats().sidecarFileBytes).toBe(primarySidecarBytes + metadataDeltaBytes);
+		} finally {
+			await rebuilt.close();
+		}
+	});
+
+	it("guards full-hot-view work before reading a commit-rebound tampered index", async () => {
+		class CountingStorage extends MemorySessionStorage {
+			indexRangeReads = 0;
+			override readRangeSync(filePath: string, offset: number, length: number) {
+				if (filePath.endsWith(".spill.idx")) this.indexRangeReads++;
+				return super.readRangeSync(filePath, offset, length);
+			}
+		}
+		const storage = new CountingStorage();
+		const sessionFile = "/sessions/rebound-index-full-view.jsonl";
+		const records = [
+			{ type: "session", version: 5, id: "rebound-index", timestamp: "0", cwd: "/cwd" },
+			{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: {} },
+			{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: {} },
+			{
+				type: "compaction",
+				id: "compact",
+				parentId: "kept",
+				timestamp: "0",
+				summary: "summary",
+				firstKeptEntryId: "kept",
+				tokensBefore: 1,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		SessionManagerTestHooks.secondaryArtifactMode = "disabled";
+		const built = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		await built.close();
+		const originalIndex = storage.readTextSync(sidecarPath(sessionFile, "idx"));
+		const tamperedIndex = originalIndex.replaceAll('"old"', '"bad"');
+		expect(tamperedIndex).not.toBe(originalIndex);
+		storage.writeTextSync(sidecarPath(sessionFile, "idx"), tamperedIndex);
+		const marker = JSON.parse(storage.readTextSync(sidecarPath(sessionFile, "commit"))) as { indexDigest: string };
+		marker.indexDigest = createHash("sha256").update(Buffer.from(tamperedIndex, "utf8")).digest("hex");
+		storage.writeTextSync(sidecarPath(sessionFile, "commit"), JSON.stringify(marker));
+
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+			const readsBefore = storage.indexRangeReads;
+			expect(() => reopened.getEntriesForExport()).toThrow("cold_sidecar_rebuild_required_for_bounded_transcript");
+			expect(storage.indexRangeReads).toBe(readsBefore);
+		} finally {
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
+			await reopened.close();
+		}
+	});
 });
 describe("descriptor-bound capture and staged fork publication", () => {
 	function writeColdTranscript(

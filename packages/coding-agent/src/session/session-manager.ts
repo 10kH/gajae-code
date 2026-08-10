@@ -7451,15 +7451,15 @@ export class SessionManager {
 			}
 			runtime.indexDigest = commit.indexDigest;
 			runtime.validatedIndexDescriptor = indexDescriptor;
-			// The dictionary artifact is disposable acceleration: adoption failure
-			// only disables the fast path; the idx remains authoritative.
-			this.#adoptCommittedDictionary(commit.dictionary);
-			this.#adoptCommittedParentArtifact(commit.parentIndex);
+			// Secondary artifacts are disposable acceleration. Parse the authoritative
+			// transcript header before adoption so every artifact is bound to its exact session.
 			const headerWindow = this.storage.readRangeSync(sessionFile, 0, Math.min(descriptor.size, 64 * 1024)).bytes;
 			const headerEnd = headerWindow.indexOf(10);
 			if (headerEnd < 0) return false;
 			const header = JSON.parse(Buffer.from(headerWindow.subarray(0, headerEnd)).toString("utf8")) as SessionHeader;
 			if (header.type !== "session" || header.version !== CURRENT_SESSION_VERSION) return false;
+			this.#adoptCommittedDictionary(commit.dictionary, header.id);
+			this.#adoptCommittedParentArtifact(commit.parentIndex);
 			const hotEntries: SessionEntry[] = [];
 			for (const record of records) {
 				const line = this.storage.readRangeSync(sessionFile, record.byteOffset, record.byteLength).bytes;
@@ -11006,6 +11006,8 @@ export class SessionManager {
 				}
 				this.#publishParentArtifact(parentBuilder, runtime.indexDigest);
 			} else {
+				this.#cleanupParentArtifactFiles();
+				this.#cleanupDictionaryArtifactFiles();
 				runtime.parentArtifact = undefined;
 				runtime.dictionary = undefined;
 			}
@@ -11391,7 +11393,7 @@ export class SessionManager {
 	 * inconsistency disables the dictionary and the session still reopens
 	 * exactly on index/tail proof.
 	 */
-	#adoptCommittedDictionary(dictionary: DictionaryArtifactCommit | undefined): void {
+	#adoptCommittedDictionary(dictionary: DictionaryArtifactCommit | undefined, expectedSessionId: string): void {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime) return;
 		const reject = (): void => {
@@ -11399,6 +11401,7 @@ export class SessionManager {
 		};
 		const parsed = this.#parseDictionaryCommitValue(dictionary);
 		if (!parsed) return reject();
+		if (parsed.header.sessionId !== expectedSessionId) return reject();
 		if (parsed.indexDigest !== runtime.indexDigest) return reject();
 		if (parsed.sidecarIneligible || parsed.duplicateIds.length > 0) return reject();
 		if (parsed.partitions.some(partition => !partition.complete)) return reject();
@@ -12955,6 +12958,8 @@ export class SessionManager {
 	#ensureFullHotView(): void {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.enabled) return;
+		if (this.#sessionFile && this.storage.statSync(this.#sessionFile).size > eagerHydrationMaxBytes())
+			throw new Error("cold_sidecar_rebuild_required_for_bounded_transcript");
 		if (!this.#validateColdBase(runtime.base) || !this.#coldTailMatchesDisk()) {
 			this.#hydrateAuthoritativeTranscriptSync(runtime);
 			return;
