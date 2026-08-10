@@ -85,10 +85,11 @@ export type ChatDaemonAction = "stop" | "reload";
  * Slack generation 36 retains stop ownership for every detached lifecycle generation.
  * Discord generation 32 / Slack generation 37 bind cleanup to the removed attachment generation.
  * Discord generation 33 / Slack generation 38 identity-fence cleanup callbacks on exact attachments.
+ * Discord generation 34 / Slack generation 39 clear stale attachment identity before provider reassignment.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 33,
-	slack: 38,
+	discord: 34,
+	slack: 39,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

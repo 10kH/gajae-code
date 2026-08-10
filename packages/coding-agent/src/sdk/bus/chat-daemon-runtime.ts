@@ -259,6 +259,7 @@ export class ChatDaemonRuntime {
 	}
 
 	async start(): Promise<void> {
+		this.#attachments.clear();
 		if (this.input.kind === "discord") {
 			const config = this.input.config.notifications.discord;
 			if (!config) throw new Error("Discord chat daemon provider configuration is unavailable.");
