@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Code summarization now runs on the native blocking-work pool and returns a promise, keeping the JavaScript render and input loop responsive while tree-sitter parses source.
+
 ### Removed
 
 - Removed the obsolete `NotificationControlServer` N-API surface. Session lifecycle mutations now enter the coding-agent SDK Broker path instead of a provider-owned native control endpoint.

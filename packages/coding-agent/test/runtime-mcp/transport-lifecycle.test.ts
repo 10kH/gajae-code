@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, setDefaultTimeout, test, vi } from "bun:test";
+import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { disposeAllOwnedProcesses, liveOwnedProcessCount } from "../../src/runtime/process-lifecycle";
 import { HttpTransport } from "../../src/runtime-mcp/transports/http";
 import { StdioTransport } from "../../src/runtime-mcp/transports/stdio";
 
-setDefaultTimeout(60_000);
+setDefaultTimeout(90_000);
 async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 30_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
@@ -34,6 +35,25 @@ async function waitForPid(pidFile: string): Promise<number> {
 }
 
 const servers: Bun.Server<unknown>[] = [];
+const STDIO_LIFECYCLE_ISOLATION = "GJC_TEST_MCP_STDIO_LIFECYCLE_ISOLATED";
+
+async function runIsolatedStdioLifecycleTest(): Promise<void> {
+	const child = Bun.spawn(
+		[process.execPath, "test", import.meta.path, "--test-name-pattern", "close and reconnect dispose"],
+		{
+			cwd: path.join(import.meta.dir, "..", ".."),
+			env: { ...process.env, [STDIO_LIFECYCLE_ISOLATION]: "1" },
+			stdout: "pipe",
+			stderr: "pipe",
+		},
+	);
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+		child.exited,
+	]);
+	expect(exitCode, `${stdout}\n${stderr}`).toBe(0);
+}
 
 afterEach(async () => {
 	try {
@@ -45,13 +65,14 @@ afterEach(async () => {
 
 describe("MCP stdio transport lifecycle", () => {
 	test("close and reconnect dispose the old owned child tree", async () => {
+		vi.restoreAllMocks();
+		if (process.env[STDIO_LIFECYCLE_ISOLATION] !== "1") {
+			await runIsolatedStdioLifecycleTest();
+			return;
+		}
 		const before = liveOwnedProcessCount();
 		const pidFile = `/tmp/gjc-mcp-stdio-${Date.now()}-${Math.random().toString(36).slice(2)}.pid`;
-		const command = [
-			"node",
-			"-e",
-			`const fs=require('fs'); const cp=require('child_process'); const child=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:false,stdio:'ignore'}); const pidFile=${JSON.stringify(pidFile)}; fs.writeFileSync(pidFile+'.tmp', String(child.pid)); fs.renameSync(pidFile+'.tmp', pidFile); setInterval(()=>{},1000);`,
-		];
+		const command = [process.execPath, path.join(import.meta.dir, "fixtures", "stdio-process-tree.ts"), pidFile];
 		const transport = new StdioTransport({ command: command[0], args: command.slice(1), timeout: 500 });
 		await transport.connect();
 		const oldChildPid = await waitForPid(pidFile);
