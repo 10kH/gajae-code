@@ -1158,6 +1158,66 @@ it("applies benchmark-only GC and secondary-artifact controls to bounded first-o
 	}
 });
 
+it("routes auto mode eagerly below the threshold and bounded above it", async () => {
+	const storage = new MemorySessionStorage();
+	const records = [
+		{ type: "session", version: 5, id: "auto-route", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	const transcript = `${records.map(record => JSON.stringify(record)).join("\n")}\n`;
+	const eagerFile = "/sessions/auto-route-eager.jsonl";
+	storage.writeTextSync(eagerFile, transcript);
+	const eager = await SessionManager.open(
+		eagerFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"auto",
+	);
+	try {
+		expect(eager.getSessionMemoryStats()).toMatchObject({
+			sidecarEnabled: false,
+			lazyReopenAttempted: false,
+		});
+		expect(eager.getEntry("old")).toMatchObject({ id: "old" });
+	} finally {
+		await eager.close();
+	}
+
+	const boundedFile = "/sessions/auto-route-bounded.jsonl";
+	storage.writeTextSync(boundedFile, transcript.replace('"auto-route"', '"auto-route-bounded"'));
+	SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1;
+	let bounded: SessionManager | undefined;
+	try {
+		bounded = await SessionManager.open(
+			boundedFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"auto",
+		);
+		expect(bounded.getSessionMemoryStats()).toMatchObject({
+			sidecarEnabled: true,
+			lazyReopenAttempted: true,
+			lazyReopenSucceeded: true,
+		});
+		expect(bounded.getEntry("old")).toMatchObject({ id: "old" });
+	} finally {
+		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
+		await bounded?.close();
+	}
+});
+
 it("selects the latest exact compaction boundary in one semantic parse pass", async () => {
 	const storage = new MemorySessionStorage();
 	const sessionFile = "/sessions/bounded-first-open-latest-compaction.jsonl";

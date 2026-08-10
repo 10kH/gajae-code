@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
+- Bounded cold-session resume now uses automatic size routing, keeps ordinary sessions eager, admits two-GiB transcripts with fork-header headroom, and reduces first-open work with reusable scanning, buffered sidecar writes, explicit GC controls, and a single full transcript JSON pass.
 - Memory-pressure sweeps now request asynchronous garbage collection instead of forcing a stop-the-world collection on the main event loop, preventing periodic input and rendering stalls under the opt-in memory guard.
 - Follow-up queue auto-continuation now waits for compaction and foreground bash/eval work to settle, preventing queued prompts from starting a model turn concurrently with those operations.
 - Follow-up queue submissions now defer slash/skill text during foreground bash/eval work instead of invoking a competing custom-message turn.

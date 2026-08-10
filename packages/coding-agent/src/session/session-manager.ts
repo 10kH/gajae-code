@@ -448,6 +448,8 @@ export interface SessionManagerObservabilityStats {
 	pathOnlyContextBuildCount: number;
 }
 
+export type SessionMemoryMode = "off" | "shadow" | "enabled" | "auto";
+
 export type SessionMemoryGcStrategy = "current" | "none" | "async" | "pressure";
 export type SessionMemorySecondaryArtifactMode = "auto" | "enabled" | "disabled";
 
@@ -6372,6 +6374,8 @@ export const SessionManagerTestHooks: {
 	firstOpenGcStrategy?: SessionMemoryGcStrategy;
 	/** Internal first-open secondary-artifact mode override; omitted means auto. */
 	secondaryArtifactMode?: SessionMemorySecondaryArtifactMode;
+	/** Test-only transcript threshold override for automatic routing. */
+	autoModeMinTranscriptBytesOverride?: number;
 } = {};
 
 function materializedCacheMaxBytes(): number {
@@ -6379,6 +6383,14 @@ function materializedCacheMaxBytes(): number {
 	if (override === undefined) return MATERIALIZED_CACHE_MAX_BYTES;
 	if (!Number.isSafeInteger(override) || override < 0)
 		throw new RangeError("materializedCacheMaxBytesOverride must be a non-negative safe integer.");
+	return override;
+}
+
+function autoModeMinTranscriptBytes(): number {
+	const override = SessionManagerTestHooks.autoModeMinTranscriptBytesOverride;
+	if (override === undefined) return EAGER_RESUME_TRANSCRIPT_MAX_BYTES + 1;
+	if (!Number.isSafeInteger(override) || override < 1)
+		throw new RangeError("autoModeMinTranscriptBytesOverride must be a positive safe integer.");
 	return override;
 }
 
@@ -6639,7 +6651,7 @@ export class SessionManager {
 	#consecutiveSidecarBuildFailures = 0;
 	#firstOpenTelemetry: SessionMemoryFirstOpenTelemetry = emptyFirstOpenTelemetry();
 	#sessionMemoryAutoDisabledReason: string | undefined;
-	#sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow";
+	#sessionMemoryMode: SessionMemoryMode = "shadow";
 	#lazyReopenAttempted = false;
 	#lazyReopenSucceeded = false;
 	#lazyReopenFallbackReason: string | undefined;
@@ -7078,7 +7090,7 @@ export class SessionManager {
 		prepared.adopt();
 		if (rebuildSidecars && this.persist && this.#sessionFile) {
 			this.#buildDisposableSidecars(this.#fileEntries);
-			if (this.#sessionMemoryMode === "enabled") this.#retireColdEntries();
+			if (this.#effectiveSessionMemoryMode() === "enabled") this.#retireColdEntries();
 		}
 		if (predecessor !== successor) this.#disposeResidentTextStore(predecessor);
 		prepared.releaseReferences();
@@ -7276,11 +7288,18 @@ export class SessionManager {
 
 	async #tryInitSessionFileFromSidecar(sessionFile: string): Promise<boolean> {
 		if (
-			this.#sessionMemoryMode !== "enabled" ||
+			(this.#sessionMemoryMode !== "enabled" && this.#sessionMemoryMode !== "auto") ||
 			this.destination.kind === "managed" ||
 			typeof this.storage.readRangeSync !== "function"
 		)
 			return false;
+		if (this.#sessionMemoryMode === "auto") {
+			try {
+				if (this.#effectiveSessionMemoryMode(this.storage.statSync(sessionFile).size) !== "enabled") return false;
+			} catch {
+				return false;
+			}
+		}
 		this.#lazyReopenAttempted = true;
 		this.#lazyReopenSucceeded = false;
 		this.#lazyReopenFallbackReason = "proof_invalid";
@@ -7501,11 +7520,18 @@ export class SessionManager {
 	 */
 	async #tryBoundedFirstOpen(sessionFile: string): Promise<boolean> {
 		if (
-			this.#sessionMemoryMode !== "enabled" ||
+			(this.#sessionMemoryMode !== "enabled" && this.#sessionMemoryMode !== "auto") ||
 			this.destination.kind === "managed" ||
 			typeof this.storage.readRangeSync !== "function"
 		)
 			return false;
+		if (this.#sessionMemoryMode === "auto") {
+			try {
+				if (this.#effectiveSessionMemoryMode(this.storage.statSync(sessionFile).size) !== "enabled") return false;
+			} catch {
+				return false;
+			}
+		}
 		this.#lazyReopenAttempted = true;
 		this.#lazyReopenSucceeded = false;
 		const strategy = firstOpenGcStrategy();
@@ -8193,7 +8219,7 @@ export class SessionManager {
 			? resolvedSessionFile.slice(0, -6)
 			: resolvedSessionFile;
 		const publishedSidecarWasPresent =
-			this.#sessionMemoryMode === "enabled" &&
+			this.#effectiveSessionMemoryMode() === "enabled" &&
 			this.storage.existsSync(`${sidecarRoot}/.session-memory.spill.commit`);
 		if (await this.#tryInitSessionFileFromSidecar(resolvedSessionFile)) {
 			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
@@ -10465,18 +10491,18 @@ export class SessionManager {
 			this.#sidecarRuntime = undefined;
 			return;
 		}
-		if (this.#sessionMemoryMode === "off") {
+		if (this.#effectiveSessionMemoryMode() === "off") {
 			this.#sidecarRuntime = undefined;
 			return;
 		}
 		try {
 			this.#buildDisposableSidecarsUnsafe(entries);
 			const runtime = this.#sidecarRuntime;
-			if (this.#sessionMemoryMode === "shadow" && runtime?.parentArtifact) {
+			if (this.#effectiveSessionMemoryMode() === "shadow" && runtime?.parentArtifact) {
 				runtime.blockCache.release(runtime.parentArtifact.chargedBytes);
 				runtime.parentArtifact = undefined;
 			}
-			if (this.#sessionMemoryMode === "shadow" && runtime?.enabled && !runtime.sidecarIneligible) {
+			if (this.#effectiveSessionMemoryMode() === "shadow" && runtime?.enabled && !runtime.sidecarIneligible) {
 				this.#compareShadowParity(runtime, entries);
 			}
 			if (runtime?.enabled && !runtime.sidecarIneligible) this.#consecutiveSidecarBuildFailures = 0;
@@ -10654,7 +10680,7 @@ export class SessionManager {
 		let operationError: unknown;
 		let closeError: unknown;
 		const parentBuilder = new BoundedParentArtifactBuilder();
-		const enabledBuild = this.#sessionMemoryMode === "enabled";
+		const enabledBuild = this.#effectiveSessionMemoryMode() === "enabled";
 		const secondaryArtifactsEligible =
 			enabledBuild &&
 			sessionEntries.length <= PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS &&
@@ -13507,9 +13533,9 @@ export class SessionManager {
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
-		if (this.#sessionMemoryMode !== "off") {
+		if (this.#effectiveSessionMemoryMode() !== "off") {
 			this.#buildDisposableSidecars(this.#fileEntries);
-			if (this.#sessionMemoryMode === "enabled") this.#retireColdEntries();
+			if (this.#effectiveSessionMemoryMode() === "enabled") this.#retireColdEntries();
 		}
 	}
 
@@ -13537,9 +13563,9 @@ export class SessionManager {
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
 		});
-		if (this.#sessionMemoryMode !== "off") {
+		if (this.#effectiveSessionMemoryMode() !== "off") {
 			this.#buildDisposableSidecars(this.#fileEntries);
-			if (this.#sessionMemoryMode === "enabled") this.#retireColdEntries();
+			if (this.#effectiveSessionMemoryMode() === "enabled") this.#retireColdEntries();
 		}
 	}
 
@@ -14118,7 +14144,21 @@ export class SessionManager {
 		};
 	}
 
-	setSessionMemoryMode(mode: "off" | "shadow" | "enabled"): void {
+	#effectiveSessionMemoryMode(size?: number): Exclude<SessionMemoryMode, "auto"> {
+		if (this.#sessionMemoryMode !== "auto") return this.#sessionMemoryMode;
+		if (this.destination.kind === "managed") return "off";
+		let transcriptBytes = size;
+		if (transcriptBytes === undefined && this.#sessionFile && this.storage.existsSync(this.#sessionFile)) {
+			try {
+				transcriptBytes = this.storage.statSync(this.#sessionFile).size;
+			} catch {
+				return "off";
+			}
+		}
+		return transcriptBytes !== undefined && transcriptBytes >= autoModeMinTranscriptBytes() ? "enabled" : "off";
+	}
+
+	setSessionMemoryMode(mode: SessionMemoryMode): void {
 		const retainedColdRuntime = this.#coldSidecarActive();
 		this.#sessionMemoryMode = mode;
 		if (mode === "off") {
@@ -15056,7 +15096,8 @@ export class SessionManager {
 		}
 		if (
 			this.destination.kind !== "managed" &&
-			(sidecarAppendCharge > 0 || (residentEntry.type === "compaction" && this.#sessionMemoryMode === "enabled"))
+			(sidecarAppendCharge > 0 ||
+				(residentEntry.type === "compaction" && this.#effectiveSessionMemoryMode() === "enabled"))
 		) {
 			const writer = this.#persistWriter;
 			if (writer?.isOpen()) {
@@ -15118,7 +15159,7 @@ export class SessionManager {
 		if (
 			entry.type === "compaction" &&
 			transcriptDurableForSidecar &&
-			this.#sessionMemoryMode === "enabled" &&
+			this.#effectiveSessionMemoryMode() === "enabled" &&
 			this.#sessionFile &&
 			this.storage.existsSync(this.#sessionFile)
 		) {
@@ -16830,7 +16871,7 @@ export class SessionManager {
 
 	async #tryForkFromBoundedSource(sourcePath: string, expectedIdentity?: ResumeSessionIdentity): Promise<boolean> {
 		if (
-			this.#sessionMemoryMode !== "enabled" ||
+			this.#effectiveSessionMemoryMode() !== "enabled" ||
 			this.destination.kind === "managed" ||
 			typeof this.storage.readRangeSync !== "function" ||
 			typeof this.storage.openStagedWriter !== "function"
@@ -17010,7 +17051,7 @@ export class SessionManager {
 		snapshot: CapturedSessionTranscriptSnapshot,
 	): Promise<StrictSessionForkResult | undefined> {
 		if (
-			this.#sessionMemoryMode !== "enabled" ||
+			this.#effectiveSessionMemoryMode(snapshot.identity.size) !== "enabled" ||
 			this.destination.kind === "managed" ||
 			typeof snapshot.storage.openStagedWriter !== "function" ||
 			(snapshot.storage instanceof FileSessionStorage && !snapshot.storage.existsSync(this.destination.directory))
@@ -17146,7 +17187,7 @@ export class SessionManager {
 		destinationInput?: SessionDestinationInput,
 		storage: SessionStorage = new FileSessionStorage(),
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
-		sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow",
+		sessionMemoryMode: SessionMemoryMode = "shadow",
 	): Promise<SessionManager> {
 		const destination = destinationFor(cwd, destinationInput, storage);
 		const managedSourcePath =
@@ -17157,13 +17198,13 @@ export class SessionManager {
 		const manager = new SessionManager(cwd, dir, true, storage, destination);
 		manager.#sessionMemoryMode = sessionMemoryMode;
 		if (
-			sessionMemoryMode === "enabled" &&
+			manager.#effectiveSessionMemoryMode(storage.statSync(managedSourcePath).size) === "enabled" &&
 			destination.kind !== "managed" &&
 			storage instanceof FileSessionStorage &&
 			(await manager.#tryForkFromBoundedSource(managedSourcePath))
 		)
 			return manager;
-		if (sessionMemoryMode === "enabled" && destination.kind !== "managed") {
+		if (manager.#effectiveSessionMemoryMode(storage.statSync(managedSourcePath).size) === "enabled" && destination.kind !== "managed") {
 			const inspected = inspectTranscriptBounded(managedSourcePath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
 			if (
 				inspected.ok &&
@@ -17209,7 +17250,7 @@ export class SessionManager {
 		destinationInput?: SessionDestinationInput,
 		storage: SessionStorage = new FileSessionStorage(),
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
-		sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow",
+		sessionMemoryMode: SessionMemoryMode = "shadow",
 	): Promise<SessionManager> {
 		const destination =
 			destinationInput === undefined
@@ -17224,7 +17265,9 @@ export class SessionManager {
 			const inspected = inspectTranscriptBounded(
 				filePath,
 				storage,
-				sessionMemoryMode === "enabled" ? BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES : RESUME_TRANSCRIPT_MAX_BYTES,
+				sessionMemoryMode === "enabled" || sessionMemoryMode === "auto"
+					? BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES
+					: RESUME_TRANSCRIPT_MAX_BYTES,
 			);
 			if (!inspected.ok) {
 				if (inspected.error.reason === "missing") {
@@ -17289,7 +17332,7 @@ export class SessionManager {
 		store: ManagedSessionDescendantStore,
 		storage: SessionStorage = new FileSessionStorage(),
 		cwdOverride?: string,
-		sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow",
+		sessionMemoryMode: SessionMemoryMode = "shadow",
 	): Promise<SessionManager> {
 		if (destination.kind !== "managed" || !trustedSessionDestinations.has(destination))
 			throw new Error("Nested managed session authority is unavailable");
@@ -17449,10 +17492,14 @@ export class SessionManager {
 		cwd: string,
 		destinationInput?: SessionDestinationInput,
 		_migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
-		sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow",
+		sessionMemoryMode: SessionMemoryMode = "shadow",
 	): Promise<StrictSessionForkResult> {
 		const destination = destinationFor(cwd, destinationInput, snapshot.storage);
-		if (sessionMemoryMode === "enabled" && destination.kind !== "managed") {
+		if (
+			(sessionMemoryMode === "enabled" ||
+				(sessionMemoryMode === "auto" && snapshot.identity.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES)) &&
+			destination.kind !== "managed"
+		) {
 			const boundedManager = new SessionManager(cwd, destination.directory, true, snapshot.storage, destination);
 			boundedManager.#sessionMemoryMode = sessionMemoryMode;
 			const bounded = await boundedManager.#tryForkFromCapturedBounded(snapshot);
@@ -17646,12 +17693,12 @@ export class SessionManager {
 				authorityFailure = finalSource;
 				throw new Error("Captured fork source authority changed after destination publication.");
 			}
-			if (manager.#sessionMemoryMode !== "off" && manager.#sessionFile) {
+			if (manager.#effectiveSessionMemoryMode() !== "off" && manager.#sessionFile) {
 				const runtime = manager.#sidecarRuntime;
 				const transcriptSize = manager.storage.statSync(manager.#sessionFile).size;
 				if (!runtime?.enabled || runtime.tail.transcriptSize !== transcriptSize)
 					manager.#buildDisposableSidecars(manager.#fileEntries);
-				if (manager.#sessionMemoryMode === "enabled") manager.#retireColdEntries();
+				if (manager.#effectiveSessionMemoryMode() === "enabled") manager.#retireColdEntries();
 			}
 			if (manager.#sessionFile) writeTerminalBreadcrumb(manager.cwd, manager.#sessionFile);
 			return { kind: "forked", manager };
@@ -17996,7 +18043,7 @@ export class SessionManager {
 		destinationInput?: SessionDestinationInput,
 		storage: SessionStorage = new FileSessionStorage(),
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
-		sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow",
+		sessionMemoryMode: SessionMemoryMode = "shadow",
 	): Promise<StrictSessionOpenResult> {
 		const destination =
 			destinationInput === undefined
@@ -18057,7 +18104,7 @@ export class SessionManager {
 		destinationInput?: SessionDestinationInput,
 		storage: SessionStorage = new FileSessionStorage(),
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
-		sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow",
+		sessionMemoryMode: SessionMemoryMode = "shadow",
 	): Promise<SessionManager> {
 		const destination = destinationFor(cwd, destinationInput, storage);
 		const dir = destination.directory;

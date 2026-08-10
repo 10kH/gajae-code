@@ -37,7 +37,7 @@ type Operation =
 	| "exact-authenticated-reopen"
 	| "transcript-ahead-reopen"
 	| "repeated-lifecycle";
-type SessionMemoryMode = "off" | "shadow" | "enabled";
+type SessionMemoryMode = "off" | "shadow" | "enabled" | "auto";
 type GcStrategy = "current" | "none" | "async" | "pressure";
 type SecondaryArtifacts = "current" | "off" | "lazy";
 
@@ -599,7 +599,7 @@ function operationFromArg(value: string | undefined): Operation {
 }
 
 function sessionMemoryModeFromArg(value: string | undefined): SessionMemoryMode {
-	if (value === "off" || value === "shadow" || value === "enabled") return value;
+	if (value === "off" || value === "shadow" || value === "enabled" || value === "auto") return value;
 	throw new Error(`invalid session memory mode: ${value ?? ""}`);
 }
 
@@ -1085,7 +1085,7 @@ function parseParentArgs(argv: string[]): ParentArgs {
 	}
 	if (smallComparison) {
 		if (!explicitSizes) sizesMiB = [...SMALL_COMPARISON_SIZES_MIB];
-		if (!explicitModes) sessionMemoryModes = ["enabled", "shadow", "off"];
+		if (!explicitModes) sessionMemoryModes = ["auto", "enabled", "shadow", "off"];
 	}
 	return { sizesMiB, scenarios, operations, sessionMemoryModes, gcStrategy, secondaryArtifacts, repetitions, samples, outPrefix, smallComparison };
 }
