@@ -10322,6 +10322,7 @@ export class AgentSession {
 					delayMs: 1,
 					generation: this.#promptGeneration,
 					shouldContinue: () => this.agent.hasQueuedSteering(),
+					continueQueuedOnly: true,
 				});
 			}
 			return outcome;
@@ -14927,6 +14928,7 @@ export class AgentSession {
 							generation,
 							shouldContinue: () => this.agent.hasQueuedMessages(),
 							rescheduleOnBusy: true,
+							continueQueuedOnly: true,
 							onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 							onError: error => this.#logCompactionContinuationError("queued_continue", error),
 							resourceRunId: options?.resourceRunId,
@@ -14948,6 +14950,7 @@ export class AgentSession {
 
 						shouldContinue: () => this.agent.hasQueuedMessages(),
 						rescheduleOnBusy: true,
+						continueQueuedOnly: true,
 						onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 						onError: error => this.#logCompactionContinuationError("queued_continue", error),
 						resourceRunId: options?.resourceRunId,
@@ -15207,6 +15210,7 @@ export class AgentSession {
 					suppressPredecessorAgentEnd: true,
 					shouldContinue: () => this.agent.hasQueuedMessages(),
 					rescheduleOnBusy: true,
+					continueQueuedOnly: true,
 					onSkip: reason => this.#logCompactionContinuationSkipped("queued_continue", reason),
 					onError: error => this.#logCompactionContinuationError("queued_continue", error),
 					resourceRunId: options?.resourceRunId,
