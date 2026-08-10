@@ -43,7 +43,7 @@ async function expectRetainedAuthorityDeleteSucceeded(
 	sessionId: string,
 	sessionPath: string,
 ): Promise<void> {
-	expect(response).toMatchObject({ type: "broker_response", ok: true, result: { sessionId } });
+	expect(response).toMatchObject({ ok: true, operation: "session.delete", result: { sessionId } });
 	await expect(fs.access(sessionPath)).rejects.toMatchObject({ code: "ENOENT" });
 	await expect(fs.access(sessionPath.slice(0, -6))).rejects.toMatchObject({ code: "ENOENT" });
 }

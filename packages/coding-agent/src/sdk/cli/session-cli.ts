@@ -262,16 +262,16 @@ export async function runSdkSessionCli(
 			} else if (isLifecycleOperation(operation)) {
 				const lifecycleService = createBrokerSessionLifecycleService(agentDir);
 				const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
-				writeOutput(
-					await lifecycleService.execute({
-						operation,
-						actor: DAEMON_CLI_LIFECYCLE_ACTOR,
-						capability: operation,
-						requestKey: idempotencyKey!,
-						target: input,
-						...(timeoutMs === undefined ? {} : { timeoutMs }),
-					} as unknown as SessionLifecycleMutationRequest),
-				);
+				const response = await lifecycleService.execute({
+					operation,
+					actor: DAEMON_CLI_LIFECYCLE_ACTOR,
+					capability: operation,
+					requestKey: idempotencyKey!,
+					target: input,
+					...(timeoutMs === undefined ? {} : { timeoutMs }),
+				} as unknown as SessionLifecycleMutationRequest);
+				writeOutput(response);
+				if (object(response)?.ok === false) setExitCode(1);
 			}
 			return;
 		}
