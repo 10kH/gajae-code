@@ -2912,9 +2912,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	async function requestSessionFrame(
 		target: CoordinatorSessionAttachment,
 		frame: Record<string, unknown>,
+		options?: { timeoutMs?: number },
 	): Promise<Record<string, unknown>> {
 		try {
-			return await router.request(target.sessionId, frame, target.generation, target.attachment);
+			return await router.request(target.sessionId, frame, target.generation, target.attachment, options);
 		} catch (error) {
 			if (error instanceof SessionRouterError)
 				throw new SdkClientError(
@@ -2932,13 +2933,19 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		idempotencyKey: string,
 	): Promise<unknown> {
 		const target = await resolveSessionAttachment(session);
+		const promptOperation =
+			operation === "turn.prompt" || operation === "turn.follow_up" || operation === "turn.abort_and_prompt";
 		const response = asRecord(
-			await requestSessionFrame(target, {
-				type: "control_request",
-				operation,
-				input,
-				idempotencyKey,
-			}),
+			await requestSessionFrame(
+				target,
+				{
+					type: "control_request",
+					operation,
+					input,
+					idempotencyKey,
+				},
+				promptOperation ? { timeoutMs: promptAckTimeoutMs } : undefined,
+			),
 		);
 		if (response?.ok === false) sdkResponse(response, operation);
 		return response;

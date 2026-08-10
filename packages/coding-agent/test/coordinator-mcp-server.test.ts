@@ -41,6 +41,7 @@ import {
 	createFixtureBrokerEnvironment,
 	createFixtureRootCleanup,
 } from "./helpers/fixture-broker-cleanup";
+import { prepareExactSessionAuthority } from "./helpers/sdk-exact-session-authority";
 
 const tempDirs: string[] = [];
 
@@ -211,6 +212,22 @@ async function createSdkControlServer(
 	const stateRoot = path.join(root, ".gjc", "coordinator-state");
 	const agentDir = path.join(root, "agent-global");
 	let createdSessions = 0;
+	for (const session of brokerSessions) {
+		if (session.live !== true) continue;
+		const sessionId = String(session.sessionId ?? session.session_id ?? "");
+		if (!sessionId) continue;
+		const cwd = root;
+		const authority = await prepareExactSessionAuthority({
+			agentDir,
+			cwd,
+			sessionId,
+			url: "ws://sdk.example.test",
+			token: "test-token",
+			endpointGeneration: typeof session.endpointGeneration === "number" ? session.endpointGeneration : 1,
+		});
+		session.pid = authority.pid;
+		session.endpointMtimeMs = authority.endpointMtimeMs;
+	}
 	const routerIndex = {
 		open: async () => {},
 		refresh: async () => {},
@@ -278,16 +295,21 @@ async function createSdkControlServer(
 							await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 							await Bun.write(
 								endpointPath,
-								JSON.stringify({ url: "ws://sdk.example.test", token: "test-token" }),
+								JSON.stringify({
+									sessionId,
+									pid: process.pid,
+									url: "ws://sdk.example.test",
+									token: "test-token",
+								}),
 							);
-							await fs.utimes(endpointPath, createdSessions / 1000, createdSessions / 1000);
+							const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
 							brokerSessions.push({
 								sessionId,
 								locator: { repo: sessionCwd },
 								live: true,
 								endpointGeneration: 1,
-								pid: 10_000 + createdSessions,
-								endpointMtimeMs: createdSessions,
+								pid: process.pid,
+								endpointMtimeMs,
 							});
 							return {
 								ok: true,
@@ -377,12 +399,6 @@ async function createSdkControlServer(
 		startedAt: Date.now(),
 		heartbeatAt: Date.now(),
 	});
-	const visibleEndpointPath = path.join(root, ".gjc", "state", "sdk", "visible-session.json");
-	await Bun.write(
-		visibleEndpointPath,
-		JSON.stringify({ url: "ws://sdk.example.test", token: "session-endpoint-secret" }),
-	);
-	await fs.utimes(visibleEndpointPath, 0.001, 0.001);
 	return server;
 }
 
@@ -2879,11 +2895,6 @@ it("repairs one terminal session without deleting another session's projections"
 	];
 	const server = await createSdkControlServer(root, controls, undefined, undefined, sessions);
 	await registerSdkSession(server, root);
-	await Bun.write(
-		path.join(root, ".gjc", "state", "sdk", "other-session.json"),
-		JSON.stringify({ version: 1, url: "ws://sdk.example.test", token: "test-token" }),
-	);
-	await fs.utimes(path.join(root, ".gjc", "state", "sdk", "other-session.json"), 0.001, 0.001);
 	await expect(
 		server.callTool("gjc_coordinator_register_session", {
 			session_id: "other-session",

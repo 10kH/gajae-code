@@ -10,6 +10,7 @@ import { runSdkSessionCli } from "../src/sdk/cli/session-cli";
 import { SdkClient } from "../src/sdk/client";
 import { createSdkMcpServer } from "../src/sdk/mcp";
 import { type Adapter, OPERATIONS, type Operation } from "../src/sdk/protocol/operation-registry";
+import type { SessionAttachment } from "../src/sdk/router";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 
 type MachineAdapter = Extract<Adapter, "mcp" | "acp" | "daemonCli">;
@@ -47,6 +48,10 @@ function parityRow(adapter: Adapter, operation: Operation, secret = false): Pari
 	return row;
 }
 
+type SdkMcpServer = {
+	callTool(name: string, args?: Record<string, unknown>): Promise<unknown>;
+	close(): Promise<void>;
+};
 type AdapterFixture = {
 	repo: string;
 	agentDir: string;
@@ -54,6 +59,15 @@ type AdapterFixture = {
 	endpoint: { url: string; token: string };
 	brokerEndpoint: { url: string; token: string };
 	observed: ObservedRequest[];
+	acpRouter: {
+		request: (
+			sessionId: string,
+			frame: Record<string, unknown>,
+			generation?: number,
+			attachment?: SessionAttachment,
+		) => Promise<Record<string, unknown>>;
+	};
+	acpAttachment: SessionAttachment;
 	stop: () => Promise<void>;
 };
 
@@ -243,6 +257,37 @@ async function fixture(): Promise<AdapterFixture> {
 		pid: process.pid,
 		endpointMtimeMs,
 	});
+	const acpAttachment: SessionAttachment = {
+		sessionId,
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => undefined,
+	};
+	const acpRouter = {
+		request: async (
+			requestedSessionId: string,
+			frame: Record<string, unknown>,
+			generation?: number,
+			attachment?: SessionAttachment,
+		): Promise<Record<string, unknown>> => {
+			if (
+				requestedSessionId !== sessionId ||
+				generation !== acpAttachment.generation ||
+				attachment !== acpAttachment
+			)
+				throw new Error("ACP fixture received a non-current SessionAttachment");
+			const operation =
+				frame.type === "control_request"
+					? frame.operation
+					: frame.type === "query_request"
+						? frame.query
+						: undefined;
+			if (typeof operation !== "string")
+				return { ok: false, error: { code: "invalid_input", message: "invalid frame" } };
+			const code = expectedDomainErrors[operation];
+			return code ? { ok: false, error: { code, message: code } } : { ok: true, result: { ok: true } };
+		},
+	};
 	return {
 		repo,
 		agentDir,
@@ -250,6 +295,8 @@ async function fixture(): Promise<AdapterFixture> {
 		endpoint: productionHost.endpoint,
 		brokerEndpoint,
 		observed,
+		acpRouter,
+		acpAttachment,
 		stop: async () => {
 			await brokerOwnerForTest(agentDir)?.stop();
 			await productionHost.stop();
@@ -281,8 +328,16 @@ async function assertAcpRow(operation: Operation, secret: boolean): Promise<void
 	const expected = expectedOutcome("acp", operation, secret);
 	const before = host.observed.length;
 	const input = inputFor(operation, secret);
-	const endpoint = operation.kind === "global" ? host.brokerEndpoint : host.endpoint;
-	const adapter = await AcpSdkAdapter.connect({ client: await SdkClient.connect(endpoint.url, endpoint.token) });
+	const adapter =
+		operation.kind === "global"
+			? await AcpSdkAdapter.connect({
+					client: await SdkClient.connect(host.brokerEndpoint.url, host.brokerEndpoint.token),
+				})
+			: await AcpSdkAdapter.connect({
+					router: host.acpRouter as never,
+					attachment: host.acpAttachment,
+					sessionId: host.sessionId,
+				});
 	try {
 		if (operation.kind === "control") {
 			if (expected === "forwarded") {
@@ -315,7 +370,7 @@ async function assertAcpRow(operation: Operation, secret: boolean): Promise<void
 
 async function assertMcpRow(operation: Operation, secret: boolean): Promise<void> {
 	const host = await fixture();
-	let mcp: ReturnType<typeof createSdkMcpServer> | undefined;
+	let mcp: SdkMcpServer | undefined;
 	try {
 		const expected = expectedOutcome("mcp", operation, secret);
 		const before = host.observed.length;

@@ -444,9 +444,9 @@ The `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon sh
 Provider integrations compose SDK core's `SessionRouter`; they never read endpoint files or retain URL/token credentials:
 
 ```js
-import { SessionRouter } from "@gajae-code/coding-agent/sdk/router";
+import { router } from "@gajae-code/coding-agent/sdk";
 
-const router = new SessionRouter({
+const sessionRouter = new router.SessionRouter({
   agentDir,
   deps: {
     onAttachment: (attachment) => provider.bind(attachment.sessionId, attachment),
@@ -455,8 +455,8 @@ const router = new SessionRouter({
   },
 });
 
-await router.start();
-const attachment = router.attachment(sessionId);
+await sessionRouter.start();
+const attachment = sessionRouter.attachment(sessionId);
 if (!attachment) throw new Error("session attachment unavailable");
 await attachment.send({ type: "reply", id: actionId, answer });
 ```

@@ -203,8 +203,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 139 privatizes raw SDK clients and removes the Python transport package.
  * Generation 140 retires failed handshakes and holds provisional frames until publication.
  * Generation 141 awaits the provider handshake before Router replay to prevent retained-event deadlock.
+ * Generation 142 migrates live adoption reservations and applies create throttling to topic adoption.
  */
-export const DAEMON_GENERATION = 141;
+export const DAEMON_GENERATION = 142;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

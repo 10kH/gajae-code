@@ -359,9 +359,6 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 					case "retry.abort":
 						session.abortRetry();
 						return { aborted: true };
-					case "session.close":
-						await session.sessionManager.flush();
-						return { closed: true };
 					case "session.rename":
 						return { renamed: await session.setSessionName(String(input.name), "user") };
 					case "session.export_html":
@@ -454,7 +451,10 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			waitForIdle: () => session.agent.waitForIdle(),
 			newSession: async () => prohibitBrokerLifecycleOperation("session.new"),
 			branch: async () => prohibitBrokerLifecycleOperation("session.branch"),
-			navigateTree: async () => prohibitBrokerLifecycleOperation("session.branch"),
+			navigateTree: async (targetId, navOptions) => {
+				const result = await session.navigateTree(targetId, { summarize: navOptions?.summarize });
+				return { cancelled: result.cancelled };
+			},
 			switchSession: async () => prohibitBrokerLifecycleOperation("session.switch"),
 			reload: async () => {
 				await session.reload();

@@ -78,6 +78,7 @@ async function routerFixture(
 		requests: Record<string, unknown>[];
 		client: SessionRouterClient;
 		emit: (frame: Record<string, unknown>) => void;
+		reconnect: () => void;
 	}> = [];
 	const attachments: SessionAttachment[] = [];
 	const router = new SessionRouter({
@@ -88,11 +89,18 @@ async function routerFixture(
 				const sent: Record<string, unknown>[] = [];
 				const requests: Record<string, unknown>[] = [];
 				let handler: ((frame: Record<string, unknown>) => void) | undefined;
+				let reconnectHandler: (() => void) | undefined;
 				const client: SessionRouterClient = {
 					onFrame: next => {
 						handler = next;
 						return () => {
 							if (handler === next) handler = undefined;
+						};
+					},
+					onReconnect: next => {
+						reconnectHandler = next;
+						return () => {
+							if (reconnectHandler === next) reconnectHandler = undefined;
 						};
 					},
 					request: async operation => {
@@ -102,7 +110,13 @@ async function routerFixture(
 					close: async () => {},
 					send: frame => sent.push(frame),
 				};
-				clients.push({ sent, requests, client, emit: frame => handler?.(frame) });
+				clients.push({
+					sent,
+					requests,
+					client,
+					emit: frame => handler?.(frame),
+					reconnect: () => reconnectHandler?.(),
+				});
 				return client;
 			},
 			onAttachment: attachment => {
@@ -328,6 +342,57 @@ describe("SessionRouter dispatch authority", () => {
 			expect(phases).toEqual(["ready", "handshake-sent"]);
 			expect(fixture.clients[0]?.sent.map(frame => frame.type)).toEqual(["hello", "event_replay"]);
 			expect(fixture.clients[0]?.requests.map(frame => frame.type)).toEqual(["event_replay"]);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("revalidates exact endpoint authority before publication handshake sends", async () => {
+		let authority: { pid: number; endpointMtimeMs: number } | undefined;
+		let endpointFile = "";
+		let sessionId = "";
+		const fixture = await routerFixture({
+			start: false,
+			onAttachmentReady: async attachment => {
+				if (!authority) throw new Error("test authority unavailable");
+				authority.pid = 43;
+				fs.writeFileSync(
+					endpointFile,
+					JSON.stringify({ sessionId, url: "ws://router.test", token: "replacement", pid: 43 }),
+				);
+				authority.endpointMtimeMs = fs.statSync(endpointFile).mtimeMs;
+				await attachment.send({ type: "hello" });
+			},
+		});
+		authority = fixture.authority;
+		endpointFile = fixture.endpointFile;
+		sessionId = fixture.sessionId;
+		await fixture.router.start();
+		expect(fixture.clients[0]?.sent).toEqual([]);
+		expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+		await fixture.router.stop();
+	});
+
+	test("reruns the provider handshake before replay after reconnect", async () => {
+		let readyCount = 0;
+		const fixture = await routerFixture({
+			onAttachmentReady: async attachment => {
+				readyCount++;
+				await attachment.send({ type: "hello", readyCount });
+				await attachment.send({ type: "event_replay", id: `provider-replay-${readyCount}` });
+			},
+		});
+		try {
+			expect(readyCount).toBe(1);
+			fixture.clients[0]?.reconnect();
+			for (let attempt = 0; readyCount < 2 && attempt < 50; attempt++) await Bun.sleep(10);
+			expect(readyCount).toBe(2);
+			expect(fixture.clients[0]?.sent.map(frame => frame.type)).toEqual([
+				"hello",
+				"event_replay",
+				"hello",
+				"event_replay",
+			]);
 		} finally {
 			await fixture.router.stop();
 		}

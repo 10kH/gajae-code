@@ -103,11 +103,13 @@ type AttachedSession = {
 	readonly endpointMtimeMs: number;
 	readonly runEpoch: number;
 	readonly client: SessionRouterClient;
+	readonly indexed: IndexedSession;
 	readonly cursor: { seq: number };
 	readonly barrier: ReplayBarrier;
 	readonly capability: SessionAttachment;
 	published: boolean;
 	initializingPublication: boolean;
+	readyTail: Promise<void>;
 	readonly publication: { promise: Promise<void>; resolve: () => void; reject: (reason?: unknown) => void };
 	dispose: () => void;
 };
@@ -399,6 +401,7 @@ export class SessionRouter {
 		frame: Record<string, unknown>,
 		expectedGeneration?: number,
 		expectedAttachment?: SessionAttachment,
+		options?: { timeoutMs?: number },
 	): Promise<Record<string, unknown>> {
 		await this.#serialReconcile(this.#runEpoch);
 		const attached = this.#sessions.get(sessionId);
@@ -407,7 +410,7 @@ export class SessionRouter {
 			throw new SessionRouterError("pre_send", "SDK session endpoint changed before command dispatch.");
 		if (expectedAttachment !== undefined && attached.capability !== expectedAttachment)
 			throw new SessionRouterError("pre_send", "SDK session attachment changed before command dispatch.");
-		const response = await attached.client.request(this.#prepareFrame(attached, frame));
+		const response = await attached.client.request(this.#prepareFrame(attached, frame), options);
 		if (
 			!this.#attachmentPublished(attached) ||
 			(expectedGeneration !== undefined && attached.generation !== expectedGeneration) ||
@@ -747,7 +750,18 @@ export class SessionRouter {
 			send: async (frame: Record<string, unknown>) => {
 				if (!attached || !this.#attachmentPublished(attached))
 					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
-				if (!attached.initializingPublication) await this.#serialReconcile(runEpoch);
+				if (attached.initializingPublication) {
+					const endpoint = await this.#readEndpoint(attached.indexed);
+					if (
+						!endpoint ||
+						endpoint.url !== attached.endpoint.url ||
+						endpoint.token !== attached.endpoint.token ||
+						endpoint.pid !== attached.pid
+					) {
+						await this.#retireAttachment(attached);
+						throw new SessionRouterError("pre_send", "SDK session attachment changed during publication.");
+					}
+				} else await this.#serialReconcile(runEpoch);
 				if (!attached || !this.#attachmentPublished(attached))
 					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 				attached.client.send(this.#prepareFrame(attached, frame));
@@ -765,7 +779,7 @@ export class SessionRouter {
 			this.#schedule(task);
 		});
 		const disposeReconnect = client.onReconnect?.(() => {
-			if (attached) this.#schedule(this.#replayAttachment(attached, attached.cursor.seq));
+			if (attached) this.#schedule(this.#reinitializeAttachment(attached));
 		});
 		attached = {
 			initializingPublication: false,
@@ -777,6 +791,8 @@ export class SessionRouter {
 			generation: indexed.endpointGeneration,
 			runEpoch,
 			client,
+			indexed,
+			readyTail: Promise.resolve(),
 			cursor: { seq: resumeSeq },
 			barrier,
 			capability,
@@ -886,6 +902,36 @@ export class SessionRouter {
 		return true;
 	}
 
+	async #reinitializeAttachment(attached: AttachedSession): Promise<void> {
+		const previous = attached.readyTail;
+		const current = previous
+			.catch(() => undefined)
+			.then(async () => {
+				if (!this.#attachmentLive(attached)) return;
+				const endpoint = await this.#readEndpoint(attached.indexed);
+				if (
+					!endpoint ||
+					endpoint.url !== attached.endpoint.url ||
+					endpoint.token !== attached.endpoint.token ||
+					endpoint.pid !== attached.pid
+				) {
+					await this.#retireAttachment(attached);
+					return;
+				}
+				attached.initializingPublication = true;
+				try {
+					await this.#deps.onAttachmentReady?.(attached.capability);
+				} catch {
+					await this.#retireAttachment(attached);
+					return;
+				} finally {
+					attached.initializingPublication = false;
+				}
+				if (this.#attachmentLive(attached)) await this.#replayAttachment(attached, attached.cursor.seq);
+			});
+		attached.readyTail = current;
+		await current;
+	}
 	#reviveTransport(attached: AttachedSession): void {
 		const connect = attached.client.connect?.bind(attached.client);
 		if (!connect || this.#reviving.has(attached.id)) return;

@@ -20,8 +20,8 @@ CLI / daemon session commands / ACP / MCP
 - **Interactive and print CLI**: `src/cli.ts` routes ordinary CLI work to `src/main.ts`, which owns local session setup and interactive or one-shot execution.
 - **Internal SDK transport client**: `src/sdk/client/client.ts` supplies `SdkClient` only to Broker, `SessionRouter`, and trusted in-process adapters. It is not exported from `@gajae-code/coding-agent/sdk` and is not a public attachment surface.
 
-- **Daemon session CLI**: `gjc daemon session ...` is implemented by `src/commands/daemon.ts` and `src/sdk/cli/session-cli.ts`. It discovers the SDK broker/session endpoint and invokes typed SDK `list`, `control`, `query`, or `global` operations; it does not launch a private transport.
-- **ACP**: `src/modes/acp/acp-mode.ts` creates the ACP connection and `src/modes/acp/acp-agent.ts` adapts ACP requests to `AcpSdkAdapter` and `SdkClient`. ACP must keep session authority in the SDK.
+- **Daemon session CLI**: `gjc daemon session ...` is implemented by `src/commands/daemon.ts` and `src/sdk/cli/session-cli.ts`. It bootstraps the Broker for lifecycle globals and uses `SessionRouter` for exact live controls and queries; it never receives endpoint credentials or launches a private transport.
+- **ACP**: `src/modes/acp/acp-mode.ts` creates the ACP connection and `src/modes/acp/acp-agent.ts` adapts ACP requests through Broker lifecycle services and exact `SessionRouter` attachments.
 - **MCP**: `gjc mcp-serve sdk` dispatches to `src/sdk/mcp/server.ts`. `gjc mcp-serve coordinator` (and the `hermes` compatibility alias) dispatches to `src/coordinator-mcp/server.ts`.
 
 ## SDK ownership and authority
@@ -65,7 +65,7 @@ must never be logged.
 
 ## Coordinator MCP routing
 
-`src/coordinator-mcp/server.ts` is a coordinator-facing MCP server, not a second session host. It resolves broker or session discovery data, connects through `SdkClient`, and calls SDK `global`, `query`, or `control` operations. Coordinator policy and artifact validation belong in `src/coordinator-mcp/`; session mutation belongs behind the SDK operation registry.
+`src/coordinator-mcp/server.ts` is a coordinator-facing MCP server, not a second session host. It submits lifecycle operations through the Broker service and live controls/queries through exact `SessionRouter` attachments; it never receives endpoint credentials or constructs a per-session transport client.
 
 The coordinator may manage its own coordinator records and artifacts, but it must not import or mutate `AgentSession` or SDK host-control internals directly.
 
@@ -73,8 +73,8 @@ The coordinator may manage its own coordinator records and artifacts, but it mus
 
 1. Define or extend the operation contract in `src/sdk/protocol/operation-registry.ts`.
 2. Implement the operation in the appropriate SDK host control or query handler.
-3. Expose it through `SdkClient` and validate adapter input with the protocol validation helpers.
-4. Route ACP, SDK MCP, daemon-session CLI, or coordinator MCP through that SDK client API. Do not duplicate the operation in a transport-specific handler.
+3. Expose live operations through `SessionRouter` and validate adapter input with the protocol helpers.
+4. Route ACP, SDK MCP, daemon-session CLI, or Coordinator MCP through exact opaque attachments. Do not duplicate the operation or open endpoint transports in an adapter.
 5. Add focused tests for success, validation failure, authorization/disposition, and lifecycle behavior.
 
 Choose the public surface deliberately:
@@ -82,7 +82,7 @@ Choose the public surface deliberately:
 - Use the **SDK** for programmatic control and queries.
 - Use **ACP** for ACP clients; keep it an SDK adapter.
 - Use **SDK MCP** for agent-facing SDK tools.
-- Use **Coordinator MCP** for coordinator workflow tools; it routes through `SdkClient`.
+- Use **Coordinator MCP** for coordinator workflow tools; it routes lifecycle intent through Broker services and live work through `SessionRouter`.
 - Use **daemon session CLI** for operator invocation of SDK operations.
 
 ## Removed surfaces

@@ -236,6 +236,18 @@ describe("SessionLifecycleService", () => {
 		expect(result).toMatchObject({ ok: false, certainty: "uncertain", error: { code: "malformed_response" } });
 	});
 
+	it("rejects a successful lifecycle response that omits its result record", async () => {
+		const { service, client } = serviceWith({ ok: true });
+		const result = await service.resume({
+			actor,
+			capability: "session.resume",
+			requestKey: "missing-result",
+			target: { sessionId: "session-1" },
+		});
+		expect(result).toMatchObject({ ok: false, certainty: "uncertain", error: { code: "malformed_response" } });
+		expect(client.calls).toHaveLength(1);
+	});
+
 	it("preserves a successful lifecycle result when SDK cleanup fails", async () => {
 		const ensureSpy = spyOn(brokerEnsure, "ensureBroker").mockResolvedValue({} as never);
 		const discoverySpy = spyOn(sdkDiscovery, "readSdkBrokerDiscovery").mockResolvedValue({
@@ -308,6 +320,66 @@ describe("SessionLifecycleService", () => {
 			expect(listSpy).not.toHaveBeenCalled();
 		} finally {
 			listSpy.mockRestore();
+		}
+	});
+	it("validates external readiness before setup, normalizes create paths, and maps mkdir failures", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-lifecycle-external-"));
+		const service = new AgentDirSessionLifecycleService(root);
+		const createSpy = spyOn(service, "create").mockResolvedValue({
+			ok: true,
+			operation: "session.create",
+			result: { sessionId: "session-1" },
+		});
+		const listSpy = spyOn(service, "listRecent").mockResolvedValue({ kind: "complete", entries: [], warnings: [] });
+		try {
+			const invalidCreate = await service.createExternal({
+				actor,
+				capability: "session.create",
+				requestKey: "invalid-create-readiness",
+				readinessTimeoutMs: -2_000,
+				target: { kind: "plain_dir", path: path.join(root, "invalid") },
+			});
+			expect(invalidCreate).toMatchObject({ ok: false, certainty: "terminal", error: { code: "invalid_request" } });
+			expect(createSpy).not.toHaveBeenCalled();
+
+			const invalidResume = await service.resumeExternal({
+				actor,
+				capability: "session.resume",
+				requestKey: "invalid-resume-readiness",
+				readinessTimeoutMs: -2_000,
+				target: { sessionIdOrPrefix: "session" },
+			});
+			expect(invalidResume).toMatchObject({ kind: "unavailable" });
+			expect(listSpy).not.toHaveBeenCalled();
+
+			const requested = path.join(root, "relative-target");
+			const relative = path.relative(process.cwd(), requested);
+			await expect(
+				service.createExternal({
+					actor,
+					capability: "session.create",
+					requestKey: "relative-create",
+					target: { kind: "plain_dir", path: relative },
+				}),
+			).resolves.toMatchObject({ ok: true });
+			expect(createSpy.mock.calls[0]?.[0]).toMatchObject({
+				target: { cwd: requested, stateRoot: path.join(requested, ".gjc", "state") },
+			});
+
+			const parentFile = path.join(root, "not-a-directory");
+			await fs.writeFile(parentFile, "file");
+			const mkdirFailure = await service.createExternal({
+				actor,
+				capability: "session.create",
+				requestKey: "mkdir-failure",
+				target: { kind: "plain_dir", path: path.join(parentFile, "child") },
+			});
+			expect(mkdirFailure).toMatchObject({ ok: false, certainty: "terminal", error: { code: "ENOTDIR" } });
+			expect(createSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			createSpy.mockRestore();
+			listSpy.mockRestore();
+			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
 });

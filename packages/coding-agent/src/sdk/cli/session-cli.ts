@@ -145,24 +145,38 @@ function isLifecycleOperation(operation: string): operation is LifecycleMutation
 
 async function bounded<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
-	const timeout = new Promise<never>((_, reject) => {
-		timer = setTimeout(() => reject(new SdkClientError("timeout", message)), timeoutMs);
-	});
+	const timeout = Promise.withResolvers<never>();
 	try {
-		return await Promise.race([promise, timeout]);
+		timer = setTimeout(() => timeout.reject(new SdkClientError("timeout", message)), timeoutMs);
+		return await Promise.race([promise, timeout.promise]);
 	} finally {
 		if (timer) clearTimeout(timer);
 	}
 }
+function reportRouterCleanupFailure(error: unknown): void {
+	const message = error instanceof Error ? error.message : String(error);
+	process.stderr.write(`SDK session Router cleanup failed: ${message}\n`);
+}
 
 async function withRouter<T>(agentDir: string, action: (router: SessionRouter) => Promise<T>): Promise<T> {
 	const router = new SessionRouter({ agentDir });
+	let result!: T;
+	let actionFailed = false;
+	let actionError: unknown;
 	try {
 		await bounded(router.start(), ROUTER_START_TIMEOUT_MS, "SDK session Router startup timed out.");
-		return await action(router);
-	} finally {
-		await bounded(router.stop(), ROUTER_STOP_TIMEOUT_MS, "SDK session Router shutdown timed out.");
+		result = await action(router);
+	} catch (error) {
+		actionFailed = true;
+		actionError = error;
 	}
+	try {
+		await bounded(router.stop(), ROUTER_STOP_TIMEOUT_MS, "SDK session Router shutdown timed out.");
+	} catch (error) {
+		reportRouterCleanupFailure(error);
+	}
+	if (actionFailed) throw actionError;
+	return result;
 }
 
 async function paginatedSessionList(

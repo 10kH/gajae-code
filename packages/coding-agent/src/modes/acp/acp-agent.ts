@@ -52,7 +52,7 @@ import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/cli
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-namespace";
 import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
-import { SessionRouter, type SessionRouterFrame } from "../../sdk/router";
+import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
 import {
 	buildToolCallStartUpdate,
 	mapAgentSessionEventToAcpSessionUpdates,
@@ -130,7 +130,7 @@ type PendingAttachment = { epoch: number; task: Promise<void> };
 type SessionRecord = {
 	cwd: string;
 	adapter: AcpSdkAdapter;
-	router: SessionRouter;
+	attachment: SessionAttachment;
 	closeIdempotencyKey: string;
 	unsubscribe: () => void;
 	reconnectUnsubscribe: () => void;
@@ -571,6 +571,15 @@ function receivedSdkEvent(frame: JsonObject): ReceivedSdkEvent | undefined {
 	};
 }
 
+const ROUTER_PASSTHROUGH_FRAME_TYPES = new Set([
+	"hello",
+	"server_hello",
+	"reverse_request",
+	"reverse_cancel",
+	"reverse_request_cancel",
+	"reverse_request_cancelled",
+]);
+
 function acpFrameFromRouted(frame: SessionRouterFrame): JsonObject {
 	if (
 		frame.body.type === "activity" ||
@@ -579,12 +588,15 @@ function acpFrameFromRouted(frame: SessionRouterFrame): JsonObject {
 		frame.body.type === "agent_failed"
 	)
 		return frame.body;
+	if (typeof frame.body.type === "string" && ROUTER_PASSTHROUGH_FRAME_TYPES.has(frame.body.type)) return frame.body;
+	const connectionId = typeof frame.body.connectionId === "string" ? frame.body.connectionId : undefined;
 	return {
 		type: "event",
 		...(frame.name === undefined ? {} : { kind: frame.name }),
 		...(frame.sessionId === undefined ? {} : { sessionId: frame.sessionId }),
 		...(frame.commandId === undefined ? {} : { commandId: frame.commandId }),
 		...(frame.turnId === undefined ? {} : { turnId: frame.turnId }),
+		...(connectionId === undefined ? {} : { connectionId }),
 		payload: frame.body,
 	};
 }
@@ -1048,6 +1060,10 @@ export async function applyAcpStartupOptions(
 export class AcpAgent implements Agent {
 	readonly #connection: AgentSideConnection;
 	readonly #agentDir: string;
+	readonly #router: SessionRouter;
+	readonly #pendingRouterAdapters = new Map<string, AcpSdkAdapter>();
+	readonly #pendingRouterFrames = new Map<string, Record<string, unknown>[]>();
+	#routerStartPromise: Promise<void> | undefined;
 	readonly #sessions = new Map<string, SessionRecord>();
 	readonly #attaching = new Map<string, PendingAttachment>();
 	readonly #resolvingExisting = new Map<string, PendingAttachment>();
@@ -1080,6 +1096,26 @@ export class AcpAgent implements Agent {
 		this.#connection = connection;
 		const candidate = object(options);
 		this.#agentDir = typeof candidate?.agentDir === "string" ? candidate.agentDir : getAgentDir();
+		this.#router = new SessionRouter({
+			agentDir: this.#agentDir,
+			deps: {
+				onAttachment: attachment => {
+					const record = this.#sessions.get(attachment.sessionId);
+					const adapter = record?.adapter ?? this.#pendingRouterAdapters.get(attachment.sessionId);
+					if (!adapter) return;
+					if (record) record.attachment = attachment;
+					adapter.acceptAttachment(attachment);
+				},
+				onFrame: (attachment, frame) => {
+					const acpFrame = acpFrameFromRouted(frame);
+					const adapter =
+						this.#sessions.get(attachment.sessionId)?.adapter ??
+						this.#pendingRouterAdapters.get(attachment.sessionId);
+					if (adapter) adapter.acceptFrame(acpFrame);
+					else this.#pendingRouterFrames.get(attachment.sessionId)?.push(acpFrame);
+				},
+			},
+		});
 		this.#startupOptions = parseAcpStartupOptions(candidate?.startupOptions);
 		this.#cancelSettlementGraceMs =
 			typeof candidate?.cancelSettlementGraceMs === "number" &&
@@ -1630,6 +1666,18 @@ export class AcpAgent implements Agent {
 		return !["terminal_uncertain", "cleanup_pending", "broker_restarting", "unavailable"].includes(error.code);
 	}
 
+	async #ensureRouterReady(): Promise<void> {
+		if (!this.#routerStartPromise) {
+			let pending!: Promise<void>;
+			pending = this.#router.start().catch(error => {
+				if (this.#routerStartPromise === pending) this.#routerStartPromise = undefined;
+				throw error;
+			});
+			this.#routerStartPromise = pending;
+		}
+		await this.#routerStartPromise;
+	}
+
 	async #attachExisting(id: string, cwd: string, mcpServers: SessionLifecycleMcpServer[] = []): Promise<void> {
 		const epoch = this.#sessionEpoch(id);
 		const attached = this.#sessions.get(id);
@@ -1748,44 +1796,32 @@ export class AcpAgent implements Agent {
 
 	async #attachEndpoint(id: string, cwd: string, epoch: number, lifecycleResult?: unknown): Promise<void> {
 		let adapter: AcpSdkAdapter | undefined;
-		let router: SessionRouter | undefined;
+		const bufferedFrames: Record<string, unknown>[] = [];
+		this.#pendingRouterFrames.set(id, bufferedFrames);
 		try {
-			const bufferedFrames: Record<string, unknown>[] = [];
-			router = new SessionRouter({
-				agentDir: this.#agentDir,
-				deps: {
-					onAttachment: attachment => {
-						if (attachment.sessionId === id && adapter) adapter.acceptAttachment(attachment);
-					},
-					onFrame: (attachment, frame) => {
-						if (attachment.sessionId !== id) return;
-						const acpFrame = acpFrameFromRouted(frame);
-						if (adapter) adapter.acceptFrame(acpFrame);
-						else bufferedFrames.push(acpFrame);
-					},
-				},
-			});
-			await router.start();
+			await this.#ensureRouterReady();
 			const attachment = lifecycleResult
-				? await router.adoptLifecycleResult(lifecycleResult, { sessionId: id, cwd })
-				: router.attachment(id);
+				? await this.#router.adoptLifecycleResult(lifecycleResult, { sessionId: id, cwd })
+				: this.#router.attachment(id);
 			if (!attachment)
 				throw new AcpSdkAdapterError("unavailable", `ACP session ${id} has no current Router attachment.`);
-			let currentAttachment = router.attachment(id);
+			let currentAttachment = this.#router.attachment(id);
 			for (let attempt = 0; !currentAttachment && attempt < 40; attempt++) {
 				await Bun.sleep(50);
-				await router.reconcile();
-				currentAttachment = router.attachment(id);
+				await this.#router.reconcile();
+				currentAttachment = this.#router.attachment(id);
 			}
 			if (!currentAttachment)
 				throw new AcpSdkAdapterError("unavailable", `ACP session ${id} lost exact Router authority.`);
-			adapter = await AcpSdkAdapter.connect({
-				router,
+			adapter = new AcpSdkAdapter({
+				router: this.#router,
 				attachment: currentAttachment,
 				sessionId: id,
 				connection: this.#reverseConnection(id),
 				providers: this.#providers(),
 			});
+			this.#pendingRouterAdapters.set(id, adapter);
+			await adapter.start();
 			for (const frame of bufferedFrames) adapter.acceptFrame(frame);
 			let capabilities: JsonObject | undefined;
 			try {
@@ -1801,10 +1837,13 @@ export class AcpAgent implements Agent {
 					"This ACP client requires a newer GJC SDK session; restart the session.",
 				);
 			this.#assertSessionEpoch(id, epoch);
+			const exactAttachment = this.#router.attachment(id) ?? currentAttachment;
+			if (!exactAttachment.isCurrent())
+				throw new AcpSdkAdapterError("unavailable", `ACP session ${id} lost exact Router authority.`);
 			const record: SessionRecord = {
 				cwd,
 				adapter,
-				router,
+				attachment: exactAttachment,
 				closeIdempotencyKey: randomUUID(),
 				unsubscribe: () => {},
 				reconnectUnsubscribe: () => {},
@@ -1820,11 +1859,15 @@ export class AcpAgent implements Agent {
 				this.#recoverSessionAfterTransportFailure(id, adapter!, error),
 			);
 			this.#sessions.set(id, record);
+			this.#pendingRouterAdapters.delete(id);
+			this.#pendingRouterFrames.delete(id);
 			this.#knownSessionCwds.set(id, cwd);
 			await applyAcpPermissionMode(adapter, this.#clientCapabilities);
 			this.#assertSessionEpoch(id, epoch);
 			this.#pendingCloseIdempotencyKeys.delete(id);
 		} catch (error) {
+			this.#pendingRouterAdapters.delete(id);
+			this.#pendingRouterFrames.delete(id);
 			if (adapter && this.#sessions.get(id)?.adapter === adapter) {
 				try {
 					await this.#teardownSession(id, "attachment failed", false);
@@ -1835,10 +1878,14 @@ export class AcpAgent implements Agent {
 				try {
 					await adapter.close();
 				} catch {}
+				try {
+					await this.#router.attachment(id)?.retire?.();
+				} catch {}
+			} else {
+				try {
+					await this.#router.attachment(id)?.retire?.();
+				} catch {}
 			}
-			try {
-				await router?.stop();
-			} catch {}
 			throw error;
 		}
 	}
@@ -1938,7 +1985,7 @@ export class AcpAgent implements Agent {
 				failures.push(error);
 			}
 			try {
-				await record?.router.stop();
+				await record?.attachment.retire?.();
 			} catch (error) {
 				failures.push(error);
 			}
@@ -1969,7 +2016,7 @@ export class AcpAgent implements Agent {
 			await adapter.close();
 		} catch {}
 		try {
-			await record.router.stop();
+			await record.attachment.retire?.();
 		} catch {}
 	}
 
@@ -2146,6 +2193,7 @@ export class AcpAgent implements Agent {
 	#enqueueSdkFrame(id: string, adapter: AcpSdkAdapter, frame: JsonObject): void {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
+		if (typeof frame.connectionId === "string") record.connectionId = frame.connectionId;
 		// Ingress ordering is recorded before queued work begins.
 		this.#observeSessionActivity(record, frame);
 		// Any frame at all proves the producer is still alive, so it refreshes the
@@ -3137,6 +3185,13 @@ export class AcpAgent implements Agent {
 			} catch (error) {
 				failures.push(error);
 			}
+		}
+		this.#pendingRouterAdapters.clear();
+		this.#pendingRouterFrames.clear();
+		try {
+			await this.#router.stop();
+		} catch (error) {
+			failures.push(error);
 		}
 		if (failures.length > 0) {
 			const detail = failures
