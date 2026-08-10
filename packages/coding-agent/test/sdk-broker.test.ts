@@ -2551,6 +2551,7 @@ describe("SDK broker identity and discovery", () => {
 				endpointGeneration: 1,
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+				lifecycleRequestId: "flush-close-capability",
 			});
 			expect(await broker.handleRequest("session.close", { sessionId }, "flush-close")).toEqual({
 				ok: false,

@@ -49,6 +49,7 @@ import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import type { NotificationSessionController } from "../src/sdk/bus/session-control";
 import { SdkClient } from "../src/sdk/client";
 import { SessionSdkHost } from "../src/sdk/host";
+import type { SessionAttachment } from "../src/sdk/router/session-router";
 import { createAgentSession } from "../src/sdk/session";
 import {
 	attachLifecycleStartupCapability,
@@ -2766,12 +2767,32 @@ test("ACP permission attachment normalizes decisions through the registered prov
 			return await promise;
 		},
 	} as unknown as AgentSideConnection;
-	const adapter = await AcpSdkAdapter.connect({
-		client: new SdkClient(endpoint.url, endpoint.token),
+	const client = new SdkClient(endpoint.url, endpoint.token);
+	const routedFrame = (frame: Record<string, unknown>): Record<string, unknown> => ({
+		...frame,
+		connectionId: client.connectionId,
+	});
+	const attachment: SessionAttachment = {
+		sessionId: acpSessionId,
+		generation: 1,
+		isCurrent: () => true,
+		send: async frame => client.send(routedFrame(frame)),
+		retire: async () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async (_sessionId: string, frame: Record<string, unknown>) =>
+				await client.request(routedFrame(frame)),
+		} as never,
+		attachment,
+		sessionId: acpSessionId,
 		connection: createAcpReverseConnection(connection, acpSessionId),
 		providers: [{ capability: "permission", definitions: [] }],
 		heartbeatMs: 60_000,
 	});
+	const unsubscribe = client.onFrame(frame => adapter.acceptFrame(frame));
+	await client.connect();
+	await adapter.start();
 
 	try {
 		await waitFor(() => permissionProvider !== undefined, "ACP permission provider installation");
@@ -2826,7 +2847,9 @@ test("ACP permission attachment normalizes decisions through the registered prov
 		expect(reverseCalls.every(call => call.input.sessionId === acpSessionId)).toBe(true);
 		expect(reverseCalls.every(call => call.signal instanceof AbortSignal)).toBe(true);
 	} finally {
+		unsubscribe();
 		await adapter.close();
+		await client.close();
 		await agentSession.dispose();
 	}
 });

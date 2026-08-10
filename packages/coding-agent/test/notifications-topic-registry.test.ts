@@ -620,10 +620,10 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes replay-recovery generation 140 at serving epoch 87", () => {
+test("publishes replay-recovery generation 141 at serving epoch 87", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 140 / serving epoch 87: failed handshakes retire exact authority and accepted ambiguity stays durable.
-	expect(DAEMON_GENERATION).toBe(140);
+	// Generation 141 / serving epoch 87: replay handshakes preserve exact authority before provider activation.
+	expect(DAEMON_GENERATION).toBe(141);
 	expect(SERVING_EPOCH).toBe(87);
 });
 test("archives pending topics into retained inactive records", async () => {
