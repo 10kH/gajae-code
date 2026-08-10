@@ -91,7 +91,7 @@ async function withRuntime(
 		await fs.mkdir(path.dirname(endpointFile), { recursive: true });
 		await fs.writeFile(
 			endpointFile,
-			`${JSON.stringify({ version: 1, url: "ws://localhost:1/", token: "not-persisted", pid: process.pid })}\n`,
+			`${JSON.stringify({ version: 1, sessionId: SESSION_ID, url: "ws://localhost:1/", token: "not-persisted", pid: process.pid })}\n`,
 		);
 		const endpointMtimeMs = (await fs.stat(endpointFile)).mtimeMs;
 		const index = await new SessionIndex(agentDir).open();
