@@ -4882,6 +4882,11 @@ export class AgentSession {
 		onError?: (error: unknown) => void;
 		resourceRunId?: string;
 		maintenanceContinuation?: boolean;
+		// Queue-consuming continuations (follow-up/steer drained after execution
+		// tails settle) must run continueQueuedMessages() so they deliver the
+		// queued turn without replaying the non-assistant tail. Every other
+		// scheduled continuation keeps continue() semantics.
+		continueQueuedOnly?: boolean;
 	}): Promise<void> {
 		const predecessorAgentEndHold = options?.suppressPredecessorAgentEnd
 			? this.#reserveDeferredAgentEndForContinuation()
@@ -4969,11 +4974,11 @@ export class AgentSession {
 							this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
 						};
 						const hasQueuedMessages = this.agent.hasQueuedMessages();
-						const startsQueuedSuccessor = hasQueuedMessages;
-						const continueQueued =
-							this.agent.state.messages.at(-1)?.role === "assistant" || !hasQueuedMessages
-								? this.agent.continue.bind(this.agent)
-								: this.agent.continueQueuedMessages.bind(this.agent);
+						const startsQueuedSuccessor =
+							hasQueuedMessages && (options?.continueQueuedOnly === true || this.agent.state.messages.at(-1)?.role === "assistant");
+						const continueQueued = options?.continueQueuedOnly
+							? this.agent.continueQueuedMessages.bind(this.agent)
+							: this.agent.continue.bind(this.agent);
 						try {
 							await continueQueued({
 								...this.#managedFallbackPromptOptions(),
@@ -9521,6 +9526,7 @@ export class AgentSession {
 		if (!this.#cancelAndSubmitInProgress && this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages()) {
 			this.#scheduleAgentContinue({
 				shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
+				continueQueuedOnly: true,
 			});
 		}
 	}
@@ -16716,6 +16722,7 @@ export class AgentSession {
 				this.#scheduleAgentContinue({
 					shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
 					rescheduleOnBusy: true,
+					continueQueuedOnly: true,
 				});
 			}
 			options?.onPersisted?.();
