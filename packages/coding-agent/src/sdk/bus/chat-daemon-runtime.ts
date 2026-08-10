@@ -433,8 +433,10 @@ export class ChatDaemonRuntime {
 	}
 
 	async #closeProviders(attachment: SessionAttachment): Promise<void> {
-		await this.#discord?.close(attachment.sessionId, attachment.generation);
-		await this.#slack?.close(attachment.sessionId, undefined, attachment.generation);
+		const discord = this.#discord;
+		const slack = this.#slack;
+		await discord?.close(attachment.sessionId, attachment.generation);
+		await slack?.close(attachment.sessionId, undefined, attachment.generation);
 	}
 
 	async #resume(sessionId: string, generation: number, content: string, publicationId?: string): Promise<void> {
