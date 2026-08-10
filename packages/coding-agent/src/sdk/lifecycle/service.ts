@@ -477,12 +477,13 @@ function brokerErrorFromThrown(value: unknown): { code: string; message: string;
 	return { code, message, ...(requestSent === undefined ? {} : { requestSent }) };
 }
 
-const TRANSPORT_ERROR_CODES = new Set(["timeout", "connection_closed", "reconnect_exhausted", "unavailable"]);
+const TRANSPORT_ERROR_CODES = new Set(["timeout", "connection_closed", "reconnect_exhausted", "unavailable", "protocol_error"]);
 
 function certaintyForThrownError(error: {
 	readonly code: string;
 	readonly requestSent?: boolean;
 }): SessionLifecycleCertainty {
+	if (error.code === "protocol_error") return error.requestSent === false ? "retryable" : "uncertain";
 	if (!TRANSPORT_ERROR_CODES.has(error.code)) return certaintyForBrokerCode(error.code);
 	if (error.requestSent === false) return "retryable";
 	if (error.requestSent === true || error.code === "connection_closed") return "uncertain";

@@ -1014,7 +1014,8 @@ export function createNotificationsEditorOperations(
 						stopAndUnregister: async () => {
 							if (controller) await controller.enterBlockedRuntime(sessionContext());
 							runtimePrepared = true;
-							await services.stopTelegramDaemon(ctx.settings);
+							const stopped = await services.stopTelegramDaemon(ctx.settings);
+							if (!stopped.ok) throw new Error(stopped.message);
 						},
 					},
 				});

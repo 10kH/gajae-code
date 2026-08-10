@@ -222,6 +222,15 @@ describe("SessionLifecycleService", () => {
 			target,
 		});
 		expect(closedOutcome).toMatchObject({ ok: false, certainty: "uncertain", error: { code: "connection_closed" } });
+		const protocol = serviceWith();
+		protocol.client.failure = Object.assign(new Error("malformed Broker frame"), { code: "protocol_error" });
+		const protocolOutcome = await protocol.service.create({
+			actor,
+			capability: "session.create",
+			requestKey: "ambiguous-protocol",
+			target,
+		});
+		expect(protocolOutcome).toMatchObject({ ok: false, certainty: "uncertain", error: { code: "protocol_error" } });
 
 		const malformed = serviceWith("not-a-broker-response");
 		const result = await malformed.service.list({ actor, capability: "session.list" });
