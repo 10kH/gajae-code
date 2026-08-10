@@ -387,7 +387,7 @@ function removeResidentCacheTreeNoFollow(pathname: string): void {
 	fs.unlinkSync(pathname);
 }
 
-function disposeVerifiedResidentCacheInstanceDir(instanceDir: string): void {
+export function disposeVerifiedResidentCacheInstanceDir(instanceDir: string): void {
 	const instanceKey = path.resolve(instanceDir);
 	const uid = residentCacheOwnerUid(instanceDir);
 	const quarantineDir = path.join(
