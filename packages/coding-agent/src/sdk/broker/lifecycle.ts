@@ -2284,6 +2284,7 @@ async function removeExactDeadSessionEndpoint(
 	id: string,
 	record: CloseRecord,
 	attempt = 0,
+	authorizedSource?: string,
 ): Promise<boolean> {
 	if (record.endpointMtimeMs === undefined) return await endpointRemoved(record.locator.stateRoot, id);
 	await broker.index.refresh();
@@ -2304,13 +2305,20 @@ async function removeExactDeadSessionEndpoint(
 	const retryEndpointPath = path.join(path.dirname(endpointPath), `.gjc-dead-endpoint-retry-${suffix}`);
 	const finalEndpointPath = path.join(path.dirname(endpointPath), `.gjc-dead-endpoint-final-${suffix}`);
 	const candidates = [finalEndpointPath, retryEndpointPath, plannedEndpointPath, endpointPath];
-	const endpointSource = candidates.find(candidate => {
-		try {
-			return fsSync.lstatSync(candidate).isFile();
-		} catch {
-			return false;
-		}
-	});
+	const authorizedDetachedSource =
+		authorizedSource && path.dirname(path.resolve(authorizedSource)) === path.dirname(path.resolve(endpointPath))
+			? authorizedSource
+			: undefined;
+	const endpointSource =
+		authorizedDetachedSource && fsSync.existsSync(authorizedDetachedSource)
+			? authorizedDetachedSource
+			: candidates.find(candidate => {
+					try {
+						return fsSync.lstatSync(candidate).isFile();
+					} catch {
+						return false;
+					}
+				});
 	if (!endpointSource) return await endpointRemoved(record.locator.stateRoot, id);
 	const plannedPath =
 		endpointSource === endpointPath
@@ -2354,8 +2362,23 @@ async function removeExactDeadSessionEndpoint(
 			})(),
 		);
 		if (removed.ok || removed.code === "not_found") return true;
+		if (removed.code === "cleanup_pending" && removed.retainedUnknownPath) return false;
+		if (removed.code === "cleanup_pending" && removed.retainedPlaceholderPath) {
+			const placeholderPath = path.resolve(removed.retainedPlaceholderPath);
+			if (path.dirname(placeholderPath) !== path.dirname(path.resolve(endpointPath))) return false;
+			const placeholder = captureLifecycleFile(placeholderPath, true, true);
+			const placeholderParent = lifecycleParentIdentity(path.dirname(placeholderPath));
+			if (!placeholder || !placeholderParent) return false;
+			const placeholderRemoval = exactUnlinkLifecycleFile(
+				placeholderPath,
+				placeholder.identity,
+				path.join(path.dirname(placeholderPath), `.gjc-dead-endpoint-placeholder-${suffix}`),
+				{ dev: BigInt(placeholderParent.dev), ino: BigInt(placeholderParent.ino) },
+			);
+			if (!placeholderRemoval.ok && placeholderRemoval.code !== "not_found") return false;
+		}
 		if (removed.code === "cleanup_pending" && attempt < 4)
-			return await removeExactDeadSessionEndpoint(broker, id, record, attempt + 1);
+			return await removeExactDeadSessionEndpoint(broker, id, record, attempt + 1, removed.detachedPath);
 		return false;
 	} catch {
 		return false;
