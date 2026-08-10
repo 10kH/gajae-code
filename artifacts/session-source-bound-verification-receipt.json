@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "kind": "session-boundary-test-report",
-  "sourceCommit": "6a57ccf59",
-  "sourceTree": "27c7d0a9a7530e149a321f38eb894aeecee89634",
-  "cumulativeDiffSha256": "7f293b552cd45add2a61f99d5c1fc95470b22b748ccb628c64b02b8c5dafb08d",
+  "sourceCommit": "b41feb2ad",
+  "sourceTree": "db03b6e7c0eca42772332afe8ec78bf2cdacf293",
+  "cumulativeDiffSha256": "c477d6e40799ef03ff5e3ce3361a3818d0f70978ae5736667a4e642b39504041",
   "results": [
     {
       "id": "package-typecheck",
@@ -18,7 +18,7 @@
       "testsPassed": 227,
       "testsSkipped": 1,
       "testsFailed": 0,
-      "assertions": 22156,
+      "assertions": 22154,
       "artifact": "artifacts/session-source-bound-focused-tests.xml"
     },
     {
@@ -46,7 +46,7 @@
       "testsPassed": 11,
       "testsFailed": 2,
       "artifact": "artifacts/session-source-bound-rss-none-tests.xml",
-      "evidence": "No-GC failed the 60k first-build 64 MiB RSS ceiling at 123781120 bytes and the million-record 128 MiB allocator ceiling at 135675904 bytes."
+      "evidence": "No-GC failed the 60k first-build 64 MiB RSS ceiling at 122748928 bytes and the million-record 128 MiB allocator ceiling at 135643136 bytes."
     },
     {
       "id": "mandatory-computer-redteam",

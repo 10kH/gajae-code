@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
   "bench": "session-scenario-matrix",
-  "generatedAt": "2026-08-10T14:26:34.292Z",
-  "gitSha": "6a57ccf5931187b9ca98ffb7c985948a1c54d44a",
+  "generatedAt": "2026-08-10T14:52:15.661Z",
+  "gitSha": "b41feb2ad1934a6958e4429102b92132005333cf",
   "platform": "darwin",
   "arch": "arm64",
   "cpu": "Apple M5 Max",
@@ -38,67 +38,67 @@
       "totalBytes": 2147483648,
       "entryCount": 8187,
       "phases": {
-        "generationMs": 749.55475,
-        "firstOpenMs": 1866.044584,
-        "closeMs": 1.0341659999999138,
-        "cpuUserMicros": 1831169,
-        "cpuSystemMicros": 177604
+        "generationMs": 663.406458,
+        "firstOpenMs": 1839.1827919999998,
+        "closeMs": 1.0214590000000499,
+        "cpuUserMicros": 1803955,
+        "cpuSystemMicros": 172464
       },
       "phaseEvidence": {
         "descriptorSecurityPreflight": {
-          "elapsedMs": 0.042291,
-          "cpuUserMicros": 44,
+          "elapsedMs": 0.028833,
+          "cpuUserMicros": 31,
           "cpuSystemMicros": null
         },
         "semanticScan": {
-          "elapsedMs": 1807.460583,
-          "cpuUserMicros": 1949055,
+          "elapsedMs": 1787.823042,
+          "cpuUserMicros": 1922580,
           "cpuSystemMicros": null
         },
         "indexTailBuildScan": {
-          "elapsedMs": 31.969583,
-          "cpuUserMicros": 36851,
+          "elapsedMs": 30.663667,
+          "cpuUserMicros": 34891,
           "cpuSystemMicros": null
         },
         "indexSerializationWrite": {
-          "elapsedMs": 12.818557,
+          "elapsedMs": 17.227025,
           "cpuUserMicros": null,
           "cpuSystemMicros": null
         },
         "dictionaryBuild": {
-          "elapsedMs": 0.002042,
+          "elapsedMs": 0.002,
           "cpuUserMicros": 3,
           "cpuSystemMicros": null
         },
         "parentBuild": {
-          "elapsedMs": 0.000917,
+          "elapsedMs": 0.001125,
           "cpuUserMicros": 1,
           "cpuSystemMicros": null
         },
         "metadataDeltaPublication": {
-          "elapsedMs": 0.030709,
-          "cpuUserMicros": 32,
+          "elapsedMs": 0.042542,
+          "cpuUserMicros": 42,
           "cpuSystemMicros": null
         },
         "fsync": {
-          "elapsedMs": 0.843126,
-          "cpuUserMicros": 671,
+          "elapsedMs": 1.148041,
+          "cpuUserMicros": 617,
           "cpuSystemMicros": null
         },
         "commitPublicationClassification": {
-          "elapsedMs": 1.2115,
-          "cpuUserMicros": 1188,
+          "elapsedMs": 1.264625,
+          "cpuUserMicros": 1252,
           "cpuSystemMicros": null
         },
         "hotSuffixMaterialization": {
-          "elapsedMs": 6.685334,
-          "cpuUserMicros": 2830,
+          "elapsedMs": 4.262,
+          "cpuUserMicros": 2555,
           "cpuSystemMicros": null
         }
       },
       "counters": {
-        "gcRequests": 15,
-        "gcElapsedMs": 63.73904100000001,
+        "gcRequests": 16,
+        "gcElapsedMs": 62.486,
         "bytesRead": 2216622620,
         "bytesWritten": 2030793,
         "recordsParsed": 8191,
@@ -107,99 +107,99 @@
         "indexWriteCalls": 8,
         "indexWriteBytes": 2030108,
         "fsyncCount": 2,
-        "fsyncElapsedMs": 0.838042
+        "fsyncElapsedMs": 1.143916
       },
       "firstOpenPerFileMs": {
         "samples": [
-          1865.885167
+          1839.041375
         ],
-        "min": 1865.885167,
-        "median": 1865.885167,
-        "p95": 1865.885167,
-        "max": 1865.885167
+        "min": 1839.041375,
+        "median": 1839.041375,
+        "p95": 1839.041375,
+        "max": 1839.041375
       },
-      "throughputMiBPerSecond": 1097.508611294788,
+      "throughputMiBPerSecond": 1113.5380392358522,
       "memory": {
         "processBaseline": {
-          "rssBytes": 123256832,
-          "heapUsedBytes": 6606358,
-          "heapTotalBytes": 18736128,
-          "externalBytes": 4658488,
+          "rssBytes": 123109376,
+          "heapUsedBytes": 6603541,
+          "heapTotalBytes": 18819072,
+          "externalBytes": 4659150,
           "arrayBuffersBytes": 1158
         },
         "operationBaseline": {
-          "rssBytes": 359677952,
-          "heapUsedBytes": 19505036,
-          "heapTotalBytes": 18768896,
-          "externalBytes": 4744701,
+          "rssBytes": 352174080,
+          "heapUsedBytes": 19499047,
+          "heapTotalBytes": 18851840,
+          "externalBytes": 4745382,
           "arrayBuffersBytes": 1158
         },
         "afterOperation": {
-          "rssBytes": 459948032,
-          "heapUsedBytes": 21124374,
-          "heapTotalBytes": 19229696,
-          "externalBytes": 5971114,
+          "rssBytes": 453591040,
+          "heapUsedBytes": 21116477,
+          "heapTotalBytes": 19311616,
+          "externalBytes": 5972053,
           "arrayBuffersBytes": 177115
         },
         "afterColdLookups": {
-          "rssBytes": 462225408,
-          "heapUsedBytes": 21124374,
-          "heapTotalBytes": 19248128,
-          "externalBytes": 6342473,
+          "rssBytes": 455311360,
+          "heapUsedBytes": 21116477,
+          "heapTotalBytes": 19313664,
+          "externalBytes": 6343411,
           "arrayBuffersBytes": 177115
         },
         "afterWarmLookups": {
-          "rssBytes": 462471168,
-          "heapUsedBytes": 21124374,
-          "heapTotalBytes": 19248128,
-          "externalBytes": 6343995,
+          "rssBytes": 455311360,
+          "heapUsedBytes": 21116477,
+          "heapTotalBytes": 19330048,
+          "externalBytes": 6344933,
           "arrayBuffersBytes": 177115
         },
         "afterClose": {
-          "rssBytes": 463126528,
-          "heapUsedBytes": 21579748,
-          "heapTotalBytes": 19248128,
-          "externalBytes": 5973006,
+          "rssBytes": 455704576,
+          "heapUsedBytes": 21147403,
+          "heapTotalBytes": 19330048,
+          "externalBytes": 5973944,
           "arrayBuffersBytes": 1158
         },
-        "operationRssGrowthBytes": 100270080,
+        "operationRssGrowthBytes": 101416960,
         "firstOpenBaseline": {
-          "rssBytes": 359677952,
-          "heapUsedBytes": 19505036,
-          "heapTotalBytes": 18768896,
-          "externalBytes": 4744701,
+          "rssBytes": 352174080,
+          "heapUsedBytes": 19499047,
+          "heapTotalBytes": 18851840,
+          "externalBytes": 4745382,
           "arrayBuffersBytes": 1158
         },
         "afterFirstOpen": {
-          "rssBytes": 459948032,
-          "heapUsedBytes": 21124374,
-          "heapTotalBytes": 19229696,
-          "externalBytes": 5971114,
+          "rssBytes": 453591040,
+          "heapUsedBytes": 21116477,
+          "heapTotalBytes": 19311616,
+          "externalBytes": 5972053,
           "arrayBuffersBytes": 177115
         },
-        "firstOpenRssGrowthBytes": 100270080,
-        "lookupRssGrowthBytes": 2523136,
-        "teardownRssGrowthBytes": 103448576,
-        "maxRssBytes": 463126528
+        "firstOpenRssGrowthBytes": 101416960,
+        "lookupRssGrowthBytes": 1720320,
+        "teardownRssGrowthBytes": 103530496,
+        "maxRssBytes": 455704576
       },
       "lookup": {
         "coldMs": {
           "samples": [
-            2.1549999999997453
+            1.807332999999744
           ],
-          "min": 2.1549999999997453,
-          "median": 2.1549999999997453,
-          "p95": 2.1549999999997453,
-          "max": 2.1549999999997453
+          "min": 1.807332999999744,
+          "median": 1.807332999999744,
+          "p95": 1.807332999999744,
+          "max": 1.807332999999744
         },
         "warmMs": {
           "samples": [
-            0.060415999999804626
+            0.06941600000027393
           ],
-          "min": 0.060415999999804626,
-          "median": 0.060415999999804626,
-          "p95": 0.060415999999804626,
-          "max": 0.060415999999804626
+          "min": 0.06941600000027393,
+          "median": 0.06941600000027393,
+          "p95": 0.06941600000027393,
+          "max": 0.06941600000027393
         },
         "coldRangeReads": 1,
         "warmRangeReads": 0
@@ -248,11 +248,11 @@
           "succeeded": true,
           "strategy": "pressure",
           "secondaryArtifactMode": "disabled",
-          "wallMs": 1848.139041,
-          "cpuMs": 1990.76,
-          "gcRequests": 15,
-          "gcRequestCount": 15,
-          "gcElapsedMs": 63.73904100000001,
+          "wallMs": 1824.625333,
+          "cpuMs": 1961.918,
+          "gcRequests": 16,
+          "gcRequestCount": 16,
+          "gcElapsedMs": 62.486,
           "bytesRead": 2216622620,
           "transcriptBytesRead": 2214592512,
           "bytesWritten": 2030793,
@@ -266,11 +266,11 @@
           "indexWriteCalls": 8,
           "indexWriteBytes": 2030108,
           "fsyncCount": 2,
-          "fsyncElapsedMs": 0.838042,
-          "dictionaryBuildElapsedMs": 0.002042,
-          "parentBuildElapsedMs": 0.000917,
-          "flatIndexElapsedMs": 12.818557,
-          "pressureBaselineBytes": 48135014
+          "fsyncElapsedMs": 1.143916,
+          "dictionaryBuildElapsedMs": 0.002,
+          "parentBuildElapsedMs": 0.001125,
+          "flatIndexElapsedMs": 17.227025,
+          "pressureBaselineBytes": 48129098
         }
       },
       "repetitionIndex": 0,
@@ -289,67 +289,67 @@
       "totalBytes": 2147483648,
       "entryCount": 8187,
       "phases": {
-        "generationMs": 706.4757910000001,
-        "firstOpenMs": 1863.569875,
-        "closeMs": 1.1272500000000036,
-        "cpuUserMicros": 1824476,
-        "cpuSystemMicros": 176447
+        "generationMs": 759.9153330000001,
+        "firstOpenMs": 1820.2519589999997,
+        "closeMs": 1.480916999999863,
+        "cpuUserMicros": 1777924,
+        "cpuSystemMicros": 159055
       },
       "phaseEvidence": {
         "descriptorSecurityPreflight": {
-          "elapsedMs": 0.028458,
-          "cpuUserMicros": 30,
+          "elapsedMs": 0.031708,
+          "cpuUserMicros": 34,
           "cpuSystemMicros": null
         },
         "semanticScan": {
-          "elapsedMs": 1808.780375,
-          "cpuUserMicros": 1947508,
+          "elapsedMs": 1752.926416,
+          "cpuUserMicros": 1883244,
           "cpuSystemMicros": null
         },
         "indexTailBuildScan": {
-          "elapsedMs": 33.11,
-          "cpuUserMicros": 33981,
+          "elapsedMs": 32.446167,
+          "cpuUserMicros": 33593,
           "cpuSystemMicros": null
         },
         "indexSerializationWrite": {
-          "elapsedMs": 13.062604,
+          "elapsedMs": 9.503964,
           "cpuUserMicros": null,
           "cpuSystemMicros": null
         },
         "dictionaryBuild": {
-          "elapsedMs": 0.002583,
-          "cpuUserMicros": 3,
+          "elapsedMs": 0.0035,
+          "cpuUserMicros": 4,
           "cpuSystemMicros": null
         },
         "parentBuild": {
-          "elapsedMs": 0.00125,
-          "cpuUserMicros": 2,
+          "elapsedMs": 0.001042,
+          "cpuUserMicros": 1,
           "cpuSystemMicros": null
         },
         "metadataDeltaPublication": {
-          "elapsedMs": 0.039834,
-          "cpuUserMicros": 40,
+          "elapsedMs": 0.045292,
+          "cpuUserMicros": 45,
           "cpuSystemMicros": null
         },
         "fsync": {
-          "elapsedMs": 0.8085,
-          "cpuUserMicros": 649,
+          "elapsedMs": 2.354416,
+          "cpuUserMicros": 688,
           "cpuSystemMicros": null
         },
         "commitPublicationClassification": {
-          "elapsedMs": 1.347083,
-          "cpuUserMicros": 1334,
+          "elapsedMs": 1.404125,
+          "cpuUserMicros": 1389,
           "cpuSystemMicros": null
         },
         "hotSuffixMaterialization": {
-          "elapsedMs": 4.239375,
-          "cpuUserMicros": 2335,
+          "elapsedMs": 11.931792,
+          "cpuUserMicros": 2855,
           "cpuSystemMicros": null
         }
       },
       "counters": {
         "gcRequests": 15,
-        "gcElapsedMs": 63.58087699999999,
+        "gcElapsedMs": 55.244958999999994,
         "bytesRead": 2216622620,
         "bytesWritten": 2030793,
         "recordsParsed": 8191,
@@ -358,99 +358,99 @@
         "indexWriteCalls": 8,
         "indexWriteBytes": 2030108,
         "fsyncCount": 2,
-        "fsyncElapsedMs": 0.803251
+        "fsyncElapsedMs": 2.349209
       },
       "firstOpenPerFileMs": {
         "samples": [
-          1863.412584
+          1820.096916
         ],
-        "min": 1863.412584,
-        "median": 1863.412584,
-        "p95": 1863.412584,
-        "max": 1863.412584
+        "min": 1820.096916,
+        "median": 1820.096916,
+        "p95": 1820.096916,
+        "max": 1820.096916
       },
-      "throughputMiBPerSecond": 1098.9660368919626,
+      "throughputMiBPerSecond": 1125.1189649179773,
       "memory": {
         "processBaseline": {
-          "rssBytes": 123043840,
-          "heapUsedBytes": 6713766,
-          "heapTotalBytes": 18685952,
-          "externalBytes": 4657964,
+          "rssBytes": 123125760,
+          "heapUsedBytes": 6563899,
+          "heapTotalBytes": 18736128,
+          "externalBytes": 4656811,
           "arrayBuffersBytes": 1158
         },
         "operationBaseline": {
-          "rssBytes": 363757568,
-          "heapUsedBytes": 19504285,
-          "heapTotalBytes": 18718720,
-          "externalBytes": 4744146,
+          "rssBytes": 359759872,
+          "heapUsedBytes": 19506784,
+          "heapTotalBytes": 18768896,
+          "externalBytes": 4742732,
           "arrayBuffersBytes": 1158
         },
         "afterOperation": {
-          "rssBytes": 465108992,
-          "heapUsedBytes": 21122299,
-          "heapTotalBytes": 19162112,
-          "externalBytes": 5970561,
+          "rssBytes": 460619776,
+          "heapUsedBytes": 21122779,
+          "heapTotalBytes": 19211264,
+          "externalBytes": 5968426,
           "arrayBuffersBytes": 177115
         },
         "afterColdLookups": {
-          "rssBytes": 466780160,
-          "heapUsedBytes": 21122299,
-          "heapTotalBytes": 19180544,
-          "externalBytes": 6341919,
+          "rssBytes": 462274560,
+          "heapUsedBytes": 21122779,
+          "heapTotalBytes": 19229696,
+          "externalBytes": 6339784,
           "arrayBuffersBytes": 177115
         },
         "afterWarmLookups": {
-          "rssBytes": 466780160,
-          "heapUsedBytes": 21122299,
-          "heapTotalBytes": 19180544,
-          "externalBytes": 6343441,
+          "rssBytes": 462536704,
+          "heapUsedBytes": 21122779,
+          "heapTotalBytes": 19229696,
+          "externalBytes": 6341306,
           "arrayBuffersBytes": 177115
         },
         "afterClose": {
-          "rssBytes": 467107840,
-          "heapUsedBytes": 21149591,
-          "heapTotalBytes": 19164160,
-          "externalBytes": 5972452,
+          "rssBytes": 462995456,
+          "heapUsedBytes": 21579582,
+          "heapTotalBytes": 19213312,
+          "externalBytes": 5970331,
           "arrayBuffersBytes": 1158
         },
-        "operationRssGrowthBytes": 101351424,
+        "operationRssGrowthBytes": 100859904,
         "firstOpenBaseline": {
-          "rssBytes": 363757568,
-          "heapUsedBytes": 19504285,
-          "heapTotalBytes": 18718720,
-          "externalBytes": 4744146,
+          "rssBytes": 359759872,
+          "heapUsedBytes": 19506784,
+          "heapTotalBytes": 18768896,
+          "externalBytes": 4742732,
           "arrayBuffersBytes": 1158
         },
         "afterFirstOpen": {
-          "rssBytes": 465108992,
-          "heapUsedBytes": 21122299,
-          "heapTotalBytes": 19162112,
-          "externalBytes": 5970561,
+          "rssBytes": 460619776,
+          "heapUsedBytes": 21122779,
+          "heapTotalBytes": 19211264,
+          "externalBytes": 5968426,
           "arrayBuffersBytes": 177115
         },
-        "firstOpenRssGrowthBytes": 101351424,
-        "lookupRssGrowthBytes": 1671168,
-        "teardownRssGrowthBytes": 103350272,
-        "maxRssBytes": 467107840
+        "firstOpenRssGrowthBytes": 100859904,
+        "lookupRssGrowthBytes": 1916928,
+        "teardownRssGrowthBytes": 103235584,
+        "maxRssBytes": 462995456
       },
       "lookup": {
         "coldMs": {
           "samples": [
-            2.101375000000189
+            1.8730420000001686
           ],
-          "min": 2.101375000000189,
-          "median": 2.101375000000189,
-          "p95": 2.101375000000189,
-          "max": 2.101375000000189
+          "min": 1.8730420000001686,
+          "median": 1.8730420000001686,
+          "p95": 1.8730420000001686,
+          "max": 1.8730420000001686
         },
         "warmMs": {
           "samples": [
-            0.06462499999997817
+            0.054249999999683496
           ],
-          "min": 0.06462499999997817,
-          "median": 0.06462499999997817,
-          "p95": 0.06462499999997817,
-          "max": 0.06462499999997817
+          "min": 0.054249999999683496,
+          "median": 0.054249999999683496,
+          "p95": 0.054249999999683496,
+          "max": 0.054249999999683496
         },
         "coldRangeReads": 1,
         "warmRangeReads": 0
@@ -499,11 +499,11 @@
           "succeeded": true,
           "strategy": "pressure",
           "secondaryArtifactMode": "disabled",
-          "wallMs": 1848.089625,
-          "cpuMs": 1985.796,
+          "wallMs": 1799.370042,
+          "cpuMs": 1921.775,
           "gcRequests": 15,
           "gcRequestCount": 15,
-          "gcElapsedMs": 63.58087699999999,
+          "gcElapsedMs": 55.244958999999994,
           "bytesRead": 2216622620,
           "transcriptBytesRead": 2214592512,
           "bytesWritten": 2030793,
@@ -517,11 +517,11 @@
           "indexWriteCalls": 8,
           "indexWriteBytes": 2030108,
           "fsyncCount": 2,
-          "fsyncElapsedMs": 0.803251,
-          "dictionaryBuildElapsedMs": 0.002583,
-          "parentBuildElapsedMs": 0.00125,
-          "flatIndexElapsedMs": 13.062604,
-          "pressureBaselineBytes": 48132594
+          "fsyncElapsedMs": 2.349209,
+          "dictionaryBuildElapsedMs": 0.0035,
+          "parentBuildElapsedMs": 0.001042,
+          "flatIndexElapsedMs": 9.503964,
+          "pressureBaselineBytes": 48133340
         }
       },
       "repetitionIndex": 1,
@@ -540,67 +540,67 @@
       "totalBytes": 2147483648,
       "entryCount": 8187,
       "phases": {
-        "generationMs": 677.997625,
-        "firstOpenMs": 1815.2512499999998,
-        "closeMs": 1.2710420000003069,
-        "cpuUserMicros": 1790407,
-        "cpuSystemMicros": 163182
+        "generationMs": 684.6405420000001,
+        "firstOpenMs": 1842.5616250000003,
+        "closeMs": 2.0216669999999795,
+        "cpuUserMicros": 1809704,
+        "cpuSystemMicros": 173982
       },
       "phaseEvidence": {
         "descriptorSecurityPreflight": {
-          "elapsedMs": 0.026792,
-          "cpuUserMicros": 28,
+          "elapsedMs": 0.033625,
+          "cpuUserMicros": 35,
           "cpuSystemMicros": null
         },
         "semanticScan": {
-          "elapsedMs": 1761.784583,
-          "cpuUserMicros": 1897909,
+          "elapsedMs": 1788.224584,
+          "cpuUserMicros": 1926232,
           "cpuSystemMicros": null
         },
         "indexTailBuildScan": {
-          "elapsedMs": 31.772625,
-          "cpuUserMicros": 36178,
+          "elapsedMs": 31.934,
+          "cpuUserMicros": 36862,
           "cpuSystemMicros": null
         },
         "indexSerializationWrite": {
-          "elapsedMs": 9.721242,
+          "elapsedMs": 15.766847,
           "cpuUserMicros": null,
           "cpuSystemMicros": null
         },
         "dictionaryBuild": {
-          "elapsedMs": 0.002458,
-          "cpuUserMicros": 2,
+          "elapsedMs": 0.002667,
+          "cpuUserMicros": 3,
           "cpuSystemMicros": null
         },
         "parentBuild": {
-          "elapsedMs": 0.001125,
+          "elapsedMs": 0.001083,
           "cpuUserMicros": 2,
           "cpuSystemMicros": null
         },
         "metadataDeltaPublication": {
-          "elapsedMs": 0.040291,
-          "cpuUserMicros": 41,
+          "elapsedMs": 0.042291,
+          "cpuUserMicros": 42,
           "cpuSystemMicros": null
         },
         "fsync": {
-          "elapsedMs": 0.863583,
-          "cpuUserMicros": 704,
+          "elapsedMs": 0.909,
+          "cpuUserMicros": 744,
           "cpuSystemMicros": null
         },
         "commitPublicationClassification": {
-          "elapsedMs": 1.612792,
-          "cpuUserMicros": 1597,
+          "elapsedMs": 1.520209,
+          "cpuUserMicros": 1502,
           "cpuSystemMicros": null
         },
         "hotSuffixMaterialization": {
-          "elapsedMs": 4.766667,
-          "cpuUserMicros": 2729,
+          "elapsedMs": 4.443375,
+          "cpuUserMicros": 2598,
           "cpuSystemMicros": null
         }
       },
       "counters": {
-        "gcRequests": 15,
-        "gcElapsedMs": 58.239043,
+        "gcRequests": 16,
+        "gcElapsedMs": 64.264586,
         "bytesRead": 2216622620,
         "bytesWritten": 2030793,
         "recordsParsed": 8191,
@@ -609,99 +609,99 @@
         "indexWriteCalls": 8,
         "indexWriteBytes": 2030108,
         "fsyncCount": 2,
-        "fsyncElapsedMs": 0.8585
+        "fsyncElapsedMs": 0.9039170000000001
       },
       "firstOpenPerFileMs": {
         "samples": [
-          1815.1042499999999
+          1842.412083
         ],
-        "min": 1815.1042499999999,
-        "median": 1815.1042499999999,
-        "p95": 1815.1042499999999,
-        "max": 1815.1042499999999
+        "min": 1842.412083,
+        "median": 1842.412083,
+        "p95": 1842.412083,
+        "max": 1842.412083
       },
-      "throughputMiBPerSecond": 1128.218476643385,
+      "throughputMiBPerSecond": 1111.496067329634,
       "memory": {
         "processBaseline": {
-          "rssBytes": 123125760,
-          "heapUsedBytes": 6694714,
-          "heapTotalBytes": 18719744,
-          "externalBytes": 4657429,
+          "rssBytes": 122830848,
+          "heapUsedBytes": 6603650,
+          "heapTotalBytes": 18750464,
+          "externalBytes": 4654415,
           "arrayBuffersBytes": 1158
         },
         "operationBaseline": {
-          "rssBytes": 359727104,
-          "heapUsedBytes": 19505216,
-          "heapTotalBytes": 18753536,
-          "externalBytes": 4743617,
+          "rssBytes": 351649792,
+          "heapUsedBytes": 19498954,
+          "heapTotalBytes": 18783232,
+          "externalBytes": 4742166,
           "arrayBuffersBytes": 1158
         },
         "afterOperation": {
-          "rssBytes": 459620352,
-          "heapUsedBytes": 21122649,
-          "heapTotalBytes": 19196928,
-          "externalBytes": 5970287,
+          "rssBytes": 451657728,
+          "heapUsedBytes": 21114478,
+          "heapTotalBytes": 19226624,
+          "externalBytes": 5968581,
           "arrayBuffersBytes": 177115
         },
         "afterColdLookups": {
-          "rssBytes": 461373440,
-          "heapUsedBytes": 21122649,
-          "heapTotalBytes": 19215360,
-          "externalBytes": 6341733,
+          "rssBytes": 453623808,
+          "heapUsedBytes": 21114478,
+          "heapTotalBytes": 19245056,
+          "externalBytes": 6339939,
           "arrayBuffersBytes": 177115
         },
         "afterWarmLookups": {
-          "rssBytes": 461520896,
-          "heapUsedBytes": 21122649,
-          "heapTotalBytes": 19215360,
-          "externalBytes": 6343167,
+          "rssBytes": 453738496,
+          "heapUsedBytes": 21114478,
+          "heapTotalBytes": 19245056,
+          "externalBytes": 6341461,
           "arrayBuffersBytes": 177115
         },
         "afterClose": {
-          "rssBytes": 461733888,
-          "heapUsedBytes": 21153573,
-          "heapTotalBytes": 19198976,
-          "externalBytes": 5972178,
+          "rssBytes": 453967872,
+          "heapUsedBytes": 21144950,
+          "heapTotalBytes": 19229696,
+          "externalBytes": 5970486,
           "arrayBuffersBytes": 1158
         },
-        "operationRssGrowthBytes": 99893248,
+        "operationRssGrowthBytes": 100007936,
         "firstOpenBaseline": {
-          "rssBytes": 359727104,
-          "heapUsedBytes": 19505216,
-          "heapTotalBytes": 18753536,
-          "externalBytes": 4743617,
+          "rssBytes": 351649792,
+          "heapUsedBytes": 19498954,
+          "heapTotalBytes": 18783232,
+          "externalBytes": 4742166,
           "arrayBuffersBytes": 1158
         },
         "afterFirstOpen": {
-          "rssBytes": 459620352,
-          "heapUsedBytes": 21122649,
-          "heapTotalBytes": 19196928,
-          "externalBytes": 5970287,
+          "rssBytes": 451657728,
+          "heapUsedBytes": 21114478,
+          "heapTotalBytes": 19226624,
+          "externalBytes": 5968581,
           "arrayBuffersBytes": 177115
         },
-        "firstOpenRssGrowthBytes": 99893248,
-        "lookupRssGrowthBytes": 1900544,
-        "teardownRssGrowthBytes": 102006784,
-        "maxRssBytes": 461733888
+        "firstOpenRssGrowthBytes": 100007936,
+        "lookupRssGrowthBytes": 2080768,
+        "teardownRssGrowthBytes": 102318080,
+        "maxRssBytes": 453967872
       },
       "lookup": {
         "coldMs": {
           "samples": [
-            1.9642499999999927
+            1.9588749999998072
           ],
-          "min": 1.9642499999999927,
-          "median": 1.9642499999999927,
-          "p95": 1.9642499999999927,
-          "max": 1.9642499999999927
+          "min": 1.9588749999998072,
+          "median": 1.9588749999998072,
+          "p95": 1.9588749999998072,
+          "max": 1.9588749999998072
         },
         "warmMs": {
           "samples": [
-            0.06454199999961929
+            0.06966600000032486
           ],
-          "min": 0.06454199999961929,
-          "median": 0.06454199999961929,
-          "p95": 0.06454199999961929,
-          "max": 0.06454199999961929
+          "min": 0.06966600000032486,
+          "median": 0.06966600000032486,
+          "p95": 0.06966600000032486,
+          "max": 0.06966600000032486
         },
         "coldRangeReads": 1,
         "warmRangeReads": 0
@@ -750,11 +750,11 @@
           "succeeded": true,
           "strategy": "pressure",
           "secondaryArtifactMode": "disabled",
-          "wallMs": 1800.535792,
-          "cpuMs": 1939.029,
-          "gcRequests": 15,
-          "gcRequestCount": 15,
-          "gcElapsedMs": 58.239043,
+          "wallMs": 1826.808042,
+          "cpuMs": 1967.934,
+          "gcRequests": 16,
+          "gcRequestCount": 16,
+          "gcElapsedMs": 64.264586,
           "bytesRead": 2216622620,
           "transcriptBytesRead": 2214592512,
           "bytesWritten": 2030793,
@@ -768,11 +768,11 @@
           "indexWriteCalls": 8,
           "indexWriteBytes": 2030108,
           "fsyncCount": 2,
-          "fsyncElapsedMs": 0.8585,
-          "dictionaryBuildElapsedMs": 0.002458,
-          "parentBuildElapsedMs": 0.001125,
-          "flatIndexElapsedMs": 9.721242,
-          "pressureBaselineBytes": 48133504
+          "fsyncElapsedMs": 0.9039170000000001,
+          "dictionaryBuildElapsedMs": 0.002667,
+          "parentBuildElapsedMs": 0.001083,
+          "flatIndexElapsedMs": 15.766847,
+          "pressureBaselineBytes": 48122698
         }
       },
       "repetitionIndex": 2,
