@@ -81,6 +81,7 @@ import {
 import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
 import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
+import { processIncarnation } from "../broker/process-incarnation";
 import { SessionIndex } from "../broker/session-index";
 import { createSdkSurfaceFactory, type SessionSdkHost, SessionSdkSessionRuntime, shouldHostSdk } from "../host";
 import { type ControlSurface, dispatchControl } from "../host/control";
@@ -5475,6 +5476,7 @@ export function createNotificationsExtension(
 					throwIfLifecycleStopped();
 					const locator = { repo: path.resolve(ctx.cwd), stateRoot: endpointStateRoot };
 					const endpointMtimeMs = fs.statSync(path.join(endpointStateRoot, "sdk", `${id}.json`)).mtimeMs;
+					const hostProcessIncarnation = processIncarnation(process.pid);
 					await host.registerWithBroker({
 						// The endpoint is written before registration. Its exact mtime
 						// binds this index generation to that discovery record.
@@ -5484,6 +5486,11 @@ export function createNotificationsExtension(
 								...input,
 								locator,
 								pid: process.pid,
+								// A pid alone cannot survive its own reuse, and the marker that
+								// binds it lives in the workspace state root this host can outlive.
+								// Publishing the incarnation into broker-owned storage is what keeps
+								// teardown identity provable after that workspace is gone.
+								...(hostProcessIncarnation ? { processIncarnation: hostProcessIncarnation } : {}),
 								endpointMtimeMs,
 								...(lifecycleRequestId ? { lifecycleRequestId } : {}),
 							});
