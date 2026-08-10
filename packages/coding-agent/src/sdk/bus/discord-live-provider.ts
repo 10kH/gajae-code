@@ -11,6 +11,7 @@ import type {
 const API_BASE = "https://discord.com/api/v10";
 const GATEWAY_INTENTS = 1 + 512 + 32_768;
 const MAX_RATE_LIMIT_RETRIES = 2;
+const REST_REQUEST_TIMEOUT_MS = 5_000;
 const NONCE_PREFIX = "<!-- gjc-thread-nonce:";
 const INVALID_SESSION_RECONNECT_DELAY_MS = 1_000;
 const TERMINAL_GATEWAY_CLOSE_CODES: ReadonlySet<number> = new Set([4_004, 4_010, 4_011, 4_012, 4_013, 4_014]);
@@ -492,10 +493,15 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 		return await this.#requestWithHeaders(path, { "Content-Type": "application/json" }, init);
 	}
 	async #requestWithHeaders(path: string, headers: Record<string, string>, init: RequestInit): Promise<unknown> {
+		const deadline = this.#now() + REST_REQUEST_TIMEOUT_MS;
 		for (let attempt = 0; ; attempt++) {
+			const remaining = deadline - this.#now();
+			if (remaining <= 0) throw new Error("Discord API request timed out");
 			const mergedHeaders = new Headers(headers);
 			for (const [key, value] of new Headers(init.headers)) mergedHeaders.set(key, value);
-			const response = await this.#fetch(`${this.#apiBaseUrl}${path}`, { ...init, headers: mergedHeaders });
+			const timeoutSignal = AbortSignal.timeout(remaining);
+			const signal = init.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
+			const response = await this.#fetch(`${this.#apiBaseUrl}${path}`, { ...init, headers: mergedHeaders, signal });
 			if (response.status !== 429) {
 				if (!response.ok) throw new Error(`Discord API request failed (${response.status})`);
 				return response.status === 204 ? undefined : await response.json();
@@ -503,7 +509,9 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 			if (attempt >= MAX_RATE_LIMIT_RETRIES) throw new Error("Discord API rate limit retry exhausted");
 			const limited = this.#record(await response.json());
 			const seconds = this.#number(limited, "retry_after") ?? 1;
-			await this.#sleep(Math.max(0, seconds * 1_000));
+			const retryRemaining = deadline - this.#now();
+			if (retryRemaining <= 0) throw new Error("Discord API request timed out");
+			await this.#sleep(Math.min(Math.max(0, seconds * 1_000), retryRemaining));
 		}
 	}
 

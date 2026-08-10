@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes Discord bounded-drain generation 128 at serving epoch 75", () => {
+test("publishes Discord REST-timeout generation 129 at serving epoch 76", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 128 / serving epoch 75: hung Discord work cannot block Router shutdown.
-	expect(DAEMON_GENERATION).toBe(128);
-	expect(SERVING_EPOCH).toBe(75);
+	// Generation 129 / serving epoch 76: every Discord REST operation has a total deadline.
+	expect(DAEMON_GENERATION).toBe(129);
+	expect(SERVING_EPOCH).toBe(76);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
