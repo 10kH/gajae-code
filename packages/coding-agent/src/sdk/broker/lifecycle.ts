@@ -2279,7 +2279,12 @@ async function endpointRemoved(root: string, id: string): Promise<boolean> {
 	}
 }
 
-async function removeExactDeadSessionEndpoint(broker: Broker, id: string, record: CloseRecord): Promise<boolean> {
+async function removeExactDeadSessionEndpoint(
+	broker: Broker,
+	id: string,
+	record: CloseRecord,
+	attempt = 0,
+): Promise<boolean> {
 	if (record.endpointMtimeMs === undefined) return await endpointRemoved(record.locator.stateRoot, id);
 	await broker.index.refresh();
 	const current = broker.index.listSessions().sessions.find(session => session.sessionId === id);
@@ -2298,7 +2303,7 @@ async function removeExactDeadSessionEndpoint(broker: Broker, id: string, record
 	const plannedEndpointPath = path.join(path.dirname(endpointPath), `.gjc-dead-endpoint-${suffix}`);
 	const retryEndpointPath = path.join(path.dirname(endpointPath), `.gjc-dead-endpoint-retry-${suffix}`);
 	const finalEndpointPath = path.join(path.dirname(endpointPath), `.gjc-dead-endpoint-final-${suffix}`);
-	const candidates = [endpointPath, plannedEndpointPath, retryEndpointPath, finalEndpointPath];
+	const candidates = [finalEndpointPath, retryEndpointPath, plannedEndpointPath, endpointPath];
 	const endpointSource = candidates.find(candidate => {
 		try {
 			return fsSync.lstatSync(candidate).isFile();
@@ -2348,7 +2353,10 @@ async function removeExactDeadSessionEndpoint(broker: Broker, id: string, record
 				return parent ? { dev: BigInt(parent.dev), ino: BigInt(parent.ino) } : undefined;
 			})(),
 		);
-		return removed.ok || removed.code === "not_found";
+		if (removed.ok || removed.code === "not_found") return true;
+		if (removed.code === "cleanup_pending" && attempt < 4)
+			return await removeExactDeadSessionEndpoint(broker, id, record, attempt + 1);
+		return false;
 	} catch {
 		return false;
 	} finally {
