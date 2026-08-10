@@ -9,6 +9,7 @@ export interface DiscordInboundDispatchReceipt {
 	actionId?: string;
 	actionNonce?: string;
 	endpointGeneration: number;
+	attachmentAuthorityId?: string;
 	effectId: string;
 	idempotencyKey: string;
 }

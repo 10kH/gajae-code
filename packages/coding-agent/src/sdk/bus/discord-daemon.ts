@@ -128,6 +128,7 @@ type DiscordInboundRouting = {
 	parentId: string;
 	threadId: string;
 	eventId: string;
+	attachmentAuthorityId?: string;
 	interactionId?: string;
 	kind: "command" | "action";
 	actionId?: string;
@@ -424,15 +425,15 @@ export class DiscordNotificationDaemon {
 		return await this.#track(this.#notify(input));
 	}
 	async #notify(input: DiscordNotificationInput): Promise<DiscordConversation> {
-		await this.#requireLiveBinding(input.sessionId, input.endpointGeneration);
+		await this.#requireLiveBinding(input.sessionId, input.endpointGeneration, input.attachmentAuthorityId);
 		const conversation = await this.#ensureConversation(input);
-		await this.#requireLiveBinding(input.sessionId, input.endpointGeneration);
+		await this.#requireLiveBinding(input.sessionId, input.endpointGeneration, input.attachmentAuthorityId);
 		if (conversation.state !== "active" || !conversation.threadId) throw new Error("Discord thread is unavailable");
 		const pendingActionId = input.actionId;
 		const authoritative = pendingActionId
 			? await this.#ensureActionPublication(conversation, pendingActionId)
 			: conversation;
-		await this.#requireLiveBinding(input.sessionId, input.endpointGeneration);
+		await this.#requireLiveBinding(input.sessionId, input.endpointGeneration, input.attachmentAuthorityId);
 		const components =
 			pendingActionId && authoritative.pendingActionNonce && input.options && input.options.length > 0
 				? actionComponents(
@@ -509,12 +510,16 @@ export class DiscordNotificationDaemon {
 	async #archive(sessionId: string): Promise<void> {
 		const record = await this.#bySession(sessionId);
 		if (!record?.threadId || record.state !== "active") return;
-		await this.#requireLiveBinding(record.sessionId!, record.endpointGeneration!);
+		await this.#requireLiveBinding(record.sessionId!, record.endpointGeneration!, record.attachmentAuthorityId);
 		const archiving = await this.#beginArchive(record);
 		const occurrenceId = archiving.archiveOccurrenceId;
 		if (!occurrenceId || !archiving.archiveEffectId) throw new Error("Discord archive occurrence is unavailable");
 		await this.#threadEffect(archiving.archiveEffectId, archiving, "archive", false, false, occurrenceId);
-		await this.#requireLiveBinding(archiving.sessionId!, archiving.endpointGeneration!);
+		await this.#requireLiveBinding(
+			archiving.sessionId!,
+			archiving.endpointGeneration!,
+			archiving.attachmentAuthorityId,
+		);
 		await this.#completeArchive(archiving, occurrenceId);
 	}
 
@@ -556,7 +561,7 @@ export class DiscordNotificationDaemon {
 			await this.#driveClose(record);
 			return undefined;
 		}
-		await this.#requireLiveBinding(sessionId, endpointGeneration);
+		await this.#requireLiveBinding(sessionId, endpointGeneration, attachmentAuthorityId);
 		const resumeOccurrenceId = randomUUID();
 		const effectIncarnationId = backfilledEffectIncarnationId(record);
 		const resuming = await this.#replace(record, {
@@ -575,10 +580,10 @@ export class DiscordNotificationDaemon {
 			const occurrenceId = resuming.resumeOccurrenceId;
 			if (!occurrenceId || !resuming.resumeEffectId) throw new Error("Discord resume occurrence is unavailable");
 			await this.#threadEffect(resuming.resumeEffectId, resuming, "unarchive", false, false, occurrenceId);
-			await this.#requireLiveBinding(sessionId, endpointGeneration);
+			await this.#requireLiveBinding(sessionId, endpointGeneration, attachmentAuthorityId);
 			return await this.#completeResume(resuming, occurrenceId);
 		} catch {
-			await this.#requireLiveBinding(sessionId, endpointGeneration);
+			await this.#requireLiveBinding(sessionId, endpointGeneration, attachmentAuthorityId);
 			const superseded = await this.#replace(resuming, {
 				...resuming,
 				state: "archived",
@@ -590,7 +595,7 @@ export class DiscordNotificationDaemon {
 			});
 
 			const replacement = await this.#create(sessionId, endpointGeneration, `resume-${randomUUID()}`);
-			await this.#requireLiveBinding(sessionId, endpointGeneration);
+			await this.#requireLiveBinding(sessionId, endpointGeneration, attachmentAuthorityId);
 			await this.#replace(superseded, { ...superseded, supersededByThreadId: replacement.threadId });
 			return replacement;
 		}
@@ -663,6 +668,7 @@ export class DiscordNotificationDaemon {
 			parentId: event.parentId,
 			threadId: event.threadId,
 			eventId: event.id,
+			...(record.attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId: record.attachmentAuthorityId }),
 			...(event.interaction ? { interactionId: event.interaction.id } : {}),
 			kind: command ? "command" : "action",
 			...(!command ? { actionId: route!.actionId, actionNonce: route!.actionNonce } : {}),
@@ -738,6 +744,9 @@ export class DiscordNotificationDaemon {
 						eventId: event.id,
 						kind: "command",
 						endpointGeneration: record.endpointGeneration!,
+						...(record.attachmentAuthorityId === undefined
+							? {}
+							: { attachmentAuthorityId: record.attachmentAuthorityId }),
 						effectId,
 						idempotencyKey,
 					}
@@ -749,6 +758,9 @@ export class DiscordNotificationDaemon {
 						actionId: route!.actionId,
 						actionNonce: route!.actionNonce,
 						endpointGeneration: record.endpointGeneration!,
+						...(record.attachmentAuthorityId === undefined
+							? {}
+							: { attachmentAuthorityId: record.attachmentAuthorityId }),
 						effectId,
 						idempotencyKey,
 					};
@@ -1172,6 +1184,7 @@ export class DiscordNotificationDaemon {
 			left.actionId === right.actionId &&
 			left.actionNonce === right.actionNonce &&
 			left.endpointGeneration === right.endpointGeneration &&
+			left.attachmentAuthorityId === right.attachmentAuthorityId &&
 			left.effectId === right.effectId &&
 			left.idempotencyKey === right.idempotencyKey
 		);
@@ -1252,6 +1265,7 @@ export class DiscordNotificationDaemon {
 			current?.state !== "active" ||
 			current.sessionId !== record.sessionId ||
 			current.endpointGeneration !== receipt.endpointGeneration ||
+			current.attachmentAuthorityId !== receipt.attachmentAuthorityId ||
 			!claimed
 		)
 			return undefined;
@@ -1275,6 +1289,9 @@ export class DiscordNotificationDaemon {
 					eventId: routing.eventId,
 					kind: "command",
 					endpointGeneration,
+					...(routing.attachmentAuthorityId === undefined
+						? {}
+						: { attachmentAuthorityId: routing.attachmentAuthorityId }),
 					effectId,
 					idempotencyKey,
 				}
@@ -1286,6 +1303,9 @@ export class DiscordNotificationDaemon {
 					actionId: routing.actionId!,
 					actionNonce: routing.actionNonce!,
 					endpointGeneration,
+					...(routing.attachmentAuthorityId === undefined
+						? {}
+						: { attachmentAuthorityId: routing.attachmentAuthorityId }),
 					effectId,
 					idempotencyKey,
 				};
@@ -1347,18 +1367,36 @@ export class DiscordNotificationDaemon {
 
 	#matches(record: DiscordConversation, attachment: SessionAttachment | null): attachment is SessionAttachment {
 		if (!attachment?.isCurrent()) return false;
-		return record.state === "active" && record.endpointGeneration === attachment.generation;
+		return (
+			record.state === "active" &&
+			record.endpointGeneration === attachment.generation &&
+			record.attachmentAuthorityId === attachment.authorityId
+		);
 	}
-	async #bindingCurrent(sessionId: string, endpointGeneration: number): Promise<boolean> {
+	async #bindingCurrent(
+		sessionId: string,
+		endpointGeneration: number,
+		attachmentAuthorityId?: string,
+	): Promise<boolean> {
 		try {
 			const attachment = await this.#resolveAttachment(sessionId, endpointGeneration);
-			return !!attachment && attachment.isCurrent() && attachment.generation === endpointGeneration;
+			return (
+				!!attachment &&
+				attachment.isCurrent() &&
+				attachment.generation === endpointGeneration &&
+				(attachmentAuthorityId === undefined || attachment.authorityId === attachmentAuthorityId)
+			);
 		} catch {
 			return false;
 		}
 	}
-	async #requireLiveBinding(sessionId: string, endpointGeneration: number): Promise<void> {
-		if (!(await this.#bindingCurrent(sessionId, endpointGeneration))) throw new DiscordAttachmentBindingError();
+	async #requireLiveBinding(
+		sessionId: string,
+		endpointGeneration: number,
+		attachmentAuthorityId?: string,
+	): Promise<void> {
+		if (!(await this.#bindingCurrent(sessionId, endpointGeneration, attachmentAuthorityId)))
+			throw new DiscordAttachmentBindingError();
 	}
 	#isDefiniteSdkPreSendFailure(error: unknown): boolean {
 		if (error instanceof DiscordAttachmentBindingError) return true;

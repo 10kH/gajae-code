@@ -114,6 +114,7 @@ type SlackInboundRouting = {
 	teamId: string;
 	channelId: string;
 	rootTs: string;
+	attachmentAuthorityId?: string;
 	actorId: string;
 	eventId: string;
 	interactionId: string;
@@ -1203,7 +1204,12 @@ export class SlackNotificationDaemon {
 		)
 			return undefined;
 		const endpoint = await this.#resolveAttachment(record.sessionId);
-		if (!endpoint || endpoint.generation !== record.endpointGeneration) return undefined;
+		if (
+			!endpoint ||
+			endpoint.generation !== record.endpointGeneration ||
+			record.attachmentAuthorityId !== endpoint.authorityId
+		)
+			return undefined;
 		const interactionId = text(inbound.event.client_msg_id) ?? inbound.eventId;
 		const retryKey = `${inbound.eventId}:${interactionId}`;
 		const inboundText = text(inbound.event.text);
@@ -1215,6 +1221,7 @@ export class SlackNotificationDaemon {
 			teamId: inbound.teamId,
 			channelId: inbound.channelId,
 			rootTs: inbound.rootTs,
+			...(record.attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId: record.attachmentAuthorityId }),
 			eventId: inbound.eventId,
 			interactionId,
 			actorId,
@@ -1244,7 +1251,12 @@ export class SlackNotificationDaemon {
 		let sessionId: string | undefined;
 		let receipt: SlackInboundDispatchReceipt | undefined;
 		await this.store.transact(key, current => {
-			if (!current?.sessionId || !acceptsSlackInbound(current, inbound.rootTs, endpoint.generation)) return current;
+			if (
+				!current?.sessionId ||
+				!acceptsSlackInbound(current, inbound.rootTs, endpoint.generation) ||
+				current.attachmentAuthorityId !== endpoint.authorityId
+			)
+				return current;
 			const existing = (current.inboundDispatches ?? []).find(
 				candidate =>
 					candidate.eventId === inbound.eventId ||
@@ -1275,6 +1287,9 @@ export class SlackNotificationDaemon {
 				kind: command ? "command" : "action",
 				...(command ? {} : { actionId: current.pendingActionId }),
 				endpointGeneration: endpoint.generation,
+				...(current.attachmentAuthorityId === undefined
+					? {}
+					: { attachmentAuthorityId: current.attachmentAuthorityId }),
 				effectId,
 				idempotencyKey,
 			};
@@ -1400,6 +1415,8 @@ export class SlackNotificationDaemon {
 			current.sessionId === claim.sessionId &&
 			acceptsSlackInbound(current, current.rootTs ?? "", claim.endpoint.generation) &&
 			claim.receipt.endpointGeneration === claim.endpoint.generation &&
+			current.attachmentAuthorityId === claim.receipt.attachmentAuthorityId &&
+			current.attachmentAuthorityId === endpoint.authorityId &&
 			this.#matchesInboundEffect(effect, claim.receipt) &&
 			(await this.#actorAuthorized(effect.payload.routing.actorId)) &&
 			(current.inboundDispatches ?? []).some(receipt => this.#sameInboundReceipt(receipt, claim.receipt))
@@ -1471,7 +1488,11 @@ export class SlackNotificationDaemon {
 					continue;
 				}
 				const endpoint = await this.#resolveAttachment(record.sessionId!);
-				if (!endpoint || endpoint.generation !== receipt.endpointGeneration) {
+				if (
+					!endpoint ||
+					endpoint.generation !== receipt.endpointGeneration ||
+					record.attachmentAuthorityId !== endpoint.authorityId
+				) {
 					await this.#terminalizeStaleInboundDispatch(key, receipt, "stale_binding");
 					continue;
 				}
@@ -1571,6 +1592,7 @@ export class SlackNotificationDaemon {
 			receipt.kind === routing.kind &&
 			receipt.actionId === routing.actionId &&
 			receipt.endpointGeneration === effect.endpointGeneration &&
+			receipt.attachmentAuthorityId === routing.attachmentAuthorityId &&
 			receipt.effectId === effect.id &&
 			receipt.idempotencyKey === payload.idempotencyKey &&
 			((payload.type === "command" && routing.kind === "command" && effect.kind === "sdk.inbound.command") ||
@@ -1590,6 +1612,7 @@ export class SlackNotificationDaemon {
 			left.kind === right.kind &&
 			left.actionId === right.actionId &&
 			left.endpointGeneration === right.endpointGeneration &&
+			left.attachmentAuthorityId === right.attachmentAuthorityId &&
 			left.effectId === right.effectId &&
 			left.idempotencyKey === right.idempotencyKey
 		);
@@ -1605,6 +1628,8 @@ export class SlackNotificationDaemon {
 			!!record.sessionId &&
 			!!record.rootTs &&
 			acceptsSlackInbound(record, record.rootTs, receipt.endpointGeneration) &&
+			record.attachmentAuthorityId === receipt.attachmentAuthorityId &&
+			effect.payload.routing.attachmentAuthorityId === receipt.attachmentAuthorityId &&
 			record.sessionId === effect.sessionId &&
 			this.#matchesInboundEffect(effect, receipt)
 		);
@@ -1712,7 +1737,8 @@ export class SlackNotificationDaemon {
 				!current ||
 				!effect.sessionId ||
 				current.sessionId !== effect.sessionId ||
-				!acceptsSlackInbound(current, routing.rootTs, effect.endpointGeneration)
+				!acceptsSlackInbound(current, routing.rootTs, effect.endpointGeneration) ||
+				current.attachmentAuthorityId !== routing.attachmentAuthorityId
 			)
 				return current;
 			const existing = (current.inboundDispatches ?? []).find(
@@ -1743,6 +1769,9 @@ export class SlackNotificationDaemon {
 				kind: routing.kind,
 				...(routing.kind === "action" ? { actionId: routing.actionId } : {}),
 				endpointGeneration: effect.endpointGeneration,
+				...(routing.attachmentAuthorityId === undefined
+					? {}
+					: { attachmentAuthorityId: routing.attachmentAuthorityId }),
 				effectId: effect.id,
 				idempotencyKey: payload.idempotencyKey,
 			};

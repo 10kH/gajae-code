@@ -2323,16 +2323,12 @@ async function removeExactDeadSessionEndpoint(broker: Broker, id: string, record
 				mtimeNs: metadata.mtimeNs,
 				sha256: createHash("sha256").update(source).digest("hex"),
 			},
-			path.join(path.dirname(endpointPath), `.gjc-dead-endpoint-${randomUUID()}.json`),
+			path.join(
+				path.dirname(endpointPath),
+				`.gjc-dead-endpoint-${id}-${record.endpointGeneration}-${record.pid}-${String(record.endpointMtimeMs).replaceAll(".", "_")}.json`,
+			),
 		);
-		return (
-			removed.ok ||
-			removed.code === "not_found" ||
-			(removed.code === "cleanup_pending" &&
-				removed.detachedPath !== undefined &&
-				removed.retainedSuccessorPath === undefined &&
-				(await endpointRemoved(record.locator.stateRoot, id)))
-		);
+		return removed.ok || removed.code === "not_found";
 	} catch (error) {
 		return (error as NodeJS.ErrnoException).code === "ENOENT";
 	} finally {

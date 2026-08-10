@@ -2206,6 +2206,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 						teamId: "T1",
 						channelId: "C1",
 						rootTs: root.rootTs!,
+						attachmentAuthorityId: "session:1",
 						actorId: "U1",
 						eventId: "event-1",
 						interactionId: "interaction-1",

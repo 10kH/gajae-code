@@ -10,6 +10,7 @@ export interface SlackInboundDispatchReceipt {
 	actionId?: string;
 	/** The endpoint generation and SDK effect captured before Socket Mode ACK. */
 	endpointGeneration: number;
+	attachmentAuthorityId?: string;
 	/** Identifier of the protected journal payload; mappings never retain message bodies. */
 	effectId: string;
 	idempotencyKey: string;
