@@ -13,7 +13,12 @@ afterEach(() => {
 	for (const directory of tempDirs.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
 });
 
-async function routerFixture() {
+async function routerFixture(
+	options: {
+		onAttachment?: (attachment: SessionAttachment) => void | Promise<void>;
+		onSessionRemoved?: (attachment: SessionAttachment) => void | Promise<void>;
+	} = {},
+) {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-authority-"));
 	tempDirs.push(repo);
 	const agentDir = path.join(repo, ".gjc", "agent");
@@ -72,8 +77,10 @@ async function routerFixture() {
 				return client;
 			},
 			onAttachment: attachment => {
+				if (options.onAttachment) return options.onAttachment(attachment);
 				attachments.push(attachment);
 			},
+			onSessionRemoved: options.onSessionRemoved,
 			setInterval: (() => 0) as unknown as typeof setInterval,
 			clearInterval: (() => {}) as unknown as typeof clearInterval,
 		},
@@ -168,6 +175,25 @@ describe("SessionRouter dispatch authority", () => {
 		} finally {
 			await router.stop();
 			warnSpy.mockRestore();
+		}
+	});
+
+	test("revokes attachment authority when provider publication rejects", async () => {
+		let removed: SessionAttachment | undefined;
+		const fixture = await routerFixture({
+			onAttachment: () => {
+				throw new Error("provider cleanup recovery failed");
+			},
+			onSessionRemoved: attachment => {
+				removed = attachment;
+			},
+		});
+		try {
+			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+			expect(removed?.sessionId).toBe(fixture.sessionId);
+			expect(removed?.isCurrent()).toBe(false);
+		} finally {
+			await fixture.router.stop();
 		}
 	});
 	test("revokes an old attachment at send time before the periodic reconciliation tick", async () => {

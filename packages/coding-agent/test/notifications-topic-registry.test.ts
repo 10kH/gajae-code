@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes definitive-rejection generation 134 at serving epoch 81", () => {
+test("publishes attachment-publication generation 135 at serving epoch 82", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 134 / serving epoch 81: definitive provider rejection remains replayable after persistence failure.
-	expect(DAEMON_GENERATION).toBe(134);
-	expect(SERVING_EPOCH).toBe(81);
+	// Generation 135 / serving epoch 82: provider cleanup failure revokes attachment publication.
+	expect(DAEMON_GENERATION).toBe(135);
+	expect(SERVING_EPOCH).toBe(82);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();

@@ -196,8 +196,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 132 invalidates Discord create-intent leases at drain expiry.
  * Generation 133 serializes Discord creator invalidation with in-flight admission.
  * Generation 134 durably restores replay after definitive provider rejection.
+ * Generation 135 revokes attachments whose provider publication hook rejects.
  */
-export const DAEMON_GENERATION = 134;
+export const DAEMON_GENERATION = 135;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -277,5 +278,6 @@ export const DAEMON_GENERATION = 134;
  * Epoch 79 releases timed-out Discord creator ownership for successor recovery.
  * Epoch 80 terminalizes leases admitted after shutdown invalidator snapshot.
  * Epoch 81 preserves definitive provider rejection across persistence failure and restart.
+ * Epoch 82 fails closed before exposing provider attachments after cleanup recovery failure.
  */
-export const SERVING_EPOCH = 81;
+export const SERVING_EPOCH = 82;

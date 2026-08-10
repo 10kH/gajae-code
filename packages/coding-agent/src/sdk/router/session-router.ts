@@ -570,7 +570,21 @@ export class SessionRouter {
 			},
 		};
 		this.#sessions.set(indexed.sessionId, attached);
-		await this.#deps.onAttachment?.(capability);
+		try {
+			await this.#deps.onAttachment?.(capability);
+		} catch (error) {
+			const failedStillCurrent = this.#sessions.get(indexed.sessionId) === attached;
+			if (failedStillCurrent) this.#sessions.delete(indexed.sessionId);
+			attached.dispose();
+			await attached.client.close().catch(() => undefined);
+			if (failedStillCurrent)
+				try {
+					await this.#deps.onSessionRemoved?.(capability);
+				} catch {
+					// Attachment publication failed closed; provider cleanup remains best effort.
+				}
+			throw error;
+		}
 		if (!this.#running(runEpoch)) {
 			const staleStillCurrent = this.#sessions.get(indexed.sessionId) === attached;
 			if (staleStillCurrent) this.#sessions.delete(indexed.sessionId);
