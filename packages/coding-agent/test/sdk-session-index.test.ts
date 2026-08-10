@@ -803,4 +803,28 @@ describe("SDK session index", () => {
 			mkdir.mockRestore();
 		}
 	});
+	it("does not unregister a same-session successor under the index lock", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-unregister-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append({
+			...event("session"),
+			pid: 1001,
+			endpointMtimeMs: 1,
+			lifecycleRequestId: "request-a",
+			processIncarnation: "incarnation-a",
+		});
+		const predecessor = index.listSessions().sessions[0]!;
+		await index.append({
+			...event("session"),
+			pid: 1002,
+			endpointMtimeMs: 2,
+			lifecycleRequestId: "request-b",
+			processIncarnation: "incarnation-b",
+		});
+		expect(await index.unregisterIfCurrent(predecessor)).toBe(false);
+		const successor = index.listSessions().sessions[0]!;
+		expect(successor).toMatchObject({ pid: 1002, lifecycleRequestId: "request-b" });
+		expect(await index.unregisterIfCurrent(successor)).toBe(true);
+		expect(index.listSessions().sessions).toEqual([]);
+	});
 });

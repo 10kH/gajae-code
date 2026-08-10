@@ -2375,15 +2375,7 @@ async function waitForClose(broker: Broker, id: string, record: CloseRecord, tim
 				!(await removeExactDeadSessionEndpoint(broker, id, record))
 			)
 				return false;
-			await broker.index.append({
-				type: "host_unregistered",
-				sessionId: id,
-				locator: registration.locator,
-				endpointGeneration: registration.endpointGeneration,
-				pid: registration.pid,
-				...(registration.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: registration.endpointMtimeMs }),
-				...(registration.lifecycleRequestId ? { lifecycleRequestId: registration.lifecycleRequestId } : {}),
-			});
+			await broker.index.unregisterIfCurrent(registration);
 			return await endpointRemoved(record.locator.stateRoot, id);
 		}
 		await timing.sleep(POLL_MS);
