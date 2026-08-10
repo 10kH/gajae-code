@@ -237,6 +237,7 @@ export class SessionRouter {
 	readonly #index: SessionIndex;
 	readonly #sessions = new Map<string, AttachedSession>();
 	readonly #adopted = new Map<string, AdoptedSession>();
+	readonly #retirements = new Map<string, Promise<void>>();
 	readonly #pending = new Set<Promise<void>>();
 	readonly #frameTails = new Map<string, Promise<void>>();
 	readonly #undelivered = new Map<string, { generation: number; seq: number; attempts: number }>();
@@ -713,6 +714,8 @@ export class SessionRouter {
 		skipReplay = false,
 		deferPublication = false,
 	): Promise<boolean> {
+		const retirement = this.#retirements.get(indexed.sessionId);
+		if (retirement) await retirement;
 		if (!this.#running(runEpoch)) return false;
 		if (indexed.endpointMtimeMs === undefined) return false;
 		const endpoint = resolvedEndpoint ?? (await this.#readEndpoint(indexed));
@@ -1010,30 +1013,37 @@ export class SessionRouter {
 		if (this.#sessions.get(attached.sessionId) !== attached) return;
 		this.#sessions.delete(attached.sessionId);
 		attached.dispose();
-		await attached.client.close().catch(() => undefined);
-		let reason = explicitReason;
-		if (reason === undefined) {
-			try {
-				await this.#index.refresh();
-				const current = this.#index
-					.listSessions()
-					.sessions.find(session => session.sessionId === attached.sessionId);
-				if (
-					current?.live &&
-					(current.endpointGeneration !== attached.generation ||
-						current.pid !== attached.pid ||
-						current.endpointMtimeMs !== attached.endpointMtimeMs)
-				)
-					reason = current.endpointGeneration === attached.generation ? "replaced_same_generation" : "replaced";
-			} catch {
-				// Revocation remains terminal when current Broker authority cannot be proven.
-			}
-		}
-		reason ??= "removed";
+		const gate = Promise.withResolvers<void>();
+		this.#retirements.set(attached.sessionId, gate.promise);
 		try {
-			await this.#deps.onSessionRemoved?.(attached.capability, reason);
-		} catch {
-			// Exact authority is already revoked; provider cleanup remains best effort.
+			let reason = explicitReason;
+			if (reason === undefined) {
+				try {
+					await this.#index.refresh();
+					const current = this.#index
+						.listSessions()
+						.sessions.find(session => session.sessionId === attached.sessionId);
+					if (
+						current?.live &&
+						(current.endpointGeneration !== attached.generation ||
+							current.pid !== attached.pid ||
+							current.endpointMtimeMs !== attached.endpointMtimeMs)
+					)
+						reason = current.endpointGeneration === attached.generation ? "replaced_same_generation" : "replaced";
+				} catch {
+					// Revocation remains terminal when current Broker authority cannot be proven.
+				}
+			}
+			reason ??= "removed";
+			try {
+				await this.#deps.onSessionRemoved?.(attached.capability, reason);
+			} catch {
+				// Exact authority is already revoked; provider cleanup remains best effort.
+			}
+			await attached.client.close().catch(() => undefined);
+		} finally {
+			gate.resolve();
+			if (this.#retirements.get(attached.sessionId) === gate.promise) this.#retirements.delete(attached.sessionId);
 		}
 	}
 

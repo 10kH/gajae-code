@@ -23,7 +23,10 @@ async function routerFixture(
 	options: {
 		onAttachment?: (attachment: SessionAttachment) => void | Promise<void>;
 		onAttachmentReady?: (attachment: SessionAttachment) => void | Promise<void>;
-		onSessionRemoved?: (attachment: SessionAttachment) => void | Promise<void>;
+		onSessionRemoved?: (
+			attachment: SessionAttachment,
+			reason?: "removed" | "replaced" | "replaced_same_generation",
+		) => void | Promise<void>;
 		onFrame?: (attachment: SessionAttachment, frame: SessionRouterFrame) => void | Promise<void>;
 		start?: boolean;
 		initiallyIndexed?: boolean;
@@ -430,6 +433,42 @@ describe("SessionRouter dispatch authority", () => {
 		expect(fixture.clients[0]?.sent).toEqual([]);
 		expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
 		await fixture.router.stop();
+	});
+
+	test("holds reconnect successor attachment behind predecessor provider retirement", async () => {
+		const entered = Promise.withResolvers<"replaced_same_generation">();
+		const release = Promise.withResolvers<void>();
+		const fixture = await routerFixture({
+			onSessionRemoved: async (_attachment, reason) => {
+				if (reason !== "replaced_same_generation") return;
+				entered.resolve(reason);
+				await release.promise;
+			},
+		});
+		try {
+			fs.writeFileSync(
+				fixture.endpointFile,
+				JSON.stringify({
+					sessionId: fixture.sessionId,
+					url: "ws://router.test",
+					token: "replacement",
+					pid: 43,
+				}),
+			);
+			fixture.authority.pid = 43;
+			fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
+			fixture.clients[0]?.reconnect();
+			await entered.promise;
+			const reconciliation = fixture.router.reconcile();
+			await Bun.sleep(25);
+			expect(fixture.clients).toHaveLength(1);
+			release.resolve();
+			await reconciliation;
+			expect(fixture.clients).toHaveLength(2);
+		} finally {
+			release.resolve();
+			await fixture.router.stop();
+		}
 	});
 
 	test("reruns the provider handshake before replay after reconnect", async () => {

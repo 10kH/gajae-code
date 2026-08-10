@@ -210,8 +210,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 146 revokes token-zero and callback leases before endpoint replacement while retaining topic presentation.
  * Generation 147 uses a restart-stable opaque Router endpoint-incarnation identity.
  * Generation 148 classifies reconnect-time endpoint successors before attachment retirement.
+ * Generation 149 serializes successor attachment behind predecessor provider retirement.
  */
-export const DAEMON_GENERATION = 148;
+export const DAEMON_GENERATION = 149;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
