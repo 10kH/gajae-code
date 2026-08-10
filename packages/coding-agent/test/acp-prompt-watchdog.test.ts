@@ -10,6 +10,12 @@ import {
 	ACP_PROMPT_INFERENCE_TIMEOUT_MS,
 	ACP_PROMPT_TOOL_ACTIVITY_TIMEOUT_MS,
 } from "../src/sdk/prompt-watchdog";
+import {
+	type ExactSessionAuthorityFixture,
+	type ExactSessionAuthorityOptions,
+	prepareExactSessionAuthority,
+	publishExactSessionAuthority,
+} from "./helpers/sdk-exact-session-authority";
 
 setDefaultTimeout(30_000);
 
@@ -149,6 +155,8 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 	let turnId = "";
 	let promptSocket: TestSocket | undefined;
 	let server!: ReturnType<typeof Bun.serve>;
+	let authority: ExactSessionAuthorityFixture;
+	let authorityOptions: ExactSessionAuthorityOptions;
 
 	const send = (frame: Record<string, unknown>): void => {
 		if (!promptSocket) throw new Error("Expected a prompt socket");
@@ -235,11 +243,12 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 					return;
 				}
 				if (frame.type === "broker_request") {
-					const result =
-						frame.operation === "session.create"
-							? { sessionId, endpoint: { url: `ws://127.0.0.1:${server.port}`, token } }
-							: {};
-					socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result }));
+					if (frame.operation !== "session.create") {
+						socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: {} }));
+						return;
+					}
+					void publishExactSessionAuthority(authorityOptions, authority);
+					socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: authority }));
 					return;
 				}
 				if (frame.type === "query_request") {
@@ -292,6 +301,14 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 	});
 	const port = server.port;
 	if (port === undefined) throw new Error("Expected an ACP fixture server port");
+	authorityOptions = {
+		agentDir,
+		cwd,
+		sessionId,
+		url: `ws://127.0.0.1:${port}`,
+		token,
+	};
+	authority = await prepareExactSessionAuthority(authorityOptions);
 	await writeBrokerDiscovery(agentDir, {
 		version: 1,
 		protocolVersion: 3,

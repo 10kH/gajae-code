@@ -5,6 +5,12 @@ import path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import {
+	type ExactSessionAuthorityFixture,
+	type ExactSessionAuthorityOptions,
+	prepareExactSessionAuthority,
+	publishExactSessionAuthority,
+} from "./helpers/sdk-exact-session-authority";
 
 type TestServer = {
 	port: number | undefined;
@@ -203,6 +209,8 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const controlOperations: string[] = [];
 	const updates: SessionNotification[] = [];
 	const providerRegistrations: Array<Record<string, unknown>> = [];
+	let authority: ExactSessionAuthorityFixture;
+	let authorityOptions: ExactSessionAuthorityOptions;
 	let promptSocket: { send(message: string): void } | undefined;
 	let abortAcknowledged = true;
 	let promptDeliveredWhileBusy = false;
@@ -241,17 +249,8 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 					brokerRequests.push(frame);
 					if (frame.operation === "session.create" || frame.operation === "session.resume") {
 						lifecycleInputs.push(frame.input as Record<string, unknown>);
-						socket.send(
-							JSON.stringify({
-								type: "broker_response",
-								id: frame.id,
-								ok: true,
-								result: {
-									sessionId: "owned-session",
-									endpoint: { url: `ws://127.0.0.1:${server.port}`, token },
-								},
-							}),
-						);
+						void publishExactSessionAuthority(authorityOptions, authority);
+						socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: authority }));
 						return;
 					}
 					if (frame.operation === "session.list") {
@@ -488,6 +487,14 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	});
 	servers.push(server);
 	await mkdir(cwd, { recursive: true });
+	authorityOptions = {
+		agentDir,
+		cwd,
+		sessionId: "owned-session",
+		url: `ws://127.0.0.1:${server.port}`,
+		token,
+	};
+	authority = await prepareExactSessionAuthority(authorityOptions);
 	await writeBrokerDiscovery(agentDir, {
 		version: 1,
 		protocolVersion: 3,
