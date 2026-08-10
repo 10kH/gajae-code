@@ -60,9 +60,11 @@ describe("SDK-owned session lifecycle authority", () => {
 	test("only SDK core modules read Broker and session endpoint discovery", async () => {
 		const router = await source("src/sdk/router/session-router.ts");
 		const lifecycleClient = await source("src/sdk/lifecycle/client.ts");
+		const brokerClient = await source("src/sdk/lifecycle/broker-client.ts");
 		expect(router).toContain("readSdkSessionEndpoint");
 		expect(router).toContain("readSdkBrokerDiscovery");
-		expect(lifecycleClient).toContain("readSdkBrokerDiscovery");
+		expect(lifecycleClient).toContain('from "./broker-client"');
+		expect(brokerClient).toContain("readSdkBrokerDiscovery");
 	});
 
 	test("providers consume opaque Router attachments", async () => {

@@ -35,6 +35,7 @@ test("ACP provider activation retries the current Router attachment after rotati
 		},
 	};
 	const attachment = (generation: number): SessionAttachment => ({
+		authorityId: `session-1:${generation}`,
 		sessionId: "session-1",
 		generation,
 		isCurrent: () => currentGeneration === generation,

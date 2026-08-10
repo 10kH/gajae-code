@@ -63,7 +63,13 @@ class FakeSlack {
 }
 
 function endpoint(sessionId: string, generation: number): SessionAttachment {
-	return { sessionId, generation, isCurrent: () => true, send: () => undefined };
+	return {
+		authorityId: `${sessionId}:${generation}`,
+		sessionId,
+		generation,
+		isCurrent: () => true,
+		send: () => undefined,
+	};
 }
 
 function intentKey(sessionId: string): string {
