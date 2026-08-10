@@ -252,7 +252,7 @@ export class ChatDaemonRuntime {
 				...deps.routerDeps,
 				onFrame: async (attachment, frame) => await this.#handleFrame(attachment, frame),
 				onAttachment: async attachment => this.#onAttachment(attachment),
-				onSessionRemoved: async attachment => await this.#close(attachment.sessionId),
+				onSessionRemoved: async attachment => await this.#close(attachment),
 			},
 		});
 	}
@@ -375,7 +375,7 @@ export class ChatDaemonRuntime {
 		const sessionId = attachment.sessionId;
 		const name = correlated.name;
 		if (name === "session_closed" || name === "session_terminated") {
-			await this.#close(sessionId);
+			await this.#close(attachment);
 			return;
 		}
 		if (name === SESSION_PREPARED_EVENT || bodyType === SESSION_PREPARED_EVENT) return;
@@ -422,9 +422,9 @@ export class ChatDaemonRuntime {
 			);
 	}
 
-	async #close(sessionId: string): Promise<void> {
-		await this.#discord?.close(sessionId);
-		await this.#slack?.close(sessionId);
+	async #close(attachment: SessionAttachment): Promise<void> {
+		await this.#discord?.close(attachment.sessionId, attachment.generation);
+		await this.#slack?.close(attachment.sessionId, undefined, attachment.generation);
 	}
 
 	async #resume(sessionId: string, generation: number, content: string, publicationId?: string): Promise<void> {

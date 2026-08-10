@@ -843,13 +843,20 @@ export class SlackNotificationDaemon {
 		);
 	}
 
-	async close(sessionId: string, marker = "Session closed."): Promise<boolean> {
-		return await this.#track(this.#close(sessionId, marker, true));
+	async close(sessionId: string, marker = "Session closed.", endpointGeneration?: number): Promise<boolean> {
+		return await this.#track(this.#close(sessionId, marker, true, endpointGeneration));
 	}
 
-	async #close(sessionId: string, marker: string, allowRemovedAttachment: boolean): Promise<boolean> {
+	async #close(
+		sessionId: string,
+		marker: string,
+		allowRemovedAttachment: boolean,
+		expectedEndpointGeneration?: number,
+	): Promise<boolean> {
 		const found = await this.findSession(sessionId, true);
 		if (!found?.record.rootTs || found.record.state !== "active") return false;
+		if (expectedEndpointGeneration !== undefined && found.record.endpointGeneration !== expectedEndpointGeneration)
+			return false;
 		const effectId = `${allowRemovedAttachment ? "close-marker-cleanup" : "close-marker"}:${sessionId}:${found.record.clientMsgId ?? found.record.rootTs}`;
 		const existing = await this.#journal.read<{
 			channel: string;
@@ -1011,7 +1018,7 @@ export class SlackNotificationDaemon {
 			}
 			let closed = false;
 			try {
-				closed = await this.#track(this.#close(sessionId, "Session closed.", false));
+				closed = await this.#track(this.#close(sessionId, "Session closed.", false, previousGeneration));
 			} catch (error) {
 				if (!(error instanceof SlackStaleEffectError)) throw error;
 				// The old-generation close marker was deliberately suppressed after

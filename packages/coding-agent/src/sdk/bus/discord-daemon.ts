@@ -373,8 +373,8 @@ export class DiscordNotificationDaemon {
 		return true;
 	}
 
-	async close(sessionId: string): Promise<void> {
-		const closing = await this.#markClosing(sessionId);
+	async close(sessionId: string, endpointGeneration?: number): Promise<void> {
+		const closing = await this.#markClosing(sessionId, endpointGeneration);
 		if (closing) await this.#driveClose(closing);
 	}
 
@@ -1410,9 +1410,10 @@ export class DiscordNotificationDaemon {
 		if (!record.threadId || !intent) throw new Error("Discord close intent is unavailable.");
 		return `close-archive:${record.threadId}:${intent.nonce}`;
 	}
-	async #markClosing(sessionId: string): Promise<DiscordConversation | undefined> {
+	async #markClosing(sessionId: string, endpointGeneration?: number): Promise<DiscordConversation | undefined> {
 		const record = await this.#bySession(sessionId);
 		if (!record?.threadId || record.state === "closed") return undefined;
+		if (endpointGeneration !== undefined && record.endpointGeneration !== endpointGeneration) return undefined;
 		const key = discordConversationKey({
 			appId: record.appId,
 			guildId: record.guildId,
@@ -1421,7 +1422,13 @@ export class DiscordNotificationDaemon {
 		});
 		let closing: DiscordConversation | undefined;
 		await this.#store.transact(key, current => {
-			if (!current || current.sessionId !== sessionId || !current.threadId || current.state === "closed")
+			if (
+				!current ||
+				current.sessionId !== sessionId ||
+				!current.threadId ||
+				current.state === "closed" ||
+				(endpointGeneration !== undefined && current.endpointGeneration !== endpointGeneration)
+			)
 				return current;
 			if (closingIntent(current)) {
 				closing = current;

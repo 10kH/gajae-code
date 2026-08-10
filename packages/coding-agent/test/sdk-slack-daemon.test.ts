@@ -613,6 +613,17 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		});
 	});
 
+	it("rejects a delayed cleanup callback for a successor generation", async () => {
+		await withDaemon(async (daemon, fake, _injected, setEndpointGeneration) => {
+			await daemon.postRoot("session", "root");
+			setEndpointGeneration(2);
+			await daemon.resume("session", "successor", 2);
+			const posts = fake.posts.length;
+			expect(await daemon.close("session", undefined, 1)).toBe(false);
+			expect(fake.posts).toHaveLength(posts);
+		});
+	});
+
 	it("reconciles an accepted uncertain post with its original durable client message id", async () => {
 		await withDaemon(async (daemon, fake) => {
 			fake.failPostAfterAccept = true;

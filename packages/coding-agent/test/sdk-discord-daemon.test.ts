@@ -2027,6 +2027,18 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 		);
 	});
 
+	test("rejects a delayed cleanup callback for a successor generation", async () => {
+		await withDaemon(async (daemon, provider) => {
+			await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
+			await daemon.resume("session", 2);
+			const messageCount = provider.messages.length;
+			const archiveCount = provider.archived.length;
+			await daemon.close("session", 1);
+			expect(provider.messages).toHaveLength(messageCount);
+			expect(provider.archived).toHaveLength(archiveCount);
+		});
+	});
+
 	test("terminalizes stale post, archive, and unarchive effects after close and generation-rotated resume", async () => {
 		await withDaemon(async (daemon, provider, agentDir) => {
 			const original = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
