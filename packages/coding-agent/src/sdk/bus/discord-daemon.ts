@@ -165,6 +165,7 @@ export class DiscordNotificationDaemon {
 	) => SessionAttachment | null | Promise<SessionAttachment | null>;
 	readonly #effects: ChatEffectJournal;
 	readonly #activeWork = new Set<Promise<unknown>>();
+	readonly #workInvalidators = new Set<() => Promise<void>>();
 	readonly #inflightInbound = new Set<string>();
 	#started = false;
 	#lifecycleGeneration = 0;
@@ -299,7 +300,7 @@ export class DiscordNotificationDaemon {
 		while (this.#activeWork.size > 0) {
 			const remaining = drainDeadline - this.#now();
 			if (remaining <= 0) {
-				this.#workGeneration += 1;
+				await this.#invalidateActiveWork();
 				logger.warn("Discord provider work exceeded the 5000ms shutdown drain; continuing with Router revocation.");
 				return;
 			}
@@ -308,11 +309,16 @@ export class DiscordNotificationDaemon {
 				Bun.sleep(remaining).then(() => false),
 			]);
 			if (!settled) {
-				this.#workGeneration += 1;
+				await this.#invalidateActiveWork();
 				logger.warn("Discord provider work exceeded the 5000ms shutdown drain; continuing with Router revocation.");
 				return;
 			}
 		}
+	}
+
+	async #invalidateActiveWork(): Promise<void> {
+		this.#workGeneration += 1;
+		await Promise.allSettled([...this.#workInvalidators].map(invalidate => invalidate()));
 	}
 
 	/**
@@ -1769,6 +1775,13 @@ export class DiscordNotificationDaemon {
 		let revalidationFailed = false;
 		let providerEffectStarted = false;
 		let renewal: Promise<boolean> | undefined;
+		const invalidate = async (): Promise<void> => {
+			renewalLost = true;
+			await this.#rescheduleAfterEffectTransition(
+				this.#effects.record(id, lease, "uncertain", { status: "shutdown_timeout" }),
+			);
+		};
+		this.#workInvalidators.add(invalidate);
 		const renewLease = async (): Promise<boolean> => {
 			if (renewalLost || workGeneration !== this.#workGeneration) {
 				renewalLost = true;
@@ -1779,6 +1792,10 @@ export class DiscordNotificationDaemon {
 				const renewed = await this.#rescheduleAfterEffectTransition(
 					this.#effects.renew(id, lease, this.#providerLeaseMs),
 				);
+				if (workGeneration !== this.#workGeneration) {
+					await invalidate();
+					return false;
+				}
 				if (!renewed) renewalLost = true;
 				return !renewalLost;
 			})();
@@ -1824,6 +1841,7 @@ export class DiscordNotificationDaemon {
 			throw error;
 		} finally {
 			clearInterval(timer);
+			this.#workInvalidators.delete(invalidate);
 		}
 	}
 
