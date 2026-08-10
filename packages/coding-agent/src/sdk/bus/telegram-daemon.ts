@@ -5021,10 +5021,13 @@ export class TelegramNotificationDaemon {
 			await this.#publicationSettlement(frame.publicationId).promise;
 	}
 
-	async #onSessionRemoved(attachment: SessionAttachment, reason: "removed" | "replaced" = "removed"): Promise<void> {
+	async #onSessionRemoved(
+		attachment: SessionAttachment,
+		reason: "removed" | "replaced" | "replaced_same_generation" = "removed",
+	): Promise<void> {
 		const session = this.sessions.get(attachment.sessionId);
 		if (!session || session.attachment !== attachment) return;
-		if (reason === "replaced") {
+		if (reason === "replaced" || reason === "replaced_same_generation") {
 			this.sessions.delete(attachment.sessionId);
 			return;
 		}

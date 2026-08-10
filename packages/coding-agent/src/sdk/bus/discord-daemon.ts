@@ -475,6 +475,24 @@ export class DiscordNotificationDaemon {
 		await this.#driveClose(record);
 	}
 
+	async retireAttachment(sessionId: string, endpointGeneration: number): Promise<void> {
+		const record = await this.#bySession(sessionId);
+		if (!record?.threadId || record.endpointGeneration !== endpointGeneration) return;
+		for (const receipt of record.inboundDispatches ?? [])
+			await this.#terminalizeInbound(record, receipt, "stale_binding");
+		const key = discordConversationKey({
+			appId: record.appId,
+			guildId: record.guildId,
+			parentChannelId: record.parentChannelId,
+			threadId: record.threadId,
+		});
+		await this.#store.transact(key, current =>
+			current?.sessionId === sessionId && current.endpointGeneration === endpointGeneration
+				? withoutClosingIntent(current, this.#now())
+				: current,
+		);
+	}
+
 	async archive(sessionId: string): Promise<void> {
 		const running = this.#archives.get(sessionId);
 		if (running) return await running;

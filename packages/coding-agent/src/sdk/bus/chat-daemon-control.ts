@@ -102,10 +102,11 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 47 / Slack generation 52 preserve presentation continuity across replacement while exact opaque authority fences stale work.
  * Discord generation 48 / Slack generation 53 allow exact publication-time requests without reconciliation deadlock.
  * Discord generation 49 / Slack generation 54 revalidate endpoint authority before exact publication-time requests.
+ * Discord generation 50 / Slack generation 55 terminalize predecessor routes only for a changed same-generation endpoint incarnation.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 49,
-	slack: 54,
+	discord: 50,
+	slack: 55,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

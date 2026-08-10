@@ -206,8 +206,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 142 migrates live adoption reservations and applies create throttling to topic adoption.
  * Generation 143 preserves topic presentation continuity across exact Router endpoint replacement.
  * Generation 144 revalidates endpoint authority before exact publication-time requests.
+ * Generation 145 distinguishes transport reconnect from a changed same-generation endpoint successor.
  */
-export const DAEMON_GENERATION = 144;
+export const DAEMON_GENERATION = 145;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
