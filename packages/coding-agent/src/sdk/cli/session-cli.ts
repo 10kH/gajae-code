@@ -3,11 +3,8 @@ import { getAgentDir } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { SdkClientError } from "../client";
-import {
-	createSessionLifecycleService,
-	type SessionLifecycleMutationRequest,
-	type SessionLifecycleOperation,
-} from "../lifecycle";
+import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
+import type { SessionLifecycleMutationRequest, SessionLifecycleOperation } from "../lifecycle/service";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { adapterDispositionError, findOperation, type OperationKind } from "../protocol/operation-registry";
 import { type SessionAttachment, SessionRouter, SessionRouterError } from "../router";
@@ -263,7 +260,7 @@ export async function runSdkSessionCli(
 					),
 				);
 			} else if (isLifecycleOperation(operation)) {
-				const lifecycleService = createSessionLifecycleService(agentDir);
+				const lifecycleService = createBrokerSessionLifecycleService(agentDir);
 				const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
 				writeOutput(
 					await lifecycleService.execute({

@@ -2,12 +2,12 @@ import { getAgentDir } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { SdkClientError } from "../client/client";
-import {
-	createSessionLifecycleService,
-	type SessionLifecycleMutationRequest,
-	type SessionLifecycleOperation,
-	type SessionLifecycleService,
-} from "../lifecycle";
+import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
+import type {
+	SessionLifecycleMutationRequest,
+	SessionLifecycleOperation,
+	SessionLifecycleService,
+} from "../lifecycle/service";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { adapterDispositionError, findOperation } from "../protocol/operation-registry";
 import { type SessionAttachment, SessionRouter, SessionRouterError } from "../router";
@@ -180,7 +180,7 @@ function textResult(
 export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 	const agentDir = options.agentDir ?? getAgentDir();
 	const router = options.router ?? new SessionRouter({ agentDir });
-	const lifecycleService = options.lifecycleService ?? createSessionLifecycleService(agentDir);
+	const lifecycleService = options.lifecycleService ?? createBrokerSessionLifecycleService(agentDir);
 	let startPromise: Promise<void> | undefined;
 	let closePromise: Promise<void> | undefined;
 
