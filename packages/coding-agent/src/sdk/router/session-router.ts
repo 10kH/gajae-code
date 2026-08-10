@@ -18,6 +18,7 @@ import { ACP_SESSION_RECONNECT } from "../session-reconnect";
 /** The only capability a provider may retain for an attached SDK session. */
 export interface SessionAttachment {
 	readonly sessionId: string;
+	readonly authorityId?: string;
 	readonly generation: number;
 	isCurrent(): boolean;
 	send(frame: Record<string, unknown>): unknown;
@@ -66,7 +67,7 @@ export interface SessionRouterDeps {
 	/** Called only after the opaque capability becomes externally current. */
 	onAttachmentReady?: (attachment: SessionAttachment) => Promise<void> | void;
 	/** Called when the Broker index no longer reports an attached session as live. */
-	onSessionRemoved?: (attachment: SessionAttachment) => Promise<void> | void;
+	onSessionRemoved?: (attachment: SessionAttachment, reason?: "removed" | "replaced") => Promise<void> | void;
 	onReconciled?: () => void;
 	setInterval?: typeof setInterval;
 	clearInterval?: typeof clearInterval;
@@ -725,7 +726,7 @@ export class SessionRouter {
 					`SDK session replacement transport cleanup failed for ${indexed.sessionId}; authority remains revoked (${String(error)}).`,
 				);
 			}
-			await this.#deps.onSessionRemoved?.(existing.capability);
+			await this.#deps.onSessionRemoved?.(existing.capability, "replaced");
 			if (!resumable) {
 				this.#undelivered.delete(indexed.sessionId);
 				this.#recoveredFrames.delete(indexed.sessionId);
@@ -748,6 +749,7 @@ export class SessionRouter {
 		const publication = Promise.withResolvers<void>();
 		void publication.promise.catch(() => undefined);
 		const capability: SessionAttachment = Object.freeze({
+			authorityId: randomUUID(),
 			sessionId: indexed.sessionId,
 			generation: indexed.endpointGeneration,
 			isCurrent: () => attached !== undefined && this.#attachmentPublished(attached),
@@ -783,7 +785,10 @@ export class SessionRouter {
 			this.#schedule(task);
 		});
 		const disposeReconnect = client.onReconnect?.(() => {
-			if (attached) this.#schedule(this.#reinitializeAttachment(attached));
+			if (attached) {
+				attached.barrier.held ??= [];
+				this.#schedule(this.#reinitializeAttachment(attached));
+			}
 		});
 		attached = {
 			initializingPublication: false,
@@ -848,6 +853,7 @@ export class SessionRouter {
 				}
 			return false;
 		}
+		if (!skipReplay) attached.barrier.held ??= [];
 		attached.published = true;
 		attached.publication.resolve();
 		attached.initializingPublication = true;
@@ -878,6 +884,7 @@ export class SessionRouter {
 	async #publishAttachment(attached: AttachedSession, skipReplay: boolean): Promise<boolean> {
 		if (attached.published) return this.#attachmentPublished(attached);
 		if (!this.#attachmentLive(attached)) return false;
+		if (!skipReplay) attached.barrier.held ??= [];
 		attached.published = true;
 		attached.publication.resolve();
 		attached.initializingPublication = true;
@@ -1132,7 +1139,7 @@ export class SessionRouter {
 
 	async #replayAttachment(attached: AttachedSession, sinceSeq: number): Promise<void> {
 		if (!this.#attachmentLive(attached)) return;
-		const held: HeldFrame[] = [];
+		const held: HeldFrame[] = attached.barrier.held ?? [];
 		attached.barrier.held = held;
 		try {
 			let replay: Record<string, unknown>;

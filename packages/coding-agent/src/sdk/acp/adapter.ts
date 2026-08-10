@@ -192,6 +192,11 @@ export class AcpSdkAdapter {
 
 	async attachmentReady(attachment: SessionAttachment): Promise<void> {
 		if (this.#attachment !== attachment) this.acceptAttachment(attachment);
+		else {
+			this.#connectionId = undefined;
+			this.#routerConnectionReady = false;
+			this.#providersActivated = false;
+		}
 		if (!attachment.isCurrent()) throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 		await this.#activateProviders();
 	}

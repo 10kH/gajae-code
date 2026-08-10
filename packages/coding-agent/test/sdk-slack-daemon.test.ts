@@ -122,7 +122,13 @@ class FakeSlack {
 }
 
 function endpoint(sessionId: string, generation = 1): SessionAttachment {
-	return { sessionId, generation, isCurrent: () => true, send: () => undefined };
+	return {
+		authorityId: `${sessionId}:${generation}`,
+		sessionId,
+		generation,
+		isCurrent: () => true,
+		send: () => undefined,
+	};
 }
 
 type LoadBarrier = {

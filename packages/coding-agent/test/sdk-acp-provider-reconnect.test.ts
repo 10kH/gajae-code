@@ -35,6 +35,7 @@ test("ACP provider activation retries the current Router attachment after rotati
 		},
 	};
 	const attachment = (generation: number): SessionAttachment => ({
+		authorityId: `session-1:${generation}`,
 		sessionId: "session-1",
 		generation,
 		isCurrent: () => currentGeneration === generation,
@@ -61,6 +62,41 @@ test("ACP provider activation retries the current Router attachment after rotati
 			generation: 2,
 			attachment: secondAttachment,
 			frame: { type: "register_provider", capability: "ui" },
+		});
+	} finally {
+		await adapter.close();
+	}
+});
+
+test("ACP provider readiness renews leases on the same attachment after transport reconnect", async () => {
+	const registrations: Record<string, unknown>[] = [];
+	const attachment: SessionAttachment = {
+		authorityId: "session-1:stable",
+		sessionId: "session-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async (_sessionId: string, frame: Record<string, unknown>) => {
+				registrations.push(frame);
+				return { ok: true, result: { leaseId: "lease-1" } };
+			},
+		} as never,
+		attachment,
+		sessionId: attachment.sessionId,
+		providers: [{ capability: "ui", definitions: [{ name: "select" }] }],
+	});
+	try {
+		await adapter.start();
+		expect(registrations).toHaveLength(1);
+		await adapter.attachmentReady(attachment);
+		expect(registrations).toHaveLength(2);
+		expect(registrations[1]).toMatchObject({
+			type: "register_provider",
+			capability: "ui",
+			expectedLeaseId: "lease-1",
 		});
 	} finally {
 		await adapter.close();

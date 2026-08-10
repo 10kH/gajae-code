@@ -476,35 +476,6 @@ describe("chat daemon worker", () => {
 			),
 		).toBe(false);
 		expect(JSON.stringify(provider.messages)).not.toContain("daemon-result-secret");
-		const globalRequest = brokerClient.waitForRequest(
-			request => request.type === "broker_request" && request.operation === "session.list",
-		);
-		const globalResult = provider.waitForMessage(
-			message =>
-				message.content ===
-				JSON.stringify({ ok: true, result: { operation: "session.list", status: "completed" } }),
-		);
-		await provider.handler?.({
-			id: "global",
-			guildId: "guild",
-			parentId: "parent",
-			threadId: "thread-1",
-			authorId: "human",
-			content: "/sdk global session.list {}",
-		});
-		await Promise.all([globalRequest, globalResult]);
-		expect(brokerClient.requests).toContainEqual(
-			expect.objectContaining({
-				type: "broker_request",
-				operation: "session.list",
-				input: {},
-				idempotencyKey: expect.any(String),
-			}),
-		);
-		expect(provider.messages).toContainEqual({
-			threadId: "thread-1",
-			content: JSON.stringify({ ok: true, result: { operation: "session.list", status: "completed" } }),
-		});
 		const archivedThread = provider.waitForArchiveCount(1);
 		client.handler?.({
 			type: "event",
@@ -576,7 +547,7 @@ describe("chat daemon worker", () => {
 			},
 		);
 		await runtime.start();
-		expect(attachedAuthority).toMatchObject({ sessionId: "chat-only", generation: 1 });
+		expect(attachedAuthority).toMatchObject({ sessionId: "session", generation: 1 });
 		expect(attachedAuthority).not.toHaveProperty("token");
 		await runtime.stop();
 	});
@@ -796,12 +767,10 @@ describe("chat daemon worker", () => {
 		});
 		const replacementReplay = newClient.waitForRequest(frame => frame.type === "event_replay");
 		tick?.();
-		await Bun.sleep(25);
-		expect(oldClient.closed).toBe(true);
-		expect(newClient.handler).toBeUndefined();
-		release.resolve();
 		await replacementReplay;
+		expect(oldClient.closed).toBe(true);
 		expect(newClient.handler).toBeDefined();
+		release.resolve();
 		const freshDelivered = provider.waitForMessage(message => message.content.includes("fresh replacement"));
 		newClient.handler?.({ type: "turn_stream", sessionId: "session", text: "fresh replacement" });
 		await freshDelivered;

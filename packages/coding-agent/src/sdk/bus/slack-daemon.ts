@@ -1356,7 +1356,13 @@ export class SlackNotificationDaemon {
 		effectId: string,
 	): Promise<boolean> {
 		const endpoint = await this.#resolveAttachment(claim.sessionId);
-		if (!endpoint || endpoint.generation !== claim.endpoint.generation) return false;
+		if (!endpoint?.isCurrent()) return false;
+		if (
+			endpoint.authorityId !== undefined && claim.endpoint.authorityId !== undefined
+				? endpoint.authorityId !== claim.endpoint.authorityId
+				: endpoint.generation !== claim.endpoint.generation
+		)
+			return false;
 		const [current, effect] = await Promise.all([
 			this.store.read(claim.key),
 			this.#journal.read<SlackInboundEffectPayload>(effectId),

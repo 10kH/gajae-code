@@ -255,7 +255,7 @@ export class ChatDaemonRuntime {
 				...deps.routerDeps,
 				onFrame: async (attachment, frame) => await this.#handleFrame(attachment, frame),
 				onAttachment: async attachment => this.#onAttachment(attachment),
-				onSessionRemoved: async attachment => await this.#onSessionRemoved(attachment),
+				onSessionRemoved: async (attachment, reason) => await this.#onSessionRemoved(attachment, reason),
 			},
 		});
 	}
@@ -422,10 +422,10 @@ export class ChatDaemonRuntime {
 		}
 	}
 
-	async #onSessionRemoved(attachment: SessionAttachment): Promise<void> {
+	async #onSessionRemoved(attachment: SessionAttachment, reason: "removed" | "replaced" = "removed"): Promise<void> {
 		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
 		this.#attachments.delete(attachment.sessionId);
-		await this.#trackCleanup(attachment);
+		if (reason === "removed") await this.#trackCleanup(attachment);
 	}
 
 	async #handleFrame(attachment: SessionAttachment, correlated: CorrelatedFrame): Promise<void> {
