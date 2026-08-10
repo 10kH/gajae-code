@@ -1121,6 +1121,12 @@ export class AcpAgent implements Agent {
 					if (adapter) adapter.acceptFrame(acpFrame);
 					else this.#pendingRouterFrames.get(attachment.sessionId)?.push(acpFrame);
 				},
+				onSessionRemoved: attachment => {
+					const adapter =
+						this.#sessions.get(attachment.sessionId)?.adapter ??
+						this.#pendingRouterAdapters.get(attachment.sessionId);
+					adapter?.revokeAttachment(attachment);
+				},
 			},
 		});
 		this.#startupOptions = parseAcpStartupOptions(candidate?.startupOptions);

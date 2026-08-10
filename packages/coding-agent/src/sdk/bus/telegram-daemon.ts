@@ -5028,6 +5028,16 @@ export class TelegramNotificationDaemon {
 		const session = this.sessions.get(attachment.sessionId);
 		if (!session || session.attachment !== attachment) return;
 		if (reason === "replaced" || reason === "replaced_same_generation") {
+			const callbackLease = {
+				session,
+				token: session.recoveryLease?.token ?? 0,
+				logicalSessionId: this.#logicalSessionId(session),
+			};
+			if (session.recoveryLease) session.recoveryLease = { ...session.recoveryLease, state: "rejected" };
+			this.revokeCallbackAliases(callbackLease);
+			this.#droppedSessions.add(session);
+			this.cancelLegacyToolStartsForSession(session);
+			this.#clearModelChoiceAliasesForSocket(session);
 			this.sessions.delete(attachment.sessionId);
 			return;
 		}

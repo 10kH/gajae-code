@@ -928,6 +928,7 @@ export class SlackNotificationDaemon {
 						state: "closed_marker",
 						pendingActionId: undefined,
 						cleanupEffectId: undefined,
+						inboundDispatches: [],
 						updatedAt: this.#now(),
 					})
 				: current,

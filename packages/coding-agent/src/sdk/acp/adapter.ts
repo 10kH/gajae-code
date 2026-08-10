@@ -183,11 +183,21 @@ export class AcpSdkAdapter {
 	acceptAttachment(attachment: SessionAttachment): void {
 		if (!this.#router || attachment.sessionId !== this.#sessionId)
 			throw new AcpSdkAdapterError("invalid_input", "ACP attachment does not match this session adapter.");
+		this.#abortActiveReverseRequests();
 		this.#attachment = attachment;
 		this.#connectionId = undefined;
 		this.#routerConnectionReady = false;
 		this.#providersActivated = false;
 		if (attachment.isCurrent()) void this.#activateProviders().catch(error => this.#reportReconnectFailure(error));
+	}
+
+	revokeAttachment(attachment: SessionAttachment): void {
+		if (this.#attachment !== attachment) return;
+		this.#abortActiveReverseRequests();
+		this.#attachment = undefined;
+		this.#connectionId = undefined;
+		this.#routerConnectionReady = false;
+		this.#providersActivated = false;
 	}
 
 	async attachmentReady(attachment: SessionAttachment): Promise<void> {
