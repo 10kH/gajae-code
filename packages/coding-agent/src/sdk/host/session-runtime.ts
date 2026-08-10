@@ -411,7 +411,24 @@ export function createInvocationReconciliation(
 		async noteTransition(kind, correlation, frame) {
 			if (!correlation) return;
 			const record = records.get(key(kind, correlation));
-			if (!record || record.terminalAt !== undefined) return;
+			if (!record) return;
+			if (record.terminalAt !== undefined) {
+				// Same late agent_failed enrichment as the kind-aware bus reconciler: a
+				// failure reason may arrive on a different delivery path than the one that
+				// claimed the terminal. Enrich the settled record instead of dropping it;
+				// never resurrect (status/terminalAt untouched), and first reason wins.
+				if (frame.type === "agent_failed" && record.error === undefined) {
+					logger.error("SDK invocation failed (late)", {
+						kind,
+						commandId: correlation.commandId,
+						turnId: correlation.turnId,
+						error: formatPromptFailureForLocalLog(frame.error),
+					});
+					record.error = sanitizePromptFailure(frame.error);
+					await persist();
+				}
+				return;
+			}
 			if (frame.type === "agent_start") {
 				record.status = "in_flight";
 				record.startedAt = Date.now();
@@ -994,8 +1011,11 @@ function createControlSurface(
 				},
 				error => {
 					if (settled) {
-						if (kind === "skill")
-							void reconciliation.noteTransition(kind, correlation, { type: "agent_failed", error });
+						// The submission promise rejects after preflight acceptance only when the
+						// work itself is over (provider stream interrupt, abort, queue failure).
+						// Every kind must terminalize here or the record stays non-terminal
+						// forever; `noteTransition` ignores an already-terminal record.
+						void reconciliation.noteTransition(kind, correlation, { type: "agent_failed", error });
 						return;
 					}
 					settled = true;
