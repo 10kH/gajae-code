@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import {
+	captureManagedFileNoFollow,
 	ManagedReplaceError,
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
@@ -599,6 +600,29 @@ describe("managed descriptor reads", () => {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
+	it.skipIf(process.platform === "win32")("rejects a FIFO cold-fallback capture without blocking", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-fallback-fifo-")));
+		const fifo = path.join(root, "session.jsonl");
+		try {
+			const created = Bun.spawnSync(["mkfifo", fifo]);
+			if (created.exitCode !== 0) throw new Error("Could not create FIFO fixture");
+			const openSync = fs.openSync;
+			let observedFlags = 0;
+			const spy = vi.spyOn(fs, "openSync").mockImplementationOnce(((
+				file: fs.PathLike,
+				flags: fs.OpenMode,
+				mode?: fs.Mode,
+			) => {
+				observedFlags = Number(flags);
+				return openSync(file, flags, mode);
+			}) as typeof fs.openSync);
+			expect(() => captureManagedFileNoFollow(fifo)).toThrow("source_changed");
+			expect(observedFlags & fs.constants.O_NONBLOCK).toBe(fs.constants.O_NONBLOCK);
+			spy.mockRestore();
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
 });
 
 describe.skipIf(process.platform !== "darwin")("authority-absent managed replacement", () => {
@@ -639,6 +663,27 @@ describe.skipIf(process.platform !== "darwin")("authority-absent managed replace
 			expect(after.ino).not.toBe(before.ino);
 			expect(fs.readFileSync(destination, "utf8")).toBe('{"id":"before"}\n{"id":"after"}\n');
 		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+	it("keeps memory-authoritative append success when cleanup receipt retirement is pending", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-append-receipt-")));
+		let exactUnlink: ReturnType<typeof vi.spyOn> | undefined;
+		try {
+			const sessionDir = path.join(root, "session");
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), sessionDir);
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("before\n"));
+			exactUnlink = vi.spyOn(native, "exactUnlink").mockImplementation(pathname => ({
+				ok: false,
+				code: "cleanup_pending",
+				retainedPlaceholderPath: pathname,
+			}));
+			const receipt = store.appendSync("session.jsonl", Buffer.from("after\n"));
+			expect(receipt.descriptor.size).toBe(Buffer.byteLength("before\nafter\n"));
+			expect(fs.readFileSync(path.join(sessionDir, "session.jsonl"), "utf8")).toBe("before\nafter\n");
+			expect(fs.readdirSync(sessionDir).some(entry => entry.startsWith(".gjc-replace-cleanup-"))).toBe(true);
+		} finally {
+			exactUnlink?.mockRestore();
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});

@@ -1316,10 +1316,9 @@ export class ManagedSessionDescendantStore {
 			expected.sha256,
 		);
 		if (!appended.ok) throw new Error(appended.code ?? "managed_append_failed");
-		const stat = this.#authority.stat(relative);
-		if (!stat.ok || !stat.identity) throw new Error(stat.code ?? "managed_append_identity_unavailable");
+		if (!appended.identity) throw new Error("managed_append_identity_unavailable");
 		this.#assertBound();
-		return managedAppendReceiptFromIdentity(managedFileIdentityFromNative(stat.identity));
+		return managedAppendReceiptFromIdentity(managedFileIdentityFromNative(appended.identity));
 	}
 
 	appendSync(relativePath: string, bytes: Uint8Array): ManagedAppendReceipt {
@@ -1347,11 +1346,8 @@ export class ManagedSessionDescendantStore {
 				expectedSha256,
 			);
 			if (!appended.ok) throw new Error(appended.code ?? "managed_append_failed");
-			// Post-fsync descriptor capture through retained authority: the native append
-			// is synchronous and durable, so the stat reflects the committed object.
-			const stat = this.#authority.stat(relative);
-			if (!stat.ok || !stat.identity) throw new Error(stat.code ?? "managed_append_identity_unavailable");
-			const receipt = managedAppendReceiptFromIdentity(managedFileIdentityFromNative(stat.identity));
+			if (!appended.identity) throw new Error("managed_append_identity_unavailable");
+			const receipt = managedAppendReceiptFromIdentity(managedFileIdentityFromNative(appended.identity));
 			this.#assertBound();
 			return receipt;
 		}
@@ -2182,7 +2178,7 @@ export function captureManagedFileNoFollow(pathname: string): ManagedFileSnapsho
 }
 
 function captureManagedFileNoFollowLimit(pathname: string, maxBytes?: number): ManagedFileSnapshot {
-	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0));
 	try {
 		const before = fs.fstatSync(fd, { bigint: true });
 		if (!before.isFile() || before.nlink > 1) throw new Error("source_changed");
@@ -2208,7 +2204,7 @@ function captureManagedFileNoFollowLimit(pathname: string, maxBytes?: number): M
 /** Streams a managed file once while retaining only a bounded header prefix and the full descriptor-bound digest. */
 export function inspectManagedFileNoFollow(pathname: string, prefixLimit: number): ManagedFileSnapshot {
 	if (!Number.isSafeInteger(prefixLimit) || prefixLimit < 0) throw new Error("invalid_capture_limit");
-	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0));
 	try {
 		const before = fs.fstatSync(fd, { bigint: true });
 		if (!before.isFile() || before.nlink > 1) throw new Error("source_changed");
@@ -2239,7 +2235,7 @@ export function inspectManagedFileNoFollow(pathname: string, prefixLimit: number
 }
 
 function captureManagedFileIdentityStreamingNoFollow(pathname: string): ManagedFileSnapshot["identity"] {
-	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0));
 	try {
 		const before = fs.fstatSync(fd, { bigint: true });
 		if (!before.isFile() || before.nlink > 1) throw new Error("source_changed");
@@ -2421,7 +2417,8 @@ function replaceManagedFileGeneratedSync(
 	policy: ManagedSessionSecurityPolicy = "default",
 	assertFence?: () => void,
 	expectedDestination?: ManagedFileSnapshot["identity"],
-): void {
+	acceptCommittedCleanupFailure = false,
+): ManagedFileSnapshot["identity"] {
 	const parent = path.dirname(destination);
 	ensureManagedDirectory(parent, root, policy);
 	const staging = path.join(parent, `.${path.basename(destination)}.${randomUUID()}.replacement`);
@@ -2438,6 +2435,8 @@ function replaceManagedFileGeneratedSync(
 		  }
 		| undefined;
 	let failure: unknown;
+	let publishedIdentity: ManagedFileSnapshot["identity"] | undefined;
+	let publicationDurable = false;
 	try {
 		fd = fs.openSync(
 			staging,
@@ -2520,9 +2519,6 @@ function replaceManagedFileGeneratedSync(
 				},
 			);
 			if (!replaced.ok) throw new ManagedReplaceError(replaced, receiptCleanup.path);
-			const named = captureManagedFileIdentityStreamingNoFollow(destination);
-			if (!sameReplacementIdentity(named, successor) || named.sha256 !== successor.sha256)
-				throw new Error("destination_identity_changed");
 			fsyncDirectory(parent);
 		} else fs.renameSync(staging, destination);
 		assertManagedDirectoryRoot(root);
@@ -2530,12 +2526,14 @@ function replaceManagedFileGeneratedSync(
 		if (!named.isFile() || named.isSymbolicLink() || named.dev !== staged.dev || named.ino !== staged.ino) {
 			throw new Error("destination_identity_changed");
 		}
+		publishedIdentity = identity(named, generated.sha256);
 		if (fd !== undefined) {
 			secureFileDescriptor(destination, fd, "verify");
 			fs.closeSync(fd);
 			fd = undefined;
 		}
 		fsyncDirectory(parent);
+		publicationDurable = true;
 		if (receiptCleanup) {
 			try {
 				const removed = nativeSessionStorage().exactUnlink(receiptCleanup.path, {
@@ -2582,7 +2580,10 @@ function replaceManagedFileGeneratedSync(
 			}
 		}
 	}
-	if (failure !== undefined) throw failure;
+	if (failure !== undefined && !(acceptCommittedCleanupFailure && publicationDurable && publishedIdentity))
+		throw failure;
+	if (!publishedIdentity) throw new Error("managed_replace_identity_unavailable");
+	return publishedIdentity;
 }
 
 export function replaceManagedFileSync(
@@ -2620,10 +2621,13 @@ function appendManagedFileStreamingSync(
 	policy: ManagedSessionSecurityPolicy,
 ): ManagedFileSnapshot["identity"] {
 	const predecessor = captureManagedFileIdentityStreamingNoFollow(destination);
-	replaceManagedFileGeneratedSync(
+	return replaceManagedFileGeneratedSync(
 		destination,
 		stagingFd => {
-			const sourceFd = fs.openSync(destination, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+			const sourceFd = fs.openSync(
+				destination,
+				fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0),
+			);
 			try {
 				const before = fs.fstatSync(sourceFd, { bigint: true });
 				if (!sameReplacementIdentity(identity(before, predecessor.sha256), predecessor))
@@ -2667,8 +2671,8 @@ function appendManagedFileStreamingSync(
 		policy,
 		undefined,
 		predecessor,
+		true,
 	);
-	return captureManagedFileIdentityStreamingNoFollow(destination);
 }
 
 export async function replaceManagedFile(

@@ -6980,6 +6980,7 @@ export class SessionManager {
 		this.#sessionName = state.header.title;
 		this.#titleSource = state.header.titleSource;
 		this.#sessionFile = state.sessionFile;
+		this.#managedRangeExpectedDescriptor = undefined;
 		this.#flushed = false;
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#ensuredOnDisk = false;
@@ -10089,6 +10090,10 @@ export class SessionManager {
 				: this.#sessionFile?.endsWith(".jsonl")
 					? this.#sessionFile.slice(0, -6)
 					: this.#sessionFile;
+		this.#managedRangeExpectedDescriptor =
+			this.destination.kind === "managed" && this.#sessionFile
+				? (this.#managedDescriptorSnapshotOrNull() ?? undefined)
+				: undefined;
 		const parentPathPrefix = sidecarRoot ? `${sidecarRoot}/.session-memory.spill.parent-` : "";
 		const dictionaryPathPrefix = sidecarRoot ? `${sidecarRoot}/.session-memory.spill.dict-part-` : "";
 		const dictionaryMetaPath = sidecarRoot ? `${sidecarRoot}/.session-memory.spill.dict-meta` : "";
@@ -12459,6 +12464,8 @@ export class SessionManager {
 			}
 		}
 		this.#sidecarBranchActivationDirty = false;
+		this.#managedRangeExpectedDescriptor =
+			this.destination.kind === "managed" ? (this.#managedDescriptorSnapshotOrNull() ?? undefined) : undefined;
 	}
 
 	#hydrateAuthoritativeTranscriptSync(runtime: SessionMemorySidecarRuntime): void {
@@ -17021,39 +17028,44 @@ export class SessionManager {
 		if (header && cwdChanged) header.cwd = sessionCwd;
 		const manager = new SessionManager(sessionCwd, destination.directory, true, storage, destination);
 		manager.#sessionMemoryMode = sessionMemoryMode;
-		let transcriptChanged = false;
-		if (entries.length > 0) {
-			const migrationApplied = migrateToCurrentVersion(entries) || cwdChanged;
-			transcriptChanged = migrationApplied;
-			await manager.#hydrateExistingSession(resolved, entries, migrationApplied, "memory-fallback");
-			if (cwdChanged) {
+		try {
+			let transcriptChanged = false;
+			if (entries.length > 0) {
+				const migrationApplied = migrateToCurrentVersion(entries) || cwdChanged;
+				transcriptChanged = migrationApplied;
+				await manager.#hydrateExistingSession(resolved, entries, migrationApplied, "memory-fallback");
+				if (cwdChanged) {
+					await manager.#rewriteFile();
+					manager.#flushed = true;
+					manager.#ensuredOnDisk = true;
+				}
+				if (cwdChanged) transcriptChanged = true;
+				writeTerminalBreadcrumb(manager.cwd, resolved);
+				if (await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist()) transcriptChanged = true;
+			} else {
+				const fresh = manager.#freshSessionState(undefined, resolved);
+				const transition = manager.#prepareFreshSessionTransition(fresh, "memory-fallback");
+				manager.#applyFreshSessionMetadata(fresh);
+				manager.#commitResidentTextStoreTransition(transition);
+				manager.#retireEphemeralArtifacts();
+				writeTerminalBreadcrumb(manager.cwd, resolved);
 				await manager.#rewriteFile();
 				manager.#flushed = true;
 				manager.#ensuredOnDisk = true;
+				transcriptChanged = true;
 			}
-			if (cwdChanged) transcriptChanged = true;
-			writeTerminalBreadcrumb(manager.cwd, resolved);
-			if (await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist()) transcriptChanged = true;
-		} else {
-			const fresh = manager.#freshSessionState(undefined, resolved);
-			const transition = manager.#prepareFreshSessionTransition(fresh, "memory-fallback");
-			manager.#applyFreshSessionMetadata(fresh);
-			manager.#commitResidentTextStoreTransition(transition);
-			manager.#retireEphemeralArtifacts();
-			writeTerminalBreadcrumb(manager.cwd, resolved);
-			await manager.#rewriteFile();
-			manager.#flushed = true;
-			manager.#ensuredOnDisk = true;
-			transcriptChanged = true;
+			store.assertBound();
+			if (!transcriptChanged) {
+				const finalDescriptor = store.descriptorExpected(path.basename(resolved));
+				if (!capturedDescriptor || !finalDescriptor || !sameDescriptor(capturedDescriptor, finalDescriptor))
+					throw new Error("source_changed");
+			}
+			manager.buildSessionContext();
+			return manager;
+		} catch (error) {
+			await manager.close().catch(() => {});
+			throw error;
 		}
-		store.assertBound();
-		if (!transcriptChanged) {
-			const finalDescriptor = store.descriptorExpected(path.basename(resolved));
-			if (!capturedDescriptor || !finalDescriptor || !sameDescriptor(capturedDescriptor, finalDescriptor))
-				throw new Error("source_changed");
-		}
-		manager.buildSessionContext();
-		return manager;
 	}
 	/**
 	 * List default-managed sessions for the resume picker without recovery or other

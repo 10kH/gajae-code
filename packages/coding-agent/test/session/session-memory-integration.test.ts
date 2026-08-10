@@ -363,6 +363,8 @@ describe("SessionManager cold sidecar integration", () => {
 			fs.utimesSync(sessionFile, reopenedStat.atime, new Date(reopenedStat.mtimeMs + 2_000));
 			expect(reopened.getEntry(coldId)?.id).toBe(coldId);
 			expect(reopened.getSessionMemoryStats().rangeReadGenerationMismatchCount).toBeGreaterThan(0);
+			reopened.setSessionMemoryMode("enabled");
+			expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
 		} finally {
 			await reopened.close();
 			tempDir.removeSync();
@@ -455,16 +457,22 @@ describe("SessionManager cold sidecar integration", () => {
 		rootStore.ensureDirectory("review");
 		const nestedStore = rootStore.deriveSubtree("review");
 		const sessionFile = path.join(nestedStore.dir, "review.jsonl");
-		const originalRead = nestedStore.readExpected.bind(nestedStore);
+		const originalDescriptor = nestedStore.descriptorExpected.bind(nestedStore);
+		const cacheRoot = getResidentCacheRootDir(profileAgentDir);
+		const cacheEntriesBefore = fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0;
 		try {
 			nestedStore.publishNoReplaceSync(
 				"review.jsonl",
 				Buffer.from(`${JSON.stringify({ type: "session", version: 5, id: "nested-swap", timestamp: "0", cwd })}\n`),
 			);
 			let replaced = false;
-			vi.spyOn(nestedStore, "readExpected").mockImplementation(relativePath => {
-				const snapshot = originalRead(relativePath);
-				if (!replaced && relativePath === "review.jsonl") {
+			vi.spyOn(nestedStore, "descriptorExpected").mockImplementation(relativePath => {
+				if (
+					!replaced &&
+					relativePath === "review.jsonl" &&
+					fs.existsSync(cacheRoot) &&
+					fs.readdirSync(cacheRoot).length > cacheEntriesBefore
+				) {
 					replaced = true;
 					nestedStore.replaceSync(
 						"review.jsonl",
@@ -473,7 +481,7 @@ describe("SessionManager cold sidecar integration", () => {
 						),
 					);
 				}
-				return snapshot;
+				return originalDescriptor(relativePath);
 			});
 			await expect(
 				SessionManager.openNestedManaged(
@@ -485,6 +493,8 @@ describe("SessionManager cold sidecar integration", () => {
 					"enabled",
 				),
 			).rejects.toThrow("source_changed");
+			expect(replaced).toBe(true);
+			expect(fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0).toBe(cacheEntriesBefore);
 		} finally {
 			rootStore.close();
 			tempDir.removeSync();
