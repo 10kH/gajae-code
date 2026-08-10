@@ -2098,7 +2098,12 @@ function captureLifecycleFile(file: string, requireRegular = false, bounded = fa
 	}
 }
 
-async function removeOwnedLifecycleArtifacts(root: string, id: string, expected: EffectMarker): Promise<boolean> {
+async function removeOwnedLifecycleArtifacts(
+	root: string,
+	id: string,
+	expected: EffectMarker,
+	onRetainedUnknown?: () => void,
+): Promise<boolean> {
 	const marker = await readEffectMarker(lifecycleMarkerPath(root, id));
 	if (!marker || !sameEffectMarker(marker, expected)) return false;
 	const endpointPath = path.join(root, "sdk", `${id}.json`);
@@ -2143,7 +2148,11 @@ async function removeOwnedLifecycleArtifacts(root: string, id: string, expected:
 			{ dev: BigInt(endpointParent.dev), ino: BigInt(endpointParent.ino) },
 		);
 		if (!endpointRemoval.ok) {
-			if (endpointRemoval.code !== "cleanup_pending" || endpointRemoval.retainedUnknownPath) return false;
+			if (endpointRemoval.code !== "cleanup_pending") return false;
+			if (endpointRemoval.retainedUnknownPath) {
+				onRetainedUnknown?.();
+				return false;
+			}
 			if (endpointRemoval.retainedPlaceholderPath) {
 				if (endpointRemoval.payloadDurable !== true) return false;
 				removeRetainedExactPlaceholder(
@@ -2394,10 +2403,14 @@ async function removeExactDeadSessionEndpoint(
 			`.gjc-delete-endpoint-placeholder-retry-${record.lifecycleRequestId}`,
 		);
 	const candidates = [...ownedPayloadPaths, finalEndpointPath, retryEndpointPath, plannedEndpointPath, endpointPath];
-	const authorizedDetachedSource =
-		authorizedSource && path.dirname(path.resolve(authorizedSource)) === path.dirname(path.resolve(endpointPath))
-			? authorizedSource
-			: undefined;
+	let authorizedDetachedSource: string | undefined;
+	if (authorizedSource && path.dirname(path.resolve(authorizedSource)) === path.dirname(path.resolve(endpointPath))) {
+		try {
+			if (fsSync.lstatSync(authorizedSource).size > 0) authorizedDetachedSource = authorizedSource;
+		} catch {
+			// The detached source was already retired; deterministic candidates remain authoritative.
+		}
+	}
 	const endpointSource =
 		authorizedDetachedSource && fsSync.existsSync(authorizedDetachedSource)
 			? authorizedDetachedSource
@@ -2524,7 +2537,12 @@ async function waitForClose(broker: Broker, id: string, record: CloseRecord, tim
 							incarnation: record.processIncarnation,
 						}
 					: undefined;
-			if (expected) await removeOwnedLifecycleArtifacts(record.locator.stateRoot, id, expected);
+			let retainedUnknown = false;
+			if (expected)
+				await removeOwnedLifecycleArtifacts(record.locator.stateRoot, id, expected, () => {
+					retainedUnknown = true;
+				});
+			if (retainedUnknown) return false;
 			if (!(await removeExactDeadSessionEndpoint(broker, id, record))) return false;
 			if (expected && (await hasOwnedEndpointPayload(record.locator.stateRoot, id, expected.effectMarker)))
 				return false;
