@@ -76,8 +76,9 @@ The tool returns one result per call; no streaming partial output is emitted fro
 - `close`: text content with either `Closed ...` or `No tab named ...`. `details` includes `action`, `name`, and `details.result`.
 - `run`: ordered `content` array built as:
   1. every `display(value)` call in execution order,
-  2. final return value, JSON-stringified unless already a string,
-  3. or `Ran code on tab "..."` if nothing else was produced.
+  2. a runtime-diagnostics JSON block when the tab observed page exceptions or `console.error` events,
+  3. final return value, JSON-stringified unless already a string,
+  4. or `Ran code on tab "..."` if nothing else was produced.
 - `act`: the same ordered `content` shape, with per-step results as the final JSON return value, or `Ran <n> action(s) on tab "..."` if no step produced content.
 - `display(value)` coercion in `packages/coding-agent/src/tools/browser/tab-worker.ts`:
   - `{ type: "image", data: string, mimeType: string }` becomes image content,
@@ -85,6 +86,7 @@ The tool returns one result per call; no streaming partial output is emitted fro
   - other values become pretty JSON text when serializable, else `String(value)`.
 - `tab.screenshot()` also appends text plus an image content item unless `silent: true`; `details.screenshots` records persisted screenshot metadata `{ dest, mimeType, bytes, width, height }`.
 - `run` and `act` `details` include `action`, `name`, current `browser`/`url` when the tab exists, optional `screenshots`, and `details.result` containing only concatenated text outputs.
+- Each tab keeps the newest 20 page `Runtime.exceptionThrown` / `console.error` events in memory. The next successful `run` or `act` drains them as `{ runtimeDiagnostics, runtimeDiagnosticsDropped }`. Each entry contains only kind, timestamp, query-masked URL, line/column, and a safe error class when available; messages, console arguments, values, and stacks are never retained. Failed actions leave the mailbox for the next successful response.
 
 ## Flow
 1. `BrowserTool.execute()` (`packages/coding-agent/src/tools/browser.ts`) abort-checks, clamps `timeout` via `clampTimeout("browser", ...)`, defaults `name` to `"main"`, and dispatches `open`, `close`, `act`, or `run`.
@@ -266,3 +268,4 @@ Security and lifecycle rules:
 - `close(all: true, kill: false)` disconnects from spawned/connected browsers when the last tab closes but leaves spawned app processes running.
 - Headless orphan cleanup is best-effort: if a worker dies before closing its page, the supervisor searches browser targets by `targetId` and closes that page.
 - Console methods inside `run` do not appear in tool output; they are forwarded as debug/warn/error logs through the worker transport.
+- Runtime diagnostics are not written to a separate browser state or log. Once surfaced, their bounded metadata follows the ordinary tool-result transcript lifecycle.

@@ -11,6 +11,7 @@ Drives a real Chromium tab with full puppeteer access via JS execution.
 - Browser kinds: no `app` launches headless Chromium; `app.path` reuses CDP or kills stale same-path processes before spawning — NEVER use it for a daily Chrome profile; use explicit `app.browser: "chrome"` profile mode instead. Saved-profile/CDP automation has access to that profile's cookies and authenticated accounts. Profile mode refuses a matching non-CDP Chrome instead of killing/relaunching it, and `kill: true` can terminate only a Chrome process GJC launched; `app.cdp_url` is externally owned and disconnect-only. CDP must stay on `127.0.0.1`: it grants full browser-account access.
 - Inside `run`, `tab` exposes high-level helpers (`goto`, `observe`, `id`, `click`, `type`, `fill`, `press`, `waitFor`, `screenshot`, `extract`, …); reach for `page` (raw puppeteer Page) when they don't cover it.
 - Selectors accept CSS as well as puppeteer query handlers: `aria/Sign in`, `text/Continue`, `xpath/…`, `pierce/…`.
+- Page `Runtime.exceptionThrown` and `console.error` events are kept in a bounded in-memory mailbox. The next successful `act`/`run` response includes at most 20 `runtimeDiagnostics` entries plus `runtimeDiagnosticsDropped`, then drains them. Entries contain only kind, time, query-masked URL, line/column, and safe error class — never messages, console arguments, values, or stacks.
 - Full reference — helpers, browser kinds, CDP/security details, and more examples — read `gjc://tools/browser.md`.
 </instruction>
 
