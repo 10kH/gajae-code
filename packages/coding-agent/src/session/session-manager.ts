@@ -905,6 +905,9 @@ export interface SessionMemorySidecarRuntime {
 	dictionary?: DictionaryArtifactRuntimeState;
 	/** Persistent metadata-delta section state; absent = no demoted provider values. */
 	metadataDelta?: MetadataDeltaArtifactRuntimeState;
+	/** Fixed-size false-positive-only cache used solely for generated-ID collision avoidance. */
+	coldIdHashes?: BoundedColdIdHashSet;
+	coldIdHashesDescriptor?: SessionStorageStat;
 	/** Live observability counters (P7 live-only contract). */
 	coldEntriesRetired: number;
 	coldEntriesReloaded: number;
@@ -1084,6 +1087,64 @@ function tailRecordKindForEntry(entry: SessionEntry): TailRecordKind {
  */
 export const BOUNDED_FIRST_OPEN_MAX_LINE_BYTES = 8 * 1024 * 1024;
 const FORK_PATCH_OVERLAY_BUDGET_BYTES = 8 * 1024 * 1024;
+const COLD_ID_HASH_CAPACITY = 1_250_003;
+const COLD_ID_HASH_BYTES = COLD_ID_HASH_CAPACITY * 3;
+
+/** Fixed-size collision cache for generated IDs. False positives only cause regeneration. */
+class BoundedColdIdHashSet {
+	readonly #high = new Uint8Array(COLD_ID_HASH_CAPACITY);
+	readonly #low = new Uint16Array(COLD_ID_HASH_CAPACITY);
+	#size = 0;
+
+	#hash(value: string, seed: number): number {
+		let hash = seed >>> 0;
+		for (let index = 0; index < value.length; index++) {
+			hash ^= value.charCodeAt(index);
+			hash = Math.imul(hash, 0x01000193) >>> 0;
+		}
+		return hash;
+	}
+
+	#fingerprint(value: string): [number, number] {
+		let fingerprint = this.#hash(value, 0x811c9dc5) & 0xffffff;
+		if (fingerprint === 0) fingerprint = 1;
+		return [(fingerprint >>> 16) & 0xff, fingerprint & 0xffff];
+	}
+
+	has(value: string): boolean {
+		const [high, low] = this.#fingerprint(value);
+		let slot = this.#hash(value, 0x9e3779b9) % COLD_ID_HASH_CAPACITY;
+		for (let probes = 0; probes < COLD_ID_HASH_CAPACITY; probes++) {
+			const existingHigh = this.#high[slot];
+			const existingLow = this.#low[slot];
+			if (existingHigh === 0 && existingLow === 0) return false;
+			if (existingHigh === high && existingLow === low) return true;
+			slot++;
+			if (slot === COLD_ID_HASH_CAPACITY) slot = 0;
+		}
+		return true;
+	}
+
+	add(value: string): boolean {
+		if (this.#size >= 1_000_000) return false;
+		const [high, low] = this.#fingerprint(value);
+		let slot = this.#hash(value, 0x9e3779b9) % COLD_ID_HASH_CAPACITY;
+		for (let probes = 0; probes < COLD_ID_HASH_CAPACITY; probes++) {
+			const existingHigh = this.#high[slot];
+			const existingLow = this.#low[slot];
+			if (existingHigh === high && existingLow === low) return true;
+			if (existingHigh === 0 && existingLow === 0) {
+				this.#high[slot] = high;
+				this.#low[slot] = low;
+				this.#size++;
+				return true;
+			}
+			slot++;
+			if (slot === COLD_ID_HASH_CAPACITY) slot = 0;
+		}
+		return false;
+	}
+}
 
 class DiskBackedIdUniquenessCheck {
 	static readonly BUCKETS = 64;
@@ -12854,6 +12915,8 @@ export class SessionManager {
 		runtime.parentArtifact = undefined;
 		runtime.dictionary = undefined;
 		runtime.metadataDelta = undefined;
+		runtime.coldIdHashes = undefined;
+		runtime.coldIdHashesDescriptor = undefined;
 		runtime.providerStateEntries = [];
 		runtime.providerStateOrder = [];
 		runtime.reducer = {
@@ -12994,6 +13057,8 @@ export class SessionManager {
 		runtime.accountant = new SessionMemoryAccountant();
 		runtime.dictionary = undefined;
 		runtime.metadataDelta = undefined;
+		runtime.coldIdHashes = undefined;
+		runtime.coldIdHashesDescriptor = undefined;
 		for (const sidecarPath of this.#disposableSidecarPaths()) {
 			if (!sidecarPath) continue;
 			try {
@@ -13010,9 +13075,57 @@ export class SessionManager {
 		return runtime.nextOrdinal;
 	}
 
+	#ensureColdIdHashes(): BoundedColdIdHashSet | undefined {
+		const runtime = this.#sidecarRuntime;
+		if (!runtime?.enabled || !runtime.indexPath) return undefined;
+		if (runtime.coldIdHashes) {
+			try {
+				if (
+					runtime.coldIdHashesDescriptor &&
+					sameDescriptor(this.storage.statSync(runtime.indexPath), runtime.coldIdHashesDescriptor)
+				)
+					return runtime.coldIdHashes;
+			} catch {
+				// Fall through to a bounded rebuild.
+			}
+			runtime.coldIdHashes = undefined;
+			runtime.coldIdHashesDescriptor = undefined;
+			runtime.accountant.release(COLD_ID_HASH_BYTES);
+		}
+		if (!this.#coldIndexDigestValid()) return undefined;
+		if (!runtime.accountant.tryCharge(COLD_ID_HASH_BYTES)) return undefined;
+		const hashes = new BoundedColdIdHashSet();
+		let complete = true;
+		try {
+			const size = this.storage.statSync(runtime.indexPath).size;
+			const failure = scanTranscriptLinesBounded(this.storage, runtime.indexPath, size, (_offset, lineBytes) => {
+				try {
+					const value = JSON.parse(decodeBoundedJsonLine(lineBytes)) as { id?: unknown };
+					if (typeof value.id !== "string" || !hashes.add(value.id)) {
+						complete = false;
+						return false;
+					}
+				} catch {
+					complete = false;
+					return false;
+				}
+			});
+			if (failure || !complete) return undefined;
+			runtime.coldIdHashes = hashes;
+			runtime.coldIdHashesDescriptor = this.storage.statSync(runtime.indexPath);
+			return hashes;
+		} finally {
+			if (!runtime.coldIdHashes) runtime.accountant.release(COLD_ID_HASH_BYTES);
+		}
+	}
+
 	#generateEntryId(): string {
 		const runtime = this.#sidecarRuntime;
 		if (!this.#coldSidecarActive() || !runtime) return generateId(this.#byId);
+		if (runtime.dictionary && this.#coldIndexDigestValid())
+			return generateId({ has: id => this.#byId.has(id) || this.#findColdEntryIndex(id, false) !== undefined });
+		const hashes = this.#ensureColdIdHashes();
+		if (hashes) return generateId({ has: id => this.#byId.has(id) || hashes.has(id) });
 		if (!this.#coldIndexDigestValid()) {
 			this.#ensureFullHotView();
 			return generateId(this.#byId);
@@ -13181,6 +13294,7 @@ export class SessionManager {
 				if (!indexWriter.fsyncSync) throw new Error("Synchronous sidecar fsync is unavailable");
 				indexWriter.fsyncSync();
 				runtime.indexHash.update(Buffer.from(indexLine, "utf8"));
+				if (runtime.coldIdHashes && !runtime.coldIdHashes.add(entry.id)) return false;
 				runtime.indexDigest = runtime.indexHash.copy().digest("hex");
 				if (runtime.metadataDelta) runtime.metadataDelta.indexDigest = runtime.indexDigest;
 			} finally {
@@ -13237,6 +13351,7 @@ export class SessionManager {
 		try {
 			const refreshed = this.storage.statSync(runtime.indexPath);
 			runtime.validatedIndexDescriptor = refreshed;
+			runtime.coldIdHashesDescriptor = runtime.coldIdHashes ? refreshed : undefined;
 		} catch {
 			// The next cold lookup re-verifies the index digest before trusting caches.
 		}
