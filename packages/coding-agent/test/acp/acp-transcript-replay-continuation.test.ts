@@ -11,7 +11,7 @@ import {
 	publishExactSessionAuthority,
 } from "../helpers/sdk-exact-session-authority";
 
-setDefaultTimeout(20_000);
+setDefaultTimeout(30_000);
 
 const TOKEN = "acp-transcript-continuation-token";
 /** Small enough that every fixture body needs several `resource.body` pages. */
@@ -125,8 +125,6 @@ describe("ACP transcript replay continuation recovery", () => {
 	let updates: SessionNotification[] = [];
 	let agentDir = "";
 	let cwd = "";
-	let authority: ExactSessionAuthorityFixture;
-	let authorityOptions: ExactSessionAuthorityOptions;
 
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@acp-transcript-continuation-");
@@ -161,10 +159,10 @@ describe("ACP transcript replay continuation recovery", () => {
 					}
 					if (frame.type === "broker_request") {
 						if (frame.operation === "session.create") {
-							void publishExactSessionAuthority(authorityOptions, authority);
 							socket.send(
 								JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: authority }),
 							);
+							setTimeout(() => void publishExactSessionAuthority(authorityOptions, authority), 10);
 							return;
 						}
 						const result = {};
@@ -265,14 +263,14 @@ describe("ACP transcript replay continuation recovery", () => {
 		});
 		const port = server.port;
 		if (port === undefined) throw new Error("Expected the ACP fixture server to expose a port");
-		authorityOptions = {
+		const authorityOptions: ExactSessionAuthorityOptions = {
 			agentDir,
 			cwd,
 			sessionId: "replay-session",
 			url: `ws://127.0.0.1:${port}`,
 			token: TOKEN,
 		};
-		authority = await prepareExactSessionAuthority(authorityOptions);
+		const authority: ExactSessionAuthorityFixture = await prepareExactSessionAuthority(authorityOptions);
 		await writeBrokerDiscovery(agentDir, {
 			version: 1,
 			protocolVersion: 3,

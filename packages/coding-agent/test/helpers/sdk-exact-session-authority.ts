@@ -1,5 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { type SessionIndexEvent, sessionIndexChecksum } from "../../src/sdk/broker/session-index";
+import { SDK_STATE_VERSION } from "../../src/sdk/broker/state-version";
 
 export interface ExactSessionAuthorityFixture {
 	readonly sessionId: string;
@@ -49,30 +51,21 @@ export async function publishExactSessionAuthority(
 	authority: ExactSessionAuthorityFixture,
 ): Promise<void> {
 	const stateRoot = path.join(options.cwd, ".gjc", "state");
-	const child = Bun.spawn([process.execPath, path.join(import.meta.dir, "sdk-exact-session-authority-publish.ts")], {
-		env: {
-			...process.env,
-			GJC_EXACT_SESSION_AUTHORITY: JSON.stringify({
-				agentDir: options.agentDir,
-				sessionId: authority.sessionId,
-				cwd: options.cwd,
-				stateRoot,
-				endpointGeneration: authority.endpointGeneration,
-				pid: authority.pid,
-				endpointMtimeMs: authority.endpointMtimeMs,
-			}),
-		},
-		stdout: "ignore",
-		stderr: "pipe",
-	});
-	const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
-	if (exitCode !== 0) throw new Error(`Exact session authority publication failed: ${stderr.trim()}`);
-}
-
-export async function registerExactSessionAuthority(
-	options: ExactSessionAuthorityOptions,
-): Promise<ExactSessionAuthorityFixture> {
-	const authority = await prepareExactSessionAuthority(options);
-	await publishExactSessionAuthority(options, authority);
-	return authority;
+	const indexDirectory = path.join(options.agentDir, "sdk", "sessions");
+	await fs.mkdir(indexDirectory, { recursive: true });
+	const unsigned = {
+		type: "host_registered" as const,
+		sessionId: authority.sessionId,
+		locator: { repo: options.cwd, stateRoot },
+		endpointGeneration: authority.endpointGeneration,
+		pid: authority.pid,
+		endpointMtimeMs: authority.endpointMtimeMs,
+		version: SDK_STATE_VERSION,
+		indexSeq: 1,
+		ts: Date.now(),
+	} satisfies Omit<SessionIndexEvent, "checksum">;
+	await Bun.write(
+		path.join(indexDirectory, "index.jsonl"),
+		`${JSON.stringify({ ...unsigned, checksum: sessionIndexChecksum(unsigned) })}\n`,
+	);
 }
