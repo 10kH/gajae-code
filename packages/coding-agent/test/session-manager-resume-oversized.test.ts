@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	RESUME_TRANSCRIPT_MAX_BYTES,
+	BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
 	type ResumeSessionIdentity,
 	SessionManager,
 	SessionTranscriptOversizedError,
@@ -120,6 +121,25 @@ describe("SessionManager oversized resume graceful fallback (#3851)", () => {
 		expect(caught).toBeInstanceOf(SessionTranscriptOversizedError);
 		expect((caught as SessionTranscriptOversizedError).code).toBe("oversized");
 		// No destination directory created on the fail-closed path.
+		expect(fs.existsSync(sessionDir)).toBe(false);
+	});
+
+	it("rejects a transcript one byte above bounded enabled admission from stat alone", async () => {
+		const dir = makeTempDir();
+		const filePath = path.join(dir, "bounded-oversized.jsonl");
+		const targetBytes = BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES + 1;
+		writeOversizedTranscript(filePath, targetBytes, "bounded-oversized");
+		const sessionDir = path.join(dir, "sessions");
+
+		await expect(
+			SessionManager.open(
+				filePath,
+				SessionManager.explicitDestination(sessionDir),
+				new FileSessionStorage(),
+				"copy-retain",
+				"enabled",
+			),
+		).rejects.toMatchObject({ code: "oversized", size: targetBytes });
 		expect(fs.existsSync(sessionDir)).toBe(false);
 	});
 

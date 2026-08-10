@@ -145,7 +145,7 @@ type BenchmarkReport = {
 	};
 	iterationsPerMode: number;
 	runs: WorkerResult[];
-	summary: Record<Mode, {
+	summary: Partial<Record<Mode, {
 		forkElapsedMs: Summary;
 		forkCpuMicros: Summary;
 		forkRssGrowthBytes: Summary;
@@ -153,7 +153,8 @@ type BenchmarkReport = {
 		coldLookupP95Ms: Summary;
 		warmLookupP95Ms: Summary;
 		teardownRssGrowthBytes: Summary;
-	}>;
+	}>>;
+
 };
 
 function percentile(sorted: number[], percentileValue: number): number {
@@ -564,11 +565,12 @@ function parseParentArgs(argv: string[]): { iterations: number; outPath?: string
 	return { iterations, outPath, gcStrategy, secondaryArtifacts, modes };
 }
 
-function summarizeMode(runs: WorkerResult[], mode: Mode): BenchmarkReport["summary"][Mode] {
+function summarizeMode(runs: WorkerResult[], mode: Mode): NonNullable<BenchmarkReport["summary"][Mode]> | undefined {
 	const selected = runs.filter(run => run.mode === mode);
+	if (selected.length === 0) return undefined;
 	return {
 		forkElapsedMs: summarize(selected.map(run => run.phases.fork.elapsedMs)),
-		forkCpuMicros: summarize(selected.map(run => run.phases.fork.cpu ? run.phases.fork.cpu.userMicros + run.phases.fork.cpu.systemMicros : 0)),
+		forkCpuMicros: summarize(selected.flatMap(run => run.phases.fork.cpu ? [run.phases.fork.cpu.userMicros + run.phases.fork.cpu.systemMicros] : [])),
 		forkRssGrowthBytes: summarize(selected.map(run => run.memory.forkRssGrowthBytes)),
 		reopenElapsedMs: summarize(selected.map(run => run.phases.reopen.elapsedMs)),
 		coldLookupP95Ms: summarize(selected.map(run => run.latency.coldLookupMs.p95)),
@@ -614,10 +616,12 @@ async function runParent(): Promise<void> {
 		},
 		iterationsPerMode: args.iterations,
 		runs,
-		summary: {
-			direct: summarizeMode(runs, "direct"),
-			captured: summarizeMode(runs, "captured"),
-		},
+		summary: Object.fromEntries(
+			args.modes.flatMap(mode => {
+				const value = summarizeMode(runs, mode);
+				return value ? [[mode, value]] : [];
+			}),
+		) as BenchmarkReport["summary"],
 	};
 	const serialized = `${JSON.stringify(report, null, 2)}\n`;
 	if (args.outPath) await Bun.write(args.outPath, serialized);

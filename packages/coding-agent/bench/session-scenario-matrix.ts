@@ -115,7 +115,7 @@ type WorkerResult = {
 	totalBytes: number;
 	entryCount: number;
 	phases: {
-		generationMs: number;
+		generationMs?: number;
 		firstOpenMs?: number;
 		exactAuthenticatedReopenMs?: number;
 		transcriptAheadReopenMs?: number;
@@ -132,7 +132,8 @@ type WorkerResult = {
 		lookupMs: Summary & { samples: number[] };
 		closeMs: Summary & { samples: number[] };
 	};
-	throughputMiBPerSecond: number;
+	throughputMiBPerSecond: number | null;
+
 	memory: {
 		processBaseline: MemorySample;
 		operationBaseline: MemorySample;
@@ -140,12 +141,12 @@ type WorkerResult = {
 		afterColdLookups: MemorySample;
 		afterWarmLookups: MemorySample;
 		afterClose: MemorySample;
-		operationRssGrowthBytes: number;
+		operationRssGrowthBytes: number | null;
 		firstOpenBaseline?: MemorySample;
 		afterFirstOpen?: MemorySample;
-		firstOpenRssGrowthBytes?: number;
-		lookupRssGrowthBytes: number;
-		teardownRssGrowthBytes: number;
+		firstOpenRssGrowthBytes?: number | null;
+		lookupRssGrowthBytes: number | null;
+		teardownRssGrowthBytes: number | null;
 		maxRssBytes: number;
 	};
 	lookup: {
@@ -155,13 +156,13 @@ type WorkerResult = {
 		warmRangeReads: number | null;
 	};
 	sessionMemory: {
-		totalAccountedBytes: number;
-		maxAccountedBytes: number;
-		coldRetirementActiveCount: number;
-		reservedBudgetBytes: number;
-		residentBytes: number;
-		sidecarFileBytes: number;
-		contextMessageCount: number;
+		totalAccountedBytes: number | null;
+		maxAccountedBytes: number | null;
+		coldRetirementActiveCount: number | null;
+		reservedBudgetBytes: number | null;
+		residentBytes: number | null;
+		sidecarFileBytes: number | null;
+		contextMessageCount: number | null;
 		telemetry: Record<string, TelemetryValue>;
 	};
 	failure?: {
@@ -412,7 +413,19 @@ function optionalNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function aggregateStats(stats: SessionMemoryStats[], contextMessageCount: number): WorkerResult["sessionMemory"] {
+function aggregateStats(stats: SessionMemoryStats[], contextMessageCount: number | null): WorkerResult["sessionMemory"] {
+	if (stats.length === 0) {
+		return {
+			totalAccountedBytes: null,
+			maxAccountedBytes: null,
+			coldRetirementActiveCount: null,
+			reservedBudgetBytes: null,
+			residentBytes: null,
+			sidecarFileBytes: null,
+			contextMessageCount: null,
+			telemetry: {},
+		};
+	}
 	const telemetry: Record<string, TelemetryValue> = {};
 	const rootKeys = new Set<string>();
 	for (const stat of stats) {
@@ -754,16 +767,16 @@ async function runFreshReopenWorker(
 			totalBytes: generated.reduce((total, value) => total + Bun.file(value.file).size, 0),
 			entryCount: generated.reduce((total, value) => total + value.entryCount + (operation === "transcript-ahead-reopen" ? 1 : 0), 0),
 			phases: {
-				generationMs: 0,
-				exactAuthenticatedReopenMs: operation === "exact-authenticated-reopen" ? operationMs : undefined,
-				transcriptAheadReopenMs: operation === "transcript-ahead-reopen" ? operationMs : undefined,
+				generationMs: undefined,
+				exactAuthenticatedReopenMs: status === "ok" && operation === "exact-authenticated-reopen" ? operationMs : undefined,
+				transcriptAheadReopenMs: status === "ok" && operation === "transcript-ahead-reopen" ? operationMs : undefined,
 				closeMs,
 				cpuUserMicros,
 				cpuSystemMicros,
 			},
 			phaseEvidence: phaseEvidenceFromStats(afterStats),
 			counters: counterEvidence(beforeStats, afterStats),
-			throughputMiBPerSecond: targetMiB / Math.max(operationMs / 1_000, 1e-9),
+			throughputMiBPerSecond: status === "ok" ? targetMiB / Math.max(operationMs / 1_000, 1e-9) : null,
 			memory: {
 				processBaseline,
 				operationBaseline,
@@ -771,18 +784,18 @@ async function runFreshReopenWorker(
 				afterColdLookups,
 				afterWarmLookups,
 				afterClose,
-				operationRssGrowthBytes: afterOperation.rssBytes - operationBaseline.rssBytes,
-				lookupRssGrowthBytes: afterWarmLookups.rssBytes - afterOperation.rssBytes,
-				teardownRssGrowthBytes: afterClose.rssBytes - operationBaseline.rssBytes,
+				operationRssGrowthBytes: status === "ok" ? afterOperation.rssBytes - operationBaseline.rssBytes : null,
+				lookupRssGrowthBytes: status === "ok" ? afterWarmLookups.rssBytes - afterOperation.rssBytes : null,
+				teardownRssGrowthBytes: status === "ok" ? afterClose.rssBytes - operationBaseline.rssBytes : null,
 				maxRssBytes: process.resourceUsage().maxRSS * (process.platform === "darwin" ? 1 : 1024),
 			},
 			lookup: {
-				coldMs: { samples: coldSamples, ...summarize(coldSamples) },
-				warmMs: { samples: warmSamples, ...summarize(warmSamples) },
-				coldRangeReads,
-				warmRangeReads,
+				coldMs: status === "ok" ? { samples: coldSamples, ...summarize(coldSamples) } : null,
+				warmMs: status === "ok" ? { samples: warmSamples, ...summarize(warmSamples) } : null,
+				coldRangeReads: status === "ok" ? coldRangeReads : null,
+				warmRangeReads: status === "ok" ? warmRangeReads : null,
 			},
-			sessionMemory: aggregateStats(afterStats, contextMessageCount),
+			sessionMemory: aggregateStats(status === "ok" ? afterStats : [], status === "ok" ? contextMessageCount : null),
 			failure,
 		};
 	} finally {
@@ -969,13 +982,13 @@ async function runWorker(
 				phases: { generationMs, firstOpenMs, repeatedLifecycleMs: lifecycleMs, closeMs, cpuUserMicros, cpuSystemMicros },
 				phaseEvidence: firstOpenEvidence,
 				counters: firstOpenCounters,
-				firstOpenPerFileMs: { samples: firstOpenSamples, ...summarize(firstOpenSamples) },
+				firstOpenPerFileMs: status === "ok" ? { samples: firstOpenSamples, ...summarize(firstOpenSamples) } : undefined,
 				lifecycle: {
 					openMs: { samples: openSamples, ...summarize(openSamples) },
 					lookupMs: { samples: lifecycleLookupSamples, ...summarize(lifecycleLookupSamples) },
 					closeMs: { samples: lifecycleCloseSamples, ...summarize(lifecycleCloseSamples) },
 				},
-				throughputMiBPerSecond: targetMiB / Math.max(lifecycleMs / 1_000, 1e-9),
+				throughputMiBPerSecond: status === "ok" ? targetMiB / Math.max(lifecycleMs / 1_000, 1e-9) : null,
 				memory: {
 					processBaseline,
 					operationBaseline,
@@ -983,16 +996,16 @@ async function runWorker(
 					afterColdLookups,
 					afterWarmLookups,
 					afterClose,
-					operationRssGrowthBytes: afterOperation.rssBytes - operationBaseline.rssBytes,
+					operationRssGrowthBytes: status === "ok" ? afterOperation.rssBytes - operationBaseline.rssBytes : null,
 					firstOpenBaseline: operationBaseline,
 					afterFirstOpen: afterOperation,
-					firstOpenRssGrowthBytes: afterOperation.rssBytes - operationBaseline.rssBytes,
-					lookupRssGrowthBytes: afterOperation.rssBytes - operationBaseline.rssBytes,
-					teardownRssGrowthBytes: afterClose.rssBytes - operationBaseline.rssBytes,
+					firstOpenRssGrowthBytes: status === "ok" ? afterOperation.rssBytes - operationBaseline.rssBytes : null,
+					lookupRssGrowthBytes: status === "ok" ? afterOperation.rssBytes - operationBaseline.rssBytes : null,
+					teardownRssGrowthBytes: status === "ok" ? afterClose.rssBytes - operationBaseline.rssBytes : null,
 					maxRssBytes: process.resourceUsage().maxRSS * (process.platform === "darwin" ? 1 : 1024),
 				},
 				lookup: { coldMs: null, warmMs: null, coldRangeReads: null, warmRangeReads: null },
-				sessionMemory: aggregateStats(firstOpenStats, contextMessageCount),
+				sessionMemory: aggregateStats(status === "ok" ? firstOpenStats : [], status === "ok" ? contextMessageCount : null),
 				failure,
 			};
 		}
@@ -1008,11 +1021,11 @@ async function runWorker(
 			fileCount,
 			totalBytes: generated.reduce((total, value) => total + value.bytes, 0),
 			entryCount: generated.reduce((total, value) => total + value.entryCount, 0),
-			phases: { generationMs, firstOpenMs, closeMs, cpuUserMicros, cpuSystemMicros },
+			phases: { generationMs, firstOpenMs: status === "ok" ? firstOpenMs : undefined, closeMs, cpuUserMicros, cpuSystemMicros },
 			phaseEvidence: firstOpenEvidence,
 			counters: firstOpenCounters,
-			firstOpenPerFileMs: { samples: firstOpenSamples, ...summarize(firstOpenSamples) },
-			throughputMiBPerSecond: status === "ok" ? targetMiB / Math.max(firstOpenMs / 1_000, 1e-9) : 0,
+			firstOpenPerFileMs: status === "ok" ? { samples: firstOpenSamples, ...summarize(firstOpenSamples) } : undefined,
+			throughputMiBPerSecond: status === "ok" ? targetMiB / Math.max(firstOpenMs / 1_000, 1e-9) : null,
 			memory: {
 				processBaseline,
 				operationBaseline,
@@ -1020,21 +1033,21 @@ async function runWorker(
 				afterColdLookups,
 				afterWarmLookups,
 				afterClose,
-				operationRssGrowthBytes: afterOperation.rssBytes - operationBaseline.rssBytes,
+				operationRssGrowthBytes: status === "ok" ? afterOperation.rssBytes - operationBaseline.rssBytes : null,
 				firstOpenBaseline: operationBaseline,
 				afterFirstOpen: afterOperation,
-				firstOpenRssGrowthBytes: afterOperation.rssBytes - operationBaseline.rssBytes,
-				lookupRssGrowthBytes: afterWarmLookups.rssBytes - afterOperation.rssBytes,
-				teardownRssGrowthBytes: afterClose.rssBytes - operationBaseline.rssBytes,
+				firstOpenRssGrowthBytes: status === "ok" ? afterOperation.rssBytes - operationBaseline.rssBytes : null,
+				lookupRssGrowthBytes: status === "ok" ? afterWarmLookups.rssBytes - afterOperation.rssBytes : null,
+				teardownRssGrowthBytes: status === "ok" ? afterClose.rssBytes - operationBaseline.rssBytes : null,
 				maxRssBytes: process.resourceUsage().maxRSS * (process.platform === "darwin" ? 1 : 1024),
 			},
 			lookup: {
-				coldMs: { samples: coldSamples, ...summarize(coldSamples) },
-				warmMs: { samples: warmSamples, ...summarize(warmSamples) },
-				coldRangeReads,
-				warmRangeReads,
+				coldMs: status === "ok" ? { samples: coldSamples, ...summarize(coldSamples) } : null,
+				warmMs: status === "ok" ? { samples: warmSamples, ...summarize(warmSamples) } : null,
+				coldRangeReads: status === "ok" ? coldRangeReads : null,
+				warmRangeReads: status === "ok" ? warmRangeReads : null,
 			},
-			sessionMemory: aggregateStats(afterStats.length > 0 ? afterStats : firstOpenStats, contextMessageCount),
+			sessionMemory: aggregateStats(status === "ok" ? (afterStats.length > 0 ? afterStats : firstOpenStats) : [], status === "ok" ? contextMessageCount : null),
 			failure,
 		};
 	} finally {
@@ -1127,11 +1140,20 @@ function csvCell(value: unknown): string {
 	return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
 
+function csvMetric(run: WorkerResult, value: unknown, divisor = 1): number | string {
+	if (run.status !== "ok" || typeof value !== "number" || !Number.isFinite(value)) return "";
+	return value / divisor;
+}
+
+function csvAvailable(run: WorkerResult, value: unknown): unknown {
+	return run.status === "ok" && value !== undefined && value !== null ? value : "";
+}
+
 function reportCsv(report: MatrixReport): string {
 	const headers = [
 		"scenario", "operationClass", "sessionMemoryMode", "gcStrategy", "secondaryArtifacts", "repetitions", "repetitionIndex", "openConcurrency", "targetMiB", "status", "fileCount", "entryCount", "generationMs", "firstOpenMs", "exactAuthenticatedReopenMs", "transcriptAheadReopenMs", "repeatedLifecycleMs", "firstOpenP95Ms",
 		"throughputMiBPerSecond", "operationRssGrowthMiB", "firstOpenRssGrowthMiB", "lookupRssGrowthMiB", "teardownRssGrowthMiB", "maxRssMiB", "phaseEvidenceJson", "counterEvidenceJson",
-		"coldLookupP95Ms", "warmLookupP95Ms", "coldRangeReads", "warmRangeReads", "accountedMiB", "reservedMiB", "residentMiB", "sidecarFileMiB", "sidecarEnabled", "coldRetirementActive", "dictionaryArtifactEnabled", "parentArtifactEnabled", "gcRequests", "bytesRead", "bytesWritten", "recordsParsed", "indexWriteCalls", "fsyncCount", "failureCode",
+		"coldLookupP95Ms", "warmLookupP95Ms", "coldRangeReads", "warmRangeReads", "accountedMiB", "reservedMiB", "residentMiB", "sidecarFileMiB", "sidecarEnabled", "coldRetirementActive", "dictionaryArtifactEnabled", "parentArtifactEnabled", "gcRequests", "bytesRead", "bytesWritten", "recordsParsed", "indexWriteCalls", "fsyncCount", "failureCode", "failureMessage",
 	];
 	const rows = report.runs.map(run => [
 		run.scenario,
@@ -1140,45 +1162,46 @@ function reportCsv(report: MatrixReport): string {
 		run.gcStrategy,
 		run.secondaryArtifacts,
 		run.repetitions,
-		run.repetitionIndex ?? 0,
-		run.openConcurrency ?? report.openConcurrency,
+		run.repetitionIndex ?? "",
+		run.openConcurrency ?? report.openConcurrency ?? "",
 		run.targetMiB,
 		run.status,
 		run.fileCount,
 		run.entryCount,
-		run.phases.generationMs,
-		run.phases.firstOpenMs ?? "",
-		run.phases.exactAuthenticatedReopenMs ?? "",
-		run.phases.transcriptAheadReopenMs ?? "",
-		run.phases.repeatedLifecycleMs ?? "",
-		run.firstOpenPerFileMs?.p95 ?? "",
-		run.throughputMiBPerSecond,
-		run.memory.operationRssGrowthBytes / MIB,
-		run.memory.firstOpenRssGrowthBytes === undefined ? "" : (run.memory.firstOpenRssGrowthBytes ?? 0) / MIB,
-		run.memory.lookupRssGrowthBytes / MIB,
-		run.memory.teardownRssGrowthBytes / MIB,
-		run.memory.maxRssBytes / MIB,
+		csvMetric(run, run.phases.generationMs),
+		csvMetric(run, run.phases.firstOpenMs),
+		csvMetric(run, run.phases.exactAuthenticatedReopenMs),
+		csvMetric(run, run.phases.transcriptAheadReopenMs),
+		csvMetric(run, run.phases.repeatedLifecycleMs),
+		csvMetric(run, run.firstOpenPerFileMs?.p95),
+		csvMetric(run, run.throughputMiBPerSecond),
+		csvMetric(run, run.memory.operationRssGrowthBytes, MIB),
+		csvMetric(run, run.memory.firstOpenRssGrowthBytes, MIB),
+		csvMetric(run, run.memory.lookupRssGrowthBytes, MIB),
+		csvMetric(run, run.memory.teardownRssGrowthBytes, MIB),
+		csvMetric(run, run.memory.maxRssBytes, MIB),
 		JSON.stringify(run.phaseEvidence),
 		JSON.stringify(run.counters),
-		run.lookup.coldMs?.p95 ?? "",
-		run.lookup.warmMs?.p95 ?? "",
-		run.lookup.coldRangeReads ?? "",
-		run.lookup.warmRangeReads ?? "",
-		run.sessionMemory.totalAccountedBytes / MIB,
-		run.sessionMemory.reservedBudgetBytes / MIB,
-		run.sessionMemory.residentBytes / MIB,
-		run.sessionMemory.sidecarFileBytes / MIB,
-		run.sessionMemory.telemetry.sidecarEnabled ?? "",
-		run.sessionMemory.telemetry.coldRetirementActive ?? "",
-		run.sessionMemory.telemetry.dictionaryArtifactEnabled ?? "",
-		run.sessionMemory.telemetry.parentArtifactEnabled ?? "",
-		run.counters.gcRequests ?? "",
-		run.counters.bytesRead ?? "",
-		run.counters.bytesWritten ?? "",
-		run.counters.recordsParsed ?? "",
-		run.counters.indexWriteCalls ?? "",
-		run.counters.fsyncCount ?? "",
+		csvMetric(run, run.lookup?.coldMs?.p95),
+		csvMetric(run, run.lookup?.warmMs?.p95),
+		csvMetric(run, run.lookup?.coldRangeReads),
+		csvMetric(run, run.lookup?.warmRangeReads),
+		csvMetric(run, run.sessionMemory?.totalAccountedBytes, MIB),
+		csvMetric(run, run.sessionMemory?.reservedBudgetBytes, MIB),
+		csvMetric(run, run.sessionMemory?.residentBytes, MIB),
+		csvMetric(run, run.sessionMemory?.sidecarFileBytes, MIB),
+		csvAvailable(run, run.sessionMemory?.telemetry?.sidecarEnabled),
+		csvAvailable(run, run.sessionMemory?.telemetry?.coldRetirementActive),
+		csvAvailable(run, run.sessionMemory?.telemetry?.dictionaryArtifactEnabled),
+		csvAvailable(run, run.sessionMemory?.telemetry?.parentArtifactEnabled),
+		csvMetric(run, run.counters?.gcRequests),
+		csvMetric(run, run.counters?.bytesRead),
+		csvMetric(run, run.counters?.bytesWritten),
+		csvMetric(run, run.counters?.recordsParsed),
+		csvMetric(run, run.counters?.indexWriteCalls),
+		csvMetric(run, run.counters?.fsyncCount),
 		run.failure?.code ?? "",
+		run.failure?.message ?? "",
 	]);
 	return `${[headers, ...rows].map(row => row.map(csvCell).join(",")).join("\n")}\n`;
 }
@@ -1190,13 +1213,35 @@ const COLORS: Record<Scenario, string> = {
 	"goal-history": "#ea580c",
 };
 
+function operationLabel(operation: string): string {
+	return {
+		"raw-cold-first-open": "raw cold first-open",
+		"exact-authenticated-reopen": "exact authenticated reopen",
+		"transcript-ahead-reopen": "transcript-ahead reopen",
+		"repeated-lifecycle": "repeated lifecycle",
+	}[operation] ?? operation;
+}
+
 function operationElapsedMs(run: WorkerResult): number | null {
 	if (run.status !== "ok") return null;
-	return run.phases.firstOpenMs ?? run.phases.exactAuthenticatedReopenMs ?? run.phases.transcriptAheadReopenMs ?? run.phases.repeatedLifecycleMs ?? null;
+	switch (run.operationClass) {
+		case "exact-authenticated-reopen":
+			return typeof run.phases.exactAuthenticatedReopenMs === "number" && Number.isFinite(run.phases.exactAuthenticatedReopenMs) ? run.phases.exactAuthenticatedReopenMs : null;
+		case "transcript-ahead-reopen":
+			return typeof run.phases.transcriptAheadReopenMs === "number" && Number.isFinite(run.phases.transcriptAheadReopenMs) ? run.phases.transcriptAheadReopenMs : null;
+		case "repeated-lifecycle":
+			return typeof run.phases.repeatedLifecycleMs === "number" && Number.isFinite(run.phases.repeatedLifecycleMs) ? run.phases.repeatedLifecycleMs : null;
+		case "raw-cold-first-open":
+		default:
+			return typeof run.phases.firstOpenMs === "number" && Number.isFinite(run.phases.firstOpenMs) ? run.phases.firstOpenMs : null;
+	}
 }
 
 function operationRssGrowthBytes(run: WorkerResult): number | null {
-	return run.status === "ok" ? run.memory.operationRssGrowthBytes : null;
+	if (run.status !== "ok") return null;
+	return typeof run.memory.operationRssGrowthBytes === "number" && Number.isFinite(run.memory.operationRssGrowthBytes)
+		? run.memory.operationRssGrowthBytes
+		: null;
 }
 
 function chartSvg(report: MatrixReport): string {
@@ -1207,18 +1252,62 @@ function chartSvg(report: MatrixReport): string {
 	const panelHeight = (height - margin.top - margin.bottom - 50) / 2;
 	const panels = [
 		{ title: "Operation latency (ms)", value: (run: WorkerResult) => operationElapsedMs(run) },
-		{ title: "Operation RSS growth (MiB)", value: (run: WorkerResult) => { const value = operationRssGrowthBytes(run); return value === null ? null : value / MIB; } },
-		{ title: "Operation throughput (MiB/s)", value: (run: WorkerResult) => run.status === "ok" ? run.throughputMiBPerSecond : null },
-		{ title: "Cold lookup p95 (ms)", value: (run: WorkerResult) => run.status === "ok" && run.lookup.coldMs ? run.lookup.coldMs.p95 : null },
+		{ title: "Operation RSS growth (MiB)", value: (run: WorkerResult) => {
+			const value = operationRssGrowthBytes(run);
+			return value === null ? null : value / MIB;
+		} },
+		{ title: "Operation throughput (MiB/s)", value: (run: WorkerResult) => {
+			return run.status === "ok" && typeof run.throughputMiBPerSecond === "number" && Number.isFinite(run.throughputMiBPerSecond)
+				? run.throughputMiBPerSecond
+				: null;
+		} },
+		{ title: "Cold lookup p95 (ms)", value: (run: WorkerResult) => {
+			const value = run.status === "ok" ? run.lookup?.coldMs?.p95 : null;
+			return typeof value === "number" && Number.isFinite(value) ? value : null;
+		} },
 	] as const;
-	const minLog = Math.log2(Math.min(...report.sizesMiB));
-	const maxLog = Math.log2(Math.max(...report.sizesMiB));
+	type ChartSeries = { key: string; scenario: Scenario; operation: string; mode: string; runs: WorkerResult[] };
+	const seriesByKey = new Map<string, ChartSeries>();
+	for (const run of report.runs) {
+		const operation = run.operationClass ?? DEFAULT_OPERATION;
+		const mode = run.sessionMemoryMode ?? "legacy";
+		const key = `${run.scenario}\u0000${operation}\u0000${mode}`;
+		const series = seriesByKey.get(key) ?? { key, scenario: run.scenario, operation, mode, runs: [] };
+		series.runs.push(run);
+		seriesByKey.set(key, series);
+	}
+	const series = [...seriesByKey.values()].sort((left, right) => left.key.localeCompare(right.key));
+	const plotSizes = [...new Set(report.runs.map(run => run.targetMiB).filter(value => typeof value === "number" && Number.isFinite(value) && value > 0))].sort((left, right) => left - right);
+	const minLog = plotSizes.length > 0 ? Math.log2(plotSizes[0]!) : 0;
+	const maxLog = plotSizes.length > 0 ? Math.log2(plotSizes.at(-1)!) : 0;
+	const xForSize = (size: number): number => positionForSize(size, margin.left, panelWidth, minLog, maxLog);
+
+	const median = (values: number[]): number | null => {
+		if (values.length === 0) return null;
+		const sorted = [...values].sort((left, right) => left - right);
+		return sorted[Math.floor((sorted.length - 1) / 2)] ?? null;
+	};
+	const aggregate = (group: ChartSeries, size: number, value: (run: WorkerResult) => number | null): number | null => {
+		const values = group.runs
+			.filter(run => run.targetMiB === size)
+			.map(value)
+			.filter((candidate): candidate is number => candidate !== null && Number.isFinite(candidate));
+		return median(values);
+	};
+	const colorFor = (scenario: Scenario): string => COLORS[scenario] ?? "#64748b";
+	const dashFor = (operation: string, mode: string): string => {
+		const operationDash = operation === "raw-cold-first-open" ? "" : operation === "exact-authenticated-reopen" ? "7 3" : operation === "transcript-ahead-reopen" ? "3 3" : "11 3 2 3";
+		if (mode === "enabled" || mode === "legacy") return operationDash;
+		if (mode === "shadow") return operationDash ? `${operationDash} 2 2` : "5 3";
+		if (mode === "off") return operationDash ? `${operationDash} 1 3` : "2 3";
+		return operationDash ? `${operationDash} 4 2` : "4 2";
+	};
 	const escape = (value: string): string => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 	const parts = [
 		`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`,
 		`<rect width="100%" height="100%" fill="#ffffff"/>`,
 		`<text x="${margin.left}" y="32" font-family="system-ui,sans-serif" font-size="22" font-weight="700">Synthetic session scenario matrix</text>`,
-		`<text x="${margin.left}" y="51" font-family="system-ui,sans-serif" font-size="12" fill="#475569">${escape(report.platform)} ${escape(report.arch)} · Bun ${escape(report.bunVersion)} · ${report.sizesMiB.length}-point dense sweep</text>`,
+		`<text x="${margin.left}" y="51" font-family="system-ui,sans-serif" font-size="12" fill="#475569">${escape(report.platform)} ${escape(report.arch)} · Bun ${escape(report.bunVersion)} · ${plotSizes.length}-point available sweep</text>`,
 	];
 	for (const [panelIndex, panel] of panels.entries()) {
 		const column = panelIndex % 2;
@@ -1228,7 +1317,7 @@ function chartSvg(report: MatrixReport): string {
 		const plotTop = y0 + 28;
 		const plotBottom = y0 + panelHeight - 32;
 		const plotHeight = plotBottom - plotTop;
-		const values = report.runs.map(panel.value).filter((value): value is number => value !== null && Number.isFinite(value));
+		const values = series.flatMap(group => plotSizes.map(size => aggregate(group, size, panel.value))).filter((value): value is number => value !== null && Number.isFinite(value));
 		const maxValue = Math.max(1, ...values) * 1.08;
 		parts.push(`<text x="${x0}" y="${y0 + 17}" font-family="system-ui,sans-serif" font-size="15" font-weight="650">${escape(panel.title)}</text>`);
 		parts.push(`<line x1="${x0}" y1="${plotBottom}" x2="${x0 + panelWidth}" y2="${plotBottom}" stroke="#94a3b8"/>`);
@@ -1239,41 +1328,51 @@ function chartSvg(report: MatrixReport): string {
 			parts.push(`<line x1="${x0}" y1="${y}" x2="${x0 + panelWidth}" y2="${y}" stroke="#e2e8f0"/>`);
 			parts.push(`<text x="${x0 - 7}" y="${y + 4}" text-anchor="end" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">${label}</text>`);
 		}
-		for (const size of report.sizesMiB) {
-			const x = x0 + ((Math.log2(size) - minLog) / Math.max(1, maxLog - minLog)) * panelWidth;
+		for (const size of plotSizes) {
+			const x = x0 + xForSize(size) - margin.left;
 			parts.push(`<text x="${x}" y="${plotBottom + 17}" text-anchor="middle" font-family="system-ui,sans-serif" font-size="10" fill="#64748b">${size}</text>`);
 		}
-		for (const scenario of report.scenarios) {
-			const scenarioRuns = report.runs.filter(run => run.scenario === scenario).sort((left, right) => left.targetMiB - right.targetMiB);
-			const points = scenarioRuns.flatMap(run => {
-				const value = panel.value(run);
+		for (const group of series) {
+			const color = colorFor(group.scenario);
+			const dash = dashFor(group.operation, group.mode);
+			const points = plotSizes.flatMap(size => {
+				const value = aggregate(group, size, panel.value);
 				if (value === null) return [];
-				const x = x0 + ((Math.log2(run.targetMiB) - minLog) / Math.max(1, maxLog - minLog)) * panelWidth;
+				const x = x0 + xForSize(size) - margin.left;
 				const y = plotBottom - (value / maxValue) * plotHeight;
 				return [{ x, y }];
 			});
-			if (points.length > 1) parts.push(`<polyline fill="none" stroke="${COLORS[scenario]}" stroke-width="2" points="${points.map(point => `${point.x},${point.y}`).join(" ")}"/>`);
-			for (const run of scenarioRuns) {
-				const x = x0 + ((Math.log2(run.targetMiB) - minLog) / Math.max(1, maxLog - minLog)) * panelWidth;
-				const value = panel.value(run);
+			const dashAttribute = dash ? ` stroke-dasharray="${dash}"` : "";
+			if (points.length > 1) parts.push(`<polyline fill="none" stroke="${color}" stroke-width="2"${dashAttribute} points="${points.map(point => `${point.x},${point.y}`).join(" ")}"/>`);
+			for (const size of plotSizes) {
+				const x = x0 + xForSize(size) - margin.left;
+				const value = aggregate(group, size, panel.value);
 				if (value === null) {
-					parts.push(`<text x="${x}" y="${plotTop + 12}" text-anchor="middle" font-family="system-ui,sans-serif" font-size="18" font-weight="700" fill="#dc2626">×</text>`);
+					if (group.runs.some(run => run.targetMiB === size)) parts.push(`<text x="${x}" y="${plotTop + 12}" text-anchor="middle" font-family="system-ui,sans-serif" font-size="18" font-weight="700" fill="#dc2626">×</text>`);
 				} else {
 					const y = plotBottom - (value / maxValue) * plotHeight;
-					parts.push(`<circle cx="${x}" cy="${y}" r="3.5" fill="${COLORS[scenario]}"/>`);
+					parts.push(`<circle cx="${x}" cy="${y}" r="3.5" fill="${color}"/>`);
 				}
 			}
 		}
+		if (series.length === 0) parts.push(`<text x="${x0 + panelWidth / 2}" y="${plotTop + plotHeight / 2}" text-anchor="middle" font-family="system-ui,sans-serif" font-size="13" fill="#64748b">N/A — no available runs</text>`);
 	}
 	let legendX = margin.left;
 	const legendY = height - 18;
-	for (const scenario of report.scenarios) {
-		parts.push(`<line x1="${legendX}" y1="${legendY - 4}" x2="${legendX + 22}" y2="${legendY - 4}" stroke="${COLORS[scenario]}" stroke-width="3"/>`);
-		parts.push(`<text x="${legendX + 28}" y="${legendY}" font-family="system-ui,sans-serif" font-size="11" fill="#334155">${escape(scenario)}</text>`);
-		legendX += 165;
+	for (const group of series) {
+		const color = colorFor(group.scenario);
+		const dash = dashFor(group.operation, group.mode);
+		const dashAttribute = dash ? ` stroke-dasharray="${dash}"` : "";
+		parts.push(`<line x1="${legendX}" y1="${legendY - 4}" x2="${legendX + 22}" y2="${legendY - 4}" stroke="${color}" stroke-width="3"${dashAttribute}/>`);
+		parts.push(`<text x="${legendX + 28}" y="${legendY}" font-family="system-ui,sans-serif" font-size="10" fill="#334155">${escape(`${group.scenario} · ${operationLabel(group.operation)} · ${group.mode}`)}</text>`);
+		legendX += Math.min(360, Math.max(160, 28 + `${group.scenario} · ${operationLabel(group.operation)} · ${group.mode}`.length * 5.4));
 	}
 	parts.push("</svg>");
 	return `${parts.join("\n")}\n`;
+}
+
+function positionForSize(size: number, left: number, width: number, minLog: number, maxLog: number): number {
+	return left + ((Math.log2(size) - minLog) / Math.max(1, maxLog - minLog)) * width;
 }
 
 async function runParent(): Promise<void> {

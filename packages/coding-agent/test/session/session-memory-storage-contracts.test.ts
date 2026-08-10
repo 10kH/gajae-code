@@ -119,9 +119,8 @@ describe("descriptor-validated bounded range reads", () => {
 	});
 });
 
-
 describe("buffered sidecar writers", () => {
-	const serializedBytes = Buffer.from("{\"type\":\"index\",\"id\":\"é\"}\n{\"type\":\"tail\",\"n\":2}\n", "utf8");
+	const serializedBytes = Buffer.from('{"type":"index","id":"é"}\n{"type":"tail","n":2}\n', "utf8");
 
 	it("keeps exact bytes across file and memory backends and bounds pending bytes", async () => {
 		const dir = await makeTempDir("gjc-buffered-parity-");
@@ -312,6 +311,36 @@ describe("buffered sidecar writers", () => {
 				bufferSize: SESSION_STORAGE_BUFFERED_WRITER_MAX_BYTES + 1,
 			}),
 		).toThrow(RangeError);
+	});
+});
+
+describe("exclusive disposable build locks", () => {
+	it("serializes file and memory owners and releases only the captured identity", async () => {
+		const dir = await makeTempDir("gjc-exclusive-lock-");
+		for (const [storage, lockPath] of [
+			[new FileSessionStorage(), path.join(dir, "build.lock")],
+			[new MemorySessionStorage(), "/sessions/build.lock"],
+		] as const) {
+			const first = storage.acquireExclusiveLockSync!(lockPath);
+			expect(first).toBeDefined();
+			expect(storage.acquireExclusiveLockSync!(lockPath)).toBeUndefined();
+			first!.releaseSync();
+			const next = storage.acquireExclusiveLockSync!(lockPath);
+			expect(next).toBeDefined();
+			next!.releaseSync();
+			expect(storage.existsSync(lockPath)).toBe(false);
+		}
+	});
+
+	it("does not unlink a replacement file when releasing the original file lock", async () => {
+		const dir = await makeTempDir("gjc-exclusive-lock-replacement-");
+		const storage = new FileSessionStorage();
+		const lockPath = path.join(dir, "build.lock");
+		const lock = storage.acquireExclusiveLockSync!(lockPath)!;
+		storage.unlinkSync(lockPath);
+		storage.writeTextSync(lockPath, "replacement\n");
+		lock.releaseSync();
+		expect(storage.readTextSync(lockPath)).toBe("replacement\n");
 	});
 });
 

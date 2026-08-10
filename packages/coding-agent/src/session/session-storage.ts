@@ -307,6 +307,10 @@ export interface StagedStreamingWriter {
 	publishNoReplace(): void;
 }
 
+export interface SessionStorageExclusiveLock {
+	releaseSync(): void;
+}
+
 export interface SessionStorage {
 	ensureDirSync(dir: string): void;
 	existsSync(path: string): boolean;
@@ -357,6 +361,8 @@ export interface SessionStorage {
 	readRange?(path: string, start: number, length: number): Promise<SessionStorageRangeSnapshot>;
 	/** Open a staged streaming writer for one immutable one-shot destination (additive). */
 	openStagedWriter?(path: string, options?: SessionStorageWriterOpenOptions): StagedStreamingWriter;
+	/** Acquire an owner-bound exclusive lock; returns undefined while another owner holds it. */
+	acquireExclusiveLockSync?(path: string): SessionStorageExclusiveLock | undefined;
 }
 
 // =============================================================================
@@ -1513,6 +1519,56 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 }
 
 export class FileSessionStorage implements SessionStorage {
+	acquireExclusiveLockSync(lockPath: string): SessionStorageExclusiveLock | undefined {
+		const dir = path.dirname(lockPath);
+		this.ensureDirSync(dir);
+		let fd: number;
+		try {
+			fd = fs.openSync(
+				lockPath,
+				fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0),
+				0o600,
+			);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EEXIST") return undefined;
+			throw error;
+		}
+		try {
+			secureOwnerOnlyFileDescriptor(lockPath, fd, "apply", undefined);
+			fs.writeSync(fd, `${process.pid}:${randomUUID()}\n`);
+			fs.fsyncSync(fd);
+			const expected = fs.fstatSync(fd, { bigint: true });
+			let released = false;
+			return {
+				releaseSync: () => {
+					if (released) return;
+					released = true;
+					try {
+						try {
+							const named = fs.lstatSync(lockPath, { bigint: true });
+							if (named.dev === expected.dev && named.ino === expected.ino && !named.isSymbolicLink())
+								fs.unlinkSync(lockPath);
+						} catch (error) {
+							if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+						}
+					} finally {
+						fs.closeSync(fd);
+					}
+				},
+			};
+		} catch (error) {
+			try {
+				fs.closeSync(fd);
+			} finally {
+				try {
+					fs.unlinkSync(lockPath);
+				} catch {
+					// Preserve the lock acquisition error.
+				}
+			}
+			throw error;
+		}
+	}
 	ensureDirSync(dir: string): void {
 		if (!fs.existsSync(dir)) {
 			fs.mkdirSync(dir, { recursive: true });
@@ -2808,6 +2864,23 @@ class MemorySessionStorageWriter implements SessionStorageBufferedWriter {
 export class MemorySessionStorage implements SessionStorage {
 	#files = new Map<string, { content: Buffer; mtimeMs: number; ino: bigint }>();
 	#nextInode = 1n;
+	acquireExclusiveLockSync(lockPath: string): SessionStorageExclusiveLock | undefined {
+		if (this.#files.has(lockPath)) return undefined;
+		const ino = this.#nextInode++;
+		this.#files.set(lockPath, {
+			content: Buffer.from(`${process.pid}:${randomUUID()}\n`, "utf8"),
+			mtimeMs: Date.now(),
+			ino,
+		});
+		let released = false;
+		return {
+			releaseSync: () => {
+				if (released) return;
+				released = true;
+				if (this.#files.get(lockPath)?.ino === ino) this.#files.delete(lockPath);
+			},
+		};
+	}
 
 	#statFor(entry: { content: Buffer; mtimeMs: number; ino: bigint }): SessionStorageStat {
 		return {
