@@ -564,6 +564,7 @@ export class SessionIndex {
 				if (
 					!current ||
 					this.hostUnregisteredAfter(expected) ||
+					current.terminalUncertain ||
 					current.endpointGeneration !== expected.endpointGeneration ||
 					current.pid !== expected.pid ||
 					current.endpointMtimeMs !== expected.endpointMtimeMs ||

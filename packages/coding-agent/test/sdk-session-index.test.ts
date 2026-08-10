@@ -827,4 +827,30 @@ describe("SDK session index", () => {
 		expect(await index.unregisterIfCurrent(successor)).toBe(true);
 		expect(index.listSessions().sessions).toEqual([]);
 	});
+	it("does not unregister a concurrent terminal-uncertain record", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-uncertain-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append({
+			...event("session"),
+			pid: 1001,
+			endpointMtimeMs: 1,
+			lifecycleRequestId: "request",
+			processIncarnation: "incarnation",
+		});
+		const predecessor = index.listSessions().sessions[0]!;
+		await index.append({
+			...event("session"),
+			type: "lifecycle_terminal",
+			pid: 1001,
+			endpointMtimeMs: 1,
+			lifecycleRequestId: "request",
+			processIncarnation: "incarnation",
+			terminalUncertain: true,
+		});
+		expect(await index.unregisterIfCurrent(predecessor)).toBe(false);
+		expect(index.listSessions().sessions[0]).toMatchObject({
+			sessionId: "session",
+			terminalUncertain: true,
+		});
+	});
 });

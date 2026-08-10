@@ -2280,7 +2280,7 @@ async function endpointRemoved(root: string, id: string): Promise<boolean> {
 }
 
 async function removeExactDeadSessionEndpoint(broker: Broker, id: string, record: CloseRecord): Promise<boolean> {
-	if (record.endpointMtimeMs === undefined) return false;
+	if (record.endpointMtimeMs === undefined) return await endpointRemoved(record.locator.stateRoot, id);
 	await broker.index.refresh();
 	const current = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	if (
@@ -2294,9 +2294,28 @@ async function removeExactDeadSessionEndpoint(broker: Broker, id: string, record
 	)
 		return false;
 	const endpointPath = path.join(record.locator.stateRoot, "sdk", `${id}.json`);
+	const suffix = `${id}-${record.endpointGeneration}-${record.pid}-${String(record.endpointMtimeMs).replaceAll(".", "_")}.json`;
+	const plannedEndpointPath = path.join(path.dirname(endpointPath), `.gjc-dead-endpoint-${suffix}`);
+	const retryEndpointPath = path.join(path.dirname(endpointPath), `.gjc-dead-endpoint-retry-${suffix}`);
+	const finalEndpointPath = path.join(path.dirname(endpointPath), `.gjc-dead-endpoint-final-${suffix}`);
+	const candidates = [endpointPath, plannedEndpointPath, retryEndpointPath, finalEndpointPath];
+	const endpointSource = candidates.find(candidate => {
+		try {
+			return fsSync.lstatSync(candidate).isFile();
+		} catch {
+			return false;
+		}
+	});
+	if (!endpointSource) return await endpointRemoved(record.locator.stateRoot, id);
+	const plannedPath =
+		endpointSource === endpointPath
+			? plannedEndpointPath
+			: endpointSource === plannedEndpointPath
+				? retryEndpointPath
+				: finalEndpointPath;
 	let handle: fs.FileHandle | undefined;
 	try {
-		handle = await fs.open(endpointPath, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+		handle = await fs.open(endpointSource, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
 		const metadata = await handle.stat({ bigint: true });
 		if (!metadata.isFile() || metadata.nlink !== 1n || metadata.size > 4096n) return false;
 		const bytes = Buffer.alloc(Number(metadata.size) + 1);
@@ -2314,7 +2333,7 @@ async function removeExactDeadSessionEndpoint(broker: Broker, id: string, record
 		await handle.close();
 		handle = undefined;
 		const removed = exactUnlinkLifecycleFile(
-			endpointPath,
+			endpointSource,
 			{
 				dev: metadata.dev,
 				ino: metadata.ino,
@@ -2323,14 +2342,15 @@ async function removeExactDeadSessionEndpoint(broker: Broker, id: string, record
 				mtimeNs: metadata.mtimeNs,
 				sha256: createHash("sha256").update(source).digest("hex"),
 			},
-			path.join(
-				path.dirname(endpointPath),
-				`.gjc-dead-endpoint-${id}-${record.endpointGeneration}-${record.pid}-${String(record.endpointMtimeMs).replaceAll(".", "_")}.json`,
-			),
+			plannedPath,
+			(() => {
+				const parent = lifecycleParentIdentity(path.dirname(endpointSource));
+				return parent ? { dev: BigInt(parent.dev), ino: BigInt(parent.ino) } : undefined;
+			})(),
 		);
 		return removed.ok || removed.code === "not_found";
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "ENOENT";
+	} catch {
+		return false;
 	} finally {
 		await handle?.close();
 	}
@@ -2370,11 +2390,7 @@ async function waitForClose(broker: Broker, id: string, record: CloseRecord, tim
 						}
 					: undefined;
 			if (expected) await removeOwnedLifecycleArtifacts(record.locator.stateRoot, id, expected);
-			if (
-				!(await endpointRemoved(record.locator.stateRoot, id)) &&
-				!(await removeExactDeadSessionEndpoint(broker, id, record))
-			)
-				return false;
+			if (!(await removeExactDeadSessionEndpoint(broker, id, record))) return false;
 			await broker.index.unregisterIfCurrent(registration);
 			return await endpointRemoved(record.locator.stateRoot, id);
 		}
