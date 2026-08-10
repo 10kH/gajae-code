@@ -9207,7 +9207,7 @@ export class TelegramNotificationDaemon {
 	 */
 	private attachedEndpointCount(): number {
 		let attached = 0;
-		for (const session of this.sessions.values()) if (session.ws.readyState === WebSocket.OPEN) attached += 1;
+		for (const session of this.sessions.values()) if (session.transport.readyState === WebSocket.OPEN) attached += 1;
 		return attached;
 	}
 	private async renewOwnershipHeartbeat(): Promise<boolean> {
