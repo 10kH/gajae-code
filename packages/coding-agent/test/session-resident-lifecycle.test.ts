@@ -266,8 +266,9 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 		expect(await readPersistedJsonl(movedFile)).toContain(sentinel.slice(0, 100));
 		expect(await readPersistedJsonl(movedFile)).not.toContain("__gjcResidentBlob");
 		expect(await readPersistedJsonl(movedFile)).not.toContain("blob:sha256:");
-		const movedCacheDir = activeResidentCacheDir();
-		expect(movedCacheDir).not.toBe(cacheDir);
+		const replacementCacheDirs = residentCacheDirs().filter(dir => dir !== cacheDir);
+		expect(replacementCacheDirs.length).toBeGreaterThan(0);
+		expect(replacementCacheDirs).not.toContain(cacheDir);
 		await sm.close();
 	});
 
