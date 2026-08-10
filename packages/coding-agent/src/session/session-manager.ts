@@ -189,6 +189,7 @@ import type {
 	SessionStorageSnapshot,
 	SessionStorageStat,
 	SessionStorageWriter,
+	SessionStorageBufferedWriter,
 	SessionStorageWriterCloseState,
 	StagedStreamingWriter,
 	VerifiedSessionDeleteResult,
@@ -447,6 +448,54 @@ export interface SessionManagerObservabilityStats {
 	pathOnlyContextBuildCount: number;
 }
 
+export type SessionMemoryGcStrategy = "current" | "none" | "async" | "pressure";
+export type SessionMemorySecondaryArtifactMode = "auto" | "enabled" | "disabled";
+
+export interface SessionMemoryPhaseTelemetry {
+	wallMs: number;
+	cpuMs: number;
+}
+
+export interface SessionMemoryFirstOpenTelemetry {
+	/** True when a bounded first-open attempt was started for this manager. */
+	attempted: boolean;
+	/** True only after the bounded sidecar set and context were committed. */
+	succeeded: boolean;
+	strategy: SessionMemoryGcStrategy;
+	secondaryArtifactMode: SessionMemorySecondaryArtifactMode;
+	wallMs: number;
+	cpuMs: number;
+	gcRequests: number;
+	gcRequestCount: number;
+	gcElapsedMs: number;
+	bytesRead: number;
+	transcriptBytesRead: number;
+	bytesWritten: number;
+	sidecarBytesWritten: number;
+	sidecarFileBytes: number;
+	recordsParsed: number;
+	lineAssemblyCopyCount: number;
+	lineCopyCount: number;
+	lineAssemblyCopyBytes: number;
+	indexWriteCalls: number;
+	indexWriteBytes: number;
+	fsyncCount: number;
+	fsyncElapsedMs: number;
+	/** Phase names are stable internal keys; missing phases remain zero-valued. */
+	phaseTelemetry: Record<string, SessionMemoryPhaseTelemetry>;
+	/** Alias retained for benchmark/report consumers. */
+	phaseEvidence: Readonly<Record<string, SessionMemoryPhaseTelemetry>>;
+	/** Alias retained for benchmark/report consumers. */
+	phaseTimings: Readonly<Record<string, SessionMemoryPhaseTelemetry>>;
+	/** Internal pressure-mode baseline; not persisted. */
+	pressureBaselineBytes?: number;
+	dictionaryArtifactEnabled: boolean;
+	parentArtifactEnabled: boolean;
+	dictionaryBuildElapsedMs: number;
+	parentBuildElapsedMs: number;
+	flatIndexElapsedMs: number;
+}
+
 export interface SessionMemoryStats {
 	sidecarEnabled: boolean;
 	coldRetirementActive: boolean;
@@ -454,6 +503,18 @@ export interface SessionMemoryStats {
 	hotRegionBytes: number;
 	metaDescriptorBytes: number;
 	totalAccountedBytes: number;
+	/** Fixed cache/reducer reservation charged for enforcement, distinct from live residency. */
+	reservedBudgetBytes: number;
+	/** Bytes currently allocated in bounded block/entry/tail caches. */
+	allocatedCacheBytes: number;
+	/** Resident hot suffix object bytes, excluding reserved budgets. */
+	hotResidentBytes: number;
+	/** Resident reducer/labels/metadata-delta descriptor bytes. */
+	metadataResidentBytes: number;
+	/** Bytes currently present in disposable sidecar files. */
+	sidecarFileBytes: number;
+	/** Latest bounded first-open telemetry; zero-valued when no attempt ran. */
+	firstOpen: SessionMemoryFirstOpenTelemetry;
 	lastReopenTransition: ReopenClassification | undefined;
 	currentCommitTransition: ReopenClassification | undefined;
 	lazyReopenAttempted: boolean;
@@ -797,6 +858,12 @@ export interface SessionMemorySidecarRuntime {
 	retirementFirstKeptEntryId: string | undefined;
 	/** Hot-suffix byte total (accountant-bounded to ≤ 16 MiB). */
 	hotSuffixBytes: number;
+	/** Resident hot suffix object bytes charged separately from the raw hot-region byte count. */
+	hotResidentBytes: number;
+	/** Fixed reservation used for accounting split telemetry. */
+	reservedBudgetBytes: number;
+	/** Disposable sidecar file byte total captured after first-open publication. */
+	sidecarFileBytes: number;
 	accountant: SessionMemoryAccountant;
 	reducer: ReducerState;
 	/** Resident inline provider-affecting entries (merged order minus demoted slots). */
@@ -1330,6 +1397,7 @@ function createBoundedLineChunkConsumer(visit: (lineStart: number, lineBytes: Ui
 
 function createReusableBoundedLineChunkConsumer(
 	visit: (lineStart: number, lineBytes: Uint8Array) => boolean | undefined,
+	onCopy?: (bytes: number) => void,
 ): {
 	consume(chunk: Buffer, chunkStart: number): BoundedLineScanFailure | undefined;
 	hasLargePendingLine(): boolean;
@@ -1343,6 +1411,7 @@ function createReusableBoundedLineChunkConsumer(
 		let capacity = pendingBuffer?.byteLength ?? 64 * 1024;
 		while (capacity < required) capacity = Math.min(BOUNDED_FIRST_OPEN_MAX_LINE_BYTES, capacity * 2);
 		const grown = Buffer.allocUnsafe(capacity);
+		if (pendingBuffer && pendingBytes > 0) onCopy?.(pendingBytes);
 		if (pendingBuffer && pendingBytes > 0) pendingBuffer.copy(grown, 0, 0, pendingBytes);
 		pendingBuffer = grown;
 		return grown;
@@ -1360,6 +1429,7 @@ function createReusableBoundedLineChunkConsumer(
 				let line = segment;
 				if (pendingBytes > 0) {
 					const assembled = ensureCapacity(lineBytes);
+					onCopy?.(segment.byteLength);
 					segment.copy(assembled, pendingBytes);
 					line = assembled.subarray(0, lineBytes);
 				}
@@ -1373,6 +1443,7 @@ function createReusableBoundedLineChunkConsumer(
 				const nextBytes = pendingBytes + remainder.byteLength;
 				if (nextBytes > BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) return "oversized_line";
 				const assembled = ensureCapacity(nextBytes);
+				onCopy?.(remainder.byteLength);
 				remainder.copy(assembled, pendingBytes);
 				pendingBytes = nextBytes;
 			}
@@ -1397,6 +1468,7 @@ function scanTranscriptLinesBounded(
 	result?: { stat?: SessionStorageStat },
 	allowUnterminated = false,
 	reuseLineAssembly = false,
+	firstOpenTelemetry?: SessionMemoryFirstOpenTelemetry,
 ): BoundedLineScanFailure | undefined {
 	const chunkBytes =
 		size > PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES
@@ -1412,7 +1484,7 @@ function scanTranscriptLinesBounded(
 			const before = fs.fstatSync(fd, { bigint: true });
 			if (!before.isFile() || before.nlink > 1 || Number(before.size) < size) return "read_failed";
 			const consumer = reuseLineAssembly
-				? createReusableBoundedLineChunkConsumer(visit)
+				? createReusableBoundedLineChunkConsumer(visit, bytes => recordFirstOpenLineCopy(firstOpenTelemetry, bytes))
 				: createBoundedLineChunkConsumer(visit);
 			let pos = 0;
 			let useLargeRecordCadence = false;
@@ -1430,6 +1502,10 @@ function scanTranscriptLinesBounded(
 				const failure = consumer.consume(chunk, pos);
 				if (failure) return failure;
 				pos += length;
+				if (firstOpenTelemetry) {
+					firstOpenTelemetry.bytesRead += length;
+					firstOpenTelemetry.transcriptBytesRead += length;
+				}
 				useLargeRecordCadence ||= consumer.hasLargePendingLine();
 				const gcIntervalBytes = useLargeRecordCadence
 					? size > PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES
@@ -1440,7 +1516,8 @@ function scanTranscriptLinesBounded(
 					: 4 * 1024 * 1024;
 				bytesSinceGc += length;
 				if (bytesSinceGc >= gcIntervalBytes) {
-					Bun.gc(true);
+					if (firstOpenTelemetry) recordFirstOpenGcRequest(firstOpenTelemetry);
+					else Bun.gc(true);
 					bytesSinceGc = 0;
 				}
 			}
@@ -1477,7 +1554,7 @@ function scanTranscriptLinesBounded(
 		}
 	}
 	const consumer = reuseLineAssembly
-		? createReusableBoundedLineChunkConsumer(visit)
+		? createReusableBoundedLineChunkConsumer(visit, bytes => recordFirstOpenLineCopy(firstOpenTelemetry, bytes))
 		: createBoundedLineChunkConsumer(visit);
 	let pos = 0;
 	let useLargeRecordCadence = false;
@@ -1493,6 +1570,10 @@ function scanTranscriptLinesBounded(
 		const failure = consumer.consume(Buffer.from(chunk), pos);
 		if (failure) return failure;
 		pos += length;
+		if (firstOpenTelemetry) {
+			firstOpenTelemetry.bytesRead += length;
+			firstOpenTelemetry.transcriptBytesRead += length;
+		}
 		useLargeRecordCadence ||= consumer.hasLargePendingLine();
 		const gcIntervalBytes = useLargeRecordCadence
 			? size > PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES
@@ -1501,7 +1582,8 @@ function scanTranscriptLinesBounded(
 			: 4 * 1024 * 1024;
 		bytesSinceGc += length;
 		if (bytesSinceGc >= gcIntervalBytes) {
-			Bun.gc(true);
+			if (firstOpenTelemetry) recordFirstOpenGcRequest(firstOpenTelemetry);
+			else Bun.gc(true);
 			bytesSinceGc = 0;
 		}
 	}
@@ -1877,7 +1959,12 @@ export type SessionAppendPersistenceFailurePhase = "current_append" | "prior_fai
 
 /** Safety bound for eager resume compatibility and managed per-file artifacts. */
 export const RESUME_TRANSCRIPT_MAX_BYTES = MANAGED_ARTIFACT_MAX_FILE_BYTES;
-const BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES = 1024 * 1024 * 1024;
+/**
+ * Explicit cold-session admission limit. Two-GiB transcripts remain streamable;
+ * the extra MiB covers bounded fork header replacement without rejecting a
+ * source exactly at the advertised limit.
+ */
+export const BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES = 2 * 1024 * 1024 * 1024 + 1024 * 1024;
 const EAGER_RESUME_TRANSCRIPT_MAX_BYTES = MANAGED_ARTIFACT_MAX_FILE_BYTES;
 
 export const SESSION_OVERSIZED_RECOVERY_MESSAGE =
@@ -6221,6 +6308,10 @@ export const SessionManagerTestHooks: {
 	afterForkTranscriptPublished?: () => void | Promise<void>;
 	beforeEphemeralArtifactManagerInstall?: (dir: string) => void | Promise<void>;
 	beforePersistPatchFence?: (attempt: number) => void;
+	/** Internal first-open GC strategy override; omitted means current. */
+	firstOpenGcStrategy?: SessionMemoryGcStrategy;
+	/** Internal first-open secondary-artifact mode override; omitted means auto. */
+	secondaryArtifactMode?: SessionMemorySecondaryArtifactMode;
 } = {};
 
 function materializedCacheMaxBytes(): number {
@@ -6229,6 +6320,144 @@ function materializedCacheMaxBytes(): number {
 	if (!Number.isSafeInteger(override) || override < 0)
 		throw new RangeError("materializedCacheMaxBytesOverride must be a non-negative safe integer.");
 	return override;
+}
+
+function emptyFirstOpenTelemetry(
+	strategy: SessionMemoryGcStrategy = "current",
+	secondaryArtifactMode: SessionMemorySecondaryArtifactMode = "auto",
+): SessionMemoryFirstOpenTelemetry {
+	const phases: Record<string, SessionMemoryPhaseTelemetry> = {};
+	return {
+		attempted: false,
+		succeeded: false,
+		strategy,
+		secondaryArtifactMode,
+		wallMs: 0,
+		cpuMs: 0,
+		gcRequests: 0,
+		gcRequestCount: 0,
+		gcElapsedMs: 0,
+		bytesRead: 0,
+		transcriptBytesRead: 0,
+		bytesWritten: 0,
+		sidecarBytesWritten: 0,
+		sidecarFileBytes: 0,
+		recordsParsed: 0,
+		lineAssemblyCopyCount: 0,
+		lineCopyCount: 0,
+		lineAssemblyCopyBytes: 0,
+		indexWriteCalls: 0,
+		indexWriteBytes: 0,
+		fsyncCount: 0,
+		fsyncElapsedMs: 0,
+		phaseTelemetry: phases,
+		phaseEvidence: phases,
+		phaseTimings: phases,
+		dictionaryArtifactEnabled: false,
+		parentArtifactEnabled: false,
+		dictionaryBuildElapsedMs: 0,
+		parentBuildElapsedMs: 0,
+		flatIndexElapsedMs: 0,
+	};
+}
+
+function firstOpenGcStrategy(): SessionMemoryGcStrategy {
+	const candidate =
+		SessionManagerTestHooks.firstOpenGcStrategy ?? process.env.GJC_SESSION_MEMORY_GC_STRATEGY?.trim().toLowerCase();
+	return candidate === "none" || candidate === "async" || candidate === "pressure" || candidate === "current"
+		? candidate
+		: "current";
+}
+
+function firstOpenSecondaryArtifactMode(): SessionMemorySecondaryArtifactMode {
+	const candidate =
+		SessionManagerTestHooks.secondaryArtifactMode ??
+		process.env.GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE?.trim().toLowerCase();
+	return candidate === "enabled" || candidate === "disabled" || candidate === "auto" ? candidate : "auto";
+}
+
+function residentProcessBytes(): number {
+	const usage = process.memoryUsage();
+	return usage.heapUsed + usage.external + usage.arrayBuffers;
+}
+
+function recordFirstOpenPhase(
+	telemetry: SessionMemoryFirstOpenTelemetry,
+	name: string,
+	startedAt: { wall: bigint; cpu: NodeJS.CpuUsage },
+): void {
+	const wallMs = Number(process.hrtime.bigint() - startedAt.wall) / 1_000_000;
+	const cpu = process.cpuUsage(startedAt.cpu);
+	const cpuMs = (cpu.user + cpu.system) / 1_000;
+	const existing = telemetry.phaseTelemetry[name];
+	telemetry.phaseTelemetry[name] = {
+		wallMs: (existing?.wallMs ?? 0) + wallMs,
+		cpuMs: (existing?.cpuMs ?? 0) + cpuMs,
+	};
+}
+
+function startFirstOpenPhase(): { wall: bigint; cpu: NodeJS.CpuUsage } {
+	return { wall: process.hrtime.bigint(), cpu: process.cpuUsage() };
+}
+
+function recordFirstOpenGcRequest(telemetry: SessionMemoryFirstOpenTelemetry): boolean {
+	if (telemetry.strategy === "none") return false;
+	if (telemetry.strategy === "pressure") {
+		const current = residentProcessBytes();
+		const baseline = telemetry.pressureBaselineBytes ?? current;
+		if (current - baseline < 32 * 1024 * 1024) return false;
+		telemetry.pressureBaselineBytes = current;
+	}
+	const started = process.hrtime.bigint();
+	if (telemetry.strategy === "async") Bun.gc(false);
+	else Bun.gc(true);
+	telemetry.gcRequests += 1;
+	telemetry.gcRequestCount = telemetry.gcRequests;
+	telemetry.gcElapsedMs += Number(process.hrtime.bigint() - started) / 1_000_000;
+	telemetry.pressureBaselineBytes = residentProcessBytes();
+	return true;
+}
+
+function recordFirstOpenLineCopy(telemetry: SessionMemoryFirstOpenTelemetry | undefined, bytes: number): void {
+	if (!telemetry || bytes <= 0) return;
+	telemetry.lineAssemblyCopyCount += 1;
+	telemetry.lineCopyCount = telemetry.lineAssemblyCopyCount;
+	telemetry.lineAssemblyCopyBytes += bytes;
+}
+
+function asBufferedSidecarWriter(writer: SessionStorageWriter): SessionStorageBufferedWriter | undefined {
+	return typeof (writer as Partial<SessionStorageBufferedWriter>).writeBytesSync === "function"
+		? (writer as SessionStorageBufferedWriter)
+		: undefined;
+}
+
+function openFirstOpenSidecarWriter(storage: SessionStorage, filePath: string): SessionStorageWriter {
+	return storage.openBufferedWriter?.(filePath, { flags: "w" }) ?? storage.openWriter(filePath, { flags: "w" });
+}
+
+function writeFirstOpenSidecarBytes(
+	writer: SessionStorageWriter,
+	bytes: Buffer,
+	telemetry: SessionMemoryFirstOpenTelemetry,
+	kind: "index" | "tail",
+): void {
+	const buffered = asBufferedSidecarWriter(writer);
+	if (buffered) buffered.writeBytesSync(bytes);
+	else writer.writeLineSync(bytes.toString("utf8"));
+	telemetry.bytesWritten += bytes.byteLength;
+	telemetry.sidecarBytesWritten += bytes.byteLength;
+	if (kind === "index") {
+		telemetry.indexWriteBytes += bytes.byteLength;
+		if (!buffered) telemetry.indexWriteCalls += 1;
+	}
+}
+
+function fsyncFirstOpenSidecarWriter(writer: SessionStorageWriter, telemetry: SessionMemoryFirstOpenTelemetry): void {
+	if (!writer.fsyncSync) throw new Error("Synchronous sidecar fsync is unavailable");
+	const started = process.hrtime.bigint();
+	writer.fsyncSync();
+	telemetry.fsyncCount += 1;
+	telemetry.fsyncElapsedMs += Number(process.hrtime.bigint() - started) / 1_000_000;
 }
 
 type ManagedDestinationTransition = {
@@ -6348,6 +6577,7 @@ export class SessionManager {
 	/** Active cold-sidecar runtime (retirement + lazy resolution). Undefined when disabled. */
 	#sidecarRuntime: SessionMemorySidecarRuntime | undefined = undefined;
 	#consecutiveSidecarBuildFailures = 0;
+	#firstOpenTelemetry: SessionMemoryFirstOpenTelemetry = emptyFirstOpenTelemetry();
 	#sessionMemoryAutoDisabledReason: string | undefined;
 	#sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow";
 	#lazyReopenAttempted = false;
@@ -7172,6 +7402,8 @@ export class SessionManager {
 			// ambiguity in the binding or rehydration fails closed to the eager path.
 			if (!this.#adoptCommittedMetadataDelta(commit.metadataDelta)) return false;
 			runtime.hotSuffixBytes = hotSuffixBytes;
+			runtime.hotResidentBytes = hotResidentBytes;
+			runtime.reservedBudgetBytes = fixedReservedBytes;
 			runtime.reopenTransition = { kind: "exact", reason: "descriptor_and_proof_match" };
 			runtime.terminalTransition = runtime.reopenTransition;
 			this.#commitResidentTextStoreTransition(prepared, false);
@@ -7216,6 +7448,13 @@ export class SessionManager {
 			return false;
 		this.#lazyReopenAttempted = true;
 		this.#lazyReopenSucceeded = false;
+		const strategy = firstOpenGcStrategy();
+		const secondaryArtifactMode = firstOpenSecondaryArtifactMode();
+		const telemetry = emptyFirstOpenTelemetry(strategy, secondaryArtifactMode);
+		telemetry.attempted = true;
+		telemetry.pressureBaselineBytes = residentProcessBytes();
+		this.#firstOpenTelemetry = telemetry;
+		const overallStarted = startFirstOpenPhase();
 		this.#sessionFile = sessionFile;
 		const runtime = this.#resetSidecarRuntime();
 		// A pre-existing commit marker means a sidecar set was previously published;
@@ -7229,24 +7468,32 @@ export class SessionManager {
 		this.#lazyReopenFallbackReason = "bounded_first_open_failed";
 		let initialized = false;
 		try {
+			const preflightStarted = startFirstOpenPhase();
 			const before = this.#managedDescriptorSnapshotOrNull();
+			recordFirstOpenPhase(telemetry, "descriptorSecurityPreflight", preflightStarted);
 			if (!before || before.size === 0 || before.size > BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES) {
 				this.#lazyReopenFallbackReason = "bounded_first_open_unreadable";
 				return false;
 			}
+			const semanticStarted = startFirstOpenPhase();
 			const discovery = this.#scanBoundedTranscriptForFirstOpen(sessionFile, before);
+			recordFirstOpenPhase(telemetry, "semanticScan", semanticStarted);
 			if (!discovery) return false;
 			// The semantic pass's fixed duplicate table is no longer needed. Collect it
 			// before allocating publication buffers for ordinary-size transcripts; the
 			// one-GiB fork lane skips this pause to preserve its latency gate.
-			if (before.size < 512 * 1024 * 1024) Bun.gc(true);
-			const built = this.#buildBoundedFirstOpenSidecars(sessionFile, before, discovery);
+			if (before.size < 512 * 1024 * 1024) recordFirstOpenGcRequest(telemetry);
+			const buildStarted = startFirstOpenPhase();
+			const built = this.#buildBoundedFirstOpenSidecars(sessionFile, before, discovery, secondaryArtifactMode);
+			recordFirstOpenPhase(telemetry, "indexTailWork", buildStarted);
 			if (!built) return false;
 			runtime.enabled = true;
 			this.#leafId = discovery.leafId;
 			this.#usageStatistics = discovery.usageStatistics;
+			const commitStarted = startFirstOpenPhase();
 			this.#publishCommitMarkerFromCurrentTranscriptSync();
 			const publishedTransition = this.#classifySidecarReopen();
+			recordFirstOpenPhase(telemetry, "commitClassification", commitStarted);
 			if (publishedTransition.kind !== "exact") {
 				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
 				return false;
@@ -7256,6 +7503,7 @@ export class SessionManager {
 				this.#lazyReopenFallbackReason = "bounded_first_open_descriptor_changed";
 				return false;
 			}
+			const hotContextStarted = startFirstOpenPhase();
 			const entries: FileEntry[] = [discovery.header, ...built.hotEntries];
 			await resolveBlobRefsInEntries(entries, this.#blobStore);
 			const prepared = this.#prepareResidentTextStoreTransition(
@@ -7270,6 +7518,7 @@ export class SessionManager {
 				},
 				"memory-fallback",
 			);
+			recordFirstOpenPhase(telemetry, "hotSuffixContext", hotContextStarted);
 			const finalDescriptor = this.#managedDescriptorSnapshotOrNull();
 			if (!finalDescriptor || !sameDescriptor(before, finalDescriptor)) {
 				prepared.dispose();
@@ -7287,12 +7536,16 @@ export class SessionManager {
 			runtime.reopenTransition = { kind: "rebuild", reason: "bounded_first_open" };
 			runtime.terminalTransition = { kind: "exact", reason: "descriptor_and_proof_match" };
 			this.#lazyReopenSucceeded = true;
+			telemetry.succeeded = true;
 			this.#lazyReopenFallbackReason = undefined;
 			initialized = true;
 			return true;
 		} catch {
 			return false;
 		} finally {
+			telemetry.wallMs = Number(process.hrtime.bigint() - overallStarted.wall) / 1_000_000;
+			const overallCpu = process.cpuUsage(overallStarted.cpu);
+			telemetry.cpuMs = (overallCpu.user + overallCpu.system) / 1_000;
 			if (!initialized) {
 				for (const sidecarPath of this.#disposableSidecarPaths()) {
 					if (!sidecarPath) continue;
@@ -7321,6 +7574,7 @@ export class SessionManager {
 		sessionFile: string,
 		descriptor: DescriptorSnapshot,
 	): BoundedFirstOpenDiscovery | undefined {
+		const telemetry = this.#firstOpenTelemetry;
 		const seenIds = new BoundedDictionaryIdSet();
 		const labelsById = new Map<string, string>();
 		let labelsBytes = 0;
@@ -7376,6 +7630,7 @@ export class SessionManager {
 				const record = parsed as Record<string, unknown>;
 				if (typeof record.type !== "string" || typeof record.id !== "string") return fail("bounded_scan_malformed");
 				if (!hasStrictSessionSchema([record as unknown as FileEntry])) return fail("bounded_scan_unsupported");
+				telemetry.recordsParsed += 1;
 				if (lineStart === 0) {
 					if (
 						record.type !== "session" ||
@@ -7468,8 +7723,11 @@ export class SessionManager {
 					providerState.set(providerKey, { ordinal, entry: providerEntry, bytes });
 				}
 				lastId = record.id;
-				if ((ordinal & 4095) === 0) Bun.gc(true);
 			},
+			undefined,
+			false,
+			true,
+			telemetry,
 		);
 		if (scanFailure) {
 			if (scanFailure === "oversized_line") this.#lazyReopenFallbackReason = "bounded_scan_unsupported";
@@ -7529,9 +7787,11 @@ export class SessionManager {
 		sessionFile: string,
 		descriptor: DescriptorSnapshot,
 		discovery: BoundedFirstOpenDiscovery,
+		secondaryArtifactMode: SessionMemorySecondaryArtifactMode = "auto",
 	): { hotEntries: SessionEntry[]; hotSuffixBytes: number } | undefined {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.indexPath || !runtime.tailPath) return undefined;
+		const telemetry = this.#firstOpenTelemetry;
 		let indexWriter: SessionStorageWriter | undefined;
 		let tailWriter: SessionStorageWriter | undefined;
 		const baseHash = crypto.createHash("sha256");
@@ -7549,8 +7809,10 @@ export class SessionManager {
 		const hotEntries: SessionEntry[] = [];
 		let buildFailed = false;
 		let secondaryArtifactsEligible =
-			descriptor.size <= PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES &&
-			discovery.recordCount <= PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS;
+			secondaryArtifactMode !== "disabled" &&
+			(secondaryArtifactMode === "enabled" ||
+				(descriptor.size <= PERSISTENT_SECONDARY_ARTIFACT_MAX_TRANSCRIPT_BYTES &&
+					discovery.recordCount <= PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS));
 		const parentBuilder = new BoundedParentArtifactBuilder();
 		// Persistent dictionary scratch stays below the 20 MiB acceptance cap.
 		// Oversized inputs retain the authenticated flat-index fallback instead.
@@ -7565,8 +7827,8 @@ export class SessionManager {
 		const metadataDeltaState = this.#createMetadataDeltaRuntimeState();
 		runtime.metadataDelta = metadataDeltaState;
 		try {
-			indexWriter = this.storage.openWriter(runtime.indexPath, { flags: "w" });
-			tailWriter = this.storage.openWriter(runtime.tailPath, { flags: "w" });
+			indexWriter = openFirstOpenSidecarWriter(this.storage, runtime.indexPath);
+			tailWriter = openFirstOpenSidecarWriter(this.storage, runtime.tailPath);
 			this.#truncateDerivedArtifactFiles(secondaryArtifactsEligible);
 			const scanFailure = scanTranscriptLinesBounded(
 				this.storage,
@@ -7585,6 +7847,7 @@ export class SessionManager {
 						buildFailed = true;
 						return false;
 					}
+					telemetry.recordsParsed += 1;
 					const record = parsed as Record<string, unknown>;
 					if (typeof record.id !== "string" || typeof record.type !== "string") {
 						buildFailed = true;
@@ -7626,9 +7889,11 @@ export class SessionManager {
 						parentId,
 						entryType: record.type,
 					})}\n`;
-					indexWriter!.writeLineSync(indexLine);
-					runtime.indexHash.update(Buffer.from(indexLine, "utf8"));
-					if (ordinal >= PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS) secondaryArtifactsEligible = false;
+					const indexBytes = Buffer.from(indexLine, "utf8");
+					writeFirstOpenSidecarBytes(indexWriter!, indexBytes, telemetry, "index");
+					runtime.indexHash.update(indexBytes);
+					if (secondaryArtifactMode === "auto" && ordinal >= PERSISTENT_SECONDARY_ARTIFACT_MAX_RECORDS)
+						secondaryArtifactsEligible = false;
 					if (secondaryArtifactsEligible) {
 						const dictionaryAdd = dictionaryBuilder.add({
 							id: record.id,
@@ -7681,7 +7946,8 @@ export class SessionManager {
 							buildFailed = true;
 							return false;
 						}
-						tailWriter!.writeLineSync(`${JSON.stringify(tailRecord)}\n`);
+						const tailBytes = Buffer.from(`${JSON.stringify(tailRecord)}\n`, "utf8");
+						writeFirstOpenSidecarBytes(tailWriter!, tailBytes, telemetry, "tail");
 						tailSeq++;
 						tailResidentBytes += tailRecordResidentBytes(tailRecord);
 					} else {
@@ -7689,8 +7955,11 @@ export class SessionManager {
 					}
 					ordinal++;
 					previousId = record.id;
-					if ((ordinal & 4095) === 0) Bun.gc(true);
 				},
+				undefined,
+				false,
+				true,
+				telemetry,
 			);
 			if (scanFailure || buildFailed) {
 				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
@@ -7705,10 +7974,14 @@ export class SessionManager {
 				this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
 				return undefined;
 			}
-			if (!indexWriter?.fsyncSync || !tailWriter?.fsyncSync)
-				throw new Error("Synchronous sidecar fsync is unavailable");
-			indexWriter.fsyncSync();
-			tailWriter.fsyncSync();
+			fsyncFirstOpenSidecarWriter(indexWriter!, telemetry);
+			fsyncFirstOpenSidecarWriter(tailWriter!, telemetry);
+			const bufferedIndexWriter = asBufferedSidecarWriter(indexWriter!);
+			if (bufferedIndexWriter) {
+				const instrumentation = bufferedIndexWriter.getInstrumentation();
+				telemetry.indexWriteCalls = instrumentation.writeCalls;
+				telemetry.bytesWritten = Math.max(telemetry.bytesWritten, instrumentation.bytesWritten);
+			}
 			if (!runtime.tailCache.tryAllocate(tailResidentBytes)) {
 				this.#lazyReopenFallbackReason = "bounded_scan_budget";
 				return undefined;
@@ -7724,6 +7997,8 @@ export class SessionManager {
 				this.#lazyReopenFallbackReason = "bounded_scan_budget";
 				return undefined;
 			}
+			runtime.hotResidentBytes = hotResidentBytes;
+			runtime.reservedBudgetBytes = fixedReservedBytes;
 			runtime.base = { baseDigest, baseEndOffset };
 			runtime.tail = tail;
 			runtime.retirementFirstKeptEntryId = discovery.retirementFirstKeptEntryId;
@@ -7732,6 +8007,7 @@ export class SessionManager {
 
 			runtime.indexDigest = runtime.indexHash.copy().digest("hex");
 			metadataDeltaState.indexDigest = runtime.indexDigest;
+			const dictionaryStarted = startFirstOpenPhase();
 			if (secondaryArtifactsEligible) {
 				const dictionaryResult = dictionaryBuilder.finish(discovery.header.id, runtime.indexDigest);
 				if (dictionaryResult.kind !== "ok" || dictionaryResult.commit.sidecarIneligible) {
@@ -7747,12 +8023,16 @@ export class SessionManager {
 			} else {
 				runtime.dictionary = undefined;
 			}
+			recordFirstOpenPhase(telemetry, "dictionary", dictionaryStarted);
+			telemetry.dictionaryBuildElapsedMs = telemetry.phaseTelemetry.dictionary?.wallMs ?? 0;
+			telemetry.dictionaryArtifactEnabled = runtime.dictionary !== undefined;
 			// Provider state with oversized-value demotion: values over
 			// MAX_REDUCER_INLINE_BYTES are persisted to the metadata-delta section
 			// (before the marker binds their descriptors) with exact location+digest
 			// and are NOT retained resident — only a 24 B descriptor is kept. The
 			// merged provider order is tracked explicitly so reopen reproduces the
 			// exact slot sequence.
+			const metadataStarted = startFirstOpenPhase();
 			runtime.providerStateEntries = [];
 			runtime.providerStateOrder = [];
 			for (const provider of discovery.providerState) {
@@ -7777,8 +8057,13 @@ export class SessionManager {
 				}
 			}
 			this.#syncMetadataDeltaDescriptorBytes();
+			recordFirstOpenPhase(telemetry, "metadataDelta", metadataStarted);
+			const parentStarted = startFirstOpenPhase();
 			if (secondaryArtifactsEligible) this.#publishParentArtifact(parentBuilder, runtime.indexDigest);
 			else runtime.parentArtifact = undefined;
+			recordFirstOpenPhase(telemetry, "parent", parentStarted);
+			telemetry.parentBuildElapsedMs = telemetry.phaseTelemetry.parent?.wallMs ?? 0;
+			telemetry.parentArtifactEnabled = runtime.parentArtifact !== undefined;
 			try {
 				const validated = this.storage.statSync(runtime.indexPath);
 				runtime.validatedIndexDescriptor = validated;
@@ -10018,6 +10303,9 @@ export class SessionManager {
 			metadataDeltaPath,
 			retirementFirstKeptEntryId: undefined,
 			hotSuffixBytes: 0,
+			hotResidentBytes: 0,
+			reservedBudgetBytes: 0,
+			sidecarFileBytes: 0,
 			accountant: new SessionMemoryAccountant(),
 			reducer: {
 				modelChange: { latest: undefined },
@@ -11615,6 +11903,18 @@ export class SessionManager {
 			...dictionaryPartitionPaths(runtime.indexPath),
 			...parentBucketPaths(runtime.indexPath),
 		];
+}
+	#sidecarFileByteTotal(): number {
+		let total = 0;
+		for (const sidecarPath of this.#disposableSidecarPaths()) {
+			if (!sidecarPath) continue;
+			try {
+				total += this.storage.statSync(sidecarPath).size;
+			} catch {
+				// Missing disposable artifacts are represented as zero bytes.
+			}
+		}
+		return total;
 	}
 
 	#validateColdBase(base = this.#sidecarRuntime?.base): boolean {
@@ -13628,6 +13928,12 @@ export class SessionManager {
 				hotRegionBytes: 0,
 				metaDescriptorBytes: 0,
 				totalAccountedBytes: 0,
+				reservedBudgetBytes: 0,
+				allocatedCacheBytes: 0,
+				hotResidentBytes: 0,
+				metadataResidentBytes: 0,
+				sidecarFileBytes: 0,
+				firstOpen: this.#firstOpenTelemetry,
 				lastReopenTransition: undefined,
 				currentCommitTransition: undefined,
 				lazyReopenAttempted: this.#lazyReopenAttempted,
@@ -13663,6 +13969,17 @@ export class SessionManager {
 			runtime.labelsPins.totalBytes +
 			reducerBytes +
 			(runtime.metadataDelta?.descriptorBytes ?? 0);
+		let sidecarFileBytes = 0;
+		for (const sidecarPath of this.#disposableSidecarPaths()) {
+			if (!sidecarPath) continue;
+			try {
+				sidecarFileBytes += this.storage.statSync(sidecarPath).size;
+			} catch {
+				// Missing disposable artifacts contribute no live file bytes.
+			}
+		}
+		runtime.sidecarFileBytes = sidecarFileBytes;
+		this.#firstOpenTelemetry.sidecarFileBytes = sidecarFileBytes;
 		return {
 			sidecarEnabled: runtime.enabled,
 			coldRetirementActive: this.#coldSidecarActive(),
@@ -13670,6 +13987,14 @@ export class SessionManager {
 			hotRegionBytes: runtime.hotSuffixBytes,
 			metaDescriptorBytes,
 			totalAccountedBytes: runtime.accountant.totalBytes,
+			reservedBudgetBytes: runtime.reservedBudgetBytes,
+			allocatedCacheBytes:
+				runtime.blockCache.allocatedBytes + runtime.entryCache.allocatedBytes + runtime.tailCache.allocatedBytes,
+			hotResidentBytes: runtime.hotResidentBytes,
+			metadataResidentBytes:
+				runtime.labelsPins.totalBytes + reducerBytes + (runtime.metadataDelta?.descriptorBytes ?? 0),
+			sidecarFileBytes,
+			firstOpen: this.#firstOpenTelemetry,
 			lastReopenTransition: runtime.reopenTransition,
 			currentCommitTransition: runtime.terminalTransition,
 			lazyReopenAttempted: this.#lazyReopenAttempted,

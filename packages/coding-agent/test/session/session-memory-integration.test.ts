@@ -12,7 +12,11 @@ import {
 	parseDictionaryArtifactCommit,
 	serializeParentBucketRecord,
 } from "../../src/session/internal/session-memory-sidecar";
-import { SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
+import {
+	BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
+	SessionManager,
+	SessionManagerTestHooks,
+} from "../../src/session/session-manager";
 import {
 	FileSessionStorage,
 	MemorySessionStorage,
@@ -75,6 +79,9 @@ function writeTreeTranscript(
 }
 
 describe("SessionManager cold sidecar integration", () => {
+	it("admits a two-GiB transcript plus bounded fork header headroom", () => {
+		expect(BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES).toBe(2 * 1024 * 1024 * 1024 + 1024 * 1024);
+	});
 	it("retires a compacted prefix on resume and lazily reloads exact transcript entries", async () => {
 		const tempDir = TempDir.createSync("@pi-session-memory-sidecar-");
 		const storage = new FileSessionStorage();
@@ -982,6 +989,23 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 			lazyReopenFallbackReason: undefined,
 			lastReopenTransition: { kind: "rebuild", reason: "bounded_first_open" },
 		});
+		const stats = manager.getSessionMemoryStats();
+		expect(stats.reservedBudgetBytes).toBeGreaterThan(0);
+		expect(stats.allocatedCacheBytes).toBeGreaterThan(0);
+		expect(stats.hotResidentBytes).toBeGreaterThan(0);
+		expect(stats.metadataResidentBytes).toBeGreaterThan(0);
+		expect(stats.sidecarFileBytes).toBeGreaterThan(0);
+		expect(stats.firstOpen).toMatchObject({
+			attempted: true,
+			succeeded: true,
+			strategy: "current",
+			secondaryArtifactMode: "auto",
+		});
+		expect(stats.firstOpen.recordsParsed).toBeGreaterThanOrEqual(records.length);
+		expect(stats.firstOpen.transcriptBytesRead).toBeGreaterThanOrEqual(transcript.length);
+		expect(stats.firstOpen.indexWriteBytes).toBeGreaterThan(0);
+		expect(stats.firstOpen.indexWriteCalls).toBeGreaterThan(0);
+		expect(stats.firstOpen.fsyncCount).toBe(2);
 		const cold = manager.getEntry("cold-old");
 		expect(cold).toMatchObject({ id: "cold-old", type: "message" });
 		if (cold?.type !== "message" || !("content" in cold.message)) throw new Error("Expected cold message entry");
@@ -1083,6 +1107,54 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 		expect(corruptIndex.getEntry("cold-old")).toMatchObject({ id: "cold-old", type: "message" });
 	} finally {
 		await corruptIndex.close();
+	}
+});
+
+it("applies benchmark-only GC and secondary-artifact controls to bounded first-open", async () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/bounded-first-open-controls.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "controlled", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	SessionManagerTestHooks.firstOpenGcStrategy = "none";
+	SessionManagerTestHooks.secondaryArtifactMode = "disabled";
+	let manager: SessionManager | undefined;
+	try {
+		manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		const stats = manager.getSessionMemoryStats();
+		expect(stats.firstOpen).toMatchObject({
+			attempted: true,
+			succeeded: true,
+			strategy: "none",
+			secondaryArtifactMode: "disabled",
+			gcRequests: 0,
+			dictionaryArtifactEnabled: false,
+			parentArtifactEnabled: false,
+		});
+		expect(stats.dictionaryArtifactEnabled).toBe(false);
+		expect(stats.parentArtifactEnabled).toBe(false);
+	} finally {
+		SessionManagerTestHooks.firstOpenGcStrategy = undefined;
+		SessionManagerTestHooks.secondaryArtifactMode = undefined;
+		await manager?.close();
 	}
 });
 
