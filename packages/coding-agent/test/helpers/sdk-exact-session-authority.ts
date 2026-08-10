@@ -70,3 +70,11 @@ export async function publishExactSessionAuthority(
 		`${JSON.stringify({ ...unsigned, checksum: sessionIndexChecksum(unsigned) })}\n`,
 	);
 }
+
+export async function registerExactSessionAuthority(
+	options: ExactSessionAuthorityOptions,
+): Promise<ExactSessionAuthorityFixture> {
+	const authority = await prepareExactSessionAuthority(options);
+	await publishExactSessionAuthority(options, authority);
+	return authority;
+}
