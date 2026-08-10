@@ -191,8 +191,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 127 keeps malformed accepted selected sends transport-ambiguous.
  * Generation 128 bounds Discord provider work before Router revocation.
  * Generation 129 bounds every Discord REST operation across retries.
+ * Generation 130 invalidates Discord effect lease renewal when shutdown drain expires.
  */
-export const DAEMON_GENERATION = 129;
+export const DAEMON_GENERATION = 130;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
@@ -267,5 +268,6 @@ export const DAEMON_GENERATION = 129;
  * Epoch 74 prevents replay after accepted responses lacking message identity.
  * Epoch 75 prevents hung Discord REST work from blocking daemon shutdown.
  * Epoch 76 cancels hung Discord REST before active-work drain expires.
+ * Epoch 77 fences late Discord effect commits after Router revocation.
  */
-export const SERVING_EPOCH = 76;
+export const SERVING_EPOCH = 77;

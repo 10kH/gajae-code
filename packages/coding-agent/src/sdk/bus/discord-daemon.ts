@@ -168,6 +168,7 @@ export class DiscordNotificationDaemon {
 	readonly #inflightInbound = new Set<string>();
 	#started = false;
 	#lifecycleGeneration = 0;
+	#workGeneration = 0;
 	#startTask: Promise<void> | undefined;
 	#stopTask: Promise<void> | undefined;
 	#providerStarting = false;
@@ -298,6 +299,7 @@ export class DiscordNotificationDaemon {
 		while (this.#activeWork.size > 0) {
 			const remaining = drainDeadline - this.#now();
 			if (remaining <= 0) {
+				this.#workGeneration += 1;
 				logger.warn("Discord provider work exceeded the 5000ms shutdown drain; continuing with Router revocation.");
 				return;
 			}
@@ -306,6 +308,7 @@ export class DiscordNotificationDaemon {
 				Bun.sleep(remaining).then(() => false),
 			]);
 			if (!settled) {
+				this.#workGeneration += 1;
 				logger.warn("Discord provider work exceeded the 5000ms shutdown drain; continuing with Router revocation.");
 				return;
 			}
@@ -1732,6 +1735,7 @@ export class DiscordNotificationDaemon {
 		revalidate: () => boolean | Promise<boolean>,
 		terminalizeStaleBeforeProvider = false,
 	): Promise<ChatEffectReceipt> {
+		const workGeneration = this.#workGeneration;
 		const claimed = await this.#rescheduleAfterEffectTransition(
 			this.#effects.enqueueAndClaim<TPayload>(
 				{ id, kind, transport: "discord", sessionId, endpointGeneration, payload },
@@ -1766,7 +1770,10 @@ export class DiscordNotificationDaemon {
 		let providerEffectStarted = false;
 		let renewal: Promise<boolean> | undefined;
 		const renewLease = async (): Promise<boolean> => {
-			if (renewalLost) return false;
+			if (renewalLost || workGeneration !== this.#workGeneration) {
+				renewalLost = true;
+				return false;
+			}
 			if (renewal) return await renewal;
 			const currentRenewal = (async (): Promise<boolean> => {
 				const renewed = await this.#rescheduleAfterEffectTransition(
