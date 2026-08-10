@@ -211,7 +211,7 @@ export class SessionRouter {
 			);
 			this.#stopTimer = () => (this.#deps.clearInterval ?? clearInterval)(timer);
 		} catch (error) {
-			await this.stop();
+			if (this.#running(runEpoch)) await this.stop();
 			throw error;
 		}
 	}
@@ -392,7 +392,7 @@ export class SessionRouter {
 					this.#ready = true;
 					this.#deps.onReconciled?.();
 				} catch (error) {
-					this.#ready = false;
+					if (this.#running(runEpoch)) this.#ready = false;
 					throw error;
 				}
 			});
