@@ -1949,11 +1949,17 @@ export class ManagedSessionDescendantStore {
 		const relative = this.#relative(this.#resolve(relativePath));
 		if (this.#authority) {
 			const captured = this.#authority.snapshotManagedTree(relative);
-			if (!captured.ok || !captured.snapshot) throw new Error(captured.code ?? "unsafe_artifacts");
+			if (!captured.ok || !captured.snapshot)
+				throw new Error(
+					captured.code === "not_found" ? "artifact_source_changed" : (captured.code ?? "unsafe_artifacts"),
+				);
 			return captured.snapshot;
 		}
 		const captured = nativeSessionStorage().snapshotDirectoryTree(this.#resolve(relativePath));
-		if (!captured.ok || !captured.snapshot) throw new Error(captured.code ?? "unsafe_artifacts");
+		if (!captured.ok || !captured.snapshot)
+			throw new Error(
+				captured.code === "not_found" ? "artifact_source_changed" : (captured.code ?? "unsafe_artifacts"),
+			);
 		return captured.snapshot;
 	}
 
