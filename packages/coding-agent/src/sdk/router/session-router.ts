@@ -107,6 +107,7 @@ type AttachedSession = {
 	readonly barrier: ReplayBarrier;
 	readonly capability: SessionAttachment;
 	published: boolean;
+	initializingPublication: boolean;
 	readonly publication: { promise: Promise<void>; resolve: () => void; reject: (reason?: unknown) => void };
 	dispose: () => void;
 };
@@ -744,7 +745,9 @@ export class SessionRouter {
 			generation: indexed.endpointGeneration,
 			isCurrent: () => attached !== undefined && this.#attachmentPublished(attached),
 			send: async (frame: Record<string, unknown>) => {
-				await this.#serialReconcile(runEpoch);
+				if (!attached || !this.#attachmentPublished(attached))
+					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
+				if (!attached.initializingPublication) await this.#serialReconcile(runEpoch);
 				if (!attached || !this.#attachmentPublished(attached))
 					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 				attached.client.send(this.#prepareFrame(attached, frame));
@@ -760,6 +763,7 @@ export class SessionRouter {
 			if (attached) this.#schedule(this.#replayAttachment(attached, attached.cursor.seq));
 		});
 		attached = {
+			initializingPublication: false,
 			id: randomUUID(),
 			sessionId: indexed.sessionId,
 			endpoint,
@@ -821,6 +825,7 @@ export class SessionRouter {
 		}
 		attached.published = true;
 		attached.publication.resolve();
+		attached.initializingPublication = true;
 		try {
 			await this.#deps.onAttachmentReady?.(capability);
 		} catch (error) {
@@ -836,6 +841,8 @@ export class SessionRouter {
 					// Ready publication failed closed; provider cleanup remains best effort.
 				}
 			throw error;
+		} finally {
+			attached.initializingPublication = false;
 		}
 		if (skipReplay) return true;
 		if (!(await this.#deliverRecoveredFrames(attached))) return false;
@@ -848,6 +855,7 @@ export class SessionRouter {
 		if (!this.#attachmentLive(attached)) return false;
 		attached.published = true;
 		attached.publication.resolve();
+		attached.initializingPublication = true;
 		try {
 			await this.#deps.onAttachmentReady?.(attached.capability);
 		} catch (error) {
@@ -864,6 +872,8 @@ export class SessionRouter {
 					// Ready publication failed closed; provider cleanup remains best effort.
 				}
 			throw error;
+		} finally {
+			attached.initializingPublication = false;
 		}
 		if (skipReplay) return true;
 		if (!(await this.#deliverRecoveredFrames(attached))) return false;

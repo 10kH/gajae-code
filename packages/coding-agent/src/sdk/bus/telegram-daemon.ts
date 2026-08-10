@@ -4931,18 +4931,17 @@ export class TelegramNotificationDaemon {
 			this.preservedInitiatorTopics.add(session.sessionId);
 	}
 
-	#onAttachmentReady(attachment: SessionAttachment): void {
+	async #onAttachmentReady(attachment: SessionAttachment): Promise<void> {
 		const session = this.sessions.get(attachment.sessionId);
 		if (!session || session.attachment !== attachment) return;
-		void this.#initializeAttachment(session);
+		await this.#initializeAttachment(session);
 	}
 
 	/**
-	 * Router reconciliation invokes onAttachment before its own replay request. The
-	 * attachment send itself waits for that reconciliation, so this handshake must
-	 * be scheduled rather than awaited here. The capability-bearing replay request
-	 * then asks the host for the gated frames that the Router's first request could
-	 * not see.
+	 * Router reconciliation invokes this after exact publication but before its own
+	 * replay. Awaiting the provider handshake lets Telegram clear replayPending from
+	 * its capability-bearing replay response before Router-delivered retained events
+	 * enter the publication settlement path.
 	 */
 	async #initializeAttachment(session: AttachmentSession): Promise<void> {
 		try {
