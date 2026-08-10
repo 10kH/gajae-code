@@ -42,6 +42,7 @@ export const MANAGED_ARTIFACT_MAX_DEPTH = 32;
 export const MANAGED_ARTIFACT_MAX_FILES = 50_000;
 export const MANAGED_ARTIFACT_MAX_FILE_BYTES = 64 * 1024 * 1024;
 export const MANAGED_ARTIFACT_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
+const REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES = 64 * 1024;
 export const MANAGED_ARTIFACT_COPY_BATCH_SIZE = 256;
 const LOCK_LEASE_MS = 60_000;
 const LOCK_HEARTBEAT_MS = 10_000;
@@ -96,6 +97,13 @@ export class ManagedCommittedMutationError extends Error {
 		super(`managed_${operation}_committed_outcome_uncertain`, { cause });
 		this.name = "ManagedCommittedMutationError";
 	}
+}
+
+function managedAppendFailure(code: string | undefined): Error {
+	const error = new Error(code ?? "managed_append_failed");
+	return code === "identity_mismatch" || code === "not_found" || code === "content_too_large"
+		? error
+		: new ManagedCommittedMutationError("append", error);
 }
 
 function publishFailure(outcome: NativePublishOutcome): ManagedPublishError {
@@ -394,6 +402,39 @@ function replacementCleanupReceiptBinding(
 	return predecessor.dev <= U64_MAX && predecessor.ino <= U64_MAX && receipt.dev <= U64_MAX && receipt.ino <= U64_MAX
 		? { predecessor, receipt }
 		: undefined;
+}
+
+function parseReplacementIdentity(value: unknown): ManagedFileSnapshot["identity"] | undefined {
+	const parsed = parseLegacyReplacementCleanupIdentity(value);
+	if (!parsed || parsed.size > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+	return {
+		dev: parsed.dev,
+		ino: parsed.ino,
+		nlink: parsed.nlink,
+		size: Number(parsed.size),
+		mtimeNs: parsed.mtimeNs,
+		ctimeNs: parsed.ctimeNs,
+		sha256: parsed.sha256,
+	};
+}
+
+function parseReplacementCleanupReceipt(bytes: Uint8Array): ReplacementCleanupReceipt | undefined {
+	let value: unknown;
+	try {
+		value = JSON.parse(Buffer.from(bytes).toString("utf8")) as unknown;
+	} catch {
+		return undefined;
+	}
+	const receipt = asRecord(value);
+	if (
+		receipt?.version !== 3 ||
+		typeof receipt.staging !== "string" ||
+		typeof receipt.destination !== "string" ||
+		!parseReplacementIdentity(receipt.successor) ||
+		!parseReplacementIdentity(receipt.predecessor)
+	)
+		return undefined;
+	return receipt as ReplacementCleanupReceipt;
 }
 
 function serializeReplacementIdentity(identity: ManagedFileSnapshot["identity"]): SerializedReplacementIdentity {
@@ -962,7 +1003,12 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 	}
 	#assertBound(): void {
-		if (!this.#authority) return;
+		if (!this.#authority) {
+			const named = fs.statSync(this.#baseDir, { bigint: true });
+			if (!named.isDirectory() || named.dev !== this.#subtreeRoot.dev || named.ino !== this.#subtreeRoot.ino)
+				throw new Error("Managed descendant root binding changed");
+			return;
+		}
 		const named = fs.lstatSync(this.#baseDir, { bigint: true });
 		const retained =
 			this.#authorityBaseDir === this.#baseDir
@@ -1039,7 +1085,7 @@ export class ManagedSessionDescendantStore {
 		if (!binding) throw new Error("managed_replace_cleanup_receipt_invalid");
 		let receipt: ManagedFileSnapshot;
 		try {
-			receipt = captureManagedFileNoFollow(receiptPath);
+			receipt = captureManagedFilePrefixNoFollow(receiptPath, REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
 			throw error;
@@ -1084,7 +1130,7 @@ export class ManagedSessionDescendantStore {
 		if (!binding) throw new Error("managed_replace_cleanup_receipt_invalid");
 		let receipt: ManagedFileSnapshot;
 		try {
-			receipt = captureManagedFileNoFollow(receiptPath);
+			receipt = captureManagedFilePrefixNoFollow(receiptPath, REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
 			throw error;
@@ -1119,7 +1165,7 @@ export class ManagedSessionDescendantStore {
 
 		let currentReceipt: ManagedFileSnapshot;
 		try {
-			currentReceipt = captureManagedFileNoFollow(receiptPath);
+			currentReceipt = captureManagedFilePrefixNoFollow(receiptPath, REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
 				fsyncDirectory(this.#baseDir);
@@ -1148,11 +1194,57 @@ export class ManagedSessionDescendantStore {
 		fsyncDirectory(this.#baseDir);
 	}
 
+	#reconcilePendingReplacementReceipt(receiptPath: string): void {
+		const pending = captureManagedFilePrefixNoFollow(receiptPath, REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES);
+		const parsed = parseReplacementCleanupReceipt(pending.bytes);
+		const predecessor = parsed ? parseReplacementIdentity(parsed.predecessor) : undefined;
+		if (
+			!parsed ||
+			!predecessor ||
+			path.dirname(path.resolve(parsed.staging)) !== this.#baseDir ||
+			path.dirname(path.resolve(parsed.destination)) !== this.#baseDir
+		)
+			throw new Error("managed_replace_cleanup_receipt_invalid");
+		const destination = replacementReceiptPath(this.#baseDir, predecessor, pending.identity);
+		const outcome = classifyNativePublishOutcome(
+			nativeSessionStorage().renameNoReplacePath(receiptPath, destination),
+		);
+		if (outcome.ok) {
+			fsyncDirectory(this.#baseDir);
+			return;
+		}
+		if (outcome.reason === "destination_exists") {
+			const existing = captureManagedFilePrefixNoFollow(destination, REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES);
+			if (existing.identity.sha256 !== pending.identity.sha256)
+				throw new Error("managed_replace_cleanup_receipt_invalid");
+			const removed = nativeSessionStorage().exactUnlink(receiptPath, {
+				dev: pending.identity.dev,
+				ino: pending.identity.ino,
+				nlink: pending.identity.nlink,
+				parentDev: this.#subtreeRoot.dev,
+				parentIno: this.#subtreeRoot.ino,
+				size: BigInt(pending.identity.size),
+				mtimeNs: pending.identity.mtimeNs,
+				sha256: pending.identity.sha256,
+				quarantineName: `.gjc-receipt-pending-remove-${pending.identity.dev.toString(16)}-${pending.identity.ino.toString(16)}`,
+			});
+			if (!exactUnlinkCompleted(removed) && removed.code !== "not_found")
+				throw new Error(`managed_replace_receipt_cleanup_pending:${removed.code ?? "unknown"}`);
+			fsyncDirectory(this.#baseDir);
+			return;
+		}
+		throw publishFailure(outcome);
+	}
+
 	#reconcileReplacementCleanupReceipts(): void {
 		if (this.#reconcilingReplacementCleanup) return;
 		this.#reconcilingReplacementCleanup = true;
 		try {
 			for (const name of fs.readdirSync(this.#baseDir)) {
+				if (name.startsWith(".gjc-replace-receipt-pending-")) {
+					this.#reconcilePendingReplacementReceipt(path.join(this.#baseDir, name));
+					continue;
+				}
 				if (!name.startsWith(".gjc-replace-cleanup-")) continue;
 				if (replacementCleanupReceiptBinding(name)) {
 					try {
@@ -1346,8 +1438,9 @@ export class ManagedSessionDescendantStore {
 			expected.ctimeNs,
 			expected.sha256,
 		);
-		if (!appended.ok) throw new Error(appended.code ?? "managed_append_failed");
-		if (!appended.identity) throw new Error("managed_append_identity_unavailable");
+		if (!appended.ok) throw managedAppendFailure(appended.code);
+		if (!appended.identity)
+			throw new ManagedCommittedMutationError("append", new Error("managed_append_identity_unavailable"));
 		this.#assertBound();
 		return managedAppendReceiptFromIdentity(managedFileIdentityFromNative(appended.identity));
 	}
@@ -1376,8 +1469,9 @@ export class ManagedSessionDescendantStore {
 				observed.identity.ctimeNs,
 				expectedSha256,
 			);
-			if (!appended.ok) throw new Error(appended.code ?? "managed_append_failed");
-			if (!appended.identity) throw new Error("managed_append_identity_unavailable");
+			if (!appended.ok) throw managedAppendFailure(appended.code);
+			if (!appended.identity)
+				throw new ManagedCommittedMutationError("append", new Error("managed_append_identity_unavailable"));
 			const receipt = managedAppendReceiptFromIdentity(managedFileIdentityFromNative(appended.identity));
 			this.#assertBound();
 			return receipt;
@@ -1682,7 +1776,9 @@ export class ManagedSessionDescendantStore {
 		const relative = this.#relative(this.#resolve(relativePath));
 		if (!this.#authority) {
 			try {
-				return captureManagedFileNoFollow(this.#resolve(relativePath));
+				const captured = captureManagedFileNoFollow(this.#resolve(relativePath));
+				this.#assertBound();
+				return captured;
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
 				throw error;
@@ -1713,12 +1809,15 @@ export class ManagedSessionDescendantStore {
 		this.#beforeMutation();
 		this.#assertBound();
 		if (!this.#authority) {
+			const parent = fs.statSync(path.dirname(this.#resolve(relativePath)), { bigint: true });
 			const removed = nativeSessionStorage().exactUnlink(this.#resolve(relativePath), {
 				dev: expected.identity.dev,
 				ino: expected.identity.ino,
 				size: BigInt(expected.identity.size),
 				mtimeNs: expected.identity.mtimeNs,
 				sha256: expected.identity.sha256,
+				parentDev: parent.dev,
+				parentIno: parent.ino,
 				quarantineName: `.gjc-remove-${process.pid}-${randomUUID()}`,
 			});
 			if (
@@ -1754,6 +1853,15 @@ export class ManagedSessionDescendantStore {
 		this.#beforeMutation();
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
+		let named: fs.BigIntStats;
+		try {
+			named = fs.lstatSync(resolved, { bigint: true });
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+			throw error;
+		}
+		if (!named.isFile() || named.isSymbolicLink()) throw new Error("managed_remove_failed");
+		if (named.size > BigInt(MANAGED_ARTIFACT_MAX_FILE_BYTES)) throw new Error("content_too_large");
 		let identity: ManagedFileSnapshot["identity"];
 		try {
 			identity = captureManagedFileIdentityStreamingNoFollow(resolved);
@@ -1761,6 +1869,7 @@ export class ManagedSessionDescendantStore {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
 			throw error;
 		}
+		this.#assertBound();
 		this.removeExpected(relativePath, { bytes: Buffer.alloc(0), identity });
 		return true;
 	}
@@ -2536,7 +2645,7 @@ function replaceManagedFileGeneratedSync(
 				nativeSessionStorage().renameNoReplacePath(receiptStagingPath, receiptPath),
 			);
 			if (!receiptPublish.ok) throw publishFailure(receiptPublish);
-			const namedReceipt = captureManagedFileNoFollow(receiptPath);
+			const namedReceipt = captureManagedFilePrefixNoFollow(receiptPath, REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES);
 			if (
 				namedReceipt.identity.dev !== publishedReceiptIdentity.dev ||
 				namedReceipt.identity.ino !== publishedReceiptIdentity.ino

@@ -630,6 +630,25 @@ describe("managed descriptor reads", () => {
 });
 
 describe.skipIf(process.platform !== "darwin")("authority-absent managed replacement", () => {
+	it("rejects authority-absent subtree replacement before read or delete", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-darwin-subtree-swap-")));
+		try {
+			const sessionDir = path.join(root, "session");
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), sessionDir);
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("authority\n"));
+			const original = `${sessionDir}.original`;
+			const attacker = `${sessionDir}.attacker`;
+			fs.renameSync(sessionDir, original);
+			fs.mkdirSync(attacker, { mode: 0o700 });
+			fs.writeFileSync(path.join(attacker, "session.jsonl"), "attacker\n", { mode: 0o600 });
+			fs.symlinkSync(attacker, sessionDir, "dir");
+			expect(() => store.readExpected("session.jsonl")).toThrow("root binding changed");
+			expect(() => store.removeIfExistsDescriptor("session.jsonl")).toThrow("root binding changed");
+			expect(fs.readFileSync(path.join(attacker, "session.jsonl"), "utf8")).toBe("attacker\n");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
 	it("rejects path-based managed writes above the reopenable ceiling before allocation", () => {
 		const oversized = { byteLength: MANAGED_ARTIFACT_MAX_FILE_BYTES + 1 } as unknown as Uint8Array;
 		expect(() => publishManagedFileNoReplaceSync("/unused", oversized)).toThrow("content_too_large");

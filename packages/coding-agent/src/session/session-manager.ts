@@ -7920,6 +7920,7 @@ export class SessionManager {
 
 	/** Initialize with a specific session file (used by factory methods). */
 	async #initSessionFile(sessionFile: string, initializeMissing = false): Promise<void> {
+		let strictManagedFallbackEntries: FileEntry[] | undefined;
 		const resolvedSessionFile = this.#storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
 		const sidecarRoot = resolvedSessionFile.endsWith(".jsonl")
 			? resolvedSessionFile.slice(0, -6)
@@ -7952,11 +7953,18 @@ export class SessionManager {
 			this.#ensuredOnDisk = true;
 			return;
 		}
-		if (this.destination.kind === "managed" && this.#sessionMemoryMode === "enabled")
-			throw new Error("managed_bounded_open_failed");
+		if (
+			this.destination.kind === "managed" &&
+			this.#sessionMemoryMode === "enabled" &&
+			process.platform !== "win32"
+		) {
+			const inspected = inspectResumeSessionFile(resolvedSessionFile, this.#storage);
+			if ("kind" in inspected) throw new Error(`Could not open session: ${inspected.reason}`);
+			strictManagedFallbackEntries = inspected.entries;
+		}
 		const eagerStat = this.#statSync(resolvedSessionFile);
 		if (eagerStat.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES) throw new SessionTranscriptOversizedError(eagerStat.size);
-		const entries = await loadEntriesFromFile(resolvedSessionFile, this.#storage);
+		const entries = strictManagedFallbackEntries ?? (await loadEntriesFromFile(resolvedSessionFile, this.#storage));
 		if (entries.length === 0) {
 			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
 			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
@@ -17095,11 +17103,16 @@ export class SessionManager {
 		) {
 			const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
 			manager.#sessionMemoryMode = sessionMemoryMode;
-			await manager.#initSessionFile(filePath, true);
-			const header = manager.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-			if (header?.cwd) manager.cwd = header.cwd;
-			manager.buildSessionContext();
-			return manager;
+			try {
+				await manager.#initSessionFile(filePath, true);
+				const header = manager.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+				if (header?.cwd) manager.cwd = header.cwd;
+				manager.buildSessionContext();
+				return manager;
+			} catch (error) {
+				await manager.close().catch(() => {});
+				throw error;
+			}
 		}
 		const inspected = inspectResumeSessionFile(filePath, storage);
 		if ("kind" in inspected) {
