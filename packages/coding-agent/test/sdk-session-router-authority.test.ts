@@ -314,6 +314,25 @@ describe("SessionRouter dispatch authority", () => {
 		}
 	});
 
+	test("allows an awaited attachment handshake to send before Router replay", async () => {
+		const phases: string[] = [];
+		const fixture = await routerFixture({
+			onAttachmentReady: async attachment => {
+				phases.push("ready");
+				await attachment.send({ type: "hello" });
+				await attachment.send({ type: "event_replay", id: "provider-replay" });
+				phases.push("handshake-sent");
+			},
+		});
+		try {
+			expect(phases).toEqual(["ready", "handshake-sent"]);
+			expect(fixture.clients[0]?.sent.map(frame => frame.type)).toEqual(["hello", "event_replay"]);
+			expect(fixture.clients[0]?.requests.map(frame => frame.type)).toEqual(["event_replay"]);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
 	test("keeps lifecycle adoption provisional until a delayed index proves the exact authority", async () => {
 		const fixture = await routerFixture({ initiallyIndexed: false });
 		const endpoint = JSON.parse(fs.readFileSync(fixture.endpointFile, "utf8")) as Record<string, unknown>;
