@@ -113,6 +113,16 @@ describe.each([
 		setKittyProtocolActive(false);
 	});
 });
+describe.each(["left", "right"] as const)("Terminal.app %s Option key", () => {
+	it("normalizes Meta-wrapped arrow input", () => {
+		setKittyProtocolActive(false);
+		expect(matchesKey("\x1b\x1b[A", "alt+up")).toBe(true);
+		expect(parseKey("\x1b\x1b[A")).toBe("alt+up");
+		expect(matchesKey("\x1b\x1b[B", "alt+down")).toBe(true);
+		expect(parseKey("\x1b\x1b[B")).toBe("alt+down");
+		setKittyProtocolActive(false);
+	});
+});
 describe("Alt+I protocol symmetry", () => {
 	it.each([
 		{ data: "\x1bi", kitty: true, expected: "alt+i" },

@@ -116,7 +116,7 @@ def check_terminal(prefs, emit):
         if problems:
             print("FAIL: " + "; ".join(problems))
         else:
-            print("PASS: Terminal.app default and startup profiles send Option as Meta/Esc")
+            print("PASS: Terminal.app default and startup profiles send both left and right Option keys as Meta/Esc")
     return not problems
 
 

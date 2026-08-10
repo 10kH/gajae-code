@@ -486,9 +486,10 @@ fn parse_key_id(key_id: &str) -> Option<ParsedKeyId<'_>> {
 
 	Some(ParsedKeyId { key, modifier })
 }
-/// Resolve a macOS Terminal.app Meta prefix wrapped around another escape
-/// sequence, such as Option+Up (`ESC ESC [ A`). The outer ESC is the Meta
-/// marker; the inner sequence is the ordinary arrow/function-key sequence.
+/// Resolve either physical macOS Terminal.app Option key's Meta prefix
+/// wrapped around another escape sequence, such as Option+Up (`ESC ESC [ A`).
+/// The outer ESC is the Meta marker; the inner sequence is the ordinary
+/// arrow/function-key sequence.
 fn parse_meta_wrapped_key(bytes: &[u8], kitty_protocol_active: bool) -> Option<Cow<'static, str>> {
 	if bytes.len() < 2 || !bytes.starts_with(b"\x1b\x1b") {
 		return None;
