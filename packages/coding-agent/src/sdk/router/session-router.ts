@@ -515,7 +515,7 @@ export class SessionRouter {
 		try {
 			client = await (this.#deps.createClient ?? connectAttachedSession)(endpoint);
 		} catch (error) {
-			if (existing)
+			if (existing && !this.#sessions.has(indexed.sessionId))
 				try {
 					await this.#deps.onSessionRemoved?.(existing.capability);
 				} catch {
@@ -525,7 +525,7 @@ export class SessionRouter {
 		}
 		if (!this.#running(runEpoch)) {
 			await client.close().catch(() => undefined);
-			if (existing)
+			if (existing && !this.#sessions.has(indexed.sessionId))
 				try {
 					await this.#deps.onSessionRemoved?.(existing.capability);
 				} catch {
@@ -572,14 +572,16 @@ export class SessionRouter {
 		this.#sessions.set(indexed.sessionId, attached);
 		await this.#deps.onAttachment?.(capability);
 		if (!this.#running(runEpoch)) {
-			this.#sessions.delete(indexed.sessionId);
+			const staleStillCurrent = this.#sessions.get(indexed.sessionId) === attached;
+			if (staleStillCurrent) this.#sessions.delete(indexed.sessionId);
 			attached.dispose();
 			await attached.client.close().catch(() => undefined);
-			try {
-				await this.#deps.onSessionRemoved?.(capability);
-			} catch {
-				// Router authority is already revoked; provider cleanup remains best effort.
-			}
+			if (staleStillCurrent)
+				try {
+					await this.#deps.onSessionRemoved?.(capability);
+				} catch {
+					// Router authority is already revoked; provider cleanup remains best effort.
+				}
 			return false;
 		}
 		if (!(await this.#deliverRecoveredFrames(attached))) return false;

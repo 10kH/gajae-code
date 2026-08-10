@@ -620,11 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes restart-and-rejection generation 124 at serving epoch 71", () => {
+test("publishes stale-cleanup generation 125 at serving epoch 72", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 124 / serving epoch 71: bounded restart detaches stale tails and rejection rollback replays.
-	expect(DAEMON_GENERATION).toBe(124);
-	expect(SERVING_EPOCH).toBe(71);
+	// Generation 125 / serving epoch 72: stale cleanup cannot delete a restarted attachment.
+	expect(DAEMON_GENERATION).toBe(125);
+	expect(SERVING_EPOCH).toBe(72);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
