@@ -54,6 +54,8 @@ import {
 	createAgentSession,
 	discoverAuthStorage,
 } from "./sdk";
+import { SessionIndex } from "./sdk/broker/session-index";
+
 import type { AgentSession } from "./session/agent-session";
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
 import {
@@ -258,15 +260,15 @@ export function resolveAcpStartupOptions(
 		...(parsed.providerSessionId ? ["--provider-session-id"] : []),
 		...(parsed.resume ? ["--resume"] : []),
 		...(parsed.sessionDir ? ["--session-dir"] : []),
-		...(parsed.skills?.length ? ["--skills"] : []),
+		...(parsed.skills !== undefined ? ["--skills"] : []),
 		...(parsed.slow ? ["--slow"] : []),
 		...(parsed.smol ? ["--smol"] : []),
 		...(parsed.plan ? ["--plan"] : []),
 		...(parsed.systemPrompt ? ["--system-prompt"] : []),
 		...(parsed.tmux ? ["--tmux"] : []),
-		...(parsed.tools?.length ? ["--tools"] : []),
+		...(parsed.tools !== undefined ? ["--tools"] : []),
 		...(parsed.extensions?.length ? ["--extension"] : []),
-		...(parsed.unknownFlags.size > 0 ? ["extension flags"] : []),
+		...(parsed.unknownFlags.size > 0 ? [`unknown flags: ${[...parsed.unknownFlags.keys()].join(" ")}`] : []),
 	];
 	if (unsupported.length > 0) {
 		throw new Error(
@@ -1660,8 +1662,11 @@ export async function runRootCommand(
 		sessionOptions.deferMcpConfigStartup = true;
 	}
 	const hasRootStartupProfile = Boolean(settingsInstance.get("modelProfile.default") || parsedArgs.mpreset);
-	const deferMemoryBackendStartup =
-		hasRootStartupProfile && !(parsedArgs.authBootstrap === true && isInteractive) && mode !== "acp";
+	// ACP is not carved out: `gjc acp` is broker-backed and never builds a local
+	// session here, and the broker-launched lifecycle child defers memory startup
+	// unconditionally (createLifecycleAgentSession) so readiness never waits on
+	// the memory pipeline's LLM work.
+	const deferMemoryBackendStartup = hasRootStartupProfile && !(parsedArgs.authBootstrap === true && isInteractive);
 	sessionOptions.deferMemoryBackendStartup = deferMemoryBackendStartup;
 
 	// Research-mode (RLM) preset: augment session options before session creation.
@@ -1717,6 +1722,30 @@ export async function runRootCommand(
 		await postmortem.cleanup();
 		return;
 	}
+	// Register a resumed direct session before constructing the agent: GC holds the
+	// same index lock while deleting artifacts, so startup and deletion are fenced.
+	const directSessionId = process.env.GJC_LIFECYCLE_REQUEST_ID ? undefined : sessionManager?.getSessionId();
+	if (directSessionId) {
+		const sessionIndex = new SessionIndex(settingsInstance.getAgentDir());
+		const locator = { repo: sessionManager?.getCwd() ?? cwd, stateRoot: settingsInstance.getAgentDir() };
+		await sessionIndex.append({
+			type: "host_registered",
+			sessionId: directSessionId,
+			locator,
+			endpointGeneration: 0,
+			pid: process.pid,
+		});
+		postmortem.register("direct-session-index", async () => {
+			await sessionIndex.append({
+				type: "host_unregistered",
+				sessionId: directSessionId,
+				locator,
+				endpointGeneration: 0,
+				pid: process.pid,
+			});
+		});
+	}
+
 	const createAgentSessionImpl = deps.createAgentSession ?? createAgentSession;
 	const createSession: CreateSessionForMain = async (options, context): Promise<CreateAgentSessionResult> => {
 		const result = await logger.time("createAgentSession", createAgentSessionImpl, options);

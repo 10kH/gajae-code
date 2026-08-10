@@ -566,6 +566,8 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	model: string;
 	/** Role: "default" or an agent role. Undefined treated as "default" */
 	role?: string;
+	/** Clears the role's previously recorded model when replaying session context. */
+	cleared?: boolean;
 	/** Requested model before a runtime substitution/fallback, in "provider/modelId" format. */
 	previousModel?: string;
 	/** Machine-readable reason for runtime model substitution/fallback. */
@@ -2562,13 +2564,13 @@ export function buildSessionContext(
 		if (entry.type === "thinking_level_change") {
 			thinkingLevel = entry.thinkingLevel ?? "off";
 		} else if (entry.type === "model_change") {
-			// New format: { model: "provider/id", role?: string }
-			if (entry.model) {
-				const role = entry.role ?? "default";
+			const role = entry.role ?? "default";
+			if (entry.cleared) {
+				delete models[role];
+				if (role === "default") hasExplicitDefaultModel = true;
+			} else if (entry.model) {
 				models[role] = entry.model;
-				if (role === "default") {
-					hasExplicitDefaultModel = true;
-				}
+				if (role === "default") hasExplicitDefaultModel = true;
 			}
 		} else if (entry.type === "configured_model_chain") {
 			const configuredChain = normalizeConfiguredModelChainEntry(entry);
@@ -6216,6 +6218,7 @@ export const SessionManagerTestHooks: {
 	materializedCacheMaxBytesOverride?: number;
 	beforeResidentTransitionIndexBuild?: () => void;
 	afterForkSnapshot?: () => void | Promise<void>;
+	afterForkTranscriptPublished?: () => void | Promise<void>;
 	beforeEphemeralArtifactManagerInstall?: (dir: string) => void | Promise<void>;
 	beforePersistPatchFence?: (attempt: number) => void;
 } = {};
@@ -6310,6 +6313,8 @@ export class SessionManager {
 	#sessionFile: string | undefined;
 	#flushed: boolean = false;
 	#needsFullRewriteOnNextPersist: boolean = false;
+	#readOnlyResume = false;
+	#resumedDraftConsumed = false;
 	#ensuredOnDisk: boolean = false;
 	#recoveryHydrationContext: RecoveryHydrationContext | undefined;
 	#recoveryPromotionTranscriptPath: string | undefined;
@@ -7823,7 +7828,7 @@ export class SessionManager {
 	}
 
 	/** Initialize with a specific session file (used by factory methods). */
-	async #initSessionFile(sessionFile: string): Promise<void> {
+	async #initSessionFile(sessionFile: string, initializeMissing = false): Promise<void> {
 		const resolvedSessionFile = this.storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
 		const sidecarRoot = resolvedSessionFile.endsWith(".jsonl")
 			? resolvedSessionFile.slice(0, -6)
@@ -7842,6 +7847,18 @@ export class SessionManager {
 				this.#sessionMemoryAutoDisabledReason = "sidecar_reload_failures";
 			}
 			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+			return;
+		}
+		if (initializeMissing && !this.storage.existsSync(resolvedSessionFile)) {
+			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
+			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
+			this.#applyFreshSessionMetadata(fresh);
+			this.#commitResidentTextStoreTransition(prepared);
+			this.#retireEphemeralArtifacts();
+			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+			await this.#rewriteFile();
+			this.#flushed = true;
+			this.#ensuredOnDisk = true;
 			return;
 		}
 		const eagerStat = this.#statSync(resolvedSessionFile);
@@ -8525,6 +8542,8 @@ export class SessionManager {
 		this.#flushed = stage.flushed;
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#ensuredOnDisk = stage.flushed;
+		this.#readOnlyResume = false;
+		this.#resumedDraftConsumed = false;
 
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
@@ -8763,6 +8782,7 @@ export class SessionManager {
 					publishedSha256,
 				};
 			}
+			await SessionManagerTestHooks.afterForkTranscriptPublished?.();
 			if (forkArtifactPublication?.kind === "managed") {
 				forkArtifactPublication.store.verifyRootSecurity();
 				forkArtifactPublication.store.assertBound();
@@ -9061,6 +9081,7 @@ export class SessionManager {
 		let managedDestinationStore: ManagedSessionDescendantStore | undefined;
 		let rollbackManagedMove: (() => Promise<void>) | undefined;
 		let residentTransition: PreparedResidentStoreTransition | undefined;
+		const hadPersistedSession = this.#ensuredOnDisk;
 
 		if (this.persist && this.#sessionFile) {
 			// Close the persist writer before moving files
@@ -9296,7 +9317,7 @@ export class SessionManager {
 			if (this.persist && this.#sessionFile && hadSessionFile) {
 				await this.#appendHeaderPatch({ cwd: resolvedCwd });
 				await this.#rewriteFile();
-			} else if (this.persist && this.#sessionFile && hasAssistant) {
+			} else if (this.persist && this.#sessionFile && (hasAssistant || (!hadSessionFile && hadPersistedSession))) {
 				await this.#appendHeaderPatch({ cwd: resolvedCwd });
 				await this.#rewriteFile();
 			} else {
@@ -9812,7 +9833,6 @@ export class SessionManager {
 		this.#managedTranscriptStoreCache = { directory: sessionDir, store };
 		return store;
 	}
-
 	#releaseManagedSidecarCache(): void {
 		this.#managedSidecarCacheStore?.dispose();
 		this.#managedSidecarCacheStore = undefined;
@@ -13441,6 +13461,10 @@ export class SessionManager {
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#flushed = stage.persistsToExistingFile;
 		this.#ensuredOnDisk = stage.persistsToExistingFile;
+		if (stage.persistsToExistingFile && this.#readOnlyResume && this.#sessionFile) {
+			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			this.#readOnlyResume = false;
+		}
 		if (!stage.boundedCold) {
 			this.#commitResidentTextStoreTransition(transition);
 			return { kind: "promoted" };
@@ -13513,6 +13537,7 @@ export class SessionManager {
 	 */
 	async ensureOnDisk(): Promise<void> {
 		if (!this.persist || !this.#sessionFile) return;
+		if (this.#readOnlyResume) return;
 		if (this.#flushed && !this.#needsFullRewriteOnNextPersist) return;
 		await this.#rewriteFile();
 		this.#ensuredOnDisk = true;
@@ -13565,6 +13590,7 @@ export class SessionManager {
 				await this.#closePersistWriterInternal();
 				this.#flushed = true;
 			}
+			if (this.#needsFullRewriteOnNextPersist && !this.#readOnlyResume) await this.#rewriteFileContents();
 		});
 		this.#retireEphemeralArtifacts();
 		await this.#drainEphemeralArtifactCleanups();
@@ -14343,7 +14369,14 @@ export class SessionManager {
 	async saveDraft(text: string): Promise<void> {
 		if (this.destination.kind === "managed") {
 			if (text.length === 0) {
-				await this.#getManagedDraftStore()?.remove("draft.txt");
+				const store = this.#getManagedDraftStore();
+				if (!store) return;
+				const removedDraft = await store.consume("draft.txt");
+				if (this.#readOnlyResume && this.#sessionFile && (removedDraft !== null || this.#resumedDraftConsumed)) {
+					writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+					this.#readOnlyResume = false;
+					this.#resumedDraftConsumed = false;
+				}
 				return;
 			}
 			// Force the session header onto disk so resume can find the file we are
@@ -14354,15 +14387,26 @@ export class SessionManager {
 			const store = this.#getManagedDraftStore();
 			if (!store) return;
 			await store.replace("draft.txt", Buffer.from(text, "utf8"));
+			if (this.#readOnlyResume && this.#sessionFile) {
+				writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+				this.#readOnlyResume = false;
+			}
 			return;
 		}
 		const draftPath = this.#getDraftPath();
 		if (!draftPath || !this.persist) return;
 		if (text.length === 0) {
+			let removedDraft = false;
 			try {
 				await this.storage.unlink(draftPath);
+				removedDraft = true;
 			} catch (err) {
 				if (!isEnoent(err)) throw err;
+			}
+			if (this.#readOnlyResume && this.#sessionFile && (removedDraft || this.#resumedDraftConsumed)) {
+				writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+				this.#readOnlyResume = false;
+				this.#resumedDraftConsumed = false;
 			}
 			return;
 		}
@@ -14374,6 +14418,10 @@ export class SessionManager {
 		const artifactManager = this.#getOrCreateArtifactManager();
 		if (!artifactManager) return;
 		await artifactManager.replaceNamed("draft.txt", text);
+		if (this.#readOnlyResume && this.#sessionFile) {
+			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			this.#readOnlyResume = false;
+		}
 	}
 
 	/**
@@ -14384,6 +14432,7 @@ export class SessionManager {
 	async consumeDraft(): Promise<string | null> {
 		if (this.destination.kind === "managed") {
 			const draft = await this.#getManagedDraftStore()?.consume("draft.txt");
+			if (draft && this.#readOnlyResume) this.#resumedDraftConsumed = true;
 			return draft ? Buffer.from(draft).toString("utf8") : null;
 		}
 		const draftPath = this.#getDraftPath();
@@ -14400,6 +14449,7 @@ export class SessionManager {
 		} catch (err) {
 			if (!isEnoent(err)) throw err;
 		}
+		if (this.#readOnlyResume) this.#resumedDraftConsumed = true;
 		return text;
 	}
 
@@ -14473,6 +14523,8 @@ export class SessionManager {
 		if (records.length === 0) return;
 		if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
 		if (!this.persist || !this.#sessionFile || !this.storage.existsSync(this.#sessionFile)) return;
+		const sessionFile = this.#sessionFile;
+		const publishResumeBreadcrumb = this.#readOnlyResume;
 		await this.#queuePersistTask(async () => {
 			for (let attempt = 0; attempt <= 2; attempt++) {
 				const token = this.#capturePersistenceInputToken();
@@ -14481,8 +14533,12 @@ export class SessionManager {
 					this.#needsFullRewriteOnNextPersist ||
 					!this.#flushed ||
 					(header?.version ?? 1) < CURRENT_SESSION_VERSION
-				)
-					return this.#rewriteFileContents();
+				) {
+					await this.#rewriteFileContents();
+					if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, sessionFile);
+					this.#readOnlyResume = false;
+					return;
+				}
 				const persistedRecords = records.map(record =>
 					record.type === "entry_patch"
 						? (prepareEntryForPersistenceSync(
@@ -14496,27 +14552,40 @@ export class SessionManager {
 						: record,
 				);
 				SessionManagerTestHooks.beforePersistPatchFence?.(attempt);
+				let persisted = false;
 				const written = this.#withSessionPersistenceFenceSync(() => {
 					if (!this.#persistenceInputTokenMatches(token)) return false;
 					if (this.destination.kind === "managed") {
 						this.#appendManagedRecordsSync(persistedRecords);
+						persisted = true;
 						return true;
 					}
 					const writer = this.#ensurePersistWriter();
 					if (!writer) {
-						this.#rewriteFile().catch(() => {});
+						void this.#rewriteFile()
+							.then(() => {
+								if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, sessionFile);
+								this.#readOnlyResume = false;
+							})
+							.catch(() => {});
 						return true;
 					}
 					for (const persistedRecord of persistedRecords) writer.writeSync(persistedRecord);
+					persisted = true;
 					return true;
 				});
-				if (written) return;
+				if (written) {
+					if (publishResumeBreadcrumb && persisted) writeTerminalBreadcrumb(this.cwd, sessionFile);
+					if (persisted) this.#readOnlyResume = false;
+					return;
+				}
 			}
 			throw new Error("session_persistence_input_stale");
 		});
 	}
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.#sessionFile) return;
+		const publishResumeBreadcrumb = this.#readOnlyResume;
 		if (this.#persistError) throw this.#persistError;
 
 		// Normally we wait for the first assistant message before persisting to avoid
@@ -14541,6 +14610,8 @@ export class SessionManager {
 			// test-level tempDir cleanup.
 			try {
 				this.#rewriteFileSync();
+				if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+				this.#readOnlyResume = false;
 			} catch (err) {
 				this.#recordPersistError(err);
 				throw this.#persistError ?? toError(err);
@@ -14553,6 +14624,7 @@ export class SessionManager {
 		// landing immediately after this call. Image externalization (rare) runs via
 		// the synchronous blob-store path so blob bytes are durable before the JSONL
 		// line referencing them is written.
+		let persisted = false;
 		try {
 			this.#withSessionPersistenceFenceSync(() => {
 				if (this.destination.kind === "managed") {
@@ -14563,15 +14635,16 @@ export class SessionManager {
 					);
 					const persistedEntry = prepareEntryForPersistenceSync(materializedEntry, this.#blobStore);
 					this.#appendManagedRecordsSync([persistedEntry]);
+					persisted = true;
 					return;
 				}
 				const writer = this.#ensurePersistWriter();
 				if (!writer) {
-					// `#ensurePersistWriter` returns undefined here only when the cached
-					// writer is mid-close (the `!persist`/`!sessionFile` cases are
-					// rejected above). Route through `#rewriteFile` so the entry — which
-					// is already in `#fileEntries` — persists once the close drains.
-					this.#rewriteFile().catch(() => {});
+					// The cached writer is closing. Preserve the appended in-memory entry for
+					// a full rewrite after close drains instead of queueing a rewrite that the
+					// concurrent close could release before it runs.
+					this.#needsFullRewriteOnNextPersist = true;
+					this.#flushed = false;
 					return;
 				}
 				const materializedEntry = materializeResidentEntryForPersistenceSync(
@@ -14581,7 +14654,10 @@ export class SessionManager {
 				);
 				const persistedEntry = prepareEntryForPersistenceSync(materializedEntry, this.#blobStore);
 				writer.writeSync(persistedEntry);
+				persisted = true;
 			});
+			if (publishResumeBreadcrumb && persisted) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			if (persisted) this.#readOnlyResume = false;
 		} catch (err) {
 			this.#recordPersistError(err);
 			throw this.#persistError ?? toError(err);
@@ -14852,6 +14928,21 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/** Append an explicit role-model clear marker, preserving absence during replay. */
+	clearModelRole(role: string): string {
+		const entry: ModelChangeEntry = {
+			type: "model_change",
+			id: generateId(this.#byId),
+			parentId: this.#leafId,
+			timestamp: new Date().toISOString(),
+			model: "",
+			role,
+			cleared: true,
+		};
+		this.#appendEntry(entry);
+		return entry.id;
+	}
+
 	/** Append session init metadata (for subagent debugging/replay). Returns entry id. */
 	appendSessionInit(init: {
 		systemPrompt: string;
@@ -15031,6 +15122,10 @@ export class SessionManager {
 		this.#assertRecoveryHydrationWritable();
 		if (!this.persist || !this.#sessionFile) return;
 		await this.#rewriteFile();
+		if (this.#readOnlyResume) {
+			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			this.#readOnlyResume = false;
+		}
 	}
 
 	/**
@@ -15760,8 +15855,10 @@ export class SessionManager {
 	 * cap are weakly held so a GC cycle can reclaim them between reads.
 	 */
 	#getSessionContextForRead(): Readonly<SessionContext> {
+		const hasResidentSentinel = this.#fileEntries.some(entry => containsResidentSentinel(entry));
 		const cached = dereferenceMaterializedCache(this.#sessionContextCache);
 		if (
+			!hasResidentSentinel &&
 			cached &&
 			this.#sessionContextEntryRevision === this.#entryRevision &&
 			this.#sessionContextLeafRevision === this.#leafRevision &&
@@ -15794,7 +15891,11 @@ export class SessionManager {
 			this.#holdMaterializedCachesWeakly();
 		}
 		const context = freezeInternalReadSnapshot(builtContext);
-		this.#sessionContextCache = this.#materializedCachesWeaklyHeld ? new WeakRef(context) : context;
+		this.#sessionContextCache = hasResidentSentinel
+			? undefined
+			: this.#materializedCachesWeaklyHeld
+				? new WeakRef(context)
+				: context;
 		transferSessionMessageIdentity(builtContext.messages, context.messages);
 		this.#sessionContextEntryRevision = this.#entryRevision;
 		this.#sessionContextLeafRevision = this.#leafRevision;
@@ -16812,7 +16913,7 @@ export class SessionManager {
 				if (inspected.error.reason === "missing") {
 					const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
 					manager.#sessionMemoryMode = sessionMemoryMode;
-					await manager.#initSessionFile(filePath);
+					await manager.#initSessionFile(filePath, true);
 					return manager;
 				}
 				if (inspected.error.reason === "oversized")
@@ -16837,7 +16938,7 @@ export class SessionManager {
 			if (inspected.reason === "missing") {
 				const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
 				manager.#sessionMemoryMode = sessionMemoryMode;
-				await manager.#initSessionFile(filePath);
+				await manager.#initSessionFile(filePath, true);
 				return manager;
 			}
 			if (inspected.reason === "oversized") throw new SessionTranscriptOversizedError(inspected.size ?? 0);
@@ -17619,18 +17720,13 @@ export class SessionManager {
 		const manager = new SessionManager(header.cwd || getProjectDir(), dir, true, storage, destination);
 		manager.#sessionMemoryMode = sessionMemoryMode;
 		await manager.#hydrateExistingSession(sessionPath, entries, inspected.migrationApplied);
+		manager.#readOnlyResume = true;
 		const ownershipInspection = revalidateResumeSessionIdentity(sessionPath, storage, inspected.identity);
 		if (ownershipInspection.kind === "error") {
 			await manager.close();
 			return ownershipInspection;
 		}
-		try {
-			await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
-			writeTerminalBreadcrumb(manager.cwd, sessionPath);
-		} catch (error) {
-			await manager.close();
-			throw error;
-		}
+		manager.#sanitizeLoadedOpenAIResponsesReplayMetadata();
 		return { kind: "opened", manager };
 	}
 

@@ -429,7 +429,6 @@ describe("SessionManager cold sidecar integration", () => {
 			tempDir.removeSync();
 		}
 	}, 60_000);
-
 	it("fails closed when the authoritative cold prefix changes after shadow indexing", async () => {
 		const tempDir = TempDir.createSync("@pi-session-memory-mismatch-");
 		const storage = new FileSessionStorage();
