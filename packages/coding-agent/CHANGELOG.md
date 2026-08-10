@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
+- Option+Q verification now supports normal macOS Terminal.app profiles and fails with an actionable Settings > Profiles > Keyboard > Use Option as Meta key diagnostic when the profile cannot forward Option as Meta/Esc.
 - Follow-up queue auto-continuation now waits for compaction and foreground bash/eval work to settle, preventing queued prompts from starting a model turn concurrently with those operations.
 - Follow-up queue submissions now defer slash/skill text during foreground bash/eval work instead of invoking a competing custom-message turn.
 - Follow-up queues now resume through a dedicated queued-message continuation after Python/Bash execution tails, avoiding an extra stale-turn replay.
