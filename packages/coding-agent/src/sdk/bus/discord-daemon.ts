@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { SdkClientError } from "../client/client";
-import type { SessionAttachment } from "../router";
+import { SessionRouterError, type SessionAttachment } from "../router";
 import type { ChatDeliveryError } from "./chat-daemon-runtime";
 
 import {
@@ -1190,6 +1190,7 @@ export class DiscordNotificationDaemon {
 	}
 	#isDefiniteSdkPreSendFailure(error: unknown): boolean {
 		if (error instanceof DiscordAttachmentBindingError) return true;
+		if (error instanceof SessionRouterError) return error.phase === "pre_send";
 		if (error instanceof SdkClientError) return error.code === "connection_closed";
 		return (
 			error instanceof Error &&
