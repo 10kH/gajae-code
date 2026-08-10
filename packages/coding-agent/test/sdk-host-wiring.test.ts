@@ -49,6 +49,7 @@ import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import type { NotificationSessionController } from "../src/sdk/bus/session-control";
 import { SdkClient } from "../src/sdk/client";
 import { SessionSdkHost } from "../src/sdk/host";
+import type { SessionRouter } from "../src/sdk/router";
 import { createAgentSession } from "../src/sdk/session";
 import {
 	attachLifecycleStartupCapability,
@@ -2737,7 +2738,29 @@ test("ACP permission attachment normalizes decisions through the registered prov
 	start(ctx);
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as {
+		sessionId: string;
+		pid: number;
+		url: string;
+		token: string;
+	};
+	const client = new SdkClient(endpoint.url, endpoint.token);
+	await client.connect();
+	const attachment = {
+		sessionId,
+		generation: 1,
+		isCurrent: () => true,
+		send: (frame: Record<string, unknown>) => client.send(frame),
+	};
+	const router = {
+		request: async (
+			_requestedSessionId: string,
+			frame: Record<string, unknown>,
+			_expectedGeneration?: number,
+			_expectedAttachment?: unknown,
+			options?: { timeoutMs?: number },
+		) => await client.request({ ...frame, connectionId: client.connectionId }, options),
+	} as unknown as SessionRouter;
 
 	let nextResponse: unknown;
 	let waitForReverseAbort = false;
@@ -2766,8 +2789,12 @@ test("ACP permission attachment normalizes decisions through the registered prov
 			return await promise;
 		},
 	} as unknown as AgentSideConnection;
-	const adapter = await AcpSdkAdapter.connect({
-		client: new SdkClient(endpoint.url, endpoint.token),
+	let adapter: AcpSdkAdapter | undefined;
+	const disposeFrames = client.onFrame(frame => adapter?.acceptFrame(frame));
+	adapter = await AcpSdkAdapter.connect({
+		router,
+		attachment,
+		sessionId,
 		connection: createAcpReverseConnection(connection, acpSessionId),
 		providers: [{ capability: "permission", definitions: [] }],
 		heartbeatMs: 60_000,
@@ -2826,7 +2853,9 @@ test("ACP permission attachment normalizes decisions through the registered prov
 		expect(reverseCalls.every(call => call.input.sessionId === acpSessionId)).toBe(true);
 		expect(reverseCalls.every(call => call.signal instanceof AbortSignal)).toBe(true);
 	} finally {
-		await adapter.close();
+		disposeFrames();
+		await Promise.race([adapter?.close(), Bun.sleep(2_000)]);
+		await client.close();
 		await agentSession.dispose();
 	}
 });
