@@ -3871,7 +3871,10 @@ test("production post-registration startup failure proves cleanup and exact repl
 		const failure = response.ok ? undefined : response.startupFailure;
 		if (!failure) throw new Error("Expected persisted startup failure evidence.");
 		const sessions = await broker.handleRequest("session.list", {});
-		expect(sessions).toMatchObject({ ok: true, result: { sessions: [] } });
+		expect(sessions).toMatchObject({
+			ok: true,
+			result: { sessions: [expect.objectContaining({ terminal: true, live: false })] },
+		});
 		const sdkDir = path.join(root, ".gjc", "state", "sdk");
 		const entries = await fs.readdir(sdkDir);
 		// Retained `.gjc-delete-*` quarantines are typed cleanup evidence; only
@@ -4063,7 +4066,10 @@ test("broker close acknowledges before terminating the lifecycle child and prese
 		await expect(
 			SdkClient.connect(endpoint.url, endpoint.token, { timeoutMs: 250, reconnectAttempts: 0 }),
 		).rejects.toThrow();
-		expect(await broker.handleRequest("session.list", {})).toMatchObject({ ok: true, result: { sessions: [] } });
+		expect(await broker.handleRequest("session.list", {})).toMatchObject({
+			ok: true,
+			result: { sessions: [expect.objectContaining({ sessionId, terminal: true, live: false })] },
+		});
 		expect(
 			(await fs.readFile(path.join(agentDir, "sdk", "sessions", "index.jsonl"), "utf8"))
 				.split("\n")
