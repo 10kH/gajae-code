@@ -2064,6 +2064,92 @@ it("routes auto mode eagerly below the threshold and bounded above it", async ()
 	}
 });
 
+it("rejects malformed auto-small managed resumes through the strict eager path", async () => {
+	const tempDir = TempDir.createSync("@pi-session-auto-small-");
+	const storage = new FileSessionStorage();
+	const cwd = tempDir.path();
+	const agentDir = path.join(cwd, ".gjc");
+	const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+	const sessionFile = path.join(agentDir, "sessions", "auto-small-malformed.jsonl");
+	storage.writeTextSync(
+		sessionFile,
+		`${JSON.stringify({ type: "session", version: 5, id: "auto-small-malformed", timestamp: "0", cwd })}\n{malformed}\n`,
+	);
+	try {
+		await expect(SessionManager.open(sessionFile, destination, storage, "copy-retain", "auto")).rejects.toThrow(
+			/Could not open session|malformed/,
+		);
+	} finally {
+		tempDir.removeSync();
+	}
+});
+
+it("activates cold state when an auto session crosses the threshold on append", async () => {
+	const storage = new MemorySessionStorage();
+	const manager = SessionManager.create("/cwd", SessionManager.explicitDestination("/sessions"), storage);
+	SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1_000;
+	try {
+		manager.setSessionMemoryMode("auto");
+		await manager.ensureOnDisk();
+		manager.appendCustomEntry("node", { payload: "old" });
+		const first = manager.appendCustomEntry("node", { payload: "small" });
+		manager.appendCompaction("summary", undefined, first, 1);
+		expect(manager.getSessionMemoryStats().sidecarEnabled).toBe(false);
+		manager.appendCustomEntry("node", { payload: "x".repeat(2_000) });
+		expect(manager.getSessionMemoryStats().sidecarEnabled).toBe(true);
+	} finally {
+		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
+		await manager.close();
+	}
+});
+
+it("captures and restores cold rollback state without full hydration", async () => {
+	const storage = new MemorySessionStorage();
+	const sourceFile = "/sessions/cold-rollback-source.jsonl";
+	const targetFile = "/sessions/cold-rollback-target.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "cold-rollback", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: { payload: "old" } },
+		{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: { payload: "kept" } },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	storage.writeTextSync(sourceFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	storage.writeTextSync(
+		targetFile,
+		`${JSON.stringify({ type: "session", version: 5, id: "rollback-target", timestamp: "0", cwd: "/cwd" })}\n`,
+	);
+	SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1;
+	SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+	let manager: SessionManager | undefined;
+	try {
+		manager = await SessionManager.open(
+			sourceFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"auto",
+		);
+		const rollback = await manager.captureRollbackState();
+		expect(rollback.coldRestoreFile).toBe(sourceFile);
+		expect(rollback.materializedFileEntries).toEqual([]);
+		await manager.setSessionFile(targetFile);
+		await manager.restoreRollbackState(rollback);
+		expect(manager.getEntry("old")).toMatchObject({ id: "old" });
+	} finally {
+		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
+		SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
+		await manager?.close();
+	}
+});
+
 it("selects the latest exact compaction boundary in one semantic parse pass", async () => {
 	const storage = new MemorySessionStorage();
 	const sessionFile = "/sessions/bounded-first-open-latest-compaction.jsonl";

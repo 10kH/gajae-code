@@ -362,7 +362,10 @@ export interface SessionStorage {
 	/** Open a staged streaming writer for one immutable one-shot destination (additive). */
 	openStagedWriter?(path: string, options?: SessionStorageWriterOpenOptions): StagedStreamingWriter;
 	/** Acquire an owner-bound exclusive lock; returns undefined while another owner holds it. */
-	acquireExclusiveLockSync?(path: string): SessionStorageExclusiveLock | undefined;
+	acquireExclusiveLockSync?(
+		path: string,
+		options?: { securityContext?: SessionStorageSecurityContext },
+	): SessionStorageExclusiveLock | undefined;
 }
 
 // =============================================================================
@@ -863,7 +866,11 @@ function createFileCommitMarkerCheckedSync(
 		const opened = fs.fstatSync(fd, { bigint: true });
 		stagedIdentity = { dev: opened.dev, ino: opened.ino };
 		let offset = 0;
-		while (offset < bytes.byteLength) offset += fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
+		while (offset < bytes.byteLength) {
+			const written = fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
+			if (written === 0) throw new Error("Short write");
+			offset += written;
+		}
 		fs.fsyncSync(fd);
 		secureOwnerOnlyFileDescriptor(tempPath, fd, "verify", securityContext);
 		const staged = fs.fstatSync(fd, { bigint: true });
@@ -932,7 +939,11 @@ function replaceFileCommitMarkerCheckedSync(
 		const opened = fs.fstatSync(fd, { bigint: true });
 		stagedIdentity = { dev: opened.dev, ino: opened.ino };
 		let offset = 0;
-		while (offset < bytes.byteLength) offset += fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
+		while (offset < bytes.byteLength) {
+			const written = fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
+			if (written === 0) throw new Error("Short write");
+			offset += written;
+		}
 		fs.fsyncSync(fd);
 		secureOwnerOnlyFileDescriptor(tempPath, fd, "verify", securityContext);
 		staged = fs.fstatSync(fd, { bigint: true });
@@ -1680,32 +1691,41 @@ function reclaimStaleSessionStorageLockSync(lockPath: string): boolean {
 	const probe = probeSessionStorageLockOwner(owner.pid);
 	const stale =
 		probe.kind === "absent" ||
-		(probe.kind === "live" && owner.incarnation !== undefined && probe.incarnation !== owner.incarnation);
+		(probe.kind === "live" &&
+			owner.incarnation !== undefined &&
+			probe.incarnation !== undefined &&
+			probe.incarnation !== owner.incarnation);
 	if (!stale) return false;
+	let lockExpected = expected;
 	const stagedPath = expected.nlink === 2n ? `${lockPath}.${owner.token}.owner.tmp` : undefined;
 	if (stagedPath) {
 		try {
 			const staged = fs.lstatSync(stagedPath, { bigint: true });
 			if (staged.dev !== expected.dev || staged.ino !== expected.ino || staged.isSymbolicLink()) return false;
+			unlinkOwnedStagedSync(stagedPath, expected);
+			if (fs.existsSync(stagedPath)) return false;
+			lockExpected = fs.lstatSync(lockPath, { bigint: true });
+			if (
+				lockExpected.dev !== expected.dev ||
+				lockExpected.ino !== expected.ino ||
+				lockExpected.nlink !== 1n ||
+				lockExpected.size !== expected.size ||
+				lockExpected.mtimeNs !== expected.mtimeNs ||
+				lockExpected.isSymbolicLink()
+			)
+				return false;
 		} catch {
 			return false;
 		}
 	}
-	if (!exactRemoveSessionStorageLockPath(lockPath, expected, sha256)) return false;
-	if (stagedPath) {
-		try {
-			const staged = fs.lstatSync(stagedPath, { bigint: true });
-			if (staged.dev === expected.dev && staged.ino === expected.ino && !staged.isSymbolicLink())
-				exactRemoveSessionStorageLockPath(stagedPath, staged, sha256);
-		} catch {
-			// The staged fallback link was already removed.
-		}
-	}
-	return true;
+	return exactRemoveSessionStorageLockPath(lockPath, lockExpected, sha256);
 }
 
 export class FileSessionStorage implements SessionStorage {
-	acquireExclusiveLockSync(lockPath: string): SessionStorageExclusiveLock | undefined {
+	acquireExclusiveLockSync(
+		lockPath: string,
+		options?: { securityContext?: SessionStorageSecurityContext },
+	): SessionStorageExclusiveLock | undefined {
 		const dir = path.dirname(lockPath);
 		this.ensureDirSync(dir);
 		for (let attempt = 0; attempt < 2; attempt++) {
@@ -1721,7 +1741,7 @@ export class FileSessionStorage implements SessionStorage {
 					fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0),
 					0o600,
 				);
-				secureOwnerOnlyFileDescriptor(stagedPath, fd, "apply", undefined);
+				secureOwnerOnlyFileDescriptor(stagedPath, fd, "apply", options?.securityContext);
 				stagedIdentity = fs.fstatSync(fd, { bigint: true });
 				const probe = probeSessionStorageLockOwner(process.pid);
 				const owner: SessionStorageLockOwner = {
@@ -1738,7 +1758,7 @@ export class FileSessionStorage implements SessionStorage {
 					offset += written;
 				}
 				fs.fsyncSync(fd);
-				secureOwnerOnlyFileDescriptor(stagedPath, fd, "verify", undefined);
+				secureOwnerOnlyFileDescriptor(stagedPath, fd, "verify", options?.securityContext);
 				stagedIdentity = fs.fstatSync(fd, { bigint: true });
 				let outcome = classifyNativePublishOutcome(
 					nativeSessionStorage().renameNoReplacePath(stagedPath, lockPath),
@@ -1775,6 +1795,7 @@ export class FileSessionStorage implements SessionStorage {
 				const publishedFd = fs.openSync(lockPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
 				let expected: fs.BigIntStats;
 				try {
+					secureOwnerOnlyFileDescriptor(lockPath, publishedFd, "verify", options?.securityContext);
 					expected = fs.fstatSync(publishedFd, { bigint: true });
 					if (
 						!expected.isFile() ||
@@ -1808,7 +1829,6 @@ export class FileSessionStorage implements SessionStorage {
 				return {
 					releaseSync: () => {
 						if (released) return;
-						released = true;
 						if (!exactRemoveSessionStorageLockPath(lockPath, expected, ownerDigest!)) {
 							try {
 								const current = fs.lstatSync(lockPath, { bigint: true });
@@ -1818,6 +1838,7 @@ export class FileSessionStorage implements SessionStorage {
 								if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 							}
 						}
+						released = true;
 					},
 				};
 			} catch (error) {
@@ -3142,7 +3163,10 @@ class MemorySessionStorageWriter implements SessionStorageBufferedWriter {
 export class MemorySessionStorage implements SessionStorage {
 	#files = new Map<string, { content: Buffer; mtimeMs: number; ino: bigint }>();
 	#nextInode = 1n;
-	acquireExclusiveLockSync(lockPath: string): SessionStorageExclusiveLock | undefined {
+	acquireExclusiveLockSync(
+		lockPath: string,
+		_options?: { securityContext?: SessionStorageSecurityContext },
+	): SessionStorageExclusiveLock | undefined {
 		if (this.#files.has(lockPath)) return undefined;
 		const ino = this.#nextInode++;
 		this.#files.set(lockPath, {
@@ -3323,8 +3347,12 @@ export class MemorySessionStorage implements SessionStorage {
 
 	deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
 		this.#files.delete(sessionPath);
+		const artifactPrefix = sessionPath.endsWith(".jsonl") ? `${sessionPath.slice(0, -6)}/` : `${sessionPath}/`;
 		for (const candidate of [...this.#files.keys()]) {
-			if (candidate.startsWith(`${sessionPath}.spill.`) && isDerivedSessionMemoryFile(candidate))
+			if (
+				(candidate.startsWith(`${sessionPath}.spill.`) || candidate.startsWith(artifactPrefix)) &&
+				isDerivedSessionMemoryFile(candidate)
+			)
 				this.#files.delete(candidate);
 		}
 		return Promise.resolve();

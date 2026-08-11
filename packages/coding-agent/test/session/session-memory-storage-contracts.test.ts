@@ -419,6 +419,43 @@ describe("exclusive disposable build locks", () => {
 		lock!.releaseSync();
 	});
 
+	it("reclaims a stale hard-link fallback crash after removing its staged name", async () => {
+		const dir = await makeTempDir("gjc-exclusive-lock-stale-link-");
+		const storage = new FileSessionStorage();
+		const lockPath = path.join(dir, "build.lock");
+		const token = "stale-link";
+		storage.writeTextSync(lockPath, `${JSON.stringify({ pid: 2_147_483_647, incarnation: "absent:1", token })}\n`);
+		const stagedPath = `${lockPath}.${token}.owner.tmp`;
+		fs.linkSync(lockPath, stagedPath);
+		const lock = storage.acquireExclusiveLockSync!(lockPath);
+		expect(lock).toBeDefined();
+		expect(fs.existsSync(stagedPath)).toBe(false);
+		lock!.releaseSync();
+	});
+
+	it("allows release retry when exact cleanup transiently fails", async () => {
+		const dir = await makeTempDir("gjc-exclusive-lock-release-retry-");
+		const storage = new FileSessionStorage();
+		const lockPath = path.join(dir, "build.lock");
+		const lock = storage.acquireExclusiveLockSync!(lockPath)!;
+		const realExactUnlink = native.exactUnlink;
+		let failed = false;
+		const exactUnlink = vi.spyOn(native, "exactUnlink").mockImplementation((target, identity) => {
+			if (target === lockPath && !failed) {
+				failed = true;
+				return { ok: false, code: "identity_mismatch" };
+			}
+			return realExactUnlink(target, identity);
+		});
+		try {
+			expect(() => lock.releaseSync()).toThrow("exclusive_lock_release_failed");
+			expect(() => lock.releaseSync()).not.toThrow();
+		} finally {
+			exactUnlink.mockRestore();
+		}
+		expect(storage.existsSync(lockPath)).toBe(false);
+	});
+
 	it("does not reap a replacement installed during stale-lock cleanup", async () => {
 		const dir = await makeTempDir("gjc-exclusive-lock-reap-race-");
 		const storage = new FileSessionStorage();
@@ -625,6 +662,36 @@ describe("commit-marker checked create/replace", () => {
 		expect(after.kind).toBe("present");
 		if (after.kind === "present") expect(after.rawBytesSha256).toBe(markerHash(markerBytes(0)));
 		expect(fs.readdirSync(dir).filter(name => name.endsWith(".tmp"))).toEqual([]);
+	});
+
+	it("file backend: zero-byte marker writes fail closed", async () => {
+		const dir = await makeTempDir("gjc-marker-short-write-");
+		const markerPath = path.join(dir, "session.jsonl.spill.commit");
+		const file = new FileSessionStorage();
+		const createWrite = vi.spyOn(fs, "writeSync").mockReturnValueOnce(0);
+		try {
+			expect(() => createSessionCommitMarkerCheckedSync(file, markerPath, markerBytes(0))).toThrow("Short write");
+		} finally {
+			createWrite.mockRestore();
+		}
+		expect(readSessionCommitMarkerSync(file, markerPath)).toEqual({ kind: "missing" });
+		createSessionCommitMarkerCheckedSync(file, markerPath, markerBytes(0));
+		const current = readSessionCommitMarkerSync(file, markerPath);
+		if (current.kind !== "present") throw new Error("Expected a present marker");
+		const replaceWrite = vi.spyOn(fs, "writeSync").mockReturnValueOnce(0);
+		try {
+			expect(() =>
+				replaceSessionCommitMarkerCheckedSync(file, markerPath, markerBytes(1), {
+					rawBytesSha256: current.rawBytesSha256,
+					descriptorIdentity: current.stat,
+				}),
+			).toThrow("Short write");
+		} finally {
+			replaceWrite.mockRestore();
+		}
+		const retained = readSessionCommitMarkerSync(file, markerPath);
+		expect(retained.kind).toBe("present");
+		if (retained.kind === "present") expect(retained.rawBytesSha256).toBe(current.rawBytesSha256);
 	});
 
 	it("file backend: temp fsync failure publishes no marker and leaves no temp debris", async () => {
@@ -955,10 +1022,17 @@ describe("derived sidecar lifecycle cleanup", () => {
 		memory.writeTextSync(sessionPath, "{}\n");
 		memory.writeTextSync(`${sessionPath}.spill.idx`, "index\n");
 		memory.writeTextSync(`${sessionPath}.spill.commit`, "commit\n");
+		const memoryArtifactDir = sessionPath.slice(0, -6);
+		const memoryBuildLock = `${memoryArtifactDir}/.session-memory.spill.build-lock`;
+		const memoryStagedOwner = `${memoryBuildLock}.owner.owner.tmp`;
+		memory.writeTextSync(memoryBuildLock, "lock\n");
+		memory.writeTextSync(memoryStagedOwner, "owner\n");
 		await memory.deleteSessionWithArtifacts(sessionPath);
 		expect(memory.existsSync(sessionPath)).toBe(false);
 		expect(memory.existsSync(`${sessionPath}.spill.idx`)).toBe(false);
 		expect(memory.existsSync(`${sessionPath}.spill.commit`)).toBe(false);
+		expect(memory.existsSync(memoryBuildLock)).toBe(false);
+		expect(memory.existsSync(memoryStagedOwner)).toBe(false);
 	});
 
 	it("leaves no spill debris across 100 create-delete cycles", async () => {

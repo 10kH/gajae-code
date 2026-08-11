@@ -195,6 +195,7 @@ import type {
 	SessionStorageBufferedWriter,
 	SessionStorageExclusiveLock,
 	SessionStorageRangeSnapshot,
+	SessionStorageSecurityContext,
 	SessionStorageSnapshot,
 	SessionStorageStat,
 	SessionStorageWriter,
@@ -6386,6 +6387,7 @@ interface SessionManagerStateSnapshot {
 	fileEntries: FileEntry[];
 	materializedFileEntries: FileEntry[];
 	adoptedArtifactManager: ArtifactManager | null;
+	coldRestoreFile?: string;
 }
 
 /** Benchmark-derived cap for strong materialized session snapshots. */
@@ -6869,6 +6871,12 @@ export class SessionManager {
 							return authority.removeIfExistsDescriptor(relative)
 								? Promise.resolve()
 								: Promise.reject(Object.assign(new Error("Managed sidecar not found"), { code: "ENOENT" }));
+						case "acquireExclusiveLockSync":
+							args[1] = {
+								...(args[1] as { securityContext?: SessionStorageSecurityContext } | undefined),
+								securityContext: this.#managedSidecarSecurityContext,
+							};
+							break;
 						case "openWriter":
 						case "openBufferedWriter":
 						case "openStagedWriter":
@@ -7331,6 +7339,38 @@ export class SessionManager {
 		return this.#blobStore.put(data);
 	}
 
+	/** Capture rollback authority without materializing an active cold transcript. @internal */
+	async captureRollbackState(): Promise<SessionManagerStateSnapshot> {
+		if (this.#coldSidecarActive() && this.#sessionFile) {
+			return {
+				sessionId: this.#sessionId,
+				sessionName: this.#sessionName,
+				titleSource: this.#titleSource,
+				sessionFile: this.#sessionFile,
+				flushed: this.#flushed,
+				ensuredOnDisk: this.#ensuredOnDisk,
+				needsFullRewriteOnNextPersist: this.#needsFullRewriteOnNextPersist,
+				fileEntries: [],
+				materializedFileEntries: [],
+				adoptedArtifactManager: this.#adoptedArtifactManager,
+				coldRestoreFile: this.#sessionFile,
+			};
+		}
+		return this.captureState();
+	}
+
+	/** Restore a rollback snapshot, reopening cold authority instead of hydrating it. @internal */
+	async restoreRollbackState(snapshot: SessionManagerStateSnapshot): Promise<void> {
+		if (!snapshot.coldRestoreFile) {
+			this.restoreState(snapshot);
+			return;
+		}
+		await this.setSessionFile(snapshot.coldRestoreFile);
+		this.#flushed = snapshot.flushed;
+		this.#ensuredOnDisk = snapshot.ensuredOnDisk;
+		this.#needsFullRewriteOnNextPersist = snapshot.needsFullRewriteOnNextPersist;
+		this.#adoptedArtifactManager = snapshot.adoptedArtifactManager;
+	}
 	captureState(): SessionManagerStateSnapshot {
 		this.#ensureFullHotView();
 		const materializedFileEntries = materializeResidentEntriesForReadSync(
@@ -7758,27 +7798,26 @@ export class SessionManager {
 			return false;
 		}
 		const overallStarted = startFirstOpenPhase();
-		this.#sessionFile = sessionFile;
-		const runtime = this.#resetSidecarRuntime();
-		if (this.#storage.existsSync(runtime.commitPath)) {
-			for (const sidecarPath of this.#disposableSidecarPaths()) {
-				if (!sidecarPath) continue;
-				try {
-					this.#storage.unlinkSync(sidecarPath);
-				} catch (error) {
-					if (!isEnoent(error)) {
-						this.#lazyReopenFallbackReason = "bounded_first_open_stale_cleanup_failed";
-						this.#sidecarRuntime = undefined;
-						this.#sessionFile = undefined;
-						buildLock.releaseSync();
-						return false;
+		let initialized = false;
+		try {
+			this.#sessionFile = sessionFile;
+			const runtime = this.#resetSidecarRuntime();
+			if (this.#storage.existsSync(runtime.commitPath)) {
+				for (const sidecarPath of this.#disposableSidecarPaths()) {
+					if (!sidecarPath) continue;
+					try {
+						this.#storage.unlinkSync(sidecarPath);
+					} catch (error) {
+						if (!isEnoent(error)) {
+							this.#lazyReopenFallbackReason = "bounded_first_open_stale_cleanup_failed";
+							this.#sidecarRuntime = undefined;
+							this.#sessionFile = undefined;
+							return false;
+						}
 					}
 				}
 			}
-		}
-		this.#lazyReopenFallbackReason = "bounded_first_open_failed";
-		let initialized = false;
-		try {
+			this.#lazyReopenFallbackReason = "bounded_first_open_failed";
 			const preflightStarted = startFirstOpenPhase();
 			const before = this.#managedDescriptorSnapshotOrNull();
 			if (this.destination.kind === "managed") this.#managedRangeExpectedDescriptor = before ?? undefined;
@@ -8531,16 +8570,19 @@ export class SessionManager {
 		} catch {
 			// Missing/unreadable transcripts continue through the existing initialization path.
 		}
+		const boundedTranscriptAdmitted =
+			transcriptSize !== undefined && transcriptSize > 0 && transcriptSize <= BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES;
 		const publishedSidecarWasPresent =
 			sidecarRoot !== undefined &&
+			boundedTranscriptAdmitted &&
 			this.#effectiveSessionMemoryMode(transcriptSize) === "enabled" &&
 			this.#storage.existsSync(`${sidecarRoot}/.session-memory.spill.commit`);
-		if (await this.#tryInitSessionFileFromSidecar(resolvedSessionFile)) {
+		if (boundedTranscriptAdmitted && (await this.#tryInitSessionFileFromSidecar(resolvedSessionFile))) {
 			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			return;
 		}
 
-		if (await this.#tryBoundedFirstOpen(resolvedSessionFile)) {
+		if (boundedTranscriptAdmitted && (await this.#tryBoundedFirstOpen(resolvedSessionFile))) {
 			if (publishedSidecarWasPresent && this.#lazyReopenAttempted && !this.#lazyReopenSucceeded) {
 				this.#sessionMemoryMode = "shadow";
 				this.#sessionMemoryAutoDisabledReason = "sidecar_reload_failures";
@@ -14639,6 +14681,7 @@ export class SessionManager {
 
 	#effectiveSessionMemoryMode(size?: number): Exclude<SessionMemoryMode, "auto"> {
 		if (this.#sessionMemoryMode !== "auto") return this.#sessionMemoryMode;
+		if (process.platform === "win32") return "off";
 		let transcriptBytes = size;
 		if (transcriptBytes === undefined && this.#sessionFile && this.#storage.existsSync(this.#sessionFile)) {
 			try {
@@ -15593,9 +15636,14 @@ export class SessionManager {
 				this.#persistError ?? toError(error),
 			);
 		}
+		const activateColdAfterAppend =
+			!this.#coldSidecarActive() &&
+			this.#sessionMemoryMode === "auto" &&
+			this.#effectiveSessionMemoryMode() === "enabled";
 		if (
 			this.destination.kind !== "managed" &&
 			(sidecarAppendCharge > 0 ||
+				activateColdAfterAppend ||
 				(residentEntry.type === "compaction" && this.#effectiveSessionMemoryMode() === "enabled"))
 		) {
 			const writer = this.#persistWriter;
@@ -15654,6 +15702,15 @@ export class SessionManager {
 					activeRuntime.hotSuffixBytes += persistedLine.byteLength;
 				}
 			}
+		}
+		if (
+			activateColdAfterAppend &&
+			transcriptDurableForSidecar &&
+			this.#sessionFile &&
+			this.#storage.existsSync(this.#sessionFile)
+		) {
+			this.#buildDisposableSidecars(this.#fileEntries);
+			if (this.#coldSidecarActive()) this.#retireColdEntries();
 		}
 		if (
 			entry.type === "compaction" &&
@@ -17808,11 +17865,16 @@ export class SessionManager {
 			manager.buildSessionContext();
 			return manager;
 		}
+		let managedResumeBounded = sessionMemoryMode === "enabled";
+		if (sessionMemoryMode === "auto" && process.platform !== "win32") {
+			try {
+				managedResumeBounded = storage.statSync(filePath).size >= autoModeMinTranscriptBytes();
+			} catch {
+				managedResumeBounded = false;
+			}
+		}
 
-		if (
-			(sessionMemoryMode === "enabled" || sessionMemoryMode === "auto") &&
-			path.dirname(path.resolve(filePath)) === path.resolve(destination.directory)
-		) {
+		if (managedResumeBounded && path.dirname(path.resolve(filePath)) === path.resolve(destination.directory)) {
 			const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
 			manager.#sessionMemoryMode = sessionMemoryMode;
 			try {
