@@ -374,15 +374,16 @@ export class ConversationStore<T extends ConversationRecord> {
 		lockFile: string,
 	): Promise<{ handle: ConversationStoreFileHandle; lock: ConversationStoreLock }> {
 		const handle = await this.#fs.open(lockFile, "wx");
-		const lock: ConversationStoreLock = {
-			pid: this.#pid,
-			incarnation: this.#pidIncarnation(this.#pid) ?? "unavailable",
-			timestamp: this.#clock(),
-			nonce: randomUUID(),
-		};
-		heldLockFiles.set(lockFile, lock.nonce!);
+		let lock: ConversationStoreLock | undefined;
 		let published = false;
 		try {
+			lock = {
+				pid: this.#pid,
+				incarnation: this.#pidIncarnation(this.#pid) ?? "unavailable",
+				timestamp: this.#clock(),
+				nonce: randomUUID(),
+			};
+			heldLockFiles.set(lockFile, lock.nonce!);
 			await handle.writeFile(`${JSON.stringify(lock)}\n`, "utf8");
 			published = true;
 			await handle.sync();
@@ -390,10 +391,10 @@ export class ConversationStore<T extends ConversationRecord> {
 		} catch (error) {
 			try {
 				await handle.close().catch(() => undefined);
-				if (published) await this.#unlinkOwnedLock(lockFile, lock);
+				if (published && lock) await this.#unlinkOwnedLock(lockFile, lock);
 				else await this.#fs.unlink(lockFile).catch(() => undefined);
 			} finally {
-				this.#releaseHeldLock(lockFile, lock);
+				if (lock) this.#releaseHeldLock(lockFile, lock);
 			}
 			throw error;
 		}

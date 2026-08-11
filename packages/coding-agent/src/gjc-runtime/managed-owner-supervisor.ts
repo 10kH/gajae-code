@@ -166,6 +166,28 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	const childProcess = nativeProcessBindings().Process.fromPid(child.pid);
 	if (!childProcess) {
 		const exitCode = await child.exited;
+		if (child.signalCode === "SIGABRT") {
+			const receipt: ManagedOwnerSigabrtReceipt = {
+				schema_version: 2,
+				generation,
+				session_id: sessionId,
+				run_id: runId,
+				endpoint_incarnation: incarnation,
+				child_token: childToken,
+				command_sha256: binding.command_sha256,
+				supervisor_pid: process.pid,
+				supervisor_start_time: supervisorStartTime,
+				child_pid: child.pid,
+				child_start_time: childStartTime,
+				signal: "SIGABRT",
+				signal_number: 6,
+				exit_code: exitCode,
+				received_at: new Date().toISOString(),
+			};
+			await writeDurableExclusive(path.join(root, `sigabrt-${childToken}.receipt.json`), receipt);
+			process.exitCode = 134;
+			return;
+		}
 		process.exitCode = exitCode;
 		return;
 	}
