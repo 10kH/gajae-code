@@ -14753,7 +14753,7 @@ export class SessionManager {
 			} catch (error) {
 				outcome = { kind: "close_unknown", error: toError(error) };
 			}
-			this.#releaseOwnedManagedAuthority();
+			if (this.#preparedNewSessions.size === 0) this.#releaseOwnedManagedAuthority();
 			this.#releaseClosedSessionState();
 		}
 		return outcome;
