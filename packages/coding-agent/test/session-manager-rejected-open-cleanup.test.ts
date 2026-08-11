@@ -16,7 +16,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import * as fs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionManager, SessionManagerTestHooks } from "@gajae-code/coding-agent/session/session-manager";
@@ -265,10 +265,10 @@ describe("rejected strict-resume open cleanup", () => {
 
 describe("managed strict-resume target races", () => {
 	it("rejects a target removed after strict revalidation without recreating it", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-strict-missing-"));
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-strict-missing-"));
 		const cwd = path.join(root, "cwd");
 		const agentDir = path.join(root, "agent");
-		fs.mkdirSync(cwd, { recursive: true });
+		await fs.mkdir(cwd, { recursive: true });
 		const storage = new FileSessionStorage();
 		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
 		const sourceFile = path.join(destination.directory, "strict-missing.jsonl");
@@ -286,15 +286,15 @@ describe("managed strict-resume target races", () => {
 			expect(hookCalls).toBe(1);
 		} finally {
 			SessionManagerTestHooks.beforeStrictMissingCheck = undefined;
-			fs.rmSync(root, { recursive: true, force: true });
+			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
 
 	it("rejects a large bounded target removed before eager fallback without recreating it", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-bounded-missing-"));
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-bounded-missing-"));
 		const cwd = path.join(root, "cwd");
 		const agentDir = path.join(root, "agent");
-		fs.mkdirSync(cwd, { recursive: true });
+		await fs.mkdir(cwd, { recursive: true });
 		const storage = new FileSessionStorage();
 		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
 		const sourceFile = path.join(destination.directory, "bounded-missing.jsonl");
@@ -316,15 +316,15 @@ describe("managed strict-resume target races", () => {
 			SessionManagerTestHooks.beforeStrictMissingCheck = undefined;
 			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
 			SessionManagerTestHooks.sidecarTailBufferBytesOverride = undefined;
-			fs.rmSync(root, { recursive: true, force: true });
+			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
 
 	it("rejects a large bounded target replaced before final acceptance", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-bounded-replaced-"));
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-bounded-replaced-"));
 		const cwd = path.join(root, "cwd");
 		const agentDir = path.join(root, "agent");
-		fs.mkdirSync(cwd, { recursive: true });
+		await fs.mkdir(cwd, { recursive: true });
 		const storage = new FileSessionStorage();
 		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
 		const sourceFile = path.join(destination.directory, "bounded-replaced.jsonl");
@@ -344,15 +344,15 @@ describe("managed strict-resume target races", () => {
 			SessionManagerTestHooks.beforeManagedResumeAcceptance = undefined;
 			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
 			SessionManagerTestHooks.sidecarTailBufferBytesOverride = undefined;
-			fs.rmSync(root, { recursive: true, force: true });
+			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
 
 	it("rejects a large bounded target replaced after acceptance without persisting", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-bounded-return-"));
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-bounded-return-"));
 		const cwd = path.join(root, "cwd");
 		const agentDir = path.join(root, "agent");
-		fs.mkdirSync(cwd, { recursive: true });
+		await fs.mkdir(cwd, { recursive: true });
 		const storage = new FileSessionStorage();
 		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
 		const sourceFile = path.join(destination.directory, "bounded-return.jsonl");
@@ -372,7 +372,7 @@ describe("managed strict-resume target races", () => {
 			SessionManagerTestHooks.beforeManagedResumeReturn = undefined;
 			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
 			SessionManagerTestHooks.sidecarTailBufferBytesOverride = undefined;
-			fs.rmSync(root, { recursive: true, force: true });
+			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
 });
