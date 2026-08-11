@@ -6526,6 +6526,7 @@ export const SessionManagerTestHooks: {
 	beforeEphemeralArtifactManagerInstall?: (dir: string) => void | Promise<void>;
 	beforePersistPatchFence?: (attempt: number) => void;
 	beforeStrictMissingCheck?: (filePath: string, storage: SessionStorage) => void;
+	beforeManagedResumeAcceptance?: (filePath: string, storage: SessionStorage) => void;
 	/** Internal first-open GC strategy override; omitted means current. */
 	firstOpenGcStrategy?: SessionMemoryGcStrategy;
 	/** Internal first-open secondary-artifact mode override; omitted means auto. */
@@ -8728,6 +8729,7 @@ export class SessionManager {
 		initializeMissing = false,
 		strictResume?: { inspection: ResumeInspectionSnapshot; storage: SessionStorage; reuseEntries?: boolean },
 		requireExisting = false,
+		deferPersistenceUntilAccepted = false,
 	): Promise<void> {
 		let strictManagedFallbackEntries: FileEntry[] | undefined;
 		let strictManagedFallbackMigrationApplied = false;
@@ -8850,7 +8852,8 @@ export class SessionManager {
 		writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
-		if (!strictResume) await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
+		if (!strictResume && !deferPersistenceUntilAccepted)
+			await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 		if (publishedSidecarWasPresent && this.#lazyReopenAttempted && !this.#lazyReopenSucceeded) {
 			this.#sessionMemoryMode = "shadow";
 			this.#sessionMemoryAutoDisabledReason = "sidecar_reload_failures";
@@ -18519,6 +18522,13 @@ export class SessionManager {
 				throw error;
 			}
 		}
+		const managedBoundedDescriptor = managedResumeBounded
+			? managedInspectionStore?.descriptorExpected(path.basename(filePath))
+			: undefined;
+		if (managedResumeBounded && !managedBoundedDescriptor) {
+			managedInspectionStore?.close();
+			throw new Error("Could not open session: unstable");
+		}
 
 		if (managedResumeBounded && sameManagedDirectory) {
 			const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
@@ -18531,7 +18541,16 @@ export class SessionManager {
 						? { inspection: strictManagedSmallInspection, storage: managedInspectionStorage }
 						: undefined,
 					true,
+					true,
 				);
+				SessionManagerTestHooks.beforeManagedResumeAcceptance?.(filePath, managedInspectionStorage);
+				const terminalManagedDescriptor = managedInspectionStore?.descriptorExpected(path.basename(filePath));
+				if (
+					!managedBoundedDescriptor ||
+					!terminalManagedDescriptor ||
+					!sameDescriptor(managedBoundedDescriptor, terminalManagedDescriptor)
+				)
+					throw new Error("Could not open session: unstable");
 				if (strictManagedSmallInspection) {
 					if (
 						!revalidateStrictResumeInspection(filePath, managedInspectionStorage, strictManagedSmallInspection) ||
@@ -18540,8 +18559,8 @@ export class SessionManager {
 						manager.setSessionMemoryMode("off");
 						throw new Error("Could not open session: unstable");
 					}
-					await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 				}
+				await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 				const header = manager.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 				if (header?.cwd) manager.cwd = header.cwd;
 				manager.buildSessionContext();
