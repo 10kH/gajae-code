@@ -449,8 +449,9 @@ async function seedSkillActivationState(
 		}),
 	);
 	if (!modeWrite) throw new Error(`Workflow activation mode write was not persisted: ${initializedStatePath}`);
+	let supersededEntries: SkillActiveEntry[] = [];
 	try {
-		const supersededEntries = await captureSupersededPlanningEntries(input.cwd, resolvedSessionId, skill);
+		supersededEntries = await captureSupersededPlanningEntries(input.cwd, resolvedSessionId, skill);
 		const activeEntryResult = await syncSkillActiveState({
 			cwd: input.cwd,
 			skill,
@@ -490,6 +491,10 @@ async function seedSkillActivationState(
 			cwd: input.cwd,
 			predicate: current => matchesGuardedStateWriteReceipt(current, modeWrite),
 		});
+		// syncSkillActiveState removes the upstream pipeline entries it supersedes
+		// before persisting; if a later write throws, restore them so a rejected
+		// invocation does not silently clear the prior workflow.
+		await restoreSupersededPlanningEntries(input.cwd, resolvedSessionId, supersededEntries);
 		throw error;
 	}
 }
@@ -509,6 +514,25 @@ async function captureSupersededPlanningEntries(
 	const visible = await readCanonicalVisibleSkillActiveState(cwd, sessionId);
 	if (!visible) return [];
 	return listActiveSkills(visible).filter(entry => upstream.includes(entry.skill));
+}
+
+/**
+ * Re-write superseded upstream pipeline entries that a seed removed, skipping
+ * skills that were re-seeded in the meantime. Shared by the seed error path and
+ * the returned rollback so a never-accepted prompt never clears a prior workflow.
+ */
+async function restoreSupersededPlanningEntries(
+	cwd: string,
+	sessionId: string,
+	superseded: readonly SkillActiveEntry[],
+): Promise<void> {
+	if (superseded.length === 0) return;
+	const existingEntries = await readActiveEntries(cwd, { sessionId });
+	const existingSkills = new Set(existingEntries.map(entry => entry.skill));
+	for (const entry of superseded) {
+		if (existingSkills.has(entry.skill)) continue;
+		await writeActiveEntry(cwd, { sessionId }, entry.skill, entry);
+	}
 }
 
 // Fallback for native-hook prompts when SkillPromptDetails.subskillActivation is absent;
@@ -596,13 +620,8 @@ export async function ensureWorkflowSkillActivationSeed(
 			}
 			// Restore the upstream pipeline entries this seed superseded so a
 			// prompt that was never accepted does not silently clear the prior
-			// workflow. Skip skills that were re-seeded in the meantime.
-			const existingEntries = await readActiveEntries(input.cwd, { sessionId: resolvedSessionId });
-			const existingSkills = new Set(existingEntries.map(entry => entry.skill));
-			for (const superseded of seed.supersededEntries) {
-				if (existingSkills.has(superseded.skill)) continue;
-				await writeActiveEntry(input.cwd, { sessionId: resolvedSessionId }, superseded.skill, superseded);
-			}
+			// workflow; skills that were re-seeded in the meantime are skipped.
+			await restoreSupersededPlanningEntries(input.cwd, resolvedSessionId, seed.supersededEntries);
 			await rebuildActiveSnapshot(input.cwd, { sessionId: resolvedSessionId }, { cwd: input.cwd });
 			return entryRemoved.deleted;
 		},

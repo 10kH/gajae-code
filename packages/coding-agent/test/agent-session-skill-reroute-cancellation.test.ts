@@ -374,3 +374,57 @@ test("releases a deferred SDK follow-up only after queued work drains", async ()
 	expect(agent.snapshotFollowUp()).toHaveLength(1);
 	expect(agent.snapshotFollowUp()[0]).toMatchObject({ content: [{ type: "text", text: "owned follow-up" }] });
 });
+test("releases the next deferred SDK follow-up when a released one is cancelled", async () => {
+	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-follow-up-advance-"));
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+	authStorage.setRuntimeApiKey("anthropic", "test-key");
+	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [] },
+	});
+	session = new AgentSession({
+		agent,
+		sessionManager: createLifecycleIndependentSessionManager(),
+		settings: Settings.isolated(),
+		modelRegistry,
+	});
+	const firstController = new AbortController();
+	const secondController = new AbortController();
+	const unrelated: AgentMessage = {
+		role: "user",
+		content: [{ type: "text", text: "unrelated follow-up" }],
+		attribution: "user",
+		timestamp: Date.now(),
+	};
+	agent.followUp(unrelated);
+	await session.sendUserMessage("owned m1", {
+		deliverAs: "followUp",
+		preflightSignal: firstController.signal,
+		sdkRunToken: "token-m1",
+		onPreflightAcceptCommit: () => {},
+	});
+	await session.sendUserMessage("owned m2", {
+		deliverAs: "followUp",
+		preflightSignal: secondController.signal,
+		sdkRunToken: "token-m2",
+		onPreflightAcceptCommit: () => {},
+	});
+	// Both SDK follow-ups are deferred behind the pre-existing queued work.
+	expect(agent.snapshotFollowUp()).toHaveLength(1);
+
+	// agent_end releases only the first deferred follow-up.
+	agent.removeQueuedMessages(candidate => candidate === unrelated);
+	agent.emitExternalEvent({ type: "agent_end", messages: [] });
+	await Bun.sleep(20);
+	expect(agent.snapshotFollowUp()).toHaveLength(1);
+	expect(agent.snapshotFollowUp()[0]).toMatchObject({ content: [{ type: "text", text: "owned m1" }] });
+
+	// Cancelling m1 before its scheduled continuation starts must advance the
+	// deferred queue to m2; no further agent_end will arrive to release it.
+	firstController.abort();
+	await Bun.sleep(20);
+	expect(agent.snapshotFollowUp()).toHaveLength(1);
+	expect(agent.snapshotFollowUp()[0]).toMatchObject({ content: [{ type: "text", text: "owned m2" }] });
+});

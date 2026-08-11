@@ -9698,6 +9698,11 @@ export class AgentSession {
 					removed = true;
 				} else {
 					removed = this.agent.removeQueuedMessages(candidate => candidate === message).followUp > 0;
+					// This message was already released from the deferred queue; its
+					// scheduled continuation was cancelled before it started. No further
+					// agent_end may arrive to release the next deferred follow-up, so
+					// advance the queue here to keep the next accepted SDK request moving.
+					if (removed) this.#releaseDeferredSdkFollowUps();
 				}
 				if (removed) {
 					this.#followUpMessages = this.#followUpMessages.filter(entry => entry !== displayEntry);

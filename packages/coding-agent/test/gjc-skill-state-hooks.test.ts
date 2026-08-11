@@ -16,6 +16,8 @@ import { reconcileWorkflowSkillState } from "../src/gjc-runtime/state-runtime";
 import { RequiredOnWriteEnvelopeSchema } from "../src/gjc-runtime/state-schema";
 import {
 	detectWorkflowEnvelopeIntegrityMismatch,
+	readActiveEntries,
+	writeActiveEntry,
 	writeGuardedJsonAtomic,
 	writeGuardedWorkflowEnvelopeAtomic,
 } from "../src/gjc-runtime/state-writer";
@@ -2009,6 +2011,75 @@ disabledExtensions:
 		// The rejected invocation must not leave a revision-1 mode file behind,
 		// which would wedge a retry on its expectedRevision: 0 write.
 		await expect(fs.stat(statePath)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+	it("restores superseded upstream entries when seed persistence fails", async () => {
+		const root = await cwd();
+		const sessionId = "session-supersede-failure";
+
+		await ensureWorkflowSkillActivationSeed({ cwd: root, skill: "deep-interview", sessionId });
+
+		// Run the real sync (which removes the upstream deep-interview entry) and
+		// then fail, simulating a persistence error after the supersede removal.
+		const originalSync = activeStateModule.syncSkillActiveState;
+		const syncSpy = vi.spyOn(activeStateModule, "syncSkillActiveState").mockImplementationOnce(async options => {
+			await originalSync(options);
+			throw new Error("simulated post-sync persistence failure");
+		});
+		try {
+			await expect(ensureWorkflowSkillActivationSeed({ cwd: root, skill: "ralplan", sessionId })).rejects.toThrow(
+				"simulated post-sync persistence failure",
+			);
+		} finally {
+			syncSpy.mockRestore();
+		}
+
+		// The rejected ralplan seed must not leave deep-interview cleared: the
+		// seed error path restores the upstream entry sync already removed.
+		const entries = await readActiveEntries(root, { sessionId });
+		expect(entries.some(entry => entry.skill === "deep-interview")).toBe(true);
+		await expect(fs.stat(modeStatePath(root, sessionId, "ralplan"))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("rollback skips restoring an upstream skill that was re-seeded in the meantime", async () => {
+		const root = await cwd();
+		const sessionId = "session-supersede-reseed";
+
+		const upstream = await ensureWorkflowSkillActivationSeed({
+			cwd: root,
+			skill: "deep-interview",
+			sessionId,
+			nowIso: "2026-08-11T00:00:00.000Z",
+		});
+		expect(upstream.seeded).toBe(true);
+
+		const successor = await ensureWorkflowSkillActivationSeed({
+			cwd: root,
+			skill: "ralplan",
+			sessionId,
+			nowIso: "2026-08-11T00:30:00.000Z",
+		});
+		expect(successor.seeded).toBe(true);
+
+		// Simulate a concurrent re-seed of the superseded upstream skill with a
+		// fresh activation stamp.
+		await writeActiveEntry(root, { sessionId }, "deep-interview", {
+			skill: "deep-interview",
+			active: true,
+			phase: "interviewing",
+			activated_at: "2026-08-11T01:00:00.000Z",
+			updated_at: "2026-08-11T01:00:00.000Z",
+			session_id: sessionId,
+		});
+
+		await expect(successor.rollback()).resolves.toBe(true);
+
+		// The re-seeded deep-interview survives; rollback must not clobber it
+		// with the original superseded snapshot.
+		const entries = await readActiveEntries(root, { sessionId });
+		const deepInterview = entries.find(entry => entry.skill === "deep-interview");
+		expect(deepInterview).toBeDefined();
+		expect(deepInterview?.activated_at).toBe("2026-08-11T01:00:00.000Z");
+		expect(entries.some(entry => entry.skill === "ralplan")).toBe(false);
 	});
 
 	it("ensureWorkflowSkillActivationState ignores non-workflow skills", async () => {
