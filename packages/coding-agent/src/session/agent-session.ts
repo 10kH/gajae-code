@@ -15641,8 +15641,10 @@ export class AgentSession {
 			controller.seedResolution(activeIndex, [...controller.skips, ...resolution.skips]);
 		}
 		if (!resolution.model) throw new Error(this.#fallbackExhaustionError(controller));
+		const previousEditMode = this.#resolveActiveEditMode();
 		this.#setModelAuthoritatively(resolution.model, "restore");
 		this.setThinkingLevel(resolution.explicitThinkingLevel ? resolution.thinkingLevel : this.thinkingLevel);
+		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
 	/**
@@ -15839,8 +15841,10 @@ export class AgentSession {
 			const from =
 				controller.tried.at(-1)?.selector ?? controller.chain.entries[controller.activeIndex - 1] ?? selector;
 			const to = selector;
+			const previousEditMode = this.#resolveActiveEditMode();
 			this.#setModelAuthoritatively(resolved.model, "fallback-switch");
 			this.setThinkingLevel(resolved.explicitThinkingLevel ? resolved.thinkingLevel : this.thinkingLevel);
+			await this.#syncEditToolModeAfterModelChange(previousEditMode);
 			if (from !== to) {
 				this.#emit({
 					type: "model_fallback_switched",

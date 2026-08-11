@@ -75,6 +75,7 @@ describe("detectModelEditFamily", () => {
 		["custom/claude-opus-4-5", "claude", "replace"],
 		["amazon-bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0", "claude", "replace"],
 		["deepseek/deepseek-v3.2", "deepseek", "replace"],
+		["amazon-bedrock/us.deepseek.r1-v1:0", "deepseek", "replace"],
 		["custom/qwen3-coder", "qwen", "replace"],
 		["minimax-code/minimax-m2.5", "minimax", "hashline"],
 		["zai/glm-4.7", "glm", "hashline"],

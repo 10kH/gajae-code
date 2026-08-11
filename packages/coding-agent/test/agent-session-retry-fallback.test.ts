@@ -771,9 +771,16 @@ describe("AgentSession retry fallback", () => {
 		if (!primary || !fallback) throw new Error("Expected bundled test models");
 		const requestedModels: string[] = [];
 		let primaryCalls = 0;
+		const editTool: AgentTool = {
+			name: "edit",
+			label: "Edit",
+			description: "Edit files",
+			parameters: z.object({}),
+			execute: async () => ({ content: [] }),
+		};
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
-			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [editTool], messages: [] },
 			streamFn: (requestedModel, context, options) => {
 				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
 				if (requestedModel.provider === primary.provider) {
@@ -804,6 +811,7 @@ describe("AgentSession retry fallback", () => {
 			"test",
 		);
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const refreshSpy = vi.spyOn(session, "refreshBaseSystemPrompt");
 		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
 		const switches: Extract<AgentSessionEvent, { type: "model_fallback_switched" }>[] = [];
 		session.subscribe(event => {
@@ -831,6 +839,7 @@ describe("AgentSession retry fallback", () => {
 			}),
 		]);
 		expect(getLastAssistantMessage(session)).toMatchObject({ stopReason: "stop" });
+		expect(refreshSpy).toHaveBeenCalledTimes(1);
 	});
 
 	it("bounds all-provider canonical timeout exhaustion", async () => {

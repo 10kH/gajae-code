@@ -71,7 +71,7 @@ export function detectModelEditFamily(modelId: string | undefined): ModelEditFam
 	if (/(?:^|[-_.])codex(?:$|[-_.\d])/.test(model)) return "codex";
 	if (/^(?:gpt|chatgpt)(?:$|[-_.\d])|(?:^|\.)openai\.(?:gpt|chatgpt)(?:$|[-_.\d])/.test(model)) return "gpt";
 	if (/^claude(?:$|[-_.\d])|(?:^|\.)anthropic\.claude(?:$|[-_.\d])/.test(model)) return "claude";
-	if (/^deepseek(?:$|[-_.\d])|(?:^|\.)deepseek\.deepseek(?:$|[-_.\d])/.test(model)) return "deepseek";
+	if (/^deepseek(?:$|[-_.\d])|(?:^|\.)deepseek(?:$|[-_.\d])/.test(model)) return "deepseek";
 	if (/^qwen(?:$|[-_.\d])|(?:^|\.)qwen\.qwen(?:$|[-_.\d])/.test(model)) return "qwen";
 	if (/^minimax(?:$|[-_.\d])/.test(model)) return "minimax";
 	if (/^glm(?:$|[-_.\d])/.test(model)) return "glm";
