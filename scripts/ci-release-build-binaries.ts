@@ -3,6 +3,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { buildReleaseCompileArgs } from "../packages/coding-agent/scripts/compile-args";
+import { signMacOSBinary } from "./macos-code-signing";
 
 interface BinaryTarget {
 	id: string;
@@ -132,7 +133,7 @@ async function buildBinary(target: BinaryTarget): Promise<void> {
 
 	// Bun 1.3.12 emits a truncated Mach-O signature on darwin builds.
 	if (shouldAdhocSignDarwinBinary(target)) {
-		await runCommand(["codesign", "--force", "--sign", "-", path.join(repoRoot, target.outfile)], repoRoot);
+		await signMacOSBinary(path.join(repoRoot, target.outfile), command => runCommand(command, repoRoot));
 	}
 }
 

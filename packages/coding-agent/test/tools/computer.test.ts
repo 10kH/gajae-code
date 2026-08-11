@@ -326,6 +326,29 @@ describe("computer tool dispatch", () => {
 		expect(calls[3].args).toEqual([42, 1, 2, 5, -6]);
 	});
 
+	it("preserves native launcher permission diagnostics for direct screenshots", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		setComputerControllerFactoryForTests(() => ({
+			screenshot: () => {
+				throw Object.assign(
+					new Error(
+						"COMPUTER_PERMISSION_REQUIRED: Screen & System Audio Recording is missing. TCC identity: executable=/tmp/gjc, pid=123",
+					),
+					{ code: "COMPUTER_PERMISSION_REQUIRED" },
+				);
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("permission-diagnostic", { action: "screenshot" });
+
+		expect(result.isError).toBe(true);
+		expect(result.details?.code).toBe("COMPUTER_PERMISSION_REQUIRED");
+		expect(textOf(result)).toContain("TCC identity: executable=/tmp/gjc");
+		expect(textOf(result)).toContain("fully quit and relaunch GJC");
+	});
+
 	it("does not invent a display epoch before any screenshot context exists", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
