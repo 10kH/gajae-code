@@ -162,7 +162,7 @@ BACK | VibeQuant | gajae-code | HOME | NEXT
 
 - `NEW SESSION`: create a terminal surface and ask for a worktree name; a blank answer starts a plain `gjc` session, while a name starts `gjc --worktree <name>`. Do not select a profile here.
 - `CLOSE TAB`: close the focused cmux surface.
-- `VOICE`: invoke GJC's `Toggle speech-to-text` action on the focused `GJC:` surface. This is the same action bound to `Option+H` (`Alt+H`).
+- `VOICE`: invoke GJC's local Whisper speech-to-text action with a user remap to `Ctrl+H` on the focused `GJC:` surface.
 - `STEER`: send `Esc`, wait 100 ms, then send `Enter`.
 - `ESC X2`: send `Esc`, wait 100 ms, then send `Esc` again.
 
@@ -271,11 +271,17 @@ cmux send-key \
   enter
 ```
 
-### Voice (`Option+H`)
+### Voice (`Ctrl+H`)
 
-GJC binds local Whisper speech-to-text to `Alt+H`, but cmux does not reliably forward that modifier through `send-key`. Use a dedicated, signed local helper app that posts the real macOS `Option+H` event after focusing the exact `GJC:` surface.
+Remap local Whisper speech-to-text in `~/.gjc/agent/keybindings.json`:
 
-The helper requires one-time macOS Accessibility approval. Keep that permission scoped to the helper app; do not fall back to typing command-palette search text into the active editor.
+```json
+{
+  "app.stt.toggle": "Ctrl+H"
+}
+```
+
+The Stream Deck plugin sends atomic `ctrl+h` through `cmux send-key`. New GJC sessions load the remap; already-running sessions keep the keybindings they started with and should not be modified in place.
 
 ### Shift+Tab
 
@@ -421,7 +427,7 @@ Use temporary surfaces and restore the original focus after each test:
 - pane previous/next;
 - tab previous/next;
 - terminal creation in the requested pane;
-- voice helper posts a real `Option+H` event without inserting text;
+- voice sends atomic `Ctrl+H` to a session that loaded the remap without inserting text;
 - fixed-folder `cd` behavior;
 - focused tab closure;
 - same-tab worktree prompting when required;
