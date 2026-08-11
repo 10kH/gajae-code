@@ -2,7 +2,7 @@ import type { Effort } from "@gajae-code/ai/model-thinking";
 import { PET_MODE_IDS, PET_SKIN_IDS, PET_SKINS } from "@gajae-code/tui/components/gajae-pet";
 import { TASK_SIMPLE_MODES } from "../task/simple-mode";
 import { getThinkingLevelMetadata } from "../thinking-metadata";
-import { EDIT_MODES } from "../utils/edit-mode";
+import { DEFAULT_EDIT_MODE_SETTING, EDIT_MODE_SETTINGS, EDIT_MODES, type EditMode } from "../utils/edit-mode";
 import { CONFIGURABLE_SEARCH_PROVIDER_IDS } from "../web/search/types";
 import type { ModelSelectorValue } from "./model-selector-value";
 import { UPDATE_CHANNELS } from "./update-channel";
@@ -181,9 +181,7 @@ interface ArrayDef<T> {
 	ui?: UiBase;
 }
 
-interface RecordValueDef {
-	type: "model-selector-value";
-}
+type RecordValueDef = { type: "model-selector-value" } | { type: "string-enum"; values: readonly string[] };
 
 interface RecordDef<T> {
 	type: "record";
@@ -218,6 +216,7 @@ export interface ModelTagsSettings {
 const EMPTY_STRING_ARRAY: string[] = [];
 const EMPTY_MODEL_SELECTOR_RECORD: Record<string, ModelSelectorValue> = {};
 const MODEL_SELECTOR_VALUE_SCHEMA = { type: "model-selector-value" } as const;
+const EDIT_MODE_VALUE_SCHEMA = { type: "string-enum", values: EDIT_MODES } as const;
 const DEFAULT_CYCLE_ORDER: string[] = ["default"];
 const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
 const HINDSIGHT_RECALL_TYPES_DEFAULT: string[] = ["world", "experience"];
@@ -2141,13 +2140,19 @@ export const SETTINGS_SCHEMA = {
 	// Edit tool
 	"edit.mode": {
 		type: "enum",
-		values: EDIT_MODES,
-		default: "hashline",
+		values: EDIT_MODE_SETTINGS,
+		default: DEFAULT_EDIT_MODE_SETTING,
 		ui: {
 			tab: "editing",
 			label: "Edit Mode",
-			description: "Select the edit tool variant (replace, patch, hashline, vim, or apply_patch)",
+			description:
+				"Select the edit tool variant (auto routes by model family; replace, patch, hashline, vim, or apply_patch)",
 		},
+	},
+	"edit.modelVariants": {
+		type: "record",
+		default: {} as Record<string, EditMode>,
+		valueSchema: EDIT_MODE_VALUE_SCHEMA,
 	},
 
 	"edit.fuzzyMatch": {
@@ -3857,6 +3862,13 @@ function validArraySettingValue(value: unknown, allowedValues: readonly string[]
 	return !allowedValues || value.every(item => typeof item === "string" && allowedValues.includes(item));
 }
 
+function validRecordValue(valueSchema: RecordValueDef, value: unknown): boolean {
+	if (valueSchema.type === "model-selector-value") {
+		return typeof value === "string" || (Array.isArray(value) && value.every(item => typeof item === "string"));
+	}
+	return typeof value === "string" && valueSchema.values.includes(value);
+}
+
 function validSettingValue(definition: (typeof SETTINGS_SCHEMA)[SettingPath], value: unknown): boolean {
 	return (
 		(definition.type === "boolean" && typeof value === "boolean") ||
@@ -3897,11 +3909,8 @@ export function validateSettingPatch(patch: Record<string, unknown>): Array<{ pa
 				issues.push({ path, detail: "Setting is not a valid record sub-path." });
 				continue;
 			}
-			if (
-				parentDef.valueSchema.type === "model-selector-value" &&
-				!(typeof value === "string" || (Array.isArray(value) && value.every(item => typeof item === "string")))
-			) {
-				issues.push({ path, detail: "Expected model-selector-value." });
+			if (!validRecordValue(parentDef.valueSchema, value)) {
+				issues.push({ path, detail: `Expected ${parentDef.valueSchema.type}.` });
 			}
 			continue;
 		}
@@ -3923,11 +3932,8 @@ export function validateSettingPatch(patch: Record<string, unknown>): Array<{ pa
 		}
 		if (definition.type === "record" && "valueSchema" in definition && definition.valueSchema) {
 			for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-				if (
-					definition.valueSchema.type === "model-selector-value" &&
-					!(typeof entry === "string" || (Array.isArray(entry) && entry.every(item => typeof item === "string")))
-				) {
-					issues.push({ path: `${path}.${key}`, detail: "Expected model-selector-value." });
+				if (!validRecordValue(definition.valueSchema, entry)) {
+					issues.push({ path: `${path}.${key}`, detail: `Expected ${definition.valueSchema.type}.` });
 				}
 			}
 		}
@@ -3984,11 +3990,12 @@ export function reconcileSettingsSchema(raw: Record<string, unknown>): {
 			validSettingValue(definition, next)
 		) {
 			for (const [key, entry] of Object.entries(next as Record<string, unknown>)) {
-				if (
-					definition.valueSchema.type === "model-selector-value" &&
-					!(typeof entry === "string" || (Array.isArray(entry) && entry.every(item => typeof item === "string")))
-				) {
-					issues.push({ path: `${path}.${key}`, kind: "invalid", detail: "Expected model-selector-value." });
+				if (!validRecordValue(definition.valueSchema, entry)) {
+					issues.push({
+						path: `${path}.${key}`,
+						kind: "invalid",
+						detail: `Expected ${definition.valueSchema.type}.`,
+					});
 				}
 			}
 		}

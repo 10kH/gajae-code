@@ -237,17 +237,17 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 	readonly label = "Search";
 	readonly loadMode = "discoverable";
 	readonly summary = "Search file contents using ripgrep (fast text search)";
-	readonly description: string;
-	readonly parameters = searchSchema;
-	readonly strict = true;
-
-	constructor(private readonly session: ToolSession) {
-		const displayMode = resolveFileDisplayMode(session);
-		this.description = prompt.render(searchDescription, {
+	get description(): string {
+		const displayMode = resolveFileDisplayMode(this.session);
+		return prompt.render(searchDescription, {
 			IS_HL_MODE: displayMode.hashLines,
 			IS_LINE_NUMBER_MODE: !displayMode.hashLines && displayMode.lineNumbers,
 		});
 	}
+	readonly parameters = searchSchema;
+	readonly strict = true;
+
+	constructor(private readonly session: ToolSession) {}
 
 	async execute(
 		_toolCallId: string,

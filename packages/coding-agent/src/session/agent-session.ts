@@ -3233,7 +3233,7 @@ export class AgentSession {
 	}
 
 	/** Restore a temporary scope, unwinding any auto-owned scopes above it. */
-	restoreTemporaryProviderSessionScope(token: TemporaryProviderSessionScope): boolean {
+	async restoreTemporaryProviderSessionScope(token: TemporaryProviderSessionScope): Promise<boolean> {
 		const scopeIndex = this.#temporaryProviderSessionScopes.findLastIndex(scope => scope.token === token);
 		if (
 			scopeIndex < 0 ||
@@ -3242,12 +3242,12 @@ export class AgentSession {
 			return false;
 		}
 		while (this.#temporaryProviderSessionScopes.length > scopeIndex) {
-			this.#restoreTopTemporaryProviderSessionScope();
+			await this.#restoreTopTemporaryProviderSessionScope();
 		}
 		return true;
 	}
 
-	#restoreTopTemporaryProviderSessionScope(): void {
+	async #restoreTopTemporaryProviderSessionScope(): Promise<void> {
 		const scope = this.#temporaryProviderSessionScopes.pop();
 		if (!scope) return;
 		this.#closeProviderSessionMap(this.#providerSessionState, "temporary scope restore");
@@ -3266,7 +3266,7 @@ export class AgentSession {
 		this.#pendingThinkingVisibilityControlFailure = undefined;
 		this.#thinkingLevel = scope.thinkingLevel;
 		this.agent.setThinkingLevel(toReasoningEffort(scope.thinkingLevel));
-		void this.#syncEditToolModeAfterModelChange(previousEditMode);
+		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
 	/** Promote a temporary scope. The suspended provider state is permanently closed. */
@@ -6787,17 +6787,9 @@ export class AgentSession {
 		return resolveEditMode(this.#getEditModeSession());
 	}
 
-	#resolveEditModeForModel(model: Model): EditMode {
-		return resolveEditMode({
-			settings: this.settings,
-			getActiveModelString: () => formatModelString(model),
-		});
-	}
-
 	async #prepareDefaultModelSelectionPrompt(model: Model): Promise<string[] | undefined> {
 		if (!this.#rebuildSystemPrompt) return undefined;
 		if (!this.getActiveToolNames().includes("edit")) return undefined;
-		if (this.#resolveActiveEditMode() === this.#resolveEditModeForModel(model)) return undefined;
 		const built = await this.#rebuildSystemPrompt(this.getActiveToolNames(), this.#toolRegistry, model);
 		return built.systemPrompt;
 	}
@@ -6836,11 +6828,8 @@ export class AgentSession {
 		this.#lastAppliedToolSignature = this.#computeAppliedToolSignature(activeToolNames, activeTools);
 	}
 
-	async #syncEditToolModeAfterModelChange(previousEditMode: EditMode): Promise<void> {
-		const currentEditMode = this.#resolveActiveEditMode();
-		if (previousEditMode !== currentEditMode && this.getActiveToolNames().includes("edit")) {
-			await this.refreshBaseSystemPrompt();
-		}
+	async #syncEditToolModeAfterModelChange(_previousEditMode: EditMode): Promise<void> {
+		if (this.getActiveToolNames().includes("edit")) await this.refreshBaseSystemPrompt();
 	}
 
 	getSelectedMCPToolNames(): string[] {
@@ -11450,7 +11439,7 @@ export class AgentSession {
 			currentAutoScope !== undefined &&
 			this.#temporaryProviderSessionScopes.at(-1) === currentAutoScope;
 		if (replaceAutoScope && currentAutoScope) {
-			this.#restoreTopTemporaryProviderSessionScope();
+			await this.#restoreTopTemporaryProviderSessionScope();
 		}
 		const scope = isTemporaryOperation
 			? (suppliedScope ??
@@ -11481,7 +11470,7 @@ export class AgentSession {
 			if (options?.persistAsSessionDefault === true) this.#clearActiveModelProfileForConcreteDefault(options?.cause);
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
 		} catch (error) {
-			if (ownsScope) this.restoreTemporaryProviderSessionScope(scope);
+			if (ownsScope) await this.restoreTemporaryProviderSessionScope(scope);
 			throw error;
 		}
 		return scope;
@@ -14132,7 +14121,7 @@ export class AgentSession {
 				signal,
 			});
 			if (signal?.aborted) {
-				if (scope) this.restoreTemporaryProviderSessionScope(scope);
+				if (scope) await this.restoreTemporaryProviderSessionScope(scope);
 				return false;
 			}
 			logger.debug("Context promotion switched model on overflow", {
@@ -15641,8 +15630,10 @@ export class AgentSession {
 			controller.seedResolution(activeIndex, [...controller.skips, ...resolution.skips]);
 		}
 		if (!resolution.model) throw new Error(this.#fallbackExhaustionError(controller));
+		const previousEditMode = this.#resolveActiveEditMode();
 		this.#setModelAuthoritatively(resolution.model, "restore");
 		this.setThinkingLevel(resolution.explicitThinkingLevel ? resolution.thinkingLevel : this.thinkingLevel);
+		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
 	/**
@@ -15839,8 +15830,10 @@ export class AgentSession {
 			const from =
 				controller.tried.at(-1)?.selector ?? controller.chain.entries[controller.activeIndex - 1] ?? selector;
 			const to = selector;
+			const previousEditMode = this.#resolveActiveEditMode();
 			this.#setModelAuthoritatively(resolved.model, "fallback-switch");
 			this.setThinkingLevel(resolved.explicitThinkingLevel ? resolved.thinkingLevel : this.thinkingLevel);
+			await this.#syncEditToolModeAfterModelChange(previousEditMode);
 			if (from !== to) {
 				this.#emit({
 					type: "model_fallback_switched",
@@ -17667,6 +17660,7 @@ export class AgentSession {
 					: didReloadConversationChange
 						? "conversation-reload"
 						: undefined;
+				const previousEditMode = this.#resolveActiveEditMode();
 				await this.#restoreMCPSelectionsForSessionContext(sessionContext);
 
 				// The target session is loaded and MCP selections are restored: discard
@@ -17740,6 +17734,7 @@ export class AgentSession {
 					if (!this.model || !modelsAreEqual(this.model, resolution.model)) {
 						this.#setModelAuthoritatively(resolution.model, "restore");
 					}
+					await this.#syncEditToolModeAfterModelChange(previousEditMode);
 					if (resolution.explicitThinkingLevel && resolution.thinkingLevel !== undefined) {
 						this.setThinkingLevel(resolution.thinkingLevel);
 					}
