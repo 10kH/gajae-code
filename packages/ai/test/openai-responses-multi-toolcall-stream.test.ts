@@ -489,4 +489,131 @@ describe("Responses multi-tool-call stream correlation", () => {
 		const deltas = emitted.filter(e => e.type === "toolcall_delta");
 		expect(deltas.length).toBeGreaterThan(0);
 	});
+
+	test("uses terminal function-call arguments instead of an added-item placeholder", async () => {
+		const events = [
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: {
+					type: "function_call",
+					id: "fc_placeholder",
+					call_id: "call_placeholder",
+					name: "bash",
+					arguments: "{}",
+				},
+			},
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: {
+					type: "function_call",
+					id: "fc_placeholder",
+					call_id: "call_placeholder",
+					name: "bash",
+					arguments: '{"command":"pwd"}',
+				},
+			},
+		];
+		const output = makeOutput();
+		const { emitted, stream } = makeCapture();
+		await processResponsesStream(makeStream(events), output, stream, makeModel());
+
+		const block = toolBlocks(output)[0];
+		expect(block?.arguments).toEqual({ command: "pwd" });
+		expect(block?.incompleteArguments).toBeUndefined();
+		expect(toolCallEnds(emitted)[0]?.toolCall.arguments).toEqual({ command: "pwd" });
+	});
+
+	test("fails closed when streamed and terminal function-call arguments conflict", async () => {
+		const events = [
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "function_call", id: "fc_conflict", call_id: "call_conflict", name: "bash", arguments: "" },
+			},
+			{
+				type: "response.function_call_arguments.delta",
+				item_id: "fc_conflict",
+				output_index: 0,
+				delta: '{"command":"whoami"}',
+			},
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: {
+					type: "function_call",
+					id: "fc_conflict",
+					call_id: "call_conflict",
+					name: "bash",
+					arguments: '{"command":"pwd"}',
+				},
+			},
+		];
+		const output = makeOutput();
+		const { emitted, stream } = makeCapture();
+		await processResponsesStream(makeStream(events), output, stream, makeModel());
+
+		const block = toolBlocks(output)[0];
+		expect(block?.arguments).toEqual({});
+		expect(block?.incompleteArguments).toBe(true);
+		expect(toolCallEnds(emitted)[0]?.toolCall.incompleteArguments).toBe(true);
+	});
+
+	test("fails closed when terminal function-call arguments are malformed", async () => {
+		const events = [
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "function_call", id: "fc_malformed", call_id: "call_malformed", name: "bash", arguments: "" },
+			},
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: {
+					type: "function_call",
+					id: "fc_malformed",
+					call_id: "call_malformed",
+					name: "bash",
+					arguments: '{"command":',
+				},
+			},
+		];
+		const output = makeOutput();
+		const { stream } = makeCapture();
+		await processResponsesStream(makeStream(events), output, stream, makeModel());
+
+		const block = toolBlocks(output)[0];
+		expect(block?.arguments).toEqual({});
+		expect(block?.incompleteArguments).toBe(true);
+	});
+
+	test("correlates llama.cpp call IDs when function-call items omit item IDs and indexes", async () => {
+		const events = [
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", call_id: "call_llama", name: "bash", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "call_llama", delta: '{"command":' },
+			{ type: "response.function_call_arguments.delta", item_id: "call_llama", delta: '"pwd"}' },
+			{
+				type: "response.output_item.done",
+				item: {
+					type: "function_call",
+					call_id: "call_llama",
+					name: "bash",
+					arguments: '{"command":"pwd"}',
+				},
+			},
+		];
+		const output = makeOutput();
+		const { emitted, stream } = makeCapture();
+		await processResponsesStream(makeStream(events), output, stream, makeModel());
+
+		const block = toolBlocks(output)[0];
+		expect(block?.id).toStartWith("call_llama|");
+		expect(block?.arguments).toEqual({ command: "pwd" });
+		expect(block?.incompleteArguments).toBeUndefined();
+		expect(toolCallEnds(emitted)[0]?.toolCall.arguments).toEqual({ command: "pwd" });
+	});
 });

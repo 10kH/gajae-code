@@ -412,6 +412,7 @@ export async function processResponsesStream<TApi extends Api>(
 	const items = new Map<string, ItemEntry>();
 	let lastKey: string | null = null;
 	const idKey = (id: string) => `id:${id}`;
+	const callKey = (id: string) => `call:${id}`;
 	const idxKey = (n: number) => `idx:${n}`;
 	const hasIndex = (n: number | undefined): n is number => typeof n === "number" && Number.isFinite(n);
 	const resolveEntry = (
@@ -429,6 +430,8 @@ export async function processResponsesStream<TApi extends Api>(
 		if (itemId) {
 			const byId = items.get(idKey(itemId));
 			if (byId) return byId;
+			const byCallId = items.get(callKey(itemId));
+			if (byCallId) return byCallId;
 		}
 		if (hasIndex(outputIndex)) {
 			const byIdx = items.get(idxKey(outputIndex));
@@ -455,16 +458,23 @@ export async function processResponsesStream<TApi extends Api>(
 		const key = item.id ? idKey(item.id) : hasIndex(outputIndex) ? idxKey(outputIndex) : `seq:${items.size}`;
 		items.set(key, entry);
 		if (item.id && hasIndex(outputIndex)) items.set(idxKey(outputIndex), entry);
+		if ((item.type === "function_call" || item.type === "custom_tool_call") && item.call_id) {
+			items.set(callKey(item.call_id), entry);
+		}
 		lastKey = key;
 		return entry;
 	};
-	const dropEntry = (itemId: string | undefined, outputIndex: number | undefined): void => {
-		const key = itemId ? idKey(itemId) : hasIndex(outputIndex) ? idxKey(outputIndex) : null;
-		if (key) {
+	const dropEntry = (itemId: string | undefined, outputIndex: number | undefined, callId?: string): void => {
+		const entry =
+			(itemId ? (items.get(idKey(itemId)) ?? items.get(callKey(itemId))) : undefined) ??
+			(callId ? items.get(callKey(callId)) : undefined) ??
+			(hasIndex(outputIndex) ? items.get(idxKey(outputIndex)) : undefined);
+		if (!entry) return;
+		for (const [key, candidate] of items) {
+			if (candidate !== entry) continue;
 			items.delete(key);
 			if (lastKey === key) lastKey = null;
 		}
-		if (itemId && hasIndex(outputIndex)) items.delete(idxKey(outputIndex));
 	};
 	let sawFirstToken = false;
 
@@ -492,7 +502,7 @@ export async function processResponsesStream<TApi extends Api>(
 					id: encodeResponsesToolCallId(item.call_id, item.id),
 					name: item.name,
 					arguments: {},
-					partialJson: item.arguments || "",
+					partialJson: "",
 				};
 				const entry = registerEntry(item, block, outputIndex);
 				stream.push({ type: "toolcall_start", contentIndex: entry.blockContentIndex, partial: output });
@@ -649,7 +659,9 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.output_item.done") {
 			const item = structuredCloneJSON(event.item);
 			options?.onOutputItemDone?.(item);
-			const entry = resolveEntry(item.id, event.output_index, "never");
+			const itemKey =
+				item.type === "function_call" || item.type === "custom_tool_call" ? (item.id ?? item.call_id) : item.id;
+			const entry = resolveEntry(itemKey, event.output_index, "never");
 			if (item.type === "reasoning") {
 				// Prefer the streamed summary buffer only when it carries real text. When it
 				// holds only synthetic separators (e.g. a part.done arrived before/without any
@@ -732,26 +744,34 @@ export async function processResponsesStream<TApi extends Api>(
 				});
 				dropEntry(item.id, event.output_index);
 			} else if (item.type === "function_call") {
-				// Finalize onto the same block object stored in output.content, reading
-				// the matching entry's buffered partialJson first and only then the done
-				// item's arguments — never an adjacent item's buffer.
-				const args =
-					entry?.block.type === "toolCall" && entry.block.partialJson
-						? parseStreamingJson(entry.block.partialJson)
-						: parseStreamingJson(item.arguments || "{}");
+				// The terminal item is canonical. Some compatible Responses relays put an
+				// empty placeholder in output_item.added and only provide real arguments
+				// here. When streamed arguments also exist, require exact agreement rather
+				// than silently choosing one source.
+				const streamedArguments = entry?.block.type === "toolCall" ? entry.block.partialJson : "";
+				const finalArguments = item.arguments ?? "";
+				const hasStreamedArguments = streamedArguments.length > 0;
+				const hasFinalArguments = finalArguments.length > 0;
+				const conflictingArgumentSources =
+					hasStreamedArguments && hasFinalArguments && streamedArguments !== finalArguments;
+				const rawArguments = hasFinalArguments ? finalArguments : streamedArguments;
+				const incompleteArguments = conflictingArgumentSources || !isCompleteJson(rawArguments);
+				const args = incompleteArguments ? {} : parseStreamingJson(rawArguments);
 				const toolCall: ToolCall = {
 					type: "toolCall",
 					id: encodeResponsesToolCallId(item.call_id, item.id),
 					name: item.name,
 					arguments: args,
+					...(incompleteArguments ? { incompleteArguments: true } : {}),
 				};
 				if (entry?.block.type === "toolCall") {
 					entry.block.id = toolCall.id;
 					entry.block.name = toolCall.name;
 					entry.block.arguments = args;
+					entry.block.incompleteArguments = incompleteArguments || undefined;
 				}
 				const contentIndex = entry?.blockContentIndex ?? output.content.length - 1;
-				dropEntry(item.id, event.output_index);
+				dropEntry(item.id, event.output_index, item.call_id);
 				stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
 			} else if (item.type === "custom_tool_call") {
 				const rawInput =
@@ -771,7 +791,7 @@ export async function processResponsesStream<TApi extends Api>(
 					entry.block.arguments = { input: rawInput };
 				}
 				const contentIndex = entry?.blockContentIndex ?? output.content.length - 1;
-				dropEntry(item.id, event.output_index);
+				dropEntry(item.id, event.output_index, item.call_id);
 				stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
 			}
 		} else if (event.type === "response.completed") {
