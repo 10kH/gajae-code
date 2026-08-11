@@ -23,8 +23,15 @@ const admissionModule = path.join(
 	"managed-owner-admission.ts",
 );
 
-function startSupervisor(stateDir: string, command: string[], env: Record<string, string> = {}) {
-	const script = `import { runManagedOwnerSupervisor } from ${JSON.stringify(supervisorModule)}; await runManagedOwnerSupervisor();`;
+function startSupervisor(
+	stateDir: string,
+	command: string[],
+	env: Record<string, string> = {},
+	options: { forceMissingNativeReferenceMarker?: string } = {},
+) {
+	const script = options.forceMissingNativeReferenceMarker
+		? `const { appendFileSync } = await import("node:fs"); const originalSpawn = Bun.spawn; Bun.spawn = options => { const child = originalSpawn(options); const actualPid = child.pid; let pidReads = 0; Object.defineProperty(child, "pid", { configurable: true, get() { pidReads += 1; if (pidReads === 2) { appendFileSync(${JSON.stringify(options.forceMissingNativeReferenceMarker)}, "forced-missing-native-reference:" + actualPid + "\\n"); return 2_000_000_000; } return actualPid; } }); return child; }; try { const { runManagedOwnerSupervisor } = await import(${JSON.stringify(supervisorModule)}); await runManagedOwnerSupervisor(); } finally { Bun.spawn = originalSpawn; }`
+		: `import { runManagedOwnerSupervisor } from ${JSON.stringify(supervisorModule)}; await runManagedOwnerSupervisor();`;
 	return Bun.spawn({
 		cmd: [process.execPath, "-e", script],
 		cwd: repoRoot,
@@ -46,8 +53,9 @@ async function runSupervisor(
 	stateDir: string,
 	command: string[],
 	env: Record<string, string> = {},
+	options: { forceMissingNativeReferenceMarker?: string } = {},
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-	const child = startSupervisor(stateDir, command, env);
+	const child = startSupervisor(stateDir, command, env, options);
 	const [stdout, stderr, exitCode] = await Promise.all([
 		new Response(child.stdout).text(),
 		new Response(child.stderr).text(),
@@ -103,6 +111,52 @@ describe("managed owner supervisor", () => {
 				endpoint_incarnation: "incarnation-2681",
 			});
 			expect(files.filter(file => file.startsWith("sigabrt-")).length).toBe(1);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	it("records SIGABRT through the missing native child reference path", async () => {
+		if (process.platform !== "linux") return;
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+		const markerFile = path.join(stateDir, "forced-missing-native-reference.marker");
+		try {
+			const result = await runSupervisor(
+				stateDir,
+				fastSigabrtCommand(),
+				{},
+				{
+					forceMissingNativeReferenceMarker: markerFile,
+				},
+			);
+			expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(134);
+			expect(await fs.readFile(markerFile, "utf8")).toMatch(/^forced-missing-native-reference:\d+\n$/);
+			const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
+			const files = await fs.readdir(root);
+			const bindingFiles = files.filter(file => file.startsWith("child-") && file.endsWith(".binding.json"));
+			const receiptFiles = files.filter(file => file.startsWith("sigabrt-") && file.endsWith(".receipt.json"));
+			expect(bindingFiles).toHaveLength(1);
+			expect(receiptFiles).toHaveLength(1);
+			const binding = JSON.parse(await fs.readFile(path.join(root, bindingFiles[0]!), "utf8")) as Record<
+				string,
+				unknown
+			>;
+			const receipt = JSON.parse(await fs.readFile(path.join(root, receiptFiles[0]!), "utf8")) as Record<
+				string,
+				unknown
+			>;
+			expect(receiptFiles[0]).toBe(`sigabrt-${binding.child_token}.receipt.json`);
+			expect(receipt).toMatchObject({
+				schema_version: 2,
+				session_id: "session-2681",
+				generation: "generation-2681",
+				signal: "SIGABRT",
+				child_token: binding.child_token,
+				signal_number: 6,
+				run_id: "run-2681",
+				endpoint_incarnation: "incarnation-2681",
+				exit_code: 134,
+			});
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}

@@ -35,6 +35,22 @@ describe("ConversationStore", () => {
 		expect(fs.modes.get(store.filePath)).toBe(0o600);
 		expect(fs.modes.get("/agent/sdk/daemons/discord")).toBe(0o700);
 	});
+	test("closes and removes an unpublished lock when metadata construction fails", async () => {
+		const fs = new MemoryConversationStoreFs();
+		const metadataError = new Error("pid incarnation failed");
+		const store = new ConversationStore<TestConversation>({
+			agentDir: "/agent",
+			kind: "discord",
+			fs,
+			pidIncarnation: () => {
+				throw metadataError;
+			},
+		});
+		await expect(store.write("mapping", undefined, record(1))).rejects.toBe(metadataError);
+		const lockFile = `${store.filePath}.lock`;
+		expect(fs.calls).toContain(`close:${lockFile}`);
+		expect(fs.files.has(lockFile)).toBe(false);
+	});
 
 	test("does not reclaim a newly created lock before its owner publishes metadata", async () => {
 		const entered = Promise.withResolvers<void>();
