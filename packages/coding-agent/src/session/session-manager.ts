@@ -15959,7 +15959,6 @@ export class SessionManager {
 		let sidecarAppendCharge = 0;
 		let sidecarTailCharge = 0;
 		const activeRuntime = this.#sidecarRuntime;
-		const coldSidecarWasActive = this.#coldSidecarActive();
 		let transcriptDurableForSidecar = this.destination.kind === "managed";
 		let transcriptDescriptor: SessionStorageStat | undefined;
 		if (activeRuntime && this.#coldSidecarActive()) {
@@ -16024,8 +16023,7 @@ export class SessionManager {
 		}
 		const activateColdAfterAppend =
 			!this.#coldSidecarActive() &&
-			!coldSidecarWasActive &&
-			(this.#sessionMemoryMode === "auto" || this.#sessionMemoryMode === "enabled") &&
+			this.#sessionMemoryMode === "auto" &&
 			this.#effectiveSessionMemoryMode() === "enabled";
 		if (
 			this.destination.kind !== "managed" &&
