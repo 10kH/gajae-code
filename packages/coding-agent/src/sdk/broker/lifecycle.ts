@@ -1959,6 +1959,7 @@ type SignalTarget = {
 	pid: number;
 	lifecycleRequestId?: string;
 	processIncarnation?: string;
+	hostIncarnation?: string;
 };
 
 /**
@@ -1981,7 +1982,11 @@ async function hasDurableProcessIdentity(target: SignalTarget, id: string, expec
 			marker.incarnation === processIncarnation(target.pid)
 		);
 	if (expected && (expected.pid !== target.pid || target.lifecycleRequestId !== expected.effectMarker)) return false;
-	return target.processIncarnation !== undefined && target.processIncarnation === processIncarnation(target.pid);
+	// Hosts that pass an explicit incarnation record it as `processIncarnation`;
+	// the index's append path auto-stamps `hostIncarnation` for everything else.
+	// Either binding is the same pid-to-incarnation proof.
+	const recorded = target.hostIncarnation ?? target.processIncarnation;
+	return recorded !== undefined && recorded === processIncarnation(target.pid);
 }
 
 async function hasOwnedReadinessEvidence(

@@ -278,8 +278,10 @@ function auditRecords(events: SessionIndexEvent[], ts: number): SessionIndexAudi
  * highest (generation, indexSeq); only `session_deleted` hides a row (DR-1 retains
  * stopped/terminal credential-free rows so inspect/offline tail can work). Heartbeats
  * inherit locator/endpoint metadata from their identity's prior event. Liveness (C2)
- * requires a heartbeat observed within 2x the checkpoint interval AND a live host:
- * a missing heartbeat (e.g. after a broker restart) is unknown, never fresh forever.
+ * requires host-written evidence — a heartbeat, or the host's own `host_registered`
+ * append — observed within 2x the checkpoint interval AND a live host whose OS
+ * incarnation still matches: a missing or stale evidence trail (e.g. after a broker
+ * restart) is unknown, never fresh forever.
  */
 function reduceEvents(events: SessionIndexEvent[], now: number): IndexedSession[] {
 	const { admitted } = admitEvents(events);
@@ -325,7 +327,15 @@ function reduceEvents(events: SessionIndexEvent[], now: number): IndexedSession[
 		if (latest.type === "session_deleted") continue;
 		const heartbeat = latestHeartbeatByIdentity.get(chosen.identity);
 		const pidAlive = alive(latest.pid);
-		const heartbeatFresh = heartbeat !== undefined && now - heartbeat.ts < 2 * SESSION_HEARTBEAT_INTERVAL_MS;
+		// Liveness evidence is host-written: a checkpointed heartbeat, or the
+		// `host_registered` event the host appended itself. Counting registration
+		// closes the up-to-one-interval window where a just-registered session
+		// would read not-live before the first C2 pass — without weakening the
+		// pid-reuse fence, because the incarnation match below is still required.
+		// Broker-written events (reconciliation, terminal records) are not host
+		// evidence and never refresh liveness.
+		const evidenceTs = Math.max(heartbeat?.ts ?? 0, latest.type === "host_registered" ? latest.ts : 0);
+		const heartbeatFresh = evidenceTs > 0 && now - evidenceTs < 2 * SESSION_HEARTBEAT_INTERVAL_MS;
 		const recordedIncarnation = effectiveIncarnation(latest);
 		const currentIncarnation = recordedIncarnation === undefined ? undefined : processIncarnation(latest.pid);
 		const incarnationMatches = currentIncarnation !== undefined && currentIncarnation === recordedIncarnation;
