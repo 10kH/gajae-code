@@ -17,7 +17,7 @@ Gajae-Code can record microphone audio, transcribe it locally with OpenAI Whispe
    gjc config set stt.enabled true
    ```
 
-   Alternatively, open `/settings` in an interactive session, select **Interaction**, and enable **Speech-to-Text**.
+   Alternatively, open `/settings` in an interactive session, select **Interaction**, and enable **Speech-to-Text**. The first `false` → `true` transition checks the recorder, Python, and Whisper installation immediately. Missing Whisper dependencies are installed with progress in the status line; if setup fails, GJC disables STT again and shows the actionable error.
 
 3. In the composer, press **Alt+H** once to start recording. Press **Alt+H** again to stop and transcribe.
 
