@@ -8230,6 +8230,7 @@ mod exact_unlink_placeholder_tests {
 			detach_only:     false,
 			quarantine_name: Some(".quarantine".to_owned()),
 			sha256:          Some(sha256(b"stale")),
+			allow_hard_link: false,
 		};
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
@@ -8299,6 +8300,7 @@ mod exact_unlink_placeholder_tests {
 			detach_only:     false,
 			quarantine_name: Some(".quarantine".to_owned()),
 			sha256:          (!target_is_directory).then(|| sha256(b"stale")),
+			allow_hard_link: false,
 		};
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
@@ -8375,6 +8377,7 @@ mod exact_unlink_placeholder_tests {
 			detach_only:     false,
 			quarantine_name: Some(".quarantine".to_owned()),
 			sha256:          (!target_is_directory).then(|| sha256(b"stale")),
+			allow_hard_link: false,
 		};
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
@@ -8455,6 +8458,7 @@ mod exact_unlink_placeholder_tests {
 			detach_only:     false,
 			quarantine_name: Some(".quarantine".to_owned()),
 			sha256:          (!target_is_directory).then(|| sha256(b"stale")),
+			allow_hard_link: false,
 		};
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
@@ -8528,6 +8532,7 @@ mod exact_unlink_placeholder_tests {
 			detach_only,
 			quarantine_name: Some(".quarantine".to_owned()),
 			sha256: Some(sha256(b"stale")),
+			allow_hard_link: false,
 		};
 		let (exchange_entered_tx, exchange_entered_rx) = mpsc::channel();
 		let (exchange_resume_tx, exchange_resume_rx) = mpsc::channel();
@@ -8627,6 +8632,7 @@ mod exact_unlink_placeholder_tests {
 			detach_only:     false,
 			quarantine_name: Some(".quarantine".to_owned()),
 			sha256:          Some(sha256(b"stale")),
+			allow_hard_link: false,
 		};
 		let (exchange_entered_tx, exchange_entered_rx) = mpsc::channel();
 		let (exchange_resume_tx, exchange_resume_rx) = mpsc::channel();
