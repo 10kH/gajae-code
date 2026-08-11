@@ -1,8 +1,8 @@
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
 import * as path from "node:path";
 import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
 import { getProviderFirstEventTimeoutFallbackMs } from "@gajae-code/ai/utils/idle-iterator";
-import { TempDir } from "@gajae-code/utils";
+import { logger, TempDir } from "@gajae-code/utils";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import {
@@ -78,6 +78,7 @@ type Fixture = {
 	sendStopped(reason: StoppedReason): void;
 	sendToolStart(toolCallId: string): void;
 	sendToolEnd(toolCallId: string): void;
+	acknowledgePrompt(): void;
 	dispose(): void;
 };
 
@@ -131,6 +132,7 @@ function toolCallUpdates(updates: SessionNotification[]): number {
 
 type FixtureOptions = {
 	agentStartBeforeAcknowledgement?: boolean;
+	deferFirstPromptAcknowledgement?: boolean;
 };
 
 async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
@@ -147,10 +149,26 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 	let turnId = "";
 	let promptSocket: TestSocket | undefined;
 	let server!: ReturnType<typeof Bun.serve>;
+	let deferredPromptAcknowledgement:
+		| { socket: TestSocket; id: unknown; result: { commandId: string; turnId: string; accepted: true } }
+		| undefined;
 
 	const send = (frame: Record<string, unknown>): void => {
 		if (!promptSocket) throw new Error("Expected a prompt socket");
 		promptSocket.send(JSON.stringify(frame));
+	};
+	const acknowledgePrompt = (): void => {
+		const deferred = deferredPromptAcknowledgement;
+		if (!deferred) throw new Error("Expected a deferred prompt acknowledgement");
+		deferredPromptAcknowledgement = undefined;
+		deferred.socket.send(
+			JSON.stringify({
+				type: "control_response",
+				id: deferred.id,
+				ok: true,
+				result: deferred.result,
+			}),
+		);
 	};
 	const sendAssistantText = (text: string): void => {
 		send({
@@ -261,20 +279,33 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 				}
 				if (frame.operation === "turn.prompt" && options.agentStartBeforeAcknowledgement)
 					socket.send(JSON.stringify({ type: "agent_start", sessionId, commandId, turnId }));
-				socket.send(
-					JSON.stringify({
-						type: "control_response",
+				const result =
+					frame.operation === "turn.prompt"
+						? { commandId, turnId, accepted: true as const }
+						: frame.operation === "turn.abort"
+							? { aborted: true }
+							: {};
+				if (frame.operation === "turn.prompt" && options.deferFirstPromptAcknowledgement && turnCount === 1) {
+					deferredPromptAcknowledgement = {
+						socket,
 						id: frame.id,
-						ok: true,
-						result:
-							frame.operation === "turn.prompt"
-								? { commandId, turnId, accepted: true }
-								: frame.operation === "turn.abort"
-									? { aborted: true }
-									: {},
-					}),
-				);
-				if (frame.operation === "turn.prompt" && !options.agentStartBeforeAcknowledgement) {
+						result: { commandId, turnId, accepted: true },
+					};
+				} else {
+					socket.send(
+						JSON.stringify({
+							type: "control_response",
+							id: frame.id,
+							ok: true,
+							result,
+						}),
+					);
+				}
+				if (
+					frame.operation === "turn.prompt" &&
+					!options.agentStartBeforeAcknowledgement &&
+					!(options.deferFirstPromptAcknowledgement && turnCount === 1)
+				) {
 					// Frames are FIFO on the socket, so the client records the acknowledged
 					// correlation before this start frame reaches the session record.
 					socket.send(JSON.stringify({ type: "agent_start", sessionId, commandId, turnId }));
@@ -319,6 +350,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 		sendStopped,
 		sendToolStart,
 		sendToolEnd,
+		acknowledgePrompt,
 		dispose: () => {
 			abort.abort();
 			server.stop(true);
@@ -723,6 +755,90 @@ function correlationlessAssistantFrame(text: string): Record<string, unknown> {
 	};
 }
 
+test("a late acknowledgement tombstones a prompt rejected before ownership was known", async () => {
+	const diagnostic = vi.spyOn(logger, "error").mockImplementation(() => {});
+	const fixture = await createFixture({ deferFirstPromptAcknowledgement: true });
+	try {
+		const idleBefore = idleUpdates(fixture.updates);
+		const abandoned = prompt(fixture, "withhold acknowledgement").then(
+			() => undefined,
+			(reason: unknown) => reason,
+		);
+		await waitFor(() => fixture.correlation().commandId.length > 0, "first prompt dispatch");
+		const stale = fixture.correlation();
+		const firstWatchdog = fixture.clock.armed;
+		if (!firstWatchdog) throw new Error("Expected the pre-acknowledgement watchdog to be armed");
+
+		fixture.clock.advance(firstWatchdog.at - fixture.clock.now() + 1);
+		await waitFor(() => idleUpdates(fixture.updates) === idleBefore + 1, "pre-acknowledgement watchdog rejection");
+		expect(fixture.clock.pending).toBe(0);
+
+		fixture.acknowledgePrompt();
+		const abandonedError = await bounded(abandoned, "late acknowledgement rejection");
+		expect(abandonedError).toBeInstanceOf(Error);
+		expect((abandonedError as Error).message).toContain("ACP prompt was abandoned");
+
+		const { pending } = await startTurn(fixture);
+		expect(fixture.correlation()).not.toEqual(stale);
+		const armedBeforeStaleFrames = fixture.clock.armed;
+		const chunksBefore = textChunks(fixture.updates);
+		const toolCallsBefore = toolCalls(fixture.updates);
+		const toolUpdatesBefore = toolCallUpdates(fixture.updates);
+		const updateBoundary = fixture.updates.length;
+		const privateMessage = "PRIVATE_LATE_MESSAGE_SENTINEL";
+		const privateTool = "PRIVATE_LATE_TOOL_SENTINEL";
+		const staleToolCallId = "late-stale-tool";
+
+		fixture.send(
+			staleEventFrame(stale, "message_update", {
+				type: "message_update",
+				message: { role: "assistant", content: [{ type: "text", text: privateMessage }] },
+			}),
+		);
+		fixture.send(
+			staleEventFrame(stale, "tool_execution_start", {
+				type: "tool_execution_start",
+				toolCallId: staleToolCallId,
+				toolName: "bash",
+				args: { command: privateTool },
+			}),
+		);
+		fixture.send({
+			type: "event",
+			payload: {
+				event_type: "tool_execution_end",
+				event: {
+					type: "tool_execution_end",
+					toolCallId: staleToolCallId,
+					toolName: "bash",
+					isError: false,
+					result: { content: [{ type: "text", text: "correlationless tool completion" }] },
+				},
+			},
+		});
+		fixture.send(correlationlessAssistantFrame("correlationless session marker"));
+		await waitFor(() => textChunks(fixture.updates) === chunksBefore + 1, "correlationless session publication");
+		await waitFor(
+			() => toolCallUpdates(fixture.updates) === toolUpdatesBefore + 1,
+			"correlationless tool publication",
+		);
+
+		expect(toolCalls(fixture.updates)).toBe(toolCallsBefore);
+		expect(fixture.clock.armed).toEqual(armedBeforeStaleFrames);
+		const published = JSON.stringify(fixture.updates.slice(updateBoundary));
+		const diagnostics = JSON.stringify(diagnostic.mock.calls);
+		expect(published).not.toContain(privateMessage);
+		expect(published).not.toContain(privateTool);
+		expect(diagnostics).not.toContain(privateMessage);
+		expect(diagnostics).not.toContain(privateTool);
+
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "successor prompt completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		diagnostic.mockRestore();
+		fixture.dispose();
+	}
+});
 test("a settled turn's stale message frame does not narrow the live turn off the inference bound", async () => {
 	const fixture = await createFixture();
 	try {

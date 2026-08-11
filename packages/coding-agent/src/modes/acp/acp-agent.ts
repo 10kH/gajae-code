@@ -149,6 +149,11 @@ type SessionRecord = {
 	/** Set by `session/cancel` so an in-flight prompt settles as `cancelled`, never as an error. */
 	cancelRequested?: boolean;
 };
+
+function promptWaiterRetired(record: SessionRecord, waiter: PromptWaiter): boolean {
+	return waiter.settled || record.activePrompt !== waiter;
+}
+
 type Endpoint = { url: string; token: string };
 
 type BrokerSession = {
@@ -1438,6 +1443,10 @@ export class AcpAgent implements Agent {
 			};
 			record.activePrompt = waiter;
 		});
+		// The watchdog may reject this waiter while the SDK acknowledgement request is still
+		// pending. Retain the original promise for the caller, but mark that delayed rejection
+		// as observed until prompt() can resume and await it.
+		void response.catch(() => undefined);
 		// Silence has to be bounded from the moment the prompt owns the session: a host that
 		// dies before it ever answers is exactly the failure that leaves the client running.
 		this.#armPromptWatchdog(params.sessionId, record, waiter);
@@ -1473,6 +1482,18 @@ export class AcpAgent implements Agent {
 			waiter.boundary = record.inboundSequence;
 			waiter.correlation = acknowledgementCorrelation;
 			waiter.acknowledged = true;
+			if (promptWaiterRetired(record, waiter)) {
+				if (
+					!record.settledPromptCorrelations.some(settled =>
+						correlationsExactlyMatch(settled, acknowledgementCorrelation),
+					)
+				) {
+					record.settledPromptCorrelations.push(acknowledgementCorrelation);
+					while (record.settledPromptCorrelations.length > SETTLED_PROMPT_CORRELATION_RETENTION)
+						record.settledPromptCorrelations.shift();
+				}
+				return await response;
+			}
 			// Frames held while ownership was unknown belong to this prompt only when the
 			// acknowledgement proves their complete correlation matches exactly.
 			const deferredActivityFrames = waiter.deferredActivityFrames.splice(0);
@@ -2246,14 +2267,6 @@ export class AcpAgent implements Agent {
 			}
 			activePrompt.terminal = { outcome, correlation };
 		}
-		const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
-		if (
-			toolCallId &&
-			(event.type === "tool_execution_start" || event.type === "tool_execution_update") &&
-			"args" in event
-		) {
-			record.toolArgs.set(toolCallId, event.args);
-		}
 		if (settledCorrelation) {
 			// Frames for an already-settled correlation stay closed until an active prompt
 			// acknowledges the exact same identity.
@@ -2266,6 +2279,23 @@ export class AcpAgent implements Agent {
 		// After a correlated settlement with no active prompt, correlationless wire frames
 		// have no prompt to belong to and must not publish further updates.
 		if (!record.activePrompt && record.settledPromptCorrelations.length > 0 && !hasCorrelation(correlation)) return;
+		if (
+			!isTerminal &&
+			activePrompt &&
+			!activePrompt.settled &&
+			activePrompt.acknowledged &&
+			hasCompleteCorrelation(correlation) &&
+			!correlationsExactlyMatch(activePrompt.correlation, correlation)
+		)
+			return;
+		const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
+		if (
+			toolCallId &&
+			(event.type === "tool_execution_start" || event.type === "tool_execution_update") &&
+			"args" in event
+		) {
+			record.toolArgs.set(toolCallId, event.args);
+		}
 		if (wirePayload) {
 			for (const notification of mapAgentWireEventPayloadToAcpSessionUpdates(wirePayload as never, id, {
 				cwd: record.cwd,
