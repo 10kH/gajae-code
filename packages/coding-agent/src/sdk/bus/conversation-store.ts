@@ -331,6 +331,8 @@ export class ConversationStore<T extends ConversationRecord> {
 				return await this.#unlinkOwnedLock(lockFile, staleLock);
 			}
 			return await this.#unlinkExpiredUnpublishedLock(lockFile);
+		} catch {
+			return false;
 		} finally {
 			await reclaimLock.handle.close().catch(() => undefined);
 			try {

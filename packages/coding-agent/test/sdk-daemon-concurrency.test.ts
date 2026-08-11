@@ -96,6 +96,27 @@ describe("ConversationStore", () => {
 		fs.files.set(`${store.filePath}.lock`, JSON.stringify({ pid: 101, incarnation: "old", timestamp: 1 }));
 		expect(await store.write("mapping", undefined, record(1))).toBe(true);
 	});
+	test("times out when a stale lock cannot be unlinked", async () => {
+		class UnlinkFailingFs extends MemoryConversationStoreFs {
+			override async unlink(file: string) {
+				if (file.endsWith("conversations.json.lock")) {
+					throw Object.assign(new Error("stale lock unlink failed"), { code: "EPERM" });
+				}
+				await super.unlink(file);
+			}
+		}
+		const fs = new UnlinkFailingFs();
+		const store = new ConversationStore<TestConversation>({
+			agentDir: "/agent",
+			kind: "discord",
+			fs,
+			pid: 202,
+			pidAlive: pid => pid === 202,
+			lockTimeoutMs: 0,
+		});
+		fs.files.set(`${store.filePath}.lock`, JSON.stringify({ pid: 101, incarnation: "old", timestamp: 1 }));
+		await expect(store.write("mapping", undefined, record(1))).rejects.toBeInstanceOf(ConversationLockTimeoutError);
+	});
 	test("recovers an abandoned reclaim lock owned by a reused PID", async () => {
 		const fs = new MemoryConversationStoreFs();
 		const store = new ConversationStore<TestConversation>({
