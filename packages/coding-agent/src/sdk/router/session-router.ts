@@ -129,6 +129,8 @@ const REPLAY_BARRIER_LIMIT = 1_024;
 const REPLAY_RETRY_ATTEMPTS = 3;
 const REPLAY_RETRY_BACKOFF_MS = 100;
 const DELIVERY_ATTEMPT_LIMIT = 3;
+const ATTACH_CONCURRENCY = 4;
+const ATTACH_CONNECT_TIMEOUT_MS = 10_000;
 
 function readGeneration(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
@@ -642,19 +644,26 @@ export class SessionRouter {
 				}
 			}
 		}
-		for (const session of live) {
-			if (!this.#running(runEpoch)) break;
-			try {
-				if (await this.#attach(session, runEpoch)) attachedIds.add(session.sessionId);
-			} catch {
-				const failed = this.#sessions.get(session.sessionId);
-				if (failed?.runEpoch === runEpoch)
-					await this.#retireAttachment(failed, liveIds.has(session.sessionId) ? "replaced" : "removed");
-				logger.warn(
-					`SDK session attachment failed for indexed session ${session.sessionId} at generation ${session.endpointGeneration}; the endpoint remains unauthorized.`,
-				);
+		let nextAttachment = 0;
+		const attachWorkers = Array.from({ length: Math.min(ATTACH_CONCURRENCY, live.length) }, async () => {
+			for (;;) {
+				if (!this.#running(runEpoch)) return;
+				const session = live[nextAttachment++];
+				if (!session) return;
+				try {
+					if (await this.#attach(session, runEpoch)) attachedIds.add(session.sessionId);
+				} catch {
+					const failed = this.#sessions.get(session.sessionId);
+					if (failed?.runEpoch === runEpoch)
+						await this.#retireAttachment(failed, liveIds.has(session.sessionId) ? "replaced" : "removed");
+					if (this.#running(runEpoch))
+						logger.warn(
+							`SDK session attachment failed for indexed session ${session.sessionId} at generation ${session.endpointGeneration}; the endpoint remains unauthorized.`,
+						);
+				}
 			}
-		}
+		});
+		await Promise.all(attachWorkers);
 		if (!this.#running(runEpoch)) return;
 		const cleanupErrors: unknown[] = [];
 		for (const [sessionId, attached] of [...this.#sessions]) {
@@ -712,6 +721,53 @@ export class SessionRouter {
 		const current = listing.sessions.find(session => session.sessionId === indexed.sessionId);
 		if (!current || !sameIndexedAuthority(indexed, current)) return null;
 		return endpoint;
+	}
+
+	async #createAttachedClient(
+		indexed: IndexedSession,
+		endpoint: SdkSessionEndpoint,
+		runEpoch: number,
+	): Promise<SessionRouterClient | undefined> {
+		const endpointMtimeMs = indexed.endpointMtimeMs;
+		if (endpointMtimeMs === undefined) return undefined;
+		const createClient = this.#deps.createClient;
+		let transport: SdkClient | undefined;
+		let connection: Promise<SessionRouterClient>;
+		if (createClient) {
+			connection = createClient({
+				sessionId: indexed.sessionId,
+				generation: indexed.endpointGeneration,
+				pid: indexed.pid,
+				endpointMtimeMs,
+			});
+		} else {
+			const defaultClient = new SdkClient(endpoint.url, endpoint.token, { ...ACP_SESSION_RECONNECT });
+			transport = defaultClient;
+			connection = defaultClient.connect().then(() => defaultClient);
+		}
+		const stopped = Promise.withResolvers<void>();
+		const timeout = Promise.withResolvers<void>();
+		const signal = this.#stopController.signal;
+		const onStop = (): void => stopped.resolve();
+		if (!this.#running(runEpoch) || signal.aborted) onStop();
+		else signal.addEventListener("abort", onStop, { once: true });
+		const timer = setTimeout(() => timeout.resolve(), ATTACH_CONNECT_TIMEOUT_MS);
+		timer.unref?.();
+		try {
+			const outcome = await Promise.race([
+				connection.then(client => ({ kind: "client" as const, client })),
+				stopped.promise.then(() => ({ kind: "stopped" as const })),
+				timeout.promise.then(() => ({ kind: "timeout" as const })),
+			]);
+			if (outcome.kind === "client") return outcome.client;
+			if (transport) void transport.close().catch(() => undefined);
+			void connection.then(client => client.close().catch(() => undefined)).catch(() => undefined);
+			if (outcome.kind === "stopped") return undefined;
+			throw new SessionRouterError("pre_send", "SDK session attachment connection timed out.");
+		} finally {
+			clearTimeout(timer);
+			signal.removeEventListener("abort", onStop);
+		}
 	}
 
 	async #attach(
@@ -773,14 +829,9 @@ export class SessionRouter {
 				this.#recoveredFrames.delete(indexed.sessionId);
 			}
 		}
-		const client: SessionRouterClient = this.#deps.createClient
-			? await this.#deps.createClient({
-					sessionId: indexed.sessionId,
-					generation: indexed.endpointGeneration,
-					pid: indexed.pid,
-					endpointMtimeMs: indexed.endpointMtimeMs,
-				})
-			: await connectAttachedSession(endpoint);
+		const client = await this.#createAttachedClient(indexed, endpoint, runEpoch);
+		if (!client) return false;
+
 		if (!this.#running(runEpoch)) {
 			await client.close().catch(() => undefined);
 			return false;
@@ -905,50 +956,23 @@ export class SessionRouter {
 			throw error;
 		}
 		if (deferPublication) return true;
-		const publicationStillCurrent = this.#sessions.get(indexed.sessionId) === attached;
-		if (!this.#running(runEpoch) || !publicationStillCurrent) {
-			if (publicationStillCurrent) this.#sessions.delete(indexed.sessionId);
-			attached.dispose();
-			await attached.client.close().catch(() => undefined);
-			if (publicationStillCurrent)
-				try {
-					await this.#deps.onSessionRemoved?.(capability);
-				} catch {
-					// Router authority is already revoked; provider cleanup remains best effort.
-				}
-			return false;
-		}
-		if (!skipReplay) attached.barrier.held ??= [];
-		attached.published = true;
-		attached.publication.resolve();
-		attached.initializingPublication = true;
-		try {
-			await this.#deps.onAttachmentReady?.(capability);
-		} catch (error) {
-			const readyStillCurrent = this.#sessions.get(indexed.sessionId) === attached;
-			attached.published = false;
-			if (readyStillCurrent) this.#sessions.delete(indexed.sessionId);
-			attached.dispose();
-			await attached.client.close().catch(() => undefined);
-			if (readyStillCurrent)
-				try {
-					await this.#deps.onSessionRemoved?.(capability);
-				} catch {
-					// Ready publication failed closed; provider cleanup remains best effort.
-				}
-			throw error;
-		} finally {
-			attached.initializingPublication = false;
-		}
-		if (skipReplay) return true;
-		if (!(await this.#deliverRecoveredFrames(attached))) return false;
-		await this.#replayAttachment(attached, attached.cursor.seq);
-		return true;
+		return await this.#publishAttachment(attached, skipReplay);
 	}
 
 	async #publishAttachment(attached: AttachedSession, skipReplay: boolean): Promise<boolean> {
 		if (attached.published) return this.#attachmentPublished(attached);
 		if (!this.#attachmentLive(attached)) return false;
+		const endpoint = await this.#readEndpoint(attached.indexed).catch(() => null);
+		if (!this.#attachmentLive(attached)) return false;
+		if (
+			!endpoint ||
+			endpoint.url !== attached.endpoint.url ||
+			endpoint.token !== attached.endpoint.token ||
+			endpoint.pid !== attached.pid
+		) {
+			await this.#retireAttachment(attached, endpoint ? "replaced_same_generation" : undefined);
+			return false;
+		}
 		if (!skipReplay) attached.barrier.held ??= [];
 		attached.published = true;
 		attached.publication.resolve();
@@ -1324,10 +1348,6 @@ export class SessionRouter {
 			if (attached.barrier.held === held) attached.barrier.held = undefined;
 		}
 	}
-}
-
-async function connectAttachedSession(endpoint: SdkSessionEndpoint): Promise<SessionRouterClient> {
-	return await SdkClient.connect(endpoint.url, endpoint.token, { ...ACP_SESSION_RECONNECT });
 }
 
 async function connectPreparedSession(endpoint: {

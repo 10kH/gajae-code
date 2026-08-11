@@ -255,6 +255,76 @@ describe("SessionRouter dispatch authority", () => {
 		}
 	});
 
+	test("attaches a healthy session while another endpoint connection never settles", async () => {
+		const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-concurrent-"));
+		tempDirs.push(repo);
+		const agentDir = path.join(repo, ".gjc", "agent");
+		const stateRoot = path.join(repo, ".gjc", "state");
+		const endpointDir = path.join(stateRoot, "sdk");
+		fs.mkdirSync(endpointDir, { recursive: true });
+		const indexed = [
+			{ sessionId: "router-hung", url: "ws://hung.test", token: "hung-secret" },
+			{ sessionId: "router-healthy", url: "ws://healthy.test", token: "healthy-secret" },
+		] as const;
+		const endpointMtimeMs = new Map<string, number>();
+		for (const session of indexed) {
+			const endpointFile = path.join(endpointDir, `${session.sessionId}.json`);
+			fs.writeFileSync(endpointFile, `${JSON.stringify({ ...session, pid: 42 })}\n`);
+			endpointMtimeMs.set(session.sessionId, fs.statSync(endpointFile).mtimeMs);
+		}
+		const index = {
+			open: async () => {},
+			refresh: async () => {},
+			listSessions: () => ({
+				indexSeq: 1,
+				sessions: indexed.map(session => ({
+					sessionId: session.sessionId,
+					locator: { repo, stateRoot },
+					endpointGeneration: 1,
+					pid: 42,
+					endpointMtimeMs: endpointMtimeMs.get(session.sessionId),
+					live: true,
+					indexSeq: 1,
+				})),
+				warnings: [],
+			}),
+		} as unknown as SessionIndex;
+		const neverSettling = Promise.withResolvers<SessionRouterClient>();
+		const healthyPublished = Promise.withResolvers<void>();
+		const router = new SessionRouter({
+			agentDir,
+			deps: {
+				createIndex: () => index,
+				createClient: async authority => {
+					if (authority.sessionId === "router-hung") return await neverSettling.promise;
+					return {
+						onFrame: () => () => {},
+						request: async () => ({ events: [] }),
+						close: async () => {},
+						send: () => {},
+					};
+				},
+				onAttachmentReady: attachment => {
+					if (attachment.sessionId === "router-healthy") healthyPublished.resolve();
+				},
+				setInterval: (() => 0) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as unknown as typeof clearInterval,
+			},
+		});
+		const starting = router.start();
+		try {
+			const attached = await Promise.race([
+				healthyPublished.promise.then(() => true),
+				Bun.sleep(250).then(() => false),
+			]);
+			expect(attached).toBe(true);
+			expect(router.attachment("router-healthy")?.isCurrent()).toBe(true);
+		} finally {
+			await router.stop();
+			await starting;
+		}
+	});
+
 	test("revokes attachment authority when provider publication rejects", async () => {
 		let removed: SessionAttachment | undefined;
 		const fixture = await routerFixture({
@@ -784,6 +854,44 @@ describe("SessionRouter dispatch authority", () => {
 			});
 			expect(fixture.clients).toHaveLength(1);
 			expect(fixture.clients[0]?.requests).toEqual([]);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("does not publish an attachment when its endpoint rotates after the client connects", async () => {
+		const preservedTimestamp = new Date(1_700_000_000_000);
+		let readyCount = 0;
+		let fixture!: RouterFixture;
+		fixture = await routerFixture({
+			start: false,
+			onClientCreated: () => {
+				fs.writeFileSync(
+					fixture.endpointFile,
+					JSON.stringify({
+						sessionId: fixture.sessionId,
+						url: "ws://router.test",
+						token: "successor",
+						pid: 42,
+					}),
+				);
+				fs.utimesSync(fixture.endpointFile, preservedTimestamp, preservedTimestamp);
+				expect(fs.statSync(fixture.endpointFile).mtimeMs).toBe(fixture.authority.endpointMtimeMs);
+			},
+			onAttachmentReady: () => {
+				readyCount += 1;
+			},
+		});
+		fs.utimesSync(fixture.endpointFile, preservedTimestamp, preservedTimestamp);
+		fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
+		try {
+			await fixture.router.start();
+			expect(fixture.clients).toHaveLength(1);
+			expect(readyCount).toBe(0);
+			expect(fixture.attachments).toHaveLength(1);
+			expect(fixture.attachments[0]?.isCurrent()).toBe(false);
+			expect(fixture.clients[0]?.requests).toEqual([]);
+			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
 		} finally {
 			await fixture.router.stop();
 		}
