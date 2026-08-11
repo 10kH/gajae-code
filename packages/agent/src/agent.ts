@@ -1207,16 +1207,28 @@ export class Agent {
 		this.#steeringQueue = [];
 	}
 
-	/** Remove queued steering+follow-up messages matching `predicate`, preserving order of the rest. */
-	removeQueuedMessages(predicate: (message: AgentMessage) => boolean): {
+	/**
+	 * Remove queued steering/follow-up messages matching `predicate`, preserving
+	 * order of the rest. `scope` restricts the removal to one queue — the
+	 * terminal-abort steering purge must not wipe the follow-up queue, which
+	 * the owned-completion resume policy preserves.
+	 */
+	removeQueuedMessages(
+		predicate: (message: AgentMessage) => boolean,
+		scope: "both" | "steering" | "followUp" = "both",
+	): {
 		steering: number;
 		followUp: number;
 		total: number;
 	} {
 		const beforeSteering = this.#steeringQueue.length;
 		const beforeFollowUp = this.#followUpQueue.length;
-		this.#steeringQueue = this.#steeringQueue.filter(m => !predicate(m));
-		this.#followUpQueue = this.#followUpQueue.filter(m => !predicate(m));
+		if (scope !== "followUp") {
+			this.#steeringQueue = this.#steeringQueue.filter(m => !predicate(m));
+		}
+		if (scope !== "steering") {
+			this.#followUpQueue = this.#followUpQueue.filter(m => !predicate(m));
+		}
 		const steering = beforeSteering - this.#steeringQueue.length;
 		const followUp = beforeFollowUp - this.#followUpQueue.length;
 		return { steering, followUp, total: steering + followUp };

@@ -582,6 +582,79 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		expect(session.agent.hasQueuedSteering()).toBe(false);
 	}, 20_000);
 
+	it("terminal abort keeps each abort's steering snapshot scoped to its own admission", async () => {
+		// Review thread P1: overlapping aborts of the same turn must each purge
+		// with their OWN admission's snapshot — a later admission capturing a
+		// higher sequence must not overwrite the earlier admission's snapshot
+		// and purge an already-accepted steer.
+		scriptedResponses = [bashCall("sleep 30", "call_hold_turn"), stopReply("steer answered")];
+		const promptPromise = session.prompt("hold the turn").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
+		const handle = session.agent.activeResourceRunId;
+		// Settle the hold turn's abort first: the loop's teardown is done, so a
+		// steer queued afterwards stays in the queue (the terminal fence blocks
+		// any idle auto-continue from draining it).
+		await session.abortPromptAndWait(handle ?? "run", { graceMs: 2_000, terminal: { scope: "turn" } });
+		// Abort A admitted: captures the snapshot (sequence 0).
+		session.captureTerminalAbortSteeringSnapshot();
+		// A client steer is accepted at sequence 1 while A awaits its durable
+		// transaction.
+		await session.sendUserMessage("accepted steer", { deliverAs: "steer" });
+		// Abort B admitted (same turn, distinct admission): captures sequence 1.
+		session.captureTerminalAbortSteeringSnapshot();
+		// A settles: its purge uses A's OWN snapshot (0) and preserves the
+		// already-accepted steer.
+		await session.abortPromptAndWait(handle ?? "run", {
+			graceMs: 2_000,
+			terminal: { scope: "turn" },
+		});
+		expect(session.agent.hasQueuedSteering()).toBe(true);
+		// B settles with its own snapshot (1): the pre-B steer is an
+		// aborted-attempt continuation and is blocked.
+		await session.abortPromptAndWait(handle ?? "run", {
+			graceMs: 2_000,
+			terminal: { scope: "turn" },
+		});
+		expect(session.agent.hasQueuedSteering()).toBe(false);
+		await promptPromise;
+	}, 30_000);
+	it("terminal abort keeps the steering display aligned with the purge decisions", async () => {
+		// Review thread P2: the display list must mirror which executable
+		// messages were actually purged — preserved post-snapshot external
+		// steers stay visible and purged internal steers disappear, so the
+		// positional editing APIs never remove a different preserved steer.
+		scriptedResponses = [bashCall("sleep 30", "call_hold_turn"), stopReply("steer answered")];
+		const promptPromise = session.prompt("hold the turn").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
+		const handle = session.agent.activeResourceRunId;
+		// Settle the hold turn's abort first so the queue state is stable (no
+		// live loop to poll, and the terminal fence blocks idle auto-continues).
+		await session.abortPromptAndWait(handle ?? "run", { graceMs: 2_000, terminal: { scope: "turn" } });
+		// An internal steer queued just before the abort wins: purged with the
+		// aborted turn's other continuations.
+		await session.steer("stale internal steer");
+		// A client steer admitted after the abort admission snapshot: preserved.
+		session.captureTerminalAbortSteeringSnapshot();
+		await session.sendUserMessage("client steer", { deliverAs: "steer" });
+		await session.abortPromptAndWait(handle ?? "run", {
+			graceMs: 2_000,
+			terminal: { scope: "turn" },
+		});
+		const queued = session.getQueuedMessages();
+		expect(queued.steering).toEqual(["client steer"]);
+		expect(session.agent.snapshotSteering()).toHaveLength(1);
+		// Positional editing stays aligned with the executable queue: removing
+		// the displayed entry removes the preserved steer (not a stale internal
+		// entry at the same index).
+		const [entry] = session.getQueuedMessageEntries();
+		expect(entry?.mode).toBe("steer");
+		const removed = session.removeQueuedMessageForEditing(entry?.id ?? "");
+		expect(removed).toBe("client steer");
+		expect(session.agent.hasQueuedSteering()).toBe(false);
+		expect(session.getQueuedMessages().steering).toHaveLength(0);
+		await promptPromise;
+	}, 30_000);
+
 	it("terminal abort rearms an external-only follow-up past the terminal fence as a fresh turn", async () => {
 		// Reproduction of the review-thread P1 scenario: when a terminal abort
 		// leaves ONLY an independently requested external follow-up queued (no
