@@ -273,6 +273,8 @@ const RETRYABLE_BROKER_ERRORS = new Set([
 	"startup_admission_timeout",
 ]);
 
+const MAX_SESSION_LIST_PAGES = 10_000;
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -443,6 +445,17 @@ function listResult(value: unknown): SessionLifecycleListResult | undefined {
 	return { indexSeq, sessions, warnings, ...(savedSession ? { savedSession } : {}) };
 }
 
+function listPageResult(
+	value: unknown,
+): { readonly result: SessionLifecycleListResult; readonly continuationCursor?: string } | undefined {
+	const result = listResult(value);
+	if (!result || !isRecord(value)) return undefined;
+	const continuationCursor = value.continuationCursor;
+	if (continuationCursor !== undefined && (typeof continuationCursor !== "string" || continuationCursor.length === 0))
+		return undefined;
+	return { result, ...(continuationCursor === undefined ? {} : { continuationCursor }) };
+}
+
 function brokerError(value: unknown): { code: string; message: string } | undefined {
 	if (!isRecord(value) || value.ok !== false || !isRecord(value.error)) return undefined;
 	if (typeof value.error.code !== "string" || typeof value.error.message !== "string") return undefined;
@@ -581,31 +594,61 @@ export class SessionLifecycleService {
 		const target = request.target ?? {};
 		if (!validTarget(target))
 			return failure("session.list", "terminal", "invalid_request", "target must be an object");
-		let response: unknown;
-		try {
-			response = await this.#client.global(
-				"session.list",
-				{ ...target },
-				{
-					...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
-				},
-			);
-		} catch (thrown) {
-			const error = brokerError(thrown) ?? brokerErrorFromThrown(thrown);
-			return error
-				? failure("session.list", certaintyForThrownError(error), error.code, error.message)
-				: failure("session.list", "retryable", "unavailable", "lifecycle broker request was unavailable");
-		}
-		const error = brokerError(response);
-		if (error) return failure("session.list", certaintyForBrokerCode(error.code), error.code, error.message);
-		const parsed = isRecord(response) && response.ok === true ? listResult(brokerSuccess(response)) : undefined;
-		return parsed
-			? { ok: true, operation: "session.list", result: parsed }
-			: failure(
+		const sessions: SessionLifecycleListEntry[] = [];
+		let indexSeq = 0;
+		let warnings: readonly string[] = [];
+		let savedSession: { readonly id: string; readonly path: string } | undefined;
+		let cursor: string | undefined;
+		const seenCursors = new Set<string>();
+		for (let pageCount = 0; pageCount < MAX_SESSION_LIST_PAGES; pageCount++) {
+			let response: unknown;
+			try {
+				response = await this.#client.global(
+					"session.list",
+					{ ...target, ...(cursor === undefined ? {} : { cursor }) },
+					{
+						...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
+					},
+				);
+			} catch (thrown) {
+				const error = brokerError(thrown) ?? brokerErrorFromThrown(thrown);
+				return error
+					? failure("session.list", certaintyForThrownError(error), error.code, error.message)
+					: failure("session.list", "retryable", "unavailable", "lifecycle broker request was unavailable");
+			}
+			const error = brokerError(response);
+			if (error) return failure("session.list", certaintyForBrokerCode(error.code), error.code, error.message);
+			const parsed =
+				isRecord(response) && response.ok === true ? listPageResult(brokerSuccess(response)) : undefined;
+			if (!parsed)
+				return failure(
 					"session.list",
 					"uncertain",
 					"malformed_response",
 					"lifecycle broker returned a malformed list result",
 				);
+			if (pageCount === 0) {
+				indexSeq = parsed.result.indexSeq;
+				warnings = parsed.result.warnings;
+				savedSession = parsed.result.savedSession;
+			}
+			sessions.push(...parsed.result.sessions);
+			if (parsed.continuationCursor === undefined)
+				return {
+					ok: true,
+					operation: "session.list",
+					result: { indexSeq, sessions, warnings, ...(savedSession === undefined ? {} : { savedSession }) },
+				};
+			if (seenCursors.has(parsed.continuationCursor))
+				return failure(
+					"session.list",
+					"uncertain",
+					"protocol_error",
+					"session.list returned a repeated continuation cursor",
+				);
+			seenCursors.add(parsed.continuationCursor);
+			cursor = parsed.continuationCursor;
+		}
+		return failure("session.list", "uncertain", "protocol_error", "session.list exceeded the page budget");
 	}
 }

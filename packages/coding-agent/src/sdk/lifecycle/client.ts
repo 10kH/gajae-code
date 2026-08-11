@@ -48,6 +48,7 @@ function invalidExternalCreate(message: string): SessionCreateOutcome {
 	};
 }
 const RETRYABLE_PLAIN_DIR_ERRORS = new Set(["EAGAIN", "EINTR", "EMFILE", "ENFILE", "ENOSPC", "EDQUOT"]);
+const COMPLETE_RECENT_SESSION_LIMIT = Number.MAX_SAFE_INTEGER;
 
 function plainDirCreateFailure(error: unknown): SessionCreateOutcome {
 	const code = isRecord(error) && typeof error.code === "string" ? error.code : "filesystem_error";
@@ -186,7 +187,7 @@ export class AgentDirSessionLifecycleService extends SessionLifecycleService {
 		const recent = await this.listRecent({
 			cwd: requestedCwd ?? this.#agentDir,
 			allWorkspaces: requestedCwd === undefined,
-			limit: 1_000,
+			limit: COMPLETE_RECENT_SESSION_LIMIT,
 			includeInternal: false,
 		});
 		if (recent.kind === "error") return { kind: "unavailable", message: recent.message };

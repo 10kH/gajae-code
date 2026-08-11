@@ -26,6 +26,7 @@ class FakeLifecycleClient implements SessionLifecycleClient {
 	readonly calls: Call[] = [];
 	response: unknown = { ok: true, result: { sessionId: "session-1" } };
 	failure: Error | undefined;
+	responses: unknown[] = [];
 
 	async global(
 		operation: SessionLifecycleOperation,
@@ -34,7 +35,7 @@ class FakeLifecycleClient implements SessionLifecycleClient {
 	): Promise<unknown> {
 		this.calls.push({ operation, input, options });
 		if (this.failure) throw this.failure;
-		return this.response;
+		return this.responses.length > 0 ? this.responses.shift() : this.response;
 	}
 }
 
@@ -130,6 +131,83 @@ describe("SessionLifecycleService", () => {
 			{},
 		]);
 		expect(client.calls.at(-1)?.options).not.toHaveProperty("idempotencyKey");
+	});
+	it("aggregates every Broker session.list page", async () => {
+		const { service, client } = serviceWith();
+		client.responses.push(
+			{
+				ok: true,
+				result: {
+					indexSeq: 7,
+					sessions: [{ sessionId: "first", live: true }],
+					warnings: ["first-page-warning"],
+					savedSession: { id: "saved", path: "/saved.jsonl" },
+					continuationCursor: "page-2",
+				},
+			},
+			{
+				ok: true,
+				result: {
+					indexSeq: 7,
+					sessions: [{ sessionId: "second", locator: { repo: "/workspace" } }],
+					warnings: ["second-page-warning"],
+				},
+			},
+		);
+
+		const result = await service.list({ actor, capability: "session.list" });
+
+		expect(result).toEqual({
+			ok: true,
+			operation: "session.list",
+			result: {
+				indexSeq: 7,
+				sessions: [
+					{ sessionId: "first", live: true },
+					{ sessionId: "second", repo: "/workspace" },
+				],
+				warnings: ["first-page-warning"],
+				savedSession: { id: "saved", path: "/saved.jsonl" },
+			},
+		});
+		expect(client.calls).toEqual([
+			{ operation: "session.list", input: {}, options: {} },
+			{ operation: "session.list", input: { cursor: "page-2" }, options: {} },
+		]);
+	});
+	it("fails safely when a Broker list cursor repeats", async () => {
+		const { service, client } = serviceWith();
+		client.responses.push(
+			{
+				ok: true,
+				result: {
+					indexSeq: 7,
+					sessions: [{ sessionId: "first" }],
+					warnings: [],
+					continuationCursor: "repeat",
+				},
+			},
+			{
+				ok: true,
+				result: {
+					indexSeq: 7,
+					sessions: [{ sessionId: "second" }],
+					warnings: [],
+					continuationCursor: "repeat",
+				},
+			},
+		);
+
+		expect(await service.list({ actor, capability: "session.list" })).toEqual({
+			ok: false,
+			operation: "session.list",
+			certainty: "uncertain",
+			error: {
+				code: "protocol_error",
+				message: "session.list returned a repeated continuation cursor",
+			},
+		});
+		expect(client.calls).toHaveLength(2);
 	});
 
 	it("redacts endpoint credentials from create and resume results", async () => {
@@ -320,6 +398,106 @@ describe("SessionLifecycleService", () => {
 			expect(unsafePrefix).toMatchObject({ kind: "unavailable" });
 			expect(listSpy).not.toHaveBeenCalled();
 		} finally {
+			listSpy.mockRestore();
+		}
+	});
+	it("resolves external IDs and prefixes against the complete recent-session scan", async () => {
+		const service = new AgentDirSessionLifecycleService("/agent");
+		const recentEntries = Array.from({ length: 1_000 }, (_, index) => ({
+			sessionId: `recent-${index}`,
+			path: "/recent",
+			sessionStateFile: `/recent/${index}.jsonl`,
+			mtimeMs: index,
+		}));
+		const olderExact = {
+			sessionId: "older-exact",
+			path: "/workspace",
+			sessionStateFile: "/workspace/older-exact.jsonl",
+			mtimeMs: -1,
+		};
+		const listSpy = spyOn(service, "listRecent");
+		const resumeSpy = spyOn(service, "resume").mockResolvedValue({
+			ok: true,
+			operation: "session.resume",
+			result: { sessionId: olderExact.sessionId },
+		});
+		try {
+			listSpy.mockImplementation(async input => ({
+				kind: "complete",
+				entries: [...recentEntries, olderExact].slice(0, input.limit ?? 20),
+				warnings: [],
+			}));
+			const exact = await service.resumeExternal({
+				actor,
+				capability: "session.resume",
+				requestKey: "older-exact",
+				target: { sessionIdOrPrefix: olderExact.sessionId },
+			});
+
+			expect(exact).toEqual({
+				kind: "result",
+				outcome: { ok: true, operation: "session.resume", result: { sessionId: olderExact.sessionId } },
+			});
+			expect(listSpy).toHaveBeenLastCalledWith({
+				cwd: "/agent",
+				allWorkspaces: true,
+				limit: Number.MAX_SAFE_INTEGER,
+				includeInternal: false,
+			});
+			expect(resumeSpy).toHaveBeenCalledWith(
+				expect.objectContaining({
+					target: {
+						sessionId: olderExact.sessionId,
+						cwd: "/workspace",
+						stateRoot: "/workspace/.gjc/state",
+						sessionPath: olderExact.sessionStateFile,
+					},
+				}),
+			);
+
+			const prefixEntries = [
+				...recentEntries,
+				{
+					sessionId: "colliding-older-a",
+					path: "/workspace/a",
+					sessionStateFile: "/workspace/a/colliding-older-a.jsonl",
+					mtimeMs: -2,
+				},
+				{
+					sessionId: "colliding-older-b",
+					path: "/workspace/b",
+					sessionStateFile: "/workspace/b/colliding-older-b.jsonl",
+					mtimeMs: -3,
+				},
+			];
+			listSpy.mockImplementation(async input => ({
+				kind: "complete",
+				entries: prefixEntries.slice(0, input.limit ?? 20),
+				warnings: [],
+			}));
+			const ambiguous = await service.resumeExternal({
+				actor,
+				capability: "session.resume",
+				requestKey: "colliding-prefix",
+				target: { sessionIdOrPrefix: "colliding" },
+			});
+
+			expect(ambiguous).toEqual({
+				kind: "ambiguous",
+				candidates: [
+					{ sessionId: "colliding-older-a", path: "/workspace/a" },
+					{ sessionId: "colliding-older-b", path: "/workspace/b" },
+				],
+			});
+			expect(listSpy).toHaveBeenLastCalledWith({
+				cwd: "/agent",
+				allWorkspaces: true,
+				limit: Number.MAX_SAFE_INTEGER,
+				includeInternal: false,
+			});
+			expect(resumeSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			resumeSpy.mockRestore();
 			listSpy.mockRestore();
 		}
 	});

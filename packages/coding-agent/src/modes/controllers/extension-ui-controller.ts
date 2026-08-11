@@ -607,7 +607,10 @@ export class ExtensionUiController {
 			waitForIdle: () => this.ctx.session.agent.waitForIdle(),
 			newSession: async () => prohibitBrokerLifecycleOperation("session.new"),
 			branch: async () => prohibitBrokerLifecycleOperation("session.branch"),
-			navigateTree: async () => prohibitBrokerLifecycleOperation("session.branch"),
+			navigateTree: async (targetId, navOptions) => {
+				const result = await this.ctx.session.navigateTree(targetId, { summarize: navOptions?.summarize });
+				return { cancelled: result.cancelled };
+			},
 			switchSession: async () => prohibitBrokerLifecycleOperation("session.switch"),
 			reload: async () => {
 				const previousSessionId = this.ctx.sessionManager.getSessionId();
@@ -828,7 +831,10 @@ export class ExtensionUiController {
 			waitForIdle: () => this.ctx.session.agent.waitForIdle(),
 			newSession: async () => prohibitBrokerLifecycleOperation("session.new"),
 			branch: async () => prohibitBrokerLifecycleOperation("session.branch"),
-			navigateTree: async () => prohibitBrokerLifecycleOperation("session.branch"),
+			navigateTree: async (targetId, navOptions) => {
+				const result = await this.ctx.session.navigateTree(targetId, { summarize: navOptions?.summarize });
+				return { cancelled: result.cancelled };
+			},
 			switchSession: async () => prohibitBrokerLifecycleOperation("session.switch"),
 			reload: async () => {
 				if (this.ctx.isBackgrounded) {

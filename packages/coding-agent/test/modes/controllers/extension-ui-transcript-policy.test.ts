@@ -61,6 +61,7 @@ function createFixture(initialSessionId = "session-a"): Fixture {
 			isStreaming: false,
 			sendCustomMessage: vi.fn(async () => undefined),
 			sendUserMessage: vi.fn(async () => undefined),
+			navigateTree: vi.fn(async () => ({ cancelled: false })),
 			switchSession: vi.fn(async () => {
 				sessionId = nextSessionId;
 				return true;
@@ -130,6 +131,23 @@ describe("ExtensionUiController transcript rebuild policy", () => {
 		expect(fixture.ctx.session.switchSession).not.toHaveBeenCalled();
 		expect(fixture.resetIrcSidebarSession).not.toHaveBeenCalled();
 		expect(fixture.rebuildInitialMessages).not.toHaveBeenCalled();
+	});
+	it("keeps extension tree navigation local in both interactive initialization paths", async () => {
+		const fixture = createFixture();
+		await fixture.controller.initHooksAndCustomTools();
+
+		await expect(fixture.getCommandActions().navigateTree("entry-from-hooks", { summarize: true })).resolves.toEqual({
+			cancelled: false,
+		});
+		expect(fixture.ctx.session.navigateTree).toHaveBeenLastCalledWith("entry-from-hooks", { summarize: true });
+
+		fixture.controller.initializeHookRunner({} as ExtensionUIContext, false);
+		await expect(
+			fixture.getCommandActions().navigateTree("entry-from-runner", { summarize: false }),
+		).resolves.toEqual({
+			cancelled: false,
+		});
+		expect(fixture.ctx.session.navigateTree).toHaveBeenLastCalledWith("entry-from-runner", { summarize: false });
 	});
 	it("resets identity when hook-runner reload replaces the logical session", async () => {
 		const fixture = createFixture();
