@@ -240,6 +240,57 @@ describe("SDK daemon session CLI", () => {
 		expect(requests).toEqual([{}, { cursor: "page-2" }]);
 	}, 60_000);
 
+	it("rejects repeated daemon CLI session.list cursors without partial output", async () => {
+		const originalHandleRequest = broker.handleRequest.bind(broker);
+		const requests: Array<Record<string, unknown>> = [];
+		broker.handleRequest = async (operation, input, idempotencyKey) => {
+			if (operation === "session.list") {
+				requests.push(input);
+				return {
+					ok: true,
+					result: { sessions: [{ sessionId: "page" }], continuationCursor: "repeat" },
+				};
+			}
+			return await originalHandleRequest(operation, input, idempotencyKey);
+		};
+
+		const result = await runCli(root, agentDir, ["list"]);
+
+		expect(result.exitCode).toBe(1);
+		const output = JSON.parse(result.stdout);
+		expect(output).toMatchObject({
+			ok: false,
+			error: { code: "protocol_error", message: "session.list returned a repeated continuation cursor." },
+		});
+		expect(output).not.toHaveProperty("result");
+		expect(requests).toEqual([{}, { cursor: "repeat" }]);
+	}, 60_000);
+
+	it("rejects malformed daemon CLI session.list continuation pages without partial output", async () => {
+		const originalHandleRequest = broker.handleRequest.bind(broker);
+		const requests: Array<Record<string, unknown>> = [];
+		broker.handleRequest = async (operation, input, idempotencyKey) => {
+			if (operation === "session.list") {
+				requests.push(input);
+				return input.cursor === undefined
+					? { ok: true, result: { sessions: [{ sessionId: "page-one" }], continuationCursor: "page-2" } }
+					: { ok: true, result: { sessions: "not-an-array" } };
+			}
+			return await originalHandleRequest(operation, input, idempotencyKey);
+		};
+
+		const result = await runCli(root, agentDir, ["list"]);
+
+		expect(result.exitCode).toBe(1);
+		const output = JSON.parse(result.stdout);
+		expect(output).toMatchObject({
+			ok: false,
+			error: { code: "protocol_error", message: "session.list returned a malformed page." },
+		});
+		expect(output).not.toHaveProperty("result");
+		expect(requests).toEqual([{}, { cursor: "page-2" }]);
+	}, 60_000);
+
 	it("selects the broker specified by --agent-dir over the ambient agent directory", async () => {
 		const alternateAgentDir = path.join(root, "alternate-agent");
 		const alternateBroker = new Broker({ agentDir: alternateAgentDir, packageGeneration: "test" });

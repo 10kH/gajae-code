@@ -210,8 +210,41 @@ describe("SessionLifecycleService", () => {
 		expect(client.calls).toHaveLength(2);
 	});
 
+	it("rejects malformed session.list continuation pages without returning partial data", async () => {
+		const { service, client } = serviceWith();
+		client.responses.push(
+			{
+				ok: true,
+				result: { indexSeq: 7, sessions: [{ sessionId: "first" }], warnings: [], continuationCursor: "page-2" },
+			},
+			{ ok: true, result: { indexSeq: 7, sessions: "not-an-array", warnings: [] } },
+		);
+
+		const outcome = await service.list({ actor, capability: "session.list" });
+
+		expect(outcome).toMatchObject({ ok: false, certainty: "uncertain", error: { code: "malformed_response" } });
+		expect(outcome).not.toHaveProperty("result");
+		expect(client.calls.map(call => call.input)).toEqual([{}, { cursor: "page-2" }]);
+	});
+
+	it("rejects missing and malformed session.list metadata", async () => {
+		for (const result of [
+			{ sessions: [], warnings: [] },
+			{ indexSeq: 7, sessions: [] },
+			{ indexSeq: -1, sessions: [], warnings: [] },
+			{ indexSeq: 7, sessions: [], warnings: ["valid", 1] },
+		]) {
+			const { service } = serviceWith({ ok: true, result });
+			expect(await service.list({ actor, capability: "session.list" })).toMatchObject({
+				ok: false,
+				certainty: "uncertain",
+				error: { code: "malformed_response" },
+			});
+		}
+	});
+
 	it("redacts endpoint credentials from create and resume results", async () => {
-		const { service } = serviceWith({
+		const { service, client } = serviceWith({
 			ok: true,
 			result: {
 				sessionId: "created",
@@ -226,7 +259,15 @@ describe("SessionLifecycleService", () => {
 			operation: "session.create",
 			result: { sessionId: "created", cwd: "/repo" },
 		});
-
+		client.response = {
+			ok: true,
+			result: {
+				sessionId: "resumed",
+				cwd: "/repo",
+				endpoint: { url: "ws://127.0.0.1:9999", token: "secret" },
+				token: "top-level-secret",
+			},
+		};
 		const resumed = await service.resume({
 			actor,
 			capability: "session.resume",
@@ -236,8 +277,68 @@ describe("SessionLifecycleService", () => {
 		expect(resumed).toEqual({
 			ok: true,
 			operation: "session.resume",
-			result: { sessionId: "created", cwd: "/repo" },
+			result: { sessionId: "resumed", cwd: "/repo" },
 		});
+	});
+
+	it("rejects empty session results for targeted lifecycle successes", async () => {
+		const { service, client } = serviceWith();
+		client.responses.push({ ok: true, result: {} }, { ok: true, result: {} }, { ok: true, result: {} });
+		const outcomes = [
+			await service.resume({
+				actor,
+				capability: "session.resume",
+				requestKey: "empty-resume",
+				target: { sessionId: "target-session" },
+			}),
+			await service.close({
+				actor,
+				capability: "session.close",
+				requestKey: "empty-close",
+				target: { sessionId: "target-session" },
+			}),
+			await service.delete({
+				actor,
+				capability: "session.delete",
+				requestKey: "empty-delete",
+				target: { sessionId: "target-session" },
+			}),
+		];
+		for (const outcome of outcomes)
+			expect(outcome).toMatchObject({ ok: false, certainty: "uncertain", error: { code: "malformed_response" } });
+		expect(client.calls).toHaveLength(3);
+	});
+
+	it("rejects mismatched session identities for targeted lifecycle successes", async () => {
+		const { service, client } = serviceWith();
+		client.responses.push(
+			{ ok: true, result: { sessionId: "other-session" } },
+			{ ok: true, result: { sessionId: "other-session" } },
+			{ ok: true, result: { sessionId: "other-session" } },
+		);
+		const outcomes = [
+			await service.resume({
+				actor,
+				capability: "session.resume",
+				requestKey: "mismatch-resume",
+				target: { sessionId: "target-session" },
+			}),
+			await service.close({
+				actor,
+				capability: "session.close",
+				requestKey: "mismatch-close",
+				target: { sessionId: "target-session" },
+			}),
+			await service.delete({
+				actor,
+				capability: "session.delete",
+				requestKey: "mismatch-delete",
+				target: { sessionId: "target-session" },
+			}),
+		];
+		for (const outcome of outcomes)
+			expect(outcome).toMatchObject({ ok: false, certainty: "uncertain", error: { code: "malformed_response" } });
+		expect(client.calls).toHaveLength(3);
 	});
 
 	it("maps Broker certainty codes and treats malformed responses as uncertain", async () => {

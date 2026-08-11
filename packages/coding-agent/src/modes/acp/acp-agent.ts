@@ -53,6 +53,7 @@ import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-namespace";
 import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
 import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
+import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
 import {
 	buildToolCallStartUpdate,
 	mapAgentSessionEventToAcpSessionUpdates,
@@ -71,7 +72,6 @@ const ACP_CUSTOM_MODEL_PRESET = "__custom__";
 const THINKING_CONFIG_ID = "thinking";
 const SESSION_PAGE_SIZE = 50;
 const MAX_ACP_REPLAY_PAGES = 10_000;
-const MAX_ACP_SESSION_LIST_PAGES = 10_000;
 /** Bounded retention of settled prompt correlations so late duplicates stay closed. */
 const SETTLED_PROMPT_CORRELATION_RETENTION = 16;
 /**
@@ -193,36 +193,36 @@ async function collectAcpSessionList(
 	request: (input: JsonObject) => Promise<unknown>,
 	input: JsonObject = {},
 ): Promise<JsonObject> {
-	const aggregate: JsonObject = {};
-	const sessions: unknown[] = [];
-	let cursor: string | undefined;
-	for (let pageCount = 0; pageCount < MAX_ACP_SESSION_LIST_PAGES; pageCount++) {
-		const response = object(await request({ ...input, ...(cursor === undefined ? {} : { cursor }) }));
-		const listing = object(response?.result) ?? response;
-		if (response?.ok === false) {
-			const failure = object(response.error);
-			throw new AcpSdkAdapterError(
-				typeof failure?.code === "string" ? failure.code : "broker_error",
-				typeof failure?.message === "string" ? failure.message : "session.list failed",
-			);
-		}
-		if (listing) {
-			for (const [key, value] of Object.entries(listing)) {
+	try {
+		const pages = await traverseSessionList(
+			input,
+			async pageInput => {
+				const response = await request(pageInput);
+				const envelope = object(response);
+				if (envelope?.ok === false) {
+					const failure = object(envelope.error);
+					throw new AcpSdkAdapterError(
+						typeof failure?.code === "string" ? failure.code : "broker_error",
+						typeof failure?.message === "string" ? failure.message : "session.list failed",
+					);
+				}
+				return response;
+			},
+			response => sessionListPageFromResponse(response),
+		);
+		const aggregate: JsonObject = {};
+		const sessions: unknown[] = [];
+		for (const { page } of pages) {
+			for (const [key, value] of Object.entries(page)) {
 				if (key !== "sessions" && key !== "continuationCursor") aggregate[key] = value;
 			}
-			if (Array.isArray(listing.sessions)) sessions.push(...listing.sessions);
-			const nextCursor =
-				typeof listing.continuationCursor === "string" && listing.continuationCursor.length > 0
-					? listing.continuationCursor
-					: undefined;
-			if (nextCursor) {
-				cursor = nextCursor;
-				continue;
-			}
+			sessions.push(...page.sessions);
 		}
 		return { ...aggregate, sessions };
+	} catch (error) {
+		if (error instanceof SessionListTraversalError) throw new AcpSdkAdapterError("protocol_error", error.message);
+		throw error;
 	}
-	throw new AcpSdkAdapterError("protocol_error", "session.list exceeded the page budget.");
 }
 
 function aggregateAcpFailure(code: string, message: string, failures: unknown[]): AcpSdkAdapterError {

@@ -8,6 +8,7 @@ import type { SessionLifecycleMutationRequest, SessionLifecycleOperation } from 
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { adapterDispositionError, findOperation, type OperationKind } from "../protocol/operation-registry";
 import { type SessionAttachment, SessionRouter, SessionRouterError } from "../router";
+import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../session-list";
 
 export type SdkSessionCliAction = "list" | "control" | "query" | "global";
 
@@ -27,7 +28,6 @@ export interface SdkSessionCliArgs {
 
 type JsonRecord = Record<string, unknown>;
 const SECRET_FIELD = /(?:secret|token|password|credential|authorization|api[_-]?key)/i;
-const MAX_SESSION_LIST_PAGES = 10_000;
 
 class SdkSessionCliError extends Error {
 	constructor(
@@ -184,41 +184,37 @@ async function paginatedSessionList(
 	input: JsonRecord = {},
 	requestKey = `${DAEMON_CLI_LIFECYCLE_ACTOR.namespace}:session.list`,
 ): Promise<unknown> {
-	const aggregate: JsonRecord = {};
-	const sessions: unknown[] = [];
-	let firstResponse: JsonRecord | undefined;
-	let cursor: string | undefined;
-	for (let pageCount = 0; pageCount < MAX_SESSION_LIST_PAGES; pageCount++) {
-		const response = object(
-			await router.listBrokerSessions({ ...input, ...(cursor === undefined ? {} : { cursor }) }, requestKey),
+	try {
+		const pages = await traverseSessionList(
+			input,
+			async pageInput => {
+				const response = object(await router.listBrokerSessions(pageInput, requestKey));
+				if (response?.ok === false) {
+					const failure = object(response.error);
+					throw new SdkClientError(
+						typeof failure?.code === "string" ? failure.code : "broker_error",
+						typeof failure?.message === "string" ? failure.message : "session.list failed",
+					);
+				}
+				return response;
+			},
+			response => sessionListPageFromResponse(response),
 		);
-		firstResponse ??= response;
-		if (response?.ok === false) {
-			const failure = object(response.error);
-			throw new SdkClientError(
-				typeof failure?.code === "string" ? failure.code : "broker_error",
-				typeof failure?.message === "string" ? failure.message : "session.list failed",
-			);
-		}
-		const listing = object(response?.result) ?? response;
-		if (listing) {
-			for (const [key, value] of Object.entries(listing)) {
+		const aggregate: JsonRecord = {};
+		const sessions: unknown[] = [];
+		for (const { page } of pages) {
+			for (const [key, value] of Object.entries(page)) {
 				if (key !== "sessions" && key !== "continuationCursor") aggregate[key] = value;
 			}
-			if (Array.isArray(listing.sessions)) sessions.push(...listing.sessions);
-			const nextCursor =
-				typeof listing.continuationCursor === "string" && listing.continuationCursor.length > 0
-					? listing.continuationCursor
-					: undefined;
-			if (nextCursor) {
-				cursor = nextCursor;
-				continue;
-			}
+			sessions.push(...page.sessions);
 		}
 		const result = { ...aggregate, sessions };
-		return firstResponse && "result" in firstResponse ? { ...firstResponse, result } : result;
+		const firstResponse = pages[0]?.response;
+		return firstResponse && Object.hasOwn(firstResponse, "result") ? { ...firstResponse, result } : result;
+	} catch (error) {
+		if (error instanceof SessionListTraversalError) throw new SdkClientError("protocol_error", error.message);
+		throw error;
 	}
-	throw new SdkClientError("protocol_error", "session.list exceeded the page budget.");
 }
 
 async function runList(agentDir: string): Promise<unknown> {

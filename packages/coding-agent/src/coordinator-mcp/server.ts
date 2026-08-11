@@ -26,6 +26,7 @@ import {
 	requestPreparedSessionActivation,
 	SessionActivationError,
 } from "../sdk/session-activation";
+import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../sdk/session-list";
 import {
 	ackCodexWakeEvent,
 	bindDelegateCodexHandoff,
@@ -327,7 +328,6 @@ const MISSING_FINAL_RESPONSE_ADVISORY = "completion_missing_final_response";
 const PROMPT_ACK_TIMEOUT_REASON = "runtime_prompt_ack_timeout";
 const DEFAULT_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 10_000;
 const MAX_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 5 * 60 * 1000;
-const MAX_COORDINATOR_SESSION_LIST_PAGES = 10_000;
 const ACTIVE_TURN_STATUSES = new Set<TurnStatus>(["delivering", "active", "waiting_for_answer", "completing"]);
 const TERMINAL_TURN_STATUSES = new Set<TurnStatus>(["completed", "failed", "cancelled", "superseded"]);
 const TURN_ID_PATTERN = /^turn-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -3313,28 +3313,29 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		cwd: string,
 		input: Record<string, unknown>,
 	): Promise<Record<string, unknown>> {
-		const aggregate: Record<string, unknown> = {};
-		const sessions: unknown[] = [];
-		let cursor: string | undefined;
-		for (let pageCount = 0; pageCount < MAX_COORDINATOR_SESSION_LIST_PAGES; pageCount++) {
-			const page = brokerResult(
-				await brokerSession(cwd, "session.list", {
-					...input,
-					...(cursor === undefined ? {} : { cursor }),
-				}),
+		try {
+			const pages = await traverseSessionList(
+				input,
+				async pageInput => {
+					const response = await brokerSession(cwd, "session.list", pageInput);
+					if (asRecord(response)?.ok === false) brokerResult(response);
+					return response;
+				},
+				response => sessionListPageFromResponse(response),
 			);
-			for (const [key, value] of Object.entries(page)) {
-				if (key !== "sessions" && key !== "continuationCursor") aggregate[key] = value;
+			const aggregate: Record<string, unknown> = {};
+			const sessions: unknown[] = [];
+			for (const { page } of pages) {
+				for (const [key, value] of Object.entries(page)) {
+					if (key !== "sessions" && key !== "continuationCursor") aggregate[key] = value;
+				}
+				sessions.push(...page.sessions);
 			}
-			if (Array.isArray(page.sessions)) sessions.push(...page.sessions);
-			const nextCursor =
-				typeof page.continuationCursor === "string" && page.continuationCursor.length > 0
-					? page.continuationCursor
-					: undefined;
-			if (!nextCursor) return { ...aggregate, sessions };
-			cursor = nextCursor;
+			return { ...aggregate, sessions };
+		} catch (error) {
+			if (error instanceof SessionListTraversalError) throw new SdkClientError("protocol_error", error.message);
+			throw error;
 		}
-		throw new SdkClientError("protocol_error", "session.list exceeded the page budget.");
 	}
 
 	async function canonicalBrokerWorkspace(cwd: string): Promise<string> {

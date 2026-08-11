@@ -822,6 +822,54 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			{ operation: "session.list", input: { cwd: root, cursor: "page-2" }, idempotencyKey: undefined },
 		]);
 	});
+	it("rejects repeated coordinator session.list cursors without partial status", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const page = { sessionId: "page", locator: { repo: root }, live: true };
+		const server = await createSdkControlServer(root, controls, [], undefined, [page], undefined, undefined, {
+			globalResult: operation =>
+				operation === "session.list"
+					? { ok: true, result: { sessions: [page], continuationCursor: "repeat" } }
+					: undefined,
+		});
+
+		const status = await server.callTool("gjc_coordinator_read_status");
+
+		expect(status).toMatchObject({
+			ok: false,
+			error: { code: "protocol_error", message: "session.list returned a repeated continuation cursor." },
+		});
+		expect(status).not.toHaveProperty("sessions");
+		expect(controls).toEqual([
+			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },
+			{ operation: "session.list", input: { cwd: root, cursor: "repeat" }, idempotencyKey: undefined },
+		]);
+	});
+	it("rejects malformed coordinator session.list continuation pages without partial status", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const page = { sessionId: "page", locator: { repo: root }, live: true };
+		const server = await createSdkControlServer(root, controls, [], undefined, [page], undefined, undefined, {
+			globalResult: (operation, input) => {
+				if (operation !== "session.list") return undefined;
+				return input.cursor === undefined
+					? { ok: true, result: { sessions: [page], continuationCursor: "page-2" } }
+					: { ok: true, result: { sessions: "not-an-array" } };
+			},
+		});
+
+		const status = await server.callTool("gjc_coordinator_read_status");
+
+		expect(status).toMatchObject({
+			ok: false,
+			error: { code: "protocol_error", message: "session.list returned a malformed page." },
+		});
+		expect(status).not.toHaveProperty("sessions");
+		expect(controls).toEqual([
+			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },
+			{ operation: "session.list", input: { cwd: root, cursor: "page-2" }, idempotencyKey: undefined },
+		]);
+	});
 	it("reads bounded tail output through the SDK", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];

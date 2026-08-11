@@ -189,6 +189,47 @@ test("production ACP rejects an ok:false session.list continuation instead of re
 		abort.abort();
 	}
 });
+
+test("production ACP rejects repeated session.list cursors without returning partial sessions", async () => {
+	const fixture = await createSessionListBroker(() => ({
+		ok: true,
+		result: { sessions: [{ sessionId: "page" }], continuationCursor: "repeat" },
+	}));
+	const abort = new AbortController();
+	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, {
+		agentDir: fixture.agentDir,
+	});
+	try {
+		await expect(agent.listSessions({})).rejects.toMatchObject({
+			code: "protocol_error",
+			message: "session.list returned a repeated continuation cursor.",
+		});
+		expect(fixture.requests.map(request => request.input)).toEqual([{}, { cursor: "repeat" }]);
+	} finally {
+		abort.abort();
+	}
+});
+
+test("production ACP rejects malformed session.list continuation pages without partial sessions", async () => {
+	const fixture = await createSessionListBroker(input =>
+		input.cursor === undefined
+			? { ok: true, result: { sessions: [{ sessionId: "page-one" }], continuationCursor: "page-2" } }
+			: { ok: true, result: { sessions: "not-an-array" } },
+	);
+	const abort = new AbortController();
+	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, {
+		agentDir: fixture.agentDir,
+	});
+	try {
+		await expect(agent.listSessions({})).rejects.toMatchObject({
+			code: "protocol_error",
+			message: "session.list returned a malformed page.",
+		});
+		expect(fixture.requests.map(request => request.input)).toEqual([{}, { cursor: "page-2" }]);
+	} finally {
+		abort.abort();
+	}
+});
 test("production ACP preserves lifecycle, turn, replay, and connection ownership contracts over SDK WebSockets", async () => {
 	const directory = await mkdtemp(path.join(tmpdir(), "gjc-sdk-acp-contract-"));
 	directories.push(directory);

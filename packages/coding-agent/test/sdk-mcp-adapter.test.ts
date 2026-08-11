@@ -7,6 +7,7 @@ import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { SessionLifecycleService } from "../src/sdk/lifecycle";
 import { createSdkMcpServer } from "../src/sdk/mcp";
 import { OPERATIONS } from "../src/sdk/protocol/operation-registry";
+import type { SessionRouter } from "../src/sdk/router";
 
 const dirs: string[] = [];
 const servers: Array<ReturnType<typeof Bun.serve>> = [];
@@ -71,6 +72,22 @@ async function fixture() {
 		endpointMtimeMs: fs.statSync(endpointPath).mtimeMs,
 	});
 	return { repo, agentDir, sessionId, endpointPath, sent: () => sends };
+}
+
+function sessionListRouter(
+	responses: Array<Record<string, unknown>>,
+	requests: Array<Record<string, unknown>>,
+): SessionRouter {
+	return {
+		async start(): Promise<void> {},
+		async stop(): Promise<void> {},
+		async listBrokerSessions(input: Record<string, unknown>): Promise<Record<string, unknown>> {
+			requests.push(input);
+			const response = responses.shift();
+			if (!response) throw new Error("Unexpected session.list request.");
+			return response;
+		},
+	} as unknown as SessionRouter;
 }
 
 test("MCP SDK schemas exclude endpoint credentials and reject G02 before any WebSocket send", async () => {
@@ -231,4 +248,54 @@ test("MCP SDK control/query tools use Router-owned live attachments and unknown 
 		mcp.callTool("gjc_session_query", { sessionId: "missing", query: "session.metadata" }),
 	).resolves.toEqual({ ok: false, error: expect.objectContaining({ code: "not_found" }) });
 	await mcp.close();
+});
+
+test("MCP rejects repeated session.list cursors without returning partial sessions", async () => {
+	const { agentDir } = await fixture();
+	const requests: Array<Record<string, unknown>> = [];
+	const mcp = createSdkMcpServer({
+		agentDir,
+		router: sessionListRouter(
+			[
+				{ ok: true, result: { sessions: [{ sessionId: "first" }], continuationCursor: "repeat" } },
+				{ ok: true, result: { sessions: [{ sessionId: "second" }], continuationCursor: "repeat" } },
+			],
+			requests,
+		),
+	});
+	try {
+		const result = await mcp.callTool("gjc_session_list");
+		expect(result).toEqual({
+			ok: false,
+			error: { code: "protocol_error", message: "session.list returned a repeated continuation cursor." },
+		});
+		expect(requests).toEqual([{}, { cursor: "repeat" }]);
+	} finally {
+		await mcp.close();
+	}
+});
+
+test("MCP rejects malformed session.list continuation pages without returning partial sessions", async () => {
+	const { agentDir } = await fixture();
+	const requests: Array<Record<string, unknown>> = [];
+	const mcp = createSdkMcpServer({
+		agentDir,
+		router: sessionListRouter(
+			[
+				{ ok: true, result: { sessions: [{ sessionId: "first" }], continuationCursor: "page-2" } },
+				{ ok: true, result: { sessions: "not-an-array" } },
+			],
+			requests,
+		),
+	});
+	try {
+		const result = await mcp.callTool("gjc_session_list");
+		expect(result).toEqual({
+			ok: false,
+			error: { code: "protocol_error", message: "session.list returned a malformed page." },
+		});
+		expect(requests).toEqual([{}, { cursor: "page-2" }]);
+	} finally {
+		await mcp.close();
+	}
 });

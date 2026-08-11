@@ -1,4 +1,10 @@
 import { createHash } from "node:crypto";
+import {
+	SessionListTraversalError,
+	type SessionListTraversalPage,
+	sessionListPageFromResponse,
+	traverseSessionList,
+} from "../session-list";
 
 export type SessionLifecycleOperation =
 	| "session.create"
@@ -7,9 +13,6 @@ export type SessionLifecycleOperation =
 	| "session.close"
 	| "session.delete"
 	| "session.list";
-
-/** The capability required to submit one lifecycle operation. */
-export type SessionLifecycleCapability = Exclude<SessionLifecycleOperation, "session.list"> | "session.list";
 
 export interface SessionLifecycleActor {
 	readonly id: string;
@@ -273,8 +276,6 @@ const RETRYABLE_BROKER_ERRORS = new Set([
 	"startup_admission_timeout",
 ]);
 
-const MAX_SESSION_LIST_PAGES = 10_000;
-
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -396,11 +397,11 @@ function credentialFreeRecord(value: Record<string, unknown>): Record<string, un
 	return output;
 }
 
-function sessionResult(value: unknown, fallbackSessionId?: string): SessionLifecycleSessionResult | undefined {
+function sessionResult(value: unknown, expectedSessionId?: string): SessionLifecycleSessionResult | undefined {
 	if (!isRecord(value)) return undefined;
 	const record = credentialFreeRecord(value);
-	const sessionId = typeof record.sessionId === "string" ? record.sessionId : fallbackSessionId;
-	if (!sessionId) return undefined;
+	const sessionId = typeof record.sessionId === "string" ? record.sessionId : undefined;
+	if (!sessionId || (expectedSessionId !== undefined && sessionId !== expectedSessionId)) return undefined;
 	const result: {
 		sessionId: string;
 		cwd?: string;
@@ -417,6 +418,14 @@ function sessionResult(value: unknown, fallbackSessionId?: string): SessionLifec
 
 function listResult(value: unknown): SessionLifecycleListResult | undefined {
 	if (!isRecord(value) || !Array.isArray(value.sessions)) return undefined;
+	const indexSeq = value.indexSeq;
+	if (
+		typeof indexSeq !== "number" ||
+		!Number.isSafeInteger(indexSeq) ||
+		indexSeq < 0 ||
+		!Array.isArray(value.warnings)
+	)
+		return undefined;
 	const sessions: SessionLifecycleListEntry[] = [];
 	for (const entry of value.sessions) {
 		if (!isRecord(entry) || typeof entry.sessionId !== "string") return undefined;
@@ -433,10 +442,11 @@ function listResult(value: unknown): SessionLifecycleListResult | undefined {
 		if (isRecord(entry.locator) && typeof entry.locator.repo === "string") item.repo = entry.locator.repo;
 		sessions.push(item);
 	}
-	const indexSeq = typeof value.indexSeq === "number" ? value.indexSeq : 0;
-	const warnings = Array.isArray(value.warnings)
-		? value.warnings.filter((warning): warning is string => typeof warning === "string")
-		: [];
+	const warnings: string[] = [];
+	for (const warning of value.warnings) {
+		if (typeof warning !== "string") return undefined;
+		warnings.push(warning);
+	}
 	const savedSession = isRecord(value.savedSession)
 		? typeof value.savedSession.id === "string" && typeof value.savedSession.path === "string"
 			? { id: value.savedSession.id, path: value.savedSession.path }
@@ -444,22 +454,30 @@ function listResult(value: unknown): SessionLifecycleListResult | undefined {
 		: undefined;
 	return { indexSeq, sessions, warnings, ...(savedSession ? { savedSession } : {}) };
 }
-
-function listPageResult(
-	value: unknown,
-): { readonly result: SessionLifecycleListResult; readonly continuationCursor?: string } | undefined {
-	const result = listResult(value);
-	if (!result || !isRecord(value)) return undefined;
-	const continuationCursor = value.continuationCursor;
-	if (continuationCursor !== undefined && (typeof continuationCursor !== "string" || continuationCursor.length === 0))
-		return undefined;
-	return { result, ...(continuationCursor === undefined ? {} : { continuationCursor }) };
-}
+type LifecycleListPage = {
+	readonly result: SessionLifecycleListResult;
+	readonly sessions: readonly SessionLifecycleListEntry[];
+	readonly continuationCursor?: unknown;
+};
 
 function brokerError(value: unknown): { code: string; message: string } | undefined {
 	if (!isRecord(value) || value.ok !== false || !isRecord(value.error)) return undefined;
 	if (typeof value.error.code !== "string" || typeof value.error.message !== "string") return undefined;
 	return { code: value.error.code, message: value.error.message };
+}
+
+class BrokerSessionListResponseError extends Error {
+	readonly #brokerError: { readonly code: string; readonly message: string };
+
+	constructor(error: { readonly code: string; readonly message: string }) {
+		super(error.message);
+		this.name = "BrokerSessionListResponseError";
+		this.#brokerError = error;
+	}
+
+	get brokerError(): { readonly code: string; readonly message: string } {
+		return this.#brokerError;
+	}
 }
 
 function brokerErrorFromThrown(value: unknown): { code: string; message: string; requestSent?: boolean } | undefined {
@@ -544,13 +562,13 @@ export class SessionLifecycleService {
 		if (error) return failure(operation, certaintyForBrokerCode(error.code), error.code, error.message);
 		if (!isRecord(response) || response.ok !== true)
 			return failure(operation, "uncertain", "malformed_response", "lifecycle broker returned a malformed response");
-		const fallbackSessionId =
+		const expectedSessionId =
 			operation === "session.resume" || operation === "session.close" || operation === "session.delete"
 				? typeof target.sessionId === "string"
 					? target.sessionId
 					: undefined
 				: undefined;
-		const parsed = sessionResult(brokerSuccess(response), fallbackSessionId);
+		const parsed = sessionResult(brokerSuccess(response), expectedSessionId);
 		if (!parsed)
 			return failure(
 				operation,
@@ -594,61 +612,65 @@ export class SessionLifecycleService {
 		const target = request.target ?? {};
 		if (!validTarget(target))
 			return failure("session.list", "terminal", "invalid_request", "target must be an object");
-		const sessions: SessionLifecycleListEntry[] = [];
-		let indexSeq = 0;
-		let warnings: readonly string[] = [];
-		let savedSession: { readonly id: string; readonly path: string } | undefined;
-		let cursor: string | undefined;
-		const seenCursors = new Set<string>();
-		for (let pageCount = 0; pageCount < MAX_SESSION_LIST_PAGES; pageCount++) {
-			let response: unknown;
-			try {
-				response = await this.#client.global(
-					"session.list",
-					{ ...target, ...(cursor === undefined ? {} : { cursor }) },
-					{
+		let pages: readonly SessionListTraversalPage<unknown, LifecycleListPage>[];
+		try {
+			pages = await traverseSessionList<Record<string, unknown>, unknown, LifecycleListPage>(
+				{ ...target },
+				async input =>
+					await this.#client.global("session.list", input, {
 						...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
-					},
-				);
-			} catch (thrown) {
-				const error = brokerError(thrown) ?? brokerErrorFromThrown(thrown);
-				return error
-					? failure("session.list", certaintyForThrownError(error), error.code, error.message)
-					: failure("session.list", "retryable", "unavailable", "lifecycle broker request was unavailable");
+					}),
+				response => {
+					const error = brokerError(response);
+					if (error) throw new BrokerSessionListResponseError(error);
+					if (!isRecord(response) || response.ok !== true) return undefined;
+					const page = sessionListPageFromResponse(response);
+					if (!page) return undefined;
+					const result = listResult(page);
+					return result
+						? { result, sessions: result.sessions, continuationCursor: page.continuationCursor }
+						: undefined;
+				},
+			);
+		} catch (thrown) {
+			if (thrown instanceof BrokerSessionListResponseError) {
+				const error = thrown.brokerError;
+				return failure("session.list", certaintyForBrokerCode(error.code), error.code, error.message);
 			}
-			const error = brokerError(response);
-			if (error) return failure("session.list", certaintyForBrokerCode(error.code), error.code, error.message);
-			const parsed =
-				isRecord(response) && response.ok === true ? listPageResult(brokerSuccess(response)) : undefined;
-			if (!parsed)
+			if (thrown instanceof SessionListTraversalError)
 				return failure(
 					"session.list",
 					"uncertain",
-					"malformed_response",
-					"lifecycle broker returned a malformed list result",
+					thrown.kind === "malformed_page" ? "malformed_response" : "protocol_error",
+					thrown.kind === "malformed_page"
+						? "lifecycle broker returned a malformed list result"
+						: thrown.kind === "repeated_cursor"
+							? "session.list returned a repeated continuation cursor"
+							: "session.list exceeded the page budget",
 				);
-			if (pageCount === 0) {
-				indexSeq = parsed.result.indexSeq;
-				warnings = parsed.result.warnings;
-				savedSession = parsed.result.savedSession;
-			}
-			sessions.push(...parsed.result.sessions);
-			if (parsed.continuationCursor === undefined)
-				return {
-					ok: true,
-					operation: "session.list",
-					result: { indexSeq, sessions, warnings, ...(savedSession === undefined ? {} : { savedSession }) },
-				};
-			if (seenCursors.has(parsed.continuationCursor))
-				return failure(
-					"session.list",
-					"uncertain",
-					"protocol_error",
-					"session.list returned a repeated continuation cursor",
-				);
-			seenCursors.add(parsed.continuationCursor);
-			cursor = parsed.continuationCursor;
+			const error = brokerError(thrown) ?? brokerErrorFromThrown(thrown);
+			return error
+				? failure("session.list", certaintyForThrownError(error), error.code, error.message)
+				: failure("session.list", "retryable", "unavailable", "lifecycle broker request was unavailable");
 		}
-		return failure("session.list", "uncertain", "protocol_error", "session.list exceeded the page budget");
+		const firstPage = pages[0];
+		if (!firstPage)
+			return failure(
+				"session.list",
+				"uncertain",
+				"malformed_response",
+				"lifecycle broker returned a malformed list result",
+			);
+		const { result } = firstPage.page;
+		return {
+			ok: true,
+			operation: "session.list",
+			result: {
+				indexSeq: result.indexSeq,
+				sessions: pages.flatMap(page => page.page.result.sessions),
+				warnings: result.warnings,
+				...(result.savedSession === undefined ? {} : { savedSession: result.savedSession }),
+			},
+		};
 	}
 }

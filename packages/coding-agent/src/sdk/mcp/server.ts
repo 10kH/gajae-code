@@ -11,6 +11,7 @@ import type {
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { adapterDispositionError, findOperation } from "../protocol/operation-registry";
 import { type SessionAttachment, SessionRouter, SessionRouterError } from "../router";
+import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../session-list";
 
 const PROTOCOL_VERSION = "2024-11-05";
 const SERVER_NAME = "gjc-sdk-mcp";
@@ -167,50 +168,53 @@ async function bounded<T>(promise: Promise<T>, timeoutMs: number, message: strin
 		if (timer) clearTimeout(timer);
 	}
 }
-const MAX_MCP_SESSION_LIST_PAGES = 10_000;
+
+class McpSessionListBrokerResponseError extends Error {
+	readonly #response: Arguments;
+
+	constructor(response: Arguments) {
+		super("session.list failed");
+		this.name = "McpSessionListBrokerResponseError";
+		this.#response = response;
+	}
+
+	get response(): Arguments {
+		return this.#response;
+	}
+}
 
 async function paginatedSessionList(
 	router: SessionRouter,
 	input: Arguments = {},
 	requestKey = `${MCP_LIFECYCLE_ACTOR.namespace}:session.list`,
 ): Promise<unknown> {
-	const aggregate: Arguments = {};
-	const sessions: unknown[] = [];
-	let firstResponse: Arguments | undefined;
-	let cursor: string | undefined;
-	const seenCursors = new Set<string>();
-	for (let pageCount = 0; pageCount < MAX_MCP_SESSION_LIST_PAGES; pageCount++) {
-		const rawResponse = await router.listBrokerSessions(
-			{ ...input, ...(cursor === undefined ? {} : { cursor }) },
-			requestKey,
+	try {
+		const pages = await traverseSessionList(
+			input,
+			async pageInput => {
+				const rawResponse = await router.listBrokerSessions(pageInput, requestKey);
+				const response = isObject(rawResponse) ? rawResponse : undefined;
+				if (response?.ok === false) throw new McpSessionListBrokerResponseError(response);
+				return response;
+			},
+			response => sessionListPageFromResponse(response),
 		);
-		const response = isObject(rawResponse) ? rawResponse : undefined;
-		firstResponse ??= response;
-		if (response?.ok === false) return response;
-		const listing = isObject(response?.result) ? response.result : response;
-		if (listing) {
-			for (const [key, value] of Object.entries(listing))
+		const aggregate: Arguments = {};
+		const sessions: unknown[] = [];
+		for (const { page } of pages) {
+			for (const [key, value] of Object.entries(page))
 				if (key !== "sessions" && key !== "continuationCursor") aggregate[key] = value;
-			if (Array.isArray(listing.sessions)) sessions.push(...listing.sessions);
-			const nextCursor =
-				typeof listing.continuationCursor === "string" && listing.continuationCursor.length > 0
-					? listing.continuationCursor
-					: undefined;
-			if (nextCursor) {
-				if (seenCursors.has(nextCursor))
-					return {
-						ok: false,
-						error: { code: "protocol_error", message: "session.list returned a repeated continuation cursor." },
-					};
-				seenCursors.add(nextCursor);
-				cursor = nextCursor;
-				continue;
-			}
+			sessions.push(...page.sessions);
 		}
 		const result = { ...aggregate, sessions };
+		const firstResponse = pages[0]?.response;
 		return firstResponse && Object.hasOwn(firstResponse, "result") ? { ...firstResponse, result } : result;
+	} catch (error) {
+		if (error instanceof McpSessionListBrokerResponseError) return error.response;
+		if (error instanceof SessionListTraversalError)
+			return { ok: false, error: { code: "protocol_error", message: error.message } };
+		throw error;
 	}
-	return { ok: false, error: { code: "protocol_error", message: "session.list exceeded the page budget." } };
 }
 
 function textResult(
