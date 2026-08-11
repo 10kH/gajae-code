@@ -18335,21 +18335,42 @@ export class SessionManager {
 				destination,
 			);
 			manager.#sessionMemoryMode = sessionMemoryMode;
-			await manager.#initSessionFile(
-				filePath,
-				false,
-				strictSmallInspection ? { inspection: strictSmallInspection, storage, reuseEntries: false } : undefined,
-			);
-			if (strictSmallInspection) {
-				const revalidated = revalidateTranscriptIdentityBounded(filePath, storage, strictSmallInspection.identity);
-				if (revalidated.kind !== "valid" || manager.#sessionId !== strictSmallInspection.identity.sessionId) {
-					manager.setSessionMemoryMode("off");
-					await manager.close();
-					throw new Error("Could not open session: unstable");
+			try {
+				await manager.#initSessionFile(
+					filePath,
+					false,
+					strictSmallInspection ? { inspection: strictSmallInspection, storage, reuseEntries: false } : undefined,
+				);
+				if (strictSmallInspection) {
+					const revalidated = revalidateTranscriptIdentityBounded(
+						filePath,
+						storage,
+						strictSmallInspection.identity,
+					);
+					if (revalidated.kind !== "valid" || manager.#sessionId !== strictSmallInspection.identity.sessionId)
+						throw new Error("Could not open session: unstable");
 				}
+				manager.buildSessionContext();
+				return manager;
+			} catch (error) {
+				manager.setSessionMemoryMode("off");
+				for (const sidecarPath of manager.#disposableSidecarPaths()) {
+					if (!sidecarPath) continue;
+					try {
+						manager.#storage.unlinkSync(sidecarPath);
+					} catch (cleanupError) {
+						if (!isEnoent(cleanupError))
+							logger.warn("Rejected explicit resume sidecar cleanup failed", {
+								error: toError(cleanupError).message,
+							});
+					}
+				}
+				manager.#sidecarRuntime = undefined;
+				await manager.close().catch(closeError => {
+					logger.warn("Rejected explicit resume manager close failed", { error: toError(closeError).message });
+				});
+				throw error;
 			}
-			manager.buildSessionContext();
-			return manager;
 		}
 		const sameManagedDirectory = path.dirname(path.resolve(filePath)) === path.resolve(destination.directory);
 		let managedInspectionStore: ManagedSessionDescendantStore | undefined;
