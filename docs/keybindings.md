@@ -19,7 +19,7 @@ Chord names are case-insensitive. New configuration should use canonical textual
 Configuration uses portable canonical key IDs, not the labels printed by a particular host: use `ctrl`, `alt`, `shift`, and `super` with a key name, for example `ctrl+p`, `alt+enter`, `shift+tab`, and `super+c`. Matching is case-insensitive, but new configuration should use this canonical textual form so the same file remains portable.
 
 Runtime UI labels are platform-native. On macOS, `Ctrl`, `Alt`, `Shift`, and `Super` display as `⌃`, `⌥`, `⇧`, and `⌘`; MacBook keycaps such as Return, Escape, Tab, Delete, and the arrow keys display as `↩`, `⎋`, `⇥`, `⌫`/`⌦`, and arrows. These glyphs are display labels only: configure `super+c`, not `⌘C`, and `alt+enter`, not `⌥↩`.
-On macOS, both left and right Option keys use the same terminal Meta/Esc path. Option shortcuts therefore require the terminal profile to forward Option as Meta/Esc or to use an enhanced keyboard protocol. In Apple Terminal, enable **Settings > Profiles > Keyboard > Use Option as Meta key** for the profile used by GJC. Command/Super is usually handled by the terminal or operating system and does not reach GJC. Text produced by an Option key as composed Unicode cannot be reverse-inferred as an Option chord.
+On macOS, Option shortcuts require the terminal to forward Option as Meta/Esc or to use an enhanced keyboard protocol. In Apple Terminal, enable **Settings > Profiles > Keyboard > Use Option as Meta key**. In Ghostty, set `macos-option-as-alt = true` in `~/.config/ghostty/config`, then reload its configuration or restart it. Command/Super is usually handled by the terminal or operating system and does not reach GJC. Text produced by an Option key as composed Unicode cannot be reverse-inferred as an Option chord.
 For terminals that do not forward Option, remap the queue actions to canonical Control chords (choose unclaimed chords appropriate for your terminal), for example:
 
 ```json
@@ -62,6 +62,8 @@ Set an action to an empty array to disable it:
 | `app.clipboard.copyPrompt` | `alt+shift+c` | Copy the whole prompt |
 | `app.stt.toggle` | `alt+h` | Toggle speech-to-text recording |
 | `app.irc.sidebar.toggle` | `alt+i` | Toggle IRC sidebar |
+
+For setup, microphone permissions, first-use behavior, and troubleshooting, see [Speech-to-text](./speech-to-text.md).
 
 Older unqualified action names are migrated when `keybindings.json` is loaded, but new docs and new configs should use the namespaced action IDs above.
 
