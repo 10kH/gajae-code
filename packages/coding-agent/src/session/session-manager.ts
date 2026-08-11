@@ -6527,6 +6527,7 @@ export const SessionManagerTestHooks: {
 	beforePersistPatchFence?: (attempt: number) => void;
 	beforeStrictMissingCheck?: (filePath: string, storage: SessionStorage) => void;
 	beforeManagedResumeAcceptance?: (filePath: string, storage: SessionStorage) => void;
+	beforeManagedResumeReturn?: (filePath: string, storage: SessionStorage) => void;
 	/** Internal first-open GC strategy override; omitted means current. */
 	firstOpenGcStrategy?: SessionMemoryGcStrategy;
 	/** Internal first-open secondary-artifact mode override; omitted means auto. */
@@ -18561,7 +18562,12 @@ export class SessionManager {
 						throw new Error("Could not open session: unstable");
 					}
 				}
-				await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
+				if (manager.#sanitizeLoadedOpenAIResponsesReplayMetadata().length > 0)
+					manager.#needsFullRewriteOnNextPersist = true;
+				SessionManagerTestHooks.beforeManagedResumeReturn?.(filePath, managedInspectionStorage);
+				const returnManagedDescriptor = managedInspectionStore?.descriptorExpected(path.basename(filePath));
+				if (!returnManagedDescriptor || !sameDescriptor(managedBoundedDescriptor, returnManagedDescriptor))
+					throw new Error("Could not open session: unstable");
 				const header = manager.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 				if (header?.cwd) manager.cwd = header.cwd;
 				manager.buildSessionContext();

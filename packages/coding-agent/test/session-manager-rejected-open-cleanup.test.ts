@@ -347,4 +347,32 @@ describe("managed strict-resume target races", () => {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
+
+	it("rejects a large bounded target replaced after acceptance without persisting", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-bounded-return-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "bounded-return.jsonl");
+		const replacement = transcript().replaceAll("rejected-open", "replacement");
+		storage.writeTextSync(sourceFile, transcript());
+		SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+		SessionManagerTestHooks.sidecarTailBufferBytesOverride = 1;
+		SessionManagerTestHooks.beforeManagedResumeReturn = filePath => {
+			if (filePath === sourceFile) storage.writeTextSync(sourceFile, replacement);
+		};
+		try {
+			await expect(SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled")).rejects.toThrow(
+				"Could not open session: unstable",
+			);
+			expect(storage.readTextSync(sourceFile)).toBe(replacement);
+		} finally {
+			SessionManagerTestHooks.beforeManagedResumeReturn = undefined;
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
+			SessionManagerTestHooks.sidecarTailBufferBytesOverride = undefined;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
 });
