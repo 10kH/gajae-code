@@ -370,11 +370,11 @@ function isMissing(error: unknown): error is NodeJS.ErrnoException {
 
 async function closeConversationStoreFileLock(handle: ConversationStoreFileHandle | undefined): Promise<void> {
 	if (!handle) return;
-	try {
-		await handle.close();
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "EBADF") throw error;
-	}
+	// A failed close must never skip the unlink: that would leak a well-formed
+	// lock whose pid is still alive and block every later waiter. The unlink is
+	// ownership-checked by the pending-file model so it can only ever remove the
+	// lock this holder wrote, making a best-effort close safe.
+	await handle.close().catch(() => undefined);
 }
 
 async function syncParentDirectory(

@@ -149,10 +149,12 @@ export interface ForceCloseOwnerDependencies {
 	now(): Date;
 	sleep(ms: number): Promise<void>;
 	listPanePids(sessionName: string, env: NodeJS.ProcessEnv): number[];
+	/** Test/runtime seam for an exact owner-exit observer; durable validation remains authoritative. */
+	waitForOwnerExitVerdict?(): Promise<OwnerVerdict>;
 }
 const GJC_TMUX_PSMUX_INCARNATION_OPTION = "@gjc-psmux-incarnation";
 
-const FORCE_CLOSE_VERDICT_TIMEOUT_MS = 5_000;
+const FORCE_CLOSE_VERDICT_TIMEOUT_MS = 15_000;
 const FORCE_CLOSE_VERDICT_POLL_MS = 50;
 
 export interface CreateGjcTmuxSessionOptions {
@@ -1363,12 +1365,28 @@ async function requireUnchangedOwnerForCompatibilityCleanup(
 	}
 }
 
+async function waitForOwnerVerdictUntil(
+	verdict: Promise<OwnerVerdict>,
+	now: () => Date,
+	deadline: number,
+): Promise<OwnerVerdict> {
+	const remainingMs = deadline - now().getTime();
+	if (remainingMs <= 0) throw new Error("owner_term_verdict_timeout");
+	const timeout = Promise.withResolvers<never>();
+	const timer = setTimeout(() => timeout.reject(new Error("owner_term_verdict_timeout")), remainingMs);
+	try {
+		return await Promise.race([verdict, timeout.promise]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 async function waitForExpectedVerdict(
 	identity: ExactOwnerIdentity,
 	sleep: (ms: number) => Promise<void>,
 	now: () => Date,
+	deadline: number,
 ): Promise<OwnerVerdict | null> {
-	const deadline = now().getTime() + FORCE_CLOSE_VERDICT_TIMEOUT_MS;
 	const paths = lifecyclePaths(identity.stateDir, identity.sessionId, identity.generation);
 	const verdictFile = paths.verdictFile;
 	const verdictAliasFile = paths.verdictAliasFile;
@@ -1459,7 +1477,8 @@ export async function forceCloseGjcTmuxSession(
 	const now = deps.now ?? (() => new Date());
 	const sleep = deps.sleep ?? (ms => Bun.sleep(ms));
 	const dispatchId = crypto.randomUUID();
-	let operatorVerdict: Promise<OwnerVerdict> | null = null;
+	const verdictDeadline = now().getTime() + FORCE_CLOSE_VERDICT_TIMEOUT_MS;
+	let operatorVerdict: Promise<OwnerVerdict> | null = deps.waitForOwnerExitVerdict?.() ?? null;
 	await closeExactTmuxOwner(
 		{
 			stateDir: identity.stateDir,
@@ -1470,7 +1489,7 @@ export async function forceCloseGjcTmuxSession(
 			startTime: identity.startTime,
 			dispatchId,
 			createdAt: now().toISOString(),
-			expiresAt: new Date(now().getTime() + FORCE_CLOSE_VERDICT_TIMEOUT_MS).toISOString(),
+			expiresAt: new Date(verdictDeadline).toISOString(),
 		},
 		{
 			readStartTime: deps.readProcessStartTime ?? readProcessStartTime,
@@ -1505,7 +1524,17 @@ export async function forceCloseGjcTmuxSession(
 				}
 			},
 
-			waitForVerdict: () => operatorVerdict ?? waitForExpectedVerdict(identity, sleep, now),
+			waitForVerdict: async () => {
+				if (!operatorVerdict) return await waitForExpectedVerdict(identity, sleep, now, verdictDeadline);
+				try {
+					return await waitForOwnerVerdictUntil(operatorVerdict, now, verdictDeadline);
+				} catch {
+					// The sidecar and raw monitor intentionally race to publish the first valid
+					// verdict. If the exact supervisor-exit path loses that race or times out
+					// under load, recover only from the same fully validated durable evidence.
+					return await waitForExpectedVerdict(identity, sleep, now, verdictDeadline);
+				}
+			},
 			cleanupSession: async () => {
 				const cleanupRequired = await requireUnchangedOwnerForCompatibilityCleanup(
 					session.name,

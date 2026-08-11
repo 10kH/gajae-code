@@ -1082,6 +1082,8 @@ interface SessionRuntime {
 	cursors: CursorRegistry;
 	/** Current endpoint session identity; never re-key an existing host across a switch. */
 	id: string;
+	/** Discovery scope is fixed before publication; a live default endpoint is never rotated in place. */
+	endpointScope: "default" | "chat";
 	idleSeq: number;
 	/** Interactive asks awaiting a remote answer, by action id. */
 	pendingInteractive: Map<string, PendingInteractiveAsk>;
@@ -1093,6 +1095,8 @@ interface SessionRuntime {
 	disposeGateListener: () => void;
 	/** Whether notification-only delivery and answer resources are active. */
 	notificationsActive: boolean;
+	/** Provider ownership state is independent from the already-published core SDK runtime. */
+	notificationOwnerState: "ready" | "retry" | "blocked";
 	/** Rejects new SDK frames while a leased terminal response drains. */
 	inboundFenced: boolean;
 	/** Set as soon as terminal teardown is requested, before startup settles. */
@@ -2201,12 +2205,12 @@ function sdkQuerySurface(
 	}),
 	configOverrides: ReadonlyMap<string, unknown> = new Map(),
 	settings: Settings | undefined = undefined,
-	promptStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
-		status: "unknown",
-	}),
-	skillStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
-		status: "unknown",
-	}),
+	turnResultLookup: (selector: {
+		kind: "prompt" | "skill";
+		commandId?: string;
+		turnId?: string;
+		clientRef?: string;
+	}) => unknown = () => ({ status: "unknown" }),
 ): SessionSurface {
 	return createSdkSurfaceFactory({
 		ctx,
@@ -2216,8 +2220,7 @@ function sdkQuerySurface(
 		getLiveState,
 		configOverrides,
 		settings,
-		promptStatusLookup,
-		skillStatusLookup,
+		turnResultLookup,
 		hostTools: () => getInstalledDefinitions("host_tools") !== undefined,
 	}).query;
 }
@@ -2849,7 +2852,12 @@ function sdkControlSurface(
 							...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
 						});
 					} else if (skillRecon) {
-						void skillRecon.noteTransition(correlation, { type: "agent_end" });
+						void skillRecon.noteTransition(correlation, {
+							type: "agent_end",
+							...(typeof result === "string"
+								? { content: { version: 1, type: "text", text: result, byteLength: 0, truncated: false } }
+								: {}),
+						});
 					}
 					return result;
 				},
@@ -3542,6 +3550,7 @@ export function createNotificationsExtension(
 		await ensureConfiguredProviderDaemons(settings, cfg, options.ensureProviderDaemon);
 		return "ready";
 	}
+
 	const identityControlOperations = new Set([
 		"session.new",
 		"session.fork",
@@ -4018,8 +4027,6 @@ export function createNotificationsExtension(
 		) => {
 			await kindReconciliation.noteAccepted("prompt", correlation, clientRef);
 		};
-		const lookupPromptStatus = (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
-			kindReconciliation.lookup("prompt", selector);
 		const releasePromptAdmission = (clientRef?: string) => kindReconciliation.releaseAdmission("prompt", clientRef);
 		const removePendingPromptCorrelation = (correlation: { commandId: string; turnId: string }) => {
 			const pendingIndex = pendingPromptCorrelations.findIndex(
@@ -4337,7 +4344,7 @@ export function createNotificationsExtension(
 				}
 			}
 			try {
-				await kindReconciliation.finalizePromptOutcome(correlation, winner, extra?.error);
+				await kindReconciliation.finalizePromptOutcome(correlation, winner, extra?.error, extra?.finalText);
 			} catch (error) {
 				// The durable pending claim survives; publishing an unpersisted terminal
 				// would contradict it, so fail the endpoint closed instead.
@@ -4455,8 +4462,7 @@ export function createNotificationsExtension(
 				},
 				configOverrides,
 				settings,
-				lookupPromptStatus,
-				selector => kindReconciliation.lookup("skill", selector),
+				selector => kindReconciliation.lookupResult(selector.kind, selector),
 			),
 			id,
 			revisions,
@@ -4808,6 +4814,7 @@ export function createNotificationsExtension(
 			revisions,
 			cursors,
 			id,
+			endpointScope: isolateChatEndpoint ? "chat" : "default",
 			idleSeq: 0,
 			pendingInteractive,
 			brokerRegistrationActive: false,
@@ -4818,6 +4825,7 @@ export function createNotificationsExtension(
 			disposeFileSink: () => {},
 			disposeGateListener: () => {},
 			notificationsActive: false,
+			notificationOwnerState: "ready",
 			enableNotifications: () => {},
 			disposeGateTerminalController: () => {},
 			disposeAckRecoveryParticipant: () => {},
@@ -5448,7 +5456,35 @@ export function createNotificationsExtension(
 				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName()),
 			};
 			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
+			// Core SDK authority is published before optional notification adapters acquire
+			// daemon ownership. A blocked adapter must not make an interactive session
+			// undiscoverable or uncontrollable.
 			const endpoint = await sdkRuntime.startTransport();
+			initializedRuntime.notificationOwnerState = "ready";
+			if (notificationsEnabledForSession && settingsAvailable && settings) {
+				initializedRuntime.notificationOwnerState = "retry";
+				try {
+					const ownership = await ensureConfiguredDaemonOwners(settings, cfg);
+					initializedRuntime.notificationOwnerState =
+						ownership === "ready" || (ownership === "blocked_identity_with_sibling" && isolateChatEndpoint)
+							? "ready"
+							: "blocked";
+					if (ownership === "blocked_identity") {
+						logger.warn("notifications: Telegram daemon ownership is blocked; core SDK remains available.");
+					}
+					if (ownership === "blocked_identity_with_sibling" && !isolateChatEndpoint) {
+						logger.warn(
+							"notifications: Telegram ownership changed after core publication; preserving the canonical endpoint and withholding adapters.",
+						);
+					}
+				} catch (error) {
+					initializedRuntime.notificationOwnerState = "retry";
+					logger.warn(
+						`notifications: provider daemon ownership unavailable; core SDK remains available: ${String(error)}`,
+					);
+				}
+			}
+
 			// The native server owns the only authoritative view of this host's live
 			// SDK client sockets; publish it so a detached session host can bound its
 			// own lifetime without probing the OS (#4010). The handle is this
@@ -5707,7 +5743,10 @@ export function createNotificationsExtension(
 	}
 
 	const sessionRuntime: NotificationSessionRuntime<ExtensionContext> = {
-		isRunning: binding => runtimes.get(binding.sessionId)?.notificationsActive === true,
+		isRunning: binding => {
+			const runtime = runtimes.get(binding.sessionId);
+			return runtime?.notificationsActive === true && runtime.notificationOwnerState === "ready";
+		},
 		start: async binding => {
 			if (sessionStartPromises.has(binding.sessionId)) {
 				const result = await startSession(binding.context);
@@ -5720,6 +5759,20 @@ export function createNotificationsExtension(
 			}
 			const runtime = runtimes.get(binding.sessionId);
 			if (runtime) {
+				if (runtime.notificationOwnerState === "retry") {
+					const { cfg, settings, settingsAvailable } = resolveSettings(options.settings);
+					if (!settingsAvailable || !settings) return "failed";
+					try {
+						const ownership = await ensureConfiguredDaemonOwners(settings, cfg);
+						runtime.notificationOwnerState =
+							ownership === "ready" ||
+							(ownership === "blocked_identity_with_sibling" && runtime.endpointScope === "chat")
+								? "ready"
+								: "blocked";
+					} catch {
+						return "failed";
+					}
+				}
 				return "started";
 			}
 			const result = await startSession(binding.context);
@@ -5729,8 +5782,11 @@ export function createNotificationsExtension(
 		isolateTelegram: async binding => {
 			const runtime = runtimes.get(binding.sessionId);
 			if (runtime) {
-				const stopped = await stopSession(binding.sessionId, "session", runtime);
-				if (!stopped || runtimes.has(binding.sessionId) || cleanupRetries.has(binding.sessionId)) return "failed";
+				if (runtime.endpointScope === "default") {
+					runtime.notificationOwnerState = "blocked";
+					return "failed";
+				}
+				return "started";
 			}
 			forceIsolatedChatSessions.add(binding.sessionId);
 			const result = await startSession(binding.context);
@@ -5774,6 +5830,7 @@ export function createNotificationsExtension(
 			// Activation is only valid after the controller commits a stable policy;
 			// never expose deferred presentations while provisional policy is held.
 			if (runtime.policySuspended) return;
+			if (runtime.notificationOwnerState !== "ready") return;
 			runtime.enableNotifications();
 			runtime.gatePresentations?.setPublicationSuspended(false);
 			runtime.gatePresentations?.activateDeferred(runtime.workflowGatePublicationEpoch);

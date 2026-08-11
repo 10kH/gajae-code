@@ -23,7 +23,7 @@ function state(close: ReturnType<typeof vi.fn>): ProviderSessionState {
 }
 
 describe("temporary provider-session suspension", () => {
-	test("restores suspended state, supports LIFO nesting, and ignores stale tokens", () => {
+	test("restores suspended state, supports LIFO nesting, and ignores stale tokens", async () => {
 		const session = createSession();
 		const originalClose = vi.fn();
 		session.providerSessionState.set("original", state(originalClose));
@@ -36,15 +36,15 @@ describe("temporary provider-session suspension", () => {
 		const inner = session.beginTemporaryProviderSessionScope("profile-preview");
 		const innerClose = vi.fn();
 		session.providerSessionState.set("inner", state(innerClose));
-		expect(session.restoreTemporaryProviderSessionScope(outer)).toBe(false);
-		expect(session.restoreTemporaryProviderSessionScope(inner)).toBe(true);
+		expect(await session.restoreTemporaryProviderSessionScope(outer)).toBe(false);
+		expect(await session.restoreTemporaryProviderSessionScope(inner)).toBe(true);
 		expect(innerClose).toHaveBeenCalledTimes(1);
 		expect(session.providerSessionState).toBe(outerMap);
-		expect(session.restoreTemporaryProviderSessionScope(outer)).toBe(true);
+		expect(await session.restoreTemporaryProviderSessionScope(outer)).toBe(true);
 		expect(outerClose).toHaveBeenCalledTimes(1);
 		expect(session.providerSessionState.has("original")).toBe(true);
 		expect(session.agent.providerSessionState).toBe(session.providerSessionState);
-		expect(session.restoreTemporaryProviderSessionScope(outer)).toBe(false);
+		expect(await session.restoreTemporaryProviderSessionScope(outer)).toBe(false);
 	});
 
 	test("restores an explicit scope after unwinding auto-owned scopes above it", async () => {
@@ -70,15 +70,15 @@ describe("temporary provider-session suspension", () => {
 		const autoClose = vi.fn();
 		autoMap.set("auto", state(autoClose));
 
-		expect(session.restoreTemporaryProviderSessionScope(planScope)).toBe(true);
+		expect(await session.restoreTemporaryProviderSessionScope(planScope)).toBe(true);
 		expect(session.model).toBe(model);
 		expect(session.providerSessionState).toBe(originalMap);
 		expect(session.agent.providerSessionState).toBe(originalMap);
 		expect(autoClose).toHaveBeenCalledTimes(1);
 		expect(planClose).toHaveBeenCalledTimes(1);
 		expect(originalClose).not.toHaveBeenCalled();
-		expect(session.restoreTemporaryProviderSessionScope(autoScope)).toBe(false);
-		expect(session.restoreTemporaryProviderSessionScope(planScope)).toBe(false);
+		expect(await session.restoreTemporaryProviderSessionScope(autoScope)).toBe(false);
+		expect(await session.restoreTemporaryProviderSessionScope(planScope)).toBe(false);
 	});
 
 	test("restores the pre-plan auto scope after unwinding a promoted scope", async () => {
@@ -113,7 +113,7 @@ describe("temporary provider-session suspension", () => {
 		const promotionClose = vi.fn();
 		session.providerSessionState.set("promotion", state(promotionClose));
 
-		expect(session.restoreTemporaryProviderSessionScope(planScope)).toBe(true);
+		expect(await session.restoreTemporaryProviderSessionScope(planScope)).toBe(true);
 		expect(session.providerSessionState).toBe(autoMap);
 		expect(promotionClose).toHaveBeenCalledTimes(1);
 		expect(planClose).toHaveBeenCalledTimes(1);
@@ -124,9 +124,9 @@ describe("temporary provider-session suspension", () => {
 		expect(session.agent.providerSessionState).toBe(originalMap);
 		expect(autoClose).toHaveBeenCalledTimes(1);
 		expect(originalClose).not.toHaveBeenCalled();
-		expect(session.restoreTemporaryProviderSessionScope(autoScope)).toBe(false);
-		expect(session.restoreTemporaryProviderSessionScope(promotionScope)).toBe(false);
-		expect(session.restoreTemporaryProviderSessionScope(planScope)).toBe(false);
+		expect(await session.restoreTemporaryProviderSessionScope(autoScope)).toBe(false);
+		expect(await session.restoreTemporaryProviderSessionScope(promotionScope)).toBe(false);
+		expect(await session.restoreTemporaryProviderSessionScope(planScope)).toBe(false);
 	});
 
 	test("new session drains provider state and installs a new shared map", async () => {
@@ -219,7 +219,7 @@ describe("temporary provider-session suspension", () => {
 		}
 
 		if (!activeScope) throw new Error("Temporary model selection did not create a scope");
-		expect(session.restoreTemporaryProviderSessionScope(activeScope)).toBe(true);
+		expect(await session.restoreTemporaryProviderSessionScope(activeScope)).toBe(true);
 		expect(session.providerSessionState).toBe(originalMap);
 		expect(session.agent.providerSessionState).toBe(originalMap);
 		expect(originalClose).not.toHaveBeenCalled();

@@ -107,9 +107,10 @@ import {
 	classifyContextOverflow,
 	getSupportedEfforts,
 	isContextOverflow,
+	isFastModeEffectiveForProvider,
 	isUsageLimitError,
+	modelSupportsServiceTier,
 	modelsAreEqual,
-	resolveServiceTier,
 	streamSimple,
 } from "@gajae-code/ai/core";
 import {
@@ -751,6 +752,13 @@ type AutoCompactionTerminalStatus =
 	| { kind: "aborted"; source: "signal" | "hook" }
 	| { kind: "skipped"; continuationScheduled?: boolean }
 	| { kind: "failed" };
+
+type ToolOutputPruneResult = {
+	prunedCount: number;
+	tokensSaved: number;
+	committed: boolean;
+	failure?: "artifact_persistence";
+};
 
 /**
  * R3.2 pre-submit seam: `build` assembles the attempt messages (Phase A once,
@@ -3233,7 +3241,7 @@ export class AgentSession {
 	}
 
 	/** Restore a temporary scope, unwinding any auto-owned scopes above it. */
-	restoreTemporaryProviderSessionScope(token: TemporaryProviderSessionScope): boolean {
+	async restoreTemporaryProviderSessionScope(token: TemporaryProviderSessionScope): Promise<boolean> {
 		const scopeIndex = this.#temporaryProviderSessionScopes.findLastIndex(scope => scope.token === token);
 		if (
 			scopeIndex < 0 ||
@@ -3242,12 +3250,12 @@ export class AgentSession {
 			return false;
 		}
 		while (this.#temporaryProviderSessionScopes.length > scopeIndex) {
-			this.#restoreTopTemporaryProviderSessionScope();
+			await this.#restoreTopTemporaryProviderSessionScope();
 		}
 		return true;
 	}
 
-	#restoreTopTemporaryProviderSessionScope(): void {
+	async #restoreTopTemporaryProviderSessionScope(): Promise<void> {
 		const scope = this.#temporaryProviderSessionScopes.pop();
 		if (!scope) return;
 		this.#closeProviderSessionMap(this.#providerSessionState, "temporary scope restore");
@@ -3266,7 +3274,7 @@ export class AgentSession {
 		this.#pendingThinkingVisibilityControlFailure = undefined;
 		this.#thinkingLevel = scope.thinkingLevel;
 		this.agent.setThinkingLevel(toReasoningEffort(scope.thinkingLevel));
-		void this.#syncEditToolModeAfterModelChange(previousEditMode);
+		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
 	/** Promote a temporary scope. The suspended provider state is permanently closed. */
@@ -6787,17 +6795,9 @@ export class AgentSession {
 		return resolveEditMode(this.#getEditModeSession());
 	}
 
-	#resolveEditModeForModel(model: Model): EditMode {
-		return resolveEditMode({
-			settings: this.settings,
-			getActiveModelString: () => formatModelString(model),
-		});
-	}
-
 	async #prepareDefaultModelSelectionPrompt(model: Model): Promise<string[] | undefined> {
 		if (!this.#rebuildSystemPrompt) return undefined;
 		if (!this.getActiveToolNames().includes("edit")) return undefined;
-		if (this.#resolveActiveEditMode() === this.#resolveEditModeForModel(model)) return undefined;
 		const built = await this.#rebuildSystemPrompt(this.getActiveToolNames(), this.#toolRegistry, model);
 		return built.systemPrompt;
 	}
@@ -6836,11 +6836,8 @@ export class AgentSession {
 		this.#lastAppliedToolSignature = this.#computeAppliedToolSignature(activeToolNames, activeTools);
 	}
 
-	async #syncEditToolModeAfterModelChange(previousEditMode: EditMode): Promise<void> {
-		const currentEditMode = this.#resolveActiveEditMode();
-		if (previousEditMode !== currentEditMode && this.getActiveToolNames().includes("edit")) {
-			await this.refreshBaseSystemPrompt();
-		}
+	async #syncEditToolModeAfterModelChange(_previousEditMode: EditMode): Promise<void> {
+		if (this.getActiveToolNames().includes("edit")) await this.refreshBaseSystemPrompt();
 	}
 
 	getSelectedMCPToolNames(): string[] {
@@ -10891,15 +10888,13 @@ export class AgentSession {
 			await this.sessionManager.flush();
 
 			const boundedColdForkEligible =
-				this.sessionManager.getSessionMemoryStats().coldRetirementActive &&
-				!this.sessionManager.isManagedDestination() &&
-				previousSessionFile !== undefined;
+				this.sessionManager.getSessionMemoryStats().coldRetirementActive && previousSessionFile !== undefined;
 			if (boundedColdForkEligible) {
 				const previousManager = this.sessionManager;
 				const forkedManager = await SessionManager.forkFrom(
 					previousSessionFile,
 					previousManager.getCwd(),
-					SessionManager.explicitDestination(previousManager.getSessionDir()),
+					previousManager.getDestinationForFork(),
 					undefined,
 					"copy-retain",
 					this.settings.get("sessionMemory.mode"),
@@ -10907,15 +10902,38 @@ export class AgentSession {
 				try {
 					await initializeLocalRoot({
 						getArtifactsDir: () => forkedManager.getArtifactsDir(),
-						isManagedDestination: () => false,
-						getManagedLegacyLocalMigrationSource: () => null,
+						isManagedDestination: () => forkedManager.isManagedDestination(),
+						getManagedLegacyLocalMigrationSource: () => forkedManager.getManagedLegacyLocalMigrationSource(),
 						getSessionId: () => forkedManager.getSessionId(),
 					});
 					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 				} catch (error) {
 					const forkedFile = forkedManager.getSessionFile();
-					await forkedManager.close();
-					if (forkedFile) await previousManager.discardUncommittedSession(forkedFile);
+					const cleanupErrors: unknown[] = [];
+					try {
+						await forkedManager.close();
+					} catch (closeError) {
+						cleanupErrors.push(closeError);
+						logger.warn("Bounded fork successor close failed after initialization failure", {
+							error: closeError instanceof Error ? closeError.message : String(closeError),
+						});
+					}
+					if (forkedFile) {
+						try {
+							await previousManager.discardUncommittedSession(forkedFile);
+						} catch (cleanupError) {
+							cleanupErrors.push(cleanupError);
+							logger.warn("Bounded fork successor cleanup failed after initialization failure", {
+								error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+							});
+						}
+					}
+					if (cleanupErrors.length > 0) {
+						throw new AggregateError(
+							[error, ...cleanupErrors],
+							"Bounded fork initialization and successor cleanup both failed.",
+						);
+					}
 					throw error;
 				}
 				this.sessionManager = forkedManager;
@@ -11452,7 +11470,7 @@ export class AgentSession {
 			currentAutoScope !== undefined &&
 			this.#temporaryProviderSessionScopes.at(-1) === currentAutoScope;
 		if (replaceAutoScope && currentAutoScope) {
-			this.#restoreTopTemporaryProviderSessionScope();
+			await this.#restoreTopTemporaryProviderSessionScope();
 		}
 		const scope = isTemporaryOperation
 			? (suppliedScope ??
@@ -11483,7 +11501,7 @@ export class AgentSession {
 			if (options?.persistAsSessionDefault === true) this.#clearActiveModelProfileForConcreteDefault(options?.cause);
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
 		} catch (error) {
-			if (ownsScope) this.restoreTemporaryProviderSessionScope(scope);
+			if (ownsScope) await this.restoreTemporaryProviderSessionScope(scope);
 			throw error;
 		}
 		return scope;
@@ -12198,17 +12216,12 @@ export class AgentSession {
 	}
 
 	/**
-	 * True when the configured `serviceTier` resolves to `"priority"` for the
-	 * given model `provider`. Returns false for scoped tiers that don't match
-	 * (e.g. `"openai-only"` on an anthropic provider) and when `provider` is
-	 * undefined. This is the canonical provider-aware fast-mode predicate.
+	 * True when the configured tier is realized as a fast-mode field on the
+	 * provider's wire protocol. Providers that silently drop unscoped priority
+	 * intent return false so UI indicators match the request that is sent.
 	 */
-	isFastForProvider(provider?: string): boolean {
-		// Fast mode applies to a concrete model's provider. With no provider
-		// (no model selected) it cannot apply, even under an unscoped `priority`
-		// tier that `resolveServiceTier` would otherwise pass through.
-		if (provider === undefined) return false;
-		return resolveServiceTier(this.serviceTier, provider) === "priority";
+	isFastForProvider(provider?: string, supportsServiceTier = false): boolean {
+		return isFastModeEffectiveForProvider(this.serviceTier, provider, supportsServiceTier);
 	}
 
 	/**
@@ -12225,14 +12238,11 @@ export class AgentSession {
 	}
 
 	/**
-	 * Provider-aware fast-mode predicate for task-tool subagent roles, evaluated
-	 * against the effective subagent tier (`task.serviceTier`) rather than the
-	 * main session tier. Use this for `task.agentModelOverrides` role rows so the
-	 * ⚡ glyph reflects the tier the subagent actually runs under.
+	 * Wire-effective fast-mode predicate for task-tool subagent roles, evaluated
+	 * against `task.serviceTier` rather than the main session tier.
 	 */
-	isFastForSubagentProvider(provider?: string): boolean {
-		if (provider === undefined) return false;
-		return resolveServiceTier(this.#subagentServiceTier(), provider) === "priority";
+	isFastForSubagentProvider(provider?: string, supportsServiceTier = false): boolean {
+		return isFastModeEffectiveForProvider(this.#subagentServiceTier(), provider, supportsServiceTier);
 	}
 
 	/**
@@ -12288,7 +12298,10 @@ export class AgentSession {
 	 */
 	isFastModeActive(): boolean {
 		const provider = this.model?.provider;
-		return this.isFastForProvider(provider) && !this.#isFastModeAutoDisabledForProvider(provider);
+		const supportsServiceTier = modelSupportsServiceTier(this.model);
+		return (
+			this.isFastForProvider(provider, supportsServiceTier) && !this.#isFastModeAutoDisabledForProvider(provider)
+		);
 	}
 
 	setServiceTier(serviceTier: ServiceTier | undefined): void {
@@ -12383,19 +12396,34 @@ export class AgentSession {
 		signal?: AbortSignal,
 		overThreshold = false,
 		options?: { commitGate?: (actual: { prunedCount: number; tokensSaved: number }) => boolean },
-	): Promise<{ prunedCount: number; tokensSaved: number; committed: boolean } | undefined> {
+	): Promise<ToolOutputPruneResult | undefined> {
 		const branchEntries = this.sessionManager.getBranch();
+		const artifactManager = await this.sessionManager.ensureArtifactManager();
+		// Over-threshold callers have already proven tool-output savings before entering
+		// this path. If exact persistence is unavailable, fail closed before hashing and
+		// planning large outputs so maintenance cannot drift into timeout-driven abort.
+		if (overThreshold && !artifactManager)
+			return { prunedCount: 0, tokensSaved: 0, committed: false, failure: "artifact_persistence" };
 		const plan = planToolOutputPrune(branchEntries, {
 			...DEFAULT_PRUNE_CONFIG,
 			minimumSavings: overThreshold ? 0 : DEFAULT_PRUNE_CONFIG.minimumSavings,
 		});
-		const artifactManager = await this.sessionManager.ensureArtifactManager();
 		const published = new Map<string, ToolOutputPruneEvictionHandle>();
 		// Fail closed when tool-output eviction is planned but no artifact store can be
 		// established: do not report a successful prune that skipped durable eviction.
 		if (!artifactManager && plan.digests.length > 0) {
-			return undefined;
+			return { prunedCount: 0, tokensSaved: 0, committed: false, failure: "artifact_persistence" };
 		}
+		const removePublishedArtifacts = async (): Promise<void> => {
+			for (const handle of published.values()) {
+				const removed = await artifactManager?.removeNamedBestEffort(`${handle.artifactId}.evicted.log`);
+				if (removed === false) {
+					logger.warn("Failed to remove unpublished tool-output eviction artifact", {
+						artifactId: handle.artifactId,
+					});
+				}
+			}
+		};
 
 		// Publish exact text one candidate at a time. The plan carries only digests and
 		// replacement proposals; original output bytes exist only in this iteration.
@@ -12418,21 +12446,18 @@ export class AgentSession {
 						outcome: outcome.outcome,
 						diagnostic: "diagnostic" in outcome ? outcome.diagnostic : undefined,
 					});
-					if (outcome.outcome === "failed") break;
+					if (outcome.outcome === "failed") {
+						await removePublishedArtifacts();
+						return {
+							prunedCount: published.size,
+							tokensSaved: 0,
+							committed: false,
+							failure: "artifact_persistence",
+						};
+					}
 				}
 			}
 		}
-
-		const removePublishedArtifacts = async (): Promise<void> => {
-			for (const handle of published.values()) {
-				const removed = await artifactManager?.removeNamedBestEffort(`${handle.artifactId}.evicted.log`);
-				if (removed === false) {
-					logger.warn("Failed to remove unpublished tool-output eviction artifact", {
-						artifactId: handle.artifactId,
-					});
-				}
-			}
-		};
 
 		// Evaluate non-tool pruning on a disposable copy so the gate runs before any
 		// live entry is mutated. This avoids retaining originals for rollback.
@@ -13114,7 +13139,7 @@ export class AgentSession {
 			// and the generated handoff document is preserved for copy/retry.
 			const previousSessionFile = this.sessionFile;
 			await this.sessionManager.flush();
-			const rollbackSessionState = this.sessionManager.captureState();
+			const rollbackSessionState = await this.sessionManager.captureRollbackState();
 			const rollbackAgentMessages = [...this.agent.state.messages];
 			const rollbackSteeringMessages = [...this.#steeringMessages];
 			const rollbackFollowUpMessages = [...this.#followUpMessages];
@@ -13226,7 +13251,7 @@ export class AgentSession {
 				// failure is non-destructive. Predecessor gate emitter, provider
 				// sessions, async jobs, IRC/plan bookkeeping, and injection signatures
 				// were never mutated before commit, so they survive intact.
-				this.sessionManager.restoreState(rollbackSessionState);
+				await this.sessionManager.restoreRollbackState(rollbackSessionState);
 				this.#syncAgentSessionId(rollbackSessionState.sessionId);
 				this.#rekeyHindsightMemoryForCurrentSessionId();
 				this.agent.replaceMessages(rollbackAgentMessages, {
@@ -13515,7 +13540,7 @@ export class AgentSession {
 				relaxedMinimum: 0,
 				artifactRefMaxChars: PRUNED_ARTIFACT_REF_MAX_CHARS,
 			});
-			let pruneResult: { prunedCount: number; tokensSaved: number; committed: boolean } | undefined;
+			let pruneResult: ToolOutputPruneResult | undefined;
 			if (
 				pruneEstimate.tokensSaved > 0 &&
 				!shouldCompact(
@@ -13527,6 +13552,7 @@ export class AgentSession {
 			) {
 				pruneResult = await this.#pruneToolOutputs(maintenanceSignal, true);
 				if (isAborted()) return result("aborted");
+				if (pruneResult?.failure === "artifact_persistence") return result("failed");
 				if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 			}
 			if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
@@ -13658,7 +13684,10 @@ export class AgentSession {
 			imageBytes,
 			sessionResidentImageBytes: this.sessionManager.getResidentImageBytes(),
 			materializedResidentBytes:
-				this.#streamingEditFileCache.totalBytes + sessionMemory.hotRegionBytes + sessionMemory.metaDescriptorBytes,
+				this.#streamingEditFileCache.totalBytes +
+				sessionMemory.allocatedCacheBytes +
+				sessionMemory.hotResidentBytes +
+				sessionMemory.metadataResidentBytes,
 			tuiChatChildren: retainedMemory.tuiChatChildren ?? 0,
 			tuiCachedRenderBytes: retainedMemory.tuiCachedRenderBytes ?? 0,
 		};
@@ -14131,7 +14160,7 @@ export class AgentSession {
 				signal,
 			});
 			if (signal?.aborted) {
-				if (scope) this.restoreTemporaryProviderSessionScope(scope);
+				if (scope) await this.restoreTemporaryProviderSessionScope(scope);
 				return false;
 			}
 			logger.debug("Context promotion switched model on overflow", {
@@ -15640,8 +15669,10 @@ export class AgentSession {
 			controller.seedResolution(activeIndex, [...controller.skips, ...resolution.skips]);
 		}
 		if (!resolution.model) throw new Error(this.#fallbackExhaustionError(controller));
+		const previousEditMode = this.#resolveActiveEditMode();
 		this.#setModelAuthoritatively(resolution.model, "restore");
 		this.setThinkingLevel(resolution.explicitThinkingLevel ? resolution.thinkingLevel : this.thinkingLevel);
+		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
 	/**
@@ -15838,8 +15869,10 @@ export class AgentSession {
 			const from =
 				controller.tried.at(-1)?.selector ?? controller.chain.entries[controller.activeIndex - 1] ?? selector;
 			const to = selector;
+			const previousEditMode = this.#resolveActiveEditMode();
 			this.#setModelAuthoritatively(resolved.model, "fallback-switch");
 			this.setThinkingLevel(resolved.explicitThinkingLevel ? resolved.thinkingLevel : this.thinkingLevel);
+			await this.#syncEditToolModeAfterModelChange(previousEditMode);
 			if (from !== to) {
 				this.#emit({
 					type: "model_fallback_switched",
@@ -16157,18 +16190,27 @@ export class AgentSession {
 			this.#retryAbortController?.abort();
 			this.#retryAbortController = retryAbortController;
 			this.#retryNowRequested = false;
-			await this.#emitSessionEvent({
-				type: "auto_retry_start",
-				attempt: this.#retryAttempt,
-				maxAttempts: managedFallback
-					? controller.maxAttempts
-					: firstEventTimeout
-						? retrySettings.maxRetries + 1
-						: retrySettings.maxRetries,
-				delayMs,
-				errorMessage,
-				unbounded: managedFallback ? false : legacyUnbounded,
-			});
+			try {
+				await this.#emitSessionEvent({
+					type: "auto_retry_start",
+					attempt: this.#retryAttempt,
+					maxAttempts: managedFallback
+						? controller.maxAttempts
+						: firstEventTimeout
+							? retrySettings.maxRetries + 1
+							: retrySettings.maxRetries,
+					delayMs,
+					errorMessage,
+					unbounded: managedFallback ? false : legacyUnbounded,
+				});
+			} catch (error) {
+				if (this.#retryAbortController === retryAbortController) this.#retryAbortController = undefined;
+				retryAbortController.abort();
+				this.#failRetryRecovery(
+					`Retry start delivery failed: ${error instanceof Error ? error.message : String(error)}`,
+				);
+				throw error;
+			}
 
 			const messages = this.agent.state.messages;
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
@@ -17603,7 +17645,7 @@ export class AgentSession {
 			this.#disconnectFromAgent();
 			// Flush pending writes before switching so restore snapshots reflect committed state.
 			await this.sessionManager.flush();
-			const previousSessionState = this.sessionManager.captureState();
+			const previousSessionState = await this.sessionManager.captureRollbackState();
 			const previousSessionContext = this.buildDisplaySessionContext();
 			// switchSession replaces these arrays wholesale during load/rollback, so retaining
 			// the existing message objects is sufficient and avoids structured-clone failures for
@@ -17657,6 +17699,7 @@ export class AgentSession {
 					: didReloadConversationChange
 						? "conversation-reload"
 						: undefined;
+				const previousEditMode = this.#resolveActiveEditMode();
 				await this.#restoreMCPSelectionsForSessionContext(sessionContext);
 
 				// The target session is loaded and MCP selections are restored: discard
@@ -17730,6 +17773,7 @@ export class AgentSession {
 					if (!this.model || !modelsAreEqual(this.model, resolution.model)) {
 						this.#setModelAuthoritatively(resolution.model, "restore");
 					}
+					await this.#syncEditToolModeAfterModelChange(previousEditMode);
 					if (resolution.explicitThinkingLevel && resolution.thinkingLevel !== undefined) {
 						this.setThinkingLevel(resolution.thinkingLevel);
 					}
@@ -17834,7 +17878,7 @@ export class AgentSession {
 				return true;
 			} catch (error) {
 				if (transitionCleanupCommitted) throw error;
-				this.sessionManager.restoreState(previousSessionState);
+				await this.sessionManager.restoreRollbackState(previousSessionState);
 				this.#defaultFallbackController = undefined;
 				this.#syncAgentSessionId(previousSessionState.sessionId);
 				this.#activeModelProfile = previousActiveModelProfile;

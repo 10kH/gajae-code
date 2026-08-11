@@ -121,11 +121,8 @@ import {
 } from "../../setup/model-onboarding-guidance";
 import { addApiCompatibleProvider, formatProviderSetupResult } from "../../setup/provider-onboarding";
 import {
-	IMAGE_PROVIDER_DEFAULTS,
 	isConfigurableSearchProviderId,
 	isSearchProviderPreference,
-	setConfiguredImageModel,
-	setPreferredImageProvider,
 	setPreferredSearchProvider,
 	setSearchFallbackProviders,
 	setSearchHardTimeoutMs,
@@ -1619,81 +1616,6 @@ export class SelectorController {
 		}
 	}
 
-	async #handleImageGenerationConfig(): Promise<void> {
-		const provider = await this.ctx.showHookInput(
-			"Image Generation provider (auto, openai, gemini, openrouter, antigravity, alibaba, custom)",
-			"auto",
-		);
-		if (provider === undefined) return;
-		const normalized = provider.trim().toLowerCase();
-		const validProviders = ["auto", "openai", "gemini", "openrouter", "antigravity", "alibaba", "custom"];
-		if (!validProviders.includes(normalized)) {
-			this.ctx.showStatus(`Invalid image provider: ${normalized}. Valid: ${validProviders.join(", ")}`);
-			return;
-		}
-		let model: string | undefined;
-		if (normalized !== "auto" && normalized !== "custom") {
-			const defaultModel = IMAGE_PROVIDER_DEFAULTS[normalized];
-			model = await this.ctx.showHookInput(`Image model for ${normalized} (default: ${defaultModel})`, defaultModel);
-			if (model === undefined) return;
-			model = model.trim() || defaultModel;
-		}
-		let customUrl: string | undefined;
-		let customKey: string | undefined;
-		if (normalized === "custom") {
-			customUrl = await this.ctx.showHookInput("Custom image endpoint base URL");
-			if (!customUrl?.trim()) {
-				this.ctx.showStatus("Custom image endpoint requires a base URL");
-				return;
-			}
-			model = await this.ctx.showHookInput("Custom image model", IMAGE_PROVIDER_DEFAULTS.openai);
-			if (model === undefined) return;
-			model = model.trim() || IMAGE_PROVIDER_DEFAULTS.openai;
-			customKey = await this.ctx.showHookInput("Custom image endpoint API key");
-		}
-		const scope = await this.ctx.showHookInput(
-			"Scope: 'session' (this session only) or 'default' (persist)",
-			"session",
-		);
-		if (scope === undefined) return;
-		const persistDefault = scope.trim().toLowerCase() === "default";
-		if (persistDefault && !this.ctx.settings.canWriteDurableConfig()) {
-			this.ctx.showError(
-				"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
-			);
-			return;
-		}
-
-		const imageProvider = normalized as
-			| "auto"
-			| "openai"
-			| "gemini"
-			| "openrouter"
-			| "antigravity"
-			| "alibaba"
-			| "custom";
-		setPreferredImageProvider(imageProvider === "custom" ? "auto" : imageProvider);
-		setConfiguredImageModel({
-			provider: imageProvider,
-			model: model ?? null,
-			customUrl: customUrl?.trim(),
-			customKey: customKey?.trim(),
-		});
-
-		if (persistDefault) {
-			this.ctx.settings.set("providers.image", imageProvider);
-			if (model) this.ctx.settings.set("providers.imageModel", model);
-			if (customUrl?.trim()) this.ctx.settings.set("providers.imageCustomUrl", customUrl.trim());
-			if (customKey?.trim()) this.ctx.settings.set("providers.imageCustomKey", customKey.trim());
-		}
-
-		const displayModel =
-			model ?? (normalized !== "auto" && normalized !== "custom" ? IMAGE_PROVIDER_DEFAULTS[normalized] : undefined);
-		const label = normalized === "auto" ? "Auto" : `${normalized}${displayModel ? ` (${displayModel})` : ""}`;
-		this.ctx.showStatus(`Image Generation: ${label}${persistDefault ? " (default)" : " (session)"}`);
-		this.ctx.ui.requestRender();
-	}
-
 	showCustomProviderWizard(): void {
 		this.showSelector(done => {
 			let wizard: CustomProviderWizardComponent;
@@ -2231,37 +2153,6 @@ export class SelectorController {
 					setSearchHardTimeoutMs(value * 1000);
 				}
 				break;
-			case "providers.image":
-			case "providers.imageModel":
-			case "providers.imageCustomUrl":
-			case "providers.imageCustomKey":
-			case "providers.imageCustomKeyEnv": {
-				const imgProvider = this.ctx.settings.get("providers.image");
-				const imgModel = this.ctx.settings.get("providers.imageModel");
-				const imgCustomUrl = this.ctx.settings.get("providers.imageCustomUrl");
-				const imgCustomKey = this.ctx.settings.get("providers.imageCustomKey");
-				const imgCustomKeyEnv = this.ctx.settings.get("providers.imageCustomKeyEnv");
-				if (
-					imgProvider === "auto" ||
-					imgProvider === "openai" ||
-					imgProvider === "gemini" ||
-					imgProvider === "openrouter" ||
-					imgProvider === "antigravity" ||
-					imgProvider === "alibaba" ||
-					imgProvider === "custom"
-				) {
-					setPreferredImageProvider(imgProvider === "custom" ? "auto" : imgProvider);
-					setConfiguredImageModel({
-						provider: imgProvider,
-						model: imgModel ?? null,
-						customUrl: imgCustomUrl,
-						customKey: imgCustomKey,
-						customKeyEnv: imgCustomKeyEnv,
-					});
-				}
-				break;
-			}
-
 			// MCP update injection - live subscribe/unsubscribe
 			case "mcp.notifications":
 				this.ctx.mcpManager?.setNotificationsEnabled(value as boolean);
@@ -2327,11 +2218,6 @@ export class SelectorController {
 						}
 						if (selection.kind === "deleteProfile") {
 							await this.#deleteCustomModelPreset(selection.profileName, modelSelector);
-							return;
-						}
-						if (selection.kind === "imageGeneration") {
-							done();
-							await this.#handleImageGenerationConfig();
 							return;
 						}
 						if (selection.kind === "profile") {
@@ -2546,8 +2432,10 @@ export class SelectorController {
 					currentThinkingLevel: this.ctx.session.thinkingLevel,
 					activeModelProfile:
 						this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
-					isFastForProvider: provider => this.ctx.session.isFastForProvider(provider),
-					isFastForSubagentProvider: provider => this.ctx.session.isFastForSubagentProvider(provider),
+					isFastForProvider: (provider, supportsServiceTier) =>
+						this.ctx.session.isFastForProvider(provider, supportsServiceTier),
+					isFastForSubagentProvider: (provider, supportsServiceTier) =>
+						this.ctx.session.isFastForSubagentProvider(provider, supportsServiceTier),
 					isCurrentModelFastModeActive: () => this.ctx.session.isFastModeActive(),
 				},
 			);

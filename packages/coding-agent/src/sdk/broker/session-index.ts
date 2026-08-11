@@ -279,8 +279,10 @@ function auditRecords(events: SessionIndexEvent[], ts: number): SessionIndexAudi
  * highest (generation, indexSeq); only `session_deleted` hides a row (DR-1 retains
  * stopped/terminal credential-free rows so inspect/offline tail can work). Heartbeats
  * inherit locator/endpoint metadata from their identity's prior event. Liveness (C2)
- * requires a heartbeat observed within 2x the checkpoint interval AND a live host:
- * a missing heartbeat (e.g. after a broker restart) is unknown, never fresh forever.
+ * requires host-written evidence — a heartbeat, or the host's own `host_registered`
+ * append — observed within 2x the checkpoint interval AND a live host whose OS
+ * incarnation still matches: a missing or stale evidence trail (e.g. after a broker
+ * restart) is unknown, never fresh forever.
  */
 function reduceEvents(events: SessionIndexEvent[], now: number): IndexedSession[] {
 	const { admitted } = admitEvents(events);
@@ -327,7 +329,15 @@ function reduceEvents(events: SessionIndexEvent[], now: number): IndexedSession[
 		const terminalUncertain = latest.type === "lifecycle_terminal" || latest.terminalUncertain === true;
 		const heartbeat = latestHeartbeatByIdentity.get(chosen.identity);
 		const pidAlive = alive(latest.pid);
-		const heartbeatFresh = heartbeat !== undefined && now - heartbeat.ts < 2 * SESSION_HEARTBEAT_INTERVAL_MS;
+		// Liveness evidence is host-written: a checkpointed heartbeat, or the
+		// `host_registered` event the host appended itself. Counting registration
+		// closes the up-to-one-interval window where a just-registered session
+		// would read not-live before the first C2 pass — without weakening the
+		// pid-reuse fence, because the incarnation match below is still required.
+		// Broker-written events (reconciliation, terminal records) are not host
+		// evidence and never refresh liveness.
+		const evidenceTs = Math.max(heartbeat?.ts ?? 0, latest.type === "host_registered" ? latest.ts : 0);
+		const heartbeatFresh = evidenceTs > 0 && now - evidenceTs < 2 * SESSION_HEARTBEAT_INTERVAL_MS;
 		const recordedIncarnation = effectiveIncarnation(latest);
 		const currentIncarnation = recordedIncarnation === undefined ? undefined : processIncarnation(latest.pid);
 		const incarnationMatches = currentIncarnation !== undefined && currentIncarnation === recordedIncarnation;
@@ -353,6 +363,13 @@ function reduceEvents(events: SessionIndexEvent[], now: number): IndexedSession[
 	return sessions;
 }
 
+// Global launch bursts may queue behind legitimate long index transactions. Keep
+// this bounded at one minute while the shared lock's exact dead-owner recovery runs.
+const SESSION_INDEX_LOCK_OPTIONS = { retries: 600, retryDelayMs: 100 } as const;
+
+function withSessionIndexLock<T>(agentDir: string, callback: () => Promise<T>): Promise<T> {
+	return withFileLock(logFor(agentDir), callback, SESSION_INDEX_LOCK_OPTIONS);
+}
 function isValidSnapshot(snapshot: unknown): snapshot is { indexSeq: number; events: SessionIndexEvent[] } {
 	if (!snapshot || typeof snapshot !== "object") return false;
 	const { indexSeq, events } = snapshot as { indexSeq?: unknown; events?: unknown };
@@ -559,7 +576,7 @@ export class SessionIndex {
 			group.promise = SessionIndex.#enqueue(indexPath, () => this.#prepareOpenGroup(indexPath, group!));
 		}
 		await group.promise;
-		await SessionIndex.#enqueue(indexPath, () => withFileLock(logFor(this.#agentDir), () => this.#replayUnderLock()));
+		await SessionIndex.#enqueue(indexPath, () => withSessionIndexLock(this.#agentDir, () => this.#replayUnderLock()));
 		return this;
 	}
 	async #prepareOpenGroup(indexPath: string, group: SessionIndexOpenGroup): Promise<void> {
@@ -573,7 +590,7 @@ export class SessionIndex {
 	}
 	async replay(): Promise<void> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
-		await SessionIndex.#enqueue(indexPath, () => withFileLock(logFor(this.#agentDir), () => this.#replayUnderLock()));
+		await SessionIndex.#enqueue(indexPath, () => withSessionIndexLock(this.#agentDir, () => this.#replayUnderLock()));
 	}
 	async #replayUnderLock(): Promise<void> {
 		const scan = await this.#scan();
@@ -764,14 +781,14 @@ export class SessionIndex {
 				}),
 			);
 			if (!exists.some(Boolean)) return { status: "healthy", validPrefixSeq: 0, snapshotSeq: 0 };
-			return await withFileLock(logFor(this.#agentDir), async () => (await this.#scan()).diagnosis);
+			return await withSessionIndexLock(this.#agentDir, async () => (await this.#scan()).diagnosis);
 		});
 	}
 	async repair(): Promise<SessionIndexRepairResult> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
 			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
-			return await withFileLock(logFor(this.#agentDir), async () => {
+			return await withSessionIndexLock(this.#agentDir, async () => {
 				const scan = await this.#scan();
 				if (scan.diagnosis.status === "unsupported") return { ...scan.diagnosis, repaired: false };
 				if (scan.diagnosis.status === "healthy") return { ...scan.diagnosis, repaired: false };
@@ -854,7 +871,7 @@ export class SessionIndex {
 	async refresh(): Promise<void> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		await SessionIndex.#enqueue(indexPath, () =>
-			withFileLock(logFor(this.#agentDir), () => this.#refreshUnderLock()),
+			withSessionIndexLock(this.#agentDir, () => this.#refreshUnderLock()),
 		);
 	}
 	async #refreshUnderLock(): Promise<void> {
@@ -871,7 +888,7 @@ export class SessionIndex {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
 			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
-			return await withFileLock(logFor(this.#agentDir), async () => {
+			return await withSessionIndexLock(this.#agentDir, async () => {
 				await this.#replayUnderLock();
 				if (this.#corruptSuffix)
 					throw new Error(
@@ -956,7 +973,7 @@ export class SessionIndex {
 				if ((error as NodeJS.ErrnoException).code === "ENOENT") return await callback();
 				throw error;
 			}
-			return await withFileLock(logFor(this.#agentDir), async () => {
+			return await withSessionIndexLock(this.#agentDir, async () => {
 				await this.#replayUnderLock();
 				if (this.#corruptSuffix) throw new Error("Cannot use corrupt session index for artifact reclamation");
 				return await callback();
@@ -966,7 +983,7 @@ export class SessionIndex {
 	async snapshot(): Promise<void> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		await SessionIndex.#enqueue(indexPath, () =>
-			withFileLock(logFor(this.#agentDir), () => this.#snapshotUnderLock()),
+			withSessionIndexLock(this.#agentDir, () => this.#snapshotUnderLock()),
 		);
 	}
 	async #snapshotUnderLock(): Promise<void> {

@@ -2,6 +2,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
+import { exactUnlink } from "@gajae-code/natives";
 import { isEnoent, logger, postmortem } from "@gajae-code/utils";
 
 const BLOB_PREFIX = "blob:sha256:";
@@ -387,9 +388,35 @@ function removeResidentCacheTreeNoFollow(pathname: string): void {
 	fs.unlinkSync(pathname);
 }
 
-export function disposeVerifiedResidentCacheInstanceDir(instanceDir: string): void {
+function assertResidentCacheDisposalParent(instanceDir: string, parentDescriptor: number): void {
+	const parentDir = path.dirname(instanceDir);
+	try {
+		assertResidentCacheDirectoryPathMatchesDescriptor(parentDir, parentDescriptor, residentCacheOwnerUid(parentDir));
+	} catch (error) {
+		throw residentCacheTrustError("parent_authority_changed", instanceDir, error);
+	}
+}
+
+export function disposeVerifiedResidentCacheInstanceDir(instanceDir: string, parentDescriptor?: number): void {
 	const instanceKey = path.resolve(instanceDir);
 	const uid = residentCacheOwnerUid(instanceDir);
+	let parentVerified = false;
+	if (parentDescriptor !== undefined) {
+		assertResidentCacheDisposalParent(instanceDir, parentDescriptor);
+		parentVerified = true;
+	}
+	// ENOENT is authoritative only while the retained parent still names the
+	// directory or after this process has already retired its ownership record.
+	try {
+		fs.lstatSync(instanceDir);
+	} catch (error) {
+		if (errorCode(error) !== "ENOENT") throw residentCacheTrustError("directory_unverifiable", instanceDir, error);
+		if (parentDescriptor !== undefined) assertResidentCacheDisposalParent(instanceDir, parentDescriptor);
+		if (!parentVerified && ownedResidentCacheInstanceDirs.has(instanceKey))
+			throw residentCacheTrustError("directory_absence_unverified", instanceDir, error);
+		ownedResidentCacheInstanceDirs.delete(instanceKey);
+		return;
+	}
 	const quarantineDir = path.join(
 		path.dirname(instanceDir),
 		`${path.basename(instanceDir)}.dispose.${crypto.randomUUID()}`,
@@ -408,7 +435,9 @@ export function disposeVerifiedResidentCacheInstanceDir(instanceDir: string): vo
 		descriptor = openVerifiedResidentCacheDirectory(instanceDir, uid);
 		assertResidentCacheDirectoryPathMatchesDescriptor(instanceDir, descriptor, uid);
 		const expected = fs.fstatSync(descriptor);
+		if (parentDescriptor !== undefined) assertResidentCacheDisposalParent(instanceDir, parentDescriptor);
 		fs.renameSync(instanceDir, quarantineDir);
+		if (parentDescriptor !== undefined) assertResidentCacheDisposalParent(instanceDir, parentDescriptor);
 		const moved = fs.lstatSync(quarantineDir);
 		if (
 			!moved.isDirectory() ||
@@ -1051,6 +1080,7 @@ export class BlobStore {
 
 interface EphemeralBlobStoreOptions {
 	readonly adoptVerifiedDir?: boolean;
+	readonly disposalParentDescriptor?: number;
 }
 
 /**
@@ -1097,10 +1127,12 @@ export class EphemeralBlobStore extends BlobStore {
 	#bufferCacheBytes = 0;
 	#adoptedVerifiedDir = false;
 	#disposed = false;
+	#disposalParentDescriptor: number | null = null;
 
 	constructor(dir: string, options: EphemeralBlobStoreOptions = {}) {
 		super(dir);
 		this.#adoptedVerifiedDir = options.adoptVerifiedDir === true;
+		this.#disposalParentDescriptor = options.disposalParentDescriptor ?? null;
 		if (this.#adoptedVerifiedDir) return;
 		fs.rmSync(dir, { recursive: true, force: true });
 		fs.mkdirSync(dir, { recursive: true, mode: BLOB_DIR_MODE });
@@ -1114,10 +1146,15 @@ export class EphemeralBlobStore extends BlobStore {
 	static adoptVerifiedDir(dir: string): EphemeralBlobStore {
 		const uid = residentCacheOwnerUid(dir);
 		let descriptor: number | null = null;
+		let parentDescriptor: number | null = null;
 		let failure: unknown;
 		try {
 			descriptor = openVerifiedResidentCacheDirectory(dir, uid);
 			assertResidentCacheDirectoryPathMatchesDescriptor(dir, descriptor, uid);
+			const parentDir = path.dirname(dir);
+			const parentUid = residentCacheOwnerUid(parentDir);
+			parentDescriptor = openVerifiedResidentCacheDirectory(parentDir, parentUid);
+			assertResidentCacheDirectoryPathMatchesDescriptor(parentDir, parentDescriptor, parentUid);
 		} catch (error) {
 			failure = error;
 		}
@@ -1129,10 +1166,18 @@ export class EphemeralBlobStore extends BlobStore {
 			}
 		}
 		if (failure !== undefined) {
+			if (parentDescriptor !== null) {
+				try {
+					fs.closeSync(parentDescriptor);
+				} catch {
+					// Preserve the adoption failure.
+				}
+			}
 			removeEmptyResidentCacheInstanceDir(dir);
 			throw residentCacheTrustError("instance_adoption_failed", dir, failure);
 		}
-		return new EphemeralBlobStore(dir, { adoptVerifiedDir: true });
+		if (parentDescriptor === null) throw new ResidentCacheTrustError("parent_authority_unavailable", dir);
+		return new EphemeralBlobStore(dir, { adoptVerifiedDir: true, disposalParentDescriptor: parentDescriptor });
 	}
 
 	#cachePut(hash: string, data: Buffer): void {
@@ -1258,7 +1303,15 @@ export class EphemeralBlobStore extends BlobStore {
 		this.#bufferCache.clear();
 		this.#bufferCacheBytes = 0;
 		if (this.#adoptedVerifiedDir) {
-			disposeVerifiedResidentCacheInstanceDir(this.dir);
+			disposeVerifiedResidentCacheInstanceDir(this.dir, this.#disposalParentDescriptor ?? undefined);
+			if (this.#disposalParentDescriptor !== null) {
+				try {
+					fs.closeSync(this.#disposalParentDescriptor);
+				} catch {
+					// Disposal is already complete; descriptor cleanup cannot restore the tree.
+				}
+				this.#disposalParentDescriptor = null;
+			}
 			this.#disposed = true;
 			return;
 		}
@@ -1566,8 +1619,10 @@ export interface CanonicalBlobEntry {
 	readonly path: string;
 	readonly bytes: number;
 	readonly mtimeMs: number;
-	readonly dev: number;
-	readonly ino: number;
+	readonly mtimeNs: bigint;
+	readonly dev: bigint;
+	readonly ino: bigint;
+	readonly nlink: bigint;
 }
 
 const CANONICAL_BLOB_NAME = /^[0-9a-f]{64}$/;
@@ -1599,20 +1654,22 @@ export async function listCanonicalBlobs(dir: string): Promise<CanonicalBlobEntr
 	for (const name of names) {
 		if (!CANONICAL_BLOB_NAME.test(name)) continue;
 		const blobPath = path.join(dir, name);
-		let stat: fs.Stats;
+		let stat: fs.BigIntStats;
 		try {
-			stat = await fsp.lstat(blobPath);
+			stat = await fsp.lstat(blobPath, { bigint: true });
 		} catch {
 			continue;
 		}
-		if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) continue;
+		if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n) continue;
 		entries.push({
 			hash: name,
 			path: blobPath,
-			bytes: stat.size,
-			mtimeMs: stat.mtimeMs,
+			bytes: Number(stat.size),
+			mtimeMs: Number(stat.mtimeMs),
+			mtimeNs: stat.mtimeNs,
 			dev: stat.dev,
 			ino: stat.ino,
+			nlink: stat.nlink,
 		});
 	}
 	return entries;
@@ -1635,32 +1692,45 @@ export async function removeCanonicalBlob(
 	entry: CanonicalBlobEntry,
 	options: { beforeUnlink?: () => Promise<boolean> } = {},
 ): Promise<{ removed: true } | { removed: false; reason: string; failed?: true }> {
-	let stat: fs.Stats;
+	let stat: fs.BigIntStats;
 	try {
-		stat = await fsp.lstat(entry.path);
+		stat = await fsp.lstat(entry.path, { bigint: true });
 	} catch (error) {
 		if (isEnoent(error)) return { removed: false, reason: "blob_disappeared" };
 		return { removed: false, reason: `blob_unverifiable: ${String(error)}`, failed: true };
 	}
-	if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+	if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n) {
 		return { removed: false, reason: "blob_not_plain_file" };
 	}
 	if (
 		stat.dev !== entry.dev ||
 		stat.ino !== entry.ino ||
-		stat.size !== entry.bytes ||
-		stat.mtimeMs !== entry.mtimeMs
+		stat.size !== BigInt(entry.bytes) ||
+		stat.mtimeNs !== entry.mtimeNs
 	) {
 		return { removed: false, reason: "blob_changed" };
 	}
 	if (options.beforeUnlink && !(await options.beforeUnlink())) {
 		return { removed: false, reason: "blob_reference_evidence_changed" };
 	}
-	try {
-		await fsp.unlink(entry.path);
-		return { removed: true };
-	} catch (error) {
-		if (isEnoent(error)) return { removed: false, reason: "blob_disappeared" };
-		return { removed: false, reason: `blob_unlink_failed: ${String(error)}`, failed: true };
+	const removed = exactUnlink(entry.path, {
+		dev: entry.dev,
+		ino: entry.ino,
+		nlink: entry.nlink,
+		size: BigInt(entry.bytes),
+		mtimeNs: entry.mtimeNs,
+		sha256: entry.hash,
+		quarantineName: `.gjc-gc-blob-${entry.hash}`,
+	});
+	if (removed.ok) return { removed: true };
+	if (removed.code === "cleanup_pending" && removed.detachedPath) {
+		try {
+			await fsp.unlink(removed.detachedPath);
+			return { removed: true };
+		} catch (error) {
+			return { removed: false, reason: `blob_cleanup_failed: ${String(error)}`, failed: true };
+		}
 	}
+	if (removed.code === "not_found") return { removed: false, reason: "blob_disappeared" };
+	return { removed: false, reason: `blob_unlink_failed: ${removed.code ?? "unknown"}`, failed: true };
 }

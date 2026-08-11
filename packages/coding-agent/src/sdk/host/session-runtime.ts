@@ -270,6 +270,7 @@ export interface InvocationReconciliation {
 		frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
 	): Promise<void>;
 	lookup(kind: InvocationKind, selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown;
+	lookupResult(kind: InvocationKind, selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown;
 	hydrate(): Promise<void>;
 }
 
@@ -473,6 +474,10 @@ export function createInvocationReconciliation(
 				...(record.error === undefined ? {} : { error: record.error }),
 			};
 		},
+		lookupResult(kind, selector) {
+			const result = this.lookup(kind, selector) as Record<string, unknown>;
+			return result.status === "unknown" ? result : { kind, ...result };
+		},
 		hydrate,
 	};
 }
@@ -487,8 +492,12 @@ export interface SdkSurfaceFactoryOptions {
 	configOverrides?: ReadonlyMap<string, unknown>;
 	/** Session settings; used for model-usage preferences in profile-limit resolution. */
 	settings?: Settings;
-	promptStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
-	skillStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
+	turnResultLookup?: (selector: {
+		kind: "prompt" | "skill";
+		commandId?: string;
+		turnId?: string;
+		clientRef?: string;
+	}) => unknown;
 	hostTools?: boolean | (() => boolean);
 }
 
@@ -511,8 +520,12 @@ function createQuerySurface(
 		configOverrides?: ReadonlyMap<string, unknown>;
 		/** Session settings; used for model-usage preferences in profile-limit resolution. */
 		settings?: Settings;
-		promptStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
-		skillStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
+		turnResultLookup?: (selector: {
+			kind: "prompt" | "skill";
+			commandId?: string;
+			turnId?: string;
+			clientRef?: string;
+		}) => unknown;
 		hostTools?: boolean | (() => boolean);
 	} = {},
 ): SessionSurface {
@@ -778,9 +791,15 @@ function createQuerySurface(
 		getArtifactRange: (artifactId, offset, length) => ctx.getArtifactRange?.(artifactId, offset, length),
 		getJobs: () => ctx.getJobs(),
 		getPromptStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
-			(options.promptStatusLookup ?? (value => reconciliation.lookup("prompt", value)))(selector),
+			reconciliation.lookup("prompt", selector),
 		getSkillInvokeStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
-			(options.skillStatusLookup ?? (value => reconciliation.lookup("skill", value)))(selector),
+			reconciliation.lookup("skill", selector),
+		getTurnResult: (selector: {
+			kind: "prompt" | "skill";
+			commandId?: string;
+			turnId?: string;
+			clientRef?: string;
+		}) => (options.turnResultLookup ?? (value => reconciliation.lookupResult(value.kind, value)))(selector),
 		getModelProfiles: async () => {
 			const profiles = ctx.modelRegistry.getModelProfiles();
 			const authenticatedProviders = await collectAuthenticatedProfileProviders(profiles, provider =>
@@ -824,8 +843,7 @@ export function createSdkSurfaceFactory(
 		getLiveState: options.getLiveState,
 		configOverrides: options.configOverrides,
 		settings: options.settings,
-		promptStatusLookup: options.promptStatusLookup,
-		skillStatusLookup: options.skillStatusLookup,
+		turnResultLookup: options.turnResultLookup,
 		hostTools: options.hostTools,
 	});
 	return {
@@ -1016,9 +1034,10 @@ function createControlSurface(
 		run: (options: {
 			onPreflightAccepted: () => void;
 			onPreflightAcceptCommit: () => Promise<void>;
-		}) => Promise<void>,
+		}) => Promise<unknown>,
 		acceptedFields?: () => Record<string, unknown>,
 		allowCompletionFallback = false,
+		alwaysQueued = false,
 	): Promise<unknown> => {
 		const retainedClientRef = normalizeClientRef(clientRef);
 		reconciliation.admit(kind, retainedClientRef);
@@ -1028,6 +1047,7 @@ function createControlSurface(
 		let settled = false;
 		const accept = async (): Promise<void> => {
 			if (settled) return;
+
 			try {
 				await reconciliation.noteAccepted(kind, correlation, retainedClientRef);
 				accepted = true;
@@ -1040,6 +1060,11 @@ function createControlSurface(
 				throw error;
 			}
 		};
+		// Snapshot before run(): if the session is streaming when the submission starts,
+		// sendUserMessage will divert to steer-queue and resolve before the turn runs.
+		// Re-reading ctx.isIdle() after run() would race — accept() does async fs I/O that
+		// yields, so isStreaming can flip during the persist window.
+		const queuedAtDispatch = alwaysQueued || !ctx.isIdle();
 		try {
 			const submission = Promise.resolve(
 				run({
@@ -1048,9 +1073,20 @@ function createControlSurface(
 				}),
 			);
 			void submission.then(
-				() => {
+				result => {
 					if (settled) {
-						if (kind === "skill") void reconciliation.noteTransition(kind, correlation, { type: "agent_end" });
+						// A resolved submission after preflight acceptance means the work is over
+						// for every kind. `noteTransition` ignores an already-terminal record, so
+						// terminalizing here is safe — unless the submission resolved at queue time
+						// (followUp, or a prompt diverted to steer while streaming), in which case
+						// the turn's own lifecycle events drive terminalization.
+						if (!queuedAtDispatch)
+							void reconciliation.noteTransition(kind, correlation, {
+								type: "agent_end",
+								...(typeof result === "string"
+									? { content: { version: 1, type: "text", text: result, byteLength: 0, truncated: false } }
+									: {}),
+							});
 						return;
 					}
 					if (allowCompletionFallback) {
@@ -1102,7 +1138,14 @@ function createControlSurface(
 			return { commandId: crypto.randomUUID(), accepted: true };
 		},
 		followUp: async text =>
-			submit("prompt", undefined, options => api.sendUserMessage(text, { ...options, deliverAs: "followUp" })),
+			submit(
+				"prompt",
+				undefined,
+				options => api.sendUserMessage(text, { ...options, deliverAs: "followUp" }),
+				undefined,
+				false,
+				true,
+			),
 		abort: () => {
 			ctx.abort();
 			return { aborted: true };
@@ -1142,7 +1185,7 @@ function createControlSurface(
 						onSkillPrepared: meta => {
 							prepared = meta;
 						},
-					}).then(() => undefined),
+					}).then(result => result),
 				() => ({
 					name: prepared?.name ?? String(name),
 					path: prepared?.path ?? "",
@@ -1381,8 +1424,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			id: sessionId,
 			api,
 			reconciliation,
-			promptStatusLookup: selector => reconciliation.lookup("prompt", selector),
-			skillStatusLookup: selector => reconciliation.lookup("skill", selector),
+			turnResultLookup: selector => reconciliation.lookupResult(selector.kind, selector),
 			configOverrides: options.configOverrides,
 			settings: options.settings,
 		});

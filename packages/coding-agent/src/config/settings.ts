@@ -37,7 +37,7 @@ import {
 	parseNotificationSettingsSnapshot,
 } from "../sdk/bus/config";
 import { AgentStorage } from "../session/agent-storage";
-import { type EditMode, normalizeEditMode } from "../utils/edit-mode";
+import { type EditMode, type EditVariantMatch, normalizeEditMode } from "../utils/edit-mode";
 import {
 	type AtomicYamlPatch,
 	applyAtomicYamlPatches,
@@ -76,6 +76,8 @@ export * from "./settings-schema";
 export interface RawSettings {
 	[key: string]: unknown;
 }
+
+const UNSAFE_EDIT_VARIANT_PATTERNS = new Set(["__proto__", "constructor", "prototype"]);
 
 type SettingsPatch = {
 	readonly path: string;
@@ -964,20 +966,52 @@ export class Settings implements NotificationSettingsReader {
 	/**
 	 * Get the edit variant for a specific model.
 	 * Returns "patch", "replace", "hashline", "vim", "apply_patch", or null (use global default).
+	 * Skips invalid values; prefer `matchEditVariantForModel` when invalid
+	 * matches must fail closed instead of falling through.
 	 */
 	getEditVariantForModel(model: string | undefined): EditMode | null {
 		if (!model) return null;
-		const variants = (this.#merged.edit as { modelVariants?: Record<string, string> })?.modelVariants;
+		const variants = this.#editModelVariants();
 		if (!variants) return null;
-		for (const pattern in variants) {
+		for (const [pattern, rawValue] of Object.entries(variants)) {
+			if (UNSAFE_EDIT_VARIANT_PATTERNS.has(pattern)) continue;
 			if (model.includes(pattern)) {
-				const value = normalizeEditMode(variants[pattern]);
+				const value = normalizeEditMode(rawValue);
 				if (value) {
 					return value;
 				}
 			}
 		}
 		return null;
+	}
+
+	/**
+	 * First matching `edit.modelVariants` rule for a model, with its raw
+	 * (unvalidated) value. The edit-mode resolver uses this discriminated
+	 * result so a matched-but-invalid value fails closed with a diagnostic
+	 * rather than silently resolving to another mode.
+	 */
+	matchEditVariantForModel(model: string | undefined): EditVariantMatch | null {
+		if (!model) return null;
+		const variants = this.#editModelVariants();
+		if (!variants) return null;
+		for (const [pattern, value] of Object.entries(variants)) {
+			if (UNSAFE_EDIT_VARIANT_PATTERNS.has(pattern)) continue;
+			if (model.includes(pattern)) {
+				return { pattern, value: String(value) };
+			}
+		}
+		return null;
+	}
+
+	#editModelVariants(): Record<string, string> | undefined {
+		const variants = (this.#merged.edit as { modelVariants?: unknown })?.modelVariants;
+		return typeof variants === "object" &&
+			variants !== null &&
+			!Array.isArray(variants) &&
+			(Object.getPrototypeOf(variants) === Object.prototype || Object.getPrototypeOf(variants) === null)
+			? (variants as Record<string, string>)
+			: undefined;
 	}
 
 	/**
@@ -1627,6 +1661,40 @@ export class Settings implements NotificationSettingsReader {
 			}
 		}
 
+		// Migrate legacy providers.image* settings into modelRoles.image.
+		// The image-generation model is now selected via the model-role system
+		// (/model image <selector>) instead of a separate provider config dialog.
+		const providersObj = raw.providers as Record<string, unknown> | undefined;
+		if (providersObj && typeof providersObj.image === "string") {
+			const imageProvider = providersObj.image as string;
+			const imageModel = typeof providersObj.imageModel === "string" ? providersObj.imageModel : undefined;
+			const imageCustomUrl =
+				typeof providersObj.imageCustomUrl === "string" ? providersObj.imageCustomUrl : undefined;
+
+			if (imageProvider !== "auto") {
+				const roles = rawSettingsRecord(raw.modelRoles) ?? {};
+				if (!roles.image) {
+					if (imageProvider === "custom" && imageCustomUrl) {
+						// Custom providers are registered as first-class OpenAI-compatible providers;
+						// the migration produces a provider/model selector.
+						const customProviderId = "image-custom";
+						roles.image = `${customProviderId}/${imageModel ?? "gpt-image-2"}`;
+					} else if (imageModel) {
+						roles.image = `${imageProvider}/${imageModel}`;
+					} else {
+						roles.image = imageProvider;
+					}
+					raw.modelRoles = roles;
+				}
+			}
+
+			delete providersObj.image;
+			delete providersObj.imageModel;
+			delete providersObj.imageCustomUrl;
+			delete providersObj.imageCustomKey;
+			delete providersObj.imageCustomKeyEnv;
+		}
+
 		raw.configSchemaVersion = CONFIG_SCHEMA_VERSION;
 
 		return raw;
@@ -2041,18 +2109,16 @@ export class Settings implements NotificationSettingsReader {
 
 			if (override === undefined) continue;
 
-			if (
+			const value =
 				typeof override === "object" &&
 				override !== null &&
 				!Array.isArray(override) &&
 				typeof baseVal === "object" &&
 				baseVal !== null &&
 				!Array.isArray(baseVal)
-			) {
-				result[key] = this.#deepMerge(baseVal as RawSettings, override as RawSettings);
-			} else {
-				result[key] = override;
-			}
+					? this.#deepMerge(baseVal as RawSettings, override as RawSettings)
+					: override;
+			Object.defineProperty(result, key, { configurable: true, enumerable: true, value, writable: true });
 		}
 		return result;
 	}

@@ -1621,9 +1621,10 @@
 					"enum": [
 						"off",
 						"shadow",
-						"enabled"
+						"enabled",
+						"auto"
 					],
-					"default": "shadow"
+					"default": "auto"
 				},
 				"contextOverflowRecovery": {
 					"type": "boolean",
@@ -1638,14 +1639,29 @@
 				"mode": {
 					"type": "string",
 					"enum": [
+						"auto",
 						"apply_patch",
 						"hashline",
 						"patch",
 						"replace",
 						"vim"
 					],
-					"description": "Select the edit tool variant (replace, patch, hashline, vim, or apply_patch)",
-					"default": "hashline"
+					"description": "Select the edit tool variant (auto routes by model family; replace, patch, hashline, vim, or apply_patch)",
+					"default": "auto"
+				},
+				"modelVariants": {
+					"type": "object",
+					"additionalProperties": {
+						"type": "string",
+						"enum": [
+							"apply_patch",
+							"hashline",
+							"patch",
+							"replace",
+							"vim"
+						]
+					},
+					"default": {}
 				},
 				"fuzzyMatch": {
 					"type": "boolean",
@@ -2665,36 +2681,6 @@
 					],
 					"description": "Provider for web search tool",
 					"default": "auto"
-				},
-				"image": {
-					"type": "string",
-					"enum": [
-						"auto",
-						"openai",
-						"gemini",
-						"openrouter",
-						"antigravity",
-						"alibaba",
-						"custom"
-					],
-					"description": "Provider and model for image generation tool",
-					"default": "auto"
-				},
-				"imageModel": {
-					"type": "string",
-					"description": "Override the default image generation model for the selected provider"
-				},
-				"imageCustomUrl": {
-					"type": "string",
-					"description": "Base URL for custom OpenAI-compatible image endpoint"
-				},
-				"imageCustomKey": {
-					"type": "string",
-					"description": "API key for custom OpenAI-compatible image endpoint"
-				},
-				"imageCustomKeyEnv": {
-					"type": "string",
-					"description": "Environment variable name holding the API key for custom image endpoint"
 				},
 				"kimiApiFormat": {
 					"type": "string",

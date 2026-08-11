@@ -113,7 +113,7 @@ isolatedSdkHostTest(
 			streamMaxRetries: 0,
 		});
 		let handlers!: Map<string, (event: unknown, context: unknown) => unknown>;
-		handlers = start(sessionContext, async () => {
+		handlers = await start(sessionContext, async () => {
 			await agent.prompt("reproduce the reviewer findings");
 		});
 		const unsubscribe = agent.subscribe(event => {
@@ -200,7 +200,7 @@ isolatedSdkHostTest(
 		const sessionId = `sdk-prompt-terminal-accepted-rejection-${Date.now()}`;
 		const sessionContext = context(cwd, sessionId);
 		const reason = `Accepted sendUserMessage rejected after commit: ${"y".repeat(600)}`;
-		const handlers = start(sessionContext, async () => {
+		const handlers = await start(sessionContext, async () => {
 			throw new Error(reason);
 		});
 		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
@@ -273,7 +273,7 @@ isolatedSdkHostTest(
 		dirs.push(cwd);
 		const sessionId = `sdk-prompt-terminal-cancel-${Date.now()}`;
 		const sessionContext = context(cwd, sessionId);
-		const handlers = start(sessionContext);
+		const handlers = await start(sessionContext);
 		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };

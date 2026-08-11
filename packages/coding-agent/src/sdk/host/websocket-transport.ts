@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { withFileLock } from "../../config/file-lock";
 import type { SessionSdkTransport } from "./session-runtime";
 import type { SdkFrame } from "./types";
 
@@ -8,7 +9,7 @@ type SocketData = { connectionId: string };
 type Socket = { readonly data: SocketData; send(message: string): void; close(): void; terminate?(): void };
 
 export interface SdkWebSocketTransportDependencies {
-	readonly filesystem?: Pick<typeof fs, "mkdir" | "writeFile" | "chmod" | "rm">;
+	readonly filesystem?: Pick<typeof fs, "mkdir" | "writeFile" | "chmod" | "rename" | "readFile" | "rm">;
 	readonly serve?: typeof Bun.serve;
 }
 type SdkServer = ReturnType<typeof Bun.serve<SocketData>>;
@@ -70,6 +71,7 @@ export async function createSdkWebSocketTransport(
 	let started = false;
 	let startPromise: Promise<{ url: string }> | undefined;
 	let stopPromise: Promise<void> | undefined;
+	let publishedEndpoint: string | undefined;
 
 	const stopServer = async (current: SdkServer): Promise<void> => {
 		try {
@@ -96,10 +98,18 @@ export async function createSdkWebSocketTransport(
 		if (current) await stopServer(current);
 	};
 
-	const removeEndpoint = async (): Promise<void> => {
+	const removePublishedEndpoint = async (): Promise<void> => {
+		if (publishedEndpoint === undefined) return;
 		try {
+			const endpoint = await filesystem.readFile(endpointFile, "utf8");
+			if (endpoint !== publishedEndpoint) return;
 			await filesystem.rm(endpointFile, { force: true });
+			publishedEndpoint = undefined;
 		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				publishedEndpoint = undefined;
+				return;
+			}
 			throw asLifecycleError("endpoint_remove_failed", "SDK endpoint file removal failed.", error);
 		}
 	};
@@ -140,6 +150,7 @@ export async function createSdkWebSocketTransport(
 			if (started && server) return { url: endpointUrl(server) };
 
 			const pending = (async (): Promise<{ url: string }> => {
+				const tempEndpointFile = `${endpointFile}.${randomUUID()}.tmp`;
 				let localServer: SdkServer | undefined;
 				const failures: unknown[] = [];
 				try {
@@ -195,26 +206,39 @@ export async function createSdkWebSocketTransport(
 					});
 					server = localServer;
 					const url = endpointUrl(localServer);
-					try {
-						await filesystem.writeFile(
-							endpointFile,
-							JSON.stringify({
-								version: 1,
-								sessionId: input.sessionId,
-								url,
-								token: input.token,
-								pid: process.pid,
-							}),
-							"utf8",
-						);
-					} catch (error) {
-						throw asLifecycleError("endpoint_write_failed", "SDK endpoint file publication failed.", error);
-					}
-					try {
-						await filesystem.chmod(endpointFile, 0o600);
-					} catch (error) {
-						throw asLifecycleError("endpoint_chmod_failed", "SDK endpoint file permission update failed.", error);
-					}
+					const endpoint = JSON.stringify({
+						version: 1,
+						sessionId: input.sessionId,
+						url,
+						token: input.token,
+						pid: process.pid,
+					});
+					await withFileLock(endpointFile, async () => {
+						try {
+							await filesystem.writeFile(tempEndpointFile, endpoint, {
+								encoding: "utf8",
+								mode: 0o600,
+								flag: "wx",
+							});
+						} catch (error) {
+							throw asLifecycleError("endpoint_write_failed", "SDK endpoint file publication failed.", error);
+						}
+						try {
+							await filesystem.chmod(tempEndpointFile, 0o600);
+						} catch (error) {
+							throw asLifecycleError(
+								"endpoint_chmod_failed",
+								"SDK endpoint file permission update failed.",
+								error,
+							);
+						}
+						try {
+							await filesystem.rename(tempEndpointFile, endpointFile);
+						} catch (error) {
+							throw asLifecycleError("endpoint_write_failed", "SDK endpoint file publication failed.", error);
+						}
+						publishedEndpoint = endpoint;
+					});
 					started = true;
 					return { url };
 				} catch (error) {
@@ -227,9 +251,11 @@ export async function createSdkWebSocketTransport(
 						failures.push(cleanupError);
 					}
 					try {
-						await removeEndpoint();
+						await filesystem.rm(tempEndpointFile, { force: true });
 					} catch (cleanupError) {
-						failures.push(cleanupError);
+						failures.push(
+							asLifecycleError("endpoint_remove_failed", "SDK endpoint temp file removal failed.", cleanupError),
+						);
 					}
 					started = false;
 					server = undefined;
@@ -255,12 +281,10 @@ export async function createSdkWebSocketTransport(
 				if (startPromise) await startPromise.catch(() => undefined);
 				const failures: unknown[] = [];
 				try {
-					await closeServer();
-				} catch (error) {
-					failures.push(error);
-				}
-				try {
-					await removeEndpoint();
+					await withFileLock(endpointFile, async () => {
+						await closeServer();
+						await removePublishedEndpoint();
+					});
 				} catch (error) {
 					failures.push(error);
 				}

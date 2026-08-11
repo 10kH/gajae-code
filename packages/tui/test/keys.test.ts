@@ -2,6 +2,8 @@ import { describe, expect, it } from "bun:test";
 import {
 	extractPrintableText,
 	isKeyId,
+	isKeyRelease,
+	isKeyRepeat,
 	matchesKey,
 	parseKey,
 	parseKeyId,
@@ -39,6 +41,17 @@ describe("matchesKey", () => {
 		expect(matchesKey(dvorakCtrlK, "ctrl+v")).toBe(false);
 		setKittyProtocolActive(false);
 	});
+	it("matches modified Korean Dubeolsik keys when Kitty omits the base-layout key", () => {
+		setKittyProtocolActive(true);
+		expect(matchesKey("\x1b[12621;5u", "ctrl+v")).toBe(true);
+		expect(matchesKey("\x1b[12621;9u", "super+v")).toBe(true);
+		expect(matchesKey("\x1b[12621;3u", "alt+v")).toBe(true);
+		expect(matchesKey("\x1b[12621u", "v")).toBe(false);
+		expect(matchesKey("\x1b[12621;5u", "ctrl+b")).toBe(false);
+		expect(matchesKey("\x1b[12621;5:3u", "ctrl+v")).toBe(false);
+		expect(matchesKey("\x1b[12626;2u", "shift+o")).toBe(false);
+		setKittyProtocolActive(false);
+	});
 
 	it("should prefer codepoint for symbol keys even when base layout differs", () => {
 		setKittyProtocolActive(true);
@@ -53,6 +66,26 @@ describe("matchesKey", () => {
 		expect(matchesKey("\x1b[127u", "backspace")).toBe(true);
 		expect(matchesKey("\x1b[127;1:2u", "backspace")).toBe(true);
 		expect(matchesKey("\x1b[127;1:3u", "backspace")).toBe(false);
+		setKittyProtocolActive(false);
+	});
+	it("filters Kitty release and repeat events for CSI letter finals", () => {
+		setKittyProtocolActive(true);
+		for (const final of ["E", "P", "Q", "R", "S"]) {
+			const release = `\x1b[1;1:3${final}`;
+			const repeat = `\x1b[1;1:2${final}`;
+			expect(isKeyRelease(release)).toBe(true);
+			expect(isKeyRepeat(repeat)).toBe(true);
+			expect(matchesKey(release, "f1")).toBe(false);
+			expect(parseKey(release)).toBeUndefined();
+		}
+		setKittyProtocolActive(false);
+	});
+	it("rejects unknown Kitty event types", () => {
+		setKittyProtocolActive(true);
+		for (const sequence of ["\x1b[112;1:0u", "\x1b[112;1:4u", "\x1b[1;1:4P", "\x1b[15;1:4~"]) {
+			expect(parseKey(sequence)).toBeUndefined();
+			expect(matchesKey(sequence, "p")).toBe(false);
+		}
 		setKittyProtocolActive(false);
 	});
 
@@ -134,6 +167,14 @@ describe("matchesKey", () => {
 		expect(parseKeyId("cmd+p")?.keyId).toBe("super+p");
 		expect(isKeyId("option+q")).toBe(false);
 		expect(isKeyId("command+p")).toBe(false);
+	});
+	it("rejects duplicate and inherited modifier aliases", () => {
+		for (const value of ["ctrl+ctrl+p", "option+alt+p", "meta+option+p", "command+super+p"]) {
+			expect(parseKeyId(value)).toBeUndefined();
+		}
+		for (const value of ["constructor+p", "toString+p", "__proto__+p"]) {
+			expect(parseKeyId(value)).toBeUndefined();
+		}
 	});
 });
 describe.each([
@@ -336,6 +377,23 @@ describe("extractPrintableText", () => {
 
 	it("preserves Kitty CSI-u text-field decoding for supported modifiers", () => {
 		expect(extractPrintableText("\x1b[97;1;229u")).toBe("å");
+	});
+	it("rejects malformed event types, modifier overflow, control text, and surrogate code points", () => {
+		for (const data of [
+			"\x1b[97;1:0u",
+			"\x1b[97;1:03u",
+			"\x1b[97;1:4u",
+			"\x1b[97;4294967297u",
+			"\x1b[27;4294967297;97~",
+			"\x1b[127u",
+			"\x1b[128u",
+			"\x1b[97;1;127u",
+			"\x1b[55296u",
+			"\x1b[97;1;55296u",
+			"\x1b[27;1;55296~",
+		]) {
+			expect(extractPrintableText(data)).toBeUndefined();
+		}
 	});
 });
 describe("KeyId grammar", () => {

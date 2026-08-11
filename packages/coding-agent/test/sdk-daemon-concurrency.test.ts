@@ -270,9 +270,9 @@ describe("ConversationStore", () => {
 		const fs = new MemoryConversationStoreFs();
 		const store = new ConversationStore<TestConversation>({ agentDir: "/agent", kind: "discord", fs, now: () => 4 });
 		await store.write("mapping", undefined, record(1));
-		fs.failFileSync = true;
+		fs.failDocumentSync = true;
 		await expect(store.write("mapping", 1, record(2))).rejects.toThrow("sync failed");
-		fs.failFileSync = false;
+		fs.failDocumentSync = false;
 		fs.failRename = true;
 		await expect(store.write("mapping", 1, record(2))).rejects.toThrow("rename failed");
 		expect(await store.read("mapping")).toEqual(record(1));

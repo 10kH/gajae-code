@@ -1199,8 +1199,8 @@ describe("AgentSession durable default model selection", () => {
 			[
 				"edit:",
 				"  modelVariants:",
-				'    "initial-provider/initial": replace',
-				'    "target-provider/reasoning": patch',
+				'    "initial-provider/initial": apply_patch',
+				'    "target-provider/reasoning": apply_patch',
 			].join("\n"),
 		);
 		resetSettingsForTest();

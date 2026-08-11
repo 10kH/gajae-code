@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as crypto from "node:crypto";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
@@ -16,7 +16,12 @@ import {
 	parseDictionaryArtifactCommit,
 	serializeParentBucketRecord,
 } from "../../src/session/internal/session-memory-sidecar";
-import { SessionManager, SessionManagerTestHooks } from "../../src/session/session-manager";
+import {
+	BOUNDED_FIRST_OPEN_MAX_LINE_BYTES,
+	BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
+	SessionManager,
+	SessionManagerTestHooks,
+} from "../../src/session/session-manager";
 import {
 	FileSessionStorage,
 	MemorySessionStorage,
@@ -82,6 +87,9 @@ const itPosix = it.skipIf(process.platform === "win32");
 const describePosix = describe.skipIf(process.platform === "win32");
 
 describe("SessionManager cold sidecar integration", () => {
+	it("admits a two-GiB transcript plus bounded fork header headroom", () => {
+		expect(BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES).toBe(2 * 1024 * 1024 * 1024 + 1024 * 1024);
+	});
 	it("retires a compacted prefix on resume and lazily reloads exact transcript entries", async () => {
 		const tempDir = TempDir.createSync("@pi-session-memory-sidecar-");
 		const storage = new FileSessionStorage();
@@ -596,16 +604,18 @@ describe("SessionManager cold sidecar integration", () => {
 			fs.chmodSync(path.join(staleSidecar, "owner.json"), 0o600);
 			fs.writeFileSync(path.join(staleSidecar, ".session-memory.spill.idx"), "crash debris", { mode: 0o600 });
 			const transcriptRead = vi.spyOn(nestedStore, "readExpected");
-			const reopened = await SessionManager.openNestedManaged(
-				sessionFile,
-				destination,
-				nestedStore,
-				new FileSessionStorage(),
-				cwd,
-				"enabled",
-			);
-			expect(transcriptRead).not.toHaveBeenCalled();
+			SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1;
+			let reopened: SessionManager | undefined;
 			try {
+				reopened = await SessionManager.openNestedManaged(
+					sessionFile,
+					destination,
+					nestedStore,
+					new FileSessionStorage(),
+					cwd,
+					"auto",
+				);
+				expect(transcriptRead).not.toHaveBeenCalled();
 				expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
 				expect(reopened.getSessionMemoryStats().totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 				expect(reopened.getEntry(coldId)?.id).toBe(coldId);
@@ -616,7 +626,8 @@ describe("SessionManager cold sidecar integration", () => {
 				});
 				expect(fs.readdirSync(cacheRoot).filter(entry => entry.startsWith("i-")).length).toBe(1);
 			} finally {
-				await reopened.close();
+				SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
+				await reopened?.close();
 			}
 			expect(fs.existsSync(sidecarCacheRoot) ? fs.readdirSync(sidecarCacheRoot).length : 0).toBe(beforeReopen);
 			expect(fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0).toBe(residentEntriesBefore);
@@ -631,6 +642,59 @@ describe("SessionManager cold sidecar integration", () => {
 		},
 		60_000,
 	);
+	itPosix("rejects malformed auto-small nested managed transcripts", async () => {
+		const tempDir = TempDir.createSync("@pi-session-memory-nested-malformed-");
+		const cwd = path.join(tempDir.path(), "project");
+		const managedRoot = path.join(tempDir.path(), "managed");
+		fs.mkdirSync(cwd, { recursive: true });
+		fs.mkdirSync(managedRoot, { recursive: true, mode: 0o700 });
+		const rootStore = new ManagedSessionDescendantStore(managedDirectoryRoot(managedRoot), managedRoot);
+		try {
+			rootStore.ensureDirectory("review");
+			const nestedStore = rootStore.deriveSubtree("review");
+			const destination = SessionManager.nestedManagedDestination(nestedStore, nestedStore.dir);
+			const sessionFile = path.join(nestedStore.dir, "malformed.jsonl");
+			nestedStore.publishNoReplaceSync(
+				path.basename(sessionFile),
+				Buffer.from(
+					`${JSON.stringify({ type: "session", version: 5, id: "nested-malformed", timestamp: "0", cwd })}\n{malformed}\n`,
+					"utf8",
+				),
+			);
+			await expect(
+				SessionManager.openNestedManaged(
+					sessionFile,
+					destination,
+					nestedStore,
+					new FileSessionStorage(),
+					cwd,
+					"auto",
+				),
+			).rejects.toThrow("malformed");
+			const descriptor = nestedStore.descriptorExpected(path.basename(sessionFile));
+			if (!descriptor) throw new Error("Expected nested descriptor");
+			const oversizedDescriptor = vi
+				.spyOn(nestedStore, "descriptorExpected")
+				.mockReturnValue({ ...descriptor, size: 2 * 1024 * 1024 * 1024 + 2 * 1024 * 1024 });
+			try {
+				await expect(
+					SessionManager.openNestedManaged(
+						sessionFile,
+						destination,
+						nestedStore,
+						new FileSessionStorage(),
+						cwd,
+						"enabled",
+					),
+				).rejects.toMatchObject({ code: "oversized" });
+			} finally {
+				oversizedDescriptor.mockRestore();
+			}
+		} finally {
+			rootStore.close();
+			tempDir.removeSync();
+		}
+	});
 	it("fails closed when the authoritative cold prefix changes after shadow indexing", async () => {
 		const tempDir = TempDir.createSync("@pi-session-memory-mismatch-");
 		const storage = new FileSessionStorage();
@@ -1112,11 +1176,12 @@ it("reopens an enabled explicit session from authenticated hot-tail metadata", a
 		"enabled",
 	);
 	try {
-		expect(storage.textReads).toBeGreaterThan(0);
+		expect(storage.textReads).toBe(0);
 		expect(fallback.getSessionMemoryStats()).toMatchObject({
 			lazyReopenAttempted: true,
-			lazyReopenSucceeded: false,
-			lazyReopenFallbackReason: "proof_invalid",
+			lazyReopenSucceeded: true,
+			lazyReopenFallbackReason: undefined,
+			lastReopenTransition: { kind: "rebuild", reason: "bounded_first_open" },
 		});
 		expect(fallback.buildSessionContext().messages).toHaveLength(3);
 	} finally {
@@ -1124,7 +1189,7 @@ it("reopens an enabled explicit session from authenticated hot-tail metadata", a
 	}
 });
 
-it("applies enabled retirement while constructing a direct fork", async () => {
+it("applies auto-routed retirement while constructing a direct fork", async () => {
 	class ForkCountingStorage extends MemorySessionStorage {
 		fullReads = 0;
 		override readTextSync(filePath: string): string {
@@ -1153,20 +1218,125 @@ it("applies enabled retirement while constructing a direct fork", async () => {
 		},
 	];
 	storage.writeTextSync(source, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
-	const forked = await SessionManager.forkFrom(
-		source,
-		"/cwd",
-		SessionManager.explicitDestination("/forks"),
-		storage,
-		"copy-retain",
-		"enabled",
-	);
+	SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1;
+	let forked: SessionManager | undefined;
 	try {
+		forked = await SessionManager.forkFrom(
+			source,
+			"/cwd",
+			SessionManager.explicitDestination("/forks"),
+			storage,
+			"copy-retain",
+			"auto",
+		);
 		expect(forked.getSessionMemoryStats().coldRetirementActive).toBe(true);
 		expect(storage.fullReads).toBe(0);
 		expect(forked.getEntry("old")).toMatchObject({ id: "old" });
 	} finally {
+		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
+		await forked?.close();
+	}
+});
+
+it("constructs managed cold forks through bounded authority-bound publication", async () => {
+	const tempDir = TempDir.createSync("@pi-session-managed-bounded-fork-");
+	const storage = new FileSessionStorage();
+	const cwd = tempDir.path();
+	const agentDir = path.join(cwd, ".gjc");
+	const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+	const source = SessionManager.create(cwd, destination, storage);
+	let forked: SessionManager | undefined;
+	SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1;
+	try {
+		source.setSessionMemoryMode("off");
+		await source.ensureOnDisk();
+		const old = source.appendCustomEntry("node", { payload: "old" });
+		const kept = source.appendCustomEntry("node", { payload: "kept" });
+		source.appendCompaction("summary", undefined, kept, 1);
+		await source.flush();
+		await source.close();
+		const sourceFile = source.getSessionFile();
+		if (!sourceFile) throw new Error("Expected managed source file");
+		forked = await SessionManager.forkFrom(sourceFile, cwd, destination, storage, "copy-retain", "auto");
+		expect(forked.getSessionFile()).not.toBe(sourceFile);
+		expect(forked.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		expect(forked.getEntry(old)).toMatchObject({ id: old });
 		await forked.close();
+		forked = undefined;
+		const captured = SessionManager.captureTranscriptStrict(sourceFile, storage);
+		if (captured.kind !== "captured") throw new Error("Expected strict managed capture");
+		try {
+			const capturedFork = await SessionManager.forkFromCaptured(
+				captured.snapshot,
+				cwd,
+				destination,
+				"copy-retain",
+				"auto",
+			);
+			if (capturedFork.kind !== "forked") throw new Error(`Captured managed fork failed: ${capturedFork.reason}`);
+			forked = capturedFork.manager;
+			expect(forked.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			expect(forked.getEntry(old)).toMatchObject({ id: old });
+		} finally {
+			captured.snapshot.close();
+		}
+	} finally {
+		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
+		await forked?.close();
+		await source.close();
+		tempDir.removeSync();
+	}
+});
+
+itPosix("restores managed cold rollback authority across session directories", async () => {
+	const tempDir = TempDir.createSync("@pi-session-managed-rollback-");
+	const managedRoot = path.join(tempDir.path(), "managed");
+	fs.mkdirSync(managedRoot, { recursive: true, mode: 0o700 });
+	const rootStore = new ManagedSessionDescendantStore(managedDirectoryRoot(managedRoot), managedRoot);
+	let source: SessionManager | undefined;
+	let target: SessionManager | undefined;
+	SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1;
+	try {
+		rootStore.ensureDirectory("source");
+		const sourceStore = rootStore.deriveSubtree("source");
+		sourceStore.ensureDirectory("target");
+		const targetStore = sourceStore.deriveSubtree("target");
+		source = SessionManager.create(
+			"/cwd",
+			SessionManager.nestedManagedDestination(sourceStore, sourceStore.dir),
+			new FileSessionStorage(),
+		);
+		target = SessionManager.create(
+			"/cwd",
+			SessionManager.nestedManagedDestination(targetStore, targetStore.dir),
+			new FileSessionStorage(),
+		);
+		source.setSessionMemoryMode("auto");
+		target.setSessionMemoryMode("auto");
+		await source.ensureOnDisk();
+		await target.ensureOnDisk();
+		const sourceOld = source.appendCustomEntry("node", { payload: "source-old" });
+		const sourceKept = source.appendCustomEntry("node", { payload: "source-kept" });
+		source.appendCompaction("source summary", undefined, sourceKept, 1);
+		const targetOld = target.appendCustomEntry("node", { payload: "target-old" });
+		const targetKept = target.appendCustomEntry("node", { payload: "target-kept" });
+		target.appendCompaction("target summary", undefined, targetKept, 1);
+		await source.flush();
+		await target.flush();
+		const targetFile = target.getSessionFile();
+		if (!targetFile) throw new Error("Expected managed target file");
+		await target.close();
+		const rollback = await source.captureRollbackState();
+		await source.setSessionFile(targetFile);
+		expect(source.getEntry(targetOld)).toMatchObject({ id: targetOld });
+		await source.restoreRollbackState(rollback);
+		expect(source.getEntry(sourceOld)).toMatchObject({ id: sourceOld });
+	} finally {
+		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
+		await target?.close();
+		await source?.close();
+		rootStore.close();
+		tempDir.removeSync();
 	}
 });
 
@@ -1338,6 +1508,27 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 			lazyReopenFallbackReason: undefined,
 			lastReopenTransition: { kind: "rebuild", reason: "bounded_first_open" },
 		});
+		const stats = manager.getSessionMemoryStats();
+		expect(stats.reservedBudgetBytes).toBeGreaterThan(0);
+		expect(stats.allocatedCacheBytes).toBeGreaterThan(0);
+		expect(stats.hotResidentBytes).toBeGreaterThan(0);
+		expect(stats.metadataResidentBytes).toBeGreaterThan(0);
+		expect(stats.sidecarFileBytes).toBeGreaterThan(0);
+		expect(stats.firstOpen).toMatchObject({
+			attempted: true,
+			succeeded: true,
+			strategy: "pressure",
+			secondaryArtifactMode: "disabled",
+		});
+		expect(stats.firstOpen.semanticRecordsParsed).toBe(records.length);
+		expect(stats.firstOpen.suffixRecordsParsed).toBeGreaterThan(0);
+		expect(stats.firstOpen.recordsParsed).toBe(
+			stats.firstOpen.semanticRecordsParsed + stats.firstOpen.suffixRecordsParsed,
+		);
+		expect(stats.firstOpen.transcriptBytesRead).toBeGreaterThanOrEqual(transcript.length);
+		expect(stats.firstOpen.indexWriteBytes).toBeGreaterThan(0);
+		expect(stats.firstOpen.indexWriteCalls).toBeGreaterThan(0);
+		expect(stats.firstOpen.fsyncCount).toBe(2);
 		const cold = manager.getEntry("cold-old");
 		expect(cold).toMatchObject({ id: "cold-old", type: "message" });
 		if (cold?.type !== "message" || !("content" in cold.message)) throw new Error("Expected cold message entry");
@@ -1439,6 +1630,840 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 		expect(corruptIndex.getEntry("cold-old")).toMatchObject({ id: "cold-old", type: "message" });
 	} finally {
 		await corruptIndex.close();
+	}
+});
+
+it("fails closed without sidecar publication for unterminated bounded first-open input", async () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/unterminated-bounded.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "unterminated", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	storage.writeTextSync(sessionFile, records.map(record => JSON.stringify(record)).join("\n"));
+	const manager = await SessionManager.open(
+		sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
+		expect(storage.existsSync(sidecarPath(sessionFile, "commit"))).toBe(false);
+		expect(manager.getEntry("kept")).toMatchObject({ id: "kept" });
+	} finally {
+		await manager.close();
+	}
+});
+
+it("fails closed when strict capture input exceeds the exact scanner line limit", () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/oversized-line-bounded.jsonl";
+	const oversized = {
+		type: "custom",
+		id: "oversized",
+		parentId: null,
+		timestamp: "0",
+		customType: "oversized",
+		data: { payload: "x".repeat(BOUNDED_FIRST_OPEN_MAX_LINE_BYTES) },
+	};
+	const records = [
+		{ type: "session", version: 5, id: "oversized-line", timestamp: "0", cwd: "/cwd" },
+		oversized,
+		{ type: "custom", id: "kept", parentId: "oversized", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	const captured = SessionManager.captureTranscriptStrict(sessionFile, storage);
+	if (captured.kind === "captured") captured.snapshot.close();
+	expect(captured).toMatchObject({ kind: "error", reason: "malformed" });
+	expect(Buffer.byteLength(JSON.stringify(oversized), "utf8") + 1).toBeGreaterThan(BOUNDED_FIRST_OPEN_MAX_LINE_BYTES);
+	expect(storage.existsSync(sidecarPath(sessionFile, "commit"))).toBe(false);
+});
+
+it("rejects invalid UTF-8 during strict bounded capture", () => {
+	const tempDir = TempDir.createSync("@pi-session-invalid-utf8-");
+	const sessionFile = path.join(tempDir.path(), "invalid-utf8.jsonl");
+	try {
+		const header = Buffer.from(
+			`${JSON.stringify({ type: "session", version: 5, id: "invalid-utf8", timestamp: "0", cwd: "/cwd" })}\n`,
+			"utf8",
+		);
+		const prefix = Buffer.from('{"type":"custom","id":"bad","parentId":null,"timestamp":"0","customType":"', "utf8");
+		const suffix = Buffer.from('","data":{}}\n', "utf8");
+		fs.writeFileSync(sessionFile, Buffer.concat([header, prefix, Buffer.from([0xff]), suffix]));
+		expect(SessionManager.captureTranscriptStrict(sessionFile)).toMatchObject({ kind: "error", reason: "malformed" });
+	} finally {
+		tempDir.removeSync();
+	}
+});
+
+it("fails closed for a missing parent in the bounded first-open chain", async () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/missing-parent-bounded.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "missing-parent", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "kept", parentId: "missing", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	const manager = await SessionManager.open(
+		sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
+		expect(storage.existsSync(sidecarPath(sessionFile, "commit"))).toBe(false);
+		expect(manager.getEntry("kept")).toMatchObject({ parentId: "missing" });
+	} finally {
+		await manager.close();
+	}
+});
+
+it("rejects descriptor mutation during the bounded semantic scan", async () => {
+	class MutatingStorage extends MemorySessionStorage {
+		transcriptReads = 0;
+		override readRangeSync(filePath: string, offset: number, length: number) {
+			const snapshot = super.readRangeSync(filePath, offset, length);
+			if (filePath === "/sessions/mutating-bounded.jsonl" && ++this.transcriptReads === 2)
+				super.writeTextSync(filePath, `${super.readTextSync(filePath)}\n`);
+			return snapshot;
+		}
+	}
+	const storage = new MutatingStorage();
+	const sessionFile = "/sessions/mutating-bounded.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "mutating", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	await expect(
+		SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		),
+	).rejects.toThrow("unstable");
+	expect(storage.transcriptReads).toBeGreaterThanOrEqual(2);
+	expect(storage.existsSync(sidecarPath(sessionFile, "commit"))).toBe(false);
+});
+
+it("serializes concurrent bounded first-open publishers through an owner-bound lock", async () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/concurrent-bounded.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "concurrent", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	const [first, second] = await Promise.all([
+		SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		),
+		SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		),
+	]);
+	try {
+		expect(first.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		expect(second.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		expect([first, second].map(manager => manager.getSessionMemoryStats().lastReopenTransition?.kind).sort()).toEqual(
+			["exact", "rebuild"],
+		);
+		expect(storage.existsSync(`${sessionFile.slice(0, -6)}/.session-memory.spill.build-lock`)).toBe(false);
+	} finally {
+		await first.close();
+		await second.close();
+	}
+});
+
+it("binds explicitly enabled secondary artifacts to the discovered first-open session id", async () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/secondary-session-binding.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "secondary-session", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: { term: "old" } },
+		{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: { term: "kept" } },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	SessionManagerTestHooks.secondaryArtifactMode = "enabled";
+	let first: SessionManager | undefined;
+	let reopened: SessionManager | undefined;
+	try {
+		first = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		expect(first.getSessionMemoryStats().dictionaryArtifactEnabled).toBe(true);
+		await first.close();
+		first = undefined;
+		reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		expect(reopened.getSessionMemoryStats()).toMatchObject({
+			coldRetirementActive: true,
+			dictionaryArtifactEnabled: true,
+			lastReopenTransition: { kind: "exact" },
+		});
+	} finally {
+		SessionManagerTestHooks.secondaryArtifactMode = undefined;
+		await first?.close();
+		await reopened?.close();
+	}
+});
+
+it("refuses unbounded authoritative hydration after bounded sidecar tamper", async () => {
+	class CountingStorage extends MemorySessionStorage {
+		transcriptTextReads = 0;
+		override readTextSync(filePath: string): string {
+			if (!filePath.includes(".spill.")) this.transcriptTextReads++;
+			return super.readTextSync(filePath);
+		}
+	}
+	const storage = new CountingStorage();
+	const sessionFile = "/sessions/no-unbounded-hydration.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "no-hydration", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	const manager = await SessionManager.open(
+		sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		storage.transcriptTextReads = 0;
+		SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+		storage.writeTextSync(
+			sidecarPath(sessionFile, "idx"),
+			`${storage.readTextSync(sidecarPath(sessionFile, "idx"))}{}\n`,
+		);
+		expect(() => manager.getEntry("old")).toThrow("cold_sidecar_rebuild_required_for_bounded_transcript");
+		expect(storage.transcriptTextReads).toBe(0);
+	} finally {
+		SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
+		await manager.close();
+	}
+});
+
+it("rejects corrupt tail and commit artifacts through manager reopen", async () => {
+	class CountingStorage extends MemorySessionStorage {
+		transcriptTextReads = 0;
+		override readText(filePath: string): Promise<string> {
+			if (!filePath.includes(".spill.")) this.transcriptTextReads++;
+			return super.readText(filePath);
+		}
+		override readTextSync(filePath: string): string {
+			if (!filePath.includes(".spill.")) this.transcriptTextReads++;
+			return super.readTextSync(filePath);
+		}
+	}
+	for (const corruptKind of ["tail", "commit"] as const) {
+		const storage = new CountingStorage();
+		const sessionFile = `/sessions/corrupt-${corruptKind}.jsonl`;
+		const records = [
+			{ type: "session", version: 5, id: `corrupt-${corruptKind}`, timestamp: "0", cwd: "/cwd" },
+			{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: {} },
+			{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: {} },
+			{
+				type: "compaction",
+				id: "compact",
+				parentId: "kept",
+				timestamp: "0",
+				summary: "summary",
+				firstKeptEntryId: "kept",
+				tokensBefore: 1,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		const built = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		await built.close();
+		storage.writeTextSync(sidecarPath(sessionFile, corruptKind), "corrupt\n");
+		storage.transcriptTextReads = 0;
+
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(storage.readTextSync(sidecarPath(sessionFile, corruptKind))).not.toBe("corrupt\n");
+			expect(reopened.getEntry("old")).toMatchObject({ id: "old" });
+			expect(storage.transcriptTextReads).toBe(0);
+		} finally {
+			await reopened.close();
+		}
+	}
+});
+
+it("refreshes split residency metrics after append and retained off-mode rollback", async () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/split-metric-transitions.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "split-metrics", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	const manager = await SessionManager.open(
+		sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		const before = manager.getSessionMemoryStats();
+		manager.appendCustomEntry("metric", { payload: "x".repeat(1024) });
+		const appended = manager.getSessionMemoryStats();
+		expect(appended.reservedBudgetBytes).toBe(before.reservedBudgetBytes);
+		expect(appended.hotResidentBytes).toBeGreaterThan(before.hotResidentBytes);
+		expect(appended.metadataResidentBytes).toBeGreaterThanOrEqual(before.metadataResidentBytes);
+		manager.setSessionMemoryMode("off");
+		const disabled = manager.getSessionMemoryStats();
+		expect(disabled.reservedBudgetBytes).toBe(appended.reservedBudgetBytes);
+		expect(disabled.hotResidentBytes).toBe(appended.hotResidentBytes);
+	} finally {
+		await manager.close();
+	}
+});
+
+it("appends after tail overflow without materializing the complete cold index", async () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/tail-overflow-next-ordinal.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "tail-overflow", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	SessionManagerTestHooks.sidecarTailBufferBytesOverride = 1;
+	SessionManagerTestHooks.secondaryArtifactMode = "disabled";
+	SessionManagerTestHooks.readAllColdEntryIndexesCalls = 0;
+	SessionManagerTestHooks.coldIdHashMaxEntriesOverride = 4;
+	let manager: SessionManager | undefined;
+	try {
+		const built = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		await built.close();
+		manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		expect(SessionManagerTestHooks.lastSidecarInitError).toBeUndefined();
+		expect(manager.getSessionMemoryStats()).toMatchObject({
+			coldRetirementActive: true,
+			dictionaryArtifactEnabled: false,
+			lazyReopenSucceeded: true,
+		});
+		expect(storage.readTextSync(sidecarPath(sessionFile, "tail"))).toBe("");
+		SessionManagerTestHooks.readAllColdEntryIndexesCalls = 0;
+		const appendedId = manager.appendCustomEntry("after-overflow", {});
+		const clearedId = manager.clearModelRole("reviewer");
+		const finalId = manager.appendCustomEntry("after-clear", {});
+		expect(SessionManagerTestHooks.readAllColdEntryIndexesCalls).toBe(0);
+		const expected = [
+			{ id: appendedId, ordinal: 3 },
+			{ id: clearedId, ordinal: 4 },
+			{ id: finalId, ordinal: 5 },
+		];
+		const finalIndex = storage
+			.readTextSync(sidecarPath(sessionFile, "idx"))
+			.trimEnd()
+			.split("\n")
+			.slice(-3)
+			.map(line => JSON.parse(line));
+		const finalTail = storage
+			.readTextSync(sidecarPath(sessionFile, "tail"))
+			.trimEnd()
+			.split("\n")
+			.slice(-3)
+			.map(line => JSON.parse(line));
+		expect(finalIndex).toMatchObject(expected);
+		expect(finalTail).toMatchObject(expected);
+	} finally {
+		SessionManagerTestHooks.sidecarTailBufferBytesOverride = undefined;
+		SessionManagerTestHooks.secondaryArtifactMode = undefined;
+		SessionManagerTestHooks.readAllColdEntryIndexesCalls = undefined;
+		SessionManagerTestHooks.coldIdHashMaxEntriesOverride = undefined;
+		await manager?.close();
+	}
+});
+
+it("applies benchmark-only GC and secondary-artifact controls to bounded first-open", async () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/bounded-first-open-controls.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "controlled", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	SessionManagerTestHooks.firstOpenGcStrategy = "none";
+	SessionManagerTestHooks.secondaryArtifactMode = "disabled";
+	let manager: SessionManager | undefined;
+	try {
+		manager = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		const stats = manager.getSessionMemoryStats();
+		expect(stats.firstOpen).toMatchObject({
+			attempted: true,
+			succeeded: true,
+			strategy: "none",
+			secondaryArtifactMode: "disabled",
+			gcRequests: 0,
+			dictionaryArtifactEnabled: false,
+			parentArtifactEnabled: false,
+		});
+		expect(stats.dictionaryArtifactEnabled).toBe(false);
+		expect(stats.parentArtifactEnabled).toBe(false);
+	} finally {
+		SessionManagerTestHooks.firstOpenGcStrategy = undefined;
+		SessionManagerTestHooks.secondaryArtifactMode = undefined;
+		await manager?.close();
+	}
+});
+
+it("routes auto mode eagerly below the threshold and bounded above it", async () => {
+	const storage = new MemorySessionStorage();
+	const records = [
+		{ type: "session", version: 5, id: "auto-route", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	const transcript = `${records.map(record => JSON.stringify(record)).join("\n")}\n`;
+	const eagerFile = "/sessions/auto-route-eager.jsonl";
+	storage.writeTextSync(eagerFile, transcript);
+	const eager = await SessionManager.open(
+		eagerFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"auto",
+	);
+	try {
+		expect(eager.getSessionMemoryStats()).toMatchObject({
+			sidecarEnabled: false,
+			lazyReopenAttempted: false,
+		});
+		expect(eager.getEntry("old")).toMatchObject({ id: "old" });
+	} finally {
+		await eager.close();
+	}
+
+	const boundedFile = "/sessions/auto-route-bounded.jsonl";
+	storage.writeTextSync(boundedFile, transcript.replace('"auto-route"', '"auto-route-bounded"'));
+	SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1;
+	let bounded: SessionManager | undefined;
+	try {
+		bounded = await SessionManager.open(
+			boundedFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"auto",
+		);
+		expect(bounded.getSessionMemoryStats()).toMatchObject({
+			sidecarEnabled: true,
+			lazyReopenAttempted: true,
+			lazyReopenSucceeded: true,
+		});
+		expect(bounded.getEntry("old")).toMatchObject({ id: "old" });
+	} finally {
+		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
+		await bounded?.close();
+	}
+});
+
+it("rejects malformed auto-small explicit resumes through strict inspection", async () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/auto-small-explicit-malformed.jsonl";
+	storage.writeTextSync(
+		sessionFile,
+		`${JSON.stringify({ type: "session", version: 5, id: "auto-small-explicit", timestamp: "0", cwd: "/cwd" })}\n{malformed}\n`,
+	);
+	await expect(
+		SessionManager.open(sessionFile, SessionManager.explicitDestination("/sessions"), storage, "copy-retain", "auto"),
+	).rejects.toThrow(/Could not open session|malformed/);
+});
+
+it("rejects schema-invalid small explicit resumes in auto and enabled modes", async () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/auto-small-explicit-schema-invalid.jsonl";
+	storage.writeTextSync(
+		sessionFile,
+		`${JSON.stringify({ type: "session", version: 5, id: "auto-small-explicit-schema", timestamp: "0", cwd: "/cwd" })}\n${JSON.stringify({ type: "custom", id: "invalid", parentId: null, timestamp: "0", data: {} })}\n`,
+	);
+	for (const mode of ["auto", "enabled"] as const) {
+		await expect(
+			SessionManager.open(
+				sessionFile,
+				SessionManager.explicitDestination("/sessions"),
+				storage,
+				"copy-retain",
+				mode,
+			),
+		).rejects.toThrow("malformed");
+	}
+});
+it("rejects malformed auto-small managed resumes through the strict eager path", async () => {
+	const tempDir = TempDir.createSync("@pi-session-auto-small-");
+	const storage = new FileSessionStorage();
+	const cwd = tempDir.path();
+	const agentDir = path.join(cwd, ".gjc");
+	const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+	const sessionFile = path.join(agentDir, "sessions", "auto-small-malformed.jsonl");
+	storage.writeTextSync(
+		sessionFile,
+		`${JSON.stringify({ type: "session", version: 5, id: "auto-small-malformed", timestamp: "0", cwd })}\n{malformed}\n`,
+	);
+	try {
+		await expect(SessionManager.open(sessionFile, destination, storage, "copy-retain", "auto")).rejects.toThrow(
+			/Could not open session|malformed/,
+		);
+	} finally {
+		tempDir.removeSync();
+	}
+});
+
+it("activates cold state when an auto session crosses the threshold on append", async () => {
+	const storage = new MemorySessionStorage();
+	const manager = SessionManager.create("/cwd", SessionManager.explicitDestination("/sessions"), storage);
+	SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1_000;
+	try {
+		manager.setSessionMemoryMode("auto");
+		await manager.ensureOnDisk();
+		manager.appendCustomEntry("node", { payload: "old" });
+		const first = manager.appendCustomEntry("node", { payload: "small" });
+		manager.appendCompaction("summary", undefined, first, 1);
+		expect(manager.getSessionMemoryStats().sidecarEnabled).toBe(false);
+		manager.appendCustomEntry("node", { payload: "x".repeat(2_000) });
+		expect(manager.getSessionMemoryStats().sidecarEnabled).toBe(true);
+	} finally {
+		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
+		await manager.close();
+	}
+});
+
+it("captures and restores cold rollback state without full hydration", async () => {
+	const storage = new MemorySessionStorage();
+	const sourceFile = "/sessions/cold-rollback-source.jsonl";
+	const targetFile = "/sessions/cold-rollback-target.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "cold-rollback", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: { payload: "old" } },
+		{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: { payload: "kept" } },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	storage.writeTextSync(sourceFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	storage.writeTextSync(
+		targetFile,
+		`${JSON.stringify({ type: "session", version: 5, id: "rollback-target", timestamp: "0", cwd: "/cwd" })}\n`,
+	);
+	SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1;
+	SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+	let manager: SessionManager | undefined;
+	try {
+		manager = await SessionManager.open(
+			sourceFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"auto",
+		);
+		const rollback = await manager.captureRollbackState();
+		expect(rollback.coldRestoreFile).toBe(sourceFile);
+		expect(rollback.materializedFileEntries).toEqual([]);
+		await manager.setSessionFile(targetFile);
+		await manager.restoreRollbackState(rollback);
+		expect(manager.getEntry("old")).toMatchObject({ id: "old" });
+	} finally {
+		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
+		SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
+		await manager?.close();
+	}
+});
+
+it("switches to an oversized-guarded cold target through bounded adoption", async () => {
+	const storage = new MemorySessionStorage();
+	const targetFile = "/sessions/bounded-switch-target.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "bounded-switch", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	storage.writeTextSync(targetFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	const manager = SessionManager.create("/cwd", SessionManager.explicitDestination("/sessions"), storage);
+	SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1;
+	SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+	try {
+		manager.setSessionMemoryMode("auto");
+		await manager.ensureOnDisk();
+		await manager.setSessionFile(targetFile);
+		expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		expect(manager.getEntry("old")).toMatchObject({ id: "old" });
+	} finally {
+		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
+		SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
+		await manager.close();
+	}
+});
+
+it("continues an oversized-guarded auto session through bounded admission", async () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/2026-01-01T00-00-00-000Z_bounded-continue.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "bounded-continue", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1;
+	SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+	let manager: SessionManager | undefined;
+	try {
+		manager = await SessionManager.continueRecent(
+			"/cwd",
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"auto",
+		);
+		expect(manager.getSessionId()).toBe("bounded-continue");
+		expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+	} finally {
+		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
+		SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
+		await manager?.close();
+	}
+});
+
+it("selects the latest exact compaction boundary in one semantic parse pass", async () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/bounded-first-open-latest-compaction.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "latest-compaction", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "a", parentId: null, timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "b", parentId: "a", timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "c", parentId: "b", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact-1",
+			parentId: "c",
+			timestamp: "0",
+			summary: "first",
+			firstKeptEntryId: "b",
+			tokensBefore: 1,
+		},
+		{ type: "custom", id: "d", parentId: "compact-1", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact-2",
+			parentId: "d",
+			timestamp: "0",
+			summary: "second",
+			firstKeptEntryId: "c",
+			tokensBefore: 2,
+		},
+		{ type: "custom", id: "e", parentId: "compact-2", timestamp: "0", customType: "node", data: {} },
+	];
+	const transcript = `${records.map(record => JSON.stringify(record)).join("\n")}\n`;
+	storage.writeTextSync(sessionFile, transcript);
+	const manager = await SessionManager.open(
+		sessionFile,
+		SessionManager.explicitDestination("/sessions"),
+		storage,
+		"copy-retain",
+		"enabled",
+	);
+	try {
+		const stats = manager.getSessionMemoryStats();
+		expect(stats.lazyReopenSucceeded).toBe(true);
+		expect(stats.firstOpen.semanticRecordsParsed).toBe(records.length);
+		expect(stats.firstOpen.suffixRecordsParsed).toBeGreaterThan(0);
+		const marker = JSON.parse(storage.readTextSync(sidecarPath(sessionFile, "commit"))) as {
+			base: { baseEndOffset: number };
+			retirementFirstKeptEntryId: string;
+		};
+		expect(marker.retirementFirstKeptEntryId).toBe("c");
+		expect(marker.base.baseEndOffset).toBe(transcript.indexOf(`${JSON.stringify(records[3])}\n`));
+		expect(manager.getEntry("a")).toMatchObject({ id: "a" });
+		expect(manager.getEntry("e")).toMatchObject({ id: "e" });
+	} finally {
+		await manager.close();
 	}
 });
 
@@ -1669,7 +2694,7 @@ it("fails closed to eager on a branched transcript during enabled first open", a
 		await manager.close();
 	}
 });
-it("fails closed for transcript-ahead and tail-ahead reopen states", async () => {
+it("rebuilds bounded state for transcript-ahead and tail-ahead reopen states", async () => {
 	class CountingStorage extends MemorySessionStorage {
 		textReads = 0;
 		override readText(filePath: string) {
@@ -1715,9 +2740,9 @@ it("fails closed for transcript-ahead and tail-ahead reopen states", async () =>
 		"enabled",
 	);
 	try {
-		expect(transcriptAhead.storage.textReads).toBeGreaterThan(0);
+		expect(transcriptAhead.storage.textReads).toBe(0);
 		expect(transcriptFallback.getEntry("new-tail")).toMatchObject({ id: "new-tail" });
-		expect(transcriptFallback.getSessionMemoryStats().autoDisabledReason).toBe("sidecar_reload_failures");
+		expect(transcriptFallback.getSessionMemoryStats().autoDisabledReason).toBeUndefined();
 	} finally {
 		await transcriptFallback.close();
 	}
@@ -1734,9 +2759,9 @@ it("fails closed for transcript-ahead and tail-ahead reopen states", async () =>
 		"enabled",
 	);
 	try {
-		expect(tailAhead.storage.textReads).toBeGreaterThan(0);
+		expect(tailAhead.storage.textReads).toBe(0);
 		expect(tailFallback.buildSessionContext().messages).toHaveLength(1);
-		expect(tailFallback.getSessionMemoryStats().autoDisabledReason).toBe("sidecar_reload_failures");
+		expect(tailFallback.getSessionMemoryStats().autoDisabledReason).toBeUndefined();
 	} finally {
 		await tailFallback.close();
 	}
@@ -1967,23 +2992,15 @@ describe("malformed transcript sidecar fallback", () => {
 			},
 		];
 		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
-		const manager = await SessionManager.open(
-			sessionFile,
-			SessionManager.explicitDestination("/sessions"),
-			storage,
-			"copy-retain",
-			"enabled",
-		);
-		try {
-			expect(manager.getSessionMemoryStats()).toMatchObject({
-				coldRetirementActive: false,
-				sidecarIneligible: true,
-				lazyReopenSucceeded: false,
-			});
-			expect(manager.getEntry("old")).toMatchObject({ id: "old" });
-		} finally {
-			await manager.close();
-		}
+		await expect(
+			SessionManager.open(
+				sessionFile,
+				SessionManager.explicitDestination("/sessions"),
+				storage,
+				"copy-retain",
+				"enabled",
+			),
+		).rejects.toThrow("malformed");
 	});
 });
 
@@ -2160,6 +3177,12 @@ describe("model-change reducer parity", () => {
 	}
 });
 describe("branch-heavy retirement", () => {
+	beforeEach(() => {
+		SessionManagerTestHooks.secondaryArtifactMode = "enabled";
+	});
+	afterEach(() => {
+		SessionManagerTestHooks.secondaryArtifactMode = undefined;
+	});
 	it("retires inactive branches appended after the active compaction boundary", async () => {
 		const storage = new MemorySessionStorage();
 		const sessionFile = "/sessions/branch-heavy.jsonl";
@@ -2714,6 +3737,12 @@ describe("whole-session persistence freshness", () => {
 	});
 });
 describe("sidecar I/O fallback", () => {
+	beforeEach(() => {
+		SessionManagerTestHooks.secondaryArtifactMode = "enabled";
+	});
+	afterEach(() => {
+		SessionManagerTestHooks.secondaryArtifactMode = undefined;
+	});
 	it("preserves eager authoritative state when disposable sidecar creation fails", async () => {
 		const sessionFile = "/sessions/sidecar-failure.jsonl";
 		const now = "0";
@@ -3837,8 +4866,10 @@ describePosix("managed session memory authority", () => {
 			await manager.close();
 		}
 		try {
-			const reopened = await SessionManager.open(sessionFile, destination, undefined, "copy-retain", "enabled");
+			SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1;
+			let reopened: SessionManager | undefined;
 			try {
+				reopened = await SessionManager.open(sessionFile, destination, undefined, "copy-retain", "auto");
 				expect(reopened.getSessionMemoryStats()).toMatchObject({
 					sidecarEnabled: true,
 					coldRetirementActive: true,
@@ -3848,15 +4879,102 @@ describePosix("managed session memory authority", () => {
 				expect(reopened.getLabel(reopened.getEntries()[0]!.id)).toBe("managed label");
 				expect(reopened.buildSessionContext().messages).toHaveLength(3);
 			} finally {
-				await reopened.close();
+				SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
+				await reopened?.close();
 			}
 		} finally {
+			tempDir.removeSync();
+		}
+	});
+	it("routes bounded managed first-open transcript ranges through retained authority", async () => {
+		class NoRawTranscriptRangeStorage extends FileSessionStorage {
+			override readRangeSync(filePath: string, offset: number, length: number) {
+				if (filePath.endsWith(".jsonl")) throw new Error("raw_managed_transcript_range");
+				return super.readRangeSync(filePath, offset, length);
+			}
+		}
+		const tempDir = TempDir.createSync("@pi-managed-memory-retained-read-");
+		const cwd = path.join(tempDir.path(), "workspace");
+		const agentDir = path.join(tempDir.path(), "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const source = SessionManager.create(cwd, destination, storage);
+		let reopened: SessionManager | undefined;
+		let sourceClosed = false;
+		try {
+			source.setSessionMemoryMode("off");
+			await source.ensureOnDisk();
+			const oldId = source.appendCustomEntry("node", { payload: "old" });
+			const keptId = source.appendCustomEntry("node", { payload: "kept" });
+			source.appendCompaction("summary", undefined, keptId, 1);
+			await source.flush();
+			const sessionFile = source.getSessionFile();
+			if (!sessionFile) throw new Error("Expected managed source file");
+			await source.close();
+			sourceClosed = true;
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+			reopened = await SessionManager.open(
+				sessionFile,
+				destination,
+				new NoRawTranscriptRangeStorage(),
+				"copy-retain",
+				"enabled",
+			);
+			expect(reopened.getSessionMemoryStats()).toMatchObject({
+				lazyReopenSucceeded: true,
+				lastReopenTransition: { kind: "rebuild", reason: "bounded_first_open" },
+			});
+			expect(reopened.getEntry(oldId)).toMatchObject({ id: oldId });
+		} finally {
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
+			await reopened?.close();
+			if (!sourceClosed) await source.close();
+			tempDir.removeSync();
+		}
+	});
+
+	it("discards managed failed successors through identity-bound transcript and tree removal", async () => {
+		class RejectRawDeleteStorage extends FileSessionStorage {
+			rawDeleteCalls = 0;
+			override async deleteSessionWithArtifacts(_sessionPath: string): Promise<void> {
+				this.rawDeleteCalls += 1;
+				throw new Error("raw_managed_delete_bypass");
+			}
+		}
+		const tempDir = TempDir.createSync("@pi-managed-memory-successor-cleanup-");
+		const cwd = path.join(tempDir.path(), "workspace");
+		const agentDir = path.join(tempDir.path(), "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		const storage = new RejectRawDeleteStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const manager = SessionManager.create(cwd, destination, storage);
+		try {
+			await manager.ensureOnDisk();
+			manager.appendCustomEntry("node", { payload: "source" });
+			await manager.flush();
+			const prepared = await manager.prepareFork();
+			if (!prepared?.sessionFile) throw new Error("Expected managed prepared successor");
+			const successorFile = prepared.sessionFile;
+			expect(storage.existsSync(successorFile)).toBe(true);
+			await manager.discardPreparedNewSession(prepared);
+			expect(storage.rawDeleteCalls).toBe(0);
+			expect(storage.existsSync(successorFile)).toBe(false);
+			expect(storage.existsSync(successorFile.slice(0, -6))).toBe(false);
+		} finally {
+			await manager.close();
 			tempDir.removeSync();
 		}
 	});
 });
 
 describe("persistent dictionary and metadata-delta artifacts", () => {
+	beforeEach(() => {
+		SessionManagerTestHooks.secondaryArtifactMode = "enabled";
+	});
+	afterEach(() => {
+		SessionManagerTestHooks.secondaryArtifactMode = undefined;
+	});
 	it("publishes the dictionary artifact bound in the commit marker and reopens exactly", async () => {
 		const storage = new MemorySessionStorage();
 		const sessionFile = "/sessions/dict-marker.jsonl";
@@ -4134,7 +5252,7 @@ describe("persistent dictionary and metadata-delta artifacts", () => {
 		}
 	});
 
-	it("fails closed to eager when the metadata-delta binding is corrupt or missing", async () => {
+	it("rebuilds bounded state when the metadata-delta binding is corrupt or missing", async () => {
 		const storage = new MemorySessionStorage();
 		const sessionFile = "/sessions/provider-delta-corrupt.jsonl";
 		const records = [
@@ -4178,7 +5296,7 @@ describe("persistent dictionary and metadata-delta artifacts", () => {
 			"enabled",
 		);
 		try {
-			expect(reopened.getSessionMemoryStats().lazyReopenSucceeded).toBe(false);
+			expect(reopened.getSessionMemoryStats().lazyReopenSucceeded).toBe(true);
 			expect(reopened.getSessionMemoryStats().currentCommitTransition).toEqual({
 				kind: "exact",
 				reason: "descriptor_and_proof_match",
@@ -4198,7 +5316,7 @@ describe("persistent dictionary and metadata-delta artifacts", () => {
 			"enabled",
 		);
 		try {
-			expect(malformedBinding.getSessionMemoryStats().lazyReopenSucceeded).toBe(false);
+			expect(malformedBinding.getSessionMemoryStats().lazyReopenSucceeded).toBe(true);
 			expect(malformedBinding.buildSessionContext()).toEqual(eager);
 		} finally {
 			await malformedBinding.close();
@@ -4227,6 +5345,167 @@ describe("persistent dictionary and metadata-delta artifacts", () => {
 		} finally {
 			await manager.close();
 			tempDir.removeSync();
+		}
+	});
+
+	it("rejects a dictionary artifact rebound to a different session id", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/dict-session-mismatch.jsonl";
+		writeTreeTranscript(storage, sessionFile, { parentCount: 4, childrenPerParent: 2 });
+		const built = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		await built.close();
+
+		const meta = JSON.parse(storage.readTextSync(dictionaryMetaPathFor(sessionFile))) as {
+			header: { sessionId: string };
+		};
+		meta.header.sessionId = "different-session";
+		const metaBytes = Buffer.from(`${JSON.stringify(meta)}\n`, "utf8");
+		storage.writeTextSync(dictionaryMetaPathFor(sessionFile), metaBytes.toString("utf8"));
+		const marker = JSON.parse(storage.readTextSync(sidecarPath(sessionFile, "commit"))) as {
+			dictionary?: { header: { sessionId: string }; metaSize: number; metaDigest: string };
+		};
+		expect(marker.dictionary).toBeDefined();
+		marker.dictionary!.header.sessionId = "different-session";
+		marker.dictionary!.metaSize = metaBytes.byteLength;
+		marker.dictionary!.metaDigest = createHash("sha256").update(metaBytes).digest("hex");
+		storage.writeTextSync(sidecarPath(sessionFile, "commit"), JSON.stringify(marker));
+
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(reopened.getSessionMemoryStats()).toMatchObject({
+				lazyReopenSucceeded: true,
+				dictionaryArtifactEnabled: false,
+			});
+			expect(reopened.getEntry("root")).toMatchObject({ id: "root" });
+		} finally {
+			await reopened.close();
+		}
+	});
+
+	it("removes stale secondary files when a rebuild uses disabled artifacts", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionFile = "/sessions/secondary-rebuild-disabled.jsonl";
+		writeTreeTranscript(storage, sessionFile, { parentCount: 4, childrenPerParent: 2 });
+		const built = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		await built.close();
+		expect(storage.existsSync(dictionaryMetaPathFor(sessionFile))).toBe(true);
+		expect(
+			Array.from({ length: PARENT_CHILDREN_BUCKET_COUNT }, (_, bucket) =>
+				parentBucketPath(sessionFile, bucket),
+			).some(path => storage.existsSync(path)),
+		).toBe(true);
+
+		SessionManagerTestHooks.secondaryArtifactMode = "disabled";
+		storage.writeTextSync(
+			sidecarPath(sessionFile, "idx"),
+			`${storage.readTextSync(sidecarPath(sessionFile, "idx"))}{}\n`,
+		);
+		const rebuilt = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(rebuilt.getSessionMemoryStats()).toMatchObject({
+				coldRetirementActive: true,
+				dictionaryArtifactEnabled: false,
+				parentArtifactEnabled: false,
+			});
+			expect(storage.existsSync(dictionaryMetaPathFor(sessionFile))).toBe(false);
+			for (let partition = 0; partition < DICTIONARY_PARTITION_COUNT; partition++)
+				expect(storage.existsSync(dictionaryPartitionPath(sessionFile, partition))).toBe(false);
+			for (let bucket = 0; bucket < PARENT_CHILDREN_BUCKET_COUNT; bucket++)
+				expect(storage.existsSync(parentBucketPath(sessionFile, bucket))).toBe(false);
+			const primarySidecarBytes = (["idx", "tail", "commit"] as const)
+				.map(kind => storage.statSync(sidecarPath(sessionFile, kind)).size)
+				.reduce((total, size) => total + size, 0);
+			const metadataDeltaBytes = storage.existsSync(metadataDeltaPathFor(sessionFile))
+				? storage.statSync(metadataDeltaPathFor(sessionFile)).size
+				: 0;
+			expect(rebuilt.getSessionMemoryStats().sidecarFileBytes).toBe(primarySidecarBytes + metadataDeltaBytes);
+		} finally {
+			await rebuilt.close();
+		}
+	});
+
+	it("guards full-hot-view work before reading a commit-rebound tampered index", async () => {
+		class CountingStorage extends MemorySessionStorage {
+			indexRangeReads = 0;
+			override readRangeSync(filePath: string, offset: number, length: number) {
+				if (filePath.endsWith(".spill.idx")) this.indexRangeReads++;
+				return super.readRangeSync(filePath, offset, length);
+			}
+		}
+		const storage = new CountingStorage();
+		const sessionFile = "/sessions/rebound-index-full-view.jsonl";
+		const records = [
+			{ type: "session", version: 5, id: "rebound-index", timestamp: "0", cwd: "/cwd" },
+			{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: {} },
+			{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: {} },
+			{
+				type: "compaction",
+				id: "compact",
+				parentId: "kept",
+				timestamp: "0",
+				summary: "summary",
+				firstKeptEntryId: "kept",
+				tokensBefore: 1,
+			},
+		];
+		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		SessionManagerTestHooks.secondaryArtifactMode = "disabled";
+		const built = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		await built.close();
+		const originalIndex = storage.readTextSync(sidecarPath(sessionFile, "idx"));
+		const tamperedIndex = originalIndex.replaceAll('"old"', '"bad"');
+		expect(tamperedIndex).not.toBe(originalIndex);
+		storage.writeTextSync(sidecarPath(sessionFile, "idx"), tamperedIndex);
+		const marker = JSON.parse(storage.readTextSync(sidecarPath(sessionFile, "commit"))) as { indexDigest: string };
+		marker.indexDigest = createHash("sha256").update(Buffer.from(tamperedIndex, "utf8")).digest("hex");
+		storage.writeTextSync(sidecarPath(sessionFile, "commit"), JSON.stringify(marker));
+
+		const reopened = await SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		);
+		try {
+			expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+			const readsBefore = storage.indexRangeReads;
+			expect(() => reopened.getEntriesForExport()).toThrow("cold_sidecar_rebuild_required_for_bounded_transcript");
+			expect(storage.indexRangeReads).toBe(readsBefore);
+		} finally {
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
+			await reopened.close();
 		}
 	});
 });
@@ -4615,14 +5894,6 @@ describe("descriptor-bound capture and staged fork publication", () => {
 			`${JSON.stringify({ type: "session", version: 5, id: "bad", timestamp: "0", cwd: "/cwd" })}\n{"type":`,
 		);
 		const truncated = SessionManager.captureTranscriptStrict("/sessions/truncated.jsonl", storage);
-		expect(truncated.kind).toBe("captured");
-		if (truncated.kind !== "captured") throw new Error("Expected descriptor capture");
-		expect(
-			await SessionManager.forkFromCaptured(
-				truncated.snapshot,
-				"/cwd",
-				SessionManager.explicitDestination("/sessions/truncated-fork"),
-			),
-		).toEqual({ kind: "error", reason: "malformed" });
+		expect(truncated).toMatchObject({ kind: "error", reason: "malformed" });
 	});
 });

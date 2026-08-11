@@ -168,6 +168,7 @@ export const GJC_MODEL_ASSIGNMENT_TARGETS: Record<GjcModelAssignmentTargetId, Gj
 		settingsPath: "task.agentModelOverrides",
 	},
 	critic: { id: "critic", tag: "CRITIC", name: "Critic", color: "error", settingsPath: "task.agentModelOverrides" },
+	image: { id: "image", tag: "IMAGE", name: "Image", color: "accent", settingsPath: "modelRoles" },
 };
 
 /** Alias for ModelRoleInfo - used for both built-in and custom roles */
@@ -1222,6 +1223,7 @@ interface ModelManagerDiscoveryOptions {
  */
 export class ModelRegistry {
 	#models: Model<Api>[] = [];
+	#catalogChangeListeners: Set<() => void> = new Set();
 	#canonicalIndex: CanonicalModelIndex = {
 		records: [],
 		byId: new Map(),
@@ -1298,6 +1300,13 @@ export class ModelRegistry {
 		this.authStorage.onGenerationChanged(() => this.#invalidateAvailableModels());
 		// Load models synchronously in constructor
 		this.#loadModels();
+	}
+
+	onCatalogChanged(listener: () => void): () => void {
+		this.#catalogChangeListeners.add(listener);
+		return () => {
+			this.#catalogChangeListeners.delete(listener);
+		};
 	}
 
 	/**
@@ -3249,6 +3258,7 @@ export class ModelRegistry {
 		}
 		this.#canonicalIndex = buildCanonicalModelIndex(this.#models, this.#equivalenceConfig);
 		this.#invalidateAvailableModels();
+		this.#notifyCatalogChanged();
 		this.#rebuildPending = false;
 	}
 
@@ -3256,6 +3266,16 @@ export class ModelRegistry {
 		this.#availableModelsCache = undefined;
 		this.#availableModelsDisabledProviders = undefined;
 		this.#availableModelsEnvFingerprint = undefined;
+	}
+
+	#notifyCatalogChanged(): void {
+		for (const listener of [...this.#catalogChangeListeners]) {
+			try {
+				listener();
+			} catch (error) {
+				logger.debug("ModelRegistry catalog listener failed", { error: String(error) });
+			}
+		}
 	}
 
 	#suspendRebuild(): void {
@@ -3270,6 +3290,7 @@ export class ModelRegistry {
 			this.#rebuildPending = false;
 			this.#canonicalIndex = buildCanonicalModelIndex(this.#models, this.#equivalenceConfig);
 			this.#invalidateAvailableModels();
+			this.#notifyCatalogChanged();
 		}
 	}
 

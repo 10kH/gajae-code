@@ -496,8 +496,7 @@ export class SlackNotificationDaemon {
 	#tryReleaseRetiredProviderWorkScope(scopeKey: string): void {
 		const retired = this.#retiredProviderWorkScopes.get(scopeKey);
 		if (
-			!retired ||
-			retired.retirements !== 0 ||
+			retired?.retirements !== 0 ||
 			retired.terminalizations.size > 0 ||
 			[...this.#workInvalidators].some(work => work.scopeKey === scopeKey)
 		)

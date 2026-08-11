@@ -103,6 +103,15 @@ async function withRuntime(
 			pid: process.pid,
 			endpointMtimeMs,
 		});
+		await index.append({
+			type: "host_heartbeat",
+			sessionId: SESSION_ID,
+			locator: { repo: agentDir, stateRoot },
+			endpointGeneration: GENERATION,
+			pid: process.pid,
+			endpointMtimeMs,
+			activity: { state: "idle", at: Date.now() },
+		});
 
 		const provider = new FakeSlackProvider();
 		let observer: ((frame: Record<string, unknown>) => void) | undefined;

@@ -342,7 +342,7 @@ describe("Telegram daemon retained owner lifecycle", () => {
 					pidIncarnation,
 					now: () => now,
 				}),
-			).toBe(true);
+			).toBe("renewed");
 			expect((await readDaemonState(daemonSettings))?.heartbeatAt).toBe(1_000);
 			expect((await readOwnerFreshnessSnapshot({ settings: daemonSettings })).effectiveHeartbeatAt).toBe(1_001);
 			expect(
@@ -353,7 +353,7 @@ describe("Telegram daemon retained owner lifecycle", () => {
 					pid,
 					pidIncarnation,
 				}),
-			).toBe(false);
+			).toBe("not_owner");
 		} finally {
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}

@@ -72,6 +72,7 @@ const MOD_ALT: u32 = 2;
 const MOD_CTRL: u32 = 4;
 const MOD_SUPER: u32 = 8;
 const MOD_NUM_LOCK: u32 = 128;
+const SUPPORTED_MODIFIER_MASK: u32 = MOD_SHIFT | MOD_ALT | MOD_CTRL | MOD_SUPER | LOCK_MASK;
 
 /// Event types from Kitty keyboard protocol (flag 2).
 #[napi]
@@ -438,6 +439,9 @@ fn parse_key_id(key_id: &str) -> Option<ParsedKeyId<'_>> {
 	let (prefix, forced_key_plus): (&str, bool) = if s == "+" {
 		("", true)
 	} else if let Some(stripped) = s.strip_suffix("++") {
+		if stripped.is_empty() || stripped.ends_with('+') {
+			return None;
+		}
 		(stripped, true)
 	} else {
 		(s, false)
@@ -445,43 +449,62 @@ fn parse_key_id(key_id: &str) -> Option<ParsedKeyId<'_>> {
 
 	let mut modifier = 0;
 	let mut key: Option<&str> = if forced_key_plus { Some("+") } else { None };
+	let part_count = prefix.split('+').count();
 
-	for part in prefix.split('+') {
+	for (part_index, part) in prefix.split('+').enumerate() {
 		let p = part.trim();
+		if p.is_empty() {
+			if forced_key_plus && part_index + 1 == part_count {
+				continue;
+			}
+			return None;
+		}
 		let [c0, ..] = p.as_bytes() else {
-			continue;
+			return None;
 		};
 
 		match c0 {
 			b'c' | b'C' if p.eq_ignore_ascii_case("ctrl") => {
+				if (!forced_key_plus && key.is_some()) || modifier & MOD_CTRL != 0 {
+					return None;
+				}
 				modifier |= MOD_CTRL;
-				continue;
 			},
 			b's' | b'S' if p.eq_ignore_ascii_case("shift") => {
+				if (!forced_key_plus && key.is_some()) || modifier & MOD_SHIFT != 0 {
+					return None;
+				}
 				modifier |= MOD_SHIFT;
-				continue;
 			},
 			b'a' | b'A' | b'o' | b'O' | b'm' | b'M'
 				if p.eq_ignore_ascii_case("alt")
 					|| p.eq_ignore_ascii_case("option")
 					|| p.eq_ignore_ascii_case("meta") =>
 			{
+				if (!forced_key_plus && key.is_some()) || modifier & MOD_ALT != 0 {
+					return None;
+				}
 				modifier |= MOD_ALT;
-				continue;
 			},
 			b'c' | b'C' if p.eq_ignore_ascii_case("command") || p.eq_ignore_ascii_case("cmd") => {
+				if (!forced_key_plus && key.is_some()) || modifier & MOD_SUPER != 0 {
+					return None;
+				}
 				modifier |= MOD_SUPER;
-				continue;
 			},
 			b's' | b'S' if p.eq_ignore_ascii_case("super") => {
+				if (!forced_key_plus && key.is_some()) || modifier & MOD_SUPER != 0 {
+					return None;
+				}
 				modifier |= MOD_SUPER;
-				continue;
 			},
-			_ => {},
+			_ => {
+				if key.is_some() {
+					return None;
+				}
+				key = Some(p);
+			},
 		}
-
-		// Treat this as the key token (last non-modifier wins)
-		key = Some(p);
 	}
 
 	let mut key = key?;
@@ -531,7 +554,6 @@ const fn ctrl_symbol_to_byte(symbol: u8) -> Option<u8> {
 	match symbol {
 		// 0x40 -> 0, 0x5b|0x5c|..-> 0x1b|0x1c|..
 		b'@' | b'[' | b'\\' | b']' | b'^' | b'_' => Some(symbol - 0x40),
-		b'-' => Some(0x1f),
 		_ => None,
 	}
 }
@@ -571,6 +593,10 @@ fn parse_modify_other_keys(bytes: &[u8]) -> Option<(u32, i32)> {
 	}
 
 	let modifier = mod_value - 1;
+	if modifier & !SUPPORTED_MODIFIER_MASK != 0 {
+		return None;
+	}
+	let modifier = modifier & !LOCK_MASK;
 	let mut keycode = i32::try_from(keycode_u32).ok()?;
 	if modifier & MOD_SHIFT != 0 && (i32::from(b'A')..=i32::from(b'Z')).contains(&keycode) {
 		keycode += i32::from(b'a' - b'A');
@@ -994,7 +1020,9 @@ fn matches_key_inner(bytes: &[u8], key_id: &str, kitty_protocol_active: bool) ->
 
 /// Check if bytes match a legacy key sequence
 fn matches_legacy_key(bytes: &[u8], key: &str) -> bool {
-	LEGACY_SEQUENCES.get(bytes).is_some_and(|&id| id == key)
+	LEGACY_SEQUENCES
+		.get(bytes)
+		.is_some_and(|&id| id.eq_ignore_ascii_case(key))
 }
 
 /// Check if bytes match a legacy modifier sequence (shift/ctrl variants)
@@ -1017,7 +1045,7 @@ fn matches_legacy_modifier_sequence(bytes: &[u8], key: &str, modifier: u32) -> b
 		if let Some(expected_key) = expected {
 			return LEGACY_SEQUENCES
 				.get(bytes)
-				.is_some_and(|&id| id == expected_key);
+				.is_some_and(|&id| id.eq_ignore_ascii_case(expected_key));
 		}
 	} else if modifier == MOD_CTRL {
 		let expected = match key {
@@ -1037,7 +1065,7 @@ fn matches_legacy_modifier_sequence(bytes: &[u8], key: &str, modifier: u32) -> b
 		if let Some(expected_key) = expected {
 			return LEGACY_SEQUENCES
 				.get(bytes)
-				.is_some_and(|&id| id == expected_key);
+				.is_some_and(|&id| id.eq_ignore_ascii_case(expected_key));
 		}
 	}
 	false
@@ -1140,6 +1168,7 @@ fn parse_esc_pair(code: u8, kitty_protocol_active: bool) -> Option<Cow<'static, 
 		b'a'..=b'z' => Some(Cow::Borrowed(ALT_LETTERS[(code - b'a') as usize])),
 		b'A'..=b'Z' => Some(Cow::Borrowed(ALT_SHIFT_LETTERS[(code - b'A') as usize])),
 		b' ' => Some(Cow::Borrowed("alt+space")),
+		0 if !kitty_protocol_active => Some(Cow::Borrowed("ctrl+alt+@")),
 		28 if !kitty_protocol_active => Some(Cow::Borrowed("ctrl+alt+\\")),
 		29 if !kitty_protocol_active => Some(Cow::Borrowed("ctrl+alt+]")),
 		30 if !kitty_protocol_active => Some(Cow::Borrowed("ctrl+alt+^")),
@@ -1169,12 +1198,19 @@ fn parse_kitty_sequence_bytes(bytes: &[u8]) -> Option<ParsedKittySequence> {
 		return None;
 	}
 
-	match *bytes.last()? {
+	let parsed = match *bytes.last()? {
 		b'u' => parse_csi_u(bytes),
 		b'~' => parse_functional(bytes),
 		// CSI 1;mod <letter>
 		b'A' | b'B' | b'C' | b'D' | b'E' | b'F' | b'H' | b'P' | b'Q' | b'R' | b'S' => {
 			parse_csi_1_letter(bytes)
+		},
+		_ => None,
+	};
+
+	match parsed {
+		Some(parsed) if parsed.event_type.is_none() || matches!(parsed.event_type, Some(1..=3)) => {
+			Some(parsed)
 		},
 		_ => None,
 	}
@@ -1600,6 +1636,37 @@ mod tests {
 		assert!(matches_key_inner(b"\x1b[27;1;112~", "p", false));
 		assert!(matches_key_inner(b"\x1b[27;1;13~", "enter", false));
 		assert!(matches_key_inner(b"\x1b[27;1;32~", "space", false));
+	}
+	#[test]
+	fn protocol_rejects_lock_bits_and_unknown_event_types() {
+		assert_eq!(parse_key_inner(b"\x1b[27;129;112~", false).as_deref(), Some("p"));
+		assert!(matches_key_inner(b"\x1b[27;129;112~", "p", false));
+		assert_eq!(parse_key_inner(b"\x1b[27;17;112~", false), None);
+		for bytes in [
+			b"\x1b[112;1:0u".as_slice(),
+			b"\x1b[112;1:4u".as_slice(),
+			b"\x1b[1;1:4P".as_slice(),
+			b"\x1b[15;1:4~".as_slice(),
+		] {
+			assert_eq!(parse_key_inner(bytes, true), None);
+			assert!(!matches_key_inner(bytes, "p", true));
+		}
+	}
+	#[test]
+	fn aliases_and_legacy_control_symbols_are_symmetric() {
+		assert!(parse_key_id("ctrl+ctrl+p").is_none());
+		assert!(parse_key_id("option+alt+p").is_none());
+		assert!(parse_key_id("command+super+p").is_none());
+		assert_eq!(parse_key_inner(b"\x1b\x00", false).as_deref(), Some("ctrl+alt+@"));
+		assert!(matches_key_inner(b"\x1b\x00", "ctrl+alt+@", false));
+		assert_eq!(parse_key_inner(b"\x1b\x1f", false).as_deref(), Some("ctrl+alt+_"));
+		assert!(matches_key_inner(b"\x1b\x1f", "ctrl+alt+_", false));
+		assert!(!matches_key_inner(b"\x1b\x1f", "ctrl+alt+-", false));
+		assert!(matches_key_inner(b"\x1bOP", "F1", false));
+		assert!(parse_key_id("ctrl+").is_none());
+		assert!(parse_key_id("++").is_none());
+		assert!(parse_key_id("foo+p").is_none());
+		assert!(parse_key_id("p+ctrl").is_none());
 	}
 
 	#[test]
