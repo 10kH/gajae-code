@@ -1200,7 +1200,7 @@ export class Broker {
 				endpoint.pid !== record.pid ||
 				endpoint.stale === true ||
 				record.endpointMtimeMs === undefined ||
-				metadata.mtimeMs !== record.endpointMtimeMs
+				Math.abs(metadata.mtimeMs - record.endpointMtimeMs) > 0.001
 			)
 				return error("endpoint_stale", "session endpoint is stale");
 			await this.index.refresh();
