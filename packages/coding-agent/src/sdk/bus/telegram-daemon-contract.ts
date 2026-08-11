@@ -104,9 +104,11 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * same-session transports attached while predecessor archival converges and
  * settles non-forum close responses. Generation 62 rejects replay-gap
  * authority claims that do not match the requested cursor, answer bounds,
- * and retained replay suffix.
+ * and retained replay suffix. Generation 63 restricts forum-topic ownership,
+ * routing, replay, and callback admission to coordinator and lifecycle
+ * sessions, preventing ordinary notification sessions from becoming topic owners.
  */
-export const DAEMON_GENERATION = 62;
+export const DAEMON_GENERATION = 63;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 5

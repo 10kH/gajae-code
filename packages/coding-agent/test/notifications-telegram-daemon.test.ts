@@ -3166,7 +3166,8 @@ describe("telegram daemon", () => {
 		// under the ownership-lock fence instead of crashing the daemon (#4200).
 		// Generation 61 keeps fenced same-session transports attached; generation 62
 		// validates replay-gap claims against the requested cursor and retained suffix.
-		expect(DAEMON_GENERATION).toBe(62);
+		// Generation 63 restricts forum-topic admission to coordinator and lifecycle sessions.
+		expect(DAEMON_GENERATION).toBe(63);
 	});
 	test.each([
 		"1",
