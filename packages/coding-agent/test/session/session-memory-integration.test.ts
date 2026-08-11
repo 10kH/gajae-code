@@ -1700,6 +1700,23 @@ it("fails closed when strict capture input exceeds the exact scanner line limit"
 	expect(storage.existsSync(sidecarPath(sessionFile, "commit"))).toBe(false);
 });
 
+it("rejects invalid UTF-8 during strict bounded capture", () => {
+	const tempDir = TempDir.createSync("@pi-session-invalid-utf8-");
+	const sessionFile = path.join(tempDir.path(), "invalid-utf8.jsonl");
+	try {
+		const header = Buffer.from(
+			`${JSON.stringify({ type: "session", version: 5, id: "invalid-utf8", timestamp: "0", cwd: "/cwd" })}\n`,
+			"utf8",
+		);
+		const prefix = Buffer.from('{"type":"custom","id":"bad","parentId":null,"timestamp":"0","customType":"', "utf8");
+		const suffix = Buffer.from('","data":{}}\n', "utf8");
+		fs.writeFileSync(sessionFile, Buffer.concat([header, prefix, Buffer.from([0xff]), suffix]));
+		expect(SessionManager.captureTranscriptStrict(sessionFile)).toMatchObject({ kind: "error", reason: "malformed" });
+	} finally {
+		tempDir.removeSync();
+	}
+});
+
 it("fails closed for a missing parent in the bounded first-open chain", async () => {
 	const storage = new MemorySessionStorage();
 	const sessionFile = "/sessions/missing-parent-bounded.jsonl";
