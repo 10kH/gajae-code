@@ -1224,6 +1224,8 @@ interface SessionRuntime {
 	busy: boolean;
 	/** Prompt command/turn identities awaiting their corresponding agent_start. */
 	pendingPromptCorrelations: Array<{ commandId: string; turnId: string }>;
+	/** SDK run tokens bind an accepted queued follow-up to only its matching agent_start. */
+	pendingPromptCorrelationsBySdkRunToken: Map<string, { commandId: string; turnId: string }>;
 	/** Identity bound to the agent lifecycle currently in flight. */
 	activePromptCorrelation?: { commandId: string; turnId: string };
 	/** Binds the executing Agent run to a correlated prompt so cleanup targets only it. */
@@ -2381,6 +2383,7 @@ function sdkControlSurface(
 		trackReconciliation?: boolean,
 		preflightAbort?: () => void | Promise<void>,
 		reconciliationKind?: ReconciliationKind,
+		sdkRunToken?: string,
 	) => void | Promise<void> = () => {},
 	onPromptFailed: (
 		correlation: { commandId: string; turnId: string },
@@ -2611,6 +2614,7 @@ function sdkControlSurface(
 				: text;
 		const commandId = crypto.randomUUID();
 		const turnId = crypto.randomUUID();
+		const sdkRunToken = deliverAs === "followUp" ? crypto.randomUUID() : undefined;
 		type PreflightTerminalResult = { status: "accepted" } | { status: "rejected"; error: unknown };
 		const preflight = Promise.withResolvers<PreflightTerminalResult>();
 		const preflightController = new AbortController();
@@ -2659,6 +2663,8 @@ function sdkControlSurface(
 					trimmedClientRef,
 					trackReconciliation,
 					settleSubmission,
+					"prompt",
+					sdkRunToken,
 				);
 			} catch (error) {
 				accepting = false;
@@ -2690,6 +2696,7 @@ function sdkControlSurface(
 					onPreflightAcceptCommit,
 					onPreflightAccepted,
 					preflightSignal: preflightController.signal,
+					...(sdkRunToken ? { sdkRunToken } : {}),
 				}),
 			);
 		} catch (error) {
@@ -4061,6 +4068,7 @@ export function createNotificationsExtension(
 
 		const pendingInteractive = new Map<string, PendingInteractiveAsk>();
 		const pendingPromptCorrelations: Array<{ commandId: string; turnId: string }> = [];
+		const pendingPromptCorrelationsBySdkRunToken = new Map<string, { commandId: string; turnId: string }>();
 		const tag = sessionTag(id);
 		let runtime: SessionRuntime | undefined;
 
@@ -4316,6 +4324,10 @@ export function createNotificationsExtension(
 				candidate => candidate.commandId === correlation.commandId && candidate.turnId === correlation.turnId,
 			);
 			if (pendingIndex !== -1) pendingPromptCorrelations.splice(pendingIndex, 1);
+			for (const [sdkRunToken, candidate] of pendingPromptCorrelationsBySdkRunToken) {
+				if (candidate.commandId === correlation.commandId && candidate.turnId === correlation.turnId)
+					pendingPromptCorrelationsBySdkRunToken.delete(sdkRunToken);
+			}
 		};
 		const addTerminalTombstone = (key: string, connectionId: string, now = Date.now()) => {
 			promptTerminalTombstones.delete(key);
@@ -4434,6 +4446,7 @@ export function createNotificationsExtension(
 			trackReconciliation = false,
 			preflightAbort?: () => void | Promise<void>,
 			reconciliationKind: ReconciliationKind = "prompt",
+			sdkRunToken?: string,
 		) => {
 			if (!requesterConnectionId) {
 				// No delivery owner: tracked prompts cannot be reconciled. Release
@@ -4453,7 +4466,8 @@ export function createNotificationsExtension(
 					);
 				expirePromptDelivery(oldestTerminal[0], oldestTerminal[1]);
 			}
-			pendingPromptCorrelations.push(correlation);
+			if (sdkRunToken) pendingPromptCorrelationsBySdkRunToken.set(sdkRunToken, correlation);
+			else pendingPromptCorrelations.push(correlation);
 			const submission: PromptSubmission = {
 				acknowledged: false,
 				connectionId: requesterConnectionId,
@@ -4772,7 +4786,10 @@ export function createNotificationsExtension(
 			pendingInteractive,
 			gatePresentations,
 			api,
-			() => runtime?.busy === true || pendingPromptCorrelations.length > 0,
+			() =>
+				runtime?.busy === true ||
+				pendingPromptCorrelations.length > 0 ||
+				pendingPromptCorrelationsBySdkRunToken.size > 0,
 			recordPromptAccepted,
 			recordPromptFailure,
 			discardPromptAcceptance,
@@ -5199,6 +5216,7 @@ export function createNotificationsExtension(
 			sessionTag: tag,
 			busy: false,
 			pendingPromptCorrelations,
+			pendingPromptCorrelationsBySdkRunToken,
 			activePromptCorrelation: undefined,
 			bindPromptExecutionHandle,
 			peekPromptPendingOutcome: correlation => {
@@ -5369,9 +5387,6 @@ export function createNotificationsExtension(
 				// terminal authority stays with the eventual normalized SDK outcome.
 				for (const submission of promptSubmissions.values())
 					if (submission.connectionId === connectionId) {
-						void Promise.resolve(submission.preflightAbort?.()).catch(error =>
-							logger.warn(`sdk: disconnected accepted preflight cancellation failed: ${String(error)}`),
-						);
 						abandonPrompt(submission);
 					}
 			});
@@ -5829,7 +5844,10 @@ export function createNotificationsExtension(
 			// runtime's alone, so only this runtime's teardown can retract it.
 			initializedRuntime.evidencePublication = publishSessionHostRuntimeEvidence({
 				attachedClients: () => server.clientCount(),
-				workInFlight: () => initializedRuntime.busy || initializedRuntime.pendingPromptCorrelations.length > 0,
+				workInFlight: () =>
+					initializedRuntime.busy ||
+					initializedRuntime.pendingPromptCorrelations.length > 0 ||
+					initializedRuntime.pendingPromptCorrelationsBySdkRunToken.size > 0,
 			});
 			ephemeralTurns.configureAuthority({
 				sessionId: id,
@@ -6549,7 +6567,7 @@ export function createNotificationsExtension(
 	// Drive the live typing indicator: mark busy when the agent loop starts so
 	// the daemon shows "typing…" in the thread while the agent is thinking,
 	// before any turn output exists. Cleared on `agent_end` below.
-	api.on("agent_start", (_event, ctx) => {
+	api.on("agent_start", (event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt) return;
@@ -6557,11 +6575,15 @@ export function createNotificationsExtension(
 		// it is tracked regardless of whether notifications are active.
 		rt.busy = true;
 		// A continuation re-enters the agent loop inside the same prompt and emits
-		// another `agent_start`. Shifting again would pop nothing and clobber the
-		// live correlation with `undefined`, so the prompt's `agent_end` could no
-		// longer be terminalized and the caller would hang until the deadline.
-		// Only claim the next pending correlation when this session has no active one.
-		const correlation = rt.activePromptCorrelation ?? rt.pendingPromptCorrelations.shift();
+		// another `agent_start`. Only a queued follow-up's exact SDK token may
+		// claim its correlation; unrelated queue work must not consume it.
+		const sdkRunToken = event.sdkRunToken;
+		const correlation =
+			rt.activePromptCorrelation ??
+			(sdkRunToken
+				? rt.pendingPromptCorrelationsBySdkRunToken.get(sdkRunToken)
+				: rt.pendingPromptCorrelations.shift());
+		if (sdkRunToken && correlation) rt.pendingPromptCorrelationsBySdkRunToken.delete(sdkRunToken);
 		const continuation = rt.activePromptCorrelation !== undefined;
 		rt.activePromptCorrelation = correlation;
 		if (correlation && !continuation) rt.bindPromptExecutionHandle(correlation, ctx.getActivePromptHandle());
