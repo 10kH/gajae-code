@@ -226,8 +226,8 @@ impl ComputerController {
 		hotkey::start();
 		let frame = capture_primary_display().map_err(capture_error)?;
 		let display = frame.display;
-		let mut controller = guarded_controller()
-			.map_err(|err| napi_error("COMPUTER_PERMISSION_REQUIRED", err.to_string()))?;
+		let mut controller =
+			guarded_controller().map_err(|err| napi::Error::from_reason(err.to_string()))?;
 		let cancel = || Supervisor::global().is_suspended();
 		let mut hooks = MacCursorHooks;
 		execute_input_transaction(
