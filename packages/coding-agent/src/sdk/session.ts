@@ -114,8 +114,11 @@ import {
 	SPAWN_PROVENANCE_ENV,
 	shouldRegisterGenericNotificationsExtension,
 } from "../sdk/bus/config";
+import { createReconciliationStore, type ReconciliationStore } from "../sdk/bus/reconciliation-store";
 import { NotificationSessionController } from "../sdk/bus/session-control";
 import { shouldHostSdk } from "../sdk/host";
+import { createSdkSessionRuntimeExtension, registerSdkOnlyNotificationCommand } from "../sdk/host/session-runtime";
+import { createSdkWebSocketTransport } from "../sdk/host/websocket-transport";
 
 import type { SecretObfuscator } from "../secrets";
 import { AgentSession, type ForkContextSeed } from "../session/agent-session";
@@ -123,6 +126,13 @@ import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
 import { createReadonlySessionManager, SessionManager } from "../session/session-manager";
+import {
+	isOwnedCompletionEnvelopeAllowed,
+	lookupOwnedRegistration,
+	type OwnedCompletionEnvelope,
+	retireOwnedRegistrationsForEndpoint,
+	unregisterOwnedRegistration,
+} from "../session/terminal-abort";
 import { formatNoModelsAvailableFallback } from "../setup/model-onboarding-guidance";
 import {
 	type BuildSystemPromptResult,
@@ -163,6 +173,8 @@ type AsyncResultEntry = {
 	result: string;
 	job: AsyncJob | undefined;
 	durationMs: number | undefined;
+	/** Exact owned-completion origin when the job is registered left-running work of a terminal turn. */
+	ownedCompletion?: OwnedCompletionEnvelope;
 };
 
 type AsyncResultJobDetails = {
@@ -174,6 +186,8 @@ type AsyncResultJobDetails = {
 
 type AsyncResultDetails = {
 	jobs: AsyncResultJobDetails[];
+	/** Private origin envelope(s); absent = ordinary delivery. Never a public field. */
+	ownedCompletions?: OwnedCompletionEnvelope[];
 };
 
 type McpNotificationEntry = {
@@ -183,13 +197,53 @@ type McpNotificationEntry = {
 
 function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): CustomMessage<AsyncResultDetails> | null {
 	if (entries.length === 0) return null;
-	const jobs = entries.map(entry => ({
+	// Partition denied owned-completion entries out ENTIRELY before batch
+	// construction (AC 36 zero final calls from stopped work): a denied entry —
+	// owned scope, forged tuple, or vanished scope — must never reach
+	// followUp/prompt, even inside a mixed batch. Allowed owned-completion and
+	// ordinary entries are delivered normally.
+	const survivors = entries.filter(
+		entry => entry.ownedCompletion === undefined || isOwnedCompletionEnvelopeAllowed(entry.ownedCompletion),
+	);
+	// Denied entries never reach followUp/prompt (AC 36), so no later
+	// settlement boundary sees them — retire their terminal tuples HERE,
+	// otherwise an owned_unsettled abort's later completion keeps occupying
+	// the global registration and retained-policy capacities (review P2).
+	const denied = entries.filter(
+		(entry): entry is AsyncResultEntry & { ownedCompletion: OwnedCompletionEnvelope } =>
+			entry.ownedCompletion !== undefined && !isOwnedCompletionEnvelopeAllowed(entry.ownedCompletion),
+	);
+	if (denied.length > 0) {
+		// Resolve the manager from the registration's OWN endpoint: the
+		// process-global instance is the last-created session, so when B's
+		// manager is global with the same local job id still running, the
+		// terminality check would observe B's running job and refuse to
+		// unregister A's already-terminal tuple (review thread P2).
+		const manager =
+			AsyncJobManager.forEndpoint(denied[0]?.ownedCompletion.registration.endpointId) ?? AsyncJobManager.instance();
+		for (const entry of denied) {
+			const registration = entry.ownedCompletion.registration;
+			const job = manager?.getJob(registration.jobId);
+			const status = job?.generation === registration.jobGeneration ? job?.status : undefined;
+			if (job === undefined || status === "completed" || status === "cancelled" || status === "failed") {
+				unregisterOwnedRegistration(registration);
+			}
+		}
+	}
+	if (survivors.length === 0) return null;
+	const jobs = survivors.map(entry => ({
 		jobId: entry.jobId,
 		result: entry.result,
 		type: entry.job?.type,
 		label: entry.job?.label,
 		durationMs: entry.durationMs,
 	}));
+	const ownedCompletions = survivors
+		.filter(
+			(entry): entry is AsyncResultEntry & { ownedCompletion: OwnedCompletionEnvelope } =>
+				entry.ownedCompletion !== undefined,
+		)
+		.map(entry => entry.ownedCompletion);
 	const details: AsyncResultDetails = {
 		jobs: jobs.map(job => ({
 			jobId: job.jobId,
@@ -197,6 +251,10 @@ function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): CustomMessag
 			label: job.label,
 			durationMs: job.durationMs,
 		})),
+		// Private origin envelope for the AgentSession injector; absent for
+		// ordinary deliveries. Only ALLOWED owned-completion entries survive
+		// partitioning, so the injector never sees a denied envelope here.
+		...(ownedCompletions.length > 0 ? { ownedCompletions } : {}),
 	};
 	return {
 		role: "custom",
@@ -224,6 +282,20 @@ function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): CustomMessag
  * result for any such trailing unpaired tool call so a resumed session always
  * starts from a valid, paired history. No-op for well-formed transcripts.
  */
+/** Whether the cached SDK-only reconciliation store still matches the current
+ *  session identity. session_switch/session_branch can move to a DIFFERENT
+ *  transcript that retains the same copied session id, so the cache is keyed
+ *  by BOTH the session id and the session-file path (including a null-to-file
+ *  transition); a mismatch means the store must be recreated or the successor
+ *  reads/writes the predecessor's reconciliation file (review thread P2). */
+export function sdkOnlyStoreMatches(
+	cached: { sessionId: string; sessionFile: string | undefined } | undefined,
+	sessionId: string,
+	sessionFile: string | undefined,
+): boolean {
+	return cached !== undefined && cached.sessionId === sessionId && cached.sessionFile === sessionFile;
+}
+
 export function reconcileTrailingToolCalls(messages: AgentMessage[]): AgentMessage[] {
 	let lastAssistantIdx = -1;
 	for (let i = messages.length - 1; i >= 0; i--) {
@@ -439,6 +511,8 @@ export interface CreateAgentSessionOptions {
 	agentRegistry?: AgentRegistry;
 	/** Parent task ID prefix for nested artifact naming (e.g., "6-Extensions") */
 	parentTaskPrefix?: string;
+	/** Parent manager borrowed by a child session; never disposed by the child. */
+	inheritedAsyncJobManager?: AsyncJobManager;
 	/**
 	 * W6b: the parent's scope-held MCP facade, handed to a canonical sub-session so
 	 * it can inherit always-on MCP tools without owning the manager. Replaces the
@@ -1177,6 +1251,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let session!: AgentSession;
 	let hasSession = false;
 	let hasRegistered = false;
+	let asyncJobManager: AsyncJobManager | undefined;
+	let asyncJobManagerAdmitted = false;
+	let priorAsyncJobManager: AsyncJobManager | undefined;
 	let cleanupOwnedMcpManager: (() => Promise<void>) | undefined;
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
 	const resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
@@ -1612,12 +1689,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const asyncMaxJobs = Math.min(100, Math.max(1, settings.get("async.maxJobs") ?? 100));
 		const ASYNC_INLINE_RESULT_MAX_CHARS = 12_000;
 		const ASYNC_PREVIEW_MAX_CHARS = 4_000;
-		const formatAsyncResultForFollowUp = async (result: string): Promise<string> => {
+		const formatAsyncResultForFollowUp = async (result: string, allowArtifact = true): Promise<string> => {
 			if (result.length <= ASYNC_INLINE_RESULT_MAX_CHARS) {
 				return result;
 			}
 
 			const preview = `${result.slice(0, ASYNC_PREVIEW_MAX_CHARS)}\n\n[Output truncated. Showing first ${ASYNC_PREVIEW_MAX_CHARS.toLocaleString()} characters.]`;
+			// A delivery already denied by a scope:"owned" gate never reaches the
+			// model: allocating an artifact for it would leave the stopped job's
+			// output in an unreferenced artifact after the flush drops it (review
+			// thread P2). Only the inline preview is produced.
+			if (!allowArtifact) return preview;
 			try {
 				const { path: artifactPath, id: artifactId } = await sessionManager.allocateArtifactPath("async");
 				if (artifactPath && artifactId) {
@@ -1636,14 +1718,49 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// parent's manager via `AsyncJobManager.instance()` (set below), so creating
 		// a second instance here just to leave it orphaned wastes a constructor and
 		// risks accidental disposal of the parent's manager on subagent teardown.
-		const asyncJobManager =
+		asyncJobManager =
 			backgroundJobsEnabled && !options.parentTaskPrefix
 				? new AsyncJobManager({
 						maxRunningJobs: asyncMaxJobs,
 						onJobComplete: async (jobId, result, job) => {
 							if (!session) return;
-							const formattedResult = await formatAsyncResultForFollowUp(result);
+							// Mandated boundary comment (corrected turn semantics):
+							// turn-scope abort blocks only deliveries whose origin is a
+							// continuation of the aborted turn. Owned-completion deliveries
+							// from work deliberately left running are intentionally allowed
+							// to resume the agent through the normal followUp/prompt path
+							// and receive a fresh turn attempt. Recover the immutable origin
+							// BEFORE formatting or artifact allocation; missing metadata
+							// fails closed to an ordinary delivery.
+							// Preserve ownership on the queued entry REGARDLESS of whether a
+							// terminal scope exists yet: the registration is determined at
+							// job-registration time, and the scope is determined at abort
+							// time (or later, at flush). A completion finished before the
+							// abort must not become an ordinary entry that owned cleanup
+							// cannot identify/purge (review thread P1).
+							// Owned tuples are keyed by the LOGICAL endpoint, not a
+							// provider-facing session id. providerSessionId may differ
+							// from sessionManager.getSessionId(), so session.sessionId
+							// would miss the tuple and turn a left-running completion
+							// into an ordinary follow-up (review thread P1).
+							const endpointId = AsyncJobManager.endpointIdOf(asyncJobManager) ?? sessionManager.getSessionId();
+							const registration = job ? lookupOwnedRegistration(jobId, job.generation, endpointId) : undefined;
+							const ownedCompletion = registration
+								? {
+										lineageIdHash: registration.lineageIdHash,
+										promptAttemptEpoch: registration.promptAttemptEpoch,
+										registration,
+									}
+								: undefined;
+							// Check suppression and classify the captured envelope BEFORE
+							// formatting/artifact allocation: a delivery already suppressed
+							// by the manager (owned-stop cancel/acknowledge) or already
+							// denied by a scope:"owned" gate must not allocate an
+							// unreferenced artifact (review thread P2).
 							if (asyncJobManager!.isDeliverySuppressed(jobId, job?.generation)) return;
+							const deniedOwnedDelivery =
+								ownedCompletion !== undefined && !isOwnedCompletionEnvelopeAllowed(ownedCompletion);
+							const formattedResult = await formatAsyncResultForFollowUp(result, !deniedOwnedDelivery);
 
 							const durationMs = job ? jobElapsedMs(job) : undefined;
 							session.yieldQueue.enqueue<AsyncResultEntry>("async-result", {
@@ -1652,10 +1769,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								result: formattedResult,
 								job,
 								durationMs,
+								...(ownedCompletion
+									? {
+											ownedCompletion: {
+												lineageIdHash: ownedCompletion.lineageIdHash,
+												promptAttemptEpoch: ownedCompletion.promptAttemptEpoch,
+												registration: ownedCompletion.registration,
+											},
+										}
+									: {}),
 							});
 						},
 					})
-				: undefined;
+				: options.inheritedAsyncJobManager;
 
 		let promptMetadataModel: Model | undefined;
 		const getActiveModelString = (): string | undefined => {
@@ -1691,7 +1817,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			assertEvalExecutionAllowed: () => session?.assertEvalExecutionAllowed(),
 			trackEvalExecution: (execution, abortController) =>
 				session ? session.trackEvalExecution(execution, abortController) : execution,
-			getSessionId: () => sessionManager.getSessionId?.() ?? null,
+			getAsyncJobManager: () => asyncJobManager,
+			// Subagents inherit the parent's manager; its registered endpoint is
+			// authoritative for owned-registration keying and endpoint-first
+			// manager lookup (the child's own id is never registered), so tools
+			// pass the same endpoint the manager's completion callback resolves
+			// (review thread P1). For a top-level session this equals the
+			// session id.
+			getSessionId: () => AsyncJobManager.endpointIdOf(asyncJobManager) ?? sessionManager.getSessionId?.() ?? null,
 			getCredentialSessionId: () => session?.credentialSessionId ?? credentialSessionId,
 			getMcpManager: () => mcpManager ?? options.inheritedMcpManager,
 			isManagedSessionDestination: () => sessionManager.isManagedDestination(),
@@ -1799,7 +1932,26 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (!options.parentTaskPrefix) {
 			setActiveSkills(skills);
 			setActiveRules([...rulebookRules, ...alwaysApplyRules]);
-			if (asyncJobManager) AsyncJobManager.setInstance(asyncJobManager);
+			if (asyncJobManager) {
+				// Register under the session endpoint so concurrent sessions'
+				// owned work settles in the correct manager (review thread P1).
+				// `session` is not yet constructed here; the session manager id
+				// is the endpoint identity. ADMIT THE ENDPOINT FIRST: a second
+				// top-level session constructed or resumed under an endpoint id
+				// already held by another LIVE manager must fail construction
+				// BEFORE the global instance is replaced — otherwise the
+				// rejected construction leaves this orphan manager as the
+				// process-global instance, redirecting global-manager
+				// consumers away from the live session (review thread P1).
+				if (!AsyncJobManager.registerForEndpoint(sessionManager.getSessionId(), asyncJobManager)) {
+					throw new Error(
+						`Cannot construct session "${sessionManager.getSessionId()}": the endpoint id is already held by another live async job manager`,
+					);
+				}
+				asyncJobManagerAdmitted = true;
+				priorAsyncJobManager = AsyncJobManager.instance();
+				AsyncJobManager.setInstance(asyncJobManager);
+			}
 		}
 		await initializeLocalRoot(localProtocolOptions);
 		if (options.localProtocolOptions) {
@@ -2130,13 +2282,29 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					if (lifecycleStartupCapability) attachLifecycleStartupCapability(api, lifecycleStartupCapability);
 					if (lifecycleStartupCapability && process.env.GJC_SDK_TEST_FACTORY_FAILURE === cwd)
 						throw new Error(process.env.GJC_SDK_TEST_FACTORY_SECRET ?? "Lifecycle factory test failure.");
-					if (notificationsExtensionEligible || sdkHostEligible) {
+					if (notificationsExtensionEligible) {
 						const createNotificationsExtension = await notificationAdapterService.get("session-extension");
 						createNotificationsExtension(api, {
 							settings,
 							controller: notificationSessionController,
 							spawnedByGjc,
 							sdkHostModeSupported: options.sdkHostModeSupported,
+							// INTERNAL terminal-abort seams, threaded directly from the
+							// owning session (NOT on the public extension context).
+							terminalAbortSeams: {
+								getTerminalTurnEpoch: () => {
+									if (!session) throw new Error("Terminal abort session is not initialized.");
+									return session.getTerminalTurnEpoch();
+								},
+								cancelPendingPreflightForTerminalAbort: () => {
+									if (!session) throw new Error("Terminal abort session is not initialized.");
+									session.cancelPendingPreflightForTerminalAbort();
+								},
+								abortPromptAndWaitWithTerminal: (handle, seamOptions) => {
+									if (!session) throw new Error("Terminal abort session is not initialized.");
+									return session.abortPromptAndWait(handle, seamOptions);
+								},
+							},
 							ensureProviderDaemon: options.ensureNotificationProviderDaemon,
 							runBtwTurn: async (question, signal) => {
 								if (!session) throw new Error("Ephemeral turns are unavailable.");
@@ -2146,6 +2314,63 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									signal,
 								});
 								return { replyText };
+							},
+						});
+					} else if (sdkHostEligible) {
+						registerSdkOnlyNotificationCommand(api);
+						let sdkOnlyReconciliationStore:
+							| { sessionId: string; sessionFile: string | undefined; store: ReconciliationStore }
+							| undefined;
+						createSdkSessionRuntimeExtension(api, {
+							agentDir,
+							brokerRegistrationRequired: lifecycleStartupCapability !== undefined,
+							createTransport: input => createSdkWebSocketTransport(input),
+							settings,
+							configOverrides: new Map(),
+							// INTERNAL terminal-abort seams, threaded directly from the
+							// owning session (NOT on the public extension context).
+							terminalAbortSeams: {
+								getReconciliationStore: () => {
+									const sessionId = sessionManager.getSessionId();
+									const sessionFile = sessionManager.getSessionFile();
+									// session_switch/session_branch may move to a DIFFERENT transcript
+									// that retains the same copied session id: the store must be
+									// recreated (keyed by session id AND file path, including a
+									// null-to-file transition) or the successor reads/writes the
+									// predecessor's reconciliation file, spuriously replaying or
+									// conflicting with its keys and losing its own replay authority
+									// after restart (review thread P2).
+									if (
+										!sdkOnlyReconciliationStore ||
+										!sdkOnlyStoreMatches(sdkOnlyReconciliationStore, sessionId, sessionFile)
+									) {
+										sdkOnlyReconciliationStore = {
+											sessionId,
+											sessionFile,
+											store: createReconciliationStore({
+												sessionFile,
+												sessionId,
+											}),
+										};
+									}
+									return sdkOnlyReconciliationStore.store;
+								},
+								getTerminalTurnEpoch: () => {
+									if (!session) throw new Error("Terminal abort session is not initialized.");
+									return session.getTerminalTurnEpoch();
+								},
+								getActivePromptHandle: () => {
+									if (!session) throw new Error("Terminal abort session is not initialized.");
+									return session.activePromptHandle;
+								},
+								cancelPendingPreflightForTerminalAbort: () => {
+									if (!session) throw new Error("Terminal abort session is not initialized.");
+									session.cancelPendingPreflightForTerminalAbort();
+								},
+								abortPromptAndWaitWithTerminal: (handle, seamOptions) => {
+									if (!session) throw new Error("Terminal abort session is not initialized.");
+									return session.abortPromptAndWait(handle, seamOptions);
+								},
 							},
 						});
 					}
@@ -3010,6 +3235,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// AsyncJobManager on teardown; subagents inherit the parent's and
 			// **MUST NOT** tear it down.
 			ownedAsyncJobManager: asyncJobManager,
+			disposeAsyncJobManager: !options.parentTaskPrefix,
 			// Only an MCP manager owned by this session is torn down on dispose;
 			// subagents and callers that merely observe a manager must not (see
 			// AgentSession.dispose).
@@ -3073,9 +3299,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		session.setActiveModelProfile(startupActiveModelProfile);
 		session.configWarnings.push(...contextFileWarnings);
 		hasSession = true;
-		if (asyncJobManager) {
+		const sessionAsyncJobManager = asyncJobManager;
+		if (sessionAsyncJobManager) {
 			session.yieldQueue.register<AsyncResultEntry>("async-result", {
-				isStale: entry => asyncJobManager.isDeliverySuppressed(entry.jobId, entry.generation),
+				isStale: entry => sessionAsyncJobManager.isDeliverySuppressed(entry.jobId, entry.generation),
+				// Build one message per ownership origin so an owned-scope drop of
+				// one turn's message never suppresses other turns'/ordinary
+				// completions batched in the same flush (review thread P2).
+				groupKey: entry =>
+					entry.ownedCompletion
+						? `${entry.ownedCompletion.lineageIdHash}\u0000${entry.ownedCompletion.promptAttemptEpoch}`
+						: "ordinary",
 				build: buildAsyncResultBatchMessage,
 			});
 		}
@@ -3098,6 +3332,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						releaseCredentialDisabledSubscription();
 						releaseLocalProtocolOverride();
 					} finally {
+						// The endpoint is gone: its owned registrations can never
+						// reach a delivery settlement boundary, and foreign-endpoint
+						// tuples are deliberately never classified terminal by other
+						// managers — retire them before unregistering the manager so
+						// repeated session churn cannot saturate the registry
+						// (review thread P2). The endpoint is the manager's live
+						// registration key, which survives newSession/switchSession
+						// rekeying and may differ from the provider-facing session id.
+						if (!options.parentTaskPrefix) {
+							retireOwnedRegistrationsForEndpoint(
+								AsyncJobManager.endpointIdOf(asyncJobManager) ?? session.sessionId,
+							);
+							AsyncJobManager.unregisterManager(asyncJobManager);
+						}
 						closeOwnedAuthStorage();
 					}
 				}
@@ -3316,6 +3564,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				await session.dispose();
 			} else {
 				if (hasRegistered) agentRegistry.unregister(resolvedAgentId);
+				// Admission happens before session construction. Any later startup
+				// failure must remove THIS manager's endpoint mapping and restore
+				// the prior global only when this manager is still global: otherwise
+				// a retry under the same endpoint is falsely rejected and an orphan
+				// redirects global-manager consumers away from the live session
+				// (review thread P1).
+				if (asyncJobManagerAdmitted && asyncJobManager) {
+					AsyncJobManager.unregisterManager(asyncJobManager);
+					if (AsyncJobManager.instance() === asyncJobManager) {
+						AsyncJobManager.setInstance(priorAsyncJobManager);
+					}
+					await asyncJobManager.dispose({ timeoutMs: 100 });
+				}
 				await cleanupOwnedMcpManager?.();
 				const [{ disposeKernelSessionsByOwner }, { disposeVmContextsByOwner }] = await Promise.all([
 					import("../eval/py/executor"),

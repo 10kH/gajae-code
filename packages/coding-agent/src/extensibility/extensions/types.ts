@@ -1175,7 +1175,10 @@ export interface ExtensionAPI {
 	 */
 	sendMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
-		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+		options?: {
+			triggerTurn?: boolean;
+			deliverAs?: "steer" | "followUp" | "nextTurn";
+		},
 	): void;
 
 	/** Send a user message to the agent, or queue it when deliverAs is set. */
@@ -1396,7 +1399,10 @@ export type SendMessageHandler = <T = unknown>(
 	 * When paired with `triggerTurn: true` during prompt teardown, the session schedules
 	 * an internal continuation without surfacing the message in the editable pending queue.
 	 */
-	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+	options?: {
+		triggerTurn?: boolean;
+		deliverAs?: "steer" | "followUp" | "nextTurn";
+	},
 ) => void;
 
 export type SendUserMessageHandler = (
@@ -1405,6 +1411,8 @@ export type SendUserMessageHandler = (
 		deliverAs?: "steer" | "followUp";
 		onPreflightAccepted?: () => void;
 		onPreflightAcceptCommit?: () => void | Promise<void>;
+		/** Fired when a queued submission (steering or follow-up) is promoted to its own run (SDK ownership correlation). */
+		onQueuedPromoted?: () => void;
 		preflightSignal?: AbortSignal;
 		/** Internal SDK correlation owner for an exact queued follow-up. */
 		sdkRunToken?: string;
@@ -1499,6 +1507,7 @@ export interface ExtensionContextActions {
 	getActivePromptHandle?: () => string | undefined;
 	abort: () => void;
 	abortPromptAndWait?: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
+
 	hasPendingMessages: () => boolean;
 	/** Typed pending-message counts per queue; optional for embedders without a counted queue. */
 	getPendingMessageCounts?: () => { steering: number; followUp: number; nextTurn: number };
