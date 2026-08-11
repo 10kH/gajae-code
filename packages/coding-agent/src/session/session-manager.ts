@@ -3421,6 +3421,50 @@ function resumeIdentityMatchesDescriptor(identity: ResumeSessionIdentity, descri
 	);
 }
 
+function descriptorSnapshotAsStorageStat(descriptor: DescriptorSnapshot): SessionStorageStat {
+	const mtimeMs = Number(descriptor.mtimeNs) / 1_000_000;
+	return { ...descriptor, mtimeMs, mtime: new Date(mtimeMs), isFile: true };
+}
+
+function retainedManagedInspectionStorage(
+	storage: SessionStorage,
+	store: ManagedSessionDescendantStore,
+	filePath: string,
+): SessionStorage {
+	const resolved = path.resolve(filePath);
+	const relative = path.basename(resolved);
+	const statExpected = (): SessionStorageStat => {
+		store.assertBound();
+		const descriptor = store.descriptorExpected(relative);
+		if (!descriptor) throw Object.assign(new Error("Managed file not found"), { code: "ENOENT" });
+		return descriptorSnapshotAsStorageStat(descriptor);
+	};
+	return new Proxy(storage, {
+		get: (target, property) => {
+			if (property === "statSync")
+				return (candidate: string) =>
+					path.resolve(candidate) === resolved ? statExpected() : target.statSync(candidate);
+			if (property === "existsSync")
+				return (candidate: string) =>
+					path.resolve(candidate) === resolved
+						? store.descriptorExpected(relative) !== null
+						: target.existsSync(candidate);
+			if (property === "readSnapshotSync")
+				return (candidate: string) => {
+					if (path.resolve(candidate) !== resolved) return target.readSnapshotSync!(candidate);
+					const before = statExpected();
+					const snapshot = store.readExpected(relative);
+					if (!snapshot) throw Object.assign(new Error("Managed file not found"), { code: "ENOENT" });
+					const after = statExpected();
+					if (!sameResumeStat(before, after)) throw new Error("source_changed");
+					return { bytes: snapshot.bytes, stat: before };
+				};
+			const value = Reflect.get(target, property, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	});
+}
+
 interface ResumeInspectionSnapshot {
 	identity: ResumeSessionIdentity;
 	content: Uint8Array;
@@ -18226,9 +18270,16 @@ export class SessionManager {
 			manager.buildSessionContext();
 			return manager;
 		}
+		const sameManagedDirectory = path.dirname(path.resolve(filePath)) === path.resolve(destination.directory);
+		let managedInspectionStore: ManagedSessionDescendantStore | undefined;
+		let managedInspectionStorage: SessionStorage = storage;
+		if (sameManagedDirectory) {
+			managedInspectionStore = managedStoreFromContext(destination.securityContext, destination.directory);
+			managedInspectionStorage = retainedManagedInspectionStorage(storage, managedInspectionStore, filePath);
+		}
 		let managedSourceSize: number | undefined;
 		try {
-			managedSourceSize = storage.statSync(filePath).size;
+			managedSourceSize = managedInspectionStorage.statSync(filePath).size;
 		} catch {
 			// Strict inspection below reports the stable failure.
 		}
@@ -18243,14 +18294,19 @@ export class SessionManager {
 			managedResumeBounded &&
 			managedSourceSize !== undefined &&
 			managedSourceSize <= eagerHydrationMaxBytes() &&
-			path.dirname(path.resolve(filePath)) === path.resolve(destination.directory)
+			sameManagedDirectory
 		) {
-			const strict = inspectResumeSessionFile(filePath, storage);
-			if ("kind" in strict) throw new Error(`Could not open session: ${strict.reason}`);
-			strictManagedSmallInspection = strict;
+			try {
+				const strict = inspectResumeSessionFile(filePath, managedInspectionStorage);
+				if ("kind" in strict) throw new Error(`Could not open session: ${strict.reason}`);
+				strictManagedSmallInspection = strict;
+			} catch (error) {
+				managedInspectionStore?.close();
+				throw error;
+			}
 		}
 
-		if (managedResumeBounded && path.dirname(path.resolve(filePath)) === path.resolve(destination.directory)) {
+		if (managedResumeBounded && sameManagedDirectory) {
 			const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
 			manager.#sessionMemoryMode = sessionMemoryMode;
 			try {
@@ -18258,7 +18314,7 @@ export class SessionManager {
 				if (strictManagedSmallInspection) {
 					const revalidated = revalidateTranscriptIdentityBounded(
 						filePath,
-						storage,
+						managedInspectionStorage,
 						strictManagedSmallInspection.identity,
 					);
 					if (
@@ -18276,8 +18332,12 @@ export class SessionManager {
 			} catch (error) {
 				await manager.close().catch(() => {});
 				throw error;
+			} finally {
+				managedInspectionStore?.close();
 			}
 		}
+		managedInspectionStore?.close();
+		managedInspectionStore = undefined;
 		const inspected = inspectResumeSessionFile(filePath, storage);
 		if ("kind" in inspected) {
 			if (inspected.reason === "missing") {
