@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- Managed master sessions now provide `gjc master create`, `gjc master list`, and `gjc master configure` for named headless orchestrators with durable state under `$GJC_HOME/master`, a default `maxConcurrentWorkers` of 3, and drain-aware capacity reductions. The separate private loopback/token master SDK v1 exposes strict snapshots, ordered event replay, worker ownership/claims, Coordinator-frozen orchestration, the injected `MemoryContract` boundary, and leased Telegram/Discord channel effects. At least one active reconciled provider keeps a master available while every configured provider retains durable ordered presentation replay until its delivery reconciles; master sessions have no repository-edit capability or bundled/default skill/agent.
+
 ### Fixed
 - Follow-up queue auto-continuation now waits for compaction and foreground bash/eval work to settle, preventing queued prompts from starting a model turn concurrently with those operations.
 - Follow-up queue submissions now defer slash/skill text during foreground bash/eval work instead of invoking a competing custom-message turn.

@@ -27,6 +27,7 @@ import type {
 	DiscordProvider,
 	DiscordThread,
 } from "../src/sdk/bus/discord-provider";
+import { MasterDaemonClient } from "../src/sdk/bus/master-daemon-client";
 import { SdkClientError } from "../src/sdk/client/client";
 
 const actionCustomIds = new Map<string, string>();
@@ -162,9 +163,92 @@ class FakeDiscordProvider implements DiscordProvider {
 	async stop(): Promise<void> {}
 }
 
+class FakeMasterTransport {
+	readonly requests: Array<Record<string, unknown>> = [];
+	readonly listeners = new Set<(frame: any) => void>();
+	closed = false;
+
+	async ready(): Promise<void> {}
+	onFrame(listener: (frame: any) => void): () => void {
+		this.listeners.add(listener);
+		return () => this.listeners.delete(listener);
+	}
+	async request(frame: any): Promise<any> {
+		this.requests.push(frame);
+		if (frame.type === "subscribe")
+			return {
+				type: "subscription_ready",
+				requestId: frame.requestId,
+				mode: "snapshot",
+				highWaterSeq: 1,
+			};
+		if (frame.type === "get_snapshot")
+			return {
+				type: "master_snapshot",
+				protocolVersion: 1,
+				requestId: frame.requestId,
+				snapshotCutSeq: 1,
+				generatedAt: new Date(0).toISOString(),
+				masters: [
+					{
+						masterName: "alpha",
+						channels: [
+							{
+								provider: "discord",
+								state: "active",
+								intentId: "intent",
+								bindingId: "binding",
+								remoteChannelId: "master-thread",
+								fence: 1,
+								pendingPresentationCount: 0,
+								deliveryHealth: "healthy",
+							},
+						],
+					},
+				],
+			};
+		if (frame.type === "provider_worker_hello")
+			return {
+				type: "ack",
+				requestId: frame.requestId,
+				operation: frame.type,
+				result: {
+					kind: "provider_worker",
+					provider: frame.provider,
+					workerId: frame.workerId,
+					state: "registered",
+				},
+			};
+		if (frame.type === "master_user_message")
+			return {
+				type: "ack",
+				requestId: frame.requestId,
+				operation: frame.type,
+				idempotencyKey: frame.idempotencyKey,
+				result: { kind: "task", taskId: "task", enqueueSeq: 1, state: "queued" },
+			};
+		return {
+			type: "ack",
+			requestId: frame.requestId,
+			operation: frame.type,
+			result: {
+				kind: "provider_effect_result",
+				effectId: frame.effectId,
+				disposition: "recorded",
+				nextState: "reconciled",
+			},
+		};
+	}
+	async close(): Promise<void> {
+		this.closed = true;
+	}
+}
+
 async function withDaemon(
 	run: (daemon: DiscordNotificationDaemon, provider: FakeDiscordProvider, agentDir: string) => Promise<void>,
-	overrides: Partial<Pick<DiscordNotificationDaemonOptions, "resolveEndpoint" | "onCommand" | "now">> = {},
+	overrides: Partial<
+		Pick<DiscordNotificationDaemonOptions, "resolveEndpoint" | "onCommand" | "now" | "masterClient">
+	> = {},
 ): Promise<void> {
 	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-discord-daemon-"));
 	let daemon: DiscordNotificationDaemon | undefined;
@@ -192,13 +276,20 @@ async function withDaemon(
 	}
 }
 
-function inbound(threadId: string, id: string, generation = 1, customId?: string): DiscordInboundEvent {
+function inbound(
+	threadId: string,
+	id: string,
+	generation = 1,
+	customId?: string,
+	content?: string,
+): DiscordInboundEvent {
 	return {
 		id,
 		guildId: "guild",
 		parentId: "parent",
 		threadId,
 		authorId: "member",
+		...(content === undefined ? {} : { content }),
 		interaction: {
 			id: `interaction-${id}`,
 			token: `token-${id}`,
@@ -2567,5 +2658,28 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			);
 			expect(new Set(archiveEffects.map(effect => effect.id)).size).toBe(2);
 		});
+	});
+
+	test("master provider worker shares the Discord gateway and fences bound ingress", async () => {
+		const transport = new FakeMasterTransport();
+		const masterClient = new MasterDaemonClient({ client: transport as any });
+		await withDaemon(
+			async (daemon, provider) => {
+				await daemon.start();
+				expect(transport.requests.filter(frame => frame.type === "provider_worker_hello")).toHaveLength(1);
+				await provider.handler?.(inbound("master-thread", "master-message", 1, undefined, "hello master"));
+				expect(transport.requests.filter(frame => frame.type === "master_user_message")).toEqual([
+					expect.objectContaining({
+						masterName: "alpha",
+						text: "hello master",
+						idempotencyKey: "discord:master-thread:master-message",
+					}),
+				]);
+				await daemon.stop();
+				await daemon.start();
+				expect(transport.requests.filter(frame => frame.type === "provider_worker_hello")).toHaveLength(2);
+			},
+			{ masterClient },
+		);
 	});
 });

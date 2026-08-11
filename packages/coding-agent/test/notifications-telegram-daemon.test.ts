@@ -14,6 +14,7 @@ import {
 	TELEGRAM_PARSE_MODE,
 } from "../src/sdk/bus/html-format";
 import type { SessionLifecycleRequest, SessionLifecycleResponse } from "../src/sdk/bus/index";
+import { MasterDaemonClient } from "../src/sdk/bus/master-daemon-client";
 import {
 	acquireDaemonTransitionLock,
 	classifyNotificationEndpoint,
@@ -22690,5 +22691,119 @@ test("a topic lease renewal failure on the liveness heartbeat is reported instea
 	} finally {
 		process.off("unhandledRejection", onEscape);
 		warn.mockRestore();
+	}
+});
+
+class FakeMasterTransport {
+	readonly requests: Array<Record<string, unknown>> = [];
+	async ready(): Promise<void> {}
+	onFrame(_listener: (frame: any) => void): () => void {
+		return () => {};
+	}
+	async request(frame: any): Promise<any> {
+		this.requests.push(frame);
+		if (frame.type === "subscribe")
+			return {
+				type: "subscription_ready",
+				requestId: frame.requestId,
+				mode: "snapshot",
+				highWaterSeq: 1,
+			};
+		if (frame.type === "get_snapshot")
+			return {
+				type: "master_snapshot",
+				protocolVersion: 1,
+				requestId: frame.requestId,
+				snapshotCutSeq: 1,
+				generatedAt: new Date(0).toISOString(),
+				masters: [
+					{
+						masterName: "alpha",
+						channels: [
+							{
+								provider: "telegram",
+								state: "active",
+								intentId: "intent",
+								bindingId: "binding",
+								remoteChannelId: "900",
+								fence: 1,
+								pendingPresentationCount: 0,
+								deliveryHealth: "healthy",
+							},
+						],
+					},
+				],
+			};
+		if (frame.type === "provider_worker_hello")
+			return {
+				type: "ack",
+				requestId: frame.requestId,
+				operation: frame.type,
+				result: {
+					kind: "provider_worker",
+					provider: frame.provider,
+					workerId: frame.workerId,
+					state: "registered",
+				},
+			};
+		if (frame.type === "master_user_message")
+			return {
+				type: "ack",
+				requestId: frame.requestId,
+				operation: frame.type,
+				idempotencyKey: frame.idempotencyKey,
+				result: { kind: "task", taskId: "task", enqueueSeq: 1, state: "queued" },
+			};
+		return {
+			type: "ack",
+			requestId: frame.requestId,
+			operation: frame.type,
+			result: {
+				kind: "provider_effect_result",
+				effectId: frame.effectId,
+				disposition: "recorded",
+				nextState: "reconciled",
+			},
+		};
+	}
+	async close(): Promise<void> {}
+}
+
+test("Telegram master worker leases through the existing bot API and fences bound topic ingress", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const transport = new FakeMasterTransport();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		masterClient: new MasterDaemonClient({ client: transport as any }),
+	});
+	try {
+		(daemon as any).running = true;
+		await (daemon as any).ensureMasterWorker();
+		await daemon.handleTelegramUpdate({
+			update_id: 700,
+			message: {
+				chat: { id: 42, type: "supergroup" },
+				message_thread_id: 900,
+				message_id: 11,
+				from: { id: 5 },
+				text: "hello master",
+			},
+		});
+		expect(transport.requests.filter(frame => frame.type === "master_user_message")).toEqual([
+			expect.objectContaining({ masterName: "alpha", text: "hello master", idempotencyKey: "telegram:900:11" }),
+		]);
+		await (daemon as any).stopMasterWorker();
+		(daemon as any).running = true;
+		(daemon as any).masterStopRequested = false;
+		await (daemon as any).ensureMasterWorker();
+		expect(transport.requests.filter(frame => frame.type === "provider_worker_hello")).toHaveLength(2);
+	} finally {
+		await (daemon as any).stopMasterWorker();
+		fs.rmSync(agentDir, { recursive: true, force: true });
 	}
 });
