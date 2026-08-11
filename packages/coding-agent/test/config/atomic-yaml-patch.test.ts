@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test, vi } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -138,20 +138,18 @@ describe("atomic YAML patches", () => {
 		expect(() => applyAtomicYamlPatches("/tmp/gjc-atomic-invalid.yml", [patch])).toThrow(TypeError);
 	});
 
-	test("keeps the old complete file and removes the temp file when rename exhausts", async () => {
+	test("keeps the old complete file and removes the temp file when the exchange fails", async () => {
 		const configPath = await configPathForTest();
 		await fs.writeFile(configPath, YAML.stringify({ durable: { value: "old" } }, null, 2));
 		const sharingViolation = Object.assign(new Error("sharing violation"), { code: "EPERM" });
 
 		await expect(
 			applyAtomicYamlPatches(configPath, [{ path: "durable.value", op: "set", value: "new" }], {
-				platform: "win32",
-				rename: async () => {
+				exactReplace: async () => {
 					throw sharingViolation;
 				},
-				sleep: async () => {},
 			}),
-		).rejects.toBeInstanceOf(AtomicYamlReplaceError);
+		).rejects.toBe(sharingViolation);
 
 		expect(await readYaml(configPath)).toEqual({ durable: { value: "old" } });
 		const directoryEntries = await fs.readdir(path.dirname(configPath));
@@ -504,93 +502,35 @@ describe("atomic YAML patches", () => {
 		expect((await fs.lstat(configPath)).isSymbolicLink()).toBe(true);
 	});
 
-	test("falls back to the identity-checked swap when the native exchange is unavailable", async () => {
+	test("fails closed when the native exchange is unavailable", async () => {
 		const configPath = await configPathForTest();
 		const initial = YAML.stringify({ original: { keep: true } }, null, 2);
 		await fs.writeFile(configPath, initial);
 
 		// NFS / old-kernel hosts have no RENAME_EXCHANGE: the native exact
-		// replacement reports atomic_unavailable, and the existing-destination
-		// write must fall back to the identity-checked detached swap instead of
-		// failing the whole transaction.
-		await withAtomicYamlConfigTransaction(configPath, async tx => {
+		// replacement reports atomic_unavailable. A detached-swap fallback would
+		// briefly expose an ABSENT config.yml to concurrent readers (workflow
+		// resolvers do not take the config lock), so the write must FAIL CLOSED
+		// and leave the existing destination untouched.
+		let failure: { cause?: { message?: string } } | null = null;
+		failure = await withAtomicYamlConfigTransaction(configPath, async tx => {
 			await tx.applyPatches([{ path: "updated.value", op: "set", value: true }], {
 				exactReplace: async () => ({ ok: false, code: "atomic_unavailable" }),
 			});
 			return "done";
-		});
+		}).then(
+			() => null,
+			(err: unknown) => err as { cause?: { message?: string } },
+		);
+		// The AtomicYamlReplaceError message is a fixed template; the
+		// atomic_unavailable detail lives on the cause.
+		expect(failure?.cause?.message).toContain("atomic_unavailable");
 
-		expect(await readYaml(configPath)).toEqual({ original: { keep: true }, updated: { value: true } });
-	});
-
-	test("restores the detached destination when link publication fails", async () => {
-		const configPath = await configPathForTest();
-		const initial = YAML.stringify({ original: { keep: true } }, null, 2);
-		await fs.writeFile(configPath, initial);
-
-		// The swap fallback (exactReplace -> atomic_unavailable) detaches the
-		// destination to a tombstone before publishing. A non-EEXIST link failure
-		// (EPERM, ENOTSUP, I/O) must RESTORE the detached destination - the
-		// existing config.yml must never be lost without a replacement published.
-		const linkSpy = vi
-			.spyOn(fs, "link")
-			.mockRejectedValueOnce(Object.assign(new Error("operation not permitted"), { code: "EPERM" }));
-		let failure: { cause?: { message?: string } } | null = null;
-		try {
-			failure = await withAtomicYamlConfigTransaction(configPath, async tx => {
-				await tx.applyPatches([{ path: "updated.value", op: "set", value: true }], {
-					exactReplace: async () => ({ ok: false, code: "atomic_unavailable" }),
-				});
-				return "done";
-			}).then(
-				() => null,
-				(err: unknown) => err as { cause?: { message?: string } },
-			);
-		} finally {
-			linkSpy.mockRestore();
-		}
-		expect(failure?.cause?.message).toContain("operation not permitted");
-
-		// The pre-existing config.yml survives the failed swap, byte for byte, and
-		// no tombstone is left behind.
+		// The pre-existing config.yml survives byte for byte, and no swap
+		// artifacts are created.
 		expect(await readYaml(configPath)).toEqual({ original: { keep: true } });
 		const leftovers = (await fs.readdir(path.dirname(configPath))).filter(name => name.includes(".swap"));
 		expect(leftovers).toEqual([]);
-	});
-
-	test("retains the tombstone when the restore would replace a new destination", async () => {
-		const configPath = await configPathForTest();
-		const initial = YAML.stringify({ original: { keep: true } }, null, 2);
-		await fs.writeFile(configPath, initial);
-
-		// The publish link fails (EPERM) and the restore link reports EEXIST,
-		// simulating an editor that published a new config.yml while the path was
-		// absent: the restore must NOT replace it, and the detached destination
-		// stays recoverable in the retained tombstone.
-		const linkSpy = vi
-			.spyOn(fs, "link")
-			.mockRejectedValueOnce(Object.assign(new Error("operation not permitted"), { code: "EPERM" }))
-			.mockRejectedValueOnce(Object.assign(new Error("file exists"), { code: "EEXIST" }));
-		let failure: { message?: string } | null = null;
-		try {
-			failure = await withAtomicYamlConfigTransaction(configPath, async tx => {
-				await tx.applyPatches([{ path: "updated.value", op: "set", value: true }], {
-					exactReplace: async () => ({ ok: false, code: "atomic_unavailable" }),
-				});
-				return "done";
-			}).then(
-				() => null,
-				(err: unknown) => err as { message?: string },
-			);
-		} finally {
-			linkSpy.mockRestore();
-		}
-		// The AtomicYamlReplaceError message is a fixed template; the retention
-		// detail lives on the cause.
-		expect((failure as { cause?: { message?: string } } | null)?.cause?.message).toContain("retained at");
-		const tombstones = (await fs.readdir(path.dirname(configPath))).filter(name => name.includes(".swap"));
-		expect(tombstones.length).toBe(1);
-		expect(await readYaml(path.join(path.dirname(configPath), tombstones[0]!))).toEqual({ original: { keep: true } });
 	});
 
 	test("rejects a config.yml symlink retarget before publication", async () => {
@@ -624,5 +564,293 @@ describe("atomic YAML patches", () => {
 		// Neither the old target nor the newly-active target was modified.
 		expect(await readYaml(realTarget)).toEqual({ theme: { dark: "red" } });
 		expect(await readYaml(otherTarget)).toEqual({ other: true });
+	});
+
+	test("publishes a first write beneath a symlinked parent directory", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-atomic-yaml-parent-link-"));
+		temporaryDirectories.push(directory);
+		const realDir = path.join(directory, "realdir");
+		await fs.mkdir(realDir);
+		const linkParent = path.join(directory, "linkparent");
+		await fs.symlink(realDir, linkParent, "dir");
+		// config.yml does not exist yet beneath a symlinked parent: the canonical
+		// target must resolve the existing PARENT, so the write lands in the real
+		// directory and a later parent repoint is detectable.
+		const configPath = path.join(linkParent, "config.yml");
+
+		await withAtomicYamlConfigTransaction(configPath, async tx => {
+			await tx.applyPatches([{ path: "durable.value", op: "set", value: "new" }]);
+			return "done";
+		});
+
+		expect(await readYaml(path.join(realDir, "config.yml"))).toEqual({ durable: { value: "new" } });
+		expect((await fs.lstat(linkParent)).isSymbolicLink()).toBe(true);
+	});
+
+	test("rejects a repointed parent symlink for an absent config.yml", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-atomic-yaml-parent-retarget-"));
+		temporaryDirectories.push(directory);
+		const realDir = path.join(directory, "realdir");
+		const otherDir = path.join(directory, "otherdir");
+		await fs.mkdir(realDir);
+		await fs.mkdir(otherDir);
+		const linkParent = path.join(directory, "linkparent");
+		await fs.symlink(realDir, linkParent, "dir");
+		// config.yml is ABSENT beneath the symlinked parent: the canonical target
+		// resolves the existing parent, so repointing it while the operation waits
+		// must reject instead of publishing into the new directory.
+		const configPath = path.join(linkParent, "config.yml");
+
+		const originalHook = FileLockTestHooks.afterParentMkdir;
+		let repointed = false;
+		FileLockTestHooks.afterParentMkdir = async lockPath => {
+			if (repointed || !lockPath.endsWith("config.yml.lock")) return;
+			repointed = true;
+			await fs.rm(linkParent, { force: true });
+			await fs.symlink(otherDir, linkParent, "dir");
+		};
+		try {
+			await expect(
+				applyAtomicYamlPatches(configPath, [{ path: "theme.dark", op: "set", value: "blue" }]),
+			).rejects.toThrow("Atomic YAML target retargeted");
+		} finally {
+			FileLockTestHooks.afterParentMkdir = originalHook;
+		}
+		// Neither the original nor the repointed target received the write.
+		expect(await fs.readdir(realDir)).toEqual([]);
+		expect(await fs.readdir(otherDir)).toEqual([]);
+	});
+	test("rejects a repointed parent symlink for a dangling config.yml symlink", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-atomic-yaml-dangling-parent-retarget-"));
+		temporaryDirectories.push(directory);
+		const realDir = path.join(directory, "realdir");
+		const otherDir = path.join(directory, "otherdir");
+		await fs.mkdir(realDir);
+		await fs.mkdir(otherDir);
+		const linkParent = path.join(directory, "linkparent");
+		await fs.symlink(realDir, linkParent, "dir");
+		// config.yml is a DANGLING symlink whose absent target lies beneath the
+		// symlinked parent: the canonical target must realpath-resolve the
+		// deepest existing ancestor (the parent), so repointing the parent while
+		// the operation waits must reject instead of publishing into the newly
+		// pointed directory (the unresolved lexical target would make the
+		// retarget check compare two identical strings and the CAS pass).
+		const configPath = path.join(directory, "config.yml");
+		await fs.symlink(path.join(linkParent, "real-config.yml"), configPath);
+
+		const originalHook = FileLockTestHooks.afterParentMkdir;
+		let repointed = false;
+		FileLockTestHooks.afterParentMkdir = async lockPath => {
+			if (repointed || !lockPath.endsWith("real-config.yml.lock")) return;
+			repointed = true;
+			await fs.rm(linkParent, { force: true });
+			await fs.symlink(otherDir, linkParent, "dir");
+		};
+		try {
+			await expect(
+				applyAtomicYamlPatches(configPath, [{ path: "theme.dark", op: "set", value: "blue" }]),
+			).rejects.toThrow("Atomic YAML target retargeted");
+		} finally {
+			FileLockTestHooks.afterParentMkdir = originalHook;
+		}
+		// Neither the original nor the repointed target received the write.
+		expect(await fs.readdir(realDir)).toEqual([]);
+		expect(await fs.readdir(otherDir)).toEqual([]);
+	});
+	test("rejects a config.yml symlink repointed during the native exchange", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-atomic-yaml-post-exchange-retarget-"));
+		temporaryDirectories.push(directory);
+		const realTarget = path.join(directory, "real-config.yml");
+		const otherTarget = path.join(directory, "other-config.yml");
+		await fs.writeFile(realTarget, YAML.stringify({ theme: { dark: "red" } }, null, 2));
+		await fs.writeFile(otherTarget, YAML.stringify({ other: true }, null, 2));
+		const configPath = path.join(directory, "config.yml");
+		await fs.symlink(realTarget, configPath);
+
+		// The native exchange repoints the symlink while the publication runs:
+		// the pre-publication retarget check has already passed and the
+		// exchange validates only the previously resolved canonical
+		// destination, so the post-publication revalidation must reject
+		// instead of reporting success while the lexical config.yml points at
+		// an unchanged file.
+		let repointed = false;
+		await expect(
+			withAtomicYamlConfigTransaction(configPath, async tx => {
+				await tx.applyPatches([{ path: "theme.dark", op: "set", value: "blue" }], {
+					exactReplace: async (tempPath: string, destinationPath: string) => {
+						// Faithfully simulate the namespace exchange with IDENTITY
+						// preservation (the destination ends with the staged
+						// inode): a rename dance swaps the two live files.
+						const swapPath = `${destinationPath}.swap.${process.pid}.${Math.random().toString(36).slice(2)}`;
+						await fs.rename(destinationPath, swapPath);
+						await fs.rename(tempPath, destinationPath);
+						await fs.rename(swapPath, tempPath);
+						if (!repointed) {
+							repointed = true;
+							await fs.rm(configPath, { force: true });
+							await fs.symlink(otherTarget, configPath);
+						}
+						return { ok: true };
+					},
+				});
+				return "done";
+			}),
+		).rejects.toThrow("Atomic YAML target retargeted");
+
+		// The operation failed closed with the OLD canonical target restored
+		// (the exchange had replaced it before the revalidation detected the
+		// repoint): retrying updates the new target without leaving the
+		// now-inactive profile modified. The lexical config.yml still resolves
+		// through the (repointed) symlink and the other target is untouched.
+		expect(await readYaml(realTarget)).toEqual({ theme: { dark: "red" } });
+		expect((await fs.lstat(configPath)).isSymbolicLink()).toBe(true);
+		expect(await readYaml(otherTarget)).toEqual({ other: true });
+	});
+	test("removes a retargeted first-write publication from the inactive target", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-atomic-yaml-first-write-retarget-"));
+		temporaryDirectories.push(directory);
+		const realTarget = path.join(directory, "real-config.yml");
+		const otherTarget = path.join(directory, "other-config.yml");
+		await fs.writeFile(otherTarget, YAML.stringify({ other: true }, null, 2));
+		const configPath = path.join(directory, "config.yml");
+		// The canonical target is ABSENT (dangling config.yml symlink): the
+		// publication uses the no-replace path, which consumes the temp path.
+		// If the symlink is retargeted before the post-check, restoring absence
+		// must REMOVE the created file rather than renaming the (gone) temp.
+		await fs.symlink(realTarget, configPath);
+
+		let repointed = false;
+		await expect(
+			applyAtomicYamlPatches(configPath, [{ path: "theme.dark", op: "set", value: "blue" }], {
+				// The NONTRANSACTIONAL writer path (reserveAtomicYamlPatchSlot)
+				// publishes an absent target through the no-replace path, which
+				// consumes the temp path; repoint the symlink right after the
+				// publication so the post-publication retarget check fires.
+				noReplace: async (tempPath: string, destinationPath: string) => {
+					// A hard link preserves the temp inode (like the native
+					// no-replace-link): the rollback identity check relies on it.
+					await fs.link(tempPath, destinationPath);
+					await fs.rm(tempPath, { force: true });
+					if (!repointed) {
+						repointed = true;
+						await fs.rm(configPath, { force: true });
+						await fs.symlink(otherTarget, configPath);
+					}
+					return {
+						ok: true,
+						reason: "committed",
+						code: "SUCCESS",
+						mutationState: "committed",
+						durabilityState: "durable",
+						primitive: "no-replace",
+						phase: "published",
+						diagnostic: { schemaVersion: 1, collectionState: "committed" },
+					};
+				},
+			}),
+		).rejects.toThrow("Atomic YAML target retargeted");
+
+		// The first-write publication was rolled back: the old canonical target
+		// is absent again, and the lexical config.yml resolves to the repointed
+		// target. This exercises the NONTRANSACTIONAL writer path
+		// (reserveAtomicYamlPatchSlot passes no expectedState).
+		await expect(fs.stat(realTarget)).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await readYaml(otherTarget)).toEqual({ other: true });
+	});
+
+	test("preserves a concurrent replacement when the first-write rollback conflicts", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-atomic-yaml-first-write-conflict-"));
+		temporaryDirectories.push(directory);
+		const realTarget = path.join(directory, "real-config.yml");
+		const otherTarget = path.join(directory, "other-config.yml");
+		await fs.writeFile(otherTarget, YAML.stringify({ other: true }, null, 2));
+		const configPath = path.join(directory, "config.yml");
+		await fs.symlink(realTarget, configPath);
+
+		// After the first-write publication, ANOTHER writer replaces the old
+		// canonical target (new inode) before the retarget rollback: the
+		// identity-checked removal must NOT delete that writer's file - the
+		// rollback reports a conflict and the replacement survives.
+		let replaced = false;
+		await expect(
+			applyAtomicYamlPatches(configPath, [{ path: "theme.dark", op: "set", value: "blue" }], {
+				noReplace: async (tempPath: string, destinationPath: string) => {
+					// A hard link preserves the temp inode (like the native
+					// no-replace-link): the rollback identity check relies on it.
+					await fs.link(tempPath, destinationPath);
+					await fs.rm(tempPath, { force: true });
+					if (!replaced) {
+						replaced = true;
+						// A concurrent writer replaces the created target and
+						// the symlink is repointed.
+						await fs.rm(destinationPath, { force: true });
+						await fs.writeFile(destinationPath, YAML.stringify({ otherWriter: true }, null, 2));
+						await fs.rm(configPath, { force: true });
+						await fs.symlink(otherTarget, configPath);
+					}
+					return {
+						ok: true,
+						reason: "committed",
+						code: "SUCCESS",
+						mutationState: "committed",
+						durabilityState: "durable",
+						primitive: "no-replace",
+						phase: "published",
+						diagnostic: { schemaVersion: 1, collectionState: "committed" },
+					};
+				},
+			}),
+			// The rollback reports the identity conflict (the AtomicYamlReplaceError
+			// message is a fixed template; the detail lives on the cause).
+		).rejects.toMatchObject({
+			cause: expect.objectContaining({ message: expect.stringContaining("rollback failed") }),
+		});
+
+		// The other writer's replacement is preserved.
+		expect(await readYaml(realTarget)).toEqual({ otherWriter: true });
+	});
+
+	test("preserves a concurrent replacement when the exchange rollback conflicts", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-atomic-yaml-exchange-conflict-"));
+		temporaryDirectories.push(directory);
+		const realTarget = path.join(directory, "real-config.yml");
+		const otherTarget = path.join(directory, "other-config.yml");
+		await fs.writeFile(realTarget, YAML.stringify({ theme: { dark: "red" } }, null, 2));
+		await fs.writeFile(otherTarget, YAML.stringify({ other: true }, null, 2));
+		const configPath = path.join(directory, "config.yml");
+		await fs.symlink(realTarget, configPath);
+
+		// After the exchange, ANOTHER writer replaces the old canonical target
+		// before the retarget rollback: the restore must NOT clobber that
+		// writer's newer file with the stale pre-publication bytes.
+		let replaced = false;
+		await expect(
+			withAtomicYamlConfigTransaction(configPath, async tx => {
+				await tx.applyPatches([{ path: "theme.dark", op: "set", value: "blue" }], {
+					exactReplace: async (tempPath: string, destinationPath: string) => {
+						// Faithfully simulate the namespace exchange: staged -> dest,
+						// dest old content -> temp.
+						const staged = await fs.readFile(tempPath, "utf8");
+						const old = await fs.readFile(destinationPath, "utf8");
+						await fs.writeFile(destinationPath, staged);
+						await fs.writeFile(tempPath, old);
+						if (!replaced) {
+							replaced = true;
+							await fs.rm(destinationPath, { force: true });
+							await fs.writeFile(destinationPath, YAML.stringify({ otherWriter: true }, null, 2));
+							await fs.rm(configPath, { force: true });
+							await fs.symlink(otherTarget, configPath);
+						}
+						return { ok: true };
+					},
+				});
+				return "done";
+			}),
+		).rejects.toMatchObject({
+			cause: expect.objectContaining({ message: expect.stringContaining("rollback failed") }),
+		});
+
+		// The concurrent writer's replacement is preserved.
+		expect(await readYaml(realTarget)).toEqual({ otherWriter: true });
 	});
 });

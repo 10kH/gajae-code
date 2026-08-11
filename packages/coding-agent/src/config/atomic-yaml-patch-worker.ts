@@ -1,4 +1,4 @@
-import { parentPort } from "node:worker_threads";
+import * as nodeWorkerThreads from "node:worker_threads";
 import type { NativeExactFileIdentity, NativeExactUnlinkResult, NativeNoReplaceResult } from "@gajae-code/natives";
 import { exactReplacePath, linkNoReplacePath, renameNoReplacePath } from "@gajae-code/natives";
 
@@ -25,6 +25,7 @@ export type AtomicYamlNativeWorkerResponse =
 	| { type: "result"; result: NativeExactUnlinkResult | NativeNoReplaceResult }
 	| { type: "error"; name?: string; message: string; stack?: string };
 
+const { parentPort } = nodeWorkerThreads;
 if (!parentPort) throw new Error("atomic YAML native worker: missing parentPort");
 
 const port = parentPort;

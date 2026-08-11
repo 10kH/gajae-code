@@ -1,8 +1,9 @@
-import { createHash, randomUUID } from "node:crypto";
+import * as nodeCrypto from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { NativeExactFileIdentity, NativeExactUnlinkResult, NativeNoReplaceResult } from "@gajae-code/natives";
+import { exactReplacePath, exactUnlink } from "@gajae-code/natives";
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import { YAML } from "bun";
 import type { AtomicYamlNativeWorkerRequest, AtomicYamlNativeWorkerResponse } from "./atomic-yaml-patch-worker";
@@ -177,22 +178,37 @@ function assertLexicalTargetUnchanged(lexicalPath: string, canonicalPath: string
 }
 
 /**
- * realpathSync fails when the final path component is a DANGLING symlink (its
- * target has not been created yet). Treating the symlink pathname itself as the
- * config path would read it as absent while the native no-replace publication
- * rejects the EXISTING symlink directory entry as `destination_exists`, so the
- * first publication must target the link's lexical target instead. Resolves a
- * chain of dangling links without requiring the target to exist; non-symlink
- * and genuinely absent paths are returned unchanged.
+ * realpathSync fails when the final path component is absent or a DANGLING
+ * symlink (its target has not been created yet). Treating the symlink pathname
+ * itself as the config path would read it as absent while the native no-replace
+ * publication rejects the EXISTING symlink directory entry as
+ * `destination_exists`, so the first publication must target the link's lexical
+ * target instead. An ABSENT final component still resolves its deepest existing
+ * ancestor (symlinked parents included), so a parent symlink repointed while
+ * the operation waits is caught by the lexical retarget check instead of
+ * comparing two unresolved lexical strings. Resolves a chain of dangling links
+ * without requiring the target to exist; genuinely absent paths are resolved
+ * through their existing ancestors.
  */
 function resolveDanglingSymlink(configPath: string): string {
+	const ancestorResolved = resolveAbsentThroughAncestors(configPath);
+	if (ancestorResolved !== null) return ancestorResolved;
+	// The path itself exists: it may be a dangling final-component symlink
+	// (link target absent) or an unreadable entry; walk the link chain.
 	let current = configPath;
 	for (let depth = 0; depth < 40; depth++) {
 		let stat: fsSync.Stats;
 		try {
 			stat = fsSync.lstatSync(current);
 		} catch {
-			return current; // absent (first-time creation) or unreadable entry
+			// The link chain walked into an ABSENT path: resolve the deepest
+			// existing ancestor (symlinked parents realpath'd) and re-append
+			// the missing suffix, exactly like the absent-top-level case. The
+			// unresolved lexical string would not capture a symlinked parent's
+			// identity, so repointing that parent while the operation waits
+			// must be detectable by the retarget check instead of comparing
+			// two identical unresolved strings.
+			return resolveAbsentThroughAncestors(current) ?? current;
 		}
 		if (!stat.isSymbolicLink()) return current;
 		let target: string;
@@ -204,6 +220,37 @@ function resolveDanglingSymlink(configPath: string): string {
 		current = path.isAbsolute(target) ? path.normalize(target) : path.resolve(path.dirname(current), target);
 	}
 	return current;
+}
+
+/**
+ * Find the deepest EXISTING ancestor of `target`, realpath-resolve it (its
+ * symlinks included), and re-append the missing suffix. Returns null when no
+ * existing ancestor exists (the filesystem root is reached without an lstat
+ * success), leaving the caller free to fall back to the lexical path.
+ */
+function resolveAbsentThroughAncestors(target: string): string | null {
+	const missing: string[] = [];
+	let existing = target;
+	for (;;) {
+		try {
+			fsSync.lstatSync(existing);
+			break;
+		} catch {
+			const parent = path.dirname(existing);
+			if (parent === existing) return null; // filesystem root reached
+			missing.unshift(path.basename(existing));
+			existing = parent;
+		}
+	}
+	// The path itself exists (e.g. a dangling symlink whose chain the caller
+	// walks): only a MISSING component is resolved through ancestors, so the
+	// caller's link-chain walk owns the existing-path case.
+	if (missing.length === 0) return null;
+	try {
+		return path.join(fsSync.realpathSync(existing), ...missing);
+	} catch {
+		return path.join(existing, ...missing);
+	}
 }
 
 function assertPatch(patch: AtomicYamlPatch): void {
@@ -291,7 +338,8 @@ function stableValue(value: unknown): string {
 }
 
 function stateHash(state: PathState): string {
-	return createHash("sha256")
+	return nodeCrypto
+		.createHash("sha256")
 		.update(state.exists ? `present:${stableValue(state.value)}` : "absent")
 		.digest("hex");
 }
@@ -359,7 +407,7 @@ async function captureExactFileIdentity(file: string): Promise<NativeExactFileId
 			parentIno: parent.ino,
 			size: stat.size,
 			mtimeNs: stat.mtimeNs,
-			sha256: createHash("sha256").update(Buffer.from(bytes)).digest("hex"),
+			sha256: nodeCrypto.createHash("sha256").update(Buffer.from(bytes)).digest("hex"),
 		};
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
@@ -447,7 +495,7 @@ async function replaceWithExpectedIdentity(
 	options: AtomicYamlPatchOptions,
 ): Promise<void> {
 	const { exists: expectedExists, raw: expectedRaw } = expectedState;
-	const expectedHash = createHash("sha256").update(expectedRaw).digest("hex");
+	const expectedHash = nodeCrypto.createHash("sha256").update(expectedRaw).digest("hex");
 	const [source, destination] = await Promise.all([
 		captureExactFileIdentity(tempPath),
 		captureExactFileIdentity(configPath),
@@ -456,7 +504,11 @@ async function replaceWithExpectedIdentity(
 		throw new AtomicYamlReplaceError(configPath, 1, new Error("staged YAML disappeared before replacement"));
 	if (!destination) {
 		if (expectedExists)
-			throw new AtomicYamlConflictError(configPath, expectedHash, createHash("sha256").update("").digest("hex"));
+			throw new AtomicYamlConflictError(
+				configPath,
+				expectedHash,
+				nodeCrypto.createHash("sha256").update("").digest("hex"),
+			);
 		const publishOnce = async (): Promise<NativeNoReplaceResult> =>
 			options.noReplace
 				? await options.noReplace(tempPath, configPath)
@@ -493,7 +545,7 @@ async function replaceWithExpectedIdentity(
 			throw new AtomicYamlConflictError(
 				configPath,
 				expectedHash,
-				createHash("sha256").update(actual.raw).digest("hex"),
+				nodeCrypto.createHash("sha256").update(actual.raw).digest("hex"),
 			);
 		}
 		throw new AtomicYamlReplaceError(
@@ -520,16 +572,19 @@ async function replaceWithExpectedIdentity(
 			})) as NativeExactUnlinkResult);
 	if (replaced.ok) return;
 	// RENAME_EXCHANGE is unsupported (NFS, kernels before 3.15): the native
-	// exact-replace reports atomic_unavailable. Fall back to an identity-checked
-	// swap that never overwrites an editor's newer file: atomically detach the
-	// destination to a unique tombstone, verify the MOVED file matches the
-	// captured destination identity (restoring it on mismatch), then publish the
-	// staged document with a no-replace hard link (EEXIST when an editor created
-	// a file while the path was briefly absent). Each step is a single atomic
-	// syscall, so no window exists in which a newer editor file is clobbered.
+	// exact-replace reports atomic_unavailable. A replacement fallback that
+	// briefly detaches the destination would expose an ABSENT config.yml to
+	// concurrent readers (workflow resolvers do not take the config lock) that
+	// could then fall back to legacy/default settings - so the write FAILS
+	// CLOSED instead of trading a transient absence window for availability.
 	if (replaced.code === "atomic_unavailable") {
-		await replaceWithDetachedIdentitySwap(tempPath, configPath, destination, expectedHash);
-		return;
+		throw new AtomicYamlReplaceError(
+			configPath,
+			1,
+			new Error(
+				`native exact replacement is unavailable on this filesystem (atomic_unavailable); refusing a fallback that would expose an absent config.yml to concurrent readers`,
+			),
+		);
 	}
 	// A retained successor proves the namespace exchange published the staged
 	// document. It may still report a post-exchange verification or durability
@@ -553,7 +608,7 @@ async function replaceWithExpectedIdentity(
 		throw new AtomicYamlConflictError(
 			configPath,
 			expectedHash,
-			createHash("sha256").update(actual.raw).digest("hex"),
+			nodeCrypto.createHash("sha256").update(actual.raw).digest("hex"),
 		);
 	}
 	throw new AtomicYamlReplaceError(
@@ -563,96 +618,6 @@ async function replaceWithExpectedIdentity(
 	);
 }
 
-/**
- * Identity-checked replacement without RENAME_EXCHANGE (NFS, older kernels).
- * The destination is atomically detached to a unique tombstone, the MOVED file
- * is verified against the captured destination identity (an editor's newer
- * replacement is renamed back and the write fails closed), and the staged
- * document is then published with a no-replace hard link so a file an editor
- * created while the path was briefly absent is never overwritten (EEXIST fails
- * the write instead). The old destination is removed only after the new
- * document is durably linked into place.
- */
-async function replaceWithDetachedIdentitySwap(
-	tempPath: string,
-	configPath: string,
-	destination: NativeExactFileIdentity,
-	expectedHash: string,
-): Promise<void> {
-	const tombstone = path.join(
-		path.dirname(configPath),
-		`.${path.basename(configPath)}.${process.pid}.${randomUUID()}.swap`,
-	);
-	try {
-		await fs.rename(configPath, tombstone);
-	} catch (error) {
-		throw new AtomicYamlReplaceError(configPath, 1, error);
-	}
-	let moved: { dev: bigint; ino: bigint } | null = null;
-	try {
-		const stat = await fs.lstat(tombstone, { bigint: true });
-		moved = { dev: stat.dev, ino: stat.ino };
-	} catch {
-		// The detached object vanished: nothing verifiable to replace.
-		throw new AtomicYamlConflictError(configPath, expectedHash, createHash("sha256").update("").digest("hex"));
-	}
-	if (moved.dev !== destination.dev || moved.ino !== destination.ino) {
-		// An editor replaced the destination between the identity capture and
-		// the detach: restore the editor's file and fail closed. The restore
-		// never REPLACES a file the editor published while the path was absent.
-		await restoreDetachedNoReplace(tombstone, configPath);
-		throw new AtomicYamlConflictError(configPath, expectedHash, createHash("sha256").update("").digest("hex"));
-	}
-	try {
-		await fs.link(tempPath, configPath);
-	} catch (error) {
-		const code = (error as NodeJS.ErrnoException).code;
-		if (code === "EEXIST") {
-			// An editor created a new file while configPath was briefly absent:
-			// never clobber it; the detached old destination is superseded.
-			await fs.rm(tombstone, { force: true }).catch(() => undefined);
-			throw new AtomicYamlConflictError(configPath, expectedHash, createHash("sha256").update("").digest("hex"));
-		}
-		// Any other publication failure (EPERM, ENOTSUP, an I/O error): the
-		// destination is detached in the tombstone, so RESTORE it - the existing
-		// config.yml must never be lost without a replacement published. If the
-		// restore itself fails (including a no-replace refusal because an editor
-		// published a new file while the path was absent), the tombstone is
-		// RETAINED (never deleted) so the old configuration stays recoverable,
-		// and the error names it.
-		if (!(await restoreDetachedNoReplace(tombstone, configPath))) {
-			throw new AtomicYamlReplaceError(
-				configPath,
-				1,
-				new Error(
-					`identity-checked swap publication failed (${code ?? "unknown"}); the previous config is retained at ${tombstone}`,
-				),
-			);
-		}
-		throw new AtomicYamlReplaceError(configPath, 1, error);
-	}
-	// The staged document is now published at configPath (a hard link to the
-	// temp inode); drop the staging name and the detached old destination.
-	await fs.rm(tempPath, { force: true }).catch(() => undefined);
-	await fs.rm(tombstone, { force: true }).catch(() => undefined);
-}
-
-/**
- * Restore a detached destination WITHOUT replacing a file an editor published
- * while the path was briefly absent: publish a hard link to the tombstone's
- * inode (EEXIST when the path is occupied - the editor's file is preserved)
- * and drop the tombstone name. Returns false when the restore could not
- * complete, in which case the tombstone is retained for recovery.
- */
-async function restoreDetachedNoReplace(tombstone: string, configPath: string): Promise<boolean> {
-	try {
-		await fs.link(tombstone, configPath);
-	} catch {
-		return false;
-	}
-	await fs.rm(tombstone, { force: true }).catch(() => undefined);
-	return true;
-}
 async function replaceWithRetry(
 	tempPath: string,
 	configPath: string,
@@ -697,7 +662,7 @@ async function writeAtomicYaml(
 	lexicalConfigPath?: string,
 ): Promise<YamlFileState> {
 	const directory = path.dirname(configPath);
-	const tempPath = path.join(directory, `.${path.basename(configPath)}.${process.pid}.${randomUUID()}.tmp`);
+	const tempPath = path.join(directory, `.${path.basename(configPath)}.${process.pid}.${nodeCrypto.randomUUID()}.tmp`);
 	const nextRaw = YAML.stringify(value, null, 2);
 	let preserveTempPath = false;
 	try {
@@ -721,16 +686,123 @@ async function writeAtomicYaml(
 			if (currentState.exists !== expectedState.exists || currentState.raw !== expectedState.raw) {
 				throw new AtomicYamlConflictError(
 					configPath,
-					createHash("sha256").update(expectedState.raw).digest("hex"),
-					createHash("sha256").update(currentState.raw).digest("hex"),
+					nodeCrypto.createHash("sha256").update(expectedState.raw).digest("hex"),
+					nodeCrypto.createHash("sha256").update(currentState.raw).digest("hex"),
 				);
 			}
 		}
+		// Capture whether the canonical target existed BEFORE the publication:
+		// the retarget rollback must distinguish a first-write (restore absence)
+		// from an exchange (restore the pre-publication content). For
+		// nontransactional writers expectedState is undefined, so probe the
+		// filesystem here - after this point the publication changes the answer.
+		const targetExistedBefore =
+			expectedState?.exists ??
+			(await fs
+				.lstat(configPath)
+				.then(() => true)
+				.catch(() => false));
+		let publishedIdentity: NativeExactFileIdentity | null = null;
+		publishedIdentity = await captureExactFileIdentity(tempPath);
 		try {
 			await replaceWithRetry(tempPath, configPath, options, expectedState);
 		} catch (error) {
 			preserveTempPath = error instanceof AtomicYamlReplaceError && error.preserveTempPath;
 			throw error;
+		}
+		// Revalidate the lexical target AFTER the publication: the native
+		// exchange validated only the previously resolved canonical
+		// destination, so a config.yml symlink repointed between the
+		// pre-publication retarget check and the exchange would update the
+		// now-inactive target and report success while the lexical config.yml
+		// points at an unchanged file. The old canonical state is restored
+		// before failing: retrying must update the new target without leaving
+		// the now-inactive profile modified as a side effect.
+		if (lexicalConfigPath !== undefined) {
+			try {
+				assertLexicalTargetUnchanged(lexicalConfigPath, configPath);
+			} catch (error) {
+				let rollbackFailed: Error | null = null;
+				try {
+					if (!targetExistedBefore) {
+						// Restore absence with an IDENTITY-ATOMIC unlink: the native
+						// validates the destination identity in the same syscall
+						// sequence as the unlink, so a successor appearing after
+						// our earlier verification is retained as a conflict.
+						if (publishedIdentity === null) {
+							throw new Error("no published identity available to remove");
+						}
+						// The native exact unlink requires a caller-persisted,
+						// single-component quarantine destination (authority survives
+						// a post-detach crash); the placeholder is exchanged into it
+						// and cleaned up within the same protocol.
+						const removed = exactUnlink(configPath, {
+							...publishedIdentity,
+							quarantineName: `.${path.basename(configPath)}.${process.pid}.${nodeCrypto.randomUUID()}.quarantine`,
+						});
+						// cleanup_pending with a detached path + the canonical pathname
+						// proven absent counts as removed (the native retirement
+						// protocol retains the placeholder for crash recovery); the
+						// retained artifacts are purged best-effort below.
+						const detached =
+							removed.ok || (removed.code === "cleanup_pending" && typeof removed.detachedPath === "string");
+						if (!detached) {
+							throw new Error(
+								"the canonical target was replaced by another writer; the first-write publication was not removed",
+							);
+						}
+						if (removed.retainedPlaceholderPath) {
+							await fs.rm(removed.retainedPlaceholderPath, { force: true }).catch(() => undefined);
+						}
+						if (removed.detachedPath) {
+							await fs.rm(removed.detachedPath, { force: true }).catch(() => undefined);
+						}
+					} else {
+						// EXISTING target: restore the pre-publication content
+						// captured by the CAS state through an identity-checked
+						// EXCHANGE. The native validates the destination identity
+						// atomically with the replacement, so a concurrent update
+						// is a rollback conflict, never clobbered with the stale
+						// bytes. The exchange unlinks both paths, so the original
+						// temp path is NOT a recovery source.
+						if (expectedState?.raw === undefined) {
+							throw new Error("no pre-publication content available to restore");
+						}
+						if (publishedIdentity === null) {
+							throw new Error("no published identity available to restore over");
+						}
+						const restoreTemp = path.join(
+							directory,
+							`.${path.basename(configPath)}.${process.pid}.${nodeCrypto.randomUUID()}.restore.tmp`,
+						);
+						try {
+							await fs.writeFile(restoreTemp, expectedState.raw, { mode: 0o600 });
+							const restoreIdentity = await captureExactFileIdentity(restoreTemp);
+							if (restoreIdentity === null) {
+								throw new Error("staged restore disappeared");
+							}
+							const replaced = exactReplacePath(restoreTemp, configPath, restoreIdentity, publishedIdentity);
+							if (!replaced.ok) {
+								throw new Error(
+									"the canonical target was replaced by another writer; the old content was not restored",
+								);
+							}
+						} finally {
+							await fs.rm(restoreTemp, { force: true }).catch(() => undefined);
+						}
+					}
+				} catch (rollbackError) {
+					rollbackFailed = rollbackError instanceof Error ? rollbackError : new Error(String(rollbackError));
+				}
+				if (rollbackFailed !== null) {
+					throw new AtomicYamlReplaceError(
+						configPath,
+						1,
+						new Error(`Atomic YAML target retargeted and rollback failed: ${rollbackFailed.message}`),
+					);
+				}
+				throw error;
+			}
 		}
 		await syncParentDirectory(directory);
 	} finally {
@@ -920,8 +992,8 @@ export function withAtomicYamlConfigTransaction<T>(
 				if (currentState.exists !== expected.exists || currentState.raw !== expected.raw) {
 					throw new AtomicYamlConflictError(
 						canonicalPath,
-						createHash("sha256").update(expected.raw).digest("hex"),
-						createHash("sha256").update(currentState.raw).digest("hex"),
+						nodeCrypto.createHash("sha256").update(expected.raw).digest("hex"),
+						nodeCrypto.createHash("sha256").update(currentState.raw).digest("hex"),
 					);
 				}
 			};
@@ -1070,7 +1142,8 @@ export function reserveAtomicYamlPatchSlot(
 		for (const patch of nextPatches) assertPatch(patch);
 		await fs.mkdir(path.dirname(canonicalPath), { recursive: true, mode: 0o700 });
 		return await withFileLock(canonicalPath, async () => {
-			const { current, root } = await readYaml(canonicalPath);
+			const state = await readYaml(canonicalPath);
+			const { current, root } = state;
 			await options.validateRoot?.(root, nextPatches);
 			return await applyPatchesUnderLock(
 				canonicalPath,
@@ -1078,7 +1151,11 @@ export function reserveAtomicYamlPatchSlot(
 				nextPatches,
 				options,
 				false,
-				undefined,
+				// Pass the read state as the CAS baseline (like the transaction
+				// path): a symlink retarget after the publication can then restore
+				// the old canonical content, and an external edit during the queue
+				// wait is a CAS conflict instead of a clobber.
+				state,
 				lexicalPath,
 			);
 		});
@@ -1098,10 +1175,20 @@ export function reserveAtomicYamlUpdateSlot<T>(
 		const atomicUpdate = await update();
 		await fs.mkdir(path.dirname(canonicalPath), { recursive: true, mode: 0o700 });
 		return await withFileLock(canonicalPath, async () => {
-			const { current } = await readYaml(canonicalPath);
+			const state = await readYaml(canonicalPath);
+			const { current } = state;
 			const result = await atomicUpdate.apply(current);
 			if (atomicUpdate.shouldWrite?.(result) !== false) {
-				await writeAtomicYaml(canonicalPath, current, options, undefined, lexicalPath);
+				await writeAtomicYaml(
+					canonicalPath,
+					current,
+					options,
+					// The read state as the CAS baseline: a symlink retarget after
+					// the publication can restore the old canonical content, and
+					// an external edit during the queue wait is a conflict.
+					state,
+					lexicalPath,
+				);
 			}
 			await atomicUpdate.committed?.(current, result);
 			return result;
