@@ -47,6 +47,18 @@ export class MemoryConversationStoreFs implements ConversationStoreFs {
 		this.modes.delete(from);
 	}
 
+	async link(from: string, to: string): Promise<void> {
+		this.calls.push(`link:${from}:${to}`);
+		if (this.files.has(to)) {
+			throw Object.assign(new Error(`EEXIST: ${to}`), { code: "EEXIST" });
+		}
+		const data = this.files.get(from);
+		if (data === undefined) throw Object.assign(new Error(`ENOENT: ${from}`), { code: "ENOENT" });
+		this.files.set(to, data);
+		const mode = this.modes.get(from);
+		if (mode !== undefined) this.modes.set(to, mode);
+	}
+
 	async unlink(file: string): Promise<void> {
 		this.calls.push(`unlink:${file}`);
 		this.files.delete(file);

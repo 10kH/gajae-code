@@ -48,56 +48,44 @@ describe("ConversationStore", () => {
 		});
 		await expect(store.write("mapping", undefined, record(1))).rejects.toBe(metadataError);
 		const lockFile = `${store.filePath}.lock`;
-		expect(fs.calls).toContain(`close:${lockFile}`);
+		const pendingClose = fs.calls.find(call => call.startsWith(`close:${lockFile}.`) && call.endsWith(".pending"));
+		expect(pendingClose).toBeDefined();
+		expect([...fs.files.keys()].some(file => file.endsWith(".pending"))).toBe(false);
 		expect(fs.files.has(lockFile)).toBe(false);
 	});
 
-	test("does not reclaim a newly created lock before its owner publishes metadata", async () => {
+	test("keeps the primary lock path absent until complete metadata is synced", async () => {
 		const entered = Promise.withResolvers<void>();
-		const observedEmptyLock = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
 		let paused = false;
 		class PausingFs extends MemoryConversationStoreFs {
 			override async open(file: string, flags: string) {
 				const handle = await super.open(file, flags);
-				if (flags === "wx" && !paused) {
+				if (flags === "wx" && file.endsWith(".pending") && !paused) {
 					paused = true;
 					entered.resolve();
 					await release.promise;
 				}
 				return handle;
 			}
-			override async readFile(file: string, encoding: "utf8") {
-				const value = await super.readFile(file, encoding);
-				if (paused && file.endsWith(".lock") && value === "") observedEmptyLock.resolve();
-				return value;
-			}
 		}
 		const fs = new PausingFs();
-		const first = new ConversationStore<TestConversation>({
+		const store = new ConversationStore<TestConversation>({
 			agentDir: "/agent",
 			kind: "discord",
 			fs,
 			pid: 101,
 			pidAlive: () => true,
 		});
-		const second = new ConversationStore<TestConversation>({
-			agentDir: "/agent",
-			kind: "discord",
-			fs,
-			pid: 202,
-			pidAlive: () => true,
-		});
-		const firstWrite = first.write("mapping", undefined, record(1));
+		const write = store.write("mapping", undefined, record(1));
 		await entered.promise;
-		let secondSettled = false;
-		const secondWrite = second.write("mapping", undefined, record(1)).finally(() => {
-			secondSettled = true;
-		});
-		await observedEmptyLock.promise;
-		expect(secondSettled).toBe(false);
+		const lockFile = `${store.filePath}.lock`;
+		expect(fs.files.has(lockFile)).toBe(false);
+		expect([...fs.files.keys()].some(file => file.endsWith(".pending"))).toBe(true);
 		release.resolve();
-		expect((await Promise.all([firstWrite, secondWrite])).filter(Boolean)).toHaveLength(1);
+		await expect(write).resolves.toBe(true);
+		expect(fs.files.has(lockFile)).toBe(false);
+		expect(fs.calls.some(call => call.startsWith(`link:${lockFile}.`) && call.endsWith(`:${lockFile}`))).toBe(true);
 	});
 	test("keeps a failed published lock registered until cleanup cannot remove a successor", async () => {
 		const closeEntered = Promise.withResolvers<void>();
@@ -106,7 +94,8 @@ describe("ConversationStore", () => {
 		class PausingCloseFs extends MemoryConversationStoreFs {
 			override async open(file: string, flags: string) {
 				const handle = await super.open(file, flags);
-				if (flags !== "wx" || !file.endsWith("conversations.json.lock")) return handle;
+				if (flags !== "wx" || !file.includes("conversations.json.lock.") || !file.endsWith(".pending"))
+					return handle;
 				return {
 					...handle,
 					close: async () => {
@@ -121,7 +110,7 @@ describe("ConversationStore", () => {
 			}
 		}
 		const fs = new PausingCloseFs();
-		fs.failFileSync = true;
+		fs.failWrite = true;
 		const first = new ConversationStore<TestConversation>({
 			agentDir: "/agent",
 			kind: "discord",
@@ -143,8 +132,8 @@ describe("ConversationStore", () => {
 		await Bun.sleep(25);
 		expect(secondSettled).toBe(false);
 		releaseClose.resolve();
-		await expect(failedWrite).rejects.toThrow("sync failed");
-		fs.failFileSync = false;
+		await expect(failedWrite).rejects.toThrow("write failed");
+		fs.failWrite = false;
 		await expect(secondWrite).resolves.toBe(true);
 		expect(await second.read("two")).toEqual(record(1));
 	});
@@ -197,7 +186,7 @@ describe("ConversationStore", () => {
 		await expect(store.write("mapping", undefined, record(1))).resolves.toBe(true);
 		expect(fs.files.has(`${store.filePath}.lock.reclaim`)).toBe(false);
 	});
-	test("recovers a stale main lock when its reclaim marker was never published", async () => {
+	test("does not reclaim an expired unreadable legacy lock", async () => {
 		class ExpiredLockFs extends MemoryConversationStoreFs {
 			async stat(_file: string) {
 				return { mtimeMs: 0 };
@@ -211,11 +200,14 @@ describe("ConversationStore", () => {
 			now: () => 30_000,
 			pid: 202,
 			pidAlive: pid => pid === 202,
+			lockTimeoutMs: 0,
 		});
-		fs.files.set(`${store.filePath}.lock`, JSON.stringify({ pid: 101, incarnation: "old", timestamp: 1 }));
-		fs.files.set(`${store.filePath}.lock.reclaim`, "");
-		await expect(store.write("mapping", undefined, record(1))).resolves.toBe(true);
-		expect(fs.files.has(`${store.filePath}.lock.reclaim`)).toBe(false);
+		const lockFile = `${store.filePath}.lock`;
+		fs.files.set(lockFile, "");
+		await expect(store.write("mapping", undefined, record(1))).rejects.toBeInstanceOf(ConversationLockTimeoutError);
+		expect(fs.files.get(lockFile)).toBe("");
+		expect(fs.calls).not.toContain(`unlink:${lockFile}`);
+		expect([...fs.files.keys()].some(file => file.endsWith(".reclaim"))).toBe(false);
 	});
 
 	test("does not steal a fresh live reclaim lock or bypass the lock timeout", async () => {
@@ -267,7 +259,8 @@ describe("ConversationStore", () => {
 		class CloseFailingLockFs extends MemoryConversationStoreFs {
 			override async open(file: string, flags: string) {
 				const handle = await super.open(file, flags);
-				if (flags !== "wx" || !file.endsWith(".lock")) return handle;
+				if (flags !== "wx" || !file.includes("conversations.json.lock.") || !file.endsWith(".pending"))
+					return handle;
 				return {
 					...handle,
 					close: async () => {
@@ -414,7 +407,7 @@ describe("ConversationStore", () => {
 		class CapturingFs extends MemoryConversationStoreFs {
 			override async open(file: string, flags: string) {
 				const handle = await super.open(file, flags);
-				if (flags === "wx" && file.endsWith(".lock")) {
+				if (flags === "wx" && file.endsWith(".pending")) {
 					return {
 						...handle,
 						writeFile: async (data: string, encoding: "utf8") => {

@@ -28,6 +28,7 @@ export interface ConversationStoreFs {
 	readFile(file: string, encoding: "utf8"): Promise<string>;
 	writeFile(file: string, data: string, options: { mode: number }): Promise<void>;
 	rename(from: string, to: string): Promise<void>;
+	link?(from: string, to: string): Promise<void>;
 	unlink(file: string): Promise<void>;
 	open(file: string, flags: string): Promise<ConversationStoreFileHandle>;
 	stat?(file: string): Promise<{ mtimeMs: number }>;
@@ -52,7 +53,6 @@ interface ConversationStoreLock {
 }
 
 const nodeFs: ConversationStoreFs = fs;
-const UNPUBLISHED_LOCK_STALE_MS = 30_000;
 
 /**
  * Lock files this process currently holds or is acquiring, across every store.
@@ -326,11 +326,8 @@ export class ConversationStore<T extends ConversationRecord> {
 		if (!reclaimLock) return false;
 		try {
 			const staleLock = await this.#readLock(lockFile);
-			if (staleLock) {
-				if (!(await this.#isStaleLock(lockFile))) return false;
-				return await this.#unlinkOwnedLock(lockFile, staleLock);
-			}
-			return await this.#unlinkExpiredUnpublishedLock(lockFile);
+			if (!staleLock || !(await this.#isStaleLock(lockFile))) return false;
+			return await this.#unlinkOwnedLock(lockFile, staleLock);
 		} catch {
 			return false;
 		} finally {
@@ -373,7 +370,10 @@ export class ConversationStore<T extends ConversationRecord> {
 	async #createLockFile(
 		lockFile: string,
 	): Promise<{ handle: ConversationStoreFileHandle; lock: ConversationStoreLock }> {
-		const handle = await this.#fs.open(lockFile, "wx");
+		const link = this.#fs.link;
+		if (!link) throw new Error("ConversationStoreFs.link is required for atomic lock publication");
+		const pendingFile = `${lockFile}.${this.#pid}.${randomUUID()}.pending`;
+		const handle = await this.#fs.open(pendingFile, "wx");
 		let lock: ConversationStoreLock | undefined;
 		let published = false;
 		try {
@@ -383,16 +383,18 @@ export class ConversationStore<T extends ConversationRecord> {
 				timestamp: this.#clock(),
 				nonce: randomUUID(),
 			};
-			heldLockFiles.set(lockFile, lock.nonce!);
 			await handle.writeFile(`${JSON.stringify(lock)}\n`, "utf8");
-			published = true;
 			await handle.sync();
+			await link.call(this.#fs, pendingFile, lockFile);
+			published = true;
+			heldLockFiles.set(lockFile, lock.nonce!);
+			await this.#fs.unlink(pendingFile);
 			return { handle, lock };
 		} catch (error) {
 			try {
 				await handle.close().catch(() => undefined);
 				if (published && lock) await this.#unlinkOwnedLock(lockFile, lock);
-				else await this.#fs.unlink(lockFile).catch(() => undefined);
+				await this.#fs.unlink(pendingFile).catch(() => undefined);
 			} finally {
 				if (lock) this.#releaseHeldLock(lockFile, lock);
 			}
@@ -409,26 +411,16 @@ export class ConversationStore<T extends ConversationRecord> {
 		}
 	}
 
-	async #unlinkExpiredUnpublishedLock(lockFile: string): Promise<boolean> {
-		if (await this.#readLock(lockFile)) return false;
-		if (!(await this.#isExpiredUnpublishedLock(lockFile))) return false;
-		try {
-			await this.#fs.unlink(lockFile);
-			return true;
-		} catch (error) {
-			if (isMissing(error)) return false;
-			throw error;
-		}
-	}
 	async #isStaleLock(lockFile: string): Promise<boolean> {
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(await this.#fs.readFile(lockFile, "utf8"));
-		} catch (error) {
-			if (isMissing(error)) return true;
-			return await this.#isExpiredUnpublishedLock(lockFile);
+		} catch {
+			// An unreadable legacy marker may still have an open creator. It is
+			// never safe to reclaim it based on age alone.
+			return false;
 		}
-		if (!isConversationStoreLock(parsed)) return await this.#isExpiredUnpublishedLock(lockFile);
+		if (!isConversationStoreLock(parsed)) return false;
 		const currentIncarnation = this.#pidIncarnation(parsed.pid);
 		return (
 			!this.#pidAlive(parsed.pid) ||
@@ -436,10 +428,6 @@ export class ConversationStore<T extends ConversationRecord> {
 				(!isProcessIncarnation(parsed.incarnation) ||
 					(currentIncarnation !== undefined && currentIncarnation !== parsed.incarnation)))
 		);
-	}
-	async #isExpiredUnpublishedLock(lockFile: string): Promise<boolean> {
-		const stat = this.#fs.stat ? await this.#fs.stat(lockFile).catch(() => undefined) : undefined;
-		return Boolean(stat && this.#clock() - stat.mtimeMs >= UNPUBLISHED_LOCK_STALE_MS);
 	}
 
 	async #readDocument(): Promise<ConversationStoreDocument<T>> {
