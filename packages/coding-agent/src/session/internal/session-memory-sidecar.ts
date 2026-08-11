@@ -395,12 +395,12 @@ export class ReducerBudget {
 
 const SPILL_SEGMENT = ".spill.";
 const DERIVED_SUFFIXES = new Set(["idx", "tail", "commit", "buckets"]);
-const DERIVED_PREFIXES = ["dict-", "capture-", "fork-", "overlay-", "parent-", "metadata-"];
+const DERIVED_PREFIXES = ["build-", "dict-", "capture-", "fork-", "overlay-", "parent-", "metadata-"];
 
 /**
  * Single source of truth for every sidecar artifact and temp: `*.spill.idx`,
  * `*.spill.tail`, `*.spill.commit`, `*.spill.buckets`, `*.spill.dict-*`,
- * `*.spill.capture-*`, `*.spill.fork-*`, `*.spill.overlay-*`,
+ * `*.spill.capture-*`, `*.spill.fork-*`, `*.spill.overlay-*`, `*.spill.build-lock`,
  * `*.spill.parent-*` (persistent parent→children buckets),
  * `*.spill.metadata-*` (persistent metadata-delta section), and any
  * `*.spill.*.tmp`. Used at every fork/delete/sweep/Memory-parity callsite so
