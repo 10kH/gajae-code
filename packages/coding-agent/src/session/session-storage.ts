@@ -1839,8 +1839,30 @@ export class FileSessionStorage implements SessionStorage {
 						if (!exactRemoveSessionStorageLockPath(lockPath, expected, ownerDigest!)) {
 							try {
 								const current = fs.lstatSync(lockPath, { bigint: true });
-								if (current.dev === expected.dev && current.ino === expected.ino)
-									throw new Error("exclusive_lock_release_failed");
+								if (current.dev === expected.dev && current.ino === expected.ino) {
+									// The inode matches, but exactRemove refused — either the
+									// content changed (replacement reused the inode) or cleanup
+									// genuinely failed on the original. Re-verify the content
+									// digest to distinguish: a replacement whose sha256 no longer
+									// matches is not ours and must not be unlinked.
+									let fd: number | undefined;
+									try {
+										fd = fs.openSync(lockPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+										const bytes = Buffer.allocUnsafe(Number(current.size));
+										let offset = 0;
+										while (offset < bytes.byteLength) {
+											const read = fs.readSync(fd, bytes, offset, bytes.byteLength - offset, offset);
+											if (read === 0) break;
+											offset += read;
+										}
+										const currentDigest = createHash("sha256")
+											.update(bytes.subarray(0, offset))
+											.digest("hex");
+										if (currentDigest === ownerDigest!) throw new Error("exclusive_lock_release_failed");
+									} finally {
+										if (fd !== undefined) fs.closeSync(fd);
+									}
+								}
 							} catch (error) {
 								if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 							}
