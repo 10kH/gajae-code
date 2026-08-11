@@ -31,6 +31,7 @@ import {
 import { normalizeResponsesToolCallId, sanitizeJsonStrings } from "../utils";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
 import { isCompleteJson, parseStreamingJson } from "../utils/json-parse";
+import { areJsonValuesEqual } from "../utils/schema";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER, partitionVisionContent } from "./vision-guard";
 
 const OPENAI_RESPONSES_PROGRESS_EVENT_TYPES = new Set([
@@ -746,14 +747,19 @@ export async function processResponsesStream<TApi extends Api>(
 			} else if (item.type === "function_call") {
 				// The terminal item is canonical. Some compatible Responses relays put an
 				// empty placeholder in output_item.added and only provide real arguments
-				// here. When streamed arguments also exist, require exact agreement rather
-				// than silently choosing one source.
+				// here. When streamed arguments also exist, require agreement rather than
+				// silently choosing one source — but compare the decoded payloads, since a
+				// relay that re-serializes the terminal item (different key spacing or
+				// escaping) is not a disagreement about what the model asked for.
 				const streamedArguments = entry?.block.type === "toolCall" ? entry.block.partialJson : "";
 				const finalArguments = item.arguments ?? "";
 				const hasStreamedArguments = streamedArguments.length > 0;
 				const hasFinalArguments = finalArguments.length > 0;
 				const conflictingArgumentSources =
-					hasStreamedArguments && hasFinalArguments && streamedArguments !== finalArguments;
+					hasStreamedArguments &&
+					hasFinalArguments &&
+					streamedArguments !== finalArguments &&
+					!isEquivalentJsonPayload(streamedArguments, finalArguments);
 				const rawArguments = hasFinalArguments ? finalArguments : streamedArguments;
 				const incompleteArguments = conflictingArgumentSources || !isCompleteJson(rawArguments);
 				const args = incompleteArguments ? {} : parseStreamingJson(rawArguments);
@@ -768,7 +774,8 @@ export async function processResponsesStream<TApi extends Api>(
 					entry.block.id = toolCall.id;
 					entry.block.name = toolCall.name;
 					entry.block.arguments = args;
-					entry.block.incompleteArguments = incompleteArguments || undefined;
+					if (incompleteArguments) entry.block.incompleteArguments = true;
+					else delete entry.block.incompleteArguments;
 				}
 				const contentIndex = entry?.blockContentIndex ?? output.content.length - 1;
 				dropEntry(item.id, event.output_index, item.call_id);
@@ -837,6 +844,21 @@ export async function processResponsesStream<TApi extends Api>(
 					: "Unknown error (no error details in response)";
 			throw new Error(message);
 		}
+	}
+}
+
+/**
+ * Whether two raw JSON argument strings decode to the same value. Used to tell a
+ * relay's re-serialization of the same tool arguments apart from a genuine
+ * disagreement between the streamed and terminal payloads; anything that does
+ * not decode cleanly on both sides is treated as a disagreement (fail closed).
+ */
+function isEquivalentJsonPayload(left: string, right: string): boolean {
+	if (!isCompleteJson(left) || !isCompleteJson(right)) return false;
+	try {
+		return areJsonValuesEqual(JSON.parse(left), JSON.parse(right));
+	} catch {
+		return false;
 	}
 }
 

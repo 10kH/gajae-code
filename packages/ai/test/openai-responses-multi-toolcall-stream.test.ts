@@ -560,6 +560,43 @@ describe("Responses multi-tool-call stream correlation", () => {
 		expect(toolCallEnds(emitted)[0]?.toolCall.incompleteArguments).toBe(true);
 	});
 
+	test("accepts a re-serialized terminal payload that matches the streamed arguments", async () => {
+		const events = [
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "function_call", id: "fc_reser", call_id: "call_reser", name: "bash", arguments: "" },
+			},
+			{
+				type: "response.function_call_arguments.delta",
+				item_id: "fc_reser",
+				output_index: 0,
+				delta: '{"command":"pwd","timeout":30}',
+			},
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: {
+					type: "function_call",
+					id: "fc_reser",
+					call_id: "call_reser",
+					name: "bash",
+					// Same payload, re-serialized by the relay with different whitespace.
+					arguments: '{ "command": "pwd", "timeout": 30 }',
+				},
+			},
+		];
+		const output = makeOutput();
+		const { emitted, stream } = makeCapture();
+		await processResponsesStream(makeStream(events), output, stream, makeModel());
+
+		const block = toolBlocks(output)[0];
+		expect(block?.arguments).toEqual({ command: "pwd", timeout: 30 });
+		expect(block?.incompleteArguments).toBeUndefined();
+		expect(toolCallEnds(emitted)[0]?.toolCall.arguments).toEqual({ command: "pwd", timeout: 30 });
+		expect(toolCallEnds(emitted)[0]?.toolCall.incompleteArguments).toBeUndefined();
+	});
+
 	test("fails closed when terminal function-call arguments are malformed", async () => {
 		const events = [
 			{
