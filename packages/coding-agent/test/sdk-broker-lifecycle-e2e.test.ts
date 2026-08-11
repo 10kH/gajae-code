@@ -2850,7 +2850,12 @@ test("broker closes a live host whose workspace state root is gone using its reg
 		// index that retirement; leaving it open would keep advertising a dead session.
 		expect(await broker.handleRequest("session.list", {})).toMatchObject({
 			ok: true,
-			result: { sessions: [expect.objectContaining({ sessionId: "wrong-incarnation" })] },
+			result: {
+				sessions: [
+					expect.objectContaining({ sessionId: "wrong-incarnation" }),
+					expect.objectContaining({ sessionId: "orphan", terminal: true, live: false }),
+				],
+			},
 		});
 	} finally {
 		if (child.exitCode === null) child.kill("SIGKILL");
@@ -3341,7 +3346,9 @@ test("conditional unregister accepts a reconciled equivalent repository locator"
 			pid: expected.pid,
 		});
 		expect(await index.unregisterIfCurrent(expected)).toBe(true);
-		expect(index.listSessions().sessions).toEqual([]);
+		expect(index.listSessions().sessions).toEqual([
+			expect.objectContaining({ sessionId: "reconciled-repo", terminal: true, live: false }),
+		]);
 	} finally {
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}
