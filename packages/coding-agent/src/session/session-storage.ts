@@ -751,12 +751,8 @@ function unlinkOwnedStagedSync(stagingPath: string, expected: { dev: bigint; ino
 	try {
 		const named = fs.lstatSync(stagingPath, { bigint: true });
 		if (!named.isFile() || named.isSymbolicLink() || named.dev !== expected.dev || named.ino !== expected.ino) return;
-		if (named.nlink > 1n) {
-			fs.unlinkSync(stagingPath);
-			return;
-		}
 		const sha256 = createHash("sha256").update(fs.readFileSync(stagingPath)).digest("hex");
-		exactRemoveSessionStorageLockPath(stagingPath, named, sha256);
+		exactRemoveSessionStorageLockPath(stagingPath, named, sha256, named.nlink > 1n);
 	} catch {
 		// ENOENT means the name was already consumed or removed; cleanup is best-effort.
 		return;
@@ -1605,7 +1601,12 @@ function parseSessionStorageLockOwner(bytes: Buffer): SessionStorageLockOwner | 
 	}
 }
 
-function exactRemoveSessionStorageLockPath(lockPath: string, expected: fs.BigIntStats, sha256: string): boolean {
+function exactRemoveSessionStorageLockPath(
+	lockPath: string,
+	expected: fs.BigIntStats,
+	sha256: string,
+	allowHardLink = false,
+): boolean {
 	try {
 		const parent = fs.lstatSync(path.dirname(lockPath), { bigint: true });
 		if (!parent.isDirectory() || parent.isSymbolicLink()) return false;
@@ -1619,6 +1620,7 @@ function exactRemoveSessionStorageLockPath(lockPath: string, expected: fs.BigInt
 			mtimeNs: expected.mtimeNs,
 			sha256,
 			quarantineName: `${path.basename(lockPath)}.reap-${randomUUID()}`,
+			allowHardLink,
 		});
 		return result.ok || (result.code === "cleanup_pending" && typeof result.detachedPath === "string");
 	} catch {
