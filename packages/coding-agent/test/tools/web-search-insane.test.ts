@@ -78,6 +78,81 @@ describe("Insane public-route provider", () => {
 		expect(result.attempts[0]?.bytes).toBe(PUBLIC_ROUTE_RESPONSE_LIMIT);
 		expect(result.sources[0]?.title).toBe("Large Feed");
 	});
+	it("accepts a public-route response one byte under the 1 MiB limit", async () => {
+		const feed = redditFeedOfSize(PUBLIC_ROUTE_RESPONSE_LIMIT - 1);
+		using _hook = hookFetch(() => new Response(feed, { status: 200 }));
+
+		const result = await routeInsanePublicUrl("https://www.reddit.com/r/test");
+		if (!result || !("sources" in result)) throw new Error("expected route success");
+
+		expect(result.attempts[0]?.bytes).toBe(PUBLIC_ROUTE_RESPONSE_LIMIT - 1);
+		expect(result.sources[0]?.title).toBe("Large Feed");
+	});
+
+	it("rejects a streamed response exceeding the limit by exactly one byte", async () => {
+		using _hook = hookFetch(() => chunkedResponse([redditFeedOfSize(PUBLIC_ROUTE_RESPONSE_LIMIT), "X"], () => {}));
+
+		const result = await routeInsanePublicUrl("https://www.reddit.com/r/test");
+		if (!result || !("attempts" in result) || "sources" in result) throw new Error("expected route failure");
+
+		expect(result.attempts.every(item => item.note === "response_too_large")).toBe(true);
+	});
+
+	it("preserves UTF-8 multibyte boundaries when the limit splits a sequence", async () => {
+		// é is U+00E9, 2 bytes in UTF-8 (0xC3 0xA9).
+		// Build a feed whose total is exactly LIMIT, with the é split across
+		// two chunks so the first byte is the last byte of chunk1 and the
+		// second byte is the first byte of chunk2. The streaming TextDecoder
+		// with { stream: true } must buffer the incomplete sequence and
+		// correctly decode it once chunk2 arrives.
+		const openTag =
+			'<?xml version="1.0"?><feed><entry><title>T</title><link href="https://www.reddit.com/r/test/comments/abc"/><content>';
+		const openBytes = new TextEncoder().encode(openTag);
+		const charName = "é"; // 2 bytes
+		const charBytes = new TextEncoder().encode(charName);
+		const closeTag = "</content></entry></feed>";
+		const closeBytes = new TextEncoder().encode(closeTag);
+
+		const paddingLength =
+			PUBLIC_ROUTE_RESPONSE_LIMIT - openBytes.byteLength - charBytes.byteLength - closeBytes.byteLength;
+		if (paddingLength < 0) throw new Error("fixture too small for multibyte test");
+
+		const padding = new Uint8Array(paddingLength).fill(0x78); // 'x'
+
+		// chunk1 ends with the first byte of é; chunk2 starts with the second byte.
+		const chunk1 = new Uint8Array(openBytes.byteLength + paddingLength + 1);
+		chunk1.set(openBytes, 0);
+		chunk1.set(padding, openBytes.byteLength);
+		chunk1.set(Uint8Array.of(charBytes[0]), openBytes.byteLength + paddingLength);
+
+		const chunk2 = new Uint8Array(1 + closeBytes.byteLength);
+		chunk2.set(Uint8Array.of(charBytes[1]), 0);
+		chunk2.set(closeBytes, 1);
+
+		expect(chunk1.byteLength + chunk2.byteLength).toBe(PUBLIC_ROUTE_RESPONSE_LIMIT);
+
+		using _hook = hookFetch(
+			() =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(chunk1);
+							controller.enqueue(chunk2);
+							controller.close();
+						},
+					}),
+					{ status: 200 },
+				),
+		);
+
+		const result = await routeInsanePublicUrl("https://www.reddit.com/r/test");
+		if (!result || !("sources" in result)) throw new Error("expected route success");
+		// The content tag should end with é, proving the split multibyte
+		// sequence was correctly reassembled rather than producing U+FFFD.
+		expect(result.sources[0]?.snippet?.endsWith("é")).toBe(true);
+		expect(result.sources[0]?.snippet?.includes("\uFFFD")).toBe(false);
+		expect(result.attempts[0]?.bytes).toBe(PUBLIC_ROUTE_RESPONSE_LIMIT);
+	});
 
 	it("rejects a declared oversized response and cancels its body", async () => {
 		let cancelCount = 0;
