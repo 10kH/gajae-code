@@ -83,24 +83,24 @@
     },
     "focusedTests": [
       {
-        "suite": "gjc-skill-state-hooks.test.ts (gen-2)",
-        "result": "53 pass / 0 fail"
+        "suite": "gjc-skill-state-hooks + agent-session-skill-reroute-cancellation (merged tree)",
+        "result": "61 pass / 0 fail"
       },
       {
-        "suite": "agent-session-skill-reroute-cancellation.test.ts (gen-2)",
-        "result": "8 pass / 0 fail"
+        "suite": "sdk-host-wiring.test.ts (x3 runs)",
+        "result": "96 pass / 0 fail per run"
       },
       {
-        "suite": "sdk-host-wiring.test.ts (merged tree)",
-        "result": "96 pass / 0 fail (full-file x3: one intermittent 30s timeout under load, passes in isolation and subsequent full runs)"
+        "suite": "4 reconciliation suites",
+        "result": "32 pass / 0 fail"
       },
       {
         "suite": "8 focused sdk/acp suites",
-        "result": "77 pass / 0 fail"
+        "result": "141 pass / 0 fail total"
       },
       {
         "suite": "dev-ci gjc-state-gates (static/runtime/integrity/read)",
-        "result": "all 4 groups passed"
+        "result": "all 4 groups passed (also green in exact-head CI)"
       }
     ],
     "checks": [
@@ -133,11 +133,16 @@
     "devCommitsSinceReplayBase": 331,
     "mergeCommit": "9fff1a9436",
     "resolutions": [
-      "sdk-host-wiring.test.ts import union (NotificationSessionController type-only on dev; dropped dev-unused getNotificationConfig/telegramDaemon imports)",
-      "turn.prompt_status cursor rejection aligned to invalid_cursor (dev query handlers; test was broken on dev)",
-      "concurrent /notify on serialization test aligned to enabled/enabled convergence (activeRuntimeId claimed at start settlement; test was broken on dev)",
-      "package.json workspace catalog bumped 0.12.21 -> 0.13.1 for all @gajae-code packages (check:public-sync was red on clean dev); bun.lock synced"
+      "sdk-host-wiring.test.ts import union + early rejection adoption (unhandled-rejection fix)",
+      "bus/index.ts: kind-scoped reconciliation (PR) + #4080 receipt-state durability; awaited agent_start/agent_end transitions (fixes replay + in_flight races)",
+      "kind-aware-reconciliation.ts: kind-scoped claimed-outcome-wins terminal handling with receiptState",
+      "reconciliation-store.ts: skill pendingOutcome + prompt-only pendingReceiptState validation",
+      "sdk-production-host.ts: ProductionSdkHost interface + notificationsInitiallyEnabled option",
+      "sdk-prompt-terminal-arbiter.test.ts: kind-scoped API calls",
+      "package.json workspace catalog bumped to 0.13.1 (check:public-sync was red on clean dev); bun.lock synced"
     ],
-    "baselineNote": "sdk-host-wiring 'waits for durable skill acceptance' times out intermittently under full-file load (passes in isolation 1.4s and in full-file runs 3rd attempt 23s; also passes on clean dev and pre-merge branch). Environmental flake, not a regression."
-  }
+    "baselineNote": "sdk-host-wiring 'waits for durable skill acceptance' times out intermittently under full-file load (passes in isolation 1.4s and in full-file runs 3rd attempt 23s; also passes on clean dev and pre-merge branch). Environmental flake, not a regression.",
+    "devAtFinalMerge": "00ca7798bcc18e6d916fd46d6c127feaae58739f"
+  },
+  "finalHead": "a6494b91a0356d7c59b4267d533f69730ae3a86e"
 }
