@@ -28,6 +28,7 @@ import {
 	getProjectDir,
 	getResidentCacheRootDir,
 	getSessionsDir,
+	getSidecarCacheRootDir,
 	getTerminalSessionsDir,
 	hasFsCode,
 	isEnoent,
@@ -57,12 +58,14 @@ import {
 	isImageDataUrl,
 	MemoryBlobStore,
 	openVerifiedResidentCacheInstanceDir,
+	openVerifiedSidecarCacheInstanceDir,
 	parseBlobRef,
 	ResidentBlobMissingError,
 	ResidentCacheTrustError,
 	resolveResidentImageDataSync,
 	resolveResidentImageDataUrlSync,
 	resolveTextBlobSync,
+	sweepResidentCacheRoot,
 } from "./blob-store";
 import {
 	canonicalizeTrustedPath,
@@ -6867,6 +6870,7 @@ export class SessionManager {
 								? Promise.resolve()
 								: Promise.reject(Object.assign(new Error("Managed sidecar not found"), { code: "ENOENT" }));
 						case "openWriter":
+						case "openBufferedWriter":
 						case "openStagedWriter":
 							args[1] = {
 								...(args[1] as SessionStorageWriterOpenOptions | undefined),
@@ -7697,13 +7701,27 @@ export class SessionManager {
 		sessionFile: string,
 	): Promise<SessionStorageExclusiveLock | "published" | undefined> {
 		if (!this.#storage.acquireExclusiveLockSync) return undefined;
-		const sidecarRoot = sessionFile.endsWith(".jsonl") ? sessionFile.slice(0, -6) : sessionFile;
+		const sidecarRoot =
+			this.destination.kind === "managed"
+				? this.#managedSidecarRoot(sessionFile)
+				: sessionFile.endsWith(".jsonl")
+					? sessionFile.slice(0, -6)
+					: sessionFile;
+		if (!sidecarRoot) return undefined;
 		const lockPath = `${sidecarRoot}/.session-memory.spill.build-lock`;
 		const commitPath = `${sidecarRoot}/.session-memory.spill.commit`;
+		let contended = false;
 		for (let attempt = 0; attempt < 3000; attempt++) {
-			if (this.#storage.existsSync(commitPath)) return "published";
 			const lock = this.#storage.acquireExclusiveLockSync(lockPath);
-			if (lock) return lock;
+			if (lock) {
+				if (contended && this.#storage.existsSync(commitPath)) {
+					lock.releaseSync();
+					return "published";
+				}
+				return lock;
+			}
+			contended = true;
+			if (this.#storage.existsSync(commitPath)) return "published";
 			await Bun.sleep(10);
 		}
 		return undefined;
@@ -7742,14 +7760,21 @@ export class SessionManager {
 		const overallStarted = startFirstOpenPhase();
 		this.#sessionFile = sessionFile;
 		const runtime = this.#resetSidecarRuntime();
-		// A pre-existing commit marker means a sidecar set was previously published;
-		// stale/corrupt marker recovery (transcript_ahead, tail_ahead, rebuild)
-		// stays on the eager authoritative path so its classifications are preserved.
 		if (this.#storage.existsSync(runtime.commitPath)) {
-			buildLock.releaseSync();
-			this.#sidecarRuntime = undefined;
-			this.#sessionFile = undefined;
-			return this.#tryInitSessionFileFromSidecar(sessionFile);
+			for (const sidecarPath of this.#disposableSidecarPaths()) {
+				if (!sidecarPath) continue;
+				try {
+					this.#storage.unlinkSync(sidecarPath);
+				} catch (error) {
+					if (!isEnoent(error)) {
+						this.#lazyReopenFallbackReason = "bounded_first_open_stale_cleanup_failed";
+						this.#sidecarRuntime = undefined;
+						this.#sessionFile = undefined;
+						buildLock.releaseSync();
+						return false;
+					}
+				}
+			}
 		}
 		this.#lazyReopenFallbackReason = "bounded_first_open_failed";
 		let initialized = false;
@@ -8498,11 +8523,21 @@ export class SessionManager {
 	async #initSessionFile(sessionFile: string, initializeMissing = false): Promise<void> {
 		let strictManagedFallbackEntries: FileEntry[] | undefined;
 		const resolvedSessionFile = this.#storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
-		const sidecarRoot = resolvedSessionFile.endsWith(".jsonl")
-			? resolvedSessionFile.slice(0, -6)
-			: resolvedSessionFile;
+		const sidecarRoot =
+			this.destination.kind === "managed"
+				? this.#managedSidecarRoot(resolvedSessionFile)
+				: resolvedSessionFile.endsWith(".jsonl")
+					? resolvedSessionFile.slice(0, -6)
+					: resolvedSessionFile;
+		let transcriptSize: number | undefined;
+		try {
+			transcriptSize = this.#statSync(resolvedSessionFile).size;
+		} catch {
+			// Missing/unreadable transcripts continue through the existing initialization path.
+		}
 		const publishedSidecarWasPresent =
-			this.#effectiveSessionMemoryMode() === "enabled" &&
+			sidecarRoot !== undefined &&
+			this.#effectiveSessionMemoryMode(transcriptSize) === "enabled" &&
 			this.#storage.existsSync(`${sidecarRoot}/.session-memory.spill.commit`);
 		if (await this.#tryInitSessionFileFromSidecar(resolvedSessionFile)) {
 			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
@@ -10538,8 +10573,13 @@ export class SessionManager {
 		if (this.#managedSidecarCacheStore && this.#managedSidecarCacheSessionFile === sessionFile)
 			return this.#managedSidecarCacheStore.dir;
 		this.#releaseManagedSidecarCache();
-		const instanceDir = openVerifiedResidentCacheInstanceDir(
-			getResidentCacheRootDir(this.#residentCacheProfileAgentDir()),
+		// Sweep abandoned pre-namespace sidecars from the resident root. The sweep
+		// only reaps stale owner leases, so the canonical resident store is untouched.
+		void sweepResidentCacheRoot(getResidentCacheRootDir(this.#residentCacheProfileAgentDir()));
+		const sessionHash = crypto.createHash("sha256").update(sessionFile).digest("hex").slice(0, 32);
+		const instanceDir = openVerifiedSidecarCacheInstanceDir(
+			getSidecarCacheRootDir(this.#residentCacheProfileAgentDir()),
+			sessionHash,
 		);
 		const cacheParent = path.dirname(instanceDir);
 		let retainedAuthority: native.RecoveryFsRoot | undefined;

@@ -3,7 +3,7 @@ import * as crypto from "node:crypto";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getBlobsDir, getResidentCacheRootDir, logger, TempDir } from "@gajae-code/utils";
+import { getBlobsDir, getResidentCacheRootDir, getSidecarCacheRootDir, logger, TempDir } from "@gajae-code/utils";
 import {
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
@@ -587,7 +587,22 @@ describe("SessionManager cold sidecar integration", () => {
 				await manager.close();
 			}
 			const cacheRoot = getResidentCacheRootDir(profileAgentDir);
-			const beforeReopen = fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0;
+			const residentEntriesBefore = fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0;
+			const sidecarCacheRoot = getSidecarCacheRootDir(profileAgentDir);
+			const beforeReopen = fs.existsSync(sidecarCacheRoot) ? fs.readdirSync(sidecarCacheRoot).length : 0;
+			const sessionHash = createHash("sha256").update(sessionFile).digest("hex").slice(0, 32);
+			const staleSidecar = path.join(sidecarCacheRoot, `s-${sessionHash}`);
+			fs.mkdirSync(sidecarCacheRoot, { recursive: true, mode: 0o700 });
+			fs.chmodSync(sidecarCacheRoot, 0o700);
+			fs.mkdirSync(staleSidecar, { mode: 0o700 });
+			fs.chmodSync(staleSidecar, 0o700);
+			fs.writeFileSync(
+				path.join(staleSidecar, "owner.json"),
+				JSON.stringify({ pid: 2_147_483_647, startTimeMs: 0, nonce: "crashed-sidecar", createdAt: 0 }),
+				{ mode: 0o600 },
+			);
+			fs.chmodSync(path.join(staleSidecar, "owner.json"), 0o600);
+			fs.writeFileSync(path.join(staleSidecar, ".session-memory.spill.idx"), "crash debris", { mode: 0o600 });
 			const transcriptRead = vi.spyOn(nestedStore, "readExpected");
 			const reopened = await SessionManager.openNestedManaged(
 				sessionFile,
@@ -602,11 +617,17 @@ describe("SessionManager cold sidecar integration", () => {
 				expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
 				expect(reopened.getSessionMemoryStats().totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 				expect(reopened.getEntry(coldId)?.id).toBe(coldId);
-				expect(fs.readdirSync(cacheRoot).length).toBeGreaterThan(beforeReopen);
+				expect(fs.readdirSync(sidecarCacheRoot).length).toBeGreaterThan(beforeReopen);
+				expect(fs.readdirSync(sidecarCacheRoot).filter(entry => /^s-[a-f0-9]{32}$/.test(entry))).toHaveLength(1);
+				expect(JSON.parse(fs.readFileSync(path.join(staleSidecar, "owner.json"), "utf8"))).toMatchObject({
+					pid: process.pid,
+				});
+				expect(fs.readdirSync(cacheRoot).filter(entry => entry.startsWith("i-")).length).toBe(1);
 			} finally {
 				await reopened.close();
 			}
-			expect(fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0).toBe(beforeReopen);
+			expect(fs.existsSync(sidecarCacheRoot) ? fs.readdirSync(sidecarCacheRoot).length : 0).toBe(beforeReopen);
+			expect(fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0).toBe(residentEntriesBefore);
 			expect(
 				fs
 					.readdirSync(managedRoot, { recursive: true })
@@ -1099,11 +1120,12 @@ it("reopens an enabled explicit session from authenticated hot-tail metadata", a
 		"enabled",
 	);
 	try {
-		expect(storage.textReads).toBeGreaterThan(0);
+		expect(storage.textReads).toBe(0);
 		expect(fallback.getSessionMemoryStats()).toMatchObject({
 			lazyReopenAttempted: true,
-			lazyReopenSucceeded: false,
-			lazyReopenFallbackReason: "proof_invalid",
+			lazyReopenSucceeded: true,
+			lazyReopenFallbackReason: undefined,
+			lastReopenTransition: { kind: "rebuild", reason: "bounded_first_open" },
 		});
 		expect(fallback.buildSessionContext().messages).toHaveLength(3);
 	} finally {
@@ -1751,8 +1773,19 @@ it("refuses unbounded authoritative hydration after bounded sidecar tamper", asy
 });
 
 it("rejects corrupt tail and commit artifacts through manager reopen", async () => {
+	class CountingStorage extends MemorySessionStorage {
+		transcriptTextReads = 0;
+		override readText(filePath: string): Promise<string> {
+			if (!filePath.includes(".spill.")) this.transcriptTextReads++;
+			return super.readText(filePath);
+		}
+		override readTextSync(filePath: string): string {
+			if (!filePath.includes(".spill.")) this.transcriptTextReads++;
+			return super.readTextSync(filePath);
+		}
+	}
 	for (const corruptKind of ["tail", "commit"] as const) {
-		const storage = new MemorySessionStorage();
+		const storage = new CountingStorage();
 		const sessionFile = `/sessions/corrupt-${corruptKind}.jsonl`;
 		const records = [
 			{ type: "session", version: 5, id: `corrupt-${corruptKind}`, timestamp: "0", cwd: "/cwd" },
@@ -1778,6 +1811,7 @@ it("rejects corrupt tail and commit artifacts through manager reopen", async () 
 		);
 		await built.close();
 		storage.writeTextSync(sidecarPath(sessionFile, corruptKind), "corrupt\n");
+		storage.transcriptTextReads = 0;
 
 		const reopened = await SessionManager.open(
 			sessionFile,
@@ -1789,6 +1823,7 @@ it("rejects corrupt tail and commit artifacts through manager reopen", async () 
 		try {
 			expect(storage.readTextSync(sidecarPath(sessionFile, corruptKind))).not.toBe("corrupt\n");
 			expect(reopened.getEntry("old")).toMatchObject({ id: "old" });
+			expect(storage.transcriptTextReads).toBe(0);
 		} finally {
 			await reopened.close();
 		}
@@ -2289,7 +2324,7 @@ it("fails closed to eager on a branched transcript during enabled first open", a
 		await manager.close();
 	}
 });
-it("fails closed for transcript-ahead and tail-ahead reopen states", async () => {
+it("rebuilds bounded state for transcript-ahead and tail-ahead reopen states", async () => {
 	class CountingStorage extends MemorySessionStorage {
 		textReads = 0;
 		override readText(filePath: string) {
@@ -2335,9 +2370,9 @@ it("fails closed for transcript-ahead and tail-ahead reopen states", async () =>
 		"enabled",
 	);
 	try {
-		expect(transcriptAhead.storage.textReads).toBeGreaterThan(0);
+		expect(transcriptAhead.storage.textReads).toBe(0);
 		expect(transcriptFallback.getEntry("new-tail")).toMatchObject({ id: "new-tail" });
-		expect(transcriptFallback.getSessionMemoryStats().autoDisabledReason).toBe("sidecar_reload_failures");
+		expect(transcriptFallback.getSessionMemoryStats().autoDisabledReason).toBeUndefined();
 	} finally {
 		await transcriptFallback.close();
 	}
@@ -2354,9 +2389,9 @@ it("fails closed for transcript-ahead and tail-ahead reopen states", async () =>
 		"enabled",
 	);
 	try {
-		expect(tailAhead.storage.textReads).toBeGreaterThan(0);
+		expect(tailAhead.storage.textReads).toBe(0);
 		expect(tailFallback.buildSessionContext().messages).toHaveLength(1);
-		expect(tailFallback.getSessionMemoryStats().autoDisabledReason).toBe("sidecar_reload_failures");
+		expect(tailFallback.getSessionMemoryStats().autoDisabledReason).toBeUndefined();
 	} finally {
 		await tailFallback.close();
 	}
@@ -4772,7 +4807,7 @@ describe("persistent dictionary and metadata-delta artifacts", () => {
 		}
 	});
 
-	it("fails closed to eager when the metadata-delta binding is corrupt or missing", async () => {
+	it("rebuilds bounded state when the metadata-delta binding is corrupt or missing", async () => {
 		const storage = new MemorySessionStorage();
 		const sessionFile = "/sessions/provider-delta-corrupt.jsonl";
 		const records = [
@@ -4816,7 +4851,7 @@ describe("persistent dictionary and metadata-delta artifacts", () => {
 			"enabled",
 		);
 		try {
-			expect(reopened.getSessionMemoryStats().lazyReopenSucceeded).toBe(false);
+			expect(reopened.getSessionMemoryStats().lazyReopenSucceeded).toBe(true);
 			expect(reopened.getSessionMemoryStats().currentCommitTransition).toEqual({
 				kind: "exact",
 				reason: "descriptor_and_proof_match",
@@ -4836,7 +4871,7 @@ describe("persistent dictionary and metadata-delta artifacts", () => {
 			"enabled",
 		);
 		try {
-			expect(malformedBinding.getSessionMemoryStats().lazyReopenSucceeded).toBe(false);
+			expect(malformedBinding.getSessionMemoryStats().lazyReopenSucceeded).toBe(true);
 			expect(malformedBinding.buildSessionContext()).toEqual(eager);
 		} finally {
 			await malformedBinding.close();
