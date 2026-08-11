@@ -629,6 +629,42 @@ describe("AsyncJobManager", () => {
 		await manager.dispose({ timeoutMs: 100 });
 	});
 
+	test("cancelling a paused subagent retires its owned registration", async () => {
+		// Review thread P2: cancelSubagent() takes its DIRECT paused branch
+		// (never reaching cancel()), so the owned tuple must be retired there —
+		// the cancellation emits no completion delivery, and without this the
+		// tuple survives job eviction and a later scope:"owned" abort of the
+		// attempt reports owned_unsettled with no work remaining.
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const jobId = manager.register("task", "paused-owned", async () => ({ kind: "paused", note: "safe boundary" }), {
+			id: "paused-owned-job",
+		});
+		manager.registerSubagentRecord({
+			subagentId: "paused-owned-subagent",
+			ownerId: "0-Test",
+			currentJobId: jobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: "/tmp/paused-owned.jsonl",
+			resumable: true,
+		});
+		await manager.getJob(jobId)?.promise;
+		const job = manager.getJob(jobId);
+		const generation = job?.generation ?? jobId;
+		const endpointId = AsyncJobManager.endpointIdOf(manager);
+		registerOwnedRegistration({
+			endpointId,
+			lineageIdHash: "lineage-paused-owned",
+			promptAttemptEpoch: 1,
+			endpointGeneration: 1,
+			jobId,
+			jobGeneration: generation,
+		});
+		expect(lookupOwnedRegistration(jobId, generation, endpointId)).toBeDefined();
+		expect(manager.cancelSubagent("paused-owned-subagent", { ownerId: "0-Test" })).toBe(true);
+		expect(lookupOwnedRegistration(jobId, generation, endpointId)).toBeUndefined();
+	});
+
 	test("paused and queued cancellation publish terminal wait evidence", async () => {
 		const pausedManager = new AsyncJobManager({ onJobComplete: async () => {} });
 		const pausedJobId = pausedManager.register(

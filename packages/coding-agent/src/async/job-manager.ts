@@ -1794,6 +1794,13 @@ export class AsyncJobManager {
 			if (shouldScheduleEviction && currentJobId) this.#scheduleEviction(currentJobId);
 			else this.#notifyChange();
 			this.#drainResumeQueue();
+			// A paused run has already unwound (it returned "paused") and this
+			// direct branch never reaches cancel(), so retire the owned tuple
+			// here — the cancellation emits no completion delivery, and without
+			// this the tuple survives job eviction and a later scope:"owned"
+			// abort of the attempt reports owned_unsettled with no work left
+			// (review thread P2).
+			if (shouldScheduleEviction && currentJobId && job) this.#retireCancelledJobOwned(currentJobId, job.generation);
 			return true;
 		}
 		if (rec.status === "queued") {

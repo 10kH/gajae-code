@@ -456,6 +456,50 @@ describe("reconciliation-store", () => {
 		expect(settleTerminalScopeRestart([stopped], now)[0]).toBe(stopped);
 	});
 
+	test("settleTerminalScopeRestart rehashes abandoned no-effect reservations to the replay payload", () => {
+		// Review thread P2: an abandoned no_effect_reserved row (the process
+		// exited before finalization) settles to plain no_effect, but its
+		// only deliverable is the metadata-bearing no_active_turn replay — the
+		// settled row must store the replay-shaped hash (replacing the input
+		// placeholder) or a written replay can never advance it.
+		const now = 5_000;
+		const reserved: DurableTerminalScopeRecord = {
+			selection: "turn",
+			idempotencyKeyHash: hash("k-reserved"),
+			idempotencyInputHash: hash("i-reserved"),
+			turnDisposition: "no_effect_reserved",
+			ownedWorkDisposition: "not_requested",
+			automaticDeliveryDisposition: "enabled",
+			resumeOnOwnedCompletion: true,
+			turnContinuationFence: {
+				state: "retained",
+				abortedAttemptEpoch: 1,
+				blockedContinuationIds: [],
+				predecessorTombstones: [],
+				ownedCompletionPolicy: "enabled",
+			},
+			responseState: "pending",
+			responsePayloadHash: hash("input-placeholder"),
+			acceptedAt: 1,
+		};
+		const settled = settleTerminalScopeRestart([reserved], now)[0];
+		expect(settled.turnDisposition).toBe("no_effect");
+		const replayResult = {
+			ok: true,
+			selection: "turn",
+			turn: "no_active_turn",
+			terminal: "terminal_no_effect",
+			replay: {
+				responseState: "pending",
+				responsePayloadHash: hash("input-placeholder"),
+				terminalPublished: false,
+			},
+		};
+		const replayPayloadHash = hash(JSON.stringify(replayResult));
+		expect(settled.responsePayloadHash).toBe(replayPayloadHash);
+		expect(settled.replayPayloadHash).toBe(replayPayloadHash);
+	});
+
 	test("settleTerminalScopeRestart stores the replay-shaped payload hash a retry delivers", () => {
 		// Review thread P2: a pending scope settled by restart replays as
 		// uncertainty — the ONLY response it can ever deliver. Its stored

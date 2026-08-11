@@ -470,9 +470,28 @@ export function settleTerminalScopeRestart(
 		// so repeated crashes with unique idle-abort keys grow the reconciliation
 		// document without bound (review thread P2).
 		if (scope.turnDisposition === "no_effect_reserved") {
+			// The reservation's only deliverable after restart is the
+			// metadata-bearing no_active_turn replay; store the replay-shaped
+			// payload hash (and replace the input placeholder) so a written
+			// replay can advance the row instead of staying durably pending
+			// (review thread P2).
+			const replayResult = {
+				ok: true,
+				selection: scope.selection,
+				turn: "no_active_turn",
+				terminal: "terminal_no_effect",
+				replay: {
+					responseState: "pending",
+					responsePayloadHash: scope.responsePayloadHash,
+					terminalPublished: scope.terminalPublished === true,
+				},
+			};
+			const replayPayloadHash = createHash("sha256").update(JSON.stringify(replayResult)).digest("hex");
 			return {
 				...scope,
 				turnDisposition: "no_effect" as const,
+				responsePayloadHash: replayPayloadHash,
+				replayPayloadHash,
 				terminalAt: scope.terminalAt ?? now,
 			};
 		}
