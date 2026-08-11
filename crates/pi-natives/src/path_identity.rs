@@ -268,7 +268,9 @@ impl NativeNoReplaceResult {
 				"unsupported"
 			}
 			.to_owned(),
-			phase:            if mutation_state == "committed" {
+			phase:            if mutation_state == "committed" && !result.ok {
+				"terminal_identity"
+			} else if mutation_state == "committed" {
 				"complete"
 			} else if matches!(reason, "invalid_request" | "identity_violation") {
 				"preflight"
@@ -4082,6 +4084,13 @@ pub(crate) mod platform {
 				return *result;
 			},
 		};
+		if source_name == destination_name {
+			unsafe {
+				libc::close(source_parent);
+				libc::close(destination_parent);
+			}
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
 		let destination_lock = unsafe {
 			libc::openat(
 				destination_parent,
@@ -7958,6 +7967,18 @@ mod owner_only_security_tests {
 		assert_eq!(result.durability_state, "not_attempted");
 		assert_eq!(result.reason, "invalid_request");
 		assert_eq!(result.phase, "preflight");
+	}
+
+	#[test]
+	fn rename_no_replace_destination_identity_loss_is_terminal() {
+		let result = NativeNoReplaceResult::from_exact(NativeExactUnlinkResult::failure(
+			"destination_identity_changed",
+		));
+		assert!(!result.ok);
+		assert_eq!(result.mutation_state, "committed");
+		assert_eq!(result.durability_state, "not_provable");
+		assert_eq!(result.reason, "identity_violation");
+		assert_eq!(result.phase, "terminal_identity");
 	}
 
 	#[test]
