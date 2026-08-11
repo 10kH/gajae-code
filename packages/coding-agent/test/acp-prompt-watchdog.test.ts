@@ -299,7 +299,14 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 					frame.operation === "turn.prompt"
 						? { commandId, turnId, accepted: true as const }
 						: frame.operation === "turn.abort"
-							? { aborted: true }
+							? {
+									ok: true,
+									selection: "owned",
+									turn: "stopped",
+									ownedWork: "stopped",
+									automaticDelivery: "none",
+									resumeOnOwnedCompletion: false,
+								}
 							: {};
 				if (frame.operation === "turn.prompt" && options.deferFirstPromptAcknowledgement && turnCount === 1) {
 					deferredPromptAcknowledgement = {

@@ -18535,7 +18535,7 @@ export class SessionManager {
 					const content = `${JSON.stringify(prepareEntryForPersistenceSync(fresh.header, manager.#blobStore))}\n`;
 					managedInspectionStore.publishNoReplaceSync(path.basename(filePath), Buffer.from(content, "utf8"));
 					const publishedTranscript = managedInspectionStore.readExpected(path.basename(filePath));
-					if (!publishedTranscript || !publishedTranscript.bytes.equals(Buffer.from(content, "utf8")))
+					if (publishedTranscript?.bytes?.equals(Buffer.from(content, "utf8")) !== true)
 						throw new Error("Could not open session: unstable");
 					if (manager.#effectiveSessionMemoryMode() !== "off") {
 						manager.#buildDisposableSidecars(manager.#fileEntries);

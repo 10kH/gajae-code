@@ -270,6 +270,30 @@ function isAtomicSettingsPath(path: string): boolean {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
+ * Value at a dotted path, accepting both the flat legacy key form and the
+ * nested form (used for the interrupted-retirement source republication).
+ */
+function valueAtPath(obj: Record<string, unknown>, dottedPath: string): unknown {
+	if (dottedPath in obj) return obj[dottedPath];
+	return getByPath(obj, dottedPath.split("."));
+}
+
+/**
+ * Flatten an object to its leaf dotted paths (nested and dotted keys alike),
+ * used to verify publication proof before retiring a legacy source.
+ */
+function flattenObjectPaths(node: unknown, prefix: string[] = []): string[] {
+	if (node === null || typeof node !== "object" || Array.isArray(node)) {
+		return [prefix.join(".")];
+	}
+	const paths: string[] = [];
+	for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+		paths.push(...flattenObjectPaths(value, [...prefix, key]));
+	}
+	return paths;
+}
+
+/**
  * Whether a dotted path has a value present in an object (used to verify
  * publication proof before retiring a legacy source).
  */
@@ -1447,7 +1471,20 @@ export class Settings implements NotificationSettingsReader {
 				merged = this.#deepMerge(merged, settings);
 			}
 			return this.#migrateRawSettings(merged);
-		} catch {
+		} catch (error) {
+			// A malformed project file is tolerated (its layer is skipped), but a
+			// marker-read failure (EACCES/EISDIR/transient I/O - an fs error with
+			// a code, not a parse error) must PROPAGATE: silently returning {}
+			// would drop the entire project layer, including valid config.yml
+			// values, on a transient failure.
+			if (
+				error !== null &&
+				typeof error === "object" &&
+				"code" in error &&
+				(error as { code?: unknown }).code !== "ENOENT"
+			) {
+				throw error;
+			}
 			return {};
 		}
 	}
@@ -1639,6 +1676,34 @@ export class Settings implements NotificationSettingsReader {
 	 * existing values (including the workflow values a migration wrote) are
 	 * never clobbered and every drained setting survives.
 	 */
+	/**
+	 * Source-overwrite patches for the interrupted-retirement recovery: every
+	 * leaf of the source's migrated values becomes a SET patch with the
+	 * source's value. Path semantics mirror {@link #collectAbsentLegacyPatches}
+	 * (top-level keys split on dots; keys inside records are literal segments
+	 * and are never split), so a record with a literal dotted member such as
+	 * `modelTags: { "custom.role": { name } }` survives recovery.
+	 */
+	#collectSourceOverwritePatches(value: RawSettings, prefix: string[] = []): AtomicYamlPatch[] {
+		const patches: AtomicYamlPatch[] = [];
+		for (const [key, entry] of Object.entries(value)) {
+			const segments = prefix.length === 0 ? [...prefix, ...key.split(".")] : [...prefix, key];
+			if (entry !== null && typeof entry === "object" && !Array.isArray(entry)) {
+				patches.push(...this.#collectSourceOverwritePatches(entry as RawSettings, segments));
+			} else {
+				// A literal dotted member (e.g. `custom.role` inside a record) is
+				// not representable in the dotted patch path format: the atomic
+				// pipeline would re-split it into nested segments and either garble
+				// the target or fail the publication. Exclude such leaves so the
+				// recovery completes without corrupting the target's literal
+				// member; the remaining source paths are republished.
+				if (segments.some(segment => segment.includes("."))) continue;
+				patches.push({ path: segments.join("."), op: "set" as const, value: structuredClone(entry) });
+			}
+		}
+		return patches;
+	}
+
 	#collectAbsentLegacyPatches(
 		current: Readonly<Record<string, unknown>>,
 		legacy: Readonly<Record<string, unknown>>,
@@ -1741,19 +1806,54 @@ export class Settings implements NotificationSettingsReader {
 
 		let settings: RawSettings = {};
 		let migrated = false;
+		// The source-only migrated values (tracked for the interrupted-retirement
+		// recovery: their CURRENT values must be REPUBLISHED, not absent-only, so
+		// a concurrent edit after the interrupted run is never silently lost).
+		let settingsJsonMigrated: RawSettings | null = null;
 
 		// 1. Migrate from settings.json (one-time via the .bak rename; runs only
-		// when config.yml is absent so it never overwrites a completed surface).
+		// when config.yml is absent so it never overwrites a completed surface,
+		// EXCEPT when a pending-retirement marker exists: a source edited after
+		// an interrupted retirement must be RE-MIGRATED (absent-only) instead of
+		// staying permanently ignored by the configExists guard).
 		const configExists = await this.#pathExists(this.#configPath);
 		const settingsJsonPath = path.join(this.#agentDir, "settings.json");
+		const pendingRetirementPath = `${settingsJsonPath}.pending-retirement`;
+		const settingsJsonRetirementMarkerExists = await this.#pathExists(pendingRetirementPath);
 		let settingsJsonRetirementPending = false;
+		let settingsJsonMarkerPersisted = false;
 		let settingsJsonRaw: string | null = null;
-		if (!configExists) {
+		// Identity (inode) of the VALIDATED bytes, captured from the same
+		// descriptor that read them: the retirement rename is bound to this
+		// identity so a concurrent replacement is never moved to .bak.
+		let settingsJsonIno: number | null = null;
+		// The marker's ORIGINAL sha at method entry (captured BEFORE the
+		// re-read rewrites it): the recovery's source-set patches must compare
+		// the current source against the INTERRUPTED run's recorded revision,
+		// not the just-rewritten marker.
+		let settingsJsonMarkerShaAtEntry: string | null = null;
+		if (settingsJsonRetirementMarkerExists) {
+			settingsJsonMarkerShaAtEntry = await Bun.file(pendingRetirementPath)
+				.text()
+				.catch(() => null);
+		}
+		if (!configExists || settingsJsonRetirementMarkerExists) {
 			try {
-				settingsJsonRaw = await Bun.file(settingsJsonPath).text();
+				// Read the bytes and capture the inode from the SAME descriptor:
+				// the retirement rename is bound to the file whose bytes were
+				// validated, so a concurrent replacement (even between the read and
+				// a later stat) is never retired.
+				const sourceHandle = await fs.promises.open(settingsJsonPath, "r");
+				try {
+					settingsJsonIno = (await sourceHandle.stat()).ino;
+					settingsJsonRaw = await sourceHandle.readFile("utf8");
+				} finally {
+					await sourceHandle.close();
+				}
 				const parsed = JSON.parse(settingsJsonRaw);
 				if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-					settings = this.#deepMerge(settings, this.#migrateRawSettings(parsed));
+					settingsJsonMigrated = this.#migrateRawSettings(parsed);
+					settings = this.#deepMerge(settings, settingsJsonMigrated);
 					migrated = true;
 					// The .bak retirement is DEFERRED until the combined migration
 					// commits: a later failure (e.g. a malformed agent.db row that
@@ -1768,10 +1868,10 @@ export class Settings implements NotificationSettingsReader {
 					// source's SHA-256 so a later edit is never retired. The payload
 					// and parent directory are FSYNCED (like the YAML publication
 					// it recovers) so a power loss cannot strand the source with a
-					// lost marker while config.yml already exists.
+					// lost marker while config.yml already exists. A replaced marker
+					// (a previous interrupted run) is overwritten.
 					try {
-						const pendingRetirementPath = `${settingsJsonPath}.pending-retirement`;
-						const markerHandle = await fs.promises.open(pendingRetirementPath, "wx", 0o600);
+						const markerHandle = await fs.promises.open(pendingRetirementPath, "w", 0o600);
 						try {
 							await markerHandle.writeFile(
 								nodeCrypto.createHash("sha256").update(settingsJsonRaw).digest("hex"),
@@ -1790,6 +1890,7 @@ export class Settings implements NotificationSettingsReader {
 								}
 							})
 							.catch(() => undefined);
+						settingsJsonMarkerPersisted = true;
 					} catch {}
 				}
 			} catch {}
@@ -1839,7 +1940,11 @@ export class Settings implements NotificationSettingsReader {
 		// or a drained-then-reopened database), merge ABSENT-ONLY so the existing
 		// values - including the workflow values the config-root migration wrote -
 		// are never clobbered.
-		if (migrated && Object.keys(settings).length > 0) {
+		if (
+			migrated &&
+			(settingsJsonRetirementPending === false || settingsJsonMarkerPersisted) &&
+			Object.keys(settings).length > 0
+		) {
 			// Publication is best-effort: a write failure (e.g. a CAS conflict with
 			// an external config.yml edit) keeps the legacy rows for the next load
 			// to retry and must never fail the settings load.
@@ -1873,8 +1978,47 @@ export class Settings implements NotificationSettingsReader {
 						return false;
 					}
 					const patches = this.#collectAbsentLegacyPatches(tx.current, settings);
-					if (patches.length > 0) {
-						await tx.applyPatches(patches);
+					// The interrupted-retirement recovery (a pending marker): the
+					// source's CURRENT values are republished as SET patches (not
+					// absent-only) so a concurrent edit after the interrupted run is
+					// preserved instead of staying permanently ignored under the
+					// target's older value.
+					// The interrupted-retirement recovery (a pending marker): the
+					// source's CURRENT values are republished as SET patches (not
+					// absent-only) so a PROVEN post-marker source edit is preserved
+					// instead of staying permanently ignored under the target's older
+					// value. The source hash must DIFFER from the marker's recorded
+					// hash: an unchanged source means the target holds the user's
+					// current surface edits and must NOT be reverted by the stale
+					// source values. Patch paths mirror #collectAbsentLegacyPatches
+					// (top-level keys split on dots; keys inside records are literal
+					// segments and are never split).
+					const sourceSetPatches =
+						settingsJsonRetirementMarkerExists && settingsJsonMigrated !== null
+							? await (async (): Promise<AtomicYamlPatch[]> => {
+									const currentSha =
+										settingsJsonRaw !== null
+											? nodeCrypto.createHash("sha256").update(settingsJsonRaw).digest("hex")
+											: null;
+									// A PROVEN post-marker source edit: the source hash
+									// differs from the INTERRUPTED run's recorded revision
+									// (the marker's entry-time sha). An unchanged source
+									// means the target holds the user's current surface
+									// edits and must NOT be reverted by the stale source
+									// values.
+									if (
+										settingsJsonMarkerShaAtEntry === null ||
+										currentSha === null ||
+										currentSha === settingsJsonMarkerShaAtEntry
+									) {
+										return [];
+									}
+									return this.#collectSourceOverwritePatches(settingsJsonMigrated);
+								})()
+							: [];
+					const allPatches = [...sourceSetPatches, ...patches];
+					if (allPatches.length > 0) {
+						await tx.applyPatches(allPatches);
 					}
 					return true;
 				});
@@ -1929,26 +2073,23 @@ export class Settings implements NotificationSettingsReader {
 			let publicationProof = false;
 			if (currentRaw !== null) {
 				try {
-					const sourceRoot = JSON.parse(currentRaw) as Record<string, unknown> | null;
 					const targetRaw = await Bun.file(this.#configPath)
 						.text()
 						.catch(() => "");
 					const targetRoot = (YAML.parse(targetRaw) ?? {}) as Record<string, unknown> | null;
-					const sourceWorkflowKeys =
-						sourceRoot !== null && typeof sourceRoot === "object" && !Array.isArray(sourceRoot)
-							? (CONFIG_ROOT_WORKFLOW_MIGRATION_KEYS as readonly string[]).filter(
-									key =>
-										// The legacy source stores FLAT dotted keys
-										// ("gjc.ralplan.maxIterations"), while the target config.yml
-										// uses the nested form; accept both so an empty key set can
-										// never make the publication proof vacuously true.
-										key in sourceRoot || hasPathValue(sourceRoot, key),
-								)
-							: [];
+					// Verify EVERY migrated path, not just the workflow keys: the
+					// agent-dir migration merges the entire #migrateRawSettings
+					// result (non-workflow settings included) through
+					// #collectAbsentLegacyPatches, so recovery must prove every
+					// post-migration path (including renamed paths) exists in the
+					// target before retiring the source. The merged `settings`
+					// holds the same paths the publication wrote.
+					const migratedPaths = flattenObjectPaths(settings);
 					publicationProof =
 						targetRoot !== null &&
 						typeof targetRoot === "object" &&
-						sourceWorkflowKeys.every(key => hasPathValue(targetRoot, key));
+						migratedPaths.length > 0 &&
+						migratedPaths.every(path => hasPathValue(targetRoot, path));
 				} catch {
 					publicationProof = false;
 				}
@@ -1960,10 +2101,21 @@ export class Settings implements NotificationSettingsReader {
 				nodeCrypto.createHash("sha256").update(currentRaw).digest("hex") === expectedSha &&
 				publicationProof
 			) {
-				try {
-					fs.renameSync(settingsJsonPath, `${settingsJsonPath}.bak`);
-					retired = true;
-				} catch {}
+				// Identity-guard the rename: only move the exact inode whose bytes
+				// were validated (captured from the same descriptor as the read). A
+				// replacement at any point after the validated read must stay active
+				// (its newer settings are re-migrated by the next load via the
+				// marker gate).
+				const currentIno = await fs.promises
+					.lstat(settingsJsonPath)
+					.then(stat => stat.ino)
+					.catch(() => null);
+				if (settingsJsonIno !== null && settingsJsonIno === currentIno) {
+					try {
+						fs.renameSync(settingsJsonPath, `${settingsJsonPath}.bak`);
+						retired = true;
+					} catch {}
+				}
 			}
 			// The pending-retirement marker is consumed ONLY after a successful
 			// retirement: a failed rename (Windows sharing violation, permissions)

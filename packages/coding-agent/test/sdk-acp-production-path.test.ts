@@ -261,6 +261,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const promptInputs: Record<string, unknown>[] = [];
 	const skillInputs: Record<string, unknown>[] = [];
 	const controlOperations: string[] = [];
+	const abortFrames: Record<string, unknown>[] = [];
 	const updates: SessionNotification[] = [];
 	const providerRegistrations: Array<Record<string, unknown>> = [];
 	let closeSessionTransport: (() => void) | undefined;
@@ -507,6 +508,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 				}
 				if (frame.type === "control_request") {
 					if (typeof frame.operation === "string") controlOperations.push(frame.operation);
+					if (frame.operation === "turn.abort") abortFrames.push(frame);
 					if (frame.operation === "model.profile.set") {
 						const input = frame.input as Record<string, unknown>;
 						if (input.id === "needs-auth") {
@@ -587,7 +589,20 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 									: frame.operation === "skill.invoke"
 										? { commandId: "skill-command", turnId: "skill-turn", accepted: true }
 										: frame.operation === "turn.abort"
-											? { aborted: abortAcknowledged }
+											? abortAcknowledged
+												? (() => {
+														const scope =
+															(frame.input as { scope?: string })?.scope === "turn" ? "turn" : "owned";
+														return {
+															ok: true,
+															selection: scope,
+															turn: "stopped",
+															ownedWork: scope === "owned" ? "stopped" : "left_running",
+															automaticDelivery: scope === "owned" ? "none" : "enabled",
+															resumeOnOwnedCompletion: scope !== "owned",
+														};
+													})()
+												: { aborted: false }
 											: {},
 						}),
 					);
@@ -1021,6 +1036,14 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	await waitFor(() => promptInputs.length === 2, "second prompt delivery");
 	await bounded(agent.cancel({ sessionId: created.sessionId }), "cancel acknowledgement");
 	expect(controlOperations).toContain("turn.abort");
+	// A client cancel is a C04 terminal abort with scope "owned": ending the turn
+	// also stops exact owned subagents and background tasks. Each cancel carries a
+	// fresh bounded idempotency key for deterministic replay.
+	expect(abortFrames.at(-1)).toMatchObject({
+		operation: "turn.abort",
+		input: { mode: "terminal", scope: "owned" },
+		idempotencyKey: expect.any(String),
+	});
 	await Bun.sleep(20);
 	expect(cancelledSettled).toBe(false);
 	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "busy" }));
@@ -1044,6 +1067,17 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 			return payload.sessionUpdate === "agent_message_chunk" && /failed/i.test(payload.content?.text ?? "");
 		}),
 	).toHaveLength(0);
+	// `_meta.gjc.abortScope: "turn"` opts out of owned termination: the turn still
+	// aborts, but exact owned subagents and background tasks keep running.
+	await bounded(
+		agent.cancel({ sessionId: created.sessionId, _meta: { gjc: { abortScope: "turn" } } }),
+		"turn-scope cancel acknowledgement",
+	);
+	expect(abortFrames.at(-1)).toMatchObject({
+		operation: "turn.abort",
+		input: { mode: "terminal", scope: "turn" },
+		idempotencyKey: expect.any(String),
+	});
 	const abortFailurePrompt = agent.prompt({
 		sessionId: created.sessionId,
 		prompt: [{ type: "text", text: "abort failure" }],

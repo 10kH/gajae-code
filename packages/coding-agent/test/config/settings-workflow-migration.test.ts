@@ -2619,9 +2619,13 @@ describe("project workflow settings migration", () => {
 		// The marker is readable for the initial read; the seam replaces it
 		// with a DIRECTORY before the post-publication re-read.
 		await fs.writeFile(path.join(cwd, ".gjc", "state", "settings.json.migrated-keys"), JSON.stringify([]));
-		// The source holds an INVALID strict key, so the seeded evidence is
-		// current (not stale); an ownership-marker failure must NOT clear it.
-		await fs.writeFile(path.join(cwd, ".gjc", "settings.json"), JSON.stringify({ "gjc.ralplan.autoHandoff": "bad" }));
+		// A VALID key that is actually published (so the post-publication marker
+		// re-read hook is reached) plus an INVALID strict key, whose evidence is
+		// current and must survive the rollback.
+		await fs.writeFile(
+			path.join(cwd, ".gjc", "settings.json"),
+			JSON.stringify({ "gjc.ralplan.maxIterations": 7, "gjc.ralplan.autoHandoff": "bad" }),
+		);
 		await fs.writeFile(
 			path.join(cwd, ".gjc", "state", "settings.json.strict-invalid"),
 			JSON.stringify({ version: 2, keys: [{ key: "gjc.ralplan.autoHandoff", value: "bad" }] }),
@@ -2629,12 +2633,16 @@ describe("project workflow settings migration", () => {
 
 		const result = await runProjectProbe(cwd, {
 			home,
+			expectLoadFailure: true,
 			env: { SETTINGS_MIGRATION_TEST_MARKER_MERGE_DIR: "1" },
 		});
 		// The post-publication marker re-read failed (EISDIR): the committed
-		// values were rolled back exactly like a failed marker write, so
-		// nothing survives in config.yml without durable ownership.
-		expect(result.loadFailed).toBe(false);
+		// values were rolled back exactly like a failed marker write, so the
+		// published valid key does NOT survive in config.yml without durable
+		// ownership. The subsequent project discovery PROPAGATES the still-
+		// unreadable marker (fs error) instead of silently dropping the layer,
+		// so the load fails loudly.
+		expect(result.loadFailed).toBe(true);
 		expect(result.maxIterations).toBeNull();
 		expect(result.configYmlRootType).toBeNull();
 		// The strict-invalid evidence is PRESERVED (cleared only when the
@@ -2671,7 +2679,64 @@ describe("project workflow settings migration", () => {
 		expect(await fs.stat(path.join(agentDir, "settings.json.pending-retirement")).catch(() => null)).toBeNull();
 	});
 
-	test("a changed settings.json is never retired by a stale pending marker", async () => {
+	test("an unchanged pending-retirement source never reverts target edits", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const { agentDir } = await setupHome(home, ".myconfig");
+		await fs.mkdir(agentDir, { recursive: true });
+		// The crash left the marker with the source's exact sha (the source is
+		// UNCHANGED); the user then edited the config.yml surface to 9. The
+		// recovery must NOT replay the stale source value (7) over the target.
+		await fs.writeFile(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxIterations: 9 } } }, null, 2),
+		);
+		const sourceRaw = JSON.stringify({ "gjc.ralplan.maxIterations": 7 });
+		await fs.writeFile(path.join(agentDir, "settings.json"), sourceRaw);
+		await fs.writeFile(
+			path.join(agentDir, "settings.json.pending-retirement"),
+			nodeCrypto.createHash("sha256").update(sourceRaw).digest("hex"),
+		);
+
+		const result = await runProbe(cwd, { home, configDir: ".myconfig" });
+		expect(result.loadFailed).toBe(false);
+		// The target's newer surface edit is preserved (no set-patch replay).
+		const target = YAML.parse(await fs.readFile(path.join(agentDir, "config.yml"), "utf8")) as {
+			gjc?: { ralplan?: { maxIterations?: unknown } };
+		};
+		expect(target.gjc?.ralplan?.maxIterations).toBe(9);
+	});
+
+	test("a literal dotted member survives the pending-retirement recovery", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const { agentDir } = await setupHome(home, ".myconfig");
+		await fs.mkdir(agentDir, { recursive: true });
+		// The source's record has a LITERAL dotted member (custom.role): the
+		// recovery must not fail or garble the target into nested segments.
+		await fs.writeFile(path.join(agentDir, "config.yml"), 'modelTags:\n  "custom.role":\n    name: Old\n');
+		await fs.writeFile(
+			path.join(agentDir, "settings.json"),
+			JSON.stringify({ modelTags: { "custom.role": { name: "New" } } }),
+		);
+		await fs.writeFile(
+			path.join(agentDir, "settings.json.pending-retirement"),
+			nodeCrypto
+				.createHash("sha256")
+				.update(JSON.stringify({ modelTags: { "custom.role": { name: "Old" } } }))
+				.digest("hex"),
+		);
+
+		const result = await runProbe(cwd, { home, configDir: ".myconfig" });
+		expect(result.loadFailed).toBe(false);
+		// The literal member is preserved verbatim (no nested "custom.role"
+		// garble, no failed publication loop).
+		const target = (await fs.readFile(path.join(agentDir, "config.yml"), "utf8")) as string;
+		expect(target).toContain("custom.role");
+		expect(target).not.toContain("custom:\n    role:");
+	});
+
+	test("a changed settings.json is republished and retired by the pending-retirement recovery", async () => {
 		const home = await tempDir();
 		const cwd = await tempDir();
 		const { agentDir } = await setupHome(home, ".myconfig");
@@ -2680,9 +2745,10 @@ describe("project workflow settings migration", () => {
 			path.join(agentDir, "config.yml"),
 			YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2),
 		);
-		// The pending marker records an OLDER revision (sha of different
-		// bytes); the current source holds the user's newer edit and must stay
-		// active.
+		// The pending marker records an OLDER revision; the current source holds
+		// the user's NEWER edit (9). The recovery RE-READS the source and
+		// REPUBLISHES its current values (set patches), so the edit is never
+		// lost to the target's older value; the source is then retired.
 		await fs.writeFile(path.join(agentDir, "settings.json"), JSON.stringify({ "gjc.ralplan.maxIterations": 9 }));
 		await fs.writeFile(
 			path.join(agentDir, "settings.json.pending-retirement"),
@@ -2693,11 +2759,15 @@ describe("project workflow settings migration", () => {
 		);
 
 		const result = await runProbe(cwd, { home, configDir: ".myconfig" });
-		// The retirement is SKIPPED: the user's newer settings are not stranded
-		// in the inactive .bak.
 		expect(result.loadFailed).toBe(false);
-		expect(await fs.stat(path.join(agentDir, "settings.json")).catch(() => null)).not.toBeNull();
-		expect(await fs.stat(path.join(agentDir, "settings.json.bak")).catch(() => null)).toBeNull();
+		// The user's edit was republished into the target.
+		const target = YAML.parse(await fs.readFile(path.join(agentDir, "config.yml"), "utf8")) as {
+			gjc?: { ralplan?: { maxIterations?: unknown } };
+		};
+		expect(target.gjc?.ralplan?.maxIterations).toBe(9);
+		// The source was retired after the successful republication.
+		expect(await fs.stat(path.join(agentDir, "settings.json")).catch(() => null)).toBeNull();
+		expect(await fs.stat(path.join(agentDir, "settings.json.bak")).catch(() => null)).not.toBeNull();
 	});
 
 	test("a marker without publication proof never retires the source", async () => {
@@ -2705,11 +2775,13 @@ describe("project workflow settings migration", () => {
 		const cwd = await tempDir();
 		const { agentDir } = await setupHome(home, ".myconfig");
 		await fs.mkdir(agentDir, { recursive: true });
-		const sourceRaw = JSON.stringify({ "gjc.ralplan.maxIterations": 7 });
-		// The target exists but does NOT contain the source's workflow key (the
-		// publication was skipped or conflicted after the marker was persisted):
-		// the marker alone is not proof, so the source must not be retired.
-		await fs.writeFile(path.join(agentDir, "config.yml"), YAML.stringify({ theme: { dark: "red" } }, null, 2));
+		const sourceRaw = JSON.stringify({ theme: { dark: "red-claw" } });
+		// The source holds ONLY a non-workflow setting: the publication proof
+		// must verify the migrated path itself (an empty workflow-key filter
+		// would make the proof vacuously true and retire the source even though
+		// the value was never published). The future-schema target skips the
+		// publication entirely.
+		await fs.writeFile(path.join(agentDir, "config.yml"), YAML.stringify({ configSchemaVersion: 9999 }, null, 2));
 		await fs.writeFile(path.join(agentDir, "settings.json"), sourceRaw);
 		await fs.writeFile(
 			path.join(agentDir, "settings.json.pending-retirement"),
@@ -2718,6 +2790,7 @@ describe("project workflow settings migration", () => {
 
 		const result = await runProbe(cwd, { home, configDir: ".myconfig" });
 		expect(result.loadFailed).toBe(false);
+		// No publication proof: the source stays active for a future load.
 		expect(await fs.stat(path.join(agentDir, "settings.json")).catch(() => null)).not.toBeNull();
 		expect(await fs.stat(path.join(agentDir, "settings.json.bak")).catch(() => null)).toBeNull();
 	});
