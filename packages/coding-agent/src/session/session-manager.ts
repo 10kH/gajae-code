@@ -14689,9 +14689,14 @@ export class SessionManager {
 		this.#clearBoundedManagedSource();
 	}
 
-	#discardRejectedOpenState(): void {
-		this.#persistWriter = undefined;
-		this.#persistWriterPath = undefined;
+	async #discardRejectedOpenState(): Promise<void> {
+		for (let attempt = 0; this.#persistWriter && attempt < 2; attempt++) {
+			try {
+				await this.#closePersistWriterInternal();
+			} catch (error) {
+				logger.warn("Rejected open persist writer close failed", { error: toError(error).message });
+			}
+		}
 		this.#releaseResidentTextStore();
 		if (this.#preparedNewSessions.size === 0) this.#releaseOwnedManagedAuthority();
 		this.#releaseClosedSessionState();
@@ -18399,7 +18404,7 @@ export class SessionManager {
 					}
 				}
 				manager.#sidecarRuntime = undefined;
-				manager.#discardRejectedOpenState();
+				await manager.#discardRejectedOpenState();
 				throw error;
 			}
 		}
@@ -18478,7 +18483,7 @@ export class SessionManager {
 					}
 				}
 				manager.#sidecarRuntime = undefined;
-				manager.#discardRejectedOpenState();
+				await manager.#discardRejectedOpenState();
 				throw error;
 			} finally {
 				managedInspectionStore?.close();
