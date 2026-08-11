@@ -2621,6 +2621,8 @@ function sdkControlSurface(
 		let accepting = false;
 		let accepted = false;
 		let submission: Promise<void> | undefined;
+		const submissionSettled = Promise.withResolvers<void>();
+		let cancellation: Promise<void> | undefined;
 		const correlation = { commandId, turnId };
 		const key = preflightKey(requesterConnectionId, correlation);
 		const settlePreflight = (result: PreflightTerminalResult) => {
@@ -2628,14 +2630,20 @@ function sdkControlSurface(
 			preflightSettled = true;
 			preflight.resolve(result);
 		};
-		const cancelPreflight = async () => {
+		// This is retained by the accepted durable record. It settles only this
+		// submission; terminal authority remains with the pending cancellation owner.
+		const settleSubmission = async () => {
 			preflightController.abort();
-			if (!accepting) settlePreflight({ status: "rejected", error: cancellationError });
-			try {
-				await submission;
-			} catch (error) {
-				if (accepted && error !== cancellationError) throw error;
-			}
+			await submissionSettled.promise;
+		};
+		const cancelPreflight = () => {
+			cancellation ??= (async () => {
+				preflightController.abort();
+				if (!accepting) settlePreflight({ status: "rejected", error: cancellationError });
+				const ownedCancellation = await abortOwnedPrompt(requesterConnectionId);
+				if (ownedCancellation.disposition === "idle") await settleSubmission();
+			})();
+			return cancellation;
 		};
 		pendingPreflightCancellations.set(key, {
 			connectionId: requesterConnectionId,
@@ -2645,7 +2653,13 @@ function sdkControlSurface(
 			if (preflightSettled) return;
 			accepting = true;
 			try {
-				await onPromptAccepted(correlation, requesterConnectionId, trimmedClientRef, trackReconciliation);
+				await onPromptAccepted(
+					correlation,
+					requesterConnectionId,
+					trimmedClientRef,
+					trackReconciliation,
+					settleSubmission,
+				);
 			} catch (error) {
 				accepting = false;
 				// Durable acceptance failed, so the prompt was never accepted: reject the
@@ -2655,13 +2669,10 @@ function sdkControlSurface(
 				throw error;
 			}
 			accepting = false;
-			pendingPreflightCancellations.delete(key);
 			accepted = true;
+			pendingPreflightCancellations.delete(key);
 			settlePreflight({ status: "accepted" });
-			if (preflightController.signal.aborted) {
-				await abortOwnedPrompt(requesterConnectionId);
-				throw cancellationError;
-			}
+			if (preflightController.signal.aborted) throw cancellationError;
 		};
 		// Durable fence preferred; keep legacy onPreflightAccepted for hosts/tests that only fire the sync hook.
 		const onPreflightAcceptCommit = settleAccepted;
@@ -2682,7 +2693,8 @@ function sdkControlSurface(
 				}),
 			);
 		} catch (error) {
-			if (accepted) void onPromptFailed(correlation, error);
+			submissionSettled.resolve();
+			if (accepted && !preflightController.signal.aborted) void onPromptFailed(correlation, error);
 			else settlePreflight({ status: "rejected", error });
 		}
 		if (submission) {
@@ -2695,10 +2707,12 @@ function sdkControlSurface(
 								code: "busy",
 							}),
 						});
+					submissionSettled.resolve();
 				},
 				error => {
-					if (accepted) void onPromptFailed(correlation, error);
+					if (accepted && !preflightController.signal.aborted) void onPromptFailed(correlation, error);
 					else settlePreflight({ status: "rejected", error });
+					submissionSettled.resolve();
 				},
 			);
 		}
@@ -2951,14 +2965,28 @@ function sdkControlSurface(
 				reject(error);
 			};
 			const executionSettled = Promise.withResolvers<void>();
+			let cancellation: Promise<void> | undefined;
 			const key = preflightKey(requesterConnectionId, correlation);
-			const cancelPreflight = async () => {
+			// This is retained by the accepted durable record. It settles only this
+			// invocation; terminal authority remains with the pending cancellation owner.
+			const settleRun = async () => {
 				preflightController.abort();
-				if (phase === "pending") {
-					releaseAdmission();
-					settleReject(cancellationError);
-				}
 				await executionSettled.promise;
+			};
+			const cancelPreflight = () => {
+				cancellation ??= (async () => {
+					preflightController.abort();
+					if (phase === "pending") {
+						releaseAdmission();
+						settleReject(cancellationError);
+					}
+					const ownedCancellation = await abortOwnedPrompt(requesterConnectionId);
+					if (ownedCancellation.disposition === "idle") {
+						await settleRun();
+						if (durableSkillAccepted && skillRecon) await skillRecon.cancel(correlation);
+					}
+				})();
+				return cancellation;
 			};
 			pendingPreflightCancellations.set(key, {
 				connectionId: requesterConnectionId,
@@ -2993,46 +3021,23 @@ function sdkControlSurface(
 									requesterConnectionId,
 									undefined,
 									false,
-									cancelPreflight,
+									settleRun,
 									"skill",
 								);
 								promptOwned = requesterConnectionId !== undefined;
-							} catch (error) {
-								onPromptAcceptFailed(correlation);
-								releaseAdmission();
-								settleReject(error);
-								throw error;
-							}
-							if (preflightController.signal.aborted) {
-								pendingPreflightCancellations.delete(key);
-								onPromptAcceptFailed(correlation);
-								promptOwned = false;
-								releaseAdmission();
-								settleReject(cancellationError);
-								throw cancellationError;
-							}
-							try {
 								if (skillRecon) {
 									await skillRecon.noteAccepted(correlation, trimmedClientRef, { skillName: meta.name });
 									durableSkillAccepted = true;
 								}
 							} catch (error) {
-								pendingPreflightCancellations.delete(key);
 								onPromptAcceptFailed(correlation);
-								promptOwned = false;
 								releaseAdmission();
 								settleReject(error);
 								throw error;
 							}
 							pendingPreflightCancellations.delete(key);
 							settleAccept(acceptedValue);
-							if (preflightController.signal.aborted) {
-								await Promise.all([
-									abortOwnedPrompt(requesterConnectionId),
-									...(skillRecon && durableSkillAccepted ? [skillRecon.cancel(correlation)] : []),
-								]);
-								throw cancellationError;
-							}
+							if (preflightController.signal.aborted) throw cancellationError;
 						},
 					}),
 				);
@@ -3066,10 +3071,10 @@ function sdkControlSurface(
 					if (phase === "pending" || phase === "accepting") {
 						releaseAdmission();
 						settleReject(error);
-					} else if (phase === "accepted" && promptOwned) {
+					} else if (phase === "accepted" && promptOwned && !preflightController.signal.aborted) {
 						void onPromptFailed(correlation, error);
 					}
-					if (!promptOwned && durableSkillAccepted && skillRecon)
+					if (!promptOwned && durableSkillAccepted && skillRecon && !preflightController.signal.aborted)
 						void skillRecon.noteTransition(correlation, { type: "agent_failed", error });
 					executionSettled.resolve();
 				},
