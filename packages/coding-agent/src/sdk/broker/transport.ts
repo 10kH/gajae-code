@@ -153,12 +153,7 @@ export class BrokerTransport {
 			return;
 		}
 		try {
-			const result = await this.#broker.handleRequest(
-				frame.operation,
-				frame.input,
-				frame.idempotencyKey,
-				frame.elevationRequestId,
-			);
+			const result = await this.#broker.handleRequest(frame.operation, frame.input, frame.idempotencyKey);
 			send(socket, { type: "broker_response", id: frame.id, ...result });
 		} catch {
 			sendError(socket, frame.id, "unavailable", "broker request failed");

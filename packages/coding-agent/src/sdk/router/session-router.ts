@@ -341,6 +341,9 @@ export class SessionRouter {
 			endpointMtimeMs,
 			live: true,
 			indexSeq: 0,
+			identityProvenance: "legacy",
+			ambiguous: false,
+			terminal: false,
 		};
 		const endpoint: SdkSessionEndpoint = {
 			sessionId,
