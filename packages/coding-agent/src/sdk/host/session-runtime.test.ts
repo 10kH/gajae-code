@@ -239,6 +239,7 @@ describe("SessionSdkSessionRuntime", () => {
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
 		let activeHandle: string | undefined = "exact-run-handle";
 		let activeEpoch: number | undefined = 7;
+		let captureCalls = 0;
 		createSdkSessionRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
@@ -248,6 +249,9 @@ describe("SessionSdkSessionRuntime", () => {
 				getActivePromptHandle: () => activeHandle,
 				getActivePromptOwnerConnectionId: () => "client",
 				cancelPendingPreflightForTerminalAbort: () => {},
+				captureTerminalAbortSteeringSnapshot: () => {
+					captureCalls += 1;
+				},
 				abortPromptAndWaitWithTerminal: async (handle, options) => {
 					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
 					return { status: "settled", terminalScope: {} };
@@ -273,6 +277,10 @@ describe("SessionSdkSessionRuntime", () => {
 			} as SdkFrame;
 			transport.feed("client", request);
 			await waitForFrame("terminal-abort-1");
+			// The steering snapshot seam is captured at ADMISSION (before the
+			// durable transaction and settlement) — mirrors the production
+			// wiring in session.ts (review thread P1).
+			expect(captureCalls).toBeGreaterThanOrEqual(1);
 			expect(seamCalls).toEqual([{ handle: "exact-run-handle", scope: "turn" }]);
 			expect(transport.sent).toEqual(
 				expect.arrayContaining([
@@ -379,6 +387,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionId: transport.sessionId,
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
+		let captureCalls = 0;
 		createSdkSessionRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
@@ -387,6 +396,9 @@ describe("SessionSdkSessionRuntime", () => {
 				getTerminalTurnEpoch: () => 7,
 				getActivePromptHandle: () => "exact-run-handle",
 				cancelPendingPreflightForTerminalAbort: () => {},
+				captureTerminalAbortSteeringSnapshot: () => {
+					captureCalls += 1;
+				},
 				abortPromptAndWaitWithTerminal: async (handle, options) => {
 					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
 					return { status: "settled", terminalScope: {} };
@@ -466,6 +478,7 @@ describe("SessionSdkSessionRuntime", () => {
 		// prompt then wins the race and every later read sees it active —
 		// exactly the window where writeNoEffect awaits the store.
 		let promptReads = 0;
+		let captureCalls = 0;
 		createSdkSessionRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
@@ -475,6 +488,9 @@ describe("SessionSdkSessionRuntime", () => {
 				getActivePromptHandle: () => (promptReads === 0 ? undefined : "won-race-handle"),
 				getActivePromptOwnerConnectionId: () => "client",
 				cancelPendingPreflightForTerminalAbort: () => {},
+				captureTerminalAbortSteeringSnapshot: () => {
+					captureCalls += 1;
+				},
 				abortPromptAndWaitWithTerminal: async (handle, options) => {
 					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
 					return {
@@ -552,6 +568,7 @@ describe("SessionSdkSessionRuntime", () => {
 		// durable reservation that blocks B's own running prompt forever
 		// (review thread P1).
 		let reads = 0;
+		let captureCalls = 0;
 		createSdkSessionRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
@@ -564,6 +581,9 @@ describe("SessionSdkSessionRuntime", () => {
 				getTerminalTurnEpoch: () => (reads === 1 ? 1 : 2),
 				getActivePromptOwnerConnectionId: () => (reads === 1 ? "conn-a" : "conn-b"),
 				cancelPendingPreflightForTerminalAbort: () => {},
+				captureTerminalAbortSteeringSnapshot: () => {
+					captureCalls += 1;
+				},
 				abortPromptAndWaitWithTerminal: async (handle, options) => {
 					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
 					return {
@@ -640,6 +660,7 @@ describe("SessionSdkSessionRuntime", () => {
 			sessionFile: path.join(cwd, "session.json"),
 			sessionId: transport.sessionId,
 		});
+		let captureCalls = 0;
 		createSdkSessionRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
@@ -649,6 +670,9 @@ describe("SessionSdkSessionRuntime", () => {
 				getActivePromptHandle: () => "exact-run-handle",
 				getActivePromptOwnerConnectionId: () => "client",
 				cancelPendingPreflightForTerminalAbort: () => {},
+				captureTerminalAbortSteeringSnapshot: () => {
+					captureCalls += 1;
+				},
 				abortPromptAndWaitWithTerminal: async (_handle, _options) => {
 					// The aborted run's loop exit publishes the correlated
 					// agent_end lifecycle event before settlement returns.
@@ -702,6 +726,7 @@ describe("SessionSdkSessionRuntime", () => {
 		});
 		const seamCalls: Array<{ handle: string; scope: string }> = [];
 		let seamCount = 0;
+		let captureCalls = 0;
 		createSdkSessionRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
@@ -711,6 +736,9 @@ describe("SessionSdkSessionRuntime", () => {
 				getActivePromptHandle: () => "exact-run-handle",
 				getActivePromptOwnerConnectionId: () => "client",
 				cancelPendingPreflightForTerminalAbort: () => {},
+				captureTerminalAbortSteeringSnapshot: () => {
+					captureCalls += 1;
+				},
 				abortPromptAndWaitWithTerminal: async (handle, options) => {
 					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
 					// The turn emits exactly ONE correlated agent_end no matter how
