@@ -74,6 +74,11 @@ type SlackProviderWork = {
 	settled: Promise<void>;
 };
 
+type SlackRetiredProviderWorkScope = {
+	retirements: number;
+	terminalizations: Set<Promise<void>>;
+};
+
 function slackProviderWorkScopeKey(scope: SlackProviderWorkScope): string {
 	return JSON.stringify([scope.sessionId, scope.endpointGeneration, scope.attachmentAuthorityId]);
 }
@@ -206,7 +211,7 @@ export class SlackNotificationDaemon {
 	readonly #inflightInbound = new Set<string>();
 	readonly #activeWork = new Set<Promise<unknown>>();
 	readonly #workInvalidators = new Set<SlackProviderWork>();
-	readonly #retiredProviderWorkScopes = new Set<string>();
+	readonly #retiredProviderWorkScopes = new Map<string, SlackRetiredProviderWorkScope>();
 	readonly #rollovers = new Map<string, Promise<SlackRootPublication>>();
 	#workGeneration = 0;
 	#lifecycleTail: Promise<void> = Promise.resolve();
@@ -481,17 +486,57 @@ export class SlackNotificationDaemon {
 		this.#workGeneration += 1;
 		await Promise.allSettled([...this.#workInvalidators].map(work => work.invalidate()));
 	}
-	async #invalidateAndDrainProviderWork(scope: SlackProviderWorkScope): Promise<void> {
+	#fenceRetiredProviderWorkScope(scope: SlackProviderWorkScope): string {
 		const scopeKey = slackProviderWorkScopeKey(scope);
-		this.#retiredProviderWorkScopes.add(scopeKey);
-		const deadline = this.#now() + RETIREMENT_DRAIN_MS;
+		const retired = this.#retiredProviderWorkScopes.get(scopeKey);
+		if (retired) retired.retirements++;
+		else this.#retiredProviderWorkScopes.set(scopeKey, { retirements: 1, terminalizations: new Set() });
+		return scopeKey;
+	}
+	#tryReleaseRetiredProviderWorkScope(scopeKey: string): void {
+		const retired = this.#retiredProviderWorkScopes.get(scopeKey);
+		if (
+			!retired ||
+			retired.retirements !== 0 ||
+			retired.terminalizations.size > 0 ||
+			[...this.#workInvalidators].some(work => work.scopeKey === scopeKey)
+		)
+			return;
+		this.#retiredProviderWorkScopes.delete(scopeKey);
+	}
+	#trackRetirementTerminalization(scopeKey: string, terminalization: Promise<void>): void {
+		const retired = this.#retiredProviderWorkScopes.get(scopeKey);
+		if (!retired) return;
+		retired.terminalizations.add(terminalization);
+		void terminalization.then(() => {
+			const current = this.#retiredProviderWorkScopes.get(scopeKey);
+			if (!current) return;
+			current.terminalizations.delete(terminalization);
+			this.#tryReleaseRetiredProviderWorkScope(scopeKey);
+		});
+	}
+	#retirementTerminalization(terminalizations: readonly Promise<unknown>[]): Promise<void> {
+		return Promise.all(
+			terminalizations.map(terminalization =>
+				terminalization.then(
+					() => undefined,
+					error => {
+						logger.warn(`Slack retired attachment terminalization failed: ${String(error)}`);
+					},
+				),
+			),
+		).then(() => undefined);
+	}
+	async #invalidateAndDrainProviderWork(scope: SlackProviderWorkScope, deadline: number): Promise<void> {
+		const scopeKey = this.#fenceRetiredProviderWorkScope(scope);
 		for (;;) {
 			const active = [...this.#workInvalidators].filter(work => work.scopeKey === scopeKey);
 			if (active.length === 0) return;
 			for (const work of active) work.abort();
 			const remaining = deadline - this.#now();
 			if (remaining <= 0) {
-				await Promise.allSettled(active.map(work => work.terminalize()));
+				const terminalization = this.#retirementTerminalization(active.map(work => work.terminalize()));
+				this.#trackRetirementTerminalization(scopeKey, terminalization);
 				logger.warn("Slack attachment provider work exceeded the 5000ms retirement drain; fenced pending effects.");
 				return;
 			}
@@ -502,23 +547,18 @@ export class SlackNotificationDaemon {
 			if (drained) continue;
 			const lingering = [...this.#workInvalidators].filter(work => work.scopeKey === scopeKey);
 			for (const work of lingering) work.abort();
-			await Promise.allSettled(lingering.map(work => work.terminalize()));
+			const terminalization = this.#retirementTerminalization(lingering.map(work => work.terminalize()));
+			this.#trackRetirementTerminalization(scopeKey, terminalization);
 			logger.warn("Slack attachment provider work exceeded the 5000ms retirement drain; fenced pending effects.");
 			return;
 		}
 	}
-
 	#releaseRetiredProviderWorkScope(scope: SlackProviderWorkScope): void {
 		const scopeKey = slackProviderWorkScopeKey(scope);
-		const releaseWhenDrained = (): void => {
-			const active = [...this.#workInvalidators].filter(work => work.scopeKey === scopeKey);
-			if (active.length === 0) {
-				this.#retiredProviderWorkScopes.delete(scopeKey);
-				return;
-			}
-			void Promise.all(active.map(work => work.settled)).then(releaseWhenDrained);
-		};
-		releaseWhenDrained();
+		const retired = this.#retiredProviderWorkScopes.get(scopeKey);
+		if (!retired || retired.retirements === 0) return;
+		retired.retirements--;
+		this.#tryReleaseRetiredProviderWorkScope(scopeKey);
 	}
 
 	#recordProviderLifecycleError(error: unknown): void {
@@ -1031,32 +1071,49 @@ export class SlackNotificationDaemon {
 			endpointGeneration,
 			...(attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId }),
 		};
+		const deadline = this.#now() + RETIREMENT_DRAIN_MS;
+		let releaseScope = false;
 		try {
-			await this.#invalidateAndDrainProviderWork(scope);
-			const current = await this.findSession(sessionId, true);
-			if (
-				!current ||
-				current.record.endpointGeneration !== endpointGeneration ||
-				current.record.attachmentAuthorityId !== attachmentAuthorityId
-			)
-				return;
-			for (const receipt of current.record.inboundDispatches ?? [])
-				await this.#journal.terminalize(receipt.effectId, { status: "stale_binding" });
-			await this.store.transact(current.key, record =>
-				record?.sessionId === sessionId &&
-				record.endpointGeneration === endpointGeneration &&
-				record.attachmentAuthorityId === attachmentAuthorityId
-					? nextRecord(record, {
-							state: "closed_marker",
-							pendingActionId: undefined,
-							cleanupEffectId: undefined,
-							inboundDispatches: [],
-							updatedAt: this.#now(),
-						})
-					: record,
+			const draining = this.#invalidateAndDrainProviderWork(scope, deadline);
+			let inboundDispatches: SlackInboundDispatchReceipt[] = [];
+			// Persist the mapping fence before waiting on terminal effects. A detached
+			// terminalization can then never be replayed through this attachment.
+			await this.store.transact(found.key, record => {
+				if (
+					record?.sessionId !== sessionId ||
+					record.endpointGeneration !== endpointGeneration ||
+					record.attachmentAuthorityId !== attachmentAuthorityId
+				)
+					return record;
+				inboundDispatches = [...(record.inboundDispatches ?? [])];
+				return nextRecord(record, {
+					state: "closed_marker",
+					pendingActionId: undefined,
+					cleanupEffectId: undefined,
+					inboundDispatches: [],
+					updatedAt: this.#now(),
+				});
+			});
+			releaseScope = true;
+			await draining;
+			if (inboundDispatches.length === 0) return;
+			const terminalization = this.#retirementTerminalization(
+				inboundDispatches.map(receipt => this.#journal.terminalize(receipt.effectId, { status: "stale_binding" })),
 			);
+			this.#trackRetirementTerminalization(slackProviderWorkScopeKey(scope), terminalization);
+			const remaining = deadline - this.#now();
+			if (remaining <= 0) {
+				logger.warn("Slack attachment retirement exceeded the 5000ms deadline; fenced pending inbound effects.");
+				return;
+			}
+			const terminalized = await Promise.race([
+				terminalization.then(() => true),
+				Bun.sleep(remaining).then(() => false),
+			]);
+			if (!terminalized)
+				logger.warn("Slack attachment retirement exceeded the 5000ms deadline; fenced pending inbound effects.");
 		} finally {
-			this.#releaseRetiredProviderWorkScope(scope);
+			if (releaseScope) this.#releaseRetiredProviderWorkScope(scope);
 		}
 	}
 
@@ -1641,6 +1698,7 @@ export class SlackNotificationDaemon {
 		} finally {
 			this.#workInvalidators.delete(work);
 			settled.resolve();
+			this.#tryReleaseRetiredProviderWorkScope(scopeKey);
 		}
 	}
 
