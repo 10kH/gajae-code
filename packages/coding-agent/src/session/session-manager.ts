@@ -3174,6 +3174,13 @@ function managedFileSnapshotMatchesDescriptor(snapshot: ManagedFileSnapshot, des
 		snapshot.identity.ctimeNs === descriptor.ctimeNs
 	);
 }
+
+function unrefDelay(ms: number): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const timer = setTimeout(resolve, ms);
+	timer.unref();
+	return promise;
+}
 const trustedSessionDestinations = new WeakSet<SessionDestination>();
 const explicitProfileAgentDirs = new WeakMap<SessionDestination, string>();
 const managedSecurityPolicies = new WeakMap<ManagedSessionSecurityContext, ManagedSessionSecurityPolicy>();
@@ -14698,7 +14705,7 @@ export class SessionManager {
 
 	async #retryRejectedOpenWriterCleanup(): Promise<void> {
 		for (let attempt = 0; this.#persistWriter?.getCloseState() === "close_failed_retryable"; attempt++) {
-			await Bun.sleep(Math.min(100 * 2 ** Math.min(attempt, 6), 5_000));
+			await unrefDelay(Math.min(100 * 2 ** Math.min(attempt, 6), 5_000));
 			try {
 				await this.#closePersistWriterInternal();
 			} catch (error) {
@@ -14706,11 +14713,11 @@ export class SessionManager {
 			}
 		}
 		const state = this.#persistWriter?.getCloseState();
-		if (state === "close_unknown") {
+		if (state === "closed" || state === "close_unknown") {
 			this.#persistWriter = undefined;
 			this.#persistWriterPath = undefined;
 		}
-		if (!this.#persistWriter || state === "close_unknown") {
+		if (!this.#persistWriter) {
 			this.#releaseRejectedOpenResources();
 			SessionManager.#rejectedOpenCleanupOwners.delete(this);
 		}
