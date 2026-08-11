@@ -531,7 +531,7 @@ function topicArchiveSettled(response: unknown): boolean {
 	if (result.ok === true && result.result === true) return true;
 	if (result.ok !== false || result.error_code !== 400 || typeof result.description !== "string") return false;
 	const description = result.description.trim();
-	return /^(?:Bad Request: )?(?:TOPIC_NOT_FOUND|THREAD_NOT_FOUND|topic (?:already|is already) closed|message thread (?:not found|is not modified))$/i.test(
+	return /^(?:Bad Request: )?(?:TOPIC_NOT_FOUND|THREAD_NOT_FOUND|the chat is not a (?:supergroup )?forum|topic (?:already|is already) closed|message thread (?:not found|is not modified))$/i.test(
 		description,
 	);
 }
@@ -4818,6 +4818,8 @@ interface SessionSocket {
 	pingTimer: ReturnType<typeof setInterval> | undefined;
 	/** Correlation id for the startup replay barrier. */
 	replayId: string;
+	/** Sequence cursor sent by the current startup replay request. */
+	replaySinceSeq: number;
 	/** Queues live frames until startup replay is applied. */
 	replayPending: boolean;
 	replayQueue: Record<string, unknown>[];
@@ -6228,8 +6230,12 @@ export class TelegramNotificationDaemon {
 					const endpointKey = endpointGenerationKey(endpoint.url, endpoint.token);
 					const connected = this.sessions.get(sessionId);
 					if (connected) {
+						const recoveryRejectedAfterArchive =
+							connected.recoveryLease?.state === "rejected" &&
+							this.topics.get(sessionId)?.authorityState === "inactive";
 						if (
 							connected.endpointKey !== endpointKey ||
+							recoveryRejectedAfterArchive ||
 							(connected.ws.readyState === WebSocket.CONNECTING &&
 								this.runtime.now() - connected.connectingSince >= CONNECTING_RECONNECT_MS)
 						)
@@ -6319,6 +6325,7 @@ export class TelegramNotificationDaemon {
 			awaitingNonce: undefined,
 			pingTimer: undefined,
 			replayId: `telegram-startup-replay:${sessionId}`,
+			replaySinceSeq: 0,
 			replayPending: false,
 			replayQueue: [],
 		};
@@ -6337,6 +6344,7 @@ export class TelegramNotificationDaemon {
 			const persistedTopic = this.topics.get(sessionId);
 			const replayCursor =
 				persistedTopic?.endpointDigest === session.endpointDigest ? this.topics.replayCursor(sessionId) : undefined;
+			session.replaySinceSeq = replayCursor?.seq ?? 0;
 			if (session.ws.readyState === WebSocket.OPEN) {
 				try {
 					session.ws.send(
@@ -10001,7 +10009,6 @@ export class TelegramNotificationDaemon {
 				msg.generation >= 1 &&
 				Number.isSafeInteger(msg.lastSeq) &&
 				msg.lastSeq >= 0 &&
-				msg.gap === undefined &&
 				Array.isArray(msg.events) &&
 				msg.events.every((event: unknown) => event !== null && typeof event === "object" && !Array.isArray(event));
 			const replayed: Record<string, unknown>[] = replayValid
@@ -10020,7 +10027,34 @@ export class TelegramNotificationDaemon {
 				frame => typeof frame.sessionId !== "string" || !frame.sessionId.trim(),
 			);
 			const identityConflict = new Set(identities).size > 1;
-			if (!replayValid || malformedIdentity || identityConflict) {
+			const retainedAtOrBelowGap =
+				msg.gap !== null &&
+				typeof msg.gap === "object" &&
+				!Array.isArray(msg.gap) &&
+				Number.isSafeInteger(msg.gap.toSeq) &&
+				Array.isArray(msg.events) &&
+				(msg.events as Record<string, unknown>[]).some(
+					event =>
+						Number.isSafeInteger(event.seq) &&
+						(event.seq as number) >= 1 &&
+						(event.seq as number) <= msg.gap.toSeq,
+				);
+			const sequenceGapWithIdentityProof =
+				msg.gap !== null &&
+				typeof msg.gap === "object" &&
+				!Array.isArray(msg.gap) &&
+				msg.gap.kind === "sequence_gap" &&
+				Number.isSafeInteger(msg.gap.fromSeq) &&
+				Number.isSafeInteger(msg.gap.toSeq) &&
+				msg.gap.fromSeq === session.replaySinceSeq + 1 &&
+				msg.gap.fromSeq <= msg.gap.toSeq &&
+				msg.gap.toSeq <= msg.lastSeq &&
+				!retainedAtOrBelowGap &&
+				Array.isArray(msg.gap.resyncQueries) &&
+				msg.gap.resyncQueries.every((query: unknown) => typeof query === "string") &&
+				identityFrames.length > 0;
+			const gapAllowsRecovery = msg.gap === undefined || sequenceGapWithIdentityProof;
+			if (!replayValid || !gapAllowsRecovery || malformedIdentity || identityConflict) {
 				// A replay result is the admission proof. Never clear its barrier or drain
 				// queued frames after malformed/conflicting proof; the socket cannot fall
 				// back to transport-local config rekeying.
@@ -10062,6 +10096,17 @@ export class TelegramNotificationDaemon {
 			);
 			if (this.sessions.get(session.sessionId) !== session) return;
 			if (!recovered) {
+				const authorityState = this.topics.get(replayCandidateSessionId)?.authorityState;
+				if (
+					replayCandidateSessionId === session.sessionId &&
+					(authorityState === "archive_pending" || authorityState === "archive_exhausted")
+				) {
+					// The old topic remains fenced, but the authenticated live transport
+					// must stay attached while archive reconciliation retries.
+					session.replayQueue = [];
+					session.replayPending = false;
+					return;
+				}
 				if (session.hostGeneration === msg.generation && session.recoveryLease?.state !== "pending")
 					this.dropSession(session, "recovery_rejected");
 				return;
