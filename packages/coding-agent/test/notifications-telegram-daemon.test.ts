@@ -9794,116 +9794,146 @@ describe("telegram daemon", () => {
 		}
 	});
 	test("a throwing run-loop heartbeat renewal is contained and the daemon keeps serving (#4200)", async () => {
-		const agentDir = tempAgentDir();
-		const s = setPrivateAgentDir(settings(agentDir), agentDir);
-		const paths = daemonPaths(agentDir);
-		const now = 0;
-		await acquireDaemonOwnership({
-			settings: s,
-			tokenFingerprint: tokenFingerprint("tok"),
-			chatId: "42",
-			pid: process.pid,
-			now: () => now,
-			randomId: () => "owner",
-		});
-
-		const timers = new Map<number, { ms: number; callback: () => void }>();
-		let nextTimerId = 1;
-		let pollCount = 0;
-		let releasePoll!: () => void;
-		const pollGate = new Promise<void>(resolve => {
-			releasePoll = resolve;
-		});
-
-		// Simulate a transient Windows EPERM on the ownership-state read: the
-		// renewal throws instead of returning publish_failed, and the run loop's
-		// containment must keep the daemon alive and serving.
-		let throwStateRead = false;
-		const flakyFs: TelegramDaemonFs = {
-			...(fs.promises as unknown as TelegramDaemonFs),
-			...transitionFsCapabilities(),
-			readFile: async (file, encoding) => {
-				if (throwStateRead && String(file) === paths.state) {
-					const error = new Error("EPERM: operation not permitted, read") as NodeJS.ErrnoException;
-					error.code = "EPERM";
-					throw error;
-				}
-				return await fs.promises.readFile(file as string, encoding as BufferEncoding);
-			},
-		};
-
-		const warn = spyOn(logger, "warn").mockImplementation(() => {});
-		const escaped: unknown[] = [];
-		const onEscape = (reason: unknown): void => void escaped.push(reason);
-		process.on("unhandledRejection", onEscape);
-		try {
-			const daemon = new TelegramNotificationDaemon({
+		const runScenario = async (throwPath: "state" | "lock"): Promise<void> => {
+			const agentDir = tempAgentDir();
+			const s = setPrivateAgentDir(settings(agentDir), agentDir);
+			const paths = daemonPaths(agentDir);
+			const now = 0;
+			await acquireDaemonOwnership({
 				settings: s,
-				ownerId: "owner",
-				botToken: "tok",
+				tokenFingerprint: tokenFingerprint("tok"),
 				chatId: "42",
-				fs: flakyFs,
+				pid: process.pid,
 				now: () => now,
-				idleTimeoutMs: 60_000,
-				createLifecycleControlServer: null,
-				botApi: {
-					async call(method: string): Promise<unknown> {
-						if (method === "getUpdates") {
-							pollCount += 1;
-							if (pollCount > 1) return { ok: true, result: [] };
-							await pollGate;
-						}
-						return { ok: true, result: [] };
-					},
-				},
-				setIntervalImpl: ((callback: () => void, ms: number) => {
-					const id = nextTimerId++;
-					timers.set(id, { ms, callback });
-					return id as unknown as ReturnType<typeof setInterval>;
-				}) as typeof setInterval,
-				clearIntervalImpl: ((id: number) => {
-					timers.delete(id);
-				}) as unknown as typeof clearInterval,
+				randomId: () => "owner",
 			});
 
-			const runPromise = daemon.run();
-			await Bun.sleep(200); // let the daemon reach the first gated poll
+			const timers = new Map<number, { ms: number; callback: () => void }>();
+			let nextTimerId = 1;
+			let pollCount = 0;
+			const pollGate = Promise.withResolvers<void>();
+			const firstPollEntered = Promise.withResolvers<void>();
+			const thirdPollEntered = Promise.withResolvers<void>();
+			const thirdPollParked = Promise.withResolvers<void>();
 
-			// Arm the state-read EPERM and release the poll: the loop re-enters its
-			// top, the renewal throws, and the containment must log + continue.
-			throwStateRead = true;
-			releasePoll();
-			for (let attempts = 0; attempts < 100; attempts++) {
-				if (warn.mock.calls.some(call => String(call[0]).includes("ownership heartbeat renewal threw"))) break;
-				await Bun.sleep(10);
-			}
-			expect(warn.mock.calls.some(call => String(call[0]).includes("ownership heartbeat renewal threw"))).toBe(true);
-			expect((daemon as unknown as { running: boolean }).running).toBe(true);
-			expect(escaped).toEqual([]);
+			// Simulate a transient Windows EPERM on the ownership-state or
+			// ownership-lock read: the renewal throws instead of returning
+			// publish_failed, and the run loop's containment must keep the daemon
+			// alive and serving.
+			let armedRead = false;
+			const failingPath = throwPath === "state" ? paths.state : paths.lock;
+			const flakyFs: TelegramDaemonFs = {
+				...(fs.promises as unknown as TelegramDaemonFs),
+				...transitionFsCapabilities(),
+				readFile: async (file, encoding) => {
+					if (armedRead && String(file) === failingPath) {
+						const error = new Error("EPERM: operation not permitted, read") as NodeJS.ErrnoException;
+						error.code = "EPERM";
+						throw error;
+					}
+					return await fs.promises.readFile(file as string, encoding as BufferEncoding);
+				},
+			};
 
-			// The transient condition clears and the daemon is still serving.
-			throwStateRead = false;
-			expect((daemon as unknown as { running: boolean }).running).toBe(true);
-			expect(escaped).toEqual([]);
+			const warn = spyOn(logger, "warn").mockImplementation(() => {});
+			const escaped: unknown[] = [];
+			const onEscape = (reason: unknown): void => void escaped.push(reason);
+			process.on("unhandledRejection", onEscape);
+			try {
+				const daemon = new TelegramNotificationDaemon({
+					settings: s,
+					ownerId: "owner",
+					botToken: "tok",
+					chatId: "42",
+					fs: flakyFs,
+					now: () => now,
+					idleTimeoutMs: 60_000,
+					createLifecycleControlServer: null,
+					botApi: {
+						async call(method: string): Promise<unknown> {
+							if (method === "getUpdates") {
+								pollCount += 1;
+								if (pollCount === 1) {
+									// Synchronize on the first gated poll instead of sleeping: on
+									// a slow or loaded runner daemon startup can outlast any fixed
+									// delay, which would arm the read failure on the startup path
+									// rather than the steady-state renewal under test.
+									firstPollEntered.resolve();
+									await pollGate.promise;
+								} else if (pollCount === 3) {
+									thirdPollEntered.resolve();
+									// Park the loop between renewals so the staging-file assertion
+									// below cannot race an in-flight renewal.
+									await thirdPollParked.promise;
+								}
+							}
+							return { ok: true, result: [] };
+						},
+					},
+					setIntervalImpl: ((callback: () => void, ms: number) => {
+						const id = nextTimerId++;
+						timers.set(id, { ms, callback });
+						return id as unknown as NodeJS.Timeout;
+					}) as typeof setInterval,
+					clearIntervalImpl: ((id: number) => {
+						timers.delete(id);
+					}) as unknown as typeof clearInterval,
+				});
 
-			daemon.requestStop();
-			await runPromise;
-			expect(timers.size).toBe(0);
-			if (fs.existsSync(paths.lock)) {
-				expect(
-					warn.mock.calls.some(
-						call =>
-							String(call[0]).includes("shutdown was not durably quiesced") ||
-							String(call[0]).includes("heartbeat join timed out"),
-					),
-				).toBe(true);
-			} else {
+				const runPromise = daemon.run();
+				// The daemon is now inside its first gated getUpdates; the startup
+				// renewal already completed unarmed.
+				await firstPollEntered.promise;
+
+				// Arm the read EPERM and release the poll: the loop re-enters its
+				// top, the renewal throws, and the containment must log + continue.
+				armedRead = true;
+				pollGate.resolve();
+				for (let attempts = 0; attempts < 100; attempts++) {
+					if (warn.mock.calls.some(call => String(call[0]).includes("ownership heartbeat renewal threw"))) break;
+					await Bun.sleep(10);
+				}
+				expect(warn.mock.calls.some(call => String(call[0]).includes("ownership heartbeat renewal threw"))).toBe(
+					true,
+				);
+				expect((daemon as unknown as { running: boolean }).running).toBe(true);
 				expect(escaped).toEqual([]);
+
+				// Park at the third poll: the previous thrown renewals have fully
+				// unwound, so any surviving staging file proves a leak. A thrown
+				// ownership-lock read after the staging write must be unlinked by
+				// the renewal helper; a thrown state read never writes a staging
+				// file at all.
+				await thirdPollEntered.promise;
+				expect(fs.readdirSync(path.dirname(paths.heartbeat)).filter(name => name.endsWith(".tmp"))).toEqual([]);
+
+				// The transient condition clears and the daemon is still serving.
+				armedRead = false;
+				thirdPollParked.resolve();
+				expect((daemon as unknown as { running: boolean }).running).toBe(true);
+				expect(escaped).toEqual([]);
+
+				daemon.requestStop();
+				await runPromise;
+				expect(timers.size).toBe(0);
+				if (fs.existsSync(paths.lock)) {
+					expect(
+						warn.mock.calls.some(
+							call =>
+								String(call[0]).includes("shutdown was not durably quiesced") ||
+								String(call[0]).includes("heartbeat join timed out"),
+						),
+					).toBe(true);
+				} else {
+					expect(escaped).toEqual([]);
+				}
+			} finally {
+				process.off("unhandledRejection", onEscape);
+				warn.mockRestore();
 			}
-		} finally {
-			process.off("unhandledRejection", onEscape);
-			warn.mockRestore();
-		}
+		};
+		await runScenario("state");
+		await runScenario("lock");
 	});
 	test("heartbeat fails closed without recreating a removed daemon directory", async () => {
 		const agentDir = tempAgentDir();
