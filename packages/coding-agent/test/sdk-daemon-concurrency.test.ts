@@ -177,6 +177,71 @@ describe("ConversationStore", () => {
 		expect(fs.files.has(`${store.filePath}.lock`)).toBe(false);
 		await expect(store.write("mapping", 1, record(2))).resolves.toBe(true);
 	});
+	test("times out instead of spinning when a leaked lock cannot be unlinked", async () => {
+		class UnlinkFailingFs extends MemoryConversationStoreFs {
+			override async unlink(file: string) {
+				if (file.endsWith("conversations.json.lock")) {
+					throw Object.assign(new Error("lock unlink failed"), { code: "EPERM" });
+				}
+				await super.unlink(file);
+			}
+		}
+		const fs = new UnlinkFailingFs();
+		const store = new ConversationStore<TestConversation>({
+			agentDir: "/agent",
+			kind: "discord",
+			fs,
+			pid: process.pid,
+			pidAlive: () => true,
+			lockTimeoutMs: 0,
+		});
+		fs.files.set(
+			`${store.filePath}.lock`,
+			JSON.stringify({ pid: process.pid, incarnation: processIncarnation(process.pid), timestamp: 1 }),
+		);
+		await expect(store.write("mapping", undefined, record(1))).rejects.toBeInstanceOf(ConversationLockTimeoutError);
+	});
+
+	test("serializes concurrent healing before either waiter can acquire a replacement lock", async () => {
+		const enteredUnlink = Promise.withResolvers<void>();
+		const releaseUnlink = Promise.withResolvers<void>();
+		let paused = false;
+		class HealingBarrierFs extends MemoryConversationStoreFs {
+			override async unlink(file: string) {
+				if (file.endsWith("conversations.json.lock") && !paused) {
+					paused = true;
+					enteredUnlink.resolve();
+					await releaseUnlink.promise;
+				}
+				await super.unlink(file);
+			}
+		}
+		const fs = new HealingBarrierFs();
+		const first = new ConversationStore<TestConversation>({
+			agentDir: "/agent",
+			kind: "discord",
+			fs,
+			pid: process.pid,
+			pidAlive: () => true,
+		});
+		const second = new ConversationStore<TestConversation>({
+			agentDir: "/agent",
+			kind: "discord",
+			fs,
+			pid: process.pid,
+			pidAlive: () => true,
+		});
+		fs.files.set(
+			`${first.filePath}.lock`,
+			JSON.stringify({ pid: process.pid, incarnation: processIncarnation(process.pid), timestamp: 1 }),
+		);
+		const firstWrite = first.write("one", undefined, record(1));
+		await enteredUnlink.promise;
+		const secondWrite = second.write("two", undefined, record(1));
+		releaseUnlink.resolve();
+		await expect(Promise.all([firstWrite, secondWrite])).resolves.toEqual([true, true]);
+		expect((await first.load()).conversations).toEqual({ one: record(1), two: record(1) });
+	});
 
 	test("does not heal a lock a same-process instance currently holds", async () => {
 		const entered = Promise.withResolvers<void>();
