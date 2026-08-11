@@ -22,6 +22,21 @@ ACP remains a stdio editor protocol. Its session control uses the SDK adapter in
 
 For the build/run/verify loop when changing ACP code locally, see [ACP local development](./acp-local-development.md).
 
+#### Turn-end termination of owned work
+
+An ACP `session/cancel` is a C04 terminal abort: it stops the active turn **and** the
+exact owned work that turn spawned (background Bash/task jobs, detached subagents), so an
+external client such as Paseo that ends a run terminates everything it started instead of
+leaving subagents running in the background. A fresh bounded idempotency key is issued per
+cancel, so retries replay deterministically. A cancel with no active turn is a
+deterministic no-effect (`no_active_turn`), and an unsettled stop reports `uncertain`
+instead of claiming stopped work.
+
+Clients that want a cancel to leave owned background work running (its completion can then
+resume the root worker as a fresh turn) opt out per request with `_meta.gjc.abortScope:
+"turn"` on the `session/cancel` notification; `GJC_ACP_ABORT_SCOPE=turn` in the agent
+environment is the process-wide fallback. Both default to `"owned"`.
+
 #### Evidence promotion policy
 
 Ordinary CI runs publish an **ephemeral** report under `$RUNNER_TEMP` and upload it as a
