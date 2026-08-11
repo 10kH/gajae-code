@@ -6531,6 +6531,7 @@ export const SessionManagerTestHooks: {
 	beforeManagedSourceStat?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
 	beforeManagedMissingInit?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
 	beforeManagedMissingPublish?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
+	beforeManagedMissingReturn?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
 	/** Internal first-open GC strategy override; omitted means current. */
 	firstOpenGcStrategy?: SessionMemoryGcStrategy;
 	/** Internal first-open secondary-artifact mode override; omitted means auto. */
@@ -18531,12 +18532,19 @@ export class SessionManager {
 					manager.#retireEphemeralArtifacts();
 					const content = `${JSON.stringify(prepareEntryForPersistenceSync(fresh.header, manager.#blobStore))}\n`;
 					managedInspectionStore.publishNoReplaceSync(path.basename(filePath), Buffer.from(content, "utf8"));
+					const publishedTranscript = managedInspectionStore.readExpected(path.basename(filePath));
+					if (!publishedTranscript || !publishedTranscript.bytes.equals(Buffer.from(content, "utf8")))
+						throw new Error("Could not open session: unstable");
 					if (manager.#effectiveSessionMemoryMode() !== "off") {
 						manager.#buildDisposableSidecars(manager.#fileEntries);
 						if (manager.#coldSidecarActive()) manager.#retireColdEntries();
 					}
 					manager.#flushed = true;
 					manager.#ensuredOnDisk = true;
+					await SessionManagerTestHooks.beforeManagedMissingReturn?.(filePath, managedInspectionStorage);
+					const returnTranscript = managedInspectionStore.readExpected(path.basename(filePath));
+					if (!returnTranscript || !managedFileSnapshotEquals(returnTranscript, publishedTranscript))
+						throw new Error("Could not open session: unstable");
 					writeTerminalBreadcrumb(manager.cwd, filePath);
 					return manager;
 				} catch (createError) {
