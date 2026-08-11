@@ -323,6 +323,8 @@ Every top-level GJC session publishes a loopback SDK discovery file:
 
 The file contains the session WebSocket URL and token. Connect with the token as a query parameter and never persist or log it elsewhere.
 
+Do not assume repositories are only one directory below a fixed workspace root. Resolve each live `gjc` process PID to its TTY and current working directory, then inspect that exact `<cwd>/.gjc/state/sdk/` directory. This includes managed `.gajae-code-worktrees` sessions.
+
 When the focused session emits:
 
 ```json
@@ -337,10 +339,10 @@ When the focused session emits:
 }
 ```
 
-temporarily replace the four profile keys with:
+temporarily replace all five top-row controls—the four profile keys plus `BTW EXPLAIN`—with:
 
 ```text
-ANSWER 1 | ANSWER 2 | ANSWER 3 | ANSWER 4
+ANSWER 1 | ANSWER 2 | ANSWER 3 | ANSWER 4 | ANSWER 5
 ```
 
 Render the real option labels with bounded wrapping. Highlight the valid recommended index, but never decorate or modify the submitted answer value.
@@ -364,7 +366,7 @@ Only display the fixed answer pad when:
 - the question belongs to the focused GJC session;
 - the session-to-surface mapping is exact;
 - the action is still active;
-- the question has one to four scalar options;
+- the question has one to five scalar options;
 - the action has no negotiated `controls` (multi-select and other controlled asks are not safe for a fixed numeric reply).
 
 Leave free-text, multi-select, controlled, and larger option sets to the native GJC UI.
@@ -485,7 +487,7 @@ Check:
 - the token-authenticated WebSocket connected;
 - the focused surface maps to the endpoint TTY;
 - the focused session was retained even when the session inventory is capped;
-- the question has no more than four scalar options.
+- the question has no more than five scalar options.
 
 ### A browser shortcut creates duplicates
 
