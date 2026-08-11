@@ -43,24 +43,30 @@ export const ACP_SESSION_RECONNECT: SessionReconnectOptions = {
 };
 
 /**
- * Request deadline for session-scoped SDK commands dispatched through the Router.
+ * Post-connect response budget for session-scoped SDK commands dispatched
+ * through the Router. It bounds the wait for a reply on an already-connected
+ * transport; connecting, reconnecting, and lifecycle work keep their own
+ * separate deadlines.
  *
  * The transport default (10s) is sized for one-shot broker requests and is too
  * short for the first query a cold session host answers: Q10
  * (`models.list/current`) collects credentials for every configured profile
  * provider, which on a multi-OAuth setup takes longer than 10s once and
- * milliseconds afterwards. Killing that request loses far more than the query —
- * the reply lands after the deadline, so the outcome can only be reported as
- * uncertain after the frame was sent, and ACP discards the session it just
- * created (#4258).
+ * milliseconds afterwards. Abandoning that request loses far more than the
+ * query — the reply lands after the deadline, so the outcome can only be
+ * reported as uncertain after the frame was sent, and ACP discards the session
+ * it just created (#4258).
  *
- * Liveness is proven independently: the host is reaped when it misses the
- * heartbeat TTL ({@link HEARTBEAT_TTL_MS}) and the client reconnects within
- * {@link ACP_SESSION_RECONNECT}. This deadline therefore only bounds a host that
- * is alive but wedged, and it must not fire sooner than the liveness evidence it
- * would contradict — hence the same two-TTL budget the reconnect side uses.
+ * The size is the SDK's existing model of what one healthy round trip may cost
+ * while the producer is still working: an owner heartbeat window plus a second
+ * window for recovery ({@link ACP_SESSION_RECONNECT}, and `SDK_RECONNECT_BUDGET_MS`
+ * in `./prompt-watchdog`, both `2 * HEARTBEAT_TTL_MS`). A response budget shorter
+ * than the recovery budget would abandon replies the rest of the stack is still
+ * waiting to deliver.
  *
- * Session controls are acknowledgement-shaped (`turn.prompt` returns an accepted
- * receipt, not the turn's result), so no legitimate session request needs longer.
+ * Session commands are acknowledgement-shaped (`turn.prompt` returns an accepted
+ * receipt, not the turn's result), so no legitimate session request needs longer,
+ * and a slow `turn.abort` does not stall the client: ACP settles a cancel on its
+ * own grace (`CANCEL_SETTLEMENT_GRACE_MS`) regardless of this budget.
  */
 export const SESSION_REQUEST_TIMEOUT_MS = 2 * HEARTBEAT_TTL_MS;
