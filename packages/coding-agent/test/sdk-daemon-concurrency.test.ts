@@ -111,6 +111,26 @@ describe("ConversationStore", () => {
 		await expect(store.write("mapping", undefined, record(1))).resolves.toBe(true);
 		expect(fs.files.has(`${store.filePath}.lock.reclaim`)).toBe(false);
 	});
+	test("recovers a stale main lock when its reclaim marker was never published", async () => {
+		class ExpiredLockFs extends MemoryConversationStoreFs {
+			async stat(_file: string) {
+				return { mtimeMs: 0 };
+			}
+		}
+		const fs = new ExpiredLockFs();
+		const store = new ConversationStore<TestConversation>({
+			agentDir: "/agent",
+			kind: "discord",
+			fs,
+			now: () => 30_000,
+			pid: 202,
+			pidAlive: pid => pid === 202,
+		});
+		fs.files.set(`${store.filePath}.lock`, JSON.stringify({ pid: 101, incarnation: "old", timestamp: 1 }));
+		fs.files.set(`${store.filePath}.lock.reclaim`, "");
+		await expect(store.write("mapping", undefined, record(1))).resolves.toBe(true);
+		expect(fs.files.has(`${store.filePath}.lock.reclaim`)).toBe(false);
+	});
 
 	test("does not steal a fresh live reclaim lock or bypass the lock timeout", async () => {
 		const fs = new MemoryConversationStoreFs();

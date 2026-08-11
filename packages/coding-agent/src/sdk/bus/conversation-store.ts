@@ -311,8 +311,11 @@ export class ConversationStore<T extends ConversationRecord> {
 			return false;
 		} finally {
 			await reclaimLock.handle.close().catch(() => undefined);
-			await this.#unlinkOwnedLock(reclaimFile, reclaimLock.lock);
-			this.#releaseHeldLock(reclaimFile, reclaimLock.lock);
+			try {
+				await this.#unlinkOwnedLock(reclaimFile, reclaimLock.lock).catch(() => undefined);
+			} finally {
+				this.#releaseHeldLock(reclaimFile, reclaimLock.lock);
+			}
 		}
 	}
 
@@ -323,12 +326,18 @@ export class ConversationStore<T extends ConversationRecord> {
 		if (!reclaimLock) return false;
 		try {
 			const staleLock = await this.#readLock(lockFile);
-			if (!staleLock || !(await this.#isStaleLock(lockFile))) return false;
-			return await this.#unlinkOwnedLock(lockFile, staleLock);
+			if (staleLock) {
+				if (!(await this.#isStaleLock(lockFile))) return false;
+				return await this.#unlinkOwnedLock(lockFile, staleLock);
+			}
+			return await this.#unlinkExpiredUnpublishedLock(lockFile);
 		} finally {
 			await reclaimLock.handle.close().catch(() => undefined);
-			await this.#unlinkOwnedLock(reclaimFile, reclaimLock.lock);
-			this.#releaseHeldLock(reclaimFile, reclaimLock.lock);
+			try {
+				await this.#unlinkOwnedLock(reclaimFile, reclaimLock.lock).catch(() => undefined);
+			} finally {
+				this.#releaseHeldLock(reclaimFile, reclaimLock.lock);
+			}
 		}
 	}
 
@@ -339,9 +348,7 @@ export class ConversationStore<T extends ConversationRecord> {
 			return await this.#createLockFile(reclaimFile);
 		} catch (error) {
 			if (!isAlreadyExists(error)) return undefined;
-			if (await this.#isStaleLock(reclaimFile)) {
-				const staleLock = await this.#readLock(reclaimFile);
-				if (staleLock) await this.#unlinkOwnedLock(reclaimFile, staleLock);
+			if (await this.#reclaimStaleLock(reclaimFile)) {
 				try {
 					return await this.#createLockFile(reclaimFile);
 				} catch (retryError) {
@@ -390,6 +397,18 @@ export class ConversationStore<T extends ConversationRecord> {
 			return isConversationStoreLock(parsed) ? parsed : undefined;
 		} catch {
 			return undefined;
+		}
+	}
+
+	async #unlinkExpiredUnpublishedLock(lockFile: string): Promise<boolean> {
+		if (await this.#readLock(lockFile)) return false;
+		if (!(await this.#isExpiredUnpublishedLock(lockFile))) return false;
+		try {
+			await this.#fs.unlink(lockFile);
+			return true;
+		} catch (error) {
+			if (isMissing(error)) return false;
+			throw error;
 		}
 	}
 	async #isStaleLock(lockFile: string): Promise<boolean> {
