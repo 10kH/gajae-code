@@ -4,12 +4,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Settings } from "../src/config/settings";
 import { getNotificationConfig } from "../src/sdk/bus/config";
-import { createNotificationsExtension, projectToolSummary } from "../src/sdk/bus/index";
+import { projectToolSummary } from "../src/sdk/bus/index";
 import { NotificationSessionController } from "../src/sdk/bus/session-control";
 import type { EnsureDaemonResult } from "../src/sdk/bus/telegram-daemon";
 import { readEndpoint } from "../src/sdk/bus/telegram-reference";
 import { SessionSdkHost } from "../src/sdk/host";
 import { isolatedNotificationSettings } from "./helpers/notification-settings";
+import { createOrchestrationNotificationsExtension } from "./helpers/telegram-topic-test";
 
 const wait = () => new Promise(resolve => setTimeout(resolve, 0));
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -74,8 +75,7 @@ async function setup(
 					eligible: true,
 					getConfig: () => getNotificationConfig(settings),
 				});
-	createNotificationsExtension(api, {
-		telegramTopicsEnabled: true,
+	createOrchestrationNotificationsExtension(api, {
 		...(settings ? { settings, controller } : {}),
 		...(options.ensureTelegramDaemon ? { ensureTelegramDaemon: options.ensureTelegramDaemon } : {}),
 	});

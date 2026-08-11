@@ -5,8 +5,8 @@ import * as path from "node:path";
 import { NotificationServer } from "../../natives/native/index.js";
 import { Settings } from "../src/config/settings";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
-import { createNotificationsExtension } from "../src/sdk/bus";
 import { type BotApi, registerNotificationRoot, TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
+import { createOrchestrationNotificationsExtension } from "./helpers/telegram-topic-test";
 
 const THREAD_ID = 901;
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -117,7 +117,7 @@ test("real notifications extension rejects an in-flight /btw response after reco
 		rich: { enabled: true },
 	});
 	try {
-		createNotificationsExtension(
+		createOrchestrationNotificationsExtension(
 			{
 				on: (event: string, handler: (event: unknown, context: unknown) => Promise<unknown>) =>
 					handlers.set(event, handler),
@@ -128,7 +128,6 @@ test("real notifications extension rejects an in-flight /btw response after reco
 			} as never,
 			{
 				settings,
-				telegramTopicsEnabled: true,
 				runBtwTurn: async (question, signal) => {
 					btwCalls.push({ question, signal });
 					if (signal?.aborted) throw signal.reason;

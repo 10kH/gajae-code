@@ -3572,8 +3572,6 @@ export function createNotificationsExtension(
 		ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>;
 		/** Suppress auto-delivery for a GJC-spawned child under `sessionScope=primary`. */
 		spawnedByGjc?: boolean;
-		/** Permit Telegram forum-topic ownership only for coordinator/lifecycle sessions. Defaults to provenance detection. */
-		telegramTopicsEnabled?: boolean;
 		controller?: NotificationSessionController;
 		/** Whether this host mode can own the root SDK endpoint. Default: true. */
 		sdkHostModeSupported?: boolean;
@@ -3588,8 +3586,7 @@ export function createNotificationsExtension(
 ): void {
 	const lifecycleStartupCapability = lifecycleStartupCapabilityForApi(api);
 	const telegramTopicsEnabled =
-		options.telegramTopicsEnabled ??
-		(lifecycleStartupCapability !== undefined || isTelegramOrchestrationSession(process.env));
+		lifecycleStartupCapability !== undefined || isTelegramOrchestrationSession(process.env);
 	const runtimes = new Map<string, SessionRuntime>();
 	const controller =
 		options.controller ??

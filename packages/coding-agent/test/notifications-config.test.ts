@@ -60,6 +60,10 @@ import {
 	isolatedNotificationSettings,
 	registerNotificationRuntime,
 } from "./helpers/notification-settings";
+import {
+	createOrchestrationNotificationsExtension,
+	withoutTelegramOrchestrationProvenance,
+} from "./helpers/telegram-topic-test";
 
 const BASE_CFG: NotificationConfig = {
 	enabled: false,
@@ -1817,9 +1821,8 @@ describe("notifications config", () => {
 				ui: { notify: () => {} },
 			} as unknown as ExtensionContext;
 			let providerEnsures = 0;
-			createNotificationsExtension(api, {
+			createOrchestrationNotificationsExtension(api, {
 				settings,
-				telegramTopicsEnabled: true,
 				ensureTelegramDaemon: async () => "blocked",
 				ensureProviderDaemon: async provider => {
 					expect(provider).toBe("discord");
@@ -1897,9 +1900,8 @@ describe("notifications config", () => {
 				ui: { notify: () => {} },
 			} as unknown as ExtensionContext;
 			let providerEnsures = 0;
-			createNotificationsExtension(api, {
+			createOrchestrationNotificationsExtension(api, {
 				settings,
-				telegramTopicsEnabled: true,
 				ensureTelegramDaemon: async () => "blocked",
 				ensureProviderDaemon: async () => {
 					providerEnsures++;
@@ -1948,9 +1950,8 @@ describe("notifications config", () => {
 				},
 				ui: { notify: () => {} },
 			} as unknown as ExtensionContext;
-			createNotificationsExtension(api, {
+			createOrchestrationNotificationsExtension(api, {
 				settings,
-				telegramTopicsEnabled: true,
 				ensureTelegramDaemon: async () => "blocked",
 			});
 			const sessionStart = handlers.get("session_start");
@@ -2075,9 +2076,8 @@ describe("notifications config", () => {
 				ui: { notify: (message: string) => notifications.push(message) },
 			} as unknown as ExtensionCommandContext;
 			const endpoint = path.join(cwd, ".gjc", "state", "chat", "sdk", "provider-readiness-retry.json");
-			createNotificationsExtension(api, {
+			createOrchestrationNotificationsExtension(api, {
 				settings,
-				telegramTopicsEnabled: true,
 				ensureTelegramDaemon: async () => "blocked",
 				ensureProviderDaemon: async () => {
 					providerAttempts++;
@@ -2361,14 +2361,15 @@ describe("notifications config", () => {
 			ui: { notify: () => {} },
 		} as unknown as ExtensionContext;
 		let telegramEnsures = 0;
-		createNotificationsExtension(api, {
-			settings,
-			telegramTopicsEnabled: false,
-			ensureTelegramDaemon: async () => {
-				telegramEnsures++;
-				return "attached";
-			},
-		});
+		withoutTelegramOrchestrationProvenance(() =>
+			createNotificationsExtension(api, {
+				settings,
+				ensureTelegramDaemon: async () => {
+					telegramEnsures++;
+					return "attached";
+				},
+			}),
+		);
 		const sessionStart = handlers.get("session_start");
 		const sessionShutdown = handlers.get("session_shutdown");
 		if (!sessionStart || !sessionShutdown) throw new Error("notifications extension handlers were not registered");
@@ -2425,9 +2426,8 @@ describe("notifications config", () => {
 			ui: { notify: () => {} },
 		} as unknown as ExtensionCommandContext;
 
-		createNotificationsExtension(api, {
+		createOrchestrationNotificationsExtension(api, {
 			settings,
-			telegramTopicsEnabled: true,
 			ensureTelegramDaemon: input => {
 				let ownerId: string | undefined;
 				return ensureTelegramDaemonRunning(input, {

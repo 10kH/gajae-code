@@ -110,7 +110,6 @@ import { MCPManager } from "../runtime-mcp";
 import {
 	getNotificationConfig,
 	isGenericNotificationHostEligible,
-	isTelegramOrchestrationSession,
 	type NotificationConfig,
 	SPAWN_PROVENANCE_ENV,
 	shouldRegisterGenericNotificationsExtension,
@@ -2091,8 +2090,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const spawnProvenance = process.env[SPAWN_PROVENANCE_ENV];
 		const spawnedByGjc = typeof spawnProvenance === "string" && spawnProvenance.trim().length > 0;
 		delete process.env[SPAWN_PROVENANCE_ENV];
-		const telegramTopicsEnabled =
-			lifecycleStartupCapability !== undefined || isTelegramOrchestrationSession(process.env);
 		const notificationHostEligible = isGenericNotificationHostEligible({
 			env: process.env,
 			hostModeSupported: options.notificationHostModeSupported ?? true,
@@ -2139,7 +2136,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							settings,
 							controller: notificationSessionController,
 							spawnedByGjc,
-							telegramTopicsEnabled,
 							sdkHostModeSupported: options.sdkHostModeSupported,
 							ensureProviderDaemon: options.ensureNotificationProviderDaemon,
 							runBtwTurn: async (question, signal) => {

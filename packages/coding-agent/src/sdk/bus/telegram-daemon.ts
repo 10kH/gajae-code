@@ -5172,6 +5172,7 @@ export class TelegramNotificationDaemon {
 	private readonly botApi: BotApi;
 	private readonly effects = new TelegramEffectSupervisor();
 	private readonly topics = new TopicRegistry();
+	private topicRegistryLoaded = false;
 	/** Stable host-local identity; never persisted in shared topic authority. */
 	private installationHostId: string;
 	/**
@@ -5226,6 +5227,8 @@ export class TelegramNotificationDaemon {
 	private readonly pendingThreadedFrames = new Map<string, PendingThreadedFrame[]>();
 	/** Durable endpoint leases for sessions that already sent an authorized session_closed. */
 	private readonly closedEndpointKeys = new Map<string, TopicEndpointBinding>();
+	/** Endpoints rejected by strict topic admission are not retried until their authority changes. */
+	private readonly rejectedTopicEndpointKeys = new Map<string, string>();
 	/** Exactly one authorized transport may route each recovered logical session. */
 	private readonly logicalSessionOwners = new Map<string, SessionSocket>();
 	private nextSocketLeaseToken = 1;
@@ -6236,6 +6239,8 @@ export class TelegramNotificationDaemon {
 
 					if (this.topics.clearOrphaned(sessionId)) await this.persistTopics();
 					const endpointKey = endpointGenerationKey(endpoint.url, endpoint.token);
+					if (this.rejectedTopicEndpointKeys.get(sessionId) === endpointKey) continue;
+					this.rejectedTopicEndpointKeys.delete(sessionId);
 					const connected = this.sessions.get(sessionId);
 					if (connected) {
 						const recoveryRejectedAfterArchive =
@@ -6286,6 +6291,8 @@ export class TelegramNotificationDaemon {
 		}
 
 		if (allRootsReadable) {
+			for (const sessionId of this.rejectedTopicEndpointKeys.keys())
+				if (!endpointSessionIds.has(sessionId)) this.rejectedTopicEndpointKeys.delete(sessionId);
 			for (const sessionId of this.topics.sessionIds()) {
 				const owner = this.logicalSessionOwners.get(sessionId);
 				if (owner && this.#leaseAllows(owner)) {
@@ -6383,6 +6390,7 @@ export class TelegramNotificationDaemon {
 				} catch {}
 			}
 			void (async () => {
+				if (!this.topicAdmissionAllows(session)) return;
 				if (this.#logicalSessionId(session) !== sessionId) return;
 				const topic = this.topics.get(sessionId);
 				if (!topic || topic.bindingMalformed) return;
@@ -6434,7 +6442,7 @@ export class TelegramNotificationDaemon {
 				return;
 			}
 			const logicalSessionId = this.#logicalSessionId(session);
-			if (session.logicalSessionIdTrusted)
+			if (session.logicalSessionIdTrusted && this.topicAdmissionAllows(session))
 				void this.#renewTopicLease(logicalSessionId).then(
 					renewed => {
 						if (!renewed) this.dropSession(session, "topic_lease_lost");
@@ -6624,7 +6632,8 @@ export class TelegramNotificationDaemon {
 		} else {
 			void this.#terminalizeBtwTurnsForSession(session).catch(() => undefined);
 		}
-		if (isCurrentSession && session.logicalSessionIdTrusted) this.#releaseTopicLease(this.#logicalSessionId(session));
+		if (isCurrentSession && session.logicalSessionIdTrusted && reason !== "topic_admission_rejected")
+			this.#releaseTopicLease(this.#logicalSessionId(session));
 		if (isCurrentSession || reason === "session_closed") {
 			this.deleteMessageRoutes(session.sessionId);
 		}
@@ -7315,6 +7324,7 @@ export class TelegramNotificationDaemon {
 		await this.#recoverTopicBinding(session, msg.sessionId, msg.type === "config_update");
 	}
 	private topicAdmissionAllows(session?: SessionSocket): boolean {
+		if (this.opts.requireTelegramTopicEligibility === true && !this.topicRegistryLoaded) return false;
 		return this.opts.requireTelegramTopicEligibility !== true || session?.telegramTopicsEnabled === true;
 	}
 
@@ -8659,7 +8669,11 @@ export class TelegramNotificationDaemon {
 	}
 
 	async loadTopics(): Promise<void> {
-		if (this.validationMode()) return;
+		this.topicRegistryLoaded = false;
+		if (this.validationMode()) {
+			this.topicRegistryLoaded = true;
+			return;
+		}
 		const paths = daemonPaths(this.opts.settings.getAgentDir());
 		const topicPath = path.join(paths.dir, "telegram-topics.json");
 		let raw = await readJson<unknown>(this.fsImpl, topicPath);
@@ -8712,6 +8726,7 @@ export class TelegramNotificationDaemon {
 			}
 			if (legacySnapshot || missingHostId || missingSessionUuid || reconciledCreateClaim) await this.persistTopics();
 		}
+		this.topicRegistryLoaded = true;
 	}
 
 	/**
@@ -9861,12 +9876,14 @@ export class TelegramNotificationDaemon {
 		this.runtime.stopInterval("telegram-scan");
 	}
 
-	/** Send a single `typing` chat action into a busy session's topic (best-effort). */
+	/** Send a single `typing` chat action into the session topic (best-effort). */
 	private async sendTyping(
 		sessionId: string,
 		capturedLease?: { session: SessionSocket; token: number; logicalSessionId: string },
 	): Promise<void> {
 		const session = this.logicalSessionOwners.get(sessionId) ?? this.sessions.get(sessionId);
+		const admissionSession = session ?? capturedLease?.session;
+		if (admissionSession && !this.topicAdmissionAllows(admissionSession)) return;
 		const socketLease = capturedLease ?? (session ? this.#socketLease(session, sessionId) : undefined);
 		if (!socketLease) return;
 		const topicLease = await this.topicAuthorityLease(sessionId);
@@ -10083,8 +10100,8 @@ export class TelegramNotificationDaemon {
 			const latestIdentity = identityIndex < 0 ? undefined : replayed[identityIndex];
 			session.telegramTopicsEnabled = latestIdentity?.telegramTopicsEnabled === true;
 			if (!this.topicAdmissionAllows(session)) {
-				session.replayPending = false;
-				session.replayQueue = [];
+				this.rejectedTopicEndpointKeys.set(session.sessionId, session.endpointKey);
+				this.dropSession(session, "topic_admission_rejected");
 				return;
 			}
 			const replayIdentitySessionId = latestIdentity?.sessionId as string | undefined;
@@ -12498,13 +12515,11 @@ export class TelegramNotificationDaemon {
 			try {
 				await this.loadTopics();
 			} catch (error) {
-				// A shared topic authority that is momentarily unavailable at startup must
-				// not kill the daemon before it starts serving: report the failure and
-				// continue with an empty in-memory registry. Connected sessions re-create
-				// their topics through ensureTopic, and later persist passes read the
-				// winner back from the authority (same philosophy as runScan's retry).
+				// A topic registry load failure is fail-closed for strict topic
+				// admission. Connected sessions are dropped after replay proof and
+				// cannot create or renew topics until a later daemon restart succeeds.
 				logger.warn(
-					`notifications: topic registry load failed; continuing with empty registry: ${sanitizeDiagnostic(
+					`notifications: topic registry load failed; strict topic admission is disabled until reload: ${sanitizeDiagnostic(
 						String(error),
 						this.opts.botToken,
 					)}`,

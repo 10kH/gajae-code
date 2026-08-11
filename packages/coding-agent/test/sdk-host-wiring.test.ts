@@ -44,7 +44,7 @@ import type { InteractiveModeContext } from "../src/modes/types";
 import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { SessionIndex } from "../src/sdk/broker/session-index";
-import { createNotificationsExtension, formatPromptSettlementDiagnostic, PresentationArbiter } from "../src/sdk/bus";
+import { formatPromptSettlementDiagnostic, PresentationArbiter } from "../src/sdk/bus";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { getNotificationConfig } from "../src/sdk/bus/config";
 import { NotificationSessionController } from "../src/sdk/bus/session-control";
@@ -68,6 +68,7 @@ import type {
 import { SessionManager } from "../src/session/session-manager";
 import { getAskAnswerSource, registerAskAnswerSource } from "../src/tools/ask-answer-registry";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
+import { createOrchestrationNotificationsExtension } from "./helpers/telegram-topic-test";
 
 type SdkPermissionProvider =
 	NonNullable<ExtensionContextActions["setSdkPermissionProvider"]> extends (provider: infer T) => void ? T : never;
@@ -166,7 +167,7 @@ function start(
 	const effectiveSettings =
 		settings ??
 		(lifecycle ? ({ get: () => undefined, getAgentDir: () => ctx.cwd } as unknown as Settings) : undefined);
-	createNotificationsExtension(
+	createOrchestrationNotificationsExtension(
 		api,
 		effectiveSettings
 			? {
@@ -174,7 +175,6 @@ function start(
 					ensureTelegramDaemon,
 					ensureProviderDaemon,
 					controller,
-					telegramTopicsEnabled: true,
 				}
 			: undefined,
 	);
