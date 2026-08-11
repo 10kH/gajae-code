@@ -11,7 +11,7 @@ import { initializeExtensions } from "../modes/runtime-init";
 import { ACP_MCP_REQUEST_TIMEOUT_MS, ACP_MCP_STARTUP_HEADROOM_MS } from "../sdk/acp/mcp";
 import { Broker } from "../sdk/broker/broker";
 import { readBrokerDiscovery } from "../sdk/broker/discovery";
-import { completeBrokerProcess, writeBrokerStartupFailureMarker } from "../sdk/broker/internal";
+import { completeBrokerProcess } from "../sdk/broker/internal";
 import {
 	type LifecycleTranscriptEvidence,
 	readSessionLifecycleLaunchRequest,
@@ -24,6 +24,7 @@ import {
 	writeSessionLifecycleReady,
 } from "../sdk/broker/lifecycle";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
+import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
 import { runSdkSessionCli } from "../sdk/cli";
 import { runSdkGuidesCli } from "../sdk/guides/cli";
 import { type CreateLifecycleAgentSessionResult, createLifecycleAgentSession } from "../sdk/lifecycle-session";

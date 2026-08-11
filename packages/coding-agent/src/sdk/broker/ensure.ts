@@ -4,8 +4,8 @@ import type { FileHandle } from "node:fs/promises";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { type BrokerDiscovery, brokerProcessIncarnation, readBrokerDiscovery } from "./discovery";
-import { BrokerStartupError, clearBrokerStartupFailureMarker, readBrokerStartupFailureMarker } from "./internal";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
+import { BrokerStartupError, clearBrokerStartupFailureMarker, readBrokerStartupFailureMarker } from "./startup-failure";
 export interface EnsureBrokerSettings {
 	agentDir: string;
 	heartbeatTtlMs?: number;

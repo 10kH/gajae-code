@@ -8,7 +8,7 @@ import {
 	clearBrokerStartupFailureMarker,
 	readBrokerStartupFailureMarker,
 	writeBrokerStartupFailureMarker,
-} from "../src/sdk/broker/internal";
+} from "../src/sdk/broker/startup-failure";
 
 async function makeAgentDir(): Promise<string> {
 	return fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-lifecycle-"));
