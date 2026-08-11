@@ -16,8 +16,16 @@ class FakeSdkClient {
 	listeners = new Set<(frame: Record<string, unknown>) => void>();
 	reconnectFailedListeners = new Set<(error: Error) => void>();
 	reconnectListeners = new Set<() => void>();
-	async control(operation: string, input: Record<string, unknown>) {
-		this.frames.push({ type: "control_request", operation, input });
+	async control(
+		operation: string,
+		input: Record<string, unknown>,
+		options?: { confirm?: boolean; idempotencyKey?: string },
+	) {
+		// Record only meaningful envelope options (confirm:true or a forwarded
+		// idempotency key) so existing strict frame assertions stay stable.
+		const envelope =
+			options && (options.confirm === true || options.idempotencyKey !== undefined) ? options : undefined;
+		this.frames.push({ type: "control_request", operation, input, ...(envelope ?? {}) });
 		return { ok: true };
 	}
 	async query(query: string, input: Record<string, unknown>, cursor?: string) {
@@ -118,13 +126,23 @@ test("ACP SDK adapter maps native and extension methods and keeps endpoint crede
 	await adapter.start();
 	await adapter.prompt({ prompt: "hello" });
 	await adapter.cancel();
+	await adapter.cancel("turn");
 	await adapter.setModel({ modelId: "provider/model" });
 	await adapter.handle("_gjc/sdk/control", { operation: "runtime.reload", input: { components: ["tools"] } });
 	await expect(adapter.handle("listSessions")).rejects.toMatchObject({ code: "operation_prohibited" });
 	expect(harness.requests).toEqual(
 		expect.arrayContaining([
 			expect.objectContaining({ operation: "turn.prompt", input: expect.objectContaining({ text: "hello" }) }),
-			expect.objectContaining({ operation: "turn.abort" }),
+			expect.objectContaining({
+				operation: "turn.abort",
+				input: { mode: "terminal", scope: "owned" },
+				idempotencyKey: expect.any(String),
+			}),
+			expect.objectContaining({
+				operation: "turn.abort",
+				input: { mode: "terminal", scope: "turn" },
+				idempotencyKey: expect.any(String),
+			}),
 			expect.objectContaining({ operation: "model.set", input: { id: "provider/model" } }),
 			expect.objectContaining({ operation: "runtime.reload" }),
 		]),
@@ -209,6 +227,32 @@ test("ACP generic routes honor provider, machine, and secret field dispositions"
 			input: { killSwitchHotkey: true },
 		}),
 	);
+	await adapter.close();
+});
+
+test("ACP SDK adapter forwards the bounded idempotency key on control envelopes", async () => {
+	// Terminal abort requires the key on the control envelope: without
+	// forwarding it, every {mode:"terminal"} control through this surface is
+	// rejected with invalid_input (review thread P1).
+	const harness = createRouterHarness();
+	const adapter = new AcpSdkAdapter({
+		router: harness.router as never,
+		attachment: harness.attachment,
+		sessionId: harness.attachment.sessionId,
+	});
+	await adapter.start();
+	await adapter.control("turn.abort", { mode: "terminal", idempotencyKey: "term-key-acp" });
+	expect(harness.requests).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({
+				type: "control_request",
+				operation: "turn.abort",
+				input: { mode: "terminal" },
+				idempotencyKey: "term-key-acp",
+			}),
+		]),
+	);
+	// The key is an envelope concern: it is stripped from the input payload.
 	await adapter.close();
 });
 

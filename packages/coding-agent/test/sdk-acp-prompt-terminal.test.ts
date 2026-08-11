@@ -64,6 +64,7 @@ async function createFixture(
 		preAcknowledgementTerminal?: Record<string, unknown>;
 		promptAcknowledgement?: Record<string, unknown>;
 		cancelSettlementGraceMs?: number;
+		abortAcknowledgement?: Record<string, unknown>;
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -147,10 +148,9 @@ async function createFixture(
 					return;
 				}
 				if (frame.type === "broker_request") {
-					if (frame.operation !== "session.create") {
-						socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: {} }));
-						return;
-					}
+					// Every broker interaction (session.list, session.get_endpoint,
+					// session.create) is answered with the exact authority: the
+					// router's reconcile resolves the session through this fixture.
 					socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: authority }));
 					setTimeout(() => void publishExactSessionAuthority(authorityOptions, authority), 10);
 					return;
@@ -198,7 +198,14 @@ async function createFixture(
 							frame.operation === "turn.prompt"
 								? (options.promptAcknowledgement ?? { commandId, turnId, accepted: true })
 								: frame.operation === "turn.abort"
-									? { aborted: true }
+									? (options.abortAcknowledgement ?? {
+											ok: true,
+											selection: "owned",
+											turn: "stopped",
+											ownedWork: "stopped",
+											automaticDelivery: "none",
+											resumeOnOwnedCompletion: false,
+										})
 									: {},
 					}),
 				);
@@ -612,6 +619,110 @@ test("ACP keeps the authoritative terminal when it arrives inside the cancel gra
 		expect(await bounded(pending, "terminal settlement")).toEqual({ stopReason: "refusal" });
 	} finally {
 		fixture.dispose();
+	}
+});
+
+test("ACP rejects a no_active_turn disposition as a cancel acknowledgement", async () => {
+	const fixture = await createFixture({
+		abortAcknowledgement: { ok: true, selection: "owned", turn: "no_active_turn", terminal: "terminal_no_effect" },
+	});
+	try {
+		// no_active_turn provides no proof the worker was stopped (it can also be a
+		// requester-ownership no-op after an SDK reconnect): the cancel must NOT
+		// settle as acknowledged (review thread P1).
+		await expect(
+			bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "no-active-turn cancel acknowledgement"),
+		).rejects.toThrow("SDK did not acknowledge cancellation");
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP rejects an uncertain disposition as a cancel acknowledgement without settling the prompt", async () => {
+	const fixture = await createFixture({
+		cancelSettlementGraceMs: 25,
+		abortAcknowledgement: {
+			ok: true,
+			selection: "owned",
+			turn: "uncertain",
+			ownedWork: "uncertain",
+			automaticDelivery: "none",
+			resumeOnOwnedCompletion: false,
+			reason: "owned_unsettled",
+		},
+	});
+	try {
+		const pending = prompt(fixture, "cancel into uncertainty");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		// uncertain proves nothing was stopped: the cancel is refused and the
+		// prompt must NOT settle as cancelled (the real terminal decides it).
+		await expect(
+			bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "uncertain cancel acknowledgement"),
+		).rejects.toThrow("SDK did not acknowledge cancellation");
+		await Bun.sleep(60);
+		let settled = false;
+		void pending.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+		await Bun.sleep(30);
+		expect(settled).toBe(false);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP rejects a cancel acknowledgement that is neither terminal nor legacy", async () => {
+	const fixture = await createFixture({ abortAcknowledgement: { ok: true, result: {} } });
+	try {
+		await expect(
+			bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "unacknowledged cancel"),
+		).rejects.toThrow("SDK did not acknowledge cancellation");
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP rejects a terminal disposition that echoes a foreign scope", async () => {
+	const fixture = await createFixture({
+		abortAcknowledgement: {
+			ok: true,
+			selection: "turn",
+			turn: "stopped",
+			ownedWork: "left_running",
+			automaticDelivery: "enabled",
+			resumeOnOwnedCompletion: true,
+		},
+	});
+	try {
+		// The default cancel requests scope "owned"; a disposition answering
+		// selection "turn" belongs to another abort and must not settle this one.
+		await expect(
+			bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "foreign-scope cancel"),
+		).rejects.toThrow("SDK did not acknowledge cancellation");
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP rejects the deterministic no_effect and no_store dispositions as cancel acknowledgements", async () => {
+	for (const turn of ["no_effect", "no_store"]) {
+		const fixture = await createFixture({
+			abortAcknowledgement: { ok: true, selection: "owned", turn, terminal: "terminal_no_effect" },
+		});
+		try {
+			// A no-effect disposition is no proof the worker was stopped: the
+			// cancel is refused (review thread P1).
+			await expect(
+				bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), `${turn} cancel acknowledgement`),
+			).rejects.toThrow("SDK did not acknowledge cancellation");
+		} finally {
+			fixture.dispose();
+		}
 	}
 });
 
