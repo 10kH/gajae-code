@@ -6790,6 +6790,7 @@ function validateEvictedToolOutputHandle(
 	return { ok: true, handle: value as EvictedToolOutputHandle };
 }
 export class SessionManager {
+	static #rejectedOpenCleanupOwners = new Set<SessionManager>();
 	#sessionId: string = "";
 	/** True once a lifecycle pre-allocated id has been adopted (consume-once). */
 	#lifecycleIdAdopted: boolean = false;
@@ -14689,17 +14690,58 @@ export class SessionManager {
 		this.#clearBoundedManagedSource();
 	}
 
+	#releaseRejectedOpenResources(): void {
+		this.#releaseResidentTextStore();
+		if (this.#preparedNewSessions.size === 0) this.#releaseOwnedManagedAuthority();
+		this.#releaseClosedSessionState();
+	}
+
+	async #retryRejectedOpenWriterCleanup(): Promise<void> {
+		for (
+			let attempt = 0;
+			this.#persistWriter?.getCloseState() === "close_failed_retryable" && attempt < 30;
+			attempt++
+		) {
+			await Bun.sleep(100);
+			try {
+				await this.#closePersistWriterInternal();
+			} catch (error) {
+				logger.warn("Retained rejected-open writer close retry failed", { error: toError(error).message });
+			}
+		}
+		const state = this.#persistWriter?.getCloseState();
+		if (state === "close_unknown") {
+			this.#persistWriter = undefined;
+			this.#persistWriterPath = undefined;
+		}
+		if (!this.#persistWriter || state === "close_unknown") {
+			this.#releaseRejectedOpenResources();
+			SessionManager.#rejectedOpenCleanupOwners.delete(this);
+		}
+	}
+
 	async #discardRejectedOpenState(): Promise<void> {
+		let closeError: Error | undefined;
 		for (let attempt = 0; this.#persistWriter && attempt < 2; attempt++) {
 			try {
 				await this.#closePersistWriterInternal();
 			} catch (error) {
-				logger.warn("Rejected open persist writer close failed", { error: toError(error).message });
+				closeError = toError(error);
 			}
 		}
-		this.#releaseResidentTextStore();
-		if (this.#preparedNewSessions.size === 0) this.#releaseOwnedManagedAuthority();
-		this.#releaseClosedSessionState();
+		const state = this.#persistWriter?.getCloseState();
+		if (state === "close_unknown") {
+			this.#persistWriter = undefined;
+			this.#persistWriterPath = undefined;
+			this.#releaseRejectedOpenResources();
+			throw closeError ?? new Error("Rejected open writer close outcome is unknown");
+		}
+		if (this.#persistWriter) {
+			SessionManager.#rejectedOpenCleanupOwners.add(this);
+			void this.#retryRejectedOpenWriterCleanup();
+			throw closeError ?? new Error("Rejected open writer close remains retryable");
+		}
+		this.#releaseRejectedOpenResources();
 	}
 
 	/** Close the persistent writer after flushing all pending data. */
@@ -18404,7 +18446,14 @@ export class SessionManager {
 					}
 				}
 				manager.#sidecarRuntime = undefined;
-				await manager.#discardRejectedOpenState();
+				try {
+					await manager.#discardRejectedOpenState();
+				} catch (cleanupError) {
+					throw new AggregateError(
+						[toError(error), toError(cleanupError)],
+						"Rejected explicit resume cleanup failed",
+					);
+				}
 				throw error;
 			}
 		}
@@ -18483,7 +18532,14 @@ export class SessionManager {
 					}
 				}
 				manager.#sidecarRuntime = undefined;
-				await manager.#discardRejectedOpenState();
+				try {
+					await manager.#discardRejectedOpenState();
+				} catch (cleanupError) {
+					throw new AggregateError(
+						[toError(error), toError(cleanupError)],
+						"Rejected managed resume cleanup failed",
+					);
+				}
 				throw error;
 			} finally {
 				managedInspectionStore?.close();
