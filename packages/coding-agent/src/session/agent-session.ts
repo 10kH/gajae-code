@@ -10912,8 +10912,31 @@ export class AgentSession {
 					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 				} catch (error) {
 					const forkedFile = forkedManager.getSessionFile();
-					await forkedManager.close();
-					if (forkedFile) await previousManager.discardUncommittedSession(forkedFile);
+					const cleanupErrors: unknown[] = [];
+					try {
+						await forkedManager.close();
+					} catch (closeError) {
+						cleanupErrors.push(closeError);
+						logger.warn("Bounded fork successor close failed after initialization failure", {
+							error: closeError instanceof Error ? closeError.message : String(closeError),
+						});
+					}
+					if (forkedFile) {
+						try {
+							await previousManager.discardUncommittedSession(forkedFile);
+						} catch (cleanupError) {
+							cleanupErrors.push(cleanupError);
+							logger.warn("Bounded fork successor cleanup failed after initialization failure", {
+								error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+							});
+						}
+					}
+					if (cleanupErrors.length > 0) {
+						throw new AggregateError(
+							[error, ...cleanupErrors],
+							"Bounded fork initialization and successor cleanup both failed.",
+						);
+					}
 					throw error;
 				}
 				this.sessionManager = forkedManager;

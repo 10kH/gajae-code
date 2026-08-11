@@ -3377,6 +3377,17 @@ function sameResumeStat(left: SessionStorageStat, right: SessionStorageStat): bo
 	);
 }
 
+function resumeIdentityMatchesDescriptor(identity: ResumeSessionIdentity, descriptor: DescriptorSnapshot): boolean {
+	return (
+		identity.dev === descriptor.dev &&
+		identity.ino === descriptor.ino &&
+		identity.nlink === descriptor.nlink &&
+		identity.size === descriptor.size &&
+		identity.mtimeNs === descriptor.mtimeNs &&
+		(identity.ctimeNs === undefined || identity.ctimeNs === descriptor.ctimeNs)
+	);
+}
+
 interface ResumeInspectionSnapshot {
 	identity: ResumeSessionIdentity;
 	content: Uint8Array;
@@ -3656,34 +3667,40 @@ function inspectTranscriptBounded(
 	}
 
 	const hash = crypto.createHash("sha256");
-	const decoder = new TextDecoder("utf-8", { fatal: true });
-	let carry = "";
 	let sessionId: string | undefined;
 	let cwd: string | undefined;
-	try {
-		for (let offset = 0; offset < before.size; offset += TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
-			const length = Math.min(TRANSCRIPT_CAPTURE_CHUNK_BYTES, before.size - offset);
-			const chunk = storage.readRangeSync(canonicalPath, offset, length).bytes;
-			hash.update(chunk);
-			const text = decoder.decode(chunk, { stream: offset + length < before.size });
-			const combined = carry + text;
-			const lines = combined.split("\n");
-			carry = lines.pop() ?? "";
-			for (const line of lines) {
-				if (line.length === 0) continue;
-				const parsed = JSON.parse(line) as SessionHeader;
+	const scanResult: { stat?: SessionStorageStat } = {};
+	const scanFailure = scanTranscriptLinesBounded(
+		storage,
+		canonicalPath,
+		before.size,
+		(_lineStart, lineBytes) => {
+			hash.update(lineBytes);
+			if (lineBytes.byteLength === 1 && lineBytes[0] === 0x0a) return;
+			try {
+				const parsed = JSON.parse(decodeBoundedJsonLine(lineBytes)) as SessionHeader;
 				if (sessionId === undefined) {
-					if (parsed.type !== "session" || typeof parsed.id !== "string")
-						return { ok: false, error: { kind: "error", reason: "malformed" } };
+					if (parsed.type !== "session" || typeof parsed.id !== "string") return false;
 					sessionId = parsed.id;
 					cwd = typeof parsed.cwd === "string" ? parsed.cwd : undefined;
 				}
+				return;
+			} catch {
+				return false;
 			}
-			if (((offset + length) & (8 * 1024 * 1024 - 1)) === 0) Bun.gc(true);
-		}
-	} catch {
-		return { ok: false, error: { kind: "error", reason: "malformed" } };
+		},
+		scanResult,
+		true,
+		true,
+	);
+	if (scanFailure) {
+		return {
+			ok: false,
+			error: { kind: "error", reason: scanFailure === "read_failed" ? "read-failed" : "malformed" },
+		};
 	}
+	if (scanResult.stat && !sameResumeStat(before, scanResult.stat))
+		return { ok: false, error: { kind: "error", reason: "unstable" } };
 	if (sessionId === undefined) return { ok: false, error: { kind: "error", reason: "malformed" } };
 
 	let after: SessionStorageStat;
@@ -6739,6 +6756,9 @@ export class SessionManager {
 	#managedSidecarCacheSessionFile: string | undefined;
 	#managedRangeExpectedDescriptor: DescriptorSnapshot | undefined;
 	#boundedReadStorageProxy: SessionStorage | undefined;
+	#boundedManagedSource:
+		| { path: string; store: ManagedSessionDescendantStore; descriptor: DescriptorSnapshot; owned: boolean }
+		| undefined;
 	// When set, take precedence over the lazily-derived per-session manager.
 	// Subagents adopt the parent's manager so artifact IDs are unique across the
 	// whole agent tree and all files land in the parent's artifacts dir.
@@ -7483,6 +7503,7 @@ export class SessionManager {
 		this.#titleSource = state.header.titleSource;
 		this.#sessionFile = state.sessionFile;
 		this.#managedRangeExpectedDescriptor = undefined;
+		this.#clearBoundedManagedSource();
 		this.#flushed = false;
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#ensuredOnDisk = false;
@@ -8257,6 +8278,7 @@ export class SessionManager {
 		const runtime = this.#sidecarRuntime;
 		if (!runtime?.indexPath || !runtime.tailPath) return undefined;
 		const telemetry = this.#firstOpenTelemetry;
+		const boundedReadStorage = this.#boundedReadStorage();
 		let tailWriter: SessionStorageWriter | undefined;
 		let buildFailed = false;
 		const secondaryArtifactsEligible =
@@ -8369,11 +8391,14 @@ export class SessionManager {
 			let hashOffset = checkpoint.offset;
 			while (hashOffset < baseEndOffset) {
 				const length = Math.min(SESSION_RANGE_READ_MAX_BYTES, baseEndOffset - hashOffset);
-				const bytes = this.#storage.readRangeSync!(sessionFile, hashOffset, length).bytes;
-				if (bytes.byteLength !== length) {
-					this.#lazyReopenFallbackReason = "bounded_scan_build_failed";
+				const baseSnapshot = boundedReadStorage.readRangeSync!(sessionFile, hashOffset, length);
+				if (!sameDescriptor(descriptor, baseSnapshot.stat) || baseSnapshot.bytes.byteLength !== length) {
+					this.#lazyReopenFallbackReason = !sameDescriptor(descriptor, baseSnapshot.stat)
+						? "bounded_first_open_descriptor_changed"
+						: "bounded_scan_build_failed";
 					return undefined;
 				}
+				const bytes = baseSnapshot.bytes;
 				baseHash.update(bytes);
 				telemetry.bytesRead += length;
 				telemetry.transcriptBytesRead += length;
@@ -8385,7 +8410,7 @@ export class SessionManager {
 				this.#lazyReopenFallbackReason = "bounded_scan_budget";
 				return undefined;
 			}
-			const suffixSnapshot = this.#storage.readRangeSync!(sessionFile, baseEndOffset, suffixLength);
+			const suffixSnapshot = boundedReadStorage.readRangeSync!(sessionFile, baseEndOffset, suffixLength);
 			if (!sameDescriptor(descriptor, suffixSnapshot.stat) || suffixSnapshot.bytes.byteLength !== suffixLength) {
 				this.#lazyReopenFallbackReason = "bounded_first_open_descriptor_changed";
 				return undefined;
@@ -9343,6 +9368,7 @@ export class SessionManager {
 		this.#sidecarRuntime = undefined;
 		this.#releaseManagedSidecarCache();
 		this.#boundedReadStorageProxy = undefined;
+		this.#clearBoundedManagedSource();
 		if (!this.#lifecycleIdAdopted && stage.sessionId === lifecyclePreallocatedSessionId())
 			this.#lifecycleIdAdopted = true;
 		this.#persistChain = Promise.resolve();
@@ -9508,6 +9534,21 @@ export class SessionManager {
 			throw new Error("Uncommitted session discard is limited to this manager's configured session directory.");
 		}
 		try {
+			if (this.destination.kind === "managed") {
+				const store = this.#managedTranscriptStore(canonicalCandidate);
+				const transcriptName = path.basename(canonicalCandidate);
+				const artifactName = path.basename(canonicalCandidate.slice(0, -6));
+				const transcript = store.readExpected(transcriptName);
+				let artifacts: native.NativeDirectoryTreeSnapshot | undefined;
+				try {
+					artifacts = store.captureTree(artifactName);
+				} catch (error) {
+					if (!(error instanceof Error) || error.message !== "not_found") throw error;
+				}
+				if (artifacts) store.removeTreeExpected(artifactName, artifacts);
+				if (transcript) store.removeExpected(transcriptName, transcript);
+				return;
+			}
 			await this.#storage.deleteSessionWithArtifacts(canonicalCandidate);
 		} catch (err) {
 			if (isEnoent(err)) return;
@@ -10710,7 +10751,25 @@ export class SessionManager {
 		return instanceDir;
 	}
 
+	#clearBoundedManagedSource(): void {
+		const source = this.#boundedManagedSource;
+		this.#boundedManagedSource = undefined;
+		if (source?.owned) source.store.close();
+	}
 	#readRangeSync(filePath: string, start: number, length: number): SessionStorageRangeSnapshot {
+		const boundedManagedSource = this.#boundedManagedSource;
+		if (
+			this.destination.kind === "managed" &&
+			boundedManagedSource &&
+			path.resolve(filePath) === path.resolve(boundedManagedSource.path)
+		) {
+			return boundedManagedSource.store.readRangeExpectedSync(
+				path.basename(filePath),
+				start,
+				length,
+				boundedManagedSource.descriptor,
+			);
+		}
 		if (
 			this.destination.kind === "managed" &&
 			this.#sessionFile &&
@@ -10738,6 +10797,17 @@ export class SessionManager {
 	}
 
 	#statSync(filePath: string): SessionStorageStat {
+		const boundedManagedSource = this.#boundedManagedSource;
+		if (
+			this.destination.kind === "managed" &&
+			boundedManagedSource &&
+			path.resolve(filePath) === path.resolve(boundedManagedSource.path)
+		) {
+			const descriptor = boundedManagedSource.store.descriptorExpected(path.basename(filePath));
+			if (!descriptor || !sameDescriptor(boundedManagedSource.descriptor, descriptor))
+				throw new Error("source_changed");
+			return descriptor;
+		}
 		if (
 			this.destination.kind === "managed" &&
 			this.#sessionFile &&
@@ -14472,6 +14542,7 @@ export class SessionManager {
 		this.#labelsById.clear();
 		this.#resetMaterializedCaches();
 		this.#releaseManagedSidecarCache();
+		this.#clearBoundedManagedSource();
 	}
 
 	/** Close the persistent writer after flushing all pending data. */
@@ -17533,10 +17604,11 @@ export class SessionManager {
 	}
 
 	async #tryForkFromBoundedSource(sourcePath: string, expectedIdentity?: ResumeSessionIdentity): Promise<boolean> {
-		const sourceSize = expectedIdentity?.size ?? this.#storage.statSync(sourcePath).size;
+		const boundedReadStorage = this.#boundedReadStorage();
+		const sourceSize = expectedIdentity?.size ?? boundedReadStorage.statSync(sourcePath).size;
 		if (
 			this.#effectiveSessionMemoryMode(sourceSize) !== "enabled" ||
-			typeof this.#storage.readRangeSync !== "function" ||
+			typeof boundedReadStorage.readRangeSync !== "function" ||
 			typeof this.#storage.openStagedWriter !== "function"
 		)
 			return false;
@@ -17552,7 +17624,7 @@ export class SessionManager {
 		const preflightHash = crypto.createHash("sha256");
 		const preflightResult: { stat?: SessionStorageStat } = {};
 		const preflightFailure = scanTranscriptLinesBounded(
-			this.#storage,
+			boundedReadStorage,
 			sourcePath,
 			sourceSize,
 			(_offset, lineBytes) => {
@@ -17649,7 +17721,7 @@ export class SessionManager {
 			const copyHash = crypto.createHash("sha256");
 			const copyResult: { stat?: SessionStorageStat } = {};
 			const copyFailure = scanTranscriptLinesBounded(
-				this.#storage,
+				boundedReadStorage,
 				sourcePath,
 				identity.size,
 				(_offset, lineBytes) => {
@@ -17700,16 +17772,20 @@ export class SessionManager {
 				if (!managedPublishedTranscript) throw new Error("managed_fork_transcript_publish_missing");
 			}
 			if (copyResult.stat) {
-				const current = this.#storage.statSync(sourcePath);
+				const current = boundedReadStorage.statSync(sourcePath);
 				if (!sameDescriptor(copyResult.stat, current)) throw new Error("fork_source_identity_changed");
-			} else if (revalidateTranscriptIdentityBounded(sourcePath, this.#storage, identity).kind !== "valid") {
+			} else if (revalidateTranscriptIdentityBounded(sourcePath, boundedReadStorage, identity).kind !== "valid") {
 				throw new Error("fork_source_identity_changed");
 			}
 			await this.copyArtifactsForFork(sourcePath, fresh.sessionFile);
-			if (this.destination.kind === "managed" && this.#storage.existsSync(fresh.sessionFile.slice(0, -6)))
-				managedPublishedArtifacts = this.#managedTranscriptStore(fresh.sessionFile).captureTree(
-					path.basename(fresh.sessionFile.slice(0, -6)),
-				);
+			if (this.destination.kind === "managed") {
+				const store = this.#managedTranscriptStore(fresh.sessionFile);
+				try {
+					managedPublishedArtifacts = store.captureTree(path.basename(fresh.sessionFile.slice(0, -6)));
+				} catch (error) {
+					if (!(error instanceof Error) || error.message !== "not_found") throw error;
+				}
+			}
 			await this.#initSessionFile(fresh.sessionFile);
 			writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
 			return true;
@@ -17747,8 +17823,40 @@ export class SessionManager {
 		const entryPatches = new Map<string, EntryPatchRecord["patch"]>();
 		let overlayBytes = 0;
 		let requiresRecordTransforms = false;
+		const managedSourceStorage = this.#boundedManagedSource ? this.#boundedReadStorage() : undefined;
+		const forEachSourceLine = (visit: (line: Uint8Array) => boolean | undefined): void => {
+			if (!managedSourceStorage) {
+				snapshot.forEachLine(visit);
+				return;
+			}
+			const hash = crypto.createHash("sha256");
+			const scanResult: { stat?: SessionStorageStat } = {};
+			let aborted = false;
+			const failure = scanTranscriptLinesBounded(
+				managedSourceStorage,
+				snapshot.sourcePath,
+				snapshot.identity.size,
+				(_offset, line) => {
+					hash.update(line);
+					const body = line[line.byteLength - 1] === 0x0a ? line.subarray(0, line.byteLength - 1) : line;
+					if (body.byteLength === 0) return;
+					if (visit(body) === false) {
+						aborted = true;
+						return false;
+					}
+				},
+				scanResult,
+				true,
+				true,
+			);
+			if (failure && !(failure === "aborted" && aborted)) throw new Error(`transcript_scan_${failure}`);
+			if (aborted) return;
+			if (!scanResult.stat || !resumeIdentityMatchesDescriptor(snapshot.identity, scanResult.stat))
+				throw new Error("identity-mismatch");
+			if (hash.digest("hex") !== snapshot.identity.sha256) throw new Error("identity-mismatch");
+		};
 		try {
-			snapshot.forEachLine(line => {
+			forEachSourceLine(line => {
 				if (rejected || line.byteLength === 0) return;
 				const record = JSON.parse(decodeBoundedJsonLine(line)) as FileEntry | SessionPatchRecord;
 				if (ordinal++ === 0) {
@@ -17809,7 +17917,7 @@ export class SessionManager {
 		let managedPublishedTranscript: ManagedFileSnapshot | undefined;
 		try {
 			let writeOrdinal = 0;
-			snapshot.forEachLine(line => {
+			forEachSourceLine(line => {
 				if (line.byteLength === 0) return;
 				if (writeOrdinal++ === 0) {
 					staged.writeLine(Buffer.from(JSON.stringify(fresh.header), "utf8"));
@@ -17840,9 +17948,13 @@ export class SessionManager {
 					undefined;
 				if (!managedPublishedTranscript) throw new Error("managed_fork_transcript_publish_missing");
 			}
-			const copyDescriptor = snapshot.getLastReadStat();
-			if (snapshot.storage instanceof FileSessionStorage && copyDescriptor) {
-				const current = snapshot.storage.statSync(snapshot.sourcePath);
+			const copyDescriptor = managedSourceStorage
+				? managedSourceStorage.statSync(snapshot.sourcePath)
+				: snapshot.getLastReadStat();
+			if (copyDescriptor) {
+				const current = managedSourceStorage
+					? managedSourceStorage.statSync(snapshot.sourcePath)
+					: snapshot.storage.statSync(snapshot.sourcePath);
 				if (!sameDescriptor(copyDescriptor, current)) {
 					await this.#cleanupFailedForkDestination(fresh.sessionFile, managedPublishedTranscript);
 					return { kind: "error", reason: "identity-mismatch" };
@@ -17881,27 +17993,71 @@ export class SessionManager {
 		sessionMemoryMode: SessionMemoryMode = "shadow",
 	): Promise<SessionManager> {
 		const destination = destinationFor(cwd, destinationInput, storage);
-		let managedSourcePath = sourcePath;
-		if (destination.kind === "managed" && storage instanceof FileSessionStorage) {
-			const prepared = await SessionManager.prepareManagedCandidateForWrite(
-				sourcePath,
-				migrationPolicy,
-				destination,
-			);
-			managedSourcePath = storage.existsSync(prepared) ? prepared : sourcePath;
-		}
 		const dir = destination.directory;
 		const manager = new SessionManager(cwd, dir, true, storage, destination);
 		manager.#sessionMemoryMode = sessionMemoryMode;
-		const sourceSize = storage.statSync(managedSourcePath).size;
-		if (manager.#effectiveSessionMemoryMode(sourceSize) === "enabled") {
-			const inspected = inspectTranscriptBounded(managedSourcePath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
+		let managedSourcePath = sourcePath;
+		if (destination.kind === "managed" && storage instanceof FileSessionStorage) {
+			const resolvedSource = path.resolve(sourcePath);
+			const sessionsRoot = path.resolve(destination.securityContext.sessionsRoot);
 			if (
-				inspected.ok &&
-				(await manager.#tryForkFromBoundedSource(managedSourcePath, inspected.inspection.identity))
-			)
-				return manager;
+				pathIsWithin(sessionsRoot, resolvedSource) &&
+				path.dirname(resolvedSource) !== path.resolve(destination.directory)
+			) {
+				managedSourcePath = await SessionManager.prepareManagedCandidateForWrite(
+					sourcePath,
+					migrationPolicy,
+					destination,
+				);
+			}
 		}
+		let boundedStorage: SessionStorage = storage;
+		if (
+			destination.kind === "managed" &&
+			storage instanceof FileSessionStorage &&
+			pathIsWithin(path.resolve(destination.securityContext.sessionsRoot), path.resolve(managedSourcePath))
+		) {
+			const sourceDirectory = path.dirname(path.resolve(managedSourcePath));
+			const destinationDirectory = path.resolve(destination.directory);
+			const sourceStore =
+				sourceDirectory === destinationDirectory
+					? manager.#managedTranscriptStore(managedSourcePath)
+					: managedStoreFromContext(destination.securityContext, sourceDirectory);
+			try {
+				sourceStore.assertBound();
+				const descriptor = sourceStore.descriptorExpected(path.basename(managedSourcePath));
+				if (!descriptor) throw Object.assign(new Error("Managed file not found"), { code: "ENOENT" });
+				manager.#boundedManagedSource = {
+					path: managedSourcePath,
+					store: sourceStore,
+					descriptor,
+					owned: sourceDirectory !== destinationDirectory,
+				};
+				boundedStorage = manager.#boundedReadStorage();
+			} catch (error) {
+				sourceStore.close();
+				throw error;
+			}
+		}
+		let sourceSize: number | undefined;
+		try {
+			sourceSize = boundedStorage.statSync(managedSourcePath).size;
+			if (manager.#effectiveSessionMemoryMode(sourceSize) === "enabled") {
+				const inspected = inspectTranscriptBounded(
+					managedSourcePath,
+					boundedStorage,
+					BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES,
+				);
+				if (
+					inspected.ok &&
+					(await manager.#tryForkFromBoundedSource(managedSourcePath, inspected.inspection.identity))
+				)
+					return manager;
+			}
+		} finally {
+			manager.#clearBoundedManagedSource();
+		}
+		if (sourceSize === undefined) throw new Error("Managed source size unavailable");
 		if (sourceSize > eagerHydrationMaxBytes()) throw new SessionTranscriptOversizedError(sourceSize);
 		const forkEntries = await loadEntriesFromFile(managedSourcePath, storage);
 		migrateToCurrentVersion(forkEntries);
@@ -17965,6 +18121,12 @@ export class SessionManager {
 					process.platform !== "win32" &&
 					sourceSize !== undefined &&
 					sourceSize >= autoModeMinTranscriptBytes());
+			let strictSmallInspection: ResumeInspectionSnapshot | undefined;
+			if (boundedAdmission && sourceSize !== undefined && sourceSize <= eagerHydrationMaxBytes()) {
+				const strict = inspectResumeSessionFile(filePath, storage);
+				if ("kind" in strict) throw new Error(`Could not open session: ${strict.reason}`);
+				strictSmallInspection = strict;
+			}
 			if (!boundedAdmission) {
 				const inspected = inspectResumeSessionFile(filePath, storage);
 				if ("kind" in inspected) {
@@ -17997,7 +18159,9 @@ export class SessionManager {
 				manager.buildSessionContext();
 				return manager;
 			}
-			const inspected = inspectTranscriptHeaderBounded(filePath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
+			const inspected = strictSmallInspection
+				? { ok: true as const, inspection: { cwd: (strictSmallInspection.entries[0] as SessionHeader).cwd } }
+				: inspectTranscriptHeaderBounded(filePath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
 			if (!inspected.ok) {
 				if (inspected.error.reason === "missing") {
 					const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
@@ -18018,16 +18182,39 @@ export class SessionManager {
 			);
 			manager.#sessionMemoryMode = sessionMemoryMode;
 			await manager.#initSessionFile(filePath);
+			if (strictSmallInspection) {
+				const revalidated = revalidateTranscriptIdentityBounded(filePath, storage, strictSmallInspection.identity);
+				if (revalidated.kind !== "valid" || manager.#sessionId !== strictSmallInspection.identity.sessionId) {
+					manager.setSessionMemoryMode("off");
+					await manager.close();
+					throw new Error("Could not open session: unstable");
+				}
+			}
 			manager.buildSessionContext();
 			return manager;
 		}
-		let managedResumeBounded = sessionMemoryMode === "enabled";
-		if (sessionMemoryMode === "auto" && process.platform !== "win32") {
-			try {
-				managedResumeBounded = storage.statSync(filePath).size >= autoModeMinTranscriptBytes();
-			} catch {
-				managedResumeBounded = false;
-			}
+		let managedSourceSize: number | undefined;
+		try {
+			managedSourceSize = storage.statSync(filePath).size;
+		} catch {
+			// Strict inspection below reports the stable failure.
+		}
+		const managedResumeBounded =
+			sessionMemoryMode === "enabled" ||
+			(sessionMemoryMode === "auto" &&
+				process.platform !== "win32" &&
+				managedSourceSize !== undefined &&
+				managedSourceSize >= autoModeMinTranscriptBytes());
+		let strictManagedSmallInspection: ResumeInspectionSnapshot | undefined;
+		if (
+			managedResumeBounded &&
+			managedSourceSize !== undefined &&
+			managedSourceSize <= eagerHydrationMaxBytes() &&
+			path.dirname(path.resolve(filePath)) === path.resolve(destination.directory)
+		) {
+			const strict = inspectResumeSessionFile(filePath, storage);
+			if ("kind" in strict) throw new Error(`Could not open session: ${strict.reason}`);
+			strictManagedSmallInspection = strict;
 		}
 
 		if (managedResumeBounded && path.dirname(path.resolve(filePath)) === path.resolve(destination.directory)) {
@@ -18035,6 +18222,20 @@ export class SessionManager {
 			manager.#sessionMemoryMode = sessionMemoryMode;
 			try {
 				await manager.#initSessionFile(filePath, true);
+				if (strictManagedSmallInspection) {
+					const revalidated = revalidateTranscriptIdentityBounded(
+						filePath,
+						storage,
+						strictManagedSmallInspection.identity,
+					);
+					if (
+						revalidated.kind !== "valid" ||
+						manager.#sessionId !== strictManagedSmallInspection.identity.sessionId
+					) {
+						manager.setSessionMemoryMode("off");
+						throw new Error("Could not open session: unstable");
+					}
+				}
 				const header = manager.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 				if (header?.cwd) manager.cwd = header.cwd;
 				manager.buildSessionContext();
@@ -18100,6 +18301,7 @@ export class SessionManager {
 		const boundedAdmission =
 			sessionMemoryMode === "enabled" ||
 			(sessionMemoryMode === "auto" &&
+				process.platform !== "win32" &&
 				capturedDescriptor !== null &&
 				capturedDescriptor.size >= autoModeMinTranscriptBytes());
 		if (boundedAdmission && capturedDescriptor && capturedDescriptor.size > 0) {
@@ -18268,25 +18470,25 @@ export class SessionManager {
 	/** Delete an authorized managed or project-local picker candidate. */
 	static async deleteManagedCandidate(sessionPath: string): Promise<void> {
 		const storage = new FileSessionStorage();
-		const entries = await loadEntriesFromFile(sessionPath, storage);
-		const header = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
-		if (!header?.cwd) throw new Error("Session has no valid workspace header.");
-		const projectGjcDir = path.join(path.resolve(header.cwd), ".gjc");
+		const inspected = inspectTranscriptHeaderBounded(sessionPath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
+		if (!inspected.ok || !inspected.inspection.cwd) throw new Error("Session has no valid workspace header.");
+		const headerCwd = inspected.inspection.cwd;
+		const projectGjcDir = path.join(path.resolve(headerCwd), ".gjc");
 		if (isProjectSessionTranscriptPath(projectGjcDir, sessionPath)) {
 			const relativePath = path.relative(projectGjcDir, path.resolve(sessionPath)).split(path.sep).join("/");
 			const authority = nativeSessionManager().openRecoveryFsRoot(projectGjcDir);
 			try {
-				const captured = authority.readManaged(relativePath);
-				if (!captured.ok || !captured.identity || !captured.data || !captured.identity.sha256)
+				const observed = authority.stat(relativePath);
+				if (!observed.ok || !observed.identity || !observed.identity.sha256)
 					throw new Error("Project session is no longer an authorized candidate.");
 				const removed = authority.removeManaged(
 					relativePath,
-					captured.identity.dev,
-					captured.identity.ino,
-					captured.identity.size,
-					captured.identity.mtimeNs,
-					captured.identity.ctimeNs,
-					captured.identity.sha256,
+					observed.identity.dev,
+					observed.identity.ino,
+					observed.identity.size,
+					observed.identity.mtimeNs,
+					observed.identity.ctimeNs,
+					observed.identity.sha256,
 				);
 				if (!removed.ok) throw new Error(removed.code ?? "Could not delete project session.");
 				return;
@@ -18296,7 +18498,7 @@ export class SessionManager {
 		}
 		const sessionsRoot = path.resolve(sessionPath, "../..");
 		const resolved = resolveManagedScope({
-			cwd: header.cwd,
+			cwd: headerCwd,
 			agentDir: path.resolve(sessionsRoot, ".."),
 			sessionsRoot,
 		});
@@ -18343,8 +18545,48 @@ export class SessionManager {
 		) {
 			const boundedManager = new SessionManager(cwd, destination.directory, true, snapshot.storage, destination);
 			boundedManager.#sessionMemoryMode = sessionMemoryMode;
-			const bounded = await boundedManager.#tryForkFromCapturedBounded(snapshot);
-			if (bounded) return bounded;
+			if (
+				destination.kind === "managed" &&
+				snapshot.storage instanceof FileSessionStorage &&
+				pathIsWithin(path.resolve(destination.securityContext.sessionsRoot), path.resolve(snapshot.sourcePath))
+			) {
+				const sourceDirectory = path.dirname(path.resolve(snapshot.sourcePath));
+				const destinationDirectory = path.resolve(destination.directory);
+				const sourceStore =
+					sourceDirectory === destinationDirectory
+						? boundedManager.#managedTranscriptStore(snapshot.sourcePath)
+						: managedStoreFromContext(destination.securityContext, sourceDirectory);
+				try {
+					sourceStore.assertBound();
+					const sourceDescriptor = sourceStore.descriptorExpected(path.basename(snapshot.sourcePath));
+					if (!sourceDescriptor || !resumeIdentityMatchesDescriptor(snapshot.identity, sourceDescriptor))
+						throw new Error("identity-mismatch");
+					boundedManager.#boundedManagedSource = {
+						path: snapshot.sourcePath,
+						store: sourceStore,
+						descriptor: sourceDescriptor,
+						owned: sourceDirectory !== destinationDirectory,
+					};
+				} catch (error) {
+					sourceStore.close();
+					await boundedManager.close().catch(() => {});
+					if (toError(error).message === "identity-mismatch")
+						return { kind: "error", reason: "identity-mismatch" };
+					throw error;
+				}
+			}
+			let bounded: StrictSessionForkResult | undefined;
+			try {
+				bounded = await boundedManager.#tryForkFromCapturedBounded(snapshot);
+			} catch (error) {
+				boundedManager.#clearBoundedManagedSource();
+				await boundedManager.close().catch(() => {});
+				throw error;
+			}
+			if (bounded) {
+				boundedManager.#clearBoundedManagedSource();
+				return bounded;
+			}
 			await boundedManager.close();
 		}
 		if (snapshot.identity.size > eagerHydrationMaxBytes())
@@ -18870,6 +19112,7 @@ export class SessionManager {
 			this.#sidecarRuntime = undefined;
 			this.#releaseManagedSidecarCache();
 			this.#boundedReadStorageProxy = undefined;
+			this.#clearBoundedManagedSource();
 			throw error;
 		}
 		this.#sessionFile = promotionPath;
@@ -18961,6 +19204,17 @@ export class SessionManager {
 			} catch {
 				// The strict read-only inspection below reports the stable failure.
 			}
+			let openPath = selectedPath;
+			if (
+				destination.kind === "managed" &&
+				storage instanceof FileSessionStorage &&
+				selectedSize !== undefined &&
+				selectedSize > eagerHydrationMaxBytes() &&
+				path.dirname(path.resolve(selectedPath)) !== path.resolve(destination.directory) &&
+				pathIsWithin(path.resolve(destination.securityContext.sessionsRoot), path.resolve(selectedPath))
+			) {
+				openPath = await SessionManager.prepareManagedCandidateForWrite(selectedPath, migrationPolicy, destination);
+			}
 			const boundedSelected =
 				selectedSize !== undefined &&
 				selectedSize > eagerHydrationMaxBytes() &&
@@ -18971,7 +19225,7 @@ export class SessionManager {
 						selectedSize >= autoModeMinTranscriptBytes()));
 			if (boundedSelected) {
 				const manager = await SessionManager.open(
-					selectedPath,
+					openPath,
 					destination,
 					storage,
 					migrationPolicy,
@@ -18981,7 +19235,7 @@ export class SessionManager {
 				await manager.close();
 				return undefined;
 			}
-			const inspected = await SessionManager.inspectSessionTailReadOnly(selectedPath, storage);
+			const inspected = await SessionManager.inspectSessionTailReadOnly(openPath, storage);
 			if (inspected.kind === "error") {
 				if (inspected.reason === "oversized") throw new SessionTranscriptOversizedError(inspected.size ?? 0);
 				if (inspected.reason === "context_too_large") throw new SessionContextTooLargeError(inspected.size ?? 0);
