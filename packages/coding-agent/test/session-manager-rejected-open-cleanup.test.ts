@@ -289,4 +289,34 @@ describe("managed strict-resume target races", () => {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
+
+	it("rejects a large bounded target removed before eager fallback without recreating it", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-bounded-missing-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "bounded-missing.jsonl");
+		storage.writeTextSync(sourceFile, transcript());
+		let hookCalls = 0;
+		SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+		SessionManagerTestHooks.sidecarTailBufferBytesOverride = 1;
+		SessionManagerTestHooks.beforeStrictMissingCheck = filePath => {
+			if (filePath !== sourceFile || hookCalls++ > 0) return;
+			storage.unlinkSync(sourceFile);
+		};
+		try {
+			await expect(SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled")).rejects.toThrow(
+				"Could not open session: unstable",
+			);
+			expect(storage.existsSync(sourceFile)).toBe(false);
+			expect(hookCalls).toBe(1);
+		} finally {
+			SessionManagerTestHooks.beforeStrictMissingCheck = undefined;
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
+			SessionManagerTestHooks.sidecarTailBufferBytesOverride = undefined;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
 });

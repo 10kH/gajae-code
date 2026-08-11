@@ -8727,6 +8727,7 @@ export class SessionManager {
 		sessionFile: string,
 		initializeMissing = false,
 		strictResume?: { inspection: ResumeInspectionSnapshot; storage: SessionStorage; reuseEntries?: boolean },
+		requireExisting = false,
 	): Promise<void> {
 		let strictManagedFallbackEntries: FileEntry[] | undefined;
 		let strictManagedFallbackMigrationApplied = false;
@@ -8776,8 +8777,9 @@ export class SessionManager {
 		revalidateStrictResume();
 		SessionManagerTestHooks.beforeStrictMissingCheck?.(resolvedSessionFile, this.#storage);
 		const transcriptMissing =
-			(initializeMissing || strictResume !== undefined) && !this.#storage.existsSync(resolvedSessionFile);
-		if (strictResume && transcriptMissing) throw new Error("Could not open session: unstable");
+			(initializeMissing || strictResume !== undefined || requireExisting) &&
+			!this.#storage.existsSync(resolvedSessionFile);
+		if ((strictResume || requireExisting) && transcriptMissing) throw new Error("Could not open session: unstable");
 		if (initializeMissing && transcriptMissing) {
 			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
 			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
@@ -18528,6 +18530,7 @@ export class SessionManager {
 					strictManagedSmallInspection
 						? { inspection: strictManagedSmallInspection, storage: managedInspectionStorage }
 						: undefined,
+					true,
 				);
 				if (strictManagedSmallInspection) {
 					if (
