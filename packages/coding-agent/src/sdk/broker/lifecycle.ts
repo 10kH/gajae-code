@@ -3282,6 +3282,24 @@ function sameCloseStoredProcessIdentity(expected: CloseRecord, current: CloseRec
 	);
 }
 
+/**
+ * Endpoint control remains safe without a durable signal identity: the caller has
+ * just read and re-read this exact generation before connecting. This narrower
+ * identity is never sufficient for signal fallback, but permits the host's typed
+ * close response to remain observable instead of being masked as stale.
+ */
+function sameCloseEndpointIdentity(expected: CloseRecord, current: CloseRecord): boolean {
+	return (
+		current.endpointGeneration === expected.endpointGeneration &&
+		current.pid === expected.pid &&
+		current.endpointMtimeMs !== undefined &&
+		expected.endpointMtimeMs !== undefined &&
+		current.lifecycleRequestId === expected.lifecycleRequestId &&
+		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
+		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
+	);
+}
+
 function sameCloseProcessIdentity(expected: CloseRecord, current: CloseRecord & { live: boolean }): boolean {
 	return current.live && sameCloseStoredProcessIdentity(expected, current);
 }
@@ -3310,8 +3328,7 @@ async function revalidateCloseGeneration(
 	if (
 		!authority &&
 		current &&
-		current.endpointGeneration === expected.endpointGeneration &&
-		sameCloseStoredProcessIdentity(expected, current)
+		(sameCloseEndpointIdentity(expected, current) || sameCloseStoredProcessIdentity(expected, current))
 	) {
 		expected.endpointMtimeMs = current.endpointMtimeMs;
 		return undefined;
@@ -3775,11 +3792,7 @@ async function executeLifecycleResponse(
 				if (!refreshedEndpointResult.ok) return refreshedEndpointResult;
 				await broker.index.refresh();
 				const refreshedRecord = broker.index.listSessions().sessions.find(session => session.sessionId === id);
-				if (
-					!refreshedRecord ||
-					refreshedRecord.endpointGeneration !== record.endpointGeneration ||
-					!sameCloseProcessIdentity(record, refreshedRecord)
-				)
+				if (!refreshedRecord || !sameCloseEndpointIdentity(record, refreshedRecord))
 					return fail("endpoint_stale", "session endpoint is stale");
 				record = refreshedRecord;
 				const refreshedEndpoint = closeEndpoint(refreshedEndpointResult.result);

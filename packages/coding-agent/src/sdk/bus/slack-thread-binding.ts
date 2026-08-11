@@ -284,7 +284,7 @@ function claimTransaction(
 			rootTs: input.rootTs,
 			sessionId: input.sessionId,
 			endpointGeneration: input.endpointGeneration,
-			attachmentAuthorityId: input.attachmentAuthorityId,
+			...(input.attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId: input.attachmentAuthorityId }),
 			updatedAt: now(),
 			seenEventIds: current?.seenEventIds ?? [],
 			seenContextIds: current?.seenContextIds ?? [],

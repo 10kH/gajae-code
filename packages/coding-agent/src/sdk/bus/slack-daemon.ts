@@ -524,6 +524,11 @@ export class SlackNotificationDaemon {
 				"session_not_live",
 				"Slack thread binding requires an exact live session endpoint.",
 			);
+		const attachment =
+			authority.attachmentAuthorityId === undefined ? await this.#resolveAttachment(sessionId) : undefined;
+		const attachmentAuthorityId =
+			authority.attachmentAuthorityId ??
+			(attachment?.generation === authority.endpointGeneration ? attachment.authorityId : undefined);
 		await this.#verifyExistingRoot(rootTs);
 		return await claimSlackThreadBinding({
 			store: this.store,
@@ -533,7 +538,7 @@ export class SlackNotificationDaemon {
 			sessionId,
 			rootTs,
 			endpointGeneration: authority.endpointGeneration,
-			attachmentAuthorityId: authority.attachmentAuthorityId,
+			...(attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId }),
 			revalidate: async () => {
 				const current = await this.#bindingAuthority(sessionId);
 				if (

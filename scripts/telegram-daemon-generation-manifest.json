@@ -494,7 +494,7 @@
     "slack:packages/coding-agent/src/sdk/bus/config.ts:notificationConfigFromFile": "ed9446063305a13e9c6e8a9ffcac46985b44d79b778e0c96dbc1612b01f1f7d2",
     "slack:packages/coding-agent/src/sdk/bus/config.ts:resolveNotificationProvider": "09402fa9db279332fc392ef13a059b90f82c8721f4ed33cbc060222663558efd",
     "slack:packages/coding-agent/src/sdk/bus/config.ts:tokenFingerprint": "dd57445254e5ca152c4a2030f8959367a6800759f3f82fc5da09cc7b9a5aa758",
-    "slack:packages/coding-agent/src/sdk/bus/slack-daemon.ts:SlackNotificationDaemon": "ed37b58b985793744d1c90e0f52041609441027cba002e02158b17a1f6b7ba1a",
+    "slack:packages/coding-agent/src/sdk/bus/slack-daemon.ts:SlackNotificationDaemon": "85082476e6027efcd8e4eb6e32f44c762d3d6a636585a8d3f0e26d4e698244c8",
     "slack:packages/coding-agent/src/sdk/bus/slack-daemon.ts:close": "82c1d933b6f951f8325502b54c6e1bd4a21e85aeec3f0e54cf514045f30e20a0",
     "slack:packages/coding-agent/src/sdk/bus/slack-daemon.ts:handleEnvelope": "b8ac026c2a7307716cecc43ad3e9c5f384b6eeaa228e77e75cbdce970c89aad2",
     "slack:packages/coding-agent/src/sdk/bus/slack-daemon.ts:notify": "ebda81d71e9ff92ad5688fe482894895d6b73d8d1f4642bfc09bbd3d18584b18",
