@@ -406,6 +406,13 @@ export async function processResponsesStream<TApi extends Api>(
 		summaryBuffer: string;
 		rawBuffer: string;
 		summaryStarted: boolean;
+		/**
+		 * Raw `arguments` carried by the item's `response.output_item.added` snapshot.
+		 * Kept out of the streaming buffer (a relay may put a `{}` placeholder here)
+		 * but retained as the lowest-precedence source for relays that supply the
+		 * real payload only in that snapshot.
+		 */
+		addedArguments: string;
 	}
 	// Per-item argument buffer keyed on stable item identity. Multiple tool-call
 	// items can stream interleaved argument deltas in one response, so a single
@@ -452,6 +459,7 @@ export async function processResponsesStream<TApi extends Api>(
 			summaryBuffer: "",
 			rawBuffer: "",
 			summaryStarted: false,
+			addedArguments: item.type === "function_call" ? (item.arguments ?? "") : "",
 		};
 		// Primary key prefers the stable item id; if the wire omits it, fall back to
 		// the positional index. A synthetic key keeps the entry addressable as lastKey
@@ -660,9 +668,13 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.output_item.done") {
 			const item = structuredCloneJSON(event.item);
 			options?.onOutputItemDone?.(item);
-			const itemKey =
-				item.type === "function_call" || item.type === "custom_tool_call" ? (item.id ?? item.call_id) : item.id;
-			const entry = resolveEntry(itemKey, event.output_index, "never");
+			// A tool item may be registered under its call id alone (relays that omit
+			// item ids in `added`) and then introduce an item id in the terminal event,
+			// so both identities are tried before the positional fallback.
+			const isToolItem = item.type === "function_call" || item.type === "custom_tool_call";
+			const entry =
+				resolveEntry(item.id, event.output_index, "never") ??
+				(isToolItem && item.call_id ? resolveEntry(item.call_id, event.output_index, "never") : undefined);
 			if (item.type === "reasoning") {
 				// Prefer the streamed summary buffer only when it carries real text. When it
 				// holds only synthetic separators (e.g. a part.done arrived before/without any
@@ -760,9 +772,24 @@ export async function processResponsesStream<TApi extends Api>(
 					hasFinalArguments &&
 					streamedArguments !== finalArguments &&
 					!isEquivalentJsonPayload(streamedArguments, finalArguments);
-				const rawArguments = hasFinalArguments ? finalArguments : streamedArguments;
-				const incompleteArguments = conflictingArgumentSources || !isCompleteJson(rawArguments);
-				const args = incompleteArguments ? {} : parseStreamingJson(rawArguments);
+				// Source precedence: terminal, then streamed deltas, then the `added`
+				// snapshot. The last one only matters for relays that never emit deltas
+				// and leave the terminal `arguments` empty; without it their real payload
+				// would silently degrade to `{}`.
+				const rawArguments = hasFinalArguments
+					? finalArguments
+					: hasStreamedArguments
+						? streamedArguments
+						: (entry?.addedArguments ?? "");
+				const decodedArguments =
+					conflictingArgumentSources || !isCompleteJson(rawArguments)
+						? undefined
+						: parseStreamingJson(rawArguments);
+				// Function-call arguments must decode to a JSON object; `null`, arrays and
+				// scalars cannot be dispatched against a tool schema, so they fail closed
+				// instead of reaching validation as a non-record value.
+				const incompleteArguments = !isJsonRecord(decodedArguments);
+				const args = incompleteArguments ? {} : (decodedArguments as Record<string, unknown>);
 				const toolCall: ToolCall = {
 					type: "toolCall",
 					id: encodeResponsesToolCallId(item.call_id, item.id),
@@ -853,6 +880,11 @@ export async function processResponsesStream<TApi extends Api>(
  * disagreement between the streamed and terminal payloads; anything that does
  * not decode cleanly on both sides is treated as a disagreement (fail closed).
  */
+/** Whether a decoded JSON value is a plain object usable as tool-call arguments. */
+function isJsonRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function isEquivalentJsonPayload(left: string, right: string): boolean {
 	if (!isCompleteJson(left) || !isCompleteJson(right)) return false;
 	try {

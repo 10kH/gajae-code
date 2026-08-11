@@ -625,6 +625,104 @@ describe("Responses multi-tool-call stream correlation", () => {
 		expect(block?.incompleteArguments).toBe(true);
 	});
 
+	test("falls back to added-item arguments when neither deltas nor terminal arguments carry them", async () => {
+		const events = [
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: {
+					type: "function_call",
+					id: "fc_added_only",
+					call_id: "call_added_only",
+					name: "bash",
+					arguments: '{"command":"pwd"}',
+				},
+			},
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: {
+					type: "function_call",
+					id: "fc_added_only",
+					call_id: "call_added_only",
+					name: "bash",
+					arguments: "",
+				},
+			},
+		];
+		const output = makeOutput();
+		const { emitted, stream } = makeCapture();
+		await processResponsesStream(makeStream(events), output, stream, makeModel());
+
+		const block = toolBlocks(output)[0];
+		expect(block?.arguments).toEqual({ command: "pwd" });
+		expect(block?.incompleteArguments).toBeUndefined();
+		expect(toolCallEnds(emitted)[0]?.toolCall.arguments).toEqual({ command: "pwd" });
+	});
+
+	test("finalizes onto the registered block when the terminal item introduces an item id", async () => {
+		const events = [
+			{
+				type: "response.output_item.added",
+				item: { type: "function_call", call_id: "call_late_id", name: "bash", arguments: "" },
+			},
+			{ type: "response.function_call_arguments.delta", item_id: "call_late_id", delta: '{"command":"pwd"}' },
+			{
+				type: "response.output_item.done",
+				item: {
+					type: "function_call",
+					id: "fc_late_id",
+					call_id: "call_late_id",
+					name: "bash",
+					arguments: '{"command":"pwd"}',
+				},
+			},
+		];
+		const output = makeOutput();
+		const { emitted, stream } = makeCapture();
+		await processResponsesStream(makeStream(events), output, stream, makeModel());
+
+		expect(toolBlocks(output)).toHaveLength(1);
+		const block = toolBlocks(output)[0];
+		expect(block?.id).toBe("call_late_id|fc_late_id");
+		expect(block?.arguments).toEqual({ command: "pwd" });
+		expect(block?.incompleteArguments).toBeUndefined();
+		const end = toolCallEnds(emitted)[0];
+		expect(end?.contentIndex).toBe(0);
+		expect(end?.toolCall.arguments).toEqual({ command: "pwd" });
+	});
+
+	test("fails closed when terminal function-call arguments decode to a non-object", async () => {
+		for (const rawArguments of ["null", "[1,2]", '"pwd"', "42"]) {
+			const events = [
+				{
+					type: "response.output_item.added",
+					output_index: 0,
+					item: { type: "function_call", id: "fc_scalar", call_id: "call_scalar", name: "bash", arguments: "" },
+				},
+				{
+					type: "response.output_item.done",
+					output_index: 0,
+					item: {
+						type: "function_call",
+						id: "fc_scalar",
+						call_id: "call_scalar",
+						name: "bash",
+						arguments: rawArguments,
+					},
+				},
+			];
+			const output = makeOutput();
+			const { emitted, stream } = makeCapture();
+			await processResponsesStream(makeStream(events), output, stream, makeModel());
+
+			const block = toolBlocks(output)[0];
+			expect(block?.arguments).toEqual({});
+			expect(block?.incompleteArguments).toBe(true);
+			expect(toolCallEnds(emitted)[0]?.toolCall.incompleteArguments).toBe(true);
+		}
+	});
+
 	test("correlates llama.cpp call IDs when function-call items omit item IDs and indexes", async () => {
 		const events = [
 			{
