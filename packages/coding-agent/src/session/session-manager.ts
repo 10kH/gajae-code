@@ -7880,9 +7880,14 @@ export class SessionManager {
 		for (let attempt = 0; attempt < 3000; attempt++) {
 			const lock = this.#storage.acquireExclusiveLockSync(lockPath);
 			if (lock) {
-				if (contended && this.#storage.existsSync(commitPath)) {
+				try {
+					if (contended && this.#storage.existsSync(commitPath)) {
+						this.#releaseExclusiveLockWithRetry(lock);
+						return "published";
+					}
+				} catch (error) {
 					this.#releaseExclusiveLockWithRetry(lock);
-					return "published";
+					throw error;
 				}
 				return lock;
 			}
@@ -8685,9 +8690,23 @@ export class SessionManager {
 	}
 
 	/** Initialize with a specific session file (used by factory methods). */
-	async #initSessionFile(sessionFile: string, initializeMissing = false): Promise<void> {
+	async #initSessionFile(
+		sessionFile: string,
+		initializeMissing = false,
+		strictResume?: { inspection: ResumeInspectionSnapshot; storage: SessionStorage; reuseEntries?: boolean },
+	): Promise<void> {
 		let strictManagedFallbackEntries: FileEntry[] | undefined;
 		const resolvedSessionFile = this.#storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
+		const revalidateStrictResume = (): void => {
+			if (!strictResume) return;
+			const revalidated = revalidateTranscriptIdentityBounded(
+				resolvedSessionFile,
+				strictResume.storage,
+				strictResume.inspection.identity,
+			);
+			if (revalidated.kind !== "valid") throw new Error("Could not open session: unstable");
+		};
+		revalidateStrictResume();
 		const sidecarRoot =
 			this.destination.kind === "managed"
 				? this.#managedSidecarRoot(resolvedSessionFile)
@@ -8709,6 +8728,7 @@ export class SessionManager {
 			this.#storage.existsSync(`${sidecarRoot}/.session-memory.spill.commit`);
 		if (boundedTranscriptAdmitted && (await this.#tryInitSessionFileFromSidecar(resolvedSessionFile))) {
 			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+			revalidateStrictResume();
 			return;
 		}
 
@@ -8718,8 +8738,10 @@ export class SessionManager {
 				this.#sessionMemoryAutoDisabledReason = "sidecar_reload_failures";
 			}
 			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+			revalidateStrictResume();
 			return;
 		}
+		revalidateStrictResume();
 		if (initializeMissing && !this.#storage.existsSync(resolvedSessionFile)) {
 			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
 			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
@@ -8732,7 +8754,9 @@ export class SessionManager {
 			this.#ensuredOnDisk = true;
 			return;
 		}
+		if (strictResume?.reuseEntries !== false) strictManagedFallbackEntries = strictResume?.inspection.entries;
 		if (
+			!strictResume &&
 			this.destination.kind === "managed" &&
 			this.#sessionMemoryMode === "enabled" &&
 			process.platform !== "win32"
@@ -8744,6 +8768,7 @@ export class SessionManager {
 		const eagerStat = this.#statSync(resolvedSessionFile);
 		if (eagerStat.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES) throw new SessionTranscriptOversizedError(eagerStat.size);
 		const entries = strictManagedFallbackEntries ?? (await loadEntriesFromFile(resolvedSessionFile, this.#storage));
+		revalidateStrictResume();
 		if (entries.length === 0) {
 			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
 			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
@@ -9491,6 +9516,7 @@ export class SessionManager {
 		}
 		this.#preparedNewSessions.delete(stage);
 		stage.discarded = true;
+		if (this.#preparedNewSessions.size === 0 && this.#fileEntries.length === 0) this.#releaseOwnedManagedAuthority();
 	}
 
 	async #retryPreparedNewSessionCleanups(): Promise<void> {
@@ -10767,11 +10793,16 @@ export class SessionManager {
 	#releaseManagedSidecarCache(): void {
 		this.#managedSidecarAuthorityStore?.close();
 		this.#managedSidecarSecurityContext?.retainedAuthority?.close();
+		const cacheStore = this.#managedSidecarCacheStore;
 		this.#managedSidecarAuthorityStore = undefined;
 		this.#managedSidecarSecurityContext = undefined;
-		this.#managedSidecarCacheStore?.dispose();
 		this.#managedSidecarCacheStore = undefined;
 		this.#managedSidecarCacheSessionFile = undefined;
+		try {
+			cacheStore?.dispose();
+		} catch (error) {
+			logger.warn("Managed sidecar cache disposal failed", { error: toError(error).message });
+		}
 		this.#managedRangeExpectedDescriptor = undefined;
 	}
 
@@ -14633,18 +14664,25 @@ export class SessionManager {
 				error: toError(error).message,
 			});
 		}
-		await this.#queuePersistTask(async () => {
-			if (this.#persistWriter) {
-				await this.#closePersistWriterInternal();
-				this.#flushed = true;
-			}
-			if (this.#needsFullRewriteOnNextPersist && !this.#readOnlyResume) await this.#rewriteFileContents();
-		});
-		this.#retireEphemeralArtifacts();
-		await this.#drainEphemeralArtifactCleanups();
-		this.#releaseResidentTextStore();
-		this.#releaseOwnedManagedAuthority();
-		this.#releaseClosedSessionState();
+		let closeError: unknown;
+		try {
+			await this.#queuePersistTask(async () => {
+				if (this.#persistWriter) {
+					await this.#closePersistWriterInternal();
+					this.#flushed = true;
+				}
+				if (this.#needsFullRewriteOnNextPersist && !this.#readOnlyResume) await this.#rewriteFileContents();
+			});
+			this.#retireEphemeralArtifacts();
+			await this.#drainEphemeralArtifactCleanups();
+		} catch (error) {
+			closeError = error;
+		} finally {
+			this.#releaseResidentTextStore();
+			if (this.#preparedNewSessions.size === 0) this.#releaseOwnedManagedAuthority();
+			this.#releaseClosedSessionState();
+		}
+		if (closeError) throw closeError;
 		if (this.#persistError) throw this.#persistError;
 	}
 	/** Flush while open, then strictly close; retryable close skips the invalid second flush. */
@@ -18116,6 +18154,7 @@ export class SessionManager {
 				throw error;
 			}
 		}
+		let retainedFallbackSnapshot: ManagedFileSnapshot | undefined;
 		let sourceSize: number | undefined;
 		try {
 			sourceSize = boundedStorage.statSync(managedSourcePath).size;
@@ -18131,12 +18170,25 @@ export class SessionManager {
 				)
 					return manager;
 			}
+			if (manager.#boundedManagedSource && sourceSize <= eagerHydrationMaxBytes()) {
+				const boundedSource = manager.#boundedManagedSource;
+				retainedFallbackSnapshot = boundedSource.store.readExpected(path.basename(managedSourcePath)) ?? undefined;
+				const terminalDescriptor = boundedSource.store.descriptorExpected(path.basename(managedSourcePath));
+				if (
+					!retainedFallbackSnapshot ||
+					!terminalDescriptor ||
+					!sameDescriptor(boundedSource.descriptor, terminalDescriptor)
+				)
+					throw new Error("source_changed");
+			}
 		} finally {
 			manager.#clearBoundedManagedSource();
 		}
 		if (sourceSize === undefined) throw new Error("Managed source size unavailable");
 		if (sourceSize > eagerHydrationMaxBytes()) throw new SessionTranscriptOversizedError(sourceSize);
-		const forkEntries = await loadEntriesFromFile(managedSourcePath, storage);
+		const forkEntries = retainedFallbackSnapshot
+			? parseSessionEntries(new TextDecoder("utf-8", { fatal: true }).decode(retainedFallbackSnapshot.bytes))
+			: await loadEntriesFromFile(managedSourcePath, storage);
 		migrateToCurrentVersion(forkEntries);
 		await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
 		const sourceHeader = forkEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
@@ -18258,7 +18310,11 @@ export class SessionManager {
 				destination,
 			);
 			manager.#sessionMemoryMode = sessionMemoryMode;
-			await manager.#initSessionFile(filePath);
+			await manager.#initSessionFile(
+				filePath,
+				false,
+				strictSmallInspection ? { inspection: strictSmallInspection, storage, reuseEntries: false } : undefined,
+			);
 			if (strictSmallInspection) {
 				const revalidated = revalidateTranscriptIdentityBounded(filePath, storage, strictSmallInspection.identity);
 				if (revalidated.kind !== "valid" || manager.#sessionId !== strictSmallInspection.identity.sessionId) {
@@ -18310,7 +18366,13 @@ export class SessionManager {
 			const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
 			manager.#sessionMemoryMode = sessionMemoryMode;
 			try {
-				await manager.#initSessionFile(filePath, true);
+				await manager.#initSessionFile(
+					filePath,
+					true,
+					strictManagedSmallInspection
+						? { inspection: strictManagedSmallInspection, storage: managedInspectionStorage }
+						: undefined,
+				);
 				if (strictManagedSmallInspection) {
 					const revalidated = revalidateTranscriptIdentityBounded(
 						filePath,
