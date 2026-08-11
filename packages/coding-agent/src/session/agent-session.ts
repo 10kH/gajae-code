@@ -11285,34 +11285,23 @@ export class AgentSession {
 						lineageIdHash: scope.lineageIdHash,
 					};
 				}
-				// Terminal abort blocks STEERING continuations of the aborted turn:
-				// purge steering queued just before the abort won (the loop can
-				// exit on the abort signal without polling it) so it cannot alter
-				// the next user turn (review thread P2). The follow-up queue is
-				// preserved — owned-completion resumes must still deliver.
-				// Snapshot the steering admission sequence BEFORE purging: only
-				// client/SDK steering admitted AFTER the abort began is an
-				// independent root-turn request whose acceptance was already
-				// acknowledged — steering admitted BEFORE it is an
-				// accepted-pre-close continuation of the aborted attempt that the
-				// terminal-abort contract requires to be blocked (review thread
-				// P1).
+				// Terminal abort blocks STEERING continuations of the aborted turn and
+				// ORDINARY follow-ups queued for it: the loop can exit on the abort
+				// signal without polling them, so a later unrelated prompt could drain
+				// and execute the supposedly-terminated turn's command. One purge over
+				// BOTH queues with a single predicate keeps exactly the independent
+				// root-turn requests (post-snapshot external steers, external
+				// follow-ups, and authorized owned-completion envelopes) and removes
+				// the rest — pre-snapshot steering is an accepted-pre-close
+				// continuation of the aborted attempt and stays blocked (review
+				// thread P1). Snapshot the steering admission sequence BEFORE
+				// purging: only client/SDK steering admitted AFTER the abort began is
+				// an independent root-turn request whose acceptance was already
+				// acknowledged (review thread P1).
 				this.#terminalAbortSteeringSnapshot ??= this.#steeringAdmissionSeq;
 				const admittedAfterSnapshot = (message: AgentMessage): boolean =>
 					this.#terminalAbortSteeringSnapshot !== undefined &&
 					(this.#externalSteerAdmissionSeq.get(message) ?? 0) > this.#terminalAbortSteeringSnapshot;
-				this.agent.removeQueuedMessages(
-					message => !(this.#externalSteerMessages.has(message) && admittedAfterSnapshot(message)),
-				);
-				this.#steeringMessages = this.#steeringMessages.filter(
-					entry => !this.#externalSteerDisplayEntries.has(entry),
-				);
-
-				// Remove ORDINARY follow-ups queued for the aborted turn: the
-				// aborted loop exits without polling them, so a later unrelated
-				// prompt could drain and execute the supposedly-terminated turn's
-				// command. Only authorized owned-completion envelopes survive
-				// (review thread P1).
 				this.agent.removeQueuedMessages(message => {
 					// The shared predicate also visits the steering queue: a
 					// client steer admitted after the abort snapshot must survive
@@ -11336,6 +11325,9 @@ export class AgentSession {
 					// ordinary and must NOT survive the abort (review thread P2).
 					return ownedCompletionResumeAction(message as never) === "ordinary";
 				});
+				this.#steeringMessages = this.#steeringMessages.filter(
+					entry => !this.#externalSteerDisplayEntries.has(entry),
+				);
 			}
 			// Do NOT advance the attempt epoch here: the terminal scope must stay
 			// keyed to the aborted epoch so #isTurnContinuationBlocked (which

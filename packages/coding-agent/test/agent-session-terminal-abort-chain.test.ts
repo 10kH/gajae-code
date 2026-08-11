@@ -608,6 +608,35 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		await waitFor(() => !session.agent.hasQueuedMessages(), "external follow-up consumed");
 		await promptPromise;
 	}, 30_000);
+	it("terminal abort preserves a queued external follow-up through the purge and rearms it", async () => {
+		// Delta-review P1 regression: the steering purge must NOT
+		// collateral-purge the follow-up queue. An independently requested
+		// external follow-up queued when the terminal abort runs is an
+		// independent next-root-turn request and must survive the abort
+		// (alongside authorized owned-completion envelopes), then be rearmed
+		// under a fresh lineage.
+		scriptedResponses = [bashCall("sleep 30", "call_hold_turn"), stopReply("follow-up answered")];
+		const promptPromise = session.prompt("hold the turn").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
+		await session.followUp("external follow-up");
+		expect(session.agent.snapshotQueues().followUp.length).toBe(1);
+		const handle = session.agent.activeResourceRunId;
+		const proof = await session.abortPromptAndWait(handle ?? "run", {
+			graceMs: 2_000,
+			terminal: { scope: "turn" },
+		});
+		expect(proof).toBeDefined();
+		// The follow-up must SURVIVE the abort purge: the pre-fix steering
+		// purge removed every non-steer message from BOTH queues.
+		expect(session.agent.snapshotQueues().followUp.length).toBe(1);
+		// And it must be rearmed and consumed under a fresh lineage (the mock
+		// model answers it).
+		await waitFor(
+			() => session.agent.snapshotQueues().followUp.length === 0,
+			"external follow-up rearmed and consumed",
+		);
+		await promptPromise;
+	}, 30_000);
 	it("settles owned-completion registrations when the idle prompt attempt fails", async () => {
 		// Reproduction of the review-thread P2 scenario: an idle owned-completion
 		// is drained by the yield queue and injected via agent.prompt; when the
