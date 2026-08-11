@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Strict resume rejection now tears down derived state without mutating the rejected transcript, closes or certainty-quarantines opened persistence writers, and retains certified retryable writers under unreferenced cleanup ownership until they reach a terminal state.
+
 ## [0.13.1] - 2026-08-11
 
 ### Added

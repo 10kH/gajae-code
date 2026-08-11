@@ -14734,6 +14734,12 @@ export class SessionManager {
 			}
 		}
 		const state = this.#persistWriter?.getCloseState();
+		if (state === "closed") {
+			this.#persistWriter = undefined;
+			this.#persistWriterPath = undefined;
+			this.#releaseRejectedOpenResources();
+			return;
+		}
 		if (state === "close_unknown") {
 			this.#persistWriter = undefined;
 			this.#persistWriterPath = undefined;
