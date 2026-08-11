@@ -181,6 +181,12 @@ function start(
 			if (forwardPreflightCallbacks) return Promise.resolve(sendUserMessage(content, options));
 			const { onPreflightAccepted, onPreflightAcceptCommit, ...delivery } = options ?? {};
 			const submission = sendUserMessage(content, Object.keys(delivery).length > 0 ? delivery : undefined);
+			// A mock may reject its submission promise before the durable acceptance
+			// await completes (fsync-backed reconciliation persistence). Adopt the
+			// rejection now so it never surfaces as an unhandled rejection during
+			// that I/O gap; the returned chain still surfaces it to the bus.
+			if (submission && typeof (submission as Promise<unknown>).catch === "function")
+				void (submission as Promise<unknown>).catch(() => {});
 			// Prefer awaitable durable fence; fall back to legacy sync accept for older mocks.
 			if (onPreflightAcceptCommit) {
 				return Promise.resolve(onPreflightAcceptCommit()).then(() => {

@@ -103,6 +103,7 @@ import {
 	normalizeSdkStartupFailure,
 	type SdkStartupFailure,
 } from "../startup-capability";
+import type { TurnResultContent } from "../turn-result";
 import { registerTelegramFileSink } from "./attachment-registry";
 import { ensureDiscordDaemon, ensureSlackDaemon } from "./chat-daemon-control";
 import {
@@ -128,11 +129,15 @@ import {
 	isExistingThreadBindingRequested,
 } from "./existing-thread-readiness";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
-import { createKindAwareReconciliation, type ReconciliationKind } from "./kind-aware-reconciliation";
+import {
+	createKindAwareReconciliation,
+	type KindAwareReconciliation,
+	type ReconciliationKind,
+} from "./kind-aware-reconciliation";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
 import { proposedTelegramIdentity } from "./notification-orchestration";
 import { createPromptReconciliation } from "./prompt-reconciliation";
-import { createReconciliationStore } from "./reconciliation-store";
+import { createReconciliationStore, resolveReconciliationSessionFile } from "./reconciliation-store";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
 import type { SlackConversation } from "./slack-conversation";
 import {
@@ -1157,7 +1162,7 @@ interface SessionRuntime {
 	notePromptReconciliation: (
 		correlation: { commandId: string; turnId: string } | undefined,
 		frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
-	) => void;
+	) => void | Promise<void>;
 	/** Settles and emits one sanitized correlated prompt failure. */
 	emitPromptFailure: (correlation: { commandId: string; turnId: string }, error: unknown) => void;
 	/** Records correlated lifecycle frames for replay and delivers them only to the accepted requester after acknowledgement. */
@@ -2213,6 +2218,9 @@ function sdkQuerySurface(
 		turnId?: string;
 		clientRef?: string;
 	}) => unknown = () => ({ status: "unknown" }),
+	steerStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
+		status: "unknown",
+	}),
 ): SessionSurface {
 	return createSdkSurfaceFactory({
 		ctx,
@@ -2223,6 +2231,7 @@ function sdkQuerySurface(
 		configOverrides,
 		settings,
 		turnResultLookup,
+		steerStatusLookup,
 		hostTools: () => getInstalledDefinitions("host_tools") !== undefined,
 	}).query;
 }
@@ -2327,9 +2336,13 @@ function sdkControlSurface(
 		cancel: (correlation: { commandId: string; turnId: string }) => Promise<void>;
 		noteTransition: (
 			correlation: { commandId: string; turnId: string } | undefined,
-			frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
+			frame:
+				| { type: "agent_start" | "agent_end"; content?: TurnResultContent }
+				| { type: "agent_failed"; error: unknown; content?: TurnResultContent },
 		) => Promise<void>;
 		lookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
+		reserveSteer?: KindAwareReconciliation["reserveSteer"];
+		settleSteer?: KindAwareReconciliation["settleSteer"];
 	},
 ): ControlSurface & {
 	cancelPendingPreflights(): Promise<void>;
@@ -2374,11 +2387,29 @@ function sdkControlSurface(
 		}
 		return "unknown";
 	};
-	const sendSteer = async (text: string) => {
-		// Await admission so a rejection (e.g. handoff in progress) surfaces as a
-		// control error instead of a false `accepted: true`.
-		await api.sendUserMessage(text, { deliverAs: "steer" });
-		return { commandId: crypto.randomUUID(), accepted: true };
+	const sendSteer = async (text: string, clientRef?: string) => {
+		if (clientRef === undefined) {
+			const correlation = { commandId: crypto.randomUUID(), turnId: crypto.randomUUID() };
+			await api.sendUserMessage(text, { deliverAs: "steer" });
+			return { ...correlation, accepted: true };
+		}
+		const normalizedClientRef = clientRef.trim();
+		if (!skillRecon?.reserveSteer || !skillRecon.settleSteer)
+			throw Object.assign(new Error("Steer reconciliation is unavailable."), { code: "unavailable" });
+		const reservation = await skillRecon.reserveSteer(normalizedClientRef, text);
+		if (reservation.replay) return { sessionId: ctx.sessionManager.getSessionId(), ...reservation.result };
+		try {
+			await api.sendUserMessage(text, { deliverAs: "steer" });
+			return {
+				sessionId: ctx.sessionManager.getSessionId(),
+				...(await skillRecon.settleSteer(normalizedClientRef, "accepted")),
+			};
+		} catch (error) {
+			return {
+				sessionId: ctx.sessionManager.getSessionId(),
+				...(await skillRecon.settleSteer(normalizedClientRef, "rejected", error)),
+			};
+		}
 	};
 	const resolveModel = (id: string) => {
 		const [provider, ...modelId] = id.split("/");
@@ -2651,7 +2682,7 @@ function sdkControlSurface(
 	} = {
 		prompt: (text, images, clientRef) =>
 			submitPrompt(text, images, false, undefined, true, controlRequesterContext.getStore(), clientRef, true),
-		steer: text => sendSteer(text),
+		steer: (text, clientRef) => sendSteer(text, clientRef),
 		followUp: text => submitPrompt(text, undefined, false, "followUp", false, controlRequesterContext.getStore()),
 		abort: async () => {
 			const requesterConnectionId = controlRequesterContext.getStore();
@@ -4132,10 +4163,13 @@ export function createNotificationsExtension(
 		// (contract documented in ./prompt-reconciliation and ../prompt-status).
 		// Active records never age into terminal; documented TTL/capacity
 		// eviction is the only removal, after which lookups report `unknown`.
-		const sessionFile =
+		const persistedSessionFile =
 			typeof ctx.sessionManager?.getSessionFile === "function" ? ctx.sessionManager.getSessionFile() : null;
 		const reconciliationSessionId =
 			typeof ctx.sessionManager?.getSessionId === "function" ? ctx.sessionManager.getSessionId() : "";
+		const sessionFile = reconciliationSessionId
+			? resolveReconciliationSessionFile(persistedSessionFile, stateRoot, String(reconciliationSessionId))
+			: null;
 		const durableStore =
 			sessionFile && reconciliationSessionId
 				? createReconciliationStore({ sessionFile, sessionId: String(reconciliationSessionId) })
@@ -4444,6 +4478,7 @@ export function createNotificationsExtension(
 			options: { fence?: boolean } = {},
 			extra?: PromptTerminalExtra,
 		) => {
+			const receiptState = extra?.finalText?.trim() ? "present" : "missing";
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission || submission.terminal || submission.phase !== "active") return;
 			submission.phase = "outcome_claimed";
@@ -4453,6 +4488,7 @@ export function createNotificationsExtension(
 					submission.reconciliationKind,
 					correlation,
 					requestedOutcome,
+					receiptState,
 				);
 			} catch (error) {
 				// The claim is the durability boundary: without it nothing may be published
@@ -4559,6 +4595,7 @@ export function createNotificationsExtension(
 					outcome: winner,
 				});
 			}
+			// eslint-disable-next-line no-console
 		};
 		const emitPromptFailure = async (correlation: { commandId: string; turnId: string }, error: unknown) => {
 			logger.error("SDK prompt submission failed", {
@@ -4633,6 +4670,7 @@ export function createNotificationsExtension(
 				configOverrides,
 				settings,
 				selector => kindReconciliation.lookupResult(selector.kind, selector),
+				selector => kindReconciliation.lookupSteer(selector),
 			),
 			id,
 			revisions,
@@ -4723,6 +4761,8 @@ export function createNotificationsExtension(
 				},
 				noteTransition: (correlation, frame) => kindReconciliation.noteTransition("skill", correlation, frame),
 				lookup: selector => kindReconciliation.lookup("skill", selector),
+				reserveSteer: kindReconciliation.reserveSteer,
+				settleSteer: kindReconciliation.settleSteer,
 			},
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
@@ -5083,7 +5123,7 @@ export function createNotificationsExtension(
 				const kind = correlation
 					? (promptSubmissions.get(promptSubmissionKey(correlation))?.reconciliationKind ?? ("prompt" as const))
 					: "prompt";
-				void kindReconciliation.noteTransition(kind, correlation, frame);
+				return kindReconciliation.noteTransition(kind, correlation, frame);
 			},
 			emitPromptFailure,
 			emitPromptLifecycle,
@@ -6418,7 +6458,7 @@ export function createNotificationsExtension(
 	// Drive the live typing indicator: mark busy when the agent loop starts so
 	// the daemon shows "typing…" in the thread while the agent is thinking,
 	// before any turn output exists. Cleared on `agent_end` below.
-	api.on("agent_start", (event, ctx) => {
+	api.on("agent_start", async (event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt) return;
@@ -6439,7 +6479,7 @@ export function createNotificationsExtension(
 		rt.activePromptCorrelation = correlation;
 		if (correlation && !continuation) rt.bindPromptExecutionHandle(correlation, ctx.getActivePromptHandle());
 		if (continuation) return;
-		rt.notePromptReconciliation(correlation, { type: "agent_start" });
+		await rt.notePromptReconciliation(correlation, { type: "agent_start" });
 		rt.emitPromptLifecycle(correlation, { type: "agent_start", sessionId: id, ...correlation });
 		try {
 			// `activity` is the native live-host lifecycle surface. The separately
@@ -6476,7 +6516,7 @@ export function createNotificationsExtension(
 	// per `turn_end`. turn_end fires once per turn iteration, so a single
 	// user-visible idle previously produced many idle pings (the flood); agent_end
 	// fires exactly once per settle, yielding exactly one idle notification.
-	api.on("agent_end", (event, ctx) => {
+	api.on("agent_end", async (event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt) return;
@@ -6534,7 +6574,7 @@ export function createNotificationsExtension(
 			// contract (see `sanitizePromptFailure`). Assistant failure messages may
 			// still remain in the local session transcript; terminalization copies only
 			// a bounded reason into the local operator log.
-			void rt.terminalizePrompt(correlation, outcome, {
+			await rt.terminalizePrompt(correlation, outcome, {
 				...(finalText ? { finalText } : {}),
 				...(outcome.kind === "failed"
 					? {
