@@ -126,6 +126,7 @@ export interface SlackThreadClaimInput {
 	sessionId: string;
 	rootTs: string;
 	endpointGeneration: number;
+	attachmentAuthorityId?: string;
 	/**
 	 * Re-proves session authority inside the store lock, immediately before
 	 * commit. It may be invoked more than once for one claim: authority here is
@@ -183,7 +184,8 @@ export async function claimSlackThreadBinding(input: SlackThreadClaimInput): Pro
 		bound?.state !== "active" ||
 		bound.sessionId !== input.sessionId ||
 		bound.rootTs !== input.rootTs ||
-		bound.endpointGeneration !== input.endpointGeneration
+		bound.endpointGeneration !== input.endpointGeneration ||
+		bound.attachmentAuthorityId !== input.attachmentAuthorityId
 	)
 		throw new SlackThreadBindingError("binding_failed", "Slack root binding could not be claimed.");
 	return bound;
@@ -282,6 +284,7 @@ function claimTransaction(
 			rootTs: input.rootTs,
 			sessionId: input.sessionId,
 			endpointGeneration: input.endpointGeneration,
+			attachmentAuthorityId: input.attachmentAuthorityId,
 			updatedAt: now(),
 			seenEventIds: current?.seenEventIds ?? [],
 			seenContextIds: current?.seenContextIds ?? [],

@@ -17,6 +17,8 @@ class FakeSlack {
 	acks: string[] = [];
 	posts: Array<{ channel: string; text: string; threadTs?: string; clientMsgId: string }> = [];
 	knownMessages = new Map<string, { channel: string; ts: string; client_msg_id: string }>();
+	knownTimestamps = new Set<string>();
+	stopError?: Error;
 	failPost = false;
 	failPostAfterAccept = false;
 	failPostProtocolAfterAccept = false;
@@ -34,6 +36,7 @@ class FakeSlack {
 	startCalls = 0;
 	stops = 0;
 	onFind?: (clientMsgId: string) => Promise<void>;
+	onPost?: (input: { channel: string; text: string; threadTs?: string; clientMsgId: string }) => void | Promise<void>;
 	onStart?: (handler: (envelope: SlackSocketEnvelope) => void | Promise<void>) => Promise<void>;
 
 	async start(handler: (envelope: SlackSocketEnvelope) => void | Promise<void>): Promise<void> {
@@ -50,6 +53,7 @@ class FakeSlack {
 		this.stops++;
 		this.#startStopGate.resolve();
 		await this.stopGate;
+		if (this.stopError) throw this.stopError;
 	}
 
 	async ack(envelopeId: string): Promise<void> {
@@ -95,6 +99,7 @@ class FakeSlack {
 		await this.postGate;
 		if (this.failPost) throw new Error("Slack rate limited");
 		this.posts.push(input);
+		await this.onPost?.(input);
 		const message = { channel: input.channel, ts: `1.${this.posts.length}`, client_msg_id: input.clientMsgId };
 		this.knownMessages.set(input.clientMsgId, message);
 		if (this.failPostAfterAccept) {
@@ -118,6 +123,12 @@ class FakeSlack {
 
 		await this.onFind?.(input.clientMsgId);
 		return this.knownMessages.get(input.clientMsgId) ?? null;
+	}
+	async findMessageByTimestamp(input: {
+		channel: string;
+		ts: string;
+	}): Promise<{ channel: string; ts: string } | null> {
+		return this.knownTimestamps.has(input.ts) ? { channel: input.channel, ts: input.ts } : null;
 	}
 }
 
@@ -1282,16 +1293,31 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		);
 	});
 
-	it("bounds a provider stop that never settles", async () => {
+	it("retains a timed-out provider shutdown until it settles before restarting", async () => {
 		let stopping = false;
 		let nowCalls = 0;
+		const releaseStop = Promise.withResolvers<void>();
 		await withDaemon(
 			async (daemon, fake) => {
-				fake.stopGate = new Promise<void>(() => {});
+				fake.stopGate = releaseStop.promise;
 				await daemon.start();
 				stopping = true;
 				await daemon.stop();
 				expect(fake.stops).toBe(1);
+				expect(daemon.restartBlocked()).toBe(true);
+
+				let restarted = false;
+				const restarting = daemon.start().then(() => {
+					restarted = true;
+				});
+				await Promise.resolve();
+				expect(restarted).toBe(false);
+				expect(fake.startCalls).toBe(1);
+
+				releaseStop.resolve();
+				await restarting;
+				expect(fake.startCalls).toBe(2);
+				stopping = false;
 				nowCalls = 0;
 			},
 			{ now: () => (stopping ? (nowCalls++ === 0 ? 0 : 5_001) : 0) },
@@ -2250,5 +2276,117 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			await daemon?.stop();
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}
+	});
+	it("propagates a rejected provider shutdown after local draining", async () => {
+		await withDaemon(async (daemon, fake) => {
+			await daemon.start();
+			const failure = new Error("Socket Mode stop failed");
+			fake.stopError = failure;
+
+			await expect(daemon.stop()).rejects.toBe(failure);
+			expect(fake.stops).toBe(1);
+			expect(daemon.restartBlocked()).toBe(true);
+		});
+	});
+
+	it("keeps an operator-bound root on the current attachment authority", async () => {
+		await withDaemon(async (daemon, fake) => {
+			const rootTs = "9.123";
+			fake.knownTimestamps.add(rootTs);
+
+			const bound = await daemon.bindExistingRoot("session", rootTs);
+			expect(bound.attachmentAuthorityId).toBe("session:1");
+
+			await daemon.notify("session", "notification", undefined, 1);
+			expect(fake.posts).toEqual([
+				expect.objectContaining({ channel: "C1", threadTs: rootTs, text: "notification" }),
+			]);
+		});
+	});
+
+	it("terminalizes retired inbound effects before a same-generation mapping can replay them", async () => {
+		let commands = 0;
+		await withDaemon(
+			async (daemon, fake, _injected, _setEndpointGeneration, agentDir) => {
+				const root = await daemon.postRoot("session", "root");
+				fake.onAck = async () => {
+					throw new Error("crash after acknowledgement");
+				};
+				await expect(
+					daemon.handleEnvelope(
+						messageEnvelope("claimed", "retired-command", root.rootTs!, {
+							clientMsgId: "retired-command-id",
+							text: "/sdk control turn.prompt {}",
+						}),
+					),
+				).rejects.toThrow("crash after acknowledgement");
+
+				const journal = new ChatEffectJournal({ agentDir, transport: "slack" });
+				const effect = (await journal.list()).find(candidate => candidate.id.startsWith("inbound:"));
+				if (!effect) throw new Error("Inbound command effect was not journaled");
+				expect(effect.state).toBe("pending");
+
+				await daemon.retireAttachment("session", 1);
+				expect(await journal.read(effect.id)).toMatchObject({
+					state: "terminal",
+					receipt: { status: "stale_binding" },
+				});
+
+				const key = "T1:C1:intent:session";
+				expect((await daemon.store.read(key))?.inboundDispatches).toEqual([]);
+				await daemon.store.transact(key, current =>
+					current
+						? {
+								...current,
+								state: "active",
+								endpointGeneration: 1,
+								attachmentAuthorityId: "session:1",
+								generation: current.generation + 1,
+								updatedAt: current.updatedAt + 1,
+							}
+						: current,
+				);
+				await daemon.start();
+				expect(commands).toBe(0);
+			},
+			{
+				onCommand: async () => {
+					commands++;
+					return true;
+				},
+			},
+		);
+	});
+
+	it("waits for an admitted provider post before attachment retirement completes", async () => {
+		const releasePost = Promise.withResolvers<void>();
+		const providerPosted = Promise.withResolvers<void>();
+		await withDaemon(async (daemon, fake) => {
+			await daemon.postRoot("session", "root");
+			fake.postGate = releasePost.promise;
+			let retired = false;
+			fake.onPost = input => {
+				if (input.text !== "in-flight notification") return;
+				expect(retired).toBe(false);
+				providerPosted.resolve();
+			};
+			const outcome = daemon.notify("session", "in-flight notification").then(
+				() => "fulfilled" as const,
+				() => "rejected" as const,
+			);
+			await fake.waitForPostStartCount(2);
+
+			const retiring = daemon.retireAttachment("session", 1).then(() => {
+				retired = true;
+			});
+			await Promise.resolve();
+			expect(retired).toBe(false);
+
+			releasePost.resolve();
+			await providerPosted.promise;
+			expect(retired).toBe(false);
+			await retiring;
+			expect(await outcome).toBe("rejected");
+		});
 	});
 });
