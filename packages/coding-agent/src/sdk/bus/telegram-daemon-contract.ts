@@ -100,25 +100,14 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * sidecar rename is retried bounded under the ownership-lock fence and an
  * exhausted publication keeps the daemon alive as `publish_failed` instead of
  * escaping as an uncaught exception, while only a proven state/lock mismatch
-<<<<<<< HEAD
  * (`not_owner`) stops the owner (#4200). Generation 61 keeps authenticated
  * same-session transports attached while predecessor archival converges and
  * settles non-forum close responses. Generation 62 rejects replay-gap
  * authority claims that do not match the requested cursor, answer bounds,
  * and retained replay suffix. Generation 63 restricts forum-topic ownership,
  * routing, replay, and callback admission to coordinator and lifecycle
- * sessions, preventing ordinary notification sessions from becoming topic owners.
-||||||| parent of 8fd530cd39 (fix(telegram): close orchestration topic admission gaps)
- * (`not_owner`) stops the owner (#4200). Generation 61 restricts forum-topic
- * ownership, routing, replay, and callback admission to coordinator and
- * lifecycle sessions, preventing ordinary notification sessions from becoming
- * topic owners.
-=======
- * (`not_owner`) stops the owner (#4200). Generation 61 restricts forum-topic
- * ownership, routing, replay, and callback admission to coordinator and
- * lifecycle sessions, preventing ordinary notification sessions from becoming
- * topic owners, and fails closed while the durable topic registry is unavailable.
->>>>>>> 8fd530cd39 (fix(telegram): close orchestration topic admission gaps)
+ * sessions, preventing ordinary notification sessions from becoming topic
+ * owners and failing closed while the durable topic registry is unavailable.
  */
 export const DAEMON_GENERATION = 63;
 
