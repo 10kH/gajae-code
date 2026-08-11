@@ -95,9 +95,14 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * the exact grace deadline when a failed archive publication rolls back.
  * Generation 59 publishes the owner's attached OPEN-socket count in the
  * heartbeat sidecar so `gjc notify health` can report a live daemon that is
- * attached to no registered endpoint (#4128).
+ * attached to no registered endpoint (#4128). Generation 60 contains transient
+ * heartbeat-sidecar publication failures: a Windows EPERM/EACCES/EBUSY on the
+ * sidecar rename is retried bounded under the ownership-lock fence and an
+ * exhausted publication keeps the daemon alive as `publish_failed` instead of
+ * escaping as an uncaught exception, while only a proven state/lock mismatch
+ * (`not_owner`) stops the owner (#4200).
  */
-export const DAEMON_GENERATION = 59;
+export const DAEMON_GENERATION = 60;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 5

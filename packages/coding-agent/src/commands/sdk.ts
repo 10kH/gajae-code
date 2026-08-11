@@ -24,6 +24,7 @@ import {
 	writeSessionLifecycleReady,
 } from "../sdk/broker/lifecycle";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
+import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
 import { runSdkSessionCli } from "../sdk/cli";
 import { runSdkGuidesCli } from "../sdk/guides/cli";
 import { type CreateLifecycleAgentSessionResult, createLifecycleAgentSession } from "../sdk/lifecycle-session";
@@ -913,8 +914,28 @@ export default class Sdk extends Command {
 				return policy === "disabled" ? "disabled" : "copy-retain";
 			},
 		});
-		await broker.start();
-		if (!broker.ownsDiscovery) return;
+		try {
+			await broker.start();
+		} catch (error) {
+			// Surface why this detached broker failed before discovery: the caller
+			// spawns with stdio ignored, so the durable marker is the only channel.
+			await writeBrokerStartupFailureMarker(agentDir, {
+				reason: error instanceof Error ? error.message : String(error),
+				exitCode: 1,
+				signal: null,
+			});
+			throw error;
+		}
+		if (!broker.ownsDiscovery) {
+			// Another broker owns discovery; this process exits cleanly (code 0) as
+			// the race loser. Record why so the caller can diagnose a missing winner.
+			await writeBrokerStartupFailureMarker(agentDir, {
+				reason: "Another broker owns the lock/discovery; this broker exited as the race loser.",
+				exitCode: 0,
+				signal: null,
+			});
+			return;
+		}
 		// A live broker must not keep advertising sessions whose host process is
 		// gone; the sweep is the broker-side half of the host reaping bound.
 		const stopSweep = startBrokerDeadRegistrationSweep(broker);

@@ -169,6 +169,9 @@ deep-interview -> ralplan -> ultragoal
 | `executor` / `architect` / `planner` / `critic` | Bundled role agents for implementation and read-only review lanes. |
 
 Also included, opt-in: **`gjc rlm`** (a Jupyter-style research/REPL mode that synthesizes a notebook and report) and **`computer-use`** (experimental desktop control). See [Python REPL](docs/python-repl.md) and [docs/tools/computer.md](docs/tools/computer.md).
+## Theme defaults
+
+The default dark TUI identity is the GJC red-claw theme; light-appearance terminals default to the bundled blue-crab theme. Explicit theme settings still take precedence.
 
 ---
 

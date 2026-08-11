@@ -1344,6 +1344,30 @@ export async function readOwnerFreshnessSnapshot(input: {
 	};
 }
 
+/** Outcome of a steady heartbeat sidecar renewal. */
+export type OwnerHeartbeatSidecarRenewal =
+	/** The sidecar was published under a still-matching ownership lock. */
+	| "renewed"
+	/** This process no longer matches the persisted state/lock; stop renewing. */
+	| "not_owner"
+	/**
+	 * Ownership still held, but the sidecar publication failed (e.g. a transient
+	 * Windows EPERM/EBUSY while another process holds the destination). The
+	 * daemon must stay alive and publish again on the next cycle (#4200); a
+	 * persistently failing publication eventually stales the heartbeat for
+	 * outside observers, whose takeover then surfaces here as `not_owner`.
+	 */
+	| "publish_failed";
+
+const HEARTBEAT_SIDECAR_PUBLISH_ATTEMPTS = 4;
+const HEARTBEAT_SIDECAR_PUBLISH_BACKOFF_MS = 25;
+
+/** Windows sharing/permission failures from antivirus, indexing, or external file locks. */
+function isTransientSidecarPublishError(error: unknown): boolean {
+	const code = (error as { code?: unknown } | null)?.code;
+	return code === "EPERM" || code === "EACCES" || code === "EBUSY";
+}
+
 /** Marker-free steady heartbeat renewal. The final lock reread fences a stale writer. */
 export async function renewOwnerHeartbeatSidecar(input: {
 	settings: Settings;
@@ -1359,7 +1383,7 @@ export async function renewOwnerHeartbeatSidecar(input: {
 	 * rather than falsely claiming zero attachments.
 	 */
 	attachedEndpoints?: number;
-}): Promise<boolean> {
+}): Promise<OwnerHeartbeatSidecarRenewal> {
 	const fsImpl = input.fs ?? nodeFs;
 	const paths = daemonPaths(input.settings.getAgentDir());
 	const state = await readJson<DaemonState>(fsImpl, paths.state);
@@ -1376,7 +1400,7 @@ export async function renewOwnerHeartbeatSidecar(input: {
 		state.acquisitionId !== acquisitionId ||
 		state.stoppedAt !== undefined
 	)
-		return false;
+		return "not_owner";
 	const sidecar: OwnerHeartbeatSidecar = {
 		pid,
 		incarnation,
@@ -1386,22 +1410,48 @@ export async function renewOwnerHeartbeatSidecar(input: {
 		...(validAttachedEndpointCount(input.attachedEndpoints) ? { attachedEndpoints: input.attachedEndpoints } : {}),
 	};
 	const tmp = `${paths.heartbeat}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-	await fsImpl.writeFile(tmp, `${JSON.stringify(sidecar, null, 2)}\n`, { mode: 0o600 });
-	await fsImpl.chmod(tmp, 0o600).catch(() => undefined);
+	try {
+		await fsImpl.writeFile(tmp, `${JSON.stringify(sidecar, null, 2)}\n`, { mode: 0o600 });
+		await fsImpl.chmod(tmp, 0o600).catch(() => undefined);
+	} catch (error) {
+		// One failed staging write must not terminate the daemon (#4200).
+		await fsImpl.unlink(tmp).catch(() => undefined);
+		logger.warn(`notifications: heartbeat sidecar staging failed: ${sanitizeDiagnostic(String(error))}`);
+		return "publish_failed";
+	}
 	const lock = await readOwnershipLock(fsImpl, paths.lock);
 	if (!ownershipLockMatchesState(lock, state)) {
 		await fsImpl.unlink(tmp).catch(() => undefined);
-		return false;
+		return "not_owner";
 	}
-	// Revalidate the exact lock after the temporary sidecar exists so a stale
-	// writer cannot publish after ownership moved during its write.
-	const finalLock = await readOwnershipLock(fsImpl, paths.lock);
-	if (!ownershipLockMatchesState(finalLock, state)) {
-		await fsImpl.unlink(tmp).catch(() => undefined);
-		return false;
+	for (let attempt = 1; ; attempt++) {
+		// Revalidate the exact lock after the temporary sidecar exists — and again
+		// before every retry — so a stale writer cannot publish after ownership
+		// moved during its write or its backoff.
+		const finalLock = await readOwnershipLock(fsImpl, paths.lock);
+		if (!ownershipLockMatchesState(finalLock, state)) {
+			await fsImpl.unlink(tmp).catch(() => undefined);
+			return "not_owner";
+		}
+		try {
+			await fsImpl.rename(tmp, paths.heartbeat);
+			return "renewed";
+		} catch (error) {
+			// Windows: a transient external lock on the destination (antivirus,
+			// indexer) surfaces as EPERM on rename and used to escape as an
+			// uncaught exception that killed the whole daemon (#4200). Retry a
+			// bounded number of times under the lock fence, then keep the daemon
+			// alive and let the next heartbeat cycle publish.
+			if (attempt >= HEARTBEAT_SIDECAR_PUBLISH_ATTEMPTS || !isTransientSidecarPublishError(error)) {
+				await fsImpl.unlink(tmp).catch(() => undefined);
+				logger.warn(
+					`notifications: heartbeat sidecar publication failed after ${attempt} attempt(s): ${sanitizeDiagnostic(String(error))}`,
+				);
+				return "publish_failed";
+			}
+			await Bun.sleep(HEARTBEAT_SIDECAR_PUBLISH_BACKOFF_MS * attempt);
+		}
 	}
-	await fsImpl.rename(tmp, paths.heartbeat);
-	return true;
 }
 
 function ownershipLockMatchesStoppedState(
@@ -3106,17 +3156,21 @@ export async function renewDaemonHeartbeat(input: {
 		// The durable sidecar must exist and match the rebound ownership lock before
 		// any observer can see ownershipPhase:"ready". A provisional state may be
 		// fresh, but readiness waiters categorically refuse to attach to it.
+		// The initial proof is strict: only a real publication counts. A
+		// `publish_failed` here has no durable sidecar, so readiness must not be
+		// claimed and the provisional ownership retires exactly as before.
 		let sidecarRenewed = false;
 		try {
-			sidecarRenewed = await renewOwnerHeartbeatSidecar({
-				settings: input.settings,
-				ownerId: input.ownerId,
-				acquisitionId,
-				fs: fsImpl,
-				now: () => heartbeatAt,
-				pid,
-				pidIncarnation: input.pidIncarnation,
-			});
+			sidecarRenewed =
+				(await renewOwnerHeartbeatSidecar({
+					settings: input.settings,
+					ownerId: input.ownerId,
+					acquisitionId,
+					fs: fsImpl,
+					now: () => heartbeatAt,
+					pid,
+					pidIncarnation: input.pidIncarnation,
+				})) === "renewed";
 		} catch {
 			sidecarRenewed = false;
 		}
@@ -9714,7 +9768,7 @@ export class TelegramNotificationDaemon {
 		for (const session of this.sessions.values()) if (session.ws.readyState === WebSocket.OPEN) attached += 1;
 		return attached;
 	}
-	private async renewOwnershipHeartbeat(): Promise<boolean> {
+	private async renewOwnershipHeartbeat(): Promise<OwnerHeartbeatSidecarRenewal> {
 		return renewOwnerHeartbeatSidecar({
 			settings: this.opts.settings,
 			ownerId: this.opts.ownerId,
@@ -9736,7 +9790,10 @@ export class TelegramNotificationDaemon {
 			if (!this.running) return;
 			void this.runtime
 				.runExclusive("telegram-owner-heartbeat", async () => {
-					if (!(await this.renewOwnershipHeartbeat())) this.runtime.requestStop();
+					// `publish_failed` keeps the daemon alive: ownership is still held
+					// and the next interval republishes (#4200). Only a proven
+					// ownership loss stops the owner.
+					if ((await this.renewOwnershipHeartbeat()) === "not_owner") this.runtime.requestStop();
 				})
 				.catch(err => {
 					logger.warn(`notifications: ownership heartbeat failed: ${sanitizeDiagnostic(String(err))}`);
@@ -12389,7 +12446,7 @@ export class TelegramNotificationDaemon {
 			while (this.running) {
 				if (await this.controlStopRequested()) break;
 				if (
-					!(await renewOwnerHeartbeatSidecar({
+					(await renewOwnerHeartbeatSidecar({
 						settings: this.opts.settings,
 						ownerId: this.opts.ownerId,
 						acquisitionId: this.opts.ownerId,
@@ -12398,7 +12455,7 @@ export class TelegramNotificationDaemon {
 						pid: this.opts.pid ?? process.pid,
 						pidIncarnation: this.opts.pidIncarnation,
 						attachedEndpoints: this.attachedEndpointCount(),
-					}))
+					})) === "not_owner"
 				)
 					break;
 				await this.runScan();

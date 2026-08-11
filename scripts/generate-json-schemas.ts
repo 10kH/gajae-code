@@ -136,7 +136,12 @@ function settingTypeToJsonSchema(definition: SettingDefinition): JsonSchemaObjec
 	}
 }
 
-function recordValueSchema(valueSchema?: { readonly type: "model-selector-value" }): JsonSchema {
+function recordValueSchema(
+	valueSchema?:
+		| { readonly type: "model-selector-value" }
+		| { readonly type: "string-enum"; readonly values: readonly string[] },
+): JsonSchema {
+	if (valueSchema?.type === "string-enum") return { type: "string", enum: valueSchema.values };
 	if (valueSchema?.type !== "model-selector-value") return true;
 	const selector = { type: "string", minLength: 1, pattern: "\\S" };
 	return {

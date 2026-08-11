@@ -89,6 +89,8 @@ export {
 
 const POLL_MS = 50;
 const CLOSE_TIMEOUT_MS = 2_000;
+const STARTUP_CLEANUP_PROOF_GRACE_MS = 500;
+
 const MAX_RECEIVED_AT_SKEW_MS = 5_000;
 const MAX_LIFECYCLE_METADATA_BYTES = 4096;
 const MAX_EFFECT_MARKER_LENGTH = 128;
@@ -4248,6 +4250,23 @@ async function exactCleanupProof(
 		: undefined;
 }
 
+async function waitForExactCleanupProof(
+	broker: Broker,
+	root: string | undefined,
+	id: string | undefined,
+	expected: EffectMarker | undefined,
+	evidence: { artifact: LifecycleFailureArtifact } | undefined,
+): Promise<LifecycleCleanupProof | undefined> {
+	const timing = lifecycleTiming(broker);
+	const deadline = timing.now() + STARTUP_CLEANUP_PROOF_GRACE_MS;
+	for (;;) {
+		const proof = await exactCleanupProof(broker, root, id, expected, evidence);
+		if (proof) return proof;
+		const remaining = deadline - timing.now();
+		if (remaining <= 0) return undefined;
+		await timing.sleep(Math.min(POLL_MS, remaining));
+	}
+}
 function validateLifecycleDeleteMetadataBinding(
 	broker: Broker,
 	operation: string,
@@ -4361,7 +4380,7 @@ export async function executeLifecycle(
 					expected,
 				)
 			: undefined;
-	const cleanupProof = await exactCleanupProof(broker, root, entry?.intendedSessionId, expected, evidence);
+	const cleanupProof = await waitForExactCleanupProof(broker, root, entry?.intendedSessionId, expected, evidence);
 	const startupFailure: LifecycleStartupFailureReceipt | undefined = evidence
 		? {
 				artifactDigest: evidence.digest,
