@@ -51,7 +51,6 @@ import {
 	prepareManagedDirectoryRoot,
 	publishManagedFileNoReplace,
 	publishManagedTombstone,
-	reapScrubbedProtocolRemnantsSync,
 	retainManagedDirectoryAuthority,
 	validateManagedArtifactTree,
 	validateNativeSecurityResult,
@@ -1153,7 +1152,6 @@ export function prepareManagedSessionScopeForWriteSync(
 		ensureManagedDirectory(path.join(internal, MANAGED_RECEIPTS_DIRECTORY), root, policy);
 		stage = "tombstones_directory";
 		ensureManagedDirectory(path.join(internal, MANAGED_TOMBSTONES_DIRECTORY), root, policy);
-		reapScrubbedProtocolRemnantsSync(scope.directoryPath);
 		return { kind: "resolved", scope };
 	} catch (error) {
 		const publication = error instanceof ManagedPublishError ? error : undefined;
@@ -3734,7 +3732,6 @@ export async function prepareManagedSessionScopeForWrite(
 		ensureManagedDirectory(path.join(internal, MANAGED_RECEIPTS_DIRECTORY), root, policy);
 		ensureManagedDirectory(path.join(internal, MANAGED_TOMBSTONES_DIRECTORY), root, policy);
 		await reconcileManagedTombstones(scope, expectedCandidate);
-		reapScrubbedProtocolRemnantsSync(scope.directoryPath);
 		return { kind: "resolved", scope };
 	} catch (error) {
 		const publication = error instanceof ManagedPublishError ? error : undefined;
