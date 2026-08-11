@@ -604,16 +604,18 @@ describe("SessionManager cold sidecar integration", () => {
 			fs.chmodSync(path.join(staleSidecar, "owner.json"), 0o600);
 			fs.writeFileSync(path.join(staleSidecar, ".session-memory.spill.idx"), "crash debris", { mode: 0o600 });
 			const transcriptRead = vi.spyOn(nestedStore, "readExpected");
-			const reopened = await SessionManager.openNestedManaged(
-				sessionFile,
-				destination,
-				nestedStore,
-				new FileSessionStorage(),
-				cwd,
-				"enabled",
-			);
-			expect(transcriptRead).not.toHaveBeenCalled();
+			SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1;
+			let reopened: SessionManager | undefined;
 			try {
+				reopened = await SessionManager.openNestedManaged(
+					sessionFile,
+					destination,
+					nestedStore,
+					new FileSessionStorage(),
+					cwd,
+					"auto",
+				);
+				expect(transcriptRead).not.toHaveBeenCalled();
 				expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
 				expect(reopened.getSessionMemoryStats().totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 				expect(reopened.getEntry(coldId)?.id).toBe(coldId);
@@ -624,7 +626,8 @@ describe("SessionManager cold sidecar integration", () => {
 				});
 				expect(fs.readdirSync(cacheRoot).filter(entry => entry.startsWith("i-")).length).toBe(1);
 			} finally {
-				await reopened.close();
+				SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
+				await reopened?.close();
 			}
 			expect(fs.existsSync(sidecarCacheRoot) ? fs.readdirSync(sidecarCacheRoot).length : 0).toBe(beforeReopen);
 			expect(fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0).toBe(residentEntriesBefore);
@@ -1133,7 +1136,7 @@ it("reopens an enabled explicit session from authenticated hot-tail metadata", a
 	}
 });
 
-it("applies enabled retirement while constructing a direct fork", async () => {
+it("applies auto-routed retirement while constructing a direct fork", async () => {
 	class ForkCountingStorage extends MemorySessionStorage {
 		fullReads = 0;
 		override readTextSync(filePath: string): string {
@@ -1162,20 +1165,23 @@ it("applies enabled retirement while constructing a direct fork", async () => {
 		},
 	];
 	storage.writeTextSync(source, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
-	const forked = await SessionManager.forkFrom(
-		source,
-		"/cwd",
-		SessionManager.explicitDestination("/forks"),
-		storage,
-		"copy-retain",
-		"enabled",
-	);
+	SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1;
+	let forked: SessionManager | undefined;
 	try {
+		forked = await SessionManager.forkFrom(
+			source,
+			"/cwd",
+			SessionManager.explicitDestination("/forks"),
+			storage,
+			"copy-retain",
+			"auto",
+		);
 		expect(forked.getSessionMemoryStats().coldRetirementActive).toBe(true);
 		expect(storage.fullReads).toBe(0);
 		expect(forked.getEntry("old")).toMatchObject({ id: "old" });
 	} finally {
-		await forked.close();
+		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
+		await forked?.close();
 	}
 });
 
@@ -4504,8 +4510,10 @@ describePosix("managed session memory authority", () => {
 			await manager.close();
 		}
 		try {
-			const reopened = await SessionManager.open(sessionFile, destination, undefined, "copy-retain", "enabled");
+			SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1;
+			let reopened: SessionManager | undefined;
 			try {
+				reopened = await SessionManager.open(sessionFile, destination, undefined, "copy-retain", "auto");
 				expect(reopened.getSessionMemoryStats()).toMatchObject({
 					sidecarEnabled: true,
 					coldRetirementActive: true,
@@ -4515,7 +4523,8 @@ describePosix("managed session memory authority", () => {
 				expect(reopened.getLabel(reopened.getEntries()[0]!.id)).toBe("managed label");
 				expect(reopened.buildSessionContext().messages).toHaveLength(3);
 			} finally {
-				await reopened.close();
+				SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
+				await reopened?.close();
 			}
 		} finally {
 			tempDir.removeSync();

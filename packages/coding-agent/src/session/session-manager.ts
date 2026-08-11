@@ -7787,10 +7787,6 @@ export class SessionManager {
 				this.#lazyReopenFallbackReason = "bounded_first_open_unreadable";
 				return false;
 			}
-			if (this.destination.kind === "managed" && before.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES) {
-				this.#lazyReopenFallbackReason = "bounded_first_open_unreadable";
-				return false;
-			}
 			const semanticStarted = startFirstOpenPhase();
 			const discovery = this.#scanBoundedTranscriptForFirstOpen(sessionFile, before);
 			recordFirstOpenPhase(telemetry, "semanticScan", semanticStarted);
@@ -14643,7 +14639,6 @@ export class SessionManager {
 
 	#effectiveSessionMemoryMode(size?: number): Exclude<SessionMemoryMode, "auto"> {
 		if (this.#sessionMemoryMode !== "auto") return this.#sessionMemoryMode;
-		if (this.destination.kind === "managed") return "off";
 		let transcriptBytes = size;
 		if (transcriptBytes === undefined && this.#sessionFile && this.#storage.existsSync(this.#sessionFile)) {
 			try {
@@ -17390,8 +17385,9 @@ export class SessionManager {
 	}
 
 	async #tryForkFromBoundedSource(sourcePath: string, expectedIdentity?: ResumeSessionIdentity): Promise<boolean> {
+		const sourceSize = expectedIdentity?.size ?? this.#storage.statSync(sourcePath).size;
 		if (
-			this.#effectiveSessionMemoryMode() !== "enabled" ||
+			this.#effectiveSessionMemoryMode(sourceSize) !== "enabled" ||
 			this.destination.kind === "managed" ||
 			typeof this.#storage.readRangeSync !== "function" ||
 			typeof this.#storage.openStagedWriter !== "function"
@@ -17408,7 +17404,6 @@ export class SessionManager {
 		let requiresRecordTransforms = false;
 		const preflightHash = crypto.createHash("sha256");
 		const preflightResult: { stat?: SessionStorageStat } = {};
-		const sourceSize = expectedIdentity?.size ?? this.#storage.statSync(sourcePath).size;
 		const preflightFailure = scanTranscriptLinesBounded(
 			this.#storage,
 			sourcePath,
@@ -17815,7 +17810,7 @@ export class SessionManager {
 		}
 
 		if (
-			sessionMemoryMode === "enabled" &&
+			(sessionMemoryMode === "enabled" || sessionMemoryMode === "auto") &&
 			path.dirname(path.resolve(filePath)) === path.resolve(destination.directory)
 		) {
 			const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
@@ -17882,7 +17877,12 @@ export class SessionManager {
 			throw new Error("Nested managed session escaped retained authority");
 		store.assertBound();
 		const capturedDescriptor = store.descriptorExpected(path.basename(resolved));
-		if (sessionMemoryMode === "enabled" && capturedDescriptor && capturedDescriptor.size > 0) {
+		const boundedAdmission =
+			sessionMemoryMode === "enabled" ||
+			(sessionMemoryMode === "auto" &&
+				capturedDescriptor !== null &&
+				capturedDescriptor.size >= autoModeMinTranscriptBytes());
+		if (boundedAdmission && capturedDescriptor && capturedDescriptor.size > 0) {
 			const boundedManager = new SessionManager(
 				cwdOverride ? path.resolve(cwdOverride) : getProjectDir(),
 				destination.directory,
@@ -17918,7 +17918,7 @@ export class SessionManager {
 				if (!(error instanceof Error) || error.message !== "nested_managed_bounded_rewrite_required") throw error;
 			}
 		}
-		if (sessionMemoryMode === "enabled" && capturedDescriptor) {
+		if (boundedAdmission && capturedDescriptor) {
 			const failedDescriptor = store.descriptorExpected(path.basename(resolved));
 			if (!failedDescriptor || !sameDescriptor(capturedDescriptor, failedDescriptor))
 				throw new Error("source_changed");
