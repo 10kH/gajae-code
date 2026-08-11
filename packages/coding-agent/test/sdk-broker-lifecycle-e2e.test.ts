@@ -3585,6 +3585,13 @@ test("idempotent lifecycle replay refreshes authority after a broker restart", a
 			pid: host.pid,
 			endpointMtimeMs,
 		});
+		await initial.index.append({
+			type: "host_heartbeat",
+			sessionId,
+			locator: { repo: root, stateRoot },
+			endpointGeneration: 2,
+			pid: host.pid,
+		});
 		const key = "replay-authority";
 		const targetHash = createHash("sha256").update(canonicalJson({ sessionId })).digest("hex");
 		const identity = await deriveIdempotencyIdentity(agentDir, "session.resume", key, targetHash);
