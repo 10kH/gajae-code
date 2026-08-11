@@ -20,7 +20,145 @@ External and managed integrations attach through SDK-core surfaces only:
 - endpoint URL/token discovery, raw WebSocket relays, and `gjc sdk serve` are not public attachment mechanisms;
 - lifecycle-equivalent per-session controls are prohibited on Telegram, Discord, Slack, ACP, MCP, and daemon CLI adapters.
 
+<<<<<<< HEAD
 For embedding GJC in-process, use the [embedding SDK guide](./sdk-embedding.md). Managed providers use the notification adapters documented below.
+||||||| d5b782d8dd
+```bash
+bun add @gajae-code/bridge-client
+```
+
+```ts
+import { SdkClient } from "@gajae-code/bridge-client";
+```
+
+`@gajae-code/coding-agent/sdk` remains a compatibility re-export of this same `SdkClient` class and associated types, so both entry points preserve class identity. The package is a client for the documented v3 transport only: it does not restore the historical BridgeClient backend protocol, handshake/commands/SSE endpoints, or any direct host-control path.
+
+## Migration from the removed RPC mode
+
+The retired `--mode rpc`, `rpc-ui`, and `bridge` modes are removed. The SDK v3
+WebSocket endpoint is now the canonical external control/query bus.
+
+| Retired RPC commands | SDK v3 control/query operations |
+| --- | --- |
+| `prompt`, `steer`, `follow_up`, `abort` | `turn.prompt`, `turn.steer`, `turn.follow_up`, `turn.abort` |
+| Model, thinking, queue, retry, and compaction controls | `model.*`, `thinking.*`, `queue.*`, `retry.*`, and `compaction.*` |
+| Session and transcript queries | `session.*`, `transcript.*`, `context.get`, and `session.stats` |
+| Workflow-gate response | `workflow.gate_answer` |
+
+See the [RPC-to-SDK v3 parity audit](./sdk-rpc-parity-audit.md) for the full
+matrix, partial equivalents, and evidence.
+
+For a local non-WebSocket transport, run one of these commands:
+
+```sh
+gjc sdk serve --stdio
+```
+
+```sh
+gjc sdk serve --socket <path>
+```
+
+It relays the identical SDK v3 frames over stdio or a Unix socket. Socket
+clients send an authentication preface and the socket is mode `0600`; stdio is
+one parent-owned connection.
+
+Python clients install the `gjc_sdk` package from `python/gjc-sdk`:
+
+```sh
+python -m pip install ./python/gjc-sdk
+```
+
+Import `SdkClient` with `from gjc_sdk import SdkClient`, then use
+`SdkClient.connect_ws`, `SdkClient.connect_socket`, or `SdkClient.connect_stdio`.
+The client supplies `reply.token` for replies.
+
+Phase 2 still does **not** provide unattended negotiation, a cross-process
+reattach/registry, or a renderer-grade full event stream. No event-plane parity
+is claimed; see the audit's [ranked Phase-2 register](./sdk-rpc-parity-audit.md#ranked-phase-2-follow-up-register--not-implemented).
+=======
+```bash
+bun add @gajae-code/bridge-client
+```
+
+```ts
+import { SdkClient } from "@gajae-code/bridge-client";
+```
+
+`@gajae-code/coding-agent/sdk` remains a compatibility re-export of this same `SdkClient` class and associated types, so both entry points preserve class identity. The package is a client for the documented v3 transport only: it does not restore the historical BridgeClient backend protocol, handshake/commands/SSE endpoints, or any direct host-control path.
+For terminal-side session operation, see [the SDK session CLI guide](./sdk-session-cli.md):
+`gjc sdk session list|inspect|send|status|tail` plus the explicit raw
+`control|query|global` hatch, all broker-bound and credential-free.
+
+## Migration from the removed RPC mode
+
+The retired `--mode rpc`, `rpc-ui`, and `bridge` modes are removed. The SDK v3
+WebSocket endpoint is now the canonical external control/query bus.
+
+| Retired RPC commands | SDK v3 control/query operations |
+| --- | --- |
+| `prompt`, `steer`, `follow_up`, `abort` | `turn.prompt`, `turn.steer`, `turn.follow_up`, `turn.abort` |
+| Model, thinking, queue, retry, and compaction controls | `model.*`, `thinking.*`, `queue.*`, `retry.*`, and `compaction.*` |
+| Session and transcript queries | `session.*`, `transcript.*`, `context.get`, and `session.stats` |
+| Workflow-gate response | `workflow.gate_answer` |
+
+See the [RPC-to-SDK v3 parity audit](./sdk-rpc-parity-audit.md) for the full
+matrix, partial equivalents, and evidence.
+
+For a local non-WebSocket transport, run one of these commands:
+
+```sh
+gjc sdk serve --stdio
+```
+
+```sh
+gjc sdk serve --socket <path>
+```
+
+It relays the identical SDK v3 frames over stdio or a Unix socket. Socket
+clients send an authentication preface and the socket is mode `0600`; stdio is
+one parent-owned connection.
+
+Python clients install the `gjc_sdk` package from `python/gjc-sdk`:
+
+```sh
+python -m pip install ./python/gjc-sdk
+```
+
+Import `SdkClient` with `from gjc_sdk import SdkClient`, then use
+`SdkClient.connect_ws`, `SdkClient.connect_socket`, or `SdkClient.connect_stdio`.
+The client supplies `reply.token` for replies.
+
+## External-agent SDK skills
+
+The generated `sdk-skills/` bundle provides host-neutral guidance for external agents that operate local GJC sessions directly through SDK v3. It is intentionally separate from GJC's four internal workflow skills, the coordinator MCP plugin, and the SDK MCP adapter.
+
+The bundle owns exactly six files:
+
+- `manifest.json`
+- `gjc-sdk-discover/SKILL.md`
+- `gjc-sdk-operate/SKILL.md`
+- `gjc-sdk-author/SKILL.md`
+- `gjc-sdk-author/templates/direct-sdk.ts`
+- `gjc-sdk-author/templates/direct-sdk.py`
+
+Regenerate with `bun run generate-sdk-skills`; CI checks byte-for-byte content and rejects unexpected files with `bun run check:sdk-skills`.
+
+### Bundle format version
+
+`manifest.json` is the versioned root of the on-disk bundle contract. It declares `formatVersion` (currently `1`) and the exact relative file closure the bundle owns. Consumers must treat any bundle whose manifest is missing, malformed, or declares an unsupported `formatVersion` as unreadable and fail closed — never guess at an unknown layout. The skill prompts are authored as static Markdown sources under `scripts/gjc-sdk-skills/prompts/`; the generator copies them verbatim and `check:sdk-skills` proves the committed bundle matches the generated artifacts byte-for-byte, so prompt text is reviewed and diffed as content, not as generator strings.
+
+The compatibility contract is additive: `formatVersion` only bumps when the layout becomes incompatible, and regeneration upgrades an installed bundle in place. A legacy unversioned bundle (the original five-file layout) is unsupported and must be rejected with a regeneration hint rather than read ambiguously.
+
+### Trust boundary
+
+Authentication for a direct SDK connection checks only possession of the endpoint token carried by the discovery record; there is no further per-request capability check at the transport. Once authenticated, requests reach the SDK operation registry dispatcher, which can serve managed bash, configuration, permissions, tools, extensions, and destructive session operations. The `sdk-skills/` templates and their allowlists are a procedural safety policy for reviewed local scripts — they are **not** a security boundary. A modified local script that has read the endpoint token can call more of the SDK than the templates permit, with that token's authority.
+
+The skills use a trusted-local procedural model. They require exact live-session selection, never log or persist endpoint credentials, compose a provenance-labeled inspection view from existing queries, and require single-use human approval before allowlisted lifecycle operations. They do not claim capability isolation: a modified local script that can read an endpoint token has the authority of that token.
+
+Phase 2 still does **not** provide unattended negotiation, a cross-process
+reattach/registry, or a renderer-grade full event stream. No event-plane parity
+is claimed; see the audit's [ranked Phase-2 register](./sdk-rpc-parity-audit.md#ranked-phase-2-follow-up-register--not-implemented).
+>>>>>>> origin/dev
 
 ## Architecture
 

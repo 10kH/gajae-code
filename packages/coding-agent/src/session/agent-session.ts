@@ -116,6 +116,7 @@ import {
 	type AuthDisposition,
 	beginAttempt,
 	classifyFallbackTrigger,
+	EMPTY_RESPONSE_PROVIDER_CODE,
 	type FallbackAttemptToken,
 	type FallbackTriggerClass,
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
@@ -938,6 +939,7 @@ type RetryErrorClassification =
 	| "terminal"
 	| "usage_limit"
 	| "first_event_timeout"
+	| "empty_response"
 	| "transient"
 	| "local_unavailable"
 	| "unknown";
@@ -15333,6 +15335,10 @@ export class AgentSession {
 		return message.transportFailure?.providerCode?.toLowerCase() === STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE;
 	}
 
+	#isTypedEmptyResponse(message: AssistantMessage): boolean {
+		return message.transportFailure?.providerCode?.toLowerCase() === EMPTY_RESPONSE_PROVIDER_CODE;
+	}
+
 	#isTerminalProviderFirstEventTimeout(message: AssistantMessage): boolean {
 		return this.#isKimiCodeFirstEventTimeout(message) || this.#isAlibabaTokenPlanFirstEventTimeout(message);
 	}
@@ -15357,7 +15363,8 @@ export class AgentSession {
 				classification === "usage_limit" ||
 				classification === "transient" ||
 				classification === "unknown" ||
-				classification === "first_event_timeout"
+				classification === "first_event_timeout" ||
+				classification === "empty_response"
 			);
 		}
 		const trigger = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
@@ -15468,6 +15475,7 @@ export class AgentSession {
 		if (message.stopReason !== "error") return "none";
 		if (message.errorKind === "provider_safety_stop") return "terminal";
 		if (this.#isTypedFirstEventTimeout(message)) return "first_event_timeout";
+		if (this.#isTypedEmptyResponse(message)) return "empty_response";
 		if (!message.errorMessage) return "none";
 		const err = message.errorMessage;
 		// Provider safety refusals (e.g. Anthropic stop_reason "refusal" /
@@ -15964,6 +15972,7 @@ export class AgentSession {
 		if (!managedFallback && !retrySettings.enabled) return false;
 		const classification = this.#classifyErrorForRetry(message);
 		const firstEventTimeout = classification === "first_event_timeout";
+		const emptyResponse = classification === "empty_response";
 		// Content-free message-only watchdog prose (wrapped canonical or bare
 		// per-provider variants) is admitted like the typed path: it is
 		// replay-safe, so a bare-default retry may re-issue the request even
@@ -15971,6 +15980,14 @@ export class AgentSession {
 		const messageOnlyWatchdogTimeout = isBareDefaultMessageOnlyFirstEventTimeout(message);
 		if (!managedFallback && firstEventTimeout && this.#retryAttempt === 0) {
 			this.#firstEventTimeoutRetryStartedAt = Date.now();
+		}
+		if (emptyResponse && (assistantMessageHasVisibleOrToolContent(message) || !scope || !scopeWasClean)) {
+			return managedOutcome
+				? {
+						type: "terminal",
+						terminal: { stopReason: "error", messages: [message] },
+					}
+				: false;
 		}
 		const requiresScopedFirstEventTimeout = managedFallback || !legacyRetryConfigured;
 		if (
@@ -16021,7 +16038,8 @@ export class AgentSession {
 		// Bare defaults retain their narrow watchdog and Codex admissions. A
 		// first-event timeout adds the typed, content-free, current-clean-scope
 		// requirement above; other transient watchdogs preserve legacy behavior.
-		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential) {
+		const canReplayEmptyResponse = emptyResponse && (this.#retryAttempt === 0 || this.#hasCleanRetryReplaySafety);
+		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential && !canReplayEmptyResponse) {
 			const bareDefaultCodexOverload = isBareDefaultCodexOverload(message);
 			const canReplayCodexOverload = bareDefaultCodexOverload;
 			if (
