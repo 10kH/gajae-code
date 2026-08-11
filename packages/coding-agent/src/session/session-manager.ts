@@ -6530,6 +6530,7 @@ export const SessionManagerTestHooks: {
 	beforeManagedResumeReturn?: (filePath: string, storage: SessionStorage) => void;
 	beforeManagedSourceStat?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
 	beforeManagedMissingInit?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
+	beforeManagedMissingPublish?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
 	/** Internal first-open GC strategy override; omitted means current. */
 	firstOpenGcStrategy?: SessionMemoryGcStrategy;
 	/** Internal first-open secondary-artifact mode override; omitted means auto. */
@@ -18510,11 +18511,24 @@ export class SessionManager {
 				managedInspectionStore.assertBound();
 				await SessionManagerTestHooks.beforeManagedMissingInit?.(filePath, managedInspectionStorage);
 				managedInspectionStore.assertBound();
+				await SessionManagerTestHooks.beforeManagedMissingPublish?.(filePath, managedInspectionStorage);
 				const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
 				manager.#sessionMemoryMode = sessionMemoryMode;
 				try {
-					await manager.#initSessionFile(filePath, true);
+					const fresh = manager.#freshSessionState(undefined, filePath);
+					const prepared = manager.#prepareFreshSessionTransition(fresh, "memory-fallback");
+					manager.#applyFreshSessionMetadata(fresh);
+					manager.#commitResidentTextStoreTransition(prepared);
+					manager.#retireEphemeralArtifacts();
+					const content = `${JSON.stringify(prepareEntryForPersistenceSync(fresh.header, manager.#blobStore))}\n`;
+					managedInspectionStore.publishNoReplaceSync(path.basename(filePath), Buffer.from(content, "utf8"));
+					manager.#flushed = true;
+					manager.#ensuredOnDisk = true;
+					writeTerminalBreadcrumb(manager.cwd, filePath);
 					return manager;
+				} catch (createError) {
+					await manager.#discardRejectedOpenState();
+					throw createError;
 				} finally {
 					managedInspectionStore.close();
 				}
