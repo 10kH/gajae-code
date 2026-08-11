@@ -81,8 +81,10 @@ User keybindings live at `~/.gjc/agent/keybindings.json`. For example:
 
 ```json
 {
-  "app.stt.toggle": "ctrl+h"
+  "app.stt.toggle": "f6"
 }
 ```
+
+On compact Mac keyboards, the physical chord may be **Fn+F6**. A function key avoids Option composed-character behavior and control-code collisions such as Ctrl+H.
 
 See [Keybindings](./keybindings.md) for chord syntax and terminal-specific behavior.
