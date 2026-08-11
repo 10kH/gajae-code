@@ -58,10 +58,13 @@ packages/ai/test/.temp-images/
 .gjc/verification/
 .gjc/logs/
 .gjc/rlm/
-.gjc/state/
+**/.gjc/state/
 .gjc/_session-*/
 .gjc/rss-checkpoints/
 .gjc/metrics.json
+**/.gjc/settings.json.fallback-invalid
+**/.gjc/settings.json.config-root.fallback-invalid
+**/.gjc/settings.json.strict-invalid
 .pi_config/
 .opencode/
 .worktrees/

@@ -5,7 +5,12 @@ import { getProjectDir } from "@gajae-code/utils";
 import { Command, Flags } from "@gajae-code/utils/cli";
 import { runUpdateCommand } from "../cli/update-cli";
 import { Settings } from "../config/settings";
-import { isUpdateChannel, UPDATE_CHANNELS, type UpdateChannel } from "../config/update-channel";
+import {
+	isUpdateChannel,
+	resolveMachineLocalUpdateChannel,
+	UPDATE_CHANNELS,
+	type UpdateChannel,
+} from "../config/update-channel";
 import { initTheme } from "../modes/theme/theme";
 
 export default class Update extends Command {
@@ -32,17 +37,11 @@ export default class Update extends Command {
 			channel = flags.channel;
 		} else {
 			const settings = await Settings.init({ cwd: getProjectDir() });
-			const configured = settings.get("startup.updateChannel");
-			if (isUpdateChannel(configured)) {
-				channel = configured;
-			} else {
-				// A hand-edited invalid value degrades to the schema default instead of
-				// leaking into output or the registry lookup.
-				process.stderr.write(
-					`Ignoring invalid startup.updateChannel "${configured}". Expected one of: ${UPDATE_CHANNELS.join(", ")}; using stable.\n`,
-				);
-				channel = "stable";
-			}
+			// Update selection is machine-local: a project `.gjc/config.yml`
+			// startup.updateChannel override must never silently pick the
+			// global release channel, so read the user/global layer only and
+			// fall back to the stable schema default when it is unset.
+			channel = resolveMachineLocalUpdateChannel(settings);
 		}
 		await initTheme();
 		await runUpdateCommand({ force: flags.force, check: flags.check, channel });

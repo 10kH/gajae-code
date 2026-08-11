@@ -1,7 +1,6 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getConfigRootDir } from "@gajae-code/utils";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "../skill-state/workflow-hud";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
@@ -46,6 +45,7 @@ export {
 	terminalCriticGateOverridden,
 } from "./ultragoal-receipt-freshness";
 
+import { isSettingsInitialized, Settings } from "../config/settings";
 import { gjcRoot, sessionUltragoalDir } from "./session-layout";
 import {
 	resolveGjcSessionForRead,
@@ -62,6 +62,7 @@ import {
 	writeArtifact,
 	writeGuardedJsonAtomic,
 } from "./state-writer";
+import { resolveWorkflowSetting } from "./workflow-settings";
 
 export {
 	captureUltragoalRecoverySnapshot,
@@ -387,39 +388,29 @@ function parseNudgeBudgetValue(value: unknown): number | null {
 	return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0 ? value : null;
 }
 
-async function readSettingsNudgeBudget(settingsPath: string): Promise<number | null> {
-	try {
-		const raw = await Bun.file(settingsPath).text();
-		const parsed = JSON.parse(raw) as Record<string, unknown>;
-		// Support both the flat dotted key and a nested gjc.ultragoal.nudgeBudget shape.
-		const flat = parseNudgeBudgetValue(parsed["gjc.ultragoal.nudgeBudget"]);
-		if (flat !== null) return flat;
-		const gjc = parsed.gjc;
-		if (gjc && typeof gjc === "object") {
-			const ultragoal = (gjc as Record<string, unknown>).ultragoal;
-			if (ultragoal && typeof ultragoal === "object") {
-				return parseNudgeBudgetValue((ultragoal as Record<string, unknown>).nudgeBudget);
-			}
-		}
-		return null;
-	} catch {
-		return null;
-	}
-}
-
 /**
- * Resolve the per-story nudge budget. Project `./.gjc/settings.json` overrides the
- * user settings (`$GJC_CONFIG_DIR/settings.json` or `~/.gjc/settings.json`), else the
- * default. Mirrors the `gjc.deepInterview.ambiguityThreshold` user+project precedence.
+ * Resolve the per-story nudge budget through the shared five-layer resolver.
+ * Ultragoal stays tolerant: an invalid optional settings file continues to the
+ * next layer and finally to the built-in default (10).
  */
-export async function resolveUltragoalNudgeBudget(cwd: string): Promise<{ budget: number; source: string }> {
-	const projectPath = path.join(gjcRoot(cwd), "settings.json");
-	const project = await readSettingsNudgeBudget(projectPath);
-	if (project !== null) return { budget: project, source: projectPath };
-	const userPath = path.join(getConfigRootDir(), "settings.json");
-	const user = await readSettingsNudgeBudget(userPath);
-	if (user !== null) return { budget: user, source: userPath };
-	return { budget: DEFAULT_ULTRAGOAL_NUDGE_BUDGET, source: "default" };
+export async function resolveUltragoalNudgeBudget(
+	cwd: string,
+	agentDir?: string,
+): Promise<{ budget: number; source: string }> {
+	const resolution = await resolveWorkflowSetting(cwd, "gjc.ultragoal.nudgeBudget", {
+		defaultValue: DEFAULT_ULTRAGOAL_NUDGE_BUDGET,
+		parse: value => {
+			const parsed = parseNudgeBudgetValue(value);
+			return parsed === null
+				? { kind: "invalid", reason: "expected gjc.ultragoal.nudgeBudget to be a non-negative integer" }
+				: { kind: "valid", value: parsed };
+		},
+		// The session's effective agent profile: an SDK session created with
+		// `createAgentSession({ agentDir })` resolves against that directory
+		// instead of the process-global default.
+		agentDir: agentDir ?? (isSettingsInitialized() ? Settings.instance.getAgentDir() : undefined),
+	});
+	return { budget: resolution.value, source: resolution.source };
 }
 
 /**
@@ -1024,7 +1015,11 @@ function emptyCounts(): Record<UltragoalGoalStatus, number> {
 	};
 }
 
-export async function getUltragoalStatus(cwd: string, sessionId?: string | null): Promise<UltragoalStatusSummary> {
+export async function getUltragoalStatus(
+	cwd: string,
+	sessionId?: string | null,
+	agentDir?: string,
+): Promise<UltragoalStatusSummary> {
 	const resolvedSessionId =
 		sessionId?.trim() ||
 		(await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID })).gjcSessionId;
@@ -1043,7 +1038,7 @@ export async function getUltragoalStatus(cwd: string, sessionId?: string | null)
 	const nudgeTarget = selectUltragoalNudgeTarget(plan, { currentGoalObjective: currentGoal?.objective });
 	let nudgeFields: Partial<UltragoalStatusSummary> = {};
 	if (nudgeTarget) {
-		const { budget } = await resolveUltragoalNudgeBudget(cwd);
+		const { budget } = await resolveUltragoalNudgeBudget(cwd, agentDir);
 		const ledger = await readUltragoalLedger(cwd, resolvedSessionId);
 		const nudgeCount = countUltragoalNudges(ledger, nudgeTarget.goalId);
 		nudgeFields = {
@@ -5072,7 +5067,11 @@ async function executeUltragoalSteeringCommand(args: readonly string[], cwd: str
 	}
 }
 
-async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<UltragoalCommandResult> {
+async function dispatchUltragoalCommand(
+	args: string[],
+	cwd: string,
+	agentDir?: string,
+): Promise<UltragoalCommandResult> {
 	// Help must not require a resolvable session; render it before session resolution.
 	const help = renderUltragoalHelp(args);
 	if (help) return { status: 0, stdout: help };
@@ -5090,7 +5089,7 @@ async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<Ul
 		const json = hasFlag(args, "--json");
 		switch (command) {
 			case "status":
-				return { status: 0, stdout: renderStatus(await getUltragoalStatus(cwd, sessionId), json) };
+				return { status: 0, stdout: renderStatus(await getUltragoalStatus(cwd, sessionId, agentDir), json) };
 			case "create":
 			case "create-goals": {
 				const mode = flagValue(args, "--gjc-goal-mode") === "per-story" ? "per-story" : "aggregate";
@@ -5321,10 +5320,10 @@ const RECONCILE_COMMANDS = new Set([
  * therefore a read PLUS a derived repair; it never mutates goals.json/ledger.jsonl
  * beyond that reconcile-failure audit event.
  */
-async function reconcileUltragoalState(cwd: string): Promise<void> {
+async function reconcileUltragoalState(cwd: string, agentDir?: string): Promise<void> {
 	const sessionId = currentUltragoalSessionId(cwd);
 	try {
-		const summary = await getUltragoalStatus(cwd, sessionId);
+		const summary = await getUltragoalStatus(cwd, sessionId, agentDir);
 		const status = summary.status;
 		const active = summary.exists && status !== "complete";
 		const payload: Record<string, unknown> = {
@@ -5397,12 +5396,16 @@ async function reconcileUltragoalState(cwd: string): Promise<void> {
 	}
 }
 
-export async function runNativeUltragoalCommand(args: string[], cwd = process.cwd()): Promise<UltragoalCommandResult> {
+export async function runNativeUltragoalCommand(
+	args: string[],
+	cwd = process.cwd(),
+	options: { agentDir?: string } = {},
+): Promise<UltragoalCommandResult> {
 	const command = commandName(args);
-	const result = await dispatchUltragoalCommand(args, cwd);
+	const result = await dispatchUltragoalCommand(args, cwd, options.agentDir);
 	const isHelp = args.some(isHelpArg) || args[0] === "help";
 	if (!isHelp && result.status === 0 && RECONCILE_COMMANDS.has(command)) {
-		await reconcileUltragoalState(cwd);
+		await reconcileUltragoalState(cwd, options.agentDir);
 	}
 	return result;
 }

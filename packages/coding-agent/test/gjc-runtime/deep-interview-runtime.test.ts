@@ -16,8 +16,8 @@ import {
 	sessionPlansDir,
 	sessionSpecsDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-
 import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
+import { YAML } from "bun";
 import { resetSettingsForTest } from "../../src/config/settings";
 
 const tempRoots: string[] = [];
@@ -588,30 +588,33 @@ describe("native gjc deep-interview runtime", () => {
 		expect(state.state.codebase_context).toBeUndefined();
 	});
 
-	it("honors gjc.deepInterview.ambiguityThreshold in project .gjc/settings.json", async () => {
+	it("honors gjc.deepInterview.ambiguityThreshold in project .gjc/config.yml", async () => {
 		const root = await tempDir();
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { deepInterview: { ambiguityThreshold: 0.08 } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { deepInterview: { ambiguityThreshold: 0.08 } } }),
 		);
 		const result = await runNativeDeepInterviewCommand(["--standard", "--json", "idea"], root);
 		expect(result.status).toBe(0);
 		const payload = JSON.parse(result.stdout ?? "{}");
 		expect(payload.threshold).toBeCloseTo(0.08);
-		expect(payload.threshold_source).toBe(path.join(root, ".gjc", "settings.json"));
+		expect(payload.threshold_source).toBe(path.join(root, ".gjc", "config.yml"));
 	});
 
-	it("prefers modern config.yml threshold over legacy project settings.json", async () => {
+	it("prefers project config.yml over user config.yml (project beats user)", async () => {
 		const root = await tempDir();
 		const agentDir = await tempDir();
 		setAgentDir(agentDir);
 		resetSettingsForTest();
-		await fs.writeFile(path.join(agentDir, "config.yml"), "gjc:\n  deepInterview:\n    ambiguityThreshold: 0.2\n");
+		await fs.writeFile(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({ gjc: { deepInterview: { ambiguityThreshold: 0.2 } } }),
+		);
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { deepInterview: { ambiguityThreshold: 0.08 } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { deepInterview: { ambiguityThreshold: 0.08 } } }),
 		);
 
 		resetSettingsForTest();
@@ -619,16 +622,16 @@ describe("native gjc deep-interview runtime", () => {
 
 		expect(result.status).toBe(0);
 		const payload = JSON.parse(result.stdout ?? "{}");
-		expect(payload.threshold).toBeCloseTo(0.2);
-		expect(payload.threshold_source).toBe(path.join(agentDir, "config.yml"));
+		expect(payload.threshold).toBeCloseTo(0.08);
+		expect(payload.threshold_source).toBe(path.join(root, ".gjc", "config.yml"));
 	});
 
-	it("--threshold beats project settings.json", async () => {
+	it("--threshold beats project config.yml", async () => {
 		const root = await tempDir();
 		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
 		await fs.writeFile(
-			path.join(root, ".gjc", "settings.json"),
-			JSON.stringify({ gjc: { deepInterview: { ambiguityThreshold: 0.08 } } }),
+			path.join(root, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { deepInterview: { ambiguityThreshold: 0.08 } } }),
 		);
 		const result = await runNativeDeepInterviewCommand(
 			["--threshold", "0.25", "--threshold-source", "flag:explicit", "--json", "idea"],
