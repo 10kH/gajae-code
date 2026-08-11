@@ -7,6 +7,7 @@ import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { EditTool } from "@gajae-code/coding-agent/edit";
 import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import type { Extension } from "@gajae-code/coding-agent/extensibility/extensions/types";
 import {
@@ -16,6 +17,9 @@ import {
 } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import type { ToolSession } from "@gajae-code/coding-agent/tools";
+import { ReadTool } from "@gajae-code/coding-agent/tools/read";
+import { SearchTool } from "@gajae-code/coding-agent/tools/search";
 import { TempDir } from "@gajae-code/utils";
 import { z } from "zod";
 
@@ -1686,6 +1690,116 @@ describe("AgentSession retry fallback", () => {
 		expect(streamOptions).toEqual([{ fallbackManaged: undefined, fallbackAttempt: undefined }]);
 	});
 
+	it("rebuilds real tool metadata after awaited model transitions", async () => {
+		const replaceModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const codexModel = getBundledModel("openai-codex", "gpt-5.5");
+		const hashlineModel = getBundledModel("zai", "glm-4.7");
+		if (!replaceModel || !codexModel || !hashlineModel) {
+			throw new Error("Expected bundled replace, Codex, and hashline models");
+		}
+		authStorage.setRuntimeApiKey("openai-codex", "openai-codex-test-key");
+		authStorage.setRuntimeApiKey("zai", "zai-test-key");
+
+		const settings = Settings.isolated({ "compaction.enabled": false, "edit.mode": "auto" });
+		const sessionManager = SessionManager.inMemory(tempDir.path());
+		let liveSession: AgentSession | undefined;
+		const toolSession: ToolSession = {
+			cwd: tempDir.path(),
+			hasUI: false,
+			settings,
+			getSessionFile: () => sessionManager.getSessionFile() ?? null,
+			getSessionSpawns: () => "*",
+			getActiveModelString: () =>
+				liveSession?.model ? `${liveSession.model.provider}/${liveSession.model.id}` : undefined,
+		};
+		const editTool = new EditTool(toolSession);
+		const readTool = new ReadTool(toolSession);
+		const searchTool = new SearchTool(toolSession);
+		const tools = [editTool, readTool, searchTool];
+		const captures: Array<{
+			model: string;
+			tools: Record<
+				string,
+				{ description: string; customWireName: string | undefined; parameters: unknown; mode: string | undefined }
+			>;
+		}> = [];
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model: replaceModel, systemPrompt: ["initial"], tools, messages: [] },
+		});
+		liveSession = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			toolRegistry: new Map<string, AgentTool>(tools.map(tool => [tool.name, tool as AgentTool])),
+			rebuildSystemPrompt: async (toolNames, toolRegistry) => {
+				const capturedTools = Object.fromEntries(
+					toolNames.map(name => {
+						const tool = toolRegistry.get(name);
+						if (!tool) throw new Error(`Missing captured tool ${name}`);
+						return [
+							name,
+							{
+								description: tool.description,
+								customWireName: tool.customWireName,
+								parameters: tool.parameters,
+								mode: name === "edit" ? (tool as EditTool).mode : undefined,
+							},
+						];
+					}),
+				);
+				captures.push({
+					model: liveSession?.model ? `${liveSession.model.provider}/${liveSession.model.id}` : "unknown",
+					tools: capturedTools,
+				});
+				return { systemPrompt: ["captured"] };
+			},
+		});
+		session = liveSession;
+
+		await liveSession.refreshBaseSystemPrompt();
+		expect(captures).toHaveLength(1);
+		const replaceCapture = captures[0];
+		expect(replaceCapture).toMatchObject({
+			model: `${replaceModel.provider}/${replaceModel.id}`,
+			tools: { edit: { mode: "replace", customWireName: undefined } },
+		});
+		expect(replaceCapture.tools.edit.parameters).toBe(editTool.parameters);
+		expect(replaceCapture.tools.read.description).not.toContain("copy it verbatim");
+		expect(replaceCapture.tools.search.description).not.toContain("2-char suffix is a content fingerprint");
+
+		await liveSession.setModel(codexModel);
+		expect(captures).toHaveLength(2);
+		const codexCapture = captures[1];
+		expect(codexCapture).toMatchObject({
+			model: `${codexModel.provider}/${codexModel.id}`,
+			tools: { edit: { mode: "apply_patch", customWireName: "apply_patch" } },
+		});
+		expect(codexCapture.tools.edit.description).not.toBe(replaceCapture.tools.edit.description);
+		expect(codexCapture.tools.edit.parameters).not.toBe(replaceCapture.tools.edit.parameters);
+		expect(codexCapture.tools.read.description).not.toContain("copy it verbatim");
+		expect(codexCapture.tools.search.description).not.toContain("2-char suffix is a content fingerprint");
+
+		await liveSession.setModel(hashlineModel);
+		expect(captures).toHaveLength(3);
+		const hashlineCapture = captures[2];
+		expect(hashlineCapture).toMatchObject({
+			model: `${hashlineModel.provider}/${hashlineModel.id}`,
+			tools: { edit: { mode: "hashline", customWireName: undefined } },
+		});
+		expect(hashlineCapture.tools.edit.description).not.toBe(codexCapture.tools.edit.description);
+		expect(hashlineCapture.tools.edit.parameters).not.toBe(codexCapture.tools.edit.parameters);
+		expect(hashlineCapture.tools.read.description).toContain("copy it verbatim");
+		expect(hashlineCapture.tools.search.description).toContain("2-char suffix is a content fingerprint");
+
+		await liveSession.setModel(replaceModel);
+		expect(captures).toHaveLength(4);
+		expect(captures[3]).toMatchObject({
+			model: `${replaceModel.provider}/${replaceModel.id}`,
+			tools: { edit: { mode: "replace", customWireName: undefined } },
+		});
+	});
 	it("normalizes suppression by base selector and clears it on model refresh", async () => {
 		const future = Date.now() + 60_000;
 		modelRegistry.suppressSelector("openai/gpt-4o:high", future);
