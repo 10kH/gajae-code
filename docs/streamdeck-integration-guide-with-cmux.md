@@ -26,7 +26,7 @@ level: 2
 
 ## Purpose
 
-Build a Stream Deck control surface that treats cmux as the terminal and browser host, GJC as the interactive coding runtime, and the GJC SDK as the authoritative machine interface for pending questions.
+Build a Stream Deck control surface that treats cmux as the terminal host, GJC as the interactive coding runtime, and the GJC SDK as the authoritative machine interface for pending questions.
 
 The control surface should:
 
@@ -37,7 +37,7 @@ The control surface should:
 - invoke common GJC skills without submitting them prematurely;
 - send precise keyboard controls such as `Shift+Tab`, `Esc`, and `Enter`;
 - render and answer the focused session's SDK questions;
-- open and close native cmux terminal and browser surfaces;
+- open and close native cmux terminal surfaces;
 - reuse existing Chrome or Safari tabs for ordinary web shortcuts;
 - use distinct, readable mascot artwork for each operation;
 - preserve the operator's original Stream Deck profile and unrelated repository work.
@@ -147,8 +147,8 @@ Compiled AppleScript applications are suitable when Stream Deck's built-in websi
 ### Page 2: cmux navigation and session entry
 
 ```text
-PANE PREV | PANE NEXT | TAB PREV | TAB NEXT | GJC FOCUS
-NEW SESSION | CLOSE TAB | NEW WEBSITE | STEER | ESC X2
+PANE PREV | PANE NEXT | NEW SESSION | CLOSE TAB | GJC FOCUS
+TAB PREV | TAB NEXT | VOICE | STEER | ESC X2
 BACK | VibeQuant | gajae-code | HOME | NEXT
 ```
 
@@ -162,7 +162,7 @@ BACK | VibeQuant | gajae-code | HOME | NEXT
 
 - `NEW SESSION`: create a terminal surface and ask for a worktree name; a blank answer starts a plain `gjc` session, while a name starts `gjc --worktree <name>`. Do not select a profile here.
 - `CLOSE TAB`: close the focused cmux surface.
-- `NEW WEBSITE`: create a native cmux browser surface in the current pane.
+- `VOICE`: toggle GJC speech-to-text with `Option+H` (`Alt+H`) on the focused `GJC:` surface.
 - `STEER`: send `Esc`, wait 100 ms, then send `Enter`.
 - `ESC X2`: send `Esc`, wait 100 ms, then send `Esc` again.
 
@@ -246,7 +246,6 @@ $CMUX identify --no-caller
 $CMUX tree --all
 $CMUX focus-panel --panel surface:7 --workspace workspace:1 --window window:1
 $CMUX new-surface --type terminal --pane pane:1 --focus true
-$CMUX new-surface --type browser --pane pane:1 --focus true
 $CMUX close-surface --surface surface:7 --workspace workspace:1 --window window:1
 ```
 
@@ -271,6 +270,16 @@ cmux send-key \
   --window window:1 \
   enter
 ```
+
+### Voice (`Option+H`)
+
+GJC maps speech-to-text to `Alt+H`. Deliver the terminal equivalent in one cmux surface write:
+
+```sh
+cmux rpc surface.send_text '{"surface":"surface:7","text":"\u001bh"}'
+```
+
+The expected bytes are `[27, 104]`. Guard this control with the same focused `GJC:` title check as other interactive GJC keys.
 
 ### Shift+Tab
 
@@ -416,7 +425,7 @@ Use temporary surfaces and restore the original focus after each test:
 - pane previous/next;
 - tab previous/next;
 - terminal creation in the requested pane;
-- browser-surface creation;
+- exact `Option+H` bytes (`[27, 104]`) and voice-mode toggle;
 - fixed-folder `cd` behavior;
 - focused tab closure;
 - same-tab worktree prompting when required;
