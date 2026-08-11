@@ -4601,18 +4601,30 @@ export interface ReapedSessionRegistration {
 /**
  * Drops every indexed session registration whose host process is provably gone.
  *
- * Liveness is the session index's own `alive(pid)` probe (`listSessions().live`),
- * which reports live for both a running pid and an EPERM pid, so an alien or
- * unreadable process is never mistaken for a dead one. Registrations already
- * marked `terminalUncertain` are left alone: their disposition belongs to the
- * terminal-uncertainty reconciliation path, and silently dropping them would
- * turn a fail-closed `session.close`/`session.delete` refusal into `not_found`.
+ * Proof of death is positive, never inferred from a missing liveness proof:
+ * `observeProcess` reports "exited" only on ESRCH or on a readable OS process
+ * incarnation that differs from the recorded one (a reused pid). A stale or
+ * missing heartbeat merely makes a session read as not-live — the host may
+ * still be running ahead of the next heartbeat checkpoint pass, so it is never
+ * grounds for a reap. EPERM and unreadable incarnations stay "uncertain", so an
+ * alien or unreadable process is never mistaken for a dead one. Registrations
+ * already terminal or marked `terminalUncertain` are left alone: their
+ * disposition belongs to the terminal-uncertainty reconciliation path, and
+ * silently dropping them would turn a fail-closed `session.close`/
+ * `session.delete` refusal into `not_found`.
  */
 export async function reapDeadSessionRegistrations(
 	broker: Pick<Broker, "index">,
 ): Promise<ReapedSessionRegistration[]> {
 	await broker.index.refresh();
-	const dead = broker.index.listSessions().sessions.filter(session => !session.live && !session.terminalUncertain);
+	const dead = broker.index
+		.listSessions()
+		.sessions.filter(
+			session =>
+				!session.terminal &&
+				!session.terminalUncertain &&
+				observeProcess(session.pid, session.hostIncarnation ?? session.processIncarnation) === "exited",
+		);
 	const reaped: ReapedSessionRegistration[] = [];
 	for (const session of dead) {
 		await broker.index.append({
