@@ -15,6 +15,7 @@ import {
 	settleProcessRestart,
 	settleTerminalScopeRestart,
 } from "../src/sdk/bus/reconciliation-store";
+import { boundCompletedTerminalScopeRows, collectEvictedTerminalKeys } from "../src/session/terminal-abort";
 
 const hash = (value: string) => crypto.createHash("sha256").update(value).digest("hex");
 
@@ -824,6 +825,48 @@ test("evicted pending tombstone advances to sent through the delivery transactio
 	const reloaded = createReconciliationStore({ sessionFile, sessionId: "s1" });
 	await reloaded.load();
 	expect(reloaded.snapshotTerminalKeys().find(k => k.keyHash === hash("k-evicted"))?.responseState).toBe("sent");
+});
+
+test("evicted terminal tombstones preserve the replay-shaped payload hash", () => {
+	// Review thread P2: a finalized row whose response is still pending must
+	// carry its replay-shaped hash into the evicted tombstone — the replay
+	// paths reconstruct the metadata-bearing payload from the tombstone, and
+	// the delivery observer requires either the original or the replay hash to
+	// advance the tombstone from pending to sent.
+	const replayPayloadHash = hash("replay-payload");
+	const rows: DurableTerminalScopeRecord[] = [
+		{
+			selection: "turn",
+			idempotencyKeyHash: hash("k-evict-replay"),
+			idempotencyInputHash: hash("i-evict-replay"),
+			turnDisposition: "stopped",
+			terminalPublished: false,
+			ownedWorkDisposition: "left_running",
+			automaticDeliveryDisposition: "enabled",
+			resumeOnOwnedCompletion: true,
+			turnContinuationFence: {
+				state: "retained",
+				abortedAttemptEpoch: 1,
+				blockedContinuationIds: [],
+				predecessorTombstones: [],
+				ownedCompletionPolicy: "enabled",
+			},
+			responseState: "pending",
+			responsePayloadHash: hash("original-payload"),
+			replayPayloadHash,
+			acceptedAt: 1,
+			terminalAt: 2,
+		},
+	];
+	const bounded = boundCompletedTerminalScopeRows(rows, 0);
+	const evicted = collectEvictedTerminalKeys(rows, bounded);
+	expect(evicted).toHaveLength(1);
+	expect(evicted[0]).toMatchObject({
+		turnDisposition: "stopped",
+		responseState: "pending",
+		responsePayloadHash: hash("original-payload"),
+		replayPayloadHash,
+	});
 });
 
 test("empty-store reload clears retained evicted-terminal keys on every empty-load path", async () => {

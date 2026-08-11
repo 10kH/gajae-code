@@ -1245,6 +1245,51 @@ test("registry saturation marks only the affected attempt and retires at endpoin
 	expect(isOwnedAttemptRegistrationIncomplete("lineage-a", 7)).toBe(false);
 });
 
+test("saturation evidence keeps an attempt incomplete after every evicted tool window settles", () => {
+	// Review thread P2: an attempt can simultaneously carry an evicted
+	// in-flight tool window AND a registration skipped because the owned
+	// registry is saturated. Settling the last tool window must not clear the
+	// incomplete marker while the saturation evidence still records an
+	// unregistered live job — a subsequent scope:"owned" abort could otherwise
+	// omit that job and claim stopped_owned.
+	for (let index = 0; index < 8194; index++) {
+		bindToolLineage(`sat-window-${index}`, {
+			lineageIdHash: "sat-attempt-lineage",
+			promptAttemptEpoch: 99,
+			endpointGeneration: 0,
+			endpointId: "ep-sat",
+		});
+	}
+	expect(isOwnedAttemptRegistrationIncomplete("sat-attempt-lineage", 99)).toBe(true);
+	// Fill the owned registry to capacity so this attempt's own registration
+	// is skipped as saturated.
+	for (let index = 0; index < 8192; index++) {
+		registerOwnedRegistration({
+			endpointId: "ep-fill",
+			lineageIdHash: `fill-lineage-${index}`,
+			promptAttemptEpoch: 1,
+			endpointGeneration: 0,
+			jobId: `fill-job-${index}`,
+			jobGeneration: `fill-gen-${index}`,
+		});
+	}
+	// The attempt's registration is skipped: its window marker AND the
+	// saturation evidence now both record the attempt as incomplete.
+	registerOwnedIfLineaged(
+		{ getJob: () => ({ generation: "gen-sat", status: "running" }) },
+		"sat-window-0",
+		"job-saturated",
+		"ep-sat",
+	);
+	settleToolLineageRegistrationWindow("sat-window-0", "ep-sat");
+	// The window marker is gone, but the saturation evidence keeps the attempt
+	// incomplete: the skipped job may still be running unregistered.
+	expect(isOwnedAttemptRegistrationIncomplete("sat-attempt-lineage", 99)).toBe(true);
+	// Retiring the saturated endpoint's registrations retires the authority.
+	retireOwnedRegistrationsForEndpoint("ep-sat");
+	expect(isOwnedAttemptRegistrationIncomplete("sat-attempt-lineage", 99)).toBe(false);
+});
+
 test("incomplete attempt evidence remains until every evicted tool window settles", () => {
 	for (let index = 0; index < 8194; index++) {
 		bindToolLineage(`shared-attempt-${index}`, {

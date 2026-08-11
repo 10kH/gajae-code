@@ -2873,7 +2873,11 @@ test("SDK-only host advances a finalized stopped row when the retry replay match
 		const payloadHash = createHash("sha256").update(JSON.stringify(result)).digest("hex");
 		const replayResult = {
 			...result,
-			replay: { responseState: "pending", responsePayloadHash: payloadHash, terminalPublished: false },
+			// The replay envelope carries the POST-CAS publication flag the
+			// stopped-row CAS observed (agent_end published); the seeded
+			// replay-shaped hash must match that exact envelope (review
+			// thread P2).
+			replay: { responseState: "pending", responsePayloadHash: payloadHash, terminalPublished: true },
 		};
 		const replayPayloadHash = createHash("sha256").update(JSON.stringify(replayResult)).digest("hex");
 		// Seed the POST-finalization durable state: the original stopped result
@@ -2885,7 +2889,7 @@ test("SDK-only host advances a finalized stopped row when the retry replay match
 					idempotencyKeyHash: keyHash,
 					idempotencyInputHash: inputHash,
 					turnDisposition: "stopped",
-					terminalPublished: false,
+					terminalPublished: true,
 					ownedWorkDisposition: "left_running",
 					automaticDeliveryDisposition: "enabled",
 					resumeOnOwnedCompletion: true,

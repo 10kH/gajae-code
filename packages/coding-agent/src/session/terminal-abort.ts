@@ -794,7 +794,14 @@ export function settleToolLineageRegistrationWindow(toolCallId: string, endpoint
 		const remaining = (incompleteAttemptWindowCounts.get(window.incompleteKey) ?? 1) - 1;
 		if (remaining <= 0) {
 			incompleteAttemptWindowCounts.delete(window.incompleteKey);
-			incompleteOwnedAttempts.delete(window.incompleteKey);
+			// The same attempt may ALSO carry saturation evidence (an owned job
+			// whose registration was rejected because the owned registry was
+			// full): keep the incomplete marker while either source remains, or
+			// a later scope:"owned" abort could omit that still-live job and
+			// claim stopped_owned (review thread P2).
+			if (!saturatedAttemptEndpoints.has(window.incompleteKey)) {
+				incompleteOwnedAttempts.delete(window.incompleteKey);
+			}
 		} else {
 			incompleteAttemptWindowCounts.set(window.incompleteKey, remaining);
 		}
@@ -1107,6 +1114,7 @@ export interface DurableScopeRetentionRow {
 	ownedWorkDisposition?: "not_requested" | "left_running" | "stopped" | "uncertain";
 	responseState?: "pending" | "sent" | "delivered" | "failed";
 	responsePayloadHash?: string;
+	replayPayloadHash?: string;
 	terminalPublished?: boolean;
 }
 
@@ -1155,6 +1163,7 @@ export interface EvictedTerminalKey {
 	ownedWorkDisposition: "not_requested" | "left_running" | "stopped" | "uncertain";
 	responseState?: "pending" | "sent" | "delivered" | "failed";
 	responsePayloadHash?: string;
+	replayPayloadHash?: string;
 	terminalPublished?: boolean;
 }
 
@@ -1175,6 +1184,10 @@ export function collectEvictedTerminalKeys<T extends DurableScopeRetentionRow>(
 				ownedWorkDisposition: row.ownedWorkDisposition ?? "not_requested",
 				responseState: row.responseState,
 				responsePayloadHash: row.responsePayloadHash,
+				// A pending finalized row's written replay must still advance the
+				// evicted tombstone; preserve its replay-shaped hash (review
+				// thread P2).
+				replayPayloadHash: row.replayPayloadHash,
 				terminalPublished: row.terminalPublished,
 			});
 		}

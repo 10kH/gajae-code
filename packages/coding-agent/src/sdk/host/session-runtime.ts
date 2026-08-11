@@ -2215,7 +2215,11 @@ function createControlSurface(
 							terminalPublished,
 							ownedWorkDisposition: scope === "turn" ? "left_running" : ownedStopped ? "stopped" : "uncertain",
 							responsePayloadHash: payloadHash,
-							replayPayloadHash: replayShapedHash(record, result, payloadHash),
+							// The replay envelope carries the POST-CAS publication
+							// flag; the replay-shaped hash must be computed from the
+							// updated row or a written replay could never match it
+							// (review thread P2).
+							replayPayloadHash: replayShapedHash({ ...record, terminalPublished }, result, payloadHash),
 							terminalAt: Date.now(),
 						}
 					: record,
