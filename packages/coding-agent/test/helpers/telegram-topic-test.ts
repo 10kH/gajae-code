@@ -11,12 +11,22 @@ const TELEGRAM_ORCHESTRATION_ENV_KEYS = [
 
 type TelegramOrchestrationEnv = Partial<Record<(typeof TELEGRAM_ORCHESTRATION_ENV_KEYS)[number], string | undefined>>;
 
-function withTelegramOrchestrationEnv<T>(enabled: boolean, run: () => T): T {
+export function withTelegramOrchestrationProvenance<T>(run: () => T): T {
+	const previous = process.env.GJC_COORDINATOR_SESSION_ID;
+	process.env.GJC_COORDINATOR_SESSION_ID = "test-telegram-orchestration";
+	try {
+		return run();
+	} finally {
+		if (previous === undefined) delete process.env.GJC_COORDINATOR_SESSION_ID;
+		else process.env.GJC_COORDINATOR_SESSION_ID = previous;
+	}
+}
+
+export function withoutTelegramOrchestrationProvenance<T>(run: () => T): T {
 	const previous: TelegramOrchestrationEnv = {};
 	for (const key of TELEGRAM_ORCHESTRATION_ENV_KEYS) {
 		previous[key] = process.env[key];
-		if (enabled && key === "GJC_COORDINATOR_SESSION_ID") process.env[key] = "test-telegram-orchestration";
-		else delete process.env[key];
+		delete process.env[key];
 	}
 	try {
 		return run();
@@ -27,14 +37,6 @@ function withTelegramOrchestrationEnv<T>(enabled: boolean, run: () => T): T {
 			else process.env[key] = value;
 		}
 	}
-}
-
-export function withTelegramOrchestrationProvenance<T>(run: () => T): T {
-	return withTelegramOrchestrationEnv(true, run);
-}
-
-export function withoutTelegramOrchestrationProvenance<T>(run: () => T): T {
-	return withTelegramOrchestrationEnv(false, run);
 }
 
 export function createOrchestrationNotificationsExtension(
