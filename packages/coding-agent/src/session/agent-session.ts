@@ -17667,6 +17667,7 @@ export class AgentSession {
 					: didReloadConversationChange
 						? "conversation-reload"
 						: undefined;
+				const previousEditMode = this.#resolveActiveEditMode();
 				await this.#restoreMCPSelectionsForSessionContext(sessionContext);
 
 				// The target session is loaded and MCP selections are restored: discard
@@ -17740,6 +17741,7 @@ export class AgentSession {
 					if (!this.model || !modelsAreEqual(this.model, resolution.model)) {
 						this.#setModelAuthoritatively(resolution.model, "restore");
 					}
+					await this.#syncEditToolModeAfterModelChange(previousEditMode);
 					if (resolution.explicitThinkingLevel && resolution.thinkingLevel !== undefined) {
 						this.setThinkingLevel(resolution.thinkingLevel);
 					}
