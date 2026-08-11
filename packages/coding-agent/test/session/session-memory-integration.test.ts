@@ -671,6 +671,25 @@ describe("SessionManager cold sidecar integration", () => {
 					"auto",
 				),
 			).rejects.toThrow("malformed");
+			const descriptor = nestedStore.descriptorExpected(path.basename(sessionFile));
+			if (!descriptor) throw new Error("Expected nested descriptor");
+			const oversizedDescriptor = vi
+				.spyOn(nestedStore, "descriptorExpected")
+				.mockReturnValue({ ...descriptor, size: 2 * 1024 * 1024 * 1024 + 2 * 1024 * 1024 });
+			try {
+				await expect(
+					SessionManager.openNestedManaged(
+						sessionFile,
+						destination,
+						nestedStore,
+						new FileSessionStorage(),
+						cwd,
+						"enabled",
+					),
+				).rejects.toMatchObject({ code: "oversized" });
+			} finally {
+				oversizedDescriptor.mockRestore();
+			}
 		} finally {
 			rootStore.close();
 			tempDir.removeSync();
@@ -1242,6 +1261,25 @@ it("constructs managed cold forks through bounded authority-bound publication", 
 		expect(forked.getSessionFile()).not.toBe(sourceFile);
 		expect(forked.getSessionMemoryStats().coldRetirementActive).toBe(true);
 		expect(forked.getEntry(old)).toMatchObject({ id: old });
+		await forked.close();
+		forked = undefined;
+		const captured = SessionManager.captureTranscriptStrict(sourceFile, storage);
+		if (captured.kind !== "captured") throw new Error("Expected strict managed capture");
+		try {
+			const capturedFork = await SessionManager.forkFromCaptured(
+				captured.snapshot,
+				cwd,
+				destination,
+				"copy-retain",
+				"auto",
+			);
+			if (capturedFork.kind !== "forked") throw new Error(`Captured managed fork failed: ${capturedFork.reason}`);
+			forked = capturedFork.manager;
+			expect(forked.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			expect(forked.getEntry(old)).toMatchObject({ id: old });
+		} finally {
+			captured.snapshot.close();
+		}
 	} finally {
 		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
 		await forked?.close();

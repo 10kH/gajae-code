@@ -750,8 +750,13 @@ function fsyncDirectorySync(pathname: string): void {
 function unlinkOwnedStagedSync(stagingPath: string, expected: { dev: bigint; ino: bigint }): void {
 	try {
 		const named = fs.lstatSync(stagingPath, { bigint: true });
-		if (named.dev !== expected.dev || named.ino !== expected.ino) return;
-		fs.unlinkSync(stagingPath);
+		if (!named.isFile() || named.isSymbolicLink() || named.dev !== expected.dev || named.ino !== expected.ino) return;
+		if (named.nlink > 1n) {
+			fs.unlinkSync(stagingPath);
+			return;
+		}
+		const sha256 = createHash("sha256").update(fs.readFileSync(stagingPath)).digest("hex");
+		exactRemoveSessionStorageLockPath(stagingPath, named, sha256);
 	} catch {
 		// ENOENT means the name was already consumed or removed; cleanup is best-effort.
 		return;
