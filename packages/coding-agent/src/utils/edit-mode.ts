@@ -25,7 +25,7 @@ export const EDIT_MODE_SETTINGS: EditModeSetting[] = ["auto", ...EDIT_MODES];
 
 export function normalizeEditMode(mode?: string | null): EditMode | undefined {
 	if (!mode) return undefined;
-	return EDIT_MODE_IDS[mode as keyof typeof EDIT_MODE_IDS];
+	return Object.hasOwn(EDIT_MODE_IDS, mode) ? EDIT_MODE_IDS[mode as keyof typeof EDIT_MODE_IDS] : undefined;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -58,9 +58,9 @@ const FAMILY_EDIT_MODES: Record<Exclude<ModelEditFamily, "unknown">, EditMode> =
  * equivalent models served through different providers route identically
  * (`openai/gpt-5.4`, `openrouter/openai/gpt-5.4`, `company-gateway/gpt-5.4`).
  *
- * Matching is anchored: only the final path segment is inspected, and family
- * tokens must appear at a token boundary. Returns `unknown` rather than making
- * a weak substring guess.
+ * Matching only examines the final path segment. A direct family prefix or a
+ * known provider-qualified family name is accepted, while arbitrary token
+ * substrings return `unknown` instead of guessing.
  */
 export function detectModelEditFamily(modelId: string | undefined): ModelEditFamily {
 	if (!modelId) return "unknown";
@@ -69,10 +69,10 @@ export function detectModelEditFamily(modelId: string | undefined): ModelEditFam
 	const model = segments.at(-1) ?? normalized;
 
 	if (/(?:^|[-_.])codex(?:$|[-_.\d])/.test(model)) return "codex";
-	if (/^(?:gpt|chatgpt)(?:$|[-_.\d])/.test(model)) return "gpt";
-	if (/^claude(?:$|[-_.\d])/.test(model)) return "claude";
-	if (/^deepseek(?:$|[-_.\d])/.test(model)) return "deepseek";
-	if (/^qwen(?:$|[-_.\d])/.test(model)) return "qwen";
+	if (/^(?:gpt|chatgpt)(?:$|[-_.\d])|(?:^|\.)openai\.(?:gpt|chatgpt)(?:$|[-_.\d])/.test(model)) return "gpt";
+	if (/^claude(?:$|[-_.\d])|(?:^|\.)anthropic\.claude(?:$|[-_.\d])/.test(model)) return "claude";
+	if (/^deepseek(?:$|[-_.\d])|(?:^|\.)deepseek\.deepseek(?:$|[-_.\d])/.test(model)) return "deepseek";
+	if (/^qwen(?:$|[-_.\d])|(?:^|\.)qwen\.qwen(?:$|[-_.\d])/.test(model)) return "qwen";
 	if (/^minimax(?:$|[-_.\d])/.test(model)) return "minimax";
 	if (/^glm(?:$|[-_.\d])/.test(model)) return "glm";
 	if (/^(?:kimi|moonshot)(?:$|[-_.\d])/.test(model)) return "kimi";

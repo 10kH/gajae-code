@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
-import type { SettingPath } from "@gajae-code/coding-agent/config/settings-schema";
+import {
+	reconcileSettingsSchema,
+	type SettingPath,
+	validateSettingPatch,
+} from "@gajae-code/coding-agent/config/settings-schema";
 import { EditTool } from "@gajae-code/coding-agent/edit";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import {
@@ -47,7 +51,7 @@ function makeSession(options: {
 		globalSettings["edit.mode"] = options.editMode;
 	}
 	if (options.modelVariants) {
-		globalSettings["edit.modelVariants" as SettingPath] = options.modelVariants;
+		globalSettings["edit.modelVariants"] = options.modelVariants as never;
 	}
 	const settings = Settings.isolated(globalSettings);
 	return {
@@ -64,10 +68,12 @@ describe("detectModelEditFamily", () => {
 		["openai/gpt-5.4", "gpt", "apply_patch"],
 		["openrouter/openai/gpt-5.4", "gpt", "apply_patch"],
 		["custom/gpt-oss-120b", "gpt", "apply_patch"],
+		["company/openai.gpt-5.4", "gpt", "apply_patch"],
 		["openai/gpt-5.3-codex", "codex", "apply_patch"],
 		["custom/codex-specialized", "codex", "apply_patch"],
 		["anthropic/claude-sonnet-4-6", "claude", "replace"],
 		["custom/claude-opus-4-5", "claude", "replace"],
+		["amazon-bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0", "claude", "replace"],
 		["deepseek/deepseek-v3.2", "deepseek", "replace"],
 		["custom/qwen3-coder", "qwen", "replace"],
 		["minimax-code/minimax-m2.5", "minimax", "hashline"],
@@ -197,6 +203,15 @@ describe("resolveEditModeDetails precedence", () => {
 		expect(() => resolveEditMode(makeSession({ model: "openai/gpt-5.4" }))).toThrow(/Invalid GJC_EDIT_VARIANT/);
 	});
 
+	test.each([
+		"toString",
+		"constructor",
+		"__proto__",
+	])("rejects inherited property name %s in GJC_EDIT_VARIANT", value => {
+		Bun.env.GJC_EDIT_VARIANT = value;
+		expect(() => resolveEditMode(makeSession({ model: "openai/gpt-5.4" }))).toThrow(/Invalid GJC_EDIT_VARIANT/);
+	});
+
 	test("invalid matched model override fails closed", () => {
 		const session = makeSession({
 			editMode: "replace",
@@ -204,6 +219,19 @@ describe("resolveEditModeDetails precedence", () => {
 			model: "custom/gpt-5.4",
 		});
 		expect(() => resolveEditModeDetails(session)).toThrow(/Invalid edit\.modelVariants value "atom"/);
+	});
+
+	test.each([
+		"toString",
+		"constructor",
+		"__proto__",
+	])("rejects inherited property name %s in a matched model override", value => {
+		const session = makeSession({
+			editMode: "auto",
+			modelVariants: { "gpt-5.4": value },
+			model: "custom/gpt-5.4",
+		});
+		expect(() => resolveEditModeDetails(session)).toThrow(/Invalid edit\.modelVariants value/);
 	});
 
 	test("non-matching invalid entries do not affect another model", () => {
@@ -218,12 +246,22 @@ describe("resolveEditModeDetails precedence", () => {
 	});
 });
 
+test("edit.modelVariants is a typed published setting with enum-validated values", () => {
+	const settings = Settings.isolated({ "edit.modelVariants": { "gpt-5.4": "hashline" } });
+	expect(settings.get("edit.modelVariants")).toEqual({ "gpt-5.4": "hashline" });
+	expect(validateSettingPatch({ "edit.modelVariants": { "gpt-5.4": "apply_patch" } })).toEqual([]);
+	expect(validateSettingPatch({ "edit.modelVariants": { "gpt-5.4": 42 } })).toEqual([
+		{ path: "edit.modelVariants.gpt-5.4", detail: "Expected string-enum." },
+	]);
+	expect(reconcileSettingsSchema({ edit: { modelVariants: { "gpt-5.4": "bogus" } } }).report.valid).toBe(false);
+});
+
 // ─── Settings integration ────────────────────────────────────────────────────
 
 describe("Settings.matchEditVariantForModel", () => {
 	test("returns raw matched value including invalid ones", () => {
 		const settings = Settings.isolated({
-			["edit.modelVariants" as SettingPath]: { "gpt-5.4": "bogus", claude: "replace" },
+			"edit.modelVariants": { "gpt-5.4": "bogus", claude: "replace" } as never,
 		});
 		expect(settings.matchEditVariantForModel("custom/gpt-5.4")).toEqual({ pattern: "gpt-5.4", value: "bogus" });
 		expect(settings.matchEditVariantForModel("anthropic/claude-opus")).toEqual({
@@ -236,7 +274,7 @@ describe("Settings.matchEditVariantForModel", () => {
 
 	test("resolver consumes Settings match with model-override provenance", () => {
 		const settings = Settings.isolated({
-			["edit.modelVariants" as SettingPath]: { "qwen3-coder-small": "hashline" },
+			"edit.modelVariants": { "qwen3-coder-small": "hashline" },
 		});
 		const details = resolveEditModeDetails({
 			settings,

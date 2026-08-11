@@ -1649,6 +1649,20 @@
 					"description": "Select the edit tool variant (auto routes by model family; replace, patch, hashline, vim, or apply_patch)",
 					"default": "auto"
 				},
+				"modelVariants": {
+					"type": "object",
+					"additionalProperties": {
+						"type": "string",
+						"enum": [
+							"apply_patch",
+							"hashline",
+							"patch",
+							"replace",
+							"vim"
+						]
+					},
+					"default": {}
+				},
 				"fuzzyMatch": {
 					"type": "boolean",
 					"description": "Accept high-confidence fuzzy matches for whitespace differences",
