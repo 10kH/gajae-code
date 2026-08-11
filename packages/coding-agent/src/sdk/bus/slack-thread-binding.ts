@@ -126,6 +126,7 @@ export interface SlackThreadClaimInput {
 	sessionId: string;
 	rootTs: string;
 	endpointGeneration: number;
+	attachmentAuthorityId?: string;
 	/**
 	 * Re-proves session authority inside the store lock, immediately before
 	 * commit. It may be invoked more than once for one claim: authority here is
@@ -282,6 +283,7 @@ function claimTransaction(
 			rootTs: input.rootTs,
 			sessionId: input.sessionId,
 			endpointGeneration: input.endpointGeneration,
+			...(input.attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId: input.attachmentAuthorityId }),
 			updatedAt: now(),
 			seenEventIds: current?.seenEventIds ?? [],
 			seenContextIds: current?.seenContextIds ?? [],

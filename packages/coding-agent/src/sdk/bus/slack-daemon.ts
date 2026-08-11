@@ -62,6 +62,7 @@ const MIN_PUBLICATION_LEASE_MS = 100;
 export interface SlackBindingAuthority {
 	sessionId: string;
 	endpointGeneration: number;
+	attachmentAuthorityId?: string;
 }
 
 export interface SlackNotificationDaemonOptions {
@@ -521,6 +522,11 @@ export class SlackNotificationDaemon {
 				"session_not_live",
 				"Slack thread binding requires an exact live session endpoint.",
 			);
+		const attachment =
+			authority.attachmentAuthorityId === undefined ? await this.#resolveAttachment(sessionId) : undefined;
+		const attachmentAuthorityId =
+			authority.attachmentAuthorityId ??
+			(attachment?.generation === authority.endpointGeneration ? attachment.authorityId : undefined);
 		await this.#verifyExistingRoot(rootTs);
 		return await claimSlackThreadBinding({
 			store: this.store,
@@ -530,6 +536,7 @@ export class SlackNotificationDaemon {
 			sessionId,
 			rootTs,
 			endpointGeneration: authority.endpointGeneration,
+			...(attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId }),
 			revalidate: async () => {
 				if ((await this.#bindingAuthority(sessionId))?.endpointGeneration !== authority.endpointGeneration)
 					return false;
@@ -548,7 +555,7 @@ export class SlackNotificationDaemon {
 		if (this.options.resolveBindingAuthority) return await this.options.resolveBindingAuthority(sessionId);
 		const endpoint = await this.#resolveAttachment(sessionId);
 		if (!endpoint || !Number.isSafeInteger(endpoint.generation) || endpoint.generation <= 0) return undefined;
-		return { sessionId, endpointGeneration: endpoint.generation };
+		return { sessionId, endpointGeneration: endpoint.generation, attachmentAuthorityId: endpoint.authorityId };
 	}
 
 	/** Prove the operator-supplied root exists in the configured channel before persisting anything. */
