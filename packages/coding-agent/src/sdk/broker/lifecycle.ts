@@ -2136,7 +2136,13 @@ async function removeOwnedLifecycleArtifacts(
 					}
 				}
 			}
-			if (endpointRemoval.detachedPath && fsSync.existsSync(endpointRemoval.detachedPath)) {
+			// A payload-durable POSIX detach has scrubbed its quarantine payload to a
+			// zero-byte placeholder, so the original identity cannot authorize a retry.
+			if (
+				endpointRemoval.detachedPath &&
+				endpointRemoval.payloadDurable !== true &&
+				fsSync.existsSync(endpointRemoval.detachedPath)
+			) {
 				const detachedPath = path.resolve(endpointRemoval.detachedPath);
 				if (path.dirname(detachedPath) !== path.dirname(path.resolve(endpointPath))) return false;
 				let detachedRemoval: NativeExactUnlinkResult;
@@ -2402,11 +2408,13 @@ async function removeExactDeadSessionEndpoint(
 		if (bytesRead !== Number(metadata.size)) return false;
 		const source = bytes.subarray(0, bytesRead);
 		const endpoint = JSON.parse(source.toString("utf8")) as { sessionId?: unknown; pid?: unknown; stale?: unknown };
+		const indexedEndpointMtimeMs = Math.trunc(record.endpointMtimeMs);
 		if (
 			endpoint.sessionId !== id ||
 			endpoint.pid !== record.pid ||
 			endpoint.stale === true ||
-			Number(metadata.mtimeNs) / 1_000_000 !== record.endpointMtimeMs
+			!Number.isSafeInteger(indexedEndpointMtimeMs) ||
+			metadata.mtimeNs / 1_000_000n !== BigInt(indexedEndpointMtimeMs)
 		)
 			return false;
 		await handle.close();
@@ -2549,7 +2557,7 @@ async function waitForClose(broker: Broker, id: string, record: CloseRecord, tim
 				(await hasOwnedEndpointPayload(record.locator.stateRoot, id, expected.effectMarker, durablePlaceholders))
 			)
 				return false;
-			await broker.index.unregisterIfCurrent(registration);
+			if (!(await broker.index.unregisterIfCurrent(registration))) return false;
 			return await endpointRemoved(record.locator.stateRoot, id);
 		}
 		await timing.sleep(POLL_MS);

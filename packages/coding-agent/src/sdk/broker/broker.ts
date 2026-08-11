@@ -335,6 +335,13 @@ function credentialFreeLifecycleResponse(value: unknown): unknown {
 	return output;
 }
 
+type LifecycleReplayEndpoint = {
+	endpoint: Record<string, unknown>;
+	endpointGeneration: number;
+	pid: number;
+	endpointMtimeMs: number;
+};
+
 type EndpointAuthority = { endpointGeneration?: number; endpointIncarnation?: string };
 function endpointIncarnation(
 	record: Pick<IndexedSession, "endpointGeneration" | "endpointMtimeMs" | "pid">,
@@ -1187,6 +1194,34 @@ export class Broker {
 		if (!record.live) return error("resource_gone", "session endpoint record is gone");
 		return this.#readEndpoint(record, authority);
 	}
+	async #readLifecycleReplayEndpoint(sessionId: string): Promise<LifecycleReplayEndpoint | BrokerResponse> {
+		await this.index.refresh();
+		const record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		if (!record || !record.live) return error("resource_gone", "session endpoint record is gone");
+		const endpointMtimeMs = record.endpointMtimeMs;
+		if (record.terminalUncertain)
+			return error("terminal_uncertain", "Session ownership is uncertain and cannot be replayed safely");
+		if (
+			!Number.isSafeInteger(record.endpointGeneration) ||
+			record.endpointGeneration <= 0 ||
+			!Number.isSafeInteger(record.pid) ||
+			record.pid <= 0 ||
+			endpointMtimeMs === undefined ||
+			!Number.isFinite(endpointMtimeMs) ||
+			endpointMtimeMs <= 0
+		)
+			return error("endpoint_stale", "session endpoint authority is incomplete");
+		const endpoint = await this.#readEndpoint(record, {});
+		if (!endpoint.ok) return endpoint;
+		if (endpoint.result === null || typeof endpoint.result !== "object" || Array.isArray(endpoint.result))
+			return error("endpoint_stale", "session endpoint is malformed");
+		return {
+			endpoint: endpoint.result as Record<string, unknown>,
+			endpointGeneration: record.endpointGeneration,
+			pid: record.pid,
+			endpointMtimeMs,
+		};
+	}
 	async #readEndpoint(record: IndexedSession, authority: EndpointAuthority): Promise<BrokerResponse> {
 		if (!isCanonicalSessionId(record.sessionId))
 			return error("invalid_input", "indexed sessionId is not a canonical safe identifier");
@@ -1403,14 +1438,20 @@ export class Broker {
 						(operation === "session.create" || operation === "session.fork" || operation === "session.resume") &&
 						typeof (replay.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
 					) {
-						const endpoint = await this.#endpoint({
-							sessionId: (replay.result as { sessionId: string }).sessionId,
-						});
-						if (endpoint.ok)
-							return {
-								ok: true,
-								result: { ...(replay.result as Record<string, unknown>), endpoint: endpoint.result },
-							};
+						const refreshed = await this.#readLifecycleReplayEndpoint(
+							(replay.result as { sessionId: string }).sessionId,
+						);
+						if (isBrokerResponse(refreshed)) return refreshed;
+						return {
+							ok: true,
+							result: {
+								...(replay.result as Record<string, unknown>),
+								endpointGeneration: refreshed.endpointGeneration,
+								pid: refreshed.pid,
+								endpointMtimeMs: refreshed.endpointMtimeMs,
+								endpoint: refreshed.endpoint,
+							},
+						};
 					}
 					return replay;
 				}

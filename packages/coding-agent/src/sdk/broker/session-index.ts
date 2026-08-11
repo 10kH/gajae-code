@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import { resolveEquivalentPath } from "@gajae-code/utils";
 import { withFileLock } from "../../config/file-lock";
 import {
 	assertSupportedSnapshotVersion,
@@ -570,7 +571,7 @@ export class SessionIndex {
 					current.endpointMtimeMs !== expected.endpointMtimeMs ||
 					current.lifecycleRequestId !== expected.lifecycleRequestId ||
 					current.processIncarnation !== expected.processIncarnation ||
-					path.resolve(current.locator.repo) !== path.resolve(expected.locator.repo) ||
+					resolveEquivalentPath(current.locator.repo) !== resolveEquivalentPath(expected.locator.repo) ||
 					path.resolve(current.locator.stateRoot) !== path.resolve(expected.locator.stateRoot)
 				)
 					return false;
