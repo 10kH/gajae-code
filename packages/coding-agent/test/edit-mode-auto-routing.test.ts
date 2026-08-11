@@ -86,6 +86,7 @@ describe("detectModelEditFamily", () => {
 		["custom/not-a-codex-model", "unknown", "hashline"],
 		["custom/gpt-not-a-codex-model", "unknown", "hashline"],
 		["custom/gptx-codex", "unknown", "hashline"],
+		["custom/not-gpt-5-codex", "unknown", "hashline"],
 		["custom/gpt-5foo", "unknown", "hashline"],
 		["custom/gpt-5foo-bar", "unknown", "hashline"],
 		["custom/company-code-model", "unknown", "hashline"],

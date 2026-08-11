@@ -68,7 +68,8 @@ export function detectModelEditFamily(modelId: string | undefined): ModelEditFam
 	const segments = normalized.split("/").filter(Boolean);
 	const model = segments.at(-1) ?? normalized;
 
-	if (/^codex(?:$|[-_.\d])|(?:^|[-_.])gpt-\d+(?:[-_.][\w]+)*[-_.]codex(?:$|[-_.\d])/.test(model)) return "codex";
+	if (/^codex(?:$|[-_.\d])|^(?:gpt|(?:duo-chat|openai)-gpt)-\d+(?:[-_.][\w]+)*[-_.]codex(?:$|[-_.\d])/.test(model))
+		return "codex";
 	if (
 		/^(?:gpt-\d+(?:$|[-_.])|gpt-oss(?:$|[-_.\d])|chatgpt(?:$|[-_.]\d))|(?:^|\.)openai\.(?:gpt|chatgpt)(?:$|[-_.\d])/.test(
 			model,
