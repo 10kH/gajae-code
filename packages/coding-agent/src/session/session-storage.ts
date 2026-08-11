@@ -1596,7 +1596,14 @@ function reclaimStaleSessionStorageLockSync(lockPath: string): boolean {
 	try {
 		fd = fs.openSync(lockPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
 		expected = fs.fstatSync(fd, { bigint: true });
-		if (!expected.isFile() || expected.nlink !== 1n || expected.size <= 0n || expected.size > 4096n) return false;
+		if (
+			!expected.isFile() ||
+			expected.nlink < 1n ||
+			expected.nlink > 2n ||
+			expected.size <= 0n ||
+			expected.size > 4096n
+		)
+			return false;
 		const bytes = Buffer.allocUnsafe(Number(expected.size));
 		let offset = 0;
 		while (offset < bytes.byteLength) {
@@ -1617,10 +1624,20 @@ function reclaimStaleSessionStorageLockSync(lockPath: string): boolean {
 		probe.kind === "absent" ||
 		(probe.kind === "live" && owner.incarnation !== undefined && probe.incarnation !== owner.incarnation);
 	if (!stale) return false;
+	const stagedPath = expected.nlink === 2n ? `${lockPath}.${owner.token}.owner.tmp` : undefined;
+	if (stagedPath) {
+		try {
+			const staged = fs.lstatSync(stagedPath, { bigint: true });
+			if (staged.dev !== expected.dev || staged.ino !== expected.ino || staged.isSymbolicLink()) return false;
+		} catch {
+			return false;
+		}
+	}
 	try {
 		const named = fs.lstatSync(lockPath, { bigint: true });
 		if (named.dev !== expected.dev || named.ino !== expected.ino || named.isSymbolicLink()) return false;
 		fs.unlinkSync(lockPath);
+		if (stagedPath) unlinkOwnedStagedSync(stagedPath, expected);
 		return true;
 	} catch (error) {
 		return (error as NodeJS.ErrnoException).code === "ENOENT";
@@ -1631,63 +1648,89 @@ export class FileSessionStorage implements SessionStorage {
 	acquireExclusiveLockSync(lockPath: string): SessionStorageExclusiveLock | undefined {
 		const dir = path.dirname(lockPath);
 		this.ensureDirSync(dir);
-		let fd: number | undefined;
 		for (let attempt = 0; attempt < 2; attempt++) {
+			const token = randomUUID();
+			const stagedPath = `${lockPath}.${token}.owner.tmp`;
+			let fd: number | undefined;
+			let stagedIdentity: { dev: bigint; ino: bigint } | undefined;
+			let published = false;
 			try {
 				fd = fs.openSync(
-					lockPath,
+					stagedPath,
 					fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0),
 					0o600,
 				);
-				break;
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-				if (attempt === 0 && reclaimStaleSessionStorageLockSync(lockPath)) continue;
-				return undefined;
-			}
-		}
-		if (fd === undefined) return undefined;
-		try {
-			secureOwnerOnlyFileDescriptor(lockPath, fd, "apply", undefined);
-			const probe = probeSessionStorageLockOwner(process.pid);
-			const owner: SessionStorageLockOwner = {
-				pid: process.pid,
-				...(probe.kind === "live" && probe.incarnation ? { incarnation: probe.incarnation } : {}),
-				token: randomUUID(),
-			};
-			fs.writeSync(fd, `${JSON.stringify(owner)}\n`);
-			fs.fsyncSync(fd);
-			const expected = fs.fstatSync(fd, { bigint: true });
-			let released = false;
-			return {
-				releaseSync: () => {
-					if (released) return;
-					released = true;
-					try {
-						try {
-							const named = fs.lstatSync(lockPath, { bigint: true });
-							if (named.dev === expected.dev && named.ino === expected.ino && !named.isSymbolicLink())
-								fs.unlinkSync(lockPath);
-						} catch (error) {
-							if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-						}
-					} finally {
-						fs.closeSync(fd);
-					}
-				},
-			};
-		} catch (error) {
-			try {
-				fs.closeSync(fd);
-			} finally {
-				try {
-					fs.unlinkSync(lockPath);
-				} catch {
-					// Preserve the lock acquisition error.
+				secureOwnerOnlyFileDescriptor(stagedPath, fd, "apply", undefined);
+				const opened = fs.fstatSync(fd, { bigint: true });
+				stagedIdentity = { dev: opened.dev, ino: opened.ino };
+				const probe = probeSessionStorageLockOwner(process.pid);
+				const owner: SessionStorageLockOwner = {
+					pid: process.pid,
+					...(probe.kind === "live" && probe.incarnation ? { incarnation: probe.incarnation } : {}),
+					token,
+				};
+				const bytes = Buffer.from(`${JSON.stringify(owner)}\n`, "utf8");
+				let offset = 0;
+				while (offset < bytes.byteLength) {
+					const written = fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
+					if (written === 0) throw new Error("Short write");
+					offset += written;
 				}
+				fs.fsyncSync(fd);
+				secureOwnerOnlyFileDescriptor(stagedPath, fd, "verify", undefined);
+				const staged = fs.fstatSync(fd, { bigint: true });
+				stagedIdentity = { dev: staged.dev, ino: staged.ino };
+				let outcome = classifyNativePublishOutcome(
+					nativeSessionStorage().renameNoReplacePath(stagedPath, lockPath),
+				);
+				let linkPublished = false;
+				if (renameFlagsUnsupported(outcome)) {
+					outcome = classifyNativePublishOutcome(nativeSessionStorage().linkNoReplacePath(stagedPath, lockPath));
+					linkPublished = outcome.ok;
+				}
+				if (!outcome.ok) {
+					fs.closeSync(fd);
+					fd = undefined;
+					unlinkOwnedStagedSync(stagedPath, stagedIdentity);
+					if (outcome.reason === "destination_exists") {
+						if (attempt === 0 && reclaimStaleSessionStorageLockSync(lockPath)) continue;
+						return undefined;
+					}
+					throw new Error(`exclusive_lock_publish_rejected:${outcome.reason}`);
+				}
+				published = true;
+				if (linkPublished) unlinkOwnedStagedSync(stagedPath, stagedIdentity);
+				secureOwnerOnlyFileDescriptor(lockPath, fd, "verify", undefined);
+				const expected = fs.fstatSync(fd, { bigint: true });
+				if (expected.nlink !== 1n) throw new Error("exclusive_lock_identity_ambiguous");
+				fsyncDirectorySync(dir);
+				const ownedFd = fd;
+				let released = false;
+				return {
+					releaseSync: () => {
+						if (released) return;
+						released = true;
+						try {
+							try {
+								const named = fs.lstatSync(lockPath, { bigint: true });
+								if (named.dev === expected.dev && named.ino === expected.ino && !named.isSymbolicLink())
+									fs.unlinkSync(lockPath);
+							} catch (error) {
+								if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+							}
+						} finally {
+							fs.closeSync(ownedFd);
+						}
+					},
+				};
+			} catch (error) {
+				if (published && stagedIdentity) unlinkOwnedStagedSync(lockPath, stagedIdentity);
+				if (stagedIdentity) unlinkOwnedStagedSync(stagedPath, stagedIdentity);
+				if (fd !== undefined) fs.closeSync(fd);
+				throw error;
 			}
-			throw error;
 		}
+		return undefined;
 	}
 	ensureDirSync(dir: string): void {
 		if (!fs.existsSync(dir)) {

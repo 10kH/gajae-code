@@ -371,6 +371,25 @@ describe("exclusive disposable build locks", () => {
 		expect(storage.existsSync(lockPath)).toBe(false);
 	});
 
+	it("does not publish a lock before owner metadata is durable", async () => {
+		const dir = await makeTempDir("gjc-exclusive-lock-owner-write-");
+		const storage = new FileSessionStorage();
+		const lockPath = path.join(dir, "build.lock");
+		const write = vi.spyOn(fs, "writeSync").mockImplementationOnce(() => {
+			throw new Error("injected_owner_write_failure");
+		});
+		try {
+			expect(() => storage.acquireExclusiveLockSync!(lockPath)).toThrow("injected_owner_write_failure");
+		} finally {
+			write.mockRestore();
+		}
+		expect(storage.existsSync(lockPath)).toBe(false);
+		expect(fs.readdirSync(dir)).toEqual([]);
+		const lock = storage.acquireExclusiveLockSync!(lockPath);
+		expect(lock).toBeDefined();
+		lock!.releaseSync();
+	});
+
 	it("does not unlink a replacement file when releasing the original file lock", async () => {
 		const dir = await makeTempDir("gjc-exclusive-lock-replacement-");
 		const storage = new FileSessionStorage();
