@@ -256,6 +256,87 @@ describe("public docs/site/version sync guard", () => {
 		await expect(checkPublicVersionSync(root)).resolves.toEqual([]);
 	});
 
+	function bunLock(workspaceVersions: Record<string, string>, catalogVersions: Record<string, string>): string {
+		const workspaces = Object.entries(workspaceVersions)
+			.map(
+				([dir, version]) =>
+					`    "packages/${dir}": {\n      "name": "@gajae-code/${dir}",\n      "version": "${version}",\n    },`,
+			)
+			.join("\n");
+		const catalog = Object.entries(catalogVersions)
+			.map(([name, version]) => `    "${name}": "${version}",`)
+			.join("\n");
+		return `{\n  "workspaces": {\n${workspaces}\n  },\n  "catalog": {\n${catalog}\n  },\n  "packages": {\n    "lucide-react": ["lucide-react@1.28.0", "", {}, "sha512-frozen"],\n  }\n}\n`;
+	}
+
+	// #4257: a merge that resolves package.json conflicts with a stale catalog
+	// leaves the Bun lock header trailing the manifests. The manifest and
+	// catalog loops alone cannot see it; the lock itself must be verified.
+	test("fails when the Bun lock workspace versions trail the package manifests", async () => {
+		const root = await createRepo({
+			"package.json": rootPackage(),
+			"packages/coding-agent/package.json": packageJson("@gajae-code/coding-agent"),
+			"packages/gajae-code/package.json": packageJson("gajae-code"),
+			"bun.lock": bunLock({ "coding-agent": "1.2.2" }, { "@gajae-code/coding-agent": "1.2.3" }),
+			"README.md": "# Gajae-Code\n",
+			"docs/sdk.md": "# SDK\n",
+		});
+		await addGeneratedDocsIndex(root);
+
+		const violations = await checkPublicVersionSync(root);
+		expect(
+			violations.some(
+				violation =>
+					violation.path === "bun.lock" &&
+					violation.message.includes("Lock workspace @gajae-code/coding-agent version 1.2.2") &&
+					violation.message.includes("does not match packages/coding-agent/package.json version 1.2.3"),
+			),
+		).toBe(true);
+	});
+
+	test("fails when the Bun lock catalog trails the root catalog", async () => {
+		const root = await createRepo({
+			"package.json": rootPackage(),
+			"packages/coding-agent/package.json": packageJson("@gajae-code/coding-agent"),
+			"packages/gajae-code/package.json": packageJson("gajae-code"),
+			"bun.lock": bunLock({ "coding-agent": "1.2.3" }, { "@gajae-code/coding-agent": "1.2.2" }),
+			"README.md": "# Gajae-Code\n",
+			"docs/sdk.md": "# SDK\n",
+		});
+		await addGeneratedDocsIndex(root);
+
+		const violations = await checkPublicVersionSync(root);
+		expect(
+			violations.some(
+				violation =>
+					violation.path === "bun.lock" &&
+					violation.message.includes("Lock catalog @gajae-code/coding-agent version 1.2.2") &&
+					violation.message.includes("does not match root catalog version 1.2.3"),
+			),
+		).toBe(true);
+	});
+
+	test("fails when a root catalog pin is missing from the Bun lock catalog", async () => {
+		const root = await createRepo({
+			"package.json": rootPackage(),
+			"packages/coding-agent/package.json": packageJson("@gajae-code/coding-agent"),
+			"packages/gajae-code/package.json": packageJson("gajae-code"),
+			"bun.lock": bunLock({ "coding-agent": "1.2.3" }, {}),
+			"README.md": "# Gajae-Code\n",
+			"docs/sdk.md": "# SDK\n",
+		});
+		await addGeneratedDocsIndex(root);
+
+		const violations = await checkPublicVersionSync(root);
+		expect(
+			violations.some(
+				violation =>
+					violation.path === "bun.lock" &&
+					violation.message.includes("Root catalog @gajae-code/coding-agent version 1.2.3 is missing from the Bun lockfile catalog"),
+			),
+		).toBe(true);
+	});
+
 	test("live check executes the production final-evidence validator against canonical deployed release state", async () => {
 		const responses = liveResponses(stableRelease(), releaseState());
 
