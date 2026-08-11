@@ -7,15 +7,24 @@ export function getRecorderInstallHint(platform: NodeJS.Platform = process.platf
 	return "Install a recorder: sudo apt install sox (or sudo apt install ffmpeg)";
 }
 
-export function formatSTTUsage(platform: NodeJS.Platform = process.platform): string {
+export function formatSTTUsage(
+	platform: NodeJS.Platform = process.platform,
+	terminalProgram: string | undefined = Bun.env.TERM_PROGRAM,
+): string {
 	const lines = [
 		"Enable STT: gjc config set stt.enabled true",
 		"You can also enable it in /settings > Interaction > Speech-to-Text.",
 		"In the composer, press Alt+H to start recording, then press Alt+H again to stop and transcribe.",
 		"The transcription is inserted into the composer for review before you send it.",
+		"Shortcut fallback: press Ctrl+P and select Toggle speech-to-text; repeat to stop and transcribe.",
 	];
 	if (platform === "darwin") {
 		lines.push("On macOS, Alt+H is Option+H. Your terminal must forward Option as Meta/Esc.");
+		if (terminalProgram?.toLowerCase().includes("ghostty")) {
+			lines.push(
+				"Ghostty: set macos-option-as-alt = true in its config, then reload the config or restart Ghostty.",
+			);
+		}
 	}
 	lines.push("Run /hotkeys inside GJC to confirm the active shortcut.");
 	return lines.join("\n");

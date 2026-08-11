@@ -25,9 +25,19 @@ Gajae-Code can record microphone audio, transcribe it locally with OpenAI Whispe
 
 Run `/hotkeys` to see the active shortcut after user remaps or extensions are loaded.
 
+If Alt/Option is not reaching GJC, press **Ctrl+P**, select **Toggle speech-to-text**, and repeat the action to stop and transcribe. This command-palette path does not depend on an Alt key sequence.
+
 ## macOS keyboard and permissions
 
 On macOS, **Alt+H** means **Option+H** (`⌥H`). The terminal must forward Option as Meta/Esc or use an enhanced keyboard protocol. In Apple Terminal, enable **Settings > Profiles > Keyboard > Use Option as Meta key** for the active profile.
+
+In Ghostty, add this to `~/.config/ghostty/config`, then reload the configuration or restart Ghostty:
+
+```ini
+macos-option-as-alt = true
+```
+
+Without that setting, Option+H may arrive as the composed Unicode character `˙`, which GJC correctly treats as text rather than an Alt+H shortcut.
 
 The first recording may cause macOS to request microphone access for the terminal application. Grant access under **System Settings > Privacy & Security > Microphone**. Restart the terminal after changing the permission.
 

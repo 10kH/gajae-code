@@ -17,10 +17,13 @@ describe("STT setup guidance", () => {
 		expect(usage).toContain("press Alt+H again to stop and transcribe");
 		expect(usage).toContain("inserted into the composer for review");
 		expect(usage).toContain("Run /hotkeys");
+		expect(usage).toContain("press Ctrl+P and select Toggle speech-to-text");
 	});
 
 	it("clarifies the macOS Option key requirement", () => {
-		expect(formatSTTUsage("darwin")).toContain("Alt+H is Option+H");
-		expect(formatSTTUsage("darwin")).toContain("forward Option as Meta/Esc");
+		const usage = formatSTTUsage("darwin", "ghostty");
+		expect(usage).toContain("Alt+H is Option+H");
+		expect(usage).toContain("forward Option as Meta/Esc");
+		expect(usage).toContain("macos-option-as-alt = true");
 	});
 });
