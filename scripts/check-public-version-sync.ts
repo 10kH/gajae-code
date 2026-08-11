@@ -197,11 +197,13 @@ export async function checkPublicVersionSync(repoRoot = path.join(import.meta.di
 	}
 
 	const packageByName = new Map<string, { relativePath: string; data: PackageJson }>();
+	const manifestByDir = new Map<string, { name: string; relativePath: string; version?: string }>();
 	for (const dir of await packageDirs(repoRoot)) {
 		const relativePath = `packages/${dir}/package.json`;
 		const packagePath = path.join(repoRoot, relativePath);
 		if (!(await pathExists(packagePath))) continue;
 		const pkg = await readJson<PackageJson>(packagePath);
+		manifestByDir.set(dir, { name: pkg.name ?? dir, relativePath, version: pkg.version });
 		if (!pkg.name || pkg.private) continue;
 		packageByName.set(pkg.name, { relativePath, data: pkg });
 
@@ -234,6 +236,69 @@ export async function checkPublicVersionSync(repoRoot = path.join(import.meta.di
 				path: "package.json",
 				message: `Workspace catalog ${name} version ${catalogVersion} does not match ${pkg.relativePath} version ${pkg.data.version}.`,
 			});
+		}
+	}
+
+	// The Bun lockfile header records each workspace package's version and a
+	// copy of the root catalog pins. Neither the manifest loop nor the catalog
+	// loop above reads it, so a merge that resolves package.json conflicts with
+	// a stale catalog (issue #4257) can land with manifests at the new version
+	// while the lock header and root catalog still pin the old one -- and
+	// `bun install --frozen-lockfile` only reports the split much later. Verify
+	// the lock agrees with both surfaces so check:public-sync fails closed on
+	// the whole version SSOT, not just the package.json half.
+	const bunLockPath = path.join(repoRoot, "bun.lock");
+	if (await pathExists(bunLockPath)) {
+		const bunLock = await Bun.file(bunLockPath).text();
+		// Everything before the top-level `"packages"` section; same marker the
+		// release script uses to scope its owned-version rewrite.
+		const header = bunLock.split('\n  "packages": {')[0] ?? bunLock;
+
+		const exactVersion = "(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)";
+		const lockCatalog = new Map<string, string>();
+		for (const match of header.matchAll(new RegExp(`\"(@gajae-code\\/[^\"]+)\":\\s*\"(${exactVersion})\"`, "g"))) {
+			lockCatalog.set(match[1]!, match[2]!);
+		}
+
+		for (const [name, lockVersion] of lockCatalog) {
+			const rootVersion = catalog[name];
+			if (rootVersion === undefined) {
+				violations.push({
+					path: "bun.lock",
+					message: `Lock catalog ${name} version ${lockVersion} is absent from the root workspace catalog.`,
+				});
+			} else if (lockVersion !== rootVersion) {
+				violations.push({
+					path: "bun.lock",
+					message: `Lock catalog ${name} version ${lockVersion} does not match root catalog version ${rootVersion}.`,
+				});
+			}
+		}
+		for (const [name, rootVersion] of Object.entries(catalog)) {
+			if (!name.startsWith("@gajae-code/")) continue;
+			if (!lockCatalog.has(name)) {
+				violations.push({
+					path: "bun.lock",
+					message: `Root catalog ${name} version ${rootVersion} is missing from the Bun lockfile catalog.`,
+				});
+			}
+		}
+
+		for (const match of header.matchAll(new RegExp(`\"packages\\/([^\"]+)\":\\s*\{\\s*\"name\":\\s*\"[^\"]+\",\\s*\"version\":\\s*\"(${exactVersion})\"`, "g"))) {
+			const dir = match[1]!;
+			const lockVersion = match[2]!;
+			const manifest = manifestByDir.get(dir);
+			if (manifest === undefined) {
+				violations.push({
+					path: "bun.lock",
+					message: `Lock workspace packages/${dir} has no package manifest.`,
+				});
+			} else if (manifest.version !== lockVersion) {
+				violations.push({
+					path: "bun.lock",
+					message: `Lock workspace ${manifest.name} version ${lockVersion} does not match ${manifest.relativePath} version ${manifest.version ?? "<missing>"}.`,
+				});
+			}
 		}
 	}
 

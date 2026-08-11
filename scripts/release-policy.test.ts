@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { releasedBunLockContent, STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME } from "./release";
 
@@ -238,5 +239,45 @@ describe("stable release policy", () => {
 		expect(releaseScript).toContain("corrections require a newer version");
 		expect(releaseScript).toContain("Keep the published tag immutable; do not retag, delete, or force-push it.");
 		expect(releaseScript).not.toMatch(/git tag -f|git push origin v\$\{version\} --force/u);
+	});
+
+	// #4257 regression: a merge that resolves package.json conflicts with a
+	// stale catalog can land with manifests at the new version while the Bun
+	// lock header and root catalog still pin the old one. The release helper's
+	// unit tests above only exercise fixtures, so this test runs the guard
+	// against the real repository state: every @gajae-code root catalog pin
+	// must be mirrored in bun.lock, and every workspace package's recorded lock
+	// version must equal its manifest version.
+	test("the real Bun lock header stays in lockstep with the root catalog and package manifests", async () => {
+		const rootPkg = JSON.parse(await Bun.file(path.join(repoRoot, "package.json")).text()) as {
+			workspaces?: { catalog?: Record<string, string> };
+		};
+		const catalog = rootPkg.workspaces?.catalog ?? {};
+		expect(catalog["@gajae-code/coding-agent"]).toBeTypeOf("string");
+
+		const lock = await Bun.file(path.join(repoRoot, "bun.lock")).text();
+		const header = lock.split('\n  "packages": {')[0] ?? lock;
+
+		for (const [name, version] of Object.entries(catalog)) {
+			if (!name.startsWith("@gajae-code/")) continue;
+			expect(header, `bun.lock must pin ${name} at ${version}`).toContain(`"${name}": "${version}"`);
+		}
+
+		const packagesRoot = path.join(repoRoot, "packages");
+		for (const entry of await fs.readdir(packagesRoot, { withFileTypes: true })) {
+			if (!entry.isDirectory()) continue;
+			// Removed packages may leave stray directories behind (e.g. the
+			// bridge-client dir after #4098); only packages with a manifest are
+			// expected in the lock.
+			const manifestPath = path.join(packagesRoot, entry.name, "package.json");
+			if ((await Bun.file(manifestPath).exists()) === false) continue;
+			const manifest = JSON.parse(await Bun.file(manifestPath).text()) as { version?: string };
+			if (typeof manifest.version !== "string") continue;
+			const match = header.match(
+				new RegExp(`"packages/${entry.name}": \\{\\s*"name": "[^\"]+",\\s*"version": "([^\"]+)"`),
+			);
+			expect(match, `bun.lock must record packages/${entry.name}`).not.toBeNull();
+			expect(match![1]!).toBe(manifest.version);
+		}
 	});
 });
