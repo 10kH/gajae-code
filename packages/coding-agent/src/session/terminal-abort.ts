@@ -1167,6 +1167,21 @@ export interface EvictedTerminalKey {
 	terminalPublished?: boolean;
 }
 
+/** Bound the retained evicted-key tombstone collection FIFO: when a
+ *  long-lived session's unique terminal-abort keys evict completed rows until
+ *  the tombstone cap is reached, the OLDEST tombstones expire instead of the
+ *  next finalization throwing after the destructive stop already happened —
+ *  the client would otherwise receive an error while its durable row stays
+ *  pending, and subsequent aborts repeat the failure and accumulate
+ *  non-evictable pending rows (review thread P2). A dropped tombstone only
+ *  loses replay authority for keys older than the bound; the idempotency
+ *  guarantee degrades to the in-memory cache horizon instead of disabling
+ *  future aborts. */
+export function boundEvictedTerminalKeys<T extends { keyHash: string }>(keys: T[], cap: number): T[] {
+	if (keys.length <= cap) return keys;
+	return keys.slice(keys.length - cap);
+}
+
 export function collectEvictedTerminalKeys<T extends DurableScopeRetentionRow>(
 	before: T[],
 	after: T[],

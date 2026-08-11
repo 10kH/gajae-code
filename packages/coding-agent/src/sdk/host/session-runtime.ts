@@ -16,6 +16,7 @@ import { type Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import {
 	boundCompletedTerminalScopeRows,
+	boundEvictedTerminalKeys,
 	collectEvictedTerminalKeys,
 	findOwnedRegistrationsForTurn,
 	isOwnedAttemptRegistrationIncomplete,
@@ -1663,10 +1664,13 @@ function createControlSurface(
 					const bounded = boundCompletedTerminalScopeRows(preBound, SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS);
 					const evicted = collectEvictedTerminalKeys(preBound, bounded);
 					const combined = [...state.keys, ...evicted];
-					if (combined.length > SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES) {
-						throw new Error("terminal key tombstone capacity reached");
-					}
-					return { scopes: bounded, keys: combined };
+					// FIFO-expire the OLDEST tombstones past the cap instead of
+					// throwing after the destructive stop already happened (review
+					// thread P2).
+					return {
+						scopes: bounded,
+						keys: boundEvictedTerminalKeys(combined, SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
+					};
 				});
 				return "ok";
 			} catch (error) {
@@ -1718,10 +1722,13 @@ function createControlSurface(
 					const bounded = boundCompletedTerminalScopeRows(scopes, SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS);
 					const evicted = collectEvictedTerminalKeys(scopes, bounded);
 					const combined = [...state.keys, ...evicted];
-					if (combined.length > SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES) {
-						throw new Error("terminal key tombstone capacity reached");
-					}
-					return { scopes: bounded, keys: combined };
+					// FIFO-expire the OLDEST tombstones past the cap instead of
+					// throwing after the destructive stop already happened (review
+					// thread P2).
+					return {
+						scopes: bounded,
+						keys: boundEvictedTerminalKeys(combined, SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
+					};
 				});
 			} catch {
 				// Best-effort: the row stays reserved (replays as uncertainty)
@@ -1742,10 +1749,13 @@ function createControlSurface(
 				const bounded = boundCompletedTerminalScopeRows(scopes, SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS);
 				const evicted = collectEvictedTerminalKeys(scopes, bounded);
 				const combined = [...state.keys, ...evicted];
-				if (combined.length > SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES) {
-					throw new Error("terminal key tombstone capacity reached");
-				}
-				return { scopes: bounded, keys: combined };
+				// FIFO-expire the OLDEST tombstones past the cap instead of
+				// throwing after the destructive stop already happened (review
+				// thread P2).
+				return {
+					scopes: bounded,
+					keys: boundEvictedTerminalKeys(combined, SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
+				};
 			});
 		};
 		let handle = terminalAbortSeams.getActivePromptHandle();
@@ -1961,10 +1971,13 @@ function createControlSurface(
 				const bounded = boundCompletedTerminalScopeRows(preBound, SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS);
 				const evicted = collectEvictedTerminalKeys(preBound, bounded);
 				const combined = [...state.keys, ...evicted];
-				if (combined.length > SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES) {
-					throw new Error("terminal key tombstone capacity reached");
-				}
-				return { scopes: bounded, keys: combined };
+				// FIFO-expire the OLDEST tombstones past the cap instead of
+				// throwing after the destructive stop already happened (review
+				// thread P2).
+				return {
+					scopes: bounded,
+					keys: boundEvictedTerminalKeys(combined, SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
+				};
 			});
 		} catch (error) {
 			if (error instanceof SdkOnlyIdempotencyConflictError) {

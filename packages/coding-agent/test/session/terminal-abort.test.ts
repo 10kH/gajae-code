@@ -4,6 +4,7 @@ import { ownedCompletionResumeAction } from "../../src/session/agent-session";
 import {
 	bindToolLineage,
 	boundCompletedTerminalScopeRows,
+	boundEvictedTerminalKeys,
 	classifyOwnedCompletion,
 	classifyOwnedEnvelope,
 	createTurnContinuationSeam,
@@ -1243,6 +1244,30 @@ test("registry saturation marks only the affected attempt and retires at endpoin
 	);
 	expect(lookupOwnedRegistration("fresh-1", "gen-fresh", "ep-fresh")).toBeDefined();
 	expect(isOwnedAttemptRegistrationIncomplete("lineage-a", 7)).toBe(false);
+});
+
+test("boundEvictedTerminalKeys FIFO-expires the oldest tombstones past the cap", () => {
+	// Review thread P2: a long-lived session's unique terminal-abort keys
+	// eventually fill the tombstone collection. The next finalization must
+	// FIFO-expire the OLDEST tombstones instead of throwing after the
+	// destructive stop already happened — the client would otherwise receive
+	// an error while its durable row stays pending, and subsequent aborts
+	// repeat the failure and accumulate non-evictable pending rows.
+	const keys = Array.from({ length: 4100 }, (_, i) => ({
+		keyHash: `k-${i}`,
+		inputHash: `i-${i}`,
+		turnDisposition: "stopped" as const,
+		ownedWorkDisposition: "left_running" as const,
+		responseState: "pending" as const,
+		responsePayloadHash: `p-${i}`,
+	}));
+	const bounded = boundEvictedTerminalKeys(keys, 4096);
+	expect(bounded).toHaveLength(4096);
+	// The OLDEST tombstones expire first; the newest keys keep replay authority.
+	expect(bounded[0]?.keyHash).toBe("k-4");
+	expect(bounded.at(-1)?.keyHash).toBe("k-4099");
+	// Under the cap nothing is dropped.
+	expect(boundEvictedTerminalKeys(keys.slice(0, 100), 4096)).toHaveLength(100);
 });
 
 test("saturation evidence keeps an attempt incomplete after every evicted tool window settles", () => {

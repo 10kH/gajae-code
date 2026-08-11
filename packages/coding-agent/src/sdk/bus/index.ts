@@ -63,6 +63,7 @@ import type { AgentSessionEvent } from "../../session/agent-session";
 import type { ClientBridge } from "../../session/client-bridge";
 import {
 	boundCompletedTerminalScopeRows,
+	boundEvictedTerminalKeys,
 	collectEvictedTerminalKeys,
 	findOwnedRegistrationsForTurn,
 	isOwnedAttemptRegistrationIncomplete,
@@ -5273,10 +5274,13 @@ export function createNotificationsExtension(
 							const bounded = boundCompletedTerminalScopeRows(scopes, MAX_DURABLE_TERMINAL_RESERVATIONS);
 							const evicted = collectEvictedTerminalKeys(scopes, bounded);
 							const combined = [...state.keys, ...evicted];
-							if (combined.length > MAX_RETAINED_TERMINAL_KEY_TOMBSTONES) {
-								throw new Error("terminal key tombstone capacity reached");
-							}
-							return { scopes: bounded, keys: combined };
+							// FIFO-expire the OLDEST tombstones past the cap instead of
+							// throwing after the destructive stop already happened (review
+							// thread P2).
+							return {
+								scopes: bounded,
+								keys: boundEvictedTerminalKeys(combined, MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
+							};
 						});
 					} catch {
 						// Best-effort: the row stays reserved (replays as uncertainty)
@@ -5297,10 +5301,13 @@ export function createNotificationsExtension(
 						const bounded = boundCompletedTerminalScopeRows(scopes, MAX_DURABLE_TERMINAL_RESERVATIONS);
 						const evicted = collectEvictedTerminalKeys(scopes, bounded);
 						const combined = [...state.keys, ...evicted];
-						if (combined.length > MAX_RETAINED_TERMINAL_KEY_TOMBSTONES) {
-							throw new Error("terminal key tombstone capacity reached");
-						}
-						return { scopes: bounded, keys: combined };
+						// FIFO-expire the OLDEST tombstones past the cap instead of
+						// throwing after the destructive stop already happened (review
+						// thread P2).
+						return {
+							scopes: bounded,
+							keys: boundEvictedTerminalKeys(combined, MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
+						};
 					});
 				};
 				const replayExisting = (row: DurableTerminalScopeRecord | EvictedTerminalKeyEntry) => {
@@ -5429,10 +5436,13 @@ export function createNotificationsExtension(
 							// (review thread P2).
 							const evicted = collectEvictedTerminalKeys(preBound, bounded);
 							const combined = [...state.keys, ...evicted];
-							if (combined.length > MAX_RETAINED_TERMINAL_KEY_TOMBSTONES) {
-								throw new Error("terminal key tombstone capacity reached");
-							}
-							return { scopes: bounded, keys: combined };
+							// FIFO-expire the OLDEST tombstones past the cap instead of
+							// throwing after the destructive stop already happened (review
+							// thread P2).
+							return {
+								scopes: bounded,
+								keys: boundEvictedTerminalKeys(combined, MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
+							};
 						});
 						return "ok";
 					} catch (error) {
@@ -5685,10 +5695,13 @@ export function createNotificationsExtension(
 						// silently drop the oldest key's replay authority, which
 						// would let a same-key retry after restart/expiry abort an
 						// unrelated later prompt (review thread P2).
-						if (combined.length > MAX_RETAINED_TERMINAL_KEY_TOMBSTONES) {
-							throw new Error("terminal key tombstone capacity reached");
-						}
-						return { scopes: bounded, keys: combined };
+						// FIFO-expire the OLDEST tombstones past the cap instead of
+						// throwing after the destructive stop already happened (review
+						// thread P2).
+						return {
+							scopes: bounded,
+							keys: boundEvictedTerminalKeys(combined, MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
+						};
 					});
 				} catch (error) {
 					if (error instanceof TerminalIdempotencyConflictError) {

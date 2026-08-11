@@ -2661,6 +2661,78 @@ test("SDK-only host never advances a finalized uncertain row for a mismatched re
 	}
 });
 
+test("SDK-only host FIFO-expires tombstones instead of failing the finalization at the cap", async () => {
+	// Review thread P2: a long-lived session fills the evicted-key tombstone
+	// collection with unique terminal-abort keys. The next finalization must
+	// FIFO-expire the oldest tombstones instead of throwing — the destructive
+	// stop may already have succeeded, and throwing would leave the client
+	// with an error and its durable row pending, with subsequent aborts
+	// repeating the failure.
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-tombstone-cap-"));
+	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+	const api = {
+		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+			handlers.set(event, handler);
+		},
+	} as unknown as ExtensionAPI;
+	const transport = memoryTransport();
+	const reconciliationStore = createReconciliationStore({
+		sessionFile: path.join(cwd, "session.json"),
+		sessionId: transport.sessionId,
+	});
+	createSdkSessionRuntimeExtension(api, {
+		agentDir: cwd,
+		createTransport: async () => transport,
+		terminalAbortSeams: {
+			getReconciliationStore: () => reconciliationStore,
+			getTerminalTurnEpoch: () => 7,
+			getActivePromptHandle: () => "exact-run-handle",
+			getActivePromptOwnerConnectionId: () => undefined,
+			cancelPendingPreflightForTerminalAbort: () => {},
+			abortPromptAndWaitWithTerminal: async (_handle, _options) => ({ status: "settled", terminalScope: {} }),
+		},
+	});
+	const ctx = extensionContext(transport.sessionId, cwd);
+	try {
+		await handlers.get("session_start")?.({}, ctx);
+		// Fill the tombstone collection to the 4096 cap.
+		await reconciliationStore.transactTerminalState(state => ({
+			scopes: state.scopes,
+			keys: Array.from({ length: 4096 }, (_, i) => ({
+				keyHash: createHash("sha256").update(`cap-key-${i}`).digest("hex"),
+				inputHash: createHash("sha256").update(`cap-input-${i}`).digest("hex"),
+				turnDisposition: "stopped" as const,
+				ownedWorkDisposition: "left_running" as const,
+				responseState: "pending" as const,
+				responsePayloadHash: createHash("sha256").update("p").digest("hex"),
+			})),
+		}));
+		// The next idle abort finalizes a no-effect reservation: the oldest
+		// tombstone expires instead of the finalization throwing.
+		transport.feed("client", {
+			type: "control_request",
+			id: "cap-abort",
+			operation: "turn.abort",
+			input: { mode: "terminal" },
+			idempotencyKey: "cap-abort-key",
+		} as SdkFrame);
+		const deadline = Date.now() + 15_000;
+		while (!transport.sent.some(frame => frame.id === "cap-abort" && frame.type === "control_response")) {
+			if (Date.now() > deadline) throw new Error("Timed out waiting for the cap abort response");
+			await Bun.sleep(20);
+		}
+		expect(transport.sent.find(frame => frame.id === "cap-abort")).toMatchObject({
+			ok: true,
+			result: expect.objectContaining({ turn: "no_active_turn", terminal: "terminal_no_effect" }),
+		});
+		// The collection stays bounded at the cap.
+		expect(reconciliationStore.snapshotTerminalKeys()).toHaveLength(4096);
+	} finally {
+		await handlers.get("session_shutdown")?.({}, ctx);
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
 test("SDK-only host cancels only the aborting requester's preflight while another connection is admitted", async () => {
 	// Review thread P1: a queued requester's terminal abort rejects its own
 	// wrapper callback but must NOT invoke the session-wide preflight abort
