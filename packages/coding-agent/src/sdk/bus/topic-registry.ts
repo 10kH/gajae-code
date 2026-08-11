@@ -213,7 +213,7 @@ export function emptyTopicRegistryState(): TopicRegistryState {
  */
 export function parseTopicRegistryState(value: unknown): TopicRegistryState | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-	const state = value as TopicRegistryState;
+	let state = value as TopicRegistryState;
 	if (state.version !== undefined && state.version !== 2) throw new Error("unsupported future Telegram topic state");
 	if (!state.topics || typeof state.topics !== "object" || Array.isArray(state.topics)) return undefined;
 	if (state.version === undefined) {
@@ -239,6 +239,26 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 
 	const isObject = (candidate: unknown): candidate is Record<string, unknown> =>
 		!!candidate && typeof candidate === "object" && !Array.isArray(candidate);
+	state = {
+		...state,
+		topics: Object.fromEntries(
+			Object.entries(state.topics).map(([sessionId, record]) => [
+				sessionId,
+				isObject(record) ? { ...record } : record,
+			]),
+		),
+		retiredTopics:
+			state.retiredTopics === undefined
+				? undefined
+				: Object.fromEntries(
+						Object.entries(state.retiredTopics).map(([sessionId, records]) => [
+							sessionId,
+							Array.isArray(records)
+								? records.map(record => (isObject(record) ? { ...record } : record))
+								: records,
+						]),
+					),
+	};
 	const validTimestamp = (candidate: unknown): candidate is number =>
 		typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0;
 	const validEpoch = (candidate: unknown): candidate is number =>
@@ -303,12 +323,19 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 			value => value !== undefined,
 		).length;
 		if (leaseFieldCount !== 0 && leaseFieldCount !== 3) malformed();
-		if (
-			raw.authorityState === "disconnect_grace"
-				? raw.disconnectGraceExpiresAt === undefined || raw.orphanedAt === undefined
-				: raw.disconnectGraceExpiresAt !== undefined
-		)
-			malformed();
+		if (raw.authorityState === "disconnect_grace") {
+			if (raw.disconnectGraceExpiresAt === undefined || raw.orphanedAt === undefined) malformed();
+		} else if (raw.disconnectGraceExpiresAt !== undefined) {
+			if (
+				raw.authorityState !== "archive_pending" &&
+				raw.authorityState !== "archive_exhausted" &&
+				raw.authorityState !== "inactive"
+			)
+				malformed();
+			// Older archive transitions retained the expired disconnect-grace marker,
+			// making the entire shared registry unreadable on the next daemon start.
+			delete raw.disconnectGraceExpiresAt;
+		}
 		const hasBinding = hasAnyBinding(raw);
 		const hasArchiveOnlyChatIdentity =
 			(raw.authorityState === "archive_pending" ||
@@ -333,11 +360,13 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 	for (const [sessionId, records] of Object.entries(state.retiredTopics ?? {})) {
 		if (!isValidBindingString(sessionId) || !Array.isArray(records)) malformed();
 		for (const [index, record] of records.entries()) {
-			parseTopicRegistryState({
+			const recordKey = `${sessionId}:retired:${index}`;
+			const parsed = parseTopicRegistryState({
 				version: 2,
 				registryGeneration: 0,
-				topics: { [`${sessionId}:retired:${index}`]: record },
+				topics: { [recordKey]: record },
 			});
+			records[index] = parsed?.topics[recordKey] ?? malformed();
 		}
 	}
 	for (const [sessionId, epoch] of Object.entries(state.fences ?? {}))

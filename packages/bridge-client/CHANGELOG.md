@@ -1,6 +1,13 @@
 # Changelog
 
 ## [Unreleased]
+### Changed
+
+- Renamed the create-connect-submit API contract to durable client-side orchestration. The create key and submission reference remain durable in their existing authorities, and recovery reconciles their composite outcome after restart; the SDK does not promise a single-authority transactional atomic outcome across process failure. `SdkDurableLookupIdentity` carries no create replay material — no `create` or `createRedacted` field — so no potentially secret-bearing MCP server definition (HTTP/SSE URL userinfo/query tokens, stdio args, env, headers) can leak into the public recovery identity. The full create is supplied separately by the caller via `SdkDurableReconcileOptions.create` when replay is needed during reconciliation.
+
+### Added
+
+- Added `SdkClient.createConnectSubscribeSubmit()` and `reconcileCreateConnectSubmit()`. The TypeScript SDK retains caller-provided create and submission identities, fences the one ordered write to a replay-validated socket incarnation, and reports explicit recovery uncertainty without retrying ordered work.
 
 ## [0.12.21] - 2026-08-09
 
@@ -21,6 +28,7 @@
 
 - `SdkClientOptions.reconnectMaxBackoffMs` caps each exponential reconnect sleep (default 2s). A client configured with a long reconnect budget now keeps probing every couple of seconds instead of sleeping for tens of seconds on its final attempts. The `reconnectAttempts`/`reconnectBackoffMs` defaults (3 attempts, 25ms base, 100ms maximum sleep) are unchanged and stay below the new cap, so no existing caller changes behavior.
 - Lifecycle requests now retain a normalized reconciliation fingerprint after an uncertain send. Callers can use `lookupLifecycle` to distinguish the durable accepted/terminal outcome without resending ordered work.
+- Added `SdkClient.createConnectSubscribeSubmit()` and `reconcileCreateConnectSubmit()`. The TypeScript SDK retains caller-provided create and submission identities, fences the one ordered write to a replay-validated socket incarnation, and reports explicit recovery uncertainty without retrying ordered work.
 
 ## [0.12.15] - 2026-08-06
 
