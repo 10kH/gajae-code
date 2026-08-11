@@ -86,6 +86,18 @@ describe("resolveSessionContextBudgetBytes fail-closed parsing", () => {
 		expect(result).toBe(SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES_DEFAULT);
 		expect(warn).toHaveBeenCalled();
 	});
+
+	it("warns when an explicitly empty override is dropped", () => {
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		expect(resolveSessionContextBudgetBytes("")).toBe(SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES_DEFAULT);
+		expect(warn).toHaveBeenCalled();
+	});
+
+	it("does not warn when the override is unset", () => {
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		expect(resolveSessionContextBudgetBytes(undefined)).toBe(SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES_DEFAULT);
+		expect(warn).not.toHaveBeenCalled();
+	});
 });
 
 describe("resolveSessionContextBudgetBytes canonical acceptance", () => {

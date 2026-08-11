@@ -1957,8 +1957,8 @@ export const SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES_MAX = 8 * 1024 * 1024 
  * warning so a dropped override is never silent.
  */
 export function resolveSessionContextBudgetBytes(override: string | undefined): number {
-	if (override === undefined || override === "") return SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES_DEFAULT;
-	if (!/^[0-9]+$/.test(override)) {
+	if (override === undefined) return SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES_DEFAULT;
+	if (override === "" || !/^[0-9]+$/.test(override)) {
 		logger.warn("GJC_SESSION_CONTEXT_BUDGET_BYTES ignored: expected a positive integer", { override });
 		return SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES_DEFAULT;
 	}
