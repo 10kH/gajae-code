@@ -301,7 +301,7 @@ export function parseKeyId(value: string): ParsedKeyId | undefined {
 					.map(part => part.trim());
 	const modifiers: KeyModifier[] = [];
 	for (const part of modifierParts) {
-		const modifier = KEY_MODIFIER_ALIASES[part];
+		const modifier = Object.hasOwn(KEY_MODIFIER_ALIASES, part) ? KEY_MODIFIER_ALIASES[part] : undefined;
 		if (!modifier || modifiers.includes(modifier)) return undefined;
 		modifiers.push(modifier);
 	}
@@ -427,9 +427,9 @@ interface ParsedKittySequence {
 
 // Regex for Kitty protocol event type detection
 // Matches CSI sequences with :2 (repeat) or :3 (release) event type
-// Format: \x1b[...;modifier:event_type<terminator> where terminator is u, ~, or A-F/H
-const KITTY_RELEASE_PATTERN = /^\x1b\[[\d:;]*:3[u~ABCDHF]$/;
-const KITTY_REPEAT_PATTERN = /^\x1b\[[\d:;]*:2[u~ABCDHF]$/;
+// Format: \x1b[...;modifier:event_type<terminator> where terminator is u, ~, navigation, or function-key finals
+const KITTY_RELEASE_PATTERN = /^\x1b\[[\d:;]*:3[u~ABCDEFHPQRS]$/;
+const KITTY_REPEAT_PATTERN = /^\x1b\[[\d:;]*:2[u~ABCDEFHPQRS]$/;
 const KITTY_CSI_U_PATTERN = /^\x1b\[(\d+)(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?(?:;([\d:]*))?u$/;
 const KITTY_MOD_SHIFT = 1;
 const KITTY_MOD_ALT = 2;
@@ -517,18 +517,37 @@ function hasControlChars(data: string): boolean {
 	});
 }
 
+function isValidProtocolNumber(value: number): boolean {
+	return Number.isSafeInteger(value) && value >= 0 && value <= 0xffffffff;
+}
+
+function isPrintableCodePoint(value: number): boolean {
+	return (
+		Number.isSafeInteger(value) &&
+		value >= 32 &&
+		value <= 0x10ffff &&
+		value !== 0x7f &&
+		!(value >= 0x80 && value <= 0x9f) &&
+		!(value >= 0xd800 && value <= 0xdfff)
+	);
+}
+
 function decodeKittyPrintable(data: string): string | undefined {
 	const match = data.match(KITTY_CSI_U_PATTERN);
 	if (!match) return undefined;
 
 	const codepoint = Number.parseInt(match[1] ?? "", 10);
-	if (!Number.isFinite(codepoint)) return undefined;
+	if (!isValidProtocolNumber(codepoint)) return undefined;
 
-	if (match[5] === "3") return undefined;
+	const eventTypeText = match[5];
+	const eventType =
+		eventTypeText === undefined || eventTypeText.length === 0 ? undefined : Number.parseInt(eventTypeText, 10);
+	if (eventType !== undefined && eventType !== 1 && eventType !== 2) return undefined;
 
 	const shiftedKey = match[2] && match[2].length > 0 ? Number.parseInt(match[2], 10) : undefined;
 	const modValue = match[4] ? Number.parseInt(match[4], 10) : 1;
-	const modifier = Number.isFinite(modValue) ? modValue - 1 : 0;
+	if (!isValidProtocolNumber(modValue) || modValue < 1) return undefined;
+	const modifier = modValue - 1;
 	const effectiveMod = modifier & ~KITTY_LOCK_MASK;
 	const supportedModifierMask = KITTY_MOD_SHIFT | KITTY_MOD_ALT | KITTY_MOD_CTRL | KITTY_MOD_SUPER;
 
@@ -541,7 +560,7 @@ function decodeKittyPrintable(data: string): string | undefined {
 			.split(":")
 			.filter(Boolean)
 			.map(value => Number.parseInt(value, 10))
-			.filter(value => Number.isFinite(value) && value >= 32);
+			.filter(value => isPrintableCodePoint(value));
 		if (codepoints.length > 0) {
 			try {
 				return String.fromCodePoint(...codepoints);
@@ -549,6 +568,7 @@ function decodeKittyPrintable(data: string): string | undefined {
 				return undefined;
 			}
 		}
+		return undefined;
 	}
 	const keypadOperatorText = KITTY_KEYPAD_OPERATOR_TEXT[codepoint];
 	if (keypadOperatorText) return keypadOperatorText;
@@ -567,7 +587,7 @@ function decodeKittyPrintable(data: string): string | undefined {
 		return undefined;
 	}
 
-	if (!Number.isFinite(effectiveCodepoint) || effectiveCodepoint < 32) return undefined;
+	if (!isPrintableCodePoint(effectiveCodepoint)) return undefined;
 
 	try {
 		return String.fromCodePoint(effectiveCodepoint);
@@ -584,7 +604,7 @@ function decodeKittyPrintable(data: string): string | undefined {
  */
 export function extractPrintableText(data: string): string | undefined {
 	const printable = decodePrintableKey(data);
-	if (printable !== undefined) return printable;
+	if (printable !== undefined && !hasControlChars(printable)) return printable;
 	if (data.length === 0 || hasControlChars(data)) return undefined;
 	return data;
 }
@@ -603,7 +623,7 @@ function parseModifyOtherKeysSequence(data: string): ParsedModifyOtherKeysSequen
 	if (!match) return null;
 	const modValue = Number.parseInt(match[1] ?? "", 10);
 	const codepoint = Number.parseInt(match[2] ?? "", 10);
-	if (!Number.isFinite(modValue) || !Number.isFinite(codepoint)) return null;
+	if (!isValidProtocolNumber(modValue) || modValue < 1 || !isValidProtocolNumber(codepoint)) return null;
 	return { codepoint, modifier: modValue - 1 };
 }
 
@@ -618,7 +638,7 @@ function decodeModifyOtherKeysPrintable(data: string): string | undefined {
 	if (!parsed) return undefined;
 	const modifier = parsed.modifier & ~KITTY_LOCK_MASK;
 	if ((modifier & ~KITTY_MOD_SHIFT) !== 0) return undefined;
-	if (!Number.isFinite(parsed.codepoint) || parsed.codepoint < 32) return undefined;
+	if (!isPrintableCodePoint(parsed.codepoint)) return undefined;
 	try {
 		return String.fromCodePoint(parsed.codepoint);
 	} catch {
