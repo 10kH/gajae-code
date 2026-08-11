@@ -1361,38 +1361,41 @@ export async function renewOwnerHeartbeatSidecar(input: {
 		logger.warn(`notifications: heartbeat sidecar staging failed: ${sanitizeDiagnostic(String(error))}`);
 		return "publish_failed";
 	}
-	const lock = await readOwnershipLock(fsImpl, paths.lock);
-	if (!ownershipLockMatchesState(lock, state)) {
-		await fsImpl.unlink(tmp).catch(() => undefined);
-		return "not_owner";
-	}
-	for (let attempt = 1; ; attempt++) {
-		// Revalidate the exact lock after the temporary sidecar exists — and again
-		// before every retry — so a stale writer cannot publish after ownership
-		// moved during its write or its backoff.
-		const finalLock = await readOwnershipLock(fsImpl, paths.lock);
-		if (!ownershipLockMatchesState(finalLock, state)) {
-			await fsImpl.unlink(tmp).catch(() => undefined);
-			return "not_owner";
-		}
-		try {
-			await fsImpl.rename(tmp, paths.heartbeat);
-			return "renewed";
-		} catch (error) {
-			// Windows: a transient external lock on the destination (antivirus,
-			// indexer) surfaces as EPERM on rename and used to escape as an
-			// uncaught exception that killed the whole daemon (#4200). Retry a
-			// bounded number of times under the lock fence, then keep the daemon
-			// alive and let the next heartbeat cycle publish.
-			if (attempt >= HEARTBEAT_SIDECAR_PUBLISH_ATTEMPTS || !isTransientSidecarPublishError(error)) {
-				await fsImpl.unlink(tmp).catch(() => undefined);
-				logger.warn(
-					`notifications: heartbeat sidecar publication failed after ${attempt} attempt(s): ${sanitizeDiagnostic(String(error))}`,
-				);
-				return "publish_failed";
+	try {
+		const lock = await readOwnershipLock(fsImpl, paths.lock);
+		if (!ownershipLockMatchesState(lock, state)) return "not_owner";
+		for (let attempt = 1; ; attempt++) {
+			// Revalidate the exact lock after the temporary sidecar exists — and again
+			// before every retry — so a stale writer cannot publish after ownership
+			// moved during its write or its backoff.
+			const finalLock = await readOwnershipLock(fsImpl, paths.lock);
+			if (!ownershipLockMatchesState(finalLock, state)) return "not_owner";
+			try {
+				await fsImpl.rename(tmp, paths.heartbeat);
+				return "renewed";
+			} catch (error) {
+				// Windows: a transient external lock on the destination (antivirus,
+				// indexer) surfaces as EPERM on rename and used to escape as an
+				// uncaught exception that killed the whole daemon (#4200). Retry a
+				// bounded number of times under the lock fence, then keep the daemon
+				// alive and let the next heartbeat cycle publish.
+				if (attempt >= HEARTBEAT_SIDECAR_PUBLISH_ATTEMPTS || !isTransientSidecarPublishError(error)) {
+					logger.warn(
+						`notifications: heartbeat sidecar publication failed after ${attempt} attempt(s): ${sanitizeDiagnostic(String(error))}`,
+					);
+					return "publish_failed";
+				}
+				await Bun.sleep(HEARTBEAT_SIDECAR_PUBLISH_BACKOFF_MS * attempt);
 			}
-			await Bun.sleep(HEARTBEAT_SIDECAR_PUBLISH_BACKOFF_MS * attempt);
 		}
+	} finally {
+		// A thrown state or ownership-lock read after the staging write (the same
+		// transient Windows sharing-violation class as the rename) must not leak
+		// the live-PID staging file: the artifact reaper refuses to reclaim
+		// staging claims belonging to a live publisher, which this containment
+		// keeps alive (#4200). After a successful rename the staging path no
+		// longer exists and this unlink is a no-op.
+		await fsImpl.unlink(tmp).catch(() => undefined);
 	}
 }
 
@@ -12139,19 +12142,31 @@ export class TelegramNotificationDaemon {
 			let idleSince = this.runtime.now();
 			while (this.running) {
 				if (await this.controlStopRequested()) break;
-				if (
-					(await renewOwnerHeartbeatSidecar({
-						settings: this.opts.settings,
-						ownerId: this.opts.ownerId,
-						acquisitionId: this.opts.ownerId,
-						fs: this.fsImpl,
-						now: this.opts.now,
-						pid: this.opts.pid ?? process.pid,
-						pidIncarnation: this.opts.pidIncarnation,
-						attachedEndpoints: this.attachedEndpointCount(),
-					})) === "not_owner"
-				)
-					break;
+				// A thrown renewal (e.g. a transient Windows EPERM/EACCES/EBUSY while
+				// an external lock also covers the state or ownership-lock read) must
+				// not terminate the daemon — the same crash class as #4200 on the
+				// sidecar rename. Contain it like the poll loop below: log one bounded
+				// diagnostic and retry on the next loop iteration. Only a proven
+				// state/lock mismatch ("not_owner") stops the owner.
+				let ownerHeld = true;
+				try {
+					ownerHeld =
+						(await renewOwnerHeartbeatSidecar({
+							settings: this.opts.settings,
+							ownerId: this.opts.ownerId,
+							acquisitionId: this.opts.ownerId,
+							fs: this.fsImpl,
+							now: this.opts.now,
+							pid: this.opts.pid ?? process.pid,
+							pidIncarnation: this.opts.pidIncarnation,
+							attachedEndpoints: this.attachedEndpointCount(),
+						})) !== "not_owner";
+				} catch (error) {
+					logger.warn(
+						`notifications: ownership heartbeat renewal threw; continuing: ${sanitizeDiagnostic(String(error))}`,
+					);
+				}
+				if (!ownerHeld) break;
 				if (await this.controlStopRequested()) break;
 				const idleElapsed = this.runtime.now() - idleSince >= (this.opts.idleTimeoutMs ?? 60_000);
 				if (this.sessions.size > 0) {
