@@ -411,7 +411,7 @@ export interface InteractiveModeContext {
 	showExtensionsDashboard(): void;
 	showCustomizationDashboard(): void;
 	showAgentsDashboard(): void;
-	showModelSelector(options?: { temporaryOnly?: boolean }): void;
+	showModelSelector(options?: { temporaryOnly?: boolean; smartRoutingOnly?: boolean }): void;
 	showEffortSelector(): void;
 	showProviderOnboarding(): void;
 	showPluginSelector(mode?: "install" | "uninstall"): void;
