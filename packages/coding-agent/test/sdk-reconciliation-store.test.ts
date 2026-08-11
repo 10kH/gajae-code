@@ -454,6 +454,57 @@ describe("reconciliation-store", () => {
 		const stopped: DurableTerminalScopeRecord = { ...pending, turnDisposition: "stopped", terminalAt: 2 };
 		expect(settleTerminalScopeRestart([stopped], now)[0]).toBe(stopped);
 	});
+
+	test("settleTerminalScopeRestart stores the replay-shaped payload hash a retry delivers", () => {
+		// Review thread P2: a pending scope settled by restart replays as
+		// uncertainty — the ONLY response it can ever deliver. Its stored
+		// payload hash must therefore describe that replay-shaped public result
+		// (reason + replay envelope), or the delivery observer's exact-hash
+		// check would never advance the row and it would stay durably pending.
+		const now = 5_000;
+		const pending: DurableTerminalScopeRecord = {
+			selection: "owned",
+			turnDisposition: "pending",
+			ownedWorkDisposition: "left_running",
+			automaticDeliveryDisposition: "none",
+			resumeOnOwnedCompletion: false,
+			turnContinuationFence: {
+				state: "retained",
+				abortedAttemptEpoch: 1,
+				blockedContinuationIds: [],
+				predecessorTombstones: [],
+				ownedCompletionPolicy: "disabled",
+			},
+			responseState: "pending",
+			responsePayloadHash: hash("original-input-placeholder"),
+			acceptedAt: 1,
+		};
+		const settled = settleTerminalScopeRestart([pending], now)[0];
+		const replayResult = {
+			ok: true,
+			selection: "owned",
+			turn: "uncertain",
+			ownedWork: "uncertain",
+			automaticDelivery: "none",
+			resumeOnOwnedCompletion: false,
+			reason: "replay_uncertain",
+			replay: {
+				responseState: "pending",
+				responsePayloadHash: hash("original-input-placeholder"),
+				terminalPublished: false,
+			},
+		};
+		const replayPayloadHash = hash(JSON.stringify(replayResult));
+		expect(settled.turnDisposition).toBe("uncertain");
+		expect(settled.responsePayloadHash).toBe(replayPayloadHash);
+		expect(settled.replayPayloadHash).toBe(replayPayloadHash);
+		// The delivery observer's advance condition accepts the written replay:
+		// the written response's hash matches the stored replay-shaped hash.
+		expect(
+			settled.responseState === "pending" &&
+				(settled.responsePayloadHash === replayPayloadHash || settled.replayPayloadHash === replayPayloadHash),
+		).toBe(true);
+	});
 });
 
 test("terminal scope response state advances pending -> sent through the shared owner", async () => {

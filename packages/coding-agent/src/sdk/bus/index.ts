@@ -6135,9 +6135,15 @@ export function createNotificationsExtension(
 						// Require EXACT payload equality: finalization now stores the precise
 						// final response hash for every disposition (including uncertainty and
 						// no-effect), so a pending_replay retry whose payload differs can never
-						// mark the durable row sent (review thread P2).
-						const payloadMatches = (record: { responsePayloadHash?: string }) =>
-							responsePayloadHash !== undefined && record.responsePayloadHash === responsePayloadHash;
+						// mark the durable row sent (review thread P2). A same-key retry
+						// delivers the replay-shaped payload (replay envelope, and the replay
+						// reason for uncertainty), so finalization also stores its hash and the
+						// written replay response advances the row exactly like the original
+						// response would (review thread P2).
+						const payloadMatches = (record: { responsePayloadHash?: string; replayPayloadHash?: string }) =>
+							responsePayloadHash !== undefined &&
+							(record.responsePayloadHash === responsePayloadHash ||
+								record.replayPayloadHash === responsePayloadHash);
 						const nextResponseState: "sent" | "failed" = outcome === "written" ? "sent" : "failed";
 						await durableStore.transactTerminalState(state => ({
 							scopes: state.scopes.map(scope =>

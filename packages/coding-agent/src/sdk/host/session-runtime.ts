@@ -164,6 +164,7 @@ export interface SdkOnlyTerminalScopeRecord {
 	};
 	responseState: "pending" | "sent" | "delivered" | "failed";
 	responsePayloadHash: string;
+	replayPayloadHash?: string;
 	acceptedAt: number;
 	terminalAt?: number;
 }
@@ -175,6 +176,7 @@ export interface SdkOnlyEvictedTerminalKeyEntry {
 	ownedWorkDisposition?: "not_requested" | "left_running" | "stopped" | "uncertain";
 	responseState?: "pending" | "sent" | "delivered" | "failed";
 	responsePayloadHash?: string;
+	replayPayloadHash?: string;
 	terminalPublished?: boolean;
 }
 
@@ -1267,19 +1269,11 @@ function createControlSurface(
 		requesterPreflights.add(cancelPreflight);
 		const accept = async (): Promise<void> => {
 			if (settled) return;
-			// Decide whether this submission ever starts its OWN turn BEFORE the
-			// await (the session already branched on its streaming state): a plain
-			// prompt accepted while another turn streams is queued as STEERING and
-			// consumed inside the current run — it emits no agent_start, so its
-			// pending entry would be wrongly consumed (and its connection
-			// associated as owner) by a later agent-initiated monitor/cron turn
-			// (review thread P1). A follow-up is ALWAYS queued (never started
-			// inline) and may never be promoted (compaction, transcript ending in
-			// a user/tool-result message): its ownership entry is created only
-			// when the queued follow-up is actually promoted to a run, never from
-			// idle state alone (review thread P1). Skills always start their own
-			// invocation; a plain prompt starts one only when idle.
-			const startsOwnTurn = kind === "skill" || (kind === "prompt" && !alwaysQueued && ctx.isIdle?.() !== false);
+			// startsOwnTurn is captured from the pre-dispatch idle snapshot (see
+			// below): re-reading ctx.isIdle() here would observe the session as
+			// already streaming, because the production AgentSession begins its
+			// in-flight bookkeeping before the preflight acceptance callback
+			// (review thread P1).
 			try {
 				await reconciliation.noteAccepted(kind, correlation, retainedClientRef);
 				accepted = true;
@@ -1303,6 +1297,17 @@ function createControlSurface(
 		// optional chaining keeps harness contexts without isIdle working (the branch
 		// model treats an absent isIdle as idle).
 		const queuedAtDispatch = alwaysQueued || ctx.isIdle?.() === false;
+		// Decide whether this submission ever starts its OWN turn from the SAME
+		// pre-dispatch snapshot: a plain prompt accepted while another turn
+		// streams is queued as STEERING and consumed inside the current run — it
+		// emits no agent_start, so its pending entry would be wrongly consumed
+		// (and its connection associated as owner) by a later agent-initiated
+		// monitor/cron turn (review thread P1). A follow-up is ALWAYS queued
+		// (never started inline): its ownership entry is created only when the
+		// queued follow-up is actually promoted to a run (review thread P1).
+		// Skills always start their own invocation; a plain prompt starts one
+		// only when idle at dispatch time.
+		const startsOwnTurn = kind === "skill" || (kind === "prompt" && !alwaysQueued && !queuedAtDispatch);
 		try {
 			const submission = Promise.resolve(
 				run({
@@ -1407,6 +1412,33 @@ function createControlSurface(
 			responsePayloadHash: record.responsePayloadHash ?? inputHash,
 			terminalPublished: record.terminalPublished === true,
 		});
+		// The exact response a same-key retry delivers appends the replay envelope
+		// (and, for uncertainty, the replay reason). The delivery hash check
+		// requires exact equality, so the durable row must store BOTH the original
+		// response hash (first write) and the replay-shaped hash (retry write) or a
+		// successfully written replay could never advance a pending row to sent
+		// (review thread P2).
+		const replayShapedHash = (
+			record: SdkOnlyTerminalScopeRecord,
+			result: Record<string, unknown>,
+			payloadHash: string,
+		): string =>
+			crypto
+				.createHash("sha256")
+				.update(
+					JSON.stringify({
+						...result,
+						...(result.turn === "uncertain" && typeof result.reason === "string"
+							? { reason: "replay_uncertain" }
+							: {}),
+						replay: {
+							responseState: record.responseState ?? "pending",
+							responsePayloadHash: payloadHash,
+							terminalPublished: record.terminalPublished === true,
+						},
+					}),
+				)
+				.digest("hex");
 		const replay = (): unknown => {
 			const scopes = store.snapshotTerminalScopes();
 			const existing = keyHash ? scopes.find(record => record.idempotencyKeyHash === keyHash) : undefined;
@@ -1596,7 +1628,9 @@ function createControlSurface(
 							// public no_effect disposition immediately, no later
 							// finalization), so store the public payload hash; idle
 							// reservations are finalized by finalizeNoEffectReservation
-							// (review thread P2).
+							// (review thread P2). The replay-shaped hash is stored too so a
+							// same-key retry's metadata-bearing replay can still advance the
+							// row on delivery (review thread P2).
 							responsePayloadHash: markerFailure
 								? hashResult({
 										ok: true,
@@ -1605,6 +1639,24 @@ function createControlSurface(
 										terminal: "terminal_no_effect",
 									})
 								: inputHash,
+							replayPayloadHash: markerFailure
+								? hashResult({
+										ok: true,
+										selection: scope,
+										turn: "no_effect",
+										terminal: "terminal_no_effect",
+										replay: {
+											responseState: "pending",
+											responsePayloadHash: hashResult({
+												ok: true,
+												selection: scope,
+												turn: "no_effect",
+												terminal: "terminal_no_effect",
+											}),
+											terminalPublished: false,
+										},
+									})
+								: undefined,
 							acceptedAt: Date.now(),
 						},
 					];
@@ -1631,15 +1683,33 @@ function createControlSurface(
 		// alone. The EXACT final response payload hash is stored so the
 		// response-state advance can require equality instead of trusting a
 		// non-pending placeholder (review thread P2).
-		const finalizeNoEffectReservation = async (payloadHash: string): Promise<void> => {
+		const finalizeNoEffectReservation = async (result: {
+			ok: boolean;
+			selection: string;
+			turn: string;
+			terminal: string;
+		}): Promise<void> => {
 			if (!keyHash) return;
+			const payloadHash = hashResult(result);
+			// The same-key retry delivers the metadata-bearing replay envelope;
+			// store its hash too so the retry's written response can advance the
+			// finalized row (review thread P2).
+			const replayPayloadHash = hashResult({
+				...result,
+				replay: { responseState: "pending", responsePayloadHash: payloadHash, terminalPublished: false },
+			});
 			try {
 				await store.transactTerminalState(state => {
 					const scopes: SdkOnlyTerminalScopeRecord[] = state.scopes.map(record =>
 						record.idempotencyKeyHash === keyHash &&
 						record.idempotencyInputHash === inputHash &&
 						record.turnDisposition === "no_effect_reserved"
-							? { ...record, turnDisposition: "no_effect", responsePayloadHash: payloadHash }
+							? {
+									...record,
+									turnDisposition: "no_effect",
+									responsePayloadHash: payloadHash,
+									replayPayloadHash,
+								}
 							: record,
 					);
 					// Finalized reservations become evictable completed rows: apply
@@ -1754,7 +1824,7 @@ function createControlSurface(
 					turn: "no_active_turn",
 					terminal: "terminal_no_effect",
 				};
-				await finalizeNoEffectReservation(hashResult(noActiveTurnResult));
+				await finalizeNoEffectReservation(noActiveTurnResult);
 				return noActiveTurnResult;
 			}
 			handle = recheckedHandle;
@@ -1819,7 +1889,7 @@ function createControlSurface(
 					turn: "no_active_turn",
 					terminal: "terminal_no_effect",
 				};
-				await finalizeNoEffectReservation(hashResult(noActiveTurnResult));
+				await finalizeNoEffectReservation(noActiveTurnResult);
 				return noActiveTurnResult;
 			}
 			handle = recheckedHandle;
@@ -1953,6 +2023,7 @@ function createControlSurface(
 				resumeOnOwnedCompletion: scope === "turn",
 				reason: "active_turn_changed",
 			};
+			const activeTurnPayloadHash = hashResult(result);
 			await transactBoundedTerminalScopes(scopes =>
 				scopes.map(record =>
 					(keyHash
@@ -1961,7 +2032,8 @@ function createControlSurface(
 						? {
 								...record,
 								turnDisposition: "uncertain",
-								responsePayloadHash: hashResult(result),
+								responsePayloadHash: activeTurnPayloadHash,
+								replayPayloadHash: replayShapedHash(record, result, activeTurnPayloadHash),
 								terminalAt: Date.now(),
 							}
 						: record,
@@ -2010,6 +2082,7 @@ function createControlSurface(
 				resumeOnOwnedCompletion: scope === "turn",
 				reason: "worker_unsettled",
 			};
+			const workerUnsettledPayloadHash = hashResult(result);
 			await transactBoundedTerminalScopes(scopes =>
 				scopes.map(record =>
 					(keyHash
@@ -2019,7 +2092,8 @@ function createControlSurface(
 								...record,
 								turnDisposition: "uncertain",
 								ownedWorkDisposition: "uncertain",
-								responsePayloadHash: hashResult(result),
+								responsePayloadHash: workerUnsettledPayloadHash,
+								replayPayloadHash: replayShapedHash(record, result, workerUnsettledPayloadHash),
 								terminalAt: Date.now(),
 							}
 						: record,
@@ -2048,6 +2122,7 @@ function createControlSurface(
 					resumeOnOwnedCompletion: false,
 					reason: "owned_unsettled",
 				};
+				const ownedUnsettledPayloadHash = hashResult(result);
 				await transactBoundedTerminalScopes(scopes =>
 					scopes.map(record =>
 						(keyHash
@@ -2058,7 +2133,8 @@ function createControlSurface(
 									...record,
 									turnDisposition: "uncertain",
 									ownedWorkDisposition: "uncertain",
-									responsePayloadHash: hashResult(result),
+									responsePayloadHash: ownedUnsettledPayloadHash,
+									replayPayloadHash: replayShapedHash(record, result, ownedUnsettledPayloadHash),
 									terminalAt: Date.now(),
 								}
 							: record,
@@ -2129,6 +2205,7 @@ function createControlSurface(
 							terminalPublished,
 							ownedWorkDisposition: scope === "turn" ? "left_running" : ownedStopped ? "stopped" : "uncertain",
 							responsePayloadHash: payloadHash,
+							replayPayloadHash: replayShapedHash(record, result, payloadHash),
 							terminalAt: Date.now(),
 						}
 					: record,
@@ -2391,6 +2468,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				fenceGateResolutions: () => void;
 				waitForGateResolutionQuiescence: () => Promise<void>;
 				activeInvocation?: { kind: InvocationKind; correlation: InvocationCorrelation };
+				drainedInvocations?: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
 				disposeGate?: () => void;
 		  }
 		| undefined;
@@ -2426,6 +2504,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				const owners = new Set<string>();
 				for (const entry of drained) if (entry.connectionId !== undefined) owners.add(entry.connectionId);
 				activePromptOwnerHolder.connectionIds = owners;
+				// A single run may drain several follow-ups promoted together; each
+				// has its own durable record that must reach terminal state, so keep
+				// the full batch for the transition pass below (review thread P1).
+				current.drainedInvocations = drained.map(({ kind, correlation }) => ({ kind, correlation }));
 			}
 		}
 		// Observe whether the lifecycle publication actually landed: a terminal
@@ -2435,17 +2517,21 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// recorded as observed=false, never rethrown into the api handler.
 		let observed = true;
 		try {
-			await current.reconciliation.noteTransition(
-				current.activeInvocation?.kind ?? "prompt",
-				current.activeInvocation?.correlation,
-				{ type },
-			);
+			const transitions =
+				current.drainedInvocations && current.drainedInvocations.length > 0
+					? current.drainedInvocations
+					: current.activeInvocation
+						? [current.activeInvocation]
+						: [];
+			for (const invocation of transitions)
+				await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, { type });
 			current.runtime.emitEvent({ type, sessionId: ctx.sessionManager.getSessionId() });
 		} catch {
 			observed = false;
 		}
 		if (type === "agent_end") {
 			current.activeInvocation = undefined;
+			current.drainedInvocations = undefined;
 			// The turn is over: no connection owns it anymore. Clearing here means
 			// an abort against a later agent-initiated turn (monitor/cron
 			// follow-up) finds no owner and fails closed, instead of letting the
@@ -2714,8 +2800,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// final response hash for every disposition (including uncertainty and
 				// no-effect), so a pending_replay retry whose payload differs can never
 				// mark the durable row sent (review thread P2).
-				const payloadMatches = (record: { responsePayloadHash?: string }) =>
-					responsePayloadHash !== undefined && record.responsePayloadHash === responsePayloadHash;
+				const payloadMatches = (record: { responsePayloadHash?: string; replayPayloadHash?: string }) =>
+					responsePayloadHash !== undefined &&
+					(record.responsePayloadHash === responsePayloadHash || record.replayPayloadHash === responsePayloadHash);
 				await reconciliationStore.transactTerminalState(state => ({
 					scopes: state.scopes.map(record =>
 						record.idempotencyKeyHash === keyHash &&

@@ -9,6 +9,7 @@
  * Non-terminal records with a pending outcome finalize that exact claim on bootstrap.
  * Outcome-less skills retain the existing failed/process_restart settlement.
  */
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { PromptReconciliationStatus, SdkPromptTerminalOutcome } from "../prompt-status";
@@ -90,6 +91,9 @@ export interface DurableTerminalScopeRecord {
 	}>;
 	responseState: "pending" | "sent" | "delivered" | "failed";
 	responsePayloadHash: string;
+	/** Hash of the replay-shaped public result a same-key retry delivers, when
+	 *  it differs from the original response (the replay appends metadata). */
+	replayPayloadHash?: string;
 	acceptedAt: number;
 	terminalAt?: number;
 }
@@ -103,6 +107,7 @@ export interface EvictedTerminalKeyEntry {
 	ownedWorkDisposition?: "not_requested" | "left_running" | "stopped" | "uncertain";
 	responseState?: "pending" | "sent" | "delivered" | "failed";
 	responsePayloadHash?: string;
+	replayPayloadHash?: string;
 	terminalPublished?: boolean;
 }
 export interface DurableSteerReconciliationRecord {
@@ -292,6 +297,7 @@ function isValidTerminalScope(value: unknown): boolean {
 		ownedDeliverySettlements,
 		responseState,
 		responsePayloadHash,
+		replayPayloadHash,
 		acceptedAt,
 		terminalAt,
 		idempotencyKeyHash,
@@ -346,6 +352,7 @@ function isValidTerminalScope(value: unknown): boolean {
 	)
 		return false;
 	if (typeof responsePayloadHash !== "string" || !responsePayloadHash) return false;
+	if (replayPayloadHash !== undefined && (typeof replayPayloadHash !== "string" || !replayPayloadHash)) return false;
 	if (typeof idempotencyKeyHash !== "string" || !SHA256_RE.test(idempotencyKeyHash)) return false;
 	if (typeof idempotencyInputHash !== "string" || !SHA256_RE.test(idempotencyInputHash)) return false;
 	if (terminalPublished !== undefined && typeof terminalPublished !== "boolean") return false;
@@ -390,6 +397,11 @@ function isValidEvictedTerminalKeyEntry(value: unknown): value is EvictedTermina
 	if (
 		value.responsePayloadHash !== undefined &&
 		(typeof value.responsePayloadHash !== "string" || !value.responsePayloadHash)
+	)
+		return false;
+	if (
+		value.replayPayloadHash !== undefined &&
+		(typeof value.replayPayloadHash !== "string" || !value.replayPayloadHash)
 	)
 		return false;
 	if (value.terminalPublished !== undefined && typeof value.terminalPublished !== "boolean") return false;
@@ -465,10 +477,33 @@ export function settleTerminalScopeRestart(
 			};
 		}
 		if (scope.turnDisposition !== "pending" || scope.terminalAt !== undefined) return scope;
+		// A restart-replay is the ONLY response a settled pending row can ever
+		// deliver (the process died before the original response was written), so
+		// the stored payload hash must describe the replay-shaped public result —
+		// the replay appends metadata (reason + replay envelope) that the delivery
+		// hash check would otherwise reject forever, leaving the row durably
+		// pending (review thread P2).
+		const replayResult = {
+			ok: true,
+			selection: scope.selection,
+			turn: "uncertain",
+			ownedWork: scope.selection === "turn" ? "left_running" : "uncertain",
+			automaticDelivery: scope.selection === "turn" ? "enabled" : "none",
+			resumeOnOwnedCompletion: scope.selection === "turn",
+			reason: "replay_uncertain",
+			replay: {
+				responseState: "pending",
+				responsePayloadHash: scope.responsePayloadHash,
+				terminalPublished: scope.terminalPublished === true,
+			},
+		};
+		const replayPayloadHash = createHash("sha256").update(JSON.stringify(replayResult)).digest("hex");
 		return {
 			...scope,
 			turnDisposition: "uncertain",
 			ownedWorkDisposition: scope.ownedWorkDisposition === "not_requested" ? "not_requested" : "uncertain",
+			responsePayloadHash: replayPayloadHash,
+			replayPayloadHash: replayPayloadHash,
 			terminalAt: now,
 		};
 	});

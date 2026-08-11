@@ -2661,6 +2661,201 @@ test("SDK-only host never advances a finalized uncertain row for a mismatched re
 	}
 });
 
+test("SDK-only host keeps the idle-submitted prompt's owner when isIdle flips during the accept window", async () => {
+	// Review thread P1: the production AgentSession begins its in-flight
+	// bookkeeping BEFORE the preflight acceptance callback, so re-reading
+	// isIdle() inside accept() would observe the session as already streaming
+	// and record no pending owner — the submitting connection could then never
+	// terminal-abort its own prompt (the abort would report no_active_turn and
+	// ACP would treat the cancellation as unacknowledged). The startsOwnTurn
+	// decision must come from the PRE-DISPATCH idle snapshot.
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-startsown-snapshot-"));
+	let idle = true;
+	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+	const api = {
+		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+			handlers.set(event, handler);
+		},
+		sendUserMessage: async (_content: string, options: { onPreflightAcceptCommit?: () => Promise<void> }) => {
+			await options?.onPreflightAcceptCommit?.();
+			// The session's in-flight bookkeeping begins during the accept
+			// window: a re-read of isIdle() now reports streaming.
+			idle = false;
+		},
+	} as unknown as ExtensionAPI;
+	const transport = memoryTransport();
+	const reconciliationStore = createReconciliationStore({
+		sessionFile: path.join(cwd, "session.json"),
+		sessionId: transport.sessionId,
+	});
+	createSdkSessionRuntimeExtension(api, {
+		agentDir: cwd,
+		createTransport: async () => transport,
+		terminalAbortSeams: {
+			getReconciliationStore: () => reconciliationStore,
+			getTerminalTurnEpoch: () => 7,
+			getActivePromptHandle: () => "exact-run-handle",
+			getActivePromptOwnerConnectionId: () => undefined,
+			cancelPendingPreflightForTerminalAbort: () => {},
+			abortPromptAndWaitWithTerminal: async () => ({ status: "settled", terminalScope: {} }),
+		},
+	});
+	const ctx = { ...extensionContext(transport.sessionId, cwd), isIdle: () => idle } as ExtensionContext;
+	try {
+		await handlers.get("session_start")?.({}, ctx);
+		transport.feed("client", {
+			type: "control_request",
+			id: "idle-owner-prompt",
+			operation: "turn.prompt",
+			input: { text: "hello" },
+		} as SdkFrame);
+		const deadline = Date.now() + 15_000;
+		while (!transport.sent.some(frame => frame.id === "idle-owner-prompt" && frame.type === "control_response")) {
+			if (Date.now() > deadline) throw new Error("Timed out waiting for the idle prompt acceptance");
+			await Bun.sleep(20);
+		}
+		expect(transport.sent.find(frame => frame.id === "idle-owner-prompt")).toMatchObject({ ok: true });
+		// The run starts: the dispatch-time idle snapshot recorded the pending
+		// owner for the submitting connection.
+		await handlers.get("agent_start")?.({}, ctx);
+		transport.feed("client", {
+			type: "control_request",
+			id: "idle-owner-abort",
+			operation: "turn.abort",
+			input: { mode: "terminal" },
+			idempotencyKey: "idle-owner-abort-key",
+		} as SdkFrame);
+		const abortDeadline = Date.now() + 15_000;
+		while (!transport.sent.some(frame => frame.id === "idle-owner-abort" && frame.type === "control_response")) {
+			if (Date.now() > abortDeadline) throw new Error("Timed out waiting for the idle-prompt abort");
+			await Bun.sleep(20);
+		}
+		expect(transport.sent.find(frame => frame.id === "idle-owner-abort")).toMatchObject({
+			ok: true,
+			result: expect.objectContaining({ turn: "stopped" }),
+		});
+	} finally {
+		await handlers.get("session_shutdown")?.({}, ctx);
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("SDK-only host advances a finalized stopped row when the retry replay matches the stored replay hash", async () => {
+	// Review thread P2: a row finalized with responseState still pending (the
+	// process exited before the original response was written) stores the
+	// ORIGINAL payload hash; a same-key retry delivers the replay-shaped
+	// payload (replay envelope appended). The finalization now also stores the
+	// replay-shaped hash, so the written retry response advances the row from
+	// pending to sent instead of leaving it durably pending forever.
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stopped-replay-advance-"));
+	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+	const api = {
+		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+			handlers.set(event, handler);
+		},
+	} as unknown as ExtensionAPI;
+	const transport = memoryTransport();
+	const reconciliationStore = createReconciliationStore({
+		sessionFile: path.join(cwd, "session.json"),
+		sessionId: transport.sessionId,
+	});
+	createSdkSessionRuntimeExtension(api, {
+		agentDir: cwd,
+		createTransport: async () => transport,
+		terminalAbortSeams: {
+			getReconciliationStore: () => reconciliationStore,
+			getTerminalTurnEpoch: () => 7,
+			getActivePromptHandle: () => "exact-run-handle",
+			getActivePromptOwnerConnectionId: () => "client",
+			cancelPendingPreflightForTerminalAbort: () => {},
+			abortPromptAndWaitWithTerminal: async (_handle, _options) => {
+				return { status: "settled", terminalScope: {} };
+			},
+		},
+	});
+	const ctx = extensionContext(transport.sessionId, cwd);
+	try {
+		await handlers.get("session_start")?.({}, ctx);
+		const keyHash = createHash("sha256").update("stopped-replay-key").digest("hex");
+		const inputHash = createHash("sha256")
+			.update(JSON.stringify({ mode: "terminal", scope: "turn" }))
+			.digest("hex");
+		const result = {
+			ok: true,
+			selection: "turn",
+			turn: "stopped",
+			ownedWork: "left_running",
+			automaticDelivery: "enabled",
+			resumeOnOwnedCompletion: true,
+		};
+		const payloadHash = createHash("sha256").update(JSON.stringify(result)).digest("hex");
+		const replayResult = {
+			...result,
+			replay: { responseState: "pending", responsePayloadHash: payloadHash, terminalPublished: false },
+		};
+		const replayPayloadHash = createHash("sha256").update(JSON.stringify(replayResult)).digest("hex");
+		// Seed the POST-finalization durable state: the original stopped result
+		// hash plus the replay-shaped hash a same-key retry delivers.
+		await reconciliationStore.transactTerminalState(state => ({
+			scopes: [
+				{
+					selection: "turn",
+					idempotencyKeyHash: keyHash,
+					idempotencyInputHash: inputHash,
+					turnDisposition: "stopped",
+					terminalPublished: false,
+					ownedWorkDisposition: "left_running",
+					automaticDeliveryDisposition: "enabled",
+					resumeOnOwnedCompletion: true,
+					turnContinuationFence: {
+						state: "retained",
+						abortedAttemptEpoch: 0,
+						blockedContinuationIds: [],
+						predecessorTombstones: [],
+						ownedCompletionPolicy: "disabled",
+					},
+					responseState: "pending",
+					responsePayloadHash: payloadHash,
+					replayPayloadHash,
+					acceptedAt: Date.now(),
+					terminalAt: Date.now(),
+				},
+				...state.scopes,
+			],
+			keys: state.keys,
+		}));
+		transport.feed("client", {
+			type: "control_request",
+			id: "stopped-replay",
+			operation: "turn.abort",
+			input: { mode: "terminal" },
+			idempotencyKey: "stopped-replay-key",
+		} as SdkFrame);
+		const deadline = Date.now() + 15_000;
+		while (!transport.sent.some(frame => frame.id === "stopped-replay" && frame.type === "control_response")) {
+			if (Date.now() > deadline) throw new Error("Timed out waiting for the stopped-row replay");
+			await Bun.sleep(20);
+		}
+		// The written replay's payload matches the stored replay-shaped hash, so
+		// the delivery observer advances the durable row to sent.
+		const stateDeadline = Date.now() + 15_000;
+		while (reconciliationStore.snapshotTerminalScopes()[0]!.responseState !== "sent") {
+			if (Date.now() > stateDeadline) throw new Error("Timed out waiting for the stopped-row response state");
+			await Bun.sleep(20);
+		}
+		expect(transport.sent.find(frame => frame.id === "stopped-replay")).toMatchObject({
+			ok: true,
+			result: expect.objectContaining({
+				turn: "stopped",
+				replay: expect.objectContaining({ responseState: "pending" }),
+			}),
+		});
+	} finally {
+		await handlers.get("session_shutdown")?.({}, ctx);
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
 test("SDK-only host does not assign a follow-up requester ownership until the follow-up actually starts", async () => {
 	// Review thread P1: a turn.follow_up accepted while ctx.isIdle() is true
 	// but the follow-up is never promoted (compaction, transcript ending in a
@@ -2885,6 +3080,29 @@ test("SDK-only host lets every connection whose follow-up was promoted abort the
 			result: expect.objectContaining({ turn: "no_active_turn" }),
 		});
 		expect(seamCalls).toHaveLength(2);
+		// Review thread P1: EVERY follow-up batched into the shared run must
+		// reach a terminal record. A promotion that only transitioned the first
+		// invocation left the remaining follow-ups durably accepted — their
+		// result lookups would never complete and a restart would report them
+		// failed even though they ran in the shared turn.
+		await handlers.get("agent_end")?.({ type: "agent_end" }, ctx);
+		{
+			const terminalDeadline = Date.now() + 15_000;
+			const promptStatuses = () =>
+				reconciliationStore
+					.snapshot()
+					.filter(record => record.kind === "prompt")
+					.map(record => record.status);
+			while (promptStatuses().some(status => status !== "terminal_ok")) {
+				if (Date.now() > terminalDeadline)
+					throw new Error("Timed out waiting for the batched follow-up records to terminalize");
+				await Bun.sleep(20);
+			}
+		}
+		const batchedTerminals = reconciliationStore
+			.snapshot()
+			.filter(record => record.kind === "prompt" && record.status === "terminal_ok");
+		expect(batchedTerminals).toHaveLength(2);
 	} finally {
 		await handlers.get("session_shutdown")?.({}, ctx);
 		await rm(cwd, { recursive: true, force: true });
