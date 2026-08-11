@@ -3837,7 +3837,13 @@ async function executeLifecycleResponse(
 						`Session endpoint close failed: ${error instanceof Error ? error.message : String(error)}`,
 					);
 			} finally {
-				await client?.close();
+				await client
+					?.close()
+					.catch(error =>
+						logger.warn(
+							`SDK session-close client cleanup failed after control dispatch: ${error instanceof Error ? error.message : String(error)}`,
+						),
+					);
 			}
 		}
 

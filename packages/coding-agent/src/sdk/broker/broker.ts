@@ -1197,7 +1197,7 @@ export class Broker {
 	async #readLifecycleReplayEndpoint(sessionId: string): Promise<LifecycleReplayEndpoint | BrokerResponse> {
 		await this.index.refresh();
 		const record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
-		if (!record || !record.live) return error("resource_gone", "session endpoint record is gone");
+		if (!record?.live) return error("resource_gone", "session endpoint record is gone");
 		const endpointMtimeMs = record.endpointMtimeMs;
 		if (record.terminalUncertain)
 			return error("terminal_uncertain", "Session ownership is uncertain and cannot be replayed safely");
