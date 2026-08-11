@@ -4,6 +4,7 @@
 
 ### Fixed
 - `SdkClientError` now carries `reconnect` diagnostics on every reconnect-cycle termination: attempts consumed, the configured attempt budget, elapsed wall-clock, and whether the cycle ended from attempt exhaustion, an elapsed deadline, or cancellation. A long-lived ACP session budget truncated by an unrelated wall-clock deadline was previously indistinguishable from a host that consumed every retry, and closing during a backoff sleep escaped as a bare teardown error with no attribution at all. `details` keeps its existing meaning — the terminating transport error — so consumers reading it directly are unaffected.
+- macOS computer-use permission failures now distinguish a real Screen & System Audio Recording denial from a capture failure after a successful preflight, include the current launcher identity in diagnostics, and preserve TCC grants across GJC ad-hoc rebuilds with a stable designated requirement. Accessibility errors now carry the same launcher/relaunch guidance.
 
 ## [0.13.1] - 2026-08-11
 

@@ -342,9 +342,9 @@ impl ComputerController {
 								results,
 								ExecError::ActionFailed {
 									index,
-									source: Box::new(ExecError::ScreenshotFailed),
+									source: Box::new(capture_exec_error(err.clone())),
 								},
-								Some(format!("COMPUTER_SCREENSHOT_FAILED: {err}")),
+								Some(format!("{}: {err}", err.code())),
 							);
 						},
 					},
@@ -383,8 +383,8 @@ impl ComputerController {
 			Err(err) => {
 				return batch_failure(
 					results,
-					ExecError::ScreenshotFailed,
-					Some(format!("COMPUTER_SCREENSHOT_FAILED: {err}")),
+					capture_exec_error(err.clone()),
+					Some(format!("{}: {err}", err.code())),
 				);
 			},
 		};
@@ -397,15 +397,18 @@ impl ComputerController {
 			.iter()
 			.position(|action| matches!(action, BatchAction::Input { action, .. } if !matches!(action, InputAction::Wait { .. })))
 			.unwrap_or(0);
-		let Ok(mut controller) = guarded_controller() else {
-			return batch_failure(
-				results,
-				ExecError::ActionFailed {
-					index:  first_input_index,
-					source: Box::new(ExecError::PermissionRequired),
-				},
-				None,
-			);
+		let mut controller = match guarded_controller() {
+			Ok(controller) => controller,
+			Err(err) => {
+				return batch_failure(
+					results,
+					ExecError::ActionFailed {
+						index:  first_input_index,
+						source: Box::new(ExecError::PermissionRequired),
+					},
+					Some(err.to_string()),
+				);
+			},
 		};
 		let mut hooks = MacCursorHooks;
 		let transaction =
@@ -422,11 +425,9 @@ impl ComputerController {
 					}
 					match action {
 						BatchAction::Screenshot { .. } => {
-							let frame =
-								capture_primary_display().map_err(|_| ExecError::ActionFailed {
-									index,
-									source: Box::new(ExecError::ScreenshotFailed),
-								})?;
+							let frame = capture_primary_display().map_err(|err| {
+								ExecError::ActionFailed { index, source: Box::new(capture_exec_error(err)) }
+							})?;
 							if step_cancelled() {
 								return Err(ExecError::ActionFailed {
 									index,
@@ -658,8 +659,20 @@ fn epoch_from_f64(value: f64) -> u64 {
 fn exec_error(err: ExecError) -> napi::Error {
 	napi_error(err.code(), err.to_string())
 }
-fn capture_error(err: impl std::fmt::Display) -> napi::Error {
-	napi_error("COMPUTER_SCREENSHOT_FAILED", err.to_string())
+fn capture_exec_error(err: crate::computer::capture::CaptureError) -> ExecError {
+	match err {
+		crate::computer::capture::CaptureError::PermissionRequired => {
+			ExecError::ScreenRecordingPermissionRequired(
+				crate::computer::capture::CaptureError::PermissionRequired.to_string(),
+			)
+		},
+		crate::computer::capture::CaptureError::CaptureFailed
+		| crate::computer::capture::CaptureError::ContextFailed
+		| crate::computer::capture::CaptureError::Encode(_) => ExecError::ScreenshotFailed,
+	}
+}
+fn capture_error(err: crate::computer::capture::CaptureError) -> napi::Error {
+	napi_error(err.code(), err.to_string())
 }
 fn napi_error(code: &'static str, reason: String) -> napi::Error {
 	napi::Error::new(napi::Status::GenericFailure, format!("{code}: {reason}"))
@@ -741,5 +754,24 @@ mod tests {
 		assert_eq!(grouped, now + Duration::from_secs(1));
 		assert_eq!(final_screenshot, now + Duration::from_secs(6));
 		assert_eq!(deadlines.len(), 1);
+	}
+
+	#[test]
+	fn capture_permission_errors_keep_the_permission_code_in_batches() {
+		let error = capture_exec_error(crate::computer::capture::CaptureError::PermissionRequired);
+
+		assert_eq!(error.code(), "COMPUTER_PERMISSION_REQUIRED");
+		assert!(
+			error
+				.to_string()
+				.contains("Screen & System Audio Recording")
+		);
+	}
+
+	#[test]
+	fn non_permission_capture_errors_keep_the_screenshot_code_in_batches() {
+		let error = capture_exec_error(crate::computer::capture::CaptureError::CaptureFailed);
+
+		assert_eq!(error.code(), "COMPUTER_SCREENSHOT_FAILED");
 	}
 }

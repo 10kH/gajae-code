@@ -65,8 +65,8 @@ Stable computer error codes include:
 - `COMPUTER_DISABLED`
 - `COMPUTER_SUSPENDED`
 - `COMPUTER_SUPERVISOR_NOT_LIVE`
-- `COMPUTER_PERMISSION_REQUIRED`
-- `COMPUTER_SCREENSHOT_FAILED` (including missing Screen Recording permission)
+- `COMPUTER_PERMISSION_REQUIRED` (Accessibility or Screen & System Audio Recording)
+- `COMPUTER_SCREENSHOT_FAILED` (capture failed after the current-process preflight passed)
 - `COMPUTER_DISPLAY_STALE`
 - `COMPUTER_COORD_INVALID`
 - `COMPUTER_CANCELLED`
@@ -75,6 +75,13 @@ Stable computer error codes include:
 - `COMPUTER_TRANSACTION_FAILED`
 
 TS handles settings/platform exposure, UX mapping, screenshot persistence, and audit output. Native execution remains the side-effect authority for supervisor state, permissions, display freshness, coordinate validation, cancellation, release-all behavior, and the serialized cursor capture/restore transaction. Whole batches cross the native boundary once; TypeScript does not perform cursor cleanup.
+
+macOS TCC checks apply to the executable that is currently running the tool.
+For source-linked GJC this is normally Bun; for a compiled launch it is the
+compiled `gjc` binary. Grant the permission to that launcher and fully quit
+and relaunch GJC after changing the grant. GJC's macOS development and
+single-host release builds use a stable ad-hoc designated requirement so a
+rebuild does not silently become a new TCC identity.
 
 ## Rendering
 
