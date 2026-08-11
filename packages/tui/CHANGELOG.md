@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-08-11
+
 ### Added
 
 - Added atomic same-line deletion APIs and an `Editor` undo callback for keeping application state synchronized with editor history.
