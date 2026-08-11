@@ -13,9 +13,9 @@ import { type ModelSelectorValue, normalizeModelSelectorValue } from "../../conf
 import { type Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { parseThinkingLevel } from "../../thinking";
-import { elevationAuthorityPath, verifyElevationCapability } from "../elevation/capability";
 import { ensureBroker } from "../broker/ensure";
 import { SessionIndex } from "../broker/session-index";
+import { elevationAuthorityPath, verifyElevationCapability } from "../elevation/capability";
 import {
 	collectAuthenticatedProfileProviders,
 	parseSyntheticModelId,

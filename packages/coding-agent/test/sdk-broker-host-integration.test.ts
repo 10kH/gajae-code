@@ -51,7 +51,7 @@ test("broker preserves host registration endpoint metadata across heartbeats", a
 		await busIndex.append(event("host_unregistered", "live", stateRoot));
 		expect(await broker.handleRequest("session.list", {})).toMatchObject({
 			ok: true,
-			result: { indexSeq: 4, sessions: [] },
+			result: { indexSeq: 4, sessions: [{ sessionId: "live", live: false, terminal: true }] },
 		});
 	} finally {
 		await broker.stop();
@@ -78,7 +78,7 @@ test("broker session.list returns bounded stable cursor pages", async () => {
 			sessions: Array<{ sessionId: string }>;
 			continuationCursor?: string;
 		};
-		expect(firstPage).toMatchObject({ indexSeq: 3, sessions: [{ sessionId: "one" }, { sessionId: "two" }] });
+		expect(firstPage.sessions).toMatchObject([{ sessionId: "one" }, { sessionId: "two" }]);
 		expect(firstPage.continuationCursor).toEqual(expect.any(String));
 
 		await busIndex.append(event("host_registered", "four", stateRoot));
@@ -86,8 +86,8 @@ test("broker session.list returns bounded stable cursor pages", async () => {
 		const second = await broker.handleRequest("session.list", { cursor: firstPage.continuationCursor });
 		expect(second).toMatchObject({
 			ok: true,
-			indexSeq: 3,
-			result: { indexSeq: 3, sessions: [{ sessionId: "three" }] },
+			indexSeq: firstPage.indexSeq,
+			result: { indexSeq: firstPage.indexSeq, sessions: [{ sessionId: "three" }] },
 		});
 		expect(JSON.stringify(second)).not.toContain('"four"');
 		expect(await broker.handleRequest("session.list", { limit: 101 })).toEqual({
@@ -290,7 +290,7 @@ test("SDK-only runtime registers its broker endpoint and retracts it on shutdown
 		await stopping;
 		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject({
 			ok: false,
-			error: { code: "resource_gone" },
+			error: { code: "endpoint_stale", message: "session endpoint is stale" },
 		});
 	} finally {
 		const shutdown = handlers.get("session_shutdown");

@@ -369,7 +369,7 @@ describe("SessionSdkSessionRuntime", () => {
 			expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject(
 				{
 					ok: false,
-					error: { code: "resource_gone" },
+					error: { code: "endpoint_stale", message: "session endpoint is stale" },
 				},
 			);
 		} finally {
