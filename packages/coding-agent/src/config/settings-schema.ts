@@ -2121,15 +2121,14 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	// Bounded-memory cold-session offloading (rollout knobs; budgets are fixed
-	// implementation constants in the sidecar primitives, not user-tunable
-	// fields). "shadow" (default) measures and offloads without changing
-	// observable behavior; canary/default-on are release-channel states, not
-	// user-facing enum values.
+	// Bounded-memory cold-session offloading. Budgets are fixed implementation
+	// constants in the sidecar primitives, not user-tunable fields. Auto keeps
+	// ordinary sessions on the eager path and routes transcripts above the eager
+	// admission limit through bounded cold-session state.
 	"sessionMemory.mode": {
 		type: "enum",
-		values: ["off", "shadow", "enabled"] as const,
-		default: "shadow",
+		values: ["off", "shadow", "enabled", "auto"] as const,
+		default: "auto",
 	},
 	// Independent runtime switch for AgentSession's async compact-once overflow
 	// recovery. The synchronous bounded context preflight stays always on.
@@ -4148,7 +4147,7 @@ export interface ShellMinimizerSettings {
 }
 
 export interface SessionMemorySettings {
-	mode: "off" | "shadow" | "enabled";
+	mode: "off" | "shadow" | "enabled" | "auto";
 	contextOverflowRecovery: boolean;
 }
 

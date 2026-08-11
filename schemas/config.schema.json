@@ -1621,9 +1621,10 @@
 					"enum": [
 						"off",
 						"shadow",
-						"enabled"
+						"enabled",
+						"auto"
 					],
-					"default": "shadow"
+					"default": "auto"
 				},
 				"contextOverflowRecovery": {
 					"type": "boolean",
