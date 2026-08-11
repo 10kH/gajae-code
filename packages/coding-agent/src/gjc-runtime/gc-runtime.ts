@@ -624,8 +624,7 @@ export interface GcDiskFamilyUsage {
 }
 
 /**
- * Why a surface refused to reclaim anything, and how much it withheld to stay
- * fail-closed. Present only when the surface declined.
+ * Why a surface withheld reclaim candidates because its evidence was incomplete.
  */
 export interface GcDiskDeclined {
 	reason: string;
@@ -645,7 +644,7 @@ export interface GcDiskSurfaceReport {
 	kept: number;
 	kept_bytes: number;
 	failed: number;
-	/** Set when the surface declined to reclaim anything because its evidence was incomplete. */
+	/** Set when the surface withheld reclaim candidates because its evidence was incomplete. */
 	declined?: GcDiskDeclined;
 	/** Per-family counts and bytes. Only surfaces whose records are individual files set this. */
 	families?: GcDiskFamilyUsage[];
@@ -1439,9 +1438,20 @@ async function runGcDiskBlobs(input: {
 		surface.records.push(record);
 
 		if (!prune || record.action !== "would_reclaim") continue;
-		const removal = await removeCanonicalBlob(blob);
+		const removal = await removeCanonicalBlob(blob, {
+			// The blob identity check has its own asynchronous read window. Bind the
+			// transcript fence after that check and before unlink, so a reference
+			// appended while the blob is being revalidated withholds the sweep.
+			beforeUnlink: async () => await verifyGcDiskMarkFence({ sessionsRoot, accounted, marked, evidence, errors }),
+		});
 		if (removal.removed) {
 			record.action = "reclaimed";
+		} else if (!evidence.complete) {
+			record.action = "keep";
+			record.reason = `withheld_evidence_incomplete: ${evidence.notes.join(", ")}`;
+			record.withheld = true;
+			withheld++;
+			withheldBytes += blob.bytes;
 		} else if (removal.failed) {
 			record.action = "reclaim_failed";
 			record.reason = removal.reason;
@@ -2097,8 +2107,10 @@ export function buildGcDiskReportText(disk: GcDiskReport): string {
 				`kept=${surface.kept} (${formatGcDiskBytes(surface.kept_bytes)})`,
 		);
 		if (surface.declined) {
+			const reclaimState =
+				surface.reclaimed === 0 ? "reclaimed nothing" : `reclaimed ${surface.reclaimed} before withholding`;
 			lines.push(
-				`  declined: reclaimed nothing — ${surface.declined.reason} ` +
+				`  declined: ${reclaimState} — ${surface.declined.reason} ` +
 					`(withheld=${surface.declined.withheld} (${formatGcDiskBytes(surface.declined.withheld_bytes)}))`,
 			);
 		}

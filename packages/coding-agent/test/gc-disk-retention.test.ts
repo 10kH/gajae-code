@@ -19,6 +19,7 @@ import {
 	runGjcGcCommand,
 } from "../src/gjc-runtime/gc-runtime";
 import { SessionIndex } from "../src/sdk/broker/session-index";
+import { listCanonicalBlobs, removeCanonicalBlob } from "../src/session/blob-store";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -551,6 +552,60 @@ describe("gjc gc --disk --prune (blob mark and sweep)", () => {
 			} finally {
 				spy.mockRestore();
 			}
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("withholds when a blob reference appears during the blob identity check", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const precious = await writeBlob(fixture, "payload referenced after blob revalidation", 10);
+			const transcript = await writeSession(fixture, "repo-a", "live-state-session", { ageDays: 0 });
+			const blobPath = path.join(fixture.blobsDir, precious);
+			const realLstat = fsp.lstat as unknown as (target: PathLike, options?: { bigint?: false }) => Promise<Stats>;
+			let blobStats = 0;
+			const spy = spyOn(fsp, "lstat");
+			spy.mockImplementation((async (target: PathLike, options?: { bigint?: false }) => {
+				if (path.resolve(String(target)) === blobPath && ++blobStats === 2) {
+					await fsp.appendFile(
+						transcript,
+						`${JSON.stringify({ type: "message", role: "user", content: `blob:sha256:${precious}` })}\n`,
+					);
+				}
+				return await realLstat(target, options);
+			}) as unknown as typeof fsp.lstat);
+			try {
+				const disk = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"]));
+				expect(reasonById(disk, "blobs").get(precious)).toBe(
+					"keep:withheld_evidence_incomplete: sessions_changed_during_mark",
+				);
+				expect(disk.surfaces.blobs.reclaimed).toBe(0);
+				expect(disk.surfaces.blobs.declined?.reason).toBe("evidence_incomplete: sessions_changed_during_mark");
+				expect(await Bun.file(blobPath).exists()).toBe(true);
+				expect(await Bun.file(transcript).text()).toContain(`blob:sha256:${precious}`);
+			} finally {
+				spy.mockRestore();
+			}
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("refuses a same-size, same-mtime canonical blob replacement", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const hash = await writeBlob(fixture, "canonical identity must be stable", 10);
+			const blobPath = path.join(fixture.blobsDir, hash);
+			const entry = (await listCanonicalBlobs(fixture.blobsDir))[0]!;
+			const original = await fsp.lstat(blobPath);
+			const replacement = `${blobPath}.replacement`;
+			await Bun.write(replacement, "canonical identity must be stable");
+			await fsp.utimes(replacement, original.atime, original.mtime);
+			await fsp.rename(replacement, blobPath);
+
+			expect(await removeCanonicalBlob(entry)).toEqual({ removed: false, reason: "blob_changed" });
+			expect(await Bun.file(blobPath).exists()).toBe(true);
 		} finally {
 			await fsp.rm(fixture.root, { recursive: true, force: true });
 		}
