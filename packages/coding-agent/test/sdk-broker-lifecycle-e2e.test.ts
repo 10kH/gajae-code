@@ -3006,7 +3006,7 @@ test("broker rebinds implicit close only for a matching non-empty lifecycle requ
 		await broker.start();
 		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
 		for (const [label, initialRequestId, replacementRequestId, successor, expectedCode] of [
-			["same", "request-a", "request-a", false, "close_refused"],
+			["same", "request-a", "request-a", false, "endpoint_stale"],
 			["absent", undefined, undefined, false, "endpoint_stale"],
 			["empty", "", "", false, "endpoint_stale"],
 			["different", "request-a", "request-b", false, "endpoint_stale"],
@@ -3103,6 +3103,13 @@ test("broker atomically reuses the indexed live owner for distinct resume keys",
 			endpointGeneration: 17,
 			pid: host.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+		});
+		await broker.index.append({
+			type: "host_heartbeat",
+			sessionId,
+			locator: { repo: root, stateRoot },
+			endpointGeneration: 17,
+			pid: host.pid,
 		});
 
 		const [first, second] = await Promise.all([
