@@ -453,6 +453,7 @@ async function invocationHarness(
 		sendUserMessage: hooks.sendUserMessage ?? (async () => {}),
 	} as unknown as ExtensionAPI;
 	createSdkSessionRuntimeExtension(api, {
+		agentDir: cwd,
 		createTransport: async ({ sessionId: id, stateRoot, token }) => ({
 			sessionId: id,
 			stateRoot,
