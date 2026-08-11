@@ -43,11 +43,16 @@ class FakeFs implements AdoptionIntentFs {
 	writeError: Error | undefined;
 	unlinkError: Error | undefined;
 	unlinkErrorFile: string | undefined;
+	chmodError: Error | undefined;
+	chmodErrorFile: string | undefined;
+	syncError: Error | undefined;
+	syncErrorFile: string | undefined;
 	async mkdir(directory: string, options: { recursive: true; mode: number }): Promise<void> {
 		this.dirs.add(directory);
 		this.modes.set(directory, options.mode);
 	}
 	async chmod(target: string, mode: number): Promise<void> {
+		if (this.chmodError && this.chmodErrorFile === target) throw this.chmodError;
 		this.modes.set(target, mode);
 	}
 	async readFile(file: string, _encoding: "utf8"): Promise<string> {
@@ -63,8 +68,11 @@ class FakeFs implements AdoptionIntentFs {
 	async rename(from: string, to: string): Promise<void> {
 		const value = this.files.get(from);
 		if (value === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+		const mode = this.modes.get(from);
 		this.files.delete(from);
+		this.modes.delete(from);
 		this.files.set(to, value);
+		if (mode !== undefined) this.modes.set(to, mode);
 	}
 	async unlink(file: string): Promise<void> {
 		if (this.unlinkError && this.unlinkErrorFile === file) throw this.unlinkError;
@@ -81,6 +89,7 @@ class FakeFs implements AdoptionIntentFs {
 		if (!this.files.has(file) && !this.dirs.has(file)) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
 		return {
 			sync: async () => {
+				if (this.syncError && this.syncErrorFile === file) throw this.syncError;
 				if (this.dirs.has(file)) this.syncedDirs.add(file);
 				else this.syncedFiles.add(file);
 			},
@@ -244,6 +253,58 @@ describe("Telegram provider-local adoption reservations", () => {
 			version: 2,
 			pendingTopic: { topicId: 17 },
 		});
+	});
+
+	test("retains the migrated v2 pending-topic sidecar when post-rename chmod fails", async () => {
+		const fake = new FakeFs();
+		const file = seedLegacyPendingTopic(fake);
+		const intents = store(fake);
+		fake.chmodErrorFile = file;
+		fake.chmodError = new Error("pending migration post-rename chmod failed");
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			expect(await intents.rehydrate()).toBe(1);
+			expect(intents.hasPendingTopic(17, "42")).toBe(true);
+			expect(fake.files.size).toBe(1);
+			expect(JSON.parse(fake.files.get(file) ?? "{}")).toMatchObject({ version: 2 });
+			expect(fake.modes.get(file)).toBe(0o600);
+			expect(warning).toHaveBeenLastCalledWith(
+				"notifications: Telegram adoption sidecar migration durability is uncertain; retained migrated v2 sidecar",
+				expect.objectContaining({
+					sidecar: "pending_topic",
+					stage: "durability",
+					error: "pending migration post-rename chmod failed",
+				}),
+			);
+		} finally {
+			warning.mockRestore();
+		}
+	});
+
+	test("retains the migrated v2 pending-topic sidecar when parent-directory sync fails", async () => {
+		const fake = new FakeFs();
+		const file = seedLegacyPendingTopic(fake);
+		const intents = store(fake);
+		fake.syncErrorFile = daemonPaths(AGENT).dir;
+		fake.syncError = new Error("pending migration parent-directory sync failed");
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			expect(await intents.rehydrate()).toBe(1);
+			expect(intents.hasPendingTopic(17, "42")).toBe(true);
+			expect(fake.files.size).toBe(1);
+			expect(JSON.parse(fake.files.get(file) ?? "{}")).toMatchObject({ version: 2 });
+			expect(fake.modes.get(file)).toBe(0o600);
+			expect(warning).toHaveBeenLastCalledWith(
+				"notifications: Telegram adoption sidecar migration durability is uncertain; retained migrated v2 sidecar",
+				expect.objectContaining({
+					sidecar: "pending_topic",
+					stage: "durability",
+					error: "pending migration parent-directory sync failed",
+				}),
+			);
+		} finally {
+			warning.mockRestore();
+		}
 	});
 
 	test("logs and retains a v1 pending-topic sidecar when migration write fails", async () => {
