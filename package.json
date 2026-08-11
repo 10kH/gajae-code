@@ -134,16 +134,9 @@
     "ci:build:native": "bun scripts/ci-build-native.ts",
     "ci:test:full": "bun run test",
     "ci:test:smoke": "bun packages/coding-agent/src/cli.ts --version && bun packages/coding-agent/src/cli.ts --help && bun packages/coding-agent/src/cli.ts stats --help && bun packages/coding-agent/src/cli.ts --smoke-test",
-<<<<<<< HEAD
-||||||| d5b782d8dd
-    "check:py-sdk": "python -m pip install -e 'python/gjc-sdk[test]' && python -m mypy python/gjc-sdk/gjc_sdk",
-    "test:py-sdk": "python -m pip install -e 'python/gjc-sdk[test]' && python -m pytest python/gjc-sdk/tests/",
-    "ci:test:py-sdk-build": "python -m pip install -e 'python/gjc-sdk[test]' && DIST=$(mktemp -d) && python -m build --outdir \"$DIST\" python/gjc-sdk && for archive in \"$DIST\"/gjc_sdk-*; do VENV=$(mktemp -d); python -m venv \"$VENV\" && \"$VENV/bin/python\" -m pip install \"$archive\" && \"$VENV/bin/python\" -c 'import gjc_sdk'; done",
-=======
     "check:py-sdk": "python -m pip install -e 'python/gjc-sdk[test]' && python -m mypy --config-file python/gjc-sdk/pyproject.toml python/gjc-sdk/gjc_sdk sdk-skills/gjc-sdk-author/templates/direct-sdk.py",
     "test:py-sdk": "python -m pip install -e 'python/gjc-sdk[test]' && python -m pytest python/gjc-sdk/tests/",
     "ci:test:py-sdk-build": "python -m pip install -e 'python/gjc-sdk[test]' && DIST=$(mktemp -d) && python -m build --outdir \"$DIST\" python/gjc-sdk && for archive in \"$DIST\"/gjc_sdk-*; do VENV=$(mktemp -d); python -m venv \"$VENV\" && \"$VENV/bin/python\" -m pip install \"$archive\" && \"$VENV/bin/python\" -c 'import gjc_sdk'; done",
->>>>>>> origin/dev
     "smoke:tui:iterm-ime": "bun packages/tui/test/iterm-ime-smoke.ts",
     "ci:test:install-methods": "bash scripts/install-tests/run-ci.sh",
     "ci:release:build-binaries": "bun scripts/ci-release-build-binaries.ts",
