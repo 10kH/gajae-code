@@ -2228,6 +2228,12 @@ async function terminateSpawnedChild(
 	};
 
 	let observation = observe();
+	const recheckOwnedExitObservation = async (): Promise<void> => {
+		if (observation !== "uncertain") return;
+		// This direct ChildProcess is owned by this broker invocation. A process-incarnation
+		// read can briefly lag its exit event, so recheck only this owned child before failing.
+		observation = await waitForExit(deadline);
+	};
 	if (observation === "alive") {
 		await waitUntil(timing, terminationStartDeadlineAt);
 		observation = observe();
@@ -2235,6 +2241,7 @@ async function terminateSpawnedChild(
 	if (observation === "alive") {
 		if (!(await signalVerifiedSession({ locator: { stateRoot: root }, pid }, id, "SIGTERM", expected))) {
 			observation = observe();
+			await recheckOwnedExitObservation();
 			if (observation !== "exited") {
 				await recordTerminalUncertain(broker, id, root, pid);
 				return false;
@@ -2248,6 +2255,7 @@ async function terminateSpawnedChild(
 	if (observation === "alive") {
 		if (!(await signalVerifiedSession({ locator: { stateRoot: root }, pid }, id, "SIGKILL", expected))) {
 			observation = observe();
+			await recheckOwnedExitObservation();
 			if (observation !== "exited") {
 				await recordTerminalUncertain(broker, id, root, pid);
 				return false;
@@ -2256,6 +2264,7 @@ async function terminateSpawnedChild(
 			observation = await waitForExit(deadline);
 		}
 	}
+	await recheckOwnedExitObservation();
 	if (observation !== "exited") {
 		await recordTerminalUncertain(broker, id, root, pid);
 		return false;
@@ -3275,8 +3284,9 @@ function sameCloseStoredProcessIdentity(expected: CloseRecord, current: CloseRec
 		typeof expected.processIncarnation === "string" &&
 		expected.processIncarnation.length > 0 &&
 		current.processIncarnation === expected.processIncarnation &&
-		(expected.lifecycleRequestId === undefined ||
-			(expected.lifecycleRequestId.length > 0 && current.lifecycleRequestId === expected.lifecycleRequestId)) &&
+		typeof expected.lifecycleRequestId === "string" &&
+		expected.lifecycleRequestId.length > 0 &&
+		current.lifecycleRequestId === expected.lifecycleRequestId &&
 		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
 		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
 	);
