@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:te
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as activeStateModule from "@gajae-code/coding-agent/skill-state/active-state";
 import { logger } from "@gajae-code/utils";
 import { DEFAULT_DISABLED_EXTENSIONS, DEFAULT_SKILL_DISCOVERY_SETTINGS } from "../src/config/skill-settings-defaults";
 import {
@@ -1954,6 +1955,60 @@ disabledExtensions:
 		expect(persistedMode.current_phase).toBe("requirements");
 		expect(persistedEntry.phase).toBe("requirements");
 		expect(rebuiltSnapshot.phase).toBe("requirements");
+	});
+	it("rollback restores upstream pipeline entries superseded by a later seed", async () => {
+		const root = await cwd();
+		const sessionId = "session-supersede-rollback";
+
+		const upstream = await ensureWorkflowSkillActivationSeed({
+			cwd: root,
+			skill: "deep-interview",
+			sessionId,
+		});
+		expect(upstream.seeded).toBe(true);
+
+		const successor = await ensureWorkflowSkillActivationSeed({
+			cwd: root,
+			skill: "ralplan",
+			sessionId,
+		});
+		expect(successor.seeded).toBe(true);
+
+		// Seeding ralplan removed the active deep-interview entry; rollback must
+		// restore it so a never-accepted prompt does not clear the prior workflow.
+		await expect(successor.rollback()).resolves.toBe(true);
+
+		const visible = await readVisibleSkillActiveState(root, sessionId);
+		expect(visible?.active_skills?.some(entry => entry.skill === "deep-interview" && entry.active !== false)).toBe(
+			true,
+		);
+		expect(visible?.active_skills?.some(entry => entry.skill === "ralplan" && entry.active !== false)).toBe(false);
+		expect(fs.stat(modeStatePath(root, sessionId, "ralplan"))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("cleans up the owned mode receipt when the seed's active-entry write fails", async () => {
+		const root = await cwd();
+		const sessionId = "session-mode-cleanup";
+		const statePath = modeStatePath(root, sessionId, "deep-interview");
+
+		const syncSpy = vi
+			.spyOn(activeStateModule, "syncSkillActiveState")
+			.mockRejectedValueOnce(new Error("simulated active-entry persistence failure"));
+		try {
+			await expect(
+				ensureWorkflowSkillActivationSeed({
+					cwd: root,
+					skill: "deep-interview",
+					sessionId,
+				}),
+			).rejects.toThrow("simulated active-entry persistence failure");
+		} finally {
+			syncSpy.mockRestore();
+		}
+
+		// The rejected invocation must not leave a revision-1 mode file behind,
+		// which would wedge a retry on its expectedRevision: 0 write.
+		await expect(fs.stat(statePath)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
 	it("ensureWorkflowSkillActivationState ignores non-workflow skills", async () => {

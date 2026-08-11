@@ -9675,7 +9675,7 @@ export class AgentSession {
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
 		}
 		if (options?.sdkRunToken) this.#sdkRunTokensByQueuedMessage.set(message, options.sdkRunToken);
-		if (options?.sdkRunToken && this.agent.state.isStreaming) {
+		if (options?.sdkRunToken && (this.agent.state.isStreaming || this.agent.hasQueuedMessages())) {
 			this.#deferredSdkFollowUps.push(message);
 		} else {
 			this.agent.followUp(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
@@ -9709,6 +9709,11 @@ export class AgentSession {
 		};
 	}
 	#releaseDeferredSdkFollowUps(): void {
+		// A deferred SDK follow-up must become the sole first message at the next
+		// acceptance so its run token is bound to the agent_start. Releasing it
+		// behind still-queued work reproduces the token-less mid-run consumption
+		// hazard, so wait for the queue to drain; the next agent_end retries.
+		if (this.agent.hasQueuedMessages()) return;
 		const message = this.#deferredSdkFollowUps.shift();
 		if (!message) return;
 		this.agent.followUp(message, { forceOneAtATime: true });

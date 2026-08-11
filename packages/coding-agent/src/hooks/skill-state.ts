@@ -11,7 +11,9 @@ import {
 	type GuardedStateWriteReceipt,
 	guardedStateWriteReceipt,
 	matchesGuardedStateWriteReceipt,
+	readActiveEntries,
 	rebuildActiveSnapshot,
+	writeActiveEntry,
 	writeGuardedJsonAtomic,
 	writeGuardedWorkflowEnvelopeAtomic,
 } from "../gjc-runtime/state-writer";
@@ -23,6 +25,7 @@ import {
 	type SkillActiveEntry,
 	type SkillActiveState,
 	syncSkillActiveState,
+	upstreamPlanningPipelineSkills,
 } from "../skill-state/active-state";
 import { initialPhaseForSkill } from "../skill-state/initial-phase";
 import { readWorkflowGuardContext } from "../skill-state/workflow-mutation-guard";
@@ -372,6 +375,8 @@ interface SeedSkillActivationWrite {
 	modeWrite: GuardedStateWriteReceipt;
 	activeEntryWrite: GuardedStateWriteReceipt;
 	activeStateWrite?: GuardedStateWriteReceipt;
+	/** Active upstream pipeline entries superseded by this seed; rollback restores them. */
+	supersededEntries: SkillActiveEntry[];
 }
 
 async function seedSkillActivationState(
@@ -444,38 +449,66 @@ async function seedSkillActivationState(
 		}),
 	);
 	if (!modeWrite) throw new Error(`Workflow activation mode write was not persisted: ${initializedStatePath}`);
-	const activeEntryResult = await syncSkillActiveState({
-		cwd: input.cwd,
-		skill,
-		active: true,
-		phase,
-		sessionId: resolvedSessionId,
-		threadId: input.threadId,
-		turnId: input.turnId,
-		active_subskills: input.activeSubskills,
-		source,
-		receipt: undefined,
-		sourceRevision: modeWrite.revision,
-		nowIso,
-		bestEffortSnapshot: true,
-	});
-	const activeEntryWrite = activeEntryResult ? guardedStateWriteReceipt(activeEntryResult) : undefined;
-	if (!activeEntryWrite) throw new Error(`Workflow activation entry write was not persisted: ${skill}`);
-	let activeStateWrite: GuardedStateWriteReceipt | undefined;
 	try {
-		activeStateWrite = guardedStateWriteReceipt(
-			await writeGuardedJsonAtomic(skillStatePath(input.cwd, resolvedSessionId), state, {
-				cwd: input.cwd,
-				policy: "cache",
-				sourceRevision: modeWrite.revision + 1,
-				receipt: undefined,
-				audit: { category: "state", verb: "write", owner: "gjc-hook", sessionId: resolvedSessionId },
-			}),
-		);
-	} catch {
-		// Corrupt derived active-state is reported by recovery diagnostics; activation remains fail-open.
+		const supersededEntries = await captureSupersededPlanningEntries(input.cwd, resolvedSessionId, skill);
+		const activeEntryResult = await syncSkillActiveState({
+			cwd: input.cwd,
+			skill,
+			active: true,
+			phase,
+			sessionId: resolvedSessionId,
+			threadId: input.threadId,
+			turnId: input.turnId,
+			active_subskills: input.activeSubskills,
+			source,
+			receipt: undefined,
+			sourceRevision: modeWrite.revision,
+			nowIso,
+			bestEffortSnapshot: true,
+		});
+		const activeEntryWrite = activeEntryResult ? guardedStateWriteReceipt(activeEntryResult) : undefined;
+		if (!activeEntryWrite) throw new Error(`Workflow activation entry write was not persisted: ${skill}`);
+		let activeStateWrite: GuardedStateWriteReceipt | undefined;
+		try {
+			activeStateWrite = guardedStateWriteReceipt(
+				await writeGuardedJsonAtomic(skillStatePath(input.cwd, resolvedSessionId), state, {
+					cwd: input.cwd,
+					policy: "cache",
+					sourceRevision: modeWrite.revision + 1,
+					receipt: undefined,
+					audit: { category: "state", verb: "write", owner: "gjc-hook", sessionId: resolvedSessionId },
+				}),
+			);
+		} catch {
+			// Corrupt derived active-state is reported by recovery diagnostics; activation remains fail-open.
+		}
+		return { state, modeWrite, activeEntryWrite, activeStateWrite, supersededEntries };
+	} catch (error) {
+		// The invocation is being rejected: remove the owned mode receipt so a retry
+		// does not wedge on a revision-1 mode file with no visible active entry.
+		await deleteIfOwned(modeWrite.path, {
+			cwd: input.cwd,
+			predicate: current => matchesGuardedStateWriteReceipt(current, modeWrite),
+		});
+		throw error;
 	}
-	return { state, modeWrite, activeEntryWrite, activeStateWrite };
+}
+/**
+ * Snapshot the active upstream planning-pipeline entries that seeding `skill`
+ * will supersede (e.g. an active deep-interview when ralplan is seeded). The
+ * seed's rollback re-writes these entries so a prompt that was never accepted
+ * does not silently clear the existing workflow.
+ */
+async function captureSupersededPlanningEntries(
+	cwd: string,
+	sessionId: string,
+	skill: string,
+): Promise<SkillActiveEntry[]> {
+	const upstream = upstreamPlanningPipelineSkills(skill);
+	if (upstream.length === 0) return [];
+	const visible = await readCanonicalVisibleSkillActiveState(cwd, sessionId);
+	if (!visible) return [];
+	return listActiveSkills(visible).filter(entry => upstream.includes(entry.skill));
 }
 
 // Fallback for native-hook prompts when SkillPromptDetails.subskillActivation is absent;
@@ -560,6 +593,15 @@ export async function ensureWorkflowSkillActivationSeed(
 					cwd: input.cwd,
 					predicate: current => matchesGuardedStateWriteReceipt(current, activeStateWrite),
 				});
+			}
+			// Restore the upstream pipeline entries this seed superseded so a
+			// prompt that was never accepted does not silently clear the prior
+			// workflow. Skip skills that were re-seeded in the meantime.
+			const existingEntries = await readActiveEntries(input.cwd, { sessionId: resolvedSessionId });
+			const existingSkills = new Set(existingEntries.map(entry => entry.skill));
+			for (const superseded of seed.supersededEntries) {
+				if (existingSkills.has(superseded.skill)) continue;
+				await writeActiveEntry(input.cwd, { sessionId: resolvedSessionId }, superseded.skill, superseded);
 			}
 			await rebuildActiveSnapshot(input.cwd, { sessionId: resolvedSessionId }, { cwd: input.cwd });
 			return entryRemoved.deleted;

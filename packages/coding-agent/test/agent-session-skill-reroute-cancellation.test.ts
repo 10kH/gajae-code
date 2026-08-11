@@ -2,7 +2,7 @@ import { afterEach, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
+import { Agent, type AgentMessage } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -289,4 +289,88 @@ test("cancels only its accepted idle follow-up before it can execute", async () 
 	expect(agent.snapshotFollowUp()).toHaveLength(1);
 	await Bun.sleep(0);
 	expect(agent.state.messages).toHaveLength(0);
+});
+test("defers an SDK follow-up behind pre-existing queued work so its run token binds", async () => {
+	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-follow-up-defer-"));
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+	authStorage.setRuntimeApiKey("anthropic", "test-key");
+	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [] },
+	});
+	session = new AgentSession({
+		agent,
+		sessionManager: createLifecycleIndependentSessionManager(),
+		settings: Settings.isolated(),
+		modelRegistry,
+	});
+	const controller = new AbortController();
+
+	agent.followUp({
+		role: "user",
+		content: [{ type: "text", text: "unrelated follow-up" }],
+		attribution: "user",
+		timestamp: Date.now(),
+	});
+	await session.sendUserMessage("owned follow-up", {
+		deliverAs: "followUp",
+		preflightSignal: controller.signal,
+		sdkRunToken: "sdk-owned-follow-up-deferred",
+		onPreflightAcceptCommit: () => {},
+	});
+
+	// The SDK-owned follow-up must not sit behind the unrelated message: at the
+	// next acceptance the unrelated message would run first and the SDK message
+	// would be consumed mid-run with its token never bound to an agent_start.
+	// It is deferred instead, so the queue holds only the pre-existing work.
+	expect(agent.snapshotFollowUp()).toHaveLength(1);
+	expect(agent.snapshotFollowUp()[0]).toMatchObject({ content: [{ type: "text", text: "unrelated follow-up" }] });
+});
+
+test("releases a deferred SDK follow-up only after queued work drains", async () => {
+	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-follow-up-release-"));
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+	authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+	authStorage.setRuntimeApiKey("anthropic", "test-key");
+	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [] },
+	});
+	session = new AgentSession({
+		agent,
+		sessionManager: createLifecycleIndependentSessionManager(),
+		settings: Settings.isolated(),
+		modelRegistry,
+	});
+
+	const unrelated: AgentMessage = {
+		role: "user",
+		content: [{ type: "text", text: "unrelated follow-up" }],
+		attribution: "user",
+		timestamp: Date.now(),
+	};
+	agent.followUp(unrelated);
+	await session.sendUserMessage("owned follow-up", {
+		deliverAs: "followUp",
+		preflightSignal: new AbortController().signal,
+		sdkRunToken: "sdk-owned-follow-up-release",
+		onPreflightAcceptCommit: () => {},
+	});
+	expect(agent.snapshotFollowUp()).toHaveLength(1);
+
+	// agent_end while queued work is still pending must hold the SDK follow-up.
+	agent.emitExternalEvent({ type: "agent_end", messages: [] });
+	await Bun.sleep(20);
+	expect(agent.snapshotFollowUp()).toHaveLength(1);
+	expect(agent.snapshotFollowUp()[0]).toMatchObject({ content: [{ type: "text", text: "unrelated follow-up" }] });
+
+	// Once the queue drains, the next agent_end releases it as its own run.
+	agent.removeQueuedMessages(candidate => candidate === unrelated);
+	agent.emitExternalEvent({ type: "agent_end", messages: [] });
+	await Bun.sleep(20);
+	expect(agent.snapshotFollowUp()).toHaveLength(1);
+	expect(agent.snapshotFollowUp()[0]).toMatchObject({ content: [{ type: "text", text: "owned follow-up" }] });
 });

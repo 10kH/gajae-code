@@ -648,7 +648,7 @@ function comparePipelineEntry(a: SkillActiveEntry, b: SkillActiveEntry): number 
 	return 0;
 }
 
-function upstreamPlanningPipelineSkills(skill: string): string[] {
+export function upstreamPlanningPipelineSkills(skill: string): string[] {
 	const rank = planningPipelineRank(skill);
 	if (rank === undefined) return [];
 	return [...PLANNING_PIPELINE_RANK.entries()]
