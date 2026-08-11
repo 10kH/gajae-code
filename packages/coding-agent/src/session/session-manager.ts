@@ -8708,6 +8708,7 @@ export class SessionManager {
 		strictResume?: { inspection: ResumeInspectionSnapshot; storage: SessionStorage; reuseEntries?: boolean },
 	): Promise<void> {
 		let strictManagedFallbackEntries: FileEntry[] | undefined;
+		let strictManagedFallbackMigrationApplied = false;
 		const resolvedSessionFile = this.#storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
 		const revalidateStrictResume = (): void => {
 			if (!strictResume) return;
@@ -8776,6 +8777,7 @@ export class SessionManager {
 			const inspected = inspectResumeSessionFile(resolvedSessionFile, this.#storage);
 			if ("kind" in inspected) throw new Error(`Could not open session: ${inspected.reason}`);
 			strictManagedFallbackEntries = inspected.entries;
+			strictManagedFallbackMigrationApplied = inspected.migrationApplied;
 		}
 		const eagerStat = this.#statSync(resolvedSessionFile);
 		if (eagerStat.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES) throw new SessionTranscriptOversizedError(eagerStat.size);
@@ -8795,7 +8797,12 @@ export class SessionManager {
 		}
 		const header = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		const sessionId = header?.id ?? createSessionId();
-		const migrationApplied = migrateToCurrentVersion(entries);
+		const migrationApplied =
+			strictResume && strictResume.reuseEntries !== false
+				? strictResume.inspection.migrationApplied
+				: strictManagedFallbackEntries
+					? strictManagedFallbackMigrationApplied
+					: migrateToCurrentVersion(entries);
 		await resolveBlobRefsInEntries(entries, this.#blobStore);
 		const prepared = this.#prepareResidentTextStoreTransition(
 			{
@@ -14695,13 +14702,12 @@ export class SessionManager {
 			await this.#drainEphemeralArtifactCleanups();
 		} catch (error) {
 			closeError = error;
-		} finally {
-			this.#releaseResidentTextStore();
-			if (this.#preparedNewSessions.size === 0) this.#releaseOwnedManagedAuthority();
-			this.#releaseClosedSessionState();
 		}
-		if (closeError) throw closeError;
-		if (this.#persistError) throw this.#persistError;
+		const terminalError = closeError ?? this.#persistError;
+		if (terminalError) throw terminalError;
+		this.#releaseResidentTextStore();
+		if (this.#preparedNewSessions.size === 0) this.#releaseOwnedManagedAuthority();
+		this.#releaseClosedSessionState();
 	}
 	/** Flush while open, then strictly close; retryable close skips the invalid second flush. */
 	async flushAndCloseStrict(): Promise<SessionManagerCloseOutcome> {
