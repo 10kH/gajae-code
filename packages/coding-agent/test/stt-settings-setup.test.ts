@@ -25,7 +25,9 @@ describe("STT settings setup", () => {
 		expect(ensureDependencies.mock.calls[0]?.[0]?.modelName).toBe("base.en");
 		expect(showStatus).toHaveBeenCalledWith("Checking speech-to-text dependencies...");
 		expect(showStatus).toHaveBeenCalledWith("Installing openai-whisper (50%)");
-		expect(showStatus).toHaveBeenLastCalledWith("Speech-to-text is ready. Use /hotkeys or Ctrl+P → Toggle speech-to-text.");
+		expect(showStatus).toHaveBeenLastCalledWith(
+			"Speech-to-text is ready. Use /hotkeys or Ctrl+P → Toggle speech-to-text.",
+		);
 		expect(setEnabled).not.toHaveBeenCalled();
 		expect(flush).not.toHaveBeenCalled();
 		expect(showError).not.toHaveBeenCalled();
