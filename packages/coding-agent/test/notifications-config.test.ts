@@ -24,7 +24,6 @@ import {
 	isGenericNotificationHostEligible,
 	isGenericNotificationSessionEnabled,
 	isProviderEffectivelyEnabled,
-	isTelegramOrchestrationSession,
 	maskToken,
 	type NotificationConfig,
 	type RedactableAction,
@@ -60,10 +59,6 @@ import {
 	isolatedNotificationSettings,
 	registerNotificationRuntime,
 } from "./helpers/notification-settings";
-import {
-	createOrchestrationNotificationsExtension,
-	withoutTelegramOrchestrationProvenance,
-} from "./helpers/telegram-topic-test";
 
 const BASE_CFG: NotificationConfig = {
 	enabled: false,
@@ -1359,17 +1354,6 @@ describe("notifications config", () => {
 		expect(hasAnyEffectivelyEnabledProvider(mixedAdapterCfg)).toBe(true);
 		expect(telegramEffectivelyEnabled(mixedAdapterCfg)).toBe(false);
 	});
-	test("isTelegramOrchestrationSession requires coordinator or lifecycle provenance", () => {
-		expect(isTelegramOrchestrationSession({})).toBe(false);
-		expect(isTelegramOrchestrationSession({ GJC_NOTIFICATIONS: "1" })).toBe(false);
-		expect(isTelegramOrchestrationSession({ GJC_COORDINATOR_SESSION_ID: "coordinator-1" })).toBe(true);
-		expect(isTelegramOrchestrationSession({ GJC_COORDINATOR_SESSION_STATE_FILE: "/tmp/session-state.json" })).toBe(
-			true,
-		);
-		expect(isTelegramOrchestrationSession({ GJC_LIFECYCLE_REQUEST_ID: "lifecycle-1" })).toBe(true);
-		expect(isTelegramOrchestrationSession({ GJC_SDK_LIFECYCLE_REQUEST: "{}" })).toBe(true);
-		expect(isTelegramOrchestrationSession({ GJC_COORDINATOR_SESSION_ID: "  " })).toBe(false);
-	});
 
 	test("isGenericNotificationSessionEnabled applies precedence", () => {
 		expect(
@@ -1821,7 +1805,7 @@ describe("notifications config", () => {
 				ui: { notify: () => {} },
 			} as unknown as ExtensionContext;
 			let providerEnsures = 0;
-			createOrchestrationNotificationsExtension(api, {
+			createNotificationsExtension(api, {
 				settings,
 				ensureTelegramDaemon: async () => "blocked",
 				ensureProviderDaemon: async provider => {
@@ -1837,7 +1821,7 @@ describe("notifications config", () => {
 			const chatEndpoint = path.join(cwd, ".gjc", "state", "chat", "sdk", `${sessionId}.json`);
 			try {
 				await sessionStart({}, context);
-				expect(providerEnsures).toBe(1);
+				expect(providerEnsures).toBe(2);
 				expect(fs.existsSync(standardEndpoint)).toBe(false);
 				expect(fs.existsSync(chatEndpoint)).toBe(true);
 			} finally {
@@ -1847,127 +1831,7 @@ describe("notifications config", () => {
 			}
 		}, 30_000);
 
-		test("preserves an already-published canonical endpoint on a late Telegram ownership race", async () => {
-			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-provider-late-telegram-race-"));
-			const agentDir = path.join(cwd, ".gjc", "agent");
-			const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
-			const botToken = "1234567890:late-race-token-value";
-			const chatId = "late-race-chat";
-			const settings = isolatedNotificationSettings(agentDir, {
-				"notifications.enabled": true,
-				"notifications.telegram.enabled": true,
-				"notifications.telegram.botToken": botToken,
-				"notifications.telegram.chatId": chatId,
-				"notifications.discord.enabled": true,
-				"notifications.discord.botToken": "discord-token",
-				"notifications.discord.applicationId": "discord-app",
-				"notifications.discord.guildId": "discord-guild",
-				"notifications.discord.parentChannelId": "discord-parent",
-			});
-			const incarnation = processIncarnation(process.pid);
-			if (!incarnation) throw new Error("Current process incarnation is unavailable for the ownership test.");
-			const paths = daemonPaths(agentDir);
-			fs.mkdirSync(paths.dir, { recursive: true });
-			fs.writeFileSync(
-				paths.state,
-				JSON.stringify({
-					pid: process.pid,
-					incarnation,
-					ownerId: "matching-owner",
-					tokenFingerprint: tokenFingerprint(botToken),
-					chatId,
-					startedAt: Date.now(),
-					heartbeatAt: Date.now(),
-					roots: [path.join(cwd, ".gjc", "state")],
-					version: DAEMON_VERSION,
-					generation: DAEMON_GENERATION,
-				}),
-			);
-			const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
-			const api = {
-				on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
-					handlers.set(event, handler);
-				},
-				registerCommand() {},
-			} as unknown as ExtensionAPI;
-			const sessionId = "late-telegram-race";
-			const context = {
-				cwd,
-				sessionManager: {
-					getSessionId: () => sessionId,
-					getSessionName: () => "late Telegram race",
-				},
-				ui: { notify: () => {} },
-			} as unknown as ExtensionContext;
-			let providerEnsures = 0;
-			createOrchestrationNotificationsExtension(api, {
-				settings,
-				ensureTelegramDaemon: async () => "blocked",
-				ensureProviderDaemon: async () => {
-					providerEnsures++;
-					return "attached";
-				},
-			});
-			const sessionStart = handlers.get("session_start");
-			const sessionShutdown = handlers.get("session_shutdown");
-			if (!sessionStart || !sessionShutdown) throw new Error("notifications extension handlers were not registered");
-			const standardEndpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-			const chatEndpoint = path.join(cwd, ".gjc", "state", "chat", "sdk", `${sessionId}.json`);
-			try {
-				await sessionStart({}, context);
-				expect(providerEnsures).toBeGreaterThan(0);
-				expect(fs.existsSync(standardEndpoint)).toBe(true);
-				expect(fs.existsSync(chatEndpoint)).toBe(false);
-			} finally {
-				await sessionShutdown({}, context);
-				expect(fs.existsSync(standardEndpoint)).toBe(false);
-				await cleanupFixtureRoot(cleanup);
-			}
-		}, 30_000);
-		test("keeps canonical SDK discovery when Telegram ownership is blocked", async () => {
-			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-ownership-blocked-"));
-			const agentDir = path.join(cwd, ".gjc", "agent");
-			const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
-			const settings = isolatedNotificationSettings(agentDir, {
-				"notifications.enabled": true,
-				"notifications.telegram.enabled": true,
-				"notifications.telegram.botToken": "1234567890:blocked-telegram-token-value",
-				"notifications.telegram.chatId": "blocked-chat",
-			});
-			const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
-			const api = {
-				on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
-					handlers.set(event, handler);
-				},
-				registerCommand() {},
-			} as unknown as ExtensionAPI;
-			const sessionId = "telegram-ownership-blocked";
-			const context = {
-				cwd,
-				sessionManager: {
-					getSessionId: () => sessionId,
-					getSessionName: () => "blocked Telegram owner",
-				},
-				ui: { notify: () => {} },
-			} as unknown as ExtensionContext;
-			createOrchestrationNotificationsExtension(api, {
-				settings,
-				ensureTelegramDaemon: async () => "blocked",
-			});
-			const sessionStart = handlers.get("session_start");
-			const sessionShutdown = handlers.get("session_shutdown");
-			if (!sessionStart || !sessionShutdown) throw new Error("notifications extension handlers were not registered");
-			const endpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-			try {
-				await sessionStart({}, context);
-				expect(JSON.parse(fs.readFileSync(endpoint, "utf8"))).toMatchObject({ sessionId });
-			} finally {
-				await sessionShutdown({}, context);
-				expect(fs.existsSync(endpoint)).toBe(false);
-				await cleanupFixtureRoot(cleanup);
-			}
-		}, 30_000);
-		test("keeps the core SDK endpoint when notification provider readiness fails", async () => {
+		test("rejects ordinary session_start after provider readiness fails without publishing an endpoint", async () => {
 			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-provider-readiness-failure-"));
 			const agentDir = path.join(cwd, ".gjc", "agent");
 			const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
@@ -2004,8 +1868,8 @@ describe("notifications config", () => {
 				const unsubscribe = runner.onError(error => errors.push(error.error));
 				await runner.emit({ type: "session_start" });
 				unsubscribe();
-				expect(errors).not.toContain("notifications: SDK startup failed: provider readiness denied");
-				expect(fs.existsSync(endpoint)).toBe(true);
+				expect(errors).toContain("notifications: SDK startup failed: provider readiness denied");
+				expect(fs.existsSync(endpoint)).toBe(false);
 			} finally {
 				await session?.extensionRunner?.emit({ type: "session_shutdown" });
 				session?.dispose();
@@ -2014,45 +1878,14 @@ describe("notifications config", () => {
 			}
 		}, 30000);
 
-		test("retains a readiness-failed notification runtime so /notify on can retry without republishing SDK", async () => {
+		test("removes a readiness-failed runtime with rollback proof so /notify on retries a real startup", async () => {
 			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-provider-readiness-retry-"));
 			const agentDir = path.join(cwd, ".gjc", "agent");
 			const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
-			const settings = isolatedNotificationSettings(agentDir, {
-				"notifications.enabled": true,
-				"notifications.telegram.enabled": true,
-				"notifications.telegram.botToken": "1234567890:mixed-retry-token-value",
-				"notifications.telegram.chatId": "mixed-retry-chat",
-				"notifications.discord.enabled": true,
-				"notifications.discord.botToken": "discord-token",
-				"notifications.discord.applicationId": "discord-app",
-				"notifications.discord.guildId": "discord-guild",
-				"notifications.discord.parentChannelId": "discord-parent",
-			});
-			const incarnation = processIncarnation(process.pid);
-			if (!incarnation) throw new Error("Current process incarnation is unavailable for the ownership test.");
-			const paths = daemonPaths(agentDir);
-			fs.mkdirSync(paths.dir, { recursive: true });
-			fs.writeFileSync(
-				paths.state,
-				JSON.stringify({
-					pid: process.pid,
-					incarnation,
-					ownerId: "foreign-retry-owner",
-					tokenFingerprint: tokenFingerprint("9876543210:foreign-retry-token-value"),
-					chatId: "foreign-retry-chat",
-					startedAt: Date.now(),
-					heartbeatAt: Date.now(),
-					roots: [path.join(cwd, ".gjc", "state")],
-					version: DAEMON_VERSION,
-					generation: DAEMON_GENERATION,
-				}),
-			);
+			const settings = providerSettings(agentDir);
 			const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
 			let notify: { handler(args: string, ctx: ExtensionCommandContext): Promise<void> | void } | undefined;
 			let providerReady = false;
-			let providerAttempts = 0;
-			const notifications: string[] = [];
 			const rollback = new SdkStartupRollbackTracker();
 			const capability = new SdkStartupCapability(rollback);
 			const api = {
@@ -2073,14 +1906,12 @@ describe("notifications config", () => {
 					getSessionId: () => "provider-readiness-retry",
 					getSessionName: () => "provider readiness retry",
 				},
-				ui: { notify: (message: string) => notifications.push(message) },
+				ui: { notify: () => {} },
 			} as unknown as ExtensionCommandContext;
-			const endpoint = path.join(cwd, ".gjc", "state", "chat", "sdk", "provider-readiness-retry.json");
-			createOrchestrationNotificationsExtension(api, {
+			const endpoint = path.join(cwd, ".gjc", "state", "sdk", "provider-readiness-retry.json");
+			createNotificationsExtension(api, {
 				settings,
-				ensureTelegramDaemon: async () => "blocked",
 				ensureProviderDaemon: async () => {
-					providerAttempts++;
 					if (!providerReady) throw new Error("provider readiness denied");
 				},
 			});
@@ -2090,24 +1921,19 @@ describe("notifications config", () => {
 				throw new Error("notifications extension did not register its command handlers");
 			try {
 				await sessionStart({}, context);
-				expect(await capability.promise).toMatchObject({ status: "started" });
-				expect(fs.existsSync(endpoint)).toBe(true);
-				expect(rollback.result).toMatchObject({
-					runtimeRemoved: false,
-					hostStopped: false,
-					brokerRegistrationReleased: false,
+				expect(await capability.promise).toMatchObject({
+					status: "failed",
+					failure: { message: "provider readiness denied" },
 				});
-				expect(providerAttempts).toBeGreaterThanOrEqual(2);
-				const attemptsAfterStartup = providerAttempts;
-				const endpointBeforeRetry = fs.readFileSync(endpoint, "utf8");
-				const endpointMtimeBeforeRetry = fs.statSync(endpoint).mtimeMs;
+				expect(fs.existsSync(endpoint)).toBe(false);
+				expect(rollback.result).toMatchObject({
+					runtimeRemoved: true,
+					hostStopped: true,
+					brokerRegistrationReleased: true,
+				});
 
 				providerReady = true;
 				await notify.handler("on", context);
-				expect(providerAttempts).toBeGreaterThan(attemptsAfterStartup);
-				expect(fs.readFileSync(endpoint, "utf8")).toBe(endpointBeforeRetry);
-				expect(fs.statSync(endpoint).mtimeMs).toBe(endpointMtimeBeforeRetry);
-				expect(notifications).toContain("Notifications enabled for this session.");
 				expect(fs.existsSync(endpoint)).toBe(true);
 			} finally {
 				await sessionShutdown({}, context);
@@ -2116,7 +1942,7 @@ describe("notifications config", () => {
 			}
 		}, 30000);
 
-		test("publishes the core SDK endpoint before notification provider readiness", async () => {
+		test("waits for provider readiness before publishing the embedded session endpoint", async () => {
 			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-provider-readiness-success-"));
 			const agentDir = path.join(cwd, ".gjc", "agent");
 			const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
@@ -2135,7 +1961,7 @@ describe("notifications config", () => {
 						model: getBundledModel("openai", "gpt-4o-mini"),
 						disableExtensionDiscovery: true,
 						ensureNotificationProviderDaemon: async () => {
-							expect(fs.existsSync(endpoint)).toBe(true);
+							expect(fs.existsSync(endpoint)).toBe(false);
 						},
 						extensions: [],
 						skills: [],
@@ -2326,65 +2152,7 @@ describe("notifications config", () => {
 		expect(fs.existsSync(path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`))).toBe(false);
 		expect(fs.existsSync(daemonPaths(agentDir).roots)).toBe(false);
 	});
-	test("ordinary notification sessions do not register a Telegram topic root", async () => {
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notification-no-topic-"));
-		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notification-no-topic-agent-"));
-		tempDirs.push(cwd, agentDir);
-		const sessionId = "session-no-topic";
-		const settings = new Proxy(
-			Settings.isolated({
-				"notifications.enabled": true,
-				"notifications.telegram.botToken": "123456:ordinary-session-token",
-				"notifications.telegram.chatId": "ordinary-session-chat",
-			}),
-			{
-				get(target, prop) {
-					if (prop === "getAgentDir") return () => agentDir;
-					const value = Reflect.get(target, prop, target);
-					return typeof value === "function" ? value.bind(target) : value;
-				},
-			},
-		) as Settings;
-		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
-		const api = {
-			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
-				handlers.set(event, handler);
-			},
-			registerCommand() {},
-		} as unknown as ExtensionAPI;
-		const context = {
-			cwd,
-			sessionManager: {
-				getSessionId: () => sessionId,
-				getSessionName: () => "ordinary session",
-			},
-			ui: { notify: () => {} },
-		} as unknown as ExtensionContext;
-		let telegramEnsures = 0;
-		withoutTelegramOrchestrationProvenance(() =>
-			createNotificationsExtension(api, {
-				settings,
-				ensureTelegramDaemon: async () => {
-					telegramEnsures++;
-					return "attached";
-				},
-			}),
-		);
-		const sessionStart = handlers.get("session_start");
-		const sessionShutdown = handlers.get("session_shutdown");
-		if (!sessionStart || !sessionShutdown) throw new Error("notifications extension handlers were not registered");
-		const endpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-		try {
-			await sessionStart({}, context);
-			expect(fs.existsSync(endpoint)).toBe(true);
-			expect(fs.existsSync(daemonPaths(agentDir).roots)).toBe(false);
-			expect(telegramEnsures).toBe(0);
-		} finally {
-			await sessionShutdown({}, context);
-			expect(fs.existsSync(endpoint)).toBe(false);
-		}
-	});
-	test("captured /notify on uses the production daemon ensurer once and awaits SDK endpoint shutdown", async () => {
+	test("captured /notify on ensures provider transport once without registering a session root", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notification-command-"));
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notification-agent-"));
 		tempDirs.push(cwd, agentDir);
@@ -2426,7 +2194,7 @@ describe("notifications config", () => {
 			ui: { notify: () => {} },
 		} as unknown as ExtensionCommandContext;
 
-		createOrchestrationNotificationsExtension(api, {
+		createNotificationsExtension(api, {
 			settings,
 			ensureTelegramDaemon: input => {
 				let ownerId: string | undefined;
@@ -2470,16 +2238,12 @@ describe("notifications config", () => {
 			settings.set("notifications.enabled", true);
 			await notify.handler("on", context);
 			expect(fs.existsSync(endpoint)).toBe(true);
-			expect(fs.existsSync(roots)).toBe(true);
-			const registeredRoots = JSON.parse(fs.readFileSync(roots, "utf8")) as { roots: string[] };
-			expect(registeredRoots.roots).toEqual([path.join(cwd, ".gjc", "state")]);
+			expect(fs.existsSync(roots)).toBe(false);
 			expect(spawns).toBe(1);
 
 			await notify.handler("on", context);
 			expect(fs.existsSync(endpoint)).toBe(true);
-			expect((JSON.parse(fs.readFileSync(roots, "utf8")) as { roots: string[] }).roots).toEqual([
-				path.join(cwd, ".gjc", "state"),
-			]);
+			expect(fs.existsSync(roots)).toBe(false);
 			expect(spawns).toBe(1);
 
 			await sessionShutdown({}, context);

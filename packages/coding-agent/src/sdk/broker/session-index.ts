@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import { resolveEquivalentPath } from "@gajae-code/utils";
 import { withFileLock } from "../../config/file-lock";
 import { processIncarnation } from "./process-incarnation";
 import {
@@ -325,6 +326,7 @@ function reduceEvents(events: SessionIndexEvent[], now: number): IndexedSession[
 		if (latest === undefined) continue;
 		const terminal = latest.type === "host_unregistered" || latest.type === "session_closed";
 		if (latest.type === "session_deleted") continue;
+		const terminalUncertain = latest.type === "lifecycle_terminal" || latest.terminalUncertain === true;
 		const heartbeat = latestHeartbeatByIdentity.get(chosen.identity);
 		const pidAlive = alive(latest.pid);
 		// Liveness evidence is host-written: a checkpointed heartbeat, or the
@@ -347,7 +349,7 @@ function reduceEvents(events: SessionIndexEvent[], now: number): IndexedSession[
 			processIncarnation: latest.processIncarnation,
 			endpointMtimeMs: latest.endpointMtimeMs,
 			lifecycleRequestId: latest.lifecycleRequestId,
-			terminalUncertain: latest.type === "lifecycle_terminal" || latest.terminalUncertain === true,
+			terminalUncertain,
 			indexSeq: latest.indexSeq,
 			hostIncarnation: latest.hostIncarnation,
 			identityProvenance: recordedIncarnation === undefined ? "legacy" : "composite",
@@ -355,7 +357,7 @@ function reduceEvents(events: SessionIndexEvent[], now: number): IndexedSession[
 			lastHeartbeatAt: heartbeat?.ts,
 			ambiguous: (roots.get(sessionId)?.size ?? 0) > 1,
 			terminal,
-			live: !terminal && pidAlive && heartbeatFresh && incarnationMatches,
+			live: !terminal && !terminalUncertain && pidAlive && heartbeatFresh && incarnationMatches,
 		});
 	}
 	return sessions;
@@ -911,6 +913,55 @@ export class SessionIndex {
 			});
 		});
 	}
+	async unregisterIfCurrent(expected: IndexedSession): Promise<boolean> {
+		const indexPath = path.resolve(logFor(this.#agentDir));
+		return await SessionIndex.#enqueue(indexPath, async () => {
+			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
+			return await withFileLock(logFor(this.#agentDir), async () => {
+				await this.#replayUnderLock();
+				if (this.#corruptSuffix) throw new Error("Cannot conditionally unregister from a corrupt session index");
+				const current = this.listSessions().sessions.find(session => session.sessionId === expected.sessionId);
+				if (
+					!current ||
+					this.hostUnregisteredAfter(expected) ||
+					current.terminalUncertain ||
+					current.endpointGeneration !== expected.endpointGeneration ||
+					current.pid !== expected.pid ||
+					current.endpointMtimeMs !== expected.endpointMtimeMs ||
+					current.lifecycleRequestId !== expected.lifecycleRequestId ||
+					current.processIncarnation !== expected.processIncarnation ||
+					(current.hostIncarnation ?? current.processIncarnation) !==
+						(expected.hostIncarnation ?? expected.processIncarnation) ||
+					resolveEquivalentPath(current.locator.repo) !== resolveEquivalentPath(expected.locator.repo) ||
+					path.resolve(current.locator.stateRoot) !== path.resolve(expected.locator.stateRoot)
+				)
+					return false;
+				const unsigned: Omit<SessionIndexEvent, "checksum"> = {
+					version: SDK_STATE_VERSION,
+					indexSeq: this.indexSeq + 1,
+					ts: Date.now(),
+					type: "host_unregistered",
+					sessionId: expected.sessionId,
+					locator: expected.locator,
+					endpointGeneration: expected.endpointGeneration,
+					pid: expected.pid,
+					...(expected.processIncarnation === undefined
+						? {}
+						: { processIncarnation: expected.processIncarnation }),
+					...(expected.hostIncarnation === undefined ? {} : { hostIncarnation: expected.hostIncarnation }),
+					...(expected.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: expected.endpointMtimeMs }),
+					...(expected.lifecycleRequestId === undefined
+						? {}
+						: { lifecycleRequestId: expected.lifecycleRequestId }),
+				};
+				const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
+				await appendSync(logFor(this.#agentDir), JSON.stringify(event));
+				await this.#refreshUnderLock();
+				if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
+				return true;
+			});
+		});
+	}
 
 	/** Hold the canonical index lock across an authority-sensitive operation. */
 	async withLocked<T>(callback: () => Promise<T>): Promise<T> {
@@ -1018,7 +1069,7 @@ export class SessionIndex {
 				const events: SessionIndexEvent[] = [];
 				const rows = reduceEvents(this.#events, now);
 				for (const row of rows) {
-					if (row.terminal) continue;
+					if (row.terminal || row.terminalUncertain) continue;
 					if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)
 						continue;
 					if (!alive(row.pid)) continue;
@@ -1053,10 +1104,17 @@ export class SessionIndex {
 	hostUnregisteredAfter(
 		registration: Pick<
 			IndexedSession,
-			"sessionId" | "endpointGeneration" | "pid" | "indexSeq" | "lifecycleRequestId"
+			| "sessionId"
+			| "endpointGeneration"
+			| "pid"
+			| "indexSeq"
+			| "lifecycleRequestId"
+			| "hostIncarnation"
+			| "processIncarnation"
 		>,
 	): { indexSeq: number; lifecycleRequestId?: string } | undefined {
 		const lifecycleRequestId = registration.lifecycleRequestId;
+		const incarnation = registration.hostIncarnation ?? registration.processIncarnation;
 		const event = this.#events.findLast(
 			item =>
 				item.type === "host_unregistered" &&
@@ -1064,7 +1122,8 @@ export class SessionIndex {
 				item.sessionId === registration.sessionId &&
 				item.endpointGeneration === registration.endpointGeneration &&
 				item.pid === registration.pid &&
-				(lifecycleRequestId === undefined || item.lifecycleRequestId === lifecycleRequestId),
+				(lifecycleRequestId === undefined || item.lifecycleRequestId === lifecycleRequestId) &&
+				(incarnation === undefined || (item.hostIncarnation ?? item.processIncarnation) === incarnation),
 		);
 		return event
 			? {

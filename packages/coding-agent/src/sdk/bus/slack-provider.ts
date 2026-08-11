@@ -49,11 +49,13 @@ export interface SlackProviderClient {
 		text: string;
 		threadTs?: string;
 		clientMsgId: string;
+		signal?: AbortSignal;
 	}): Promise<SlackPostedMessage>;
 	findMessageByClientMsgId?(input: {
 		channel: string;
 		clientMsgId: string;
 		threadTs?: string;
+		signal?: AbortSignal;
 	}): Promise<SlackMessageSearchResult | null>;
 	/**
 	 * Prove that an operator-supplied timestamp addresses a real message in the
@@ -92,6 +94,7 @@ export class SlackProvider {
 		text: string;
 		threadTs?: string;
 		clientMsgId: string;
+		signal?: AbortSignal;
 	}): Promise<SlackPostedMessage> {
 		return await this.client.postMessage(input);
 	}
@@ -100,6 +103,7 @@ export class SlackProvider {
 		channel: string;
 		clientMsgId: string;
 		threadTs?: string;
+		signal?: AbortSignal;
 	}): Promise<SlackMessageSearchResult | null> {
 		return (await this.client.findMessageByClientMsgId?.(input)) ?? null;
 	}

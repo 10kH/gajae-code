@@ -254,7 +254,6 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		richDraft: cfg.richDraft,
 		toolActivity: cfg.toolActivity,
 		topics: cfg.topics,
-		requireTelegramTopicEligibility: true,
 		btw: cfg.btw,
 		pid: deps.processPid ?? process.pid,
 		control: createDaemonControlHooks(settings as Settings),

@@ -1,4 +1,4 @@
-import { expect, test, vi } from "bun:test";
+import { expect, setDefaultTimeout, test, vi } from "bun:test";
 import * as path from "node:path";
 import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
 import { getProviderFirstEventTimeoutFallbackMs } from "@gajae-code/ai/utils/idle-iterator";
@@ -10,6 +10,14 @@ import {
 	ACP_PROMPT_INFERENCE_TIMEOUT_MS,
 	ACP_PROMPT_TOOL_ACTIVITY_TIMEOUT_MS,
 } from "../src/sdk/prompt-watchdog";
+import {
+	type ExactSessionAuthorityFixture,
+	type ExactSessionAuthorityOptions,
+	prepareExactSessionAuthority,
+	publishExactSessionAuthority,
+} from "./helpers/sdk-exact-session-authority";
+
+setDefaultTimeout(60_000);
 
 type TestSocket = { send(message: string): void };
 type StoppedReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";
@@ -85,14 +93,14 @@ type Fixture = {
 async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
 	return await Promise.race([
 		promise,
-		Bun.sleep(2_000).then(() => {
+		Bun.sleep(45_000).then(() => {
 			throw new Error(`Timed out waiting for ${label}`);
 		}),
 	]);
 }
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-	const deadline = Date.now() + 2_000;
+	const deadline = Date.now() + 45_000;
 	while (Date.now() < deadline) {
 		if (predicate()) return;
 		await Bun.sleep(5);
@@ -174,6 +182,8 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 	const sendAssistantText = (text: string): void => {
 		send({
 			type: "event",
+			kind: "message_end",
+			sessionId,
 			commandId,
 			turnId,
 			payload: {
@@ -194,6 +204,8 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 	const sendToolStart = (toolCallId: string): void => {
 		send({
 			type: "event",
+			kind: "tool_execution_start",
+			sessionId,
 			commandId,
 			turnId,
 			payload: {
@@ -210,6 +222,8 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 	const sendToolEnd = (toolCallId: string): void => {
 		send({
 			type: "event",
+			kind: "tool_execution_end",
+			sessionId,
 			commandId,
 			turnId,
 			payload: {
@@ -246,11 +260,12 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 					return;
 				}
 				if (frame.type === "broker_request") {
-					const result =
-						frame.operation === "session.create"
-							? { sessionId, endpoint: { url: `ws://127.0.0.1:${server.port}`, token } }
-							: {};
-					socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result }));
+					if (frame.operation !== "session.create") {
+						socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: {} }));
+						return;
+					}
+					socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: authority }));
+					setTimeout(() => void publishExactSessionAuthority(authorityOptions, authority), 10);
 					return;
 				}
 				if (frame.type === "query_request") {
@@ -316,6 +331,14 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 	});
 	const port = server.port;
 	if (port === undefined) throw new Error("Expected an ACP fixture server port");
+	const authorityOptions: ExactSessionAuthorityOptions = {
+		agentDir,
+		cwd,
+		sessionId,
+		url: `ws://127.0.0.1:${port}`,
+		token,
+	};
+	const authority: ExactSessionAuthorityFixture = await prepareExactSessionAuthority(authorityOptions);
 	await writeBrokerDiscovery(agentDir, {
 		version: 1,
 		protocolVersion: 3,

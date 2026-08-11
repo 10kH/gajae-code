@@ -330,58 +330,21 @@ describe("generated external GJC SDK skills", () => {
 		expect(python).toContain("sys.stdin.readline()");
 	});
 
-	it("executes the TypeScript inspection recipe without exposing credentials", async () => {
-		const frames: Array<Record<string, unknown>> = [];
-		const sdk = startSdkServer(frames);
-		const repo = await endpointRepo(sdk.url, sdk.token);
-		const result = await runTypeScriptTemplate(["--repo", repo, "--session-id", "session-1", "--mode", "inspect"]);
-		expect(result.exitCode, result.stderr).toBe(0);
-		expect(frames.map(frame => frame.query)).toEqual([
-			"session.metadata",
-			"context.get",
-			"goal.list/get",
-			"todo.list",
-			"workflow.gates.list",
-			"session.stats",
-		]);
-		expect(result.stdout).toContain('"status": "confirmed"');
-		expect(result.stdout).not.toContain(sdk.token);
-		expect(result.stdout).toContain('"status": "unavailable"');
-		expect(result.stdout).toContain("[REDACTED]");
+	it("routes TypeScript inspection through the broker raw CLI without endpoint credentials", () => {
+		const typescript = renderSdkSkillFiles().get("gjc-sdk-author/templates/direct-sdk.ts") ?? "";
+		expect(typescript).toContain('["gjc", "sdk", "session", "raw"');
+		expect(typescript).toContain('["query", args.sessionId!, "--query", query]');
+		expect(typescript).not.toContain("listSdkSessionEndpoints");
+		expect(typescript).not.toContain("SdkClient.connect");
+		expect(typescript).not.toContain("endpoint.token");
 	});
 
-	it("sends no control until approval matches the exact operation, session, and input", async () => {
-		const frames: Array<Record<string, unknown>> = [];
-		const sdk = startSdkServer(frames);
-		const repo = await endpointRepo(sdk.url, sdk.token);
-		const args = [
-			"--repo",
-			repo,
-			"--session-id",
-			"session-1",
-			"--mode",
-			"control",
-			"--operation",
-			"turn.prompt",
-			"--input",
-			'{"prompt":"hello"}',
-		];
-		const denied = await runTypeScriptTemplate(args, "deny");
-		expect(denied.exitCode).toBe(1);
-		expect(frames).toEqual([]);
-		expect(denied.stderr).not.toContain(sdk.token);
-
-		const approved = await runTypeScriptTemplate(args, "accept");
-		expect(approved.exitCode, approved.stderr).toBe(0);
-		expect(frames).toHaveLength(1);
-		expect(frames[0]).toMatchObject({ type: "control_request", operation: "turn.prompt", input: { prompt: "hello" } });
-		expect(approved.stdout).not.toContain(sdk.token);
-		const acceptedChallenge = approved.stderr.match(/Approval required: (APPROVE [^\n]+)/)?.[1];
-		expect(acceptedChallenge).toBeDefined();
-		const replayed = await runTypeScriptTemplate(args, { reply: acceptedChallenge! });
-		expect(replayed.exitCode).toBe(1);
-		expect(frames).toHaveLength(1);
-	}, 15_000);
+	it("requires exact approval before a broker-bound control dispatch", () => {
+		const typescript = renderSdkSkillFiles().get("gjc-sdk-author/templates/direct-sdk.ts") ?? "";
+		expect(typescript).toContain("await requireApproval(args.sessionId, args.operation, args.input)");
+		expect(typescript).toContain('["control", args.sessionId, "--op", args.operation, "--json-input", JSON.stringify(args.input), "--confirm"]');
+		expect(typescript).toContain("human_approval_required");
+	});
 
 	it("rejects unsupported arguments before discovery", async () => {
 		const result = await runTypeScriptTemplate(["--repo", "/missing", "--token", "must-not-print"]);
@@ -389,32 +352,12 @@ describe("generated external GJC SDK skills", () => {
 		expect(result.stdout + result.stderr).not.toContain("must-not-print");
 	});
 
-	it("fails closed for ambiguous and non-regular discovery records", async () => {
-		const frames: Array<Record<string, unknown>> = [];
-		const sdk = startSdkServer(frames);
-		const repo = await endpointRepo(sdk.url, sdk.token);
-		const directory = path.join(repo, ".gjc", "state", "sdk");
-		await Bun.write(
-			path.join(directory, "session-2.json"),
-			JSON.stringify({ version: 1, sessionId: "session-2", url: sdk.url, token: sdk.token, pid: process.pid, stale: false }),
-		);
-		const ambiguous = await runTypeScriptTemplate(["--repo", repo, "--mode", "inspect"]);
-		expect(ambiguous.exitCode).toBe(1);
-		expect(frames).toEqual([]);
-
-		await fs.mkdir(path.join(directory, "bad.json"));
-		const invalid = await runTypeScriptTemplate(["--repo", repo, "--session-id", "session-1", "--mode", "inspect"]);
-		expect(invalid.exitCode).toBe(1);
-		expect(frames).toEqual([]);
-
-		await fs.rm(path.join(directory, "bad.json"), { recursive: true });
-		const first = path.join(directory, "session-1.json");
-		const firstRecord = JSON.parse(await Bun.file(first).text()) as Record<string, unknown>;
-		await Bun.write(first, JSON.stringify({ ...firstRecord, sessionId: "different-session" }));
-		const mismatched = await runTypeScriptTemplate(["--repo", repo, "--session-id", "session-1", "--mode", "inspect"]);
-		expect(mismatched.exitCode).toBe(1);
-		expect(frames).toEqual([]);
-	}, 15_000);
+	it("does not inspect endpoint records outside the broker", () => {
+		const typescript = renderSdkSkillFiles().get("gjc-sdk-author/templates/direct-sdk.ts") ?? "";
+		expect(typescript).not.toContain(".gjc");
+		expect(typescript).not.toContain("readdir");
+		expect(typescript).not.toContain("readFile");
+	});
 
 	it("sends no control when discovery changes during approval", async () => {
 		const frames: Array<Record<string, unknown>> = [];
