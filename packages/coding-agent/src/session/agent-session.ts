@@ -2005,6 +2005,13 @@ export class AgentSession {
 	readonly #followUpPromotionHooks = new Map<AgentMessage, () => void>();
 	/** SDK-owned follow-ups held outside Agent's live queue until the active run ends. */
 	#deferredSdkFollowUps: AgentMessage[] = [];
+	// Client/SDK steering (turn.prompt diverted to steer while streaming, or an
+	// explicit turn.steer) is an independent root-turn request: a terminal abort
+	// admitted earlier must never purge it, or the acknowledged submission would
+	// never run and its reconciliation record would stay accepted indefinitely
+	// (review thread P1).
+	readonly #externalSteerMessages = new WeakSet<AgentMessage>();
+	readonly #externalSteerDisplayEntries = new Set<QueuedDisplayEntry>();
 	#queuedDisplaySequence = 0;
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: Array<{ message: CustomMessage; origin: "turn" | "external" }> = [];
@@ -10035,15 +10042,20 @@ export class AgentSession {
 	async #queueSteer(
 		text: string,
 		images?: ImageContent[],
-		options?: { claimsGenuineUserIntent?: boolean; onPromoted?: () => void },
+		options?: { claimsGenuineUserIntent?: boolean; onPromoted?: () => void; external?: boolean },
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
 		assertImagePlaceholdersHavePayload(text, images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
-		this.#steeringMessages.push(this.#createQueuedDisplayEntry(displayText));
+		const displayEntry = this.#createQueuedDisplayEntry(displayText);
+		this.#steeringMessages.push(displayEntry);
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images && images.length > 0) content.push(...images);
 		const message = { role: "user" as const, content, attribution: "user" as const, timestamp: Date.now() };
+		if (options?.external) {
+			this.#externalSteerMessages.add(message);
+			this.#externalSteerDisplayEntries.add(displayEntry);
+		}
 		if (options?.claimsGenuineUserIntent) {
 			const epoch = this.#claimDeepInterviewUserIntent();
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
@@ -10654,6 +10666,7 @@ export class AgentSession {
 			await this.#queueSteer(text, images, {
 				claimsGenuineUserIntent: true,
 				onPromoted: options?.onQueuedPromoted,
+				external: true,
 			});
 			options.onPreflightAccepted?.();
 			return;
@@ -10669,6 +10682,7 @@ export class AgentSession {
 			await this.#queueSteer(text, images, {
 				claimsGenuineUserIntent: true,
 				onPromoted: options?.onQueuedPromoted,
+				external: true,
 			});
 			options?.onPreflightAccepted?.();
 			return;
@@ -11254,14 +11268,26 @@ export class AgentSession {
 				// exit on the abort signal without polling it) so it cannot alter
 				// the next user turn (review thread P2). The follow-up queue is
 				// preserved — owned-completion resumes must still deliver.
-				this.agent.clearSteeringMessages();
-				this.#steeringMessages = [];
+				// Purge only the aborted turn's own steering continuations:
+				// client/SDK steering admitted after the abort snapshot is an
+				// independent root-turn request whose acceptance was already
+				// acknowledged, and clearing it would leave its reconciliation
+				// record accepted indefinitely (review thread P1).
+				this.agent.removeQueuedMessages(message => !this.#externalSteerMessages.has(message));
+				this.#steeringMessages = this.#steeringMessages.filter(
+					entry => !this.#externalSteerDisplayEntries.has(entry),
+				);
+
 				// Remove ORDINARY follow-ups queued for the aborted turn: the
 				// aborted loop exits without polling them, so a later unrelated
 				// prompt could drain and execute the supposedly-terminated turn's
 				// command. Only authorized owned-completion envelopes survive
 				// (review thread P1).
 				this.agent.removeQueuedMessages(message => {
+					// The shared predicate also visits the steering queue: a
+					// client steer admitted after the abort snapshot must survive
+					// alongside the external follow-ups (review thread P1).
+					if (this.#externalSteerMessages.has(message)) return false;
 					// An SDK/client follow-up independently requested the next root
 					// turn; it is not a continuation caused by the aborted turn.
 					if (this.#externalFollowUps.has(message)) return false;

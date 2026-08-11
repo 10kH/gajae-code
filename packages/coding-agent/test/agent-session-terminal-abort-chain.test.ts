@@ -520,6 +520,33 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		expect(session.agent.hasQueuedSteering()).toBe(false);
 		expect(session.agent.snapshotQueues().followUp).toHaveLength(0);
 	}, 20_000);
+	it("terminal abort preserves client steering admitted after the abort snapshot", async () => {
+		// Review thread P1: when a terminal abort has been admitted but is still
+		// awaiting its durable transaction, a client turn.prompt/steer can be
+		// accepted and queued as steering. It is an independent root-turn
+		// request whose acceptance was already acknowledged, so the abort must
+		// preserve it instead of purging every steering message — clearing it
+		// would leave its reconciliation record accepted indefinitely.
+		scriptedResponses = [stopReply("ok")];
+		await session.prompt("first turn");
+		await session.sendUserMessage("client steer", { deliverAs: "steer" });
+		expect(session.agent.hasQueuedSteering()).toBe(true);
+		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
+			graceMs: 2_000,
+			terminal: { scope: "turn" },
+		});
+		// The client steering survives the abort; only the aborted turn's own
+		// steering continuations are purged.
+		expect(session.agent.hasQueuedSteering()).toBe(true);
+		const queues = session.agent.snapshotQueues();
+		expect(
+			queues.steering.some(
+				message =>
+					((message as { content?: unknown }).content as Array<{ text?: string }>)[0]?.text === "client steer",
+			),
+		).toBe(true);
+	}, 20_000);
+
 	it("terminal abort rearms an external-only follow-up past the terminal fence as a fresh turn", async () => {
 		// Reproduction of the review-thread P1 scenario: when a terminal abort
 		// leaves ONLY an independently requested external follow-up queued (no
