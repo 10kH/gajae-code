@@ -140,6 +140,8 @@ type SessionRecord = {
 	busy: boolean;
 	/** Start/update args retained because tool_execution_end does not carry them. */
 	toolArgs: Map<string, unknown>;
+	/** Message projection state for correlationless session-scoped assistant events. */
+	sessionMessageProgress?: { textEmitted: boolean; thoughtEmitted: boolean };
 	/** Actionable model-profile authentication failure detected before prompt dispatch. */
 	connectionId?: string;
 	/** Bounded set of correlations already settled; they stay closed for publication. */
@@ -323,25 +325,6 @@ export function acpAvailableCommandsFromSkills(query: unknown): AvailableCommand
 	return [...commands.values()];
 }
 
-function correlationFrom(...values: unknown[]): PromptCorrelation {
-	const correlation: PromptCorrelation = {};
-	for (const value of values) {
-		const candidate = object(value);
-		for (const record of [candidate, object(candidate?.result)]) {
-			if (!record) continue;
-			if (!correlation.commandId) {
-				const commandId = record.commandId ?? record.command_id;
-				if (typeof commandId === "string" && commandId) correlation.commandId = commandId;
-			}
-			if (!correlation.turnId) {
-				const turnId = record.turnId ?? record.turn_id;
-				if (typeof turnId === "string" && turnId) correlation.turnId = turnId;
-			}
-		}
-	}
-	return correlation;
-}
-
 function hasCorrelation(correlation: PromptCorrelation): boolean {
 	return correlation.commandId !== undefined || correlation.turnId !== undefined;
 }
@@ -422,14 +405,12 @@ function strictCorrelationFrom(...values: unknown[]): PromptCorrelation | undefi
 }
 
 function sdkFrameCorrelation(frame: JsonObject, event?: JsonObject): PromptCorrelation | undefined {
-	return event?.type === "agent_end" || event?.type === "agent_failed"
-		? strictCorrelationFrom(frame, event)
-		: correlationFrom(frame, event);
+	return strictCorrelationFrom(frame, event);
 }
 
 /**
- * Watchdog attribution is stricter than general nonterminal routing: conflicting
- * envelope/event identities own no prompt and therefore cannot extend its lifetime.
+ * Conflicting envelope/event identities own no prompt and therefore cannot
+ * refresh a watchdog or publish into either turn.
  */
 function watchdogCorrelationFrom(frame: JsonObject, event?: JsonObject): PromptCorrelation {
 	return strictCorrelationFrom(frame, event) ?? {};
@@ -1467,7 +1448,7 @@ export class AcpAgent implements Agent {
 				record.adapter,
 			);
 		}
-		try {
+		const acknowledgementTask = (async (): Promise<PromptResponse> => {
 			const acknowledgement = await record.adapter.prompt({
 				text: payload.text,
 				...(payload.images.length ? { images: payload.images } : {}),
@@ -1549,6 +1530,13 @@ export class AcpAgent implements Agent {
 				);
 			}
 			this.#settlePrompt(record, waiter);
+			return await response;
+		})();
+		// Settlement can win before the SDK answers `turn.prompt`; acknowledgement processing
+		// must remain alive to tombstone its eventual correlation without holding the ACP caller.
+		void acknowledgementTask.catch(() => undefined);
+		try {
+			return await Promise.race([response, acknowledgementTask]);
 		} catch (error) {
 			waiter.deferredFrames.length = 0;
 			waiter.deferredActivityFrames.length = 0;
@@ -1567,7 +1555,6 @@ export class AcpAgent implements Agent {
 			}
 			throw error;
 		}
-		return await response;
 	}
 
 	async cancel(params: { sessionId: string }): Promise<void> {
@@ -2230,7 +2217,8 @@ export class AcpAgent implements Agent {
 		if (!received) return;
 		const { event, wirePayload } = received;
 		const isTerminal = event.type === "agent_end" || event.type === "agent_failed";
-		const correlation = sdkFrameCorrelation(frame, event) ?? {};
+		const derivedCorrelation = sdkFrameCorrelation(frame, event);
+		const correlation = derivedCorrelation ?? {};
 		const activePrompt = record.activePrompt;
 		const outcome = isTerminal ? terminalOutcome(event) : undefined;
 		const settledCorrelation = record.settledPromptCorrelations.some(settled =>
@@ -2271,6 +2259,15 @@ export class AcpAgent implements Agent {
 			}
 			activePrompt.terminal = { outcome, correlation };
 		}
+		if (!isTerminal && derivedCorrelation === undefined) return;
+		if (!isTerminal && hasCorrelation(correlation)) {
+			if (!activePrompt || activePrompt.settled) return;
+			if (!activePrompt.acknowledged) {
+				activePrompt.deferredFrames.push(frame);
+				return;
+			}
+			if (!correlationsExactlyMatch(activePrompt.correlation, correlation)) return;
+		}
 		if (settledCorrelation) {
 			// Frames for an already-settled correlation stay closed until an active prompt
 			// acknowledges the exact same identity.
@@ -2280,15 +2277,13 @@ export class AcpAgent implements Agent {
 			}
 			if (!activePrompt || activePrompt.settled || !correlationsMatch(activePrompt.correlation, correlation)) return;
 		}
-		if (
-			!isTerminal &&
+		const promptOwner =
 			activePrompt &&
 			!activePrompt.settled &&
 			activePrompt.acknowledged &&
-			hasCompleteCorrelation(correlation) &&
-			!correlationsExactlyMatch(activePrompt.correlation, correlation)
-		)
-			return;
+			correlationsExactlyMatch(activePrompt.correlation, correlation)
+				? activePrompt
+				: undefined;
 		const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
 		if (
 			toolCallId &&
@@ -2302,17 +2297,21 @@ export class AcpAgent implements Agent {
 				cwd: record.cwd,
 				getToolArgs: id => record.toolArgs.get(id),
 				getMessageProgress: message => {
-					if (!activePrompt || !object(message)) return undefined;
-					activePrompt.messageProgress ??= { textEmitted: false, thoughtEmitted: false };
-					return activePrompt.messageProgress;
+					if (!object(message)) return undefined;
+					if (promptOwner) {
+						promptOwner.messageProgress ??= { textEmitted: false, thoughtEmitted: false };
+						return promptOwner.messageProgress;
+					}
+					record.sessionMessageProgress ??= { textEmitted: false, thoughtEmitted: false };
+					return record.sessionMessageProgress;
 				},
 			})) {
 				if (
-					activePrompt &&
+					promptOwner &&
 					notification.update.sessionUpdate === "agent_message_chunk" &&
 					notification.update.content.type === "text"
 				)
-					activePrompt.emittedAssistantText += notification.update.content.text;
+					promptOwner.emittedAssistantText += notification.update.content.text;
 				await this.#publishSessionUpdate(id, notification, adapter);
 			}
 		}
@@ -2331,14 +2330,16 @@ export class AcpAgent implements Agent {
 				adapter,
 			);
 		}
-		if (event.type === "message_end" && object(event.message)?.role === "assistant" && activePrompt)
-			activePrompt.messageProgress = undefined;
+		if (event.type === "message_end" && object(event.message)?.role === "assistant") {
+			if (promptOwner) promptOwner.messageProgress = undefined;
+			else record.sessionMessageProgress = undefined;
+		}
 		if (event.type === "agent_end") {
 			const finalText = typeof event.finalText === "string" ? event.finalText : "";
-			if (activePrompt && finalText) {
-				const resolution = resolveAcpFinalText(activePrompt.emittedAssistantText, finalText);
+			if (promptOwner && finalText) {
+				const resolution = resolveAcpFinalText(promptOwner.emittedAssistantText, finalText);
 				if (resolution.kind === "emit") {
-					activePrompt.emittedAssistantText += resolution.text;
+					promptOwner.emittedAssistantText += resolution.text;
 					await this.#publishSessionUpdate(
 						id,
 						{
@@ -2354,9 +2355,9 @@ export class AcpAgent implements Agent {
 				} else if (resolution.kind === "divergent") {
 					logger.warn("acp_final_text_diverged", {
 						sessionId: id,
-						...(activePrompt.correlation.commandId ? { commandId: activePrompt.correlation.commandId } : {}),
-						...(activePrompt.correlation.turnId ? { turnId: activePrompt.correlation.turnId } : {}),
-						streamedLength: activePrompt.emittedAssistantText.length,
+						...(promptOwner.correlation.commandId ? { commandId: promptOwner.correlation.commandId } : {}),
+						...(promptOwner.correlation.turnId ? { turnId: promptOwner.correlation.turnId } : {}),
+						streamedLength: promptOwner.emittedAssistantText.length,
 						finalLength: resolution.final.text.length,
 					});
 				}

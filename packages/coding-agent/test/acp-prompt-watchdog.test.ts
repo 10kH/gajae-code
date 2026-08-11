@@ -133,6 +133,7 @@ function toolCallUpdates(updates: SessionNotification[]): number {
 type FixtureOptions = {
 	agentStartBeforeAcknowledgement?: boolean;
 	deferFirstPromptAcknowledgement?: boolean;
+	cancelSettlementGraceMs?: number;
 };
 
 async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
@@ -334,7 +335,13 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 			signal: abort.signal,
 			closed: Promise.withResolvers<void>().promise,
 		} as unknown as AgentSideConnection,
-		{ agentDir, promptWatchdogClock: clock },
+		{
+			agentDir,
+			promptWatchdogClock: clock,
+			...(options.cancelSettlementGraceMs === undefined
+				? {}
+				: { cancelSettlementGraceMs: options.cancelSettlementGraceMs }),
+		},
 	);
 	const created = await bounded(agent.newSession({ cwd, mcpServers: [] }), "new session");
 	await waitFor(() => idleUpdates(updates) > 0, "bootstrap update");
@@ -772,11 +779,11 @@ test("a late acknowledgement tombstones a prompt rejected before ownership was k
 		fixture.clock.advance(firstWatchdog.at - fixture.clock.now() + 1);
 		await waitFor(() => idleUpdates(fixture.updates) === idleBefore + 1, "pre-acknowledgement watchdog rejection");
 		expect(fixture.clock.pending).toBe(0);
-
-		fixture.acknowledgePrompt();
-		const abandonedError = await bounded(abandoned, "late acknowledgement rejection");
+		const abandonedError = await bounded(abandoned, "watchdog rejection before acknowledgement");
 		expect(abandonedError).toBeInstanceOf(Error);
 		expect((abandonedError as Error).message).toContain("ACP prompt was abandoned");
+
+		fixture.acknowledgePrompt();
 
 		const { pending } = await startTurn(fixture);
 		expect(fixture.correlation()).not.toEqual(stale);
@@ -839,6 +846,50 @@ test("a late acknowledgement tombstones a prompt rejected before ownership was k
 		fixture.dispose();
 	}
 });
+
+test("a foreign correlated frame waits for exact pre-acknowledgement ownership", async () => {
+	const fixture = await createFixture({ deferFirstPromptAcknowledgement: true });
+	try {
+		const pending = prompt(fixture, "withhold acknowledgement");
+		await waitFor(() => fixture.correlation().commandId.length > 0, "prompt dispatch");
+		const chunksBefore = textChunks(fixture.updates);
+		const updateBoundary = fixture.updates.length;
+		const privateMessage = "PRIVATE_FOREIGN_PRE_ACK_SENTINEL";
+
+		fixture.send(
+			staleEventFrame({ commandId: "foreign-command", turnId: "foreign-turn" }, "message_end", {
+				type: "message_end",
+				message: { role: "assistant", content: [{ type: "text", text: privateMessage }] },
+			}),
+		);
+		fixture.send(correlationlessAssistantFrame("pre-acknowledgement ingress marker"));
+		await waitFor(() => textChunks(fixture.updates) > chunksBefore, "pre-acknowledgement frame ingress");
+
+		expect(textChunks(fixture.updates)).toBe(chunksBefore + 1);
+		expect(JSON.stringify(fixture.updates.slice(updateBoundary))).not.toContain(privateMessage);
+
+		fixture.acknowledgePrompt();
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "prompt completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a cancelled pre-acknowledgement prompt settles without its acknowledgement", async () => {
+	const fixture = await createFixture({ deferFirstPromptAcknowledgement: true, cancelSettlementGraceMs: 25 });
+	try {
+		const pending = prompt(fixture, "cancel before acknowledgement");
+		await waitFor(() => fixture.correlation().commandId.length > 0, "prompt dispatch");
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
+		expect(await bounded(pending, "pre-acknowledgement cancellation")).toEqual({ stopReason: "cancelled" });
+
+		fixture.acknowledgePrompt();
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("a settled turn's stale message frame does not narrow the live turn off the inference bound", async () => {
 	const fixture = await createFixture();
 	try {
@@ -967,14 +1018,46 @@ test("correlationless frames do not refresh the active prompt watchdog", async (
 	}
 });
 
-test("conflicting frame and event identities do not refresh the active prompt watchdog", async () => {
+test("correlationless assistant text does not consume the prompt final text", async () => {
+	const fixture = await createFixture();
+	try {
+		const { pending } = await startTurn(fixture);
+		const chunksBefore = textChunks(fixture.updates);
+		const correlationlessText = "CORRELATIONLESS_SESSION_TEXT";
+		const finalText = "AUTHORITATIVE_PROMPT_FINAL_TEXT";
+
+		fixture.send(correlationlessAssistantFrame(correlationlessText));
+		await waitFor(() => textChunks(fixture.updates) === chunksBefore + 1, "correlationless assistant publication");
+		const { commandId, turnId } = fixture.correlation();
+		fixture.send({
+			type: "agent_end",
+			sessionId: fixture.sessionId,
+			commandId,
+			turnId,
+			finalText,
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		});
+
+		expect(await bounded(pending, "prompt completion")).toEqual({ stopReason: "end_turn" });
+		const published = fixture.updates
+			.filter(update => update.update.sessionUpdate === "agent_message_chunk")
+			.map(update => (update.update as { content: { text: string } }).content.text);
+		expect(published.slice(-2)).toEqual([correlationlessText, finalText]);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("conflicting frame and event identities do not publish or refresh the active prompt", async () => {
 	const fixture = await createFixture();
 	try {
 		const { pending } = await startTurn(fixture);
 		const armedBefore = fixture.clock.armed;
 		if (!armedBefore) throw new Error("Expected an armed prompt watchdog");
 		const { commandId, turnId } = fixture.correlation();
-		const chunks = textChunks(fixture.updates);
+		const chunksBefore = textChunks(fixture.updates);
+		const updateBoundary = fixture.updates.length;
+		const privateMessage = "PRIVATE_CONFLICTING_IDENTITY_SENTINEL";
 
 		fixture.send({
 			type: "event",
@@ -986,12 +1069,15 @@ test("conflicting frame and event identities do not refresh the active prompt wa
 					type: "message_end",
 					commandId: "foreign-command",
 					turnId: "foreign-turn",
-					message: { role: "assistant", content: [{ type: "text", text: "conflicting identity" }] },
+					message: { role: "assistant", content: [{ type: "text", text: privateMessage }] },
 				},
 			},
 		});
-		await waitFor(() => textChunks(fixture.updates) > chunks, "conflicting identity frame ingress");
+		fixture.send(correlationlessAssistantFrame("conflicting identity ingress marker"));
+		await waitFor(() => textChunks(fixture.updates) > chunksBefore, "conflicting identity frame ingress");
 
+		expect(textChunks(fixture.updates)).toBe(chunksBefore + 1);
+		expect(JSON.stringify(fixture.updates.slice(updateBoundary))).not.toContain(privateMessage);
 		expect(fixture.clock.armed).toEqual(armedBefore);
 		fixture.clock.advance(armedBefore.at - fixture.clock.now() + 1);
 		const error = await bounded(

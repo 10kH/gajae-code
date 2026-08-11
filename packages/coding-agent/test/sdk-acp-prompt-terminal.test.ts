@@ -637,7 +637,7 @@ test("ACP suppresses partial and duplicate terminals after settlement", async ()
 	}
 });
 
-test("ACP delivers assistant updates before terminal settlement and drops later updates", async () => {
+test("ACP keeps correlationless session updates publishable after terminal settlement", async () => {
 	const fixture = await createFixture();
 	try {
 		const order: string[] = [];
@@ -659,8 +659,12 @@ test("ACP delivers assistant updates before terminal settlement and drops later 
 		expect(await bounded(pending, "terminal completion")).toEqual({ stopReason: "end_turn" });
 		expect(order).toEqual(["update", "update", "resolved"]);
 		fixture.sendAssistantMessage("after terminal");
-		await Bun.sleep(30);
-		expect(fixture.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk")).toHaveLength(2);
+		await waitFor(
+			() => fixture.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk").length === 3,
+			"post-terminal correlationless assistant update",
+		);
+		const lastChunk = fixture.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk").at(-1);
+		expect((lastChunk?.update as { content?: { text?: string } }).content?.text).toBe("after terminal");
 	} finally {
 		fixture.dispose();
 	}
