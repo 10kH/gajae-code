@@ -8,7 +8,7 @@ export type ControlInput = Record<string, unknown>;
 export interface ControlSurface {
 	authorizeElevationClaim?(sdkId: string, input: ControlInput, capability: string): boolean;
 	prompt(text: string, images?: ControlValue, clientRef?: string): Promise<ControlValue> | ControlValue;
-	steer(text: string): Promise<ControlValue> | ControlValue;
+	steer(text: string, clientRef?: string): Promise<ControlValue> | ControlValue;
 	followUp(text: string): Promise<ControlValue> | ControlValue;
 	abort(): Promise<ControlValue> | ControlValue;
 	abortAndPrompt(text: string): Promise<ControlValue> | ControlValue;
@@ -46,7 +46,7 @@ export interface ControlSurface {
 	newSession(): Promise<ControlValue> | ControlValue;
 	forkSession(): Promise<ControlValue> | ControlValue;
 	resumeSession(id: string): Promise<ControlValue> | ControlValue;
-	closeSession(): Promise<ControlValue> | ControlValue;
+	closeSession(capability?: string): Promise<ControlValue> | ControlValue;
 	switchSession(id: string): Promise<ControlValue> | ControlValue;
 	branchSession(entryId: string): Promise<ControlValue> | ControlValue;
 	renameSession(name: string): Promise<ControlValue> | ControlValue;

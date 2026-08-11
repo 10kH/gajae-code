@@ -1,6 +1,6 @@
 # External controller integration guide
 
-This guide is for authors of bots and orchestrators that want to drive Gajae-Code (`gjc`) without scraping terminal scrollback. Hermes, OpenClaw, GitHub bots, chatops bots, and custom schedulers are examples of external controllers; none of them need bespoke GJC behavior if they can speak the Coordinator MCP tools or the SDK WebSocket lifecycle below.
+This guide is for authors of bots and orchestrators that want to drive Gajae-Code (`gjc`) without scraping terminal scrollback. Hermes, OpenClaw, GitHub bots, chatops bots, and custom schedulers are examples of external controllers; none of them need bespoke GJC behavior if they use Coordinator MCP, the broker-backed daemon session CLI, or a managed SDK-core adapter.
 
 GJC is an external runner. Your controller owns queueing, identity, policy, and credentials; GJC owns the coding-agent session, workflows, tools, artifacts, and evidence inside the selected repository or worktree.
 
@@ -153,7 +153,7 @@ A stock session publishes readiness immediately, so a running chat daemon surfac
 
 A prepared session is live and endpoint-addressable but withholds its readiness signal, so no root is claimed. The response carries `session_id` and `state: "prepared"`, and `session_state.ready_for_input` is `false`. `prepare_existing_thread` refuses an initial `prompt`, and `gjc_coordinator_send_prompt` refuses the session with `session_not_activated` until it is activated.
 
-Preparation requires a configured, session-enabled Slack target in the selected workdir: that target plus the agent directory is what supplies the daemon-owned bind/activation authority. Without it the start fails closed with a lifecycle startup failure instead of returning a prepared session that could be activated before any thread is bound.
+Preparation requires a configured, session-enabled Slack target in the selected workdir. Slack owns the existing-thread presentation mapping, while `SessionRouter` supplies exact endpoint-generation proof and performs activation without exposing endpoint credentials. Without that combined authority the start fails closed with a lifecycle startup failure instead of returning a prepared session that could activate before any thread is bound.
 
 Bind the existing thread through the daemon-owned command path, which is the only writer of chat mappings:
 
@@ -317,9 +317,12 @@ Use `gjc_coordinator_list_artifacts` to inspect safe roots and `gjc_coordinator_
 
 Artifact paths are canonicalized, symlink escapes are rejected, and output is byte-capped. Use `gjc_coordinator_read_coordination_status` for status reports written through `gjc_coordinator_report_status`.
 
-## SDK WebSocket integration
+## Managed SDK attachment integration
 
-Use the SDK when your bot owns a single live session rather than an MCP coordinator. Each running session exposes a loopback WebSocket endpoint discovered via `.gjc/state/sdk/<sessionId>.json`; the wire protocol (state queries, control operations, event subscription and replay, workflow-gate replies, reverse host-tool leases) is documented in [`docs/sdk.md`](./sdk.md).
+Bots must attach through a managed SDK-core adapter backed by `SessionRouter`. Do not read `.gjc/state/sdk` endpoint records, retain URL/token credentials, or open raw per-session WebSockets. `SessionRouter` owns endpoint resolution, credentials, replay, reconnect, rotation, and exact opaque attachment authority; provider code owns only transport and presentation state.
+
+Use the Telegram, Discord, or Slack managed adapter for a single live session. Use Coordinator MCP for multi-session orchestration, artifacts, status, and durable workflow-gate operations. Lifecycle mutations always enter `SessionLifecycleService` and the Broker ledger with a stable idempotency identity.
+The `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions; the native loader version sentinel enforces the pair. Mixed native/runtime versions are unsupported and cannot claim SDK compatibility.
 
 Key SDK workflow-gate facts:
 - The discovery file carries the endpoint URL and per-session token; a wrong
@@ -342,7 +345,7 @@ The prior documented invariant `action_needed.id == gate_id` is incorrect for
 v3 and must not be implemented by controllers. See [`docs/sdk.md`](./sdk.md)
 for exact wire examples, Q12 tags/lifecycle diagnostics, and control payloads.
 
-`--mode rpc`, `--mode rpc-ui`, and `--mode bridge` have been removed along with their JSONL/HTTPS protocols and the former Python RPC client. There are no compatibility shims; migrate controllers to the SDK endpoint or Coordinator MCP.
+`--mode rpc`, `--mode rpc-ui`, and `--mode bridge` have been removed along with their JSONL/HTTPS protocols and the former Python RPC client. There are no compatibility shims; migrate controllers to Coordinator MCP, the broker-backed daemon session CLI, or a managed Telegram, Discord, or Slack adapter.
 
 ## Error handling playbook
 

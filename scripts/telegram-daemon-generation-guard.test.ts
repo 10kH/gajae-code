@@ -3,7 +3,24 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
 import manifest from "./telegram-daemon-generation-manifest.json" with { type: "json" };
-import { assertGuardAuthority, currentTreeDigests, declaration, evaluate, GUARD_CONTRACT_VERSION, isLegacyBootstrapBase, manifestForCurrentTree, protectedInventory, TELEGRAM_SHUTDOWN_DRAIN_PROTECTED_DECLARATIONS, validateCiInputs, validateCurrentTreeManifest, validateInventory, validateManifest, validateSha, writeManifest } from "./telegram-daemon-generation-guard";
+import {
+	assertGuardAuthority,
+	currentTreeDigests,
+	declaration,
+	evaluate,
+	GUARD_CONTRACT_VERSION,
+	isLegacyBootstrapBase,
+	manifestForCurrentTree,
+	protectedInventory,
+	TELEGRAM_LIFECYCLE_PROTECTED_DECLARATIONS,
+	TELEGRAM_SHUTDOWN_DRAIN_PROTECTED_DECLARATIONS,
+	validateCiInputs,
+	validateCurrentTreeManifest,
+	validateInventory,
+	validateManifest,
+	validateSha,
+	writeManifest,
+} from "./telegram-daemon-generation-guard";
 
 const guardScript = "scripts/telegram-daemon-generation-guard.ts";
 const manifestScript = "scripts/telegram-daemon-generation-manifest.json";
@@ -15,9 +32,9 @@ const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-contr
 
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
 const chatCli = "packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts";
-const chatRuntime = "packages/coding-agent/src/sdk/bus/chat-daemon-runtime.ts";
 const sdkDiscovery = "packages/coding-agent/src/sdk/client/discovery.ts";
 const config = "packages/coding-agent/src/sdk/bus/config.ts";
+const sessionRouter = "packages/coding-agent/src/sdk/router/session-router.ts";
 const inventory = {
 	telegram: { [telegramContract]: ["DAEMON_GENERATION"], [telegramDaemon]: ["acquireDaemonOwnership"] },
 	discord: {
@@ -93,7 +110,11 @@ const chatConfigHelpers = {
 	],
 } as const;
 const chatEndpointHelpers = {
-	[chatRuntime]: ["attach"],
+	[sessionRouter]: [
+		"SessionRouter.#attach",
+		"SessionRouter.#createAttachedClient",
+		"SessionRouter.#publishAttachment",
+	],
 	[sdkDiscovery]: ["readSdkSessionEndpoint"],
 } as const;
 const telegramToolActivityDeclarations = {
@@ -197,7 +218,9 @@ function mappedHelperMutation(input: {
 		discordGeneration: input.family === "discord" && input.generationBumped ? 5 : 4,
 		slackGeneration: input.family === "slack" && input.generationBumped ? 5 : 4,
 	});
-	const before = `export function ${input.name}() { return "before"; }`;
+	const before = input.name.includes(".#")
+		? `export class ${input.name.split(".#")[0]} { #${input.name.split(".#")[1]}() { return "before"; } }`
+		: `export function ${input.name}() { return "before"; }`;
 	base.set(input.file, before);
 	head.set(input.file, before.replace("before", "after"));
 	const inventory = {
@@ -731,8 +754,8 @@ test("fails closed when a protected native authority declaration is missing or m
 		expect(() => validateManifest({ contractVersion: GUARD_CONTRACT_VERSION, inventory: narrowed })).toThrow("Telegram owner-lock handoff primitives");
 	});
 
-	test("rejects inventories missing required Telegram lifecycle, lease, tool-activity, chat CLI, or provider configuration authorities", () => {
-		for (const symbol of ["validBotToken", "requestStop", "startLifecycleControl", "run"] as const) {
+	test("rejects inventories missing required Telegram lifecycle, lease, tool-activity, chat CLI, endpoint discovery, or provider configuration authorities", () => {
+		for (const symbol of TELEGRAM_LIFECYCLE_PROTECTED_DECLARATIONS) {
 			const telegram = mutableInventory();
 			telegram.telegram[telegramDaemon] = telegram.telegram[telegramDaemon]!.filter(name => name !== symbol);
 			expect(() => validateInventory(telegram)).toThrow("Telegram authentication and lifecycle primitives");
@@ -760,9 +783,17 @@ test("fails closed when a protected native authority declaration is missing or m
 		const providerConfig = mutableInventory();
 		providerConfig.slack[config] = providerConfig.slack[config]!.filter(name => name !== "isSlackComplete");
 		expect(() => validateInventory(providerConfig)).toThrow("chat configuration primitives");
-		const endpointDiscovery = mutableInventory();
-		delete endpointDiscovery.discord[chatRuntime];
-		expect(() => validateInventory(endpointDiscovery)).toThrow("isolated chat endpoint discovery");
+		for (const family of ["discord", "slack"] as const) {
+			for (const [file, declarations] of Object.entries(chatEndpointHelpers)) {
+				for (const symbol of declarations) {
+					const endpointDiscovery = mutableInventory();
+					const remaining = endpointDiscovery[family][file]!.filter(name => name !== symbol);
+					if (remaining.length === 0) delete endpointDiscovery[family][file];
+					else endpointDiscovery[family][file] = remaining;
+					expect(() => validateInventory(endpointDiscovery)).toThrow("isolated chat endpoint discovery");
+				}
+			}
+		}
 	});
 	test("protects Telegram shutdown admission and durable drain authorities", () => {
 		expect(protectedInventory.telegram[telegramDaemon]).toEqual(
@@ -790,7 +821,8 @@ test("fails closed when a protected native authority declaration is missing or m
 				"isPhysicalMatchingOwner",
 				"validBotToken",
 				"requestStop",
-				"startLifecycleControl",
+				"ensureTelegramDaemonRunningDetailed",
+				"TelegramNotificationDaemon.#socketLease",
 				"run",
 				"writeJsonAtomic",
 				"syncTelegramFile",

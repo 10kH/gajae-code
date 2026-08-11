@@ -88,7 +88,8 @@ const user: UserMessage = { role: "user", content: "go", timestamp: Date.now() }
 const HOLLOW_THINKING = { type: "thinking" as const, thinking: "", thinkingSignature: "" };
 const SIGNED_EARLY = { type: "thinking" as const, thinking: "early reasoning", thinkingSignature: "sig_early" };
 const SIGNED_LATE = { type: "thinking" as const, thinking: "late reasoning", thinkingSignature: "sig_late" };
-/** A block with empty text but a valid signature — natively replayable via the signed-thinking path. */
+/** A block with empty text but a valid signature — stale after clear_thinking_20251015.
+ *  Signing Anthropic endpoints must treat this as unreplayable (issue #4247). */
 const SIGNED_EMPTY = { type: "thinking" as const, thinking: "", thinkingSignature: "sig_empty" };
 
 function nativeThinkingCount(payload: { messages: unknown[] }): number {
@@ -169,7 +170,7 @@ describe("Anthropic unreplayable latest-assistant thinking", () => {
 		expect(JSON.stringify(payload.messages)).toContain("sig_early");
 	});
 
-	it("does not degrade when the latest turn has signed-but-empty thinking", async () => {
+	it("degrades when the latest turn has signed-but-empty thinking (clear_thinking)", async () => {
 		const payload = await capturePayload([
 			user,
 			assistantTurn([SIGNED_EARLY], "toolu_a"),
@@ -179,10 +180,65 @@ describe("Anthropic unreplayable latest-assistant thinking", () => {
 			toolResult("toolu_b"),
 		]);
 
-		// A block with empty text but a valid signature is natively replayable —
-		// convertAnthropicMessages forwards it via the signed-thinking path — so
-		// both signed blocks are preserved.
-		expect(nativeThinkingCount(payload)).toBe(2);
-		expect(JSON.stringify(payload.messages)).toContain("sig_empty");
+		// A signed block whose text was emptied by clear_thinking_20251015 carries
+		// a stale signature. Signing endpoints reject it, so the pre-emptive local
+		// degrade drops all native thinking from the replay (issue #4247).
+		expect(nativeThinkingCount(payload)).toBe(0);
+		expect(JSON.stringify(payload.messages)).not.toContain("sig_empty");
+		expect(JSON.stringify(payload.messages)).not.toContain("sig_early");
+	});
+
+	it("drops signed-empty historical thinking on signing endpoints (clear_thinking)", async () => {
+		const payload = await capturePayload([
+			user,
+			assistantTurn([SIGNED_EMPTY], "toolu_a"),
+			toolResult("toolu_a"),
+			{ ...user, content: "again", timestamp: Date.now() + 1 },
+			assistantTurn([SIGNED_LATE], "toolu_b"),
+			toolResult("toolu_b"),
+		]);
+
+		// The historical signed-empty block is dropped by transform-messages, so it
+		// never reaches the wire. The latest turn's valid signed thinking survives.
+		expect(JSON.stringify(payload.messages)).not.toContain("sig_empty");
+		expect(JSON.stringify(payload.messages)).toContain("sig_late");
+		expect(nativeThinkingCount(payload)).toBe(1);
+	});
+
+	it("drops signed-empty historical thinking recorded under a different model id (#4262)", async () => {
+		// The same turn recorded under the dated snapshot while the request runs the
+		// alias (or vice versa) is not `isSameModel`, so it takes the cross-identity
+		// branch instead of the #4247 drop. It must still never reach the wire: this
+		// is the shape #4262 reported as replaying from earlier assistant messages.
+		const snapshotModel: Model<"anthropic-messages"> = { ...model, id: `${model.id}-20260101` };
+		const payload = await capturePayload([
+			user,
+			assistantTurn([SIGNED_EMPTY], "toolu_a", snapshotModel),
+			toolResult("toolu_a"),
+			{ ...user, content: "again", timestamp: Date.now() + 1 },
+			assistantTurn([SIGNED_LATE], "toolu_b"),
+			toolResult("toolu_b"),
+		]);
+
+		expect(JSON.stringify(payload.messages)).not.toContain("sig_empty");
+		expect(nativeThinkingCount(payload)).toBe(1);
+	});
+
+	it("does not degrade a non-signing endpoint whose latest turn has signed-empty thinking", async () => {
+		const payload = await capturePayload(
+			[
+				user,
+				assistantTurn([SIGNED_EARLY], "toolu_a", deepseekModel),
+				toolResult("toolu_a"),
+				{ ...user, content: "again", timestamp: Date.now() + 1 },
+				assistantTurn([SIGNED_EMPTY], "toolu_b", deepseekModel),
+				toolResult("toolu_b"),
+			],
+			deepseekModel,
+		);
+
+		// DeepSeek does not sign thinking and does not validate thinking presence.
+		// Signed-empty blocks are harmless on non-signing endpoints.
+		expect(JSON.stringify(payload.messages)).toContain("sig_early");
 	});
 });

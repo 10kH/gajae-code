@@ -1672,7 +1672,8 @@ function exactRemoveSessionStorageLockPath(
 		(result.code === "cleanup_pending" &&
 			result.payloadDurable === true &&
 			!result.retainedSuccessorPath &&
-			!result.retainedUnknownPath)
+			!result.retainedUnknownPath &&
+			(!result.retainedPlaceholderPath || path.resolve(result.retainedPlaceholderPath) !== path.resolve(lockPath)))
 	);
 }
 
@@ -1890,7 +1891,9 @@ export class FileSessionStorage implements SessionStorage {
 								removal.code === "cleanup_pending" &&
 								removal.payloadDurable === true &&
 								!removal.retainedSuccessorPath &&
-								!removal.retainedUnknownPath
+								!removal.retainedUnknownPath &&
+								(!removal.retainedPlaceholderPath ||
+									path.resolve(removal.retainedPlaceholderPath) !== path.resolve(lockPath))
 							) {
 								released = true;
 								return;
@@ -2655,7 +2658,8 @@ export class FileSessionStorage implements SessionStorage {
 					deletion.code === "cleanup_pending" &&
 					(deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true &&
 					deletion.retainedSuccessorPath === undefined &&
-					deletion.retainedUnknownPath === undefined
+					deletion.retainedUnknownPath === undefined &&
+					deletion.retainedPlaceholderPath === undefined
 				)
 					return { kind: "deleted" };
 				const error = exactUnlinkFailure(deletion);
@@ -2730,7 +2734,8 @@ export class FileSessionStorage implements SessionStorage {
 				deletion.code === "cleanup_pending" &&
 				(deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true &&
 				deletion.retainedSuccessorPath === undefined &&
-				deletion.retainedUnknownPath === undefined
+				deletion.retainedUnknownPath === undefined &&
+				deletion.retainedPlaceholderPath === undefined
 			)
 				return { kind: "deleted" };
 			const error = exactUnlinkFailure(deletion);

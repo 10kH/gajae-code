@@ -144,7 +144,7 @@ API key 提供商、本地运行时（Ollama、LM Studio、vLLM）与网关（Cl
 
 代理需要决策时会 ping 你的 Telegram — 你在任何地方都能回复：
 
-- **按会话的论坛话题**：实时/最终输出、上下文更新、图片附件、内联按钮、自由文本回复、输入中指示。
+- **仅限协调器/生命周期会话的论坛话题**：实时/最终输出、上下文更新、图片附件、内联按钮、自由文本回复、输入中指示。
 - **一次配置**：在运行中会话的 `/settings` → Notifications，或无头方式 `gjc notify setup|status|health|test|recovery`。令牌输入即打码，之后永不显示。
 - **`gjc daemon`** 为每个 bot 令牌维持唯一的安全 long-poll 所有者，新会话干净接入，不会触发 Telegram 409 冲突。
 - Discord 与 Slack 投递同步提供；通用 `action_needed`/`reply` 协议让任何 bot 或移动应用都能把回答路由回来，无需抓取终端。

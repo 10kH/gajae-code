@@ -152,13 +152,13 @@ interface TelegramUpdate {
 }
 
 const THREADED_ENABLED_SUCCESS =
-	"Telegram Threaded Mode capability verified for this bot. GJC will request a private-chat topic per session; if Telegram ever refuses topic creation, notifications fall back to this flat chat with inline ask buttons only and a one-time Threaded Mode nudge.\n";
+	"Telegram Threaded Mode capability verified for this bot. GJC will request private-chat topics for coordinator/lifecycle sessions; if Telegram ever refuses topic creation, notifications fall back to this flat chat with inline ask buttons only and a one-time Threaded Mode nudge.\n";
 const THREADED_MISSING_WARNING =
 	"Warning: Telegram getMe did not include has_topics_enabled, so GJC cannot verify private-chat Threaded Mode capability for this bot. Setup will continue; flat private-chat fallback supports outbound notifications and inline ask buttons only. Free-text replies and session commands require Threaded Mode/topic routing.\n";
 const THREADED_NONINTERACTIVE_WARNING =
 	"Warning: Telegram Threaded Mode capability is OFF for this bot. Setup will be saved because this run is non-interactive. Flat private-chat fallback supports outbound notifications and inline ask buttons only; free-text replies and session commands require enabling Threaded Mode in @BotFather > Bot Settings > Threads Settings.\n";
 const THREADED_DISABLED_GUIDANCE =
-	"Telegram Threaded Mode is OFF for this bot. GJC needs Telegram private-chat topics so each session can use its own thread.\n" +
+	"Telegram Threaded Mode is OFF for this bot. GJC needs Telegram private-chat topics for coordinator/lifecycle sessions.\n" +
 	"GJC cannot enable this through the Bot API. Open @BotFather > Bot Settings > Threads Settings for this bot, enable Threaded Mode / forum topics for private chats, then return here.\n" +
 	"Without Threaded Mode, flat private-chat fallback supports outbound notifications and inline ask buttons only; free-text replies and session commands require topic routing.\n";
 const THREADED_DISABLED_PROMPT =

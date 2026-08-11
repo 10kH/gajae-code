@@ -2037,6 +2037,32 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						resetOutputForRetry();
 						continue;
 					}
+					// Managed attempts never take the repair branch above: the fallback
+					// controller owns retries, so the provider must not retry inside the
+					// attempt it was handed. That left the repair unreachable for the
+					// coding agent, which prompts exclusively through managed attempts —
+					// every turn rebuilt the same replay from the same history, drew the
+					// same deterministic 400, and the session never converged (issue
+					// #4262: one rejected 1.3 MB request every 12s, indefinitely).
+					// Recording the escalation costs no round trip and keeps the retry
+					// boundary intact: the next managed attempt builds a repaired replay.
+					// The masked `api_error` stays out — it names no cause and may be a
+					// transient blip, so only a rejection that provably indicts the
+					// replayed thinking blocks may cost the session its native replay.
+					if (
+						options?.fallbackManaged &&
+						providerSessionState &&
+						providerSessionState.thinkingReplayRepairScope !== "all" &&
+						firstTokenTime === undefined &&
+						(thinkingSignatureInvalid || thinkingBlocksImmutable) &&
+						hasNativeThinkingBlocks(params.messages)
+					) {
+						logger.debug("anthropic: recording thinking replay repair for the next managed attempt", {
+							model: model.id,
+							error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
+						});
+						providerSessionState.thinkingReplayRepairScope = "all";
+					}
 					if (
 						!options?.fallbackManaged &&
 						!dropFastMode &&
@@ -2396,12 +2422,15 @@ function latestAssistantThinkingIsUnreplayable(messages: Message[], model: Model
 		if (block.type !== "thinking") return false;
 		// A block with empty text and no signature cannot go back on the wire:
 		// `convertAnthropicMessages` drops it, and Anthropic rejects the turn for
-		// arriving without it. A block with a valid signature is replayable even
-		// when the text is empty, and non-signing endpoints replay unsigned blocks
-		// verbatim, so only signing endpoints treat a missing signature as
-		// unreplayable.
+		// arriving without it. A block with a valid signature AND non-empty text is
+		// replayable. But a signed block whose text was emptied — e.g. by
+		// clear_thinking_20251015 — carries a stale signature that signing endpoints
+		// reject on replay (issue #4247). Non-signing endpoints replay unsigned
+		// blocks verbatim, so only they treat a missing signature as unreplayable.
 		const hasSignature = !!block.thinkingSignature?.trim();
+		const isEmpty = !block.thinking.trim();
 		if (!hasSignature) return requiresSignature;
+		if (isEmpty && requiresSignature) return true;
 		return false;
 	});
 }

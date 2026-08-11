@@ -24,7 +24,6 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
-import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
@@ -84,9 +83,9 @@ import { ensureBroker } from "../broker/ensure";
 import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
 import { processIncarnation } from "../broker/process-incarnation";
 import { SessionIndex } from "../broker/session-index";
-import { elevationAuthorityPath, verifyElevationCapability } from "../elevation/capability";
 import { createSdkSurfaceFactory, type SessionSdkHost, SessionSdkSessionRuntime, shouldHostSdk } from "../host";
-import { type ControlSurface, controlRequestFromFrame, dispatchControl } from "../host/control";
+import { type ControlSurface, dispatchControl } from "../host/control";
+import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import type { SdkFrame } from "../host/types";
 import {
@@ -104,6 +103,7 @@ import {
 	normalizeSdkStartupFailure,
 	type SdkStartupFailure,
 } from "../startup-capability";
+import type { TurnResultContent } from "../turn-result";
 import { registerTelegramFileSink } from "./attachment-registry";
 import { ensureDiscordDaemon, ensureSlackDaemon } from "./chat-daemon-control";
 import {
@@ -129,20 +129,21 @@ import {
 	isExistingThreadBindingRequested,
 } from "./existing-thread-readiness";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
-import { createKindAwareReconciliation } from "./kind-aware-reconciliation";
+import {
+	createKindAwareReconciliation,
+	type KindAwareReconciliation,
+	type ReconciliationKind,
+} from "./kind-aware-reconciliation";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
 import { proposedTelegramIdentity } from "./notification-orchestration";
 import { createPromptReconciliation } from "./prompt-reconciliation";
-import { createReconciliationStore } from "./reconciliation-store";
+import { createReconciliationStore, resolveReconciliationSessionFile } from "./reconciliation-store";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
 import type { SlackConversation } from "./slack-conversation";
 import {
 	ASK_SELECTED_ACK_CAPABILITY,
 	type EnsureDaemonResult,
-	endpointAuthorityDigest,
 	ensureTelegramDaemonRunningDetailed,
-	type RegisterNotificationRootResult,
-	unregisterNotificationRoot,
 } from "./telegram-daemon";
 
 export type {
@@ -193,6 +194,13 @@ function formatPromptTerminalFailureReason(reason: unknown): string {
 	return rawReason ? rawReason.slice(0, PROMPT_TERMINAL_FAILURE_REASON_LOG_MAX) : "unreported";
 }
 
+function endpointAuthorityDigest(url: string, token: string): string {
+	const parsed = new URL(url);
+	parsed.hash = "";
+	parsed.search = "";
+	parsed.hostname = parsed.hostname.toLowerCase();
+	return crypto.createHash("sha256").update(`${parsed.toString()}\0${token}`, "utf8").digest("hex");
+}
 export function formatPromptSettlementDiagnostic(
 	proof: Extract<RunSettlementProof, { status: "unfenced" }>,
 	now = Date.now(),
@@ -210,15 +218,11 @@ export function formatPromptSettlementDiagnostic(
 }
 
 // ===========================================================================
-// Session lifecycle control protocol (TypeScript mirror of the Rust wire
-// contract in `crates/gjc-sdk/src/lifecycle.rs`).
-//
-// These describe the frames exchanged over the daemon-owned, session-independent
-// control endpoint for remote session create / close / resume. Field names are
-// camelCase on the wire; `type`/`kind` discriminators are snake_case. The Rust
-// ingress authenticates and forwards; the daemon (TypeScript) owns all policy,
-// spawn orchestration, idempotency, rate limiting, audit, and UX.
+// Session lifecycle presentation contract
 // ===========================================================================
+// Provider-neutral lifecycle command targets and credential-free presentation outcomes.
+// SessionLifecycleService owns request authorization/idempotency; these types contain no
+// control endpoint, process, tmux, session-state, or SDK endpoint authority.
 
 /** Where a `session_create` should run. Discriminated by `kind`. */
 export type SessionCreateTarget =
@@ -229,10 +233,6 @@ export type SessionCreateTarget =
 /** Identifies the session a `session_close` targets. */
 export interface SessionCloseTarget {
 	sessionId: string;
-	/** Expected GJC-managed tmux session name (defense-in-depth match). */
-	tmuxSession?: string;
-	/** Expected `@gjc-session-state-file` tag (defense-in-depth match). */
-	sessionStateFile?: string;
 }
 
 /** Identifies the session a `session_resume` targets. */
@@ -242,110 +242,33 @@ export interface SessionResumeTarget {
 	path?: string;
 }
 
-/** Create a new session. */
-export interface SessionCreateFrame {
-	type: "session_create";
-	requestId: string;
-	/** Deterministic lifecycle marker preallocated by the daemon before spawn. */
-	lifecycleRequestId: string;
-	/** Session id the daemon preallocated and propagates to the child. */
-	intendedSessionId: string;
-	/** Telegram update id (idempotency key on the daemon side). */
-	updateId: number;
-	chatId: string;
-	/** Control-endpoint token authorizing this frame. */
-	token: string;
-	target: SessionCreateTarget;
-	/** Reserved for a future capability transport; any supplied value is rejected before lifecycle acceptance. */
-	startupPromptRef?: string;
-	/** Model profile preset to activate for the spawned session (--mpreset). */
-	modelPreset?: string;
-}
-
-/** Close (hard-kill, history preserved) a session. */
-export interface SessionCloseFrame {
-	type: "session_close";
-	requestId: string;
-	updateId: number;
-	chatId: string;
-	token: string;
-	target: SessionCloseTarget;
-	/** Required force-only close flag; false/omitted is rejected by daemon policy. */
-	force?: boolean;
-}
-
-/** Resume a session (reattach if alive, else cold-restart from history). */
-export interface SessionResumeFrame {
-	type: "session_resume";
-	requestId: string;
-	updateId: number;
-	chatId: string;
-	token: string;
-	target: SessionResumeTarget;
-	/** Reserved for a future capability transport; any supplied value is rejected before lifecycle acceptance. */
-	startupPromptRef?: string;
-}
-
-/** Any client -> ingress lifecycle request frame. */
-export type SessionLifecycleRequest = SessionCreateFrame | SessionCloseFrame | SessionResumeFrame;
-
-/** Terminal status of a lifecycle request. */
 export type LifecycleStatus = "ok" | "error";
 
-/** A connected session's per-session endpoint, returned to the control client. */
-export interface LifecycleEndpoint {
-	url: string;
-	token: string;
-}
-
-/** The Telegram topic/thread a session is surfaced in. */
-export interface LifecycleTopic {
-	chatId: string;
-	threadId: string;
-}
-
-/** How a create request was correlated to its spawned session. */
-export type MatchedBy = "spawn_marker" | "session_ready";
-
-/** Response to a successful `session_create`. */
 export interface SessionCreateResponseFrame {
 	type: "session_create_response";
 	requestId: string;
 	status: LifecycleStatus;
-	lifecycleRequestId: string;
 	sessionId: string;
-	matchedBy: MatchedBy;
-	endpoint: LifecycleEndpoint;
-	topic: LifecycleTopic;
 	target: SessionCreateTarget;
 }
 
-/** Response to a successful `session_close`. */
 export interface SessionCloseResponseFrame {
 	type: "session_close_response";
 	requestId: string;
 	status: LifecycleStatus;
 	sessionId: string;
-	processGone: boolean;
-	historyPreserved: boolean;
-	endpointStale: boolean;
 }
 
-/** Whether a resume reattached to a live session or cold-restarted a dead one. */
 export type ResumeMode = "reattached" | "cold_restarted";
 
-/** Response to a successful `session_resume`. */
 export interface SessionResumeResponseFrame {
 	type: "session_resume_response";
 	requestId: string;
 	status: LifecycleStatus;
 	sessionId: string;
 	mode: ResumeMode;
-	endpoint: LifecycleEndpoint;
-	topic: LifecycleTopic;
 }
 
-/** Machine-readable reason a lifecycle request failed. */
 export type LifecycleErrorReason =
 	| "unauthorized"
 	| "rate_limited"
@@ -360,15 +283,12 @@ export type LifecycleErrorReason =
 	| "terminal_uncertain"
 	| "unsupported_platform";
 
-/** A candidate returned with an `ambiguous_target` resume error. */
 export interface ResumeCandidate {
 	sessionId: string;
 	path?: string;
-	/** Last-activity epoch-millis (session history file mtime), if known. */
 	mtimeMs?: number;
 }
 
-/** A structured lifecycle error frame. */
 export interface SessionLifecycleErrorFrame {
 	type: "session_lifecycle_error";
 	requestId: string;
@@ -378,7 +298,6 @@ export interface SessionLifecycleErrorFrame {
 	candidates?: ResumeCandidate[];
 }
 
-/** Any ingress -> client lifecycle response frame. */
 export type SessionLifecycleResponse =
 	| SessionCreateResponseFrame
 	| SessionCloseResponseFrame
@@ -1216,14 +1135,14 @@ interface SessionRuntime {
 	/** This runtime's own host-liveness publication; only its teardown may retract it. */
 	evidencePublication?: SessionHostRuntimePublication;
 	brokerRegistrationReleased: boolean;
-	/** Managed Telegram root registration released during terminal teardown. */
-	notificationRootRegistration?: { settings: Settings; cwd: string; registrationToken: string };
 	verbosity: "lean" | "verbose";
 	sessionTag: string;
 	/** Whether the agent loop is currently running (drives the typing indicator). */
 	busy: boolean;
 	/** Prompt command/turn identities awaiting their corresponding agent_start. */
 	pendingPromptCorrelations: Array<{ commandId: string; turnId: string }>;
+	/** SDK run tokens bind an accepted queued follow-up to only its matching agent_start. */
+	pendingPromptCorrelationsBySdkRunToken: Map<string, { commandId: string; turnId: string }>;
 	/** Identity bound to the agent lifecycle currently in flight. */
 	activePromptCorrelation?: { commandId: string; turnId: string };
 	/** Binds the executing Agent run to a correlated prompt so cleanup targets only it. */
@@ -1243,7 +1162,7 @@ interface SessionRuntime {
 	notePromptReconciliation: (
 		correlation: { commandId: string; turnId: string } | undefined,
 		frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
-	) => void;
+	) => void | Promise<void>;
 	/** Settles and emits one sanitized correlated prompt failure. */
 	emitPromptFailure: (correlation: { commandId: string; turnId: string }, error: unknown) => void;
 	/** Records correlated lifecycle frames for replay and delivers them only to the accepted requester after acknowledgement. */
@@ -2299,6 +2218,9 @@ function sdkQuerySurface(
 		turnId?: string;
 		clientRef?: string;
 	}) => unknown = () => ({ status: "unknown" }),
+	steerStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
+		status: "unknown",
+	}),
 ): SessionSurface {
 	return createSdkSurfaceFactory({
 		ctx,
@@ -2309,6 +2231,7 @@ function sdkQuerySurface(
 		configOverrides,
 		settings,
 		turnResultLookup,
+		steerStatusLookup,
 		hostTools: () => getInstalledDefinitions("host_tools") !== undefined,
 	}).query;
 }
@@ -2379,8 +2302,14 @@ function sdkControlSurface(
 		requesterConnectionId?: string,
 		clientRef?: string,
 		trackReconciliation?: boolean,
+		preflightAbort?: () => void | Promise<void>,
+		reconciliationKind?: ReconciliationKind,
+		sdkRunToken?: string,
 	) => void | Promise<void> = () => {},
-	onPromptFailed: (correlation: { commandId: string; turnId: string }, error: unknown) => void = () => {},
+	onPromptFailed: (
+		correlation: { commandId: string; turnId: string },
+		error: unknown,
+	) => void | Promise<void> = () => {},
 	onPromptAcceptFailed: (correlation: { commandId: string; turnId: string }) => void = () => {},
 	acceptGateResolution: () => boolean,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T>,
@@ -2390,7 +2319,6 @@ function sdkControlSurface(
 	settings?: Settings,
 	configOverrides: Map<string, unknown> = new Map(),
 	configRevision: { current: number } = { current: 0 },
-	elevationAuthorityToken?: string,
 	abortOwnedPrompt: (
 		connectionId: string | undefined,
 	) => Promise<{ aborted: true; disposition: "cancelled" | "already_terminal" | "idle" }> = async () => ({
@@ -2405,15 +2333,20 @@ function sdkControlSurface(
 			clientRef?: string,
 			extra?: { skillName?: string },
 		) => Promise<void>;
+		cancel: (correlation: { commandId: string; turnId: string }) => Promise<void>;
 		noteTransition: (
 			correlation: { commandId: string; turnId: string } | undefined,
-			frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
+			frame:
+				| { type: "agent_start" | "agent_end"; content?: TurnResultContent }
+				| { type: "agent_failed"; error: unknown; content?: TurnResultContent },
 		) => Promise<void>;
 		lookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
+		reserveSteer?: KindAwareReconciliation["reserveSteer"];
+		settleSteer?: KindAwareReconciliation["settleSteer"];
 	},
 ): ControlSurface & {
-	cancelPendingPreflights(): void;
-	cancelPendingPreflightsForConnection(connectionId: string): void;
+	cancelPendingPreflights(): Promise<void>;
+	cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
 } {
 	const unavailable = (operation: string, reason: string) => () => {
 		throw Object.assign(new Error(`${operation} is unavailable: ${reason}`), { code: "unavailable" });
@@ -2454,11 +2387,29 @@ function sdkControlSurface(
 		}
 		return "unknown";
 	};
-	const sendSteer = async (text: string) => {
-		// Await admission so a rejection (e.g. handoff in progress) surfaces as a
-		// control error instead of a false `accepted: true`.
-		await api.sendUserMessage(text, { deliverAs: "steer" });
-		return { commandId: crypto.randomUUID(), accepted: true };
+	const sendSteer = async (text: string, clientRef?: string) => {
+		if (clientRef === undefined) {
+			const correlation = { commandId: crypto.randomUUID(), turnId: crypto.randomUUID() };
+			await api.sendUserMessage(text, { deliverAs: "steer" });
+			return { ...correlation, accepted: true };
+		}
+		const normalizedClientRef = clientRef.trim();
+		if (!skillRecon?.reserveSteer || !skillRecon.settleSteer)
+			throw Object.assign(new Error("Steer reconciliation is unavailable."), { code: "unavailable" });
+		const reservation = await skillRecon.reserveSteer(normalizedClientRef, text);
+		if (reservation.replay) return { sessionId: ctx.sessionManager.getSessionId(), ...reservation.result };
+		try {
+			await api.sendUserMessage(text, { deliverAs: "steer" });
+			return {
+				sessionId: ctx.sessionManager.getSessionId(),
+				...(await skillRecon.settleSteer(normalizedClientRef, "accepted")),
+			};
+		} catch (error) {
+			return {
+				sessionId: ctx.sessionManager.getSessionId(),
+				...(await skillRecon.settleSteer(normalizedClientRef, "rejected", error)),
+			};
+		}
 	};
 	const resolveModel = (id: string) => {
 		const [provider, ...modelId] = id.split("/");
@@ -2525,19 +2476,22 @@ function sdkControlSurface(
 			return unavailable(operation, "no typed session seam is installed")();
 		return ctx.sdkControl(operation, input);
 	};
-	const pendingPreflightCancellations = new Map<string, { connectionId?: string; cancel: () => void }>();
+	const pendingPreflightCancellations = new Map<string, { connectionId?: string; cancel: () => Promise<void> }>();
 	const preflightKey = (connectionId: string | undefined, correlation: { commandId: string; turnId: string }) =>
 		`${connectionId ?? ""}\0${correlation.commandId}\0${correlation.turnId}`;
-	const cancelPendingPreflights = () => {
-		for (const { cancel } of pendingPreflightCancellations.values()) cancel();
+	const cancelPendingPreflights = async () => {
+		await Promise.all([...pendingPreflightCancellations.values()].map(async entry => await entry.cancel()));
 	};
-	const cancelPendingPreflightsForConnection = (connectionId: string) => {
-		for (const entry of pendingPreflightCancellations.values())
-			if (entry.connectionId === connectionId) entry.cancel();
+	const cancelPendingPreflightsForConnection = async (connectionId: string) => {
+		await Promise.all(
+			[...pendingPreflightCancellations.values()]
+				.filter(entry => entry.connectionId === connectionId)
+				.map(async entry => await entry.cancel()),
+		);
 	};
 	const isSessionBusy = () => isBusy() || ctx.isIdle?.() === false;
 	const awaitAbortReady = async () => {
-		cancelPendingPreflights();
+		await cancelPendingPreflights();
 		await (ctx.abort as () => unknown)();
 		while (isSessionBusy()) {
 			await Bun.sleep(10);
@@ -2602,39 +2556,71 @@ function sdkControlSurface(
 				: text;
 		const commandId = crypto.randomUUID();
 		const turnId = crypto.randomUUID();
+		const sdkRunToken = deliverAs === "followUp" ? crypto.randomUUID() : undefined;
 		type PreflightTerminalResult = { status: "accepted" } | { status: "rejected"; error: unknown };
 		const preflight = Promise.withResolvers<PreflightTerminalResult>();
+		const preflightController = new AbortController();
+		const cancellationError = Object.assign(new Error("Prompt preflight was cancelled before execution."), {
+			code: "busy",
+		});
 		let preflightSettled = false;
+		let accepting = false;
 		let accepted = false;
+		let submission: Promise<void> | undefined;
+		const submissionSettled = Promise.withResolvers<void>();
+		let cancellation: Promise<void> | undefined;
 		const correlation = { commandId, turnId };
+		const key = preflightKey(requesterConnectionId, correlation);
 		const settlePreflight = (result: PreflightTerminalResult) => {
 			if (preflightSettled) return;
 			preflightSettled = true;
 			preflight.resolve(result);
 		};
-		const cancelPreflight = () =>
-			settlePreflight({
-				status: "rejected",
-				error: Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" }),
-			});
-		pendingPreflightCancellations.set(preflightKey(requesterConnectionId, correlation), {
+		// This is retained by the accepted durable record. It settles only this
+		// submission; terminal authority remains with the pending cancellation owner.
+		const settleSubmission = async () => {
+			preflightController.abort();
+			await submissionSettled.promise;
+		};
+		const cancelPreflight = () => {
+			cancellation ??= (async () => {
+				preflightController.abort();
+				if (!accepting) settlePreflight({ status: "rejected", error: cancellationError });
+				const ownedCancellation = await abortOwnedPrompt(requesterConnectionId);
+				if (ownedCancellation.disposition === "idle") await settleSubmission();
+			})();
+			return cancellation;
+		};
+		pendingPreflightCancellations.set(key, {
 			connectionId: requesterConnectionId,
 			cancel: cancelPreflight,
 		});
 		const settleAccepted = async () => {
 			if (preflightSettled) return;
-			accepted = true;
+			accepting = true;
 			try {
-				await onPromptAccepted(correlation, requesterConnectionId, trimmedClientRef, trackReconciliation);
+				await onPromptAccepted(
+					correlation,
+					requesterConnectionId,
+					trimmedClientRef,
+					trackReconciliation,
+					settleSubmission,
+					"prompt",
+					sdkRunToken,
+				);
 			} catch (error) {
+				accepting = false;
 				// Durable acceptance failed, so the prompt was never accepted: reject the
 				// control preflight and rethrow so the awaiting session does not execute it.
-				accepted = false;
 				onPromptAcceptFailed(correlation);
 				settlePreflight({ status: "rejected", error });
 				throw error;
 			}
+			accepting = false;
+			accepted = true;
+			pendingPreflightCancellations.delete(key);
 			settlePreflight({ status: "accepted" });
+			if (preflightController.signal.aborted) throw cancellationError;
 		};
 		// Durable fence preferred; keep legacy onPreflightAccepted for hosts/tests that only fire the sync hook.
 		const onPreflightAcceptCommit = settleAccepted;
@@ -2645,17 +2631,19 @@ function sdkControlSurface(
 		};
 		// Do not acknowledge the prompt until AgentSession's async preflight
 		// succeeds. The terminal result records correlation before agent_start can fire.
-		let submission: Promise<void> | undefined;
 		try {
 			submission = Promise.resolve(
 				api.sendUserMessage(content, {
 					...(deliverAs ? { deliverAs } : !forceFresh && isBusy() ? { deliverAs: "steer" as const } : {}),
 					onPreflightAcceptCommit,
 					onPreflightAccepted,
+					preflightSignal: preflightController.signal,
+					...(sdkRunToken ? { sdkRunToken } : {}),
 				}),
 			);
 		} catch (error) {
-			if (accepted) onPromptFailed(correlation, error);
+			submissionSettled.resolve();
+			if (accepted && !preflightController.signal.aborted) void onPromptFailed(correlation, error);
 			else settlePreflight({ status: "rejected", error });
 		}
 		if (submission) {
@@ -2668,10 +2656,12 @@ function sdkControlSurface(
 								code: "busy",
 							}),
 						});
+					submissionSettled.resolve();
 				},
 				error => {
-					if (accepted) onPromptFailed(correlation, error);
+					if (accepted && !preflightController.signal.aborted) void onPromptFailed(correlation, error);
 					else settlePreflight({ status: "rejected", error });
+					submissionSettled.resolve();
 				},
 			);
 		}
@@ -2683,19 +2673,16 @@ function sdkControlSurface(
 			if (trackReconciliation) releasePromptAdmission(trimmedClientRef);
 			throw error;
 		} finally {
-			pendingPreflightCancellations.delete(preflightKey(requesterConnectionId, correlation));
+			pendingPreflightCancellations.delete(key);
 		}
 	};
 	const surface: ControlSurface & {
-		cancelPendingPreflights(): void;
-		cancelPendingPreflightsForConnection(connectionId: string): void;
+		cancelPendingPreflights(): Promise<void>;
+		cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
 	} = {
-		authorizeElevationClaim: (sdkId, input, capability) =>
-			elevationAuthorityToken !== undefined &&
-			verifyElevationCapability(elevationAuthorityToken, capability, sdkId, input),
 		prompt: (text, images, clientRef) =>
 			submitPrompt(text, images, false, undefined, true, controlRequesterContext.getStore(), clientRef, true),
-		steer: text => sendSteer(text),
+		steer: (text, clientRef) => sendSteer(text, clientRef),
 		followUp: text => submitPrompt(text, undefined, false, "followUp", false, controlRequesterContext.getStore()),
 		abort: async () => {
 			const requesterConnectionId = controlRequesterContext.getStore();
@@ -2703,8 +2690,8 @@ function sdkControlSurface(
 				entry => entry.connectionId === requesterConnectionId,
 			);
 			if (pendingPreflight) {
-				if (requesterConnectionId) cancelPendingPreflightsForConnection(requesterConnectionId);
-				else cancelPendingPreflights();
+				if (requesterConnectionId) await cancelPendingPreflightsForConnection(requesterConnectionId);
+				else await cancelPendingPreflights();
 				return { aborted: true, disposition: "preflight_cancelled" };
 			}
 			return await abortOwnedPrompt(requesterConnectionId);
@@ -2727,7 +2714,7 @@ function sdkControlSurface(
 			pending.completeDirect();
 			return { resolved: true };
 		},
-		answerGate: async (id, response, expectedSessionId, idempotencyKey, _elevationRequestId) => {
+		answerGate: async (id, response, expectedSessionId, idempotencyKey) => {
 			if (!acceptGateResolution())
 				throw Object.assign(new Error("Workflow gate is no longer answerable."), { code: "resource_gone" });
 			if (expectedSessionId === undefined) auditMissingExpectedSessionId("workflow.gate_answer");
@@ -2802,7 +2789,7 @@ function sdkControlSurface(
 				code: "terminal_uncertain",
 			});
 		},
-		approvePlan: async (id, choice, expectedSessionId, _elevationRequestId) => {
+		approvePlan: async (id, choice, expectedSessionId) => {
 			if (!acceptGateResolution())
 				throw Object.assign(new Error("Workflow plan is no longer answerable."), { code: "resource_gone" });
 			if (expectedSessionId === undefined) auditMissingExpectedSessionId("workflow.plan_approve");
@@ -2888,6 +2875,7 @@ function sdkControlSurface(
 			const commandId = crypto.randomUUID();
 			const turnId = crypto.randomUUID();
 			const correlation = { commandId, turnId };
+			const requesterConnectionId = controlRequesterContext.getStore();
 			if (skillRecon) {
 				try {
 					await awaitReconciliationReady();
@@ -2898,44 +2886,116 @@ function sdkControlSurface(
 				}
 				skillRecon.admit(trimmedClientRef);
 			}
+			const cancellationError = Object.assign(new Error("Skill preflight was cancelled before execution."), {
+				code: "busy",
+			});
+			const preflightController = new AbortController();
 			const { promise: acceptedP, resolve, reject } = Promise.withResolvers<Record<string, unknown>>();
-			let phase: "pending" | "accepted" | "rejected" = "pending";
+			let phase: "pending" | "accepting" | "accepted" | "rejected" = "pending";
+			let promptOwned = false;
+			let durableSkillAccepted = false;
+			let admissionReleased = false;
+			const releaseAdmission = () => {
+				if (admissionReleased || durableSkillAccepted) return;
+				admissionReleased = true;
+				skillRecon?.release(trimmedClientRef);
+			};
 			const settleAccept = (value: Record<string, unknown>) => {
-				if (phase !== "pending") return;
+				if (phase !== "pending" && phase !== "accepting") return;
 				phase = "accepted";
 				resolve(value);
 			};
 			const settleReject = (error: unknown) => {
-				if (phase !== "pending") return;
+				if (phase === "accepted" || phase === "rejected") return;
 				phase = "rejected";
 				reject(error);
 			};
+			const executionSettled = Promise.withResolvers<void>();
+			let cancellation: Promise<void> | undefined;
+			const key = preflightKey(requesterConnectionId, correlation);
+			// This is retained by the accepted durable record. It settles only this
+			// invocation; terminal authority remains with the pending cancellation owner.
+			const settleRun = async () => {
+				preflightController.abort();
+				await executionSettled.promise;
+			};
+			const cancelPreflight = () => {
+				cancellation ??= (async () => {
+					preflightController.abort();
+					if (phase === "pending") {
+						releaseAdmission();
+						settleReject(cancellationError);
+					}
+					const ownedCancellation = await abortOwnedPrompt(requesterConnectionId);
+					if (ownedCancellation.disposition === "idle") {
+						await settleRun();
+						if (durableSkillAccepted && skillRecon) await skillRecon.cancel(correlation);
+					}
+				})();
+				return cancellation;
+			};
+			pendingPreflightCancellations.set(key, {
+				connectionId: requesterConnectionId,
+				cancel: cancelPreflight,
+			});
 			let prepared: { name: string; path: string; lineCount?: number; cleanedArgs?: string } | undefined;
-			const run = Promise.resolve(
-				ctx.invokeSkill(name, args as string | undefined, {
-					onSkillPrepared: meta => {
-						prepared = meta;
-					},
-					onPreflightAcceptCommit: async () => {
-						const meta = prepared ?? { name: String(name), path: "" };
-						if (skillRecon)
-							await skillRecon.noteAccepted(correlation, trimmedClientRef, { skillName: meta.name });
-						settleAccept({
-							accepted: true,
-							commandId,
-							turnId,
-							name: meta.name,
-							path: meta.path,
-							...(meta.lineCount !== undefined ? { lineCount: meta.lineCount } : {}),
-							...(meta.cleanedArgs !== undefined ? { args: meta.cleanedArgs } : {}),
-							...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
-						});
-					},
-				}),
-			).then(
+			let run: Promise<unknown>;
+			try {
+				run = Promise.resolve(
+					ctx.invokeSkill(name, args as string | undefined, {
+						preflightSignal: preflightController.signal,
+						onSkillPrepared: meta => {
+							prepared = meta;
+						},
+						onPreflightAcceptCommit: async () => {
+							if (preflightController.signal.aborted) throw cancellationError;
+							phase = "accepting";
+							const meta = prepared ?? { name: String(name), path: "" };
+							const acceptedValue = {
+								accepted: true,
+								commandId,
+								turnId,
+								name: meta.name,
+								path: meta.path,
+								...(meta.lineCount !== undefined ? { lineCount: meta.lineCount } : {}),
+								...(meta.cleanedArgs !== undefined ? { args: meta.cleanedArgs } : {}),
+								...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
+							};
+							try {
+								await onPromptAccepted(
+									correlation,
+									requesterConnectionId,
+									undefined,
+									false,
+									settleRun,
+									"skill",
+								);
+								promptOwned = requesterConnectionId !== undefined;
+								if (skillRecon) {
+									await skillRecon.noteAccepted(correlation, trimmedClientRef, { skillName: meta.name });
+									durableSkillAccepted = true;
+								}
+							} catch (error) {
+								onPromptAcceptFailed(correlation);
+								releaseAdmission();
+								settleReject(error);
+								throw error;
+							}
+							pendingPreflightCancellations.delete(key);
+							settleAccept(acceptedValue);
+							if (preflightController.signal.aborted) throw cancellationError;
+						},
+					}),
+				);
+			} catch (error) {
+				releaseAdmission();
+				settleReject(error);
+				run = Promise.reject(error);
+			}
+			void run.then(
 				result => {
 					if (phase === "pending") {
-						// Completed without fence (e.g. queue path) — still surface result.
+						pendingPreflightCancellations.delete(key);
 						settleAccept({
 							accepted: true,
 							commandId,
@@ -2943,7 +3003,7 @@ function sdkControlSurface(
 							...(typeof result === "object" && result ? (result as object) : {}),
 							...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
 						});
-					} else if (skillRecon) {
+					} else if (durableSkillAccepted && skillRecon) {
 						void skillRecon.noteTransition(correlation, {
 							type: "agent_end",
 							...(typeof result === "string"
@@ -2951,20 +3011,25 @@ function sdkControlSurface(
 								: {}),
 						});
 					}
-					return result;
+					executionSettled.resolve();
 				},
 				error => {
-					if (phase === "pending") {
-						if (skillRecon) skillRecon.release(trimmedClientRef);
+					if (phase === "pending" || phase === "accepting") {
+						releaseAdmission();
 						settleReject(error);
-					} else if (skillRecon) {
-						void skillRecon.noteTransition(correlation, { type: "agent_failed", error });
+					} else if (phase === "accepted" && promptOwned && !preflightController.signal.aborted) {
+						void onPromptFailed(correlation, error);
 					}
-					throw error;
+					if (durableSkillAccepted && skillRecon && !preflightController.signal.aborted)
+						void skillRecon.noteTransition(correlation, { type: "agent_failed", error });
+					executionSettled.resolve();
 				},
 			);
-			void run.catch(() => {});
-			return await acceptedP;
+			try {
+				return await acceptedP;
+			} finally {
+				pendingPreflightCancellations.delete(key);
+			}
 		},
 		setPlanMode: async on => {
 			if (!bindings.has("setPlanMode") || !ctx.setPlanMode)
@@ -3074,7 +3139,11 @@ function sdkControlSurface(
 		newSession: () => typed("session.new"),
 		forkSession: () => typed("session.fork"),
 		resumeSession: id => typed("session.resume", { id }),
-		closeSession: () => typed("session.close"),
+		closeSession: capability =>
+			typed(
+				"session.close",
+				capability === undefined ? {} : { [BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: capability },
+			),
 		switchSession: id => typed("session.switch", { id }),
 		branchSession: entryId => typed("session.branch", { entryId }),
 		renameSession: name => typed("session.rename", { name }),
@@ -3560,12 +3629,7 @@ export function createNotificationsExtension(
 	api: ExtensionAPI,
 	options: {
 		settings?: Settings;
-		ensureTelegramDaemon?: (input: {
-			settings: Settings;
-			cwd: string;
-			sessionId: string;
-			onRegistered?: (registration: RegisterNotificationRootResult) => void;
-		}) => Promise<EnsureDaemonResult>;
+		ensureTelegramDaemon?: (input: { settings: Settings }) => Promise<EnsureDaemonResult>;
 		ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>;
 		/** Suppress auto-delivery for a GJC-spawned child under `sessionScope=primary`. */
 		spawnedByGjc?: boolean;
@@ -3609,28 +3673,11 @@ export function createNotificationsExtension(
 		| undefined;
 	let extensionShuttingDown = false;
 
-	async function ensureTelegramOwner(
-		settings: Settings,
-		cwd: string,
-		id: string,
-		onRegistered?: (registrationToken: string) => void,
-	): Promise<"ready" | "blocked_identity"> {
+	async function ensureTelegramOwner(settings: Settings): Promise<"ready" | "blocked_identity"> {
 		if (options.ensureTelegramDaemon) {
-			return (await options.ensureTelegramDaemon({
-				settings,
-				cwd,
-				sessionId: id,
-				onRegistered: registration => onRegistered?.(registration.token),
-			})) === "blocked"
-				? "blocked_identity"
-				: "ready";
+			return (await options.ensureTelegramDaemon({ settings })) === "blocked" ? "blocked_identity" : "ready";
 		}
-		return (await ensureTelegramDaemonRunningDetailed({
-			settings,
-			cwd,
-			sessionId: id,
-			onRegistered: registration => onRegistered?.(registration.token),
-		})) === "blocked_identity"
+		return (await ensureTelegramDaemonRunningDetailed({ settings })) === "blocked_identity"
 			? "blocked_identity"
 			: "ready";
 	}
@@ -3638,9 +3685,6 @@ export function createNotificationsExtension(
 	async function ensureConfiguredDaemonOwners(
 		settings: Settings,
 		cfg: NotificationConfig,
-		cwd: string,
-		id: string,
-		onRegistered?: (registrationToken: string) => void,
 	): Promise<ConfiguredDaemonOwnerResult> {
 		if (isProviderEffectivelyEnabled(cfg, "telegram")) {
 			const telegramMarker = getCurrentTelegramActivationMarker(cfg);
@@ -3651,7 +3695,7 @@ export function createNotificationsExtension(
 				await ensureConfiguredProviderDaemons(settings, cfg, options.ensureProviderDaemon);
 				return "blocked_identity_with_sibling";
 			}
-			const telegram = await ensureTelegramOwner(settings, cwd, id, onRegistered);
+			const telegram = await ensureTelegramOwner(settings);
 			if (telegram === "blocked_identity") {
 				if (!isProviderEffectivelyEnabled(cfg, "discord") && !isProviderEffectivelyEnabled(cfg, "slack")) {
 					return "blocked_identity";
@@ -3664,23 +3708,6 @@ export function createNotificationsExtension(
 		return "ready";
 	}
 
-	function retainNotificationRootRegistration(
-		runtime: SessionRuntime,
-		settings: Settings,
-		cwd: string,
-		id: string,
-		registrationToken: string,
-	): void {
-		if (runtimes.get(id) === runtime && !runtime.stopping) {
-			runtime.notificationRootRegistration = { settings, cwd, registrationToken };
-			return;
-		}
-		runtime.notificationRootRegistration = { settings, cwd, registrationToken };
-		cleanupRetries.set(id, runtime);
-		void stopSession(id, "session", runtime).catch(error =>
-			logger.warn(`notifications: late Telegram root unregister failed: ${String(error)}`),
-		);
-	}
 	const identityControlOperations = new Set([
 		"session.new",
 		"session.fork",
@@ -3834,20 +3861,6 @@ export function createNotificationsExtension(
 			hostStopped: rt.hostStopped && rt.serverStopped,
 			brokerRegistrationReleased: rt.brokerRegistrationReleased,
 		});
-		if (rt.notificationRootRegistration) {
-			try {
-				await unregisterNotificationRoot({
-					settings: rt.notificationRootRegistration.settings,
-					cwd: rt.notificationRootRegistration.cwd,
-					sessionId: id,
-					registrationToken: rt.notificationRootRegistration.registrationToken,
-				});
-				rt.notificationRootRegistration = undefined;
-			} catch (e) {
-				ownerReleaseFailures.push(e);
-				logger.warn(`notifications: Telegram root unregister failed: ${String(e)}`);
-			}
-		}
 		if (ownerReleaseFailures.length > 0) {
 			cleanupRetries.set(id, rt);
 			throw new AggregateError(ownerReleaseFailures, `SDK notification runtime ${id} owner release failed.`);
@@ -3942,6 +3955,7 @@ export function createNotificationsExtension(
 
 		const pendingInteractive = new Map<string, PendingInteractiveAsk>();
 		const pendingPromptCorrelations: Array<{ commandId: string; turnId: string }> = [];
+		const pendingPromptCorrelationsBySdkRunToken = new Map<string, { commandId: string; turnId: string }>();
 		const tag = sessionTag(id);
 		let runtime: SessionRuntime | undefined;
 
@@ -3950,11 +3964,6 @@ export function createNotificationsExtension(
 		// build information and required capability while lifecycle startup can settle
 		// a structured failure instead of leaving the lifecycle caller pending.
 		const token = resolveToken();
-		const elevationAuthorityToken = crypto.randomBytes(32).toString("base64url");
-		const elevationAuthorityFile = elevationAuthorityPath(endpointStateRoot, id);
-		await fsPromises.mkdir(path.dirname(elevationAuthorityFile), { recursive: true, mode: 0o700 });
-		await Bun.write(elevationAuthorityFile, `${JSON.stringify({ version: 1, token: elevationAuthorityToken })}\n`);
-		await fsPromises.chmod(elevationAuthorityFile, 0o600);
 		let server: NotificationServer;
 		try {
 			const { NotificationServer, nativeBuildInfo } = sdkBusNatives();
@@ -3995,6 +4004,7 @@ export function createNotificationsExtension(
 				createSdkPermissionAskAnswerSource(
 					async (params, signal) => await host!.reverse.request("permission", "request", params, signal),
 				),
+				"protocol",
 			);
 		};
 		const installProviderDefinitions = (capability: string, definitions: unknown) => {
@@ -4038,6 +4048,7 @@ export function createNotificationsExtension(
 					createSdkUiAskAnswerSource(
 						async (params, signal) => await host!.reverse.request("ui", "ui.elicit", params, signal),
 					),
+					"protocol",
 				);
 				disposePermissionAnswerSource?.();
 				disposePermissionAnswerSource = undefined;
@@ -4138,21 +4149,27 @@ export function createNotificationsExtension(
 			outcome?: SdkPromptTerminalOutcome;
 			/** Agent-owned resource run captured at acceptance; cleanup targets only this handle. */
 			executionHandle?: string;
+			/** Cancels accepted skill preparation before an execution handle exists. */
+			preflightAbort?: () => void | Promise<void>;
+			reconciliationKind: ReconciliationKind;
 			bufferedFrames: Array<PromptLifecycleFrame | Record<string, unknown>>;
 		};
 		const promptSubmissions = new Map<string, PromptSubmission>();
 		/** Connections fenced by a fatal prompt closure; their later frames are refused. */
 		const fencedConnections = new Set<string>();
-		let cancelPreflightsForConnection: ((connectionId: string) => void) | undefined;
+		let cancelPreflightsForConnection: ((connectionId: string) => Promise<void>) | undefined;
 		const promptTerminalTombstones = new Map<string, { connectionId: string; expiresAt: number }>();
 		// Authoritative bounded reconciliation state for Q26 turn.prompt_status
 		// (contract documented in ./prompt-reconciliation and ../prompt-status).
 		// Active records never age into terminal; documented TTL/capacity
 		// eviction is the only removal, after which lookups report `unknown`.
-		const sessionFile =
+		const persistedSessionFile =
 			typeof ctx.sessionManager?.getSessionFile === "function" ? ctx.sessionManager.getSessionFile() : null;
 		const reconciliationSessionId =
 			typeof ctx.sessionManager?.getSessionId === "function" ? ctx.sessionManager.getSessionId() : "";
+		const sessionFile = reconciliationSessionId
+			? resolveReconciliationSessionFile(persistedSessionFile, stateRoot, String(reconciliationSessionId))
+			: null;
 		const durableStore =
 			sessionFile && reconciliationSessionId
 				? createReconciliationStore({ sessionFile, sessionId: String(reconciliationSessionId) })
@@ -4160,12 +4177,22 @@ export function createNotificationsExtension(
 		const kindReconciliation = createKindAwareReconciliation({ store: durableStore });
 		// Restart recovery must commit before any prompt is admitted; otherwise a new
 		// admission can race the hydrated full-state replacement.
-		const reconciliationReady: Promise<void> = durableStore
-			? kindReconciliation.hydrateFromStore()
-			: Promise.resolve();
+		let reconciliationReady: Promise<void> = durableStore ? kindReconciliation.hydrateFromStore() : Promise.resolve();
 		// Never let a hydration rejection become an unhandled rejection; tracked prompts
 		// re-await the same promise and fail closed below.
 		void reconciliationReady.catch(() => {});
+		const awaitReconciliationReady = async () => {
+			const observed = reconciliationReady;
+			try {
+				await observed;
+			} catch {
+				if (reconciliationReady === observed) {
+					reconciliationReady = durableStore ? kindReconciliation.hydrateFromStore() : Promise.resolve();
+					void reconciliationReady.catch(() => {});
+				}
+				await reconciliationReady;
+			}
+		};
 		// Backward-compatible process-local prompt reconciler kept for unit-test isolation;
 		// production path uses kindReconciliation for prompt+skill.
 		const reconciliation = createPromptReconciliation();
@@ -4182,6 +4209,10 @@ export function createNotificationsExtension(
 				candidate => candidate.commandId === correlation.commandId && candidate.turnId === correlation.turnId,
 			);
 			if (pendingIndex !== -1) pendingPromptCorrelations.splice(pendingIndex, 1);
+			for (const [sdkRunToken, candidate] of pendingPromptCorrelationsBySdkRunToken) {
+				if (candidate.commandId === correlation.commandId && candidate.turnId === correlation.turnId)
+					pendingPromptCorrelationsBySdkRunToken.delete(sdkRunToken);
+			}
 		};
 		const addTerminalTombstone = (key: string, connectionId: string, now = Date.now()) => {
 			promptTerminalTombstones.delete(key);
@@ -4298,6 +4329,9 @@ export function createNotificationsExtension(
 			requesterConnectionId?: string,
 			clientRef?: string,
 			trackReconciliation = false,
+			preflightAbort?: () => void | Promise<void>,
+			reconciliationKind: ReconciliationKind = "prompt",
+			sdkRunToken?: string,
 		) => {
 			if (!requesterConnectionId) {
 				// No delivery owner: tracked prompts cannot be reconciled. Release
@@ -4317,7 +4351,8 @@ export function createNotificationsExtension(
 					);
 				expirePromptDelivery(oldestTerminal[0], oldestTerminal[1]);
 			}
-			pendingPromptCorrelations.push(correlation);
+			if (sdkRunToken) pendingPromptCorrelationsBySdkRunToken.set(sdkRunToken, correlation);
+			else pendingPromptCorrelations.push(correlation);
 			const submission: PromptSubmission = {
 				acknowledged: false,
 				connectionId: requesterConnectionId,
@@ -4330,6 +4365,8 @@ export function createNotificationsExtension(
 				phase: "active",
 				// Bound to the Agent run at `agent_start`; acceptance precedes execution.
 				executionHandle: undefined,
+				...(preflightAbort ? { preflightAbort } : {}),
+				reconciliationKind,
 				bufferedFrames: [],
 			};
 			promptSubmissions.set(promptSubmissionKey(correlation), submission);
@@ -4350,6 +4387,8 @@ export function createNotificationsExtension(
 		};
 		/** Roll back process-local registration when durable acceptance failed. */
 		const discardPromptAcceptance = (correlation: { commandId: string; turnId: string }) => {
+			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+			if (submission?.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			promptSubmissions.delete(promptSubmissionKey(correlation));
 			removePendingPromptCorrelation(correlation);
 		};
@@ -4402,7 +4441,10 @@ export function createNotificationsExtension(
 			// connection is marked failed (every later inbound frame from it is refused),
 			// its reverse leases are released, and its deliveries are abandoned. The durable
 			// record stays active for Q26 and restart recovery.
-			cancelPreflightsForConnection?.(submission.connectionId);
+			if (cancelPreflightsForConnection)
+				void cancelPreflightsForConnection(submission.connectionId).catch(error =>
+					logger.warn(`sdk: failed to cancel fenced preflight: ${String(error)}`),
+				);
 			fencedConnections.add(submission.connectionId);
 			host?.handleDisconnect(submission.connectionId);
 			for (const [key, owned] of promptSubmissions)
@@ -4422,7 +4464,10 @@ export function createNotificationsExtension(
 			handle: string | undefined,
 		) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
-			if (submission) submission.executionHandle = handle;
+			if (submission) {
+				submission.executionHandle = handle;
+				submission.preflightAbort = undefined;
+			}
 		};
 		const terminalizePrompt = async (
 			correlation: { commandId: string; turnId: string },
@@ -4433,12 +4478,18 @@ export function createNotificationsExtension(
 			options: { fence?: boolean } = {},
 			extra?: PromptTerminalExtra,
 		) => {
+			const receiptState = extra?.finalText?.trim() ? "present" : "missing";
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission || submission.terminal || submission.phase !== "active") return;
 			submission.phase = "outcome_claimed";
 			let winner: SdkPromptTerminalOutcome;
 			try {
-				winner = await kindReconciliation.claimPendingOutcome(correlation, requestedOutcome);
+				winner = await kindReconciliation.claimPendingOutcome(
+					submission.reconciliationKind,
+					correlation,
+					requestedOutcome,
+					receiptState,
+				);
 			} catch (error) {
 				// The claim is the durability boundary: without it nothing may be published
 				// and the endpoint must fail closed so the client rejects exactly once. The
@@ -4493,7 +4544,13 @@ export function createNotificationsExtension(
 				}
 			}
 			try {
-				await kindReconciliation.finalizePromptOutcome(correlation, winner, extra?.error, extra?.finalText);
+				await kindReconciliation.finalizeOutcome(
+					submission.reconciliationKind,
+					correlation,
+					winner,
+					extra?.error,
+					extra?.finalText,
+				);
 			} catch (error) {
 				// The durable pending claim survives; publishing an unpersisted terminal
 				// would contradict it, so fail the endpoint closed instead.
@@ -4538,8 +4595,9 @@ export function createNotificationsExtension(
 					outcome: winner,
 				});
 			}
+			// eslint-disable-next-line no-console
 		};
-		const emitPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
+		const emitPromptFailure = async (correlation: { commandId: string; turnId: string }, error: unknown) => {
 			logger.error("SDK prompt submission failed", {
 				commandId: correlation.commandId,
 				turnId: correlation.turnId,
@@ -4562,7 +4620,7 @@ export function createNotificationsExtension(
 				provenance: outcome.provenance,
 				reason: formatPromptTerminalFailureReason(error),
 			});
-			void terminalizePrompt(
+			await terminalizePrompt(
 				correlation,
 				outcome,
 				{},
@@ -4571,7 +4629,7 @@ export function createNotificationsExtension(
 				{ error: sanitized, diagnostic: { reason: error }, diagnosticAlreadyLogged: true },
 			);
 		};
-		const recordPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
+		const recordPromptFailure = async (correlation: { commandId: string; turnId: string }, error: unknown) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission) return;
 			submission.failed = true;
@@ -4581,7 +4639,7 @@ export function createNotificationsExtension(
 				runtime.activePromptCorrelation.turnId === correlation.turnId
 			)
 				runtime.activePromptCorrelation = undefined;
-			emitPromptFailure(correlation, error);
+			await emitPromptFailure(correlation, error);
 		};
 		const acknowledgePrompt = (connectionId: string, correlation: { commandId: string; turnId: string }) => {
 			const key = promptSubmissionKey(correlation);
@@ -4612,6 +4670,7 @@ export function createNotificationsExtension(
 				configOverrides,
 				settings,
 				selector => kindReconciliation.lookupResult(selector.kind, selector),
+				selector => kindReconciliation.lookupSteer(selector),
 			),
 			id,
 			revisions,
@@ -4622,7 +4681,10 @@ export function createNotificationsExtension(
 			pendingInteractive,
 			gatePresentations,
 			api,
-			() => runtime?.busy === true || pendingPromptCorrelations.length > 0,
+			() =>
+				runtime?.busy === true ||
+				pendingPromptCorrelations.length > 0 ||
+				pendingPromptCorrelationsBySdkRunToken.size > 0,
 			recordPromptAccepted,
 			recordPromptFailure,
 			discardPromptAcceptance,
@@ -4630,23 +4692,58 @@ export function createNotificationsExtension(
 			trackGateResolution,
 			admitPromptSubmission,
 			releasePromptAdmission,
-			() => reconciliationReady,
+			awaitReconciliationReady,
 			settings,
 			configOverrides,
 			configRevision,
-			elevationAuthorityToken,
 			async connectionId => {
 				const active = [...promptSubmissions.entries()].find(
 					([, submission]) => submission.connectionId === connectionId && !submission.terminal,
 				);
 				if (!active) return { aborted: true, disposition: "idle" as const };
-				const [commandId, turnId] = active[0].split(":", 2);
-				if (commandId && turnId)
-					await terminalizePrompt(
-						{ commandId, turnId },
-						{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
-						{ fence: true },
-					);
+				const [key, submission] = active;
+				const [commandId, turnId] = key.split(":", 2);
+				if (commandId && turnId) {
+					const hasExecutionHandle = Boolean(submission.executionHandle);
+					const cancellationOutcome: SdkPromptTerminalOutcome = {
+						kind: "stopped",
+						reason: "cancelled",
+						provenance: "client_cancel",
+					};
+					if (!hasExecutionHandle && submission.preflightAbort) {
+						try {
+							await kindReconciliation.claimPendingOutcome(
+								submission.reconciliationKind,
+								{ commandId, turnId },
+								cancellationOutcome,
+							);
+						} catch (error) {
+							logger.warn(`sdk: accepted preflight cancellation claim failed: ${String(error)}`);
+							failPromptClosed(
+								{ commandId, turnId },
+								submission,
+								"terminal_uncertain",
+								"Accepted prompt cancellation could not be persisted.",
+							);
+							return { aborted: true, disposition: "cancelled" as const };
+						}
+						try {
+							await submission.preflightAbort();
+						} catch (error) {
+							logger.warn(`sdk: accepted preflight cancellation failed: ${String(error)}`);
+							failPromptClosed(
+								{ commandId, turnId },
+								submission,
+								"terminal_uncertain",
+								"Accepted prompt preparation could not be settled before cancellation.",
+							);
+							return { aborted: true, disposition: "cancelled" as const };
+						}
+					}
+					await terminalizePrompt({ commandId, turnId }, cancellationOutcome, {
+						fence: hasExecutionHandle || !submission.preflightAbort,
+					});
+				}
 				return { aborted: true, disposition: "cancelled" as const };
 			},
 			{
@@ -4654,8 +4751,18 @@ export function createNotificationsExtension(
 				release: (clientRef?: string) => kindReconciliation.releaseAdmission("skill", clientRef),
 				noteAccepted: (correlation, clientRef, extra) =>
 					kindReconciliation.noteAccepted("skill", correlation, clientRef, extra),
+				cancel: async correlation => {
+					const outcome = await kindReconciliation.claimPendingOutcome("skill", correlation, {
+						kind: "stopped",
+						reason: "cancelled",
+						provenance: "client_cancel",
+					});
+					await kindReconciliation.finalizeOutcome("skill", correlation, outcome);
+				},
 				noteTransition: (correlation, frame) => kindReconciliation.noteTransition("skill", correlation, frame),
 				lookup: selector => kindReconciliation.lookup("skill", selector),
+				reserveSteer: kindReconciliation.reserveSteer,
+				settleSteer: kindReconciliation.settleSteer,
 			},
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
@@ -4863,7 +4970,8 @@ export function createNotificationsExtension(
 				if (
 					(request.operation === "turn.prompt" ||
 						request.operation === "turn.follow_up" ||
-						request.operation === "turn.abort_and_prompt") &&
+						request.operation === "turn.abort_and_prompt" ||
+						request.operation === "skill.invoke") &&
 					response.ok === true &&
 					response.result &&
 					typeof response.result === "object" &&
@@ -4918,7 +5026,15 @@ export function createNotificationsExtension(
 					dispatchControl(
 						controlSurface,
 						OPERATIONS.find(row => row.kind === "control" && row.sdkId === operation),
-						controlRequestFromFrame(request as Record<string, unknown>),
+						{
+							id: requestId,
+							operation,
+							input: request.input,
+							expectedRevision:
+								typeof request.expectedRevision === "string" ? request.expectedRevision : undefined,
+							idempotencyKey: typeof request.idempotencyKey === "string" ? request.idempotencyKey : undefined,
+							confirm: request.confirm === true,
+						},
 					),
 				);
 
@@ -4930,16 +5046,6 @@ export function createNotificationsExtension(
 			},
 			query: async (connectionId, frame) => {
 				const request = frame as { id?: unknown; query?: unknown; input?: unknown; cursor?: unknown };
-				// D1: a non-string top-level cursor is rejected, never silently
-				// dropped into a fresh-snapshot query (parity with the loopback
-				// session-runtime adapter).
-				if (request.cursor !== undefined && typeof request.cursor !== "string")
-					return {
-						type: "query_response",
-						id: typeof request.id === "string" ? request.id : undefined,
-						ok: false,
-						error: { code: "invalid_input", message: "cursor must be a non-empty string" },
-					};
 				const response = await queryHandlers.dispatch({
 					id: typeof request.id === "string" ? request.id : undefined,
 					query: typeof request.query === "string" ? request.query : "",
@@ -5004,12 +5110,20 @@ export function createNotificationsExtension(
 			sessionTag: tag,
 			busy: false,
 			pendingPromptCorrelations,
+			pendingPromptCorrelationsBySdkRunToken,
 			activePromptCorrelation: undefined,
 			bindPromptExecutionHandle,
-			peekPromptPendingOutcome: correlation => kindReconciliation.peekPendingOutcome(correlation),
+			peekPromptPendingOutcome: correlation => {
+				const kind =
+					promptSubmissions.get(promptSubmissionKey(correlation))?.reconciliationKind ?? ("prompt" as const);
+				return kindReconciliation.peekPendingOutcome(kind, correlation);
+			},
 			terminalizePrompt: (correlation, outcome, extra) => terminalizePrompt(correlation, outcome, {}, extra),
 			notePromptReconciliation: (correlation, frame) => {
-				void kindReconciliation.noteTransition("prompt", correlation, frame);
+				const kind = correlation
+					? (promptSubmissions.get(promptSubmissionKey(correlation))?.reconciliationKind ?? ("prompt" as const))
+					: "prompt";
+				return kindReconciliation.noteTransition(kind, correlation, frame);
 			},
 			emitPromptFailure,
 			emitPromptLifecycle,
@@ -5020,7 +5134,6 @@ export function createNotificationsExtension(
 				{ toolName: string; args?: unknown; pendingPhase?: "completed" | "failed" | "cancelled" }
 			>(),
 			deferredInboundControls: [],
-			notificationRootRegistration: undefined,
 		};
 		const initializedRuntime = runtime;
 		runtimes.set(id, initializedRuntime);
@@ -5150,7 +5263,9 @@ export function createNotificationsExtension(
 			});
 			server.onConnectionClose((_err, connectionId) => {
 				if (!connectionId) return;
-				controlSurface.cancelPendingPreflightsForConnection(connectionId);
+				void controlSurface
+					.cancelPendingPreflightsForConnection(connectionId)
+					.catch(error => logger.warn(`sdk: failed to cancel disconnected preflight: ${String(error)}`));
 				host.handleDisconnect(connectionId);
 				hostCapCache.delete(connectionId);
 				// The socket is gone, so its fence has nothing left to refuse. Dropping the
@@ -5164,7 +5279,9 @@ export function createNotificationsExtension(
 				// therefore only abandons delivery; ACP rejects its own local waiter once and
 				// terminal authority stays with the eventual normalized SDK outcome.
 				for (const submission of promptSubmissions.values())
-					if (submission.connectionId === connectionId) abandonPrompt(submission);
+					if (submission.connectionId === connectionId) {
+						abandonPrompt(submission);
+					}
 			});
 
 			server.onReply((err, reply) => {
@@ -5574,9 +5691,35 @@ export function createNotificationsExtension(
 				await cleanupAbandonedStartup();
 				return { status: "failed" };
 			}
-			// Record canonical identity before transport startup so lifecycle events emitted
-			// by an early server-start callback cannot overtake it in replay. The direct
-			// socket publication remains below, after the server is listening.
+			if (notificationsEnabledForSession && settingsAvailable && settings) {
+				try {
+					const ownership = await ensureConfiguredDaemonOwners(settings, cfg);
+					if (ownership === "blocked_identity") {
+						const result = failLifecycleStartup("failed", "Telegram daemon ownership is blocked.");
+						finishStartup(result);
+						await cleanupAbandonedStartup();
+						return result;
+					}
+					if (ownership === "blocked_identity_with_sibling" && !isolateChatEndpoint) {
+						await cleanupAbandonedStartup();
+						if (sessionStartPromises.get(id) === startSettled.promise) sessionStartPromises.delete(id);
+						forceIsolatedChatSessions.add(id);
+						const result = await startSession(ctx);
+						finishStartup(result);
+						return result;
+					}
+				} catch (error) {
+					const result = failLifecycleStartup("failed", error);
+					finishStartup(result);
+					await cleanupAbandonedStartup();
+					return result;
+				}
+			}
+
+			// Startup contract: configured notification daemon ownership must be ready
+			// before identity or endpoint publication. Native frames are ephemeral, so
+			// publish identity only after readiness; late SDK consumers recover it from
+			// event_replay.
 			const identityHeader = {
 				type: "identity_header",
 				sessionId: id,
@@ -5591,9 +5734,7 @@ export function createNotificationsExtension(
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
 				initializedRuntime.notificationOwnerState = "retry";
 				try {
-					const ownership = await ensureConfiguredDaemonOwners(settings, cfg, ctx.cwd, id, token => {
-						retainNotificationRootRegistration(initializedRuntime, settings, ctx.cwd, id, token);
-					});
+					const ownership = await ensureConfiguredDaemonOwners(settings, cfg);
 					initializedRuntime.notificationOwnerState =
 						ownership === "ready" || (ownership === "blocked_identity_with_sibling" && isolateChatEndpoint)
 							? "ready"
@@ -5620,7 +5761,10 @@ export function createNotificationsExtension(
 			// runtime's alone, so only this runtime's teardown can retract it.
 			initializedRuntime.evidencePublication = publishSessionHostRuntimeEvidence({
 				attachedClients: () => server.clientCount(),
-				workInFlight: () => initializedRuntime.busy || initializedRuntime.pendingPromptCorrelations.length > 0,
+				workInFlight: () =>
+					initializedRuntime.busy ||
+					initializedRuntime.pendingPromptCorrelations.length > 0 ||
+					initializedRuntime.pendingPromptCorrelationsBySdkRunToken.size > 0,
 			});
 			ephemeralTurns.configureAuthority({
 				sessionId: id,
@@ -5854,7 +5998,7 @@ export function createNotificationsExtension(
 			logger.warn(`notifications: failed to start server: ${String(e)}`);
 			const result = failLifecycleStartup("failed", e);
 			finishStartup(result);
-			let suppressExtensionError = result.failure?.message === "Lifecycle SDK startup was cancelled.";
+			let suppressExtensionError = false;
 			let stopped = false;
 			try {
 				stopped = await stopSession(id, "session", runtime);
@@ -5892,15 +6036,7 @@ export function createNotificationsExtension(
 					const { cfg, settings, settingsAvailable } = resolveSettings(options.settings);
 					if (!settingsAvailable || !settings) return "failed";
 					try {
-						const ownership = await ensureConfiguredDaemonOwners(
-							settings,
-							cfg,
-							binding.cwd,
-							binding.sessionId,
-							token => {
-								retainNotificationRootRegistration(runtime, settings, binding.cwd, binding.sessionId, token);
-							},
-						);
+						const ownership = await ensureConfiguredDaemonOwners(settings, cfg);
 						runtime.notificationOwnerState =
 							ownership === "ready" ||
 							(ownership === "blocked_identity_with_sibling" && runtime.endpointScope === "chat")
@@ -5974,29 +6110,11 @@ export function createNotificationsExtension(
 			flushPendingFinal(runtime, runtime.id);
 			for (const processControl of runtime.deferredInboundControls.splice(0)) processControl();
 		},
-		ensureTelegramDaemon: async binding => {
+		ensureTelegramDaemon: async _binding => {
 			const { settings, settingsAvailable } = resolveSettings(options.settings);
 			if (!settingsAvailable || !settings) return "blocked_identity";
 			try {
-				let registrationToken: string | undefined;
-				const result = await ensureTelegramOwner(settings, binding.cwd, binding.sessionId, token => {
-					registrationToken = token;
-				});
-				const runtime = runtimes.get(binding.sessionId);
-				const configured = isProviderEffectivelyEnabled(resolveSettings(options.settings).cfg, "telegram");
-				if (result === "ready" && runtime && !runtime.stopping && configured && registrationToken !== undefined) {
-					runtime.notificationRootRegistration = { settings, cwd: binding.cwd, registrationToken };
-				} else if (registrationToken !== undefined) {
-					await unregisterNotificationRoot({
-						settings,
-						cwd: binding.cwd,
-						sessionId: binding.sessionId,
-						registrationToken,
-					});
-				}
-				if (runtime?.notificationOwnerState === "blocked")
-					runtime.notificationOwnerState = result === "ready" ? "ready" : "blocked";
-				return result;
+				return await ensureTelegramOwner(settings);
 			} catch {
 				return "failed";
 			}
@@ -6340,7 +6458,7 @@ export function createNotificationsExtension(
 	// Drive the live typing indicator: mark busy when the agent loop starts so
 	// the daemon shows "typing…" in the thread while the agent is thinking,
 	// before any turn output exists. Cleared on `agent_end` below.
-	api.on("agent_start", (_event, ctx) => {
+	api.on("agent_start", async (event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt) return;
@@ -6348,16 +6466,20 @@ export function createNotificationsExtension(
 		// it is tracked regardless of whether notifications are active.
 		rt.busy = true;
 		// A continuation re-enters the agent loop inside the same prompt and emits
-		// another `agent_start`. Shifting again would pop nothing and clobber the
-		// live correlation with `undefined`, so the prompt's `agent_end` could no
-		// longer be terminalized and the caller would hang until the deadline.
-		// Only claim the next pending correlation when this session has no active one.
-		const correlation = rt.activePromptCorrelation ?? rt.pendingPromptCorrelations.shift();
+		// another `agent_start`. Only a queued follow-up's exact SDK token may
+		// claim its correlation; unrelated queue work must not consume it.
+		const sdkRunToken = event.sdkRunToken;
+		const correlation =
+			rt.activePromptCorrelation ??
+			(sdkRunToken
+				? rt.pendingPromptCorrelationsBySdkRunToken.get(sdkRunToken)
+				: rt.pendingPromptCorrelations.shift());
+		if (sdkRunToken && correlation) rt.pendingPromptCorrelationsBySdkRunToken.delete(sdkRunToken);
 		const continuation = rt.activePromptCorrelation !== undefined;
 		rt.activePromptCorrelation = correlation;
 		if (correlation && !continuation) rt.bindPromptExecutionHandle(correlation, ctx.getActivePromptHandle());
 		if (continuation) return;
-		rt.notePromptReconciliation(correlation, { type: "agent_start" });
+		await rt.notePromptReconciliation(correlation, { type: "agent_start" });
 		rt.emitPromptLifecycle(correlation, { type: "agent_start", sessionId: id, ...correlation });
 		try {
 			// `activity` is the native live-host lifecycle surface. The separately
@@ -6394,7 +6516,7 @@ export function createNotificationsExtension(
 	// per `turn_end`. turn_end fires once per turn iteration, so a single
 	// user-visible idle previously produced many idle pings (the flood); agent_end
 	// fires exactly once per settle, yielding exactly one idle notification.
-	api.on("agent_end", (event, ctx) => {
+	api.on("agent_end", async (event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt) return;
@@ -6452,7 +6574,7 @@ export function createNotificationsExtension(
 			// contract (see `sanitizePromptFailure`). Assistant failure messages may
 			// still remain in the local session transcript; terminalization copies only
 			// a bounded reason into the local operator log.
-			void rt.terminalizePrompt(correlation, outcome, {
+			await rt.terminalizePrompt(correlation, outcome, {
 				...(finalText ? { finalText } : {}),
 				...(outcome.kind === "failed"
 					? {

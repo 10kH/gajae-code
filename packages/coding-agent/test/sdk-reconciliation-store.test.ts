@@ -7,6 +7,7 @@ import {
 	type DurableReconciliationRecord,
 	isSafeReconciliationSessionId,
 	reconciliationStorePath,
+	resolveReconciliationSessionFile,
 	settleProcessRestart,
 } from "../src/sdk/bus/reconciliation-store";
 
@@ -25,6 +26,32 @@ describe("reconciliation-store", () => {
 		const storePath = reconciliationStorePath(sessionFile, "abc");
 		expect(storePath).toBe("/home/u/.gjc/agent/sessions/scope/.sdk-reconciliation/abc.json");
 		expect(storePath.includes("abc/")).toBe(false); // not under artifact stem abc/
+	});
+
+	test("bus derives a durable state-root store when session file method returns undefined", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "recon-state-root-"));
+		try {
+			const sessionId = "session-1";
+			const sessionFile = resolveReconciliationSessionFile(undefined, root, sessionId);
+			const store = createReconciliationStore({ sessionFile, sessionId });
+			await store.transact(() => [
+				{
+					kind: "steer",
+					clientRef: "state-root-ref",
+					textDigest: "a".repeat(64),
+					createdAt: 1,
+					status: "accepted",
+					settledAt: 2,
+					commandId: "command",
+					turnId: "turn",
+					acceptedAt: 1,
+				},
+			]);
+			expect(store.path).toBe(path.join(root, ".sdk-reconciliation", `${sessionId}.json`));
+			expect(await fs.readFile(store.path!, "utf8")).toContain('"textDigest"');
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 
 	test("settleProcessRestart never invents terminal_ok", () => {
@@ -99,6 +126,58 @@ describe("reconciliation-store", () => {
 		await again.delete();
 		await expect(fs.stat(store.path!)).rejects.toMatchObject({ code: "ENOENT" });
 		await fs.rm(root, { recursive: true, force: true });
+	});
+
+	test("reload preserves a skill pending claim without quarantining sibling records", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "recon-skill-pending-"));
+		try {
+			const sessionFile = path.join(root, "sess.jsonl");
+			await fs.writeFile(sessionFile, "");
+			const store = createReconciliationStore({ sessionFile, sessionId: "skill-session", now: () => 5_000 });
+			await store.transact(() => [
+				{
+					kind: "skill",
+					commandId: "skill-command",
+					turnId: "skill-turn",
+					status: "in_flight",
+					acceptedAt: 1_000,
+					startedAt: 2_000,
+					skillName: "deep-interview",
+					pendingOutcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+				},
+				{
+					kind: "prompt",
+					commandId: "completed-command",
+					turnId: "completed-turn",
+					status: "terminal_ok",
+					acceptedAt: 1_000,
+					terminalAt: 3_000,
+					outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+				},
+			]);
+
+			const reopened = createReconciliationStore({ sessionFile, sessionId: "skill-session", now: () => 9_000 });
+			expect(await reopened.load()).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						kind: "skill",
+						status: "terminal_ok",
+						terminalAt: 9_000,
+						outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+						pendingOutcome: undefined,
+					}),
+					expect.objectContaining({
+						kind: "prompt",
+						commandId: "completed-command",
+						status: "terminal_ok",
+					}),
+				]),
+			);
+			const entries = await fs.readdir(path.dirname(store.path!));
+			expect(entries.some(name => name.includes("corrupt"))).toBe(false);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 
 	test("corrupt file quarantines and returns empty", async () => {

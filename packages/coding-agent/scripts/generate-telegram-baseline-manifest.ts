@@ -18,6 +18,7 @@ const explicitTests = [
 	"telegram-send-tool.test.ts",
 	"telegram-onboarding-docs.test.ts",
 	"lifecycle-notification-docs.test.ts",
+	"sdk-lifecycle-telegram-integration.test.ts",
 ];
 const requiredTests = [
 	"packages/coding-agent/test/daemon-control.test.ts",

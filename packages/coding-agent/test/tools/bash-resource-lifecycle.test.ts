@@ -95,6 +95,32 @@ describe("bash resource lifecycle", () => {
 		}
 	});
 
+	it("clears both foreground deadlines after concurrent early completions", async () => {
+		settings.set("bash.autoBackground.enabled", false);
+		const sleep = vi.spyOn(Bun, "sleep");
+		const firstTool = new BashTool(makeToolSession(tempDir, settings));
+		const secondTool = new BashTool(makeToolSession(tempDir, settings));
+
+		try {
+			const [first, second] = await Promise.all([
+				firstTool.execute("foreground-early-completion-a", {
+					command: "printf first",
+					timeout: 5,
+				}),
+				secondTool.execute("foreground-early-completion-b", {
+					command: "printf second",
+					timeout: 5,
+				}),
+			]);
+
+			expect(first.content[0]).toMatchObject({ type: "text", text: "first" });
+			expect(second.content[0]).toMatchObject({ type: "text", text: "second" });
+			expect(sleep).not.toHaveBeenCalledWith(6_000);
+		} finally {
+			sleep.mockRestore();
+		}
+	});
+
 	it("repeated monitor jobs return native shell session count to baseline", async () => {
 		const baseline = getShellSessionCount();
 		const tool = new BashTool(makeToolSession(tempDir, settings));
@@ -248,8 +274,10 @@ describe("bash resource lifecycle", () => {
 			timeout: 5_000,
 			sessionKey: "late-retiring-replacement",
 		});
-		expect(afterLateSettle.output.trim()).toBe("replacement");
-		expect(runCalls).toBe(2);
+		expect(afterLateSettle.output.trim()).toBe("after-late-settle");
+		expect(runCalls).toBe(3);
+		expect(shells[2]).toBe(shells[1]);
+		expect(shells[2]).not.toBe(shells[0]);
 
 		runSpy.mockRestore();
 		abortSpy.mockRestore();
