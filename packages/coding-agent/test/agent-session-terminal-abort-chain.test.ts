@@ -521,22 +521,21 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		expect(session.agent.snapshotQueues().followUp).toHaveLength(0);
 	}, 20_000);
 	it("terminal abort preserves client steering admitted after the abort snapshot", async () => {
-		// Review thread P1: when a terminal abort has been admitted but is still
-		// awaiting its durable transaction, a client turn.prompt/steer can be
-		// accepted and queued as steering. It is an independent root-turn
-		// request whose acceptance was already acknowledged, so the abort must
-		// preserve it instead of purging every steering message — clearing it
-		// would leave its reconciliation record accepted indefinitely.
+		// Review thread P1: a client turn.prompt/steer accepted while the abort
+		// is in flight (past its snapshot) is an independent root-turn request
+		// whose acceptance was already acknowledged, so the abort must preserve
+		// it instead of purging every steering message — clearing it would
+		// leave its reconciliation record accepted indefinitely.
 		scriptedResponses = [stopReply("ok")];
 		await session.prompt("first turn");
-		await session.sendUserMessage("client steer", { deliverAs: "steer" });
-		expect(session.agent.hasQueuedSteering()).toBe(true);
-		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
+		const abortPromise = session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
 			graceMs: 2_000,
 			terminal: { scope: "turn" },
 		});
-		// The client steering survives the abort; only the aborted turn's own
-		// steering continuations are purged.
+		// Queue the client steer AFTER the abort began (past its snapshot): it
+		// survives the purge.
+		await session.sendUserMessage("client steer", { deliverAs: "steer" });
+		await abortPromise;
 		expect(session.agent.hasQueuedSteering()).toBe(true);
 		const queues = session.agent.snapshotQueues();
 		expect(
@@ -545,6 +544,23 @@ describe("terminal abort registers a turn scope so left-running owned work class
 					((message as { content?: unknown }).content as Array<{ text?: string }>)[0]?.text === "client steer",
 			),
 		).toBe(true);
+	}, 20_000);
+
+	it("terminal abort blocks client steering admitted before the abort snapshot", async () => {
+		// Review thread P1: an SDK steer queued BEFORE the terminal abort begins
+		// is an accepted-pre-close continuation of the aborted attempt, which
+		// the terminal-abort contract requires to be blocked — the abort exits
+		// the loop and only rearms follow-ups, so a stale steer would otherwise
+		// remain queued and alter the next prompt.
+		scriptedResponses = [stopReply("ok")];
+		await session.prompt("first turn");
+		await session.sendUserMessage("pre-abort steer", { deliverAs: "steer" });
+		expect(session.agent.hasQueuedSteering()).toBe(true);
+		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
+			graceMs: 2_000,
+			terminal: { scope: "turn" },
+		});
+		expect(session.agent.hasQueuedSteering()).toBe(false);
 	}, 20_000);
 
 	it("terminal abort rearms an external-only follow-up past the terminal fence as a fresh turn", async () => {

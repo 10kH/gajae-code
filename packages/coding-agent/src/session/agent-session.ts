@@ -2006,12 +2006,23 @@ export class AgentSession {
 	/** SDK-owned follow-ups held outside Agent's live queue until the active run ends. */
 	#deferredSdkFollowUps: AgentMessage[] = [];
 	// Client/SDK steering (turn.prompt diverted to steer while streaming, or an
-	// explicit turn.steer) is an independent root-turn request: a terminal abort
-	// admitted earlier must never purge it, or the acknowledged submission would
-	// never run and its reconciliation record would stay accepted indefinitely
-	// (review thread P1).
+	// explicit turn.steer) is an independent root-turn request ONLY when it is
+	// admitted AFTER the terminal abort snapshot: a terminal abort admitted
+	// earlier must never purge it, or the acknowledged submission would never
+	// run and its reconciliation record would stay accepted indefinitely —
+	// while a steer admitted BEFORE the abort is an accepted-pre-close
+	// continuation of the aborted attempt that the contract requires to be
+	// blocked (review thread P1).
 	readonly #externalSteerMessages = new WeakSet<AgentMessage>();
-	readonly #externalSteerDisplayEntries = new Set<QueuedDisplayEntry>();
+	// The display entry set must not retain consumed entries: steering
+	// consumption only splices from #steeringMessages, so a strong set would
+	// keep every historical display entry alive for the session lifetime
+	// (review thread P2).
+	readonly #externalSteerDisplayEntries = new WeakSet<QueuedDisplayEntry>();
+	/** Monotonic steering admission sequence; the terminal abort snapshots it. */
+	#steeringAdmissionSeq = 0;
+	readonly #externalSteerAdmissionSeq = new WeakMap<AgentMessage, number>();
+	#terminalAbortSteeringSnapshot: number | undefined;
 	#queuedDisplaySequence = 0;
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: Array<{ message: CustomMessage; origin: "turn" | "external" }> = [];
@@ -10055,6 +10066,7 @@ export class AgentSession {
 		if (options?.external) {
 			this.#externalSteerMessages.add(message);
 			this.#externalSteerDisplayEntries.add(displayEntry);
+			this.#externalSteerAdmissionSeq.set(message, ++this.#steeringAdmissionSeq);
 		}
 		if (options?.claimsGenuineUserIntent) {
 			const epoch = this.#claimDeepInterviewUserIntent();
@@ -11268,12 +11280,20 @@ export class AgentSession {
 				// exit on the abort signal without polling it) so it cannot alter
 				// the next user turn (review thread P2). The follow-up queue is
 				// preserved — owned-completion resumes must still deliver.
-				// Purge only the aborted turn's own steering continuations:
-				// client/SDK steering admitted after the abort snapshot is an
+				// Snapshot the steering admission sequence BEFORE purging: only
+				// client/SDK steering admitted AFTER the abort began is an
 				// independent root-turn request whose acceptance was already
-				// acknowledged, and clearing it would leave its reconciliation
-				// record accepted indefinitely (review thread P1).
-				this.agent.removeQueuedMessages(message => !this.#externalSteerMessages.has(message));
+				// acknowledged — steering admitted BEFORE it is an
+				// accepted-pre-close continuation of the aborted attempt that the
+				// terminal-abort contract requires to be blocked (review thread
+				// P1).
+				this.#terminalAbortSteeringSnapshot = this.#steeringAdmissionSeq;
+				const admittedAfterSnapshot = (message: AgentMessage): boolean =>
+					this.#terminalAbortSteeringSnapshot !== undefined &&
+					(this.#externalSteerAdmissionSeq.get(message) ?? 0) > this.#terminalAbortSteeringSnapshot;
+				this.agent.removeQueuedMessages(
+					message => !(this.#externalSteerMessages.has(message) && admittedAfterSnapshot(message)),
+				);
 				this.#steeringMessages = this.#steeringMessages.filter(
 					entry => !this.#externalSteerDisplayEntries.has(entry),
 				);
@@ -11286,8 +11306,15 @@ export class AgentSession {
 				this.agent.removeQueuedMessages(message => {
 					// The shared predicate also visits the steering queue: a
 					// client steer admitted after the abort snapshot must survive
-					// alongside the external follow-ups (review thread P1).
-					if (this.#externalSteerMessages.has(message)) return false;
+					// alongside the external follow-ups; pre-snapshot steering is
+					// an aborted-attempt continuation and stays blocked (review
+					// thread P1).
+					if (
+						this.#terminalAbortSteeringSnapshot !== undefined &&
+						this.#externalSteerMessages.has(message) &&
+						(this.#externalSteerAdmissionSeq.get(message) ?? 0) > this.#terminalAbortSteeringSnapshot
+					)
+						return false;
 					// An SDK/client follow-up independently requested the next root
 					// turn; it is not a continuation caused by the aborted turn.
 					if (this.#externalFollowUps.has(message)) return false;
