@@ -10,6 +10,7 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { daemonPaths } from "./daemon-paths";
 import type { SessionCreateTarget } from "./index";
 
@@ -19,6 +20,7 @@ export type TelegramAdoptionTarget = Extract<SessionCreateTarget, { kind: "exist
 export const DEFAULT_ADOPTION_INTENT_TTL_MS = 10 * 60 * 1000;
 const INTENT_FILE_SUFFIX = ".adoption-intent.json";
 const PENDING_TOPIC_FILE_SUFFIX = ".pending-topic.json";
+const MIGRATION_DIAGNOSTIC_MAX_LENGTH = 256;
 
 export interface AdoptionIntentFs {
 	mkdir(directory: string, options: { recursive: true; mode: number }): Promise<unknown>;
@@ -537,25 +539,37 @@ export class TelegramAdoptionIntentStore {
 	}
 
 	async #migrateIntentSidecar(file: string, intent: TelegramAdoptionIntent): Promise<void> {
+		const destination = adoptionIntentFilePath(this.#agentDir, intent.providerRequestKey);
 		try {
-			const destination = adoptionIntentFilePath(this.#agentDir, intent.providerRequestKey);
 			await this.#writeSidecar(destination, { version: TELEGRAM_ADOPTION_INTENT_VERSION, intent });
-			if (destination !== file) await this.#fsImpl.unlink(file).catch(() => undefined);
-		} catch {
-			// Keep a live v1 sidecar in place when migration is temporarily unavailable.
+		} catch (error) {
+			logMigrationFailure("intent", "write", error);
+			return;
+		}
+		if (destination === file) return;
+		try {
+			await this.#fsImpl.unlink(file);
+		} catch (error) {
+			logMigrationFailure("intent", "unlink", error);
 		}
 	}
 
 	async #migratePendingTopicSidecar(file: string, pendingTopic: TelegramPendingTopic): Promise<void> {
+		const destination = pendingTopicFilePath(this.#agentDir, pendingTopic.topicId);
 		try {
-			const destination = pendingTopicFilePath(this.#agentDir, pendingTopic.topicId);
 			await this.#writeSidecar(destination, {
 				version: TELEGRAM_ADOPTION_INTENT_VERSION,
 				pendingTopic,
 			});
-			if (destination !== file) await this.#fsImpl.unlink(file).catch(() => undefined);
-		} catch {
-			// Keep a live v1 sidecar in place when migration is temporarily unavailable.
+		} catch (error) {
+			logMigrationFailure("pending_topic", "write", error);
+			return;
+		}
+		if (destination === file) return;
+		try {
+			await this.#fsImpl.unlink(file);
+		} catch (error) {
+			logMigrationFailure("pending_topic", "unlink", error);
 		}
 	}
 
@@ -584,6 +598,22 @@ export class TelegramAdoptionIntentStore {
 		if (syncError) throw syncError;
 		if (closeError) throw closeError;
 	}
+}
+
+function migrationFailureMessage(error: unknown): string {
+	const message =
+		error instanceof Error ? error.message : typeof error === "string" ? error : "non-error migration failure";
+	return message.length <= MIGRATION_DIAGNOSTIC_MAX_LENGTH
+		? message
+		: `${message.slice(0, MIGRATION_DIAGNOSTIC_MAX_LENGTH - 1)}…`;
+}
+
+function logMigrationFailure(sidecar: "intent" | "pending_topic", stage: "write" | "unlink", error: unknown): void {
+	logger.warn("notifications: Telegram adoption sidecar migration failed; retaining legacy sidecar", {
+		sidecar,
+		stage,
+		error: migrationFailureMessage(error),
+	});
 }
 
 async function syncRequired(handle: AdoptionIntentFileHandle): Promise<void> {

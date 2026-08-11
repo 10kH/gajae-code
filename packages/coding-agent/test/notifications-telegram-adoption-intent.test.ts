@@ -1,7 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import * as fsSync from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 
 import { daemonPaths } from "../src/sdk/bus/daemon-paths";
 import {
@@ -39,6 +40,9 @@ class FakeFs implements AdoptionIntentFs {
 	readonly dirs = new Set<string>();
 	readonly syncedFiles = new Set<string>();
 	readonly syncedDirs = new Set<string>();
+	writeError: Error | undefined;
+	unlinkError: Error | undefined;
+	unlinkErrorFile: string | undefined;
 	async mkdir(directory: string, options: { recursive: true; mode: number }): Promise<void> {
 		this.dirs.add(directory);
 		this.modes.set(directory, options.mode);
@@ -52,6 +56,7 @@ class FakeFs implements AdoptionIntentFs {
 		return value;
 	}
 	async writeFile(file: string, data: string, options: { mode: number }): Promise<void> {
+		if (this.writeError) throw this.writeError;
 		this.files.set(file, data);
 		this.modes.set(file, options.mode);
 	}
@@ -62,6 +67,7 @@ class FakeFs implements AdoptionIntentFs {
 		this.files.set(to, value);
 	}
 	async unlink(file: string): Promise<void> {
+		if (this.unlinkError && this.unlinkErrorFile === file) throw this.unlinkError;
 		if (!this.files.delete(file)) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
 	}
 	async readdir(directory: string): Promise<readonly string[]> {
@@ -85,6 +91,39 @@ class FakeFs implements AdoptionIntentFs {
 
 function store(fake: FakeFs, now = 1_000): TelegramAdoptionIntentStore {
 	return new TelegramAdoptionIntentStore({ agentDir: AGENT, fs: fake, now: () => now });
+}
+
+function seedLegacyIntent(fake: FakeFs): string {
+	const file = path.join(daemonPaths(AGENT).dir, "legacy-intent.adoption-intent.json");
+	fake.dirs.add(daemonPaths(AGENT).dir);
+	fake.files.set(
+		file,
+		JSON.stringify({
+			version: 1,
+			intent: {
+				intendedSessionId: "legacy-session",
+				topicId: 17,
+				chatId: "42",
+				target: TARGET,
+				createdAt: 1_000,
+				expiresAt: 2_000,
+			},
+		}),
+	);
+	return file;
+}
+
+function seedLegacyPendingTopic(fake: FakeFs, filename = "17.pending-topic.json"): string {
+	const file = path.join(daemonPaths(AGENT).dir, filename);
+	fake.dirs.add(daemonPaths(AGENT).dir);
+	fake.files.set(
+		file,
+		JSON.stringify({
+			version: 1,
+			pendingTopic: { topicId: 17, chatId: "42", createdAt: 1_000, expiresAt: 2_000 },
+		}),
+	);
+	return file;
 }
 
 describe("Telegram provider-local adoption reservations", () => {
@@ -131,6 +170,128 @@ describe("Telegram provider-local adoption reservations", () => {
 		expect(reader.byProviderRequestKey("telegram:42:19")).toBeUndefined();
 		expect(await reader.rehydrate()).toBe(1);
 		expect(reader.bySession("broker-session-19")?.topicId).toBe(19);
+	});
+
+	test("migrates a v1 intent sidecar to the provider-keyed v2 record", async () => {
+		const fake = new FakeFs();
+		const legacyFile = seedLegacyIntent(fake);
+		const intents = store(fake);
+		const destination = adoptionIntentFilePath(AGENT, "legacy:v1:legacy-session");
+
+		expect(await intents.rehydrate()).toBe(1);
+		expect(intents.byProviderRequestKey("legacy:v1:legacy-session")?.topicId).toBe(17);
+		expect(fake.files.has(legacyFile)).toBe(false);
+		expect(JSON.parse(fake.files.get(destination) ?? "{}")).toMatchObject({
+			version: 2,
+			intent: { providerRequestKey: "legacy:v1:legacy-session" },
+		});
+	});
+
+	test("logs a bounded diagnostic and retains a v1 intent sidecar when migration write fails", async () => {
+		const fake = new FakeFs();
+		const legacyFile = seedLegacyIntent(fake);
+		const intents = store(fake);
+		fake.writeError = new Error(`migration write failed: ${"x".repeat(300)}`);
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			expect(await intents.rehydrate()).toBe(1);
+			expect(intents.byProviderRequestKey("legacy:v1:legacy-session")?.topicId).toBe(17);
+			expect(fake.files.get(legacyFile)).toContain('"version":1');
+			expect(fake.files.has(adoptionIntentFilePath(AGENT, "legacy:v1:legacy-session"))).toBe(false);
+			expect(warning).toHaveBeenLastCalledWith(
+				"notifications: Telegram adoption sidecar migration failed; retaining legacy sidecar",
+				expect.objectContaining({ sidecar: "intent", stage: "write" }),
+			);
+			const error = warning.mock.calls[0]?.[1]?.error;
+			expect(typeof error).toBe("string");
+			expect((error as string).length).toBeLessThanOrEqual(256);
+		} finally {
+			warning.mockRestore();
+		}
+	});
+
+	test("logs and retains a v1 intent sidecar when migration source unlink fails", async () => {
+		const fake = new FakeFs();
+		const legacyFile = seedLegacyIntent(fake);
+		const intents = store(fake);
+		fake.unlinkErrorFile = legacyFile;
+		fake.unlinkError = new Error("migration unlink failed");
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			expect(await intents.rehydrate()).toBe(1);
+			expect(fake.files.get(legacyFile)).toContain('"version":1');
+			expect(
+				JSON.parse(fake.files.get(adoptionIntentFilePath(AGENT, "legacy:v1:legacy-session")) ?? "{}"),
+			).toMatchObject({ version: 2 });
+			expect(warning).toHaveBeenLastCalledWith(
+				"notifications: Telegram adoption sidecar migration failed; retaining legacy sidecar",
+				expect.objectContaining({ sidecar: "intent", stage: "unlink", error: "migration unlink failed" }),
+			);
+		} finally {
+			warning.mockRestore();
+		}
+	});
+
+	test("migrates a v1 pending-topic sidecar to the canonical v2 record", async () => {
+		const fake = new FakeFs();
+		seedLegacyPendingTopic(fake);
+		const intents = store(fake);
+		const destination = pendingTopicFilePath(AGENT, 17);
+
+		expect(await intents.rehydrate()).toBe(1);
+		expect(intents.hasPendingTopic(17, "42")).toBe(true);
+		expect(JSON.parse(fake.files.get(destination) ?? "{}")).toMatchObject({
+			version: 2,
+			pendingTopic: { topicId: 17 },
+		});
+	});
+
+	test("logs and retains a v1 pending-topic sidecar when migration write fails", async () => {
+		const fake = new FakeFs();
+		const legacyFile = seedLegacyPendingTopic(fake);
+		const intents = store(fake);
+		fake.writeError = new Error("pending migration write failed");
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			expect(await intents.rehydrate()).toBe(1);
+			expect(intents.hasPendingTopic(17, "42")).toBe(true);
+			expect(fake.files.get(legacyFile)).toContain('"version":1');
+			expect(JSON.parse(fake.files.get(pendingTopicFilePath(AGENT, 17)) ?? "{}")).toMatchObject({ version: 1 });
+			expect(warning).toHaveBeenLastCalledWith(
+				"notifications: Telegram adoption sidecar migration failed; retaining legacy sidecar",
+				expect.objectContaining({
+					sidecar: "pending_topic",
+					stage: "write",
+					error: "pending migration write failed",
+				}),
+			);
+		} finally {
+			warning.mockRestore();
+		}
+	});
+
+	test("logs and retains a v1 pending-topic sidecar when migration source unlink fails", async () => {
+		const fake = new FakeFs();
+		const legacyFile = seedLegacyPendingTopic(fake, "017.pending-topic.json");
+		const intents = store(fake);
+		fake.unlinkErrorFile = legacyFile;
+		fake.unlinkError = new Error("pending migration unlink failed");
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			expect(await intents.rehydrate()).toBe(1);
+			expect(fake.files.get(legacyFile)).toContain('"version":1');
+			expect(JSON.parse(fake.files.get(pendingTopicFilePath(AGENT, 17)) ?? "{}")).toMatchObject({ version: 2 });
+			expect(warning).toHaveBeenLastCalledWith(
+				"notifications: Telegram adoption sidecar migration failed; retaining legacy sidecar",
+				expect.objectContaining({
+					sidecar: "pending_topic",
+					stage: "unlink",
+					error: "pending migration unlink failed",
+				}),
+			);
+		} finally {
+			warning.mockRestore();
+		}
 	});
 
 	test("pending topic authorization remains separate from adoption reservation", async () => {
