@@ -3163,6 +3163,17 @@ function managedFileSnapshotEquals(left: ManagedFileSnapshot | null, right: Mana
 		left.bytes.equals(right.bytes)
 	);
 }
+
+function managedFileSnapshotMatchesDescriptor(snapshot: ManagedFileSnapshot, descriptor: DescriptorSnapshot): boolean {
+	return (
+		snapshot.identity.dev === descriptor.dev &&
+		snapshot.identity.ino === descriptor.ino &&
+		snapshot.identity.nlink === descriptor.nlink &&
+		snapshot.identity.size === descriptor.size &&
+		snapshot.identity.mtimeNs === descriptor.mtimeNs &&
+		snapshot.identity.ctimeNs === descriptor.ctimeNs
+	);
+}
 const trustedSessionDestinations = new WeakSet<SessionDestination>();
 const explicitProfileAgentDirs = new WeakMap<SessionDestination, string>();
 const managedSecurityPolicies = new WeakMap<ManagedSessionSecurityContext, ManagedSessionSecurityPolicy>();
@@ -18184,7 +18195,8 @@ export class SessionManager {
 				if (
 					!retainedFallbackSnapshot ||
 					!terminalDescriptor ||
-					!sameDescriptor(boundedSource.descriptor, terminalDescriptor)
+					!sameDescriptor(boundedSource.descriptor, terminalDescriptor) ||
+					!managedFileSnapshotMatchesDescriptor(retainedFallbackSnapshot, boundedSource.descriptor)
 				)
 					throw new Error("source_changed");
 			}
@@ -18194,7 +18206,13 @@ export class SessionManager {
 		if (sourceSize === undefined) throw new Error("Managed source size unavailable");
 		if (sourceSize > eagerHydrationMaxBytes()) throw new SessionTranscriptOversizedError(sourceSize);
 		const forkEntries = retainedFallbackSnapshot
-			? parseSessionEntries(new TextDecoder("utf-8", { fatal: true }).decode(retainedFallbackSnapshot.bytes))
+			? (() => {
+					const entries = parseSessionEntries(
+						new TextDecoder("utf-8", { fatal: true }).decode(retainedFallbackSnapshot.bytes),
+					);
+					const header = entries[0] as SessionHeader | undefined;
+					return header?.type === "session" && typeof header.id === "string" ? entries : [];
+				})()
 			: await loadEntriesFromFile(managedSourcePath, storage);
 		migrateToCurrentVersion(forkEntries);
 		await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
