@@ -136,7 +136,10 @@ async function withFakeTransport(run: (clock: FakeClock) => Promise<void>): Prom
 	}
 }
 
-const flush = () => new Promise<void>(resolve => queueMicrotask(resolve));
+const flush = async () => {
+	await new Promise<void>(resolve => queueMicrotask(resolve));
+	await new Promise<void>(resolve => queueMicrotask(resolve));
+};
 
 async function connect(client: SdkClient, connectionId = "connection"): Promise<FakeWebSocket> {
 	const pending = client.connect();
@@ -179,6 +182,633 @@ test("SdkClient gates requests on hello and correlates success and typed errors"
 		});
 		await expect(failed).rejects.toBeInstanceOf(SdkClientError);
 		await expect(failed).rejects.toMatchObject({ code: "unknown_operation", message: "missing" });
+		await client.close();
+	});
+});
+
+const invalidDurableInputs = [
+	{
+		create: { unsupported: true },
+		createIdempotencyKey: "create-key",
+		submission: { kind: "prompt", text: "hello", clientRef: "work" },
+	},
+	{
+		create: {},
+		createIdempotencyKey: "create-key",
+		timeoutMs: 0,
+		submission: { kind: "prompt", text: "hello", clientRef: "work" },
+	},
+	{
+		create: {},
+		createIdempotencyKey: "create-key",
+		replaySinceSeq: -1,
+		submission: { kind: "prompt", text: "hello", clientRef: "work" },
+	},
+	{
+		create: {},
+		createIdempotencyKey: "create-key",
+		submission: { kind: "prompt", text: "hello", name: "mixed", clientRef: "work" },
+	},
+	{
+		create: {},
+		createIdempotencyKey: "create-key",
+		submission: { kind: "prompt", text: "hello", clientRef: " invalid " },
+	},
+];
+
+test("createConnectSubscribeSubmit rejects invalid durable inputs before broker traffic", async () => {
+	await withFakeTransport(async () => {
+		for (const input of invalidDurableInputs) {
+			const client = new SdkClient("ws://sdk.test", "token");
+			await expect(client.createConnectSubscribeSubmit(input as never)).resolves.toMatchObject({
+				kind: "failed",
+				error: { code: "invalid_input" },
+			});
+			await client.close();
+		}
+		expect(FakeWebSocket.instances).toHaveLength(0);
+	});
+});
+test("createConnectSubscribeSubmit accepts long and trailing-newline prompt text", async () => {
+	await withFakeTransport(async () => {
+		for (const text of ["x".repeat(129), "realistic prompt text\n"]) {
+			const client = new SdkClient("ws://sdk.test", "token");
+			const pending = client.createConnectSubscribeSubmit({
+				create: {},
+				createIdempotencyKey: "create-key",
+				submission: { kind: "prompt", text, clientRef: "prompt-work" },
+			});
+			await flush();
+			expect(FakeWebSocket.instances).toHaveLength(1);
+			await client.close();
+			await expect(pending).resolves.toMatchObject({ kind: "create_uncertain" });
+			FakeWebSocket.instances = [];
+		}
+	});
+});
+
+test("createConnectSubscribeSubmit replays and writes one prompt on the validated endpoint incarnation", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });
+		const pending = client.createConnectSubscribeSubmit({
+			create: { cwd: "/repo", readiness: "immediate", target: { worktree: { name: "work" } } },
+			createIdempotencyKey: "create-identity",
+			submission: { kind: "prompt", text: "hello", clientRef: "prompt-work" },
+		});
+		const broker = FakeWebSocket.instances[0]!;
+		broker.open();
+		broker.message({ type: "hello", connectionId: "broker" });
+		await flush();
+		const create = sent(broker);
+		expect(create).toMatchObject({
+			type: "broker_request",
+			operation: "session.create",
+			idempotencyKey: "create-identity",
+		});
+		broker.message({ type: "broker_response", id: create.id, ok: true, result: { sessionId: "session-1" } });
+		await flush();
+		const endpointRequest = sent(broker, 1);
+		broker.message({
+			type: "broker_response",
+			id: endpointRequest.id,
+			ok: true,
+			result: { url: "ws://endpoint.test", token: "endpoint-token", generation: 1 },
+		});
+		await flush();
+		const endpoint = FakeWebSocket.instances[1]!;
+		endpoint.open();
+		endpoint.message({ type: "hello", connectionId: "endpoint-a" });
+		await flush();
+		const replay = sent(endpoint);
+		expect(replay).toMatchObject({ type: "event_replay", sinceGeneration: 1, sinceSeq: 0 });
+		endpoint.message({ type: "event", generation: 1, seq: 1, name: "session_ready" });
+		endpoint.message({
+			type: "event_replay_result",
+			id: replay.id,
+			ok: true,
+			generation: 1,
+			lastSeq: 2,
+			events: [{ type: "event", generation: 1, seq: 1, name: "session_ready" }],
+		});
+		await flush();
+		const control = sent(endpoint, 1);
+		expect(control).toMatchObject({
+			type: "control_request",
+			operation: "turn.prompt",
+			input: { text: "hello", clientRef: "prompt-work" },
+		});
+		endpoint.message({
+			type: "control_response",
+			id: control.id,
+			ok: true,
+			result: { commandId: "command-1", turnId: "turn-1" },
+		});
+		const result = await pending;
+		expect(result).toMatchObject({ kind: "accepted", sessionId: "session-1" });
+		expect(result.kind === "accepted" && "create" in result.identity).toBe(false);
+		expect(endpoint.sent.filter(value => JSON.parse(value).type === "control_request")).toHaveLength(1);
+		await client.close();
+	});
+});
+
+test("createConnectSubscribeSubmit never sends after replay incarnation closes before control write", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });
+		const pending = client.createConnectSubscribeSubmit({
+			create: { cwd: "/repo" },
+			createIdempotencyKey: "create-identity",
+			submission: { kind: "skill", name: "review", clientRef: "skill-work" },
+		});
+		const broker = FakeWebSocket.instances[0]!;
+		broker.open();
+		broker.message({ type: "hello", connectionId: "broker" });
+		await flush();
+		const create = sent(broker);
+		broker.message({ type: "broker_response", id: create.id, ok: true, result: { sessionId: "session-1" } });
+		await flush();
+		const endpointRequest = sent(broker, 1);
+		broker.message({
+			type: "broker_response",
+			id: endpointRequest.id,
+			ok: true,
+			result: { url: "ws://endpoint.test", token: "endpoint-token" },
+		});
+		await flush();
+		const endpoint = FakeWebSocket.instances[1]!;
+		endpoint.open();
+		endpoint.message({ type: "hello", connectionId: "endpoint-a" });
+		await flush();
+		const replay = sent(endpoint);
+		endpoint.message({ type: "event_replay_result", id: replay.id, ok: true, generation: 1, lastSeq: 0, events: [] });
+		endpoint.readyState = FakeWebSocket.CLOSED;
+		endpoint.emit("close");
+		await expect(pending).resolves.toMatchObject({
+			kind: "attachment_uncertain",
+			nextLegalLookupAction: "reconcileCreateConnectSubmit",
+			prohibitResubmission: true,
+		});
+		expect(endpoint.sent.filter(value => JSON.parse(value).type === "control_request")).toHaveLength(0);
+		await client.close();
+	});
+});
+
+test("createConnectSubscribeSubmit rejects replay generation resets and sequence gaps without ordered control", async () => {
+	for (const replayResult of [
+		{ gap: { kind: "generation_reset", fromGeneration: 1, toGeneration: 2 }, generation: 2, lastSeq: 0, events: [] },
+		{ gap: { kind: "sequence_gap", fromSeq: 1, toSeq: 2 }, generation: 1, lastSeq: 2, events: [] },
+	]) {
+		await withFakeTransport(async () => {
+			const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });
+			const pending = client.createConnectSubscribeSubmit({
+				create: { cwd: "/repo" },
+				createIdempotencyKey: "create-identity",
+				submission: { kind: "prompt", text: "hello", clientRef: "prompt-work" },
+			});
+			const broker = FakeWebSocket.instances[0]!;
+			broker.open();
+			broker.message({ type: "hello", connectionId: "broker" });
+			await flush();
+			const create = sent(broker);
+			broker.message({ type: "broker_response", id: create.id, ok: true, result: { sessionId: "session-1" } });
+			await flush();
+			const endpointRequest = sent(broker, 1);
+			broker.message({
+				type: "broker_response",
+				id: endpointRequest.id,
+				ok: true,
+				result: { url: "ws://endpoint.test", token: "endpoint-token" },
+			});
+			await flush();
+			const endpoint = FakeWebSocket.instances[1]!;
+			endpoint.open();
+			endpoint.message({ type: "hello", connectionId: "endpoint-a" });
+			await flush();
+			const replay = sent(endpoint);
+			endpoint.message({ type: "event_replay_result", id: replay.id, ok: true, ...replayResult });
+			await expect(pending).resolves.toMatchObject({ kind: "subscription_uncertain", prohibitResubmission: true });
+			expect(endpoint.sent.filter(value => JSON.parse(value).type === "control_request")).toHaveLength(0);
+			await client.close();
+		});
+	}
+});
+
+test("createConnectSubscribeSubmit permits capability-gated global replay gaps on the validated incarnation", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });
+		const pending = client.createConnectSubscribeSubmit({
+			create: { cwd: "/repo" },
+			createIdempotencyKey: "create-identity",
+			submission: { kind: "prompt", text: "hello", clientRef: "prompt-work" },
+		});
+		const broker = FakeWebSocket.instances[0]!;
+		broker.open();
+		broker.message({ type: "hello", connectionId: "broker" });
+		await flush();
+		const create = sent(broker);
+		broker.message({ type: "broker_response", id: create.id, ok: true, result: { sessionId: "session-1" } });
+		await flush();
+		const endpointRequest = sent(broker, 1);
+		broker.message({
+			type: "broker_response",
+			id: endpointRequest.id,
+			ok: true,
+			result: { url: "ws://endpoint.test", token: "endpoint-token" },
+		});
+		await flush();
+		const endpoint = FakeWebSocket.instances[1]!;
+		endpoint.open();
+		endpoint.message({ type: "hello", connectionId: "endpoint-a" });
+		await flush();
+		const replay = sent(endpoint);
+		endpoint.message({ type: "event", generation: 1, seq: 2, name: "live" });
+		endpoint.message({ type: "event_replay_result", id: replay.id, ok: true, generation: 1, lastSeq: 2, events: [] });
+		await flush();
+		const control = sent(endpoint, 1);
+		expect(control).toMatchObject({ type: "control_request", operation: "turn.prompt" });
+		endpoint.message({ type: "control_response", id: control.id, ok: true, result: { commandId: "command-1" } });
+		await expect(pending).resolves.toMatchObject({ kind: "accepted" });
+		expect(endpoint.sent.filter(value => JSON.parse(value).type === "control_request")).toHaveLength(1);
+		await client.close();
+	});
+});
+
+test("durable recovery identity never carries create material or MCP credentials from any source", async () => {
+	await withFakeTransport(async () => {
+		// Secrets in every credential form the broker accepts: HTTP/SSE URL
+		// userinfo, URL query params, stdio args, env, and headers.
+		const urlUserinfoSecret = "TEST_URL_USERINFO_TOKEN";
+		const urlQuerySecret = "TEST_URL_QUERY_TOKEN";
+		const stdioArgsSecret = "TEST_STDIO_ARGS_TOKEN";
+		const envSecret = "TEST_ONLY_MCP_ENV_SECRET";
+		const headerSecret = "TEST_ONLY_MCP_AUTH_SECRET";
+		const allSecrets = [urlUserinfoSecret, urlQuerySecret, stdioArgsSecret, envSecret, headerSecret];
+		const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });
+		const pending = client.createConnectSubscribeSubmit({
+			create: {
+				cwd: "/repo",
+				mcpServers: [
+					{
+						type: "http",
+						name: "remote-with-userinfo",
+						url: `https://user:${urlUserinfoSecret}@mcp.test?api_key=${urlQuerySecret}`,
+						headers: { Authorization: `Bearer ${headerSecret}` },
+					},
+					{
+						type: "stdio",
+						name: "stdio-with-args-secret",
+						command: "/usr/local/bin/mcp-runner",
+						args: ["--token", stdioArgsSecret],
+						env: { MCP_TOKEN: envSecret },
+					},
+				],
+			},
+			createIdempotencyKey: "create-identity",
+			submission: { kind: "prompt", text: "hello", clientRef: "prompt-work" },
+		});
+		const broker = FakeWebSocket.instances[0]!;
+		broker.open();
+		broker.message({ type: "hello", connectionId: "broker" });
+		await flush();
+		const create = sent(broker);
+		// The broker receives the full create with secrets intact.
+		expect((create.input as Record<string, unknown[]>).mcpServers).toHaveLength(2);
+		broker.message({
+			type: "broker_response",
+			id: create.id,
+			ok: true,
+			result: { sessionId: "session-1", generation: 1 },
+		});
+		await flush();
+		const endpointRequest = sent(broker, 1);
+		broker.message({ type: "broker_response", id: endpointRequest.id, ok: true, result: {} });
+		const result = await pending;
+		expect(result).toMatchObject({ kind: "attachment_uncertain", identity: { sessionId: "session-1" } });
+		// No secret from any credential form appears in the serialized result.
+		const serialized = JSON.stringify(result);
+		for (const secret of allSecrets) expect(serialized).not.toContain(secret);
+		if (result.kind === "failed") throw new Error("Expected recovery identity");
+		// The identity carries no create field at all — no replay material.
+		expect("create" in result.identity).toBe(false);
+		expect("createRedacted" in result.identity).toBe(false);
+		// Recovery from an identity with a sessionId goes directly to endpoint
+		// lookup; the create option is accepted but not needed for this path.
+		const recovery = client.reconcileCreateConnectSubmit(result.identity, {
+			create: {
+				cwd: "/repo",
+				mcpServers: [
+					{
+						type: "http",
+						name: "remote-with-userinfo",
+						url: `https://user:${urlUserinfoSecret}@mcp.test?api_key=${urlQuerySecret}`,
+						headers: { Authorization: `Bearer ${headerSecret}` },
+					},
+					{
+						type: "stdio",
+						name: "stdio-with-args-secret",
+						command: "/usr/local/bin/mcp-runner",
+						args: ["--token", stdioArgsSecret],
+						env: { MCP_TOKEN: envSecret },
+					},
+				],
+			},
+		});
+		await flush();
+		const recoveryEndpoint = sent(broker, 2);
+		expect(recoveryEndpoint).toMatchObject({
+			type: "broker_request",
+			operation: "session.get_endpoint",
+			input: { sessionId: "session-1" },
+		});
+		broker.message({
+			type: "broker_response",
+			id: recoveryEndpoint.id,
+			ok: true,
+			result: { url: "ws://endpoint.test", token: "endpoint-token", generation: 1 },
+		});
+		await flush();
+		const endpoint = FakeWebSocket.instances[1]!;
+		endpoint.open();
+		endpoint.message({ type: "hello", connectionId: "endpoint-a" });
+		await flush();
+		const replay = sent(endpoint);
+		endpoint.message({ type: "event_replay_result", id: replay.id, ok: true, generation: 1, lastSeq: 0, events: [] });
+		await flush();
+		const status = sent(endpoint, 1);
+		endpoint.message({ type: "query_response", id: status.id, ok: true, result: { status: "unknown" } });
+		const reconciled = await recovery;
+		expect(reconciled).toMatchObject({ kind: "reconciled", status: { status: "unknown" } });
+		const reconciledSerialized = JSON.stringify(reconciled);
+		for (const secret of allSecrets) expect(reconciledSerialized).not.toContain(secret);
+		await client.close();
+	});
+});
+
+test("durable recovery identity rejects nested, encoded, and duplicate credential forms in serialized output", async () => {
+	await withFakeTransport(async () => {
+		// Percent-encoded userinfo, base64 token in args, duplicate credential
+		// across URL query and headers, and nested env values.
+		const encodedUserinfoSecret = "TEST_ENCODED_USERINFO_SECRET";
+		const base64ArgsSecret = "TEST_BASE64_ARGS_SECRET";
+		const duplicateQuerySecret = "TEST_DUP_QUERY_SECRET";
+		const nestedEnvSecret = "TEST_NESTED_ENV_SECRET";
+		const allSecrets = [encodedUserinfoSecret, base64ArgsSecret, duplicateQuerySecret, nestedEnvSecret];
+		const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });
+		const pending = client.createConnectSubscribeSubmit({
+			create: {
+				cwd: "/repo",
+				mcpServers: [
+					{
+						type: "sse",
+						name: "encoded-userinfo",
+						url: `https://user%3A${encodedUserinfoSecret}@mcp-sse.test`,
+						headers: { "X-Api-Key": duplicateQuerySecret },
+					},
+					{
+						type: "stdio",
+						name: "base64-args",
+						command: "/opt/mcp/server",
+						args: ["--auth", Buffer.from(base64ArgsSecret).toString("base64")],
+						env: { NESTED_KEY: nestedEnvSecret },
+					},
+					{
+						type: "http",
+						name: "dup-query",
+						url: `https://mcp-dup.test?key=${duplicateQuerySecret}`,
+					},
+				],
+			},
+			createIdempotencyKey: "create-encoded-identity",
+			submission: { kind: "skill", name: "review", clientRef: "skill-work" },
+		});
+		const broker = FakeWebSocket.instances[0]!;
+		broker.open();
+		broker.message({ type: "hello", connectionId: "broker" });
+		await flush();
+		const create = sent(broker);
+		broker.message({
+			type: "broker_response",
+			id: create.id,
+			ok: false,
+			error: { code: "invalid_input", message: `Rejected ${allSecrets.join(", ")}` },
+		});
+		const result = await pending;
+		expect(result).toMatchObject({ kind: "failed", error: { code: "invalid_input" } });
+		const serialized = JSON.stringify(result);
+		for (const secret of allSecrets) expect(serialized).not.toContain(secret);
+		if (result.kind === "failed" && result.identity) {
+			expect("create" in result.identity).toBe(false);
+		}
+		await client.close();
+	});
+});
+
+test("reconcileCreateConnectSubmit reports create_uncertain without create replay material", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token");
+		const result = await client.reconcileCreateConnectSubmit({
+			version: 1,
+			operation: "session.create",
+			createIdempotencyKey: "create-key",
+			submission: { kind: "prompt", clientRef: "work" },
+		});
+		expect(result).toMatchObject({
+			kind: "create_uncertain",
+			nextLegalLookupAction: "reconcileCreateConnectSubmit",
+			prohibitResubmission: true,
+		});
+		expect(FakeWebSocket.instances).toHaveLength(0);
+		await client.close();
+	});
+});
+
+test("reconcileCreateConnectSubmit rejects malformed recovery identities before broker traffic", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token");
+		const result = await client.reconcileCreateConnectSubmit({
+			version: 1,
+			operation: "session.create",
+			createIdempotencyKey: "create-key",
+			submission: { kind: "not-a-submission", clientRef: "work" },
+		} as never);
+		expect(result).toMatchObject({ kind: "failed", error: { code: "invalid_input" } });
+		expect(FakeWebSocket.instances).toHaveLength(0);
+		await client.close();
+	});
+});
+
+test("durable create errors never serialize MCP credential values", async () => {
+	await withFakeTransport(async () => {
+		const envSecret = "TEST_ONLY_MCP_ENV_ERROR_SECRET";
+		const headerSecret = "TEST_ONLY_MCP_AUTH_ERROR_SECRET";
+		const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });
+		const pending = client.createConnectSubscribeSubmit({
+			create: {
+				cwd: "/repo",
+				mcpServers: [
+					{
+						type: "http",
+						name: "remote",
+						url: "https://mcp.test",
+						headers: { Authorization: `Bearer ${headerSecret}` },
+					},
+					{
+						type: "stdio",
+						name: "local",
+						command: "/usr/local/bin/mcp",
+						args: [],
+						env: { MCP_TOKEN: envSecret },
+					},
+				],
+			},
+			createIdempotencyKey: "create-error-identity",
+			submission: { kind: "prompt", text: "hello", clientRef: "prompt-error-work" },
+		});
+		const broker = FakeWebSocket.instances[0]!;
+		broker.open();
+		broker.message({ type: "hello", connectionId: "broker" });
+		await flush();
+		const create = sent(broker);
+		broker.message({
+			type: "broker_response",
+			id: create.id,
+			ok: false,
+			error: { code: "invalid_input", message: `Rejected ${envSecret} and ${headerSecret}` },
+		});
+		const result = await pending;
+		expect(result).toMatchObject({ kind: "failed", error: { code: "invalid_input" } });
+		const serialized = JSON.stringify(result);
+		expect(serialized).not.toContain(envSecret);
+		expect(serialized).not.toContain(headerSecret);
+		await client.close();
+	});
+});
+
+/** Recovery must replay exactly what the broker hashed, never a redacted subset. */
+test("reconcileCreateConnectSubmit replays unknown create fields only by rejecting them before creation", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token");
+		const result = await client.createConnectSubscribeSubmit({
+			create: { cwd: "/repo", unknown: "would-change-broker-hash" },
+			createIdempotencyKey: "create-key",
+			submission: { kind: "prompt", text: "hello", clientRef: "work" },
+		});
+		expect(result).toMatchObject({ kind: "failed", error: { code: "invalid_input" } });
+		expect(FakeWebSocket.instances).toHaveLength(0);
+		await client.close();
+	});
+});
+test("reconcileCreateConnectSubmit queries status despite a replay gap and never submits ordered work", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });
+		const pending = client.reconcileCreateConnectSubmit(
+			{
+				version: 1,
+				operation: "session.create",
+				createIdempotencyKey: "create-identity",
+				submission: { kind: "skill", clientRef: "skill-work" },
+			},
+			{ create: { cwd: "/repo" } },
+		);
+		const broker = FakeWebSocket.instances[0]!;
+		broker.open();
+		broker.message({ type: "hello", connectionId: "broker" });
+		await flush();
+		const create = sent(broker);
+		expect(create).toMatchObject({
+			type: "broker_request",
+			operation: "session.create",
+			idempotencyKey: "create-identity",
+		});
+		broker.message({
+			type: "broker_response",
+			id: create.id,
+			ok: true,
+			result: { sessionId: "session-1", generation: 1 },
+		});
+		await flush();
+		const endpointRequest = sent(broker, 1);
+		expect(endpointRequest).toMatchObject({
+			type: "broker_request",
+			operation: "session.get_endpoint",
+			input: { sessionId: "session-1", endpointGeneration: 1 },
+		});
+		broker.message({
+			type: "broker_response",
+			id: endpointRequest.id,
+			ok: true,
+			result: { url: "ws://endpoint.test", token: "endpoint-token", generation: 1 },
+		});
+		await flush();
+		const endpoint = FakeWebSocket.instances[1]!;
+		endpoint.open();
+		endpoint.message({ type: "hello", connectionId: "endpoint-a" });
+		await flush();
+		const replay = sent(endpoint);
+		endpoint.message({
+			type: "event_replay_result",
+			id: replay.id,
+			ok: true,
+			generation: 1,
+			lastSeq: 2,
+			gap: { kind: "sequence_gap", fromSeq: 1, toSeq: 2 },
+			events: [],
+		});
+		await flush();
+		const status = sent(endpoint, 1);
+		expect(status).toMatchObject({
+			type: "query_request",
+			query: "skill.invoke_status",
+			input: { clientRef: "skill-work" },
+		});
+		expect(endpoint.sent.filter(value => JSON.parse(value).type === "control_request")).toHaveLength(0);
+		endpoint.message({ type: "query_response", id: status.id, ok: true, result: { status: "unknown" } });
+		await expect(pending).resolves.toMatchObject({
+			kind: "reconciled",
+			identity: { sessionId: "session-1", createIdempotencyKey: "create-identity" },
+			status: { status: "unknown" },
+		});
+		await client.close();
+	});
+});
+
+test("createConnectSubscribeSubmit classifies lifecycle errors after an ordered write as uncertain", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });
+		const pending = client.createConnectSubscribeSubmit({
+			create: { cwd: "/repo" },
+			createIdempotencyKey: "create-identity",
+			submission: { kind: "prompt", text: "hello", clientRef: "prompt-work" },
+		});
+		const broker = FakeWebSocket.instances[0]!;
+		broker.open();
+		broker.message({ type: "hello", connectionId: "broker" });
+		await flush();
+		const create = sent(broker);
+		broker.message({ type: "broker_response", id: create.id, ok: true, result: { sessionId: "session-1" } });
+		await flush();
+		const endpointRequest = sent(broker, 1);
+		broker.message({
+			type: "broker_response",
+			id: endpointRequest.id,
+			ok: true,
+			result: { url: "ws://endpoint.test", token: "endpoint-token" },
+		});
+		await flush();
+		const endpoint = FakeWebSocket.instances[1]!;
+		endpoint.open();
+		endpoint.message({ type: "hello", connectionId: "endpoint-a" });
+		await flush();
+		const replay = sent(endpoint);
+		endpoint.message({ type: "event_replay_result", id: replay.id, ok: true, generation: 1, lastSeq: 0, events: [] });
+		await flush();
+		const control = sent(endpoint, 1);
+		endpoint.message({
+			type: "control_response",
+			id: control.id,
+			ok: false,
+			error: { code: "endpoint_stale", message: "endpoint changed" },
+		});
+		await expect(pending).resolves.toMatchObject({ kind: "submission_uncertain", prohibitResubmission: true });
 		await client.close();
 	});
 });

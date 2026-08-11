@@ -56,6 +56,57 @@ export type SdkFrameHandler = (frame: SdkFrame) => void;
 export type SdkReconnectHandler = () => void;
 export type SdkReconnectFailedHandler = (error: SdkClientError) => void;
 
+/** One ordered operation submitted after durable client-side create orchestration. */
+export type SdkDurableSubmission =
+	| { kind: "prompt"; text: string; images?: unknown; clientRef: string }
+	| { kind: "skill"; name: string; args?: unknown; clientRef: string };
+
+/**
+ * Durable client-side orchestration input. The create key and submission reference
+ * are durable in their respective authorities; restart recovery reconciles them.
+ * This is not a single-authority transactional atomicity guarantee across failure.
+ */
+export interface SdkDurableCreateConnectSubmitInput {
+	create: Record<string, unknown>;
+	createIdempotencyKey: string;
+	submission: SdkDurableSubmission;
+	timeoutMs?: number;
+	replaySinceGeneration?: number;
+	replaySinceSeq?: number;
+}
+
+/** Safe, canonical recovery identity without create credentials or MCP replay material. */
+export interface SdkDurableLookupIdentity {
+	version: 1;
+	operation: "session.create";
+	createIdempotencyKey: string;
+	sessionId?: string;
+	endpointGeneration?: number;
+	endpointIncarnation?: string;
+	submission: { kind: SdkDurableSubmission["kind"]; clientRef: string };
+	commandId?: string;
+	turnId?: string;
+}
+
+/** Options for reconciling a prior durable orchestration. The create input is
+ *  supplied separately by the caller and is only used when the identity has no
+ *  sessionId; it is never stored on or serialized through the identity. */
+export interface SdkDurableReconcileOptions extends SdkRequestOptions {
+	create?: Record<string, unknown>;
+}
+
+/** Durable client-side orchestration outcome, including reconciliation-required uncertainty. */
+export type SdkDurableResult =
+	| { kind: "accepted"; sessionId: string; identity: SdkDurableLookupIdentity; receipt: Record<string, unknown> }
+	| { kind: "reconciled"; identity: SdkDurableLookupIdentity; status: Record<string, unknown> }
+	| {
+			kind: "create_uncertain" | "attachment_uncertain" | "subscription_uncertain" | "submission_uncertain";
+			identity: SdkDurableLookupIdentity;
+			nextLegalLookupAction: "reconcileCreateConnectSubmit";
+			prohibitResubmission: true;
+	  }
+	| { kind: "failed"; error: { code: SdkErrorCode; message: string }; identity?: SdkDurableLookupIdentity };
+
 type Frame = SdkFrame;
 type Cycle = {
 	readonly generation: number;
@@ -135,6 +186,211 @@ function canonicalJson(value: unknown): string {
 
 function lifecycleFingerprint(operation: string, input: unknown): string {
 	return JSON.stringify({ operation, input: JSON.parse(JSON.stringify(input)) });
+}
+
+function stringField(value: Record<string, unknown>, field: string): string | undefined {
+	const candidate = value[field];
+	return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
+}
+
+function responseResult(value: unknown): Record<string, unknown> {
+	if (!value || typeof value !== "object" || Array.isArray(value))
+		throw new SdkClientError("protocol_error", "SDK response is malformed.");
+	const frame = value as Record<string, unknown>;
+	const result = frame.result;
+	return result && typeof result === "object" && !Array.isArray(result) ? (result as Record<string, unknown>) : frame;
+}
+
+function validClientRef(value: unknown): value is string {
+	return typeof value === "string" && value.trim() === value && value.length >= 1 && value.length <= 128;
+}
+
+function validNonEmptyString(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+const durableCreateFields = new Set([
+	"cwd",
+	"path",
+	"target",
+	"stateRoot",
+	"modelPreset",
+	"mcpServers",
+	"readiness",
+	"readinessTimeoutMs",
+	"coordinatorStateDir",
+	"coordinatorSessionId",
+	"coordinatorSessionBranch",
+]);
+const durableTargetFields = new Set(["path", "stateRoot", "worktree"]);
+
+function canonicalCreate(create: Record<string, unknown>): Record<string, unknown> {
+	const canonicalize = (value: unknown, seen: Set<object>): unknown => {
+		if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+		if (typeof value === "number") {
+			if (!Number.isFinite(value)) throw new SdkClientError("invalid_input", "Create input must be JSON-safe.");
+			return value;
+		}
+		if (Array.isArray(value)) {
+			if (seen.has(value)) throw new SdkClientError("invalid_input", "Create input must not be cyclic.");
+			seen.add(value);
+			const result = value.map(item => canonicalize(item, seen));
+			seen.delete(value);
+			return result;
+		}
+		if (!isRecord(value)) throw new SdkClientError("invalid_input", "Create input must be JSON-safe.");
+		if (seen.has(value)) throw new SdkClientError("invalid_input", "Create input must not be cyclic.");
+		seen.add(value);
+		const result: Record<string, unknown> = {};
+		for (const key of Object.keys(value).sort()) result[key] = canonicalize(value[key], seen);
+		seen.delete(value);
+		return result;
+	};
+	for (const key of Object.keys(create)) {
+		if (!durableCreateFields.has(key))
+			throw new SdkClientError("invalid_input", `Unsupported session.create field: ${key}.`);
+	}
+	if (create.target !== undefined) {
+		if (!isRecord(create.target)) throw new SdkClientError("invalid_input", "Create target must be an object.");
+		for (const key of Object.keys(create.target)) {
+			if (!durableTargetFields.has(key))
+				throw new SdkClientError("invalid_input", `Unsupported session.create target field: ${key}.`);
+		}
+	}
+	return canonicalize(create, new Set()) as Record<string, unknown>;
+}
+
+function validTimeout(value: unknown): boolean {
+	return value === undefined || (typeof value === "number" && Number.isFinite(value) && value > 0);
+}
+
+function validReplayCursor(value: unknown): boolean {
+	return value === undefined || (typeof value === "number" && Number.isSafeInteger(value) && value >= 0);
+}
+
+function durableIdentity(input: SdkDurableCreateConnectSubmitInput): SdkDurableLookupIdentity {
+	if (!isRecord(input.create)) throw new SdkClientError("invalid_input", "Create input must be an object.");
+	if (!validClientRef(input.createIdempotencyKey))
+		throw new SdkClientError("invalid_input", "createIdempotencyKey must be a trimmed non-empty string.");
+	if (!validTimeout(input.timeoutMs))
+		throw new SdkClientError("invalid_input", "timeoutMs must be a positive finite number.");
+	if (!validReplayCursor(input.replaySinceGeneration) || !validReplayCursor(input.replaySinceSeq))
+		throw new SdkClientError("invalid_input", "Replay cursors must be non-negative safe integers.");
+	const submission = input.submission;
+	if (!submission || !validClientRef(submission.clientRef))
+		throw new SdkClientError("invalid_input", "clientRef must be a trimmed 1..128 character string.");
+	if (submission.kind === "prompt") {
+		if (!validNonEmptyString(submission.text) || "name" in submission || "args" in submission)
+			throw new SdkClientError("invalid_input", "Prompt submission is invalid.");
+	} else if (submission.kind === "skill") {
+		if (!validNonEmptyString(submission.name) || "text" in submission || "images" in submission)
+			throw new SdkClientError("invalid_input", "Skill submission is invalid.");
+	} else {
+		throw new SdkClientError("invalid_input", "Submission is invalid.");
+	}
+	// Validate create input shape without retaining it on the identity. The full
+	// create payload is sent to the broker on session.create; it is not stored on
+	// the public identity, which carries only non-secret lookup fields.
+	canonicalCreate(input.create);
+	return {
+		version: 1,
+		operation: "session.create",
+		createIdempotencyKey: input.createIdempotencyKey,
+		submission: { kind: submission.kind, clientRef: submission.clientRef },
+	};
+}
+function validDurableIdentity(identity: unknown): identity is SdkDurableLookupIdentity {
+	if (!isRecord(identity) || !isRecord(identity.submission)) return false;
+	return (
+		identity.version === 1 &&
+		identity.operation === "session.create" &&
+		validClientRef(identity.createIdempotencyKey) &&
+		validClientRef(identity.submission.clientRef) &&
+		(identity.submission.kind === "prompt" || identity.submission.kind === "skill")
+	);
+}
+
+function isKnownLifecycleFailure(error: SdkClientError): boolean {
+	return ["invalid_input", "idempotency_conflict", "endpoint_stale", "resource_gone", "not_found"].includes(
+		error.code,
+	);
+}
+
+function durableFailure(error: unknown, identity?: SdkDurableLookupIdentity): SdkDurableResult {
+	const typed =
+		error instanceof SdkClientError
+			? error
+			: new SdkClientError("invalid_input", "Durable orchestration input is invalid.");
+	return { kind: "failed", error: { code: typed.code, message: typed.message }, ...(identity ? { identity } : {}) };
+}
+
+function uncertain(
+	kind: Extract<SdkDurableResult, { prohibitResubmission: true }>["kind"],
+	identity: SdkDurableLookupIdentity,
+): SdkDurableResult {
+	return { kind, identity, nextLegalLookupAction: "reconcileCreateConnectSubmit", prohibitResubmission: true };
+}
+
+function replayReady(
+	replay: Record<string, unknown>,
+	liveEvents: readonly Frame[],
+	sinceGeneration: number,
+	sinceSeq: number,
+): boolean {
+	if (replay.gap !== undefined || !Array.isArray(replay.events)) return false;
+	if (
+		typeof replay.generation !== "number" ||
+		!Number.isSafeInteger(replay.generation) ||
+		replay.generation < 0 ||
+		replay.generation !== sinceGeneration ||
+		typeof replay.lastSeq !== "number" ||
+		!Number.isSafeInteger(replay.lastSeq) ||
+		replay.lastSeq < sinceSeq
+	)
+		return false;
+	for (const event of [...(replay.events as Frame[]), ...liveEvents]) {
+		if (
+			event.type !== "event" ||
+			typeof event.generation !== "number" ||
+			event.generation !== replay.generation ||
+			typeof event.seq !== "number" ||
+			!Number.isSafeInteger(event.seq) ||
+			event.seq <= sinceSeq
+		)
+			return false;
+	}
+	// `lastSeq` is the host's global cursor. Capability-gated events are absent
+	// from this connection's replay, so only an explicit host gap can invalidate
+	// the same-incarnation replay barrier.
+	return true;
+}
+
+function isConnectionFailure(error: unknown): boolean {
+	return (
+		error instanceof SdkClientError &&
+		["connection_closed", "unavailable", "timeout", "reconnect_exhausted"].includes(error.code)
+	);
+}
+
+function endpointGeneration(endpoint: Record<string, unknown>): number | undefined {
+	const generation = endpoint.generation ?? endpoint.endpointGeneration;
+	return typeof generation === "number" && Number.isSafeInteger(generation) && generation >= 0
+		? generation
+		: undefined;
+}
+
+function endpointIncarnation(endpoint: Record<string, unknown>): string | undefined {
+	return typeof endpoint.endpointIncarnation === "string" && /^[a-f0-9]{64}$/.test(endpoint.endpointIncarnation)
+		? endpoint.endpointIncarnation
+		: undefined;
+}
+
+function statusIsKnown(status: Record<string, unknown>): boolean {
+	return ["accepted", "in_flight", "terminal_ok", "failed", "unknown"].includes(String(status.status));
 }
 
 /** A transport-only v3 SDK WebSocket client with no host or session authority. */
@@ -259,6 +515,222 @@ export class SdkClient {
 			this.#settlePending(id, pending, new SdkClientError("connection_closed", "SDK client closed"));
 		await Promise.all([...transports].map(incarnation => this.#closeTransport(incarnation)));
 		this.#sentRecords.clear();
+	}
+
+	/** Durable client-side orchestration; failures recover by reconciliation, not transaction rollback. */
+	async createConnectSubscribeSubmit(input: SdkDurableCreateConnectSubmitInput): Promise<SdkDurableResult> {
+		let identity: SdkDurableLookupIdentity;
+		try {
+			identity = durableIdentity(input);
+		} catch (error) {
+			return durableFailure(error);
+		}
+		let created: Record<string, unknown>;
+		try {
+			created = responseResult(
+				await this.global("session.create", canonicalCreate(input.create), {
+					idempotencyKey: identity.createIdempotencyKey,
+					timeoutMs: input.timeoutMs,
+				}),
+			);
+		} catch (error) {
+			return error instanceof SdkClientError && isKnownLifecycleFailure(error)
+				? durableFailure(new SdkClientError(error.code, "Durable session creation failed."), identity)
+				: uncertain("create_uncertain", identity);
+		}
+		const sessionId = stringField(created, "sessionId");
+		if (!sessionId) return uncertain("create_uncertain", identity);
+		identity = {
+			...identity,
+			sessionId,
+			...(endpointGeneration(created) === undefined ? {} : { endpointGeneration: endpointGeneration(created) }),
+			...(endpointIncarnation(created) === undefined ? {} : { endpointIncarnation: endpointIncarnation(created) }),
+		};
+		let endpoint: Record<string, unknown>;
+		try {
+			endpoint = responseResult(
+				await this.global(
+					"session.get_endpoint",
+					{
+						sessionId,
+						...(identity.endpointGeneration === undefined
+							? {}
+							: { endpointGeneration: identity.endpointGeneration }),
+						...(identity.endpointIncarnation === undefined
+							? {}
+							: { endpointIncarnation: identity.endpointIncarnation }),
+					},
+					{ timeoutMs: input.timeoutMs },
+				),
+			);
+		} catch {
+			return uncertain("attachment_uncertain", identity);
+		}
+		const url = stringField(endpoint, "url");
+		const token = stringField(endpoint, "token");
+		if (!url || !token) return uncertain("attachment_uncertain", identity);
+		identity = {
+			...identity,
+			...(endpointGeneration(endpoint) === undefined ? {} : { endpointGeneration: endpointGeneration(endpoint) }),
+			...(endpointIncarnation(endpoint) === undefined ? {} : { endpointIncarnation: endpointIncarnation(endpoint) }),
+		};
+		const endpointClient = new SdkClient(url, token, {
+			timeoutMs: input.timeoutMs,
+			deadline: this.#deadline,
+			reconnectAttempts: 0,
+		});
+		const liveEvents: Frame[] = [];
+		const detach = endpointClient.onFrame(frame => {
+			if (frame.type === "event") liveEvents.push(frame);
+		});
+		let submissionStarted = false;
+		try {
+			const incarnation = await endpointClient.#connect();
+			const replayGeneration = input.replaySinceGeneration ?? identity.endpointGeneration ?? 1;
+			const replaySeq = input.replaySinceSeq ?? 0;
+			const replay = await endpointClient.#requestOnIncarnation(
+				{
+					type: "event_replay",
+					sinceGeneration: replayGeneration,
+					sinceSeq: replaySeq,
+				},
+				incarnation,
+				{ timeoutMs: input.timeoutMs },
+			);
+			if (!replayReady(responseResult(replay), liveEvents, replayGeneration, replaySeq))
+				return uncertain("subscription_uncertain", identity);
+			const operation = input.submission.kind === "prompt" ? "turn.prompt" : "skill.invoke";
+			const controlInput =
+				input.submission.kind === "prompt"
+					? {
+							text: input.submission.text,
+							...(input.submission.images === undefined ? {} : { images: input.submission.images }),
+							clientRef: input.submission.clientRef,
+						}
+					: {
+							name: input.submission.name,
+							...(input.submission.args === undefined ? {} : { args: input.submission.args }),
+							clientRef: input.submission.clientRef,
+						};
+			const response = responseResult(
+				await endpointClient.#requestOnIncarnation(
+					{ type: "control_request", operation, input: controlInput },
+					incarnation,
+					{ timeoutMs: input.timeoutMs, onWrite: () => (submissionStarted = true) },
+				),
+			);
+			const commandId = stringField(response, "commandId");
+			const turnId = stringField(response, "turnId");
+			identity = { ...identity, ...(commandId ? { commandId } : {}), ...(turnId ? { turnId } : {}) };
+			return { kind: "accepted", sessionId, identity, receipt: response };
+		} catch (error) {
+			if (submissionStarted) return uncertain("submission_uncertain", identity);
+			return uncertain(isConnectionFailure(error) ? "attachment_uncertain" : "subscription_uncertain", identity);
+		} finally {
+			detach();
+			await endpointClient.close().catch(() => undefined);
+		}
+	}
+
+	/** Reconcile a prior durable client-side orchestration outcome without resubmitting ordered work. */
+	async reconcileCreateConnectSubmit(
+		identity: SdkDurableLookupIdentity,
+		options: SdkDurableReconcileOptions = {},
+	): Promise<SdkDurableResult> {
+		if (!validDurableIdentity(identity))
+			return durableFailure(new SdkClientError("invalid_input", "Invalid durable lookup identity."));
+		let recovered = identity;
+		if (!recovered.sessionId) {
+			// The identity intentionally carries no create replay material. The
+			// caller must supply the original create separately so the broker's
+			// idempotency key can resolve the prior create; without it, recovery
+			// cannot safely replay and must report uncertainty.
+			if (!options.create) return uncertain("create_uncertain", recovered);
+			try {
+				const created = responseResult(
+					await this.global("session.create", canonicalCreate(options.create), {
+						idempotencyKey: recovered.createIdempotencyKey,
+						timeoutMs: options.timeoutMs,
+					}),
+				);
+				const sessionId = stringField(created, "sessionId");
+				if (!sessionId) return uncertain("create_uncertain", recovered);
+				recovered = {
+					...recovered,
+					sessionId,
+					...(endpointGeneration(created) === undefined
+						? {}
+						: { endpointGeneration: endpointGeneration(created) }),
+					...(endpointIncarnation(created) === undefined
+						? {}
+						: { endpointIncarnation: endpointIncarnation(created) }),
+				};
+			} catch (error) {
+				return error instanceof SdkClientError && isKnownLifecycleFailure(error)
+					? durableFailure(error, recovered)
+					: uncertain("create_uncertain", recovered);
+			}
+		}
+		try {
+			const endpoint = responseResult(
+				await this.global(
+					"session.get_endpoint",
+					{
+						sessionId: recovered.sessionId,
+						...(recovered.endpointGeneration === undefined
+							? {}
+							: { endpointGeneration: recovered.endpointGeneration }),
+						...(recovered.endpointIncarnation === undefined
+							? {}
+							: { endpointIncarnation: recovered.endpointIncarnation }),
+					},
+					options,
+				),
+			);
+			const url = stringField(endpoint, "url");
+			const token = stringField(endpoint, "token");
+			if (!url || !token) return uncertain("attachment_uncertain", recovered);
+			recovered = {
+				...recovered,
+				...(endpointGeneration(endpoint) === undefined ? {} : { endpointGeneration: endpointGeneration(endpoint) }),
+				...(endpointIncarnation(endpoint) === undefined
+					? {}
+					: { endpointIncarnation: endpointIncarnation(endpoint) }),
+			};
+			const client = new SdkClient(url, token, {
+				timeoutMs: options.timeoutMs,
+				deadline: this.#deadline,
+				reconnectAttempts: 0,
+			});
+			try {
+				const incarnation = await client.#connect();
+				const replayGeneration = recovered.endpointGeneration ?? 1;
+				await client
+					.#requestOnIncarnation(
+						{ type: "event_replay", sinceGeneration: replayGeneration, sinceSeq: 0 },
+						incarnation,
+						options,
+					)
+					.catch(() => undefined);
+				const query = recovered.submission.kind === "prompt" ? "turn.prompt_status" : "skill.invoke_status";
+				const status = responseResult(
+					await (client.#isActive(incarnation) && incarnation.socket.readyState === WebSocket.OPEN
+						? client.#requestOnIncarnation(
+								{ type: "query_request", query, input: { clientRef: recovered.submission.clientRef } },
+								incarnation,
+								options,
+							)
+						: client.query(query, { clientRef: recovered.submission.clientRef }, undefined, options)),
+				);
+				return statusIsKnown(status)
+					? { kind: "reconciled", identity: recovered, status }
+					: uncertain("submission_uncertain", recovered);
+			} finally {
+				await client.close().catch(() => undefined);
+			}
+		} catch (error) {
+			return uncertain(isConnectionFailure(error) ? "attachment_uncertain" : "submission_uncertain", recovered);
+		}
 	}
 
 	async control(
@@ -387,6 +859,59 @@ export class SdkClient {
 				);
 			}
 		});
+	}
+
+	#requestOnIncarnation(
+		frame: Frame,
+		incarnation: Incarnation,
+		options: SdkRequestOptions & { onWrite?: () => void },
+	): Promise<SdkFrame> {
+		if (this.#closed || !this.#isActive(incarnation) || incarnation.socket.readyState !== WebSocket.OPEN)
+			return Promise.reject(
+				new SdkClientError("connection_closed", "SDK WebSocket incarnation is no longer active"),
+			);
+		const timeoutMs = this.#remainingTimeout(options.timeoutMs ?? this.#timeoutMs);
+		if (timeoutMs <= 0) return Promise.reject(this.#deadlineError());
+		const id = randomUUID();
+		const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+		const pending: Pending = {
+			incarnation,
+			resolve,
+			reject,
+			sent: false,
+			timer: setTimeout(
+				() =>
+					this.#settlePending(
+						id,
+						pending,
+						new SdkClientError("timeout", `SDK request timed out after ${timeoutMs}ms`),
+					),
+				timeoutMs,
+			),
+		};
+		this.#pending.set(id, pending);
+		if (!this.#isActive(incarnation) || incarnation.socket.readyState !== WebSocket.OPEN) {
+			this.#settlePending(
+				id,
+				pending,
+				new SdkClientError("connection_closed", "SDK WebSocket incarnation is no longer active"),
+			);
+			return promise as Promise<SdkFrame>;
+		}
+		try {
+			incarnation.socket.send(
+				JSON.stringify({
+					...frame,
+					id,
+					...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+				}),
+			);
+			pending.sent = true;
+			options.onWrite?.();
+		} catch (error) {
+			this.#settlePending(id, pending, new SdkClientError("unavailable", "SDK WebSocket send failed", error));
+		}
+		return promise as Promise<SdkFrame>;
 	}
 
 	#deadlineError(): SdkClientError {
