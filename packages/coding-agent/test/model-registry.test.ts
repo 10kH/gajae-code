@@ -315,6 +315,35 @@ describe("ModelRegistry", () => {
 			expect(sol?.contextWindow).toBe(373_000);
 			expect(terra?.contextWindow).toBe(372_000);
 		});
+		test("registerProvider reapplies an openai-codex contextWindow override before the final cap", () => {
+			writeRawModelsJson({
+				"openai-codex": {
+					modelOverrides: {
+						"gpt-5.6-sol": { contextWindow: 373_000 },
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			registry.registerProvider("openai-codex", {
+				baseUrl: "https://chatgpt.com/backend-api",
+				api: "openai-codex-responses",
+				apiKey: "TEST_KEY",
+				models: [
+					{
+						id: "gpt-5.6-sol",
+						name: "Runtime GPT-5.6 Sol",
+						reasoning: true,
+						input: ["text", "image"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 1_000_000,
+						maxTokens: 128_000,
+					},
+				],
+			});
+
+			expect(registry.find("openai-codex", "gpt-5.6-sol")?.contextWindow).toBe(373_000);
+		});
 		test("openai-codex contextWindow override does not exempt same-id models on other Codex-transport providers", () => {
 			writeRawModelsJson({
 				"openai-codex": {

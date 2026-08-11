@@ -4090,12 +4090,13 @@ export class ModelRegistry {
 						return this.#applyRuntimeProviderOverride(model, runtimeTransportOverride);
 					})
 				: nextModels;
+			const withModelOverrides = this.#applyProviderModelOverrides(providerName, withRuntimeTransportOverride);
 
 			if (config.oauth?.modifyModels) {
 				const credential = this.authStorage.getOAuthCredential(providerName);
 				if (credential) {
 					this.#models = applyFinalCodexGpt56ContextCap(
-						config.oauth.modifyModels(withRuntimeTransportOverride, credential),
+						config.oauth.modifyModels(withModelOverrides, credential),
 						undefined,
 						this.#codexContextWindowOverrides,
 					);
@@ -4106,7 +4107,7 @@ export class ModelRegistry {
 			}
 
 			this.#models = applyFinalCodexGpt56ContextCap(
-				withRuntimeTransportOverride,
+				withModelOverrides,
 				undefined,
 				this.#codexContextWindowOverrides,
 			);
