@@ -273,13 +273,9 @@ cmux send-key \
 
 ### Voice (`Option+H`)
 
-GJC binds speech-to-text to `Alt+H`, but cmux does not reliably forward that modifier through `send-key`, and macOS blocks Stream Deck plugin keystroke automation unless the plugin host has Accessibility permission. Use the focused GJC command palette instead:
+GJC binds local Whisper speech-to-text to `Alt+H`, but cmux does not reliably forward that modifier through `send-key`. Use a dedicated, signed local helper app that posts the real macOS `Option+H` event after focusing the exact `GJC:` surface.
 
-```text
-Ctrl+P -> type "Toggle speech-to-text" -> Enter
-```
-
-This invokes the same registered `app.stt.toggle` action without inserting a stray `h` into the editor or requiring macOS Accessibility access.
+The helper requires one-time macOS Accessibility approval. Keep that permission scoped to the helper app; do not fall back to typing command-palette search text into the active editor.
 
 ### Shift+Tab
 
@@ -425,7 +421,7 @@ Use temporary surfaces and restore the original focus after each test:
 - pane previous/next;
 - tab previous/next;
 - terminal creation in the requested pane;
-- voice action toggles through the GJC command palette without inserting `h`;
+- voice helper posts a real `Option+H` event without inserting text;
 - fixed-folder `cd` behavior;
 - focused tab closure;
 - same-tab worktree prompting when required;
