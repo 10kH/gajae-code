@@ -13351,7 +13351,10 @@ export class SessionManager {
 		}
 		if (!hasStrictSessionSchema(entries)) throw new Error("cold_transcript_schema_invalid");
 		const migrationApplied = migrateToCurrentVersion(entries);
-		for (const entry of entries) residentizePersistedBlobRefs(entry);
+		for (const entry of entries) {
+			if (entry.type !== "session") sanitizeLoadedSessionEntryReplayMetadata(entry);
+			residentizePersistedBlobRefs(entry);
+		}
 		const transition = this.#prepareResidentTextStoreTransition(
 			{
 				target: { sessionId: header.id, sessionFile: this.#sessionFile },
@@ -13413,7 +13416,7 @@ export class SessionManager {
 					("parentId" in record && entry.parentId !== record.parentId)
 				)
 					throw new Error("cold_index_identity_mismatch");
-				residentizePersistedBlobRefs(entry);
+				residentizePersistedBlobRefs(sanitizeLoadedSessionEntryReplayMetadata(entry));
 				rebuilt.push(entry);
 			}
 			const transition = this.#prepareResidentTextStoreTransition(
@@ -16532,10 +16535,13 @@ export class SessionManager {
 						if (record.type === "session") return;
 						if (record.type === "header_patch" || record.type === "entry_patch") return false;
 						if (typeof record.id !== "string") return false;
+						const coldEntry = sanitizeLoadedSessionEntryReplayMetadata(record);
+						residentizePersistedBlobRefs(coldEntry);
+						const entry = materializeResidentEntryForReadSync(coldEntry, this.#residentBlobStores(), new Map());
 						visitor(
 							cloneSessionEntry(
 								rehydrateColdSpillEntry(
-									materializeResidentEntryForReadSync(record, this.#residentBlobStores(), new Map()),
+									entry,
 									this.#coldSpillReadStore(),
 									this.#residentBlobStoresForColdRehydrate(),
 								),

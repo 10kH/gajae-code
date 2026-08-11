@@ -13,6 +13,9 @@ import { type ModelSelectorValue, normalizeModelSelectorValue } from "../../conf
 import { type Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { parseThinkingLevel } from "../../thinking";
+import { ensureBroker } from "../broker/ensure";
+import { SessionIndex } from "../broker/session-index";
+import { elevationAuthorityPath, verifyElevationCapability } from "../elevation/capability";
 import {
 	collectAuthenticatedProfileProviders,
 	parseSyntheticModelId,
@@ -24,9 +27,9 @@ import {
 import { projectQ10Models } from "../models.js";
 import { formatPromptFailureForLocalLog, sanitizePromptFailure } from "../prompt-failure";
 import { OPERATIONS } from "../protocol/operation-registry";
-import { type ControlSurface, dispatchControl } from "./control";
+import { type ControlSurface, controlRequestFromFrame, dispatchControl } from "./control";
 import { SessionSdkHost, type SessionSdkHostOptions } from "./host";
-import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "./query";
+import { CursorRegistry, QueryHandlers, RevisionStore, type SdkCheckpointRecord, type SessionSurface } from "./query";
 import {
 	createSdkCapabilities,
 	createSdkSurfacePolicyForContext,
@@ -217,6 +220,10 @@ export class SessionSdkSessionRuntime {
 
 /** Narrow extension-facing factory for the SDK-only session path. */
 export interface CreateSdkSessionRuntimeOptions {
+	/** Authoritative broker state root for this session's endpoint lifecycle. */
+	agentDir: string;
+	/** Lifecycle-owned sessions require broker publication before they become usable. */
+	brokerRegistrationRequired?: boolean;
 	createTransport(input: {
 		sessionId: string;
 		stateRoot: string;
@@ -483,6 +490,8 @@ export interface SdkSurfaceFactoryOptions {
 	promptStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 	skillStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 	hostTools?: boolean | (() => boolean);
+	/** Q30 event-ring watermark source (the live session event stream); synchronous. */
+	getEventWatermark?: () => { generation: number; seq: number };
 }
 
 /** Shared policy, capability, and query-surface factory for every SDK transport. */
@@ -507,6 +516,8 @@ function createQuerySurface(
 		promptStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 		skillStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 		hostTools?: boolean | (() => boolean);
+		/** Q30 event-ring watermark source (the live session event stream); synchronous. */
+		getEventWatermark?: () => { generation: number; seq: number };
 	} = {},
 ): SessionSurface {
 	const policy =
@@ -790,6 +801,23 @@ function createQuerySurface(
 				})),
 			)) as unknown[];
 		},
+		getCheckpointSnapshot: (): { entries: unknown[]; watermark: SdkCheckpointRecord } => {
+			// Q30 atomic checkpoint capture (C9): the transcript entries and the
+			// event-ring watermark are read in one synchronous call from the host
+			// event stream, so the snapshot revision and the subscribe position
+			// can never straddle a concurrent append.
+			const entries =
+				typeof (ctx as Partial<ExtensionContext>).getTranscript === "function" ? ctx.getTranscript() : [];
+			const watermark = options.getEventWatermark?.() ?? { generation: 0, seq: 0 };
+			return {
+				entries,
+				watermark: {
+					revision: Array.isArray(entries) ? entries.length : 0,
+					generation: watermark.generation,
+					seq: watermark.seq,
+				},
+			};
+		},
 		installedQueries: policy.installedQueries,
 	};
 }
@@ -820,6 +848,7 @@ export function createSdkSurfaceFactory(
 		promptStatusLookup: options.promptStatusLookup,
 		skillStatusLookup: options.skillStatusLookup,
 		hostTools: options.hostTools,
+		getEventWatermark: options.getEventWatermark,
 	});
 	return {
 		policy,
@@ -883,6 +912,52 @@ function containsSecretConfigKey(value: unknown, seen = new Set<object>()): bool
 			containsSecretConfigKey(nested, seen),
 	);
 }
+async function resolveSdkWorkflowGate(
+	ctx: ExtensionContext,
+	operation: "workflow.gate_answer" | "workflow.plan_approve",
+	id: string,
+	answer: unknown,
+	expectedSessionId: string | undefined,
+	idempotencyKey: string,
+	canResolve: () => boolean,
+): Promise<unknown> {
+	if (!canResolve())
+		throw Object.assign(new Error("Workflow gate is no longer answerable."), { code: "resource_gone" });
+	if (expectedSessionId !== undefined && expectedSessionId !== ctx.sessionManager.getSessionId())
+		throw Object.assign(new Error("Workflow gate session does not match this endpoint."), { code: "resource_gone" });
+	if (expectedSessionId === undefined) logger.warn("workflow_control_missing_expected_session_id", { operation });
+	const workflowGate = ctx.workflowGate;
+	if (
+		typeof workflowGate?.resolveGate !== "function" ||
+		typeof workflowGate.recoverAcceptedGates !== "function" ||
+		typeof workflowGate.lookupCompletedResolution !== "function" ||
+		typeof workflowGate.prepareTerminalization !== "function" ||
+		typeof workflowGate.clearPreparedTerminalization !== "function"
+	)
+		throw Object.assign(new Error("Workflow gates are unavailable for this session."), { code: "resource_gone" });
+	const response = { gate_id: id, answer, idempotency_key: idempotencyKey };
+	const completed = workflowGate.lookupCompletedResolution(response);
+	if (completed.kind === "completed") return completed.resolution;
+	if (completed.kind === "accepted_incomplete") {
+		await workflowGate.recoverAcceptedGates();
+		const recovered = workflowGate.lookupCompletedResolution(response);
+		if (recovered.kind === "completed") return recovered.resolution;
+		throw Object.assign(new Error("Workflow gate resolution outcome is uncertain."), { code: "terminal_uncertain" });
+	}
+	if (!workflowGate.prepareTerminalization(id, "not_published"))
+		throw Object.assign(new Error("Workflow gate is no longer answerable."), { code: "resource_gone" });
+	try {
+		const resolution = await workflowGate.resolveGate(response);
+		if ((resolution as { status?: unknown }).status === "rejected") workflowGate.clearPreparedTerminalization(id);
+		return resolution;
+	} catch (error) {
+		const stillPending = workflowGate.listPendingGates?.().some(gate => gate.gate_id === id) === true;
+		if (stillPending) workflowGate.clearPreparedTerminalization(id);
+		else workflowGate.quarantineGate?.(id);
+		throw error;
+	}
+}
+
 function createControlSurface(
 	ctx: ExtensionContext,
 	api: ExtensionAPI,
@@ -892,6 +967,9 @@ function createControlSurface(
 	settings?: Settings,
 	configOverrides?: Map<string, unknown>,
 	configRevision: { current: number } = { current: 0 },
+	elevationAuthorityToken?: string,
+	canResolveGate: () => boolean = () => true,
+	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T> = async resolution => await resolution,
 ): ControlSurface {
 	const surfacePolicy =
 		policy ?? createSdkSurfacePolicyForContext(ctx, hasSdkWorkflowGateCapability(ctx.workflowGate));
@@ -988,7 +1066,7 @@ function createControlSurface(
 		try {
 			const submission = Promise.resolve(
 				run({
-					onPreflightAccepted: () => void accept().catch(() => undefined),
+					onPreflightAccepted: () => void accept().catch(error => preflight.reject(error)),
 					onPreflightAcceptCommit: accept,
 				}),
 			);
@@ -999,7 +1077,7 @@ function createControlSurface(
 						return;
 					}
 					if (allowCompletionFallback) {
-						void accept().catch(() => undefined);
+						void accept().catch(error => preflight.reject(error));
 						return;
 					}
 					settled = true;
@@ -1035,6 +1113,9 @@ function createControlSurface(
 		}
 	};
 	return {
+		authorizeElevationClaim: (sdkId, input, capability) =>
+			elevationAuthorityToken !== undefined &&
+			verifyElevationCapability(elevationAuthorityToken, capability, sdkId, input),
 		prompt: async (text, images, clientRef) =>
 			submit("prompt", clientRef, options =>
 				api.sendUserMessage(
@@ -1057,8 +1138,22 @@ function createControlSurface(
 			return await submit("prompt", undefined, options => api.sendUserMessage(text, options));
 		},
 		answerAsk: unavailable("ask.answer"),
-		answerGate: unavailable("workflow.gate_answer"),
-		approvePlan: unavailable("workflow.plan_approve"),
+		answerGate: async (id, response, expectedSessionId, idempotencyKey) =>
+			await trackGateResolution(
+				resolveSdkWorkflowGate(
+					ctx,
+					"workflow.gate_answer",
+					id,
+					response,
+					expectedSessionId,
+					idempotencyKey ?? id,
+					canResolveGate,
+				),
+			),
+		approvePlan: async (id, choice, expectedSessionId) =>
+			await trackGateResolution(
+				resolveSdkWorkflowGate(ctx, "workflow.plan_approve", id, choice, expectedSessionId, id, canResolveGate),
+			),
 		invokeSkill: async (name, args, clientRef) => {
 			if (!ctx.invokeSkill) return unavailable("skill.invoke")();
 			if (args !== undefined && typeof args !== "string")
@@ -1240,6 +1335,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				cursors: CursorRegistry;
 				reconciliation: InvocationReconciliation;
 				pending: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
+				registerBroker: () => Promise<void>;
+				fenceGateResolutions: () => void;
+				waitForGateResolutionQuiescence: () => Promise<void>;
 				activeInvocation?: { kind: InvocationKind; correlation: InvocationCorrelation };
 				disposeGate?: () => void;
 		  }
@@ -1258,9 +1356,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	};
 	api.on("agent_start", async (_event, ctx) => await emitLifecycle("agent_start", ctx));
 	api.on("agent_end", async (_event, ctx) => await emitLifecycle("agent_end", ctx));
-	api.on("turn_start", (_event, ctx) =>
-		active?.runtime.emitEvent({ type: "turn_start", sessionId: ctx.sessionManager.getSessionId() }),
-	);
+	api.on("turn_start", async (_event, ctx) => {
+		const current = active;
+		if (!current) return;
+		await current.registerBroker();
+		current.runtime.emitEvent({ type: "turn_start", sessionId: ctx.sessionManager.getSessionId() });
+	});
 	api.on("turn_end", (_event, ctx) =>
 		active?.runtime.emitEvent({ type: "turn_end", sessionId: ctx.sessionManager.getSessionId() }),
 	);
@@ -1276,6 +1377,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const sessionId = ctx.sessionManager.getSessionId();
 		const stateRoot = path.join(ctx.cwd, ".gjc", "state");
 		const token = crypto.randomBytes(24).toString("base64url");
+		const elevationAuthorityToken = crypto.randomBytes(32).toString("base64url");
+		const elevationAuthorityFile = elevationAuthorityPath(stateRoot, sessionId);
+		await fs.mkdir(path.dirname(elevationAuthorityFile), { recursive: true, mode: 0o700 });
+		await Bun.write(elevationAuthorityFile, `${JSON.stringify({ version: 1, token: elevationAuthorityToken })}\n`);
+		await fs.chmod(elevationAuthorityFile, 0o600);
 		const transport = await options.createTransport({ sessionId, stateRoot, token });
 		const revisions = new RevisionStore(sessionId, Date.now, { storageDir: stateRoot });
 		const cursors = new CursorRegistry(token, revisions);
@@ -1283,6 +1389,25 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		await reconciliation.hydrate();
 		const pending: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
 		const configRevision = { current: 0 };
+		// The event-ring watermark lives on the runtime host, which is constructed
+		// after the surface factory; the lazy source indirection lets the surface
+		// read the live generation/seq once the runtime exists (Q30 atomic
+		// capture, C9).
+		let eventWatermarkSource: () => { generation: number; seq: number } = () => ({ generation: 0, seq: 0 });
+		let acceptingGateResolutions = true;
+		const inFlightGateResolutions = new Set<Promise<unknown>>();
+		const trackGateResolution = <T>(resolution: Promise<T>): Promise<T> => {
+			const tracked = resolution.finally(() => inFlightGateResolutions.delete(tracked));
+			inFlightGateResolutions.add(tracked);
+			return tracked;
+		};
+		const waitForGateResolutionQuiescence = async (): Promise<void> => {
+			const settled = Promise.allSettled(inFlightGateResolutions);
+			const timeout = Bun.sleep(5_000).then(() => {
+				throw new Error("Timed out waiting for SDK workflow gate resolutions to settle.");
+			});
+			await Promise.race([settled, timeout]);
+		};
 		const surfaceFactory = createSdkSurfaceFactory({
 			ctx,
 			id: sessionId,
@@ -1292,6 +1417,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			skillStatusLookup: selector => reconciliation.lookup("skill", selector),
 			configOverrides: options.configOverrides,
 			settings: options.settings,
+			getEventWatermark: () => eventWatermarkSource(),
 		});
 		const queryHandlers = new QueryHandlers(surfaceFactory.query, sessionId, revisions, cursors);
 		const controlSurface = createControlSurface(
@@ -1305,6 +1431,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			options.settings,
 			options.configOverrides,
 			configRevision,
+			elevationAuthorityToken,
+			() => acceptingGateResolutions,
+			trackGateResolution,
 		);
 		let runtime: SessionSdkSessionRuntime;
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
@@ -1374,22 +1503,23 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		runtime = new SessionSdkSessionRuntime({
 			transport,
 			control: async (_connectionId, frame) => {
-				const request = frame as Record<string, unknown>;
+				const request = controlRequestFromFrame(frame as Record<string, unknown>);
 				return dispatchControl(
 					controlSurface,
 					OPERATIONS.find(operation => operation.kind === "control" && operation.sdkId === request.operation),
-					{
-						id: typeof request.id === "string" ? request.id : "",
-						operation: typeof request.operation === "string" ? request.operation : "",
-						input: request.input,
-						expectedRevision: typeof request.expectedRevision === "string" ? request.expectedRevision : undefined,
-						idempotencyKey: typeof request.idempotencyKey === "string" ? request.idempotencyKey : undefined,
-						confirm: request.confirm === true,
-					},
+					request,
 				);
 			},
 			query: async (connectionId, frame) => {
 				const request = frame as Record<string, unknown>;
+				// D1: a non-string top-level cursor is rejected, never silently
+				// dropped into a fresh-snapshot query.
+				if (request.cursor !== undefined && typeof request.cursor !== "string")
+					return {
+						id: typeof request.id === "string" ? request.id : undefined,
+						ok: false,
+						error: { code: "invalid_input", message: "cursor must be a non-empty string" },
+					};
 				return queryHandlers.dispatch({
 					id: typeof request.id === "string" ? request.id : undefined,
 					query: typeof request.query === "string" ? request.query : "",
@@ -1408,12 +1538,54 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				if (request.operation === "session.close" && response.ok === true) ctx.shutdown();
 			},
 		});
+		// The runtime host now owns the live event stream; point the surface's
+		// checkpoint watermark at the real generation/seq (C9).
+		eventWatermarkSource = () => ({
+			generation: runtime.host.events.generation,
+			seq: runtime.host.events.sequence,
+		});
 		const disposeGate = ctx.workflowGate?.onGateEmitted?.(gate =>
 			runtime.emitEvent({ kind: "workflow_gate", payload: gate }),
 		);
-		active = { runtime, revisions, cursors, reconciliation, pending, disposeGate };
+		let brokerRegistered = false;
+		const registerBroker = async (): Promise<void> => {
+			if (brokerRegistered) return;
+			try {
+				await ensureBroker({ agentDir: options.agentDir });
+				const index = await new SessionIndex(options.agentDir).open();
+				const locator = { repo: path.resolve(ctx.cwd), stateRoot };
+				await runtime.registerWithBroker({
+					register: async input => {
+						const endpointMtimeMs = (await fs.stat(path.join(input.stateRoot, "sdk", `${input.sessionId}.json`)))
+							.mtimeMs;
+						await index.append({ type: "host_registered", ...input, locator, pid: process.pid, endpointMtimeMs });
+					},
+					unregister: async input => {
+						await index.append({ type: "host_unregistered", ...input, locator, pid: process.pid });
+					},
+				});
+				brokerRegistered = true;
+			} catch (error) {
+				if (options.brokerRegistrationRequired) throw error;
+				logger.warn(`sdk broker registration unavailable: ${String(error)}`);
+			}
+		};
+		active = {
+			runtime,
+			revisions,
+			cursors,
+			reconciliation,
+			pending,
+			registerBroker,
+			fenceGateResolutions: () => {
+				acceptingGateResolutions = false;
+			},
+			waitForGateResolutionQuiescence,
+			disposeGate,
+		};
 		try {
 			await runtime.start();
+			await registerBroker();
 		} catch (error) {
 			active = undefined;
 			disposeGate?.();
@@ -1424,7 +1596,19 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					code: errorCode(cleanupError),
 					error: String(cleanupError),
 				});
-				active = { runtime, revisions, cursors, reconciliation, pending, disposeGate };
+				active = {
+					runtime,
+					revisions,
+					cursors,
+					reconciliation,
+					pending,
+					registerBroker,
+					fenceGateResolutions: () => {
+						acceptingGateResolutions = false;
+					},
+					waitForGateResolutionQuiescence,
+					disposeGate,
+				};
 				throw new AggregateError([error, cleanupError], "SDK runtime startup failed and cleanup failed.");
 			}
 			cursors.close();
@@ -1434,10 +1618,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	};
 	const stopActive = async (): Promise<void> => {
 		const current = active;
-		active = undefined;
 		if (!current) return;
-		current.disposeGate?.();
+		current.fenceGateResolutions();
 		try {
+			await current.waitForGateResolutionQuiescence();
+			active = undefined;
+			current.disposeGate?.();
 			await current.runtime.stop();
 		} catch (error) {
 			logger.error("sdk runtime stop failed", { code: errorCode(error), error: String(error) });
