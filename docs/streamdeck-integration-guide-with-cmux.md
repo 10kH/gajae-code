@@ -190,7 +190,7 @@ Use explicit paths instead of recent-project discovery:
 - `gajae-code` -> `$HOME/Documents/Workspace/gajae-code`;
 - `HOME` -> `$HOME`.
 
-Parameterize these values for each operator. A fixed folder key creates a terminal surface in the current pane and sends `cd -- '<path>'`. Store fully expanded absolute paths (or `$HOME`-relative values the plugin normalizes before shell-quoting) so single-quoting never suppresses tilde expansion.
+Parameterize these values for each operator. A fixed folder key creates a terminal surface in the current pane and sends `cd -- '<path>'`. Store fully expanded absolute paths (or `$HOME`-relative values the plugin normalizes before shell-quoting) so single-quoting never suppresses tilde expansion. Do not manually rename the cmux tab: when the operator starts `gjc`, GJC must remain free to publish its authoritative `GJC:` title so focus guards recognize the session.
 
 ### Page 3: focused GJC operations
 
