@@ -213,8 +213,11 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 149 serializes successor attachment behind predecessor provider retirement.
  * Generation 150 version-fences attaches already in flight when retirement begins.
  * Generation 151 preserves provider continuity for endpoint-before-index replacement cleanup.
+ * Generation 152 contains a thrown steady heartbeat renewal in the run loop
+ * (a transient EPERM/EACCES/EBUSY on the state or ownership-lock read) the
+ * same way instead of terminating the daemon (#4200).
  */
-export const DAEMON_GENERATION = 151;
+export const DAEMON_GENERATION = 152;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

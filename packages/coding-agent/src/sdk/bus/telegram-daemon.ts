@@ -12139,19 +12139,32 @@ export class TelegramNotificationDaemon {
 			let idleSince = this.runtime.now();
 			while (this.running) {
 				if (await this.controlStopRequested()) break;
-				if (
-					(await renewOwnerHeartbeatSidecar({
-						settings: this.opts.settings,
-						ownerId: this.opts.ownerId,
-						acquisitionId: this.opts.ownerId,
-						fs: this.fsImpl,
-						now: this.opts.now,
-						pid: this.opts.pid ?? process.pid,
-						pidIncarnation: this.opts.pidIncarnation,
-						attachedEndpoints: this.attachedEndpointCount(),
-					})) === "not_owner"
-				)
-					break;
+				// A thrown renewal (e.g. a transient Windows EPERM/EACCES/EBUSY while
+				// an external lock also covers the state or ownership-lock read) must
+				// not terminate the daemon — the same crash class as #4200 on the
+				// sidecar rename. Contain it like the poll loop below: log one bounded
+				// diagnostic and retry on the next loop iteration. Only a proven
+				// state/lock mismatch ("not_owner") stops the owner.
+				let ownerHeld = true;
+				try {
+					ownerHeld =
+						(await renewOwnerHeartbeatSidecar({
+							settings: this.opts.settings,
+							ownerId: this.opts.ownerId,
+							acquisitionId: this.opts.ownerId,
+							fs: this.fsImpl,
+							now: this.opts.now,
+							pid: this.opts.pid ?? process.pid,
+							pidIncarnation: this.opts.pidIncarnation,
+							attachedEndpoints: this.attachedEndpointCount(),
+						})) !== "not_owner";
+				} catch (error) {
+					logger.warn(
+						`notifications: ownership heartbeat renewal threw; continuing: ${sanitizeDiagnostic(String(error))}`,
+					);
+				}
+				if (!ownerHeld) break;
+				await this.runScan();
 				if (await this.controlStopRequested()) break;
 				const idleElapsed = this.runtime.now() - idleSince >= (this.opts.idleTimeoutMs ?? 60_000);
 				if (this.sessions.size > 0) {
