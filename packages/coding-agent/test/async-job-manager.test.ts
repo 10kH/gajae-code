@@ -1,5 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
+import { lookupOwnedRegistration, registerOwnedRegistration } from "../src/session/terminal-abort";
 
 describe("AsyncJobManager", () => {
 	test("forwards progress updates and delivers completion", async () => {
@@ -542,6 +543,40 @@ describe("AsyncJobManager", () => {
 		expect(phases.filter(p => p === "cancel")).toHaveLength(1);
 		expect(phases.filter(p => p === "terminal")).toHaveLength(1);
 		expect(phases.filter(p => p === "evict")).toHaveLength(2);
+	});
+
+	test("cancelling a job retires its owned registration", async () => {
+		// Review thread P2: a task registered under the turn fence that is later
+		// explicitly cancelled settles no delivery (the cancelled-job completion
+		// path deliberately enqueues none), so the ownership tuple must be
+		// retired at cancellation — otherwise it persists until eviction, makes
+		// an owned abort of the same turn report owned_unsettled with no work
+		// remaining, and repeated cancellations exhaust the bounded registries.
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const endpointId = AsyncJobManager.endpointIdOf(manager);
+		const jobId = manager.register(
+			"task",
+			"subagent",
+			async ({ signal }) => {
+				await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+				return "cancelled";
+			},
+			{},
+		);
+		const job = manager.getJob(jobId);
+		const generation = job?.generation ?? jobId;
+		registerOwnedRegistration({
+			endpointId,
+			lineageIdHash: "lineage-hash",
+			promptAttemptEpoch: 1,
+			endpointGeneration: 1,
+			jobId,
+			jobGeneration: generation,
+		});
+		expect(lookupOwnedRegistration(jobId, generation, endpointId)).toBeDefined();
+		expect(manager.cancel(jobId)).toBe(true);
+		await manager.waitForAll();
+		expect(lookupOwnedRegistration(jobId, generation, endpointId)).toBeUndefined();
 	});
 
 	test("terminal waits support all/any predicates and idempotent acknowledgement", async () => {

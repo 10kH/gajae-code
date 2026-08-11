@@ -1055,6 +1055,7 @@ export class AsyncJobManager {
 			this.#runLifecycle(id, "cancel");
 			this.#scheduleEviction(id);
 			this.#drainResumeQueue();
+			this.#retireCancelledJobOwned(id, job.generation);
 			return true;
 		}
 		if (job.status !== "running") return false;
@@ -1065,6 +1066,7 @@ export class AsyncJobManager {
 		this.#runLifecycle(id, "cancel");
 		job.abortController.abort();
 		this.#notifyChange();
+		this.#retireCancelledJobOwned(id, job.generation);
 		return true;
 	}
 
@@ -1632,6 +1634,17 @@ export class AsyncJobManager {
 			return { ok: true, queued: true, status: "queued" };
 		}
 		return this.#startResume(rec, message, descriptor, resumeToolCallId);
+	}
+
+	/** Retire the owned registration of a job that settles WITHOUT a delivery
+	 *  (explicit cancellation): the cancelled-job completion path deliberately
+	 *  enqueues no delivery, so the tuple would otherwise persist until
+	 *  eviction — an owned abort of the same turn then reports owned_unsettled
+	 *  with no work remaining, and repeated cancellations exhaust the bounded
+	 *  ownership registries (review thread P2). */
+	#retireCancelledJobOwned(jobId: string, jobGeneration: string): void {
+		const registration = lookupOwnedRegistration(jobId, jobGeneration, AsyncJobManager.endpointIdOf(this));
+		if (registration) unregisterOwnedRegistration(registration);
 	}
 
 	#retireQueuedOwned(rec: SubagentRecord): void {

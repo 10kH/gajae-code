@@ -1974,12 +1974,20 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				if (event.type === "model_fallback_switched") {
 					activeProviderModelString = event.to;
 					progress.fastMode = isFastForModel(session.model);
-					AsyncJobManager.instance()?.updateSubagentModel?.(options.subagentId ?? id, {
-						requestedModel: modelSubstitutionWarning?.requested ?? resolvedModelString,
-						effectiveModel: event.to,
-						modelFellBack: true,
-						fastMode: progress.fastMode,
-					});
+					// Keep the fallback metadata on the SAME manager the initial
+					// update used: another session may have become the
+					// process-global instance, and writing to it would leave this
+					// session's subagent metadata stale or overwrite an unrelated
+					// same-ID record (review thread P2).
+					(options.asyncJobManager ?? AsyncJobManager.instance())?.updateSubagentModel?.(
+						options.subagentId ?? id,
+						{
+							requestedModel: modelSubstitutionWarning?.requested ?? resolvedModelString,
+							effectiveModel: event.to,
+							modelFellBack: true,
+							fastMode: progress.fastMode,
+						},
+					);
 					scheduleProgress(true);
 					forwardSubagentEvent(event);
 					return;
