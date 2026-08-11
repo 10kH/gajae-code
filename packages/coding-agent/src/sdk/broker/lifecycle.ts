@@ -3447,6 +3447,11 @@ async function executeLifecycleResponse(
 	let record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	if (operation === "session.close") {
 		if (!record) return fail("not_found", "session is not indexed");
+		// DR-1 retains closed/unregistered rows for inspect and offline tail.
+		// Pre-DR-1 they vanished from the listing and close answered not_found;
+		// a terminal row is the same already-gone outcome, never an escalation
+		// target — signalling its recorded pid could hit a reused process.
+		if (record.terminal) return fail("resource_gone", "Session is already closed and unregistered.");
 		if (record.terminalUncertain)
 			return fail("terminal_uncertain", "Session ownership is uncertain and cannot be closed safely.");
 		const requestedAuthority = requestedCloseAuthority(input);
