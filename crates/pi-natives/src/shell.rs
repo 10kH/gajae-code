@@ -236,6 +236,17 @@ impl Shell {
 		self.inner.abort().await;
 		Ok(())
 	}
+
+	/// Abort in-flight commands and release the retained shell session.
+	///
+	/// `abort` leaves a completed session alive for reuse, so a caller that is
+	/// finished with a shell must call this to release the native process and
+	/// let the host exit. Returns `Ok(())` even when nothing is retained.
+	#[napi]
+	pub async fn close(&self) -> Result<()> {
+		self.inner.close().await;
+		Ok(())
+	}
 }
 
 /// Execute a brush shell command.

@@ -204,16 +204,19 @@ export function getShellSessionCount(): number {
  */
 export async function disposeAllShellSessions(): Promise<void> {
 	// Snapshot and drop strong references up front so concurrent callers cannot
-	// reuse a session that is being torn down, then await every native abort so
+	// reuse a session that is being torn down, then await every native close so
 	// shutdown/signal cleanup does not return before resources are released.
 	// Include retiring shells whose JS call returned after bounded abort cleanup
 	// while the native run is still unwinding; they are no longer reusable but
 	// remain owned until their run promise settles.
+	// `close` rather than `abort`: aborting only cancels in-flight commands and
+	// leaves a completed session retained for reuse, which keeps the native shell
+	// alive for the rest of the process lifetime.
 	const sessions = new Set([...shellSessions.values(), ...retiringShellSessions]);
 	shellSessions.clear();
 	retiringShellSessions.clear();
 	brokenShellSessions.clear();
-	await Promise.allSettled([...sessions].map(session => session.abort()));
+	await Promise.allSettled([...sessions].map(session => session.close()));
 }
 
 postmortem.register("bash-executor:shell-sessions", () => disposeAllShellSessions());
@@ -392,9 +395,12 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				brokenShellSessions.add(sessionKey);
 				shellSessions.delete(sessionKey);
 				runSettled = await awaitAbortCleanup(runPromise);
+				// A retired session is never reused, so release the native shell instead
+				// of leaving it retained for the rest of the process lifetime.
 				if (runSettled) {
 					brokenShellSessions.delete(sessionKey);
 					retiringShellSessions.delete(shellSession);
+					void shellSession.close().catch(() => undefined);
 				} else {
 					void runPromise
 						.finally(() => {
@@ -403,6 +409,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 							if (shellSessions.get(sessionKey) === shellSession) {
 								shellSessions.delete(sessionKey);
 							}
+							void shellSession.close().catch(() => undefined);
 						})
 						.catch(() => undefined);
 				}
@@ -508,7 +515,9 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			shellSessions.delete(sessionKey);
 		}
 		if (oneShotShell) {
-			const disposePromise = abortPromise ?? oneShotShell.abort();
+			// Always close: a successful run keeps its session retained, so aborting
+			// alone would leak the native shell and hold the event loop open.
+			const disposePromise = (abortPromise ?? Promise.resolve()).then(() => oneShotShell.close());
 			await Promise.race([disposePromise.catch(() => undefined), Bun.sleep(CANCEL_CLEANUP_WAIT_MS)]);
 		}
 	}
