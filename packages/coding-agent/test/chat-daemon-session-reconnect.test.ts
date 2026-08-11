@@ -39,6 +39,7 @@ class FakeSlackProvider implements SlackProviderClient {
 	failReconciliations = 0;
 	/** Every post this provider refused, so a test can settle on the refusal itself. */
 	readonly refused: string[] = [];
+	readonly completedClientMsgIds = new Set<string>();
 	readonly transportHealthy = true;
 
 	async start(): Promise<void> {}
@@ -82,7 +83,10 @@ class FakeSlackProvider implements SlackProviderClient {
 		}
 		this.postAttempts.push(input);
 		const duplicate = this.posts.findIndex(post => post.clientMsgId === input.clientMsgId);
-		if (duplicate >= 0) return { channel: input.channel, ts: `7.${duplicate + 1}`, client_msg_id: input.clientMsgId };
+		if (duplicate >= 0) {
+			this.completedClientMsgIds.add(input.clientMsgId);
+			return { channel: input.channel, ts: `7.${duplicate + 1}`, client_msg_id: input.clientMsgId };
+		}
 		const position = this.posts.push(input);
 		if (this.acceptThenThrowPosts > 0) {
 			this.acceptThenThrowPosts -= 1;
@@ -90,6 +94,7 @@ class FakeSlackProvider implements SlackProviderClient {
 			throw new SlackProviderError("connection", "chat.postMessage", undefined, undefined, true);
 		}
 		if (this.#publishGate) await this.#publishGate;
+		this.completedClientMsgIds.add(input.clientMsgId);
 		return { channel: input.channel, ts: `7.${position}`, client_msg_id: input.clientMsgId };
 	}
 
@@ -515,6 +520,18 @@ async function awaitPosts(provider: FakeSlackProvider, count: number): Promise<v
 	await Bun.sleep(25);
 }
 
+async function awaitCompletedPosts(provider: FakeSlackProvider, count: number): Promise<void> {
+	for (
+		let attempt = 0;
+		attempt < 2_000 && (provider.posts.length < count || provider.completedClientMsgIds.size < count);
+		attempt++
+	)
+		await Bun.sleep(1);
+	expect(provider.posts).toHaveLength(count);
+	expect(provider.completedClientMsgIds.size).toBeGreaterThanOrEqual(count);
+	await Bun.sleep(100);
+}
+
 async function awaitDiscordPosts(provider: FakeDiscordProvider, count: number): Promise<void> {
 	for (let attempt = 0; attempt < 2_000 && provider.posts.length < count; attempt++) await Bun.sleep(1);
 	expect(provider.posts).toHaveLength(count);
@@ -566,7 +583,7 @@ test("an established chat attachment that loses its open socket resumes from its
 			await starting;
 
 			host.emit("before the drop");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			// Drop the already-attached, already-active socket, then keep the session
 			// producing: these events exist only in the host's log until delivery resumes.
@@ -638,7 +655,7 @@ test("a live frame delivered before the resume replay answers is published in se
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			host.drop();
 			host.emit("two");
@@ -734,7 +751,7 @@ test("a supersession while a replay is pending discards it instead of replaying 
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			host.drop();
 			host.emit("two");
@@ -775,7 +792,7 @@ test("a replay refused on a live socket loses no event and leaves the cursor bel
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			host.drop();
 			host.emit("two");
@@ -869,7 +886,7 @@ test("a real 256-frame host ring loses only the sequences the host says it evict
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			host.drop();
 			host.emit("two");
@@ -1027,7 +1044,7 @@ test("a replay whose gap never states its range fails the barrier instead of pub
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			host.drop();
 			host.emit("two");
@@ -1478,6 +1495,60 @@ test("a rolled endpoint's first frame gets its own delivery budget, not the prev
 				{ sinceGeneration: GENERATION + 1, sinceSeq: 0 },
 				{ sinceGeneration: GENERATION + 1, sinceSeq: 0 },
 			]);
+		});
+	});
+}, 20_000);
+test("a frame queued behind a failed publication cannot advance the cursor past it", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile }) => {
+		await withFakeTransport(async () => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("one");
+			await awaitPosts(provider, 1);
+
+			// A later frame is already queued behind the failing one. The rollback a
+			// naive fix would apply is defeated here: `enqueueFrame` swallows the
+			// rejection, so the later frame runs. Only retiring the attachment on
+			// failure prevents its cursor from advancing past the undelivered sequence.
+			provider.failPosts = 1;
+			host.emit("two");
+			host.emit("three");
+			await awaitRefusals(provider, 1);
+			// Wait for the runtime to retire the attachment, not just for the surface to
+			// refuse: the failure warning is the synchronous completion signal from
+			// `#failDelivery` → `#failBarrier`, and reconciling before it arrives races a
+			// replay the delayed retirement would still discard.
+			for (
+				let attempt = 0;
+				attempt < 2_000 && !warnings.some(line => line.includes("publication failed at seq 2"));
+				attempt++
+			)
+				await Bun.sleep(1);
+			expect(warnings.some(line => line.includes("publication failed at seq 2"))).toBe(true);
+
+			// The cursor sits at seq 1 — below the failed publication — not at seq 2 or 3.
+			host.drop();
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitReplayRequests(host, 2);
+			expect(host.replayRequests).toEqual([
+				{ sinceGeneration: GENERATION, sinceSeq: 0 },
+				{ sinceGeneration: GENERATION, sinceSeq: 1 },
+			]);
+
+			// The failed frame is re-served and published, and the frame queued behind it
+			// follows in order. Neither is permanently lost or duplicated.
+			await awaitPosts(provider, 3);
+			await Bun.sleep(20);
+			expect(provider.posts.map(post => post.text)).toEqual([
+				"GJC notice\none",
+				"GJC notice\ntwo",
+				"GJC notice\nthree",
+			]);
+			expect(warnings.filter(line => line.includes("publication failed at seq 2"))).toHaveLength(1);
 		});
 	});
 }, 20_000);

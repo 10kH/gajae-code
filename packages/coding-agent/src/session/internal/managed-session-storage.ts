@@ -9,7 +9,7 @@ import type {
 	RecoveryFsIdentity,
 	RecoveryFsRoot,
 } from "@gajae-code/natives";
-import type { SessionStorageStat } from "../session-storage";
+import type { SessionStorageRangeSnapshot, SessionStorageStat } from "../session-storage";
 import {
 	classifyNativePublishOutcome,
 	formatNativePublishDiagnostic,
@@ -42,6 +42,8 @@ export const MANAGED_ARTIFACT_MAX_DEPTH = 32;
 export const MANAGED_ARTIFACT_MAX_FILES = 50_000;
 export const MANAGED_ARTIFACT_MAX_FILE_BYTES = 64 * 1024 * 1024;
 export const MANAGED_ARTIFACT_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
+const REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES = 64 * 1024;
+const REPLACEMENT_CLEANUP_RECEIPT_SCAN_LIMIT = MANAGED_ARTIFACT_MAX_FILES;
 export const MANAGED_ARTIFACT_COPY_BATCH_SIZE = 256;
 const LOCK_LEASE_MS = 60_000;
 const LOCK_HEARTBEAT_MS = 10_000;
@@ -86,6 +88,23 @@ export class ManagedReplaceError extends Error {
 		this.retainedUnknownPath = result.retainedUnknownPath;
 		this.replacementCause = replacementCause;
 	}
+}
+
+export class ManagedCommittedMutationError extends Error {
+	constructor(
+		readonly operation: "replace" | "append",
+		cause: unknown,
+	) {
+		super(`managed_${operation}_committed_outcome_uncertain`, { cause });
+		this.name = "ManagedCommittedMutationError";
+	}
+}
+
+function managedAppendFailure(code: string | undefined): Error {
+	const error = new Error(code ?? "managed_append_failed");
+	return code === "content_too_large" || code === "too_large" || code === "header_patch_write_failed"
+		? error
+		: new ManagedCommittedMutationError("append", error);
 }
 
 function publishFailure(outcome: NativePublishOutcome): ManagedPublishError {
@@ -384,6 +403,39 @@ function replacementCleanupReceiptBinding(
 	return predecessor.dev <= U64_MAX && predecessor.ino <= U64_MAX && receipt.dev <= U64_MAX && receipt.ino <= U64_MAX
 		? { predecessor, receipt }
 		: undefined;
+}
+
+function parseReplacementIdentity(value: unknown): ManagedFileSnapshot["identity"] | undefined {
+	const parsed = parseLegacyReplacementCleanupIdentity(value);
+	if (!parsed || parsed.size > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+	return {
+		dev: parsed.dev,
+		ino: parsed.ino,
+		nlink: parsed.nlink,
+		size: Number(parsed.size),
+		mtimeNs: parsed.mtimeNs,
+		ctimeNs: parsed.ctimeNs,
+		sha256: parsed.sha256,
+	};
+}
+
+function parseReplacementCleanupReceipt(bytes: Uint8Array): ReplacementCleanupReceipt | undefined {
+	let value: unknown;
+	try {
+		value = JSON.parse(Buffer.from(bytes).toString("utf8")) as unknown;
+	} catch {
+		return undefined;
+	}
+	const receipt = asRecord(value);
+	if (
+		receipt?.version !== 3 ||
+		typeof receipt.staging !== "string" ||
+		typeof receipt.destination !== "string" ||
+		!parseReplacementIdentity(receipt.successor) ||
+		!parseReplacementIdentity(receipt.predecessor)
+	)
+		return undefined;
+	return receipt as ReplacementCleanupReceipt;
 }
 
 function serializeReplacementIdentity(identity: ManagedFileSnapshot["identity"]): SerializedReplacementIdentity {
@@ -952,7 +1004,12 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 	}
 	#assertBound(): void {
-		if (!this.#authority) return;
+		if (!this.#authority) {
+			const named = fs.statSync(this.#baseDir, { bigint: true });
+			if (!named.isDirectory() || named.dev !== this.#subtreeRoot.dev || named.ino !== this.#subtreeRoot.ino)
+				throw new Error("Managed descendant root binding changed");
+			return;
+		}
 		const named = fs.lstatSync(this.#baseDir, { bigint: true });
 		const retained =
 			this.#authorityBaseDir === this.#baseDir
@@ -1029,7 +1086,7 @@ export class ManagedSessionDescendantStore {
 		if (!binding) throw new Error("managed_replace_cleanup_receipt_invalid");
 		let receipt: ManagedFileSnapshot;
 		try {
-			receipt = captureManagedFileNoFollow(receiptPath);
+			receipt = captureManagedFilePrefixNoFollow(receiptPath, REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
 			throw error;
@@ -1074,7 +1131,7 @@ export class ManagedSessionDescendantStore {
 		if (!binding) throw new Error("managed_replace_cleanup_receipt_invalid");
 		let receipt: ManagedFileSnapshot;
 		try {
-			receipt = captureManagedFileNoFollow(receiptPath);
+			receipt = captureManagedFilePrefixNoFollow(receiptPath, REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
 			throw error;
@@ -1109,7 +1166,7 @@ export class ManagedSessionDescendantStore {
 
 		let currentReceipt: ManagedFileSnapshot;
 		try {
-			currentReceipt = captureManagedFileNoFollow(receiptPath);
+			currentReceipt = captureManagedFilePrefixNoFollow(receiptPath, REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
 				fsyncDirectory(this.#baseDir);
@@ -1138,27 +1195,82 @@ export class ManagedSessionDescendantStore {
 		fsyncDirectory(this.#baseDir);
 	}
 
+	#reconcilePendingReplacementReceipt(receiptPath: string): void {
+		const pending = captureManagedFilePrefixNoFollow(receiptPath, REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES);
+		const parsed = parseReplacementCleanupReceipt(pending.bytes);
+		const predecessor = parsed ? parseReplacementIdentity(parsed.predecessor) : undefined;
+		if (
+			!parsed ||
+			!predecessor ||
+			path.dirname(path.resolve(parsed.staging)) !== this.#baseDir ||
+			path.dirname(path.resolve(parsed.destination)) !== this.#baseDir
+		)
+			throw new Error("managed_replace_cleanup_receipt_invalid");
+		const destination = replacementReceiptPath(this.#baseDir, predecessor, pending.identity);
+		const outcome = classifyNativePublishOutcome(
+			nativeSessionStorage().renameNoReplacePath(receiptPath, destination),
+		);
+		if (outcome.ok) {
+			fsyncDirectory(this.#baseDir);
+			return;
+		}
+		if (outcome.reason === "destination_exists") {
+			const existing = captureManagedFilePrefixNoFollow(destination, REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES);
+			if (existing.identity.sha256 !== pending.identity.sha256)
+				throw new Error("managed_replace_cleanup_receipt_invalid");
+			const removed = nativeSessionStorage().exactUnlink(receiptPath, {
+				dev: pending.identity.dev,
+				ino: pending.identity.ino,
+				nlink: pending.identity.nlink,
+				parentDev: this.#subtreeRoot.dev,
+				parentIno: this.#subtreeRoot.ino,
+				size: BigInt(pending.identity.size),
+				mtimeNs: pending.identity.mtimeNs,
+				sha256: pending.identity.sha256,
+				quarantineName: `.gjc-receipt-pending-remove-${pending.identity.dev.toString(16)}-${pending.identity.ino.toString(16)}`,
+			});
+			if (!exactUnlinkCompleted(removed) && removed.code !== "not_found")
+				throw new Error(`managed_replace_receipt_cleanup_pending:${removed.code ?? "unknown"}`);
+			fsyncDirectory(this.#baseDir);
+			return;
+		}
+		throw publishFailure(outcome);
+	}
+
 	#reconcileReplacementCleanupReceipts(): void {
 		if (this.#reconcilingReplacementCleanup) return;
 		this.#reconcilingReplacementCleanup = true;
 		try {
-			for (const name of fs.readdirSync(this.#baseDir)) {
-				if (!name.startsWith(".gjc-replace-cleanup-")) continue;
-				if (replacementCleanupReceiptBinding(name)) {
-					try {
-						this.#detachReplacementCleanupReceipt(path.join(this.#baseDir, name));
-					} catch (error) {
-						// A transient Windows handle/AV failure leaves the receipt intact for a
-						// later reconciliation; it must not abort the session mutation.
-						if (!isRetryableReplacementReceiptCleanupError(error)) throw error;
+			const directory = fs.opendirSync(this.#baseDir);
+			try {
+				let examined = 0;
+				for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
+					examined++;
+					if (examined > REPLACEMENT_CLEANUP_RECEIPT_SCAN_LIMIT)
+						throw new Error("managed_replace_cleanup_receipt_limit_exceeded");
+					const name = entry.name;
+					if (!name.startsWith(".gjc-replace-receipt-pending-") && !name.startsWith(".gjc-replace-cleanup-"))
+						continue;
+					if (name.startsWith(".gjc-replace-receipt-pending-")) {
+						this.#reconcilePendingReplacementReceipt(path.join(this.#baseDir, name));
+						continue;
 					}
-					continue;
+					if (replacementCleanupReceiptBinding(name)) {
+						try {
+							this.#detachReplacementCleanupReceipt(path.join(this.#baseDir, name));
+						} catch (error) {
+							if (!isRetryableReplacementReceiptCleanupError(error)) throw error;
+						}
+						continue;
+					}
+					if (legacyReplacementCleanupReceiptBinding(name)) {
+						this.#reconcileLegacyReplacementCleanupReceipt(path.join(this.#baseDir, name), name);
+						continue;
+					}
+					throw new Error("managed_replace_cleanup_receipt_invalid");
 				}
-				if (legacyReplacementCleanupReceiptBinding(name)) {
-					this.#reconcileLegacyReplacementCleanupReceipt(path.join(this.#baseDir, name), name);
-					continue;
-				}
-				throw new Error("managed_replace_cleanup_receipt_invalid");
+			} finally {
+				directory.closeSync();
 			}
 		} finally {
 			this.#reconcilingReplacementCleanup = false;
@@ -1281,18 +1393,20 @@ export class ManagedSessionDescendantStore {
 
 	captureBoundedAppendExpectation(relativePath: string): ManagedBoundedAppendExpectation | undefined {
 		this.#assertBound();
-		if (!this.#authority) return undefined;
-		const observed = this.#authority.stat(this.#relative(this.#resolve(relativePath)));
-		if (!observed.ok || !observed.identity) return undefined;
-		const sha256 = observed.identity.sha256;
-		if (typeof sha256 !== "string" || !/^[0-9a-f]{64}$/i.test(sha256)) return undefined;
+		let identity: ManagedFileSnapshot["identity"];
+		try {
+			identity = captureManagedFileIdentityStreamingNoFollow(this.#resolve(relativePath));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		}
 		return {
-			dev: observed.identity.dev,
-			ino: observed.identity.ino,
-			size: observed.identity.size,
-			mtimeNs: observed.identity.mtimeNs,
-			ctimeNs: observed.identity.ctimeNs,
-			sha256: sha256.toLowerCase(),
+			dev: identity.dev.toString(),
+			ino: identity.ino.toString(),
+			size: identity.size.toString(),
+			mtimeNs: identity.mtimeNs.toString(),
+			ctimeNs: identity.ctimeNs.toString(),
+			sha256: identity.sha256,
 		};
 	}
 
@@ -1303,7 +1417,26 @@ export class ManagedSessionDescendantStore {
 	): ManagedAppendReceipt {
 		this.#beforeMutation();
 		this.#assertBound();
-		if (!this.#authority) throw new Error("managed_bounded_append_unavailable");
+		if (!this.#authority) {
+			const current = captureManagedFileIdentityStreamingNoFollow(this.#resolve(relativePath));
+			if (
+				current.dev.toString() !== expected.dev ||
+				current.ino.toString() !== expected.ino ||
+				current.size.toString() !== expected.size ||
+				current.mtimeNs.toString() !== expected.mtimeNs ||
+				current.ctimeNs.toString() !== expected.ctimeNs ||
+				current.sha256 !== expected.sha256
+			)
+				throw new Error("managed_append_identity_mismatch");
+			const appended = appendManagedFileStreamingSync(
+				this.#resolve(relativePath),
+				bytes,
+				this.#subtreeRoot,
+				this.#policy,
+			);
+			this.#assertBound();
+			return managedAppendReceiptFromIdentity(appended);
+		}
 		const relative = this.#relative(this.#resolve(relativePath));
 		const appended = this.#authority.appendManaged(
 			relative,
@@ -1315,11 +1448,11 @@ export class ManagedSessionDescendantStore {
 			expected.ctimeNs,
 			expected.sha256,
 		);
-		if (!appended.ok) throw new Error(appended.code ?? "managed_append_failed");
-		const stat = this.#authority.stat(relative);
-		if (!stat.ok || !stat.identity) throw new Error(stat.code ?? "managed_append_identity_unavailable");
+		if (!appended.ok) throw managedAppendFailure(appended.code);
+		if (!appended.identity)
+			throw new ManagedCommittedMutationError("append", new Error("managed_append_identity_unavailable"));
 		this.#assertBound();
-		return managedAppendReceiptFromIdentity(managedFileIdentityFromNative(stat.identity));
+		return managedAppendReceiptFromIdentity(managedFileIdentityFromNative(appended.identity));
 	}
 
 	appendSync(relativePath: string, bytes: Uint8Array): ManagedAppendReceipt {
@@ -1346,12 +1479,10 @@ export class ManagedSessionDescendantStore {
 				observed.identity.ctimeNs,
 				expectedSha256,
 			);
-			if (!appended.ok) throw new Error(appended.code ?? "managed_append_failed");
-			// Post-fsync descriptor capture through retained authority: the native append
-			// is synchronous and durable, so the stat reflects the committed object.
-			const stat = this.#authority.stat(relative);
-			if (!stat.ok || !stat.identity) throw new Error(stat.code ?? "managed_append_identity_unavailable");
-			const receipt = managedAppendReceiptFromIdentity(managedFileIdentityFromNative(stat.identity));
+			if (!appended.ok) throw managedAppendFailure(appended.code);
+			if (!appended.identity)
+				throw new ManagedCommittedMutationError("append", new Error("managed_append_identity_unavailable"));
+			const receipt = managedAppendReceiptFromIdentity(managedFileIdentityFromNative(appended.identity));
 			this.#assertBound();
 			return receipt;
 		}
@@ -1363,6 +1494,30 @@ export class ManagedSessionDescendantStore {
 		const receipt = managedAppendReceiptFromIdentity(successor);
 		this.#assertBound();
 		return receipt;
+	}
+
+	#assertPathBackedReadRelative(relativePath: string): void {
+		if (!this.#authority && relativePath.split(/[\\/]/).length > 1)
+			throw new Error("managed_nested_path_unsupported");
+	}
+
+	/**
+	 * Without retained root authority a nested read resolves through intermediate
+	 * directories that `O_NOFOLLOW` does not cover, so each component between the
+	 * bound base directory and the target is verified as a real same-device
+	 * directory before the capture opens the leaf.
+	 */
+	#assertPathBackedDirectoryChain(resolved: string): void {
+		if (this.#authority) return;
+		const relative = path.relative(this.#baseDir, resolved);
+		const components = relative.split(path.sep);
+		let current = this.#baseDir;
+		for (const component of components.slice(0, -1)) {
+			current = path.join(current, component);
+			const stat = fs.lstatSync(current, { bigint: true });
+			if (!stat.isDirectory() || stat.isSymbolicLink() || stat.dev !== this.#subtreeRoot.dev)
+				throw new Error("Managed descendant path escapes retained store");
+		}
 	}
 
 	#relative(resolved: string): string {
@@ -1473,11 +1628,59 @@ export class ManagedSessionDescendantStore {
 
 	/** Capture descriptor identity without copying file bytes when retained authority is available. */
 	descriptorExpected(relativePath: string): SessionStorageStat | null {
+		this.#assertPathBackedReadRelative(relativePath);
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
-			const snapshot = this.readExpected(relativePath);
-			return snapshot ? managedAppendReceiptFromIdentity(snapshot.identity).descriptor : null;
+			const rootBefore = fs.lstatSync(this.#baseDir, { bigint: true });
+			if (
+				!rootBefore.isDirectory() ||
+				rootBefore.isSymbolicLink() ||
+				rootBefore.dev !== this.#subtreeRoot.dev ||
+				rootBefore.ino !== this.#subtreeRoot.ino
+			)
+				throw new Error("Managed descendant root binding changed");
+			let fd: number | undefined;
+			try {
+				fd = fs.openSync(
+					resolved,
+					fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0),
+				);
+				const opened = fs.fstatSync(fd, { bigint: true });
+				const named = fs.lstatSync(resolved, { bigint: true });
+				if (
+					!opened.isFile() ||
+					opened.nlink > 1n ||
+					!named.isFile() ||
+					named.isSymbolicLink() ||
+					named.dev !== opened.dev ||
+					named.ino !== opened.ino ||
+					named.nlink !== opened.nlink
+				)
+					throw new Error("source_changed");
+				const rootAfter = fs.lstatSync(this.#baseDir, { bigint: true });
+				if (
+					!rootAfter.isDirectory() ||
+					rootAfter.isSymbolicLink() ||
+					rootAfter.dev !== rootBefore.dev ||
+					rootAfter.ino !== rootBefore.ino
+				)
+					throw new Error("Managed descendant root binding changed");
+				this.#assertBound();
+				return managedAppendReceiptFromIdentity({
+					dev: opened.dev,
+					ino: opened.ino,
+					nlink: opened.nlink,
+					size: Number(opened.size),
+					mtimeNs: opened.mtimeNs,
+					ctimeNs: opened.ctimeNs,
+				}).descriptor;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+				throw error;
+			} finally {
+				if (fd !== undefined) fs.closeSync(fd);
+			}
 		}
 		const stat = this.#authority.stat(this.#relative(resolved));
 		if (!stat.ok) {
@@ -1488,13 +1691,132 @@ export class ManagedSessionDescendantStore {
 		return managedAppendReceiptFromIdentity(managedFileIdentityFromNative(stat.identity)).descriptor;
 	}
 
+	/**
+	 * Read one bounded range through a no-follow descriptor while binding the
+	 * opened file to retained authority (when available) and the managed root
+	 * before and after the read. This avoids whole-transcript capture for cold
+	 * managed-session indexing without weakening pathname authority.
+	 */
+	readRangeExpectedSync(
+		relativePath: string,
+		start: number,
+		length: number,
+		expectedDescriptor?: Pick<SessionStorageStat, "dev" | "ino" | "nlink" | "size" | "mtimeNs" | "ctimeNs">,
+	): SessionStorageRangeSnapshot {
+		if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(length) || length < 0)
+			throw new RangeError("Invalid managed range read");
+		if (start > Number.MAX_SAFE_INTEGER - length) throw new RangeError("Managed range read start overflows");
+		if (length > 64 * 1024 * 1024) throw new RangeError("Managed range read exceeds the bounded maximum");
+		this.#assertPathBackedReadRelative(relativePath);
+		this.#assertBound();
+		const rootBefore = fs.lstatSync(this.#baseDir, { bigint: true });
+		if (
+			!rootBefore.isDirectory() ||
+			rootBefore.isSymbolicLink() ||
+			rootBefore.dev !== this.#subtreeRoot.dev ||
+			rootBefore.ino !== this.#subtreeRoot.ino
+		)
+			throw new Error("Managed descendant root binding changed");
+		const resolved = this.#resolve(relativePath);
+		const relative = this.#relative(resolved);
+		const retained = this.#authority?.stat(relative);
+		if (retained && !retained.ok) {
+			if (retained.code === "not_found")
+				throw Object.assign(new Error("Managed file not found"), { code: "ENOENT" });
+			throw new Error(retained.code ?? "managed_stat_failed");
+		}
+		if (retained && !retained.identity) throw new Error("managed_stat_identity_unavailable");
+		const fd = fs.openSync(
+			resolved,
+			fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0),
+		);
+		try {
+			const before = fs.fstatSync(fd, { bigint: true });
+			if (!before.isFile() || before.nlink > 1n) throw new Error("source_changed");
+			if (retained?.identity) {
+				const expected = retained.identity;
+				if (
+					before.dev.toString() !== expected.dev ||
+					before.ino.toString() !== expected.ino ||
+					before.nlink.toString() !== expected.nlink ||
+					before.size.toString() !== expected.size ||
+					before.mtimeNs.toString() !== expected.mtimeNs ||
+					before.ctimeNs.toString() !== expected.ctimeNs
+				)
+					throw new Error("source_changed");
+			}
+			if (
+				expectedDescriptor &&
+				(before.dev !== expectedDescriptor.dev ||
+					before.ino !== expectedDescriptor.ino ||
+					before.nlink !== (expectedDescriptor.nlink ?? before.nlink) ||
+					Number(before.size) !== expectedDescriptor.size ||
+					before.mtimeNs !== expectedDescriptor.mtimeNs ||
+					before.ctimeNs !== expectedDescriptor.ctimeNs)
+			)
+				throw new Error("managed_range_generation_mismatch");
+			if (Number(before.size) < start + length) throw new Error("range_not_present");
+			const bytes = Buffer.alloc(length);
+			let offset = 0;
+			while (offset < length) {
+				const count = fs.readSync(fd, bytes, offset, length - offset, start + offset);
+				if (count === 0) throw new Error("range_not_present");
+				offset += count;
+			}
+			const after = fs.fstatSync(fd, { bigint: true });
+			const named = fs.lstatSync(resolved, { bigint: true });
+			if (
+				after.dev !== before.dev ||
+				after.ino !== before.ino ||
+				after.nlink !== before.nlink ||
+				after.size !== before.size ||
+				after.mtimeNs !== before.mtimeNs ||
+				after.ctimeNs !== before.ctimeNs ||
+				!named.isFile() ||
+				named.isSymbolicLink() ||
+				named.dev !== before.dev ||
+				named.ino !== before.ino ||
+				named.nlink !== before.nlink
+			)
+				throw new Error("source_changed");
+			const rootAfter = fs.lstatSync(this.#baseDir, { bigint: true });
+			if (
+				!rootAfter.isDirectory() ||
+				rootAfter.isSymbolicLink() ||
+				rootAfter.dev !== rootBefore.dev ||
+				rootAfter.ino !== rootBefore.ino
+			)
+				throw new Error("Managed descendant root binding changed");
+			this.#assertBound();
+			return {
+				bytes,
+				stat: {
+					dev: after.dev,
+					ino: after.ino,
+					nlink: after.nlink,
+					size: Number(after.size),
+					mtimeNs: after.mtimeNs,
+					ctimeNs: after.ctimeNs,
+					mtimeMs: Number(after.mtimeNs) / 1_000_000,
+					mtime: new Date(Number(after.mtimeNs) / 1_000_000),
+					isFile: true,
+				},
+			};
+		} finally {
+			fs.closeSync(fd);
+		}
+	}
 	/** Read an exact managed file without exposing its pathname as authority. */
 	readExpected(relativePath: string): ManagedFileSnapshot | null {
 		this.#assertBound();
-		const relative = this.#relative(this.#resolve(relativePath));
+		const resolved = this.#resolve(relativePath);
+		const relative = this.#relative(resolved);
 		if (!this.#authority) {
 			try {
-				return captureManagedFileNoFollow(this.#resolve(relativePath));
+				this.#assertPathBackedDirectoryChain(resolved);
+				const captured = captureManagedFileNoFollow(resolved);
+				this.#assertBound();
+				return captured;
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
 				throw error;
@@ -1525,12 +1847,15 @@ export class ManagedSessionDescendantStore {
 		this.#beforeMutation();
 		this.#assertBound();
 		if (!this.#authority) {
+			const parent = fs.statSync(path.dirname(this.#resolve(relativePath)), { bigint: true });
 			const removed = nativeSessionStorage().exactUnlink(this.#resolve(relativePath), {
 				dev: expected.identity.dev,
 				ino: expected.identity.ino,
 				size: BigInt(expected.identity.size),
 				mtimeNs: expected.identity.mtimeNs,
 				sha256: expected.identity.sha256,
+				parentDev: parent.dev,
+				parentIno: parent.ino,
 				quarantineName: `.gjc-remove-${process.pid}-${randomUUID()}`,
 			});
 			if (
@@ -1559,6 +1884,31 @@ export class ManagedSessionDescendantStore {
 		if (!removed.ok && !(removed.code === "cleanup_pending" && removed.recoveryPath !== undefined))
 			throw new Error(removed.code ?? "managed_remove_failed");
 		this.#assertBound();
+	}
+
+	/** Remove one exact file without allocating its contents. */
+	removeIfExistsDescriptor(relativePath: string): boolean {
+		this.#beforeMutation();
+		this.#assertBound();
+		const resolved = this.#resolve(relativePath);
+		let named: fs.BigIntStats;
+		try {
+			named = fs.lstatSync(resolved, { bigint: true });
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+			throw error;
+		}
+		if (!named.isFile() || named.isSymbolicLink()) throw new Error("managed_remove_failed");
+		let identity: ManagedFileSnapshot["identity"];
+		try {
+			identity = captureManagedFileIdentityStreamingNoFollow(resolved);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+			throw error;
+		}
+		this.#assertBound();
+		this.removeExpected(relativePath, { bytes: Buffer.alloc(0), identity });
+		return true;
 	}
 	/** Read and remove one managed descendant through retained authority. */
 	async consume(relativePath: string): Promise<Uint8Array | null> {
@@ -1608,14 +1958,28 @@ export class ManagedSessionDescendantStore {
 	/** Capture a complete descendant tree through this retained root. */
 	captureTree(relativePath: string): NativeDirectoryTreeSnapshot {
 		this.#assertBound();
+		const resolved = this.#resolve(relativePath);
+		try {
+			fs.lstatSync(resolved);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error("not_found");
+			throw error;
+		}
+		validateManagedArtifactTree(resolved);
 		const relative = this.#relative(this.#resolve(relativePath));
 		if (this.#authority) {
 			const captured = this.#authority.snapshotManagedTree(relative);
-			if (!captured.ok || !captured.snapshot) throw new Error(captured.code ?? "unsafe_artifacts");
+			if (!captured.ok || !captured.snapshot)
+				throw new Error(
+					captured.code === "not_found" ? "artifact_source_changed" : (captured.code ?? "unsafe_artifacts"),
+				);
 			return captured.snapshot;
 		}
 		const captured = nativeSessionStorage().snapshotDirectoryTree(this.#resolve(relativePath));
-		if (!captured.ok || !captured.snapshot) throw new Error(captured.code ?? "unsafe_artifacts");
+		if (!captured.ok || !captured.snapshot)
+			throw new Error(
+				captured.code === "not_found" ? "artifact_source_changed" : (captured.code ?? "unsafe_artifacts"),
+			);
 		return captured.snapshot;
 	}
 
@@ -1871,7 +2235,8 @@ function sameReplacementIdentity(
 		left.ino === right.ino &&
 		left.nlink === right.nlink &&
 		left.size === right.size &&
-		left.mtimeNs === right.mtimeNs
+		left.mtimeNs === right.mtimeNs &&
+		left.sha256 === right.sha256
 	);
 }
 
@@ -2021,7 +2386,7 @@ export function captureManagedFileNoFollow(pathname: string): ManagedFileSnapsho
 }
 
 function captureManagedFileNoFollowLimit(pathname: string, maxBytes?: number): ManagedFileSnapshot {
-	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0));
 	try {
 		const before = fs.fstatSync(fd, { bigint: true });
 		if (!before.isFile() || before.nlink > 1) throw new Error("source_changed");
@@ -2047,7 +2412,7 @@ function captureManagedFileNoFollowLimit(pathname: string, maxBytes?: number): M
 /** Streams a managed file once while retaining only a bounded header prefix and the full descriptor-bound digest. */
 export function inspectManagedFileNoFollow(pathname: string, prefixLimit: number): ManagedFileSnapshot {
 	if (!Number.isSafeInteger(prefixLimit) || prefixLimit < 0) throw new Error("invalid_capture_limit");
-	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0));
 	try {
 		const before = fs.fstatSync(fd, { bigint: true });
 		if (!before.isFile() || before.nlink > 1) throw new Error("source_changed");
@@ -2078,7 +2443,7 @@ export function inspectManagedFileNoFollow(pathname: string, prefixLimit: number
 }
 
 function captureManagedFileIdentityStreamingNoFollow(pathname: string): ManagedFileSnapshot["identity"] {
-	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0));
 	try {
 		const before = fs.fstatSync(fd, { bigint: true });
 		if (!before.isFile() || before.nlink > 1) throw new Error("source_changed");
@@ -2108,6 +2473,7 @@ export async function publishManagedFileNoReplace(
 	root?: ManagedDirectoryRoot,
 	policy: ManagedSessionSecurityPolicy = "default",
 ): Promise<void> {
+	if (bytes.byteLength > MANAGED_ARTIFACT_MAX_FILE_BYTES) throw new Error("content_too_large");
 	const parent = path.dirname(destination);
 	ensureManagedDirectory(parent, root, policy);
 	const staging = path.join(parent, `.${path.basename(destination)}.${randomUUID()}.staging`);
@@ -2189,6 +2555,7 @@ export function publishManagedFileNoReplaceSync(
 	root?: ManagedDirectoryRoot,
 	policy: ManagedSessionSecurityPolicy = "default",
 ): ManagedFileSnapshot["identity"] {
+	if (bytes.byteLength > MANAGED_ARTIFACT_MAX_FILE_BYTES) throw new Error("content_too_large");
 	const parent = path.dirname(destination);
 	ensureManagedDirectory(parent, root, policy);
 	const staging = path.join(parent, `.${path.basename(destination)}.${randomUUID()}.staging`);
@@ -2260,7 +2627,9 @@ function replaceManagedFileGeneratedSync(
 	policy: ManagedSessionSecurityPolicy = "default",
 	assertFence?: () => void,
 	expectedDestination?: ManagedFileSnapshot["identity"],
-): void {
+	acceptCommittedCleanupFailure = false,
+	operation: "replace" | "append" = "replace",
+): ManagedFileSnapshot["identity"] {
 	const parent = path.dirname(destination);
 	ensureManagedDirectory(parent, root, policy);
 	const staging = path.join(parent, `.${path.basename(destination)}.${randomUUID()}.replacement`);
@@ -2277,6 +2646,10 @@ function replaceManagedFileGeneratedSync(
 		  }
 		| undefined;
 	let failure: unknown;
+	let publishedIdentity: ManagedFileSnapshot["identity"] | undefined;
+	let publicationDurable = false;
+	let publicationCommitted = false;
+	let expectedSuccessor: ManagedFileSnapshot["identity"] | undefined;
 	try {
 		fd = fs.openSync(
 			staging,
@@ -2284,11 +2657,14 @@ function replaceManagedFileGeneratedSync(
 			0o600,
 		);
 		secureFileDescriptor(staging, fd, "apply");
+		const initiallyStaged = fs.fstatSync(fd, { bigint: true });
+		stagedIdentity = { dev: initiallyStaged.dev, ino: initiallyStaged.ino };
 		const generated = writeContent(fd);
 		fs.fsyncSync(fd);
 		secureFileDescriptor(staging, fd, "verify");
 		const staged = fs.fstatSync(fd, { bigint: true });
 		stagedIdentity = { dev: staged.dev, ino: staged.ino };
+		expectedSuccessor = identity(staged, generated.sha256);
 		if (process.platform === "win32" && expectedDestination) {
 			fs.closeSync(fd);
 			fd = undefined;
@@ -2298,7 +2674,7 @@ function replaceManagedFileGeneratedSync(
 		if (expectedDestination) {
 			const parentIdentity = fs.lstatSync(parent, { bigint: true });
 			if (Number(staged.size) !== generated.size) throw new Error("managed_replace_generated_size_changed");
-			const successor = identity(staged, generated.sha256);
+			const successor = expectedSuccessor;
 			const receiptStagingPath = path.join(parent, `.gjc-replace-receipt-pending-${randomUUID()}.json`);
 			preserveStaging = true;
 			const publishedReceiptIdentity = publishManagedFileNoReplaceSync(
@@ -2320,7 +2696,7 @@ function replaceManagedFileGeneratedSync(
 				nativeSessionStorage().renameNoReplacePath(receiptStagingPath, receiptPath),
 			);
 			if (!receiptPublish.ok) throw publishFailure(receiptPublish);
-			const namedReceipt = captureManagedFileNoFollow(receiptPath);
+			const namedReceipt = captureManagedFilePrefixNoFollow(receiptPath, REPLACEMENT_CLEANUP_RECEIPT_MAX_BYTES);
 			if (
 				namedReceipt.identity.dev !== publishedReceiptIdentity.dev ||
 				namedReceipt.identity.ino !== publishedReceiptIdentity.ino
@@ -2358,23 +2734,41 @@ function replaceManagedFileGeneratedSync(
 					sha256: expectedDestination.sha256,
 				},
 			);
-			if (!replaced.ok) throw new ManagedReplaceError(replaced, receiptCleanup.path);
-			const named = captureManagedFileIdentityStreamingNoFollow(destination);
-			if (!sameReplacementIdentity(named, successor) || named.sha256 !== successor.sha256)
-				throw new Error("destination_identity_changed");
+			if (!replaced.ok) {
+				publicationCommitted =
+					replaced.code === "cleanup_pending" ||
+					replaced.code === "durability_failed" ||
+					Boolean(
+						replaced.detachedPath ??
+							replaced.retainedSuccessorPath ??
+							replaced.retainedPlaceholderPath ??
+							replaced.retainedUnknownPath,
+					);
+				throw new ManagedReplaceError(replaced, receiptCleanup.path);
+			}
+			publicationCommitted = true;
 			fsyncDirectory(parent);
-		} else fs.renameSync(staging, destination);
+		} else {
+			fs.renameSync(staging, destination);
+			publicationCommitted = true;
+		}
 		assertManagedDirectoryRoot(root);
 		const named = fs.lstatSync(destination, { bigint: true });
 		if (!named.isFile() || named.isSymbolicLink() || named.dev !== staged.dev || named.ino !== staged.ino) {
 			throw new Error("destination_identity_changed");
 		}
+		if (!expectedSuccessor) throw new Error("managed_replace_identity_unavailable");
 		if (fd !== undefined) {
 			secureFileDescriptor(destination, fd, "verify");
 			fs.closeSync(fd);
 			fd = undefined;
 		}
 		fsyncDirectory(parent);
+		const verifiedIdentity = captureManagedFileIdentityStreamingNoFollow(destination);
+		if (!sameReplacementIdentity(verifiedIdentity, expectedSuccessor))
+			throw new Error("destination_identity_changed");
+		publishedIdentity = verifiedIdentity;
+		publicationDurable = true;
 		if (receiptCleanup) {
 			try {
 				const removed = nativeSessionStorage().exactUnlink(receiptCleanup.path, {
@@ -2404,9 +2798,27 @@ function replaceManagedFileGeneratedSync(
 			}
 		}
 	} catch (error) {
-		failure = error;
+		failure =
+			publicationCommitted && !publishedIdentity ? new ManagedCommittedMutationError(operation, error) : error;
 	} finally {
-		if (fd !== undefined) fs.closeSync(fd);
+		if (fd !== undefined) {
+			try {
+				fs.closeSync(fd);
+			} catch (error) {
+				if (publicationCommitted && !publishedIdentity) {
+					const cause =
+						failure === undefined
+							? error
+							: new AggregateError([failure, error], "Managed replacement and descriptor close both failed.");
+					failure = new ManagedCommittedMutationError(operation, cause);
+				} else {
+					failure =
+						failure === undefined
+							? error
+							: new AggregateError([failure, error], "Managed replacement and descriptor close both failed.");
+				}
+			}
+		}
 		if (stagedIdentity && !preserveStaging) {
 			try {
 				const named = fs.lstatSync(staging, { bigint: true });
@@ -2421,7 +2833,10 @@ function replaceManagedFileGeneratedSync(
 			}
 		}
 	}
-	if (failure !== undefined) throw failure;
+	if (failure !== undefined && !(acceptCommittedCleanupFailure && publicationDurable && publishedIdentity))
+		throw failure;
+	if (!publishedIdentity) throw new Error("managed_replace_identity_unavailable");
+	return publishedIdentity;
 }
 
 export function replaceManagedFileSync(
@@ -2432,6 +2847,7 @@ export function replaceManagedFileSync(
 	assertFence?: () => void,
 	expectedDestination?: ManagedFileSnapshot["identity"],
 ): void {
+	if (bytes.byteLength > MANAGED_ARTIFACT_MAX_FILE_BYTES) throw new Error("content_too_large");
 	replaceManagedFileGeneratedSync(
 		destination,
 		fd => {
@@ -2459,10 +2875,15 @@ function appendManagedFileStreamingSync(
 	policy: ManagedSessionSecurityPolicy,
 ): ManagedFileSnapshot["identity"] {
 	const predecessor = captureManagedFileIdentityStreamingNoFollow(destination);
-	replaceManagedFileGeneratedSync(
+	if (predecessor.size > MANAGED_ARTIFACT_MAX_FILE_BYTES - appendedBytes.byteLength)
+		throw new Error("content_too_large");
+	return replaceManagedFileGeneratedSync(
 		destination,
 		stagingFd => {
-			const sourceFd = fs.openSync(destination, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+			const sourceFd = fs.openSync(
+				destination,
+				fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0),
+			);
 			try {
 				const before = fs.fstatSync(sourceFd, { bigint: true });
 				if (!sameReplacementIdentity(identity(before, predecessor.sha256), predecessor))
@@ -2490,6 +2911,8 @@ function appendManagedFileStreamingSync(
 				)
 					throw new Error("managed_replace_identity_mismatch");
 				if (hash.copy().digest("hex") !== predecessor.sha256) throw new Error("managed_replace_identity_mismatch");
+				if (total > MANAGED_ARTIFACT_MAX_FILE_BYTES - appendedBytes.byteLength)
+					throw new Error("content_too_large");
 				let appended = 0;
 				while (appended < appendedBytes.byteLength) {
 					const amount = fs.writeSync(stagingFd, appendedBytes, appended, appendedBytes.byteLength - appended);
@@ -2506,8 +2929,9 @@ function appendManagedFileStreamingSync(
 		policy,
 		undefined,
 		predecessor,
+		true,
+		"append",
 	);
-	return captureManagedFileIdentityStreamingNoFollow(destination);
 }
 
 export async function replaceManagedFile(
@@ -2707,23 +3131,31 @@ export function validateManagedArtifactTree(root: string, limits: ManagedArtifac
 	};
 	const maxFiles = clampLimit(limits.maxFiles, MANAGED_ARTIFACT_MAX_FILES);
 	const maxTotalBytes = clampLimit(limits.maxTotalBytes, MANAGED_ARTIFACT_MAX_TOTAL_BYTES);
+	let entries = 0;
 	let files = 0;
 	let bytes = 0;
 	const visit = (directory: string, depth: number): void => {
 		if (depth > MANAGED_ARTIFACT_MAX_DEPTH) throw new Error("unsafe_artifacts");
-		for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-			const entryPath = path.join(directory, entry.name);
-			const stat = fs.lstatSync(entryPath);
-			if (stat.isSymbolicLink()) throw new Error("unsafe_artifacts");
-			if (stat.isDirectory()) {
-				visit(entryPath, depth + 1);
-				continue;
+		const handle = fs.opendirSync(directory);
+		try {
+			for (let entry = handle.readSync(); entry; entry = handle.readSync()) {
+				entries++;
+				if (entries > maxFiles) throw new Error("artifact_capacity_exceeded");
+				const entryPath = path.join(directory, entry.name);
+				const stat = fs.lstatSync(entryPath);
+				if (stat.isSymbolicLink()) throw new Error("unsafe_artifacts");
+				if (stat.isDirectory()) {
+					visit(entryPath, depth + 1);
+					continue;
+				}
+				if (stat.nlink > 1) throw new Error("unsafe_artifacts");
+				if (!stat.isFile() || stat.size > MANAGED_ARTIFACT_MAX_FILE_BYTES) throw new Error("unsafe_artifacts");
+				files++;
+				bytes += stat.size;
+				if (files > maxFiles || bytes > maxTotalBytes) throw new Error("artifact_capacity_exceeded");
 			}
-			if (stat.nlink > 1) throw new Error("unsafe_artifacts");
-			if (!stat.isFile() || stat.size > MANAGED_ARTIFACT_MAX_FILE_BYTES) throw new Error("unsafe_artifacts");
-			files++;
-			bytes += stat.size;
-			if (files > maxFiles || bytes > maxTotalBytes) throw new Error("artifact_capacity_exceeded");
+		} finally {
+			handle.closeSync();
 		}
 	};
 	const rootStat = fs.lstatSync(root);

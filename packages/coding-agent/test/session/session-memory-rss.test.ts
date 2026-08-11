@@ -35,6 +35,24 @@ interface GibForkWorkerResult {
 const enabled = process.env.GJC_SESSION_MEMORY_RSS === "1";
 
 describe.skipIf(!enabled)("session memory RSS plateau", () => {
+	it("captures a 128 MiB managed descriptor without reading the transcript into memory", () => {
+		const worker = path.join(import.meta.dir, "fixtures", "managed-descriptor-rss-worker.ts");
+		const result = Bun.spawnSync({
+			cmd: [process.execPath, worker],
+			env: process.env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(result.exitCode, result.stderr.toString()).toBe(0);
+		const measured = JSON.parse(result.stdout.toString()) as {
+			sourceBytes: number;
+			rssGrowthBytes: number;
+			externalGrowthBytes: number;
+		};
+		expect(measured.sourceBytes).toBe(128 * 1024 * 1024);
+		expect(measured.rssGrowthBytes).toBeLessThanOrEqual(16 * 1024 * 1024);
+		expect(measured.externalGrowthBytes).toBeLessThanOrEqual(16 * 1024 * 1024);
+	}, 60_000);
 	it("materializes a 24 MiB public provider context within the 64 MiB RSS budget", () => {
 		const worker = path.join(import.meta.dir, "fixtures", "session-memory-rss-worker.ts");
 		const result = Bun.spawnSync({

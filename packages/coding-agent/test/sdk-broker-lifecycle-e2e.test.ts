@@ -2336,6 +2336,46 @@ test("broker propagates an owned lifecycle startup failure without semantic read
 	}
 });
 
+test("broker preserves a code-less lifecycle startup failure message", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-startup-message-"));
+	const agentDir = path.join(root, "agent");
+	const fixture = path.join(root, "startup-failure.ts");
+	const previousCommand = process.env.GJC_SDK_SESSION_COMMAND;
+	const broker = new Broker({ agentDir });
+	try {
+		await fs.writeFile(
+			fixture,
+			`import { writeSessionLifecycleFailure } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/sdk/broker/lifecycle.ts"))};
+const request = JSON.parse(process.env.GJC_SDK_LIFECYCLE_REQUEST!);
+await writeSessionLifecycleFailure(
+	request.stateRoot,
+	request.sessionId,
+	request.effectMarker,
+	{ phase: "startup", reason: "failed", message: "owned synthetic startup failure" },
+	{ endpointGeneration: null, fenced: true, runtimeRemoved: true, hostStopped: true, brokerRegistrationReleased: true },
+);
+await Bun.sleep(60_000);
+`,
+		);
+		process.env.GJC_SDK_SESSION_COMMAND = `${process.execPath} ${fixture}`;
+		await broker.start();
+		const response = await broker.handleRequest(
+			"session.create",
+			{ cwd: root, readinessTimeoutMs: 4_000 },
+			"code-less-startup-failure",
+		);
+		expect(response).toMatchObject({
+			ok: false,
+			error: { code: "spawn_failed", message: "owned synthetic startup failure" },
+		});
+	} finally {
+		if (previousCommand === undefined) delete process.env.GJC_SDK_SESSION_COMMAND;
+		else process.env.GJC_SDK_SESSION_COMMAND = previousCommand;
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
 test("broker replays immutable lifecycle cleanup after a crash immediately after an exact detach", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-ledger-crash-"));
 	const agentDir = path.join(root, "agent");
@@ -2455,7 +2495,10 @@ await fs.rm(endpoint);
 				{ cwd: normalRoot, sessionId: normalSessionId, sessionPath: normalSessionPath },
 				"normal-after-verification",
 			);
-			expect(normalResponse).toMatchObject({ ok: false, error: { code: "spawn_failed" } });
+			expect(normalResponse).toMatchObject({
+				ok: false,
+				error: { code: "spawn_failed", message: "owned synthetic startup failure" },
+			});
 			const normalTerminal = (await fs.readFile(path.join(normalAgentDir, "sdk", "lifecycle-ledger.jsonl"), "utf8"))
 				.split("\n")
 				.filter(Boolean)
@@ -2753,6 +2796,66 @@ test("broker refuses a stale registered PID when no durable effect marker proves
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}
 });
+
+test("broker closes a live host whose workspace state root is gone using its registered incarnation", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-lost-workspace-"));
+	// The workspace — and with it the spawn-time lifecycle marker and endpoint —
+	// was deleted while the host kept running, which is exactly how an orphan that
+	// still serves its original source outlives every later close attempt.
+	const stateRoot = path.join(agentDir, "deleted-workspace", ".gjc", "state");
+	const child = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
+		stdio: ["ignore", "ignore", "ignore"],
+	});
+	const pid = child.pid;
+	const broker = new Broker({ agentDir });
+	try {
+		await broker.start();
+		const incarnation = processIncarnation(pid);
+		expect(incarnation).toBeString();
+
+		await broker.index.append({
+			type: "host_registered",
+			sessionId: "wrong-incarnation",
+			locator: { repo: "fixture", stateRoot },
+			endpointGeneration: 1,
+			pid,
+			processIncarnation: `${incarnation}-recycled`,
+		});
+		expect(await broker.handleRequest("session.close", { sessionId: "wrong-incarnation" }, "recycled-close")).toEqual(
+			{
+				ok: false,
+				error: {
+					code: "close_refused",
+					message: "Session endpoint is unavailable and its durable process identity could not be verified.",
+				},
+			},
+		);
+		expect(child.exitCode).toBeNull();
+
+		await broker.index.append({
+			type: "host_registered",
+			sessionId: "orphan",
+			locator: { repo: "fixture", stateRoot },
+			endpointGeneration: 1,
+			pid,
+			processIncarnation: incarnation,
+		});
+		const closed = await broker.handleRequest("session.close", { sessionId: "orphan" }, "orphan-close");
+		expect(closed).toMatchObject({ ok: true, result: { sessionId: "orphan" } });
+		expect(await child.exited).toBe(143);
+		// The killed host never withdrew its own registration, so the broker owes the
+		// index that retirement; leaving it open would keep advertising a dead session.
+		expect(await broker.handleRequest("session.list", {})).toMatchObject({
+			ok: true,
+			result: { sessions: [expect.objectContaining({ sessionId: "wrong-incarnation" })] },
+		});
+	} finally {
+		if (child.exitCode === null) child.kill("SIGKILL");
+		await child.exited;
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+}, 15_000);
 
 test("broker refuses same-generation close authority from a prior endpoint incarnation", async () => {
 	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-close-incarnation-"));
@@ -3249,7 +3352,7 @@ test("production post-registration startup failure proves cleanup and exact repl
 			ok: false,
 			error: {
 				code: "spawn_failed",
-				message: "No ready SDK endpoint remains available.",
+				message: "Lifecycle test failure after SDK host registration.",
 				endpoint: "unavailable",
 			},
 			startupFailure: {

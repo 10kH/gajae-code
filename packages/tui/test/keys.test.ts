@@ -99,6 +99,8 @@ describe("matchesKey", () => {
 });
 describe.each([
 	{ data: "\x1bq", kitty: false, key: "alt+q", expected: "alt+q" },
+	{ data: "\x1b\x1b[A", kitty: false, key: "alt+up", expected: "alt+up" },
+	{ data: "\x1b\x1b[B", kitty: false, key: "alt+down", expected: "alt+down" },
 	{ data: "\x1bC", kitty: true, key: "alt+shift+c", expected: "alt+shift+c" },
 	{ data: "\x1b[113;3u", kitty: true, key: "alt+q", expected: "alt+q" },
 	{ data: "\x1b[99;4u", kitty: true, key: "alt+shift+c", expected: "alt+shift+c" },
@@ -108,6 +110,16 @@ describe.each([
 		setKittyProtocolActive(kitty);
 		expect(matchesKey(data, key)).toBe(true);
 		expect(parseKey(data)).toBe(expected);
+		setKittyProtocolActive(false);
+	});
+});
+describe.each(["left", "right"] as const)("Terminal.app %s Option key", () => {
+	it("normalizes Meta-wrapped arrow input", () => {
+		setKittyProtocolActive(false);
+		expect(matchesKey("\x1b\x1b[A", "alt+up")).toBe(true);
+		expect(parseKey("\x1b\x1b[A")).toBe("alt+up");
+		expect(matchesKey("\x1b\x1b[B", "alt+down")).toBe(true);
+		expect(parseKey("\x1b\x1b[B")).toBe("alt+down");
 		setKittyProtocolActive(false);
 	});
 });
