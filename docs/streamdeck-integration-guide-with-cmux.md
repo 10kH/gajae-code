@@ -160,7 +160,7 @@ BACK | VibeQuant | gajae-code | HOME | NEXT
 
 #### Session and surface controls
 
-- `NEW SESSION`: create a terminal surface, ask for a worktree name, and run `gjc --worktree <name>` without selecting a profile.
+- `NEW SESSION`: create a terminal surface and ask for a worktree name; a blank answer starts a plain `gjc` session, while a name starts `gjc --worktree <name>`. Do not select a profile here.
 - `CLOSE TAB`: close the focused cmux surface.
 - `NEW WEBSITE`: create a native cmux browser surface in the current pane.
 - `STEER`: send `Esc`, wait 100 ms, then send `Enter`.
@@ -172,10 +172,10 @@ A session-only launcher can be implemented as:
 #!/bin/zsh
 set -u
 
-printf 'GJC worktree name (blank = auto): '
+printf 'GJC worktree name (blank = plain session): '
 IFS= read -r worktree_name
-args=(--worktree)
-[[ -n "$worktree_name" ]] && args+=("$worktree_name")
+args=()
+[[ -n "$worktree_name" ]] && args+=(--worktree "$worktree_name")
 exec "$HOME/.local/bin/gjc" "${args[@]}"
 ```
 
@@ -457,7 +457,7 @@ Check the focused cmux surface title. GJC-only commands intentionally fail close
 
 ### Worktree prompting does not appear
 
-Confirm the helper is executable, the new terminal inherited or entered a Git repository, and the helper invokes `gjc --worktree [name]`. Do not pass a filesystem path as the worktree name.
+Confirm the helper is executable. A blank name must invoke plain `gjc`; a non-empty name must invoke `gjc --worktree <name>` from a Git repository. Do not pass a filesystem path as the worktree name.
 
 ### Think level aborts the operation
 
