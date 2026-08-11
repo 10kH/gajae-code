@@ -62,7 +62,7 @@ The control surface should:
 8. Send `Shift+Tab` as one atomic key event. Do not emulate it with separately delivered `Esc`-prefixed text.
 9. Do not create duplicate browser tabs when an existing Chrome or Safari tab matches.
 10. Reuse a focused non-GJC terminal when the operator explicitly wants an in-place worktree launch.
-11. Keep Stream Deck profiles, local plugin installations, generated artwork, and SDK state outside the repository.
+11. Keep Stream Deck profiles, local plugin installations, generated artwork, and SDK state outside version control. Repository-local `.gjc/state/` is gitignored and is the authoritative SDK discovery location; do not move, delete, or copy it elsewhere.
 
 ## Reference environment
 
@@ -124,6 +124,7 @@ Before changing a profile:
 ```sh
 stamp="$(date +%Y%m%d-%H%M%S)"
 base="$HOME/Library/Application Support/com.elgato.StreamDeck"
+mkdir -p "$base/ManualBackups"
 ditto -c -k --sequesterRsrc --keepParent \
   "$base/ProfilesV3/<profile>.sdProfile" \
   "$base/ManualBackups/streamdeck-before-change-$stamp.zip"
@@ -189,7 +190,7 @@ Use explicit paths instead of recent-project discovery:
 - `gajae-code` -> `$HOME/Documents/Workspace/gajae-code`;
 - `HOME` -> `$HOME`.
 
-Parameterize these values for each operator. A fixed folder key creates a terminal surface in the current pane and sends `cd -- '<path>'`.
+Parameterize these values for each operator. A fixed folder key creates a terminal surface in the current pane and sends `cd -- '<path>'`. Store fully expanded absolute paths (or `$HOME`-relative values the plugin normalizes before shell-quoting) so single-quoting never suppresses tilde expansion.
 
 ### Page 3: focused GJC operations
 
@@ -210,7 +211,7 @@ Model profile keys submit commands to the focused GJC editor:
 /model gajae-code/kimi-gpt
 ```
 
-A profile must exist and be available to the current session. `kimi-gpt` is typically a user-defined profile in `~/.gjc/agent/models.yml`; do not document it as a bundled default unless the product adds it to the bundled profile set.
+A profile must exist and be available to the current session. The names shown above (`frontier-heavy`, `gpt-heavy`, `glm-deepseek`, `kimi-gpt`) are operator-defined examples, not bundled defaults; none of them ships with GJC. Provide matching definitions in `~/.gjc/agent/models.yml` or replace them with bundled profile names before the keys will work.
 
 #### Session controls
 
@@ -356,16 +357,17 @@ Reply with the exact active presentation ID:
 }
 ```
 
-Return to the ordinary profile controls when `action_resolved` arrives. If `reply_rejected` arrives, show an error and do not guess from question text, option text, workflow IDs, or earlier presentations.
+Return to the ordinary profile controls only when `action_resolved` arrives for the **same presentation ID currently displayed**; an `action_resolved` for a different session can arrive while another question's pad is still active, so match the frame `id` against the displayed presentation before clearing it. If `reply_rejected` arrives, show an error and do not guess from question text, option text, workflow IDs, or earlier presentations.
 
 Only display the fixed answer pad when:
 
 - the question belongs to the focused GJC session;
 - the session-to-surface mapping is exact;
 - the action is still active;
-- the question has one to four scalar options.
+- the question has one to four scalar options;
+- the action has no negotiated `controls` (multi-select and other controlled asks are not safe for a fixed numeric reply).
 
-Leave free-text, multi-select, and larger option sets to the native GJC UI.
+Leave free-text, multi-select, controlled, and larger option sets to the native GJC UI.
 
 ## Mascot artwork
 
@@ -389,7 +391,7 @@ Represent each key with an action UUID and small settings payload. A generic con
 
 ```json
 { "name": "new-website-tab", "type": "newWebsiteTab" }
-{ "name": "folder-gajae", "type": "fixedFolder", "path": "~/src/gajae-code", "label": "gajae-code" }
+{ "name": "folder-gajae", "type": "fixedFolder", "path": "$HOME/src/gajae-code", "label": "gajae-code" }
 { "name": "set-kimi-gpt", "type": "command", "value": "/model gajae-code/kimi-gpt", "submit": true, "answerSlot": 3 }
 { "name": "thinking-level", "type": "key", "value": "shift+tab" }
 ```
@@ -405,7 +407,7 @@ After each behavioral change, verify the narrow observable contract.
 ```sh
 bun build ~/.local/share/gjc-streamdeck-plugin/plugin.js \
   --target=bun \
-  --outfile=~/tmp/gjc-streamdeck-plugin-verify.js
+  --outfile="$HOME/tmp/gjc-streamdeck-plugin-verify.js"
 
 cmp ~/.local/share/gjc-streamdeck-plugin/plugin.js \
   "$HOME/Library/Application Support/com.elgato.StreamDeck/Plugins/dev.gajae.streamdeck.sdPlugin/plugin.js"
