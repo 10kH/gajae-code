@@ -476,6 +476,65 @@ function replacementReceiptPlaceholderRetirementName(
 	return `.gjc-receipt-placeholder-remove-${placeholder.dev.toString(16)}-${placeholder.ino.toString(16)}-${predecessor.dev.toString(16)}-${predecessor.ino.toString(16)}-${receipt.dev.toString(16)}-${receipt.ino.toString(16)}`;
 }
 
+/**
+ * Terminal write-protocol remnant names. The POSIX exact-unlink fallback cannot
+ * descriptor-unlink, so it detaches, scrubs, and retains zero-length quarantine
+ * entries and exchange placeholders instead of removing them (`cleanup_pending`
+ * with a durable payload). Linux completes deletion through the retained
+ * directory authority, but macOS has no retained authority, so every managed
+ * replacement leaks its scrubbed remnants and scope directories grow without
+ * bound (tens of thousands of dirents per workspace), degrading every
+ * per-mutation receipt scan and widening quarantine-collision windows.
+ */
+const SCRUBBED_REMNANT_PREFIXES = [
+	".gjc-exact-unlink-placeholder-",
+	".gjc-exact-replace-destination-",
+	".gjc-receipt-remove-",
+	".gjc-receipt-placeholder-remove-",
+	".gjc-replace-retry-",
+] as const;
+
+/** In-flight protocol steps complete in milliseconds; anything older is abandoned. */
+const SCRUBBED_REMNANT_MIN_AGE_MS = 15 * 60 * 1000;
+
+/**
+ * Best-effort removal of scrubbed write-protocol remnants from one managed
+ * directory. Only zero-length, single-link, non-symlink regular files whose
+ * names carry a terminal remnant prefix and whose timestamps are older than
+ * the age gate are removed: a zero-length single-link entry is exactly what
+ * the scrub proof leaves behind, and non-zero entries (displaced predecessors
+ * or detached receipts retained as evidence) are never touched. Failures are
+ * swallowed — a concurrent same-owner writer may legitimately own or already
+ * have reconciled any candidate.
+ */
+export function reapScrubbedProtocolRemnantsSync(
+	directory: string,
+	minAgeMs: number = SCRUBBED_REMNANT_MIN_AGE_MS,
+): number {
+	let names: string[];
+	try {
+		names = fs.readdirSync(directory);
+	} catch {
+		return 0;
+	}
+	const cutoff = Date.now() - minAgeMs;
+	let reaped = 0;
+	for (const name of names) {
+		if (!SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
+		const pathname = path.join(directory, name);
+		try {
+			const named = fs.lstatSync(pathname);
+			if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 || named.size !== 0) continue;
+			if (named.mtimeMs > cutoff) continue;
+			fs.unlinkSync(pathname);
+			reaped += 1;
+		} catch {
+			// Best effort: concurrently reconciled or removed remnants are not errors.
+		}
+	}
+	return reaped;
+}
+
 const ACL_FAILURE_CODES = new Set(["acl_denied", "acl_io_error", "acl_present", "acl_malformed", "acl_unknown"]);
 const ACL_CLEAR_EVIDENCE = new Set(["cleared", "already_absent", "unsupported", "not_run"]);
 const GENERAL_FAILURE_CODES = new Set([
