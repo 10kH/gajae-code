@@ -21,7 +21,6 @@ export const ComputerController = nativeBindings.ComputerController;
 export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
 export const MacOSPowerAssertion = nativeBindings.MacOSPowerAssertion;
 export const NativeRetainedBrokerPublication = nativeBindings.NativeRetainedBrokerPublication;
-export const NotificationControlServer = nativeBindings.NotificationControlServer;
 export const NotificationServer = nativeBindings.NotificationServer;
 export const Process = nativeBindings.Process;
 export const PtySession = nativeBindings.PtySession;
@@ -30,7 +29,7 @@ export const Shell = nativeBindings.Shell;
 
 // functions
 export const __piNativesPublishOutcomeV1 = nativeBindings.__piNativesPublishOutcomeV1;
-export const __piNativesV0_12_21 = nativeBindings.__piNativesV0_12_21;
+export const __piNativesV0_13_1 = nativeBindings.__piNativesV0_13_1;
 export const applyBashFixups = nativeBindings.applyBashFixups;
 export const applyOwnerOnlyFdSecurity = nativeBindings.applyOwnerOnlyFdSecurity;
 export const applyOwnerOnlyPathSecurity = nativeBindings.applyOwnerOnlyPathSecurity;

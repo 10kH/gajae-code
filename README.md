@@ -142,7 +142,7 @@ API-key providers, local runtimes (Ollama, LM Studio, vLLM), and gateways (Cloud
 
 When the agent needs a decision, it pings you on Telegram — and you answer from anywhere:
 
-- **Per-session forum topics** with live/finalized output, context updates, image attachments, inline buttons, free-text replies, and typing indicators.
+- **Coordinator/lifecycle session forum topics** with live/finalized output, context updates, image attachments, inline buttons, free-text replies, and typing indicators.
 - **Configure once** from `/settings` → Notifications in a running session, or headless via `gjc notify setup|status|health|test|recovery`. Tokens are masked on entry and never displayed again.
 - **`gjc daemon`** keeps one safe long-poll owner per bot token, so new sessions attach cleanly without Telegram 409 conflicts.
 - Discord and Slack delivery ship alongside; the generic `action_needed`/`reply` protocol lets any bot or mobile app route answers back without terminal scraping.

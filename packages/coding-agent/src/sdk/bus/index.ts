@@ -24,7 +24,6 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
-import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
@@ -84,9 +83,9 @@ import { ensureBroker } from "../broker/ensure";
 import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
 import { processIncarnation } from "../broker/process-incarnation";
 import { SessionIndex } from "../broker/session-index";
-import { elevationAuthorityPath, verifyElevationCapability } from "../elevation/capability";
 import { createSdkSurfaceFactory, type SessionSdkHost, SessionSdkSessionRuntime, shouldHostSdk } from "../host";
-import { type ControlSurface, controlRequestFromFrame, dispatchControl } from "../host/control";
+import { type ControlSurface, dispatchControl } from "../host/control";
+import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import type { SdkFrame } from "../host/types";
 import {
@@ -139,10 +138,7 @@ import type { SlackConversation } from "./slack-conversation";
 import {
 	ASK_SELECTED_ACK_CAPABILITY,
 	type EnsureDaemonResult,
-	endpointAuthorityDigest,
 	ensureTelegramDaemonRunningDetailed,
-	type RegisterNotificationRootResult,
-	unregisterNotificationRoot,
 } from "./telegram-daemon";
 
 export type {
@@ -193,6 +189,13 @@ function formatPromptTerminalFailureReason(reason: unknown): string {
 	return rawReason ? rawReason.slice(0, PROMPT_TERMINAL_FAILURE_REASON_LOG_MAX) : "unreported";
 }
 
+function endpointAuthorityDigest(url: string, token: string): string {
+	const parsed = new URL(url);
+	parsed.hash = "";
+	parsed.search = "";
+	parsed.hostname = parsed.hostname.toLowerCase();
+	return crypto.createHash("sha256").update(`${parsed.toString()}\0${token}`, "utf8").digest("hex");
+}
 export function formatPromptSettlementDiagnostic(
 	proof: Extract<RunSettlementProof, { status: "unfenced" }>,
 	now = Date.now(),
@@ -210,15 +213,11 @@ export function formatPromptSettlementDiagnostic(
 }
 
 // ===========================================================================
-// Session lifecycle control protocol (TypeScript mirror of the Rust wire
-// contract in `crates/gjc-sdk/src/lifecycle.rs`).
-//
-// These describe the frames exchanged over the daemon-owned, session-independent
-// control endpoint for remote session create / close / resume. Field names are
-// camelCase on the wire; `type`/`kind` discriminators are snake_case. The Rust
-// ingress authenticates and forwards; the daemon (TypeScript) owns all policy,
-// spawn orchestration, idempotency, rate limiting, audit, and UX.
+// Session lifecycle presentation contract
 // ===========================================================================
+// Provider-neutral lifecycle command targets and credential-free presentation outcomes.
+// SessionLifecycleService owns request authorization/idempotency; these types contain no
+// control endpoint, process, tmux, session-state, or SDK endpoint authority.
 
 /** Where a `session_create` should run. Discriminated by `kind`. */
 export type SessionCreateTarget =
@@ -229,10 +228,6 @@ export type SessionCreateTarget =
 /** Identifies the session a `session_close` targets. */
 export interface SessionCloseTarget {
 	sessionId: string;
-	/** Expected GJC-managed tmux session name (defense-in-depth match). */
-	tmuxSession?: string;
-	/** Expected `@gjc-session-state-file` tag (defense-in-depth match). */
-	sessionStateFile?: string;
 }
 
 /** Identifies the session a `session_resume` targets. */
@@ -242,110 +237,33 @@ export interface SessionResumeTarget {
 	path?: string;
 }
 
-/** Create a new session. */
-export interface SessionCreateFrame {
-	type: "session_create";
-	requestId: string;
-	/** Deterministic lifecycle marker preallocated by the daemon before spawn. */
-	lifecycleRequestId: string;
-	/** Session id the daemon preallocated and propagates to the child. */
-	intendedSessionId: string;
-	/** Telegram update id (idempotency key on the daemon side). */
-	updateId: number;
-	chatId: string;
-	/** Control-endpoint token authorizing this frame. */
-	token: string;
-	target: SessionCreateTarget;
-	/** Reserved for a future capability transport; any supplied value is rejected before lifecycle acceptance. */
-	startupPromptRef?: string;
-	/** Model profile preset to activate for the spawned session (--mpreset). */
-	modelPreset?: string;
-}
-
-/** Close (hard-kill, history preserved) a session. */
-export interface SessionCloseFrame {
-	type: "session_close";
-	requestId: string;
-	updateId: number;
-	chatId: string;
-	token: string;
-	target: SessionCloseTarget;
-	/** Required force-only close flag; false/omitted is rejected by daemon policy. */
-	force?: boolean;
-}
-
-/** Resume a session (reattach if alive, else cold-restart from history). */
-export interface SessionResumeFrame {
-	type: "session_resume";
-	requestId: string;
-	updateId: number;
-	chatId: string;
-	token: string;
-	target: SessionResumeTarget;
-	/** Reserved for a future capability transport; any supplied value is rejected before lifecycle acceptance. */
-	startupPromptRef?: string;
-}
-
-/** Any client -> ingress lifecycle request frame. */
-export type SessionLifecycleRequest = SessionCreateFrame | SessionCloseFrame | SessionResumeFrame;
-
-/** Terminal status of a lifecycle request. */
 export type LifecycleStatus = "ok" | "error";
 
-/** A connected session's per-session endpoint, returned to the control client. */
-export interface LifecycleEndpoint {
-	url: string;
-	token: string;
-}
-
-/** The Telegram topic/thread a session is surfaced in. */
-export interface LifecycleTopic {
-	chatId: string;
-	threadId: string;
-}
-
-/** How a create request was correlated to its spawned session. */
-export type MatchedBy = "spawn_marker" | "session_ready";
-
-/** Response to a successful `session_create`. */
 export interface SessionCreateResponseFrame {
 	type: "session_create_response";
 	requestId: string;
 	status: LifecycleStatus;
-	lifecycleRequestId: string;
 	sessionId: string;
-	matchedBy: MatchedBy;
-	endpoint: LifecycleEndpoint;
-	topic: LifecycleTopic;
 	target: SessionCreateTarget;
 }
 
-/** Response to a successful `session_close`. */
 export interface SessionCloseResponseFrame {
 	type: "session_close_response";
 	requestId: string;
 	status: LifecycleStatus;
 	sessionId: string;
-	processGone: boolean;
-	historyPreserved: boolean;
-	endpointStale: boolean;
 }
 
-/** Whether a resume reattached to a live session or cold-restarted a dead one. */
 export type ResumeMode = "reattached" | "cold_restarted";
 
-/** Response to a successful `session_resume`. */
 export interface SessionResumeResponseFrame {
 	type: "session_resume_response";
 	requestId: string;
 	status: LifecycleStatus;
 	sessionId: string;
 	mode: ResumeMode;
-	endpoint: LifecycleEndpoint;
-	topic: LifecycleTopic;
 }
 
-/** Machine-readable reason a lifecycle request failed. */
 export type LifecycleErrorReason =
 	| "unauthorized"
 	| "rate_limited"
@@ -360,15 +278,12 @@ export type LifecycleErrorReason =
 	| "terminal_uncertain"
 	| "unsupported_platform";
 
-/** A candidate returned with an `ambiguous_target` resume error. */
 export interface ResumeCandidate {
 	sessionId: string;
 	path?: string;
-	/** Last-activity epoch-millis (session history file mtime), if known. */
 	mtimeMs?: number;
 }
 
-/** A structured lifecycle error frame. */
 export interface SessionLifecycleErrorFrame {
 	type: "session_lifecycle_error";
 	requestId: string;
@@ -378,7 +293,6 @@ export interface SessionLifecycleErrorFrame {
 	candidates?: ResumeCandidate[];
 }
 
-/** Any ingress -> client lifecycle response frame. */
 export type SessionLifecycleResponse =
 	| SessionCreateResponseFrame
 	| SessionCloseResponseFrame
@@ -1216,8 +1130,6 @@ interface SessionRuntime {
 	/** This runtime's own host-liveness publication; only its teardown may retract it. */
 	evidencePublication?: SessionHostRuntimePublication;
 	brokerRegistrationReleased: boolean;
-	/** Managed Telegram root registration released during terminal teardown. */
-	notificationRootRegistration?: { settings: Settings; cwd: string; registrationToken: string };
 	verbosity: "lean" | "verbose";
 	sessionTag: string;
 	/** Whether the agent loop is currently running (drives the typing indicator). */
@@ -2398,7 +2310,6 @@ function sdkControlSurface(
 	settings?: Settings,
 	configOverrides: Map<string, unknown> = new Map(),
 	configRevision: { current: number } = { current: 0 },
-	elevationAuthorityToken?: string,
 	abortOwnedPrompt: (
 		connectionId: string | undefined,
 	) => Promise<{ aborted: true; disposition: "cancelled" | "already_terminal" | "idle" }> = async () => ({
@@ -2738,9 +2649,6 @@ function sdkControlSurface(
 		cancelPendingPreflights(): Promise<void>;
 		cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
 	} = {
-		authorizeElevationClaim: (sdkId, input, capability) =>
-			elevationAuthorityToken !== undefined &&
-			verifyElevationCapability(elevationAuthorityToken, capability, sdkId, input),
 		prompt: (text, images, clientRef) =>
 			submitPrompt(text, images, false, undefined, true, controlRequesterContext.getStore(), clientRef, true),
 		steer: text => sendSteer(text),
@@ -2775,7 +2683,7 @@ function sdkControlSurface(
 			pending.completeDirect();
 			return { resolved: true };
 		},
-		answerGate: async (id, response, expectedSessionId, idempotencyKey, _elevationRequestId) => {
+		answerGate: async (id, response, expectedSessionId, idempotencyKey) => {
 			if (!acceptGateResolution())
 				throw Object.assign(new Error("Workflow gate is no longer answerable."), { code: "resource_gone" });
 			if (expectedSessionId === undefined) auditMissingExpectedSessionId("workflow.gate_answer");
@@ -2850,7 +2758,7 @@ function sdkControlSurface(
 				code: "terminal_uncertain",
 			});
 		},
-		approvePlan: async (id, choice, expectedSessionId, _elevationRequestId) => {
+		approvePlan: async (id, choice, expectedSessionId) => {
 			if (!acceptGateResolution())
 				throw Object.assign(new Error("Workflow plan is no longer answerable."), { code: "resource_gone" });
 			if (expectedSessionId === undefined) auditMissingExpectedSessionId("workflow.plan_approve");
@@ -3200,7 +3108,11 @@ function sdkControlSurface(
 		newSession: () => typed("session.new"),
 		forkSession: () => typed("session.fork"),
 		resumeSession: id => typed("session.resume", { id }),
-		closeSession: () => typed("session.close"),
+		closeSession: capability =>
+			typed(
+				"session.close",
+				capability === undefined ? {} : { [BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: capability },
+			),
 		switchSession: id => typed("session.switch", { id }),
 		branchSession: entryId => typed("session.branch", { entryId }),
 		renameSession: name => typed("session.rename", { name }),
@@ -3686,12 +3598,7 @@ export function createNotificationsExtension(
 	api: ExtensionAPI,
 	options: {
 		settings?: Settings;
-		ensureTelegramDaemon?: (input: {
-			settings: Settings;
-			cwd: string;
-			sessionId: string;
-			onRegistered?: (registration: RegisterNotificationRootResult) => void;
-		}) => Promise<EnsureDaemonResult>;
+		ensureTelegramDaemon?: (input: { settings: Settings }) => Promise<EnsureDaemonResult>;
 		ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>;
 		/** Suppress auto-delivery for a GJC-spawned child under `sessionScope=primary`. */
 		spawnedByGjc?: boolean;
@@ -3735,28 +3642,11 @@ export function createNotificationsExtension(
 		| undefined;
 	let extensionShuttingDown = false;
 
-	async function ensureTelegramOwner(
-		settings: Settings,
-		cwd: string,
-		id: string,
-		onRegistered?: (registrationToken: string) => void,
-	): Promise<"ready" | "blocked_identity"> {
+	async function ensureTelegramOwner(settings: Settings): Promise<"ready" | "blocked_identity"> {
 		if (options.ensureTelegramDaemon) {
-			return (await options.ensureTelegramDaemon({
-				settings,
-				cwd,
-				sessionId: id,
-				onRegistered: registration => onRegistered?.(registration.token),
-			})) === "blocked"
-				? "blocked_identity"
-				: "ready";
+			return (await options.ensureTelegramDaemon({ settings })) === "blocked" ? "blocked_identity" : "ready";
 		}
-		return (await ensureTelegramDaemonRunningDetailed({
-			settings,
-			cwd,
-			sessionId: id,
-			onRegistered: registration => onRegistered?.(registration.token),
-		})) === "blocked_identity"
+		return (await ensureTelegramDaemonRunningDetailed({ settings })) === "blocked_identity"
 			? "blocked_identity"
 			: "ready";
 	}
@@ -3764,9 +3654,6 @@ export function createNotificationsExtension(
 	async function ensureConfiguredDaemonOwners(
 		settings: Settings,
 		cfg: NotificationConfig,
-		cwd: string,
-		id: string,
-		onRegistered?: (registrationToken: string) => void,
 	): Promise<ConfiguredDaemonOwnerResult> {
 		if (isProviderEffectivelyEnabled(cfg, "telegram")) {
 			const telegramMarker = getCurrentTelegramActivationMarker(cfg);
@@ -3777,7 +3664,7 @@ export function createNotificationsExtension(
 				await ensureConfiguredProviderDaemons(settings, cfg, options.ensureProviderDaemon);
 				return "blocked_identity_with_sibling";
 			}
-			const telegram = await ensureTelegramOwner(settings, cwd, id, onRegistered);
+			const telegram = await ensureTelegramOwner(settings);
 			if (telegram === "blocked_identity") {
 				if (!isProviderEffectivelyEnabled(cfg, "discord") && !isProviderEffectivelyEnabled(cfg, "slack")) {
 					return "blocked_identity";
@@ -3790,23 +3677,6 @@ export function createNotificationsExtension(
 		return "ready";
 	}
 
-	function retainNotificationRootRegistration(
-		runtime: SessionRuntime,
-		settings: Settings,
-		cwd: string,
-		id: string,
-		registrationToken: string,
-	): void {
-		if (runtimes.get(id) === runtime && !runtime.stopping) {
-			runtime.notificationRootRegistration = { settings, cwd, registrationToken };
-			return;
-		}
-		runtime.notificationRootRegistration = { settings, cwd, registrationToken };
-		cleanupRetries.set(id, runtime);
-		void stopSession(id, "session", runtime).catch(error =>
-			logger.warn(`notifications: late Telegram root unregister failed: ${String(error)}`),
-		);
-	}
 	const identityControlOperations = new Set([
 		"session.new",
 		"session.fork",
@@ -3960,20 +3830,6 @@ export function createNotificationsExtension(
 			hostStopped: rt.hostStopped && rt.serverStopped,
 			brokerRegistrationReleased: rt.brokerRegistrationReleased,
 		});
-		if (rt.notificationRootRegistration) {
-			try {
-				await unregisterNotificationRoot({
-					settings: rt.notificationRootRegistration.settings,
-					cwd: rt.notificationRootRegistration.cwd,
-					sessionId: id,
-					registrationToken: rt.notificationRootRegistration.registrationToken,
-				});
-				rt.notificationRootRegistration = undefined;
-			} catch (e) {
-				ownerReleaseFailures.push(e);
-				logger.warn(`notifications: Telegram root unregister failed: ${String(e)}`);
-			}
-		}
 		if (ownerReleaseFailures.length > 0) {
 			cleanupRetries.set(id, rt);
 			throw new AggregateError(ownerReleaseFailures, `SDK notification runtime ${id} owner release failed.`);
@@ -4077,11 +3933,6 @@ export function createNotificationsExtension(
 		// build information and required capability while lifecycle startup can settle
 		// a structured failure instead of leaving the lifecycle caller pending.
 		const token = resolveToken();
-		const elevationAuthorityToken = crypto.randomBytes(32).toString("base64url");
-		const elevationAuthorityFile = elevationAuthorityPath(endpointStateRoot, id);
-		await fsPromises.mkdir(path.dirname(elevationAuthorityFile), { recursive: true, mode: 0o700 });
-		await Bun.write(elevationAuthorityFile, `${JSON.stringify({ version: 1, token: elevationAuthorityToken })}\n`);
-		await fsPromises.chmod(elevationAuthorityFile, 0o600);
 		let server: NotificationServer;
 		try {
 			const { NotificationServer, nativeBuildInfo } = sdkBusNatives();
@@ -4807,7 +4658,6 @@ export function createNotificationsExtension(
 			settings,
 			configOverrides,
 			configRevision,
-			elevationAuthorityToken,
 			async connectionId => {
 				const active = [...promptSubmissions.entries()].find(
 					([, submission]) => submission.connectionId === connectionId && !submission.terminal,
@@ -5136,7 +4986,15 @@ export function createNotificationsExtension(
 					dispatchControl(
 						controlSurface,
 						OPERATIONS.find(row => row.kind === "control" && row.sdkId === operation),
-						controlRequestFromFrame(request as Record<string, unknown>),
+						{
+							id: requestId,
+							operation,
+							input: request.input,
+							expectedRevision:
+								typeof request.expectedRevision === "string" ? request.expectedRevision : undefined,
+							idempotencyKey: typeof request.idempotencyKey === "string" ? request.idempotencyKey : undefined,
+							confirm: request.confirm === true,
+						},
 					),
 				);
 
@@ -5148,16 +5006,6 @@ export function createNotificationsExtension(
 			},
 			query: async (connectionId, frame) => {
 				const request = frame as { id?: unknown; query?: unknown; input?: unknown; cursor?: unknown };
-				// D1: a non-string top-level cursor is rejected, never silently
-				// dropped into a fresh-snapshot query (parity with the loopback
-				// session-runtime adapter).
-				if (request.cursor !== undefined && typeof request.cursor !== "string")
-					return {
-						type: "query_response",
-						id: typeof request.id === "string" ? request.id : undefined,
-						ok: false,
-						error: { code: "invalid_input", message: "cursor must be a non-empty string" },
-					};
 				const response = await queryHandlers.dispatch({
 					id: typeof request.id === "string" ? request.id : undefined,
 					query: typeof request.query === "string" ? request.query : "",
@@ -5246,7 +5094,6 @@ export function createNotificationsExtension(
 				{ toolName: string; args?: unknown; pendingPhase?: "completed" | "failed" | "cancelled" }
 			>(),
 			deferredInboundControls: [],
-			notificationRootRegistration: undefined,
 		};
 		const initializedRuntime = runtime;
 		runtimes.set(id, initializedRuntime);
@@ -5804,9 +5651,35 @@ export function createNotificationsExtension(
 				await cleanupAbandonedStartup();
 				return { status: "failed" };
 			}
-			// Record canonical identity before transport startup so lifecycle events emitted
-			// by an early server-start callback cannot overtake it in replay. The direct
-			// socket publication remains below, after the server is listening.
+			if (notificationsEnabledForSession && settingsAvailable && settings) {
+				try {
+					const ownership = await ensureConfiguredDaemonOwners(settings, cfg);
+					if (ownership === "blocked_identity") {
+						const result = failLifecycleStartup("failed", "Telegram daemon ownership is blocked.");
+						finishStartup(result);
+						await cleanupAbandonedStartup();
+						return result;
+					}
+					if (ownership === "blocked_identity_with_sibling" && !isolateChatEndpoint) {
+						await cleanupAbandonedStartup();
+						if (sessionStartPromises.get(id) === startSettled.promise) sessionStartPromises.delete(id);
+						forceIsolatedChatSessions.add(id);
+						const result = await startSession(ctx);
+						finishStartup(result);
+						return result;
+					}
+				} catch (error) {
+					const result = failLifecycleStartup("failed", error);
+					finishStartup(result);
+					await cleanupAbandonedStartup();
+					return result;
+				}
+			}
+
+			// Startup contract: configured notification daemon ownership must be ready
+			// before identity or endpoint publication. Native frames are ephemeral, so
+			// publish identity only after readiness; late SDK consumers recover it from
+			// event_replay.
 			const identityHeader = {
 				type: "identity_header",
 				sessionId: id,
@@ -5821,9 +5694,7 @@ export function createNotificationsExtension(
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
 				initializedRuntime.notificationOwnerState = "retry";
 				try {
-					const ownership = await ensureConfiguredDaemonOwners(settings, cfg, ctx.cwd, id, token => {
-						retainNotificationRootRegistration(initializedRuntime, settings, ctx.cwd, id, token);
-					});
+					const ownership = await ensureConfiguredDaemonOwners(settings, cfg);
 					initializedRuntime.notificationOwnerState =
 						ownership === "ready" || (ownership === "blocked_identity_with_sibling" && isolateChatEndpoint)
 							? "ready"
@@ -6087,7 +5958,7 @@ export function createNotificationsExtension(
 			logger.warn(`notifications: failed to start server: ${String(e)}`);
 			const result = failLifecycleStartup("failed", e);
 			finishStartup(result);
-			let suppressExtensionError = result.failure?.message === "Lifecycle SDK startup was cancelled.";
+			let suppressExtensionError = false;
 			let stopped = false;
 			try {
 				stopped = await stopSession(id, "session", runtime);
@@ -6125,15 +5996,7 @@ export function createNotificationsExtension(
 					const { cfg, settings, settingsAvailable } = resolveSettings(options.settings);
 					if (!settingsAvailable || !settings) return "failed";
 					try {
-						const ownership = await ensureConfiguredDaemonOwners(
-							settings,
-							cfg,
-							binding.cwd,
-							binding.sessionId,
-							token => {
-								retainNotificationRootRegistration(runtime, settings, binding.cwd, binding.sessionId, token);
-							},
-						);
+						const ownership = await ensureConfiguredDaemonOwners(settings, cfg);
 						runtime.notificationOwnerState =
 							ownership === "ready" ||
 							(ownership === "blocked_identity_with_sibling" && runtime.endpointScope === "chat")
@@ -6207,29 +6070,11 @@ export function createNotificationsExtension(
 			flushPendingFinal(runtime, runtime.id);
 			for (const processControl of runtime.deferredInboundControls.splice(0)) processControl();
 		},
-		ensureTelegramDaemon: async binding => {
+		ensureTelegramDaemon: async _binding => {
 			const { settings, settingsAvailable } = resolveSettings(options.settings);
 			if (!settingsAvailable || !settings) return "blocked_identity";
 			try {
-				let registrationToken: string | undefined;
-				const result = await ensureTelegramOwner(settings, binding.cwd, binding.sessionId, token => {
-					registrationToken = token;
-				});
-				const runtime = runtimes.get(binding.sessionId);
-				const configured = isProviderEffectivelyEnabled(resolveSettings(options.settings).cfg, "telegram");
-				if (result === "ready" && runtime && !runtime.stopping && configured && registrationToken !== undefined) {
-					runtime.notificationRootRegistration = { settings, cwd: binding.cwd, registrationToken };
-				} else if (registrationToken !== undefined) {
-					await unregisterNotificationRoot({
-						settings,
-						cwd: binding.cwd,
-						sessionId: binding.sessionId,
-						registrationToken,
-					});
-				}
-				if (runtime?.notificationOwnerState === "blocked")
-					runtime.notificationOwnerState = result === "ready" ? "ready" : "blocked";
-				return result;
+				return await ensureTelegramOwner(settings);
 			} catch {
 				return "failed";
 			}

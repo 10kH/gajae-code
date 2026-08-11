@@ -365,13 +365,9 @@ describe("TopicRegistry", () => {
 	test("retains archived topic records and never recreates physical topics", async () => {
 		const reg = new TopicRegistry();
 		await reg.getOrCreateTopic("s1", async () => "1");
-		expect(reg.acquireLease("s1", "host", 100, 1_000, 500)).toBe(true);
-		expect(reg.releaseLeaseToGrace("s1", "host", 200, 500)).toBe(true);
-		expect(reg.get("s1")?.disconnectGraceExpiresAt).toBe(700);
 
 		reg.beginArchive("s1");
 		expect(reg.get("s1")?.authorityState).toBe("archive_pending");
-		expect(reg.get("s1")?.disconnectGraceExpiresAt).toBeUndefined();
 		expect(reg.sessionForTopic("1")).toBeUndefined();
 
 		await expect(reg.getOrCreateTopic("s1", async () => "2")).rejects.toThrow("topic authority is archive-fenced");
@@ -624,18 +620,11 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes generation 62 at serving epoch 5", () => {
-	// Generation 55: shared-topic-authority outage hardening (#3974).
-	// Generation 56: lazy native authority for startup-cost cut (#3846).
-	// Generation 57: parser-valid archive transitions after disconnect grace.
+test("publishes exact durable authority generation 151 at serving epoch 87", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 59: attached OPEN-socket count in the heartbeat sidecar (#4128).
-	// Generation 60: transient heartbeat-sidecar publication failures are
-	// contained instead of crashing the daemon (#4200).
-	// Generation 61: fenced same-session transport recovery.
-	// Generation 62: replay-gap authority validation.
-	expect(DAEMON_GENERATION).toBe(62);
-	expect(SERVING_EPOCH).toBe(5);
+	// Generation 151 / serving epoch 87: durable provider work is exact-attachment fenced.
+	expect(DAEMON_GENERATION).toBe(151);
+	expect(SERVING_EPOCH).toBe(87);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
@@ -723,67 +712,6 @@ test("rejects future topic registry versions and quarantines retained legacy rec
 
 	expect(registry.get("legacy")).toMatchObject({ topicId: "42", authorityState: "legacy_quarantined" });
 	expect(registry.sessionForTopic("42")).toBeUndefined();
-});
-
-test("repairs an archive record carrying a stale disconnect-grace marker", () => {
-	const snapshot = {
-		version: 2,
-		registryGeneration: 7,
-		topics: {
-			session: {
-				topicId: "42",
-				topicOrigin: "daemon_created",
-				sessionUuid: "session-uuid",
-				identitySent: true,
-				createdAt: 1,
-				orphanedAt: 2,
-				authorityEpoch: 1,
-				authorityState: "archive_pending",
-				chatId: "42",
-				endpointKey: "endpoint",
-				endpointDigest: "digest",
-				endpointGeneration: 1,
-				archiveHostId: "host",
-				archiveLeaseEpoch: 1,
-				disconnectGraceExpiresAt: 3,
-			},
-		},
-	};
-	const original = structuredClone(snapshot);
-	const state = parseTopicRegistryState(snapshot);
-
-	expect(state?.topics.session?.authorityState).toBe("archive_pending");
-	expect(state?.topics.session?.disconnectGraceExpiresAt).toBeUndefined();
-	expect(snapshot).toEqual(original);
-});
-test("normalizes stale disconnect-grace markers in retired history without mutating the snapshot", () => {
-	const snapshot = {
-		version: 2,
-		registryGeneration: 7,
-		topics: {},
-		retiredTopics: {
-			session: [
-				{
-					topicId: "42",
-					topicOrigin: "daemon_created",
-					sessionUuid: "session-uuid",
-					identitySent: true,
-					createdAt: 1,
-					orphanedAt: 2,
-					authorityEpoch: 1,
-					authorityState: "inactive",
-					chatId: "42",
-					disconnectGraceExpiresAt: 3,
-				},
-			],
-		},
-	};
-	const original = structuredClone(snapshot);
-	const state = parseTopicRegistryState(snapshot);
-
-	expect(state?.retiredTopics?.session?.[0]?.disconnectGraceExpiresAt).toBeUndefined();
-	expect(new TopicRegistry(state).serialize().retiredTopics?.session?.[0]?.disconnectGraceExpiresAt).toBeUndefined();
-	expect(snapshot).toEqual(original);
 });
 test("fences a concurrent host and permits same-topic resume only before grace expiry", async () => {
 	const registry = new TopicRegistry();

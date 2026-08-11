@@ -102,19 +102,19 @@ gate(
 	"exclusion list",
 );
 
-gate(
-	"templates are direct SDK clients",
-	typeScript.includes('@gajae-code/coding-agent/sdk') && python.includes("from gjc_sdk import") && python.includes("SdkClient"),
-	"maintained SDK imports",
-);
+	gate(
+		"templates use approved SDK transport",
+		typeScript.includes('["gjc", "sdk", "session", "raw"') && python.includes("from gjc_sdk import") && python.includes("SdkClient"),
+		"broker-bound TypeScript CLI and maintained Python SDK import",
+	);
 gate(
 	"templates require repository input",
 	typeScript.includes('values.get("--repo")') && python.includes('parser.add_argument("--repo", required=True)'),
 	"--repo",
 );
-gate(
-	"templates require immediate nonce-bound approval",
-	typeScript.includes("await requireApproval(endpoint.sessionId, args.operation, args.input)") &&
+	gate(
+		"templates require immediate nonce-bound approval",
+		typeScript.includes("await requireApproval(args.sessionId, args.operation, args.input)") &&
 		python.includes("require_approval(endpoint.session_id, operation, operation_input)") &&
 		typeScript.includes("randomBytes(8)") &&
 		python.includes("secrets.token_hex(8)") &&
@@ -122,26 +122,23 @@ gate(
 		python.includes("Type the exact challenge") &&
 		typeScript.includes("human_approval_required") &&
 		python.includes("human_approval_required"),
-	"single-process operation/session/input/nonce approval",
-);
+		"single-process operation/session/input/nonce approval",
+	);
 gate(
 	"python approval challenge stays off stdout",
 	python.includes("file=sys.stderr") && python.includes("sys.stdin.readline()"),
 	"challenge on stderr, answer from stdin",
 );
-gate(
-	"templates close clients",
-	typeScript.includes("finally {\n\t\tawait client.close();") && python.includes("finally:\n        await client.close()"),
-	"finally close",
-);
-gate(
-	"templates redact secret-shaped fields and endpoint token values",
-	typeScript.includes("SECRET_FIELD") &&
-		python.includes("SECRET_FIELD") &&
-		typeScript.includes('value.replaceAll(endpointToken, "[REDACTED]")') &&
-		python.includes('value.replace(endpoint_token, "[REDACTED]")'),
-	"field and value redaction",
-);
+	gate(
+		"templates release SDK resources",
+		typeScript.includes("await process.exited") && python.includes("finally:\n        await client.close()"),
+		"broker subprocess completion and Python client close",
+	);
+	gate(
+		"templates redact secret-shaped fields",
+		typeScript.includes("SECRET_FIELD") && python.includes("SECRET_FIELD"),
+		"field redaction",
+	);
 gate(
 	"templates omit token CLI arguments",
 	!typeScript.includes('"--token"') && !python.includes('"--token"'),
