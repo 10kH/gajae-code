@@ -65,8 +65,10 @@ export const ACP_SESSION_RECONNECT: SessionReconnectOptions = {
  * waiting to deliver.
  *
  * Session commands are acknowledgement-shaped (`turn.prompt` returns an accepted
- * receipt, not the turn's result), so no legitimate session request needs longer,
- * and a slow `turn.abort` does not stall the client: ACP settles a cancel on its
- * own grace (`CANCEL_SETTLEMENT_GRACE_MS`) regardless of this budget.
+ * receipt, not the turn's result), so no legitimate session request needs longer.
+ * The tradeoff is that a connected but wedged host is reported after this budget
+ * rather than after 10s, including `turn.abort`: ACP awaits that acknowledgement
+ * before arming its own settlement grace (`CANCEL_SETTLEMENT_GRACE_MS`), which
+ * bounds only the terminal that follows an acknowledged abort.
  */
 export const SESSION_REQUEST_TIMEOUT_MS = 2 * HEARTBEAT_TTL_MS;
