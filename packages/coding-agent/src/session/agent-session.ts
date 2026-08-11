@@ -11205,6 +11205,16 @@ export class AgentSession {
 		this.#promptPreflightAbortController.abort();
 		this.#promptPreflightAbortController = new AbortController();
 	}
+	/**
+	 * Capture the steering admission snapshot at abort ADMISSION: the host
+	 * invokes this before its durable marker transaction, so client steering
+	 * admitted while the abort is in flight classifies as post-snapshot and is
+	 * preserved instead of being purged at the later abortPromptAndWait
+	 * (review thread P1).
+	 */
+	captureTerminalAbortSteeringSnapshot(): void {
+		this.#terminalAbortSteeringSnapshot = this.#steeringAdmissionSeq;
+	}
 
 	getTerminalTurnEpoch(): number | undefined {
 		const lineageIdHash = this.#turnLineageIdHash;
@@ -11287,7 +11297,7 @@ export class AgentSession {
 				// accepted-pre-close continuation of the aborted attempt that the
 				// terminal-abort contract requires to be blocked (review thread
 				// P1).
-				this.#terminalAbortSteeringSnapshot = this.#steeringAdmissionSeq;
+				this.#terminalAbortSteeringSnapshot ??= this.#steeringAdmissionSeq;
 				const admittedAfterSnapshot = (message: AgentMessage): boolean =>
 					this.#terminalAbortSteeringSnapshot !== undefined &&
 					(this.#externalSteerAdmissionSeq.get(message) ?? 0) > this.#terminalAbortSteeringSnapshot;
@@ -11396,20 +11406,35 @@ export class AgentSession {
 						message =>
 							ownedCompletionResumeAction(message as never) === "fresh" || this.#externalFollowUps.has(message),
 					);
-			if (hasPreservedFollowUp()) {
-				// ANY preserved follow-up — an owned-completion resume OR an
-				// independently requested external follow-up — needs a fresh lineage
-				// before its continue: without it the scheduled continuation runs
-				// under the aborted lineage+epoch and the terminal fence skips it
-				// as terminal_turn, stranding the preserved user follow-up until
-				// unrelated activity. Minting the fresh lineage does not reclassify
-				// the external message as agent-initiated owned work; it only
-				// unbinds the new turn from the aborted attempt (review thread P1).
+			// A preserved post-snapshot client steer is also an independent
+			// root-turn request: the abort exits the loop and never polls the
+			// steering queue, so without a rearm the accepted steer stays
+			// stranded until unrelated activity (review thread P1).
+			const hasPreservedSteering = (): boolean =>
+				this.agent
+					.snapshotQueues()
+					.steering.some(
+						message =>
+							this.#terminalAbortSteeringSnapshot !== undefined &&
+							this.#externalSteerMessages.has(message) &&
+							(this.#externalSteerAdmissionSeq.get(message) ?? 0) > this.#terminalAbortSteeringSnapshot,
+					);
+			if (hasPreservedFollowUp() || hasPreservedSteering()) {
+				// ANY preserved follow-up or steer — an owned-completion resume,
+				// an independently requested external follow-up, or a
+				// post-snapshot client steer — needs a fresh lineage before its
+				// continue: without it the scheduled continuation runs under the
+				// aborted lineage+epoch and the terminal fence skips it as
+				// terminal_turn, stranding the preserved user request until
+				// unrelated activity. Minting the fresh lineage does not
+				// reclassify the external message as agent-initiated owned work;
+				// it only unbinds the new turn from the aborted attempt (review
+				// thread P1).
 				this.#resumeFromOwnedCompletion();
 				this.#scheduleAgentContinue({
 					delayMs: 1,
 					generation: this.#promptGeneration,
-					shouldContinue: hasPreservedFollowUp,
+					shouldContinue: () => hasPreservedFollowUp() || hasPreservedSteering(),
 				});
 			}
 		}

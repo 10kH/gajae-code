@@ -207,6 +207,10 @@ export interface SdkOnlyTerminalAbortSeams {
 	 *  thread P1). */
 	getActivePromptOwnerConnectionId?: () => string | undefined;
 	cancelPendingPreflightForTerminalAbort: () => void;
+	/** Capture the steering admission snapshot at abort ADMISSION (before any
+	 *  durable transaction), so steers admitted while the abort is in flight
+	 *  classify as post-snapshot (review thread P1). */
+	captureTerminalAbortSteeringSnapshot?: () => void;
 	abortPromptAndWaitWithTerminal: (
 		handle: string,
 		options: { graceMs: number; terminal?: { scope: "turn" | "owned"; expectedEpoch?: number } },
@@ -1386,6 +1390,11 @@ function createControlSurface(
 		idempotencyKey?: string,
 	): Promise<unknown> => {
 		const scope = input.scope === "owned" ? "owned" : "turn";
+		// Capture the steering snapshot at ADMISSION (before any durable
+		// transaction): client steering admitted while the abort is in flight
+		// classifies as post-snapshot and is preserved at abortPromptAndWait
+		// (review thread P1).
+		terminalAbortSeams?.captureTerminalAbortSteeringSnapshot?.();
 		// Hash the EXACT response payload this abort will return: the durable row
 		// stores it at finalization so the response-state advance requires
 		// equality instead of trusting a non-pending placeholder (review thread P2).

@@ -2404,6 +2404,7 @@ function sdkControlSurface(
 	terminalAbortSeams?: {
 		getTerminalTurnEpoch: () => number | undefined;
 		cancelPendingPreflightForTerminalAbort: () => void;
+		captureTerminalAbortSteeringSnapshot?: () => void;
 	},
 ): ControlSurface & {
 	cancelPendingPreflights(): Promise<void>;
@@ -3888,6 +3889,7 @@ export function createNotificationsExtension(
 		terminalAbortSeams?: {
 			getTerminalTurnEpoch: () => number | undefined;
 			cancelPendingPreflightForTerminalAbort: () => void;
+			captureTerminalAbortSteeringSnapshot?: () => void;
 			abortPromptAndWaitWithTerminal: (
 				handle: string,
 				options: { graceMs: number; terminal?: { scope: "turn" | "owned"; expectedEpoch?: number } },
@@ -5061,6 +5063,11 @@ export function createNotificationsExtension(
 				return { aborted: true, disposition: "cancelled" as const };
 			},
 			async (connectionId, scope, idempotencyKey, preflightCancel, noOtherConnectionPreflights) => {
+				// Capture the steering snapshot at ADMISSION (before the durable
+				// marker transaction): client steering admitted while the abort
+				// is in flight classifies as post-snapshot and is preserved at
+				// abortPromptAndWait (review thread P1).
+				terminalAbortSeams?.captureTerminalAbortSteeringSnapshot?.();
 				// Hash the EXACT response payload this abort will return: the durable
 				// row stores it at finalization so the response-state advance requires
 				// equality instead of trusting a non-pending placeholder (review

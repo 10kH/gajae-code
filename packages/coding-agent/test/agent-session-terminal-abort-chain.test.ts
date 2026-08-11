@@ -526,8 +526,9 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// whose acceptance was already acknowledged, so the abort must preserve
 		// it instead of purging every steering message — clearing it would
 		// leave its reconciliation record accepted indefinitely.
-		scriptedResponses = [stopReply("ok")];
-		await session.prompt("first turn");
+		scriptedResponses = [bashCall("sleep 30", "call_hold_turn"), stopReply("steer answered")];
+		const promptPromise = session.prompt("hold the turn").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		const abortPromise = session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
 			graceMs: 2_000,
 			terminal: { scope: "turn" },
@@ -536,15 +537,33 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// survives the purge.
 		await session.sendUserMessage("client steer", { deliverAs: "steer" });
 		await abortPromise;
-		expect(session.agent.hasQueuedSteering()).toBe(true);
-		const queues = session.agent.snapshotQueues();
-		expect(
-			queues.steering.some(
-				message =>
-					((message as { content?: unknown }).content as Array<{ text?: string }>)[0]?.text === "client steer",
-			),
-		).toBe(true);
-	}, 20_000);
+		// The post-abort rearm schedules the preserved steer: it is consumed by
+		// a fresh run instead of staying stranded until unrelated activity
+		// (review thread P1). (The pre-snapshot counterpart is blocked — see
+		// the "blocks client steering admitted before" test.)
+		await waitFor(() => !session.agent.hasQueuedSteering(), "preserved steer consumed");
+		await promptPromise;
+	}, 30_000);
+
+	it("terminal abort preserves client steering admitted after the abort admission snapshot", async () => {
+		// Review thread P1: the host captures the steering snapshot at abort
+		// ADMISSION (before its durable marker transaction) — a steer admitted
+		// while the abort is in flight classifies as post-snapshot even though
+		// the later abortPromptAndWait purge has not run yet.
+		scriptedResponses = [bashCall("sleep 30", "call_hold_turn"), stopReply("steer answered")];
+		const promptPromise = session.prompt("hold the turn").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
+		session.captureTerminalAbortSteeringSnapshot();
+		await session.sendUserMessage("admission-window steer", { deliverAs: "steer" });
+		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
+			graceMs: 2_000,
+			terminal: { scope: "turn" },
+		});
+		// The steer admitted after the admission snapshot is preserved and
+		// rearmed into a fresh run.
+		await waitFor(() => !session.agent.hasQueuedSteering(), "admission-window steer consumed");
+		await promptPromise;
+	}, 30_000);
 
 	it("terminal abort blocks client steering admitted before the abort snapshot", async () => {
 		// Review thread P1: an SDK steer queued BEFORE the terminal abort begins
