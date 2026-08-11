@@ -6934,6 +6934,7 @@ export class SessionManager {
 		private readonly persist: boolean,
 		storage: SessionStorage,
 		private destination: SessionDestination = explicitDestination(sessionDir),
+		skipEnsureSessionDir = false,
 	) {
 		this.#storage = new Proxy(storage, {
 			get: (target, property, receiver) => {
@@ -7036,7 +7037,7 @@ export class SessionManager {
 		this.#blobStore = persist ? new BlobStore(getBlobsDir()) : this.#residentTextBlobStore;
 		this.#residentImageBlobStore = this.#blobStore;
 		if (persist && sessionDir) {
-			this.#storage.ensureDirSync(sessionDir);
+			if (!skipEnsureSessionDir) this.#storage.ensureDirSync(sessionDir);
 			// Canonicalize the trusted session directory (single choke point for every
 			// creation path: create/open/moveTo/fork/SDK) so benign ancestor symlinks
 			// (e.g. macOS `/var -> /private/var`, a symlinked `$HOME`) are resolved to a
@@ -18511,10 +18512,18 @@ export class SessionManager {
 				managedInspectionStore.assertBound();
 				await SessionManagerTestHooks.beforeManagedMissingInit?.(filePath, managedInspectionStorage);
 				managedInspectionStore.assertBound();
-				await SessionManagerTestHooks.beforeManagedMissingPublish?.(filePath, managedInspectionStorage);
-				const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
+				const manager = new SessionManager(
+					getProjectDir(),
+					destination.directory,
+					true,
+					storage,
+					destination,
+					true,
+				);
 				manager.#sessionMemoryMode = sessionMemoryMode;
 				try {
+					await SessionManagerTestHooks.beforeManagedMissingPublish?.(filePath, managedInspectionStorage);
+					managedInspectionStore.assertBound();
 					const fresh = manager.#freshSessionState(undefined, filePath);
 					const prepared = manager.#prepareFreshSessionTransition(fresh, "memory-fallback");
 					manager.#applyFreshSessionMetadata(fresh);
