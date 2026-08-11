@@ -11,7 +11,7 @@
  *   const isolated = Settings.isolated({ "compaction.enabled": false });
  */
 
-import { createHash, randomUUID } from "node:crypto";
+import * as nodeCrypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -157,6 +157,21 @@ type WorkflowMigrationMarker = {
 	preRepairTargetHashes?: Record<string, string>;
 	completedAt?: string;
 };
+/**
+ * Test-only seams for the config-root workflow migration. Production code
+ * never sets these; tests use them to interleave external filesystem changes
+ * at exact points of the migration state machine (mirroring
+ * `FileLockTestHooks` in file-lock.ts).
+ */
+export const SettingsMigrationTestHooks: {
+	/** Fires after the no-replace backup copy is created and its identity
+	 * (inode + sha256) has been captured, immediately before the source is
+	 * re-hashed for the move verification. */
+	afterBackupIdentityCaptured?: (backupPath: string) => void | Promise<void>;
+	/** Fires after a quarantined backup is verified as this run's file,
+	 * immediately before the quarantined entry is unlinked. */
+	beforeQuarantineRemoval?: (backupPath: string) => void | Promise<void>;
+} = {};
 
 type SettingsPatch = {
 	readonly path: string;
@@ -1399,8 +1414,12 @@ export class Settings implements NotificationSettingsReader {
 				// settings.get() must not surface stale legacy values (e.g. after
 				// `gjc config unset` removed a migrated key). The project config.yml
 				// item keeps its workflow keys - config.yml is the settings surface.
+				// Only keys with DURABLE migration ownership are stripped: when the
+				// migration could not publish or could not record ownership, the
+				// resolver keeps the retained legacy value active as a fallback, and
+				// the generic view must agree with it.
 				const data = item.path.endsWith(`${path.sep}settings.json`)
-					? this.#stripRetiredWorkflowKeys(structuredClone(item.data as RawSettings))
+					? await this.#stripRetiredWorkflowKeys(item.path, structuredClone(item.data as RawSettings))
 					: (item.data as RawSettings);
 				const { settings, rejectedNotifications } = this.#stripProjectNotificationSettings(data);
 				if (rejectedNotifications) {
@@ -1415,17 +1434,36 @@ export class Settings implements NotificationSettingsReader {
 	}
 
 	/**
-	 * Retired workflow keys (flat dotted and nested forms) are removed from
-	 * retained project `settings.json` before merging: config.yml is the only
-	 * workflow settings surface, so the generic settings API must not resurrect
-	 * values the resolver no longer reads.
+	 * Retired workflow keys (flat dotted and nested forms) are removed from a
+	 * retained project `settings.json` before merging ONLY when they are durably
+	 * owned by config.yml (recorded in the migrated-keys marker): config.yml is
+	 * the workflow settings surface, so the generic settings API must not
+	 * resurrect values the resolver no longer reads. An UNOWNED key stays
+	 * visible: an incomplete migration (could not publish, or could not record
+	 * ownership) keeps the retained legacy value active as the resolver's
+	 * fallback, and the generic view must report the same value the workflow
+	 * runtime uses.
 	 */
-	#stripRetiredWorkflowKeys(settings: RawSettings): RawSettings {
+	async #stripRetiredWorkflowKeys(sourcePath: string, settings: RawSettings): Promise<RawSettings> {
+		const owned = await this.#readProjectMigratedKeys(sourcePath);
 		for (const key of CONFIG_ROOT_WORKFLOW_MIGRATION_KEYS) {
-			// Flat dotted form used by the legacy settings.json.
-			if (Object.hasOwn(settings, key)) delete settings[key];
-			// Nested config form.
-			deleteByPath(settings, key.split("."));
+			if (owned.has(key)) {
+				// Flat dotted form used by the legacy settings.json.
+				if (Object.hasOwn(settings, key)) delete settings[key];
+				// Nested config form.
+				deleteByPath(settings, key.split("."));
+				continue;
+			}
+			// UNOWNED key: the migration is incomplete (could not publish or could
+			// not record ownership), so the resolver keeps the retained legacy
+			// value active as a fallback and the generic view must agree. The
+			// legacy file stores flat dotted keys; expose them under the nested
+			// (schema) form the generic settings API reads.
+			if (Object.hasOwn(settings, key)) {
+				const value = settings[key];
+				delete settings[key];
+				setByPath(settings, key.split("."), value);
+			}
 		}
 		return settings;
 	}
@@ -1597,15 +1635,24 @@ export class Settings implements NotificationSettingsReader {
 		// they are never literal keys.
 		if (prefix.length > 0 && Object.keys(legacy).some(key => key.includes("."))) {
 			const currentRecord = getByPath(current, prefix);
+			// An OCCUPIED non-record enclosing path (scalar, array, or null)
+			// must be left unchanged: emitting a whole-record merge would
+			// replace the modern value (e.g. `modelTags: "custom"`) and then
+			// clear the legacy rows, violating the absent-only migration
+			// contract. Only absent or record-valued paths participate.
+			if (
+				currentRecord !== undefined &&
+				(currentRecord === null || typeof currentRecord !== "object" || Array.isArray(currentRecord))
+			) {
+				return patches;
+			}
 			patches.push({
 				path: prefix.join("."),
 				op: "set" as const,
-				value: this.#mergeAbsentRecords(
-					currentRecord !== null && typeof currentRecord === "object" && !Array.isArray(currentRecord)
-						? (currentRecord as Record<string, unknown>)
-						: {},
-					legacy,
-				),
+				value:
+					currentRecord === undefined
+						? legacy
+						: this.#mergeAbsentRecords(currentRecord as Record<string, unknown>, legacy),
 			});
 			return patches;
 		}
@@ -1720,7 +1767,17 @@ export class Settings implements NotificationSettingsReader {
 				migrated = true;
 			}
 			dbReadSucceeded = true;
-		} catch {}
+		} catch (error) {
+			// A malformed or persistently unreadable legacy database is a data
+			// integrity problem: fail the load so it is actionable instead of
+			// silently continuing without the previously effective rows. The
+			// rows did NOT participate in any publication, so nothing is
+			// drained and they stay in place for repair and the next load.
+			this.#warnLegacyFallbackMigration(
+				`Settings: legacy agent.db settings could not be read (${error instanceof Error ? error.message : String(error)}); failing the load so the database can be repaired`,
+			);
+			throw error;
+		}
 
 		// 3. Write merged settings through the shared atomic YAML pipeline. When
 		// config.yml already exists (created by the config-root workflow migration,
@@ -1792,9 +1849,13 @@ export class Settings implements NotificationSettingsReader {
 	/**
 	 * One-time migration of the machine-global config-root `settings.json`
 	 * (`<configRoot>/settings.json`, normally `~/.gjc/settings.json`) workflow
-	 * keys into the default global agent `config.yml`. Runs only for the default
-	 * global agent scope, inside one critical section on the target config lock,
-	 * and migrates only the five workflow keys that the workflow runtimes read.
+	 * keys into the environment-selected global agent `config.yml` — the
+	 * `GJC_CODING_AGENT_DIR` / `PI_CODING_AGENT_DIR` profile when set, else the
+	 * default `<configRoot>/agent/config.yml`. Runs only for the global agent
+	 * scope (an explicitly supplied temporary agentDir such as an SDK session
+	 * must never consume the machine-global source), inside one critical
+	 * section on the target config lock, and migrates only the five workflow
+	 * keys that the workflow runtimes read.
 	 *
 	 * The legacy config-root file is an orphan path: only the workflow runtimes
 	 * ever read it, and the earlier Settings migrations never covered it. Keeping
@@ -1805,9 +1866,10 @@ export class Settings implements NotificationSettingsReader {
 	 */
 	async #migrateConfigRootWorkflowSettings(): Promise<void> {
 		if (!this.#configPath) return;
-		// Strengthened pairing gate: only the default global agent scope may
-		// consume the machine-global source. A custom/temporary agentDir
-		// (`Settings.loadForScope` for SDK or tests) must never touch it.
+		// Strengthened pairing gate: only the GLOBAL agent scope may consume the
+		// machine-global source. That includes an environment-selected non-default
+		// profile (GJC_CODING_AGENT_DIR / PI_CODING_AGENT_DIR); a custom/temporary
+		// agentDir (`Settings.loadForScope` for SDK or tests) must never touch it.
 		if (!this.#isGlobalAgentScope()) return;
 
 		const source = path.resolve(getConfigRootDir(), "settings.json");
@@ -1866,6 +1928,10 @@ export class Settings implements NotificationSettingsReader {
 		// must never be removed by this migration: abort paths may delete a backup
 		// only when this run created it (after a successful no-replace move).
 		let backupCreatedByThisRun = false;
+		// Identity of the backup this run created (captured right after the
+		// no-replace move): abort paths remove the backup only through the
+		// quarantine-based #removeIfStillOurs guard, never by pathname.
+		let backupIno: number | null = null;
 		try {
 			await withAtomicYamlConfigTransaction(target, async tx => {
 				// A config.yml written by a NEWER schema version is intentionally
@@ -1979,9 +2045,18 @@ export class Settings implements NotificationSettingsReader {
 						// user replaced after the transition cannot be verified
 						// (the repaired values' source is gone) and is preserved.
 						let deletionBackupDoc: Record<string, unknown> | null = null;
+						// Identity of the verified backup revision (captured inside
+						// the try): the removal below must quarantine and re-verify
+						// before unlinking, because another process can replace the
+						// backup while the recovery patches the target.
+						let deletionBackupIno: number | null = null;
+						// Verified revision hash (captured inside the try); used by
+						// the guarded removal below.
+						let deletionBackupHash: string | null = null;
 						try {
 							const deletionBackupRead = await this.#readBackupBytes(backup);
-							const deletionBackupHash = createHash("sha256")
+							deletionBackupHash = nodeCrypto
+								.createHash("sha256")
 								.update(Buffer.from(deletionBackupRead.bytes))
 								.digest("hex");
 							if (
@@ -1993,6 +2068,7 @@ export class Settings implements NotificationSettingsReader {
 								);
 								return;
 							}
+							deletionBackupIno = (await fs.promises.stat(backup).catch(() => null))?.ino ?? null;
 							deletionBackupDoc = JSON.parse(deletionBackupRead.text) as Record<string, unknown>;
 						} catch {
 							this.#warnLegacyFallbackMigration(
@@ -2017,7 +2093,7 @@ export class Settings implements NotificationSettingsReader {
 								// pre-repair state could be a coincidental user
 								// value).
 								(marker.repairValueHashes?.[key] !== undefined &&
-									createHash("sha256").update(JSON.stringify(targetValue.value)).digest("hex") ===
+									nodeCrypto.createHash("sha256").update(JSON.stringify(targetValue.value)).digest("hex") ===
 										marker.repairValueHashes[key] &&
 									marker.repairsApplied === true)
 							) {
@@ -2026,7 +2102,9 @@ export class Settings implements NotificationSettingsReader {
 							}
 						}
 						await tx.applyPatchesAndRemoveTopLevelKeys(markerOwnedUnsets, markerFlatKeys);
-						await fs.promises.rm(backup, { force: true }).catch(() => undefined);
+						if (deletionBackupIno !== null && deletionBackupHash !== null) {
+							await this.#removeIfStillOurs(backup, deletionBackupIno, deletionBackupHash);
+						}
 						await fs.promises.rm(markerPath, { force: true }).catch(() => undefined);
 						this.#warnLegacyFallbackMigration(
 							`Settings: config-root workflow migration cleared: ${source} was deleted during pending recovery; marker-owned target values reverted, backup removed`,
@@ -2047,7 +2125,15 @@ export class Settings implements NotificationSettingsReader {
 						// parse use the SAME bytes (a second read could observe a
 						// different revision).
 						const pendingBackupRead = await this.#readBackupBytes(backup);
-						const backupHash = createHash("sha256").update(Buffer.from(pendingBackupRead.bytes)).digest("hex");
+						const backupHash = nodeCrypto
+							.createHash("sha256")
+							.update(Buffer.from(pendingBackupRead.bytes))
+							.digest("hex");
+						// Capture the identity of the verified backup revision so the
+						// recovery removal below can quarantine and re-verify before
+						// unlinking (another process can replace the backup while
+						// the target patches are applied).
+						const pendingBackupIno = (await fs.promises.stat(backup).catch(() => null))?.ino ?? null;
 						// (Reconciliation of an edited legacy source after completion is
 						// obsolete: settings.json is retired, so a hash mismatch simply
 						// falls through to the mismatch branch below.)
@@ -2128,7 +2214,9 @@ export class Settings implements NotificationSettingsReader {
 									}
 								}
 								await tx.applyPatchesAndRemoveTopLevelKeys(markerOwnedUnsets, markerFlatKeys);
-								await fs.promises.rm(backup, { force: true }).catch(() => undefined);
+								if (pendingBackupIno !== null) {
+									await this.#removeIfStillOurs(backup, pendingBackupIno, backupHash);
+								}
 								await fs.promises.rm(markerPath, { force: true }).catch(() => undefined);
 								this.#warnLegacyFallbackMigration(
 									`Settings: config-root workflow migration pending marker source edited after a crash; stale marker-owned target values reverted, user overrides kept, backup removed, marker cleared`,
@@ -2184,7 +2272,7 @@ export class Settings implements NotificationSettingsReader {
 					);
 					return;
 				}
-				const sourceSha256 = createHash("sha256").update(sourceRaw).digest("hex");
+				const sourceSha256 = nodeCrypto.createHash("sha256").update(sourceRaw).digest("hex");
 				let sourceDoc: unknown;
 				try {
 					sourceDoc = JSON.parse(sourceRaw);
@@ -2224,7 +2312,8 @@ export class Settings implements NotificationSettingsReader {
 						let staleBackupDoc: Record<string, unknown>;
 						try {
 							const staleBackupRead = await this.#readBackupBytes(backup);
-							const staleBackupHash = createHash("sha256")
+							const staleBackupHash = nodeCrypto
+								.createHash("sha256")
 								.update(Buffer.from(staleBackupRead.bytes))
 								.digest("hex");
 							if (staleBackupHash !== marker.sourceSha256 && staleBackupHash !== marker.priorSourceSha256) {
@@ -2253,7 +2342,10 @@ export class Settings implements NotificationSettingsReader {
 							const targetValue = extractWorkflowSetting(tx.current, key, { flat: false });
 							if (!targetValue.present) continue;
 							const backupValue = extractWorkflowSetting(staleBackupDoc, key);
-							const targetHash = createHash("sha256").update(JSON.stringify(targetValue.value)).digest("hex");
+							const targetHash = nodeCrypto
+								.createHash("sha256")
+								.update(JSON.stringify(targetValue.value))
+								.digest("hex");
 							const migrationOwned =
 								(backupValue.present &&
 									this.#coerceWorkflowScalar(key, backupValue.value) === targetValue.value) ||
@@ -2336,7 +2428,10 @@ export class Settings implements NotificationSettingsReader {
 							if (backupExists) {
 								try {
 									const staleRead = await this.#readBackupBytes(backup);
-									const staleHash = createHash("sha256").update(Buffer.from(staleRead.bytes)).digest("hex");
+									const staleHash = nodeCrypto
+										.createHash("sha256")
+										.update(Buffer.from(staleRead.bytes))
+										.digest("hex");
 									if (staleHash === marker.sourceSha256 || staleHash === marker.priorSourceSha256) {
 										staleBackupDoc = JSON.parse(staleRead.text) as Record<string, unknown>;
 									}
@@ -2353,7 +2448,10 @@ export class Settings implements NotificationSettingsReader {
 								const ownedBackupValue = staleBackupDoc
 									? extractWorkflowSetting(staleBackupDoc, ownedKey)
 									: { present: false, value: undefined };
-								const ownedHash = createHash("sha256").update(JSON.stringify(ownedValue.value)).digest("hex");
+								const ownedHash = nodeCrypto
+									.createHash("sha256")
+									.update(JSON.stringify(ownedValue.value))
+									.digest("hex");
 								const verifiable =
 									(ownedBackupValue.present &&
 										this.#coerceWorkflowScalar(ownedKey, ownedBackupValue.value) === ownedValue.value) ||
@@ -2396,7 +2494,8 @@ export class Settings implements NotificationSettingsReader {
 								let removedKeyBackupDoc: Record<string, unknown> | null = null;
 								try {
 									const removedKeyRead = await this.#readBackupBytes(backup);
-									const removedKeyHash = createHash("sha256")
+									const removedKeyHash = nodeCrypto
+										.createHash("sha256")
 										.update(Buffer.from(removedKeyRead.bytes))
 										.digest("hex");
 									if (
@@ -2412,7 +2511,8 @@ export class Settings implements NotificationSettingsReader {
 								const removedKeyBackupValue = removedKeyBackupDoc
 									? extractWorkflowSetting(removedKeyBackupDoc, key)
 									: { present: false, value: undefined };
-								const removedKeyTargetHash = createHash("sha256")
+								const removedKeyTargetHash = nodeCrypto
+									.createHash("sha256")
 									.update(JSON.stringify(removedKeyTarget.value))
 									.digest("hex");
 								const removedKeyVerifiable =
@@ -2747,7 +2847,7 @@ export class Settings implements NotificationSettingsReader {
 					// clear the now-obsolete marker so the deletion is honored (the
 					// later post-copy deletion path does the same).
 					await tx.replaceCurrent(prePatchTargetSnapshot);
-					if (backupCreatedByThisRun) await fs.promises.rm(backup, { force: true }).catch(() => undefined);
+					if (backupIno !== null) await this.#removeIfStillOurs(backup, backupIno, sourceSha256);
 					await fs.promises.rm(markerPath, { force: true }).catch(() => undefined);
 					this.#warnLegacyFallbackMigration(
 						`Settings: config-root workflow migration aborted: ${source} was deleted during migration; target reverted, ${backupCreatedByThisRun ? "backup removed" : "external backup preserved"}, marker cleared`,
@@ -2756,7 +2856,7 @@ export class Settings implements NotificationSettingsReader {
 				}
 				if (preMoveSourceHash !== sourceSha256) {
 					await tx.replaceCurrent(prePatchTargetSnapshot);
-					if (backupCreatedByThisRun) await fs.promises.rm(backup, { force: true }).catch(() => undefined);
+					if (backupIno !== null) await this.#removeIfStillOurs(backup, backupIno, sourceSha256);
 					await fs.promises.rm(markerPath, { force: true }).catch(() => undefined);
 					this.#warnLegacyFallbackMigration(
 						`Settings: config-root workflow migration aborted: ${source} changed during migration; target reverted, ${backupCreatedByThisRun ? "backup removed" : "external backup preserved"}, marker cleared`,
@@ -2775,6 +2875,19 @@ export class Settings implements NotificationSettingsReader {
 					return;
 				}
 				backupCreatedByThisRun = true;
+				// Capture the backup's inode for the guarded removals below. The
+				// copy is byte-identical to the verified source at this point
+				// (the move re-hashed the source before completing), so the
+				// expected sha is sourceSha256 and the inode identifies the file
+				// this run created; a backup replaced or edited afterwards fails
+				// the guard and is preserved.
+				try {
+					backupIno = (await fs.promises.stat(backup)).ino;
+				} catch {
+					// The backup vanished right after the move; nothing of ours
+					// to remove on the abort paths.
+					backupIno = null;
+				}
 
 				// The source may have been edited in the narrow window after the
 				// pre-move check but before/during the move; verify the bytes we
@@ -2785,7 +2898,7 @@ export class Settings implements NotificationSettingsReader {
 				// file (never completing behind a stale hash).
 				if ((await this.#sha256File(backup)) !== sourceSha256) {
 					await tx.replaceCurrent(prePatchTargetSnapshot);
-					if (backupCreatedByThisRun) await fs.promises.rm(backup, { force: true }).catch(() => undefined);
+					if (backupIno !== null) await this.#removeIfStillOurs(backup, backupIno, sourceSha256);
 					this.#warnLegacyFallbackMigration(
 						`Settings: config-root workflow migration aborted: ${source} changed during migration; target reverted, backup removed, source left active for the next load`,
 					);
@@ -2809,7 +2922,7 @@ export class Settings implements NotificationSettingsReader {
 					// values and silently undoing the deletion.
 					if (isEnoent(error)) {
 						await tx.replaceCurrent(prePatchTargetSnapshot);
-						if (backupCreatedByThisRun) await fs.promises.rm(backup, { force: true }).catch(() => undefined);
+						if (backupIno !== null) await this.#removeIfStillOurs(backup, backupIno, sourceSha256);
 						await fs.promises.rm(markerPath, { force: true }).catch(() => undefined);
 						this.#warnLegacyFallbackMigration(
 							`Settings: config-root workflow migration aborted: ${source} was deleted during migration; target reverted, backup removed, marker cleared`,
@@ -2827,7 +2940,7 @@ export class Settings implements NotificationSettingsReader {
 				}
 				if (sourceHashAfterMove !== null && sourceHashAfterMove !== sourceSha256) {
 					await tx.replaceCurrent(prePatchTargetSnapshot);
-					if (backupCreatedByThisRun) await fs.promises.rm(backup, { force: true }).catch(() => undefined);
+					if (backupIno !== null) await this.#removeIfStillOurs(backup, backupIno, sourceSha256);
 					this.#warnLegacyFallbackMigration(
 						`Settings: config-root workflow migration aborted: ${source} edited after the copy; target reverted, backup removed, source left active for the next load`,
 					);
@@ -3128,13 +3241,22 @@ export class Settings implements NotificationSettingsReader {
 				// set first, then write ONE evidence file carrying every unresolved
 				// key - a per-key write-then-delete would let a later key's cleanup
 				// drop an earlier key's evidence.
+				const shadowedInvalidKeys: WorkflowSettingKey[] = [];
 				const unresolved = invalidStrictKeys.filter(retained => {
 					const targetValue = extractWorkflowSetting(tx.root, retained.key, { flat: false });
-					return !(
+					const shadowed =
 						!targetValue.malformedParent &&
 						targetValue.present &&
-						this.#workflowKeyValueIsValid(retained.key, targetValue.value)
-					);
+						this.#workflowKeyValueIsValid(retained.key, targetValue.value);
+					// A strict key shadowed by a valid project target is TOLERATED
+					// (no exit 2 while the target wins), but it must still be
+					// recorded as owned: the retained legacy source keeps the file
+					// for non-workflow settings, and without ownership a later
+					// `gjc config unset` of the target value would resurrect the
+					// invalid legacy value and exit 2 (mirroring the config-root
+					// path, where the source is retired so the value is gone).
+					if (shadowed) shadowedInvalidKeys.push(retained.key);
+					return !shadowed;
 				});
 				if (unresolved.length === 0) {
 					await fs.promises
@@ -3206,7 +3328,7 @@ export class Settings implements NotificationSettingsReader {
 					// the lock before returning - an all-present first load must still
 					// create ownership, or a later `gjc config unset` would re-import
 					// the stale legacy value.
-					newlyOwned = patches.map(patch => patch.path as WorkflowSettingKey);
+					newlyOwned = [...patches.map(patch => patch.path as WorkflowSettingKey), ...shadowedInvalidKeys];
 					const allPresentMarkerOk = await this.#writeProjectMigratedKeys(
 						source,
 						await this.#mergeProjectMigratedKeys(source, newlyOwned),
@@ -3284,11 +3406,12 @@ export class Settings implements NotificationSettingsReader {
 						.catch(() => undefined);
 					return;
 				}
-				// Record EVERY valid source key as config-owned (both the keys copied
-				// by this run and the pre-existing present-valid keys whose marker was
-				// lost), so a later unset of either is not re-imported from the
-				// retained legacy source.
-				newlyOwned = patches.map(patch => patch.path as WorkflowSettingKey);
+				// Record EVERY config-owned key: the valid source keys copied by
+				// this run and the pre-existing present-valid keys whose marker was
+				// lost, plus strict keys shadowed by a valid project target (their
+				// slot is owned by config.yml), so a later unset of any of them is
+				// not re-imported from the retained legacy source.
+				newlyOwned = [...patches.map(patch => patch.path as WorkflowSettingKey), ...shadowedInvalidKeys];
 				// Merge the per-key ownership marker under the config lock: a
 				// concurrent migration of the same project may have published its own
 				// marker between our initial read and this transaction, so re-read the
@@ -3376,7 +3499,7 @@ export class Settings implements NotificationSettingsReader {
 		} catch {
 			return true; // already gone: nothing to remove
 		}
-		const tombstone = `${filePath}.gjc-remove-${randomUUID()}`;
+		const tombstone = `${filePath}.gjc-remove-${nodeCrypto.randomUUID()}`;
 		try {
 			await fs.promises.rename(filePath, tombstone);
 		} catch (error) {
@@ -3617,7 +3740,7 @@ export class Settings implements NotificationSettingsReader {
 		// is durable, and readRetainedStrictEvidence would then read malformed
 		// JSON as no evidence - the still-invalid strict key would silently fall
 		// through to defaults instead of preserving exit 2.
-		const tempPath = `${evidencePath}.${randomUUID()}.tmp`;
+		const tempPath = `${evidencePath}.${nodeCrypto.randomUUID()}.tmp`;
 		try {
 			await fs.promises.mkdir(path.dirname(evidencePath), { recursive: true });
 			const tempHandle = await fs.promises.open(tempPath, "wx", 0o600);
@@ -3964,7 +4087,7 @@ export class Settings implements NotificationSettingsReader {
 		// concurrently, and a fixed .tmp name could be consumed by one writer's
 		// rename, making the other fail its marker write and roll back a copy
 		// whose ownership the winner recorded.
-		const tempPath = `${markerPath}.${randomUUID()}.tmp`;
+		const tempPath = `${markerPath}.${nodeCrypto.randomUUID()}.tmp`;
 		try {
 			await fs.promises.mkdir(path.dirname(markerPath), { recursive: true });
 			// Fsync the staged payload BEFORE the rename: Bun.write alone would let a
@@ -4170,7 +4293,7 @@ export class Settings implements NotificationSettingsReader {
 		entries: readonly StrictInvalidEvidenceEntry[],
 		markerPath = `${source}.fallback-invalid`,
 	): Promise<boolean> {
-		const tempPath = `${markerPath}.${randomUUID()}.tmp`;
+		const tempPath = `${markerPath}.${nodeCrypto.randomUUID()}.tmp`;
 		try {
 			if (entries.length === 0) {
 				await fs.promises.rm(markerPath, { force: true }).catch(() => undefined);
@@ -4487,7 +4610,10 @@ export class Settings implements NotificationSettingsReader {
 		}
 		const serialized = JSON.stringify(marker, null, 2);
 		const directory = path.dirname(markerPath);
-		const tempPath = path.join(directory, `.${path.basename(markerPath)}.${process.pid}.${randomUUID()}.tmp`);
+		const tempPath = path.join(
+			directory,
+			`.${path.basename(markerPath)}.${process.pid}.${nodeCrypto.randomUUID()}.tmp`,
+		);
 		try {
 			await Bun.write(tempPath, serialized);
 			// Durable before publication: fsync the marker file so a crash
@@ -4584,7 +4710,7 @@ export class Settings implements NotificationSettingsReader {
 	 * never deleted by pathname.
 	 */
 	async #retireConfigRootSource(source: string, expectedSourceSha256: string): Promise<void> {
-		const quarantinePath = `${source}.migrated-src-${randomUUID()}`;
+		const quarantinePath = `${source}.migrated-src-${nodeCrypto.randomUUID()}`;
 		let quarantined = false;
 		try {
 			await fs.promises.rename(source, quarantinePath);
@@ -4645,18 +4771,32 @@ export class Settings implements NotificationSettingsReader {
 			} finally {
 				await userCopyHandle.close();
 			}
+			// Capture the identity of the copy we just made BEFORE any further
+			// verification: an external replacement or in-place edit after this
+			// point must never be removed by an abort path.
+			let copiedDestIno: number | null = null;
+			let copiedDestSha: string | null = null;
+			try {
+				copiedDestIno = (await fs.promises.stat(destination)).ino;
+				copiedDestSha = await this.#sha256File(destination);
+			} catch {
+				// The copy vanished right after creation; nothing of ours remains.
+				return false;
+			}
+			await SettingsMigrationTestHooks.afterBackupIdentityCaptured?.(destination);
 			let copiedSourceHash: string | null = null;
 			try {
 				copiedSourceHash = await this.#sha256File(source);
 			} catch {
-				// The source was deleted right after the copy: remove the copy and
-				// report failure so the caller reverts the target (the caller's
-				// later guarded recheck would otherwise be bypassed by the throw).
-				await fs.promises.rm(destination, { force: true });
+				// The source was deleted right after the copy: remove the copy
+				// ONLY while it is still the file we created (an external
+				// replacement or edit at the backup pathname must be preserved)
+				// and report failure so the caller reverts the target.
+				await this.#removeIfStillOurs(destination, copiedDestIno, copiedDestSha);
 				return false;
 			}
 			if (copiedSourceHash !== expectedSourceSha256) {
-				await fs.promises.rm(destination, { force: true });
+				await this.#removeIfStillOurs(destination, copiedDestIno, copiedDestSha);
 				return false;
 			}
 			return true;
@@ -4694,8 +4834,17 @@ export class Settings implements NotificationSettingsReader {
 				await copyHandle.close();
 			}
 		}
+		let destinationIno: number | null = null;
+		try {
+			destinationIno = (await fs.promises.stat(destination)).ino;
+		} catch {
+			return false;
+		}
 		if (!(await this.#legacySourceStillVerified(source, sourceIno))) {
-			await fs.promises.rm(destination, { force: true });
+			// Remove the destination ONLY while it is still the entry created
+			// above; an external replacement at the quarantine pathname must be
+			// preserved.
+			await this.#removeIfStillOurs(destination, destinationIno);
 			return false;
 		}
 		try {
@@ -4704,6 +4853,75 @@ export class Settings implements NotificationSettingsReader {
 			return false;
 		}
 		return true;
+	}
+
+	/**
+	 * Remove `path` only while it is still the file this migration created:
+	 * the observed inode must match and (when a hash is given) the bytes must
+	 * too. A concurrent external process that replaced or edited the file at
+	 * this pathname must never be deleted - the migration's no-clobber promise
+	 * preserves externally created `.bak`/quarantine data, mirroring the
+	 * identity guards already applied to config targets and strict-evidence
+	 * files.
+	 */
+	async #removeIfStillOurs(path: string, expectedIno: number, expectedSha256?: string): Promise<boolean> {
+		// Atomically QUARANTINE the entry (same-directory rename) before any
+		// verification: the identity check and the unlink then operate on the
+		// private quarantine name, so an external process that replaces the
+		// file at the PUBLIC pathname after the check but before the removal
+		// can no longer have its file deleted. Whatever the rename moved is
+		// what gets verified; a mismatch is restored to the public pathname
+		// (no-clobber) or retained under the quarantine name, never unlinked.
+		const quarantine = `${path}.quarantine-${process.pid}-${nodeCrypto.randomUUID()}`;
+		try {
+			await fs.promises.rename(path, quarantine);
+		} catch {
+			// Nothing to remove (ENOENT) or the entry cannot be moved: removal
+			// by pathname is never attempted - the quarantine is the only
+			// removal basis.
+			return false;
+		}
+		const stat = await fs.promises.stat(quarantine).catch(() => null);
+		if (!stat || stat.ino !== expectedIno) {
+			await this.#restoreQuarantined(quarantine, path);
+			return false;
+		}
+		if (expectedSha256 !== undefined && (await this.#sha256File(quarantine)) !== expectedSha256) {
+			await this.#restoreQuarantined(quarantine, path);
+			return false;
+		}
+		await SettingsMigrationTestHooks.beforeQuarantineRemoval?.(path);
+		await fs.promises.rm(quarantine, { force: true }).catch(() => undefined);
+		return true;
+	}
+
+	/**
+	 * Restore a quarantined entry to its original pathname without ever
+	 * replacing a file another process published there meanwhile: the restore
+	 * is no-clobber (hard link, then a copy fallback), and on any failure the
+	 * quarantined entry is RETAINED (never deleted) so the data stays
+	 * recoverable.
+	 */
+	async #restoreQuarantined(quarantine: string, original: string): Promise<void> {
+		try {
+			await fs.promises.link(quarantine, original);
+			await fs.promises.rm(quarantine, { force: true }).catch(() => undefined);
+			return;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+				// The pathname was re-occupied while quarantined: keep the
+				// quarantined entry (displaced, never deleted).
+				return;
+			}
+		}
+		try {
+			// Filesystems without hard links: a no-clobber copy fallback.
+			await fs.promises.copyFile(quarantine, original, fs.constants.COPYFILE_EXCL);
+			await fs.promises.rm(quarantine, { force: true }).catch(() => undefined);
+		} catch {
+			// Occupied or uncopyable: retain the quarantined file so the data
+			// stays recoverable.
+		}
 	}
 	/**
 	 * True only if `path` still refers to the same inode that was verified
@@ -4736,7 +4954,7 @@ export class Settings implements NotificationSettingsReader {
 
 	async #sha256File(target: string): Promise<string> {
 		const raw = await Bun.file(target).arrayBuffer();
-		return createHash("sha256").update(Buffer.from(raw)).digest("hex");
+		return nodeCrypto.createHash("sha256").update(Buffer.from(raw)).digest("hex");
 	}
 
 	#hasCustomThemeFile(name: string): boolean {

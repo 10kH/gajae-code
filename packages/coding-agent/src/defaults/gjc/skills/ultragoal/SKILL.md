@@ -23,7 +23,7 @@ Existing aggregate plans with the legacy enumerated objective are migrated to th
   through one shared resolver in this exact order (first valid value wins):
   1. project `.gjc/config.yml`
   2. user `<agentDir>/config.yml` (normally `~/.gjc/agent/config.yml`, honoring
-     `GJC_CODING_AGENT_DIR`/`PI_CODING_AGENT_DIR` and XDG)
+     `GJC_CODING_AGENT_DIR`/`PI_CODING_AGENT_DIR`; XDG applies only to categorized data/state/cache subdirs, never the workflow config path)
   3. built-in default
   `config.yml` uses the nested (schema) form - `gjc: { ultragoal: { nudgeBudget } }`.
   Project configuration beats user configuration. The reported `source` is the

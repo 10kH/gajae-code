@@ -132,7 +132,7 @@ The consensus workflow:
   (first valid value wins):
   1. project `.gjc/config.yml`
   2. user `<agentDir>/config.yml` (normally `~/.gjc/agent/config.yml`, honoring
-     `GJC_CODING_AGENT_DIR`/`PI_CODING_AGENT_DIR` and XDG)
+     `GJC_CODING_AGENT_DIR`/`PI_CODING_AGENT_DIR`; XDG applies only to categorized data/state/cache subdirs, never the workflow config path)
   3. built-in default
 
   `config.yml` uses the nested (schema) form — `gjc: { ralplan: { maxIterations } }`.

@@ -36,7 +36,13 @@ type ProbeResult = {
 
 async function runProbe(
 	cwd: string,
-	options: { home: string; configDir?: string; agentDir?: string; codingAgentDir?: string },
+	options: {
+		home: string;
+		configDir?: string;
+		agentDir?: string;
+		codingAgentDir?: string;
+		env?: Record<string, string>;
+	},
 ): Promise<ProbeResult> {
 	const args = [process.execPath, PROBE];
 	if (options.agentDir) args.push("--agent-dir", options.agentDir);
@@ -47,6 +53,7 @@ async function runProbe(
 			HOME: options.home,
 			GJC_CONFIG_DIR: options.configDir ?? ".gjc",
 			...(options.codingAgentDir ? { GJC_CODING_AGENT_DIR: options.codingAgentDir } : {}),
+			...(options.env ?? {}),
 		},
 		stdout: "pipe",
 		stderr: "pipe",
@@ -399,6 +406,93 @@ describe("config-root workflow settings migration", () => {
 		after.close();
 		expect(remaining?.n).toBe(0);
 	});
+	test("preserves an occupied scalar enclosing path during the database merge", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const { agentDir } = await setupHome(home, ".myconfig");
+		await fs.mkdir(agentDir, { recursive: true });
+		// config.yml holds a SCALAR at a record-valued setting (`modelTags`);
+		// the legacy database row for the same key carries a dotted member. The
+		// occupied non-record enclosing path must be left unchanged: a
+		// whole-record replacement would clobber the modern scalar and then
+		// clear the rows, violating the absent-only migration contract.
+		await fs.writeFile(path.join(agentDir, "config.yml"), YAML.stringify({ modelTags: "custom" }, null, 2));
+		const db = new Database(path.join(agentDir, "agent.db"));
+		db.run(
+			"CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT 0)",
+		);
+		db.run("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)");
+		db.run("INSERT INTO schema_version (version) VALUES (5)");
+		db.run("INSERT INTO settings (key, value, updated_at) VALUES ('modelTags', ?, 0)", [
+			JSON.stringify({ "custom.role": { name: "Custom" } }),
+		]);
+		db.close();
+
+		await runProbe(cwd, { home, configDir: ".myconfig" });
+
+		const config = YAML.parse(await fs.readFile(path.join(agentDir, "config.yml"), "utf8")) as {
+			modelTags?: unknown;
+		};
+		// The modern scalar survives; the legacy record is never merged into it
+		// and no dotted path is split into a nested `custom` member.
+		expect(config.modelTags).toBe("custom");
+		expect((config as Record<string, unknown>).custom).toBeUndefined();
+	});
+	test("a shadowed invalid strict key is recorded as owned so an unset falls through", async () => {
+		const cwd = await tempDir();
+		const home = await tempDir();
+		const agentDir = path.join(home, ".gjc", "agent");
+		// The retained project settings.json holds an INVALID strict value while
+		// the project config.yml holds a VALID value for the same key (the
+		// shadow case: the valid target wins, so no strict evidence is written).
+		// The migration must still record the key as owned - without ownership,
+		// a later `gjc config unset` of the target value would resurrect the
+		// invalid legacy value and exit 2 instead of falling through to
+		// defaults (mirroring the config-root path, where the source is retired).
+		await fs.mkdir(path.join(cwd, ".gjc", "state"), { recursive: true });
+		await fs.writeFile(
+			path.join(cwd, ".gjc", "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2),
+		);
+		await fs.writeFile(
+			path.join(cwd, ".gjc", "settings.json"),
+			JSON.stringify({ "gjc.ralplan.maxIterations": "invalid" }),
+		);
+		await fs.mkdir(agentDir, { recursive: true });
+
+		// The project migration runs during Settings.load (probe child process).
+		await runProbe(cwd, { home, configDir: ".gjc" });
+
+		// The migrated-keys ownership marker records the shadowed key.
+		const marker = JSON.parse(
+			await fs.readFile(path.join(cwd, ".gjc", "state", "settings.json.migrated-keys"), "utf8"),
+		) as string[];
+		expect(marker).toContain("gjc.ralplan.maxIterations");
+
+		// Simulate `gjc config unset`: remove the key from the project config.
+		await fs.writeFile(path.join(cwd, ".gjc", "config.yml"), YAML.stringify({ theme: { dark: "red" } }, null, 2));
+
+		// A strict ralplan caller must fall through to the default instead of
+		// exiting 2 on the resurrected invalid legacy value.
+		const wsProbe = path.join(import.meta.dir, "../fixtures/workflow-settings-probe.ts");
+		const proc = Bun.spawn([process.execPath, wsProbe, "gjc.ralplan.maxIterations", "--strict"], {
+			cwd,
+			env: {
+				...process.env,
+				HOME: home,
+				GJC_CONFIG_DIR: ".gjc",
+				GJC_CODING_AGENT_DIR: agentDir,
+				PI_CODING_AGENT_DIR: undefined,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+		if ((await proc.exited) !== 0) throw new Error(`resolve probe failed: ${err}`);
+		const resolved = JSON.parse(out.trim()) as { value: unknown; threw?: boolean };
+		expect(resolved.threw).toBeUndefined();
+		expect(resolved.value).toBe("default");
+	});
 
 	test("database rows are not merged into or drained from read-only targets", async () => {
 		const home = await tempDir();
@@ -453,6 +547,61 @@ describe("config-root workflow settings migration", () => {
 		const remaining = after.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM settings").get();
 		after.close();
 		expect(remaining?.n).toBe(1); // rows retained for the next load
+	});
+
+	test("a malformed legacy database row fails the load instead of dropping the valid rows", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const { agentDir } = await setupHome(home, ".myconfig");
+		await fs.mkdir(agentDir, { recursive: true });
+		const db = new Database(path.join(agentDir, "agent.db"));
+		db.run(
+			"CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT 0)",
+		);
+		db.run("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)");
+		db.run("INSERT INTO schema_version (version) VALUES (5)");
+		db.run("INSERT INTO settings (key, value, updated_at) VALUES ('theme.dark', ?, 0)", [JSON.stringify("red-claw")]);
+		// One malformed row makes the whole legacy read fail: the load must fail
+		// (actionable) instead of silently continuing without the valid rows.
+		db.run("INSERT INTO settings (key, value, updated_at) VALUES ('gjc.ralplan.maxIterations', '{broken', 0)");
+		db.close();
+
+		const result = await runProbe(cwd, { home, configDir: ".myconfig" });
+		expect(result.loadFailed).toBe(true);
+		// Nothing was drained: every row stays in place for repair.
+		const after = new Database(path.join(agentDir, "agent.db"));
+		const remaining = after.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM settings").get();
+		after.close();
+		expect(remaining?.n).toBe(2);
+	});
+
+	test("gjc ultragoal --help renders help without running the settings migration", async () => {
+		const cwd = await tempDir();
+		const home = await tempDir();
+		// A legacy config-root source the migration would consume if it ran.
+		await fs.mkdir(path.join(home, ".gjc"), { recursive: true });
+		const legacySource = path.join(home, ".gjc", "settings.json");
+		const sourceRaw = JSON.stringify({ "gjc.ralplan.maxIterations": 7 });
+		await fs.writeFile(legacySource, sourceRaw);
+
+		const probe = path.join(import.meta.dir, "../fixtures/ultragoal-help-probe.ts");
+		const proc = Bun.spawn([process.execPath, probe], {
+			cwd,
+			env: {
+				...process.env,
+				HOME: home,
+				GJC_CONFIG_DIR: ".gjc",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+		if ((await proc.exited) !== 0) throw new Error(`ultragoal help probe failed: ${err}`);
+		expect(out).toContain("ultragoal");
+		// The read-only help request performed no migration: the legacy source
+		// is untouched and no agent config.yml was created.
+		expect(await fs.readFile(legacySource, "utf8")).toBe(sourceRaw);
+		expect(await fs.stat(path.join(home, ".gjc", "agent", "config.yml")).catch(() => null)).toBeNull();
 	});
 
 	test("project fallback ownership survives the config-root collision reconcile", async () => {
@@ -658,6 +807,71 @@ describe("config-root workflow settings migration", () => {
 		expect(result.markerStatus).toBeNull();
 		expect(result.backupExists).toBe(false);
 		expect(result.targetValue).toBeNull();
+	});
+	test("deletion recovery never removes a backup replaced during recovery", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const { source, agentDir } = await setupHome(home, ".myconfig");
+		const sourceRaw = JSON.stringify({ "gjc.ralplan.maxIterations": 7 });
+		const sourceSha256 = createHash("sha256").update(sourceRaw).digest("hex");
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.writeFile(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2),
+		);
+		await fs.writeFile(source, sourceRaw);
+		await fs.rename(source, `${source}.bak`);
+		await fs.writeFile(
+			`${source}.migrated`,
+			JSON.stringify({
+				version: 1,
+				status: "pending",
+				sourcePath: source,
+				backupPath: `${source}.bak`,
+				targetPath: path.join(agentDir, "config.yml"),
+				canonicalTargetDir: await fs.realpath(agentDir),
+				canonicalTargetIdentity: `${(await fs.stat(agentDir)).dev}:${(await fs.stat(agentDir)).ino}`,
+				sourceSha256,
+				migratedKeys: ["gjc.ralplan.maxIterations"],
+				startedAt: new Date().toISOString(),
+			}),
+		);
+
+		const result = await runProbe(cwd, {
+			home,
+			configDir: ".myconfig",
+			env: { SETTINGS_MIGRATION_TEST_REPLACE_BACKUP_AT_REMOVAL: "1" },
+		});
+
+		// The sentinel published at the backup pathname while the recovery
+		// removed its verified copy survives; the marker-owned target values are
+		// reverted and the marker cleared regardless.
+		expect(await fs.readFile(`${source}.bak`, "utf8")).toBe("external-backup-content");
+		expect(result.markerStatus).toBeNull();
+		expect(result.targetValue).toBeNull();
+	});
+
+	test("post-copy mismatch cleanup never removes a replaced backup", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const { source } = await setupHome(home, ".myconfig");
+		await fs.writeFile(source, '{"gjc.ralplan.maxIterations":7}');
+		const backup = `${source}.bak`;
+		const sentinel = "external-backup-content";
+
+		// The move succeeds (the source is untouched), but the backup was
+		// replaced before the outer post-copy re-hash; the mismatch cleanup must
+		// quarantine and re-verify the observed backup instead of removing it by
+		// pathname.
+		const result = await runProbe(cwd, {
+			home,
+			configDir: ".myconfig",
+			env: { SETTINGS_MIGRATION_TEST_REPLACE_BACKUP_ONLY: "1" },
+		});
+
+		expect(await fs.readFile(backup, "utf8")).toBe(sentinel);
+		expect(result.targetValue).toBeNull();
+		expect(result.markerStatus).toBe("pending");
 	});
 
 	test("a scalar/array target root aborts without touching anything", async () => {
@@ -1705,6 +1919,57 @@ describe("config-root workflow settings migration", () => {
 			interceptor.kill();
 		}
 	});
+	test("a backup replaced after its identity capture is never removed by the abort path", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const { source } = await setupHome(home, ".myconfig");
+		await fs.writeFile(source, '{"gjc.ralplan.maxIterations":7}');
+		const backup = `${source}.bak`;
+		const sentinel = "external-backup-content";
+
+		const result = await runProbe(cwd, {
+			home,
+			configDir: ".myconfig",
+			env: { SETTINGS_MIGRATION_TEST_REPLACE_BACKUP: "1" },
+		});
+
+		// The external replacement is preserved: the abort path never unlinks a
+		// backup that is no longer the file this run created (the promise that
+		// externally created backup data is never removed).
+		expect(await fs.readFile(backup, "utf8")).toBe(sentinel);
+		// The source edit aborted the move: the target patch was reverted and
+		// the pending marker retained for the next load.
+		expect(result.markerStatus).toBe("pending");
+		expect(result.targetValue).toBeNull();
+		// No quarantine leftovers: the migration's own copy was restored and the
+		// external replacement was never displaced.
+		const leftovers = (await fs.readdir(path.join(home, ".myconfig"))).filter(name => name.includes(".quarantine-"));
+		expect(leftovers).toEqual([]);
+	});
+	test("a backup published at the public pathname during removal is never deleted", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const { source } = await setupHome(home, ".myconfig");
+		await fs.writeFile(source, '{"gjc.ralplan.maxIterations":7}');
+		const backup = `${source}.bak`;
+		const sentinel = "external-backup-content";
+
+		const result = await runProbe(cwd, {
+			home,
+			configDir: ".myconfig",
+			env: { SETTINGS_MIGRATION_TEST_REPLACE_BACKUP_AT_REMOVAL: "1" },
+		});
+
+		// The file published at the backup pathname while the migration removed
+		// its own quarantined copy is preserved: the removal operates on the
+		// private quarantine name, never on the public pathname.
+		expect(await fs.readFile(backup, "utf8")).toBe(sentinel);
+		expect(result.markerStatus).toBe("pending");
+		expect(result.targetValue).toBeNull();
+		// No quarantine leftovers: the migration's own copy was the one removed.
+		const leftovers = (await fs.readdir(path.join(home, ".myconfig"))).filter(name => name.includes(".quarantine-"));
+		expect(leftovers).toEqual([]);
+	});
 
 	test("an identity-less complete marker never applies recovery claims", async () => {
 		const home = await tempDir();
@@ -2179,6 +2444,10 @@ describe("project workflow settings migration", () => {
 		expect(result.configYmlRootType).toBeNull();
 		expect(result.maxIterations).toBeNull(); // nothing published into config.yml
 		expect(result.migrationLog).toContain("removed the config.yml it created during rollback");
+		// No durable ownership was recorded, so the generic settings view must
+		// keep the retained legacy values visible - it would otherwise report a
+		// lower-layer/default while the workflow runtime still uses the fallback.
+		expect(result.settingsGetMaxIterations).toBe(7);
 	});
 
 	test("clears fallback-invalid values from config.yml when the source no longer holds them", async () => {

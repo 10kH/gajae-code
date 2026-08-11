@@ -12,11 +12,49 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, getConfigRootDir } from "@gajae-code/utils";
 import { YAML } from "bun";
-import { Settings } from "../../src/config/settings";
+import { Settings, SettingsMigrationTestHooks } from "../../src/config/settings";
 
 const cwd = process.cwd();
 const agentDirIndex = process.argv.indexOf("--agent-dir");
 const agentDirOverride = agentDirIndex >= 0 ? process.argv[agentDirIndex + 1] : undefined;
+// Test seam: when enabled, another process replaces the freshly created
+// backup and edits the source at the exact point between the backup identity
+// capture and the source re-hash, so the move verification fails while the
+// backup pathname no longer holds this run's file. The abort path must never
+// unlink the external replacement.
+if (process.env.SETTINGS_MIGRATION_TEST_REPLACE_BACKUP === "1") {
+	SettingsMigrationTestHooks.afterBackupIdentityCaptured = async (backupPath: string) => {
+		const sourcePath = path.resolve(getConfigRootDir(), "settings.json");
+		await fs.rm(backupPath, { force: true });
+		await fs.writeFile(backupPath, "external-backup-content");
+		await fs.writeFile(sourcePath, '{"gjc.ralplan.maxIterations":9}');
+	};
+}
+// Test seam: when enabled, another process publishes a new file at the backup
+// pathname while the migration is removing its OWN quarantined copy (after the
+// quarantined entry was verified, immediately before the unlink). The removal
+// must operate on the private quarantine name and never delete the file
+// published at the public pathname. The source edit below guarantees the move
+// verification fails so the removal path is reached.
+if (process.env.SETTINGS_MIGRATION_TEST_REPLACE_BACKUP_AT_REMOVAL === "1") {
+	SettingsMigrationTestHooks.afterBackupIdentityCaptured = async () => {
+		await fs.writeFile(path.resolve(getConfigRootDir(), "settings.json"), '{"gjc.ralplan.maxIterations":9}');
+	};
+	SettingsMigrationTestHooks.beforeQuarantineRemoval = async (backupPath: string) => {
+		await fs.writeFile(backupPath, "external-backup-content");
+	};
+}
+// Test seam: when enabled, another process replaces the freshly created
+// backup WITHOUT touching the source, so the move succeeds and the outer
+// post-copy backup re-hash (against sourceSha256) observes the replacement.
+// The mismatch cleanup must quarantine and re-verify before unlinking and
+// never delete the external revision.
+if (process.env.SETTINGS_MIGRATION_TEST_REPLACE_BACKUP_ONLY === "1") {
+	SettingsMigrationTestHooks.afterBackupIdentityCaptured = async (backupPath: string) => {
+		await fs.rm(backupPath, { force: true });
+		await fs.writeFile(backupPath, "external-backup-content");
+	};
+}
 
 let loadFailed = false;
 try {
