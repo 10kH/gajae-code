@@ -2360,6 +2360,10 @@ function sdkControlSurface(
 			hasPending: () => boolean;
 			cancel: () => void;
 		},
+		// True only when NO OTHER connection has a pending preflight admission;
+		// the session-wide preflight seam must not be invoked while another
+		// connection's active preflight could be cancelled by it (review P1).
+		noOtherConnectionPreflights?: () => boolean,
 	) => Promise<
 		| {
 				ok: true;
@@ -2774,10 +2778,21 @@ function sdkControlSurface(
 			// replay/conflict must NOT cancel a pending prompt — only a newly
 			// admitted abort may (review thread P2).
 			const scope: AbortScope = input.scope === "owned" ? "owned" : "turn";
-			const outcome = await abortTerminalPrompt(requesterConnectionId, scope, idempotencyKey, {
-				hasPending: () => capturedRequesterPreflights.length > 0,
-				cancel: cancelCapturedPreflights,
-			});
+			const outcome = await abortTerminalPrompt(
+				requesterConnectionId,
+				scope,
+				idempotencyKey,
+				{
+					hasPending: () => capturedRequesterPreflights.length > 0,
+					cancel: cancelCapturedPreflights,
+				},
+				// The seam cancels the SESSION-WIDE preflight controller; the
+				// internal per-connection map lets the queued requester's abort
+				// verify no OTHER connection has a pending admission before
+				// invoking it (review thread P1).
+				() =>
+					![...pendingPreflightCancellations.values()].some(entry => entry.connectionId !== requesterConnectionId),
+			);
 			// Preflight cancellation happens ONLY for a NEWLY ADMITTED abort,
 			// after the durable admission/replay decision inside
 			// abortTerminalPrompt: a no-store request or a same-key
@@ -2804,9 +2819,14 @@ function sdkControlSurface(
 				// while the abort was completing must never be cancelled as part of
 				// this abort (review thread P1). The session seam stays
 				// requester-gated so an unrelated connection's prompt is not
-				// failed.
+				// failed: it cancels the SESSION-WIDE preflight controller, so it
+				// is invoked only when no OTHER connection has a pending admission
+				// (review thread P1).
 				cancelCapturedPreflights();
-				terminalAbortSeams?.cancelPendingPreflightForTerminalAbort?.();
+				const otherConnectionPreflights = [...pendingPreflightCancellations.values()].some(
+					entry => entry.connectionId !== requesterConnectionId,
+				);
+				if (!otherConnectionPreflights) terminalAbortSeams?.cancelPendingPreflightForTerminalAbort?.();
 			}
 			if (!outcome.ok && outcome.reason === "conflict") {
 				// Throw a typed control error instead of returning a nested result
@@ -5039,7 +5059,7 @@ export function createNotificationsExtension(
 				}
 				return { aborted: true, disposition: "cancelled" as const };
 			},
-			async (connectionId, scope, idempotencyKey, preflightCancel) => {
+			async (connectionId, scope, idempotencyKey, preflightCancel, noOtherConnectionPreflights) => {
 				// Hash the EXACT response payload this abort will return: the durable
 				// row stores it at finalization so the response-state advance requires
 				// equality instead of trusting a non-pending placeholder (review
@@ -5218,13 +5238,32 @@ export function createNotificationsExtension(
 				// row (exact key+input, still reserved) is touched (review thread P2).
 				const finalizeNoEffectReservation = async (payloadHash: string): Promise<void> => {
 					if (!keyHash) return;
+					// The same-key retry delivers the replay envelope; store its hash
+					// too so a written replay can advance the finalized row (review
+					// thread P2).
+					const replayPayloadHash = hashResult({
+						ok: true,
+						selection: scope,
+						turn: "no_active_turn",
+						terminal: "terminal_no_effect",
+						replay: {
+							responseState: "pending",
+							responsePayloadHash: payloadHash,
+							terminalPublished: false,
+						},
+					});
 					try {
 						await durableStore.transactTerminalState(state => {
 							const scopes: DurableTerminalScopeRecord[] = state.scopes.map(record =>
 								record.idempotencyKeyHash === keyHash &&
 								record.idempotencyInputHash === inputHash &&
 								record.turnDisposition === "no_effect_reserved"
-									? { ...record, turnDisposition: "no_effect", responsePayloadHash: payloadHash }
+									? {
+											...record,
+											turnDisposition: "no_effect",
+											responsePayloadHash: payloadHash,
+											replayPayloadHash,
+										}
 									: record,
 							);
 							// Finalized reservations become evictable completed rows: apply
@@ -5446,7 +5485,12 @@ export function createNotificationsExtension(
 						// already removed (review thread P1).
 						if (preflightCancel?.hasPending()) {
 							preflightCancel.cancel();
-							terminalAbortSeams?.cancelPendingPreflightForTerminalAbort?.();
+							// The seam cancels the SESSION-WIDE preflight controller:
+							// invoke it only when no OTHER connection has a pending
+							// admission, or this queued requester's abort would fail an
+							// unrelated connection's active preflight (review thread P1).
+							if (noOtherConnectionPreflights?.() !== false)
+								terminalAbortSeams?.cancelPendingPreflightForTerminalAbort?.();
 						}
 						// No prompt won the race: finalize the reserved row so a later
 						// same-key retry (including after restart) replays this
@@ -5537,7 +5581,14 @@ export function createNotificationsExtension(
 							);
 							return already_terminalResult;
 						}
-						terminalAbortSeams?.cancelPendingPreflightForTerminalAbort?.();
+						if (preflightCancel?.hasPending()) {
+							preflightCancel.cancel();
+							// The seam cancels the SESSION-WIDE preflight controller:
+							// invoke it only when no OTHER connection has a pending
+							// admission (review thread P1).
+							if (noOtherConnectionPreflights?.() !== false)
+								terminalAbortSeams?.cancelPendingPreflightForTerminalAbort?.();
+						}
 						await terminalizePrompt(
 							{ commandId, turnId },
 							{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
@@ -5735,6 +5786,7 @@ export function createNotificationsExtension(
 										scopeRecord.selection === scope &&
 										scopeRecord.turnDisposition === "pending");
 								if (!isMarker) return scopeRecord;
+								const responsePayloadHash = hashPublicUncertain("worker_unsettled");
 								return {
 									...scopeRecord,
 									turnDisposition: "uncertain" as const,
@@ -5742,7 +5794,24 @@ export function createNotificationsExtension(
 									// Hash the public worker_unsettled disposition the client
 									// receives, or the response can never advance the row
 									// (review thread P2).
-									responsePayloadHash: hashPublicUncertain("worker_unsettled"),
+									responsePayloadHash,
+									// A same-key retry delivers the replay envelope (with the
+									// replay reason); store its hash so the written replay can
+									// advance the row (review thread P2).
+									replayPayloadHash: hashResult({
+										ok: true,
+										selection: scope,
+										turn: "uncertain",
+										ownedWork: scope === "turn" ? "left_running" : "uncertain",
+										automaticDelivery: scope === "turn" ? "enabled" : "none",
+										resumeOnOwnedCompletion: scope === "turn",
+										reason: "replay_uncertain",
+										replay: {
+											responseState: "pending",
+											responsePayloadHash,
+											terminalPublished: captured.published === true,
+										},
+									}),
 									// Preserve the captured publication bit: if agent_end
 									// was already published before settlement failed, the
 									// implementation will NOT publish a second event, so the
@@ -5780,6 +5849,23 @@ export function createNotificationsExtension(
 					// so the internal outcome shape can never match (review thread P2).
 					const result = { ok: false as const, reason };
 					const responsePayloadHash = hashPublicUncertain(reason);
+					// A same-key retry delivers the replay envelope (with the replay
+					// reason); store its hash so the written replay can advance the
+					// row (review thread P2).
+					const replayPayloadHash = hashResult({
+						ok: true,
+						selection: scope,
+						turn: "uncertain",
+						ownedWork: scope === "turn" ? "left_running" : "uncertain",
+						automaticDelivery: scope === "turn" ? "enabled" : "none",
+						resumeOnOwnedCompletion: scope === "turn",
+						reason: "replay_uncertain",
+						replay: {
+							responseState: "pending",
+							responsePayloadHash,
+							terminalPublished: captured.published === true,
+						},
+					});
 					try {
 						await transactBoundedTerminalScopes(scopes =>
 							scopes.map(scopeRecord => {
@@ -5794,6 +5880,7 @@ export function createNotificationsExtension(
 									turnDisposition: "uncertain" as const,
 									ownedWorkDisposition: "uncertain" as const,
 									responsePayloadHash,
+									replayPayloadHash,
 									// Preserve the captured publication bit: if agent_end
 									// was already published before settlement failed, the
 									// implementation will NOT publish a second event, so the
@@ -5885,6 +5972,27 @@ export function createNotificationsExtension(
 									}),
 								)
 								.digest("hex");
+							// A same-key retry delivers the replay envelope; store its
+							// hash too so a written replay can advance the pending row
+							// (review thread P2).
+							const replayPayloadHash = crypto
+								.createHash("sha256")
+								.update(
+									JSON.stringify({
+										ok: true,
+										selection: scope,
+										turn: "stopped",
+										ownedWork: ownedWorkDisposition,
+										automaticDelivery: scope === "turn" ? "enabled" : "none",
+										resumeOnOwnedCompletion: scope === "turn",
+										replay: {
+											responseState: "pending",
+											responsePayloadHash: payloadHash,
+											terminalPublished: captured.published === true,
+										},
+									}),
+								)
+								.digest("hex");
 							return {
 								...scopeRecord,
 								turnDisposition: "stopped" as const,
@@ -5897,6 +6005,7 @@ export function createNotificationsExtension(
 										scopeRecord.turnContinuationFence.abortedAttemptEpoch,
 								},
 								responsePayloadHash: payloadHash,
+								replayPayloadHash,
 								terminalAt: Date.now(),
 							};
 						}),

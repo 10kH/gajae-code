@@ -3123,6 +3123,185 @@ test("SDK host turn.abort terminal mode returns no-effect with no active turn", 
 	expect(frames.some(frame => frame.type === "agent_start")).toBe(false);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
+test("terminal abort from a queued requester never cancels another connection's pending preflight", async () => {
+	// Review thread P1: two connections submit prompts before either receives a
+	// run handle. The queued requester's terminal abort rejects its own
+	// wrapper preflight but must NOT invoke the session-wide preflight seam —
+	// it cancels the session's single controller captured by the OTHER
+	// connection's active preflight, failing an unrelated prompt.
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-preflight-scope-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-preflight-scope-${Date.now()}`;
+	let sessionPreflightCancelled = 0;
+	const neverPreflight = Promise.withResolvers<never>();
+	const deliveries: unknown[][] = [];
+	const handlers = start(
+		{
+			...context(cwd, sessionId),
+			cancelPendingPreflightForTerminalAbort: () => {
+				sessionPreflightCancelled += 1;
+			},
+		},
+		undefined,
+		async (content, options) => {
+			deliveries.push([content, options]);
+			if (content === "conn-a pending prompt") {
+				await neverPreflight.promise;
+			}
+			await firePreflightAccept(options);
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const connect = async () => {
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		return { socket, frames };
+	};
+	const connA = await connect();
+	const connB = await connect();
+	// Conn A's prompt enters preflight and stays there (never resolves).
+	connA.socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "scope-prompt-a",
+			operation: "turn.prompt",
+			input: { text: "conn-a pending prompt", images: [] },
+		}),
+	);
+	await waitFor(() => deliveries.length === 1, "conn-a preflight started");
+	// Conn B terminal-aborts while conn A's preflight is still pending: the
+	// aborting requester has no admission of its own yet, so only conn A's
+	// preflight could be hit by the session-wide seam.
+	connB.socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "scope-abort-b",
+			operation: "turn.abort",
+			input: { mode: "terminal" },
+			idempotencyKey: "scope-abort-b-key",
+		}),
+	);
+	await waitFor(
+		() => connB.frames.some(frame => frame.type === "control_response" && frame.id === "scope-abort-b"),
+		"queued requester abort response",
+	);
+	// The session-wide seam was never invoked while another connection's
+	// preflight was pending: conn A's prompt must still be able to complete.
+	expect(sessionPreflightCancelled).toBe(0);
+	neverPreflight.resolve();
+	await waitFor(
+		() => connA.frames.some(frame => frame.type === "control_response" && frame.id === "scope-prompt-a"),
+		"conn-a prompt response after preflight release",
+	);
+	expect(connA.frames.find(f => f.type === "control_response" && f.id === "scope-prompt-a")).toMatchObject({
+		ok: true,
+	});
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, context(cwd, sessionId));
+});
+
+test("full-bus terminal replay advances a finalized row through the stored replay payload hash", async () => {
+	// Review thread P2: the full-bus no-effect finalization must store the
+	// replay-shaped payload hash alongside the original response hash — a
+	// same-key retry delivers the replay envelope, and the delivery observer
+	// only advances a pending row when the written response matches either
+	// stored hash. Without replayPayloadHash the written replay stays durably
+	// pending forever.
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-fullbus-replay-hash-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-fullbus-replay-hash-${Date.now()}`;
+	const sessionFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`);
+	const handlers = start(
+		{
+			...context(cwd, sessionId),
+			sessionManager: {
+				...(context(cwd, sessionId).sessionManager as Record<string, unknown>),
+				getSessionFile: () => sessionFile,
+			},
+			getTerminalTurnEpoch: () => 1,
+		},
+		undefined,
+		() => {},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	// Idle abort: durable no-effect reservation, finalized to plain no_effect.
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "fh-abort-1",
+			operation: "turn.abort",
+			input: { mode: "terminal" },
+			idempotencyKey: "fh-key-1",
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "fh-abort-1"),
+		"first abort response",
+	);
+	expect(frames.find(f => f.type === "control_response" && f.id === "fh-abort-1")).toMatchObject({
+		ok: true,
+		result: { turn: "no_active_turn", terminal: "terminal_no_effect" },
+	});
+	// The finalized row stores BOTH the original and the replay-shaped hash.
+	const storeFile = reconciliationStorePath(sessionFile, sessionId);
+	await waitFor(() => fs.existsSync(storeFile), "durable store file");
+	const row = JSON.parse(fs.readFileSync(storeFile, "utf8")).terminalScopes?.find(
+		(scope: { idempotencyKeyHash?: string }) => scope.idempotencyKeyHash,
+	);
+	expect(row).toMatchObject({ turnDisposition: "no_effect", responsePayloadHash: expect.any(String) });
+	expect(typeof row.replayPayloadHash).toBe("string");
+	// Same-key retry: the replay is delivered and the written response advances
+	// the pending row to sent (its hash matches the stored replay-shaped hash).
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "fh-abort-2",
+			operation: "turn.abort",
+			input: { mode: "terminal" },
+			idempotencyKey: "fh-key-1",
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "fh-abort-2"),
+		"retry abort response",
+	);
+	expect(frames.find(f => f.type === "control_response" && f.id === "fh-abort-2")).toMatchObject({
+		ok: true,
+		result: expect.objectContaining({ turn: "no_active_turn", terminal: "terminal_no_effect" }),
+	});
+	const sentDeadline = Date.now() + 15_000;
+	let advancedRow: { responseState?: string } | undefined;
+	while (Date.now() < sentDeadline) {
+		const doc = JSON.parse(fs.readFileSync(storeFile, "utf8")) as {
+			terminalScopes?: Array<{ idempotencyKeyHash?: string; responseState?: string }>;
+		};
+		advancedRow = doc.terminalScopes?.find(scope => scope.idempotencyKeyHash);
+		if (advancedRow?.responseState === "sent") break;
+		await Bun.sleep(20);
+	}
+	expect(advancedRow?.responseState).toBe("sent");
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, context(cwd, sessionId));
+});
+
 test("terminal abort durable replay after restart never cancels a NEW unrelated pending preflight", async () => {
 	// A successful durable row replayed after the in-memory dispatch entry
 	// expires/restart returns stopped/stopped_owned/no_effect WITH `stored`; the
