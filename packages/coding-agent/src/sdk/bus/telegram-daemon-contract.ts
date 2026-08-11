@@ -95,9 +95,11 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * the exact grace deadline when a failed archive publication rolls back.
  * Generation 59 publishes the owner's attached OPEN-socket count in the
  * heartbeat sidecar so `gjc notify health` can report a live daemon that is
- * attached to no registered endpoint (#4128).
+ * attached to no registered endpoint (#4128). Generation 60 fences the
+ * master-worker lifecycle: older daemons cannot continue serving while this
+ * daemon adds or removes master-channel delivery authority.
  */
-export const DAEMON_GENERATION = 59;
+export const DAEMON_GENERATION = 60;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 5
