@@ -4775,8 +4775,9 @@ export interface TelegramDaemonOptions {
 	topics?: { nameTemplate?: string };
 	/**
 	 * Require every connected session to explicitly advertise Telegram topic
-	 * eligibility in its identity header. Production daemon owners enable this;
-	 * the default keeps the embeddable daemon compatible with legacy test clients.
+	 * eligibility in its identity header. Production daemon owners MUST enable
+	 * this; the default is permissive only for direct embedded legacy clients and
+	 * tests, and is never a provenance input supplied by notification factories.
 	 */
 	requireTelegramTopicEligibility?: boolean;
 	/**
