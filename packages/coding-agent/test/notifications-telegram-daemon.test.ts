@@ -123,7 +123,7 @@ test("steady ownership heartbeat advances only the owner-tagged sidecar", async 
 			pid: process.pid,
 			now: () => now,
 		}),
-	).toBe(true);
+	).toBe("renewed");
 	expect((await readDaemonState(s))?.heartbeatAt).toBe(1);
 	expect((await readOwnerFreshnessSnapshot({ settings: s })).effectiveHeartbeatAt).toBe(2);
 });
@@ -153,7 +153,7 @@ test("stale-tag sidecars are inert and a stale writer cannot overwrite a success
 	expect(snapshot.effectiveHeartbeatAt).toBe((await readDaemonState(s))?.heartbeatAt);
 	expect(
 		await renewOwnerHeartbeatSidecar({ settings: s, ownerId: "other", acquisitionId: "other", pid: process.pid }),
-	).toBe(false);
+	).toBe("not_owner");
 });
 
 test("a stale rename landing after a steal stays inert and the successor self-heals", async () => {
@@ -233,7 +233,7 @@ test("a stale rename landing after a steal stays inert and the successor self-he
 			pid: process.pid,
 			now: () => now,
 		}),
-	).toBe(true);
+	).toBe("renewed");
 	expect((await readOwnerFreshnessSnapshot({ settings: s })).effectiveHeartbeatAt).toBe(30);
 });
 
@@ -311,7 +311,7 @@ test("sidecar fence skips publication after the ownership lock changes", async (
 			pid: process.pid,
 			fs: fencedFs,
 		}),
-	).toBe(false);
+	).toBe("not_owner");
 	expect(fs.existsSync(paths.heartbeat)).toBe(false);
 });
 
@@ -557,11 +557,154 @@ test("steady sidecar renewal creates no transition markers and calls no exactUnl
 				now: () => now,
 				fs: spyFs,
 			}),
-		).toBe(true);
+		).toBe("renewed");
 	}
 	expect(exactUnlinks).toBe(0);
 	expect(stealTouches).toBe(0);
 	expect(leakArtifacts()).toEqual(before);
+});
+test("a transient EPERM on the sidecar rename is retried and the heartbeat still publishes (#4200)", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	let now = 1;
+	await acquireDaemonOwnership({
+		settings: s,
+		tokenFingerprint: "fp",
+		chatId: "42",
+		pid: process.pid,
+		randomId: () => "owner",
+		now: () => now,
+	});
+	let renameAttempts = 0;
+	const flakyFs: TelegramDaemonFs = {
+		...(fs.promises as unknown as TelegramDaemonFs),
+		rename: async (from, to) => {
+			renameAttempts += 1;
+			if (renameAttempts <= 2) {
+				const error = new Error("EPERM: operation not permitted, rename") as NodeJS.ErrnoException;
+				error.code = "EPERM";
+				throw error;
+			}
+			return await fs.promises.rename(from as string, to as string);
+		},
+	};
+	now = 7;
+	expect(
+		await renewOwnerHeartbeatSidecar({
+			settings: s,
+			ownerId: "owner",
+			acquisitionId: "owner",
+			pid: process.pid,
+			now: () => now,
+			fs: flakyFs,
+		}),
+	).toBe("renewed");
+	expect(renameAttempts).toBe(3);
+	expect((await readOwnerFreshnessSnapshot({ settings: s })).effectiveHeartbeatAt).toBe(7);
+});
+test("a persistent EPERM on the sidecar rename reports publish_failed without throwing or leaking staging temps (#4200)", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const paths = daemonPaths(agentDir);
+	let now = 1;
+	await acquireDaemonOwnership({
+		settings: s,
+		tokenFingerprint: "fp",
+		chatId: "42",
+		pid: process.pid,
+		randomId: () => "owner",
+		now: () => now,
+	});
+	let renameAttempts = 0;
+	const lockedFs: TelegramDaemonFs = {
+		...(fs.promises as unknown as TelegramDaemonFs),
+		rename: async () => {
+			renameAttempts += 1;
+			const error = new Error("EPERM: operation not permitted, rename") as NodeJS.ErrnoException;
+			error.code = "EPERM";
+			throw error;
+		},
+	};
+	now = 7;
+	// The pre-fix behavior was an uncaught EPERM that terminated the daemon; the
+	// contract now is a contained non-owner-loss outcome after bounded retries.
+	expect(
+		await renewOwnerHeartbeatSidecar({
+			settings: s,
+			ownerId: "owner",
+			acquisitionId: "owner",
+			pid: process.pid,
+			now: () => now,
+			fs: lockedFs,
+		}),
+	).toBe("publish_failed");
+	expect(renameAttempts).toBe(4);
+	// The staged temp is cleaned up and the published sidecar is untouched.
+	expect(fs.readdirSync(path.dirname(paths.heartbeat)).filter(name => name.endsWith(".tmp"))).toEqual([]);
+	// A later cycle with the contention gone publishes normally.
+	now = 12;
+	expect(
+		await renewOwnerHeartbeatSidecar({
+			settings: s,
+			ownerId: "owner",
+			acquisitionId: "owner",
+			pid: process.pid,
+			now: () => now,
+		}),
+	).toBe("renewed");
+	expect((await readOwnerFreshnessSnapshot({ settings: s })).effectiveHeartbeatAt).toBe(12);
+});
+test("an ownership steal during EPERM retry backoff fences the stale writer as not_owner (#4200)", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const paths = daemonPaths(agentDir);
+	let now = 1;
+	await acquireDaemonOwnership({
+		settings: s,
+		tokenFingerprint: "fp",
+		chatId: "42",
+		pid: process.pid,
+		randomId: () => "a",
+		now: () => now,
+	});
+	let renameAttempts = 0;
+	const stealingFs: TelegramDaemonFs = {
+		...(fs.promises as unknown as TelegramDaemonFs),
+		rename: async () => {
+			renameAttempts += 1;
+			// Successor B steals on disk while A is inside its retry loop.
+			const state = JSON.parse(fs.readFileSync(paths.state, "utf8")) as DaemonState;
+			fs.writeFileSync(paths.state, JSON.stringify({ ...state, ownerId: "b", acquisitionId: "b" }));
+			fs.writeFileSync(
+				paths.lock,
+				JSON.stringify({
+					pid: state.pid,
+					incarnation: state.incarnation,
+					ownerId: "b",
+					acquisitionId: "b",
+					startedAt: 20,
+				}),
+			);
+			const error = new Error("EPERM: operation not permitted, rename") as NodeJS.ErrnoException;
+			error.code = "EPERM";
+			throw error;
+		},
+	};
+	now = 7;
+	expect(
+		await renewOwnerHeartbeatSidecar({
+			settings: s,
+			ownerId: "a",
+			acquisitionId: "a",
+			pid: process.pid,
+			now: () => now,
+			fs: stealingFs,
+		}),
+	).toBe("not_owner");
+	// Exactly one rename attempt: the next retry's lock reread refuses the publish.
+	expect(renameAttempts).toBe(1);
+	expect(fs.existsSync(paths.heartbeat)).toBe(false);
+	expect(fs.readdirSync(path.dirname(paths.heartbeat)).filter(name => name.endsWith(".tmp"))).toEqual([]);
 });
 test("corrupt or directory sidecar degrades to state-floor freshness and never throws", async () => {
 	const agentDir = tempAgentDir();
@@ -3018,7 +3161,9 @@ describe("telegram daemon", () => {
 		// lazy native bindings (#3846); generation 57 preserves parser-valid archive
 		// transitions; generation 58 covers fence-load promotion and rollback.
 		// Generation 59 publishes the attached OPEN-socket count in the heartbeat sidecar (#4128).
-		expect(DAEMON_GENERATION).toBe(59);
+		// Generation 60 contains transient heartbeat-sidecar publication failures
+		// under the ownership-lock fence instead of crashing the daemon (#4200).
+		expect(DAEMON_GENERATION).toBe(60);
 	});
 	test.each([
 		"1",
@@ -9488,6 +9633,157 @@ describe("telegram daemon", () => {
 		await runPromise;
 		expect(timers.size).toBe(0);
 		expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);
+	});
+	test("a transient heartbeat publish failure keeps the daemon serving and the next cycle recovers (#4200)", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		let now = 0;
+		await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: tokenFingerprint("tok"),
+			chatId: "42",
+			pid: process.pid,
+			now: () => now,
+			randomId: () => "owner",
+		});
+
+		const timers = new Map<number, { ms: number; callback: () => void }>();
+		let nextTimerId = 1;
+		let pollStarted!: () => void;
+		const pollStartedPromise = new Promise<void>(resolve => {
+			pollStarted = resolve;
+		});
+		let releasePoll!: () => void;
+		const pollGate = new Promise<void>(resolve => {
+			releasePoll = resolve;
+		});
+
+		// Only the heartbeat destination rename is blocked; every other daemon
+		// rename (state, roots, aliases) must keep working so the daemon's normal
+		// operations are unaffected by the simulated Windows sharing violation.
+		let blockHeartbeatRename = false;
+		let heartbeatRenameAttempts = 0;
+		const flakyFs: TelegramDaemonFs = {
+			...(fs.promises as unknown as TelegramDaemonFs),
+			...transitionFsCapabilities(),
+			rename: async (from, to) => {
+				if (blockHeartbeatRename && String(to) === paths.heartbeat) {
+					heartbeatRenameAttempts += 1;
+					const error = new Error("EPERM: operation not permitted, rename") as NodeJS.ErrnoException;
+					error.code = "EPERM";
+					throw error;
+				}
+				return await fs.promises.rename(from as string, to as string);
+			},
+		};
+
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const escaped: unknown[] = [];
+		const onEscape = (reason: unknown): void => void escaped.push(reason);
+		process.on("unhandledRejection", onEscape);
+		try {
+			const daemon = new TelegramNotificationDaemon({
+				settings: s,
+				ownerId: "owner",
+				botToken: "tok",
+				chatId: "42",
+				fs: flakyFs,
+				now: () => now,
+				idleTimeoutMs: 60_000,
+				createLifecycleControlServer: null,
+				botApi: {
+					async call(method: string): Promise<unknown> {
+						if (method === "getUpdates") {
+							pollStarted();
+							await pollGate;
+						}
+						return { ok: true, result: [] };
+					},
+				},
+				setIntervalImpl: ((callback: () => void, ms: number) => {
+					const id = nextTimerId++;
+					timers.set(id, { ms, callback });
+					return id as unknown as ReturnType<typeof setInterval>;
+				}) as typeof setInterval,
+				clearIntervalImpl: ((id: number) => {
+					timers.delete(id);
+				}) as unknown as typeof clearInterval,
+			});
+
+			const runPromise = daemon.run();
+			await pollStartedPromise;
+
+			// A healthy initial sidecar establishes the owner tag.
+			now = 5_000;
+			[...timers.values()].find(timer => timer.ms === 5_000)?.callback();
+			for (let attempts = 0; attempts < 20; attempts++) {
+				const heartbeat = JSON.parse(await fs.promises.readFile(paths.heartbeat, "utf8")) as {
+					heartbeatAt: number;
+				};
+				if (heartbeat.heartbeatAt === now) break;
+				await Bun.sleep(5);
+			}
+			expect(JSON.parse(await fs.promises.readFile(paths.heartbeat, "utf8"))).toMatchObject({ heartbeatAt: now });
+
+			// The next heartbeat hits the transient Windows sharing violation. It
+			// must NOT stop the owner: the sidecar stays at its last good value,
+			// the daemon keeps running, and a bounded warning is logged.
+			blockHeartbeatRename = true;
+			now = 10_000;
+			const attemptsBefore = heartbeatRenameAttempts;
+			[...timers.values()].find(timer => timer.ms === 5_000)?.callback();
+			for (let attempts = 0; attempts < 100 && heartbeatRenameAttempts === attemptsBefore; attempts++) {
+				await Bun.sleep(5);
+			}
+			await Bun.sleep(250); // allow the bounded retry loop + warn to finish
+			expect(heartbeatRenameAttempts).toBeGreaterThan(attemptsBefore);
+			expect(JSON.parse(await fs.promises.readFile(paths.heartbeat, "utf8"))).toMatchObject({ heartbeatAt: 5_000 });
+			expect((daemon as unknown as { running: boolean }).running).toBe(true);
+			expect(escaped).toEqual([]);
+			expect(warn.mock.calls.some(call => String(call[0]).includes("heartbeat sidecar publication failed"))).toBe(
+				true,
+			);
+			expect(fs.readdirSync(path.dirname(paths.heartbeat)).filter(name => name.endsWith(".tmp"))).toEqual([]);
+
+			// The transient lock clears: the next heartbeat cycle republishes and
+			// the daemon recovers without any restart.
+			blockHeartbeatRename = false;
+			now = 15_000;
+			[...timers.values()].find(timer => timer.ms === 5_000)?.callback();
+			for (let attempts = 0; attempts < 20; attempts++) {
+				const heartbeat = JSON.parse(await fs.promises.readFile(paths.heartbeat, "utf8")) as {
+					heartbeatAt: number;
+				};
+				if (heartbeat.heartbeatAt === now) break;
+				await Bun.sleep(5);
+			}
+			expect(JSON.parse(await fs.promises.readFile(paths.heartbeat, "utf8"))).toMatchObject({ heartbeatAt: now });
+			expect((daemon as unknown as { running: boolean }).running).toBe(true);
+			expect(escaped).toEqual([]);
+
+			daemon.requestStop();
+			releasePoll();
+			await runPromise;
+			expect(timers.size).toBe(0);
+			// Ownership release requires a durably quiesced shutdown; a retained
+			// lock only means shutdown persistence did not finish in the join
+			// budget, never that a transient heartbeat failure stopped the owner.
+			if (fs.existsSync(paths.lock)) {
+				expect(
+					warn.mock.calls.some(
+						call =>
+							String(call[0]).includes("shutdown was not durably quiesced") ||
+							String(call[0]).includes("heartbeat join timed out"),
+					),
+				).toBe(true);
+			} else {
+				expect(escaped).toEqual([]);
+			}
+		} finally {
+			process.off("unhandledRejection", onEscape);
+			warn.mockRestore();
+		}
 	});
 	test("heartbeat fails closed without recreating a removed daemon directory", async () => {
 		const agentDir = tempAgentDir();
