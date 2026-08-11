@@ -91,8 +91,8 @@
         "result": "8 pass / 0 fail"
       },
       {
-        "suite": "sdk-host-wiring.test.ts (x4 runs)",
-        "result": "101 pass / 0 fail per run"
+        "suite": "sdk-host-wiring.test.ts (merged tree)",
+        "result": "96 pass / 0 fail (full-file x3: one intermittent 30s timeout under load, passes in isolation and subsequent full runs)"
       },
       {
         "suite": "8 focused sdk/acp suites",
@@ -115,6 +115,10 @@
       {
         "check": "bun run check:public-sync (exact PR CI surface)",
         "result": "in sync"
+      },
+      {
+        "check": "bun run check:public-sync on merged tree (was broken on clean dev)",
+        "result": "in sync after catalog bump"
       }
     ],
     "baselineNote": "packages/coding-agent/test/sdk-client.test.ts has 5 pre-existing failures on origin/dev itself (b33943fa) and on the pure replay head; unrelated to this PR and not part of the PR CI surface.",
@@ -123,5 +127,17 @@
       "txt": "artifacts/qa-pr-4243-redteam-report.txt",
       "summary": "12 adversarial cases (10 code-inspection + 2 new dynamic), 6 contract rows covered, no blockers; architect gen-1 CLEAR/APPROVE"
     }
+  },
+  "mergeReconciliation": {
+    "devAtMerge": "9bd1b642bc994bce880d961d2a4528d050551892",
+    "devCommitsSinceReplayBase": 331,
+    "mergeCommit": "9fff1a9436",
+    "resolutions": [
+      "sdk-host-wiring.test.ts import union (NotificationSessionController type-only on dev; dropped dev-unused getNotificationConfig/telegramDaemon imports)",
+      "turn.prompt_status cursor rejection aligned to invalid_cursor (dev query handlers; test was broken on dev)",
+      "concurrent /notify on serialization test aligned to enabled/enabled convergence (activeRuntimeId claimed at start settlement; test was broken on dev)",
+      "package.json workspace catalog bumped 0.12.21 -> 0.13.1 for all @gajae-code packages (check:public-sync was red on clean dev); bun.lock synced"
+    ],
+    "baselineNote": "sdk-host-wiring 'waits for durable skill acceptance' times out intermittently under full-file load (passes in isolation 1.4s and in full-file runs 3rd attempt 23s; also passes on clean dev and pre-merge branch). Environmental flake, not a regression."
   }
 }
