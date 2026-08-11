@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-08-11
+
 ### Fixed
 
 - Code summarization now runs on the native blocking-work pool and returns a promise, keeping the JavaScript render and input loop responsive while tree-sitter parses source.

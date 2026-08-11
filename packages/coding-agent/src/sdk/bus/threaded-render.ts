@@ -62,6 +62,7 @@ interface ThreadedFrame {
 	branch?: unknown;
 	machine?: unknown;
 	title?: unknown;
+	telegramTopicsEnabled?: unknown;
 	// context_update
 	lastMessage?: unknown;
 	task?: unknown;

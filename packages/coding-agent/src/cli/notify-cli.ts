@@ -981,7 +981,7 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} notify activate-thread --session-id 01J...
 
 ${chalk.bold("Threaded Mode:")}
-  GJC uses Telegram private-chat topics for per-session threads. Setup verifies the bot
+  GJC uses Telegram private-chat topics for coordinator/lifecycle sessions only. Setup verifies the bot
   capability via getMe.has_topics_enabled. Enable Threaded Mode in @BotFather > Bot Settings
   > Threads Settings; bots cannot toggle it through the Bot API. If Telegram refuses topic
   creation at runtime, GJC delivers flat to the paired private chat with outbound notifications
