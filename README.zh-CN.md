@@ -28,6 +28,10 @@ Gajae-Code（`gjc`）是一个外置的编码代理运行器：在任意仓库�
 
 ## 用你已有的编码订阅
 
+<p align="center">
+  <img src="assets/coding-plans-banner.png" alt="GJC 支持的编码计划与提供商：Claude、ChatGPT/Codex、Gemini、GitHub Copilot、GitLab Duo、Cursor、Grok、GLM/Z.AI、Kimi、MiniMax、Qwen、Xiaomi、Perplexity、OpenCode、Fireworks" width="100%" />
+</p>
+
 登录一次，就能用你已经订阅的计划运行 GJC，无需额外的 API 计费 —— 在会话中运行 `/login` 并选择提供商：
 
 | 计划 / 订阅 | OAuth 登录 |
@@ -38,6 +42,7 @@ Gajae-Code（`gjc`）是一个外置的编码代理运行器：在任意仓库�
 | GitHub Copilot | `github-copilot` |
 | GitLab Duo | `gitlab-duo` |
 | Cursor | `cursor` |
+| xAI (Grok) | `xai` |
 | 智谱 Z.AI GLM Coding Plan | `zai` |
 | Kimi Code / Coding Plan / Moonshot | `kimi-code` · `moonshot` |
 | Fire Pass（Fireworks Kimi K2.6 Turbo 订阅） | `firepass` |

@@ -28,6 +28,10 @@ Gajae-Code（`gjc`）は外付けのコーディングエージェントハー�
 
 ## いま契約中のコーディングプランをそのまま
 
+<p align="center">
+  <img src="assets/coding-plans-banner.png" alt="GJC が対応するコーディングプランとプロバイダ: Claude、ChatGPT/Codex、Gemini、GitHub Copilot、GitLab Duo、Cursor、Grok、GLM/Z.AI、Kimi、MiniMax、Qwen、Xiaomi、Perplexity、OpenCode、Fireworks" width="100%" />
+</p>
+
 一度ログインすれば、すでに契約しているプランで GJC を動かせます。追加の API 課金は不要 — セッション内で `/login` を実行してプロバイダを選ぶだけです:
 
 | プラン / サブスクリプション | OAuth ログイン |
@@ -38,6 +42,7 @@ Gajae-Code（`gjc`）は外付けのコーディングエージェントハー�
 | GitHub Copilot | `github-copilot` |
 | GitLab Duo | `gitlab-duo` |
 | Cursor | `cursor` |
+| xAI (Grok) | `xai` |
 | Z.AI GLM Coding Plan | `zai` |
 | Kimi Code / Coding Plan / Moonshot | `kimi-code` · `moonshot` |
 | Fire Pass（Fireworks Kimi K2.6 Turbo サブスクリプション） | `firepass` |

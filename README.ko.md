@@ -28,6 +28,10 @@ Gajae-Code(`gjc`)는 외부 코딩 에이전트 하네스입니다. 아무 저�
 
 ## 쓰던 코딩 플랜 그대로
 
+<p align="center">
+  <img src="assets/coding-plans-banner.png" alt="GJC가 지원하는 코딩 플랜과 프로바이더: Claude, ChatGPT/Codex, Gemini, GitHub Copilot, GitLab Duo, Cursor, Grok, GLM/Z.AI, Kimi, MiniMax, Qwen, Xiaomi, Perplexity, OpenCode, Fireworks" width="100%" />
+</p>
+
 한 번 로그인하면 이미 구독 중인 플랜으로 GJC를 돌릴 수 있습니다. 별도 API 과금이 필요 없습니다 — 세션 안에서 `/login`을 실행하고 프로바이더를 고르세요:
 
 | 플랜 / 구독 | OAuth 로그인 |
@@ -38,6 +42,7 @@ Gajae-Code(`gjc`)는 외부 코딩 에이전트 하네스입니다. 아무 저�
 | GitHub Copilot | `github-copilot` |
 | GitLab Duo | `gitlab-duo` |
 | Cursor | `cursor` |
+| xAI (Grok) | `xai` |
 | Z.AI GLM Coding Plan | `zai` |
 | Kimi Code / Coding Plan / Moonshot | `kimi-code` · `moonshot` |
 | Fire Pass (Fireworks Kimi K2.6 Turbo 구독) | `firepass` |

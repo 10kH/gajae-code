@@ -26,6 +26,10 @@ Gajae-Code (`gjc`) is an external coding-agent harness: run it in any repository
 
 ## Bring your coding plan
 
+<p align="center">
+  <img src="assets/coding-plans-banner.png" alt="Coding plans and providers GJC runs on: Claude, ChatGPT/Codex, Gemini, GitHub Copilot, GitLab Duo, Cursor, Grok, GLM/Z.AI, Kimi, MiniMax, Qwen, Xiaomi, Perplexity, OpenCode, Fireworks" width="100%" />
+</p>
+
 Log in once and run GJC on the subscription you already have. No separate API billing required — run `/login` inside a session and pick a provider:
 
 | Plan / subscription | OAuth login |
@@ -36,6 +40,7 @@ Log in once and run GJC on the subscription you already have. No separate API bi
 | GitHub Copilot | `github-copilot` |
 | GitLab Duo | `gitlab-duo` |
 | Cursor | `cursor` |
+| xAI (Grok) | `xai` |
 | Z.AI GLM Coding Plan | `zai` |
 | Kimi Code / Coding Plan / Moonshot | `kimi-code` · `moonshot` |
 | Fire Pass (Fireworks Kimi K2.6 Turbo subscription) | `firepass` |
