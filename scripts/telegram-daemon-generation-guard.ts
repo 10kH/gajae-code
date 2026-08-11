@@ -8,7 +8,7 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 45;
+export const GUARD_CONTRACT_VERSION = 46;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
@@ -69,7 +69,7 @@ type GuardManifest = {
  * protected because old owners must be replaced when that admission path changes.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "f4caf659746092f5f4c6b90abd50546f893866a0c222495db586d1f6f26b2217";
+const PROTECTED_INVENTORY_SHA256 = "33829373c15a54fe665b888adf28d10a383098ab7ce041263d4bee32db3fa65e";
 
 /** Transition-marker generations fence every daemon lifecycle mutation. */
 export const TRANSITION_TOKEN_PROTECTED_DECLARATIONS = [
@@ -168,7 +168,11 @@ export const CHAT_CONFIG_PROTECTED_DECLARATIONS = {
 
 /** Chat-only endpoint isolation must replace daemon owners that cannot discover it. */
 export const CHAT_ENDPOINT_DISCOVERY_PROTECTED_DECLARATIONS = {
-	[sessionRouter]: ["SessionRouter.#attach"],
+	[sessionRouter]: [
+		"SessionRouter.#attach",
+		"SessionRouter.#createAttachedClient",
+		"SessionRouter.#publishAttachment",
+	],
 	[sdkDiscovery]: ["readSdkSessionEndpoint"],
 } as const;
 

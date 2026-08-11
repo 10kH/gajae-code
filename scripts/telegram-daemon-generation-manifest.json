@@ -1,5 +1,5 @@
 {
-  "contractVersion": 45,
+  "contractVersion": 46,
   "inventory": {
     "telegram": {
       "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts": [
@@ -225,7 +225,9 @@
         "runChatDaemonInternal"
       ],
       "packages/coding-agent/src/sdk/router/session-router.ts": [
-        "SessionRouter.#attach"
+        "SessionRouter.#attach",
+        "SessionRouter.#createAttachedClient",
+        "SessionRouter.#publishAttachment"
       ],
       "packages/coding-agent/src/sdk/client/discovery.ts": [
         "readSdkSessionEndpoint"
@@ -321,7 +323,9 @@
         "runChatDaemonInternal"
       ],
       "packages/coding-agent/src/sdk/router/session-router.ts": [
-        "SessionRouter.#attach"
+        "SessionRouter.#attach",
+        "SessionRouter.#createAttachedClient",
+        "SessionRouter.#publishAttachment"
       ],
       "packages/coding-agent/src/sdk/client/discovery.ts": [
         "readSdkSessionEndpoint"
@@ -421,6 +425,8 @@
     "discord:packages/coding-agent/src/sdk/bus/discord-daemon.ts:stop": "c8bcd881cc0331fb0565a82d997805f939701b12a80e03177192dbd5935824ff",
     "discord:packages/coding-agent/src/sdk/client/discovery.ts:readSdkSessionEndpoint": "beaffc6c3ccda96fdde2f81058c6c206e2c6e821b43f89b7bd5ca58440a37d0d",
     "discord:packages/coding-agent/src/sdk/router/session-router.ts:SessionRouter.#attach": "7c1d606012428e3628f11e33c6dce4819c01778ee005887a27198ead7ccc0360",
+    "discord:packages/coding-agent/src/sdk/router/session-router.ts:SessionRouter.#createAttachedClient": "dc2c780c9decb94e23481bc57d5d0fbfd3a45320197e03f33079a91a3334e43e",
+    "discord:packages/coding-agent/src/sdk/router/session-router.ts:SessionRouter.#publishAttachment": "7ddb2e7c2e1c61fa3b4bb3b71c3311a94b312b6e52944469d76be7d7c0b930b2",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:defaultPidAlive": "4b35a9534120b352539eb85c65099b9bc0adddd08ad53df7efae92ba98f35455",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:loadConfig": "aff409ff6d08bfe19f5c39aac900ec6c8e898d988971bac029edb50459a84f5e",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:ownerPid": "31110dcdd6e0f5dbc8b4dce27383646b9c339739758623ab67dc40ddc36661e0",
@@ -494,7 +500,7 @@
     "slack:packages/coding-agent/src/sdk/bus/config.ts:notificationConfigFromFile": "ed9446063305a13e9c6e8a9ffcac46985b44d79b778e0c96dbc1612b01f1f7d2",
     "slack:packages/coding-agent/src/sdk/bus/config.ts:resolveNotificationProvider": "09402fa9db279332fc392ef13a059b90f82c8721f4ed33cbc060222663558efd",
     "slack:packages/coding-agent/src/sdk/bus/config.ts:tokenFingerprint": "dd57445254e5ca152c4a2030f8959367a6800759f3f82fc5da09cc7b9a5aa758",
-    "slack:packages/coding-agent/src/sdk/bus/slack-daemon.ts:SlackNotificationDaemon": "a8f31f794c1e3dec13cc66094de058b4f554d7fa44db9d2aaee94150d0f3de23",
+    "slack:packages/coding-agent/src/sdk/bus/slack-daemon.ts:SlackNotificationDaemon": "b3fb0bc77a81c7addd593fde7c868920de4fa52d9e617592f3b313daf903a219",
     "slack:packages/coding-agent/src/sdk/bus/slack-daemon.ts:close": "82c1d933b6f951f8325502b54c6e1bd4a21e85aeec3f0e54cf514045f30e20a0",
     "slack:packages/coding-agent/src/sdk/bus/slack-daemon.ts:handleEnvelope": "b8ac026c2a7307716cecc43ad3e9c5f384b6eeaa228e77e75cbdce970c89aad2",
     "slack:packages/coding-agent/src/sdk/bus/slack-daemon.ts:notify": "ebda81d71e9ff92ad5688fe482894895d6b73d8d1f4642bfc09bbd3d18584b18",
@@ -504,6 +510,8 @@
     "slack:packages/coding-agent/src/sdk/bus/slack-daemon.ts:stop": "193b4d16482533da0d6ae137e0b9e74e5449cfa7f1633bb87b4e10572ad7c43e",
     "slack:packages/coding-agent/src/sdk/client/discovery.ts:readSdkSessionEndpoint": "beaffc6c3ccda96fdde2f81058c6c206e2c6e821b43f89b7bd5ca58440a37d0d",
     "slack:packages/coding-agent/src/sdk/router/session-router.ts:SessionRouter.#attach": "7c1d606012428e3628f11e33c6dce4819c01778ee005887a27198ead7ccc0360",
+    "slack:packages/coding-agent/src/sdk/router/session-router.ts:SessionRouter.#createAttachedClient": "dc2c780c9decb94e23481bc57d5d0fbfd3a45320197e03f33079a91a3334e43e",
+    "slack:packages/coding-agent/src/sdk/router/session-router.ts:SessionRouter.#publishAttachment": "7ddb2e7c2e1c61fa3b4bb3b71c3311a94b312b6e52944469d76be7d7c0b930b2",
     "telegram:packages/coding-agent/src/sdk/bus/config.ts:parseNotificationSettingsSnapshot": "a694158726a9a4f4df58d1b1a4cee54884ef2e4bab506b3c6cac981b3f41072e",
     "telegram:packages/coding-agent/src/sdk/bus/daemon-paths.ts:DaemonPaths": "a0ff443307bd24f6613567f2a891180775065c27d333316b6541713f0dc4527e",
     "telegram:packages/coding-agent/src/sdk/bus/daemon-paths.ts:HEARTBEAT_TTL_MS": "62255b5467995d21d3f929c863278ca3e815102001c51ca6d66840e1522ff990",

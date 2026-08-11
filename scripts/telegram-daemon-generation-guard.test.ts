@@ -110,7 +110,11 @@ const chatConfigHelpers = {
 	],
 } as const;
 const chatEndpointHelpers = {
-	[sessionRouter]: ["SessionRouter.#attach"],
+	[sessionRouter]: [
+		"SessionRouter.#attach",
+		"SessionRouter.#createAttachedClient",
+		"SessionRouter.#publishAttachment",
+	],
 	[sdkDiscovery]: ["readSdkSessionEndpoint"],
 } as const;
 const telegramToolActivityDeclarations = {
@@ -750,7 +754,7 @@ test("fails closed when a protected native authority declaration is missing or m
 		expect(() => validateManifest({ contractVersion: GUARD_CONTRACT_VERSION, inventory: narrowed })).toThrow("Telegram owner-lock handoff primitives");
 	});
 
-	test("rejects inventories missing required Telegram lifecycle, lease, tool-activity, chat CLI, or provider configuration authorities", () => {
+	test("rejects inventories missing required Telegram lifecycle, lease, tool-activity, chat CLI, endpoint discovery, or provider configuration authorities", () => {
 		for (const symbol of TELEGRAM_LIFECYCLE_PROTECTED_DECLARATIONS) {
 			const telegram = mutableInventory();
 			telegram.telegram[telegramDaemon] = telegram.telegram[telegramDaemon]!.filter(name => name !== symbol);
@@ -779,9 +783,17 @@ test("fails closed when a protected native authority declaration is missing or m
 		const providerConfig = mutableInventory();
 		providerConfig.slack[config] = providerConfig.slack[config]!.filter(name => name !== "isSlackComplete");
 		expect(() => validateInventory(providerConfig)).toThrow("chat configuration primitives");
-		const endpointDiscovery = mutableInventory();
-		delete endpointDiscovery.discord[sessionRouter];
-		expect(() => validateInventory(endpointDiscovery)).toThrow("isolated chat endpoint discovery");
+		for (const family of ["discord", "slack"] as const) {
+			for (const [file, declarations] of Object.entries(chatEndpointHelpers)) {
+				for (const symbol of declarations) {
+					const endpointDiscovery = mutableInventory();
+					const remaining = endpointDiscovery[family][file]!.filter(name => name !== symbol);
+					if (remaining.length === 0) delete endpointDiscovery[family][file];
+					else endpointDiscovery[family][file] = remaining;
+					expect(() => validateInventory(endpointDiscovery)).toThrow("isolated chat endpoint discovery");
+				}
+			}
+		}
 	});
 	test("protects Telegram shutdown admission and durable drain authorities", () => {
 		expect(protectedInventory.telegram[telegramDaemon]).toEqual(
