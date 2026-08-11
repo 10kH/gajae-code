@@ -417,4 +417,27 @@ describe("managed strict-resume target races", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
+
+	it("propagates retained root disappearance instead of treating the target as missing", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-retained-root-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "source.jsonl");
+		storage.writeTextSync(sourceFile, transcript());
+		SessionManagerTestHooks.beforeManagedSourceStat = async () => {
+			await fs.rm(destination.directory, { recursive: true, force: true });
+		};
+		try {
+			await expect(
+				SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled"),
+			).rejects.toThrow();
+			expect(storage.existsSync(sourceFile)).toBe(false);
+		} finally {
+			SessionManagerTestHooks.beforeManagedSourceStat = undefined;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
 });
