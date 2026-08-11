@@ -9,7 +9,6 @@ import type { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../src/extensibility/shared-events";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { createNotificationsExtension, shouldAwaitNotificationStartup } from "../src/sdk/bus/index";
-import { readEndpoint } from "../src/sdk/bus/telegram-reference";
 import { SessionSdkHost } from "../src/sdk/host";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
@@ -21,6 +20,7 @@ import {
 	isolatedNotificationSettings,
 	registerNotificationRuntime,
 } from "./helpers/notification-settings";
+import { readTestSdkEndpoint } from "./helpers/sdk-endpoint";
 
 /**
  * Regression for "the SDK notification transport spawns a new session instead of renaming":
@@ -145,7 +145,7 @@ function createHarness(
 }
 
 async function connectFrames(endpoint: string): Promise<Frame[]> {
-	const { url, token } = readEndpoint(endpoint);
+	const { url, token } = readTestSdkEndpoint(endpoint);
 	const frames: Frame[] = [];
 	const ws = new WebSocket(`${url}/?token=${encodeURIComponent(token)}`);
 	openSockets.push(ws);
@@ -272,7 +272,7 @@ test("turn.prompt preflight rejection returns a correlated failure without an ac
 	await handlers.get("session_start")!({ type: "session_start" }, ctx);
 	const endpointPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointPath), 4000, "preflight endpoint");
-	const { url, token } = readEndpoint(endpointPath);
+	const { url, token } = readTestSdkEndpoint(endpointPath);
 	const frames: Array<Record<string, unknown>> = [];
 	const ws = new WebSocket(`${url}/?token=${encodeURIComponent(token)}`);
 	openSockets.push(ws);
@@ -340,7 +340,7 @@ test("accepted turn.prompt submission failures emit a correlated terminal event"
 	await handlers.get("session_start")!({ type: "session_start" }, ctx);
 	const endpointPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointPath), 4000, "terminal failure endpoint");
-	const { url, token } = readEndpoint(endpointPath);
+	const { url, token } = readTestSdkEndpoint(endpointPath);
 	const frames: Array<Record<string, unknown>> = [];
 	const ws = new WebSocket(`${url}/?token=${encodeURIComponent(token)}`);
 	openSockets.push(ws);
@@ -424,7 +424,7 @@ test("session_switch rotates SDK authority while preserving topic identity", asy
 		const originalEndpoint = path.join(notifDir, `${sid}.json`);
 		await waitFor(() => fs.existsSync(originalEndpoint), 4000, "original endpoint file");
 
-		const { url, token } = readEndpoint(originalEndpoint);
+		const { url, token } = readTestSdkEndpoint(originalEndpoint);
 		const frames: Frame[] = [];
 		const ws = new WebSocket(`${url}/?token=${encodeURIComponent(token)}`);
 		openSockets.push(ws);

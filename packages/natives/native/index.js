@@ -21,7 +21,6 @@ export const ComputerController = nativeBindings.ComputerController;
 export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
 export const MacOSPowerAssertion = nativeBindings.MacOSPowerAssertion;
 export const NativeRetainedBrokerPublication = nativeBindings.NativeRetainedBrokerPublication;
-export const NotificationControlServer = nativeBindings.NotificationControlServer;
 export const NotificationServer = nativeBindings.NotificationServer;
 export const Process = nativeBindings.Process;
 export const PtySession = nativeBindings.PtySession;

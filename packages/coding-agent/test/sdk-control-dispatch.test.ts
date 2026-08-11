@@ -58,6 +58,17 @@ const methodByOperation: Record<string, string> = {
 	"bash.background": "backgroundBash",
 };
 
+const BROKER_LIFECYCLE_OPERATIONS = new Set([
+	"session.new",
+	"session.fork",
+	"session.resume",
+	"session.close",
+	"session.switch",
+	"session.branch",
+	"session.handoff",
+	"session.delete",
+]);
+
 function request(row: (typeof OPERATIONS)[number]): ControlRequest {
 	return {
 		id: row.id,
@@ -107,7 +118,7 @@ test("dispatches every control registry operation to its ControlSurface method",
 				},
 		},
 	) as ControlSurface;
-	const rows = OPERATIONS.filter(row => row.kind === "control");
+	const rows = OPERATIONS.filter(row => row.kind === "control" && !BROKER_LIFECYCLE_OPERATIONS.has(row.sdkId));
 	for (const row of rows) {
 		const response = await dispatchControl(surface, row, request(row));
 		expect(response).toEqual({ id: row.id, ok: true, result: methodByOperation[row.sdkId] });
@@ -167,14 +178,12 @@ test("forwards an optional thinking level with model.set without changing legacy
 	]);
 });
 
-test("session.handoff surfaces the retained handoff document in the error details", async () => {
+test("session.handoff remains available only through the Broker lifecycle service", async () => {
 	const row = OPERATIONS.find(operation => operation.sdkId === "session.handoff")!;
+	let called = false;
 	const surface = {
 		handoffSession: () => {
-			throw Object.assign(new Error("Handoff is unavailable for the current state."), {
-				code: "invalid_request",
-				handoffDocument: "## Goal\nRetained across the SDK wire",
-			});
+			called = true;
 		},
 	} as unknown as ControlSurface;
 
@@ -184,8 +193,82 @@ test("session.handoff surfaces the retained handoff document in the error detail
 	});
 
 	expect(response.ok).toBe(false);
-	expect(response.error?.code).toBe("invalid_request");
-	expect(response.error?.details).toEqual({ handoffDocument: "## Goal\nRetained across the SDK wire" });
+	expect(response.error?.code).toBe("operation_prohibited");
+	expect(response.error?.details).toBeUndefined();
+	expect(called).toBe(false);
+});
+
+test("rejects an ordinary session.close request before closeSession can mutate the surface", async () => {
+	const row = OPERATIONS.find(operation => operation.sdkId === "session.close")!;
+	const effects: string[] = [];
+	const surface = {
+		closeSession: () => {
+			effects.push("close");
+			return { closed: true };
+		},
+	} as unknown as ControlSurface;
+
+	const response = await dispatchControl(surface, row, {
+		id: "ordinary-close",
+		operation: "session.close",
+		input: {},
+	});
+
+	expect(response).toEqual({
+		id: "ordinary-close",
+		ok: false,
+		error: {
+			code: "operation_prohibited",
+			message: "session.close is available only through the Broker lifecycle service.",
+		},
+	});
+	expect(effects).toEqual([]);
+});
+
+test("dispatches session.close only for the exact Broker runtime capability", () => {
+	const dispatchModule = new URL("../src/sdk/host/control/dispatch.ts", import.meta.url).href;
+	const registryModule = new URL("../src/sdk/protocol/operation-registry.ts", import.meta.url).href;
+	const capability = "broker-close-capability";
+	const script = `
+		import { dispatchControl } from ${JSON.stringify(dispatchModule)};
+		import { OPERATIONS } from ${JSON.stringify(registryModule)};
+
+		const row = OPERATIONS.find(operation => operation.kind === "control" && operation.sdkId === "session.close");
+		if (!row) throw new Error("Missing session.close control operation.");
+		const calls: Array<string | undefined> = [];
+		const surface = {
+			closeSession: (receivedCapability?: string) => {
+				calls.push(receivedCapability);
+				return { receivedCapability };
+			},
+		};
+		const responses = [];
+		for (const [id, input] of [
+			["ordinary", {}],
+			["wrong", { __gjcBrokerCloseCapability: "wrong-capability" }],
+			["exact", { __gjcBrokerCloseCapability: ${JSON.stringify(capability)} }],
+		] as const) {
+			responses.push(await dispatchControl(surface as never, row, { id, operation: "session.close", input }));
+		}
+		process.stdout.write(JSON.stringify({ calls, responses }));
+	`;
+	const child = Bun.spawnSync([process.execPath, "-e", script], {
+		env: { ...process.env, GJC_LIFECYCLE_REQUEST_ID: capability },
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+
+	expect(child.exitCode, child.stderr.toString()).toBe(0);
+	const result = JSON.parse(child.stdout.toString()) as {
+		calls: string[];
+		responses: Array<{ id: string; ok: boolean; result?: { receivedCapability: string }; error?: { code: string } }>;
+	};
+	expect(result.calls).toEqual([capability]);
+	expect(result.responses).toMatchObject([
+		{ id: "ordinary", ok: false, error: { code: "operation_prohibited" } },
+		{ id: "wrong", ok: false, error: { code: "operation_prohibited" } },
+		{ id: "exact", ok: true, result: { receivedCapability: capability } },
+	]);
 });
 
 test("non-handoff control failures do not attach handoff details", async () => {

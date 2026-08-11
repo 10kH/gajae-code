@@ -46,10 +46,10 @@ import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { formatPromptSettlementDiagnostic, PresentationArbiter } from "../src/sdk/bus";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
-import { getNotificationConfig } from "../src/sdk/bus/config";
-import { NotificationSessionController } from "../src/sdk/bus/session-control";
-import * as telegramDaemon from "../src/sdk/bus/telegram-daemon";
+import type { NotificationSessionController } from "../src/sdk/bus/session-control";
+import { SdkClient } from "../src/sdk/client";
 import { SessionSdkHost } from "../src/sdk/host";
+import type { SessionAttachment } from "../src/sdk/router/session-router";
 import { createAgentSession } from "../src/sdk/session";
 import {
 	attachLifecycleStartupCapability,
@@ -129,12 +129,7 @@ function start(
 	commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>(),
 	lifecycle?: { startupCapability: SdkStartupCapability; lifecycleRequired: true },
 	autoStart = true,
-	ensureTelegramDaemon?: (input: {
-		settings: Settings;
-		cwd: string;
-		sessionId: string;
-		onRegistered?: (registration: telegramDaemon.RegisterNotificationRootResult) => void;
-	}) => Promise<"attached" | "blocked">,
+	ensureTelegramDaemon?: (input: { settings: Settings }) => Promise<"attached" | "blocked">,
 	controller?: NotificationSessionController,
 	ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>,
 ): Map<string, (event: unknown, context: unknown) => unknown> {
@@ -180,22 +175,6 @@ function start(
 	);
 	if (autoStart) void handlers.get("session_start")?.({ type: "session_start" }, ctx);
 	return handlers;
-}
-
-function telegramSettings(agentDir: string, configured: boolean): Settings {
-	const settings = Settings.isolated({
-		"notifications.enabled": true,
-		...(configured
-			? { "notifications.telegram.botToken": "123456:token", "notifications.telegram.chatId": "42" }
-			: {}),
-	}) as Settings;
-	return new Proxy(settings, {
-		get(target, prop) {
-			if (prop === "getAgentDir") return () => agentDir;
-			const value = Reflect.get(target, prop, target);
-			return typeof value === "function" ? value.bind(target) : value;
-		},
-	}) as Settings;
 }
 
 function context(
@@ -525,217 +504,7 @@ test("lifecycle cleanup fences same-id startup and preserves proven owner releas
 	}
 }, 60_000);
 
-test("Telegram root release failure is retained and retried through lifecycle shutdown", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-root-retry-"));
-	dirs.push(cwd);
-	const sessionId = `telegram-root-retry-${Date.now()}`;
-	const settings = telegramSettings(path.join(cwd, "agent"), true);
-	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
-	const unregisterImpl = telegramDaemon.unregisterNotificationRoot;
-	let unregisterAttempts = 0;
-	const unregister = spyOn(telegramDaemon, "unregisterNotificationRoot").mockImplementation(async input => {
-		unregisterAttempts++;
-		// Fail the first owner-release attempt for the live registration token.
-		if (unregisterAttempts === 1) throw new Error("roots write failed");
-		return await unregisterImpl(input);
-	});
-	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
-	try {
-		const sessionContext = context(cwd, sessionId);
-		const handlers = start(
-			sessionContext,
-			settings,
-			() => {},
-			false,
-			new Map(),
-			{ startupCapability: capability, lifecycleRequired: true },
-			false,
-			async input => {
-				const registration = await telegramDaemon.registerNotificationRoot(input);
-				input.onRegistered?.(registration);
-				return "attached";
-			},
-		);
-		// Await full start+reconcile so shutdown uses the final replacement token only.
-		await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
-		await expect(capability.promise).resolves.toEqual({ status: "started" });
-		const rootsFile = telegramDaemon.daemonPaths(settings.getAgentDir()).roots;
-		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBe(path.join(cwd, ".gjc", "state"));
-		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
-		// First shutdown retains the failed owner release (exactly one attempt).
-		expect(unregister).toHaveBeenCalledTimes(1);
-		expect(unregister.mock.calls[0]?.[0].registrationToken).toEqual(expect.any(String));
-		expect(
-			errorSpy.mock.calls.some(([message]) =>
-				String(message).includes(`SDK notification runtime ${sessionId} owner release failed`),
-			),
-		).toBe(true);
-		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBe(path.join(cwd, ".gjc", "state"));
-		// Explicit later lifecycle shutdown retries the retained release and succeeds.
-		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
-		expect(unregister).toHaveBeenCalledTimes(2);
-		expect(unregister.mock.calls[1]?.[0].registrationToken).toBe(unregister.mock.calls[0]?.[0].registrationToken);
-		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBeUndefined();
-		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8"))).toEqual({
-			version: 1,
-			roots: [],
-			managedRoots: [],
-			sessions: {},
-			registrationTokens: {},
-		});
-		await expect(
-			handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext),
-		).resolves.toBeUndefined();
-		expect(unregister).toHaveBeenCalledTimes(2);
-	} finally {
-		unregister.mockRestore();
-		errorSpy.mockRestore();
-	}
-}, 60_000);
-
-test("Telegram cleanup is never retained without a registration token", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-root-tokenless-"));
-	dirs.push(cwd);
-	const sessionId = `telegram-root-tokenless-${Date.now()}`;
-	const settings = telegramSettings(path.join(cwd, "agent"), true);
-	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
-	const unregister = spyOn(telegramDaemon, "unregisterNotificationRoot");
-	try {
-		const sessionContext = context(cwd, sessionId);
-		const handlers = start(
-			sessionContext,
-			settings,
-			() => {},
-			false,
-			new Map(),
-			{ startupCapability: capability, lifecycleRequired: true },
-			false,
-			async () => "attached",
-		);
-		await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
-		await expect(capability.promise).resolves.toEqual({ status: "started" });
-		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
-		expect(unregister).not.toHaveBeenCalled();
-	} finally {
-		unregister.mockRestore();
-	}
-}, 60_000);
-
-test("shutdown releases a Telegram root registered before sibling readiness settles", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-root-startup-race-"));
-	dirs.push(cwd);
-	const sessionId = `telegram-root-startup-race-${Date.now()}`;
-	const settings = telegramSettings(path.join(cwd, "agent"), true);
-	settings.set("notifications.discord.enabled", true);
-	settings.set("notifications.discord.botToken", "discord-token");
-	settings.set("notifications.discord.applicationId", "discord-app");
-	settings.set("notifications.discord.guildId", "discord-guild");
-	settings.set("notifications.discord.parentChannelId", "discord-parent");
-	const registered = Promise.withResolvers<void>();
-	const releaseProvider = Promise.withResolvers<void>();
-	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
-	const unregister = spyOn(telegramDaemon, "unregisterNotificationRoot");
-	let registrationToken: string | undefined;
-	try {
-		const sessionContext = context(cwd, sessionId);
-		const handlers = start(
-			sessionContext,
-			settings,
-			() => {},
-			false,
-			new Map(),
-			{ startupCapability: capability, lifecycleRequired: true },
-			false,
-			async input => {
-				const registration = await telegramDaemon.registerNotificationRoot(input);
-				registrationToken = registration.token;
-				input.onRegistered?.(registration);
-				registered.resolve();
-				return "attached";
-			},
-			undefined,
-			async () => await releaseProvider.promise,
-		);
-		const startup = Promise.resolve(handlers.get("session_start")!({ type: "session_start" }, sessionContext));
-		await registered.promise;
-		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
-		expect(unregister).toHaveBeenCalledWith(expect.objectContaining({ sessionId, registrationToken }));
-		const rootsFile = telegramDaemon.daemonPaths(settings.getAgentDir()).roots;
-		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8"))).toEqual({
-			version: 1,
-			roots: [],
-			managedRoots: [],
-			sessions: {},
-			registrationTokens: {},
-		});
-		releaseProvider.resolve();
-		await startup;
-		await expect(capability.promise).resolves.toMatchObject({ status: "failed" });
-	} finally {
-		releaseProvider.resolve();
-		unregister.mockRestore();
-	}
-}, 60_000);
-
-test("provider retry replaces and releases the Telegram root registration token", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-root-provider-retry-"));
-	dirs.push(cwd);
-	const sessionId = `telegram-root-provider-retry-${Date.now()}`;
-	const settings = telegramSettings(path.join(cwd, "agent"), true);
-	settings.set("notifications.discord.enabled", true);
-	settings.set("notifications.discord.botToken", "discord-token");
-	settings.set("notifications.discord.applicationId", "discord-app");
-	settings.set("notifications.discord.guildId", "discord-guild");
-	settings.set("notifications.discord.parentChannelId", "discord-parent");
-	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
-	const unregister = spyOn(telegramDaemon, "unregisterNotificationRoot");
-	const registrationTokens: string[] = [];
-	let providerAttempts = 0;
-	try {
-		const sessionContext = context(cwd, sessionId);
-		const handlers = start(
-			sessionContext,
-			settings,
-			() => {},
-			false,
-			new Map(),
-			{ startupCapability: capability, lifecycleRequired: true },
-			false,
-			async input => {
-				const registration = await telegramDaemon.registerNotificationRoot(input);
-				registrationTokens.push(registration.token);
-				input.onRegistered?.(registration);
-				return "attached";
-			},
-			undefined,
-			async () => {
-				providerAttempts++;
-				if (providerAttempts === 1) throw new Error("Discord unavailable");
-			},
-		);
-		await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
-		await expect(capability.promise).resolves.toEqual({ status: "started" });
-		expect(providerAttempts).toBe(2);
-		expect(registrationTokens.length).toBeGreaterThanOrEqual(2);
-		expect(registrationTokens.at(-1)).not.toBe(registrationTokens[0]);
-		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
-		expect(unregister).toHaveBeenCalledWith(
-			expect.objectContaining({ sessionId, registrationToken: registrationTokens.at(-1) }),
-		);
-		const rootsFile = telegramDaemon.daemonPaths(settings.getAgentDir()).roots;
-		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8"))).toEqual({
-			version: 1,
-			roots: [],
-			managedRoots: [],
-			sessions: {},
-			registrationTokens: {},
-		});
-	} finally {
-		unregister.mockRestore();
-	}
-}, 60_000);
-
-test("late Telegram ownership races preserve the published canonical core endpoint", async () => {
+test("Telegram ownership races publish safe siblings only in broker-authorized chat scope", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-sibling-isolation-"));
 	dirs.push(cwd);
 	const agentDir = path.join(cwd, "agent");
@@ -774,67 +543,19 @@ test("late Telegram ownership races preserve the published canonical core endpoi
 	await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
 	await expect(capability.promise).resolves.toEqual({ status: "started" });
 	const defaultEndpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-	const stateRoot = path.join(cwd, ".gjc", "state");
-	const chatEndpoint = path.join(stateRoot, "chat", "sdk", `${sessionId}.json`);
-	expect(fs.existsSync(defaultEndpoint)).toBe(true);
-	expect(fs.existsSync(chatEndpoint)).toBe(false);
+	const chatStateRoot = path.join(cwd, ".gjc", "state", "chat");
+	const chatEndpoint = path.join(chatStateRoot, "sdk", `${sessionId}.json`);
+	expect(fs.existsSync(defaultEndpoint)).toBe(false);
+	expect(fs.existsSync(chatEndpoint)).toBe(true);
 	const sessions = (await new SessionIndex(agentDir).open()).listSessions().sessions;
 	expect(sessions).toContainEqual(
 		expect.objectContaining({
 			sessionId,
-			locator: { repo: path.resolve(cwd), stateRoot },
-			endpointMtimeMs: fs.statSync(defaultEndpoint).mtimeMs,
+			locator: { repo: path.resolve(cwd), stateRoot: chatStateRoot },
+			endpointMtimeMs: fs.statSync(chatEndpoint).mtimeMs,
 		}),
 	);
 	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
-}, 60_000);
-test("Telegram root ownership is recorded when reconciliation configures Telegram after startup", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-root-reconcile-"));
-	dirs.push(cwd);
-	const sessionId = `telegram-root-reconcile-${Date.now()}`;
-	const settings = telegramSettings(path.join(cwd, "agent"), false);
-	const controller = new NotificationSessionController({
-		eligible: true,
-		getConfig: () => getNotificationConfig(settings),
-	});
-	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
-	let registrations = 0;
-	const sessionContext = context(cwd, sessionId);
-	const handlers = start(
-		sessionContext,
-		settings,
-		() => {},
-		false,
-		new Map(),
-		{ startupCapability: capability, lifecycleRequired: true },
-		true,
-		async input => {
-			registrations++;
-			const registration = await telegramDaemon.registerNotificationRoot(input);
-			input.onRegistered?.(registration);
-			return "attached";
-		},
-		controller,
-	);
-	await expect(capability.promise).resolves.toEqual({ status: "started" });
-	expect(registrations).toBe(0);
-	settings.set("notifications.telegram.botToken", "123456:token");
-	settings.set("notifications.telegram.chatId", "42");
-	await expect(controller.reconcileCurrentSession(sessionContext as never)).resolves.toMatchObject({
-		outcome: "started",
-	});
-	const rootsFile = telegramDaemon.daemonPaths(settings.getAgentDir()).roots;
-	expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBe(path.join(cwd, ".gjc", "state"));
-	await expect(
-		handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext),
-	).resolves.toBeUndefined();
-	expect(JSON.parse(fs.readFileSync(rootsFile, "utf8"))).toEqual({
-		version: 1,
-		roots: [],
-		managedRoots: [],
-		sessions: {},
-		registrationTokens: {},
-	});
 }, 60_000);
 
 test("production SDK host starts exactly one instrumented server (no duplicate auto-host)", async () => {
@@ -1216,9 +937,8 @@ test("interactive SDK control routes synthetic gajae-code selections to session-
 		contextActions?.sdkControl?.("model.set", { id: "gajae-code/codex-eco", thinkingLevel: "high" }),
 	).rejects.toMatchObject({ code: "invalid_input" });
 });
-test("interactive session.handoff SDK control threads focus instructions to session.handoff", async () => {
+test("interactive SDK controls reject Broker-owned session handoff", async () => {
 	let contextActions: ExtensionContextActions | undefined;
-	const handoffCalls: (string | undefined)[] = [];
 	const runner = {
 		initialize(
 			_actions: ExtensionActions,
@@ -1230,26 +950,12 @@ test("interactive session.handoff SDK control threads focus instructions to sess
 		},
 	};
 	const controller = new ExtensionUiController({
-		session: {
-			extensionRunner: runner,
-			handoff: async (instructions?: string) => {
-				handoffCalls.push(instructions);
-				return { document: "## Goal\nContinue", savedPath: undefined };
-			},
-		},
+		session: { extensionRunner: runner },
 	} as unknown as InteractiveModeContext);
 	controller.initializeHookRunner({} as ExtensionUIContext, false);
-
-	// The wire carries the focus under `target` (see sdk-control-dispatch);
-	// the SDK control seam must forward it to session.handoff.
-	expect(await contextActions?.sdkControl?.("session.handoff", { target: "preserve failing test" })).toEqual({
-		handoff: { document: "## Goal\nContinue", savedPath: undefined },
-	});
-	expect(handoffCalls).toEqual(["preserve failing test"]);
-
-	// A bare handoff (no focus) forwards undefined.
-	await contextActions?.sdkControl?.("session.handoff", {});
-	expect(handoffCalls).toEqual(["preserve failing test", undefined]);
+	await expect(
+		contextActions?.sdkControl?.("session.handoff", { target: "preserve failing test" }),
+	).rejects.toMatchObject({ code: "operation_prohibited" });
 });
 
 test("startup records identity before an early lifecycle event and publishes it only after NotificationServer starts", async () => {
@@ -3043,7 +2749,12 @@ test("ACP permission attachment normalizes decisions through the registered prov
 	start(ctx);
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as {
+		sessionId: string;
+		pid: number;
+		url: string;
+		token: string;
+	};
 
 	let nextResponse: unknown;
 	let waitForReverseAbort = false;
@@ -3072,13 +2783,32 @@ test("ACP permission attachment normalizes decisions through the registered prov
 			return await promise;
 		},
 	} as unknown as AgentSideConnection;
-	const adapter = await AcpSdkAdapter.connect({
-		url: endpoint.url,
-		token: endpoint.token,
+	const client = new SdkClient(endpoint.url, endpoint.token);
+	const routedFrame = (frame: Record<string, unknown>): Record<string, unknown> => ({
+		...frame,
+		connectionId: client.connectionId,
+	});
+	const attachment: SessionAttachment = {
+		sessionId: acpSessionId,
+		generation: 1,
+		isCurrent: () => true,
+		send: async frame => client.send(routedFrame(frame)),
+		retire: async () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async (_sessionId: string, frame: Record<string, unknown>) =>
+				await client.request(routedFrame(frame)),
+		} as never,
+		attachment,
+		sessionId: acpSessionId,
 		connection: createAcpReverseConnection(connection, acpSessionId),
 		providers: [{ capability: "permission", definitions: [] }],
 		heartbeatMs: 60_000,
 	});
+	const unsubscribe = client.onFrame(frame => adapter.acceptFrame(frame));
+	await client.connect();
+	await adapter.start();
 
 	try {
 		await waitFor(() => permissionProvider !== undefined, "ACP permission provider installation");
@@ -3133,7 +2863,9 @@ test("ACP permission attachment normalizes decisions through the registered prov
 		expect(reverseCalls.every(call => call.input.sessionId === acpSessionId)).toBe(true);
 		expect(reverseCalls.every(call => call.signal instanceof AbortSignal)).toBe(true);
 	} finally {
+		unsubscribe();
 		await adapter.close();
+		await client.close();
 		await agentSession.dispose();
 	}
 });
@@ -3818,20 +3550,11 @@ test("SDK endpoint applies typed skill, plan, goal, and config controls with obs
 		...context(cwd, sessionId),
 		getSkillState: () => activeSkills,
 		getGoalState: () => goal,
-		invokeSkill: async (
-			name: string,
-			args?: string,
-			options?: {
-				onSkillPrepared?: (meta: { name: string; path: string }) => void;
-				onPreflightAcceptCommit?: () => Promise<void>;
-			},
-		) => {
+		invokeSkill: async (name: string, args?: string) => {
 			if (name !== "fixture-skill")
 				throw Object.assign(new Error(`Skill ${name} was not found.`), { code: "invalid_input" });
-			options?.onSkillPrepared?.({ name, path: "fixture-skill.md" });
-			await options?.onPreflightAcceptCommit?.();
 			activeSkills.push({ name, args });
-			return "production skill completion";
+			return { name, args };
 		},
 		setPlanMode: (on: boolean) => {
 			plan = on ? { enabled: true, planFilePath: "local://PLAN.md" } : undefined;
@@ -3895,22 +3618,13 @@ test("SDK endpoint applies typed skill, plan, goal, and config controls with obs
 			type: "control_request",
 			id: "skill",
 			operation: "skill.invoke",
-			input: { name: "fixture-skill", args: "run", clientRef: "skill-result" },
+			input: { name: "fixture-skill", args: "run" },
 		}),
 	).toMatchObject({ ok: true });
 	expect(await request("q11", { type: "query_request", id: "q11", query: "Q11" })).toMatchObject({
 		ok: true,
 		page: { items: [{ name: "fixture-skill", args: "run" }] },
 	});
-	await Bun.sleep(50);
-	expect(
-		await request("turn-result", {
-			type: "query_request",
-			id: "turn-result",
-			query: "turn.result",
-			input: { kind: "skill", clientRef: "skill-result" },
-		}),
-	).toMatchObject({ ok: true, result: { status: "terminal_ok", content: { text: "production skill completion" } } });
 	expect(
 		await request("plan", { type: "control_request", id: "plan", operation: "mode.plan.set", input: { on: true } }),
 	).toMatchObject({ ok: true, result: { state: { enabled: true, planFilePath: "local://PLAN.md" } } });
@@ -5980,7 +5694,7 @@ test("turn.prompt_status validates selectors and rejects invalid clientRef input
 			input: { clientRef: "r" },
 			cursor: "x",
 		}),
-	).toMatchObject({ ok: false, error: { code: "invalid_cursor" } });
+	).toMatchObject({ ok: false, error: { code: "invalid_request" } });
 	expect(
 		await request({
 			type: "query_request",

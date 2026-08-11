@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
-import { Args, CliParseError, Command, Flags, renderCommandHelp } from "@gajae-code/utils/cli";
+import { CliParseError, Command, renderCommandHelp } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
 import { Settings } from "../config/settings";
 import { applyStartupModelProfiles, createSessionManager } from "../main";
@@ -24,9 +24,6 @@ import {
 	writeSessionLifecycleReady,
 } from "../sdk/broker/lifecycle";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
-import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
-import { runSdkSessionCli } from "../sdk/cli";
-import { runSdkGuidesCli } from "../sdk/guides/cli";
 import { type CreateLifecycleAgentSessionResult, createLifecycleAgentSession } from "../sdk/lifecycle-session";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../sdk/session-directory";
 import {
@@ -35,7 +32,6 @@ import {
 	type SdkStartupRollbackResult,
 	SdkStartupRollbackTracker,
 } from "../sdk/startup-capability";
-import { runSdkServe } from "../sdk/transport/serve-cli";
 import {
 	type CapturedSessionTranscriptSnapshot,
 	type ResumeSessionIdentity,
@@ -708,199 +704,18 @@ export function parseSdkInternalArgv(argv: readonly string[]): SdkInternalArgv {
 	throw new CliParseError("Invalid internal SDK invocation.");
 }
 
-function parsePositiveTimeout(raw: string | undefined, flagName: string): number | undefined {
-	if (raw === undefined) return undefined;
-	if (!/^[0-9]+$/.test(raw)) {
-		throw new CliParseError(`Expected ${flagName} to be a positive safe integer, got "${raw}"`);
-	}
-	const value = Number(raw);
-	if (!Number.isSafeInteger(value) || value <= 0) {
-		throw new CliParseError(`Expected ${flagName} to be a positive safe integer, got "${raw}"`);
-	}
-	return value;
-}
-
-class SdkServeHelp extends Command {
-	static description = "gjc sdk serve --stdio | --socket <path> [--session <id>] [--pending-ceiling <bytes>]";
-	static flags = {
-		stdio: Flags.boolean({ description: "Serve SDK frames over standard input and output" }),
-		socket: Flags.string({ description: "Serve SDK frames over a Unix socket path" }),
-		session: Flags.string({ description: "Attach to a specific SDK session" }),
-		"pending-ceiling": Flags.string({ description: "Maximum queued relay bytes per direction" }),
-	};
-	async run(): Promise<void> {}
-}
-
-class SdkSessionHelp extends Command {
-	static description =
-		"Manage SDK sessions: `gjc sdk session list|inspect|send|status|tail|elevate`, or the explicit raw hatch `gjc sdk session raw control|query|global`. The session CLI is broker-bound, credential-free by default, and elevation approval requires an attended operator.";
-	static args = {
-		verb: Args.string({
-			description: "Session verb",
-			required: false,
-			options: ["list", "inspect", "send", "status", "tail", "elevate", "raw"],
-		}),
-		target: Args.string({
-			description: "Session id (or the raw kind control|query|global for `raw`)",
-			required: false,
-		}),
-		opRef: Args.string({ description: "Operation reference to report on (status only)", required: false }),
-	};
-	static flags = {
-		"agent-dir": Flags.string({ description: "SDK broker state directory" }),
-		json: Flags.boolean({ description: "Emit JSON output (default for SDK session commands)" }),
-		repo: Flags.string({
-			description: "Workspace directory for saved-session resolution (default: current directory)",
-		}),
-		op: Flags.string({ description: "Raw control or global operation" }),
-		query: Flags.string({ description: "Raw query name" }),
-		kind: Flags.string({ description: "Elevation operation kind (control|global)", options: ["control", "global"] }),
-		"json-input": Flags.string({ description: "SDK request JSON object" }),
-		"json-input-file": Flags.string({ description: "Read SDK request JSON from a 0600 file" }),
-		"json-input-stdin": Flags.boolean({ description: "Read SDK request JSON from standard input" }),
-		"idempotency-key": Flags.string({ description: "Caller idempotency key required for SDK lifecycle globals" }),
-		"elevation-request-id": Flags.string({ description: "Approved elevation grant id for allowlisted raw controls" }),
-		confirm: Flags.boolean({ description: "Confirm a destructive SDK control operation" }),
-		cursor: Flags.string({
-			description:
-				"Raw query continuation cursor, or a saved checkpoint token to resume tail from (re-minted per connection)",
-		}),
-		"show-endpoint-credential": Flags.boolean({ description: "Allow session.get_endpoint secret output" }),
-		yes: Flags.boolean({ description: "Confirm endpoint credential output on a TTY" }),
-		text: Flags.string({ description: "Prompt text for send (alternative to --json-input)" }),
-		"op-ref": Flags.string({ description: "Operation reference for send (defaults to a generated ULID)" }),
-		wait: Flags.boolean({
-			description: "send --wait: poll turn.prompt_status until terminal or the wait window elapses (never cancels)",
-		}),
-		"timeout-ms": Flags.string({ description: "Wait window for send --wait, status, and live tail follow" }),
-		strict: Flags.boolean({ description: "tail --strict: fail closed (exit 1 retention_gap) on retention gaps" }),
-		"until-idle": Flags.boolean({
-			description: "tail --until-idle: exit once the observed event stream reaches a terminal turn state",
-		}),
-		"all-events": Flags.boolean({ description: "tail --all-events: include every event-ring kind" }),
-	};
-	async run(): Promise<void> {}
-}
-
-class SdkSessionCommand extends Command {
-	static description = SdkSessionHelp.description;
-	static args = SdkSessionHelp.args;
-	static flags = SdkSessionHelp.flags;
-	async run(): Promise<void> {
-		const { args, flags } = await this.parse(SdkSessionCommand);
-		const verb = args.verb;
-		const target = args.target;
-		const flagRec = flags as Record<string, unknown>;
-		const timeoutMs = parsePositiveTimeout(flagRec["timeout-ms"] as string | undefined, "--timeout-ms");
-		await runSdkSessionCli({
-			action: verb,
-			...(verb === "raw"
-				? {
-						rawAction: target,
-						sessionId: target === "control" || target === "query" ? args.opRef : undefined,
-					}
-				: { sessionId: verb === "list" ? undefined : target }),
-			opRef: verb === "status" ? args.opRef : (flagRec["op-ref"] as string | undefined),
-			operation: flagRec.op as string | undefined,
-			query: flagRec.query as string | undefined,
-			text: flagRec.text as string | undefined,
-			jsonInput: flagRec["json-input"] as string | undefined,
-			jsonInputFile: flagRec["json-input-file"] as string | undefined,
-			jsonInputStdin: Boolean(flagRec["json-input-stdin"]),
-			confirm: Boolean(flagRec.confirm),
-			idempotencyKey: flagRec["idempotency-key"] as string | undefined,
-			elevationRequestId: flagRec["elevation-request-id"] as string | undefined,
-			operationKind: flagRec.kind as "control" | "global" | undefined,
-			cursor: flagRec.cursor as string | undefined,
-			showEndpointCredential: Boolean(flagRec["show-endpoint-credential"]),
-			yes: Boolean(flagRec.yes),
-			wait: Boolean(flagRec.wait),
-			timeoutMs,
-			strict: Boolean(flagRec.strict),
-			untilIdle: Boolean(flagRec["until-idle"]),
-			allEvents: Boolean(flagRec["all-events"]),
-			agentDir: flagRec["agent-dir"] as string | undefined,
-			repo: flagRec.repo as string | undefined,
-		});
-	}
-}
-
-class SdkGuidesHelp extends Command {
-	static description = "Manage verified advisory SDK guides: refresh, list, show, status, or trust.";
-	static args = {
-		action: Args.string({ required: false, options: ["refresh", "list", "show", "status", "trust"] }),
-		guideId: Args.string({ required: false, description: "Guide id for show" }),
-	};
-	static flags = {
-		"agent-dir": Flags.string({ description: "SDK broker state directory" }),
-		url: Flags.string({ description: "HTTPS allowlisted manifest URL for refresh" }),
-		"timeout-ms": Flags.string({ description: "Bounded refresh timeout in milliseconds" }),
-	};
-	async run(): Promise<void> {}
-}
-
-class SdkGuidesCommand extends Command {
-	static description = SdkGuidesHelp.description;
-	static args = SdkGuidesHelp.args;
-	static flags = SdkGuidesHelp.flags;
-	async run(): Promise<void> {
-		const { args, flags } = await this.parse(SdkGuidesCommand);
-		const flagRec = flags as Record<string, unknown>;
-		await runSdkGuidesCli({
-			action: args.action,
-			guideId: args.guideId,
-			url: flagRec.url as string | undefined,
-			agentDir: flagRec["agent-dir"] as string | undefined,
-			timeoutMs: parsePositiveTimeout(flagRec["timeout-ms"] as string | undefined, "--timeout-ms"),
-		});
-	}
-}
-
 export default class Sdk extends Command {
-	static description =
-		"gjc sdk serve --stdio | --socket <path> [--session <id>]; gjc sdk session list|inspect|send|status|tail; gjc sdk guides refresh|list|show|status|trust";
-	static hidden = false;
+	static description = "Internal SDK runtime command";
+	static hidden = true;
 	static delegateHelp = true;
-	static args = { action: Args.string({ required: false, options: ["serve", "session", "guides"] }) };
-	static flags = SdkServeHelp.flags;
 	async run(): Promise<void> {
 		const action = this.argv[0];
 		if (this.argv.includes("--help") || this.argv.includes("-h")) {
-			const helpAction =
-				action === "serve"
-					? "sdk serve"
-					: action === "session"
-						? "sdk session"
-						: action === "guides"
-							? "sdk guides"
-							: "sdk";
-			const helpCommand =
-				action === "serve"
-					? SdkServeHelp
-					: action === "session"
-						? SdkSessionCommand
-						: action === "guides"
-							? SdkGuidesCommand
-							: Sdk;
-			renderCommandHelp("gjc", helpAction, helpCommand);
-			return;
-		}
-		if (action === "session") {
-			const instance = new SdkSessionCommand(this.argv.slice(1), this.config);
-			await instance.run();
-			return;
-		}
-		if (action === "guides") {
-			const instance = new SdkGuidesCommand(this.argv.slice(1), this.config);
-			await instance.run();
-			return;
-		}
-		if (action === "serve") {
-			await runSdkServe(this.argv.slice(1));
+			renderCommandHelp("gjc", "sdk", Sdk);
 			return;
 		}
 		if (action !== "broker-internal" && action !== "session-host-internal")
-			throw new CliParseError("Expected action to be serve, session, or guides.");
+			throw new CliParseError("Expected an internal SDK action.");
 		const internal = parseSdkInternalArgv(this.argv);
 		if (internal.action === "session-host-internal") {
 			await runSessionHost();
@@ -914,28 +729,8 @@ export default class Sdk extends Command {
 				return policy === "disabled" ? "disabled" : "copy-retain";
 			},
 		});
-		try {
-			await broker.start();
-		} catch (error) {
-			// Surface why this detached broker failed before discovery: the caller
-			// spawns with stdio ignored, so the durable marker is the only channel.
-			await writeBrokerStartupFailureMarker(agentDir, {
-				reason: error instanceof Error ? error.message : String(error),
-				exitCode: 1,
-				signal: null,
-			});
-			throw error;
-		}
-		if (!broker.ownsDiscovery) {
-			// Another broker owns discovery; this process exits cleanly (code 0) as
-			// the race loser. Record why so the caller can diagnose a missing winner.
-			await writeBrokerStartupFailureMarker(agentDir, {
-				reason: "Another broker owns the lock/discovery; this broker exited as the race loser.",
-				exitCode: 0,
-				signal: null,
-			});
-			return;
-		}
+		await broker.start();
+		if (!broker.ownsDiscovery) return;
 		// A live broker must not keep advertising sessions whose host process is
 		// gone; the sweep is the broker-side half of the host reaping bound.
 		const stopSweep = startBrokerDeadRegistrationSweep(broker);

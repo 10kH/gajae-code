@@ -15,7 +15,6 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "..
 import { parseThinkingLevel } from "../../thinking";
 import { ensureBroker } from "../broker/ensure";
 import { SessionIndex } from "../broker/session-index";
-import { elevationAuthorityPath, verifyElevationCapability } from "../elevation/capability";
 import {
 	collectAuthenticatedProfileProviders,
 	parseSyntheticModelId,
@@ -27,9 +26,10 @@ import {
 import { projectQ10Models } from "../models.js";
 import { formatPromptFailureForLocalLog, sanitizePromptFailure } from "../prompt-failure";
 import { OPERATIONS } from "../protocol/operation-registry";
-import { type ControlSurface, controlRequestFromFrame, dispatchControl } from "./control";
+import { type ControlSurface, dispatchControl } from "./control";
+import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "./control/runtime-gate";
 import { SessionSdkHost, type SessionSdkHostOptions } from "./host";
-import { CursorRegistry, QueryHandlers, RevisionStore, type SdkCheckpointRecord, type SessionSurface } from "./query";
+import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "./query";
 import {
 	createSdkCapabilities,
 	createSdkSurfacePolicyForContext,
@@ -499,8 +499,6 @@ export interface SdkSurfaceFactoryOptions {
 		clientRef?: string;
 	}) => unknown;
 	hostTools?: boolean | (() => boolean);
-	/** Q30 event-ring watermark source (the live session event stream); synchronous. */
-	getEventWatermark?: () => { generation: number; seq: number };
 }
 
 /** Shared policy, capability, and query-surface factory for every SDK transport. */
@@ -529,8 +527,6 @@ function createQuerySurface(
 			clientRef?: string;
 		}) => unknown;
 		hostTools?: boolean | (() => boolean);
-		/** Q30 event-ring watermark source (the live session event stream); synchronous. */
-		getEventWatermark?: () => { generation: number; seq: number };
 	} = {},
 ): SessionSurface {
 	const policy =
@@ -820,23 +816,6 @@ function createQuerySurface(
 				})),
 			)) as unknown[];
 		},
-		getCheckpointSnapshot: (): { entries: unknown[]; watermark: SdkCheckpointRecord } => {
-			// Q30 atomic checkpoint capture (C9): the transcript entries and the
-			// event-ring watermark are read in one synchronous call from the host
-			// event stream, so the snapshot revision and the subscribe position
-			// can never straddle a concurrent append.
-			const entries =
-				typeof (ctx as Partial<ExtensionContext>).getTranscript === "function" ? ctx.getTranscript() : [];
-			const watermark = options.getEventWatermark?.() ?? { generation: 0, seq: 0 };
-			return {
-				entries,
-				watermark: {
-					revision: Array.isArray(entries) ? entries.length : 0,
-					generation: watermark.generation,
-					seq: watermark.seq,
-				},
-			};
-		},
 		installedQueries: policy.installedQueries,
 	};
 }
@@ -866,7 +845,6 @@ export function createSdkSurfaceFactory(
 		settings: options.settings,
 		turnResultLookup: options.turnResultLookup,
 		hostTools: options.hostTools,
-		getEventWatermark: options.getEventWatermark,
 	});
 	return {
 		policy,
@@ -985,7 +963,6 @@ function createControlSurface(
 	settings?: Settings,
 	configOverrides?: Map<string, unknown>,
 	configRevision: { current: number } = { current: 0 },
-	elevationAuthorityToken?: string,
 	canResolveGate: () => boolean = () => true,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T> = async resolution => await resolution,
 ): ControlSurface {
@@ -1091,7 +1068,7 @@ function createControlSurface(
 		try {
 			const submission = Promise.resolve(
 				run({
-					onPreflightAccepted: () => void accept().catch(error => preflight.reject(error)),
+					onPreflightAccepted: () => void accept().catch(() => undefined),
 					onPreflightAcceptCommit: accept,
 				}),
 			);
@@ -1113,7 +1090,7 @@ function createControlSurface(
 						return;
 					}
 					if (allowCompletionFallback) {
-						void accept().catch(error => preflight.reject(error));
+						void accept().catch(() => undefined);
 						return;
 					}
 					settled = true;
@@ -1149,9 +1126,6 @@ function createControlSurface(
 		}
 	};
 	return {
-		authorizeElevationClaim: (sdkId, input, capability) =>
-			elevationAuthorityToken !== undefined &&
-			verifyElevationCapability(elevationAuthorityToken, capability, sdkId, input),
 		prompt: async (text, images, clientRef) =>
 			submit("prompt", clientRef, options =>
 				api.sendUserMessage(
@@ -1271,7 +1245,11 @@ function createControlSurface(
 		newSession: () => typed("session.new"),
 		forkSession: () => typed("session.fork"),
 		resumeSession: id => typed("session.resume", { id }),
-		closeSession: () => typed("session.close"),
+		closeSession: capability =>
+			typed(
+				"session.close",
+				capability === undefined ? {} : { [BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: capability },
+			),
 		switchSession: id => typed("session.switch", { id }),
 		branchSession: entryId => typed("session.branch", { entryId }),
 		renameSession: name => typed("session.rename", { name }),
@@ -1420,11 +1398,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const sessionId = ctx.sessionManager.getSessionId();
 		const stateRoot = path.join(ctx.cwd, ".gjc", "state");
 		const token = crypto.randomBytes(24).toString("base64url");
-		const elevationAuthorityToken = crypto.randomBytes(32).toString("base64url");
-		const elevationAuthorityFile = elevationAuthorityPath(stateRoot, sessionId);
-		await fs.mkdir(path.dirname(elevationAuthorityFile), { recursive: true, mode: 0o700 });
-		await Bun.write(elevationAuthorityFile, `${JSON.stringify({ version: 1, token: elevationAuthorityToken })}\n`);
-		await fs.chmod(elevationAuthorityFile, 0o600);
 		const transport = await options.createTransport({ sessionId, stateRoot, token });
 		const revisions = new RevisionStore(sessionId, Date.now, { storageDir: stateRoot });
 		const cursors = new CursorRegistry(token, revisions);
@@ -1432,11 +1405,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		await reconciliation.hydrate();
 		const pending: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
 		const configRevision = { current: 0 };
-		// The event-ring watermark lives on the runtime host, which is constructed
-		// after the surface factory; the lazy source indirection lets the surface
-		// read the live generation/seq once the runtime exists (Q30 atomic
-		// capture, C9).
-		let eventWatermarkSource: () => { generation: number; seq: number } = () => ({ generation: 0, seq: 0 });
 		let acceptingGateResolutions = true;
 		const inFlightGateResolutions = new Set<Promise<unknown>>();
 		const trackGateResolution = <T>(resolution: Promise<T>): Promise<T> => {
@@ -1459,7 +1427,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			turnResultLookup: selector => reconciliation.lookupResult(selector.kind, selector),
 			configOverrides: options.configOverrides,
 			settings: options.settings,
-			getEventWatermark: () => eventWatermarkSource(),
 		});
 		const queryHandlers = new QueryHandlers(surfaceFactory.query, sessionId, revisions, cursors);
 		const controlSurface = createControlSurface(
@@ -1473,7 +1440,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			options.settings,
 			options.configOverrides,
 			configRevision,
-			elevationAuthorityToken,
 			() => acceptingGateResolutions,
 			trackGateResolution,
 		);
@@ -1545,23 +1511,22 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		runtime = new SessionSdkSessionRuntime({
 			transport,
 			control: async (_connectionId, frame) => {
-				const request = controlRequestFromFrame(frame as Record<string, unknown>);
+				const request = frame as Record<string, unknown>;
 				return dispatchControl(
 					controlSurface,
 					OPERATIONS.find(operation => operation.kind === "control" && operation.sdkId === request.operation),
-					request,
+					{
+						id: typeof request.id === "string" ? request.id : "",
+						operation: typeof request.operation === "string" ? request.operation : "",
+						input: request.input,
+						expectedRevision: typeof request.expectedRevision === "string" ? request.expectedRevision : undefined,
+						idempotencyKey: typeof request.idempotencyKey === "string" ? request.idempotencyKey : undefined,
+						confirm: request.confirm === true,
+					},
 				);
 			},
 			query: async (connectionId, frame) => {
 				const request = frame as Record<string, unknown>;
-				// D1: a non-string top-level cursor is rejected, never silently
-				// dropped into a fresh-snapshot query.
-				if (request.cursor !== undefined && typeof request.cursor !== "string")
-					return {
-						id: typeof request.id === "string" ? request.id : undefined,
-						ok: false,
-						error: { code: "invalid_input", message: "cursor must be a non-empty string" },
-					};
 				return queryHandlers.dispatch({
 					id: typeof request.id === "string" ? request.id : undefined,
 					query: typeof request.query === "string" ? request.query : "",
@@ -1579,12 +1544,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			afterControlResponse: async (_connectionId, request, response) => {
 				if (request.operation === "session.close" && response.ok === true) ctx.shutdown();
 			},
-		});
-		// The runtime host now owns the live event stream; point the surface's
-		// checkpoint watermark at the real generation/seq (C9).
-		eventWatermarkSource = () => ({
-			generation: runtime.host.events.generation,
-			seq: runtime.host.events.sequence,
 		});
 		const disposeGate = ctx.workflowGate?.onGateEmitted?.(gate =>
 			runtime.emitEvent({ kind: "workflow_gate", payload: gate }),

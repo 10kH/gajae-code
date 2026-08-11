@@ -4,13 +4,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Settings } from "../src/config/settings";
 import { getNotificationConfig } from "../src/sdk/bus/config";
-import { projectToolSummary } from "../src/sdk/bus/index";
+import { createNotificationsExtension, projectToolSummary } from "../src/sdk/bus/index";
 import { NotificationSessionController } from "../src/sdk/bus/session-control";
 import type { EnsureDaemonResult } from "../src/sdk/bus/telegram-daemon";
-import { readEndpoint } from "../src/sdk/bus/telegram-reference";
 import { SessionSdkHost } from "../src/sdk/host";
 import { isolatedNotificationSettings } from "./helpers/notification-settings";
-import { createOrchestrationNotificationsExtension } from "./helpers/telegram-topic-test";
+import { readTestSdkEndpoint } from "./helpers/sdk-endpoint";
 
 const wait = () => new Promise(resolve => setTimeout(resolve, 0));
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -44,11 +43,7 @@ interface SetupResult {
 
 interface SetupOptions {
 	settingsOverrides?: Record<string, unknown>;
-	ensureTelegramDaemon?: (input: {
-		settings: Settings;
-		cwd: string;
-		sessionId: string;
-	}) => Promise<EnsureDaemonResult>;
+	ensureTelegramDaemon?: (input: { settings: Settings }) => Promise<EnsureDaemonResult>;
 }
 
 async function setup(
@@ -75,7 +70,7 @@ async function setup(
 					eligible: true,
 					getConfig: () => getNotificationConfig(settings),
 				});
-	createOrchestrationNotificationsExtension(api, {
+	createNotificationsExtension(api, {
 		...(settings ? { settings, controller } : {}),
 		...(options.ensureTelegramDaemon ? { ensureTelegramDaemon: options.ensureTelegramDaemon } : {}),
 	});
@@ -94,7 +89,7 @@ async function setup(
 
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "endpoint file");
-	const { url, token } = readEndpoint(endpointFile);
+	const { url, token } = readTestSdkEndpoint(endpointFile);
 	const frames: Frame[] = [];
 	const ws = new WebSocket(`${url}/?token=${encodeURIComponent(token)}`);
 	sockets.push(ws);
