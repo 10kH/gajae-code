@@ -575,7 +575,14 @@ describe("AsyncJobManager", () => {
 		});
 		expect(lookupOwnedRegistration(jobId, generation, endpointId)).toBeDefined();
 		expect(manager.cancel(jobId)).toBe(true);
+		// The run is still unwinding (it awaits the abort signal): the tuple is
+		// RETAINED so a concurrent scope:"owned" abort still captures this exact
+		// job and waits for it instead of reporting stopped while it keeps
+		// executing (review thread P1).
+		expect(lookupOwnedRegistration(jobId, generation, endpointId)).toBeDefined();
 		await manager.waitForAll();
+		// The run actually unwound: the tuple is retired at the settlement
+		// boundary, so cancelled tasks leave no permanent registration.
 		expect(lookupOwnedRegistration(jobId, generation, endpointId)).toBeUndefined();
 	});
 

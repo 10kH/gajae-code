@@ -958,6 +958,11 @@ export class AsyncJobManager {
 					this.#runLifecycle(id, "terminal", job);
 					this.#scheduleEviction(id);
 					this.#drainResumeQueue();
+					// The run has now actually unwound: retire the owned tuple so a
+					// later scope:"owned" abort of the same turn does not report
+					// stopped/stopped_owned while this job is still executing
+					// (review thread P1).
+					this.#retireCancelledJobOwned(id, job.generation);
 					return;
 				}
 				if (outcome.kind === "paused") {
@@ -1003,6 +1008,7 @@ export class AsyncJobManager {
 					this.#runLifecycle(id, "terminal", job);
 					this.#scheduleEviction(id);
 					this.#drainResumeQueue();
+					this.#retireCancelledJobOwned(id, job.generation);
 					return;
 				}
 				const errorText = error instanceof Error ? error.message : String(error);
@@ -1055,6 +1061,9 @@ export class AsyncJobManager {
 			this.#runLifecycle(id, "cancel");
 			this.#scheduleEviction(id);
 			this.#drainResumeQueue();
+			// A PAUSED job's run has already unwound (it returned "paused"), so
+			// its owned tuple is retired here; a RUNNING job's tuple is retired
+			// from the settlement path once the run actually unwinds below.
 			this.#retireCancelledJobOwned(id, job.generation);
 			return true;
 		}
@@ -1066,7 +1075,6 @@ export class AsyncJobManager {
 		this.#runLifecycle(id, "cancel");
 		job.abortController.abort();
 		this.#notifyChange();
-		this.#retireCancelledJobOwned(id, job.generation);
 		return true;
 	}
 
