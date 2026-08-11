@@ -63,6 +63,8 @@ Set an action to an empty array to disable it:
 | `app.stt.toggle` | `alt+h` | Toggle speech-to-text recording |
 | `app.irc.sidebar.toggle` | `alt+i` | Toggle IRC sidebar |
 
+For setup, microphone permissions, first-use behavior, and troubleshooting, see [Speech-to-text](./speech-to-text.md).
+
 Older unqualified action names are migrated when `keybindings.json` is loaded, but new docs and new configs should use the namespaced action IDs above.
 
 On macOS, Option+Q queues a message for the next turn when the active terminal profile forwards Option as Meta/Esc; in Apple Terminal, this is controlled by **Use Option as Meta key**. On native Windows terminals, the equivalent default is Alt+Q. Windows Terminal and PowerShell commonly reserve Alt+Enter for fullscreen before GJC can receive it. Users who prefer another chord can remap `app.message.queue` in `~/.gjc/agent/keybindings.json`.
