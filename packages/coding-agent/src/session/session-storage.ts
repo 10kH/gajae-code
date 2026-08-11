@@ -748,14 +748,47 @@ function fsyncDirectorySync(pathname: string): void {
 
 /** Best-effort identity-checked removal of one of our own staged temp names. */
 function unlinkOwnedStagedSync(stagingPath: string, expected: { dev: bigint; ino: bigint }): void {
+	let fd: number | undefined;
 	try {
 		const named = fs.lstatSync(stagingPath, { bigint: true });
 		if (!named.isFile() || named.isSymbolicLink() || named.dev !== expected.dev || named.ino !== expected.ino) return;
-		const sha256 = createHash("sha256").update(fs.readFileSync(stagingPath)).digest("hex");
-		exactRemoveSessionStorageLockPath(stagingPath, named, sha256, named.nlink > 1n);
+		fd = fs.openSync(stagingPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+		const opened = fs.fstatSync(fd, { bigint: true });
+		if (
+			!opened.isFile() ||
+			opened.dev !== named.dev ||
+			opened.ino !== named.ino ||
+			opened.nlink !== named.nlink ||
+			opened.size !== named.size ||
+			opened.mtimeNs !== named.mtimeNs ||
+			opened.ctimeNs !== named.ctimeNs
+		)
+			return;
+		const hash = createHash("sha256");
+		const buffer = Buffer.allocUnsafe(64 * 1024);
+		let offset = 0;
+		while (offset < Number(opened.size)) {
+			const length = Math.min(buffer.byteLength, Number(opened.size) - offset);
+			const count = fs.readSync(fd, buffer, 0, length, offset);
+			if (count === 0) return;
+			hash.update(buffer.subarray(0, count));
+			offset += count;
+		}
+		const after = fs.fstatSync(fd, { bigint: true });
+		if (
+			after.dev !== opened.dev ||
+			after.ino !== opened.ino ||
+			after.nlink !== opened.nlink ||
+			after.size !== opened.size ||
+			after.mtimeNs !== opened.mtimeNs ||
+			after.ctimeNs !== opened.ctimeNs
+		)
+			return;
+		exactRemoveSessionStorageLockPath(stagingPath, after, hash.digest("hex"), after.nlink > 1n);
 	} catch {
 		// ENOENT means the name was already consumed or removed; cleanup is best-effort.
-		return;
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
 	}
 }
 
@@ -1601,16 +1634,16 @@ function parseSessionStorageLockOwner(bytes: Buffer): SessionStorageLockOwner | 
 	}
 }
 
-function exactRemoveSessionStorageLockPath(
+function exactRemoveSessionStorageLockPathResult(
 	lockPath: string,
 	expected: fs.BigIntStats,
 	sha256: string,
 	allowHardLink = false,
-): boolean {
+): native.NativeExactUnlinkResult {
 	try {
 		const parent = fs.lstatSync(path.dirname(lockPath), { bigint: true });
-		if (!parent.isDirectory() || parent.isSymbolicLink()) return false;
-		const result = nativeSessionStorage().exactUnlink(lockPath, {
+		if (!parent.isDirectory() || parent.isSymbolicLink()) return { ok: false, code: "parent_mismatch" };
+		return nativeSessionStorage().exactUnlink(lockPath, {
 			dev: expected.dev,
 			ino: expected.ino,
 			nlink: expected.nlink,
@@ -1622,10 +1655,25 @@ function exactRemoveSessionStorageLockPath(
 			quarantineName: `${path.basename(lockPath)}.reap-${randomUUID()}`,
 			allowHardLink,
 		});
-		return result.ok || (result.code === "cleanup_pending" && typeof result.detachedPath === "string");
 	} catch {
-		return false;
+		return { ok: false, code: "native_failure" };
 	}
+}
+
+function exactRemoveSessionStorageLockPath(
+	lockPath: string,
+	expected: fs.BigIntStats,
+	sha256: string,
+	allowHardLink = false,
+): boolean {
+	const result = exactRemoveSessionStorageLockPathResult(lockPath, expected, sha256, allowHardLink);
+	return (
+		result.ok ||
+		(result.code === "cleanup_pending" &&
+			result.payloadDurable === true &&
+			!result.retainedSuccessorPath &&
+			!result.retainedUnknownPath)
+	);
 }
 
 function exactRemoveOwnedSessionStorageLockPath(
@@ -1836,7 +1884,17 @@ export class FileSessionStorage implements SessionStorage {
 				return {
 					releaseSync: () => {
 						if (released) return;
-						if (!exactRemoveSessionStorageLockPath(lockPath, expected, ownerDigest!)) {
+						const removal = exactRemoveSessionStorageLockPathResult(lockPath, expected, ownerDigest!);
+						if (!removal.ok) {
+							if (
+								removal.code === "cleanup_pending" &&
+								removal.payloadDurable === true &&
+								!removal.retainedSuccessorPath &&
+								!removal.retainedUnknownPath
+							) {
+								released = true;
+								return;
+							}
 							try {
 								const current = fs.lstatSync(lockPath, { bigint: true });
 								if (current.dev === expected.dev && current.ino === expected.ino) {
