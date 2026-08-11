@@ -1042,7 +1042,7 @@ describe("SDK session index", () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
 		const index = await new SessionIndex(dir, { clock: () => now }).open();
 		const currentIncarnation = processIncarnation(process.pid)!;
-		await index.append({ ...event("fresh"), hostIncarnation: currentIncarnation });
+		await index.append({ ...event("fresh"), hostIncarnation: currentIncarnation, ts: now - 5_000 });
 		await index.append({
 			...event("fresh"),
 			type: "host_heartbeat",
@@ -1050,7 +1050,13 @@ describe("SDK session index", () => {
 			activity: { state: "active", at: now - 5_000 },
 			ts: now - 5_000,
 		});
-		await index.append({ ...event("stale"), hostIncarnation: currentIncarnation });
+		// Registration is itself liveness evidence, so a stale host needs its
+		// registration outside the freshness window too.
+		await index.append({
+			...event("stale"),
+			hostIncarnation: currentIncarnation,
+			ts: now - 2 * 60_000 - 10_000,
+		});
 		await index.append({
 			...event("stale"),
 			type: "host_heartbeat",
@@ -1130,9 +1136,15 @@ describe("SDK session index", () => {
 		if (incarnation === undefined) return;
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
 		const index = await new SessionIndex(dir, { clock: () => now }).open();
-		await index.append({ ...event("s"), hostIncarnation: incarnation });
-		// A registered host with no heartbeat yet is unknown/not live, never fresh forever.
-		expect(index.listSessions().sessions[0]).toMatchObject({ sessionId: "s", live: false, terminal: false });
+		await index.append({ ...event("s"), hostIncarnation: incarnation, ts: now });
+		// A fresh registration is host-written liveness evidence: it reads live
+		// immediately, before the first checkpoint pass.
+		expect(index.listSessions().sessions[0]).toMatchObject({ sessionId: "s", live: true, terminal: false });
+		// Registration evidence ages out like a heartbeat — never fresh forever.
+		const beforeCheckpoint = await new SessionIndex(dir, {
+			clock: () => now + 2 * SESSION_HEARTBEAT_INTERVAL_MS + 1,
+		}).open();
+		expect(beforeCheckpoint.listSessions().sessions[0]).toMatchObject({ sessionId: "s", live: false });
 		// The production writer observes the live host and checkpoints it.
 		expect(await index.checkpointLiveHeartbeats(now)).toBe(1);
 		expect(index.listSessions().sessions[0]).toMatchObject({
