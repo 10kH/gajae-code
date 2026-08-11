@@ -565,8 +565,7 @@ export class SlackNotificationDaemon {
 		if (this.options.resolveBindingAuthority && !resolved) return undefined;
 		const endpoint = await this.#resolveAttachment(sessionId);
 		if (
-			!endpoint ||
-			!endpoint.isCurrent() ||
+			!endpoint?.isCurrent() ||
 			endpoint.sessionId !== sessionId ||
 			!Number.isSafeInteger(endpoint.generation) ||
 			endpoint.generation <= 0 ||
