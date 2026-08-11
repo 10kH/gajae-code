@@ -83,6 +83,55 @@ describe("ConversationStore", () => {
 		release.resolve();
 		expect((await Promise.all([firstWrite, secondWrite])).filter(Boolean)).toHaveLength(1);
 	});
+	test("keeps a failed published lock registered until cleanup cannot remove a successor", async () => {
+		const closeEntered = Promise.withResolvers<void>();
+		const releaseClose = Promise.withResolvers<void>();
+		let paused = false;
+		class PausingCloseFs extends MemoryConversationStoreFs {
+			override async open(file: string, flags: string) {
+				const handle = await super.open(file, flags);
+				if (flags !== "wx" || !file.endsWith("conversations.json.lock")) return handle;
+				return {
+					...handle,
+					close: async () => {
+						if (!paused) {
+							paused = true;
+							closeEntered.resolve();
+							await releaseClose.promise;
+						}
+						await handle.close();
+					},
+				};
+			}
+		}
+		const fs = new PausingCloseFs();
+		fs.failFileSync = true;
+		const first = new ConversationStore<TestConversation>({
+			agentDir: "/agent",
+			kind: "discord",
+			fs,
+			pid: process.pid,
+		});
+		const second = new ConversationStore<TestConversation>({
+			agentDir: "/agent",
+			kind: "discord",
+			fs,
+			pid: process.pid,
+		});
+		const failedWrite = first.write("one", undefined, record(1));
+		await closeEntered.promise;
+		let secondSettled = false;
+		const secondWrite = second.write("two", undefined, record(1)).finally(() => {
+			secondSettled = true;
+		});
+		await Bun.sleep(25);
+		expect(secondSettled).toBe(false);
+		releaseClose.resolve();
+		await expect(failedWrite).rejects.toThrow("sync failed");
+		fs.failFileSync = false;
+		await expect(secondWrite).resolves.toBe(true);
+		expect(await second.read("two")).toEqual(record(1));
+	});
 
 	test("recovers a lock whose recorded owner is dead", async () => {
 		const fs = new MemoryConversationStoreFs();

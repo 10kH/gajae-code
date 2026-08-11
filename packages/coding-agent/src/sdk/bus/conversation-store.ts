@@ -381,14 +381,20 @@ export class ConversationStore<T extends ConversationRecord> {
 			nonce: randomUUID(),
 		};
 		heldLockFiles.set(lockFile, lock.nonce!);
+		let published = false;
 		try {
 			await handle.writeFile(`${JSON.stringify(lock)}\n`, "utf8");
+			published = true;
 			await handle.sync();
 			return { handle, lock };
 		} catch (error) {
-			this.#releaseHeldLock(lockFile, lock);
-			await handle.close().catch(() => undefined);
-			await this.#fs.unlink(lockFile).catch(() => undefined);
+			try {
+				await handle.close().catch(() => undefined);
+				if (published) await this.#unlinkOwnedLock(lockFile, lock);
+				else await this.#fs.unlink(lockFile).catch(() => undefined);
+			} finally {
+				this.#releaseHeldLock(lockFile, lock);
+			}
 			throw error;
 		}
 	}
