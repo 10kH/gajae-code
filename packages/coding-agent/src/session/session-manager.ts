@@ -3174,6 +3174,13 @@ function managedFileSnapshotMatchesDescriptor(snapshot: ManagedFileSnapshot, des
 		snapshot.identity.ctimeNs === descriptor.ctimeNs
 	);
 }
+
+function unrefDelay(ms: number): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const timer = setTimeout(resolve, ms);
+	timer.unref();
+	return promise;
+}
 const trustedSessionDestinations = new WeakSet<SessionDestination>();
 const explicitProfileAgentDirs = new WeakMap<SessionDestination, string>();
 const managedSecurityPolicies = new WeakMap<ManagedSessionSecurityContext, ManagedSessionSecurityPolicy>();
@@ -6518,6 +6525,9 @@ export const SessionManagerTestHooks: {
 	afterForkTranscriptPublished?: () => void | Promise<void>;
 	beforeEphemeralArtifactManagerInstall?: (dir: string) => void | Promise<void>;
 	beforePersistPatchFence?: (attempt: number) => void;
+	beforeStrictMissingCheck?: (filePath: string, storage: SessionStorage) => void;
+	beforeManagedResumeAcceptance?: (filePath: string, storage: SessionStorage) => void;
+	beforeManagedResumeReturn?: (filePath: string, storage: SessionStorage) => void;
 	/** Internal first-open GC strategy override; omitted means current. */
 	firstOpenGcStrategy?: SessionMemoryGcStrategy;
 	/** Internal first-open secondary-artifact mode override; omitted means auto. */
@@ -8719,6 +8729,8 @@ export class SessionManager {
 		sessionFile: string,
 		initializeMissing = false,
 		strictResume?: { inspection: ResumeInspectionSnapshot; storage: SessionStorage; reuseEntries?: boolean },
+		requireExisting = false,
+		deferPersistenceUntilAccepted = false,
 	): Promise<void> {
 		let strictManagedFallbackEntries: FileEntry[] | undefined;
 		let strictManagedFallbackMigrationApplied = false;
@@ -8766,7 +8778,12 @@ export class SessionManager {
 			return;
 		}
 		revalidateStrictResume();
-		if (initializeMissing && !this.#storage.existsSync(resolvedSessionFile)) {
+		SessionManagerTestHooks.beforeStrictMissingCheck?.(resolvedSessionFile, this.#storage);
+		const transcriptMissing =
+			(initializeMissing || strictResume !== undefined || requireExisting) &&
+			!this.#storage.existsSync(resolvedSessionFile);
+		if ((strictResume || requireExisting) && transcriptMissing) throw new Error("Could not open session: unstable");
+		if (initializeMissing && transcriptMissing) {
 			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
 			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
 			this.#applyFreshSessionMetadata(fresh);
@@ -8836,7 +8853,8 @@ export class SessionManager {
 		writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
-		if (!strictResume) await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
+		if (!strictResume && !deferPersistenceUntilAccepted)
+			await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 		if (publishedSidecarWasPresent && this.#lazyReopenAttempted && !this.#lazyReopenSucceeded) {
 			this.#sessionMemoryMode = "shadow";
 			this.#sessionMemoryAutoDisabledReason = "sidecar_reload_failures";
@@ -14689,12 +14707,72 @@ export class SessionManager {
 		this.#clearBoundedManagedSource();
 	}
 
-	#discardRejectedOpenState(): void {
-		this.#persistWriter = undefined;
-		this.#persistWriterPath = undefined;
+	#releaseRejectedOpenResources(): void {
 		this.#releaseResidentTextStore();
 		if (this.#preparedNewSessions.size === 0) this.#releaseOwnedManagedAuthority();
 		this.#releaseClosedSessionState();
+	}
+
+	async #retryRejectedOpenWriterCleanup(): Promise<void> {
+		for (let attempt = 0; this.#persistWriter?.getCloseState() === "close_failed_retryable"; attempt++) {
+			await unrefDelay(Math.min(100 * 2 ** Math.min(attempt, 6), 5_000));
+			try {
+				await this.#closePersistWriterInternal();
+			} catch (error) {
+				logger.warn("Retained rejected-open writer close retry failed", { error: toError(error).message });
+			}
+		}
+		// The loop only exits once the writer is terminal (`closed` or the quarantined
+		// `close_unknown`) or was already cleared by a successful close, so ownership of
+		// the descriptor and of the rejected session's resident state always ends here.
+		if (this.#persistWriter) {
+			this.#persistWriter = undefined;
+			this.#persistWriterPath = undefined;
+		}
+		this.#releaseRejectedOpenResources();
+	}
+
+	async #discardRejectedOpenState(): Promise<void> {
+		let closeError: Error | undefined;
+		for (let attempt = 0; this.#persistWriter && attempt < 2; attempt++) {
+			try {
+				await this.#closePersistWriterInternal();
+			} catch (error) {
+				closeError = toError(error);
+				if (this.#persistWriter?.getCloseState() !== "close_failed_retryable") break;
+			}
+		}
+		const state = this.#persistWriter?.getCloseState();
+		if (state === "closed") {
+			// The OS close was dispatched and confirmed, so cleanup succeeded even though
+			// `close()` rethrew a queued write/flush drain failure. Reporting that drain
+			// error as a cleanup failure would mask the real resume rejection, so record
+			// it and let the caller surface the resume error alone.
+			this.#persistWriter = undefined;
+			this.#persistWriterPath = undefined;
+			this.#releaseRejectedOpenResources();
+			if (closeError)
+				logger.warn("Rejected-open writer drained with errors before a confirmed close", {
+					error: closeError.message,
+				});
+			return;
+		}
+		if (state === "close_unknown") {
+			this.#persistWriter = undefined;
+			this.#persistWriterPath = undefined;
+			this.#releaseRejectedOpenResources();
+			throw closeError ?? new Error("Rejected open writer close outcome is unknown");
+		}
+		if (this.#persistWriter) {
+			// Certified pre-dispatch failure: the descriptor is still owned, so the writer
+			// and the resident state it guards are retained until a retry reaches a
+			// terminal close. The retry loop keeps this manager reachable on its own.
+			void this.#retryRejectedOpenWriterCleanup().catch(error => {
+				logger.warn("Rejected-open writer cleanup retry loop failed", { error: toError(error).message });
+			});
+			throw closeError ?? new Error("Rejected open writer close remains retryable");
+		}
+		this.#releaseRejectedOpenResources();
 	}
 
 	/** Close the persistent writer after flushing all pending data. */
@@ -18399,7 +18477,14 @@ export class SessionManager {
 					}
 				}
 				manager.#sidecarRuntime = undefined;
-				manager.#discardRejectedOpenState();
+				try {
+					await manager.#discardRejectedOpenState();
+				} catch (cleanupError) {
+					throw new AggregateError(
+						[toError(error), toError(cleanupError)],
+						"Rejected explicit resume cleanup failed",
+					);
+				}
 				throw error;
 			}
 		}
@@ -18438,6 +18523,14 @@ export class SessionManager {
 				throw error;
 			}
 		}
+		const managedBoundedDescriptor =
+			managedResumeBounded && sameManagedDirectory
+				? managedInspectionStore?.descriptorExpected(path.basename(filePath))
+				: undefined;
+		if (managedResumeBounded && sameManagedDirectory && !managedBoundedDescriptor) {
+			managedInspectionStore?.close();
+			throw new Error("Could not open session: unstable");
+		}
 
 		if (managedResumeBounded && sameManagedDirectory) {
 			const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
@@ -18449,7 +18542,17 @@ export class SessionManager {
 					strictManagedSmallInspection
 						? { inspection: strictManagedSmallInspection, storage: managedInspectionStorage }
 						: undefined,
+					true,
+					true,
 				);
+				SessionManagerTestHooks.beforeManagedResumeAcceptance?.(filePath, managedInspectionStorage);
+				const terminalManagedDescriptor = managedInspectionStore?.descriptorExpected(path.basename(filePath));
+				if (
+					!managedBoundedDescriptor ||
+					!terminalManagedDescriptor ||
+					!sameDescriptor(managedBoundedDescriptor, terminalManagedDescriptor)
+				)
+					throw new Error("Could not open session: unstable");
 				if (strictManagedSmallInspection) {
 					if (
 						!revalidateStrictResumeInspection(filePath, managedInspectionStorage, strictManagedSmallInspection) ||
@@ -18458,8 +18561,13 @@ export class SessionManager {
 						manager.setSessionMemoryMode("off");
 						throw new Error("Could not open session: unstable");
 					}
-					await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 				}
+				if (manager.#sanitizeLoadedOpenAIResponsesReplayMetadata().length > 0)
+					manager.#needsFullRewriteOnNextPersist = true;
+				SessionManagerTestHooks.beforeManagedResumeReturn?.(filePath, managedInspectionStorage);
+				const returnManagedDescriptor = managedInspectionStore?.descriptorExpected(path.basename(filePath));
+				if (!returnManagedDescriptor || !sameDescriptor(managedBoundedDescriptor, returnManagedDescriptor))
+					throw new Error("Could not open session: unstable");
 				const header = manager.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 				if (header?.cwd) manager.cwd = header.cwd;
 				manager.buildSessionContext();
@@ -18478,7 +18586,14 @@ export class SessionManager {
 					}
 				}
 				manager.#sidecarRuntime = undefined;
-				manager.#discardRejectedOpenState();
+				try {
+					await manager.#discardRejectedOpenState();
+				} catch (cleanupError) {
+					throw new AggregateError(
+						[toError(error), toError(cleanupError)],
+						"Rejected managed resume cleanup failed",
+					);
+				}
 				throw error;
 			} finally {
 				managedInspectionStore?.close();
