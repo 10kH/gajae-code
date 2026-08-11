@@ -1,11 +1,16 @@
 import { beforeAll, describe, expect, test, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import { Effort, type Model } from "@gajae-code/ai";
-import type { GjcModelAssignmentTargetId, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import { type GjcModelAssignmentTargetId, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import type { TUI } from "@gajae-code/tui";
+import { hookFetch } from "@gajae-code/utils";
 
 const DOWN = "\x1b[B";
 
@@ -47,6 +52,7 @@ function createSelector(
 		refresh: async () => {},
 		getAvailable: () => knownModels,
 		getError: () => undefined,
+		onCatalogChanged: () => () => {},
 		hasConfiguredProviderAuth: () => false,
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
@@ -253,4 +259,67 @@ describe("ModelSelector batch assignment thinking menu", () => {
 		if (!selectedAssignment) throw new Error("Expected executor assignment selection");
 		expect(selectedAssignment.selector).toBe("anthropic/claude-plain");
 	});
+});
+
+test("updates the rendered catalog when an in-flight registry refresh completes", async () => {
+	installTestTheme();
+	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-model-selector-catalog-"));
+	const modelsPath = path.join(tempDir, "models.json");
+	const authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+	let selector: ModelSelectorComponent | undefined;
+
+	try {
+		await Bun.write(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					"catalog-refresh": {
+						baseUrl: "https://catalog-refresh.example.com/v1",
+						api: "openai-responses",
+						discovery: { type: "openai-models-list" },
+					},
+				},
+			}),
+		);
+		authStorage.setRuntimeApiKey("catalog-refresh", "test-key");
+		const response = Promise.withResolvers<Response>();
+		using _hook = hookFetch(input => {
+			expect(String(input)).toBe("https://catalog-refresh.example.com/v1/models");
+			return response.promise;
+		});
+		const registry = new ModelRegistry(authStorage, modelsPath);
+
+		const ui = { requestRender: vi.fn() } as unknown as TUI;
+		selector = new ModelSelectorComponent(
+			ui,
+			undefined,
+			Settings.isolated(),
+			registry,
+			[],
+			() => {},
+			() => {},
+			{ initialSearchInput: "newly" },
+		);
+		await Bun.sleep(0);
+		installTestTheme();
+		const refresh = registry.refresh("online");
+		await Bun.sleep(0);
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).not.toContain("newly-available-model");
+
+		response.resolve(
+			new Response(JSON.stringify({ data: [{ id: "newly-available-model" }] }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			}),
+		);
+		await refresh;
+		await Bun.sleep(0);
+		installTestTheme();
+
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("newly-available-model");
+	} finally {
+		selector?.dispose();
+		authStorage.close();
+		await fs.rm(tempDir, { recursive: true, force: true });
+	}
 });

@@ -374,6 +374,8 @@ export class ModelSelectorComponent extends Container {
 	#selectedThinkingIndex: number = 0;
 	#assignmentState: "idle" | "assigning" = "idle";
 	#closeAfterAssignment = false;
+	#unsubscribeCatalogChanged: () => void = () => {};
+	#disposed = false;
 
 	// Preset landing state
 	#viewMode: ModelSelectorViewMode = "presets";
@@ -479,6 +481,13 @@ export class ModelSelectorComponent extends Container {
 		// Add bottom border
 		this.addChild(new DynamicBorder());
 
+		if (typeof this.#modelRegistry.onCatalogChanged === "function") {
+			this.#unsubscribeCatalogChanged = this.#modelRegistry.onCatalogChanged(() => {
+				if (this.#disposed) return;
+				if (this.#refreshCatalogView()) this.#tui.requestRender();
+			});
+		}
+
 		// Load models and do initial render
 		this.#loadModels().then(() => {
 			this.#buildProviderTabs();
@@ -502,6 +511,13 @@ export class ModelSelectorComponent extends Container {
 			// Request re-render after models are loaded
 			this.#tui.requestRender();
 		});
+	}
+
+	override dispose(): void {
+		if (this.#disposed) return;
+		this.#disposed = true;
+		this.#unsubscribeCatalogChanged();
+		super.dispose();
 	}
 
 	#isActiveDefaultFallback(): boolean {
