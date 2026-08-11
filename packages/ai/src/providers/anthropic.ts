@@ -2396,12 +2396,15 @@ function latestAssistantThinkingIsUnreplayable(messages: Message[], model: Model
 		if (block.type !== "thinking") return false;
 		// A block with empty text and no signature cannot go back on the wire:
 		// `convertAnthropicMessages` drops it, and Anthropic rejects the turn for
-		// arriving without it. A block with a valid signature is replayable even
-		// when the text is empty, and non-signing endpoints replay unsigned blocks
-		// verbatim, so only signing endpoints treat a missing signature as
-		// unreplayable.
+		// arriving without it. A block with a valid signature AND non-empty text is
+		// replayable. But a signed block whose text was emptied — e.g. by
+		// clear_thinking_20251015 — carries a stale signature that signing endpoints
+		// reject on replay (issue #4247). Non-signing endpoints replay unsigned
+		// blocks verbatim, so only they treat a missing signature as unreplayable.
 		const hasSignature = !!block.thinkingSignature?.trim();
+		const isEmpty = !block.thinking.trim();
 		if (!hasSignature) return requiresSignature;
+		if (isEmpty && requiresSignature) return true;
 		return false;
 	});
 }
