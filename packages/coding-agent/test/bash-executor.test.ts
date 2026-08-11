@@ -100,6 +100,17 @@ describe("executeBash", () => {
 		expect(getShellSessionCount()).toBe(0);
 	});
 
+	it("owns and disposes one-shot native shells", async () => {
+		await disposeAllShellSessions();
+		const abortSpy = vi.spyOn(piNatives.Shell.prototype, "abort");
+
+		const result = await executeBash("echo one-shot", { cwd: tempDir, timeout: 5000, oneShot: true });
+
+		expect(result.output.trim()).toBe("one-shot");
+		expect(getShellSessionCount()).toBe(0);
+		expect(abortSpy).toHaveBeenCalledTimes(1);
+	});
+
 	it("reports the bash shell-session owner count via runtime resource gauges", async () => {
 		await disposeAllShellSessions();
 		expect(getRuntimeResourceCounts()["bash.shellSessions"]).toBe(0);
@@ -299,7 +310,7 @@ describe("executeBash", () => {
 			sessionKey: "hung-native-abort",
 		});
 		expect(next.output.trim()).toBe("next");
-		expect(runCalls).toBe(1);
+		expect(runCalls).toBe(2);
 	});
 
 	it("restores persistent sessions after native abort cleanup settles", async () => {

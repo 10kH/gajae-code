@@ -19,7 +19,7 @@ import { formatArtifactReference, resolveOutputMaxColumns, resolveOutputSinkHead
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { NON_INTERACTIVE_ENV } from "./non-interactive-env";
 
-type NativeShellBindings = Pick<typeof import("@gajae-code/natives"), "Shell" | "executeShell">;
+type NativeShellBindings = Pick<typeof import("@gajae-code/natives"), "Shell">;
 let nativeShellBindingsLoad: Promise<NativeShellBindings> | undefined;
 
 async function shellNatives(): Promise<NativeShellBindings> {
@@ -288,7 +288,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			...(await sink.dump("Command cancelled")),
 		};
 	}
-	const { Shell, executeShell } = await shellNatives();
+	const { Shell } = await shellNatives();
 
 	const usePersistentShell = options?.oneShot !== true;
 	const sessionKey = buildSessionKey(shell, configuredPrefix, snapshotPath, shellEnv, options?.sessionKey, minimizer);
@@ -303,14 +303,26 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		});
 		shellSessions.set(sessionKey, shellSession);
 	}
+	// Non-persistent invocations still need an owned native Shell so its lifetime
+	// can be ended explicitly. executeShell creates a native shell outside the
+	// persistent registry, leaving its cleanup untrackable by the host process.
+	const oneShotShell =
+		!usePersistentShell || persistentSessionBroken
+			? new Shell({
+					sessionEnv: shellEnv,
+					snapshotPath: snapshotPath ?? undefined,
+					minimizer,
+				})
+			: undefined;
+	const activeShell = shellSession ?? oneShotShell;
 	const userSignal = options?.signal;
 	const runAbortController = new AbortController();
 	const abortCurrentExecution = () => {
 		if (!runAbortController.signal.aborted) {
 			runAbortController.abort();
 		}
-		if (shellSession && !abortPromise) {
-			abortPromise = shellSession.abort();
+		if (activeShell && !abortPromise) {
+			abortPromise = activeShell.abort();
 		}
 	};
 	const abortDeferred = Promise.withResolvers<"abort">();
@@ -351,38 +363,20 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	let runSettled = false;
 
 	try {
-		const runPromise = shellSession
-			? shellSession.run(
-					{
-						command: finalCommand,
-						cwd: commandCwd,
-						env: commandEnv,
-						timeoutMs: executionTimeoutMs,
-						signal: runAbortController.signal,
-					},
-					(err, chunk) => {
-						if (!err) {
-							enqueueChunk(chunk);
-						}
-					},
-				)
-			: executeShell(
-					{
-						command: finalCommand,
-						cwd: commandCwd,
-						env: commandEnv,
-						sessionEnv: shellEnv,
-						snapshotPath: snapshotPath ?? undefined,
-						minimizer,
-						timeoutMs: executionTimeoutMs,
-						signal: runAbortController.signal,
-					},
-					(err, chunk) => {
-						if (!err) {
-							enqueueChunk(chunk);
-						}
-					},
-				);
+		const runPromise = activeShell!.run(
+			{
+				command: finalCommand,
+				cwd: commandCwd,
+				env: commandEnv,
+				timeoutMs: executionTimeoutMs,
+				signal: runAbortController.signal,
+			},
+			(err, chunk) => {
+				if (!err) {
+					enqueueChunk(chunk);
+				}
+			},
+		);
 
 		const winner = await Promise.race([
 			runPromise.then(result => ({ kind: "result" as const, result })),
@@ -413,7 +407,8 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 						.catch(() => undefined);
 				}
 			} else {
-				void runPromise.catch(() => undefined);
+				runSettled = await awaitAbortCleanup(runPromise);
+				if (!runSettled) void runPromise.catch(() => undefined);
 			}
 			return {
 				exitCode: undefined,
@@ -511,6 +506,10 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		}
 		if (resetSession && runSettled && shellSessions.get(sessionKey) === shellSession) {
 			shellSessions.delete(sessionKey);
+		}
+		if (oneShotShell) {
+			const disposePromise = abortPromise ?? oneShotShell.abort();
+			await Promise.race([disposePromise.catch(() => undefined), Bun.sleep(CANCEL_CLEANUP_WAIT_MS)]);
 		}
 	}
 }
