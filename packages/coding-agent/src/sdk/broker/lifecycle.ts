@@ -2593,13 +2593,12 @@ async function currentReadyAuthority(
 			token?: unknown;
 			pid?: unknown;
 		};
+		// A new lifecycle registration has no heartbeat until the broker checkpoints it.
+		// Publish that positive liveness evidence through the broker-owned checkpoint before
+		// enforcing ready authority; endpoint, marker, incarnation, and generation checks below remain unchanged.
+		await broker.heartbeatSessions();
 		await broker.index.refresh();
-		let record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
-		if (record && !record.live && !record.terminal && !record.terminalUncertain) {
-			await broker.heartbeatSessions();
-			await broker.index.refresh();
-			record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
-		}
+		const record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 		if (
 			!record?.live ||
 			record.pid !== expected.pid ||

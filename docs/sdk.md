@@ -20,62 +20,6 @@ External and managed integrations attach through SDK-core surfaces only:
 - endpoint URL/token discovery, raw WebSocket relays, and `gjc sdk serve` are not public attachment mechanisms;
 - lifecycle-equivalent per-session controls are prohibited on Telegram, Discord, Slack, ACP, MCP, and daemon CLI adapters.
 
-<<<<<<< HEAD
-For embedding GJC in-process, use the [embedding SDK guide](./sdk-embedding.md). Managed providers use the notification adapters documented below.
-||||||| d5b782d8dd
-```bash
-bun add @gajae-code/bridge-client
-```
-
-```ts
-import { SdkClient } from "@gajae-code/bridge-client";
-```
-
-`@gajae-code/coding-agent/sdk` remains a compatibility re-export of this same `SdkClient` class and associated types, so both entry points preserve class identity. The package is a client for the documented v3 transport only: it does not restore the historical BridgeClient backend protocol, handshake/commands/SSE endpoints, or any direct host-control path.
-
-## Migration from the removed RPC mode
-
-The retired `--mode rpc`, `rpc-ui`, and `bridge` modes are removed. The SDK v3
-WebSocket endpoint is now the canonical external control/query bus.
-
-| Retired RPC commands | SDK v3 control/query operations |
-| --- | --- |
-| `prompt`, `steer`, `follow_up`, `abort` | `turn.prompt`, `turn.steer`, `turn.follow_up`, `turn.abort` |
-| Model, thinking, queue, retry, and compaction controls | `model.*`, `thinking.*`, `queue.*`, `retry.*`, and `compaction.*` |
-| Session and transcript queries | `session.*`, `transcript.*`, `context.get`, and `session.stats` |
-| Workflow-gate response | `workflow.gate_answer` |
-
-See the [RPC-to-SDK v3 parity audit](./sdk-rpc-parity-audit.md) for the full
-matrix, partial equivalents, and evidence.
-
-For a local non-WebSocket transport, run one of these commands:
-
-```sh
-gjc sdk serve --stdio
-```
-
-```sh
-gjc sdk serve --socket <path>
-```
-
-It relays the identical SDK v3 frames over stdio or a Unix socket. Socket
-clients send an authentication preface and the socket is mode `0600`; stdio is
-one parent-owned connection.
-
-Python clients install the `gjc_sdk` package from `python/gjc-sdk`:
-
-```sh
-python -m pip install ./python/gjc-sdk
-```
-
-Import `SdkClient` with `from gjc_sdk import SdkClient`, then use
-`SdkClient.connect_ws`, `SdkClient.connect_socket`, or `SdkClient.connect_stdio`.
-The client supplies `reply.token` for replies.
-
-Phase 2 still does **not** provide unattended negotiation, a cross-process
-reattach/registry, or a renderer-grade full event stream. No event-plane parity
-is claimed; see the audit's [ranked Phase-2 register](./sdk-rpc-parity-audit.md#ranked-phase-2-follow-up-register--not-implemented).
-=======
 ```bash
 bun add @gajae-code/bridge-client
 ```
@@ -158,7 +102,6 @@ The skills use a trusted-local procedural model. They require exact live-session
 Phase 2 still does **not** provide unattended negotiation, a cross-process
 reattach/registry, or a renderer-grade full event stream. No event-plane parity
 is claimed; see the audit's [ranked Phase-2 register](./sdk-rpc-parity-audit.md#ranked-phase-2-follow-up-register--not-implemented).
->>>>>>> origin/dev
 
 ## Architecture
 

@@ -2852,10 +2852,10 @@ test("broker closes a live host whose workspace state root is gone using its reg
 		expect(await broker.handleRequest("session.list", {})).toMatchObject({
 			ok: true,
 			result: {
-				sessions: expect.arrayContaining([
+				sessions: [
 					expect.objectContaining({ sessionId: "wrong-incarnation" }),
-					expect.objectContaining({ sessionId: "orphan", live: false, terminal: true }),
-				]),
+					expect.objectContaining({ sessionId: "orphan", terminal: true, live: false }),
+				],
 			},
 		});
 	} finally {
@@ -3104,6 +3104,13 @@ test("broker atomically reuses the indexed live owner for distinct resume keys",
 			endpointGeneration: 17,
 			pid: host.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+		});
+		await broker.index.append({
+			type: "host_heartbeat",
+			sessionId,
+			locator: { repo: root, stateRoot },
+			endpointGeneration: 17,
+			pid: host.pid,
 		});
 
 		const [first, second] = await Promise.all([
@@ -3599,6 +3606,13 @@ test("idempotent lifecycle replay refreshes authority after a broker restart", a
 			pid: host.pid,
 			endpointMtimeMs,
 		});
+		await initial.index.append({
+			type: "host_heartbeat",
+			sessionId,
+			locator: { repo: root, stateRoot },
+			endpointGeneration: 2,
+			pid: host.pid,
+		});
 		const key = "replay-authority";
 		const targetHash = createHash("sha256").update(canonicalJson({ sessionId })).digest("hex");
 		const identity = await deriveIdempotencyIdentity(agentDir, "session.resume", key, targetHash);
@@ -3878,7 +3892,10 @@ test("production post-registration startup failure proves cleanup and exact repl
 		const failure = response.ok ? undefined : response.startupFailure;
 		if (!failure) throw new Error("Expected persisted startup failure evidence.");
 		const sessions = await broker.handleRequest("session.list", {});
-		expect(sessions).toMatchObject({ ok: true, result: { sessions: [] } });
+		expect(sessions).toMatchObject({
+			ok: true,
+			result: { sessions: [expect.objectContaining({ terminal: true, live: false })] },
+		});
 		const sdkDir = path.join(root, ".gjc", "state", "sdk");
 		const entries = await fs.readdir(sdkDir);
 		// Retained `.gjc-delete-*` quarantines are typed cleanup evidence; only
@@ -4072,7 +4089,7 @@ test("broker close acknowledges before terminating the lifecycle child and prese
 		).rejects.toThrow();
 		expect(await broker.handleRequest("session.list", {})).toMatchObject({
 			ok: true,
-			result: { sessions: [expect.objectContaining({ sessionId, live: false, terminal: true })] },
+			result: { sessions: [expect.objectContaining({ sessionId, terminal: true, live: false })] },
 		});
 		expect(
 			(await fs.readFile(path.join(agentDir, "sdk", "sessions", "index.jsonl"), "utf8"))
