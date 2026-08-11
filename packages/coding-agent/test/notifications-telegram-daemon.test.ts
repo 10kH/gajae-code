@@ -1107,8 +1107,9 @@ type TopicAuthorityState = {
 			nameReconcilePending?: boolean;
 			userNameUpdateId?: number;
 			identitySent?: boolean;
-			authorityState?: "active" | "archive_pending" | "inactive";
+			authorityState?: "active" | "disconnect_grace" | "archive_pending" | "inactive";
 			bindingMalformed?: true;
+			orphanedAt?: number;
 			endpointDigest?: string;
 			endpointGeneration?: number;
 			replayGeneration?: number;
@@ -11980,7 +11981,8 @@ test("strict daemon blocks an ordinary endpoint discovered under an orchestratio
 	expect(daemon.sessions.has("ordinary")).toBe(false);
 	expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(0);
 	expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(0);
-	expect((await readTopicAuthorityState(agentDir)).topics.ordinary?.authorityState).toBe("active");
+	expect((await readTopicAuthorityState(agentDir)).topics.ordinary?.authorityState).toBe("disconnect_grace");
+	expect((await readTopicAuthorityState(agentDir)).topics.ordinary?.orphanedAt).toBeGreaterThan(0);
 	const connectionCount = FakeWs.instances.length;
 	await daemon.scanRoots();
 	expect(FakeWs.instances).toHaveLength(connectionCount);

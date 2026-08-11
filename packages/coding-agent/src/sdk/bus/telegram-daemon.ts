@@ -6239,7 +6239,10 @@ export class TelegramNotificationDaemon {
 
 					if (this.topics.clearOrphaned(sessionId)) await this.persistTopics();
 					const endpointKey = endpointGenerationKey(endpoint.url, endpoint.token);
-					if (this.rejectedTopicEndpointKeys.get(sessionId) === endpointKey) continue;
+					if (this.rejectedTopicEndpointKeys.get(sessionId) === endpointKey) {
+						await this.observeOrphanedTopic(sessionId);
+						continue;
+					}
 					this.rejectedTopicEndpointKeys.delete(sessionId);
 					const connected = this.sessions.get(sessionId);
 					if (connected) {
@@ -10101,6 +10104,11 @@ export class TelegramNotificationDaemon {
 			session.telegramTopicsEnabled = latestIdentity?.telegramTopicsEnabled === true;
 			if (!this.topicAdmissionAllows(session)) {
 				this.rejectedTopicEndpointKeys.set(session.sessionId, session.endpointKey);
+				await this.observeOrphanedTopic(session.sessionId).catch(error => {
+					logger.warn(
+						`notifications: rejected topic orphan observation failed: ${sanitizeDiagnostic(String(error))}`,
+					);
+				});
 				this.dropSession(session, "topic_admission_rejected");
 				return;
 			}
