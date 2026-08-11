@@ -41,3 +41,26 @@ export const ACP_SESSION_RECONNECT: SessionReconnectOptions = {
 	reconnectBackoffMs: SESSION_RECONNECT_BACKOFF_MS,
 	reconnectMaxBackoffMs: SESSION_RECONNECT_MAX_BACKOFF_MS,
 };
+
+/**
+ * Request deadline for session-scoped SDK commands dispatched through the Router.
+ *
+ * The transport default (10s) is sized for one-shot broker requests and is too
+ * short for the first query a cold session host answers: Q10
+ * (`models.list/current`) collects credentials for every configured profile
+ * provider, which on a multi-OAuth setup takes longer than 10s once and
+ * milliseconds afterwards. Killing that request loses far more than the query —
+ * the reply lands after the deadline, so the outcome can only be reported as
+ * uncertain after the frame was sent, and ACP discards the session it just
+ * created (#4258).
+ *
+ * Liveness is proven independently: the host is reaped when it misses the
+ * heartbeat TTL ({@link HEARTBEAT_TTL_MS}) and the client reconnects within
+ * {@link ACP_SESSION_RECONNECT}. This deadline therefore only bounds a host that
+ * is alive but wedged, and it must not fire sooner than the liveness evidence it
+ * would contradict — hence the same two-TTL budget the reconnect side uses.
+ *
+ * Session controls are acknowledgement-shaped (`turn.prompt` returns an accepted
+ * receipt, not the turn's result), so no legitimate session request needs longer.
+ */
+export const SESSION_REQUEST_TIMEOUT_MS = 2 * HEARTBEAT_TTL_MS;
