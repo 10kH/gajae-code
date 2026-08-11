@@ -1,6 +1,7 @@
 import { describe, expect, spyOn, test, vi } from "bun:test";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
@@ -3129,7 +3130,7 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 through generation 55 lazy native authority", () => {
+	test("keeps wire protocol 3 through generation 62 replay-gap authority validation", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
 		// Generations 34 and 35 add media conversion and topic adoption; generation
 		// 36 bound managed-session replacement to exact native filesystem authority,
@@ -3163,7 +3164,9 @@ describe("telegram daemon", () => {
 		// Generation 59 publishes the attached OPEN-socket count in the heartbeat sidecar (#4128).
 		// Generation 60 contains transient heartbeat-sidecar publication failures
 		// under the ownership-lock fence instead of crashing the daemon (#4200).
-		expect(DAEMON_GENERATION).toBe(60);
+		// Generation 61 keeps fenced same-session transports attached; generation 62
+		// validates replay-gap claims against the requested cursor and retained suffix.
+		expect(DAEMON_GENERATION).toBe(62);
 	});
 	test.each([
 		"1",
@@ -12082,6 +12085,26 @@ test("archive-pending topics fence model choices and threaded frames while activ
 	bot.calls = [];
 	daemon.connectSession("S", "ws://resumed", "replacement-token");
 	const resumedSession = daemon.sessions.get("S")!;
+	(resumedSession.ws as unknown as FakeWs).dispatchEvent(new Event("open"));
+	await daemon.handleSessionMessage(resumedSession, {
+		type: "event_replay_result",
+		id: resumedSession.replayId,
+		ok: true,
+		generation: 1,
+		lastSeq: 1,
+		events: [
+			{
+				seq: 1,
+				payload: {
+					type: "identity_header",
+					sessionId: "S",
+					repo: "r",
+					branch: "b",
+				},
+			},
+		],
+	});
+	expect(daemon.sessions.get("S")).toBe(resumedSession);
 	await daemon.handleSessionMessage(resumedSession, {
 		type: "control_command_result",
 		status: "ok",
@@ -19273,11 +19296,128 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		expect(routed).toHaveLength(2);
 		expect(routed.every(call => call.body.message_thread_id !== 77)).toBe(true);
 	});
+	test("archive settlement redials a rejected fenced transport and restores delivery on a new topic", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const daemonSettings = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "repo");
+		await registerNotificationRoot({ settings: daemonSettings, cwd, sessionId: "S" });
+		const endpointDir = path.join(cwd, ".gjc", "state", "sdk");
+		await fsPromises.mkdir(endpointDir, { recursive: true });
+		await Bun.write(
+			path.join(endpointDir, "S.json"),
+			JSON.stringify({ url: "ws://successor", token: "successor-token" }),
+		);
+		const topicsPath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+		await fsPromises.mkdir(path.dirname(topicsPath), { recursive: true });
+		await Bun.write(
+			topicsPath,
+			JSON.stringify({
+				version: 2,
+				topics: {
+					S: {
+						topicId: "77",
+						topicOrigin: "daemon_created",
+						sessionUuid: "predecessor",
+						identitySent: true,
+						createdAt: 1,
+						chatId: "42",
+						endpointKey: endpointAuthorityDigest("ws://predecessor", "predecessor-token"),
+						endpointDigest: endpointAuthorityDigest("ws://predecessor", "predecessor-token"),
+						endpointGeneration: 1,
+						authorityState: "archive_pending",
+						authorityEpoch: 2,
+					},
+				},
+				fences: { S: 2 },
+			}),
+		);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: daemonSettings,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as never,
+		});
+		await daemon.loadTopics();
+		daemon.connectSession("S", "ws://successor", "successor-token");
+		const fenced = daemon.sessions.get("S")!;
+		fenced.ws.dispatchEvent(new Event("open"));
+		await daemon.handleSessionMessage(fenced, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: "queued behind the replay barrier",
+		});
+		await daemon.handleSessionMessage(fenced, {
+			type: "event_replay_result",
+			ok: true,
+			id: fenced.replayId,
+			generation: 1,
+			lastSeq: 1,
+			events: [{ payload: { type: "identity_header", sessionId: "S", repo: "gajae-code", branch: "dev" } }],
+		});
+		expect(daemon.sessions.get("S")).toBe(fenced);
+		expect(fenced.recoveryLease?.state).toBe("rejected");
+		expect(fenced.replayQueue).toEqual([]);
+
+		await daemon.scanRoots();
+		const successor = daemon.sessions.get("S")!;
+		expect(successor).not.toBe(fenced);
+		successor.ws.dispatchEvent(new Event("open"));
+		await daemon.handleSessionMessage(successor, {
+			type: "event_replay_result",
+			ok: true,
+			id: successor.replayId,
+			generation: 1,
+			lastSeq: 1,
+			events: [{ payload: { type: "identity_header", sessionId: "S", repo: "gajae-code", branch: "dev" } }],
+		});
+		await daemon.handleSessionMessage(successor, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: "successor delivery",
+		});
+
+		expect(bot.calls.some(call => call.method === "closeForumTopic" && call.body.message_thread_id === 77)).toBe(
+			true,
+		);
+		expect(bot.calls.some(call => call.method === "createForumTopic")).toBe(true);
+		expect(
+			bot.calls.some(
+				call =>
+					call.method === "sendMessage" &&
+					call.body.message_thread_id !== 77 &&
+					String(call.body.text).includes("successor delivery"),
+			),
+		).toBe(true);
+	});
 	test.each([
 		["accepted remote archive", async () => ({ ok: true, result: true }), "inactive", "42", "42", [77], false],
 		[
 			"already closed remote topic",
 			async () => ({ ok: false, error_code: 400, description: "Bad Request: TOPIC_NOT_FOUND" }),
+			"inactive",
+			"42",
+			"42",
+			[77],
+			false,
+		],
+		[
+			"non-forum chat cannot retain a closable topic",
+			async () => ({ ok: false, error_code: 400, description: "Bad Request: the chat is not a supergroup forum" }),
+			"inactive",
+			"42",
+			"42",
+			[77],
+			false,
+		],
+		[
+			"non-forum chat alias cannot retain a closable topic",
+			async () => ({ ok: false, error_code: 400, description: "Bad Request: the chat is not a forum" }),
 			"inactive",
 			"42",
 			"42",
@@ -20816,6 +20956,103 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		);
 		const after = JSON.parse(fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"));
 		expect(after.topics.S).toMatchObject({ replayGeneration: 1, replaySeq: 1 });
+	});
+	test("a single-event sequence-gap replay with a consistent identity resumes the exact endpoint authority", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const initial = recoveryDaemon(agentDir, bot);
+		await replayResumedIdentity(initial, "S", "S", { generation: 1 });
+		const topicId = bot.createdTopicThreadIds[0]!;
+
+		const restarted = recoveryDaemon(agentDir, bot);
+		await restarted.loadTopics();
+		restarted.connectSession("S", "ws://canonical", "canonical-token");
+		const session = restarted.sessions.get("S")!;
+		session.ws.dispatchEvent(new Event("open"));
+		bot.calls.length = 0;
+
+		await restarted.handleSessionMessage(session, {
+			type: "event_replay_result",
+			ok: true,
+			id: session.replayId,
+			generation: 1,
+			lastSeq: 10,
+			gap: { kind: "sequence_gap", fromSeq: 2, toSeq: 2, resyncQueries: ["Q01"] },
+			events: [
+				{
+					seq: 3,
+					payload: {
+						type: "identity_header",
+						sessionId: "S",
+						repo: "gajae-code",
+						branch: "dev",
+						title: "Recovered after replay gap",
+					},
+				},
+			],
+		});
+
+		expect(restarted.sessions.get("S")).toBe(session);
+		expect(session.replayPending).toBe(false);
+		expect(session.logicalSessionIdTrusted).toBe(true);
+		expect(
+			(restarted as unknown as { topics: { get(id: string): { topicId: string } | undefined } }).topics.get("S"),
+		).toMatchObject({ topicId: String(topicId) });
+		expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(0);
+		expect((await readTopicAuthorityState(agentDir)).topics.S).toMatchObject({
+			replayGeneration: 1,
+			replaySeq: 10,
+		});
+	});
+	test.each([
+		[
+			"gap starts after the requested cursor",
+			{
+				lastSeq: 10,
+				gap: { kind: "sequence_gap", fromSeq: 3, toSeq: 3, resyncQueries: ["Q01"] },
+				events: [{ seq: 4, payload: { type: "identity_header", sessionId: "S" } }],
+			},
+		],
+		[
+			"gap extends past lastSeq",
+			{
+				lastSeq: 2,
+				gap: { kind: "sequence_gap", fromSeq: 2, toSeq: 3, resyncQueries: ["Q01"] },
+				events: [{ seq: 4, payload: { type: "identity_header", sessionId: "S" } }],
+			},
+		],
+		[
+			"retained event overlaps the conceded gap",
+			{
+				lastSeq: 3,
+				gap: { kind: "sequence_gap", fromSeq: 2, toSeq: 2, resyncQueries: ["Q01"] },
+				events: [{ seq: 2, payload: { type: "identity_header", sessionId: "S" } }],
+			},
+		],
+	] as const)("%s cannot authorize recovery", async (_name, proof) => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const initial = recoveryDaemon(agentDir, bot);
+		await replayResumedIdentity(initial, "S", "S", { generation: 1 });
+
+		const restarted = recoveryDaemon(agentDir, bot);
+		await restarted.loadTopics();
+		restarted.connectSession("S", "ws://canonical", "canonical-token");
+		const session = restarted.sessions.get("S")!;
+		session.ws.dispatchEvent(new Event("open"));
+		await restarted.handleSessionMessage(session, {
+			type: "event_replay_result",
+			ok: true,
+			id: session.replayId,
+			generation: 2,
+			...proof,
+		});
+
+		expect(restarted.sessions.has("S")).toBe(false);
+		expect(session.logicalSessionIdTrusted).toBe(false);
+		expect(session.hostGeneration).toBe(0);
 	});
 	test.each([
 		[
