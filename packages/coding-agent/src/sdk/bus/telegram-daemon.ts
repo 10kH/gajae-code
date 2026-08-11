@@ -12167,7 +12167,6 @@ export class TelegramNotificationDaemon {
 					);
 				}
 				if (!ownerHeld) break;
-				await this.runScan();
 				if (await this.controlStopRequested()) break;
 				const idleElapsed = this.runtime.now() - idleSince >= (this.opts.idleTimeoutMs ?? 60_000);
 				if (this.sessions.size > 0) {
