@@ -19,6 +19,33 @@ afterEach(() => {
 	for (const directory of tempDirs.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
 });
 
+interface RouterFixtureAuthority {
+	generation: number;
+	pid: number;
+	endpointMtimeMs: number;
+	indexed: boolean;
+	terminalUncertain: boolean;
+	warnings: string[];
+}
+
+interface RouterFixtureClient {
+	sent: Record<string, unknown>[];
+	requests: Record<string, unknown>[];
+	client: SessionRouterClient;
+	emit: (frame: Record<string, unknown>) => void;
+	reconnect: () => void;
+}
+
+interface RouterFixture {
+	repo: string;
+	authority: RouterFixtureAuthority;
+	attachments: SessionAttachment[];
+	clients: RouterFixtureClient[];
+	endpointFile: string;
+	router: SessionRouter;
+	sessionId: string;
+}
+
 async function routerFixture(
 	options: {
 		onAttachment?: (attachment: SessionAttachment) => void | Promise<void>;
@@ -32,7 +59,7 @@ async function routerFixture(
 		initiallyIndexed?: boolean;
 		onIndexRefresh?: () => void | Promise<void>;
 	} = {},
-) {
+): Promise<RouterFixture> {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-authority-"));
 	tempDirs.push(repo);
 	const agentDir = path.join(repo, ".gjc", "agent");
@@ -76,13 +103,7 @@ async function routerFixture(
 			warnings: authority.warnings,
 		}),
 	} as unknown as SessionIndex;
-	const clients: Array<{
-		sent: Record<string, unknown>[];
-		requests: Record<string, unknown>[];
-		client: SessionRouterClient;
-		emit: (frame: Record<string, unknown>) => void;
-		reconnect: () => void;
-	}> = [];
+	const clients: RouterFixtureClient[] = [];
 	const attachments: SessionAttachment[] = [];
 	const router = new SessionRouter({
 		agentDir,
@@ -664,7 +685,7 @@ describe("SessionRouter dispatch authority", () => {
 	});
 	test("rejects an endpoint when the Broker index rotates during endpoint validation", async () => {
 		let refreshCount = 0;
-		let fixture!: Awaited<ReturnType<typeof routerFixture>>;
+		let fixture!: RouterFixture;
 		fixture = await routerFixture({
 			start: false,
 			onIndexRefresh: () => {

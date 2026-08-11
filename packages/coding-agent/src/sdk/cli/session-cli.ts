@@ -144,7 +144,7 @@ function isLifecycleOperation(operation: string): operation is LifecycleMutation
 }
 
 async function bounded<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-	let timer: ReturnType<typeof setTimeout> | undefined;
+	let timer: NodeJS.Timeout | undefined;
 	const timeout = Promise.withResolvers<never>();
 	try {
 		timer = setTimeout(() => timeout.reject(new SdkClientError("timeout", message)), timeoutMs);

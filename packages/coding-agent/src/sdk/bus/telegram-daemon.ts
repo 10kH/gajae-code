@@ -4379,7 +4379,7 @@ export class TelegramNotificationDaemon {
 		return this.selectedAckCache.get(cacheKey);
 	}
 
-	private async settleSelectedPublication(
+	async #settleSelectedPublication(
 		publicationId: string | undefined,
 		outcome: SelectedAckOutcome,
 	): Promise<void> {
@@ -4441,7 +4441,7 @@ export class TelegramNotificationDaemon {
 		for (const item of new Set(this.selectedAckPending.values())) {
 			if (item.state === "queued") {
 				const removed = this.pool.removeById(item.itemId);
-				if (removed) this.rejectRemovedPublication(removed);
+				if (removed) this.#rejectRemovedPublication(removed);
 			} else item.controller?.abort();
 			this.finishSelectedAck(item, { status: "unknown", reason: "shutdown" });
 		}
@@ -4449,7 +4449,7 @@ export class TelegramNotificationDaemon {
 			if (item.payload.selectedAck)
 				this.finishSelectedAck(item.payload.selectedAck, { status: "unknown", reason: "shutdown" });
 			item.payload.btwDelivery?.finish("uncertain");
-			this.rejectRemovedPublication(item);
+			this.#rejectRemovedPublication(item);
 		}
 		for (const session of this.sessions.values()) {
 			for (const item of session.replayQueue) {
@@ -5082,7 +5082,7 @@ export class TelegramNotificationDaemon {
 						session.transport.send(
 							JSON.stringify({ type: "ask_selected_ack_result", requestId, commitKey, outcome: cached }),
 						);
-						await this.settleSelectedPublication(publicationId, cached);
+						await this.#settleSelectedPublication(publicationId, cached);
 						return;
 					}
 					const finishImmediately = async (outcome: SelectedAckOutcome): Promise<void> => {
@@ -5092,7 +5092,7 @@ export class TelegramNotificationDaemon {
 								JSON.stringify({ type: "ask_selected_ack_result", requestId, commitKey, outcome }),
 							);
 						}
-						await this.settleSelectedPublication(publicationId, outcome);
+						await this.#settleSelectedPublication(publicationId, outcome);
 					};
 					if (deadlineAt <= this.runtime.now()) {
 						await finishImmediately({ status: "failed", reason: "expired" });
@@ -5124,20 +5124,20 @@ export class TelegramNotificationDaemon {
 							existing.followers.some(follower => follower.requestId === requestId)
 						) {
 							const outcome = await existing.settled;
-							await this.settleSelectedPublication(publicationId, outcome);
+							await this.#settleSelectedPublication(publicationId, outcome);
 							return;
 						}
 						const pendingKey = `${session.attachmentKey}\0${requestId}`;
 						existing.followers.push({ pendingKey, requestId, commitKey });
 						this.selectedAckPending.set(pendingKey, existing);
 						const outcome = await existing.settled;
-						await this.settleSelectedPublication(publicationId, outcome);
+						await this.#settleSelectedPublication(publicationId, outcome);
 						return;
 					}
 					const pendingKey = `${session.attachmentKey}\0${requestId}`;
 					if (this.selectedAckPending.has(pendingKey)) {
 						const outcome = await this.selectedAckPending.get(pendingKey)!.settled;
-						await this.settleSelectedPublication(publicationId, outcome);
+						await this.#settleSelectedPublication(publicationId, outcome);
 						return;
 					}
 					const settlement = Promise.withResolvers<SelectedAckOutcome>();
@@ -5218,12 +5218,12 @@ export class TelegramNotificationDaemon {
 					if (item.state !== "sending") {
 						this.pool.removeById(item.itemId);
 						this.finishSelectedAck(item, { status: "failed", reason: "cancelled" });
-						await this.settleSelectedPublication(item.publicationId, { status: "failed", reason: "cancelled" });
+						await this.#settleSelectedPublication(item.publicationId, { status: "failed", reason: "cancelled" });
 						return;
 					}
 					item.controller?.abort();
 					this.finishSelectedAck(item, { status: "unknown", reason: "transport_ambiguous" });
-					await this.settleSelectedPublication(item.publicationId, {
+					await this.#settleSelectedPublication(item.publicationId, {
 						status: "unknown",
 						reason: "transport_ambiguous",
 					});
@@ -5963,7 +5963,7 @@ export class TelegramNotificationDaemon {
 				item.payload.toolActivity !== undefined &&
 				(attachmentKey === undefined || item.payload.toolActivity.attachmentKey === attachmentKey),
 		);
-		for (const item of removedToolItems) this.rejectRemovedPublication(item);
+		for (const item of removedToolItems) this.#rejectRemovedPublication(item);
 		const next = this.enqueueToolTerminalization(claimVisible, false, strict);
 		if (attachmentKey !== undefined) {
 			void next.then(() => this.revokedToolEndpoints.delete(attachmentKey));
@@ -6067,7 +6067,7 @@ export class TelegramNotificationDaemon {
 	#finishQueuedBtwDeliveries(pending: PendingBtwTurn, outcome: BtwQueuedDeliveryOutcome): void {
 		for (const item of this.pool.removeWhere(item => item.payload.btwDelivery?.pending === pending)) {
 			item.payload.btwDelivery?.finish(outcome);
-			this.rejectRemovedPublication(item);
+			this.#rejectRemovedPublication(item);
 		}
 	}
 	#takeBtwTurn(requestId: string, pending: PendingBtwTurn): boolean {
@@ -6337,7 +6337,7 @@ export class TelegramNotificationDaemon {
 		this.#btwTerminalTombstones.clear();
 		for (const item of this.pool.removeWhere(() => true)) {
 			item.payload.btwDelivery?.finish("uncertain");
-			this.rejectRemovedPublication(item);
+			this.#rejectRemovedPublication(item);
 		}
 	}
 
@@ -7052,7 +7052,7 @@ export class TelegramNotificationDaemon {
 		if (state.phase !== "admitted" && state.phase !== "pending_identity" && state.phase !== "queued") return false;
 		if (state.itemId) {
 			const removed = this.pool.removeById(state.itemId);
-			if (removed) this.rejectRemovedPublication(removed);
+			if (removed) this.#rejectRemovedPublication(removed);
 		}
 		for (const [sessionId, frames] of this.pendingThreadedFrames) {
 			const removed = frames.filter(frame => frame.toolActivity === state.owner);
@@ -7769,7 +7769,7 @@ export class TelegramNotificationDaemon {
 			if (item.payload.selectedAck)
 				this.finishSelectedAck(item.payload.selectedAck, { status: "failed", reason: "cancelled" });
 			item.payload.btwDelivery?.finish("stale");
-			this.rejectRemovedPublication(item);
+			this.#rejectRemovedPublication(item);
 		}
 		try {
 			await this.flushPool();
@@ -8382,7 +8382,7 @@ export class TelegramNotificationDaemon {
 	}
 
 	/** Drain the shared rate-limit pool and deliver each granted send to its topic. */
-	private rejectRemovedPublication(item: { payload: TelegramQueuePayload }): void {
+	#rejectRemovedPublication(item: { payload: TelegramQueuePayload }): void {
 		const publicationId = item.payload.publicationId;
 		if (!publicationId) return;
 		this.#deferredPublications.delete(publicationId);
@@ -8574,7 +8574,7 @@ export class TelegramNotificationDaemon {
 						if (!requeued) {
 							const shutdownOutcome = { status: "unknown", reason: "shutdown" } as const;
 							this.finishSelectedAck(selectedAck, shutdownOutcome);
-							await this.settleSelectedPublication(item.payload.publicationId, shutdownOutcome);
+							await this.#settleSelectedPublication(item.payload.publicationId, shutdownOutcome);
 							if (item.payload.publicationId) this.#deferredPublications.delete(item.payload.publicationId);
 						} else {
 							selectedAck.state = "queued";
@@ -11385,7 +11385,7 @@ export class TelegramNotificationDaemon {
 							return !this.liveMessages.has(key) || owner?.session !== toolActivity.session;
 						});
 						for (const item of removedTools) {
-							this.rejectRemovedPublication(item);
+							this.#rejectRemovedPublication(item);
 							const toolActivity = item.payload.toolActivity;
 							if (!toolActivity) continue;
 							const key = `${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`;

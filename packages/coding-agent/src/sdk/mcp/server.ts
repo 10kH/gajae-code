@@ -158,7 +158,7 @@ function isLifecycleOperation(operation: string): operation is LifecycleMutation
 }
 
 async function bounded<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-	let timer: ReturnType<typeof setTimeout> | undefined;
+	let timer: NodeJS.Timeout | undefined;
 	const timeout = Promise.withResolvers<never>();
 	try {
 		timer = setTimeout(() => timeout.reject(new SdkClientError("timeout", message)), timeoutMs);
@@ -415,7 +415,8 @@ export async function runSdkMcpStdio(options: SdkMcpServerOptions = {}): Promise
 			void work.finally(() => inflight.delete(work));
 		};
 
-		await new Promise<void>((resolve, reject) => {
+		const stdinDone = Promise.withResolvers<void>();
+		{
 			const onData = (chunk: string) => {
 				buffer += chunk;
 				let index = buffer.indexOf("\n");
@@ -446,18 +447,19 @@ export async function runSdkMcpStdio(options: SdkMcpServerOptions = {}): Promise
 				process.stdin.off("data", onData);
 				process.stdin.off("end", onEnd);
 				process.stdin.off("error", onError);
-				resolve();
+				stdinDone.resolve();
 			};
 			const onError = (error: Error) => {
 				process.stdin.off("data", onData);
 				process.stdin.off("end", onEnd);
 				process.stdin.off("error", onError);
-				reject(error);
+				stdinDone.reject(error);
 			};
 			process.stdin.on("data", onData);
 			process.stdin.on("end", onEnd);
 			process.stdin.on("error", onError);
-		});
+		}
+		await stdinDone.promise;
 
 		// Stdin EOF must not drop in-flight tools/call handlers (WS connect/query).
 		// Awaiting them also prevents the process from exiting before responses flush.

@@ -675,7 +675,7 @@ export class SessionRouter {
 		if (!endpointStat || endpointStat.mtimeMs !== indexed.endpointMtimeMs) return null;
 		let raw: Record<string, unknown>;
 		try {
-			const parsed = JSON.parse(await fs.readFile(endpoint.path, "utf8"));
+			const parsed = JSON.parse(await Bun.file(endpoint.path).text());
 			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
 			raw = parsed as Record<string, unknown>;
 		} catch {
