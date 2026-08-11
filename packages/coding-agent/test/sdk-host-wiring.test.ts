@@ -169,7 +169,13 @@ function start(
 	createNotificationsExtension(
 		api,
 		effectiveSettings
-			? { settings: effectiveSettings, ensureTelegramDaemon, ensureProviderDaemon, controller }
+			? {
+					settings: effectiveSettings,
+					ensureTelegramDaemon,
+					ensureProviderDaemon,
+					controller,
+					telegramTopicsEnabled: true,
+				}
 			: undefined,
 	);
 	if (autoStart) void handlers.get("session_start")?.({ type: "session_start" }, ctx);

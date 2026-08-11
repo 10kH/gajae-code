@@ -190,7 +190,12 @@ async function bootSession(
 		eligible: true,
 		getConfig: () => getNotificationConfig(settings),
 	});
-	createNotificationsExtension(api, { settings, controller, ensureTelegramDaemon: options.ensureTelegramDaemon });
+	createNotificationsExtension(api, {
+		settings,
+		controller,
+		telegramTopicsEnabled: true,
+		ensureTelegramDaemon: options.ensureTelegramDaemon,
+	});
 	const sid = `stream-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
 		cwd,

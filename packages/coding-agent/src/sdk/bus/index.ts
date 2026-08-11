@@ -111,6 +111,7 @@ import {
 	getNotificationConfig,
 	isProviderEffectivelyEnabled,
 	isSlackComplete,
+	isTelegramOrchestrationSession,
 	type NotificationConfig,
 	type NotificationSettingsReader,
 	resolveGenericNotificationSessionEligibility,
@@ -454,19 +455,21 @@ export function readGitRepoName(cwd: string): string | undefined {
 /** Build the one-time identity header fields for a session thread. */
 function buildIdentity(
 	cwd: string,
-	sessionName?: string,
+	sessionName: string | undefined,
+	telegramTopicsEnabled: boolean,
 ): {
 	repo: string;
 	branch: string;
 	machine: string;
 	title?: string;
+	telegramTopicsEnabled: boolean;
 } {
 	const repo = readGitRepoName(cwd) ?? (path.basename(cwd) || cwd);
 	const branch = readGitBranch(cwd) ?? "(detached)";
 	// Send repo/branch and the raw session title separately; the consumer
 	// composes the topic name ("{repo}/{branch}" before the session title is
 	// auto-generated, then "{repo}/{branch} - {session title}" once it exists).
-	return { repo, branch, machine: os.hostname(), title: sessionName };
+	return { repo, branch, machine: os.hostname(), title: sessionName, telegramTopicsEnabled };
 }
 
 /** Compact cwd label for remote session identity; never emits the full host path by default. */
@@ -3569,6 +3572,8 @@ export function createNotificationsExtension(
 		ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>;
 		/** Suppress auto-delivery for a GJC-spawned child under `sessionScope=primary`. */
 		spawnedByGjc?: boolean;
+		/** Permit Telegram forum-topic ownership only for coordinator/lifecycle sessions. Defaults to provenance detection. */
+		telegramTopicsEnabled?: boolean;
 		controller?: NotificationSessionController;
 		/** Whether this host mode can own the root SDK endpoint. Default: true. */
 		sdkHostModeSupported?: boolean;
@@ -3582,6 +3587,9 @@ export function createNotificationsExtension(
 	} = {},
 ): void {
 	const lifecycleStartupCapability = lifecycleStartupCapabilityForApi(api);
+	const telegramTopicsEnabled =
+		options.telegramTopicsEnabled ??
+		(lifecycleStartupCapability !== undefined || isTelegramOrchestrationSession(process.env));
 	const runtimes = new Map<string, SessionRuntime>();
 	const controller =
 		options.controller ??
@@ -3615,6 +3623,7 @@ export function createNotificationsExtension(
 		id: string,
 		onRegistered?: (registrationToken: string) => void,
 	): Promise<"ready" | "blocked_identity"> {
+		if (!telegramTopicsEnabled) return "blocked_identity";
 		if (options.ensureTelegramDaemon) {
 			return (await options.ensureTelegramDaemon({
 				settings,
@@ -3642,7 +3651,7 @@ export function createNotificationsExtension(
 		id: string,
 		onRegistered?: (registrationToken: string) => void,
 	): Promise<ConfiguredDaemonOwnerResult> {
-		if (isProviderEffectivelyEnabled(cfg, "telegram")) {
+		if (telegramTopicsEnabled && isProviderEffectivelyEnabled(cfg, "telegram")) {
 			const telegramMarker = getCurrentTelegramActivationMarker(cfg);
 			if (telegramMarker) {
 				if (!isProviderEffectivelyEnabled(cfg, "discord") && !isProviderEffectivelyEnabled(cfg, "slack")) {
@@ -5580,7 +5589,7 @@ export function createNotificationsExtension(
 			const identityHeader = {
 				type: "identity_header",
 				sessionId: id,
-				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName()),
+				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName(), telegramTopicsEnabled),
 			};
 			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
 			// Core SDK authority is published before optional notification adapters acquire
@@ -5975,6 +5984,7 @@ export function createNotificationsExtension(
 			for (const processControl of runtime.deferredInboundControls.splice(0)) processControl();
 		},
 		ensureTelegramDaemon: async binding => {
+			if (!telegramTopicsEnabled) return "blocked_identity";
 			const { settings, settingsAvailable } = resolveSettings(options.settings);
 			if (!settingsAvailable || !settings) return "blocked_identity";
 			try {
@@ -6497,7 +6507,7 @@ export function createNotificationsExtension(
 			pushSessionFrame(rt, {
 				type: "identity_header",
 				sessionId: id,
-				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName()),
+				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName(), telegramTopicsEnabled),
 			});
 		} catch {}
 		try {

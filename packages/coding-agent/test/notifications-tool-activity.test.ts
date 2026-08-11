@@ -75,6 +75,7 @@ async function setup(
 					getConfig: () => getNotificationConfig(settings),
 				});
 	createNotificationsExtension(api, {
+		telegramTopicsEnabled: true,
 		...(settings ? { settings, controller } : {}),
 		...(options.ensureTelegramDaemon ? { ensureTelegramDaemon: options.ensureTelegramDaemon } : {}),
 	});

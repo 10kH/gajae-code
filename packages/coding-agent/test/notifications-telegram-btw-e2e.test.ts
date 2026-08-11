@@ -128,6 +128,7 @@ test("real notifications extension rejects an in-flight /btw response after reco
 			} as never,
 			{
 				settings,
+				telegramTopicsEnabled: true,
 				runBtwTurn: async (question, signal) => {
 					btwCalls.push({ question, signal });
 					if (signal?.aborted) throw signal.reason;

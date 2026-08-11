@@ -59,6 +59,7 @@ import {
 	getNotificationConfig,
 	isProviderEffectivelyEnabled,
 	isTelegramComplete,
+	isTelegramOrchestrationSession,
 	maskToken,
 	type NotificationProvider,
 } from "../../sdk/bus/config";
@@ -366,6 +367,7 @@ export function createNotificationsEditorOperations(
 			settings: ctx.settings,
 			cwd: ctx.sessionManager.getCwd(),
 			sessionId: ctx.sessionManager.getSessionId(),
+			registerRoot: isTelegramOrchestrationSession(process.env),
 		});
 	const telegramSetupPreflight = async (): Promise<TelegramSetupPreflight> =>
 		await services.resolveTelegramSetupPreflight(ctx.settings);
