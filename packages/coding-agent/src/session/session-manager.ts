@@ -3912,6 +3912,18 @@ function revalidateTranscriptIdentityBounded(
 	return sameResumeIdentity(expected, observed) ? { kind: "valid" } : { kind: "error", reason: "identity-mismatch" };
 }
 
+function revalidateStrictResumeInspection(
+	filePath: string,
+	storage: SessionStorage,
+	inspection: ResumeInspectionSnapshot,
+): boolean {
+	if (!storage.readRangeSync) {
+		const inspected = inspectResumeSessionFile(filePath, storage);
+		return !("kind" in inspected) && sameResumeIdentity(inspection.identity, inspected.identity);
+	}
+	return revalidateTranscriptIdentityBounded(filePath, storage, inspection.identity).kind === "valid";
+}
+
 function createTranscriptSnapshotHandle(
 	inspection: BoundedTranscriptInspection,
 	filePath: string,
@@ -6813,6 +6825,7 @@ export class SessionManager {
 	#persistChain: Promise<void> = Promise.resolve();
 	#persistError: Error | undefined;
 	#persistErrorReported = false;
+	#closeRetryPending = false;
 	/** Depth of the non-yielding same-session persistence fence (reentrancy counter). */
 	#persistenceFenceDepth = 0;
 	/** Publication fence counter carried by the mutable `.spill.commit` marker. */
@@ -8711,13 +8724,11 @@ export class SessionManager {
 		let strictManagedFallbackMigrationApplied = false;
 		const resolvedSessionFile = this.#storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
 		const revalidateStrictResume = (): void => {
-			if (!strictResume) return;
-			const revalidated = revalidateTranscriptIdentityBounded(
-				resolvedSessionFile,
-				strictResume.storage,
-				strictResume.inspection.identity,
-			);
-			if (revalidated.kind !== "valid") throw new Error("Could not open session: unstable");
+			if (
+				strictResume &&
+				!revalidateStrictResumeInspection(resolvedSessionFile, strictResume.storage, strictResume.inspection)
+			)
+				throw new Error("Could not open session: unstable");
 		};
 		revalidateStrictResume();
 		const sidecarRoot =
@@ -8825,7 +8836,7 @@ export class SessionManager {
 		writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
-		await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
+		if (!strictResume) await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 		if (publishedSidecarWasPresent && this.#lazyReopenAttempted && !this.#lazyReopenSucceeded) {
 			this.#sessionMemoryMode = "shadow";
 			this.#sessionMemoryAutoDisabledReason = "sidecar_reload_failures";
@@ -14678,6 +14689,14 @@ export class SessionManager {
 		this.#clearBoundedManagedSource();
 	}
 
+	#discardRejectedOpenState(): void {
+		this.#persistWriter = undefined;
+		this.#persistWriterPath = undefined;
+		this.#releaseResidentTextStore();
+		if (this.#preparedNewSessions.size === 0) this.#releaseOwnedManagedAuthority();
+		this.#releaseClosedSessionState();
+	}
+
 	/** Close the persistent writer after flushing all pending data. */
 	async close(): Promise<void> {
 		// Drain any uncommitted prepared successors before releasing resources so
@@ -14690,18 +14709,27 @@ export class SessionManager {
 			});
 		}
 		let closeError: unknown;
+		let taskStarted = false;
 		try {
-			await this.#queuePersistTask(async () => {
-				if (this.#persistWriter) {
-					await this.#closePersistWriterInternal();
-					this.#flushed = true;
-				}
-				if (this.#needsFullRewriteOnNextPersist && !this.#readOnlyResume) await this.#rewriteFileContents();
-			});
+			await this.#queuePersistTask(
+				async () => {
+					taskStarted = true;
+					if (this.#persistWriter) {
+						await this.#closePersistWriterInternal();
+						this.#flushed = true;
+					}
+					if (this.#needsFullRewriteOnNextPersist && !this.#readOnlyResume) await this.#rewriteFileContents();
+				},
+				{ ignoreError: this.#closeRetryPending },
+			);
+			this.#persistError = undefined;
+			this.#persistErrorReported = false;
+			this.#closeRetryPending = false;
 			this.#retireEphemeralArtifacts();
 			await this.#drainEphemeralArtifactCleanups();
 		} catch (error) {
 			closeError = error;
+			if (taskStarted) this.#closeRetryPending = true;
 		}
 		const terminalError = closeError ?? this.#persistError;
 		if (terminalError) throw terminalError;
@@ -18348,13 +18376,12 @@ export class SessionManager {
 					strictSmallInspection ? { inspection: strictSmallInspection, storage, reuseEntries: false } : undefined,
 				);
 				if (strictSmallInspection) {
-					const revalidated = revalidateTranscriptIdentityBounded(
-						filePath,
-						storage,
-						strictSmallInspection.identity,
-					);
-					if (revalidated.kind !== "valid" || manager.#sessionId !== strictSmallInspection.identity.sessionId)
+					if (
+						!revalidateStrictResumeInspection(filePath, storage, strictSmallInspection) ||
+						manager.#sessionId !== strictSmallInspection.identity.sessionId
+					)
 						throw new Error("Could not open session: unstable");
+					await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 				}
 				manager.buildSessionContext();
 				return manager;
@@ -18372,9 +18399,7 @@ export class SessionManager {
 					}
 				}
 				manager.#sidecarRuntime = undefined;
-				await manager.close().catch(closeError => {
-					logger.warn("Rejected explicit resume manager close failed", { error: toError(closeError).message });
-				});
+				manager.#discardRejectedOpenState();
 				throw error;
 			}
 		}
@@ -18426,25 +18451,34 @@ export class SessionManager {
 						: undefined,
 				);
 				if (strictManagedSmallInspection) {
-					const revalidated = revalidateTranscriptIdentityBounded(
-						filePath,
-						managedInspectionStorage,
-						strictManagedSmallInspection.identity,
-					);
 					if (
-						revalidated.kind !== "valid" ||
+						!revalidateStrictResumeInspection(filePath, managedInspectionStorage, strictManagedSmallInspection) ||
 						manager.#sessionId !== strictManagedSmallInspection.identity.sessionId
 					) {
 						manager.setSessionMemoryMode("off");
 						throw new Error("Could not open session: unstable");
 					}
+					await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 				}
 				const header = manager.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 				if (header?.cwd) manager.cwd = header.cwd;
 				manager.buildSessionContext();
 				return manager;
 			} catch (error) {
-				await manager.close().catch(() => {});
+				manager.setSessionMemoryMode("off");
+				for (const sidecarPath of manager.#disposableSidecarPaths()) {
+					if (!sidecarPath) continue;
+					try {
+						manager.#storage.unlinkSync(sidecarPath);
+					} catch (cleanupError) {
+						if (!isEnoent(cleanupError))
+							logger.warn("Rejected managed resume sidecar cleanup failed", {
+								error: toError(cleanupError).message,
+							});
+					}
+				}
+				manager.#sidecarRuntime = undefined;
+				manager.#discardRejectedOpenState();
 				throw error;
 			} finally {
 				managedInspectionStore?.close();
