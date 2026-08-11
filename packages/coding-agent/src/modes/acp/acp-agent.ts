@@ -158,7 +158,6 @@ function promptWaiterRetired(record: SessionRecord, waiter: PromptWaiter): boole
 	return waiter.settled || record.activePrompt !== waiter;
 }
 
-
 type BrokerSession = {
 	sessionId: string;
 	locator?: { repo?: string };
