@@ -3284,6 +3284,8 @@ function sameCloseEndpointIdentity(expected: CloseRecord, current: CloseRecord):
 	return (
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
+		current.endpointMtimeMs !== undefined &&
+		expected.endpointMtimeMs !== undefined &&
 		current.lifecycleRequestId === expected.lifecycleRequestId &&
 		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
 		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
@@ -3315,7 +3317,11 @@ async function revalidateCloseGeneration(
 ): Promise<BrokerResponse | undefined> {
 	await broker.index.refresh();
 	const current = broker.index.listSessions().sessions.find(session => session.sessionId === id);
-	if (!authority && current && sameCloseEndpointIdentity(expected, current)) {
+	if (
+		!authority &&
+		current &&
+		(sameCloseEndpointIdentity(expected, current) || sameCloseStoredProcessIdentity(expected, current))
+	) {
 		expected.endpointMtimeMs = current.endpointMtimeMs;
 		return undefined;
 	}
