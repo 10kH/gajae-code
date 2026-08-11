@@ -7,6 +7,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
+import * as native from "@gajae-code/natives";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -20,6 +21,7 @@ import {
 	SESSION_STORAGE_BUFFERED_WRITER_MAX_BYTES,
 	SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES,
 	type SessionStorageBufferedWriter,
+	type SessionStorageExclusiveLock,
 	SessionStorageWriterRetryableCloseError,
 	STAGED_MEMORY_WRITER_MAX_BYTES,
 	STAGED_WRITER_PATCH_LIMIT_BYTES,
@@ -384,10 +386,61 @@ describe("exclusive disposable build locks", () => {
 			write.mockRestore();
 		}
 		expect(storage.existsSync(lockPath)).toBe(false);
-		expect(fs.readdirSync(dir)).toEqual([]);
+		expect(fs.readdirSync(dir).some(name => name === path.basename(lockPath) || name.endsWith(".owner.tmp"))).toBe(
+			false,
+		);
 		const lock = storage.acquireExclusiveLockSync!(lockPath);
 		expect(lock).toBeDefined();
 		lock!.releaseSync();
+	});
+
+	it("uses the hard-link fallback without retaining the staged owner name", async () => {
+		const dir = await makeTempDir("gjc-exclusive-lock-link-fallback-");
+		const storage = new FileSessionStorage();
+		const lockPath = path.join(dir, "build.lock");
+		const rename = vi.spyOn(native, "renameNoReplacePath").mockReturnValue({
+			ok: false,
+			code: "atomic_unavailable",
+			mutationState: "not_committed",
+			durabilityState: "not_attempted",
+			reason: "atomic_unavailable",
+			primitive: "unsupported",
+			phase: "rename",
+			diagnostic: { schemaVersion: 1, collectionState: "complete" },
+		});
+		let lock: SessionStorageExclusiveLock | undefined;
+		try {
+			lock = storage.acquireExclusiveLockSync!(lockPath);
+		} finally {
+			rename.mockRestore();
+		}
+		expect(lock).toBeDefined();
+		expect(fs.readdirSync(dir).some(name => name.endsWith(".owner.tmp"))).toBe(false);
+		lock!.releaseSync();
+	});
+
+	it("does not reap a replacement installed during stale-lock cleanup", async () => {
+		const dir = await makeTempDir("gjc-exclusive-lock-reap-race-");
+		const storage = new FileSessionStorage();
+		const lockPath = path.join(dir, "build.lock");
+		storage.writeTextSync(
+			lockPath,
+			`${JSON.stringify({ pid: 2_147_483_647, incarnation: "absent:1", token: "stale-race" })}\n`,
+		);
+		const realExactUnlink = native.exactUnlink;
+		const exactUnlink = vi.spyOn(native, "exactUnlink").mockImplementation((target, identity) => {
+			if (target === lockPath) {
+				fs.unlinkSync(lockPath);
+				fs.writeFileSync(lockPath, "replacement\n");
+			}
+			return realExactUnlink(target, identity);
+		});
+		try {
+			expect(storage.acquireExclusiveLockSync!(lockPath)).toBeUndefined();
+		} finally {
+			exactUnlink.mockRestore();
+		}
+		expect(storage.readTextSync(lockPath)).toBe("replacement\n");
 	});
 
 	it("does not unlink a replacement file when releasing the original file lock", async () => {

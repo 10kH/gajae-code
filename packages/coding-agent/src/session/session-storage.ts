@@ -1589,10 +1589,67 @@ function parseSessionStorageLockOwner(bytes: Buffer): SessionStorageLockOwner | 
 	}
 }
 
+function exactRemoveSessionStorageLockPath(lockPath: string, expected: fs.BigIntStats, sha256: string): boolean {
+	try {
+		const parent = fs.lstatSync(path.dirname(lockPath), { bigint: true });
+		if (!parent.isDirectory() || parent.isSymbolicLink()) return false;
+		const result = nativeSessionStorage().exactUnlink(lockPath, {
+			dev: expected.dev,
+			ino: expected.ino,
+			nlink: expected.nlink,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			size: expected.size,
+			mtimeNs: expected.mtimeNs,
+			sha256,
+			quarantineName: `${path.basename(lockPath)}.reap-${randomUUID()}`,
+		});
+		return result.ok || (result.code === "cleanup_pending" && typeof result.detachedPath === "string");
+	} catch {
+		return false;
+	}
+}
+
+function exactRemoveOwnedSessionStorageLockPath(
+	lockPath: string,
+	expected: Pick<fs.BigIntStats, "dev" | "ino">,
+): boolean {
+	let fd: number | undefined;
+	try {
+		fd = fs.openSync(lockPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+		const current = fs.fstatSync(fd, { bigint: true });
+		if (
+			!current.isFile() ||
+			current.dev !== expected.dev ||
+			current.ino !== expected.ino ||
+			current.nlink < 1n ||
+			current.nlink > 2n ||
+			current.size > 4096n
+		)
+			return false;
+		const bytes = Buffer.allocUnsafe(Number(current.size));
+		let offset = 0;
+		while (offset < bytes.byteLength) {
+			const read = fs.readSync(fd, bytes, offset, bytes.byteLength - offset, offset);
+			if (read === 0) return false;
+			offset += read;
+		}
+		const sha256 = createHash("sha256").update(bytes).digest("hex");
+		fs.closeSync(fd);
+		fd = undefined;
+		return exactRemoveSessionStorageLockPath(lockPath, current, sha256);
+	} catch {
+		return false;
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
+	}
+}
+
 function reclaimStaleSessionStorageLockSync(lockPath: string): boolean {
 	let fd: number | undefined;
 	let expected: fs.BigIntStats | undefined;
 	let owner: SessionStorageLockOwner | undefined;
+	let sha256: string | undefined;
 	try {
 		fd = fs.openSync(lockPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
 		expected = fs.fstatSync(fd, { bigint: true });
@@ -1612,13 +1669,14 @@ function reclaimStaleSessionStorageLockSync(lockPath: string): boolean {
 			offset += read;
 		}
 		owner = parseSessionStorageLockOwner(bytes);
+		sha256 = createHash("sha256").update(bytes).digest("hex");
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
 		return false;
 	} finally {
 		if (fd !== undefined) fs.closeSync(fd);
 	}
-	if (!owner || !expected) return false;
+	if (!owner || !expected || !sha256) return false;
 	const probe = probeSessionStorageLockOwner(owner.pid);
 	const stale =
 		probe.kind === "absent" ||
@@ -1633,15 +1691,17 @@ function reclaimStaleSessionStorageLockSync(lockPath: string): boolean {
 			return false;
 		}
 	}
-	try {
-		const named = fs.lstatSync(lockPath, { bigint: true });
-		if (named.dev !== expected.dev || named.ino !== expected.ino || named.isSymbolicLink()) return false;
-		fs.unlinkSync(lockPath);
-		if (stagedPath) unlinkOwnedStagedSync(stagedPath, expected);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "ENOENT";
+	if (!exactRemoveSessionStorageLockPath(lockPath, expected, sha256)) return false;
+	if (stagedPath) {
+		try {
+			const staged = fs.lstatSync(stagedPath, { bigint: true });
+			if (staged.dev === expected.dev && staged.ino === expected.ino && !staged.isSymbolicLink())
+				exactRemoveSessionStorageLockPath(stagedPath, staged, sha256);
+		} catch {
+			// The staged fallback link was already removed.
+		}
 	}
+	return true;
 }
 
 export class FileSessionStorage implements SessionStorage {
@@ -1652,7 +1712,8 @@ export class FileSessionStorage implements SessionStorage {
 			const token = randomUUID();
 			const stagedPath = `${lockPath}.${token}.owner.tmp`;
 			let fd: number | undefined;
-			let stagedIdentity: { dev: bigint; ino: bigint } | undefined;
+			let stagedIdentity: fs.BigIntStats | undefined;
+			let ownerDigest: string | undefined;
 			let published = false;
 			try {
 				fd = fs.openSync(
@@ -1661,8 +1722,7 @@ export class FileSessionStorage implements SessionStorage {
 					0o600,
 				);
 				secureOwnerOnlyFileDescriptor(stagedPath, fd, "apply", undefined);
-				const opened = fs.fstatSync(fd, { bigint: true });
-				stagedIdentity = { dev: opened.dev, ino: opened.ino };
+				stagedIdentity = fs.fstatSync(fd, { bigint: true });
 				const probe = probeSessionStorageLockOwner(process.pid);
 				const owner: SessionStorageLockOwner = {
 					pid: process.pid,
@@ -1670,6 +1730,7 @@ export class FileSessionStorage implements SessionStorage {
 					token,
 				};
 				const bytes = Buffer.from(`${JSON.stringify(owner)}\n`, "utf8");
+				ownerDigest = createHash("sha256").update(bytes).digest("hex");
 				let offset = 0;
 				while (offset < bytes.byteLength) {
 					const written = fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
@@ -1678,8 +1739,7 @@ export class FileSessionStorage implements SessionStorage {
 				}
 				fs.fsyncSync(fd);
 				secureOwnerOnlyFileDescriptor(stagedPath, fd, "verify", undefined);
-				const staged = fs.fstatSync(fd, { bigint: true });
-				stagedIdentity = { dev: staged.dev, ino: staged.ino };
+				stagedIdentity = fs.fstatSync(fd, { bigint: true });
 				let outcome = classifyNativePublishOutcome(
 					nativeSessionStorage().renameNoReplacePath(stagedPath, lockPath),
 				);
@@ -1691,7 +1751,7 @@ export class FileSessionStorage implements SessionStorage {
 				if (!outcome.ok) {
 					fs.closeSync(fd);
 					fd = undefined;
-					unlinkOwnedStagedSync(stagedPath, stagedIdentity);
+					exactRemoveSessionStorageLockPath(stagedPath, stagedIdentity, ownerDigest);
 					if (outcome.reason === "destination_exists") {
 						if (attempt === 0 && reclaimStaleSessionStorageLockSync(lockPath)) continue;
 						return undefined;
@@ -1699,34 +1759,87 @@ export class FileSessionStorage implements SessionStorage {
 					throw new Error(`exclusive_lock_publish_rejected:${outcome.reason}`);
 				}
 				published = true;
-				if (linkPublished) unlinkOwnedStagedSync(stagedPath, stagedIdentity);
-				secureOwnerOnlyFileDescriptor(lockPath, fd, "verify", undefined);
-				const expected = fs.fstatSync(fd, { bigint: true });
-				if (expected.nlink !== 1n) throw new Error("exclusive_lock_identity_ambiguous");
+				fs.closeSync(fd);
+				fd = undefined;
+				if (linkPublished) {
+					const stagedNamed = fs.lstatSync(stagedPath, { bigint: true });
+					if (
+						stagedNamed.dev !== stagedIdentity.dev ||
+						stagedNamed.ino !== stagedIdentity.ino ||
+						stagedNamed.isSymbolicLink()
+					)
+						throw new Error("exclusive_lock_staging_identity_changed");
+					unlinkOwnedStagedSync(stagedPath, stagedIdentity);
+					if (fs.existsSync(stagedPath)) throw new Error("exclusive_lock_staging_cleanup_failed");
+				}
+				const publishedFd = fs.openSync(lockPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+				let expected: fs.BigIntStats;
+				try {
+					expected = fs.fstatSync(publishedFd, { bigint: true });
+					if (
+						!expected.isFile() ||
+						expected.isSymbolicLink() ||
+						expected.dev !== stagedIdentity.dev ||
+						expected.ino !== stagedIdentity.ino ||
+						expected.nlink !== 1n ||
+						expected.size !== BigInt(bytes.byteLength)
+					)
+						throw new Error("exclusive_lock_identity_changed");
+					const installed = Buffer.allocUnsafe(bytes.byteLength);
+					let readOffset = 0;
+					while (readOffset < installed.byteLength) {
+						const read = fs.readSync(
+							publishedFd,
+							installed,
+							readOffset,
+							installed.byteLength - readOffset,
+							readOffset,
+						);
+						if (read === 0) throw new Error("exclusive_lock_short_read");
+						readOffset += read;
+					}
+					if (createHash("sha256").update(installed).digest("hex") !== ownerDigest)
+						throw new Error("exclusive_lock_content_changed");
+				} finally {
+					fs.closeSync(publishedFd);
+				}
 				fsyncDirectorySync(dir);
-				const ownedFd = fd;
 				let released = false;
 				return {
 					releaseSync: () => {
 						if (released) return;
 						released = true;
-						try {
+						if (!exactRemoveSessionStorageLockPath(lockPath, expected, ownerDigest!)) {
 							try {
-								const named = fs.lstatSync(lockPath, { bigint: true });
-								if (named.dev === expected.dev && named.ino === expected.ino && !named.isSymbolicLink())
-									fs.unlinkSync(lockPath);
+								const current = fs.lstatSync(lockPath, { bigint: true });
+								if (current.dev === expected.dev && current.ino === expected.ino)
+									throw new Error("exclusive_lock_release_failed");
 							} catch (error) {
 								if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 							}
-						} finally {
-							fs.closeSync(ownedFd);
 						}
 					},
 				};
 			} catch (error) {
-				if (published && stagedIdentity) unlinkOwnedStagedSync(lockPath, stagedIdentity);
-				if (stagedIdentity) unlinkOwnedStagedSync(stagedPath, stagedIdentity);
 				if (fd !== undefined) fs.closeSync(fd);
+				if (published && stagedIdentity && ownerDigest) {
+					try {
+						const named = fs.lstatSync(lockPath, { bigint: true });
+						if (named.dev === stagedIdentity.dev && named.ino === stagedIdentity.ino)
+							exactRemoveSessionStorageLockPath(lockPath, named, ownerDigest);
+					} catch {
+						// The published name is absent or belongs to another owner.
+					}
+				}
+				if (stagedIdentity && ownerDigest) {
+					try {
+						const named = fs.lstatSync(stagedPath, { bigint: true });
+						if (named.dev === stagedIdentity.dev && named.ino === stagedIdentity.ino)
+							exactRemoveOwnedSessionStorageLockPath(stagedPath, stagedIdentity);
+					} catch {
+						// The staged name was consumed or removed.
+					}
+				}
 				throw error;
 			}
 		}
