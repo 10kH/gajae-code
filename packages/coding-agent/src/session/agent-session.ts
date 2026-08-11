@@ -10905,8 +10905,8 @@ export class AgentSession {
 				try {
 					await initializeLocalRoot({
 						getArtifactsDir: () => forkedManager.getArtifactsDir(),
-						isManagedDestination: () => false,
-						getManagedLegacyLocalMigrationSource: () => null,
+						isManagedDestination: () => forkedManager.isManagedDestination(),
+						getManagedLegacyLocalMigrationSource: () => forkedManager.getManagedLegacyLocalMigrationSource(),
 						getSessionId: () => forkedManager.getSessionId(),
 					});
 					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();

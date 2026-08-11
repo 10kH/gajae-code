@@ -2230,6 +2230,18 @@ it("rejects malformed auto-small explicit resumes through strict inspection", as
 		SessionManager.open(sessionFile, SessionManager.explicitDestination("/sessions"), storage, "copy-retain", "auto"),
 	).rejects.toThrow(/Could not open session|malformed/);
 });
+
+it("rejects schema-invalid auto-small explicit resumes", async () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/auto-small-explicit-schema-invalid.jsonl";
+	storage.writeTextSync(
+		sessionFile,
+		`${JSON.stringify({ type: "session", version: 5, id: "auto-small-explicit-schema", timestamp: "0", cwd: "/cwd" })}\n${JSON.stringify({ type: "custom", id: "invalid", parentId: null, timestamp: "0", data: {} })}\n`,
+	);
+	await expect(
+		SessionManager.open(sessionFile, SessionManager.explicitDestination("/sessions"), storage, "copy-retain", "auto"),
+	).rejects.toThrow("malformed");
+});
 it("rejects malformed auto-small managed resumes through the strict eager path", async () => {
 	const tempDir = TempDir.createSync("@pi-session-auto-small-");
 	const storage = new FileSessionStorage();
@@ -2347,6 +2359,44 @@ it("switches to an oversized-guarded cold target through bounded adoption", asyn
 		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
 		SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
 		await manager.close();
+	}
+});
+
+it("continues an oversized-guarded auto session through bounded admission", async () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/2026-01-01T00-00-00-000Z_bounded-continue.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "bounded-continue", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1;
+	SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+	let manager: SessionManager | undefined;
+	try {
+		manager = await SessionManager.continueRecent(
+			"/cwd",
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"auto",
+		);
+		expect(manager.getSessionId()).toBe("bounded-continue");
+		expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+	} finally {
+		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
+		SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
+		await manager?.close();
 	}
 });
 

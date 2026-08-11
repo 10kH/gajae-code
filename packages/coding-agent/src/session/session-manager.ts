@@ -17017,6 +17017,11 @@ export class SessionManager {
 		return materializedEntries;
 	}
 
+	/** Whether this manager contains persisted history without forcing cold hydration. */
+	hasHistoryEntries(): boolean {
+		if (this.#coldSidecarActive()) return true;
+		return this.#fileEntries.some(entry => entry.type !== "session");
+	}
 	getEntries(): SessionEntry[] {
 		this.#publicMaterializerCallCount++;
 		this.#getEntriesMaterializerCallCount++;
@@ -17504,21 +17509,21 @@ export class SessionManager {
 		return opened.path;
 	}
 
-	async #cleanupFailedForkDestination(sessionFile: string): Promise<void> {
+	async #cleanupFailedForkDestination(
+		sessionFile: string,
+		expectedTranscript?: ManagedFileSnapshot,
+		expectedArtifacts?: native.NativeDirectoryTreeSnapshot,
+	): Promise<void> {
 		this.#releaseManagedSidecarCache();
 		if (this.destination.kind !== "managed") {
 			await this.#storage.deleteSessionWithArtifacts(sessionFile);
 			return;
 		}
 		const store = this.#managedTranscriptStore(sessionFile);
+		const transcriptName = path.basename(sessionFile);
 		const artifactName = path.basename(sessionFile.slice(0, -6));
-		try {
-			const artifactSnapshot = store.captureTree(artifactName);
-			store.removeTreeExpected(artifactName, artifactSnapshot);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		}
-		store.removeIfExistsDescriptor(path.basename(sessionFile));
+		if (expectedArtifacts) store.removeTreeExpected(artifactName, expectedArtifacts);
+		if (expectedTranscript) store.removeExpected(transcriptName, expectedTranscript);
 	}
 
 	async #tryForkFromBoundedSource(sourcePath: string, expectedIdentity?: ResumeSessionIdentity): Promise<boolean> {
@@ -17631,6 +17636,8 @@ export class SessionManager {
 			securityContext: this.destination.kind === "managed" ? this.destination.securityContext : undefined,
 		});
 		let published = false;
+		let managedPublishedTranscript: ManagedFileSnapshot | undefined;
+		let managedPublishedArtifacts: native.NativeDirectoryTreeSnapshot | undefined;
 		try {
 			let ordinal = 0;
 			const copyHash = crypto.createHash("sha256");
@@ -17680,6 +17687,12 @@ export class SessionManager {
 			if (this.destination.kind === "managed") this.#managedTranscriptStore(fresh.sessionFile).assertBound();
 			staged.publishNoReplace();
 			published = true;
+			if (this.destination.kind === "managed") {
+				managedPublishedTranscript =
+					this.#managedTranscriptStore(fresh.sessionFile).readExpected(path.basename(fresh.sessionFile)) ??
+					undefined;
+				if (!managedPublishedTranscript) throw new Error("managed_fork_transcript_publish_missing");
+			}
 			if (copyResult.stat) {
 				const current = this.#storage.statSync(sourcePath);
 				if (!sameDescriptor(copyResult.stat, current)) throw new Error("fork_source_identity_changed");
@@ -17687,6 +17700,10 @@ export class SessionManager {
 				throw new Error("fork_source_identity_changed");
 			}
 			await this.copyArtifactsForFork(sourcePath, fresh.sessionFile);
+			if (this.destination.kind === "managed" && this.#storage.existsSync(fresh.sessionFile.slice(0, -6)))
+				managedPublishedArtifacts = this.#managedTranscriptStore(fresh.sessionFile).captureTree(
+					path.basename(fresh.sessionFile.slice(0, -6)),
+				);
 			await this.#initSessionFile(fresh.sessionFile);
 			writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
 			return true;
@@ -17696,7 +17713,12 @@ export class SessionManager {
 			} catch {
 				// Preserve the fork failure.
 			}
-			if (published) await this.#cleanupFailedForkDestination(fresh.sessionFile);
+			if (published)
+				await this.#cleanupFailedForkDestination(
+					fresh.sessionFile,
+					managedPublishedTranscript,
+					managedPublishedArtifacts,
+				);
 			throw error;
 		}
 	}
@@ -17778,6 +17800,7 @@ export class SessionManager {
 			securityContext: this.destination.kind === "managed" ? this.destination.securityContext : undefined,
 		});
 		let published = false;
+		let managedPublishedTranscript: ManagedFileSnapshot | undefined;
 		try {
 			let writeOrdinal = 0;
 			snapshot.forEachLine(line => {
@@ -17805,17 +17828,23 @@ export class SessionManager {
 			if (this.destination.kind === "managed") this.#managedTranscriptStore(fresh.sessionFile).assertBound();
 			staged.publishNoReplace();
 			published = true;
+			if (this.destination.kind === "managed") {
+				managedPublishedTranscript =
+					this.#managedTranscriptStore(fresh.sessionFile).readExpected(path.basename(fresh.sessionFile)) ??
+					undefined;
+				if (!managedPublishedTranscript) throw new Error("managed_fork_transcript_publish_missing");
+			}
 			const copyDescriptor = snapshot.getLastReadStat();
 			if (snapshot.storage instanceof FileSessionStorage && copyDescriptor) {
 				const current = snapshot.storage.statSync(snapshot.sourcePath);
 				if (!sameDescriptor(copyDescriptor, current)) {
-					await this.#cleanupFailedForkDestination(fresh.sessionFile);
+					await this.#cleanupFailedForkDestination(fresh.sessionFile, managedPublishedTranscript);
 					return { kind: "error", reason: "identity-mismatch" };
 				}
 			} else {
 				const afterWrite = snapshot.revalidate();
 				if (afterWrite.kind !== "valid") {
-					await this.#cleanupFailedForkDestination(fresh.sessionFile);
+					await this.#cleanupFailedForkDestination(fresh.sessionFile, managedPublishedTranscript);
 					return afterWrite;
 				}
 			}
@@ -17828,7 +17857,7 @@ export class SessionManager {
 			} catch {
 				// Preserve the captured-fork failure.
 			}
-			if (published) await this.#cleanupFailedForkDestination(fresh.sessionFile);
+			if (published) await this.#cleanupFailedForkDestination(fresh.sessionFile, managedPublishedTranscript);
 			throw error;
 		}
 	}
@@ -17930,10 +17959,39 @@ export class SessionManager {
 					process.platform !== "win32" &&
 					sourceSize !== undefined &&
 					sourceSize >= autoModeMinTranscriptBytes());
-			const maxBytes = boundedAdmission ? BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES : RESUME_TRANSCRIPT_MAX_BYTES;
-			const inspected = boundedAdmission
-				? inspectTranscriptHeaderBounded(filePath, storage, maxBytes)
-				: inspectTranscriptBounded(filePath, storage, maxBytes);
+			if (!boundedAdmission) {
+				const inspected = inspectResumeSessionFile(filePath, storage);
+				if ("kind" in inspected) {
+					if (inspected.reason === "missing") {
+						const manager = new SessionManager(
+							getProjectDir(),
+							destination.directory,
+							true,
+							storage,
+							destination,
+						);
+						manager.#sessionMemoryMode = sessionMemoryMode;
+						await manager.#initSessionFile(filePath, true);
+						return manager;
+					}
+					if (inspected.reason === "oversized") throw new SessionTranscriptOversizedError(inspected.size ?? 0);
+					throw new Error(`Could not open session: ${inspected.reason}`);
+				}
+				const header = inspected.entries[0] as SessionHeader;
+				const manager = new SessionManager(
+					header.cwd || getProjectDir(),
+					destination.directory,
+					true,
+					storage,
+					destination,
+				);
+				manager.#sessionMemoryMode = sessionMemoryMode;
+				await manager.#hydrateExistingSession(filePath, inspected.entries, inspected.migrationApplied);
+				await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
+				manager.buildSessionContext();
+				return manager;
+			}
+			const inspected = inspectTranscriptHeaderBounded(filePath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
 			if (!inspected.ok) {
 				if (inspected.error.reason === "missing") {
 					const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
@@ -18891,6 +18949,32 @@ export class SessionManager {
 		const destination = destinationFor(cwd, destinationInput, storage);
 		const dir = destination.directory;
 		const openSelectedStrictly = async (selectedPath: string): Promise<SessionManager | undefined> => {
+			let selectedSize: number | undefined;
+			try {
+				selectedSize = storage.statSync(selectedPath).size;
+			} catch {
+				// The strict read-only inspection below reports the stable failure.
+			}
+			const boundedSelected =
+				selectedSize !== undefined &&
+				selectedSize > eagerHydrationMaxBytes() &&
+				selectedSize <= BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES &&
+				(sessionMemoryMode === "enabled" ||
+					(sessionMemoryMode === "auto" &&
+						process.platform !== "win32" &&
+						selectedSize >= autoModeMinTranscriptBytes()));
+			if (boundedSelected) {
+				const manager = await SessionManager.open(
+					selectedPath,
+					destination,
+					storage,
+					migrationPolicy,
+					sessionMemoryMode,
+				);
+				if (canContinuePersistedHistory(manager.buildSessionContext().messages)) return manager;
+				await manager.close();
+				return undefined;
+			}
 			const inspected = await SessionManager.inspectSessionTailReadOnly(selectedPath, storage);
 			if (inspected.kind === "error") {
 				if (inspected.reason === "oversized") throw new SessionTranscriptOversizedError(inspected.size ?? 0);
