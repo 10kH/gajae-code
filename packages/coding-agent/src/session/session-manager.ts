@@ -15959,6 +15959,7 @@ export class SessionManager {
 		let sidecarAppendCharge = 0;
 		let sidecarTailCharge = 0;
 		const activeRuntime = this.#sidecarRuntime;
+		const coldSidecarWasActive = this.#coldSidecarActive();
 		let transcriptDurableForSidecar = this.destination.kind === "managed";
 		let transcriptDescriptor: SessionStorageStat | undefined;
 		if (activeRuntime && this.#coldSidecarActive()) {
@@ -16023,7 +16024,9 @@ export class SessionManager {
 		}
 		const activateColdAfterAppend =
 			!this.#coldSidecarActive() &&
-			this.#sessionMemoryMode === "auto" &&
+			!coldSidecarWasActive &&
+			(!activeRuntime || activeRuntime.sidecarIneligible) &&
+			(this.#sessionMemoryMode === "auto" || this.#sessionMemoryMode === "enabled") &&
 			this.#effectiveSessionMemoryMode() === "enabled";
 		if (
 			this.destination.kind !== "managed" &&
@@ -18522,6 +18525,10 @@ export class SessionManager {
 					manager.#retireEphemeralArtifacts();
 					const content = `${JSON.stringify(prepareEntryForPersistenceSync(fresh.header, manager.#blobStore))}\n`;
 					managedInspectionStore.publishNoReplaceSync(path.basename(filePath), Buffer.from(content, "utf8"));
+					if (manager.#effectiveSessionMemoryMode() !== "off") {
+						manager.#buildDisposableSidecars(manager.#fileEntries);
+						if (manager.#coldSidecarActive()) manager.#retireColdEntries();
+					}
 					manager.#flushed = true;
 					manager.#ensuredOnDisk = true;
 					writeTerminalBreadcrumb(manager.cwd, filePath);
