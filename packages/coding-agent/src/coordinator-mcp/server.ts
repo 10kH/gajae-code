@@ -2888,13 +2888,40 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			session.endpoint_generation > 0
 				? session.endpoint_generation
 				: null;
+		const workspace = optionalString(session.broker_workspace);
+		const incarnation = optionalString(session.endpoint_incarnation);
 		if (!sessionId || generation === null)
 			throw new SdkClientError("not_found", "Coordinator session has no usable endpoint generation.");
+		if (!workspace || !incarnation)
+			throw new SdkClientError("endpoint_stale", "Coordinator session has no exact endpoint authority.");
+		let persistedWorkspace: string;
+		try {
+			persistedWorkspace = await canonicalBrokerWorkspace(workspace);
+		} catch {
+			throw new SdkClientError("endpoint_stale", "Coordinator session workspace authority is unavailable.");
+		}
 		await ensureRouterReady();
 		await router.reconcile();
 		const attachment = router.attachment(sessionId, generation);
 		if (!attachment?.isCurrent())
 			throw new SdkClientError("endpoint_stale", "Coordinator session attachment is unavailable or stale.");
+		let authority: BrokerSessionAuthority;
+		try {
+			authority = await exactBrokerSessionAuthority(sessionId, persistedWorkspace);
+		} catch (error) {
+			if (error instanceof SdkClientError && (error.code === "not_found" || error.code === "endpoint_stale"))
+				throw new SdkClientError(
+					"endpoint_stale",
+					"Coordinator session endpoint authority is unavailable or stale.",
+				);
+			throw error;
+		}
+		if (
+			!sameCanonicalPath(authority.workspace, persistedWorkspace, platform) ||
+			authority.endpointGeneration !== generation ||
+			authority.endpointIncarnation !== incarnation
+		)
+			throw new SdkClientError("endpoint_stale", "Coordinator session endpoint authority changed.");
 		return { sessionId, generation, attachment };
 	}
 
@@ -2919,8 +2946,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		} catch (error) {
 			if (error instanceof SessionRouterError)
 				throw new SdkClientError(
-					"endpoint_stale",
-					"Coordinator session attachment changed before request completion.",
+					error.phase === "ambiguous" ? "ambiguous" : "endpoint_stale",
+					error.phase === "ambiguous"
+						? "Coordinator session request may have been accepted before attachment changed."
+						: "Coordinator session attachment changed before request dispatch.",
+					error,
 				);
 			throw error;
 		}
@@ -3082,6 +3112,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return error?.code === UNOBSERVED_COMPENSATION_CODE;
 	}
 
+	function isRouterRequestAmbiguous(response: Record<string, unknown>): boolean {
+		if (response.ok !== false) return false;
+		return asRecord(response.error)?.code === "ambiguous";
+	}
+
 	function sdkError(error: unknown): Record<string, unknown> {
 		if (error instanceof SdkClientError) return { ok: false, error: { code: error.code, message: error.message } };
 		return {
@@ -3111,8 +3146,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	 * the remote effect settled. A tool may declare such a response nonterminal,
 	 * which returns it to this caller while the receipt stays `in_progress`, so
 	 * an exact same-key retry re-runs the observation under the same request
-	 * digest. The default declares nothing nonterminal, so every other tool keeps
-	 * its existing caching, conflict, and replay behaviour unchanged.
+	 * digest. Router post-send ambiguity is nonterminal by default; every other
+	 * tool-specific exception is supplied by its handler.
 	 */
 	async function withToolIdempotency(
 		tool: string,
@@ -3120,7 +3155,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		canonicalArgs: Record<string, unknown>,
 		operation: () => Promise<Record<string, unknown>>,
 		recoverInProgress = false,
-		isNonterminal: (response: Record<string, unknown>) => boolean = () => false,
+		isNonterminal: (response: Record<string, unknown>) => boolean = isRouterRequestAmbiguous,
 	): Promise<Record<string, unknown>> {
 		const keyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
 		const requestDigest = createHash("sha256")
@@ -3759,9 +3794,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			const existing = transaction.requests.prompts[keyDigest];
 			if (existing) {
 				if (existing.request_digest !== requestDigest) throw new Error("idempotency_conflict");
-				if (existing.phase === "remote_started" || existing.phase === "uncertain")
-					throw new Error("terminal_uncertain");
-				return;
+				if (existing.phase === "uncertain") throw new Error("terminal_uncertain");
+				// The host deduplicates this key, so a post-send Router ambiguity may re-dispatch it to recover the receipt.
+				if (existing.phase === "remote_started") {
+					existing.updated_at = new Date().toISOString();
+					return;
+				}
 			}
 			const now = new Date().toISOString();
 			transaction.requests.prompts[keyDigest] = {
@@ -4944,7 +4982,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						return response;
 					},
 					true,
-					isUnobservedCompensation,
+					response => isUnobservedCompensation(response) || isRouterRequestAmbiguous(response),
 				);
 			}
 			if (name === "gjc_coordinator_activate_session") {
@@ -5043,7 +5081,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					 * `already` rather than publishing readiness twice.
 					 */
 					true,
-					isUnknownActivationOutcome,
+					response => isUnknownActivationOutcome(response) || isRouterRequestAmbiguous(response),
 				);
 			}
 			if (name === "gjc_coordinator_send_prompt") {
@@ -5133,6 +5171,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								session_state: publicCoordinatorSessionState(await readSessionState(namespaceDir, sessionId)),
 							};
 						}),
+					true,
 				);
 			}
 			if (name === "gjc_coordinator_read_turn") {

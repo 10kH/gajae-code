@@ -75,6 +75,7 @@ function createRouterHarness(options: { send?: (frame: Record<string, unknown>) 
 	const sent: Record<string, unknown>[] = [];
 	const attachment: SessionAttachment = {
 		sessionId: "session-1",
+		connectionId: "router-connection-1",
 		generation: 1,
 		isCurrent: () => current,
 		send: async frame => {
@@ -283,7 +284,7 @@ test("ACP lifecycle aliases forward caller idempotency keys outside operation in
 	await adapter.close();
 });
 
-test("ACP reverse dispatch derives Router identity from exact frames and rejects duplicates", async () => {
+test("ACP reverse dispatch captures Router identity before reverse dispatch and rejects duplicates", async () => {
 	const harness = createRouterHarness();
 	const callbacks: Array<{ method: string; params: Record<string, unknown> }> = [];
 	const response = Promise.withResolvers<unknown>();
@@ -310,6 +311,7 @@ test("ACP reverse dispatch derives Router identity from exact frames and rejects
 			payload: { method: "ui.select", payload: { options: ["yes"] } },
 		});
 	await adapter.start();
+	expect(adapter.connectionId).toBe(connectionId);
 	try {
 		reverse("stale-lease", connectionId, "ui", "stale-lease");
 		reverse("wrong-capability", connectionId, "terminal", "lease-1");

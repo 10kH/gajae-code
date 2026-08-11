@@ -204,6 +204,8 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const controlOperations: string[] = [];
 	const updates: SessionNotification[] = [];
 	const providerRegistrations: Array<Record<string, unknown>> = [];
+	let closeSessionTransport: (() => void) | undefined;
+	let reconnectingSessionTransport = false;
 	let promptSocket: { send(message: string): void } | undefined;
 	let abortAcknowledged = true;
 	let promptDeliveredWhileBusy = false;
@@ -227,11 +229,14 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		},
 		websocket: {
 			open(socket) {
-				socket.send(JSON.stringify({ type: "hello", connectionId: "acp-contract" }));
+				const connectionId = reconnectingSessionTransport ? "acp-contract-reconnected" : "acp-contract";
+				reconnectingSessionTransport = false;
+				socket.send(JSON.stringify({ type: "hello", connectionId }));
 			},
 			message(socket, raw) {
 				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
 				if (frame.type === "register_provider") {
+					closeSessionTransport = () => socket.close();
 					providerRegistrations.push(frame);
 					socket.send(
 						JSON.stringify({ type: "register_provider_result", id: frame.id, ok: true, leaseId: "lease" }),
@@ -666,6 +671,22 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 			],
 		}),
 	]);
+	await waitFor(
+		() => closeSessionTransport !== undefined && providerRegistrations.length > 0,
+		"ACP provider registration",
+	);
+	const initialProviderRegistrationCount = providerRegistrations.length;
+	reconnectingSessionTransport = true;
+	closeSessionTransport!();
+	await waitFor(
+		() => providerRegistrations.length > initialProviderRegistrationCount,
+		"ACP provider re-registration after transport reconnect",
+	);
+	expect(providerRegistrations.slice(initialProviderRegistrationCount)).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({ connectionId: "acp-contract-reconnected", expectedLeaseId: "lease" }),
+		]),
+	);
 	await waitFor(
 		() => updates.some(update => update.update.sessionUpdate === "available_commands_update"),
 		"ACP available commands",

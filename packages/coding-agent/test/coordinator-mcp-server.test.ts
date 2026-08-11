@@ -35,7 +35,7 @@ import {
 import type { SessionIndex } from "../src/sdk/broker/session-index";
 import { UnsupportedStateVersionError } from "../src/sdk/broker/state-version";
 import { type SdkClient, SdkClientError } from "../src/sdk/client/client";
-import type { SessionRouterClient } from "../src/sdk/router";
+import { type SessionRouterClient, SessionRouterError } from "../src/sdk/router";
 import {
 	cleanupFixtureRoot,
 	createFixtureBrokerEnvironment,
@@ -688,6 +688,31 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			fs.readdir(path.join(root, ".gjc", "coordinator-state", "local", "repo", "turns")),
 		).rejects.toMatchObject({ code: "ENOENT" });
 	});
+	it("keeps post-send Router ambiguity retryable under the same prompt idempotency key", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let attempts = 0;
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			controlResult: control => {
+				if (control.operation === "turn.prompt" && attempts++ === 0)
+					throw new SessionRouterError("ambiguous", "response crossed attachment rotation");
+				return { accepted: true, command_id: "reconciled-command", turn_id: "reconciled-turn" };
+			},
+		});
+		await registerSdkSession(server, root);
+		const args = {
+			session_id: "visible-session",
+			prompt: "reconcile this prompt",
+			idempotency_key: "ambiguous-prompt",
+			allow_mutation: true,
+		};
+		const ambiguous = await server.callTool("gjc_coordinator_send_prompt", args);
+		expect(ambiguous).toMatchObject({ ok: false, error: { code: "ambiguous" } });
+		const reconciled = await server.callTool("gjc_coordinator_send_prompt", args);
+		expect(reconciled).toMatchObject({ ok: true, result: { accepted: true } });
+		expect(await server.callTool("gjc_coordinator_send_prompt", args)).toEqual(reconciled);
+		expect(controls.filter(control => control.operation === "turn.prompt")).toHaveLength(2);
+	});
 	it("keeps prompt acknowledgement timing under Router ownership", async () => {
 		for (const [configuredTimeoutMs, expectedTimeoutMs] of [
 			[undefined, 10_000],
@@ -1117,7 +1142,21 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			recordPath,
 			JSON.stringify({ ...record, ephemeral: true, created_at: new Date(Date.now() - 31 * 60_000).toISOString() }),
 		);
-		sessions[0]!.endpointMtimeMs = 2;
+		const successor = await prepareExactSessionAuthority({
+			agentDir: path.join(root, "agent-global"),
+			cwd: root,
+			sessionId: "visible-session",
+			url: "ws://sdk-successor.example.test",
+			token: "successor-token",
+			endpointGeneration: 1,
+		});
+		const endpointPath = path.join(root, ".gjc", "state", "sdk", "visible-session.json");
+		await fs.utimes(endpointPath, 0.002, 0.002);
+		sessions[0] = {
+			...sessions[0]!,
+			pid: successor.pid,
+			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+		};
 
 		await expect(
 			server.callTool("gjc_coordinator_send_prompt", {
@@ -1136,6 +1175,49 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		expect(
 			controls.filter(control => control.operation === "turn.prompt" || control.operation === "session.close"),
 		).toEqual([]);
+	});
+	it("fails closed when a same-generation successor moves to a different broker workspace", async () => {
+		const root = await tempRoot();
+		const otherWorkspace = path.join(root, "successor-workspace");
+		await fs.mkdir(otherWorkspace);
+		const controls: SdkControl[] = [];
+		const sessions = [
+			{
+				sessionId: "visible-session",
+				locator: { repo: root },
+				live: true,
+				endpointGeneration: 1,
+				pid: 101,
+				endpointMtimeMs: 1,
+			},
+		];
+		const server = await createSdkControlServer(root, controls, undefined, undefined, sessions);
+		await registerSdkSession(server, root);
+		const successor = await prepareExactSessionAuthority({
+			agentDir: path.join(root, "agent-global"),
+			cwd: otherWorkspace,
+			sessionId: "visible-session",
+			url: "ws://sdk-successor.example.test",
+			token: "successor-token",
+			endpointGeneration: 1,
+		});
+		const endpointPath = path.join(otherWorkspace, ".gjc", "state", "sdk", "visible-session.json");
+		await fs.utimes(endpointPath, 0.003, 0.003);
+		sessions[0] = {
+			...sessions[0]!,
+			locator: { repo: otherWorkspace },
+			pid: successor.pid,
+			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+		};
+		await expect(
+			server.callTool("gjc_coordinator_send_prompt", {
+				session_id: "visible-session",
+				prompt: "must not reach successor workspace",
+				idempotency_key: "stale-workspace-prompt",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: false, error: { code: "endpoint_stale" } });
+		expect(controls.filter(control => control.operation === "turn.prompt")).toEqual([]);
 	});
 	it("rejects a stale same-generation attachment before dispatch", async () => {
 		const root = await tempRoot();

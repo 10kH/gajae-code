@@ -139,7 +139,7 @@ export class AcpSdkAdapter {
 	#unsubscribeReconnectFailed?: () => void;
 	#heartbeat?: NodeJS.Timeout;
 	#connectionId?: string;
-	/** Router transport identity learned only from an exact reverse frame. */
+	/** Router transport identity captured before reverse provider activation. */
 	#routerConnectionReady = false;
 
 	#leases = new Map<string, string>();
@@ -418,7 +418,9 @@ export class AcpSdkAdapter {
 				"operation_prohibited",
 				"Provider registration requires the current Router attachment.",
 			);
-		if (!this.#attachment?.isCurrent()) throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
+		const attachment = this.#attachment;
+		if (!attachment?.isCurrent()) throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
+		this.#captureRouterConnection(attachment);
 		const previousLeaseId = this.#leases.get(provider.capability);
 		const response = await this.#requestSession(
 			{
@@ -442,9 +444,11 @@ export class AcpSdkAdapter {
 		const activation = (async () => {
 			for (;;) {
 				const attachment = this.#attachment;
+				const connectionId = attachment?.connectionId;
 				try {
 					for (const provider of this.#providers) await this.registerProvider(provider);
-					if (this.#router && attachment !== this.#attachment) {
+					if (this.#router && (attachment !== this.#attachment || attachment?.connectionId !== connectionId)) {
+						this.#abortActiveReverseRequests();
 						this.#providersActivated = false;
 						continue;
 					}
@@ -502,6 +506,23 @@ export class AcpSdkAdapter {
 			await this.#reclaiming;
 		} finally {
 			this.#reclaiming = undefined;
+		}
+	}
+
+	#captureRouterConnection(attachment: SessionAttachment): void {
+		const connectionId = attachment.connectionId;
+		if (typeof connectionId !== "string" || connectionId.length === 0) {
+			this.#connectionId = undefined;
+			this.#routerConnectionReady = false;
+			this.#providersActivated = false;
+			return;
+		}
+		const changed = this.#connectionId !== undefined && this.#connectionId !== connectionId;
+		this.#connectionId = connectionId;
+		this.#routerConnectionReady = true;
+		if (changed) {
+			this.#providersActivated = false;
+			this.#abortActiveReverseRequests();
 		}
 	}
 
