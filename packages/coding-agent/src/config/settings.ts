@@ -1005,7 +1005,10 @@ export class Settings implements NotificationSettingsReader {
 	}
 
 	#editModelVariants(): Record<string, string> | undefined {
-		return (this.#merged.edit as { modelVariants?: Record<string, string> })?.modelVariants;
+		const variants = (this.#merged.edit as { modelVariants?: unknown })?.modelVariants;
+		return typeof variants === "object" && variants !== null && !Array.isArray(variants)
+			? (variants as Record<string, string>)
+			: undefined;
 	}
 
 	/**

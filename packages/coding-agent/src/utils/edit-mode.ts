@@ -68,8 +68,9 @@ export function detectModelEditFamily(modelId: string | undefined): ModelEditFam
 	const segments = normalized.split("/").filter(Boolean);
 	const model = segments.at(-1) ?? normalized;
 
-	if (/^codex(?:$|[-_.\d])|^gpt(?:[-_.\w]*[-_.])codex(?:$|[-_.\d])/.test(model)) return "codex";
-	if (/^(?:gpt|chatgpt)(?:$|[-_.\d])|(?:^|\.)openai\.(?:gpt|chatgpt)(?:$|[-_.\d])/.test(model)) return "gpt";
+	if (/^codex(?:$|[-_.\d])|^gpt-\d+(?:[-_.\w]*[-_.])codex(?:$|[-_.\d])/.test(model)) return "codex";
+	if (/^(?:gpt-(?:\d|oss(?:$|[-_.\d]))|chatgpt(?:$|[-_.]\d))|(?:^|\.)openai\.(?:gpt|chatgpt)(?:$|[-_.\d])/.test(model))
+		return "gpt";
 	if (/^claude(?:$|[-_.\d])|(?:^|\.)anthropic\.claude(?:$|[-_.\d])/.test(model)) return "claude";
 	if (/^deepseek(?:$|[-_.\d])|(?:^|\.)deepseek(?:$|[-_.\d])/.test(model)) return "deepseek";
 	if (/^qwen(?:$|[-_.\d])|(?:^|\.)qwen\.qwen(?:$|[-_.\d])/.test(model)) return "qwen";

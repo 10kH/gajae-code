@@ -82,6 +82,8 @@ describe("detectModelEditFamily", () => {
 		["moonshotai/kimi-k2.5", "kimi", "hashline"],
 		["custom/moonshot-v1-code", "kimi", "hashline"],
 		["custom/not-a-codex-model", "unknown", "hashline"],
+		["custom/gpt-not-a-codex-model", "unknown", "hashline"],
+		["custom/gptx-codex", "unknown", "hashline"],
 		["custom/company-code-model", "unknown", "hashline"],
 		["custom/not-a-glm-model", "unknown", "hashline"],
 	];
@@ -280,6 +282,12 @@ describe("Settings.matchEditVariantForModel", () => {
 		const settings = Settings.isolated({ "edit.modelVariants": modelVariants });
 		expect(settings.matchEditVariantForModel("custom/__proto__")).toBeNull();
 		expect(settings.getEditVariantForModel("custom/__proto__")).toBeNull();
+	});
+
+	test("ignores invalid model variant containers", () => {
+		const settings = Settings.isolated({ "edit.modelVariants": ["replace"] as never });
+		expect(settings.matchEditVariantForModel("custom/0")).toBeNull();
+		expect(settings.getEditVariantForModel("custom/0")).toBeNull();
 	});
 
 	test("resolver consumes Settings match with model-override provenance", () => {
