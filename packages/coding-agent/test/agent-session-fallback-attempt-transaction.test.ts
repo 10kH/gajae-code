@@ -342,6 +342,26 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		]);
 	});
 
+	it("does not replay a typed empty response after a managed context handler participates", async () => {
+		const calls: string[] = [];
+		let handlerCalls = 0;
+		createSession(
+			(model, _context, _options) => {
+				calls.push(selector(model));
+				return zeroTokenEmptyStopStream(model);
+			},
+			3,
+			{ handler: "context", onHandler: () => handlerCalls++ },
+		);
+
+		await session!.prompt("do not replay an extension-observable empty response");
+		await session!.waitForIdle();
+
+		expect(handlerCalls).toBe(1);
+		expect(calls).toHaveLength(1);
+		expect(session!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "error" });
+	});
+
 	it("emits exhausted completion exactly once through the agent finalizer", async () => {
 		const { agent, primary, fallback } = createSession(model => failedStream(model), 3);
 		const terminalSpy = vi.spyOn(agent, "requestRunTerminal");

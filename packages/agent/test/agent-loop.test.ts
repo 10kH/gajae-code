@@ -1791,10 +1791,11 @@ describe("agentLoop - empty response overflow detection", () => {
 			],
 		});
 		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const events: AgentEvent[] = [];
 
 		const stream = agentLoop([createUserMessage("Hello")], context, config, undefined, mock.stream);
-		for await (const _ of stream) {
-			// drain
+		for await (const event of stream) {
+			events.push(event);
 		}
 
 		const messages = await stream.result();
@@ -1803,6 +1804,14 @@ describe("agentLoop - empty response overflow detection", () => {
 			stopReason: "error",
 			errorMessage: "Provider returned an empty response with zero token usage",
 			transportFailure: { kind: "transport", providerCode: "empty_response" },
+		});
+		const messageEnd = events.find(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
+				event.type === "message_end" && event.message.role === "assistant",
+		);
+		expect(messageEnd?.message).toMatchObject({
+			stopReason: "error",
+			errorMessage: "Provider returned an empty response with zero token usage",
 		});
 	});
 

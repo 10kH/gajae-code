@@ -176,17 +176,21 @@ function managedRetryableFailure(failure: unknown): boolean {
 	return trigger.class === "rate_limit" || trigger.class === "quota" || trigger.class === "server";
 }
 
-function isTypedEmptyResponseStop(message: AssistantMessage): boolean {
-	return (
-		message.stopReason === "stop" &&
-		message.content.length === 0 &&
-		message.usage.input === 0 &&
-		message.usage.output === 0 &&
-		message.usage.cacheRead === 0 &&
-		message.usage.cacheWrite === 0 &&
-		message.usage.totalTokens === 0 &&
-		managedTransportFailure(message)?.providerCode?.toLowerCase() === EMPTY_RESPONSE_PROVIDER_CODE
-	);
+function promoteTypedEmptyResponseStop(message: AssistantMessage): void {
+	if (
+		message.stopReason !== "stop" ||
+		message.content.length !== 0 ||
+		message.usage.input !== 0 ||
+		message.usage.output !== 0 ||
+		message.usage.cacheRead !== 0 ||
+		message.usage.cacheWrite !== 0 ||
+		message.usage.totalTokens !== 0 ||
+		managedTransportFailure(message)?.providerCode?.toLowerCase() !== EMPTY_RESPONSE_PROVIDER_CODE
+	) {
+		return;
+	}
+	message.stopReason = "error";
+	message.errorMessage = "Provider returned an empty response with zero token usage";
 }
 
 /**
@@ -1770,10 +1774,6 @@ async function runLoopBody(
 			}
 
 			const overflow = managedContextOverflow(message, config);
-			if (!overflow && isTypedEmptyResponseStop(message)) {
-				message.stopReason = "error";
-				message.errorMessage = "Provider returned an empty response with zero token usage";
-			}
 			if (config.fallbackManaged && overflow) {
 				transaction?.discard();
 				currentContext.messages.splice(contextMessageCount);
@@ -2438,6 +2438,7 @@ async function streamAssistantResponse(
 							const finalMessage = config.fallbackManaged
 								? managedAssistantShell(await finishResponse(), config.model)
 								: await finishResponse();
+							promoteTypedEmptyResponseStop(finalMessage);
 							if (addedPartial) {
 								context.messages[context.messages.length - 1] = finalMessage;
 							} else {

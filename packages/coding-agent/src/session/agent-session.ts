@@ -15981,12 +15981,13 @@ export class AgentSession {
 		if (!managedFallback && firstEventTimeout && this.#retryAttempt === 0) {
 			this.#firstEventTimeoutRetryStartedAt = Date.now();
 		}
-		if (
-			!managedFallback &&
-			emptyResponse &&
-			(assistantMessageHasVisibleOrToolContent(message) || !scope || !scopeWasClean)
-		) {
-			return false;
+		if (emptyResponse && (assistantMessageHasVisibleOrToolContent(message) || !scope || !scopeWasClean)) {
+			return managedOutcome
+				? {
+						type: "terminal",
+						terminal: { stopReason: "error", messages: [message] },
+					}
+				: false;
 		}
 		const requiresScopedFirstEventTimeout = managedFallback || !legacyRetryConfigured;
 		if (
@@ -16037,7 +16038,7 @@ export class AgentSession {
 		// Bare defaults retain their narrow watchdog and Codex admissions. A
 		// first-event timeout adds the typed, content-free, current-clean-scope
 		// requirement above; other transient watchdogs preserve legacy behavior.
-		const canReplayEmptyResponse = emptyResponse;
+		const canReplayEmptyResponse = emptyResponse && (this.#retryAttempt === 0 || this.#hasCleanRetryReplaySafety);
 		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential && !canReplayEmptyResponse) {
 			const bareDefaultCodexOverload = isBareDefaultCodexOverload(message);
 			const canReplayCodexOverload = bareDefaultCodexOverload;

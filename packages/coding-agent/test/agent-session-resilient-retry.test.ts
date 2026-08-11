@@ -1723,6 +1723,51 @@ describe("AgentSession resilient retry", () => {
 		expect(streamCalls).toBe(2);
 		expect(lastAssistant(session).stopReason).toBe("error");
 	});
+	it("does not replay a second bare-default empty response after auto_retry_start handlers participate", async () => {
+		let hookCalls = 0;
+		let streamCalls = 0;
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		session = buildBareStreamingSession({
+			streamFn: () => {
+				streamCalls++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const failure = assistantMessage(
+						model,
+						[],
+						"error",
+						"Provider returned an empty response with zero token usage",
+					);
+					failure.transportFailure = { kind: "transport", providerCode: "empty_response" };
+					stream.push({ type: "start", partial: failure });
+					stream.push({ type: "error", reason: "error", error: failure });
+				});
+				return stream;
+			},
+			extensionRunner: createExtensionRunner(
+				new Map([
+					[
+						"auto_retry_start",
+						[
+							async () => {
+								hookCalls++;
+							},
+						],
+					],
+				]),
+			),
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("bare-default auto-retry lifecycle empty response");
+		await session.waitForIdle();
+
+		expect(hookCalls).toBe(1);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(streamCalls).toBe(2);
+		expect(lastAssistant(session).stopReason).toBe("error");
+	});
 
 	it("retries provider stream idle stalls under a bare default config (single model)", async () => {
 		const requestedModels: string[] = [];

@@ -483,6 +483,8 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 
 			output.providerPayload = createOpenAIResponsesHistoryPayload(model.provider, nativeOutputItems);
 			if (isOpenCodeGoEmptyCompletedResponse(model, output, nativeOutputItems.length)) {
+				output.stopReason = "error";
+				output.errorMessage = "Provider returned an empty response with zero token usage";
 				output.transportFailure = {
 					kind: "transport",
 					providerCode: EMPTY_RESPONSE_PROVIDER_CODE,
@@ -492,7 +494,11 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
-			stream.push({ type: "done", reason: output.stopReason, message: output });
+			if (output.stopReason === "error") {
+				stream.push({ type: "error", reason: "error", error: output });
+			} else {
+				stream.push({ type: "done", reason: output.stopReason, message: output });
+			}
 			stream.end();
 		} catch (error) {
 			for (const block of output.content) delete (block as { index?: number }).index;
