@@ -18502,11 +18502,11 @@ export class SessionManager {
 			// Strict inspection below reports the stable failure.
 		}
 		const managedResumeBounded =
-			sessionMemoryMode === "enabled" ||
-			(sessionMemoryMode === "auto" &&
-				process.platform !== "win32" &&
-				managedSourceSize !== undefined &&
-				managedSourceSize >= autoModeMinTranscriptBytes());
+			managedSourceSize !== undefined &&
+			(sessionMemoryMode === "enabled" ||
+				(sessionMemoryMode === "auto" &&
+					process.platform !== "win32" &&
+					managedSourceSize >= autoModeMinTranscriptBytes()));
 		let strictManagedSmallInspection: ResumeInspectionSnapshot | undefined;
 		if (
 			managedResumeBounded &&

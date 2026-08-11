@@ -375,4 +375,23 @@ describe("managed strict-resume target races", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
+
+	it("initializes an initially missing managed target with bounded mode enabled", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-bounded-create-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "new.jsonl");
+		let manager: SessionManager | undefined;
+		try {
+			manager = await SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled");
+			expect(storage.existsSync(sourceFile)).toBe(true);
+			expect(manager.getSessionFile()).toBe(sourceFile);
+		} finally {
+			await manager?.close();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
 });
