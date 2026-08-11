@@ -1359,9 +1359,10 @@ type BoundedLineScanFailure = "read_failed" | "oversized_line" | "unterminated" 
  * path. Returns `undefined` only after every byte was consumed as a complete
  * newline-terminated line.
  */
+const boundedJsonLineDecoder = new TextDecoder("utf-8", { fatal: true });
 function decodeBoundedJsonLine(lineBytes: Uint8Array): string {
 	const length = lineBytes.at(-1) === 0x0a ? lineBytes.byteLength - 1 : lineBytes.byteLength;
-	return Buffer.from(lineBytes.buffer, lineBytes.byteOffset, length).toString("utf8");
+	return boundedJsonLineDecoder.decode(lineBytes.subarray(0, length));
 }
 
 function bytesStartWith(bytes: Uint8Array, prefix: Uint8Array): boolean {
@@ -17883,8 +17884,8 @@ export class SessionManager {
 			);
 			if (failure && !(failure === "aborted" && aborted)) throw new Error(`transcript_scan_${failure}`);
 			if (aborted) return;
-			if (!scanResult.stat || !resumeIdentityMatchesDescriptor(snapshot.identity, scanResult.stat))
-				throw new Error("identity-mismatch");
+			const terminalStat = scanResult.stat ?? managedSourceStorage.statSync(snapshot.sourcePath);
+			if (!resumeIdentityMatchesDescriptor(snapshot.identity, terminalStat)) throw new Error("identity-mismatch");
 			if (hash.digest("hex") !== snapshot.identity.sha256) throw new Error("identity-mismatch");
 		};
 		try {
