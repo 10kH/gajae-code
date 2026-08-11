@@ -80,6 +80,7 @@ import {
 	type LifecycleControlServerFactory,
 } from "./lifecycle-control-runtime";
 import type { OrchestratorDeps } from "./lifecycle-orchestrator";
+import { MasterDaemonClient } from "./master-daemon-client";
 import { NotificationOperatorRuntime, OperatorBackoffPolicy, OperatorEventRouter } from "./operator-runtime";
 import { RateLimitPool } from "./rate-limit-pool";
 import { type ListRecentSessionsResult, listRecentSessions } from "./recent-activity";
@@ -98,6 +99,7 @@ import {
 	TelegramAdoptionIntentStore,
 	type TelegramAdoptionTarget,
 } from "./telegram-adoption-intent";
+import { TelegramMasterChannelWorker } from "./telegram-master-channel-worker";
 import {
 	type AliasTable,
 	buildActionMarkdown,
@@ -4685,6 +4687,10 @@ export interface TelegramDaemonOptions {
 	pid?: number;
 	/** Liveness probe for skipping dead-PID endpoint records in {@link TelegramNotificationDaemon.scanRoots}. */
 	pidAlive?: (pid: number) => boolean;
+	/** Optional aggregate master endpoint; absent discovery is a no-op. */
+	master?: TelegramMasterClientOptions;
+	masterClient?: MasterDaemonClient;
+	createMasterClient?: () => MasterDaemonClient | Promise<MasterDaemonClient>;
 	pidIncarnation?: (pid: number) => string | undefined;
 	botApi?: BotApi;
 	control?: DaemonControlHooks;
@@ -4726,6 +4732,12 @@ export interface TelegramDaemonOptions {
 	topicRegistryAuthority?: TopicRegistryCasAuthority;
 	/** Stable host-local identity. Required whenever a shared authority is configured. */
 	installationHostId?: string;
+}
+
+export interface TelegramMasterClientOptions {
+	enabled?: boolean;
+	client?: MasterDaemonClient;
+	createClient?: () => MasterDaemonClient | Promise<MasterDaemonClient>;
 }
 
 interface StagedCallbackActivation {
@@ -5107,6 +5119,14 @@ export class TelegramNotificationDaemon {
 	private readonly fsImpl: TelegramDaemonFs;
 	private readonly botApi: BotApi;
 	private readonly effects = new TelegramEffectSupervisor();
+
+	private masterClient: MasterDaemonClient | undefined;
+	private masterWorker: TelegramMasterChannelWorker | undefined;
+	private masterBindings = new Map<string, { masterName: string; bindingId: string; remoteChannelId: string }>();
+	private masterAmbiguousBindings = new Set<string>();
+	private masterBindingDisposer: (() => void) | undefined;
+	private masterStartTask: Promise<void> | undefined;
+	private masterStopRequested = false;
 	private readonly topics = new TopicRegistry();
 	/** Stable host-local identity; never persisted in shared topic authority. */
 	private installationHostId: string;
@@ -5703,6 +5723,235 @@ export class TelegramNotificationDaemon {
 			backoff: this.pollConflictBackoff,
 			processUpdate: update => this.processTelegramUpdate(update),
 		});
+	}
+
+	private async ensureMasterWorker(): Promise<void> {
+		if (
+			this.opts.master?.enabled === false ||
+			this.masterWorker ||
+			this.masterStartTask ||
+			this.masterStopRequested ||
+			!this.running
+		)
+			return;
+		const task = this.startMasterWorker();
+		this.masterStartTask = task;
+		try {
+			await task;
+		} finally {
+			if (this.masterStartTask === task) this.masterStartTask = undefined;
+		}
+	}
+
+	private async startMasterWorker(): Promise<void> {
+		let client: MasterDaemonClient | undefined;
+		try {
+			client =
+				this.opts.masterClient ??
+				this.opts.master?.client ??
+				(await (this.opts.createMasterClient ?? this.opts.master?.createClient)?.()) ??
+				new MasterDaemonClient();
+			const worker = new TelegramMasterChannelWorker({
+				client,
+				provider: { chatId: this.opts.chatId, call: this.botApi.call.bind(this.botApi) },
+				chatId: this.opts.chatId,
+				resolveRemoteChannelId: input => client!.resolveRemoteChannelId?.(input),
+			});
+			this.masterClient = client;
+			this.masterWorker = worker;
+			this.masterBindingDisposer = client.onFrame(frame => {
+				if (frame.type === "master_snapshot") {
+					this.setMasterBindings(frame.masters);
+					return;
+				}
+				if (frame.type === "channel_updated") void this.refreshMasterBindings(client!).catch(() => undefined);
+			});
+			await worker.start();
+			if (this.masterStopRequested || !this.running) {
+				await worker.stop();
+				return;
+			}
+			try {
+				await this.refreshMasterBindings(client);
+			} catch (error) {
+				this.masterBindings.clear();
+				this.masterAmbiguousBindings.clear();
+				if (
+					this.opts.masterClient ||
+					this.opts.master?.client ||
+					this.opts.createMasterClient ||
+					this.opts.master?.createClient
+				)
+					logger.warn(
+						`notifications: Telegram master bindings unavailable: ${error instanceof Error ? error.message : String(error)}`,
+					);
+			}
+		} catch (error) {
+			this.masterBindings.clear();
+			this.masterAmbiguousBindings.clear();
+			this.masterBindingDisposer?.();
+			this.masterBindingDisposer = undefined;
+			if (this.masterWorker) await this.masterWorker.stop().catch(() => undefined);
+			this.masterWorker = undefined;
+			if (client && !this.opts.masterClient && !this.opts.master?.client)
+				await client.close().catch(() => undefined);
+			this.masterClient = undefined;
+			if (
+				this.opts.masterClient ||
+				this.opts.master?.client ||
+				this.opts.createMasterClient ||
+				this.opts.master?.createClient
+			)
+				logger.warn(
+					`notifications: Telegram master worker unavailable: ${error instanceof Error ? error.message : String(error)}`,
+				);
+		}
+	}
+
+	private async refreshMasterBindings(client: MasterDaemonClient): Promise<void> {
+		const frame = await client.request({
+			type: "get_snapshot",
+			requestId: `telegram-master-snapshot-${crypto.randomUUID()}`,
+		});
+		if (frame.type !== "master_snapshot") throw new Error("master daemon returned an invalid snapshot");
+		this.setMasterBindings(frame.masters);
+	}
+
+	private setMasterBindings(masters: readonly unknown[]): void {
+		this.masterBindings.clear();
+		this.masterAmbiguousBindings.clear();
+		for (const master of masters) {
+			if (!master || typeof master !== "object" || Array.isArray(master)) continue;
+			const candidate = master as { masterName?: unknown; channels?: unknown };
+			if (
+				typeof candidate.masterName !== "string" ||
+				candidate.masterName.length === 0 ||
+				!Array.isArray(candidate.channels)
+			)
+				continue;
+			for (const channel of candidate.channels) {
+				if (!channel || typeof channel !== "object" || Array.isArray(channel)) continue;
+				const value = channel as {
+					provider?: unknown;
+					state?: unknown;
+					bindingId?: unknown;
+					remoteChannelId?: unknown;
+				};
+				if (
+					value.provider !== "telegram" ||
+					value.state !== "active" ||
+					typeof value.bindingId !== "string" ||
+					typeof value.remoteChannelId !== "string" ||
+					value.bindingId.length === 0 ||
+					value.remoteChannelId.length === 0
+				)
+					continue;
+				if (this.masterAmbiguousBindings.has(value.remoteChannelId)) continue;
+				const existing = this.masterBindings.get(value.remoteChannelId);
+				if (existing && (existing.masterName !== candidate.masterName || existing.bindingId !== value.bindingId)) {
+					this.masterBindings.delete(value.remoteChannelId);
+					this.masterAmbiguousBindings.add(value.remoteChannelId);
+					continue;
+				}
+				this.masterBindings.set(value.remoteChannelId, {
+					masterName: candidate.masterName,
+					bindingId: value.bindingId,
+					remoteChannelId: value.remoteChannelId,
+				});
+			}
+		}
+	}
+
+	private async forwardMasterIngress(update: unknown): Promise<"handled" | "retry" | "not_bound"> {
+		const raw = update as {
+			update_id?: unknown;
+			message?: {
+				chat?: { id?: unknown };
+				message_thread_id?: unknown;
+				message_id?: unknown;
+				text?: unknown;
+				caption?: unknown;
+				from?: { id?: unknown; is_bot?: unknown };
+			};
+		};
+		const message = raw.message;
+		const updateId =
+			Number.isSafeInteger(raw.update_id) && Number(raw.update_id) >= 0 ? Number(raw.update_id) : undefined;
+		if (updateId !== undefined && this.dispatchState.seenUpdateIds.has(updateId)) return "handled";
+		if (!message || String(message.chat?.id) !== String(this.opts.chatId) || message.from?.is_bot === true)
+			return "not_bound";
+		if (!Number.isSafeInteger(message.message_thread_id) || Number(message.message_thread_id) <= 0)
+			return "not_bound";
+		const channelId = String(message.message_thread_id);
+		if (this.masterAmbiguousBindings.has(channelId)) return "not_bound";
+		const binding = this.masterBindings.get(channelId);
+		if (!binding || binding.remoteChannelId !== channelId) return "not_bound";
+		const messageId = message.message_id;
+		const actorId = message.from?.id;
+		if (
+			!Number.isSafeInteger(messageId) ||
+			Number(messageId) <= 0 ||
+			!Number.isSafeInteger(actorId) ||
+			Number(actorId) <= 0
+		)
+			return "not_bound";
+		const content = (
+			typeof message.text === "string" ? message.text : typeof message.caption === "string" ? message.caption : ""
+		).trim();
+		if (!content) return "not_bound";
+		await this.ensureMasterWorker();
+		const client = this.masterClient;
+		if (!client) return "retry";
+		const idempotencyKey = `telegram:${channelId}:${messageId}`;
+		try {
+			const response = await client.request({
+				type: "master_user_message",
+				requestId: `telegram-master-ingress-${crypto.randomUUID()}`,
+				idempotencyKey,
+				masterName: binding.masterName,
+				text: content,
+				workdir: null,
+				urgency: "user",
+				ingress: {
+					kind: "provider",
+					provider: "telegram",
+					channelId: binding.remoteChannelId,
+					messageId: String(messageId),
+					actorId: String(actorId),
+				},
+			});
+			if (
+				response.type !== "ack" ||
+				response.operation !== "master_user_message" ||
+				response.idempotencyKey !== idempotencyKey ||
+				response.result.kind !== "task" ||
+				response.result.state !== "queued"
+			)
+				throw new Error("master ingress was not durably acknowledged");
+			if (updateId !== undefined) await this.rememberSeenUpdateId(updateId);
+			return "handled";
+		} catch (error) {
+			logger.warn(
+				`notifications: Telegram master ingress degraded: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return "retry";
+		}
+	}
+
+	private async stopMasterWorker(): Promise<void> {
+		this.masterStopRequested = true;
+		try {
+			await this.masterStartTask;
+		} catch {}
+		this.masterBindingDisposer?.();
+		this.masterBindingDisposer = undefined;
+		await this.masterWorker?.stop().catch(() => undefined);
+		this.masterWorker = undefined;
+		this.masterBindings.clear();
+		this.masterAmbiguousBindings.clear();
+		const client = this.masterClient;
+		this.masterClient = undefined;
+		if (client && !this.opts.masterClient && !this.opts.master?.client) await client.close().catch(() => undefined);
 	}
 
 	private createSessionRouter(): OperatorEventRouter<SessionSocket> {
@@ -11568,6 +11817,9 @@ export class TelegramNotificationDaemon {
 
 	async handleTelegramUpdate(update: unknown): Promise<void> {
 		if (this.validationMode()) return;
+		const masterIngress = await this.forwardMasterIngress(update);
+		if (masterIngress === "handled") return;
+		if (masterIngress === "retry") throw new Error("master ingress must be retried");
 		if ((await this.handleForumTopicCreatedUpdate(update)) !== "not-topic") return;
 		if ((await this.handleForumTopicEdited(update)) !== "not-topic") return;
 		// A raw path is accepted only after the explicit direct-entry choice. The exact
@@ -12330,6 +12582,7 @@ export class TelegramNotificationDaemon {
 			if (!renewed) return;
 			ownershipProved = true;
 			this.running = !this.stopRequested;
+			this.masterStopRequested = false;
 			if (!this.running) return;
 			// Self-heal durable notification state before any scan/poll work so
 			// `daemon reload` recovers dead roots + leak artifacts (#2956).
@@ -12385,6 +12638,7 @@ export class TelegramNotificationDaemon {
 				await this.replyStore.load();
 			}
 			await this.runScan();
+			await this.ensureMasterWorker();
 			let idleSince = this.runtime.now();
 			while (this.running) {
 				if (await this.controlStopRequested()) break;
@@ -12402,6 +12656,7 @@ export class TelegramNotificationDaemon {
 				)
 					break;
 				await this.runScan();
+				await this.ensureMasterWorker();
 				if (await this.controlStopRequested()) break;
 				const idleElapsed = this.runtime.now() - idleSince >= (this.opts.idleTimeoutMs ?? 60_000);
 				if (this.sessions.size > 0) {
@@ -12449,6 +12704,7 @@ export class TelegramNotificationDaemon {
 					toolShutdownError = error;
 				}
 				this.effects.beginShutdown();
+				await this.stopMasterWorker();
 				this.#deliveryAbort.abort();
 				this.stopFlushTimer();
 				this.stopScanTimer();

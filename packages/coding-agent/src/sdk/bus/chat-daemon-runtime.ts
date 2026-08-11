@@ -18,6 +18,7 @@ import { type DiscordEndpointBinding, DiscordEndpointBindingError, DiscordNotifi
 import { DiscordLiveProvider } from "./discord-live-provider";
 import type { DiscordProvider } from "./discord-provider";
 import { type NotificationEvent, NotificationPresentationEngine } from "./engine";
+import type { MasterDaemonClient } from "./master-daemon-client";
 import {
 	type SlackBindingAuthority,
 	type SlackEndpoint,
@@ -81,6 +82,7 @@ export interface ChatDaemonRuntimeDeps {
 		config: NonNullable<ChatDaemonRuntimeConfig["notifications"]["slack"]>,
 	) => SlackProviderClient;
 	createClient?: (endpoint: SdkSessionEndpoint) => Promise<ChatDaemonSdkClient>;
+	createMasterClient?: (provider: "discord" | "telegram") => MasterDaemonClient | Promise<MasterDaemonClient>;
 	createIndex?: (agentDir: string) => SessionIndex;
 	createBrokerClient?: (endpoint: { url: string; token: string }) => Promise<ChatDaemonSdkClient>;
 	onReconciled?: () => void;
@@ -465,6 +467,8 @@ export class ChatDaemonRuntime {
 				guildId: config.guildId,
 				parentChannelId: config.parentChannelId,
 				provider,
+				createMasterClient:
+					this.deps.createMasterClient === undefined ? undefined : () => this.deps.createMasterClient!("discord"),
 				resolveEndpoint: async sessionId => this.#discordEndpoint(sessionId),
 				onCommand: async (sessionId, content, endpoint, idempotencyKey) => {
 					const attached = this.#sessions.get(sessionId);

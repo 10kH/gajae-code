@@ -1,6 +1,7 @@
 /**
  * Manage GJC background daemons (status/list/stop/reload).
  */
+
 import { Args, CliParseError, Command, Flags } from "@gajae-code/utils/cli";
 import {
 	type DaemonCommandAction,
@@ -10,10 +11,13 @@ import {
 } from "../cli/daemon-cli";
 import type { DaemonKind } from "../daemon/control-types";
 import { DAEMON_ACTION_TOKENS, resolveDaemonAction } from "../daemon/operator-contract";
+import { runMasterDaemonInternal } from "../master/daemon";
 import { initTheme } from "../modes/theme/theme";
 import { runSdkSessionCli } from "../sdk/cli";
 
-const ACTIONS = [...DAEMON_ACTION_TOKENS, "discord-internal", "slack-internal", "session"] as const;
+const INTERNAL_ACTIONS = ["discord-internal", "slack-internal"] as const;
+
+const ACTIONS = [...DAEMON_ACTION_TOKENS, ...INTERNAL_ACTIONS, "session"] as const;
 
 function parsePositiveTimeout(raw: string | undefined, flagName: string): number | undefined {
 	if (raw === undefined) return undefined;
@@ -82,6 +86,10 @@ export default class Daemon extends Command {
 		);
 		const killTimeoutMs = parsePositiveTimeout(flagRec["kill-timeout-ms"] as string | undefined, "--kill-timeout-ms");
 		if (rawAction === "session") {
+			if (rawAction === "session" && flagRec.op === "master.owner.internal") {
+				await runMasterDaemonInternal(flagRec["agent-dir"] as string | undefined);
+				return;
+			}
 			await runSdkSessionCli({
 				action: positional[0],
 				sessionId: positional[1],
