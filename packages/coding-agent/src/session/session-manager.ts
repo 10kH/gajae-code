@@ -1943,8 +1943,17 @@ export class SessionTranscriptOversizedError extends Error {
 		this.size = size;
 	}
 }
+function resolveSessionContextBudgetBytes(): number {
+	const override = process.env.GJC_SESSION_CONTEXT_BUDGET_BYTES;
+	if (override !== undefined && override !== "") {
+		const parsed = Number.parseInt(override, 10);
+		if (Number.isFinite(parsed) && parsed > 0) return parsed;
+	}
+	return 512 * 1024 * 1024;
+}
+
 /** Operation-peak budget for one synchronous session-context materialization. */
-export const SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES = 64 * 1024 * 1024;
+export const SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES = resolveSessionContextBudgetBytes();
 
 /**
  * Thrown by the synchronous session-context builders when the materialized graph

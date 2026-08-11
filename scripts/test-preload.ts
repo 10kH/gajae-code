@@ -21,3 +21,11 @@ try {
 } catch {
 	// Leave the environment untouched if the temp root cannot be resolved.
 }
+
+// The session-context materialization budget defaults to 512 MiB in production
+// (overridable via GJC_SESSION_CONTEXT_BUDGET_BYTES). Test fixtures in
+// session-context-overflow.test.ts were authored against the former 64 MiB
+// default (BIG_TEXT = 40 MiB → ~80 MiB measured). Pin the budget to 64 MiB for
+// the test process so those fixtures keep triggering the overflow preflight
+// without inflating memory usage across every other test suite.
+process.env.GJC_SESSION_CONTEXT_BUDGET_BYTES = String(64 * 1024 * 1024);
