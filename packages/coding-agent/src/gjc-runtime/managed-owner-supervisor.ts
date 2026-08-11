@@ -164,7 +164,11 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	const childStartTime = await managedOwnerProcessProvenance(child.pid);
 	if (!childStartTime) throw new Error("managed_owner_child_start_time_unavailable");
 	const childProcess = nativeProcessBindings().Process.fromPid(child.pid);
-	if (!childProcess) throw new Error("managed_owner_child_reference_unavailable");
+	if (!childProcess) {
+		const exitCode = await child.exited;
+		process.exitCode = exitCode;
+		return;
+	}
 	if (process.platform === "linux" && childProcess.incarnation !== `linux:${childStartTime}`)
 		throw new Error("managed_owner_child_incarnation_mismatch");
 	let childExited = false;
