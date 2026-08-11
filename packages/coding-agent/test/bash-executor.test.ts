@@ -102,13 +102,15 @@ describe("executeBash", () => {
 
 	it("owns and disposes one-shot native shells", async () => {
 		await disposeAllShellSessions();
+		const closeSpy = vi.spyOn(piNatives.Shell.prototype, "close");
 		const abortSpy = vi.spyOn(piNatives.Shell.prototype, "abort");
 
 		const result = await executeBash("echo one-shot", { cwd: tempDir, timeout: 5000, oneShot: true });
 
 		expect(result.output.trim()).toBe("one-shot");
 		expect(getShellSessionCount()).toBe(0);
-		expect(abortSpy).toHaveBeenCalledTimes(1);
+		expect(closeSpy).toHaveBeenCalledTimes(1);
+		expect(abortSpy).not.toHaveBeenCalled();
 	});
 
 	it("reports the bash shell-session owner count via runtime resource gauges", async () => {

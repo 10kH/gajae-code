@@ -217,6 +217,17 @@ impl Shell {
 	pub async fn abort(&self) {
 		self.abort_state.abort().await;
 	}
+
+	/// Abort in-flight work and drop the retained session.
+	///
+	/// `abort` only cancels running commands; a successfully completed command
+	/// keeps its session alive for reuse (see `session_keepalive`). Callers that
+	/// are done with a shell must be able to release the underlying process and
+	/// its resources, otherwise the host keeps them for its whole lifetime.
+	pub async fn close(&self) {
+		self.abort_state.abort().await;
+		*self.session.lock().await = None;
+	}
 }
 
 pub async fn execute_shell(

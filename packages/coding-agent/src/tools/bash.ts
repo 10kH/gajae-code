@@ -862,26 +862,28 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			return { kind: "aborted" };
 		}
 
+		const threshold = Promise.withResolvers<{ kind: "running" }>();
+		const thresholdTimer = setTimeout(() => threshold.resolve({ kind: "running" }), Math.max(0, thresholdMs));
 		const waiters: Array<Promise<ManagedBashJobCompletion | { kind: "running" } | { kind: "aborted" }>> = [
 			job.completion,
-			Bun.sleep(thresholdMs).then(() => ({ kind: "running" as const })),
+			threshold.promise,
 		];
 		if (backgroundRequest) {
 			waiters.push(backgroundRequest.then(() => ({ kind: "running" as const })));
 		}
 
-		if (!signal) {
-			return await Promise.race(waiters);
+		let onAbort: (() => void) | undefined;
+		if (signal) {
+			const aborted = Promise.withResolvers<{ kind: "aborted" }>();
+			onAbort = () => aborted.resolve({ kind: "aborted" });
+			signal.addEventListener("abort", onAbort, { once: true });
+			waiters.push(aborted.promise);
 		}
-
-		const { promise: abortedPromise, resolve: resolveAborted } = Promise.withResolvers<{ kind: "aborted" }>();
-		const onAbort = () => resolveAborted({ kind: "aborted" });
-		signal.addEventListener("abort", onAbort, { once: true });
-		waiters.push(abortedPromise);
 		try {
 			return await Promise.race(waiters);
 		} finally {
-			signal.removeEventListener("abort", onAbort);
+			clearTimeout(thresholdTimer);
+			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
 		}
 	}
 
