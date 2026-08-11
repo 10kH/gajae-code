@@ -163,6 +163,31 @@ describe("buffered sidecar writers", () => {
 		});
 	});
 
+	it("reuses memory backing capacity across buffered flushes", () => {
+		const memory = new MemorySessionStorage();
+		const memoryPath = "/sessions/reused-buffer.jsonl";
+		const allocationSpy = vi.spyOn(Buffer, "allocUnsafe");
+		const writer = memory.openBufferedWriter!(memoryPath, {
+			flags: "w",
+			bufferSize: SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES,
+		});
+		const chunk = Buffer.alloc(SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES, 0x61);
+		const flushCount = 8;
+		try {
+			for (let index = 0; index < flushCount; index++) writer.writeBytesSync(chunk);
+			writer.fsyncSync();
+			writer.closeSync();
+			const totalBytes = chunk.byteLength * flushCount;
+			expect(memory.readBytesSync(memoryPath).byteLength).toBe(totalBytes);
+			const allocations = allocationSpy.mock.calls
+				.map(call => call[0])
+				.filter((size): size is number => typeof size === "number");
+			expect(Math.max(...allocations)).toBeLessThanOrEqual(totalBytes * 2);
+		} finally {
+			allocationSpy.mockRestore();
+		}
+	});
+
 	it("flushes pending bytes before fsync and close", async () => {
 		const dir = await makeTempDir("gjc-buffered-order-");
 		const file = new FileSessionStorage();
@@ -330,6 +355,20 @@ describe("exclusive disposable build locks", () => {
 			next!.releaseSync();
 			expect(storage.existsSync(lockPath)).toBe(false);
 		}
+	});
+
+	it("reclaims a lock whose recorded owner process is absent", async () => {
+		const dir = await makeTempDir("gjc-exclusive-lock-stale-");
+		const storage = new FileSessionStorage();
+		const lockPath = path.join(dir, "build.lock");
+		storage.writeTextSync(
+			lockPath,
+			`${JSON.stringify({ pid: 2_147_483_647, incarnation: "absent:1", token: "stale" })}\n`,
+		);
+		const lock = storage.acquireExclusiveLockSync!(lockPath);
+		expect(lock).toBeDefined();
+		lock!.releaseSync();
+		expect(storage.existsSync(lockPath)).toBe(false);
 	});
 
 	it("does not unlink a replacement file when releasing the original file lock", async () => {

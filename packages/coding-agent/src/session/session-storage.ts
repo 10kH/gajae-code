@@ -1541,24 +1541,121 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 	}
 }
 
+type SessionStorageLockOwner = {
+	pid: number;
+	incarnation?: string;
+	token: string;
+};
+
+type SessionStorageLockOwnerProbe =
+	| { kind: "absent" }
+	| { kind: "live"; incarnation?: string }
+	| { kind: "unverifiable" };
+
+function probeSessionStorageLockOwner(pid: number): SessionStorageLockOwnerProbe {
+	try {
+		const owner = nativeSessionStorage().Process.fromPid(pid) as { incarnation?: unknown } | null;
+		if (!owner) return { kind: "absent" };
+		return {
+			kind: "live",
+			...(typeof owner.incarnation === "string" && owner.incarnation.length > 0
+				? { incarnation: owner.incarnation }
+				: {}),
+		};
+	} catch {
+		return { kind: "unverifiable" };
+	}
+}
+
+function parseSessionStorageLockOwner(bytes: Buffer): SessionStorageLockOwner | undefined {
+	const text = bytes.toString("utf8").trim();
+	try {
+		const value = JSON.parse(text) as Partial<SessionStorageLockOwner>;
+		if (
+			!Number.isSafeInteger(value.pid) ||
+			(value.pid ?? 0) <= 0 ||
+			typeof value.token !== "string" ||
+			value.token.length === 0 ||
+			(value.incarnation !== undefined && (typeof value.incarnation !== "string" || value.incarnation.length === 0))
+		)
+			return undefined;
+		return value as SessionStorageLockOwner;
+	} catch {
+		const legacy = /^(\d+):(.+)$/.exec(text);
+		if (!legacy) return undefined;
+		const pid = Number.parseInt(legacy[1]!, 10);
+		if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+		return { pid, token: legacy[2]! };
+	}
+}
+
+function reclaimStaleSessionStorageLockSync(lockPath: string): boolean {
+	let fd: number | undefined;
+	let expected: fs.BigIntStats | undefined;
+	let owner: SessionStorageLockOwner | undefined;
+	try {
+		fd = fs.openSync(lockPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+		expected = fs.fstatSync(fd, { bigint: true });
+		if (!expected.isFile() || expected.nlink !== 1n || expected.size <= 0n || expected.size > 4096n) return false;
+		const bytes = Buffer.allocUnsafe(Number(expected.size));
+		let offset = 0;
+		while (offset < bytes.byteLength) {
+			const read = fs.readSync(fd, bytes, offset, bytes.byteLength - offset, offset);
+			if (read === 0) return false;
+			offset += read;
+		}
+		owner = parseSessionStorageLockOwner(bytes);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+		return false;
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
+	}
+	if (!owner || !expected) return false;
+	const probe = probeSessionStorageLockOwner(owner.pid);
+	const stale =
+		probe.kind === "absent" ||
+		(probe.kind === "live" && owner.incarnation !== undefined && probe.incarnation !== owner.incarnation);
+	if (!stale) return false;
+	try {
+		const named = fs.lstatSync(lockPath, { bigint: true });
+		if (named.dev !== expected.dev || named.ino !== expected.ino || named.isSymbolicLink()) return false;
+		fs.unlinkSync(lockPath);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ENOENT";
+	}
+}
+
 export class FileSessionStorage implements SessionStorage {
 	acquireExclusiveLockSync(lockPath: string): SessionStorageExclusiveLock | undefined {
 		const dir = path.dirname(lockPath);
 		this.ensureDirSync(dir);
-		let fd: number;
-		try {
-			fd = fs.openSync(
-				lockPath,
-				fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0),
-				0o600,
-			);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "EEXIST") return undefined;
-			throw error;
+		let fd: number | undefined;
+		for (let attempt = 0; attempt < 2; attempt++) {
+			try {
+				fd = fs.openSync(
+					lockPath,
+					fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0),
+					0o600,
+				);
+				break;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+				if (attempt === 0 && reclaimStaleSessionStorageLockSync(lockPath)) continue;
+				return undefined;
+			}
 		}
+		if (fd === undefined) return undefined;
 		try {
 			secureOwnerOnlyFileDescriptor(lockPath, fd, "apply", undefined);
-			fs.writeSync(fd, `${process.pid}:${randomUUID()}\n`);
+			const probe = probeSessionStorageLockOwner(process.pid);
+			const owner: SessionStorageLockOwner = {
+				pid: process.pid,
+				...(probe.kind === "live" && probe.incarnation ? { incarnation: probe.incarnation } : {}),
+				token: randomUUID(),
+			};
+			fs.writeSync(fd, `${JSON.stringify(owner)}\n`);
 			fs.fsyncSync(fd);
 			const expected = fs.fstatSync(fd, { bigint: true });
 			let released = false;
@@ -2741,12 +2838,14 @@ class MemorySessionStorageWriter implements SessionStorageBufferedWriter {
 		if (!this.#buffer || this.#bufferedBytes === 0) return;
 		const pendingBytes = this.#bufferedBytes;
 		const nextLength = this.#length + pendingBytes;
-		const expanded = Buffer.allocUnsafe(Math.max(nextLength, this.#bytes.byteLength * 2));
-		this.#bytes.copy(expanded, 0, 0, this.#length);
-		this.#buffer.copy(expanded, this.#length, 0, pendingBytes);
+		if (nextLength > this.#bytes.byteLength) {
+			const expanded = Buffer.allocUnsafe(Math.max(nextLength, this.#bytes.byteLength * 2));
+			this.#bytes.copy(expanded, 0, 0, this.#length);
+			this.#bytes = expanded;
+		}
+		this.#buffer.copy(this.#bytes, this.#length, 0, pendingBytes);
 		this.#writeCalls++;
-		this.#storage.writeBytesOwnedSync(this.#path, Buffer.from(expanded.subarray(0, nextLength)));
-		this.#bytes = expanded;
+		this.#storage.writeBytesOwnedSync(this.#path, Buffer.from(this.#bytes.subarray(0, nextLength)));
 		this.#length = nextLength;
 		this.#bufferedBytes = 0;
 		this.#bytesWritten += pendingBytes;

@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { SessionManager, type SessionMemoryStats } from "../src/session/session-manager";
+import { SessionManager, type SessionMemoryStats, type StrictSessionCaptureResult } from "../src/session/session-manager";
 
 const SOURCE_ENTRY_COUNT = 1_023;
 const PAYLOAD_BYTES = 1024 * 1024;
@@ -233,6 +233,11 @@ function statsRecord(stats: SessionMemoryStats): Record<string, unknown> {
 	return stats as unknown as Record<string, unknown>;
 }
 
+function firstOpenRecord(stats: SessionMemoryStats): Record<string, unknown> {
+	const value = statsRecord(stats).firstOpen;
+	return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
+
 function optionalNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
@@ -247,11 +252,13 @@ function sessionTelemetry(stats: SessionMemoryStats): Record<string, TelemetryVa
 }
 
 function counterFromStats(stats: SessionMemoryStats): CounterEvidence {
-	const record = statsRecord(stats);
+	const containers = [statsRecord(stats), firstOpenRecord(stats)];
 	const read = (aliases: readonly string[]): number | null => {
-		for (const alias of aliases) {
-			const value = optionalNumber(record[alias]);
-			if (value !== undefined) return value;
+		for (const container of containers) {
+			for (const alias of aliases) {
+				const value = optionalNumber(container[alias]);
+				if (value !== undefined) return value;
+			}
 		}
 		return null;
 	};
@@ -381,7 +388,7 @@ async function runWorker(
 	const destinationDirectory = path.join(root, "forks");
 	await fs.mkdir(destinationDirectory);
 	const baseline = memorySample();
-	let captured: ReturnType<typeof SessionManager.captureTranscriptStrict> | undefined;
+	let captured: StrictSessionCaptureResult | undefined;
 	let forkedManager: SessionManager | undefined;
 	let reopenedManager: SessionManager | undefined;
 	try {
