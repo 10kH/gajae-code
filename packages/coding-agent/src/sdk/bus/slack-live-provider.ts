@@ -255,13 +255,18 @@ export class SlackLiveProvider implements SlackProviderClient, SlackDiagnosticPr
 		text: string;
 		threadTs?: string;
 		clientMsgId: string;
+		signal?: AbortSignal;
 	}): Promise<SlackPostedMessage> {
-		const response = await this.#api("chat.postMessage", {
-			channel: input.channel,
-			text: input.text,
-			thread_ts: input.threadTs,
-			client_msg_id: input.clientMsgId,
-		});
+		const response = await this.#api(
+			"chat.postMessage",
+			{
+				channel: input.channel,
+				text: input.text,
+				thread_ts: input.threadTs,
+				client_msg_id: input.clientMsgId,
+			},
+			input.signal,
+		);
 		const message = this.#message(response);
 		// A successful HTTP response without a usable receipt can still represent a
 		// remote acceptance. The daemon must reconcile by client_msg_id before retrying.
@@ -273,11 +278,16 @@ export class SlackLiveProvider implements SlackProviderClient, SlackDiagnosticPr
 		channel: string;
 		clientMsgId: string;
 		threadTs?: string;
+		signal?: AbortSignal;
 	}): Promise<SlackMessageSearchResult | null> {
-		const response = await this.#api("conversations.history", { channel: input.channel });
+		const response = await this.#api("conversations.history", { channel: input.channel }, input.signal);
 		const fromHistory = this.#findMessage(response, input.clientMsgId, input.channel);
 		if (fromHistory || !input.threadTs) return fromHistory;
-		const replies = await this.#api("conversations.replies", { channel: input.channel, ts: input.threadTs });
+		const replies = await this.#api(
+			"conversations.replies",
+			{ channel: input.channel, ts: input.threadTs },
+			input.signal,
+		);
 		return this.#findMessage(replies, input.clientMsgId, input.channel);
 	}
 
@@ -393,8 +403,12 @@ export class SlackLiveProvider implements SlackProviderClient, SlackDiagnosticPr
 		return url;
 	}
 
-	async #api(operation: string, body: Record<string, string | undefined>): Promise<SlackApiResponse> {
-		const result = await this.#request(operation, this.#botToken, body, true);
+	async #api(
+		operation: string,
+		body: Record<string, string | undefined>,
+		signal?: AbortSignal,
+	): Promise<SlackApiResponse> {
+		const result = await this.#request(operation, this.#botToken, body, true, signal);
 		if (result.ok === true) return result;
 		throw new SlackProviderError("web_api", operation);
 	}

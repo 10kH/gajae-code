@@ -58,6 +58,25 @@ function slackPublicationClientMsgId(publicationId: string): string {
 
 // Durable filesystem publication leases must outlast one event-loop and persistence turn.
 const MIN_PUBLICATION_LEASE_MS = 100;
+const RETIREMENT_DRAIN_MS = 5_000;
+
+type SlackProviderWorkScope = {
+	sessionId: string;
+	endpointGeneration: number;
+	attachmentAuthorityId?: string;
+};
+
+type SlackProviderWork = {
+	scopeKey: string;
+	invalidate(): Promise<void>;
+	abort(): void;
+	terminalize(): Promise<void>;
+	settled: Promise<void>;
+};
+
+function slackProviderWorkScopeKey(scope: SlackProviderWorkScope): string {
+	return JSON.stringify([scope.sessionId, scope.endpointGeneration, scope.attachmentAuthorityId]);
+}
 
 export interface SlackBindingAuthority {
 	sessionId: string;
@@ -186,9 +205,8 @@ export class SlackNotificationDaemon {
 
 	readonly #inflightInbound = new Set<string>();
 	readonly #activeWork = new Set<Promise<unknown>>();
-	readonly #workInvalidators = new Set<() => Promise<void>>();
-	#workInvalidatorDrain: Promise<void> = Promise.resolve();
-	#resolveWorkInvalidatorDrain: (() => void) | undefined;
+	readonly #workInvalidators = new Set<SlackProviderWork>();
+	readonly #retiredProviderWorkScopes = new Set<string>();
 	readonly #rollovers = new Map<string, Promise<SlackRootPublication>>();
 	#workGeneration = 0;
 	#lifecycleTail: Promise<void> = Promise.resolve();
@@ -461,11 +479,46 @@ export class SlackNotificationDaemon {
 
 	async #invalidateActiveWork(): Promise<void> {
 		this.#workGeneration += 1;
-		await Promise.allSettled([...this.#workInvalidators].map(invalidate => invalidate()));
+		await Promise.allSettled([...this.#workInvalidators].map(work => work.invalidate()));
 	}
-	async #invalidateAndDrainProviderWork(): Promise<void> {
-		await this.#invalidateActiveWork();
-		while (this.#workInvalidators.size > 0) await this.#workInvalidatorDrain;
+	async #invalidateAndDrainProviderWork(scope: SlackProviderWorkScope): Promise<void> {
+		const scopeKey = slackProviderWorkScopeKey(scope);
+		this.#retiredProviderWorkScopes.add(scopeKey);
+		const deadline = this.#now() + RETIREMENT_DRAIN_MS;
+		for (;;) {
+			const active = [...this.#workInvalidators].filter(work => work.scopeKey === scopeKey);
+			if (active.length === 0) return;
+			for (const work of active) work.abort();
+			const remaining = deadline - this.#now();
+			if (remaining <= 0) {
+				await Promise.allSettled(active.map(work => work.terminalize()));
+				logger.warn("Slack attachment provider work exceeded the 5000ms retirement drain; fenced pending effects.");
+				return;
+			}
+			const drained = await Promise.race([
+				Promise.all(active.map(work => work.settled)).then(() => true),
+				Bun.sleep(remaining).then(() => false),
+			]);
+			if (drained) continue;
+			const lingering = [...this.#workInvalidators].filter(work => work.scopeKey === scopeKey);
+			for (const work of lingering) work.abort();
+			await Promise.allSettled(lingering.map(work => work.terminalize()));
+			logger.warn("Slack attachment provider work exceeded the 5000ms retirement drain; fenced pending effects.");
+			return;
+		}
+	}
+
+	#releaseRetiredProviderWorkScope(scope: SlackProviderWorkScope): void {
+		const scopeKey = slackProviderWorkScopeKey(scope);
+		const releaseWhenDrained = (): void => {
+			const active = [...this.#workInvalidators].filter(work => work.scopeKey === scopeKey);
+			if (active.length === 0) {
+				this.#retiredProviderWorkScopes.delete(scopeKey);
+				return;
+			}
+			void Promise.all(active.map(work => work.settled)).then(releaseWhenDrained);
+		};
+		releaseWhenDrained();
 	}
 
 	#recordProviderLifecycleError(error: unknown): void {
@@ -544,7 +597,7 @@ export class SlackNotificationDaemon {
 				if (
 					!current ||
 					current.endpointGeneration !== authority.endpointGeneration ||
-					current.attachmentAuthorityId !== authority.attachmentAuthorityId
+					current.attachmentAuthorityId !== attachmentAuthorityId
 				)
 					return false;
 				return commitAuthority ? await commitAuthority() : true;
@@ -971,25 +1024,41 @@ export class SlackNotificationDaemon {
 	}
 
 	async retireAttachment(sessionId: string, endpointGeneration: number): Promise<void> {
-		await this.#invalidateAndDrainProviderWork();
 		const found = await this.findSession(sessionId, true);
 		if (found?.record.endpointGeneration !== endpointGeneration) return;
 		const attachmentAuthorityId = found.record.attachmentAuthorityId;
-		for (const receipt of found.record.inboundDispatches ?? [])
-			await this.#journal.terminalize(receipt.effectId, { status: "stale_binding" });
-		await this.store.transact(found.key, current =>
-			current?.sessionId === sessionId &&
-			current.endpointGeneration === endpointGeneration &&
-			current.attachmentAuthorityId === attachmentAuthorityId
-				? nextRecord(current, {
-						state: "closed_marker",
-						pendingActionId: undefined,
-						cleanupEffectId: undefined,
-						inboundDispatches: [],
-						updatedAt: this.#now(),
-					})
-				: current,
-		);
+		const scope: SlackProviderWorkScope = {
+			sessionId,
+			endpointGeneration,
+			...(attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId }),
+		};
+		try {
+			await this.#invalidateAndDrainProviderWork(scope);
+			const current = await this.findSession(sessionId, true);
+			if (
+				!current ||
+				current.record.endpointGeneration !== endpointGeneration ||
+				current.record.attachmentAuthorityId !== attachmentAuthorityId
+			)
+				return;
+			for (const receipt of current.record.inboundDispatches ?? [])
+				await this.#journal.terminalize(receipt.effectId, { status: "stale_binding" });
+			await this.store.transact(current.key, record =>
+				record?.sessionId === sessionId &&
+				record.endpointGeneration === endpointGeneration &&
+				record.attachmentAuthorityId === attachmentAuthorityId
+					? nextRecord(record, {
+							state: "closed_marker",
+							pendingActionId: undefined,
+							cleanupEffectId: undefined,
+							inboundDispatches: [],
+							updatedAt: this.#now(),
+						})
+					: record,
+			);
+		} finally {
+			this.#releaseRetiredProviderWorkScope(scope);
+		}
 	}
 
 	async #close(
@@ -1395,10 +1464,17 @@ export class SlackNotificationDaemon {
 			return false;
 		}
 		const lease: ChatEffectLease = { owner: this.#publicationOwnerId, epoch: effect.epoch };
+		const workScope: SlackProviderWorkScope = {
+			sessionId: claim.sessionId,
+			endpointGeneration: claim.receipt.endpointGeneration,
+			...(claim.receipt.attachmentAuthorityId === undefined
+				? {}
+				: { attachmentAuthorityId: claim.receipt.attachmentAuthorityId }),
+		};
 		try {
 			if (effect.payload.type === "command") {
 				const payload = effect.payload;
-				const accepted = await this.#withEffectLease(effect.id, lease, async () => {
+				const accepted = await this.#withEffectLease(effect.id, lease, workScope, async () => {
 					if (!(await this.#inboundEffectCurrent(claim, effect.id))) throw new SlackStaleEffectError();
 					return await (this.options.onCommand?.(
 						claim.sessionId,
@@ -1417,7 +1493,7 @@ export class SlackNotificationDaemon {
 				if (recorded) await this.#finishDispatch(claim, "terminal");
 				return accepted && !!recorded;
 			}
-			await this.#withEffectLease(effect.id, lease, async () => {
+			await this.#withEffectLease(effect.id, lease, workScope, async () => {
 				if (!(await this.#inboundEffectCurrent(claim, effect.id))) throw new SlackStaleEffectError();
 				await claim.endpoint.send(effect.payload);
 			});
@@ -1478,25 +1554,52 @@ export class SlackNotificationDaemon {
 	async #withEffectLease<T>(
 		id: string,
 		lease: ChatEffectLease,
-		operation: () => Promise<T>,
+		scope: SlackProviderWorkScope,
+		operation: (signal: AbortSignal) => Promise<T>,
 		workGeneration = this.#workGeneration,
 	): Promise<T> {
+		const scopeKey = slackProviderWorkScopeKey(scope);
+		const controller = new AbortController();
 		let invalidation: Promise<void> | undefined;
+		let terminalization: Promise<void> | undefined;
 		let invalidated = false;
-		const invalidate = async (): Promise<void> => {
+		const abort = (): void => {
 			invalidated = true;
+			controller.abort();
+		};
+		const invalidate = async (): Promise<void> => {
+			abort();
 			invalidation ??= this.#rescheduleAfterEffectTransition(
 				this.#journal.record(id, lease, "uncertain", { status: "shutdown_timeout" }),
 			).then(() => undefined);
 			await invalidation;
 		};
-		if (this.#workInvalidators.size === 0) {
-			const drained = Promise.withResolvers<void>();
-			this.#workInvalidatorDrain = drained.promise;
-			this.#resolveWorkInvalidatorDrain = drained.resolve;
-		}
-		this.#workInvalidators.add(invalidate);
+		const terminalize = async (): Promise<void> => {
+			abort();
+			terminalization ??= (async (): Promise<void> => {
+				const receipt = { status: "stale_binding" };
+				const terminalized = await this.#rescheduleAfterEffectTransition(
+					this.#journal.terminalize(id, receipt, lease),
+				);
+				if (!terminalized) await this.#rescheduleAfterEffectTransition(this.#journal.terminalize(id, receipt));
+			})();
+			await terminalization;
+		};
+		const settled = Promise.withResolvers<void>();
+		const work: SlackProviderWork = {
+			scopeKey,
+			invalidate,
+			abort,
+			terminalize,
+			settled: settled.promise,
+		};
+		this.#workInvalidators.add(work);
+		const retiring = (): boolean => this.#retiredProviderWorkScopes.has(scopeKey);
 		const ensureLive = async (): Promise<void> => {
+			if (retiring()) {
+				await terminalize();
+				throw new SlackStaleEffectError();
+			}
 			if (invalidated || workGeneration !== this.#workGeneration) {
 				await invalidate();
 				throw new Error(`Slack effect ${id} was admitted after shutdown drain expiry`);
@@ -1507,6 +1610,10 @@ export class SlackNotificationDaemon {
 				))
 			)
 				throw new Error("Slack effect lease renewal failed");
+			if (retiring()) {
+				await terminalize();
+				throw new SlackStaleEffectError();
+			}
 			if (workGeneration !== this.#workGeneration) {
 				await invalidate();
 				throw new Error(`Slack effect ${id} lost its shutdown fence`);
@@ -1517,7 +1624,15 @@ export class SlackNotificationDaemon {
 			const result = await this.#withRenewal(
 				async () => {
 					await ensureLive();
-					return await operation();
+					try {
+						return await operation(controller.signal);
+					} catch (error) {
+						if (retiring()) {
+							await terminalize();
+							throw new SlackStaleEffectError();
+						}
+						throw error;
+					}
 				},
 				ensureLive,
 				false,
@@ -1525,11 +1640,8 @@ export class SlackNotificationDaemon {
 			await ensureLive();
 			return result;
 		} finally {
-			this.#workInvalidators.delete(invalidate);
-			if (this.#workInvalidators.size === 0) {
-				this.#resolveWorkInvalidatorDrain?.();
-				this.#resolveWorkInvalidatorDrain = undefined;
-			}
+			this.#workInvalidators.delete(work);
+			settled.resolve();
 		}
 	}
 
@@ -2366,6 +2478,13 @@ export class SlackNotificationDaemon {
 		}
 		if (!effect) throw new Error("Slack provider effect is owned by another worker");
 		const lease: ChatEffectLease = { owner: this.#publicationOwnerId, epoch: effect.epoch };
+		const workScope: SlackProviderWorkScope = {
+			sessionId,
+			endpointGeneration,
+			...(payload.attachmentAuthorityId === undefined
+				? {}
+				: { attachmentAuthorityId: payload.attachmentAuthorityId }),
+		};
 		// A recovered lease may have crossed the provider boundary before its owner
 		// died, and a fresh post may have reached Slack at a now-superseded generation.
 		// Reconcile first in all cases. Only an effect that may have crossed the
@@ -2377,11 +2496,13 @@ export class SlackNotificationDaemon {
 			const posted = await this.#withEffectLease(
 				id,
 				lease,
-				async () => {
+				workScope,
+				async signal => {
 					const found = await this.options.provider.findMessageByClientMsgId({
 						channel: effect!.payload.channel,
 						threadTs: effect!.payload.threadTs,
 						clientMsgId: effect!.payload.clientMsgId,
+						signal,
 					});
 					if (found) return found;
 					if (workGeneration !== this.#workGeneration)
@@ -2392,7 +2513,7 @@ export class SlackNotificationDaemon {
 					}
 					if (workGeneration !== this.#workGeneration)
 						throw new Error(`Slack effect ${id} lost its shutdown fence`);
-					return await this.options.provider.postMessage(effect!.payload);
+					return await this.options.provider.postMessage({ ...effect!.payload, signal });
 				},
 				workGeneration,
 			);
@@ -2422,11 +2543,13 @@ export class SlackNotificationDaemon {
 					const reconciled = await this.#withEffectLease(
 						id,
 						lease,
-						async () =>
+						workScope,
+						async signal =>
 							await this.options.provider.findMessageByClientMsgId({
 								channel: effect!.payload.channel,
 								threadTs: effect!.payload.threadTs,
 								clientMsgId: effect!.payload.clientMsgId,
+								signal,
 							}),
 						workGeneration,
 					);
