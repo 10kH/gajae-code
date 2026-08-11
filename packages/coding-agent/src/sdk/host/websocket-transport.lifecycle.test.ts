@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { SdkClient } from "../client/client";
 import { SessionSdkSessionRuntime, type SessionSdkTransport } from "./session-runtime";
 import { createSdkWebSocketTransport, type SdkWebSocketTransportDependencies } from "./websocket-transport";
 
@@ -39,10 +40,115 @@ describe("SDK WebSocket transport lifecycle", () => {
 		const endpoints = await Promise.all([transport.start(), transport.start(), transport.start()]);
 		expect(new Set(endpoints.map(endpoint => endpoint.url)).size).toBe(1);
 		const endpointPath = path.join(stateRoot, "sdk", "concurrent-start.json");
-		expect(JSON.parse(await fs.readFile(endpointPath, "utf8")).url).toBe(endpoints[0]?.url);
+		expect(JSON.parse(await fs.readFile(endpointPath, "utf8"))).toMatchObject({
+			sessionId: "concurrent-start",
+			url: endpoints[0]?.url,
+		});
 		await transport.stop();
 		await expect(fs.stat(endpointPath)).rejects.toMatchObject({ code: "ENOENT" });
 		await fs.rm(stateRoot, { recursive: true, force: true });
+	});
+	test("publishes a complete mode-600 endpoint through one atomic rename", async () => {
+		const stateRoot = await tempStateRoot();
+		const endpointPath = path.join(stateRoot, "sdk", "atomic-publication.json");
+		const renameEntered = Promise.withResolvers<void>();
+		const releaseRename = Promise.withResolvers<void>();
+		const transport = await createSdkWebSocketTransport({
+			sessionId: "atomic-publication",
+			stateRoot,
+			token: "secret-token",
+			filesystem: {
+				mkdir: fs.mkdir,
+				writeFile: fs.writeFile,
+				chmod: fs.chmod,
+				rename: async (from, to) => {
+					expect(to).toBe(endpointPath);
+					expect((await fs.stat(from)).mode & 0o777).toBe(0o600);
+					expect(JSON.parse(await fs.readFile(from, "utf8"))).toMatchObject({
+						sessionId: "atomic-publication",
+						token: "secret-token",
+					});
+					renameEntered.resolve();
+					await releaseRename.promise;
+					await fs.rename(from, to);
+				},
+				rm: fs.rm,
+			},
+		});
+		const start = transport.start();
+		try {
+			await renameEntered.promise;
+			await expect(fs.stat(endpointPath)).rejects.toMatchObject({ code: "ENOENT" });
+			expect((await fs.readdir(path.dirname(endpointPath))).filter(file => file.endsWith(".tmp"))).toHaveLength(1);
+			releaseRename.resolve();
+			await start;
+			expect(JSON.parse(await fs.readFile(endpointPath, "utf8"))).toMatchObject({
+				sessionId: "atomic-publication",
+				token: "secret-token",
+			});
+		} finally {
+			releaseRename.resolve();
+			await start.catch(() => undefined);
+			await transport.stop().catch(() => undefined);
+			await fs.rm(stateRoot, { recursive: true, force: true });
+		}
+	});
+	test("six isolated roots publish unique endpoints that accept metadata and prompt controls", async () => {
+		const roots = await Promise.all(Array.from({ length: 6 }, () => tempStateRoot()));
+		const transports = await Promise.all(
+			roots.map((stateRoot, index) =>
+				createSdkWebSocketTransport({
+					sessionId: `isolated-lane-${index + 1}`,
+					stateRoot,
+					token: `token-${index + 1}`,
+				}),
+			),
+		);
+		const frameDisposers = transports.map(transport =>
+			transport.onFrame((connectionId, frame) => {
+				if (frame.type !== "query_request" && frame.type !== "control_request") return;
+				void transport.sendFrame(connectionId, {
+					type: frame.type === "query_request" ? "query_response" : "control_response",
+					id: frame.id,
+					ok: true,
+					result: frame.type === "query_request" ? { sessionId: transport.sessionId } : { accepted: true },
+				});
+			}),
+		);
+		const clients: SdkClient[] = [];
+		try {
+			const endpoints = await Promise.all(transports.map(transport => transport.start()));
+			expect(new Set(endpoints.map(endpoint => endpoint.url)).size).toBe(6);
+			await Promise.all(
+				roots.map(async (stateRoot, index) => {
+					const sessionId = `isolated-lane-${index + 1}`;
+					const record = JSON.parse(await fs.readFile(path.join(stateRoot, "sdk", `${sessionId}.json`), "utf8"));
+					expect(record).toMatchObject({ sessionId, url: endpoints[index]?.url, token: `token-${index + 1}` });
+					await probeWebSocketEndpoint(endpoints[index]!.url, `token-${index + 1}`);
+				}),
+			);
+			const connected = await Promise.all(
+				endpoints.map((endpoint, index) => SdkClient.connect(endpoint.url, `token-${index + 1}`)),
+			);
+			clients.push(...connected);
+			await Promise.all(
+				connected.flatMap((client, index) => [
+					expect(client.query("session.metadata")).resolves.toMatchObject({
+						ok: true,
+						result: { sessionId: `isolated-lane-${index + 1}` },
+					}),
+					expect(client.control("turn.prompt", { text: `probe lane ${index + 1}` })).resolves.toMatchObject({
+						ok: true,
+						result: { accepted: true },
+					}),
+				]),
+			);
+		} finally {
+			await Promise.all(clients.map(client => client.close()));
+			for (const dispose of frameDisposers) dispose?.();
+			await Promise.all(transports.map(transport => transport.stop().catch(() => undefined)));
+			await Promise.all(roots.map(root => fs.rm(root, { recursive: true, force: true })));
+		}
 	});
 
 	test("start waits for a pending stop before publishing a probeable replacement endpoint", async () => {
@@ -120,6 +226,7 @@ describe("SDK WebSocket transport lifecycle", () => {
 				chmod: async () => {
 					throw Object.assign(new Error("chmod injected failure"), { code: "EACCES" });
 				},
+				rename: real.rename,
 				rm: real.rm,
 			},
 		};
@@ -146,6 +253,7 @@ describe("SDK WebSocket transport lifecycle", () => {
 				mkdir: real.mkdir,
 				writeFile: real.writeFile,
 				chmod: real.chmod,
+				rename: real.rename,
 				rm: async (...args: Parameters<typeof real.rm>) => {
 					rmCalls += 1;
 					if (rmCalls === 1) throw Object.assign(new Error("rm injected failure"), { code: "EIO" });
