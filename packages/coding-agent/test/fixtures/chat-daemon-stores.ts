@@ -6,7 +6,8 @@ export class MemoryConversationStoreFs implements ConversationStoreFs {
 	readonly calls: string[] = [];
 	failWrite = false;
 	failRename = false;
-	failFileSync = false;
+	failLockSync = false;
+	failDocumentSync = false;
 	failDirectorySync = false;
 
 	async mkdir(directory: string, options: { recursive: true; mode: number }): Promise<void> {
@@ -79,7 +80,11 @@ export class MemoryConversationStoreFs implements ConversationStoreFs {
 		return {
 			sync: async () => {
 				this.calls.push(`sync:${file}`);
-				if ((isDirectory && this.failDirectorySync) || (!isDirectory && this.failFileSync)) {
+				if (
+					(isDirectory && this.failDirectorySync) ||
+					(file.endsWith(".pending") && this.failLockSync) ||
+					(file.endsWith(".tmp") && this.failDocumentSync)
+				) {
 					throw new Error("sync failed");
 				}
 			},

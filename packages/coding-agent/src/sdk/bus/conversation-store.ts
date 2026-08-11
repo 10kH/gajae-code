@@ -28,7 +28,7 @@ export interface ConversationStoreFs {
 	readFile(file: string, encoding: "utf8"): Promise<string>;
 	writeFile(file: string, data: string, options: { mode: number }): Promise<void>;
 	rename(from: string, to: string): Promise<void>;
-	link?(from: string, to: string): Promise<void>;
+	link(from: string, to: string): Promise<void>;
 	unlink(file: string): Promise<void>;
 	open(file: string, flags: string): Promise<ConversationStoreFileHandle>;
 	stat?(file: string): Promise<{ mtimeMs: number }>;
@@ -370,8 +370,6 @@ export class ConversationStore<T extends ConversationRecord> {
 	async #createLockFile(
 		lockFile: string,
 	): Promise<{ handle: ConversationStoreFileHandle; lock: ConversationStoreLock }> {
-		const link = this.#fs.link;
-		if (!link) throw new Error("ConversationStoreFs.link is required for atomic lock publication");
 		const pendingFile = `${lockFile}.${this.#pid}.${randomUUID()}.pending`;
 		const handle = await this.#fs.open(pendingFile, "wx");
 		let lock: ConversationStoreLock | undefined;
@@ -385,7 +383,7 @@ export class ConversationStore<T extends ConversationRecord> {
 			};
 			await handle.writeFile(`${JSON.stringify(lock)}\n`, "utf8");
 			await handle.sync();
-			await link.call(this.#fs, pendingFile, lockFile);
+			await this.#fs.link(pendingFile, lockFile);
 			published = true;
 			heldLockFiles.set(lockFile, lock.nonce!);
 			await this.#fs.unlink(pendingFile);
@@ -393,8 +391,11 @@ export class ConversationStore<T extends ConversationRecord> {
 		} catch (error) {
 			try {
 				await handle.close().catch(() => undefined);
-				if (published && lock) await this.#unlinkOwnedLock(lockFile, lock);
-				await this.#fs.unlink(pendingFile).catch(() => undefined);
+				try {
+					if (published && lock) await this.#unlinkOwnedLock(lockFile, lock);
+				} finally {
+					await this.#fs.unlink(pendingFile).catch(() => undefined);
+				}
 			} finally {
 				if (lock) this.#releaseHeldLock(lockFile, lock);
 			}

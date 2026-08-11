@@ -53,6 +53,34 @@ describe("ConversationStore", () => {
 		expect([...fs.files.keys()].some(file => file.endsWith(".pending"))).toBe(false);
 		expect(fs.files.has(lockFile)).toBe(false);
 	});
+	test("cleans the pending alias when published-lock cleanup fails", async () => {
+		const primaryError = new Error("primary lock unlink failed");
+		const pendingError = new Error("pending lock unlink failed");
+		class CleanupFailingFs extends MemoryConversationStoreFs {
+			pendingUnlinkAttempts = 0;
+			primaryUnlinkAttempts = 0;
+
+			override async unlink(file: string) {
+				if (file.endsWith(".pending")) {
+					this.pendingUnlinkAttempts++;
+					if (this.pendingUnlinkAttempts === 1) throw pendingError;
+				}
+				if (file.endsWith("conversations.json.lock")) {
+					this.primaryUnlinkAttempts++;
+					if (this.primaryUnlinkAttempts === 1) throw primaryError;
+				}
+				await super.unlink(file);
+			}
+		}
+		const fs = new CleanupFailingFs();
+		const store = new ConversationStore<TestConversation>({ agentDir: "/agent", kind: "discord", fs });
+		const lockFile = `${store.filePath}.lock`;
+
+		await expect(store.write("mapping", undefined, record(1))).rejects.toBe(primaryError);
+		expect(fs.pendingUnlinkAttempts).toBe(2);
+		expect([...fs.files.keys()].some(file => file.endsWith(".pending"))).toBe(false);
+		expect(fs.files.has(lockFile)).toBe(true);
+	});
 
 	test("keeps the primary lock path absent until complete metadata is synced", async () => {
 		const entered = Promise.withResolvers<void>();
@@ -86,6 +114,77 @@ describe("ConversationStore", () => {
 		await expect(write).resolves.toBe(true);
 		expect(fs.files.has(lockFile)).toBe(false);
 		expect(fs.calls.some(call => call.startsWith(`link:${lockFile}.`) && call.endsWith(`:${lockFile}`))).toBe(true);
+	});
+	test("publishes complete synced metadata before admitting a successor", async () => {
+		const enteredLink = Promise.withResolvers<void>();
+		const contenderAttempted = Promise.withResolvers<void>();
+		const releaseLink = Promise.withResolvers<void>();
+		const retryPermit = Promise.withResolvers<void>();
+		let firstLink = true;
+		class PublicationBarrierFs extends MemoryConversationStoreFs {
+			override async link(from: string, to: string): Promise<void> {
+				if (firstLink) {
+					firstLink = false;
+					const metadata = this.files.get(from);
+					expect(metadata).toBeDefined();
+					expect(JSON.parse(metadata!.trim())).toEqual({
+						pid: 101,
+						incarnation: "unavailable",
+						timestamp: 1,
+						nonce: expect.any(String),
+					});
+					expect(this.calls.at(-1)).toBe(`sync:${from}`);
+					await super.link(from, to);
+					enteredLink.resolve();
+					await releaseLink.promise;
+					return;
+				}
+				contenderAttempted.resolve();
+				await super.link(from, to);
+			}
+		}
+		const fs = new PublicationBarrierFs();
+		const first = new ConversationStore<TestConversation>({
+			agentDir: "/agent",
+			kind: "discord",
+			fs,
+			pid: 101,
+			pidIncarnation: () => undefined,
+			pidAlive: () => true,
+			now: () => 1,
+		});
+		const second = new ConversationStore<TestConversation>({
+			agentDir: "/agent",
+			kind: "discord",
+			fs,
+			pid: 202,
+			pidIncarnation: () => undefined,
+			pidAlive: () => true,
+			sleep: async () => await retryPermit.promise,
+		});
+		const lockFile = `${first.filePath}.lock`;
+		const firstWrite = first.write("mapping", undefined, record(1));
+		await enteredLink.promise;
+		expect(fs.files.has(lockFile)).toBe(true);
+		let secondSettled = false;
+		const secondWrite = second.write("mapping", undefined, record(1)).finally(() => {
+			secondSettled = true;
+		});
+		await contenderAttempted.promise;
+		expect(secondSettled).toBe(false);
+		releaseLink.resolve();
+		await expect(firstWrite).resolves.toBe(true);
+		retryPermit.resolve();
+		await expect(secondWrite).resolves.toBe(false);
+
+		const pendingSync = fs.calls.findIndex(call => call.startsWith(`sync:${lockFile}.`) && call.endsWith(".pending"));
+		const publication = fs.calls.findIndex(
+			call => call.startsWith(`link:${lockFile}.`) && call.endsWith(`:${lockFile}`),
+		);
+		expect(pendingSync).toBeGreaterThanOrEqual(0);
+		expect(publication).toBeGreaterThan(pendingSync);
+		expect([...fs.files.keys()].some(file => file.endsWith(".pending"))).toBe(false);
+		expect(fs.files.has(lockFile)).toBe(false);
 	});
 	test("keeps a failed published lock registered until cleanup cannot remove a successor", async () => {
 		const closeEntered = Promise.withResolvers<void>();
@@ -510,17 +609,24 @@ describe("ConversationStore", () => {
 		await expect(store.write("mapping", undefined, record(1))).resolves.toBe(true);
 		expect(fs.temporaryOpenFlags).toBe("r+");
 	});
-	test("keeps the prior document intact when fsync or rename fails", async () => {
+	test("keeps the prior document intact when staged document fsync or rename fails", async () => {
 		const fs = new MemoryConversationStoreFs();
 		const store = new ConversationStore<TestConversation>({ agentDir: "/agent", kind: "discord", fs, now: () => 4 });
 		await store.write("mapping", undefined, record(1));
-		fs.failFileSync = true;
+		const callsBeforeSecondWrite = fs.calls.length;
+		fs.failDocumentSync = true;
 		await expect(store.write("mapping", 1, record(2))).rejects.toThrow("sync failed");
-		fs.failFileSync = false;
+		const failedWriteCalls = fs.calls.slice(callsBeforeSecondWrite);
+		const lockSync = failedWriteCalls.findIndex(call => call.startsWith("sync:") && call.endsWith(".pending"));
+		const documentSync = failedWriteCalls.findIndex(
+			call => call.startsWith(`sync:${store.filePath}.`) && call.endsWith(".tmp"),
+		);
+		expect(lockSync).toBeGreaterThanOrEqual(0);
+		expect(documentSync).toBeGreaterThan(lockSync);
+		fs.failDocumentSync = false;
 		fs.failRename = true;
 		await expect(store.write("mapping", 1, record(2))).rejects.toThrow("rename failed");
 		expect(await store.read("mapping")).toEqual(record(1));
-		expect(fs.calls.some(call => call.startsWith("sync:/agent/sdk/daemons/discord/conversations.json."))).toBe(true);
 	});
 	class DirectoryBarrierFs extends MemoryConversationStoreFs {
 		directoryOpenError?: Error;

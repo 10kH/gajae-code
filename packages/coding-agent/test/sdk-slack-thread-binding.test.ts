@@ -83,6 +83,7 @@ function parentSyncFailingFs(directory: string): ConversationStoreFs & { failPar
 		readFile: async (file, encoding) => await fs.readFile(file, encoding),
 		writeFile: async (file, data, options) => await fs.writeFile(file, data, options),
 		rename: async (from, to) => await fs.rename(from, to),
+		link: async (from, to) => await fs.link(from, to),
 		unlink: async file => await fs.unlink(file),
 		stat: async file => await fs.stat(file),
 		open: async (file, flags) => {
