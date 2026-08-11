@@ -6529,6 +6529,7 @@ export const SessionManagerTestHooks: {
 	beforeManagedResumeAcceptance?: (filePath: string, storage: SessionStorage) => void;
 	beforeManagedResumeReturn?: (filePath: string, storage: SessionStorage) => void;
 	beforeManagedSourceStat?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
+	beforeManagedMissingInit?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
 	/** Internal first-open GC strategy override; omitted means current. */
 	firstOpenGcStrategy?: SessionMemoryGcStrategy;
 	/** Internal first-open secondary-artifact mode override; omitted means auto. */
@@ -18505,8 +18506,20 @@ export class SessionManager {
 				managedInspectionStore?.close();
 				throw error;
 			}
-			// An initially missing target is created by the ordinary managed path below.
-			managedInspectionStore?.assertBound();
+			if (managedInspectionStore) {
+				managedInspectionStore.assertBound();
+				await SessionManagerTestHooks.beforeManagedMissingInit?.(filePath, managedInspectionStorage);
+				managedInspectionStore.assertBound();
+				const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
+				manager.#sessionMemoryMode = sessionMemoryMode;
+				try {
+					await manager.#initSessionFile(filePath, true);
+					return manager;
+				} finally {
+					managedInspectionStore.close();
+				}
+			}
+			// Cross-directory missing candidates continue through the migration path below.
 		}
 		const managedResumeBounded =
 			managedSourceSize !== undefined &&

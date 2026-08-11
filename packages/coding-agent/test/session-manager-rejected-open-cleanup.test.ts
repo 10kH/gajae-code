@@ -440,4 +440,29 @@ describe("managed strict-resume target races", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
+
+	it("rejects root replacement after missing-target authority acceptance", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-missing-root-race-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "source.jsonl");
+		const replacement = transcript().replaceAll("rejected-open", "replacement");
+		SessionManagerTestHooks.beforeManagedMissingInit = async () => {
+			await fs.rm(destination.directory, { recursive: true, force: true });
+			await fs.mkdir(destination.directory, { recursive: true });
+			storage.writeTextSync(sourceFile, replacement);
+		};
+		try {
+			await expect(
+				SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled"),
+			).rejects.toThrow();
+			expect(storage.readTextSync(sourceFile)).toBe(replacement);
+		} finally {
+			SessionManagerTestHooks.beforeManagedMissingInit = undefined;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
 });
