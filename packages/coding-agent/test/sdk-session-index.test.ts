@@ -490,7 +490,7 @@ describe("SDK session index", () => {
 		});
 	}, 30_000);
 
-	it("compaction drops terminal+dead sessions and keeps live sessions with their original indexSeq", async () => {
+	it("compaction retains terminal sessions and keeps live sessions with their original indexSeq", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
 		const deadPid = await (async () => {
 			const proc = Bun.spawn({ cmd: ["true"] });
@@ -504,11 +504,15 @@ describe("SDK session index", () => {
 		await index.append(event("live2"));
 		await index.snapshot();
 		const snapshot = JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"));
-		expect(snapshot.events.map((e: { sessionId: string }) => e.sessionId)).toEqual(["live", "live2"]);
+		expect(snapshot.events.map((e: { sessionId: string }) => e.sessionId)).toEqual(["live", "dead", "dead", "live2"]);
 		expect(snapshot.events[0].indexSeq).toBe(1);
 		expect(snapshot.indexSeq).toBe(4);
 		const replay = await new SessionIndex(dir).open();
-		expect(replay.listSessions().sessions.map(s => s.sessionId)).toEqual(["live", "live2"]);
+		expect(replay.listSessions().sessions.map(s => s.sessionId)).toEqual(["live", "dead", "live2"]);
+		expect(replay.listSessions().sessions.find(session => session.sessionId === "dead")).toMatchObject({
+			live: false,
+			terminal: true,
+		});
 		expect(replay.indexSeq).toBe(4);
 	});
 	it("collapses superseded heartbeats to the latest per surviving session", async () => {
@@ -599,7 +603,7 @@ describe("SDK session index", () => {
 		const sessionsDir = path.join(dir, "sdk", "sessions");
 		await fs.mkdir(sessionsDir, { recursive: true });
 		const snapshotFile = path.join(sessionsDir, "index.snapshot.json");
-		await fs.writeFile(snapshotFile, JSON.stringify({ version: 3, indexSeq: 7, events: [] }));
+		await fs.writeFile(snapshotFile, JSON.stringify({ version: 4, indexSeq: 7, events: [] }));
 		const unsupported = new SessionIndex(dir);
 		expect(await unsupported.diagnose()).toMatchObject({ status: "unsupported", validPrefixSeq: 0, snapshotSeq: 7 });
 		expect(await unsupported.repair()).toMatchObject({ status: "unsupported", repaired: false });
@@ -824,8 +828,17 @@ describe("SDK session index", () => {
 		expect(await index.unregisterIfCurrent(predecessor)).toBe(false);
 		const successor = index.listSessions().sessions[0]!;
 		expect(successor).toMatchObject({ pid: 1002, lifecycleRequestId: "request-b" });
+		expect(await index.unregisterIfCurrent({ ...successor, hostIncarnation: "different-incarnation" })).toBe(false);
 		expect(await index.unregisterIfCurrent(successor)).toBe(true);
-		expect(index.listSessions().sessions).toEqual([]);
+		expect(index.listSessions().sessions).toEqual([
+			expect.objectContaining({
+				sessionId: "session",
+				pid: 1002,
+				lifecycleRequestId: "request-b",
+				live: false,
+				terminal: true,
+			}),
+		]);
 	});
 	it("does not unregister a concurrent terminal-uncertain record", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-uncertain-"));
@@ -851,6 +864,27 @@ describe("SDK session index", () => {
 		expect(index.listSessions().sessions[0]).toMatchObject({
 			sessionId: "session",
 			terminalUncertain: true,
+			live: false,
 		});
+	});
+	it("never exposes a terminal-uncertain identity as live", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-uncertain-live-"));
+		const index = await new SessionIndex(dir).open();
+		const registration = await index.append(event("session"));
+		expect(await index.checkpointLiveHeartbeats()).toBe(1);
+		expect(index.listSessions().sessions[0]).toMatchObject({ live: true });
+		await index.append({
+			type: "lifecycle_terminal",
+			sessionId: registration.sessionId,
+			locator: registration.locator,
+			endpointGeneration: registration.endpointGeneration,
+			pid: registration.pid,
+			...(registration.processIncarnation === undefined
+				? {}
+				: { processIncarnation: registration.processIncarnation }),
+			...(registration.hostIncarnation === undefined ? {} : { hostIncarnation: registration.hostIncarnation }),
+			terminalUncertain: true,
+		});
+		expect(index.listSessions().sessions[0]).toMatchObject({ terminalUncertain: true, live: false });
 	});
 });

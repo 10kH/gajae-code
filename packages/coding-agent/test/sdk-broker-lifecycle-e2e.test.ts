@@ -6,6 +6,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import { NotificationServer } from "@gajae-code/natives";
+import { logger } from "@gajae-code/utils";
 import { openLifecycleSessionManager, runSessionHost, watchSessionHostBrokerLiveness } from "../src/commands/sdk";
 import { planLaunchWorktree } from "../src/gjc-runtime/launch-worktree";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
@@ -3006,7 +3007,7 @@ test("broker rebinds implicit close only for a matching non-empty lifecycle requ
 		await broker.start();
 		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
 		for (const [label, initialRequestId, replacementRequestId, successor, expectedCode] of [
-			["same", "request-a", "request-a", false, "endpoint_stale"],
+			["same", "request-a", "request-a", false, "close_refused"],
 			["absent", undefined, undefined, false, "endpoint_stale"],
 			["empty", "", "", false, "endpoint_stale"],
 			["different", "request-a", "request-b", false, "endpoint_stale"],
@@ -3354,7 +3355,13 @@ test("conditional unregister accepts a reconciled equivalent repository locator"
 		});
 		expect(await index.unregisterIfCurrent(expected)).toBe(true);
 		expect(index.listSessions().sessions).toEqual([
-			expect.objectContaining({ sessionId: "reconciled-repo", terminal: true, live: false }),
+			expect.objectContaining({
+				sessionId: "reconciled-repo",
+				locator: { repo: repoAlias, stateRoot },
+				identityProvenance: "composite",
+				live: false,
+				terminal: true,
+			}),
 		]);
 	} finally {
 		await fs.rm(agentDir, { recursive: true, force: true });
@@ -4093,6 +4100,42 @@ test("broker close acknowledges before terminating the lifecycle child and prese
 		).toMatchObject({ type: "host_unregistered", sessionId });
 		expect(await broker.handleRequest("session.close", { sessionId }, "close-1")).toEqual(closed);
 	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 20_000);
+
+test("broker preserves an acknowledged session.close result when endpoint client close rejects", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-close-cleanup-rejection-"));
+	const agentDir = path.join(root, "agent");
+	const sessionId = "close-cleanup-rejection";
+	const broker = new Broker({ agentDir });
+	const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	const close = vi
+		.spyOn(SdkClient.prototype, "close")
+		.mockRejectedValue(new Error("injected endpoint client close handshake rejection"));
+	try {
+		await broker.start();
+		const { child } = await liveLifecycleSession(root, agentDir, sessionId);
+		await waitFor(async () => {
+			const listed = (await broker.handleRequest("session.list", {})) as {
+				result?: { sessions?: Array<{ sessionId?: string }> };
+			};
+			return listed.result?.sessions?.some(session => session.sessionId === sessionId) ? true : undefined;
+		}, "session indexed before rejected client cleanup");
+
+		expect(await broker.handleRequest("session.close", { sessionId }, "close-cleanup-rejection")).toMatchObject({
+			ok: true,
+			result: { sessionId },
+		});
+		expect(await child.exited).toBe(0);
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(warning).toHaveBeenCalledWith(
+			"SDK session-close client cleanup failed after control dispatch: injected endpoint client close handshake rejection",
+		);
+	} finally {
+		close.mockRestore();
+		warning.mockRestore();
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}

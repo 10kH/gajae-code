@@ -1004,6 +1004,7 @@ export class Broker {
 				Math.min(BROKER_PUBLICATION_CADENCE_MS, Math.floor(this.settings.heartbeatTtlMs / 3)),
 			);
 			this.#heartbeatTimer = setInterval(() => void this.#watchPublication(), cadenceMs);
+			await this.#checkpointSessionHeartbeats();
 			return this.discovery;
 		} catch (error) {
 			await this.#transport?.stop();
@@ -1070,6 +1071,7 @@ export class Broker {
 			this.#lossAt = null;
 			this.#ambiguousAt = null;
 			if (writeHeartbeat) await this.#writeHeartbeat();
+			if (this.#publicationState === "healthy-owned") await this.#checkpointSessionHeartbeats();
 			return;
 		}
 		this.#fence(observation === "ambiguous" ? "observation-ambiguous" : "suspect-unpublished");
@@ -1095,6 +1097,17 @@ export class Broker {
 	async heartbeat(): Promise<void> {
 		if (this.#publicationState !== "healthy-owned") return;
 		await this.#writeHeartbeat();
+	}
+	/** Re-observes provably live session hosts and checkpoints their liveness. */
+	async heartbeatSessions(now = Date.now()): Promise<number> {
+		return await this.index.checkpointLiveHeartbeats(now);
+	}
+	async #checkpointSessionHeartbeats(): Promise<void> {
+		try {
+			await this.heartbeatSessions();
+		} catch (error) {
+			logger.warn(`sdk broker: session heartbeat checkpoint failed: ${String(error)}`);
+		}
 	}
 	async #complete(mode: BrokerStopMode): Promise<void> {
 		if (this.#completionTask) return this.#completionTask;
@@ -1188,7 +1201,12 @@ export class Broker {
 		const authority = expectedEndpointAuthority(input);
 		if ("ok" in authority) return authority;
 		await this.index.refresh();
-		const record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		let record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		if (record && !record.live && !record.terminal && !record.terminalUncertain) {
+			await this.heartbeatSessions();
+			await this.index.refresh();
+			record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		}
 		if (!record) return error("resource_gone", "session is not indexed");
 		if (!matchesEndpointAuthority(record, authority)) return error("endpoint_stale", "session endpoint is stale");
 		if (!record.live) return error("resource_gone", "session endpoint record is gone");

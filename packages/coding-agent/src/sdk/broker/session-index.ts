@@ -324,6 +324,7 @@ function reduceEvents(events: SessionIndexEvent[], now: number): IndexedSession[
 		if (latest === undefined) continue;
 		const terminal = latest.type === "host_unregistered" || latest.type === "session_closed";
 		if (latest.type === "session_deleted") continue;
+		const terminalUncertain = latest.type === "lifecycle_terminal" || latest.terminalUncertain === true;
 		const heartbeat = latestHeartbeatByIdentity.get(chosen.identity);
 		const pidAlive = alive(latest.pid);
 		const heartbeatFresh = heartbeat !== undefined && now - heartbeat.ts < 2 * SESSION_HEARTBEAT_INTERVAL_MS;
@@ -338,7 +339,7 @@ function reduceEvents(events: SessionIndexEvent[], now: number): IndexedSession[
 			processIncarnation: latest.processIncarnation,
 			endpointMtimeMs: latest.endpointMtimeMs,
 			lifecycleRequestId: latest.lifecycleRequestId,
-			terminalUncertain: latest.type === "lifecycle_terminal" || latest.terminalUncertain === true,
+			terminalUncertain,
 			indexSeq: latest.indexSeq,
 			hostIncarnation: latest.hostIncarnation,
 			identityProvenance: recordedIncarnation === undefined ? "legacy" : "composite",
@@ -346,7 +347,7 @@ function reduceEvents(events: SessionIndexEvent[], now: number): IndexedSession[
 			lastHeartbeatAt: heartbeat?.ts,
 			ambiguous: (roots.get(sessionId)?.size ?? 0) > 1,
 			terminal,
-			live: !terminal && pidAlive && heartbeatFresh && incarnationMatches,
+			live: !terminal && !terminalUncertain && pidAlive && heartbeatFresh && incarnationMatches,
 		});
 	}
 	return sessions;
@@ -912,6 +913,8 @@ export class SessionIndex {
 					current.endpointMtimeMs !== expected.endpointMtimeMs ||
 					current.lifecycleRequestId !== expected.lifecycleRequestId ||
 					current.processIncarnation !== expected.processIncarnation ||
+					(current.hostIncarnation ?? current.processIncarnation) !==
+						(expected.hostIncarnation ?? expected.processIncarnation) ||
 					resolveEquivalentPath(current.locator.repo) !== resolveEquivalentPath(expected.locator.repo) ||
 					path.resolve(current.locator.stateRoot) !== path.resolve(expected.locator.stateRoot)
 				)
@@ -928,6 +931,7 @@ export class SessionIndex {
 					...(expected.processIncarnation === undefined
 						? {}
 						: { processIncarnation: expected.processIncarnation }),
+					...(expected.hostIncarnation === undefined ? {} : { hostIncarnation: expected.hostIncarnation }),
 					...(expected.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: expected.endpointMtimeMs }),
 					...(expected.lifecycleRequestId === undefined
 						? {}
@@ -1048,7 +1052,7 @@ export class SessionIndex {
 				const events: SessionIndexEvent[] = [];
 				const rows = reduceEvents(this.#events, now);
 				for (const row of rows) {
-					if (row.terminal) continue;
+					if (row.terminal || row.terminalUncertain) continue;
 					if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)
 						continue;
 					if (!alive(row.pid)) continue;
@@ -1083,10 +1087,17 @@ export class SessionIndex {
 	hostUnregisteredAfter(
 		registration: Pick<
 			IndexedSession,
-			"sessionId" | "endpointGeneration" | "pid" | "indexSeq" | "lifecycleRequestId"
+			| "sessionId"
+			| "endpointGeneration"
+			| "pid"
+			| "indexSeq"
+			| "lifecycleRequestId"
+			| "hostIncarnation"
+			| "processIncarnation"
 		>,
 	): { indexSeq: number; lifecycleRequestId?: string } | undefined {
 		const lifecycleRequestId = registration.lifecycleRequestId;
+		const incarnation = registration.hostIncarnation ?? registration.processIncarnation;
 		const event = this.#events.findLast(
 			item =>
 				item.type === "host_unregistered" &&
@@ -1094,7 +1105,8 @@ export class SessionIndex {
 				item.sessionId === registration.sessionId &&
 				item.endpointGeneration === registration.endpointGeneration &&
 				item.pid === registration.pid &&
-				(lifecycleRequestId === undefined || item.lifecycleRequestId === lifecycleRequestId),
+				(lifecycleRequestId === undefined || item.lifecycleRequestId === lifecycleRequestId) &&
+				(incarnation === undefined || (item.hostIncarnation ?? item.processIncarnation) === incarnation),
 		);
 		return event
 			? {

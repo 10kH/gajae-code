@@ -173,6 +173,140 @@ async function routerFixture(
 	};
 }
 
+interface ManualTimeouts {
+	readonly clearTimeout: typeof clearTimeout;
+	readonly fire: () => void;
+	readonly pending: () => number;
+	readonly setTimeout: typeof setTimeout;
+}
+
+function manualTimeouts(): ManualTimeouts {
+	const timers = new Map<number, () => void>();
+	let nextTimer = 0;
+	return {
+		setTimeout: ((callback: () => void) => {
+			const timer = ++nextTimer;
+			timers.set(timer, callback);
+			return timer;
+		}) as unknown as typeof setTimeout,
+		clearTimeout: ((timer: number) => {
+			timers.delete(timer);
+		}) as unknown as typeof clearTimeout,
+		pending: () => timers.size,
+		fire: () => {
+			const timer = timers.entries().next().value;
+			if (!timer || timers.size !== 1) throw new Error("Expected exactly one pending attach deadline.");
+			const [id, callback] = timer;
+			timers.delete(id);
+			callback();
+		},
+	};
+}
+
+async function waitFor(condition: () => boolean, message: string): Promise<void> {
+	for (let attempt = 0; attempt < 50; attempt++) {
+		if (condition()) return;
+		await Bun.sleep(10);
+	}
+	throw new Error(message);
+}
+
+interface HungRouterFixture {
+	readonly deadlines: ManualTimeouts;
+	readonly healthyPublished: Promise<void>;
+	readonly healthySent: Record<string, unknown>[];
+	readonly hungConnections: () => number;
+	readonly reconciliations: () => number;
+	readonly router: SessionRouter;
+	readonly tick: () => void;
+}
+
+function hungRouterFixture(): HungRouterFixture {
+	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-hung-"));
+	tempDirs.push(repo);
+	const agentDir = path.join(repo, ".gjc", "agent");
+	const stateRoot = path.join(repo, ".gjc", "state");
+	const endpointDir = path.join(stateRoot, "sdk");
+	fs.mkdirSync(endpointDir, { recursive: true });
+	const indexed = [
+		{ sessionId: "router-hung", url: "ws://hung.test", token: "hung-secret" },
+		{ sessionId: "router-healthy", url: "ws://healthy.test", token: "healthy-secret" },
+	] as const;
+	const endpointMtimeMs = new Map<string, number>();
+	for (const session of indexed) {
+		const endpointFile = path.join(endpointDir, `${session.sessionId}.json`);
+		fs.writeFileSync(endpointFile, `${JSON.stringify({ ...session, pid: 42 })}\n`);
+		endpointMtimeMs.set(session.sessionId, fs.statSync(endpointFile).mtimeMs);
+	}
+	const index = {
+		open: async () => {},
+		refresh: async () => {},
+		listSessions: () => ({
+			indexSeq: 1,
+			sessions: indexed.map(session => ({
+				sessionId: session.sessionId,
+				locator: { repo, stateRoot },
+				endpointGeneration: 1,
+				pid: 42,
+				endpointMtimeMs: endpointMtimeMs.get(session.sessionId),
+				live: true,
+				indexSeq: 1,
+			})),
+			warnings: [],
+		}),
+	} as unknown as SessionIndex;
+	const deadlines = manualTimeouts();
+	const healthyPublished = Promise.withResolvers<void>();
+	const healthySent: Record<string, unknown>[] = [];
+	let hungConnections = 0;
+	let reconciliations = 0;
+	let reconcileTick: (() => void) | undefined;
+	const router = new SessionRouter({
+		agentDir,
+		deps: {
+			createIndex: () => index,
+			createClient: async authority => {
+				if (authority.sessionId === "router-hung") {
+					hungConnections++;
+					const connection = Promise.withResolvers<SessionRouterClient>();
+					return await connection.promise;
+				}
+				return {
+					onFrame: () => () => {},
+					request: async () => ({ events: [] }),
+					close: async () => {},
+					send: frame => healthySent.push(frame),
+				};
+			},
+			onAttachmentReady: attachment => {
+				if (attachment.sessionId === "router-healthy") healthyPublished.resolve();
+			},
+			onReconciled: () => {
+				reconciliations++;
+			},
+			setInterval: ((callback: () => void) => {
+				reconcileTick = callback;
+				return 0;
+			}) as unknown as typeof setInterval,
+			clearInterval: (() => {}) as unknown as typeof clearInterval,
+			setTimeout: deadlines.setTimeout,
+			clearTimeout: deadlines.clearTimeout,
+		},
+	});
+	return {
+		deadlines,
+		healthyPublished: healthyPublished.promise,
+		healthySent,
+		hungConnections: () => hungConnections,
+		reconciliations: () => reconciliations,
+		router,
+		tick: () => {
+			if (!reconcileTick) throw new Error("SessionRouter interval was not installed.");
+			reconcileTick();
+		},
+	};
+}
+
 describe("SessionRouter dispatch authority", () => {
 	test("contains an unreachable indexed endpoint while attaching healthy sessions", async () => {
 		const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-reconcile-"));
@@ -255,72 +389,67 @@ describe("SessionRouter dispatch authority", () => {
 		}
 	});
 
-	test("attaches a healthy session while another endpoint connection never settles", async () => {
-		const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-concurrent-"));
-		tempDirs.push(repo);
-		const agentDir = path.join(repo, ".gjc", "agent");
-		const stateRoot = path.join(repo, ".gjc", "state");
-		const endpointDir = path.join(stateRoot, "sdk");
-		fs.mkdirSync(endpointDir, { recursive: true });
-		const indexed = [
-			{ sessionId: "router-hung", url: "ws://hung.test", token: "hung-secret" },
-			{ sessionId: "router-healthy", url: "ws://healthy.test", token: "healthy-secret" },
-		] as const;
-		const endpointMtimeMs = new Map<string, number>();
-		for (const session of indexed) {
-			const endpointFile = path.join(endpointDir, `${session.sessionId}.json`);
-			fs.writeFileSync(endpointFile, `${JSON.stringify({ ...session, pid: 42 })}\n`);
-			endpointMtimeMs.set(session.sessionId, fs.statSync(endpointFile).mtimeMs);
-		}
-		const index = {
-			open: async () => {},
-			refresh: async () => {},
-			listSessions: () => ({
-				indexSeq: 1,
-				sessions: indexed.map(session => ({
-					sessionId: session.sessionId,
-					locator: { repo, stateRoot },
-					endpointGeneration: 1,
-					pid: 42,
-					endpointMtimeMs: endpointMtimeMs.get(session.sessionId),
-					live: true,
-					indexSeq: 1,
-				})),
-				warnings: [],
-			}),
-		} as unknown as SessionIndex;
-		const neverSettling = Promise.withResolvers<SessionRouterClient>();
-		const healthyPublished = Promise.withResolvers<void>();
-		const router = new SessionRouter({
-			agentDir,
-			deps: {
-				createIndex: () => index,
-				createClient: async authority => {
-					if (authority.sessionId === "router-hung") return await neverSettling.promise;
-					return {
-						onFrame: () => () => {},
-						request: async () => ({ events: [] }),
-						close: async () => {},
-						send: () => {},
-					};
-				},
-				onAttachmentReady: attachment => {
-					if (attachment.sessionId === "router-healthy") healthyPublished.resolve();
-				},
-				setInterval: (() => 0) as unknown as typeof setInterval,
-				clearInterval: (() => {}) as unknown as typeof clearInterval,
-			},
-		});
-		const starting = router.start();
+	test("bounds a never-settling attachment without stopping the router", async () => {
+		const fixture = hungRouterFixture();
+		const starting = fixture.router.start();
 		try {
-			const attached = await Promise.race([
-				healthyPublished.promise.then(() => true),
-				Bun.sleep(250).then(() => false),
-			]);
-			expect(attached).toBe(true);
-			expect(router.attachment("router-healthy")?.isCurrent()).toBe(true);
+			await fixture.healthyPublished;
+			const healthy = fixture.router.attachment("router-healthy");
+			if (!healthy) throw new Error("Healthy attachment was not published.");
+			expect(healthy.isCurrent()).toBe(true);
+			expect(fixture.router.attachment("router-hung")).toBeNull();
+			expect(fixture.hungConnections()).toBe(1);
+			expect(fixture.deadlines.pending()).toBe(1);
+
+			fixture.deadlines.fire();
+			await starting;
+			expect(fixture.router.isReady()).toBe(true);
+			expect(fixture.reconciliations()).toBe(1);
+			expect(fixture.router.attachment("router-healthy")).toBe(healthy);
+			expect(healthy.isCurrent()).toBe(true);
+
+			fixture.tick();
+			await waitFor(() => fixture.hungConnections() === 2, "Hung endpoint was not retried.");
+			expect(fixture.deadlines.pending()).toBe(1);
+			fixture.deadlines.fire();
+			await waitFor(() => fixture.reconciliations() === 2, "Reconciliation did not continue after the deadline.");
+			expect(fixture.router.attachment("router-hung")).toBeNull();
+			expect(fixture.router.attachment("router-healthy")).toBe(healthy);
+			expect(healthy.isCurrent()).toBe(true);
 		} finally {
-			await router.stop();
+			await fixture.router.stop();
+			await starting;
+		}
+	});
+
+	test("coalesces hung-endpoint poll ticks while keeping a healthy attachment dispatchable", async () => {
+		const fixture = hungRouterFixture();
+		const starting = fixture.router.start();
+		try {
+			await fixture.healthyPublished;
+			fixture.deadlines.fire();
+			await starting;
+			const healthy = fixture.router.attachment("router-healthy");
+			if (!healthy) throw new Error("Healthy attachment was not published.");
+
+			fixture.tick();
+			await waitFor(() => fixture.hungConnections() === 2, "Hung endpoint did not begin reconciliation.");
+			for (let tick = 0; tick < 6; tick++) fixture.tick();
+			const dispatched = Promise.resolve(healthy.send({ type: "healthy-dispatch" }));
+
+			fixture.deadlines.fire();
+			await waitFor(() => fixture.hungConnections() === 3, "Coalesced reconciliation did not begin.");
+			expect(fixture.deadlines.pending()).toBe(1);
+			fixture.deadlines.fire();
+			const settled = await Promise.race([dispatched.then(() => true), Bun.sleep(250).then(() => false)]);
+			expect(settled).toBe(true);
+			expect(fixture.hungConnections()).toBe(3);
+			expect(fixture.reconciliations()).toBe(3);
+			expect(fixture.router.attachment("router-healthy")).toBe(healthy);
+			expect(healthy.isCurrent()).toBe(true);
+			expect(fixture.healthySent).toEqual([{ type: "healthy-dispatch" }]);
+		} finally {
+			await fixture.router.stop();
 			await starting;
 		}
 	});

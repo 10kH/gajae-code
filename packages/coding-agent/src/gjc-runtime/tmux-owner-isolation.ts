@@ -1503,15 +1503,16 @@ const liveOwnerTerminalObservations = new Map<string, Promise<OwnerVerdict>>();
 export async function observeOwnerTerminal(request: ObserveTerminalRequest): Promise<OwnerVerdict> {
 	if (!isObserveTerminalRequest(request)) throw new Error("terminal_observation_invalid");
 	const paths = lifecyclePaths(request.state_dir, request.session_id, request.owner_generation);
-	const existing = liveOwnerTerminalObservations.get(paths.root);
+	const observationKey = JSON.stringify([paths.verdictFile, request.socket_key]);
+	const existing = liveOwnerTerminalObservations.get(observationKey);
 	if (existing) return existing;
 	const observation = observeOwnerTerminalExclusive(request);
-	liveOwnerTerminalObservations.set(paths.root, observation);
+	liveOwnerTerminalObservations.set(observationKey, observation);
 	try {
 		return await observation;
 	} finally {
-		if (liveOwnerTerminalObservations.get(paths.root) === observation)
-			liveOwnerTerminalObservations.delete(paths.root);
+		if (liveOwnerTerminalObservations.get(observationKey) === observation)
+			liveOwnerTerminalObservations.delete(observationKey);
 	}
 }
 

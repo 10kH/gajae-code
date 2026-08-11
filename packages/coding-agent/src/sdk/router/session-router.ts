@@ -76,6 +76,8 @@ export interface SessionRouterDeps {
 	onReconciled?: () => void;
 	setInterval?: typeof setInterval;
 	clearInterval?: typeof clearInterval;
+	setTimeout?: typeof setTimeout;
+	clearTimeout?: typeof clearTimeout;
 }
 
 export interface SessionRouterOptions {
@@ -253,6 +255,7 @@ export class SessionRouter {
 	readonly #reviving = new Set<string>();
 	#stopTimer: (() => void) | undefined;
 	#reconcileTail: Promise<void> = Promise.resolve();
+	#reconcilePending: { readonly runEpoch: number } | undefined;
 	#ready = false;
 	#started = false;
 	#stopController = new AbortController();
@@ -277,6 +280,7 @@ export class SessionRouter {
 		if (this.#stopController.signal.aborted) {
 			this.#stopController = new AbortController();
 			this.#reconcileTail = Promise.resolve();
+			this.#reconcilePending = undefined;
 			this.#frameTails.clear();
 		}
 		try {
@@ -579,10 +583,16 @@ export class SessionRouter {
 		}
 	}
 
-	async #serialReconcile(runEpoch: number): Promise<void> {
+	#serialReconcile(runEpoch: number): Promise<void> {
+		if (!this.#running(runEpoch)) return Promise.resolve();
+		const pending = this.#reconcilePending;
+		if (pending?.runEpoch === runEpoch) return this.#reconcileTail;
+		const queued = { runEpoch };
+		this.#reconcilePending = queued;
 		const task = this.#reconcileTail
 			.catch(() => undefined)
 			.then(async () => {
+				if (this.#reconcilePending === queued) this.#reconcilePending = undefined;
 				try {
 					await this.#reconcile(runEpoch);
 					if (!this.#running(runEpoch)) return;
@@ -594,7 +604,7 @@ export class SessionRouter {
 				}
 			});
 		this.#reconcileTail = task;
-		return await task;
+		return task;
 	}
 
 	async #reconcile(runEpoch: number): Promise<void> {
@@ -754,7 +764,7 @@ export class SessionRouter {
 		const onStop = (): void => stopped.resolve();
 		if (!this.#running(runEpoch) || signal.aborted) onStop();
 		else signal.addEventListener("abort", onStop, { once: true });
-		const timer = setTimeout(() => timeout.resolve(), ATTACH_CONNECT_TIMEOUT_MS);
+		const timer = (this.#deps.setTimeout ?? setTimeout)(() => timeout.resolve(), ATTACH_CONNECT_TIMEOUT_MS);
 		timer.unref?.();
 		try {
 			const outcome = await Promise.race([
@@ -768,7 +778,7 @@ export class SessionRouter {
 			if (outcome.kind === "stopped") return undefined;
 			throw new SessionRouterError("pre_send", "SDK session attachment connection timed out.");
 		} finally {
-			clearTimeout(timer);
+			(this.#deps.clearTimeout ?? clearTimeout)(timer);
 			signal.removeEventListener("abort", onStop);
 		}
 	}

@@ -348,7 +348,11 @@ export class TelegramAdoptionIntentStore {
 		this.#pendingTopics.set(stored.topicId, stored);
 	}
 
-	async #writeSidecar(file: string, payload: PersistedIntent | PersistedPendingTopic): Promise<void> {
+	async #writeSidecar(
+		file: string,
+		payload: PersistedIntent | PersistedPendingTopic,
+		retainRenamedFileOnFailure = false,
+	): Promise<void> {
 		await this.#fsImpl.mkdir(this.#dir, { recursive: true, mode: 0o700 });
 		await this.#fsImpl.chmod(this.#dir, 0o700);
 		const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
@@ -367,6 +371,7 @@ export class TelegramAdoptionIntentStore {
 			await this.#fsImpl.chmod(file, 0o600);
 			await this.#syncParentDirectory();
 		} catch (error) {
+			if (renamed && retainRenamedFileOnFailure) throw new SidecarDurabilityUncertainError(error);
 			const cleanupTarget = renamed ? file : temporary;
 			let cleanupError: unknown;
 			try {
@@ -541,9 +546,14 @@ export class TelegramAdoptionIntentStore {
 	async #migrateIntentSidecar(file: string, intent: TelegramAdoptionIntent): Promise<void> {
 		const destination = adoptionIntentFilePath(this.#agentDir, intent.providerRequestKey);
 		try {
-			await this.#writeSidecar(destination, { version: TELEGRAM_ADOPTION_INTENT_VERSION, intent });
+			await this.#writeSidecar(
+				destination,
+				{ version: TELEGRAM_ADOPTION_INTENT_VERSION, intent },
+				destination === file,
+			);
 		} catch (error) {
-			logMigrationFailure("intent", "write", error);
+			if (error instanceof SidecarDurabilityUncertainError) logMigrationDurabilityUncertain("intent", error);
+			else logMigrationFailure("intent", "write", error);
 			return;
 		}
 		if (destination === file) return;
@@ -557,12 +567,14 @@ export class TelegramAdoptionIntentStore {
 	async #migratePendingTopicSidecar(file: string, pendingTopic: TelegramPendingTopic): Promise<void> {
 		const destination = pendingTopicFilePath(this.#agentDir, pendingTopic.topicId);
 		try {
-			await this.#writeSidecar(destination, {
-				version: TELEGRAM_ADOPTION_INTENT_VERSION,
-				pendingTopic,
-			});
+			await this.#writeSidecar(
+				destination,
+				{ version: TELEGRAM_ADOPTION_INTENT_VERSION, pendingTopic },
+				destination === file,
+			);
 		} catch (error) {
-			logMigrationFailure("pending_topic", "write", error);
+			if (error instanceof SidecarDurabilityUncertainError) logMigrationDurabilityUncertain("pending_topic", error);
+			else logMigrationFailure("pending_topic", "write", error);
 			return;
 		}
 		if (destination === file) return;
@@ -606,6 +618,24 @@ function migrationFailureMessage(error: unknown): string {
 	return message.length <= MIGRATION_DIAGNOSTIC_MAX_LENGTH
 		? message
 		: `${message.slice(0, MIGRATION_DIAGNOSTIC_MAX_LENGTH - 1)}…`;
+}
+
+class SidecarDurabilityUncertainError extends Error {
+	constructor(error: unknown) {
+		super(migrationFailureMessage(error));
+		this.name = "SidecarDurabilityUncertainError";
+	}
+}
+
+function logMigrationDurabilityUncertain(sidecar: "intent" | "pending_topic", error: unknown): void {
+	logger.warn(
+		"notifications: Telegram adoption sidecar migration durability is uncertain; retained migrated v2 sidecar",
+		{
+			sidecar,
+			stage: "durability",
+			error: migrationFailureMessage(error),
+		},
+	);
 }
 
 function logMigrationFailure(sidecar: "intent" | "pending_topic", stage: "write" | "unlink", error: unknown): void {

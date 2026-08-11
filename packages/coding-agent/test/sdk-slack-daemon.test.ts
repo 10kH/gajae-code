@@ -7,7 +7,7 @@ import { ChatEffectJournal } from "../src/sdk/bus/chat-effect-journal";
 import { ConversationStore } from "../src/sdk/bus/conversation-store";
 import type { SlackConversation } from "../src/sdk/bus/slack-conversation";
 import { SlackEndpointBindingError, SlackNotificationDaemon } from "../src/sdk/bus/slack-daemon";
-import { SlackProviderError } from "../src/sdk/bus/slack-live-provider";
+import { SlackLiveProvider, SlackProviderError } from "../src/sdk/bus/slack-live-provider";
 import { SlackProvider, type SlackSocketEnvelope } from "../src/sdk/bus/slack-provider";
 import { SdkClientError } from "../src/sdk/client/client";
 import { type SessionAttachment, SessionRouterError } from "../src/sdk/router";
@@ -2393,6 +2393,95 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		);
 	});
 
+	it("returns after the retirement deadline while slow journal terminalization keeps the old scope fenced", async () => {
+		let commands = 0;
+		let retiring = false;
+		let nowCalls = 0;
+		await withDaemon(
+			async (daemon, fake, _injected, _setEndpointGeneration, agentDir) => {
+				const root = await daemon.postRoot("session", "root");
+				fake.onAck = async () => {
+					throw new Error("crash after acknowledgement");
+				};
+				await expect(
+					daemon.handleEnvelope(
+						messageEnvelope("claimed", "retirement-liveness", root.rootTs!, {
+							clientMsgId: "retirement-liveness-id",
+							text: "/sdk control turn.prompt {}",
+						}),
+					),
+				).rejects.toThrow("crash after acknowledgement");
+
+				const journal = new ChatEffectJournal({ agentDir, transport: "slack" });
+				const effect = (await journal.list()).find(candidate => candidate.id.startsWith("inbound:"));
+				if (!effect) throw new Error("Inbound command effect was not journaled");
+				const lockPath = `${journal.filePath}.lock`;
+				await fs.writeFile(
+					lockPath,
+					`${JSON.stringify({ pid: process.pid, incarnation: "unavailable", timestamp: Date.now() })}\n`,
+					{ mode: 0o600 },
+				);
+				try {
+					retiring = true;
+					const retirement = daemon.retireAttachment("session", 1);
+					expect(
+						await Promise.race([
+							retirement.then(() => "retired" as const),
+							Bun.sleep(100).then(() => "blocked" as const),
+						]),
+					).toBe("retired");
+
+					const key = "T1:C1:intent:session";
+					const fenced = await daemon.store.read(key);
+					expect(fenced?.state).toBe("closed_marker");
+					expect(fenced?.inboundDispatches).toEqual([]);
+
+					fake.onAck = undefined;
+					await daemon.store.transact(key, current =>
+						current
+							? {
+									...current,
+									state: "active",
+									endpointGeneration: 1,
+									attachmentAuthorityId: "session:1",
+									generation: current.generation + 1,
+									updatedAt: current.updatedAt + 1,
+								}
+							: current,
+					);
+					const replaying = daemon.handleEnvelope(
+						messageEnvelope("replay", "retirement-liveness", root.rootTs!, {
+							clientMsgId: "retirement-liveness-id",
+							text: "/sdk control turn.prompt {}",
+						}),
+					);
+					await Bun.sleep(20);
+					expect(commands).toBe(0);
+
+					await fs.rm(lockPath, { force: true });
+					await expect(replaying).resolves.toBe(false);
+					await retirement;
+					expect(await journal.read(effect.id)).toMatchObject({
+						state: "terminal",
+						receipt: { status: "stale_binding" },
+					});
+					expect(commands).toBe(0);
+				} finally {
+					retiring = false;
+					nowCalls = 0;
+					await fs.rm(lockPath, { force: true });
+				}
+			},
+			{
+				now: () => (retiring ? (nowCalls++ === 0 ? 0 : 5_001) : 0),
+				onCommand: async () => {
+					commands++;
+					return true;
+				},
+			},
+		);
+	});
+
 	it("waits for an admitted provider post before attachment retirement completes", async () => {
 		const releasePost = Promise.withResolvers<void>();
 		const providerPosted = Promise.withResolvers<void>();
@@ -2466,11 +2555,6 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 
 				expect(fake.postSignals).toHaveLength(1);
 				expect(fake.postSignals[0]?.aborted).toBe(true);
-				const effect = (await new ChatEffectJournal({ agentDir, transport: "slack" }).list()).find(candidate =>
-					candidate.id.startsWith("notification:"),
-				);
-				expect(effect).toMatchObject({ state: "terminal", receipt: { status: "stale_binding" } });
-
 				releasePost.resolve();
 				expect(
 					await posting.then(
@@ -2478,11 +2562,65 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 						() => "rejected" as const,
 					),
 				).toBe("rejected");
+				const effect = (await new ChatEffectJournal({ agentDir, transport: "slack" }).list()).find(candidate =>
+					candidate.id.startsWith("notification:"),
+				);
+				expect(effect).toMatchObject({ state: "terminal", receipt: { status: "stale_binding" } });
 				expect(fake.posts.map(post => post.text)).toEqual(["root"]);
 				retiring = false;
 				nowCalls = 0;
 			},
 			{ now: () => (retiring ? (nowCalls++ === 0 ? 0 : 5_001) : 0) },
 		);
+	});
+
+	it("aborts a rate-limit backoff before issuing another fetch", async () => {
+		const backoff = Promise.withResolvers<void>();
+		const sleepStarted = Promise.withResolvers<void>();
+		let fetches = 0;
+		const provider = new SlackLiveProvider({
+			appToken: "xapp-test",
+			botToken: "xoxb-test",
+			fetch: async () => {
+				fetches++;
+				if (fetches === 1)
+					return new Response(JSON.stringify({ ok: false }), {
+						status: 429,
+						headers: { "Content-Type": "application/json", "Retry-After": "60" },
+					});
+				throw new Error("Unexpected Slack retry after cancellation");
+			},
+			sleep: async () => {
+				sleepStarted.resolve();
+				await backoff.promise;
+			},
+		});
+		const controller = new AbortController();
+		const posting = provider.postMessage({
+			channel: "C1",
+			text: "hello",
+			clientMsgId: "client-1",
+			signal: controller.signal,
+		});
+		await sleepStarted.promise;
+		try {
+			controller.abort();
+			expect(
+				await Promise.race([
+					posting.then(
+						() => "fulfilled" as const,
+						() => "aborted" as const,
+					),
+					Bun.sleep(100).then(() => "blocked" as const),
+				]),
+			).toBe("aborted");
+			expect(fetches).toBe(1);
+			backoff.resolve();
+			await Promise.resolve();
+			expect(fetches).toBe(1);
+		} finally {
+			backoff.resolve();
+			await posting.catch(() => undefined);
+		}
 	});
 });
