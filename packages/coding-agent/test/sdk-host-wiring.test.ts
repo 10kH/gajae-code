@@ -105,14 +105,16 @@ function pauseNextReconciliationCommit(
 	started: Promise<void>;
 	release: () => void;
 	restore: () => void;
+	arm: () => void;
 } {
 	const target = reconciliationStorePath(sessionFile, sessionId);
 	const started = Promise.withResolvers<void>();
 	const release = Promise.withResolvers<void>();
 	const realRename = fsPromises.rename.bind(fsPromises);
+	let armed = false;
 	let paused = false;
 	const rename = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
-		if (!paused && String(to) === target) {
+		if (armed && !paused && String(to) === target) {
 			paused = true;
 			started.resolve();
 			await release.promise;
@@ -123,6 +125,9 @@ function pauseNextReconciliationCommit(
 		started: started.promise,
 		release: () => release.resolve(),
 		restore: () => rename.mockRestore(),
+		arm: () => {
+			armed = true;
+		},
 	};
 }
 
@@ -2727,6 +2732,7 @@ test("SDK host waits for durable prompt acceptance before completing concurrent 
 			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
 		});
 
+		pausedCommit.arm();
 		socket.send(
 			JSON.stringify({
 				type: "control_request",
@@ -2851,6 +2857,7 @@ test("SDK host waits for durable skill acceptance before completing concurrent c
 			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
 		});
 
+		pausedCommit.arm();
 		socket.send(
 			JSON.stringify({
 				type: "control_request",

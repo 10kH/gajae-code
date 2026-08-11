@@ -3064,13 +3064,13 @@ function sdkControlSurface(
 							...(typeof result === "object" && result ? (result as object) : {}),
 							...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
 						});
-				} else if (!promptOwned && durableSkillAccepted && skillRecon) {
-					void skillRecon.noteTransition(correlation, {
-						type: "agent_end",
-						...(typeof result === "string"
-							? { content: { version: 1, type: "text", text: result, byteLength: 0, truncated: false } }
-							: {}),
-					});
+					} else if (durableSkillAccepted && skillRecon) {
+						void skillRecon.noteTransition(correlation, {
+							type: "agent_end",
+							...(typeof result === "string"
+								? { content: { version: 1, type: "text", text: result, byteLength: 0, truncated: false } }
+								: {}),
+						});
 					}
 					executionSettled.resolve();
 				},
@@ -3081,7 +3081,7 @@ function sdkControlSurface(
 					} else if (phase === "accepted" && promptOwned && !preflightController.signal.aborted) {
 						void onPromptFailed(correlation, error);
 					}
-					if (!promptOwned && durableSkillAccepted && skillRecon && !preflightController.signal.aborted)
+					if (durableSkillAccepted && skillRecon && !preflightController.signal.aborted)
 						void skillRecon.noteTransition(correlation, { type: "agent_failed", error });
 					executionSettled.resolve();
 				},
@@ -4657,7 +4657,13 @@ export function createNotificationsExtension(
 				}
 			}
 			try {
-				await kindReconciliation.finalizeOutcome(submission.reconciliationKind, correlation, winner, extra?.error, extra?.finalText);
+				await kindReconciliation.finalizeOutcome(
+					submission.reconciliationKind,
+					correlation,
+					winner,
+					extra?.error,
+					extra?.finalText,
+				);
 			} catch (error) {
 				// The durable pending claim survives; publishing an unpersisted terminal
 				// would contradict it, so fail the endpoint closed instead.
