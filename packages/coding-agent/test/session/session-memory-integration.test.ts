@@ -1250,6 +1250,58 @@ it("constructs managed cold forks through bounded authority-bound publication", 
 	}
 });
 
+itPosix("restores managed cold rollback authority across session directories", async () => {
+	const tempDir = TempDir.createSync("@pi-session-managed-rollback-");
+	const managedRoot = path.join(tempDir.path(), "managed");
+	fs.mkdirSync(managedRoot, { recursive: true, mode: 0o700 });
+	const rootStore = new ManagedSessionDescendantStore(managedDirectoryRoot(managedRoot), managedRoot);
+	let source: SessionManager | undefined;
+	let target: SessionManager | undefined;
+	SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1;
+	try {
+		rootStore.ensureDirectory("source");
+		const sourceStore = rootStore.deriveSubtree("source");
+		sourceStore.ensureDirectory("target");
+		const targetStore = sourceStore.deriveSubtree("target");
+		source = SessionManager.create(
+			"/cwd",
+			SessionManager.nestedManagedDestination(sourceStore, sourceStore.dir),
+			new FileSessionStorage(),
+		);
+		target = SessionManager.create(
+			"/cwd",
+			SessionManager.nestedManagedDestination(targetStore, targetStore.dir),
+			new FileSessionStorage(),
+		);
+		source.setSessionMemoryMode("auto");
+		target.setSessionMemoryMode("auto");
+		await source.ensureOnDisk();
+		await target.ensureOnDisk();
+		const sourceOld = source.appendCustomEntry("node", { payload: "source-old" });
+		const sourceKept = source.appendCustomEntry("node", { payload: "source-kept" });
+		source.appendCompaction("source summary", undefined, sourceKept, 1);
+		const targetOld = target.appendCustomEntry("node", { payload: "target-old" });
+		const targetKept = target.appendCustomEntry("node", { payload: "target-kept" });
+		target.appendCompaction("target summary", undefined, targetKept, 1);
+		await source.flush();
+		await target.flush();
+		const targetFile = target.getSessionFile();
+		if (!targetFile) throw new Error("Expected managed target file");
+		await target.close();
+		const rollback = await source.captureRollbackState();
+		await source.setSessionFile(targetFile);
+		expect(source.getEntry(targetOld)).toMatchObject({ id: targetOld });
+		await source.restoreRollbackState(rollback);
+		expect(source.getEntry(sourceOld)).toMatchObject({ id: sourceOld });
+	} finally {
+		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
+		await target?.close();
+		await source?.close();
+		rootStore.close();
+		tempDir.removeSync();
+	}
+});
+
 it("folds direct fork header and entry patches without full transcript reads", async () => {
 	class PatchForkStorage extends MemorySessionStorage {
 		fullReads = 0;

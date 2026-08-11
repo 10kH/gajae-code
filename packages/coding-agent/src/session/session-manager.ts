@@ -7369,7 +7369,18 @@ export class SessionManager {
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
-		await this.#initSessionFile(snapshot.coldRestoreFile);
+		const managedTransition =
+			this.destination.kind === "managed"
+				? this.#prepareManagedDestinationTransition(path.resolve(path.dirname(snapshot.coldRestoreFile)))
+				: undefined;
+		try {
+			managedTransition?.adopt();
+			await this.#initSessionFile(snapshot.coldRestoreFile);
+			managedTransition?.settle();
+		} catch (error) {
+			managedTransition?.rollback();
+			throw error;
+		}
 		this.#flushed = snapshot.flushed;
 		this.#ensuredOnDisk = snapshot.ensuredOnDisk;
 		this.#needsFullRewriteOnNextPersist = snapshot.needsFullRewriteOnNextPersist;
