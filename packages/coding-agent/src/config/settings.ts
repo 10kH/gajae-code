@@ -77,6 +77,8 @@ export interface RawSettings {
 	[key: string]: unknown;
 }
 
+const UNSAFE_EDIT_VARIANT_PATTERNS = new Set(["__proto__", "constructor", "prototype"]);
+
 type SettingsPatch = {
 	readonly path: string;
 	readonly value: unknown | undefined;
@@ -971,9 +973,10 @@ export class Settings implements NotificationSettingsReader {
 		if (!model) return null;
 		const variants = this.#editModelVariants();
 		if (!variants) return null;
-		for (const pattern in variants) {
+		for (const [pattern, rawValue] of Object.entries(variants)) {
+			if (UNSAFE_EDIT_VARIANT_PATTERNS.has(pattern)) continue;
 			if (model.includes(pattern)) {
-				const value = normalizeEditMode(variants[pattern]);
+				const value = normalizeEditMode(rawValue);
 				if (value) {
 					return value;
 				}
@@ -992,9 +995,10 @@ export class Settings implements NotificationSettingsReader {
 		if (!model) return null;
 		const variants = this.#editModelVariants();
 		if (!variants) return null;
-		for (const pattern in variants) {
+		for (const [pattern, value] of Object.entries(variants)) {
+			if (UNSAFE_EDIT_VARIANT_PATTERNS.has(pattern)) continue;
 			if (model.includes(pattern)) {
-				return { pattern, value: String(variants[pattern]) };
+				return { pattern, value: String(value) };
 			}
 		}
 		return null;
@@ -2099,18 +2103,16 @@ export class Settings implements NotificationSettingsReader {
 
 			if (override === undefined) continue;
 
-			if (
+			const value =
 				typeof override === "object" &&
 				override !== null &&
 				!Array.isArray(override) &&
 				typeof baseVal === "object" &&
 				baseVal !== null &&
 				!Array.isArray(baseVal)
-			) {
-				result[key] = this.#deepMerge(baseVal as RawSettings, override as RawSettings);
-			} else {
-				result[key] = override;
-			}
+					? this.#deepMerge(baseVal as RawSettings, override as RawSettings)
+					: override;
+			Object.defineProperty(result, key, { configurable: true, enumerable: true, value, writable: true });
 		}
 		return result;
 	}

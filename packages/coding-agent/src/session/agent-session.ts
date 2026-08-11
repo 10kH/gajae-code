@@ -6836,11 +6836,8 @@ export class AgentSession {
 		this.#lastAppliedToolSignature = this.#computeAppliedToolSignature(activeToolNames, activeTools);
 	}
 
-	async #syncEditToolModeAfterModelChange(previousEditMode: EditMode): Promise<void> {
-		const currentEditMode = this.#resolveActiveEditMode();
-		if (previousEditMode !== currentEditMode && this.getActiveToolNames().includes("edit")) {
-			await this.refreshBaseSystemPrompt();
-		}
+	async #syncEditToolModeAfterModelChange(_previousEditMode: EditMode): Promise<void> {
+		if (this.getActiveToolNames().includes("edit")) await this.refreshBaseSystemPrompt();
 	}
 
 	getSelectedMCPToolNames(): string[] {

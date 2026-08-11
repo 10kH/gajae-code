@@ -839,7 +839,7 @@ describe("AgentSession retry fallback", () => {
 			}),
 		]);
 		expect(getLastAssistantMessage(session)).toMatchObject({ stopReason: "stop" });
-		expect(refreshSpy).toHaveBeenCalledTimes(1);
+		expect(refreshSpy).toHaveBeenCalledTimes(2);
 	});
 
 	it("bounds all-provider canonical timeout exhaustion", async () => {

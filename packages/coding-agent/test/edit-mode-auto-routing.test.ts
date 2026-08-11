@@ -81,6 +81,7 @@ describe("detectModelEditFamily", () => {
 		["zai/glm-4.7", "glm", "hashline"],
 		["moonshotai/kimi-k2.5", "kimi", "hashline"],
 		["custom/moonshot-v1-code", "kimi", "hashline"],
+		["custom/not-a-codex-model", "unknown", "hashline"],
 		["custom/company-code-model", "unknown", "hashline"],
 		["custom/not-a-glm-model", "unknown", "hashline"],
 	];
@@ -271,6 +272,14 @@ describe("Settings.matchEditVariantForModel", () => {
 		});
 		expect(settings.matchEditVariantForModel("zai/glm-4.7")).toBeNull();
 		expect(settings.matchEditVariantForModel(undefined)).toBeNull();
+	});
+
+	test("ignores own prototype-key model variant rules", () => {
+		const modelVariants = Object.create(null) as Record<string, string>;
+		Object.defineProperty(modelVariants, "__proto__", { enumerable: true, value: "replace" });
+		const settings = Settings.isolated({ "edit.modelVariants": modelVariants });
+		expect(settings.matchEditVariantForModel("custom/__proto__")).toBeNull();
+		expect(settings.getEditVariantForModel("custom/__proto__")).toBeNull();
 	});
 
 	test("resolver consumes Settings match with model-override provenance", () => {
