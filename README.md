@@ -87,7 +87,7 @@ Nightly channel: `bun install -g gajae-code@nightly`. Full install matrix, Windo
 ## Bring your coding plan
 
 <p align="center">
-  <img src="assets/coding-plans-banner.png" alt="Coding plans and providers GJC runs on: Claude, ChatGPT/Codex, Gemini, GitHub Copilot, GitLab Duo, Cursor, Grok, GLM/Z.AI, Kimi, MiniMax, Qwen, Xiaomi, Perplexity, OpenCode, Fireworks" width="100%" />
+  <img src="assets/coding-plans-banner.png" alt="Coding plans and providers GJC runs on: Claude, ChatGPT/Codex, Cursor, GitHub Copilot, OpenCode Go, Kimi, GLM/Z.AI, MiniMax, Grok, Qwen, Command Code GOAT, ClinePass" width="100%" />
 </p>
 
 Log in once and run GJC on the subscription you already pay for. Run `/login` inside a session and pick your plan:

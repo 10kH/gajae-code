@@ -89,7 +89,7 @@ Nightly 渠道：`bun install -g gajae-code@nightly`。完整安装矩阵、Wind
 ## 带上你的编程订阅
 
 <p align="center">
-  <img src="assets/coding-plans-banner.png" alt="GJC 支持的编程订阅与提供商：Claude、ChatGPT/Codex、Gemini、GitHub Copilot、GitLab Duo、Cursor、Grok、GLM/Z.AI、Kimi、MiniMax、Qwen、Xiaomi、Perplexity、OpenCode、Fireworks" width="100%" />
+  <img src="assets/coding-plans-banner.png" alt="GJC 支持的编程订阅与提供商：Claude、ChatGPT/Codex、Cursor、GitHub Copilot、OpenCode Go、Kimi、GLM/Z.AI、MiniMax、Grok、Qwen、Command Code GOAT、ClinePass" width="100%" />
 </p>
 
 登录一次，GJC 就跑在你已经付费的订阅上。在会话内运行 `/login` 并选择你的订阅：

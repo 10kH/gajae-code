@@ -89,7 +89,7 @@ gjc @screenshot.png "뭘 바꿔야 할까?"   # 이미지 입력
 ## 쓰던 코딩 플랜 그대로
 
 <p align="center">
-  <img src="assets/coding-plans-banner.png" alt="GJC가 지원하는 코딩 플랜과 프로바이더: Claude, ChatGPT/Codex, Gemini, GitHub Copilot, GitLab Duo, Cursor, Grok, GLM/Z.AI, Kimi, MiniMax, Qwen, Xiaomi, Perplexity, OpenCode, Fireworks" width="100%" />
+  <img src="assets/coding-plans-banner.png" alt="GJC가 지원하는 코딩 플랜과 프로바이더: Claude, ChatGPT/Codex, Cursor, GitHub Copilot, OpenCode Go, Kimi, GLM/Z.AI, MiniMax, Grok, Qwen, Command Code GOAT, ClinePass" width="100%" />
 </p>
 
 한 번 로그인하면 이미 결제 중인 구독으로 GJC가 돌아갑니다. 세션 안에서 `/login`을 실행하고 플랜을 고르세요:

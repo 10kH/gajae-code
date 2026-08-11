@@ -89,7 +89,7 @@ Nightly チャンネル: `bun install -g gajae-code@nightly`。インストー�
 ## 手持ちのコーディングプランで
 
 <p align="center">
-  <img src="assets/coding-plans-banner.png" alt="GJC が対応するコーディングプランとプロバイダ: Claude、ChatGPT/Codex、Gemini、GitHub Copilot、GitLab Duo、Cursor、Grok、GLM/Z.AI、Kimi、MiniMax、Qwen、Xiaomi、Perplexity、OpenCode、Fireworks" width="100%" />
+  <img src="assets/coding-plans-banner.png" alt="GJC が対応するコーディングプランとプロバイダ: Claude、ChatGPT/Codex、Cursor、GitHub Copilot、OpenCode Go、Kimi、GLM/Z.AI、MiniMax、Grok、Qwen、Command Code GOAT、ClinePass" width="100%" />
 </p>
 
 一度ログインすれば、すでに払っているサブスクリプションで GJC が動きます。セッション内で `/login` を実行してプランを選択:
