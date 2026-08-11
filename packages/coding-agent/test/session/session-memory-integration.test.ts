@@ -582,6 +582,19 @@ describe("SessionManager cold sidecar integration", () => {
 			const residentEntriesBefore = fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0;
 			const sidecarCacheRoot = getSidecarCacheRootDir(profileAgentDir);
 			const beforeReopen = fs.existsSync(sidecarCacheRoot) ? fs.readdirSync(sidecarCacheRoot).length : 0;
+			const sessionHash = createHash("sha256").update(sessionFile).digest("hex").slice(0, 32);
+			const staleSidecar = path.join(sidecarCacheRoot, `s-${sessionHash}`);
+			fs.mkdirSync(sidecarCacheRoot, { recursive: true, mode: 0o700 });
+			fs.chmodSync(sidecarCacheRoot, 0o700);
+			fs.mkdirSync(staleSidecar, { mode: 0o700 });
+			fs.chmodSync(staleSidecar, 0o700);
+			fs.writeFileSync(
+				path.join(staleSidecar, "owner.json"),
+				JSON.stringify({ pid: 2_147_483_647, startTimeMs: 0, nonce: "crashed-sidecar", createdAt: 0 }),
+				{ mode: 0o600 },
+			);
+			fs.chmodSync(path.join(staleSidecar, "owner.json"), 0o600);
+			fs.writeFileSync(path.join(staleSidecar, ".session-memory.spill.idx"), "crash debris", { mode: 0o600 });
 			const transcriptRead = vi.spyOn(nestedStore, "readExpected");
 			const reopened = await SessionManager.openNestedManaged(
 				sessionFile,
@@ -598,6 +611,9 @@ describe("SessionManager cold sidecar integration", () => {
 				expect(reopened.getEntry(coldId)?.id).toBe(coldId);
 				expect(fs.readdirSync(sidecarCacheRoot).length).toBeGreaterThan(beforeReopen);
 				expect(fs.readdirSync(sidecarCacheRoot).filter(entry => /^s-[a-f0-9]{32}$/.test(entry))).toHaveLength(1);
+				expect(JSON.parse(fs.readFileSync(path.join(staleSidecar, "owner.json"), "utf8"))).toMatchObject({
+					pid: process.pid,
+				});
 				expect(fs.readdirSync(cacheRoot).filter(entry => entry.startsWith("i-")).length).toBe(1);
 			} finally {
 				await reopened.close();

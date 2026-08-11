@@ -608,7 +608,20 @@ function openVerifiedCacheInstanceDir(root: string, instanceName?: string): stri
 				if (!/^s-[a-f0-9]{32}$/.test(instanceName))
 					throw new ResidentCacheTrustError("instance_name_invalid", instanceName);
 				const candidate = path.join(root, instanceName);
-				fs.mkdirSync(candidate, { mode: BLOB_DIR_MODE });
+				try {
+					fs.mkdirSync(candidate, { mode: BLOB_DIR_MODE });
+				} catch (error) {
+					if (errorCode(error) !== "EEXIST") throw error;
+					const staleInstance = readResidentCacheOwnerSnapshot(candidate, uid);
+					if (
+						staleInstance === null ||
+						!residentCacheOwnerIsStale(staleInstance.owner, new Map<number, number | null>()) ||
+						!reapResidentCacheInstanceDir(root, rootDescriptor, candidate, staleInstance, uid)
+					) {
+						throw error;
+					}
+					fs.mkdirSync(candidate, { mode: BLOB_DIR_MODE });
+				}
 				instanceDir = candidate;
 			}
 		} catch (error) {
