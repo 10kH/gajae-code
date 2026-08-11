@@ -6787,17 +6787,9 @@ export class AgentSession {
 		return resolveEditMode(this.#getEditModeSession());
 	}
 
-	#resolveEditModeForModel(model: Model): EditMode {
-		return resolveEditMode({
-			settings: this.settings,
-			getActiveModelString: () => formatModelString(model),
-		});
-	}
-
 	async #prepareDefaultModelSelectionPrompt(model: Model): Promise<string[] | undefined> {
 		if (!this.#rebuildSystemPrompt) return undefined;
 		if (!this.getActiveToolNames().includes("edit")) return undefined;
-		if (this.#resolveActiveEditMode() === this.#resolveEditModeForModel(model)) return undefined;
 		const built = await this.#rebuildSystemPrompt(this.getActiveToolNames(), this.#toolRegistry, model);
 		return built.systemPrompt;
 	}
