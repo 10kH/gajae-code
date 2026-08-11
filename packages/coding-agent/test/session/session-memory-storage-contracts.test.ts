@@ -17,6 +17,10 @@ import {
 	readSessionCommitMarkerSync,
 	replaceSessionCommitMarkerCheckedSync,
 	SESSION_RANGE_READ_MAX_BYTES,
+	SESSION_STORAGE_BUFFERED_WRITER_MAX_BYTES,
+	SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES,
+	type SessionStorageBufferedWriter,
+	SessionStorageWriterRetryableCloseError,
 	STAGED_MEMORY_WRITER_MAX_BYTES,
 	STAGED_WRITER_PATCH_LIMIT_BYTES,
 	STAGED_WRITER_PATCH_MAX_COUNT,
@@ -112,6 +116,231 @@ describe("descriptor-validated bounded range reads", () => {
 
 		expect(() => file.readRangeSync(linkPath, 0, 4)).toThrow();
 		await expect(file.readRange!(linkPath, 0, 4)).rejects.toThrow();
+	});
+});
+
+describe("buffered sidecar writers", () => {
+	const serializedBytes = Buffer.from('{"type":"index","id":"é"}\n{"type":"tail","n":2}\n', "utf8");
+
+	it("keeps exact bytes across file and memory backends and bounds pending bytes", async () => {
+		const dir = await makeTempDir("gjc-buffered-parity-");
+		const file = new FileSessionStorage();
+		const memory = new MemorySessionStorage();
+		const filePath = path.join(dir, "index.jsonl");
+		const memoryPath = "/sessions/index.jsonl";
+		const fileWriter = file.openBufferedWriter!(filePath, {
+			flags: "w",
+			bufferSize: SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES,
+		});
+		const memoryWriter = memory.openBufferedWriter!(memoryPath, {
+			flags: "w",
+			bufferSize: SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES,
+		});
+		for (let offset = 0; offset < serializedBytes.byteLength; offset += 3) {
+			const chunk = serializedBytes.subarray(offset, Math.min(offset + 3, serializedBytes.byteLength));
+			fileWriter.writeBytesSync(chunk);
+			memoryWriter.writeBytesSync(chunk);
+			expect(fileWriter.getInstrumentation().bufferedBytes).toBeLessThanOrEqual(
+				SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES,
+			);
+			expect(memoryWriter.getInstrumentation().bufferedBytes).toBeLessThanOrEqual(
+				SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES,
+			);
+		}
+		fileWriter.fsyncSync();
+		memoryWriter.fsyncSync();
+		fileWriter.closeSync();
+		memoryWriter.closeSync();
+
+		expect(Buffer.from(file.readBytesSync(filePath))).toEqual(Buffer.from(memory.readBytesSync(memoryPath)));
+		expect(fileWriter.getInstrumentation()).toMatchObject({
+			bytesSubmitted: serializedBytes.byteLength,
+			bytesWritten: serializedBytes.byteLength,
+		});
+		expect(memoryWriter.getInstrumentation()).toMatchObject({
+			bytesSubmitted: serializedBytes.byteLength,
+			bytesWritten: serializedBytes.byteLength,
+		});
+	});
+
+	it("flushes pending bytes before fsync and close", async () => {
+		const dir = await makeTempDir("gjc-buffered-order-");
+		const file = new FileSessionStorage();
+		const filePath = path.join(dir, "order.jsonl");
+		const events: string[] = [];
+		let closeObservedBytes = -1;
+		let writer!: SessionStorageBufferedWriter;
+
+		writer = file.openBufferedWriter!(filePath, {
+			flags: "w",
+			bufferSize: SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES,
+			closeAdapter: {
+				close(fd) {
+					closeObservedBytes = writer.getInstrumentation().bytesWritten;
+					fs.closeSync(fd);
+				},
+			},
+		});
+		const realFsync = fs.fsyncSync;
+		const fsync = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+			events.push("fsync");
+			expect(writer.getInstrumentation().bytesWritten).toBe(serializedBytes.byteLength);
+			return realFsync(fd);
+		});
+		try {
+			writer.writeBytesSync(serializedBytes);
+			expect(writer.getInstrumentation().bytesWritten).toBe(0);
+			writer.fsyncSync();
+			events.push("after_fsync");
+			writer.writeBytesSync(Buffer.from("close\n", "utf8"));
+			writer.closeSync();
+		} finally {
+			fsync.mockRestore();
+		}
+		expect(events).toEqual(["fsync", "after_fsync"]);
+		expect(closeObservedBytes).toBe(serializedBytes.byteLength + 6);
+		expect(writer.getCloseState()).toBe("closed");
+	});
+
+	it("reduces backend write calls while preserving ordinary writer behavior", async () => {
+		const dir = await makeTempDir("gjc-buffered-calls-");
+		const file = new FileSessionStorage();
+		const ordinaryPath = path.join(dir, "ordinary.jsonl");
+		const bufferedPath = path.join(dir, "buffered.jsonl");
+		const ordinary = file.openWriter(ordinaryPath, { flags: "w" }) as unknown as SessionStorageBufferedWriter;
+		const buffered = file.openBufferedWriter!(bufferedPath, {
+			flags: "w",
+			bufferSize: SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES,
+		});
+		for (let index = 0; index < 32; index++) {
+			const bytes = Buffer.from(`record-${index}\n`, "utf8");
+			ordinary.writeBytesSync(bytes);
+			buffered.writeBytesSync(bytes);
+		}
+		ordinary.closeSync();
+		buffered.closeSync();
+		expect(buffered.getInstrumentation().writeCalls).toBeLessThan(ordinary.getInstrumentation().writeCalls);
+		expect(file.readBytesSync(bufferedPath)).toEqual(file.readBytesSync(ordinaryPath));
+	});
+
+	it("records write failures and keeps subsequent operations deterministic", async () => {
+		const dir = await makeTempDir("gjc-buffered-write-failure-");
+		const file = new FileSessionStorage();
+		const writer = file.openBufferedWriter!(path.join(dir, "write-failure.jsonl"), {
+			flags: "w",
+			bufferSize: SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES,
+		});
+		const write = vi.spyOn(fs, "writeSync").mockImplementationOnce(() => {
+			throw new Error("injected_buffer_write_failure");
+		});
+		try {
+			writer.writeBytesSync(Buffer.from("pending\n", "utf8"));
+			expect(() => writer.flushSync()).toThrow("injected_buffer_write_failure");
+			expect(() => writer.flushSync()).toThrow("injected_buffer_write_failure");
+			expect(writer.getError()?.message).toBe("injected_buffer_write_failure");
+			expect(writer.getInstrumentation().writeCalls).toBe(1);
+		} finally {
+			write.mockRestore();
+		}
+		writer.closeSync();
+		expect(writer.getCloseState()).toBe("closed");
+	});
+
+	it("flushes before and preserves the first fsync failure", async () => {
+		const dir = await makeTempDir("gjc-buffered-fsync-failure-");
+		const file = new FileSessionStorage();
+		const filePath = path.join(dir, "fsync-failure.jsonl");
+		const writer = file.openBufferedWriter!(filePath, {
+			flags: "w",
+			bufferSize: SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES,
+		});
+		writer.writeBytesSync(serializedBytes);
+		const fsync = vi.spyOn(fs, "fsyncSync").mockImplementationOnce(() => {
+			throw new Error("injected_buffer_fsync_failure");
+		});
+		try {
+			expect(() => writer.fsyncSync()).toThrow("injected_buffer_fsync_failure");
+			expect(writer.getInstrumentation().bytesWritten).toBe(serializedBytes.byteLength);
+			expect(() => writer.fsyncSync()).toThrow("injected_buffer_fsync_failure");
+		} finally {
+			fsync.mockRestore();
+		}
+		writer.closeSync();
+		expect(Buffer.from(file.readBytesSync(filePath))).toEqual(serializedBytes);
+	});
+
+	it("preserves retryable close state after flushing pending bytes", async () => {
+		const dir = await makeTempDir("gjc-buffered-close-state-");
+		const file = new FileSessionStorage();
+		const filePath = path.join(dir, "close-state.jsonl");
+		let failFirst = true;
+		let closeCalls = 0;
+		const writer = file.openBufferedWriter!(filePath, {
+			flags: "w",
+			bufferSize: SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES,
+			closeAdapter: {
+				close(fd) {
+					closeCalls++;
+					if (failFirst) {
+						failFirst = false;
+						throw new SessionStorageWriterRetryableCloseError("injected_retryable_close");
+					}
+					fs.closeSync(fd);
+				},
+			},
+		});
+		writer.writeBytesSync(serializedBytes);
+		expect(() => writer.closeSync()).toThrow("injected_retryable_close");
+		expect(writer.getInstrumentation().bytesWritten).toBe(serializedBytes.byteLength);
+		expect(writer.getCloseState()).toBe("close_failed_retryable");
+		writer.closeSync();
+		expect(closeCalls).toBe(2);
+		expect(writer.getCloseState()).toBe("closed");
+	});
+
+	it("rejects capacities outside the bounded range", async () => {
+		const dir = await makeTempDir("gjc-buffered-capacity-");
+		const file = new FileSessionStorage();
+		expect(() =>
+			file.openBufferedWriter!(path.join(dir, "too-small.jsonl"), {
+				bufferSize: SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES - 1,
+			}),
+		).toThrow(RangeError);
+		expect(() =>
+			file.openBufferedWriter!(path.join(dir, "too-large.jsonl"), {
+				bufferSize: SESSION_STORAGE_BUFFERED_WRITER_MAX_BYTES + 1,
+			}),
+		).toThrow(RangeError);
+	});
+});
+
+describe("exclusive disposable build locks", () => {
+	it("serializes file and memory owners and releases only the captured identity", async () => {
+		const dir = await makeTempDir("gjc-exclusive-lock-");
+		for (const [storage, lockPath] of [
+			[new FileSessionStorage(), path.join(dir, "build.lock")],
+			[new MemorySessionStorage(), "/sessions/build.lock"],
+		] as const) {
+			const first = storage.acquireExclusiveLockSync!(lockPath);
+			expect(first).toBeDefined();
+			expect(storage.acquireExclusiveLockSync!(lockPath)).toBeUndefined();
+			first!.releaseSync();
+			const next = storage.acquireExclusiveLockSync!(lockPath);
+			expect(next).toBeDefined();
+			next!.releaseSync();
+			expect(storage.existsSync(lockPath)).toBe(false);
+		}
+	});
+
+	it("does not unlink a replacement file when releasing the original file lock", async () => {
+		const dir = await makeTempDir("gjc-exclusive-lock-replacement-");
+		const storage = new FileSessionStorage();
+		const lockPath = path.join(dir, "build.lock");
+		const lock = storage.acquireExclusiveLockSync!(lockPath)!;
+		storage.unlinkSync(lockPath);
+		storage.writeTextSync(lockPath, "replacement\n");
+		lock.releaseSync();
+		expect(storage.readTextSync(lockPath)).toBe("replacement\n");
 	});
 });
 

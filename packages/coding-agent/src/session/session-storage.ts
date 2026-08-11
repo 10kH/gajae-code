@@ -83,6 +83,19 @@ function validateRangeReadBounds(start: number, length: number): void {
 	if (length > SESSION_RANGE_READ_MAX_BYTES) throw new RangeError("Session range read exceeds the bounded maximum");
 }
 
+function normalizeBufferedWriterCapacity(value: number | undefined): number {
+	const capacity = value ?? SESSION_STORAGE_BUFFERED_WRITER_DEFAULT_BYTES;
+	if (
+		!Number.isSafeInteger(capacity) ||
+		capacity < SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES ||
+		capacity > SESSION_STORAGE_BUFFERED_WRITER_MAX_BYTES
+	)
+		throw new RangeError(
+			`Buffered writer capacity must be between ${SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES} and ${SESSION_STORAGE_BUFFERED_WRITER_MAX_BYTES} bytes`,
+		);
+	return capacity;
+}
+
 function statFromNode(stats: fs.BigIntStats): SessionStorageStat {
 	return {
 		dev: stats.dev,
@@ -135,6 +148,23 @@ export class SessionStorageWriterRetryableCloseError extends Error {
 export interface SessionStorageWriterCloseAdapter {
 	close(fd: number): void;
 }
+/** Bounded buffered-writer capacity limits. */
+export const SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES = 64 * 1024;
+export const SESSION_STORAGE_BUFFERED_WRITER_MAX_BYTES = 512 * 1024;
+export const SESSION_STORAGE_BUFFERED_WRITER_DEFAULT_BYTES = 256 * 1024;
+
+/**
+ * Counters for a synchronous buffered sidecar writer. `bytesWritten` and
+ * `writeCalls` count operations against the backend, not calls accepted into
+ * the in-process buffer.
+ */
+export interface SessionStorageBufferedWriterInstrumentation {
+	readonly bytesSubmitted: number;
+	readonly bytesWritten: number;
+	readonly writeCalls: number;
+	readonly flushCalls: number;
+	readonly bufferedBytes: number;
+}
 
 /** Options for opening a {@link SessionStorageWriter}. */
 export interface SessionStorageWriterOpenOptions {
@@ -144,6 +174,8 @@ export interface SessionStorageWriterOpenOptions {
 	closeAdapter?: SessionStorageWriterCloseAdapter;
 	/** Opaque authority for default-computed managed destinations only. */
 	securityContext?: SessionStorageSecurityContext;
+	/** Enable bounded synchronous buffering for disposable sidecar writes. */
+	bufferSize?: number;
 }
 
 /**
@@ -215,6 +247,20 @@ export interface SessionStorageWriter {
 	/** Stored error for non-success close states (`close_failed_retryable`/`close_unknown`). */
 	getCloseError(): Error | undefined;
 }
+
+/** Synchronous byte-oriented writer with bounded buffering for disposable sidecars. */
+export interface SessionStorageBufferedWriter extends SessionStorageWriter {
+	/** Append already-serialized bytes; the caller's view may be reused on return. */
+	writeBytesSync(bytes: Uint8Array): void;
+	/** Flush pending bytes to the backend without synchronizing them to stable storage. */
+	flushSync(): void;
+	/** Flush pending bytes, then synchronize the backend. */
+	fsyncSync(): void;
+	/** Flush pending bytes, then close the backend descriptor. */
+	closeSync(): void;
+	/** Snapshot backend-write counters and current pending capacity. */
+	getInstrumentation(): SessionStorageBufferedWriterInstrumentation;
+}
 // =============================================================================
 // Staged streaming writer contract (two-pass fork publication, immutable destinations)
 // =============================================================================
@@ -261,6 +307,10 @@ export interface StagedStreamingWriter {
 	publishNoReplace(): void;
 }
 
+export interface SessionStorageExclusiveLock {
+	releaseSync(): void;
+}
+
 export interface SessionStorage {
 	ensureDirSync(dir: string): void;
 	existsSync(path: string): boolean;
@@ -303,12 +353,16 @@ export interface SessionStorage {
 	 */
 	deleteSessionVerified?(target: VerifiedSessionDeleteTarget): Promise<VerifiedSessionDeleteResult>;
 	openWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter;
+	/** Open a bounded synchronous byte-oriented writer for disposable sidecars. */
+	openBufferedWriter?(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageBufferedWriter;
 	/** Bounded recorded-length read with descriptor identity validation (additive). */
 	readRangeSync?(path: string, start: number, length: number): SessionStorageRangeSnapshot;
 	/** Async bounded recorded-length read with descriptor identity validation (additive). */
 	readRange?(path: string, start: number, length: number): Promise<SessionStorageRangeSnapshot>;
 	/** Open a staged streaming writer for one immutable one-shot destination (additive). */
 	openStagedWriter?(path: string, options?: SessionStorageWriterOpenOptions): StagedStreamingWriter;
+	/** Acquire an owner-bound exclusive lock; returns undefined while another owner holds it. */
+	acquireExclusiveLockSync?(path: string): SessionStorageExclusiveLock | undefined;
 }
 
 // =============================================================================
@@ -949,7 +1003,7 @@ const writerRegistry = new FinalizationRegistry<number>(fd => {
 	}
 });
 
-class FileSessionStorageWriter implements SessionStorageWriter {
+class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 	#fd: number;
 	#path: string;
 
@@ -960,10 +1014,21 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 	#closeAdapter: SessionStorageWriterCloseAdapter;
 	#securityContext: SessionStorageSecurityContext;
 
+	#bufferSize: number | undefined;
+	#buffer: Buffer | undefined;
+	#bufferedBytes = 0;
+	#bytesSubmitted = 0;
+	#bytesWritten = 0;
+	#writeCalls = 0;
+	#flushCalls = 0;
+
 	constructor(fpath: string, options?: SessionStorageWriterOpenOptions) {
 		this.#onError = options?.onError;
 		this.#closeAdapter = options?.closeAdapter ?? defaultCloseAdapter;
 		this.#securityContext = options?.securityContext;
+		this.#bufferSize =
+			options?.bufferSize === undefined ? undefined : normalizeBufferedWriterCapacity(options.bufferSize);
+		this.#buffer = this.#bufferSize === undefined ? undefined : Buffer.allocUnsafe(this.#bufferSize);
 		const flags = options?.flags ?? "a";
 		const dir = path.dirname(fpath);
 		assertNoReparsePath(dir);
@@ -1010,47 +1075,97 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		}
 	}
 
-	writeLineSync(line: string): void {
+	#assertOpen(): void {
 		if (this.#closeState !== "open") throw this.#nonOpenWriteError();
 		if (this.#error) throw this.#error;
+	}
+
+	#asBuffer(bytes: Uint8Array): Buffer {
+		if (Buffer.isBuffer(bytes)) return bytes;
+		return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	}
+
+	#writeToKernel(bytes: Uint8Array): void {
+		const buffer = this.#asBuffer(bytes);
+		let offset = 0;
+		while (offset < buffer.byteLength) {
+			this.#writeCalls++;
+			const written = fs.writeSync(this.#fd, buffer, offset, buffer.byteLength - offset);
+			if (written === 0) throw new Error("Short write");
+			offset += written;
+			this.#bytesWritten += written;
+		}
+	}
+
+	#flushPending(): void {
+		this.#flushCalls++;
+		if (!this.#buffer || this.#bufferedBytes === 0) return;
+		this.#writeToKernel(this.#buffer.subarray(0, this.#bufferedBytes));
+		this.#bufferedBytes = 0;
+	}
+
+	#appendBytes(bytes: Uint8Array): void {
+		if (bytes.byteLength === 0) return;
+		if (!this.#buffer || !this.#bufferSize) {
+			this.#writeToKernel(bytes);
+			return;
+		}
+		const source = this.#asBuffer(bytes);
+		if (source.byteLength >= this.#bufferSize) {
+			this.#flushPending();
+			this.#writeToKernel(source);
+			return;
+		}
+		if (this.#bufferedBytes + source.byteLength > this.#bufferSize) this.#flushPending();
+		source.copy(this.#buffer, this.#bufferedBytes);
+		this.#bufferedBytes += source.byteLength;
+		if (this.#bufferedBytes === this.#bufferSize) this.#flushPending();
+	}
+
+	writeBytesSync(bytes: Uint8Array): void {
+		this.#assertOpen();
 		try {
-			const buf = Buffer.from(line, "utf-8");
-			let offset = 0;
-			while (offset < buf.length) {
-				const written = fs.writeSync(this.#fd, buf, offset, buf.length - offset);
-				if (written === 0) {
-					throw new Error("Short write");
-				}
-				offset += written;
-			}
+			this.#appendBytes(bytes);
+			this.#bytesSubmitted += bytes.byteLength;
 		} catch (err) {
 			throw this.#recordError(err);
 		}
+	}
+
+	writeLineSync(line: string): void {
+		this.writeBytesSync(Buffer.from(line, "utf-8"));
 	}
 
 	async writeLine(line: string): Promise<void> {
 		this.writeLineSync(line);
 	}
 
+	flushSync(): void {
+		this.#assertOpen();
+		try {
+			this.#flushPending();
+		} catch (err) {
+			throw this.#recordError(err);
+		}
+	}
+
 	async flush(): Promise<void> {
-		if (this.#closeState !== "open") throw this.#nonOpenWriteError();
-		if (this.#error) throw this.#error;
-		// OS buffers are flushed on fsync, nothing to do here
+		this.flushSync();
 	}
 
 	fsyncSync(): void {
-		if (this.#closeState !== "open") throw this.#nonOpenWriteError();
-		if (this.#error) throw this.#error;
+		this.#assertOpen();
 		try {
+			this.#flushPending();
 			fs.fsyncSync(this.#fd);
 			secureOwnerOnlyFileDescriptor(this.#path, this.#fd, "verify", this.#securityContext);
 		} catch (err) {
 			throw this.#recordError(err);
 		}
 	}
+
 	statSync(): SessionStorageStat {
-		if (this.#closeState !== "open") throw this.#nonOpenWriteError();
-		if (this.#error) throw this.#error;
+		this.#assertOpen();
 		return statFromNode(fs.fstatSync(this.#fd, { bigint: true }));
 	}
 
@@ -1064,6 +1179,15 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		// Dispatched close already threw: outcome is uncertain. Never dispatch OS close
 		// for this numeric fd again; surface the stored non-quiescent error.
 		if (this.#closeState === "close_unknown") throw this.#closeError!;
+
+		let flushError: Error | undefined;
+		if (!this.#error) {
+			try {
+				this.#flushPending();
+			} catch (err) {
+				flushError = this.#recordError(err);
+			}
+		}
 		// State is "open" or "close_failed_retryable": a close may be dispatched.
 		try {
 			secureOwnerOnlyFileDescriptor(this.#path, this.#fd, "verify", this.#securityContext);
@@ -1095,7 +1219,9 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		// Successful underlying close confirms closed.
 		this.#closeState = "closed";
 		this.#closeError = undefined;
+		this.#bufferedBytes = 0;
 		writerRegistry.unregister(this);
+		if (flushError) throw flushError;
 	}
 
 	async close(): Promise<void> {
@@ -1114,6 +1240,16 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 
 	getCloseError(): Error | undefined {
 		return this.#closeError;
+	}
+
+	getInstrumentation(): SessionStorageBufferedWriterInstrumentation {
+		return {
+			bytesSubmitted: this.#bytesSubmitted,
+			bytesWritten: this.#bytesWritten,
+			writeCalls: this.#writeCalls,
+			flushCalls: this.#flushCalls,
+			bufferedBytes: this.#bufferedBytes,
+		};
 	}
 }
 /**
@@ -1172,13 +1308,14 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 		this.#assertOpen();
 		if (bytes.byteLength > STAGED_WRITER_LINE_MAX_BYTES)
 			throw new RangeError("Staged line exceeds the bounded maximum");
-		const line = Buffer.concat([Buffer.from(bytes), newlineBuffer]);
 		try {
-			let written = 0;
-			while (written < line.byteLength) {
-				const count = fs.writeSync(this.#fd, line, written, line.byteLength - written);
-				if (count === 0) throw new Error("Short write");
-				written += count;
+			for (const chunk of [bytes, newlineBuffer]) {
+				let written = 0;
+				while (written < chunk.byteLength) {
+					const count = fs.writeSync(this.#fd, chunk, written, chunk.byteLength - written);
+					if (count === 0) throw new Error("Short write");
+					written += count;
+				}
 			}
 			this.#lineCount++;
 		} catch (err) {
@@ -1405,6 +1542,56 @@ class FileStagedStreamingWriter implements StagedStreamingWriter {
 }
 
 export class FileSessionStorage implements SessionStorage {
+	acquireExclusiveLockSync(lockPath: string): SessionStorageExclusiveLock | undefined {
+		const dir = path.dirname(lockPath);
+		this.ensureDirSync(dir);
+		let fd: number;
+		try {
+			fd = fs.openSync(
+				lockPath,
+				fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0),
+				0o600,
+			);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EEXIST") return undefined;
+			throw error;
+		}
+		try {
+			secureOwnerOnlyFileDescriptor(lockPath, fd, "apply", undefined);
+			fs.writeSync(fd, `${process.pid}:${randomUUID()}\n`);
+			fs.fsyncSync(fd);
+			const expected = fs.fstatSync(fd, { bigint: true });
+			let released = false;
+			return {
+				releaseSync: () => {
+					if (released) return;
+					released = true;
+					try {
+						try {
+							const named = fs.lstatSync(lockPath, { bigint: true });
+							if (named.dev === expected.dev && named.ino === expected.ino && !named.isSymbolicLink())
+								fs.unlinkSync(lockPath);
+						} catch (error) {
+							if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+						}
+					} finally {
+						fs.closeSync(fd);
+					}
+				},
+			};
+		} catch (error) {
+			try {
+				fs.closeSync(fd);
+			} finally {
+				try {
+					fs.unlinkSync(lockPath);
+				} catch {
+					// Preserve the lock acquisition error.
+				}
+			}
+			throw error;
+		}
+	}
 	ensureDirSync(dir: string): void {
 		if (!fs.existsSync(dir)) {
 			fs.mkdirSync(dir, { recursive: true });
@@ -1646,6 +1833,12 @@ export class FileSessionStorage implements SessionStorage {
 
 	openWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
 		return new FileSessionStorageWriter(path, options);
+	}
+	openBufferedWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageBufferedWriter {
+		return new FileSessionStorageWriter(path, {
+			...options,
+			bufferSize: options?.bufferSize ?? SESSION_STORAGE_BUFFERED_WRITER_DEFAULT_BYTES,
+		}) as SessionStorageBufferedWriter;
 	}
 
 	openStagedWriter(path: string, options?: SessionStorageWriterOpenOptions): StagedStreamingWriter {
@@ -2458,7 +2651,7 @@ class MemoryStagedStreamingWriter implements StagedStreamingWriter {
 	}
 }
 
-class MemorySessionStorageWriter implements SessionStorageWriter {
+class MemorySessionStorageWriter implements SessionStorageBufferedWriter {
 	#storage: MemorySessionStorage;
 	#path: string;
 	#closeState: SessionStorageWriterCloseState = "open";
@@ -2469,12 +2662,22 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 	#closeAdapter: SessionStorageWriterCloseAdapter | undefined;
 	#bytes: Buffer;
 	#length = 0;
+	#bufferSize: number | undefined;
+	#buffer: Buffer | undefined;
+	#bufferedBytes = 0;
+	#bytesSubmitted = 0;
+	#bytesWritten = 0;
+	#writeCalls = 0;
+	#flushCalls = 0;
 
 	constructor(storage: MemorySessionStorage, path: string, options?: SessionStorageWriterOpenOptions) {
 		this.#storage = storage;
 		this.#path = path;
 		this.#onError = options?.onError;
 		this.#closeAdapter = options?.closeAdapter;
+		this.#bufferSize =
+			options?.bufferSize === undefined ? undefined : normalizeBufferedWriterCapacity(options.bufferSize);
+		this.#buffer = this.#bufferSize === undefined ? undefined : Buffer.allocUnsafe(this.#bufferSize);
 		const existing =
 			options?.flags === "w" || !storage.existsSync(path)
 				? Buffer.alloc(0)
@@ -2492,40 +2695,125 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 		return error;
 	}
 
-	writeLineSync(line: string): void {
-		if (this.#closeState !== "open") throw new Error("Writer closed");
+	#nonOpenWriteError(): Error {
+		switch (this.#closeState) {
+			case "closed":
+				return new Error("Writer closed");
+			case "close_unknown":
+				return this.#closeError ?? new Error("Writer close outcome is unknown; descriptor quarantined");
+			case "close_failed_retryable":
+				return this.#closeError ?? new Error("Writer close failed before dispatch (retryable); writes rejected");
+			default:
+				return new Error("Writer closed");
+		}
+	}
+
+	#assertOpen(): void {
+		if (this.#closeState !== "open") throw this.#nonOpenWriteError();
 		if (this.#error) throw this.#error;
+	}
+
+	#asBuffer(bytes: Uint8Array): Buffer {
+		if (Buffer.isBuffer(bytes)) return bytes;
+		return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	}
+
+	#appendToBytes(bytes: Uint8Array): void {
+		const source = this.#asBuffer(bytes);
+		const nextLength = this.#length + source.byteLength;
+		if (nextLength > this.#bytes.byteLength) {
+			const expanded = Buffer.allocUnsafe(Math.max(nextLength, this.#bytes.byteLength * 2));
+			this.#bytes.copy(expanded, 0, 0, this.#length);
+			this.#bytes = expanded;
+		}
+		source.copy(this.#bytes, this.#length);
+		this.#length = nextLength;
+	}
+
+	#writeCurrent(bytesWritten: number): void {
+		this.#writeCalls++;
+		this.#storage.writeBytesOwnedSync(this.#path, Buffer.from(this.#bytes.subarray(0, this.#length)));
+		this.#bytesWritten += bytesWritten;
+	}
+
+	#flushPending(): void {
+		this.#flushCalls++;
+		if (!this.#buffer || this.#bufferedBytes === 0) return;
+		const pendingBytes = this.#bufferedBytes;
+		const nextLength = this.#length + pendingBytes;
+		const expanded = Buffer.allocUnsafe(Math.max(nextLength, this.#bytes.byteLength * 2));
+		this.#bytes.copy(expanded, 0, 0, this.#length);
+		this.#buffer.copy(expanded, this.#length, 0, pendingBytes);
+		this.#writeCalls++;
+		this.#storage.writeBytesOwnedSync(this.#path, Buffer.from(expanded.subarray(0, nextLength)));
+		this.#bytes = expanded;
+		this.#length = nextLength;
+		this.#bufferedBytes = 0;
+		this.#bytesWritten += pendingBytes;
+	}
+
+	#appendBytes(bytes: Uint8Array): void {
+		if (bytes.byteLength === 0) return;
+		if (!this.#buffer || !this.#bufferSize) {
+			this.#appendToBytes(bytes);
+			this.#writeCurrent(bytes.byteLength);
+			return;
+		}
+		const source = this.#asBuffer(bytes);
+		if (source.byteLength >= this.#bufferSize) {
+			this.#flushPending();
+			this.#appendToBytes(source);
+			this.#writeCurrent(source.byteLength);
+			return;
+		}
+		if (this.#bufferedBytes + source.byteLength > this.#bufferSize) this.#flushPending();
+		source.copy(this.#buffer, this.#bufferedBytes);
+		this.#bufferedBytes += source.byteLength;
+		if (this.#bufferedBytes === this.#bufferSize) this.#flushPending();
+	}
+
+	writeBytesSync(bytes: Uint8Array): void {
+		this.#assertOpen();
 		try {
-			const bytes = Buffer.from(line, "utf8");
-			const nextLength = this.#length + bytes.byteLength;
-			if (nextLength > this.#bytes.byteLength) {
-				const expanded = Buffer.allocUnsafe(Math.max(nextLength, this.#bytes.byteLength * 2));
-				this.#bytes.copy(expanded, 0, 0, this.#length);
-				this.#bytes = expanded;
-			}
-			bytes.copy(this.#bytes, this.#length);
-			this.#length = nextLength;
-			this.#storage.writeBytesOwnedSync(this.#path, this.#bytes.subarray(0, this.#length));
+			this.#appendBytes(bytes);
+			this.#bytesSubmitted += bytes.byteLength;
 		} catch (err) {
 			throw this.#recordError(err);
 		}
+	}
+
+	writeLineSync(line: string): void {
+		this.writeBytesSync(Buffer.from(line, "utf8"));
 	}
 
 	async writeLine(line: string): Promise<void> {
 		this.writeLineSync(line);
 	}
 
+	flushSync(): void {
+		this.#assertOpen();
+		try {
+			this.#flushPending();
+		} catch (err) {
+			throw this.#recordError(err);
+		}
+	}
+
 	async flush(): Promise<void> {
-		if (this.#closeState !== "open") throw new Error("Writer closed");
-		if (this.#error) throw this.#error;
+		this.flushSync();
 	}
+
 	fsyncSync(): void {
-		if (this.#closeState !== "open") throw new Error("Writer closed");
-		if (this.#error) throw this.#error;
+		this.#assertOpen();
+		try {
+			this.#flushPending();
+		} catch (err) {
+			throw this.#recordError(err);
+		}
 	}
+
 	statSync(): SessionStorageStat {
-		if (this.#closeState !== "open") throw new Error("Writer closed");
-		if (this.#error) throw this.#error;
+		this.#assertOpen();
 		return this.#storage.statSync(this.#path);
 	}
 
@@ -2540,6 +2828,15 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 		// succeeds. The sentinel fd (-1) signals "no real descriptor".
 		if (this.#closeState === "closed") return;
 		if (this.#closeState === "close_unknown") throw this.#closeError!;
+
+		let flushError: Error | undefined;
+		if (!this.#error) {
+			try {
+				this.#flushPending();
+			} catch (err) {
+				flushError = this.#recordError(err);
+			}
+		}
 		if (this.#closeAdapter) {
 			try {
 				this.#closeAdapter.close(-1);
@@ -2556,6 +2853,8 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 		}
 		this.#closeState = "closed";
 		this.#closeError = undefined;
+		this.#bufferedBytes = 0;
+		if (flushError) throw flushError;
 	}
 
 	async close(): Promise<void> {
@@ -2573,11 +2872,38 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 	getCloseError(): Error | undefined {
 		return this.#closeError;
 	}
+
+	getInstrumentation(): SessionStorageBufferedWriterInstrumentation {
+		return {
+			bytesSubmitted: this.#bytesSubmitted,
+			bytesWritten: this.#bytesWritten,
+			writeCalls: this.#writeCalls,
+			flushCalls: this.#flushCalls,
+			bufferedBytes: this.#bufferedBytes,
+		};
+	}
 }
 
 export class MemorySessionStorage implements SessionStorage {
 	#files = new Map<string, { content: Buffer; mtimeMs: number; ino: bigint }>();
 	#nextInode = 1n;
+	acquireExclusiveLockSync(lockPath: string): SessionStorageExclusiveLock | undefined {
+		if (this.#files.has(lockPath)) return undefined;
+		const ino = this.#nextInode++;
+		this.#files.set(lockPath, {
+			content: Buffer.from(`${process.pid}:${randomUUID()}\n`, "utf8"),
+			mtimeMs: Date.now(),
+			ino,
+		});
+		let released = false;
+		return {
+			releaseSync: () => {
+				if (released) return;
+				released = true;
+				if (this.#files.get(lockPath)?.ino === ino) this.#files.delete(lockPath);
+			},
+		};
+	}
 
 	#statFor(entry: { content: Buffer; mtimeMs: number; ino: bigint }): SessionStorageStat {
 		return {
@@ -2814,6 +3140,12 @@ export class MemorySessionStorage implements SessionStorage {
 
 	openWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
 		return new MemorySessionStorageWriter(this, path, options);
+	}
+	openBufferedWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageBufferedWriter {
+		return new MemorySessionStorageWriter(this, path, {
+			...options,
+			bufferSize: options?.bufferSize ?? SESSION_STORAGE_BUFFERED_WRITER_DEFAULT_BYTES,
+		}) as SessionStorageBufferedWriter;
 	}
 
 	openStagedWriter(path: string): StagedStreamingWriter {
