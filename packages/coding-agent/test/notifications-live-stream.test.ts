@@ -4,7 +4,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Settings } from "../src/config/settings";
 import { getNotificationConfig } from "../src/sdk/bus/config";
-import { createNotificationsExtension } from "../src/sdk/bus/index";
 import type { NotificationSessionContext } from "../src/sdk/bus/session-control";
 import { NotificationSessionController } from "../src/sdk/bus/session-control";
 import { type EnsureDaemonResult, TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
@@ -19,6 +18,7 @@ import {
 	isolatedNotificationSettings,
 	registerNotificationRuntime,
 } from "./helpers/notification-settings";
+import { createOrchestrationNotificationsExtension } from "./helpers/telegram-topic-test";
 
 // ---------------------------------------------------------------------------
 // 1) Pure render contract: streamed turn frames become editable, and live +
@@ -190,7 +190,11 @@ async function bootSession(
 		eligible: true,
 		getConfig: () => getNotificationConfig(settings),
 	});
-	createNotificationsExtension(api, { settings, controller, ensureTelegramDaemon: options.ensureTelegramDaemon });
+	createOrchestrationNotificationsExtension(api, {
+		settings,
+		controller,
+		ensureTelegramDaemon: options.ensureTelegramDaemon,
+	});
 	const sid = `stream-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
 		cwd,

@@ -693,16 +693,17 @@ without live credentials or live-provider end-to-end tests.
 ## Managed Telegram daemon (bundled reference client)
 
 GJC also ships a managed Telegram reference client for the common phone-notify
-workflow. It remains a client of the generic SDK: it scans session discovery
-files, opens each session WebSocket, and routes Telegram replies back to the
-matching endpoint. Run `gjc notify setup` once to complete Telegram's interactive
-private-chat pairing flow.
+workflow. It remains a client of the generic SDK: it scans registered session
+roots and may inspect their endpoint files, but only coordinator/lifecycle
+sessions can claim Telegram forum topics. Ordinary sessions remain topic-free.
+Run `gjc notify setup` once to complete Telegram's interactive private-chat
+pairing flow.
 
-For Telegram forum topics, the daemon deletes the per-session topic when the local
-notification endpoint shuts down, so it disappears from the topic list. A resumed
-session creates a fresh topic before sending again. The bot must be allowed to
-delete messages in that chat; without that permission, deletion is best-effort and
-delivery continues.
+For Telegram forum topics, the daemon deletes the coordinator/lifecycle session
+topic when the local notification endpoint shuts down, so it disappears from the
+topic list. A resumed orchestration session creates a fresh topic before sending
+again. The bot must be allowed to delete messages in that chat; without that
+permission, deletion is best-effort and delivery continues.
 
 ### Singleton poller and trust model
 
@@ -722,11 +723,12 @@ The trust model is intentionally strict:
 
 ### Routing in private-chat topics
 
-The paired private chat prefers per-session Telegram topics (Threaded Mode). The
-daemon tags messages by session, stores compact callback aliases for inline
-buttons, and routes replies back to the exact session/action. A forum-enabled
-supergroup is no longer required: when the bot owner enables Threaded Mode in
-@BotFather, the daemon creates one topic per session in the paired private chat.
+The paired private chat prefers one Telegram topic per coordinator/lifecycle
+session (Threaded Mode). The daemon tags messages by session, stores compact
+callback aliases for inline buttons, and routes replies back to the exact
+session/action. A forum-enabled supergroup is no longer required: when the bot
+owner enables Threaded Mode in @BotFather, the daemon creates topics only for
+orchestration sessions in the paired private chat.
 GJC cannot enable Threaded Mode through the Bot API; setup only verifies the
 capability and guides the manual BotFather toggle.
 

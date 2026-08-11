@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-08-11
+
 ### Added
 - `/model <preset>` and `/model gajae-code/<preset>` now activate a known model profile immediately instead of failing with "Unknown model". Unknown names still fall through to model resolution, and `/model <role> <preset>` keeps assigning a model to the named role.
 - Browser `act` and `run` responses can now surface an opt-in (`open(..., { diagnostics: true })`), bounded mailbox of page exceptions and `console.error` metadata. Entries carry only kind, timestamp, origin-only URL, line/column, and an allowlisted built-in error class; path segments, query strings, messages, arguments, values, and stacks are never retained. Serialization is byte-bounded with an explicit truncation marker.
@@ -12,6 +14,7 @@
 ### Fixed
 - A just-created or just-registered SDK session no longer reads as not-live (failing immediate `session.close`/`session.delete`, endpoint resolution, and chat-daemon attachment) for up to one heartbeat interval: the host-written registration now counts as initial liveness evidence, aging out exactly like a heartbeat, with the OS process-incarnation match still required. The broker's shutdown-escalation identity proof also accepts the incarnation the index auto-stamps at registration, and ACP `session/list` no longer advertises or re-adopts closed/unregistered (DR-1 terminal) rows — repeated ACP deletes answer already-gone instead of escalating against a host that no longer exists.
 - Insane public-route search now cancels and rejects response bodies larger than 1 MiB instead of buffering unbounded feed, HTML, or JSON payloads.
+- Telegram forum-topic ownership is now limited to coordinator/lifecycle-managed sessions; ordinary sessions can still use local SDK or other notification providers without creating Telegram topics.
 - The Telegram notification daemon no longer terminates with an uncaught `EPERM` when publishing its heartbeat sidecar while an external Windows file lock (antivirus, indexer) briefly holds the destination. The rename is retried a bounded number of times under the ownership-lock fence, a still-failing publication is contained as a diagnostic-logged transient (the next heartbeat cycle republishes), and only a proven ownership loss stops the daemon; the stale-writer fence and staging-temp cleanup are preserved on every path (#4200).
 - `/fast` status, model badges, and task/subagent badges no longer show `⚡` for providers that silently drop unscoped priority intent. Indicators now follow wire-effective built-in support or an explicit `compat.supportsServiceTier` capability instead of treating every provider as fast-capable.
 - The broker's dead-registration sweep now requires positive proof of host death (ESRCH, or a readable OS process incarnation that differs from the recorded one) before unregistering a session. Under heartbeat-based liveness a registered host whose heartbeat had not yet been checkpointed read as not-live and could be reaped while still running; a stale or missing heartbeat is no longer grounds for a reap, and terminal registrations are never re-reaped.

@@ -24,6 +24,7 @@ import {
 	isGenericNotificationHostEligible,
 	isGenericNotificationSessionEnabled,
 	isProviderEffectivelyEnabled,
+	isTelegramOrchestrationSession,
 	maskToken,
 	type NotificationConfig,
 	type RedactableAction,
@@ -59,6 +60,10 @@ import {
 	isolatedNotificationSettings,
 	registerNotificationRuntime,
 } from "./helpers/notification-settings";
+import {
+	createOrchestrationNotificationsExtension,
+	withoutTelegramOrchestrationProvenance,
+} from "./helpers/telegram-topic-test";
 
 const BASE_CFG: NotificationConfig = {
 	enabled: false,
@@ -1354,6 +1359,17 @@ describe("notifications config", () => {
 		expect(hasAnyEffectivelyEnabledProvider(mixedAdapterCfg)).toBe(true);
 		expect(telegramEffectivelyEnabled(mixedAdapterCfg)).toBe(false);
 	});
+	test("isTelegramOrchestrationSession requires coordinator or lifecycle provenance", () => {
+		expect(isTelegramOrchestrationSession({})).toBe(false);
+		expect(isTelegramOrchestrationSession({ GJC_NOTIFICATIONS: "1" })).toBe(false);
+		expect(isTelegramOrchestrationSession({ GJC_COORDINATOR_SESSION_ID: "coordinator-1" })).toBe(true);
+		expect(isTelegramOrchestrationSession({ GJC_COORDINATOR_SESSION_STATE_FILE: "/tmp/session-state.json" })).toBe(
+			true,
+		);
+		expect(isTelegramOrchestrationSession({ GJC_LIFECYCLE_REQUEST_ID: "lifecycle-1" })).toBe(true);
+		expect(isTelegramOrchestrationSession({ GJC_SDK_LIFECYCLE_REQUEST: "{}" })).toBe(true);
+		expect(isTelegramOrchestrationSession({ GJC_COORDINATOR_SESSION_ID: "  " })).toBe(false);
+	});
 
 	test("isGenericNotificationSessionEnabled applies precedence", () => {
 		expect(
@@ -1805,7 +1821,7 @@ describe("notifications config", () => {
 				ui: { notify: () => {} },
 			} as unknown as ExtensionContext;
 			let providerEnsures = 0;
-			createNotificationsExtension(api, {
+			createOrchestrationNotificationsExtension(api, {
 				settings,
 				ensureTelegramDaemon: async () => "blocked",
 				ensureProviderDaemon: async provider => {
@@ -1884,7 +1900,7 @@ describe("notifications config", () => {
 				ui: { notify: () => {} },
 			} as unknown as ExtensionContext;
 			let providerEnsures = 0;
-			createNotificationsExtension(api, {
+			createOrchestrationNotificationsExtension(api, {
 				settings,
 				ensureTelegramDaemon: async () => "blocked",
 				ensureProviderDaemon: async () => {
@@ -1934,7 +1950,7 @@ describe("notifications config", () => {
 				},
 				ui: { notify: () => {} },
 			} as unknown as ExtensionContext;
-			createNotificationsExtension(api, {
+			createOrchestrationNotificationsExtension(api, {
 				settings,
 				ensureTelegramDaemon: async () => "blocked",
 			});
@@ -2060,7 +2076,7 @@ describe("notifications config", () => {
 				ui: { notify: (message: string) => notifications.push(message) },
 			} as unknown as ExtensionCommandContext;
 			const endpoint = path.join(cwd, ".gjc", "state", "chat", "sdk", "provider-readiness-retry.json");
-			createNotificationsExtension(api, {
+			createOrchestrationNotificationsExtension(api, {
 				settings,
 				ensureTelegramDaemon: async () => "blocked",
 				ensureProviderDaemon: async () => {
@@ -2310,6 +2326,64 @@ describe("notifications config", () => {
 		expect(fs.existsSync(path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`))).toBe(false);
 		expect(fs.existsSync(daemonPaths(agentDir).roots)).toBe(false);
 	});
+	test("ordinary notification sessions do not register a Telegram topic root", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notification-no-topic-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notification-no-topic-agent-"));
+		tempDirs.push(cwd, agentDir);
+		const sessionId = "session-no-topic";
+		const settings = new Proxy(
+			Settings.isolated({
+				"notifications.enabled": true,
+				"notifications.telegram.botToken": "123456:ordinary-session-token",
+				"notifications.telegram.chatId": "ordinary-session-chat",
+			}),
+			{
+				get(target, prop) {
+					if (prop === "getAgentDir") return () => agentDir;
+					const value = Reflect.get(target, prop, target);
+					return typeof value === "function" ? value.bind(target) : value;
+				},
+			},
+		) as Settings;
+		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+		const api = {
+			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+				handlers.set(event, handler);
+			},
+			registerCommand() {},
+		} as unknown as ExtensionAPI;
+		const context = {
+			cwd,
+			sessionManager: {
+				getSessionId: () => sessionId,
+				getSessionName: () => "ordinary session",
+			},
+			ui: { notify: () => {} },
+		} as unknown as ExtensionContext;
+		let telegramEnsures = 0;
+		withoutTelegramOrchestrationProvenance(() =>
+			createNotificationsExtension(api, {
+				settings,
+				ensureTelegramDaemon: async () => {
+					telegramEnsures++;
+					return "attached";
+				},
+			}),
+		);
+		const sessionStart = handlers.get("session_start");
+		const sessionShutdown = handlers.get("session_shutdown");
+		if (!sessionStart || !sessionShutdown) throw new Error("notifications extension handlers were not registered");
+		const endpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		try {
+			await sessionStart({}, context);
+			expect(fs.existsSync(endpoint)).toBe(true);
+			expect(fs.existsSync(daemonPaths(agentDir).roots)).toBe(false);
+			expect(telegramEnsures).toBe(0);
+		} finally {
+			await sessionShutdown({}, context);
+			expect(fs.existsSync(endpoint)).toBe(false);
+		}
+	});
 	test("captured /notify on uses the production daemon ensurer once and awaits SDK endpoint shutdown", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notification-command-"));
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notification-agent-"));
@@ -2352,7 +2426,7 @@ describe("notifications config", () => {
 			ui: { notify: () => {} },
 		} as unknown as ExtensionCommandContext;
 
-		createNotificationsExtension(api, {
+		createOrchestrationNotificationsExtension(api, {
 			settings,
 			ensureTelegramDaemon: input => {
 				let ownerId: string | undefined;
