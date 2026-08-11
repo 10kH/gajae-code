@@ -115,32 +115,26 @@ describe("ConversationStore", () => {
 		expect(fs.files.has(lockFile)).toBe(false);
 		expect(fs.calls.some(call => call.startsWith(`link:${lockFile}.`) && call.endsWith(`:${lockFile}`))).toBe(true);
 	});
-	test("publishes complete synced metadata before admitting a successor", async () => {
+	test("publishes complete synced metadata before admitting a same-process successor", async () => {
 		const enteredLink = Promise.withResolvers<void>();
-		const contenderAttempted = Promise.withResolvers<void>();
 		const releaseLink = Promise.withResolvers<void>();
-		const retryPermit = Promise.withResolvers<void>();
 		let firstLink = true;
 		class PublicationBarrierFs extends MemoryConversationStoreFs {
 			override async link(from: string, to: string): Promise<void> {
-				if (firstLink) {
-					firstLink = false;
-					const metadata = this.files.get(from);
-					expect(metadata).toBeDefined();
-					expect(JSON.parse(metadata!.trim())).toEqual({
-						pid: 101,
-						incarnation: "unavailable",
-						timestamp: 1,
-						nonce: expect.any(String),
-					});
-					expect(this.calls.at(-1)).toBe(`sync:${from}`);
-					await super.link(from, to);
-					enteredLink.resolve();
-					await releaseLink.promise;
-					return;
-				}
-				contenderAttempted.resolve();
+				if (!firstLink) return await super.link(from, to);
+				firstLink = false;
+				const metadata = this.files.get(from);
+				expect(metadata).toBeDefined();
+				expect(JSON.parse(metadata!.trim())).toEqual({
+					pid: 101,
+					incarnation: "unavailable",
+					timestamp: 1,
+					nonce: expect.any(String),
+				});
+				expect(this.calls.at(-1)).toBe(`sync:${from}`);
 				await super.link(from, to);
+				enteredLink.resolve();
+				await releaseLink.promise;
 			}
 		}
 		const fs = new PublicationBarrierFs();
@@ -157,26 +151,18 @@ describe("ConversationStore", () => {
 			agentDir: "/agent",
 			kind: "discord",
 			fs,
-			pid: 202,
+			pid: 101,
 			pidIncarnation: () => undefined,
 			pidAlive: () => true,
-			sleep: async () => await retryPermit.promise,
+			lockTimeoutMs: 0,
 		});
 		const lockFile = `${first.filePath}.lock`;
 		const firstWrite = first.write("mapping", undefined, record(1));
 		await enteredLink.promise;
 		expect(fs.files.has(lockFile)).toBe(true);
-		let secondSettled = false;
-		const secondWrite = second.write("mapping", undefined, record(1)).finally(() => {
-			secondSettled = true;
-		});
-		await contenderAttempted.promise;
-		expect(secondSettled).toBe(false);
+		await expect(second.write("mapping", undefined, record(1))).rejects.toBeInstanceOf(ConversationLockTimeoutError);
 		releaseLink.resolve();
 		await expect(firstWrite).resolves.toBe(true);
-		retryPermit.resolve();
-		await expect(secondWrite).resolves.toBe(false);
-
 		const pendingSync = fs.calls.findIndex(call => call.startsWith(`sync:${lockFile}.`) && call.endsWith(".pending"));
 		const publication = fs.calls.findIndex(
 			call => call.startsWith(`link:${lockFile}.`) && call.endsWith(`:${lockFile}`),

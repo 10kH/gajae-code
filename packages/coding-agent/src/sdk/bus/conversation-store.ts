@@ -381,11 +381,11 @@ export class ConversationStore<T extends ConversationRecord> {
 				timestamp: this.#clock(),
 				nonce: randomUUID(),
 			};
+			if (!heldLockFiles.has(lockFile)) heldLockFiles.set(lockFile, lock.nonce!);
 			await handle.writeFile(`${JSON.stringify(lock)}\n`, "utf8");
 			await handle.sync();
 			await this.#fs.link(pendingFile, lockFile);
 			published = true;
-			heldLockFiles.set(lockFile, lock.nonce!);
 			await this.#fs.unlink(pendingFile);
 			return { handle, lock };
 		} catch (error) {
