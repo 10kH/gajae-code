@@ -1775,7 +1775,17 @@ function createControlSurface(
 				// added by a LATER submission is untouched by this abort (and the
 				// bucket cleanup below reflects what actually remains).
 				for (const cancel of admittedRequesterPreflights) requesterPreflights?.delete(cancel);
-				terminalAbortSeams.cancelPendingPreflightForTerminalAbort();
+				// The seam cancels the SESSION-WIDE preflight controller, so only
+				// invoke it when NO OTHER connection has a pending admission: a
+				// queued requester's abort must reject its own wrapper callback
+				// (above) without cancelling another connection's active
+				// preflight — the aborting requester's admission is already
+				// rejected, so the session-wide abort is never required for it
+				// (review thread P1).
+				const otherConnectionPreflights = [...pendingPreflights.entries()].some(
+					([bucket, callbacks]) => bucket !== requesterBucketKey && callbacks.size > 0,
+				);
+				if (!otherConnectionPreflights) terminalAbortSeams.cancelPendingPreflightForTerminalAbort();
 			}
 			if (requesterPreflights && requesterPreflights.size === 0) {
 				// Abort-only lookups must not retain an empty per-connection bucket:

@@ -2661,6 +2661,88 @@ test("SDK-only host never advances a finalized uncertain row for a mismatched re
 	}
 });
 
+test("SDK-only host cancels only the aborting requester's preflight while another connection is admitted", async () => {
+	// Review thread P1: a queued requester's terminal abort rejects its own
+	// wrapper callback but must NOT invoke the session-wide preflight abort
+	// while another connection has an active pending admission — the seam
+	// cancels the session's single controller, which would kill the other
+	// connection's preflight while the aborting requester's queued admission
+	// may still start on the newly reset controller.
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-preflight-scope-"));
+	let seamCancels = 0;
+	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+	const api = {
+		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+			handlers.set(event, handler);
+		},
+		sendUserMessage: async (_content: string, options: { onPreflightAcceptCommit?: () => Promise<void> }) => {
+			await options?.onPreflightAcceptCommit?.();
+		},
+	} as unknown as ExtensionAPI;
+	const transport = memoryTransport();
+	const reconciliationStore = createReconciliationStore({
+		sessionFile: path.join(cwd, "session.json"),
+		sessionId: transport.sessionId,
+	});
+	createSdkSessionRuntimeExtension(api, {
+		agentDir: cwd,
+		createTransport: async () => transport,
+		terminalAbortSeams: {
+			getReconciliationStore: () => reconciliationStore,
+			getTerminalTurnEpoch: () => 7,
+			getActivePromptHandle: () => "exact-run-handle",
+			getActivePromptOwnerConnectionId: () => undefined,
+			cancelPendingPreflightForTerminalAbort: () => {
+				seamCancels++;
+			},
+			abortPromptAndWaitWithTerminal: async (_handle, _options) => ({ status: "settled", terminalScope: {} }),
+		},
+	});
+	const ctx = extensionContext(transport.sessionId, cwd);
+	try {
+		await handlers.get("session_start")?.({}, ctx);
+		const waitResponse = async (id: string) => {
+			const deadline = Date.now() + 15_000;
+			while (!transport.sent.some(frame => frame.id === id && frame.type === "control_response")) {
+				if (Date.now() > deadline) throw new Error(`Timed out waiting for ${id}`);
+				await Bun.sleep(20);
+			}
+		};
+		// Two connections admit prompts while idle; both preflights are pending.
+		transport.feed("conn-a", {
+			type: "control_request",
+			id: "preflight-a",
+			operation: "turn.prompt",
+			input: { text: "a" },
+		} as SdkFrame);
+		await waitResponse("preflight-a");
+		transport.feed("conn-b", {
+			type: "control_request",
+			id: "preflight-b",
+			operation: "turn.prompt",
+			input: { text: "b" },
+		} as SdkFrame);
+		await waitResponse("preflight-b");
+		// Conn B terminal-aborts before its run starts: only B's wrapper
+		// preflight may be cancelled; A's active preflight must survive.
+		transport.feed("conn-b", {
+			type: "control_request",
+			id: "preflight-abort-b",
+			operation: "turn.abort",
+			input: { mode: "terminal" },
+			idempotencyKey: "preflight-abort-b-key",
+		} as SdkFrame);
+		await waitResponse("preflight-abort-b");
+		// The session-wide seam was never invoked while another connection's
+		// preflight was pending — only the aborting requester's wrapper
+		// callback was rejected.
+		expect(seamCancels).toBe(0);
+	} finally {
+		await handlers.get("session_shutdown")?.({}, ctx);
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
 test("SDK-only host keeps the idle-submitted prompt's owner when isIdle flips during the accept window", async () => {
 	// Review thread P1: the production AgentSession begins its in-flight
 	// bookkeeping BEFORE the preflight acceptance callback, so re-reading
