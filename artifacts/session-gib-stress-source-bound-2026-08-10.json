@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
   "bench": "session-gib-stress",
-  "generatedAt": "2026-08-11T14:49:06.361Z",
-  "gitSha": "8fe34e4aea668a75310f35d680a8b70e6fa6c8ff",
+  "generatedAt": "2026-08-11T14:53:11.682Z",
+  "gitSha": "d83041e4e0c45b37cafe7f3b00c478428219a026",
   "platform": "darwin",
   "arch": "arm64",
   "cpu": "Apple M5 Max",
@@ -34,68 +34,68 @@
       "outputToSourceRatio": 1.0000000727141707,
       "phases": {
         "fixtureGeneration": {
-          "elapsedMs": 495.082458,
+          "elapsedMs": 1189.834208,
           "cpu": {
-            "userMicros": 134242,
-            "systemMicros": 147999
+            "userMicros": 134842,
+            "systemMicros": 154190
           }
         },
         "fork": {
-          "elapsedMs": 3311.8015,
+          "elapsedMs": 2921.109208,
           "cpu": {
-            "userMicros": 2829951,
-            "systemMicros": 501592
+            "userMicros": 2791730,
+            "systemMicros": 502010
           }
         },
         "closeFork": {
-          "elapsedMs": 1.431166999999732,
+          "elapsedMs": 1.8426669999998921,
           "cpu": {
-            "userMicros": 950,
-            "systemMicros": 488
+            "userMicros": 969,
+            "systemMicros": 871
           }
         },
         "reopen": {
-          "elapsedMs": 1301.774542,
+          "elapsedMs": 1682.6757499999994,
           "cpu": {
-            "userMicros": 1804359,
-            "systemMicros": 404386
+            "userMicros": 1675335,
+            "systemMicros": 414326
           }
         },
         "coldLookups": {
-          "elapsedMs": 23.40124999999989,
+          "elapsedMs": 20.1347080000005,
           "cpu": {
-            "userMicros": 18126,
-            "systemMicros": 6999
+            "userMicros": 16218,
+            "systemMicros": 5816
           }
         },
         "warmLookups": {
-          "elapsedMs": 0.4610000000002401,
+          "elapsedMs": 0.4084579999998823,
           "cpu": {
-            "userMicros": 489,
-            "systemMicros": 18
+            "userMicros": 487,
+            "systemMicros": 8
           }
         },
         "buildContext": {
-          "elapsedMs": 0.17875000000003638,
+          "elapsedMs": 0.1630829999994603,
           "cpu": {
-            "userMicros": 233,
-            "systemMicros": 13
+            "userMicros": 234,
+            "systemMicros": 11
           }
         },
         "closeReopened": {
-          "elapsedMs": 0.6253340000002936,
+          "elapsedMs": 5.116250000000036,
           "cpu": {
-            "userMicros": 188,
-            "systemMicros": 448
+            "userMicros": 147,
+            "systemMicros": 497
           }
         }
       },
       "phaseEvidence": {
         "wholeFork": {
-          "elapsedMs": 3311.8015,
+          "elapsedMs": 2921.109208,
           "cpu": {
-            "userMicros": 2829951,
-            "systemMicros": 501592
+            "userMicros": 2791730,
+            "systemMicros": 502010
           }
         },
         "preflightScan": null,
@@ -114,135 +114,135 @@
         "fsyncCount": 0
       },
       "throughput": {
-        "fixtureGenerationMiBPerSecond": 2066.3224549151773,
-        "forkMiBPerSecond": 308.89532479528134
+        "fixtureGenerationMiBPerSecond": 859.7836514715502,
+        "forkMiBPerSecond": 350.2094331832321
       },
       "latency": {
         "coldLookupMs": {
           "samples": [
-            1.4823749999995925,
-            1.0349169999999503,
-            1.063999999999396,
-            1.2637500000000728,
-            1.3590839999997115,
-            1.3089580000005299,
-            1.4158749999996871,
-            1.4577909999998155,
-            1.7574589999994714,
-            1.572374999999738,
-            1.9014159999996991,
-            1.3844170000002123,
-            1.4590419999994992,
-            1.430250000000342,
-            1.5871250000000146,
-            1.501709000000119
+            1.1814999999996871,
+            0.872667000000547,
+            0.9075000000002547,
+            1.0712079999993875,
+            1.2500829999999041,
+            1.252582999999504,
+            1.1562910000002375,
+            1.1464169999999285,
+            1.195875000000342,
+            1.265875000000051,
+            1.9271669999998267,
+            1.3134589999999662,
+            1.2231670000001031,
+            1.1607920000005834,
+            1.2254590000002281,
+            1.6081250000006548
           ],
-          "min": 1.0349169999999503,
-          "median": 1.430250000000342,
-          "p95": 1.9014159999996991,
-          "max": 1.9014159999996991
+          "min": 0.872667000000547,
+          "median": 1.195875000000342,
+          "p95": 1.9271669999998267,
+          "max": 1.9271669999998267
         },
         "warmLookupMs": {
           "samples": [
-            0.020708999999442312,
-            0.004917000000205007,
-            0.0025420000001759036,
-            0.005375000000640284,
-            0.0038330000006681075,
-            0.0022500000004583853,
-            0.0031249999992724042,
-            0.002749999999650754,
-            0.002666999999746622,
+            0.010333000000173342,
+            0.0027079999999841675,
+            0.0029160000003685127,
+            0.0036250000002837623,
+            0.002832999999554886,
+            0.002500000000509317,
+            0.0020000000004074536,
+            0.0019579999998313724,
+            0.005417000000306871,
+            0.0019170000005033216,
             0.002375000000029104,
-            0.004000000000814907,
-            0.009083999999347725,
-            0.003583000000617176,
-            0.007458999999471416,
-            0.003333000000566244,
-            0.004541000000244821
+            0.010000000000218279,
+            0.002666999999746622,
+            0.005084000000351807,
+            0.0027079999999841675,
+            0.002500000000509317
           ],
-          "min": 0.0022500000004583853,
-          "median": 0.003583000000617176,
-          "p95": 0.020708999999442312,
-          "max": 0.020708999999442312
+          "min": 0.0019170000005033216,
+          "median": 0.0027079999999841675,
+          "p95": 0.010333000000173342,
+          "max": 0.010333000000173342
         }
       },
       "memory": {
         "baseline": {
-          "rssBytes": 180174848,
-          "heapUsedBytes": 19653498,
-          "heapTotalBytes": 18931712,
-          "externalBytes": 4724862,
+          "rssBytes": 180371456,
+          "heapUsedBytes": 19619703,
+          "heapTotalBytes": 18913280,
+          "externalBytes": 4726506,
           "arrayBuffersBytes": 1158
         },
         "afterFixture": {
-          "rssBytes": 411566080,
-          "heapUsedBytes": 76280038,
-          "heapTotalBytes": 18931712,
-          "externalBytes": 4781236,
+          "rssBytes": 447365120,
+          "heapUsedBytes": 76282306,
+          "heapTotalBytes": 18913280,
+          "externalBytes": 4780330,
           "arrayBuffersBytes": 1158
         },
         "afterCapture": {
-          "rssBytes": 411697152,
-          "heapUsedBytes": 76280038,
-          "heapTotalBytes": 18931712,
-          "externalBytes": 4781237,
+          "rssBytes": 447365120,
+          "heapUsedBytes": 76282306,
+          "heapTotalBytes": 18913280,
+          "externalBytes": 4780331,
           "arrayBuffersBytes": 1158
         },
         "afterFork": {
-          "rssBytes": 494993408,
-          "heapUsedBytes": 22008960,
+          "rssBytes": 530546688,
+          "heapUsedBytes": 22013967,
           "heapTotalBytes": 19217408,
-          "externalBytes": 6846911,
+          "externalBytes": 6845746,
           "arrayBuffersBytes": 912689
         },
         "afterForkClose": {
-          "rssBytes": 495255552,
-          "heapUsedBytes": 22008960,
-          "heapTotalBytes": 19184640,
-          "externalBytes": 6006292,
+          "rssBytes": 530743296,
+          "heapUsedBytes": 22013967,
+          "heapTotalBytes": 19201024,
+          "externalBytes": 6005127,
           "arrayBuffersBytes": 1158
         },
         "afterReopen": {
-          "rssBytes": 514539520,
-          "heapUsedBytes": 19589254,
+          "rssBytes": 548241408,
+          "heapUsedBytes": 19588032,
+          "heapTotalBytes": 19168256,
+          "externalBytes": 5671440,
+          "arrayBuffersBytes": 912689
+        },
+        "afterColdLookups": {
+          "rssBytes": 556253184,
+          "heapUsedBytes": 35868004,
+          "heapTotalBytes": 19725312,
+          "externalBytes": 21738907,
+          "arrayBuffersBytes": 912689
+        },
+        "afterWarmLookups": {
+          "rssBytes": 556269568,
+          "heapUsedBytes": 35868004,
+          "heapTotalBytes": 19725312,
+          "externalBytes": 21740211,
+          "arrayBuffersBytes": 912689
+        },
+        "afterContext": {
+          "rssBytes": 556285952,
+          "heapUsedBytes": 35868004,
+          "heapTotalBytes": 19741696,
+          "externalBytes": 21758350,
+          "arrayBuffersBytes": 912689
+        },
+        "afterTeardown": {
+          "rssBytes": 556285952,
+          "heapUsedBytes": 35868004,
           "heapTotalBytes": 19151872,
-          "externalBytes": 5672694,
-          "arrayBuffersBytes": 912689
-        },
-        "afterColdLookups": {
-          "rssBytes": 520503296,
-          "heapUsedBytes": 35869226,
-          "heapTotalBytes": 19692544,
-          "externalBytes": 21740161,
-          "arrayBuffersBytes": 912689
-        },
-        "afterWarmLookups": {
-          "rssBytes": 520519680,
-          "heapUsedBytes": 35869226,
-          "heapTotalBytes": 19692544,
-          "externalBytes": 21741465,
-          "arrayBuffersBytes": 912689
-        },
-        "afterContext": {
-          "rssBytes": 520536064,
-          "heapUsedBytes": 35869226,
-          "heapTotalBytes": 19708928,
-          "externalBytes": 21759604,
-          "arrayBuffersBytes": 912689
-        },
-        "afterTeardown": {
-          "rssBytes": 520536064,
-          "heapUsedBytes": 17921989,
-          "heapTotalBytes": 19135488,
-          "externalBytes": 3995163,
+          "externalBytes": 3993909,
           "arrayBuffersBytes": 1158
         },
-        "forkRssGrowthBytes": 83296256,
-        "reopenRssGrowthBytes": 19283968,
-        "lookupRssGrowthBytes": 5980160,
-        "teardownRssGrowthBytes": 340361216,
-        "maxRssBytes": 520536064
+        "forkRssGrowthBytes": 83181568,
+        "reopenRssGrowthBytes": 17498112,
+        "lookupRssGrowthBytes": 8028160,
+        "teardownRssGrowthBytes": 375914496,
+        "maxRssBytes": 556285952
       },
       "io": {
         "coldRangeReads": 16,
@@ -270,11 +270,11 @@
           "succeeded": true,
           "strategy": "pressure",
           "secondaryArtifactMode": "disabled",
-          "wallMs": 1070.647125,
-          "cpuMs": 1106.165,
-          "gcRequests": 12,
-          "gcRequestCount": 12,
-          "gcElapsedMs": 75.46271000000002,
+          "wallMs": 1019.95475,
+          "cpuMs": 1078.787,
+          "gcRequests": 11,
+          "gcRequestCount": 11,
+          "gcElapsedMs": 48.091210999999994,
           "bytesRead": 1138971422,
           "transcriptBytesRead": 1138753692,
           "bytesWritten": 218362,
@@ -289,708 +289,139 @@
           "indexWriteCalls": 1,
           "indexWriteBytes": 217730,
           "fsyncCount": 2,
-          "fsyncElapsedMs": 0.7772920000000001,
+          "fsyncElapsedMs": 0.8187500000000001,
           "phaseTelemetry": {
             "descriptorSecurityPreflight": {
-              "wallMs": 0.037791,
-              "cpuMs": 0.039
+              "wallMs": 0.025542,
+              "cpuMs": 0.026
             },
             "fsync": {
-              "wallMs": 0.782709,
-              "cpuMs": 0.762
+              "wallMs": 0.825,
+              "cpuMs": 0.79
             },
             "indexSerializationWrite": {
-              "wallMs": 6.486761,
+              "wallMs": 6.177758,
               "cpuMs": null
             },
             "semanticScan": {
-              "wallMs": 1029.891667,
-              "cpuMs": 1066.967
+              "wallMs": 978.706375,
+              "cpuMs": 1039.655
             },
             "dictionary": {
-              "wallMs": 0.002584,
+              "wallMs": 0.002625,
               "cpuMs": 0.003
             },
             "metadataDelta": {
-              "wallMs": 0.0425,
-              "cpuMs": 0.042
+              "wallMs": 0.042917,
+              "cpuMs": 0.043
             },
             "parent": {
-              "wallMs": 0.01875,
-              "cpuMs": 0.018
+              "wallMs": 0.018125,
+              "cpuMs": 0.019
             },
             "indexTailWork": {
-              "wallMs": 31.426916,
-              "cpuMs": 31.97
+              "wallMs": 32.132334,
+              "cpuMs": 32.792
             },
             "commitClassification": {
-              "wallMs": 1.720166,
-              "cpuMs": 1.801
+              "wallMs": 1.667125,
+              "cpuMs": 1.603
             },
             "hotSuffixContext": {
-              "wallMs": 6.7935,
-              "cpuMs": 4.359
+              "wallMs": 6.777791,
+              "cpuMs": 3.753
             }
           },
           "phaseEvidence": {
             "descriptorSecurityPreflight": {
-              "wallMs": 0.037791,
-              "cpuMs": 0.039
+              "wallMs": 0.025542,
+              "cpuMs": 0.026
             },
             "fsync": {
-              "wallMs": 0.782709,
-              "cpuMs": 0.762
+              "wallMs": 0.825,
+              "cpuMs": 0.79
             },
             "indexSerializationWrite": {
-              "wallMs": 6.486761,
+              "wallMs": 6.177758,
               "cpuMs": null
             },
             "semanticScan": {
-              "wallMs": 1029.891667,
-              "cpuMs": 1066.967
+              "wallMs": 978.706375,
+              "cpuMs": 1039.655
             },
             "dictionary": {
-              "wallMs": 0.002584,
+              "wallMs": 0.002625,
               "cpuMs": 0.003
             },
             "metadataDelta": {
-              "wallMs": 0.0425,
-              "cpuMs": 0.042
+              "wallMs": 0.042917,
+              "cpuMs": 0.043
             },
             "parent": {
-              "wallMs": 0.01875,
-              "cpuMs": 0.018
+              "wallMs": 0.018125,
+              "cpuMs": 0.019
             },
             "indexTailWork": {
-              "wallMs": 31.426916,
-              "cpuMs": 31.97
+              "wallMs": 32.132334,
+              "cpuMs": 32.792
             },
             "commitClassification": {
-              "wallMs": 1.720166,
-              "cpuMs": 1.801
+              "wallMs": 1.667125,
+              "cpuMs": 1.603
             },
             "hotSuffixContext": {
-              "wallMs": 6.7935,
-              "cpuMs": 4.359
+              "wallMs": 6.777791,
+              "cpuMs": 3.753
             }
           },
           "phaseTimings": {
             "descriptorSecurityPreflight": {
-              "wallMs": 0.037791,
-              "cpuMs": 0.039
+              "wallMs": 0.025542,
+              "cpuMs": 0.026
             },
             "fsync": {
-              "wallMs": 0.782709,
-              "cpuMs": 0.762
+              "wallMs": 0.825,
+              "cpuMs": 0.79
             },
             "indexSerializationWrite": {
-              "wallMs": 6.486761,
+              "wallMs": 6.177758,
               "cpuMs": null
             },
             "semanticScan": {
-              "wallMs": 1029.891667,
-              "cpuMs": 1066.967
-            },
-            "dictionary": {
-              "wallMs": 0.002584,
-              "cpuMs": 0.003
-            },
-            "metadataDelta": {
-              "wallMs": 0.0425,
-              "cpuMs": 0.042
-            },
-            "parent": {
-              "wallMs": 0.01875,
-              "cpuMs": 0.018
-            },
-            "indexTailWork": {
-              "wallMs": 31.426916,
-              "cpuMs": 31.97
-            },
-            "commitClassification": {
-              "wallMs": 1.720166,
-              "cpuMs": 1.801
-            },
-            "hotSuffixContext": {
-              "wallMs": 6.7935,
-              "cpuMs": 4.359
-            }
-          },
-          "dictionaryArtifactEnabled": false,
-          "parentArtifactEnabled": false,
-          "dictionaryBuildElapsedMs": 0.002584,
-          "parentBuildElapsedMs": 0.01875,
-          "flatIndexElapsedMs": 6.486761,
-          "pressureBaselineBytes": 56203300
-        },
-        "lastReopenTransition": {
-          "kind": "rebuild",
-          "reason": "bounded_first_open"
-        },
-        "currentCommitTransition": {
-          "kind": "exact",
-          "reason": "descriptor_and_proof_match"
-        },
-        "lazyReopenAttempted": true,
-        "lazyReopenSucceeded": true,
-        "consecutiveBuildFailures": 0,
-        "parentArtifactEnabled": false,
-        "dictionaryArtifactEnabled": false,
-        "metadataDeltaDescriptorBytes": 0,
-        "coldIndexBytes": 217730,
-        "coldIndexBlockCacheBytes": 0,
-        "coldEntryCacheBytes": 0,
-        "coldEntriesRetired": 0,
-        "coldEntriesReloaded": 0,
-        "rangeReadCount": 0,
-        "rangeReadGenerationMismatchCount": 0,
-        "sidecarRebuildCount": 0,
-        "coldMutationPromotions": 0,
-        "hotOverflowTransitions": 0,
-        "labelDiskFallbackCount": 0,
-        "shadowParityMismatchCount": 0,
-        "shadowParityCheckCount": 0,
-        "transcriptGeneration": 0
-      },
-      "reopenStats": {
-        "sidecarEnabled": true,
-        "coldRetirementActive": true,
-        "sidecarIneligible": false,
-        "hotRegionBytes": 911734,
-        "metaDescriptorBytes": 17262109,
-        "totalAccountedBytes": 49075532,
-        "reservedBudgetBytes": 47251456,
-        "allocatedCacheBytes": 17261883,
-        "hotResidentBytes": 1824076,
-        "metadataResidentBytes": 226,
-        "sidecarFileBytes": 219155,
-        "firstOpen": {
-          "attempted": false,
-          "succeeded": false,
-          "strategy": "pressure",
-          "secondaryArtifactMode": "disabled",
-          "wallMs": 0,
-          "cpuMs": 0,
-          "gcRequests": 0,
-          "gcRequestCount": 0,
-          "gcElapsedMs": 0,
-          "bytesRead": 0,
-          "transcriptBytesRead": 0,
-          "bytesWritten": 0,
-          "sidecarBytesWritten": 0,
-          "sidecarFileBytes": 219155,
-          "recordsParsed": 0,
-          "semanticRecordsParsed": 0,
-          "suffixRecordsParsed": 0,
-          "lineAssemblyCopyCount": 0,
-          "lineCopyCount": 0,
-          "lineAssemblyCopyBytes": 0,
-          "indexWriteCalls": 0,
-          "indexWriteBytes": 0,
-          "fsyncCount": 0,
-          "fsyncElapsedMs": 0,
-          "phaseTelemetry": {},
-          "phaseEvidence": {},
-          "phaseTimings": {},
-          "dictionaryArtifactEnabled": false,
-          "parentArtifactEnabled": false,
-          "dictionaryBuildElapsedMs": 0,
-          "parentBuildElapsedMs": 0,
-          "flatIndexElapsedMs": 0
-        },
-        "lastReopenTransition": {
-          "kind": "exact",
-          "reason": "descriptor_and_proof_match"
-        },
-        "currentCommitTransition": {
-          "kind": "exact",
-          "reason": "descriptor_and_proof_match"
-        },
-        "lazyReopenAttempted": true,
-        "lazyReopenSucceeded": true,
-        "consecutiveBuildFailures": 0,
-        "parentArtifactEnabled": false,
-        "dictionaryArtifactEnabled": false,
-        "metadataDeltaDescriptorBytes": 0,
-        "coldIndexBytes": 217730,
-        "coldIndexBlockCacheBytes": 481580,
-        "coldEntryCacheBytes": 16779349,
-        "coldEntriesRetired": 0,
-        "coldEntriesReloaded": 16,
-        "rangeReadCount": 16,
-        "rangeReadGenerationMismatchCount": 0,
-        "sidecarRebuildCount": 0,
-        "coldMutationPromotions": 0,
-        "hotOverflowTransitions": 0,
-        "labelDiskFallbackCount": 0,
-        "shadowParityMismatchCount": 0,
-        "shadowParityCheckCount": 0,
-        "transcriptGeneration": 0
-      },
-      "sessionMemoryTelemetry": {
-        "sidecarEnabled": true,
-        "coldRetirementActive": true,
-        "sidecarIneligible": false,
-        "hotRegionBytes": 911734,
-        "metaDescriptorBytes": 1180,
-        "totalAccountedBytes": 49075532,
-        "reservedBudgetBytes": 47251456,
-        "allocatedCacheBytes": 954,
-        "hotResidentBytes": 1824076,
-        "metadataResidentBytes": 226,
-        "sidecarFileBytes": 219155,
-        "lazyReopenAttempted": true,
-        "lazyReopenSucceeded": true,
-        "consecutiveBuildFailures": 0,
-        "parentArtifactEnabled": false,
-        "dictionaryArtifactEnabled": false,
-        "metadataDeltaDescriptorBytes": 0,
-        "coldIndexBytes": 217730,
-        "coldIndexBlockCacheBytes": 0,
-        "coldEntryCacheBytes": 0,
-        "coldEntriesRetired": 0,
-        "coldEntriesReloaded": 0,
-        "rangeReadCount": 0,
-        "rangeReadGenerationMismatchCount": 0,
-        "sidecarRebuildCount": 0,
-        "coldMutationPromotions": 0,
-        "hotOverflowTransitions": 0,
-        "labelDiskFallbackCount": 0,
-        "shadowParityMismatchCount": 0,
-        "shadowParityCheckCount": 0,
-        "transcriptGeneration": 0,
-        "reopen.sidecarEnabled": true,
-        "reopen.coldRetirementActive": true,
-        "reopen.sidecarIneligible": false,
-        "reopen.hotRegionBytes": 911734,
-        "reopen.metaDescriptorBytes": 17262109,
-        "reopen.totalAccountedBytes": 49075532,
-        "reopen.reservedBudgetBytes": 47251456,
-        "reopen.allocatedCacheBytes": 17261883,
-        "reopen.hotResidentBytes": 1824076,
-        "reopen.metadataResidentBytes": 226,
-        "reopen.sidecarFileBytes": 219155,
-        "reopen.lazyReopenAttempted": true,
-        "reopen.lazyReopenSucceeded": true,
-        "reopen.consecutiveBuildFailures": 0,
-        "reopen.parentArtifactEnabled": false,
-        "reopen.dictionaryArtifactEnabled": false,
-        "reopen.metadataDeltaDescriptorBytes": 0,
-        "reopen.coldIndexBytes": 217730,
-        "reopen.coldIndexBlockCacheBytes": 481580,
-        "reopen.coldEntryCacheBytes": 16779349,
-        "reopen.coldEntriesRetired": 0,
-        "reopen.coldEntriesReloaded": 16,
-        "reopen.rangeReadCount": 16,
-        "reopen.rangeReadGenerationMismatchCount": 0,
-        "reopen.sidecarRebuildCount": 0,
-        "reopen.coldMutationPromotions": 0,
-        "reopen.hotOverflowTransitions": 0,
-        "reopen.labelDiskFallbackCount": 0,
-        "reopen.shadowParityMismatchCount": 0,
-        "reopen.shadowParityCheckCount": 0,
-        "reopen.transcriptGeneration": 0
-      }
-    },
-    {
-      "operationClass": "direct-fork",
-      "gcStrategy": "pressure",
-      "secondaryArtifacts": "off",
-      "repetitions": 3,
-      "mode": "direct",
-      "sourceBytes": 1072693248,
-      "destinationBytes": 1072693326,
-      "outputToSourceRatio": 1.0000000727141707,
-      "phases": {
-        "fixtureGeneration": {
-          "elapsedMs": 402.77862500000003,
-          "cpu": {
-            "userMicros": 131080,
-            "systemMicros": 137184
-          }
-        },
-        "fork": {
-          "elapsedMs": 3055.60675,
-          "cpu": {
-            "userMicros": 2854482,
-            "systemMicros": 509167
-          }
-        },
-        "closeFork": {
-          "elapsedMs": 1.1482919999998558,
-          "cpu": {
-            "userMicros": 733,
-            "systemMicros": 412
-          }
-        },
-        "reopen": {
-          "elapsedMs": 1299.612792,
-          "cpu": {
-            "userMicros": 1784157,
-            "systemMicros": 397360
-          }
-        },
-        "coldLookups": {
-          "elapsedMs": 24.541291999999885,
-          "cpu": {
-            "userMicros": 18194,
-            "systemMicros": 7084
-          }
-        },
-        "warmLookups": {
-          "elapsedMs": 0.45962500000041473,
-          "cpu": {
-            "userMicros": 455,
-            "systemMicros": 10
-          }
-        },
-        "buildContext": {
-          "elapsedMs": 0.2541659999997137,
-          "cpu": {
-            "userMicros": 365,
-            "systemMicros": 40
-          }
-        },
-        "closeReopened": {
-          "elapsedMs": 0.473957999999584,
-          "cpu": {
-            "userMicros": 152,
-            "systemMicros": 327
-          }
-        }
-      },
-      "phaseEvidence": {
-        "wholeFork": {
-          "elapsedMs": 3055.60675,
-          "cpu": {
-            "userMicros": 2854482,
-            "systemMicros": 509167
-          }
-        },
-        "preflightScan": null,
-        "copyScan": null,
-        "stagedWriterPublication": null,
-        "destinationFirstOpen": null,
-        "sourceRevalidation": null
-      },
-      "counters": {
-        "gcRequests": 0,
-        "gcElapsedMs": 0,
-        "bytesRead": 0,
-        "bytesWritten": 0,
-        "recordsParsed": 0,
-        "indexWriteCalls": 0,
-        "fsyncCount": 0
-      },
-      "throughput": {
-        "fixtureGenerationMiBPerSecond": 2539.8567265082647,
-        "forkMiBPerSecond": 334.79439067216356
-      },
-      "latency": {
-        "coldLookupMs": {
-          "samples": [
-            1.570292000000336,
-            1.2374579999996058,
-            1.219082999999955,
-            1.3890000000001237,
-            1.2220829999996567,
-            1.3361249999998108,
-            1.3855419999999867,
-            1.4767080000001442,
-            1.3765410000005431,
-            1.3766660000001139,
-            1.69537500000024,
-            2.9534999999996217,
-            1.5123750000002474,
-            1.3484589999998207,
-            1.3917499999997744,
-            1.5522500000006403
-          ],
-          "min": 1.219082999999955,
-          "median": 1.3855419999999867,
-          "p95": 2.9534999999996217,
-          "max": 2.9534999999996217
-        },
-        "warmLookupMs": {
-          "samples": [
-            0.019500000000334694,
-            0.004291999999622931,
-            0.0028750000001309672,
-            0.006083000000216998,
-            0.003125000000181899,
-            0.0020830000003115856,
-            0.0018749999999272404,
-            0.0023330000003625173,
-            0.0032499999997526174,
-            0.002165999999306223,
-            0.0035420000003796304,
-            0.00912499999958527,
-            0.00429100000019389,
-            0.0035410000000410946,
-            0.003832999999758613,
-            0.0033329999996567494
-          ],
-          "min": 0.0018749999999272404,
-          "median": 0.0033329999996567494,
-          "p95": 0.019500000000334694,
-          "max": 0.019500000000334694
-        }
-      },
-      "memory": {
-        "baseline": {
-          "rssBytes": 176701440,
-          "heapUsedBytes": 19701452,
-          "heapTotalBytes": 18702336,
-          "externalBytes": 4751415,
-          "arrayBuffersBytes": 1158
-        },
-        "afterFixture": {
-          "rssBytes": 407076864,
-          "heapUsedBytes": 76307584,
-          "heapTotalBytes": 18702336,
-          "externalBytes": 4807782,
-          "arrayBuffersBytes": 1158
-        },
-        "afterCapture": {
-          "rssBytes": 407224320,
-          "heapUsedBytes": 76307584,
-          "heapTotalBytes": 18702336,
-          "externalBytes": 4807795,
-          "arrayBuffersBytes": 1158
-        },
-        "afterFork": {
-          "rssBytes": 490094592,
-          "heapUsedBytes": 22038450,
-          "heapTotalBytes": 18987008,
-          "externalBytes": 6872303,
-          "arrayBuffersBytes": 912689
-        },
-        "afterForkClose": {
-          "rssBytes": 490274816,
-          "heapUsedBytes": 22038450,
-          "heapTotalBytes": 18970624,
-          "externalBytes": 6031684,
-          "arrayBuffersBytes": 1158
-        },
-        "afterReopen": {
-          "rssBytes": 507281408,
-          "heapUsedBytes": 23398130,
-          "heapTotalBytes": 19118080,
-          "externalBytes": 7920226,
-          "arrayBuffersBytes": 912689
-        },
-        "afterColdLookups": {
-          "rssBytes": 515194880,
-          "heapUsedBytes": 38981054,
-          "heapTotalBytes": 19625984,
-          "externalBytes": 23628586,
-          "arrayBuffersBytes": 912689
-        },
-        "afterWarmLookups": {
-          "rssBytes": 515194880,
-          "heapUsedBytes": 38981054,
-          "heapTotalBytes": 19625984,
-          "externalBytes": 23594474,
-          "arrayBuffersBytes": 912689
-        },
-        "afterContext": {
-          "rssBytes": 515227648,
-          "heapUsedBytes": 38981054,
-          "heapTotalBytes": 19642368,
-          "externalBytes": 23613176,
-          "arrayBuffersBytes": 912689
-        },
-        "afterTeardown": {
-          "rssBytes": 515227648,
-          "heapUsedBytes": 38931456,
-          "heapTotalBytes": 19101696,
-          "externalBytes": 5848747,
-          "arrayBuffersBytes": 1158
-        },
-        "forkRssGrowthBytes": 82870272,
-        "reopenRssGrowthBytes": 17006592,
-        "lookupRssGrowthBytes": 7913472,
-        "teardownRssGrowthBytes": 338526208,
-        "maxRssBytes": 515227648
-      },
-      "io": {
-        "coldRangeReads": 16,
-        "warmRangeReads": 0,
-        "coldEntriesReloaded": 16
-      },
-      "guards": {
-        "contextMessageCount": 1,
-        "lookupPayloadBytes": 33554432
-      },
-      "forkStats": {
-        "sidecarEnabled": true,
-        "coldRetirementActive": true,
-        "sidecarIneligible": false,
-        "hotRegionBytes": 911734,
-        "metaDescriptorBytes": 1180,
-        "totalAccountedBytes": 49075532,
-        "reservedBudgetBytes": 47251456,
-        "allocatedCacheBytes": 954,
-        "hotResidentBytes": 1824076,
-        "metadataResidentBytes": 226,
-        "sidecarFileBytes": 219155,
-        "firstOpen": {
-          "attempted": true,
-          "succeeded": true,
-          "strategy": "pressure",
-          "secondaryArtifactMode": "disabled",
-          "wallMs": 987.229875,
-          "cpuMs": 1078.393,
-          "gcRequests": 12,
-          "gcRequestCount": 12,
-          "gcElapsedMs": 52.250417000000006,
-          "bytesRead": 1138971422,
-          "transcriptBytesRead": 1138753692,
-          "bytesWritten": 218362,
-          "sidecarBytesWritten": 218362,
-          "sidecarFileBytes": 219155,
-          "recordsParsed": 1027,
-          "semanticRecordsParsed": 1025,
-          "suffixRecordsParsed": 2,
-          "lineAssemblyCopyCount": 4304,
-          "lineCopyCount": 4304,
-          "lineAssemblyCopyBytes": 1074003775,
-          "indexWriteCalls": 1,
-          "indexWriteBytes": 217730,
-          "fsyncCount": 2,
-          "fsyncElapsedMs": 0.916417,
-          "phaseTelemetry": {
-            "descriptorSecurityPreflight": {
-              "wallMs": 0.030708,
-              "cpuMs": 0.032
-            },
-            "fsync": {
-              "wallMs": 0.92225,
-              "cpuMs": 0.864
-            },
-            "indexSerializationWrite": {
-              "wallMs": 5.242093,
-              "cpuMs": null
-            },
-            "semanticScan": {
-              "wallMs": 948.024875,
-              "cpuMs": 1040.183
+              "wallMs": 978.706375,
+              "cpuMs": 1039.655
             },
             "dictionary": {
               "wallMs": 0.002625,
               "cpuMs": 0.003
             },
             "metadataDelta": {
-              "wallMs": 0.042666,
+              "wallMs": 0.042917,
               "cpuMs": 0.043
             },
             "parent": {
-              "wallMs": 0.020917,
-              "cpuMs": 0.021
+              "wallMs": 0.018125,
+              "cpuMs": 0.019
             },
             "indexTailWork": {
-              "wallMs": 31.758708,
-              "cpuMs": 32.315
+              "wallMs": 32.132334,
+              "cpuMs": 32.792
             },
             "commitClassification": {
-              "wallMs": 1.477,
-              "cpuMs": 1.457
+              "wallMs": 1.667125,
+              "cpuMs": 1.603
             },
             "hotSuffixContext": {
-              "wallMs": 5.181917,
-              "cpuMs": 3.29
-            }
-          },
-          "phaseEvidence": {
-            "descriptorSecurityPreflight": {
-              "wallMs": 0.030708,
-              "cpuMs": 0.032
-            },
-            "fsync": {
-              "wallMs": 0.92225,
-              "cpuMs": 0.864
-            },
-            "indexSerializationWrite": {
-              "wallMs": 5.242093,
-              "cpuMs": null
-            },
-            "semanticScan": {
-              "wallMs": 948.024875,
-              "cpuMs": 1040.183
-            },
-            "dictionary": {
-              "wallMs": 0.002625,
-              "cpuMs": 0.003
-            },
-            "metadataDelta": {
-              "wallMs": 0.042666,
-              "cpuMs": 0.043
-            },
-            "parent": {
-              "wallMs": 0.020917,
-              "cpuMs": 0.021
-            },
-            "indexTailWork": {
-              "wallMs": 31.758708,
-              "cpuMs": 32.315
-            },
-            "commitClassification": {
-              "wallMs": 1.477,
-              "cpuMs": 1.457
-            },
-            "hotSuffixContext": {
-              "wallMs": 5.181917,
-              "cpuMs": 3.29
-            }
-          },
-          "phaseTimings": {
-            "descriptorSecurityPreflight": {
-              "wallMs": 0.030708,
-              "cpuMs": 0.032
-            },
-            "fsync": {
-              "wallMs": 0.92225,
-              "cpuMs": 0.864
-            },
-            "indexSerializationWrite": {
-              "wallMs": 5.242093,
-              "cpuMs": null
-            },
-            "semanticScan": {
-              "wallMs": 948.024875,
-              "cpuMs": 1040.183
-            },
-            "dictionary": {
-              "wallMs": 0.002625,
-              "cpuMs": 0.003
-            },
-            "metadataDelta": {
-              "wallMs": 0.042666,
-              "cpuMs": 0.043
-            },
-            "parent": {
-              "wallMs": 0.020917,
-              "cpuMs": 0.021
-            },
-            "indexTailWork": {
-              "wallMs": 31.758708,
-              "cpuMs": 32.315
-            },
-            "commitClassification": {
-              "wallMs": 1.477,
-              "cpuMs": 1.457
-            },
-            "hotSuffixContext": {
-              "wallMs": 5.181917,
-              "cpuMs": 3.29
+              "wallMs": 6.777791,
+              "cpuMs": 3.753
             }
           },
           "dictionaryArtifactEnabled": false,
           "parentArtifactEnabled": false,
           "dictionaryBuildElapsedMs": 0.002625,
-          "parentBuildElapsedMs": 0.020917,
-          "flatIndexElapsedMs": 5.242093,
-          "pressureBaselineBytes": 56260960
+          "parentBuildElapsedMs": 0.018125,
+          "flatIndexElapsedMs": 6.177758,
+          "pressureBaselineBytes": 56207113
         },
         "lastReopenTransition": {
           "kind": "rebuild",
@@ -1172,644 +603,68 @@
       "outputToSourceRatio": 1.0000000727141707,
       "phases": {
         "fixtureGeneration": {
-          "elapsedMs": 408.302166,
+          "elapsedMs": 496.10808299999997,
           "cpu": {
-            "userMicros": 130895,
-            "systemMicros": 134244
+            "userMicros": 135355,
+            "systemMicros": 147276
           }
         },
         "fork": {
-          "elapsedMs": 2904.822958,
+          "elapsedMs": 3055.8370409999998,
           "cpu": {
-            "userMicros": 2830052,
-            "systemMicros": 496267
+            "userMicros": 2818420,
+            "systemMicros": 508037
           }
         },
         "closeFork": {
-          "elapsedMs": 1.1023329999998168,
+          "elapsedMs": 1.4882080000002134,
           "cpu": {
-            "userMicros": 714,
-            "systemMicros": 382
-          }
-        },
-        "reopen": {
-          "elapsedMs": 1403.3266250000001,
-          "cpu": {
-            "userMicros": 1821181,
-            "systemMicros": 396969
-          }
-        },
-        "coldLookups": {
-          "elapsedMs": 22.449791000000005,
-          "cpu": {
-            "userMicros": 17583,
-            "systemMicros": 6928
-          }
-        },
-        "warmLookups": {
-          "elapsedMs": 0.45429199999944103,
-          "cpu": {
-            "userMicros": 543,
-            "systemMicros": 28
-          }
-        },
-        "buildContext": {
-          "elapsedMs": 0.19695800000044983,
-          "cpu": {
-            "userMicros": 292,
-            "systemMicros": 19
-          }
-        },
-        "closeReopened": {
-          "elapsedMs": 0.5587080000004789,
-          "cpu": {
-            "userMicros": 139,
-            "systemMicros": 413
-          }
-        }
-      },
-      "phaseEvidence": {
-        "wholeFork": {
-          "elapsedMs": 2904.822958,
-          "cpu": {
-            "userMicros": 2830052,
-            "systemMicros": 496267
-          }
-        },
-        "preflightScan": null,
-        "copyScan": null,
-        "stagedWriterPublication": null,
-        "destinationFirstOpen": null,
-        "sourceRevalidation": null
-      },
-      "counters": {
-        "gcRequests": 0,
-        "gcElapsedMs": 0,
-        "bytesRead": 0,
-        "bytesWritten": 0,
-        "recordsParsed": 0,
-        "indexWriteCalls": 0,
-        "fsyncCount": 0
-      },
-      "throughput": {
-        "fixtureGenerationMiBPerSecond": 2505.4973624607223,
-        "forkMiBPerSecond": 352.17292578283184
-      },
-      "latency": {
-        "coldLookupMs": {
-          "samples": [
-            1.591457999999875,
-            1.1332500000007713,
-            1.22662500000024,
-            1.2830000000003565,
-            1.2117920000000595,
-            1.2101660000007541,
-            1.157666000000063,
-            1.2075830000003407,
-            1.4130420000001322,
-            1.439875000000029,
-            1.411750000000211,
-            2.2299160000002303,
-            1.3496249999998327,
-            1.1998750000002474,
-            1.5751250000002983,
-            1.369166999999834
-          ],
-          "min": 1.1332500000007713,
-          "median": 1.2830000000003565,
-          "p95": 2.2299160000002303,
-          "max": 2.2299160000002303
-        },
-        "warmLookupMs": {
-          "samples": [
-            0.017665999999735504,
-            0.003125000000181899,
-            0.0030829999996058177,
-            0.005500000000211003,
-            0.003749999999854481,
-            0.0020409999997355044,
-            0.0021669999996447586,
-            0.0022500000004583853,
-            0.0023329999994530226,
-            0.003792000000430562,
-            0.0028750000001309672,
-            0.011250000000472937,
-            0.0026250000000800355,
-            0.007874999999330612,
-            0.003832999999758613,
-            0.0033750000002328306
-          ],
-          "min": 0.0020409999997355044,
-          "median": 0.003125000000181899,
-          "p95": 0.017665999999735504,
-          "max": 0.017665999999735504
-        }
-      },
-      "memory": {
-        "baseline": {
-          "rssBytes": 172179456,
-          "heapUsedBytes": 19676281,
-          "heapTotalBytes": 18850816,
-          "externalBytes": 4751179,
-          "arrayBuffersBytes": 1158
-        },
-        "afterFixture": {
-          "rssBytes": 421167104,
-          "heapUsedBytes": 76311012,
-          "heapTotalBytes": 18850816,
-          "externalBytes": 4807788,
-          "arrayBuffersBytes": 1158
-        },
-        "afterCapture": {
-          "rssBytes": 421396480,
-          "heapUsedBytes": 76311012,
-          "heapTotalBytes": 18850816,
-          "externalBytes": 4807801,
-          "arrayBuffersBytes": 1158
-        },
-        "afterFork": {
-          "rssBytes": 503627776,
-          "heapUsedBytes": 22064942,
-          "heapTotalBytes": 19136512,
-          "externalBytes": 6888929,
-          "arrayBuffersBytes": 912689
-        },
-        "afterForkClose": {
-          "rssBytes": 503791616,
-          "heapUsedBytes": 22064942,
-          "heapTotalBytes": 19120128,
-          "externalBytes": 6051071,
-          "arrayBuffersBytes": 1158
-        },
-        "afterReopen": {
-          "rssBytes": 523780096,
-          "heapUsedBytes": 23163645,
-          "heapTotalBytes": 19234816,
-          "externalBytes": 7927626,
-          "arrayBuffersBytes": 912689
-        },
-        "afterColdLookups": {
-          "rssBytes": 529907712,
-          "heapUsedBytes": 39022939,
-          "heapTotalBytes": 19775488,
-          "externalBytes": 23682251,
-          "arrayBuffersBytes": 912689
-        },
-        "afterWarmLookups": {
-          "rssBytes": 529924096,
-          "heapUsedBytes": 39022939,
-          "heapTotalBytes": 19775488,
-          "externalBytes": 23623630,
-          "arrayBuffersBytes": 912689
-        },
-        "afterContext": {
-          "rssBytes": 529956864,
-          "heapUsedBytes": 39022939,
-          "heapTotalBytes": 19791872,
-          "externalBytes": 23634083,
-          "arrayBuffersBytes": 912689
-        },
-        "afterTeardown": {
-          "rssBytes": 529956864,
-          "heapUsedBytes": 20980554,
-          "heapTotalBytes": 19218432,
-          "externalBytes": 5869654,
-          "arrayBuffersBytes": 1158
-        },
-        "forkRssGrowthBytes": 82231296,
-        "reopenRssGrowthBytes": 19988480,
-        "lookupRssGrowthBytes": 6144000,
-        "teardownRssGrowthBytes": 357777408,
-        "maxRssBytes": 529956864
-      },
-      "io": {
-        "coldRangeReads": 16,
-        "warmRangeReads": 0,
-        "coldEntriesReloaded": 16
-      },
-      "guards": {
-        "contextMessageCount": 1,
-        "lookupPayloadBytes": 33554432
-      },
-      "forkStats": {
-        "sidecarEnabled": true,
-        "coldRetirementActive": true,
-        "sidecarIneligible": false,
-        "hotRegionBytes": 911734,
-        "metaDescriptorBytes": 1180,
-        "totalAccountedBytes": 49075532,
-        "reservedBudgetBytes": 47251456,
-        "allocatedCacheBytes": 954,
-        "hotResidentBytes": 1824076,
-        "metadataResidentBytes": 226,
-        "sidecarFileBytes": 219155,
-        "firstOpen": {
-          "attempted": true,
-          "succeeded": true,
-          "strategy": "pressure",
-          "secondaryArtifactMode": "disabled",
-          "wallMs": 990.464875,
-          "cpuMs": 1080.27,
-          "gcRequests": 12,
-          "gcRequestCount": 12,
-          "gcElapsedMs": 52.177667,
-          "bytesRead": 1138971422,
-          "transcriptBytesRead": 1138753692,
-          "bytesWritten": 218362,
-          "sidecarBytesWritten": 218362,
-          "sidecarFileBytes": 219155,
-          "recordsParsed": 1027,
-          "semanticRecordsParsed": 1025,
-          "suffixRecordsParsed": 2,
-          "lineAssemblyCopyCount": 4304,
-          "lineCopyCount": 4304,
-          "lineAssemblyCopyBytes": 1074003775,
-          "indexWriteCalls": 1,
-          "indexWriteBytes": 217730,
-          "fsyncCount": 2,
-          "fsyncElapsedMs": 0.737,
-          "phaseTelemetry": {
-            "descriptorSecurityPreflight": {
-              "wallMs": 0.041041,
-              "cpuMs": 0.042
-            },
-            "fsync": {
-              "wallMs": 0.742417,
-              "cpuMs": 0.7010000000000001
-            },
-            "indexSerializationWrite": {
-              "wallMs": 5.45944,
-              "cpuMs": null
-            },
-            "semanticScan": {
-              "wallMs": 950.154292,
-              "cpuMs": 1041.259
-            },
-            "dictionary": {
-              "wallMs": 0.002459,
-              "cpuMs": 0.003
-            },
-            "metadataDelta": {
-              "wallMs": 0.041709,
-              "cpuMs": 0.042
-            },
-            "parent": {
-              "wallMs": 0.01975,
-              "cpuMs": 0.02
-            },
-            "indexTailWork": {
-              "wallMs": 32.293334,
-              "cpuMs": 32.649
-            },
-            "commitClassification": {
-              "wallMs": 1.416292,
-              "cpuMs": 1.404
-            },
-            "hotSuffixContext": {
-              "wallMs": 5.511083,
-              "cpuMs": 3.456
-            }
-          },
-          "phaseEvidence": {
-            "descriptorSecurityPreflight": {
-              "wallMs": 0.041041,
-              "cpuMs": 0.042
-            },
-            "fsync": {
-              "wallMs": 0.742417,
-              "cpuMs": 0.7010000000000001
-            },
-            "indexSerializationWrite": {
-              "wallMs": 5.45944,
-              "cpuMs": null
-            },
-            "semanticScan": {
-              "wallMs": 950.154292,
-              "cpuMs": 1041.259
-            },
-            "dictionary": {
-              "wallMs": 0.002459,
-              "cpuMs": 0.003
-            },
-            "metadataDelta": {
-              "wallMs": 0.041709,
-              "cpuMs": 0.042
-            },
-            "parent": {
-              "wallMs": 0.01975,
-              "cpuMs": 0.02
-            },
-            "indexTailWork": {
-              "wallMs": 32.293334,
-              "cpuMs": 32.649
-            },
-            "commitClassification": {
-              "wallMs": 1.416292,
-              "cpuMs": 1.404
-            },
-            "hotSuffixContext": {
-              "wallMs": 5.511083,
-              "cpuMs": 3.456
-            }
-          },
-          "phaseTimings": {
-            "descriptorSecurityPreflight": {
-              "wallMs": 0.041041,
-              "cpuMs": 0.042
-            },
-            "fsync": {
-              "wallMs": 0.742417,
-              "cpuMs": 0.7010000000000001
-            },
-            "indexSerializationWrite": {
-              "wallMs": 5.45944,
-              "cpuMs": null
-            },
-            "semanticScan": {
-              "wallMs": 950.154292,
-              "cpuMs": 1041.259
-            },
-            "dictionary": {
-              "wallMs": 0.002459,
-              "cpuMs": 0.003
-            },
-            "metadataDelta": {
-              "wallMs": 0.041709,
-              "cpuMs": 0.042
-            },
-            "parent": {
-              "wallMs": 0.01975,
-              "cpuMs": 0.02
-            },
-            "indexTailWork": {
-              "wallMs": 32.293334,
-              "cpuMs": 32.649
-            },
-            "commitClassification": {
-              "wallMs": 1.416292,
-              "cpuMs": 1.404
-            },
-            "hotSuffixContext": {
-              "wallMs": 5.511083,
-              "cpuMs": 3.456
-            }
-          },
-          "dictionaryArtifactEnabled": false,
-          "parentArtifactEnabled": false,
-          "dictionaryBuildElapsedMs": 0.002459,
-          "parentBuildElapsedMs": 0.01975,
-          "flatIndexElapsedMs": 5.45944,
-          "pressureBaselineBytes": 56265014
-        },
-        "lastReopenTransition": {
-          "kind": "rebuild",
-          "reason": "bounded_first_open"
-        },
-        "currentCommitTransition": {
-          "kind": "exact",
-          "reason": "descriptor_and_proof_match"
-        },
-        "lazyReopenAttempted": true,
-        "lazyReopenSucceeded": true,
-        "consecutiveBuildFailures": 0,
-        "parentArtifactEnabled": false,
-        "dictionaryArtifactEnabled": false,
-        "metadataDeltaDescriptorBytes": 0,
-        "coldIndexBytes": 217730,
-        "coldIndexBlockCacheBytes": 0,
-        "coldEntryCacheBytes": 0,
-        "coldEntriesRetired": 0,
-        "coldEntriesReloaded": 0,
-        "rangeReadCount": 0,
-        "rangeReadGenerationMismatchCount": 0,
-        "sidecarRebuildCount": 0,
-        "coldMutationPromotions": 0,
-        "hotOverflowTransitions": 0,
-        "labelDiskFallbackCount": 0,
-        "shadowParityMismatchCount": 0,
-        "shadowParityCheckCount": 0,
-        "transcriptGeneration": 0
-      },
-      "reopenStats": {
-        "sidecarEnabled": true,
-        "coldRetirementActive": true,
-        "sidecarIneligible": false,
-        "hotRegionBytes": 911734,
-        "metaDescriptorBytes": 17262109,
-        "totalAccountedBytes": 49075532,
-        "reservedBudgetBytes": 47251456,
-        "allocatedCacheBytes": 17261883,
-        "hotResidentBytes": 1824076,
-        "metadataResidentBytes": 226,
-        "sidecarFileBytes": 219155,
-        "firstOpen": {
-          "attempted": false,
-          "succeeded": false,
-          "strategy": "pressure",
-          "secondaryArtifactMode": "disabled",
-          "wallMs": 0,
-          "cpuMs": 0,
-          "gcRequests": 0,
-          "gcRequestCount": 0,
-          "gcElapsedMs": 0,
-          "bytesRead": 0,
-          "transcriptBytesRead": 0,
-          "bytesWritten": 0,
-          "sidecarBytesWritten": 0,
-          "sidecarFileBytes": 219155,
-          "recordsParsed": 0,
-          "semanticRecordsParsed": 0,
-          "suffixRecordsParsed": 0,
-          "lineAssemblyCopyCount": 0,
-          "lineCopyCount": 0,
-          "lineAssemblyCopyBytes": 0,
-          "indexWriteCalls": 0,
-          "indexWriteBytes": 0,
-          "fsyncCount": 0,
-          "fsyncElapsedMs": 0,
-          "phaseTelemetry": {},
-          "phaseEvidence": {},
-          "phaseTimings": {},
-          "dictionaryArtifactEnabled": false,
-          "parentArtifactEnabled": false,
-          "dictionaryBuildElapsedMs": 0,
-          "parentBuildElapsedMs": 0,
-          "flatIndexElapsedMs": 0
-        },
-        "lastReopenTransition": {
-          "kind": "exact",
-          "reason": "descriptor_and_proof_match"
-        },
-        "currentCommitTransition": {
-          "kind": "exact",
-          "reason": "descriptor_and_proof_match"
-        },
-        "lazyReopenAttempted": true,
-        "lazyReopenSucceeded": true,
-        "consecutiveBuildFailures": 0,
-        "parentArtifactEnabled": false,
-        "dictionaryArtifactEnabled": false,
-        "metadataDeltaDescriptorBytes": 0,
-        "coldIndexBytes": 217730,
-        "coldIndexBlockCacheBytes": 481580,
-        "coldEntryCacheBytes": 16779349,
-        "coldEntriesRetired": 0,
-        "coldEntriesReloaded": 16,
-        "rangeReadCount": 16,
-        "rangeReadGenerationMismatchCount": 0,
-        "sidecarRebuildCount": 0,
-        "coldMutationPromotions": 0,
-        "hotOverflowTransitions": 0,
-        "labelDiskFallbackCount": 0,
-        "shadowParityMismatchCount": 0,
-        "shadowParityCheckCount": 0,
-        "transcriptGeneration": 0
-      },
-      "sessionMemoryTelemetry": {
-        "sidecarEnabled": true,
-        "coldRetirementActive": true,
-        "sidecarIneligible": false,
-        "hotRegionBytes": 911734,
-        "metaDescriptorBytes": 1180,
-        "totalAccountedBytes": 49075532,
-        "reservedBudgetBytes": 47251456,
-        "allocatedCacheBytes": 954,
-        "hotResidentBytes": 1824076,
-        "metadataResidentBytes": 226,
-        "sidecarFileBytes": 219155,
-        "lazyReopenAttempted": true,
-        "lazyReopenSucceeded": true,
-        "consecutiveBuildFailures": 0,
-        "parentArtifactEnabled": false,
-        "dictionaryArtifactEnabled": false,
-        "metadataDeltaDescriptorBytes": 0,
-        "coldIndexBytes": 217730,
-        "coldIndexBlockCacheBytes": 0,
-        "coldEntryCacheBytes": 0,
-        "coldEntriesRetired": 0,
-        "coldEntriesReloaded": 0,
-        "rangeReadCount": 0,
-        "rangeReadGenerationMismatchCount": 0,
-        "sidecarRebuildCount": 0,
-        "coldMutationPromotions": 0,
-        "hotOverflowTransitions": 0,
-        "labelDiskFallbackCount": 0,
-        "shadowParityMismatchCount": 0,
-        "shadowParityCheckCount": 0,
-        "transcriptGeneration": 0,
-        "reopen.sidecarEnabled": true,
-        "reopen.coldRetirementActive": true,
-        "reopen.sidecarIneligible": false,
-        "reopen.hotRegionBytes": 911734,
-        "reopen.metaDescriptorBytes": 17262109,
-        "reopen.totalAccountedBytes": 49075532,
-        "reopen.reservedBudgetBytes": 47251456,
-        "reopen.allocatedCacheBytes": 17261883,
-        "reopen.hotResidentBytes": 1824076,
-        "reopen.metadataResidentBytes": 226,
-        "reopen.sidecarFileBytes": 219155,
-        "reopen.lazyReopenAttempted": true,
-        "reopen.lazyReopenSucceeded": true,
-        "reopen.consecutiveBuildFailures": 0,
-        "reopen.parentArtifactEnabled": false,
-        "reopen.dictionaryArtifactEnabled": false,
-        "reopen.metadataDeltaDescriptorBytes": 0,
-        "reopen.coldIndexBytes": 217730,
-        "reopen.coldIndexBlockCacheBytes": 481580,
-        "reopen.coldEntryCacheBytes": 16779349,
-        "reopen.coldEntriesRetired": 0,
-        "reopen.coldEntriesReloaded": 16,
-        "reopen.rangeReadCount": 16,
-        "reopen.rangeReadGenerationMismatchCount": 0,
-        "reopen.sidecarRebuildCount": 0,
-        "reopen.coldMutationPromotions": 0,
-        "reopen.hotOverflowTransitions": 0,
-        "reopen.labelDiskFallbackCount": 0,
-        "reopen.shadowParityMismatchCount": 0,
-        "reopen.shadowParityCheckCount": 0,
-        "reopen.transcriptGeneration": 0
-      }
-    },
-    {
-      "operationClass": "captured-fork",
-      "gcStrategy": "pressure",
-      "secondaryArtifacts": "off",
-      "repetitions": 3,
-      "mode": "captured",
-      "sourceBytes": 1072693248,
-      "destinationBytes": 1072693326,
-      "outputToSourceRatio": 1.0000000727141707,
-      "phases": {
-        "fixtureGeneration": {
-          "elapsedMs": 575.859083,
-          "cpu": {
-            "userMicros": 134149,
-            "systemMicros": 142816
-          }
-        },
-        "capture": {
-          "elapsedMs": 610.067375,
-          "cpu": {
-            "userMicros": 642008,
-            "systemMicros": 93949
-          }
-        },
-        "fork": {
-          "elapsedMs": 2374.925625,
-          "cpu": {
-            "userMicros": 2194352,
-            "systemMicros": 392849
-          }
-        },
-        "closeFork": {
-          "elapsedMs": 1.2446250000002692,
-          "cpu": {
-            "userMicros": 837,
-            "systemMicros": 401
-          }
-        },
-        "reopen": {
-          "elapsedMs": 1286.9190420000004,
-          "cpu": {
-            "userMicros": 1799132,
-            "systemMicros": 396492
-          }
-        },
-        "coldLookups": {
-          "elapsedMs": 21.1737090000006,
-          "cpu": {
-            "userMicros": 16941,
-            "systemMicros": 6093
-          }
-        },
-        "warmLookups": {
-          "elapsedMs": 0.4575830000003407,
-          "cpu": {
-            "userMicros": 546,
-            "systemMicros": 21
-          }
-        },
-        "buildContext": {
-          "elapsedMs": 0.1946250000000873,
-          "cpu": {
-            "userMicros": 280,
-            "systemMicros": 31
-          }
-        },
-        "closeReopened": {
-          "elapsedMs": 4.2006250000004,
-          "cpu": {
-            "userMicros": 179,
+            "userMicros": 934,
             "systemMicros": 494
           }
+        },
+        "reopen": {
+          "elapsedMs": 1319.320334,
+          "cpu": {
+            "userMicros": 1760899,
+            "systemMicros": 413463
+          }
+        },
+        "coldLookups": {
+          "elapsedMs": 24.017917000000125,
+          "cpu": {
+            "userMicros": 18060,
+            "systemMicros": 7144
+          }
+        },
+        "warmLookups": {
+          "elapsedMs": 0.5175410000001648,
+          "cpu": {
+            "userMicros": 605,
+            "systemMicros": 36
+          }
+        },
+        "buildContext": {
+          "elapsedMs": 0.1797500000002401,
+          "cpu": {
+            "userMicros": 229,
+            "systemMicros": 11
+          }
+        },
+        "closeReopened": {
+          "elapsedMs": 9.92241599999943,
+          "cpu": {
+            "userMicros": 239,
+            "systemMicros": 520
+          }
         }
       },
       "phaseEvidence": {
         "wholeFork": {
-          "elapsedMs": 2374.925625,
+          "elapsedMs": 3055.8370409999998,
           "cpu": {
-            "userMicros": 2194352,
-            "systemMicros": 392849
+            "userMicros": 2818420,
+            "systemMicros": 508037
           }
         },
         "preflightScan": null,
@@ -1828,135 +683,135 @@
         "fsyncCount": 0
       },
       "throughput": {
-        "fixtureGenerationMiBPerSecond": 1776.4762772700763,
-        "forkMiBPerSecond": 430.75033139195676
+        "fixtureGenerationMiBPerSecond": 2062.050660037321,
+        "forkMiBPerSecond": 334.76916022499387
       },
       "latency": {
         "coldLookupMs": {
           "samples": [
-            1.324666999999863,
-            1.1002079999998386,
-            1.1033330000000205,
-            1.2822910000004413,
-            1.1012080000000424,
-            1.1398330000001806,
-            1.1540830000003552,
-            1.2989580000003116,
-            1.3390419999996084,
-            1.3532500000001164,
-            1.3324579999998605,
-            2.0493329999999332,
-            1.2896249999994325,
-            1.187167000000045,
-            1.3550420000001395,
-            1.3509160000003249
+            1.812833999999384,
+            1.2614160000002812,
+            1.1270830000003116,
+            1.2619580000000497,
+            1.3201669999998558,
+            1.3365410000005795,
+            1.5204579999999623,
+            1.4976669999996375,
+            1.3135840000004464,
+            1.2966669999996157,
+            1.2695840000005774,
+            2.3956660000003467,
+            1.5140000000001237,
+            1.6471249999995052,
+            1.5331669999995938,
+            1.3890419999997903
           ],
-          "min": 1.1002079999998386,
-          "median": 1.2896249999994325,
-          "p95": 2.0493329999999332,
-          "max": 2.0493329999999332
+          "min": 1.1270830000003116,
+          "median": 1.3365410000005795,
+          "p95": 2.3956660000003467,
+          "max": 2.3956660000003467
         },
         "warmLookupMs": {
           "samples": [
-            0.014165999999931955,
-            0.0042920000005324255,
-            0.003250000000662112,
-            0.005707999999685853,
-            0.00204200000007404,
-            0.002666999999746622,
-            0.001833999999689695,
-            0.0022500000004583853,
-            0.002375000000029104,
-            0.003582999999707681,
-            0.0024160000002666493,
-            0.008667000000059488,
-            0.002832999999554886,
-            0.006832999999460299,
-            0.027624999999716238,
-            0.007083000000420725
+            0.021999999999934516,
+            0.004416000000674103,
+            0.004500000000007276,
+            0.005542000000787084,
+            0.0032499999997526174,
+            0.002500000000509317,
+            0.0026659999994080863,
+            0.002417000000605185,
+            0.0023330000003625173,
+            0.002291999999215477,
+            0.010541999999986729,
+            0.010583000000224274,
+            0.005125000000589353,
+            0.007083000000420725,
+            0.0031660000004194444,
+            0.003792000000430562
           ],
-          "min": 0.001833999999689695,
-          "median": 0.003250000000662112,
-          "p95": 0.027624999999716238,
-          "max": 0.027624999999716238
+          "min": 0.002291999999215477,
+          "median": 0.003792000000430562,
+          "p95": 0.021999999999934516,
+          "max": 0.021999999999934516
         }
       },
       "memory": {
         "baseline": {
-          "rssBytes": 176390144,
-          "heapUsedBytes": 19615200,
-          "heapTotalBytes": 18948096,
-          "externalBytes": 4722968,
+          "rssBytes": 177815552,
+          "heapUsedBytes": 19665585,
+          "heapTotalBytes": 18835456,
+          "externalBytes": 4727575,
           "arrayBuffersBytes": 1158
         },
         "afterFixture": {
-          "rssBytes": 442810368,
-          "heapUsedBytes": 76275184,
-          "heapTotalBytes": 18948096,
-          "externalBytes": 4779330,
+          "rssBytes": 427245568,
+          "heapUsedBytes": 76283071,
+          "heapTotalBytes": 18835456,
+          "externalBytes": 4781380,
           "arrayBuffersBytes": 1158
         },
         "afterCapture": {
-          "rssBytes": 446726144,
-          "heapUsedBytes": 19785711,
-          "heapTotalBytes": 18965504,
-          "externalBytes": 4879487,
+          "rssBytes": 427311104,
+          "heapUsedBytes": 76283071,
+          "heapTotalBytes": 18835456,
+          "externalBytes": 4781381,
           "arrayBuffersBytes": 1158
         },
         "afterFork": {
-          "rssBytes": 525336576,
-          "heapUsedBytes": 22021484,
-          "heapTotalBytes": 19249152,
-          "externalBytes": 6850057,
-          "arrayBuffersBytes": 912687
+          "rssBytes": 510459904,
+          "heapUsedBytes": 22014431,
+          "heapTotalBytes": 19102720,
+          "externalBytes": 6847165,
+          "arrayBuffersBytes": 912689
         },
         "afterForkClose": {
-          "rssBytes": 525516800,
-          "heapUsedBytes": 22021484,
-          "heapTotalBytes": 19250176,
-          "externalBytes": 6009434,
+          "rssBytes": 510640128,
+          "heapUsedBytes": 22014431,
+          "heapTotalBytes": 19087360,
+          "externalBytes": 6006546,
           "arrayBuffersBytes": 1158
         },
         "afterReopen": {
-          "rssBytes": 544440320,
-          "heapUsedBytes": 22522482,
-          "heapTotalBytes": 19315712,
-          "externalBytes": 7443235,
-          "arrayBuffersBytes": 912687
+          "rssBytes": 531054592,
+          "heapUsedBytes": 22510386,
+          "heapTotalBytes": 19169280,
+          "externalBytes": 7436155,
+          "arrayBuffersBytes": 912689
         },
         "afterColdLookups": {
-          "rssBytes": 551026688,
-          "heapUsedBytes": 38743281,
-          "heapTotalBytes": 19856384,
-          "externalBytes": 23457222,
-          "arrayBuffersBytes": 912687
+          "rssBytes": 537001984,
+          "heapUsedBytes": 38153690,
+          "heapTotalBytes": 19693568,
+          "externalBytes": 23080758,
+          "arrayBuffersBytes": 912689
         },
         "afterWarmLookups": {
-          "rssBytes": 551026688,
-          "heapUsedBytes": 38743281,
-          "heapTotalBytes": 19856384,
-          "externalBytes": 23466718,
-          "arrayBuffersBytes": 912687
+          "rssBytes": 537018368,
+          "heapUsedBytes": 38153690,
+          "heapTotalBytes": 19628032,
+          "externalBytes": 22701109,
+          "arrayBuffersBytes": 912689
         },
         "afterContext": {
-          "rssBytes": 551059456,
-          "heapUsedBytes": 38743281,
-          "heapTotalBytes": 19872768,
-          "externalBytes": 23476665,
-          "arrayBuffersBytes": 912687
+          "rssBytes": 537034752,
+          "heapUsedBytes": 38153690,
+          "heapTotalBytes": 19644416,
+          "externalBytes": 22699901,
+          "arrayBuffersBytes": 912689
         },
         "afterTeardown": {
-          "rssBytes": 551059456,
-          "heapUsedBytes": 20513713,
-          "heapTotalBytes": 19299328,
-          "externalBytes": 5489788,
+          "rssBytes": 537034752,
+          "heapUsedBytes": 18194853,
+          "heapTotalBytes": 19070976,
+          "externalBytes": 4100966,
           "arrayBuffersBytes": 1158
         },
-        "forkRssGrowthBytes": 78610432,
-        "reopenRssGrowthBytes": 18923520,
-        "lookupRssGrowthBytes": 6586368,
-        "teardownRssGrowthBytes": 374669312,
-        "maxRssBytes": 551059456
+        "forkRssGrowthBytes": 83148800,
+        "reopenRssGrowthBytes": 20414464,
+        "lookupRssGrowthBytes": 5963776,
+        "teardownRssGrowthBytes": 359219200,
+        "maxRssBytes": 537034752
       },
       "io": {
         "coldRangeReads": 16,
@@ -1971,12 +826,12 @@
         "sidecarEnabled": true,
         "coldRetirementActive": true,
         "sidecarIneligible": false,
-        "hotRegionBytes": 911732,
+        "hotRegionBytes": 911734,
         "metaDescriptorBytes": 1180,
-        "totalAccountedBytes": 49075528,
+        "totalAccountedBytes": 49075532,
         "reservedBudgetBytes": 47251456,
         "allocatedCacheBytes": 954,
-        "hotResidentBytes": 1824072,
+        "hotResidentBytes": 1824076,
         "metadataResidentBytes": 226,
         "sidecarFileBytes": 219155,
         "firstOpen": {
@@ -1984,11 +839,11 @@
           "succeeded": true,
           "strategy": "pressure",
           "secondaryArtifactMode": "disabled",
-          "wallMs": 1123.520875,
-          "cpuMs": 1099.3,
+          "wallMs": 1139.581,
+          "cpuMs": 1109.952,
           "gcRequests": 12,
           "gcRequestCount": 12,
-          "gcElapsedMs": 63.108458,
+          "gcElapsedMs": 58.738876000000005,
           "bytesRead": 1138971422,
           "transcriptBytesRead": 1138753692,
           "bytesWritten": 218362,
@@ -1999,143 +854,143 @@
           "suffixRecordsParsed": 2,
           "lineAssemblyCopyCount": 4304,
           "lineCopyCount": 4304,
-          "lineAssemblyCopyBytes": 1074003769,
+          "lineAssemblyCopyBytes": 1074003775,
           "indexWriteCalls": 1,
           "indexWriteBytes": 217730,
           "fsyncCount": 2,
-          "fsyncElapsedMs": 0.710209,
+          "fsyncElapsedMs": 0.714542,
           "phaseTelemetry": {
             "descriptorSecurityPreflight": {
-              "wallMs": 0.039583,
-              "cpuMs": 0.041
+              "wallMs": 0.033875,
+              "cpuMs": 0.121
             },
             "fsync": {
-              "wallMs": 0.7148760000000001,
-              "cpuMs": 0.678
+              "wallMs": 0.719958,
+              "cpuMs": 0.672
             },
             "indexSerializationWrite": {
-              "wallMs": 13.764694,
+              "wallMs": 6.82261,
               "cpuMs": null
             },
             "semanticScan": {
-              "wallMs": 1086.129,
-              "cpuMs": 1062.808
+              "wallMs": 1098.442209,
+              "cpuMs": 1070.889
             },
             "dictionary": {
-              "wallMs": 0.002458,
-              "cpuMs": 0.003
+              "wallMs": 0.002375,
+              "cpuMs": 0.002
             },
             "metadataDelta": {
-              "wallMs": 0.043,
-              "cpuMs": 0.043
+              "wallMs": 0.05025,
+              "cpuMs": 0.047
             },
             "parent": {
-              "wallMs": 0.015583,
-              "cpuMs": 0.018
+              "wallMs": 0.018708,
+              "cpuMs": 0.019
             },
             "indexTailWork": {
-              "wallMs": 30.465541,
-              "cpuMs": 31.406
+              "wallMs": 33.531916,
+              "cpuMs": 32.864
             },
             "commitClassification": {
-              "wallMs": 1.244375,
-              "cpuMs": 1.23
+              "wallMs": 1.536917,
+              "cpuMs": 1.487
             },
             "hotSuffixContext": {
-              "wallMs": 4.883292,
-              "cpuMs": 3.024
+              "wallMs": 5.043667,
+              "cpuMs": 3.276
             }
           },
           "phaseEvidence": {
             "descriptorSecurityPreflight": {
-              "wallMs": 0.039583,
-              "cpuMs": 0.041
+              "wallMs": 0.033875,
+              "cpuMs": 0.121
             },
             "fsync": {
-              "wallMs": 0.7148760000000001,
-              "cpuMs": 0.678
+              "wallMs": 0.719958,
+              "cpuMs": 0.672
             },
             "indexSerializationWrite": {
-              "wallMs": 13.764694,
+              "wallMs": 6.82261,
               "cpuMs": null
             },
             "semanticScan": {
-              "wallMs": 1086.129,
-              "cpuMs": 1062.808
+              "wallMs": 1098.442209,
+              "cpuMs": 1070.889
             },
             "dictionary": {
-              "wallMs": 0.002458,
-              "cpuMs": 0.003
+              "wallMs": 0.002375,
+              "cpuMs": 0.002
             },
             "metadataDelta": {
-              "wallMs": 0.043,
-              "cpuMs": 0.043
+              "wallMs": 0.05025,
+              "cpuMs": 0.047
             },
             "parent": {
-              "wallMs": 0.015583,
-              "cpuMs": 0.018
+              "wallMs": 0.018708,
+              "cpuMs": 0.019
             },
             "indexTailWork": {
-              "wallMs": 30.465541,
-              "cpuMs": 31.406
+              "wallMs": 33.531916,
+              "cpuMs": 32.864
             },
             "commitClassification": {
-              "wallMs": 1.244375,
-              "cpuMs": 1.23
+              "wallMs": 1.536917,
+              "cpuMs": 1.487
             },
             "hotSuffixContext": {
-              "wallMs": 4.883292,
-              "cpuMs": 3.024
+              "wallMs": 5.043667,
+              "cpuMs": 3.276
             }
           },
           "phaseTimings": {
             "descriptorSecurityPreflight": {
-              "wallMs": 0.039583,
-              "cpuMs": 0.041
+              "wallMs": 0.033875,
+              "cpuMs": 0.121
             },
             "fsync": {
-              "wallMs": 0.7148760000000001,
-              "cpuMs": 0.678
+              "wallMs": 0.719958,
+              "cpuMs": 0.672
             },
             "indexSerializationWrite": {
-              "wallMs": 13.764694,
+              "wallMs": 6.82261,
               "cpuMs": null
             },
             "semanticScan": {
-              "wallMs": 1086.129,
-              "cpuMs": 1062.808
+              "wallMs": 1098.442209,
+              "cpuMs": 1070.889
             },
             "dictionary": {
-              "wallMs": 0.002458,
-              "cpuMs": 0.003
+              "wallMs": 0.002375,
+              "cpuMs": 0.002
             },
             "metadataDelta": {
-              "wallMs": 0.043,
-              "cpuMs": 0.043
+              "wallMs": 0.05025,
+              "cpuMs": 0.047
             },
             "parent": {
-              "wallMs": 0.015583,
-              "cpuMs": 0.018
+              "wallMs": 0.018708,
+              "cpuMs": 0.019
             },
             "indexTailWork": {
-              "wallMs": 30.465541,
-              "cpuMs": 31.406
+              "wallMs": 33.531916,
+              "cpuMs": 32.864
             },
             "commitClassification": {
-              "wallMs": 1.244375,
-              "cpuMs": 1.23
+              "wallMs": 1.536917,
+              "cpuMs": 1.487
             },
             "hotSuffixContext": {
-              "wallMs": 4.883292,
-              "cpuMs": 3.024
+              "wallMs": 5.043667,
+              "cpuMs": 3.276
             }
           },
           "dictionaryArtifactEnabled": false,
           "parentArtifactEnabled": false,
-          "dictionaryBuildElapsedMs": 0.002458,
-          "parentBuildElapsedMs": 0.015583,
-          "flatIndexElapsedMs": 13.764694,
-          "pressureBaselineBytes": 56217336
+          "dictionaryBuildElapsedMs": 0.002375,
+          "parentBuildElapsedMs": 0.018708,
+          "flatIndexElapsedMs": 6.82261,
+          "pressureBaselineBytes": 56209004
         },
         "lastReopenTransition": {
           "kind": "rebuild",
@@ -2170,12 +1025,12 @@
         "sidecarEnabled": true,
         "coldRetirementActive": true,
         "sidecarIneligible": false,
-        "hotRegionBytes": 911732,
+        "hotRegionBytes": 911734,
         "metaDescriptorBytes": 17262109,
-        "totalAccountedBytes": 49075528,
+        "totalAccountedBytes": 49075532,
         "reservedBudgetBytes": 47251456,
         "allocatedCacheBytes": 17261883,
-        "hotResidentBytes": 1824072,
+        "hotResidentBytes": 1824076,
         "metadataResidentBytes": 226,
         "sidecarFileBytes": 219155,
         "firstOpen": {
@@ -2245,12 +1100,12 @@
         "sidecarEnabled": true,
         "coldRetirementActive": true,
         "sidecarIneligible": false,
-        "hotRegionBytes": 911732,
+        "hotRegionBytes": 911734,
         "metaDescriptorBytes": 1180,
-        "totalAccountedBytes": 49075528,
+        "totalAccountedBytes": 49075532,
         "reservedBudgetBytes": 47251456,
         "allocatedCacheBytes": 954,
-        "hotResidentBytes": 1824072,
+        "hotResidentBytes": 1824076,
         "metadataResidentBytes": 226,
         "sidecarFileBytes": 219155,
         "lazyReopenAttempted": true,
@@ -2276,12 +1131,12 @@
         "reopen.sidecarEnabled": true,
         "reopen.coldRetirementActive": true,
         "reopen.sidecarIneligible": false,
-        "reopen.hotRegionBytes": 911732,
+        "reopen.hotRegionBytes": 911734,
         "reopen.metaDescriptorBytes": 17262109,
-        "reopen.totalAccountedBytes": 49075528,
+        "reopen.totalAccountedBytes": 49075532,
         "reopen.reservedBudgetBytes": 47251456,
         "reopen.allocatedCacheBytes": 17261883,
-        "reopen.hotResidentBytes": 1824072,
+        "reopen.hotResidentBytes": 1824076,
         "reopen.metadataResidentBytes": 226,
         "reopen.sidecarFileBytes": 219155,
         "reopen.lazyReopenAttempted": true,
@@ -2307,85 +1162,78 @@
       }
     },
     {
-      "operationClass": "captured-fork",
+      "operationClass": "direct-fork",
       "gcStrategy": "pressure",
       "secondaryArtifacts": "off",
       "repetitions": 3,
-      "mode": "captured",
+      "mode": "direct",
       "sourceBytes": 1072693248,
       "destinationBytes": 1072693326,
       "outputToSourceRatio": 1.0000000727141707,
       "phases": {
         "fixtureGeneration": {
-          "elapsedMs": 1117.024209,
+          "elapsedMs": 264.727667,
           "cpu": {
-            "userMicros": 136751,
-            "systemMicros": 147196
-          }
-        },
-        "capture": {
-          "elapsedMs": 661.9112500000001,
-          "cpu": {
-            "userMicros": 629843,
-            "systemMicros": 90939
+            "userMicros": 128624,
+            "systemMicros": 135114
           }
         },
         "fork": {
-          "elapsedMs": 2224.5582080000004,
+          "elapsedMs": 2996.60575,
           "cpu": {
-            "userMicros": 2151099,
-            "systemMicros": 381257
+            "userMicros": 2801273,
+            "systemMicros": 499899
           }
         },
         "closeFork": {
-          "elapsedMs": 1.173667000000023,
+          "elapsedMs": 1.6993330000000242,
           "cpu": {
-            "userMicros": 771,
-            "systemMicros": 395
+            "userMicros": 1134,
+            "systemMicros": 597
           }
         },
         "reopen": {
-          "elapsedMs": 1269.3606249999993,
+          "elapsedMs": 1331.8860409999998,
           "cpu": {
-            "userMicros": 1708849,
-            "systemMicros": 387484
+            "userMicros": 1787628,
+            "systemMicros": 393692
           }
         },
         "coldLookups": {
-          "elapsedMs": 20.702915999999277,
+          "elapsedMs": 23.726916999999958,
           "cpu": {
-            "userMicros": 16772,
-            "systemMicros": 6079
+            "userMicros": 17928,
+            "systemMicros": 7372
           }
         },
         "warmLookups": {
-          "elapsedMs": 0.43258400000013353,
+          "elapsedMs": 0.4377919999997175,
           "cpu": {
-            "userMicros": 450,
-            "systemMicros": 22
+            "userMicros": 448,
+            "systemMicros": 14
           }
         },
         "buildContext": {
-          "elapsedMs": 0.15429200000016863,
+          "elapsedMs": 0.18491699999958655,
           "cpu": {
-            "userMicros": 227,
-            "systemMicros": 10
+            "userMicros": 267,
+            "systemMicros": 27
           }
         },
         "closeReopened": {
-          "elapsedMs": 5.609459000000243,
+          "elapsedMs": 8.326042000000598,
           "cpu": {
-            "userMicros": 173,
-            "systemMicros": 518
+            "userMicros": 250,
+            "systemMicros": 568
           }
         }
       },
       "phaseEvidence": {
         "wholeFork": {
-          "elapsedMs": 2224.5582080000004,
+          "elapsedMs": 2996.60575,
           "cpu": {
-            "userMicros": 2151099,
-            "systemMicros": 381257
+            "userMicros": 2801273,
+            "systemMicros": 499899
           }
         },
         "preflightScan": null,
@@ -2404,135 +1252,135 @@
         "fsyncCount": 0
       },
       "throughput": {
-        "fixtureGenerationMiBPerSecond": 915.8261672017173,
-        "forkMiBPerSecond": 459.8665911824951
+        "fixtureGenerationMiBPerSecond": 3864.3486402197623,
+        "forkMiBPerSecond": 341.3862500931262
       },
       "latency": {
         "coldLookupMs": {
           "samples": [
-            1.2301250000000437,
-            0.9302920000000086,
-            1.0221249999995052,
-            1.139458999999988,
-            1.1138339999997697,
-            1.1713749999998981,
-            1.1855830000004062,
-            1.186916999999994,
-            1.1580830000002607,
-            1.2859580000003916,
-            2.3282090000002427,
-            1.3327500000004875,
-            1.2915830000001733,
-            1.1972499999992579,
-            1.3297499999998763,
-            1.409208000000035
+            1.620708999999806,
+            1.2758329999996931,
+            1.2325419999997393,
+            1.1850839999997334,
+            1.2629580000002534,
+            1.233499999999367,
+            1.3435419999996157,
+            1.5485410000001139,
+            1.3277079999998023,
+            1.323750000000473,
+            1.574666999999863,
+            2.370708999999806,
+            1.490208999999595,
+            1.3477499999999054,
+            1.5398329999998168,
+            1.5662090000005264
           ],
-          "min": 0.9302920000000086,
-          "median": 1.186916999999994,
-          "p95": 2.3282090000002427,
-          "max": 2.3282090000002427
+          "min": 1.1850839999997334,
+          "median": 1.3435419999996157,
+          "p95": 2.370708999999806,
+          "max": 2.370708999999806
         },
         "warmLookupMs": {
           "samples": [
-            0.014500000000225555,
-            0.0038340000000971486,
-            0.004417000000103144,
-            0.0052910000003976165,
-            0.0021670000005542533,
-            0.0018749999999272404,
-            0.002375000000029104,
-            0.0018749999999272404,
-            0.0020419999991645454,
-            0.002292000000124972,
-            0.002292000000124972,
-            0.008458000000246102,
-            0.003333999999995285,
-            0.012542000000394182,
-            0.003333999999995285,
-            0.0026250000000800355
+            0.016499999999723514,
+            0.004542000000583357,
+            0.003042000000277767,
+            0.005415999999968335,
+            0.0021660000002157176,
+            0.00220900000022084,
+            0.002207999999882304,
+            0.002082999999402091,
+            0.003374999999323336,
+            0.001999999999497959,
+            0.0027920000002268353,
+            0.008792000000539701,
+            0.004167000000052212,
+            0.006541000000652275,
+            0.0027089999994132086,
+            0.0032920000003286987
           ],
-          "min": 0.0018749999999272404,
-          "median": 0.0026250000000800355,
-          "p95": 0.014500000000225555,
-          "max": 0.014500000000225555
+          "min": 0.001999999999497959,
+          "median": 0.003042000000277767,
+          "p95": 0.016499999999723514,
+          "max": 0.016499999999723514
         }
       },
       "memory": {
         "baseline": {
-          "rssBytes": 177061888,
-          "heapUsedBytes": 19616130,
-          "heapTotalBytes": 18913280,
-          "externalBytes": 4723816,
+          "rssBytes": 180273152,
+          "heapUsedBytes": 19666487,
+          "heapTotalBytes": 18754560,
+          "externalBytes": 4752037,
           "arrayBuffersBytes": 1158
         },
         "afterFixture": {
-          "rssBytes": 425033728,
-          "heapUsedBytes": 76279248,
-          "heapTotalBytes": 18914304,
-          "externalBytes": 4780324,
+          "rssBytes": 429850624,
+          "heapUsedBytes": 76307950,
+          "heapTotalBytes": 18754560,
+          "externalBytes": 4808404,
           "arrayBuffersBytes": 1158
         },
         "afterCapture": {
-          "rssBytes": 429522944,
-          "heapUsedBytes": 19788965,
-          "heapTotalBytes": 18932736,
-          "externalBytes": 4880690,
+          "rssBytes": 430047232,
+          "heapUsedBytes": 76307950,
+          "heapTotalBytes": 18754560,
+          "externalBytes": 4808414,
           "arrayBuffersBytes": 1158
         },
         "afterFork": {
-          "rssBytes": 508755968,
-          "heapUsedBytes": 22024384,
-          "heapTotalBytes": 19217408,
-          "externalBytes": 6849420,
-          "arrayBuffersBytes": 912687
+          "rssBytes": 512933888,
+          "heapUsedBytes": 22041954,
+          "heapTotalBytes": 19021824,
+          "externalBytes": 6873939,
+          "arrayBuffersBytes": 912689
         },
         "afterForkClose": {
-          "rssBytes": 508952576,
-          "heapUsedBytes": 22024384,
-          "heapTotalBytes": 19217408,
-          "externalBytes": 6008802,
+          "rssBytes": 513130496,
+          "heapUsedBytes": 22041954,
+          "heapTotalBytes": 19005440,
+          "externalBytes": 6033320,
           "arrayBuffersBytes": 1158
         },
         "afterReopen": {
-          "rssBytes": 527876096,
-          "heapUsedBytes": 19594078,
-          "heapTotalBytes": 19184640,
-          "externalBytes": 5673524,
-          "arrayBuffersBytes": 912687
+          "rssBytes": 531709952,
+          "heapUsedBytes": 23552341,
+          "heapTotalBytes": 19141632,
+          "externalBytes": 8294488,
+          "arrayBuffersBytes": 912689
         },
         "afterColdLookups": {
-          "rssBytes": 534364160,
-          "heapUsedBytes": 35874135,
-          "heapTotalBytes": 19758080,
-          "externalBytes": 21741076,
-          "arrayBuffersBytes": 912687
+          "rssBytes": 538017792,
+          "heapUsedBytes": 39773437,
+          "heapTotalBytes": 19683328,
+          "externalBytes": 24308470,
+          "arrayBuffersBytes": 912689
         },
         "afterWarmLookups": {
-          "rssBytes": 534380544,
-          "heapUsedBytes": 35874135,
-          "heapTotalBytes": 19758080,
-          "externalBytes": 21742508,
-          "arrayBuffersBytes": 912687
+          "rssBytes": 538034176,
+          "heapUsedBytes": 39773437,
+          "heapTotalBytes": 19683328,
+          "externalBytes": 24309774,
+          "arrayBuffersBytes": 912689
         },
         "afterContext": {
-          "rssBytes": 534396928,
-          "heapUsedBytes": 35874135,
-          "heapTotalBytes": 19774464,
-          "externalBytes": 21760647,
-          "arrayBuffersBytes": 912687
+          "rssBytes": 538083328,
+          "heapUsedBytes": 39773437,
+          "heapTotalBytes": 19699712,
+          "externalBytes": 24328605,
+          "arrayBuffersBytes": 912689
         },
         "afterTeardown": {
-          "rssBytes": 534396928,
-          "heapUsedBytes": 17926154,
-          "heapTotalBytes": 19168256,
-          "externalBytes": 3996066,
+          "rssBytes": 538083328,
+          "heapUsedBytes": 21825108,
+          "heapTotalBytes": 19142656,
+          "externalBytes": 6564176,
           "arrayBuffersBytes": 1158
         },
-        "forkRssGrowthBytes": 79233024,
-        "reopenRssGrowthBytes": 18923520,
-        "lookupRssGrowthBytes": 6504448,
-        "teardownRssGrowthBytes": 357335040,
-        "maxRssBytes": 534396928
+        "forkRssGrowthBytes": 82886656,
+        "reopenRssGrowthBytes": 18579456,
+        "lookupRssGrowthBytes": 6324224,
+        "teardownRssGrowthBytes": 357810176,
+        "maxRssBytes": 538083328
       },
       "io": {
         "coldRangeReads": 16,
@@ -2547,12 +1395,12 @@
         "sidecarEnabled": true,
         "coldRetirementActive": true,
         "sidecarIneligible": false,
-        "hotRegionBytes": 911732,
+        "hotRegionBytes": 911734,
         "metaDescriptorBytes": 1180,
-        "totalAccountedBytes": 49075528,
+        "totalAccountedBytes": 49075532,
         "reservedBudgetBytes": 47251456,
         "allocatedCacheBytes": 954,
-        "hotResidentBytes": 1824072,
+        "hotResidentBytes": 1824076,
         "metadataResidentBytes": 226,
         "sidecarFileBytes": 219155,
         "firstOpen": {
@@ -2560,11 +1408,11 @@
           "succeeded": true,
           "strategy": "pressure",
           "secondaryArtifactMode": "disabled",
-          "wallMs": 983.460875,
-          "cpuMs": 1070.342,
-          "gcRequests": 12,
-          "gcRequestCount": 12,
-          "gcElapsedMs": 50.456585,
+          "wallMs": 984.221917,
+          "cpuMs": 1068.225,
+          "gcRequests": 11,
+          "gcRequestCount": 11,
+          "gcElapsedMs": 46.892083,
           "bytesRead": 1138971422,
           "transcriptBytesRead": 1138753692,
           "bytesWritten": 218362,
@@ -2575,143 +1423,143 @@
           "suffixRecordsParsed": 2,
           "lineAssemblyCopyCount": 4304,
           "lineCopyCount": 4304,
-          "lineAssemblyCopyBytes": 1074003769,
+          "lineAssemblyCopyBytes": 1074003775,
           "indexWriteCalls": 1,
           "indexWriteBytes": 217730,
           "fsyncCount": 2,
-          "fsyncElapsedMs": 0.66725,
+          "fsyncElapsedMs": 0.812416,
           "phaseTelemetry": {
             "descriptorSecurityPreflight": {
-              "wallMs": 0.031542,
-              "cpuMs": 0.032
+              "wallMs": 0.037667,
+              "cpuMs": 0.039
             },
             "fsync": {
-              "wallMs": 0.672,
-              "cpuMs": 0.631
+              "wallMs": 0.81775,
+              "cpuMs": 0.763
             },
             "indexSerializationWrite": {
-              "wallMs": 4.920858,
+              "wallMs": 4.929902,
               "cpuMs": null
             },
             "semanticScan": {
-              "wallMs": 944.407167,
-              "cpuMs": 1031.936
+              "wallMs": 944.919084,
+              "cpuMs": 1029.845
             },
             "dictionary": {
               "wallMs": 0.002625,
               "cpuMs": 0.003
             },
             "metadataDelta": {
-              "wallMs": 0.037791,
-              "cpuMs": 0.039
+              "wallMs": 0.040917,
+              "cpuMs": 0.042
             },
             "parent": {
-              "wallMs": 0.017583,
+              "wallMs": 0.019083,
               "cpuMs": 0.018
             },
             "indexTailWork": {
-              "wallMs": 31.540709,
-              "cpuMs": 32.238
+              "wallMs": 31.351625,
+              "cpuMs": 31.883
             },
             "commitClassification": {
-              "wallMs": 1.219375,
-              "cpuMs": 1.207
+              "wallMs": 1.767167,
+              "cpuMs": 1.738
             },
             "hotSuffixContext": {
-              "wallMs": 5.357917,
-              "cpuMs": 3.674
+              "wallMs": 5.362958,
+              "cpuMs": 3.505
             }
           },
           "phaseEvidence": {
             "descriptorSecurityPreflight": {
-              "wallMs": 0.031542,
-              "cpuMs": 0.032
+              "wallMs": 0.037667,
+              "cpuMs": 0.039
             },
             "fsync": {
-              "wallMs": 0.672,
-              "cpuMs": 0.631
+              "wallMs": 0.81775,
+              "cpuMs": 0.763
             },
             "indexSerializationWrite": {
-              "wallMs": 4.920858,
+              "wallMs": 4.929902,
               "cpuMs": null
             },
             "semanticScan": {
-              "wallMs": 944.407167,
-              "cpuMs": 1031.936
+              "wallMs": 944.919084,
+              "cpuMs": 1029.845
             },
             "dictionary": {
               "wallMs": 0.002625,
               "cpuMs": 0.003
             },
             "metadataDelta": {
-              "wallMs": 0.037791,
-              "cpuMs": 0.039
+              "wallMs": 0.040917,
+              "cpuMs": 0.042
             },
             "parent": {
-              "wallMs": 0.017583,
+              "wallMs": 0.019083,
               "cpuMs": 0.018
             },
             "indexTailWork": {
-              "wallMs": 31.540709,
-              "cpuMs": 32.238
+              "wallMs": 31.351625,
+              "cpuMs": 31.883
             },
             "commitClassification": {
-              "wallMs": 1.219375,
-              "cpuMs": 1.207
+              "wallMs": 1.767167,
+              "cpuMs": 1.738
             },
             "hotSuffixContext": {
-              "wallMs": 5.357917,
-              "cpuMs": 3.674
+              "wallMs": 5.362958,
+              "cpuMs": 3.505
             }
           },
           "phaseTimings": {
             "descriptorSecurityPreflight": {
-              "wallMs": 0.031542,
-              "cpuMs": 0.032
+              "wallMs": 0.037667,
+              "cpuMs": 0.039
             },
             "fsync": {
-              "wallMs": 0.672,
-              "cpuMs": 0.631
+              "wallMs": 0.81775,
+              "cpuMs": 0.763
             },
             "indexSerializationWrite": {
-              "wallMs": 4.920858,
+              "wallMs": 4.929902,
               "cpuMs": null
             },
             "semanticScan": {
-              "wallMs": 944.407167,
-              "cpuMs": 1031.936
+              "wallMs": 944.919084,
+              "cpuMs": 1029.845
             },
             "dictionary": {
               "wallMs": 0.002625,
               "cpuMs": 0.003
             },
             "metadataDelta": {
-              "wallMs": 0.037791,
-              "cpuMs": 0.039
+              "wallMs": 0.040917,
+              "cpuMs": 0.042
             },
             "parent": {
-              "wallMs": 0.017583,
+              "wallMs": 0.019083,
               "cpuMs": 0.018
             },
             "indexTailWork": {
-              "wallMs": 31.540709,
-              "cpuMs": 32.238
+              "wallMs": 31.351625,
+              "cpuMs": 31.883
             },
             "commitClassification": {
-              "wallMs": 1.219375,
-              "cpuMs": 1.207
+              "wallMs": 1.767167,
+              "cpuMs": 1.738
             },
             "hotSuffixContext": {
-              "wallMs": 5.357917,
-              "cpuMs": 3.674
+              "wallMs": 5.362958,
+              "cpuMs": 3.505
             }
           },
           "dictionaryArtifactEnabled": false,
           "parentArtifactEnabled": false,
           "dictionaryBuildElapsedMs": 0.002625,
-          "parentBuildElapsedMs": 0.017583,
-          "flatIndexElapsedMs": 4.920858,
-          "pressureBaselineBytes": 56220808
+          "parentBuildElapsedMs": 0.019083,
+          "flatIndexElapsedMs": 4.929902,
+          "pressureBaselineBytes": 56262233
         },
         "lastReopenTransition": {
           "kind": "rebuild",
@@ -2746,12 +1594,12 @@
         "sidecarEnabled": true,
         "coldRetirementActive": true,
         "sidecarIneligible": false,
-        "hotRegionBytes": 911732,
+        "hotRegionBytes": 911734,
         "metaDescriptorBytes": 17262109,
-        "totalAccountedBytes": 49075528,
+        "totalAccountedBytes": 49075532,
         "reservedBudgetBytes": 47251456,
         "allocatedCacheBytes": 17261883,
-        "hotResidentBytes": 1824072,
+        "hotResidentBytes": 1824076,
         "metadataResidentBytes": 226,
         "sidecarFileBytes": 219155,
         "firstOpen": {
@@ -2821,12 +1669,12 @@
         "sidecarEnabled": true,
         "coldRetirementActive": true,
         "sidecarIneligible": false,
-        "hotRegionBytes": 911732,
+        "hotRegionBytes": 911734,
         "metaDescriptorBytes": 1180,
-        "totalAccountedBytes": 49075528,
+        "totalAccountedBytes": 49075532,
         "reservedBudgetBytes": 47251456,
         "allocatedCacheBytes": 954,
-        "hotResidentBytes": 1824072,
+        "hotResidentBytes": 1824076,
         "metadataResidentBytes": 226,
         "sidecarFileBytes": 219155,
         "lazyReopenAttempted": true,
@@ -2852,12 +1700,12 @@
         "reopen.sidecarEnabled": true,
         "reopen.coldRetirementActive": true,
         "reopen.sidecarIneligible": false,
-        "reopen.hotRegionBytes": 911732,
+        "reopen.hotRegionBytes": 911734,
         "reopen.metaDescriptorBytes": 17262109,
-        "reopen.totalAccountedBytes": 49075528,
+        "reopen.totalAccountedBytes": 49075532,
         "reopen.reservedBudgetBytes": 47251456,
         "reopen.allocatedCacheBytes": 17261883,
-        "reopen.hotResidentBytes": 1824072,
+        "reopen.hotResidentBytes": 1824076,
         "reopen.metadataResidentBytes": 226,
         "reopen.sidecarFileBytes": 219155,
         "reopen.lazyReopenAttempted": true,
@@ -2893,75 +1741,75 @@
       "outputToSourceRatio": 1.0000000727141707,
       "phases": {
         "fixtureGeneration": {
-          "elapsedMs": 743.7743750000001,
+          "elapsedMs": 297.38800000000003,
           "cpu": {
-            "userMicros": 133153,
-            "systemMicros": 142020
+            "userMicros": 128342,
+            "systemMicros": 127689
           }
         },
         "capture": {
-          "elapsedMs": 591.3925839999999,
+          "elapsedMs": 627.8215829999999,
           "cpu": {
-            "userMicros": 625421,
-            "systemMicros": 86062
+            "userMicros": 639508,
+            "systemMicros": 92641
           }
         },
         "fork": {
-          "elapsedMs": 2215.3475419999995,
+          "elapsedMs": 2246.330625,
           "cpu": {
-            "userMicros": 2142936,
-            "systemMicros": 379573
+            "userMicros": 2165794,
+            "systemMicros": 381468
           }
         },
         "closeFork": {
-          "elapsedMs": 1.1104169999998703,
+          "elapsedMs": 0.9442909999997937,
           "cpu": {
-            "userMicros": 720,
-            "systemMicros": 398
+            "userMicros": 618,
+            "systemMicros": 332
           }
         },
         "reopen": {
-          "elapsedMs": 1359.2039170000003,
+          "elapsedMs": 1383.6886249999998,
           "cpu": {
-            "userMicros": 1751061,
-            "systemMicros": 394197
+            "userMicros": 1762944,
+            "systemMicros": 388792
           }
         },
         "coldLookups": {
-          "elapsedMs": 21.22295800000029,
+          "elapsedMs": 21.496541999999863,
           "cpu": {
-            "userMicros": 17000,
+            "userMicros": 16889,
             "systemMicros": 6285
           }
         },
         "warmLookups": {
-          "elapsedMs": 0.4558340000003227,
+          "elapsedMs": 0.5462080000006608,
           "cpu": {
-            "userMicros": 536,
-            "systemMicros": 19
+            "userMicros": 635,
+            "systemMicros": 46
           }
         },
         "buildContext": {
-          "elapsedMs": 0.17849999999998545,
+          "elapsedMs": 0.18408399999952962,
           "cpu": {
-            "userMicros": 265,
-            "systemMicros": 25
+            "userMicros": 268,
+            "systemMicros": 26
           }
         },
         "closeReopened": {
-          "elapsedMs": 0.6290829999998095,
+          "elapsedMs": 13.100750000000517,
           "cpu": {
-            "userMicros": 154,
-            "systemMicros": 402
+            "userMicros": 218,
+            "systemMicros": 797
           }
         }
       },
       "phaseEvidence": {
         "wholeFork": {
-          "elapsedMs": 2215.3475419999995,
+          "elapsedMs": 2246.330625,
           "cpu": {
-            "userMicros": 2142936,
-            "systemMicros": 379573
+            "userMicros": 2165794,
+            "systemMicros": 381468
           }
         },
         "preflightScan": null,
@@ -2980,135 +1828,1287 @@
         "fsyncCount": 0
       },
       "throughput": {
-        "fixtureGenerationMiBPerSecond": 1375.4171081788074,
-        "forkMiBPerSecond": 461.7785609730756
+        "fixtureGenerationMiBPerSecond": 3439.9505023740026,
+        "forkMiBPerSecond": 455.4093634368716
       },
       "latency": {
         "coldLookupMs": {
           "samples": [
-            1.2931250000001455,
-            1.057625000000371,
-            1.0060000000003129,
-            1.382832999999664,
-            1.3506659999993644,
-            1.1861659999995027,
-            1.109124999999949,
-            1.1106660000004922,
-            1.1596669999998994,
-            1.248333000000457,
-            2.3341249999994034,
-            1.2764590000006137,
-            1.1706249999997453,
-            1.384208000000399,
-            1.2682910000003176,
-            1.4477500000002692
+            1.429374999999709,
+            1.2474169999995866,
+            1.0807919999997466,
+            1.1534999999994398,
+            1.2032920000001468,
+            1.3707500000000437,
+            1.2870410000004995,
+            1.2281250000005457,
+            1.2790830000003552,
+            1.2727909999994154,
+            1.2683749999996508,
+            1.9424580000004426,
+            1.3120840000001408,
+            1.2015000000001237,
+            1.251792000000023,
+            1.5232089999999516
           ],
-          "min": 1.0060000000003129,
-          "median": 1.248333000000457,
-          "p95": 2.3341249999994034,
-          "max": 2.3341249999994034
+          "min": 1.0807919999997466,
+          "median": 1.2683749999996508,
+          "p95": 1.9424580000004426,
+          "max": 1.9424580000004426
         },
         "warmLookupMs": {
           "samples": [
-            0.01954200000000128,
-            0.004874999999628926,
-            0.003499999999803549,
-            0.005583000000115135,
-            0.0024159999993571546,
-            0.0020830000003115856,
-            0.0036250000002837623,
-            0.006000000000312866,
-            0.003042000000277767,
-            0.0018340000005991897,
-            0.0035420000003796304,
-            0.009500000000116415,
-            0.0043750000004365575,
-            0.0036250000002837623,
-            0.00483299999996234,
-            0.0034159999995608814
+            0.019874999999956344,
+            0.004249999999956344,
+            0.008458000000246102,
+            0.007250000000567525,
+            0.0024999999995998223,
+            0.002290999999786436,
+            0.001999999999497959,
+            0.002832999999554886,
+            0.002832999999554886,
+            0.0024169999996956903,
+            0.002375000000029104,
+            0.009375000000545697,
+            0.003875000000334694,
+            0.025415999999495398,
+            0.02387500000077125,
+            0.02591599999959726
           ],
-          "min": 0.0018340000005991897,
-          "median": 0.0036250000002837623,
-          "p95": 0.01954200000000128,
-          "max": 0.01954200000000128
+          "min": 0.001999999999497959,
+          "median": 0.003875000000334694,
+          "p95": 0.02591599999959726,
+          "max": 0.02591599999959726
+        }
+      },
+      "memory": {
+        "baseline": {
+          "rssBytes": 174686208,
+          "heapUsedBytes": 19658651,
+          "heapTotalBytes": 18849792,
+          "externalBytes": 4723113,
+          "arrayBuffersBytes": 1158
+        },
+        "afterFixture": {
+          "rssBytes": 426508288,
+          "heapUsedBytes": 76277889,
+          "heapTotalBytes": 18849792,
+          "externalBytes": 4779490,
+          "arrayBuffersBytes": 1158
+        },
+        "afterCapture": {
+          "rssBytes": 430194688,
+          "heapUsedBytes": 22230884,
+          "heapTotalBytes": 18867200,
+          "externalBytes": 4879391,
+          "arrayBuffersBytes": 1158
+        },
+        "afterFork": {
+          "rssBytes": 509706240,
+          "heapUsedBytes": 22021296,
+          "heapTotalBytes": 19117056,
+          "externalBytes": 6849277,
+          "arrayBuffersBytes": 912687
+        },
+        "afterForkClose": {
+          "rssBytes": 509870080,
+          "heapUsedBytes": 22021296,
+          "heapTotalBytes": 19118080,
+          "externalBytes": 6008654,
+          "arrayBuffersBytes": 1158
+        },
+        "afterReopen": {
+          "rssBytes": 526974976,
+          "heapUsedBytes": 23543091,
+          "heapTotalBytes": 19253248,
+          "externalBytes": 8276518,
+          "arrayBuffersBytes": 912687
+        },
+        "afterColdLookups": {
+          "rssBytes": 535183360,
+          "heapUsedBytes": 39764769,
+          "heapTotalBytes": 19810304,
+          "externalBytes": 24290250,
+          "arrayBuffersBytes": 912687
+        },
+        "afterWarmLookups": {
+          "rssBytes": 535183360,
+          "heapUsedBytes": 39764769,
+          "heapTotalBytes": 19810304,
+          "externalBytes": 24301282,
+          "arrayBuffersBytes": 912687
+        },
+        "afterContext": {
+          "rssBytes": 535216128,
+          "heapUsedBytes": 39764769,
+          "heapTotalBytes": 19810304,
+          "externalBytes": 24309437,
+          "arrayBuffersBytes": 912687
+        },
+        "afterTeardown": {
+          "rssBytes": 535216128,
+          "heapUsedBytes": 21815142,
+          "heapTotalBytes": 19236864,
+          "externalBytes": 6544868,
+          "arrayBuffersBytes": 1158
+        },
+        "forkRssGrowthBytes": 79511552,
+        "reopenRssGrowthBytes": 17104896,
+        "lookupRssGrowthBytes": 8208384,
+        "teardownRssGrowthBytes": 360529920,
+        "maxRssBytes": 535216128
+      },
+      "io": {
+        "coldRangeReads": 16,
+        "warmRangeReads": 0,
+        "coldEntriesReloaded": 16
+      },
+      "guards": {
+        "contextMessageCount": 1,
+        "lookupPayloadBytes": 33554432
+      },
+      "forkStats": {
+        "sidecarEnabled": true,
+        "coldRetirementActive": true,
+        "sidecarIneligible": false,
+        "hotRegionBytes": 911732,
+        "metaDescriptorBytes": 1180,
+        "totalAccountedBytes": 49075528,
+        "reservedBudgetBytes": 47251456,
+        "allocatedCacheBytes": 954,
+        "hotResidentBytes": 1824072,
+        "metadataResidentBytes": 226,
+        "sidecarFileBytes": 219155,
+        "firstOpen": {
+          "attempted": true,
+          "succeeded": true,
+          "strategy": "pressure",
+          "secondaryArtifactMode": "disabled",
+          "wallMs": 982.849083,
+          "cpuMs": 1073.616,
+          "gcRequests": 12,
+          "gcRequestCount": 12,
+          "gcElapsedMs": 50.642708,
+          "bytesRead": 1138971422,
+          "transcriptBytesRead": 1138753692,
+          "bytesWritten": 218362,
+          "sidecarBytesWritten": 218362,
+          "sidecarFileBytes": 219155,
+          "recordsParsed": 1027,
+          "semanticRecordsParsed": 1025,
+          "suffixRecordsParsed": 2,
+          "lineAssemblyCopyCount": 4304,
+          "lineCopyCount": 4304,
+          "lineAssemblyCopyBytes": 1074003769,
+          "indexWriteCalls": 1,
+          "indexWriteBytes": 217730,
+          "fsyncCount": 2,
+          "fsyncElapsedMs": 0.756583,
+          "phaseTelemetry": {
+            "descriptorSecurityPreflight": {
+              "wallMs": 0.05225,
+              "cpuMs": 0.054
+            },
+            "fsync": {
+              "wallMs": 0.7613340000000001,
+              "cpuMs": 0.694
+            },
+            "indexSerializationWrite": {
+              "wallMs": 5.305863,
+              "cpuMs": null
+            },
+            "semanticScan": {
+              "wallMs": 945.529459,
+              "cpuMs": 1036.898
+            },
+            "dictionary": {
+              "wallMs": 0.001916,
+              "cpuMs": 0.003
+            },
+            "metadataDelta": {
+              "wallMs": 0.034625,
+              "cpuMs": 0.034
+            },
+            "parent": {
+              "wallMs": 0.01675,
+              "cpuMs": 0.016
+            },
+            "indexTailWork": {
+              "wallMs": 30.185333,
+              "cpuMs": 30.867
+            },
+            "commitClassification": {
+              "wallMs": 1.174375,
+              "cpuMs": 1.162
+            },
+            "hotSuffixContext": {
+              "wallMs": 4.871584,
+              "cpuMs": 3.109
+            }
+          },
+          "phaseEvidence": {
+            "descriptorSecurityPreflight": {
+              "wallMs": 0.05225,
+              "cpuMs": 0.054
+            },
+            "fsync": {
+              "wallMs": 0.7613340000000001,
+              "cpuMs": 0.694
+            },
+            "indexSerializationWrite": {
+              "wallMs": 5.305863,
+              "cpuMs": null
+            },
+            "semanticScan": {
+              "wallMs": 945.529459,
+              "cpuMs": 1036.898
+            },
+            "dictionary": {
+              "wallMs": 0.001916,
+              "cpuMs": 0.003
+            },
+            "metadataDelta": {
+              "wallMs": 0.034625,
+              "cpuMs": 0.034
+            },
+            "parent": {
+              "wallMs": 0.01675,
+              "cpuMs": 0.016
+            },
+            "indexTailWork": {
+              "wallMs": 30.185333,
+              "cpuMs": 30.867
+            },
+            "commitClassification": {
+              "wallMs": 1.174375,
+              "cpuMs": 1.162
+            },
+            "hotSuffixContext": {
+              "wallMs": 4.871584,
+              "cpuMs": 3.109
+            }
+          },
+          "phaseTimings": {
+            "descriptorSecurityPreflight": {
+              "wallMs": 0.05225,
+              "cpuMs": 0.054
+            },
+            "fsync": {
+              "wallMs": 0.7613340000000001,
+              "cpuMs": 0.694
+            },
+            "indexSerializationWrite": {
+              "wallMs": 5.305863,
+              "cpuMs": null
+            },
+            "semanticScan": {
+              "wallMs": 945.529459,
+              "cpuMs": 1036.898
+            },
+            "dictionary": {
+              "wallMs": 0.001916,
+              "cpuMs": 0.003
+            },
+            "metadataDelta": {
+              "wallMs": 0.034625,
+              "cpuMs": 0.034
+            },
+            "parent": {
+              "wallMs": 0.01675,
+              "cpuMs": 0.016
+            },
+            "indexTailWork": {
+              "wallMs": 30.185333,
+              "cpuMs": 30.867
+            },
+            "commitClassification": {
+              "wallMs": 1.174375,
+              "cpuMs": 1.162
+            },
+            "hotSuffixContext": {
+              "wallMs": 4.871584,
+              "cpuMs": 3.109
+            }
+          },
+          "dictionaryArtifactEnabled": false,
+          "parentArtifactEnabled": false,
+          "dictionaryBuildElapsedMs": 0.001916,
+          "parentBuildElapsedMs": 0.01675,
+          "flatIndexElapsedMs": 5.305863,
+          "pressureBaselineBytes": 56216992
+        },
+        "lastReopenTransition": {
+          "kind": "rebuild",
+          "reason": "bounded_first_open"
+        },
+        "currentCommitTransition": {
+          "kind": "exact",
+          "reason": "descriptor_and_proof_match"
+        },
+        "lazyReopenAttempted": true,
+        "lazyReopenSucceeded": true,
+        "consecutiveBuildFailures": 0,
+        "parentArtifactEnabled": false,
+        "dictionaryArtifactEnabled": false,
+        "metadataDeltaDescriptorBytes": 0,
+        "coldIndexBytes": 217730,
+        "coldIndexBlockCacheBytes": 0,
+        "coldEntryCacheBytes": 0,
+        "coldEntriesRetired": 0,
+        "coldEntriesReloaded": 0,
+        "rangeReadCount": 0,
+        "rangeReadGenerationMismatchCount": 0,
+        "sidecarRebuildCount": 0,
+        "coldMutationPromotions": 0,
+        "hotOverflowTransitions": 0,
+        "labelDiskFallbackCount": 0,
+        "shadowParityMismatchCount": 0,
+        "shadowParityCheckCount": 0,
+        "transcriptGeneration": 0
+      },
+      "reopenStats": {
+        "sidecarEnabled": true,
+        "coldRetirementActive": true,
+        "sidecarIneligible": false,
+        "hotRegionBytes": 911732,
+        "metaDescriptorBytes": 17262109,
+        "totalAccountedBytes": 49075528,
+        "reservedBudgetBytes": 47251456,
+        "allocatedCacheBytes": 17261883,
+        "hotResidentBytes": 1824072,
+        "metadataResidentBytes": 226,
+        "sidecarFileBytes": 219155,
+        "firstOpen": {
+          "attempted": false,
+          "succeeded": false,
+          "strategy": "pressure",
+          "secondaryArtifactMode": "disabled",
+          "wallMs": 0,
+          "cpuMs": 0,
+          "gcRequests": 0,
+          "gcRequestCount": 0,
+          "gcElapsedMs": 0,
+          "bytesRead": 0,
+          "transcriptBytesRead": 0,
+          "bytesWritten": 0,
+          "sidecarBytesWritten": 0,
+          "sidecarFileBytes": 219155,
+          "recordsParsed": 0,
+          "semanticRecordsParsed": 0,
+          "suffixRecordsParsed": 0,
+          "lineAssemblyCopyCount": 0,
+          "lineCopyCount": 0,
+          "lineAssemblyCopyBytes": 0,
+          "indexWriteCalls": 0,
+          "indexWriteBytes": 0,
+          "fsyncCount": 0,
+          "fsyncElapsedMs": 0,
+          "phaseTelemetry": {},
+          "phaseEvidence": {},
+          "phaseTimings": {},
+          "dictionaryArtifactEnabled": false,
+          "parentArtifactEnabled": false,
+          "dictionaryBuildElapsedMs": 0,
+          "parentBuildElapsedMs": 0,
+          "flatIndexElapsedMs": 0
+        },
+        "lastReopenTransition": {
+          "kind": "exact",
+          "reason": "descriptor_and_proof_match"
+        },
+        "currentCommitTransition": {
+          "kind": "exact",
+          "reason": "descriptor_and_proof_match"
+        },
+        "lazyReopenAttempted": true,
+        "lazyReopenSucceeded": true,
+        "consecutiveBuildFailures": 0,
+        "parentArtifactEnabled": false,
+        "dictionaryArtifactEnabled": false,
+        "metadataDeltaDescriptorBytes": 0,
+        "coldIndexBytes": 217730,
+        "coldIndexBlockCacheBytes": 481580,
+        "coldEntryCacheBytes": 16779349,
+        "coldEntriesRetired": 0,
+        "coldEntriesReloaded": 16,
+        "rangeReadCount": 16,
+        "rangeReadGenerationMismatchCount": 0,
+        "sidecarRebuildCount": 0,
+        "coldMutationPromotions": 0,
+        "hotOverflowTransitions": 0,
+        "labelDiskFallbackCount": 0,
+        "shadowParityMismatchCount": 0,
+        "shadowParityCheckCount": 0,
+        "transcriptGeneration": 0
+      },
+      "sessionMemoryTelemetry": {
+        "sidecarEnabled": true,
+        "coldRetirementActive": true,
+        "sidecarIneligible": false,
+        "hotRegionBytes": 911732,
+        "metaDescriptorBytes": 1180,
+        "totalAccountedBytes": 49075528,
+        "reservedBudgetBytes": 47251456,
+        "allocatedCacheBytes": 954,
+        "hotResidentBytes": 1824072,
+        "metadataResidentBytes": 226,
+        "sidecarFileBytes": 219155,
+        "lazyReopenAttempted": true,
+        "lazyReopenSucceeded": true,
+        "consecutiveBuildFailures": 0,
+        "parentArtifactEnabled": false,
+        "dictionaryArtifactEnabled": false,
+        "metadataDeltaDescriptorBytes": 0,
+        "coldIndexBytes": 217730,
+        "coldIndexBlockCacheBytes": 0,
+        "coldEntryCacheBytes": 0,
+        "coldEntriesRetired": 0,
+        "coldEntriesReloaded": 0,
+        "rangeReadCount": 0,
+        "rangeReadGenerationMismatchCount": 0,
+        "sidecarRebuildCount": 0,
+        "coldMutationPromotions": 0,
+        "hotOverflowTransitions": 0,
+        "labelDiskFallbackCount": 0,
+        "shadowParityMismatchCount": 0,
+        "shadowParityCheckCount": 0,
+        "transcriptGeneration": 0,
+        "reopen.sidecarEnabled": true,
+        "reopen.coldRetirementActive": true,
+        "reopen.sidecarIneligible": false,
+        "reopen.hotRegionBytes": 911732,
+        "reopen.metaDescriptorBytes": 17262109,
+        "reopen.totalAccountedBytes": 49075528,
+        "reopen.reservedBudgetBytes": 47251456,
+        "reopen.allocatedCacheBytes": 17261883,
+        "reopen.hotResidentBytes": 1824072,
+        "reopen.metadataResidentBytes": 226,
+        "reopen.sidecarFileBytes": 219155,
+        "reopen.lazyReopenAttempted": true,
+        "reopen.lazyReopenSucceeded": true,
+        "reopen.consecutiveBuildFailures": 0,
+        "reopen.parentArtifactEnabled": false,
+        "reopen.dictionaryArtifactEnabled": false,
+        "reopen.metadataDeltaDescriptorBytes": 0,
+        "reopen.coldIndexBytes": 217730,
+        "reopen.coldIndexBlockCacheBytes": 481580,
+        "reopen.coldEntryCacheBytes": 16779349,
+        "reopen.coldEntriesRetired": 0,
+        "reopen.coldEntriesReloaded": 16,
+        "reopen.rangeReadCount": 16,
+        "reopen.rangeReadGenerationMismatchCount": 0,
+        "reopen.sidecarRebuildCount": 0,
+        "reopen.coldMutationPromotions": 0,
+        "reopen.hotOverflowTransitions": 0,
+        "reopen.labelDiskFallbackCount": 0,
+        "reopen.shadowParityMismatchCount": 0,
+        "reopen.shadowParityCheckCount": 0,
+        "reopen.transcriptGeneration": 0
+      }
+    },
+    {
+      "operationClass": "captured-fork",
+      "gcStrategy": "pressure",
+      "secondaryArtifacts": "off",
+      "repetitions": 3,
+      "mode": "captured",
+      "sourceBytes": 1072693248,
+      "destinationBytes": 1072693326,
+      "outputToSourceRatio": 1.0000000727141707,
+      "phases": {
+        "fixtureGeneration": {
+          "elapsedMs": 253.95374999999999,
+          "cpu": {
+            "userMicros": 132401,
+            "systemMicros": 135298
+          }
+        },
+        "capture": {
+          "elapsedMs": 600.1104169999999,
+          "cpu": {
+            "userMicros": 630077,
+            "systemMicros": 88811
+          }
+        },
+        "fork": {
+          "elapsedMs": 2295.244709,
+          "cpu": {
+            "userMicros": 2146403,
+            "systemMicros": 393833
+          }
+        },
+        "closeFork": {
+          "elapsedMs": 1.405666999999994,
+          "cpu": {
+            "userMicros": 918,
+            "systemMicros": 498
+          }
+        },
+        "reopen": {
+          "elapsedMs": 1372.906,
+          "cpu": {
+            "userMicros": 1744818,
+            "systemMicros": 387617
+          }
+        },
+        "coldLookups": {
+          "elapsedMs": 22.403583999999682,
+          "cpu": {
+            "userMicros": 17337,
+            "systemMicros": 6752
+          }
+        },
+        "warmLookups": {
+          "elapsedMs": 0.5032919999994192,
+          "cpu": {
+            "userMicros": 528,
+            "systemMicros": 27
+          }
+        },
+        "buildContext": {
+          "elapsedMs": 0.17970800000057352,
+          "cpu": {
+            "userMicros": 276,
+            "systemMicros": 32
+          }
+        },
+        "closeReopened": {
+          "elapsedMs": 7.839082999999846,
+          "cpu": {
+            "userMicros": 228,
+            "systemMicros": 608
+          }
+        }
+      },
+      "phaseEvidence": {
+        "wholeFork": {
+          "elapsedMs": 2295.244709,
+          "cpu": {
+            "userMicros": 2146403,
+            "systemMicros": 393833
+          }
+        },
+        "preflightScan": null,
+        "copyScan": null,
+        "stagedWriterPublication": null,
+        "destinationFirstOpen": null,
+        "sourceRevalidation": null
+      },
+      "counters": {
+        "gcRequests": 0,
+        "gcElapsedMs": 0,
+        "bytesRead": 0,
+        "bytesWritten": 0,
+        "recordsParsed": 0,
+        "indexWriteCalls": 0,
+        "fsyncCount": 0
+      },
+      "throughput": {
+        "fixtureGenerationMiBPerSecond": 4028.2925532700347,
+        "forkMiBPerSecond": 445.70410988800586
+      },
+      "latency": {
+        "coldLookupMs": {
+          "samples": [
+            1.3634170000004815,
+            1.099583000000166,
+            1.1923750000005384,
+            1.4830830000000788,
+            1.1755000000002838,
+            1.141208000000006,
+            1.115708999999697,
+            1.2000410000000556,
+            1.4207919999998921,
+            1.3241669999997612,
+            1.4735000000000582,
+            2.3659590000006574,
+            1.3521670000000086,
+            1.2461670000002414,
+            1.498833999999988,
+            1.5125410000000556
+          ],
+          "min": 1.099583000000166,
+          "median": 1.3241669999997612,
+          "p95": 2.3659590000006574,
+          "max": 2.3659590000006574
+        },
+        "warmLookupMs": {
+          "samples": [
+            0.021749999999883585,
+            0.0045419999996738625,
+            0.003749999999854481,
+            0.016499999999723514,
+            0.0033329999996567494,
+            0.0027500000005602487,
+            0.0032920000003286987,
+            0.002334000000701053,
+            0.002375000000029104,
+            0.004583000000820903,
+            0.003250000000662112,
+            0.011541000000761414,
+            0.0030000000006111804,
+            0.00841599999967002,
+            0.003792000000430562,
+            0.004500000000007276
+          ],
+          "min": 0.002334000000701053,
+          "median": 0.003749999999854481,
+          "p95": 0.021749999999883585,
+          "max": 0.021749999999883585
+        }
+      },
+      "memory": {
+        "baseline": {
+          "rssBytes": 178323456,
+          "heapUsedBytes": 19655564,
+          "heapTotalBytes": 18900992,
+          "externalBytes": 4721994,
+          "arrayBuffersBytes": 1158
+        },
+        "afterFixture": {
+          "rssBytes": 409223168,
+          "heapUsedBytes": 76275890,
+          "heapTotalBytes": 18900992,
+          "externalBytes": 4778375,
+          "arrayBuffersBytes": 1158
+        },
+        "afterCapture": {
+          "rssBytes": 413089792,
+          "heapUsedBytes": 19780725,
+          "heapTotalBytes": 18902016,
+          "externalBytes": 4878533,
+          "arrayBuffersBytes": 1158
+        },
+        "afterFork": {
+          "rssBytes": 491814912,
+          "heapUsedBytes": 22018794,
+          "heapTotalBytes": 19168256,
+          "externalBytes": 6849076,
+          "arrayBuffersBytes": 912687
+        },
+        "afterForkClose": {
+          "rssBytes": 492011520,
+          "heapUsedBytes": 22018794,
+          "heapTotalBytes": 19168256,
+          "externalBytes": 6007877,
+          "arrayBuffersBytes": 1158
+        },
+        "afterReopen": {
+          "rssBytes": 510033920,
+          "heapUsedBytes": 23540904,
+          "heapTotalBytes": 19303424,
+          "externalBytes": 8273756,
+          "arrayBuffersBytes": 912687
+        },
+        "afterColdLookups": {
+          "rssBytes": 517636096,
+          "heapUsedBytes": 39762839,
+          "heapTotalBytes": 19876864,
+          "externalBytes": 24287744,
+          "arrayBuffersBytes": 912687
+        },
+        "afterWarmLookups": {
+          "rssBytes": 517636096,
+          "heapUsedBytes": 39762839,
+          "heapTotalBytes": 19876864,
+          "externalBytes": 24289048,
+          "arrayBuffersBytes": 912687
+        },
+        "afterContext": {
+          "rssBytes": 517668864,
+          "heapUsedBytes": 39762839,
+          "heapTotalBytes": 19893248,
+          "externalBytes": 24307187,
+          "arrayBuffersBytes": 912687
+        },
+        "afterTeardown": {
+          "rssBytes": 517668864,
+          "heapUsedBytes": 39795119,
+          "heapTotalBytes": 19287040,
+          "externalBytes": 6542618,
+          "arrayBuffersBytes": 1158
+        },
+        "forkRssGrowthBytes": 78725120,
+        "reopenRssGrowthBytes": 18022400,
+        "lookupRssGrowthBytes": 7602176,
+        "teardownRssGrowthBytes": 339345408,
+        "maxRssBytes": 517668864
+      },
+      "io": {
+        "coldRangeReads": 16,
+        "warmRangeReads": 0,
+        "coldEntriesReloaded": 16
+      },
+      "guards": {
+        "contextMessageCount": 1,
+        "lookupPayloadBytes": 33554432
+      },
+      "forkStats": {
+        "sidecarEnabled": true,
+        "coldRetirementActive": true,
+        "sidecarIneligible": false,
+        "hotRegionBytes": 911732,
+        "metaDescriptorBytes": 1180,
+        "totalAccountedBytes": 49075528,
+        "reservedBudgetBytes": 47251456,
+        "allocatedCacheBytes": 954,
+        "hotResidentBytes": 1824072,
+        "metadataResidentBytes": 226,
+        "sidecarFileBytes": 219155,
+        "firstOpen": {
+          "attempted": true,
+          "succeeded": true,
+          "strategy": "pressure",
+          "secondaryArtifactMode": "disabled",
+          "wallMs": 996.823125,
+          "cpuMs": 1075.301,
+          "gcRequests": 12,
+          "gcRequestCount": 12,
+          "gcElapsedMs": 49.819832000000005,
+          "bytesRead": 1138971422,
+          "transcriptBytesRead": 1138753692,
+          "bytesWritten": 218362,
+          "sidecarBytesWritten": 218362,
+          "sidecarFileBytes": 219155,
+          "recordsParsed": 1027,
+          "semanticRecordsParsed": 1025,
+          "suffixRecordsParsed": 2,
+          "lineAssemblyCopyCount": 4304,
+          "lineCopyCount": 4304,
+          "lineAssemblyCopyBytes": 1074003769,
+          "indexWriteCalls": 1,
+          "indexWriteBytes": 217730,
+          "fsyncCount": 2,
+          "fsyncElapsedMs": 0.713083,
+          "phaseTelemetry": {
+            "descriptorSecurityPreflight": {
+              "wallMs": 0.034625,
+              "cpuMs": 0.035
+            },
+            "fsync": {
+              "wallMs": 0.717875,
+              "cpuMs": 0.694
+            },
+            "indexSerializationWrite": {
+              "wallMs": 5.427926,
+              "cpuMs": null
+            },
+            "semanticScan": {
+              "wallMs": 956.610208,
+              "cpuMs": 1036.681
+            },
+            "dictionary": {
+              "wallMs": 0.002625,
+              "cpuMs": 0.003
+            },
+            "metadataDelta": {
+              "wallMs": 0.042167,
+              "cpuMs": 0.043
+            },
+            "parent": {
+              "wallMs": 0.022667,
+              "cpuMs": 0.023
+            },
+            "indexTailWork": {
+              "wallMs": 31.639208,
+              "cpuMs": 31.99
+            },
+            "commitClassification": {
+              "wallMs": 1.499333,
+              "cpuMs": 1.487
+            },
+            "hotSuffixContext": {
+              "wallMs": 6.218625,
+              "cpuMs": 3.887
+            }
+          },
+          "phaseEvidence": {
+            "descriptorSecurityPreflight": {
+              "wallMs": 0.034625,
+              "cpuMs": 0.035
+            },
+            "fsync": {
+              "wallMs": 0.717875,
+              "cpuMs": 0.694
+            },
+            "indexSerializationWrite": {
+              "wallMs": 5.427926,
+              "cpuMs": null
+            },
+            "semanticScan": {
+              "wallMs": 956.610208,
+              "cpuMs": 1036.681
+            },
+            "dictionary": {
+              "wallMs": 0.002625,
+              "cpuMs": 0.003
+            },
+            "metadataDelta": {
+              "wallMs": 0.042167,
+              "cpuMs": 0.043
+            },
+            "parent": {
+              "wallMs": 0.022667,
+              "cpuMs": 0.023
+            },
+            "indexTailWork": {
+              "wallMs": 31.639208,
+              "cpuMs": 31.99
+            },
+            "commitClassification": {
+              "wallMs": 1.499333,
+              "cpuMs": 1.487
+            },
+            "hotSuffixContext": {
+              "wallMs": 6.218625,
+              "cpuMs": 3.887
+            }
+          },
+          "phaseTimings": {
+            "descriptorSecurityPreflight": {
+              "wallMs": 0.034625,
+              "cpuMs": 0.035
+            },
+            "fsync": {
+              "wallMs": 0.717875,
+              "cpuMs": 0.694
+            },
+            "indexSerializationWrite": {
+              "wallMs": 5.427926,
+              "cpuMs": null
+            },
+            "semanticScan": {
+              "wallMs": 956.610208,
+              "cpuMs": 1036.681
+            },
+            "dictionary": {
+              "wallMs": 0.002625,
+              "cpuMs": 0.003
+            },
+            "metadataDelta": {
+              "wallMs": 0.042167,
+              "cpuMs": 0.043
+            },
+            "parent": {
+              "wallMs": 0.022667,
+              "cpuMs": 0.023
+            },
+            "indexTailWork": {
+              "wallMs": 31.639208,
+              "cpuMs": 31.99
+            },
+            "commitClassification": {
+              "wallMs": 1.499333,
+              "cpuMs": 1.487
+            },
+            "hotSuffixContext": {
+              "wallMs": 6.218625,
+              "cpuMs": 3.887
+            }
+          },
+          "dictionaryArtifactEnabled": false,
+          "parentArtifactEnabled": false,
+          "dictionaryBuildElapsedMs": 0.002625,
+          "parentBuildElapsedMs": 0.022667,
+          "flatIndexElapsedMs": 5.427926,
+          "pressureBaselineBytes": 56215108
+        },
+        "lastReopenTransition": {
+          "kind": "rebuild",
+          "reason": "bounded_first_open"
+        },
+        "currentCommitTransition": {
+          "kind": "exact",
+          "reason": "descriptor_and_proof_match"
+        },
+        "lazyReopenAttempted": true,
+        "lazyReopenSucceeded": true,
+        "consecutiveBuildFailures": 0,
+        "parentArtifactEnabled": false,
+        "dictionaryArtifactEnabled": false,
+        "metadataDeltaDescriptorBytes": 0,
+        "coldIndexBytes": 217730,
+        "coldIndexBlockCacheBytes": 0,
+        "coldEntryCacheBytes": 0,
+        "coldEntriesRetired": 0,
+        "coldEntriesReloaded": 0,
+        "rangeReadCount": 0,
+        "rangeReadGenerationMismatchCount": 0,
+        "sidecarRebuildCount": 0,
+        "coldMutationPromotions": 0,
+        "hotOverflowTransitions": 0,
+        "labelDiskFallbackCount": 0,
+        "shadowParityMismatchCount": 0,
+        "shadowParityCheckCount": 0,
+        "transcriptGeneration": 0
+      },
+      "reopenStats": {
+        "sidecarEnabled": true,
+        "coldRetirementActive": true,
+        "sidecarIneligible": false,
+        "hotRegionBytes": 911732,
+        "metaDescriptorBytes": 17262109,
+        "totalAccountedBytes": 49075528,
+        "reservedBudgetBytes": 47251456,
+        "allocatedCacheBytes": 17261883,
+        "hotResidentBytes": 1824072,
+        "metadataResidentBytes": 226,
+        "sidecarFileBytes": 219155,
+        "firstOpen": {
+          "attempted": false,
+          "succeeded": false,
+          "strategy": "pressure",
+          "secondaryArtifactMode": "disabled",
+          "wallMs": 0,
+          "cpuMs": 0,
+          "gcRequests": 0,
+          "gcRequestCount": 0,
+          "gcElapsedMs": 0,
+          "bytesRead": 0,
+          "transcriptBytesRead": 0,
+          "bytesWritten": 0,
+          "sidecarBytesWritten": 0,
+          "sidecarFileBytes": 219155,
+          "recordsParsed": 0,
+          "semanticRecordsParsed": 0,
+          "suffixRecordsParsed": 0,
+          "lineAssemblyCopyCount": 0,
+          "lineCopyCount": 0,
+          "lineAssemblyCopyBytes": 0,
+          "indexWriteCalls": 0,
+          "indexWriteBytes": 0,
+          "fsyncCount": 0,
+          "fsyncElapsedMs": 0,
+          "phaseTelemetry": {},
+          "phaseEvidence": {},
+          "phaseTimings": {},
+          "dictionaryArtifactEnabled": false,
+          "parentArtifactEnabled": false,
+          "dictionaryBuildElapsedMs": 0,
+          "parentBuildElapsedMs": 0,
+          "flatIndexElapsedMs": 0
+        },
+        "lastReopenTransition": {
+          "kind": "exact",
+          "reason": "descriptor_and_proof_match"
+        },
+        "currentCommitTransition": {
+          "kind": "exact",
+          "reason": "descriptor_and_proof_match"
+        },
+        "lazyReopenAttempted": true,
+        "lazyReopenSucceeded": true,
+        "consecutiveBuildFailures": 0,
+        "parentArtifactEnabled": false,
+        "dictionaryArtifactEnabled": false,
+        "metadataDeltaDescriptorBytes": 0,
+        "coldIndexBytes": 217730,
+        "coldIndexBlockCacheBytes": 481580,
+        "coldEntryCacheBytes": 16779349,
+        "coldEntriesRetired": 0,
+        "coldEntriesReloaded": 16,
+        "rangeReadCount": 16,
+        "rangeReadGenerationMismatchCount": 0,
+        "sidecarRebuildCount": 0,
+        "coldMutationPromotions": 0,
+        "hotOverflowTransitions": 0,
+        "labelDiskFallbackCount": 0,
+        "shadowParityMismatchCount": 0,
+        "shadowParityCheckCount": 0,
+        "transcriptGeneration": 0
+      },
+      "sessionMemoryTelemetry": {
+        "sidecarEnabled": true,
+        "coldRetirementActive": true,
+        "sidecarIneligible": false,
+        "hotRegionBytes": 911732,
+        "metaDescriptorBytes": 1180,
+        "totalAccountedBytes": 49075528,
+        "reservedBudgetBytes": 47251456,
+        "allocatedCacheBytes": 954,
+        "hotResidentBytes": 1824072,
+        "metadataResidentBytes": 226,
+        "sidecarFileBytes": 219155,
+        "lazyReopenAttempted": true,
+        "lazyReopenSucceeded": true,
+        "consecutiveBuildFailures": 0,
+        "parentArtifactEnabled": false,
+        "dictionaryArtifactEnabled": false,
+        "metadataDeltaDescriptorBytes": 0,
+        "coldIndexBytes": 217730,
+        "coldIndexBlockCacheBytes": 0,
+        "coldEntryCacheBytes": 0,
+        "coldEntriesRetired": 0,
+        "coldEntriesReloaded": 0,
+        "rangeReadCount": 0,
+        "rangeReadGenerationMismatchCount": 0,
+        "sidecarRebuildCount": 0,
+        "coldMutationPromotions": 0,
+        "hotOverflowTransitions": 0,
+        "labelDiskFallbackCount": 0,
+        "shadowParityMismatchCount": 0,
+        "shadowParityCheckCount": 0,
+        "transcriptGeneration": 0,
+        "reopen.sidecarEnabled": true,
+        "reopen.coldRetirementActive": true,
+        "reopen.sidecarIneligible": false,
+        "reopen.hotRegionBytes": 911732,
+        "reopen.metaDescriptorBytes": 17262109,
+        "reopen.totalAccountedBytes": 49075528,
+        "reopen.reservedBudgetBytes": 47251456,
+        "reopen.allocatedCacheBytes": 17261883,
+        "reopen.hotResidentBytes": 1824072,
+        "reopen.metadataResidentBytes": 226,
+        "reopen.sidecarFileBytes": 219155,
+        "reopen.lazyReopenAttempted": true,
+        "reopen.lazyReopenSucceeded": true,
+        "reopen.consecutiveBuildFailures": 0,
+        "reopen.parentArtifactEnabled": false,
+        "reopen.dictionaryArtifactEnabled": false,
+        "reopen.metadataDeltaDescriptorBytes": 0,
+        "reopen.coldIndexBytes": 217730,
+        "reopen.coldIndexBlockCacheBytes": 481580,
+        "reopen.coldEntryCacheBytes": 16779349,
+        "reopen.coldEntriesRetired": 0,
+        "reopen.coldEntriesReloaded": 16,
+        "reopen.rangeReadCount": 16,
+        "reopen.rangeReadGenerationMismatchCount": 0,
+        "reopen.sidecarRebuildCount": 0,
+        "reopen.coldMutationPromotions": 0,
+        "reopen.hotOverflowTransitions": 0,
+        "reopen.labelDiskFallbackCount": 0,
+        "reopen.shadowParityMismatchCount": 0,
+        "reopen.shadowParityCheckCount": 0,
+        "reopen.transcriptGeneration": 0
+      }
+    },
+    {
+      "operationClass": "captured-fork",
+      "gcStrategy": "pressure",
+      "secondaryArtifacts": "off",
+      "repetitions": 3,
+      "mode": "captured",
+      "sourceBytes": 1072693248,
+      "destinationBytes": 1072693326,
+      "outputToSourceRatio": 1.0000000727141707,
+      "phases": {
+        "fixtureGeneration": {
+          "elapsedMs": 240.60970800000004,
+          "cpu": {
+            "userMicros": 126967,
+            "systemMicros": 121385
+          }
+        },
+        "capture": {
+          "elapsedMs": 601.3087089999999,
+          "cpu": {
+            "userMicros": 632361,
+            "systemMicros": 91024
+          }
+        },
+        "fork": {
+          "elapsedMs": 2305.314125,
+          "cpu": {
+            "userMicros": 2134468,
+            "systemMicros": 373564
+          }
+        },
+        "closeFork": {
+          "elapsedMs": 1.1454589999998461,
+          "cpu": {
+            "userMicros": 777,
+            "systemMicros": 362
+          }
+        },
+        "reopen": {
+          "elapsedMs": 1314.493125,
+          "cpu": {
+            "userMicros": 1736650,
+            "systemMicros": 380662
+          }
+        },
+        "coldLookups": {
+          "elapsedMs": 21.93041699999958,
+          "cpu": {
+            "userMicros": 17387,
+            "systemMicros": 6451
+          }
+        },
+        "warmLookups": {
+          "elapsedMs": 0.44770799999969313,
+          "cpu": {
+            "userMicros": 511,
+            "systemMicros": 19
+          }
+        },
+        "buildContext": {
+          "elapsedMs": 0.20637499999975262,
+          "cpu": {
+            "userMicros": 264,
+            "systemMicros": 24
+          }
+        },
+        "closeReopened": {
+          "elapsedMs": 0.578417000000627,
+          "cpu": {
+            "userMicros": 149,
+            "systemMicros": 421
+          }
+        }
+      },
+      "phaseEvidence": {
+        "wholeFork": {
+          "elapsedMs": 2305.314125,
+          "cpu": {
+            "userMicros": 2134468,
+            "systemMicros": 373564
+          }
+        },
+        "preflightScan": null,
+        "copyScan": null,
+        "stagedWriterPublication": null,
+        "destinationFirstOpen": null,
+        "sourceRevalidation": null
+      },
+      "counters": {
+        "gcRequests": 0,
+        "gcElapsedMs": 0,
+        "bytesRead": 0,
+        "bytesWritten": 0,
+        "recordsParsed": 0,
+        "indexWriteCalls": 0,
+        "fsyncCount": 0
+      },
+      "throughput": {
+        "fixtureGenerationMiBPerSecond": 4251.69877185504,
+        "forkMiBPerSecond": 443.7573122491496
+      },
+      "latency": {
+        "coldLookupMs": {
+          "samples": [
+            1.3910419999992882,
+            1.1509169999999358,
+            1.0932499999998981,
+            1.309541999999965,
+            1.025166999999783,
+            1.1574170000003505,
+            1.2128339999999298,
+            1.2318749999994907,
+            1.2574589999994714,
+            1.3844579999995403,
+            1.2752499999996871,
+            2.166790999999648,
+            1.6373750000002474,
+            1.5418330000002243,
+            1.302625000000262,
+            1.3444159999999101
+          ],
+          "min": 1.025166999999783,
+          "median": 1.2752499999996871,
+          "p95": 2.166790999999648,
+          "max": 2.166790999999648
+        },
+        "warmLookupMs": {
+          "samples": [
+            0.018290999999408086,
+            0.002915999999459018,
+            0.0029170000007070485,
+            0.005874999999832653,
+            0.001999999999497959,
+            0.0024580000008427305,
+            0.0019579999998313724,
+            0.002375000000029104,
+            0.00220900000022084,
+            0.00204200000007404,
+            0.00258399999984249,
+            0.010750000000371074,
+            0.0031669999998484855,
+            0.008249999999861757,
+            0.003832999999758613,
+            0.0033750000002328306
+          ],
+          "min": 0.0019579999998313724,
+          "median": 0.002915999999459018,
+          "p95": 0.018290999999408086,
+          "max": 0.018290999999408086
         }
       },
       "memory": {
         "baseline": {
           "rssBytes": 179142656,
-          "heapUsedBytes": 19623511,
-          "heapTotalBytes": 18926592,
-          "externalBytes": 4725980,
+          "heapUsedBytes": 19657992,
+          "heapTotalBytes": 18832384,
+          "externalBytes": 4725714,
           "arrayBuffersBytes": 1158
         },
         "afterFixture": {
-          "rssBytes": 447332352,
-          "heapUsedBytes": 76286597,
-          "heapTotalBytes": 18926592,
-          "externalBytes": 4779902,
+          "rssBytes": 429178880,
+          "heapUsedBytes": 76279674,
+          "heapTotalBytes": 18832384,
+          "externalBytes": 4782079,
           "arrayBuffersBytes": 1158
         },
         "afterCapture": {
-          "rssBytes": 451870720,
-          "heapUsedBytes": 19793563,
-          "heapTotalBytes": 18927616,
-          "externalBytes": 4880283,
+          "rssBytes": 432324608,
+          "heapUsedBytes": 19785692,
+          "heapTotalBytes": 18849792,
+          "externalBytes": 4881980,
           "arrayBuffersBytes": 1158
         },
         "afterFork": {
-          "rssBytes": 530677760,
-          "heapUsedBytes": 22029533,
-          "heapTotalBytes": 19212288,
-          "externalBytes": 6849018,
+          "rssBytes": 511459328,
+          "heapUsedBytes": 22020073,
+          "heapTotalBytes": 19117056,
+          "externalBytes": 6849078,
           "arrayBuffersBytes": 912687
         },
         "afterForkClose": {
-          "rssBytes": 530857984,
-          "heapUsedBytes": 22029533,
-          "heapTotalBytes": 19212288,
-          "externalBytes": 6008395,
+          "rssBytes": 511672320,
+          "heapUsedBytes": 22020073,
+          "heapTotalBytes": 19117056,
+          "externalBytes": 6012039,
           "arrayBuffersBytes": 1158
         },
         "afterReopen": {
-          "rssBytes": 548470784,
-          "heapUsedBytes": 19841017,
-          "heapTotalBytes": 19195904,
-          "externalBytes": 5829984,
+          "rssBytes": 531054592,
+          "heapUsedBytes": 23548220,
+          "heapTotalBytes": 19252224,
+          "externalBytes": 8280223,
           "arrayBuffersBytes": 912687
         },
         "afterColdLookups": {
-          "rssBytes": 556040192,
-          "heapUsedBytes": 35858356,
-          "heapTotalBytes": 19687424,
-          "externalBytes": 21720938,
+          "rssBytes": 537739264,
+          "heapUsedBytes": 39770154,
+          "heapTotalBytes": 19825664,
+          "externalBytes": 24294211,
           "arrayBuffersBytes": 912687
         },
         "afterWarmLookups": {
-          "rssBytes": 556056576,
-          "heapUsedBytes": 35858356,
-          "heapTotalBytes": 19688448,
-          "externalBytes": 21772632,
+          "rssBytes": 537755648,
+          "heapUsedBytes": 39770154,
+          "heapTotalBytes": 19825664,
+          "externalBytes": 24295515,
           "arrayBuffersBytes": 912687
         },
         "afterContext": {
-          "rssBytes": 556105728,
-          "heapUsedBytes": 35858356,
-          "heapTotalBytes": 19704832,
-          "externalBytes": 21790771,
+          "rssBytes": 537772032,
+          "heapUsedBytes": 39770154,
+          "heapTotalBytes": 19842048,
+          "externalBytes": 24313654,
           "arrayBuffersBytes": 912687
         },
         "afterTeardown": {
-          "rssBytes": 556105728,
-          "heapUsedBytes": 17917245,
-          "heapTotalBytes": 19164160,
-          "externalBytes": 3984367,
+          "rssBytes": 537772032,
+          "heapUsedBytes": 21819951,
+          "heapTotalBytes": 19235840,
+          "externalBytes": 6549085,
           "arrayBuffersBytes": 1158
         },
-        "forkRssGrowthBytes": 78807040,
-        "reopenRssGrowthBytes": 17612800,
-        "lookupRssGrowthBytes": 7585792,
-        "teardownRssGrowthBytes": 376963072,
-        "maxRssBytes": 556105728
+        "forkRssGrowthBytes": 79134720,
+        "reopenRssGrowthBytes": 19382272,
+        "lookupRssGrowthBytes": 6701056,
+        "teardownRssGrowthBytes": 358629376,
+        "maxRssBytes": 537772032
       },
       "io": {
         "coldRangeReads": 16,
@@ -3136,11 +3136,11 @@
           "succeeded": true,
           "strategy": "pressure",
           "secondaryArtifactMode": "disabled",
-          "wallMs": 981.646625,
-          "cpuMs": 1071.929,
-          "gcRequests": 12,
-          "gcRequestCount": 12,
-          "gcElapsedMs": 49.719374,
+          "wallMs": 1072.01575,
+          "cpuMs": 1060.772,
+          "gcRequests": 11,
+          "gcRequestCount": 11,
+          "gcElapsedMs": 71.72975099999998,
           "bytesRead": 1138971422,
           "transcriptBytesRead": 1138753692,
           "bytesWritten": 218362,
@@ -3155,139 +3155,139 @@
           "indexWriteCalls": 1,
           "indexWriteBytes": 217730,
           "fsyncCount": 2,
-          "fsyncElapsedMs": 0.759958,
+          "fsyncElapsedMs": 0.72775,
           "phaseTelemetry": {
             "descriptorSecurityPreflight": {
-              "wallMs": 0.034,
-              "cpuMs": 0.035
+              "wallMs": 0.063,
+              "cpuMs": 0.192
             },
             "fsync": {
-              "wallMs": 0.765458,
-              "cpuMs": 0.744
+              "wallMs": 0.7332080000000001,
+              "cpuMs": 0.7010000000000001
             },
             "indexSerializationWrite": {
-              "wallMs": 4.977097,
+              "wallMs": 5.406778,
               "cpuMs": null
             },
             "semanticScan": {
-              "wallMs": 942.369083,
-              "cpuMs": 1033.551
+              "wallMs": 1032.44925,
+              "cpuMs": 1022.293
             },
             "dictionary": {
-              "wallMs": 0.002667,
+              "wallMs": 0.002458,
               "cpuMs": 0.003
             },
             "metadataDelta": {
-              "wallMs": 0.041625,
+              "wallMs": 0.040875,
               "cpuMs": 0.042
             },
             "parent": {
-              "wallMs": 0.01925,
-              "cpuMs": 0.019
+              "wallMs": 0.016542,
+              "cpuMs": 0.017
             },
             "indexTailWork": {
-              "wallMs": 31.750833,
-              "cpuMs": 32.422
+              "wallMs": 31.002125,
+              "cpuMs": 31.618
             },
             "commitClassification": {
-              "wallMs": 1.283375,
-              "cpuMs": 1.269
+              "wallMs": 1.352292,
+              "cpuMs": 1.339
             },
             "hotSuffixContext": {
-              "wallMs": 5.365042,
-              "cpuMs": 3.412
+              "wallMs": 6.086709,
+              "cpuMs": 3.908
             }
           },
           "phaseEvidence": {
             "descriptorSecurityPreflight": {
-              "wallMs": 0.034,
-              "cpuMs": 0.035
+              "wallMs": 0.063,
+              "cpuMs": 0.192
             },
             "fsync": {
-              "wallMs": 0.765458,
-              "cpuMs": 0.744
+              "wallMs": 0.7332080000000001,
+              "cpuMs": 0.7010000000000001
             },
             "indexSerializationWrite": {
-              "wallMs": 4.977097,
+              "wallMs": 5.406778,
               "cpuMs": null
             },
             "semanticScan": {
-              "wallMs": 942.369083,
-              "cpuMs": 1033.551
+              "wallMs": 1032.44925,
+              "cpuMs": 1022.293
             },
             "dictionary": {
-              "wallMs": 0.002667,
+              "wallMs": 0.002458,
               "cpuMs": 0.003
             },
             "metadataDelta": {
-              "wallMs": 0.041625,
+              "wallMs": 0.040875,
               "cpuMs": 0.042
             },
             "parent": {
-              "wallMs": 0.01925,
-              "cpuMs": 0.019
+              "wallMs": 0.016542,
+              "cpuMs": 0.017
             },
             "indexTailWork": {
-              "wallMs": 31.750833,
-              "cpuMs": 32.422
+              "wallMs": 31.002125,
+              "cpuMs": 31.618
             },
             "commitClassification": {
-              "wallMs": 1.283375,
-              "cpuMs": 1.269
+              "wallMs": 1.352292,
+              "cpuMs": 1.339
             },
             "hotSuffixContext": {
-              "wallMs": 5.365042,
-              "cpuMs": 3.412
+              "wallMs": 6.086709,
+              "cpuMs": 3.908
             }
           },
           "phaseTimings": {
             "descriptorSecurityPreflight": {
-              "wallMs": 0.034,
-              "cpuMs": 0.035
+              "wallMs": 0.063,
+              "cpuMs": 0.192
             },
             "fsync": {
-              "wallMs": 0.765458,
-              "cpuMs": 0.744
+              "wallMs": 0.7332080000000001,
+              "cpuMs": 0.7010000000000001
             },
             "indexSerializationWrite": {
-              "wallMs": 4.977097,
+              "wallMs": 5.406778,
               "cpuMs": null
             },
             "semanticScan": {
-              "wallMs": 942.369083,
-              "cpuMs": 1033.551
+              "wallMs": 1032.44925,
+              "cpuMs": 1022.293
             },
             "dictionary": {
-              "wallMs": 0.002667,
+              "wallMs": 0.002458,
               "cpuMs": 0.003
             },
             "metadataDelta": {
-              "wallMs": 0.041625,
+              "wallMs": 0.040875,
               "cpuMs": 0.042
             },
             "parent": {
-              "wallMs": 0.01925,
-              "cpuMs": 0.019
+              "wallMs": 0.016542,
+              "cpuMs": 0.017
             },
             "indexTailWork": {
-              "wallMs": 31.750833,
-              "cpuMs": 32.422
+              "wallMs": 31.002125,
+              "cpuMs": 31.618
             },
             "commitClassification": {
-              "wallMs": 1.283375,
-              "cpuMs": 1.269
+              "wallMs": 1.352292,
+              "cpuMs": 1.339
             },
             "hotSuffixContext": {
-              "wallMs": 5.365042,
-              "cpuMs": 3.412
+              "wallMs": 6.086709,
+              "cpuMs": 3.908
             }
           },
           "dictionaryArtifactEnabled": false,
           "parentArtifactEnabled": false,
-          "dictionaryBuildElapsedMs": 0.002667,
-          "parentBuildElapsedMs": 0.01925,
-          "flatIndexElapsedMs": 4.977097,
-          "pressureBaselineBytes": 56224724
+          "dictionaryBuildElapsedMs": 0.002458,
+          "parentBuildElapsedMs": 0.016542,
+          "flatIndexElapsedMs": 5.406778,
+          "pressureBaselineBytes": 56222702
         },
         "lastReopenTransition": {
           "kind": "rebuild",
@@ -3462,90 +3462,90 @@
   "summary": {
     "direct": {
       "forkElapsedMs": {
-        "min": 2904.822958,
-        "median": 3055.60675,
-        "p95": 3311.8015,
-        "max": 3311.8015
+        "min": 2921.109208,
+        "median": 2996.60575,
+        "p95": 3055.8370409999998,
+        "max": 3055.8370409999998
       },
       "forkCpuMicros": {
-        "min": 3326319,
-        "median": 3331543,
-        "p95": 3363649,
-        "max": 3363649
+        "min": 3293740,
+        "median": 3301172,
+        "p95": 3326457,
+        "max": 3326457
       },
       "forkRssGrowthBytes": {
-        "min": 82231296,
-        "median": 82870272,
-        "p95": 83296256,
-        "max": 83296256
+        "min": 82886656,
+        "median": 83148800,
+        "p95": 83181568,
+        "max": 83181568
       },
       "reopenElapsedMs": {
-        "min": 1299.612792,
-        "median": 1301.774542,
-        "p95": 1403.3266250000001,
-        "max": 1403.3266250000001
+        "min": 1319.320334,
+        "median": 1331.8860409999998,
+        "p95": 1682.6757499999994,
+        "max": 1682.6757499999994
       },
       "coldLookupP95Ms": {
-        "min": 1.9014159999996991,
-        "median": 2.2299160000002303,
-        "p95": 2.9534999999996217,
-        "max": 2.9534999999996217
+        "min": 1.9271669999998267,
+        "median": 2.370708999999806,
+        "p95": 2.3956660000003467,
+        "max": 2.3956660000003467
       },
       "warmLookupP95Ms": {
-        "min": 0.017665999999735504,
-        "median": 0.019500000000334694,
-        "p95": 0.020708999999442312,
-        "max": 0.020708999999442312
+        "min": 0.010333000000173342,
+        "median": 0.016499999999723514,
+        "p95": 0.021999999999934516,
+        "max": 0.021999999999934516
       },
       "teardownRssGrowthBytes": {
-        "min": 338526208,
-        "median": 340361216,
-        "p95": 357777408,
-        "max": 357777408
+        "min": 357810176,
+        "median": 359219200,
+        "p95": 375914496,
+        "max": 375914496
       }
     },
     "captured": {
       "forkElapsedMs": {
-        "min": 2215.3475419999995,
-        "median": 2224.5582080000004,
-        "p95": 2374.925625,
-        "max": 2374.925625
+        "min": 2246.330625,
+        "median": 2295.244709,
+        "p95": 2305.314125,
+        "max": 2305.314125
       },
       "forkCpuMicros": {
-        "min": 2522509,
-        "median": 2532356,
-        "p95": 2587201,
-        "max": 2587201
+        "min": 2508032,
+        "median": 2540236,
+        "p95": 2547262,
+        "max": 2547262
       },
       "forkRssGrowthBytes": {
-        "min": 78610432,
-        "median": 78807040,
-        "p95": 79233024,
-        "max": 79233024
+        "min": 78725120,
+        "median": 79134720,
+        "p95": 79511552,
+        "max": 79511552
       },
       "reopenElapsedMs": {
-        "min": 1269.3606249999993,
-        "median": 1286.9190420000004,
-        "p95": 1359.2039170000003,
-        "max": 1359.2039170000003
+        "min": 1314.493125,
+        "median": 1372.906,
+        "p95": 1383.6886249999998,
+        "max": 1383.6886249999998
       },
       "coldLookupP95Ms": {
-        "min": 2.0493329999999332,
-        "median": 2.3282090000002427,
-        "p95": 2.3341249999994034,
-        "max": 2.3341249999994034
+        "min": 1.9424580000004426,
+        "median": 2.166790999999648,
+        "p95": 2.3659590000006574,
+        "max": 2.3659590000006574
       },
       "warmLookupP95Ms": {
-        "min": 0.014500000000225555,
-        "median": 0.01954200000000128,
-        "p95": 0.027624999999716238,
-        "max": 0.027624999999716238
+        "min": 0.018290999999408086,
+        "median": 0.021749999999883585,
+        "p95": 0.02591599999959726,
+        "max": 0.02591599999959726
       },
       "teardownRssGrowthBytes": {
-        "min": 357335040,
-        "median": 374669312,
-        "p95": 376963072,
-        "max": 376963072
+        "min": 339345408,
+        "median": 358629376,
+        "p95": 360529920,
+        "max": 360529920
       }
     }
   }
