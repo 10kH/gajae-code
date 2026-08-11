@@ -7,6 +7,8 @@ export class MemoryConversationStoreFs implements ConversationStoreFs {
 	failWrite = false;
 	failRename = false;
 	failLockSync = false;
+	failLockWrite = false;
+	failLockLink = false;
 	failDocumentSync = false;
 	failDirectorySync = false;
 
@@ -50,6 +52,10 @@ export class MemoryConversationStoreFs implements ConversationStoreFs {
 
 	async link(from: string, to: string): Promise<void> {
 		this.calls.push(`link:${from}:${to}`);
+		if (from.endsWith(".pending") && this.failLockLink) {
+			throw Object.assign(new Error("lock link failed"), { code: "EPERM" });
+		}
+
 		if (this.files.has(to)) {
 			throw Object.assign(new Error(`EEXIST: ${to}`), { code: "EEXIST" });
 		}
@@ -74,6 +80,7 @@ export class MemoryConversationStoreFs implements ConversationStoreFs {
 		}
 		const isDirectory = !this.files.has(file);
 		const writeFile = async (data: string, _encoding: "utf8"): Promise<void> => {
+			if (file.endsWith(".pending") && this.failLockWrite) throw new Error("lock write failed");
 			this.files.set(file, data);
 		};
 

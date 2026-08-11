@@ -47,12 +47,15 @@ export class ConversationLockTimeoutError extends Error {
 interface ConversationStoreLock {
 	pid: number;
 	incarnation: string;
+	isolateId?: string;
 	timestamp: number;
 	/** Uniquely identifies one acquire; lets a release prove it owns the lock file. */
 	nonce?: string;
 }
 
 const nodeFs: ConversationStoreFs = fs;
+/** Unique to this module evaluation, including one Bun worker isolate. */
+const processIsolateId = randomUUID();
 
 /**
  * Lock files this process currently holds or is acquiring, across every store.
@@ -266,6 +269,7 @@ export class ConversationStore<T extends ConversationRecord> {
 			!isConversationStoreLock(parsed) ||
 			parsed.pid !== expected.pid ||
 			parsed.incarnation !== expected.incarnation ||
+			parsed.isolateId !== expected.isolateId ||
 			parsed.timestamp !== expected.timestamp ||
 			parsed.nonce !== expected.nonce
 		)
@@ -303,12 +307,20 @@ export class ConversationStore<T extends ConversationRecord> {
 	 */
 	async #reclaimSameProcessLeak(lockFile: string): Promise<boolean> {
 		const expected = await this.#readLock(lockFile);
-		if (!expected || expected.pid !== this.#pid || heldLockFiles.has(lockFile)) return false;
+		if (
+			!expected ||
+			expected.pid !== this.#pid ||
+			expected.isolateId !== processIsolateId ||
+			heldLockFiles.has(lockFile)
+		)
+			return false;
+
 		const reclaimFile = `${lockFile}.reclaim`;
 		const reclaimLock = await this.#acquireReclaimLock(reclaimFile);
 		if (!reclaimLock) return false;
 		try {
-			if (heldLockFiles.has(lockFile)) return false;
+			if (expected.pid !== this.#pid || expected.isolateId !== processIsolateId || heldLockFiles.has(lockFile))
+				return false;
 			return await this.#unlinkOwnedLock(lockFile, expected);
 		} catch {
 			return false;
@@ -381,6 +393,7 @@ export class ConversationStore<T extends ConversationRecord> {
 			lock = {
 				pid: this.#pid,
 				incarnation: this.#pidIncarnation(this.#pid) ?? "unavailable",
+				isolateId: processIsolateId,
 				timestamp: this.#clock(),
 				nonce: randomUUID(),
 			};
@@ -531,6 +544,7 @@ function isConversationStoreLock(value: unknown): value is ConversationStoreLock
 		Number.isSafeInteger(value.pid) &&
 		value.pid > 0 &&
 		typeof value.incarnation === "string" &&
+		(value.isolateId === undefined || typeof value.isolateId === "string") &&
 		typeof value.timestamp === "number"
 	);
 }

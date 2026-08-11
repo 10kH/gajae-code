@@ -21,6 +21,31 @@ function record(generation: number, state: TestConversation["state"] = "creating
 	return { generation, state, seenEventIds: [] };
 }
 
+class LockMetadataFs extends MemoryConversationStoreFs {
+	lockMetadata?: string;
+
+	override async open(file: string, flags: string) {
+		const handle = await super.open(file, flags);
+		if (flags !== "wx" || !file.endsWith(".pending")) return handle;
+		return {
+			...handle,
+			writeFile: async (data: string, encoding: "utf8") => {
+				this.lockMetadata = data.trim();
+				await handle.writeFile(data, encoding);
+			},
+		};
+	}
+}
+
+async function captureLockMetadata(): Promise<string> {
+	const fs = new LockMetadataFs();
+	const store = new ConversationStore<TestConversation>({ agentDir: "/capture", kind: "discord", fs });
+	await store.write("capture", undefined, record(1));
+	const metadata = fs.lockMetadata;
+	if (!metadata) throw new Error("lock metadata was not captured");
+	return metadata;
+}
+
 describe("ConversationStore", () => {
 	test("creates the transport store under the SDK daemon path and permits one concurrent creator", async () => {
 		const fs = new MemoryConversationStoreFs();
@@ -53,7 +78,7 @@ describe("ConversationStore", () => {
 		expect([...fs.files.keys()].some(file => file.endsWith(".pending"))).toBe(false);
 		expect(fs.files.has(lockFile)).toBe(false);
 	});
-	test("cleans the pending alias when published-lock cleanup fails", async () => {
+	test("cleans the pending alias but keeps the primary marker when its unlink fails", async () => {
 		const primaryError = new Error("primary lock unlink failed");
 		const pendingError = new Error("pending lock unlink failed");
 		class CleanupFailingFs extends MemoryConversationStoreFs {
@@ -78,8 +103,42 @@ describe("ConversationStore", () => {
 
 		await expect(store.write("mapping", undefined, record(1))).rejects.toBe(primaryError);
 		expect(fs.pendingUnlinkAttempts).toBe(2);
+		expect(fs.primaryUnlinkAttempts).toBe(1);
 		expect([...fs.files.keys()].some(file => file.endsWith(".pending"))).toBe(false);
 		expect(fs.files.has(lockFile)).toBe(true);
+	});
+	test("cleans the pending lock when metadata write fails", async () => {
+		const fs = new MemoryConversationStoreFs();
+		fs.failLockWrite = true;
+		const store = new ConversationStore<TestConversation>({ agentDir: "/agent", kind: "discord", fs });
+		const lockFile = `${store.filePath}.lock`;
+
+		await expect(store.write("mapping", undefined, record(1))).rejects.toThrow("lock write failed");
+		expect([...fs.files.keys()].some(file => file.endsWith(".pending"))).toBe(false);
+		expect(fs.files.has(lockFile)).toBe(false);
+	});
+
+	test("cleans the pending lock when metadata sync fails", async () => {
+		const fs = new MemoryConversationStoreFs();
+		fs.failLockSync = true;
+		const store = new ConversationStore<TestConversation>({ agentDir: "/agent", kind: "discord", fs });
+		const lockFile = `${store.filePath}.lock`;
+
+		await expect(store.write("mapping", undefined, record(1))).rejects.toThrow("sync failed");
+		expect([...fs.files.keys()].some(file => file.endsWith(".pending"))).toBe(false);
+		expect(fs.files.has(lockFile)).toBe(false);
+	});
+
+	test("cleans the pending lock when hard-link publication fails without EEXIST", async () => {
+		const fs = new MemoryConversationStoreFs();
+		fs.failLockLink = true;
+		const store = new ConversationStore<TestConversation>({ agentDir: "/agent", kind: "discord", fs });
+		const lockFile = `${store.filePath}.lock`;
+
+		await expect(store.write("mapping", undefined, record(1))).rejects.toMatchObject({ code: "EPERM" });
+		expect(fs.calls.some(call => call.startsWith(`link:${lockFile}.`) && call.endsWith(`:${lockFile}`))).toBe(true);
+		expect([...fs.files.keys()].some(file => file.endsWith(".pending"))).toBe(false);
+		expect(fs.files.has(lockFile)).toBe(false);
 	});
 
 	test("keeps the primary lock path absent until complete metadata is synced", async () => {
@@ -128,6 +187,7 @@ describe("ConversationStore", () => {
 				expect(JSON.parse(metadata!.trim())).toEqual({
 					pid: 101,
 					incarnation: "unavailable",
+					isolateId: expect.any(String),
 					timestamp: 1,
 					nonce: expect.any(String),
 				});
@@ -333,12 +393,59 @@ describe("ConversationStore", () => {
 		// well-formed lock whose recorded pid is still this (live) process. The
 		// recorded owner being alive makes it unstale, so only the evidence-based
 		// same-process leak heal can recover it without raising the timeout.
-		const leaked = JSON.stringify({ pid: process.pid, incarnation: processIncarnation(process.pid), timestamp: 1 });
+		const leaked = await captureLockMetadata();
 		fs.files.set(`${store.filePath}.lock`, leaked);
 		const started = performance.now();
 		await expect(store.write("mapping", undefined, record(1))).resolves.toBe(true);
 		expect(performance.now() - started).toBeLessThan(900);
 		expect(fs.files.has(`${store.filePath}.lock`)).toBe(false);
+	});
+	test("does not reclaim a matching-PID lock from a different worker isolate", async () => {
+		const fs = new MemoryConversationStoreFs();
+		const store = new ConversationStore<TestConversation>({
+			agentDir: "/agent",
+			kind: "discord",
+			fs,
+			pid: process.pid,
+			pidAlive: () => true,
+			lockTimeoutMs: 0,
+		});
+		const lockFile = `${store.filePath}.lock`;
+		const foreign = JSON.stringify({
+			pid: process.pid,
+			incarnation: processIncarnation(process.pid),
+			isolateId: "different-worker-isolate",
+			timestamp: 1,
+			nonce: "foreign-lock",
+		});
+		fs.files.set(lockFile, foreign);
+
+		await expect(store.write("mapping", undefined, record(1))).rejects.toBeInstanceOf(ConversationLockTimeoutError);
+		expect(fs.files.get(lockFile)).toBe(foreign);
+		expect(fs.calls).not.toContain(`unlink:${lockFile}`);
+	});
+
+	test("does not reclaim a legacy same-PID lock without isolate identity", async () => {
+		const fs = new MemoryConversationStoreFs();
+		const store = new ConversationStore<TestConversation>({
+			agentDir: "/agent",
+			kind: "discord",
+			fs,
+			pid: process.pid,
+			pidAlive: () => true,
+			lockTimeoutMs: 0,
+		});
+		const lockFile = `${store.filePath}.lock`;
+		const legacy = JSON.stringify({
+			pid: process.pid,
+			incarnation: processIncarnation(process.pid),
+			timestamp: 1,
+		});
+		fs.files.set(lockFile, legacy);
+
+		await expect(store.write("mapping", undefined, record(1))).rejects.toBeInstanceOf(ConversationLockTimeoutError);
+		expect(fs.files.get(lockFile)).toBe(legacy);
+		expect(fs.calls).not.toContain(`unlink:${lockFile}`);
 	});
 	test("removes its lock when closing the lock handle fails", async () => {
 		class CloseFailingLockFs extends MemoryConversationStoreFs {
@@ -363,8 +470,11 @@ describe("ConversationStore", () => {
 	});
 	test("times out instead of spinning when a leaked lock cannot be unlinked", async () => {
 		class UnlinkFailingFs extends MemoryConversationStoreFs {
+			primaryUnlinkAttempts = 0;
+
 			override async unlink(file: string) {
 				if (file.endsWith("conversations.json.lock")) {
+					this.primaryUnlinkAttempts++;
 					throw Object.assign(new Error("lock unlink failed"), { code: "EPERM" });
 				}
 				await super.unlink(file);
@@ -379,11 +489,10 @@ describe("ConversationStore", () => {
 			pidAlive: () => true,
 			lockTimeoutMs: 0,
 		});
-		fs.files.set(
-			`${store.filePath}.lock`,
-			JSON.stringify({ pid: process.pid, incarnation: processIncarnation(process.pid), timestamp: 1 }),
-		);
+		fs.files.set(`${store.filePath}.lock`, await captureLockMetadata());
 		await expect(store.write("mapping", undefined, record(1))).rejects.toBeInstanceOf(ConversationLockTimeoutError);
+		expect(fs.primaryUnlinkAttempts).toBe(1);
+		expect(fs.files.has(`${store.filePath}.lock`)).toBe(true);
 	});
 
 	test("serializes concurrent healing before either waiter can acquire a replacement lock", async () => {
@@ -415,10 +524,7 @@ describe("ConversationStore", () => {
 			pid: process.pid,
 			pidAlive: () => true,
 		});
-		fs.files.set(
-			`${first.filePath}.lock`,
-			JSON.stringify({ pid: process.pid, incarnation: processIncarnation(process.pid), timestamp: 1 }),
-		);
+		fs.files.set(`${first.filePath}.lock`, await captureLockMetadata());
 		const firstWrite = first.write("one", undefined, record(1));
 		await enteredUnlink.promise;
 		const secondWrite = second.write("two", undefined, record(1));
@@ -481,7 +587,13 @@ describe("ConversationStore", () => {
 			pidIncarnation: pid => (pid === 303 ? "linux:102" : "linux:101"),
 			lockTimeoutMs: 0,
 		});
-		const foreign = JSON.stringify({ pid: 303, incarnation: "linux:102", timestamp: 1 });
+		const foreign = JSON.stringify({
+			pid: 303,
+			incarnation: "linux:102",
+			isolateId: "foreign-process-isolate",
+			timestamp: 1,
+			nonce: "foreign-lock",
+		});
 		fs.files.set(`${store.filePath}.lock`, foreign);
 		await expect(store.write("mapping", undefined, record(1))).rejects.toBeInstanceOf(ConversationLockTimeoutError);
 		expect(fs.files.get(`${store.filePath}.lock`)).toBe(foreign);
@@ -516,6 +628,7 @@ describe("ConversationStore", () => {
 		expect(capturedLock).toBeDefined();
 		const lock = JSON.parse(capturedLock!);
 		expect(lock.pid).toBe(process.pid);
+		expect(lock.isolateId).toEqual(expect.any(String));
 		// The incarnation must be canonical (not a locale-dependent lstart string).
 		expect(isProcessIncarnation(lock.incarnation)).toBe(true);
 		expect(lock.incarnation).toBe(processIncarnation(process.pid));
