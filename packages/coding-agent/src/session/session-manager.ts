@@ -16025,7 +16025,6 @@ export class SessionManager {
 		const activateColdAfterAppend =
 			!this.#coldSidecarActive() &&
 			!coldSidecarWasActive &&
-			(!activeRuntime || activeRuntime.sidecarIneligible) &&
 			(this.#sessionMemoryMode === "auto" || this.#sessionMemoryMode === "enabled") &&
 			this.#effectiveSessionMemoryMode() === "enabled";
 		if (
