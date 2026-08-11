@@ -11439,7 +11439,7 @@ export class AgentSession {
 			currentAutoScope !== undefined &&
 			this.#temporaryProviderSessionScopes.at(-1) === currentAutoScope;
 		if (replaceAutoScope && currentAutoScope) {
-			this.#restoreTopTemporaryProviderSessionScope();
+			await this.#restoreTopTemporaryProviderSessionScope();
 		}
 		const scope = isTemporaryOperation
 			? (suppliedScope ??
