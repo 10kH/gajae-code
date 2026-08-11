@@ -488,6 +488,14 @@ describe("TopicRegistry", () => {
 		expect(() => parseTopicRegistryState(stateWith({ disconnectGraceExpiresAt: "soon" }))).toThrow(
 			"malformed Telegram topic state",
 		);
+		// The archive-family tolerance is scoped: a stray grace deadline on any
+		// non-archive state is still rejected, never interpreted as healthy.
+		expect(() => parseTopicRegistryState(stateWith({ authorityState: "active" }))).toThrow(
+			"malformed Telegram topic state",
+		);
+		expect(() => parseTopicRegistryState(stateWith({ authorityState: "delete_pending" }))).toThrow(
+			"malformed Telegram topic state",
+		);
 	});
 
 	test("restores the exact disconnect grace deadline after archive publication fails", async () => {
