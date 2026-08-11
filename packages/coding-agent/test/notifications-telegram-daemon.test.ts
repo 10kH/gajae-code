@@ -11948,6 +11948,7 @@ test("strict daemon blocks an ordinary endpoint discovered under an orchestratio
 	);
 
 	const bot = new FakeBotApi();
+	let now = Date.now();
 	const daemon = new TelegramNotificationDaemon({
 		settings: s,
 		ownerId: "owner",
@@ -11956,6 +11957,7 @@ test("strict daemon blocks an ordinary endpoint discovered under an orchestratio
 		botApi: bot,
 		WebSocketImpl: FakeWs as any,
 		requireTelegramTopicEligibility: true,
+		now: () => now,
 	});
 	await daemon.loadTopics();
 	await daemon.scanRoots();
@@ -11986,6 +11988,10 @@ test("strict daemon blocks an ordinary endpoint discovered under an orchestratio
 	const connectionCount = FakeWs.instances.length;
 	await daemon.scanRoots();
 	expect(FakeWs.instances).toHaveLength(connectionCount);
+	expect((await readTopicAuthorityState(agentDir)).topics.ordinary?.authorityState).toBe("disconnect_grace");
+	now += 60_001;
+	await daemon.scanRoots();
+	expect((await readTopicAuthorityState(agentDir)).topics.ordinary?.authorityState).toBe("inactive");
 });
 test("strict daemon admits an orchestrated endpoint through replay", async () => {
 	FakeWs.instances = [];

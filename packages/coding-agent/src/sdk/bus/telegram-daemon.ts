@@ -6237,13 +6237,13 @@ export class TelegramNotificationDaemon {
 						continue;
 					}
 
-					if (this.topics.clearOrphaned(sessionId)) await this.persistTopics();
 					const endpointKey = endpointGenerationKey(endpoint.url, endpoint.token);
 					if (this.rejectedTopicEndpointKeys.get(sessionId) === endpointKey) {
 						await this.observeOrphanedTopic(sessionId);
 						continue;
 					}
 					this.rejectedTopicEndpointKeys.delete(sessionId);
+					if (this.topics.clearOrphaned(sessionId)) await this.persistTopics();
 					const connected = this.sessions.get(sessionId);
 					if (connected) {
 						const recoveryRejectedAfterArchive =
