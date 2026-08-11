@@ -323,6 +323,18 @@ function canonicalJson(value: unknown): string {
 		.join(",")}}`;
 }
 
+function credentialFreeLifecycleResponse(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(credentialFreeLifecycleResponse);
+	if (value === null || typeof value !== "object") return value;
+	const output: Record<string, unknown> = {};
+	for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+		if (key === "token" || key === "url" || (key === "endpoint" && nested !== null && typeof nested === "object"))
+			continue;
+		output[key] = credentialFreeLifecycleResponse(nested);
+	}
+	return output;
+}
+
 type EndpointAuthority = { endpointGeneration?: number; endpointIncarnation?: string };
 function endpointIncarnation(
 	record: Pick<IndexedSession, "endpointGeneration" | "endpointMtimeMs" | "pid">,
@@ -1171,8 +1183,8 @@ export class Broker {
 		await this.index.refresh();
 		const record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
 		if (!record) return error("resource_gone", "session is not indexed");
-		if (!record.live || !matchesEndpointAuthority(record, authority))
-			return error("endpoint_stale", "session endpoint is stale");
+		if (!matchesEndpointAuthority(record, authority)) return error("endpoint_stale", "session endpoint is stale");
+		if (!record.live) return error("resource_gone", "session endpoint record is gone");
 		return this.#readEndpoint(record, authority);
 	}
 	async #readEndpoint(record: IndexedSession, authority: EndpointAuthority): Promise<BrokerResponse> {
@@ -1236,7 +1248,10 @@ export class Broker {
 			offset: 0,
 			expiresAt: Date.now() + SESSION_LIST_CURSOR_TTL_MS,
 		};
-		const sessions = snapshot.sessions.slice(snapshot.offset, snapshot.offset + snapshot.limit);
+		const sessions = snapshot.sessions.slice(snapshot.offset, snapshot.offset + snapshot.limit).map(session => {
+			const { lifecycleRequestId: _lifecycleRequestId, ...publicSession } = session;
+			return publicSession;
+		});
 		const offset = snapshot.offset + sessions.length;
 		if (offset >= snapshot.sessions.length && typeof cursor === "string") this.#sessionListCursors.delete(cursor);
 		const continuationCursor =
@@ -1382,12 +1397,29 @@ export class Broker {
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;
 				const cleanup = cleanupFromResponse(replay) ?? reconstructedDeleteCleanup;
-				if (!cleanup) return replay;
+				if (!cleanup) {
+					if (
+						replay.ok &&
+						(operation === "session.create" || operation === "session.fork" || operation === "session.resume") &&
+						typeof (replay.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
+					) {
+						const endpoint = await this.#endpoint({
+							sessionId: (replay.result as { sessionId: string }).sessionId,
+						});
+						if (endpoint.ok)
+							return {
+								ok: true,
+								result: { ...(replay.result as Record<string, unknown>), endpoint: endpoint.result },
+							};
+					}
+					return replay;
+				}
 				const outcome = await executeLifecycle(this, operation, input, identity, cleanup);
 				const response = outcome.response;
+				const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
 				await this.ledger.transition(identity, lifecycleResponseState(response), {
-					response,
-					responseDigest: createHash("sha256").update(canonicalJson(response)).digest("hex"),
+					response: storedResponse,
+					responseDigest: createHash("sha256").update(canonicalJson(storedResponse)).digest("hex"),
 					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
 					...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
 				});
@@ -1402,10 +1434,11 @@ export class Broker {
 					return replay ?? error("terminal_uncertain", "prior lifecycle operation outcome is uncertain");
 				const outcome = await executeLifecycle(this, operation, input, identity, cleanup);
 				const response = outcome.response;
+				const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
 				await this.ledger.transition(identity, lifecycleResponseState(response), {
 					...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
-					response,
-					responseDigest: createHash("sha256").update(canonicalJson(response)).digest("hex"),
+					response: storedResponse,
+					responseDigest: createHash("sha256").update(canonicalJson(storedResponse)).digest("hex"),
 					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
 					...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
 				});
@@ -1414,14 +1447,15 @@ export class Broker {
 			if (begun.kind === "in_progress") return error("broker_restarting", "lifecycle operation is in progress");
 			const outcome = await executeLifecycle(this, operation, input, identity);
 			const response = outcome.response;
+			const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
 			await this.ledger.transition(identity, lifecycleResponseState(response), {
 				...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
 				resultSessionId:
 					response.ok && typeof (response.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
 						? (response.result as { sessionId: string }).sessionId
 						: undefined,
-				response,
-				responseDigest: createHash("sha256").update(canonicalJson(response)).digest("hex"),
+				response: storedResponse,
+				responseDigest: createHash("sha256").update(canonicalJson(storedResponse)).digest("hex"),
 				...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
 				...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
 			});
@@ -1429,7 +1463,7 @@ export class Broker {
 			const persisted = await this.ledger.readTerminal(identity, requestHash);
 			const persistenceVerified =
 				persisted !== undefined &&
-				canonicalJson(persisted.response) === canonicalJson(response) &&
+				canonicalJson(persisted.response) === canonicalJson(storedResponse) &&
 				canonicalJson(persisted.durableEffects) === canonicalJson(outcome.durableEffects) &&
 				canonicalJson(persisted.startupFailure) === canonicalJson(outcome.startupFailure);
 			if (!persistenceVerified) {

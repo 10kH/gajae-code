@@ -8,10 +8,13 @@
 - The macOS computer batch controller is now warning-free under the workspace's strict Clippy configuration, with infallible result construction represented directly instead of wrapped in redundant `Result` values.
 - macOS Terminal.app Meta-wrapped escape sequences such as Option+Arrow are now recognized by the native key matcher and parser.
 
+### Removed
+
+- Removed the obsolete `NotificationControlServer` N-API surface. Session lifecycle mutations now enter the coding-agent SDK Broker path instead of a provider-owned native control endpoint.
+
 ## [0.12.21] - 2026-08-09
 
 ## [0.12.20] - 2026-08-09
-
 ## [0.12.19] - 2026-08-08
 
 ## [0.12.18] - 2026-08-08

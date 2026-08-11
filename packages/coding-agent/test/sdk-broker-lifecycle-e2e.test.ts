@@ -13,6 +13,7 @@ import { Broker, type BrokerCleanupEvidence, type BrokerResponse } from "../src/
 import { brokerOwnerForTest, startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
 import {
+	canonicalDeleteLocatorPath,
 	deriveLifecycleDeadlines,
 	executeLifecycle,
 	hasValidLifecycleDeadlines,
@@ -126,6 +127,13 @@ function canonicalJson(value: unknown): string {
 		.sort()
 		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
 		.join(",")}}`;
+}
+function deleteRequestHash(request: Record<string, unknown>): string {
+	const cwd = canonicalDeleteLocatorPath(String(request.cwd));
+	const input = { ...request, cwd, stateRoot: path.join(cwd, ".gjc", "state") };
+	return createHash("sha256")
+		.update(canonicalJson({ operation: "session.delete", input }))
+		.digest("hex");
 }
 
 async function snapshotDeleteSurface(
@@ -1606,9 +1614,7 @@ test("broker replays an unmarked base metadata cleanup receipt and rejects a rep
 		const [stat, bytes] = await Promise.all([fs.stat(markerPath, { bigint: true }), fs.readFile(markerPath)]);
 		const target = createHash("sha256").update(canonicalJson({ sessionId })).digest("hex");
 		const identity = await deriveIdempotencyIdentity(agentDir, "session.delete", key, target);
-		const requestHash = createHash("sha256")
-			.update(canonicalJson({ operation: "session.delete", input: request }))
-			.digest("hex");
+		const requestHash = deleteRequestHash(request);
 		const ledger = await new LifecycleLedger(agentDir).open();
 		await ledger.begin(identity, requestHash);
 		await ledger.transition(identity, "effect_started", {
@@ -1789,9 +1795,7 @@ test("broker rejects a corrupt completed lifecycle cleanup receipt when its read
 		]);
 		const target = createHash("sha256").update(canonicalJson({ sessionId })).digest("hex");
 		const identity = await deriveIdempotencyIdentity(agentDir, "session.delete", key, target);
-		const requestHash = createHash("sha256")
-			.update(canonicalJson({ operation: "session.delete", input: request }))
-			.digest("hex");
+		const requestHash = deleteRequestHash(request);
 		const ledger = await new LifecycleLedger(agentDir).open();
 		await ledger.begin(identity, requestHash);
 		await ledger.transition(identity, "effect_started", {
@@ -2004,12 +2008,7 @@ test("broker rejects duplicate lifecycle marker replay authorities without unlin
 			createHash("sha256").update(canonicalJson({ sessionId })).digest("hex"),
 		);
 		const ledger = await new LifecycleLedger(agentDir).open();
-		await ledger.begin(
-			identity,
-			createHash("sha256")
-				.update(canonicalJson({ operation: "session.delete", input: request }))
-				.digest("hex"),
-		);
+		await ledger.begin(identity, deleteRequestHash(request));
 		const cleanupFile = (plannedPath: string) => ({
 			path: markerPath,
 			identity: {
@@ -2076,12 +2075,7 @@ test("broker rejects a ready-only lifecycle replay entry without marker authorit
 			createHash("sha256").update(canonicalJson({ sessionId })).digest("hex"),
 		);
 		const ledger = await new LifecycleLedger(agentDir).open();
-		await ledger.begin(
-			identity,
-			createHash("sha256")
-				.update(canonicalJson({ operation: "session.delete", input: request }))
-				.digest("hex"),
-		);
+		await ledger.begin(identity, deleteRequestHash(request));
 		await ledger.transition(identity, "effect_started", {
 			intendedSessionId: sessionId,
 			response: {
@@ -2156,12 +2150,7 @@ test("broker fails closed when a lifecycle ready sibling is swapped after marker
 			createHash("sha256").update(canonicalJson({ sessionId })).digest("hex"),
 		);
 		const ledger = await new LifecycleLedger(agentDir).open();
-		await ledger.begin(
-			identity,
-			createHash("sha256")
-				.update(canonicalJson({ operation: "session.delete", input: request }))
-				.digest("hex"),
-		);
+		await ledger.begin(identity, deleteRequestHash(request));
 		await ledger.transition(identity, "effect_started", {
 			intendedSessionId: sessionId,
 			response: {
@@ -2785,11 +2774,9 @@ test("broker refuses a stale registered PID when no durable effect marker proves
 		});
 		expect(await broker.handleRequest("session.close", { sessionId: "stale" }, "stale-close")).toEqual({
 			ok: false,
-			error: {
-				code: "close_refused",
-				message: "Session endpoint is unavailable and its durable process identity could not be verified.",
-			},
+			error: { code: "endpoint_stale", message: "session endpoint is stale" },
 		});
+
 		expect(process.pid).toBeGreaterThan(0);
 	} finally {
 		await broker.stop();
@@ -2825,8 +2812,9 @@ test("broker closes a live host whose workspace state root is gone using its reg
 			{
 				ok: false,
 				error: {
-					code: "close_refused",
-					message: "Session endpoint is unavailable and its durable process identity could not be verified.",
+					code: "terminal_uncertain",
+					message:
+						"Session did not close after SIGTERM and its durable process identity could not be verified for SIGKILL.",
 				},
 			},
 		);
@@ -2903,6 +2891,91 @@ test("broker refuses same-generation close authority from a prior endpoint incar
 	}
 });
 
+test("dead endpoint cleanup preserves a successor rebound between capture and native unlink", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-dead-endpoint-rebind-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "dead-endpoint-rebind";
+	const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+	const successorPath = path.join(stateRoot, "sdk", `${sessionId}.successor.json`);
+	const markerPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`);
+
+	const child = Bun.spawn(["/bin/sleep", "30"]);
+	const broker = new Broker({ agentDir });
+	const originalExactUnlink = native.exactUnlink.bind(native);
+	let intercepted = false;
+	const originalHandleRequest = broker.handleRequest.bind(broker);
+
+	try {
+		const childIncarnation = await waitFor(
+			async () => processIncarnation(child.pid) ?? undefined,
+			"child incarnation",
+		);
+
+		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+		await fs.writeFile(
+			endpointPath,
+			JSON.stringify({ sessionId, pid: child.pid, url: "ws://127.0.0.1:1", token: "retired-token" }),
+		);
+		await fs.utimes(endpointPath, 1_700_000_000, 1_700_000_000);
+		await fs.writeFile(
+			markerPath,
+			canonicalJson({ pid: child.pid, effectMarker: "dead-endpoint-rebind-request", incarnation: childIncarnation }),
+		);
+
+		const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+		await broker.start();
+		await broker.index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { repo: root, stateRoot },
+			endpointGeneration: 1,
+			pid: child.pid,
+			endpointMtimeMs,
+			lifecycleRequestId: "dead-endpoint-rebind-request",
+			processIncarnation: childIncarnation,
+		});
+		broker.handleRequest = async (operation, input, idempotencyKey) => {
+			if (operation === "session.get_endpoint" && input.sessionId === sessionId)
+				return { ok: false, error: { code: "resource_gone", message: "session endpoint record is gone" } };
+			return originalHandleRequest(operation, input, idempotencyKey);
+		};
+
+		child.kill("SIGKILL");
+		await child.exited;
+		await fs.writeFile(
+			successorPath,
+			JSON.stringify({ sessionId, pid: process.pid, url: "ws://127.0.0.1:2", token: "successor-token" }),
+		);
+		const unlinkSpy = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+			if (pathname === endpointPath && !intercepted) {
+				intercepted = true;
+				syncFs.renameSync(successorPath, endpointPath);
+			}
+			return originalExactUnlink(pathname, identity);
+		});
+		try {
+			await expect(
+				broker.handleRequest("session.close", { sessionId }, "dead-endpoint-rebind-close"),
+			).resolves.toMatchObject({
+				ok: false,
+				error: { code: "terminal_uncertain" },
+			});
+		} finally {
+			unlinkSpy.mockRestore();
+		}
+		expect(intercepted).toBe(true);
+		expect(await fs.readFile(endpointPath, "utf8")).toContain("successor-token");
+		const registration = broker.index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		expect(registration).toMatchObject({ endpointGeneration: 1, pid: child.pid });
+		broker.handleRequest = originalHandleRequest;
+	} finally {
+		if (child.exitCode === null) child.kill("SIGKILL");
+		await child.exited;
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 20_000);
 test("broker rebinds implicit close only for a matching non-empty lifecycle request id", async () => {
 	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-close-rebind-"));
 	const stateRoot = path.join(agentDir, "state");
@@ -2910,10 +2983,12 @@ test("broker rebinds implicit close only for a matching non-empty lifecycle requ
 	const originalHandleRequest = broker.handleRequest.bind(broker);
 	try {
 		await broker.start();
-		for (const [label, initialRequestId, replacementRequestId, expectedCode] of [
-			["same", "request-a", "request-a", "close_refused"],
-			["absent", undefined, undefined, "endpoint_stale"],
-			["different", "request-a", "request-b", "endpoint_stale"],
+		const processIdentity = await incarnation(process.pid);
+		for (const [label, initialRequestId, replacementRequestId, replacementIncarnation, expectedCode] of [
+			["same", "request-a", "request-a", processIdentity, "close_refused"],
+			["absent", undefined, undefined, processIdentity, "endpoint_stale"],
+			["different", "request-a", "request-b", processIdentity, "endpoint_stale"],
+			["successor", "request-a", "request-a", `${processIdentity}:successor`, "endpoint_stale"],
 		] as const) {
 			const sessionId = `close-rebind-${label}`;
 			const locator = { repo: "fixture", stateRoot };
@@ -2924,6 +2999,7 @@ test("broker rebinds implicit close only for a matching non-empty lifecycle requ
 				endpointGeneration: 1,
 				pid: process.pid,
 				endpointMtimeMs: 1,
+				processIncarnation: processIdentity,
 				...(initialRequestId ? { lifecycleRequestId: initialRequestId } : {}),
 			});
 			await broker.index.append({
@@ -2945,6 +3021,7 @@ test("broker rebinds implicit close only for a matching non-empty lifecycle requ
 							endpointGeneration: 2,
 							pid: process.pid,
 							endpointMtimeMs: 2,
+							processIncarnation: replacementIncarnation,
 							...(replacementRequestId ? { lifecycleRequestId: replacementRequestId } : {}),
 						});
 						return { ok: false, error: { code: "endpoint_stale", message: "session endpoint is stale" } };
@@ -3606,17 +3683,17 @@ test("ACP, MCP, and daemon global requests bootstrap a broker with zero sessions
 		expect(await acp.listSessions({})).toEqual({ sessions: [] });
 		expect(await readSdkBrokerDiscovery(agentDirs[0])).not.toBeNull();
 
-		const mcp = createSdkMcpServer({ repo: path.join(root, "mcp"), agentDir: agentDirs[1] });
+		const mcp = createSdkMcpServer({ agentDir: agentDirs[1] });
 		expect(await mcp.callTool("gjc_session_global", { operation: "session.list" })).toMatchObject({
 			ok: true,
 			result: { sessions: [] },
 		});
 		expect(await readSdkBrokerDiscovery(agentDirs[1])).not.toBeNull();
+		await mcp.close();
 
 		const output: unknown[] = [];
-		await runSdkSessionCli(
-			{ action: "global", operation: "session.list", agentDir: agentDirs[2], repo: path.join(root, "daemon") },
-			value => output.push(value),
+		await runSdkSessionCli({ action: "global", operation: "session.list", agentDir: agentDirs[2] }, value =>
+			output.push(value),
 		);
 		expect(output).toMatchObject([{ ok: true, result: { sessions: [] } }]);
 		expect(await readSdkBrokerDiscovery(agentDirs[2])).not.toBeNull();

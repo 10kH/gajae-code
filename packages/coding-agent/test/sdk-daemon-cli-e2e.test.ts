@@ -96,6 +96,10 @@ describe("SDK daemon session CLI", () => {
 				},
 				message(socket, message) {
 					const frame = JSON.parse(String(message)) as Record<string, unknown>;
+					if (frame.type === "event_replay") {
+						socket.send(JSON.stringify({ type: "event_replay_result", id: frame.id, events: [] }));
+						return;
+					}
 					if (frame.type === "control_request") receivedControl = frame;
 					if (frame.type === "query_request" && frame.query === "session.metadata") {
 						socket.send(
@@ -139,10 +143,11 @@ describe("SDK daemon session CLI", () => {
 		await fs.rm(root, { recursive: true, force: true });
 	});
 
-	it("AD-L-G02: uses the broker and per-session WebSocket endpoints without leaking ordinary credentials", async () => {
+	it("uses the broker and Router-owned session attachments without leaking credentials", async () => {
 		const list = await runCli(root, agentDir, ["list"]);
 		expect(list.exitCode).toBe(0);
 		expect(JSON.parse(list.stdout)).toMatchObject({ result: { sessions: [{ sessionId: "live" }] } });
+		const connectionsAfterList = endpointConnections;
 
 		const control = await runCli(root, agentDir, [
 			"control",
@@ -155,7 +160,7 @@ describe("SDK daemon session CLI", () => {
 		]);
 		expect(control.exitCode).toBe(1);
 		expect(receivedControl).toBeUndefined();
-		expect(endpointConnections).toBe(0);
+		expect(endpointConnections).toBe(connectionsAfterList);
 		expect(JSON.parse(control.stdout)).toMatchObject({ error: { code: "unknown_operation" } });
 		expect(control.stderr).not.toContain("session-token");
 
@@ -187,12 +192,9 @@ describe("SDK daemon session CLI", () => {
 			"--json-input",
 			'{"sessionId":"live"}',
 			"--show-endpoint-credential",
-			"--yes",
 		]);
-		expect(disclosed.exitCode).toBe(0);
-		expect(disclosed.stdout.trim().split("\n")).toHaveLength(1);
-		expect(JSON.parse(disclosed.stdout)).toMatchObject({ ok: true, result: { token: "session-token" } });
-		expect(disclosed.stderr).not.toContain("session-token");
+		expect(disclosed.exitCode).not.toBe(0);
+		expect(`${disclosed.stdout}\n${disclosed.stderr}`).not.toContain("session-token");
 	}, 60_000);
 
 	it("drains daemon CLI session.list continuation pages before returning sessions", async () => {
@@ -276,22 +278,22 @@ describe("SDK daemon session CLI", () => {
 		expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "invalid_input" } });
 	}, 60_000);
 
-	it("preserves corrupt endpoint discovery errors without connecting", async () => {
+	it("fails closed on corrupt endpoint records without exposing discovery details", async () => {
 		await fs.writeFile(path.join(stateRoot, "sdk", "live.json"), "not-json");
 		const result = await runCli(root, agentDir, ["query", "live", "--query", "session.metadata"]);
 		expect(result.exitCode).toBe(1);
-		expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "discovery_error" } });
+		expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "session_unavailable" } });
 		expect(endpointConnections).toBe(0);
 	}, 60_000);
 
-	it("preserves unreadable endpoint discovery errors without connecting", async () => {
+	it("fails closed on unreadable endpoint records without exposing discovery details", async () => {
 		if (process.platform === "win32") return;
 		const endpoint = path.join(stateRoot, "sdk", "live.json");
 		await fs.chmod(endpoint, 0o000);
 		try {
 			const result = await runCli(root, agentDir, ["query", "live", "--query", "session.metadata"]);
 			expect(result.exitCode).toBe(1);
-			expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "discovery_error" } });
+			expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "session_unavailable" } });
 			expect(endpointConnections).toBe(0);
 		} finally {
 			await fs.chmod(endpoint, 0o600);

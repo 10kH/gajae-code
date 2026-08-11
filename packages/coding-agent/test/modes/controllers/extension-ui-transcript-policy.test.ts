@@ -120,25 +120,16 @@ function createFixture(initialSessionId = "session-a"): Fixture {
 }
 
 describe("ExtensionUiController transcript rebuild policy", () => {
-	it("resets identity when a hook-runner switch loads a different session id from the same path", async () => {
-		const fixture = createFixture();
-		fixture.setNextSessionId("session-b");
-		fixture.controller.initializeHookRunner({} as ExtensionUIContext, false);
-
-		await fixture.getCommandActions().switchSession("/tmp/project/session.jsonl");
-
-		expect(fixture.resetIrcSidebarSession).toHaveBeenCalledTimes(1);
-		expect(fixture.rebuildInitialMessages).toHaveBeenCalledWith("replace-identity");
-	});
-
-	it("reconciles a true same-session switch in the foreground extension path", async () => {
+	it("rejects extension-owned session switches through the Broker lifecycle boundary", async () => {
 		const fixture = createFixture();
 		await fixture.controller.initHooksAndCustomTools();
 
-		await fixture.getCommandActions().switchSession("/tmp/project/session.jsonl");
-
+		await expect(fixture.getCommandActions().switchSession("/tmp/project/session.jsonl")).rejects.toMatchObject({
+			code: "operation_prohibited",
+		});
+		expect(fixture.ctx.session.switchSession).not.toHaveBeenCalled();
 		expect(fixture.resetIrcSidebarSession).not.toHaveBeenCalled();
-		expect(fixture.rebuildInitialMessages).toHaveBeenCalledWith("reconcile-same-transcript");
+		expect(fixture.rebuildInitialMessages).not.toHaveBeenCalled();
 	});
 	it("resets identity when hook-runner reload replaces the logical session", async () => {
 		const fixture = createFixture();

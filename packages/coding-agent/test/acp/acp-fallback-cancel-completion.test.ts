@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setDefaultTimeout, spyOn } from "bun:test";
 import * as path from "node:path";
 import {
 	type AgentSideConnection,
@@ -15,9 +15,17 @@ import {
 } from "@agentclientprotocol/sdk";
 import { AcpAgent, acpRequestFailure } from "@gajae-code/coding-agent/modes/acp/acp-agent";
 import { createAcpConnection } from "@gajae-code/coding-agent/modes/acp/acp-mode";
-import { writeBrokerDiscovery } from "@gajae-code/coding-agent/sdk/broker/discovery";
 import { TempDir } from "@gajae-code/utils";
 import { AcpSdkAdapterError } from "../../src/sdk/acp";
+import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
+import {
+	type ExactSessionAuthorityFixture,
+	type ExactSessionAuthorityOptions,
+	prepareExactSessionAuthority,
+	publishExactSessionAuthority,
+} from "../helpers/sdk-exact-session-authority";
+
+setDefaultTimeout(60_000);
 
 type TestSocket = { send(message: string): void };
 class TestClient implements Client {
@@ -35,7 +43,7 @@ class TestClient implements Client {
 async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
 	return await Promise.race([
 		promise,
-		Bun.sleep(2_000).then(() => {
+		Bun.sleep(45_000).then(() => {
 			throw new Error(`Timed out waiting for ${label}`);
 		}),
 	]);
@@ -88,13 +96,14 @@ describe("ACP production cancellation completion", () => {
 						return;
 					}
 					if (frame.type === "broker_request") {
-						const result =
-							frame.operation === "session.create"
-								? {
-										sessionId: "cancel-session",
-										endpoint: { url: `ws://127.0.0.1:${server!.port}`, token },
-									}
-								: {};
+						if (frame.operation === "session.create") {
+							socket.send(
+								JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: authority }),
+							);
+							setTimeout(() => void publishExactSessionAuthority(authorityOptions, authority), 10);
+							return;
+						}
+						const result = {};
 						socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result }));
 						return;
 					}
@@ -149,6 +158,14 @@ describe("ACP production cancellation completion", () => {
 		});
 		const port = server.port;
 		if (port === undefined) throw new Error("Expected ACP fixture server port");
+		const authorityOptions: ExactSessionAuthorityOptions = {
+			agentDir,
+			cwd,
+			sessionId: "cancel-session",
+			url: `ws://127.0.0.1:${port}`,
+			token,
+		};
+		const authority: ExactSessionAuthorityFixture = await prepareExactSessionAuthority(authorityOptions);
 
 		await writeBrokerDiscovery(agentDir, {
 			version: 1,

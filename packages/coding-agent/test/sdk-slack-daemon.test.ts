@@ -6,10 +6,11 @@ import { ChatDeliveryError } from "../src/sdk/bus/chat-daemon-runtime";
 import { ChatEffectJournal } from "../src/sdk/bus/chat-effect-journal";
 import { ConversationStore } from "../src/sdk/bus/conversation-store";
 import type { SlackConversation } from "../src/sdk/bus/slack-conversation";
-import { type SlackEndpoint, SlackEndpointBindingError, SlackNotificationDaemon } from "../src/sdk/bus/slack-daemon";
+import { SlackEndpointBindingError, SlackNotificationDaemon } from "../src/sdk/bus/slack-daemon";
 import { SlackProviderError } from "../src/sdk/bus/slack-live-provider";
 import { SlackProvider, type SlackSocketEnvelope } from "../src/sdk/bus/slack-provider";
 import { SdkClientError } from "../src/sdk/client/client";
+import { type SessionAttachment, SessionRouterError } from "../src/sdk/router";
 
 class FakeSlack {
 	handler: ((envelope: SlackSocketEnvelope) => void | Promise<void>) | undefined;
@@ -24,6 +25,7 @@ class FakeSlack {
 	onAck?: (envelopeId: string) => Promise<void>;
 	postGate?: Promise<void>;
 	startGate?: Promise<void>;
+	stopGate?: Promise<void>;
 	startUntilStopped = false;
 	postStarts = 0;
 	#postStartWaiters: Array<{ count: number; resolve: () => void }> = [];
@@ -47,6 +49,7 @@ class FakeSlack {
 	async stop(): Promise<void> {
 		this.stops++;
 		this.#startStopGate.resolve();
+		await this.stopGate;
 	}
 
 	async ack(envelopeId: string): Promise<void> {
@@ -118,8 +121,14 @@ class FakeSlack {
 	}
 }
 
-function endpoint(sessionId: string, generation = 1): SlackEndpoint {
-	return { sessionId, url: "ws://localhost", token: "not-persisted", path: "", generation };
+function endpoint(sessionId: string, generation = 1): SessionAttachment {
+	return {
+		authorityId: `${sessionId}:${generation}`,
+		sessionId,
+		generation,
+		isCurrent: () => true,
+		send: () => undefined,
+	};
 }
 
 type LoadBarrier = {
@@ -152,13 +161,14 @@ async function withDaemon(
 		daemon: SlackNotificationDaemon,
 		fake: FakeSlack,
 		injected: Array<Record<string, unknown>>,
-		setEndpointGeneration: (generation: number) => void,
+		setEndpointGeneration: (generation: number | undefined) => void,
 		agentDir: string,
 	) => Promise<void>,
 	options: {
 		onCommand?: (sessionId: string, content: string) => Promise<boolean>;
-		createClient?: (injected: Array<Record<string, unknown>>) => { send(frame: Record<string, unknown>): void };
+		attachmentSend?: (injected: Array<Record<string, unknown>>) => { send(frame: Record<string, unknown>): unknown };
 		authorizeActor?: ((actorId: string) => boolean | Promise<boolean>) | false;
+		now?: () => number;
 	} = {},
 ): Promise<void> {
 	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-daemon-"));
@@ -166,7 +176,8 @@ async function withDaemon(
 	try {
 		const fake = new FakeSlack();
 		const injected: Array<Record<string, unknown>> = [];
-		let endpointGeneration = 1;
+		let endpointGeneration: number | undefined = 1;
+		const attachment = options.attachmentSend?.(injected);
 		let id = 0;
 		daemon = new SlackNotificationDaemon({
 			agentDir,
@@ -175,13 +186,17 @@ async function withDaemon(
 			channelId: "C1",
 			provider: new SlackProvider(fake),
 			randomId: () => `client-id-${++id}`,
-			createClient: () =>
-				options.createClient?.(injected) ?? {
-					send(frame: Record<string, unknown>) {
+			resolveAttachment: async sessionId => {
+				if (endpointGeneration === undefined) return null;
+				return {
+					...endpoint(sessionId, endpointGeneration),
+					send: (frame: Record<string, unknown>) => {
+						if (attachment) return attachment.send(frame);
 						injected.push(frame);
 					},
-				},
-			resolveEndpoint: async sessionId => endpoint(sessionId, endpointGeneration),
+				};
+			},
+			now: options.now,
 			onCommand: options.onCommand,
 			...(options.authorizeActor === false
 				? {}
@@ -320,8 +335,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(fake),
 				randomId: () => "root-client-id",
-				createClient: () => ({ send(_frame: Record<string, unknown>) {} }),
-				resolveEndpoint: async (sessionId: string) => endpoint(sessionId),
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
 			};
 			const [first, second] = await Promise.all([
 				new SlackNotificationDaemon(options).postRoot("session", "root"),
@@ -345,8 +359,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(fake),
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async (sessionId: string) => endpoint(sessionId),
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
 				now: () => now,
 				publicationLeaseMs: 10,
 			};
@@ -397,8 +410,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(fake),
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async (sessionId: string) => endpoint(sessionId),
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
 				publicationLeaseMs: 15,
 			};
 			const first = new SlackNotificationDaemon({
@@ -461,9 +473,8 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(fake),
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async (sessionId: string) => endpoint(sessionId),
-				publicationLeaseMs: 15,
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
+				publicationLeaseMs: 500,
 			};
 			const root = new SlackNotificationDaemon({ ...base, randomId: () => "root", publicationOwnerId: "root" });
 			await root.postRoot("session", "root");
@@ -486,7 +497,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			const firstLease = await first.store.read(key);
 			if (!firstLease) throw new Error("Slack action lease was not persisted");
 			let renewedLease = firstLease;
-			for (let attempt = 0; attempt < 20 && renewedLease.generation === firstLease.generation; attempt++) {
+			for (let attempt = 0; attempt < 80 && renewedLease.generation === firstLease.generation; attempt++) {
 				await Bun.sleep(25);
 				renewedLease = (await first.store.read(key)) ?? renewedLease;
 			}
@@ -554,8 +565,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(fake),
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async (sessionId: string) => endpoint(sessionId),
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
 				publicationLeaseMs: 1_000,
 			};
 			const root = new SlackNotificationDaemon({
@@ -597,6 +607,42 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			const replacements = fake.posts.filter(post => post.text === "replacement root");
 			expect(replacements).toHaveLength(1);
 			expect(replacements[0]?.threadTs).toBeUndefined();
+		});
+	});
+
+	it("posts the close marker after Router attachment revocation", async () => {
+		await withDaemon(async (daemon, fake, _injected, setEndpointGeneration) => {
+			await daemon.postRoot("session", "root");
+			setEndpointGeneration(undefined);
+			expect(await daemon.close("session")).toBe(true);
+			expect(fake.posts.map(post => post.text)).toEqual(["root", "Session closed."]);
+		});
+	});
+
+	it("clears an exact terminally rejected cleanup before successor attachment", async () => {
+		await withDaemon(async (daemon, fake) => {
+			await daemon.postRoot("session", "root");
+			fake.failPost = true;
+			await expect(daemon.close("session", undefined, 1)).rejects.toThrow("Slack rate limited");
+			expect((await daemon.findSession("session", true))?.record.cleanupEffectId).toContain(
+				"close-marker-cleanup:session:",
+			);
+			fake.failPost = false;
+			await daemon.recoverCleanup("session", 1);
+			const recovered = (await daemon.findSession("session", true))?.record;
+			expect(recovered?.state).toBe("active");
+			expect(recovered?.cleanupEffectId).toBeUndefined();
+		});
+	});
+
+	it("rejects a delayed cleanup callback for a successor generation", async () => {
+		await withDaemon(async (daemon, fake, _injected, setEndpointGeneration) => {
+			await daemon.postRoot("session", "root");
+			setEndpointGeneration(2);
+			await daemon.resume("session", "successor", 2);
+			const posts = fake.posts.length;
+			expect(await daemon.close("session", undefined, 1)).toBe(false);
+			expect(fake.posts).toHaveLength(posts);
 		});
 	});
 
@@ -760,8 +806,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(fake),
 				store,
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async sessionId => endpoint(sessionId, generation),
+				resolveAttachment: async sessionId => endpoint(sessionId, generation),
 			});
 			await daemon.postRoot("session", "generation one", 1);
 			generation = 2;
@@ -820,8 +865,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				store,
 				publicationOwnerId,
 				randomId: () => `client-${++id}`,
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async (sessionId: string) => endpoint(sessionId, generation),
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId, generation),
 			});
 			const initial = new SlackNotificationDaemon(options(new BlockingSlackStore(agentDir, barrier), "initial"));
 			await initial.postRoot("session", "generation one", 1);
@@ -892,8 +936,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(fake),
 				randomId: () => "root-client",
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async (sessionId: string) => endpoint(sessionId),
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
 			};
 			const first = new SlackNotificationDaemon(options);
 			const posted = await first.postRoot("session", "root");
@@ -935,8 +978,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(fake),
 				randomId: () => `client-${++id}`,
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async (sessionId: string) => endpoint(sessionId),
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
 			};
 			const first = new SlackNotificationDaemon(options);
 			const root = await first.postRoot("session", "root");
@@ -983,8 +1025,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(fake),
 				randomId: () => `client-${++id}`,
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async (sessionId: string) => endpoint(sessionId),
+				resolveAttachment: async (sessionId: string) => endpoint(sessionId),
 				authorizeActor: (actorId: string) => actorId === "U1",
 			};
 			const first = new SlackNotificationDaemon(options);
@@ -1024,7 +1065,10 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			};
 			restarted = new SlackNotificationDaemon({
 				...options,
-				createClient: () => ({ send: frame => injected.push(frame) }),
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					send: (frame: Record<string, unknown>) => injected.push(frame),
+				}),
 			});
 			await restarted.start();
 			expect(fake.acks).toContain("early");
@@ -1152,6 +1196,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 					threadTs: root.rootTs,
 					text: "recovery before start",
 					clientMsgId: "recovery-before-start",
+					attachmentAuthorityId: "session:1",
 				},
 			});
 			const starting = daemon.start();
@@ -1206,6 +1251,192 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		});
 	});
 
+	it("bounds stop when a tracked /sdk command never settles", async () => {
+		let stopping = false;
+		let nowCalls = 0;
+		const commandStarted = Promise.withResolvers<void>();
+		await withDaemon(
+			async (daemon, fake) => {
+				await daemon.postRoot("session", "root");
+				await daemon.start();
+				const handler = fake.handler;
+				if (!handler) throw new Error("Slack Socket Mode handler was not installed");
+				void handler(
+					messageEnvelope("never-settles", "never-settles-event", "1.1", {
+						text: "/sdk hi",
+					}),
+				);
+				await commandStarted.promise;
+				stopping = true;
+				await daemon.stop();
+				expect(fake.stops).toBe(1);
+				nowCalls = 0;
+			},
+			{
+				now: () => (stopping ? (nowCalls++ === 0 ? 0 : 5_001) : 0),
+				onCommand: async () => {
+					commandStarted.resolve();
+					return await new Promise<boolean>(() => {});
+				},
+			},
+		);
+	});
+
+	it("bounds a provider stop that never settles", async () => {
+		let stopping = false;
+		let nowCalls = 0;
+		await withDaemon(
+			async (daemon, fake) => {
+				fake.stopGate = new Promise<void>(() => {});
+				await daemon.start();
+				stopping = true;
+				await daemon.stop();
+				expect(fake.stops).toBe(1);
+				nowCalls = 0;
+			},
+			{ now: () => (stopping ? (nowCalls++ === 0 ? 0 : 5_001) : 0) },
+		);
+	});
+
+	it("bounds a start predecessor that never settles", async () => {
+		let stopping = false;
+		let nowCalls = 0;
+		await withDaemon(
+			async (daemon, fake) => {
+				fake.startGate = new Promise<void>(() => {});
+				void daemon.start();
+				await fake.waitForStartCount(1);
+				stopping = true;
+				await daemon.stop();
+				expect(fake.stops).toBe(1);
+				nowCalls = 0;
+			},
+			{ now: () => (stopping ? (nowCalls++ === 0 ? 0 : 5_001) : 0) },
+		);
+	});
+
+	it("does not let a detached startup clear a restarted daemon", async () => {
+		let boundedStop = false;
+		let nowCalls = 0;
+		const oldStartGate = Promise.withResolvers<void>();
+		await withDaemon(
+			async (daemon, fake) => {
+				fake.startGate = oldStartGate.promise;
+				const oldStart = daemon.start();
+				await fake.waitForStartCount(1);
+				boundedStop = true;
+				await daemon.stop();
+				boundedStop = false;
+				fake.startGate = undefined;
+				await daemon.start();
+				expect(fake.startCalls).toBe(2);
+				await daemon.stop();
+				expect(fake.stops).toBe(2);
+				await daemon.start();
+				expect(fake.startCalls).toBe(3);
+				oldStartGate.resolve();
+				await oldStart;
+				expect(fake.stops).toBe(2);
+				await daemon.stop();
+				expect(fake.stops).toBe(3);
+				nowCalls = 0;
+			},
+			{ now: () => (boundedStop ? (nowCalls++ === 0 ? 0 : 5_001) : 0) },
+		);
+	});
+
+	it("fences tracked outbound notification work that races stop", async () => {
+		let stopping = false;
+		let nowCalls = 0;
+		const findStarted = Promise.withResolvers<void>();
+		const releaseFind = Promise.withResolvers<void>();
+		await withDaemon(
+			async (daemon, fake, _injected, _setEndpointGeneration, agentDir) => {
+				await daemon.postRoot("session", "root");
+				fake.onFind = async () => {
+					findStarted.resolve();
+					await releaseFind.promise;
+				};
+				const posting = daemon.notify("session", "late notification");
+				await findStarted.promise;
+				stopping = true;
+				await daemon.stop();
+				releaseFind.resolve();
+				await expect(posting).rejects.toThrow("shutdown");
+				expect(fake.posts.map(post => post.text)).toEqual(["root"]);
+				const effect = (await new ChatEffectJournal({ agentDir, transport: "slack" }).list()).find(candidate =>
+					candidate.id.startsWith("notification:"),
+				);
+				expect(effect).toMatchObject({ state: "uncertain", receipt: { status: "shutdown_timeout" } });
+				nowCalls = 0;
+			},
+			{ now: () => (stopping ? (nowCalls++ === 0 ? 0 : 5_001) : 0) },
+		);
+	});
+
+	it("fences tracked close-marker work that races stop", async () => {
+		let stopping = false;
+		let nowCalls = 0;
+		const findStarted = Promise.withResolvers<void>();
+		const releaseFind = Promise.withResolvers<void>();
+		await withDaemon(
+			async (daemon, fake, _injected, _setEndpointGeneration, agentDir) => {
+				await daemon.postRoot("session", "root");
+				fake.onFind = async () => {
+					findStarted.resolve();
+					await releaseFind.promise;
+				};
+				const closing = daemon.close("session");
+				await findStarted.promise;
+				stopping = true;
+				await daemon.stop();
+				releaseFind.resolve();
+				await expect(closing).rejects.toThrow("shutdown");
+				expect(fake.posts.map(post => post.text)).toEqual(["root"]);
+				const effect = (await new ChatEffectJournal({ agentDir, transport: "slack" }).list()).find(candidate =>
+					candidate.id.startsWith("close-marker"),
+				);
+				expect(effect).toMatchObject({ state: "uncertain", receipt: { status: "shutdown_timeout" } });
+				nowCalls = 0;
+			},
+			{ now: () => (stopping ? (nowCalls++ === 0 ? 0 : 5_001) : 0) },
+		);
+	});
+
+	it("does not let a cleanup close overwrite a successor mapping", async () => {
+		const postGate = Promise.withResolvers<void>();
+		await withDaemon(async (daemon, fake, _injected, setEndpointGeneration) => {
+			const root = await daemon.postRoot("session", "root");
+			setEndpointGeneration(undefined);
+			fake.postGate = postGate.promise;
+			const closing = daemon.close("session");
+			await fake.waitForPostStartCount(2);
+			const key = "T1:C1:intent:session";
+			await daemon.store.transact(key, current =>
+				current
+					? {
+							...current,
+							state: "active",
+							rootTs: "successor-root",
+							clientMsgId: "successor-client",
+							endpointGeneration: 2,
+							updatedAt: current.updatedAt + 1,
+							generation: current.generation + 1,
+						}
+					: current,
+			);
+			postGate.resolve();
+			expect(await closing).toBe(false);
+			expect(await daemon.store.read(key)).toMatchObject({
+				state: "active",
+				rootTs: "successor-root",
+				clientMsgId: "successor-client",
+				endpointGeneration: 2,
+			});
+			expect(fake.posts).toContainEqual(expect.objectContaining({ threadTs: root.rootTs, text: "Session closed." }));
+		});
+	});
+
 	it("suppresses a generation-N provider effect after close and generation-N+1 resume", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-stale-provider-effect-"));
 		try {
@@ -1217,8 +1448,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(fake),
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async sessionId => endpoint(sessionId, generation),
+				resolveAttachment: async sessionId => endpoint(sessionId, generation),
 			});
 			const original = await daemon.postRoot("session", "root", 1);
 			await new ChatEffectJournal({ agentDir, transport: "slack" }).enqueue({
@@ -1300,8 +1530,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(firstProvider),
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
+				resolveAttachment: async sessionId => endpoint(sessionId),
 				authorizeActor: actorId => actorId === "U1",
 				onCommand: async () => {
 					throw new Error("command must not run before ACK");
@@ -1327,8 +1556,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(new FakeSlack()),
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
+				resolveAttachment: async sessionId => endpoint(sessionId),
 				authorizeActor: actorId => actorId === "U1",
 				onCommand: async (_sessionId, _content, _endpoint, idempotencyKey) => {
 					keys.push(idempotencyKey);
@@ -1401,8 +1629,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(firstFake),
 				randomId: () => "client-id",
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
+				resolveAttachment: async sessionId => endpoint(sessionId),
 			});
 			const root = await first.postRoot("session", "root");
 			await first.notify("session", "question", "restored-action");
@@ -1414,12 +1641,10 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(new FakeSlack()),
 				randomId: () => "client-id",
-				createClient: () => ({
-					send(frame) {
-						injected.push(frame);
-					},
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					send: (frame: Record<string, unknown>) => injected.push(frame),
 				}),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
 				authorizeActor: actorId => actorId === "U1",
 			});
 			expect(
@@ -1484,11 +1709,52 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				expect(injected).toHaveLength(1);
 			},
 			{
-				createClient: injected => ({
+				attachmentSend: injected => ({
 					send(frame) {
 						if (fail) {
 							fail = false;
 							throw new SdkClientError("connection_closed", "SDK unavailable before send");
+						}
+						injected.push(frame);
+					},
+				}),
+			},
+		);
+	});
+
+	it("awaits an async stale attachment rejection before journaling inbound success", async () => {
+		let sendAttempts = 0;
+		await withDaemon(
+			async (daemon, _fake, injected, _setEndpointGeneration, agentDir) => {
+				const root = await daemon.postRoot("session", "root");
+				await daemon.notify("session", "question", "action-1");
+				const inbound = messageEnvelope("first", "event-1", root.rootTs!, { clientMsgId: "interaction-1" });
+				const idempotencyKey = "slack:T1:C1:1.1:U1:event-1:interaction-1";
+				const effectId = "inbound:T1:C1:1.1:U1:event-1:interaction-1";
+				const journal = new ChatEffectJournal({ agentDir, transport: "slack" });
+
+				expect(await daemon.handleEnvelope(inbound)).toBe(false);
+				expect(await journal.read(effectId)).toMatchObject({
+					state: "accepted",
+					receipt: { status: "accepted" },
+				});
+				expect(injected).toEqual([]);
+
+				expect(await daemon.handleEnvelope({ ...inbound, envelope_id: "redelivery" })).toBe(true);
+				expect(sendAttempts).toBe(2);
+				expect(injected).toEqual([expect.objectContaining({ idempotencyKey })]);
+				expect(await journal.read(effectId)).toMatchObject({
+					state: "terminal",
+					receipt: { status: "sent" },
+				});
+			},
+			{
+				attachmentSend: injected => ({
+					async send(frame) {
+						sendAttempts++;
+						if (sendAttempts === 1) {
+							await Promise.resolve();
+							throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 						}
 						injected.push(frame);
 					},
@@ -1506,12 +1772,12 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(new FakeSlack()),
-				createClient: () => ({
-					send() {
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					send: () => {
 						throw new SdkClientError("connection_closed", "before send");
 					},
 				}),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
 				authorizeActor: actorId => actorId === "U1",
 			});
 			const root = await first.postRoot("session", "root");
@@ -1528,8 +1794,10 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(new FakeSlack()),
-				createClient: () => ({ send: frame => replayed.push(frame) }),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					send: (frame: Record<string, unknown>) => replayed.push(frame),
+				}),
 				authorizeActor: actorId => actorId === "U1",
 			});
 			await restarted.start();
@@ -1566,8 +1834,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(firstFake),
 				randomId: () => "client-id",
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
+				resolveAttachment: async sessionId => endpoint(sessionId),
 				authorizeActor: actorId => actorId === "U1",
 			});
 			const root = await first.postRoot("session", "root");
@@ -1587,8 +1854,10 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(new FakeSlack()),
 				randomId: () => "client-id",
-				createClient: () => ({ send: frame => replayed.push(frame) }),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					send: (frame: Record<string, unknown>) => replayed.push(frame),
+				}),
 				authorizeActor: actorId => actorId === "U1",
 			});
 			await restarted.start();
@@ -1620,7 +1889,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				expect(sent).toBe(true);
 			},
 			{
-				createClient: injected => ({
+				attachmentSend: injected => ({
 					send(frame) {
 						if (swapped) throw new SlackEndpointBindingError();
 						sent = true;
@@ -1738,7 +2007,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				);
 			},
 			{
-				createClient: injected => ({
+				attachmentSend: injected => ({
 					send(frame) {
 						injected.push(frame);
 						throw new SdkClientError("unavailable", "accepted then disconnected");
@@ -1757,12 +2026,13 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(new FakeSlack()),
-				createClient: () => ({
-					send() {
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					send: () => {
 						throw new SdkClientError("unavailable", "accepted then disconnected");
 					},
 				}),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
+
 				authorizeActor: actorId => actorId === "U1",
 			});
 			const root = await first.postRoot("session", "root");
@@ -1786,8 +2056,10 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(new FakeSlack()),
-				createClient: () => ({ send: frame => replayed.push(frame) }),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					send: (frame: Record<string, unknown>) => replayed.push(frame),
+				}),
 				authorizeActor: actorId => actorId === "U1",
 			});
 			await restarted.start();
@@ -1807,8 +2079,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(new FakeSlack()),
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
+				resolveAttachment: async sessionId => endpoint(sessionId),
 			});
 			const original = await first.postRoot("session", "original root");
 			const effectId = `inbound:T1:C1:${original.rootTs}:U1:event-1:interaction-1`;
@@ -1845,8 +2116,10 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(new FakeSlack()),
-				createClient: () => ({ send: frame => injected.push(frame) }),
-				resolveEndpoint: async sessionId => endpoint(sessionId),
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					send: (frame: Record<string, unknown>) => injected.push(frame),
+				}),
 			});
 			const replacement = await restarted.resume("session", "replacement root");
 			expect(replacement.rootTs).not.toBe(original.rootTs);
@@ -1874,8 +2147,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				teamId: "T1",
 				channelId: "C1",
 				provider: new SlackProvider(fake),
-				createClient: () => ({ send() {} }),
-				resolveEndpoint: async sessionId => endpoint(sessionId, generation),
+				resolveAttachment: async sessionId => endpoint(sessionId, generation),
 			});
 			await daemon.postRoot("session", "root");
 			fake.onFind = async () => {
@@ -1907,13 +2179,12 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				channelId: "C1",
 				provider: new SlackProvider(fake),
 				now: () => now,
-				createClient: () => ({ send: frame => injected.push(frame) }),
-				resolveEndpoint: async sessionId => {
+				resolveAttachment: async sessionId => {
 					if (failScheduledDrain) {
 						scheduledDrainFailed.resolve();
 						throw new Error("transient endpoint lookup failure");
 					}
-					return endpoint(sessionId);
+					return { ...endpoint(sessionId), send: (frame: Record<string, unknown>) => injected.push(frame) };
 				},
 				authorizeActor: actorId => actorId === "U1",
 			});
@@ -1936,6 +2207,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 						teamId: "T1",
 						channelId: "C1",
 						rootTs: root.rootTs!,
+						attachmentAuthorityId: "session:1",
 						actorId: "U1",
 						eventId: "event-1",
 						interactionId: "interaction-1",

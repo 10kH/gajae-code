@@ -85,6 +85,7 @@ import { processIncarnation } from "../broker/process-incarnation";
 import { SessionIndex } from "../broker/session-index";
 import { createSdkSurfaceFactory, type SessionSdkHost, SessionSdkSessionRuntime, shouldHostSdk } from "../host";
 import { type ControlSurface, dispatchControl } from "../host/control";
+import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import type { SdkFrame } from "../host/types";
 import {
@@ -137,10 +138,7 @@ import type { SlackConversation } from "./slack-conversation";
 import {
 	ASK_SELECTED_ACK_CAPABILITY,
 	type EnsureDaemonResult,
-	endpointAuthorityDigest,
 	ensureTelegramDaemonRunningDetailed,
-	type RegisterNotificationRootResult,
-	unregisterNotificationRoot,
 } from "./telegram-daemon";
 
 export type {
@@ -191,6 +189,13 @@ function formatPromptTerminalFailureReason(reason: unknown): string {
 	return rawReason ? rawReason.slice(0, PROMPT_TERMINAL_FAILURE_REASON_LOG_MAX) : "unreported";
 }
 
+function endpointAuthorityDigest(url: string, token: string): string {
+	const parsed = new URL(url);
+	parsed.hash = "";
+	parsed.search = "";
+	parsed.hostname = parsed.hostname.toLowerCase();
+	return crypto.createHash("sha256").update(`${parsed.toString()}\0${token}`, "utf8").digest("hex");
+}
 export function formatPromptSettlementDiagnostic(
 	proof: Extract<RunSettlementProof, { status: "unfenced" }>,
 	now = Date.now(),
@@ -208,15 +213,11 @@ export function formatPromptSettlementDiagnostic(
 }
 
 // ===========================================================================
-// Session lifecycle control protocol (TypeScript mirror of the Rust wire
-// contract in `crates/gjc-sdk/src/lifecycle.rs`).
-//
-// These describe the frames exchanged over the daemon-owned, session-independent
-// control endpoint for remote session create / close / resume. Field names are
-// camelCase on the wire; `type`/`kind` discriminators are snake_case. The Rust
-// ingress authenticates and forwards; the daemon (TypeScript) owns all policy,
-// spawn orchestration, idempotency, rate limiting, audit, and UX.
+// Session lifecycle presentation contract
 // ===========================================================================
+// Provider-neutral lifecycle command targets and credential-free presentation outcomes.
+// SessionLifecycleService owns request authorization/idempotency; these types contain no
+// control endpoint, process, tmux, session-state, or SDK endpoint authority.
 
 /** Where a `session_create` should run. Discriminated by `kind`. */
 export type SessionCreateTarget =
@@ -227,10 +228,6 @@ export type SessionCreateTarget =
 /** Identifies the session a `session_close` targets. */
 export interface SessionCloseTarget {
 	sessionId: string;
-	/** Expected GJC-managed tmux session name (defense-in-depth match). */
-	tmuxSession?: string;
-	/** Expected `@gjc-session-state-file` tag (defense-in-depth match). */
-	sessionStateFile?: string;
 }
 
 /** Identifies the session a `session_resume` targets. */
@@ -240,110 +237,33 @@ export interface SessionResumeTarget {
 	path?: string;
 }
 
-/** Create a new session. */
-export interface SessionCreateFrame {
-	type: "session_create";
-	requestId: string;
-	/** Deterministic lifecycle marker preallocated by the daemon before spawn. */
-	lifecycleRequestId: string;
-	/** Session id the daemon preallocated and propagates to the child. */
-	intendedSessionId: string;
-	/** Telegram update id (idempotency key on the daemon side). */
-	updateId: number;
-	chatId: string;
-	/** Control-endpoint token authorizing this frame. */
-	token: string;
-	target: SessionCreateTarget;
-	/** Reserved for a future capability transport; any supplied value is rejected before lifecycle acceptance. */
-	startupPromptRef?: string;
-	/** Model profile preset to activate for the spawned session (--mpreset). */
-	modelPreset?: string;
-}
-
-/** Close (hard-kill, history preserved) a session. */
-export interface SessionCloseFrame {
-	type: "session_close";
-	requestId: string;
-	updateId: number;
-	chatId: string;
-	token: string;
-	target: SessionCloseTarget;
-	/** Required force-only close flag; false/omitted is rejected by daemon policy. */
-	force?: boolean;
-}
-
-/** Resume a session (reattach if alive, else cold-restart from history). */
-export interface SessionResumeFrame {
-	type: "session_resume";
-	requestId: string;
-	updateId: number;
-	chatId: string;
-	token: string;
-	target: SessionResumeTarget;
-	/** Reserved for a future capability transport; any supplied value is rejected before lifecycle acceptance. */
-	startupPromptRef?: string;
-}
-
-/** Any client -> ingress lifecycle request frame. */
-export type SessionLifecycleRequest = SessionCreateFrame | SessionCloseFrame | SessionResumeFrame;
-
-/** Terminal status of a lifecycle request. */
 export type LifecycleStatus = "ok" | "error";
 
-/** A connected session's per-session endpoint, returned to the control client. */
-export interface LifecycleEndpoint {
-	url: string;
-	token: string;
-}
-
-/** The Telegram topic/thread a session is surfaced in. */
-export interface LifecycleTopic {
-	chatId: string;
-	threadId: string;
-}
-
-/** How a create request was correlated to its spawned session. */
-export type MatchedBy = "spawn_marker" | "session_ready";
-
-/** Response to a successful `session_create`. */
 export interface SessionCreateResponseFrame {
 	type: "session_create_response";
 	requestId: string;
 	status: LifecycleStatus;
-	lifecycleRequestId: string;
 	sessionId: string;
-	matchedBy: MatchedBy;
-	endpoint: LifecycleEndpoint;
-	topic: LifecycleTopic;
 	target: SessionCreateTarget;
 }
 
-/** Response to a successful `session_close`. */
 export interface SessionCloseResponseFrame {
 	type: "session_close_response";
 	requestId: string;
 	status: LifecycleStatus;
 	sessionId: string;
-	processGone: boolean;
-	historyPreserved: boolean;
-	endpointStale: boolean;
 }
 
-/** Whether a resume reattached to a live session or cold-restarted a dead one. */
 export type ResumeMode = "reattached" | "cold_restarted";
 
-/** Response to a successful `session_resume`. */
 export interface SessionResumeResponseFrame {
 	type: "session_resume_response";
 	requestId: string;
 	status: LifecycleStatus;
 	sessionId: string;
 	mode: ResumeMode;
-	endpoint: LifecycleEndpoint;
-	topic: LifecycleTopic;
 }
 
-/** Machine-readable reason a lifecycle request failed. */
 export type LifecycleErrorReason =
 	| "unauthorized"
 	| "rate_limited"
@@ -358,15 +278,12 @@ export type LifecycleErrorReason =
 	| "terminal_uncertain"
 	| "unsupported_platform";
 
-/** A candidate returned with an `ambiguous_target` resume error. */
 export interface ResumeCandidate {
 	sessionId: string;
 	path?: string;
-	/** Last-activity epoch-millis (session history file mtime), if known. */
 	mtimeMs?: number;
 }
 
-/** A structured lifecycle error frame. */
 export interface SessionLifecycleErrorFrame {
 	type: "session_lifecycle_error";
 	requestId: string;
@@ -376,7 +293,6 @@ export interface SessionLifecycleErrorFrame {
 	candidates?: ResumeCandidate[];
 }
 
-/** Any ingress -> client lifecycle response frame. */
 export type SessionLifecycleResponse =
 	| SessionCreateResponseFrame
 	| SessionCloseResponseFrame
@@ -1210,8 +1126,6 @@ interface SessionRuntime {
 	/** This runtime's own host-liveness publication; only its teardown may retract it. */
 	evidencePublication?: SessionHostRuntimePublication;
 	brokerRegistrationReleased: boolean;
-	/** Managed Telegram root registration released during terminal teardown. */
-	notificationRootRegistration?: { settings: Settings; cwd: string; registrationToken: string };
 	verbosity: "lean" | "verbose";
 	sessionTag: string;
 	/** Whether the agent loop is currently running (drives the typing indicator). */
@@ -3060,7 +2974,11 @@ function sdkControlSurface(
 		newSession: () => typed("session.new"),
 		forkSession: () => typed("session.fork"),
 		resumeSession: id => typed("session.resume", { id }),
-		closeSession: () => typed("session.close"),
+		closeSession: capability =>
+			typed(
+				"session.close",
+				capability === undefined ? {} : { [BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: capability },
+			),
 		switchSession: id => typed("session.switch", { id }),
 		branchSession: entryId => typed("session.branch", { entryId }),
 		renameSession: name => typed("session.rename", { name }),
@@ -3546,12 +3464,7 @@ export function createNotificationsExtension(
 	api: ExtensionAPI,
 	options: {
 		settings?: Settings;
-		ensureTelegramDaemon?: (input: {
-			settings: Settings;
-			cwd: string;
-			sessionId: string;
-			onRegistered?: (registration: RegisterNotificationRootResult) => void;
-		}) => Promise<EnsureDaemonResult>;
+		ensureTelegramDaemon?: (input: { settings: Settings }) => Promise<EnsureDaemonResult>;
 		ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>;
 		/** Suppress auto-delivery for a GJC-spawned child under `sessionScope=primary`. */
 		spawnedByGjc?: boolean;
@@ -3595,28 +3508,11 @@ export function createNotificationsExtension(
 		| undefined;
 	let extensionShuttingDown = false;
 
-	async function ensureTelegramOwner(
-		settings: Settings,
-		cwd: string,
-		id: string,
-		onRegistered?: (registrationToken: string) => void,
-	): Promise<"ready" | "blocked_identity"> {
+	async function ensureTelegramOwner(settings: Settings): Promise<"ready" | "blocked_identity"> {
 		if (options.ensureTelegramDaemon) {
-			return (await options.ensureTelegramDaemon({
-				settings,
-				cwd,
-				sessionId: id,
-				onRegistered: registration => onRegistered?.(registration.token),
-			})) === "blocked"
-				? "blocked_identity"
-				: "ready";
+			return (await options.ensureTelegramDaemon({ settings })) === "blocked" ? "blocked_identity" : "ready";
 		}
-		return (await ensureTelegramDaemonRunningDetailed({
-			settings,
-			cwd,
-			sessionId: id,
-			onRegistered: registration => onRegistered?.(registration.token),
-		})) === "blocked_identity"
+		return (await ensureTelegramDaemonRunningDetailed({ settings })) === "blocked_identity"
 			? "blocked_identity"
 			: "ready";
 	}
@@ -3624,9 +3520,6 @@ export function createNotificationsExtension(
 	async function ensureConfiguredDaemonOwners(
 		settings: Settings,
 		cfg: NotificationConfig,
-		cwd: string,
-		id: string,
-		onRegistered?: (registrationToken: string) => void,
 	): Promise<ConfiguredDaemonOwnerResult> {
 		if (isProviderEffectivelyEnabled(cfg, "telegram")) {
 			const telegramMarker = getCurrentTelegramActivationMarker(cfg);
@@ -3637,7 +3530,7 @@ export function createNotificationsExtension(
 				await ensureConfiguredProviderDaemons(settings, cfg, options.ensureProviderDaemon);
 				return "blocked_identity_with_sibling";
 			}
-			const telegram = await ensureTelegramOwner(settings, cwd, id, onRegistered);
+			const telegram = await ensureTelegramOwner(settings);
 			if (telegram === "blocked_identity") {
 				if (!isProviderEffectivelyEnabled(cfg, "discord") && !isProviderEffectivelyEnabled(cfg, "slack")) {
 					return "blocked_identity";
@@ -3802,20 +3695,6 @@ export function createNotificationsExtension(
 			hostStopped: rt.hostStopped && rt.serverStopped,
 			brokerRegistrationReleased: rt.brokerRegistrationReleased,
 		});
-		if (rt.notificationRootRegistration) {
-			try {
-				await unregisterNotificationRoot({
-					settings: rt.notificationRootRegistration.settings,
-					cwd: rt.notificationRootRegistration.cwd,
-					sessionId: id,
-					registrationToken: rt.notificationRootRegistration.registrationToken,
-				});
-				rt.notificationRootRegistration = undefined;
-			} catch (e) {
-				ownerReleaseFailures.push(e);
-				logger.warn(`notifications: Telegram root unregister failed: ${String(e)}`);
-			}
-		}
 		if (ownerReleaseFailures.length > 0) {
 			cleanupRetries.set(id, rt);
 			throw new AggregateError(ownerReleaseFailures, `SDK notification runtime ${id} owner release failed.`);
@@ -4981,7 +4860,6 @@ export function createNotificationsExtension(
 				{ toolName: string; args?: unknown; pendingPhase?: "completed" | "failed" | "cancelled" }
 			>(),
 			deferredInboundControls: [],
-			notificationRootRegistration: undefined,
 		};
 		const initializedRuntime = runtime;
 		runtimes.set(id, initializedRuntime);
@@ -5537,10 +5415,7 @@ export function createNotificationsExtension(
 			}
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
 				try {
-					let registrationToken: string | undefined;
-					const ownership = await ensureConfiguredDaemonOwners(settings, cfg, ctx.cwd, id, token => {
-						registrationToken = token;
-					});
+					const ownership = await ensureConfiguredDaemonOwners(settings, cfg);
 					if (ownership === "blocked_identity") {
 						const result = failLifecycleStartup("failed", "Telegram daemon ownership is blocked.");
 						finishStartup(result);
@@ -5554,9 +5429,6 @@ export function createNotificationsExtension(
 						const result = await startSession(ctx);
 						finishStartup(result);
 						return result;
-					}
-					if (registrationToken !== undefined) {
-						runtime.notificationRootRegistration = { settings, cwd: ctx.cwd, registrationToken };
 					}
 				} catch (error) {
 					const result = failLifecycleStartup("failed", error);
@@ -5908,27 +5780,11 @@ export function createNotificationsExtension(
 			flushPendingFinal(runtime, runtime.id);
 			for (const processControl of runtime.deferredInboundControls.splice(0)) processControl();
 		},
-		ensureTelegramDaemon: async binding => {
+		ensureTelegramDaemon: async _binding => {
 			const { settings, settingsAvailable } = resolveSettings(options.settings);
 			if (!settingsAvailable || !settings) return "blocked_identity";
 			try {
-				let registrationToken: string | undefined;
-				const result = await ensureTelegramOwner(settings, binding.cwd, binding.sessionId, token => {
-					registrationToken = token;
-				});
-				const runtime = runtimes.get(binding.sessionId);
-				const configured = isProviderEffectivelyEnabled(resolveSettings(options.settings).cfg, "telegram");
-				if (result === "ready" && runtime && !runtime.stopping && configured && registrationToken !== undefined) {
-					runtime.notificationRootRegistration = { settings, cwd: binding.cwd, registrationToken };
-				} else if (registrationToken !== undefined) {
-					await unregisterNotificationRoot({
-						settings,
-						cwd: binding.cwd,
-						sessionId: binding.sessionId,
-						registrationToken,
-					});
-				}
-				return result;
+				return await ensureTelegramOwner(settings);
 			} catch {
 				return "failed";
 			}

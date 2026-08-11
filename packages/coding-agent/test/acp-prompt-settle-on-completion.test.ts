@@ -1,9 +1,11 @@
 import { expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
 import { TempDir } from "@gajae-code/utils";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { SessionIndex } from "../src/sdk/broker/session-index";
 import { ACP_PROMPT_INFERENCE_TIMEOUT_MS } from "../src/sdk/prompt-watchdog";
 
 type TestSocket = { send(message: string): void };
@@ -139,8 +141,12 @@ async function createFixture(options: { silentQueries?: string[] } = {}): Promis
 			open(socket) {
 				socket.send(JSON.stringify({ type: "hello", connectionId: "acp-prompt-settle" }));
 			},
-			message(socket, raw) {
+			async message(socket, raw) {
 				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
+				if (frame.type === "event_replay") {
+					socket.send(JSON.stringify({ type: "event_replay_result", id: frame.id, events: [] }));
+					return;
+				}
 				if (frame.type === "register_provider") {
 					socket.send(
 						JSON.stringify({ type: "register_provider_result", id: frame.id, ok: true, leaseId: "lease" }),
@@ -148,9 +154,35 @@ async function createFixture(options: { silentQueries?: string[] } = {}): Promis
 					return;
 				}
 				if (frame.type === "broker_request") {
+					const endpointMtimeMs = 1;
+					if (frame.operation === "session.create") {
+						const endpointPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+						await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+						await Bun.write(
+							endpointPath,
+							JSON.stringify({ sessionId, pid: process.pid, url: `ws://127.0.0.1:${server.port}`, token }),
+						);
+						await fs.utimes(endpointPath, 0.001, 0.001);
+						const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+						const index = await new SessionIndex(agentDir).open();
+						await index.append({
+							type: "host_registered",
+							sessionId,
+							locator: { repo: cwd, stateRoot: path.join(cwd, ".gjc", "state") },
+							endpointGeneration: 1,
+							pid: process.pid,
+							endpointMtimeMs,
+						});
+					}
 					const result =
 						frame.operation === "session.create"
-							? { sessionId, endpoint: { url: `ws://127.0.0.1:${server.port}`, token } }
+							? {
+									sessionId,
+									endpointGeneration: 1,
+									pid: process.pid,
+									endpointMtimeMs,
+									endpoint: { sessionId, pid: process.pid, url: `ws://127.0.0.1:${server.port}`, token },
+								}
 							: {};
 					socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result }));
 					return;

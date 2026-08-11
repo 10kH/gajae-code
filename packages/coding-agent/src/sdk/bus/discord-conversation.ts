@@ -9,6 +9,7 @@ export interface DiscordInboundDispatchReceipt {
 	actionId?: string;
 	actionNonce?: string;
 	endpointGeneration: number;
+	attachmentAuthorityId?: string;
 	effectId: string;
 	idempotencyKey: string;
 }
@@ -28,6 +29,7 @@ export interface DiscordConversation extends ConversationRecord {
 	createOwner?: string;
 	createLeaseExpiresAt?: number;
 	endpointGeneration?: number;
+	attachmentAuthorityId?: string;
 	/** Immutable lineage for archive and resume provider effects. */
 	effectIncarnationId?: string;
 	/** Current archive operation authority. */

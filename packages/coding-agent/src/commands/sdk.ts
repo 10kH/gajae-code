@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
-import { Args, CliParseError, Command, Flags, renderCommandHelp } from "@gajae-code/utils/cli";
+import { CliParseError, Command, renderCommandHelp } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
 import { Settings } from "../config/settings";
 import { applyStartupModelProfiles, createSessionManager } from "../main";
@@ -32,7 +32,6 @@ import {
 	type SdkStartupRollbackResult,
 	SdkStartupRollbackTracker,
 } from "../sdk/startup-capability";
-import { runSdkServe } from "../sdk/transport/serve-cli";
 import {
 	type CapturedSessionTranscriptSnapshot,
 	type ResumeSessionIdentity,
@@ -705,35 +704,18 @@ export function parseSdkInternalArgv(argv: readonly string[]): SdkInternalArgv {
 	throw new CliParseError("Invalid internal SDK invocation.");
 }
 
-class SdkServeHelp extends Command {
-	static description = "gjc sdk serve --stdio | --socket <path> [--session <id>] [--pending-ceiling <bytes>]";
-	static flags = {
-		stdio: Flags.boolean({ description: "Serve SDK frames over standard input and output" }),
-		socket: Flags.string({ description: "Serve SDK frames over a Unix socket path" }),
-		session: Flags.string({ description: "Attach to a specific SDK session" }),
-		"pending-ceiling": Flags.string({ description: "Maximum queued relay bytes per direction" }),
-	};
-	async run(): Promise<void> {}
-}
-
 export default class Sdk extends Command {
-	static description = "gjc sdk serve --stdio | --socket <path> [--session <id>] [--pending-ceiling <bytes>]";
-	static hidden = false;
+	static description = "Internal SDK runtime command";
+	static hidden = true;
 	static delegateHelp = true;
-	static args = { action: Args.string({ required: false, options: ["serve"] }) };
-	static flags = SdkServeHelp.flags;
 	async run(): Promise<void> {
 		const action = this.argv[0];
 		if (this.argv.includes("--help") || this.argv.includes("-h")) {
-			renderCommandHelp("gjc", action === "serve" ? "sdk serve" : "sdk", action === "serve" ? SdkServeHelp : Sdk);
-			return;
-		}
-		if (action === "serve") {
-			await runSdkServe(this.argv.slice(1));
+			renderCommandHelp("gjc", "sdk", Sdk);
 			return;
 		}
 		if (action !== "broker-internal" && action !== "session-host-internal")
-			throw new CliParseError("Expected action to be serve.");
+			throw new CliParseError("Expected an internal SDK action.");
 		const internal = parseSdkInternalArgv(this.argv);
 		if (internal.action === "session-host-internal") {
 			await runSessionHost();

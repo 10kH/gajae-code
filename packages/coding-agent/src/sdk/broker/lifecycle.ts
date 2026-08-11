@@ -44,6 +44,7 @@ import {
 } from "../../session/session-storage";
 import type { SessionLifecycleMcpServer } from "../acp/mcp";
 import { SdkClient, SdkClientError } from "../client/client";
+import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
 import { SESSION_PREPARED_EVENT } from "../host/host";
 import {
 	type LogicalSessionCandidate,
@@ -745,6 +746,7 @@ async function reconcileReadyScope(broker: Broker, id: string, scope: string | u
 		// published about its own process has to survive it: dropping the incarnation
 		// here would silently disarm the teardown fence for every lifecycle session.
 		...(record.processIncarnation === undefined ? {} : { processIncarnation: record.processIncarnation }),
+		...(record.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: record.lifecycleRequestId }),
 		endpointMtimeMs: record.endpointMtimeMs,
 	});
 }
@@ -2067,7 +2069,13 @@ function captureLifecycleFile(file: string, requireRegular = false, bounded = fa
 	}
 }
 
-async function removeOwnedLifecycleArtifacts(root: string, id: string, expected: EffectMarker): Promise<boolean> {
+async function removeOwnedLifecycleArtifacts(
+	root: string,
+	id: string,
+	expected: EffectMarker,
+	onRetainedUnknown?: () => void,
+	onDurablePlaceholder?: (file: string) => void,
+): Promise<boolean> {
 	const marker = await readEffectMarker(lifecycleMarkerPath(root, id));
 	if (!marker || !sameEffectMarker(marker, expected)) return false;
 	const endpointPath = path.join(root, "sdk", `${id}.json`);
@@ -2111,7 +2119,43 @@ async function removeOwnedLifecycleArtifacts(root: string, id: string, expected:
 					: finalEndpointPath,
 			{ dev: BigInt(endpointParent.dev), ino: BigInt(endpointParent.ino) },
 		);
-		if (!endpointRemoval.ok) return false;
+		if (!endpointRemoval.ok) {
+			if (endpointRemoval.retainedUnknownPath) {
+				onRetainedUnknown?.();
+				return false;
+			}
+			if (endpointRemoval.code !== "cleanup_pending") return false;
+			if (endpointRemoval.retainedPlaceholderPath) {
+				if (endpointRemoval.payloadDurable !== true) return false;
+				onDurablePlaceholder?.(path.resolve(endpointRemoval.retainedPlaceholderPath));
+				for (const candidate of [endpointSource, plannedEndpointPath, retryEndpointPath, finalEndpointPath]) {
+					try {
+						if (fsSync.lstatSync(candidate).size === 0) onDurablePlaceholder?.(path.resolve(candidate));
+					} catch {
+						// Absent aliases carry no retained authority.
+					}
+				}
+			}
+			if (endpointRemoval.detachedPath && fsSync.existsSync(endpointRemoval.detachedPath)) {
+				const detachedPath = path.resolve(endpointRemoval.detachedPath);
+				if (path.dirname(detachedPath) !== path.dirname(path.resolve(endpointPath))) return false;
+				let detachedRemoval: NativeExactUnlinkResult;
+				try {
+					detachedRemoval = exactUnlinkLifecycleFile(
+						detachedPath,
+						endpoint.identity,
+						path.join(
+							path.dirname(detachedPath),
+							`.gjc-delete-endpoint-detached-${expected.effectMarker}-${path.basename(endpointPath)}`,
+						),
+						{ dev: BigInt(endpointParent.dev), ino: BigInt(endpointParent.ino) },
+					);
+				} catch {
+					return false;
+				}
+				if (!detachedRemoval.ok && detachedRemoval.code !== "not_found") return false;
+			}
+		}
 	}
 	const currentMarker = await readEffectMarker(lifecycleMarkerPath(root, id));
 	if (!currentMarker || !sameEffectMarker(currentMarker, expected)) return false;
@@ -2277,14 +2321,178 @@ async function endpointRemoved(root: string, id: string): Promise<boolean> {
 	}
 }
 
-async function waitForClose(
+async function removeExactDeadSessionEndpoint(
 	broker: Broker,
 	id: string,
-	record: { locator: { stateRoot: string }; endpointGeneration: number; pid: number; lifecycleRequestId?: string },
-	timeoutMs: number,
+	record: CloseRecord,
+	attempt = 0,
+	authorizedSource?: string,
+	durablePlaceholders?: Set<string>,
 ): Promise<boolean> {
+	if (record.endpointMtimeMs === undefined) return await endpointRemoved(record.locator.stateRoot, id);
+	await broker.index.refresh();
+	const current = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+	if (
+		!current ||
+		current.endpointGeneration !== record.endpointGeneration ||
+		current.pid !== record.pid ||
+		current.endpointMtimeMs !== record.endpointMtimeMs ||
+		current.lifecycleRequestId !== record.lifecycleRequestId ||
+		current.processIncarnation !== record.processIncarnation ||
+		path.resolve(current.locator.stateRoot) !== path.resolve(record.locator.stateRoot)
+	)
+		return false;
+	const endpointPath = path.join(record.locator.stateRoot, "sdk", `${id}.json`);
+	const suffix = `${id}-${record.endpointGeneration}-${record.pid}-${String(record.endpointMtimeMs).replaceAll(".", "_")}.json`;
+	const plannedEndpointPath = path.join(path.dirname(endpointPath), `.gjc-dead-endpoint-${suffix}`);
+	const retryEndpointPath = path.join(path.dirname(endpointPath), `.gjc-dead-endpoint-retry-${suffix}`);
+	const finalEndpointPath = path.join(path.dirname(endpointPath), `.gjc-dead-endpoint-final-${suffix}`);
+	const ownedEndpointPaths = record.lifecycleRequestId
+		? [
+				`.gjc-delete-endpoint-detached-${record.lifecycleRequestId}-${path.basename(endpointPath)}`,
+				`.gjc-delete-endpoint-final-${record.lifecycleRequestId}-${path.basename(endpointPath)}`,
+				`.gjc-delete-endpoint-retry-${record.lifecycleRequestId}-${path.basename(endpointPath)}`,
+				`.gjc-delete-endpoint-${record.lifecycleRequestId}-${path.basename(endpointPath)}`,
+			].map(name => path.join(path.dirname(endpointPath), name))
+		: [];
+	const ownedPayloadPaths: string[] = [];
+	for (const ownedPath of ownedEndpointPaths) {
+		let size: number;
+		try {
+			size = fsSync.lstatSync(ownedPath).size;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			return false;
+		}
+		if (size > 0) ownedPayloadPaths.push(ownedPath);
+	}
+	const candidates = [...ownedPayloadPaths, finalEndpointPath, retryEndpointPath, plannedEndpointPath, endpointPath];
+	let authorizedDetachedSource: string | undefined;
+	if (authorizedSource && path.dirname(path.resolve(authorizedSource)) === path.dirname(path.resolve(endpointPath))) {
+		try {
+			if (fsSync.lstatSync(authorizedSource).size > 0) authorizedDetachedSource = authorizedSource;
+		} catch {
+			// The detached source was already retired; deterministic candidates remain authoritative.
+		}
+	}
+	const endpointSource =
+		authorizedDetachedSource && fsSync.existsSync(authorizedDetachedSource)
+			? authorizedDetachedSource
+			: candidates.find(candidate => {
+					try {
+						return fsSync.lstatSync(candidate).isFile();
+					} catch {
+						return false;
+					}
+				});
+	if (!endpointSource) return await endpointRemoved(record.locator.stateRoot, id);
+	const plannedPath =
+		endpointSource === endpointPath
+			? plannedEndpointPath
+			: endpointSource === plannedEndpointPath
+				? retryEndpointPath
+				: finalEndpointPath;
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(endpointSource, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+		const metadata = await handle.stat({ bigint: true });
+		if (!metadata.isFile() || metadata.nlink !== 1n || metadata.size > 4096n) return false;
+		const bytes = Buffer.alloc(Number(metadata.size) + 1);
+		const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+		if (bytesRead !== Number(metadata.size)) return false;
+		const source = bytes.subarray(0, bytesRead);
+		const endpoint = JSON.parse(source.toString("utf8")) as { sessionId?: unknown; pid?: unknown; stale?: unknown };
+		if (
+			endpoint.sessionId !== id ||
+			endpoint.pid !== record.pid ||
+			endpoint.stale === true ||
+			Number(metadata.mtimeNs) / 1_000_000 !== record.endpointMtimeMs
+		)
+			return false;
+		await handle.close();
+		handle = undefined;
+		const removed = exactUnlinkLifecycleFile(
+			endpointSource,
+			{
+				dev: metadata.dev,
+				ino: metadata.ino,
+				nlink: metadata.nlink,
+				size: metadata.size,
+				mtimeNs: metadata.mtimeNs,
+				sha256: createHash("sha256").update(source).digest("hex"),
+			},
+			plannedPath,
+			(() => {
+				const parent = lifecycleParentIdentity(path.dirname(endpointSource));
+				return parent ? { dev: BigInt(parent.dev), ino: BigInt(parent.ino) } : undefined;
+			})(),
+		);
+		if (removed.ok || removed.code === "not_found") return true;
+		if (removed.code === "cleanup_pending" && removed.retainedUnknownPath) return false;
+		if (removed.code === "cleanup_pending" && removed.retainedPlaceholderPath) {
+			if (removed.payloadDurable !== true) return false;
+			durablePlaceholders?.add(path.resolve(removed.retainedPlaceholderPath));
+			for (const candidate of [endpointSource, plannedEndpointPath, retryEndpointPath, finalEndpointPath]) {
+				try {
+					if (fsSync.lstatSync(candidate).size === 0) durablePlaceholders?.add(path.resolve(candidate));
+				} catch {
+					// Absent aliases carry no retained authority.
+				}
+			}
+		}
+		if (removed.code === "cleanup_pending" && attempt < 4)
+			return await removeExactDeadSessionEndpoint(
+				broker,
+				id,
+				record,
+				attempt + 1,
+				removed.detachedPath,
+				durablePlaceholders,
+			);
+		return false;
+	} catch {
+		return false;
+	} finally {
+		await handle?.close();
+	}
+}
+
+async function hasOwnedEndpointPayload(
+	root: string,
+	id: string,
+	effectMarker: string,
+	durablePlaceholders: ReadonlySet<string>,
+): Promise<boolean> {
+	const directory = path.join(root, "sdk");
+	const endpointName = `${id}.json`;
+	let names: string[];
+	try {
+		names = await fs.readdir(directory);
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code !== "ENOENT";
+	}
+	for (const name of names) {
+		if (!name.startsWith(".gjc-delete-endpoint-") || !name.includes(effectMarker) || !name.includes(endpointName))
+			continue;
+		try {
+			const candidate = path.join(directory, name);
+			const metadata = await fs.lstat(candidate);
+			if (
+				!metadata.isFile() ||
+				metadata.size > 0 ||
+				(metadata.size === 0 && !durablePlaceholders.has(path.resolve(candidate)))
+			)
+				return true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return true;
+		}
+	}
+	return false;
+}
+async function waitForClose(broker: Broker, id: string, record: CloseRecord, timeoutMs: number): Promise<boolean> {
 	const timing = lifecycleTiming(broker);
 	const deadline = timing.now() + timeoutMs;
+	const durablePlaceholders = new Set<string>();
 	while (timing.now() < deadline) {
 		await broker.index.refresh();
 		const registration = broker.index.findHostRegistration(
@@ -2297,7 +2505,14 @@ async function waitForClose(
 			registration &&
 			broker.index.hostUnregisteredAfter(registration) &&
 			(await endpointRemoved(record.locator.stateRoot, id)) &&
-			hasObservedProcessExit(record.pid)
+			hasObservedProcessExit(record.pid) &&
+			(!record.lifecycleRequestId ||
+				!(await hasOwnedEndpointPayload(
+					record.locator.stateRoot,
+					id,
+					record.lifecycleRequestId,
+					durablePlaceholders,
+				)))
 		)
 			return true;
 		// A host that dies before it can withdraw its own registration — killed
@@ -2307,16 +2522,35 @@ async function waitForClose(
 		// on, so retire it here too instead of escalating signals at a pid that no
 		// longer exists and then reporting the teardown as unfinished.
 		if (registration && hasObservedProcessExit(record.pid)) {
-			await broker.index.append({
-				type: "host_unregistered",
-				sessionId: id,
-				locator: registration.locator,
-				endpointGeneration: registration.endpointGeneration,
-				pid: registration.pid,
-				...(registration.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: registration.endpointMtimeMs }),
-				...(registration.lifecycleRequestId ? { lifecycleRequestId: registration.lifecycleRequestId } : {}),
-			});
-			return true;
+			const expected =
+				typeof record.lifecycleRequestId === "string" && typeof record.processIncarnation === "string"
+					? {
+							pid: record.pid,
+							effectMarker: record.lifecycleRequestId,
+							incarnation: record.processIncarnation,
+						}
+					: undefined;
+			let retainedUnknown = false;
+			if (expected)
+				await removeOwnedLifecycleArtifacts(
+					record.locator.stateRoot,
+					id,
+					expected,
+					() => {
+						retainedUnknown = true;
+					},
+					file => durablePlaceholders.add(path.resolve(file)),
+				);
+			if (retainedUnknown) return false;
+			if (!(await removeExactDeadSessionEndpoint(broker, id, record, 0, undefined, durablePlaceholders)))
+				return false;
+			if (
+				expected &&
+				(await hasOwnedEndpointPayload(record.locator.stateRoot, id, expected.effectMarker, durablePlaceholders))
+			)
+				return false;
+			await broker.index.unregisterIfCurrent(registration);
+			return await endpointRemoved(record.locator.stateRoot, id);
 		}
 		await timing.sleep(POLL_MS);
 	}
@@ -2977,6 +3211,7 @@ type CloseRecord = {
 	pid: number;
 	endpointMtimeMs?: number;
 	lifecycleRequestId?: string;
+	processIncarnation?: string;
 };
 
 function endpointIncarnation(record: CloseRecord, sessionId: string): string | undefined {
@@ -3026,16 +3261,21 @@ function sameCloseAuthority(authority: CloseAuthority, record: CloseRecord, sess
 	);
 }
 
-function sameCloseProcessIdentity(expected: CloseRecord, current: CloseRecord & { live: boolean }): boolean {
+function sameCloseStoredProcessIdentity(expected: CloseRecord, current: CloseRecord): boolean {
 	return (
-		current.live &&
 		current.pid === expected.pid &&
-		typeof expected.lifecycleRequestId === "string" &&
-		expected.lifecycleRequestId.length > 0 &&
-		current.lifecycleRequestId === expected.lifecycleRequestId &&
+		typeof expected.processIncarnation === "string" &&
+		expected.processIncarnation.length > 0 &&
+		current.processIncarnation === expected.processIncarnation &&
+		(expected.lifecycleRequestId === undefined ||
+			(expected.lifecycleRequestId.length > 0 && current.lifecycleRequestId === expected.lifecycleRequestId)) &&
 		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
 		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
 	);
+}
+
+function sameCloseProcessIdentity(expected: CloseRecord, current: CloseRecord & { live: boolean }): boolean {
+	return current.live && sameCloseStoredProcessIdentity(expected, current);
 }
 
 function sameCloseGeneration(expected: CloseRecord, current: CloseRecord & { live: boolean }): boolean {
@@ -3044,6 +3284,8 @@ function sameCloseGeneration(expected: CloseRecord, current: CloseRecord & { liv
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
+		current.lifecycleRequestId === expected.lifecycleRequestId &&
+		current.processIncarnation === expected.processIncarnation &&
 		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
 		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
 	);
@@ -3057,9 +3299,16 @@ async function revalidateCloseGeneration(
 ): Promise<BrokerResponse | undefined> {
 	await broker.index.refresh();
 	const current = broker.index.listSessions().sessions.find(session => session.sessionId === id);
-	return current &&
-		sameCloseGeneration(expected, current) &&
-		(!authority || sameCloseAuthority(authority, current, id))
+	if (
+		!authority &&
+		current &&
+		current.endpointGeneration === expected.endpointGeneration &&
+		sameCloseStoredProcessIdentity(expected, current)
+	) {
+		expected.endpointMtimeMs = current.endpointMtimeMs;
+		return undefined;
+	}
+	return authority && current && sameCloseGeneration(expected, current) && sameCloseAuthority(authority, current, id)
 		? undefined
 		: fail("endpoint_stale", "session endpoint is stale");
 }
@@ -3132,12 +3381,16 @@ async function executeLifecycleResponse(
 				if ("ok" in finalScope) return finalScope;
 				if (!sameResumeSessionIdentity(initialScope, finalScope))
 					return fail("endpoint_stale", "Saved session changed while its resume authority was being verified.");
+				if (current.endpointMtimeMs === undefined)
+					return fail("endpoint_stale", "Live session endpoint authority is incomplete.");
 				return {
 					ok: true,
 					result: {
 						sessionId: requestedSessionId,
 						cwd: finalScope.cwd,
 						endpointGeneration: current.endpointGeneration,
+						pid: current.pid,
+						endpointMtimeMs: current.endpointMtimeMs,
 						endpoint: endpoint.result,
 						reused: true,
 					},
@@ -3429,6 +3682,9 @@ async function executeLifecycleResponse(
 			result: {
 				sessionId: launch.id,
 				cwd: launch.cwd,
+				endpointGeneration: verified.endpointGeneration,
+				pid: verified.endpoint.pid,
+				endpointMtimeMs: verified.endpointMtimeMs,
 				endpoint: verified.endpoint,
 				...(launch.readiness === "deferred" ? { readiness: "prepared" as const } : {}),
 				...(worktreeReceipt ? { worktree: worktreeReceipt } : {}),
@@ -3450,6 +3706,10 @@ async function executeLifecycleResponse(
 		if (requestedAuthority.authority && !sameCloseAuthority(requestedAuthority.authority, record, id))
 			return fail("endpoint_stale", "session endpoint is stale");
 		await broker.ledger.transition(identity, "effect_started", { intendedSessionId: id, effectMarker: randomUUID() });
+		const signalAuthority: EffectMarker | undefined =
+			typeof record.lifecycleRequestId === "string" && typeof record.processIncarnation === "string"
+				? { pid: record.pid, effectMarker: record.lifecycleRequestId, incarnation: record.processIncarnation }
+				: undefined;
 
 		let usedSignalFallback = false;
 		let note: string | undefined;
@@ -3481,11 +3741,39 @@ async function executeLifecycleResponse(
 					timeoutMs: 2_000,
 					reconnectAttempts: 0,
 				});
-				const refreshedEndpointResult = await broker.handleRequest("session.get_endpoint", {
+				let refreshedEndpointResult = await broker.handleRequest("session.get_endpoint", {
 					sessionId: id,
 					endpointGeneration: record.endpointGeneration,
 				});
+				if (
+					!refreshedEndpointResult.ok &&
+					refreshedEndpointResult.error.code === "endpoint_stale" &&
+					!requestedAuthority.authority
+				) {
+					await broker.index.refresh();
+					const heartbeatRecord = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+					if (
+						heartbeatRecord &&
+						heartbeatRecord.endpointGeneration === record.endpointGeneration &&
+						sameCloseProcessIdentity(record, heartbeatRecord)
+					) {
+						record = heartbeatRecord;
+						refreshedEndpointResult = await broker.handleRequest("session.get_endpoint", {
+							sessionId: id,
+							endpointGeneration: record.endpointGeneration,
+						});
+					}
+				}
 				if (!refreshedEndpointResult.ok) return refreshedEndpointResult;
+				await broker.index.refresh();
+				const refreshedRecord = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+				if (
+					!refreshedRecord ||
+					refreshedRecord.endpointGeneration !== record.endpointGeneration ||
+					!sameCloseProcessIdentity(record, refreshedRecord)
+				)
+					return fail("endpoint_stale", "session endpoint is stale");
+				record = refreshedRecord;
 				const refreshedEndpoint = closeEndpoint(refreshedEndpointResult.result);
 				if (
 					!refreshedEndpoint ||
@@ -3495,11 +3783,22 @@ async function executeLifecycleResponse(
 					return fail("endpoint_stale", "session endpoint is stale");
 				const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
 				if (stale) return stale;
-				const response = await client.control("session.close");
-				if ((response as { ok?: unknown }).ok !== true)
-					return fail("close_refused", "Session endpoint rejected session.close.");
+				if (record.lifecycleRequestId === undefined) {
+					usedSignalFallback = true;
+				} else {
+					const response = await client.control("session.close", {
+						[BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: record.lifecycleRequestId,
+					});
+					if ((response as { ok?: unknown }).ok !== true) {
+						const closeError = (response as { error?: { code?: unknown } }).error;
+						if (closeError?.code === "operation_prohibited") usedSignalFallback = true;
+						else return fail("close_refused", "Session endpoint rejected session.close.");
+					}
+				}
 			} catch (error) {
 				if (isTransportFailure(error)) usedSignalFallback = true;
+				else if (error instanceof SdkClientError && error.code === "operation_prohibited")
+					usedSignalFallback = true;
 				else if (error instanceof SdkClientError) return fail(error.code, error.message);
 				else
 					return fail(
@@ -3514,19 +3813,26 @@ async function executeLifecycleResponse(
 		if (usedSignalFallback) {
 			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
 			if (stale) return stale;
-			if (!(await signalVerifiedSession(record, id, "SIGTERM")))
-				return fail(
-					"close_refused",
-					"Session endpoint is unavailable and its durable process identity could not be verified.",
-				);
-			note = "Endpoint close was unreachable; sent SIGTERM to the durably identified session process.";
+			const exited =
+				typeof record.processIncarnation === "string" &&
+				observeProcess(record.pid, record.processIncarnation, value =>
+					processIncarnationForBroker(broker, value),
+				) === "exited";
+			if (!exited) {
+				if (!(await signalVerifiedSession(record, id, "SIGTERM", signalAuthority)))
+					return fail(
+						"close_refused",
+						"Session endpoint is unavailable and its durable process identity could not be verified.",
+					);
+				note = "Endpoint close was unreachable; sent SIGTERM to the durably identified session process.";
+			}
 		}
 
 		let closed = await waitForClose(broker, id, record, CLOSE_TIMEOUT_MS);
 		if (!closed && !usedSignalFallback) {
 			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
 			if (stale) return stale;
-			if (!(await signalVerifiedSession(record, id, "SIGTERM"))) {
+			if (!(await signalVerifiedSession(record, id, "SIGTERM", signalAuthority))) {
 				await recordTerminalUncertain(broker, id, record.locator.stateRoot, record.pid);
 				return fail(
 					"terminal_uncertain",
@@ -3540,7 +3846,7 @@ async function executeLifecycleResponse(
 		if (!closed) {
 			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
 			if (stale) return stale;
-			if (!(await signalVerifiedSession(record, id, "SIGKILL"))) {
+			if (!(await signalVerifiedSession(record, id, "SIGKILL", signalAuthority))) {
 				await recordTerminalUncertain(broker, id, record.locator.stateRoot, record.pid);
 				return fail(
 					"terminal_uncertain",
@@ -4595,15 +4901,7 @@ export async function reapDeadSessionRegistrations(
 	const dead = broker.index.listSessions().sessions.filter(session => !session.live && !session.terminalUncertain);
 	const reaped: ReapedSessionRegistration[] = [];
 	for (const session of dead) {
-		await broker.index.append({
-			type: "host_unregistered",
-			sessionId: session.sessionId,
-			locator: session.locator,
-			endpointGeneration: session.endpointGeneration,
-			pid: session.pid,
-			...(session.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: session.endpointMtimeMs }),
-			...(session.lifecycleRequestId ? { lifecycleRequestId: session.lifecycleRequestId } : {}),
-		});
+		if (!(await broker.index.unregisterIfCurrent(session))) continue;
 		const record = {
 			sessionId: session.sessionId,
 			pid: session.pid,

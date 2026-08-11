@@ -26,7 +26,6 @@ export const cleanPatterns: readonly CleanPattern[] = [
 	{ glob: "packages/*/dist-chrome", scope: "default" },
 	{ glob: "packages/*/dist-firefox", scope: "default" },
 	{ glob: "packages/coding-agent/binaries", scope: "default" },
-	{ glob: "python/gjc-sdk/build", scope: "default" },
 	{ glob: "coverage", scope: "default" },
 	{ glob: "packages/*/coverage", scope: "default" },
 	// `bun build --compile` leaves these next to the entrypoint when interrupted.

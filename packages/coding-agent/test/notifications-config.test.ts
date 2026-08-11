@@ -2152,7 +2152,7 @@ describe("notifications config", () => {
 		expect(fs.existsSync(path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`))).toBe(false);
 		expect(fs.existsSync(daemonPaths(agentDir).roots)).toBe(false);
 	});
-	test("captured /notify on uses the production daemon ensurer once and awaits SDK endpoint shutdown", async () => {
+	test("captured /notify on ensures provider transport once without registering a session root", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notification-command-"));
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notification-agent-"));
 		tempDirs.push(cwd, agentDir);
@@ -2238,16 +2238,12 @@ describe("notifications config", () => {
 			settings.set("notifications.enabled", true);
 			await notify.handler("on", context);
 			expect(fs.existsSync(endpoint)).toBe(true);
-			expect(fs.existsSync(roots)).toBe(true);
-			const registeredRoots = JSON.parse(fs.readFileSync(roots, "utf8")) as { roots: string[] };
-			expect(registeredRoots.roots).toEqual([path.join(cwd, ".gjc", "state")]);
+			expect(fs.existsSync(roots)).toBe(false);
 			expect(spawns).toBe(1);
 
 			await notify.handler("on", context);
 			expect(fs.existsSync(endpoint)).toBe(true);
-			expect((JSON.parse(fs.readFileSync(roots, "utf8")) as { roots: string[] }).roots).toEqual([
-				path.join(cwd, ".gjc", "state"),
-			]);
+			expect(fs.existsSync(roots)).toBe(false);
 			expect(spawns).toBe(1);
 
 			await sessionShutdown({}, context);

@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import { logger } from "@gajae-code/utils";
 import { SdkClientError } from "../client/client";
-import { readSdkSessionEndpoint, type SdkSessionEndpoint } from "../client/discovery";
+import { type SessionAttachment, SessionRouterError } from "../router";
+
 import type { ChatDeliveryError } from "./chat-daemon-runtime";
 import { ConversationStore } from "./conversation-store";
 import {
@@ -57,15 +59,6 @@ function slackPublicationClientMsgId(publicationId: string): string {
 // Durable filesystem publication leases must outlast one event-loop and persistence turn.
 const MIN_PUBLICATION_LEASE_MS = 100;
 
-export interface SlackEndpoint extends SdkSessionEndpoint {
-	generation: number;
-}
-
-export interface SlackSdkClient {
-	send(frame: Record<string, unknown>): void;
-}
-
-/** Proven right to bind one session at one endpoint generation. */
 export interface SlackBindingAuthority {
 	sessionId: string;
 	endpointGeneration: number;
@@ -87,18 +80,13 @@ export interface SlackNotificationDaemonOptions {
 	publicationOwnerId?: string;
 	publicationLeaseMs?: number;
 
-	resolveEndpoint?: (sessionId: string) => Promise<SlackEndpoint | null>;
-	/**
-	 * Exact discovery/attachment authority for adopting an existing root. The
-	 * runtime supplies index, endpoint, and attachment proof; without it only the
-	 * resolvable endpoint generation can be proven.
-	 */
+	resolveAttachment: (sessionId: string) => Promise<SessionAttachment | null>;
+	/** Exact Router proof for adopting an existing root. */
 	resolveBindingAuthority?: (sessionId: string) => Promise<SlackBindingAuthority | undefined>;
-	createClient: (endpoint: SlackEndpoint) => SlackSdkClient;
 	onCommand?: (
 		sessionId: string,
 		content: string,
-		endpoint: SlackEndpoint,
+		attachment: SessionAttachment,
 		idempotencyKey: string,
 	) => Promise<boolean>;
 }
@@ -126,6 +114,7 @@ type SlackInboundRouting = {
 	teamId: string;
 	channelId: string;
 	rootTs: string;
+	attachmentAuthorityId?: string;
 	actorId: string;
 	eventId: string;
 	interactionId: string;
@@ -188,14 +177,17 @@ export class SlackNotificationDaemon {
 	readonly store: ConversationStore<SlackConversation>;
 	readonly #now: () => number;
 	readonly #randomId: () => string;
-	readonly #resolveEndpoint: (sessionId: string) => Promise<SlackEndpoint | null>;
+	readonly #resolveAttachment: (sessionId: string) => Promise<SessionAttachment | null>;
+
 	readonly #publicationOwnerId: string;
 	readonly #publicationLeaseMs: number;
 	readonly #journal: ChatEffectJournal;
 
 	readonly #inflightInbound = new Set<string>();
 	readonly #activeWork = new Set<Promise<unknown>>();
+	readonly #workInvalidators = new Set<() => Promise<void>>();
 	readonly #rollovers = new Map<string, Promise<SlackRootPublication>>();
+	#workGeneration = 0;
 	#lifecycleTail: Promise<void> = Promise.resolve();
 	#lifecycleGeneration = 0;
 	#startedGeneration: number | undefined;
@@ -203,9 +195,12 @@ export class SlackNotificationDaemon {
 	#startOperationGeneration: number | undefined;
 	#stopOperation: Promise<void> | undefined;
 	#started = false;
-	#providerStarting = false;
-	#providerRunning = false;
-	#providerStopRequestedGeneration: number | undefined;
+	#providerStartingGeneration: number | undefined;
+	#providerRunningGeneration: number | undefined;
+	readonly #providerStopRequestedGenerations = new Set<number>();
+	#providerLifecycleTail: Promise<void> | undefined;
+	#providerLifecycleError: unknown;
+	#providerLifecycleErrorSet = false;
 	#leaseRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
 	#leaseRecoveryAt: number | undefined;
 	#leaseRecoveryFailures = 0;
@@ -221,15 +216,30 @@ export class SlackNotificationDaemon {
 		this.#publicationOwnerId = options.publicationOwnerId ?? randomUUID();
 		this.#publicationLeaseMs = Math.max(options.publicationLeaseMs ?? 30_000, MIN_PUBLICATION_LEASE_MS);
 		this.#journal = new ChatEffectJournal({ agentDir: options.agentDir, transport: "slack", now: this.#now });
-		this.#resolveEndpoint =
-			options.resolveEndpoint ??
-			(async sessionId => {
-				const endpoint = await readSdkSessionEndpoint(options.repo, sessionId);
-				return endpoint ? { ...endpoint, generation: 1 } : null;
-			});
+		this.#resolveAttachment = options.resolveAttachment;
+	}
+
+	restartBlocked(): boolean {
+		return this.#providerLifecycleTail !== undefined || this.#providerLifecycleErrorSet;
 	}
 
 	async start(): Promise<void> {
+		if (this.#providerLifecycleErrorSet) throw this.#providerLifecycleError;
+		if (this.#providerLifecycleTail) {
+			const tail = this.#providerLifecycleTail;
+			const settled = await Promise.race([
+				Promise.allSettled([tail]).then(() => true),
+				Bun.sleep(5_000).then(() => false),
+			]);
+			if (!settled) throw new Error("Prior Slack provider shutdown did not settle before restart.");
+			try {
+				await tail;
+			} catch (error) {
+				this.#recordProviderLifecycleError(error);
+				throw error;
+			}
+			if (this.#providerLifecycleTail === tail) this.#providerLifecycleTail = undefined;
+		}
 		const lifecycleGeneration = this.#lifecycleGeneration;
 		if (this.#started && this.#startedGeneration === lifecycleGeneration) return;
 		if (this.#startOperation && this.#startOperationGeneration === lifecycleGeneration)
@@ -253,26 +263,38 @@ export class SlackNotificationDaemon {
 					!this.#started ||
 					this.#startedGeneration !== lifecycleGeneration
 				) {
-					this.#started = false;
-					this.#startedGeneration = undefined;
-					this.#clearLeaseRecoveryTimer();
+					if (this.#startedGeneration === lifecycleGeneration) {
+						this.#started = false;
+						this.#startedGeneration = undefined;
+						this.#clearLeaseRecoveryTimer();
+					}
 					return;
 				}
-				this.#providerStarting = true;
+				this.#providerStartingGeneration = lifecycleGeneration;
 				try {
 					await this.options.provider.start(async envelope => {
+						if (
+							!this.#started ||
+							this.#startedGeneration !== lifecycleGeneration ||
+							lifecycleGeneration !== this.#lifecycleGeneration
+						)
+							return;
 						await this.#track(this.handleEnvelope(envelope));
 					});
-					this.#providerRunning = true;
+					if (this.#startedGeneration === lifecycleGeneration && this.#lifecycleGeneration === lifecycleGeneration)
+						this.#providerRunningGeneration = lifecycleGeneration;
 				} finally {
-					this.#providerStarting = false;
+					if (this.#providerStartingGeneration === lifecycleGeneration)
+						this.#providerStartingGeneration = undefined;
 				}
 				if (lifecycleGeneration !== this.#lifecycleGeneration || this.#startedGeneration !== lifecycleGeneration) {
-					this.#started = false;
-					this.#startedGeneration = undefined;
-					this.#providerRunning = false;
-					this.#clearLeaseRecoveryTimer();
-					if (this.#providerStopRequestedGeneration !== lifecycleGeneration) await this.options.provider.stop();
+					if (this.#startedGeneration === lifecycleGeneration) {
+						this.#started = false;
+						this.#startedGeneration = undefined;
+						this.#clearLeaseRecoveryTimer();
+					}
+					if (this.#providerRunningGeneration === lifecycleGeneration) this.#providerRunningGeneration = undefined;
+					if (!this.#providerStopRequestedGenerations.has(lifecycleGeneration)) await this.options.provider.stop();
 				}
 			} catch (error) {
 				if (this.#startedGeneration === lifecycleGeneration) {
@@ -298,23 +320,94 @@ export class SlackNotificationDaemon {
 	async stop(): Promise<void> {
 		if (this.#stopOperation) return await this.#stopOperation;
 		const lifecycleGeneration = this.#lifecycleGeneration++;
-		const stopProvider = this.#providerStarting || this.#providerRunning;
+		const stopProvider =
+			this.#providerStartingGeneration === lifecycleGeneration ||
+			this.#providerRunningGeneration === lifecycleGeneration;
 		this.#started = false;
 		this.#startedGeneration = undefined;
-		this.#providerRunning = false;
+		if (this.#providerRunningGeneration === lifecycleGeneration) this.#providerRunningGeneration = undefined;
 		this.#clearLeaseRecoveryTimer();
-		if (stopProvider) this.#providerStopRequestedGeneration = lifecycleGeneration;
-		const providerStop = stopProvider ? this.options.provider.stop() : undefined;
-		const operation = this.#enqueueLifecycle(async () => {
+		if (stopProvider) this.#providerStopRequestedGenerations.add(lifecycleGeneration);
+		const providerStop = stopProvider ? Promise.resolve().then(() => this.options.provider.stop()) : undefined;
+		if (providerStop) void providerStop.catch(() => undefined);
+		let providerStopError: unknown;
+		let providerStopRejected = false;
+		const shutdownDeadline = this.#now() + 5_000;
+		const predecessor = this.#lifecycleTail;
+		const operation = (async () => {
+			const predecessorRemaining = shutdownDeadline - this.#now();
+			const predecessorSettled =
+				predecessorRemaining > 0 &&
+				(await Promise.race([
+					predecessor.then(
+						() => true,
+						() => true,
+					),
+					Bun.sleep(predecessorRemaining).then(() => false),
+				]));
+			if (!predecessorSettled) {
+				await this.#invalidateActiveWork();
+				logger.warn(
+					"Slack lifecycle predecessor exceeded the shutdown deadline; continuing with Router revocation.",
+				);
+			}
 			// Calling provider.stop() before joining the lifecycle queue lets a provider
-			// cancel an open that resolves only after its socket is stopped.
-			if (providerStop) await providerStop;
-			// Drain until quiescent: a tracked task can schedule further tracked work
-			// (recovery/reconciliation) while we await, and any that outlives stop() would
-			// bleed timing pressure into the next daemon/test. #started is already false,
-			// so no new lease-recovery timers can be armed and the loop terminates.
-			while (this.#activeWork.size > 0) await Promise.all([...this.#activeWork]);
-		});
+			// cancel an open that resolves only after its socket is stopped. The same
+			// operation deadline covers provider teardown and admitted work draining.
+			if (providerStop) {
+				const remaining = shutdownDeadline - this.#now();
+				const stopped =
+					remaining > 0 &&
+					(await Promise.race([
+						providerStop.then(
+							() => true,
+							error => {
+								providerStopRejected = true;
+								providerStopError = error;
+								logger.warn(`Slack provider stop failed; continuing with Router revocation: ${String(error)}`);
+								return false;
+							},
+						),
+						Bun.sleep(remaining).then(() => false),
+					]));
+				if (!stopped) {
+					this.#retainProviderLifecycle(providerStop);
+					await this.#invalidateActiveWork();
+					logger.warn("Slack provider stop exceeded the shutdown deadline; continuing with Router revocation.");
+				}
+			}
+			// Drain until quiescent, but never let hung provider work prevent
+			// SessionRouter authority revocation and daemon ownership release.
+			while (this.#activeWork.size > 0) {
+				const remaining = shutdownDeadline - this.#now();
+				if (remaining <= 0) {
+					await this.#invalidateActiveWork();
+					logger.warn(
+						"Slack provider work exceeded the 5000ms shutdown drain; continuing with Router revocation.",
+					);
+					break;
+				}
+				const settled = await Promise.race([
+					Promise.allSettled([...this.#activeWork]).then(() => true),
+					Bun.sleep(remaining).then(() => false),
+				]);
+				if (!settled) {
+					await this.#invalidateActiveWork();
+					logger.warn(
+						"Slack provider work exceeded the 5000ms shutdown drain; continuing with Router revocation.",
+					);
+					break;
+				}
+			}
+			if (providerStopRejected) {
+				this.#recordProviderLifecycleError(providerStopError);
+				throw providerStopError;
+			}
+		})();
+		this.#lifecycleTail = operation.then(
+			() => undefined,
+			() => undefined,
+		);
 		this.#stopOperation = operation;
 		try {
 			await operation;
@@ -365,6 +458,29 @@ export class SlackNotificationDaemon {
 	#track<T>(work: Promise<T>): Promise<T> {
 		this.#activeWork.add(work);
 		return work.finally(() => this.#activeWork.delete(work));
+	}
+
+	async #invalidateActiveWork(): Promise<void> {
+		this.#workGeneration += 1;
+		await Promise.allSettled([...this.#workInvalidators].map(invalidate => invalidate()));
+	}
+
+	#recordProviderLifecycleError(error: unknown): void {
+		this.#providerLifecycleError = error;
+		this.#providerLifecycleErrorSet = true;
+	}
+
+	#retainProviderLifecycle(tail: Promise<void>): void {
+		this.#providerLifecycleTail = tail;
+		void tail.then(
+			() => {
+				if (this.#providerLifecycleTail === tail) this.#providerLifecycleTail = undefined;
+			},
+			error => {
+				this.#recordProviderLifecycleError(error);
+				if (this.#providerLifecycleTail === tail) this.#providerLifecycleTail = undefined;
+			},
+		);
 	}
 
 	#enqueueLifecycle<T>(operation: () => Promise<T>): Promise<T> {
@@ -430,7 +546,7 @@ export class SlackNotificationDaemon {
 	 */
 	async #bindingAuthority(sessionId: string): Promise<SlackBindingAuthority | undefined> {
 		if (this.options.resolveBindingAuthority) return await this.options.resolveBindingAuthority(sessionId);
-		const endpoint = await this.#resolveEndpoint(sessionId);
+		const endpoint = await this.#resolveAttachment(sessionId);
 		if (!endpoint || !Number.isSafeInteger(endpoint.generation) || endpoint.generation <= 0) return undefined;
 		return { sessionId, endpointGeneration: endpoint.generation };
 	}
@@ -456,14 +572,14 @@ export class SlackNotificationDaemon {
 		endpointGeneration?: number,
 		requestedClientMsgId?: string,
 	): Promise<SlackRootPublication> {
-		const endpoint = await this.#resolveEndpoint(sessionId);
+		const endpoint = await this.#resolveAttachment(sessionId);
 		if (!endpoint || (endpointGeneration !== undefined && endpoint.generation !== endpointGeneration))
 			throw new SlackEndpointBindingError("Slack root publication requires the current session endpoint.");
 		const generation = endpoint.generation;
 		const pendingKey = this.#intentKey(sessionId);
 		let claimed = false;
 		const pending = await this.store.transact(pendingKey, current => {
-			if (current?.state === "active") return current;
+			if (current?.state === "active" && current.attachmentAuthorityId === endpoint.authorityId) return current;
 			const now = this.#now();
 			if (
 				current?.rootPublicationOwner !== undefined &&
@@ -493,12 +609,17 @@ export class SlackNotificationDaemon {
 				rootPublicationLeaseExpiresAt: now + this.#publicationLeaseMs,
 				rootPublicationFence: (current?.rootPublicationFence ?? 0) + 1,
 				endpointGeneration: generation,
+				attachmentAuthorityId: endpoint.authorityId,
 				updatedAt: now,
-				seenEventIds: current?.seenEventIds ?? [],
-				seenContextIds: current?.seenContextIds ?? [],
-				seenRetryKeys: current?.seenRetryKeys ?? [],
-				seenInteractionIds: current?.seenInteractionIds ?? [],
-				inboundDispatches: current?.inboundDispatches ?? [],
+				seenEventIds: current?.attachmentAuthorityId === endpoint.authorityId ? (current?.seenEventIds ?? []) : [],
+				seenContextIds:
+					current?.attachmentAuthorityId === endpoint.authorityId ? (current?.seenContextIds ?? []) : [],
+				seenRetryKeys:
+					current?.attachmentAuthorityId === endpoint.authorityId ? (current?.seenRetryKeys ?? []) : [],
+				seenInteractionIds:
+					current?.attachmentAuthorityId === endpoint.authorityId ? (current?.seenInteractionIds ?? []) : [],
+				inboundDispatches:
+					current?.attachmentAuthorityId === endpoint.authorityId ? (current?.inboundDispatches ?? []) : [],
 			};
 		});
 		// An already-active session root is authoritative whether this daemon
@@ -524,6 +645,7 @@ export class SlackNotificationDaemon {
 					channel: this.options.channelId,
 					text: body,
 					clientMsgId,
+					...(endpoint.authorityId === undefined ? {} : { attachmentAuthorityId: endpoint.authorityId }),
 				});
 				createdRootEffect = !durable.existed;
 				posted = await this.#postDurable(effectId, sessionId, generation, durable.payload);
@@ -567,6 +689,7 @@ export class SlackNotificationDaemon {
 				state: "active",
 				rootTs: confirmedPosted.ts,
 				endpointGeneration: generation,
+				attachmentAuthorityId: endpoint.authorityId,
 				updatedAt: this.#now(),
 				lastError: undefined,
 				rootPublicationOwner: undefined,
@@ -587,7 +710,17 @@ export class SlackNotificationDaemon {
 		endpointGeneration?: number,
 		publicationId?: string,
 	): Promise<SlackConversation> {
-		const endpoint = await this.#resolveEndpoint(sessionId);
+		return await this.#track(this.#notify(sessionId, body, actionId, endpointGeneration, publicationId));
+	}
+
+	async #notify(
+		sessionId: string,
+		body: string,
+		actionId?: string,
+		endpointGeneration?: number,
+		publicationId?: string,
+	): Promise<SlackConversation> {
+		const endpoint = await this.#resolveAttachment(sessionId);
 		if (!endpoint || (endpointGeneration !== undefined && endpoint.generation !== endpointGeneration))
 			throw new SlackEndpointBindingError("Slack notification requires the current session endpoint.");
 		const generation = endpoint.generation;
@@ -602,7 +735,8 @@ export class SlackNotificationDaemon {
 		const usedExistingRoot =
 			existing?.record.state === "active" &&
 			!!existing.record.rootTs &&
-			existing.record.endpointGeneration === generation;
+			existing.record.endpointGeneration === generation &&
+			existing.record.attachmentAuthorityId === endpoint.authorityId;
 		let conversation: SlackConversation;
 		let bodyWasUsedAsRoot =
 			usedExistingRoot &&
@@ -648,6 +782,9 @@ export class SlackNotificationDaemon {
 				threadTs: conversation.rootTs,
 				text: body,
 				clientMsgId: publication.clientMsgId,
+				...(conversation.attachmentAuthorityId === undefined
+					? {}
+					: { attachmentAuthorityId: conversation.attachmentAuthorityId }),
 			});
 			return conversation;
 		}
@@ -696,6 +833,9 @@ export class SlackNotificationDaemon {
 					threadTs: conversation.rootTs,
 					text: body,
 					clientMsgId,
+					...(conversation.attachmentAuthorityId === undefined
+						? {}
+						: { attachmentAuthorityId: conversation.attachmentAuthorityId }),
 				});
 				published = await this.#postDurable(effectId, sessionId, conversationGeneration, durable.payload);
 			});
@@ -742,6 +882,10 @@ export class SlackNotificationDaemon {
 
 	/** Posts a safe command outcome to the active mapped root thread. */
 	async postCommandResult(sessionId: string, content: string): Promise<boolean> {
+		return await this.#track(this.#postCommandResult(sessionId, content));
+	}
+
+	async #postCommandResult(sessionId: string, content: string): Promise<boolean> {
 		const found = await this.findSession(sessionId, false);
 		if (found?.record.state !== "active" || !found.record.rootTs) return false;
 		const generation = this.#requireEndpointGeneration(found.record);
@@ -750,6 +894,9 @@ export class SlackNotificationDaemon {
 			threadTs: found.record.rootTs,
 			text: content,
 			clientMsgId: this.#randomId(),
+			...(found.record.attachmentAuthorityId === undefined
+				? {}
+				: { attachmentAuthorityId: found.record.attachmentAuthorityId }),
 		});
 		return true;
 	}
@@ -764,10 +911,78 @@ export class SlackNotificationDaemon {
 		);
 	}
 
-	async close(sessionId: string, marker = "Session closed."): Promise<boolean> {
+	async close(sessionId: string, marker = "Session closed.", endpointGeneration?: number): Promise<boolean> {
+		return await this.#track(this.#close(sessionId, marker, true, endpointGeneration));
+	}
+
+	async recoverCleanup(sessionId: string, endpointGeneration: number): Promise<void> {
+		const found = await this.findSession(sessionId, true);
+		if (
+			!found?.record.rootTs ||
+			found.record.state !== "active" ||
+			found.record.endpointGeneration !== endpointGeneration
+		)
+			return;
+		const effectId = `close-marker-cleanup:${sessionId}:${found.record.clientMsgId ?? found.record.rootTs}`;
+		if (found.record.cleanupEffectId !== effectId) return;
+		const effect = await this.#journal.read(effectId);
+		if (!effect || (effect.state === "terminal" && !effect.receipt?.messageId && !effect.receipt?.timestamp)) {
+			await this.store.transact(found.key, current =>
+				current?.cleanupEffectId === effectId
+					? nextRecord(current, { cleanupEffectId: undefined, updatedAt: this.#now() })
+					: current,
+			);
+			return;
+		}
+		await this.close(sessionId, "Session closed.", endpointGeneration);
+	}
+
+	async retireAttachment(sessionId: string, endpointGeneration: number): Promise<void> {
+		const found = await this.findSession(sessionId, true);
+		if (found?.record.endpointGeneration !== endpointGeneration) return;
+		await this.store.transact(found.key, current =>
+			current?.sessionId === sessionId && current.endpointGeneration === endpointGeneration
+				? nextRecord(current, {
+						state: "closed_marker",
+						pendingActionId: undefined,
+						cleanupEffectId: undefined,
+						inboundDispatches: [],
+						updatedAt: this.#now(),
+					})
+				: current,
+		);
+	}
+
+	async #close(
+		sessionId: string,
+		marker: string,
+		allowRemovedAttachment: boolean,
+		expectedEndpointGeneration?: number,
+	): Promise<boolean> {
 		const found = await this.findSession(sessionId, true);
 		if (!found?.record.rootTs || found.record.state !== "active") return false;
-		const effectId = `close-marker:${sessionId}:${found.record.clientMsgId ?? found.record.rootTs}`;
+		if (expectedEndpointGeneration !== undefined && found.record.endpointGeneration !== expectedEndpointGeneration)
+			return false;
+		const effectId = `${allowRemovedAttachment ? "close-marker-cleanup" : "close-marker"}:${sessionId}:${found.record.clientMsgId ?? found.record.rootTs}`;
+		if (allowRemovedAttachment) {
+			let admitted = false;
+			await this.store.transact(found.key, current => {
+				if (
+					current?.state !== "active" ||
+					current.sessionId !== found.record.sessionId ||
+					current.rootTs !== found.record.rootTs ||
+					current.endpointGeneration !== found.record.endpointGeneration ||
+					current.clientMsgId !== found.record.clientMsgId ||
+					(current.cleanupEffectId !== undefined && current.cleanupEffectId !== effectId)
+				)
+					return current;
+				admitted = true;
+				return current.cleanupEffectId === effectId
+					? current
+					: nextRecord(current, { cleanupEffectId: effectId, updatedAt: this.#now() });
+			});
+			if (!admitted) return false;
+		}
 		const existing = await this.#journal.read<{
 			channel: string;
 			text: string;
@@ -783,19 +998,45 @@ export class SlackNotificationDaemon {
 				threadTs: found.record.rootTs,
 				text: marker,
 				clientMsgId: existing?.payload.clientMsgId ?? this.#randomId(),
+				...(found.record.attachmentAuthorityId === undefined
+					? {}
+					: { attachmentAuthorityId: found.record.attachmentAuthorityId }),
 			},
 		);
 		await this.#postDurable(effectId, sessionId, this.#requireEndpointGeneration(found.record), durable.payload);
-		await this.store.transact(found.key, current =>
-			current
-				? nextRecord(current, { state: "closed_marker", pendingActionId: undefined, updatedAt: this.#now() })
-				: current,
-		);
+		let closed = false;
+		await this.store.transact(found.key, current => {
+			if (
+				current?.state !== "active" ||
+				current.sessionId !== found.record.sessionId ||
+				current.rootTs !== found.record.rootTs ||
+				current.endpointGeneration !== found.record.endpointGeneration ||
+				current.clientMsgId !== found.record.clientMsgId ||
+				(allowRemovedAttachment && current.cleanupEffectId !== effectId)
+			)
+				return current;
+			closed = true;
+			return nextRecord(current, {
+				state: "closed_marker",
+				cleanupEffectId: undefined,
+				pendingActionId: undefined,
+				updatedAt: this.#now(),
+			});
+		});
 
-		return true;
+		return closed;
 	}
 
 	async resume(
+		sessionId: string,
+		body: string,
+		endpointGeneration?: number,
+		publicationId?: string,
+	): Promise<SlackConversation> {
+		return await this.#track(this.#resume(sessionId, body, endpointGeneration, publicationId));
+	}
+
+	async #resume(
 		sessionId: string,
 		body: string,
 		endpointGeneration?: number,
@@ -843,7 +1084,7 @@ export class SlackNotificationDaemon {
 		endpointGeneration?: number,
 		requestedClientMsgId?: string,
 	): Promise<SlackRootPublication> {
-		const endpoint = await this.#resolveEndpoint(sessionId);
+		const endpoint = await this.#resolveAttachment(sessionId);
 		if (!endpoint || (endpointGeneration !== undefined && endpoint.generation !== endpointGeneration))
 			throw new SlackEndpointBindingError("Slack root rollover requires the current session endpoint.");
 		const generation = endpoint.generation;
@@ -872,7 +1113,11 @@ export class SlackNotificationDaemon {
 			const previousGeneration = this.#requireEndpointGeneration(previous.record);
 			if (previousGeneration > generation)
 				throw new SlackEndpointBindingError("Slack root belongs to a newer endpoint generation.");
-			if (previousGeneration === generation && (!forced || waitedForRollover))
+			if (
+				previousGeneration === generation &&
+				previous.record.attachmentAuthorityId === endpoint.authorityId &&
+				(!forced || waitedForRollover)
+			)
 				return { conversation: previous.record, created: false };
 
 			let claimed = false;
@@ -907,7 +1152,7 @@ export class SlackNotificationDaemon {
 			}
 			let closed = false;
 			try {
-				closed = await this.close(sessionId);
+				closed = await this.#track(this.#close(sessionId, "Session closed.", false, previousGeneration));
 			} catch (error) {
 				if (!(error instanceof SlackStaleEffectError)) throw error;
 				// The old-generation close marker was deliberately suppressed after
@@ -946,7 +1191,7 @@ export class SlackNotificationDaemon {
 		},
 		actorId: string,
 	): Promise<
-		{ key: string; endpoint: SlackEndpoint; sessionId: string; receipt: SlackInboundDispatchReceipt } | undefined
+		{ key: string; endpoint: SessionAttachment; sessionId: string; receipt: SlackInboundDispatchReceipt } | undefined
 	> {
 		const document = await this.store.load();
 		const matched = Object.entries(document.conversations)
@@ -971,8 +1216,13 @@ export class SlackNotificationDaemon {
 			!acceptsSlackInbound(record, inbound.rootTs, record.endpointGeneration)
 		)
 			return undefined;
-		const endpoint = await this.#resolveEndpoint(record.sessionId);
-		if (!endpoint || endpoint.generation !== record.endpointGeneration) return undefined;
+		const endpoint = await this.#resolveAttachment(record.sessionId);
+		if (
+			!endpoint ||
+			endpoint.generation !== record.endpointGeneration ||
+			record.attachmentAuthorityId !== endpoint.authorityId
+		)
+			return undefined;
 		const interactionId = text(inbound.event.client_msg_id) ?? inbound.eventId;
 		const retryKey = `${inbound.eventId}:${interactionId}`;
 		const inboundText = text(inbound.event.text);
@@ -984,6 +1234,7 @@ export class SlackNotificationDaemon {
 			teamId: inbound.teamId,
 			channelId: inbound.channelId,
 			rootTs: inbound.rootTs,
+			...(record.attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId: record.attachmentAuthorityId }),
 			eventId: inbound.eventId,
 			interactionId,
 			actorId,
@@ -1013,7 +1264,12 @@ export class SlackNotificationDaemon {
 		let sessionId: string | undefined;
 		let receipt: SlackInboundDispatchReceipt | undefined;
 		await this.store.transact(key, current => {
-			if (!current?.sessionId || !acceptsSlackInbound(current, inbound.rootTs, endpoint.generation)) return current;
+			if (
+				!current?.sessionId ||
+				!acceptsSlackInbound(current, inbound.rootTs, endpoint.generation) ||
+				current.attachmentAuthorityId !== endpoint.authorityId
+			)
+				return current;
 			const existing = (current.inboundDispatches ?? []).find(
 				candidate =>
 					candidate.eventId === inbound.eventId ||
@@ -1044,6 +1300,9 @@ export class SlackNotificationDaemon {
 				kind: command ? "command" : "action",
 				...(command ? {} : { actionId: current.pendingActionId }),
 				endpointGeneration: endpoint.generation,
+				...(current.attachmentAuthorityId === undefined
+					? {}
+					: { attachmentAuthorityId: current.attachmentAuthorityId }),
 				effectId,
 				idempotencyKey,
 			};
@@ -1057,7 +1316,8 @@ export class SlackNotificationDaemon {
 
 	async #dispatchInbound(claim: {
 		key: string;
-		endpoint: SlackEndpoint;
+		endpoint: SessionAttachment;
+
 		sessionId: string;
 		receipt: SlackInboundDispatchReceipt;
 	}): Promise<boolean> {
@@ -1079,7 +1339,8 @@ export class SlackNotificationDaemon {
 	}
 
 	async #dispatchEffect(
-		claim: { key: string; endpoint: SlackEndpoint; sessionId: string; receipt: SlackInboundDispatchReceipt },
+		claim: { key: string; endpoint: SessionAttachment; sessionId: string; receipt: SlackInboundDispatchReceipt },
+
 		effectId: string,
 	): Promise<boolean> {
 		const effect = await this.#rescheduleAfterEffectTransition(
@@ -1119,7 +1380,7 @@ export class SlackNotificationDaemon {
 			}
 			await this.#withEffectLease(effect.id, lease, async () => {
 				if (!(await this.#inboundEffectCurrent(claim, effect.id))) throw new SlackStaleEffectError();
-				this.options.createClient(claim.endpoint).send(effect.payload);
+				await claim.endpoint.send(effect.payload);
 			});
 			if (!(await this.#inboundEffectCurrent(claim, effect.id))) {
 				await this.#terminalizeStaleInboundDispatch(claim.key, claim.receipt, "stale_binding");
@@ -1145,11 +1406,18 @@ export class SlackNotificationDaemon {
 	}
 
 	async #inboundEffectCurrent(
-		claim: { key: string; endpoint: SlackEndpoint; sessionId: string; receipt: SlackInboundDispatchReceipt },
+		claim: { key: string; endpoint: SessionAttachment; sessionId: string; receipt: SlackInboundDispatchReceipt },
+
 		effectId: string,
 	): Promise<boolean> {
-		const endpoint = await this.#resolveEndpoint(claim.sessionId);
-		if (!endpoint || endpoint.generation !== claim.endpoint.generation) return false;
+		const endpoint = await this.#resolveAttachment(claim.sessionId);
+		if (!endpoint?.isCurrent()) return false;
+		if (
+			endpoint.authorityId !== undefined && claim.endpoint.authorityId !== undefined
+				? endpoint.authorityId !== claim.endpoint.authorityId
+				: endpoint.generation !== claim.endpoint.generation
+		)
+			return false;
 		const [current, effect] = await Promise.all([
 			this.store.read(claim.key),
 			this.#journal.read<SlackInboundEffectPayload>(effectId),
@@ -1160,27 +1428,61 @@ export class SlackNotificationDaemon {
 			current.sessionId === claim.sessionId &&
 			acceptsSlackInbound(current, current.rootTs ?? "", claim.endpoint.generation) &&
 			claim.receipt.endpointGeneration === claim.endpoint.generation &&
+			current.attachmentAuthorityId === claim.receipt.attachmentAuthorityId &&
+			current.attachmentAuthorityId === endpoint.authorityId &&
 			this.#matchesInboundEffect(effect, claim.receipt) &&
 			(await this.#actorAuthorized(effect.payload.routing.actorId)) &&
 			(current.inboundDispatches ?? []).some(receipt => this.#sameInboundReceipt(receipt, claim.receipt))
 		);
 	}
 
-	async #withEffectLease<T>(id: string, lease: ChatEffectLease, operation: () => Promise<T>): Promise<T> {
-		// The effect was just claimed, so its lease is current. The periodic renewal
-		// still protects the external operation without another durable write first.
-		return await this.#withRenewal(
-			operation,
-			async () => {
-				if (
-					!(await this.#rescheduleAfterEffectTransition(
-						this.#journal.renew(id, lease, Math.max(this.#publicationLeaseMs, 100)),
-					))
-				)
-					throw new Error("Slack effect lease renewal failed");
-			},
-			false,
-		);
+	async #withEffectLease<T>(
+		id: string,
+		lease: ChatEffectLease,
+		operation: () => Promise<T>,
+		workGeneration = this.#workGeneration,
+	): Promise<T> {
+		let invalidation: Promise<void> | undefined;
+		let invalidated = false;
+		const invalidate = async (): Promise<void> => {
+			invalidated = true;
+			invalidation ??= this.#rescheduleAfterEffectTransition(
+				this.#journal.record(id, lease, "uncertain", { status: "shutdown_timeout" }),
+			).then(() => undefined);
+			await invalidation;
+		};
+		this.#workInvalidators.add(invalidate);
+		const ensureLive = async (): Promise<void> => {
+			if (invalidated || workGeneration !== this.#workGeneration) {
+				await invalidate();
+				throw new Error(`Slack effect ${id} was admitted after shutdown drain expiry`);
+			}
+			if (
+				!(await this.#rescheduleAfterEffectTransition(
+					this.#journal.renew(id, lease, Math.max(this.#publicationLeaseMs, 100)),
+				))
+			)
+				throw new Error("Slack effect lease renewal failed");
+			if (workGeneration !== this.#workGeneration) {
+				await invalidate();
+				throw new Error(`Slack effect ${id} lost its shutdown fence`);
+			}
+		};
+		try {
+			await ensureLive();
+			const result = await this.#withRenewal(
+				async () => {
+					await ensureLive();
+					return await operation();
+				},
+				ensureLive,
+				false,
+			);
+			await ensureLive();
+			return result;
+		} finally {
+			this.#workInvalidators.delete(invalidate);
+		}
 	}
 
 	async #drainPendingDispatches(): Promise<void> {
@@ -1198,8 +1500,12 @@ export class SlackNotificationDaemon {
 					await this.#terminalizeStaleInboundDispatch(key, receipt, "stale_mapping");
 					continue;
 				}
-				const endpoint = await this.#resolveEndpoint(record.sessionId!);
-				if (!endpoint || endpoint.generation !== receipt.endpointGeneration) {
+				const endpoint = await this.#resolveAttachment(record.sessionId!);
+				if (
+					!endpoint ||
+					endpoint.generation !== receipt.endpointGeneration ||
+					record.attachmentAuthorityId !== endpoint.authorityId
+				) {
 					await this.#terminalizeStaleInboundDispatch(key, receipt, "stale_binding");
 					continue;
 				}
@@ -1230,7 +1536,7 @@ export class SlackNotificationDaemon {
 				continue;
 			const adopted = await this.#adoptOrphanInbound(effect as ChatEffect<SlackInboundEffectPayload>);
 			if (!adopted) continue;
-			const endpoint = await this.#resolveEndpoint(adopted.sessionId);
+			const endpoint = await this.#resolveAttachment(adopted.sessionId);
 			if (
 				!endpoint ||
 				endpoint.generation !== adopted.receipt.endpointGeneration ||
@@ -1299,6 +1605,7 @@ export class SlackNotificationDaemon {
 			receipt.kind === routing.kind &&
 			receipt.actionId === routing.actionId &&
 			receipt.endpointGeneration === effect.endpointGeneration &&
+			receipt.attachmentAuthorityId === routing.attachmentAuthorityId &&
 			receipt.effectId === effect.id &&
 			receipt.idempotencyKey === payload.idempotencyKey &&
 			((payload.type === "command" && routing.kind === "command" && effect.kind === "sdk.inbound.command") ||
@@ -1318,6 +1625,7 @@ export class SlackNotificationDaemon {
 			left.kind === right.kind &&
 			left.actionId === right.actionId &&
 			left.endpointGeneration === right.endpointGeneration &&
+			left.attachmentAuthorityId === right.attachmentAuthorityId &&
 			left.effectId === right.effectId &&
 			left.idempotencyKey === right.idempotencyKey
 		);
@@ -1333,6 +1641,8 @@ export class SlackNotificationDaemon {
 			!!record.sessionId &&
 			!!record.rootTs &&
 			acceptsSlackInbound(record, record.rootTs, receipt.endpointGeneration) &&
+			record.attachmentAuthorityId === receipt.attachmentAuthorityId &&
+			effect.payload.routing.attachmentAuthorityId === receipt.attachmentAuthorityId &&
 			record.sessionId === effect.sessionId &&
 			this.#matchesInboundEffect(effect, receipt)
 		);
@@ -1440,7 +1750,8 @@ export class SlackNotificationDaemon {
 				!current ||
 				!effect.sessionId ||
 				current.sessionId !== effect.sessionId ||
-				!acceptsSlackInbound(current, routing.rootTs, effect.endpointGeneration)
+				!acceptsSlackInbound(current, routing.rootTs, effect.endpointGeneration) ||
+				current.attachmentAuthorityId !== routing.attachmentAuthorityId
 			)
 				return current;
 			const existing = (current.inboundDispatches ?? []).find(
@@ -1471,6 +1782,9 @@ export class SlackNotificationDaemon {
 				kind: routing.kind,
 				...(routing.kind === "action" ? { actionId: routing.actionId } : {}),
 				endpointGeneration: effect.endpointGeneration,
+				...(routing.attachmentAuthorityId === undefined
+					? {}
+					: { attachmentAuthorityId: routing.attachmentAuthorityId }),
 				effectId: effect.id,
 				idempotencyKey: payload.idempotencyKey,
 			};
@@ -1489,7 +1803,8 @@ export class SlackNotificationDaemon {
 	}
 
 	async #finishDispatch(
-		claim: { key: string; endpoint: SlackEndpoint; receipt: SlackInboundDispatchReceipt },
+		claim: { key: string; endpoint: SessionAttachment; receipt: SlackInboundDispatchReceipt },
+
 		state: "terminal" | "uncertain",
 	): Promise<void> {
 		await this.store.transact(claim.key, current => {
@@ -1503,7 +1818,7 @@ export class SlackNotificationDaemon {
 
 	async #releaseDispatch(claim: {
 		key: string;
-		endpoint: SlackEndpoint;
+		endpoint: SessionAttachment;
 		receipt: SlackInboundDispatchReceipt;
 	}): Promise<void> {
 		await this.store.transact(claim.key, current => {
@@ -1734,6 +2049,7 @@ export class SlackNotificationDaemon {
 					text?: unknown;
 					threadTs?: unknown;
 					clientMsgId?: unknown;
+					attachmentAuthorityId?: unknown;
 				};
 				if (
 					typeof payload.channel !== "string" ||
@@ -1747,6 +2063,9 @@ export class SlackNotificationDaemon {
 					text: payload.text,
 					...(typeof payload.threadTs === "string" ? { threadTs: payload.threadTs } : {}),
 					clientMsgId: payload.clientMsgId,
+					...(typeof payload.attachmentAuthorityId === "string"
+						? { attachmentAuthorityId: payload.attachmentAuthorityId }
+						: {}),
 				});
 			} catch {
 				failed = true;
@@ -1855,22 +2174,32 @@ export class SlackNotificationDaemon {
 	async #providerEffectCurrent(effect: ChatEffect): Promise<boolean> {
 		if (!effect.sessionId || !Number.isSafeInteger(effect.endpointGeneration) || effect.endpointGeneration <= 0)
 			return false;
-		const endpoint = await this.#resolveEndpoint(effect.sessionId);
-		if (!endpoint || endpoint.generation !== effect.endpointGeneration) return false;
-		const payload = effect.payload as { threadTs?: unknown };
+		if (!effect.id.startsWith("close-marker-cleanup:")) {
+			const endpoint = await this.#resolveAttachment(effect.sessionId);
+			const payload = effect.payload as { attachmentAuthorityId?: unknown; threadTs?: unknown };
+			if (
+				!endpoint ||
+				endpoint.generation !== effect.endpointGeneration ||
+				payload.attachmentAuthorityId !== endpoint.authorityId
+			)
+				return false;
+		}
+		const payload = effect.payload as { attachmentAuthorityId?: unknown; threadTs?: unknown };
 		const threadTs = payload.threadTs;
 		const records = Object.values((await this.store.load()).conversations);
 		if (typeof threadTs === "string") {
 			return records.some(
 				record =>
 					record.sessionId === effect.sessionId &&
-					acceptsSlackInbound(record, threadTs, effect.endpointGeneration),
+					acceptsSlackInbound(record, threadTs, effect.endpointGeneration) &&
+					record.attachmentAuthorityId === payload.attachmentAuthorityId,
 			);
 		}
 		return records.some(
 			record =>
 				record.sessionId === effect.sessionId &&
 				record.endpointGeneration === effect.endpointGeneration &&
+				record.attachmentAuthorityId === payload.attachmentAuthorityId &&
 				record.state === "posting_root",
 		);
 	}
@@ -1897,23 +2226,34 @@ export class SlackNotificationDaemon {
 		id: string,
 		sessionId: string,
 		endpointGeneration: number,
-		expected: { channel: string; text: string; threadTs?: string; clientMsgId: string },
-	): Promise<{ payload: typeof expected; existed: boolean }> {
-		const existing = await this.#journal.read<typeof expected>(id);
-		if (!existing) return { payload: expected, existed: false };
+		expected: {
+			channel: string;
+			text: string;
+			threadTs?: string;
+			clientMsgId: string;
+			attachmentAuthorityId?: string;
+		},
+	): Promise<{
+		payload: typeof expected & { attachmentAuthorityId?: string };
+		existed: boolean;
+	}> {
+		const durableExpected = { ...expected };
+		const existing = await this.#journal.read<typeof durableExpected>(id);
+		if (!existing) return { payload: durableExpected, existed: false };
 		const payload = existing.payload;
 		if (
 			existing.kind !== "provider-post" ||
 			existing.transport !== "slack" ||
 			existing.sessionId !== sessionId ||
 			existing.endpointGeneration !== endpointGeneration ||
+			payload.attachmentAuthorityId !== durableExpected.attachmentAuthorityId ||
 			typeof payload.channel !== "string" ||
 			typeof payload.text !== "string" ||
 			typeof payload.clientMsgId !== "string" ||
 			(payload.threadTs !== undefined && typeof payload.threadTs !== "string") ||
-			payload.channel !== expected.channel ||
-			payload.threadTs !== expected.threadTs ||
-			payload.clientMsgId !== expected.clientMsgId
+			payload.channel !== durableExpected.channel ||
+			payload.threadTs !== durableExpected.threadTs ||
+			payload.clientMsgId !== durableExpected.clientMsgId
 		) {
 			throw new SlackEndpointBindingError("Slack provider effect identity does not match the durable occurrence.");
 		}
@@ -1924,10 +2264,17 @@ export class SlackNotificationDaemon {
 		id: string,
 		sessionId: string,
 		endpointGeneration: number,
-		payload: { channel: string; text: string; threadTs?: string; clientMsgId: string },
+		payload: {
+			channel: string;
+			text: string;
+			threadTs?: string;
+			clientMsgId: string;
+			attachmentAuthorityId?: string;
+		},
 	): Promise<SlackPostedMessage> {
 		if (!Number.isSafeInteger(endpointGeneration) || endpointGeneration <= 0)
 			throw new SlackEndpointBindingError("Slack provider effects require a positive endpoint generation.");
+		const workGeneration = this.#workGeneration;
 		const initial = await this.#rescheduleAfterEffectTransition(
 			this.#journal.enqueue({
 				id,
@@ -1979,19 +2326,28 @@ export class SlackNotificationDaemon {
 		const requiresReconciliation =
 			initial.state === "accepted" || initial.state === "uncertain" || initial.state === "leased";
 		try {
-			const posted = await this.#withEffectLease(id, lease, async () => {
-				const found = await this.options.provider.findMessageByClientMsgId({
-					channel: effect!.payload.channel,
-					threadTs: effect!.payload.threadTs,
-					clientMsgId: effect!.payload.clientMsgId,
-				});
-				if (found) return found;
-				if (!(await this.#providerEffectCurrent(effect!))) {
-					if (requiresReconciliation) throw new SlackReconciledAbsentEffectError();
-					throw new SlackStaleEffectError();
-				}
-				return await this.options.provider.postMessage(effect!.payload);
-			});
+			const posted = await this.#withEffectLease(
+				id,
+				lease,
+				async () => {
+					const found = await this.options.provider.findMessageByClientMsgId({
+						channel: effect!.payload.channel,
+						threadTs: effect!.payload.threadTs,
+						clientMsgId: effect!.payload.clientMsgId,
+					});
+					if (found) return found;
+					if (workGeneration !== this.#workGeneration)
+						throw new Error(`Slack effect ${id} lost its shutdown fence`);
+					if (!(await this.#providerEffectCurrent(effect!))) {
+						if (requiresReconciliation) throw new SlackReconciledAbsentEffectError();
+						throw new SlackStaleEffectError();
+					}
+					if (workGeneration !== this.#workGeneration)
+						throw new Error(`Slack effect ${id} lost its shutdown fence`);
+					return await this.options.provider.postMessage(effect!.payload);
+				},
+				workGeneration,
+			);
 
 			if (
 				!(await this.#journal.record(id, lease, "terminal", {
@@ -2024,6 +2380,7 @@ export class SlackNotificationDaemon {
 								threadTs: effect!.payload.threadTs,
 								clientMsgId: effect!.payload.clientMsgId,
 							}),
+						workGeneration,
 					);
 					if (reconciled) {
 						if (
@@ -2096,7 +2453,18 @@ export class SlackNotificationDaemon {
 	}
 
 	async #withPublicationLease<T>(operation: () => Promise<T>, renew: () => Promise<void>): Promise<T> {
-		return await this.#withRenewal(operation, renew);
+		const workGeneration = this.#workGeneration;
+		const fencedRenew = async (): Promise<void> => {
+			if (workGeneration !== this.#workGeneration) throw new Error("Slack publication lost its shutdown fence");
+			await renew();
+			if (workGeneration !== this.#workGeneration) throw new Error("Slack publication lost its shutdown fence");
+		};
+		const result = await this.#withRenewal(async () => {
+			if (workGeneration !== this.#workGeneration) throw new Error("Slack publication lost its shutdown fence");
+			return await operation();
+		}, fencedRenew);
+		if (workGeneration !== this.#workGeneration) throw new Error("Slack publication lost its shutdown fence");
+		return result;
 	}
 
 	async #withRenewal<T>(
@@ -2191,6 +2559,9 @@ export class SlackNotificationDaemon {
 						channel: payload.channel,
 						text: payload.text,
 						clientMsgId,
+						...(current.attachmentAuthorityId === undefined
+							? {}
+							: { attachmentAuthorityId: current.attachmentAuthorityId }),
 					});
 				} catch (error) {
 					if (!(error instanceof SlackStaleEffectError)) throw error;
@@ -2302,6 +2673,7 @@ export class SlackNotificationDaemon {
 	}
 	#isDefiniteSdkPreSendFailure(error: unknown): boolean {
 		if (error instanceof SlackEndpointBindingError) return true;
+		if (error instanceof SessionRouterError) return error.phase === "pre_send";
 		if (error instanceof SdkClientError) return error.code === "connection_closed";
 		return (
 			error instanceof Error &&

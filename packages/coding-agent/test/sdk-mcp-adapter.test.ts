@@ -3,8 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
-import { brokerProcessIncarnation } from "../src/sdk/broker/discovery";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
+import { SessionLifecycleService } from "../src/sdk/lifecycle";
 import { createSdkMcpServer } from "../src/sdk/mcp";
 import { OPERATIONS } from "../src/sdk/protocol/operation-registry";
 
@@ -18,9 +18,10 @@ afterEach(async () => {
 	}
 });
 
-function fixture() {
+async function fixture() {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-mcp-"));
 	dirs.push(repo);
+	const agentDir = path.join(repo, "agent");
 	const token = "sdk-mcp-test-token";
 	let sends = 0;
 	const server = Bun.serve({
@@ -51,18 +52,30 @@ function fixture() {
 	});
 	servers.push(server);
 	const sessionId = "live-session";
-	const dir = path.join(repo, ".gjc", "state", "sdk");
-	fs.mkdirSync(dir, { recursive: true });
+	const stateRoot = path.join(repo, ".gjc", "state");
+	const sdkDir = path.join(stateRoot, "sdk");
+	fs.mkdirSync(sdkDir, { recursive: true });
+	const endpointPath = path.join(sdkDir, `${sessionId}.json`);
 	fs.writeFileSync(
-		path.join(dir, `${sessionId}.json`),
-		JSON.stringify({ url: `ws://127.0.0.1:${server.port}`, token }),
+		endpointPath,
+		JSON.stringify({ sessionId, pid: process.pid, url: `ws://127.0.0.1:${server.port}`, token }),
 	);
-	return { repo, sessionId, sent: () => sends };
+	const broker = new Broker({ agentDir, packageGeneration: "test" });
+	await broker.start();
+	await broker.index.append({
+		type: "host_registered",
+		sessionId,
+		locator: { repo, stateRoot },
+		endpointGeneration: 1,
+		pid: process.pid,
+		endpointMtimeMs: fs.statSync(endpointPath).mtimeMs,
+	});
+	return { repo, agentDir, sessionId, endpointPath, sent: () => sends };
 }
 
 test("MCP SDK schemas exclude endpoint credentials and reject G02 before any WebSocket send", async () => {
-	const { repo, sessionId, sent } = fixture();
-	const mcp = createSdkMcpServer({ repo });
+	const { agentDir, sessionId, sent } = await fixture();
+	const mcp = createSdkMcpServer({ agentDir });
 	expect(JSON.stringify(mcp.tools)).not.toContain("get_endpoint");
 	await expect(mcp.callTool("gjc_session_control", { sessionId, operation: "session.get_endpoint" })).resolves.toEqual(
 		{ ok: false, error: expect.objectContaining({ code: "unknown_operation" }) },
@@ -72,95 +85,57 @@ test("MCP SDK schemas exclude endpoint credentials and reject G02 before any Web
 		error: expect.objectContaining({ code: "endpoint_credential_forbidden" }),
 	});
 	expect(sent()).toBe(0);
+	await mcp.close();
 });
 
 test("MCP lifecycle responses never expose broker endpoint credentials", async () => {
-	const { repo } = fixture();
-	const agentDir = path.join(repo, "agent");
-	const brokerDir = path.join(agentDir, "sdk");
-	fs.mkdirSync(brokerDir, { recursive: true });
-	const incarnation = brokerProcessIncarnation(process.pid);
-	if (!incarnation) throw new Error(`Current process incarnation is unavailable for pid ${process.pid}.`);
-	fs.writeFileSync(
-		path.join(brokerDir, "broker.json"),
-		JSON.stringify({
-			version: 1,
-			protocolVersion: 3,
-			packageGeneration: "test",
-			ownerId: "mcp-owner",
-			pid: process.pid,
-			incarnation,
-			host: "127.0.0.1",
-			port: 1,
-			url: "ws://broker.example.test",
-			token: "broker-discovery-secret",
-			startedAt: Date.now(),
-			heartbeatAt: Date.now(),
+	const { repo, agentDir } = await fixture();
+	const lifecycleService = new SessionLifecycleService({
+		global: async () => ({
+			ok: true,
+			result: {
+				sessionId: "created-session",
+				endpoint: { url: "ws://session.example.test?token=url-secret", token: "session-secret" },
+				token: "result-secret",
+			},
 		}),
-	);
-	const mcp = createSdkMcpServer({
-		repo,
-		agentDir,
-		connect: async () =>
-			({
-				global: async () => ({
-					ok: true,
-					result: {
-						sessionId: "created-session",
-						endpoint: { url: "ws://session.example.test?token=url-secret", token: "session-secret" },
-						token: "result-secret",
-					},
-				}),
-				close: async () => {},
-			}) as never,
 	});
+	const mcp = createSdkMcpServer({ agentDir, lifecycleService });
 	const result = await mcp.callTool("gjc_session_global", {
 		operation: "session.create",
 		input: { cwd: repo },
 		idempotencyKey: "create-1",
 	});
-	expect(result).toEqual({ ok: true, result: { sessionId: "created-session" } });
+	expect(result).toEqual({ ok: true, operation: "session.create", result: { sessionId: "created-session" } });
 	expect(JSON.stringify(result)).not.toContain("secret");
+	await mcp.close();
 });
 
-test("MCP forwards the lifecycle startup budget to the broker client deadline", async () => {
+test("MCP forwards the lifecycle startup budget to the lifecycle service", async () => {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-mcp-startup-budget-"));
 	dirs.push(repo);
 	const agentDir = path.join(repo, "agent");
-	const broker = new Broker({ agentDir });
 	let forwardedTimeoutMs: number | undefined;
-	await broker.start();
-	try {
-		const result = await createSdkMcpServer({
-			repo,
-			agentDir,
-			connect: async () =>
-				({
-					global: async (
-						_operation: string,
-						_input: Record<string, unknown>,
-						options?: { timeoutMs?: number },
-					) => {
-						forwardedTimeoutMs = options?.timeoutMs;
-						return { ok: true, result: { sessionId: "created-session" } };
-					},
-					close: async () => {},
-				}) as never,
-		}).callTool("gjc_session_global", {
-			operation: "session.create",
-			input: { cwd: repo, readinessTimeoutMs: 4_000 },
-			idempotencyKey: "forward-startup-budget",
-		});
-		expect(result).toEqual({ ok: true, result: { sessionId: "created-session" } });
-		expect(forwardedTimeoutMs).toBe(9_000);
-	} finally {
-		await broker.stop();
-	}
+	const lifecycleService = new SessionLifecycleService({
+		global: async (_operation, _input, options) => {
+			forwardedTimeoutMs = options.timeoutMs;
+			return { ok: true, result: { sessionId: "created-session" } };
+		},
+	});
+	const mcp = createSdkMcpServer({ agentDir, lifecycleService });
+	const result = await mcp.callTool("gjc_session_global", {
+		operation: "session.create",
+		input: { cwd: repo, readinessTimeoutMs: 4_000 },
+		idempotencyKey: "forward-startup-budget",
+	});
+	expect(result).toEqual({ ok: true, operation: "session.create", result: { sessionId: "created-session" } });
+	expect(forwardedTimeoutMs).toBe(9_000);
+	await mcp.close();
 });
 
 test("MCP global schema exposes and requires caller lifecycle idempotency keys", async () => {
-	const { repo } = fixture();
-	const mcp = createSdkMcpServer({ repo });
+	const { repo, agentDir } = await fixture();
+	const mcp = createSdkMcpServer({ agentDir });
 	const global = mcp.tools.find(tool => tool.name === "gjc_session_global")!;
 	expect(global.inputSchema).toMatchObject({ properties: { idempotencyKey: { type: "string" } } });
 	await expect(
@@ -169,57 +144,47 @@ test("MCP global schema exposes and requires caller lifecycle idempotency keys",
 		ok: false,
 		error: { code: "invalid_input" },
 	});
+	await mcp.close();
 });
 
-test("MCP rejects unknown operation names before discovery or connection", async () => {
-	const { repo, sessionId } = fixture();
-	let connects = 0;
-	const mcp = createSdkMcpServer({
-		repo,
-		connect: async () => {
-			connects++;
-			throw new Error("must not connect");
-		},
-	});
+test("MCP rejects unknown operation names before Router startup or connection", async () => {
+	const { agentDir, sessionId } = await fixture();
+	const mcp = createSdkMcpServer({ agentDir });
 	for (const [tool, args] of [
 		["gjc_session_control", { sessionId, operation: "not.real" }],
 		["gjc_session_query", { sessionId, query: "not.real" }],
 		["gjc_session_global", { operation: "not.real" }],
 	] as const)
 		expect(await mcp.callTool(tool, args)).toMatchObject({ ok: false, error: { code: "unknown_operation" } });
-	expect(connects).toBe(0);
+	await mcp.close();
 });
 
-test("MCP preserves corrupt endpoint discovery errors with a relative path", async () => {
-	const { repo, sessionId } = fixture();
-	const endpoint = path.join(repo, ".gjc", "state", "sdk", `${sessionId}.json`);
-	fs.writeFileSync(endpoint, "not-json");
-	const result = await createSdkMcpServer({ repo }).callTool("gjc_session_query", {
-		sessionId,
-		query: "session.metadata",
-	});
-	expect(result).toMatchObject({ ok: false, error: { code: "discovery_error", path: `${sessionId}.json` } });
+test("MCP fails closed on corrupt endpoint records without exposing discovery details", async () => {
+	const { agentDir, sessionId, endpointPath } = await fixture();
+	fs.writeFileSync(endpointPath, "not-json");
+	const mcp = createSdkMcpServer({ agentDir });
+	const result = await mcp.callTool("gjc_session_query", { sessionId, query: "session.metadata" });
+	expect(result).toMatchObject({ ok: false, error: { code: "not_found" } });
+	await mcp.close();
 });
 
-test("MCP preserves unreadable endpoint discovery errors", async () => {
+test("MCP fails closed on unreadable endpoint records without exposing discovery details", async () => {
 	if (process.platform === "win32") return;
-	const { repo, sessionId } = fixture();
-	const endpoint = path.join(repo, ".gjc", "state", "sdk", `${sessionId}.json`);
-	fs.chmodSync(endpoint, 0o000);
+	const { agentDir, sessionId, endpointPath } = await fixture();
+	fs.chmodSync(endpointPath, 0o000);
 	try {
-		const result = await createSdkMcpServer({ repo }).callTool("gjc_session_query", {
-			sessionId,
-			query: "session.metadata",
-		});
-		expect(result).toMatchObject({ ok: false, error: { code: "discovery_error", path: `${sessionId}.json` } });
+		const mcp = createSdkMcpServer({ agentDir });
+		const result = await mcp.callTool("gjc_session_query", { sessionId, query: "session.metadata" });
+		expect(result).toMatchObject({ ok: false, error: { code: "not_found" } });
+		await mcp.close();
 	} finally {
-		fs.chmodSync(endpoint, 0o600);
+		fs.chmodSync(endpointPath, 0o600);
 	}
 });
 
 test("MCP rejects every registry-prohibited operation without sending a frame or exposing secret input", async () => {
-	const { repo, sessionId, sent } = fixture();
-	const mcp = createSdkMcpServer({ repo });
+	const { agentDir, sessionId, sent } = await fixture();
+	const mcp = createSdkMcpServer({ agentDir });
 	const blocked = OPERATIONS.filter(
 		operation =>
 			(operation.kind === "control" || operation.kind === "global") &&
@@ -236,11 +201,13 @@ test("MCP rejects every registry-prohibited operation without sending a frame or
 		expect(JSON.stringify(result)).not.toContain("mcp-secret");
 	}
 	expect(sent()).toBe(0);
+	await mcp.close();
 });
 
-test("MCP rejects secret-bearing config patches before endpoint discovery", async () => {
-	const { repo, sessionId, sent } = fixture();
-	const result = await createSdkMcpServer({ repo }).callTool("gjc_session_control", {
+test("MCP rejects secret-bearing config patches before Router startup", async () => {
+	const { agentDir, sessionId, sent } = await fixture();
+	const mcp = createSdkMcpServer({ agentDir });
+	const result = await mcp.callTool("gjc_session_control", {
 		sessionId,
 		operation: "config.patch",
 		input: { patch: { apiKey: "mcp-secret" } },
@@ -248,11 +215,12 @@ test("MCP rejects secret-bearing config patches before endpoint discovery", asyn
 	expect(result).toMatchObject({ ok: false, error: { code: "secret_field_forbidden" } });
 	expect(JSON.stringify(result)).not.toContain("mcp-secret");
 	expect(sent()).toBe(0);
+	await mcp.close();
 });
 
-test("MCP SDK control/query tools use discovered live session endpoints and unknown sessions are typed", async () => {
-	const { repo, sessionId } = fixture();
-	const mcp = createSdkMcpServer({ repo });
+test("MCP SDK control/query tools use Router-owned live attachments and unknown sessions are typed", async () => {
+	const { agentDir, sessionId } = await fixture();
+	const mcp = createSdkMcpServer({ agentDir });
 	await expect(
 		mcp.callTool("gjc_session_control", { sessionId, operation: "turn.prompt", input: { text: "hello" } }),
 	).resolves.toMatchObject({ ok: true, echoed: { operation: "turn.prompt" } });
@@ -262,4 +230,5 @@ test("MCP SDK control/query tools use discovered live session endpoints and unkn
 	await expect(
 		mcp.callTool("gjc_session_query", { sessionId: "missing", query: "session.metadata" }),
 	).resolves.toEqual({ ok: false, error: expect.objectContaining({ code: "not_found" }) });
+	await mcp.close();
 });
