@@ -15,6 +15,18 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Canonical lifecycle state observed by reconciliation and lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleState {
+	Accepted,
+	EffectStarted,
+	AwaitingReady,
+	TerminalOk,
+	TerminalError,
+	TerminalUncertain,
+}
+
 /// Where a `session_create` should run. Tagged by `kind` on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

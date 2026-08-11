@@ -29,3 +29,11 @@ This package is transport-only. It does not import, instantiate, dispatch to, or
 It is SDK v3 only. The historical BridgeClient/backend-bridge protocol, RPC ingress, and compatibility behavior are intentionally unsupported and must not be restored. Use the documented SDK v3 WebSocket endpoint and frames instead.
 
 `@gajae-code/coding-agent/sdk` re-exports this package for compatibility; both entrypoints expose the same `SdkClient` class identity.
+
+## Durable create, attach, and submit orchestration
+
+`SdkClient.createConnectSubscribeSubmit()` is a durable client-side orchestration convenience operation over broker create and endpoint controls. It requires a fresh `createIdempotencyKey` and a fresh, kind-scoped 1–128 character `clientRef`. Its safe canonical recovery identity (`SdkDurableLookupIdentity`) carries no create replay material — no MCP server definitions, URLs, args, env, or headers — so no potentially secret-bearing field can leak into the public identity. The identity excludes credentials, secrets, submission payloads, and endpoint credentials.
+
+The create key and submission reference are durably recorded by their existing respective authorities. There is no single-authority transactional atomicity guarantee across process failure: restart recovery uses `reconcileCreateConnectSubmit()` to resolve the composite outcome. The operation opens an operation-owned endpoint socket, completes same-incarnation replay on that socket, then writes at most one `turn.prompt` or `skill.invoke`. Ordered work is never retried. A transport failure after the write returns `submission_uncertain`, not a successful or non-executed result.
+
+Use `reconcileCreateConnectSubmit(identity, options)` for recovery. When the identity has no `sessionId`, supply the original `create` via `options.create` so the broker's idempotency key can resolve the prior create; the create is never stored on or serialized through the identity. The method queries the matching prompt or skill status, but never sends an ordered control. `unknown` means the reconciliation authority or retention cannot establish the outcome; it is not proof that the work did not execute.

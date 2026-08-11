@@ -162,6 +162,7 @@ type BrokerSession = {
 	sessionId: string;
 	locator?: { repo?: string };
 	live?: boolean;
+	terminal?: boolean;
 	endpointGeneration?: number;
 	endpointMtimeMs?: number;
 	title?: string;
@@ -252,7 +253,11 @@ export function paginateAcpSessions(
 			(value): value is BrokerSession & { locator: { repo: string } } =>
 				typeof value?.sessionId === "string" && typeof value.locator?.repo === "string",
 		)
-		.filter(value => !cwd || value.locator.repo === cwd);
+		.filter(value => !cwd || value.locator.repo === cwd)
+		// DR-1 retains closed/unregistered rows in the broker index for inspect
+		// and offline tail; ACP's session/list advertises only loadable sessions,
+		// so terminal rows are excluded here (matching the pre-DR-1 wire shape).
+		.filter(value => value.terminal !== true);
 	const sessions = filtered.slice(offset, offset + SESSION_PAGE_SIZE).map(value => {
 		const metadata = sessionMetadata.get(value.sessionId);
 		const updatedAt =
@@ -1245,7 +1250,10 @@ export class AcpAgent implements Agent {
 				if (
 					typeof candidate?.sessionId !== "string" ||
 					typeof candidate.locator?.repo !== "string" ||
-					path.resolve(candidate.locator.repo) !== path.resolve(params.cwd)
+					path.resolve(candidate.locator.repo) !== path.resolve(params.cwd) ||
+					// A DR-1 terminal row is not a loadable session: adopting its cwd
+					// here would re-arm teardown authority for a host that is gone.
+					candidate.terminal === true
 				)
 					continue;
 				if (discovered.has(candidate.sessionId))

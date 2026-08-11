@@ -28,7 +28,9 @@
  * drain it, so a chatty child whose stdout is never read can still block on a
  * full pipe. That draining is the adopter's responsibility.
  */
+import * as fs from "node:fs";
 import { logger, postmortem, ptree } from "@gajae-code/utils";
+import { type LinuxProcPidProbeResult, probeLinuxProcPidSync } from "../gjc-runtime/linux-proc";
 
 const DEFAULT_GRACEFUL_MS = 2_000;
 // Hard cap for how long `dispose()` waits after SIGKILL before giving up so a
@@ -69,6 +71,63 @@ function groupAlive(pgid: number): boolean {
 	}
 }
 
+/** Whether an unreadable `/proc` entry might still describe a running process. */
+export function procEntryMayStillBeRunning(error: unknown): boolean {
+	const code = (error as NodeJS.ErrnoException).code;
+	return code !== "ENOENT" && code !== "ESRCH";
+}
+
+/** Whether a process-group leader still has the spawn-time identity we own. */
+export function groupLeaderIdentityMatches(
+	expectedStartTime: string | undefined,
+	leader: LinuxProcPidProbeResult,
+): boolean {
+	// An absent leader cannot be a recycled leader. Its group may still contain
+	// descendants that we own, including when the root exits before we can read
+	// its start time immediately after spawn.
+	if (leader.kind === "absent") return true;
+	return expectedStartTime !== undefined && leader.kind === "live" && leader.startTime === expectedStartTime;
+}
+
+/**
+ * Whether a POSIX process group still has a *running* member. Zombies are
+ * inert: they execute no code and can only be reaped by their parent, which
+ * the owned process cannot control. Teardown must not wait on an external
+ * reaper, so disposal considers a group terminated once every member is dead
+ * or a zombie. On Linux this inspects `/proc`; elsewhere it conservatively
+ * falls back to {@link groupAlive} (zombies count as alive), so teardown there
+ * relies on the bounded SIGTERM/SIGKILL windows rather than zombie detection.
+ */
+function groupHasRunningMembers(pgid: number): boolean {
+	if (!groupAlive(pgid)) return false;
+	if (process.platform !== "linux") return true;
+	try {
+		for (const entry of fs.readdirSync("/proc")) {
+			if (entry.length === 0 || entry.charCodeAt(0) < 0x30 || entry.charCodeAt(0) > 0x39) continue;
+			let stat: string;
+			try {
+				stat = fs.readFileSync(`/proc/${entry}/stat`, "utf8");
+			} catch (error) {
+				// Entries disappearing during enumeration are expected. Every other
+				// failure leaves the member's state unknowable, so fail closed.
+				if (!procEntryMayStillBeRunning(error)) continue;
+				return true;
+			}
+			// Format: pid (comm) state ppid pgrp session tty ...; comm may contain
+			// spaces or parens, so parse everything after the last ')'.
+			const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+			const state = fields[0] ?? "";
+			if (Number(fields[2]) === pgid && state !== "Z" && state !== "X") {
+				return true;
+			}
+		}
+		return false;
+	} catch {
+		// /proc unavailable or unreadable: keep the conservative behavior.
+		return true;
+	}
+}
+
 /** Options for {@link spawnOwnedProcess}. */
 export interface SpawnOwnedOptions {
 	cwd?: string;
@@ -97,6 +156,14 @@ export interface AwaitExitResult {
 	code: number | null;
 }
 
+/** The observed outcome of an owned-process teardown attempt. */
+export type OwnedProcessTeardownStatus = "terminated" | "still_running" | "identity_unverified";
+
+/** Result of {@link OwnedProcess.dispose}. */
+export interface OwnedProcessTeardownResult {
+	status: OwnedProcessTeardownStatus;
+}
+
 /** A spawned child process owned by the runtime with guaranteed teardown. */
 export interface OwnedProcess {
 	readonly child: ptree.ChildProcess;
@@ -116,7 +183,7 @@ export interface OwnedProcess {
 	 * abort listener and deregisters from the live-owner set only after teardown
 	 * has completed. Repeated/concurrent calls return the same in-flight promise.
 	 */
-	dispose(): Promise<void>;
+	dispose(): Promise<OwnedProcessTeardownResult>;
 }
 
 const liveOwners = new Set<OwnedProcess>();
@@ -155,9 +222,10 @@ export function spawnOwnedProcess(cmd: string[], opts: SpawnOwnedOptions = {}): 
 	// On POSIX with `detached`, the child is its own process-group leader, so the
 	// group id equals its pid. `undefined` => single-process (Windows/opt-out).
 	const pgid = useGroup ? child.pid : undefined;
-
+	const groupLeader = pgid === undefined ? undefined : probeLinuxProcPidSync(pgid);
+	const groupLeaderStartTime = groupLeader?.kind === "live" ? groupLeader.startTime : undefined;
 	let disposed = false;
-	let disposePromise: Promise<void> | undefined;
+	let disposePromise: Promise<OwnedProcessTeardownResult> | undefined;
 	let deregistered = false;
 	// Terminal once teardown/reconciliation has confirmed the group is gone. A
 	// late dispose() must then be a true no-op and never re-probe a pgid the OS
@@ -172,12 +240,26 @@ export function spawnOwnedProcess(cmd: string[], opts: SpawnOwnedOptions = {}): 
 		}
 	};
 
-	const deregister = (): void => {
+	const deregister = (terminal = true): void => {
 		if (deregistered) return;
 		deregistered = true;
-		terminated = true;
+		if (terminal) terminated = true;
 		liveOwners.delete(owner);
 		removeAbort();
+	};
+
+	// Identity verification exists to stop a recycled pgid from being signalled.
+	// It is only decidable where the leader's spawn-time identity is readable
+	// (`/proc`). Elsewhere the group id is still ours for the lifetime of the
+	// owned child, so an unverifiable probe must not be reported as a mismatch —
+	// doing so skips SIGTERM/SIGKILL entirely and leaks the whole child tree.
+	const groupIdentityMatches = (): boolean => {
+		if (pgid === undefined) return false;
+		if (process.platform !== "linux") return true;
+		const leader = probeLinuxProcPidSync(pgid);
+		// Once the original leader has exited, its group can still own descendants.
+		// A replacement group has a leader at this pid, whose start time must match.
+		return groupLeaderIdentityMatches(groupLeaderStartTime, leader);
 	};
 
 	const signalTree = (signal: NodeJS.Signals): void => {
@@ -232,51 +314,68 @@ export function spawnOwnedProcess(cmd: string[], opts: SpawnOwnedOptions = {}): 
 				if (timer) clearTimeout(timer);
 			}
 		},
-		dispose(): Promise<void> {
+		dispose(): Promise<OwnedProcessTeardownResult> {
 			// Already terminal (e.g. clean drain reconciled and deregistered):
 			// never re-probe the pgid; treat dispose as a settled no-op.
 			if (terminated) {
 				disposed = true;
-				if (!disposePromise) disposePromise = Promise.resolve();
+				if (!disposePromise) disposePromise = Promise.resolve({ status: "terminated" });
 				return disposePromise;
 			}
 			if (disposePromise) return disposePromise;
 			disposed = true;
 			removeAbort();
-			disposePromise = (async () => {
+			const result = (status: OwnedProcessTeardownStatus): OwnedProcessTeardownResult => ({ status });
+			disposePromise = (async (): Promise<OwnedProcessTeardownResult> => {
 				try {
 					if (pgid !== undefined) {
-						// Group ownership: reap until the whole group is gone, even if
-						// the root has already exited (it may have backgrounded children).
-						if (!groupAlive(pgid)) return;
+						// Group ownership: terminate every *running* member, even if the
+						// root has already exited (it may have backgrounded children).
+						// Liveness is measured by running members, not raw group
+						// existence: SIGTERM'd descendants become zombies that only their
+						// parent (often PID 1) can reap, and teardown must not burn its
+						// grace window waiting on an external reaper.
+						if (!groupAlive(pgid)) return result("terminated");
+						if (!groupIdentityMatches()) return result("identity_unverified");
 						signalTree("SIGTERM");
-						if (await pollUntil(() => !groupAlive(pgid), gracefulMs)) return;
+						if (await pollUntil(() => !groupHasRunningMembers(pgid), gracefulMs)) return result("terminated");
+						if (!groupIdentityMatches()) return result("identity_unverified");
 						signalTree("SIGKILL");
-						if (!(await pollUntil(() => !groupAlive(pgid), SIGKILL_REAP_CAP_MS))) {
-							logger.warn("owned process group still alive after SIGKILL", {
-								name: opts.name,
-								pgid,
-							});
-						}
-						return;
+						if (await pollUntil(() => !groupHasRunningMembers(pgid), SIGKILL_REAP_CAP_MS))
+							return result("terminated");
+						logger.warn("owned process group still running after SIGKILL", {
+							name: opts.name,
+							pgid,
+						});
+						return result("still_running");
 					}
 					// Single-process fallback (Windows / processGroup:false).
-					if (child.exitCode !== null) return;
+					if (child.exitCode !== null) return result("terminated");
 					signalTree("SIGTERM");
-					if ((await owner.awaitExit({ timeoutMs: gracefulMs })).exited) return;
+					if ((await owner.awaitExit({ timeoutMs: gracefulMs })).exited) return result("terminated");
 					signalTree("SIGKILL");
-					await owner.awaitExit({ timeoutMs: SIGKILL_REAP_CAP_MS });
+					return (await owner.awaitExit({ timeoutMs: SIGKILL_REAP_CAP_MS })).exited
+						? result("terminated")
+						: result("still_running");
 				} catch (err) {
 					logger.warn("owned process dispose failed", {
 						name: opts.name,
 						error: err instanceof Error ? err.message : String(err),
 					});
-				} finally {
-					// FIX: deregister only after teardown has completed so a postmortem
-					// firing mid-grace still sees the owner and awaits this dispose.
-					deregister();
+					return result("still_running");
 				}
-			})();
+			})().then(res => {
+				// `identity_unverified` and `still_running` leave the owner registered
+				// so a later postmortem or caller retry can make another bounded attempt.
+				// Only a confirmed `terminated` closes the book.
+				if (res.status === "terminated") {
+					deregister(true);
+				} else {
+					disposePromise = undefined;
+					disposed = false;
+				}
+				return res;
+			});
 			return disposePromise;
 		},
 	};

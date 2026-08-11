@@ -615,7 +615,121 @@ test("Telegram cleanup is never retained without a registration token", async ()
 	}
 }, 60_000);
 
-test("Telegram ownership races publish safe siblings only in broker-authorized chat scope", async () => {
+test("shutdown releases a Telegram root registered before sibling readiness settles", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-root-startup-race-"));
+	dirs.push(cwd);
+	const sessionId = `telegram-root-startup-race-${Date.now()}`;
+	const settings = telegramSettings(path.join(cwd, "agent"), true);
+	settings.set("notifications.discord.enabled", true);
+	settings.set("notifications.discord.botToken", "discord-token");
+	settings.set("notifications.discord.applicationId", "discord-app");
+	settings.set("notifications.discord.guildId", "discord-guild");
+	settings.set("notifications.discord.parentChannelId", "discord-parent");
+	const registered = Promise.withResolvers<void>();
+	const releaseProvider = Promise.withResolvers<void>();
+	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
+	const unregister = spyOn(telegramDaemon, "unregisterNotificationRoot");
+	let registrationToken: string | undefined;
+	try {
+		const sessionContext = context(cwd, sessionId);
+		const handlers = start(
+			sessionContext,
+			settings,
+			() => {},
+			false,
+			new Map(),
+			{ startupCapability: capability, lifecycleRequired: true },
+			false,
+			async input => {
+				const registration = await telegramDaemon.registerNotificationRoot(input);
+				registrationToken = registration.token;
+				input.onRegistered?.(registration);
+				registered.resolve();
+				return "attached";
+			},
+			undefined,
+			async () => await releaseProvider.promise,
+		);
+		const startup = Promise.resolve(handlers.get("session_start")!({ type: "session_start" }, sessionContext));
+		await registered.promise;
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+		expect(unregister).toHaveBeenCalledWith(expect.objectContaining({ sessionId, registrationToken }));
+		const rootsFile = telegramDaemon.daemonPaths(settings.getAgentDir()).roots;
+		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8"))).toEqual({
+			version: 1,
+			roots: [],
+			managedRoots: [],
+			sessions: {},
+			registrationTokens: {},
+		});
+		releaseProvider.resolve();
+		await startup;
+		await expect(capability.promise).resolves.toMatchObject({ status: "failed" });
+	} finally {
+		releaseProvider.resolve();
+		unregister.mockRestore();
+	}
+}, 60_000);
+
+test("provider retry replaces and releases the Telegram root registration token", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-root-provider-retry-"));
+	dirs.push(cwd);
+	const sessionId = `telegram-root-provider-retry-${Date.now()}`;
+	const settings = telegramSettings(path.join(cwd, "agent"), true);
+	settings.set("notifications.discord.enabled", true);
+	settings.set("notifications.discord.botToken", "discord-token");
+	settings.set("notifications.discord.applicationId", "discord-app");
+	settings.set("notifications.discord.guildId", "discord-guild");
+	settings.set("notifications.discord.parentChannelId", "discord-parent");
+	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
+	const unregister = spyOn(telegramDaemon, "unregisterNotificationRoot");
+	const registrationTokens: string[] = [];
+	let providerAttempts = 0;
+	try {
+		const sessionContext = context(cwd, sessionId);
+		const handlers = start(
+			sessionContext,
+			settings,
+			() => {},
+			false,
+			new Map(),
+			{ startupCapability: capability, lifecycleRequired: true },
+			false,
+			async input => {
+				const registration = await telegramDaemon.registerNotificationRoot(input);
+				registrationTokens.push(registration.token);
+				input.onRegistered?.(registration);
+				return "attached";
+			},
+			undefined,
+			async () => {
+				providerAttempts++;
+				if (providerAttempts === 1) throw new Error("Discord unavailable");
+			},
+		);
+		await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
+		await expect(capability.promise).resolves.toEqual({ status: "started" });
+		expect(providerAttempts).toBe(2);
+		expect(registrationTokens.length).toBeGreaterThanOrEqual(2);
+		expect(registrationTokens.at(-1)).not.toBe(registrationTokens[0]);
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+		expect(unregister).toHaveBeenCalledWith(
+			expect.objectContaining({ sessionId, registrationToken: registrationTokens.at(-1) }),
+		);
+		const rootsFile = telegramDaemon.daemonPaths(settings.getAgentDir()).roots;
+		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8"))).toEqual({
+			version: 1,
+			roots: [],
+			managedRoots: [],
+			sessions: {},
+			registrationTokens: {},
+		});
+	} finally {
+		unregister.mockRestore();
+	}
+}, 60_000);
+
+test("late Telegram ownership races preserve the published canonical core endpoint", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-sibling-isolation-"));
 	dirs.push(cwd);
 	const agentDir = path.join(cwd, "agent");
@@ -654,16 +768,16 @@ test("Telegram ownership races publish safe siblings only in broker-authorized c
 	await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
 	await expect(capability.promise).resolves.toEqual({ status: "started" });
 	const defaultEndpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-	const chatStateRoot = path.join(cwd, ".gjc", "state", "chat");
-	const chatEndpoint = path.join(chatStateRoot, "sdk", `${sessionId}.json`);
-	expect(fs.existsSync(defaultEndpoint)).toBe(false);
-	expect(fs.existsSync(chatEndpoint)).toBe(true);
+	const stateRoot = path.join(cwd, ".gjc", "state");
+	const chatEndpoint = path.join(stateRoot, "chat", "sdk", `${sessionId}.json`);
+	expect(fs.existsSync(defaultEndpoint)).toBe(true);
+	expect(fs.existsSync(chatEndpoint)).toBe(false);
 	const sessions = (await new SessionIndex(agentDir).open()).listSessions().sessions;
 	expect(sessions).toContainEqual(
 		expect.objectContaining({
 			sessionId,
-			locator: { repo: path.resolve(cwd), stateRoot: chatStateRoot },
-			endpointMtimeMs: fs.statSync(chatEndpoint).mtimeMs,
+			locator: { repo: path.resolve(cwd), stateRoot },
+			endpointMtimeMs: fs.statSync(defaultEndpoint).mtimeMs,
 		}),
 	);
 	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
@@ -3698,11 +3812,20 @@ test("SDK endpoint applies typed skill, plan, goal, and config controls with obs
 		...context(cwd, sessionId),
 		getSkillState: () => activeSkills,
 		getGoalState: () => goal,
-		invokeSkill: async (name: string, args?: string) => {
+		invokeSkill: async (
+			name: string,
+			args?: string,
+			options?: {
+				onSkillPrepared?: (meta: { name: string; path: string }) => void;
+				onPreflightAcceptCommit?: () => Promise<void>;
+			},
+		) => {
 			if (name !== "fixture-skill")
 				throw Object.assign(new Error(`Skill ${name} was not found.`), { code: "invalid_input" });
+			options?.onSkillPrepared?.({ name, path: "fixture-skill.md" });
+			await options?.onPreflightAcceptCommit?.();
 			activeSkills.push({ name, args });
-			return { name, args };
+			return "production skill completion";
 		},
 		setPlanMode: (on: boolean) => {
 			plan = on ? { enabled: true, planFilePath: "local://PLAN.md" } : undefined;
@@ -3766,13 +3889,22 @@ test("SDK endpoint applies typed skill, plan, goal, and config controls with obs
 			type: "control_request",
 			id: "skill",
 			operation: "skill.invoke",
-			input: { name: "fixture-skill", args: "run" },
+			input: { name: "fixture-skill", args: "run", clientRef: "skill-result" },
 		}),
 	).toMatchObject({ ok: true });
 	expect(await request("q11", { type: "query_request", id: "q11", query: "Q11" })).toMatchObject({
 		ok: true,
 		page: { items: [{ name: "fixture-skill", args: "run" }] },
 	});
+	await Bun.sleep(50);
+	expect(
+		await request("turn-result", {
+			type: "query_request",
+			id: "turn-result",
+			query: "turn.result",
+			input: { kind: "skill", clientRef: "skill-result" },
+		}),
+	).toMatchObject({ ok: true, result: { status: "terminal_ok", content: { text: "production skill completion" } } });
 	expect(
 		await request("plan", { type: "control_request", id: "plan", operation: "mode.plan.set", input: { on: true } }),
 	).toMatchObject({ ok: true, result: { state: { enabled: true, planFilePath: "local://PLAN.md" } } });
@@ -5842,7 +5974,7 @@ test("turn.prompt_status validates selectors and rejects invalid clientRef input
 			input: { clientRef: "r" },
 			cursor: "x",
 		}),
-	).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+	).toMatchObject({ ok: false, error: { code: "invalid_cursor" } });
 	expect(
 		await request({
 			type: "query_request",

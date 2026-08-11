@@ -39,9 +39,10 @@ pub use discovery::{
 };
 pub use lifecycle::{
 	LifecycleClientMessage, LifecycleEndpoint, LifecycleErrorReason, LifecycleServerMessage,
-	LifecycleStatus, MatchedBy, ResumeCandidate, ResumeMode, SessionClose, SessionCloseResponse,
-	SessionCloseTarget, SessionCreate, SessionCreateResponse, SessionCreateTarget,
-	SessionLifecycleError, SessionResume, SessionResumeResponse, SessionResumeTarget,
+	LifecycleState, LifecycleStatus, MatchedBy, ResumeCandidate, ResumeMode, SessionClose,
+	SessionCloseResponse, SessionCloseTarget, SessionCreate, SessionCreateResponse,
+	SessionCreateTarget, SessionLifecycleError, SessionResume, SessionResumeResponse,
+	SessionResumeTarget,
 };
 pub use protocol::{
 	ActionKind, ActionNeeded, ActionResolved, ActionUnavailable, ActionUnavailableReason,

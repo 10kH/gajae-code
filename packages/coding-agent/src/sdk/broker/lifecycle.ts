@@ -1959,6 +1959,7 @@ type SignalTarget = {
 	pid: number;
 	lifecycleRequestId?: string;
 	processIncarnation?: string;
+	hostIncarnation?: string;
 };
 
 /**
@@ -1981,7 +1982,11 @@ async function hasDurableProcessIdentity(target: SignalTarget, id: string, expec
 			marker.incarnation === processIncarnation(target.pid)
 		);
 	if (expected && (expected.pid !== target.pid || target.lifecycleRequestId !== expected.effectMarker)) return false;
-	return target.processIncarnation !== undefined && target.processIncarnation === processIncarnation(target.pid);
+	// Hosts that pass an explicit incarnation record it as `processIncarnation`;
+	// the index's append path auto-stamps `hostIncarnation` for everything else.
+	// Either binding is the same pid-to-incarnation proof.
+	const recorded = target.hostIncarnation ?? target.processIncarnation;
+	return recorded !== undefined && recorded === processIncarnation(target.pid);
 }
 
 async function hasOwnedReadinessEvidence(
@@ -3064,7 +3069,9 @@ async function revalidateCloseGeneration(
 function isTransportFailure(error: unknown): error is SdkClientError {
 	return (
 		error instanceof SdkClientError &&
-		["unavailable", "timeout", "connection_closed", "reconnect_exhausted"].includes(error.code)
+		["unavailable", "timeout", "connection_closed", "uncertain_after_send", "reconnect_exhausted"].includes(
+			error.code,
+		)
 	);
 }
 
@@ -3440,6 +3447,11 @@ async function executeLifecycleResponse(
 	let record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	if (operation === "session.close") {
 		if (!record) return fail("not_found", "session is not indexed");
+		// DR-1 retains closed/unregistered rows for inspect and offline tail.
+		// Pre-DR-1 they vanished from the listing and close answered not_found;
+		// a terminal row is the same already-gone outcome, never an escalation
+		// target — signalling its recorded pid could hit a reused process.
+		if (record.terminal) return fail("resource_gone", "Session is already closed and unregistered.");
 		if (record.terminalUncertain)
 			return fail("terminal_uncertain", "Session ownership is uncertain and cannot be closed safely.");
 		const requestedAuthority = requestedCloseAuthority(input);
@@ -4599,18 +4611,30 @@ export interface ReapedSessionRegistration {
 /**
  * Drops every indexed session registration whose host process is provably gone.
  *
- * Liveness is the session index's own `alive(pid)` probe (`listSessions().live`),
- * which reports live for both a running pid and an EPERM pid, so an alien or
- * unreadable process is never mistaken for a dead one. Registrations already
- * marked `terminalUncertain` are left alone: their disposition belongs to the
- * terminal-uncertainty reconciliation path, and silently dropping them would
- * turn a fail-closed `session.close`/`session.delete` refusal into `not_found`.
+ * Proof of death is positive, never inferred from a missing liveness proof:
+ * `observeProcess` reports "exited" only on ESRCH or on a readable OS process
+ * incarnation that differs from the recorded one (a reused pid). A stale or
+ * missing heartbeat merely makes a session read as not-live — the host may
+ * still be running ahead of the next heartbeat checkpoint pass, so it is never
+ * grounds for a reap. EPERM and unreadable incarnations stay "uncertain", so an
+ * alien or unreadable process is never mistaken for a dead one. Registrations
+ * already terminal or marked `terminalUncertain` are left alone: their
+ * disposition belongs to the terminal-uncertainty reconciliation path, and
+ * silently dropping them would turn a fail-closed `session.close`/
+ * `session.delete` refusal into `not_found`.
  */
 export async function reapDeadSessionRegistrations(
 	broker: Pick<Broker, "index">,
 ): Promise<ReapedSessionRegistration[]> {
 	await broker.index.refresh();
-	const dead = broker.index.listSessions().sessions.filter(session => !session.live && !session.terminalUncertain);
+	const dead = broker.index
+		.listSessions()
+		.sessions.filter(
+			session =>
+				!session.terminal &&
+				!session.terminalUncertain &&
+				observeProcess(session.pid, session.hostIncarnation ?? session.processIncarnation) === "exited",
+		);
 	const reaped: ReapedSessionRegistration[] = [];
 	for (const session of dead) {
 		await broker.index.append({

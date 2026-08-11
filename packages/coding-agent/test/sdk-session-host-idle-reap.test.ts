@@ -335,12 +335,16 @@ test("the broker drops registrations whose host process is gone, keeps live ones
 
 		const reaped = await reapDeadSessionRegistrations({ index });
 		expect(reaped).toEqual([{ sessionId: "leaked", pid: deadPid, endpointGeneration: 2 }]);
-		expect(
-			index
-				.listSessions()
-				.sessions.map(session => session.sessionId)
-				.sort(),
-		).toEqual(["live", "uncertain"]);
+		// DR-1: a reaped registration stays listed for inspect/offline tail, but
+		// reads terminal and not-live; the survivors keep their standing.
+		const afterFirstSweep = index.listSessions().sessions;
+		expect(afterFirstSweep.map(session => session.sessionId).sort()).toEqual(["leaked", "live", "uncertain"]);
+		expect(afterFirstSweep.find(session => session.sessionId === "leaked")).toMatchObject({
+			terminal: true,
+			live: false,
+		});
+		expect(afterFirstSweep.find(session => session.sessionId === "live")?.terminal).toBe(false);
+		expect(afterFirstSweep.find(session => session.sessionId === "uncertain")?.terminalUncertain).toBe(true);
 		expect(warn.mock.calls.filter(call => String(call[0]).includes("reaped a session registration")).length).toBe(1);
 
 		// A second sweep has nothing left to prove gone.
@@ -350,7 +354,7 @@ test("the broker drops registrations whose host process is gone, keeps live ones
 				.listSessions()
 				.sessions.map(session => session.sessionId)
 				.sort(),
-		).toEqual(["live", "uncertain"]);
+		).toEqual(["leaked", "live", "uncertain"]);
 	} finally {
 		warn.mockRestore();
 		await fs.rm(agentDir, { recursive: true, force: true });
