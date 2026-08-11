@@ -3233,7 +3233,7 @@ export class AgentSession {
 	}
 
 	/** Restore a temporary scope, unwinding any auto-owned scopes above it. */
-	restoreTemporaryProviderSessionScope(token: TemporaryProviderSessionScope): boolean {
+	async restoreTemporaryProviderSessionScope(token: TemporaryProviderSessionScope): Promise<boolean> {
 		const scopeIndex = this.#temporaryProviderSessionScopes.findLastIndex(scope => scope.token === token);
 		if (
 			scopeIndex < 0 ||
@@ -3242,12 +3242,12 @@ export class AgentSession {
 			return false;
 		}
 		while (this.#temporaryProviderSessionScopes.length > scopeIndex) {
-			this.#restoreTopTemporaryProviderSessionScope();
+			await this.#restoreTopTemporaryProviderSessionScope();
 		}
 		return true;
 	}
 
-	#restoreTopTemporaryProviderSessionScope(): void {
+	async #restoreTopTemporaryProviderSessionScope(): Promise<void> {
 		const scope = this.#temporaryProviderSessionScopes.pop();
 		if (!scope) return;
 		this.#closeProviderSessionMap(this.#providerSessionState, "temporary scope restore");
@@ -3266,7 +3266,7 @@ export class AgentSession {
 		this.#pendingThinkingVisibilityControlFailure = undefined;
 		this.#thinkingLevel = scope.thinkingLevel;
 		this.agent.setThinkingLevel(toReasoningEffort(scope.thinkingLevel));
-		void this.#syncEditToolModeAfterModelChange(previousEditMode);
+		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
 	/** Promote a temporary scope. The suspended provider state is permanently closed. */
@@ -11470,7 +11470,7 @@ export class AgentSession {
 			if (options?.persistAsSessionDefault === true) this.#clearActiveModelProfileForConcreteDefault(options?.cause);
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
 		} catch (error) {
-			if (ownsScope) this.restoreTemporaryProviderSessionScope(scope);
+			if (ownsScope) await this.restoreTemporaryProviderSessionScope(scope);
 			throw error;
 		}
 		return scope;
@@ -14121,7 +14121,7 @@ export class AgentSession {
 				signal,
 			});
 			if (signal?.aborted) {
-				if (scope) this.restoreTemporaryProviderSessionScope(scope);
+				if (scope) await this.restoreTemporaryProviderSessionScope(scope);
 				return false;
 			}
 			logger.debug("Context promotion switched model on overflow", {
