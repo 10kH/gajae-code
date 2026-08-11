@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
 /**
- * Per-session forum-topic registry for the threaded session surface.
+ * Forum-topic registry for eligible orchestration sessions on the threaded
+ * Telegram surface.
  *
- * Each GJC session owns one active Telegram forum topic. Remote archive closes
- * daemon-created topics without deleting their durable records; rotated
- * successors move inactive records into retained history before creating a new
- * active authority. The registry also tracks whether the one-time identity
- * header has already been pinned.
+ * Each eligible orchestration session owns one active Telegram forum topic.
+ * Remote archive closes daemon-created topics without deleting their durable
+ * records; rotated successors move inactive records into retained history before
+ * creating a new active authority. The registry also tracks whether the one-time
+ * identity header has already been pinned.
  *
  * State is a plain serialisable map persisted beside the daemon state files;
  * topic creation is injected so this module is pure and unit-testable without a

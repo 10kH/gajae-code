@@ -44,6 +44,11 @@ import {
 	withNotificationRootRegistryFence,
 } from "@gajae-code/coding-agent/sdk/bus/telegram-daemon";
 
+import {
+	withoutTelegramOrchestrationProvenance,
+	withTelegramOrchestrationProvenance,
+} from "./helpers/telegram-topic-test";
+
 const TOKEN = "1234567890:ABCDEFghijkLmnOpQrsTuvWxYz012345678";
 
 function receipt(): CasReceipt {
@@ -354,6 +359,7 @@ describe("notification settings controller adapter", () => {
 		const setupCalls: Array<Record<string, unknown>> = [];
 		const identityCalls: Array<Record<string, unknown>> = [];
 		const serviceCalls: string[] = [];
+		const registerRoots: boolean[] = [];
 
 		const dependencies: Partial<NotificationsEditorOperationDependencies> = {
 			buildNotificationStatusReport: input => {
@@ -398,6 +404,7 @@ describe("notification settings controller adapter", () => {
 
 			ensureTelegramDaemonRunningDetailed: async input => {
 				expect(input).toMatchObject({ cwd: "/workspace/current", sessionId: "session-current" });
+				registerRoots.push(input.registerRoot === true);
 				return "attached";
 			},
 			runTelegramSetup: async input => {
@@ -440,13 +447,15 @@ describe("notification settings controller adapter", () => {
 		await operations.refreshHealth({ probe: true, signal });
 		await operations.sendTest();
 		await operations.recover();
-		await operations.reconnect();
+		await withoutTelegramOrchestrationProvenance(() => operations.reconnect());
+		await withTelegramOrchestrationProvenance(() => operations.reconnect());
 		expect(controller.clearBlockedRuntime).toHaveBeenCalledWith(
 			expect.objectContaining({ sessionManager: ctx.sessionManager }),
 		);
 		expect(controller.reconcileCurrentSession).toHaveBeenCalledWith(
 			expect.objectContaining({ sessionManager: ctx.sessionManager }),
 		);
+		expect(registerRoots).toEqual([false, true]);
 		expect(healthCalls).toContainEqual(
 			expect.objectContaining({ stateRoot: path.join("/workspace/current", ".gjc", "state"), probe: true, signal }),
 		);

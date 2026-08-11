@@ -1107,8 +1107,9 @@ type TopicAuthorityState = {
 			nameReconcilePending?: boolean;
 			userNameUpdateId?: number;
 			identitySent?: boolean;
-			authorityState?: "active" | "archive_pending" | "inactive";
+			authorityState?: "active" | "disconnect_grace" | "archive_pending" | "inactive";
 			bindingMalformed?: true;
+			orphanedAt?: number;
 			endpointDigest?: string;
 			endpointGeneration?: number;
 			replayGeneration?: number;
@@ -3166,7 +3167,9 @@ describe("telegram daemon", () => {
 		// under the ownership-lock fence instead of crashing the daemon (#4200).
 		// Generation 61 keeps fenced same-session transports attached; generation 62
 		// validates replay-gap claims against the requested cursor and retained suffix.
-		expect(DAEMON_GENERATION).toBe(62);
+		// Generation 63 restricts topic admission to orchestration sessions and fails
+		// closed while the durable topic registry is unavailable.
+		expect(DAEMON_GENERATION).toBe(63);
 	});
 	test.each([
 		"1",
@@ -11871,6 +11874,212 @@ test("threaded off + unresolvable getChat: fails closed", async () => {
 	expect(bot.calls.filter(c => c.method === "sendMessage")).toHaveLength(0);
 });
 
+test("strict daemon admits only explicitly orchestrated identity headers", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		requireTelegramTopicEligibility: true,
+	});
+	await daemon.loadTopics();
+	const session = {
+		sessionId: "S",
+		token: "tok",
+		ws: { readyState: 1, send() {} },
+		pending: new Map(),
+		replayPending: false,
+	};
+
+	await daemon.handleSessionMessage(session as never, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "ordinary",
+		branch: "main",
+		telegramTopicsEnabled: false,
+	});
+	expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(0);
+	expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(0);
+
+	await daemon.handleSessionMessage(session as never, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "orchestrated",
+		branch: "main",
+		telegramTopicsEnabled: true,
+	});
+	expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(1);
+});
+test("strict daemon blocks an ordinary endpoint discovered under an orchestration root", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const cwd = path.join(agentDir, "repo");
+	const endpointDir = path.join(cwd, ".gjc", "state", "sdk");
+	await registerNotificationRoot({ settings: s, cwd, sessionId: "orchestration-owner" });
+	fs.mkdirSync(endpointDir, { recursive: true });
+	fs.writeFileSync(path.join(endpointDir, "ordinary.json"), JSON.stringify({ url: "ws://ordinary", token: "tok" }));
+	fs.mkdirSync(daemonPaths(agentDir).dir, { recursive: true });
+	fs.writeFileSync(
+		path.join(daemonPaths(agentDir).dir, "telegram-topics.json"),
+		JSON.stringify({
+			version: 2,
+			topics: {
+				ordinary: {
+					topicId: "777",
+					topicOrigin: "daemon_created",
+					sessionUuid: "ordinary-topic",
+					identitySent: true,
+					createdAt: Date.now(),
+					authorityState: "active",
+					chatId: "42",
+					endpointKey: "ws://previous",
+					endpointDigest: endpointAuthorityDigest("ws://previous", "previous-token"),
+					endpointGeneration: 1,
+					leaseOwner: "previous-host",
+					leaseHeartbeatAt: Date.now(),
+					leaseExpiresAt: Date.now() + 60_000,
+				},
+			},
+		}),
+	);
+
+	const bot = new FakeBotApi();
+	let now = Date.now();
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+		requireTelegramTopicEligibility: true,
+		now: () => now,
+	});
+	await daemon.loadTopics();
+	await daemon.scanRoots();
+	const session = daemon.sessions.get("ordinary");
+	if (!session) throw new Error("ordinary endpoint was not discovered");
+	FakeWs.instances[0]!.dispatchEvent(new Event("open"));
+	await daemon.handleSessionMessage(session, {
+		type: "event_replay_result",
+		ok: true,
+		id: session.replayId,
+		generation: 1,
+		lastSeq: 0,
+		events: [{ payload: { type: "identity_header", sessionId: "ordinary", telegramTopicsEnabled: false } }],
+	});
+	await daemon.handleSessionMessage(session, {
+		type: "action_needed",
+		sessionId: "ordinary",
+		id: "ask",
+		kind: "ask",
+		question: "Proceed?",
+		options: ["Yes"],
+	});
+	expect(daemon.sessions.has("ordinary")).toBe(false);
+	expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(0);
+	expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(0);
+	expect((await readTopicAuthorityState(agentDir)).topics.ordinary?.authorityState).toBe("disconnect_grace");
+	expect((await readTopicAuthorityState(agentDir)).topics.ordinary?.orphanedAt).toBeGreaterThan(0);
+	const connectionCount = FakeWs.instances.length;
+	await daemon.scanRoots();
+	expect(FakeWs.instances).toHaveLength(connectionCount);
+	expect((await readTopicAuthorityState(agentDir)).topics.ordinary?.authorityState).toBe("disconnect_grace");
+	now += 60_001;
+	await daemon.scanRoots();
+	expect((await readTopicAuthorityState(agentDir)).topics.ordinary?.authorityState).toBe("inactive");
+});
+test("strict daemon admits an orchestrated endpoint through replay", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const cwd = path.join(agentDir, "repo");
+	const endpointDir = path.join(cwd, ".gjc", "state", "sdk");
+	await registerNotificationRoot({ settings: s, cwd, sessionId: "orchestration-owner" });
+	fs.mkdirSync(endpointDir, { recursive: true });
+	fs.writeFileSync(
+		path.join(endpointDir, "orchestrated.json"),
+		JSON.stringify({ url: "ws://orchestrated", token: "tok" }),
+	);
+
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+		requireTelegramTopicEligibility: true,
+	});
+	await daemon.loadTopics();
+	await daemon.scanRoots();
+	const session = daemon.sessions.get("orchestrated");
+	if (!session) throw new Error("orchestrated endpoint was not discovered");
+	FakeWs.instances[0]!.dispatchEvent(new Event("open"));
+	await daemon.handleSessionMessage(session, {
+		type: "event_replay_result",
+		ok: true,
+		id: session.replayId,
+		generation: 1,
+		lastSeq: 0,
+		events: [
+			{
+				payload: {
+					type: "identity_header",
+					sessionId: "orchestrated",
+					repo: "orchestrated",
+					branch: "main",
+					telegramTopicsEnabled: true,
+				},
+			},
+		],
+	});
+	expect(daemon.sessions.get("orchestrated")).toBe(session);
+	expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(1);
+});
+test("strict daemon fails closed when the topic registry cannot be loaded", async () => {
+	const agentDir = tempAgentDir();
+	const failingFs: TelegramDaemonFs = {
+		...topicStateFs(async () => undefined),
+		readFile: async (file, encoding) => {
+			if (file.endsWith("telegram-topics.json")) throw new Error("registry unavailable");
+			return await fs.promises.readFile(file, encoding);
+		},
+	};
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		fs: failingFs,
+		requireTelegramTopicEligibility: true,
+	});
+	await expect(daemon.loadTopics()).rejects.toThrow("registry unavailable");
+	await daemon.handleSessionMessage(
+		{
+			sessionId: "S",
+			token: "tok",
+			ws: { readyState: 1, send() {} },
+			pending: new Map(),
+			replayPending: false,
+		} as never,
+		{
+			type: "identity_header",
+			sessionId: "S",
+			repo: "orchestrated",
+			branch: "main",
+			telegramTopicsEnabled: true,
+		},
+	);
+	expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(0);
+});
 test("identity_header without a title names the topic repo/branch", async () => {
 	const agentDir = tempAgentDir();
 	const bot = new FakeBotApi();
