@@ -16,8 +16,12 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { SessionManager, SessionManagerTestHooks } from "@gajae-code/coding-agent/session/session-manager";
 import {
+	FileSessionStorage,
 	MemorySessionStorage,
 	type SessionStorageWriter,
 	type SessionStorageWriterCloseState,
@@ -256,5 +260,33 @@ describe("rejected strict-resume open cleanup", () => {
 		await Bun.sleep(500);
 		// Once terminal, the retry loop stops instead of spinning forever.
 		expect(storage.closeAttempts).toBe(attemptsAtRelease);
+	});
+});
+
+describe("managed strict-resume target races", () => {
+	it("rejects a target removed after strict revalidation without recreating it", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-strict-missing-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "strict-missing.jsonl");
+		storage.writeTextSync(sourceFile, transcript());
+		let hookCalls = 0;
+		SessionManagerTestHooks.beforeStrictMissingCheck = filePath => {
+			if (filePath !== sourceFile || hookCalls++ > 0) return;
+			storage.unlinkSync(sourceFile);
+		};
+		try {
+			await expect(SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled")).rejects.toThrow(
+				"Could not open session: unstable",
+			);
+			expect(storage.existsSync(sourceFile)).toBe(false);
+			expect(hookCalls).toBe(1);
+		} finally {
+			SessionManagerTestHooks.beforeStrictMissingCheck = undefined;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 });

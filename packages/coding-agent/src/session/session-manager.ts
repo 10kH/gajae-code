@@ -6525,6 +6525,7 @@ export const SessionManagerTestHooks: {
 	afterForkTranscriptPublished?: () => void | Promise<void>;
 	beforeEphemeralArtifactManagerInstall?: (dir: string) => void | Promise<void>;
 	beforePersistPatchFence?: (attempt: number) => void;
+	beforeStrictMissingCheck?: (filePath: string, storage: SessionStorage) => void;
 	/** Internal first-open GC strategy override; omitted means current. */
 	firstOpenGcStrategy?: SessionMemoryGcStrategy;
 	/** Internal first-open secondary-artifact mode override; omitted means auto. */
@@ -8773,6 +8774,7 @@ export class SessionManager {
 			return;
 		}
 		revalidateStrictResume();
+		SessionManagerTestHooks.beforeStrictMissingCheck?.(resolvedSessionFile, this.#storage);
 		const transcriptMissing =
 			(initializeMissing || strictResume !== undefined) && !this.#storage.existsSync(resolvedSessionFile);
 		if (strictResume && transcriptMissing) throw new Error("Could not open session: unstable");
