@@ -236,6 +236,9 @@ impl NativeNoReplaceResult {
 				Some("not_found" | "invalid_request") => {
 					("not_committed", "not_attempted", "invalid_request")
 				},
+				Some("destination_identity_changed") => {
+					("committed", "not_provable", "identity_violation")
+				},
 				Some("reparse_point" | "identity_mismatch") => {
 					("not_committed", "not_attempted", "identity_violation")
 				},
@@ -265,7 +268,9 @@ impl NativeNoReplaceResult {
 				"unsupported"
 			}
 			.to_owned(),
-			phase:            if mutation_state == "committed" {
+			phase:            if mutation_state == "committed" && !result.ok {
+				"terminal_identity"
+			} else if mutation_state == "committed" {
 				"complete"
 			} else if matches!(reason, "invalid_request" | "identity_violation") {
 				"preflight"
@@ -3513,7 +3518,11 @@ pub(crate) mod platform {
 			// SAFETY: parent_fd remains live and binds the mutated quarantine namespace.
 			let synced = unsafe { libc::fsync(parent_fd) } == 0;
 			if !unlinked || !synced {
-				return NativeExactUnlinkResult::detached_failure("cleanup_pending", detached_path);
+				return NativeExactUnlinkResult::detached_failure_with_durable_payload_and_placeholder(
+					"cleanup_pending",
+					detached_path,
+					path.to_string_lossy().into_owned(),
+				);
 			}
 			return match remove_exchange_placeholder(parent_fd, &name, placeholder) {
 				ExchangePlaceholderRemoval::Removed => NativeExactUnlinkResult::success(),
@@ -3843,18 +3852,7 @@ pub(crate) mod platform {
 			{
 				NativeExactUnlinkResult::success()
 			},
-			Ok(()) => {
-				let cleanup = cleanup_substituted_publication(
-					destination_parent,
-					&destination_name,
-					destination_path,
-				);
-				if cleanup.ok {
-					NativeExactUnlinkResult::failure("identity_mismatch")
-				} else {
-					cleanup
-				}
-			},
+			Ok(()) => NativeExactUnlinkResult::failure("destination_identity_changed"),
 			Err(code) => NativeExactUnlinkResult::failure(code),
 		};
 		unsafe {
@@ -3934,18 +3932,7 @@ pub(crate) mod platform {
 			{
 				NativeExactUnlinkResult::success()
 			},
-			Ok(()) => {
-				let cleanup = cleanup_substituted_publication(
-					destination_parent,
-					&destination_name,
-					destination_path,
-				);
-				if cleanup.ok {
-					NativeExactUnlinkResult::failure("identity_mismatch")
-				} else {
-					cleanup
-				}
-			},
+			Ok(()) => NativeExactUnlinkResult::failure("destination_identity_changed"),
 			Err(code) => NativeExactUnlinkResult::failure(code),
 		};
 		unsafe {
@@ -4074,6 +4061,9 @@ pub(crate) mod platform {
 		expected_source: &ExactFileIdentity,
 		expected_destination: &ExactFileIdentity,
 	) -> NativeExactUnlinkResult {
+		if source_path == destination_path {
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
 		if expected_source.directory
 			|| expected_source.detach_only
 			|| expected_destination.directory
@@ -4094,6 +4084,13 @@ pub(crate) mod platform {
 				return *result;
 			},
 		};
+		if source_name == destination_name {
+			unsafe {
+				libc::close(source_parent);
+				libc::close(destination_parent);
+			}
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
 		let destination_lock = unsafe {
 			libc::openat(
 				destination_parent,
@@ -7970,6 +7967,18 @@ mod owner_only_security_tests {
 		assert_eq!(result.durability_state, "not_attempted");
 		assert_eq!(result.reason, "invalid_request");
 		assert_eq!(result.phase, "preflight");
+	}
+
+	#[test]
+	fn rename_no_replace_destination_identity_loss_is_terminal() {
+		let result = NativeNoReplaceResult::from_exact(NativeExactUnlinkResult::failure(
+			"destination_identity_changed",
+		));
+		assert!(!result.ok);
+		assert_eq!(result.mutation_state, "committed");
+		assert_eq!(result.durability_state, "not_provable");
+		assert_eq!(result.reason, "identity_violation");
+		assert_eq!(result.phase, "terminal_identity");
 	}
 
 	#[test]

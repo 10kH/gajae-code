@@ -1667,7 +1667,7 @@ it("fails closed without sidecar publication for unterminated bounded first-open
 	}
 });
 
-it("fails closed when a bounded first-open line exceeds the exact scanner limit", async () => {
+it("fails closed when strict capture input exceeds the exact scanner line limit", () => {
 	const storage = new MemorySessionStorage();
 	const sessionFile = "/sessions/oversized-line-bounded.jsonl";
 	const oversized = {
@@ -1693,21 +1693,27 @@ it("fails closed when a bounded first-open line exceeds the exact scanner limit"
 		},
 	];
 	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
-	const manager = await SessionManager.open(
-		sessionFile,
-		SessionManager.explicitDestination("/sessions"),
-		storage,
-		"copy-retain",
-		"enabled",
-	);
+	const captured = SessionManager.captureTranscriptStrict(sessionFile, storage);
+	if (captured.kind === "captured") captured.snapshot.close();
+	expect(captured).toMatchObject({ kind: "error", reason: "malformed" });
+	expect(Buffer.byteLength(JSON.stringify(oversized), "utf8") + 1).toBeGreaterThan(BOUNDED_FIRST_OPEN_MAX_LINE_BYTES);
+	expect(storage.existsSync(sidecarPath(sessionFile, "commit"))).toBe(false);
+});
+
+it("rejects invalid UTF-8 during strict bounded capture", () => {
+	const tempDir = TempDir.createSync("@pi-session-invalid-utf8-");
+	const sessionFile = path.join(tempDir.path(), "invalid-utf8.jsonl");
 	try {
-		expect(Buffer.byteLength(JSON.stringify(oversized), "utf8") + 1).toBeGreaterThan(
-			BOUNDED_FIRST_OPEN_MAX_LINE_BYTES,
+		const header = Buffer.from(
+			`${JSON.stringify({ type: "session", version: 5, id: "invalid-utf8", timestamp: "0", cwd: "/cwd" })}\n`,
+			"utf8",
 		);
-		expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
-		expect(storage.existsSync(sidecarPath(sessionFile, "commit"))).toBe(false);
+		const prefix = Buffer.from('{"type":"custom","id":"bad","parentId":null,"timestamp":"0","customType":"', "utf8");
+		const suffix = Buffer.from('","data":{}}\n', "utf8");
+		fs.writeFileSync(sessionFile, Buffer.concat([header, prefix, Buffer.from([0xff]), suffix]));
+		expect(SessionManager.captureTranscriptStrict(sessionFile)).toMatchObject({ kind: "error", reason: "malformed" });
 	} finally {
-		await manager.close();
+		tempDir.removeSync();
 	}
 });
 
@@ -1772,20 +1778,17 @@ it("rejects descriptor mutation during the bounded semantic scan", async () => {
 		},
 	];
 	storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
-	const manager = await SessionManager.open(
-		sessionFile,
-		SessionManager.explicitDestination("/sessions"),
-		storage,
-		"copy-retain",
-		"enabled",
-	);
-	try {
-		expect(storage.transcriptReads).toBeGreaterThanOrEqual(2);
-		expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(false);
-		expect(storage.existsSync(sidecarPath(sessionFile, "commit"))).toBe(false);
-	} finally {
-		await manager.close();
-	}
+	await expect(
+		SessionManager.open(
+			sessionFile,
+			SessionManager.explicitDestination("/sessions"),
+			storage,
+			"copy-retain",
+			"enabled",
+		),
+	).rejects.toThrow("unstable");
+	expect(storage.transcriptReads).toBeGreaterThanOrEqual(2);
+	expect(storage.existsSync(sidecarPath(sessionFile, "commit"))).toBe(false);
 });
 
 it("serializes concurrent bounded first-open publishers through an owner-bound lock", async () => {
@@ -2231,16 +2234,24 @@ it("rejects malformed auto-small explicit resumes through strict inspection", as
 	).rejects.toThrow(/Could not open session|malformed/);
 });
 
-it("rejects schema-invalid auto-small explicit resumes", async () => {
+it("rejects schema-invalid small explicit resumes in auto and enabled modes", async () => {
 	const storage = new MemorySessionStorage();
 	const sessionFile = "/sessions/auto-small-explicit-schema-invalid.jsonl";
 	storage.writeTextSync(
 		sessionFile,
 		`${JSON.stringify({ type: "session", version: 5, id: "auto-small-explicit-schema", timestamp: "0", cwd: "/cwd" })}\n${JSON.stringify({ type: "custom", id: "invalid", parentId: null, timestamp: "0", data: {} })}\n`,
 	);
-	await expect(
-		SessionManager.open(sessionFile, SessionManager.explicitDestination("/sessions"), storage, "copy-retain", "auto"),
-	).rejects.toThrow("malformed");
+	for (const mode of ["auto", "enabled"] as const) {
+		await expect(
+			SessionManager.open(
+				sessionFile,
+				SessionManager.explicitDestination("/sessions"),
+				storage,
+				"copy-retain",
+				mode,
+			),
+		).rejects.toThrow("malformed");
+	}
 });
 it("rejects malformed auto-small managed resumes through the strict eager path", async () => {
 	const tempDir = TempDir.createSync("@pi-session-auto-small-");
@@ -2981,23 +2992,15 @@ describe("malformed transcript sidecar fallback", () => {
 			},
 		];
 		storage.writeTextSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
-		const manager = await SessionManager.open(
-			sessionFile,
-			SessionManager.explicitDestination("/sessions"),
-			storage,
-			"copy-retain",
-			"enabled",
-		);
-		try {
-			expect(manager.getSessionMemoryStats()).toMatchObject({
-				coldRetirementActive: false,
-				sidecarIneligible: true,
-				lazyReopenSucceeded: false,
-			});
-			expect(manager.getEntry("old")).toMatchObject({ id: "old" });
-		} finally {
-			await manager.close();
-		}
+		await expect(
+			SessionManager.open(
+				sessionFile,
+				SessionManager.explicitDestination("/sessions"),
+				storage,
+				"copy-retain",
+				"enabled",
+			),
+		).rejects.toThrow("malformed");
 	});
 });
 
@@ -4883,6 +4886,86 @@ describePosix("managed session memory authority", () => {
 			tempDir.removeSync();
 		}
 	});
+	it("routes bounded managed first-open transcript ranges through retained authority", async () => {
+		class NoRawTranscriptRangeStorage extends FileSessionStorage {
+			override readRangeSync(filePath: string, offset: number, length: number) {
+				if (filePath.endsWith(".jsonl")) throw new Error("raw_managed_transcript_range");
+				return super.readRangeSync(filePath, offset, length);
+			}
+		}
+		const tempDir = TempDir.createSync("@pi-managed-memory-retained-read-");
+		const cwd = path.join(tempDir.path(), "workspace");
+		const agentDir = path.join(tempDir.path(), "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const source = SessionManager.create(cwd, destination, storage);
+		let reopened: SessionManager | undefined;
+		let sourceClosed = false;
+		try {
+			source.setSessionMemoryMode("off");
+			await source.ensureOnDisk();
+			const oldId = source.appendCustomEntry("node", { payload: "old" });
+			const keptId = source.appendCustomEntry("node", { payload: "kept" });
+			source.appendCompaction("summary", undefined, keptId, 1);
+			await source.flush();
+			const sessionFile = source.getSessionFile();
+			if (!sessionFile) throw new Error("Expected managed source file");
+			await source.close();
+			sourceClosed = true;
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+			reopened = await SessionManager.open(
+				sessionFile,
+				destination,
+				new NoRawTranscriptRangeStorage(),
+				"copy-retain",
+				"enabled",
+			);
+			expect(reopened.getSessionMemoryStats()).toMatchObject({
+				lazyReopenSucceeded: true,
+				lastReopenTransition: { kind: "rebuild", reason: "bounded_first_open" },
+			});
+			expect(reopened.getEntry(oldId)).toMatchObject({ id: oldId });
+		} finally {
+			SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
+			await reopened?.close();
+			if (!sourceClosed) await source.close();
+			tempDir.removeSync();
+		}
+	});
+
+	it("discards managed failed successors through identity-bound transcript and tree removal", async () => {
+		class RejectRawDeleteStorage extends FileSessionStorage {
+			rawDeleteCalls = 0;
+			override async deleteSessionWithArtifacts(_sessionPath: string): Promise<void> {
+				this.rawDeleteCalls += 1;
+				throw new Error("raw_managed_delete_bypass");
+			}
+		}
+		const tempDir = TempDir.createSync("@pi-managed-memory-successor-cleanup-");
+		const cwd = path.join(tempDir.path(), "workspace");
+		const agentDir = path.join(tempDir.path(), "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		const storage = new RejectRawDeleteStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const manager = SessionManager.create(cwd, destination, storage);
+		try {
+			await manager.ensureOnDisk();
+			manager.appendCustomEntry("node", { payload: "source" });
+			await manager.flush();
+			const prepared = await manager.prepareFork();
+			if (!prepared?.sessionFile) throw new Error("Expected managed prepared successor");
+			const successorFile = prepared.sessionFile;
+			expect(storage.existsSync(successorFile)).toBe(true);
+			await manager.discardPreparedNewSession(prepared);
+			expect(storage.rawDeleteCalls).toBe(0);
+			expect(storage.existsSync(successorFile)).toBe(false);
+			expect(storage.existsSync(successorFile.slice(0, -6))).toBe(false);
+		} finally {
+			await manager.close();
+			tempDir.removeSync();
+		}
+	});
 });
 
 describe("persistent dictionary and metadata-delta artifacts", () => {
@@ -5811,14 +5894,6 @@ describe("descriptor-bound capture and staged fork publication", () => {
 			`${JSON.stringify({ type: "session", version: 5, id: "bad", timestamp: "0", cwd: "/cwd" })}\n{"type":`,
 		);
 		const truncated = SessionManager.captureTranscriptStrict("/sessions/truncated.jsonl", storage);
-		expect(truncated.kind).toBe("captured");
-		if (truncated.kind !== "captured") throw new Error("Expected descriptor capture");
-		expect(
-			await SessionManager.forkFromCaptured(
-				truncated.snapshot,
-				"/cwd",
-				SessionManager.explicitDestination("/sessions/truncated-fork"),
-			),
-		).toEqual({ kind: "error", reason: "malformed" });
+		expect(truncated).toMatchObject({ kind: "error", reason: "malformed" });
 	});
 });
