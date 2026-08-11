@@ -2080,8 +2080,40 @@ export class SessionTranscriptOversizedError extends Error {
 		this.size = size;
 	}
 }
+/** Default synchronous session-context materialization budget (512 MiB). */
+export const SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES_DEFAULT = 512 * 1024 * 1024;
+/** Ceiling for a `GJC_SESSION_CONTEXT_BUDGET_BYTES` override (8 GiB) so the memory guard stays meaningful. */
+export const SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES_MAX = 8 * 1024 * 1024 * 1024;
+
+/**
+ * Resolve the operation-peak session-context materialization budget from the
+ * `GJC_SESSION_CONTEXT_BUDGET_BYTES` override. Parsing is fail-closed: only a
+ * canonical positive-integer decimal value is honored; anything else (empty,
+ * non-numeric, negative, zero, overflowing a safe integer, or above the
+ * documented ceiling) falls back to the 512 MiB default and is surfaced as a
+ * warning so a dropped override is never silent.
+ */
+export function resolveSessionContextBudgetBytes(override: string | undefined): number {
+	if (override === undefined) return SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES_DEFAULT;
+	if (override === "" || !/^[0-9]+$/.test(override)) {
+		logger.warn("GJC_SESSION_CONTEXT_BUDGET_BYTES ignored: expected a positive integer", { override });
+		return SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES_DEFAULT;
+	}
+	const parsed = Number(override);
+	if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES_MAX) {
+		logger.warn("GJC_SESSION_CONTEXT_BUDGET_BYTES ignored: must be a positive integer ≤ 8 GiB", {
+			override,
+			max: SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES_MAX,
+		});
+		return SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES_DEFAULT;
+	}
+	return parsed;
+}
+
 /** Operation-peak budget for one synchronous session-context materialization. */
-export const SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES = 64 * 1024 * 1024;
+export const SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES = resolveSessionContextBudgetBytes(
+	process.env.GJC_SESSION_CONTEXT_BUDGET_BYTES,
+);
 
 /**
  * Thrown by the synchronous session-context builders when the materialized graph
