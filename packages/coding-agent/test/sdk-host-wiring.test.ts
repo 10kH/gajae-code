@@ -1,5 +1,6 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
@@ -46,6 +47,7 @@ import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { formatPromptSettlementDiagnostic, PresentationArbiter } from "../src/sdk/bus";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
+import { reconciliationStorePath } from "../src/sdk/bus/reconciliation-store";
 import type { NotificationSessionController } from "../src/sdk/bus/session-control";
 import { SdkClient } from "../src/sdk/client";
 import { SessionSdkHost } from "../src/sdk/host";
@@ -97,6 +99,38 @@ async function waitFor(predicate: () => boolean, label: string): Promise<void> {
 		await Bun.sleep(20);
 	}
 }
+function pauseNextReconciliationCommit(
+	sessionFile: string,
+	sessionId: string,
+): {
+	started: Promise<void>;
+	release: () => void;
+	restore: () => void;
+	arm: () => void;
+} {
+	const target = reconciliationStorePath(sessionFile, sessionId);
+	const started = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const realRename = fsPromises.rename.bind(fsPromises);
+	let armed = false;
+	let paused = false;
+	const rename = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+		if (armed && !paused && String(to) === target) {
+			paused = true;
+			started.resolve();
+			await release.promise;
+		}
+		await realRename(from, to);
+	});
+	return {
+		started: started.promise,
+		release: () => release.resolve(),
+		restore: () => rename.mockRestore(),
+		arm: () => {
+			armed = true;
+		},
+	};
+}
 
 async function closeSocket(socket: WebSocket): Promise<void> {
 	if (socket.readyState === WebSocket.CLOSED) return;
@@ -147,6 +181,12 @@ function start(
 			if (forwardPreflightCallbacks) return Promise.resolve(sendUserMessage(content, options));
 			const { onPreflightAccepted, onPreflightAcceptCommit, ...delivery } = options ?? {};
 			const submission = sendUserMessage(content, Object.keys(delivery).length > 0 ? delivery : undefined);
+			// A mock may reject its submission promise before the durable acceptance
+			// await completes (fsync-backed reconciliation persistence). Adopt the
+			// rejection now so it never surfaces as an unhandled rejection during
+			// that I/O gap; the returned chain still surfaces it to the bus.
+			if (submission && typeof (submission as Promise<unknown>).catch === "function")
+				void (submission as Promise<unknown>).catch(() => {});
 			// Prefer awaitable durable fence; fall back to legacy sync accept for older mocks.
 			if (onPreflightAcceptCommit) {
 				return Promise.resolve(onPreflightAcceptCommit()).then(() => {
@@ -1022,7 +1062,7 @@ test("startup records identity before an early lifecycle event and publishes it 
 	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
 });
 
-test("serializes concurrent /notify on across cancelled and replacement startups", async () => {
+test("serializes concurrent /notify on across overlapping replacement startups", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-notify-startup-"));
 	dirs.push(cwd);
 	const sessionId = `notify-startup-${Date.now()}`;
@@ -1056,8 +1096,11 @@ test("serializes concurrent /notify on across cancelled and replacement startups
 		await Promise.all([firstEnable, secondEnable]);
 
 		expect(getAskAnswerSource(sessionId)).toBeDefined();
+		// Both startups serialize behind the single controller queue and converge
+		// to enabled: the first startup is no longer reported as failed once its
+		// server start completes (activeRuntimeId is claimed at start settlement).
 		expect(messages).toEqual([
-			{ message: "Notifications failed to start for this session.", level: "error" },
+			{ message: "Notifications enabled for this session.", level: "info" },
 			{ message: "Notifications enabled for this session.", level: "info" },
 		]);
 	} finally {
@@ -1446,9 +1489,12 @@ test("SDK host preserves ordered prompt image blocks in the host payload", async
 				{ type: "image", data: "cG5nLWJ5dGVz", mimeType: "image/png" },
 				{ type: "image", data: "ZGVmYXVsdC1taW1l", mimeType: "image/jpeg" },
 			],
-			undefined,
+			{ preflightSignal: expect.any(AbortSignal) },
 		],
-		[[{ type: "image", data: "d2VicC1ieXRlcw", mimeType: "image/webp" }]],
+		[
+			[{ type: "image", data: "d2VicC1ieXRlcw", mimeType: "image/webp" }],
+			{ preflightSignal: expect.any(AbortSignal) },
+		],
 	]);
 });
 
@@ -1472,6 +1518,9 @@ test("SDK host correlates follow-up acknowledgements with the later agent start"
 		socket.addEventListener("open", () => resolve(), { once: true });
 		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
 	});
+	void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	await Bun.sleep(10);
+	expect(frames.some(frame => frame.type === "agent_start" && frame.commandId !== undefined)).toBe(false);
 	socket.send(
 		JSON.stringify({
 			type: "control_request",
@@ -1494,8 +1543,19 @@ test("SDK host correlates follow-up acknowledgements with the later agent start"
 		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
 	});
 	if (typeof commandId !== "string" || typeof turnId !== "string") throw new Error("missing follow-up correlation");
-	expect(sent).toEqual([["queued follow-up", { deliverAs: "followUp" }]]);
-	void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	const sentOptions = sent[0]?.[1];
+	const sdkRunToken = sentOptions && "sdkRunToken" in sentOptions ? sentOptions.sdkRunToken : undefined;
+	expect(sent).toEqual([
+		[
+			"queued follow-up",
+			{ deliverAs: "followUp", preflightSignal: expect.any(AbortSignal), sdkRunToken: expect.any(String) },
+		],
+	]);
+	if (typeof sdkRunToken !== "string") throw new Error("missing SDK follow-up run token");
+	void handlers.get("agent_end")?.({ type: "agent_end", messages: [], stopReason: "completed" }, sessionContext);
+	await Bun.sleep(10);
+	expect(frames.some(frame => frame.type === "agent_start" && frame.commandId === commandId)).toBe(false);
+	void handlers.get("agent_start")?.({ type: "agent_start", sdkRunToken }, sessionContext);
 	await waitFor(
 		() => frames.some(frame => frame.type === "agent_start" && frame.commandId === commandId),
 		"correlated agent start",
@@ -2133,6 +2193,558 @@ test("SDK host terminalizes a cancelled preflight and releases prompt authority"
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, context(cwd, sessionId));
 });
 
+test("SDK host cancels canonical skill invocation before agent start and fences late acceptance", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-preflight-cancelled-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-skill-preflight-cancelled-${Date.now()}`;
+	const preflightStarted = Promise.withResolvers<void>();
+	const releasePreflight = Promise.withResolvers<void>();
+	let executionStarted = false;
+	const sessionContext = context(cwd, sessionId);
+	const baseBindings = sessionContext.sdkBindings as () => string[];
+	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
+	sessionContext.invokeSkill = async (
+		name: string,
+		args: string | undefined,
+		options?: {
+			onSkillPrepared?: (meta: { name: string; path: string }) => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+			preflightSignal?: AbortSignal;
+		},
+	) => {
+		expect(name).toBe("fixture-skill");
+		expect(args).toBe("cancel before start");
+		preflightStarted.resolve();
+		const cancelled = Promise.withResolvers<never>();
+		const onAbort = () =>
+			cancelled.reject(
+				Object.assign(new Error("Skill preflight was cancelled before execution."), { code: "busy" }),
+			);
+		options?.preflightSignal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			await Promise.race([releasePreflight.promise, cancelled.promise]);
+		} finally {
+			options?.preflightSignal?.removeEventListener("abort", onAbort);
+		}
+		options?.onSkillPrepared?.({ name, path: "/fixture/SKILL.md" });
+		await options?.onPreflightAcceptCommit?.();
+		if (options?.preflightSignal?.aborted)
+			throw Object.assign(new Error("Skill preflight was cancelled before execution."), { code: "busy" });
+		executionStarted = true;
+		return { name, path: "/fixture/SKILL.md", args };
+	};
+	const handlers = start(sessionContext);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "skill-preflight",
+			operation: "skill.invoke",
+			input: { name: "fixture-skill", args: "cancel before start" },
+		}),
+	);
+	await preflightStarted.promise;
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "abort-skill-preflight",
+			operation: "turn.abort",
+			input: {},
+		}),
+	);
+	await waitFor(
+		() =>
+			frames.some(frame => frame.type === "control_response" && frame.id === "skill-preflight") &&
+			frames.some(frame => frame.type === "control_response" && frame.id === "abort-skill-preflight"),
+		"skill preflight cancellation responses",
+	);
+	expect(frames.find(frame => frame.type === "control_response" && frame.id === "skill-preflight")).toMatchObject({
+		ok: false,
+		error: { code: "busy", message: "Skill preflight was cancelled before execution." },
+	});
+	expect(
+		frames.find(frame => frame.type === "control_response" && frame.id === "abort-skill-preflight"),
+	).toMatchObject({
+		ok: true,
+		result: { aborted: true, disposition: "preflight_cancelled" },
+	});
+	releasePreflight.resolve();
+	await Promise.resolve();
+	await Promise.resolve();
+	expect(executionStarted).toBe(false);
+	expect(frames.some(frame => frame.type === "agent_start")).toBe(false);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
+test("SDK host waits for accepted handleless skill settlement before publishing cancellation", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-accepted-handleless-cancel-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-skill-accepted-handleless-cancel-${Date.now()}`;
+	const acceptedWithoutHandle = Promise.withResolvers<void>();
+	const abortObserved = Promise.withResolvers<void>();
+	const releaseSettlement = Promise.withResolvers<void>();
+	let executionStarted = false;
+	const sessionContext = context(cwd, sessionId);
+	const baseBindings = sessionContext.sdkBindings as () => string[];
+	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
+	sessionContext.invokeSkill = async (
+		name: string,
+		args: string | undefined,
+		options?: {
+			onSkillPrepared?: (meta: { name: string; path: string }) => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+			preflightSignal?: AbortSignal;
+		},
+	) => {
+		options?.onSkillPrepared?.({ name, path: "/fixture/SKILL.md" });
+		await options?.onPreflightAcceptCommit?.();
+		acceptedWithoutHandle.resolve();
+		options?.preflightSignal?.addEventListener("abort", () => abortObserved.resolve(), { once: true });
+		await releaseSettlement.promise;
+		if (options?.preflightSignal?.aborted)
+			throw Object.assign(new Error("Skill preflight was cancelled before execution."), { code: "busy" });
+		executionStarted = true;
+		return { name, path: "/fixture/SKILL.md", args };
+	};
+	const handlers = start(sessionContext);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "accepted-handleless-skill",
+			operation: "skill.invoke",
+			input: { name: "fixture-skill", args: "cancel after acceptance" },
+		}),
+	);
+	await acceptedWithoutHandle.promise;
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "accepted-handleless-skill"),
+		"accepted handleless skill response",
+	);
+	const acceptedFrame = frames.find(
+		frame => frame.type === "control_response" && frame.id === "accepted-handleless-skill",
+	) as { result?: { commandId?: string; turnId?: string } } | undefined;
+	const acceptedCommandId = acceptedFrame?.result?.commandId;
+	const acceptedTurnId = acceptedFrame?.result?.turnId;
+	expect(acceptedFrame).toMatchObject({
+		ok: true,
+		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
+	});
+
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "abort-accepted-handleless-skill",
+			operation: "turn.abort",
+			input: {},
+		}),
+	);
+	await abortObserved.promise;
+	await Bun.sleep(20);
+	expect(
+		frames.some(frame => frame.type === "control_response" && frame.id === "abort-accepted-handleless-skill"),
+	).toBe(false);
+	expect(
+		frames.some(
+			frame =>
+				(frame.type === "agent_end" || frame.type === "agent_failed") &&
+				frame.commandId === acceptedFrame?.result?.commandId &&
+				frame.turnId === acceptedFrame?.result?.turnId,
+		),
+	).toBe(false);
+
+	releaseSettlement.resolve();
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "abort-accepted-handleless-skill"),
+		"accepted handleless cancellation response",
+	);
+	await waitFor(
+		() =>
+			frames.some(
+				frame =>
+					frame.type === "agent_end" && frame.commandId === acceptedCommandId && frame.turnId === acceptedTurnId,
+			),
+		"accepted handleless cancellation terminal",
+	);
+	expect(
+		frames.find(frame => frame.type === "control_response" && frame.id === "abort-accepted-handleless-skill"),
+	).toMatchObject({
+		ok: true,
+		result: { aborted: true, disposition: "cancelled" },
+	});
+	expect(
+		frames.find(
+			frame =>
+				frame.type === "agent_end" && frame.commandId === acceptedCommandId && frame.turnId === acceptedTurnId,
+		),
+	).toMatchObject({
+		outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+	});
+	expect(executionStarted).toBe(false);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+test("SDK host waits for durable prompt acceptance before completing concurrent cancellation", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-durable-accept-cancel-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-prompt-durable-accept-cancel-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = {
+		...sessionManager,
+		getSessionFile: () => sessionFile,
+	};
+	let executionStarted = false;
+	const abortObserved = Promise.withResolvers<void>();
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (_content, options) => {
+			const signal = options?.preflightSignal;
+			const onAbort = () => abortObserved.resolve();
+			if (signal?.aborted) onAbort();
+			else signal?.addEventListener("abort", onAbort, { once: true });
+			try {
+				await options?.onPreflightAcceptCommit?.();
+			} finally {
+				signal?.removeEventListener("abort", onAbort);
+			}
+			if (signal?.aborted)
+				throw Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" });
+			executionStarted = true;
+		},
+		true,
+		new Map(),
+		undefined,
+		false,
+	);
+	await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+	const pausedCommit = pauseNextReconciliationCommit(sessionFile, sessionId);
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+
+		pausedCommit.arm();
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "durable-prompt-acceptance",
+				operation: "turn.prompt",
+				input: { text: "cancel while durable prompt acceptance is pending" },
+			}),
+		);
+		await pausedCommit.started;
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "abort-durable-prompt-acceptance",
+				operation: "turn.abort",
+				input: {},
+			}),
+		);
+		await abortObserved.promise;
+		expect(frames.some(frame => frame.type === "control_response" && frame.id === "durable-prompt-acceptance")).toBe(
+			false,
+		);
+		expect(
+			frames.some(frame => frame.type === "control_response" && frame.id === "abort-durable-prompt-acceptance"),
+		).toBe(false);
+		expect(frames.some(frame => frame.type === "agent_end" || frame.type === "agent_failed")).toBe(false);
+
+		pausedCommit.release();
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "durable-prompt-acceptance"),
+			"durable prompt acceptance response",
+		);
+		await waitFor(
+			() =>
+				frames.some(frame => frame.type === "control_response" && frame.id === "abort-durable-prompt-acceptance"),
+			"durable prompt abort response",
+		);
+		await waitFor(
+			() =>
+				frames.some(
+					frame =>
+						frame.type === "agent_end" &&
+						typeof frame.commandId === "string" &&
+						typeof frame.turnId === "string" &&
+						(frame.outcome as { kind?: unknown; reason?: unknown } | undefined)?.kind === "stopped" &&
+						(frame.outcome as { kind?: unknown; reason?: unknown } | undefined)?.reason === "cancelled",
+				),
+			"durable prompt cancellation terminal",
+		);
+		expect(
+			frames.find(frame => frame.type === "control_response" && frame.id === "durable-prompt-acceptance"),
+		).toMatchObject({
+			ok: true,
+			result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
+		});
+		expect(
+			frames.find(frame => frame.type === "control_response" && frame.id === "abort-durable-prompt-acceptance"),
+		).toMatchObject({
+			ok: true,
+			result: { aborted: true, disposition: "preflight_cancelled" },
+		});
+		expect(executionStarted).toBe(false);
+		expect(frames.some(frame => frame.type === "agent_start" || frame.type === "agent_failed")).toBe(false);
+	} finally {
+		pausedCommit.release();
+		pausedCommit.restore();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	}
+}, 30_000);
+
+test("SDK host waits for durable skill acceptance before completing concurrent cancellation", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-durable-accept-cancel-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-skill-durable-accept-cancel-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = {
+		...sessionManager,
+		getSessionFile: () => sessionFile,
+	};
+	const baseBindings = sessionContext.sdkBindings as () => string[];
+	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
+	let executionStarted = false;
+	const abortObserved = Promise.withResolvers<void>();
+	sessionContext.invokeSkill = async (
+		name: string,
+		args: string | undefined,
+		options?: {
+			onSkillPrepared?: (meta: { name: string; path: string; cleanedArgs?: string }) => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+			preflightSignal?: AbortSignal;
+		},
+	) => {
+		options?.onSkillPrepared?.({ name, path: "/fixture/SKILL.md", cleanedArgs: args });
+		const signal = options?.preflightSignal;
+		const onAbort = () => abortObserved.resolve();
+		if (signal?.aborted) onAbort();
+		else signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			await options?.onPreflightAcceptCommit?.();
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
+		}
+		if (signal?.aborted)
+			throw Object.assign(new Error("Skill preflight was cancelled before execution."), { code: "busy" });
+		executionStarted = true;
+		return { name, path: "/fixture/SKILL.md", args };
+	};
+	const handlers = start(sessionContext, undefined, () => {}, false, new Map(), undefined, false);
+	await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+	const pausedCommit = pauseNextReconciliationCommit(sessionFile, sessionId);
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+
+		pausedCommit.arm();
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "durable-skill-acceptance",
+				operation: "skill.invoke",
+				input: { name: "fixture-skill", args: "cancel while durable skill acceptance is pending" },
+			}),
+		);
+		await pausedCommit.started;
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "abort-durable-skill-acceptance",
+				operation: "turn.abort",
+				input: {},
+			}),
+		);
+		await abortObserved.promise;
+		expect(frames.some(frame => frame.type === "control_response" && frame.id === "durable-skill-acceptance")).toBe(
+			false,
+		);
+		expect(
+			frames.some(frame => frame.type === "control_response" && frame.id === "abort-durable-skill-acceptance"),
+		).toBe(false);
+		expect(frames.some(frame => frame.type === "agent_end" || frame.type === "agent_failed")).toBe(false);
+
+		pausedCommit.release();
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "durable-skill-acceptance"),
+			"durable skill acceptance response",
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "abort-durable-skill-acceptance"),
+			"durable skill abort response",
+		);
+		await waitFor(
+			() =>
+				frames.some(
+					frame =>
+						frame.type === "agent_end" &&
+						typeof frame.commandId === "string" &&
+						typeof frame.turnId === "string" &&
+						(frame.outcome as { kind?: unknown; reason?: unknown } | undefined)?.kind === "stopped" &&
+						(frame.outcome as { kind?: unknown; reason?: unknown } | undefined)?.reason === "cancelled",
+				),
+			"durable skill cancellation terminal",
+		);
+		expect(
+			frames.find(frame => frame.type === "control_response" && frame.id === "durable-skill-acceptance"),
+		).toMatchObject({
+			ok: true,
+			result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
+		});
+		expect(
+			frames.find(frame => frame.type === "control_response" && frame.id === "abort-durable-skill-acceptance"),
+		).toMatchObject({
+			ok: true,
+			result: { aborted: true, disposition: "preflight_cancelled" },
+		});
+		expect(executionStarted).toBe(false);
+		expect(frames.some(frame => frame.type === "agent_start" || frame.type === "agent_failed")).toBe(false);
+	} finally {
+		pausedCommit.release();
+		pausedCommit.restore();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	}
+}, 30_000);
+
+test("SDK host rolls back canonical skill ownership when durable acceptance fails", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-acceptance-failed-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-skill-acceptance-failed-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = {
+		...sessionManager,
+		getSessionFile: () => sessionFile,
+	};
+	const baseBindings = sessionContext.sdkBindings as () => string[];
+	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
+	let executionCount = 0;
+	sessionContext.invokeSkill = async (
+		name: string,
+		args: string | undefined,
+		options?: {
+			onSkillPrepared?: (meta: { name: string; path: string; cleanedArgs?: string }) => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+		},
+	) => {
+		options?.onSkillPrepared?.({ name, path: "/fixture/SKILL.md", cleanedArgs: args });
+		await options?.onPreflightAcceptCommit?.();
+		executionCount++;
+		return { name, path: "/fixture/SKILL.md", args };
+	};
+	const storeDirectory = path.dirname(reconciliationStorePath(sessionFile, sessionId));
+	fs.rmSync(storeDirectory, { recursive: true, force: true });
+	fs.writeFileSync(storeDirectory, "block reconciliation persistence");
+	const handlers = start(sessionContext, undefined, () => {}, false, new Map(), undefined, false);
+	await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+
+	const clientRef = "skill-acceptance-failure-ref";
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "skill-acceptance-failed",
+			operation: "skill.invoke",
+			input: { name: "fixture-skill", args: "persist", clientRef },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-acceptance-failed"),
+		"failed skill acceptance response",
+	);
+	expect(
+		frames.find(frame => frame.type === "control_response" && frame.id === "skill-acceptance-failed"),
+	).toMatchObject({
+		ok: false,
+		error: {
+			code: "unavailable",
+			message: "Skill reconciliation state is unavailable; retry after restart.",
+		},
+	});
+	expect(executionCount).toBe(0);
+	expect(frames.some(frame => frame.type === "agent_start")).toBe(false);
+
+	fs.unlinkSync(storeDirectory);
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "skill-acceptance-retry",
+			operation: "skill.invoke",
+			input: { name: "fixture-skill", args: "retry", clientRef },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-acceptance-retry"),
+		"retried skill acceptance response",
+	);
+	expect(
+		frames.find(frame => frame.type === "control_response" && frame.id === "skill-acceptance-retry"),
+	).toMatchObject({
+		ok: true,
+		result: {
+			accepted: true,
+			name: "fixture-skill",
+			args: "retry",
+			clientRef,
+		},
+	});
+	expect(executionCount).toBe(1);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
 test("SDK host terminalizes a never-resolving preflight on abort and fences late acceptance", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-preflight-never-"));
 	dirs.push(cwd);
@@ -2149,7 +2761,17 @@ test("SDK host terminalizes a never-resolving preflight on abort and fences late
 				? () => void options.onPreflightAcceptCommit?.()
 				: options?.onPreflightAccepted;
 			preflightStarted.resolve();
-			await neverPreflight.promise;
+			const cancelled = Promise.withResolvers<never>();
+			const onAbort = () =>
+				cancelled.reject(
+					Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" }),
+				);
+			options?.preflightSignal?.addEventListener("abort", onAbort, { once: true });
+			try {
+				await Promise.race([neverPreflight.promise, cancelled.promise]);
+			} finally {
+				options?.preflightSignal?.removeEventListener("abort", onAbort);
+			}
 		},
 		true,
 	);
@@ -3051,6 +3673,130 @@ test("SDK host routes AskUserQuestion through a live ACP form elicitation provid
 	disposePriorAnswerSource();
 });
 
+test("SDK ACP form elicitation remains preferred after /notify on and falls back on provider disconnect", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ui-provider-notify-priority-"));
+	dirs.push(cwd);
+	const host = await startProductionSdkHost(cwd, { notificationsInitiallyEnabled: false });
+	const { sessionId, endpoint } = host;
+	try {
+		expect(getAskAnswerSource(sessionId)).toBeUndefined();
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		await waitFor(() => frames.some(frame => frame.type === "hello"), "SDK hello");
+		const connectionId = String(frames.find(frame => frame.type === "hello")?.connectionId);
+		socket.send(
+			JSON.stringify({
+				type: "register_provider",
+				id: "ui",
+				connectionId,
+				capability: "ui",
+				definitions: [],
+			}),
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "register_provider_result" && frame.id === "ui"),
+			"UI provider registration",
+		);
+		const priorNotifications = process.env.GJC_NOTIFICATIONS;
+		process.env.GJC_NOTIFICATIONS = "1";
+		try {
+			await host.runCommand("/notify on");
+		} finally {
+			if (priorNotifications === undefined) delete process.env.GJC_NOTIFICATIONS;
+			else process.env.GJC_NOTIFICATIONS = priorNotifications;
+		}
+
+		const protocolAnswerSource = getAskAnswerSource(sessionId);
+		expect(protocolAnswerSource).toBeDefined();
+		const protocolAnswer = protocolAnswerSource!.awaitAnswerRequest!(
+			{
+				question: "Choose the protocol answer",
+				options: ["First", "Second"],
+				interaction: "selector",
+				controls: [],
+			},
+			new AbortController().signal,
+		);
+		await waitFor(() => frames.some(frame => frame.type === "reverse_request"), "protocol elicitation request");
+		const protocolRequest = frames.find(frame => frame.type === "reverse_request")!;
+		expect(protocolRequest).toMatchObject({
+			payload: {
+				method: "ui.elicit",
+				payload: { mode: "form", message: "Choose the protocol answer" },
+			},
+		});
+		socket.send(
+			JSON.stringify({
+				type: "reverse_response",
+				id: protocolRequest.id,
+				connectionId,
+				leaseId: protocolRequest.leaseId,
+				ok: true,
+				result: { action: "accept", content: { value: "option:1" } },
+			}),
+		);
+		expect(await protocolAnswer).toBe("Second");
+
+		await closeSocket(socket);
+		await waitFor(() => {
+			const selected = getAskAnswerSource(sessionId);
+			return selected !== undefined && selected !== protocolAnswerSource;
+		}, "interactive answer source restoration");
+		const fallbackFrames: Record<string, unknown>[] = [];
+		const fallbackSocket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(fallbackSocket);
+		fallbackSocket.addEventListener("message", event => fallbackFrames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			fallbackSocket.addEventListener("open", () => resolve(), { once: true });
+			fallbackSocket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		await waitFor(() => fallbackFrames.some(frame => frame.type === "hello"), "fallback SDK hello");
+		const interactiveAnswerSource = getAskAnswerSource(sessionId);
+		expect(interactiveAnswerSource).toBeDefined();
+		expect(interactiveAnswerSource).not.toBe(protocolAnswerSource);
+		const fallbackAnswer = interactiveAnswerSource!.awaitAnswer("Choose the interactive fallback", [
+			"Continue",
+			"Stop",
+		]);
+		await waitFor(
+			() => fallbackFrames.some(frame => frame.type === "action_needed" && frame.kind === "ask"),
+			"interactive fallback presentation",
+		);
+		const fallbackAction = fallbackFrames.find(frame => frame.type === "action_needed" && frame.kind === "ask")!;
+		fallbackSocket.send(
+			JSON.stringify({
+				type: "control_command",
+				sessionId,
+				token: endpoint.token,
+				requestId: "interactive-fallback-answer",
+				command: {
+					type: "control_request",
+					id: "interactive-fallback-answer",
+					operation: "ask.answer",
+					input: { id: fallbackAction.id, answer: 0 },
+					idempotencyKey: "interactive-fallback-answer",
+				},
+			}),
+		);
+		await waitFor(
+			() =>
+				fallbackFrames.some(
+					frame => frame.type === "control_command_result" && frame.requestId === "interactive-fallback-answer",
+				),
+			"interactive fallback answer",
+		);
+		expect(await fallbackAnswer).toBe("Continue");
+		expect(frames.filter(frame => frame.type === "reverse_request")).toHaveLength(1);
+	} finally {
+		await host.stop();
+	}
+});
 test("rejects malformed provider definitions without replacing a valid tools registry", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-provider-validation-"));
 	dirs.push(cwd);
@@ -5478,15 +6224,39 @@ test("AC2/AC8: SDK host completes successful session mutations over its live Web
 	});
 });
 
-test("turn.prompt_status reconciles an accepted prompt across client reconnect without duplicate execution", async () => {
+test("turn.prompt_status settles durable acceptance after disconnect before agent_start", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-reconcile-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-reconcile-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
 	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = {
+		...sessionManager,
+		getSessionFile: () => sessionFile,
+	};
 	const deliveries: unknown[] = [];
-	const handlers = start(sessionContext, undefined, (content: unknown) => {
-		deliveries.push(content);
-	});
+	const releaseExecution = Promise.withResolvers<void>();
+	let preflightAborted = false;
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (content, options) => {
+			await options?.onPreflightAcceptCommit?.();
+			deliveries.push(content);
+			const signal = options?.preflightSignal;
+			const onAbort = () => {
+				preflightAborted = true;
+			};
+			signal?.addEventListener("abort", onAbort, { once: true });
+			try {
+				await releaseExecution.promise;
+			} finally {
+				signal?.removeEventListener("abort", onAbort);
+			}
+		},
+		true,
+	);
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
@@ -5527,19 +6297,26 @@ test("turn.prompt_status reconciles an accepted prompt across client reconnect w
 	// Simulate client-process death without consuming the control response. The
 	// caller retained only its fresh clientRef, not the generated IDs.
 	await closeSocket(first.socket);
+	await Bun.sleep(20);
+	expect(preflightAborted).toBe(false);
 	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 
 	// Reconnect: clientRef recovers the canonical generated pair, which then
 	// reconciles identically through the generated-ID selector.
 	const second = await connect();
-	const byRef = await second.request({
-		type: "query_request",
-		id: "status-ref",
-		query: "turn.prompt_status",
-		input: { clientRef: "recon-ref-1" },
-	});
+	let byRef: Record<string, unknown> | undefined;
+	for (let attempt = 0; attempt < 50; attempt++) {
+		byRef = await second.request({
+			type: "query_request",
+			id: `status-ref-${attempt}`,
+			query: "turn.prompt_status",
+			input: { clientRef: "recon-ref-1" },
+		});
+		if ((byRef.result as { status?: unknown } | undefined)?.status === "in_flight") break;
+		await Bun.sleep(20);
+	}
 	expect(byRef).toMatchObject({ ok: true, result: { status: "in_flight", clientRef: "recon-ref-1" } });
-	const { commandId, turnId } = (byRef.result ?? {}) as { commandId: string; turnId: string };
+	const { commandId, turnId } = (byRef?.result ?? {}) as { commandId: string; turnId: string };
 	expect(typeof commandId).toBe("string");
 	expect(typeof turnId).toBe("string");
 	const byPair = await second.request({
@@ -5570,13 +6347,19 @@ test("turn.prompt_status reconciles an accepted prompt across client reconnect w
 	expect(duplicate).toMatchObject({ ok: false, error: { code: "client_ref_conflict" } });
 
 	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
-	const terminal = await second.request({
-		type: "query_request",
-		id: "status-terminal",
-		query: "turn.prompt_status",
-		input: { commandId, turnId },
-	});
+	let terminal: Record<string, unknown> | undefined;
+	for (let attempt = 0; attempt < 50; attempt++) {
+		terminal = await second.request({
+			type: "query_request",
+			id: `status-terminal-${attempt}`,
+			query: "turn.prompt_status",
+			input: { commandId, turnId },
+		});
+		if ((terminal.result as { status?: unknown } | undefined)?.status === "terminal_ok") break;
+		await Bun.sleep(20);
+	}
 	expect(terminal).toMatchObject({ ok: true, result: { status: "terminal_ok" } });
+	releaseExecution.resolve();
 
 	// Exactly one execution happened across the whole reconnect/reconcile flow.
 	expect(deliveries).toHaveLength(1);
@@ -5694,7 +6477,7 @@ test("turn.prompt_status validates selectors and rejects invalid clientRef input
 			input: { clientRef: "r" },
 			cursor: "x",
 		}),
-	).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+	).toMatchObject({ ok: false, error: { code: "invalid_cursor" } });
 	expect(
 		await request({
 			type: "query_request",
