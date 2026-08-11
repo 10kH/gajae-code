@@ -249,7 +249,61 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			expect(provider.creates).toBe(1);
 		});
 	});
+	test("fences a creating predecessor when a same-generation attachment is retired", async () => {
+		let authorityId = "predecessor";
+		let providerCreated = false;
+		let postCreateBindingChecks = 0;
+		const commitBindingEntered = Promise.withResolvers<void>();
+		const releaseCommitBinding = Promise.withResolvers<void>();
+		await withDaemon(
+			async (daemon, provider, agentDir) => {
+				const originalCreate = provider.createThread.bind(provider);
+				provider.createThread = async input => {
+					const thread = await originalCreate(input);
+					providerCreated = true;
+					return thread;
+				};
+				const predecessor = daemon.notify({
+					sessionId: "session",
+					endpointGeneration: 1,
+					attachmentAuthorityId: "predecessor",
+					content: "predecessor",
+				});
+				await commitBindingEntered.promise;
+				await daemon.retireAttachment("session", 1);
+				authorityId = "successor";
+				releaseCommitBinding.resolve();
+				await expect(predecessor).rejects.toThrow("create intent lost its fence before mapping commit");
 
+				const successor = await daemon.notify({
+					sessionId: "session",
+					endpointGeneration: 1,
+					attachmentAuthorityId: "successor",
+					content: "successor",
+				});
+				expect(successor.threadId).toBe("thread-2");
+				expect(provider.creates).toBe(2);
+				const store = new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" });
+				expect(await store.read("app:guild:parent:thread-1")).toBeUndefined();
+			},
+			{
+				resolveAttachment: async (sessionId, expectedGeneration = 1) => {
+					const resolvedAuthorityId = authorityId;
+					if (providerCreated && ++postCreateBindingChecks === 2) {
+						commitBindingEntered.resolve();
+						await releaseCommitBinding.promise;
+					}
+					return {
+						authorityId: resolvedAuthorityId,
+						sessionId,
+						generation: expectedGeneration,
+						isCurrent: () => true,
+						send: () => {},
+					};
+				},
+			},
+		);
+	});
 	test("restores a durable mapping after daemon restart without creating another thread", async () => {
 		await withDaemon(async (daemon, provider, agentDir) => {
 			const first = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
@@ -289,6 +343,14 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				provider.failUnarchive = true;
 				const replacement = await daemon.resume("session", 3, "authority");
 				expect(replacement?.threadId).toBe("thread-2");
+				expect(replacement?.attachmentAuthorityId).toBe("authority");
+				const reused = await daemon.notify({
+					sessionId: "session",
+					endpointGeneration: 3,
+					attachmentAuthorityId: "authority",
+					content: "continued",
+				});
+				expect(reused.threadId).toBe(replacement?.threadId);
 				expect(provider.creates).toBe(2);
 			},
 			{

@@ -4379,10 +4379,7 @@ export class TelegramNotificationDaemon {
 		return this.selectedAckCache.get(cacheKey);
 	}
 
-	async #settleSelectedPublication(
-		publicationId: string | undefined,
-		outcome: SelectedAckOutcome,
-	): Promise<void> {
+	async #settleSelectedPublication(publicationId: string | undefined, outcome: SelectedAckOutcome): Promise<void> {
 		if (!publicationId) return;
 		if (outcome.status === "delivered") {
 			await this.#markPublicationDelivered(publicationId);
@@ -4896,6 +4893,16 @@ export class TelegramNotificationDaemon {
 			settlePublication: (publicationId: string) => this.#settlePublication(publicationId),
 		};
 	}
+
+	/** @internal Test-only access to attachment routing lifecycle transitions. */
+	attachmentRoutingHarnessForTest() {
+		return {
+			attach: (attachment: SessionAttachment) => this.#onAttachment(attachment),
+			remove: async (attachment: SessionAttachment, reason: "removed" | "replaced" | "replaced_same_generation") =>
+				await this.#onSessionRemoved(attachment, reason),
+			ownsLogicalSession: (sessionId: string) => this.#logicalSessionOwners.has(sessionId),
+		};
+	}
 	#attachmentIsCurrent(session: AttachmentSession): boolean {
 		return this.sessions.get(session.sessionId) === session && session.attachment.isCurrent();
 	}
@@ -5039,6 +5046,9 @@ export class TelegramNotificationDaemon {
 			this.cancelLegacyToolStartsForSession(session);
 			this.#clearModelChoiceAliasesForSocket(session);
 			this.sessions.delete(attachment.sessionId);
+			for (const [logicalSessionId, owner] of this.#logicalSessionOwners) {
+				if (owner === session) this.#logicalSessionOwners.delete(logicalSessionId);
+			}
 			return;
 		}
 		this.#dropSession(session, "router_session_removed");

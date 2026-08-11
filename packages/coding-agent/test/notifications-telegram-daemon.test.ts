@@ -234,6 +234,43 @@ describe("Telegram provider supervisor ownership", () => {
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
 	});
+	test("drops logical-session ownership when a router replacement retires its predecessor", async () => {
+		const agentDir = tempAgentDir();
+		try {
+			const daemon = new TelegramNotificationDaemon({
+				settings: settings(agentDir),
+				ownerId: "provider-owner",
+				botToken: BOT_TOKEN,
+				chatId: "42",
+			});
+			const routing = daemon.attachmentRoutingHarnessForTest();
+			const attachment = {
+				sessionId: "session",
+				generation: 1,
+				isCurrent: () => true,
+				send: () => {},
+			};
+			routing.attach(attachment);
+			const session = daemon.sessions.get(attachment.sessionId);
+			if (!session) throw new Error("Expected a routed Telegram attachment session.");
+			await daemon.handleSessionMessage(session, {
+				type: "event_replay_result",
+				id: session.replayId,
+				ok: true,
+				generation: 1,
+				lastSeq: 0,
+				events: [],
+			});
+			expect(routing.ownsLogicalSession(attachment.sessionId)).toBe(true);
+
+			await routing.remove(attachment, "replaced");
+
+			expect(routing.ownsLogicalSession(attachment.sessionId)).toBe(false);
+			expect(daemon.sessions.has(attachment.sessionId)).toBe(false);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
 });
 
 test("advances past a malformed-only getUpdates batch", async () => {

@@ -478,6 +478,26 @@ export class DiscordNotificationDaemon {
 	}
 
 	async retireAttachment(sessionId: string, endpointGeneration: number): Promise<void> {
+		const intentKey = this.#intentKey(sessionId);
+		const now = this.#now();
+		await this.#store.transact(intentKey, current => {
+			if (
+				current?.state !== "creating" ||
+				current.sessionId !== sessionId ||
+				current.endpointGeneration !== endpointGeneration
+			)
+				return current;
+			return normalizeDiscordConversation({
+				...current,
+				generation: current.generation + 1,
+				state: "closed",
+				createNonce: undefined,
+				createOwner: undefined,
+				createLeaseExpiresAt: undefined,
+				closedAt: now,
+				updatedAt: now,
+			});
+		});
 		const record = await this.#bySession(sessionId);
 		if (!record?.threadId || record.endpointGeneration !== endpointGeneration) return;
 		for (const receipt of record.inboundDispatches ?? [])
@@ -490,7 +510,7 @@ export class DiscordNotificationDaemon {
 		});
 		await this.#store.transact(key, current =>
 			current?.sessionId === sessionId && current.endpointGeneration === endpointGeneration
-				? withoutClosingIntent(current, this.#now())
+				? withoutClosingIntent(current, now)
 				: current,
 		);
 	}
@@ -1563,6 +1583,7 @@ export class DiscordNotificationDaemon {
 			currentIntent?.state !== "creating" ||
 			currentIntent.createOwner !== intent.createOwner ||
 			currentIntent.generation !== intent.generation ||
+			currentIntent.attachmentAuthorityId !== intent.attachmentAuthorityId ||
 			(currentIntent.createLeaseExpiresAt ?? 0) <= this.#now()
 		) {
 			throw new Error("Discord create intent lost its fence before mapping commit");
@@ -1574,8 +1595,19 @@ export class DiscordNotificationDaemon {
 			parentChannelId: intent.parentChannelId,
 			threadId: thread.id,
 		});
-		const record = await this.#store.transact(key, old =>
-			normalizeDiscordConversation({
+		let committed = false;
+		const record = await this.#store.transactWithSnapshot(key, (old, conversations) => {
+			const current = conversations[intentKey];
+			if (
+				current?.state !== "creating" ||
+				current.createOwner !== intent.createOwner ||
+				current.generation !== intent.generation ||
+				current.attachmentAuthorityId !== intent.attachmentAuthorityId ||
+				(current.createLeaseExpiresAt ?? 0) <= this.#now()
+			)
+				return old;
+			committed = true;
+			return normalizeDiscordConversation({
 				generation: (old?.generation ?? 0) + 1,
 				state: "active",
 				appId: intent.appId,
@@ -1593,9 +1625,9 @@ export class DiscordNotificationDaemon {
 					old?.attachmentAuthorityId === intent.attachmentAuthorityId ? (old?.seenInteractionIds ?? []) : [],
 				inboundDispatches:
 					old?.attachmentAuthorityId === intent.attachmentAuthorityId ? old?.inboundDispatches : undefined,
-			}),
-		);
-		if (!record) throw new Error("Unable to persist Discord thread mapping");
+			});
+		});
+		if (!committed || !record) throw new Error("Discord create intent lost its fence before mapping commit");
 		await this.#store.delete(intentKey, intent.generation);
 		return record;
 	}
