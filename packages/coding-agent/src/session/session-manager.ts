@@ -14697,12 +14697,8 @@ export class SessionManager {
 	}
 
 	async #retryRejectedOpenWriterCleanup(): Promise<void> {
-		for (
-			let attempt = 0;
-			this.#persistWriter?.getCloseState() === "close_failed_retryable" && attempt < 30;
-			attempt++
-		) {
-			await Bun.sleep(100);
+		for (let attempt = 0; this.#persistWriter?.getCloseState() === "close_failed_retryable"; attempt++) {
+			await Bun.sleep(Math.min(100 * 2 ** Math.min(attempt, 6), 5_000));
 			try {
 				await this.#closePersistWriterInternal();
 			} catch (error) {
@@ -14727,6 +14723,7 @@ export class SessionManager {
 				await this.#closePersistWriterInternal();
 			} catch (error) {
 				closeError = toError(error);
+				if (this.#persistWriter?.getCloseState() !== "close_failed_retryable") break;
 			}
 		}
 		const state = this.#persistWriter?.getCloseState();
