@@ -394,4 +394,27 @@ describe("managed strict-resume target races", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
+
+	it("propagates retained authority stat failures instead of pathname fallback", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-retained-stat-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "source.jsonl");
+		storage.writeTextSync(sourceFile, transcript());
+		SessionManagerTestHooks.beforeManagedSourceStat = () => {
+			throw new Error("source_changed");
+		};
+		try {
+			await expect(SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled")).rejects.toThrow(
+				"source_changed",
+			);
+			expect(storage.readTextSync(sourceFile)).toBe(transcript());
+		} finally {
+			SessionManagerTestHooks.beforeManagedSourceStat = undefined;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
 });

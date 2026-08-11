@@ -6528,6 +6528,7 @@ export const SessionManagerTestHooks: {
 	beforeStrictMissingCheck?: (filePath: string, storage: SessionStorage) => void;
 	beforeManagedResumeAcceptance?: (filePath: string, storage: SessionStorage) => void;
 	beforeManagedResumeReturn?: (filePath: string, storage: SessionStorage) => void;
+	beforeManagedSourceStat?: (filePath: string, storage: SessionStorage) => void;
 	/** Internal first-open GC strategy override; omitted means current. */
 	firstOpenGcStrategy?: SessionMemoryGcStrategy;
 	/** Internal first-open secondary-artifact mode override; omitted means auto. */
@@ -18497,9 +18498,14 @@ export class SessionManager {
 		}
 		let managedSourceSize: number | undefined;
 		try {
+			SessionManagerTestHooks.beforeManagedSourceStat?.(filePath, managedInspectionStorage);
 			managedSourceSize = managedInspectionStorage.statSync(filePath).size;
-		} catch {
-			// Strict inspection below reports the stable failure.
+		} catch (error) {
+			if (!isEnoent(error)) {
+				managedInspectionStore?.close();
+				throw error;
+			}
+			// An initially missing target is created by the ordinary managed path below.
 		}
 		const managedResumeBounded =
 			managedSourceSize !== undefined &&
