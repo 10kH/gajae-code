@@ -6532,6 +6532,7 @@ export const SessionManagerTestHooks: {
 	beforeManagedMissingInit?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
 	beforeManagedMissingPublish?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
 	beforeManagedMissingReturn?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
+	afterManagedMissingAssertion?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
 	/** Internal first-open GC strategy override; omitted means current. */
 	firstOpenGcStrategy?: SessionMemoryGcStrategy;
 	/** Internal first-open secondary-artifact mode override; omitted means auto. */
@@ -18525,10 +18526,11 @@ export class SessionManager {
 				try {
 					await SessionManagerTestHooks.beforeManagedMissingPublish?.(filePath, managedInspectionStorage);
 					managedInspectionStore.assertBound();
+					await SessionManagerTestHooks.afterManagedMissingAssertion?.(filePath, managedInspectionStorage);
 					const fresh = manager.#freshSessionState(undefined, filePath);
 					const prepared = manager.#prepareFreshSessionTransition(fresh, "memory-fallback");
 					manager.#applyFreshSessionMetadata(fresh);
-					manager.#commitResidentTextStoreTransition(prepared);
+					manager.#commitResidentTextStoreTransition(prepared, false);
 					manager.#retireEphemeralArtifacts();
 					const content = `${JSON.stringify(prepareEntryForPersistenceSync(fresh.header, manager.#blobStore))}\n`;
 					managedInspectionStore.publishNoReplaceSync(path.basename(filePath), Buffer.from(content, "utf8"));
