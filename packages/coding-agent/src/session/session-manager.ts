@@ -8774,7 +8774,10 @@ export class SessionManager {
 			return;
 		}
 		revalidateStrictResume();
-		if (initializeMissing && !this.#storage.existsSync(resolvedSessionFile)) {
+		const transcriptMissing =
+			(initializeMissing || strictResume !== undefined) && !this.#storage.existsSync(resolvedSessionFile);
+		if (strictResume && transcriptMissing) throw new Error("Could not open session: unstable");
+		if (initializeMissing && transcriptMissing) {
 			const fresh = this.#freshSessionState(undefined, resolvedSessionFile);
 			const prepared = this.#prepareFreshSessionTransition(fresh, "memory-fallback");
 			this.#applyFreshSessionMetadata(fresh);
