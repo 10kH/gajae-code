@@ -333,8 +333,13 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 				raw.authorityState !== "inactive"
 			)
 				malformed();
-			// Older archive transitions retained the expired disconnect-grace marker,
-			// making the entire shared registry unreadable on the next daemon start.
+			// A grace deadline on a non-grace record is a known artifact of the
+			// v0.12.12–v0.12.17 archive writers, which moved disconnect_grace records
+			// to archive_pending without clearing disconnectGraceExpiresAt (fixed by
+			// #4054). Rejecting it here permanently bricked otherwise-healthy shared
+			// registries: the CAS authority refused every read and write forever.
+			// The field is inert outside disconnect_grace, so drop it here to heal
+			// the in-memory state; the next serialize no longer persists it.
 			delete raw.disconnectGraceExpiresAt;
 		}
 		const hasBinding = hasAnyBinding(raw);
