@@ -162,7 +162,7 @@ BACK | VibeQuant | gajae-code | HOME | NEXT
 
 - `NEW SESSION`: create a terminal surface and ask for a worktree name; a blank answer starts a plain `gjc` session, while a name starts `gjc --worktree <name>`. Do not select a profile here.
 - `CLOSE TAB`: close the focused cmux surface.
-- `VOICE`: toggle GJC speech-to-text with `Option+H` (`Alt+H`) on the focused `GJC:` surface.
+- `VOICE`: invoke GJC's `Toggle speech-to-text` action on the focused `GJC:` surface. This is the same action bound to `Option+H` (`Alt+H`).
 - `STEER`: send `Esc`, wait 100 ms, then send `Enter`.
 - `ESC X2`: send `Esc`, wait 100 ms, then send `Esc` again.
 
@@ -273,13 +273,13 @@ cmux send-key \
 
 ### Voice (`Option+H`)
 
-GJC maps speech-to-text to `Alt+H`. Deliver the terminal equivalent in one cmux surface write:
+GJC binds speech-to-text to `Alt+H`, but cmux does not reliably forward that modifier through `send-key`, and macOS blocks Stream Deck plugin keystroke automation unless the plugin host has Accessibility permission. Use the focused GJC command palette instead:
 
-```sh
-cmux rpc surface.send_text '{"surface":"surface:7","text":"\u001bh"}'
+```text
+Ctrl+P -> type "Toggle speech-to-text" -> Enter
 ```
 
-The expected bytes are `[27, 104]`. Guard this control with the same focused `GJC:` title check as other interactive GJC keys.
+This invokes the same registered `app.stt.toggle` action without inserting a stray `h` into the editor or requiring macOS Accessibility access.
 
 ### Shift+Tab
 
@@ -425,7 +425,7 @@ Use temporary surfaces and restore the original focus after each test:
 - pane previous/next;
 - tab previous/next;
 - terminal creation in the requested pane;
-- exact `Option+H` bytes (`[27, 104]`) and voice-mode toggle;
+- voice action toggles through the GJC command palette without inserting `h`;
 - fixed-folder `cd` behavior;
 - focused tab closure;
 - same-tab worktree prompting when required;
