@@ -642,6 +642,40 @@ describe("SessionManager cold sidecar integration", () => {
 		},
 		60_000,
 	);
+	itPosix("rejects malformed auto-small nested managed transcripts", async () => {
+		const tempDir = TempDir.createSync("@pi-session-memory-nested-malformed-");
+		const cwd = path.join(tempDir.path(), "project");
+		const managedRoot = path.join(tempDir.path(), "managed");
+		fs.mkdirSync(cwd, { recursive: true });
+		fs.mkdirSync(managedRoot, { recursive: true, mode: 0o700 });
+		const rootStore = new ManagedSessionDescendantStore(managedDirectoryRoot(managedRoot), managedRoot);
+		try {
+			rootStore.ensureDirectory("review");
+			const nestedStore = rootStore.deriveSubtree("review");
+			const destination = SessionManager.nestedManagedDestination(nestedStore, nestedStore.dir);
+			const sessionFile = path.join(nestedStore.dir, "malformed.jsonl");
+			nestedStore.publishNoReplaceSync(
+				path.basename(sessionFile),
+				Buffer.from(
+					`${JSON.stringify({ type: "session", version: 5, id: "nested-malformed", timestamp: "0", cwd })}\n{malformed}\n`,
+					"utf8",
+				),
+			);
+			await expect(
+				SessionManager.openNestedManaged(
+					sessionFile,
+					destination,
+					nestedStore,
+					new FileSessionStorage(),
+					cwd,
+					"auto",
+				),
+			).rejects.toThrow("malformed");
+		} finally {
+			rootStore.close();
+			tempDir.removeSync();
+		}
+	});
 	it("fails closed when the authoritative cold prefix changes after shadow indexing", async () => {
 		const tempDir = TempDir.createSync("@pi-session-memory-mismatch-");
 		const storage = new FileSessionStorage();
@@ -1182,6 +1216,37 @@ it("applies auto-routed retirement while constructing a direct fork", async () =
 	} finally {
 		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
 		await forked?.close();
+	}
+});
+
+it("constructs managed cold forks through bounded authority-bound publication", async () => {
+	const tempDir = TempDir.createSync("@pi-session-managed-bounded-fork-");
+	const storage = new FileSessionStorage();
+	const cwd = tempDir.path();
+	const agentDir = path.join(cwd, ".gjc");
+	const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+	const source = SessionManager.create(cwd, destination, storage);
+	let forked: SessionManager | undefined;
+	SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1;
+	try {
+		source.setSessionMemoryMode("off");
+		await source.ensureOnDisk();
+		const old = source.appendCustomEntry("node", { payload: "old" });
+		const kept = source.appendCustomEntry("node", { payload: "kept" });
+		source.appendCompaction("summary", undefined, kept, 1);
+		await source.flush();
+		await source.close();
+		const sourceFile = source.getSessionFile();
+		if (!sourceFile) throw new Error("Expected managed source file");
+		forked = await SessionManager.forkFrom(sourceFile, cwd, destination, storage, "copy-retain", "auto");
+		expect(forked.getSessionFile()).not.toBe(sourceFile);
+		expect(forked.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		expect(forked.getEntry(old)).toMatchObject({ id: old });
+	} finally {
+		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
+		await forked?.close();
+		await source.close();
+		tempDir.removeSync();
 	}
 });
 
@@ -2064,6 +2129,17 @@ it("routes auto mode eagerly below the threshold and bounded above it", async ()
 	}
 });
 
+it("rejects malformed auto-small explicit resumes through strict inspection", async () => {
+	const storage = new MemorySessionStorage();
+	const sessionFile = "/sessions/auto-small-explicit-malformed.jsonl";
+	storage.writeTextSync(
+		sessionFile,
+		`${JSON.stringify({ type: "session", version: 5, id: "auto-small-explicit", timestamp: "0", cwd: "/cwd" })}\n{malformed}\n`,
+	);
+	await expect(
+		SessionManager.open(sessionFile, SessionManager.explicitDestination("/sessions"), storage, "copy-retain", "auto"),
+	).rejects.toThrow(/Could not open session|malformed/);
+});
 it("rejects malformed auto-small managed resumes through the strict eager path", async () => {
 	const tempDir = TempDir.createSync("@pi-session-auto-small-");
 	const storage = new FileSessionStorage();
@@ -2147,6 +2223,40 @@ it("captures and restores cold rollback state without full hydration", async () 
 		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
 		SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
 		await manager?.close();
+	}
+});
+
+it("switches to an oversized-guarded cold target through bounded adoption", async () => {
+	const storage = new MemorySessionStorage();
+	const targetFile = "/sessions/bounded-switch-target.jsonl";
+	const records = [
+		{ type: "session", version: 5, id: "bounded-switch", timestamp: "0", cwd: "/cwd" },
+		{ type: "custom", id: "old", parentId: null, timestamp: "0", customType: "node", data: {} },
+		{ type: "custom", id: "kept", parentId: "old", timestamp: "0", customType: "node", data: {} },
+		{
+			type: "compaction",
+			id: "compact",
+			parentId: "kept",
+			timestamp: "0",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 1,
+		},
+	];
+	storage.writeTextSync(targetFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	const manager = SessionManager.create("/cwd", SessionManager.explicitDestination("/sessions"), storage);
+	SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = 1;
+	SessionManagerTestHooks.eagerHydrationMaxBytesOverride = 1;
+	try {
+		manager.setSessionMemoryMode("auto");
+		await manager.ensureOnDisk();
+		await manager.setSessionFile(targetFile);
+		expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+		expect(manager.getEntry("old")).toMatchObject({ id: "old" });
+	} finally {
+		SessionManagerTestHooks.autoModeMinTranscriptBytesOverride = undefined;
+		SessionManagerTestHooks.eagerHydrationMaxBytesOverride = undefined;
+		await manager.close();
 	}
 });
 

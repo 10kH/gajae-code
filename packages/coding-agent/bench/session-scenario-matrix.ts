@@ -694,7 +694,8 @@ async function runFreshReopenWorker(
 	let cpuSystemMicros = 0;
 	let status: Status = "ok";
 	let failure: WorkerResult["failure"];
-	let beforeStats: SessionMemoryStats[] = [];
+	const beforeStats: SessionMemoryStats[] = [];
+	let lookupBaselineStats: SessionMemoryStats[] = [];
 	let afterStats: SessionMemoryStats[] = [];
 	try {
 		const cpuStart = process.cpuUsage();
@@ -720,7 +721,7 @@ async function runFreshReopenWorker(
 		cpuSystemMicros = cpu.system;
 		afterOperation = await settledMemorySample();
 		if (status === "ok") {
-			beforeStats = managers.map(manager => manager.getSessionMemoryStats());
+			lookupBaselineStats = managers.map(manager => manager.getSessionMemoryStats());
 			for (let index = 0; index < managers.length; index++) {
 				const id = generated[index]?.coldEntryId ?? "";
 				const measured = await measurePhase(() => {
@@ -743,7 +744,10 @@ async function runFreshReopenWorker(
 			}
 			afterWarmLookups = await settledMemorySample();
 			const afterWarm = managers.map(manager => manager.getSessionMemoryStats());
-			coldRangeReads = afterCold.reduce((total, value, index) => total + value.rangeReadCount - (beforeStats[index]?.rangeReadCount ?? 0), 0);
+			coldRangeReads = afterCold.reduce(
+				(total, value, index) => total + value.rangeReadCount - (lookupBaselineStats[index]?.rangeReadCount ?? 0),
+				0,
+			);
 			warmRangeReads = afterWarm.reduce((total, value, index) => total + value.rangeReadCount - (afterCold[index]?.rangeReadCount ?? 0), 0);
 			for (const manager of managers) contextMessageCount += manager.buildSessionContext().messages.length;
 			afterStats = afterWarm;

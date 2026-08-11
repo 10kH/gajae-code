@@ -7365,7 +7365,11 @@ export class SessionManager {
 			this.restoreState(snapshot);
 			return;
 		}
-		await this.setSessionFile(snapshot.coldRestoreFile);
+		await this.#closePersistWriter();
+		this.#persistChain = Promise.resolve();
+		this.#persistError = undefined;
+		this.#persistErrorReported = false;
+		await this.#initSessionFile(snapshot.coldRestoreFile);
 		this.#flushed = snapshot.flushed;
 		this.#ensuredOnDisk = snapshot.ensuredOnDisk;
 		this.#needsFullRewriteOnNextPersist = snapshot.needsFullRewriteOnNextPersist;
@@ -7737,6 +7741,19 @@ export class SessionManager {
 	 * partial sidecars/state and returns `false` so the caller falls back to the
 	 * existing eager authoritative path.
 	 */
+	#releaseExclusiveLockWithRetry(lock: SessionStorageExclusiveLock): void {
+		let firstError: Error | undefined;
+		for (let attempt = 0; attempt < 2; attempt++) {
+			try {
+				lock.releaseSync();
+				return;
+			} catch (error) {
+				firstError ??= toError(error);
+			}
+		}
+		throw firstError ?? new Error("exclusive_lock_release_failed");
+	}
+
 	async #acquireBoundedFirstOpenLock(
 		sessionFile: string,
 	): Promise<SessionStorageExclusiveLock | "published" | undefined> {
@@ -7755,7 +7772,7 @@ export class SessionManager {
 			const lock = this.#storage.acquireExclusiveLockSync(lockPath);
 			if (lock) {
 				if (contended && this.#storage.existsSync(commitPath)) {
-					lock.releaseSync();
+					this.#releaseExclusiveLockWithRetry(lock);
 					return "published";
 				}
 				return lock;
@@ -7914,7 +7931,7 @@ export class SessionManager {
 				this.#sidecarRuntime = undefined;
 				this.#sessionFile = undefined;
 			}
-			buildLock.releaseSync();
+			this.#releaseExclusiveLockWithRetry(buildLock);
 		}
 	}
 
@@ -8717,6 +8734,35 @@ export class SessionManager {
 				const inspected = inspectResumeSessionFile(resolvedSessionFile, this.#storage);
 				if ("kind" in inspected || !sameResumeIdentity(strictAdoption.identity, inspected.identity))
 					throw new Error("Prepared session changed before strict adoption.");
+			}
+			if (!strictAdoption && this.#storage.existsSync(resolvedSessionFile)) {
+				let targetSize: number | undefined;
+				try {
+					targetSize = this.#storage.statSync(resolvedSessionFile).size;
+				} catch {
+					// Strict eager inspection below handles unreadable targets.
+				}
+				const boundedTarget =
+					targetSize !== undefined &&
+					targetSize > 0 &&
+					targetSize <= BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES &&
+					this.#effectiveSessionMemoryMode(targetSize) === "enabled";
+				if (boundedTarget) {
+					const previous = await this.captureRollbackState();
+					try {
+						await this.#closePersistWriter();
+						managedTransition?.adopt();
+						await this.#initSessionFile(resolvedSessionFile);
+						if (!options?.deferEphemeralArtifactRetirement) this.#retireEphemeralArtifacts();
+						managedTransition?.settle();
+						this.#pendingStrictAdoption = undefined;
+						return;
+					} catch (error) {
+						managedTransition?.rollback();
+						await this.restoreRollbackState(previous);
+						throw error;
+					}
+				}
 			}
 			let entries: FileEntry[];
 			let candidateMigrationApplied = false;
@@ -14904,6 +14950,11 @@ export class SessionManager {
 		return this.destination.kind === "managed";
 	}
 
+	/** Retain the verified destination contract for bounded forks. @internal */
+	getDestinationForFork(): SessionDestination {
+		return this.destination;
+	}
+
 	/** Supplies opaque retained authority for mandatory managed legacy local migration. */
 	getManagedLegacyLocalMigrationSource(): ManagedLegacyLocalMigrationSource | null {
 		return this.#managedLegacyLocalMigrationSourceFor(this.#sessionFile);
@@ -17445,7 +17496,6 @@ export class SessionManager {
 		const sourceSize = expectedIdentity?.size ?? this.#storage.statSync(sourcePath).size;
 		if (
 			this.#effectiveSessionMemoryMode(sourceSize) !== "enabled" ||
-			this.destination.kind === "managed" ||
 			typeof this.#storage.readRangeSync !== "function" ||
 			typeof this.#storage.openStagedWriter !== "function"
 		)
@@ -17548,7 +17598,9 @@ export class SessionManager {
 		fresh.header.title = sourceHeader.title;
 		fresh.header.titleSource = sourceHeader.titleSource;
 		if (!fresh.sessionFile) return false;
-		const staged = this.#storage.openStagedWriter(fresh.sessionFile);
+		const staged = this.#storage.openStagedWriter(fresh.sessionFile, {
+			securityContext: this.destination.kind === "managed" ? this.destination.securityContext : undefined,
+		});
 		let published = false;
 		try {
 			let ordinal = 0;
@@ -17762,24 +17814,25 @@ export class SessionManager {
 		sessionMemoryMode: SessionMemoryMode = "shadow",
 	): Promise<SessionManager> {
 		const destination = destinationFor(cwd, destinationInput, storage);
-		const managedSourcePath =
-			destination.kind === "managed" && storage instanceof FileSessionStorage
-				? await SessionManager.prepareManagedCandidateForWrite(sourcePath, migrationPolicy, destination)
-				: sourcePath;
+		let managedSourcePath = sourcePath;
+		if (destination.kind === "managed" && storage instanceof FileSessionStorage) {
+			const prepared = await SessionManager.prepareManagedCandidateForWrite(
+				sourcePath,
+				migrationPolicy,
+				destination,
+			);
+			managedSourcePath = storage.existsSync(prepared) ? prepared : sourcePath;
+		}
 		const dir = destination.directory;
 		const manager = new SessionManager(cwd, dir, true, storage, destination);
 		manager.#sessionMemoryMode = sessionMemoryMode;
 		if (
 			manager.#effectiveSessionMemoryMode(storage.statSync(managedSourcePath).size) === "enabled" &&
-			destination.kind !== "managed" &&
 			storage instanceof FileSessionStorage &&
 			(await manager.#tryForkFromBoundedSource(managedSourcePath))
 		)
 			return manager;
-		if (
-			manager.#effectiveSessionMemoryMode(storage.statSync(managedSourcePath).size) === "enabled" &&
-			destination.kind !== "managed"
-		) {
+		if (manager.#effectiveSessionMemoryMode(storage.statSync(managedSourcePath).size) === "enabled") {
 			const inspected = inspectTranscriptBounded(managedSourcePath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
 			if (
 				inspected.ok &&
@@ -17837,7 +17890,18 @@ export class SessionManager {
 		// owner-only and reparse guards accept.
 		if (storage instanceof FileSessionStorage) filePath = canonicalizeTrustedPath(filePath);
 		if (destination.kind === "explicit" || !(storage instanceof FileSessionStorage)) {
-			const boundedAdmission = sessionMemoryMode === "enabled" || sessionMemoryMode === "auto";
+			let sourceSize: number | undefined;
+			try {
+				sourceSize = storage.statSync(filePath).size;
+			} catch {
+				// Missing files continue through strict inspection and initialization.
+			}
+			const boundedAdmission =
+				sessionMemoryMode === "enabled" ||
+				(sessionMemoryMode === "auto" &&
+					process.platform !== "win32" &&
+					sourceSize !== undefined &&
+					sourceSize >= autoModeMinTranscriptBytes());
 			const maxBytes = boundedAdmission ? BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES : RESUME_TRANSCRIPT_MAX_BYTES;
 			const inspected = boundedAdmission
 				? inspectTranscriptHeaderBounded(filePath, storage, maxBytes)
@@ -17998,7 +18062,23 @@ export class SessionManager {
 					captured.identity.ctimeNs !== capturedDescriptor.ctimeNs))
 		)
 			throw new Error("source_changed");
-		const entries = captured ? parseSessionEntries(captured.bytes.toString("utf8")) : [];
+		let entries: FileEntry[] = [];
+		let capturedMigrationApplied = false;
+		if (captured) {
+			try {
+				const content = new TextDecoder("utf-8", { fatal: true }).decode(captured.bytes);
+				for (const line of content.split(/\r?\n/)) {
+					if (line.length > 0) JSON.parse(line);
+				}
+				entries = parseSessionEntries(content);
+				const strictHeader = entries[0] as SessionHeader | undefined;
+				if (strictHeader?.type !== "session" || typeof strictHeader.id !== "string") throw new Error("malformed");
+				capturedMigrationApplied = migrateToCurrentVersion(entries);
+				if (!hasStrictSessionSchema(entries)) throw new Error("malformed");
+			} catch {
+				throw new Error("Could not open nested managed session: malformed");
+			}
+		}
 		const header = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		const sessionCwd = cwdOverride ? path.resolve(cwdOverride) : (header?.cwd ?? getProjectDir());
 		const cwdChanged = Boolean(
@@ -18010,7 +18090,7 @@ export class SessionManager {
 		try {
 			let transcriptChanged = false;
 			if (entries.length > 0) {
-				const migrationApplied = migrateToCurrentVersion(entries) || cwdChanged;
+				const migrationApplied = capturedMigrationApplied || cwdChanged;
 				transcriptChanged = migrationApplied;
 				await manager.#hydrateExistingSession(resolved, entries, migrationApplied, "memory-fallback");
 				if (cwdChanged) {

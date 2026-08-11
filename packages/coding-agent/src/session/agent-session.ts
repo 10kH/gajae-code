@@ -10889,15 +10889,13 @@ export class AgentSession {
 			await this.sessionManager.flush();
 
 			const boundedColdForkEligible =
-				this.sessionManager.getSessionMemoryStats().coldRetirementActive &&
-				!this.sessionManager.isManagedDestination() &&
-				previousSessionFile !== undefined;
+				this.sessionManager.getSessionMemoryStats().coldRetirementActive && previousSessionFile !== undefined;
 			if (boundedColdForkEligible) {
 				const previousManager = this.sessionManager;
 				const forkedManager = await SessionManager.forkFrom(
 					previousSessionFile,
 					previousManager.getCwd(),
-					SessionManager.explicitDestination(previousManager.getSessionDir()),
+					previousManager.getDestinationForFork(),
 					undefined,
 					"copy-retain",
 					this.settings.get("sessionMemory.mode"),
