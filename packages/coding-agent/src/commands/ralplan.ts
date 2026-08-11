@@ -1,4 +1,5 @@
 import { Command } from "@gajae-code/utils/cli";
+import { ensureWorkflowSettingsMigrated } from "../config/settings";
 import { runNativeRalplanCommand } from "../gjc-runtime/ralplan-runtime";
 
 export default class Ralplan extends Command {
@@ -12,6 +13,7 @@ export default class Ralplan extends Command {
 	];
 
 	async run(): Promise<void> {
+		await ensureWorkflowSettingsMigrated(process.cwd());
 		const result = await runNativeRalplanCommand(this.argv, process.cwd());
 		if (result.stdout) process.stdout.write(result.stdout);
 		if (result.stderr) process.stderr.write(result.stderr);

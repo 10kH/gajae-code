@@ -576,6 +576,9 @@ export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
 	settings: Settings;
+	/** The session's REQUESTED effective agent directory, independent of the
+	 * global Settings singleton (which may be reused across sessions). */
+	agentDir?: string;
 	/** Lazy memory backend service; omitted callers receive a session-local default. */
 	memoryBackend?: LazyService<MemoryBackend>;
 	/** Lazy workspace-tree service; omitted callers retain the legacy direct-scan path. */
@@ -1855,6 +1858,16 @@ export class AgentSession {
 	readonly agent: Agent;
 	sessionManager: SessionManager;
 	readonly settings: Settings;
+	readonly #requestedAgentDir: string | undefined;
+
+	/**
+	 * The session's effective agent directory: its REQUESTED directory when
+	 * provided, else the global Settings singleton's (which may be reused
+	 * across sessions and therefore not the requesting session's own).
+	 */
+	getSessionAgentDir(): string {
+		return this.#requestedAgentDir ?? this.settings.getAgentDir();
+	}
 	readonly memoryBackend: LazyService<MemoryBackend>;
 	readonly notificationSessionController: NotificationSessionController | undefined;
 	readonly taskDepth: number;
@@ -2799,6 +2812,7 @@ export class AgentSession {
 		this.agent.bindRunCancellationDomainBridge(this.#runCancellationDomains, this.#agentSessionClaimKey);
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
+		this.#requestedAgentDir = config.agentDir ? path.resolve(config.agentDir) : undefined;
 		this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
 		this.#unregisterSessionMemorySettings = this.settings.onChanged(settingPath => {
 			if (settingPath === "sessionMemory.mode") {
@@ -7173,6 +7187,7 @@ export class AgentSession {
 						activeSkillState: this.getActiveSkillState(),
 						sessionId: this.sessionManager.getSessionId(),
 					}),
+					() => this.getSessionAgentDir(),
 				),
 			),
 		);

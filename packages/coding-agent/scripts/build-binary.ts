@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import * as path from "node:path";
+import { signMacOSBinary } from "../../../scripts/macos-code-signing";
 import { buildDevCompileArgs } from "./compile-args";
 
 const packageDir = path.join(import.meta.dir, "..");
@@ -40,7 +41,7 @@ async function main(): Promise<void> {
 			await stageWorkspaceNativeAddons();
 			// Bun 1.3.12 emits a truncated Mach-O signature on darwin builds.
 			if (shouldAdhocSignDarwinBinary()) {
-				await runCommand(["codesign", "--force", "--sign", "-", outputPath]);
+				await signMacOSBinary(outputPath, runCommand);
 			}
 		} finally {
 			await runCommand(["bun", "--cwd=../natives", "run", "embed:native", "--reset"]);

@@ -186,6 +186,8 @@ GJC optimizes both sides of the token bill:
 
 ---
 
+The default dark TUI identity is the GJC red-claw theme; light-appearance terminals default to the bundled blue-crab theme. See [docs/theme.md](docs/theme.md) for the full catalog and `theme.dark` / `theme.light` settings.
+
 ## Let OpenClaw / Hermes drive GJC
 
 GJC ships a native Coordinator MCP bridge, so an external controller like OpenClaw or Hermes orchestrates real GJC sessions through durable turns — never terminal scraping.

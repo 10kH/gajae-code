@@ -2,16 +2,19 @@
 //!
 //! # Overview
 //! Two distinct TCC permissions gate the computer tool:
-//! - **Screen Recording** — required for `screenshot` capture (see
-//!   [`super::capture`]).
+//! - **Screen & System Audio Recording** — required for `screenshot` capture
+//!   (see [`super::capture`]).
 //! - **Accessibility** — required for input injection (click/type/etc.). This
-//!   is a *separate* grant from Screen Recording.
+//!   is a *separate* grant from screen capture.
 //!
 //! This module performs non-prompting preflight checks and can open the correct
 //! System Settings pane so the user can grant a missing permission, then retry.
 //! It never injects input and never blocks; callers gate side effects on
 //! [`preflight`] and surface [`PermissionError`] when a required grant is
-//! missing rather than acting on a stale assumption.
+//! missing rather than acting on a stale assumption. TCC grants are evaluated
+//! for the current executable identity, so diagnostics include the actual
+//! launcher path and pid instead of implying that a grant for Terminal, Bun,
+//! or a previous GJC binary applies automatically.
 
 use std::process::Command;
 
@@ -34,7 +37,7 @@ unsafe extern "C" {
 pub enum TccPermission {
 	/// Accessibility — required for input injection.
 	Accessibility,
-	/// Screen Recording — required for screen capture.
+	/// Screen & System Audio Recording — required for screen capture.
 	ScreenRecording,
 }
 
@@ -58,7 +61,7 @@ impl TccPermission {
 pub struct PreflightStatus {
 	/// Whether Accessibility (input injection) is granted.
 	pub accessibility:    bool,
-	/// Whether Screen Recording (capture) is granted.
+	/// Whether Screen & System Audio Recording (capture) is granted.
 	pub screen_recording: bool,
 }
 
@@ -75,12 +78,16 @@ impl std::fmt::Display for PermissionError {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		let (name, what) = match self.missing {
 			TccPermission::Accessibility => ("Accessibility", "inject input"),
-			TccPermission::ScreenRecording => ("Screen Recording", "capture the screen"),
+			TccPermission::ScreenRecording => {
+				("Screen & System Audio Recording", "capture the screen")
+			},
 		};
 		write!(
 			f,
 			"COMPUTER_PERMISSION_REQUIRED: {name} permission is required to {what}. Grant it in \
-			 System Settings (opened for you), then retry."
+			 System Settings for the current GJC launcher, then fully quit and relaunch GJC before \
+			 retrying. {}",
+			current_process_diagnostic()
 		)
 	}
 }
@@ -95,12 +102,25 @@ pub fn accessibility_granted() -> bool {
 	unsafe { AXIsProcessTrusted() }
 }
 
-/// Whether the process already has Screen Recording access (no prompt).
+/// Whether the process already has Screen & System Audio Recording access (no
+/// prompt).
 #[must_use]
 pub fn screen_recording_granted() -> bool {
 	// SAFETY: `CGPreflightScreenCaptureAccess` takes no arguments and only reads
-	// the current process's capture-access state.
+	// the current process's TCC access state.
 	unsafe { CGPreflightScreenCaptureAccess() }
+}
+
+/// Identify the process whose TCC grant is being queried.
+///
+/// macOS privacy grants are evaluated for the current executable's code
+/// identity. The path is especially important in development, where GJC may
+/// run as Bun, a compiled ad-hoc binary, or a launcher from another terminal.
+#[must_use]
+pub fn current_process_diagnostic() -> String {
+	let executable = std::env::current_exe()
+		.map_or_else(|_| "<unavailable>".to_string(), |path| path.display().to_string());
+	format!("TCC identity: executable={executable}, pid={}", std::process::id())
 }
 
 /// Read the current grant state for both required permissions.
@@ -137,13 +157,13 @@ pub fn require_accessibility_for_input() -> Result<(), PermissionError> {
 	Err(PermissionError { missing: TccPermission::Accessibility })
 }
 
-/// Ensure Screen Recording is granted for capture.
+/// Ensure Screen & System Audio Recording is granted for capture.
 ///
 /// On failure, opens the Screen Recording settings pane and returns
 /// [`PermissionError`].
 ///
 /// # Errors
-/// Returns [`PermissionError`] when Screen Recording is not granted.
+/// Returns [`PermissionError`] when screen capture permission is not granted.
 pub fn require_screen_recording_for_capture() -> Result<(), PermissionError> {
 	if screen_recording_granted() {
 		return Ok(());
@@ -154,7 +174,7 @@ pub fn require_screen_recording_for_capture() -> Result<(), PermissionError> {
 
 #[cfg(test)]
 mod tests {
-	use super::{TccPermission, preflight};
+	use super::{PermissionError, TccPermission, current_process_diagnostic, preflight};
 
 	#[test]
 	fn settings_urls_target_the_privacy_panes() {
@@ -168,6 +188,21 @@ mod tests {
 				.settings_url()
 				.contains("Privacy_ScreenCapture")
 		);
+	}
+
+	#[test]
+	fn diagnostic_identifies_the_process_being_checked() {
+		let diagnostic = current_process_diagnostic();
+		assert!(diagnostic.contains("TCC identity: executable="));
+		assert!(diagnostic.contains("pid="));
+	}
+
+	#[test]
+	fn permission_error_explains_launcher_identity_and_relaunch() {
+		let message = PermissionError { missing: TccPermission::Accessibility }.to_string();
+		assert!(message.contains("current GJC launcher"));
+		assert!(message.contains("fully quit and relaunch"));
+		assert!(message.contains("TCC identity:"));
 	}
 
 	/// Reports the live TCC grant state. Ignored by default (result depends on

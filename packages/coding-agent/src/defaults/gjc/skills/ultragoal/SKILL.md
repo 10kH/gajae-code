@@ -18,6 +18,22 @@ Use when the user asks for `ultragoal`, `create-goals`, `complete-goals`, durabl
 - `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl` (checkpoint and structured steering audit events)
 
 Existing aggregate plans with the legacy enumerated objective are migrated to the stable pointer objective on read, persisted to `goals.json`, retained in `gjcObjectiveAliases` for already-active hidden goal reconciliation, and audited with an `aggregate_objective_migrated` ledger entry.
+- **Nudge budget setting** — the per-story give-up budget
+  (`gjc.ultragoal.nudgeBudget`, default **10**, non-negative integer) is read
+  through one shared resolver in this exact order (first valid value wins):
+  1. project `.gjc/config.yml`
+  2. user `<agentDir>/config.yml` (normally `~/.gjc/agent/config.yml`, honoring
+     `GJC_CODING_AGENT_DIR`/`PI_CODING_AGENT_DIR`; XDG applies only to categorized data/state/cache subdirs, never the workflow config path)
+  3. built-in default
+  `config.yml` uses the nested (schema) form - `gjc: { ultragoal: { nudgeBudget } }`.
+  Project configuration beats user configuration. The reported `source` is the
+  canonical path of the winning file, or `default`. `config.yml` is the ONLY
+  settings surface: the legacy `settings.json` files (project and config-root)
+  are retired: the config-root `~/.gjc/settings.json` is migrated once into the
+  default global agent `config.yml` and its source removed, while the project
+  `.gjc/settings.json` is retained for non-workflow settings (only its workflow
+  keys are migrated into project `.gjc/config.yml` and no longer read unless a migration target is absent - a migration that could not publish (e.g. a read-only `.gjc`) leaves the retained legacy value effective as the previously configured override until it can publish). Invalid optional settings
+  files continue to the next layer or the default (tolerant).
 
 ## Corrupt current-session state recovery
 

@@ -563,4 +563,49 @@ describe("BashTool ACP terminal routing", () => {
 		expect(releaseSpy).toHaveBeenCalledTimes(1);
 		pendingExit.resolve({ exitCode: null, signal: "TERM" });
 	});
+
+	it("injects the session's requested agent directory into child command environments", async () => {
+		// The global Settings singleton belongs to an EARLIER session (default
+		// profile); the session's REQUESTED directory is the tenant profile and
+		// must win in the spawned command environment.
+		const session = {
+			cwd: process.cwd(),
+			settings: {
+				get: () => undefined,
+				has: () => false,
+				getAgentDir: () => "default-profile",
+			},
+			getSessionId: () => "test-session",
+			getSessionAgentDir: () => "tenant-profile",
+		} as unknown as ToolSession;
+
+		const result = await new BashTool(session).execute("call", { command: 'echo "$GJC_CODING_AGENT_DIR"' });
+		const text = result.content.find(block => block.type === "text")?.text ?? "";
+		expect(text).toContain("tenant-profile");
+		expect(text).not.toContain("default-profile");
+	});
+
+	it("lets an explicit legacy agent-directory override beat the session injection", async () => {
+		const session = {
+			cwd: process.cwd(),
+			settings: {
+				get: () => undefined,
+				has: () => false,
+				getAgentDir: () => "default-profile",
+			},
+			getSessionId: () => "test-session",
+			getSessionAgentDir: () => "tenant-profile",
+		} as unknown as ToolSession;
+
+		// The tool call explicitly supplies ONLY the legacy alias: the injected
+		// canonical variable must be suppressed, or the child's getAgentDir()
+		// would prefer it over the caller's explicit override.
+		const result = await new BashTool(session).execute("call", {
+			command: 'echo "gjc=$GJC_CODING_AGENT_DIR pi=$PI_CODING_AGENT_DIR"',
+			env: { PI_CODING_AGENT_DIR: "legacy-profile" },
+		});
+		const text = result.content.find(block => block.type === "text")?.text ?? "";
+		expect(text).toContain("pi=legacy-profile");
+		expect(text).not.toContain("tenant-profile");
+	});
 });

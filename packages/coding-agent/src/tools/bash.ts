@@ -1024,12 +1024,28 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					),
 				)
 			: undefined;
+		// Spawned workflow commands must resolve the SESSION's agent
+		// profile: the child's getAgentDir() reads GJC_CODING_AGENT_DIR at
+		// module load. Injected per-command (session-scoped), never
+		// mutating the host process; an explicit tool-call env wins. The
+		// session's REQUESTED directory (getSessionAgentDir) takes
+		// precedence over the global Settings singleton, which may belong
+		// to an earlier session.
+		const sessionAgentDir = this.session.getSessionAgentDir?.() ?? this.session.settings?.getAgentDir?.();
+		// An EXPLICIT tool-call env that supplies either supported spelling of
+		// the agent-directory override wins over the session injection: the
+		// child's getAgentDir() prefers GJC_CODING_AGENT_DIR, so injecting it
+		// while the caller only set the legacy PI_CODING_AGENT_DIR alias would
+		// silently ignore the caller's override.
+		const explicitAgentDirOverride =
+			expandedEnv?.["GJC_CODING_AGENT_DIR"] !== undefined || expandedEnv?.["PI_CODING_AGENT_DIR"] !== undefined;
 		const resolvedEnv = {
 			...buildGjcRuntimeSessionEnv({
 				sessionFile: null,
 				sessionId: this.session.getSessionId?.(),
 				cwd: this.session.cwd,
 			}),
+			...(sessionAgentDir && !explicitAgentDirOverride ? { GJC_CODING_AGENT_DIR: sessionAgentDir } : {}),
 			...expandedEnv,
 			...(this.session.bashRestrictionProfile === "read-only" ? READ_ONLY_BASH_ENV : {}),
 			...(allowedPrefixes && allowedPrefixes.length > 0 ? { [GJC_RESTRICTED_ROLE_AGENT_BASH_ENV]: "1" } : {}),

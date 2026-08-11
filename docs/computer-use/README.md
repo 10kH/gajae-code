@@ -30,9 +30,12 @@ the committed summary and roadmap.
 - **Coordinate contract:** a single normalized virtual display. The returned
   screenshot's pixel dimensions *are* the action coordinate space; Rust owns the
   transform to macOS logical points (Retina/HiDPI-safe) and display selection.
-- **Permissions:** macOS TCC (Accessibility + Screen Recording) auto-preflighted;
-  on a missing grant, open the relevant Settings pane and return a clear
-  "grant then retry/relaunch" error.
+- **Permissions:** macOS TCC (Accessibility + Screen & System Audio Recording)
+  is checked for the actual GJC launcher; on a missing grant, open the
+  relevant Settings pane and return a clear "grant then fully relaunch" error.
+  macOS grants belong to the launcher's code identity, so a permission granted
+  to Terminal, Bun, or an older rebuilt binary is not proof that the current
+  executable can capture or inject input.
 - **Gating:** off by default; opt-in config flag (per session) plus a persistent
   always-on option.
 - **Safety:** no per-action approval (autonomous), **but** a daemon-enforced
@@ -58,8 +61,9 @@ invalid scale) and requires no display or granted permissions.
 `crates/pi-natives/src/computer/capture.rs` (macOS) implements the read-only
 `screenshot` primitive: it captures the primary display via CoreGraphics into a
 PNG and derives the `NormalizedDisplay` scale from captured physical pixels vs
-logical bounds, surfacing a missing Screen Recording grant as
-`CaptureError::CaptureFailed` (never a silent black frame). Verified live: a
+logical bounds. It only classifies a failed capture as a missing permission
+when the real capture fails and the current-process preflight also reports no
+grant, avoiding false negatives from a stale preflight result. Verified live: a
 real, non-uniform primary-display capture decodes as a PNG with matching
 dimensions (`cargo test -p pi-natives --ignored captures_non_uniform_primary_display`).
 
