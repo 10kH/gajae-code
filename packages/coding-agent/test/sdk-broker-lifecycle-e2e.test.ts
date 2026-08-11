@@ -2851,7 +2851,12 @@ test("broker closes a live host whose workspace state root is gone using its reg
 		// index that retirement; leaving it open would keep advertising a dead session.
 		expect(await broker.handleRequest("session.list", {})).toMatchObject({
 			ok: true,
-			result: { sessions: [expect.objectContaining({ sessionId: "wrong-incarnation" })] },
+			result: {
+				sessions: expect.arrayContaining([
+					expect.objectContaining({ sessionId: "wrong-incarnation" }),
+					expect.objectContaining({ sessionId: "orphan", live: false, terminal: true }),
+				]),
+			},
 		});
 	} finally {
 		if (child.exitCode === null) child.kill("SIGKILL");
@@ -3342,7 +3347,15 @@ test("conditional unregister accepts a reconciled equivalent repository locator"
 			pid: expected.pid,
 		});
 		expect(await index.unregisterIfCurrent(expected)).toBe(true);
-		expect(index.listSessions().sessions).toEqual([]);
+		expect(index.listSessions().sessions).toEqual([
+			expect.objectContaining({
+				sessionId: "reconciled-repo",
+				locator: { repo: repoAlias, stateRoot },
+				identityProvenance: "composite",
+				live: false,
+				terminal: true,
+			}),
+		]);
 	} finally {
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}
@@ -4057,7 +4070,10 @@ test("broker close acknowledges before terminating the lifecycle child and prese
 		await expect(
 			SdkClient.connect(endpoint.url, endpoint.token, { timeoutMs: 250, reconnectAttempts: 0 }),
 		).rejects.toThrow();
-		expect(await broker.handleRequest("session.list", {})).toMatchObject({ ok: true, result: { sessions: [] } });
+		expect(await broker.handleRequest("session.list", {})).toMatchObject({
+			ok: true,
+			result: { sessions: [expect.objectContaining({ sessionId, live: false, terminal: true })] },
+		});
 		expect(
 			(await fs.readFile(path.join(agentDir, "sdk", "sessions", "index.jsonl"), "utf8"))
 				.split("\n")

@@ -71,6 +71,7 @@ async function fixture() {
 		pid: process.pid,
 		endpointMtimeMs: fs.statSync(endpointPath).mtimeMs,
 	});
+	await broker.heartbeatSessions();
 	return { repo, agentDir, sessionId, endpointPath, sent: () => sends };
 }
 

@@ -574,6 +574,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		pid: process.pid,
 		endpointMtimeMs,
 	});
+	await index.checkpointLiveHeartbeats();
 	await writeBrokerDiscovery(agentDir, {
 		version: 1,
 		protocolVersion: 3,

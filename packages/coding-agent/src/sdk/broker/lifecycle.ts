@@ -2594,7 +2594,12 @@ async function currentReadyAuthority(
 			pid?: unknown;
 		};
 		await broker.index.refresh();
-		const record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+		let record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+		if (record && !record.live && !record.terminal && !record.terminalUncertain) {
+			await broker.heartbeatSessions();
+			await broker.index.refresh();
+			record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+		}
 		if (
 			!record?.live ||
 			record.pid !== expected.pid ||
@@ -3385,6 +3390,7 @@ async function executeLifecycleResponse(
 		return fail("invalid_input", "sourceSessionId must be a canonical safe identifier.");
 	if (operation === "session.create" || operation === "session.fork" || operation === "session.resume") {
 		await broker.index.refresh();
+		await broker.heartbeatSessions();
 		if (operation === "session.resume") {
 			const requestedSessionId = sessionId(input);
 			const existing = requestedSessionId
@@ -3734,6 +3740,12 @@ async function executeLifecycleResponse(
 	let record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	if (operation === "session.close") {
 		if (!record) return fail("not_found", "session is not indexed");
+		if (!record.live && !record.terminal && !record.terminalUncertain) {
+			await broker.heartbeatSessions();
+			await broker.index.refresh();
+			record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+			if (!record) return fail("not_found", "session is not indexed");
+		}
 		if (record.terminalUncertain)
 			return fail("terminal_uncertain", "Session ownership is uncertain and cannot be closed safely.");
 		const requestedAuthority = requestedCloseAuthority(input);
@@ -3754,6 +3766,7 @@ async function executeLifecycleResponse(
 		});
 		if (!endpointResult.ok && endpointResult.error.code === "endpoint_stale" && !requestedAuthority.authority) {
 			await broker.index.refresh();
+			await broker.heartbeatSessions();
 			const refreshed = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 			if (refreshed && sameCloseProcessIdentity(record, refreshed)) {
 				record = refreshed;
