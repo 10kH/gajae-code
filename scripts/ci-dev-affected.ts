@@ -49,6 +49,7 @@ const CODING_AGENT_SHARD_ONE_COVERAGE_PATHS = [
 	"packages/coding-agent/src/coordinator-mcp/",
 	"packages/coding-agent/test/sdk-host-wiring.test.ts",
 	"packages/coding-agent/test/coordinator-mcp/send-prompt-concurrency.test.ts",
+	"packages/coding-agent/test/sdk-prompt-terminal-diagnostics.test.ts",
 ] as const;
 
 

@@ -1013,6 +1013,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		"packages/coding-agent/test/rlm-live-model-e2e.test.ts",
 		"packages/coding-agent/test/startup-update-contract.test.ts",
 		"packages/coding-agent/test/sdk-host-wiring.test.ts",
+		"packages/coding-agent/test/sdk-prompt-terminal-diagnostics.test.ts",
 		"packages/coding-agent/test/sdk/index.test.ts",
 		"packages/coding-agent/test/other/index.test.ts",
 		"packages/coding-agent/test/sdk-client.test.ts",
@@ -1054,6 +1055,22 @@ describe("planTargetedTasks PR-mode targeting", () => {
 				"../../scripts/run-sdk-production-host-isolated.ts",
 			]);
 		}
+	});
+
+	test("prompt terminal diagnostics changes run directly and on the isolated SDK host", () => {
+		const testFile = "packages/coding-agent/test/sdk-prompt-terminal-diagnostics.test.ts";
+		const tasks = targeted([testFile]);
+		expect(tasks.find(task => task.key === `test:${testFile}`)?.command).toEqual(["bun", "test", testFile]);
+		expect(tasks.find(task => task.key === "test:@gajae-code/coding-agent:shard-1-of-8")?.command).toEqual([
+			"bun",
+			"test",
+			"--isolate",
+			"--shard=1/8",
+		]);
+		expect(tasks.find(task => task.key === "test:@gajae-code/coding-agent:sdk-production-host-isolated")?.command).toEqual([
+			"bun",
+			"../../scripts/run-sdk-production-host-isolated.ts",
+		]);
 	});
 
 	test("basename collisions fall back to package checks instead of arbitrary tests", () => {
