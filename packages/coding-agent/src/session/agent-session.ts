@@ -10281,8 +10281,16 @@ export class AgentSession {
 					// DISCARD only the turn-origin hidden successors queued by the
 					// aborted turn so they cannot be drained into a later explicit
 					// prompt; external/background next-turn context survives
-					// (review thread P2).
-					this.#pendingNextTurnMessages = this.#pendingNextTurnMessages.filter(entry => entry.origin !== "turn");
+					// (review thread P2). AUTHORIZED owned-completion envelopes
+					// survive too: a left-running owned job's completion queued
+					// via sendCustomMessage (default origin "turn") is a promised
+					// resume of the root worker, not a continuation of the aborted
+					// attempt, and #promptQueuedHiddenNextTurnMessages classifies
+					// it fresh (review thread P1).
+					this.#pendingNextTurnMessages = this.#pendingNextTurnMessages.filter(
+						entry =>
+							entry.origin !== "turn" || ownedCompletionResumeAction(entry.message as never) !== "ordinary",
+					);
 					return;
 				}
 				try {

@@ -681,6 +681,86 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		await waitFor(() => !session.agent.hasQueuedMessages(), "external follow-up consumed");
 		await promptPromise;
 	}, 30_000);
+	it("terminal abort preserves authorized owned completions queued as hidden next-turn messages", async () => {
+		// Review thread P1: when ACP defers agent-initiated turns and a
+		// left-running owned job completes after a scope:"turn" abort while the
+		// session is idle, sendCustomMessage() queues the authorized completion
+		// envelope in #pendingNextTurnMessages with the default origin:"turn".
+		// The hidden-next-turn fence purge must not delete it solely by origin —
+		// it is a promised resume of the root worker (classified fresh), and
+		// dropping it also bypasses the registration-settlement path.
+		scriptedResponses = [bashCall("sleep 30", "call_hold_turn")];
+		const promptPromise = session.prompt("hold the turn").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
+		// Terminal abort closes the current turn's continuation fence.
+		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
+			graceMs: 2_000,
+			terminal: { scope: "turn" },
+		});
+		// A left-running owned job completes: its envelope references the
+		// authorized scope it is bound to (turn scope enabled, registered
+		// tuple), so it must classify FRESH.
+		const bindEndpoint = chainSessionManager.getSessionId?.() ?? "local";
+		const jobId = "bg-hidden-next";
+		const generation = "job:1";
+		const registration: TurnRegistrationKey = {
+			endpointId: bindEndpoint,
+			endpointGeneration: 0,
+			lineageIdHash: "hidden-next-lineage",
+			promptAttemptEpoch: 77,
+			jobId,
+			jobGeneration: generation,
+		};
+		registerTerminalTurnScope({
+			lineageIdHash: registration.lineageIdHash,
+			promptAttemptEpoch: registration.promptAttemptEpoch,
+		});
+		registerOwnedRegistration(registration, { isJobTerminal: () => true });
+		session.queueDeferredMessageForTests(
+			{
+				role: "custom",
+				customType: "test-hidden-next-owned",
+				content: [{ type: "text", text: "owned completion" }],
+				display: true,
+				details: {
+					ownedCompletions: [
+						{
+							lineageIdHash: registration.lineageIdHash,
+							promptAttemptEpoch: registration.promptAttemptEpoch,
+							registration,
+						},
+					],
+				},
+				timestamp: Date.now(),
+			},
+			true,
+		);
+		// Let the scheduled hidden-next-turn flush observe the closed fence:
+		// the authorized completion must survive its purge (it was dropped
+		// pre-fix solely by origin).
+		await Bun.sleep(150);
+		expect(
+			session
+				.getPendingNextTurnMessagesForTests()
+				.some(
+					message =>
+						((message as { content?: unknown }).content as Array<{ text?: string }>)[0]?.text ===
+						"owned completion",
+				),
+		).toBe(true);
+		// A new explicit prompt drains the preserved completion: it is
+		// classified fresh, delivered (the mock answers), and its registration
+		// settles instead of bypassing the settlement path.
+		scriptedResponses = [stopReply("completion answered")];
+		await session.prompt("new user turn");
+		expect(session.getPendingNextTurnMessagesForTests()).toHaveLength(0);
+		await waitFor(
+			() => lookupOwnedRegistration(jobId, generation, bindEndpoint) === undefined,
+			"owned completion registration settled after delivery",
+		);
+		await promptPromise;
+	}, 30_000);
+
 	it("terminal abort preserves a queued external follow-up through the purge and rearms it", async () => {
 		// Delta-review P1 regression: the steering purge must NOT
 		// collateral-purge the follow-up queue. An independently requested
