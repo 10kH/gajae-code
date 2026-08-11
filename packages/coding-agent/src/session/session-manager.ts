@@ -6797,7 +6797,6 @@ function validateEvictedToolOutputHandle(
 	return { ok: true, handle: value as EvictedToolOutputHandle };
 }
 export class SessionManager {
-	static #rejectedOpenCleanupOwners = new Set<SessionManager>();
 	#sessionId: string = "";
 	/** True once a lifecycle pre-allocated id has been adopted (consume-once). */
 	#lifecycleIdAdopted: boolean = false;
@@ -14712,15 +14711,14 @@ export class SessionManager {
 				logger.warn("Retained rejected-open writer close retry failed", { error: toError(error).message });
 			}
 		}
-		const state = this.#persistWriter?.getCloseState();
-		if (state === "closed" || state === "close_unknown") {
+		// The loop only exits once the writer is terminal (`closed` or the quarantined
+		// `close_unknown`) or was already cleared by a successful close, so ownership of
+		// the descriptor and of the rejected session's resident state always ends here.
+		if (this.#persistWriter) {
 			this.#persistWriter = undefined;
 			this.#persistWriterPath = undefined;
 		}
-		if (!this.#persistWriter) {
-			this.#releaseRejectedOpenResources();
-			SessionManager.#rejectedOpenCleanupOwners.delete(this);
-		}
+		this.#releaseRejectedOpenResources();
 	}
 
 	async #discardRejectedOpenState(): Promise<void> {
@@ -14735,9 +14733,17 @@ export class SessionManager {
 		}
 		const state = this.#persistWriter?.getCloseState();
 		if (state === "closed") {
+			// The OS close was dispatched and confirmed, so cleanup succeeded even though
+			// `close()` rethrew a queued write/flush drain failure. Reporting that drain
+			// error as a cleanup failure would mask the real resume rejection, so record
+			// it and let the caller surface the resume error alone.
 			this.#persistWriter = undefined;
 			this.#persistWriterPath = undefined;
 			this.#releaseRejectedOpenResources();
+			if (closeError)
+				logger.warn("Rejected-open writer drained with errors before a confirmed close", {
+					error: closeError.message,
+				});
 			return;
 		}
 		if (state === "close_unknown") {
@@ -14747,8 +14753,12 @@ export class SessionManager {
 			throw closeError ?? new Error("Rejected open writer close outcome is unknown");
 		}
 		if (this.#persistWriter) {
-			SessionManager.#rejectedOpenCleanupOwners.add(this);
-			void this.#retryRejectedOpenWriterCleanup();
+			// Certified pre-dispatch failure: the descriptor is still owned, so the writer
+			// and the resident state it guards are retained until a retry reaches a
+			// terminal close. The retry loop keeps this manager reachable on its own.
+			void this.#retryRejectedOpenWriterCleanup().catch(error => {
+				logger.warn("Rejected-open writer cleanup retry loop failed", { error: toError(error).message });
+			});
 			throw closeError ?? new Error("Rejected open writer close remains retryable");
 		}
 		this.#releaseRejectedOpenResources();

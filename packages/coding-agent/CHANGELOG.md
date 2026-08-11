@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
-- Strict resume rejection now tears down derived state without mutating the rejected transcript, closes or certainty-quarantines opened persistence writers, and retains certified retryable writers under unreferenced cleanup ownership until they reach a terminal state.
+- Strict resume rejection now tears down derived state without mutating the rejected transcript, and releases the persistence writer it opened. A confirmed close is reported as successful cleanup even when the writer rethrows a queued drain failure, a quarantined `close_unknown` outcome is surfaced to the caller as an `AggregateError` alongside the resume error, and a certified pre-dispatch failure retains the writer under an unreferenced retry that releases the descriptor, resident session state, and managed authority once the close reaches a terminal state.
 
 ## [0.13.1] - 2026-08-11
 
