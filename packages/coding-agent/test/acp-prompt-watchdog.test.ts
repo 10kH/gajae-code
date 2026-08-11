@@ -945,6 +945,23 @@ test("correlationless frames do not refresh the active prompt watchdog", async (
 		const message = (error as Error).message;
 		expect(message).toContain(`${Math.round(ACP_PROMPT_INFERENCE_TIMEOUT_MS / 1_000)}s of silence`);
 		expect(message).toContain('"agent_start"');
+		const idleToolUpdates = toolCallUpdates(fixture.updates);
+		expect(fixture.clock.pending).toBe(0);
+		fixture.send({
+			type: "event",
+			payload: {
+				event_type: "tool_execution_end",
+				event: {
+					type: "tool_execution_end",
+					toolCallId: "idle-session-tool",
+					toolName: "bash",
+					isError: false,
+					result: { content: [{ type: "text", text: "idle session event" }] },
+				},
+			},
+		});
+		await waitFor(() => toolCallUpdates(fixture.updates) === idleToolUpdates + 1, "idle correlationless publication");
+		expect(fixture.clock.pending).toBe(0);
 	} finally {
 		fixture.dispose();
 	}

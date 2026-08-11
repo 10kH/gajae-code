@@ -97,7 +97,7 @@ function phaseUpdates(updates: SessionNotification[], phase: string): number {
  * reproducing a host that stops producing the moment it publishes its terminal frame.
  */
 async function createFixture(
-	options: { silentQueries?: string[]; terminalBeforeAcknowledgement?: boolean } = {},
+	options: { silentQueries?: string[]; terminalBeforeAcknowledgement?: boolean; rejectFinalTextUpdate?: boolean } = {},
 ): Promise<Fixture> {
 	const silent = new Set(options.silentQueries ?? []);
 	const tempDir = TempDir.createSync("@acp-prompt-settle-");
@@ -232,7 +232,11 @@ async function createFixture(
 	});
 	const agent = new AcpAgent(
 		{
-			sessionUpdate: async (update: SessionNotification) => updates.push(update),
+			sessionUpdate: async (update: SessionNotification) => {
+				if (options.rejectFinalTextUpdate && update.update.sessionUpdate === "agent_message_chunk")
+					throw new Error("client update failed");
+				updates.push(update);
+			},
 			signal: abort.signal,
 			closed: Promise.withResolvers<void>().promise,
 		} as unknown as AgentSideConnection,
@@ -320,6 +324,28 @@ test("a pre-acknowledgement terminal uses correlation carried by its event paylo
 				.map(update => (update.update as { content: { text: string } }).content.text),
 		).toEqual(["the complete final report"]);
 		expect(fixture.clock.now()).toBe(0);
+		expect(fixture.clock.pending).toBe(0);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a deferred terminal processing failure is contained by the frame queue", async () => {
+	const fixture = await createFixture({ terminalBeforeAcknowledgement: true, rejectFinalTextUpdate: true });
+	try {
+		const pending = fixture.agent.prompt({
+			sessionId: fixture.sessionId,
+			messageId: "00000000-0000-4000-8000-000000000003",
+			prompt: [{ type: "text", text: "terminal update failure" }],
+		} as PromptRequest) as Promise<{ stopReason: StoppedReason }>;
+		const outcome = await bounded(
+			pending.then(
+				() => undefined,
+				(error: unknown) => error as { code?: string },
+			),
+			"deferred terminal processing failure",
+		);
+		expect(outcome).toMatchObject({ code: "frame_processing_failed" });
 		expect(fixture.clock.pending).toBe(0);
 	} finally {
 		fixture.dispose();

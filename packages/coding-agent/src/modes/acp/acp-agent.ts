@@ -1540,8 +1540,12 @@ export class AcpAgent implements Agent {
 						);
 					continue;
 				}
-				record.frameTail = record.frameTail.then(
+				const task = record.frameTail.then(
 					async () => await this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame),
+				);
+				record.frameTail = task.catch(
+					async error =>
+						await this.#failSession(params.sessionId, record.adapter, this.#frameProcessingFailure(error)),
 				);
 			}
 			this.#settlePrompt(record, waiter);
@@ -2276,9 +2280,6 @@ export class AcpAgent implements Agent {
 			}
 			if (!activePrompt || activePrompt.settled || !correlationsMatch(activePrompt.correlation, correlation)) return;
 		}
-		// After a correlated settlement with no active prompt, correlationless wire frames
-		// have no prompt to belong to and must not publish further updates.
-		if (!record.activePrompt && record.settledPromptCorrelations.length > 0 && !hasCorrelation(correlation)) return;
 		if (
 			!isTerminal &&
 			activePrompt &&
