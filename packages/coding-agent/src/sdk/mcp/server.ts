@@ -54,6 +54,10 @@ function schema(name: (typeof SDK_MCP_TOOL_NAMES)[number]): Record<string, unkno
 						operation: { type: "string" },
 						input: { type: "object" },
 						confirm: { type: "boolean", description: "Required for destructive controls." },
+						idempotencyKey: {
+							type: "string",
+							description: "Bounded idempotency key; required for turn.abort mode:terminal.",
+						},
 					},
 				},
 			};
@@ -302,11 +306,22 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 			if (secretError) return invalidControl(secretError);
 			const invalid = validateAdapterControl(operation, input);
 			if (invalid) return invalidControl(invalid);
+			const idempotencyKey =
+				args.idempotencyKey === undefined ? undefined : (asString(args, "idempotencyKey") ?? undefined);
+			if (args.idempotencyKey !== undefined && !idempotencyKey)
+				return {
+					ok: false,
+					error: { code: "invalid_input", message: "idempotencyKey must be a non-empty string" },
+				};
+			// Forward the key on the control frame: terminal abort requires it,
+			// and without it every {mode:"terminal"} control is rejected (review
+			// thread P1).
 			return await withSession(sessionId, {
 				type: "control_request",
 				operation,
 				input,
 				confirm: args.confirm === true,
+				...(idempotencyKey === undefined ? {} : { idempotencyKey }),
 			});
 		}
 		if (name === "gjc_session_query") {

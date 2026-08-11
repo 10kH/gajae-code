@@ -30,6 +30,11 @@ import {
 	truncateHeadBytes,
 	truncateTailBytes,
 } from "../session/streaming-output";
+import {
+	lookupOwnedRegistration,
+	registerOwnedIfLineaged,
+	unregisterOwnedRegistration,
+} from "../session/terminal-abort";
 
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock, getOutputBlockContentWidth } from "../tui/output-block";
@@ -598,6 +603,23 @@ function formatTimeoutClampNotice(requestedTimeoutSec: number, effectiveTimeoutS
  *
  * Executes bash commands with optional timeout and working directory.
  */
+/** Remove the owned registration of a FOREGROUND bash job whose delivery was
+ *  synchronously acknowledged: the tuple is settled and must not occupy the
+ *  registry, otherwise old retained policies are treated as occupied and the
+ *  tombstone FIFO fallback can evict a genuinely live work's policy (review
+ *  thread P2). */
+function unregisterForegroundOwnedBash(
+	manager: { getJob?(id: string): { generation?: string } | undefined },
+	jobId: string,
+	endpointId?: string,
+): void {
+	const generation = manager.getJob?.(jobId)?.generation;
+	if (!generation) return;
+	// The endpoint disambiguates concurrent sessions' same job ids (review P1).
+	const registration = lookupOwnedRegistration(jobId, generation, endpointId);
+	if (registration) unregisterOwnedRegistration(registration);
+}
+
 export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	readonly name = "bash";
 	readonly label = "Bash";
@@ -751,8 +773,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		resolvedEnv?: Record<string, string>;
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>;
 		startBackgrounded: boolean;
+		/** Immutable attempt-scoped tool call id, when executed via a tool call. */
+		toolCallId?: string;
 	}): ManagedBashJobHandle {
-		const manager = AsyncJobManager.instance();
+		const manager = this.#resolveOwnedJobManager();
 		if (!manager) {
 			throw new ToolError("Background job manager unavailable for this session.");
 		}
@@ -840,6 +864,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				},
 			},
 		);
+		registerOwnedIfLineaged(manager, options.toolCallId, jobId, this.session.getSessionId?.() ?? undefined);
 
 		return {
 			jobId,
@@ -850,6 +875,24 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				backgrounded = nextBackgrounded;
 			},
 		};
+	}
+
+	/**
+	 * The session's ENDPOINT-owned AsyncJobManager, falling back to the
+	 * process-global instance. Concurrent top-level sessions each register
+	 * their manager under their endpoint (sdk/session.ts), so a job created
+	 * by THIS session must be stored in THIS session's manager — otherwise a
+	 * Bash launched by session A lands in the last-created session B's
+	 * manager while registering as A-owned, an A scope:"owned" abort then
+	 * consults A's endpoint manager and cannot cancel the actual job, and a
+	 * later missing-job settlement can retire the tuple while the job keeps
+	 * running (review thread P1).
+	 */
+	#resolveOwnedJobManager(): AsyncJobManager | undefined {
+		const endpointId = this.session.getSessionId?.() ?? undefined;
+		return (
+			this.session.getAsyncJobManager?.() ?? AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance()
+		);
 	}
 
 	async #waitForManagedBashJob(
@@ -1094,12 +1137,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			ownerId?: string;
 			label?: string;
 			ctx?: AgentToolContext;
+			toolCallId?: string;
 			onRawLine?: (line: string, jobId: string) => void;
 			shouldAcceptRawLine?: (jobId: string) => boolean;
 			lifecycle?: import("../async").AsyncJobLifecycleCleanup;
 		} = {},
 	): Promise<{ jobId: string; label: string; commandCwd: string }> {
-		const manager = AsyncJobManager.instance();
+		const manager = this.#resolveOwnedJobManager();
 		if (!manager) {
 			throw new ToolError("Async job manager unavailable for this session.");
 		}
@@ -1197,12 +1241,16 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			},
 			{ ownerId, metadata: { monitor: true }, lifecycle: opts.lifecycle },
 		);
+		// Monitor jobs are exact owned background work of the turn that started
+		// them: register the five-tuple so scope:"owned" terminal abort stops the
+		// monitor too (review thread P2).
+		registerOwnedIfLineaged(manager, opts.toolCallId, jobId, this.session.getSessionId?.() ?? undefined);
 		currentJobId = jobId;
 		return { jobId, label, commandCwd: prepared.commandCwd };
 	}
 
 	async execute(
-		_toolCallId: string,
+		toolCallId: string,
 		{
 			command: rawCommand,
 			env: rawEnv,
@@ -1238,7 +1286,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		} = prepared;
 
 		if (asyncRequested) {
-			if (!AsyncJobManager.instance()) {
+			// Availability is endpoint-first: a concurrent top-level session
+			// that was the process-global instance may have been disposed,
+			// clearing instance() while THIS session's manager stays
+			// registered by endpoint (review thread P1).
+			if (!this.#resolveOwnedJobManager()) {
 				throw new ToolError("Async job manager unavailable for this session.");
 			}
 			const job = this.#startManagedBashJob({
@@ -1252,6 +1304,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				resolvedEnv,
 				onUpdate,
 				startBackgrounded: true,
+				toolCallId,
 			});
 			return this.#buildBackgroundStartResult(job.jobId, job.label, "", timeoutSec, {
 				requestedTimeoutSec,
@@ -1265,11 +1318,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			this.session.bashRestrictionProfile === "read-only" ? undefined : this.session.getClientBridge?.();
 		const clientTerminalActive = Boolean(clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty);
 
-		const autoBgManager = AsyncJobManager.instance();
 		// Run non-PTY bash through the managed job path so Ctrl+B-twice fold-on-demand works
 		// even when auto-background is disabled. When a client terminal will handle the
 		// command, keep the existing bridge path unless auto-background is enabled.
-		if (!pty && autoBgManager && (this.#autoBackgroundEnabled || !clientTerminalActive)) {
+		// The manager is resolved ONCE from the session's endpoint (same instance the
+		// job was created in) and reused for creation, acknowledgement, cancellation,
+		// and unregistering — the process-global instance may belong to a different
+		// concurrent top-level session (review thread P1).
+		const ownedManager = this.#resolveOwnedJobManager();
+		if (!pty && ownedManager && (this.#autoBackgroundEnabled || !clientTerminalActive)) {
 			// With auto-background off, wait past the command's own timeout so the job only
 			// leaves the foreground on an explicit Ctrl+B fold, never on an auto-background timer.
 			const autoBackgroundWaitMs = this.#autoBackgroundEnabled
@@ -1287,6 +1344,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				resolvedEnv,
 				onUpdate,
 				startBackgrounded,
+				toolCallId,
 			});
 			if (startBackgrounded) {
 				return this.#buildBackgroundStartResult(job.jobId, job.label, "", timeoutSec, {
@@ -1311,17 +1369,20 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				unregisterBackgroundRequest?.();
 			}
 			if (waitResult.kind === "completed") {
-				autoBgManager.acknowledgeDeliveries([job.jobId]);
+				ownedManager.acknowledgeDeliveries([job.jobId]);
+				unregisterForegroundOwnedBash(ownedManager, job.jobId, this.session.getSessionId?.() ?? "local");
 				return waitResult.result;
 			}
 			if (waitResult.kind === "failed") {
-				autoBgManager.acknowledgeDeliveries([job.jobId]);
+				ownedManager.acknowledgeDeliveries([job.jobId]);
+				unregisterForegroundOwnedBash(ownedManager, job.jobId, this.session.getSessionId?.() ?? "local");
 				throw waitResult.error;
 			}
 			if (waitResult.kind === "aborted") {
-				autoBgManager.cancel(job.jobId);
+				ownedManager.cancel(job.jobId);
 				const terminal = await job.completion;
-				autoBgManager.acknowledgeDeliveries([job.jobId]);
+				ownedManager.acknowledgeDeliveries([job.jobId]);
+				unregisterForegroundOwnedBash(ownedManager, job.jobId, this.session.getSessionId?.() ?? "local");
 				if (terminal.kind === "failed") {
 					throw new ToolAbortError(
 						formatManagedAbortFailure(terminal.error, terminal.result, job.getLatestText()),

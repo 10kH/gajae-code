@@ -269,6 +269,15 @@ export interface ExecutorOptions {
 	 */
 	parentArtifactManager?: ArtifactManager;
 	managedPersistence?: ManagedTaskPersistence;
+	/**
+	 * The parent session's ENDPOINT-owned AsyncJobManager (resolved by the
+	 * TaskTool via forEndpoint(sessionId) ?? instance()). Model metadata and
+	 * live-handle state for THIS subagent are recorded in the SAME manager the
+	 * task job runs in — with concurrent top-level sessions the process-global
+	 * instance belongs to a different session and would surface this subagent
+	 * under the wrong session's record (review thread P1).
+	 */
+	asyncJobManager?: AsyncJobManager;
 	parentHindsightSessionState?: HindsightSessionState;
 	/**
 	 * Parent agent's OpenTelemetry configuration. When defined, the subagent's
@@ -1560,7 +1569,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// Record which model the subagent actually runs on (and any auth fallback,
 			// see #985) so the subagent panel can surface it to the user.
 			if (model) {
-				AsyncJobManager.instance()?.updateSubagentModel?.(options.subagentId ?? id, {
+				(options.asyncJobManager ?? AsyncJobManager.instance())?.updateSubagentModel?.(options.subagentId ?? id, {
 					requestedModel: modelSubstitutionWarning?.requested ?? resolvedModelString,
 					effectiveModel: resolvedModelString,
 					modelFellBack: authFallbackUsed === true,
@@ -1738,6 +1747,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					},
 					parentHindsightSessionState: options.parentHindsightSessionState,
 					parentTaskPrefix: id,
+					inheritedAsyncJobManager: options.asyncJobManager,
 					inheritedMcpManager: options.parentMcpManager,
 					agentId: id,
 					agentDisplayName: agent.name,
@@ -1761,7 +1771,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				session.seedDefaultFallbackResolution(activeIndex ?? 0, skips);
 			}
 			const liveSubagentId = options.subagentId ?? id;
-			const manager = AsyncJobManager.instance();
+			const manager = options.asyncJobManager ?? AsyncJobManager.instance();
 			if (manager) {
 				manager.registerLiveHandle(liveSubagentId, {
 					requestPause: () => {
@@ -1964,12 +1974,20 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				if (event.type === "model_fallback_switched") {
 					activeProviderModelString = event.to;
 					progress.fastMode = isFastForModel(session.model);
-					AsyncJobManager.instance()?.updateSubagentModel?.(options.subagentId ?? id, {
-						requestedModel: modelSubstitutionWarning?.requested ?? resolvedModelString,
-						effectiveModel: event.to,
-						modelFellBack: true,
-						fastMode: progress.fastMode,
-					});
+					// Keep the fallback metadata on the SAME manager the initial
+					// update used: another session may have become the
+					// process-global instance, and writing to it would leave this
+					// session's subagent metadata stale or overwrite an unrelated
+					// same-ID record (review thread P2).
+					(options.asyncJobManager ?? AsyncJobManager.instance())?.updateSubagentModel?.(
+						options.subagentId ?? id,
+						{
+							requestedModel: modelSubstitutionWarning?.requested ?? resolvedModelString,
+							effectiveModel: event.to,
+							modelFellBack: true,
+							fastMode: progress.fastMode,
+						},
+					);
 					scheduleProgress(true);
 					forwardSubagentEvent(event);
 					return;
@@ -2108,7 +2126,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				if (exitCode === 0) exitCode = 1;
 			}
 			sessionAbortController.abort();
-			AsyncJobManager.instance()?.removeLiveHandle(options.subagentId ?? id);
+			(options.asyncJobManager ?? AsyncJobManager.instance())?.removeLiveHandle(options.subagentId ?? id);
 			if (unsubscribe) {
 				try {
 					unsubscribe();

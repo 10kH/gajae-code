@@ -6,6 +6,8 @@ import {
 } from "../src/sdk/bus/prompt-reconciliation";
 import {
 	type DurableReconciliationRecord,
+	type DurableTerminalScopeRecord,
+	type EvictedTerminalKeyEntry,
 	type ReconciliationStore,
 	settleProcessRestart,
 } from "../src/sdk/bus/reconciliation-store";
@@ -14,8 +16,37 @@ class MemoryStore implements ReconciliationStore {
 	readonly path = null;
 	readonly sessionId = "steer-session";
 	#records: DurableReconciliationRecord[] = [];
+	#terminalScopes: DurableTerminalScopeRecord[] = [];
+	#terminalKeys: EvictedTerminalKeyEntry[] = [];
 	async transact(mutator: (records: DurableReconciliationRecord[]) => DurableReconciliationRecord[]): Promise<void> {
 		this.#records = mutator(this.snapshot());
+	}
+	async transactTerminalScopes(
+		mutator: (scopes: DurableTerminalScopeRecord[]) => DurableTerminalScopeRecord[],
+	): Promise<void> {
+		this.#terminalScopes = mutator(this.snapshotTerminalScopes());
+	}
+	async transactTerminalState(
+		mutator: (state: { scopes: DurableTerminalScopeRecord[]; keys: EvictedTerminalKeyEntry[] }) => {
+			scopes: DurableTerminalScopeRecord[];
+			keys: EvictedTerminalKeyEntry[];
+		},
+	): Promise<void> {
+		const next = mutator({ scopes: this.snapshotTerminalScopes(), keys: this.snapshotTerminalKeys() });
+		this.#terminalScopes = next.scopes;
+		this.#terminalKeys = next.keys;
+	}
+	async transactTerminalKeys(mutator: (keys: EvictedTerminalKeyEntry[]) => EvictedTerminalKeyEntry[]): Promise<void> {
+		this.#terminalKeys = mutator(this.snapshotTerminalKeys());
+	}
+	snapshotTerminalKeys(): EvictedTerminalKeyEntry[] {
+		return this.#terminalKeys.map(key => ({ ...key }));
+	}
+	async loadTerminalScopes(): Promise<DurableTerminalScopeRecord[]> {
+		return this.snapshotTerminalScopes();
+	}
+	snapshotTerminalScopes(): DurableTerminalScopeRecord[] {
+		return this.#terminalScopes.map(scope => ({ ...scope }));
 	}
 	async load(): Promise<DurableReconciliationRecord[]> {
 		return this.snapshot();

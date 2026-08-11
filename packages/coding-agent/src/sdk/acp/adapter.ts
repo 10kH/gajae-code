@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { type SdkClient, SdkClientError } from "../client";
+import type { AbortScope } from "../host/control/operations";
 import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
@@ -283,8 +284,16 @@ export class AcpSdkAdapter {
 			input: { ...(typeof params === "object" ? params : {}), text },
 		});
 	}
-	async cancel(): Promise<unknown> {
-		return await this.#requestSession({ type: "control_request", operation: "turn.abort", input: {} });
+	/**
+	 * Ends the active turn with a C04 terminal abort. The default `scope:"owned"`
+	 * also stops exact causal owned work (background Bash/task jobs, detached
+	 * subagents) so an external client that cancels a turn terminates everything
+	 * that turn spawned; `scope:"turn"` leaves owned work running so its
+	 * completion can resume the root worker. A fresh bounded idempotency key per
+	 * call keeps terminal-abort replay deterministic across retries.
+	 */
+	async cancel(scope: AbortScope = "owned"): Promise<unknown> {
+		return await this.control("turn.abort", { mode: "terminal", scope, idempotencyKey: randomUUID() });
 	}
 	async setModel(params: JsonObject | string): Promise<unknown> {
 		const id = typeof params === "string" ? params : String(params.modelId ?? params.id ?? "");
@@ -293,7 +302,12 @@ export class AcpSdkAdapter {
 
 	async control(operation: string, input: JsonObject = {}): Promise<unknown> {
 		this.#assertGenericDisposition("control", operation);
-		const { confirm, ...payload } = input;
+		// `confirm` and `idempotencyKey` are envelope concerns, not control input:
+		// extract them so the payload passes the control validator and the bounded
+		// key reaches the control envelope — terminal abort requires it, and
+		// without it every {mode:"terminal"} control is rejected (review
+		// thread P1).
+		const { confirm, idempotencyKey, ...payload } = input;
 		const secretError = validateAdapterSecretFields(operation, payload);
 		if (secretError) throw new AcpSdkAdapterError(secretError.code, secretError.message);
 
@@ -304,6 +318,7 @@ export class AcpSdkAdapter {
 			operation,
 			input: payload,
 			...(confirm === undefined ? {} : { confirm: confirm === true }),
+			...(typeof idempotencyKey === "string" && idempotencyKey ? { idempotencyKey } : {}),
 		});
 	}
 	async query(query: string, input: JsonObject = {}, cursor?: string): Promise<unknown> {

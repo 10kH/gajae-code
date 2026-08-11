@@ -156,11 +156,64 @@ function inputHash(input: unknown): string {
 		.update(JSON.stringify(canonicalize(input)))
 		.digest("hex");
 }
+/**
+ * Normalize a WELL-FORMED terminal abort input for the idempotency hash:
+ * omitted scope defaults to "turn", so `{mode:"terminal"}` and
+ * `{mode:"terminal", scope:"turn"}` share one idempotency key (the durable
+ * terminal-scope replay hashes the same normalized payload). Malformed
+ * inputs (unknown fields, invalid mode/scope) are left raw so they are
+ * rejected downstream and never collide with a valid input's key.
+ */
+function normalizeTerminalAbortInputForHash(input: unknown): unknown {
+	if (typeof input !== "object" || input === null) return input;
+	const record = input as Record<string, unknown>;
+	if (record.mode !== "terminal") return input;
+	for (const key of Object.keys(record)) if (!TERMINAL_ABORT_FIELDS.has(key)) return input;
+	const scope = record.scope;
+	if (scope !== undefined && scope !== "turn" && scope !== "owned") return input;
+	return { mode: "terminal", scope: scope === undefined ? "turn" : scope };
+}
 
 function text(input: ControlInput, key = "text"): string {
 	return input[key] as string;
 }
 
+const TERMINAL_ABORT_FIELDS = new Set(["mode", "scope"]);
+
+function invalidInput(message: string): never {
+	throw new TypedControlError("invalid_input", message);
+}
+
+/**
+ * C04 `turn.abort` dispatch.
+ *
+ * Legacy behavior (omitted mode or `mode:"turn"`) is preserved verbatim: the
+ * input is dropped and the ordinary argument-less `surface.abort()` runs.
+ *
+ * Terminal mode (`mode:"terminal"`) is validated strictly and side-effect-free
+ * before any surface call: only `mode`/`scope` fields are accepted, `scope`
+ * must be `"turn"` or `"owned"` (default `"turn"`), and a nonempty idempotency
+ * key of at most 128 UTF-8 bytes is required on the request envelope. Terminal
+ * semantics (see the approved plan): stop the root worker's current turn and
+ * block only its own continuation routes; left-running owned work keeps
+ * running and its completions are delivered normally so the root worker can
+ * resume with a fresh attempt — owned delivery is NOT suppressed.
+ */
+function invokeAbort(surface: ControlSurface, input: ControlInput, idempotencyKey: string | undefined): ControlValue {
+	const mode = input.mode === undefined ? "turn" : input.mode;
+	if (mode === "turn") return surface.abort();
+	if (mode !== "terminal") invalidInput('turn.abort mode must be "turn" or "terminal".');
+	for (const key of Object.keys(input))
+		if (!TERMINAL_ABORT_FIELDS.has(key)) invalidInput(`Unknown turn.abort terminal field: ${key}`);
+	const scope = input.scope === undefined ? "turn" : input.scope;
+	if (scope !== "turn" && scope !== "owned") invalidInput('turn.abort terminal scope must be "turn" or "owned".');
+	if (typeof idempotencyKey !== "string" || idempotencyKey.length === 0)
+		invalidInput("terminal abort requires a nonempty idempotency key.");
+	if (new TextEncoder().encode(idempotencyKey).length > 128)
+		invalidInput("terminal abort idempotency key must be at most 128 UTF-8 bytes.");
+	if (!surface.abortTerminal) invalidInput("terminal abort is not supported by this surface.");
+	return surface.abortTerminal({ mode: "terminal", scope }, idempotencyKey);
+}
 function invoke(
 	surface: ControlSurface,
 	operation: string,
@@ -177,7 +230,7 @@ function invoke(
 		case "turn.follow_up":
 			return surface.followUp(text(input));
 		case "turn.abort":
-			return surface.abort();
+			return invokeAbort(surface, input, idempotencyKey);
 		case "turn.abort_and_prompt":
 			return surface.abortAndPrompt(text(input));
 		case "ask.answer":
@@ -364,7 +417,11 @@ function idempotent(
 	const now = Date.now();
 	for (const [key, entry] of requests) if (entry.expiresAt <= now) requests.delete(key);
 	const key = `${row.sdkId}\u0000${request.idempotencyKey}`;
-	const hash = inputHash(request.input);
+	// Terminal abort normalizes the omitted scope BEFORE hashing so the
+	// defaulted and explicit shapes share one idempotency key (and reach the
+	// durable terminal-scope replay on eviction); malformed inputs stay raw.
+	const hashInput = row.sdkId === "turn.abort" ? normalizeTerminalAbortInputForHash(request.input) : request.input;
+	const hash = inputHash(hashInput);
 	const existing = requests.get(key);
 	if (existing) {
 		requests.delete(key);

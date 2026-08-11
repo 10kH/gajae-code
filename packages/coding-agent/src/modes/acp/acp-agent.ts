@@ -7,6 +7,7 @@ import {
 	type AuthenticateResponse,
 	type AuthMethod,
 	type AvailableCommand,
+	type CancelNotification,
 	type ClientCapabilities,
 	type CloseSessionRequest,
 	type CloseSessionResponse,
@@ -49,11 +50,13 @@ import { resolveAcpFinalText } from "../../sdk/acp/final-text";
 import { ACP_MCP_LIFECYCLE_TIMEOUT_MS, type SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
 import { ensureBroker } from "../../sdk/broker/ensure";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
+import type { AbortScope } from "../../sdk/host/control/operations";
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-namespace";
 import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
 import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
+import { resolveAcpAbortScope } from "./abort-scope";
 import {
 	buildToolCallStartUpdate,
 	mapAgentSessionEventToAcpSessionUpdates,
@@ -370,6 +373,26 @@ function promptAcknowledgement(value: unknown): PromptCorrelation | undefined {
 	if (typeof payload.commandId !== "string" || payload.commandId.trim().length === 0) return undefined;
 	if (typeof payload.turnId !== "string" || payload.turnId.trim().length === 0) return undefined;
 	return { commandId: payload.commandId, turnId: payload.turnId };
+}
+
+/**
+ * A `session/cancel` is acknowledged ONLY by a matching-scope C04 `stopped`
+ * disposition (`{ok:true, turn:"stopped", selection: <requested scope>, ...}`)
+ * or by the legacy `{aborted:true}` plain-abort ack from a broker that predates
+ * terminal mode. The no-effect dispositions (`no_active_turn`, `no_effect`,
+ * `no_store`) and `uncertain` explicitly provide NO proof the worker was
+ * stopped — the agent turn may keep running and executing tools — so accepting
+ * them would settle the ACP prompt as cancelled against a live worker (review
+ * thread P1). `no_active_turn` can also be a requester-ownership no-op after an
+ * SDK reconnect. Anything else means the SDK did not confirm the stop and the
+ * client must see an error rather than a settled turn.
+ */
+function isAbortAcknowledged(value: unknown, scope: AbortScope): boolean {
+	const candidate = object(value);
+	const result = object(candidate?.result) ?? candidate;
+	if (result === undefined) return false;
+	if (result.aborted === true) return true;
+	return result.ok === true && result.turn === "stopped" && result.selection === scope;
 }
 function strictCorrelationFrom(...values: unknown[]): PromptCorrelation | undefined {
 	const correlation: PromptCorrelation = {};
@@ -1632,25 +1655,30 @@ export class AcpAgent implements Agent {
 		}
 	}
 
-	async cancel(params: { sessionId: string }): Promise<void> {
+	async cancel(params: CancelNotification): Promise<void> {
 		const record = this.#sessions.get(params.sessionId);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		// Record the client's intent before awaiting the SDK so a prompt that rejects
 		// mid-cancel (e.g. preflight `busy`) can still settle as `cancelled`.
 		record.cancelRequested = true;
+		// C04 terminal abort: ending a turn from an external client also stops exact
+		// owned subagents and background tasks (`scope:"owned"`, the default). A
+		// client that wants background work to keep running opts out with
+		// `_meta.gjc.abortScope: "turn"` (or `GJC_ACP_ABORT_SCOPE=turn`).
+		const scope = resolveAcpAbortScope(params._meta, process.env);
 		const waiter = record.activePrompt;
 		const cancelAttempt = waiter ? Promise.withResolvers<boolean>() : undefined;
 		if (waiter && cancelAttempt) waiter.cancelAttempt = cancelAttempt.promise;
 		try {
-			const acknowledgement = await record.adapter.cancel();
+			const acknowledgement = await record.adapter.cancel(scope);
 			const result = object(object(acknowledgement)?.result) ?? object(acknowledgement);
-			if (result?.aborted !== true)
+			if (!isAbortAcknowledged(acknowledgement, scope))
 				throw new AcpSdkAdapterError(
 					"abort_unacknowledged",
 					"SDK did not acknowledge cancellation of the active prompt.",
 				);
 			if (
-				result.disposition === "preflight_cancelled" &&
+				result?.disposition === "preflight_cancelled" &&
 				waiter &&
 				record.activePrompt === waiter &&
 				!waiter.acknowledged &&

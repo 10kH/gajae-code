@@ -474,7 +474,9 @@ export function createKindAwareReconciliation(
 		const record = key === undefined ? undefined : records.get(key);
 		if (!record || record.kind === "steer") return { status: "unknown" };
 		const identity = {
-			kind: record.kind,
+			// Durable terminal markers (kind "terminal") are not prompt/skill
+			// invocation pages: never surface them under a prompt/skill kind.
+			kind: record.kind === "terminal" ? undefined : record.kind,
 			commandId: record.commandId,
 			turnId: record.turnId,
 			...(record.clientRef !== undefined ? { clientRef: record.clientRef } : {}),
